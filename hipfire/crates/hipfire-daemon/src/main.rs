@@ -22,7 +22,7 @@
 
 use base64::Engine;
 use hipfire_config::developer_var;
-use hipfire_config::devices::{Claim, DeviceSelection, GpuDevice, ObservedDevice};
+use hipfire_config::devices::{Claim, DeviceSelection, ObservedDevice};
 use hipfire_runtime::emit_text::{
     currently_in_think, extract_tool_calls_from_text, ThinkOutputRouter, ThinkRouteEvent,
     ToolOutputRouter, ToolRouteError, ToolRouteEvent,
@@ -36,7 +36,6 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-
 use hipfire_engine::emit::*;
 use hipfire_engine::prompt::*;
 use hipfire_engine::redline::*;
@@ -48,10 +47,9 @@ use hipfire_engine::wire_seed::parse_wire_seed;
 use hipfire_generate::ar::take_fault_after_prefill;
 use hipfire_generate::ar::{
     ckpt_interval, ckpt_max, ckpt_resume_enabled, deepseek4_spec_requested,
-    deepseek4_spec_requested_from_policy, emit_qwen_ar_done, emit_qwen_ar_open_think_terminal,
-    generate, llama_prefill_sample_seed, llama_qwen3_batched_prefill_eligible,
-    model_retry_reset_eligible, qwen_ar_apply_cache_action, qwen_ar_cache_action,
-    qwen_ar_done_value, qwen_ar_drain_pending_into_router, qwen_ar_eos_filter_config,
+    deepseek4_spec_requested_from_policy, emit_qwen_ar_done, generate, llama_prefill_sample_seed,
+    llama_qwen3_batched_prefill_eligible, model_retry_reset_eligible, qwen_ar_apply_cache_action,
+    qwen_ar_cache_action, qwen_ar_done_value, qwen_ar_drain_pending_into_router,
     qwen_ar_eviction_prefill_chunk_limit, qwen_ar_finish_route, qwen_ar_forward_fail_action,
     qwen_ar_forward_fail_message, qwen_ar_observe_and_route, qwen_ar_raw_commit_token,
     qwen_ar_route_filter_text, qwen_ar_route_think_events, reset_core_arch_key,
@@ -66,8 +64,8 @@ use hipfire_generate::batch::{
     lfm_prefill_cancellable_or_fallback,
 };
 use hipfire_generate::redline::{
-    handle_redline_dflash_verify_shadow_pm4, handle_redline_dispatch_profile,
-    handle_redline_dspark_shadow_pm4, handle_redline_pm4_prefix_profile,
+    handle_railgun_g0_dflash_cycle, handle_redline_dflash_verify_shadow_pm4, handle_redline_dispatch_profile,
+    handle_redline_dspark_shadow_pm4, handle_redline_greedy_trace, handle_redline_pm4_prefix_profile,
     handle_redline_prefix_shadow, handle_redline_probe_aql, handle_redline_shadow,
     redline_append_tensor_slice, redline_bench_decode_deepseek4, redline_bench_decode_lfm2moe,
     redline_deepseek4_snapshot, redline_dspark_shadow_block, redline_dspark_verify_guard,
@@ -82,11 +80,13 @@ use hipfire_generate::redline::{
     RedlineDsparkReplayArm, RedlineDsparkVerifySnapshot, RedlineLfm2MoeSnapshot,
     RedlineQwenSnapshot, RedlineSnapshot,
 };
+mod gpu_lock;
+use gpu_lock::GpuLocks;
 mod request_guards;
 mod slots;
 mod vision_ladder;
+mod weight_host_tenant;
 use vision_ladder::{apply_vision_mode_gate, resolve_vision_ladder};
-
 #[cfg(test)]
 pub(crate) static TERMINAL_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
@@ -101,9 +101,7 @@ use hipfire_runtime::spec::{
 /// Must stay aligned with `lm_head_batched` + `prepare_decode_batch_inputs`
 /// in hipfire-arch-qwen35 — unsupported lm_head or F32 embedding must never
 /// advertise `continuous_batch_capable` or enter the batch route.
-
 pub type CaskConfig = hipfire_runtime::loader_api::CaskConfig;
-
 #[allow(dead_code)]
 fn emit_error_no_id(stdout: &mut impl std::io::Write, message: impl std::fmt::Display) {
     emit_uncorrelated_error(stdout, None, &message.to_string(), "internal", false, false);
@@ -117,7 +115,6 @@ struct BatchTerminalCleanup {
     attempt_id: u64,
     admission: Option<BatchGeneration>,
 }
-
 impl Drop for BatchTerminalCleanup {
     fn drop(&mut self) {
         if let Some(admission) = self.admission {
@@ -163,7 +160,6 @@ fn parse_wire_attempt_id(value: Option<&serde_json::Value>) -> Option<u64> {
     }
     None
 }
-
 /// Require a present, nonzero numeric attempt_id on the wire.
 ///
 /// Zero is reserved for uncorrelated control-plane envelopes. It must never
@@ -178,7 +174,6 @@ fn require_wire_attempt_id(value: Option<&serde_json::Value>) -> Result<u64, &'s
         },
     }
 }
-
 /// Announce a generate key only after the command has a valid nonzero attempt.
 ///
 /// `None` means the request is malformed or uses reserved attempt zero and
@@ -200,7 +195,6 @@ fn announce_generate_terminal(
 
 // ── serve-fault-inject (test-only; compiled out of production) ─────────
 // Per-request fault arming lives in hipfire_generate::common::RequestFaultGuard.
-
 #[cfg(feature = "serve-fault-inject")]
 fn write_test_state_snapshot(
     stdout: &mut impl std::io::Write,
@@ -388,157 +382,9 @@ fn gpu_block_attractor_token(
             .memcpy_htod_offset(logits_buf, (tok_id as usize) * 4, &bytes);
     }
 }
-#[cfg(unix)]
-fn prepare_gpu_lock_dir(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    if !path.is_absolute() {
-        return Err(format!("GPU lock directory must be absolute: {}", path.display()));
-    }
-    if !path.exists() {
-        std::fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o1777))
-            .map_err(|e| format!("set permissions on {}: {e}", path.display()))?;
-    }
-    if !path.is_dir() {
-        return Err(format!("GPU lock path is not a directory: {}", path.display()));
-    }
-    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
-        .map_err(|e| format!("invalid GPU lock directory {}: {e}", path.display()))?;
-    if unsafe { libc::access(c_path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
-        return Err(format!("GPU lock directory is not writable: {}", path.display()));
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn gpu_lock_dir() -> Result<std::path::PathBuf, String> {
-    if let Some(override_dir) = std::env::var_os("HIPFIRE_LOCK_DIR") {
-        let dir = std::path::PathBuf::from(override_dir);
-        prepare_gpu_lock_dir(&dir)?;
-        return Ok(dir);
-    }
-    let primary = Path::new("/run/lock/hipfire");
-    if prepare_gpu_lock_dir(primary).is_ok() {
-        return Ok(primary.to_path_buf());
-    }
-    let fallback = Path::new("/tmp/hipfire-locks");
-    prepare_gpu_lock_dir(fallback)?;
-    Ok(fallback.to_path_buf())
-}
-
-/// Machine-wide GPU reservations held until process exit. Lock files are
-/// keyed by [`GpuDevice::lock_identity`]: `gpu-GPU-<uuid>.lock`, or
-/// `gpu-pci-<bdf>.lock` for cards without a UUID. The per-HOME PID file is
-/// advisory discovery for uninstall tooling, not a mutex: two daemons using
-/// different cards in one HOME must both run.
-#[cfg(unix)]
-struct GpuLocks {
-    dir: std::path::PathBuf,
-    held: Vec<(String, std::fs::File)>,
-}
-
-#[cfg(unix)]
-impl GpuLocks {
-    fn open() -> Result<Self, String> {
-        let dir = gpu_lock_dir()?;
-        eprintln!("[gpu-lock] directory={}", dir.display());
-        Ok(Self { dir, held: Vec::new() })
-    }
-
-    /// Non-blocking reservation; a busy card reports its holder so arch
-    /// selectors can move on to the next card. Never waits, so the claim
-    /// order cannot deadlock against another daemon.
-    fn try_claim(&mut self, device: &GpuDevice) -> Result<Claim, String> {
-        use std::io::{Read, Seek, Write};
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        use std::os::unix::io::AsRawFd;
-
-        let identity = device.lock_identity();
-        if self.held.iter().any(|(held, _)| *held == identity) {
-            return Ok(Claim::Claimed);
-        }
-        let path = self.dir.join(device.lock_file_name());
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true).mode(0o666).custom_flags(libc::O_NOFOLLOW);
-        let mut file = options.open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::WouldBlock {
-                let mut holder = String::new();
-                let _ = file.read_to_string(&mut holder);
-                return Ok(Claim::Busy(format!(
-                    "already reserved by holder PID {}",
-                    holder.split_whitespace().next().unwrap_or("<unknown>")
-                )));
-            }
-            return Err(format!("flock {}: {error}", path.display()));
-        }
-        // The lock file stays on disk forever; never unlink an active inode.
-        // Loosen files created under a restrictive umask for other HOME/users.
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
-        file.set_len(0).map_err(|e| e.to_string())?;
-        file.seek(std::io::SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-        writeln!(file, "{} {}", std::process::id(), device.bdf).map_err(|e| e.to_string())?;
-        file.flush().map_err(|e| e.to_string())?;
-        eprintln!("[gpu-lock] reserved {}", path.display());
-        self.held.push((identity, file));
-        Ok(Claim::Claimed)
-    }
-
-    /// Reserve every card in `devices`, sorted by identity; any busy card
-    /// fails the whole set (held descriptors close on process exit).
-    fn claim_all(&mut self, devices: &[GpuDevice]) -> Result<(), String> {
-        let mut sorted = devices.iter().collect::<Vec<_>>();
-        sorted.sort_by_key(|device| device.lock_identity());
-        for device in sorted {
-            if let Claim::Busy(holder) = self.try_claim(device)? {
-                return Err(format!(
-                    "GPU {} (PCI {}) {holder}",
-                    device.lock_identity(),
-                    device.bdf
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn write_pid_file(&self) -> Result<(), String> {
-        if self.held.is_empty() {
-            return Err("no visible GPUs to reserve".into());
-        }
-        let mut identities = self.held.iter().map(|(identity, _)| identity.as_str()).collect::<Vec<_>>();
-        identities.sort_unstable();
-        let home = std::env::var("HOME").map_err(|e| format!("HOME: {e}"))?;
-        let hipfire_dir = Path::new(&home).join(".hipfire");
-        std::fs::create_dir_all(&hipfire_dir).map_err(|e| e.to_string())?;
-        let pid_path = hipfire_dir.join(format!("daemon-{}.pid", identities.join("_")));
-        std::fs::write(&pid_path, format!("{}\n", std::process::id()))
-            .map_err(|e| format!("write {}: {e}", pid_path.display()))
-    }
-}
-
-#[cfg(not(unix))]
-struct GpuLocks;
-
-#[cfg(not(unix))]
-impl GpuLocks {
-    fn open() -> Result<Self, String> {
-        Err("per-GPU locking requires Unix flock; refusing to run unlocked".into())
-    }
-    fn try_claim(&mut self, _: &GpuDevice) -> Result<Claim, String> {
-        unreachable!("GpuLocks::open fails on non-Unix hosts")
-    }
-    fn claim_all(&mut self, _: &[GpuDevice]) -> Result<(), String> {
-        unreachable!("GpuLocks::open fails on non-Unix hosts")
-    }
-    fn write_pid_file(&self) -> Result<(), String> {
-        unreachable!("GpuLocks::open fails on non-Unix hosts")
-    }
-}
-
-/// Query what HIP exposes: one entry per logical device.
-fn observe_hip_devices() -> Result<Vec<ObservedDevice>, String> {
+/// Query what HIP exposes: one entry per logical device. The UUID is read
+/// only where identity comes from HIP rather than the KFD topology.
+fn observe_hip_devices(with_uuid: bool) -> Result<Vec<ObservedDevice>, String> {
     let hip = hip_bridge::HipRuntime::load().map_err(|e| e.to_string())?;
     let count = hip.device_count().map_err(|e| e.to_string())?;
     if count < 1 {
@@ -550,6 +396,9 @@ fn observe_hip_devices() -> Result<Vec<ObservedDevice>, String> {
                 logical: id as usize,
                 arch: hip.get_arch(id).map_err(|e| e.to_string())?,
                 pci_bus_id: hip.device_pci_bus_id(id).map_err(|e| e.to_string())?,
+                uuid: with_uuid
+                    .then(|| hip.device_uuid(id).map_err(|e| e.to_string()))
+                    .transpose()?,
             })
         })
         .collect()
@@ -561,9 +410,14 @@ fn observe_hip_devices() -> Result<Vec<ObservedDevice>, String> {
 /// `hardware.devices` already reserved its cards while resolving; here each
 /// logical device must be exactly the resolved card (arch and PCI bus ID).
 /// Without it (raw inherited filters or none), the HIP-visible cards are
-/// identified by PCI address in the KFD topology and reserved all-or-nothing.
+/// identified — by PCI address in the KFD topology on native Linux, from HIP
+/// UUID and PCI address on WSL2/ROCDXG and native Windows — and reserved
+/// all-or-nothing.
 fn reserve_and_verify_gpus(locks: &mut GpuLocks) -> Result<(), String> {
-    let observed = observe_hip_devices()?;
+    use hipfire_config::devices::{DeviceRoot, IdentitySource};
+    let root = DeviceRoot::system();
+    let source = root.identity_source();
+    let observed = observe_hip_devices(source == IdentitySource::Hip)?;
     if let Some(active) = hipfire_config::devices::active_devices() {
         active.verify_visible(&observed)?;
         for (seen, device) in observed.iter().zip(&active.devices) {
@@ -578,32 +432,15 @@ fn reserve_and_verify_gpus(locks: &mut GpuLocks) -> Result<(), String> {
             );
         }
     } else {
-        let topology = hipfire_config::devices::enumerate_gpus(Path::new(
-            hipfire_config::devices::KFD_TOPOLOGY_NODES,
-        ))
-        .map_err(|e| e.to_string())?;
-        let devices = observed
-            .iter()
-            .map(|seen| {
-                let bdf = hipfire_config::devices::PciBdf::parse(&seen.pci_bus_id);
-                topology
-                    .iter()
-                    .find(|device| Some(device.bdf) == bdf)
-                    .cloned()
-                    .ok_or_else(|| {
-                        format!(
-                            "HIP logical device {} (PCI {}) is not in the KFD topology\n{}",
-                            seen.logical,
-                            seen.pci_bus_id,
-                            hipfire_config::devices::device_table(&topology)
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let devices = hipfire_config::devices::identify_observed(&root, &observed)?;
         locks.claim_all(&devices)?;
+        let source = match source {
+            IdentitySource::Kfd => "",
+            IdentitySource::Hip => " (identity from HIP: no KFD topology)",
+        };
         for (seen, device) in observed.iter().zip(&devices) {
             eprintln!(
-                "[devices] logical {}: HIP {} {} = index {} {}",
+                "[devices] logical {}: HIP {} {} = index {} {}{source}",
                 seen.logical,
                 seen.arch,
                 seen.pci_bus_id,
@@ -651,6 +488,62 @@ fn write_typed_error(
         retryable,
         rolled_back,
     );
+}
+
+/// The request's wire `seed`, or `None` after refusing an out-of-domain one
+/// (negative, fractional, non-numeric) with a typed `validation` error — a
+/// client fault, never an `internal` one.
+/// Report a batch drive result; a poisoned (unattested) drive retires the
+/// scheduler until unload/reload. Checked teardown: reset_all was already
+/// attempted in fail_all.
+fn apply_batch_drive_result(
+    res: Result<(), BatchDriveError>,
+    tag: &str,
+    batch_scheduler: &mut Option<ContinuousBatchScheduler>,
+    continuous_batch_size: &mut usize,
+    batch_poisoned: &mut Option<String>,
+) {
+    match res {
+        Ok(()) => {}
+        Err(BatchDriveError::Gpu(e)) => eprintln!("{tag} drive failed (attested): {e}"),
+        Err(BatchDriveError::Poisoned(e)) => {
+            eprintln!("{tag} drive poisoned (unattested): {e} — generation poisoned until unload/reload");
+            *batch_scheduler = None;
+            *continuous_batch_size = 1;
+            *batch_poisoned = Some(e);
+            batch_clear_all_terminals();
+        }
+    }
+}
+
+fn client_seed_or_refuse(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    seed: Option<&serde_json::Value>,
+) -> Option<Option<u64>> {
+    match parse_wire_seed(seed) {
+        Ok(seed) => Some(seed),
+        Err(reason) => {
+            write_typed_error(stdout, id, &reason, "validation", false, false);
+            None
+        }
+    }
+}
+
+/// Refuse an image sent to a model with no vision encoder: the client asked
+/// for a capability this load lacks (`unsupported`), not a server fault.
+fn refuse_image_without_vision(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    vision_gated_off: Option<&str>,
+) {
+    let message = match vision_gated_off {
+        Some(sidecar) => format!(
+            "model has no vision encoder loaded: vision_mode is off and the tower sidecar {sidecar} was skipped; run `hipfire config set vision_mode auto` (or `on`) and reload"
+        ),
+        None => "model has no vision encoder".to_owned(),
+    };
+    write_typed_error(stdout, id, &message, "unsupported", false, false);
 }
 
 /// Resident KV backend metadata for `loaded` ACK and `diag`.
@@ -723,7 +616,6 @@ impl ResidentKvDiag {
     }
 }
 
-
 /// Pure gate for the deferred EP (tp>1) load handoff.
 ///
 /// After a new EP model is constructed, the prior model is unloaded. The new
@@ -755,6 +647,18 @@ fn ep_deferred_handoff_error_message(prior_err: &str, rollback_err: Option<&str>
 /// occupies `model` — that path tears down after successful new load.
 fn ep_deferred_needs_vmm_preflight(load_tp: usize, model_present: bool) -> bool {
     load_tp > 1 && !model_present
+}
+
+/// Suffix for an admitted-load failure. Single-device/pp loads are
+/// unload-first, so after admission the prior model is already retired and a
+/// construction or staging failure leaves `model=None`; say so explicitly.
+/// A deferred tp>1 load keeps its prior model and gets no suffix.
+fn no_model_loaded_suffix(model_present: bool) -> &'static str {
+    if model_present {
+        ""
+    } else {
+        "; no model loaded (the prior model was unloaded before this load)"
+    }
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -867,10 +771,20 @@ fn install_process_config(
 /// Read the first protocol message before GPU initialization. Native clients
 /// send `configure`; older/direct clients may send `load`, in which case the
 /// daemon resolves local TOML plus compatibility env itself and preserves the
-/// load as the first regular command.
+/// load as the first regular command. Also returns the model the client
+/// starts the daemon for, if it names one: `configure`'s optional `model`, or
+/// the startup `load`'s.
 fn receive_startup_config(
     stdout: &mut impl Write,
-) -> Result<Option<(hipfire_config::ProcessConfig, Option<DaemonMsg>, bool)>, String> {
+) -> Result<
+    Option<(
+        hipfire_config::ProcessConfig,
+        Option<DaemonMsg>,
+        bool,
+        Option<std::path::PathBuf>,
+    )>,
+    String,
+> {
     let stdin = std::io::stdin();
     let mut lock = stdin.lock();
     let mut line = String::new();
@@ -901,6 +815,10 @@ fn receive_startup_config(
                 continue;
             }
         };
+        let model = msg
+            .get("model")
+            .and_then(|value| value.as_str())
+            .map(std::path::PathBuf::from);
         if msg.get("type").and_then(|value| value.as_str()) == Some("configure") {
             let config = serde_json::from_value::<hipfire_config::ProcessConfig>(
                 msg.get("config")
@@ -909,8 +827,9 @@ fn receive_startup_config(
             )
             .map_err(|error| format!("invalid process configuration: {error}"))?;
             config.validate().map_err(|error| error.to_string())?;
-            return Ok(Some((config, None, true)));
+            return Ok(Some((config, None, true, model)));
         }
+        let model = model.filter(|_| msg.get("type").and_then(|value| value.as_str()) == Some("load"));
         let config =
             hipfire_config::load_local_process_config().map_err(|error| error.to_string())?;
         let pending = match announce_generate_terminal(&msg) {
@@ -931,7 +850,7 @@ fn receive_startup_config(
             }
             None => DaemonMsg::Regular(msg),
         };
-        return Ok(Some((config, Some(pending), false)));
+        return Ok(Some((config, Some(pending), false, model)));
     }
 }
 
@@ -1038,7 +957,7 @@ fn main() {
     // context is created.
 
     let mut stdout = std::io::stdout();
-    let Some((process_config, pending_message, acknowledge_config)) =
+    let Some((process_config, pending_message, acknowledge_config, startup_model)) =
         receive_startup_config(&mut stdout).unwrap_or_else(|error| {
             eprintln!("FATAL: failed to resolve startup configuration: {error}");
             std::process::exit(1);
@@ -1046,7 +965,7 @@ fn main() {
     else {
         return;
     };
-    let mut gpu_locks = GpuLocks::open().unwrap_or_else(|error| {
+    let (weight_host, mut gpu_locks) = weight_host_tenant::open_locks().unwrap_or_else(|error| {
         eprintln!("FATAL: {error}");
         std::process::exit(1);
     });
@@ -1055,10 +974,27 @@ fn main() {
             eprintln!("FATAL: failed to install process configuration: {error}");
             std::process::exit(1);
         });
+    // The model the client starts this daemon for decides the host-memory
+    // switches the HIP runtime reads once, when it first loads just below.
+    if let Some(model) = &startup_model {
+        hipfire_loader::prepare_host_memory_for(model);
+    }
     reserve_and_verify_gpus(&mut gpu_locks).unwrap_or_else(|error| {
         eprintln!("FATAL: {error}");
         std::process::exit(1);
     });
+    // Uncertified driver models (WSL2/ROCDXG, native Windows) refuse an
+    // explicit Redline backend outright; the per-load default falls back to
+    // the HIP graph instead (load handler).
+    if let Some(refusal) = hipfire_config::devices::redline_platform_refusal() {
+        let backend = hipfire_config::process_value("HIPFIRE_REPLAY_BACKEND")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if matches!(backend.as_str(), "redline" | "shadow") {
+            eprintln!("FATAL: replay.backend={backend} refused: {refusal}");
+            std::process::exit(1);
+        }
+    }
     if acknowledge_config {
         writeln!(
             stdout,
@@ -1112,6 +1048,8 @@ fn main() {
     let mut continuous_batch_size: usize = 1;
     let mut batch_scheduler: Option<ContinuousBatchScheduler> = None;
     let mut batch_poisoned: Option<String> = None;
+    // VMM batch route params, set only when the model staged `vmm_store`; None => flag-off routes.
+    let mut vmm_batch: Option<hipfire_engine::scheduler::VmmBatchParams> = None;
     // Experimental multi-slot backend: alternate model owner (one SlotEngine/weight set).
     // None => ordinary LoadedModel path. Continuous-batching integration is deferred.
     // Arc allows request workers to hold the model alive only while active; reset/unload/swap refuse while active.
@@ -1120,7 +1058,6 @@ fn main() {
     // unload and empty handoff; preserved when a replacement fails and the prior
     // resident remains loaded.
     let mut resident_kv: Option<ResidentKvDiag> = None;
-
 
     // Background stdin reader. Drains stdin into an mpsc channel so
     // the main loop can pull non-blockingly between messages. Abort /
@@ -1132,6 +1069,7 @@ fn main() {
     // even read the abort line until after the prefill completed.
     let (msg_tx, msg_rx) = mpsc::channel::<DaemonMsg>();
     if let Some(message) = pending_message {
+        hipfire_engine::scheduler::note_daemon_msg_queued(&message);
         let _ = msg_tx.send(message);
     }
     std::thread::spawn(move || {
@@ -1160,10 +1098,6 @@ fn main() {
                                 attempt_id,
                                 command = kind,
                                 "daemon control command received"
-                            );
-                            eprintln!(
-                                "[daemon-control] received {} for id={} attempt_id={}",
-                                kind, id, attempt_id
                             );
                             apply_terminal_control(kind, id, attempt_id);
                             batch_apply_terminal_control(kind, id, attempt_id);
@@ -1199,6 +1133,7 @@ fn main() {
                         None => DaemonMsg::Regular(msg),
                     };
 
+                    hipfire_engine::scheduler::note_daemon_msg_queued(&queued);
                     if msg_tx.send(queued).is_err() {
                         break;
                     }
@@ -1240,6 +1175,11 @@ fn main() {
         };
 
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let idle = !batch_scheduler.as_ref().is_some_and(|s| s.active_count() > 0);
+        let quiet = weight_host.is_some() && idle && !matches!(msg_type, "ping" | "diag");
+        if quiet && weight_host_tenant::reconcile_lease(&mut model, &mut gpu) {
+            (resident_kv, batch_scheduler, vmm_batch, continuous_batch_size) = (None, None, None, 1);
+        }
         let request_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
         let command_span = tracing::info_span!(
             "daemon_command",
@@ -1262,6 +1202,11 @@ fn main() {
                 let _ = stdout.flush();
             }
             "load" => {
+                if let Some(refusal) = weight_host_tenant::load_refusal(weight_host.is_some(), &msg) {
+                    emit_uncorrelated_error(&mut stdout, None, &refusal, "validation", false, false);
+                    let _ = stdout.flush();
+                    continue;
+                }
                 // FIX #1 (transactional EP load): the unload of the prior model
                 // is deferred for the EP (tp>1) path until AFTER the new load
                 // succeeds, so a partial EP load failure leaves the prior model
@@ -1276,6 +1221,7 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1) as usize;
                 let parsed_continuous_batch_size = parse_continuous_batch_size(msg.get("params"));
+                let parsed_vmm_batch = hipfire_engine::scheduler::parse_vmm_batch_params(msg.get("params"));
                 let experimental_multi_slot = msg
                     .get("params")
                     .and_then(|p| p.get("experimental_multi_slot"))
@@ -1300,7 +1246,7 @@ fn main() {
                 if experimental_multi_slot {
                     // Experimental slot backend is an alternate model owner, not a batch-mode switch.
                     // Validate mutually exclusive knobs before any GPU work.
-                    if let Some(err) = slots::validate_load_caps(&msg) {
+                    if let Some(err) = slots::validate_load_caps(&msg, &gpu.arch) {
                         emit_uncorrelated_error(
                             &mut stdout,
                             None,
@@ -1426,6 +1372,7 @@ fn main() {
                     batch_scheduler = None;
                     continuous_batch_size = 1;
                     batch_poisoned = None;
+                    vmm_batch = None;
 
                     let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
                     if path.is_empty() {
@@ -1472,6 +1419,7 @@ fn main() {
                         cap_tokens,
                         prefill_chunk,
                         slot_params.mtp_k,
+                        slot_params.mtp_mode,
                         &slot_params.kv_mode_raw,
                         &slot_params.kv_backend,
                         slot_params.dflash_draft,
@@ -1754,12 +1702,12 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .unwrap_or(&hipfire_runtime::config::get().mtp_mode)
                     .to_string();
-                let mtp_k: usize = msg
+                let mtp_k: Option<usize> = msg
                     .get("params")
                     .and_then(|p| p.get("mtp_k"))
                     .and_then(|v| v.as_u64())
                     .map(|value| value as usize)
-                    .unwrap_or(hipfire_runtime::config::get().mtp_k);
+                    .or(hipfire_runtime::config::get().mtp_k);
                 let mtp_path = request_guards::mtp_sidecar_path(&msg, &mtp_mode);
 
                 // DFlash adaptive verify-block (opt-in, default off): clamp(ceil(τ̂)+2,
@@ -1771,6 +1719,15 @@ fn main() {
                     .and_then(|p| p.get("dflash_adaptive_b"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+
+                let Some(dflash_block) = request_guards::dflash_block(
+                    &mut stdout,
+                    &msg,
+                    parsed_vmm_batch.is_some(),
+                    parsed_continuous_batch_size,
+                ) else {
+                    continue;
+                };
 
                 // Model-free n-gram policy normally arrives as per-load params
                 // resolved by the CLI. Direct protocol clients inherit the
@@ -1813,29 +1770,18 @@ fn main() {
                         .get("params")
                         .and_then(|p| p.get("dspark_mode"))
                         .and_then(|v| v.as_str())
-                        .and_then(|s| match s {
-                            "on" => Some(true),
-                            "off" => Some(false),
-                            _ => None, // "auto" → loader default
-                        }),
+                        .and_then(hipfire_config::parse_tri_state),
                     dspark_conf_threshold: msg
                         .get("params")
                         .and_then(|p| p.get("dspark_conf_threshold"))
                         .and_then(|v| v.as_f64())
                         .map(|t| t as f32),
                     // DFlash mirrors mtp: on = fail closed on a missing/unloadable draft.
-                    dflash: match dflash_mode {
-                        "on" => Some(true),
-                        "off" => Some(false),
-                        _ => None, // "auto" → loader default
-                    },
-                    mtp: match mtp_mode.as_str() {
-                        "on" => Some(true),
-                        "off" => Some(false),
-                        _ => None, // "auto" → loader default
-                    },
-                    mtp_k: Some(mtp_k),
+                    dflash: hipfire_config::parse_tri_state(dflash_mode),
+                    mtp: hipfire_config::parse_tri_state(&mtp_mode),
+                    mtp_k,
                     dflash_adaptive_b: Some(adaptive_b),
+                    dflash_block: Some(dflash_block),
                 };
 
                 // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
@@ -2179,7 +2125,7 @@ fn main() {
                         cask: Some(&cask),
                         deepseek4_heterogeneous: !matches!(deepseek4_compute_placement, hipfire_config::Deepseek4ComputePlacement::Single),
                         vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
-                        free_vram_bytes: gpu.hip.get_vram_info().ok().map(|(free, _)| free),
+                        free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
                         qwen_default_q8: hipfire_loader::admission::qwen_default_q8_enabled(),
                     },
                     qwen4_admission_options,
@@ -2194,8 +2140,11 @@ fn main() {
                         continue;
                     }
                 };
-                let defer_prior_unload =
-                    load_tp > 1 || hipfire_loader::defers_prior_unload(admission.arch_id);
+                // Only tp>1 EP loads defer prior retirement. Every single-device
+                // or pp load (Qwen4/Flash-Next included) is unload-first: after
+                // admission the prior model is torn down and VMM must be clean
+                // before construction, so a later failure leaves no model.
+                let defer_prior_unload = load_tp > 1;
                 let max_seq = admission.max_seq;
                 let sequence_reason = admission.sequence_reason;
                 // Exactly one legacy warning per admitted trunk; loader admitted
@@ -2281,6 +2230,8 @@ fn main() {
                         kv_k_override.as_deref(),
                         kv_v_override.as_deref(),
                         state_quant_override.as_deref(),
+                        mtp_path.as_deref(),
+                        spec_cfg,
                     )
                 } else {
                     hipfire_loader::load_admitted_with_gemma4_drafter(
@@ -2295,7 +2246,6 @@ fn main() {
                         mtp_path.as_deref(),
                         kv_mode_override.as_deref(),
                         kv_k_override.as_deref(),
-                        kv_v_override.as_deref(),
                         kv_adaptive_override.as_deref(),
                         state_quant_override.as_deref(),
                         &cask,
@@ -2339,9 +2289,12 @@ fn main() {
                             arch,
                             path,
                             pp,
-                            tp,
+                            tp, hipfire_loader::admission::effective_ep(m.arch_id),
                             drafter.is_some(),
-                        );
+                        ) && hipfire_config::devices::redline_platform_refusal().map_or(true, |refusal| {
+                            eprintln!("[redline] retained default refused: {refusal}; using the HIP graph");
+                            false
+                        });
                         if gpu.replay.configure_model_default(redline_default) && redline_default {
                             eprintln!(
                                 "[redline] enabling fail-closed retained default on {} \
@@ -2368,9 +2321,9 @@ fn main() {
                         let vl = m.has_vision_encoder();
                         let (dim, layers, vocab) = m.ack_dims();
 
-                        // Apply MTP config from load-message params.
+                        // MTP config from load params; `None` (auto) keeps the carrier-resolved K (Qwen4 native MTP) else the skeleton MTP_K_DEFAULT.
                         m.mtp_mode = mtp_mode;
-                        m.mtp_k = mtp_k;
+                        m.mtp_k = mtp_k.unwrap_or(m.mtp_k);
                         // Detect whether MTP weights are present in the loaded
                         // model. Used by mtp_mode=auto to decide whether to
                         // enable spec-decode at generate time. Three sources:
@@ -2438,6 +2391,7 @@ fn main() {
                             &mut m,
                             &mut gpu,
                             parsed_continuous_batch_size,
+                            hipfire_generate::batch::vmm_staging_request(parsed_vmm_batch),
                         ) {
                             Ok(staging) => staging,
                             Err(stage_err) => {
@@ -2455,8 +2409,9 @@ fn main() {
                                     Err(e) => Some(e),
                                 };
                                 let mut msg = format!(
-                                    "load failed: continuous batch staging failed: {stage_err}. GPU: {} ({free_mb} MB free / {total_mb} MB total)",
-                                    gpu.arch
+                                    "load failed: continuous batch staging failed: {stage_err}. GPU: {} ({free_mb} MB free / {total_mb} MB total){}",
+                                    gpu.arch,
+                                    no_model_loaded_suffix(model.is_some())
                                 );
                                 if let Some(rb) = rollback_err {
                                     msg.push_str(&format!(
@@ -2479,7 +2434,7 @@ fn main() {
                         // the new model is fully staged — NOW retire the
                         // prior model before publishing. Single-GPU/pp models
                         // are unloaded eagerly above; this branch handles
-                        // deferred TP or Qwen4 loads. Prior PFlash drafter is
+                        // deferred tp>1 EP loads. Prior PFlash drafter is
                         // part of that prior model, so tear it down first in
                         // the same drafter-before-unload order used elsewhere.
                         //
@@ -2544,13 +2499,15 @@ fn main() {
                             1
                         };
                         batch_scheduler = staged_batch_scheduler;
+                        vmm_batch = if staging.vmm { parsed_vmm_batch } else { None };
                         // `cache_capable` is the daemon's prompt-cache source of truth.
-                        // arch_id 13 (gemma4) is intentionally ABSENT: hipfire_generate::dense::generate_gemma4 has
-                        // no LCP prefix-cache block and always cold-prefills the full
-                        // Jinja-rendered prompt. Enabling the cache would corrupt KV
-                        // slot offsets after turn 1 (stale prefix reuse). Wire when
-                        // hipfire_generate::dense::generate_gemma4 gains an LCP block matching other archs.
-                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10 | 12 | 14);
+                        // Gemma 4 (13) and Qwen4 (16) only with their attached
+                        // session cache (`ArchModel::session_cache_attached`).
+                        let cache_capable = match m.arch_id {
+                            5 | 6 | 9 | 10 | 12 | 14 => true,
+                            13 | 16 => m.state.as_deref().is_some_and(|state| state.session_cache_attached()),
+                            _ => false,
+                        };
                         let retry_reset_eligible = model_retry_reset_eligible(m.arch_id);
                         let continuous_batch_capable = staged_batch_capable;
                         let reasoning_contract = hipfire_loader::carrier_for(m.arch_id)
@@ -2616,8 +2573,7 @@ fn main() {
                                 serde_json::to_string(&card_cap).unwrap(), seq_kv,
                             );
                         } else {
-                            let _ = writeln!(
-                                stdout,
+                            let ack = format!(
                                 r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
@@ -2638,6 +2594,10 @@ fn main() {
                                 max_seq, seq_bound, seq_reason_json, serde_json::to_string(&model_ctx).unwrap(),
                                 serde_json::to_string(&card_cap).unwrap(), seq_kv,
                             );
+                            let ack = hipfire_generate::batch::vmm_loaded_ack(
+                                ack, &mut m, vmm_batch, staging.slots, staging.row_budget, &gpu,
+                            );
+                            let _ = writeln!(stdout, "{ack}");
                         }
                         // ── PFlash drafter load (Phase 4.0) ──────────────
                         //
@@ -2780,8 +2740,9 @@ fn main() {
                             &mut stdout,
                             None,
                             &format!(
-                                "load failed: {e}. GPU: {} ({free_mb} MB free / {total_mb} MB total)",
-                                gpu.arch
+                                "load failed: {e}. GPU: {} ({free_mb} MB free / {total_mb} MB total){}",
+                                gpu.arch,
+                                no_model_loaded_suffix(model.is_some())
                             ),
                             "gpu",
                             false,
@@ -2831,6 +2792,32 @@ fn main() {
                         continue;
                     }
                 };
+                // An embedding checkpoint has no generation route: its carrier
+                // answers only `embed`. Refuse here — AFTER attempt_id and the
+                // admission token are bound, so the refusal is a keyed
+                // `emit_batch_admission_error` the caller's pending entry
+                // routes (an attempt-0 uncorrelated error would land on a
+                // channel no generate caller waits on and the request would
+                // hang). The mirror of `embed`'s refusal and of
+                // `img_generate`'s non-diffusion refusal below; reaching the
+                // generic body instead downcasts the wrong bundle and panics.
+                if model
+                    .as_ref()
+                    .is_some_and(|m| !hipfire_loader::wire_verb(m.arch_id).is_generate())
+                {
+                    emit_batch_admission_error(
+                        &mut stdout,
+                        id,
+                        gen_attempt_id,
+                        admission,
+                        "generate refused: the loaded model is a qwen3.5 embedding checkpoint — use the `embed` verb",
+                        "validation",
+                        false,
+                        false,
+                    );
+                    continue;
+                }
+
                 #[cfg(feature = "serve-fault-inject")]
                 let _fault_guard =
                     hipfire_generate::common::RequestFaultGuard::arm_from_request(&msg);
@@ -3033,53 +3020,23 @@ fn main() {
                     },
                     None => None,
                 };
+                // Each message's content is normalized like `prompt` (shared
+                // with the VMM batch admission so both render identical bytes).
                 let messages_history: Option<Vec<hipfire_runtime::prompt_frame::Message>> =
-                    match msg.get("messages") {
-                        Some(v) => match serde_json::from_value::<
-                            Vec<hipfire_runtime::prompt_frame::Message>,
-                        >(v.clone())
-                        {
-                            Ok(mut m) => {
-                                // Apply the same normalization to each message's
-                                // content that the daemon applies to `prompt` at
-                                // line 1384 (`maybe_normalize_prompt`: strip
-                                // trailing whitespace before `\n`, collapse 3+
-                                // newlines to 2, etc.). Without this, turn N's
-                                // `prompt`-encoded user tokens diverge from turn
-                                // N+1's `messages[].content`-encoded history
-                                // tokens, breaking the LCP cache on any prompt
-                                // whose raw text has trailing whitespace or
-                                // run-of-newlines patterns.
-                                for entry in &mut m {
-                                    if !entry.content.is_empty() {
-                                        let normalized =
-                                            hipfire_runtime::tokenizer::maybe_normalize_prompt(
-                                                &entry.content,
-                                            );
-                                        if matches!(normalized, std::borrow::Cow::Owned(_)) {
-                                            entry.content = normalized.into_owned();
-                                        }
-                                    }
-                                }
-                                Some(m)
-                            }
-                            Err(e) => {
-                                hipfire_generate::dense::emit_active_attempt_error(
-                                    &mut stdout,
-                                    Some(id),
-                                    &format!(
-                                        "invalid messages field: {}",
-                                        e.to_string().replace('"', "'"),
-                                    ),
-                                    "validation",
-                                    false,
-                                    false,
-                                );
-                                let _ = stdout.flush();
-                                continue;
-                            }
-                        },
-                        None => None,
+                    match hipfire_engine::prompt::parse_generate_messages(&msg) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            hipfire_generate::dense::emit_active_attempt_error(
+                                &mut stdout,
+                                Some(id),
+                                &format!("invalid messages field: {}", e.replace('"', "'")),
+                                "validation",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
                     };
                 // OpenAI `stop` (string or array form); an invalid value is rejected.
                 let Some(stop_seqs) = hipfire_generate::ar::stop_or_reject(&mut stdout, id, &msg)
@@ -3087,48 +3044,29 @@ fn main() {
                     continue;
                 };
 
-                // Sampling defaults differ by arch: qwen35 family was tuned
-                // at `temp=0.3, top_p=0.8` (DFlash-friendly, instruct-stable);
-                // DeepSeek V4 Flash's HF card recommends `temp=1.0, top_p=1.0`
-                // for local deployment, and lower values consistently fall
-                // into block-level attractors on this quantized instruct
-                // model. Pick arch-shaped defaults so a vanilla
-                // `/v1/chat/completions` POST (no sampling fields) works on
-                // both. Explicit per-request values still override either.
-                // Hardcoded arch ladder — the LAST-RESORT fallback for the
-                // sampling defaults. The author-recommended values baked into
-                // the .hfq `generation_config` (m.rec_temperature/m.rec_top_p,
-                // populated at load time via HfqFile::recommended_sampling) take
-                // precedence over this ladder; an explicit per-request field
-                // (set below via `msg.get(...)`) overrides both. The CLI's
-                // curated registry `recommended_settings` reach this handler as
-                // explicit request fields (CLI explicit-send guard), so they sit
-                // above the .hfq layer on that path.
+                // Sampling defaults (shared with the batch and multi-slot
+                // routes via `resolve_temp_top_p`): explicit request field >
+                // the .hfq-baked author recommendation (m.rec_temperature /
+                // m.rec_top_p, from HfqFile::recommended_sampling) > the
+                // carrier's arch ladder (qwen35 `temp=0.3, top_p=0.8`;
+                // DeepSeek V4 Flash `1.0/1.0`). The CLI's curated registry
+                // `recommended_settings` reach this handler as explicit
+                // request fields (CLI explicit-send guard).
                 let defaults = hipfire_loader::carrier_for(m.arch_id)
                     .map(|c| c.sampling_defaults())
                     .unwrap_or_default();
-                let (arch_default_temp, arch_default_top_p) = (defaults.temp, defaults.top_p);
-                // Layer the .hfq-baked author recommendation OVER the arch
-                // ladder. Per-knob: a model that bakes only `temperature` still
-                // gets the arch-ladder `top_p`.
-                let default_temp = m
-                    .rec_temperature
-                    .map(|x| x as f64)
-                    .unwrap_or(arch_default_temp);
-                let default_top_p = m.rec_top_p.map(|x| x as f64).unwrap_or(arch_default_top_p);
-                let temp = msg
-                    .get("temperature")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(default_temp) as f32;
+                let (temp, top_p) = hipfire_engine::scheduler::resolve_temp_top_p(
+                    &msg,
+                    m.arch_id,
+                    m.rec_temperature,
+                    m.rec_top_p,
+                );
                 let max_tokens = msg
                     .get("max_tokens")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(4096) as usize;
+                    .map(|v| v as usize)
+                    .unwrap_or(hipfire_engine::scheduler::DEFAULT_GENERATE_MAX_TOKENS);
                 let _fit = request_guards::fit_max_tokens(&msg);
-                let top_p = msg
-                    .get("top_p")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(default_top_p) as f32;
                 // CACTUS acceptance-boost δ — OPT-IN (request `cactus_delta`), 0.0
                 // default = lossless/distribution-preserving. >0 is deliberately lossy
                 // (higher acceptance τ, KL-bounded distortion) and applies only to a
@@ -3285,14 +3223,15 @@ fn main() {
                 // new clients send `thinking_enabled` as authority and keep
                 // `max_think_tokens` independent.
                 //
-                // When the cap is reached the daemon force-emits "</think>\n"
-                // through the same KV-write + sample path as a normal token,
-                // closing the thinking block so the model commits to an
-                // answer with the remaining max_tokens budget. Caught by
-                // Codex stop-time review on 2026-04-28: the field had been
-                // shipping in genParams since cli/index.ts but the daemon
-                // was silently ignoring it, making the new reasoning.effort
-                // / enable_thinking knobs no-ops on the wire.
+                // When the cap is reached the generate path splices a think
+                // close through the same KV-write + commit path as a sampled
+                // token, and the model answers with the remaining max_tokens
+                // budget. Qwen4 (AR and MTP) splices the template's own
+                // "\n</think>\n\n"; the Qwen3.5 AR/DFlash loops splice
+                // `HIPFIRE_THINK_CONTINUATION` (default "</think>\n\n"); the
+                // multi-slot engine masks to the close instead. The Qwen3.5
+                // dense-TP and MoE-EP producers still fail the request
+                // ("think token budget exceeded").
                 let max_think_tokens = msg
                     .get("max_think_tokens")
                     .and_then(|v| v.as_u64())
@@ -3331,16 +3270,7 @@ fn main() {
                     batch_scope.rebind_for(gen_attempt_id);
                 }
                 if has_image && !has_vl {
-                    match vision_gated_off.as_deref() {
-                        Some(sidecar) => write_error(
-                            &mut stdout,
-                            id,
-                            &format!(
-                                "model has no vision encoder loaded: vision_mode is off and the tower sidecar {sidecar} was skipped; run `hipfire config set vision_mode auto` (or `on`) and reload"
-                            ),
-                        ),
-                        None => write_error(&mut stdout, id, "model has no vision encoder"),
-                    }
+                    refuse_image_without_vision(&mut stdout, id, vision_gated_off.as_deref());
                 } else if has_image && has_vl {
                     // DEFENSIVE: VL is single-image, single-turn only. The
                     // CLI rejects images in non-last turns, but a raw
@@ -3457,13 +3387,16 @@ fn main() {
                     }
                     let source = if let Some(b64) = image_base64 {
                         if b64.len() > MAX_BASE64_ENCODED_LEN {
-                            write_error(
+                            write_typed_error(
                                 &mut stdout,
                                 id,
                                 &format!(
                                     "image payload exceeds maximum encoded size ({} bytes)",
                                     MAX_BASE64_ENCODED_LEN,
                                 ),
+                                "validation",
+                                false,
+                                false,
                             );
                             continue;
                         }
@@ -3486,12 +3419,9 @@ fn main() {
                     // wire `seed` wins, else attempt key + counter entropy.
                     // Out-of-domain seeds (negative, fractional, non-numeric)
                     // are rejected — never silently treated as unseeded.
-                    let client_seed = match parse_wire_seed(msg.get("seed")) {
-                        Ok(s) => s,
-                        Err(reason) => {
-                            write_error(&mut stdout, id, &reason);
-                            continue;
-                        }
+                    let Some(client_seed) = client_seed_or_refuse(&mut stdout, id, msg.get("seed"))
+                    else {
+                        continue;
                     };
                     let vl_request_seed =
                         request_seed_for(&AttemptKey::new(id, gen_attempt_id), client_seed);
@@ -3711,17 +3641,11 @@ fn main() {
                             // Explicit wire `seed` must reach the lane RNG on
                             // the batched route too; out-of-domain values are
                             // rejected loudly, never silently unseeded.
-                            let client_seed = match parse_wire_seed(msg.get("seed")) {
-                                Ok(s) => s,
-                                Err(reason) => {
-                                    write_error(&mut stdout, id, &reason);
-                                    batch_clear_terminal_at_generation(
-                                        id,
-                                        gen_attempt_id,
-                                        admission,
-                                    );
-                                    continue;
-                                }
+                            let Some(client_seed) =
+                                client_seed_or_refuse(&mut stdout, id, msg.get("seed"))
+                            else {
+                                batch_clear_terminal_at_generation(id, gen_attempt_id, admission);
+                                continue;
                             };
                             let pending = BatchPendingRequest {
                                 key: AttemptKey::new(id, gen_attempt_id),
@@ -3762,20 +3686,7 @@ fn main() {
                                     &mut stdout,
                                     &mut inbox,
                                 );
-                                match drive_res {
-                                    Ok(()) => {}
-                                    Err(BatchDriveError::Gpu(e)) => {
-                                        eprintln!("[batch][EP] drive failed (attested): {e}");
-                                    }
-                                    Err(BatchDriveError::Poisoned(e)) => {
-                                        eprintln!("[batch][EP] drive poisoned (unattested): {e} — generation poisoned until unload/reload");
-                                        // Checked teardown: reset_all already attempted in fail_all; poison scheduler.
-                                        batch_scheduler = None;
-                                        continuous_batch_size = 1;
-                                        batch_poisoned = Some(e);
-                                        batch_clear_all_terminals();
-                                    }
-                                }
+                                apply_batch_drive_result(drive_res, "[batch][EP]", &mut batch_scheduler, &mut continuous_batch_size, &mut batch_poisoned);
                             }
                             continue;
                         }
@@ -3785,13 +3696,14 @@ fn main() {
                     // falls through to the sequential path below instead of
                     // failing closed. The batch route above still wins when
                     // staged and requested with `serve_continuous_batch`.
-                    let batch_eligible = if !singleton_handoff && batch_scheduler.is_some() {
-                        is_batch_request_eligible(
-                            &msg,
-                            m,
-                            continuous_batch_size,
-                            serve_continuous_batch,
-                            pflash_active,
+                    let vmm_route = hipfire_generate::batch::vmm_route_active(vmm_batch, m);
+                    // Qwen4 batches only through its staged fn-lanes route.
+                    let qwen4_batch = hipfire_loader::continuous_batch_route(m.arch_id)
+                        == Some(hipfire_loader::ContinuousBatchRoute::Qwen4);
+                    let qwen4_lanes = qwen4_batch && vmm_route;
+                    let batch_eligible = if !singleton_handoff && batch_scheduler.is_some() && (!qwen4_batch || qwen4_lanes) {
+                        hipfire_generate::batch::batch_request_eligible_for_route(
+                            vmm_route, &msg, m, continuous_batch_size, serve_continuous_batch, pflash_active, &mut inbox,
                         )
                     } else {
                         false
@@ -3807,7 +3719,11 @@ fn main() {
                                 admission,
                             );
                             hipfire_generate::ar::emit_generation_start(
-                                hipfire_generate::ar::GenerationRoute::QwenAr,
+                                if qwen4_lanes {
+                                    hipfire_generate::ar::GenerationRoute::Qwen4Ar
+                                } else {
+                                    hipfire_generate::ar::GenerationRoute::QwenAr
+                                },
                                 &mut stdout,
                                 id,
                                 false,
@@ -3820,7 +3736,13 @@ fn main() {
                         // Render prompt once at admission and store tokens/started flag; do not render twice at lane assignment.
                         let prompt_owned =
                             batch_single_user_content(&msg).unwrap_or_else(|| prompt.to_string());
-                        let (prompt_tokens, started_in_think) = match batch_render_prompt_tokens(
+                        // Qwen4 lanes: the driver renders exactly at assignment (its own
+                        // template path, not the Qwen3.5 batch render); admission defers
+                        // prompt tokens and skips Qwen3.5 length/think validation.
+                        let render = if qwen4_lanes {
+                            Ok((Vec::new(), false))
+                        } else {
+                            batch_render_prompt_tokens(
                             &prompt_owned,
                             system,
                             assistant_prefix,
@@ -3830,7 +3752,8 @@ fn main() {
                             messages_history.as_deref(),
                             enable_thinking_jinja,
                             reasoning_effort_jinja.as_deref(),
-                        ) {
+                        ) };
+                        let (prompt_tokens, started_in_think) = match render {
                             Ok(v) => v,
                             Err(e) => {
                                 emit_batch_admission_error(
@@ -3846,18 +3769,30 @@ fn main() {
                                 continue;
                             }
                         };
-                        if started_in_think {
-                            // Rendered prompts that open a think span are sequential
-                            // barriers. Transfer any pre-latched abort exactly once
-                            // (transfer retires the batch entry and holds a tombstone until singleton cleanup).
+                        // VMM route: a sampled request with no batch lane in its singleton mode at
+                        // this prompt length takes the singleton route before enqueue announces it.
+                        let vmm_singleton_now = vmm_route
+                            && !hipfire_generate::batch::vmm_request_fits_batch(
+                                &msg, m, &sampling, vmm_batch, batch_scheduler.as_ref().map_or(0, |s| s.max_batch),
+                                &gpu.arch, prompt_tokens.len(), max_tokens,
+                            );
+                        if (started_in_think && !vmm_route) || vmm_singleton_now {
+                            // Fixed-lane route: think-open prompts are sequential
+                            // barriers; VMM route: see above. Transfer any
+                            // pre-latched abort exactly once (transfer retires the
+                            // batch entry and holds a tombstone until singleton cleanup).
                             let _ = batch_transfer_abort_to_singleton_and_clear(
                                 id,
                                 gen_attempt_id,
                                 admission,
                             );
+                            if vmm_singleton_now {
+                                // As on the not-eligible path: the sequential producer takes the singleton claim.
+                                batch_scope.rebind_for(gen_attempt_id);
+                            }
                             // Fall through to sequential generate below (do not enqueue).
                         } else {
-                            if prompt_tokens.is_empty() || prompt_tokens.len() >= m.max_seq {
+                            if !qwen4_lanes && (prompt_tokens.is_empty() || prompt_tokens.len() >= m.max_seq) {
                                 emit_batch_admission_error(
                                     &mut stdout,
                                     id,
@@ -3873,17 +3808,11 @@ fn main() {
                             // Explicit wire `seed` must reach the lane RNG on
                             // the batched route too; out-of-domain values are
                             // rejected loudly, never silently unseeded.
-                            let client_seed = match parse_wire_seed(msg.get("seed")) {
-                                Ok(s) => s,
-                                Err(reason) => {
-                                    write_error(&mut stdout, id, &reason);
-                                    batch_clear_terminal_at_generation(
-                                        id,
-                                        gen_attempt_id,
-                                        admission,
-                                    );
-                                    continue;
-                                }
+                            let Some(client_seed) =
+                                client_seed_or_refuse(&mut stdout, id, msg.get("seed"))
+                            else {
+                                batch_clear_terminal_at_generation(id, gen_attempt_id, admission);
+                                continue;
                             };
                             let pending = BatchPendingRequest {
                                 key: AttemptKey::new(id, gen_attempt_id),
@@ -3930,20 +3859,8 @@ fn main() {
                                         &mut stdout,
                                         &mut inbox,
                                     );
-                                    match drive_res {
-                                        Ok(()) => {}
-                                        Err(BatchDriveError::Gpu(e)) => {
-                                            eprintln!("[batch] drive failed (attested): {e}");
-                                        }
-                                        Err(BatchDriveError::Poisoned(e)) => {
-                                            eprintln!("[batch] drive poisoned (unattested): {e} — generation poisoned until unload/reload");
-                                            batch_scheduler = None;
-                                            continuous_batch_size = 1;
-                                            batch_poisoned = Some(e);
-                                            batch_clear_all_terminals();
-                                        }
-                                    }
-                                } else if arch == 5 || arch == 6 {
+                                    apply_batch_drive_result(drive_res, "[batch]", &mut batch_scheduler, &mut continuous_batch_size, &mut batch_poisoned);
+                                } else if arch == 5 || arch == 6 || qwen4_lanes {
                                     let enq_ok = sched.enqueue(pending);
                                     if !enq_ok {
                                         eprintln!(
@@ -3952,7 +3869,9 @@ fn main() {
                                         );
                                         continue;
                                     }
-                                    {
+                                    // Qwen4 lanes announce `Qwen4Ar` from the driver after
+                                    // its exact render (started_in_think is known only then).
+                                    if !qwen4_lanes {
                                         let _scope = BatchAttemptScope::enter_for_generation(
                                             id,
                                             gen_attempt_id,
@@ -3962,29 +3881,13 @@ fn main() {
                                             hipfire_generate::ar::GenerationRoute::QwenAr,
                                             &mut stdout,
                                             id,
-                                            false,
+                                            started_in_think,
                                         );
                                     }
-                                    let drive_res = drive_qwen_continuous_batch(
-                                        sched,
-                                        &mut gpu,
-                                        m,
-                                        &mut stdout,
-                                        &mut inbox,
+                                    let drive_res = hipfire_generate::batch::drive_staged_continuous_batch(
+                                        sched, &mut gpu, m, vmm_batch.filter(|_| vmm_route), &mut stdout, &mut inbox,
                                     );
-                                    match drive_res {
-                                        Ok(()) => {}
-                                        Err(BatchDriveError::Gpu(e)) => {
-                                            eprintln!("[batch] drive failed (attested): {e}");
-                                        }
-                                        Err(BatchDriveError::Poisoned(e)) => {
-                                            eprintln!("[batch] drive poisoned (unattested): {e} — generation poisoned until unload/reload");
-                                            batch_scheduler = None;
-                                            continuous_batch_size = 1;
-                                            batch_poisoned = Some(e);
-                                            batch_clear_all_terminals();
-                                        }
-                                    }
+                                    apply_batch_drive_result(drive_res, "[batch]", &mut batch_scheduler, &mut continuous_batch_size, &mut batch_poisoned);
                                 } else {
                                     eprintln!(
                                         "[batch] impossible arch {} reached scheduler — fail closed",
@@ -4056,15 +3959,16 @@ fn main() {
                     // streams. Out-of-domain seeds (negative, fractional,
                     // non-numeric) are rejected — never silently treated as
                     // unseeded.
-                    let client_seed = match parse_wire_seed(msg.get("seed")) {
-                        Ok(s) => s,
-                        Err(reason) => {
-                            write_error(&mut stdout, id, &reason);
-                            continue;
-                        }
+                    let Some(client_seed) = client_seed_or_refuse(&mut stdout, id, msg.get("seed"))
+                    else {
+                        continue;
                     };
                     let request_seed =
                         request_seed_for(&AttemptKey::new(id, gen_attempt_id), client_seed);
+                    hipfire_generate::batch::arm_promotion(
+                        vmm_route && batch_scheduler.is_some(), &msg, m, continuous_batch_size, serve_continuous_batch,
+                        pflash_active, max_tokens, max_think_tokens, client_seed, assistant_prefix,
+                    );
                     generate(
                         m,
                         &mut gpu,
@@ -4099,10 +4003,34 @@ fn main() {
                         logprobs_top_k,
                         request_seed,
                     );
+                    if let Some(drive_res) = hipfire_generate::batch::drive_promoted(
+                        batch_scheduler.as_mut(), &mut gpu, m, vmm_batch, &mut stdout, &mut inbox,
+                    ) {
+                        apply_batch_drive_result(drive_res, "[batch]", &mut batch_scheduler, &mut continuous_batch_size, &mut batch_poisoned);
+                    }
                 }
                 if let Some(marker) = gpu.replay.replay_observation_marker(id) {
                     eprintln!("{marker}");
                 }
+            }
+
+            "decide" => {
+                let lanes_active = batch_scheduler
+                    .as_ref()
+                    .is_some_and(|s| s.active_count() > 0);
+                let (reply, reset) = hipfire_generate::decide::handle_decide_message(
+                    model.as_mut(),
+                    &mut gpu,
+                    &msg,
+                    lanes_active,
+                    slot_backend.is_some(),
+                );
+                // `reset`: the decide ran and rolled the model back; bump like `reset`.
+                if reset {
+                    state_epoch = state_epoch.saturating_add(1);
+                }
+                let _ = writeln!(stdout, "{reply}");
+                let _ = stdout.flush();
             }
 
             "reset" => {
@@ -4454,6 +4382,83 @@ fn main() {
                 // The body lives in hipfire_generate::img so main.rs names
                 // no arch-crate type (keeps daemon_arch_refs at 0).
                 hipfire_generate::img::generate_img(m, &mut gpu, &mut stdout, &id, &msg);
+                let _ = stdout.flush();
+            }
+
+            "embed" => {
+                // Embedding encode (arch 17, the qwen3.5 multi-vector
+                // encoder). The img_generate shape: dispatch + refusals
+                // here, the body in hipfire-generate so main.rs names no
+                // arch-crate type.
+                let id = msg
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0")
+                    .to_string();
+                // Multi-slot backend dispatches before the ordinary model
+                // path, for the same reason the generate arm does: in slot mode
+                // the daemon's `model` slot is empty by design and the engine
+                // owns the one weight copy. A worker per request keeps the read
+                // loop free, so concurrent embeds reach the engine together and
+                // it can merge them into one forward.
+                if let Some(slot) = slot_backend.clone() {
+                    // Bound thread creation BEFORE spawning, same reason the
+                    // generate arm does: a guard inside an already-spawned
+                    // thread does not bound thread creation. The worker's
+                    // acquire_guard in handle_embed remains the hard bound.
+                    // Embed replies correlate by (id, 0), so the uncorrelated
+                    // emitter is the right channel here (attempt TLS is 0).
+                    if slot.active_count() >= 32 {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            Some(id.as_str()),
+                            "too many concurrent slot requests (bounded worker limit hit)",
+                            "overload",
+                            true,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    let msg_clone = msg.clone();
+                    let id_owned = id.clone();
+                    let slot_clone = slot.clone();
+                    std::thread::spawn(move || {
+                        let mut worker_stdout = std::io::stdout();
+                        slot_clone.handle_embed(&msg_clone, &mut worker_stdout, &id_owned);
+                        let _ = worker_stdout.flush();
+                    });
+                    continue;
+                }
+                let m = match model.as_mut() {
+                    Some(m) => m,
+                    None => {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            Some(id.as_str()),
+                            "no model loaded",
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                if hipfire_loader::wire_verb(m.arch_id).is_generate() {
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        Some(id.as_str()),
+                        "embed refused: loaded model is not an embedding checkpoint \
+                         (qwen3.5 multi-vector encoder) — use generate",
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+                hipfire_generate::embed::generate_embed(m, &mut gpu, &mut stdout, &id, &msg);
                 let _ = stdout.flush();
             }
 
@@ -4867,6 +4872,28 @@ fn main() {
                     let _ = stdout.flush();
                     continue;
                 }
+                // Railgun G0: one plain-AR token either observed eagerly or
+                // recorded, compared by `scripts/redline_daemon_harness.py --g0`.
+                let g0 = match hipfire_engine::redline::G0Arm::from_request(&msg) {
+                    Ok(g0) => g0,
+                    Err(reason) => {
+                        emit_uncorrelated_error(&mut stdout, None, &reason, "validation", false, false);
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                if g0.is_some() && (capture || product_route || iterations != 1) {
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        None,
+                        "g0 requires iterations == 1 and excludes redline_capture/redline_product_route",
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
                 if context == 0 || iterations == 0 {
                     emit_uncorrelated_error(
                         &mut stdout,
@@ -4898,6 +4925,13 @@ fn main() {
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
                 let _ = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu);
+                // Railgun G0: both arms author the same forward, so both prime
+                // from the same GDN requant frame (a host word the forward
+                // consumes: kernarg +76 of gated_delta_net_*). Without this the
+                // arms differ only by how many forwards ran before them.
+                if g0.is_some() {
+                    rdna_compute::norm::restore_gdn_requant_frame_checkpoint(0);
+                }
                 let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
                 let prime_error: Option<String> =
                     match hipfire_loader::bench_decode_route(m.arch_id) {
@@ -4952,6 +4986,14 @@ fn main() {
                         continue;
                     }
                 }
+                let g0_before = match g0.map(|arm| arm.begin(&mut gpu)).transpose() {
+                    Ok(before) => before,
+                    Err(reason) => {
+                        emit_uncorrelated_error(&mut stdout, None, &reason, "unsupported", false, false);
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
 
                 if product_route {
                     gpu.replay.begin_replay_observation_window();
@@ -5014,6 +5056,17 @@ fn main() {
                 } else {
                     None
                 };
+                let g0_result = match (g0, g0_before) {
+                    (Some(arm), Some(before)) => match arm.finish(&mut gpu, before) {
+                        Ok(value) => Some(value),
+                        Err(reason) => {
+                            emit_uncorrelated_error(&mut stdout, None, &reason, "internal", false, false);
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    },
+                    _ => None,
+                };
 
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
@@ -5032,6 +5085,9 @@ fn main() {
                     if let Some(summary) = capture_summary {
                         response["redline_capture"] =
                             redline_capture_json(&gpu, summary, capture_detail);
+                    }
+                    if let Some(value) = g0_result {
+                        response["g0"] = value;
                     }
                     if product_route {
                         let prepared = gpu.replay.prepared_route_identity().map(|identity| {
@@ -5097,8 +5153,16 @@ fn main() {
                 handle_redline_dflash_verify_shadow_pm4(&msg, &mut model, &mut gpu, &mut stdout);
             }
 
+            "railgun_g0_dflash_cycle" => {
+                handle_railgun_g0_dflash_cycle(&msg, &mut model, &mut gpu, &mut stdout);
+            }
+
             "redline_shadow_aql" | "redline_shadow_pm4" => {
                 handle_redline_shadow(&msg, &mut model, &mut gpu, &mut stdout);
+            }
+
+            "redline_greedy_trace" => {
+                handle_redline_greedy_trace(&msg, &mut model, &mut gpu, &mut stdout);
             }
 
             "redline_dispatch_profile" => {
@@ -5114,16 +5178,11 @@ fn main() {
             }
 
             "profile" => {
-                // Precompile kernels for common configurations so we have something to profile.
-                // If a model is loaded its kernels are already compiled; this fills in the rest.
-                // Cover all KV modes × weight formats × head_dims to catch all kernel variants.
-                #[cfg(feature = "deltanet")]
-                for kv in &["q8"] {
-                    for wq in &["hfq4", "hfq6", "q8"] {
-                        for hd in &[128usize, 256] {
-                            let _ = gpu.precompile_qwen35(wq, kv, *hd);
-                        }
-                    }
+                // Compile the arch's registry inventory into the kernel cache so
+                // the profiler has every packaged kernel, not only this model's.
+                // CPU-only: no module is loaded and a loaded route is untouched.
+                if let Err(e) = gpu.precompile_registry() {
+                    eprintln!("profile: registry precompile incomplete: {e}");
                 }
                 let (cap, kernels) = gpu.profile();
                 let kernels_json: Vec<String> = kernels.iter().map(|k| k.to_json()).collect();
@@ -5159,9 +5218,18 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn admitted_load_failure_names_missing_model_only_when_unload_first() {
+        // Unload-first (single-device/pp, incl. Qwen4): prior already retired.
+        assert!(super::no_model_loaded_suffix(false).contains("no model loaded"));
+        // Deferred tp>1: prior model survives a failed load.
+        assert_eq!(super::no_model_loaded_suffix(true), "");
+    }
+
     use super::{
-        announce_generate_terminal, apply_vision_mode_gate, emit_batch_admission_error,
-        require_wire_attempt_id, TERMINAL_TEST_LOCK,
+        announce_generate_terminal, apply_vision_mode_gate, client_seed_or_refuse,
+        emit_batch_admission_error, refuse_image_without_vision, require_wire_attempt_id,
+        TERMINAL_TEST_LOCK,
     };
     use hipfire_engine::emit::{emit_active_attempt_error, emit_uncorrelated_error};
     use hipfire_engine::terminal::{
@@ -5190,6 +5258,71 @@ mod tests {
             );
             assert_eq!(apply_vision_mode_gate(mode, None), None);
         }
+    }
+
+    fn error_events(output: &[u8]) -> Vec<serde_json::Value> {
+        std::str::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// Client faults in the generate arm carry a client class (HTTP 400 at
+    /// the gateway), never `internal` (HTTP 500).
+    #[test]
+    fn generate_client_faults_are_typed_not_internal() {
+        let _lock = TERMINAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // One live generate attempt per refusal, as the generate arm has.
+        let announce = |id: &str| {
+            clear_terminal_control();
+            batch_clear_all_terminals();
+            set_active_attempt_id(7);
+            announce_generate_terminal(
+                &serde_json::json!({"type": "generate", "id": id, "attempt_id": 7}),
+            );
+        };
+        for seed in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("abc"),
+        ] {
+            announce("req-seed");
+            let _scope = BatchAttemptScope::enter_for("req-seed", 7);
+            let mut output = Vec::new();
+            assert_eq!(client_seed_or_refuse(&mut output, "req-seed", Some(&seed)), None);
+            let events = error_events(&output);
+            assert_eq!(events.len(), 1, "{seed}");
+            assert_eq!(events[0]["type"], "error");
+            assert_eq!(events[0]["id"], "req-seed");
+            assert_eq!(events[0]["attempt_id"], 7);
+            assert_eq!(events[0]["class"], "validation", "{seed}");
+        }
+        announce("req-seed");
+        let mut output = Vec::new();
+        assert_eq!(
+            client_seed_or_refuse(&mut output, "req-seed", Some(&serde_json::json!(42))),
+            Some(Some(42))
+        );
+        assert_eq!(client_seed_or_refuse(&mut output, "req-seed", None), Some(None));
+        assert!(output.is_empty(), "a valid or absent seed emits nothing");
+
+        for gated in [None, Some("/models/x-vision.hfq")] {
+            announce("req-img");
+            let _scope = BatchAttemptScope::enter_for("req-img", 7);
+            let mut output = Vec::new();
+            refuse_image_without_vision(&mut output, "req-img", gated);
+            let events = error_events(&output);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["class"], "unsupported");
+            assert!(events[0]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("model has no vision encoder"));
+        }
+        clear_terminal_control();
+        batch_clear_all_terminals();
+        set_active_attempt_id(0);
     }
 
     #[test]

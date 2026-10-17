@@ -211,6 +211,16 @@ pub trait SpecTarget {
     /// so production rollback can attest `rolled_back:false`.
     fn reset_recurrent(&mut self, gpu: &mut Gpu) -> Result<(), String>;
 
+    /// Discard live decode state after a terminal stop inside a speculative
+    /// window that [`Speculator::repair_terminal_prefix`] could not repair.
+    /// The caller drops its host history and never extends this state; the
+    /// next request prefills anew. Default: [`Self::reset_recurrent`]. A
+    /// target whose prompt cache is a durable checkpoint that live decode
+    /// rows never overwrite may rewind to it instead, so it survives the stop.
+    fn reset_after_unrepaired_terminal(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.reset_recurrent(gpu)
+    }
+
     /// Whether this target's architecture reset-core is complete enough for
     /// serve-hardening retry. Default `false` (explicitly ineligible). Retry
     /// candidates override to `true` only when recurrent/EF/KV/cache/graph/
@@ -863,6 +873,15 @@ pub trait Speculator {
     /// error rather than a silent VRAM leak.
     fn free(self: Box<Self>, gpu: &mut Gpu);
 
+    /// [`Self::free`] for a mesh unload: a dense-TP drafter owns per-rank
+    /// buffers the daemon's single `Gpu` cannot reach.
+    fn free_multi(self: Box<Self>, gpus: &mut crate::multi_gpu::Gpus) {
+        if let Some(dev) = gpus.devices.first_mut() {
+            let _ = dev.bind_thread();
+            self.free(dev);
+        }
+    }
+
     /// Whether this drafter requires greedy verification (temperature 0).
     /// A greedy-only drafter (n-gram chain, the MTP-via-`Speculator` wrapper)
     /// returns `true`; a sampling-capable drafter (DFlash with lossless rejection
@@ -901,6 +920,12 @@ pub trait Speculator {
     fn verify_pm4_report(&self) -> Option<serde_json::Value> {
         None
     }
+
+    /// The concrete drafter, for an arch-owned hand-off of its live state
+    /// (continuous-batching promotion of a running request). Default `None`.
+    fn drafter_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
 }
 
 // ─── Multi-token-prediction (MTP) drafter core ──────────────────────────────
@@ -927,8 +952,11 @@ pub struct SpecRequestConfig {
     pub temp: f32,
     /// Nucleus (top-p) mass. `1.0` disables nucleus truncation.
     pub top_p: f32,
-    /// Top-k truncation. `0` disables top-k.
-    pub top_k: usize,
+    /// Request top-k as sent; `None` = absent. The host AR sampler
+    /// distinguishes absent (20 candidates) from `Some(0)` (its 64-wide
+    /// pool); verifiers that reproduce it take [`Self::ar_candidate_cap`],
+    /// the remaining chain verifiers [`Self::top_k_cut`].
+    pub top_k: Option<u32>,
     /// Min-p truncation floor. `0.0` disables.
     pub min_p: f32,
     /// CACTUS acceptance-boost δ. `0.0` = lossless rejection sampling.
@@ -937,6 +965,16 @@ pub struct SpecRequestConfig {
     pub rng_seed: u64,
     /// When true, allow n-gram draft modifiers that touch the proposal stream.
     pub allow_ngram_modifier: bool,
+    /// Recency-weighted repeat penalty (`llama::apply_repeat_penalty`).
+    /// `1.0` = off.
+    pub repeat_penalty: f32,
+    /// Trailing tokens of the request history the three penalties see.
+    /// `0` disables all of them.
+    pub repeat_window: usize,
+    /// OpenAI presence penalty over the window. `0.0` = off.
+    pub presence_penalty: f32,
+    /// OpenAI frequency penalty over the window. `0.0` = off.
+    pub frequency_penalty: f32,
 }
 
 impl Default for SpecRequestConfig {
@@ -946,11 +984,53 @@ impl Default for SpecRequestConfig {
         Self {
             temp: 0.0,
             top_p: 1.0,
-            top_k: 0,
+            top_k: None,
             min_p: 0.0,
             cactus_delta: 0.0,
             rng_seed: 0x1357_9BDF,
             allow_ngram_modifier: false,
+            repeat_penalty: 1.0,
+            repeat_window: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+        }
+    }
+}
+
+impl SpecRequestConfig {
+    /// Top-k truncation for verifiers where `0` disables it: absent and
+    /// `Some(0)` both disable.
+    pub fn top_k_cut(&self) -> usize {
+        self.top_k.map_or(0, |k| k as usize)
+    }
+
+    /// The AR sampler's candidate cap for this request
+    /// ([`crate::llama::ar_candidate_cap`]): absent → 20, `Some(0)` → 64,
+    /// `Some(k)` → `min(k, 64)`. Never 0, so a verifier taking it as its
+    /// top-k always truncates to AR's pool.
+    pub fn ar_candidate_cap(&self) -> usize {
+        crate::llama::ar_candidate_cap(self.top_k)
+    }
+
+    /// Whether the request's penalties move the target distribution: the
+    /// exact predicate `sampler::sample_cpu` (and the GPU sampler) applies.
+    /// A penalty-capable verifier reproduces AR only if every verify row
+    /// is penalized against `suffix_W(prompt || emitted || earlier drafts)`
+    /// — the full rendered prompt included, not the generated ids alone.
+    pub fn penalties_active(&self) -> bool {
+        self.repeat_window > 0
+            && (self.repeat_penalty != 1.0
+                || self.presence_penalty > 0.0
+                || self.frequency_penalty > 0.0)
+    }
+
+    /// The window a penalty history must keep: `repeat_window` when
+    /// [`Self::penalties_active`], else `0` (no history work at all).
+    pub fn penalty_window(&self) -> usize {
+        if self.penalties_active() {
+            self.repeat_window
+        } else {
+            0
         }
     }
 }
@@ -968,10 +1048,10 @@ pub fn request_rng_state(rng_seed: u64) -> u64 {
     }
 }
 
-/// Typed MTP+ngram-mod counters surfaced on the wire done event.
+/// Typed MTP and ngram-mod counters surfaced on the wire done event.
 ///
-/// Populated by the Qwen MTP drafter when `HIPFIRE_MTP_NGRAM` composition is
-/// armed for the request; zeroed defaults otherwise. Accept-rate is
+/// Populated by the Qwen MTP drafter. Ngram-mod counters remain zero unless
+/// `HIPFIRE_MTP_NGRAM` composition is armed for the request. Accept-rate is
 /// `accepted/drafts` rounded to three decimals when drafts > 0.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct MtpRequestStats {
@@ -987,11 +1067,12 @@ pub struct MtpRequestStats {
     pub ngram_mod_accept_rate: f64,
     /// Native MTP windows (every n-gram miss, or plain MTP).
     pub mtp_windows: usize,
-    /// Trunk-only (`k=0`) windows. qwen35 MTP no longer retires after an
-    /// n-gram accept (the takeover fills the head KV), so this stays 0; kept
-    /// on the wire for campaign parsers.
+    /// Target-only (`k=0`) windows after sticky native Qwen4 floor retirement.
+    /// Qwen35 MTP does not retire after an n-gram accept because the takeover
+    /// fills the head KV.
     pub ar_windows: usize,
-    /// Always false since takeovers fill the head KV; kept on the wire.
+    /// Sticky native Qwen4 retirement to target-only decoding for this request.
+    /// Qwen35 MTP does not retire because takeovers fill the head KV.
     pub mtp_retired: bool,
 }
 
@@ -1119,6 +1200,14 @@ pub trait MtpDrafter {
     /// Release all GPU buffers the drafter owns.
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu);
 
+    /// [`Self::mtp_free`] for a mesh unload.
+    fn mtp_free_multi(self: Box<Self>, gpus: &mut crate::multi_gpu::Gpus) {
+        if let Some(dev) = gpus.devices.first_mut() {
+            let _ = dev.bind_thread();
+            self.mtp_free(dev);
+        }
+    }
+
     /// Draft window size (K).
     fn k(&self) -> usize;
 
@@ -1206,7 +1295,7 @@ fn mtp_draft_k(arch_k: usize, max_emit: usize) -> usize {
     max_emit.saturating_sub(1).min(arch_k)
 }
 
-impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
+impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
     fn name(&self) -> &'static str {
         self.arch.name()
     }
@@ -1338,6 +1427,14 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
         Box::new(self.arch).mtp_free(gpu);
     }
 
+    fn free_multi(self: Box<Self>, gpus: &mut crate::multi_gpu::Gpus) {
+        Box::new(self.arch).mtp_free_multi(gpus);
+    }
+
+    fn drafter_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(&mut self.arch)
+    }
+
     fn requires_greedy(&self) -> bool {
         self.arch.requires_greedy()
     }
@@ -1460,7 +1557,8 @@ pub struct FinishSummary {
     /// filter stop_at spanning split byte fragments). Carried into terminal
     /// lowering so wrappers do not recompute solely from the last token id.
     pub decoded_eot: bool,
-    /// Unclosed thinking region at finish — nonretryable unsafe terminal.
+    /// Unclosed thinking region at finish (`finish_reason == "open_think"`):
+    /// a reasoning-only `stop` with no tool calls and no cache store.
     pub open_think: bool,
 }
 

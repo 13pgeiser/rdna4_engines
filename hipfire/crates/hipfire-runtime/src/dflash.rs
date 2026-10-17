@@ -48,6 +48,65 @@ const MQ_X_ROT_CHUNK_ROWS: usize = 1024;
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
+/// DFlash2 runtime proposal width without VMM batching: what `auto` (the
+/// `speculation.dflash_block` default) picks for a singleton-only load. 16
+/// removes the B=8 acceptance ceiling at C1 on gfx1201.
+pub const DFLASH_BLOCK_UNBATCHED: usize = 16;
+/// `speculation.dflash_block = "auto"` width on a batching serve
+/// (`serve.vmm_batch` with at least [`DFLASH_BLOCK_AUTO_MIN_LANES`] lanes):
+/// the draft's trained width, which keeps a full C8 verify step at 64 rows.
+pub const DFLASH_BLOCK_AUTO_BATCHED: usize = 8;
+/// Lane count from which `auto` picks [`DFLASH_BLOCK_AUTO_BATCHED`].
+pub const DFLASH_BLOCK_AUTO_MIN_LANES: usize = 4;
+/// Admitted fixed widths of `speculation.dflash_block`.
+pub const DFLASH_BLOCK_MIN: usize = 4;
+pub const DFLASH_BLOCK_MAX: usize = 16;
+
+/// `speculation.dflash_block`: the DFlash2 proposal width of one load.
+///
+/// The width is a property of the serving configuration, resolved once at
+/// load, never of the live batch: a load-dependent width would move window
+/// boundaries with server load and break batched == singleton output. Every
+/// request of a load (singleton or batched lane) runs the same width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DflashBlockPolicy {
+    /// [`DFLASH_BLOCK_AUTO_BATCHED`] on a VMM batching serve with at least
+    /// [`DFLASH_BLOCK_AUTO_MIN_LANES`] lanes, else [`DFLASH_BLOCK_UNBATCHED`].
+    /// The default.
+    Auto,
+    /// A fixed width in `DFLASH_BLOCK_MIN..=DFLASH_BLOCK_MAX`.
+    Fixed(usize),
+}
+
+impl DflashBlockPolicy {
+    /// Parse the `dflash_block` load param: `"auto"` or an integer in range.
+    /// Absent = [`Self::Auto`], the schema default.
+    pub fn from_param(value: Option<&serde_json::Value>) -> Result<Self, String> {
+        let Some(value) = value else {
+            return Ok(Self::Auto);
+        };
+        if value.as_str() == Some("auto") {
+            return Ok(Self::Auto);
+        }
+        match value.as_u64().map(|v| v as usize) {
+            Some(b) if (DFLASH_BLOCK_MIN..=DFLASH_BLOCK_MAX).contains(&b) => Ok(Self::Fixed(b)),
+            _ => Err(format!(
+                "dflash_block must be \"auto\" or an integer {DFLASH_BLOCK_MIN}..={DFLASH_BLOCK_MAX} (got {value})"
+            )),
+        }
+    }
+
+    /// The width of a load: `vmm_batch` = the VMM continuous-batching route
+    /// is staged, `lanes` = its `continuous_batch_size`.
+    pub fn resolve(self, vmm_batch: bool, lanes: usize) -> usize {
+        match self {
+            Self::Fixed(b) => b,
+            Self::Auto if vmm_batch && lanes >= DFLASH_BLOCK_AUTO_MIN_LANES => DFLASH_BLOCK_AUTO_BATCHED,
+            Self::Auto => DFLASH_BLOCK_UNBATCHED,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DflashConfig {
     pub n_layers: usize,
@@ -103,14 +162,15 @@ impl DflashConfig {
         self.n_heads * self.head_dim
     }
 
-    /// Runtime proposal width. DFlash2's selector and dynamic convolutions are
-    /// length-generic even though the published checkpoint declares B=8.
-    /// B=16 removes the B=8 acceptance ceiling and wins on both the canonical
-    /// merge-sort and prose fixtures on gfx1201; legacy DFlash retains its
-    /// artifact-declared width.
-    pub fn runtime_block_size(&self) -> usize {
-        if self.selector_rank.is_some() && self.block_size == 8 {
-            16
+    /// Runtime proposal width for the configured `speculation.dflash_block`
+    /// width `requested` (already resolved by [`DflashBlockPolicy::resolve`]).
+    /// DFlash2's selector and dynamic convolutions are length-generic even
+    /// though the published checkpoint declares B=8, so a DFlash2 draft runs
+    /// at `requested` (8 or 16 under the `auto` default). Legacy DFlash is not
+    /// length-generic and always runs its artifact-declared width.
+    pub fn runtime_block_size(&self, requested: usize) -> usize {
+        if self.selector_rank.is_some() {
+            requested
         } else {
             self.block_size
         }
@@ -1455,6 +1515,9 @@ mod target_hidden_log {
 }
 pub use target_hidden_log::{TargetHiddenLog, TargetHiddenLogMark};
 
+mod lanes;
+pub use lanes::{draft_forward_lanes, DraftLane};
+
 // ─── Scratch ───────────────────────────────────────────────────────────────
 
 /// Draft context mode (HIPFIRE_DFLASH_WINDOW).
@@ -1501,6 +1564,72 @@ pub fn ring_segments(start: usize, end: usize, modulus: usize) -> Vec<(usize, us
     out
 }
 
+/// Rows of the lane-batched ctx/fc workspace: eight lanes of at most nine new
+/// rows each (an accepted block of up to `b + 1` committed rows).
+pub const DRAFT_LANE_WS_ROWS: usize = 72;
+
+/// Preallocated packing buffers of the lane-batched context fill and `fc`
+/// projection (`draft_forward_lanes`). Allocated once per shared draft
+/// scratch, never per lane or per forward; contents are transient within one
+/// stage and carry no lane state.
+pub struct DraftLaneWorkspace {
+    /// Packed rows these tensors hold ([`DRAFT_LANE_WS_ROWS`]).
+    pub rows: usize,
+    /// Row stride of `input`: `max(num_extract × hidden, hidden)`.
+    pub input_width: usize,
+    /// `[rows, input_width]` gathered `target_hidden` (fc) / projected-hidden
+    /// (ctx) rows; shape subviews use the actual width of the stage.
+    pub input: GpuTensor,
+    /// `[rows, hidden]` fc output (post-norm before the scatter).
+    pub fc_out: GpuTensor,
+    /// `[rows, kv_dim]` packed context K.
+    pub k_out: GpuTensor,
+    /// `[rows, kv_dim]` packed context V.
+    pub v_out: GpuTensor,
+    /// `[rows]` i32 packed key positions (stored in an F32 tensor like every
+    /// `positions_*` plane).
+    pub positions: GpuTensor,
+}
+
+impl DraftLaneWorkspace {
+    /// Allocate every tensor or none: a failure frees the earlier ones.
+    fn alloc(gpu: &mut Gpu, cfg: &DflashConfig) -> HipResult<Self> {
+        let rows = DRAFT_LANE_WS_ROWS;
+        let h = cfg.hidden;
+        let kvd = cfg.kv_dim();
+        let input_width = std::cmp::max(cfg.num_extract() * h, h);
+        let mut live: Vec<GpuTensor> = Vec::with_capacity(5);
+        for len in [rows * input_width, rows * h, rows * kvd, rows * kvd, rows] {
+            match gpu.alloc_tensor(&[len], DType::F32) {
+                Ok(t) => live.push(t),
+                Err(e) => {
+                    for t in live {
+                        let _ = gpu.free_tensor(t);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let mut it = live.into_iter();
+        let mut next = || it.next().expect("five lane workspace tensors");
+        Ok(Self {
+            rows,
+            input_width,
+            input: next(),
+            fc_out: next(),
+            k_out: next(),
+            v_out: next(),
+            positions: next(),
+        })
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) {
+        for t in [self.input, self.fc_out, self.k_out, self.v_out, self.positions] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
 /// Activation buffers for one forward pass. Sized for up to
 /// `max_block_size` query positions and up to `max_ctx_len` context
 /// positions. A single scratch is reused across all speculative steps.
@@ -1534,6 +1663,11 @@ pub struct DflashScratch {
     // Positions (i32).
     pub positions_q: GpuTensor, // [B]       i32
     pub positions_k: GpuTensor, // [L + B]   i32
+    /// Host staging of the concatenated query positions of a batched lane
+    /// draft (`draft_forward_lanes` on the shared scratch). Capacity
+    /// `max_block_size`, reserved once and never grown, so the upload source
+    /// has a stable owned address (a captured upload bakes it).
+    pub lane_positions_q: Vec<i32>,
 
     // FWHT rotation scratch for MQ4 weight paths. Sized to the largest
     // single-call requirement: max(max_ctx × num_extract*hidden,
@@ -1604,6 +1738,14 @@ pub struct DflashScratch {
     /// this FFN subgraph does not, so it can replay across DFlash cycles.
     pub draft_ffn_graphs: Vec<HashMap<usize, (Graph, GraphExec, Vec<Vec<u8>>)>>,
     pub draft_ffn_warmed_up: Vec<HashSet<usize>>,
+
+    /// Lane-batched ctx/fc workspace of the shared continuous-batching draft
+    /// scratch (`None` elsewhere, and when the batched path is off). See
+    /// [`DflashScratch::enable_lane_workspace`].
+    pub lane_ws: Option<DraftLaneWorkspace>,
+    /// Developer-only online draft tuner (`HIPFIRE_DFLASH_ONLINE_TUNE`);
+    /// `None` keeps the shipping argmax proposal path.
+    pub online: Option<crate::dflash_online::OnlineDraftTuner>,
 }
 
 impl DflashScratch {
@@ -1943,6 +2085,7 @@ impl DflashScratch {
 
             positions_q: take!(i_positions_q),
             positions_k: take!(i_positions_k),
+            lane_positions_q: Vec::with_capacity(b),
 
             mq_x_rot: i_mq_x_rot.map(|j| take!(j)),
             mq_x_rot_f16: i_mq_x_rot_f16.map(|j| take!(j)),
@@ -1962,9 +2105,29 @@ impl DflashScratch {
             v_cat_full: None,
             draft_ffn_graphs,
             draft_ffn_warmed_up,
+            lane_ws: None,
+            online: crate::dflash_online::OnlineDraftTuner::from_env(),
         };
         debug_assert!(live.iter().all(|s| s.is_none()));
         Ok(scratch)
+    }
+
+    /// Allocate the lane-batched ctx/fc workspace ([`DraftLaneWorkspace`]) on
+    /// this scratch (idempotent). Only the shared continuous-batching draft
+    /// scratch calls this. A no-op (`Ok`, nothing allocated) unless the batched
+    /// context path can ever be admitted: `HIPFIRE_CB_DRAFT_LANE_CTX` not `0`,
+    /// exact gfx1201, and an MQ scratch (`mq_x_rot` present). On `Err` nothing
+    /// is left allocated by this call; the caller still owns (and frees) `self`.
+    pub fn enable_lane_workspace(&mut self, gpu: &mut Gpu, cfg: &DflashConfig) -> HipResult<()> {
+        if self.lane_ws.is_some()
+            || self.mq_x_rot.is_none()
+            || !lanes::draft_lane_ctx_enabled()
+            || gpu.arch != "gfx1201"
+        {
+            return Ok(());
+        }
+        self.lane_ws = Some(DraftLaneWorkspace::alloc(gpu, cfg)?);
+        Ok(())
     }
 
     /// Reset the incremental-upload tracker for target_hidden. Call this
@@ -2004,6 +2167,9 @@ impl DflashScratch {
                 let _ = gpu.hip.graph_exec_destroy(exec);
                 let _ = gpu.hip.graph_destroy(graph);
             }
+        }
+        if let Some(mut t) = self.online {
+            t.free_gpu(gpu);
         }
         let _ = gpu.free_tensor(self.x);
         let _ = gpu.free_tensor(self.x_norm);
@@ -2056,6 +2222,9 @@ impl DflashScratch {
         .flatten()
         {
             let _ = gpu.free_tensor(t);
+        }
+        if let Some(ws) = self.lane_ws {
+            ws.free_gpu(gpu);
         }
     }
 }
@@ -2153,6 +2322,99 @@ fn gemm_dispatch_mq4_collapsed(
         row += n;
     }
     chunked
+}
+
+/// Draft lm_head on FWHT-rotated draft rows (`rotated` `[rows, k]` → `logits`
+/// `[rows, m]`), routed through this draft-GEMM layer like [`gemm_dispatch`]'s
+/// MQ4G256V2 arm: on exact gfx1201 an MQ4G256V2 head runs the in-kernel-zeroing
+/// overwrite twin (`Gpu::gemm_mq4g256v2_overwrite_gfx12_dflash`, bit-identical to
+/// the `hipMemset` pre-zero + residual lm_head it replaces;
+/// `HIPFIRE_DRAFT_COLLAPSE_OFF=1` vetoes it). `Ok(false)` = not admitted and
+/// nothing launched: the caller runs its batched lm_head launcher unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn draft_lm_head_overwrite(
+    gpu: &mut Gpu,
+    dtype: DType,
+    w_buf: &GpuTensor,
+    rotated: &GpuTensor,
+    logits: &GpuTensor,
+    m: usize,
+    k: usize,
+    rows: usize,
+) -> HipResult<bool> {
+    if dtype != DType::MQ4G256V2 {
+        return Ok(false);
+    }
+    gpu.gemm_mq4g256v2_overwrite_gfx12_dflash(w_buf, rotated, logits, m, k, rows)
+}
+
+/// Projection group of a [`gemm_dispatch_shared`] call; selects its kill switch.
+enum SharedProjection {
+    Qkv,
+    Ffn,
+    ContextKv,
+}
+
+/// Run `N` draft projections that read the same input `x` (#838). On exact
+/// gfx1100, eager (no replay recording, no graph capture), 2..=16 rows, every
+/// weight MQ4G256V2 with the same `k` (a multiple of 256), no AWQ sidecar and
+/// scratch for all rows, `x` is FWHT-rotated once and every projection's GEMM
+/// reads that one rotation: the route `gemm_dispatch` would pick per
+/// projection (the S7 overwrite split-K GEMM on F16, else the batched lm_head
+/// GEMM), minus the repeated rotations of identical bytes. Anything else, or
+/// the group's switch off (`kernel.draft_shared_{qkv,ffn,ctx_kv}_rotation`,
+/// default on exact gfx1100), runs [`gemm_dispatch`] once per projection in
+/// order. Inventoried as railgun-cert decision
+/// `dflash-gfx1100-shared-rotation`.
+fn gemm_dispatch_shared<const N: usize>(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    projections: [(&WeightTensor, &GpuTensor); N],
+    batch: usize,
+    mq_x_rot: Option<&GpuTensor>,
+    mq_x_rot_f16: Option<&GpuTensor>,
+    family: SharedProjection,
+) -> HipResult<()> {
+    let enabled = match family {
+        SharedProjection::Qkv => gpu.flags.draft_shared_qkv_rotation,
+        SharedProjection::Ffn => gpu.flags.draft_shared_ffn_rotation,
+        SharedProjection::ContextKv => gpu.flags.draft_shared_ctx_kv_rotation,
+    };
+    let k = projections[0].0.k;
+    let eligible = enabled
+        && k > 0 && k % 256 == 0
+        && gpu.arch_caps.is_gfx1100()
+        && !gpu.replay.is_recording() && !gpu.graphs.capture_mode
+        && batch > 1 && batch <= 16
+        && !crate::config::get().draft_gemm_dump
+        && mq_x_rot.is_some_and(|s| s.shape[0] / k >= batch)
+        && mq_x_rot_f16.is_some_and(|s| s.shape[0] / k >= batch)
+        && projections.iter().all(|(w, _)|
+            w.gpu_dtype == DType::MQ4G256V2 && w.k == k && w.awq_scale.is_none());
+    if !eligible {
+        for (w, y) in projections {
+            gemm_dispatch(gpu, x, w, y, batch, mq_x_rot, mq_x_rot_f16)?;
+        }
+        return Ok(());
+    }
+    // All consumers use the same input and rotation contract; GEMMs stay unchanged.
+    match gpu.draft_collapse_mq4v2_route(k, batch, false) {
+        rdna_compute::dflash_draft_fusion::DraftCollapseV2::OverwriteKsplit { kw } => {
+            let rot = mq_x_rot_f16.unwrap().sub_offset(0, batch * k);
+            gpu.mq_rotate_x_f16_dflash(x, &rot, k, batch)?;
+            for (w, y) in projections {
+                gpu.gemm_mq4g256v2_overwrite_ksplit_lds_dflash(&w.buf, &rot, y, w.m, k, batch, kw)?;
+            }
+        }
+        rdna_compute::dflash_draft_fusion::DraftCollapseV2::Off => {
+            let rot = mq_x_rot.unwrap().sub_offset(0, batch * k);
+            crate::llama::rotate_x_mq_batched_for(gpu, projections[0].0, x, &rot, k, batch)?;
+            for (w, y) in projections {
+                gpu.gemm_mq4g256v2_batched_lmhead(&w.buf, &rot, y, w.m, k, batch)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// For MQ-G256, the kernel needs the input FWHT-rotated. We do that into
@@ -2290,9 +2552,11 @@ fn gemm_dispatch(
             // correct; rotation is identical FWHT path.
             // S7: per-chunk route — chunks that hit the gfx1100 ksplit tier
             // (batch 2..=16, default policy) rotate to F16 and run the
-            // overwrite ksplit GEMM; everything else (n==1 GEMV tails,
-            // chunked first-call prefixes, capture/replay, kill switch)
-            // keeps the legacy loop byte-for-byte.
+            // overwrite ksplit GEMM. On gfx1201 the `Off` branch first tries
+            // the in-kernel-zeroing overwrite WMMA twin (batch 2..=63, no
+            // memset); everything else (n==1 GEMV tails, chunked first-call
+            // prefixes, capture/replay, kill switch) keeps the legacy loop
+            // byte-for-byte.
             let scratch_f16 = mq_x_rot_f16;
             let max_chunk = (mq_x_rot
                 .expect("MQ4V2 dispatch requires mq_x_rot scratch")
@@ -2325,11 +2589,26 @@ fn gemm_dispatch(
                             chunked = Err(e);
                             break;
                         }
-                        if let Err(e) = gpu
-                            .gemm_mq4g256v2_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n)
-                        {
-                            chunked = Err(e);
-                            break;
+                        // gfx1201: overwrite twin of the one-tile / verify-tile
+                        // residual kernel (no pre-zero fill, byte-identical).
+                        // `Ok(false)` = not admitted, device untouched: run the
+                        // legacy memset + residual lm_head launcher unchanged.
+                        match gpu.gemm_mq4g256v2_overwrite_gfx12_dflash(
+                            &w.buf, &rot_view, &y_chunk, w.m, w.k, n,
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                if let Err(e) = gpu.gemm_mq4g256v2_batched_lmhead(
+                                    &w.buf, &rot_view, &y_chunk, w.m, w.k, n,
+                                ) {
+                                    chunked = Err(e);
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                chunked = Err(e);
+                                break;
+                            }
                         }
                     } else {
                         let scratch =
@@ -2599,23 +2878,14 @@ fn draft_ffn_layer(
         }
         gpu.rmsnorm_batched(&scratch.x, &layer.ffn_norm, &scratch.x_norm, b, h, eps)?;
     }
-    gemm_dispatch(
+    gemm_dispatch_shared(
         gpu,
         &scratch.x_norm,
-        &layer.w_gate,
-        &scratch.gate,
+        [(&layer.w_gate, &scratch.gate), (&layer.w_up, &scratch.up)],
         b,
         scratch.mq_x_rot.as_ref(),
         scratch.mq_x_rot_f16.as_ref(),
-    )?;
-    gemm_dispatch(
-        gpu,
-        &scratch.x_norm,
-        &layer.w_up,
-        &scratch.up,
-        b,
-        scratch.mq_x_rot.as_ref(),
-        scratch.mq_x_rot_f16.as_ref(),
+        SharedProjection::Ffn,
     )?;
     gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.gate_up)?;
     gemm_dispatch(
@@ -2691,25 +2961,79 @@ fn upload_slice_f32(gpu: &Gpu, dst: &GpuTensor, data: &[f32]) -> HipResult<()> {
 }
 
 /// Upload i32 slice into a GPU tensor (interpreted as i32 by kernels).
+/// Synchronous outside hipGraph capture; while capturing it is enqueued on
+/// the capturing stream (`Gpu::memcpy_htod_auto`), which bakes `data`'s host
+/// address into the graph: a replaying owner keeps that storage alive and
+/// rewrites it in place before each launch.
 fn upload_slice_i32(gpu: &Gpu, dst: &GpuTensor, data: &[i32]) -> HipResult<()> {
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-    gpu.hip.memcpy_htod(&dst.buf, bytes)
+    gpu.memcpy_htod_auto(&dst.buf, bytes)
+}
+
+/// `HIPFIRE_DFLASH_ORDERED_DRAFT=0` (developer kill switch): the draft
+/// body's D2D copies (residual saves, context/noise K/V concatenation) go
+/// back to the synchronous `hipMemcpy` on the null stream, and the batched
+/// lane draft uploads its key positions between the lane fc GEMMs again.
+/// Default on: the copies are enqueued on the execution stream
+/// (`Gpu::memcpy_dtod_at_ordered_async`) ahead of their consumer kernels and
+/// the host no longer drains the queue per copy. Same bytes, same ranges,
+/// same order on the stream as every producer and consumer kernel.
+static ORDERED_DRAFT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_DFLASH_ORDERED_DRAFT").map_or(true, |v| v.trim() != "0")
+});
+
+/// Whether the draft body runs its D2D copies stream-ordered
+/// ([`ORDERED_DRAFT`]); resolved once per process.
+pub(crate) fn ordered_draft() -> bool {
+    *ORDERED_DRAFT
+}
+
+/// One draft-body D2D copy. `ordered`: enqueued on the active stream (the
+/// null stream when none is set), where every producer of `src` and every
+/// consumer of `dst` in the draft body also runs, so no host wait is needed
+/// and the source cannot be rewritten before the copy executes. Otherwise
+/// the historical host-synchronous copy.
+#[track_caller]
+fn draft_dtod_at(
+    gpu: &Gpu,
+    ordered: bool,
+    dst: &DeviceBuffer,
+    dst_offset: usize,
+    src: &DeviceBuffer,
+    src_offset: usize,
+    bytes: usize,
+) -> HipResult<()> {
+    if ordered {
+        gpu.memcpy_dtod_at_ordered_async(dst, dst_offset, src, src_offset, bytes)
+    } else {
+        gpu.hip.memcpy_dtod_at(dst, dst_offset, src, src_offset, bytes)
+    }
 }
 
 /// Rows per chunk for the windowed-mode post-seed backfill.
 pub const SEED_BACKFILL_CHUNK: usize = 512;
 
+/// Whether [`draft_seed_backfill`] reads its host shadow for a cold prompt of
+/// `prompt_len` rows: only a windowed draft with a dedicated long-reach layer
+/// (`w != w_full`) whose prompt is longer than the SWA window. Legacy mode and
+/// DFlash2 all-sliding drafts (every layer shares the same W ring) never read
+/// it, so a cold prefill may leave the hidden rows on device.
+pub fn draft_seed_backfill_reads_host(ctx_mode: DraftCtxMode, prompt_len: usize) -> bool {
+    matches!(ctx_mode, DraftCtxMode::Windowed { w, w_full } if w != w_full && prompt_len > w)
+}
+
 /// Windowed-mode post-seed backfill: after a cold prefill longer than the
 /// SWA window, the last (full-attention) layer still needs K/V for EVERY
 /// context row — but `hidden_rb` / the draft ring only retain the last
-/// `swa_w`. The host shadow (`target_hidden_host`, cumulative on the cold
-/// path) has the full prompt, so stream it through the ring in chunks:
+/// `swa_w`. The host shadow (cumulative over the cold prefill) has the full
+/// prompt, so stream it through the ring in chunks:
 /// upload → fc → hidden_norm → last-layer wk/wv + k_norm into its
 /// `full_w`-row ring. SWA layers are deliberately skipped — the first
 /// `draft_forward` lazy fill covers their in-window rows bit-identically.
 ///
-/// No-op in Legacy mode or when `prompt_len <= swa_w`. Sets the thlog
+/// No-op (and `host_hidden` unread) unless
+/// [`draft_seed_backfill_reads_host`]. Sets the thlog
 /// full-layer watermark to `prompt_len` so the forward's lazy fill resumes
 /// from the window edge. GEMMs, norms, and RoPE are row-local: chunked ==
 /// monolithic bit-exactly.
@@ -2722,17 +3046,13 @@ pub fn draft_seed_backfill(
     prompt_len: usize,
 ) -> HipResult<()> {
     let (swa_w, full_w) = match scratch.ctx_mode {
-        DraftCtxMode::Legacy => return Ok(()),
-        DraftCtxMode::Windowed { w, w_full } => (w, w_full),
+        DraftCtxMode::Windowed { w, w_full }
+            if draft_seed_backfill_reads_host(scratch.ctx_mode, prompt_len) =>
+        {
+            (w, w_full)
+        }
+        _ => return Ok(()),
     };
-    // DFlash2 all-sliding: every layer shares the same W ring, no dedicated
-    // long-reach layer and no out-of-window backfill needed.
-    if swa_w == full_w {
-        return Ok(());
-    }
-    if prompt_len <= swa_w {
-        return Ok(());
-    }
     let h = cfg.hidden;
     let ne = cfg.num_extract();
     let kvd = cfg.kv_dim();
@@ -3134,6 +3454,7 @@ pub fn draft_forward_opts(
     // ── 2. Per-layer decoder ─────────────────────────────────────────────
     // DFlash2 all-sliding detection for windowed mode branching.
     let is_all_sliding_windowed = windowed && cfg.all_layers_sliding;
+    let ordered = ordered_draft();
     for li in 0..cfg.n_layers {
         let layer = &weights.layers[li];
 
@@ -3151,8 +3472,7 @@ pub fn draft_forward_opts(
             )?;
         } else {
             // Residual.
-            gpu.hip
-                .memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, (b * h) * 4)?;
+            draft_dtod_at(gpu, ordered, &scratch.residual.buf, 0, &scratch.x.buf, 0, (b * h) * 4)?;
             // attn_norm.
             gpu.rmsnorm_batched(&scratch.x, &layer.attn_norm, &scratch.x_norm, b, h, eps)?;
         }
@@ -3211,32 +3531,14 @@ pub fn draft_forward_opts(
         // Q and K/V noise (over the B block positions) must be computed
         // every cycle. K_ctx and V_ctx (over the L context positions)
         // are *incrementally* cached — see the per-layer block below.
-        gemm_dispatch(
+        gemm_dispatch_shared(
             gpu,
             qkv_src,
-            &layer.wq,
-            &scratch.q,
+            [(&layer.wq, &scratch.q), (&layer.wk, &scratch.k_noise), (&layer.wv, &scratch.v_noise)],
             b,
             scratch.mq_x_rot.as_ref(),
             scratch.mq_x_rot_f16.as_ref(),
-        )?;
-        gemm_dispatch(
-            gpu,
-            qkv_src,
-            &layer.wk,
-            &scratch.k_noise,
-            b,
-            scratch.mq_x_rot.as_ref(),
-            scratch.mq_x_rot_f16.as_ref(),
-        )?;
-        gemm_dispatch(
-            gpu,
-            qkv_src,
-            &layer.wv,
-            &scratch.v_noise,
-            b,
-            scratch.mq_x_rot.as_ref(),
-            scratch.mq_x_rot_f16.as_ref(),
+            SharedProjection::Qkv,
         )?;
 
         // K_ctx / V_ctx — same wk/wv weights but projected over the L
@@ -3313,23 +3615,14 @@ pub fn draft_forward_opts(
                 let thp_slice = scratch.target_hidden_proj.sub_offset(p_slot * h, step * h);
                 let k_slot = k_cache_layer.sub_offset(c_slot * kvd, step * kvd);
                 let v_slot = v_cache_layer.sub_offset(c_slot * kvd, step * kvd);
-                gemm_dispatch(
+                gemm_dispatch_shared(
                     gpu,
                     &thp_slice,
-                    &layer.wk,
-                    &k_slot,
+                    [(&layer.wk, &k_slot), (&layer.wv, &v_slot)],
                     step,
                     scratch.mq_x_rot.as_ref(),
                     scratch.mq_x_rot_f16.as_ref(),
-                )?;
-                gemm_dispatch(
-                    gpu,
-                    &thp_slice,
-                    &layer.wv,
-                    &v_slot,
-                    step,
-                    scratch.mq_x_rot.as_ref(),
-                    scratch.mq_x_rot_f16.as_ref(),
+                    SharedProjection::ContextKv,
                 )?;
                 // Per-head RMSNorm on K delta rows only. batch = step × n_kv_heads.
                 gpu.rmsnorm_batched(
@@ -3409,14 +3702,18 @@ pub fn draft_forward_opts(
         let mut cat_off = 0usize;
         for (_row0, slot0, len) in ring_segments(span_start, l, layer_w) {
             let seg_bytes = len * kvd * 4;
-            gpu.hip.memcpy_dtod_at(
+            draft_dtod_at(
+                gpu,
+                ordered,
                 &k_cat_l.buf,
                 cat_off,
                 &k_cache_layer.buf,
                 slot0 * kvd * 4,
                 seg_bytes,
             )?;
-            gpu.hip.memcpy_dtod_at(
+            draft_dtod_at(
+                gpu,
+                ordered,
                 &v_cat_l.buf,
                 cat_off,
                 &v_cache_layer.buf,
@@ -3425,10 +3722,8 @@ pub fn draft_forward_opts(
             )?;
             cat_off += seg_bytes;
         }
-        gpu.hip
-            .memcpy_dtod_at(&k_cat_l.buf, cat_off, &scratch.k_noise.buf, 0, noise_bytes)?;
-        gpu.hip
-            .memcpy_dtod_at(&v_cat_l.buf, cat_off, &scratch.v_noise.buf, 0, noise_bytes)?;
+        draft_dtod_at(gpu, ordered, &k_cat_l.buf, cat_off, &scratch.k_noise.buf, 0, noise_bytes)?;
+        draft_dtod_at(gpu, ordered, &v_cat_l.buf, cat_off, &scratch.v_noise.buf, 0, noise_bytes)?;
 
         if let Some(t) = t1 {
             gpu.hip.device_synchronize()?;
@@ -3598,8 +3893,7 @@ pub fn draft_forward_opts(
                     eps,
                 )?;
             } else {
-                gpu.hip
-                    .memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, (b * h) * 4)?;
+                draft_dtod_at(gpu, ordered, &scratch.residual.buf, 0, &scratch.x.buf, 0, (b * h) * 4)?;
                 gpu.rmsnorm_batched(&scratch.x, &layer.ffn_norm, &scratch.x_norm, b, h, eps)?;
             }
             let k = cfg.conv_kernel_size.unwrap_or(2);
@@ -3628,23 +3922,14 @@ pub fn draft_forward_opts(
                 stride,
                 0,
             )?;
-            gemm_dispatch(
+            gemm_dispatch_shared(
                 gpu,
                 tmp,
-                &layer.w_gate,
-                &scratch.gate,
+                [(&layer.w_gate, &scratch.gate), (&layer.w_up, &scratch.up)],
                 b,
                 scratch.mq_x_rot.as_ref(),
                 scratch.mq_x_rot_f16.as_ref(),
-            )?;
-            gemm_dispatch(
-                gpu,
-                tmp,
-                &layer.w_up,
-                &scratch.up,
-                b,
-                scratch.mq_x_rot.as_ref(),
-                scratch.mq_x_rot_f16.as_ref(),
+                SharedProjection::Ffn,
             )?;
             gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.gate_up)?;
             // S7: w_down lands in dead conv_temp (last read by the gate/up
@@ -3798,6 +4083,61 @@ mod ring_tests {
         assert_eq!(log.abs_positions(), &[0, 1, 2, 3]);
         assert_eq!(log.proj_cached_rows(), 3);
         assert_eq!(log.full_cached_rows(), 4);
+    }
+}
+
+#[cfg(test)]
+mod block_policy_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn param_parses_auto_fixed_and_absent() {
+        assert_eq!(DflashBlockPolicy::from_param(None), Ok(DflashBlockPolicy::Auto));
+        assert_eq!(DflashBlockPolicy::from_param(Some(&json!("auto"))), Ok(DflashBlockPolicy::Auto));
+        assert_eq!(DflashBlockPolicy::from_param(Some(&json!(8))), Ok(DflashBlockPolicy::Fixed(8)));
+        for bad in [json!(3), json!(17), json!("8"), json!(true), json!(-1)] {
+            assert!(DflashBlockPolicy::from_param(Some(&bad)).is_err(), "{bad} must be refused");
+        }
+    }
+
+    #[test]
+    fn auto_depends_on_serving_configuration_only() {
+        assert_eq!(DflashBlockPolicy::Auto.resolve(true, 8), 8);
+        assert_eq!(DflashBlockPolicy::Auto.resolve(true, 4), 8);
+        assert_eq!(DflashBlockPolicy::Auto.resolve(true, 3), 16);
+        assert_eq!(DflashBlockPolicy::Auto.resolve(false, 8), 16);
+        assert_eq!(DflashBlockPolicy::Fixed(12).resolve(true, 8), 12);
+        assert_eq!(DflashBlockPolicy::Fixed(8).resolve(false, 1), 8);
+    }
+
+    #[test]
+    fn legacy_drafts_keep_their_declared_width() {
+        let mut cfg = DflashConfig {
+            n_layers: 1,
+            hidden: 8,
+            intermediate: 16,
+            n_heads: 1,
+            n_kv_heads: 1,
+            head_dim: 8,
+            vocab_size: 8,
+            norm_eps: 1e-6,
+            rope_theta: 1.0,
+            block_size: 8,
+            mask_token_id: 0,
+            target_layer_ids: vec![0],
+            num_target_layers: 1,
+            declared_window: None,
+            all_layers_sliding: true,
+            conv_group_size: Some(16),
+            conv_kernel_size: Some(2),
+            selector_rank: Some(256),
+            selector_top_k: Some(16),
+        };
+        assert_eq!(cfg.runtime_block_size(DFLASH_BLOCK_UNBATCHED), 16);
+        assert_eq!(cfg.runtime_block_size(8), 8);
+        cfg.selector_rank = None;
+        assert_eq!(cfg.runtime_block_size(DFLASH_BLOCK_UNBATCHED), 8);
     }
 }
 
@@ -4269,8 +4609,62 @@ fn softmax_sample(scores: &[f32], temp: f32, uniform: f32) -> (usize, Vec<f32>) 
     (last, q)
 }
 
+/// Borrowed-readback selector scorer: the arithmetic of the former
+/// `propose_inner` (runtime lines 4275-4372 before this factoring), exposed so
+/// packed multi-lane readbacks can score each lane's span without a device or
+/// a copy of the projection/IDs/unaries.
+///
+/// Inputs are the raw device readbacks for ONE chain: `projection`
+/// `[rows*rank]` (hidden projection GEMM output), `ids` `[rows*K]` (raw GPU
+/// top-K IDs) and `unaries` `[rows*K]` (raw top-K values); `rank`/`K`/vocab
+/// come from `weights`. Scoring is sequential: predecessor starts at `anchor`
+/// and becomes the selected ID of each row; candidates are scored in readback
+/// order with the sequential f32 `pred_cb*projection*succ_cb` dot. With
+/// `temperature>0` `uniforms` (>= `rows`, one per row) are required.
+pub fn propose_candidates_from_rows(
+    weights: &DflashWeights,
+    projection: &[f32],
+    ids: &[u32],
+    unaries: &[f32],
+    rows: usize,
+    anchor: u32,
+    temperature: f32,
+    uniforms: Option<&[f32]>,
+) -> HipResult<DflashCandidateProposal> {
+    if rows == 0 {
+        return Err(hip_bridge::HipError::new(0, "rows must be >0"));
+    }
+    if !weights.has_candidate_selector() {
+        return Err(hip_bridge::HipError::new(0, "selector weights not loaded"));
+    }
+    let rank = weights.selector_rank.unwrap_or(256);
+    let k = weights.selector_top_k.unwrap_or(16);
+    if k == 0 || k > 16 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "selector_top_k must be in [1,16]",
+        ));
+    }
+    if projection.len() != rows * rank {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "projection length != rows*rank",
+        ));
+    }
+    if ids.len() != rows * k || unaries.len() != rows * k {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "ids/unaries length != rows*K",
+        ));
+    }
+    let vocab = weights.predecessor_codebook.as_ref().unwrap().vocab;
+    propose_inner(
+        vocab, weights, projection, ids, unaries, rows, k, rank, anchor, temperature, uniforms,
+    )
+}
+
 fn propose_inner(
-    cfg: &DflashConfig,
+    vocab_size: usize,
     weights: &DflashWeights,
     hidden_proj_host: &[f32], // [rows*rank] already projected, row-major
     top_ids: &[u32],          // [rows*K]
@@ -4316,7 +4710,7 @@ fn propose_inner(
         let mut scores = Vec::with_capacity(k);
         for j in 0..k {
             let cand = top_ids[id_off + j] as usize;
-            if cand >= cfg.vocab_size {
+            if cand >= vocab_size {
                 return Err(hip_bridge::HipError::new(
                     0,
                     "candidate id out of vocab range",
@@ -4454,35 +4848,12 @@ pub fn propose_candidates_host(
             top_vals.push(row[idxs[j]]);
         }
     }
-    propose_inner(
-        &DflashConfig {
-            n_layers: 0,
-            hidden: 0,
-            intermediate: 0,
-            n_heads: 0,
-            n_kv_heads: 0,
-            head_dim: 0,
-            vocab_size: vocab,
-            norm_eps: 0.0,
-            rope_theta: 0.0,
-            block_size: 0,
-            mask_token_id: 0,
-            target_layer_ids: vec![],
-            num_target_layers: 0,
-            declared_window: None,
-            all_layers_sliding: false,
-            conv_group_size: None,
-            conv_kernel_size: None,
-            selector_rank: Some(rank),
-            selector_top_k: Some(k),
-        },
+    propose_candidates_from_rows(
         weights,
         &host_proj,
         &top_ids,
         &top_vals,
         rows,
-        k,
-        rank,
         anchor,
         temperature,
         uniforms,
@@ -4524,6 +4895,141 @@ pub fn propose_candidates_device(
         return Err(hip_bridge::HipError::new(0, "logits buffer too small"));
     }
     // Project hidden -> rank
+    let host_proj = selector_projection_host(gpu, weights, scratch, hidden, rows, rank)?;
+    // GPU top-K raw values (small D2H)
+    let top_ids_gpu = scratch
+        .topk_ids
+        .as_ref()
+        .ok_or_else(|| hip_bridge::HipError::new(0, "topk_ids scratch not allocated"))?;
+    let top_vals_gpu = scratch
+        .topk_vals
+        .as_ref()
+        .ok_or_else(|| hip_bridge::HipError::new(0, "topk_vals scratch not allocated"))?;
+    let ids_slice = top_ids_gpu.sub_offset(0, rows * k);
+    let vals_slice = top_vals_gpu.sub_offset(0, rows * k);
+    // Call the raw top-k primitive; the string `topk_values_batched_f32` is kept for grep checks
+    // and the fallback trait will delegate to logsumexp when native is absent (per-row shift valid).
+    {
+        let _marker = "topk_values_batched_f32";
+        let _ = _marker;
+    }
+    gpu.topk_values_batched_f32(logits, &ids_slice, &vals_slice, vocab, k, rows)?;
+    let (top_ids, top_vals) = download_top(gpu, &ids_slice, &vals_slice, rows * k)?;
+    propose_candidates_from_rows(
+        weights,
+        &host_proj,
+        &top_ids,
+        &top_vals,
+        rows,
+        anchor,
+        temperature,
+        uniforms,
+    )
+}
+
+/// One lane of [`propose_candidates_lanes_device`]: its `rows` candidate rows
+/// start at row `first_row` of the shared hidden / logits rows.
+#[derive(Clone, Copy, Debug)]
+pub struct SelectorLane {
+    pub first_row: usize,
+    pub rows: usize,
+    pub anchor: u32,
+}
+
+/// GREEDY selector proposals (temperature 0.0, no uniforms: the batched
+/// greedy CB draft is the only caller) of several lanes whose draft rows
+/// share one `[rows_total × hidden]` / `[rows_total × vocab]` pair:
+/// ONE selector projection GEMM and ONE top-K over all `rows_total` rows
+/// (rows no lane selects, e.g. seed rows, are computed and ignored), one
+/// download of the projection and one of each top-K tensor, then per-lane
+/// host scoring ([`propose_candidates_from_rows`]) of exactly the lane's row
+/// slice — three host syncs per call instead of three per lane. Proposals
+/// are byte-identical to per-lane [`propose_candidates_device`] calls
+/// because the projection GEMM (MQ4G256V2 gfx1201 overwrite route,
+/// `gemm_dispatch`) and `topk_values_batched_f32` are row-local.
+///
+/// The projection route admits `2..=63` rows, and exactly 64 only inside
+/// [`Gpu::draft_rows64_enter`]'s scope: `rows64_scope` opens that scope
+/// around the projection GEMM (and only it). The caller MUST pass `true`
+/// iff `rows_total == 64` and the 64-row draft chunk is exact on this GPU
+/// (`dflash_draft_batch_max_rows == 64`), `false` otherwise.
+///
+/// `scratch` must hold `rows_total` selector rows (`selector_proj`,
+/// `topk_ids`, `topk_vals`) and own FWHT rotation buffers (`mq_x_rot`,
+/// `mq_x_rot_f16`).
+#[allow(clippy::too_many_arguments)]
+pub fn propose_candidates_lanes_device(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    scratch: &DflashScratch,
+    hidden: &GpuTensor,
+    logits: &GpuTensor,
+    rows_total: usize,
+    lanes: &[SelectorLane],
+    rows64_scope: bool,
+) -> HipResult<Vec<DflashCandidateProposal>> {
+    if rows_total == 0 || lanes.iter().any(|l| l.rows == 0 || l.first_row + l.rows > rows_total) {
+        return Err(hip_bridge::HipError::new(0, "selector lanes outside the rows"));
+    }
+    if !weights.has_candidate_selector() {
+        return Err(hip_bridge::HipError::new(0, "selector weights not loaded"));
+    }
+    let rank = weights.selector_rank.unwrap_or(256);
+    let k = weights.selector_top_k.unwrap_or(16);
+    if k == 0 || k > 16 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "selector_top_k must be in [1,16]",
+        ));
+    }
+    let vocab = weights.predecessor_codebook.as_ref().unwrap().vocab;
+    if logits.buf.size() < rows_total * vocab * 4 {
+        return Err(hip_bridge::HipError::new(0, "logits buffer too small"));
+    }
+    let prev = gpu.draft_rows64_enter(rows64_scope);
+    let host_proj = selector_projection_host(gpu, weights, scratch, hidden, rows_total, rank);
+    gpu.draft_rows64_exit(prev);
+    let host_proj = host_proj?;
+    let ids_slice = scratch
+        .topk_ids
+        .as_ref()
+        .ok_or_else(|| hip_bridge::HipError::new(0, "topk_ids scratch not allocated"))?
+        .sub_offset(0, rows_total * k);
+    let vals_slice = scratch
+        .topk_vals
+        .as_ref()
+        .ok_or_else(|| hip_bridge::HipError::new(0, "topk_vals scratch not allocated"))?
+        .sub_offset(0, rows_total * k);
+    gpu.topk_values_batched_f32(logits, &ids_slice, &vals_slice, vocab, k, rows_total)?;
+    let (top_ids, top_vals) = download_top(gpu, &ids_slice, &vals_slice, rows_total * k)?;
+    lanes
+        .iter()
+        .map(|l| {
+            let (a, b) = (l.first_row, l.first_row + l.rows);
+            propose_candidates_from_rows(
+                weights,
+                &host_proj[a * rank..b * rank],
+                &top_ids[a * k..b * k],
+                &top_vals[a * k..b * k],
+                l.rows,
+                l.anchor,
+                0.0,
+                None,
+            )
+        })
+        .collect()
+}
+
+/// Selector hidden projection `[rows × rank]` (one `gemm_dispatch`),
+/// downloaded to the host.
+fn selector_projection_host(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    scratch: &DflashScratch,
+    hidden: &GpuTensor,
+    rows: usize,
+    rank: usize,
+) -> HipResult<Vec<f32>> {
     let proj = scratch
         .selector_proj
         .as_ref()
@@ -4544,67 +5050,27 @@ pub fn propose_candidates_device(
         std::slice::from_raw_parts_mut(host_proj.as_mut_ptr() as *mut u8, host_proj.len() * 4)
     };
     gpu.hip.memcpy_dtoh(bytes, &proj_slice.buf)?;
-    // GPU top-K raw values (small D2H)
-    let top_ids_gpu = scratch
-        .topk_ids
-        .as_ref()
-        .ok_or_else(|| hip_bridge::HipError::new(0, "topk_ids scratch not allocated"))?;
-    let top_vals_gpu = scratch
-        .topk_vals
-        .as_ref()
-        .ok_or_else(|| hip_bridge::HipError::new(0, "topk_vals scratch not allocated"))?;
-    let ids_slice = top_ids_gpu.sub_offset(0, rows * k);
-    let vals_slice = top_vals_gpu.sub_offset(0, rows * k);
-    // Call the raw top-k primitive; the string `topk_values_batched_f32` is kept for grep checks
-    // and the fallback trait will delegate to logsumexp when native is absent (per-row shift valid).
-    {
-        let _marker = "topk_values_batched_f32";
-        let _ = _marker;
-    }
-    gpu.topk_values_batched_f32(logits, &ids_slice, &vals_slice, vocab, k, rows)?;
-    let mut ids_bytes = vec![0u8; rows * k * 4];
-    let mut vals_bytes = vec![0u8; rows * k * 4];
-    gpu.hip.memcpy_dtoh(&mut ids_bytes, &ids_slice.buf)?;
-    gpu.hip.memcpy_dtoh(&mut vals_bytes, &vals_slice.buf)?;
-    let mut top_ids = Vec::with_capacity(rows * k);
-    let mut top_vals = Vec::with_capacity(rows * k);
-    for chunk in ids_bytes.chunks_exact(4) {
-        top_ids.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-    for chunk in vals_bytes.chunks_exact(4) {
-        top_vals.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-    propose_inner(
-        &DflashConfig {
-            n_layers: 0,
-            hidden: 0,
-            intermediate: 0,
-            n_heads: 0,
-            n_kv_heads: 0,
-            head_dim: 0,
-            vocab_size: vocab,
-            norm_eps: 0.0,
-            rope_theta: 0.0,
-            block_size: 0,
-            mask_token_id: 0,
-            target_layer_ids: vec![],
-            num_target_layers: 0,
-            declared_window: None,
-            all_layers_sliding: false,
-            conv_group_size: None,
-            conv_kernel_size: None,
-            selector_rank: Some(rank),
-            selector_top_k: Some(k),
-        },
-        weights,
-        &host_proj,
-        &top_ids,
-        &top_vals,
-        rows,
-        k,
-        rank,
-        anchor,
-        temperature,
-        uniforms,
-    )
+    Ok(host_proj)
+}
+
+/// Download `n` top-K ids (i32 stored in an F32 buffer) and values (f32).
+fn download_top(
+    gpu: &mut Gpu,
+    ids: &GpuTensor,
+    vals: &GpuTensor,
+    n: usize,
+) -> HipResult<(Vec<u32>, Vec<f32>)> {
+    let mut ids_bytes = vec![0u8; n * 4];
+    let mut vals_bytes = vec![0u8; n * 4];
+    gpu.hip.memcpy_dtoh(&mut ids_bytes, &ids.buf)?;
+    gpu.hip.memcpy_dtoh(&mut vals_bytes, &vals.buf)?;
+    let top_ids = ids_bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let top_vals = vals_bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    Ok((top_ids, top_vals))
 }

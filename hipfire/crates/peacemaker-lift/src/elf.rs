@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! C2: ELF section, symbol, note and envelope read/write.
 //!
 //! An `Envelope` is every byte of an AMDGPU code object except what its kernels own:
@@ -671,8 +675,8 @@ pub(crate) mod fixtures {
     /// SHA-256 f876e2ce520ba8d97358b34c903a48dafc5cff2e4cc552d7ffc775361cbcb6bc.
     pub fn kt48_co() -> Vec<u8> { load("tests/fixtures/kt48/hipcc.co", 42_208) }
 
-    /// The F2 builder bundle, SHA-256 73168098cae2d414ad8e0c97883b0c953350fbd2795af763d34a367085dcce4e.
-    pub fn f2_hxaco() -> Vec<u8> { load("../../kernels/gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco", 362_032) }
+    /// The F2 builder bundle, SHA-256 1efb0b8b16b510407446dae8dc4ec137955de27d818b424daeb84383c8191fa7.
+    pub fn f2_hxaco() -> Vec<u8> { load("../../kernels/gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco", 361_976) }
 }
 
 #[cfg(test)]

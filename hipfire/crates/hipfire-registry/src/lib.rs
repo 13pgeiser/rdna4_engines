@@ -28,6 +28,48 @@ pub const REGISTRY_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 pub const REGISTRY_FETCH_TIMEOUT: Duration = Duration::from_millis(3500);
 const BUNDLED_REGISTRY: &str = include_str!("../../../registry/v1.json");
 
+pub const FLASH_NEXT_XTS_LEGACY_FILE: &str = "qwen3.8-flash-next-gptq3.mq4";
+pub const FLASH_NEXT_XTS_CANONICAL_FILE: &str = "qwen3.8-flash-next.mq4-xts";
+const FLASH_NEXT_XTS_REPO: &str = "hipfire-models/qwen3.8-flash-next";
+const FLASH_NEXT_XTS_SIZE: u64 = 125288544792;
+const FLASH_NEXT_XTS_SHA256: &str =
+    "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972";
+
+/// Suffix appended to a split base's file name for its exact Q8F16 PLE rows.
+pub const PLE_Q8_SIDECAR_SUFFIX: &str = ".ple-q8";
+/// Suffix appended to a split base's file name for its 4-bit Lloyd-Max PLE rows.
+pub const PLE_Q4_SIDECAR_SUFFIX: &str = ".ple-q4";
+/// Marker inserted before the extension of a split base's file name
+/// (`qwen3.8-flash-next.mq4-xts` -> `qwen3.8-flash-next-base.mq4-xts`); the
+/// mirror of `hipfire_runtime::ple_convert::default_split_base_path`.
+const SPLIT_BASE_STEM_SUFFIX: &str = "-base";
+
+/// True when `file` is a bare split-base file name (`<name>-base.<ext>`).
+pub fn is_split_base_file(file: &str) -> bool {
+    monolithic_file_for_split_base(file).is_some()
+}
+
+/// The monolithic sibling file name of a split-base file name: drops the
+/// `-base` marker from the stem. `None` when `file` is not a bare split-base
+/// name (a path, an empty stem, or no `-base` marker).
+pub fn monolithic_file_for_split_base(file: &str) -> Option<String> {
+    if file.contains('/') || file.contains('\\') {
+        return None;
+    }
+    let path = Path::new(file);
+    let stem = path.file_stem()?.to_str()?;
+    let prefix = stem.strip_suffix(SPLIT_BASE_STEM_SUFFIX)?;
+    if prefix.is_empty() {
+        return None;
+    }
+    Some(
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some(extension) => format!("{prefix}.{extension}"),
+            None => prefix.to_owned(),
+        },
+    )
+}
+
 #[derive(Debug, Error)]
 pub enum RegistryError {
     #[error("failed to read {path}: {source}")]
@@ -64,6 +106,66 @@ pub struct Sidecar {
     pub sha256: Option<String>,
     #[serde(default)]
     pub size_bytes: Option<u64>,
+}
+
+/// Content identity of one trunk overlay sidecar and of the exact base
+/// artifact it is bound to.
+///
+/// The overlay is an HFQM container of pre-encoded QT44 trunk tensors
+/// (`<base file>.trunk-overlay`) that the Qwen4 loader applies by default on
+/// gfx1151 (`HIPFIRE_QWEN4_TRUNK_OVERLAY=0` is the kill switch). The pin lives
+/// in the client instead of a registry field so that older clients' strict
+/// `deny_unknown_fields` v1 parser keeps accepting the published registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrunkOverlayPin {
+    /// SHA-256 of the base artifact (the registry entry's `sha256`).
+    pub base_sha256: &'static str,
+    /// Size in bytes of the base artifact (the registry entry's `size_bytes`).
+    pub base_size: u64,
+    /// Hugging Face repo that hosts the overlay file.
+    pub repo: &'static str,
+    /// Overlay file name: the canonical base file name plus
+    /// `hipfire_config::memory::TRUNK_OVERLAY_SIDECAR_SUFFIX`.
+    pub file: &'static str,
+    /// SHA-256 of the overlay file.
+    pub sha256: &'static str,
+    /// Size in bytes of the overlay file.
+    pub size_bytes: u64,
+}
+
+/// Trunk overlays known to this client, keyed by exact base artifact identity.
+pub const TRUNK_OVERLAY_PINS: &[TrunkOverlayPin] = &[TrunkOverlayPin {
+    base_sha256: FLASH_NEXT_XTS_SHA256,
+    base_size: FLASH_NEXT_XTS_SIZE,
+    repo: FLASH_NEXT_XTS_REPO,
+    file: "qwen3.8-flash-next.mq4-xts.trunk-overlay",
+    sha256: "df49bc0aa601c2e26556261effd680f0be5d216804a1c5976a8a07ccd66840fd",
+    size_bytes: 305_543_168,
+}];
+
+/// A resolved trunk overlay: the repo that hosts it and its sidecar identity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrunkOverlay {
+    pub repo: &'static str,
+    pub sidecar: Sidecar,
+}
+
+/// The pin in `pins` whose base identity equals the entry's `sha256` and
+/// `size_bytes`, as a [`TrunkOverlay`]. An entry without a pinned digest and
+/// size never matches.
+pub fn trunk_overlay_in(entry: &ModelEntry, pins: &[TrunkOverlayPin]) -> Option<TrunkOverlay> {
+    let sha256 = entry.sha256.as_deref()?;
+    let size_bytes = entry.size_bytes?;
+    pins.iter()
+        .find(|pin| pin.base_size == size_bytes && pin.base_sha256.eq_ignore_ascii_case(sha256))
+        .map(|pin| TrunkOverlay {
+            repo: pin.repo,
+            sidecar: Sidecar {
+                file: pin.file.to_owned(),
+                sha256: Some(pin.sha256.to_owned()),
+                size_bytes: Some(pin.size_bytes),
+            },
+        })
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -219,6 +321,16 @@ pub struct ModelEntry {
     /// trunk; sha256/size_bytes stay absent until the pack ships.
     #[serde(default)]
     pub vision: Option<Sidecar>,
+    /// Exact Q8F16 PLE n-gram rows of a Flash-Next split base
+    /// (`<file>.ple-q8`). Only valid on an entry whose `file` is a split base
+    /// (`<name>-base.<ext>`); the file name must be exactly `<file>.ple-q8`.
+    #[serde(default)]
+    pub ple_q8: Option<Sidecar>,
+    /// 4-bit Lloyd-Max PLE rows of a Flash-Next split base (`<file>.ple-q4`),
+    /// bit-identical in decode to the q4 derived locally from the q8 rows.
+    /// Same placement rules as `ple_q8`.
+    #[serde(default)]
+    pub ple_q4: Option<Sidecar>,
     /// Alternative `lm_head` carriers, keyed by short name (`q4k`, `bf16`).
     ///
     /// Each is a single-tensor `.hfq` from `hipfire-quantize --head-only` that
@@ -252,6 +364,29 @@ pub struct ModelEntry {
 }
 
 impl ModelEntry {
+    /// Exact XTS artifact identity, including the two admitted filename spellings.
+    /// This selection has no filesystem side effects; CLI migration verifies bytes.
+    pub fn is_flash_next_xts(&self) -> bool {
+        self.repo == FLASH_NEXT_XTS_REPO
+            && self.size_bytes == Some(FLASH_NEXT_XTS_SIZE)
+            && self.sha256.as_deref() == Some(FLASH_NEXT_XTS_SHA256)
+            && matches!(
+                self.file.as_str(),
+                FLASH_NEXT_XTS_LEGACY_FILE | FLASH_NEXT_XTS_CANONICAL_FILE
+            )
+    }
+
+    /// The Flash-Next trunk overlay sidecar of this entry's base artifact, from
+    /// the compiled-in [`TRUNK_OVERLAY_PINS`]; `None` for every other entry.
+    pub fn trunk_overlay(&self) -> Option<TrunkOverlay> {
+        trunk_overlay_in(self, TRUNK_OVERLAY_PINS)
+    }
+
+    /// True when this entry is a split base that publishes PLE row sidecars.
+    pub fn has_ple_sidecars(&self) -> bool {
+        self.ple_q4.is_some() || self.ple_q8.is_some()
+    }
+
     /// Resolve a named sampling profile (`general` | `coding` | `instruct`).
     /// `general` falls back to `recommended_settings` (the default profile)
     /// when no explicit profile map is present. Unknown names return `None`.
@@ -301,8 +436,16 @@ impl ModelEntry {
 /// Backend selection is source-independent at admission. Qwen3.8 entries
 /// with `arch_id=16` (Qwen4) and Muse Glimmer tags write neither length.
 ///
-/// Explicit global/model/one-shot user config remains higher precedence than
-/// this registry layer.
+/// Qwen3.8-27B trunk tiers (`qwen3.8:27b` and `qwen3.8:27b-*`, never a
+/// longer lookalike such as `27boops`) that declare a paired `dflash` sidecar
+/// also lower `speculation.dflash = "auto"`. The load resolver wires the draft
+/// only when that registry-declared file is present; without it MTP `auto`
+/// stays in effect. The schema/BuiltIn default stays `off` for every other
+/// model; `arch_id=16`, draft/dflash sidecars, and tiers with no `dflash`
+/// declaration get no speculation policy.
+///
+/// Explicit global/model/one-shot user config (including `dflash=off`) remains
+/// higher precedence than this registry layer.
 pub fn config_layer_for_tag(
     tag: &str,
     entry: &ModelEntry,
@@ -316,6 +459,12 @@ pub fn config_layer_for_tag(
     if is_qwen_tag_policy {
         layer
             .set("generation.max_tokens", ConfigValue::Integer(81920))
+            .map_err(|error| error.to_string())?;
+    }
+    let is_qwen38_27b_tier = tag == "qwen3.8:27b" || tag.starts_with("qwen3.8:27b-");
+    if is_qwen_tag_policy && is_qwen38_27b_tier && entry.dflash.is_some() {
+        layer
+            .set("speculation.dflash", ConfigValue::String("auto".into()))
             .map_err(|error| error.to_string())?;
     }
     let is_deepseek_tag_policy =
@@ -348,6 +497,7 @@ impl RegistryV1 {
                 message: error.to_string(),
             })?;
         registry.validate(&source_name)?;
+        registry.normalize_flash_next_xts();
         // An alias is non-authoritative convenience data. Match v1 behavior by
         // dropping dangling redirects instead of rejecting an otherwise valid
         // registry.
@@ -355,6 +505,15 @@ impl RegistryV1 {
             .aliases
             .retain(|_, target| registry.models.contains_key(target));
         Ok(registry)
+    }
+
+    fn normalize_flash_next_xts(&mut self) {
+        for entry in self.models.values_mut() {
+            if entry.is_flash_next_xts() && entry.file != FLASH_NEXT_XTS_CANONICAL_FILE {
+                entry.file.clear();
+                entry.file.push_str(FLASH_NEXT_XTS_CANONICAL_FILE);
+            }
+        }
     }
 
     pub fn validate(&self, source_name: &str) -> Result<()> {
@@ -395,6 +554,8 @@ impl RegistryV1 {
                 &entry.clip,
                 &entry.qwen3,
                 &entry.vae,
+                &entry.ple_q4,
+                &entry.ple_q8,
             ]
             .into_iter()
             .flatten()
@@ -404,6 +565,28 @@ impl RegistryV1 {
                     return Err(fail(format!("model '{tag}' has an empty sidecar file")));
                 }
                 validate_digest(sidecar.sha256.as_deref(), tag).map_err(fail)?;
+            }
+            for (slot, suffix, sidecar) in [
+                ("ple_q4", PLE_Q4_SIDECAR_SUFFIX, &entry.ple_q4),
+                ("ple_q8", PLE_Q8_SIDECAR_SUFFIX, &entry.ple_q8),
+            ] {
+                let Some(sidecar) = sidecar else {
+                    continue;
+                };
+                if !is_split_base_file(&entry.file) {
+                    return Err(fail(format!(
+                        "model '{tag}' declares {slot} but its file '{}' is not a split base \
+                         (expected <name>-base.<ext>)",
+                        entry.file
+                    )));
+                }
+                let expected = format!("{}{suffix}", entry.file);
+                if sidecar.file != expected {
+                    return Err(fail(format!(
+                        "model '{tag}' {slot} file '{}' must be '{expected}'",
+                        sidecar.file
+                    )));
+                }
             }
             if let Some(format) = entry.default_tool_format.as_deref() {
                 if !matches!(format, "hermes" | "qwen_xml") {
@@ -463,19 +646,26 @@ impl RegistryV1 {
         self.models
             .iter()
             .find_map(|(tag, entry)| {
-                (entry.file == normalized || entry.file == input).then(|| tag.clone())
+                (entry.file == normalized
+                    || entry.file == input
+                    || (input == FLASH_NEXT_XTS_LEGACY_FILE && entry.is_flash_next_xts()))
+                .then(|| tag.clone())
             })
             .unwrap_or(normalized)
     }
 
-    /// Exact `entry.file` match for callers that already established the input
+    /// Exact bare filename match for callers that already established the input
     /// is the installed artifact (e.g. via canonical path comparison against
-    /// the models directory). Unlike [`RegistryV1::model`], this never applies
-    /// tag/alias normalization: `file_name` must be the bare file as stored.
+    /// the models directory). The pinned XTS legacy basename also matches its
+    /// normalized entry. Unlike [`RegistryV1::model`], no tag/alias normalization
+    /// is applied.
     pub fn entry_for_file(&self, file_name: &str) -> Option<(&str, &ModelEntry)> {
         self.models
             .iter()
-            .find(|(_, entry)| entry.file == file_name)
+            .find(|(_, entry)| {
+                entry.file == file_name
+                    || (file_name == FLASH_NEXT_XTS_LEGACY_FILE && entry.is_flash_next_xts())
+            })
             .map(|(tag, entry)| (tag.as_str(), entry))
     }
 
@@ -484,6 +674,25 @@ impl RegistryV1 {
         self.models
             .get_key_value(&tag)
             .map(|(tag, entry)| (tag.as_str(), entry))
+    }
+
+    /// The monolithic (PLE embedded) entry a split `entry` was cut from: the
+    /// entry of the same repo whose file is `entry.file` without the `-base`
+    /// marker and that has no PLE sidecars itself. `None` for an entry that is
+    /// not a split base or whose monolithic sibling is not catalogued. Lets a
+    /// user who still has the grandfathered monolithic keep serving it under
+    /// the split tag instead of being forced to re-download.
+    pub fn monolithic_sibling(&self, entry: &ModelEntry) -> Option<(&str, &ModelEntry)> {
+        if !entry.has_ple_sidecars() {
+            return None;
+        }
+        let file = monolithic_file_for_split_base(&entry.file)?;
+        self.models
+            .iter()
+            .find(|(_, other)| {
+                other.repo == entry.repo && other.file == file && !other.has_ple_sidecars()
+            })
+            .map(|(tag, other)| (tag.as_str(), other))
     }
 }
 
@@ -731,19 +940,23 @@ fn prefer_bundled_if_newer(
 }
 
 pub fn load(paths: &RegistryPaths) -> LoadedRegistry {
+    let url = env::var("HIPFIRE_REGISTRY_URL").unwrap_or_else(|_| DEFAULT_REGISTRY_URL.into());
+    let fetch = env::var_os("HIPFIRE_NO_REGISTRY_FETCH").as_deref() != Some("1".as_ref());
+    load_with_options(paths, fetch.then_some(url.as_str()))
+}
+
+fn load_with_options(paths: &RegistryPaths, url: Option<&str>) -> LoadedRegistry {
     let mut warnings = Vec::new();
     let bundled = bundled().expect("checked-in registry/v1.json must validate");
-    if env::var_os("HIPFIRE_NO_REGISTRY_FETCH").as_deref() == Some("1".as_ref()) {
+    let Some(url) = url else {
         return LoadedRegistry {
             registry: bundled,
             source: RegistrySource::Bundled,
             warnings,
         };
-    }
-
-    let url = env::var("HIPFIRE_REGISTRY_URL").unwrap_or_else(|_| DEFAULT_REGISTRY_URL.into());
+    };
     let now = epoch_millis();
-    let cache = read_cache(&paths.cache, &url, &mut warnings);
+    let cache = read_cache(&paths.cache, url, &mut warnings);
     if cache
         .as_ref()
         .is_some_and(|cache| cache_is_fresh(cache, now, REGISTRY_CACHE_TTL))
@@ -760,7 +973,7 @@ pub fn load(paths: &RegistryPaths) -> LoadedRegistry {
         Ok(registry) => {
             let cache_file = RegistryCache {
                 fetched_at: now,
-                url,
+                url: url.to_owned(),
                 registry: registry.clone(),
             };
             if let Err(error) = write_cache(&paths.cache, &cache_file) {
@@ -815,6 +1028,7 @@ fn read_cache(path: &Path, url: &str, warnings: &mut Vec<String>) -> Option<Regi
         warnings.push(error.to_string());
         return None;
     }
+    cache.registry.normalize_flash_next_xts();
     cache
         .registry
         .aliases
@@ -882,6 +1096,718 @@ fn epoch_millis() -> u64 {
 mod tests {
     use super::*;
 
+    const FLASH_NEXT_FIXTURE_TAGS: [&str; 4] = [
+        "qwen3.8:flash-next",
+        "qwen3.8:flash-next-mq4",
+        "qwen3.8:flash-next-gptq3",
+        "qwen3.8:flash-next-mq4-xts",
+    ];
+
+    fn pinned_flash_next_entry(file: &str) -> ModelEntry {
+        ModelEntry {
+            repo: FLASH_NEXT_XTS_REPO.into(),
+            file: file.into(),
+            size_gb: 125.29,
+            min_vram_gb: 8.0,
+            desc: "Qwen3.8-Flash-Next MQ4 XTS fixture".into(),
+            sha256: Some(FLASH_NEXT_XTS_SHA256.into()),
+            size_bytes: Some(FLASH_NEXT_XTS_SIZE),
+            arch_id: Some(16),
+            quant: Some("mq4".into()),
+            ..Default::default()
+        }
+    }
+
+    /// A registry as the pre-split wire format spelled it: three tags on the
+    /// legacy filename and the canonical pinned monolithic under its own tag.
+    fn flash_next_wire_registry(stamp: &str) -> RegistryV1 {
+        let mut models = BTreeMap::new();
+        for tag in &FLASH_NEXT_FIXTURE_TAGS[..3] {
+            models.insert(
+                (*tag).to_owned(),
+                pinned_flash_next_entry(FLASH_NEXT_XTS_LEGACY_FILE),
+            );
+        }
+        models.insert(
+            "qwen3.8:flash-next-mq4-xts".into(),
+            pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE),
+        );
+        RegistryV1 {
+            schema_version: REGISTRY_SCHEMA_VERSION,
+            generated_at: stamp.into(),
+            _comment: None,
+            models,
+            aliases: BTreeMap::from([("fixture".into(), "qwen3.8:flash-next".into())]),
+        }
+    }
+
+    fn assert_flash_next_xts(registry: &RegistryV1, tags: &[&str]) {
+        for tag in tags {
+            let (_, entry) = registry.model(tag).unwrap();
+            assert!(entry.is_flash_next_xts(), "{tag}");
+            assert_eq!(entry.file, FLASH_NEXT_XTS_CANONICAL_FILE, "{tag}");
+            assert_eq!(entry.arch_id, Some(16));
+            assert_eq!(entry.quant.as_deref(), Some("mq4"));
+        }
+    }
+
+    /// The pinned monolithic stays catalogued under its own tag whatever the
+    /// canonical `qwen3.8:flash-next` tag maps to (the pinned monolithic, or the
+    /// split base once the registry switches).
+    const BUNDLED_PINNED_TAGS: [&str; 1] = ["qwen3.8:flash-next-mq4-xts"];
+
+    #[test]
+    fn flash_next_xts_bundle_preserves_wire_compatibility_and_normalizes_locally() {
+        let wire: RegistryV1 = serde_json::from_str(BUNDLED_REGISTRY).unwrap();
+        assert_eq!(
+            wire.models["qwen3.8:flash-next-mq4-xts"].file,
+            FLASH_NEXT_XTS_CANONICAL_FILE
+        );
+        let parsed = bundled().unwrap();
+        assert_flash_next_xts(&parsed, &BUNDLED_PINNED_TAGS);
+        assert_eq!(wire.aliases["qwen3.8:flash"], "qwen3.8:flash-next");
+        let (short_tag, _) = parsed.model("qwen3.8:flash").unwrap();
+        assert_eq!(short_tag, "qwen3.8:flash-next");
+        assert!(wire
+            .models
+            .values()
+            .all(|entry| !entry.desc.to_ascii_lowercase().contains("gptq3")));
+        for (tag, entry) in &wire.models {
+            let mut expected = entry.clone();
+            if expected.is_flash_next_xts() {
+                assert!(!entry.desc.contains("GPTQ3"), "{tag}");
+                expected.file = FLASH_NEXT_XTS_CANONICAL_FILE.into();
+            }
+            assert_eq!(
+                &parsed.models[tag], &expected,
+                "{tag}: only filename may change"
+            );
+        }
+        assert!(!parsed.models["qwen3.8:flash-next-rtn-asym"].is_flash_next_xts());
+        assert_eq!(
+            parsed.models["qwen3.8:flash-next-rtn-asym"].file,
+            "qwen3.8-flash-next.mq4"
+        );
+    }
+
+    #[test]
+    fn flash_next_zab_named_tier_preserves_stock_aliases() {
+        let wire: RegistryV1 = serde_json::from_str(BUNDLED_REGISTRY).unwrap();
+        let curated: serde_json::Value =
+            serde_json::from_str(include_str!("../../../registry/models.json")).unwrap();
+        let tag = "qwen3.8:flash-next-mq4-xts-zab";
+        let zab = &wire.models[tag];
+        assert!(zab.repo.is_empty(), "staged artifact must not be pullable");
+        assert_eq!(zab.file, "qwen3.8-flash-next.mq4-xts-zab");
+        assert_eq!(zab.arch_id, Some(16));
+        assert_eq!(zab.quant.as_deref(), Some("mq4"));
+        assert_eq!(
+            zab.sha256.as_deref(),
+            Some("a85a00d192ee7a352d5d1f55f0421691a2553fe90f05d9ae1d7e59fec5b686fa")
+        );
+        assert_eq!(zab.size_bytes, Some(125144775192));
+        let curated_zab: ModelEntry =
+            serde_json::from_value(curated["models"][tag].clone()).unwrap();
+        assert_eq!(zab.sha256, curated_zab.sha256);
+        assert_eq!(zab.size_bytes, curated_zab.size_bytes);
+        assert!(!zab.is_flash_next_xts());
+        assert!(zab.desc.contains("LOCAL-ONLY"));
+        assert!(zab.desc.contains("108 GDN"));
+        assert!(zab.desc.contains("symmetric QT44"));
+        assert!(zab.desc.contains("non-zab bytes unchanged"));
+        assert!(zab.desc.contains("qwen4_trunk_iu4_default=gfx1151-zab-v1"));
+        assert!(zab.desc.contains("HIPFIRE_QWEN4_TRUNK_IU4=0"));
+        assert!(zab.desc.contains("NOT uploaded/pullable"));
+        let settings = zab.recommended_settings.as_ref().unwrap();
+        assert_eq!(settings.temperature, Some(1.0));
+        assert_eq!(settings.top_p, Some(0.95));
+        assert_eq!(settings.top_k, Some(20));
+        assert_eq!(serde_json::to_value(&wire.aliases).unwrap(), curated["aliases"]);
+        assert_eq!(wire.aliases["qwen3.8:flash"], "qwen3.8:flash-next");
+        assert!(!wire.aliases.values().any(|target| target == tag));
+        for stock in FLASH_NEXT_FIXTURE_TAGS {
+            let entry = &wire.models[stock];
+            assert_eq!(entry.repo, FLASH_NEXT_XTS_REPO);
+            assert_eq!(entry.sha256.as_deref(), Some(FLASH_NEXT_XTS_SHA256));
+            assert_eq!(entry.size_bytes, Some(FLASH_NEXT_XTS_SIZE));
+            assert_eq!(
+                entry.file,
+                if stock == "qwen3.8:flash-next-mq4-xts" {
+                    FLASH_NEXT_XTS_CANONICAL_FILE
+                } else {
+                    FLASH_NEXT_XTS_LEGACY_FILE
+                }
+            );
+            assert_eq!(entry.recommended_settings, zab.recommended_settings);
+        }
+    }
+
+    const TRUNK_OVERLAY_FILE: &str = "qwen3.8-flash-next.mq4-xts.trunk-overlay";
+
+    #[test]
+    fn trunk_overlay_pin_names_the_canonical_base_file_plus_the_suffix() {
+        assert_eq!(TRUNK_OVERLAY_PINS.len(), 1);
+        let pin = &TRUNK_OVERLAY_PINS[0];
+        assert_eq!(
+            pin.file,
+            format!(
+                "{FLASH_NEXT_XTS_CANONICAL_FILE}{}",
+                hipfire_config::memory::TRUNK_OVERLAY_SIDECAR_SUFFIX
+            )
+        );
+        assert_eq!(pin.file, TRUNK_OVERLAY_FILE);
+        assert_eq!(pin.base_sha256, FLASH_NEXT_XTS_SHA256);
+        assert_eq!(pin.base_size, FLASH_NEXT_XTS_SIZE);
+        assert_eq!(pin.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(pin.size_bytes, 305_543_168);
+        for digest in [pin.base_sha256, pin.sha256] {
+            assert_eq!(digest.len(), 64);
+            assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+        assert!(!pin.file.contains('/') && !pin.file.contains('\\'));
+    }
+
+    #[test]
+    fn trunk_overlay_lookup_matches_the_base_identity_only() {
+        let entry = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        let overlay = entry.trunk_overlay().unwrap();
+        assert_eq!(overlay.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(
+            overlay.sidecar,
+            Sidecar {
+                file: TRUNK_OVERLAY_FILE.into(),
+                sha256: Some(TRUNK_OVERLAY_PINS[0].sha256.into()),
+                size_bytes: Some(305_543_168),
+            }
+        );
+        // The legacy spelling of the same pinned bytes resolves to the canonical overlay name.
+        let legacy = pinned_flash_next_entry(FLASH_NEXT_XTS_LEGACY_FILE);
+        assert_eq!(legacy.trunk_overlay(), Some(overlay));
+
+        let mut other = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        other.sha256 = Some(digest('a'));
+        assert!(other.trunk_overlay().is_none());
+        let mut other = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        other.size_bytes = Some(FLASH_NEXT_XTS_SIZE - 1);
+        assert!(other.trunk_overlay().is_none());
+        let mut other = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        other.sha256 = None;
+        assert!(other.trunk_overlay().is_none());
+        let mut other = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        other.size_bytes = None;
+        assert!(other.trunk_overlay().is_none());
+    }
+
+    #[test]
+    fn trunk_overlay_in_uses_the_supplied_pin_table() {
+        let mut entry = pinned_flash_next_entry("custom.mq4");
+        entry.sha256 = Some(digest('b'));
+        entry.size_bytes = Some(123);
+        assert!(trunk_overlay_in(&entry, TRUNK_OVERLAY_PINS).is_none());
+        let pins = [TrunkOverlayPin {
+            base_sha256: "b".repeat(64).leak(),
+            base_size: 123,
+            repo: "test/repo",
+            file: "custom.mq4.trunk-overlay",
+            sha256: "c".repeat(64).leak(),
+            size_bytes: 7,
+        }];
+        let overlay = trunk_overlay_in(&entry, &pins).unwrap();
+        assert_eq!(overlay.repo, "test/repo");
+        assert_eq!(overlay.sidecar.file, "custom.mq4.trunk-overlay");
+        assert_eq!(overlay.sidecar.sha256, Some(digest('c')));
+        assert_eq!(overlay.sidecar.size_bytes, Some(7));
+        assert!(trunk_overlay_in(&entry, &[]).is_none());
+    }
+
+    #[test]
+    fn bundled_registry_resolves_the_trunk_overlay_on_exactly_the_stock_xts_tags() {
+        let parsed = bundled().unwrap();
+        let mut resolved: Vec<&str> = parsed
+            .models
+            .iter()
+            .filter(|(_, entry)| entry.trunk_overlay().is_some())
+            .map(|(tag, _)| tag.as_str())
+            .collect();
+        resolved.sort_unstable();
+        let mut expected = FLASH_NEXT_FIXTURE_TAGS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(resolved, expected);
+        assert!(parsed.models["qwen3.8:flash-next-rtn-asym"]
+            .trunk_overlay()
+            .is_none());
+        assert!(parsed.models["qwen3.8:flash-next-mq4-xts-zab"]
+            .trunk_overlay()
+            .is_none());
+        let first = parsed.models["qwen3.8:flash-next"].trunk_overlay().unwrap();
+        for tag in FLASH_NEXT_FIXTURE_TAGS {
+            assert_eq!(
+                parsed.models[tag].trunk_overlay().as_ref(),
+                Some(&first),
+                "{tag}"
+            );
+        }
+        let (alias_tag, aliased) = parsed.model("qwen3.8:flash").unwrap();
+        assert_eq!(alias_tag, "qwen3.8:flash-next");
+        assert_eq!(aliased.trunk_overlay().as_ref(), Some(&first));
+    }
+
+    #[test]
+    fn the_wire_registry_has_no_trunk_overlay_field() {
+        // The overlay pin is compiled into the client; the registry schema is
+        // unchanged so older clients' strict v1 parser keeps accepting it.
+        assert!(!BUNDLED_REGISTRY.contains("trunk_overlay"));
+        assert!(!include_str!("../../../registry/models.json").contains("trunk_overlay"));
+        let mut value: serde_json::Value = serde_json::from_str(BUNDLED_REGISTRY).unwrap();
+        value["models"]["qwen3.8:flash-next"]["trunk_overlay"] = serde_json::json!({
+            "file": TRUNK_OVERLAY_FILE
+        });
+        assert!(
+            RegistryV1::parse(&value.to_string(), "fixture").is_err(),
+            "ModelEntry stays deny_unknown_fields"
+        );
+    }
+
+    #[test]
+    fn flash_next_legacy_spelled_wire_entries_normalize_locally() {
+        let wire = flash_next_wire_registry("2099-01-01T00:00:00Z");
+        for tag in &FLASH_NEXT_FIXTURE_TAGS[..3] {
+            assert_eq!(wire.models[*tag].file, FLASH_NEXT_XTS_LEGACY_FILE);
+        }
+        let parsed = RegistryV1::parse(&serde_json::to_string(&wire).unwrap(), "fixture").unwrap();
+        assert_flash_next_xts(&parsed, &FLASH_NEXT_FIXTURE_TAGS);
+        assert_eq!(parsed.model("fixture").unwrap().0, "qwen3.8:flash-next");
+    }
+
+    const SPLIT_BASE_FILE: &str = "qwen3.8-flash-next-base.mq4-xts";
+
+    fn digest(byte: char) -> String {
+        byte.to_string().repeat(64)
+    }
+
+    /// The registry after the split switch: `qwen3.8:flash-next` is the split
+    /// base with both PLE slots; the pinned monolithic keeps its own tags.
+    fn split_registry_json() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "generated_at": "2099-01-01T00:00:00Z",
+            "models": {
+                "qwen3.8:flash-next": {
+                    "repo": FLASH_NEXT_XTS_REPO,
+                    "file": SPLIT_BASE_FILE,
+                    "size_gb": 70.9,
+                    "min_vram_gb": 8.0,
+                    "desc": "Qwen3.8-Flash-Next MQ4 XTS split base",
+                    "arch_id": 16,
+                    "quant": "mq4",
+                    "sha256": digest('a'),
+                    "size_bytes": 70_900_000_000_u64,
+                    "ple_q8": {
+                        "file": format!("{SPLIT_BASE_FILE}.ple-q8"),
+                        "sha256": digest('b'),
+                        "size_bytes": 54_400_000_000_u64
+                    },
+                    "ple_q4": {
+                        "file": format!("{SPLIT_BASE_FILE}.ple-q4"),
+                        "sha256": digest('c'),
+                        "size_bytes": 28_800_000_000_u64
+                    }
+                },
+                "qwen3.8:flash-next-mq4": serde_json::to_value(
+                    pinned_flash_next_entry(FLASH_NEXT_XTS_LEGACY_FILE)).unwrap(),
+                "qwen3.8:flash-next-mq4-xts": serde_json::to_value(
+                    pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE)).unwrap()
+            },
+            "aliases": { "qwen3.8:flash": "qwen3.8:flash-next" }
+        })
+    }
+
+    fn parse_split(value: &serde_json::Value) -> Result<RegistryV1> {
+        RegistryV1::parse(&value.to_string(), "split fixture")
+    }
+
+    #[test]
+    fn split_entry_parses_and_keeps_the_pinned_monolithic_distinct() {
+        let registry = parse_split(&split_registry_json()).unwrap();
+        let (tag, split) = registry.model("qwen3.8:flash").unwrap();
+        assert_eq!(tag, "qwen3.8:flash-next");
+        assert_eq!(split.file, SPLIT_BASE_FILE);
+        assert!(split.has_ple_sidecars());
+        assert!(
+            !split.is_flash_next_xts(),
+            "the split base is not the pinned monolithic"
+        );
+        assert_eq!(
+            split.ple_q8.as_ref().unwrap().file,
+            format!("{SPLIT_BASE_FILE}{PLE_Q8_SIDECAR_SUFFIX}")
+        );
+        assert_eq!(
+            split.ple_q4.as_ref().unwrap().file,
+            format!("{SPLIT_BASE_FILE}{PLE_Q4_SIDECAR_SUFFIX}")
+        );
+        // The pinned monolithic still normalizes to the canonical file under its tags.
+        assert_flash_next_xts(
+            &registry,
+            &["qwen3.8:flash-next-mq4", "qwen3.8:flash-next-mq4-xts"],
+        );
+        // Either legacy spelling of the pin resolves to a pinned entry, never the split.
+        let (legacy_tag, legacy) = registry.model(FLASH_NEXT_XTS_LEGACY_FILE).unwrap();
+        assert!(legacy.is_flash_next_xts(), "{legacy_tag}");
+        assert_eq!(
+            registry.entry_for_file(SPLIT_BASE_FILE).unwrap().0,
+            "qwen3.8:flash-next"
+        );
+        let reparsed = parse_split(&serde_json::to_value(&registry).unwrap()).unwrap();
+        assert_eq!(registry, reparsed);
+    }
+
+    #[test]
+    fn split_base_without_slots_or_with_one_slot_is_valid() {
+        for keep in [None, Some("ple_q8"), Some("ple_q4")] {
+            let mut value = split_registry_json();
+            let entry = value["models"]["qwen3.8:flash-next"]
+                .as_object_mut()
+                .unwrap();
+            for slot in ["ple_q8", "ple_q4"] {
+                if Some(slot) != keep {
+                    entry.remove(slot);
+                }
+            }
+            let registry = parse_split(&value).unwrap();
+            assert_eq!(
+                registry.models["qwen3.8:flash-next"].has_ple_sidecars(),
+                keep.is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn ple_slot_validation_rejects_misplaced_or_malformed_sidecars() {
+        let cases: [(&str, Box<dyn Fn(&mut serde_json::Value)>, &str); 7] = [
+            (
+                "slot on a monolithic file",
+                Box::new(|entry: &mut serde_json::Value| {
+                    entry["file"] = "qwen3.8-flash-next.mq4-xts".into();
+                    entry["ple_q8"]["file"] = "qwen3.8-flash-next.mq4-xts.ple-q8".into();
+                    entry["ple_q4"]["file"] = "qwen3.8-flash-next.mq4-xts.ple-q4".into();
+                }),
+                "not a split base",
+            ),
+            (
+                "q8 file does not follow the base",
+                Box::new(|entry: &mut serde_json::Value| {
+                    entry["ple_q8"]["file"] = "other.ple-q8".into()
+                }),
+                "must be",
+            ),
+            (
+                "q4 slot names the q8 file",
+                Box::new(|entry: &mut serde_json::Value| {
+                    entry["ple_q4"]["file"] = format!("{SPLIT_BASE_FILE}.ple-q8").into();
+                }),
+                "must be",
+            ),
+            (
+                "sidecar in a subdirectory",
+                Box::new(|entry: &mut serde_json::Value| {
+                    entry["ple_q4"]["file"] = format!("sub/{SPLIT_BASE_FILE}.ple-q4").into();
+                }),
+                "must be",
+            ),
+            (
+                "bad q8 digest",
+                Box::new(|entry: &mut serde_json::Value| {
+                    entry["ple_q8"]["sha256"] = "8b15b6".into()
+                }),
+                "invalid SHA-256",
+            ),
+            (
+                "empty q4 file",
+                Box::new(|entry: &mut serde_json::Value| entry["ple_q4"]["file"] = "  ".into()),
+                "empty sidecar file",
+            ),
+            (
+                "empty stem before -base",
+                Box::new(|entry: &mut serde_json::Value| {
+                    entry["file"] = "-base.mq4-xts".into();
+                    entry["ple_q8"]["file"] = "-base.mq4-xts.ple-q8".into();
+                    entry["ple_q4"]["file"] = "-base.mq4-xts.ple-q4".into();
+                }),
+                "not a split base",
+            ),
+        ];
+        for (name, mutate, needle) in cases {
+            let mut value = split_registry_json();
+            mutate(&mut value["models"]["qwen3.8:flash-next"]);
+            let error = parse_split(&value).expect_err(name).to_string();
+            assert!(error.contains(needle), "{name}: {error}");
+        }
+        let mut value = split_registry_json();
+        value["models"]["qwen3.8:flash-next"]["ple_q8"]["unknown"] = 1.into();
+        assert!(
+            parse_split(&value).is_err(),
+            "sidecar slots stay deny_unknown_fields"
+        );
+    }
+
+    #[test]
+    fn split_base_file_helpers_mirror_the_converter_naming() {
+        for (base, monolithic) in [
+            (
+                "qwen3.8-flash-next-base.mq4-xts",
+                Some("qwen3.8-flash-next.mq4-xts"),
+            ),
+            ("model-base.mq4", Some("model.mq4")),
+            ("model-base", Some("model")),
+            ("model.mq4", None),
+            ("-base.mq4", None),
+            ("model-base.mq4.ple-q8", None),
+            ("dir/model-base.mq4", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                monolithic_file_for_split_base(base).as_deref(),
+                monolithic,
+                "{base}"
+            );
+            assert_eq!(is_split_base_file(base), monolithic.is_some(), "{base}");
+        }
+    }
+
+    #[test]
+    fn monolithic_sibling_maps_the_split_base_to_the_catalogued_pin() {
+        let registry = parse_split(&split_registry_json()).unwrap();
+        let split = &registry.models["qwen3.8:flash-next"];
+        let (_, sibling) = registry.monolithic_sibling(split).unwrap();
+        assert!(sibling.is_flash_next_xts());
+        assert_eq!(sibling.file, FLASH_NEXT_XTS_CANONICAL_FILE);
+        // A monolithic entry has no sibling of its own.
+        assert!(registry
+            .monolithic_sibling(&registry.models["qwen3.8:flash-next-mq4-xts"])
+            .is_none());
+
+        let mut orphan = split_registry_json();
+        orphan["models"]
+            .as_object_mut()
+            .unwrap()
+            .remove("qwen3.8:flash-next-mq4");
+        orphan["models"]
+            .as_object_mut()
+            .unwrap()
+            .remove("qwen3.8:flash-next-mq4-xts");
+        let orphan = parse_split(&orphan).unwrap();
+        assert!(orphan
+            .monolithic_sibling(&orphan.models["qwen3.8:flash-next"])
+            .is_none());
+
+        let mut foreign = split_registry_json();
+        foreign["models"]["qwen3.8:flash-next-mq4"]["repo"] = "other/repo".into();
+        foreign["models"]["qwen3.8:flash-next-mq4-xts"]["repo"] = "other/repo".into();
+        let foreign = parse_split(&foreign).unwrap();
+        assert!(foreign
+            .monolithic_sibling(&foreign.models["qwen3.8:flash-next"])
+            .is_none());
+    }
+
+    #[test]
+    fn bundled_split_entries_name_their_monolithic_sibling() {
+        let registry = bundled().unwrap();
+        for (tag, entry) in &registry.models {
+            if entry.has_ple_sidecars() {
+                assert!(
+                    registry.monolithic_sibling(entry).is_some(),
+                    "{tag}: a split entry must keep its grandfathered monolithic catalogued"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn flash_next_xts_normalization_requires_the_complete_pin_and_exact_filename() {
+        let wire = flash_next_wire_registry("2099-01-01T00:00:00Z");
+        let original = wire.models["qwen3.8:flash-next"].clone();
+        assert!(original.is_flash_next_xts());
+        for mismatch in 0..7 {
+            let mut entry = original.clone();
+            match mismatch {
+                0 => entry.repo = "other/qwen3.8-flash-next".into(),
+                1 => entry.size_bytes = Some(FLASH_NEXT_XTS_SIZE - 1),
+                2 => entry.sha256 = Some("a".repeat(64)),
+                3 => entry.file = "qwen3.8-flash-next.mq4".into(),
+                4 => entry.file = format!("subdir/{FLASH_NEXT_XTS_LEGACY_FILE}"),
+                5 => entry.sha256 = None,
+                6 => entry.size_bytes = None,
+                _ => unreachable!(),
+            }
+            assert!(!entry.is_flash_next_xts());
+            let mut changed = wire.clone();
+            changed
+                .models
+                .insert("qwen3.8:flash-next".into(), entry.clone());
+            let parsed =
+                RegistryV1::parse(&serde_json::to_string(&changed).unwrap(), "fixture").unwrap();
+            assert_eq!(parsed.models["qwen3.8:flash-next"], entry);
+        }
+        let parsed = RegistryV1::parse(&serde_json::to_string(&wire).unwrap(), "fixture").unwrap();
+        assert_eq!(
+            parsed.model("fixture").unwrap().1.file,
+            FLASH_NEXT_XTS_CANONICAL_FILE
+        );
+        let reparsed =
+            RegistryV1::parse(&serde_json::to_string(&parsed).unwrap(), "fixture").unwrap();
+        assert_eq!(parsed, reparsed);
+        assert!(parsed
+            .model(FLASH_NEXT_XTS_LEGACY_FILE)
+            .unwrap()
+            .1
+            .is_flash_next_xts());
+        assert!(parsed
+            .entry_for_file(FLASH_NEXT_XTS_LEGACY_FILE)
+            .unwrap()
+            .1
+            .is_flash_next_xts());
+        for path in [
+            format!("./{FLASH_NEXT_XTS_LEGACY_FILE}"),
+            format!("/tmp/{FLASH_NEXT_XTS_LEGACY_FILE}"),
+        ] {
+            assert!(parsed.model(&path).is_none());
+            assert!(parsed.entry_for_file(&path).is_none());
+        }
+        let mut vintage = wire.clone();
+        vintage.models.remove("qwen3.8:flash-next-mq4-xts");
+        let parsed =
+            RegistryV1::parse(&serde_json::to_string(&vintage).unwrap(), "v0.4.1 remote").unwrap();
+        for entry in parsed.models.values() {
+            assert!(entry.is_flash_next_xts());
+            assert_eq!(entry.file, FLASH_NEXT_XTS_CANONICAL_FILE);
+        }
+        let mut invalid = wire;
+        invalid.models.get_mut("qwen3.8:flash-next").unwrap().sha256 = Some("8b15b6".into());
+        assert!(RegistryV1::parse(&serde_json::to_string(&invalid).unwrap(), "fixture").is_err());
+    }
+
+    struct RegistryTestDir(PathBuf);
+
+    impl RegistryTestDir {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let dir = env::temp_dir().join(format!(
+                "hipfire-registry-{}-{}-{}",
+                std::process::id(),
+                epoch_millis(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for RegistryTestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn serve_registry_once(registry: &RegistryV1) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/alternate-registry.json",
+            listener.local_addr().unwrap()
+        );
+        let body = serde_json::to_string(registry).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let read = socket.read(&mut request).unwrap();
+            assert!(read > 0, "client sent no request");
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            ).unwrap();
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn flash_next_xts_normalizes_bundle_remote_fresh_and_stale_cache_and_alternate_url() {
+        let dir = RegistryTestDir::new();
+        let paths = RegistryPaths {
+            cache: dir.0.join("registry.cache.json"),
+        };
+        let offline = load_with_options(&paths, None);
+        assert_eq!(offline.source, RegistrySource::Bundled);
+        assert_flash_next_xts(&offline.registry, &BUNDLED_PINNED_TAGS);
+        assert!(
+            !paths.cache.exists(),
+            "bundle-only must not fetch or write cache"
+        );
+
+        let wire = flash_next_wire_registry("2099-01-01T00:00:00Z");
+        let (url, server) = serve_registry_once(&wire);
+        let remote = load_with_options(&paths, Some(&url));
+        server.join().unwrap();
+        assert_eq!(remote.source, RegistrySource::Network);
+        assert_flash_next_xts(&remote.registry, &FLASH_NEXT_FIXTURE_TAGS);
+        let cached = load_with_options(&paths, Some(&url));
+        assert_eq!(cached.source, RegistrySource::Cache);
+        assert_flash_next_xts(&cached.registry, &FLASH_NEXT_FIXTURE_TAGS);
+
+        // Simulate a pre-upgrade cache: deserialization alone has not normalized it.
+        let legacy_cache = RegistryCache {
+            fetched_at: epoch_millis(),
+            url: url.clone(),
+            registry: wire.clone(),
+        };
+        write_cache(&paths.cache, &legacy_cache).unwrap();
+        let cached = load_with_options(&paths, Some(&url));
+        assert_eq!(cached.source, RegistrySource::Cache);
+        assert_flash_next_xts(&cached.registry, &FLASH_NEXT_FIXTURE_TAGS);
+        assert!(cached
+            .registry
+            .model("fixture")
+            .unwrap()
+            .1
+            .is_flash_next_xts());
+
+        let mut stale = legacy_cache;
+        stale.fetched_at = 0;
+        write_cache(&paths.cache, &stale).unwrap();
+        let loaded = load_with_options(&paths, Some(&url));
+        assert_eq!(loaded.source, RegistrySource::StaleCache);
+        assert_flash_next_xts(&loaded.registry, &FLASH_NEXT_FIXTURE_TAGS);
+        assert!(!loaded.warnings.is_empty());
+
+        let (alternate, server) = serve_registry_once(&wire);
+        assert_ne!(url, alternate);
+        let loaded = load_with_options(&paths, Some(&alternate));
+        server.join().unwrap();
+        assert_eq!(loaded.source, RegistrySource::Network, "cache is URL-bound");
+        assert_flash_next_xts(&loaded.registry, &FLASH_NEXT_FIXTURE_TAGS);
+        let offline = load_with_options(&paths, None);
+        assert_eq!(
+            offline.source,
+            RegistrySource::Bundled,
+            "disabled fetch ignores cache"
+        );
+
+        let old_wire = flash_next_wire_registry("2000-01-01T00:00:00Z");
+        let (old_url, server) = serve_registry_once(&old_wire);
+        let loaded = load_with_options(&paths, Some(&old_url));
+        server.join().unwrap();
+        assert_eq!(loaded.source, RegistrySource::Bundled, "newer bundle wins");
+        assert_flash_next_xts(&loaded.registry, &BUNDLED_PINNED_TAGS);
+        assert!(loaded
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("newer")));
+    }
+
     #[test]
     fn config_layer_omits_universal_q8_fallback_but_lowers_model_opinions() {
         let raw = r#"{
@@ -895,7 +1821,12 @@ mod tests {
         }"#;
         let registry = RegistryV1::parse(raw, "test").unwrap();
 
-        let fallback = registry.model("fallback").unwrap().1.config_layer().unwrap();
+        let fallback = registry
+            .model("fallback")
+            .unwrap()
+            .1
+            .config_layer()
+            .unwrap();
         assert!(fallback.get("memory.kv_cache").is_none());
 
         let opinion = registry.model("opinion").unwrap().1.config_layer().unwrap();
@@ -1257,7 +2188,7 @@ mod tests {
         assert_eq!(settings.min_p, Some(0.0));
         assert_eq!(settings.presence_penalty, Some(0.0));
         assert_eq!(settings.repeat_penalty, Some(1.0));
-        assert_eq!(settings.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(settings.reasoning_effort.as_deref(), Some("medium"));
         assert!(
             settings.thinking_budget.is_none(),
             "effort-native: absence means uncapped"
@@ -1274,7 +2205,7 @@ mod tests {
         assert_eq!(general.min_p, Some(0.0));
         assert_eq!(general.presence_penalty, Some(0.0));
         assert_eq!(general.repeat_penalty, Some(1.0));
-        assert_eq!(general.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(general.reasoning_effort.as_deref(), Some("medium"));
         assert!(
             general.thinking_budget.is_none(),
             "effort-native: absence means uncapped"
@@ -1317,7 +2248,7 @@ mod tests {
         assert!(flash_layer.get("generation.max_tokens").is_none());
         assert_eq!(
             layer.get("reasoning.effort"),
-            Some(&ConfigValue::String("xhigh".into()))
+            Some(&ConfigValue::String("medium".into()))
         );
         // Original Qwen3 family (without .5/.6/.8) receives no automatic policy.
         let qwen3_raw = r#"{
@@ -1333,6 +2264,50 @@ mod tests {
         assert!(q3_layer.get("memory.kv_backend").is_none());
         assert!(q3_layer.get("memory.max_seq").is_none());
         assert!(q3_layer.get("generation.max_tokens").is_none());
+    }
+
+    /// Qwen3.8 dense tiers and both Ornith 1.5 artifacts share the effort-native
+    /// Qwen3.8 contract: the registry default and general profile are medium.
+    /// Flash-Next (Qwen4, arch_id=16), sidecar drafts, and the intentional
+    /// Ornith coding/instruct profiles are unchanged.
+    #[test]
+    fn bundled_qwen38_family_effort_defaults_medium() {
+        let registry = bundled().unwrap();
+        let mut tiers = 0;
+        for (tag, entry) in &registry.models {
+            let is_dense_trunk = tag.starts_with("qwen3.8:27b") && !tag.contains("-draft");
+            let is_ornith = tag.starts_with("ornith-1.5:");
+            if !is_dense_trunk && !is_ornith {
+                continue;
+            }
+            let settings = entry
+                .recommended_settings
+                .as_ref()
+                .unwrap_or_else(|| panic!("{tag} must carry recommended_settings"));
+            assert_eq!(
+                settings.reasoning_effort.as_deref(),
+                Some("medium"),
+                "{tag} recommended_settings effort"
+            );
+            let general = entry
+                .sampling_profile("general")
+                .unwrap_or_else(|| panic!("{tag} must carry a general profile"));
+            assert_eq!(
+                general.reasoning_effort.as_deref(),
+                Some("medium"),
+                "{tag} general profile effort"
+            );
+            tiers += 1;
+        }
+        assert!(tiers >= 15, "13 Qwen3.8-27B tiers plus 2 Ornith artifacts");
+
+        // Flash-Next (arch_id=16) never carried an effort default.
+        let (_, flash) = registry.model("qwen3.8:flash-next").unwrap();
+        assert_eq!(flash.arch_id, Some(16));
+        assert!(!flash
+            .recommended_settings
+            .as_ref()
+            .is_some_and(|settings| settings.reasoning_effort.is_some()));
     }
 
     #[test]
@@ -1430,14 +2405,16 @@ mod tests {
 
     #[test]
     fn bundled_vision_sidecar_is_shared_across_qwen38_tiers() {
-        // Every `qwen3.8:27b*` tier declares the same vision-tower sidecar
-        // (`qwen3.8-27b-vision.hfq`) so each text quant tier serves images
-        // without requantizing the trunk. Unlike dflash, the vision file is
-        // standalone: no registry entry's `file` names it.
+        // Every non-draft `qwen3.8:27b*` target tier declares the same
+        // vision-tower sidecar (`qwen3.8-27b-vision.hfq`) so each text quant
+        // tier serves images without requantizing the trunk. `-draft*` tags
+        // are text-only DFlash controller sidecars and carry no vision. Unlike
+        // dflash, the vision file is standalone: no registry entry's `file`
+        // names it.
         let registry = bundled().unwrap();
         let mut declared = 0;
         for (tag, entry) in &registry.models {
-            if !tag.starts_with("qwen3.8:27b") {
+            if !tag.starts_with("qwen3.8:27b") || tag.contains("-draft") {
                 continue;
             }
             let sidecar = entry
@@ -1853,6 +2830,258 @@ mod tests {
     }
 
     #[test]
+    fn qwen38_27b_dflash_auto_is_scoped_to_paired_trunk_tiers() {
+        // `speculation.dflash = "auto"` is lowered only for canonical Qwen3.8-27B
+        // trunk tags (`qwen3.8:27b`, `qwen3.8:27b-*`) that declare a `dflash`
+        // sidecar, are not draft/dflash sidecars, and are not arch_id=16.
+        let dflash = r#""dflash":{"file":"qwen38-27b-dflash-mq4.hfq"}"#;
+        let raw = format!(
+            r#"{{
+            "schema_version":1,
+            "generated_at":"2026-09-01T00:00:00Z",
+            "models":{{
+                "qwen3.8:27b":{{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:27b-mq3":{{"repo":"x","file":"qwen3.8-27b.mq3","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:27b-mq4-pro":{{"repo":"x","file":"qwen3.8-27b.mq4-pro","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:27b-mq4-xt":{{"repo":"x","file":"qwen3.8-27b.mq4-xt","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:27b-mq5":{{"repo":"x","file":"qwen3.8-27b.mq5","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5}},
+                "qwen3.8:27boops":{{"repo":"x","file":"qwen3.8-27boops.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:flash-next":{{"repo":"x","file":"qwen3.8-flash-next.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":16,{dflash}}},
+                "qwen3.8:27b-draft-mq4":{{"repo":"x","file":"qwen38-27b-draft.hfq","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":20,{dflash}}},
+                "qwen3.8:27b-dflash-mq4":{{"repo":"x","file":"qwen38-27b-dflash.hfq","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":20,{dflash}}},
+                "qwen3.6:27b":{{"repo":"x","file":"qwen3.6-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
+                "qwen3.5:27b":{{"repo":"x","file":"qwen3.5-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
+                "qwen3:8b":{{"repo":"x","file":"qwen3-8b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
+                "qwen3.8:9b":{{"repo":"x","file":"qwen3.8-9b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}}
+            }},
+            "aliases":{{
+                "qwen3.8":"qwen3.8:27b",
+                "qwen3.8:latest":"qwen3.8:27b",
+                "qwen3.8:27b-mq4":"qwen3.8:27b",
+                "qwen3.8:fast":"qwen3.8:27b-mq4-xt",
+                "qwen3.8:27b-fast":"qwen3.8:27b-mq4-xt"
+            }}
+        }}"#
+        );
+        let registry = RegistryV1::parse(&raw, "test").unwrap();
+        let auto_value = ConfigValue::String("auto".into());
+        let auto = Some(&auto_value);
+
+        // Canonical tags and every alias that resolves to an eligible tag.
+        for input in [
+            "qwen3.8:27b",
+            "qwen3.8:27b-mq3",
+            "qwen3.8:27b-mq4-pro",
+            "qwen3.8:27b-mq4-xt",
+            "qwen3.8",
+            "qwen3.8:latest",
+            "qwen3.8:27b-mq4",
+            "qwen3.8:fast",
+            "qwen3.8:27b-fast",
+        ] {
+            let (tag, entry) = registry.model(input).unwrap();
+            let layer = config_layer_for_tag(tag, entry).unwrap();
+            assert_eq!(layer.get("speculation.dflash"), auto, "{input}->{tag}");
+            // Only the dflash mode is added; MTP and the ngram/mode knobs are untouched.
+            assert!(layer.get("speculation.mtp").is_none(), "{input}->{tag}");
+            assert!(layer.get("speculation.mode").is_none(), "{input}->{tag}");
+            assert_eq!(
+                layer.get("generation.max_tokens"),
+                Some(&ConfigValue::Integer(81920)),
+                "{input}->{tag} keeps the existing max_tokens policy"
+            );
+        }
+
+        // Same family/tier without a registry dflash declaration, a longer
+        // lookalike tier, arch_id=16, draft/dflash sidecar tags, and other
+        // families/sizes never get the policy.
+        for tag in [
+            "qwen3.8:27b-mq5",
+            "qwen3.8:27boops",
+            "qwen3.8:flash-next",
+            "qwen3.8:27b-draft-mq4",
+            "qwen3.8:27b-dflash-mq4",
+            "qwen3.6:27b",
+            "qwen3.5:27b",
+            "qwen3:8b",
+            "qwen3.8:9b",
+        ] {
+            let (_, entry) = registry.model(tag).unwrap();
+            let layer = config_layer_for_tag(tag, entry).unwrap();
+            assert!(
+                layer.get("speculation.dflash").is_none(),
+                "{tag} must not default DFlash"
+            );
+        }
+
+        // arch_id and the dflash declaration are both required, not just the tag.
+        let (tag, entry) = registry.model("qwen3.8:27b").unwrap();
+        let mut no_dflash = entry.clone();
+        no_dflash.dflash = None;
+        assert!(config_layer_for_tag(tag, &no_dflash)
+            .unwrap()
+            .get("speculation.dflash")
+            .is_none());
+        let mut qwen4 = entry.clone();
+        qwen4.arch_id = Some(16);
+        assert!(config_layer_for_tag(tag, &qwen4)
+            .unwrap()
+            .get("speculation.dflash")
+            .is_none());
+        // A different tag with the same dflash-less entry stays off too.
+        assert!(config_layer_for_tag("qwen3.8:27b-mq4-pro", &no_dflash)
+            .unwrap()
+            .get("speculation.dflash")
+            .is_none());
+    }
+
+    #[test]
+    fn bundled_dflash_auto_matches_only_declared_qwen38_27b_tiers() {
+        // Source-grounded against checked-in registry/v1.json: DFlash-paired
+        // Qwen3.8-27B trunk tiers lower `auto`; mq5/mq6 tiers (no dflash
+        // declaration), Flash-Next, drafts, and other families do not.
+        let registry = bundled().unwrap();
+        let mut auto_tiers = 0;
+        for (tag, entry) in &registry.models {
+            let layer = config_layer_for_tag(tag, entry).unwrap();
+            let expected = (tag == "qwen3.8:27b" || tag.starts_with("qwen3.8:27b-"))
+                && !tag.contains("draft")
+                && !tag.contains("dflash")
+                && entry.arch_id != Some(16)
+                && entry.dflash.is_some();
+            assert_eq!(
+                layer.get("speculation.dflash") == Some(&ConfigValue::String("auto".into())),
+                expected,
+                "{tag}"
+            );
+            if expected {
+                auto_tiers += 1;
+            } else {
+                assert!(layer.get("speculation.dflash").is_none(), "{tag}");
+            }
+        }
+        assert!(
+            auto_tiers >= 1,
+            "at least one bundled Qwen3.8-27B tier declares a DFlash draft"
+        );
+        for tag in [
+            "qwen3.8:27b",
+            "qwen3.8:27b-mq3",
+            "qwen3.8:27b-mq3-xt",
+            "qwen3.8:27b-mq3-pro",
+            "qwen3.8:27b-mq4-xt",
+            "qwen3.8:27b-mq4-xts",
+            "qwen3.8:27b-mq4-pro",
+        ] {
+            let (resolved, entry) = registry.model(tag).unwrap();
+            assert!(entry.dflash.is_some(), "{tag} declares a DFlash draft");
+            assert_eq!(
+                config_layer_for_tag(resolved, entry)
+                    .unwrap()
+                    .get("speculation.dflash"),
+                Some(&ConfigValue::String("auto".into())),
+                "{tag}"
+            );
+        }
+        for tag in [
+            "qwen3.8:27b-mq5",
+            "qwen3.8:27b-mq6-pro",
+            "qwen3.8:flash-next",
+            "qwen3.8:27b-draft-mq4",
+        ] {
+            let (resolved, entry) = registry.model(tag).unwrap();
+            assert!(
+                config_layer_for_tag(resolved, entry)
+                    .unwrap()
+                    .get("speculation.dflash")
+                    .is_none(),
+                "{tag}"
+            );
+        }
+        for alias in [
+            "qwen3.8",
+            "qwen3.8:latest",
+            "qwen3.8:fast",
+            "qwen3.8:27b-fast",
+        ] {
+            let (resolved, entry) = registry.model(alias).unwrap();
+            assert_eq!(
+                config_layer_for_tag(resolved, entry)
+                    .unwrap()
+                    .get("speculation.dflash"),
+                Some(&ConfigValue::String("auto".into())),
+                "{alias}->{resolved}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen38_27b_dflash_auto_yields_to_explicit_user_off() {
+        // Registry layer is lowest; global/model/one-shot dflash=off wins.
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"2026-09-01T00:00:00Z",
+            "models":{"qwen3.8:27b":{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,"dflash":{"file":"qwen38-27b-dflash-mq4.hfq"}}},
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+        let (tag, entry) = registry.model("qwen3.8:27b").unwrap();
+        let registry_named = || hipfire_config::NamedLayer {
+            source: hipfire_config::ConfigSource::RegistryModel {
+                tag: tag.to_owned(),
+                revision: "v1".into(),
+            },
+            layer: config_layer_for_tag(tag, entry).unwrap(),
+        };
+        let dflash_of = |layers: Vec<hipfire_config::NamedLayer>| {
+            hipfire_config::resolve(layers)
+                .unwrap()
+                .get("speculation.dflash")
+                .map(|item| item.value.clone())
+        };
+        // Registry alone: auto beats the BuiltIn off default.
+        assert_eq!(
+            dflash_of(vec![registry_named()]),
+            Some(ConfigValue::String("auto".into()))
+        );
+        // Explicit global-user off wins.
+        let mut global_off = ConfigLayer::default();
+        global_off
+            .set("speculation.dflash", ConfigValue::String("off".into()))
+            .unwrap();
+        assert_eq!(
+            dflash_of(vec![
+                registry_named(),
+                hipfire_config::NamedLayer {
+                    source: hipfire_config::ConfigSource::GlobalUser {
+                        path: std::path::PathBuf::from("/tmp/global.toml"),
+                    },
+                    layer: global_off,
+                },
+            ]),
+            Some(ConfigValue::String("off".into()))
+        );
+        // Explicit per-model-user off wins too.
+        let mut model_off = ConfigLayer::default();
+        model_off
+            .set("speculation.dflash", ConfigValue::String("off".into()))
+            .unwrap();
+        assert_eq!(
+            dflash_of(vec![
+                registry_named(),
+                hipfire_config::NamedLayer {
+                    source: hipfire_config::ConfigSource::ModelUser {
+                        model: tag.to_owned(),
+                        path: std::path::PathBuf::from("/tmp/model.toml"),
+                    },
+                    layer: model_off,
+                },
+            ]),
+            Some(ConfigValue::String("off".into()))
+        );
+    }
+
+    #[test]
     fn tag_policy_explicit_override_wins_over_registry() {
         // Registry tag policy is a low-precedence layer; global/model/one-shot user config wins.
         let raw = r#"{
@@ -1877,10 +3106,7 @@ mod tests {
         // Simulate user global override to legacy + different max_seq/max_tokens.
         let mut user_layer = ConfigLayer::default();
         user_layer
-            .set(
-                "memory.kv_backend",
-                ConfigValue::String("legacy".into()),
-            )
+            .set("memory.kv_backend", ConfigValue::String("legacy".into()))
             .unwrap();
         user_layer
             .set("memory.max_seq", ConfigValue::Integer(32768))
@@ -1936,10 +3162,7 @@ mod tests {
         assert!(g_registry_layer.get("generation.max_tokens").is_none());
         let mut g_user = ConfigLayer::default();
         g_user
-            .set(
-                "memory.kv_backend",
-                ConfigValue::String("legacy".into()),
-            )
+            .set("memory.kv_backend", ConfigValue::String("legacy".into()))
             .unwrap();
         g_user
             .set("memory.max_seq", ConfigValue::Integer(8192))
@@ -2131,21 +3354,22 @@ mod tests {
             }
         }
 
-        // Both Ornith 1.5 artifacts share the release contract:
-        // default/general/coding xhigh, instruct none, and no named
+        // Both Ornith 1.5 artifacts share the Qwen3.8 effort-native contract:
+        // default/general medium (hipfire default; xhigh stays selectable),
+        // explicit coding profile xhigh, instruct none, and no named
         // thinking_budget (absence = uncapped).
         for tag in ["ornith-1.5:35b-a3b", "ornith-1.5:35b-a3b-mq4r"] {
             let (_, ornith) = registry
                 .model(tag)
                 .unwrap_or_else(|| panic!("{tag} must exist"));
             let ornith_rs = ornith.recommended_settings.as_ref().unwrap();
-            assert_eq!(ornith_rs.reasoning_effort.as_deref(), Some("xhigh"));
+            assert_eq!(ornith_rs.reasoning_effort.as_deref(), Some("medium"));
             assert!(
                 ornith_rs.thinking_budget.is_none(),
                 "{tag} effort-native: absence means uncapped"
             );
             let ornith_general = ornith.sampling_profile("general").unwrap();
-            assert_eq!(ornith_general.reasoning_effort.as_deref(), Some("xhigh"));
+            assert_eq!(ornith_general.reasoning_effort.as_deref(), Some("medium"));
             assert!(ornith_general.thinking_budget.is_none());
             let ornith_coding = ornith.sampling_profile("coding").unwrap();
             assert_eq!(ornith_coding.reasoning_effort.as_deref(), Some("xhigh"));

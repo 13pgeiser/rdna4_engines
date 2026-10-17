@@ -11,6 +11,7 @@ use hipfire_runtime::kv_mode;
 use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::{self, KvCache, KvDims, KvLayers, KvTarget};
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
+use hipfire_runtime::offload;
 
 pub struct Qwen35Bundle {
     pub config: Qwen35Config,
@@ -38,7 +39,399 @@ pub struct Qwen35Bundle {
     /// or eagerly via `LoadedModel::qwen35_mut()` in `unload_model` before
     /// `ArchModel::free_gpu`. Previously lived on `LoadedModel`.
     pub qwen35_decode_batch: Option<Qwen35DecodeBatchState>,
+    /// Per-request VMM continuous-batching executor (request owners plus
+    /// row-budget scratch). `None` unless the VMM batch route is staged;
+    /// freed before KV/weights in every bundle free path.
+    pub vmm_store: Option<crate::forward_slots::vmm::Qwen35VmmStore>,
+    /// Live weight-host lease (`HIPFIRE_WEIGHT_HOST=1`): `Some` exactly when
+    /// `weights` were imported from a host generation. Released only by
+    /// [`free_qwen35_bundle`] / the loader's `unload_model` after the imported
+    /// owners are freed and VMM teardown is clean; dropping it closes the
+    /// lease without a release acknowledgement.
+    pub weight_lease: Option<SharedWeightLease>,
 }
+/// Device bytes one draft file will take, estimated the way the loader's own
+/// admission estimates a weight file: file bytes + 1/8 for the expanded/AWQ
+/// tensors + 512 MiB of scratch. An over-estimate for a head that loads only its
+/// own layers, which is the safe direction — it can only make the trunk spill
+/// slightly more, never less. 0 for a path that does not exist.
+pub(crate) fn draft_file_reserve_bytes(path: &std::path::Path) -> u64 {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    reserve_for_bytes(meta.len())
+}
+
+/// The `draft_file_reserve_bytes` formula for a known byte count: file bytes +
+/// 1/8 for the expanded/AWQ tensors + 512 MiB of scratch. Split out so the
+/// bundled-trailer arm (which knows its section size without a file of its
+/// own) charges the same estimate as a sidecar file of the same size.
+fn reserve_for_bytes(file_bytes: u64) -> u64 {
+    file_bytes + file_bytes / 8 + (512 << 20)
+}
+
+/// Where the MTP head that will load beside a trunk lives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MtpHeadLocation {
+    /// A standalone `.mtp` sidecar file.
+    Sidecar(std::path::PathBuf),
+    /// A head bundled inside the trunk file itself: only the appended MTP
+    /// section counts — the trunk's own bytes are already in the arch census
+    /// (`qwen35_layer_bytes`), so charging the whole file would count them
+    /// twice and force a maximal spill.
+    Bundled { section_bytes: u64 },
+}
+
+/// Device bytes the drafts take when they load beside a spilled trunk.
+///
+/// Drafts stay on the GPU — they are not part of the trunk spill — so their
+/// bytes come out of the capacity the placement may spend. Pure (paths and a
+/// byte count in, bytes out; the only filesystem reads are the files' own
+/// lengths), so unit tests pin the arithmetic without a GPU. 0 when no draft
+/// is in play.
+///
+/// `mtp_head` is the exact head that will load (`None` = none), and
+/// `dflash_draft` the DFlash draft file that will load on the slots route.
+/// The single caller that both resolvers share — this is what fixes the
+/// slots under-reserve, where the old inline probe charged only the MTP
+/// sidecar and silently dropped a DFlash draft.
+pub(crate) fn draft_device_reserve_bytes(
+    mtp_head: Option<&MtpHeadLocation>,
+    dflash_draft: Option<&std::path::Path>,
+) -> u64 {
+    let mut bytes = 0u64;
+    match mtp_head {
+        Some(MtpHeadLocation::Sidecar(path)) => {
+            bytes = bytes.saturating_add(draft_file_reserve_bytes(path));
+        }
+        Some(MtpHeadLocation::Bundled { section_bytes }) => {
+            if *section_bytes > 0 {
+                bytes = bytes.saturating_add(reserve_for_bytes(*section_bytes));
+            }
+        }
+        None => {}
+    }
+    if let Some(path) = dflash_draft {
+        bytes = bytes.saturating_add(draft_file_reserve_bytes(path));
+    }
+    bytes
+}
+
+/// The MTP head that will load beside this trunk: the bundled trailer first,
+/// then the first existing `sidecar_candidates(trunk, "mtp")` spelling
+/// (last-extension replacement, then the stem spelling `model.mtp`). Both
+/// loaders probe in this order (bundled, then sidecar), so the reserve always
+/// covers what actually loads. A single `path + ".mtp"` concatenation misses
+/// the stem spelling and charges 0 for a head that then loads,
+/// under-reserving the placement.
+///
+/// A bundled trailer (the MTP head rides inside the trunk file itself, found
+/// by `detect_bundled_mtp_offset`) reserves only the appended MTP section
+/// (`file_len − offset − trailer`). The section is a second HFQM container
+/// after the trunk's tensors: `HfqFile::open` parses exactly the `n_tensors`
+/// index entries of the header at offset 0 (`open_at_offset`), and the census
+/// (`qwen35_layer_bytes`) walks only that `tensor_infos()` — no MTP tensor
+/// is ever counted there, while the head loader opens the same file
+/// separately at the trailer offset (`load_mtp_head_at_offset`). The two
+/// containers are disjoint, so the section size is the head's footprint with
+/// no double count; the file+1/8+512MiB formula on top is the same
+/// over-estimate the sidecar arm already uses for a head that loads only its
+/// own layers (safe direction: it can only spill slightly more, never less).
+pub(crate) fn resolve_mtp_head_file(trunk: &std::path::Path) -> Option<MtpHeadLocation> {
+    if let Some(offset) = crate::mtp_head::detect_bundled_mtp_offset(trunk)
+        .ok()
+        .flatten()
+    {
+        let section_bytes = std::fs::metadata(trunk)
+            .map(|meta| {
+                meta.len()
+                    .saturating_sub(offset)
+                    .saturating_sub(crate::mtp_head::BUNDLE_TRAILER_LEN)
+            })
+            .unwrap_or(0);
+        return Some(MtpHeadLocation::Bundled { section_bytes });
+    }
+    crate::mtp_head::mtp_sidecar_candidates(trunk)
+        .into_iter()
+        .find(|p| p.is_file())
+        .map(MtpHeadLocation::Sidecar)
+}
+
+/// Resolve partial GPU offload before the first allocation.
+///
+/// Returns `None` when both budgets are `Full` — the unset default on every
+/// model, including MoE. It stays byte-identical to the pre-offload loader:
+/// no measured capacity, no admission, no refusal.
+///
+/// With a knob set, the capacity is `free VRAM − KV reservation − prefill floor −
+/// 128 MiB`, the same KV footprint the post-weight path computes, so the
+/// placement and the KV admission cannot drift.
+///
+/// Eligibility is `hipfire_config::memory::spill_support` over this load's own
+/// facts (arch 5|6, `ctx.pp`, EP never on this route, the trunk tower-tensor
+/// probe, `config.paged_experts`, `config.reap_keep`) — the same call the
+/// slots twin makes, so the two cannot disagree. A configured spill on an
+/// unspillable path was already refused at admission (`partial_offload_refusal`).
+/// The defensive unsupported-path arm below permits only a fully resident
+/// placement that fits, otherwise refusing before allocation.
+fn resolve_partial_offload(
+    hfq: &HfqFile,
+    config: &Qwen35Config,
+    ctx: &LoadCtx,
+    plan: &Qwen35KvPlan,
+) -> Result<Option<offload::Placement>, String> {
+    use hipfire_config::memory::{
+        effective_offload_budgets, spill_support, OffloadBudget, SpillSupport,
+    };
+    let spill_facts = spill_facts(hfq.arch_id, ctx, config);
+    let support = spill_support(
+        spill_facts.arch_id,
+        spill_facts.tp,
+        spill_facts.pp,
+        spill_facts.ep_experts,
+        spill_facts.paged_experts,
+        spill_facts.reap_keep,
+        spill_facts.is_vl,
+    );
+    let budgets = effective_offload_budgets();
+    if budgets == (OffloadBudget::Full, OffloadBudget::Full) {
+        return Ok(None);
+    }
+    // A configured spill on an unsupported path should already have been
+    // refused at admission. Defensively allow only a pinned Full/Full plan
+    // that fits; otherwise refuse before allocation. This reuses offload::plan
+    // against the same capacity the placement below would spend.
+    if let SpillSupport::Refused(refusal) = support {
+        return fail_closed_or_resident(hfq, config, ctx, plan, refusal);
+    }
+    // `memory.offload_exec=cpu` with an `auto` budget is allowed: the capture
+    // gate now reads the model-level host-weights flag the loader sets from the
+    // resolved placement (`Gpu::set_host_cpu_weights`), so `auto` can no longer
+    // leave hipGraph capture enabled over CPU-executed steps.
+
+    let placement_inputs = placement_capacity_inputs(hfq, config, ctx, plan)?;
+    // Every pinned host byte, not just the routed experts: a whole-layer spill
+    // hosts each layer's own weights too, and those are the largest host consumer
+    // a dense model has.
+    let placement = offload::resolve_placement(
+        &placement_inputs.layer_bytes,
+        &placement_inputs.inputs,
+        budgets,
+        offload::Orientation::SuffixResident,
+    )?;
+    Ok(Some(placement))
+}
+
+/// The single fact bundle behind both placement resolvers: every dimension
+/// `spill_support` takes, built identically by the sequential carrier and the
+/// slots engine, so a future arch copies one call, not a condition list.
+struct SpillFacts {
+    arch_id: u32,
+    tp: usize,
+    pp: usize,
+    ep_experts: Option<usize>,
+    paged_experts: bool,
+    reap_keep: bool,
+    is_vl: bool,
+}
+
+/// Build the fact bundle for the sequential single-GPU route: tp is 1 by
+/// construction (the tp>1 routes never call this), EP never applies, pp and
+/// the parsed model flags come from the load, and VL-ness is the trunk
+/// tower-tensor probe — the same index the loader's `probe_vision` asks, so
+/// the two cannot classify a tower differently (`config.is_vl_text` is the
+/// nested-name text wrapper, which a plain text checkpoint carries too).
+fn spill_facts(arch_id: u32, ctx: &LoadCtx, config: &Qwen35Config) -> SpillFacts {
+    SpillFacts {
+        arch_id,
+        tp: 1,
+        pp: ctx.pp,
+        ep_experts: None,
+        paged_experts: config.paged_experts,
+        reap_keep: config.reap_keep.is_some(),
+        is_vl: has_vision_tower(ctx, arch_id),
+    }
+}
+
+/// Whether this trunk carries the Qwen3.5-VL vision tower: the inline tower
+/// tensor in the trunk index, or a sidecar tower the carrier will load — the
+/// explicit `vision_path`, or the `<stem>.vl` sibling discovery unless
+/// `vision_mode=off` suppresses it (the same ladder the carrier's VL block
+/// applies when it resolves `vl_path`). Reads the index and the filesystem
+/// only; touches no GPU state. Named for what it answers (tower presence
+/// from any source), not just the inline probe that answers most of it.
+fn has_vision_tower(ctx: &LoadCtx, arch_id: u32) -> bool {
+    if !matches!(arch_id, 5 | 6) {
+        return false;
+    }
+    // `LoadCtx` borrows the trunk path, not the open HFQ, so re-open
+    // read-only for the single index probe (the loader gate probes the
+    // already-open source instead — same tensor, same answer).
+    let inline = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(ctx.path))
+        .ok()
+        .is_some_and(|hfq| {
+            hfq.tensor_data("model.visual.patch_embed.proj.weight")
+                .is_some()
+        });
+    if inline {
+        return true;
+    }
+    if ctx.vision_path.is_some() {
+        return true;
+    }
+    if ctx.vision_mode == "off" {
+        return false;
+    }
+    hipfire_runtime::sidecar::find_vl_sidecar(std::path::Path::new(ctx.path)).is_some()
+}
+
+/// Measured capacity inputs both the fail-closed check and the placement
+/// search spend: free VRAM minus the KV reservation, the prefill floor, any
+/// device-resident draft, and the fixed slack. One function so the check and
+/// the search cannot be charged different rooms.
+struct PlacementCapacity {
+    layer_bytes: offload::LayerBytes,
+    inputs: offload::CapacityInputs,
+}
+
+fn placement_capacity_inputs(
+    hfq: &HfqFile,
+    config: &Qwen35Config,
+    ctx: &LoadCtx,
+    plan: &Qwen35KvPlan,
+) -> Result<PlacementCapacity, String> {
+    let free_vram = ctx
+        .gpu
+        .hip
+        .get_vram_info()
+        .map_err(|e| format!("Qwen pre-weight VRAM query: {e}"))?
+        .0 as u64;
+    let rows = plan.dims.physical_cap.unwrap_or(plan.dims.max_seq);
+    let stride =
+        crate::qwen35::prefill::vmm_kv_token_bytes(config, plan.pair, plan.adaptive.is_some())
+            .ok_or("Qwen KV stride overflow")?;
+    let kv = offload::kv_reserve(stride as u64, rows).ok_or("Qwen KV reservation overflow")?;
+    // A MoE model has no prefill-scratch sizing model
+    // (`dense_prefill_allocation_bytes` deliberately returns `None` for
+    // `num_experts != 0`), which is why the VMM path refuses MoE models outright.
+    // Reserve 0 and say so: the placement is then bounded by the KV reservation
+    // alone, and the shortfall is visible rather than hidden.
+    let pbs_reservation =
+        crate::qwen35::prefill::minimum_prefill_reservation_bytes(config, &ctx.gpu.arch);
+    let pbs = pbs_reservation.unwrap_or(0) as u64;
+    // A draft stays on the GPU: MTP (bundled trailer or `.mtp` sidecar) and
+    // the DFlash draft are both device-resident and are *not* part of the
+    // trunk spill, so they must be reserved out of the capacity the placement
+    // spends — otherwise `auto` would over-place the trunk and the head's own
+    // load would OOM after the weights landed.
+    let mtp_head: Option<MtpHeadLocation>;
+    let dflash_draft: Option<&std::path::Path> = ctx.draft_path.map(std::path::Path::new);
+    if ctx.spec.mtp != Some(false) {
+        mtp_head = match ctx.mtp_path.clone() {
+            // An explicit CLI path is always a standalone sidecar file.
+            Some(path) => Some(MtpHeadLocation::Sidecar(path)),
+            None => resolve_mtp_head_file(hfq.path()),
+        };
+    } else {
+        // Speculation explicitly off: the MTP head will not load. A DFlash
+        // draft is still charged when named — the slots route runs its
+        // DFlash2 chain independently of the MTP kill switch.
+        mtp_head = None;
+    }
+    // (DSpark is a DeepSeek4 module and never attaches here.)
+    let draft_reservation = draft_device_reserve_bytes(mtp_head.as_ref(), dflash_draft);
+    let layer_bytes = crate::qwen35::load::qwen35_layer_bytes(hfq, config);
+    let inputs = offload::CapacityInputs {
+        free_vram,
+        kv_bytes: kv.bytes,
+        kv_rows: kv.rows,
+        kv_stride: stride as u64,
+        prefill_floor: pbs,
+        prefill_floor_absent: pbs_reservation.is_none(),
+        draft_bytes: draft_reservation,
+        slack: 128u64 << 20,
+    };
+    Ok(PlacementCapacity { layer_bytes, inputs })
+}
+
+/// Defensive arm for a configured spill on an unspillable path. Admission
+/// normally refuses it before reaching this loader. Runs the pinned `Full`/`Full`
+/// plan against the same capacity the placement would spend: if it fits, stay
+/// resident; otherwise refuse, naming the unsupported path and the knob.
+fn fail_closed_or_resident(
+    hfq: &HfqFile,
+    config: &Qwen35Config,
+    ctx: &LoadCtx,
+    plan: &Qwen35KvPlan,
+    refusal: hipfire_config::memory::SpillRefusal,
+) -> Result<Option<offload::Placement>, String> {
+    use hipfire_config::memory::OffloadBudget;
+    let capacity = placement_capacity_inputs(hfq, config, ctx, plan)?;
+    let weight_room = offload::weight_capacity(
+        capacity.inputs.free_vram,
+        capacity.inputs.kv_bytes,
+        capacity.inputs.prefill_floor,
+        capacity.inputs.draft_bytes,
+        capacity.inputs.slack,
+    );
+    // The pinned plan is the residency proof: it errs exactly when even a
+    // fully resident load overruns the room — the shape that used to OOM
+    // mid-load. `plan`'s tier order and its own refusal text are untouched;
+    // only the `Ok` arm is read here.
+    if offload::plan(
+        &capacity.layer_bytes,
+        (OffloadBudget::Full, OffloadBudget::Full),
+        &weight_room,
+        offload::Orientation::SuffixResident,
+    )
+    .is_ok()
+    {
+        return Ok(None);
+    }
+    let device = capacity.layer_bytes.weight_total();
+    Err(unspillable_no_fit_refusal(
+        refusal,
+        device,
+        weight_room.weight_bytes,
+    ))
+}
+
+/// The shared fail-closed sentence for an unspillable path whose model does
+/// not fit: names the path that cannot spill, the reason, and the knob. Both
+/// placement resolvers refuse through this — the sequential twin after its
+/// pinned-residency proof, the slots twin after its own — so the wording
+/// cannot drift between routes. `pub(crate)`: the slots engine is the only
+/// other caller.
+pub(crate) fn unspillable_no_fit_refusal(
+    refusal: hipfire_config::memory::SpillRefusal,
+    device_bytes: u64,
+    room_bytes: u64,
+) -> String {
+    use hipfire_config::memory::SpillRefusal;
+    let reason = match refusal {
+        SpillRefusal::Arch(arch_id) => format!("arch id {arch_id} has no host-placement path"),
+        SpillRefusal::Tp(tp) => format!("tp={tp} loads every layer on every rank"),
+        SpillRefusal::Pp(pp) => format!("pp={pp} bands own per-device layouts"),
+        SpillRefusal::ExpertParallel(experts) => {
+            format!("expert parallelism pins each of {experts} experts to one rank")
+        }
+        SpillRefusal::VisionTower => {
+            "the Qwen3.5-VL vision tower loads through its own lowered loader".to_string()
+        }
+        SpillRefusal::PagedExperts => "the weight pager owns the expert buffers".to_string(),
+        SpillRefusal::ReapKeepMap => "the REAP keep-map has no host-placement path".to_string(),
+    };
+    format!(
+        "load refused: this Qwen3.5-MoE needs {} MiB of device weights but {reason}, so the \
+         auto-fit default cannot spill it — it would OOM mid-load instead. Lower memory.max_seq, \
+         use a smaller quantization, or load on a spillable path (single-GPU text trunk without \
+         paged experts or a REAP keep-map; memory.gpu_layer_budget / memory.moe_expert_budget) — \
+         only {} MiB is available after the KV reservation and the prefill floor",
+        device_bytes / (1 << 20),
+        room_bytes / (1 << 20),
+    )
+}
+
 /// Build the Qwen35 GPU bundle from an HFQ source.
 ///
 /// CPU-only config/compat validation runs **before** weight upload. Every
@@ -55,24 +448,51 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
 
     // ── CPU-only parse + compatibility (zero GPU allocation) ─────────
     let mut plan = plan_qwen35_gpu_stages(&config, ctx)?;
+    // Placement is resolved once, here, against the measured capacity a
+    // configured spill must fit — before any allocation. `None` (no knob) keeps
+    // the load byte-identical to the pre-offload loader.
+    let placement = resolve_partial_offload(&hfq, &config, ctx, &plan)?;
     let dn_quant = parse_state_quant(ctx.state_quant_override)?;
     eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
     warn_tiny_model_state(&hfq, dn_quant);
 
-    // ── Weight upload (first GPU ownership) ──────────────────────────
-    let weights = <Qwen35 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
+    // ── Weights (first GPU ownership): private upload, or import from the
+    //    weight host when HIPFIRE_WEIGHT_HOST=1. No private-load fallback
+    //    once opted in. ─────────────────────────────────────────────────
+    let weights_started = std::time::Instant::now();
+    let socket = weight_host_socket()?;
+    let route = if socket.is_some() { "import" } else { "private" };
+    let (weights, mut weight_lease) = match socket {
+        None => (
+            <Qwen35 as Architecture>::load_weights_with_placement(
+                &mut hfq,
+                &config,
+                ctx.gpu,
+                placement.as_ref(),
+            )?,
+            None,
+        ),
+        Some(socket) => {
+            let (weights, lease) = import_from_weight_host(&socket, &hfq, &config, ctx)?;
+            (weights, Some(lease))
+        }
+    };
     hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
+    let weights_ms = weights_started.elapsed().as_secs_f64() * 1e3;
     // The real card bound is determined only now: weights (including any
     // expanded tensors) already own VRAM, while KV and lazy PBS do not.
     if let Some(mut sequence) = ctx.sequence {
         let capacity = (|| -> Result<(usize, usize, usize, usize), String> {
-            let (free, _) = ctx.gpu.hip.get_vram_info().map_err(|e| format!("Qwen post-weight VRAM query: {e}"))?;
+            let (free, _) = ctx.gpu.device_mem_info().map_err(|e| format!("Qwen post-weight VRAM query: {e}"))?;
             let minimum = crate::qwen35::prefill::minimum_prefill_reservation_bytes(
                 &config, &ctx.gpu.arch,
             ).ok_or("Qwen minimum PBS sizing overflow")?;
             let stride = crate::qwen35::prefill::vmm_kv_token_bytes(
-                &config, plan.pair, plan.adaptive.is_some(),
-            ).ok_or("Qwen KV stride overflow")?;
+                &config,
+                plan.pair,
+                plan.adaptive.is_some(),
+            )
+            .ok_or("Qwen KV stride overflow")?;
             let card_cap = free.saturating_sub(minimum).saturating_sub(128 << 20) / stride;
             Ok((free, minimum, stride, card_cap))
         })();
@@ -80,7 +500,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
             Ok(v) => v,
             Err(e) => {
                 weights.free_gpu(ctx.gpu);
-                return Err(e);
+                return Err(release_after_failed_load(e, weight_lease.take(), ctx.gpu));
             }
         };
         eprintln!(
@@ -90,7 +510,11 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         if sequence.automatic {
             if card_cap < 512 {
                 weights.free_gpu(ctx.gpu);
-                return Err("Qwen VMM load refused: measured post-weight VRAM cannot hold minimum PBS and KV".into());
+                return Err(release_after_failed_load(
+                    "Qwen VMM load refused: measured post-weight VRAM cannot hold minimum PBS and KV".into(),
+                    weight_lease.take(),
+                    ctx.gpu,
+                ));
             }
             ctx.max_seq = sequence.model_ctx.min(card_cap);
         }
@@ -100,40 +524,52 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
             Ok(v) => v,
             Err(e) => {
                 weights.free_gpu(ctx.gpu);
-                return Err(e);
+                return Err(release_after_failed_load(e, weight_lease.take(), ctx.gpu));
             }
         };
     }
 
     // ── KV (transactional: free weights on fail) ─────────────────────
+    let kv_started = std::time::Instant::now();
     let (kv, kv_adaptive) = match construct_kv_cache(&config, ctx, plan) {
         Ok(v) => v,
         Err(e) => {
             weights.free_gpu(ctx.gpu);
-            return Err(append_cleanup_context(e, note_vmm_after_free(ctx.gpu)));
+            let e = append_cleanup_context(e, note_vmm_after_free(ctx.gpu));
+            return Err(release_after_failed_load(e, weight_lease.take(), ctx.gpu));
         }
     };
+    let kv_ms = kv_started.elapsed().as_secs_f64() * 1e3;
 
     // ── DeltaNet state (free kv + weights on fail) ───────────────────
+    let dn_started = std::time::Instant::now();
     let dn = match DeltaNetState::new_with_quant(ctx.gpu, &config, dn_quant) {
         Ok(v) => v,
         Err(e) => {
             let cleanup = free_kv_and_weights(kv, weights, ctx.gpu);
-            return Err(append_cleanup_context(format!("{e}"), cleanup));
+            let e = append_cleanup_context(format!("{e}"), cleanup);
+            return Err(release_after_failed_load(e, weight_lease.take(), ctx.gpu));
         }
     };
+    let dn_ms = dn_started.elapsed().as_secs_f64() * 1e3;
 
     // ── Scratch (free dn + kv + weights on fail) ─────────────────────
     // Flash-attention partials address physical KV slots, not the logical
     // context range.  An eviction-bounded cache can make this cap much smaller
     // than max_seq, so sizing from max_seq retains memory for unreachable tiles.
+    let scratch_started = std::time::Instant::now();
     let scratch = match Qwen35Scratch::new_with_kv_max(ctx.gpu, &config, 2048, kv.physical_cap) {
         Ok(v) => v,
         Err(e) => {
             let cleanup = free_dn_kv_and_weights(dn, kv, weights, ctx.gpu);
-            return Err(append_cleanup_context(format!("{e}"), cleanup));
+            let e = append_cleanup_context(format!("{e}"), cleanup);
+            return Err(release_after_failed_load(e, weight_lease.take(), ctx.gpu));
         }
     };
+    let scratch_ms = scratch_started.elapsed().as_secs_f64() * 1e3;
+    eprintln!(
+        "QWEN35_LOAD_PHASES route={route} weights_ms={weights_ms:.3} kv_ms={kv_ms:.3} dn_ms={dn_ms:.3} scratch_ms={scratch_ms:.3}"
+    );
 
     Ok(Qwen35Bundle {
         config,
@@ -146,6 +582,8 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         vision_config: None,
         vision_weights: None,
         qwen35_decode_batch: None,
+        vmm_store: None,
+        weight_lease,
     })
 }
 
@@ -174,20 +612,10 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         .map(|t| *t == LayerType::FullAttention)
         .collect();
 
-    // Typed `kv_v_override` wins; developer HIPFIRE_KV_V only when no typed V.
-    let kv_v_env = if ctx.kv_v_override.filter(|s| !s.is_empty()).is_some() {
-        String::new()
-    } else {
-        hipfire_config::developer_var("HIPFIRE_KV_V").unwrap_or_default()
-    };
+    // `kv_v_override` is admission's resolved V (typed > HIPFIRE_KV_V); never
+    // re-read the env here or VMM sizing and the loaded pair can diverge.
     let k_raw = ctx.kv_k_override.filter(|s| !s.is_empty());
-    let v_raw = ctx
-        .kv_v_override
-        .filter(|s| !s.is_empty())
-        .or_else(|| match kv_v_env.as_str() {
-            "" | "q8" => None,
-            other => Some(other),
-        });
+    let v_raw = ctx.kv_v_override.filter(|s| !s.is_empty());
     let kv_adaptive_spec = ctx
         .kv_adaptive_override
         .filter(|s| !s.is_empty())
@@ -195,16 +623,26 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         .unwrap_or_else(|| hipfire_runtime::config::get().kv_adaptive.clone());
     let adaptive_req = parse_kv_adaptive(&kv_adaptive_spec)?;
     let native_eligible = kv_mode::qwen35_native_eligible(
-        ctx.gpu.arch.as_str(), config.n_heads, config.n_kv_heads, config.head_dim,
-        ctx.pp, adaptive_req.is_some(), ctx.cask.sidecar.is_some(),
+        ctx.gpu.arch.as_str(),
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        ctx.pp,
+        adaptive_req.is_some(),
+        ctx.cask.sidecar.is_some(),
     );
-    let policy = kv_mode::qwen35_policy_for_native(
-        &kv_mode::QWEN35_HFQ_POLICY, &mode_raw, native_eligible,
-    );
+    let policy =
+        kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, &mode_raw, native_eligible);
 
     let pair = kv_mode::resolve_kv_pair(
-        &mode_raw, k_raw, v_raw, &policy, ctx.gpu.arch.as_str(), ctx.qwen_default_q8,
-    ).map_err(|e| e.to_string())?;
+        &mode_raw,
+        k_raw,
+        v_raw,
+        &policy,
+        ctx.gpu.arch.as_str(),
+        ctx.qwen_default_q8,
+    )
+    .map_err(|e| e.to_string())?;
     let mode = pair.k();
     match pair {
         kv_mode::KvPair::Native(_) => eprintln!(
@@ -226,6 +664,19 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         ctx.kv_backend,
         ctx.cask.cask_m_folding,
         ctx.max_seq,
+    )?;
+    validate_gfx1100_split_verify_kv(
+        crate::qwen35::prefill::gfx1100_split_verify_min_ctx(&*ctx.gpu, config).is_some(),
+        adaptive_req.is_none()
+            && matches!(
+                pair,
+                kv_mode::KvPair::Native(hipfire_runtime::kv_mode::KvMode::Q8)
+                    | kv_mode::KvPair::Split(
+                        hipfire_runtime::kv_mode::KvMode::Q8,
+                        llama::VMode::Q8
+                    )
+            ),
+        ctx.kv_backend,
     )?;
 
     // Adaptive DFlash is out of scope: refuse explicit adaptive + DFlash draft.
@@ -300,7 +751,10 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         validate_cask_static_layout(ctx.cask.sidecar.is_some(), pair)?;
         if let kv_mode::KvPair::Split(_, static_v) = pair {
             if !matches!(static_v, llama::VMode::Q8)
-                && !matches!(mode, kv_mode::KvMode::Fwht2 | kv_mode::KvMode::Fwht3 | kv_mode::KvMode::Fwht4)
+                && !matches!(
+                    mode,
+                    kv_mode::KvMode::Fwht2 | kv_mode::KvMode::Fwht3 | kv_mode::KvMode::Fwht4
+                )
             {
                 return Err(format!(
                     "V={} requires an FWHT K mode (fwht2/3/4); resolved mode is {:?} (K={})",
@@ -335,8 +789,13 @@ pub fn validate_native_kv_admission(
         return Ok(());
     }
     if !kv_mode::qwen35_native_eligible(
-        ctx.gpu.arch.as_str(), config.n_heads, config.n_kv_heads, config.head_dim,
-        ctx.pp, adaptive, ctx.cask.sidecar.is_some(),
+        ctx.gpu.arch.as_str(),
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        ctx.pp,
+        adaptive,
+        ctx.cask.sidecar.is_some(),
     ) {
         return Err(format!(
             "kv_mode {mode:?} requires exact gfx1201 H24/Hkv4/D256, single GPU, no adaptive/CASK (got {}, H{}/Hkv{}/D{}); use --kv-mode q8",
@@ -399,18 +858,39 @@ fn validate_adaptive_cask_handoff(
     Ok(())
 }
 
+/// `kernel.gfx1100_fa2_split_verify` admits VMM KV only. When the opt-in
+/// applies to this model (`split_envelope`: exact gfx1100, dense
+/// H24/KV4/D256, parent `kernel.verify_attn` on) and the cache is plain Q8,
+/// a legacy backend is refused before any upload rather than serving the
+/// split route from a legacy cache or silently dropping the opt-in.
+#[doc(hidden)]
+pub fn validate_gfx1100_split_verify_kv(
+    split_envelope: bool,
+    plain_q8: bool,
+    backend: KvBackend,
+) -> Result<(), String> {
+    if split_envelope && plain_q8 && backend != KvBackend::Vmm {
+        return Err(
+            "kernel.gfx1100_fa2_split_verify admits VMM KV only, but this load resolved \
+             memory.kv_backend=legacy; use memory.kv_backend=vmm or set \
+             kernel.gfx1100_fa2_split_verify=false"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// The static CASK path remains limited to Q8 V and Givens legacy-asym K.
 /// Adaptive FWHT/Lloyd layouts use the separately validated plain-TriAttention
 /// handoff; m-folding still lacks the corresponding fold/requant kernels.
-fn validate_cask_static_layout(
-    cask_enabled: bool,
-    pair: kv_mode::KvPair,
-) -> Result<(), String> {
+fn validate_cask_static_layout(cask_enabled: bool, pair: kv_mode::KvPair) -> Result<(), String> {
     if !cask_enabled {
         return Ok(());
     }
     if !matches!(pair, kv_mode::KvPair::Split(_, llama::VMode::Q8)) {
-        return Err(format!("CASK currently requires split V=q8 (resolved KV is {pair:?})"));
+        return Err(format!(
+            "CASK currently requires split V=q8 (resolved KV is {pair:?})"
+        ));
     }
     if !matches!(
         pair.k(),
@@ -493,25 +973,44 @@ fn construct_kv_cache(
         let kv = match (ctx.kv_backend, plan.pair) {
             (KvBackend::Vmm, kv_mode::KvPair::Native(_)) => {
                 <KvCache as KvCacheExt>::from_mode_with_backend(
-                    mode, KvBackend::Vmm, KvTarget::Single(ctx.gpu), &plan.dims,
-                ).map_err(|e| format!("{e}"))?
+                    mode,
+                    KvBackend::Vmm,
+                    KvTarget::Single(ctx.gpu),
+                    &plan.dims,
+                )
+                .map_err(|e| format!("{e}"))?
             }
             (KvBackend::Vmm, kv_mode::KvPair::Split(_, vm)) => {
                 KvCache::new_gpu_vmm_capped_filtered(
-                    ctx.gpu, &plan.is_kv_layer, config.n_kv_heads, config.head_dim,
-                    ctx.max_seq, physical_cap, mode, vm,
-                ).map_err(|e| format!("{e}"))?
+                    ctx.gpu,
+                    &plan.is_kv_layer,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    ctx.max_seq,
+                    physical_cap,
+                    mode,
+                    vm,
+                )
+                .map_err(|e| format!("{e}"))?
             }
             (KvBackend::Legacy, kv_mode::KvPair::Native(_))
             | (KvBackend::Legacy, kv_mode::KvPair::Split(_, llama::VMode::Q8)) => {
                 <KvCache as KvCacheExt>::from_mode_with_backend(
-                    mode, KvBackend::Legacy, KvTarget::Single(ctx.gpu), &plan.dims,
-                ).map_err(|e| format!("{e}"))?
+                    mode,
+                    KvBackend::Legacy,
+                    KvTarget::Single(ctx.gpu),
+                    &plan.dims,
+                )
+                .map_err(|e| format!("{e}"))?
             }
             (KvBackend::Legacy, kv_mode::KvPair::Split(_, vm)) => {
                 let mut kv = <KvCache as KvCacheExt>::from_mode_with_backend(
-                    mode, KvBackend::Legacy, KvTarget::Single(ctx.gpu), &plan.dims,
-                ).map_err(|e| format!("{e}"))?;
+                    mode,
+                    KvBackend::Legacy,
+                    KvTarget::Single(ctx.gpu),
+                    &plan.dims,
+                )
+                .map_err(|e| format!("{e}"))?;
                 if let Err(e) = kv.set_v_mode_realloc(ctx.gpu, vm) {
                     let cleanup = kv.free_gpu(ctx.gpu).map_err(|fe| fe.to_string());
                     return Err(append_cleanup_context(format!("{e}"), cleanup));
@@ -544,12 +1043,19 @@ pub fn free_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut rdna_compute::Gpu) -> 
         vision_config: _,
         vision_weights,
         qwen35_decode_batch,
+        vmm_store,
+        weight_lease,
     } = bundle;
     debug_assert!(
         pp_scratch_set.is_none(),
         "free_qwen35_bundle: pp_scratch_set must be None on single-GPU free"
     );
     let _ = pp_scratch_set;
+    if let Some(store) = vmm_store {
+        if let Err(e) = store.free_gpu(gpu) {
+            eprintln!("free_qwen35_bundle: VMM batch store free: {e}");
+        }
+    }
     if let Some(batch) = qwen35_decode_batch {
         let _ = batch.free_gpu(gpu);
     }
@@ -565,12 +1071,238 @@ pub fn free_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut rdna_compute::Gpu) -> 
         vw.free_gpu(gpu);
     }
     let vmm = note_vmm_after_free(gpu);
-    match (first, vmm) {
+    let result = match (first, vmm) {
         (None, Ok(())) => Ok(()),
         (Some(e), Ok(())) => Err(e),
         (None, Err(c)) => Err(c),
         (Some(e), Err(c)) => Err(format!("{e}; cleanup also failed: {c}")),
+    };
+    match (weight_lease, result) {
+        (None, result) => result,
+        (Some(lease), Ok(())) => {
+            // Captured graphs embed imported addresses; drop them before
+            // telling the host this tenant holds no references.
+            gpu.invalidate_graph_state();
+            lease.release()
+        }
+        (Some(lease), Err(e)) => {
+            drop(lease);
+            Err(format!("{e}; weight-host lease closed without release (teardown not proven clean)"))
+        }
     }
+}
+
+/// Live lease on one weight-host generation, held by [`Qwen35Bundle`] for as
+/// long as imported weights may be referenced. Dropping it closes the lease
+/// without a release acknowledgement: the host then keeps the lease until this
+/// process exits.
+pub struct SharedWeightLease {
+    #[cfg(target_os = "linux")]
+    inner: hipfire_runtime::weight_host::WeightHostLease,
+    #[cfg(not(target_os = "linux"))]
+    _never: std::convert::Infallible,
+}
+
+impl SharedWeightLease {
+    /// `Ok(false)` once the host closed the lease (drain or exit).
+    pub fn host_alive(&self) -> Result<bool, String> {
+        #[cfg(target_os = "linux")]
+        return self.inner.host_alive().map_err(|e| e.to_string());
+        #[cfg(not(target_os = "linux"))]
+        match self._never {}
+    }
+
+    /// Send `Release` (closing every allocation FD first). Call only after
+    /// every imported owner is freed and VMM teardown reported clean.
+    pub fn release(self) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut inner = self.inner;
+            inner.close_allocation_fds();
+            inner.release().map_err(|e| format!("weight-host release: {e}"))
+        }
+        #[cfg(not(target_os = "linux"))]
+        match self._never {}
+    }
+}
+
+/// `HIPFIRE_WEIGHT_HOST` opt-in, read at bootstrap (it selects the GPU claim
+/// before the process config exists). `Ok(None)`: unset or the `0` kill
+/// switch, incumbent private loading. `Ok(Some(socket))`: import from the
+/// weight host at `HIPFIRE_WEIGHT_HOST_SOCKET`. Anything else fails closed.
+pub fn weight_host_socket() -> Result<Option<std::path::PathBuf>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        hipfire_runtime::weight_host::weight_host_socket_from_env().map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    match std::env::var("HIPFIRE_WEIGHT_HOST").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("0") => Ok(None),
+        Ok("1") => Err("HIPFIRE_WEIGHT_HOST=1 is supported on Linux only".into()),
+        _ => Err("HIPFIRE_WEIGHT_HOST must be unset, 0 or 1".into()),
+    }
+}
+
+/// Failed load after an import: release the lease only when the imported
+/// owners are gone and VMM teardown is clean, else close it unacknowledged.
+fn release_after_failed_load(
+    error: String,
+    lease: Option<SharedWeightLease>,
+    gpu: &mut rdna_compute::Gpu,
+) -> String {
+    let Some(lease) = lease else {
+        return error;
+    };
+    match note_vmm_after_free(gpu) {
+        Ok(()) => match lease.release() {
+            Ok(()) => error,
+            Err(release) => format!("{error}; {release}"),
+        },
+        Err(cleanup) => format!("{error}; {cleanup}; weight-host lease closed without release"),
+    }
+}
+
+/// Weight-host v1 envelope for an import: single device, plain dense decode.
+/// Checked before connecting, so an unsupported request never takes a lease.
+fn refuse_outside_weight_host_envelope(ctx: &LoadCtx) -> Result<(), String> {
+    let refuse = |what: &str| Err(format!("HIPFIRE_WEIGHT_HOST=1 does not support {what}"));
+    if ctx.pp != 1 {
+        return refuse("pp > 1");
+    }
+    if ctx.draft_path.is_some() || ctx.gemma4_drafter_path.is_some() {
+        return refuse("a draft model");
+    }
+    if ctx.mtp_path.is_some() || ctx.spec.mtp == Some(true) {
+        return refuse("MTP");
+    }
+    if ctx.spec.dflash == Some(true) || ctx.spec.dspark == Some(true) {
+        return refuse("DFlash/DSpark");
+    }
+    if ctx.vision_path.is_some() {
+        return refuse("a vision tower");
+    }
+    if ctx.gpu.arch != "gfx1201" {
+        return refuse(&format!("{} (v1 is gfx1201 only)", ctx.gpu.arch));
+    }
+    Ok(())
+}
+
+/// Card identity both sides of the handshake compute the same way: HIP UUID,
+/// PCI bus ID and architecture of the bound device.
+#[cfg(target_os = "linux")]
+pub fn weight_host_card_identity(
+    gpu: &rdna_compute::Gpu,
+) -> Result<hipfire_runtime::weight_host::CardIdentity, String> {
+    let uuid = gpu.hip.device_uuid(gpu.device_id).map_err(|e| format!("card UUID: {e}"))?;
+    let pci_bus_id = gpu.hip.device_pci_bus_id(gpu.device_id).map_err(|e| format!("card PCI bus ID: {e}"))?;
+    Ok(hipfire_runtime::weight_host::CardIdentity { uuid, pci_bus_id, device_arch: gpu.arch.clone() })
+}
+
+/// Source certificate the host publishes beside its socket (same private
+/// directory): `<socket>.source-cert`.
+pub fn weight_host_source_certificate_path(socket: &std::path::Path) -> std::path::PathBuf {
+    let mut name = socket.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".source-cert");
+    socket.with_file_name(name)
+}
+
+#[cfg(target_os = "linux")]
+mod loader_abi_generated {
+    include!(concat!(env!("OUT_DIR"), "/loader_abi.rs"));
+}
+
+/// `LoaderAbiSha256` inputs of this build (build.rs: loader closure source
+/// digests, quant representation constants, CPU toolchain and features).
+/// Forward kernels are not inputs, so compute-only builds share one ABI.
+#[cfg(target_os = "linux")]
+pub fn loader_abi() -> hipfire_runtime::weight_host::LoaderAbi {
+    use hipfire_runtime::weight_host::{FieldValue, LoaderAbi, Sha256Digest};
+    let mut abi = LoaderAbi::new("hipfire.qwen35.dense.loader-abi/v1")
+        .with("representation_tag", FieldValue::str(crate::shared_weights::DENSE_REPRESENTATION_TAG));
+    for (name, digest) in loader_abi_generated::LOADER_ABI_COMPONENTS {
+        abi.components.insert((*name).to_owned(), Sha256Digest(*digest));
+    }
+    abi
+}
+
+/// `ModelContentSha256` of the base HFQ, the only v1 source.
+#[cfg(target_os = "linux")]
+pub fn weight_host_source_sha256(
+    cert: &hipfire_runtime::weight_host::SourceCertificate,
+) -> Result<hipfire_runtime::weight_host::Sha256Digest, String> {
+    hipfire_runtime::weight_host::model_content_sha256(&[cert.to_source_digest()]).map_err(|e| e.to_string())
+}
+
+/// Diagnostics-only provenance: never compared or hashed.
+#[cfg(target_os = "linux")]
+pub fn weight_host_provenance(role: &str) -> hipfire_runtime::weight_host::BuildProvenance {
+    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
+    hipfire_runtime::weight_host::BuildProvenance {
+        label: format!("{role} {exe} pid {}", std::process::id()),
+        ..Default::default()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn import_from_weight_host(
+    socket: &std::path::Path,
+    hfq: &HfqFile,
+    config: &Qwen35Config,
+    ctx: &mut LoadCtx,
+) -> Result<(Qwen35Weights, SharedWeightLease), String> {
+    use hipfire_runtime::weight_host as wh;
+    refuse_outside_weight_host_envelope(ctx)?;
+    let connect_started = std::time::Instant::now();
+    let admission_token = std::env::var("HIPFIRE_FABRIC_ADMISSION")
+        .map_err(|_| "HIPFIRE_WEIGHT_HOST=1 needs HIPFIRE_FABRIC_ADMISSION (dev-fabric correct-class job)".to_string())?;
+    let card = weight_host_card_identity(ctx.gpu)?;
+    let cert_path = weight_host_source_certificate_path(socket);
+    // Identity check only (fstat), no content scan: the host hashed once.
+    let (_source, cert) = wh::SourceCertificate::verify_source_path(&cert_path, std::path::Path::new(ctx.path))
+        .map_err(|e| format!("weight host source certificate {}: {e}", cert_path.display()))?;
+    let source_sha256 = weight_host_source_sha256(&cert)?;
+    crate::shared_weights::apply_source_dispatch_flags(ctx.gpu, hfq);
+    let recipe = crate::shared_weights::resolve_dense_recipe(ctx.gpu, config).map_err(|e| e.to_string())?;
+    let hello = wh::HostHello {
+        card,
+        source_sha256,
+        loader_abi_sha256: loader_abi().sha256().map_err(|e| e.to_string())?,
+        recipe,
+        admission_token,
+        provenance: weight_host_provenance("tenant"),
+        options: wh::ConnectOptions { handshake_timeout: std::time::Duration::from_secs(30), expected_host_pid: None },
+    };
+    let mut lease = wh::WeightHostClient::connect(socket, hello)
+        .map_err(|e| format!("weight host {}: {e}", socket.display()))?;
+    let connect_ms = connect_started.elapsed().as_secs_f64() * 1e3;
+    let import_started = std::time::Instant::now();
+    // Failures before ImportAck drop the lease unacknowledged (Release is only
+    // valid after an ack); the host keeps it charged until this process exits.
+    let weights = crate::shared_weights::import_dense_weights(ctx.gpu, config, &lease)
+        .map_err(|e| format!("weight host import (rolled back): {e}"))?;
+    let imported_bytes = crate::shared_weights::dense_imported_physical_bytes(lease.manifest());
+    if let Err(e) = lease.ack_import(imported_bytes) {
+        weights.free_gpu(ctx.gpu);
+        return Err(append_cleanup_context(format!("weight host import ack: {e}"), note_vmm_after_free(ctx.gpu)));
+    }
+    let import_map_ms = import_started.elapsed().as_secs_f64() * 1e3;
+    eprintln!(
+        "WEIGHT_HOST_IMPORT epoch={} layout_sha256={} imported_bytes={imported_bytes} fds={} connect_ms={connect_ms:.3} import_map_ms={import_map_ms:.3} ack=ok",
+        lease.epoch(),
+        lease.layout_sha256(),
+        lease.allocation_fds().len(),
+    );
+    Ok((weights, SharedWeightLease { inner: lease }))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn import_from_weight_host(
+    _socket: &std::path::Path,
+    _hfq: &HfqFile,
+    _config: &Qwen35Config,
+    _ctx: &mut LoadCtx,
+) -> Result<(Qwen35Weights, SharedWeightLease), String> {
+    Err("HIPFIRE_WEIGHT_HOST=1 is supported on Linux only".into())
 }
 
 fn free_kv_and_weights(
@@ -830,6 +1562,20 @@ mod tests {
     }
 
     #[test]
+    fn gfx1100_split_verify_refuses_legacy_kv() {
+        assert!(validate_gfx1100_split_verify_kv(true, true, KvBackend::Vmm).is_ok());
+        assert!(
+            validate_gfx1100_split_verify_kv(true, true, KvBackend::Legacy)
+                .unwrap_err()
+                .contains("admits VMM KV only")
+        );
+        // Outside the opt-in envelope or off plain Q8 the route never runs,
+        // so the backend is not this check's concern.
+        assert!(validate_gfx1100_split_verify_kv(false, true, KvBackend::Legacy).is_ok());
+        assert!(validate_gfx1100_split_verify_kv(true, false, KvBackend::Legacy).is_ok());
+    }
+
+    #[test]
     fn append_cleanup_preserves_primary_error() {
         let s = append_cleanup_context("kv failed".into(), Ok(()));
         assert_eq!(s, "kv failed");
@@ -846,13 +1592,18 @@ mod tests {
             validate_cask_static_layout(true, KvPair::Split(mode, VMode::Q8)).unwrap();
         }
         for mode in [KvMode::Fwht2, KvMode::Fwht3, KvMode::Fwht4] {
-            let err = validate_cask_static_layout(true, KvPair::Split(mode, VMode::Q8)).unwrap_err();
+            let err =
+                validate_cask_static_layout(true, KvPair::Split(mode, VMode::Q8)).unwrap_err();
             assert!(err.contains("legacy-asym"), "{err}");
         }
-        let err = validate_cask_static_layout(true, KvPair::Split(KvMode::Fwht3, VMode::Lloyd3)).unwrap_err();
+        let err = validate_cask_static_layout(true, KvPair::Split(KvMode::Fwht3, VMode::Lloyd3))
+            .unwrap_err();
         assert!(err.contains("V=q8"), "{err}");
-        assert!(validate_cask_static_layout(true, KvPair::Native(KvMode::Fp8))
-            .unwrap_err().contains("V=q8"));
+        assert!(
+            validate_cask_static_layout(true, KvPair::Native(KvMode::Fp8))
+                .unwrap_err()
+                .contains("V=q8")
+        );
     }
 
     #[test]
@@ -860,5 +1611,75 @@ mod tests {
         use hipfire_runtime::kv_mode::{KvMode, KvPair};
 
         validate_cask_static_layout(false, KvPair::Split(KvMode::Fwht3, VMode::Lloyd3)).unwrap();
+    }
+
+    /// The draft-reserve arithmetic, pinned without a GPU: one file reserves
+    /// file + file/8 + 512 MiB, and MTP + DFlash charge independently and add.
+    #[test]
+    fn draft_reserve_charges_mtp_and_dflash() {
+        let dir = std::env::temp_dir().join(format!("hipfire-draft-reserve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let write_sized = |name: &str, len: u64| {
+            let path = dir.join(name);
+            std::fs::write(&path, vec![0u8; len as usize]).expect("temp file");
+            path
+        };
+        let file_len = 8 << 20;
+        let mtp = write_sized("model.mtp", file_len);
+        let dflash = write_sized("draft.hfq", file_len);
+        let expect = file_len + file_len / 8 + (512 << 20);
+        assert_eq!(draft_file_reserve_bytes(&mtp), expect);
+        assert_eq!(draft_file_reserve_bytes(&dflash), expect);
+        assert_eq!(draft_file_reserve_bytes(&dir.join("missing.mtp")), 0);
+        // Each side alone, then both together: the single helper both
+        // resolvers call, so a slots load with a DFlash sidecar charges it.
+        let mtp_sidecar = MtpHeadLocation::Sidecar(mtp);
+        assert_eq!(draft_device_reserve_bytes(Some(&mtp_sidecar), None), expect);
+        assert_eq!(draft_device_reserve_bytes(None, Some(&dflash)), expect);
+        assert_eq!(
+            draft_device_reserve_bytes(Some(&mtp_sidecar), Some(&dflash)),
+            expect.saturating_mul(2)
+        );
+        // A bundled head charges only its appended section, never the trunk.
+        let bundled = MtpHeadLocation::Bundled { section_bytes: file_len };
+        assert_eq!(draft_device_reserve_bytes(Some(&bundled), None), expect);
+        assert_eq!(
+            draft_device_reserve_bytes(Some(&bundled), Some(&dflash)),
+            expect.saturating_mul(2)
+        );
+        assert_eq!(draft_device_reserve_bytes(None, None), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The MTP head probe both resolvers share: the stem sidecar spelling
+    /// resolves, the last-extension spelling shadows it, and a bundled
+    /// trailer resolves to the appended section size (its MTP container is
+    /// disjoint from the trunk index the census walks — see
+    /// `resolve_mtp_head_file`).
+    #[test]
+    fn mtp_head_probe_prefers_sidecar_spelling_then_bundle() {
+        let dir = std::env::temp_dir().join(format!("hipfire-mtp-head-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let trunk = dir.join("model.mq4v2.hfq");
+        std::fs::write(&trunk, [0u8; 64]).expect("temp file");
+        // No sidecar, no trailer: no head.
+        assert!(resolve_mtp_head_file(&trunk).is_none());
+        // Stem spelling (`model.mtp`) resolves.
+        let stem = dir.join("model.mtp");
+        std::fs::write(&stem, [0u8; 64]).expect("temp file");
+        assert!(matches!(
+            resolve_mtp_head_file(&trunk),
+            Some(MtpHeadLocation::Sidecar(p)) if p == stem
+        ));
+        // The last-extension spelling shadows the stem when both exist.
+        let specific = dir.join("model.mq4v2.mtp");
+        std::fs::write(&specific, [0u8; 64]).expect("temp file");
+        assert!(matches!(
+            resolve_mtp_head_file(&trunk),
+            Some(MtpHeadLocation::Sidecar(p)) if p == specific
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

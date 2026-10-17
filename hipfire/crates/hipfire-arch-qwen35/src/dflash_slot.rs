@@ -174,7 +174,7 @@ impl DflashSlotDraft {
 
 /// Load the shared DFlash2 draft state for the slot engine. Mirrors
 /// `load_dflash_state` (dflash_spec.rs) minus the sequential-only pieces
-/// (hidden ring, host shadow, DDTree, PM4 tape, verify prefill scratch).
+/// (hidden ring, DDTree, PM4 tape, verify prefill scratch).
 ///
 /// `requested_ctx` is the engine's per-slot token capacity (`cap_tokens`).
 /// `max_batch` sizes the shared hidden staging (one step's rows).
@@ -276,7 +276,9 @@ pub fn load_dflash_shared(
                 .into(),
         );
     }
-    let block_size = draft_config.runtime_block_size();
+    // The daemon admits only the default `speculation.dflash_block` on this
+    // route (`validate_load_caps`).
+    let block_size = draft_config.runtime_block_size(hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED);
     if block_size != draft_config.block_size {
         eprintln!(
             "  DFlash2 runtime block: {} -> {} (selector/conv path is length-generic)",

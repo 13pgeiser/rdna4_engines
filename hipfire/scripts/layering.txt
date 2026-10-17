@@ -21,22 +21,30 @@
  0 hipfire-detect
  0 hipfire-xdna
  0 peacemaker-ir
+ 0 peacemaker-npu
  0 radiowave
  0 redline
+ 0 railgun-corpus
  1 hip-bridge
  1 hipfire-client
- 2 hipfire-isa
+ 2 peacemaker-isa
  1 hipfire-registry
  1 hsa-bridge
+ 1 peacemaker-author
  1 peacemaker-lift
  1 redline-rocr
  1 va-bridge
+ 1 railgun
  2 hipfire-tui
  2 redline-dispatch
+ 2 railgun-cert
+ 2 npu-tools
  3 hipfire-cpu
  3 rdna-compute
+ 3 peacemaker-rip
  4 hipfire-dispatch
  4 saddle-core
+ 4 railgun-jitcorpus
  5 hipfire-runtime
  6 hipfire-arch-cohere2moe
  6 hipfire-arch-diffusion
@@ -57,6 +65,7 @@
  7 hipfire-arch-lfm2moe
  7 hipfire-arch-minimax
  7 hipfire-arch-qwen35
+ 7 hipfire-arch-qwen35-embed
  7 hipfire-quantize
  7 saddle-quant
  8 hipfire-cli

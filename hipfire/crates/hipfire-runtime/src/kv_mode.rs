@@ -337,8 +337,9 @@ fn normalize_qwen(raw: &str) -> Option<KvMode> {
 }
 
 /// [`normalize_qwen`] plus the three indivisible native presets, for the
-/// multi-slot site only: bf16/f16 have slot readers, and fp8 (none) takes
-/// [`resolve`]'s explicit-native carry-forward so the slot engine refuses it.
+/// multi-slot site only: bf16/f16 have slot readers, and fp8 resolves too
+/// (gfx1201-gated — see [`resolve_qwen35_slots`], which hard-errors an
+/// explicit fp8 off gfx1201 instead of letting the engine discover it).
 fn normalize_qwen_slots(raw: &str) -> Option<KvMode> {
     match raw.trim() {
         "fp8" => Some(Fp8),
@@ -377,14 +378,15 @@ pub const DIR_SAFETENSORS_POLICY: KvModePolicy = KvModePolicy {
 };
 
 /// Non-Qwen (llama HFQ) alias table — preserved pre-migration semantics.
-/// `asymN` stays Givens AsymN; `turbo`/`auto` → Fwht3 (unaccepted → q8 warn).
+/// `asymN` stays Givens AsymN; `auto` is the site default (q8, silent);
+/// `turbo`/`turbo3` → Fwht3 (unaccepted → q8 warn).
 fn normalize_full(raw: &str) -> Option<KvMode> {
     match raw {
-        "q8" => Some(Q8),
+        "q8" | "auto" => Some(Q8),
         // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3
         "asym2" | "turbo2" => Some(Asym2),
         "asym3" => Some(Asym3),
-        "auto" | "turbo" | "turbo3" => Some(Fwht3),
+        "turbo" | "turbo3" => Some(Fwht3),
         "asym4" | "turbo4" => Some(Asym4),
         "fwht2" => Some(Fwht2),
         "fwht3" => Some(Fwht3),
@@ -408,6 +410,32 @@ pub const HFQ_Q8_ONLY_POLICY: KvModePolicy = KvModePolicy {
     site: "hfq-q8-only",
     normalize_alias: normalize_full,
     accepted: &[Q8],
+    default: Q8,
+};
+
+/// Gemma4 full-attention tier. Names use the shared Qwen table, so
+/// bare `asym3`/`turbo3` mean FWHT (no hd512 FWHT tier here → q8 + warn) and
+/// the legacy Givens tier needs the explicit `legacy-asym3` opt-out.
+/// `fp8`/`bf16` are carried forward so the carrier fails closed on them.
+fn normalize_gemma4(raw: &str) -> Option<KvMode> {
+    match raw.trim() {
+        "" | "auto" => Some(Q8),
+        "fp8" => Some(Fp8),
+        "bf16" => Some(Bf16),
+        other => parse_qwen_k_name(other).ok(),
+    }
+}
+
+/// Gemma4 carrier, full-attention tier (the sliding tier is always q8).
+/// `auto` follows the shared policy: fp8 only where the site admits Fp8, else
+/// q8. Fp8 is not admitted: every Gemma4 attend site builds its tier plan
+/// with `quant_fp8: false`, and the batched prefill uses the Q8 plan, which
+/// refuses fp8. So `auto` is q8 on every arch; `legacy-asym3` restores the
+/// previous Givens asym3 tier.
+pub const GEMMA4_FULL_POLICY: KvModePolicy = KvModePolicy {
+    site: "gemma4-full",
+    normalize_alias: normalize_gemma4,
+    accepted: &[Q8, Asym3],
     default: Q8,
 };
 
@@ -451,31 +479,55 @@ pub const MAPLE_POLICY: KvModePolicy = KvModePolicy {
 /// paged pools), so every rotated tier the sequential path accepts is
 /// accepted here too — plus the flat 2-byte native tiers bf16 and f16, which
 /// DO have slot readers (descriptor-aware `kv_cache_write_*` +
-/// `attention_flash_*_tile_batched` kernels). Only fp8 stays refused: it
-/// has no slot-reader support (fail closed) on this site.
-/// The DEFAULT stays q8 — deliberately NOT the sequential site's fwht3:
-/// the slots q8 path has production mileage on every fixture, and an
-/// operator who wants a rotated tier on the slots engine says so
-/// explicitly (`HIPFIRE_KV_MODE=fwht3` / config). "auto" therefore means
-/// q8 HERE (mirroring the qwen35-pp site's convention, not the hfq site's).
+/// `attention_flash_*_tile_batched` kernels). fp8 is accepted at the string
+/// level on exact gfx1201 ONLY: the descriptor-aware fp8 writer/reader
+/// kernels exist there (`HIPFIRE_KV_FP8_E4M3` TU family), and
+/// [`resolve_qwen35_slots`] hard-errors the tier everywhere else. This
+/// policy stays arch-unaware by design — [`resolve`] is pure — so Fp8 in
+/// `accepted` can never leak into an auto selection: the DEFAULT stays q8 on
+/// EVERY arch (deliberately NOT the sequential site's fwht3, and NOT the
+/// sequential hfq site's gfx1201-fp8 auto: the slots q8 path has production
+/// mileage on every fixture, and an operator who wants a rotated or native
+/// tier on the slots engine says so explicitly). "auto" therefore means q8
+/// HERE (mirroring the qwen35-pp site's convention, not the hfq site's).
 /// Names come from the shared Qwen table: `asymN`/`turboN` → FwhtN,
 /// `legacy-asymN` → AsymN.
 pub const QWEN35_SLOTS_POLICY: KvModePolicy = KvModePolicy {
     site: "qwen35-slots",
     normalize_alias: normalize_qwen_slots,
-    accepted: &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4, Bf16, F16],
+    accepted: &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4, Bf16, F16, Fp8],
     default: Q8,
 };
 
+/// Strict, arch-aware qwen35 multi-slot resolution. `""`/`auto` is q8 on
+/// EVERY arch (the slots engine's shipped default — never fp8, mirroring
+/// the qwen35-pp convention); an explicit fp8 is honored only on exact
+/// gfx1201, where the descriptor-aware fp8 writer/reader kernels exist, and
+/// hard-errors everywhere else naming the arch and the fix (same shape as
+/// [`resolve_qwen4`]). Every other mode falls through to the pure
+/// [`resolve`] unchanged.
+pub fn resolve_qwen35_slots(raw: &str, arch: &str) -> Result<ResolveResult, String> {
+    let resolved = resolve(raw, &QWEN35_SLOTS_POLICY);
+    if resolved.mode == Fp8 && arch != "gfx1201" {
+        return Err(format!(
+            "qwen35 slots kv mode \"fp8\" needs gfx1201 (have {arch}); use q8 or auto"
+        ));
+    }
+    Ok(resolved)
+}
+
 /// Qwen4 (Flash-Next) QSA K/V. `bf16` is the exact reference state (F32
 /// K/V arenas, BF16-valued index keys); `fp8` stores K/V as E4M3 with one
-/// f16 scale per head and token (gfx12 kernels) and the index keys as BF16.
-/// Aliases stay local so an explicit q8/rotated mode cannot be silently
-/// rewritten by the generic fallback resolver.
+/// f16 scale per head and token (gfx12 kernels); `q8` stores K/V as the
+/// dense q8 KV row, Q8_0 blocks of 32 (gfx11 and gfx12 kernels). Both
+/// quantized modes keep the index keys as BF16. Aliases stay local so an
+/// explicit rotated mode cannot be silently rewritten by the generic
+/// fallback resolver.
 fn normalize_qwen4(raw: &str) -> Option<KvMode> {
     match raw.trim() {
         "" | "auto" | "bf16" => Some(Bf16),
         "fp8" => Some(Fp8),
+        "q8" => Some(Q8),
         _ => None,
     }
 }
@@ -483,17 +535,19 @@ fn normalize_qwen4(raw: &str) -> Option<KvMode> {
 pub const QWEN4_POLICY: KvModePolicy = KvModePolicy {
     site: "qwen4",
     normalize_alias: normalize_qwen4,
-    accepted: &[Bf16, Fp8],
+    accepted: &[Bf16, Fp8, Q8],
     default: Bf16,
 };
 
 /// Strict, arch-aware Qwen4 resolution. `""`/`auto` is fp8 on exact gfx1201
-/// and bf16 everywhere else; explicit `fp8` is refused off gfx1201, and any
-/// other unsupported explicit mode is refused before the generic [`resolve`]
-/// fallback can rewrite it. The model's head geometry is checked where the
-/// state is built (`hipfire_arch_qwen4::resolve_qsa_format`).
+/// and bf16 everywhere else; explicit `fp8` is refused off gfx1201 and
+/// explicit `q8` off gfx11/gfx12, and any other unsupported explicit mode
+/// is refused before the generic [`resolve`] fallback can rewrite it. The
+/// model's head geometry is checked where the state is built
+/// (`hipfire_arch_qwen4::resolve_qsa_format`).
 pub fn resolve_qwen4(raw: &str, arch: &str) -> Result<ResolveResult, String> {
     let fp8_arch = arch == "gfx1201";
+    let q8_arch = arch.starts_with("gfx11") || arch.starts_with("gfx12");
     let mode = match raw.trim() {
         "" | "auto" if fp8_arch => Fp8,
         "" | "auto" | "bf16" => Bf16,
@@ -503,9 +557,15 @@ pub fn resolve_qwen4(raw: &str, arch: &str) -> Result<ResolveResult, String> {
                 "qwen4 kv mode \"fp8\" needs gfx1201 (have {arch}); use bf16 or auto"
             ))
         }
+        "q8" if q8_arch => Q8,
+        "q8" => {
+            return Err(format!(
+                "qwen4 kv mode \"q8\" needs a gfx11 or gfx12 GPU (have {arch}); use bf16 or auto"
+            ))
+        }
         other => {
             return Err(format!(
-                "unsupported qwen4 kv mode {other:?}; explicit mode must be one of: auto, bf16, fp8"
+                "unsupported qwen4 kv mode {other:?}; explicit mode must be one of: auto, bf16, fp8, q8"
             ))
         }
     };
@@ -1090,15 +1150,43 @@ mod tests {
             assert_eq!(r.mode, mode, "{raw} must be honored on the slots site");
             assert!(r.warning.is_none(), "{raw} must not warn");
         }
-        // fp8 alone stays refused (no slot readers): the single-string path
-        // carries the native forward WITH a warning so construction fails
-        // closed, and the pair path hard-errors instead of selecting an
-        // indivisible native tier.
+        // fp8 resolves cleanly at the STRING level (the descriptor-aware
+        // fp8 writer/reader kernels exist on gfx1201); the arch gate lives
+        // in resolve_qwen35_slots below, and auto stays q8 on every arch
+        // because the slots default is q8 — Fp8 in `accepted` can never
+        // become an auto selection.
         let r = resolve("fp8", p);
-        assert!(r.warning.is_some(), "fp8 must warn on the slots site");
-        assert!(
-            resolve_kv_pair("fp8", None, None, p, "gfx1201", true).is_err(),
-            "fp8 must error on the slots pair path"
+        assert_eq!(r.mode, KvMode::Fp8);
+        assert!(r.warning.is_none(), "fp8 must resolve cleanly on the slots site");
+        // Arch-parameterized gate: explicit fp8 on gfx1201 is honored, and
+        // every other arch hard-errors naming the arch and the fix.
+        let ok = resolve_qwen35_slots("fp8", "gfx1201").unwrap();
+        assert_eq!(ok.mode, KvMode::Fp8);
+        assert!(ok.warning.is_none());
+        for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1200", "gfx942"] {
+            let Err(error) = resolve_qwen35_slots("fp8", arch) else {
+                panic!("fp8 off gfx1201 must be refused on {arch}");
+            };
+            assert!(error.contains("fp8") && error.contains(arch), "{error}");
+            assert!(error.contains("gfx1201"), "{error}");
+        }
+        // auto/unset never select fp8, even on gfx1201 (slots default q8).
+        for raw in ["", "auto"] {
+            for arch in ["gfx1100", "gfx1201"] {
+                let r = resolve_qwen35_slots(raw, arch).unwrap();
+                assert_eq!(r.mode, KvMode::Q8, "{raw:?} on {arch} must stay q8");
+                assert!(r.warning.is_none());
+            }
+        }
+        // The pair path now honors fp8 too (it is in `accepted`): an
+        // indivisible native pair resolves on gfx1201. The slots site itself
+        // only consumes the single-string [`resolve`], so this is a
+        // policy-level statement, not a production route — and the arch gate
+        // in resolve_qwen35_slots applies identically either way.
+        assert_eq!(
+            resolve_kv_pair("fp8", None, None, p, "gfx1201", true).unwrap(),
+            KvPair::Native(Fp8),
+            "fp8 must resolve as an indivisible native pair once accepted"
         );
         let garbage = resolve("garbage", p);
         assert_eq!(garbage.mode, KvMode::Q8);
@@ -1124,8 +1212,8 @@ mod tests {
                 assert!(r.warning.is_some(), "site {} must WARN on {raw}", p.site);
             }
         }
-        // The slots site honors f16 and bf16 and carries fp8 forward (with a
-        // warning) so the slot engine refuses it.
+        // The slots site honors f16 and bf16 and fp8 (the latter
+        // gfx1201-gated by resolve_qwen35_slots, not by the string resolver).
         assert_eq!(resolve("f16", &QWEN35_SLOTS_POLICY).mode, KvMode::F16);
         assert_eq!(resolve("bf16", &QWEN35_SLOTS_POLICY).mode, KvMode::Bf16);
         assert_eq!(resolve("fp8", &QWEN35_SLOTS_POLICY).mode, KvMode::Fp8);
@@ -1136,18 +1224,23 @@ mod tests {
         let p = &QWEN4_POLICY;
         // (raw, arch) -> mode. The Halo (gfx1151) and the XTX (gfx1100) keep
         // bf16 under auto; only exact gfx1201 selects fp8 (not gfx1200).
+        // Explicit q8 is served on every gfx11/gfx12 arch and never by auto.
         for (raw, arch, mode) in [
             ("", "gfx1201", KvMode::Fp8),
             ("auto", "gfx1201", KvMode::Fp8),
             (" auto ", "gfx1201", KvMode::Fp8),
             ("bf16", "gfx1201", KvMode::Bf16),
             ("fp8", "gfx1201", KvMode::Fp8),
+            ("q8", "gfx1201", KvMode::Q8),
             ("", "gfx1151", KvMode::Bf16),
             ("auto", "gfx1151", KvMode::Bf16),
             ("bf16", "gfx1151", KvMode::Bf16),
+            (" q8 ", "gfx1151", KvMode::Q8),
             ("", "gfx1100", KvMode::Bf16),
             ("auto", "gfx1100", KvMode::Bf16),
+            ("q8", "gfx1100", KvMode::Q8),
             ("auto", "gfx1200", KvMode::Bf16),
+            ("q8", "gfx1200", KvMode::Q8),
         ] {
             let resolved = resolve_qwen4(raw, arch).expect("supported qwen4 mode");
             assert_eq!(resolved.mode, mode, "{raw:?} on {arch}");
@@ -1159,7 +1252,13 @@ mod tests {
             };
             assert!(error.contains("fp8") && error.contains(arch), "{error}");
         }
-        for raw in ["q8", "asym3", "f16", "garbage"] {
+        for arch in ["gfx1030", "gfx906", "gfx942"] {
+            let Err(error) = resolve_qwen4("q8", arch) else {
+                panic!("q8 off gfx11/gfx12 must be refused on {arch}");
+            };
+            assert!(error.contains("q8") && error.contains(arch), "{error}");
+        }
+        for raw in ["asym3", "fwht3", "f16", "garbage"] {
             for arch in ["gfx1201", "gfx1151"] {
                 let error = match resolve_qwen4(raw, arch) {
                     Ok(_) => panic!("explicit unsupported mode {raw} must be rejected"),
@@ -1186,9 +1285,7 @@ mod tests {
         assert!(resolve("asym3", p).warning.is_none());
         assert_eq!(resolve("asym4", p).mode, KvMode::Asym4);
         assert_eq!(resolve("turbo4", p).mode, KvMode::Asym4);
-        // auto/turbo/turbo3 → Fwht3 unaccepted → Q8 + warn (legacy non-Qwen path)
-        assert_eq!(resolve("auto", p).mode, KvMode::Q8);
-        assert!(resolve("auto", p).warning.is_some());
+        // turbo/turbo3 → Fwht3 unaccepted → Q8 + warn (legacy non-Qwen path)
         assert_eq!(resolve("turbo", p).mode, KvMode::Q8);
         assert!(resolve("turbo", p).warning.is_some());
         assert_eq!(resolve("turbo3", p).mode, KvMode::Q8);
@@ -1208,10 +1305,45 @@ mod tests {
         assert_eq!(resolve("q8", p).mode, KvMode::Q8);
         assert_eq!(resolve("asym3", p).mode, KvMode::Q8);
         assert!(resolve("asym3", p).warning.is_some());
-        assert_eq!(resolve("auto", p).mode, KvMode::Q8);
-        assert!(resolve("auto", p).warning.is_some());
+        assert!(resolve("fwht4", p).warning.is_some());
         assert_eq!(resolve("fwht4", p).mode, KvMode::Q8);
         assert_eq!(resolve("garbage", p).mode, KvMode::Q8);
+    }
+
+    /// `auto` is the site default on every non-Qwen q8 site: it resolves to
+    /// q8 without the "unrecognized or unsupported" warning.
+    #[test]
+    fn non_qwen_auto_resolves_q8_without_warning() {
+        for p in [&LLAMA_HFQ_POLICY, &HFQ_Q8_ONLY_POLICY] {
+            let r = resolve("auto", p);
+            assert_eq!(r.mode, KvMode::Q8, "site {}", p.site);
+            assert!(r.warning.is_none(), "site {}: {:?}", p.site, r.warning);
+        }
+    }
+
+    #[test]
+    fn gemma4_full_policy() {
+        let p = &GEMMA4_FULL_POLICY;
+        for raw in ["", "auto", "q8"] {
+            let r = resolve(raw, p);
+            assert_eq!(r.mode, Q8, "{raw:?}");
+            assert!(r.warning.is_none(), "{raw:?}");
+        }
+        let legacy = resolve("legacy-asym3", p);
+        assert_eq!(legacy.mode, Asym3);
+        assert!(legacy.warning.is_none());
+        // Bare asymN/turboN/fwhtN are FWHT names; no hd512 FWHT tier → q8 + warn.
+        for raw in ["asym3", "turbo3", "turbo", "fwht3", "asym4", "legacy-asym4", "garbage"] {
+            let r = resolve(raw, p);
+            assert_eq!(r.mode, Q8, "{raw}");
+            assert!(r.warning.is_some(), "{raw} must warn");
+        }
+        // Native presets are carried forward so the carrier fails closed.
+        for (raw, mode) in [("fp8", Fp8), ("bf16", Bf16)] {
+            let r = resolve(raw, p);
+            assert_eq!(r.mode, mode);
+            assert!(r.warning.is_some());
+        }
     }
 
     #[test]

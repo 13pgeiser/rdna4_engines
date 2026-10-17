@@ -14,19 +14,34 @@ pub mod rocm;
 
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     env, fmt, fs,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{LazyLock, OnceLock},
 };
 use thiserror::Error;
 
 pub const CONFIG_SCHEMA_VERSION: i64 = 1;
 
+/// Largest `serve.continuous_batch_size` the schema, CLI and serve precheck
+/// accept. It is a configuration ceiling only: runtime memory admission may
+/// still allow fewer live lanes, and per-chunk verify row limits bound rows
+/// per chunk, not the total lane count.
+pub const MAX_CONTINUOUS_BATCH_SIZE: u64 = 256;
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("unknown configuration key '{0}'")]
     UnknownKey(String),
+    #[error(
+        "configuration key '{key}' was removed in {removed_in} ({reason}); it has no effect — \
+         delete it from config.toml if it is still set"
+    )]
+    RetiredKey {
+        key: &'static str,
+        removed_in: &'static str,
+        reason: &'static str,
+    },
     #[error("invalid value for {key}: {message}")]
     InvalidValue { key: String, message: String },
     #[error("failed to read {path}: {source}")]
@@ -330,11 +345,30 @@ pub enum ValueRule {
         min: i64,
         max: i64,
     },
+    /// The string `auto` or an integer in `min..=max`.
+    AutoInteger {
+        min: i64,
+        max: i64,
+    },
+    /// Like [`ValueRule::NullableInteger`], but also accepts the literal
+    /// `auto` (case-insensitive) — the spelling the TUI rows and the help text
+    /// use for these budget keys, and the one an operator is likely to type.
+    /// `-1` remains the wire spelling that `auto` is equivalent to.
+    NullableIntegerOrAuto {
+        min: i64,
+        max: i64,
+    },
     NullableFloat {
         min: f64,
         max: f64,
     },
     KvAdaptive,
+    /// `auto` | a GPU share in `[0.0, 0.5]`. The schedule divides a spilled step's
+    /// output rows between the two engines (GPU = the `pcie` path, CPU = the `cpu`
+    /// path); `0.0` collapses it to the CPU engine alone, i.e. the step runs exactly
+    /// as `memory.offload_exec=cpu`. The upper bound is 0.5 because a share above
+    /// half the rows is better expressed by switching `memory.offload_exec` to `pcie`.
+    PassbackShare,
     /// `legacy` | `vmm`. Rejects the pre-rename `contiguous` spelling with a
     /// migration message rather than a generic enum failure.
     KvBackend,
@@ -390,6 +424,10 @@ impl ConfigField {
                 matches!(value, ConfigValue::Bool(_))
                     || matches!(value, ConfigValue::String(v) if v == "auto")
             }
+            ValueRule::AutoInteger { min, max } => {
+                matches!(value, ConfigValue::String(v) if v == "auto")
+                    || matches!(value, ConfigValue::Integer(v) if *v >= min && *v <= max)
+            }
             ValueRule::NullableString => {
                 matches!(value, ConfigValue::Null | ConfigValue::String(_))
             }
@@ -400,6 +438,11 @@ impl ConfigField {
             ValueRule::NullableInteger { min, max } => {
                 matches!(value, ConfigValue::Null)
                     || matches!(value, ConfigValue::Integer(v) if *v >= min && *v <= max)
+            }
+            ValueRule::NullableIntegerOrAuto { min, max } => {
+                matches!(value, ConfigValue::Null)
+                    || matches!(value, ConfigValue::Integer(v) if *v >= min && *v <= max)
+                    || matches!(value, ConfigValue::String(v) if v.trim().eq_ignore_ascii_case("auto"))
             }
             ValueRule::NullableFloat { min, max } => {
                 matches!(value, ConfigValue::Null)
@@ -412,6 +455,9 @@ impl ConfigField {
             ValueRule::KvBackend => {
                 matches!(value, ConfigValue::String(v) if matches!(v.as_str(), "legacy" | "vmm"))
             }
+            ValueRule::PassbackShare => matches!(value, ConfigValue::String(v) if {
+                v == "auto" || v.parse::<f64>().is_ok_and(|f| (0.0..=0.5).contains(&f))
+            }),
             ValueRule::Deepseek4Placement => matches!(value, ConfigValue::String(v)
                 if v.parse::<Deepseek4ComputePlacement>().is_ok()),
         };
@@ -440,6 +486,10 @@ impl ConfigField {
             ValueRule::Float { .. } => raw.parse::<f64>().ok().map(ConfigValue::Float),
             ValueRule::AutoBool if raw == "auto" => Some(ConfigValue::String(raw.to_owned())),
             ValueRule::AutoBool => parse_bool(raw).map(ConfigValue::Bool),
+            ValueRule::AutoInteger { .. } if raw.eq_ignore_ascii_case("auto") => {
+                Some(ConfigValue::String("auto".to_owned()))
+            }
+            ValueRule::AutoInteger { .. } => raw.parse::<i64>().ok().map(ConfigValue::Integer),
             ValueRule::NullableString if raw.eq_ignore_ascii_case("null") => {
                 Some(ConfigValue::Null)
             }
@@ -450,6 +500,15 @@ impl ConfigField {
                 Some(ConfigValue::Null)
             }
             ValueRule::NullableInteger { .. } => raw.parse::<i64>().ok().map(ConfigValue::Integer),
+            ValueRule::NullableIntegerOrAuto { .. } if raw.eq_ignore_ascii_case("null") => {
+                Some(ConfigValue::Null)
+            }
+            ValueRule::NullableIntegerOrAuto { .. } if raw.trim().eq_ignore_ascii_case("auto") => {
+                Some(ConfigValue::String(raw.to_owned()))
+            }
+            ValueRule::NullableIntegerOrAuto { .. } => {
+                raw.parse::<i64>().ok().map(ConfigValue::Integer)
+            }
             ValueRule::NullableFloat { .. } if raw.eq_ignore_ascii_case("null") => {
                 Some(ConfigValue::Null)
             }
@@ -520,10 +579,27 @@ const KV_V_NAMES: &[&str] = &["", "q8", "lloyd2", "lloyd3", "lloyd4"];
 // which warn and fall back for anything they cannot allocate. `bf16` is
 // maple's default plus the Qwen quality-control arm; `fp8` is admitted at
 // the single-GPU Qwen sites under the carrier's exact gfx1201/geometry guards.
+// `legacy-asym3` is the Gemma4 lowered full-tier opt-out back to Givens asym3
+// (on Qwen it names the same legacy K as `--kv-k legacy-asym3`).
 const KV_MODES: &[&str] = &[
     // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3 (asymN / turbo*)
-    "auto", "f32", "f16", "bf16", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2",
-    "turbo", "turbo4", "turbo3", "turbo2", "fp8",
+    "auto",
+    "f32",
+    "f16",
+    "bf16",
+    "q8",
+    "asym4",
+    "asym3",
+    "asym2",
+    "fwht4",
+    "fwht3",
+    "fwht2",
+    "turbo",
+    "turbo4",
+    "turbo3",
+    "turbo2",
+    "fp8",
+    "legacy-asym3",
 ];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
 /// VL image decode path: `cpu` (default) / `vcn` / `auto` (VCN when probed).
@@ -543,7 +619,7 @@ pub const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "medium", "high"
 // same reason as `REASONING_EFFORTS`: the TUI's option list must be this list, or
 // a value the schema accepts becomes unselectable (and an unselectable value
 // cycles from the wrong place).
-pub const OFFLOAD_EXECS: &[&str] = &["pcie", "cpu"];
+pub const OFFLOAD_EXECS: &[&str] = &["pcie", "cpu", "passback"];
 const SPECULATION_MODES: &[&str] = &["off", "auto", "ngram", "dflash", "mtp", "dspark"];
 
 macro_rules! field {
@@ -690,11 +766,23 @@ pub static FIELDS: &[ConfigField] = &[
         Memory,
         ModelLoad,
         DefaultValue::Null,
-        ValueRule::NullableInteger { min: -1, max: 65536 },
+        ValueRule::NullableIntegerOrAuto { min: -1, max: 65536 },
         true,
         false,
         Some("HIPFIRE_GPU_LAYER_BUDGET"),
-        "Resident-layer budget for partial GPU offload: N keeps the last N layers on the GPU and spills the rest to system RAM; unset keeps every layer on the GPU. The number counts layers ON the GPU, not layers offloaded — 3 on a 64-layer model spills 61. 'auto' (-1) defers placement to the engine, which currently keeps every layer on the GPU."
+        "Resident-layer budget for partial GPU offload: N keeps the last N layers on the GPU and spills the rest to system RAM; unset/null keeps every layer on the GPU on every model, including MoE. The number counts layers ON the GPU, not layers offloaded — 3 on a 64-layer model spills 61. Explicit 'auto' (-1) opts into placement by fit: the smallest spill that loads, routed experts first, and a model that already fits is left fully resident."
+    ),
+    field!(
+        "memory.moe_expert_budget",
+        "moe_expert_budget",
+        Memory,
+        ModelLoad,
+        DefaultValue::Null,
+        ValueRule::NullableIntegerOrAuto { min: -1, max: 65536 },
+        true,
+        false,
+        Some("HIPFIRE_MOE_EXPERT_BUDGET"),
+        "Resident routed-expert budget for a Mixture-of-Experts model whose experts exceed VRAM: N keeps the last N layers' routed experts on the GPU and spills the rest to system RAM; unset/null keeps every routed expert on the GPU. The number counts layers whose expert weights stay ON the GPU — llama.cpp's `--n-cpu-moe K` is this value written as `n_layers - K`. Only routed experts move: attention, router, shared expert and KV stay on the card. Explicit 'auto' (-1) opts into placement by fit, spilling routed experts before whole layers. No effect on a dense model, and none on an architecture that cannot spill experts (a configured spill fails that arch's load rather than being ignored)."
     ),
     field!(
         "memory.offload_exec",
@@ -706,7 +794,19 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_OFFLOAD_EXEC"),
-        "Which engine executes the ops that read a spilled layer's weights: 'pcie' (default) runs the GPU kernels against host-mapped weights over the link, 'cpu' executes those GEMVs on the CPU instead. Decides who multiplies, never what is spilled — placement stays memory.gpu_layer_budget, and the KV cache stays in VRAM either way. Unset, empty and unknown values all fall back to 'pcie'."
+        "Which engine executes the ops that read a spilled layer's weights: 'pcie' (default) runs the GPU kernels against host-mapped weights over the link; 'cpu' executes those GEMVs on the CPU instead; 'passback' is scheduled co-inference — both engines run the same spilled step concurrently (the GPU arm is the 'pcie' path, the CPU arm is the 'cpu' path), divided by output rows per 'memory.offload_passback_share'. Not a third engine and not a fallback: it decides who multiplies, never what is spilled — placement stays memory.gpu_layer_budget, and the KV cache stays in VRAM either way. Unset, empty and unknown values all fall back to 'pcie'."
+    ),
+    field!(
+        "memory.offload_passback_share",
+        "offload_passback_share",
+        Memory,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::PassbackShare,
+        true,
+        false,
+        Some("HIPFIRE_OFFLOAD_PASSBACK_SHARE"),
+        "How a spilled step's output rows are divided between the two engines under scheduled co-inference (memory.offload_exec=passback only): the GPU takes the first rows (the 'pcie' arm) while the CPU runs the rest (the 'cpu' arm). 'auto' (default) schedules the split from this host's measured engine rates and refines it online; a number in (0, 0.5] pins it; 0 collapses the split onto the CPU engine alone, so the mode is then byte-identical to memory.offload_exec=cpu."
     ),
     // Process-scoped: the preflight guards snapshot this once at startup, and
     // a mid-serve flip would make the refusal policy depend on which load ran
@@ -754,6 +854,18 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_ATTN_FLASH"),
         "Flash-attention admission preference."
+    ),
+    field!(
+        "attention.yarn_factor",
+        "yarn_factor",
+        Attention,
+        ModelLoad,
+        DefaultValue::Null,
+        ValueRule::NullableFloat { min: 1.0, max: 64.0 },
+        true,
+        false,
+        Some("HIPFIRE_YARN_FACTOR"),
+        "YaRN RoPE scaling factor override. Default null = the checkpoint's own rope_parameters; above 1 enables YaRN over the checkpoint's original context (factor x original positions); 1 disables a checkpoint's YaRN."
     ),
     field!(
         "serve.default_model",
@@ -842,6 +954,54 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         None,
         "Sampling temperature."
+    ),
+    field!(
+        "decide.calibration.choice",
+        "decide_calibration_choice",
+        Generation,
+        Request,
+        DefaultValue::Float(1.0),
+        ValueRule::Float {
+            min: 0.05,
+            max: 20.0,
+            min_inclusive: true
+        },
+        false,
+        false,
+        None,
+        "Decide (/v1/systemone) temperature T for choice answers: probabilities are softmax(label logits / T); 1 = raw. Set per model from a fit (docs/specs/2026-09-28-jev-decide-design.md section 13)."
+    ),
+    field!(
+        "decide.calibration.score",
+        "decide_calibration_score",
+        Generation,
+        Request,
+        DefaultValue::Float(1.0),
+        ValueRule::Float {
+            min: 0.05,
+            max: 20.0,
+            min_inclusive: true
+        },
+        false,
+        false,
+        None,
+        "Decide (/v1/systemone) temperature T for score answers: probabilities are softmax(label logits / T); 1 = raw. Set per model from a fit (docs/specs/2026-09-28-jev-decide-design.md section 13)."
+    ),
+    field!(
+        "decide.calibration.noul",
+        "decide_calibration_noul",
+        Generation,
+        Request,
+        DefaultValue::Float(1.0),
+        ValueRule::Float {
+            min: 0.05,
+            max: 20.0,
+            min_inclusive: true
+        },
+        false,
+        false,
+        None,
+        "Decide (/v1/systemone) temperature T for noul (yes/no) answers: p(yes) = sigmoid(log-odds / T); 1 = raw. Set per model from a fit (docs/specs/2026-09-28-jev-decide-design.md section 13)."
     ),
     field!(
         "generation.top_p",
@@ -1105,6 +1265,15 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_MAX_REQUEST_BYTES"),
         "Maximum request-body bytes."
     ),
+    process_bool_field!(
+        "serve.ui",
+        "serve_ui",
+        Serve,
+        false,
+        false,
+        "HIPFIRE_SERVE_UI",
+        "Serve the embedded chat UI at /ui on the serve listener; default off."
+    ),
     field!(
         "serve.max_queue",
         "serve_max_queue",
@@ -1126,11 +1295,50 @@ pub static FIELDS: &[ConfigField] = &[
         Serve,
         Process,
         DefaultValue::Integer(1),
-        ValueRule::Integer { min: 1, max: 128 },
+        ValueRule::Integer {
+            min: 1,
+            max: MAX_CONTINUOUS_BATCH_SIZE as i64
+        },
         false,
         false,
         Some("HIPFIRE_CONTINUOUS_BATCH_SIZE"),
         "Maximum coexisting eligible batch lanes for serve; 1 preserves sequential behavior."
+    ),
+    process_bool_field!(
+        "serve.vmm_batch",
+        "serve_vmm_batch",
+        Serve,
+        false,
+        true,
+        "HIPFIRE_SERVE_VMM_BATCH",
+        "Route eligible concurrent requests through the VMM continuous-batching executor (per-request VMM KV, one resident target). Off = existing VMM singleton route; never the fixed-slot legacy route. Developer default off until its route gates pass."
+    ),
+    process_bool_field!(
+        "serve.batch_spec",
+        "serve_batch_spec",
+        Serve,
+        true,
+        true,
+        "HIPFIRE_SERVE_BATCH_SPEC",
+        "Allow cross-request speculative verify rows on the VMM batch route; 0 disables batched speculation only and keeps singleton speculation unchanged."
+    ),
+    process_bool_field!(
+        "serve.batch_nonexact",
+        "serve_batch_nonexact",
+        Serve,
+        false,
+        true,
+        "HIPFIRE_SERVE_BATCH_NONEXACT",
+        "Permit explicitly labeled non-bit-exact batched arithmetic on the VMM batch route. Always default off."
+    ),
+    process_bool_field!(
+        "serve.batch_sampled",
+        "serve_batch_sampled",
+        Serve,
+        true,
+        true,
+        "HIPFIRE_SERVE_BATCH_SAMPLED",
+        "Default on (applies only with serve.vmm_batch). Admit sampled (temperature>0) requests to the VMM batch route only in the lane mode the singleton route selects for them, each proven byte-identical to that singleton (AR, native MTP, FAST_SAMPLE selector-chain DFlash). 0 is the kill switch: sampled requests stay on the serialized singleton route."
     ),
     field!(
         "serve.queue_timeout_ms",
@@ -1296,6 +1504,18 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         None,
         "Opt in to the DFlash trailing-τ adaptive verify-block width (default fixed block)."
+    ),
+    field!(
+        "speculation.dflash_block",
+        "dflash_block",
+        Speculation,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::AutoInteger { min: 4, max: 16 },
+        true,
+        false,
+        Some("HIPFIRE_DFLASH_BLOCK"),
+        "DFlash2 proposal width per serving configuration, never per live batch (batched lanes stay byte-identical to the singleton). Default `auto` = 8 on a `serve.vmm_batch` serve with `continuous_batch_size` >= 4, else 16; `16` restores the previous fixed width. Legacy DFlash drafts keep their declared width."
     ),
     field!(
         "speculation.dflash",
@@ -1521,6 +1741,91 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_PROMPT_CACHE_CAP",
         "Maximum cached assistant-turn tokenizations; zero keeps no entries."
     ),
+    process_field!(
+        "memory.session_cache_bytes",
+        "session_cache_bytes",
+        Memory,
+        DefaultValue::Integer(8589934592),
+        ValueRule::Integer {
+            min: 0,
+            max: 1099511627776
+        },
+        false,
+        "HIPFIRE_SESSION_CACHE_BYTES",
+        "Byte budget for reusable prefill snapshots (session cache; Flash-Next). 0 disables the cache."
+    ),
+    process_field!(
+        "memory.ple_hot_store_bytes",
+        "ple_hot_store_bytes",
+        Memory,
+        DefaultValue::Integer(0),
+        ValueRule::AutoInteger {
+            min: 0,
+            max: 1099511627776
+        },
+        false,
+        "HIPFIRE_PLE_HOT_STORE_BYTES",
+        "Prewarm budget of the Qwen4 PLE hot-row store (bytes of the frequency-ranked `<model>.plehotrows` hot-row pack read into the page cache after load; rows the pack holds are read from it, everything else from the model file; unified-memory GPUs only, needs the `<model>.plehot` sidecar and the pack from `hipfire-quantize ple-hot-pack`). Default 0 (off). `auto` prewarms MemAvailable minus 4 GiB at ready, capped at the pack. The pack's pages are ordinary reclaimable page cache: they are dropped, never swapped, under memory pressure."
+    ),
+    process_field!(
+        "memory.ple_format",
+        "ple_format",
+        Memory,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(&["auto", "q4", "q8"]),
+        false,
+        "HIPFIRE_PLE_FORMAT",
+        "Which PLE row table a Flash-Next (Qwen4) load reads: `q8` = the exact Q8 rows (embedded in a monolithic model, or the `<model>.ple-q8` sidecar of a split base), `q4` = the 4-bit Lloyd-Max rows (`<model>.ple-q4`, derived from the Q8 rows on first load when missing), `auto` = q4 on gfx1151 (unified-memory Strix Halo) and q8 elsewhere, using the other format when only that one is on disk (auto never derives or downloads)."
+    ),
+    process_field!(
+        "memory.ple_prewarm_bytes",
+        "ple_prewarm_bytes",
+        Memory,
+        DefaultValue::String("auto"),
+        ValueRule::AutoInteger {
+            min: 0,
+            max: 1099511627776
+        },
+        false,
+        "HIPFIRE_PLE_PREWARM_BYTES",
+        "Prewarm budget of the q4 PLE table (bytes of `<model>.ple-q4` read into the page cache after the model is ready, while no request runs; a rank-ordered table hottest tier first, then tier 0 again). Default `auto` = 15 GiB (the hottest rows), capped at MemAvailable minus 8 GiB at ready and at the table. `0` turns the prewarm off; an explicit N is that many bytes. The pages are ordinary reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission."
+    ),
+    process_field!(
+        "memory.ple_load_fill_bytes",
+        "ple_load_fill_bytes",
+        Memory,
+        DefaultValue::String("auto"),
+        ValueRule::AutoInteger {
+            min: 0,
+            max: 1099511627776
+        },
+        false,
+        "HIPFIRE_PLE_LOAD_FILL_BYTES",
+        "Bytes of a rank-ordered q4 PLE table (`<model>.ple-q4`) read into the page cache while the model loads, hottest rows first, at no more than 0.2 GB/s so the weight upload keeps the drive, re-reading pages the upload's cache traffic evicted (hottest first) until ready; the prewarm after ready (`memory.ple_prewarm_bytes`) continues at the end of the resident prefix. Ready never waits for it: what is resident by then serves the first request. Default `auto` = 14 GiB, capped at the table, at an explicit `memory.ple_prewarm_bytes`, and at the host RAM available at load start (MemAvailable plus TTM's page pool) minus the weights the load puts in host RAM minus 8 GiB. `0` turns it off; an explicit N is that many bytes (same caps). Ordinary reclaimable page cache, not charged in admission."
+    ),
+    process_field!(
+        "memory.session_cache_disk_bytes",
+        "session_cache_disk_bytes",
+        Memory,
+        DefaultValue::Integer(0),
+        ValueRule::Integer {
+            min: 0,
+            max: 70368744177664
+        },
+        false,
+        "HIPFIRE_SESSION_CACHE_DISK_BYTES",
+        "Byte budget of the session cache's disk tier: snapshots evicted from memory are written to memory.session_cache_dir and restored on demand, surviving restarts. 0 disables it."
+    ),
+    process_field!(
+        "memory.session_cache_dir",
+        "session_cache_dir",
+        Memory,
+        DefaultValue::String(""),
+        ValueRule::String,
+        false,
+        "HIPFIRE_SESSION_CACHE_DIR",
+        "Directory of the session cache's disk tier; empty = $HIPFIRE_HOME/session-cache. One process uses it at a time."
+    ),
     process_bool_field!(
         "memory.prompt_cache_unbounded",
         "prompt_cache_unbounded",
@@ -1742,12 +2047,36 @@ pub static FIELDS: &[ConfigField] = &[
         "mtp_k",
         Speculation,
         ModelLoad,
-        DefaultValue::Integer(3),
-        ValueRule::Integer { min: 1, max: 10 },
+        DefaultValue::String("auto"),
+        ValueRule::AutoInteger { min: 1, max: 10 },
         true,
         false,
         Some("HIPFIRE_MTP_K"),
-        "MTP draft window."
+        "MTP draft window. Default `auto` = 4 for native Qwen4 MTP (Flash-Next, arch 16) on gfx1151, else 3; an explicit 1-10 overrides; `3` restores the previous gfx1151 cap."
+    ),
+    field!(
+        "speculation.mtp_ngram",
+        "mtp_ngram",
+        Speculation,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(&["auto", "on", "off", "1", "0"]),
+        true,
+        false,
+        Some("HIPFIRE_MTP_NGRAM"),
+        "N-gram takeover windows inside native MTP (greedy and sampled, thinking on or off). auto (default) arms it for native Qwen4 MTP (arch 16) on gfx1151 and gfx1201 and leaves other producers off; on/1 arms every MTP producer that supports it; off/0 disables it."
+    ),
+    field!(
+        "speculation.mtp_sampled",
+        "mtp_sampled",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Bool(true),
+        ValueRule::Bool,
+        false,
+        false,
+        Some("HIPFIRE_MTP_SAMPLED"),
+        "Qwen4 (Flash-Next) native MTP for sampled (temperature > 0) requests: lossless speculative rejection sampling against the AR sampler's distribution. On by default; off routes sampled requests to AR."
     ),
     field!(
         "speculation.mode",
@@ -1875,6 +2204,18 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         "HIPFIRE_DEVICES",
         "Device list for this process, in logical order: BDF-order index, gfxNNNN (first free card of that arch), GPU-<uuid>, or PCI address; resolved from the KFD topology and lowered to ROCr selectors plus HIP logical 0..N-1 before GPU initialization."
+    ),
+    field!(
+        "topology.ep",
+        "ep",
+        Hardware,
+        ModelLoad,
+        DefaultValue::Integer(1),
+        ValueRule::Integer { min: 1, max: 4 },
+        false,
+        true,
+        Some("HIPFIRE_TOPOLOGY_EP"),
+        "Expert-parallel degree for Qwen4 (Flash-Next) on gfx1201: 1 (default, single device), 2 or 4. Experts shard e % N across N visible gfx1201 cards that can access each other as peers; every card runs the unchanged single-device program. Opt-in; HIPFIRE_QWEN4_EP=0 forces 1."
     ),
     process_field!(
         "hardware.uniform_vram_tolerance_gb",
@@ -2138,7 +2479,7 @@ pub static FIELDS: &[ConfigField] = &[
         ValueRule::Integer { min: 2, max: 1048576 },
         false,
         "HIPFIRE_PREFILL_CHUNK_ROWS",
-        "Widened ordinary-prefill chunk ceiling in rows (arch default 8192 on exact gfx1100/gfx1151/gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH overrides; per-device VRAM admission may select a smaller rung)."
+        "Widened ordinary-prefill chunk ceiling in rows (arch default 8192 on exact gfx1100/gfx1151/gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH overrides; per-device VRAM admission may select a smaller rung). Qwen4 (Flash-Next) rounds it down to 256 rows; its default is 8192 on exact gfx1151, 4096 on exact gfx1201, 1536 elsewhere."
     ),
     process_bool_field!(
         "speculation.draft_f16",
@@ -2313,6 +2654,24 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         "HIPFIRE_FP8_WMMA",
         "Enable the experimental FP8 WMMA route."
+    ),
+    process_bool_field!(
+        "kernel.mq4v2_gateup_k5120",
+        "mq4v2_gateup_k5120",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_MQ4V2_GATEUP_K5120",
+        "Run exact gfx1100 MQ4V2 K5120 gate/up decode (17408 rows per output) on its fixed-group-count kernel (default on; byte-identical to the generic kernel; set to false or HIPFIRE_MQ4V2_GATEUP_K5120=0 to restore the generic route)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_mq4v2_gateup_k5120",
+        "gfx12_mq4v2_gateup_k5120",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GFX12_MQ4V2_GATEUP_K5120",
+        "Enable experimental exact gfx1201 MQ4V2 K5120 gate/up decode (17408 rows per output); preserves the existing DEV/RT weight-load policy."
     ),
     process_bool_field!(
         "kernel.gfx12_mq4v2_fp8_gateup",
@@ -2514,6 +2873,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Run speculative-verify attention (1..=32 rows, non-tree) through VerifyAttn: on gfx1201 and gfx1100 the GQA-shared split-K twin of the batched flash tile + reduce (on gfx1100 also of the multi-row R4/R8 Q8 tile), on gfx1151 the context-parallel twin of the single-slot WMMA flash prefill (default on exact gfx1201, gfx1100 and gfx1151; byte-identical output; set to false or HIPFIRE_VERIFY_ATTN=0 to opt out to attention_flash_*_tile_batched / attention_flash_q8_0_rows{4,8}_d8 / attention_q8_0_flash_prefill_wmma)."
     ),
     process_bool_field!(
+        "kernel.gfx1100_fa2_split_verify",
+        "gfx1100_fa2_split_verify",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GFX1100_FA2_SPLIT_VERIFY",
+        "Opt in to the exact-gfx1100 Q8 FA2 split-KV VerifyAttn route (default off; applies only on exact gfx1100 inside the dense H24/KV4/HD256 long-context envelope with VMM KV, and a load that resolves legacy KV is refused). Off keeps the established VerifyAttn/R4-R8/batched route. The parent kernel.verify_attn switch takes precedence."
+    ),
+    process_bool_field!(
         "kernel.gfx12_fa_prep_fused",
         "gfx12_fa_prep_fused",
         Kernel,
@@ -2556,6 +2924,14 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         "HIPFIRE_IU4_PREFILL",
         "Enable the W4A4 iu4-direct MMQ prefill route (default on exact gfx1100/gfx1151/gfx1201, other arches keep their incumbent route; set to false or HIPFIRE_IU4_PREFILL=0 to opt out)."
+    ),
+    process_auto_bool_field!(
+        "kernel.pm_decode",
+        "pm_decode",
+        Kernel,
+        true,
+        "HIPFIRE_PM_DECODE",
+        "Load the oracle-accepted builder (PeaceMaker) twins of the W1 decode projection modules instead of compiling them with hipcc: auto enables on exact gfx1201 only; false or HIPFIRE_PM_DECODE=0 restores the hipcc modules. Other architectures ignore it."
     ),
     process_bool_field!(
         "kernel.gfx11_iu4_gridspec",
@@ -2781,6 +3157,33 @@ pub static FIELDS: &[ConfigField] = &[
         "Keep native-BF16 calibration teachers in BF16 instead of widening to F32 (calibration only; shipped inference is unaffected)."
     ),
     process_bool_field!(
+        "kernel.draft_shared_qkv_rotation",
+        "draft_shared_qkv_rotation",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_DRAFT_SHARED_QKV_ROTATION",
+        "Rotate the DFlash draft's MQ4V2 noise Q/K/V input once and reuse it for all three projections (default on exact gfx1100, ignored elsewhere; set to false or HIPFIRE_DRAFT_SHARED_QKV_ROTATION=0 to rotate once per projection; same GEMMs, bit-identical)."
+    ),
+    process_bool_field!(
+        "kernel.draft_shared_ffn_rotation",
+        "draft_shared_ffn_rotation",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_DRAFT_SHARED_FFN_ROTATION",
+        "Rotate the DFlash draft's MQ4V2 FFN input once and reuse it for gate and up (default on exact gfx1100, ignored elsewhere; set to false or HIPFIRE_DRAFT_SHARED_FFN_ROTATION=0 to rotate once per projection; same GEMMs, bit-identical)."
+    ),
+    process_bool_field!(
+        "kernel.draft_shared_ctx_kv_rotation",
+        "draft_shared_ctx_kv_rotation",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION",
+        "Rotate the DFlash draft's MQ4V2 incremental context input once and reuse it for K and V (default on exact gfx1100, ignored elsewhere; set to false or HIPFIRE_DRAFT_SHARED_CTX_KV_ROTATION=0 to rotate once per projection; same GEMMs, bit-identical)."
+    ),
+    process_bool_field!(
         "kernel.qkvza_split_tail",
         "qkvza_split_tail",
         Kernel,
@@ -3002,15 +3405,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Select deterministic kernel variants where available."
     ),
     process_bool_field!(
-        "kernel.mw16",
-        "mw16",
-        Kernel,
-        false,
-        true,
-        "HIPFIRE_MW16",
-        "Enable the MW16 kernel experiment."
-    ),
-    process_bool_field!(
         "kernel.q8_batched_legacy",
         "q8_batched_legacy",
         Kernel,
@@ -3198,6 +3592,24 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         "HIPFIRE_REPLAY_TRANSPORT",
         "Retained replay transport; auto follows the runtime default route predicate, not certification/admission."
+    ),
+    process_bool_field!(
+        "replay.unsafe_wsl_redline",
+        "unsafe_wsl_redline",
+        Replay,
+        false,
+        true,
+        "HIPFIRE_UNSAFE_WSL_REDLINE",
+        "UNSAFE until certified: allow Redline PM4/retained replay under WSL/ROCDXG (/dev/dxg without /dev/kfd). Default off: the retained default falls back to the HIP graph and an explicit replay.backend=redline/shadow is refused."
+    ),
+    process_bool_field!(
+        "memory.unsafe_wsl_vmm_kv",
+        "unsafe_wsl_vmm_kv",
+        Memory,
+        false,
+        true,
+        "HIPFIRE_UNSAFE_WSL_VMM_KV",
+        "UNSAFE until certified: allow the VMM KV backend under WSL/ROCDXG (/dev/dxg without /dev/kfd), where WDDM VA growth may alias earlier KV pages. Default off: automatic KV selects legacy and an explicit kv_backend=vmm is refused."
     ),
     diagnostic_bool_field!(
         "diagnostic.replay.route_proof_log",
@@ -3393,6 +3805,30 @@ pub static FIELDS: &[ConfigField] = &[
         "Patch retained PM4 grid dimensions at replay time."
     ),
     field!(
+        "fusions.npu_trunk",
+        "npu_trunk",
+        Fusions,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(&["off", "auto", "on", "emulate"]),
+        false,
+        true,
+        Some("HIPFIRE_QWEN4_NPU_TRUNK"),
+        "Qwen4 trunk projection engine; auto admits calibrated gfx1151 NPU prefill, off is the GPU-only kill switch."
+    ),
+    field!(
+        "fusions.npu_trunk_calibration",
+        "npu_trunk_calibration",
+        Fusions,
+        ModelLoad,
+        DefaultValue::String(""),
+        ValueRule::String,
+        false,
+        true,
+        Some("HIPFIRE_QWEN4_NPU_TRUNK_CAL"),
+        "NPU trunk calibration path; empty resolves to <hipfire home>/npu-trunk/calibration.json; absent file uses the keyed builtin; never read when effectively off."
+    ),
+    field!(
         "fusions.policy",
         "fusion_policy",
         Fusions,
@@ -3455,6 +3891,62 @@ pub fn canonical_config_key(key: &str) -> Option<String> {
         .or_else(|| is_developer_key(key).then(|| key.to_owned()))
 }
 
+/// A config key that shipped in a release and was later removed from the
+/// schema. Through its deprecation window (until `ignored_until`) a config
+/// file that still sets it loads with a warning and the value is ignored;
+/// keys that never shipped stay unknown and fail the load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetiredConfigKey {
+    pub key: &'static str,
+    pub legacy_key: &'static str,
+    pub shipped_in: &'static str,
+    pub removed_in: &'static str,
+    pub ignored_until: &'static str,
+    pub reason: &'static str,
+}
+
+pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[RetiredConfigKey {
+    key: "kernel.mw16",
+    legacy_key: "mw16",
+    shipped_in: "0.3.1",
+    removed_in: "0.4.1",
+    ignored_until: "0.5.0",
+    reason: "the MW16 GEMM experiment was removed",
+}];
+
+pub fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKey> {
+    RETIRED_CONFIG_KEYS
+        .iter()
+        .find(|retired| retired.key == key || retired.legacy_key == key)
+}
+
+/// The error for a key that is not in the schema: the removal message for a
+/// [`RETIRED_CONFIG_KEYS`] entry, otherwise [`ConfigError::UnknownKey`].
+pub fn unknown_key(key: &str) -> ConfigError {
+    match retired_config_key(key) {
+        Some(retired) => ConfigError::RetiredKey {
+            key: retired.key,
+            removed_in: retired.removed_in,
+            reason: retired.reason,
+        },
+        None => ConfigError::UnknownKey(key.to_owned()),
+    }
+}
+
+impl RetiredConfigKey {
+    fn warning(&self, path: &Path) -> String {
+        format!(
+            "ignored {} in {}: removed in {} ({}); the setting has no effect and is \
+             accepted with this warning until {} — delete it from the file",
+            self.key,
+            path.display(),
+            self.removed_in,
+            self.reason,
+            self.ignored_until
+        )
+    }
+}
+
 pub fn developer_env_for_key(key: &str) -> Option<String> {
     key.strip_prefix(DEVELOPER_PREFIX)
         .filter(|suffix| valid_developer_suffix(suffix))
@@ -3474,7 +3966,7 @@ impl ConfigLayer {
         } else if is_developer_key(key) {
             self.values.insert(key.to_owned(), value);
         } else {
-            return Err(ConfigError::UnknownKey(key.to_owned()));
+            return Err(unknown_key(key));
         }
         Ok(())
     }
@@ -3487,7 +3979,7 @@ impl ConfigLayer {
             // distinguish enum-like values such as `on` from boolean `1`.
             self.set(key, ConfigValue::String(raw.to_owned()))
         } else {
-            Err(ConfigError::UnknownKey(key.to_owned()))
+            Err(unknown_key(key))
         }
     }
 
@@ -3496,8 +3988,7 @@ impl ConfigLayer {
     }
 
     pub fn remove(&mut self, key: &str) -> Result<Option<ConfigValue>> {
-        let key =
-            canonical_config_key(key).ok_or_else(|| ConfigError::UnknownKey(key.to_owned()))?;
+        let key = canonical_config_key(key).ok_or_else(|| unknown_key(key))?;
         Ok(self.values.remove(&key))
     }
 
@@ -3705,8 +4196,52 @@ pub fn active_or_local_process_config() -> &'static ProcessConfig {
 /// Read one process-start value from the validated in-memory policy. The
 /// argument is the temporary compatibility spelling used by compact runtime
 /// parsers; this function never reads or mutates the ambient environment.
+/// One hash lookup into a table rendered once from the active policy (it is
+/// read on per-request and per-kernel paths); same answers as
+/// [`ProcessConfig::legacy_value`].
 pub fn process_value(name: &str) -> Option<String> {
-    active_or_local_process_config().legacy_value(name)
+    static TABLE: LazyLock<HashMap<String, String>> =
+        LazyLock::new(|| legacy_table(active_or_local_process_config()));
+    match TABLE.get(name) {
+        Some(value) => Some(value.clone()),
+        // The table holds canonical upper-case spellings; legacy_value also
+        // folds the case of developer names, so defer to it for those.
+        None if name.bytes().any(|b| b.is_ascii_lowercase()) => {
+            active_or_local_process_config().legacy_value(name)
+        }
+        None => None,
+    }
+}
+
+/// Every compatibility name `config` answers, rendered: schema fields under
+/// their `env_compat` spelling, then developer keys under their `HIPFIRE_*`
+/// name unless a schema field owns that spelling (which `legacy_value`
+/// consults first, present or not).
+fn legacy_table(config: &ProcessConfig) -> HashMap<String, String> {
+    let mut table = HashMap::new();
+    for schema in FIELDS {
+        let Some(name) = schema.env_compat else {
+            continue;
+        };
+        if let Some(value) = config.values.get(schema.key).and_then(render_compat_value) {
+            table.insert(name.to_owned(), value);
+        }
+    }
+    for (key, value) in &config.values.values {
+        let Some(name) = developer_env_for_key(key) else {
+            continue;
+        };
+        if FIELDS
+            .iter()
+            .any(|schema| schema.env_compat == Some(name.as_str()))
+        {
+            continue;
+        }
+        if let Some(value) = render_compat_value(value) {
+            table.insert(name, value);
+        }
+    }
+    table
 }
 
 /// Resolve the memory preflight OOM guard (`memory.oom_guard`, compat
@@ -3769,7 +4304,7 @@ pub fn is_unified_memory_arch(arch: &str) -> bool {
 }
 
 /// Whether `arch` is a recognized discrete-VRAM GPU.
-fn is_discrete_memory_arch(arch: &str) -> bool {
+pub fn is_discrete_memory_arch(arch: &str) -> bool {
     DISCRETE_MEMORY_ARCHS
         .iter()
         .any(|known| arch.eq_ignore_ascii_case(known))
@@ -3881,6 +4416,126 @@ fn parse_developer_bool(raw: Option<&str>, default: bool) -> bool {
         _ => default,
     }
 }
+/// The `on`/`off`/`auto` mode knobs the CLI lowers into load params
+/// (`dspark_mode`, `dflash_mode`, `mtp_mode`): `"on"` forces the feature
+/// (`Some(true)`), `"off"` skips it (`Some(false)`), and `"auto"` or any
+/// other value defers to the loader default (`None`). Exact, lower-case.
+pub fn parse_tri_state(mode: &str) -> Option<bool> {
+    match mode {
+        "on" => Some(true),
+        "off" => Some(false),
+        _ => None,
+    }
+}
+/// The `on`/`off`/`auto` MTP selector the CLI lowers into `params.mtp_mode`.
+/// `Off` keeps AR, `On` arms the head wherever one exists, `Auto` arms it
+/// except over a host-mapped expert spill (the shared [`mtp_host_spill_policy`]
+/// decline). `Default = Off`: the slots `mtp_mode` param defaults to `"off"`
+/// unless the operator opted in, and the daemon parse keeps that default
+/// verbatim — only the `auto`-vs-`on` distinction now survives beside `mtp_k`.
+/// Exact, lower-case; anything unrecognized (including `auto` and the empty
+/// string, which the slots `mtp_k` rule already treats as off) resolves as
+/// documented on [`MtpMode::parse`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MtpMode {
+    /// Never arm the head (today's behaviour, unchanged).
+    #[default]
+    Off,
+    /// Arm unless the host-spill policy declines (today's `auto`).
+    Auto,
+    /// Arm even over a host-mapped expert spill (explicit opt-in).
+    On,
+}
+
+impl MtpMode {
+    /// Parse a `params.mtp_mode` value. Absent normalizes to `"off"` at the
+    /// call site (so the default stays `Off`); an explicit empty string maps
+    /// to `Off` too, matching the slots `mtp_k` rule that already treats an
+    /// empty name as off. Any other unrecognized spelling defers to `Auto`,
+    /// matching the schema default the CLI sends.
+    pub fn parse(raw: &str) -> Self {
+        match raw {
+            "off" | "" => Self::Off,
+            "on" => Self::On,
+            _ => Self::Auto,
+        }
+    }
+}
+
+/// One MTP-over-host-spill verdict, shared by the qwen35 and qwen4 arming
+/// sites. `attach` decides whether the head loads; `reason` is the shared
+/// static sentence both arches print inside their one decline line (the
+/// per-arch line adds its own counts via [`mtp_host_spill_decline_line`]).
+pub struct MtpHostSpillPolicy {
+    pub attach: bool,
+    pub reason: &'static str,
+}
+
+/// Whether an MTP head stays attached once `host_mapped_expert_blobs` routed
+/// experts sit in host RAM. The arch's admitted list is data: an arch that
+/// keeps `auto` armed on a measured GPU names it (qwen4's `&["gfx1201"]`),
+/// one with no such measurement passes none (qwen35's `&[]`). `On` always
+/// attaches (explicit opt-in); `Off` never does; a fully resident placement
+/// (`blobs == 0`) always attaches.
+///
+/// Folds in the qwen4 spelling it replaces
+/// (`host == 0 || mtp == Some(true) || arch == "gfx1201"`): same table, with
+/// the `gfx1201` clause as the admitted list instead of a second function.
+/// Worst-case pre-placement use passes the largest count the placement can
+/// still produce (never the literal `1` the old pre-copy pinned).
+pub fn mtp_host_spill_policy(
+    mode: MtpMode,
+    host_mapped_expert_blobs: usize,
+    arch: &str,
+    admitted_arm_arches: &[&str],
+) -> MtpHostSpillPolicy {
+    if host_mapped_expert_blobs == 0 {
+        return MtpHostSpillPolicy {
+            attach: !matches!(mode, MtpMode::Off),
+            reason: "",
+        };
+    }
+    if matches!(mode, MtpMode::Off) {
+        return MtpHostSpillPolicy {
+            attach: false,
+            reason: "",
+        };
+    }
+    if matches!(mode, MtpMode::On) || admitted_arm_arches.contains(&arch) {
+        return MtpHostSpillPolicy {
+            attach: true,
+            reason: "",
+        };
+    }
+    MtpHostSpillPolicy {
+        attach: false,
+        reason: "MTP: off by default with host-mapped experts; opt in with --spec mtp",
+    }
+}
+
+/// The one shared MTP-over-spill decline line, worded once here so the
+/// sequential and slots routes report the same decline. `model` is the arch
+/// label (`"qwen35"`, `"qwen4 native"`); `detail` is the placement fact that
+/// disambiguates the spill (`"offload_exec=cpu"` / `"offload_exec=pcie"` on
+/// qwen35, `"on <arch>"` on qwen4, which names the admitted-arch clause).
+pub fn mtp_host_spill_decline_line(
+    model: &str,
+    host_mapped_expert_blobs: usize,
+    host_mapped_expert_bytes: u64,
+    detail: &str,
+) -> String {
+    format!(
+        "  {model} {} ({host_mapped_expert_blobs} expert blobs, {:.2} GiB, {detail})",
+        mtp_host_spill_reason(),
+        host_mapped_expert_bytes as f64 / (1u64 << 30) as f64,
+    )
+}
+
+/// The shared static decline sentence inside [`mtp_host_spill_decline_line`]
+/// (and [`MtpHostSpillPolicy::reason`]).
+pub fn mtp_host_spill_reason() -> &'static str {
+    "MTP: off by default with host-mapped experts; opt in with --spec mtp"
+}
 /// MTP divergent-render checkpoint + strict-prefix terminal-repair policy.
 ///
 /// Resolved once at drafter construction from the documented process-snapshot
@@ -3919,11 +4574,60 @@ pub fn mtp_cache_policy() -> MtpCachePolicy {
         window_rollback: developer_bool("HIPFIRE_SPEC_WINDOW_ROLLBACK", true),
     }
 }
-/// MTP n-gram-modifier arm enablement (`HIPFIRE_MTP_NGRAM=1`). Strict
-/// snapshot boolean, default off — identical to the former
-/// `developer_var(..) == Some("1")` call sites.
+/// MTP n-gram-modifier explicit-arm check (`speculation.mtp_ngram`, env
+/// override `HIPFIRE_MTP_NGRAM`). True only for an explicit `on`/`1`; `auto`
+/// (the schema default), `off`/`0`, and unset all return false. This is the
+/// legacy no-arch answer (Qwen3.5 verify-capacity sizing). Arch-aware arming
+/// decisions use [`mtp_ngram_enabled_for_arch`].
 pub fn mtp_ngram_enabled() -> bool {
-    developer_bool("HIPFIRE_MTP_NGRAM", false)
+    mtp_ngram_enabled_for(process_value("HIPFIRE_MTP_NGRAM").as_deref())
+}
+fn mtp_ngram_enabled_for(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "on"))
+}
+/// Arch-aware MTP + n-gram-modifier arming. `on`/`1` arms every MTP producer
+/// that supports it, `off`/`0` disables it, and `auto` (the schema default;
+/// an unset key also resolves to `auto`) arms it only for native Qwen4 MTP
+/// (`model_arch == 16`) on gfx1151 and gfx1201.
+pub fn mtp_ngram_enabled_for_arch(model_arch: u32, gpu_arch: &str) -> bool {
+    mtp_ngram_enabled_for_arch_value(
+        process_value("HIPFIRE_MTP_NGRAM").as_deref(),
+        model_arch,
+        gpu_arch,
+    )
+}
+fn mtp_ngram_enabled_for_arch_value(value: Option<&str>, model_arch: u32, gpu_arch: &str) -> bool {
+    match value {
+        Some("1" | "on") => true,
+        Some("0" | "off") => false,
+        _ => ngram_mod_arch_admitted(model_arch, gpu_arch),
+    }
+}
+/// Native Qwen4 MTP (model arch 16) on the two GPUs the n-gram composition is
+/// admitted for.
+fn ngram_mod_arch_admitted(model_arch: u32, gpu_arch: &str) -> bool {
+    model_arch == 16 && matches!(gpu_arch, "gfx1151" | "gfx1201")
+}
+/// Fallback MTP draft cap (`speculation.mtp_k` = `auto`): every model/GPU pair
+/// except [`mtp_k_default_for_arch`]'s admitted one.
+pub const MTP_K_DEFAULT: usize = 3;
+/// `auto` MTP draft cap. Native Qwen4 MTP (`model_arch == 16`, Flash-Next) on
+/// gfx1151 drafts 4; every other model/GPU keeps [`MTP_K_DEFAULT`]. An explicit
+/// `HIPFIRE_MTP_K` / `speculation.mtp_k` / `mtp_k` load param (including `3`)
+/// overrides this; callers apply it only when no explicit value is present.
+pub fn mtp_k_default_for_arch(model_arch: u32, gpu_arch: &str) -> usize {
+    if model_arch == 16 && gpu_arch == "gfx1151" {
+        4
+    } else {
+        MTP_K_DEFAULT
+    }
+}
+/// Sampled native-MTP enablement (`speculation.mtp_sampled`, env override
+/// `HIPFIRE_MTP_SAMPLED`, default on; `0` opts out). On, the Qwen4 MTP
+/// drafter verifies temperature > 0 requests by speculative rejection
+/// sampling; off leaves them to AR.
+pub fn mtp_sampled_enabled() -> bool {
+    developer_bool("HIPFIRE_MTP_SAMPLED", true)
 }
 /// MTP prompt-fill route opt-out (`HIPFIRE_MTP_OWN_PREFILL=1`). Strict
 /// snapshot boolean, default off: the MTP prompt fill prefills the trunk
@@ -3936,19 +4640,37 @@ pub fn mtp_own_prefill() -> bool {
 /// defaults (24/48/64). Validation (max <= 64, min <= max, …) stays with the
 /// arch consumer; this only resolves the snapshot values.
 pub fn ngram_mod_triple() -> (usize, usize, usize) {
-    let n_match: usize = developer_var("HIPFIRE_NGRAM_MOD_N_MATCH")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(24);
-    let n_min: usize = developer_var("HIPFIRE_NGRAM_MOD_N_MIN")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(48);
-    let n_max: usize = developer_var("HIPFIRE_NGRAM_MOD_N_MAX")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(64);
-    (n_match, n_min, n_max)
+    ngram_mod_triple_with_defaults((24, 48, 64))
+}
+/// Arch-aware `(n_match, n_min, n_max)` triple. `5/3/3` is the approved
+/// arch-16 (native Qwen4 MTP) default on gfx1151 and gfx1201; every other
+/// family keeps the production `24/48/64`. A `HIPFIRE_NGRAM_MOD_{N_MATCH,
+/// N_MIN,N_MAX}` override wins per component. Validation stays with the
+/// consumer.
+pub fn ngram_mod_triple_for_arch(model_arch: u32, gpu_arch: &str) -> (usize, usize, usize) {
+    ngram_mod_triple_with_defaults(ngram_mod_default_triple(model_arch, gpu_arch))
+}
+fn ngram_mod_default_triple(model_arch: u32, gpu_arch: &str) -> (usize, usize, usize) {
+    if ngram_mod_arch_admitted(model_arch, gpu_arch) {
+        (5, 3, 3)
+    } else {
+        (24, 48, 64)
+    }
+}
+fn ngram_mod_triple_with_defaults(defaults: (usize, usize, usize)) -> (usize, usize, usize) {
+    ngram_mod_triple_resolve(defaults, |name| developer_var(name).ok())
+}
+fn ngram_mod_triple_resolve(
+    defaults: (usize, usize, usize),
+    get: impl Fn(&str) -> Option<String>,
+) -> (usize, usize, usize) {
+    let pick =
+        |name: &str, default: usize| get(name).and_then(|s| s.parse().ok()).unwrap_or(default);
+    (
+        pick("HIPFIRE_NGRAM_MOD_N_MATCH", defaults.0),
+        pick("HIPFIRE_NGRAM_MOD_N_MIN", defaults.1),
+        pick("HIPFIRE_NGRAM_MOD_N_MAX", defaults.2),
+    )
 }
 
 fn render_compat_value(value: &ConfigValue) -> Option<String> {
@@ -4130,6 +4852,19 @@ pub struct LoadedCatalog {
     pub warnings: Vec<String>,
 }
 
+/// Resolve the opt-in trunk calibration path without reading the file.
+pub fn npu_trunk_calibration_path() -> PathBuf {
+    developer_var("HIPFIRE_QWEN4_NPU_TRUNK_CAL")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            ConfigPaths::discover()
+                .root
+                .join("npu-trunk/calibration.json")
+        })
+}
+
 #[derive(Clone, Debug)]
 pub struct ConfigPaths {
     pub root: PathBuf,
@@ -4172,12 +4907,12 @@ impl ConfigPaths {
 
 pub fn load_global(paths: &ConfigPaths) -> Result<LoadedConfig> {
     if paths.config_toml.exists() {
-        let layer = load_toml_layer(&paths.config_toml)?;
+        let (layer, warnings) = load_toml_layer_with_warnings(&paths.config_toml)?;
         return Ok(LoadedConfig {
             layer,
             path: paths.config_toml.clone(),
             format: ConfigFormat::Toml,
-            warnings: Vec::new(),
+            warnings,
         });
     }
     if paths.config_json.exists() {
@@ -4411,7 +5146,7 @@ fn validate_model_layer(layer: &ConfigLayer) -> Result<()> {
             });
         }
         let Some(schema) = field(key) else {
-            return Err(ConfigError::UnknownKey(key.clone()));
+            return Err(unknown_key(key));
         };
         if matches!(schema.scope, ConfigScope::Process | ConfigScope::Diagnostic) {
             return Err(ConfigError::InvalidValue {
@@ -4625,6 +5360,12 @@ fn migrate_legacy_aliases(
     }
 }
 
+/// Whether the legacy environment selects devices (`HIPFIRE_DEVICES` or its
+/// singular spelling `HIPFIRE_DEVICE`), without validating any other key.
+pub fn legacy_devices_env_set() -> bool {
+    env::var_os("HIPFIRE_DEVICES").is_some() || env::var_os("HIPFIRE_DEVICE").is_some()
+}
+
 pub fn load_env_layer() -> Result<ConfigLayer> {
     let mut layer = ConfigLayer::default();
     let mut stable_names = BTreeSet::new();
@@ -4682,7 +5423,15 @@ pub fn load_env_layer() -> Result<ConfigLayer> {
     Ok(layer)
 }
 
+/// Load a TOML config layer. Retired keys ([`RETIRED_CONFIG_KEYS`]) are
+/// dropped; use [`load_toml_layer_with_warnings`] to report them.
 pub fn load_toml_layer(path: &Path) -> Result<ConfigLayer> {
+    load_toml_layer_with_warnings(path).map(|(layer, _)| layer)
+}
+
+/// Load a TOML config layer, ignoring retired keys with one warning each.
+/// Every other unknown key still fails the load.
+pub fn load_toml_layer_with_warnings(path: &Path) -> Result<(ConfigLayer, Vec<String>)> {
     let raw = read_string(path)?;
     let table = toml::from_str::<toml::Table>(&raw).map_err(|source| ConfigError::Parse {
         path: path.to_owned(),
@@ -4699,10 +5448,17 @@ pub fn load_toml_layer(path: &Path) -> Result<ConfigLayer> {
     let mut flat = BTreeMap::new();
     flatten_toml("", &table, &mut flat, path)?;
     let mut layer = ConfigLayer::default();
+    let mut warnings = Vec::new();
     for (key, value) in flat {
+        if field(&key).is_none() {
+            if let Some(retired) = retired_config_key(&key) {
+                warnings.push(retired.warning(path));
+                continue;
+            }
+        }
         layer.set(&key, value)?;
     }
-    Ok(layer)
+    Ok((layer, warnings))
 }
 
 fn flatten_toml(
@@ -5064,7 +5820,7 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
             ("speculation.mode", ConfigValue::String("auto".to_owned())),
             ("speculation.dflash", ConfigValue::String("off".to_owned())),
             ("speculation.mtp", ConfigValue::String("auto".to_owned())),
-            ("speculation.mtp_k", ConfigValue::Integer(3)),
+            ("speculation.mtp_k", ConfigValue::String("auto".to_owned())),
             ("speculation.ngram", ConfigValue::String("off".to_owned())),
             ("serve.host", ConfigValue::String("127.0.0.1".to_owned())),
             ("serve.port", ConfigValue::Integer(11435)),
@@ -5192,12 +5948,204 @@ mod tests {
         }
     }
 
+    /// The cached lookup behind `process_value` answers exactly what the
+    /// per-call `legacy_value` scan does, for every compatibility name.
+    #[test]
+    fn legacy_table_matches_legacy_value() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let mut values = ConfigLayer::default();
+        for schema in FIELDS.iter().filter(|schema| schema.env_compat.is_some()) {
+            if let Some(resolved_value) = resolved.get(schema.key) {
+                values
+                    .values
+                    .insert(schema.key.to_owned(), resolved_value.value.clone());
+            }
+        }
+        values.values.insert(
+            "developer.dspark_q8_wmma".into(),
+            ConfigValue::String("1".into()),
+        );
+        values
+            .values
+            .insert("developer.ngram_window".into(), ConfigValue::Integer(64));
+        let config = ProcessConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            values,
+        };
+        let table = legacy_table(&config);
+        let mut names: Vec<&str> = FIELDS
+            .iter()
+            .filter_map(|schema| schema.env_compat)
+            .collect();
+        names.extend([
+            "HIPFIRE_DSPARK_Q8_WMMA",
+            "HIPFIRE_NGRAM_WINDOW",
+            "NOT_HIPFIRE",
+        ]);
+        let mut answered = 0;
+        for name in names {
+            let cached = table.get(name).cloned();
+            assert_eq!(cached, config.legacy_value(name), "{name}");
+            answered += usize::from(cached.is_some());
+        }
+        assert!(answered > 2, "the fixture must exercise rendered values");
+        // An unset developer-shaped name (built at runtime so the env-docs
+        // inventory does not read it as a real knob).
+        let unset = ["HIPFIRE", "UNSET", "PROBE"].join("_");
+        assert_eq!(table.get(&unset).cloned(), config.legacy_value(&unset));
+    }
+
+    #[test]
+    fn tri_state_truth_table() {
+        // Only the exact lower-case modes force; everything else, including
+        // "auto" and the boolean spellings other parsers accept, defers.
+        assert_eq!(parse_tri_state("on"), Some(true));
+        assert_eq!(parse_tri_state("off"), Some(false));
+        for deferred in ["auto", "", "ON", "Off", "1", "0", "true", "false", "yes"] {
+            assert_eq!(parse_tri_state(deferred), None, "{deferred:?}");
+        }
+    }
+    #[test]
+    fn mtp_mode_parse_preserves_tri_state() {
+        // The daemon's slots parse must keep auto distinct from on: absent
+        // normalizes to "off" at the call site (default Off), while an
+        // explicit empty string matches the mtp_k rule (off, not auto).
+        assert_eq!(MtpMode::parse("off"), MtpMode::Off);
+        assert_eq!(MtpMode::parse(""), MtpMode::Off);
+        assert_eq!(MtpMode::parse("auto"), MtpMode::Auto);
+        assert_eq!(MtpMode::parse("on"), MtpMode::On);
+        assert_eq!(MtpMode::parse("anything-else"), MtpMode::Auto);
+        assert_eq!(MtpMode::default(), MtpMode::Off);
+    }
+
+    #[test]
+    fn mtp_host_spill_policy_truth_table() {
+        // (mode, blobs, arch, admitted) -> attach. qwen35 passes &[] (never
+        // attaches on a spill under auto); qwen4 passes &["gfx1201"].
+        let qwen35: &[&str] = &[];
+        let qwen4: &[&str] = &["gfx1201"];
+        // Fully resident: attaches unless explicitly off.
+        assert!(mtp_host_spill_policy(MtpMode::Auto, 0, "gfx1100", qwen35).attach);
+        assert!(mtp_host_spill_policy(MtpMode::On, 0, "gfx1100", qwen35).attach);
+        assert!(!mtp_host_spill_policy(MtpMode::Off, 0, "gfx1100", qwen35).attach);
+        // Off never attaches, even on a spill.
+        assert!(!mtp_host_spill_policy(MtpMode::Off, 21, "gfx1201", qwen4).attach);
+        assert!(!mtp_host_spill_policy(MtpMode::Off, 21, "gfx1100", qwen35).attach);
+        // On always attaches, even on a spill on an unmeasured arch.
+        assert!(mtp_host_spill_policy(MtpMode::On, 21, "gfx1100", qwen35).attach);
+        assert!(mtp_host_spill_policy(MtpMode::On, 21, "gfx1030", qwen4).attach);
+        // qwen35 under auto: never attaches on a spill, on any arch.
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx1030"] {
+            let policy = mtp_host_spill_policy(MtpMode::Auto, 21, arch, qwen35);
+            assert!(!policy.attach, "qwen35 auto on {arch}");
+            assert_eq!(policy.reason, mtp_host_spill_reason());
+        }
+        // qwen4 under auto: attaches only on the admitted arch.
+        assert!(mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1201", qwen4).attach);
+        assert!(!mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1100", qwen4).attach);
+        assert!(!mtp_host_spill_policy(MtpMode::Auto, 21, "gfx1151", qwen4).attach);
+        // Attached verdicts carry no reason; the decline line words it once.
+        assert_eq!(mtp_host_spill_policy(MtpMode::On, 21, "gfx1100", qwen35).reason, "");
+        assert_eq!(mtp_host_spill_policy(MtpMode::Auto, 0, "gfx1100", qwen35).reason, "");
+        let line = mtp_host_spill_decline_line("qwen35", 21, 3 << 30, "offload_exec=pcie");
+        assert!(line.contains(mtp_host_spill_reason()), "{line}");
+        assert!(line.contains("21 expert blobs"), "{line}");
+        assert!(line.contains("offload_exec=pcie"), "{line}");
+    }
+
     #[test]
     fn developer_bool_defaults_when_unset() {
         // A probe name nothing sets must resolve to the caller's default
         // through the live snapshot (no install, no TOML, no env).
         assert!(!developer_bool("HIPFIRE_S4_FLAG_PROBE_UNSET_OFF", false));
         assert!(developer_bool("HIPFIRE_S4_FLAG_PROBE_UNSET_ON", true));
+    }
+
+    #[test]
+    fn mtp_ngram_key_resolves_tri_state_with_env_override() {
+        // Legacy no-arch resolver: explicit on/1 only.
+        for (raw, want) in [
+            (None, false),
+            (Some("off"), false),
+            (Some("0"), false),
+            (Some("on"), true),
+            (Some("1"), true),
+            (Some("auto"), false),
+        ] {
+            assert_eq!(mtp_ngram_enabled_for(raw), want, "{raw:?}");
+        }
+        let field = field("speculation.mtp_ngram").expect("mtp_ngram schema field");
+        assert_eq!(field.env_compat, Some("HIPFIRE_MTP_NGRAM"));
+        assert!(matches!(field.default, DefaultValue::String("auto")));
+        assert!(field.validate(&ConfigValue::String("1".into())).is_ok());
+        assert!(field.validate(&ConfigValue::String("auto".into())).is_ok());
+        assert!(field.validate(&ConfigValue::String("yes".into())).is_err());
+    }
+
+    #[test]
+    fn mtp_ngram_arch_resolver_table() {
+        let cases: [(u32, &str); 4] = [
+            (16, "gfx1151"),
+            (16, "gfx1201"),
+            (16, "gfx1100"),
+            (5, "gfx1151"),
+        ];
+        // auto/unset: only arch 16 on the two admitted GPUs.
+        let auto = [true, true, false, false];
+        for (raw, expect) in [
+            (Some("on"), [true; 4]),
+            (Some("1"), [true; 4]),
+            (Some("off"), [false; 4]),
+            (Some("0"), [false; 4]),
+            (Some("auto"), auto),
+            (None, auto),
+        ] {
+            for (i, (model_arch, gpu)) in cases.iter().enumerate() {
+                assert_eq!(
+                    mtp_ngram_enabled_for_arch_value(raw, *model_arch, gpu),
+                    expect[i],
+                    "{raw:?} arch={model_arch} gpu={gpu}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ngram_mod_triple_defaults_per_arch_with_env_override() {
+        assert_eq!(ngram_mod_default_triple(16, "gfx1151"), (5, 3, 3));
+        assert_eq!(ngram_mod_default_triple(16, "gfx1201"), (5, 3, 3));
+        assert_eq!(ngram_mod_default_triple(16, "gfx1100"), (24, 48, 64));
+        assert_eq!(ngram_mod_default_triple(5, "gfx1151"), (24, 48, 64));
+
+        let none = |_: &str| None;
+        assert_eq!(ngram_mod_triple_resolve((5, 3, 3), none), (5, 3, 3));
+        assert_eq!(ngram_mod_triple_resolve((24, 48, 64), none), (24, 48, 64));
+        // Overrides win per component; unparseable values fall back to the default.
+        let env = |name: &str| match name {
+            "HIPFIRE_NGRAM_MOD_N_MATCH" => Some("7".to_string()),
+            "HIPFIRE_NGRAM_MOD_N_MAX" => Some("junk".to_string()),
+            _ => None,
+        };
+        assert_eq!(ngram_mod_triple_resolve((5, 3, 3), env), (7, 3, 3));
+        assert_eq!(ngram_mod_triple_resolve((24, 48, 64), env), (7, 48, 64));
+    }
+
+    #[test]
+    fn mtp_k_default_per_arch_and_auto_rule() {
+        assert_eq!(mtp_k_default_for_arch(16, "gfx1151"), 4);
+        assert_eq!(mtp_k_default_for_arch(16, "gfx1201"), MTP_K_DEFAULT);
+        assert_eq!(mtp_k_default_for_arch(16, "gfx1100"), MTP_K_DEFAULT);
+        assert_eq!(mtp_k_default_for_arch(5, "gfx1151"), MTP_K_DEFAULT);
+        assert_eq!(MTP_K_DEFAULT, 3);
+
+        let field = field("speculation.mtp_k").expect("speculation.mtp_k field");
+        assert!(field.validate(&ConfigValue::String("auto".into())).is_ok());
+        for k in 1..=10 {
+            assert!(field.validate(&ConfigValue::Integer(k)).is_ok(), "k={k}");
+        }
+        assert!(field.validate(&ConfigValue::Integer(0)).is_err());
+        assert!(field.validate(&ConfigValue::Integer(11)).is_err());
+        assert!(field.validate(&ConfigValue::String("fast".into())).is_err());
     }
 
     #[test]
@@ -5330,6 +6278,72 @@ mod tests {
     }
 
     #[test]
+    fn decide_calibration_fields_are_per_model_request_temperatures() {
+        for kind in ["choice", "score", "noul"] {
+            let key = format!("decide.calibration.{kind}");
+            let f = field(&key).unwrap_or_else(|| panic!("{key} missing"));
+            assert!(matches!(f.scope, ConfigScope::Request), "{key}");
+            assert!(f.env_compat.is_none() && !f.registry_allowed, "{key}");
+            assert_eq!(f.default.to_value(), ConfigValue::Float(1.0));
+            for ok in [
+                ConfigValue::Float(0.05),
+                ConfigValue::Integer(2),
+                ConfigValue::Float(20.0),
+            ] {
+                assert!(f.validate(&ok).is_ok(), "{key} {ok:?}");
+            }
+            for bad in [
+                ConfigValue::Float(0.0),
+                ConfigValue::Float(0.04),
+                ConfigValue::Float(20.5),
+            ] {
+                assert!(f.validate(&bad).is_err(), "{key} {bad:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn models_toml_accepts_and_round_trips_decide_calibration() {
+        let root = temp_root("decide-calibration");
+        fs::create_dir_all(&root).unwrap();
+        let paths = ConfigPaths::under(&root);
+        fs::write(
+            &paths.models_toml,
+            r#"schema_version = 1
+
+[models."qwen3.5-4b.mq4"]
+path = "/models/qwen3.5-4b.mq4"
+overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } } }
+"#,
+        )
+        .unwrap();
+        let loaded = load_catalog(&paths).unwrap();
+        let (_, model) = loaded.catalog.model("qwen3.5-4b.mq4").unwrap();
+        assert_eq!(
+            model.overrides.get("decide.calibration.choice"),
+            Some(&ConfigValue::Float(1.3))
+        );
+        assert_eq!(
+            model.overrides.get("decide.calibration.score"),
+            Some(&ConfigValue::Integer(2))
+        );
+        write_catalog_toml(&paths, &loaded.catalog).unwrap();
+        let written = fs::read_to_string(&paths.models_toml).unwrap();
+        assert!(written.contains("decide.calibration"), "{written}");
+        assert_eq!(
+            load_catalog_toml(&paths.models_toml).unwrap(),
+            loaded.catalog
+        );
+        fs::write(
+            &paths.models_toml,
+            "schema_version = 1\n[models.m]\npath = \"/m\"\n\
+             [models.m.overrides.decide.calibration]\nchoice = 0\n",
+        )
+        .unwrap();
+        assert!(load_catalog(&paths).is_err(), "T = 0 must be refused");
+    }
+
+    #[test]
     fn experimental_memory_and_prefill_features_default_off() {
         assert_eq!(
             field("memory.cask.enabled").unwrap().default.to_value(),
@@ -5373,6 +6387,45 @@ mod tests {
             );
         }
         assert!(field.parse_cli("sometimes").is_err());
+    }
+    #[test]
+    fn npu_trunk_calibration_schema_and_snapshot() {
+        let path_field = field("fusions.npu_trunk_calibration").unwrap();
+        assert_eq!(path_field.legacy_key, "npu_trunk_calibration");
+        assert_eq!(path_field.env_compat, Some("HIPFIRE_QWEN4_NPU_TRUNK_CAL"));
+        assert_eq!(
+            path_field.default.to_value(),
+            ConfigValue::String(String::new())
+        );
+        assert_eq!(
+            path_field.parse_cli("/tmp/cal.json").unwrap(),
+            ConfigValue::String("/tmp/cal.json".into())
+        );
+        let mut layer = ConfigLayer::default();
+        layer.values.insert(
+            path_field.key.into(),
+            ConfigValue::String("/tmp/cal.json".into()),
+        );
+        let process = ProcessConfig::from_resolved(
+            &resolve([NamedLayer {
+                source: ConfigSource::LegacyEnv {
+                    name: "HIPFIRE_QWEN4_NPU_TRUNK_CAL".into(),
+                },
+                layer,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            process.legacy_value("HIPFIRE_QWEN4_NPU_TRUNK_CAL"),
+            Some("/tmp/cal.json".into())
+        );
+        assert_eq!(
+            ConfigPaths::under("/tmp/hipfire")
+                .root
+                .join("npu-trunk/calibration.json"),
+            PathBuf::from("/tmp/hipfire/npu-trunk/calibration.json")
+        );
     }
     #[test]
     fn npu_spillover_defaults_off_with_env_parse() {
@@ -5481,6 +6534,112 @@ mod tests {
         );
         assert_eq!(loaded.warnings.len(), 1);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retired_keys_warn_and_are_ignored() {
+        // kernel.mw16 shipped in 0.3.1/0.4.0 and was removed in 0.4.1. A file
+        // written by those releases must still load through the window.
+        for (name, body) in [
+            (
+                "canonical",
+                "schema_version = 1\n[kernel]\nmw16 = true\n[memory]\nmax_seq = 8192\n",
+            ),
+            (
+                "legacy",
+                "schema_version = 1\nmw16 = true\n[memory]\nmax_seq = 8192\n",
+            ),
+        ] {
+            let root = temp_root(&format!("retired-{name}"));
+            fs::create_dir_all(&root).unwrap();
+            let paths = ConfigPaths::under(&root);
+            fs::write(&paths.config_toml, body).unwrap();
+            let loaded = load_global(&paths).unwrap();
+            assert_eq!(loaded.format, ConfigFormat::Toml);
+            assert_eq!(
+                loaded.layer.get("memory.max_seq"),
+                Some(&ConfigValue::Integer(8192))
+            );
+            assert_eq!(
+                loaded.layer.values.len(),
+                1,
+                "{name}: retired key must be dropped"
+            );
+            assert_eq!(loaded.warnings.len(), 1, "{name}: {:?}", loaded.warnings);
+            let warning = &loaded.warnings[0];
+            for needle in ["kernel.mw16", "removed in 0.4.1", "until 0.5.0"] {
+                assert!(warning.contains(needle), "{name}: {warning}");
+            }
+            assert!(resolve([NamedLayer {
+                source: ConfigSource::GlobalUser { path: loaded.path },
+                layer: loaded.layer,
+            }])
+            .is_ok());
+            // Setting a retired key is still refused: it has no effect. The
+            // error names the removal instead of calling the key unknown.
+            let err = ConfigLayer::default()
+                .set_cli("kernel.mw16", "true")
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                ConfigError::RetiredKey {
+                    key: "kernel.mw16",
+                    ..
+                }
+            ));
+            assert!(err.to_string().contains("removed in 0.4.1"), "{err}");
+            assert!(matches!(
+                ConfigLayer::default().set_cli("mw16", "true"),
+                Err(ConfigError::RetiredKey { .. })
+            ));
+            assert!(matches!(
+                ConfigLayer::default().set_cli("kernel.mw17", "true"),
+                Err(ConfigError::UnknownKey(_))
+            ));
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn unreleased_gfx11_iu4_swizzle_stays_unknown() {
+        // kernel.gfx11_iu4_swizzle only existed on the exp/gfx11-iu4-swizzle
+        // branch (c34c9ab3bc) and never shipped, so it is an unknown key, not
+        // a retired one. This is hipx's config written by that branch.
+        let hipx = "schema_version = 1\n\n[diagnostic]\ngemm_dump = false\n\n\
+                    [experimental.graph]\nforward = true\n\n[kernel]\n\
+                    gfx11_iu4_gridspec = true\ngfx11_iu4_shape = false\n\
+                    gfx11_iu4_swizzle = false\n\n[memory]\nmax_seq = 8192\n\n\
+                    [speculation]\ndflash = \"off\"\nmode = \"auto\"\nmtp = \"auto\"\n";
+        assert!(retired_config_key("kernel.gfx11_iu4_swizzle").is_none());
+        let root = temp_root("unreleased-swizzle");
+        fs::create_dir_all(&root).unwrap();
+        let paths = ConfigPaths::under(&root);
+        fs::write(&paths.config_toml, hipx).unwrap();
+        match load_global(&paths) {
+            Err(ConfigError::UnknownKey(key)) => assert_eq!(key, "kernel.gfx11_iu4_swizzle"),
+            other => panic!("expected UnknownKey, got {other:?}"),
+        }
+        fs::write(
+            &paths.config_toml,
+            hipx.replace("gfx11_iu4_swizzle = false\n", ""),
+        )
+        .unwrap();
+        let loaded = load_global(&paths).unwrap();
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retired_keys_are_not_live_schema_keys() {
+        for retired in RETIRED_CONFIG_KEYS {
+            assert!(field(retired.key).is_none(), "{} is live", retired.key);
+            assert!(
+                field(retired.legacy_key).is_none(),
+                "{} is live",
+                retired.legacy_key
+            );
+            assert!(!retired.ignored_until.is_empty() && !retired.shipped_in.is_empty());
+        }
     }
 
     #[test]
@@ -5702,7 +6861,7 @@ mod tests {
     #[test]
     fn process_config_is_sparse_versioned_and_revalidated() {
         let mut global = ConfigLayer::default();
-        global.set_cli("kernel.mw16", "true").unwrap();
+        global.set_cli("kernel.deterministic", "true").unwrap();
         global.set_cli("diagnostic.kernel.gemv_rows", "4").unwrap();
         global
             .set_cli("attention.ck_runtime_lib", "/opt/hipfire/ck.so")
@@ -5719,7 +6878,10 @@ mod tests {
         .unwrap();
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
 
-        assert_eq!(process.legacy_value("HIPFIRE_MW16").as_deref(), Some("1"));
+        assert_eq!(
+            process.legacy_value("HIPFIRE_DETERMINISTIC").as_deref(),
+            Some("1")
+        );
         assert_eq!(
             process.legacy_value("HIPFIRE_FLASH_ATTN_CK_LIB").as_deref(),
             Some("/opt/hipfire/ck.so")
@@ -6146,46 +7308,162 @@ mod tests {
     }
 }
 
+/// Device topology policy: expert-parallel degree (`topology.ep`, compat env
+/// `HIPFIRE_TOPOLOGY_EP`) and the Qwen4 kill switch `HIPFIRE_QWEN4_EP=0`.
+/// Pure and GPU-independent; the loader resolves the degree once, before any
+/// teardown or allocation.
+pub mod topology {
+    use super::process_value;
+
+    /// Developer kill switch: `HIPFIRE_QWEN4_EP=0` forces Qwen4 to ep = 1
+    /// regardless of `topology.ep`.
+    pub const QWEN4_EP_KILL_SWITCH_ENV: &str = "HIPFIRE_QWEN4_EP";
+    /// Compatibility spelling of `topology.ep`.
+    pub const EP_ENV: &str = "HIPFIRE_TOPOLOGY_EP";
+    /// Expert-parallel degrees the schema admits (512 experts divide evenly).
+    pub const EP_DEGREES: [usize; 3] = [1, 2, 4];
+
+    /// Pure parser behind [`ep`]: unset or empty is 1 (the default); an
+    /// integer outside [`EP_DEGREES`] is a refusal naming the allowed set.
+    pub fn parse_ep(raw: Option<&str>) -> Result<usize, String> {
+        let Some(raw) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+            return Ok(1);
+        };
+        match raw.parse::<usize>() {
+            Ok(n) if EP_DEGREES.contains(&n) => Ok(n),
+            _ => Err(format!(
+                "topology.ep = {raw:?} is not a valid expert-parallel degree (allowed: 1, 2, 4)"
+            )),
+        }
+    }
+
+    /// True when the raw `HIPFIRE_QWEN4_EP` value is the kill switch (`0`).
+    pub fn qwen4_ep_killed(raw: Option<&str>) -> bool {
+        raw.map(str::trim) == Some("0")
+    }
+
+    /// Qwen4 degree from raw inputs: the kill switch wins over any (even
+    /// invalid) configured value.
+    pub fn resolve_qwen4_ep(
+        configured: Option<&str>,
+        kill_switch: Option<&str>,
+    ) -> Result<usize, String> {
+        if qwen4_ep_killed(kill_switch) {
+            return Ok(1);
+        }
+        parse_ep(configured)
+    }
+
+    /// Configured `topology.ep` from the process snapshot.
+    pub fn ep() -> Result<usize, String> {
+        parse_ep(process_value(EP_ENV).as_deref())
+    }
+
+    /// Effective Qwen4 expert-parallel degree: `topology.ep` unless
+    /// `HIPFIRE_QWEN4_EP=0` forces 1.
+    pub fn qwen4_ep() -> Result<usize, String> {
+        resolve_qwen4_ep(
+            process_value(EP_ENV).as_deref(),
+            process_value(QWEN4_EP_KILL_SWITCH_ENV).as_deref(),
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parse_ep_defaults_and_allowed_set() {
+            assert_eq!(parse_ep(None), Ok(1));
+            assert_eq!(parse_ep(Some("")), Ok(1));
+            assert_eq!(parse_ep(Some("1")), Ok(1));
+            assert_eq!(parse_ep(Some(" 2 ")), Ok(2));
+            assert_eq!(parse_ep(Some("4")), Ok(4));
+            for bad in ["0", "3", "5", "8", "-1", "two", "2.0"] {
+                let err = parse_ep(Some(bad)).unwrap_err();
+                assert!(
+                    err.contains("topology.ep") && err.contains("1, 2, 4"),
+                    "{bad}: {err}"
+                );
+            }
+        }
+
+        #[test]
+        fn kill_switch_forces_one_regardless_of_config() {
+            assert_eq!(resolve_qwen4_ep(Some("4"), Some("0")), Ok(1));
+            assert_eq!(resolve_qwen4_ep(Some("2"), Some("0")), Ok(1));
+            // Even an invalid configured value is moot under the kill switch.
+            assert_eq!(resolve_qwen4_ep(Some("3"), Some("0")), Ok(1));
+            // Any other kill-switch spelling leaves the config in charge.
+            assert_eq!(resolve_qwen4_ep(Some("4"), Some("1")), Ok(4));
+            assert_eq!(resolve_qwen4_ep(Some("4"), Some("")), Ok(4));
+            assert_eq!(resolve_qwen4_ep(Some("4"), None), Ok(4));
+            assert_eq!(resolve_qwen4_ep(None, None), Ok(1));
+            assert!(resolve_qwen4_ep(Some("3"), None).is_err());
+        }
+
+        #[test]
+        fn schema_field_validates_range_and_defaults_to_one() {
+            let field = crate::FIELDS
+                .iter()
+                .find(|field| field.key == "topology.ep")
+                .expect("topology.ep is in the schema");
+            assert_eq!(field.env_compat, Some(EP_ENV));
+            assert!(field.validate(&crate::ConfigValue::Integer(1)).is_ok());
+            assert!(field.validate(&crate::ConfigValue::Integer(4)).is_ok());
+            assert!(field.validate(&crate::ConfigValue::Integer(0)).is_err());
+            assert!(field.validate(&crate::ConfigValue::Integer(5)).is_err());
+            assert!(matches!(
+                field.parse_cli("2"),
+                Ok(crate::ConfigValue::Integer(2))
+            ));
+            assert!(matches!(field.default, crate::DefaultValue::Integer(1)));
+        }
+    }
+}
+
 /// Placement policy for partial GPU offload — decides which layers stay in
 /// device VRAM versus spill to host RAM, resolved once at load so placement is
 /// fixed for the model's lifetime and never thrashes per request. This module is
-/// intentionally pure and GPU-independent: it owns the configuration vocabulary
-/// ([`GpuLayerBudget`]) and the admission arithmetic ([`largest_fitting_tail`]);
-/// the qwen35 load path consumes them to pick `i_gpu_start`.
+/// intentionally pure and GPU-independent: it owns only the configuration
+/// vocabulary ([`OffloadBudget`]); the placement arithmetic and admission live in
+/// `hipfire_runtime::offload`, which has the device measurements config cannot
+/// take.
 pub mod memory {
-    use super::process_value;
+    use super::{developer_var, process_value};
+    use std::path::{Path, PathBuf};
 
     /// Resident-layer budget for partial GPU offload (`memory.gpu_layer_budget`,
     /// compat env `HIPFIRE_GPU_LAYER_BUDGET`). Resolved once at load.
     ///
-    /// * [`GpuLayerBudget::Full`] is the unset default: keep every layer
+    /// * [`OffloadBudget::Full`] is the unset default: keep every layer
     ///   resident, never offload — byte-identical to a pure-VRAM run and the
     ///   regression guard for the whole feature.
-    /// * [`GpuLayerBudget::Auto`] (`-1`) defers placement to the engine, as `auto`
-    ///   does for every other key. The engine currently keeps every layer on the
-    ///   GPU, because a real placement needs a measured device and per-layer
-    ///   weight bytes (see [`largest_fitting_tail`]) and this is resolved where
-    ///   neither exists. `auto` will mean the same thing once that measurement is
-    ///   in hand — it will just decide a split instead of nothing.
-    /// * [`GpuLayerBudget::Layers`] pins exactly this many resident layers; the
+    /// * [`OffloadBudget::Auto`] (`-1`) defers placement to the engine, as `auto`
+    ///   does for every other key: the loader measures free VRAM, the per-layer
+    ///   weight bytes and the KV reservation, then places by fit — routed experts
+    ///   first, whole layers only when the expert tier cannot free enough. A model
+    ///   that already fits is left fully resident.
+    /// * [`OffloadBudget::Layers`] pins exactly this many resident layers; the
     ///   layers before them spill to host RAM.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum GpuLayerBudget {
-        /// Fully resident — never offload (the zero-diff default).
+    pub enum OffloadBudget {
+        /// Fully resident — never offload (the zero-diff default for every model).
         Full,
-        /// Defers placement to the engine, as `auto` does everywhere else in the
-        /// config. The engine currently keeps every layer on the GPU.
+        /// Places by fit: the minimum spill that loads, routed experts first,
+        /// whole layers only when the expert tier cannot free enough. A model
+        /// that already fits stays fully resident.
         Auto,
         /// Pin exactly this many resident layers; spill everything before them.
         Layers(usize),
     }
 
-    impl std::fmt::Display for GpuLayerBudget {
+    impl std::fmt::Display for OffloadBudget {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                GpuLayerBudget::Full => write!(f, "full"),
-                GpuLayerBudget::Auto => write!(f, "auto"),
-                GpuLayerBudget::Layers(n) => write!(f, "{n}"),
+                OffloadBudget::Full => write!(f, "full"),
+                OffloadBudget::Auto => write!(f, "auto"),
+                OffloadBudget::Layers(n) => write!(f, "{n}"),
             }
         }
     }
@@ -6196,24 +7474,366 @@ pub mod memory {
     /// or absent setting never forces offload); `"auto"`/`"-1"` selects auto; any
     /// other non-negative integer pins that many resident layers. A negative value
     /// other than `-1` is treated as unset rather than an error.
-    pub fn parse_gpu_layer_budget(raw: Option<&str>) -> GpuLayerBudget {
+    pub fn parse_gpu_layer_budget(raw: Option<&str>) -> OffloadBudget {
         match raw.map(|v| v.trim().to_ascii_lowercase()) {
-            None => GpuLayerBudget::Full,
-            Some(v) if v.is_empty() => GpuLayerBudget::Full,
-            Some(v) if v == "auto" || v == "-1" => GpuLayerBudget::Auto,
+            None => OffloadBudget::Full,
+            Some(v) if v.is_empty() => OffloadBudget::Full,
+            Some(v) if v == "auto" || v == "-1" => OffloadBudget::Auto,
             Some(v) => match v.parse::<i64>() {
-                Ok(n) if n >= 0 => GpuLayerBudget::Layers(n as usize),
-                _ => GpuLayerBudget::Full,
+                Ok(n) if n >= 0 => OffloadBudget::Layers(n as usize),
+                _ => OffloadBudget::Full,
             },
         }
     }
 
-    /// The configured [`GpuLayerBudget`] from the process snapshot. Reads exactly
-    /// one resolved value: unset or `"auto"`/`"-1"` selects auto-fit; a non-negative
-    /// integer pins that many resident layers; anything else fails closed to full
-    /// residency (the zero-diff baseline).
-    pub fn gpu_layer_budget() -> GpuLayerBudget {
+    /// The configured [`OffloadBudget`] from the process snapshot. Reads exactly
+    /// one resolved value: `"auto"`/`"-1"` selects auto-fit; a non-negative integer
+    /// pins that many resident layers; unset/empty/unparseable fails closed to full
+    /// residency (the zero-diff baseline on every model).
+    pub fn gpu_layer_budget() -> OffloadBudget {
         parse_gpu_layer_budget(process_value("HIPFIRE_GPU_LAYER_BUDGET").as_deref())
+    }
+
+    /// Byte budget of the session cache (`memory.session_cache_bytes`, compat
+    /// env `HIPFIRE_SESSION_CACHE_BYTES`); 0 disables it.
+    pub fn session_cache_bytes() -> u64 {
+        process_value("HIPFIRE_SESSION_CACHE_BYTES")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(8589934592)
+    }
+
+    /// Prewarm budget request of the PLE hot-row store
+    /// (`memory.ple_hot_store_bytes`, compat env `HIPFIRE_PLE_HOT_STORE_BYTES`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum PleHotStoreBudget {
+        /// `auto`: the carrier picks the budget from `MemAvailable` when the
+        /// device, model, sidecar and pack allow it.
+        Auto,
+        /// An explicit byte budget; `0` (the default) is off.
+        Bytes(u64),
+    }
+
+    /// Pure parser behind [`ple_hot_store_bytes`]: unset and empty resolve
+    /// to off (`Bytes(0)`, the default), `auto` to [`PleHotStoreBudget::Auto`];
+    /// an integer is that budget; an unparseable value (the config layer
+    /// rejects those before they get here) fails closed to off.
+    pub fn parse_ple_hot_store_bytes(raw: Option<&str>) -> PleHotStoreBudget {
+        match raw.map(str::trim) {
+            Some(v) if v.eq_ignore_ascii_case("auto") => PleHotStoreBudget::Auto,
+            Some(v) if !v.is_empty() => v
+                .parse::<u64>()
+                .map(PleHotStoreBudget::Bytes)
+                .unwrap_or(PleHotStoreBudget::Bytes(0)),
+            _ => PleHotStoreBudget::Bytes(0),
+        }
+    }
+
+    /// Configured PLE hot-store budget from the process snapshot.
+    pub fn ple_hot_store_bytes() -> PleHotStoreBudget {
+        parse_ple_hot_store_bytes(process_value("HIPFIRE_PLE_HOT_STORE_BYTES").as_deref())
+    }
+
+    /// Which PLE row table a Flash-Next (Qwen4) load reads: the exact Q8F16
+    /// rows or the 4-bit Lloyd-Max rows derived from them.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PleFormat {
+        /// 4-bit Lloyd-Max rows (`<model>.ple-q4`).
+        Q4,
+        /// Exact Q8F16 rows (embedded in a monolithic model, or `<model>.ple-q8`).
+        Q8,
+    }
+
+    impl PleFormat {
+        /// Spelling used in the config value and in messages.
+        pub fn name(self) -> &'static str {
+            match self {
+                PleFormat::Q4 => "q4",
+                PleFormat::Q8 => "q8",
+            }
+        }
+
+        /// Sidecar extension appended to the model file name (without the dot).
+        pub fn sidecar_suffix(self) -> &'static str {
+            match self {
+                PleFormat::Q4 => "ple-q4",
+                PleFormat::Q8 => "ple-q8",
+            }
+        }
+
+        /// Inverse of [`PleFormat::name`].
+        pub fn from_name(name: &str) -> Option<Self> {
+            match name {
+                "q4" => Some(PleFormat::Q4),
+                "q8" => Some(PleFormat::Q8),
+                _ => None,
+            }
+        }
+    }
+
+    /// The `memory.ple_format` request (compat env `HIPFIRE_PLE_FORMAT`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PleFormatRequest {
+        /// q4 on the unified-memory Strix Halo (`gfx1151`), q8 elsewhere; never
+        /// derives or downloads a missing sidecar.
+        Auto,
+        /// 4-bit rows; derived from the Q8 rows on first load when missing.
+        Q4,
+        /// Exact Q8 rows.
+        Q8,
+    }
+
+    impl PleFormatRequest {
+        /// Parse a config spelling (`auto`, `q4`, `q8`; trimmed, case-insensitive).
+        pub fn parse(s: &str) -> Option<Self> {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "auto" => Some(PleFormatRequest::Auto),
+                "q4" => Some(PleFormatRequest::Q4),
+                "q8" => Some(PleFormatRequest::Q8),
+                _ => None,
+            }
+        }
+
+        /// The config spelling of this request.
+        pub fn name(self) -> &'static str {
+            match self {
+                PleFormatRequest::Auto => "auto",
+                PleFormatRequest::Q4 => "q4",
+                PleFormatRequest::Q8 => "q8",
+            }
+        }
+
+        /// The format this request prefers on `gpu_arch`. `Auto` picks q4 only
+        /// on `gfx1151` (the unified-memory Strix Halo) and keeps q8 elsewhere
+        /// until there is evidence for another arch.
+        pub fn resolve(self, gpu_arch: &str) -> PleFormat {
+            match self {
+                PleFormatRequest::Q4 => PleFormat::Q4,
+                PleFormatRequest::Q8 => PleFormat::Q8,
+                PleFormatRequest::Auto if gpu_arch == "gfx1151" => PleFormat::Q4,
+                PleFormatRequest::Auto => PleFormat::Q8,
+            }
+        }
+    }
+
+    /// Pure parser behind [`ple_format`]: unset, empty and unparseable values
+    /// (the config layer rejects those before they get here) resolve to `auto`.
+    pub fn parse_ple_format(raw: Option<&str>) -> PleFormatRequest {
+        raw.and_then(PleFormatRequest::parse)
+            .unwrap_or(PleFormatRequest::Auto)
+    }
+
+    /// Configured PLE row format request from the process snapshot.
+    pub fn ple_format() -> PleFormatRequest {
+        parse_ple_format(process_value("HIPFIRE_PLE_FORMAT").as_deref())
+    }
+
+    /// Pure parser behind [`ple_prewarm_bytes`]: like
+    /// [`parse_ple_hot_store_bytes`] but unset and empty resolve to `auto`
+    /// (the key's default), not off.
+    pub fn parse_ple_prewarm_bytes(raw: Option<&str>) -> PleHotStoreBudget {
+        match raw.map(str::trim) {
+            None | Some("") => PleHotStoreBudget::Auto,
+            other => parse_ple_hot_store_bytes(other),
+        }
+    }
+
+    /// Prewarm budget of the q4 PLE sidecar page-cache prewarm
+    /// (`memory.ple_prewarm_bytes`, compat env `HIPFIRE_PLE_PREWARM_BYTES`):
+    /// `Auto` (default) = 15 GiB, capped at `MemAvailable` minus 8 GiB at ready
+    /// and at the sidecar's data bytes; `Bytes(0)` = off; `Bytes(n)` = that many bytes.
+    pub fn ple_prewarm_bytes() -> PleHotStoreBudget {
+        parse_ple_prewarm_bytes(process_value("HIPFIRE_PLE_PREWARM_BYTES").as_deref())
+    }
+
+    /// Bytes of the rank-ordered q4 PLE table read during model load
+    /// (`memory.ple_load_fill_bytes`, compat env `HIPFIRE_PLE_LOAD_FILL_BYTES`;
+    /// parsed like [`parse_ple_prewarm_bytes`]): `Auto` (default) = 14 GiB,
+    /// `Bytes(0)` = off, `Bytes(n)` = that many bytes.  The loader caps it at
+    /// the table, an explicit prewarm budget and the host memory left after
+    /// the weights.
+    pub fn ple_load_fill_bytes() -> PleHotStoreBudget {
+        parse_ple_prewarm_bytes(process_value("HIPFIRE_PLE_LOAD_FILL_BYTES").as_deref())
+    }
+
+    /// Path of the PLE sidecar of `model`: `<model file name>.ple-q4` /
+    /// `.ple-q8`, appended to the full file name (extension included).
+    pub fn ple_sidecar_path(model: &Path, format: PleFormat) -> PathBuf {
+        let mut path = model.as_os_str().to_owned();
+        path.push(".");
+        path.push(format.sidecar_suffix());
+        PathBuf::from(path)
+    }
+
+    /// Suffix of a Flash-Next trunk overlay sidecar: pre-encoded QT44 trunk
+    /// tensors (an HFQM container bound to its base by size and index
+    /// sha256) that the Qwen4 loader substitutes for the base's tensors.
+    pub const TRUNK_OVERLAY_SIDECAR_SUFFIX: &str = ".trunk-overlay";
+
+    /// Path of the trunk overlay sidecar of `model`: `<model file
+    /// name>.trunk-overlay`, appended to the full file name (extension
+    /// included), the same placement as [`ple_sidecar_path`].
+    pub fn trunk_overlay_sidecar_path(model: &Path) -> PathBuf {
+        let mut path = model.as_os_str().to_owned();
+        path.push(TRUNK_OVERLAY_SIDECAR_SUFFIX);
+        PathBuf::from(path)
+    }
+
+    /// Optional override of the PLE hot-rank sidecar path
+    /// (`HIPFIRE_PLE_HOT_RANK_FILE`); empty or unset means `<model>.plehot`.
+    pub fn ple_hot_rank_file() -> Option<String> {
+        developer_var("HIPFIRE_PLE_HOT_RANK_FILE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+    }
+
+    /// Optional override of the PLE hot-row pack path
+    /// (`HIPFIRE_PLE_HOT_PACK_FILE`); empty or unset means
+    /// `<model>.plehotrows`.
+    pub fn ple_hot_pack_file() -> Option<String> {
+        developer_var("HIPFIRE_PLE_HOT_PACK_FILE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+    }
+
+    /// PLE fetch timing on stderr, one line per prefill-chunk fetch
+    /// (`HIPFIRE_PLE_HOT_DEBUG=1`, developer variable).
+    pub fn ple_hot_debug() -> bool {
+        developer_var("HIPFIRE_PLE_HOT_DEBUG").is_ok_and(|v| v == "1")
+    }
+
+    /// Byte budget of the session cache's disk tier
+    /// (`memory.session_cache_disk_bytes`, compat env
+    /// `HIPFIRE_SESSION_CACHE_DISK_BYTES`); 0 disables it.
+    pub fn session_cache_disk_bytes() -> u64 {
+        process_value("HIPFIRE_SESSION_CACHE_DISK_BYTES")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Directory of the session cache's disk tier (`memory.session_cache_dir`,
+    /// compat env `HIPFIRE_SESSION_CACHE_DIR`); empty =
+    /// `$HIPFIRE_HOME/session-cache`.
+    pub fn session_cache_dir() -> std::path::PathBuf {
+        match process_value("HIPFIRE_SESSION_CACHE_DIR") {
+            Some(value) if !value.trim().is_empty() => super::expand_tilde(value.trim()),
+            _ => crate::ConfigPaths::discover().root.join("session-cache"),
+        }
+    }
+
+    /// The configured routed-expert [`OffloadBudget`] from the process snapshot
+    /// (`memory.moe_expert_budget`). Same parser and spelling as
+    /// [`gpu_layer_budget`]: unset/empty/unparseable is [`OffloadBudget::Full`]
+    /// (never spill an expert), `"auto"`/`"-1"` is [`OffloadBudget::Auto`], and a
+    /// non-negative integer pins that many layers whose routed experts stay on
+    /// the device.
+    pub fn moe_expert_budget() -> OffloadBudget {
+        parse_gpu_layer_budget(process_value("HIPFIRE_MOE_EXPERT_BUDGET").as_deref())
+    }
+
+    /// The configured placement budgets. Unset is [`OffloadBudget::Full`] on
+    /// both tiers for every model; auto-fit and manual spills require opt-in.
+    pub fn effective_offload_budgets() -> (OffloadBudget, OffloadBudget) {
+        (gpu_layer_budget(), moe_expert_budget())
+    }
+
+    /// Whether an explicit spill was configured on either tier: at least one of
+    /// `memory.gpu_layer_budget` / `memory.moe_expert_budget` resolved off
+    /// [`OffloadBudget::Full`]. The trigger behind the loader's
+    /// `partial_offload_refusal` gate. Reads the process
+    /// snapshot (not pure); the pure eligibility table is [`spill_support`].
+    pub fn spill_requested() -> bool {
+        gpu_layer_budget() != OffloadBudget::Full || moe_expert_budget() != OffloadBudget::Full
+    }
+
+    /// Whether a spill may be requested on this path, and whether this path
+    /// can honour it: the single policy behind the loader's
+    /// `partial_offload_refusal` gate and both Qwen3.5 placement resolvers
+    /// (sequential carrier, slots engine). Pure over caller-supplied facts —
+    /// GPU-free and dependency-free — so every spelling agrees by
+    /// construction. Each refusal has a stable name; callers own the wording.
+    ///
+    /// Priority matches the loader gate it replaces (arch, tp, pp, EP, VL,
+    /// paged, REAP): the first failing dimension wins, so a tp>1 MoE reports
+    /// the topology, never the expert pinning behind it.
+    /// [`effective_offload_budgets`] decides *what* the budgets resolve to;
+    /// this decides whether a resolved spill may *run* here.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SpillSupport {
+        /// The path honours a spill; resolve budgets (and auto-fit) normally.
+        Supported,
+        /// The path cannot honour a spill; the payload names the dimension.
+        Refused(SpillRefusal),
+    }
+
+    impl SpillSupport {
+        /// True for [`SpillSupport::Supported`].
+        pub fn is_supported(&self) -> bool {
+            matches!(self, SpillSupport::Supported)
+        }
+    }
+
+    /// Why a path cannot honour a spill. Stable names for the refusal
+    /// dimension — callers map these to their own messages (the loader gate
+    /// keeps its existing sentences verbatim; the arch resolvers name the
+    /// same reason in their fail-closed refusal).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum SpillRefusal {
+        /// Neither Qwen3.5 dense (5) nor MoE (6); carries the arch id.
+        Arch(u32),
+        /// Tensor-parallel ranks each load every layer; carries tp.
+        Tp(usize),
+        /// Pipeline bands own per-device layouts; carries pp.
+        Pp(usize),
+        /// An expert is pinned to one rank; carries the expert count.
+        ExpertParallel(usize),
+        /// The Qwen3.5-VL vision tower loads through its own lowered loader.
+        VisionTower,
+        /// The weight pager owns the expert buffers.
+        PagedExperts,
+        /// The pruned (REAP keep-map) expert load has no host-placement path.
+        ReapKeepMap,
+    }
+
+    /// The spill-eligibility truth table. `ep_experts` is `Some(n)` with `n >
+    /// 0` on an expert-parallel route (`None`/zero is not expert-parallel);
+    /// `reap_keep` is whether a REAP keep-map is attached.
+    pub fn spill_support(
+        arch_id: u32,
+        tp: usize,
+        pp: usize,
+        ep_experts: Option<usize>,
+        paged_experts: bool,
+        reap_keep: bool,
+        is_vl: bool,
+    ) -> SpillSupport {
+        use SpillRefusal::*;
+        // Only the Qwen3.5 storage seam places a layer or a routed expert in
+        // host RAM. Qwen4 has its own expert-residency route and the other
+        // arches have none, so either knob is a request this loader cannot honour.
+        if !matches!(arch_id, 5 | 6) {
+            return SpillSupport::Refused(Arch(arch_id));
+        }
+        if tp > 1 {
+            return SpillSupport::Refused(Tp(tp));
+        }
+        if pp > 1 {
+            return SpillSupport::Refused(Pp(pp));
+        }
+        if let Some(experts) = ep_experts {
+            if experts > 0 {
+                return SpillSupport::Refused(ExpertParallel(experts));
+            }
+        }
+        if is_vl {
+            return SpillSupport::Refused(VisionTower);
+        }
+        if paged_experts {
+            return SpillSupport::Refused(PagedExperts);
+        }
+        if reap_keep {
+            return SpillSupport::Refused(ReapKeepMap);
+        }
+        SpillSupport::Supported
     }
 
     /// Which engine executes the ops that read a spilled layer's weights
@@ -6233,6 +7853,18 @@ pub mod memory {
         Pcie,
         /// CPU executes the steps whose weight tensor is host-mapped.
         Cpu,
+        /// Every spilled step runs on both: the GPU takes the first
+        /// `memory.offload_passback_share` of its output rows, the CPU the rest.
+        ///
+        /// Not reproducible run to run, by design. [`OffloadExec::Cpu`] and
+        /// [`OffloadExec::Pcie`] execute a layer's GEMV on different engines, so
+        /// their arithmetic need not agree, and this mode's row split is
+        /// scheduled per process (a seeding probe plus the online arm timings) —
+        /// two identical greedy runs divide the same step differently. Pin
+        /// `memory.offload_passback_share` to a number, or to `0`, which is
+        /// byte-identical to [`OffloadExec::Cpu`], before diffing output against
+        /// a reference.
+        Passback,
     }
 
     impl std::fmt::Display for OffloadExec {
@@ -6240,6 +7872,7 @@ pub mod memory {
             match self {
                 OffloadExec::Pcie => write!(f, "pcie"),
                 OffloadExec::Cpu => write!(f, "cpu"),
+                OffloadExec::Passback => write!(f, "passback"),
             }
         }
     }
@@ -6251,6 +7884,7 @@ pub mod memory {
     pub fn parse_offload_exec(raw: Option<&str>) -> OffloadExec {
         match raw.map(|v| v.trim().to_ascii_lowercase()) {
             Some(v) if v == "cpu" => OffloadExec::Cpu,
+            Some(v) if v == "passback" => OffloadExec::Passback,
             _ => OffloadExec::Pcie,
         }
     }
@@ -6260,82 +7894,64 @@ pub mod memory {
         parse_offload_exec(process_value("HIPFIRE_OFFLOAD_EXEC").as_deref())
     }
 
-    /// Largest contiguous resident tail `[i_gpu_start .. n_layers)` such that the
-    /// bytes of those layers' weights plus the fully-resident KV footprint fit
-    /// within `effective_capacity_bytes` (device memory minus headroom and minus
-    /// any always-resident base overhead, already subtracted by the caller).
+    /// How much of a split step the GPU takes (`memory.offload_passback_share`).
     ///
-    /// Returns the *smallest* `i_gpu_start` that fits — keeping as many layers
-    /// resident as possible while still fitting — which is exactly the partial
-    /// offload objective: spill only the prefix that must. As `i_gpu_start` grows,
-    /// resident weight bytes shrink monotonically, so a linear scan from zero
-    /// finds the optimum on the first hit. Returns `None` when even offloading
-    /// every layer leaves KV over budget, in which case the load refuses cleanly
-    /// rather than OOM mid-generation.
-    pub fn largest_fitting_tail(
-        n_layers: usize,
-        per_layer_weight_bytes: &[usize],
-        kv_bytes: usize,
-        always_resident_bytes: usize,
-        effective_capacity_bytes: usize,
-    ) -> Option<usize> {
-        assert!(
-            per_layer_weight_bytes.len() == n_layers,
-            "per_layer_weight_bytes must have exactly n_layers entries"
-        );
-        // resident(i_gpu_start) = always-resident base (embed + lm_head) + the
-        // weight bytes of the resident tail [i_gpu_start..n] + fully-resident KV.
-        // Walk from the most-resident candidate (i_gpu_start=0, whose weight tail
-        // is the whole array) and shrink VRAM one layer at a time until the
-        // footprint fits within effective_capacity_bytes (= device memory minus
-        // headroom). The first fit is the largest resident tail; if even
-        // offloading every layer still overshoots, None — the load refuses rather
-        // than OOM mid-generation.
-        let mut resident: usize =
-            always_resident_bytes + per_layer_weight_bytes.iter().sum::<usize>() + kv_bytes;
-        if resident <= effective_capacity_bytes {
-            return Some(0);
-        }
-        for i_gpu_start in 1..=n_layers {
-            resident = resident.saturating_sub(per_layer_weight_bytes[i_gpu_start - 1]);
-            if resident <= effective_capacity_bytes {
-                return Some(i_gpu_start);
-            }
-        }
-        None
+    /// Read only when [`offload_exec`] is [`OffloadExec::Passback`]; in any other
+    /// mode the key is inert (see [`stray_passback_share_notice`]).
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub enum PassbackShare {
+        /// Scheduled from this host's own measured engine rates.
+        Auto,
+        /// Pinned by the user. `0.0` disables the pass-back.
+        Share(f64),
     }
 
-    /// Resolve the resident-tail split point from a placement [`GpuLayerBudget`].
-    ///
-    /// Returns `i_gpu_start`: layers `[0 .. i_gpu_start)` spill to host-mapped RAM,
-    /// `[i_gpu_start .. n_layers)` stay device-resident. This is the single
-    /// policy→number call Step 3's loader uses; it never allocates or probes a
-    /// device, so it stays pure and unit-testable. Returns `None` only when the
-    /// budget is `Auto` and even offloading every layer leaves KV over capacity —
-    /// the caller refuses cleanly rather than OOM mid-generation.
-    pub fn resolve_i_gpu_start(
-        n_layers: usize,
-        per_layer_weight_bytes: &[usize],
-        kv_bytes: usize,
-        always_resident_bytes: usize,
-        effective_capacity_bytes: usize,
-        budget: GpuLayerBudget,
-    ) -> Option<usize> {
-        match budget {
-            // Fully resident — never offload (the zero-diff default).
-            GpuLayerBudget::Full => Some(0),
-            // Auto-fit: the largest resident tail that fits device memory with headroom.
-            GpuLayerBudget::Auto => largest_fitting_tail(
-                n_layers,
-                per_layer_weight_bytes,
-                kv_bytes,
-                always_resident_bytes,
-                effective_capacity_bytes,
-            ),
-            // Pin exactly this many resident layers; spill everything before them.
-            GpuLayerBudget::Layers(resident) => Some(n_layers - resident.min(n_layers)),
+    impl std::fmt::Display for PassbackShare {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                PassbackShare::Auto => write!(f, "auto"),
+                PassbackShare::Share(v) => write!(f, "{v}"),
+            }
         }
     }
+
+    /// Pure truth table behind [`offload_passback_share`]. Unset, empty and
+    /// unknown all resolve to `Auto`; the schema ([`super::ValueRule::PassbackShare`])
+    /// rejects an out-of-range number before this runs, so the fallback here is
+    /// belt-and-braces rather than the primary guard.
+    pub fn parse_passback_share(raw: Option<&str>) -> PassbackShare {
+        match raw.map(|v| v.trim()) {
+            Some("auto") => PassbackShare::Auto,
+            Some(v) => match v.parse::<f64>() {
+                Ok(f) if (0.0..=0.5).contains(&f) => PassbackShare::Share(f),
+                _ => PassbackShare::Auto,
+            },
+            None => PassbackShare::Auto,
+        }
+    }
+
+    /// The configured [`PassbackShare`] from the process snapshot.
+    pub fn offload_passback_share() -> PassbackShare {
+        parse_passback_share(process_value("HIPFIRE_OFFLOAD_PASSBACK_SHARE").as_deref())
+    }
+
+    /// `true` when a share is set but the mode cannot read it, so the load can
+    /// print one informational line instead of silently ignoring the key.
+    ///
+    /// The mode is the selector and the share is its modifier, so a share in a
+    /// `pcie`/`cpu` run is not a misconfiguration to refuse — just an inert key
+    /// worth naming once.
+    pub fn stray_passback_share_configured() -> bool {
+        let Some(raw) = process_value("HIPFIRE_OFFLOAD_PASSBACK_SHARE") else {
+            return false;
+        };
+        let mode = offload_exec();
+        mode != OffloadExec::Passback && raw.trim() != "" && raw.trim() != "auto"
+    }
+
+    // Placement arithmetic (`largest_fitting_tail`, the policy→split call) lives
+    // in `hipfire_runtime::offload`: it is placement, not configuration
+    // vocabulary, and it needs a device measurement this crate cannot take.
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -6354,150 +7970,452 @@ pub mod memory {
             assert_eq!(parse_offload_exec(Some("PCIE")), OffloadExec::Pcie);
             assert_eq!(parse_offload_exec(Some("banana")), OffloadExec::Pcie);
             assert_eq!(parse_offload_exec(Some("cpu0")), OffloadExec::Pcie);
+            // Pass-back is its own mode; whitespace/case trimmed like "cpu".
+            assert_eq!(parse_offload_exec(Some("passback")), OffloadExec::Passback);
+            assert_eq!(
+                parse_offload_exec(Some(" Passback ")),
+                OffloadExec::Passback
+            );
+            assert_eq!(parse_offload_exec(Some("PASSBACK")), OffloadExec::Passback);
+            assert_eq!(parse_offload_exec(Some("passback0")), OffloadExec::Pcie);
             // Display is the wire spelling the registry/TOML round-trips.
             assert_eq!(OffloadExec::Pcie.to_string(), "pcie");
             assert_eq!(OffloadExec::Cpu.to_string(), "cpu");
+            assert_eq!(OffloadExec::Passback.to_string(), "passback");
+        }
+
+        #[test]
+        fn passback_share_roundtrip() {
+            // Absent/empty/unknown all schedule.
+            assert_eq!(parse_passback_share(None), PassbackShare::Auto);
+            assert_eq!(parse_passback_share(Some("")), PassbackShare::Auto);
+            assert_eq!(parse_passback_share(Some("auto")), PassbackShare::Auto);
+            assert_eq!(parse_passback_share(Some(" auto ")), PassbackShare::Auto);
+            // Both ends of the legal range are pinned shares; 0 disables.
+            assert_eq!(
+                parse_passback_share(Some("0")),
+                PassbackShare::Share(0.0)
+            );
+            assert_eq!(
+                parse_passback_share(Some("0.375")),
+                PassbackShare::Share(0.375)
+            );
+            assert_eq!(
+                parse_passback_share(Some("0.5")),
+                PassbackShare::Share(0.5)
+            );
+            // Out of range and garbage fail closed to scheduling (the schema
+            // rejects them earlier; this is the second guard).
+            assert_eq!(parse_passback_share(Some("0.6")), PassbackShare::Auto);
+            assert_eq!(parse_passback_share(Some("-0.1")), PassbackShare::Auto);
+            assert_eq!(parse_passback_share(Some("banana")), PassbackShare::Auto);
+            assert_eq!(PassbackShare::Auto.to_string(), "auto");
+            assert_eq!(PassbackShare::Share(0.25).to_string(), "0.25");
         }
 
         #[test]
         fn gpu_layer_budget_roundtrip() {
             // Unset resolves to full residency — the zero-diff baseline.
-            assert_eq!(parse_gpu_layer_budget(None), GpuLayerBudget::Full);
+            assert_eq!(parse_gpu_layer_budget(None), OffloadBudget::Full);
             // Empty string is unset, not auto.
-            assert_eq!(parse_gpu_layer_budget(Some("")), GpuLayerBudget::Full);
+            assert_eq!(parse_gpu_layer_budget(Some("")), OffloadBudget::Full);
             // "auto" and "-1" both select auto-fit (case-insensitive).
-            assert_eq!(parse_gpu_layer_budget(Some("auto")), GpuLayerBudget::Auto);
-            assert_eq!(parse_gpu_layer_budget(Some("-1")), GpuLayerBudget::Auto);
-            assert_eq!(parse_gpu_layer_budget(Some("AUTO")), GpuLayerBudget::Auto);
+            assert_eq!(parse_gpu_layer_budget(Some("auto")), OffloadBudget::Auto);
+            assert_eq!(parse_gpu_layer_budget(Some("-1")), OffloadBudget::Auto);
+            assert_eq!(parse_gpu_layer_budget(Some("AUTO")), OffloadBudget::Auto);
             // A non-negative integer pins that many resident layers (trimmed).
-            assert_eq!(parse_gpu_layer_budget(Some("3")), GpuLayerBudget::Layers(3));
+            assert_eq!(parse_gpu_layer_budget(Some("3")), OffloadBudget::Layers(3));
             assert_eq!(
                 parse_gpu_layer_budget(Some(" 12 ")),
-                GpuLayerBudget::Layers(12)
+                OffloadBudget::Layers(12)
             );
             // Garbage, negatives other than -1, and anything unparseable fail
             // closed to full residency rather than forcing an offload.
-            assert_eq!(parse_gpu_layer_budget(Some("banana")), GpuLayerBudget::Full);
-            assert_eq!(parse_gpu_layer_budget(Some("-2")), GpuLayerBudget::Full);
+            assert_eq!(parse_gpu_layer_budget(Some("banana")), OffloadBudget::Full);
+            assert_eq!(parse_gpu_layer_budget(Some("-2")), OffloadBudget::Full);
+        }
+
+        #[test]
+        fn ple_hot_store_bytes_parse() {
+            assert_eq!(parse_ple_hot_store_bytes(None), PleHotStoreBudget::Bytes(0));
+            assert_eq!(
+                parse_ple_hot_store_bytes(Some("")),
+                PleHotStoreBudget::Bytes(0)
+            );
+            assert_eq!(
+                parse_ple_hot_store_bytes(Some("auto")),
+                PleHotStoreBudget::Auto
+            );
+            assert_eq!(
+                parse_ple_hot_store_bytes(Some("0")),
+                PleHotStoreBudget::Bytes(0)
+            );
+            assert_eq!(
+                parse_ple_hot_store_bytes(Some(" 16000000000 ")),
+                PleHotStoreBudget::Bytes(16_000_000_000)
+            );
+            assert_eq!(
+                parse_ple_hot_store_bytes(Some("-1")),
+                PleHotStoreBudget::Bytes(0)
+            );
+            let field = crate::FIELDS
+                .iter()
+                .find(|field| field.key == "memory.ple_hot_store_bytes")
+                .expect("ple_hot_store_bytes is in the schema");
+            assert!(field
+                .validate(&crate::ConfigValue::String("auto".into()))
+                .is_ok());
+            assert!(field.validate(&crate::ConfigValue::Integer(0)).is_ok());
+            assert!(field
+                .validate(&crate::ConfigValue::String("on".into()))
+                .is_err());
+            assert!(field.validate(&crate::ConfigValue::Integer(-1)).is_err());
+            assert!(matches!(
+                field.parse_cli("auto"),
+                Ok(crate::ConfigValue::String(_))
+            ));
+            assert!(matches!(
+                field.parse_cli("42"),
+                Ok(crate::ConfigValue::Integer(42))
+            ));
+        }
+
+        #[test]
+        fn ple_format_parse_resolve_and_names() {
+            assert_eq!(
+                PleFormatRequest::parse("auto"),
+                Some(PleFormatRequest::Auto)
+            );
+            assert_eq!(PleFormatRequest::parse("q4"), Some(PleFormatRequest::Q4));
+            assert_eq!(PleFormatRequest::parse(" Q8 "), Some(PleFormatRequest::Q8));
+            assert_eq!(PleFormatRequest::parse(""), None);
+            assert_eq!(PleFormatRequest::parse("q5"), None);
+            for request in [
+                PleFormatRequest::Auto,
+                PleFormatRequest::Q4,
+                PleFormatRequest::Q8,
+            ] {
+                assert_eq!(PleFormatRequest::parse(request.name()), Some(request));
+            }
+            assert_eq!(PleFormat::from_name("q4"), Some(PleFormat::Q4));
+            assert_eq!(PleFormat::from_name("q8"), Some(PleFormat::Q8));
+            assert_eq!(PleFormat::from_name("auto"), None);
+            assert_eq!(PleFormat::Q4.name(), "q4");
+            assert_eq!(PleFormat::Q8.name(), "q8");
+            assert_eq!(PleFormat::Q4.sidecar_suffix(), "ple-q4");
+            assert_eq!(PleFormat::Q8.sidecar_suffix(), "ple-q8");
+            // Explicit requests ignore the arch; auto is q4 only on gfx1151.
+            for arch in ["gfx1151", "gfx1100", "gfx1201", ""] {
+                assert_eq!(PleFormatRequest::Q4.resolve(arch), PleFormat::Q4);
+                assert_eq!(PleFormatRequest::Q8.resolve(arch), PleFormat::Q8);
+            }
+            assert_eq!(PleFormatRequest::Auto.resolve("gfx1151"), PleFormat::Q4);
+            assert_eq!(PleFormatRequest::Auto.resolve("gfx1100"), PleFormat::Q8);
+            assert_eq!(PleFormatRequest::Auto.resolve("gfx1201"), PleFormat::Q8);
+            assert_eq!(PleFormatRequest::Auto.resolve(""), PleFormat::Q8);
+        }
+
+        #[test]
+        fn ple_sidecar_path_appends_to_full_file_name() {
+            let model = Path::new("/m/qwen3.8-flash-next-base.mq4-xts");
+            assert_eq!(
+                ple_sidecar_path(model, PleFormat::Q4),
+                PathBuf::from("/m/qwen3.8-flash-next-base.mq4-xts.ple-q4")
+            );
+            assert_eq!(
+                ple_sidecar_path(model, PleFormat::Q8),
+                PathBuf::from("/m/qwen3.8-flash-next-base.mq4-xts.ple-q8")
+            );
+            assert_eq!(
+                ple_sidecar_path(Path::new("model"), PleFormat::Q4),
+                PathBuf::from("model.ple-q4")
+            );
+        }
+
+        #[test]
+        fn trunk_overlay_sidecar_path_appends_to_full_file_name() {
+            assert_eq!(
+                trunk_overlay_sidecar_path(Path::new("/m/qwen3.8-flash-next.mq4-xts")),
+                PathBuf::from("/m/qwen3.8-flash-next.mq4-xts.trunk-overlay")
+            );
+            assert_eq!(
+                trunk_overlay_sidecar_path(Path::new("model")),
+                PathBuf::from("model.trunk-overlay")
+            );
+        }
+
+        #[test]
+        fn ple_format_key_defaults_auto_with_env_override() {
+            let field = crate::FIELDS
+                .iter()
+                .find(|field| field.key == "memory.ple_format")
+                .expect("ple_format is in the schema");
+            assert_eq!(field.legacy_key, "ple_format");
+            assert_eq!(field.env_compat, Some("HIPFIRE_PLE_FORMAT"));
+            assert_eq!(
+                field.default.to_value(),
+                crate::ConfigValue::String("auto".into())
+            );
+            for value in ["auto", "q4", "q8"] {
+                assert_eq!(
+                    field.parse_cli(value).unwrap(),
+                    crate::ConfigValue::String(value.into())
+                );
+            }
+            assert!(field.parse_cli("q5").is_err());
+            assert!(field.validate(&crate::ConfigValue::Integer(4)).is_err());
+            // HIPFIRE_PLE_FORMAT is unique to this test; no other test reads it.
+            std::env::set_var("HIPFIRE_PLE_FORMAT", "q4");
+            let env_layer = crate::load_env_layer().expect("env layer");
+            std::env::remove_var("HIPFIRE_PLE_FORMAT");
+            let process = crate::ProcessConfig::from_resolved(
+                &crate::resolve([crate::NamedLayer {
+                    source: crate::ConfigSource::LegacyEnv {
+                        name: "HIPFIRE_PLE_FORMAT".into(),
+                    },
+                    layer: env_layer,
+                }])
+                .expect("env resolve"),
+            )
+            .expect("process");
+            let raw = process.legacy_value("HIPFIRE_PLE_FORMAT");
+            assert_eq!(raw.as_deref(), Some("q4"));
+            assert_eq!(parse_ple_format(raw.as_deref()), PleFormatRequest::Q4);
+            // Unset or unparseable resolves to the default.
+            let defaults =
+                crate::ProcessConfig::from_resolved(&crate::resolve([]).expect("empty resolve"))
+                    .expect("process");
+            assert_eq!(
+                parse_ple_format(defaults.legacy_value("HIPFIRE_PLE_FORMAT").as_deref()),
+                PleFormatRequest::Auto
+            );
+            assert_eq!(parse_ple_format(None), PleFormatRequest::Auto);
+            assert_eq!(parse_ple_format(Some("bogus")), PleFormatRequest::Auto);
+        }
+
+        #[test]
+        fn ple_prewarm_bytes_defaults_auto_with_env_override() {
+            assert_eq!(parse_ple_prewarm_bytes(None), PleHotStoreBudget::Auto);
+            assert_eq!(parse_ple_prewarm_bytes(Some("")), PleHotStoreBudget::Auto);
+            assert_eq!(parse_ple_prewarm_bytes(Some("  ")), PleHotStoreBudget::Auto);
+            assert_eq!(
+                parse_ple_prewarm_bytes(Some("auto")),
+                PleHotStoreBudget::Auto
+            );
+            assert_eq!(
+                parse_ple_prewarm_bytes(Some("0")),
+                PleHotStoreBudget::Bytes(0)
+            );
+            assert_eq!(
+                parse_ple_prewarm_bytes(Some(" 16000000000 ")),
+                PleHotStoreBudget::Bytes(16_000_000_000)
+            );
+            // An unparseable value (the config layer rejects those first) fails
+            // closed to off, like the hot-store budget.
+            assert_eq!(
+                parse_ple_prewarm_bytes(Some("-1")),
+                PleHotStoreBudget::Bytes(0)
+            );
+            let field = crate::FIELDS
+                .iter()
+                .find(|field| field.key == "memory.ple_prewarm_bytes")
+                .expect("ple_prewarm_bytes is in the schema");
+            assert_eq!(field.legacy_key, "ple_prewarm_bytes");
+            assert_eq!(field.env_compat, Some("HIPFIRE_PLE_PREWARM_BYTES"));
+            assert_eq!(
+                field.default.to_value(),
+                crate::ConfigValue::String("auto".into())
+            );
+            assert!(field
+                .validate(&crate::ConfigValue::String("auto".into()))
+                .is_ok());
+            assert!(field.validate(&crate::ConfigValue::Integer(0)).is_ok());
+            assert!(field
+                .validate(&crate::ConfigValue::String("on".into()))
+                .is_err());
+            assert!(field.validate(&crate::ConfigValue::Integer(-1)).is_err());
+            assert!(matches!(
+                field.parse_cli("auto"),
+                Ok(crate::ConfigValue::String(_))
+            ));
+            assert!(matches!(
+                field.parse_cli("42"),
+                Ok(crate::ConfigValue::Integer(42))
+            ));
+            // HIPFIRE_PLE_PREWARM_BYTES is unique to this test; no other test reads it.
+            std::env::set_var("HIPFIRE_PLE_PREWARM_BYTES", "0");
+            let env_layer = crate::load_env_layer().expect("env layer");
+            std::env::remove_var("HIPFIRE_PLE_PREWARM_BYTES");
+            let process = crate::ProcessConfig::from_resolved(
+                &crate::resolve([crate::NamedLayer {
+                    source: crate::ConfigSource::LegacyEnv {
+                        name: "HIPFIRE_PLE_PREWARM_BYTES".into(),
+                    },
+                    layer: env_layer,
+                }])
+                .expect("env resolve"),
+            )
+            .expect("process");
+            let raw = process.legacy_value("HIPFIRE_PLE_PREWARM_BYTES");
+            assert_eq!(raw.as_deref(), Some("0"));
+            assert_eq!(
+                parse_ple_prewarm_bytes(raw.as_deref()),
+                PleHotStoreBudget::Bytes(0)
+            );
+            // Without the env the default (auto) resolves.
+            let defaults =
+                crate::ProcessConfig::from_resolved(&crate::resolve([]).expect("empty resolve"))
+                    .expect("process");
+            assert_eq!(
+                parse_ple_prewarm_bytes(
+                    defaults
+                        .legacy_value("HIPFIRE_PLE_PREWARM_BYTES")
+                        .as_deref()
+                ),
+                PleHotStoreBudget::Auto
+            );
+        }
+
+        #[test]
+        fn ple_load_fill_bytes_is_an_auto_integer_defaulting_to_auto() {
+            let field = crate::FIELDS
+                .iter()
+                .find(|field| field.key == "memory.ple_load_fill_bytes")
+                .expect("ple_load_fill_bytes is in the schema");
+            assert_eq!(field.legacy_key, "ple_load_fill_bytes");
+            assert_eq!(field.env_compat, Some("HIPFIRE_PLE_LOAD_FILL_BYTES"));
+            assert_eq!(
+                field.default.to_value(),
+                crate::ConfigValue::String("auto".into())
+            );
+            assert!(field
+                .validate(&crate::ConfigValue::String("auto".into()))
+                .is_ok());
+            assert!(field.validate(&crate::ConfigValue::Integer(0)).is_ok());
+            assert!(field.validate(&crate::ConfigValue::Integer(-1)).is_err());
+            let defaults =
+                crate::ProcessConfig::from_resolved(&crate::resolve([]).expect("empty resolve"))
+                    .expect("process");
+            assert_eq!(
+                parse_ple_prewarm_bytes(
+                    defaults
+                        .legacy_value("HIPFIRE_PLE_LOAD_FILL_BYTES")
+                        .as_deref()
+                ),
+                PleHotStoreBudget::Auto
+            );
+        }
+
+        #[test]
+        fn budget_keys_default_to_full_and_preserve_explicit_placement() {
+            use OffloadBudget::{Auto, Full, Layers};
+            let defaults = crate::ProcessConfig::from_resolved(&crate::resolve([]).unwrap()).unwrap();
+            for (key, env) in [
+                ("memory.gpu_layer_budget", "HIPFIRE_GPU_LAYER_BUDGET"),
+                ("memory.moe_expert_budget", "HIPFIRE_MOE_EXPERT_BUDGET"),
+            ] {
+                assert_eq!(crate::field(key).unwrap().default.to_value(), crate::ConfigValue::Null);
+                assert_eq!(parse_gpu_layer_budget(defaults.legacy_value(env).as_deref()), Full);
+                for (spelling, expected) in [
+                    ("null", Full),
+                    ("auto", Auto),
+                    ("-1", Auto),
+                    ("26", Layers(26)),
+                    ("0", Layers(0)),
+                ] {
+                    let mut layer = crate::ConfigLayer::default();
+                    layer.set_cli(key, spelling).unwrap();
+                    let resolved = crate::resolve([crate::NamedLayer {
+                        source: crate::ConfigSource::OneShot {
+                            argument: format!("{key}={spelling}"),
+                        },
+                        layer,
+                    }]).unwrap();
+                    let process = crate::ProcessConfig::from_resolved(&resolved).unwrap();
+                    for budget_env in ["HIPFIRE_GPU_LAYER_BUDGET", "HIPFIRE_MOE_EXPERT_BUDGET"] {
+                        assert_eq!(
+                            parse_gpu_layer_budget(process.legacy_value(budget_env).as_deref()),
+                            if budget_env == env { expected } else { Full },
+                            "{key}={spelling}, {budget_env}"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn budget_keys_accept_the_auto_spelling() {
+            // The TUI rows and the help text both use `auto`; the wire spelling
+            // `-1` is equivalent. Both must survive CLI/env validation, or the
+            // documented spelling is unusable.
+            for key in ["memory.gpu_layer_budget", "memory.moe_expert_budget"] {
+                let field = crate::field(key).expect("budget key is in the schema");
+                for spelling in ["auto", "AUTO", "-1", "26", "null"] {
+                    let parsed = field
+                        .parse_cli(spelling)
+                        .unwrap_or_else(|e| panic!("{key}={spelling}: {e}"));
+                    field.validate(&parsed).unwrap();
+                }
+                // Garbage still fails closed rather than being read as a count.
+                assert!(field.parse_cli("banana").is_err(), "{key}");
+            }
         }
 
         #[test]
         fn gpu_layer_budget_display() {
-            assert_eq!(GpuLayerBudget::Full.to_string(), "full");
-            assert_eq!(GpuLayerBudget::Auto.to_string(), "auto");
-            assert_eq!(GpuLayerBudget::Layers(5).to_string(), "5");
+            assert_eq!(OffloadBudget::Full.to_string(), "full");
+            assert_eq!(OffloadBudget::Auto.to_string(), "auto");
+            assert_eq!(OffloadBudget::Layers(5).to_string(), "5");
         }
 
         #[test]
-        fn largest_fitting_tail_keeps_largest_resident_tail() {
-            // Four layers of 10/20/30/40; KV footprint 20. Effective capacity 100
-            // -> weight-tail budget 80. Full resident weights=100 > 80; dropping
-            // L0 leaves 90 > 80; dropping L0,L1 leaves 70 <= 80 => i_gpu_start=2,
-            // keeping L2+L3 resident (the largest tail that fits).
-            let weights = [10usize, 20, 30, 40];
-            assert_eq!(largest_fitting_tail(4, &weights, 20, 0, 100), Some(2));
-        }
-
-        #[test]
-        fn largest_fitting_tail_full_when_everything_fits() {
-            // Weights + KV comfortably within capacity: keep all layers resident.
-            let weights = [10usize, 20, 30];
-            assert_eq!(largest_fitting_tail(3, &weights, 5, 0, 1000), Some(0));
-        }
-
-        #[test]
-        fn largest_fitting_tail_headroom_drives_offload() {
-            // Effective capacity 115: resident@0 = weights(100)+KV(20) = 120 > 115;
-            // dropping L0 leaves weights[1..]=90 + KV(20) = 110 <= 115 => i_gpu_start=1.
-            let weights = [10usize, 20, 30, 40];
-            assert_eq!(largest_fitting_tail(4, &weights, 20, 0, 115), Some(1));
-        }
-
-        #[test]
-        fn largest_fitting_tail_none_when_kv_alone_exceeds_budget() {
-            // Even offloading every layer leaves KV over capacity: refuse.
-            let weights = [10usize, 20];
-            assert_eq!(largest_fitting_tail(2, &weights, 5_000, 0, 1_000), None);
-        }
-
-        #[test]
-        fn largest_fitting_tail_all_but_last_offloaded() {
-            // Only the final layer fits after KV: i_gpu_start == n_layers-1.
-            let weights = [100usize, 100, 5];
-            let kv = 3;
-            // Effective capacity 8 -> weight-tail budget 5. sum([5])=5 <= 5 => keep
-            // only L2 resident.
-            assert_eq!(largest_fitting_tail(3, &weights, kv, 0, 8), Some(2));
-        }
-        #[test]
-        fn largest_fitting_tail_always_resident_reduces_fit() {
-            // Embed + lm_head stay resident in every mode (always_resident_bytes). With
-            // base=100, KV=10: resident@0 = 100+60+10 = 170 > 150; @1 = 160 > 150; @2 =
-            // 140 <= 150 => keep only L2 resident — the base alone leaves room for just
-            // one layer's weights.
-            let weights = [10usize, 20, 30];
-            assert_eq!(largest_fitting_tail(3, &weights, 10, 100, 150), Some(2));
-        }
-
-        #[test]
-        fn largest_fitting_tail_base_alone_exceeds_capacity() {
-            // Embed + lm_head alone overshoot capacity even with every layer offloaded:
-            // refuse rather than OOM mid-generation.
-            let weights = [10usize, 20];
-            // base=500 + KV=200 = 700 > 600 at i_gpu_start=n_layers => None.
-            assert_eq!(largest_fitting_tail(2, &weights, 200, 500, 600), None);
-        }
-
-        // resolve_i_gpu_start: policy -> split point. Full never offloads; Layers
-        // pins exactly that many resident layers; Auto delegates to
-        // largest_fitting_tail (including the None-refuse path).
-        #[test]
-        fn resolve_i_gpu_start_full_is_zero() {
-            let weights = [10usize, 20];
+        fn spill_support_truth_table() {
+            use SpillRefusal::*;
+            use SpillSupport::{Refused, Supported};
+            // Clean single-GPU non-VL non-paged non-REAP MoE: the only
+            // supported shape (dense included — the policy is MoE-blind).
+            for arch_id in [5u32, 6] {
+                assert_eq!(
+                    spill_support(arch_id, 1, 1, None, false, false, false),
+                    Supported,
+                    "arch {arch_id}"
+                );
+            }
+            // Each refusal dimension, in gate priority order.
             assert_eq!(
-                resolve_i_gpu_start(2, &weights, 10, 5, 15, GpuLayerBudget::Full),
-                Some(0)
+                spill_support(9, 1, 1, None, false, false, false),
+                Refused(Arch(9))
             );
-        }
-
-        #[test]
-        fn resolve_i_gpu_start_layers_pins_resident_count() {
-            let weights = [10usize, 20, 30];
-            // Pin exactly 2 resident of 3 -> spill the first layer.
             assert_eq!(
-                resolve_i_gpu_start(3, &weights, 10, 5, 15, GpuLayerBudget::Layers(2)),
-                Some(1)
+                spill_support(6, 2, 1, Some(4), false, false, false),
+                Refused(Tp(2)),
+                "tp wins over the EP pinning behind it"
             );
-        }
-
-        #[test]
-        fn resolve_i_gpu_start_layers_at_or_above_total_is_full() {
-            let weights = [10usize, 20];
-            // Asking for more resident layers than exist keeps everything resident.
             assert_eq!(
-                resolve_i_gpu_start(2, &weights, 10, 5, 15, GpuLayerBudget::Layers(9)),
-                Some(0)
+                spill_support(6, 1, 2, None, false, false, false),
+                Refused(Pp(2))
             );
-        }
-
-        #[test]
-        fn resolve_i_gpu_start_auto_refuses_when_nothing_fits() {
-            let weights = [10usize, 20];
-            // base + KV alone overshoot even with every layer offloaded.
             assert_eq!(
-                resolve_i_gpu_start(2, &weights, 200, 500, 600, GpuLayerBudget::Auto),
-                None
+                spill_support(6, 1, 1, Some(4), false, false, false),
+                Refused(ExpertParallel(4))
             );
-        }
-
-        #[test]
-        fn resolve_i_gpu_start_auto_matches_largest_fitting_tail() {
-            let weights = [10usize, 20, 30];
-            // base=50 + weights(60) + KV=40 = 150 > cap 90; every layer offloaded
-            // leaves 90 == cap => the whole table spills (Some(3)).
             assert_eq!(
-                resolve_i_gpu_start(3, &weights, 40, 50, 90, GpuLayerBudget::Auto),
-                Some(3)
+                spill_support(6, 1, 1, None, false, false, true),
+                Refused(VisionTower)
+            );
+            assert_eq!(
+                spill_support(6, 1, 1, None, true, false, false),
+                Refused(PagedExperts)
+            );
+            assert_eq!(
+                spill_support(6, 1, 1, None, false, true, false),
+                Refused(ReapKeepMap)
+            );
+            // `None`/zero experts is not expert-parallel — no other
+            // dimension failing means supported.
+            assert_eq!(
+                spill_support(6, 1, 1, Some(0), false, false, false),
+                Supported
             );
         }
     }

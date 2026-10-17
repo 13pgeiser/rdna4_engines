@@ -58,6 +58,20 @@ pub struct WeightRef<'a> {
 
 // ── Dispatch parameters ────────────────────────────────
 
+/// Bytes per weight row, or `None` when the tensor's byte length is not an exact
+/// multiple of its row count.
+///
+/// Every CPU-covered format stores exactly `m * row_bytes` bytes; the padded
+/// strides are the exception, and the row-split caller refuses those rather than
+/// trusting the divisor. This is the one place the split math derives a row
+/// stride from the allocation itself.
+pub(crate) fn weight_row_bytes(w: &WeightRef) -> Option<usize> {
+    if w.m == 0 || w.buf.buf.size() % w.m != 0 {
+        return None;
+    }
+    Some(w.buf.buf.size() / w.m)
+}
+
 pub struct GemvParams<'a> {
     pub w: &'a WeightRef<'a>,
     pub x: &'a GpuTensor,
@@ -658,6 +672,7 @@ fn dispatch_swiglu_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), Di
         MQ2G256V2 => hip!(gpu.gemv_mq2g256v2_residual(w.buf, x_in, residual, m, k)),
         MQ4CG256 => hip!(gpu.gemv_mq4cg256_residual(w.buf, x_in, residual, m, k)),
         MQ5G256 => hip!(gpu.gemv_hfq5g256_residual(w.buf, x_in, residual, m, k)),
+        MQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x_in, residual, m, k)),
         MQ3G256Lloyd => hip!(gpu.gemv_mq3g256_lloyd_residual(w.buf, x_in, residual, m, k)),
         MQ4G256Lloyd => hip!(gpu.gemv_mq4g256_lloyd_residual(w.buf, x_in, residual, m, k)),
         MQ4G128V2 => reject_mq4g128v2(),

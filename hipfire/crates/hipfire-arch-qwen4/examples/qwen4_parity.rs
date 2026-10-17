@@ -20,6 +20,12 @@
 //!       --mode state --model /path/to/model.hfq \
 //!       --tokens benchmarks/prompts/qwen4-teacher-forced.tokens.json \
 //!       --out /tmp/qwen4-state-parity.json
+//!
+//! Session-cache hit-vs-cold quality oracle (absolute paths only; the report is
+//! always written, the exit status is non-zero when an expectation failed):
+//!   cargo run --release -p hipfire-arch-qwen4 --features reference-parity --example qwen4_parity -- \
+//!       --mode cache-quality --model /abs/model.hfq \
+//!       --tokens /abs/cache-quality-fixture.json --out /abs/cache-quality-result.json
 
 use hipfire_arch_qwen4::{admit_hfqm_artifact, PleHashMetadata, PleHistory, Qwen4HfqmArtifact};
 use hipfire_runtime::device_mesh::DeviceMesh;
@@ -2181,6 +2187,7 @@ fn run_qsa(
             index_dim,
             position: None,
             grid_bound: blocks,
+            yarn: rdna_compute::rope::RopeYarn::OFF,
         },
     )
     .map_err(|error| error.to_string())?;
@@ -2365,6 +2372,7 @@ fn run_qsa(
                 head_stride: head_dim,
                 position: positions[token],
                 rotary_dim: head_dim,
+                yarn: rdna_compute::rope::RopeYarn::OFF,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -2402,6 +2410,7 @@ fn run_qsa(
                 head_stride: head_dim,
                 position: positions[token],
                 rotary_dim: head_dim,
+                yarn: rdna_compute::rope::RopeYarn::OFF,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -2445,6 +2454,7 @@ fn run_qsa(
                 head_stride: 8,
                 position: *position,
                 rotary_dim: 8,
+                yarn: rdna_compute::rope::RopeYarn::OFF,
             },
         )
         .map_err(|error| error.to_string())?;
@@ -3291,6 +3301,7 @@ fn run_mtp(
             index_dim,
             position: None,
             grid_bound: 1,
+            yarn: rdna_compute::rope::RopeYarn::OFF,
         },
     )
     .map_err(|error| error.to_string())?;
@@ -3852,6 +3863,12 @@ fn run_quality_candidate(
     let metadata = receipt.ple.clone();
     let placements = receipt.placements.clone();
     let mut gpu = Gpu::init().map_err(|error| error.to_string())?;
+    // The loader's forward scratch plan, decided from the actual payload
+    // while the mapping is readable.
+    let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+        &gpu, &hfq, &config, &manifest,
+    )
+    .map_err(|error| error.to_string())?;
     // Load by byte range like the serve loader and state runner. The borrowed
     // mmap path never finished on gfx1151 UMA (over an hour, stuck in SVM
     // registration); range loading takes about a minute.
@@ -3877,19 +3894,22 @@ fn run_quality_candidate(
     )
     .map_err(|error| format!("qwen4 manifest fulfillment failed: {error}"))?;
     let placements = placements;
+    let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
     let mut bundle = hipfire_arch_qwen4::bundle::Qwen4Bundle::assemble_with_metadata(
         config.clone(),
+        &manifest.identity.recipe,
         transaction,
         &placements,
         &mut gpu,
         2048,
         metadata,
         hipfire_arch_qwen4::Qwen4StateFormat::F32,
+        backend,
     )
     .map_err(|error| format!("qwen4 bundle assembly failed: {error}"))?;
     let mut nlls = Vec::with_capacity(tokens.len().saturating_sub(1));
     bundle
-        .attach_forward(&mut gpu, 2048)
+        .attach_forward(&mut gpu, 2048, scratch_mode)
         .map_err(|error| format!("qwen4 forward setup failed: {error}"))?;
     let vocab = config.vocab_size;
     let logits = gpu
@@ -4045,6 +4065,11 @@ enum ParityMode {
         tokens: PathBuf,
         output: PathBuf,
     },
+    CacheQuality {
+        model: PathBuf,
+        fixture: PathBuf,
+        output: PathBuf,
+    },
 }
 
 fn parse_args() -> Result<ParityMode, String> {
@@ -4069,7 +4094,7 @@ fn parse_args() -> Result<ParityMode, String> {
             "--out" => out = Some(PathBuf::from(args.next().ok_or("--out needs FILE")?)),
             other => {
                 return fail(format!(
-                    "unsupported argument {other:?}; use --fixtures DIR --out FILE, --model FILE --tokens CORPUS --out FILE, --mode state --model FILE --tokens CORPUS --out FILE, or --mode profile --model FILE --tokens CORPUS --out FILE"
+                    "unsupported argument {other:?}; use --fixtures DIR --out FILE, --model FILE --tokens CORPUS --out FILE, --mode state --model FILE --tokens CORPUS --out FILE, --mode profile --model FILE --tokens CORPUS --out FILE, or --mode cache-quality --model ABS --tokens ABS_FIXTURE_JSON --out ABS_REPORT_JSON"
                 ));
             }
         }
@@ -4092,11 +4117,29 @@ fn parse_args() -> Result<ParityMode, String> {
             tokens,
             output,
         }),
+        (Some("cache-quality"), None, Some(model), Some(fixture)) => {
+            for (flag, path) in [("--model", &model), ("--tokens", &fixture), ("--out", &output)] {
+                if !path.is_absolute() {
+                    return fail(format!(
+                        "--mode cache-quality needs absolute paths: {flag} {} is relative",
+                        path.display()
+                    ));
+                }
+            }
+            Ok(ParityMode::CacheQuality {
+                model,
+                fixture,
+                output,
+            })
+        }
+        (Some("cache-quality"), _, _, _) => fail(
+            "--mode cache-quality needs --model ABS --tokens ABS_FIXTURE_JSON --out ABS_REPORT_JSON (and no --fixtures)",
+        ),
         (Some(other), _, _, _) => fail(format!(
-            "unsupported --mode {other:?}; only --mode state and --mode profile are available"
+            "unsupported --mode {other:?}; only --mode state, --mode profile and --mode cache-quality are available"
         )),
         _ => fail(
-            "choose exactly one mode: --fixtures DIR, --model FILE --tokens CORPUS, --mode state --model FILE --tokens CORPUS, or --mode profile --model FILE --tokens CORPUS",
+            "choose exactly one mode: --fixtures DIR, --model FILE --tokens CORPUS, --mode state --model FILE --tokens CORPUS, --mode profile --model FILE --tokens CORPUS, or --mode cache-quality --model ABS --tokens ABS_FIXTURE_JSON --out ABS_REPORT_JSON",
         ),
     }
 }
@@ -4229,6 +4272,15 @@ fn run() -> Result<(), String> {
             let report = hipfire_arch_qwen4::state_parity::run_profile(&model, &tokens)?;
             write_profile_report(report, &output)?;
             println!("qwen4 bounded profile written: {}", output.display());
+            Ok(())
+        }
+        ParityMode::CacheQuality {
+            model,
+            fixture,
+            output,
+        } => {
+            hipfire_arch_qwen4::cache_quality::run_prefix_cache_quality(&model, &fixture, &output)?;
+            println!("qwen4 cache quality PASS: {}", output.display());
             Ok(())
         }
     }

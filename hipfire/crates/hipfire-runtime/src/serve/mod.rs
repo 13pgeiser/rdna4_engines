@@ -2,13 +2,20 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// Concurrent serve: several agents served at once by the multi-slot engine.
+// Legacy concurrent serve protocol: the experimental fixed-slot `SlotEngine`
+// (`serve.multi_slot`). It stays explicitly labeled legacy and is never the
+// default route.
 //
-// `hipfire serve` already exposes an OpenAI-compatible /v1/chat/completions
-// over HTTP, and HTTP is already concurrent. What serialises requests today is
-// behind it: one `Engine` (a single daemon process) guarded by a
-// `Mutex<ServeRuntime>`. `SlotEngine` is an alternative backend that lives
-// OUTSIDE that mutex — which is the entire point — so requests overlap.
+// What actually serializes default serve: the CLI's `Mutex<ServeRuntime>`
+// covers model/request setup only (the engine handle is cloned and the lock
+// dropped before generation), but the single daemon owns one mutable resident
+// model and runs one generation at a time unless a continuous-batch route is
+// admitted. Batch routes are daemon-owned (`hipfire-generate::batch`): the
+// existing fixed-lane Qwen/LFM/EP drivers, and the VMM continuous-batching
+// route (`serve.vmm_batch`, default off) that plans steps with
+// `slot_batch::BatchPlanner` over one resident weight set and per-request VMM
+// state. `SlotEngine` lives outside the CLI mutex and loads its own model; it
+// is not that VMM route.
 
 // The engine LOOP lives in `hipfire-arch-qwen35::serve_engine`, not here:
 // it needs `forward_batch_slots_graphed`, and that crate already depends on
@@ -283,6 +290,10 @@ pub struct SlotEngineConfig {
     pub vl_path: Option<PathBuf>,
     /// MTP draft depth (K+1 verify rows per speculative cycle). 0 = off.
     pub mtp_k: usize,
+    /// The `params.mtp_mode` tri-state (`off`/`auto`/`on`). `mtp_k > 0` alone
+    /// cannot distinguish `auto` from an explicit `on`, so the slots arming
+    /// site reads this (not `mtp_k`) for the host-spill decline.
+    pub mtp_mode: hipfire_config::MtpMode,
     /// Raw KV-mode string from the load request (empty = resolve from
     /// env/config in the engine).
     pub kv_mode_raw: String,
@@ -311,6 +322,70 @@ pub struct SlotEngineConfig {
     pub dflash_required: bool,
 }
 
+/// What the daemon's slot-mode admission and `loaded` ACK need from a
+/// checkpoint *before* any GPU work: geometry, arch, tokenizer.
+///
+/// The daemon's own preflight reads this off the qwen35 HFQ layout, which is
+/// where every slot-capable arch used to come from. An arch whose checkpoint
+/// is not an HFQ at all (arch 17's encoder loads a safetensors dir as
+/// happily as a container) supplies it through `Carrier::preflight_slot_model`
+/// instead, and the daemon fills the same struct from it. The generate-only
+/// pieces the daemon's preflight also produces (chat template, vision config,
+/// recommended sampling) have no meaning on such a route and stay `None`.
+pub struct SlotModelPreflight {
+    pub arch_id: u32,
+    /// `hipfire_loader::arch_label(arch_id)` equivalent, for the ACK.
+    pub arch_str: String,
+    pub dim: usize,
+    pub layers: usize,
+    pub vocab: usize,
+    pub tokenizer: crate::tokenizer::Tokenizer,
+    /// A vision tower will be resident.
+    pub is_vl: bool,
+    /// Resolved `.vl` sidecar path, when the tower lives outside the trunk.
+    pub vl_path: Option<PathBuf>,
+}
+
+
+/// Which prompt the encoder wraps the input in. Queries and documents carry
+/// different markers and different truncation limits, and the document side
+/// additionally drops the multi-vector mask's punctuated positions — so the
+/// kind is part of the request, not a server-side default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbedKind {
+    Query,
+    Document,
+}
+
+/// One embedding encode request handed to a slot engine.
+///
+/// The engine owns the tokenizer, so the text rides raw — the same split the
+/// sequential `embed` wire body uses. `image` is decoded image bytes; the
+/// engine runs the vision tower itself, on its own GPU thread.
+#[derive(Clone, Debug)]
+pub struct EmbedRequest {
+    pub kind: EmbedKind,
+    pub text: String,
+    pub image: Option<Vec<u8>>,
+    /// The wire request id, for diagnostics only.
+    pub request_tag: String,
+}
+
+/// One encode's result: the post-skiplist, L2-normalized token matrix
+/// `[n_tokens, dim]` row-major, plus the accounting the wire reply needs.
+#[derive(Clone, Debug)]
+pub struct EmbedResponse {
+    pub kind: EmbedKind,
+    pub embeddings: Vec<f32>,
+    /// Rows in `embeddings` (the mask's survivors).
+    pub n_tokens: usize,
+    /// Token-embedding width.
+    pub dim: usize,
+    /// Tokens the input tokenized to, before the mask.
+    pub n_input_tokens: usize,
+}
+
+
 /// Arch-erased multi-slot engine. The concrete engine runs its own thread
 /// and is driven through this narrow surface: submit a request, cancel a
 /// queued one, close/reset a session, read stats, and shut down. The wire
@@ -330,6 +405,31 @@ pub trait SlotEngineHandle: Send + Sync {
     fn reset(&self) -> Result<(), String>;
     /// Snapshot of engine-level counters (submitted/rejected/completed/…).
     fn stats(&self) -> EngineStats;
+
+    /// Serve one batch of embedding encodes synchronously, one result per
+    /// request in order.
+    ///
+    /// Synchronous (not the `submit`/`Event` streaming shape) because an
+    /// encode has exactly one result and no incremental output: a caller
+    /// hands over the requests it already has and waits. The engine is free
+    /// to merge *other* callers' pending requests into the same forward — that
+    /// is what a multi-slot embedding engine buys — so a single-request call
+    /// may still be served as part of a larger batch.
+    ///
+    /// The outer `Err` is an engine-level failure (shutting down, GPU gone).
+    /// The inner one is per request: one bad input must not fail its
+    /// neighbours in the same forward.
+    ///
+    /// Defaulted: a generation engine has no synchronous encode verb, so the
+    /// daemon's `embed` arm leaves the default `Err` alone and keeps the
+    /// ordinary path. Only an embedding arch overrides it.
+    fn encode(
+        &self,
+        _reqs: Vec<EmbedRequest>,
+    ) -> Result<Vec<Result<EmbedResponse, String>>, String> {
+        Err("this engine does not serve embeddings".into())
+    }
+
     /// Consuming shutdown: close the command channel, fail in-flight
     /// requests, join the engine thread and free GPU state. On `Err` the
     /// caller may withhold `unloaded` to keep the load registered.

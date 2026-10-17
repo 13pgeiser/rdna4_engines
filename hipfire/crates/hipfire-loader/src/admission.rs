@@ -15,6 +15,7 @@ use crate::Carrier;
 use hipfire_arch_qwen4::config::{Qwen4Config, ARCH_ID as QWEN4_ARCH_ID};
 use hipfire_arch_qwen4::{InputModality, Qwen4Capabilities};
 use hipfire_runtime::kv_backend::KvBackend;
+use hipfire_runtime::kv_mode::{KvMode, VMode};
 use hipfire_runtime::loader_api::{ModelSource, SpecLoadCfg};
 fn qwen4_vision_tensor_name(name: &str) -> bool {
     [
@@ -54,6 +55,31 @@ pub fn qwen_default_q8_enabled() -> bool {
     )
 }
 
+/// Effective Qwen3.5 V axis: a typed `kv_v` wins, else developer
+/// `HIPFIRE_KV_V` (empty / `q8` = neutral). Resolved once in admission so
+/// VMM sizing and the carrier load see the same pair. The env fallback only
+/// applies to the Qwen3.5 carrier (arch 5/6) on single-rank tensor topology;
+/// other owners never honored it.
+fn resolve_kv_v(typed: Option<&str>, arch_id: u32, tp: usize) -> Option<String> {
+    let env = hipfire_config::developer_var("HIPFIRE_KV_V").ok();
+    resolve_kv_v_from(typed, env.as_deref(), arch_id, tp).map(str::to_string)
+}
+
+fn resolve_kv_v_from<'a>(
+    typed: Option<&'a str>,
+    env: Option<&'a str>,
+    arch_id: u32,
+    tp: usize,
+) -> Option<&'a str> {
+    if let Some(v) = typed.filter(|s| !s.is_empty()) {
+        return Some(v);
+    }
+    if !matches!(arch_id, 5 | 6) || tp > 1 {
+        return None;
+    }
+    env.filter(|v| !matches!(*v, "" | "q8"))
+}
+
 /// Single authoritative operator warning for an admitted legacy trunk.
 pub fn legacy_warning(backend: KvBackend, reason: Option<&str>) -> Option<String> {
     if backend != KvBackend::Legacy {
@@ -65,6 +91,65 @@ pub fn legacy_warning(backend: KvBackend, reason: Option<&str>) -> Option<String
         ),
         None => "WARNING HIPFIRE_KV_BACKEND=legacy: explicitly selected legacy KV storage (--kv-backend legacy or memory.kv_backend); inspect before benchmarking or filing a PR.".to_string(),
     })
+}
+
+/// Admitted gfx11 Qwen3.5-family VMM KV combinations.
+///
+/// Q8 retains the existing gfx1100/gfx1151 and multi-rank admission. Modern
+/// FWHT K tiers paired with Q8/Lloyd V use the same static row layouts as their
+/// legacy-storage owners, but are admitted only on exact gfx1100 TP1: extending
+/// this predicate must not accidentally promote TP2 or gfx1151 without separate
+/// lifecycle proof. Deprecated Givens `legacy-asym*` remains fail-closed.
+fn qwen35_gfx11_vmm_supported(
+    gpu_arch: &str,
+    arch_id: u32,
+    tp: usize,
+    mode_raw: &str,
+    k_raw: Option<&str>,
+    v_raw: Option<&str>,
+) -> bool {
+    if !matches!(gpu_arch, "gfx1100" | "gfx1151") || !matches!(arch_id, 5 | 6) {
+        return false;
+    }
+    let requested_k = k_raw
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(mode_raw)
+        .trim();
+    if matches!(requested_k, "" | "auto" | "q8") {
+        return v_raw.is_none_or(|value| matches!(value.trim(), "" | "q8"));
+    }
+    if gpu_arch != "gfx1100" || tp != 1 {
+        return false;
+    }
+    let Ok(k) = hipfire_runtime::kv_mode::parse_qwen_k_name(requested_k) else {
+        return false;
+    };
+    let requested_v = v_raw
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("q8");
+    let Ok(v) = hipfire_runtime::kv_mode::parse_qwen_v_name(requested_v) else {
+        return false;
+    };
+    matches!(k, KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4)
+        && matches!(v, VMode::Q8 | VMode::Lloyd2 | VMode::Lloyd3 | VMode::Lloyd4)
+}
+
+/// An FWHT K override of the Q8/default mode has no certified gfx1151 VMM path.
+fn qwen35_gfx1151_fwht_k_override(
+    gpu_arch: &str,
+    arch_id: u32,
+    mode_raw: &str,
+    k_raw: Option<&str>,
+) -> bool {
+    gpu_arch == "gfx1151"
+        && matches!(arch_id, 5 | 6)
+        && matches!(mode_raw.trim(), "" | "auto" | "q8")
+        && k_raw.is_some_and(|raw| {
+            matches!(
+                hipfire_runtime::kv_mode::parse_qwen_k_name(raw),
+                Ok(KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4)
+            )
+        })
 }
 
 #[derive(Clone, Copy)]
@@ -122,7 +207,6 @@ pub struct SourceAdmissionOptions {
     pub pflash: bool,
 }
 
-
 /// Return whether a per-load adaptive-KV value requests the active controller.
 /// The CLI schema default is `Some("off")`, which must remain ordinary AR.
 /// Empty values are also inactive because daemon normalization drops them.
@@ -135,15 +219,24 @@ pub fn qwen4_kv_adaptive_requested(value: Option<&str>) -> bool {
 /// and `Some(false)` keeps AR. The retained Redline default (a `.mq4r` name)
 /// owns the load instead: its tape is the single-row AR forward, which no MTP
 /// window runs, so `auto` stays AR there and an explicit `Some(true)` refuses.
+/// Under expert parallelism (`ep` > 1) the head is attached only on an explicit
+/// request: `Some(true)` admits it (the drafter is replicated on every rank),
+/// while `auto` (`None`) and `Some(false)` stay AR, so the EP default and
+/// flag-off bytes are unchanged.
 pub(crate) fn qwen4_native_mtp(
     spec: SpecLoadCfg,
     gpu_arch: &str,
     path: &str,
     pp: usize,
     tp: usize,
+    ep: usize,
 ) -> Result<bool, String> {
-    let retained =
-        hipfire_runtime::config::retained_redline_default(gpu_arch, "qwen4", path, pp, tp, true);
+    if ep > 1 {
+        return Ok(spec.mtp == Some(true));
+    }
+    let retained = hipfire_runtime::config::retained_redline_default(
+        gpu_arch, "qwen4", path, pp, tp, ep, true,
+    );
     match spec.mtp {
         Some(false) => Ok(false),
         Some(true) if retained => Err(
@@ -155,19 +248,181 @@ pub(crate) fn qwen4_native_mtp(
     }
 }
 
+/// Native MTP once the profile is known: the head exists only where the
+/// profile declares one (`config.mtp`).  `auto` turns off for a head-free
+/// profile; an explicit `speculation.mtp = "on"` (`--spec mtp`) is refused
+/// rather than guessed, before any allocation.  A profile with the head keeps
+/// the policy decision [`qwen4_native_mtp`] made.
+pub(crate) fn qwen4_native_mtp_for_head(
+    native_mtp: bool,
+    spec_mtp: Option<bool>,
+    has_mtp_head: bool,
+    profile: &str,
+) -> Result<bool, String> {
+    match (has_mtp_head, spec_mtp) {
+        (true, _) => Ok(native_mtp),
+        (false, Some(true)) => Err(format!(
+            "qwen4: native MTP (--spec mtp) was requested, but profile {profile} has no MTP head; \
+             load a profile with an MTP head or leave speculation.mtp unset"
+        )),
+        (false, _) => Ok(false),
+    }
+}
+
+/// Sidecar PLE rows (`memory.ple_format`), the hot-row store
+/// (`memory.ple_hot_store_bytes`), the prewarm and the rank table are
+/// Flash-Next-only: a developer profile reads its embedded rows directly.  An
+/// explicit request for any of them on a developer profile is refused before
+/// allocation; `auto` is skipped, with the returned note for the load log.
+/// Flash-Next never reaches either arm.
+pub(crate) fn qwen4_developer_ple_policy(
+    flash_next: bool,
+    id: &str,
+    format: hipfire_config::memory::PleFormatRequest,
+    hot_store: hipfire_config::memory::PleHotStoreBudget,
+) -> Result<Option<String>, String> {
+    use hipfire_config::memory::{PleFormatRequest, PleHotStoreBudget};
+    if flash_next {
+        return Ok(None);
+    }
+    if format != PleFormatRequest::Auto {
+        return Err(format!(
+            "qwen4: memory.ple_format = {format:?} requests PLE sidecar rows, which are Flash-Next-only; \
+             developer profile {id} reads its embedded PLE rows (unset memory.ple_format)"
+        ));
+    }
+    match hot_store {
+        PleHotStoreBudget::Bytes(0) => Ok(None),
+        PleHotStoreBudget::Bytes(bytes) => Err(format!(
+            "qwen4: memory.ple_hot_store_bytes = {bytes} requests the PLE hot-row store, which is Flash-Next-only; \
+             developer profile {id} reads its embedded PLE rows (set it to 0)"
+        )),
+        PleHotStoreBudget::Auto => Ok(Some(format!(
+            "ple hot store and sidecar prewarm: off (developer profile {id} reads its embedded PLE rows)"
+        ))),
+    }
+}
+
 /// Whether an admitted Qwen4 native MTP head stays attached once
 /// `host_mapped_experts` routed-expert tensors were placed in pinned host RAM
-/// (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`). Greedy MTP over host-mapped experts
-/// gains little (gfx1201 N=12: 1.08x median AR, slower on low-tau prompts) and
-/// its text differs from AR on 4/8 prompts, so `auto` keeps AR there and only
-/// an explicit `speculation.mtp = "on"` (`--spec mtp`) attaches the head.
-/// Device-resident loads (Strix Halo: MTP text = AR on 8/8, 1.41x) keep the
-/// `auto` default on.
+/// (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`). Device-resident loads (Strix Halo:
+/// MTP text = AR on 8/8, 1.41x) and exact gfx1201 (R9700, `auto` placement:
+/// greedy MTP text = AR on 8/8 prompts, faster on every one) keep the `auto`
+/// default on; other arches with host-mapped experts are unmeasured, so
+/// `auto` keeps AR there and only an explicit `speculation.mtp = "on"`
+/// (`--spec mtp`) attaches the head. `speculation.mtp = "off"` always keeps
+/// AR (the admitted head is never attached then).
+///
+/// Thin twin over the shared [`hipfire_config::mtp_host_spill_policy`]: the
+/// qwen4 admitted list is `&["gfx1201"]` (the arch clause is data, not a
+/// second function). Kept so the two policy call sites in `carriers.rs` keep
+/// their typed-`SpecLoadCfg` spelling.
 pub(crate) fn qwen4_mtp_with_host_mapped_experts(
     spec: SpecLoadCfg,
+    gpu_arch: &str,
     host_mapped_experts: usize,
 ) -> bool {
-    host_mapped_experts == 0 || spec.mtp == Some(true)
+    let mode = match spec.mtp {
+        Some(true) => hipfire_config::MtpMode::On,
+        Some(false) => hipfire_config::MtpMode::Off,
+        None => hipfire_config::MtpMode::Auto,
+    };
+    hipfire_config::mtp_host_spill_policy(mode, host_mapped_experts, gpu_arch, &["gfx1201"]).attach
+}
+
+/// Fail-closed list for partial GPU offload, raised where the arch is dispatched.
+///
+/// An arch that never reaches the placement resolver must still be refused rather
+/// than handed a resident load: "arch crates are typed declarations and the loader
+/// owns placement" is only enforceable if an arch that cannot honour a placement
+/// never quietly receives one. Returns `Err` naming the offending key and the
+/// reason; `Ok(())` when no spill was requested or the source can honour it.
+///
+/// The trigger stays here — an *explicitly configured* spill (either budget key
+/// off `Full`) is refused on an unsupported path (`spill_requested`, so the
+/// MoE auto-fit default never trips this gate) — but every refusal dimension
+/// is `hipfire_config::memory::spill_support`'s, mapped below to the existing
+/// sentences. Wording is verbatim; only the derivation is shared.
+pub(crate) fn partial_offload_refusal(
+    arch_id: u32,
+    source: &ModelSource,
+    tp: usize,
+    pp: usize,
+    ep_experts: Option<usize>,
+) -> Result<(), String> {
+    use hipfire_config::memory::{spill_requested, spill_support, SpillSupport};
+    if !spill_requested() {
+        return Ok(());
+    }
+    let keys = "memory.gpu_layer_budget / memory.moe_expert_budget";
+    // Facts the predicate owns: the loader's topology counts, the EP expert
+    // count, and the model flags from the source — the tower tensor probe and
+    // the parsed Qwen3.5 config (paged/REAP). Tower *tensor* presence decides
+    // text-vs-VL, never config metadata (`config.is_vl_text` is the
+    // nested-name text wrapper, which a plain text checkpoint carries too), so
+    // ask the same probe the admission record uses.
+    let ModelSource::Hfq(hfq) = source else {
+        return match spill_support(arch_id, tp, pp, ep_experts, false, false, false) {
+            SpillSupport::Supported => Ok(()),
+            SpillSupport::Refused(refusal) => Err(spill_refusal_message(refusal, keys)),
+        };
+    };
+    let is_vl = probe_vision(source, arch_id)?;
+    let (paged_experts, reap_keep) = if matches!(arch_id, 5 | 6) {
+        let config = hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
+            .map_err(|e| format!("qwen35 config: {e}"))?;
+        (config.paged_experts, config.reap_keep.is_some())
+    } else {
+        (false, false)
+    };
+    match spill_support(arch_id, tp, pp, ep_experts, paged_experts, reap_keep, is_vl) {
+        SpillSupport::Supported => Ok(()),
+        SpillSupport::Refused(refusal) => Err(spill_refusal_message(refusal, keys)),
+    }
+}
+
+/// The loader gate's sentences for each `SpillRefusal` dimension — verbatim
+/// from the hand-written checks this replaced (`{keys}` is the two budget
+/// keys; non-arch arms interpolate their own count).
+fn spill_refusal_message(refusal: hipfire_config::memory::SpillRefusal, keys: &str) -> String {
+    use hipfire_config::memory::SpillRefusal::*;
+    match refusal {
+        // Only the Qwen3.5 storage seam places a layer or a routed expert in host
+        // RAM. Qwen4 has its own expert-residency route and the other arches have
+        // none, so either knob is a request this loader cannot honour.
+        Arch(arch_id) => format!(
+            "load refused: partial GPU offload ({keys}) is implemented for Qwen3.5 dense and MoE \
+             only; this source is arch id {arch_id}. Unset both keys for this model"
+        ),
+        Tp(tp) => format!(
+            "load refused: partial GPU offload ({keys}) supports the single-GPU topology only; \
+             tp={tp} loads every layer on every rank and never places one in host RAM. Unset both \
+             keys for this model"
+        ),
+        Pp(pp) => format!(
+            "load refused: partial GPU offload ({keys}) supports the single-GPU topology only; \
+             pp={pp} would place the first pipeline band's spilled weights in host RAM mapped by \
+             device 0, which has never been run. Unset both keys for this model"
+        ),
+        ExpertParallel(_) => format!(
+            "load refused: partial GPU offload ({keys}) cannot be combined with expert parallelism \
+             — an expert is pinned to one rank and its weights stay on that rank's device. Unset \
+             both keys for this model"
+        ),
+        VisionTower => format!(
+            "load refused: partial GPU offload ({keys}) cannot place the Qwen3.5-VL vision tower, \
+             which loads through its own lowered loader. Unset both keys for this model"
+        ),
+        PagedExperts => format!(
+            "load refused: partial GPU offload ({keys}) cannot be combined with paged experts — \
+             the weight pager owns those buffers and would move them behind the placement's back. \
+             Unset both keys for this model"
+        ),
+        ReapKeepMap => format!(
+            "load refused: partial GPU offload ({keys}) cannot be combined with a REAP keep-map — \
+             the pruned expert load has no host-placement path. Unset both keys for this model"
+        ),
+    }
 }
 
 /// The source-only portion of Qwen4 admission. The validated config and
@@ -201,14 +456,307 @@ pub fn qwen4_request_admission(
     if native_mtp && !capabilities.native_mtp {
         return Err("qwen4: native MTP is not supported by this source".into());
     }
-    if !effective_mesh.is_single() {
+    if !effective_mesh.is_qwen4_admitted() {
         return Err(format!(
-            "qwen4: only Single topology is admitted (pp={}, tp={}, ep={})",
+            "qwen4: only pp=1, tp=1 with expert-parallel ep in {{1, 2, 4}} is admitted (pp={}, tp={}, ep={})",
             effective_mesh.pp, effective_mesh.tp, effective_mesh.ep
         ));
     }
     Ok(())
 }
+
+/// Qwen4 expert parallelism needs exact gfx1201 cards (the EP gather and the
+/// grouped MoE route are certified there) and one visible device per rank.
+/// Pre-allocation check from what admission already knows: the daemon's own
+/// device architecture and the visible device count (`None` skips the count,
+/// as in [`visible_device_count`]). `ep <= 1` never refuses. Per-device
+/// architectures and peer access are checked with real devices by
+/// [`qwen4_ep_preflight`] at load.
+pub(crate) fn qwen4_ep_geometry_refusal(
+    ep: usize,
+    pp: usize,
+    tp: usize,
+    gpu_arch: &str,
+    n_devices: Option<usize>,
+) -> Option<String> {
+    if ep <= 1 {
+        return None;
+    }
+    if pp != 1 || tp != 1 {
+        return Some(format!(
+            "qwen4: expert parallelism (topology.ep = {ep}) cannot combine with pipeline/tensor parallelism (pp={pp}, tp={tp})"
+        ));
+    }
+    if gpu_arch != "gfx1201" {
+        return Some(format!(
+            "qwen4: expert parallelism (topology.ep = {ep}) requires gfx1201 on every rank; device 0 is {gpu_arch}"
+        ));
+    }
+    match n_devices {
+        Some(n) if n < ep => Some(format!(
+            "qwen4: expert parallelism (topology.ep = {ep}) needs {ep} visible devices, {n} visible \
+             (hardware.devices / HIPFIRE_DEVICES)"
+        )),
+        _ => None,
+    }
+}
+
+/// Pure core of [`qwen4_ep_preflight`]: `archs[r]` is rank `r`'s device
+/// architecture; `peer(a, b)` is whether device `a` can access device `b`.
+/// Every rank must be gfx1201 and every directed pair must be accessible.
+pub fn qwen4_ep_device_refusal(
+    ep: usize,
+    archs: &[String],
+    mut peer: impl FnMut(usize, usize) -> Result<bool, String>,
+) -> Result<(), String> {
+    if archs.len() < ep {
+        return Err(format!(
+            "qwen4: expert parallelism (topology.ep = {ep}) needs {ep} visible devices, {} visible",
+            archs.len()
+        ));
+    }
+    for (rank, arch) in archs.iter().take(ep).enumerate() {
+        if arch != "gfx1201" {
+            return Err(format!(
+                "qwen4: expert parallelism (topology.ep = {ep}) requires gfx1201 on every rank; rank {rank} is {arch}"
+            ));
+        }
+    }
+    for from in 0..ep {
+        for to in 0..ep {
+            if from != to && !peer(from, to)? {
+                return Err(format!(
+                    "qwen4: expert parallelism (topology.ep = {ep}) needs peer access between every pair of ranks; \
+                     device {from} cannot access device {to}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Load-time EP device check with real devices: devices `0..ep` of this
+/// process's HIP view (the `hardware.devices` order) must be visible, all
+/// gfx1201, and every directed pair must report `hipDeviceCanAccessPeer`.
+/// Returns the rank → HIP device id table (`rank r` runs on device `r`).
+pub fn qwen4_ep_preflight(hip: &hip_bridge::HipRuntime, ep: usize) -> Result<Vec<i32>, String> {
+    let count = hip
+        .device_count()
+        .map_err(|error| format!("qwen4: EP device count: {error}"))?
+        .max(0) as usize;
+    let archs = (0..count.min(ep))
+        .map(|device| {
+            hip.get_arch(device as i32)
+                .map(|arch| arch.split(':').next().unwrap_or("").to_string())
+                .map_err(|error| format!("qwen4: EP device {device} arch: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    qwen4_ep_device_refusal(ep, &archs, |from, to| {
+        hip.can_access_peer(from as i32, to as i32)
+            .map_err(|error| format!("qwen4: EP peer query {from}->{to}: {error}"))
+    })?;
+    Ok((0..ep as i32).collect())
+}
+
+/// The expert-parallel degree a loaded model of `arch_id` runs with: `1`
+/// everywhere except Qwen4 with `topology.ep` > 1 (and no `HIPFIRE_QWEN4_EP=0`
+/// kill switch). An invalid configured value was refused at admission, so it
+/// reads as `1` here.
+pub fn effective_ep(arch_id: u32) -> usize {
+    if arch_id == QWEN4_ARCH_ID {
+        hipfire_config::topology::qwen4_ep().unwrap_or(1)
+    } else {
+        1
+    }
+}
+
+/// Device memory a Qwen4 load keeps free beyond the growth it can name
+/// (context pages, gather workspace, native MTP request buffers): the
+/// first long request's other lazy allocations (measured ~1.9 GiB on Strix
+/// Halo with 8192-row chunks), kernel-cache warmup and VMM page rounding.
+pub const QWEN4_MEMORY_HEADROOM_BYTES: u64 = 2 << 30;
+
+/// Smallest context an automatic Qwen4 load accepts.
+const QWEN4_MIN_AUTO_CONTEXT: usize = 4096;
+
+/// What a Qwen4 load admits of the device memory left free after its own
+/// allocations ([`qwen4_memory_admission`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Qwen4MemoryAdmission {
+    /// Free device memory once the load's own allocations are made.
+    pub free: u64,
+    /// Target and MTP-head QSA context arenas still unmapped through
+    /// `max_seq` (VMM storage maps them as forwards reach them).
+    pub context_growth: u64,
+    /// Gathered QSA prefill workspace still uncommitted through `max_seq`.
+    pub gather_growth: u64,
+    /// Buffers the first native MTP request allocates and keeps.
+    pub mtp_request: u64,
+    pub headroom: u64,
+    /// Largest context whose growth fits (at most the assembled capacity).
+    pub card_cap: usize,
+    /// The admitted context.
+    pub max_seq: usize,
+}
+
+impl Qwen4MemoryAdmission {
+    /// Everything a request through `max_seq` still commits after load.
+    pub fn growth(&self) -> u64 {
+        self.context_growth
+            .saturating_add(self.gather_growth)
+            .saturating_add(self.mtp_request)
+    }
+}
+
+/// Admit what a Qwen4 load commits after load against the `free` device
+/// memory its own allocations left, keeping `headroom` free: VMM context
+/// pages and the gathered workspace through a context of `t` tokens
+/// (`growth(t)` = `(context, gather)`, monotone, assembled for `capacity`
+/// tokens) and the native MTP request buffers. `card_cap` is the largest
+/// context that fits. An automatic load (`requested` = `None`) admits
+/// `min(capacity, card_cap)`; an explicit `max_seq` must fit whole. The
+/// session cache is not charged: its snapshots yield to context growth.
+pub fn qwen4_memory_admission(
+    capacity: usize,
+    requested: Option<usize>,
+    free: u64,
+    mtp_request: u64,
+    headroom: u64,
+    growth: impl Fn(usize) -> (u64, u64),
+) -> Result<Qwen4MemoryAdmission, String> {
+    const MIB: u64 = 1 << 20;
+    let fixed = mtp_request.saturating_add(headroom);
+    let fits = |tokens: usize| {
+        let (context, gather) = growth(tokens);
+        context.saturating_add(gather).saturating_add(fixed) <= free
+    };
+    let card_cap = if !fits(0) {
+        0
+    } else {
+        // Largest fitting context in [0, capacity].
+        let (mut lo, mut hi) = (0usize, capacity);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            if fits(mid) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        lo
+    };
+    let max_seq = requested.unwrap_or(capacity.min(card_cap));
+    let (context_growth, gather_growth) = growth(max_seq);
+    let admission = Qwen4MemoryAdmission {
+        free,
+        context_growth,
+        gather_growth,
+        mtp_request,
+        headroom,
+        card_cap,
+        max_seq,
+    };
+    let detail = || {
+        format!(
+            "a {max_seq}-token context commits {} MiB after load ({} MiB QSA context + {} MiB QSA gather workspace + {} MiB native MTP request buffers) plus {} MiB headroom, and {} MiB is free after load",
+            admission.growth() / MIB,
+            context_growth / MIB,
+            gather_growth / MIB,
+            mtp_request / MIB,
+            headroom / MIB,
+            free / MIB
+        )
+    };
+    match requested {
+        None if max_seq < QWEN4_MIN_AUTO_CONTEXT.min(capacity) => Err(format!(
+            "qwen4: device memory cannot hold an automatic context: {}; free device memory",
+            detail()
+        )),
+        Some(requested) if requested > card_cap => Err(format!(
+            "qwen4: max_seq {requested} does not fit device memory: {}; lower memory.max_seq to at most {card_cap} or omit it",
+            detail()
+        )),
+        _ => Ok(admission),
+    }
+}
+
+/// Whether `hfq` carries the Qwen4 PLE n-gram table in either form: the 128
+/// shard tensors (monolithic) or the split-base marker.  Anything else is no
+/// PLE-bearing base at all and keeps failing in the artifact admission with
+/// its own inventory/config diagnostic instead of a PLE-rows one.
+fn qwen4_ple_rows_layout_present(hfq: &hipfire_runtime::hfq::HfqFile) -> bool {
+    hfq.ple_rows_marker().is_some()
+        || hfq
+            .tensors()
+            .iter()
+            .any(|tensor| hipfire_arch_qwen4::weights::is_ple_shard_name(&tensor.name))
+}
+
+/// Stderr progress of a PLE derive: one line per phase and per ~5% step, so a
+/// minutes-long derivation of the q4 rows is visible without flooding the log.
+pub fn ple_progress_printer() -> impl FnMut(&hipfire_runtime::ple_convert::PleProgress) + Send {
+    let mut last: Option<(&'static str, u64)> = None;
+    move |progress| {
+        let percent = match progress.total_bytes {
+            0 => 100,
+            total => progress.done_bytes.min(total).saturating_mul(100) / total,
+        };
+        let step = percent / 5 * 5;
+        if last == Some((progress.phase, step)) {
+            return;
+        }
+        last = Some((progress.phase, step));
+        eprintln!(
+            "  qwen4 ple {}: {percent}% ({:.1} of {:.1} GB)",
+            progress.phase,
+            progress.done_bytes as f64 / 1e9,
+            progress.total_bytes as f64 / 1e9
+        );
+    }
+}
+
+/// Resolve and attach the Qwen4 PLE rows source (`memory.ple_format`) on an
+/// opened HFQ source, deriving the q4 rows when they are missing and the
+/// request allows it.  Idempotent; a no-op for non-HFQ sources and for a
+/// source that is not a PLE-bearing Qwen4 base.  Returns the choice for the
+/// load log (`None` when nothing was resolved).
+pub fn resolve_qwen4_ple_rows(
+    source: &mut ModelSource,
+    path: &str,
+    gpu_arch: &str,
+) -> Result<Option<hipfire_runtime::ple_sidecar::PleRowsChoice>, String> {
+    let ModelSource::Hfq(hfq) = source else {
+        return Ok(None);
+    };
+    resolve_qwen4_ple_rows_hfq(hfq, path, gpu_arch)
+}
+
+/// [`resolve_qwen4_ple_rows`] on an opened HFQ file.  A base without the
+/// Flash-Next PLE layout (a developer profile's embedded rows, or a profile
+/// without PLE) has no sidecar to resolve and yields `None`.
+pub fn resolve_qwen4_ple_rows_hfq(
+    hfq: &mut hipfire_runtime::hfq::HfqFile,
+    path: &str,
+    gpu_arch: &str,
+) -> Result<Option<hipfire_runtime::ple_sidecar::PleRowsChoice>, String> {
+    if !qwen4_ple_rows_layout_present(hfq) {
+        return Ok(None);
+    }
+    let mut progress = ple_progress_printer();
+    hipfire_runtime::ple_sidecar::resolve_and_attach_ple_rows(
+        hfq,
+        std::path::Path::new(path),
+        hipfire_config::memory::ple_format(),
+        gpu_arch,
+        hipfire_runtime::ple_sidecar::ResolvePolicy {
+            derive_missing_q4: true,
+            progress: Some(&mut progress),
+        },
+    )
+    .map(Some)
+    .map_err(|error| format!("qwen4: PLE rows: {error}"))
+}
+
 /// Validate a reserved arch-16 HFQM source without allocating weights.
 ///
 /// The architecture crate owns the complete source/index contract.  Loader
@@ -219,6 +767,7 @@ pub fn admit_qwen4_source(
     effective_mesh: hipfire_arch_qwen4::EffectiveMesh,
     modality: InputModality,
     native_mtp: bool,
+    spec_mtp: Option<bool>,
 ) -> Result<Qwen4SourceAdmission, String> {
     qwen4_request_admission(effective_mesh, modality, native_mtp)?;
     let ModelSource::Hfq(hfq) = source else {
@@ -228,6 +777,25 @@ pub fn admit_qwen4_source(
     };
     let receipt =
         hipfire_arch_qwen4::admit_hfqm_artifact(hfq).map_err(|error| error.to_string())?;
+    // An inventory-valid developer profile the executor cannot run (a
+    // synthetic MoE, a RoPE base the QSA kernels lack, a build without
+    // `qwen4-dev-profiles`) is refused here, not after the weights upload.
+    hipfire_arch_qwen4::bundle::admit_executable_profile(&receipt.config)
+        .map_err(|error| format!("qwen4: {error}"))?;
+    // The profile is known now: the head-free and developer-PLE refusals
+    // happen here, before any weight is allocated or any model torn down.
+    let native_mtp = qwen4_native_mtp_for_head(
+        native_mtp,
+        spec_mtp,
+        receipt.config.mtp.is_some(),
+        receipt.config.profile.id(),
+    )?;
+    qwen4_developer_ple_policy(
+        receipt.config.profile.is_flash_next(),
+        receipt.config.profile.id(),
+        hipfire_config::memory::ple_format(),
+        hipfire_config::memory::ple_hot_store_bytes(),
+    )?;
     Ok(Qwen4SourceAdmission {
         config: receipt.config,
         effective_mesh,
@@ -259,6 +827,9 @@ pub struct SourceAdmission {
     pub sequence_reason: Option<&'static str>,
     pub kv_backend_request: KvBackendRequest,
     pub qwen_default_q8: bool,
+    /// Effective V axis ([`resolve_kv_v`]); the loader hands exactly this to
+    /// the carrier.
+    pub kv_v: Option<String>,
     /// The resolved carrier (single/pp path). `None` for expert-parallel, which
     /// dispatches on `arch_id` directly rather than through the registry.
     pub carrier: Option<&'static dyn Carrier>,
@@ -862,7 +1433,30 @@ pub fn admit_source_with_options(
     let arch_id = source
         .arch_id()
         .ok_or_else(|| format!("unrecognized source: {}", source.describe()))?;
+    let kv_v = resolve_kv_v(hints.kv_v, arch_id, tp);
+    let hints = KvBackendHints {
+        kv_v: kv_v.as_deref(),
+        ..hints
+    };
     let is_dir = source.is_dir();
+
+    // Refuse before backend selection or sequence budgeting, even without VMM
+    // runtime/platform support; only an explicit legacy request opts out.
+    if request != KvBackendRequest::Explicit(KvBackend::Legacy)
+        && qwen35_gfx1151_fwht_k_override(
+            gpu_arch,
+            arch_id,
+            hints
+                .kv_mode
+                .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.as_str()),
+            hints.kv_k,
+        )
+    {
+        return Err(
+            "Qwen KV admission: no certified gfx1151 VMM FWHT path for the kv_k override; use --kv-backend legacy"
+                .into(),
+        );
+    }
 
     // FLUX/Klein need gfx11 wave32 WMMA (the trunk GEMM and vtk/v2 use the
     // gfx11 WMMA intrinsic hipcc rejects on gfx12). Refuse here — before the
@@ -870,15 +1464,30 @@ pub fn admit_source_with_options(
     if let Some(refusal) = flux_arch_refusal(arch_id, gpu_arch) {
         return Err(refusal);
     }
-    // An omitted (automatic) Qwen4 request gets the default context; explicit
-    // values are checked against QWEN4_MAX_CONTEXT below.
-    let max_seq = if arch_id == QWEN4_ARCH_ID && max_seq == 0 {
+    // Weight-host v1 (HIPFIRE_WEIGHT_HOST=1) imports only a dense Qwen3.5 HFQ
+    // (arch 5) on one device; anything else would be a private load, which
+    // the opt-in forbids. Refused before teardown, so the prior model stays.
+    if hipfire_arch_qwen35::carrier::weight_host_socket()?
+        .is_some()
+        && (arch_id != 5 || is_dir || tp != 1 || pp != 1)
+    {
+        return Err(format!(
+            "HIPFIRE_WEIGHT_HOST=1 supports only a single-device dense Qwen3.5 HFQ (arch 5, tp=pp=1); got arch {arch_id}{}, tp={tp}, pp={pp}",
+            if is_dir { " (directory source)" } else { "" }
+        ));
+    }
+    // Qwen4 sequence on a unified-memory APU: an omitted max_seq is automatic
+    // (the model's context, capped by the measured card capacity at load);
+    // explicit values are honored within the limits below. A discrete GPU
+    // keeps the default context for an omitted max_seq and no sequence.
+    let unified_memory = hipfire_config::is_unified_memory_arch(gpu_arch);
+    let max_seq = if arch_id == QWEN4_ARCH_ID && max_seq == 0 && !unified_memory {
         hipfire_arch_qwen4::QWEN4_DEFAULT_CONTEXT
     } else {
         max_seq
     };
-
     let mut qwen35_ep_experts = None;
+    let mut qwen4_sequence = None;
     let (topology, carrier) = if arch_id == QWEN4_ARCH_ID {
         // Arch 16 is an executable local-path carrier, but only after its
         // complete source-only boundary succeeds. Keep this before vision/head
@@ -889,17 +1498,51 @@ pub fn admit_source_with_options(
                 hipfire_arch_qwen4::QWEN4_MAX_CONTEXT
             ));
         }
-        hipfire_runtime::kv_mode::resolve_qwen4(hints.kv_mode.unwrap_or(""), gpu_arch)?;
-        let native_mtp = qwen4_native_mtp(options.spec, gpu_arch, path, pp, tp)?;
-        crate::carrier_for(arch_id)
-            .ok_or_else(|| "no carrier for qwen4".to_string())?
-            .admit_options(draft_path, options)?;
-        admit_qwen4_source(
+        let qwen4_kv =
+            hipfire_runtime::kv_mode::resolve_qwen4(hints.kv_mode.unwrap_or(""), gpu_arch)?;
+        // Expert-parallel degree: `topology.ep`, forced to 1 by the
+        // `HIPFIRE_QWEN4_EP=0` kill switch. Resolved once, before any
+        // teardown, and re-resolved identically by the carrier at load.
+        let ep = hipfire_config::topology::qwen4_ep()?;
+        let native_mtp = qwen4_native_mtp(options.spec, gpu_arch, path, pp, tp, ep)?;
+        let spec_mtp = options.spec.mtp;
+        let carrier = crate::carrier_for(arch_id).ok_or_else(|| "no carrier for qwen4".to_string())?;
+        crate::carriers::qwen4_ep_option_refusal(ep, draft_path, &options)?;
+        carrier.admit_options(draft_path, options)?;
+        if let Some(refusal) = qwen4_ep_geometry_refusal(ep, pp, tp, gpu_arch, visible_device_count()) {
+            return Err(refusal);
+        }
+        // The PLE rows source is chosen (and a missing q4 derived from the
+        // q8 rows or the embedded shards) here, before the resident model is
+        // torn down: a refusal (missing sidecar, binding mismatch, no space)
+        // leaves the loaded model in place.  The attached sidecar travels
+        // with `source` to the carrier.
+        resolve_qwen4_ple_rows(&mut source, path, gpu_arch)?;
+        let admitted = admit_qwen4_source(
             &source,
-            hipfire_arch_qwen4::EffectiveMesh::new(pp, tp, 1),
+            hipfire_arch_qwen4::EffectiveMesh::new(pp, tp, ep),
             InputModality::Text,
             native_mtp,
+            spec_mtp,
         )?;
+        // Native positions, or the YaRN-extended `factor x original` context.
+        let positions = admitted.config.context_limit();
+        if max_seq > positions {
+            return Err(format!(
+                "qwen4: max_seq {max_seq} exceeds the model's RoPE context {positions} \
+                 (max_position_embeddings, or YaRN factor x original; see attention.yarn_factor)"
+            ));
+        }
+        let model_ctx = positions.min(hipfire_arch_qwen4::QWEN4_MAX_CONTEXT);
+        if unified_memory {
+            qwen4_sequence = Some(SequenceResolution {
+                max_seq: if max_seq == 0 { model_ctx } else { max_seq },
+                bound: if max_seq == 0 { "pending" } else { "user" },
+                model_ctx,
+                card_cap: 0,
+                kv_mode: hipfire_runtime::kv_mode::qwen_k_display_name(qwen4_kv.mode),
+            });
+        }
         (EffectiveTopology::Single, Some(resolve_carrier(&source)?))
     } else if tp > 1 {
         // Expert-parallel admission (HFQ-only). Mirrors
@@ -975,43 +1618,36 @@ pub fn admit_source_with_options(
         };
         (topology, Some(carrier))
     };
-    // Partial GPU offload (#793): only the single-GPU dense Qwen3.5 loader
-    // places layers in host RAM. Refuse a budget that would spill under tp>1,
-    // pp>1 or on a MoE model before any teardown. Unset budget: no parse.
-    if matches!(arch_id, 5 | 6)
-        && hipfire_config::memory::gpu_layer_budget()
-            != hipfire_config::memory::GpuLayerBudget::Full
-    {
-        if let ModelSource::Hfq(hfq) = &source {
-            let config = hipfire_arch_qwen35::qwen35::config_from_hfq(hfq)
-                .map_err(|e| format!("qwen35 config: {e}"))?;
-            if let Some(refusal) =
-                hipfire_arch_qwen35::qwen35::offload_topology_refusal(&config, tp, pp)
-            {
-                return Err(refusal);
-            }
-        }
-    }
+    // Partial GPU offload: fail closed where the arch is dispatched, before any
+    // teardown, so a source that cannot honour a configured spill never receives
+    // a resident load.
+    partial_offload_refusal(arch_id, &source, tp, pp, qwen35_ep_experts)?;
     let heterogeneous_reason = hints.deepseek4_heterogeneous && arch_id == 9;
-    let unsupported = if heterogeneous_reason {
+    // Qwen4 owns its own VMM QSA layout and certification (gfx1151/gfx1201), so
+    // its capability replaces the Qwen/KvCache predicates below; its
+    // topology is Single by the refusals above.
+    let unsupported = if arch_id == QWEN4_ARCH_ID {
+        hipfire_arch_qwen4::qwen4_vmm_refusal(gpu_arch, hints.vmm_runtime_available)
+    } else if heterogeneous_reason {
         Some(
             "heterogeneous DeepSeek compressor owner uses a dense gfx1100 cache with no VMM layout"
                 .to_string(),
         )
     } else if !hints.vmm_runtime_available {
         Some("HIP VMM symbols/granularity unavailable".to_string())
-    } else if cfg!(windows) {
-        Some("Windows VMM mapping/graph semantics are not certified".to_string())
+    } else if let Some(reason) = hipfire_config::devices::vmm_kv_platform_refusal() {
+        Some(reason)
     } else if gpu_arch != "gfx1201"
-        && !(matches!(gpu_arch, "gfx1100" | "gfx1151")
-            && matches!(arch_id, 5 | 6)
-            && matches!(
-                hints
-                    .kv_mode
-                    .unwrap_or(hipfire_runtime::config::get().kv_mode.as_str())
-                    .trim(),
-                "" | "auto" | "q8"
-            ))
+        && !qwen35_gfx11_vmm_supported(
+            gpu_arch,
+            arch_id,
+            tp,
+            hints
+                .kv_mode
+                .unwrap_or(hipfire_runtime::config::get().kv_mode.as_str()),
+            hints.kv_k,
+            hints.kv_v,
+        )
     {
         Some(format!(
             "device {gpu_arch} has no certified VMM KV path for the selected mode"
@@ -1080,6 +1716,16 @@ pub fn admit_source_with_options(
         && (hints.free_vram_bytes.is_some() || max_seq == 0)
     {
         Some(resolve_sequence(&source, max_seq, gpu_arch, hints)?)
+    } else if let Some(sequence) = qwen4_sequence {
+        // Automatic Qwen4 context grows VMM pages on demand; legacy storage
+        // would allocate all of it at load.
+        if sequence.bound == "pending" && kv_backend != KvBackend::Vmm {
+            return Err(format!(
+                "qwen4: automatic max_seq needs the VMM KV backend ({}); set memory.max_seq for legacy storage",
+                kv_backend_reason.as_deref().unwrap_or("legacy requested")
+            ));
+        }
+        Some(sequence)
     } else {
         None
     };
@@ -1127,12 +1773,6 @@ pub fn admit_source_with_options(
                      reload without a draft or use an MQ4/HFQ4/Q8 target"
                 ));
             }
-        }
-        // Gemma 4 lowered min-context: refuse before teardown/alloc so a
-        // small max_seq leaves the prior model serving. Eager stays exempt.
-        if matches!(arch_id, 13 | 22) {
-            let use_lowered = hipfire_arch_gemma4::gemma4_source_uses_lowered(hfq, false);
-            hipfire_arch_gemma4::gemma4_context_admission(effective_seq, use_lowered)?;
         }
     }
     // Head overlay (`params.head`): validated AND attached to the retained
@@ -1202,6 +1842,39 @@ pub fn admit_source_with_options(
             hints.qwen_default_q8,
         )
         .map_err(|e| format!("Qwen KV admission: {e}"))?;
+        if let Some(cfg) = qwen_cfg.as_ref() {
+            use hipfire_dispatch::families::attention::{
+                gfx1100_split_verify_min_ctx, Gfx1100SplitVerifyModel,
+            };
+            let flags = rdna_compute::FeatureFlags::from_active_config(gpu_arch);
+            let min_ctx = hipfire_config::developer_var("HIPFIRE_FA_PERTOKEN_MIN_CTX")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(4_096);
+            let split_envelope = gfx1100_split_verify_min_ctx(&Gfx1100SplitVerifyModel {
+                arch: gpu_arch,
+                verify_attn: flags.verify_attn,
+                split_verify: flags.gfx1100_fa2_split_verify,
+                num_experts: cfg.num_experts,
+                n_heads: cfg.n_heads,
+                n_kv_heads: cfg.n_kv_heads,
+                head_dim: cfg.head_dim,
+                resolved_min_ctx: (min_ctx > 0).then_some(min_ctx),
+            })
+            .is_some();
+            // All source/topology owners pass this boundary, including PP,
+            // dense TP and directory sources that bypass the HFQ carrier.
+            hipfire_arch_qwen35::carrier::validate_gfx1100_split_verify_kv(
+                split_envelope,
+                !adaptive
+                    && matches!(
+                        pair,
+                        kv_mode::KvPair::Native(KvMode::Q8)
+                            | kv_mode::KvPair::Split(KvMode::Q8, kv_mode::VMode::Q8)
+                    ),
+                kv_backend,
+            )?;
+        }
         let k = pair.k();
         if (pp > 1 || tp > 1) && pair.v().is_some_and(|v| v != kv_mode::VMode::Q8) {
             return Err(format!(
@@ -1276,6 +1949,7 @@ pub fn admit_source_with_options(
         sequence_reason,
         kv_backend_request: request,
         qwen_default_q8: hints.qwen_default_q8,
+        kv_v,
         carrier,
         vision_path,
         vision_mode: vision_mode.to_string(),
@@ -1285,6 +1959,120 @@ pub fn admit_source_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gfx1100_qwen35_vmm_admits_fwht_split_matrix_only_on_tp1() {
+        for mode in [
+            "fwht2", "fwht3", "fwht4", "asym2", "asym3", "asym4", "turbo", "turbo2",
+            "turbo3", "turbo4",
+        ] {
+            assert!(qwen35_gfx11_vmm_supported(
+                "gfx1100", 5, 1, mode, None, None
+            ));
+            assert!(qwen35_gfx11_vmm_supported(
+                "gfx1100", 6, 1, mode, None, None
+            ));
+            assert!(!qwen35_gfx11_vmm_supported(
+                "gfx1100", 5, 2, mode, None, None
+            ));
+        }
+        for k in ["fwht2", "fwht3", "fwht4"] {
+            for v in ["lloyd2", "lloyd3", "lloyd4"] {
+                assert!(qwen35_gfx11_vmm_supported(
+                    "gfx1100",
+                    5,
+                    1,
+                    k,
+                    None,
+                    Some(v)
+                ));
+            }
+        }
+        for k in ["legacy-asym2", "legacy-asym3", "legacy-asym4"] {
+            for v in ["q8", "lloyd3"] {
+                assert!(!qwen35_gfx11_vmm_supported(
+                    "gfx1100",
+                    5,
+                    1,
+                    k,
+                    None,
+                    Some(v)
+                ));
+            }
+        }
+        assert!(qwen35_gfx11_vmm_supported(
+            "gfx1100",
+            5,
+            1,
+            "q8",
+            Some("fwht3"),
+            Some("q8")
+        ));
+    }
+
+    #[test]
+    fn gfx11_qwen35_vmm_preserves_q8_matrix_and_other_refusals() {
+        for arch in ["gfx1100", "gfx1151"] {
+            for arch_id in [5, 6] {
+                assert!(qwen35_gfx11_vmm_supported(
+                    arch, arch_id, 2, "q8", None, None
+                ));
+            }
+        }
+        assert!(!qwen35_gfx11_vmm_supported(
+            "gfx1100",
+            5,
+            1,
+            "q8",
+            None,
+            Some("lloyd3")
+        ));
+        assert!(!qwen35_gfx11_vmm_supported(
+            "gfx1151", 5, 1, "fwht3", None, None
+        ));
+        assert!(!qwen35_gfx11_vmm_supported(
+            "gfx1100", 9, 1, "fwht3", None, None
+        ));
+        assert!(qwen35_gfx11_vmm_supported(
+            "gfx1100", 5, 1, "fwht4", None, None
+        ));
+    }
+
+    #[test]
+    fn gfx1151_fwht_k_override_predicate_is_scoped() {
+        let refuses = qwen35_gfx1151_fwht_k_override;
+        for mode in ["", "auto", "q8", " q8 "] {
+            for k in [
+                "fwht2", "fwht3", "fwht4", "asym2", "asym3", "asym4", "turbo2",
+                "turbo3", "turbo4", "turbo", " fwht3 ",
+            ] {
+                for arch_id in [5, 6] {
+                    assert!(refuses("gfx1151", arch_id, mode, Some(k)));
+                    for arch in ["gfx1100", "gfx1201", "gfx1030"] {
+                        assert!(!refuses(arch, arch_id, mode, Some(k)));
+                    }
+                }
+                assert!(!refuses("gfx1151", 9, mode, Some(k)));
+            }
+            for k in [
+                None,
+                Some(""),
+                Some(" "),
+                Some("q8"),
+                Some("legacy-asym2"),
+                Some("legacy-asym3"),
+                Some("legacy-asym4"),
+                Some("fwht5"),
+            ] {
+                for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+                    assert!(!refuses(arch, 5, mode, k));
+                }
+            }
+        }
+        for mode in ["fwht2", "fwht3", "fwht4", "legacy-asym3", "fp8", "bf16"] {
+            assert!(!refuses("gfx1151", 5, mode, Some("fwht3")));
+        }
+    }
     fn admit_source(
         path: &str,
         tp: usize,
@@ -1358,26 +2146,111 @@ mod tests {
             ..SpecLoadCfg::default()
         };
         let (hfq, mq4r) = ("m/qwen3.8-flash-next.mq4", "m/qwen3.8-flash-next.mq4r");
-        assert_eq!(qwen4_native_mtp(with(None), "gfx1151", hfq, 1, 1), Ok(true));
+        assert_eq!(qwen4_native_mtp(with(None), "gfx1151", hfq, 1, 1, 1), Ok(true));
         assert_eq!(
-            qwen4_native_mtp(with(Some(false)), "gfx1151", hfq, 1, 1),
+            qwen4_native_mtp(with(Some(false)), "gfx1151", hfq, 1, 1, 1),
             Ok(false)
         );
         assert_eq!(
-            qwen4_native_mtp(with(Some(true)), "gfx1151", hfq, 1, 1),
+            qwen4_native_mtp(with(Some(true)), "gfx1151", hfq, 1, 1, 1),
             Ok(true)
         );
         // A `.mq4r` load on a retained-default GPU is the retained AR route.
         assert_eq!(
-            qwen4_native_mtp(with(None), "gfx1151", mq4r, 1, 1),
+            qwen4_native_mtp(with(None), "gfx1151", mq4r, 1, 1, 1),
             Ok(false)
         );
-        assert!(qwen4_native_mtp(with(Some(true)), "gfx1151", mq4r, 1, 1).is_err());
+        assert!(qwen4_native_mtp(with(Some(true)), "gfx1151", mq4r, 1, 1, 1).is_err());
         // Off the retained-default GPUs the name does not claim the load.
         assert_eq!(
-            qwen4_native_mtp(with(None), "gfx1030", mq4r, 1, 1),
+            qwen4_native_mtp(with(None), "gfx1030", mq4r, 1, 1, 1),
             Ok(true)
         );
+        // Expert parallelism attaches the head only on an explicit `on`:
+        // `auto`/off stay AR.
+        for ep in [2, 4] {
+            assert_eq!(qwen4_native_mtp(with(None), "gfx1201", hfq, 1, 1, ep), Ok(false));
+            assert_eq!(
+                qwen4_native_mtp(with(Some(false)), "gfx1201", hfq, 1, 1, ep),
+                Ok(false)
+            );
+            assert_eq!(
+                qwen4_native_mtp(with(Some(true)), "gfx1201", hfq, 1, 1, ep),
+                Ok(true)
+            );
+        }
+    }
+
+    #[test]
+    fn qwen4_request_admission_matrix_covers_ep_pp_tp() {
+        use hipfire_arch_qwen4::EffectiveMesh;
+        let admit = |pp, tp, ep, mtp| {
+            qwen4_request_admission(EffectiveMesh::new(pp, tp, ep), InputModality::Text, mtp)
+        };
+        for ep in [1, 2, 4] {
+            assert_eq!(admit(1, 1, ep, false), Ok(()), "ep {ep}");
+        }
+        assert_eq!(admit(1, 1, 1, true), Ok(()));
+        for ep in [0, 3, 5, 8] {
+            assert!(admit(1, 1, ep, false).unwrap_err().contains("ep in {1, 2, 4}"), "ep {ep}");
+        }
+        for (pp, tp, ep) in [(2, 1, 1), (1, 2, 1), (2, 1, 2), (1, 2, 4)] {
+            assert!(admit(pp, tp, ep, false).is_err(), "pp {pp} tp {tp} ep {ep}");
+        }
+        for ep in [2, 4] {
+            assert_eq!(admit(1, 1, ep, true), Ok(()), "ep {ep}");
+        }
+    }
+
+    #[test]
+    fn qwen4_ep_geometry_refusal_names_the_missing_requirement() {
+        assert_eq!(qwen4_ep_geometry_refusal(1, 1, 1, "gfx1100", Some(1)), None);
+        assert_eq!(qwen4_ep_geometry_refusal(4, 1, 1, "gfx1201", Some(4)), None);
+        assert_eq!(qwen4_ep_geometry_refusal(2, 1, 1, "gfx1201", None), None);
+        let arch = qwen4_ep_geometry_refusal(4, 1, 1, "gfx1100", Some(4)).unwrap();
+        assert!(arch.contains("gfx1201") && arch.contains("expert parallelism"), "{arch}");
+        let count = qwen4_ep_geometry_refusal(4, 1, 1, "gfx1201", Some(2)).unwrap();
+        assert!(count.contains("4 visible devices") && count.contains("2 visible"), "{count}");
+        assert!(qwen4_ep_geometry_refusal(2, 2, 1, "gfx1201", Some(2)).is_some());
+        assert!(qwen4_ep_geometry_refusal(2, 1, 2, "gfx1201", Some(2)).is_some());
+    }
+
+    #[test]
+    fn qwen4_ep_device_refusal_checks_arch_count_and_every_directed_pair() {
+        let gfx1201 = |n: usize| vec!["gfx1201".to_string(); n];
+        let all = |_: usize, _: usize| Ok(true);
+        assert_eq!(qwen4_ep_device_refusal(4, &gfx1201(4), all), Ok(()));
+        assert_eq!(qwen4_ep_device_refusal(2, &gfx1201(4), all), Ok(()));
+        // Too few devices.
+        assert!(qwen4_ep_device_refusal(4, &gfx1201(3), all).unwrap_err().contains("3 visible"));
+        // A different arch on rank 2 refuses and names the rank.
+        let mut mixed = gfx1201(4);
+        mixed[2] = "gfx1100".to_string();
+        let error = qwen4_ep_device_refusal(4, &mixed, all).unwrap_err();
+        assert!(error.contains("rank 2") && error.contains("gfx1100"), "{error}");
+        // An arch beyond the rank count is not part of the mesh.
+        assert_eq!(qwen4_ep_device_refusal(2, &mixed, all), Ok(()));
+        // Every directed pair is probed; one missing direction refuses.
+        let mut probed = Vec::new();
+        qwen4_ep_device_refusal(4, &gfx1201(4), |a, b| {
+            probed.push((a, b));
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(probed.len(), 12);
+        let error =
+            qwen4_ep_device_refusal(4, &gfx1201(4), |a, b| Ok(!(a == 3 && b == 1))).unwrap_err();
+        assert!(error.contains("device 3 cannot access device 1"), "{error}");
+        // A failed query is an error, not "no peer".
+        assert!(qwen4_ep_device_refusal(2, &gfx1201(2), |_, _| Err("hip".to_string()))
+            .unwrap_err()
+            .contains("hip"));
+    }
+
+    #[test]
+    fn effective_ep_is_one_for_other_archs() {
+        assert_eq!(effective_ep(5), 1);
+        assert_eq!(effective_ep(9), 1);
     }
 
     #[test]
@@ -1387,10 +2260,104 @@ mod tests {
             ..SpecLoadCfg::default()
         };
         // Device-resident experts: the admitted head stays on under `auto`.
-        assert!(qwen4_mtp_with_host_mapped_experts(with(None), 0));
-        // Host-mapped experts: `auto` keeps AR, an explicit `on` keeps MTP.
-        assert!(!qwen4_mtp_with_host_mapped_experts(with(None), 21));
-        assert!(qwen4_mtp_with_host_mapped_experts(with(Some(true)), 21));
+        assert!(qwen4_mtp_with_host_mapped_experts(with(None), "gfx1100", 0));
+        // Host-mapped experts: `auto` keeps AR off gfx1201, an explicit `on`
+        // keeps MTP everywhere, and gfx1201 keeps the head under `auto`.
+        assert!(!qwen4_mtp_with_host_mapped_experts(
+            with(None),
+            "gfx1100",
+            21
+        ));
+        assert!(qwen4_mtp_with_host_mapped_experts(
+            with(Some(true)),
+            "gfx1100",
+            21
+        ));
+        assert!(qwen4_mtp_with_host_mapped_experts(
+            with(None),
+            "gfx1201",
+            21
+        ));
+        assert!(qwen4_mtp_with_host_mapped_experts(
+            with(Some(true)),
+            "gfx1201",
+            21
+        ));
+    }
+
+    #[test]
+    fn qwen4_head_free_profile_turns_auto_mtp_off_and_refuses_an_explicit_request() {
+        // A profile with the head keeps the policy decision.
+        assert_eq!(qwen4_native_mtp_for_head(true, None, true, "p"), Ok(true));
+        assert_eq!(
+            qwen4_native_mtp_for_head(false, Some(false), true, "p"),
+            Ok(false)
+        );
+        assert_eq!(
+            qwen4_native_mtp_for_head(true, Some(true), true, "p"),
+            Ok(true)
+        );
+        // No head: auto and `off` resolve to AR, `--spec mtp` is refused.
+        assert_eq!(qwen4_native_mtp_for_head(true, None, false, "p"), Ok(false));
+        assert_eq!(
+            qwen4_native_mtp_for_head(false, Some(false), false, "p"),
+            Ok(false)
+        );
+        let error = qwen4_native_mtp_for_head(true, Some(true), false, "tiny-dense").unwrap_err();
+        assert!(
+            error.contains("--spec mtp")
+                && error.contains("tiny-dense")
+                && error.contains("no MTP head"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn qwen4_developer_profiles_refuse_explicit_sidecar_and_hot_store_requests() {
+        use hipfire_config::memory::{PleFormatRequest, PleHotStoreBudget};
+        // Flash-Next is never touched by the developer policy.
+        for format in [
+            PleFormatRequest::Auto,
+            PleFormatRequest::Q4,
+            PleFormatRequest::Q8,
+        ] {
+            for hot in [
+                PleHotStoreBudget::Auto,
+                PleHotStoreBudget::Bytes(0),
+                PleHotStoreBudget::Bytes(1 << 30),
+            ] {
+                assert_eq!(
+                    qwen4_developer_ple_policy(true, "fn", format, hot),
+                    Ok(None)
+                );
+            }
+        }
+        // A developer profile: defaults pass, `auto` hot store is skipped with
+        // a note, explicit sidecar/hot requests are refused.
+        let dev = |format, hot| qwen4_developer_ple_policy(false, "tiny-dense", format, hot);
+        assert_eq!(
+            dev(PleFormatRequest::Auto, PleHotStoreBudget::Bytes(0)),
+            Ok(None)
+        );
+        let note = dev(PleFormatRequest::Auto, PleHotStoreBudget::Auto)
+            .unwrap()
+            .expect("note");
+        assert!(
+            note.contains("tiny-dense") && note.contains("off"),
+            "{note}"
+        );
+        for format in [PleFormatRequest::Q4, PleFormatRequest::Q8] {
+            let error = dev(format, PleHotStoreBudget::Bytes(0)).unwrap_err();
+            assert!(
+                error.contains("memory.ple_format") && error.contains("tiny-dense"),
+                "{error}"
+            );
+        }
+        let error = dev(PleFormatRequest::Auto, PleHotStoreBudget::Bytes(4096)).unwrap_err();
+        assert!(
+            error.contains("memory.ple_hot_store_bytes") && error.contains("tiny-dense"),
+            "{error}"
+        );
     }
 
     mod qwen4_ddtree_admission {
@@ -1870,6 +2837,147 @@ mod tests {
             assert!(error.contains("gfx940") && error.contains("legacy"));
             cleanup(&trunk);
         }
+        /// P2: the V axis admission sizes VMM KV with is the one the carrier
+        /// loads (`SourceAdmission::kv_v` → `LoadCtx::kv_v_override`), for
+        /// every `HIPFIRE_KV_V` setting.
+        #[test]
+        fn kv_v_resolves_once_for_admission_and_carrier() {
+            use super::super::resolve_kv_v_from as r;
+            for env in [None, Some(""), Some("q8")] {
+                assert_eq!(r(None, env, 5, 1), None, "neutral env {env:?}");
+                assert_eq!(r(Some("lloyd3"), env, 5, 1), Some("lloyd3"));
+            }
+            assert_eq!(r(None, Some("lloyd3"), 5, 1), Some("lloyd3"));
+            assert_eq!(r(None, Some("lloyd3"), 6, 1), Some("lloyd3"));
+            assert_eq!(
+                r(Some("q8"), Some("lloyd3"), 5, 1),
+                Some("q8"),
+                "typed wins"
+            );
+            assert_eq!(
+                r(Some(""), Some("lloyd3"), 5, 1),
+                Some("lloyd3"),
+                "empty typed = unset"
+            );
+            assert_eq!(
+                r(None, Some("lloyd3"), 1, 1),
+                None,
+                "non-qwen35 ignores env"
+            );
+            assert_eq!(r(None, Some("lloyd3"), 5, 2), None, "EP ignores env");
+
+            let trunk = write_hfq("kv-v-once", 5, false);
+            let admit = |kv_mode, kv_v| {
+                super::super::admit_source(
+                    trunk.to_str().unwrap(),
+                    1,
+                    1,
+                    KvBackendRequest::Automatic,
+                    None,
+                    "gfx1100",
+                    None,
+                    "auto",
+                    None,
+                    4096,
+                    KvBackendHints {
+                        kv_mode: Some(kv_mode),
+                        kv_v,
+                        ..KvBackendHints::without_device()
+                    },
+                )
+                .map(|a| a.kv_v)
+            };
+            assert_eq!(
+                admit("fwht3", Some("lloyd3")).unwrap().as_deref(),
+                Some("lloyd3")
+            );
+            assert_eq!(admit("q8", Some("q8")).unwrap().as_deref(), Some("q8"));
+            // The pair is validated at admission, before the resident model is
+            // touched — not first discovered by the carrier.
+            let err = admit("q8", Some("lloyd3")).unwrap_err();
+            assert!(err.contains("Lloyd V"), "{err}");
+            cleanup(&trunk);
+        }
+        /// gfx1151 FWHT K overrides refuse without silently falling back.
+        /// Explicit legacy and mode-only FWHT fallback remain available.
+        #[test]
+        fn gfx1151_fwht_k_override_refuses_instead_of_legacy_fallback() {
+            let trunk = write_hfq("kv-axis-refusal", 5, false);
+            let path = trunk.to_str().unwrap();
+            let admit = |request, arch, kv_mode, kv_k, vmm_runtime_available| {
+                super::super::admit_source(
+                    path,
+                    1,
+                    1,
+                    request,
+                    None,
+                    arch,
+                    None,
+                    "auto",
+                    None,
+                    4096,
+                    KvBackendHints {
+                        kv_mode,
+                        kv_k,
+                        kv_v: None,
+                        qwen_default_q8: true,
+                        kv_adaptive: None,
+                        cask: None,
+                        deepseek4_heterogeneous: false,
+                        vmm_runtime_available,
+                        free_vram_bytes: None,
+                    },
+                )
+            };
+            let auto = KvBackendRequest::Automatic;
+            for k in ["fwht2", "fwht3", "fwht4"] {
+                for mode in [None, Some("auto"), Some("q8")] {
+                    for runtime_available in [true, false] {
+                        for request in [auto, KvBackendRequest::Explicit(KvBackend::Vmm)] {
+                            let err = admit(request, "gfx1151", mode, Some(k), runtime_available)
+                                .map(|_| ())
+                                .unwrap_err();
+                            assert!(
+                                err.contains("no certified gfx1151 VMM FWHT path")
+                                    && err.contains("--kv-backend legacy"),
+                                "{err}"
+                            );
+                        }
+                        let legacy = admit(
+                            KvBackendRequest::Explicit(KvBackend::Legacy),
+                            "gfx1151",
+                            mode,
+                            Some(k),
+                            runtime_available,
+                        )
+                        .unwrap();
+                        assert_eq!(legacy.kv_backend, KvBackend::Legacy);
+                        assert!(legacy.kv_backend_reason.is_none());
+                    }
+                }
+                let gfx1100 = admit(auto, "gfx1100", Some("q8"), Some(k), true).unwrap();
+                assert_eq!(gfx1100.kv_backend, KvBackend::Vmm);
+                assert!(gfx1100.kv_backend_reason.is_none());
+            }
+            let mode_spelling = admit(auto, "gfx1151", Some("fwht3"), None, true).unwrap();
+            assert_eq!(mode_spelling.kv_backend, KvBackend::Legacy);
+            assert!(mode_spelling
+                .kv_backend_reason
+                .unwrap()
+                .contains("no certified VMM KV path"));
+            let default = admit(auto, "gfx1151", Some("q8"), None, true).unwrap();
+            assert_eq!(default.kv_backend, KvBackend::Vmm);
+            let unavailable = admit(auto, "gfx1151", Some("q8"), None, false).unwrap();
+            assert_eq!(unavailable.kv_backend, KvBackend::Legacy);
+            assert!(unavailable
+                .kv_backend_reason
+                .unwrap()
+                .contains("HIP VMM symbols/granularity unavailable"));
+            let gfx1201 = admit(auto, "gfx1201", Some("q8"), Some("fwht3"), true).unwrap();
+            assert_eq!(gfx1201.kv_backend, KvBackend::Vmm);
+            assert!(gfx1201.kv_backend_reason.is_none());
+            cleanup(&trunk);
+        }
         #[test]
         fn moe_preserves_legacy_context_when_dense_capacity_is_unknown() {
             let path = write_hfq("moe-capacity", 6, false);
@@ -1927,6 +3035,104 @@ mod tests {
             assert_eq!(explicit.max_seq, 50000);
             assert!(explicit.sequence_reason.is_none());
             cleanup(&path);
+        }
+    }
+    /// The loader gate and the arch resolvers reach the same verdict for the
+    /// same facts: the gate's refusal (when a spill was requested) is exactly
+    /// the predicate's `Refused` arm, and silence is exactly `Supported`. The
+    /// arch side is asserted in the arch crate (`spill_resolver_agrees_with_*`
+    /// there calls the same predicate through its own facts — this pins the
+    /// gate half of the agreement here, where the snapshot trigger lives).
+    mod spill_agreement {
+        use super::*;
+        use hipfire_config::memory::{spill_support, SpillRefusal, SpillSupport};
+
+        /// The arch resolver's verdict for these facts: one call, not a
+        /// condition list — the shape both twins must copy.
+        fn arch_verdict(
+            arch_id: u32,
+            tp: usize,
+            pp: usize,
+            ep_experts: Option<usize>,
+            paged_experts: bool,
+            reap_keep: bool,
+            is_vl: bool,
+        ) -> SpillSupport {
+            spill_support(arch_id, tp, pp, ep_experts, paged_experts, reap_keep, is_vl)
+        }
+
+        fn verdicts_agree(
+            arch_id: u32,
+            tp: usize,
+            pp: usize,
+            ep_experts: Option<usize>,
+            paged_experts: bool,
+            reap_keep: bool,
+            is_vl: bool,
+        ) {
+            let gate = spill_support(arch_id, tp, pp, ep_experts, paged_experts, reap_keep, is_vl);
+            assert_eq!(
+                arch_verdict(arch_id, tp, pp, ep_experts, paged_experts, reap_keep, is_vl),
+                gate,
+                "loader gate and arch resolver disagree"
+            );
+        }
+
+        #[test]
+        fn loader_gate_and_arch_resolver_agree_on_every_dimension() {
+            // Supported shape (dense included): both stay silent.
+            for arch_id in [5u32, 6] {
+                verdicts_agree(arch_id, 1, 1, None, false, false, false);
+            }
+            // Every refusal dimension: both refuse, same arm.
+            verdicts_agree(9, 1, 1, None, false, false, false);
+            verdicts_agree(6, 2, 1, None, false, false, false);
+            verdicts_agree(6, 1, 2, None, false, false, false);
+            verdicts_agree(6, 1, 1, Some(4), false, false, false);
+            verdicts_agree(6, 1, 1, None, false, false, true);
+            verdicts_agree(6, 1, 1, None, true, false, false);
+            verdicts_agree(6, 1, 1, None, false, true, false);
+        }
+
+        #[test]
+        fn refusal_messages_name_the_key_and_the_reason() {
+            // Spot-check the arm the auto-fit unification added: the VL
+            // message is verbatim (tower, lowered loader, unset-both-keys).
+            let msg = spill_refusal_message(SpillRefusal::VisionTower, "the-keys");
+            assert!(msg.contains("the-keys"), "names the key: {msg}");
+            assert!(msg.contains("vision tower"), "names the reason: {msg}");
+            assert!(msg.contains("Unset both keys"), "names the remedy: {msg}");
+            // Every other arm renders non-empty too (verbatim sentences above).
+            for refusal in [
+                SpillRefusal::Arch(9),
+                SpillRefusal::Tp(2),
+                SpillRefusal::Pp(2),
+                SpillRefusal::ExpertParallel(4),
+                SpillRefusal::PagedExperts,
+                SpillRefusal::ReapKeepMap,
+            ] {
+                assert!(
+                    !spill_refusal_message(refusal, "the-keys").is_empty(),
+                    "{refusal:?} must render"
+                );
+            }
+        }
+
+        #[test]
+        fn dense_unset_model_stays_resident_and_silent() {
+            // The zero-diff default: a dense model with both keys unset is
+            // compatible (`Supported`), and `Full`/`Full` budgets resolve to
+            // the all-device placement with no capacity check — the refusal
+            // below can never fire on this path.
+            use hipfire_config::memory::{effective_offload_budgets, OffloadBudget};
+            assert_eq!(
+                spill_support(5, 1, 1, None, false, false, false),
+                SpillSupport::Supported
+            );
+            assert_eq!(
+                effective_offload_budgets(),
+                (OffloadBudget::Full, OffloadBudget::Full)
+            );
         }
     }
     mod head_overlay {
@@ -2213,6 +3419,149 @@ mod tests {
             .expect_err("full model as head must refuse");
             assert!(err.contains("expected only"), "refusal: {err}");
             cleanup(&[trunk, head]);
+        }
+    }
+
+    mod qwen4_memory {
+        use super::super::{qwen4_memory_admission, QWEN4_MEMORY_HEADROOM_BYTES};
+
+        const MIB: u64 = 1 << 20;
+        const CAPACITY: usize = 262_144;
+        /// Strix Halo receipt: 98,304 MiB carve-out, 78,547 MiB used after a
+        /// default Flash-Next load (native MTP, max_seq 262144, VMM).
+        const HALO_FREE: u64 = (98_304 - 78_547) * MIB;
+        const MTP_REQUEST: u64 = 740 * MIB;
+
+        /// Linear growth: 15,392 MiB of target + MTP QSA arenas and 512 MiB
+        /// of gather workspace over the 262,144-token capacity.
+        fn growth(tokens: usize) -> (u64, u64) {
+            let tokens = tokens.min(CAPACITY) as u64;
+            (
+                15_392 * MIB * tokens / CAPACITY as u64,
+                512 * MIB * tokens / CAPACITY as u64,
+            )
+        }
+
+        fn fixed() -> u64 {
+            MTP_REQUEST + QWEN4_MEMORY_HEADROOM_BYTES
+        }
+
+        #[test]
+        fn halo_default_admits_the_whole_model_context() {
+            let admission = qwen4_memory_admission(
+                CAPACITY,
+                None,
+                HALO_FREE,
+                MTP_REQUEST,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                growth,
+            )
+            .unwrap();
+            assert_eq!(admission.max_seq, CAPACITY);
+            assert_eq!(admission.card_cap, CAPACITY);
+            assert_eq!(admission.context_growth, 15_392 * MIB);
+            assert_eq!(admission.gather_growth, 512 * MIB);
+            assert!(admission.growth() + admission.headroom <= HALO_FREE);
+        }
+
+        #[test]
+        fn automatic_context_caps_at_the_largest_fit() {
+            let free = 12 << 30;
+            let admission = qwen4_memory_admission(
+                CAPACITY,
+                None,
+                free,
+                MTP_REQUEST,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                growth,
+            )
+            .unwrap();
+            let cap = admission.card_cap;
+            assert!(cap > 0 && cap < CAPACITY);
+            assert_eq!(admission.max_seq, cap);
+            let total = |tokens| {
+                let (context, gather) = growth(tokens);
+                context + gather + fixed()
+            };
+            assert!(total(cap) <= free);
+            assert!(total(cap + 1) > free);
+        }
+
+        #[test]
+        fn explicit_context_is_honored_when_it_fits() {
+            let admission = qwen4_memory_admission(
+                CAPACITY,
+                Some(CAPACITY),
+                HALO_FREE,
+                MTP_REQUEST,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                growth,
+            )
+            .unwrap();
+            assert_eq!(admission.max_seq, CAPACITY);
+            let short = qwen4_memory_admission(
+                8192,
+                Some(8192),
+                HALO_FREE,
+                MTP_REQUEST,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                growth,
+            )
+            .unwrap();
+            assert_eq!(short.max_seq, 8192);
+            assert_eq!(short.card_cap, 8192);
+        }
+
+        #[test]
+        fn explicit_context_that_cannot_grow_refuses_at_load() {
+            let free = 12 << 30;
+            let cap = qwen4_memory_admission(
+                CAPACITY,
+                None,
+                free,
+                MTP_REQUEST,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                growth,
+            )
+            .unwrap()
+            .card_cap;
+            let error = qwen4_memory_admission(
+                CAPACITY,
+                Some(CAPACITY),
+                free,
+                MTP_REQUEST,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                growth,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("max_seq 262144 does not fit device memory"),
+                "{error}"
+            );
+            assert!(error.contains(&format!("at most {cap}")), "{error}");
+            assert!(
+                error.contains(
+                    "15392 MiB QSA context + 512 MiB QSA gather workspace + 740 MiB native MTP"
+                ),
+                "{error}"
+            );
+        }
+
+        #[test]
+        fn automatic_context_refuses_when_nothing_fits() {
+            let error = qwen4_memory_admission(
+                CAPACITY,
+                None,
+                fixed() - 1,
+                MTP_REQUEST,
+                QWEN4_MEMORY_HEADROOM_BYTES,
+                growth,
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("cannot hold an automatic context"),
+                "{error}"
+            );
         }
     }
 }

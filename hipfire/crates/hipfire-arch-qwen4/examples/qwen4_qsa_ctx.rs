@@ -23,9 +23,11 @@
 //! * attention output: `ops::qsa_attention` (F32) over the GPU selection, the
 //!   GPU's Q/gate row and K/V arenas, against the GPU's gated head output.
 //!
-//! Then the final-row logits of the decode route are compared against an
-//! all-prefill run of the same `L` tokens (no tap), and 24 greedy tokens are
-//! decoded from that state for a coherence read.
+//! With QSA_DUMP_DIR set, also retain every pp8192 Q/gate, source cache
+//! codes/scales, selection/mirror, eager and per-head exact output. A repeated
+//! identical-partition run checks instrumentation's logits/state byte identity.
+//! QSA_ARTIFACT_ID should be the recorded model md5. Shared metrics and offline
+//! f64/cast-oracle analysis are in `bench_qsa_indexed`; greedy text is secondary.
 //!
 //! usage: qwen4_qsa_ctx MODEL TEXT OUT.jsonl [CTX=2048,4096,8192,16384,32768]
 //!        [STRIDE=256] [DECODE=4]
@@ -41,6 +43,10 @@ use hipfire_runtime::model_source::{ModelSource as _, SourcePayload};
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use rdna_compute::tensor_ops::QsaKvFormat;
+
+#[allow(dead_code)]
+#[path = "../../rdna-compute/examples/bench_qsa_indexed.rs"]
+mod evidence;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
 use std::cmp::Ordering;
@@ -124,6 +130,13 @@ fn read_kv_rows(
                 for head in 0..kv_heads {
                     let scale = f16_bits_to_f32(u16::from_le_bytes([scales[2 * head], scales[2 * head + 1]]));
                     out.extend(codes[head * head_dim..(head + 1) * head_dim].iter().map(|&c| e4m3_to_f32(c) * scale));
+                }
+            }
+            QsaKvFormat::Q8 => {
+                // Q8_0 blocks: f16 scale + 32 int8 codes, head-major.
+                for block in row.chunks_exact(34) {
+                    let scale = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                    out.extend(block[2..].iter().map(|&c| c as i8 as f32 * scale));
                 }
             }
         }
@@ -247,9 +260,20 @@ struct Probe {
     /// Per slot: pooled blocks already checked this session.
     pooled_checked: Vec<usize>,
     wmma_dense: bool,
+    /// `HIPFIRE_QWEN4_QSA_WMMA_GATHER` not `0` on the arch / state format it serves
+    /// (gfx1151 F32, gfx1201 fp8): prefill chunks past the dense route run
+    /// the gathered F16 WMMA kernel instead of hg4 (a route label only).
+    wmma_gather: bool,
     /// Teacher-forced decode rows after the prefill (the prefill's final row
     /// is `ctx - decode`).
     decode: usize,
+    dump_dir: Option<std::path::PathBuf>,
+    /// `QSA_DUMP_POSITIONS=0,57344`: restrict dumps to these all-prefill chunk
+    /// starts and skip the pre-prologue dumps.
+    dump_positions: Option<Vec<usize>>,
+    artifact_id: String,
+    expected_state: Vec<(String, String)>,
+    validation_cursor: Option<usize>,
 }
 
 impl Probe {
@@ -277,6 +301,228 @@ impl Probe {
         result
     }
 
+    fn projection_evidence(&mut self, gpu: &mut Gpu, slot: usize, op: &IndexedAttentionOp<'_>) -> Result<()> {
+        let Some(root) = self.dump_dir.as_ref() else { return Ok(()); };
+        if self.dump_positions.is_some() { return Ok(()); }
+        let key = format!("ctx-{}-{}-layer-{slot}-chunk-{}", self.ctx, self.phase, op.state.position);
+        let index_stride = (op.index_heads + op.index_kv_heads) * op.index_dim;
+        let tensors = [
+            ("raw-qgate.f32", op.qgate_scratch, op.rows * op.heads * op.head_dim * 2),
+            ("raw-index.f32", op.index_scratch, op.rows * index_stride),
+            ("raw-k.f32", op.k_scratch, op.rows * op.kv_heads * op.head_dim),
+            ("raw-v.f32", op.v_scratch, op.rows * op.kv_heads * op.head_dim),
+            ("index-q-norm.source", op.indexer_q_norm, op.index_dim),
+            ("index-k-norm.source", op.indexer_k_norm, op.index_dim),
+            ("q-norm.source", op.q_norm, op.head_dim),
+            ("k-norm.source", op.k_norm, op.head_dim),
+            ("keys.source", op.state.full_keys, op.state.full_keys.numel()),
+            ("values.source", op.state.full_values, op.state.full_values.numel()),
+            ("raw-index.source", op.state.raw_index_keys, op.state.full_capacity * op.index_dim),
+            ("pooled.source", op.state.pooled_keys, op.state.pooled_capacity * op.index_dim),
+            ("selected-mirror.i32", op.state.selected_indices, op.state.selected_capacity * 4),
+        ];
+        let mut blobs = Vec::with_capacity(tensors.len());
+        let mut files = serde_json::Map::new();
+        for (name,tensor,elements) in tensors {
+            let bytes = read_raw(gpu,tensor,0,elements)?;
+            files.insert(name.into(),json!({"bytes":bytes.len(),"sha256":evidence::sha256(&bytes),
+                "dtype":format!("{:?}",tensor.dtype),"elements":elements}));
+            blobs.push((name,bytes));
+        }
+        let digest = evidence::sha256(serde_json::to_vec(&files).map_err(err)?.as_slice());
+        let event = format!("pre-prologue:{key}");
+        if let Some(cursor) = self.validation_cursor.as_mut() {
+            if self.expected_state.get(*cursor) != Some(&(event,digest)) {
+                return Err(format!("instrumented/uninstrumented raw projections differ at {key}"));
+            }
+            *cursor += 1;
+            return Ok(());
+        }
+        self.expected_state.push((event,digest));
+        let dir = root.join(&key).join("pre-prologue");
+        std::fs::create_dir_all(&dir).map_err(err)?;
+        for (name,bytes) in blobs { std::fs::write(dir.join(name),bytes).map_err(err)?; }
+        let header = json!({"schema":"qsa-pre-prologue-v1","artifact":self.artifact_id,
+            "phase":self.phase,"ctx":self.ctx,"layer":slot,"rows":op.rows,"position":op.state.position,
+            "heads":op.heads,"kv_heads":op.kv_heads,"dim":op.head_dim,
+            "index_heads":op.index_heads,"index_kv_heads":op.index_kv_heads,"index_dim":op.index_dim,
+            "index_stride":index_stride,"compress":op.compress,"cache_format":op.state.format.name(),
+            "full_capacity":op.state.full_capacity,"pooled_capacity":op.state.pooled_capacity,
+            "selected_capacity":op.state.selected_capacity,"files":files,
+            "capture_boundary":"after exact production project_weights; before any QSA norm/RoPE/cache append"});
+        std::fs::write(dir.join("snapshot.json"),serde_json::to_vec_pretty(&header).map_err(err)?).map_err(err)?;
+        Ok(())
+    }
+
+    /// q8 (BF16 index arenas) selector-only `qsa-source-v1` snapshot: post-step
+    /// index projection, BF16 pooled arena, ordered selection and mirror.
+    fn selector_evidence(&mut self, gpu: &mut Gpu, slot: usize, op: &IndexedAttentionOp<'_>, root: std::path::PathBuf) -> Result<()> {
+        let g = evidence::Geometry {
+            rows: op.rows, position_start: op.state.position, heads: op.heads,
+            kv_heads: op.kv_heads, dim: op.head_dim, budget_blocks: op.budget / op.compress,
+            compress: op.compress, capacity: op.state.selected_capacity,
+            full_capacity: op.state.full_capacity, fp8: false,
+        };
+        let key = format!("ctx-{}-{}-layer-{slot}-chunk-{}", self.ctx, self.phase, g.position_start);
+        let selected = read_bytes(gpu, op.selected_scratch, 0, g.rows * g.capacity * 4)?;
+        let mirror = read_bytes(gpu, op.state.selected_indices, 0, g.capacity * 4)?;
+        let pooled = read_raw(gpu, op.state.pooled_keys, 0, op.state.pooled_capacity * op.index_dim)?;
+        let index_stride = (op.index_heads + op.index_kv_heads) * op.index_dim;
+        let index_projection = read_raw(gpu, op.index_scratch, 0, g.rows * index_stride)?;
+        let blobs = [
+            ("selected.i32", selected.as_slice()), ("selected-mirror.i32", mirror.as_slice()),
+            ("pooled.source", pooled.as_slice()), ("index-projection.f32", index_projection.as_slice()),
+        ];
+        let digest = evidence::sha256(serde_json::to_string(
+            &blobs.iter().map(|(name, b)| (*name, evidence::sha256(b))).collect::<Vec<_>>()
+        ).map_err(err)?.as_bytes());
+        if let Some(cursor) = self.validation_cursor.as_mut() {
+            if self.expected_state.get(*cursor) != Some(&(key.clone(), digest.clone())) {
+                return Err(format!("instrumented/uninstrumented state differs at {key} (event {cursor})"));
+            }
+            *cursor += 1;
+            return Ok(());
+        }
+        self.expected_state.push((key.clone(), digest));
+        let mut geometry = g.json();
+        geometry["format"] = json!("q8");
+        let dir = root.join(&key);
+        std::fs::create_dir_all(&dir).map_err(err)?;
+        let mut files = serde_json::Map::new();
+        for (name, bytes) in blobs {
+            std::fs::write(dir.join(name), bytes).map_err(err)?;
+            files.insert(name.into(), json!({"bytes":bytes.len(),"sha256":evidence::sha256(bytes)}));
+        }
+        let identity = json!({"artifact": self.artifact_id, "layer": slot, "chunk": g.position_start,
+            "phase": self.phase, "ctx": self.ctx, "arch": gpu.arch,
+            "source_format": op.state.format.name(), "instrumentation_state_differing_bytes": 0,
+            "selector_only": true,
+            "selector":{"heads":op.index_heads,"kv_heads":op.index_kv_heads,"dim":op.index_dim,
+                "projection_stride":index_stride,"projection_dtype":format!("{:?}",op.index_scratch.dtype),
+                "raw_dtype":format!("{:?}",op.state.raw_index_keys.dtype),
+                "pooled_dtype":format!("{:?}",op.state.pooled_keys.dtype),
+                "norm_dtype":format!("{:?}",op.indexer_k_norm.dtype),"pooled_capacity":op.state.pooled_capacity}});
+        let path = dir.join("snapshot.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&json!({"schema":"qsa-source-v1","identity":identity,
+            "geometry":geometry,"files":files})).map_err(err)?).map_err(err)?;
+        self.rows.push(json!({"kind":"selector_evidence","slot":slot,"chunk":g.position_start,
+            "phase":self.phase,"ctx":self.ctx,"snapshot":path.display().to_string()}));
+        Ok(())
+    }
+
+    fn full_evidence(&mut self, gpu: &mut Gpu, slot: usize, op: &IndexedAttentionOp<'_>) -> Result<()> {
+        let Some(root) = self.dump_dir.as_ref() else { return Ok(()); };
+        // QSA_DUMP_POSITIONS: only the all-prefill calls at these chunk starts.
+        if let Some(positions) = self.dump_positions.as_ref() {
+            if slot == 0 {
+                eprintln!("[dump-pos] phase {} position {} rows {}", self.phase, op.state.position, op.rows);
+            }
+            if self.phase != "all_prefill" || !positions.contains(&op.state.position) { return Ok(()); }
+        }
+        if op.state.format == QsaKvFormat::Q8 {
+            // Lab (BF16-index select route G0): with QSA_DUMP_POSITIONS, the q8
+            // state dumps the selector inputs/outputs only (no K/V attention
+            // reference: the exact attention oracle covers f32/fp8 only).
+            if self.dump_positions.is_none() {
+                return Err("qsa evidence dumps cover the f32 and fp8 states only (q8: selector-only with QSA_DUMP_POSITIONS)".into());
+            }
+            let root = root.clone();
+            return self.selector_evidence(gpu, slot, op, root);
+        }
+        let g = evidence::Geometry {
+            rows: op.rows, position_start: op.state.position, heads: op.heads,
+            kv_heads: op.kv_heads, dim: op.head_dim, budget_blocks: op.budget / op.compress,
+            compress: op.compress, capacity: op.state.selected_capacity,
+            full_capacity: op.state.full_capacity, fp8: op.state.format == QsaKvFormat::Fp8,
+        };
+        let key = format!("ctx-{}-{}-layer-{slot}-chunk-{}", self.ctx, self.phase, g.position_start);
+        let q = read_f32(gpu, op.qgate_scratch, 0, g.rows * g.heads * g.dim * 2)?;
+        let eager = read_f32(gpu, op.qsa_output, 0, g.rows * g.heads * g.dim)?;
+        let cache_bytes = g.full_capacity * op.state.format.kv_row_bytes(g.kv_heads, g.dim);
+        let keys = read_bytes(gpu, op.state.full_keys, 0, cache_bytes)?;
+        let values = read_bytes(gpu, op.state.full_values, 0, cache_bytes)?;
+        let selected = read_bytes(gpu, op.selected_scratch, 0, g.rows * g.capacity * 4)?;
+        let mirror = read_bytes(gpu, op.state.selected_indices, 0, g.capacity * 4)?;
+        let raw = read_raw(gpu, op.state.raw_index_keys, 0, g.full_capacity * op.index_dim)?;
+        let pooled = read_raw(gpu, op.state.pooled_keys, 0, op.state.pooled_capacity * op.index_dim)?;
+        let index_stride = (op.index_heads + op.index_kv_heads) * op.index_dim;
+        let index_projection = read_raw(gpu, op.index_scratch, 0, g.rows * index_stride)?;
+        let index_norm = read_raw(gpu, op.indexer_k_norm, 0, op.index_dim)?;
+        let qbytes = evidence::f32_bytes(&q);
+        let eager_bytes = evidence::f32_bytes(&eager);
+        let blobs = [
+            ("qgate.f32", qbytes.as_slice()), ("keys.source", keys.as_slice()),
+            ("values.source", values.as_slice()), ("selected.i32", selected.as_slice()),
+            ("selected-mirror.i32", mirror.as_slice()), ("raw-index.source", raw.as_slice()),
+            ("pooled.source", pooled.as_slice()), ("eager.f32", eager_bytes.as_slice()),
+            ("index-projection.f32", index_projection.as_slice()),
+            ("indexer-k-norm.source", index_norm.as_slice()),
+        ];
+        let digest = evidence::sha256(serde_json::to_string(
+            &blobs.iter().map(|(name, b)| (*name, evidence::sha256(b))).collect::<Vec<_>>()
+        ).map_err(err)?.as_bytes());
+        if let Some(cursor) = self.validation_cursor.as_mut() {
+            if self.expected_state.get(*cursor) != Some(&(key.clone(), digest.clone())) {
+                return Err(format!("instrumented/uninstrumented state differs at {key} (event {cursor})"));
+            }
+            *cursor += 1;
+            return Ok(());
+        }
+        self.expected_state.push((key.clone(), digest));
+        let exact = gpu.zeros(&[eager.len()], DType::F32).map_err(err)?;
+        let launch = rdna_compute::tensor_ops::indexed_attention_attention_batch_exact(
+            gpu, &rdna_compute::tensor_ops::IndexedAttentionAttentionBatch {
+                q_with_gate: op.qgate_scratch, full_keys: op.state.full_keys,
+                full_values: op.state.full_values, selected: op.selected_scratch, output: &exact,
+                rows: g.rows, position_start: g.position_start, n_heads: g.heads,
+                n_kv_heads: g.kv_heads, head_dim: g.dim, budget_blocks: g.budget_blocks,
+                compress: g.compress, capacity: g.capacity, full_capacity: g.full_capacity,
+                format: op.state.format, shape_selected: g.capacity,
+            },
+        ).map_err(err);
+        let reference = launch.and_then(|()| gpu.download_f32(&exact).map_err(err));
+        gpu.free_tensor(exact).map_err(err)?;
+        let reference = reference?;
+        // The exact launch writes only its private output allocation. Check all
+        // model-owned sources and outputs; do not restore or hide any mutation.
+        for (name, original, tensor, bytes) in [
+            ("qgate", qbytes.as_slice(), op.qgate_scratch, qbytes.len()),
+            ("eager", eager_bytes.as_slice(), op.qsa_output, eager_bytes.len()),
+            ("keys", keys.as_slice(), op.state.full_keys, keys.len()),
+            ("values", values.as_slice(), op.state.full_values, values.len()),
+            ("selected", selected.as_slice(), op.selected_scratch, selected.len()),
+            ("mirror", mirror.as_slice(), op.state.selected_indices, mirror.len()),
+            ("raw", raw.as_slice(), op.state.raw_index_keys, raw.len()),
+            ("pooled", pooled.as_slice(), op.state.pooled_keys, pooled.len()),
+            ("index-projection", index_projection.as_slice(), op.index_scratch, index_projection.len()),
+            ("indexer-k-norm", index_norm.as_slice(), op.indexer_k_norm, index_norm.len()),
+        ] {
+            if read_bytes(gpu, tensor, 0, bytes)? != original {
+                return Err(format!("exact-reference instrumentation mutated {key}/{name}"));
+            }
+        }
+        let dir = root.join(&key);
+        std::fs::create_dir_all(&dir).map_err(err)?;
+        let stats = evidence::metrics(&reference, &eager, g.heads, g.dim, Some(&dir.join("G-vs-R.elements")))?;
+        let exact_bytes = evidence::f32_bytes(&reference);
+        let mut all_blobs = blobs.to_vec();
+        all_blobs.push(("exact.f32", &exact_bytes));
+        let snapshot = evidence::dump_snapshot(
+            &dir, json!({"artifact": self.artifact_id, "layer": slot, "chunk": g.position_start,
+                "phase": self.phase, "ctx": self.ctx, "arch": gpu.arch,
+                "source_format": op.state.format.name(), "instrumentation_state_differing_bytes": 0,
+                "selector":{"heads":op.index_heads,"kv_heads":op.index_kv_heads,"dim":op.index_dim,
+                    "projection_stride":index_stride,"projection_dtype":format!("{:?}",op.index_scratch.dtype),
+                    "raw_dtype":format!("{:?}",op.state.raw_index_keys.dtype),
+                    "pooled_dtype":format!("{:?}",op.state.pooled_keys.dtype),
+                    "norm_dtype":format!("{:?}",op.indexer_k_norm.dtype),"pooled_capacity":op.state.pooled_capacity}}),
+            &g, &all_blobs, stats.clone(),
+        )?;
+        self.rows.push(json!({"kind":"full_evidence","slot":slot,"chunk":g.position_start,
+            "phase":self.phase,"ctx":self.ctx,"snapshot":snapshot,"metrics":stats}));
+        Ok(())
+    }
+
     fn tap_inner(&mut self, gpu: &mut Gpu, slot: usize, op: &IndexedAttentionOp<'_>) -> Result<()> {
         let n = op.rows;
         let start = op.state.position;
@@ -290,6 +536,8 @@ impl Probe {
         let q_width = op.heads * op.head_dim;
         let kv_width = op.kv_heads * op.head_dim;
         let blocks_end = end / compress;
+        self.full_evidence(gpu, slot, op)?;
+        if self.validation_cursor.is_some() { return Ok(()); }
         if self.k_norm.len() <= slot {
             self.k_norm.resize(slot + 1, None);
             self.pooled_checked.resize(slot + 1, 0);
@@ -330,7 +578,7 @@ impl Probe {
                 let mut value: Vec<f32> = (0..dim)
                     .map(|c| bf16_round(mean[c] * inv * (1.0 + norm[c])))
                     .collect();
-                ops::rope_prefix_halfsplit(&mut value, block * compress, dim.min(64), 10_000_000.0)
+                ops::rope_prefix_halfsplit(&mut value, block * compress, dim.min(64), op.rope)
                     .map_err(err)?;
                 for c in 0..dim {
                     let cpu = bf16_round(value[c]);
@@ -358,6 +606,8 @@ impl Probe {
             "per_head"
         } else if self.wmma_dense && n >= 512 && blocks_end <= budget_blocks && end <= capacity {
             "dense_f16"
+        } else if self.wmma_gather && n >= 512 {
+            "gathered_f16"
         } else {
             "hg4"
         };
@@ -438,7 +688,8 @@ impl Probe {
                 &mut cpu_out,
             )
             .map_err(err)?;
-            let (mut max_abs, mut ref_max, mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            let (mut max_abs, mut ref_max, mut dot, mut na, mut nb, mut err2) =
+                (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
             for (&a, &b) in cpu_out.iter().zip(&gpu_out) {
                 let (a, b) = (a as f64, b as f64);
                 max_abs = max_abs.max((a - b).abs());
@@ -446,6 +697,7 @@ impl Probe {
                 dot += a * b;
                 na += a * a;
                 nb += b * b;
+                err2 += (a - b) * (a - b);
             }
             self.rows.push(json!({
                 "kind": "row", "phase": self.phase, "ctx": self.ctx, "slot": slot,
@@ -456,6 +708,7 @@ impl Probe {
                 "attn_max_abs": max_abs, "attn_ref_max": ref_max,
                 "attn_rel": max_abs / ref_max.max(1.0e-30),
                 "attn_cos": dot / (na.sqrt() * nb.sqrt()).max(1.0e-30),
+                "attn_rel_l2": (err2 / na.max(1.0e-30)).sqrt(),
             }));
         }
         Ok(())
@@ -508,16 +761,63 @@ fn main() -> Result<()> {
     let receipt = admit_hfqm_artifact(&hfq).map_err(err)?;
     let mut gpu = Gpu::init().map_err(err)?;
     eprintln!("gpu {} uma={} n_ctx={n_ctx}", gpu.arch, gpu.is_uma());
+    // The loader's forward scratch plan: decided from the actual routed-expert
+    // payload (while the mapping is readable) and charged to the auto
+    // placement and attached below alike.
+    let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+        &gpu, &hfq, &receipt.config, &receipt.manifest,
+    )
+    .map_err(err)?;
+    eprintln!("forward scratch mode: {scratch_mode:?}");
     let use_ranges = gpu.is_uma();
     if use_ranges {
         hfq.drop_mmap();
     }
+    // The shipped state formats for this device (HIPFIRE_KV_MODE /
+    // HIPFIRE_STATE_QUANT; `bf16` + `fp32` is the exact reference arm).
+    let state_format = hipfire_arch_qwen4::resolve_state_format(
+        &hipfire_runtime::config::get().kv_mode,
+        &std::env::var("HIPFIRE_STATE_QUANT").unwrap_or_default(),
+        &gpu,
+        &receipt.config,
+    )
+    .map_err(err)?;
+    let qsa_format = state_format.qsa;
+    // The product's automatic QSA context storage (VMM where supported).
+    let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
+    eprintln!(
+        "state format qsa={} gdn={} backend={}",
+        qsa_format.name(),
+        state_format.gdn.name(),
+        backend.name()
+    );
     #[allow(unused_mut)]
     let mut weights = receipt.manifest.weights.clone();
-    if let Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Layers(vram_layers)) =
-        hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env().map_err(err)?
-    {
-        let moved = hipfire_arch_qwen4::expert_residency::place_routed_experts(&mut weights, vram_layers);
+    use hipfire_arch_qwen4::expert_residency as residency;
+    if let Some(policy) = residency::expert_vram_layers_from_env().map_err(err)? {
+        if use_ranges { return Err("host-mapped experts are only for discrete GPUs".into()); }
+        let vram_layers = match policy {
+            residency::ExpertVramLayers::Layers(n) => n,
+            residency::ExpertVramLayers::Auto => {
+                let (free, _) = gpu.hip.get_vram_info().map_err(err)?;
+                let (non_expert, per_layer) = residency::resident_split(&weights, |entry|
+                    hfq.tensor_data(&entry.name).map(|(_, bytes)| bytes.len() as u64)).map_err(err)?;
+                let chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu.arch, n_ctx);
+                let context = hipfire_arch_qwen4::Qwen4ContextCommit::new(
+                    backend, n_ctx, chunk, gpu.vmm_recommended_granularity().unwrap_or(1));
+                let gather = rdna_compute::tensor_ops::qsa_gather_workspace_needed(&gpu, qsa_format, state_format.qsa_f16_arena)
+                    .then(|| rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(receipt.config.num_key_value_heads, context.tokens))
+                    .flatten().map(|bytes| bytes as u64);
+                let reserve = residency::auto_vram_reserve(&receipt.config, &context,
+                    chunk, scratch_mode, state_format.layout(), None, gather).map_err(err)?;
+                if (free as u64) < non_expert.saturating_add(reserve) {
+                    return Err("not enough free VRAM for non-expert weights plus auto reserve".into());
+                }
+                eprintln!("auto placement: {free} free bytes, {non_expert} non-expert bytes, {reserve} reserved bytes, gather={gather:?}");
+                residency::auto_vram_layers(free as u64, non_expert, per_layer, receipt.config.num_hidden_layers, reserve)
+            }
+        };
+        let moved = residency::place_routed_experts(&mut weights, vram_layers);
         eprintln!("routed experts: layers 0..{vram_layers} in VRAM, {moved} tensors host-mapped");
     }
     let mesh = DeviceMesh::single().map_err(err)?;
@@ -547,28 +847,25 @@ fn main() -> Result<()> {
     )
     .map_err(err)?;
     let vocab = receipt.config.vocab_size;
-    // The shipped state formats for this device (HIPFIRE_KV_MODE /
-    // HIPFIRE_STATE_QUANT; `bf16` + `fp32` is the exact reference arm).
-    let state_format = hipfire_arch_qwen4::resolve_state_format(
-        &hipfire_runtime::config::get().kv_mode,
-        &std::env::var("HIPFIRE_STATE_QUANT").unwrap_or_default(),
-        &gpu,
-        &receipt.config,
-    )
-    .map_err(err)?;
-    let qsa_format = state_format.qsa;
-    eprintln!("state format qsa={} gdn={}", qsa_format.name(), state_format.gdn.name());
     let mut bundle = Qwen4Bundle::assemble_with_metadata(
         receipt.config,
+        &receipt.manifest.identity.recipe,
         transaction,
         &receipt.placements,
         &mut gpu,
         n_ctx,
         receipt.ple,
         state_format,
+        backend,
     )
     .map_err(err)?;
-    bundle.attach_forward(&mut gpu, n_ctx).map_err(err)?;
+    bundle.attach_forward(&mut gpu, n_ctx, scratch_mode).map_err(err)?;
+    // The tap reads every arena over its whole capacity, so map all of it
+    // (VMM storage maps nothing at construction).
+    bundle
+        .state
+        .ensure_mapped_capacity(&mut gpu, n_ctx)
+        .map_err(|error| format!("map QSA context: {error}"))?;
     let logits = gpu.zeros(&[vocab], DType::F32).map_err(err)?;
     let tokens = tokenizer.encode(&text);
     eprintln!("text: {} tokens", tokens.len());
@@ -581,8 +878,14 @@ fn main() -> Result<()> {
         k_norm: Vec::new(),
         pooled_checked: Vec::new(),
         decode,
+        dump_dir: std::env::var_os("QSA_DUMP_DIR").map(std::path::PathBuf::from),
+        dump_positions: std::env::var("QSA_DUMP_POSITIONS").ok().map(|v| v.split(',').map(|p| p.trim().parse().unwrap()).collect()),
+        artifact_id: std::env::var("QSA_ARTIFACT_ID").unwrap_or_else(|_| args[1].clone()),
+        expected_state: Vec::new(),
+        validation_cursor: None,
         wmma_dense: gpu.arch_caps.has_wmma_w32()
             && std::env::var("HIPFIRE_QWEN4_F16_WMMA").map_or(true, |v| v.trim() != "0"),
+        wmma_gather: rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(&gpu, qsa_format),
     }));
     let mut out = std::fs::File::create(out_path).map_err(err)?;
     let run_start = Instant::now();
@@ -598,11 +901,18 @@ fn main() -> Result<()> {
             let mut p = probe.lock().unwrap();
             p.phase = "prefill";
             p.ctx = ctx;
+            p.expected_state.clear();
+            p.validation_cursor = None;
             p.pooled_checked.iter_mut().for_each(|c| *c = 0);
         }
         let tap_probe = Arc::clone(&probe);
         let tap: Qwen4QsaTap = Box::new(move |gpu, slot, op| tap_probe.lock().unwrap().tap(gpu, slot, op));
         bundle.set_qsa_tap(Some(tap)).map_err(err)?;
+        if probe.lock().map_err(err)?.dump_dir.is_some() {
+            let projection_probe = Arc::clone(&probe);
+            bundle.set_qsa_projection_hook(Some(Box::new(move |gpu, slot, op|
+                projection_probe.lock().map_err(err)?.projection_evidence(gpu, slot, op)))).map_err(err)?;
+        }
         let phase = |name: &str| eprintln!("[phase] ctx {ctx} {name} at {:.1}s", run_start.elapsed().as_secs_f64());
         phase("tapped prefill");
         let t = Instant::now();
@@ -619,15 +929,58 @@ fn main() -> Result<()> {
         let decode_logits = gpu.download_f32(&logits).map_err(err)?;
         bundle.set_qsa_tap(None).map_err(err)?;
 
-        // Untapped: all-prefill of the same tokens.
+        let has_dump = probe.lock().map_err(err)?.dump_dir.is_some();
+        let instrumentation = if has_dump {
+            // Same prefill/decode partition, with a read-only observational tap.
+            // Comparing all-prefill instead would conflate instrumentation with
+            // the known different chunk/reduction schedule.
+            bundle.reset(&mut gpu).map_err(err)?;
+            {
+                let mut p = probe.lock().map_err(err)?;
+                p.phase = "prefill";
+                p.validation_cursor = Some(0);
+            }
+            let check_probe = Arc::clone(&probe);
+            bundle.set_qsa_tap(Some(Box::new(move |gpu, slot, op|
+                check_probe.lock().map_err(err)?.tap(gpu, slot, op)))).map_err(err)?;
+            bundle.forward_chunk_final(&mut gpu, &prompt[..ctx - decode], &logits, None).map_err(err)?;
+            probe.lock().map_err(err)?.phase = "decode";
+            for &token in &prompt[ctx - decode..] {
+                bundle.forward_token(&mut gpu, token, &logits, None).map_err(err)?;
+            }
+            let control = gpu.download_f32(&logits).map_err(err)?;
+            if evidence::f32_bytes(&control) != evidence::f32_bytes(&decode_logits) {
+                return Err(format!("instrumentation changes final logits at ctx {ctx}"));
+            }
+            bundle.set_qsa_tap(None).map_err(err)?;
+            let mut p = probe.lock().map_err(err)?;
+            if p.validation_cursor != Some(p.expected_state.len()) {
+                return Err("instrumentation validation missed state events".into());
+            }
+            let events = p.expected_state.len();
+            p.validation_cursor = None;
+            p.expected_state.clear();
+            json!({"logits_differing_bytes":0,"state_differing_bytes":0,"events":events})
+        } else { Value::Null };
+
+        // All-prefill: retain the actual pp8192 activation geometry (including
+        // the final 512-row chunk), in addition to the split decode sanity run.
         bundle.reset(&mut gpu).map_err(err)?;
         gpu.hip.device_synchronize().map_err(err)?;
         phase("untapped prefill");
+        if has_dump {
+            probe.lock().map_err(err)?.phase = "all_prefill";
+            let full_probe = Arc::clone(&probe);
+            bundle.set_qsa_tap(Some(Box::new(move |gpu, slot, op|
+                full_probe.lock().map_err(err)?.full_evidence(gpu, slot, op)))).map_err(err)?;
+        }
         let t = Instant::now();
         bundle.forward_chunk_final(&mut gpu, prompt, &logits, None).map_err(err)?;
         gpu.hip.device_synchronize().map_err(err)?;
         let prefill_s = t.elapsed().as_secs_f64();
         let prefill_logits = gpu.download_f32(&logits).map_err(err)?;
+        bundle.set_qsa_tap(None).map_err(err)?;
+        bundle.set_qsa_projection_hook(None).map_err(err)?;
         // Final-row logits of the all-prefill route, for cross-arm KL (e.g.
         // compressed QSA state against the F32 reference).
         let bytes: Vec<u8> = prefill_logits.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -661,6 +1014,7 @@ fn main() -> Result<()> {
             "max_abs_diff": max_diff, "kl_prefill_decode": kl,
             "argmax_prefill": argmax(&prefill_logits), "argmax_decode": argmax(&decode_logits),
             "top5_overlap": top5_overlap,
+            "instrumentation": instrumentation,
             "prefill_s": prefill_s, "prefill_tok_s": ctx as f64 / prefill_s,
             "tapped_prefill_s": tapped_prefill_s, "greedy_tok_s": decode_tok_s,
             "greedy_text": tokenizer.decode(&generated),

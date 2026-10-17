@@ -14,20 +14,24 @@
 // `_slots` entry points SP1 built, and DeltaNet through a per-slot loop
 // over SP2's per-slot `DeltaNetState`.
 //
-// Scope: dense layers admit uniform `Q8_0` or a uniform MQ-family projection
-// dtype the multi-slot body already implements (MQ4G256 / MQ4G256V2 /
-// MQ4CG256 / MQ6G256V2 / MQ5G256V2 / MQ3G256V2 / MQ2G256V2). Every weight a
-// `DeltaNet`/`FullAttn` (dense) layer touches (QKV/QKVZA, wo, gate/up, down,
-// and the lm_head) must share one admitted dtype; the KV cache is
-// Q8_0-quantized and DeltaNet state is `StateQuant::Q8` regardless. MQ4G256
-// differs only in that activations are FWHT-rotated before each GEMM and the
-// `*Hfq4G256` kernel keys are used (MQ4 shares HFQ4's byte layout) — the same
-// treatment the MoE bodies already gave their attention projections. This is
-// what lets a dense MQ4 checkpoint such as `qwen3.6-27b.mq4` run multi-slot.
-// MQ4G256V2 (qt=44) and MQ6G256V2 (qt=47) use dedicated V2 residual/fused keys
-// selected by weight CONTAINER (`residual_gemm_key_for` / `fused_*_key_for`) —
-// never the V1 HFQ4 keys. MQ3/ParoQ4G128 and mixed-dtype-within-layer remain
-// unported for the dense body. This matches the ABI the multi-slot
+// Scope: dense and MoE attention projections are admitted per SITE via
+// `plan_proj_group` / `slots_check_residual_weight` (see `slots_proj_admissible`
+// for the admitted container set): a fused group — {wqkv,wz,wβ,wα} (DeltaNet),
+// {wq,wk,wv} (FullAttn), {w_gate,w_up} (FFN) — keeps its single fused launch
+// when every member shares one container, and any admitted mix inside the
+// group falls back to per-weight plain GEMMs with each member reading the
+// activation variant its own dtype wants (`slots_norm_site` produces the
+// rotated and/or normed buffer; rotated consumers MUST NOT read the
+// unrotated buffer and vice versa). This is what lets the `--tier xt/base/
+// pro` and `--fixed-tier` recipes — which lift individual projections to
+// Q8_0 inside an MQ4V2 body — run multi-slot. Residual roles (wo, w_down)
+// dispatch on the weight's own dtype; `slots_residual_gemm_key` selects the
+// container (never a wildcard v1 fallback). Uniform Q8_0 groups take the
+// WMMA fused kernels only on WMMA archs with the prefill WMMA switch on,
+// otherwise the reference's plain-GEMM fork (`plan_q8_fused_or_plain`).
+// DeltaNet state stays `StateQuant::Q8` regardless. Out of scope: Lloyd-V2,
+// PARO, E8/MFP4 and G128-rotated containers (named `HipError` refusals).
+// This matches the ABI the multi-slot
 // infrastructure was actually built against — `SlotPool`'s per-slot
 // descriptor addressing (`KvSlotDesc`, with separate legacy K/V bases for
 // the tiers whose K/V strides differ), the `*_batched_slots` write/attend
@@ -60,12 +64,18 @@
 // reference's own `prefill_moe_ffn_body_batched` directly over the flat N-row
 // batch, gated by the reference's own `moe_ffn_batched_admissible` (uniform
 // MQ4G256V2 / MQ6G256V2 shared+routed paths ride that shared gate — no
-// duplicate MoE dispatch in this file). PARO/Lloyd/E8/mixed-dtype MoE
-// attention outside the shared gate, and mixed-dtype-within-layer attention
-// projections, remain out of scope here (see
-// `require_batchable_deltanet_moe_layer` / `require_batchable_fullattn_moe_layer`
-// / `require_batchable_moe_ffn`) — each returns a clear `HipError` rather than
-// guessing at an untested path.
+// duplicate MoE dispatch in this file). Attention and dense-FFN projections
+// are admitted per SITE via `plan_proj_group` / `slots_check_residual_weight`:
+// any mix of `slots_proj_admissible` containers within a fused group falls
+// back to per-weight plain GEMMs (AWQ sidecars refuse mixed groups), and
+// PARO/Lloyd-V2/E8/G128-rotated containers stay out of scope — every refusal
+// returns a clear `HipError` rather than guessing at an untested path.
+// Legacy v1 MQ6G256 (qt=15) MoE attention rides the uniform-group path: AWQ
+// A3B checkpoints (`ornith-1.5:35b-a3b`, `qwen3.6-35b-a3b.mq4-awq-mi300x`)
+// ship 4/40 layers — 0, 1, 38, 39 — with uniformly MQ6G256 attention; it
+// shares HFQ6G256's 200 B/group container, so the container selectors route
+// it to the `*Hfq6G256` keys after the same FWHT rotate, exactly the
+// reference's `is_6bit` arms.
 //
 // DeltaNet slot-state note: only the GDN recurrence and the conv1d causal
 // state are sequential-per-slot (both carry state across steps: the S
@@ -81,6 +91,8 @@
 // like the FullAttention layer body (whose only slot-aware steps are the
 // KV write and the attend call, both single launches via the `_slots`
 // entry points — RoPE is slot-agnostic per SP2 Task 2 and needs no split).
+
+pub mod vmm;
 
 use crate::qwen35::prefill::is_batchable_la;
 use crate::qwen35::{
@@ -144,18 +156,22 @@ fn pack_descs(descs: &[KvSlotDesc]) -> Vec<u8> {
 /// The multi-slot path originally shipped Q8_0-only (see this file's header
 /// comment); it is now tier-generic across the static ladder the qwen35
 /// carrier resolves — q8, asym{2,3,4}, fwht{2,3,4} — under BOTH the legacy
-/// slab pool and the paged pool. The tier touches exactly two steps of the
-/// FullAttention layer body: the KV write (K through the tier's packed
-/// writer, V through the Q8_0 writer resolving `legacy_v_base`) and the
-/// attend call (the tier's descriptor-driven flash kernel). Everything else
-/// — projections, RoPE, DeltaNet, sampling — is tier-agnostic.
+/// slab pool and the paged pool, plus the flat native tiers bf16/f16 and
+/// the native fp8 tier (gfx1201-only; every other arch refuses at load).
+/// The tier touches exactly two steps of the FullAttention layer body: the
+/// KV write (K through the tier's packed writer, V through the Q8_0 writer
+/// resolving `legacy_v_base`; the flat tiers and fp8 write V through their
+/// own writer, K and V strides equal) and the attend call (the tier's
+/// descriptor-driven kernel). Everything else — projections, RoPE,
+/// DeltaNet, sampling — is tier-agnostic.
 ///
 /// The tables are model-global (shared by every slot and every layer):
 /// Givens angles for the asym tiers, ±1 FWHT sign vectors for the fwht
-/// tiers, none for q8/bf16. They are built once by the rig with the same
-/// seeds as the sequential path's constructors (`gen_givens_angles(42, ·)`,
-/// `gen_fwht_signs(42|1042, ·)`), so the packed cache bytes a slot pool
-/// produces are bit-identical to the sequential engine's for the same tier.
+/// tiers, none for q8/bf16/f16/fp8. They are built once by the rig with the
+/// same seeds as the sequential path's constructors
+/// (`gen_givens_angles(42, ·)`, `gen_fwht_signs(42|1042, ·)`), so the packed
+/// cache bytes a slot pool produces are bit-identical to the sequential
+/// engine's for the same tier.
 pub struct SlotKvTier {
     pub mode: KvMode,
     /// Givens cos table (`[head_dim/2]` f32) — asym tiers only.
@@ -336,121 +352,550 @@ impl SlotDescStaging {
     }
 }
 
-/// Projection dtypes the multi-slot attention/FFN body can run: Q8_0 is a
-/// separate path; everything else here is the FWHT-rotated MQ family that
-/// routes through `residual_gemm_key_for` / `fused_*_key_for`. Uniformity is
-/// still required per layer (mixed qt=13/qt=44 would mis-decode headers).
-fn slots_mq_proj_family(dt: DType) -> bool {
+
+/// Where one FullAttention layer's KV lives for a slots step.
+///
+/// `Arena` is the explicitly-legacy shared-arena route (`SlotPool` slab or
+/// paged), addressed through `KvSlotDesc` offsets into one arena tensor per
+/// layer. `Vmm` is the per-request route: every request owns its own
+/// `KvCache` VMM reservation and this layer's `VmmKvSlotDesc` table carries
+/// each request's absolute per-layer K/V base VA. The two descriptor ABIs are
+/// never reinterpreted as one another.
+pub(crate) enum LayerKvAddr<'a> {
+    Arena {
+        k_cache: &'a GpuTensor,
+        v_cache: &'a GpuTensor,
+        desc_staging: &'a SlotDescStaging,
+        single_slot: Option<(u64, usize)>,
+        n_tiles: Option<usize>,
+    },
+    Vmm(vmm::VmmLayerKv<'a>),
+}
+
+/// KV write + attend for one FullAttention layer step on either storage.
+#[allow(clippy::too_many_arguments)]
+fn layer_kv_write_attend(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    kv: &SlotKvTier,
+    addr: &LayerKvAddr,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    n: usize,
+    physical_cap: usize,
+    max_ctx_len: usize,
+) -> HipResult<()> {
+    match addr {
+        LayerKvAddr::Arena {
+            k_cache,
+            v_cache,
+            desc_staging,
+            single_slot,
+            n_tiles,
+        } => {
+            // Batched KV write — slot-aware, ONE launch per arena across every
+            // slot, on the engine's resolved KV tier (`kv.mode`). Both arenas
+            // resolve through the descriptor table (block tables under paged);
+            // on the rotated-K tiers the V write resolves the descriptor's
+            // `legacy_v_base`, which differs from `legacy_k_base`.
+            kv_write_slots(
+                gpu,
+                kv,
+                k_cache,
+                v_cache,
+                &pbs.fa_k_batch,
+                &pbs.fa_v_batch,
+                &pbs.positions,
+                config.n_kv_heads,
+                config.head_dim,
+                n,
+                &desc_staging.descs_dev,
+                &desc_staging.row_slot_dev,
+            )?;
+            // Batched attend — slot-aware, one launch across every slot.
+            // `positions[]` (not any `desc.seq_len`) is authoritative for the
+            // causal bound inside the ported kernels — SP1's only Critical
+            // defect came from conflating the two on a tile kernel bounded by
+            // `desc.seq_len` while the shared reduce kernel stayed bounded by
+            // `positions[]`. `tree_bias` is never combined with descriptors
+            // here (asserted out of SP1 scope).
+            tier_attend_slots(
+                gpu,
+                kv,
+                &pbs.fa_q_batch,
+                k_cache,
+                v_cache,
+                &pbs.fa_attn_out_batch,
+                &pbs.positions,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                physical_cap,
+                max_ctx_len,
+                n,
+                &s.flash_partials,
+                &desc_staging.descs_dev,
+                &desc_staging.row_slot_dev,
+                *single_slot,
+                n_tiles.map(|nt| {
+                    (
+                        &desc_staging.tile_slot_dev,
+                        &desc_staging.tile_row0_dev,
+                        &desc_staging.tile_qbase_dev,
+                        nt,
+                    )
+                }),
+            )
+        }
+        LayerKvAddr::Vmm(layer) => {
+            vmm::vmm_kv_write_attend(gpu, config, layer, pbs, n)
+        }
+    }
+}
+
+/// Projection dtypes the multi-slot attention/FFN body can run at all
+/// (uniform OR as a mixed-group member). The arch-sensitive half defers
+/// to the shared `is_batchable_la` (MQ3/MQ3-Lloyd WMMA, MQ*V2 WMMA
+/// eligibility, etc.) so no duplicate admit table drifts here.
+fn slots_proj_admissible(dt: DType, arch: &str) -> bool {
+    let member = matches!(
+        dt,
+        DType::Q8_0
+            | DType::MQ4G256
+            | DType::HFQ4G256
+            | DType::MQ4G256V2
+            | DType::MQ4CG256
+            | DType::MQ6G256
+            | DType::HFQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
+            | DType::MQ3G256
+            | DType::MQ3G256V2
+            | DType::MQ3G256Lloyd
+            | DType::MQ2G256V2
+    );
+    member && is_batchable_la(dt, arch)
+}
+
+/// Dtypes whose stored weights are offline-FWHT-rotated over G256 groups:
+/// the activation must be rotated by the matching producer before the
+/// GEMM. Mirrors the `is_mq` set in `batch_chunk_delta_net_input_projection`
+/// minus the containers slots refuses (MQ4G256V2Lloyd has no uniform key
+/// anywhere; MFP4G32 and G128-rotated families stay out of v1).
+fn slots_weight_rotated(dt: DType) -> bool {
     matches!(
         dt,
         DType::MQ4G256
             | DType::MQ4G256V2
             | DType::MQ4CG256
+            | DType::MQ6G256
             | DType::MQ6G256V2
             | DType::MQ5G256V2
+            | DType::MQ3G256
             | DType::MQ3G256V2
+            | DType::MQ3G256Lloyd
             | DType::MQ2G256V2
     )
 }
 
 /// lm_head dtypes the multi-slot path admits. `Step::Gemv` +
 /// `weights.output.dispatch_ref()` is dtype-generic, so this is an allow-list
-/// of formats whose GEMV/rotate path is known-good. Uniform MQ4G256V2 and
-/// MQ6G256V2 ride the same dispatcher as the single-sequence reference —
-/// no slot-local kernel. Do not silently widen to MQ2/3/5V2 here.
+/// of formats whose GEMV/rotate path is known-good. Covers every container
+/// `--tier`/`--fixed-tier` can lift the head to (q8..mq6v2) plus the HFQ
+/// siblings. Do not silently widen to Lloyd/E8 here.
 fn lm_head_slots_admissible(dt: DType) -> bool {
     matches!(
         dt,
-        DType::Q8_0 | DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256V2
+        DType::Q8_0
+            | DType::MQ4G256
+            | DType::HFQ4G256
+            | DType::MQ4G256V2
+            | DType::MQ4CG256
+            | DType::MQ6G256
+            | DType::HFQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
+            | DType::MQ3G256
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
+            | DType::HFQ3G256
+            | DType::F16
     )
 }
 
-/// Uniform-dtype gate for a `DeltaNetLayerWeights`. All eight projections must
-/// share ONE dtype — `Q8_0` or a slots MQ-family dtype that
-/// [`is_batchable_la`] admits on `arch`. Uniformity is the load-bearing part:
-/// a mixed-dtype layer would silently misroute through one dtype's stride
-/// against a differently-strided weight, the exact corruption class the dense
-/// batched-prefill path guards against at every one of its own dtype branches.
-/// Arch/env gates (MQ4V2/MQ6V2 WMMA on gfx11/12) come from the shared
-/// `is_batchable_la` predicate — no duplicate MQV2 admit table here.
-fn require_batchable_deltanet_layer(
+/// Per-projection-group dispatch plan for the dense slot bodies. A "group"
+/// is the operand set of one fused launch in the uniform path:
+/// {wqkv,wz,w_beta,w_alpha} for DeltaNet, {wq,wk,wv} for FullAttn,
+/// {w_gate,w_up} for the FFN.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GroupPlan {
+    /// Every member shares one container: one fused launch (Q8_0 keeps its
+    /// WMMA-vs-plain split at the call site).
+    Uniform(DType),
+    /// Members differ: per-weight plain GEMMs. Plan time has already
+    /// verified every member has a `slots_plain_gemm_key` and that AWQ
+    /// sidecars are consistent: flat members must be scale-free (the
+    /// plain GEMM has no AWQ fold), and rotated members must all agree
+    /// on sidecar presence (the shared rotated basis carries one scale).
+    Mixed { needs_rot: bool, needs_norm: bool },
+}
+
+/// Plain (single-weight) batched GEMM key for a projection dtype, or None
+/// when no plain kernel exists (uniform-only containers: HFQ6/MQ6, MQ3,
+/// MQ3-Lloyd — those can only appear in Uniform groups).
+fn slots_plain_gemm_key(dt: DType) -> Option<KernelKey> {
+    Some(match dt {
+        DType::Q8_0 => KernelKey::GemmQ8_0BatchedChunked,
+        DType::MQ4G256 | DType::HFQ4G256 => KernelKey::GemmHfq4G256,
+        DType::MQ4G256V2 => KernelKey::GemmMq4G256V2,
+        DType::MQ4CG256 => KernelKey::GemmMq4CG256,
+        DType::MQ6G256V2 => KernelKey::GemmMq6G256V2,
+        DType::MQ5G256V2 => KernelKey::GemmMq5G256V2,
+        DType::MQ3G256V2 => KernelKey::GemmMq3G256V2,
+        DType::MQ2G256V2 => KernelKey::GemmMq2G256V2,
+        _ => return None,
+    })
+}
+
+/// Residual-GEMM key for a non-Q8 projection. `residual_gemm_key_for` only
+/// knows the V2 family + defaults to HFQ4, so the HFQ6/HFQ3 containers and
+/// the rotated v1 dtypes that share their payloads are spelled out here.
+fn slots_residual_gemm_key(dt: DType) -> Option<KernelKey> {
+    Some(match dt {
+        DType::MQ4G256V2 => KernelKey::GemmMq4G256V2Residual,
+        DType::MQ4CG256 => KernelKey::GemmMq4CG256Residual,
+        DType::MQ6G256V2 => KernelKey::GemmMq6G256V2Residual,
+        DType::MQ5G256V2 => KernelKey::GemmMq5G256V2Residual,
+        DType::MQ3G256V2 => KernelKey::GemmMq3G256V2Residual,
+        DType::MQ2G256V2 => KernelKey::GemmMq2G256V2Residual,
+        DType::MQ4G256 | DType::HFQ4G256 => KernelKey::GemmHfq4G256Residual,
+        DType::MQ6G256 | DType::HFQ6G256 => KernelKey::GemmHfq6G256Residual,
+        DType::MQ3G256 => KernelKey::GemmHfq3G256Residual,
+        DType::MQ3G256Lloyd => KernelKey::GemmMq3G256LloydResidual,
+        _ => return None,
+    })
+}
+
+/// Validate one weight for the residual-projection role (wo, w_down):
+/// Q8_0, an admitted rotated container, or any admitted container with a
+/// residual key. Names the projection in the error.
+fn slots_check_residual_weight(w: &WeightTensor, name: &str, arch: &str) -> HipResult<()> {
+    let dt = w.gpu_dtype;
+    if dt == DType::Q8_0
+        || (slots_proj_admissible(dt, arch)
+            && (slots_weight_rotated(dt) || slots_residual_gemm_key(dt).is_some()))
+    {
+        return Ok(());
+    }
+    Err(HipError::new(
+        0,
+        &format!(
+            "forward_batch_slots: {name} dtype {dt:?} is not admitted by the multi-slot \
+             dense path on {arch} (residual role needs Q8_0, a rotated MQ-family container, \
+             or a container with a residual GEMM key)"
+        ),
+    ))
+}
+
+/// Plan one projection group (see [`GroupPlan`]) from dtype+AWQ summaries —
+/// the pure core, unit-testable without GPU buffers. Uniform groups need
+/// every member admitted; mixed groups additionally need a plain key per
+/// member. AWQ sidecars in a mixed group are admitted only when every
+/// ROTATED member carries one — the AWQ divide folds into the fused
+/// norm+rotate that produces the shared rotated basis (one scale call, so
+/// presence must agree), while a flat member's sidecar has no kernel to
+/// apply it and must be refused outright.
+fn plan_proj_group_dtypes(members: &[(DType, bool)], arch: &str) -> Result<GroupPlan, String> {
+    for (dt, _) in members {
+        if !slots_proj_admissible(*dt, arch) {
+            return Err(format!(
+                "weight dtype {dt:?} is not admitted by the multi-slot dense path on {arch}"
+            ));
+        }
+    }
+    let d0 = members[0].0;
+    if members.iter().all(|(dt, _)| *dt == d0) {
+        return Ok(GroupPlan::Uniform(d0));
+    }
+    // AWQ in a mixed group: a flat member's sidecar has no fused kernel to
+    // fold into (the plain GEMM reads the natural basis) — refuse it
+    // outright. Rotated members may carry sidecars, but only uniformly:
+    // the fused norm+rotate applies ONE awq_scale to the shared rotated
+    // activation (siblings share input, so the quantizer emits them the
+    // same scale; presence is what must agree).
+    let rotated_have_awq = members
+        .iter()
+        .filter(|(dt, _)| slots_weight_rotated(*dt))
+        .map(|(_, awq)| *awq);
+    let n_rot_awq = rotated_have_awq.clone().filter(|a| *a).count();
+    let n_rot = rotated_have_awq.count();
+    if members
+        .iter()
+        .any(|(dt, awq)| *awq && !slots_weight_rotated(*dt))
+    {
+        return Err(
+            "mixes dtypes and a FLAT member carries an AWQ sidecar — no fused \
+             kernel applies it on the natural basis"
+                .to_string(),
+        );
+    }
+    if n_rot_awq != 0 && n_rot_awq != n_rot {
+        return Err(
+            "mixes dtypes and rotated members disagree on AWQ sidecar presence \
+             — one shared rotated activation cannot serve both"
+                .to_string(),
+        );
+    }
+    for (dt, _) in members {
+        if slots_plain_gemm_key(*dt).is_none() {
+            return Err(format!(
+                "mixes dtypes and {dt:?} has no per-projection GEMM key \
+                 (uniform-only container) — quantize the whole group to one dtype"
+            ));
+        }
+    }
+    Ok(GroupPlan::Mixed {
+        needs_rot: members.iter().any(|(dt, _)| slots_weight_rotated(*dt)),
+        needs_norm: members.iter().any(|(dt, _)| !slots_weight_rotated(*dt)),
+    })
+}
+
+/// Weight-bearing wrapper: names the group in the error and reads the AWQ
+/// sidecar off each `WeightTensor`.
+fn plan_proj_group(
+    weights: &[&WeightTensor],
+    group: &str,
+    arch: &str,
+) -> HipResult<GroupPlan> {
+    let members: Vec<(DType, bool)> = weights
+        .iter()
+        .map(|w| (w.gpu_dtype, w.awq_scale.is_some()))
+        .collect();
+    plan_proj_group_dtypes(&members, arch)
+        .map_err(|why| HipError::new(0, &format!("forward_batch_slots: {group} {why}")))
+}
+
+/// Layer-level admission preflight over the per-site machinery: every fused
+/// group of the layer must plan (uniform OR mixed) and every residual role
+/// must be admitted — exactly the checks the slot runners perform per step,
+/// hoisted so load-time callers (the VMM executor's preflight) can refuse
+/// before any GPU work. The Q8 WMMA fold is admission-neutral (it only
+/// converts an admitted Uniform(Q8_0) into an admitted Mixed) and is
+/// therefore not applied here.
+pub(crate) fn require_batchable_deltanet_layer(
     layer: &DeltaNetLayerWeights,
     arch: &str,
-) -> HipResult<AttnProjDtype> {
-    let all = |d: DType| {
-        layer.wqkv.gpu_dtype == d
-            && layer.wz.gpu_dtype == d
-            && layer.w_beta.gpu_dtype == d
-            && layer.w_alpha.gpu_dtype == d
-            && layer.wo.gpu_dtype == d
-            && layer.w_gate.gpu_dtype == d
-            && layer.w_up.gpu_dtype == d
-            && layer.w_down.gpu_dtype == d
-    };
-    if all(DType::Q8_0) {
-        return Ok(AttnProjDtype::Q8_0);
-    }
-    // Uniform MQ-family: one container across every projection, and that
-    // container must pass the shared batched-prefill LA gate on this arch
-    // (MQ4G256 always; MQ4G256V2/MQ6G256V2 via mqv2 WMMA eligibility).
-    let dt = layer.wqkv.gpu_dtype;
-    if all(dt) && slots_mq_proj_family(dt) && is_batchable_la(dt, arch) {
-        return Ok(AttnProjDtype::Mq4G256);
-    }
-    Err(HipError::new(
-        0,
-        "forward_batch_slots: dense DeltaNet layer is neither uniformly Q8_0 nor \
-         a uniformly batchable MQ-family dtype on this arch; the multi-slot \
-         path admits Q8_0 and slots_mq_proj_family ∩ is_batchable_la \
-         (MQ4G256 / MQ4G256V2 / MQ6G256V2 / …). Mixed-dtype-within-layer, \
-         ParoQ4G128, and non-batchable arches stay out of scope",
-    ))
+) -> HipResult<()> {
+    plan_proj_group(
+        &[&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha],
+        "DeltaNet qkvza",
+        arch,
+    )
+    .map(|_| ())?;
+    slots_check_residual_weight(&layer.wo, "DeltaNet wo", arch)?;
+    plan_proj_group(&[&layer.w_gate, &layer.w_up], "dense FFN gate_up", arch).map(|_| ())?;
+    slots_check_residual_weight(&layer.w_down, "dense FFN w_down", arch)
 }
 
-fn require_batchable_fullattn_layer(
+/// FullAttention twin of [`require_batchable_deltanet_layer`].
+pub(crate) fn require_batchable_fullattn_layer(
     layer: &FullAttnLayerWeights,
     arch: &str,
-) -> HipResult<AttnProjDtype> {
-    let all = |d: DType| {
-        layer.wq.gpu_dtype == d
-            && layer.wk.gpu_dtype == d
-            && layer.wv.gpu_dtype == d
-            && layer.wo.gpu_dtype == d
-            && layer.w_gate.gpu_dtype == d
-            && layer.w_up.gpu_dtype == d
-            && layer.w_down.gpu_dtype == d
-    };
-    if all(DType::Q8_0) {
-        return Ok(AttnProjDtype::Q8_0);
-    }
-    let dt = layer.wq.gpu_dtype;
-    if all(dt) && slots_mq_proj_family(dt) && is_batchable_la(dt, arch) {
-        return Ok(AttnProjDtype::Mq4G256);
-    }
-    Err(HipError::new(
-        0,
-        "forward_batch_slots: dense FullAttention layer is neither uniformly \
-         Q8_0 nor a uniformly batchable MQ-family dtype on this arch; see \
-         require_batchable_deltanet_layer",
-    ))
+) -> HipResult<()> {
+    plan_proj_group(&[&layer.wq, &layer.wk, &layer.wv], "FullAttn qkv", arch).map(|_| ())?;
+    slots_check_residual_weight(&layer.wo, "FullAttn wo", arch)?;
+    plan_proj_group(&[&layer.w_gate, &layer.w_up], "dense FFN gate_up", arch).map(|_| ())?;
+    slots_check_residual_weight(&layer.w_down, "dense FFN w_down", arch)
 }
 
-/// Which batched projection dispatch an attention body should take. Applies to
-/// dense and MoE layers alike: the projections are the same weights either way,
-/// and only the FFN downstream differs.
-/// Mirrors the `is_q8` / `is_mq` dtype forks `forward_prefill_chunk` applies
-/// to `DeltaNetMoe`/`FullAttnMoe` layers (qwen35.rs's DeltaNetMoe LA branch
-/// and FullAttnMoe FA branch) — narrowed to the dtypes this file implements a
-/// slot-aware body for. MQ-family admission further consults the shared
-/// `is_batchable_la` (MQ4G256V2 / MQ6G256V2 on gfx11/gfx12). ParoQ4G128 and
-/// mixed-dtype-within-layer are real paths in the reference but are NOT
-/// ported here; see `require_batchable_deltanet_moe_layer` /
-/// `require_batchable_fullattn_moe_layer`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum AttnProjDtype {
-    Q8_0,
-    Mq4G256,
+/// MoE DeltaNet attention-side preflight (the MoE FFN has its own shared
+/// gate, `require_batchable_moe_ffn`, which callers chain). Takes `arch`
+/// unlike the pre-per-site version: the planners consult `is_batchable_la`.
+pub(crate) fn require_batchable_deltanet_moe_layer(
+    layer: &DeltaNetMoeLayerWeights,
+    arch: &str,
+) -> HipResult<()> {
+    plan_proj_group(
+        &[&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha],
+        "DeltaNetMoE qkvza",
+        arch,
+    )
+    .map(|_| ())?;
+    slots_check_residual_weight(&layer.wo, "DeltaNetMoE wo", arch)
 }
+
+/// MoE FullAttention twin of [`require_batchable_deltanet_moe_layer`].
+pub(crate) fn require_batchable_fullattn_moe_layer(
+    layer: &FullAttnMoeLayerWeights,
+    arch: &str,
+) -> HipResult<()> {
+    plan_proj_group(&[&layer.wq, &layer.wk, &layer.wv], "FullAttnMoE qkv", arch).map(|_| ())?;
+    slots_check_residual_weight(&layer.wo, "FullAttnMoE wo", arch)
+}
+
+/// Post-process a fused-group plan for the Q8 WMMA fork: a uniform Q8_0
+/// group on a non-WMMA arch (or with `HIPFIRE_Q8_PREFILL_WMMA=0`, which
+/// `q8_prefill_wmma_enabled` folds into `q8_wmma_arch`) must NOT take the
+/// WMMA-only `FusedQkvzaQ8_0`/`FusedQkvQ8_0` kernels. Degrade it to the
+/// Mixed machinery, which is the reference's plain fork for that case: one
+/// `GemmQ8_0BatchedChunked` per weight over the normed input
+/// (prefill.rs forks `is_q8 && q8_wmma_arch` the same way at every qkvza /
+/// qkv site).
+fn plan_q8_fused_or_plain(plan: GroupPlan, q8_wmma_arch: bool) -> GroupPlan {
+    if !q8_wmma_arch && plan == GroupPlan::Uniform(DType::Q8_0) {
+        GroupPlan::Mixed {
+            needs_rot: false,
+            needs_norm: true,
+        }
+    } else {
+        plan
+    }
+}
+
+/// Populate the norm-site activation buffers a projection site needs:
+/// `x_norm` gets the rmsnorm output when any consumer is unrotated,
+/// `x_rot` gets the FWHT-rotated normed rows when any consumer is a
+/// rotated container. Uniform rotated sites keep the fused
+/// rmsnorm+rotate producer (bit-identical to the reference); mixed sites
+/// rotate the normed rows afterward (rmsnorm math is identical; only the
+/// kernel fusion differs).
+#[allow(clippy::too_many_arguments)]
+fn slots_norm_site(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    norm: &GpuTensor,
+    rot_anchor: Option<&WeightTensor>,
+    x_rot: &GpuTensor,
+    x_norm: &GpuTensor,
+    need_rot: bool,
+    need_norm: bool,
+    dim: usize,
+    eps: f32,
+    n: usize,
+) -> HipResult<()> {
+    if need_norm {
+        gpu.rmsnorm_batched(x, norm, x_norm, n, dim, eps)?;
+    }
+    if need_rot {
+        let anchor = rot_anchor.ok_or_else(|| {
+            HipError::new(0, "slots_norm_site: need_rot without a rotated weight")
+        })?;
+        if need_norm {
+            rotate_x_mq_batched_for(gpu, anchor, x_norm, x_rot, dim, n)?;
+        } else {
+            fused_rmsnorm_rotate_mq_batched_for(gpu, x, norm, anchor, x_rot, dim, eps, n)?;
+        }
+    }
+    Ok(())
+}
+
+/// Per-weight GEMM for a Mixed group: pick the activation variant from the
+/// consuming weight's dtype (rotated containers read `x_rot`, everything
+/// else reads `x_norm`). Plan time has proven the plain key exists.
+fn slots_plain_proj(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x_rot: &GpuTensor,
+    x_norm: &GpuTensor,
+    y: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    let x = if slots_weight_rotated(w.gpu_dtype) { x_rot } else { x_norm };
+    run_plain_gemm_key(
+        gpu,
+        slots_plain_gemm_key(w.gpu_dtype).expect("mixed group members have plain keys"),
+        &w.buf,
+        w.gpu_dtype,
+        x,
+        y,
+        w.m,
+        w.k,
+        n,
+    )
+}
+
+/// Embedding formats the slots paths admit for a batched lookup. HostF32
+/// embeds (qt1/2/16/40/41/44/45/47-50, see `embed_classify`) arrive as
+/// `EmbeddingFormat::F32` and gather via `embedding_lookup_f32_batched`;
+/// the raw formats keep their own batched dequant kernels. Shared by the
+/// slot forward and the VMM executor so the two cannot drift.
+pub(crate) fn slots_embed_format_admitted(fmt: EmbeddingFormat) -> HipResult<()> {
+    match fmt {
+        EmbeddingFormat::Q8_0
+        | EmbeddingFormat::F32
+        | EmbeddingFormat::HFQ4G256
+        | EmbeddingFormat::HFQ4G128 => Ok(()),
+        other => Err(HipError::new(
+            0,
+            &format!(
+                "forward_batch_slots: embedding format {other:?} has no batched \
+                 lookup in the slots path (admitted: Q8_0, F32, HFQ4G256, HFQ4G128)"
+            ),
+        )),
+    }
+}
+
+/// Batched embedding lookup for the admitted slots formats: every branch
+/// reads token ids from a device buffer, so the call replays under graph
+/// capture (a host-side per-row D2D would bake stale offsets).
+pub(crate) fn embed_lookup_slots(
+    gpu: &mut Gpu,
+    fmt: EmbeddingFormat,
+    table: &GpuTensor,
+    output: &GpuTensor,
+    token_ids: &GpuTensor,
+    n: usize,
+    dim: usize,
+) -> HipResult<()> {
+    match fmt {
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(table, output, token_ids, n, dim),
+        EmbeddingFormat::F32 => gpu.embedding_lookup_f32_batched(table, output, token_ids, n, dim),
+        EmbeddingFormat::HFQ4G256 => {
+            gpu.embedding_lookup_hfq4g256_batched(table, output, token_ids, n, dim)
+        }
+        EmbeddingFormat::HFQ4G128 => {
+            gpu.embedding_lookup_hfq4g128_batched(table, output, token_ids, n, dim)
+        }
+        other => Err(HipError::new(
+            0,
+            &format!("embed_lookup_slots: unsupported format {other:?}"),
+        )),
+    }
+}
+
+/// `y += w · x`, dispatching by `w.gpu_dtype` alone: Q8_0 residual path,
+/// rotated containers rotate `x` into `rot_scratch` first, plain
+/// containers project `x` directly. Replaces the layer-uniform arm the
+/// old `AttnProjDtype` forced.
+#[allow(clippy::too_many_arguments)]
+fn slots_residual_proj(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    rot_scratch: &GpuTensor,
+    q8_scratch: &GpuTensor,
+    n: usize,
+    q8_wmma_arch: bool,
+) -> HipResult<()> {
+    let dt = w.gpu_dtype;
+    if dt == DType::Q8_0 {
+        return q8_residual_proj(gpu, w, x, y, q8_scratch, n, q8_wmma_arch);
+    }
+    if slots_weight_rotated(dt) {
+        return mq4_residual_proj(gpu, w, x, y, rot_scratch, n);
+    }
+    let key = slots_residual_gemm_key(dt).ok_or_else(|| {
+        HipError::new(
+            0,
+            &format!("forward_batch_slots: residual projection dtype {dt:?} has no residual key"),
+        )
+    })?;
+    let y_n = y.sub_offset(0, n * w.m);
+    run_residual_gemm_key(gpu, key, &w.buf, dt, x, &y_n, w.m, w.k, n)
+}
+
+
 
 // ── Kernel-key selection by weight CONTAINER, never hardcoded ──────────────
 //
@@ -474,12 +919,18 @@ enum AttnProjDtype {
 
 pub(crate) fn fused_qkvza_key_for(dt: DType) -> KernelKey {
     match dt {
+        DType::Q8_0 => KernelKey::FusedQkvzaQ8_0,
         DType::MQ4G256V2 => KernelKey::FusedQkvzaMq4G256V2,
         DType::MQ4CG256 => KernelKey::FusedQkvzaMq4CG256,
         DType::MQ6G256V2 => KernelKey::FusedQkvzaMq6G256V2,
         DType::MQ5G256V2 => KernelKey::FusedQkvzaMq5G256V2,
         DType::MQ3G256V2 => KernelKey::FusedQkvzaMq3G256V2,
         DType::MQ2G256V2 => KernelKey::FusedQkvzaMq2G256V2,
+        // qt=15/qt=8 are the 200 B/group 6-bit container: an HFQ4 key would
+        // read them at the 136 B HFQ4 stride and return noise at full speed.
+        DType::MQ6G256 | DType::HFQ6G256 => KernelKey::FusedQkvzaHfq6G256,
+        DType::MQ3G256 => KernelKey::FusedQkvzaHfq3G256,
+        DType::MQ3G256Lloyd => KernelKey::FusedQkvzaMq3G256Lloyd,
         // qt=52 must NEVER alias a uniform fused key: no fused LUT kernel exists.
         DType::MQ4G256V2Lloyd => panic!(
             "fused_qkvza_key_for: MQ4G256V2Lloyd (qt=52) has no fused key — route Lloyd prefill through gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd"
@@ -490,12 +941,16 @@ pub(crate) fn fused_qkvza_key_for(dt: DType) -> KernelKey {
 
 pub(crate) fn fused_qkv_key_for(dt: DType) -> KernelKey {
     match dt {
+        DType::Q8_0 => KernelKey::FusedQkvQ8_0,
         DType::MQ4G256V2 => KernelKey::FusedQkvMq4G256V2,
         DType::MQ4CG256 => KernelKey::FusedQkvMq4CG256,
         DType::MQ6G256V2 => KernelKey::FusedQkvMq6G256V2,
         DType::MQ5G256V2 => KernelKey::FusedQkvMq5G256V2,
         DType::MQ3G256V2 => KernelKey::FusedQkvMq3G256V2,
         DType::MQ2G256V2 => KernelKey::FusedQkvMq2G256V2,
+        DType::MQ6G256 | DType::HFQ6G256 => KernelKey::FusedQkvHfq6G256,
+        DType::MQ3G256 => KernelKey::FusedQkvHfq3G256,
+        DType::MQ3G256Lloyd => KernelKey::FusedQkvMq3G256Lloyd,
         // qt=52 must NEVER alias a uniform fused key: no fused LUT kernel exists.
         DType::MQ4G256V2Lloyd => panic!(
             "fused_qkv_key_for: MQ4G256V2Lloyd (qt=52) has no fused key — route Lloyd prefill through gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd"
@@ -504,96 +959,7 @@ pub(crate) fn fused_qkv_key_for(dt: DType) -> KernelKey {
     }
 }
 
-/// Q8_0-or-MQ4G256 weight-dtype gate for a `DeltaNetMoeLayerWeights`,
-/// uniform across all five attention projections (wqkv/wz/w_beta/w_alpha/wo)
-/// — a mixed Q8/MQ4 layer would misroute through a single-stride fused
-/// kernel against differently-strided weights, the same corruption class
-/// `require_q8_deltanet_layer` guards against for the dense path. MQ4G256
-/// requires the caller to additionally rotate activations via
-/// `fused_rmsnorm_rotate_mq_batched_for`/`rotate_x_mq_batched_for` before
-/// each GEMM — see `run_deltanet_moe_layer_slots`.
-fn require_batchable_deltanet_moe_layer(
-    layer: &DeltaNetMoeLayerWeights,
-) -> HipResult<AttnProjDtype> {
-    let all_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0)
-        && matches!(layer.wz.gpu_dtype, DType::Q8_0)
-        && matches!(layer.w_beta.gpu_dtype, DType::Q8_0)
-        && matches!(layer.w_alpha.gpu_dtype, DType::Q8_0)
-        && matches!(layer.wo.gpu_dtype, DType::Q8_0);
-    if all_q8 {
-        return Ok(AttnProjDtype::Q8_0);
-    }
-    // Renamed from `mq4c` now that MQ4C/qt=45 is a real format name — this predicate
-    // is the whole MQ4 FAMILY, not that one container.
-    let mq4_family = |d: DType| {
-        matches!(
-            d,
-            DType::MQ4G256
-                | DType::MQ4G256V2
-                | DType::MQ4CG256
-                | DType::MQ6G256V2
-                | DType::MQ5G256V2
-                | DType::MQ3G256V2
-                | DType::MQ2G256V2
-        )
-    };
-    let all_mq4 = mq4_family(layer.wqkv.gpu_dtype)
-        && layer.wz.gpu_dtype == layer.wqkv.gpu_dtype
-        && layer.w_beta.gpu_dtype == layer.wqkv.gpu_dtype
-        && layer.w_alpha.gpu_dtype == layer.wqkv.gpu_dtype
-        && layer.wo.gpu_dtype == layer.wqkv.gpu_dtype;
-    if all_mq4 {
-        return Ok(AttnProjDtype::Mq4G256);
-    }
-    Err(HipError::new(
-        0,
-        "forward_batch_slots: DeltaNetMoe layer attention weights must be \
-         uniformly Q8_0 or uniformly MQ4G256 (mirrors forward_prefill_chunk's \
-         is_q8/is_mq dispatch); MQ6G256/HFQ6G256, ParoQ4G128, and mixed-dtype \
-         MoE attention are out of scope for the multi-slot batched path",
-    ))
-}
 
-/// Same gate as [`require_batchable_deltanet_moe_layer`] for a
-/// `FullAttnMoeLayerWeights` (wq/wk/wv/wo).
-fn require_batchable_fullattn_moe_layer(
-    layer: &FullAttnMoeLayerWeights,
-) -> HipResult<AttnProjDtype> {
-    let all_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0)
-        && matches!(layer.wk.gpu_dtype, DType::Q8_0)
-        && matches!(layer.wv.gpu_dtype, DType::Q8_0)
-        && matches!(layer.wo.gpu_dtype, DType::Q8_0);
-    if all_q8 {
-        return Ok(AttnProjDtype::Q8_0);
-    }
-    let mq4_family = |d: DType| {
-        matches!(
-            d,
-            DType::MQ4G256
-                | DType::MQ4G256V2
-                | DType::MQ4CG256
-                | DType::MQ6G256V2
-                | DType::MQ5G256V2
-                | DType::MQ3G256V2
-                | DType::MQ2G256V2
-        )
-    };
-    let all_mq4 = mq4_family(layer.wq.gpu_dtype)
-        && layer.wk.gpu_dtype == layer.wq.gpu_dtype
-        && layer.wv.gpu_dtype == layer.wq.gpu_dtype
-        && layer.wo.gpu_dtype == layer.wq.gpu_dtype;
-    if all_mq4 {
-        return Ok(AttnProjDtype::Mq4G256);
-    }
-    Err(HipError::new(
-        0,
-        "forward_batch_slots: FullAttnMoe layer attention weights must be \
-         uniformly Q8_0 or uniformly MQ4G256 (mirrors forward_prefill_chunk's \
-         qkv_is_q8/qkv_is_mq dispatch); MQ6G256/HFQ6G256, ParoQ4G128, and \
-         mixed-dtype MoE attention are out of scope for the multi-slot \
-         batched path",
-    ))
-}
 
 /// MoE-FFN weight-dtype admissibility gate, delegating to the reference's own
 /// `moe_ffn_batched_admissible` (same predicate `prefill_batch_pbs_eligible`
@@ -630,12 +996,15 @@ fn require_batchable_moe_ffn(gpu: &Gpu, ffn: &MoeFfnWeights) -> HipResult<()> {
     }
 }
 
-/// FWHT-rotated MQ4G256 residual projection: `y[0..n*m] += w · FWHT(x[0..n*k])`.
-/// Mirrors the reference's default (non-Q8/non-6bit/non-PARO) wo / w_down
-/// dispatch fork for `DeltaNetMoe`/`FullAttnMoe` layers — `GemmHfq4G256Residual`
-/// against a `rotate_x_mq_batched_for`-rotated input. `scratch` is the
-/// caller's dead buffer to rotate into (mirrors `pbs.dn_normed_rot_batch` /
-/// `pbs.fa_attn_out_rot_batch` reuse in the dense Q8 path's `q8_residual_proj`).
+/// FWHT-rotated residual projection: `y[0..n*m] += w · FWHT(x[0..n*k])` for
+/// any rotated container (`slots_weight_rotated`). The residual key MUST come
+/// from `slots_residual_gemm_key`, NOT `residual_gemm_key_for`: the dispatch
+/// helper only knows the V2 family and defaults everything else to
+/// `GemmHfq4G256Residual`, which silently mis-decodes the 200 B/group
+/// MQ6G256 and 104 B/group MQ3G256/MQ3G256Lloyd headers (see the
+/// container-selection note below). `scratch` is the caller's dead buffer to
+/// rotate into (mirrors `pbs.dn_normed_rot_batch` / `pbs.fa_attn_out_rot_batch`
+/// reuse in the dense Q8 path's `q8_residual_proj`).
 fn mq4_residual_proj(
     gpu: &mut Gpu,
     w: &WeightTensor,
@@ -646,9 +1015,18 @@ fn mq4_residual_proj(
 ) -> HipResult<()> {
     rotate_x_mq_batched_for(gpu, w, x, scratch, w.k, n)?;
     let y_n = y.sub_offset(0, n * w.m);
+    let key = slots_residual_gemm_key(w.gpu_dtype).ok_or_else(|| {
+        HipError::new(
+            0,
+            &format!(
+                "forward_batch_slots: rotated residual dtype {:?} has no residual key",
+                w.gpu_dtype
+            ),
+        )
+    })?;
     run_residual_gemm_key(
         gpu,
-        residual_gemm_key_for(w.gpu_dtype),
+        key,
         &w.buf,
         w.gpu_dtype,
         scratch,
@@ -761,17 +1139,19 @@ fn q8_gate_up_proj(
     }
 }
 
-/// Dense FFN body, dtype-forked. Mirrors the reference's dense
-/// `ffn_is_mq`/`ffn_is_q8` forks (qwen35.rs LA and FA branches) exactly:
+/// Dense FFN body, dispatched per site from the gate/up group's dtypes and
+/// `w_down`'s own dtype:
 ///
-///   * MQ4G256 — `fused_rmsnorm_rotate_mq_batched_for(w_gate)`, the
-///     `FusedGateUpHfq4G256` fused gate+up, then **`fused_silu_mul_rotate_mq_
-///     batched_for(w_down)`** and a plain `GemmHfq4G256Residual`. The rotate
-///     for `w_down` is FUSED INTO the SwiGLU, so this must NOT route through
-///     `mq4_residual_proj` (which rotates its own input) — that would rotate
-///     twice and is the one place the two dtypes are not symmetric.
-///   * Q8_0 — plain rmsnorm, `q8_gate_up_proj`, plain `silu_mul_f32`,
-///     `q8_residual_proj`.
+///   * gate/up Uniform rotated — `fused_rmsnorm_rotate_mq_batched_for` +
+///     one fused gate+up launch. Uniform unrotated (HFQ4G256) — separate
+///     rmsnorm + fused launch. Uniform Q8_0 — `q8_gate_up_proj`.
+///   * gate/up Mixed — rmsnorm (+rotate when a member needs it) then one
+///     plain GEMM per weight, each reading the variant its dtype wants.
+///   * w_down — rotated: `fused_silu_mul_rotate_mq_batched_for` + the
+///     container's residual key. The rotate is FUSED INTO the SwiGLU, so
+///     this must NOT route through `mq4_residual_proj` (which rotates its
+///     own input). Unrotated non-Q8: plain silu_mul + `slots_residual_gemm_
+///     key`. Q8: `q8_residual_proj`.
 #[allow(clippy::too_many_arguments)]
 fn dense_ffn_body_slots(
     gpu: &mut Gpu,
@@ -781,86 +1161,110 @@ fn dense_ffn_body_slots(
     w_up: &WeightTensor,
     w_down: &WeightTensor,
     pbs: &PrefillBatchScratch,
-    dtype: AttnProjDtype,
     n: usize,
     q8_wmma_arch: bool,
 ) -> HipResult<()> {
-    match dtype {
-        AttnProjDtype::Mq4G256 => {
-            fused_rmsnorm_rotate_mq_batched_for(
-                gpu,
-                &pbs.x_batch,
-                ffn_norm,
-                w_gate,
-                &pbs.x_rot_batch,
-                config.dim,
-                config.norm_eps,
-                n,
-            )?;
-            run_fused_gate_up_key(
-                gpu,
-                fused_gate_up_key_for(w_gate.gpu_dtype),
-                &w_gate.buf,
-                &w_up.buf,
-                &pbs.x_rot_batch,
-                &pbs.gate_ffn_batch,
-                &pbs.up_batch,
-                w_gate.m,
-                w_up.m,
-                w_gate.k,
-                n,
-            )?;
-            fused_silu_mul_rotate_mq_batched_for(
-                gpu,
-                w_down,
-                &pbs.gate_ffn_batch,
-                &pbs.up_batch,
-                &pbs.ffn_hidden_batch,
-                w_down.k,
-                n,
-            )?;
-            run_residual_gemm_key(
-                gpu,
-                residual_gemm_key_for(w_down.gpu_dtype),
-                &w_down.buf,
-                w_down.gpu_dtype,
-                &pbs.ffn_hidden_batch,
-                &pbs.x_batch,
-                w_down.m,
-                w_down.k,
-                n,
-            )
+    let arch = gpu.arch.as_str();
+    let gu_plan = plan_proj_group(&[w_gate, w_up], "dense FFN gate_up", arch)?;
+    slots_check_residual_weight(w_down, "dense FFN w_down", arch)?;
+
+    let (need_rot, need_norm) = match gu_plan {
+        GroupPlan::Uniform(dt) => (slots_weight_rotated(dt), !slots_weight_rotated(dt)),
+        GroupPlan::Mixed { needs_rot, needs_norm } => (needs_rot, needs_norm),
+    };
+    let gu_anchor = if let GroupPlan::Mixed { .. } = gu_plan {
+        [w_gate, w_up]
+            .iter()
+            .find(|w| slots_weight_rotated(w.gpu_dtype))
+            .copied()
+    } else {
+        slots_weight_rotated(w_gate.gpu_dtype).then_some(w_gate)
+    };
+    slots_norm_site(
+        gpu,
+        &pbs.x_batch,
+        ffn_norm,
+        gu_anchor,
+        &pbs.x_rot_batch,
+        &pbs.x_norm_batch,
+        need_rot,
+        need_norm,
+        config.dim,
+        config.norm_eps,
+        n,
+    )?;
+
+    match gu_plan {
+        GroupPlan::Uniform(DType::Q8_0) => q8_gate_up_proj(
+            gpu,
+            w_gate,
+            w_up,
+            &pbs.x_norm_batch,
+            &pbs.gate_ffn_batch,
+            &pbs.up_batch,
+            n,
+            q8_wmma_arch,
+        )?,
+        GroupPlan::Uniform(dt) => run_fused_gate_up_key(
+            gpu,
+            fused_gate_up_key_for(dt),
+            &w_gate.buf,
+            &w_up.buf,
+            if slots_weight_rotated(dt) { &pbs.x_rot_batch } else { &pbs.x_norm_batch },
+            &pbs.gate_ffn_batch,
+            &pbs.up_batch,
+            w_gate.m,
+            w_up.m,
+            w_gate.k,
+            n,
+        )?,
+        GroupPlan::Mixed { .. } => {
+            let g = pbs.gate_ffn_batch.sub_offset(0, n * w_gate.m);
+            slots_plain_proj(gpu, w_gate, &pbs.x_rot_batch, &pbs.x_norm_batch, &g, n)?;
+            let u = pbs.up_batch.sub_offset(0, n * w_up.m);
+            slots_plain_proj(gpu, w_up, &pbs.x_rot_batch, &pbs.x_norm_batch, &u, n)?;
         }
-        AttnProjDtype::Q8_0 => {
-            gpu.rmsnorm_batched(
-                &pbs.x_batch,
-                ffn_norm,
-                &pbs.x_rot_batch,
-                n,
-                config.dim,
-                config.norm_eps,
-            )?;
-            q8_gate_up_proj(
-                gpu,
-                w_gate,
-                w_up,
-                &pbs.x_rot_batch,
-                &pbs.gate_ffn_batch,
-                &pbs.up_batch,
-                n,
-                q8_wmma_arch,
-            )?;
-            gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
-            q8_residual_proj(
-                gpu,
-                w_down,
-                &pbs.ffn_hidden_batch,
-                &pbs.x_batch,
-                &pbs.x_rot_batch,
-                n,
-                q8_wmma_arch,
-            )
-        }
+    }
+
+    // w_down + residual — dispatched by w_down's own dtype. For a rotated
+    // container the input rotate is fused into the SwiGLU; the x_rot/x_norm
+    // buffers are free to reuse as rotate scratch here.
+    let dt = w_down.gpu_dtype;
+    if slots_weight_rotated(dt) {
+        fused_silu_mul_rotate_mq_batched_for(
+            gpu,
+            w_down,
+            &pbs.gate_ffn_batch,
+            &pbs.up_batch,
+            &pbs.ffn_hidden_batch,
+            w_down.k,
+            n,
+        )?;
+        let key = slots_residual_gemm_key(dt).expect("rotated w_down has a residual key");
+        let y = pbs.x_batch.sub_offset(0, n * w_down.m);
+        run_residual_gemm_key(
+            gpu,
+            key,
+            &w_down.buf,
+            dt,
+            &pbs.ffn_hidden_batch,
+            &y,
+            w_down.m,
+            w_down.k,
+            n,
+        )
+    } else {
+        gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+        slots_residual_proj(
+            gpu,
+            w_down,
+            &pbs.ffn_hidden_batch,
+            &pbs.x_batch,
+            &pbs.x_rot_batch,
+            &pbs.x_rot_batch,
+            n,
+            q8_wmma_arch,
+        )
     }
 }
 
@@ -984,19 +1388,34 @@ fn spec_tape_layer_rows(
 /// once over all `n` rows. The stateful pieces (conv1d, the GDN recurrence)
 /// loop per slot with that slot's own state — see the module doc.
 #[allow(clippy::too_many_arguments)]
-fn run_deltanet_layer_slots(
+fn run_deltanet_layer_slots<D>(
     gpu: &mut Gpu,
     config: &Qwen35Config,
     layer: &DeltaNetLayerWeights,
     batch: &SlotBatch,
-    dn_states: &mut [DeltaNetState],
+    dn_states: &D,
     pbs: &PrefillBatchScratch,
     q8_wmma_arch: bool,
     n: usize,
     delta_layer_idx: usize,
     mut spec_capture: Option<&mut SpecVerifyCapture>,
-) -> HipResult<()> {
-    let attn_dtype = require_batchable_deltanet_layer(layer, gpu.arch.as_str())?;
+) -> HipResult<()>
+where
+    D: std::ops::Index<usize, Output = DeltaNetState> + ?Sized,
+{
+    let arch = gpu.arch.as_str();
+    // Per-site plans: the qkvza group keeps one fused launch when uniform,
+    // otherwise per-weight GEMMs; wo and the FFN weights validate their own
+    // roles inside their dispatchers.
+    let qkvza_plan = plan_q8_fused_or_plain(
+        plan_proj_group(
+            &[&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha],
+            "DeltaNet qkvza",
+            arch,
+        )?,
+        q8_wmma_arch,
+    );
+    slots_check_residual_weight(&layer.wo, "DeltaNet wo", arch)?;
 
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
@@ -1004,52 +1423,39 @@ fn run_deltanet_layer_slots(
     let n_v_heads = config.linear_num_value_heads;
     let hd = config.linear_key_head_dim;
 
-    // 1-2. rmsnorm (+FWHT-rotate for MQ4) then the batched 4-way QKVZA
-    // projection. Mirrors the reference's dense LA `is_mq` fork: MQ4G256
-    // shares HFQ4G256's byte layout, so the only difference is the rotated
-    // input (qwen35.rs's `FusedQkvzaHfq4G256` default branch).
-    if attn_dtype == AttnProjDtype::Mq4G256 {
-        fused_rmsnorm_rotate_mq_batched_for(
-            gpu,
-            &pbs.x_batch,
-            &layer.attn_norm,
-            &layer.wqkv,
-            &pbs.x_rot_batch,
-            config.dim,
-            config.norm_eps,
-            n,
-        )?;
-        run_fused_qkvza_key(
-            gpu,
-            fused_qkvza_key_for(layer.wqkv.gpu_dtype),
-            &layer.wqkv.buf,
-            &layer.wz.buf,
-            &layer.w_beta.buf,
-            &layer.w_alpha.buf,
-            &pbs.x_rot_batch,
-            &pbs.dn_qkv_batch,
-            &pbs.dn_z_batch,
-            &pbs.dn_beta_batch,
-            &pbs.dn_alpha_batch,
-            layer.wqkv.m,
-            layer.wz.m,
-            layer.w_beta.m,
-            layer.w_alpha.m,
-            layer.wqkv.k,
-            n,
-        )?;
+    // 1-2. rmsnorm (+FWHT-rotate for rotated containers) then the 4-way
+    // QKVZA projection. Uniform rotated groups keep the fused rmsnorm+rotate
+    // producer; mixed groups normalize once, rotate the normed rows, then
+    // run one plain GEMM per weight (each member's dtype picks its input
+    // variant — the load-bearing bit: an unrotated member MUST NOT read
+    // rotated activations).
+    let (need_rot, need_norm) = match qkvza_plan {
+        GroupPlan::Uniform(dt) => (slots_weight_rotated(dt), !slots_weight_rotated(dt)),
+        GroupPlan::Mixed { needs_rot, needs_norm } => (needs_rot, needs_norm),
+    };
+    let qkvza_anchor = if let GroupPlan::Uniform(dt) = qkvza_plan {
+        slots_weight_rotated(dt).then_some(&layer.wqkv)
     } else {
-        gpu.rmsnorm_batched(
-            &pbs.x_batch,
-            &layer.attn_norm,
-            &pbs.x_rot_batch,
-            n,
-            config.dim,
-            config.norm_eps,
-        )?;
-
-        // 2. Batched 4-way QKVZA projection.
-        if q8_wmma_arch {
+        [&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha]
+            .iter()
+            .find(|w| slots_weight_rotated(w.gpu_dtype))
+            .copied()
+    };
+    slots_norm_site(
+        gpu,
+        &pbs.x_batch,
+        &layer.attn_norm,
+        qkvza_anchor,
+        &pbs.x_rot_batch,
+        &pbs.x_norm_batch,
+        need_rot,
+        need_norm,
+        config.dim,
+        config.norm_eps,
+        n,
+    )?;
+    match qkvza_plan {
+        GroupPlan::Uniform(DType::Q8_0) if q8_wmma_arch => {
             run_fused_qkvza_key(
                 gpu,
                 KernelKey::FusedQkvzaQ8_0,
@@ -1057,7 +1463,7 @@ fn run_deltanet_layer_slots(
                 &layer.wz.buf,
                 &layer.w_beta.buf,
                 &layer.w_alpha.buf,
-                &pbs.x_rot_batch,
+                &pbs.x_norm_batch,
                 &pbs.dn_qkv_batch,
                 &pbs.dn_z_batch,
                 &pbs.dn_beta_batch,
@@ -1067,55 +1473,44 @@ fn run_deltanet_layer_slots(
                 layer.w_beta.m,
                 layer.w_alpha.m,
                 layer.wqkv.k,
-                n,
-            )?;
-        } else {
-            run_plain_gemm_key(
-                gpu,
-                KernelKey::GemmQ8_0BatchedChunked,
-                &layer.wqkv.buf,
-                layer.wqkv.gpu_dtype,
-                &pbs.x_rot_batch,
-                &pbs.dn_qkv_batch,
-                layer.wqkv.m,
-                layer.wqkv.k,
-                n,
-            )?;
-            run_plain_gemm_key(
-                gpu,
-                KernelKey::GemmQ8_0BatchedChunked,
-                &layer.wz.buf,
-                layer.wz.gpu_dtype,
-                &pbs.x_rot_batch,
-                &pbs.dn_z_batch,
-                layer.wz.m,
-                layer.wz.k,
-                n,
-            )?;
-            run_plain_gemm_key(
-                gpu,
-                KernelKey::GemmQ8_0BatchedChunked,
-                &layer.w_beta.buf,
-                layer.w_beta.gpu_dtype,
-                &pbs.x_rot_batch,
-                &pbs.dn_beta_batch,
-                layer.w_beta.m,
-                layer.w_beta.k,
-                n,
-            )?;
-            run_plain_gemm_key(
-                gpu,
-                KernelKey::GemmQ8_0BatchedChunked,
-                &layer.w_alpha.buf,
-                layer.w_alpha.gpu_dtype,
-                &pbs.x_rot_batch,
-                &pbs.dn_alpha_batch,
-                layer.w_alpha.m,
-                layer.w_alpha.k,
                 n,
             )?;
         }
+        GroupPlan::Uniform(dt) => {
+            let x = if slots_weight_rotated(dt) { &pbs.x_rot_batch } else { &pbs.x_norm_batch };
+            run_fused_qkvza_key(
+                gpu,
+                fused_qkvza_key_for(dt),
+                &layer.wqkv.buf,
+                &layer.wz.buf,
+                &layer.w_beta.buf,
+                &layer.w_alpha.buf,
+                x,
+                &pbs.dn_qkv_batch,
+                &pbs.dn_z_batch,
+                &pbs.dn_beta_batch,
+                &pbs.dn_alpha_batch,
+                layer.wqkv.m,
+                layer.wz.m,
+                layer.w_beta.m,
+                layer.w_alpha.m,
+                layer.wqkv.k,
+                n,
+            )?;
+        }
+        GroupPlan::Mixed { .. } => {
+            for (w, out) in [
+                (&layer.wqkv, &pbs.dn_qkv_batch),
+                (&layer.wz, &pbs.dn_z_batch),
+                (&layer.w_beta, &pbs.dn_beta_batch),
+                (&layer.w_alpha, &pbs.dn_alpha_batch),
+            ] {
+                let y = out.sub_offset(0, n * w.m);
+                slots_plain_proj(gpu, w, &pbs.x_rot_batch, &pbs.x_norm_batch, &y, n)?;
+            }
+        }
     }
+
 
     // 3. Fused sigmoid(beta) + alpha_gate(alpha) — stateless, batched over N.
     gpu.fused_sigmoid_alpha_gate_f32_batched(
@@ -1253,29 +1648,21 @@ fn run_deltanet_layer_slots(
         n,
     )?;
 
-    // 8. wo + residual. MQ4 rotates its input for the pre-rotated weights
-    // (the reference's `wo_is_mq` fork); Q8 projects directly.
-    match attn_dtype {
-        AttnProjDtype::Mq4G256 => mq4_residual_proj(
-            gpu,
-            &layer.wo,
-            &pbs.dn_normed_batch,
-            &pbs.x_batch,
-            &pbs.dn_normed_rot_batch,
-            n,
-        )?,
-        AttnProjDtype::Q8_0 => q8_residual_proj(
-            gpu,
-            &layer.wo,
-            &pbs.dn_normed_batch,
-            &pbs.x_batch,
-            &pbs.x_rot_batch,
-            n,
-            q8_wmma_arch,
-        )?,
-    }
+    // 8. wo + residual — dispatched by wo's own dtype (Q8 residual, rotated
+    // containers rotate into dn_normed_rot first, HFQ* containers direct).
+    slots_residual_proj(
+        gpu,
+        &layer.wo,
+        &pbs.dn_normed_batch,
+        &pbs.x_batch,
+        &pbs.dn_normed_rot_batch,
+        &pbs.x_rot_batch,
+        n,
+        q8_wmma_arch,
+    )?;
 
-    // 9. FFN: rmsnorm, gate+up, silu_mul, w_down + residual — dtype-forked.
+    // 9. FFN: rmsnorm, gate+up, silu_mul, w_down + residual — dispatched per
+    // site inside the body.
     dense_ffn_body_slots(
         gpu,
         config,
@@ -1284,7 +1671,6 @@ fn run_deltanet_layer_slots(
         &layer.w_up,
         &layer.w_down,
         pbs,
-        attn_dtype,
         n,
         q8_wmma_arch,
     )
@@ -1294,8 +1680,8 @@ fn run_deltanet_layer_slots(
 ///
 /// Same shape as [`run_deltanet_layer_slots`] — the stateless attention
 /// pieces run once over all `n` rows, the stateful pieces (conv1d, GDN) loop
-/// per slot — except: (a) the QKVZA projection and wo admit MQ4G256 as well
-/// as Q8_0 (see `require_batchable_deltanet_moe_layer`), and (b) the dense
+/// per slot — except: (a) the QKVZA projection and wo admit the same
+/// per-site container set as the dense body (see `plan_proj_group`), and (b) the dense
 /// FFN (rmsnorm+gate/up+silu_mul+down) is replaced by a call to the
 /// reference's own `prefill_moe_ffn_body_batched`. The MoE FFN is stateless
 /// per row — it takes no `kv_cache`, `dn_state`, or `positions` — so no
@@ -1303,12 +1689,12 @@ fn run_deltanet_layer_slots(
 /// function already threads through the attention body is exactly the input
 /// shape `prefill_moe_ffn_body_batched` expects.
 #[allow(clippy::too_many_arguments)]
-fn run_deltanet_moe_layer_slots(
+fn run_deltanet_moe_layer_slots<D>(
     gpu: &mut Gpu,
     config: &Qwen35Config,
     layer: &DeltaNetMoeLayerWeights,
     batch: &SlotBatch,
-    dn_states: &mut [DeltaNetState],
+    dn_states: &D,
     pbs: &PrefillBatchScratch,
     q8_wmma_arch: bool,
     n: usize,
@@ -1323,8 +1709,25 @@ fn run_deltanet_moe_layer_slots(
     // instead of the model-wide flag would silently diverge from the
     // reference whenever the SAME model mixes an MQ6 layer elsewhere.
     weights_moe_has_mq6: bool,
-) -> HipResult<()> {
-    let attn_dtype = require_batchable_deltanet_moe_layer(layer)?;
+) -> HipResult<()>
+where
+    D: std::ops::Index<usize, Output = DeltaNetState> + ?Sized,
+{
+    // Layer span (opt-in trace only): attention half vs MoE FFN body. Host
+    // wall around work this layer already runs; no new sync, no order change.
+    let trace_on = hipfire_dispatch::moe_trace_enabled();
+    let t_layer = trace_on.then(std::time::Instant::now);
+    let t_attn = trace_on.then(std::time::Instant::now);
+    let arch = gpu.arch.as_str();
+    let qkvza_plan = plan_q8_fused_or_plain(
+        plan_proj_group(
+            &[&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha],
+            "DeltaNetMoE qkvza",
+            arch,
+        )?,
+        q8_wmma_arch,
+    );
+    slots_check_residual_weight(&layer.wo, "DeltaNetMoE wo", arch)?;
     require_batchable_moe_ffn(gpu, &layer.ffn)?;
 
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -1333,30 +1736,43 @@ fn run_deltanet_moe_layer_slots(
     let n_v_heads = config.linear_num_value_heads;
     let hd = config.linear_key_head_dim;
 
-    // 1-2. rmsnorm(+FWHT-rotate for MQ4) then the batched 4-way QKVZA
-    // projection. Mirrors forward_prefill_chunk's DeltaNetMoe `is_mq`/`is_q8`
-    // forks (qwen35.rs) — MQ4G256 shares HFQ4G256's byte layout, so the only
-    // difference from HFQ4G256 is the FWHT-rotated input.
-    match attn_dtype {
-        AttnProjDtype::Mq4G256 => {
-            fused_rmsnorm_rotate_mq_batched_for(
-                gpu,
-                &pbs.x_batch,
-                &layer.attn_norm,
-                &layer.wqkv,
-                &pbs.x_rot_batch,
-                config.dim,
-                config.norm_eps,
-                n,
-            )?;
+    // 1-2. rmsnorm(+FWHT-rotate for rotated containers) then the 4-way
+    // QKVZA projection — same group-plan rules as the dense DeltaNet body.
+    let (need_rot, need_norm) = match qkvza_plan {
+        GroupPlan::Uniform(dt) => (slots_weight_rotated(dt), !slots_weight_rotated(dt)),
+        GroupPlan::Mixed { needs_rot, needs_norm } => (needs_rot, needs_norm),
+    };
+    let qkvza_anchor = if let GroupPlan::Uniform(dt) = qkvza_plan {
+        slots_weight_rotated(dt).then_some(&layer.wqkv)
+    } else {
+        [&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha]
+            .iter()
+            .find(|w| slots_weight_rotated(w.gpu_dtype))
+            .copied()
+    };
+    slots_norm_site(
+        gpu,
+        &pbs.x_batch,
+        &layer.attn_norm,
+        qkvza_anchor,
+        &pbs.x_rot_batch,
+        &pbs.x_norm_batch,
+        need_rot,
+        need_norm,
+        config.dim,
+        config.norm_eps,
+        n,
+    )?;
+    match qkvza_plan {
+        GroupPlan::Uniform(DType::Q8_0) if q8_wmma_arch => {
             run_fused_qkvza_key(
                 gpu,
-                fused_qkvza_key_for(layer.wqkv.gpu_dtype),
+                KernelKey::FusedQkvzaQ8_0,
                 &layer.wqkv.buf,
                 &layer.wz.buf,
                 &layer.w_beta.buf,
                 &layer.w_alpha.buf,
-                &pbs.x_rot_batch,
+                &pbs.x_norm_batch,
                 &pbs.dn_qkv_batch,
                 &pbs.dn_z_batch,
                 &pbs.dn_beta_batch,
@@ -1369,83 +1785,41 @@ fn run_deltanet_moe_layer_slots(
                 n,
             )?;
         }
-        AttnProjDtype::Q8_0 => {
-            gpu.rmsnorm_batched(
-                &pbs.x_batch,
-                &layer.attn_norm,
-                &pbs.x_rot_batch,
+        GroupPlan::Uniform(dt) => {
+            let x = if slots_weight_rotated(dt) { &pbs.x_rot_batch } else { &pbs.x_norm_batch };
+            run_fused_qkvza_key(
+                gpu,
+                fused_qkvza_key_for(dt),
+                &layer.wqkv.buf,
+                &layer.wz.buf,
+                &layer.w_beta.buf,
+                &layer.w_alpha.buf,
+                x,
+                &pbs.dn_qkv_batch,
+                &pbs.dn_z_batch,
+                &pbs.dn_beta_batch,
+                &pbs.dn_alpha_batch,
+                layer.wqkv.m,
+                layer.wz.m,
+                layer.w_beta.m,
+                layer.w_alpha.m,
+                layer.wqkv.k,
                 n,
-                config.dim,
-                config.norm_eps,
             )?;
-            if q8_wmma_arch {
-                run_fused_qkvza_key(
-                    gpu,
-                    KernelKey::FusedQkvzaQ8_0,
-                    &layer.wqkv.buf,
-                    &layer.wz.buf,
-                    &layer.w_beta.buf,
-                    &layer.w_alpha.buf,
-                    &pbs.x_rot_batch,
-                    &pbs.dn_qkv_batch,
-                    &pbs.dn_z_batch,
-                    &pbs.dn_beta_batch,
-                    &pbs.dn_alpha_batch,
-                    layer.wqkv.m,
-                    layer.wz.m,
-                    layer.w_beta.m,
-                    layer.w_alpha.m,
-                    layer.wqkv.k,
-                    n,
-                )?;
-            } else {
-                run_plain_gemm_key(
-                    gpu,
-                    KernelKey::GemmQ8_0BatchedChunked,
-                    &layer.wqkv.buf,
-                    layer.wqkv.gpu_dtype,
-                    &pbs.x_rot_batch,
-                    &pbs.dn_qkv_batch,
-                    layer.wqkv.m,
-                    layer.wqkv.k,
-                    n,
-                )?;
-                run_plain_gemm_key(
-                    gpu,
-                    KernelKey::GemmQ8_0BatchedChunked,
-                    &layer.wz.buf,
-                    layer.wz.gpu_dtype,
-                    &pbs.x_rot_batch,
-                    &pbs.dn_z_batch,
-                    layer.wz.m,
-                    layer.wz.k,
-                    n,
-                )?;
-                run_plain_gemm_key(
-                    gpu,
-                    KernelKey::GemmQ8_0BatchedChunked,
-                    &layer.w_beta.buf,
-                    layer.w_beta.gpu_dtype,
-                    &pbs.x_rot_batch,
-                    &pbs.dn_beta_batch,
-                    layer.w_beta.m,
-                    layer.w_beta.k,
-                    n,
-                )?;
-                run_plain_gemm_key(
-                    gpu,
-                    KernelKey::GemmQ8_0BatchedChunked,
-                    &layer.w_alpha.buf,
-                    layer.w_alpha.gpu_dtype,
-                    &pbs.x_rot_batch,
-                    &pbs.dn_alpha_batch,
-                    layer.w_alpha.m,
-                    layer.w_alpha.k,
-                    n,
-                )?;
+        }
+        GroupPlan::Mixed { .. } => {
+            for (w, out) in [
+                (&layer.wqkv, &pbs.dn_qkv_batch),
+                (&layer.wz, &pbs.dn_z_batch),
+                (&layer.w_beta, &pbs.dn_beta_batch),
+                (&layer.w_alpha, &pbs.dn_alpha_batch),
+            ] {
+                let y = out.sub_offset(0, n * w.m);
+                slots_plain_proj(gpu, w, &pbs.x_rot_batch, &pbs.x_norm_batch, &y, n)?;
             }
         }
     }
+
 
     // 3. Fused sigmoid(beta) + alpha_gate(alpha) — stateless, batched over N.
     gpu.fused_sigmoid_alpha_gate_f32_batched(
@@ -1582,33 +1956,28 @@ fn run_deltanet_moe_layer_slots(
         n,
     )?;
 
-    // 8. wo + residual.
-    match attn_dtype {
-        AttnProjDtype::Mq4G256 => mq4_residual_proj(
-            gpu,
-            &layer.wo,
-            &pbs.dn_normed_batch,
-            &pbs.x_batch,
-            &pbs.dn_normed_rot_batch,
-            n,
-        )?,
-        AttnProjDtype::Q8_0 => q8_residual_proj(
-            gpu,
-            &layer.wo,
-            &pbs.dn_normed_batch,
-            &pbs.x_batch,
-            &pbs.dn_normed_rot_batch,
-            n,
-            q8_wmma_arch,
-        )?,
-    }
+    // 8. wo + residual — dispatched by wo's own dtype.
+    slots_residual_proj(
+        gpu,
+        &layer.wo,
+        &pbs.dn_normed_batch,
+        &pbs.x_batch,
+        &pbs.dn_normed_rot_batch,
+        &pbs.x_rot_batch,
+        n,
+        q8_wmma_arch,
+    )?;
 
     // 9. Batched MoE FFN replaces the dense (rmsnorm + gate+up + silu_mul +
     // w_down) block — stateless per row, no slot machinery needed. Takes
     // pbs.x_batch as input and accumulates the FFN output residual back
     // into it (same contract as the reference's own call site).
+    let (attn_ns, t_moe) = match (&t_attn, trace_on) {
+        (Some(t), true) => (t.elapsed().as_nanos() as u64, Some(std::time::Instant::now())),
+        _ => (0, None),
+    };
     let ctx = DispatchCtx::new(gpu);
-    prefill_moe_ffn_body_batched(
+    let moe_result = prefill_moe_ffn_body_batched(
         gpu,
         &layer.ffn,
         &layer.ffn_norm,
@@ -1618,7 +1987,22 @@ fn run_deltanet_moe_layer_slots(
         &ctx,
         weights_moe_has_mq6,
         /*routed_out=*/ None,
-    )
+    );
+    if trace_on {
+        let moe_ns = t_moe.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
+        let total_ns = t_layer.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
+        hipfire_dispatch::moe_layer_trace(
+            layer.ffn.layer_idx as usize,
+            false,
+            hipfire_dispatch::MoeLayerTiming {
+                total_ns,
+                attn_ns,
+                moe_ns,
+                rows: n,
+            },
+        );
+    }
+    moe_result
 }
 
 /// Mirrors the `flash_optin && wmma_ok` gate that
@@ -1912,21 +2296,49 @@ fn kv_write_slots(
                 Some(row_slot),
             )
         }
-        // Native fp8 has no slot readers; Rig::build refuses it before any
-        // allocation, so reaching here means a gate was bypassed.
-        KvMode::Fp8 => Err(HipError::new(
-            0,
-            "kv_write_slots: fp8 KV has no slot writer",
-        )),
+        // Native fp8 (gfx1201-only — Rig::build refuses the tier elsewhere):
+        // per-arena writes like Q8/bf16 — the fp8 writer is descriptor-aware,
+        // and both arenas share the fp8 row layout (`[Hkv*D codes][Hkv f16
+        // scales]`, equal K/V strides), so both launches resolve the shared
+        // K base and `dst` alone selects the arena.
+        //
+        // untested-hw: gfx1201-only path, implemented from the q8 slots
+        // template; no gfx1201 host was available.
+        KvMode::Fp8 => {
+            gpu.kv_cache_write_fp8_e4m3_batched_slots(
+                k_cache,
+                k_batch,
+                positions,
+                n_kv_heads,
+                head_dim,
+                n_rows,
+                Some(descs),
+                Some(row_slot),
+            )?;
+            gpu.kv_cache_write_fp8_e4m3_batched_slots(
+                v_cache,
+                v_batch,
+                positions,
+                n_kv_heads,
+                head_dim,
+                n_rows,
+                Some(descs),
+                Some(row_slot),
+            )
+        }
     }
 }
 
 /// Per-tier batched attend for one FullAttention layer step. q8 keeps the
 /// full dispatch ladder (single-slot WMMA prefill fast path, scalar decode
 /// below the ctx crossover); every other tier runs its descriptor-driven
-/// flash tile — the only path those tiers have, and the only one the slots
-/// engine needs: they have no scalar batched decode and the WMMA single-slot
-/// reduction is a Q8-slab pointer trick that cannot express a descriptor.
+/// kernel — the flash tile for the rotated/fp8 tiers, and the SEQUENTIAL
+/// path's scalar bf16 batched kernel for bf16 (bit-parity with
+/// `AttnBf16KvBatchedMasked`; the windowed flash tile accumulates in a
+/// different order and diverged past tolerance in the golden harness).
+/// These are the only paths those tiers have: they have no scalar batched
+/// decode besides bf16's parity kernel, and the WMMA single-slot reduction
+/// is a Q8-slab pointer trick that cannot express a descriptor.
 #[allow(clippy::too_many_arguments)]
 fn tier_attend_slots(
     gpu: &mut Gpu,
@@ -2105,7 +2517,17 @@ fn tier_attend_slots(
             d,
             r,
         ),
-        KvMode::Bf16 => gpu.attention_flash_bf16_batched_masked_windowed_slots(
+        // bf16 keeps the SEQUENTIAL path's scalar kernel, not the windowed
+        // flash tile: the tile accumulates in a different order and the
+        // golden harness measured a 6.27x-tolerance divergence on one logits
+        // element against the sequential reference. `attention_bf16_kv_batched_slots`
+        // runs the same TU + ABI the sequential dispatch executes
+        // (`AttnBf16KvBatchedMasked` — plain causal, no window arg), with the
+        // descriptor tail threaded through, so slot-pool bf16 output is
+        // bit-parity with the sequential engine's instead of merely close.
+        // Same arg shape the q8 scalar delegate passes (physical_cap as the
+        // arena's max_seq, tree verify out of scope for slots).
+        KvMode::Bf16 => gpu.attention_bf16_kv_batched_slots(
             q,
             k_cache,
             v_cache,
@@ -2117,11 +2539,9 @@ fn tier_attend_slots(
             physical_cap,
             max_ctx_len,
             batch_size,
-            flash_partials,
             None,
             0,
             0,
-            /*window=*/ 0,
             d,
             r,
         ),
@@ -2146,12 +2566,35 @@ fn tier_attend_slots(
             r,
         ),
         KvMode::Q8 => unreachable!("handled by the q8 delegate above"),
-        // Native fp8 has no slot readers; Rig::build refuses it before any
-        // allocation, so reaching here means a gate was bypassed.
-        KvMode::Fp8 => Err(HipError::new(
+        // Native fp8 (gfx1201-only — Rig::build refuses the tier elsewhere):
+        // the descriptor-driven fp8 flash tile is the ONLY fp8 slot reader.
+        // No scalar decode or WMMA fast path exists for it — the WMMA
+        // single-slot reduction is a Q8-slab pointer trick that cannot
+        // express a descriptor, and the gfx1201 VerifyAttn twins take no
+        // descriptor parameters — so every shape routes here (the slots
+        // ladder passes window 0 for every tier).
+        //
+        // untested-hw: gfx1201-only path, implemented from the q8 slots
+        // template; no gfx1201 host was available.
+        KvMode::Fp8 => gpu.attention_flash_fp8_e4m3_batched_masked_slots(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            physical_cap,
+            max_ctx_len,
+            batch_size,
+            flash_partials,
+            None,
             0,
-            "tier_attend_slots: fp8 KV has no slot reader",
-        )),
+            0,
+            d,
+            r,
+        ),
     }
 }
 
@@ -2308,73 +2751,64 @@ fn run_fullattn_layer_slots(
     layer: &FullAttnLayerWeights,
     pbs: &PrefillBatchScratch,
     s: &Qwen35Scratch,
-    k_cache: &GpuTensor,
-    v_cache: &GpuTensor,
-    desc_staging: &SlotDescStaging,
+    addr: &LayerKvAddr,
     kv: &SlotKvTier,
     q8_wmma_arch: bool,
     n: usize,
     physical_cap: usize,
     max_ctx_len: usize,
-    single_slot: Option<(u64, usize)>,
-    n_tiles: Option<usize>,
     // When true, `pbs.pos3` carries per-row M-RoPE phases: dispatch the
     // batched M-RoPE kernel instead of the 1D one. Text rows carry [p, p, p]
     // (bit-identical angles); only VL image/post-image rows genuinely differ.
     use_mrope: bool,
 ) -> HipResult<()> {
-    let attn_dtype = require_batchable_fullattn_layer(layer, gpu.arch.as_str())?;
+    let arch = gpu.arch.as_str();
+    // Per-site plans: {wq,wk,wv} keep one fused launch when uniform, wo and
+    // the FFN weights validate their own roles inside their dispatchers.
+    let qkv_plan = plan_q8_fused_or_plain(
+        plan_proj_group(&[&layer.wq, &layer.wk, &layer.wv], "FullAttn qkv", arch)?,
+        q8_wmma_arch,
+    );
+    slots_check_residual_weight(&layer.wo, "FullAttn wo", arch)?;
 
     let dim = config.dim;
 
-    // 1-2. rmsnorm (+FWHT-rotate for MQ4) then the batched 3-way QKV
-    // projection — the reference's dense FA `is_mq` fork.
-    if attn_dtype == AttnProjDtype::Mq4G256 {
-        fused_rmsnorm_rotate_mq_batched_for(
-            gpu,
-            &pbs.x_batch,
-            &layer.attn_norm,
-            &layer.wq,
-            &pbs.x_rot_batch,
-            dim,
-            config.norm_eps,
-            n,
-        )?;
-        run_fused_qkv_key(
-            gpu,
-            fused_qkv_key_for(layer.wq.gpu_dtype),
-            &layer.wq.buf,
-            &layer.wk.buf,
-            &layer.wv.buf,
-            &pbs.x_rot_batch,
-            &pbs.fa_q_full_batch,
-            &pbs.fa_k_batch,
-            &pbs.fa_v_batch,
-            layer.wq.m,
-            layer.wk.m,
-            layer.wv.m,
-            layer.wq.k,
-            n,
-        )?;
+    // 1-2. rmsnorm (+FWHT-rotate for rotated containers) then the 3-way QKV
+    // projection — same group-plan rules as the DeltaNet site above.
+    let (need_rot, need_norm) = match qkv_plan {
+        GroupPlan::Uniform(dt) => (slots_weight_rotated(dt), !slots_weight_rotated(dt)),
+        GroupPlan::Mixed { needs_rot, needs_norm } => (needs_rot, needs_norm),
+    };
+    let qkv_anchor = if let GroupPlan::Uniform(dt) = qkv_plan {
+        slots_weight_rotated(dt).then_some(&layer.wq)
     } else {
-        gpu.rmsnorm_batched(
-            &pbs.x_batch,
-            &layer.attn_norm,
-            &pbs.x_rot_batch,
-            n,
-            dim,
-            config.norm_eps,
-        )?;
-
-        // 2. Batched 3-way QKV projection.
-        if q8_wmma_arch {
+        [&layer.wq, &layer.wk, &layer.wv]
+            .iter()
+            .find(|w| slots_weight_rotated(w.gpu_dtype))
+            .copied()
+    };
+    slots_norm_site(
+        gpu,
+        &pbs.x_batch,
+        &layer.attn_norm,
+        qkv_anchor,
+        &pbs.x_rot_batch,
+        &pbs.x_norm_batch,
+        need_rot,
+        need_norm,
+        dim,
+        config.norm_eps,
+        n,
+    )?;
+    match qkv_plan {
+        GroupPlan::Uniform(DType::Q8_0) if q8_wmma_arch => {
             run_fused_qkv_key(
                 gpu,
                 KernelKey::FusedQkvQ8_0,
                 &layer.wq.buf,
                 &layer.wk.buf,
                 &layer.wv.buf,
-                &pbs.x_rot_batch,
+                &pbs.x_norm_batch,
                 &pbs.fa_q_full_batch,
                 &pbs.fa_k_batch,
                 &pbs.fa_v_batch,
@@ -2382,44 +2816,40 @@ fn run_fullattn_layer_slots(
                 layer.wk.m,
                 layer.wv.m,
                 layer.wq.k,
-                n,
-            )?;
-        } else {
-            run_plain_gemm_key(
-                gpu,
-                KernelKey::GemmQ8_0BatchedChunked,
-                &layer.wq.buf,
-                layer.wq.gpu_dtype,
-                &pbs.x_rot_batch,
-                &pbs.fa_q_full_batch,
-                layer.wq.m,
-                layer.wq.k,
-                n,
-            )?;
-            run_plain_gemm_key(
-                gpu,
-                KernelKey::GemmQ8_0BatchedChunked,
-                &layer.wk.buf,
-                layer.wk.gpu_dtype,
-                &pbs.x_rot_batch,
-                &pbs.fa_k_batch,
-                layer.wk.m,
-                layer.wk.k,
-                n,
-            )?;
-            run_plain_gemm_key(
-                gpu,
-                KernelKey::GemmQ8_0BatchedChunked,
-                &layer.wv.buf,
-                layer.wv.gpu_dtype,
-                &pbs.x_rot_batch,
-                &pbs.fa_v_batch,
-                layer.wv.m,
-                layer.wv.k,
                 n,
             )?;
         }
+        GroupPlan::Uniform(dt) => {
+            let x = if slots_weight_rotated(dt) { &pbs.x_rot_batch } else { &pbs.x_norm_batch };
+            run_fused_qkv_key(
+                gpu,
+                fused_qkv_key_for(dt),
+                &layer.wq.buf,
+                &layer.wk.buf,
+                &layer.wv.buf,
+                x,
+                &pbs.fa_q_full_batch,
+                &pbs.fa_k_batch,
+                &pbs.fa_v_batch,
+                layer.wq.m,
+                layer.wk.m,
+                layer.wv.m,
+                layer.wq.k,
+                n,
+            )?;
+        }
+        GroupPlan::Mixed { .. } => {
+            for (w, out) in [
+                (&layer.wq, &pbs.fa_q_full_batch),
+                (&layer.wk, &pbs.fa_k_batch),
+                (&layer.wv, &pbs.fa_v_batch),
+            ] {
+                let y = out.sub_offset(0, n * w.m);
+                slots_plain_proj(gpu, w, &pbs.x_rot_batch, &pbs.x_norm_batch, &y, n)?;
+            }
+        }
     }
+
 
     // 3. Deinterleave Q + gate.
     gpu.deinterleave_f32_batched(
@@ -2486,60 +2916,9 @@ fn run_fullattn_layer_slots(
         )?;
     }
 
-    // 6. Batched KV write — slot-aware, ONE launch per arena across every
-    // slot, on the engine's resolved KV tier (`kv.mode`). Both arenas
-    // resolve through the descriptor table (block tables under paged); on
-    // the rotated-K tiers the V write resolves the descriptor's
-    // `legacy_v_base`, which differs from `legacy_k_base`.
-    kv_write_slots(
-        gpu,
-        kv,
-        k_cache,
-        v_cache,
-        &pbs.fa_k_batch,
-        &pbs.fa_v_batch,
-        &pbs.positions,
-        config.n_kv_heads,
-        config.head_dim,
-        n,
-        &desc_staging.descs_dev,
-        &desc_staging.row_slot_dev,
-    )?;
-
-    // 7. Batched attend — slot-aware, one launch across every slot.
-    // `positions[]` (not any `desc.seq_len`) is authoritative for the
-    // causal bound inside the ported kernels — SP1's only Critical defect
-    // came from conflating the two on a tile kernel bounded by
-    // `desc.seq_len` while the shared reduce kernel stayed bounded by
-    // `positions[]`. `tree_bias` is never combined with descriptors here
-    // (asserted out of SP1 scope).
-    tier_attend_slots(
-        gpu,
-        kv,
-        &pbs.fa_q_batch,
-        k_cache,
-        v_cache,
-        &pbs.fa_attn_out_batch,
-        &pbs.positions,
-        config.n_heads,
-        config.n_kv_heads,
-        config.head_dim,
-        physical_cap,
-        max_ctx_len,
-        n,
-        &s.flash_partials,
-        &desc_staging.descs_dev,
-        &desc_staging.row_slot_dev,
-        single_slot,
-        n_tiles.map(|nt| {
-            (
-                &desc_staging.tile_slot_dev,
-                &desc_staging.tile_row0_dev,
-                &desc_staging.tile_qbase_dev,
-                nt,
-            )
-        }),
-    )?;
+    // 6-7. Batched KV write + attend — slot-aware, one launch each across
+    // every slot, on the resolved KV tier and storage (`LayerKvAddr`).
+    layer_kv_write_attend(gpu, config, kv, addr, pbs, s, n, physical_cap, max_ctx_len)?;
 
     // 8. sigmoid(gate) * attn_out, over the `n` LIVE rows only.
     //
@@ -2564,28 +2943,20 @@ fn run_fullattn_layer_slots(
         &pbs.fa_gate_batch.sub_offset(0, gate_elems),
     )?;
 
-    // 9. wo + residual — MQ4 rotates into the pre-rotated weights first.
-    match attn_dtype {
-        AttnProjDtype::Mq4G256 => mq4_residual_proj(
-            gpu,
-            &layer.wo,
-            &pbs.fa_attn_out_batch,
-            &pbs.x_batch,
-            &pbs.fa_attn_out_rot_batch,
-            n,
-        )?,
-        AttnProjDtype::Q8_0 => q8_residual_proj(
-            gpu,
-            &layer.wo,
-            &pbs.fa_attn_out_batch,
-            &pbs.x_batch,
-            &pbs.x_rot_batch,
-            n,
-            q8_wmma_arch,
-        )?,
-    }
+    // 9. wo + residual — dispatched by wo's own dtype (rotated containers
+    // rotate into fa_attn_out_rot first, HFQ*/Q8 project directly).
+    slots_residual_proj(
+        gpu,
+        &layer.wo,
+        &pbs.fa_attn_out_batch,
+        &pbs.x_batch,
+        &pbs.fa_attn_out_rot_batch,
+        &pbs.x_rot_batch,
+        n,
+        q8_wmma_arch,
+    )?;
 
-    // 10. FFN: rmsnorm, gate+up, silu_mul, w_down + residual — dtype-forked.
+    // 10. FFN: rmsnorm, gate+up, silu_mul, w_down + residual — per-site.
     dense_ffn_body_slots(
         gpu,
         config,
@@ -2594,7 +2965,6 @@ fn run_fullattn_layer_slots(
         &layer.w_up,
         &layer.w_down,
         pbs,
-        attn_dtype,
         n,
         q8_wmma_arch,
     )
@@ -2604,8 +2974,8 @@ fn run_fullattn_layer_slots(
 /// [`run_fullattn_layer_slots`] — attention (KV write + attend) is a SINGLE
 /// slot-aware launch across every slot via the `_slots` entry points, on the
 /// engine's resolved KV tier regardless of this layer's projection weight
-/// dtype — except: (a) the QKV projection and wo admit
-/// MQ4G256 as well as Q8_0 (see `require_batchable_fullattn_moe_layer`), and
+/// dtype — except: (a) the QKV projection and wo admit the same per-site
+/// container set as the dense body (see `plan_proj_group`), and
 /// (b) the dense FFN is replaced by the reference's own
 /// `prefill_moe_ffn_body_batched` (stateless per row, no slot machinery
 /// needed — see `run_deltanet_moe_layer_slots`'s doc comment).
@@ -2616,46 +2986,66 @@ fn run_fullattn_moe_layer_slots(
     layer: &FullAttnMoeLayerWeights,
     pbs: &PrefillBatchScratch,
     s: &Qwen35Scratch,
-    k_cache: &GpuTensor,
-    v_cache: &GpuTensor,
-    desc_staging: &SlotDescStaging,
+    addr: &LayerKvAddr,
     kv: &SlotKvTier,
     q8_wmma_arch: bool,
     n: usize,
     physical_cap: usize,
     max_ctx_len: usize,
-    single_slot: Option<(u64, usize)>,
-    n_tiles: Option<usize>,
     weights_moe_has_mq6: bool,
     use_mrope: bool,
 ) -> HipResult<()> {
-    let attn_dtype = require_batchable_fullattn_moe_layer(layer)?;
+    // Layer span (opt-in trace only): attention half vs MoE FFN body. Host
+    // wall around work this layer already runs; no new sync, no order change.
+    let trace_on = hipfire_dispatch::moe_trace_enabled();
+    let t_layer = trace_on.then(std::time::Instant::now);
+    let t_attn = trace_on.then(std::time::Instant::now);
+    let arch = gpu.arch.as_str();
+    let qkv_plan = plan_q8_fused_or_plain(
+        plan_proj_group(&[&layer.wq, &layer.wk, &layer.wv], "FullAttnMoE qkv", arch)?,
+        q8_wmma_arch,
+    );
+    slots_check_residual_weight(&layer.wo, "FullAttnMoE wo", arch)?;
     require_batchable_moe_ffn(gpu, &layer.ffn)?;
 
     let dim = config.dim;
 
-    // 1-2. rmsnorm(+FWHT-rotate for MQ4) then the batched 3-way QKV
-    // projection. Mirrors forward_prefill_chunk's FullAttnMoe
-    // `qkv_is_mq`/`qkv_is_q8` forks (qwen35.rs).
-    match attn_dtype {
-        AttnProjDtype::Mq4G256 => {
-            fused_rmsnorm_rotate_mq_batched_for(
-                gpu,
-                &pbs.x_batch,
-                &layer.attn_norm,
-                &layer.wq,
-                &pbs.x_rot_batch,
-                dim,
-                config.norm_eps,
-                n,
-            )?;
+    // 1-2. rmsnorm(+FWHT-rotate for rotated containers) then the 3-way QKV
+    // projection — same group-plan rules as the dense FullAttn body.
+    let (need_rot, need_norm) = match qkv_plan {
+        GroupPlan::Uniform(dt) => (slots_weight_rotated(dt), !slots_weight_rotated(dt)),
+        GroupPlan::Mixed { needs_rot, needs_norm } => (needs_rot, needs_norm),
+    };
+    let qkv_anchor = if let GroupPlan::Uniform(dt) = qkv_plan {
+        slots_weight_rotated(dt).then_some(&layer.wq)
+    } else {
+        [&layer.wq, &layer.wk, &layer.wv]
+            .iter()
+            .find(|w| slots_weight_rotated(w.gpu_dtype))
+            .copied()
+    };
+    slots_norm_site(
+        gpu,
+        &pbs.x_batch,
+        &layer.attn_norm,
+        qkv_anchor,
+        &pbs.x_rot_batch,
+        &pbs.x_norm_batch,
+        need_rot,
+        need_norm,
+        dim,
+        config.norm_eps,
+        n,
+    )?;
+    match qkv_plan {
+        GroupPlan::Uniform(DType::Q8_0) if q8_wmma_arch => {
             run_fused_qkv_key(
                 gpu,
-                fused_qkv_key_for(layer.wq.gpu_dtype),
+                KernelKey::FusedQkvQ8_0,
                 &layer.wq.buf,
                 &layer.wk.buf,
                 &layer.wv.buf,
-                &pbs.x_rot_batch,
+                &pbs.x_norm_batch,
                 &pbs.fa_q_full_batch,
                 &pbs.fa_k_batch,
                 &pbs.fa_v_batch,
@@ -2666,69 +3056,37 @@ fn run_fullattn_moe_layer_slots(
                 n,
             )?;
         }
-        AttnProjDtype::Q8_0 => {
-            gpu.rmsnorm_batched(
-                &pbs.x_batch,
-                &layer.attn_norm,
-                &pbs.x_rot_batch,
+        GroupPlan::Uniform(dt) => {
+            let x = if slots_weight_rotated(dt) { &pbs.x_rot_batch } else { &pbs.x_norm_batch };
+            run_fused_qkv_key(
+                gpu,
+                fused_qkv_key_for(dt),
+                &layer.wq.buf,
+                &layer.wk.buf,
+                &layer.wv.buf,
+                x,
+                &pbs.fa_q_full_batch,
+                &pbs.fa_k_batch,
+                &pbs.fa_v_batch,
+                layer.wq.m,
+                layer.wk.m,
+                layer.wv.m,
+                layer.wq.k,
                 n,
-                dim,
-                config.norm_eps,
             )?;
-            if q8_wmma_arch {
-                run_fused_qkv_key(
-                    gpu,
-                    KernelKey::FusedQkvQ8_0,
-                    &layer.wq.buf,
-                    &layer.wk.buf,
-                    &layer.wv.buf,
-                    &pbs.x_rot_batch,
-                    &pbs.fa_q_full_batch,
-                    &pbs.fa_k_batch,
-                    &pbs.fa_v_batch,
-                    layer.wq.m,
-                    layer.wk.m,
-                    layer.wv.m,
-                    layer.wq.k,
-                    n,
-                )?;
-            } else {
-                run_plain_gemm_key(
-                    gpu,
-                    KernelKey::GemmQ8_0BatchedChunked,
-                    &layer.wq.buf,
-                    layer.wq.gpu_dtype,
-                    &pbs.x_rot_batch,
-                    &pbs.fa_q_full_batch,
-                    layer.wq.m,
-                    layer.wq.k,
-                    n,
-                )?;
-                run_plain_gemm_key(
-                    gpu,
-                    KernelKey::GemmQ8_0BatchedChunked,
-                    &layer.wk.buf,
-                    layer.wk.gpu_dtype,
-                    &pbs.x_rot_batch,
-                    &pbs.fa_k_batch,
-                    layer.wk.m,
-                    layer.wk.k,
-                    n,
-                )?;
-                run_plain_gemm_key(
-                    gpu,
-                    KernelKey::GemmQ8_0BatchedChunked,
-                    &layer.wv.buf,
-                    layer.wv.gpu_dtype,
-                    &pbs.x_rot_batch,
-                    &pbs.fa_v_batch,
-                    layer.wv.m,
-                    layer.wv.k,
-                    n,
-                )?;
+        }
+        GroupPlan::Mixed { .. } => {
+            for (w, out) in [
+                (&layer.wq, &pbs.fa_q_full_batch),
+                (&layer.wk, &pbs.fa_k_batch),
+                (&layer.wv, &pbs.fa_v_batch),
+            ] {
+                let y = out.sub_offset(0, n * w.m);
+                slots_plain_proj(gpu, w, &pbs.x_rot_batch, &pbs.x_norm_batch, &y, n)?;
             }
         }
     }
+
 
     // 3. Deinterleave Q + gate.
     gpu.deinterleave_f32_batched(
@@ -2791,51 +3149,10 @@ fn run_fullattn_moe_layer_slots(
         )?;
     }
 
-    // 6. Batched KV write — slot-aware, on the engine's resolved KV tier
-    // regardless of this layer's projection weight dtype (see module doc).
-    kv_write_slots(
-        gpu,
-        kv,
-        k_cache,
-        v_cache,
-        &pbs.fa_k_batch,
-        &pbs.fa_v_batch,
-        &pbs.positions,
-        config.n_kv_heads,
-        config.head_dim,
-        n,
-        &desc_staging.descs_dev,
-        &desc_staging.row_slot_dev,
-    )?;
-
-    // 7. Batched attend — slot-aware, one launch across every slot.
-    tier_attend_slots(
-        gpu,
-        kv,
-        &pbs.fa_q_batch,
-        k_cache,
-        v_cache,
-        &pbs.fa_attn_out_batch,
-        &pbs.positions,
-        config.n_heads,
-        config.n_kv_heads,
-        config.head_dim,
-        physical_cap,
-        max_ctx_len,
-        n,
-        &s.flash_partials,
-        &desc_staging.descs_dev,
-        &desc_staging.row_slot_dev,
-        single_slot,
-        n_tiles.map(|nt| {
-            (
-                &desc_staging.tile_slot_dev,
-                &desc_staging.tile_row0_dev,
-                &desc_staging.tile_qbase_dev,
-                nt,
-            )
-        }),
-    )?;
+    // 6-7. Batched KV write + attend — slot-aware, on the engine's resolved
+    // KV tier and storage regardless of this layer's projection weight dtype
+    // (see module doc).
+    layer_kv_write_attend(gpu, config, kv, addr, pbs, s, n, physical_cap, max_ctx_len)?;
 
     // 8. sigmoid(gate) * attn_out, over the `n` LIVE rows only.
     //
@@ -2860,30 +3177,25 @@ fn run_fullattn_moe_layer_slots(
         &pbs.fa_gate_batch.sub_offset(0, gate_elems),
     )?;
 
-    // 9. wo + residual.
-    match attn_dtype {
-        AttnProjDtype::Mq4G256 => mq4_residual_proj(
-            gpu,
-            &layer.wo,
-            &pbs.fa_attn_out_batch,
-            &pbs.x_batch,
-            &pbs.fa_attn_out_rot_batch,
-            n,
-        )?,
-        AttnProjDtype::Q8_0 => q8_residual_proj(
-            gpu,
-            &layer.wo,
-            &pbs.fa_attn_out_batch,
-            &pbs.x_batch,
-            &pbs.fa_attn_out_rot_batch,
-            n,
-            q8_wmma_arch,
-        )?,
-    }
+    // 9. wo + residual — dispatched by wo's own dtype.
+    slots_residual_proj(
+        gpu,
+        &layer.wo,
+        &pbs.fa_attn_out_batch,
+        &pbs.x_batch,
+        &pbs.fa_attn_out_rot_batch,
+        &pbs.x_rot_batch,
+        n,
+        q8_wmma_arch,
+    )?;
 
     // 10. Batched MoE FFN — stateless per row, no slot machinery needed.
+    let (attn_ns, t_moe) = match (&t_attn, trace_on) {
+        (Some(t), true) => (t.elapsed().as_nanos() as u64, Some(std::time::Instant::now())),
+        _ => (0, None),
+    };
     let ctx = DispatchCtx::new(gpu);
-    prefill_moe_ffn_body_batched(
+    let moe_result = prefill_moe_ffn_body_batched(
         gpu,
         &layer.ffn,
         &layer.ffn_norm,
@@ -2893,7 +3205,22 @@ fn run_fullattn_moe_layer_slots(
         &ctx,
         weights_moe_has_mq6,
         /*routed_out=*/ None,
-    )
+    );
+    if trace_on {
+        let moe_ns = t_moe.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
+        let total_ns = t_layer.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
+        hipfire_dispatch::moe_layer_trace(
+            layer.ffn.layer_idx as usize,
+            true,
+            hipfire_dispatch::MoeLayerTiming {
+                total_ns,
+                attn_ns,
+                moe_ns,
+                rows: n,
+            },
+        );
+    }
+    moe_result
 }
 
 /// Final output norm + per-slot last-token logits. Gathers only the last
@@ -2946,7 +3273,8 @@ fn final_logits_per_slot(
             0,
             &format!(
                 "forward_batch_slots: lm_head (weights.output) dtype {:?} is not \
-                 supported by the multi-slot path (expected Q8_0, MQ4G256, MQ4G256V2 or MQ6G256V2)",
+                 supported by the multi-slot path (see `lm_head_slots_admissible` \
+                 for the admitted tier/fixed-tier container set)",
                 weights.output.gpu_dtype
             ),
         ));
@@ -3389,7 +3717,7 @@ pub fn forward_batch_slots_graphed_opts(
     // The captured step includes the per-slot lm_head `Step::Gemv`, so a spilled
     // model routes it to the CPU (a host sync point) and the graph must not be
     // used — same rule as the dense AR graph in `qwen35/forward.rs`.
-    if hipfire_dispatch::cpu_offload_active(config.i_gpu_start) {
+    if gpu.owns_host_cpu_weights() {
         hipfire_dispatch::log_capture_disabled_once();
         return forward_batch_slots_opts(
             gpu,
@@ -3802,21 +4130,19 @@ pub fn forward_batch_slots_opts(
 
     let dim = config.dim;
 
-    // ── 1. Embed tokens (Q8_0 only) ──────────────────────────────────────
-    if !matches!(weights.embd_format, EmbeddingFormat::Q8_0) {
-        return Err(HipError::new(
-            0,
-            "forward_batch_slots: embedding table must be Q8_0 (the multi-slot \
-             batched path is Q8_0-only, see sp3-task-2-report.md)",
-        ));
-    }
+    // ── 1. Embed tokens ──────────────────────────────────────────────────
+    // Every admitted format dequantizes/copies into pbs.x_batch as F32 with
+    // token ids read from a device buffer, so the call replays under graph
+    // capture. HostF32 embeds (qt1/2/16/40/41/44/45/47-50 — see
+    // `embed_classify`) arrive as `EmbeddingFormat::F32`.
+    slots_embed_format_admitted(weights.embd_format)?;
     if !opts.skip_uploads {
         let tokens_host: Vec<i32> = batch.tokens.iter().map(|&t| t as i32).collect();
         let tokens_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4) };
         gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
     }
-    gpu.embedding_lookup_q8_batched(&weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?;
+    embed_lookup_slots(gpu, weights.embd_format, &weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?;
 
     // ── 1b. VL rows: overwrite image-pad rows with vision embeddings ─────
     // `batch.ext_emb` (per-row matrix index, -1 = token table) and the
@@ -4016,103 +4342,30 @@ pub fn forward_batch_slots_opts(
 
     // ── 4. Per-layer loop ─────────────────────────────────────────────────
     let layer_end = config.n_layers.min(max_layer.unwrap_or(usize::MAX));
-    let mut delta_layer_idx = 0usize;
-    let mut kv_layer_idx = 0usize;
-    for layer_idx in 0..layer_end {
-        match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
-            (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
-                run_deltanet_layer_slots(
-                    gpu,
-                    config,
-                    layer,
-                    batch,
-                    dn_states,
-                    pbs,
-                    q8_wmma_arch,
-                    n,
-                    delta_layer_idx,
-                    spec_capture.as_deref_mut(),
-                )?;
-                delta_layer_idx += 1;
-            }
-            (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
-                run_fullattn_layer_slots(
-                    gpu,
-                    config,
-                    layer,
-                    pbs,
-                    s,
-                    &k_arenas[kv_layer_idx],
-                    &v_arenas[kv_layer_idx],
-                    desc_staging,
-                    kv,
-                    q8_wmma_arch,
-                    n,
-                    physical_cap,
-                    max_ctx_len,
-                    single_slot,
-                    n_tiles,
-                    use_mrope,
-                )?;
-                kv_layer_idx += 1;
-            }
-            (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
-                run_deltanet_moe_layer_slots(
-                    gpu,
-                    config,
-                    layer,
-                    batch,
-                    dn_states,
-                    pbs,
-                    q8_wmma_arch,
-                    n,
-                    delta_layer_idx,
-                    spec_capture.as_deref_mut(),
-                    weights.moe_has_mq6,
-                )?;
-                delta_layer_idx += 1;
-            }
-            (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) => {
-                run_fullattn_moe_layer_slots(
-                    gpu,
-                    config,
-                    layer,
-                    pbs,
-                    s,
-                    &k_arenas[kv_layer_idx],
-                    &v_arenas[kv_layer_idx],
-                    desc_staging,
-                    kv,
-                    q8_wmma_arch,
-                    n,
-                    physical_cap,
-                    max_ctx_len,
-                    single_slot,
-                    n_tiles,
-                    weights.moe_has_mq6,
-                    use_mrope,
-                )?;
-                kv_layer_idx += 1;
-            }
-            (_, lt) => {
-                return Err(HipError::new(
-                    0,
-                    &format!(
-                        "forward_batch_slots: layer {layer_idx} weight/type mismatch \
-                         (layer_type={lt:?})"
-                    ),
-                ));
-            }
-        }
-        // DFlash2 extract-layer hidden capture: copy this step's
-        // post-layer hidden rows into the shared staging buffer. Runs
-        // for every layer kind (extract layers can be DeltaNet or
-        // FullAttention); `capture_hidden_rows` is a no-op when the
-        // capture is unset or this layer is not an extract layer.
-        if let Some(cap) = spec_capture.as_deref() {
-            cap.capture_hidden_rows(gpu, pbs, layer_idx, n)?;
-        }
-    }
+    run_layers_slots(
+        gpu,
+        weights,
+        config,
+        batch,
+        &*dn_states,
+        |kv_layer_idx| LayerKvAddr::Arena {
+            k_cache: &k_arenas[kv_layer_idx],
+            v_cache: &v_arenas[kv_layer_idx],
+            desc_staging,
+            single_slot,
+            n_tiles,
+        },
+        kv,
+        pbs,
+        s,
+        q8_wmma_arch,
+        n,
+        physical_cap,
+        max_ctx_len,
+        use_mrope,
+        layer_end,
+        spec_capture.as_deref_mut(),
+    )?;
 
     if max_layer.is_some() {
         // Early-exit for bisection: mirror the reference's `do_lm_head =
@@ -4149,6 +4402,123 @@ pub fn forward_batch_slots_opts(
     // correct-by-construction: this function is the only thing that advances a
     // slot's KV, so it is the only thing that can get the length right.
     advance_slot_seq_lens(batch, pool)?;
+    Ok(())
+}
+
+/// The per-layer body shared by the arena and VMM slots forwards. `kv_addr`
+/// yields the KV storage for FullAttention layer `kv_layer_idx`.
+#[allow(clippy::too_many_arguments)]
+fn run_layers_slots<'a, D, F>(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    batch: &SlotBatch,
+    dn_states: &D,
+    kv_addr: F,
+    kv: &SlotKvTier,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    q8_wmma_arch: bool,
+    n: usize,
+    physical_cap: usize,
+    max_ctx_len: usize,
+    use_mrope: bool,
+    layer_end: usize,
+    mut spec_capture: Option<&mut SpecVerifyCapture>,
+) -> HipResult<()>
+where
+    D: std::ops::Index<usize, Output = DeltaNetState> + ?Sized,
+    F: Fn(usize) -> LayerKvAddr<'a>,
+{
+    let mut delta_layer_idx = 0usize;
+    let mut kv_layer_idx = 0usize;
+    for layer_idx in 0..layer_end {
+        match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
+            (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
+                run_deltanet_layer_slots(
+                    gpu,
+                    config,
+                    layer,
+                    batch,
+                    dn_states,
+                    pbs,
+                    q8_wmma_arch,
+                    n,
+                    delta_layer_idx,
+                    spec_capture.as_deref_mut(),
+                )?;
+                delta_layer_idx += 1;
+            }
+            (LayerWeights::FullAttn(layer), LayerType::FullAttention) => {
+                run_fullattn_layer_slots(
+                    gpu,
+                    config,
+                    layer,
+                    pbs,
+                    s,
+                    &kv_addr(kv_layer_idx),
+                    kv,
+                    q8_wmma_arch,
+                    n,
+                    physical_cap,
+                    max_ctx_len,
+                    use_mrope,
+                )?;
+                kv_layer_idx += 1;
+            }
+            (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
+                run_deltanet_moe_layer_slots(
+                    gpu,
+                    config,
+                    layer,
+                    batch,
+                    dn_states,
+                    pbs,
+                    q8_wmma_arch,
+                    n,
+                    delta_layer_idx,
+                    spec_capture.as_deref_mut(),
+                    weights.moe_has_mq6,
+                )?;
+                delta_layer_idx += 1;
+            }
+            (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) => {
+                run_fullattn_moe_layer_slots(
+                    gpu,
+                    config,
+                    layer,
+                    pbs,
+                    s,
+                    &kv_addr(kv_layer_idx),
+                    kv,
+                    q8_wmma_arch,
+                    n,
+                    physical_cap,
+                    max_ctx_len,
+                    weights.moe_has_mq6,
+                    use_mrope,
+                )?;
+                kv_layer_idx += 1;
+            }
+            (_, lt) => {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "forward_batch_slots: layer {layer_idx} weight/type mismatch \
+                         (layer_type={lt:?})"
+                    ),
+                ));
+            }
+        }
+        // DFlash2 extract-layer hidden capture: copy this step's
+        // post-layer hidden rows into the shared staging buffer. Runs
+        // for every layer kind (extract layers can be DeltaNet or
+        // FullAttention); `capture_hidden_rows` is a no-op when the
+        // capture is unset or this layer is not an extract layer.
+        if let Some(cap) = spec_capture.as_deref() {
+            cap.capture_hidden_rows(gpu, pbs, layer_idx, n)?;
+        }
+    }
     Ok(())
 }
 
@@ -4236,6 +4606,19 @@ mod tests {
     }
 
     #[test]
+    fn six_bit_g256_container_selects_hfq6_keys() {
+        // MQ6G256 MoE attention and shared-expert gate/up (AWQ A3B layers
+        // 0/1/38/39) route through these selectors; an HFQ4 key here reads the
+        // 200 B/group container at the 136 B stride and decodes noise.
+        for dt in [DType::MQ6G256, DType::HFQ6G256] {
+            assert_eq!(fused_qkvza_key_for(dt), KernelKey::FusedQkvzaHfq6G256, "{dt:?}");
+            assert_eq!(fused_qkv_key_for(dt), KernelKey::FusedQkvHfq6G256, "{dt:?}");
+            assert_eq!(fused_gate_up_key_for(dt), KernelKey::FusedGateUpHfq6G256, "{dt:?}");
+            assert_eq!(residual_gemm_key_for(dt), KernelKey::GemmHfq6G256Residual, "{dt:?}");
+        }
+    }
+
+    #[test]
     fn v2_plain_gemm_resolve_no_wildcard() {
         // Plain GEMM auto-selection (GemmFamily::resolve) — not this file's logic
         // but we assert the key helpers correctly identify V2 vs wildcard.
@@ -4247,17 +4630,252 @@ mod tests {
     }
 
     #[test]
-    fn lm_head_slots_admissible_admits_mq6v2() {
-        assert!(lm_head_slots_admissible(DType::Q8_0));
-        assert!(lm_head_slots_admissible(DType::MQ4G256));
-        assert!(lm_head_slots_admissible(DType::MQ4G256V2));
-        assert!(lm_head_slots_admissible(DType::MQ6G256V2));
-        // Do not silently widen to MQ2/3/5V2.
-        assert!(!lm_head_slots_admissible(DType::MQ5G256V2));
-        assert!(!lm_head_slots_admissible(DType::MQ3G256V2));
-        assert!(!lm_head_slots_admissible(DType::MQ2G256V2));
-        assert!(!lm_head_slots_admissible(DType::MQ4CG256));
-        assert!(!lm_head_slots_admissible(DType::HFQ4G256));
+    fn lm_head_slots_admissible_covers_tier_dtypes() {
+        // Everything `--tier`/`--fixed-tier` can lift the head to, plus the
+        // unrotated siblings the generic GEMV handles.
+        for dt in [
+            DType::Q8_0,
+            DType::MQ4G256,
+            DType::HFQ4G256,
+            DType::MQ4G256V2,
+            DType::MQ4CG256,
+            DType::MQ6G256,
+            DType::HFQ6G256,
+            DType::MQ6G256V2,
+            DType::MQ5G256V2,
+            DType::MQ3G256,
+            DType::MQ3G256V2,
+            DType::MQ2G256V2,
+            DType::HFQ3G256,
+            DType::F16,
+        ] {
+            assert!(lm_head_slots_admissible(dt), "lm_head refuses {dt:?}");
+        }
+        // Do not silently widen to codebooks without slot GEMV coverage.
+        for dt in [DType::MQ4G256V2Lloyd, DType::MQ3G256Lloyd] {
+            assert!(!lm_head_slots_admissible(dt), "lm_head admits {dt:?}");
+        }
+    }
+
+    #[test]
+    fn proj_group_plans_uniform_and_mixed() {
+        let arch = "gfx1101";
+        let m = |dt: DType| (dt, false);
+        // Uniform: the whole-V2 family plus Q8 stay one fused launch.
+        for dt in [
+            DType::Q8_0,
+            DType::MQ4G256,
+            DType::MQ4G256V2,
+            DType::MQ6G256,
+            DType::MQ6G256V2,
+            DType::MQ5G256V2,
+            DType::MQ3G256,
+            DType::MQ3G256V2,
+            DType::MQ2G256V2,
+        ] {
+            assert_eq!(
+                plan_proj_group_dtypes(&[m(dt), m(dt)], arch),
+                Ok(GroupPlan::Uniform(dt)),
+                "uniform {dt:?} must plan Uniform"
+            );
+        }
+        // MQ4CG256 is a gfx12-only container (is_batchable_la WMMA gate):
+        // refused on gfx11, admitted uniform on gfx12.
+        assert!(plan_proj_group_dtypes(&[m(DType::MQ4CG256), m(DType::MQ4CG256)], arch).is_err());
+        assert_eq!(
+            plan_proj_group_dtypes(&[m(DType::MQ4CG256), m(DType::MQ4CG256)], "gfx1201"),
+            Ok(GroupPlan::Uniform(DType::MQ4CG256))
+        );
+        // qt44 + Q8 mixed group (tier-pro shape): both plain-capable, both
+        // variants needed.
+        assert_eq!(
+            plan_proj_group_dtypes(&[m(DType::MQ4G256V2), m(DType::Q8_0)], arch),
+            Ok(GroupPlan::Mixed {
+                needs_rot: true,
+                needs_norm: true
+            })
+        );
+        // Two rotated V2 dtypes: one rot variant serves both.
+        assert_eq!(
+            plan_proj_group_dtypes(&[m(DType::MQ4G256V2), m(DType::MQ6G256V2)], arch),
+            Ok(GroupPlan::Mixed {
+                needs_rot: true,
+                needs_norm: false
+            })
+        );
+        // HFQ4 (unrotated) + MQ4 (rotated): both variants.
+        assert_eq!(
+            plan_proj_group_dtypes(&[m(DType::MQ4G256), m(DType::HFQ4G256)], arch),
+            Ok(GroupPlan::Mixed {
+                needs_rot: true,
+                needs_norm: true
+            })
+        );
+        // qt15 Promote6 member in a MIXED group: no GemmHfq6G256 plain key →
+        // refuse with a named reason (uniform qt15 stays fused-legal).
+        assert!(plan_proj_group_dtypes(&[m(DType::MQ6G256), m(DType::MQ4G256V2)], arch)
+            .unwrap_err()
+            .contains("no per-projection GEMM key"));
+        // AWQ in a mixed group: flat-member sidecars refuse (no kernel
+        // applies them on the natural basis); rotated members may all carry
+        // a sidecar or none, but not a mix.
+        assert!(plan_proj_group_dtypes(
+            &[m(DType::MQ4G256V2), (DType::Q8_0, true)],
+            arch
+        )
+        .unwrap_err()
+        .contains("FLAT"));
+        assert!(plan_proj_group_dtypes(
+            &[(DType::MQ4G256V2, true), m(DType::MQ6G256V2)],
+            arch
+        )
+        .unwrap_err()
+        .contains("AWQ"));
+        // All-rotated members sharing AWQ presence is admitted.
+        assert_eq!(
+            plan_proj_group_dtypes(
+                &[(DType::MQ4G256V2, true), (DType::MQ6G256V2, true)],
+                arch
+            ),
+            Ok(GroupPlan::Mixed {
+                needs_rot: true,
+                needs_norm: false
+            })
+        );
+        assert_eq!(
+            plan_proj_group_dtypes(&[(DType::MQ4G256V2, true), (DType::MQ4G256V2, true)], arch),
+            Ok(GroupPlan::Uniform(DType::MQ4G256V2))
+        );
+        // Out-of-scope containers refuse at admission.
+        for dt in [
+            DType::MQ4G256V2Lloyd,
+            DType::TQ2G128,
+            DType::HFQ4G128,
+            DType::F16,
+        ] {
+            assert!(
+                plan_proj_group_dtypes(&[m(dt), m(DType::MQ4G256V2)], arch).is_err(),
+                "{dt:?} must not be admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn residual_and_plain_key_tables_cover_admitted_set() {
+        // Every admitted rotated container must have BOTH a plain path and
+        // a residual path reachable — the tables are the contract
+        // `slots_residual_proj`/`slots_plain_proj` dispatch on.
+        for dt in [
+            DType::MQ4G256,
+            DType::MQ4G256V2,
+            DType::MQ4CG256,
+            DType::MQ6G256V2,
+            DType::MQ5G256V2,
+            DType::MQ3G256V2,
+            DType::MQ2G256V2,
+        ] {
+            assert!(slots_plain_gemm_key(dt).is_some(), "{dt:?} needs a plain key");
+            assert!(
+                slots_residual_gemm_key(dt).is_some(),
+                "{dt:?} needs a residual key"
+            );
+            assert!(slots_weight_rotated(dt), "{dt:?} must be rotated");
+        }
+        // Unrotated containers: residual only (plain key is only needed for
+        // mixed groups — HFQ4 has one, HFQ6/HFQ3 are uniform-only).
+        assert!(slots_plain_gemm_key(DType::HFQ4G256).is_some());
+        for dt in [DType::HFQ4G256, DType::HFQ6G256, DType::MQ6G256] {
+            assert!(
+                slots_residual_gemm_key(dt).is_some(),
+                "{dt:?} needs a residual key"
+            );
+        }
+        assert!(slots_plain_gemm_key(DType::Q8_0).is_some());
+        // F16/Lloyd/etc. stay refused at admission regardless of key tables.
+        assert!(!slots_proj_admissible(DType::F16, "gfx1101"));
+        assert!(!slots_proj_admissible(DType::MQ4G256V2Lloyd, "gfx1101"));
+    }
+
+    #[test]
+    fn rotated_residual_keys_never_fall_back_to_hfq4() {
+        // The wo/w_down rotated path (`mq4_residual_proj`) requires every
+        // rotated container to resolve through `slots_residual_gemm_key`.
+        // The dispatch-level `residual_gemm_key_for` wildcard would silently
+        // send the 200 B/group MQ6G256 and 104/112 B/group MQ3 headers
+        // through the 136 B/group HFQ4 v1 kernel — full-speed noise (see the
+        // container-selection note above the fused key helpers). MQ4G256 is
+        // the one legitimate borrower (it IS the HFQ4 container plus an
+        // offline FWHT).
+        for dt in [
+            DType::MQ4G256,
+            DType::MQ4G256V2,
+            DType::MQ4CG256,
+            DType::MQ6G256,
+            DType::MQ6G256V2,
+            DType::MQ5G256V2,
+            DType::MQ3G256,
+            DType::MQ3G256V2,
+            DType::MQ3G256Lloyd,
+            DType::MQ2G256V2,
+        ] {
+            assert!(slots_weight_rotated(dt), "{dt:?} is a rotated member");
+            let key = slots_residual_gemm_key(dt)
+                .unwrap_or_else(|| panic!("rotated container {dt:?} lost its residual key"));
+            if dt != DType::MQ4G256 {
+                assert_ne!(
+                    key, KernelKey::GemmHfq4G256Residual,
+                    "{dt:?} must not share the HFQ4 v1 residual kernel"
+                );
+            }
+        }
+        // ...and the non-136B containers get their own families explicitly.
+        assert_eq!(
+            slots_residual_gemm_key(DType::MQ6G256),
+            Some(KernelKey::GemmHfq6G256Residual)
+        );
+        assert_eq!(
+            slots_residual_gemm_key(DType::MQ3G256),
+            Some(KernelKey::GemmHfq3G256Residual)
+        );
+        assert_eq!(
+            slots_residual_gemm_key(DType::MQ3G256Lloyd),
+            Some(KernelKey::GemmMq3G256LloydResidual)
+        );
+    }
+
+    #[test]
+    fn q8_uniform_degrades_to_plain_on_non_wmma() {
+        // Uniform Q8_0 must degrade to the Mixed plain fork when the WMMA
+        // fused kernels don't apply (non-WMMA arch or HIPFIRE_Q8_PREFILL_
+        // WMMA=0 folded into q8_wmma_arch); every other plan passes through.
+        assert_eq!(
+            plan_q8_fused_or_plain(GroupPlan::Uniform(DType::Q8_0), false),
+            GroupPlan::Mixed {
+                needs_rot: false,
+                needs_norm: true
+            }
+        );
+        assert_eq!(
+            plan_q8_fused_or_plain(GroupPlan::Uniform(DType::Q8_0), true),
+            GroupPlan::Uniform(DType::Q8_0)
+        );
+        assert_eq!(
+            plan_q8_fused_or_plain(GroupPlan::Uniform(DType::MQ4G256V2), false),
+            GroupPlan::Uniform(DType::MQ4G256V2)
+        );
+        assert_eq!(
+            plan_q8_fused_or_plain(
+                GroupPlan::Mixed {
+                    needs_rot: true,
+                    needs_norm: true
+                },
+                false
+            ),
+            GroupPlan::Mixed {
+                needs_rot: true,
+                needs_norm: true
+            }
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ license.workspace = true
 description = "Qwen4/ Qwen3.8-Flash-Next text configuration, PLE hashing, admission, and manifest foundations"
 
 [dependencies]
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
@@ -16,13 +17,21 @@ rdna-compute = { path = "../rdna-compute", features = ["deltanet"] }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["deltanet"] }
 smallvec = { version = "1.15.2", features = ["const_generics"] }
 sha2.workspace = true
+peacemaker-npu = { path = "../peacemaker-npu" }
+rayon.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+railgun = { path = "../railgun", features = ["npu"] }
 
 [dev-dependencies]
 memmap2.workspace = true
 saddle-quant = { path = "../saddle-quant" }
+half.workspace = true
 
 [features]
-reference-parity = []
+# Explicit developer build opt-in; never part of the default serving build.
+qwen4-dev-profiles = []
+reference-parity = ["rdna-compute/lab"]
 lab = []
 
 [[example]]
@@ -34,9 +43,33 @@ name = "qwen4_qsa_ctx"
 required-features = ["reference-parity"]
 
 [[example]]
+name = "qwen4_qsa_arena_check"
+required-features = ["reference-parity"]
+
+[[example]]
+name = "qwen4_mtp_fill"
+required-features = ["reference-parity"]
+
+[[example]]
 name = "qwen4_kld"
 required-features = ["lab"]
 
 [[example]]
 name = "qwen4_rows"
 required-features = ["lab"]
+
+[[example]]
+name = "fn_lane_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "fn_prefill_g0"
+required-features = ["lab"]
+
+[[example]]
+name = "fn_sampled_plumbing_oracle"
+required-features = ["lab"]
+
+[[test]]
+name = "mtp_takeover_fill_hw"
+required-features = ["reference-parity"]

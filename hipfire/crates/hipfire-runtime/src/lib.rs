@@ -19,11 +19,13 @@ pub mod arch_mapping;
 pub mod arch_model;
 pub mod arch_spec;
 pub mod augmentor;
+pub mod batch_sampler;
 pub mod bf16_loader;
 pub mod cache_plan;
 #[cfg(feature = "deltanet")]
 pub mod cask;
 pub mod chatml;
+pub mod checkpoint_pool;
 pub mod config;
 #[cfg(feature = "deltanet")]
 pub mod cpu_router;
@@ -37,9 +39,12 @@ pub mod dflash;
 /// analogue is `dspark_block_controller`. Pure math, no GPU types.
 pub mod dflash_adaptive_block;
 pub mod dflash_generic;
+pub mod dflash_online;
 pub mod dspark_block_controller;
 pub mod dspark_core;
 pub mod ep;
+pub mod ep_row_gather;
+pub mod ep_tile_exchange;
 pub mod eval_common;
 pub mod external_rows;
 pub mod gguf;
@@ -57,37 +62,52 @@ pub mod loop_guard;
 pub mod model_load;
 pub mod model_source;
 pub mod multi_gpu;
+pub mod offload_calibrate;
 pub mod paro;
+pub mod ple_convert;
+pub mod ple_hot_pack;
+pub mod ple_hot_store;
+pub mod ple_prewarm;
+pub mod ple_q4;
+pub mod ple_sidecar;
 pub mod prefix;
 pub mod prefix_index;
 pub mod reset_core;
+pub mod rope;
 pub mod safetensors_source;
 pub mod sampler;
+/// `Scheduler` — decides what goes into each step's `SlotBatch`. Pure CPU
+/// logic; no GPU dependencies. Round-robin, chunked prefill mixed with
+/// decode. Moved from `hipfire-arch-qwen35` with `slot_batch`.
+pub mod scheduler;
 pub mod sealed_moe;
 pub mod serve;
-pub mod checkpoint_pool;
 pub mod serve_contract;
 pub mod serve_fairness;
 pub mod serve_wait;
+pub mod session_cache;
+pub mod sidecar;
 /// `SlotBatch` — one forward step's ragged work across N slots. Pure CPU
 /// data structure; no GPU dependencies. Moved from `hipfire-arch-qwen35`
 /// (the multi-slot scheduler/batch substrate is model-agnostic). See module
 /// docs for the per-slot-absolute `positions[]` invariant.
 pub mod slot_batch;
-/// `Scheduler` — decides what goes into each step's `SlotBatch`. Pure CPU
-/// logic; no GPU dependencies. Round-robin, chunked prefill mixed with
-/// decode. Moved from `hipfire-arch-qwen35` with `slot_batch`.
-pub mod scheduler;
-pub mod sidecar;
 pub mod spec;
 
 pub mod ngram_mod;
+pub mod offload;
 pub mod spec_ngram;
+pub mod spec_sampling;
 pub mod swap;
 pub mod tp_shard;
+pub mod trunk_overlay;
 #[cfg(feature = "deltanet")]
 pub mod triattn;
 pub mod weight_manifest;
+/// Shared-weight host protocol v1 (`HIPFIRE_WEIGHT_HOST`): identities, typed
+/// manifest, source certificates and the `SCM_RIGHTS` handshake. Linux only.
+#[cfg(target_os = "linux")]
+pub mod weight_host;
 #[cfg(feature = "deltanet")]
 pub mod weight_pager;
 pub mod weight_store;
@@ -96,8 +116,8 @@ pub mod emit_text;
 pub mod eos_filter;
 pub mod prompt_frame;
 pub mod semantic;
-pub mod stop_sequence;
 pub mod session_table;
+pub mod stop_sequence;
 pub mod tokenizer;
 
 pub mod calibration;

@@ -1,6 +1,10 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! C5: per-counter weighted wait replay across the CFG.
 //!
-//! CFG-aware port of `hipfire-isa/src/ledger_replay.rs` onto typed streams,
+//! CFG-aware port of `peacemaker-isa/src/ledger_replay.rs` onto typed streams,
 //! implementing the rule table of core.md §2.6:
 //!
 //! * Issue: one [`PendingEvent`] per memory instruction. Counter membership
@@ -10,8 +14,11 @@
 //!   `n` units remain. `Km` and `Store` are out of order and retire only at
 //!   `n = 0`; gfx11 `Lgkm` retires partially when all outstanding events
 //!   belong to the in-order LDS family, but not when SMEM shares the counter.
-//!   `Load` retires partially only within one family (buffer vs global, the
-//!   `ledger.rs` rule kept from `ledger_replay.rs:45-61`).
+//!   `Load` (gfx12 LOADcnt) retires partially only within one in-order class:
+//!   BUFFER and GLOBAL loads form one class (ROCm 10.0 `SIInsertWaitcnts.cpp`
+//!   maps both to LOAD_CNT's single `VMEM_ACCESS` event, so
+//!   `counterOutOfOrder(LOAD_CNT)` is false); flat, scratch and image loads
+//!   stay separate classes (the `ledger.rs` / `ledger_replay.rs` rule).
 //! * Hazard: touching `defs` of a pending load (RAW/WAW), or redefining
 //!   `src_locks` of a pending store (WAR), before retirement is a finding.
 //!   Store locks are `Effects.uses` (the `ledger.rs` rule); the WAR def set
@@ -21,9 +28,10 @@
 //! * `s_wait_alu depctr_vm_vsrc(0)` clears VMEM store locks
 //!   (`ledger_replay.rs:109-114`); every other `s_wait_alu` is replay-neutral.
 //! * `s_endpgm` empties the state; barriers never retire.
-//! * Join at a block entry is the maximal pending set keyed by issuing
-//!   `InstId`: counters union, units per-counter maximum, satisfied
-//!   intersection, defs/locks union (core.md §2.6).
+//! * Join retains the maximal pending set keyed by issuing `InstId`. For
+//!   in-order counters, the minimum younger-unit suffix over reaching paths
+//!   determines retirement; mutually exclusive issues never pad a queue.
+//!   Out-of-order families still require a zero wait.
 //!
 //! Depctr bit positions below are pinned by `llvm-mc -mcpu=gfx1201`
 //! (single-field probes): `sa_sdst` = bit 0, `va_vcc` = bit 1,
@@ -35,7 +43,7 @@ use thiserror::Error;
 
 use crate::cfg::{BlockId, Body, InstId};
 use crate::effects::{Control, MemClass};
-use crate::inst::{Arch, Inst};
+use crate::inst::{Arch, Inst, Wave};
 use crate::operand::{ImmField, Operand};
 use crate::reg::{Kind, RegRef, RegSet};
 use crate::state::ObligationKind;
@@ -68,7 +76,7 @@ pub struct WaitCensus {
 /// facts, per-site obligations, and the converged state before each inst.
 #[derive(Clone, Debug)]
 pub struct WaitReplay {
-    /// One entry per memory instruction, in first-issue order.
+    /// One entry per reachable memory instruction, with stable layout-order IDs.
     pub events: Vec<PendingEvent>,
     pub facts: Vec<WaitFact>,
     pub obligations: Vec<Obligation>,
@@ -107,13 +115,14 @@ fn is_load(class: MemClass) -> bool {
     )
 }
 
-/// Memory classes the replay tracks. Atomics/image/sample rows have no M1
-/// table rows; anything else decodable is replayed.
+/// Memory classes the replay tracks. Image/sample rows and flat atomics have
+/// no table rows; anything else decodable is replayed.
 fn is_tracked(class: MemClass) -> bool {
     matches!(
         class,
         MemClass::VmemLoad
             | MemClass::VmemStore
+            | MemClass::VmemAtomic { .. }
             | MemClass::DsLoad
             | MemClass::DsStore
             | MemClass::SmemLoad
@@ -123,12 +132,15 @@ fn is_tracked(class: MemClass) -> bool {
     )
 }
 
-/// Load-counter family for the in-order rule: buffer vs everything else,
-/// from the encoding form (the `ledger.rs` family rule).
+/// Load-counter in-order class from the encoding form: gfx12 BUFFER and
+/// GLOBAL loads share LOADcnt's `VMEM_ACCESS` event; flat, scratch and image
+/// stay separate (the `ledger.rs` order-class rule).
 fn family_of(inst: &Inst) -> &'static str {
     match inst.form {
-        crate::inst::Form::Vmem(crate::inst::VmemForm::Buffer) => "buffer",
-        crate::inst::Form::Vmem(_) => "global",
+        crate::inst::Form::Vmem(crate::inst::VmemForm::Buffer | crate::inst::VmemForm::Global) => "vmem_read",
+        crate::inst::Form::Vmem(crate::inst::VmemForm::Scratch) => "scratch",
+        crate::inst::Form::Vmem(crate::inst::VmemForm::Flat) => "flat",
+        crate::inst::Form::Vmem(crate::inst::VmemForm::Image) => "image",
         crate::inst::Form::Ds => "ds",
         crate::inst::Form::Smem => "smem",
         _ => "scalar",
@@ -175,17 +187,44 @@ fn overlaps(a: &[(Kind, u16)], b: &[(Kind, u16)]) -> bool {
     a.iter().any(|x| b.contains(x))
 }
 
-fn explicit_regs(inst: &Inst) -> Vec<RegRef> {
-    let mut out: Vec<RegRef> =
-        inst.effects.defs.iter().chain(inst.effects.uses.iter()).copied().collect();
-    for operand in &inst.operands {
-        match operand {
-            Operand::Reg(reg) => out.push(*reg),
-            Operand::Half(reg, _) => out.push(*reg),
-            _ => {}
-        }
+fn explicit_regs(inst: &Inst, arch: Arch, wave: Wave) -> Vec<RegRef> {
+    inst.operands.iter().enumerate().filter_map(|(index, _)|
+        crate::codec::gfx12::operand_register(arch, wave, inst, index)).collect()
+}
+
+/// Physical bits touched by an explicit operand. A narrow DS store reads
+/// only its data half, never a narrow address. D16 loads independently
+/// write their selected half; the preserved half is not a hardware read.
+fn operand_mask(inst: &Inst, arch: Arch, index: usize) -> u32 {
+    use crate::operand::Half;
+    match inst.operands.get(index) {
+        Some(Operand::Half(_, Half::Lo)) => return 0xffff,
+        Some(Operand::Half(_, Half::Hi)) => return 0xffff0000,
+        Some(Operand::Reg(r)) if r.kind == Kind::V && r.len == 1 => {}
+        _ => return u32::MAX,
     }
-    out
+    let name = inst.op.name(arch).unwrap_or("");
+    if index == 0 && inst.effects.mem.as_ref().is_some_and(|m| is_load(m.class))
+        && name.contains("d16") {
+        return if name.contains("d16_hi") { 0xffff0000 } else { 0xffff };
+    }
+    if index > 0 && name.starts_with("ds_store_")
+        && (name.contains("_b8") || name.contains("_b16")) {
+        return if name.contains("d16_hi") { 0xffff0000 } else { 0xffff };
+    }
+    u32::MAX
+}
+
+fn raw_overlap(body: &Body, event: &PendingEvent, consumer: &Inst, arch: Arch, wave: Wave) -> bool {
+    let producer = body.insts.get(event.inst).expect("pending instruction exists");
+    let mask = operand_mask(producer, arch, 0);
+    consumer.operands.iter().enumerate().any(|(index, _)| {
+        let Some(reg) = crate::codec::gfx12::operand_register(arch, wave, consumer, index) else { return false };
+        if mask & operand_mask(consumer, arch, index) == 0 { return false; }
+        event.defs.0.iter().any(|dst| dst.kind == reg.kind
+            && dst.base < reg.base + u16::from(reg.len)
+            && reg.base < dst.base + u16::from(dst.len))
+    })
 }
 
 /// Raw SOPP simm16 bits of an `s_wait_alu`, if present.
@@ -215,16 +254,14 @@ fn counter_at(index: usize) -> Counter {
     }
 }
 
-/// Unit weight per counter from the table row (`Km:2` → 2 on Km).
+/// Unit weight per counter from the table row (`Km:2` → 2 on Km), for the
+/// instruction's return form (`@rtn` / `@nortn` rules).
 fn unit_weights(inst: &Inst, arch: Arch) -> [u8; N] {
     let mut units = [0u8; N];
     let Some(row) = crate::isa::lookup(arch, inst.op, inst.form) else {
         return units;
     };
-    for pair in row.counter.split(',') {
-        let Some((counter, weight)) = pair.split_once(':') else {
-            continue;
-        };
+    for (counter, weight) in row.counter_rules(crate::isa::atomic_returns(arch, &inst.mods.cpol)) {
         let slot = match counter {
             "Load" => Counter::Load,
             "Store" => Counter::Store,
@@ -254,6 +291,7 @@ fn join_states(a: &WaitState, b: &WaitState) -> WaitState {
                 prior.counters = prior.counters.union(event.counters);
                 for i in 0..N {
                     prior.units[i] = prior.units[i].max(event.units[i]);
+                    prior.younger[i] = prior.younger[i].min(event.younger[i]);
                 }
                 prior.satisfied = prior.satisfied.intersection(event.satisfied);
                 let mut defs = prior.defs.0.clone();
@@ -273,6 +311,8 @@ fn join_states(a: &WaitState, b: &WaitState) -> WaitState {
             }
         }
     }
+    // Presentation order is deterministic; retirement uses path-local suffix
+    // bounds, never this first-issue order. Union size is not a queue length.
     let mut pending: Vec<PendingEvent> = merged.into_values().collect();
     pending.sort_by_key(|event| event.id.0);
     WaitState { pending }
@@ -337,21 +377,12 @@ fn retire(
         }
     }
     let mut retired = Vec::new();
-    loop {
-        let units: u32 = state
-            .pending
-            .iter()
-            .filter(|e| e.counters.contains(counter) && !e.satisfied.contains(counter))
-            .map(|e| u32::from(e.units[counter as usize]))
-            .sum();
-        if units <= u32::from(count) {
-            break;
+    for position in (0..state.pending.len()).rev() {
+        let event = &state.pending[position];
+        if !event.counters.contains(counter) || event.satisfied.contains(counter)
+            || (count != 0 && event.younger[counter as usize] < count) {
+            continue;
         }
-        let Some(position) =
-            state.pending.iter().position(|e| e.counters.contains(counter) && !e.satisfied.contains(counter))
-        else {
-            break;
-        };
         let event = &mut state.pending[position];
         event.satisfied.insert(counter);
         if event.satisfied == event.counters {
@@ -444,8 +475,9 @@ fn inst_of(body: &Body, id: InstId) -> Result<&Inst, WaitError> {
 /// branches (conditional fall-through is not a leader), so the
 /// fall-through exit alone is path-ambiguous: every mid-block conditional
 /// branch contributes its own exit state, taken at the branch point.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct BlockExits {
-    fall: WaitState,
+    fall: Option<WaitState>,
     branches: Vec<(BlockId, WaitState)>,
 }
 
@@ -476,16 +508,32 @@ fn push_event(
         inst: id,
         counters: mem.counters,
         units: unit_weights(inst, arch),
+        younger: [0; N],
         satisfied: CounterSet::default(),
         class: mem.class,
         defs,
         src_locks: locks,
         in_order_type: mem.in_order_type,
     };
-    match state.pending.iter_mut().find(|e| e.id == id_event) {
-        Some(slot) => *slot = fresh.clone(),
-        None => state.pending.push(fresh.clone()),
+    // Reissue belongs at the tail, including across a loop back-edge.
+    // A still-pending previous issue is diagnosed above. It still consumes
+    // hardware counter units: replacing its static-site record must not
+    // subtract those units from other events' proven suffix bounds.
+    if let Some(position) = state.pending.iter().position(|e| e.id == id_event) {
+        state.pending.remove(position);
     }
+    for event in &mut state.pending {
+        for i in 0..N {
+            let counter = counter_at(i);
+            // Out-of-order families only retire at zero. Their suffix is
+            // irrelevant; aging it would force useless loop walks to 255.
+            if !matches!(counter, Counter::Km | Counter::Store | Counter::Vs)
+                && event.counters.contains(counter) {
+                event.younger[i] = event.younger[i].saturating_add(fresh.units[i]);
+            }
+        }
+    }
+    state.pending.push(fresh.clone());
     if record_issued && events.events.iter().all(|e| e.id != id_event) {
         events.events.push(fresh);
     }
@@ -497,9 +545,11 @@ fn push_event(
 fn walk_block(
     body: &Body,
     arch: Arch,
+    wave: Wave,
     range: (usize, usize),
     entry: &WaitState,
     events: &mut EventTable,
+    choices: &HashMap<InstId, bool>,
     mut recorder: Option<&mut Recorder>,
 ) -> Result<BlockExits, WaitError> {
     let mut state = entry.clone();
@@ -508,12 +558,17 @@ fn walk_block(
         let id = body.layout[index];
         let inst = inst_of(body, id)?;
         if let Some(recorder) = recorder.as_mut() {
-            recorder.before.insert(id, state.clone());
+            match recorder.before.entry(id) {
+                std::collections::hash_map::Entry::Vacant(slot) => { slot.insert(state.clone()); }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let joined = join_states(slot.get(), &state);
+                    slot.insert(joined);
+                }
+            }
         }
         match inst.effects.control {
-            Control::EndPgm => {
-                state.pending.clear();
-                continue;
+            Control::EndPgm | Control::Halt | Control::Trap => {
+                return Ok(BlockExits { fall: None, branches });
             }
             Control::Wait => {
                 if let Some(wait) = &inst.mods.wait {
@@ -545,28 +600,32 @@ fn walk_block(
                 if let Some(target) = branch_target(inst) {
                     branches.push((target, state.clone()));
                 }
-                state = WaitState::default();
-                break;
+                return Ok(BlockExits { fall: None, branches });
             }
             Control::Branch { .. } => {
-                if let Some(target) = branch_target(inst) {
-                    branches.push((target, state.clone()));
+                if choices.get(&id) != Some(&false) {
+                    if let Some(target) = branch_target(inst) {
+                        branches.push((target, state.clone()));
+                    }
+                }
+                if choices.get(&id) == Some(&true) {
+                    return Ok(BlockExits { fall: None, branches });
                 }
             }
             _ => {}
         }
-        let touch = dwords(&explicit_regs(inst));
-        let war = dwords(&war_defs(inst, arch));
-        let mut war_hits: Vec<PendingEvent> = Vec::new();
-        let mut raw_hits: Vec<PendingEvent> = Vec::new();
-        for event in &state.pending {
-            if overlaps(&regset_dwords(&event.src_locks), &war) {
-                war_hits.push(event.clone());
-            } else if overlaps(&regset_dwords(&event.defs), &touch) {
-                raw_hits.push(event.clone());
-            }
-        }
         if let Some(recorder) = recorder.as_mut() {
+            let touch = dwords(&explicit_regs(inst, arch, wave));
+            let war = dwords(&war_defs(inst, arch));
+            let mut war_hits: Vec<PendingEvent> = Vec::new();
+            let mut raw_hits: Vec<PendingEvent> = Vec::new();
+            for event in &state.pending {
+                if overlaps(&regset_dwords(&event.src_locks), &war) {
+                    war_hits.push(event.clone());
+                } else if raw_overlap(body, event, inst, arch, wave) {
+                    raw_hits.push(event.clone());
+                }
+            }
             if !war_hits.is_empty() || !raw_hits.is_empty() {
                 record_finding(recorder, id, &war_hits, &raw_hits, &touch, &war);
             }
@@ -580,20 +639,12 @@ fn walk_block(
             }
         }
     }
-    Ok(BlockExits { fall: state, branches })
+    Ok(BlockExits { fall: Some(state), branches })
 }
 
-/// Blocks in layout order, or one synthetic straight-line block when the
-/// body has no built CFG (synthetic streams).
-fn ranges_of(body: &Body) -> Vec<(BlockId, (usize, usize), Vec<BlockId>)> {
-    if body.blocks.is_empty() {
-        return vec![(BlockId(0), (0, body.layout.len()), Vec::new())];
-    }
-    body.blocks.iter().map(|block| (block.id, block.range, block.preds.iter().copied().collect())).collect()
-}
 
 /// CFG-aware wait replay with fixpoint over the block graph.
-pub fn replay(body: &Body, arch: Arch) -> Result<WaitReplay, WaitError> {
+pub fn replay(body: &Body, arch: Arch, wave: Wave) -> Result<WaitReplay, WaitError> {
     if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) {
         return Err(WaitError::UnsupportedArch(arch));
     }
@@ -602,83 +653,103 @@ pub fn replay(body: &Body, arch: Arch) -> Result<WaitReplay, WaitError> {
             return Err(WaitError::DanglingInst { id: *id });
         }
     }
-    let ranges = ranges_of(body);
-    let entries = fixpoint(body, arch, &ranges)?;
-    // Final recording pass in layout order.
     let mut events = EventTable { ids: HashMap::new(), events: Vec::new(), next: 0 };
+    for id in &body.layout {
+        if body.insts.get(*id).unwrap().effects.mem.is_some() { events.id_of(*id); }
+    }
     let mut recorder = Recorder {
         facts: Vec::new(),
         obligations: Vec::new(),
         before: HashMap::new(),
     };
-    for ((_, range, _), entry) in ranges.iter().zip(&entries) {
-        walk_block(body, arch, *range, entry, &mut events, Some(&mut recorder))?;
+    let ranges: Vec<(BlockId, (usize, usize))> = if body.blocks.is_empty() {
+        vec![(BlockId(0), (0, body.layout.len()))]
+    } else { body.blocks.iter().map(|block| (block.id, block.range)).collect() };
+    // A successful conservative replay already proves every path. Correlating
+    // immutable guards is only necessary to discharge remaining hazards.
+    let mut partitions = vec![HashMap::new()];
+    let mut refined = false;
+    loop {
+        for choices in &partitions {
+            let entries = fixpoint(body, arch, wave, &ranges, choices, &mut events)?;
+            for ((_, range), entry) in ranges.iter().zip(&entries) {
+                let Some(entry) = entry else { continue };
+                walk_block(body, arch, wave, *range, entry, &mut events, choices, Some(&mut recorder))?;
+            }
+        }
+        if refined || recorder.obligations.is_empty() { break; }
+        partitions = super::predicates::partitions(body, arch);
+        if partitions.len() == 1 && partitions[0].is_empty() { break; }
+        recorder.facts.clear();
+        recorder.obligations.clear();
+        recorder.before.clear();
+        refined = true;
+    }
+    recorder.obligations.sort_unstable_by(|a, b| a.insts.iter().map(|id| id.0).cmp(b.insts.iter().map(|id| id.0))
+        .then_with(|| a.rule_id.cmp(&b.rule_id)).then_with(|| a.text.cmp(&b.text)));
+    recorder.obligations.dedup();
+    let mut facts: Vec<WaitFact> = Vec::new();
+    for fact in recorder.facts {
+        if let Some(prior) = facts.iter_mut().find(|f| f.wait == fact.wait) {
+            for event in fact.satisfies { if !prior.satisfies.contains(&event) { prior.satisfies.push(event); } }
+        } else { facts.push(fact); }
     }
     Ok(WaitReplay {
         events: events.events,
-        facts: recorder.facts,
+        facts,
         obligations: recorder.obligations,
         before: recorder.before,
     })
 }
 
-/// Block entry states: the least fixpoint of "entry = join of the incoming
-/// exits" from empty states, solved with a worklist so a block is re-walked
-/// only when its entry changes and a changed exit only revisits its own
-/// successors. Each block's exit edges (fall-through, and every mid-block
-/// branch the walk reaches) do not depend on the entry state, so the edge
-/// lists come from the first walk.
-fn fixpoint(body: &Body, arch: Arch, ranges: &[(BlockId, (usize, usize), Vec<BlockId>)]) -> Result<Vec<WaitState>, WaitError> {
+/// Reachable block-entry fixpoint. Transfer captures mid-block branch exits
+/// at their instruction positions, including partition-selected edges.
+/// Keeping straight-line transfer in one walk avoids retaining and cloning
+/// the entire pending state at each instruction during convergence.
+fn fixpoint(body: &Body, arch: Arch, wave: Wave, ranges: &[(BlockId, (usize, usize))], choices: &HashMap<InstId, bool>, events: &mut EventTable) -> Result<Vec<Option<WaitState>>, WaitError> {
     let count = ranges.len();
-    let index: HashMap<BlockId, usize> = ranges.iter().enumerate().map(|(i, (id, _, _))| (*id, i)).collect();
-    let mut first_at: HashMap<usize, usize> = HashMap::new();
-    for (i, (_, range, _)) in ranges.iter().enumerate() {
-        first_at.entry(range.0).or_insert(i);
-    }
-    let mut scratch_events = EventTable { ids: HashMap::new(), events: Vec::new(), next: 0 };
-    let mut entries = vec![WaitState::default(); count];
-    let mut exits = Vec::with_capacity(count);
-    for (_, range, _) in ranges {
-        exits.push(walk_block(body, arch, *range, &WaitState::default(), &mut scratch_events, None)?);
-    }
-    // Incoming edges per block: true fall-through first (p ends where b
-    // begins and p's last instruction can fall through; C4 `preds`
-    // conflate these with mid-block conditional-branch targets, which the
-    // walk reports as branch exits instead), then branch exits.
+    let index: HashMap<BlockId, usize> = ranges.iter().enumerate().map(|(p, (id, _))| (*id, p)).collect();
+    let first_at: HashMap<usize, usize> = ranges.iter().enumerate().map(|(p, (_, range))| (range.0, p)).collect();
     let mut incoming: Vec<Vec<(usize, Option<usize>)>> = vec![Vec::new(); count];
-    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); count];
-    for (p, (_, range, _)) in ranges.iter().enumerate() {
-        let falls = range.0 != range.1 && body.insts.get(body.layout[range.1 - 1])
-            .is_some_and(|last| !matches!(last.effects.control, Control::Jump | Control::EndPgm));
-        if let (true, Some(&b)) = (falls, first_at.get(&range.1)) {
-            incoming[b].push((p, None));
-            succs[p].push(b);
+    let mut succs = vec![Vec::new(); count];
+    for (p, (_, range)) in ranges.iter().enumerate() {
+        let shape = walk_block(body, arch, wave, *range, &WaitState::default(), events, choices, None)?;
+        if shape.fall.is_some() {
+            if let Some(&q) = first_at.get(&range.1).filter(|&&q| q != p) {
+                incoming[q].push((p, None));
+                succs[p].push(q);
+            }
         }
-    }
-    for (p, exit) in exits.iter().enumerate() {
-        for (k, (target, _)) in exit.branches.iter().enumerate() {
-            if let Some(&b) = index.get(target) {
-                incoming[b].push((p, Some(k)));
-                if !succs[p].contains(&b) { succs[p].push(b); }
+        for (k, (target, _)) in shape.branches.iter().enumerate() {
+            if let Some(&q) = index.get(target) {
+                incoming[q].push((p, Some(k)));
+                if !succs[p].contains(&q) { succs[p].push(q); }
             }
         }
     }
-    let mut work: std::collections::BTreeSet<usize> = (0..count).collect();
-    let budget = count.saturating_mul(1000).max(1000);
-    let mut walks = 0usize;
-    while let Some(b) = work.pop_first() {
-        let mut joined: Option<WaitState> = None;
-        for &(p, edge) in &incoming[b] {
-            let state = match edge { None => &exits[p].fall, Some(k) => &exits[p].branches[k].1 };
-            joined = Some(match joined { None => state.clone(), Some(prior) => join_states(&prior, state) });
+    let mut entries: Vec<Option<WaitState>> = vec![None; count];
+    let mut exits: Vec<Option<BlockExits>> = vec![None; count];
+    let mut work: std::collections::BTreeSet<usize> = (0..count.min(1)).collect();
+    let budget = body.layout.len().saturating_mul(1000).max(1000);
+    let mut walks = 0;
+    while let Some(p) = work.pop_first() {
+        let mut joined = (p == 0).then(WaitState::default);
+        for &(q, edge) in &incoming[p] {
+            let Some(exit) = &exits[q] else { continue };
+            let state = match edge { None => exit.fall.as_ref(), Some(k) => Some(&exit.branches[k].1) };
+            if let Some(state) = state {
+                joined = Some(match joined { None => state.clone(), Some(prior) => join_states(&prior, state) });
+            }
         }
-        let joined = joined.unwrap_or_default();
-        if joined == entries[b] { continue; }
+        if joined == entries[p] { continue; }
         walks += 1;
         if walks > budget { return Err(WaitError::NoFixpoint { walks }); }
-        exits[b] = walk_block(body, arch, ranges[b].1, &joined, &mut scratch_events, None)?;
-        entries[b] = joined;
-        work.extend(succs[b].iter().copied());
+        let exit = match &joined {
+            None => None,
+            Some(state) => Some(walk_block(body, arch, wave, ranges[p].1, state, events, choices, None)?),
+        };
+        entries[p] = joined;
+        if exits[p] != exit { exits[p] = exit; work.extend(succs[p].iter().copied()); }
     }
     Ok(entries)
 }
@@ -795,7 +866,7 @@ mod c5_tests {
     }
 
     fn ok(body: &Body) -> bool {
-        replay(body, Arch::Gfx1201).unwrap().obligations.is_empty()
+        replay(body, Arch::Gfx1201, crate::inst::Wave::Wave64).unwrap().obligations.is_empty()
     }
 
     /// On gfx11 a positive lgkmcnt retires the oldest LDS access when no
@@ -819,25 +890,47 @@ mod c5_tests {
             assert_eq!(wait.mods.wait.as_ref().unwrap().per_counter[Counter::Lgkm as usize], Some(3));
             let consumer = || inst("v_add_f32_e32", vec![v(20, 1), v(1, 1), v(21, 1)]);
             let ds_only = body_of(vec![ds(1), ds(2), ds(3), ds(4), wait.clone(), consumer()]);
-            assert!(replay(&ds_only, arch).unwrap().obligations.is_empty(), "{arch:?}: oldest LDS must retire");
+            assert!(replay(&ds_only, arch, crate::inst::Wave::Wave64).unwrap().obligations.is_empty(), "{arch:?}: oldest LDS must retire");
             let ds_later = body_of(vec![ds(1), ds(2), ds(3), ds(4), wait.clone(),
                 inst("v_add_f32_e32", vec![v(20, 1), v(2, 1), v(21, 1)])]);
-            assert!(replay(&ds_later, arch).unwrap().obligations.iter()
+            assert!(replay(&ds_later, arch, crate::inst::Wave::Wave64).unwrap().obligations.iter()
                 .any(|obligation| obligation.rule_id == "wait-raw-ds-load"));
             let atomic = inst("ds_min_i32", vec![
                 v(30, 1), v(31, 1), Operand::Imm(ImmField::DsOffset(0)),
             ]);
             let atomics_in_order = body_of(vec![atomic, ds(1), ds(2), ds(3), wait.clone(),
                 inst("v_mov_b32_e32", vec![v(31, 1), v(21, 1)])]);
-            assert!(replay(&atomics_in_order, arch).unwrap().obligations.is_empty(),
+            assert!(replay(&atomics_in_order, arch, crate::inst::Wave::Wave64).unwrap().obligations.is_empty(),
                 "{arch:?}: oldest LDS atomic has retired before reusing its data source");
             let smem = inst("s_load_b32", vec![
                 s(20, 1), s(0, 2), Operand::Imm(ImmField::SmemOffset(0)),
             ]);
             let mixed = body_of(vec![ds(1), smem, ds(2), ds(3), ds(4), wait, consumer()]);
-            assert!(replay(&mixed, arch).unwrap().obligations.iter()
+            assert!(replay(&mixed, arch, crate::inst::Wave::Wave64).unwrap().obligations.iter()
                 .any(|obligation| obligation.rule_id == "wait-raw-ds-load"),
                 "{arch:?}: SMEM makes partial lgkmcnt unable to prove LDS retirement");
+        }
+    }
+
+    /// gfx11 GLOBAL atomics: the returning (GLC) form's destination is
+    /// pending on vmcnt; the non-returning form locks its sources on vscnt,
+    /// which `vmcnt(0)` does not retire.
+    #[test]
+    fn gfx11_global_atomic_counts_on_vmcnt_only_when_returning() {
+        for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+            let dec = |words: &[u32]| crate::codec::gfx11::decode(arch, words).unwrap().0;
+            let rules = |insts: Vec<Inst>| replay(&body_of(insts), arch, crate::inst::Wave::Wave64).unwrap().obligations
+                .into_iter().map(|o| o.rule_id).collect::<Vec<_>>();
+            let add_rtn = || dec(&[0xdcd6_4000, 0x0204_020a]); // global_atomic_add_u32 v2, v10, v2, s[4:5] glc
+            let swap = || dec(&[0xdcce_0000, 0x0000_0000]); // global_atomic_swap_b32 v0, v0, s[0:1]
+            let vmcnt0 = || dec(&[0xbf89_03f7]);
+            let vscnt0 = || dec(&[0xbc7c_0000]);
+            let read_v2 = || dec(&[0x7e04_0502]); // v_readfirstlane_b32 s2, v2
+            let write_v0 = || dec(&[0x7e00_0280]); // v_mov_b32_e32 v0, 0
+            assert_eq!(rules(vec![add_rtn(), read_v2()]), ["wait-raw-vmem-atomic"], "{arch:?}");
+            assert!(rules(vec![add_rtn(), vmcnt0(), read_v2()]).is_empty(), "{arch:?}");
+            assert_eq!(rules(vec![swap(), vmcnt0(), write_v0()]), ["wait-war-vmem-store"], "{arch:?}");
+            assert!(rules(vec![swap(), vscnt0(), write_v0()]).is_empty(), "{arch:?}");
         }
     }
 
@@ -964,6 +1057,51 @@ mod c5_tests {
         assert!(ok(&drained));
     }
 
+    #[test]
+    fn scalar_compare_mask_does_not_touch_adjacent_sgpr_in_wave32() {
+        use crate::inst::Wave;
+        let load = || mi("s_load_b32", vec![s(2, 1), s(8, 2), Operand::Imm(ImmField::SmemOffset(0))]);
+        let body = body_of(vec![
+            load(),
+            mi("v_cmp_lt_u32_e64", vec![s(1, 2), v(0, 1), v(1, 1)]),
+        ]);
+        assert!(replay(&body, Arch::Gfx1201, Wave::Wave32).unwrap().obligations.is_empty());
+        let wide = replay(&body, Arch::Gfx1201, Wave::Wave64).unwrap();
+        assert_eq!(wide.obligations[0].rule_id, "wait-raw-smem-load");
+        let real_read = body_of(vec![
+            load(),
+            mi("v_cmp_lt_u32_e64", vec![s(1, 2), s(2, 1), v(1, 1)]),
+        ]);
+        let narrow = replay(&real_read, Arch::Gfx1201, Wave::Wave32).unwrap();
+        assert_eq!(narrow.obligations[0].rule_id, "wait-raw-smem-load");
+    }
+
+    #[test]
+    fn d16_pending_high_half_only_conflicts_with_a_high_or_full_read() {
+        use crate::inst::Wave;
+        for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201] {
+            let decode = |words: &[u32]| crate::codec::gfx12::decode_for(arch, words).unwrap().0;
+            let (low, high, wait) = if arch == Arch::Gfx1201 {
+                (decode(&[0xee07807c, 10, 2]), decode(&[0xee08407c, 10, 4]), decode(&[0xbfc00001]))
+            } else {
+                (decode(&[0xdc7a0000, 0x0a7c0002]), decode(&[0xdc860000, 0x0a7c0004]), decode(&[0xbf8907f7]))
+            };
+            let lo_store = decode(&[0xd8780000, 0x00000a06]);
+            let hi_store = decode(&[0xda800000, 0x00000a06]);
+            let clean = body_of(vec![low.clone(), high.clone(), wait.clone(), lo_store.clone()]);
+            assert!(replay(&clean, arch, Wave::Wave32).unwrap().obligations.is_empty(), "{arch:?}");
+            let hazard = body_of(vec![low.clone(), high.clone(), wait.clone(), hi_store]);
+            let obligations = replay(&hazard, arch, Wave::Wave32).unwrap().obligations;
+            assert!(obligations.iter().any(|o| o.rule_id == "wait-raw-vmem-load" && o.insts == vec![crate::cfg::InstId(3)]), "{arch:?}");
+            let full_read = body_of(vec![low.clone(), high.clone(), wait, decode(&[0x7e28030a])]);
+            assert!(replay(&full_read, arch, Wave::Wave32).unwrap().obligations
+                .iter().any(|o| o.rule_id == "wait-raw-vmem-load" && o.insts == vec![crate::cfg::InstId(3)]));
+            let missing_wait = body_of(vec![low, high, lo_store]);
+            assert!(replay(&missing_wait, arch, Wave::Wave32).unwrap().obligations
+                .iter().any(|o| o.rule_id == "wait-raw-vmem-load" && o.insts == vec![crate::cfg::InstId(2)]));
+        }
+    }
+
     /// Linear `vm_vsrc_releases_store_sources…`, typed (VALU move stands in
     /// for the text test's `v_writelane_b32`, which has no M1 table row).
     #[test]
@@ -991,31 +1129,25 @@ mod c5_tests {
         assert!(!ok(&other));
     }
 
-    /// Linear `mixed_vmem_loads_require_zero_wait`, typed.
+    /// gfx12 LOADcnt: BUFFER and GLOBAL loads are one in-order class, so a
+    /// positive wait retires exactly the oldest of a mixed window; a wait that
+    /// leaves the consumed load among the youngest `n` is still a hazard, and
+    /// a FLAT load in the window keeps the full-drain rule.
     #[test]
-    fn mixed_vmem_loads_need_zero_wait() {
-        let mixed = body_of(vec![
-            mi("buffer_load_b32",
-                vec![v(0, 2), v(8, 2), s(4, 4), s(9, 1), Operand::Vmem(VmemToken::Offen)],
-            ),
-            mi("global_load_b64", vec![v(2, 1), v(8, 2), s(4, 2)]),
-            mk("s_wait_loadcnt", vec![sopp(1)], wait_mods(Some(1), None, None, None)),
-            vadd(3, 0, 4),
+    fn mixed_buffer_global_loads_retire_in_issue_order() {
+        let window = |wait: i16, consume: u16| body_of(vec![
+            buffer_load(0, 8),
+            mi("global_load_b32", vec![v(1, 1), v(8, 2), s(4, 2)]),
+            buffer_load(2, 8),
+            mk("s_wait_loadcnt", vec![sopp(wait)], wait_mods(Some(wait as u8), None, None, None)),
+            vadd(3, consume, 4),
         ]);
-        assert!(!ok(&mixed));
-        let mut zero = body_of(vec![
-            mi("buffer_load_b32",
-                vec![v(0, 2), v(8, 2), s(4, 4), s(9, 1), Operand::Vmem(VmemToken::Offen)],
-            ),
-            mi("global_load_b64", vec![v(2, 1), v(8, 2), s(4, 2)]),
-            mk("s_wait_loadcnt", vec![sopp(0)], wait_mods(Some(0), None, None, None)),
-            vadd(3, 0, 4),
-        ]);
-        assert!(ok(&zero));
-        // Same-family loads still retire partially: oldest of two globals.
-        zero.layout.pop();
-        let tail = vadd(3, 0, 4);
-        let _ = tail;
+        assert!(ok(&window(2, 0)), "loadcnt 2 retires the oldest (buffer v0)");
+        assert!(!ok(&window(2, 1)), "the global v1 is still among the youngest two");
+        assert!(ok(&window(1, 1)));
+        assert!(!ok(&window(1, 2)), "insufficient wait for the youngest buffer v2");
+        assert!(ok(&window(0, 2)));
+        // Same-class loads still retire partially: oldest of two globals.
         let same = body_of(vec![
             mi("global_load_b64", vec![v(0, 1), v(8, 2), s(4, 2)]),
             mi("global_load_b64", vec![v(1, 2), v(9, 2), s(4, 2)]),
@@ -1023,6 +1155,13 @@ mod c5_tests {
             vadd(3, 0, 4),
         ]);
         assert!(ok(&same));
+        let flat = body_of(vec![
+            buffer_load(0, 8),
+            mi("flat_load_b32", vec![v(1, 1), v(8, 2)]),
+            mk("s_wait_loadcnt", vec![sopp(1)], wait_mods(Some(1), None, None, None)),
+            vadd(3, 0, 4),
+        ]);
+        assert!(!ok(&flat), "a flat load is not in the BUFFER/GLOBAL class");
     }
 
     // ---- KT48 T6 gate ----
@@ -1082,7 +1221,7 @@ mod c5_tests {
     #[test]
     fn kt48_replay_obligations_are_ds_store_war() {
         let body = kt48_body();
-        let replay = replay(&body, Arch::Gfx1201).unwrap();
+        let replay = replay(&body, Arch::Gfx1201, crate::inst::Wave::Wave64).unwrap();
         assert_eq!(replay.obligations.len(), 124, "120 linear-common + 4 first-iteration sites");
         for obligation in &replay.obligations {
             assert_eq!(obligation.kind, ObligationKind::SrcReadTiming(MemClass::DsStore));
@@ -1117,7 +1256,7 @@ mod c5_tests {
     #[test]
     fn kt48_path_sensitive_sites() {
         let body = kt48_body();
-        let replay = replay(&body, Arch::Gfx1201).unwrap();
+        let replay = replay(&body, Arch::Gfx1201, crate::inst::Wave::Wave64).unwrap();
         let positions: Vec<usize> = replay
             .obligations
             .iter()
@@ -1136,7 +1275,7 @@ mod c5_tests {
     #[test]
     fn kt48_kmcnt_units_and_retirement() {
         let body = kt48_body();
-        let replay = replay(&body, Arch::Gfx1201).unwrap();
+        let replay = replay(&body, Arch::Gfx1201, crate::inst::Wave::Wave64).unwrap();
         let mut smem: Vec<_> =
             replay.events.iter().filter(|event| event.class == MemClass::SmemLoad).collect();
         assert_eq!(smem.len(), 6, "KT48 has six SMEM loads");
@@ -1186,7 +1325,7 @@ mod c5_tests {
             let mut mutated = body.clone();
             let inst = mutated.insts.get_mut(wait).unwrap();
             inst.mods.wait.as_mut().unwrap().per_counter[Counter::Km as usize] = Some(1);
-            let replay = replay(&mutated, Arch::Gfx1201).unwrap();
+            let replay = replay(&mutated, Arch::Gfx1201, crate::inst::Wave::Wave64).unwrap();
             if replay.obligations.iter().any(|obligation| {
                 matches!(obligation.kind, ObligationKind::Hazard)
                     && obligation.rule_id == "wait-raw-smem-load"
@@ -1212,8 +1351,9 @@ mod c5_tests {
         build_blocks(&mut body, crate::inst::Arch::Gfx1201).unwrap();
         assert!(body.blocks.len() > 1500);
         let consumer = body.layout[body.layout.len() - 2];
-        let replay = replay(&body, Arch::Gfx1201).unwrap();
+        let replay = replay(&body, Arch::Gfx1201, crate::inst::Wave::Wave64).unwrap();
         assert!(replay.obligations.iter().any(|o| o.rule_id == "wait-raw-vmem-load" && o.insts == [consumer]),
             "{:?}", replay.obligations);
     }
+
 }

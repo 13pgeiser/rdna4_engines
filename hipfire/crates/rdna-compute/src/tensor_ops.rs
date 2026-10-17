@@ -11,19 +11,96 @@
 use hip_bridge::{HipError, HipResult, KernargBlob};
 
 use crate::{DType, Gpu, GpuTensor};
+use crate::prefill_invariant::{qwen4_gdn_prefill, Qwen4GdnPrefill};
+
+#[path = "npu_trunk_consumers.rs"]
+pub(crate) mod npu_arena;
+pub use npu_arena::*;
 
 pub(crate) const TENSOR_OPS_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_fwht256.h"),
+    include_str!("../../../kernels/src/rope_yarn.h"),
     include_str!("../../../kernels/src/tensor_ops.hip")
 );
-const HYPER_READ_UP_WMMA_SRC: &str =
+pub(crate) const HYPER_READ_UP_WMMA_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_wmma.gfx1151.hip");
-const HYPER_READ_UP_WMMA_GFX1201_SRC: &str =
+pub(crate) const HYPER_READ_UP_WMMA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_wmma.gfx1201.hip");
-const GATED_DELTA_CHUNK_WMMA_SRC: &str =
+pub(crate) const GATED_DELTA_CHUNK_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_chunk_wmma.gfx1151.hip");
-const INDEXED_ATTENTION_DENSE_WMMA_SRC: &str =
+pub(crate) const GATED_DELTA_CHUNK_Q8_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gated_delta_chunk_q8_wmma.gfx1151.hip");
+
+pub(crate) const INDEXED_ATTENTION_DENSE_WMMA_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_dense_wmma.gfx1151.hip");
+const INDEXED_ATTENTION_GATHERED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1151.hip");
+const INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1201.hip");
+const INDEXED_ATTENTION_SELECT_EXACT_SRC: &str =
+    include_str!("../../../kernels/src/indexed_attention_select_exact.hip");
+/// `HIPFIRE_QWEN4_QSA_WMMA_GATHER` (on unless `0`) routes QSA prefill
+/// attention chunks (rows >= QWEN4_F16_WMMA_MIN_TOKENS) that the full-window
+/// dense route does not take through the gathered F16 WMMA kernels: gfx1151 on
+/// the F32 and q8 states, gfx1201 on the fp8 state.  Not bit-exact against the hg4
+/// kernel; admitted because its error against an f64 reference is no worse
+/// than BF16 storage of Q/K/V/P.  `0` keeps every launch of the incumbent
+/// route.  Read once.
+static QWEN4_QSA_WMMA_GATHER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_WMMA_GATHER", true)
+});
+/// `HIPFIRE_QWEN4_GDN_PIPE=0` keeps gfx1201's non-capture batched GDN
+/// recurrence on `gated_delta_step_halves_state128_persistent256_{f32,q8}`
+/// instead of the register-resident `gated_delta_step_pipe128_{f32,q8}`
+/// (bytewise identical results).  Read once.
+static QWEN4_GDN_PIPE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_GDN_PIPE", true)
+});
+/// `HIPFIRE_QWEN4_QSA_PM` (on unless `0`) runs the gathered route's producer
+/// and attention from the certified builder module (`kernels::QSA_GATHER_PM_*`,
+/// same ABI, grid, LDS and output bytes as the hipcc kernels) instead of the
+/// JIT source, on every gathered-route arch (gfx1151, gfx1201).  `0` keeps the
+/// hipcc kernels.  Read once.
+static QWEN4_QSA_PM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_PM", true)
+});
+/// Persistent per-QSA-layer F16 K/V for exact gfx1151 F32-state prefill.
+/// Opt-in (`HIPFIRE_QWEN4_QSA_F16_ARENA=1`); off keeps per-launch
+/// conversion. Resolved once at load; decode keeps the F32 state.
+static QWEN4_QSA_F16_ARENA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_F16_ARENA", false)
+});
+/// `HIPFIRE_QWEN4_QSA_SCORE_PM` / `HIPFIRE_QWEN4_QSA_SELECT_PM` (each on
+/// unless `0`) use the certified builder rows16 F32/BF16 score and
+/// select-from-scores kernels on covered gfx1151 prefill calls
+/// ([`qsa_select_pm_fits`]), with identical output bytes. For F32, `0` keeps
+/// the corresponding hipcc kernel; SCORE_PM=0 keeps the fused hipcc selector
+/// for BF16 arenas. SELECT_PM chooses PM versus hipcc selection. Read once.
+static QWEN4_QSA_SCORE_PM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SCORE_PM", true)
+});
+/// Select PM versus hipcc from-scores for either dtype; BF16 only reaches
+/// this choice when SCORE_PM is enabled, otherwise it stays fused hipcc.
+static QWEN4_QSA_SELECT_PM: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SELECT_PM", true)
+});
+/// `HIPFIRE_QWEN4_QSA_SELECT_EXACT=1` runs the batched QSA selector on the
+/// `_exact` kernels (tile sort + fixed-order merge instead of the all-pairs
+/// ranks; selected indices and mirror byte-identical) for complete <= 2048
+/// pooled blocks, outside recording and capture.  Unset or `0` keeps the
+/// incumbent selector.  Read once.
+static QWEN4_QSA_SELECT_EXACT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_QSA_SELECT_EXACT", false)
+});
+/// Pooled blocks the exact selector handles; larger contexts keep the
+/// incumbent selector.
+const QSA_SELECT_EXACT_MAX_BLOCKS: usize = 2048;
+/// Budget blocks the exact selector's 512-entry merge bound covers.
+const QSA_SELECT_EXACT_MAX_BUDGET_BLOCKS: usize = 512;
+/// Dynamic LDS floor of the exact selector kernels
+/// (`indexed_attention_select_exact.hip`), which keep no static LDS:
+/// 6144 B even in global-score mode, otherwise 4 B per live block.
+const QSA_SELECT_EXACT_DYNAMIC_LDS_FLOOR_BYTES: usize = 6 * 1024;
 const QSA_SELECT_PARALLEL_THREADS: u32 = 256;
 // gfx1151's 64-KiB dynamic LDS budget; other devices use the serial path.
 // Oversized rows also use serial kernels without changing the contract.
@@ -214,6 +291,20 @@ pub struct GatedDeltaStep<'a> {
 /// Head-pair arrival counters of the fused GDN step's optional rotation.
 const GDN_PAIR_COUNTERS: usize = 256;
 
+/// Allocate and zero the fused GDN step's head-pair arrival counters if they
+/// do not exist yet. Each launch leaves them zero, so the zeroing memset runs
+/// once. A retained-body boundary calls this before opening its capture
+/// window: the tape replays dispatches only, and a memset inside the window
+/// makes the capture effect-incomplete.
+pub fn ensure_gdn_pair_counters(gpu: &mut Gpu) -> HipResult<()> {
+    if gpu.scratch.gdn_pair_counters.is_none() {
+        let counters = gpu.hip.malloc(GDN_PAIR_COUNTERS * 4)?;
+        gpu.hip.memset(&counters, 0, GDN_PAIR_COUNTERS * 4)?;
+        gpu.scratch.gdn_pair_counters = Some(counters);
+    }
+    Ok(())
+}
+
 pub fn gated_delta_step(gpu: &mut Gpu, p: &GatedDeltaStep<'_>) -> HipResult<()> {
     gated_delta_step_launch(gpu, p, None, None)
 }
@@ -327,11 +418,7 @@ fn gated_delta_step_launch(
         let (rotated, signs1, signs2, counters) = match rotate_into {
             Some(rotated) => {
                 gpu.ensure_mq_signs()?;
-                if gpu.scratch.gdn_pair_counters.is_none() {
-                    let counters = gpu.hip.malloc(GDN_PAIR_COUNTERS * 4)?;
-                    gpu.hip.memset(&counters, 0, GDN_PAIR_COUNTERS * 4)?;
-                    gpu.scratch.gdn_pair_counters = Some(counters);
-                }
+                ensure_gdn_pair_counters(gpu)?;
                 if p.value_heads / 2 > GDN_PAIR_COUNTERS {
                     return Err(HipError::new(0, "GDN rotate: too many head pairs"));
                 }
@@ -395,7 +482,8 @@ pub struct GatedDeltaStepBatched<'a> {
     pub key_dim: usize,
     pub value_dim: usize,
     /// The first row's position; a Q8 state's requantization is seeded by
-    /// the last row's.
+    /// the last row's. With `row_states` (verify capture) each row also
+    /// requantizes at its own position, token-exact with [`gated_delta_step`].
     pub position: usize,
 }
 
@@ -443,10 +531,26 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     let key_dim = checked_i32(p.key_dim, "GDN batched key width")?;
     let value_dim = checked_i32(p.value_dim, "GDN batched value width")?;
     let value_heads_grid = checked_u32(p.value_heads, "GDN batched value-head grid")?;
+    // `HIPFIRE_QWEN4_GDN_PREFILL=canon` (lab): a Q8 state inside the Qwen4
+    // forward (`Gpu::qwen4_scope`, so the arm also works with the invariant
+    // profile off) runs the token-canonical persistent recurrence, which
+    // requantizes every row at its own position and stores to `state`: the
+    // result no longer depends on how rows are split into launches.  An F32
+    // state keeps the persistent kernel (already token-exact).
+    let canon = p.row_states.is_none()
+        && format == GdnStateFormat::Q8
+        && gpu.qwen4_scope
+        && qwen4_gdn_prefill() == Qwen4GdnPrefill::Canon;
+    // gfx1201 non-capture: the register-resident one-thread-per-column
+    // recurrence (bitwise the persistent256 kernel's result), 128 threads.
+    let pipe128 = !canon && p.row_states.is_none() && gpu.arch == "gfx1201" && *QWEN4_GDN_PIPE;
     let kernel = match (p.row_states.is_some(), format) {
         (true, GdnStateFormat::F32) => "gated_delta_step_halves_state128_persistent256_capture_f32",
+        (false, GdnStateFormat::F32) if pipe128 => "gated_delta_step_pipe128_f32",
         (false, GdnStateFormat::F32) => "gated_delta_step_halves_state128_persistent256_f32",
         (true, GdnStateFormat::Q8) => "gated_delta_step_halves_state128_persistent256_capture_q8",
+        (false, GdnStateFormat::Q8) if canon => "gated_delta_step_halves_state128_persistent256_canon_q8",
+        (false, GdnStateFormat::Q8) if pipe128 => "gated_delta_step_pipe128_q8",
         (false, GdnStateFormat::Q8) => "gated_delta_step_halves_state128_persistent256_q8",
     };
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
@@ -471,7 +575,7 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     gpu.launch_blob_recorded(
         kernel,
         [value_heads_grid, 1, 1],
-        [256, 1, 1],
+        [if pipe128 { 128 } else { 256 }, 1, 1],
         0,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
@@ -496,7 +600,8 @@ pub struct GatedDeltaRollbackLayers<'a> {
     pub qkv_width: usize,
     pub key_heads: usize,
     pub value_heads: usize,
-    /// Position of the last kept row: seeds a Q8 state's requantization.
+    /// Position of the last kept row: a Q8 state's kept row `r` requantizes
+    /// at `position - (keep - 1) + r`, token-exact with [`gated_delta_step`].
     pub position: usize,
 }
 
@@ -558,7 +663,8 @@ pub fn gated_delta_rollback_layers(
 /// then stores its output as packed BF16 for that kernel.
 pub fn gated_delta_chunk_route(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool {
     gpu.arch_caps.has_wmma_w32()
-        && p.rows >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+        && gpu.route_rows(p.rows) >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+        && qwen4_gdn_prefill() == Qwen4GdnPrefill::Wy
         && *crate::gemm::QWEN4_F16_WMMA
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
@@ -568,18 +674,116 @@ pub fn gated_delta_chunk_route(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool
         && p.value_heads % p.key_heads == 0
 }
 
+/// Whether H6's inline-Q8 chunk kernel (`gated_delta_chunk_gate_q8_wmma`) can
+/// run this step, flag aside: exact gfx1151 on the chunked route, a Q8 slot
+/// whose base is 16-byte aligned (the kernel loads codes as `int4`).
+pub fn gated_delta_q8_inline_geometry(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool {
+    gpu.arch_caps.is_gfx1151()
+        && gpu.arch_caps.has_wmma_w32()
+        && gated_delta_chunk_route(gpu, p)
+        && matches!(GdnStateFormat::of(p.state), Ok(GdnStateFormat::Q8))
+        && (p.state.buf.as_ptr() as usize) % 16 == 0
+}
+
+/// [`gated_delta_q8_inline_geometry`] under `HIPFIRE_QWEN4_GDN_Q8_INLINE=1`
+/// (default off): the selector [`gated_delta_step_gate_wmma`] uses.
+pub fn gated_delta_q8_inline_route(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool {
+    gpu.flags.qwen4_gdn_q8_inline_enabled() && gated_delta_q8_inline_geometry(gpu, p)
+}
+
+/// Whether H5's convolution that also writes the normalized Q/K
+/// (`gated_delta_conv_qknorm_bf16_f32_batched_k4`) can run this chunk, flag
+/// aside: exact gfx1151 wave32 on the chunked route (so never a recorder, a
+/// graph capture or the persistent gfx1201/gfx1100-persistent route), 16 key
+/// heads of 128 in q|k|v channel order, `channels % 256 == 0`, K=4 with a
+/// 3-row ring, and a BF16 convolution output.
+pub fn gated_delta_conv_qknorm_geometry(
+    gpu: &Gpu,
+    step: &GatedDeltaStepBatched<'_>,
+    conv: &GatedDeltaConvBatched<'_>,
+) -> bool {
+    gpu.arch_caps.is_gfx1151()
+        && gpu.arch_caps.has_wmma_w32()
+        && gated_delta_chunk_route(gpu, step)
+        && step.key_heads == 16
+        && step.key_dim == 128
+        && step.qkv_width == conv.channels
+        && conv.rows == step.rows
+        && conv.channels >= 4096
+        && conv.channels % 256 == 0
+        && conv.history_rows == 3
+        && conv.kernel_size == 4
+        && conv.output.dtype == DType::BF16
+}
+
+/// [`gated_delta_conv_qknorm_geometry`] under
+/// `HIPFIRE_QWEN4_GDN_CONV_QKNORM=1` (default off).  When it holds, the
+/// caller launches [`gated_delta_conv_params_qknorm_batched`] in place of
+/// [`gated_delta_conv_params_batched`] and then
+/// [`gated_delta_step_gate_wmma_qknormed`] in place of
+/// [`gated_delta_step_gate_wmma`].
+pub fn gated_delta_conv_qknorm_route(
+    gpu: &Gpu,
+    step: &GatedDeltaStepBatched<'_>,
+    conv: &GatedDeltaConvBatched<'_>,
+) -> bool {
+    gpu.flags.qwen4_gdn_conv_qknorm_enabled() && gated_delta_conv_qknorm_geometry(gpu, step, conv)
+}
+
+/// Opt-in arms of the chunked GDN launch.
+#[derive(Clone, Copy, Default)]
+struct GatedDeltaChunkArms {
+    /// The convolution already wrote the normalized Q/K into the scratch.
+    qk_prenormed: bool,
+    /// Q8 state decoded/requantized inside the recurrence kernel.
+    q8_inline: bool,
+}
+
 /// [`gated_delta_step_batched`] followed by [`gated_delta_gate_batched`] as
 /// one chunked (16-row WY form) F16 WMMA kernel where
 /// [`gated_delta_chunk_route`] holds; `p.projection` is the convolution
 /// output as packed BF16.  `gate.output` receives the gated rows and
 /// `p.output` is not written.  The recurrence's products round to F16, so
-/// the route is KLD-gated; the gate is that kernel's expression.
+/// the route is KLD-gated; the gate is that kernel's expression.  A Q8 state
+/// runs the inline-Q8 kernel where [`gated_delta_q8_inline_route`] holds.
 pub fn gated_delta_step_gate_wmma(
     gpu: &mut Gpu,
     p: &GatedDeltaStepBatched<'_>,
     gate: &GatedDeltaGateBatched<'_>,
 ) -> HipResult<()> {
-    if !gated_delta_chunk_route(gpu, p) || p.projection.dtype != DType::BF16 {
+    let arms = GatedDeltaChunkArms {
+        qk_prenormed: false,
+        q8_inline: gated_delta_q8_inline_route(gpu, p),
+    };
+    gated_delta_step_gate_wmma_arms(gpu, p, gate, arms)
+}
+
+/// [`gated_delta_step_gate_wmma`] after
+/// [`gated_delta_conv_params_qknorm_batched`] over the same rows: the
+/// normalized Q/K are already in the F16 activation scratch, so the
+/// Q/K-norm launch is skipped.  Nothing may use that scratch in between.
+pub fn gated_delta_step_gate_wmma_qknormed(
+    gpu: &mut Gpu,
+    p: &GatedDeltaStepBatched<'_>,
+    gate: &GatedDeltaGateBatched<'_>,
+) -> HipResult<()> {
+    let arms = GatedDeltaChunkArms {
+        qk_prenormed: true,
+        q8_inline: gated_delta_q8_inline_route(gpu, p),
+    };
+    gated_delta_step_gate_wmma_arms(gpu, p, gate, arms)
+}
+
+fn gated_delta_step_gate_wmma_arms(
+    gpu: &mut Gpu,
+    p: &GatedDeltaStepBatched<'_>,
+    gate: &GatedDeltaGateBatched<'_>,
+    arms: GatedDeltaChunkArms,
+) -> HipResult<()> {
+    if !gated_delta_chunk_route(gpu, p)
+        || p.projection.dtype != DType::BF16
+        || (arms.q8_inline && !gated_delta_q8_inline_geometry(gpu, p))
+    {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
     let format = GdnStateFormat::of(p.state)?;
@@ -615,36 +819,60 @@ pub fn gated_delta_step_gate_wmma(
     let qn = gpu.qwen4_f16_x_scratch(2 * p.rows * qk)?;
     let qp = qn.buf.as_ptr();
     let kp = unsafe { (qp as *mut u8).add(p.rows * qk * 2) } as *mut std::ffi::c_void;
-    gpu.ensure_kernel_public(
-        "tensor_ops",
-        TENSOR_OPS_SRC,
-        "gated_delta_qk_norm_bf16_batched",
-    )?;
-    gpu.ensure_kernel_public(
-        "gated_delta_chunk_wmma",
-        GATED_DELTA_CHUNK_WMMA_SRC,
-        "gated_delta_chunk_gate_wmma",
-    )?;
-    let mut args = KernargBlob::new();
-    args.push_ptr(p.projection.buf.as_ptr());
-    args.push_ptr(qp);
-    args.push_ptr(kp);
-    args.push_i32(rows);
-    args.push_i32(qkv_width);
-    args.push_i32(key_heads);
-    args.pad_to(16);
-    gpu.launch_blob_recorded(
-        "gated_delta_qk_norm_bf16_batched",
-        [checked_u32(p.rows, "GDN chunk row grid")?, 1, 1],
-        [256, 1, 1],
-        0,
-        args.as_mut_slice(),
-        crate::dispatch::ReplayLaunchBindings::NONE,
-    )?;
+    if !arms.qk_prenormed {
+        gpu.ensure_kernel_public(
+            "tensor_ops",
+            TENSOR_OPS_SRC,
+            "gated_delta_qk_norm_bf16_batched",
+        )?;
+    }
+    if arms.q8_inline {
+        gpu.ensure_kernel_public(
+            "gated_delta_chunk_q8_wmma",
+            GATED_DELTA_CHUNK_Q8_WMMA_SRC,
+            "gated_delta_chunk_gate_q8_wmma",
+        )?;
+    } else {
+        gpu.ensure_kernel_public(
+            "gated_delta_chunk_wmma",
+            GATED_DELTA_CHUNK_WMMA_SRC,
+            "gated_delta_chunk_gate_wmma",
+        )?;
+    }
+    // With `qk_prenormed` the convolution already stored the normalized Q/K
+    // in this same scratch (`gated_delta_conv_params_qknorm_batched`).
+    if !arms.qk_prenormed {
+        let mut args = KernargBlob::new();
+        args.push_ptr(p.projection.buf.as_ptr());
+        args.push_ptr(qp);
+        args.push_ptr(kp);
+        args.push_i32(rows);
+        args.push_i32(qkv_width);
+        args.push_i32(key_heads);
+        args.pad_to(16);
+        gpu.launch_blob_recorded(
+            "gated_delta_qk_norm_bf16_batched",
+            [checked_u32(p.rows, "GDN chunk row grid")?, 1, 1],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )?;
+    }
     // A Q8 state runs the chunk on its F32 dequantization (the state scratch)
     // and is requantized from it after the chunk, seeded by the last row.
+    // The inline arm (`gated_delta_chunk_gate_q8_wmma`) does both inside the
+    // kernel on the slot itself.  Both seed the requantization with the last
+    // row's absolute position, `position + rows - 1`.  The route excludes a
+    // recorder and graph capture (`gated_delta_chunk_route`), so the frame is
+    // never a replayed kernarg and needs no mutable-frame binding.
+    let frame = match format {
+        GdnStateFormat::F32 => 0,
+        GdnStateFormat::Q8 => checked_u32(p.position + p.rows - 1, "GDN Q8 frame")?,
+    };
     let state = match format {
         GdnStateFormat::F32 => p.state.buf.as_ptr(),
+        GdnStateFormat::Q8 if arms.q8_inline => p.state.buf.as_ptr(),
         GdnStateFormat::Q8 => {
             let scratch = gpu.gdn_state_f32_scratch(
                 GdnStateFormat::F32.state_bytes(p.value_heads, p.key_dim, p.value_dim),
@@ -669,17 +897,25 @@ pub fn gated_delta_step_gate_wmma(
     args.push_i32(value_heads);
     args.push_f32((p.key_dim as f32).sqrt().recip());
     args.push_i32(i32::from(output_bf16));
+    if arms.q8_inline {
+        args.push_i32(1);
+        args.push_u32(frame);
+    }
     args.pad_to(16);
+    let chunk_kernel = if arms.q8_inline {
+        "gated_delta_chunk_gate_q8_wmma"
+    } else {
+        "gated_delta_chunk_gate_wmma"
+    };
     gpu.launch_blob_recorded(
-        "gated_delta_chunk_gate_wmma",
+        chunk_kernel,
         [checked_u32(p.value_heads, "GDN chunk head grid")?, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )?;
-    if format == GdnStateFormat::Q8 {
-        let frame = checked_u32(p.position + p.rows - 1, "GDN Q8 frame")?;
+    if format == GdnStateFormat::Q8 && !arms.q8_inline {
         gdn_state_convert(gpu, "gdn_state_f32_to_q8", state, p.state.buf.as_ptr(), p.value_heads, Some(frame))?;
     }
     Ok(())
@@ -1349,6 +1585,70 @@ pub fn hyper_norm_gate(gpu: &mut Gpu, p: &HyperNormGate<'_>) -> HipResult<()> {
     )
 }
 
+/// H4 read side: [`hyper_norm_gate`]'s norm + BF16 gate projection of the
+/// streams and [`hyper_norm_f16`]'s F16 normalized row (the HC down GEMM's
+/// input) in one launch (`hyper_norm_gate_outputs`).  `gates` receives the
+/// gate logits the paired HC write would have computed from the same streams;
+/// the write then skips its own norm + gate launch.  Bytewise the two
+/// launches' outputs (hence not the F32/BF16 `normalized` copies).
+pub struct HyperNormGateOutputs<'a> {
+    pub input: &'a GpuTensor,
+    pub norm_weight: &'a GpuTensor,
+    /// The paired write's BF16 `[branches, branches * hidden]` gate weight.
+    pub gate_weight: &'a GpuTensor,
+    pub gates: &'a GpuTensor,
+    /// F16 `rows * branches * hidden` elements.
+    pub normalized_f16: &'a GpuTensor,
+    pub rows: usize,
+    pub branches: usize,
+    pub hidden: usize,
+    /// `input` holds BF16 bits (see [`Gpu::qwen4_bf16_streams`]).
+    pub state_bf16: bool,
+}
+
+pub fn hyper_norm_gate_outputs(gpu: &mut Gpu, p: &HyperNormGateOutputs<'_>) -> HipResult<()> {
+    ensure_f32(p.input)?;
+    ensure_f32(p.gates)?;
+    let wide = checked_product(p.branches, p.hidden, "HC norm-gate-outputs width")?;
+    if p.norm_weight.dtype != DType::BF16
+        || p.gate_weight.dtype != DType::BF16
+        || p.normalized_f16.dtype != DType::F16
+        || p.rows == 0
+        || !gpu.arch_caps.has_gfx11_plus_simt()
+        || !HyperNormGate::supports(p.branches, p.hidden)
+        || p.norm_weight.numel() != wide
+        || p.gate_weight.numel() < p.branches * wide
+        || p.input.numel() < p.rows * wide
+        || p.gates.numel() < p.rows * p.branches
+        || p.normalized_f16.numel() < p.rows * wide
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let hidden = checked_i32(p.hidden, "HC norm-gate-outputs hidden width")?;
+    let row_grid = checked_u32(p.rows, "HC norm-gate-outputs row grid")?;
+    let lds_bytes = checked_u32(p.hidden * 8 + 4 * 256 * 4, "HC norm-gate-outputs LDS")?;
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "hyper_norm_gate_outputs")?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.input.buf.as_ptr());
+    args.push_ptr(p.norm_weight.buf.as_ptr());
+    args.push_ptr(p.gate_weight.buf.as_ptr());
+    args.push_ptr(p.gates.buf.as_ptr());
+    args.push_ptr(p.normalized_f16.buf.as_ptr());
+    args.push_ptr(std::ptr::null());
+    args.push_ptr(std::ptr::null());
+    args.push_i32(hidden);
+    args.push_i32(i32::from(p.state_bf16));
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        "hyper_norm_gate_outputs",
+        [row_grid, 1, 1],
+        [256, 1, 1],
+        lds_bytes,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
 /// gfx1151 HC read tail: the BF16 `[4 * hidden, low_rank]` up projection of
 /// `low` fused with `hyper_read_projected` (four branches), bitwise
 /// identical to the multi-row BF16 GEMM followed by that kernel; the
@@ -1417,6 +1717,17 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
 /// order, so a gate occasionally rounds one BF16 step apart; the epilogue is
 /// unchanged.
 pub fn hyper_read_up_wmma(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<()> {
+    let tiled = gpu.flags.qwen4_hc_up_tile_enabled();
+    hyper_read_up_wmma_tiled(gpu, p, tiled)
+}
+
+/// [`hyper_read_up_wmma`] on its baseline entries (`tiled == false`) or the
+/// retiled operand-swapped ones (`tiled == true`, bytewise the baseline's).
+fn hyper_read_up_wmma_tiled(
+    gpu: &mut Gpu,
+    p: &HyperReadUpFused<'_>,
+    tiled: bool,
+) -> HipResult<()> {
     ensure_f32(p.mixed)?;
     let wide = checked_product(4, p.hidden, "HC read width")?;
     let (module, source, entry) = if gpu.arch_caps.has_wmma_w32() {
@@ -1448,8 +1759,26 @@ pub fn hyper_read_up_wmma(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<
     let low_rank = checked_i32(p.low_rank, "HC read low rank")?;
     let rows = checked_i32(p.rows, "HC read rows")?;
     let column_grid = checked_u32(p.hidden / 16, "HC read column grid")?;
-    let row_grid = checked_u32(p.rows.div_ceil(512), "HC read row grid")?;
-    let lds_bytes = checked_u32(64 * (p.low_rank + 8) * 2, "HC read LDS")?;
+    // H3 (`HIPFIRE_QWEN4_HC_UP_TILE`, exact gfx1151 / gfx1201): the retiled
+    // operand-swapped entries.  gfx1151 keeps the baseline launch geometry;
+    // gfx1201's takes 128 rows per block, static LDS only, `low_rank % 64 == 0`.
+    let tile_1201 = tiled && entry == "hyper_read_up_wmma_bf16_gfx1201" && p.low_rank % 64 == 0;
+    let entry = match (tiled, entry) {
+        (true, "hyper_read_up_wmma_bf16") => "hyper_read_up_wmma_bf16_swap",
+        (true, "hyper_read_up_wmma_bf16_gfx1201") if tile_1201 => {
+            "hyper_read_up_wmma_bf16_gfx1201_t128"
+        }
+        (_, entry) => entry,
+    };
+    let row_grid = checked_u32(
+        p.rows.div_ceil(if tile_1201 { 128 } else { 512 }),
+        "HC read row grid",
+    )?;
+    let lds_bytes = if tile_1201 {
+        0
+    } else {
+        checked_u32(64 * (p.low_rank + 8) * 2, "HC read LDS")?
+    };
     gpu.ensure_kernel_public(module, source, entry)?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.up_weight.buf.as_ptr());
@@ -1620,7 +1949,7 @@ pub struct GatedDeltaConvBatched<'a> {
 }
 
 pub fn gated_delta_conv_batched(gpu: &mut Gpu, p: &GatedDeltaConvBatched<'_>) -> HipResult<()> {
-    gated_delta_conv_batched_impl(gpu, p, None)
+    gated_delta_conv_batched_impl(gpu, p, None, None)
 }
 
 /// [`gated_delta_conv_batched`] and [`gated_delta_params_batched`] in one
@@ -1631,13 +1960,67 @@ pub fn gated_delta_conv_params_batched(
     params: &GatedDeltaParamsBatched<'_>,
 ) -> HipResult<()> {
     validate_gated_delta_params_batched(params)?;
-    gated_delta_conv_batched_impl(gpu, conv, Some(params))
+    gated_delta_conv_batched_impl(gpu, conv, Some(params), None)
+}
+
+/// [`gated_delta_conv_params_batched`] that also stores the Q/K the chunked
+/// recurrence consumes already normalized
+/// (`gated_delta_conv_qknorm_bf16_f32_batched_k4`): the convolution values
+/// and parameters are bitwise the plain launch's, and the normalized Q/K are
+/// bitwise what `gated_delta_qk_norm_bf16_batched` stores, written into the
+/// shared F16 activation scratch ([`Gpu::qwen4_f16_x_scratch`]) where
+/// [`gated_delta_step_gate_wmma_qknormed`] reads them.  `step` is the
+/// recurrence this convolution feeds; it must satisfy
+/// [`gated_delta_conv_qknorm_geometry`].  Without `keep_qk_conv` the Q/K
+/// columns of `conv.output` are NOT written (the chunk kernel reads only V
+/// from it): a caller that consumes them (debug / capture) passes `true`,
+/// or stays on [`gated_delta_conv_params_batched`] and
+/// [`gated_delta_step_gate_wmma`].
+pub fn gated_delta_conv_params_qknorm_batched(
+    gpu: &mut Gpu,
+    conv: &GatedDeltaConvBatched<'_>,
+    params: &GatedDeltaParamsBatched<'_>,
+    step: &GatedDeltaStepBatched<'_>,
+    keep_qk_conv: bool,
+) -> HipResult<()> {
+    if !gated_delta_conv_qknorm_geometry(gpu, step, conv) {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    validate_gated_delta_params_batched(params)?;
+    let qk = checked_product(step.key_heads, step.key_dim, "GDN chunk qk extent")?;
+    let scratch = gpu.qwen4_f16_x_scratch(2 * step.rows * qk)?;
+    let qn = scratch.buf.as_ptr();
+    let kn = unsafe { (qn as *mut u8).add(step.rows * qk * 2) } as *mut std::ffi::c_void;
+    // The kernel stores qn / kn as 8-byte vectors.
+    if (qn as usize) % 8 != 0 || (kn as usize) % 8 != 0 {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    gated_delta_conv_batched_impl(
+        gpu,
+        conv,
+        Some(params),
+        Some(ConvQkNorm {
+            qn,
+            kn,
+            keep_qk_conv,
+        }),
+    )
+}
+
+/// H5's extra outputs: the normalized Q/K (`[rows, 16, 128]` BF16 each).
+#[derive(Clone, Copy)]
+struct ConvQkNorm {
+    qn: *mut std::ffi::c_void,
+    kn: *mut std::ffi::c_void,
+    /// Also store the unnormalized Q/K convolution into the output.
+    keep_qk_conv: bool,
 }
 
 fn gated_delta_conv_batched_impl(
     gpu: &mut Gpu,
     p: &GatedDeltaConvBatched<'_>,
     params: Option<&GatedDeltaParamsBatched<'_>>,
+    qk_norm: Option<ConvQkNorm>,
 ) -> HipResult<()> {
     for tensor in [p.history, p.next_history] {
         ensure_f32(tensor)?;
@@ -1683,7 +2066,11 @@ fn gated_delta_conv_batched_impl(
     let start_cursor = checked_i32(p.start_cursor, "GDN batched convolution cursor")?;
     let grid = blocks(p.channels)?;
     let row_grid = checked_u32(p.rows.div_ceil(16), "GDN batched convolution row grid")?;
-    let kernel = "gated_delta_conv_bf16_f32_batched_k4";
+    let kernel = if qk_norm.is_some() {
+        "gated_delta_conv_qknorm_bf16_f32_batched_k4"
+    } else {
+        "gated_delta_conv_bf16_f32_batched_k4"
+    };
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
     for tensor in [p.input, p.kernel, p.history, p.output, p.next_history] {
@@ -1695,7 +2082,9 @@ fn gated_delta_conv_batched_impl(
     args.push_i32(kernel_size);
     args.push_i32(start_cursor);
     let start_cursor_offset = args.len() - 4;
-    args.push_i32(i32::from(output_bf16));
+    // H5's `output_bf16` is a flag word: bit 0 = packed BF16 output, bit 1 =
+    // also store the unnormalized Q/K convolution (debug / capture).
+    args.push_i32(i32::from(output_bf16) | qk_norm.map_or(0, |n| 2 * i32::from(n.keep_qk_conv)));
     args.push_i32(i32::from(input_bf16));
     let (param_elements, param_heads) = match params {
         Some(q) => {
@@ -1713,8 +2102,25 @@ fn gated_delta_conv_batched_impl(
     };
     args.push_i32(checked_i32(param_elements, "GDN batched parameter extent")?);
     args.push_i32(checked_i32(param_heads, "GDN batched parameter heads")?);
+    if let Some(norm) = qk_norm {
+        args.push_ptr(norm.qn);
+        args.push_ptr(norm.kn);
+    }
     args.pad_to(16);
     let param_grid = checked_u32(param_elements.div_ceil(256), "GDN batched parameter grid")?;
+    // Compact 1-D grid: `conv_blocks * row_grid` convolution tiles (block `i`
+    // is channel block `i % conv_blocks`, row block `i / conv_blocks`), then the
+    // parameter blocks.  The kernel re-derives the split from rows / channels,
+    // so the grid depends only on those and the heads, fixed at capture.
+    let conv_tiles = checked_product(
+        grid as usize,
+        row_grid as usize,
+        "GDN batched convolution tile grid",
+    )?;
+    let total_grid = checked_u32(
+        checked_add(conv_tiles, param_grid as usize, "GDN batched convolution launch grid")?,
+        "GDN batched convolution launch grid",
+    )?;
     // `start_cursor` is `start_position % history_rows` for the chunk (the
     // kernel advances the ring per row from there), so the declared binding
     // re-derives it at the replay position.
@@ -1726,7 +2132,7 @@ fn gated_delta_conv_batched_impl(
     }];
     gpu.launch_blob_recorded(
         kernel,
-        [grid + param_grid, row_grid, 1],
+        [total_grid, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
@@ -2044,6 +2450,8 @@ pub struct IndexedAttentionNormRope<'a> {
     pub head_stride: usize,
     pub position: usize,
     pub rotary_dim: usize,
+    /// [`crate::rope::Rope::yarn`] of the model's RoPE at `rotary_dim`.
+    pub yarn: crate::rope::RopeYarn,
 }
 
 pub fn indexed_attention_norm_rope(
@@ -2087,6 +2495,7 @@ pub fn indexed_attention_norm_rope(
     args.push_i32(head_stride);
     args.push_i32(position);
     args.push_i32(rotary_dim);
+    p.yarn.push(&mut args);
     args.pad_to(16);
     gpu.launch_blob_recorded(
         "indexed_attention_norm_rope_f32",
@@ -2108,12 +2517,15 @@ pub struct IndexedAttentionNormRopeBatch<'a> {
     pub head_stride: usize,
     pub position_start: usize,
     pub rotary_dim: usize,
+    /// [`crate::rope::Rope::yarn`] of the model's RoPE at `rotary_dim`.
+    pub yarn: crate::rope::RopeYarn,
 }
 
 /// Storage format of a QSA layer's state: the full K/V caches and the
 /// indexer's raw and pooled keys (`kernels/src/tensor_ops.hip`, "QSA state
-/// formats"). The index keys are BF16 values in every format, so the fp8
-/// format's BF16 index arenas pool and select exactly what F32 arenas do.
+/// formats"). The index keys are BF16 values in every format, so the
+/// quantized formats' BF16 index arenas pool and select exactly what F32
+/// arenas do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum QsaKvFormat {
     /// F32 K/V and index keys: the exact reference.
@@ -2121,6 +2533,9 @@ pub enum QsaKvFormat {
     /// E4M3 K/V with one f16 scale per head and token (the Qwen3.5 native fp8
     /// row; gfx12 only), BF16 index keys.
     Fp8,
+    /// Q8_0 K/V (32-element blocks of one f16 scale and 32 int8 codes, the
+    /// dense q8 KV row; gfx11 and gfx12), BF16 index keys.
+    Q8,
 }
 
 impl QsaKvFormat {
@@ -2128,6 +2543,7 @@ impl QsaKvFormat {
         match self {
             Self::F32 => "f32",
             Self::Fp8 => "fp8",
+            Self::Q8 => "q8",
         }
     }
 
@@ -2138,14 +2554,17 @@ impl QsaKvFormat {
             // Whole-head scales over one 256-thread block, and 4-byte aligned
             // code rows (`kv_heads * 258` bytes).
             Self::Fp8 => head_dim == 256 && kv_heads % 2 == 0,
+            // One 256-thread block per head, eight 32-lane Q8_0 blocks, and
+            // 4-byte aligned block pairs (272-byte heads).
+            Self::Q8 => head_dim == 256 && kv_heads > 0,
         }
     }
 
-    /// Dtype of the K/V tensors: F32 elements, or fp8 byte rows as Raw.
+    /// Dtype of the K/V tensors: F32 elements, or quantized byte rows as Raw.
     pub const fn kv_dtype(self) -> DType {
         match self {
             Self::F32 => DType::F32,
-            Self::Fp8 => DType::Raw,
+            Self::Fp8 | Self::Q8 => DType::Raw,
         }
     }
 
@@ -2154,6 +2573,7 @@ impl QsaKvFormat {
         match self {
             Self::F32 => kv_heads * head_dim,
             Self::Fp8 => kv_heads * (head_dim + 2),
+            Self::Q8 => kv_heads * (head_dim / 32) * 34,
         }
     }
 
@@ -2161,7 +2581,7 @@ impl QsaKvFormat {
     pub const fn kv_row_bytes(self, kv_heads: usize, head_dim: usize) -> usize {
         match self {
             Self::F32 => kv_heads * head_dim * 4,
-            Self::Fp8 => self.kv_row_units(kv_heads, head_dim),
+            Self::Fp8 | Self::Q8 => self.kv_row_units(kv_heads, head_dim),
         }
     }
 
@@ -2169,13 +2589,136 @@ impl QsaKvFormat {
     pub const fn index_dtype(self) -> DType {
         match self {
             Self::F32 => DType::F32,
-            Self::Fp8 => DType::BF16,
+            Self::Fp8 | Self::Q8 => DType::BF16,
         }
     }
 
-    /// This format's entry of a `[f32, fp8]` kernel-name table.
-    fn kernel(self, names: [&'static str; 2]) -> &'static str {
+    /// This format's entry of a `[f32, fp8, q8]` kernel-name table.
+    fn kernel(self, names: [&'static str; 3]) -> &'static str {
         names[self as usize]
+    }
+}
+
+/// Context storage of one QSA layer, including the optional derived F16
+/// arena. A bare [`QsaKvFormat`] describes the unchanged state without one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct QsaStateLayout {
+    pub kv: QsaKvFormat,
+    /// Persistent F16 K and block-transposed V arenas
+    /// ([`QsaF16ArenaRef`]); each holds `qsa_f16_arena_rows(max_seq)` rows of
+    /// `kv_heads * head_dim` F16 elements.
+    pub f16_arena: bool,
+}
+
+impl QsaStateLayout {
+    /// The exact F32 reference state with no extra storage.
+    pub const F32: Self = Self::new(QsaKvFormat::F32);
+
+    pub const fn new(kv: QsaKvFormat) -> Self {
+        Self {
+            kv,
+            f16_arena: false,
+        }
+    }
+
+    /// Dtype of the raw and pooled index-key arenas.
+    pub const fn index_dtype(self) -> DType {
+        self.kv.index_dtype()
+    }
+
+    /// Bytes per cached token of both F16 arenas (K and V, 2 bytes per
+    /// channel), `0` without them.
+    pub const fn f16_arena_bytes_per_token(self, kv_heads: usize, head_dim: usize) -> usize {
+        if self.f16_arena {
+            2 * kv_heads * head_dim * 2
+        } else {
+            0
+        }
+    }
+}
+
+impl From<QsaKvFormat> for QsaStateLayout {
+    fn from(kv: QsaKvFormat) -> Self {
+        Self::new(kv)
+    }
+}
+
+/// Rows an F16 arena of `tokens` cached tokens holds: V is block-transposed
+/// in four-token blocks, so its last block is written whole.
+pub const fn qsa_f16_arena_rows(tokens: usize) -> usize {
+    tokens.div_ceil(4).saturating_mul(4)
+}
+
+/// Load-time arena admission: enabled unless opted out, exact gfx1151,
+/// F32 K/V, head_dim 256, and the gathered prefill route enabled.
+pub fn qsa_f16_arena_enabled(gpu: &Gpu, format: QsaKvFormat, head_dim: usize) -> bool {
+    *QWEN4_QSA_F16_ARENA
+        && format == QsaKvFormat::F32
+        && head_dim == 256
+        && gpu.arch_caps.is_gfx1151()
+        && qsa_gathered_wmma_enabled(gpu, format)
+}
+
+
+/// Whether the gathered route's shared F16 workspace is still needed: the
+/// route is enabled for `format` and the QSA layers do not keep their own F16
+/// arena (`f16_arena`; the MTP head never takes the gathered route, its
+/// attention rows stay below `QWEN4_F16_WMMA_MIN_TOKENS`).
+pub fn qsa_gather_workspace_needed(gpu: &Gpu, format: QsaKvFormat, f16_arena: bool) -> bool {
+    !f16_arena && qsa_gathered_wmma_enabled(gpu, format)
+}
+
+/// Host watermark for a derived arena. It travels with its F32/F16 owners,
+/// is never snapshotted, and only the successful converter advances it.
+#[derive(Default)]
+pub struct QsaF16ValidLen(std::sync::atomic::AtomicUsize);
+
+impl QsaF16ValidLen {
+    pub fn get(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn valid(&self, committed: usize) -> usize {
+        self.get().min(committed)
+    }
+
+    pub fn clamp(&self, committed: usize) {
+        self.0.fetch_min(committed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn invalidate(&self) {
+        self.0.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn converted(&self, end: usize) {
+        self.0.store(end, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Conversion starts at a four-token boundary to preserve the existing
+/// block-transposed V layout; at most three valid rows are reread.
+fn qsa_f16_arena_start(valid: usize, committed: usize) -> usize {
+    valid.min(committed) & !3
+}
+
+/// A QSA layer's persistent F16 arena as the gathered attention reads it:
+/// `keys` is F16 `[token][kv_heads * 256]` and `values` the block-transposed
+/// F16 `[token / 4][kv_heads * 256][token % 4]`
+/// (`indexed_attention_kv_f16vb`'s layout), both sized for
+/// [`qsa_f16_arena_rows`] of the cache capacity. `valid_len` counts the
+/// leading tokens whose F16 rows are known to equal the F32 cache's; the owner
+/// clamps it whenever cache rows are rewritten or rewound.
+#[derive(Clone, Copy)]
+pub struct QsaF16ArenaRef<'a> {
+    pub keys: &'a GpuTensor,
+    pub values: &'a GpuTensor,
+    pub valid_len: &'a QsaF16ValidLen,
+}
+
+impl QsaF16ArenaRef<'_> {
+    /// Leading tokens that are valid while the F32 cache holds `committed`.
+    pub fn valid(&self, committed: usize) -> usize {
+        self.valid_len.valid(committed)
     }
 }
 
@@ -2199,6 +2742,9 @@ fn check_qsa_format(
     }
     if format == QsaKvFormat::Fp8 && !(gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201()) {
         return Err(HipError::new(0, "QSA fp8 K/V needs a gfx12 device"));
+    }
+    if format == QsaKvFormat::Q8 && !gpu.arch_caps.has_gfx11_plus_simt() {
+        return Err(HipError::new(0, "QSA q8 K/V needs a gfx11 or gfx12 device"));
     }
     if tensors.iter().any(|tensor| tensor.dtype != format.kv_dtype()) {
         return Err(HipError::new(0, &ComputeError::WrongDtype.to_string()));
@@ -2233,6 +2779,9 @@ pub struct IndexedAttentionDecodePrologue<'a> {
     pub position: usize,
     pub rows: usize,
     pub format: QsaKvFormat,
+    /// [`crate::rope::Rope::yarn`] at the prologue's rotary width
+    /// (`min(dim, 64)`).
+    pub yarn: crate::rope::RopeYarn,
 }
 
 pub fn indexed_attention_decode_prologue(
@@ -2284,6 +2833,7 @@ pub fn indexed_attention_decode_prologue(
     let kernel = p.format.kernel([
         "indexed_attention_decode_prologue_f32",
         "indexed_attention_decode_prologue_fp8",
+        "indexed_attention_decode_prologue_q8",
     ]);
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
@@ -2315,6 +2865,7 @@ pub fn indexed_attention_decode_prologue(
     // Declared dynamic field: replay re-derives the position (angles and
     // both cache rows follow it).
     let position_offset = args.len() - 4;
+    p.yarn.push(&mut args);
     args.pad_to(16);
     let position_binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 {
         offset: position_offset,
@@ -2323,6 +2874,136 @@ pub fn indexed_attention_decode_prologue(
     gpu.launch_blob_recorded(
         kernel,
         [blocks_x, checked_u32(p.rows, "QSA prologue rows")?, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings {
+            grid: None,
+            kernargs: &position_binding,
+        },
+    )
+}
+
+/// QSA prologue of the `MtpStep::Append`-style key-value-only fill of `rows`
+/// consecutive prompt rows: the decode prologue kernel launched with
+/// `heads == 0`, so the query/gate branch is dead and only the index-query,
+/// key norm+RoPE, K/V cache append and index-key BF16 round trip + raw-key copy
+/// run (same kernel, same per-element operations as `rows` decode-prologue
+/// launches). Row buffers are row-major at their natural row widths; row `r`
+/// sits at cache position `position + r`.
+pub struct IndexedAttentionAppendPrologue<'a> {
+    /// `rows x [index q (index_heads * index_dim) | index k (index_kv_width)]`.
+    pub index_row: &'a GpuTensor,
+    /// `rows x [kv_heads * head_dim]`, normed + roped in place.
+    pub keys: &'a GpuTensor,
+    /// `rows x [kv_heads * head_dim]`.
+    pub values: &'a GpuTensor,
+    pub full_keys: &'a GpuTensor,
+    pub full_values: &'a GpuTensor,
+    pub raw_index_keys: &'a GpuTensor,
+    pub index_q_norm: &'a GpuTensor,
+    pub k_norm: &'a GpuTensor,
+    pub index_heads: usize,
+    pub index_dim: usize,
+    pub index_kv_width: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub position: usize,
+    pub rows: usize,
+    pub format: QsaKvFormat,
+    /// See [`IndexedAttentionDecodePrologue::yarn`].
+    pub yarn: crate::rope::RopeYarn,
+}
+
+pub fn indexed_attention_append_prologue(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAppendPrologue<'_>,
+) -> HipResult<()> {
+    for tensor in [p.index_row, p.keys, p.values] {
+        ensure_f32(tensor)?;
+    }
+    check_qsa_format(gpu, p.format, p.kv_heads, p.head_dim, [p.full_keys, p.full_values])?;
+    if p.raw_index_keys.dtype != p.format.index_dtype() {
+        return Err(HipError::new(0, &ComputeError::WrongDtype.to_string()));
+    }
+    let row_units = p.format.kv_row_units(p.kv_heads, p.head_dim);
+    let kv_width = checked_product(p.kv_heads, p.head_dim, "QSA append prologue KV width")?;
+    let end = checked_add(p.position, p.rows, "QSA append prologue position")?;
+    let index_width =
+        checked_product(p.index_heads, p.index_dim, "QSA append prologue index")? + p.index_kv_width;
+    let bad = [p.index_q_norm, p.k_norm]
+        .iter()
+        .any(|n| n.dtype != DType::BF16)
+        || p.rows == 0
+        || p.index_heads == 0
+        || p.kv_heads == 0
+        || p.index_dim == 0
+        || p.index_dim > 256
+        || p.head_dim == 0
+        || p.head_dim > 256
+        || p.index_q_norm.numel() != p.index_dim
+        || p.k_norm.numel() != p.head_dim
+        || p.index_row.numel() < checked_product(p.rows, index_width, "QSA append prologue index")?
+        || p.keys.numel() < checked_product(p.rows, kv_width, "QSA append prologue keys")?
+        || p.values.numel() < checked_product(p.rows, kv_width, "QSA append prologue values")?
+        || p.full_keys.numel() < checked_product(end, row_units, "QSA append prologue cache")?
+        || p.full_values.numel() < checked_product(end, row_units, "QSA append prologue cache")?
+        || p.raw_index_keys.numel()
+            < checked_product(end, p.index_kv_width, "QSA append prologue raw keys")?;
+    if bad {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let blocks_x = checked_u32(
+        p.index_heads + p.kv_heads + 1,
+        "QSA append prologue block count",
+    )?;
+    let kernel = p.format.kernel([
+        "indexed_attention_decode_prologue_f32",
+        "indexed_attention_decode_prologue_fp8",
+        "indexed_attention_decode_prologue_q8",
+    ]);
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
+    let mut args = KernargBlob::new();
+    // heads == 0: the kernel never dereferences `qgate` (its row offset is
+    // `r * 2 * 0 * head_dim`, and `block < heads` is never true) nor `q_norm`,
+    // so they alias live buffers of the right dtype.
+    for tensor in [
+        p.index_row,
+        p.keys,
+        p.keys,
+        p.values,
+        p.full_keys,
+        p.full_values,
+        p.raw_index_keys,
+        p.index_q_norm,
+        p.k_norm,
+        p.k_norm,
+    ] {
+        args.push_ptr(tensor.buf.as_ptr());
+    }
+    for (value, label) in [
+        (p.index_heads, "QSA append prologue index heads"),
+        (p.index_dim, "QSA append prologue index width"),
+        (p.index_kv_width, "QSA append prologue index KV width"),
+        (0, "QSA append prologue heads"),
+        (p.kv_heads, "QSA append prologue KV heads"),
+        (p.head_dim, "QSA append prologue head width"),
+    ] {
+        args.push_i32(checked_i32(value, label)?);
+    }
+    args.push_i32(checked_i32(p.position, "QSA append prologue position")?);
+    // Declared dynamic field: replay re-derives the position (angles and
+    // both cache rows follow it).
+    let position_offset = args.len() - 4;
+    p.yarn.push(&mut args);
+    args.pad_to(16);
+    let position_binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 {
+        offset: position_offset,
+        addend: 0,
+    }];
+    gpu.launch_blob_recorded(
+        kernel,
+        [blocks_x, checked_u32(p.rows, "QSA append prologue rows")?, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
@@ -2397,6 +3078,7 @@ pub fn indexed_attention_norm_rope_batch(
     // base; the kernel adds the row index itself.
     let position_offset = args.len() - 4;
     args.push_i32(rotary_dim);
+    p.yarn.push(&mut args);
     args.pad_to(16);
     let position_binding = [crate::replay::ReplayKernargBinding::PositionPlusU32 {
         offset: position_offset,
@@ -2516,6 +3198,7 @@ pub fn indexed_attention_cache_append_batch(
     let kernel = p.format.kernel([
         "indexed_attention_cache_append_f32_batched",
         "indexed_attention_cache_append_fp8_batched",
+        "indexed_attention_cache_append_q8_batched",
     ]);
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
@@ -2781,17 +3464,9 @@ fn indexed_attention_select_batch_impl(
 ) -> HipResult<bool> {
     ensure_f32(p.query)?;
     // Pooled keys are F32 or BF16 arenas (`QsaKvFormat::index_dtype`).
-    let (parallel_kernel, serial_kernel) = match p.pooled.dtype {
-        DType::F32 => (
-            "indexed_attention_select_f32_batched",
-            "indexed_attention_select_f32_batched_serial",
-        ),
-        DType::BF16 => (
-            "indexed_attention_select_bf16_batched",
-            "indexed_attention_select_bf16_batched_serial",
-        ),
-        _ => return Err(HipError::new(0, &ComputeError::WrongDtype.to_string())),
-    };
+    if !matches!(p.pooled.dtype, DType::F32 | DType::BF16) {
+        return Err(HipError::new(0, &ComputeError::WrongDtype.to_string()));
+    }
     if p.selected.dtype != DType::Raw
         || p.rows == 0
         || p.query_row_stride == 0
@@ -2831,16 +3506,16 @@ fn indexed_attention_select_batch_impl(
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
-    let rows = checked_i32(p.rows, "QSA batch select rows")?;
-    let query_row_stride = checked_i32(p.query_row_stride, "QSA batch select query stride")?;
-    let block_count = checked_i32(p.block_count, "QSA batch select blocks")?;
-    let index_heads = checked_i32(p.index_heads, "QSA batch select heads")?;
-    let index_dim = checked_i32(p.index_dim, "QSA batch select dim")?;
-    let budget_blocks = checked_i32(p.budget_blocks, "QSA batch select budget")?;
-    let compress = checked_i32(p.compress, "QSA batch select compress")?;
-    let position_start = checked_i32(p.position_start, "QSA batch select position")?;
-    let capacity = checked_i32(p.capacity, "QSA batch select capacity")?;
-    let row_grid = checked_u32(p.rows, "QSA batch select row grid")?;
+    checked_i32(p.rows, "QSA batch select rows")?;
+    checked_i32(p.query_row_stride, "QSA batch select query stride")?;
+    checked_i32(p.block_count, "QSA batch select blocks")?;
+    checked_i32(p.index_heads, "QSA batch select heads")?;
+    checked_i32(p.index_dim, "QSA batch select dim")?;
+    checked_i32(p.budget_blocks, "QSA batch select budget")?;
+    checked_i32(p.compress, "QSA batch select compress")?;
+    checked_i32(p.position_start, "QSA batch select position")?;
+    checked_i32(p.capacity, "QSA batch select capacity")?;
+    checked_u32(p.rows, "QSA batch select row grid")?;
     // The active count is declared to the recorder as `(position_start + rows) /
     // compress`, so replay re-derives it. Verify the caller used that formula:
     // a mismatch would make replay select against a different block count.
@@ -2871,6 +3546,61 @@ fn indexed_attention_select_batch_impl(
             ),
         ));
     }
+    let shape_blocks = p.shape_blocks;
+    shape_blocks
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| HipError::new(0, "QSA batch select shape overflow"))?;
+    let parallel = gpu.arch_caps.has_gfx11_plus_simt()
+        && shape_blocks > 0
+        && !select_forced_serial();
+    // Live F32 launches use the score/select pair. Covered BF16 prefill
+    // launches use the builder score with either select kernel; SCORE_PM=0
+    // keeps the fused BF16 selector. The opt-in exact selector keeps its route.
+    if parallel
+        && !*QWEN4_QSA_SELECT_EXACT
+        && (p.pooled.dtype == DType::F32
+            || (qsa_select_pm_fits(gpu, p) && *QWEN4_QSA_SCORE_PM))
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode
+        && p.index_heads == 4
+        && p.index_dim.is_multiple_of(4)
+        && p.index_dim <= 128
+        && p.block_count > 0
+        && p.budget_blocks <= QSA_SELECT_FROM_SCORES_MAX_BUDGET
+    {
+        let pm = qsa_select_pm_arm(gpu, p);
+        return indexed_attention_select_rows8(gpu, p, mirror, pm);
+    }
+    indexed_attention_select_fused(gpu, p, mirror)
+}
+
+/// Incumbent fused selector, also used as the BF16 lab baseline.
+fn indexed_attention_select_fused(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionSelectBatch<'_>,
+    mirror: Option<&GpuTensor>,
+) -> HipResult<bool> {
+    let (parallel_kernel, serial_kernel) = match p.pooled.dtype {
+        DType::F32 => (
+            "indexed_attention_select_f32_batched",
+            "indexed_attention_select_f32_batched_serial",
+        ),
+        DType::BF16 => (
+            "indexed_attention_select_bf16_batched",
+            "indexed_attention_select_bf16_batched_serial",
+        ),
+        _ => return Err(HipError::new(0, &ComputeError::WrongDtype.to_string())),
+    };
+    let rows = checked_i32(p.rows, "QSA batch select rows")?;
+    let query_row_stride = checked_i32(p.query_row_stride, "QSA batch select query stride")?;
+    let block_count = checked_i32(p.block_count, "QSA batch select blocks")?;
+    let index_heads = checked_i32(p.index_heads, "QSA batch select heads")?;
+    let index_dim = checked_i32(p.index_dim, "QSA batch select dim")?;
+    let budget_blocks = checked_i32(p.budget_blocks, "QSA batch select budget")?;
+    let compress = checked_i32(p.compress, "QSA batch select compress")?;
+    let position_start = checked_i32(p.position_start, "QSA batch select position")?;
+    let capacity = checked_i32(p.capacity, "QSA batch select capacity")?;
+    let row_grid = checked_u32(p.rows, "QSA batch select row grid")?;
     let shape_blocks = p.shape_blocks;
     let lds_bytes = shape_blocks
         .checked_mul(std::mem::size_of::<f32>())
@@ -2909,7 +3639,12 @@ fn indexed_attention_select_batch_impl(
                 capacity: p.capacity,
                 shape_blocks: p.shape_blocks,
             };
-            persisted = indexed_attention_select_batch_impl(
+            let select = if p.pooled.dtype == DType::BF16 {
+                indexed_attention_select_fused
+            } else {
+                indexed_attention_select_batch_impl
+            };
+            persisted = select(
                 gpu,
                 &group,
                 if last { mirror } else { None },
@@ -2939,7 +3674,40 @@ fn indexed_attention_select_batch_impl(
     } else {
         (serial_kernel, [1, 1, 1], 0)
     };
-    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel_name)?;
+    // `HIPFIRE_QWEN4_QSA_SELECT_EXACT`: the exact selector replaces the
+    // incumbent parallel kernel (same ABI, grid and block) for live
+    // complete <= 2048 blocks and <= 512 budget blocks, never under a
+    // recorder or capture; every other launch is the incumbent's.  The
+    // exact kernel keeps no static LDS and needs max(6144, live-score-row)
+    // bytes of dynamic LDS: the floor applies even in global-score mode,
+    // otherwise 4 B per live block.
+    let exact_dynamic_need = QSA_SELECT_EXACT_DYNAMIC_LDS_FLOOR_BYTES.max(if global {
+        0
+    } else {
+        p.block_count.saturating_mul(std::mem::size_of::<f32>())
+    });
+    let launch_exact = *QWEN4_QSA_SELECT_EXACT
+        && kernel_name == parallel_kernel
+        && p.block_count <= QSA_SELECT_EXACT_MAX_BLOCKS
+        && p.budget_blocks <= QSA_SELECT_EXACT_MAX_BUDGET_BLOCKS
+        && exact_dynamic_need <= QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode;
+    let (launch_kernel, shared_mem) = if launch_exact {
+        let exact = match p.pooled.dtype {
+            DType::F32 => "indexed_attention_select_f32_batched_exact",
+            _ => "indexed_attention_select_bf16_batched_exact",
+        };
+        gpu.ensure_kernel_public(
+            "indexed_attention_select_exact",
+            INDEXED_ATTENTION_SELECT_EXACT_SRC,
+            exact,
+        )?;
+        (exact, exact_dynamic_need as u32)
+    } else {
+        gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel_name)?;
+        (kernel_name, shared_mem)
+    };
     let mut args = KernargBlob::new();
     for tensor in [p.query, p.pooled, p.selected] {
         args.push_ptr(tensor.buf.as_ptr());
@@ -2983,7 +3751,7 @@ fn indexed_attention_select_batch_impl(
         },
     ];
     gpu.launch_blob_recorded(
-        kernel_name,
+        launch_kernel,
         [row_grid, 1, 1],
         block,
         shared_mem,
@@ -2995,6 +3763,245 @@ fn indexed_attention_select_batch_impl(
     )?;
     Ok(mirror.is_some())
 }
+
+/// Score-scratch budget of [`indexed_attention_select_rows8`]: rows are
+/// selected in groups whose scores fit it.
+const QSA_SELECT_SCORE_SCRATCH_BYTES: usize = 64 << 20;
+/// `indexed_attention_select_from_scores` holds the chosen blocks in 512 LDS
+/// entries; larger budgets take the batched kernel.
+const QSA_SELECT_FROM_SCORES_MAX_BUDGET: usize = 512;
+
+/// Which kernels of the live pair come from certified builder modules.
+/// For BF16, `Hipcc` is the fused incumbent, `ScoreOnly` and `Both` use the
+/// BF16 PM score; `SelectOnly` is unsupported (no hipcc BF16 rows score).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QsaSelectPmArm {
+    Hipcc,
+    ScoreOnly,
+    SelectOnly,
+    Both,
+}
+impl QsaSelectPmArm {
+    fn score(self) -> bool { matches!(self, Self::ScoreOnly | Self::Both) }
+    fn select(self) -> bool { matches!(self, Self::SelectOnly | Self::Both) }
+}
+
+/// Pooled blocks the builder selector serves: its per-lane bit-sliced
+/// counters take at most 511 packets of 32 keys per wave.
+const QSA_SELECT_PM_MAX_BLOCKS: usize = 511 * 8 * 32;
+/// Original-call rows from which the builder pair runs (prefill; decode and
+/// verify keep the hipcc F32 pair or fused BF16 selector).
+const QSA_SELECT_PM_MIN_ROWS: usize = 512;
+
+/// Whether the builder pair covers the live-pair call `p`: exact gfx1151,
+/// prefill rows, the fixed four-head / 128-dim F32-query geometry with F32 or
+/// BF16 pooled keys, and every buffer addressed through 32-bit raw-buffer
+/// offsets below the out-of-range offset (pooled extents use its element size).
+fn qsa_select_pm_fits(gpu: &Gpu, p: &IndexedAttentionSelectBatch<'_>) -> bool {
+    qsa_select_pm_shape_fits(
+        // Threshold input under the invariant profile; never below the real
+        // rows, which the shape's raw-offset bounds are checked against.
+        gpu.arch_caps.is_gfx1151(), p.pooled.dtype, gpu.route_rows(p.rows).max(p.rows), p.index_heads,
+        p.index_dim, p.block_count, p.query_row_stride, p.capacity,
+    )
+}
+
+/// No tensor payload or GPU initialization is needed to choose the native
+/// score/select image. Keep raw-offset admissions shared with live dispatch.
+pub(crate) fn qsa_select_pm_shape_fits(
+    halo: bool, dtype: DType, rows: usize, index_heads: usize,
+    index_dim: usize, block_count: usize, query_row_stride: usize, capacity: usize,
+) -> bool {
+    const PM_OOB_OFFSET: usize = 0x7fff_ff00;
+    let below = |n: Option<usize>| n.is_some_and(|bytes| bytes < PM_OOB_OFFSET);
+    halo && matches!(dtype, DType::F32 | DType::BF16)
+        && rows >= QSA_SELECT_PM_MIN_ROWS && index_heads == 4 && index_dim == 128
+        && block_count <= QSA_SELECT_PM_MAX_BLOCKS
+        && below(rows.checked_mul(query_row_stride).and_then(|n| n.checked_mul(4)))
+        && below(block_count.checked_mul(128 * dtype.size()))
+        && below(rows.checked_mul(capacity).and_then(|n| n.checked_mul(4)))
+}
+
+pub(crate) fn qsa_select_pm_selected(
+    fits: bool, score: bool, select: bool,
+) -> QsaSelectPmArm {
+    if !fits { return QsaSelectPmArm::Hipcc; }
+    match (score, select) {
+        (false, false) => QsaSelectPmArm::Hipcc,
+        (true, false) => QsaSelectPmArm::ScoreOnly,
+        (false, true) => QsaSelectPmArm::SelectOnly,
+        (true, true) => QsaSelectPmArm::Both,
+    }
+}
+
+/// The route's arm: `HIPFIRE_QWEN4_QSA_SCORE_PM` / `HIPFIRE_QWEN4_QSA_SELECT_PM`
+/// (each on unless `0`) where the builder pair covers the call.
+fn qsa_select_pm_arm(gpu: &Gpu, p: &IndexedAttentionSelectBatch<'_>) -> QsaSelectPmArm {
+    if !qsa_select_pm_fits(gpu, p) {
+        return QsaSelectPmArm::Hipcc;
+    }
+    qsa_select_pm_selected(
+        true, *QWEN4_QSA_SCORE_PM, *QWEN4_QSA_SELECT_PM,
+    )
+}
+
+/// Lab entry with an explicit arm (grouping, scratch and mirror persistence;
+/// only the env choice is bypassed). Refuses uncovered calls before launch.
+/// BF16 `Hipcc` uses the fused incumbent; `ScoreOnly`/`Both` use PM scores
+/// with hipcc/PM selection, and `SelectOnly` is refused.
+#[cfg(any(test, feature = "lab"))]
+pub fn indexed_attention_select_batch_pm_arm(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionSelectBatch<'_>,
+    mirror: Option<&GpuTensor>,
+    arm: QsaSelectPmArm,
+) -> HipResult<bool> {
+    let live = gpu.arch_caps.has_gfx11_plus_simt()
+        && matches!(p.pooled.dtype, DType::F32 | DType::BF16)
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode
+        && p.index_heads == 4
+        && p.index_dim.is_multiple_of(4)
+        && p.index_dim <= 128
+        && p.block_count > 0
+        && gpu.route_rows(p.rows) > 8
+        && p.budget_blocks <= QSA_SELECT_FROM_SCORES_MAX_BUDGET;
+    if !live || (arm != QsaSelectPmArm::Hipcc && !qsa_select_pm_fits(gpu, p)) {
+        return Err(HipError::new(0, "QSA select PM arm: call not covered"));
+    }
+    if p.pooled.dtype == DType::BF16 {
+        if arm == QsaSelectPmArm::SelectOnly {
+            return Err(HipError::new(0, "QSA select BF16 requires PM score"));
+        }
+        if arm == QsaSelectPmArm::Hipcc {
+            return indexed_attention_select_fused(gpu, p, mirror);
+        }
+    }
+    indexed_attention_select_rows8(gpu, p, mirror, arm)
+}
+
+/// Live score/select route: F32 uses hipcc rows8/16 or PM rows16 scores.
+/// BF16 requires the PM rows16 score from `qsa_select_bf16_pm_gfx1151`;
+/// there is no hipcc BF16 rows score. Both dtypes select using hipcc or the
+/// existing PM select module, with identical kernargs, grids and output bytes.
+fn indexed_attention_select_rows8(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionSelectBatch<'_>,
+    mirror: Option<&GpuTensor>,
+    pm: QsaSelectPmArm,
+) -> HipResult<bool> {
+    const PM_MODULE: &str = "qsa_select_pm_gfx1151";
+    if p.pooled.dtype == DType::BF16 && !pm.score() {
+        return Err(HipError::new(0, "QSA select BF16 requires PM score"));
+    }
+    let stride = p.block_count;
+    // Prefill scores sixteen rows per pooled-key read; decode and few-row
+    // verify keep eight (the sixteen-row kernel costs them more than it saves).
+    let (score_kernel, score_rows) = if p.pooled.dtype == DType::BF16 {
+        ("indexed_attention_select_scores_rows16_bf16_pm_gfx1151", 16)
+    } else if pm.score() {
+        ("indexed_attention_select_scores_rows16_f32_pm_gfx1151", 16)
+    } else if gpu.route_rows(p.rows) > 8 {
+        ("indexed_attention_select_scores_rows16_f32", 16)
+    } else {
+        ("indexed_attention_select_scores_rows8_f32", 8)
+    };
+    let select_kernel = if pm.select() {
+        "indexed_attention_select_from_scores_pm_gfx1151"
+    } else {
+        "indexed_attention_select_from_scores"
+    };
+    let group = (QSA_SELECT_SCORE_SCRATCH_BYTES / (stride * 4) / 16 * 16)
+        .max(16)
+        .min(p.rows);
+    // Growth goes through the accessor that invalidates captured state first.
+    let scores = gpu.qwen4_f16_x_scratch(group * stride * 2)?.buf.as_ptr();
+    if p.pooled.dtype == DType::BF16 {
+        gpu.ensure_embedded_kernel(
+            "qsa_select_bf16_pm_gfx1151",
+            crate::kernels::QSA_SELECT_BF16_PM_GFX1151,
+            score_kernel,
+        )?;
+    } else if pm.score() {
+        gpu.ensure_embedded_kernel(PM_MODULE, crate::kernels::QSA_SELECT_PM_GFX1151, score_kernel)?;
+    } else {
+        gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, score_kernel)?;
+    }
+    if pm.select() {
+        gpu.ensure_embedded_kernel(PM_MODULE, crate::kernels::QSA_SELECT_PM_GFX1151, select_kernel)?;
+    } else {
+        gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, select_kernel)?;
+    }
+    let mirror =
+        mirror.filter(|m| m.numel() * m.dtype.size() >= p.capacity * std::mem::size_of::<i32>());
+    let block_count = checked_i32(p.block_count, "QSA batch select blocks")?;
+    let block_tiles = checked_u32(p.block_count.div_ceil(256), "QSA select block tiles")?;
+    let mut g0 = 0usize;
+    while g0 < p.rows {
+        let n = group.min(p.rows - g0);
+        let query = unsafe {
+            (p.query.buf.as_ptr() as *mut f32).add(g0 * p.query_row_stride) as *mut std::ffi::c_void
+        };
+        let selected = unsafe {
+            (p.selected.buf.as_ptr() as *mut i32).add(g0 * p.capacity) as *mut std::ffi::c_void
+        };
+        let position_start = checked_i32(p.position_start + g0, "QSA batch select position")?;
+        let rows = checked_i32(n, "QSA batch select rows")?;
+        let query_row_stride = checked_i32(p.query_row_stride, "QSA batch select query stride")?;
+        let mut args = KernargBlob::new();
+        args.push_ptr(query);
+        args.push_ptr(p.pooled.buf.as_ptr());
+        args.push_ptr(scores);
+        args.push_i32(rows);
+        args.push_i32(query_row_stride);
+        args.push_i32(block_count);
+        args.push_i32(checked_i32(p.index_dim, "QSA batch select dim")?);
+        args.push_i32(checked_i32(p.compress, "QSA batch select compress")?);
+        args.push_i32(position_start);
+        args.push_i32(block_count);
+        args.pad_to(16);
+        gpu.launch_blob_recorded(
+            score_kernel,
+            [
+                block_tiles,
+                checked_u32(n.div_ceil(score_rows), "QSA select row groups")?,
+                1,
+            ],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )?;
+        // The persistent selection is the final row's: the last group's.
+        let last = g0 + n == p.rows;
+        let mirror_ptr = mirror
+            .filter(|_| last)
+            .map_or(std::ptr::null_mut(), |m| m.buf.as_ptr());
+        let mut args = KernargBlob::new();
+        args.push_ptr(scores);
+        args.push_i32(block_count);
+        args.push_ptr(selected);
+        args.push_i32(rows);
+        args.push_i32(block_count);
+        args.push_i32(checked_i32(p.budget_blocks, "QSA batch select budget")?);
+        args.push_i32(checked_i32(p.compress, "QSA batch select compress")?);
+        args.push_i32(position_start);
+        args.push_i32(checked_i32(p.capacity, "QSA batch select capacity")?);
+        args.push_ptr(mirror_ptr);
+        args.pad_to(16);
+        gpu.launch_blob_recorded(
+            select_kernel,
+            [rows as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )?;
+        g0 += n;
+    }
+    Ok(mirror.is_some())
+}
+
 /// Device-side stable reuse of a prior MTP QSA selection row.
 ///
 /// `selected` is a byte-addressed [`DType::Raw`] allocation containing i32
@@ -3084,11 +4091,16 @@ pub struct IndexedAttentionPoolRope<'a> {
     /// Declared source of `block_count`, or `None` for a synthetic caller whose
     /// count is not position-derived (which then declares nothing).
     pub position: Option<QsaPositionBinding>,
-    /// Declared `grid.x` for this launch. A retained tape needs the grid to be
-    /// position-independent, so callers pass the capacity the kernel masks
-    /// against (`>= block_count`); a caller without a capacity passes the active
-    /// count. Must be `>= block_count`.
+    /// `grid.x` bound for a full (non-incremental) launch. A retained tape needs
+    /// the grid to be position-independent, so callers pass the capacity the
+    /// kernel masks against (`>= block_count`); a caller without a capacity
+    /// passes the active count. Must be `>= block_count`. An incremental launch
+    /// instead uses `ceil(rows / compress)` (capped by this bound), which is
+    /// also position-independent.
     pub grid_bound: usize,
+    /// [`crate::rope::Rope::yarn`] at the pooled keys' rotary width
+    /// (`min(index_dim, 64)`).
+    pub yarn: crate::rope::RopeYarn,
 }
 
 pub fn indexed_attention_pool_rope(
@@ -3175,7 +4187,15 @@ fn indexed_attention_pool_rope_impl(
             ),
         ));
     }
-    let block_grid = checked_u32(p.grid_bound, "QSA pool/RoPE block grid")?;
+    // An incremental launch completes `(start + rows) / c - start / c <=
+    // ceil(rows / c)` blocks from `first_block` (the kernel offsets
+    // `blockIdx.x` by it), so its grid depends on `rows` only: constant across
+    // replayed positions, with `first_block` arriving as a declared kernarg.
+    let grid_x = match (incremental, p.position) {
+        (true, Some(position)) => position.rows.div_ceil(p.compress).max(1).min(p.grid_bound),
+        _ => p.grid_bound,
+    };
+    let block_grid = checked_u32(grid_x, "QSA pool/RoPE block grid")?;
     let dim_grid = blocks(p.index_dim)?;
     if p.raw_keys.numel() < raw_elements || p.pooled.numel() < pooled_elements {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
@@ -3202,6 +4222,7 @@ fn indexed_attention_pool_rope_impl(
     args.push_i32(checked_i32(first_block, "QSA pool/RoPE first block")?);
     // Declared dynamic too when incremental: `position_start / compress`.
     let first_block_offset = args.len() - 4;
+    p.yarn.push(&mut args);
     args.pad_to(16);
     let addend = u32::try_from(p.position.map_or(0, |position| position.rows))
         .map_err(|_| HipError::new(0, "QSA pool/RoPE rows exceed u32"))?;
@@ -3379,10 +4400,12 @@ pub fn indexed_attention_attention(
         p.format.kernel([
             "indexed_attention_attention_f32",
             "indexed_attention_attention_fp8",
+            "indexed_attention_attention_q8",
         ]),
         p.format.kernel([
             "indexed_attention_attention_f32_serial",
             "indexed_attention_attention_fp8_serial",
+            "indexed_attention_attention_q8_serial",
         ]),
     ];
     let (kernel_name, shared_mem) =
@@ -3451,6 +4474,15 @@ pub struct IndexedAttentionAttentionBatch<'a> {
 
 /// Query heads per workgroup in `indexed_attention_attention_f32_batched_hg4`.
 const QSA_ATTENTION_HG4_HEADS: usize = 4;
+/// Query heads per KV head of `indexed_attention_attention_f32_batched_hg12`
+/// (one workgroup per KV group; its scores live in registers, QSA_T = 9
+/// tiles of 256 selected rows).
+const QSA_ATTENTION_HG12_HEADS: usize = 12;
+const QSA_ATTENTION_HG12_MAX_SELECTED: usize = 9 * 256;
+/// Few-row verify launches only `rows * n_kv_heads` hg12 workgroups; hg4's
+/// three per KV group fill the GPU better there (4-row MTP verify at 32k
+/// context: decode 51.4 -> 50.8 tok/s with hg12).
+const QSA_ATTENTION_HG12_MIN_ROWS: usize = 16;
 
 /// Below this many rows the grouped kernel launches too few workgroups
 /// (`rows * n_heads / 4`) to fill the GPU and the per-head kernel is faster
@@ -3471,7 +4503,7 @@ fn qsa_attention_hg4_lds_bytes(
     if !gpu.arch_caps.has_gfx11_plus_simt()
         || p.head_dim != 256
         || group % QSA_ATTENTION_HG4_HEADS != 0
-        || p.rows < QSA_ATTENTION_HG4_MIN_ROWS
+        || gpu.route_rows(p.rows) < QSA_ATTENTION_HG4_MIN_ROWS
     {
         return None;
     }
@@ -3489,12 +4521,68 @@ pub fn indexed_attention_attention_batch(
     indexed_attention_attention_batch_impl(gpu, p, true)
 }
 
+/// Developer-only exact reference for the QSA oracle: the same
+/// `IndexedAttentionAttentionBatch` through the per-head kernels
+/// (`allow_fast = false`), bypassing the grouped hg4 and dense/gathered WMMA
+/// routes. Not a production route; Unit0 harness only. Gated behind `lab`
+/// (or test) so production builds expose no new API.
+#[cfg(any(test, feature = "lab"))]
+#[doc(hidden)]
+pub fn indexed_attention_attention_batch_exact(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+) -> HipResult<()> {
+    indexed_attention_attention_batch_impl(gpu, p, false)
+}
+
+/// The gathered route's launches for `p` on the hipcc kernels or, with `pm`,
+/// the builder module (`HIPFIRE_QWEN4_QSA_PM`), whatever the route flags say.
+/// Byte-equality and timing harness only (`examples/qsa_pm_check.rs`).
+#[cfg(any(test, feature = "lab"))]
+#[doc(hidden)]
+pub fn indexed_attention_gathered_batch(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+    pm: bool,
+) -> HipResult<()> {
+    let end_position = p.position_start + p.rows;
+    let max_selected = end_position
+        .min(p.capacity)
+        .min(p.budget_blocks * p.compress + p.compress - 1);
+    if pm && !qsa_gathered_pm_fits(p) {
+        return Err(HipError::new(0, "QSA PM gathered route does not cover this shape"));
+    }
+    qsa_gathered_wmma_launch_with(gpu, p, end_position, max_selected, pm, None)
+}
+
 /// `allow_fast` admits the grouped hg4 kernel and the dense F16 WMMA route;
 /// without it the per-head kernels run (the exact reference).
 fn indexed_attention_attention_batch_impl(
     gpu: &mut Gpu,
     p: &IndexedAttentionAttentionBatch<'_>,
     allow_fast: bool,
+) -> HipResult<()> {
+    indexed_attention_attention_batch_arena(gpu, p, allow_fast, None)
+}
+
+/// [`indexed_attention_attention_batch`] for a layer that keeps a persistent
+/// F16 K/V `arena` (F32 state only; `None` = the shared per-launch
+/// workspace). The gathered route first brings the arena up to this launch's
+/// rows ([`qsa_f16_arena_sync`]), then attends from it; every other route
+/// ignores it.
+pub fn indexed_attention_attention_batch_with_arena(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+    arena: Option<&QsaF16ArenaRef<'_>>,
+) -> HipResult<()> {
+    indexed_attention_attention_batch_arena(gpu, p, true, arena)
+}
+
+fn indexed_attention_attention_batch_arena(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+    allow_fast: bool,
+    arena: Option<&QsaF16ArenaRef<'_>>,
 ) -> HipResult<()> {
     for tensor in [p.q_with_gate, p.output] {
         ensure_f32(tensor)?;
@@ -3564,6 +4652,9 @@ fn indexed_attention_attention_batch_impl(
             ),
         ));
     }
+    if allow_fast && qsa_gathered_wmma_applies(gpu, p) {
+        return qsa_gathered_wmma(gpu, p, end_position, max_selected, arena);
+    }
     // Live (unrecorded) launches reserve LDS for this chunk's longest row
     // only; a recorded launch keeps the position-independent shape bound.
     let shape_selected = if gpu.replay.is_recording() || gpu.graphs.capture_mode {
@@ -3581,14 +4672,32 @@ fn indexed_attention_attention_batch_impl(
     let capacity = checked_i32(p.capacity, "QSA batch attention capacity")?;
     let full_capacity = checked_i32(p.full_capacity, "QSA batch attention cache capacity")?;
     let row_grid = checked_u32(p.rows, "QSA batch attention row grid")?;
-    let hg4_bytes = allow_fast
+    let hg12 = allow_fast
+        && p.format == QsaKvFormat::F32
+        && gpu.arch_caps.has_gfx11_plus_simt()
+        && p.head_dim == 256
+        && p.n_heads == p.n_kv_heads * QSA_ATTENTION_HG12_HEADS
+        && gpu.route_rows(p.rows) >= QSA_ATTENTION_HG12_MIN_ROWS
+        && shape_selected <= QSA_ATTENTION_HG12_MAX_SELECTED;
+    let hg4_bytes = (allow_fast && !hg12)
         .then(|| qsa_attention_hg4_lds_bytes(gpu, p, shape_selected))
         .flatten();
-    let (kernel_name, grid, shared_mem) = if let Some(bytes) = hg4_bytes {
+    let (kernel_name, grid, shared_mem) = if hg12 {
+        (
+            "indexed_attention_attention_f32_batched_hg12",
+            [
+                checked_u32(p.n_kv_heads, "QSA batch attention KV head grid")?,
+                1,
+                row_grid,
+            ],
+            0,
+        )
+    } else if let Some(bytes) = hg4_bytes {
         (
             p.format.kernel([
                 "indexed_attention_attention_f32_batched_hg4",
                 "indexed_attention_attention_fp8_batched_hg4",
+                "indexed_attention_attention_q8_batched_hg4",
             ]),
             [
                 checked_u32(
@@ -3615,6 +4724,7 @@ fn indexed_attention_attention_batch_impl(
                     p.format.kernel([
                         "indexed_attention_attention_f32_batched",
                         "indexed_attention_attention_fp8_batched",
+                        "indexed_attention_attention_q8_batched",
                     ]),
                     [head_grid, dim_grid, row_grid],
                     bytes as u32,
@@ -3624,6 +4734,7 @@ fn indexed_attention_attention_batch_impl(
                 p.format.kernel([
                     "indexed_attention_attention_f32_batched_serial",
                     "indexed_attention_attention_fp8_batched_serial",
+                    "indexed_attention_attention_q8_batched_serial",
                 ]),
                 [head_grid, dim_grid, row_grid],
                 0,
@@ -3681,14 +4792,15 @@ fn indexed_attention_attention_batch_impl(
 /// head_dim 256 in four-head KV groups, and every row's selection is its
 /// whole causal window: the budget covers every visible block and the
 /// capacity every visible token (indexed_attention_select then emits all of
-/// them). Only F32 caches take this route (fp8 is gfx12-only).
+/// them). Only F32 caches take this route; q8 caches take the gathered route,
+/// whose per-call F16 convert dequantizes them (fp8 is gfx12-only).
 fn qsa_dense_wmma_applies(
     gpu: &Gpu,
     p: &IndexedAttentionAttentionBatch<'_>,
     end_position: usize,
 ) -> bool {
     gpu.arch_caps.has_wmma_w32()
-        && p.rows >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+        && gpu.route_rows(p.rows) >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
         && *crate::gemm::QWEN4_F16_WMMA
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
@@ -3772,6 +4884,415 @@ fn qsa_dense_wmma(
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
+
+/// Static LDS of the gathered kernels: F16 Q (16 heads x 256), two parity
+/// sets of F16 probabilities (8 waves x 16 x 16) and of the per-wave max/sum.
+const QSA_GATHERED_STATIC_LDS_BYTES: usize = 16 * 256 * 2 + 2 * 8 * 256 * 2 + 2 * 2 * 8 * 16 * 4;
+
+/// Whether this process runs QSA prefill attention in `format` on the
+/// gathered F16 WMMA route: `HIPFIRE_QWEN4_QSA_WMMA_GATHER` not `0` (read
+/// first, so with it `0` nothing else is consulted), the Qwen4 F16 route not opted
+/// out, and an arch with a kernel for the state format (gfx1151: F32 and
+/// q8, gfx1201: fp8).  Loaders use it to reserve and account the route's scratch.
+pub fn qsa_gathered_wmma_enabled(gpu: &Gpu, format: QsaKvFormat) -> bool {
+    *QWEN4_QSA_WMMA_GATHER
+        && *crate::gemm::QWEN4_F16_WMMA
+        && match format {
+            QsaKvFormat::F32 => gpu.arch_caps.is_gfx1151(),
+            QsaKvFormat::Fp8 => gpu.arch_caps.is_gfx1201(),
+            QsaKvFormat::Q8 => gpu.arch_caps.is_gfx1151(),
+        }
+}
+
+/// Bytes of the gathered route's F16 workspace a forward ending at `tokens`
+/// touches, with `n_kv_heads` heads of 256 channels: F16 K of the rows
+/// `[0, tokens)` followed by block-transposed V of their whole four-token
+/// (pooled) blocks, 2 bytes per KV channel each. Every producer write and
+/// attention read of that forward lies in this prefix (selected tokens are
+/// validated below the row's visible end, and a whole-block V load needs all
+/// four tokens visible); at `tokens` = the cache capacity it is the whole
+/// reservation.
+pub fn qsa_gathered_wmma_scratch_bytes(n_kv_heads: usize, tokens: usize) -> Option<usize> {
+    let width = n_kv_heads.checked_mul(256)?;
+    tokens
+        .checked_add(tokens.div_ceil(4).checked_mul(4)?)?
+        .checked_mul(width)?
+        .checked_mul(2)
+}
+
+fn qsa_gathered_wmma_bytes(n_kv_heads: usize, tokens: usize) -> HipResult<usize> {
+    qsa_gathered_wmma_scratch_bytes(n_kv_heads, tokens)
+        .ok_or_else(|| HipError::new(0, "QSA gathered scratch size overflows"))
+}
+
+/// Reserve the gathered route's per-GPU workspace for a QSA cache of
+/// `tokens` rows when the route is enabled for `format`. Where the VMM
+/// workspace is admitted (gfx1151/gfx1201 on a VMM-certified platform) this is a
+/// stable-VA reservation that commits no pages, released by
+/// `Gpu::invalidate_weight_caches` (model unload); elsewhere the legacy
+/// slot is allocated whole, as before. Returns the reserved bytes, 0 when
+/// the route is off (nothing reserved). Call at attach, before any graph
+/// capture or Redline record, so the workspace address never moves; map
+/// each forward's prefix with [`ensure_qsa_gathered_wmma_workspace`].
+pub fn reserve_qsa_gathered_wmma_workspace(
+    gpu: &mut Gpu,
+    format: QsaKvFormat,
+    n_kv_heads: usize,
+    tokens: usize,
+) -> HipResult<usize> {
+    if !qsa_gathered_wmma_enabled(gpu, format) {
+        return Ok(0);
+    }
+    let bytes = qsa_gathered_wmma_bytes(n_kv_heads, tokens)?;
+    gpu.qsa_gather_reserve(bytes)?;
+    Ok(bytes)
+}
+
+/// Map the gathered route's workspace over everything a forward ending at
+/// `end_tokens` touches ([`qsa_gathered_wmma_scratch_bytes`]), in place at
+/// its reserved address (reserving at least that much first when nothing
+/// is reserved; the legacy slot grows to it). Call before capture or
+/// record: VMM growth while either is armed is refused. Returns the
+/// committed bytes (VMM: granularity-rounded), 0 when the route is off.
+pub fn ensure_qsa_gathered_wmma_workspace(
+    gpu: &mut Gpu,
+    format: QsaKvFormat,
+    n_kv_heads: usize,
+    end_tokens: usize,
+) -> HipResult<usize> {
+    if !qsa_gathered_wmma_enabled(gpu, format) {
+        return Ok(0);
+    }
+    let bytes = qsa_gathered_wmma_bytes(n_kv_heads, end_tokens)?;
+    gpu.qsa_gather_scratch(bytes, bytes)?;
+    Ok(gpu.qsa_gather_scratch_bytes())
+}
+
+/// Reserve the gathered route's workspace for a QSA cache of `tokens` rows
+/// and commit all of it when the route is enabled for `format`; returns the
+/// bytes reserved (0 when it is not enabled, and nothing is allocated).
+/// The whole-context commit of the attach-time contract, kept until the
+/// caller moves to [`reserve_qsa_gathered_wmma_workspace`] +
+/// [`ensure_qsa_gathered_wmma_workspace`]: call at load, before any graph
+/// capture or Redline record, so a forward never maps more.
+pub fn reserve_qsa_gathered_wmma_scratch(
+    gpu: &mut Gpu,
+    format: QsaKvFormat,
+    n_kv_heads: usize,
+    tokens: usize,
+) -> HipResult<usize> {
+    let bytes = reserve_qsa_gathered_wmma_workspace(gpu, format, n_kv_heads, tokens)?;
+    if bytes > 0 {
+        gpu.qsa_gather_scratch(bytes, bytes)?;
+    }
+    Ok(bytes)
+}
+
+/// Whether the gathered F16 WMMA attention applies (checked after the dense
+/// route): the route is enabled for the state format
+/// ([`qsa_gathered_wmma_enabled`]), >= QWEN4_F16_WMMA_MIN_TOKENS rows, no
+/// recorder or capture, head_dim 256 with at most 16 query heads per KV head,
+/// and a token list that fits the LDS budget.  With
+/// `HIPFIRE_QWEN4_QSA_WMMA_GATHER=0` every launch is the incumbent's.
+fn qsa_gathered_wmma_applies(gpu: &Gpu, p: &IndexedAttentionAttentionBatch<'_>) -> bool {
+    qsa_gathered_wmma_enabled(gpu, p.format)
+        && gpu.route_rows(p.rows) >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+        && !gpu.replay.is_recording()
+        && !gpu.graphs.capture_mode
+        && p.head_dim == 256
+        && p.n_heads / p.n_kv_heads <= 16
+        && p.capacity.div_ceil(128) * 128 * 4 + QSA_GATHERED_STATIC_LDS_BYTES
+            <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
+}
+
+/// QSA attention over each row's selection in F16 WMMA
+/// (kernels/src/indexed_attention_gathered_wmma.gfx{1151,1201}.hip).  The
+/// cache rows `[0, end_position)` are first written as F16 K and
+/// block-transposed V into the route's own workspace
+/// ([`reserve_qsa_gathered_wmma_workspace`]; 2 KiB per token at 2 x 256 KV
+/// channels), mapped over that prefix before the launches.
+fn qsa_gathered_wmma(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+    end_position: usize,
+    max_selected: usize,
+    arena: Option<&QsaF16ArenaRef<'_>>,
+) -> HipResult<()> {
+    let pm = *QWEN4_QSA_PM && qsa_gathered_pm_fits(p);
+    qsa_gathered_wmma_launch_with(gpu, p, end_position, max_selected, pm, arena)
+}
+
+/// Whether the builder module covers `p`: its raw buffer offsets are 32-bit,
+/// so the F16 K/V scratch over the whole cache capacity and the query row
+/// stay below its out-of-range offset.
+fn qsa_gathered_pm_fits(p: &IndexedAttentionAttentionBatch<'_>) -> bool {
+    qsa_gathered_pm_shape_fits(p.full_capacity, p.n_kv_heads, p.n_heads)
+}
+
+pub(crate) fn qsa_gathered_pm_shape_fits(
+    full_capacity: usize, n_kv_heads: usize, n_heads: usize,
+) -> bool {
+    const PM_OOB_OFFSET: usize = 0x7fff_ff00;
+    let scratch = full_capacity.div_ceil(4).checked_mul(4)
+        .and_then(|t| t.checked_mul(n_kv_heads * 512));
+    scratch.is_some_and(|bytes| bytes + 4096 <= PM_OOB_OFFSET)
+        && n_heads.checked_mul(2048).is_some_and(|bytes| bytes + 4096 <= PM_OOB_OFFSET)
+        && full_capacity < 1 << 24
+        && n_kv_heads * 2048 < 1 << 24
+}
+
+/// The existing hipcc/PM producer and gathered attention launches. An arena
+/// replaces only the per-launch F16 workspace; all attend arguments and
+/// kernels are unchanged. The quantized formats retain their converters.
+fn qsa_gathered_wmma_launch_with(
+    gpu: &mut Gpu,
+    p: &IndexedAttentionAttentionBatch<'_>,
+    end_position: usize,
+    max_selected: usize,
+    pm: bool,
+    arena: Option<&QsaF16ArenaRef<'_>>,
+) -> HipResult<()> {
+    // (module, hipcc source or the builder image, kernel).
+    type Code = (&'static str, Result<&'static str, &'static [u8]>, &'static str);
+    const GFX1151: &str = "indexed_attention_gathered_wmma";
+    const GFX1201: &str = "indexed_attention_gathered_wmma_gfx1201";
+    const PM_GFX1151: &str = "qsa_gather_pm_gfx1151";
+    const PM_GFX1201: &str = "qsa_gather_pm_gfx1201";
+    let hip = |module, src, kernel| -> Code { (module, Ok(src), kernel) };
+    let built = |module, image, kernel| -> Code { (module, Err(image), kernel) };
+    let attend_gfx1151 = if pm {
+        built(PM_GFX1151, crate::kernels::QSA_GATHER_PM_GFX1151, "indexed_attention_gathered_wmma_f16_pm_gfx1151")
+    } else {
+        hip(GFX1151, INDEXED_ATTENTION_GATHERED_WMMA_SRC, "indexed_attention_gathered_wmma_f16")
+    };
+    let (convert, attend) = match (p.format, pm) {
+        (QsaKvFormat::F32, false) => (
+            hip(GFX1151, INDEXED_ATTENTION_GATHERED_WMMA_SRC, "indexed_attention_kv_f16vb"),
+            attend_gfx1151,
+        ),
+        (QsaKvFormat::F32, true) => (
+            built(PM_GFX1151, crate::kernels::QSA_GATHER_PM_GFX1151, "indexed_attention_kv_f16vb_pm_gfx1151"),
+            attend_gfx1151,
+        ),
+        (QsaKvFormat::Q8, _) => (
+            hip(GFX1151, INDEXED_ATTENTION_GATHERED_WMMA_SRC, "indexed_attention_kv_f16vb_q8"),
+            attend_gfx1151,
+        ),
+        (QsaKvFormat::Fp8, false) => (
+            hip(GFX1201, INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC, "indexed_attention_kv_f16vb_fp8_gfx1201"),
+            hip(GFX1201, INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC, "indexed_attention_gathered_wmma_f16_gfx1201"),
+        ),
+        (QsaKvFormat::Fp8, true) => (
+            built(PM_GFX1201, crate::kernels::QSA_GATHER_PM_GFX1201, "indexed_attention_kv_f16vb_fp8_pm_gfx1201"),
+            built(PM_GFX1201, crate::kernels::QSA_GATHER_PM_GFX1201, "indexed_attention_gathered_wmma_f16_pm_gfx1201"),
+        ),
+    };
+    let width = checked_product(p.n_kv_heads, 256, "QSA gathered KV width")?;
+    // The persistent arena has no per-launch convert kernel to ensure.
+    for (module, code, kernel) in [convert, attend]
+        .into_iter()
+        .skip(usize::from(arena.is_some()))
+    {
+        match code {
+            Ok(src) => {
+                gpu.ensure_kernel_public(module, src, kernel)?;
+            }
+            Err(image) => {
+                gpu.ensure_embedded_kernel(module, image, kernel)?;
+            }
+        }
+    }
+    let (convert, attend) = (convert.2, attend.2);
+    let (k16, vb16) = match arena {
+        // The persistent arena already holds every cache row below the ones
+        // this op appended; convert only those (and the partial block they
+        // continue), then attend straight from it.
+        Some(arena) => {
+            if p.format != QsaKvFormat::F32 {
+                return Err(HipError::new(0, &ComputeError::WrongDtype.to_string()));
+            }
+            qsa_f16_arena_sync(
+                gpu,
+                p.full_keys,
+                p.full_values,
+                arena,
+                p.n_kv_heads,
+                p.position_start,
+                end_position,
+                pm,
+            )?;
+            (arena.keys.buf.as_ptr(), arena.values.buf.as_ptr())
+        }
+        None => {
+            let k_elements = checked_product(end_position, width, "QSA gathered K")?;
+            let bytes = qsa_gathered_wmma_scratch_bytes(p.n_kv_heads, end_position)
+                .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
+            // Reserved for the whole cache (one stable address per model), mapped
+            // over this forward's prefix.
+            let reserve =
+                qsa_gathered_wmma_scratch_bytes(p.n_kv_heads, p.full_capacity.max(end_position))
+                    .ok_or_else(|| HipError::new(0, &ComputeError::WrongShape.to_string()))?;
+            let k16 = gpu.qsa_gather_scratch(bytes, reserve)?;
+            // V follows K: whole four-token blocks, the last one padded.
+            let vb16 = unsafe { (k16 as *mut u8).add(k_elements * 2) } as *mut std::ffi::c_void;
+            let tokens = checked_i32(end_position, "QSA gathered tokens")?;
+            let kv_heads = checked_i32(p.n_kv_heads, "QSA gathered KV heads")?;
+            let mut args = KernargBlob::new();
+            args.push_ptr(p.full_keys.buf.as_ptr());
+            args.push_ptr(p.full_values.buf.as_ptr());
+            args.push_ptr(k16);
+            args.push_ptr(vb16);
+            args.push_i32(tokens);
+            args.push_i32(kv_heads);
+            args.pad_to(16);
+            gpu.launch_blob_recorded(
+                convert,
+                [checked_u32(end_position, "QSA gathered token grid")?, p.n_kv_heads as u32, 1],
+                [256, 1, 1],
+                0,
+                args.as_mut_slice(),
+                crate::dispatch::ReplayLaunchBindings::NONE,
+            )?;
+            (k16, vb16)
+        }
+    };
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.q_with_gate.buf.as_ptr());
+    args.push_ptr(k16);
+    args.push_ptr(vb16);
+    args.push_ptr(p.selected.buf.as_ptr());
+    args.push_ptr(p.output.buf.as_ptr());
+    for (value, what) in [
+        (p.rows, "QSA gathered rows"),
+        (p.position_start, "QSA gathered position"),
+        (p.n_heads, "QSA gathered heads"),
+        (p.n_kv_heads, "QSA gathered KV heads"),
+        (p.budget_blocks, "QSA gathered budget"),
+        (p.compress, "QSA gathered compress"),
+        (p.capacity, "QSA gathered capacity"),
+        (p.full_capacity, "QSA gathered cache capacity"),
+    ] {
+        args.push_i32(checked_i32(value, what)?);
+    }
+    args.pad_to(16);
+    // The validated token list of the longest selection, in 128-entry tiles.
+    let lds = checked_u32(max_selected.div_ceil(128) * 128 * 4, "QSA gathered LDS")?;
+    gpu.launch_blob_recorded(
+        attend,
+        [
+            checked_u32(p.rows, "QSA gathered row grid")?,
+            checked_u32(p.n_kv_heads, "QSA gathered head grid")?,
+            1,
+        ],
+        [256, 1, 1],
+        lds,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
+/// Bring a QSA layer's persistent F16 arena up to `end_tokens` cache rows:
+/// the F32 cache rows `[align_down4(valid), end_tokens)` through the
+/// unchanged `indexed_attention_kv_f16vb` converter, where `valid` is the
+/// arena's valid prefix while the cache holds `committed` unchanged rows
+/// ([`QsaF16ArenaRef::valid`]). The converter's block-transposed V index uses
+/// the token's offset inside its grid, so starting the grid at a four-token
+/// boundary and offsetting the F32 inputs by `start * width * 4` bytes, the
+/// K output by `start * width * 2` and the V output by `start / 4` blocks of
+/// `width * 8` bytes makes the local layout equal the global one; at most
+/// three already-valid rows are reread. Records `end_tokens` as the valid
+/// prefix. Direct (unrecorded, uncaptured) launches only: the host start and
+/// length are baked into the launch.
+/// `pm` chooses the already-certified producer; callers must provide mapped
+/// F32 sources and F16 destinations. The byte oracle also uses this helper
+/// with an empty watermark for its independent whole-prefix reference.
+pub fn qsa_f16_arena_sync(
+    gpu: &mut Gpu,
+    full_keys: &GpuTensor,
+    full_values: &GpuTensor,
+    arena: &QsaF16ArenaRef<'_>,
+    n_kv_heads: usize,
+    committed: usize,
+    end_tokens: usize,
+    pm: bool,
+) -> HipResult<()> {
+    let valid = arena.valid(committed);
+    if end_tokens <= valid {
+        return Ok(());
+    }
+    if !gpu.arch_caps.is_gfx1151() || gpu.replay.is_recording() || gpu.graphs.capture_mode {
+        return Err(HipError::new(
+            0,
+            "QSA F16 arena sync needs a direct launch on gfx1151",
+        ));
+    }
+    ensure_f32(full_keys)?;
+    ensure_f32(full_values)?;
+    let width = checked_product(n_kv_heads, 256, "QSA F16 arena KV width")?;
+    let rows = checked_product(qsa_f16_arena_rows(end_tokens), width, "QSA F16 arena rows")?;
+    let source = checked_product(end_tokens, width, "QSA F16 arena source")?;
+    let arena_bytes = checked_product(rows, 2, "QSA F16 arena bytes")?;
+    let source_bytes = checked_product(source, 4, "QSA F16 arena source bytes")?;
+    if n_kv_heads == 0
+        || arena.keys.dtype != DType::F16
+        || arena.values.dtype != DType::F16
+        || arena.keys.numel() < rows
+        || arena.values.numel() < rows
+        || full_keys.numel() < source
+        || full_values.numel() < source
+        || full_keys.buf.size() < source_bytes
+        || full_values.buf.size() < source_bytes
+        || arena.keys.buf.size() < arena_bytes
+        || arena.values.buf.size() < arena_bytes
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let start = qsa_f16_arena_start(valid, committed);
+    let tokens = checked_i32(end_tokens - start, "QSA F16 arena tokens")?;
+    let kv_heads = checked_i32(n_kv_heads, "QSA F16 arena KV heads")?;
+    let offset = |base: *mut std::ffi::c_void, bytes: usize| -> HipResult<*mut std::ffi::c_void> {
+        Ok(unsafe { (base as *mut u8).add(bytes) } as *mut std::ffi::c_void)
+    };
+    let f32_offset = checked_product(start, width * 4, "QSA F16 arena source offset")?;
+    let k_offset = checked_product(start, width * 2, "QSA F16 arena K offset")?;
+    let v_offset = checked_product(start / 4, width * 8, "QSA F16 arena V offset")?;
+    let kernel = if pm {
+        let kernel = "indexed_attention_kv_f16vb_pm_gfx1151";
+        gpu.ensure_embedded_kernel(
+            "qsa_gather_pm_gfx1151",
+            crate::kernels::QSA_GATHER_PM_GFX1151,
+            kernel,
+        )?;
+        kernel
+    } else {
+        let kernel = "indexed_attention_kv_f16vb";
+        gpu.ensure_kernel_public(
+            "indexed_attention_gathered_wmma",
+            INDEXED_ATTENTION_GATHERED_WMMA_SRC,
+            kernel,
+        )?;
+        kernel
+    };
+    let mut args = KernargBlob::new();
+    args.push_ptr(offset(full_keys.buf.as_ptr(), f32_offset)?);
+    args.push_ptr(offset(full_values.buf.as_ptr(), f32_offset)?);
+    args.push_ptr(offset(arena.keys.buf.as_ptr(), k_offset)?);
+    args.push_ptr(offset(arena.values.buf.as_ptr(), v_offset)?);
+    args.push_i32(tokens);
+    args.push_i32(kv_heads);
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        kernel,
+        [checked_u32(end_tokens - start, "QSA F16 arena token grid")?, n_kv_heads as u32, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )?;
+    arena.valid_len.converted(end_tokens);
+    Ok(())
+}
+
 
 pub struct IndexedAttentionPool<'a> {
     pub raw_keys: &'a GpuTensor,
@@ -3908,6 +5429,47 @@ pub fn argmax_f32_host(gpu: &mut Gpu, logits: &GpuTensor) -> HipResult<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qsa_f16_arena_sizing_and_alignment() {
+        let arena = QsaStateLayout { f16_arena: true, ..QsaStateLayout::F32 };
+        assert_eq!(QsaStateLayout::F32.f16_arena_bytes_per_token(2, 256), 0);
+        assert_eq!(arena.f16_arena_bytes_per_token(2, 256), 2048);
+        for tokens in [0usize, 1, 2, 3, 4, 5, 8191, 8192, 8193, 262144] {
+            let rows = qsa_f16_arena_rows(tokens);
+            assert_eq!(rows % 4, 0);
+            assert!(rows >= tokens && rows - tokens < 4);
+        }
+        for committed in 0..1024 {
+            for valid in [0, committed, committed + 17] {
+                let start = qsa_f16_arena_start(valid, committed);
+                assert_eq!(start % 4, 0);
+                assert!(start <= valid.min(committed));
+                assert!(valid.min(committed) - start < 4);
+            }
+        }
+    }
+
+    #[test]
+    fn qsa_f16_arena_watermark_clamp_invalidate_and_move() {
+        let mark = QsaF16ValidLen::default();
+        assert_eq!(mark.get(), 0);
+        mark.converted(8193);
+        assert_eq!(mark.valid(8192), 8192);
+        mark.clamp(8191);
+        assert_eq!(mark.get(), 8191);
+        mark.clamp(9000); // A decode append does not claim converted rows.
+        assert_eq!(mark.get(), 8191);
+        assert_eq!(qsa_f16_arena_start(mark.get(), 8191), 8188);
+        mark.converted(9000);
+        let moved = mark; // Watermark moves with the storage owner.
+        assert_eq!(moved.get(), 9000);
+        moved.invalidate(); // Replaced prefix, reset, or failed append.
+        assert_eq!(moved.valid(9000), 0);
+        moved.converted(3);
+        moved.clamp(0);
+        assert_eq!(moved.get(), 0);
+    }
 
     fn try_gpu() -> Option<Gpu> {
         Gpu::init().ok()
@@ -4092,6 +5654,136 @@ mod tests {
         gpu.free_tensor(kernel).expect("free");
     }
 
+    /// The compact 1-D grid of the conv + parameter launch: the convolution
+    /// output and ring must equal the convolution-only launch, and gate / beta
+    /// the stand-alone batched parameter kernel's, with a ragged channel block
+    /// (300 channels), rows that are not multiples of 16, several row blocks
+    /// (3 .. 512) and several parameter blocks (the 48-head Flash-Next shape).
+    #[test]
+    fn gdn_conv_params_compact_grid_is_bit_identical_to_split_launches() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let (channels, heads) = (300usize, 48usize);
+        let mut kernel = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(1, channels * 4, 1.0)), &[channels * 4 * 2])
+            .expect("kernel");
+        kernel.dtype = DType::BF16;
+        kernel.shape = vec![channels * 4];
+        let mut a_log = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(11, heads, 1.0)), &[heads * 2])
+            .expect("a_log");
+        a_log.dtype = DType::BF16;
+        a_log.shape = vec![heads];
+        let mut dt_bias = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(12, heads, 1.0)), &[heads * 2])
+            .expect("dt_bias");
+        dt_bias.dtype = DType::BF16;
+        dt_bias.shape = vec![heads];
+        let history = test_wave(2, channels * 3, 2.0);
+        let bits = |gpu: &Gpu, t: &GpuTensor| -> Vec<u32> {
+            gpu.download_f32(t)
+                .expect("download")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        for (rows, start_cursor) in [(37usize, 2usize), (513, 1), (8192, 0)] {
+            let input = gpu
+                .upload_f32(&test_wave(3 + rows, rows * channels, 3.0), &[rows * channels])
+                .expect("input");
+            let a = gpu
+                .upload_f32(&test_wave(9, rows * heads, 2.0), &[rows * heads])
+                .expect("a");
+            let b = gpu
+                .upload_f32(&test_wave(10, rows * heads, 2.0), &[rows * heads])
+                .expect("b");
+            // Split launches: convolution only, then the stand-alone parameters.
+            let hist_a = gpu.upload_f32(&history, &[history.len()]).expect("hist");
+            let out_a = gpu.zeros(&[rows * channels], DType::F32).expect("out");
+            let gate_a = gpu.zeros(&[rows * heads], DType::F32).expect("gate");
+            let beta_a = gpu.zeros(&[rows * heads], DType::F32).expect("beta");
+            gated_delta_conv_batched(
+                &mut gpu,
+                &GatedDeltaConvBatched {
+                    input: &input,
+                    kernel: &kernel,
+                    history: &hist_a,
+                    output: &out_a,
+                    next_history: &hist_a,
+                    rows,
+                    channels,
+                    history_rows: 3,
+                    kernel_size: 4,
+                    start_cursor,
+                },
+            )
+            .expect("conv");
+            gated_delta_params_batched(
+                &mut gpu,
+                &GatedDeltaParamsBatched {
+                    a: &a,
+                    b: &b,
+                    a_log: &a_log,
+                    dt_bias: &dt_bias,
+                    gate: &gate_a,
+                    beta: &beta_a,
+                    rows,
+                    heads,
+                },
+            )
+            .expect("params");
+            // One launch over the compact grid.
+            let hist_b = gpu.upload_f32(&history, &[history.len()]).expect("hist");
+            let out_b = gpu.zeros(&[rows * channels], DType::F32).expect("out");
+            let gate_b = gpu.zeros(&[rows * heads], DType::F32).expect("gate");
+            let beta_b = gpu.zeros(&[rows * heads], DType::F32).expect("beta");
+            gated_delta_conv_params_batched(
+                &mut gpu,
+                &GatedDeltaConvBatched {
+                    input: &input,
+                    kernel: &kernel,
+                    history: &hist_b,
+                    output: &out_b,
+                    next_history: &hist_b,
+                    rows,
+                    channels,
+                    history_rows: 3,
+                    kernel_size: 4,
+                    start_cursor,
+                },
+                &GatedDeltaParamsBatched {
+                    a: &a,
+                    b: &b,
+                    a_log: &a_log,
+                    dt_bias: &dt_bias,
+                    gate: &gate_b,
+                    beta: &beta_b,
+                    rows,
+                    heads,
+                },
+            )
+            .expect("conv + params");
+            assert!(
+                bits(&gpu, &gate_a).iter().any(|v| *v != 0),
+                "rows {rows}: gate reference is all zero"
+            );
+            assert_eq!(bits(&gpu, &out_a), bits(&gpu, &out_b), "rows {rows}: output");
+            assert_eq!(bits(&gpu, &hist_a), bits(&gpu, &hist_b), "rows {rows}: history");
+            assert_eq!(bits(&gpu, &gate_a), bits(&gpu, &gate_b), "rows {rows}: gate");
+            assert_eq!(bits(&gpu, &beta_a), bits(&gpu, &beta_b), "rows {rows}: beta");
+            for tensor in [
+                input, a, b, hist_a, out_a, gate_a, beta_a, hist_b, out_b, gate_b, beta_b,
+            ] {
+                gpu.free_tensor(tensor).expect("free");
+            }
+        }
+        for tensor in [kernel, a_log, dt_bias] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
     /// The fused HC norm + BF16 gate projection must equal hyper_norm followed
     /// by the multi-row BF16 GEMM bit for bit, at the production width.
     #[test]
@@ -4171,6 +5863,125 @@ mod tests {
         for tensor in [input, norm, gate_weight, fused, normalized, reference] {
             gpu.free_tensor(tensor).expect("free");
         }
+    }
+
+    /// H4 read side: `hyper_norm_gate_outputs` stores, bytewise, the gates of
+    /// `hyper_norm_gate` and the F16 normalized row of `hyper_norm_f16`, for F32
+    /// streams and for BF16-bit streams, over ragged row counts.
+    #[test]
+    fn hyper_norm_gate_outputs_is_bytewise_the_norm_gate_and_norm_f16_pair() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.has_gfx11_plus_simt() {
+            eprintln!("skip: needs gfx11+ wave32");
+            return;
+        }
+        let (branches, hidden) = (4usize, 2560usize);
+        let wide = branches * hidden;
+        let norm = {
+            let mut t = gpu
+                .upload_raw(&bf16_le_bytes(&test_wave(2, wide, 0.5)), &[wide * 2])
+                .expect("norm");
+            t.dtype = DType::BF16;
+            t.shape = vec![wide];
+            t
+        };
+        let gate_weight = {
+            let mut t = gpu
+                .upload_raw(&bf16_le_bytes(&test_wave(3, branches * wide, 0.05)), &[branches * wide * 2])
+                .expect("gate weight");
+            t.dtype = DType::BF16;
+            t.shape = vec![branches * wide];
+            t
+        };
+        let bytes = |gpu: &Gpu, t: &GpuTensor| -> Vec<u8> {
+            let mut out = vec![0u8; t.byte_size()];
+            gpu.hip.memcpy_dtoh(&mut out, &t.buf).expect("download");
+            out
+        };
+        for rows in [1usize, 37, 512, 530] {
+            for state_bf16 in [false, true] {
+                let values = test_wave(1, rows * wide, 3.0);
+                let input = if state_bf16 {
+                    // BF16 bits in the first half of an F32-typed buffer.
+                    let mut raw = bf16_le_bytes(&values);
+                    raw.resize(rows * wide * 4, 0);
+                    gpu.upload_raw(&raw, &[rows * wide * 4])
+                        .map(|mut t| {
+                            t.dtype = DType::F32;
+                            t.shape = vec![rows * wide];
+                            t
+                        })
+                        .expect("input")
+                } else {
+                    gpu.upload_f32(&values, &[rows * wide]).expect("input")
+                };
+                let gates_ref = gpu.zeros(&[rows * branches], DType::F32).expect("gates");
+                let x16_ref = gpu.zeros(&[rows * wide], DType::F16).expect("x16");
+                let normalized = gpu.zeros(&[rows * wide], DType::F32).expect("normalized");
+                hyper_norm_gate(
+                    &mut gpu,
+                    &HyperNormGate {
+                        input: &input,
+                        norm_weight: &norm,
+                        gate_weight: &gate_weight,
+                        gates: &gates_ref,
+                        rows,
+                        branches,
+                        hidden,
+                        state_bf16,
+                    },
+                )
+                .expect("norm gate");
+                hyper_norm_f16(
+                    &mut gpu,
+                    &HyperNorm {
+                        input: &input,
+                        norm_weight: &norm,
+                        normalized: &normalized,
+                        branches,
+                        hidden,
+                        state_bf16,
+                    },
+                    &x16_ref,
+                    false,
+                )
+                .expect("norm f16");
+                let gates = gpu.zeros(&[rows * branches], DType::F32).expect("gates");
+                let x16 = gpu.zeros(&[rows * wide], DType::F16).expect("x16");
+                hyper_norm_gate_outputs(
+                    &mut gpu,
+                    &HyperNormGateOutputs {
+                        input: &input,
+                        norm_weight: &norm,
+                        gate_weight: &gate_weight,
+                        gates: &gates,
+                        normalized_f16: &x16,
+                        rows,
+                        branches,
+                        hidden,
+                        state_bf16,
+                    },
+                )
+                .expect("outputs");
+                assert!(
+                    bytes(&gpu, &gates) == bytes(&gpu, &gates_ref),
+                    "{rows} rows bf16={state_bf16}: gates differ"
+                );
+                assert!(
+                    bytes(&gpu, &x16) == bytes(&gpu, &x16_ref),
+                    "{rows} rows bf16={state_bf16}: F16 normalized row differs"
+                );
+                assert!(bytes(&gpu, &gates).iter().any(|b| *b != 0), "gates are all zero");
+                for tensor in [input, gates_ref, x16_ref, normalized, gates, x16] {
+                    gpu.free_tensor(tensor).expect("free");
+                }
+            }
+        }
+        gpu.free_tensor(norm).expect("free");
+        gpu.free_tensor(gate_weight).expect("free");
     }
 
     /// HC streams stored as BF16 bits (the Qwen4 F16 prefill route) must give
@@ -4479,6 +6290,30 @@ mod tests {
                 differ * 100 < reference.len(),
                 "WMMA HC read: {differ} differ"
             );
+            // H3: the retiled operand-swapped entries are bytewise the
+            // baseline entries' (also at the ragged row count 131).
+            let tiled_out = gpu.zeros(&[rows * hidden], DType::F32).expect("tiled");
+            hyper_read_up_wmma_tiled(
+                &mut gpu,
+                &HyperReadUpFused {
+                    up_weight: &up_weight,
+                    low: &low_bf16,
+                    normalized: &normalized_f16,
+                    mixed: &tiled_out,
+                    rows,
+                    hidden,
+                    low_rank,
+                    normalized_bf16: true,
+                },
+                true,
+            )
+            .expect("tiled wmma");
+            assert_eq!(
+                bits(&gpu, &tiled_out),
+                bits(&gpu, &wmma),
+                "retiled HC read differs from the baseline entry"
+            );
+            gpu.free_tensor(tiled_out).expect("free");
             gpu.free_tensor(normalized_f16).expect("free");
             gpu.free_tensor(low_bf16).expect("free");
         }
@@ -4495,6 +6330,74 @@ mod tests {
             norm_weight,
         ] {
             gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
+    /// The few-row BF16 K4 GEMV (Qwen4 HC write gates and read down in a
+    /// 2..=8-row MTP verify) must give every row bitwise the single-row decode
+    /// kernel's value, with and without the HC activation epilogue: greedy
+    /// MTP == AR rests on a verify row reproducing its decode row.
+    #[test]
+    fn gemv_bf16_k4_rows_are_bit_identical_to_single_row() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let wave = |seed: usize, n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let h = i.wrapping_mul(2_654_435_761).wrapping_add(seed * 131) % 8191;
+                    (h as f32 - 4095.0) / 4095.0 * scale
+                })
+                .collect()
+        };
+        let bits = |gpu: &Gpu, t: &GpuTensor| -> Vec<u32> {
+            gpu.download_f32(t)
+                .expect("download")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        // (M, K): HC write gates (4 x 4*2560) and an HC read down (320 x 4*2560).
+        for (m, k) in [(4usize, 10240usize), (320, 10240)] {
+            let bytes: Vec<u8> = wave(1, m * k, 0.05)
+                .iter()
+                .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect();
+            let mut weight = gpu.upload_raw(&bytes, &[bytes.len()]).expect("weight");
+            weight.dtype = DType::BF16;
+            weight.shape = vec![m * k];
+            let x = gpu.upload_f32(&wave(2, 8 * k, 1.5), &[8 * k]).expect("x");
+            for act in [None, Some(0.25f32)] {
+                let single = gpu.zeros(&[8 * m], DType::F32).expect("single");
+                for row in 0..8 {
+                    gpu.gemv_bf16_xf32_k4(
+                        &weight,
+                        &x.sub_offset(row * k, k),
+                        &single.sub_offset(row * m, m),
+                        m,
+                        k,
+                        act,
+                    )
+                    .expect("k4");
+                }
+                let expected = bits(&gpu, &single);
+                assert!(expected.iter().any(|v| *v != 0), "single-row output is all zero");
+                for rows in 2..=8usize {
+                    let multi = gpu.zeros(&[rows * m], DType::F32).expect("multi");
+                    gpu.gemv_bf16_xf32_k4_rows(&weight, &x, &multi, m, k, act, rows)
+                        .expect("k4 rows");
+                    assert_eq!(
+                        bits(&gpu, &multi),
+                        expected[..rows * m],
+                        "M={m} K={k} rows={rows} act={act:?}"
+                    );
+                    gpu.free_tensor(multi).expect("free");
+                }
+                gpu.free_tensor(single).expect("free");
+            }
+            gpu.free_tensor(x).expect("free");
+            gpu.free_tensor(weight).expect("free");
         }
     }
 
@@ -4604,6 +6507,154 @@ mod tests {
             row_state,
             row_out,
         ] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
+    /// gfx1201's register-resident `gated_delta_step_pipe128_{f32,q8}` must
+    /// equal the persistent256 kernel byte for byte (output, final F32 state,
+    /// and the Q8 codes and scales), across the 256-row parameter-block
+    /// boundary and ragged row counts, on a nonzero random start state at a
+    /// nonzero position.  Both kernels are launched by name, so the
+    /// `HIPFIRE_QWEN4_GDN_PIPE` selection is not under test.  gfx1201 only.
+    #[test]
+    fn gdn_pipe128_is_bytewise_the_persistent256_kernel() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if gpu.arch != "gfx1201" {
+            eprintln!("skip: gfx1201 only (arch {})", gpu.arch);
+            return;
+        }
+        let (key_heads, value_heads, dim) = (16usize, 48usize, 128usize);
+        let row_counts = [1usize, 2, 3, 255, 256, 257, 511, 513, 1000];
+        let max_rows = 1000usize;
+        let position = 37usize;
+        let qk = key_heads * dim;
+        let value = value_heads * dim;
+        let qkv = 2 * qk + value;
+        let slot_bytes = GdnStateFormat::Q8.state_units(value_heads, dim, dim);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut unit = move || -> f32 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let projection: Vec<f32> =
+            (0..max_rows * qkv).map(|_| (unit() * 2.0 - 1.0) * 1.5).collect();
+        let gate: Vec<f32> = (0..max_rows * value_heads).map(|_| -3.0 * unit()).collect();
+        let beta: Vec<f32> = (0..max_rows * value_heads).map(|_| unit()).collect();
+        let state0: Vec<f32> = (0..value * dim).map(|_| (unit() * 2.0 - 1.0) * 0.2).collect();
+        let proj_gpu = gpu.upload_f32(&projection, &[projection.len()]).expect("projection");
+        let gate_gpu = gpu.upload_f32(&gate, &[gate.len()]).expect("gate");
+        let beta_gpu = gpu.upload_f32(&beta, &[beta.len()]).expect("beta");
+        let state0_gpu = gpu.upload_f32(&state0, &[state0.len()]).expect("state0");
+        let slot0 = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
+        gdn_state_convert(
+            &mut gpu,
+            "gdn_state_f32_to_q8",
+            state0_gpu.buf.as_ptr(),
+            slot0.buf.as_ptr(),
+            value_heads,
+            Some(7),
+        )
+        .expect("quantize");
+
+        let launch = |gpu: &mut Gpu,
+                      kernel: &str,
+                      threads: u32,
+                      q8: bool,
+                      state: &GpuTensor,
+                      output: &GpuTensor,
+                      rows: usize| {
+            gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel).expect("kernel");
+            let mut args = KernargBlob::new();
+            for tensor in [&proj_gpu, &gate_gpu, &beta_gpu, state, output] {
+                args.push_ptr(tensor.buf.as_ptr());
+            }
+            args.push_i32(rows as i32);
+            args.push_i32(qkv as i32);
+            args.push_i32(key_heads as i32);
+            args.push_i32(value_heads as i32);
+            args.push_i32(dim as i32);
+            args.push_i32(dim as i32);
+            args.push_f32((dim as f32).sqrt().recip());
+            if q8 {
+                args.push_u32((position + rows - 1) as u32);
+            }
+            args.pad_to(16);
+            gpu.launch_blob_recorded(
+                kernel,
+                [value_heads as u32, 1, 1],
+                [threads, 1, 1],
+                0,
+                args.as_mut_slice(),
+                crate::dispatch::ReplayLaunchBindings::NONE,
+            )
+            .expect("launch");
+        };
+        for &rows in &row_counts {
+            for q8 in [false, true] {
+                let fresh = |gpu: &mut Gpu| -> GpuTensor {
+                    if q8 {
+                        let slot = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
+                        gpu.copy_d2d(&slot0, &slot, slot_bytes).expect("copy slot");
+                        slot
+                    } else {
+                        gpu.upload_f32(&state0, &[state0.len()]).expect("state")
+                    }
+                };
+                let (old_kernel, new_kernel) = if q8 {
+                    (
+                        "gated_delta_step_halves_state128_persistent256_q8",
+                        "gated_delta_step_pipe128_q8",
+                    )
+                } else {
+                    (
+                        "gated_delta_step_halves_state128_persistent256_f32",
+                        "gated_delta_step_pipe128_f32",
+                    )
+                };
+                let old_state = fresh(&mut gpu);
+                let old_out = gpu.zeros(&[rows * value], DType::F32).expect("output");
+                launch(&mut gpu, old_kernel, 256, q8, &old_state, &old_out, rows);
+                let new_state = fresh(&mut gpu);
+                let new_out = gpu.zeros(&[rows * value], DType::F32).expect("output");
+                launch(&mut gpu, new_kernel, 128, q8, &new_state, &new_out, rows);
+
+                let old_out_bytes = gpu.download_raw_bytes(&old_out).expect("download");
+                let new_out_bytes = gpu.download_raw_bytes(&new_out).expect("download");
+                let old_state_bytes = gpu.download_raw_bytes(&old_state).expect("download");
+                let new_state_bytes = gpu.download_raw_bytes(&new_state).expect("download");
+                let start_bytes = if q8 {
+                    gpu.download_raw_bytes(&slot0).expect("download")
+                } else {
+                    gpu.download_raw_bytes(&state0_gpu).expect("download")
+                };
+                assert!(
+                    old_out_bytes.iter().any(|b| *b != 0),
+                    "{rows} rows q8={q8}: reference output is all zero"
+                );
+                assert_ne!(
+                    old_state_bytes, start_bytes,
+                    "{rows} rows q8={q8}: reference left the state untouched"
+                );
+                assert!(
+                    old_out_bytes == new_out_bytes,
+                    "{rows} rows q8={q8}: pipe128 output differs from persistent256"
+                );
+                assert!(
+                    old_state_bytes == new_state_bytes,
+                    "{rows} rows q8={q8}: pipe128 final state differs from persistent256"
+                );
+                for tensor in [old_state, old_out, new_state, new_out] {
+                    gpu.free_tensor(tensor).expect("free");
+                }
+            }
+        }
+        for tensor in [proj_gpu, gate_gpu, beta_gpu, state0_gpu, slot0] {
             gpu.free_tensor(tensor).expect("free");
         }
     }
@@ -4743,12 +6794,265 @@ mod tests {
         }
     }
 
+    /// Repeated single-row Q8 decode ([`gated_delta_step`], AR's route) of
+    /// the first `n` rows of a packed `[rows, qkv]` projection on `slot`, row
+    /// `r` at absolute position `start + r`: every row's recurrence output,
+    /// and the slot's bytes after every row. The token-exact oracle for the
+    /// verify capture and its rollback.
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_q8_sequential(
+        gpu: &mut Gpu,
+        projection: &GpuTensor,
+        gate: &GpuTensor,
+        beta: &GpuTensor,
+        slot: &GpuTensor,
+        n: usize,
+        start: usize,
+        key_heads: usize,
+        value_heads: usize,
+    ) -> (Vec<f32>, Vec<Vec<u8>>) {
+        let (qk, value) = (key_heads * 128, value_heads * 128);
+        let qkv = 2 * qk + value;
+        let out = gpu.zeros(&[n * value], DType::F32).expect("output");
+        let mut states = Vec::with_capacity(n);
+        for row in 0..n {
+            gated_delta_step(
+                gpu,
+                &GatedDeltaStep {
+                    q: &projection.sub_offset(row * qkv, qk),
+                    k: &projection.sub_offset(row * qkv + qk, qk),
+                    v: &projection.sub_offset(row * qkv + 2 * qk, value),
+                    gate: &gate.sub_offset(row * value_heads, value_heads),
+                    beta: &beta.sub_offset(row * value_heads, value_heads),
+                    state: slot,
+                    output: &out.sub_offset(row * value, value),
+                    key_heads,
+                    value_heads,
+                    key_dim: 128,
+                    value_dim: 128,
+                    position: start + row,
+                },
+            )
+            .expect("GDN step");
+            gpu.hip.device_synchronize().expect("sync");
+            let mut bytes = vec![0u8; slot.byte_size()];
+            gpu.hip.memcpy_dtoh(&mut bytes, &slot.buf).expect("download");
+            states.push(bytes);
+        }
+        let values = gpu.download_f32(&out).expect("download");
+        gpu.free_tensor(out).expect("free");
+        (values, states)
+    }
+
+    /// Verify capture and rollback on a Q8 state are token-exact: from a
+    /// nonzero seed state at a nonzero absolute position, a 2..8-row captured
+    /// window's recurrence output and its ring slot, and every kept prefix's
+    /// rollback state and output, equal repeated single-row decode (AR) at
+    /// the same positions bit for bit; the live state and the rollback's
+    /// source slot stay untouched. A HIP-graph replay of the same launches
+    /// meets the same sequential oracle.
+    #[test]
+    fn gdn_q8_verify_matches_single_row() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let (key_heads, value_heads, dim, max_rows) = (2usize, 6usize, 128usize, 8usize);
+        // Nonzero: every Q8 rounding is seeded by the absolute position.
+        let start = 1157usize;
+        let qk = key_heads * dim;
+        let value = value_heads * dim;
+        let qkv = 2 * qk + value;
+        let format = GdnStateFormat::Q8;
+        let slot_bytes = format.state_units(value_heads, dim, dim);
+        let wave = |seed: usize, n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let h = i.wrapping_mul(2_654_435_761).wrapping_add(seed * 97) % 10007;
+                    (h as f32 - 5003.0) / 5003.0 * scale
+                })
+                .collect()
+        };
+        let projection = wave(11, max_rows * qkv, 1.5);
+        let gate: Vec<f32> =
+            wave(12, max_rows * value_heads, 0.5).iter().map(|g| g - 0.6).collect();
+        let beta: Vec<f32> =
+            wave(13, max_rows * value_heads, 0.45).iter().map(|b| b + 0.5).collect();
+        let state0 = wave(14, value * dim, 0.2);
+        let proj_gpu = gpu.upload_f32(&projection, &[projection.len()]).expect("projection");
+        let gate_gpu = gpu.upload_f32(&gate, &[gate.len()]).expect("gate");
+        let beta_gpu = gpu.upload_f32(&beta, &[beta.len()]).expect("beta");
+        let state0_gpu = gpu.upload_f32(&state0, &[state0.len()]).expect("state0");
+        let slot0 = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
+        gdn_state_convert(&mut gpu, "gdn_state_f32_to_q8", state0_gpu.buf.as_ptr(), slot0.buf.as_ptr(), value_heads, Some(start as u32 - 1))
+            .expect("quantize");
+        let bytes = |gpu: &Gpu, t: &GpuTensor| -> Vec<u8> {
+            gpu.hip.device_synchronize().expect("sync");
+            let mut out = vec![0u8; t.byte_size()];
+            gpu.hip.memcpy_dtoh(&mut out, &t.buf).expect("download");
+            out
+        };
+        let seed_bytes = bytes(&gpu, &slot0);
+        assert!(seed_bytes.iter().any(|b| *b != 0), "seed state is zero");
+        let fresh_slot = |gpu: &mut Gpu| -> GpuTensor {
+            let slot = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
+            gpu.copy_d2d(&slot0, &slot, slot_bytes).expect("copy slot");
+            slot
+        };
+        gpu.ensure_capture_stream().expect("stream");
+
+        // Every mismatch is collected, then asserted, so one run reports
+        // exactly which rows and prefixes leave the sequential oracle.
+        let mut failures: Vec<String> = Vec::new();
+        for graph in [false, true] {
+            for n in 2..=max_rows {
+                let oracle_slot = fresh_slot(&mut gpu);
+                let (seq_out, seq_states) = gdn_q8_sequential(
+                    &mut gpu, &proj_gpu, &gate_gpu, &beta_gpu, &oracle_slot, n, start, key_heads,
+                    value_heads,
+                );
+
+                let live = fresh_slot(&mut gpu);
+                let out = gpu.zeros(&[n * value], DType::F32).expect("output");
+                // Ring: slot 0 the rollback source (the pre-verify state), the
+                // capture lands in slot n - 1, rollback `keep` in n + keep - 1.
+                let ring = gpu.zeros(&[2 * n * slot_bytes], DType::Raw).expect("ring");
+                gpu.copy_d2d(&slot0, &ring, slot_bytes).expect("seed ring");
+                let recurrence: Vec<f32> = projection[..n * qkv]
+                    .iter()
+                    .chain(&gate[..n * value_heads])
+                    .chain(&beta[..n * value_heads])
+                    .copied()
+                    .collect();
+                let recurrence_gpu =
+                    gpu.upload_f32(&recurrence, &[recurrence.len()]).expect("recurrence");
+                let pointers: Vec<u8> = [recurrence_gpu.buf.as_ptr(), ring.buf.as_ptr()]
+                    .iter()
+                    .flat_map(|p| (*p as u64).to_ne_bytes())
+                    .collect();
+                let table = gpu.upload_raw(&pointers, &[pointers.len()]).expect("table");
+                // One `[keep, value]` output region per kept prefix.
+                let discard = gpu.zeros(&[n * n * value], DType::F32).expect("discard");
+                let launch = |gpu: &mut Gpu| {
+                    gated_delta_step_batched(
+                        gpu,
+                        &GatedDeltaStepBatched {
+                            projection: &proj_gpu.sub_offset(0, n * qkv),
+                            gate: &gate_gpu.sub_offset(0, n * value_heads),
+                            beta: &beta_gpu.sub_offset(0, n * value_heads),
+                            state: &live,
+                            output: &out,
+                            row_states: Some(&ring),
+                            rows: n,
+                            qkv_width: qkv,
+                            key_heads,
+                            value_heads,
+                            key_dim: dim,
+                            value_dim: dim,
+                            position: start,
+                        },
+                    )
+                    .expect("captured verify");
+                    for keep in 1..=n {
+                        gated_delta_rollback_layers(
+                            gpu,
+                            &GatedDeltaRollbackLayers {
+                                table: &table,
+                                discard: &discard.sub_offset((keep - 1) * n * value, keep * value),
+                                format,
+                                layers: 1,
+                                rows: n,
+                                keep,
+                                from: 0,
+                                to: n,
+                                qkv_width: qkv,
+                                key_heads,
+                                value_heads,
+                                position: start + keep - 1,
+                            },
+                        )
+                        .expect("rollback");
+                    }
+                };
+                if graph {
+                    // Kernels are warm from the direct pass; the capture only
+                    // records, so the buffers above are what the replay sees.
+                    let stream = gpu.active_stream.take().expect("stream");
+                    gpu.graphs.begin_graph_capture(&gpu.hip, gpu.device_id, &stream).expect("begin capture");
+                    gpu.active_stream = Some(stream);
+                    launch(&mut gpu);
+                    let stream = gpu.active_stream.take().expect("stream");
+                    gpu.graphs.end_graph_capture(&gpu.hip, gpu.device_id, &stream).expect("end capture");
+                    gpu.graphs.graph_launch(&gpu.hip, gpu.device_id, &stream).expect("replay");
+                    gpu.active_stream = Some(stream);
+                    gpu.hip.device_synchronize().expect("sync");
+                    gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);
+                } else {
+                    launch(&mut gpu);
+                }
+
+                let tag = format!("{} n={n}", if graph { "graph" } else { "direct" });
+                gpu.hip.device_synchronize().expect("sync");
+                let verify_out = gpu.download_f32(&out).expect("download");
+                let row_diff = |a: &[f32], b: &[f32]| -> Vec<(usize, usize)> {
+                    (0..a.len() / value)
+                        .map(|r| {
+                            let (x, y) = (&a[r * value..][..value], &b[r * value..][..value]);
+                            (r, x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count())
+                        })
+                        .filter(|(_, d)| *d > 0)
+                        .collect()
+                };
+                let diff = row_diff(&verify_out, &seq_out);
+                if !diff.is_empty() {
+                    failures.push(format!("{tag}: verify output (row, differing f32s) {diff:?}"));
+                }
+                let slot_diff = |a: &[u8], b: &[u8]| a.iter().zip(b).filter(|(p, q)| p != q).count();
+                let captured = bytes(&gpu, &ring.sub_offset((n - 1) * slot_bytes, slot_bytes));
+                let d = slot_diff(&captured, &seq_states[n - 1]);
+                if d > 0 {
+                    failures.push(format!("{tag}: captured slot differs from AR in {d} bytes"));
+                }
+                if bytes(&gpu, &live) != seed_bytes {
+                    failures.push(format!("{tag}: capture wrote the live state"));
+                }
+                if bytes(&gpu, &ring.sub_offset(0, slot_bytes)) != seed_bytes {
+                    failures.push(format!("{tag}: rollback wrote its source slot"));
+                }
+                let rollback_out = gpu.download_f32(&discard).expect("download");
+                for keep in 1..=n {
+                    let kept = bytes(&gpu, &ring.sub_offset((n + keep - 1) * slot_bytes, slot_bytes));
+                    let d = slot_diff(&kept, &seq_states[keep - 1]);
+                    if d > 0 {
+                        failures.push(format!("{tag} keep={keep}: rollback slot differs from AR in {d} bytes"));
+                    }
+                    let diff = row_diff(&rollback_out[(keep - 1) * n * value..][..keep * value], &seq_out[..keep * value]);
+                    if !diff.is_empty() {
+                        failures.push(format!("{tag} keep={keep}: rollback output (row, differing f32s) {diff:?}"));
+                    }
+                }
+                for tensor in [oracle_slot, live, out, ring, recurrence_gpu, table, discard] {
+                    gpu.free_tensor(tensor).expect("free");
+                }
+            }
+        }
+        for failure in &failures {
+            eprintln!("GDN_Q8_SEAM {failure}");
+        }
+        assert!(failures.is_empty(), "{} Q8 verify/rollback seams leave AR", failures.len());
+        for tensor in [proj_gpu, gate_gpu, beta_gpu, state0_gpu, slot0] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
     /// Q8 GDN state (Qwen3.5's DeltaNet Q8 format): every route tracks its
     /// F32 twin (decode steps, the persistent batch, the chunked prefill),
-    /// the verify capture writes exactly the plain batch's final state into
-    /// its ring slot, and a rollback re-run of the kept rows writes exactly
-    /// the state a plain batch over those rows does. A transposed row, a
-    /// wrong scale or a slot offset lands near 1.
+    /// and the verify capture and a rollback re-run of its kept rows are
+    /// token-exact with single-row decode (AR): the captured output and ring
+    /// slot, and the rollback slot, equal decode steps from the same state at
+    /// the same positions, bit for bit (the unarmed batch requantizes once,
+    /// so it is not their oracle). A transposed row, a wrong scale or a slot
+    /// offset lands near 1.
     #[test]
     fn gdn_q8_state_tracks_f32_on_every_route() {
         let Some(mut gpu) = try_gpu() else {
@@ -4906,19 +7210,30 @@ mod tests {
             );
             fold(&bytes(&gpu, &q8_batch_state));
 
+            // Verify capture: AR's tokens, not the unarmed batch. Its output
+            // and ring slot are `n` single-row decode steps from the same
+            // state at the same positions, bit for bit.
+            let oracle_slot = fresh_slot(&mut gpu);
+            let (seq_out, seq_states) = gdn_q8_sequential(
+                &mut gpu, &proj_gpu, &gate_gpu, &beta_gpu, &oracle_slot, n, 0, key_heads,
+                value_heads,
+            );
             let captured_state = fresh_slot(&mut gpu);
             let ring = gpu.zeros(&[2 * n * slot_bytes], DType::Raw).expect("ring");
             let captured_out = batch(&mut gpu, &captured_state, Some(&ring), n);
-            assert_eq!(captured_out, q8_batch_out, "{n} rows: captured verify output differs");
+            assert!(
+                captured_out.iter().zip(&seq_out).all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{n} rows: captured verify output is not single-row decode's"
+            );
             assert_eq!(
                 bytes(&gpu, &captured_state),
                 bytes(&gpu, &slot0),
                 "{n} rows: capture wrote the live state"
             );
-            assert_eq!(
-                bytes(&gpu, &ring.sub_offset((n - 1) * slot_bytes, slot_bytes)),
-                bytes(&gpu, &q8_batch_state),
-                "{n} rows: captured slot is not the plain batch's final state"
+            assert!(
+                bytes(&gpu, &ring.sub_offset((n - 1) * slot_bytes, slot_bytes))
+                    == seq_states[n - 1],
+                "{n} rows: captured slot is not single-row decode's state"
             );
 
             // Rollback: `keep` rows re-run from ring slot 0 into slot `n`. Its
@@ -4956,17 +7271,15 @@ mod tests {
                 },
             )
             .expect("rollback");
-            let kept_state = fresh_slot(&mut gpu);
-            batch(&mut gpu, &kept_state, None, keep);
-            assert_eq!(
-                bytes(&gpu, &ring.sub_offset((n + keep - 1) * slot_bytes, slot_bytes)),
-                bytes(&gpu, &kept_state),
-                "{n} rows: rollback slot is not the kept rows' state"
+            assert!(
+                bytes(&gpu, &ring.sub_offset((n + keep - 1) * slot_bytes, slot_bytes))
+                    == seq_states[keep - 1],
+                "{n} rows: rollback slot is not single-row decode's state after {keep} rows"
             );
-            fold(&bytes(&gpu, &kept_state));
+            fold(&seq_states[keep - 1]);
             for tensor in [
-                f32_batch_state, q8_batch_state, captured_state, ring, recurrence_gpu, table,
-                discard, kept_state,
+                f32_batch_state, q8_batch_state, oracle_slot, captured_state, ring,
+                recurrence_gpu, table, discard,
             ] {
                 gpu.free_tensor(tensor).expect("free");
             }
@@ -5105,6 +7418,388 @@ mod tests {
         }
         eprintln!("GDN_Q8_CHUNK_DIGEST {digest:016x}");
         for tensor in [proj_bf16, gate_gpu, beta_gpu, z_gpu, norm_gpu, state0_gpu, seed_slot] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
+    /// Round-to-nearest-even BF16 bits of `values`, little-endian.
+    fn bf16_le_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|v| {
+                let u = v.to_bits();
+                (((u + 0x7FFF + ((u >> 16) & 1)) >> 16) as u16).to_le_bytes()
+            })
+            .collect()
+    }
+
+    fn test_wave(seed: usize, n: usize, scale: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let h = i.wrapping_mul(2_654_435_761).wrapping_add(seed * 97) % 10007;
+                (h as f32 - 5003.0) / 5003.0 * scale
+            })
+            .collect()
+    }
+
+    /// H5 hookup: the opt-in convolution that also stores the normalized Q/K
+    /// plus the Q/K-norm-skipping chunk launch is bytewise the plain
+    /// convolution + `gated_delta_qk_norm_bf16_batched` + chunk launch pair:
+    /// gated output, final state, convolution ring, gate/beta and the V
+    /// columns of the convolution output (all columns with `keep_qk_conv`).
+    /// Ragged last row tile, a nonzero ring cursor and the in-place ring the
+    /// pipeline uses.  The flag is off by default, and the geometry guards
+    /// refuse every other head layout.
+    #[test]
+    fn gdn_conv_qknorm_hookup_is_bytewise_the_two_launch_pair() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1151() || !*crate::gemm::QWEN4_F16_WMMA {
+            eprintln!("skip: needs gfx1151 and the F16 WMMA route");
+            return;
+        }
+        // 530: ragged last row tile (34 row blocks); 8192: the Flash-Next
+        // prefill chunk (512 row blocks), where the compact 1-D conv grid is
+        // 24 channel blocks x 512 row blocks + 512 parameter blocks.
+        for rows in [530usize, 8192] {
+            gdn_conv_qknorm_hookup_case(&mut gpu, rows);
+        }
+    }
+
+    fn gdn_conv_qknorm_hookup_case(gpu: &mut Gpu, rows: usize) {
+        let (key_heads, value_heads, dim) = (16usize, 16usize, 128usize);
+        let qk = key_heads * dim;
+        let value = value_heads * dim;
+        let qkv = 2 * qk + value;
+        let projection = gpu
+            .upload_f32(&test_wave(1, rows * qkv, 1.5), &[rows * qkv])
+            .expect("projection");
+        let mut conv_kernel = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(7, qkv * 4, 0.6)), &[qkv * 4 * 2])
+            .expect("conv kernel");
+        conv_kernel.dtype = DType::BF16;
+        conv_kernel.shape = vec![qkv * 4];
+        let history0 = test_wave(8, 3 * qkv, 1.0);
+        let a = gpu
+            .upload_f32(&test_wave(9, rows * value_heads, 2.0), &[rows * value_heads])
+            .expect("a");
+        let b = gpu
+            .upload_f32(&test_wave(10, rows * value_heads, 2.0), &[rows * value_heads])
+            .expect("b");
+        let mut a_log = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(11, value_heads, 1.0)), &[value_heads * 2])
+            .expect("a_log");
+        a_log.dtype = DType::BF16;
+        a_log.shape = vec![value_heads];
+        let mut dt_bias = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(12, value_heads, 1.0)), &[value_heads * 2])
+            .expect("dt_bias");
+        dt_bias.dtype = DType::BF16;
+        dt_bias.shape = vec![value_heads];
+        let state0 = test_wave(4, value_heads * dim * dim, 0.2);
+        let z = gpu
+            .upload_f32(&test_wave(5, rows * value, 2.0), &[rows * value])
+            .expect("z");
+        let mut norm = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(6, dim, 1.0)), &[dim * 2])
+            .expect("norm");
+        norm.dtype = DType::BF16;
+        norm.shape = vec![dim];
+        let bytes = |gpu: &Gpu, t: &GpuTensor| -> Vec<u8> {
+            let mut out = vec![0u8; t.byte_size()];
+            gpu.hip.memcpy_dtoh(&mut out, &t.buf).expect("download");
+            out
+        };
+        // (gated output, state, ring, gate, beta, convolution output)
+        let run = |gpu: &mut Gpu, fused: bool, keep_qk_conv: bool| -> [Vec<u8>; 6] {
+            let history = gpu.upload_f32(&history0, &[history0.len()]).expect("history");
+            let conv_out = gpu.zeros(&[rows * qkv], DType::BF16).expect("conv out");
+            let gate = gpu.zeros(&[rows * value_heads], DType::F32).expect("gate");
+            let beta = gpu.zeros(&[rows * value_heads], DType::F32).expect("beta");
+            let state = gpu.upload_f32(&state0, &[state0.len()]).expect("state");
+            let recurrent = gpu.zeros(&[rows * value], DType::F32).expect("recurrent");
+            let out = gpu.zeros(&[rows * value], DType::F32).expect("output");
+            let conv = GatedDeltaConvBatched {
+                input: &projection,
+                kernel: &conv_kernel,
+                history: &history,
+                output: &conv_out,
+                next_history: &history,
+                rows,
+                channels: qkv,
+                history_rows: 3,
+                kernel_size: 4,
+                start_cursor: 1,
+            };
+            let params = GatedDeltaParamsBatched {
+                a: &a,
+                b: &b,
+                a_log: &a_log,
+                dt_bias: &dt_bias,
+                gate: &gate,
+                beta: &beta,
+                rows,
+                heads: value_heads,
+            };
+            let step = GatedDeltaStepBatched {
+                projection: &conv_out,
+                gate: &gate,
+                beta: &beta,
+                state: &state,
+                output: &recurrent,
+                row_states: None,
+                rows,
+                qkv_width: qkv,
+                key_heads,
+                value_heads,
+                key_dim: dim,
+                value_dim: dim,
+                position: 0,
+            };
+            let gated = GatedDeltaGateBatched {
+                recurrent_output: &recurrent,
+                z: &z,
+                norm: &norm,
+                output: &out,
+                rows,
+                value_heads,
+                value_dim: dim,
+            };
+            assert!(gated_delta_chunk_route(gpu, &step), "chunked route did not apply");
+            assert!(gated_delta_conv_qknorm_geometry(gpu, &step, &conv));
+            // Default off: the flag alone selects the new kernels.
+            assert_eq!(
+                gated_delta_conv_qknorm_route(gpu, &step, &conv),
+                gpu.flags.qwen4_gdn_conv_qknorm_enabled()
+            );
+            if fused {
+                gated_delta_conv_params_qknorm_batched(gpu, &conv, &params, &step, keep_qk_conv)
+                    .expect("conv + qk norm");
+                gated_delta_step_gate_wmma_qknormed(gpu, &step, &gated).expect("chunk");
+            } else {
+                gated_delta_conv_params_batched(gpu, &conv, &params).expect("conv");
+                gated_delta_step_gate_wmma(gpu, &step, &gated).expect("chunk");
+            }
+            let values = [
+                bytes(gpu, &out),
+                bytes(gpu, &state),
+                bytes(gpu, &history),
+                bytes(gpu, &gate),
+                bytes(gpu, &beta),
+                bytes(gpu, &conv_out),
+            ];
+            for tensor in [history, conv_out, gate, beta, state, recurrent, out] {
+                gpu.free_tensor(tensor).expect("free");
+            }
+            values
+        };
+        let plain = run(gpu, false, false);
+        let fused = run(gpu, true, false);
+        let kept = run(gpu, true, true);
+        for (i, label) in ["gated output", "state", "conv ring", "gate", "beta"].iter().enumerate() {
+            assert!(plain[i] == fused[i], "{label} differs (qk columns dropped)");
+            assert!(plain[i] == kept[i], "{label} differs (qk columns kept)");
+        }
+        assert!(plain[5] == kept[5], "convolution output differs with keep_qk_conv");
+        // Gate / beta against the stand-alone parameter kernel (a separate
+        // grid), so the compact conv + parameter grid is not only compared to
+        // itself: `rows * value_heads` spans several parameter blocks.
+        let ref_gate = gpu.zeros(&[rows * value_heads], DType::F32).expect("ref gate");
+        let ref_beta = gpu.zeros(&[rows * value_heads], DType::F32).expect("ref beta");
+        gated_delta_params_batched(
+            gpu,
+            &GatedDeltaParamsBatched {
+                a: &a,
+                b: &b,
+                a_log: &a_log,
+                dt_bias: &dt_bias,
+                gate: &ref_gate,
+                beta: &ref_beta,
+                rows,
+                heads: value_heads,
+            },
+        )
+        .expect("stand-alone params");
+        assert!(bytes(gpu, &ref_gate) == plain[3], "rows {rows}: gate vs stand-alone params");
+        assert!(bytes(gpu, &ref_beta) == plain[4], "rows {rows}: beta vs stand-alone params");
+        for tensor in [ref_gate, ref_beta] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+        let (row_bytes, v_from) = (qkv * 2, 2 * qk * 2);
+        for r in 0..rows {
+            assert!(
+                plain[5][r * row_bytes + v_from..(r + 1) * row_bytes]
+                    == fused[5][r * row_bytes + v_from..(r + 1) * row_bytes],
+                "row {r}: V convolution columns differ"
+            );
+        }
+        // The geometry guards: only 16 key heads of 128 in q|k|v order.
+        let conv_out = gpu.zeros(&[rows * qkv], DType::BF16).expect("conv out");
+        let history = gpu.upload_f32(&history0, &[history0.len()]).expect("history");
+        let state = gpu.upload_f32(&state0, &[state0.len()]).expect("state");
+        let gate = gpu.zeros(&[rows * value_heads], DType::F32).expect("gate");
+        let recurrent = gpu.zeros(&[rows * value], DType::F32).expect("recurrent");
+        let step = GatedDeltaStepBatched {
+            projection: &conv_out,
+            gate: &gate,
+            beta: &gate,
+            state: &state,
+            output: &recurrent,
+            row_states: None,
+            rows,
+            qkv_width: qkv,
+            key_heads,
+            value_heads,
+            key_dim: dim,
+            value_dim: dim,
+            position: 0,
+        };
+        let conv = GatedDeltaConvBatched {
+            input: &projection,
+            kernel: &conv_kernel,
+            history: &history,
+            output: &conv_out,
+            next_history: &history,
+            rows,
+            channels: qkv,
+            history_rows: 3,
+            kernel_size: 4,
+            start_cursor: 0,
+        };
+        assert!(gated_delta_conv_qknorm_geometry(&gpu, &step, &conv));
+        let eight = GatedDeltaStepBatched { key_heads: 8, ..step };
+        assert!(!gated_delta_conv_qknorm_geometry(&gpu, &eight, &conv));
+        let short = GatedDeltaStepBatched { rows: 511, ..eight };
+        assert!(!gated_delta_conv_qknorm_geometry(&gpu, &short, &conv));
+        let f32_out = gpu.zeros(&[rows * qkv], DType::F32).expect("f32 conv out");
+        let f32_conv = GatedDeltaConvBatched { output: &f32_out, ..conv };
+        assert!(!gated_delta_conv_qknorm_geometry(&gpu, &step, &f32_conv));
+        let ring4 = GatedDeltaConvBatched { history_rows: 4, ..f32_conv };
+        assert!(!gated_delta_conv_qknorm_geometry(&gpu, &step, &ring4));
+        for tensor in [
+            projection, conv_kernel, a, b, a_log, dt_bias, z, norm, conv_out, history, state, gate,
+            recurrent, f32_out,
+        ] {
+            gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
+    /// H6 hookup: the inline-Q8 chunk module is bytewise the
+    /// dequantize + chunk + requantize arm it replaces (gated output and the
+    /// whole Q8 slot), over the route's minimum rows and the 16-row chunk
+    /// boundary +-1, at a nonzero start position (the requantization seed).
+    #[test]
+    fn gdn_q8_inline_hookup_is_bytewise_the_conversion_arm() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1151() || !*crate::gemm::QWEN4_F16_WMMA {
+            eprintln!("skip: needs gfx1151 and the F16 WMMA route");
+            return;
+        }
+        let (key_heads, value_heads, dim, max_rows) = (2usize, 6usize, 128usize, 530usize);
+        let qk = key_heads * dim;
+        let value = value_heads * dim;
+        let qkv = 2 * qk + value;
+        let mut proj_bf16 = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(1, max_rows * qkv, 1.5)), &[max_rows * qkv * 2])
+            .expect("projection");
+        proj_bf16.dtype = DType::BF16;
+        proj_bf16.shape = vec![max_rows * qkv];
+        let gate_values: Vec<f32> =
+            test_wave(2, max_rows * value_heads, 0.5).iter().map(|g| g - 0.6).collect();
+        let beta_values: Vec<f32> =
+            test_wave(3, max_rows * value_heads, 0.45).iter().map(|b| b + 0.5).collect();
+        let gate_gpu = gpu.upload_f32(&gate_values, &[gate_values.len()]).expect("gate");
+        let beta_gpu = gpu.upload_f32(&beta_values, &[beta_values.len()]).expect("beta");
+        let z_gpu = gpu
+            .upload_f32(&test_wave(5, max_rows * value, 2.0), &[max_rows * value])
+            .expect("z");
+        let mut norm_gpu = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(6, dim, 1.0)), &[dim * 2])
+            .expect("norm");
+        norm_gpu.dtype = DType::BF16;
+        norm_gpu.shape = vec![dim];
+        let state0 = test_wave(4, value_heads * dim * dim, 0.2);
+        let slot_bytes = GdnStateFormat::Q8.state_units(value_heads, dim, dim);
+        let state0_gpu = gpu.upload_f32(&state0, &[state0.len()]).expect("state0");
+        let seed_slot = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
+        gdn_state_convert(&mut gpu, "gdn_state_f32_to_q8", state0_gpu.buf.as_ptr(), seed_slot.buf.as_ptr(), value_heads, Some(3))
+            .expect("quantize");
+        let bytes = |gpu: &Gpu, t: &GpuTensor| -> Vec<u8> {
+            let mut out = vec![0u8; t.byte_size()];
+            gpu.hip.memcpy_dtoh(&mut out, &t.buf).expect("download");
+            out
+        };
+        for (n, position) in [(512usize, 0usize), (513, 7), (527, 4096), (528, 1), (529, 99), (530, 262_143)] {
+            let mut results = Vec::new();
+            for inline in [false, true] {
+                let slot = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
+                gpu.copy_d2d(&seed_slot, &slot, slot_bytes).expect("copy slot");
+                let recurrent = gpu.zeros(&[n * value], DType::F32).expect("recurrent");
+                let out = gpu.zeros(&[n * value], DType::F32).expect("output");
+                let step = GatedDeltaStepBatched {
+                    projection: &proj_bf16.sub_offset(0, n * qkv),
+                    gate: &gate_gpu.sub_offset(0, n * value_heads),
+                    beta: &beta_gpu.sub_offset(0, n * value_heads),
+                    state: &slot,
+                    output: &recurrent,
+                    row_states: None,
+                    rows: n,
+                    qkv_width: qkv,
+                    key_heads,
+                    value_heads,
+                    key_dim: dim,
+                    value_dim: dim,
+                    position,
+                };
+                let gated = GatedDeltaGateBatched {
+                    recurrent_output: &recurrent,
+                    z: &z_gpu.sub_offset(0, n * value),
+                    norm: &norm_gpu,
+                    output: &out,
+                    rows: n,
+                    value_heads,
+                    value_dim: dim,
+                };
+                assert!(gated_delta_q8_inline_geometry(&gpu, &step));
+                // Default off: the flag alone selects the new module.
+                assert_eq!(
+                    gated_delta_q8_inline_route(&gpu, &step),
+                    gpu.flags.qwen4_gdn_q8_inline_enabled()
+                );
+                let arms = GatedDeltaChunkArms { qk_prenormed: false, q8_inline: inline };
+                gated_delta_step_gate_wmma_arms(&mut gpu, &step, &gated, arms).expect("chunked GDN");
+                results.push((bytes(&gpu, &out), bytes(&gpu, &slot)));
+                for tensor in [slot, recurrent, out] {
+                    gpu.free_tensor(tensor).expect("free");
+                }
+            }
+            assert!(results[0].0 == results[1].0, "{n} rows @ {position}: gated output differs");
+            assert!(results[0].1 == results[1].1, "{n} rows @ {position}: Q8 slot differs");
+        }
+        // An F32 state or a misaligned slot never takes the inline arm.
+        let f32_state = gpu.zeros(&[value_heads * dim * dim], DType::F32).expect("f32 state");
+        let step = GatedDeltaStepBatched {
+            projection: &proj_bf16,
+            gate: &gate_gpu,
+            beta: &beta_gpu,
+            state: &f32_state,
+            output: &f32_state,
+            row_states: None,
+            rows: 512,
+            qkv_width: qkv,
+            key_heads,
+            value_heads,
+            key_dim: dim,
+            value_dim: dim,
+            position: 0,
+        };
+        assert!(!gated_delta_q8_inline_geometry(&gpu, &step));
+        for tensor in [proj_bf16, gate_gpu, beta_gpu, z_gpu, norm_gpu, state0_gpu, seed_slot, f32_state] {
             gpu.free_tensor(tensor).expect("free");
         }
     }
@@ -5381,6 +8076,7 @@ mod tests {
                     rows,
                 }),
                 grid_bound: blocks,
+                yarn: crate::rope::RopeYarn::OFF,
             },
         )
         .expect("QSA pool/RoPE");
@@ -5475,8 +8171,31 @@ mod tests {
         )
         .expect("index-key write");
 
+        // The incremental pool at a large capacity: `first_block` is declared
+        // and the grid is `ceil(rows / compress)`, not the capacity.
+        let inc_rows = 3usize;
+        let inc_start = blocks * compress - inc_rows;
+        indexed_attention_pool_rope_incremental(
+            &mut gpu,
+            &IndexedAttentionPoolRope {
+                raw_keys: &raw_gpu,
+                pooled: &pooled_gpu,
+                norm: None,
+                block_count: blocks,
+                compress,
+                index_dim,
+                position: Some(QsaPositionBinding {
+                    position_start: inc_start,
+                    rows: inc_rows,
+                }),
+                grid_bound: 65_536,
+                yarn: crate::rope::RopeYarn::OFF,
+            },
+        )
+        .expect("incremental QSA pool/RoPE");
+
         let launches = gpu.replay.recorded_launches();
-        assert_eq!(launches.len(), 4, "the recorded QSA sequence changed");
+        assert_eq!(launches.len(), 5, "the recorded QSA sequence changed");
 
         // The declared slot must hold the value this very launch used.
         let check = |launch: &crate::replay::RecordedHipLaunch,
@@ -5586,6 +8305,37 @@ mod tests {
         );
         check(&launches[3], copy_mul, dco as u32, "index-key row offset");
 
+        let inc = &launches[4];
+        assert_eq!(
+            inc.grid[0],
+            inc_rows.div_ceil(compress) as u32,
+            "incremental pool grid must be ceil(rows / compress), not the capacity"
+        );
+        assert!(
+            inc.grid_binding.is_none(),
+            "incremental pool grid must be constant"
+        );
+        check(
+            inc,
+            crate::replay::ReplayKernargBinding::PositionDivU32 {
+                offset: 24,
+                addend: inc_rows as u32,
+                divisor: compress as u32,
+            },
+            blocks as u32,
+            "incremental pool block count",
+        );
+        check(
+            inc,
+            crate::replay::ReplayKernargBinding::PositionDivU32 {
+                offset: 36,
+                addend: 0,
+                divisor: compress as u32,
+            },
+            (inc_start / compress) as u32,
+            "incremental pool first block",
+        );
+
         gpu.free_tensor(raw_gpu).expect("free raw");
         gpu.free_tensor(pooled_gpu).expect("free pooled");
         gpu.free_tensor(query_gpu).expect("free query");
@@ -5596,6 +8346,517 @@ mod tests {
         gpu.free_tensor(output_gpu).expect("free attention output");
         gpu.free_tensor(copy_src).expect("free copy src");
         gpu.free_tensor(copy_dst).expect("free copy dst");
+    }
+
+    /// A retained PM4 tape owns raw device addresses, not allocations. The QSA
+    /// K/V and raw index-key arenas are VMM tensors: virtual ranges reserved up
+    /// front whose mapped prefix grows in place, so a base address recorded in
+    /// the tape must keep naming the same bytes after growth. This records the
+    /// full QSA sequence (index-key write, pool/RoPE, select, attention) while
+    /// only the first granule of each arena is mapped, prepares the PM4 tape,
+    /// and only then maps two more granules. Replaying positions inside the
+    /// newly mapped granules must then read and write the grown pages (the
+    /// attention tail and the raw index-key write land there, and for the last
+    /// position the pooled blocks also cover grown raw keys) and match, byte
+    /// for byte, the same sequence launched through plain HIP. Outputs, the
+    /// selection, the pooled prefix and the written index-key row are poisoned
+    /// before every execution so a stale result cannot pass.
+    #[test]
+    fn retained_pm4_tape_replays_over_grown_vmm_qsa_arena() {
+        use crate::replay::{ReplayBackendRequest, ReplayController};
+
+        const COMPRESS: usize = 4;
+        const INDEX_HEADS: usize = 2;
+        const N_HEADS: usize = 2;
+        const N_KV_HEADS: usize = 1;
+        const DIM: usize = 128;
+        const BUDGET_BLOCKS: usize = 2;
+        const SELECTED_CAPACITY: usize = BUDGET_BLOCKS * COMPRESS + COMPRESS - 1;
+        const CAPTURE_POSITION: usize = 3;
+        const F32_BYTES: usize = std::mem::size_of::<f32>();
+
+        struct Qsa {
+            reserved_rows: usize,
+            raw_keys: GpuTensor,
+            full_keys: GpuTensor,
+            full_values: GpuTensor,
+            pooled: GpuTensor,
+            index_src: GpuTensor,
+            query: GpuTensor,
+            q_with_gate: GpuTensor,
+            selected: GpuTensor,
+            output: GpuTensor,
+        }
+
+        struct Observed {
+            raw_row: Vec<u8>,
+            pooled: Vec<u8>,
+            selected: Vec<u8>,
+            output: Vec<f32>,
+        }
+
+        /// The QSA sequence at one position, launched through whatever route
+        /// `gpu.replay` currently selects (recorded when capturing).
+        fn run_qsa(gpu: &mut Gpu, t: &Qsa, position: usize) {
+            let blocks = (position + 1) / COMPRESS;
+            let max_blocks = t.reserved_rows / COMPRESS;
+            gpu.copy_rows_strided_f32(
+                &t.index_src,
+                &t.raw_keys,
+                1,
+                DIM,
+                DIM,
+                DIM,
+                position * DIM,
+                Some(DIM),
+            )
+            .expect("index-key write");
+            indexed_attention_pool_rope(
+                gpu,
+                &IndexedAttentionPoolRope {
+                    raw_keys: &t.raw_keys,
+                    pooled: &t.pooled,
+                    norm: None,
+                    block_count: blocks,
+                    compress: COMPRESS,
+                    index_dim: DIM,
+                    position: Some(QsaPositionBinding {
+                        position_start: position,
+                        rows: 1,
+                    }),
+                    grid_bound: max_blocks,
+                    yarn: crate::rope::RopeYarn::OFF,
+                },
+            )
+            .expect("QSA pool/RoPE");
+            indexed_attention_select_batch(
+                gpu,
+                &IndexedAttentionSelectBatch {
+                    query: &t.query,
+                    pooled: &t.pooled,
+                    selected: &t.selected,
+                    rows: 1,
+                    query_row_stride: INDEX_HEADS * DIM,
+                    block_count: blocks,
+                    index_heads: INDEX_HEADS,
+                    index_dim: DIM,
+                    budget_blocks: BUDGET_BLOCKS,
+                    compress: COMPRESS,
+                    position_start: position,
+                    capacity: SELECTED_CAPACITY,
+                    shape_blocks: max_blocks,
+                },
+            )
+            .expect("QSA select");
+            indexed_attention_attention_batch(
+                gpu,
+                &IndexedAttentionAttentionBatch {
+                    q_with_gate: &t.q_with_gate,
+                    full_keys: &t.full_keys,
+                    full_values: &t.full_values,
+                    selected: &t.selected,
+                    output: &t.output,
+                    rows: 1,
+                    position_start: position,
+                    n_heads: N_HEADS,
+                    n_kv_heads: N_KV_HEADS,
+                    head_dim: DIM,
+                    budget_blocks: BUDGET_BLOCKS,
+                    compress: COMPRESS,
+                    capacity: SELECTED_CAPACITY,
+                    full_capacity: t.reserved_rows,
+                    format: QsaKvFormat::F32,
+                    shape_selected: SELECTED_CAPACITY,
+                },
+            )
+            .expect("QSA attention");
+        }
+
+        /// Poison every result location, execute the position through the
+        /// retained PM4 tape or (replay disabled) plain HIP, and read back.
+        fn observe(gpu: &mut Gpu, t: &Qsa, position: usize, replay: bool) -> Observed {
+            let blocks = (position + 1) / COMPRESS;
+            let row_offset = position * DIM * F32_BYTES;
+            let nan_bytes = |count: usize| f32::NAN.to_ne_bytes().repeat(count);
+            gpu.hip
+                .memcpy_htod_offset(&t.raw_keys.buf, row_offset, &nan_bytes(DIM))
+                .expect("poison index-key row");
+            gpu.hip
+                .memcpy_htod(&t.pooled.buf, &nan_bytes(t.pooled.numel()))
+                .expect("poison pooled");
+            gpu.hip
+                .memcpy_htod(&t.selected.buf, &vec![0xFFu8; SELECTED_CAPACITY * 4])
+                .expect("poison selected");
+            gpu.hip
+                .memcpy_htod(&t.output.buf, &nan_bytes(t.output.numel()))
+                .expect("poison output");
+            gpu.hip.device_synchronize().expect("sync poison");
+            if replay {
+                // SAFETY: every tensor the tape recorded is live in `t`, at the
+                // base address captured (the arenas only grew in place).
+                unsafe { gpu.replay.replay_pm4(position) }
+                    .unwrap_or_else(|reason| panic!("PM4 replay at {position}: {reason}"));
+            } else {
+                let retained = std::mem::replace(
+                    &mut gpu.replay,
+                    ReplayController::new(ReplayBackendRequest::Hip),
+                );
+                run_qsa(gpu, t, position);
+                gpu.replay = retained;
+            }
+            gpu.hip.device_synchronize().expect("sync execution");
+            let mut raw_row = vec![0u8; DIM * F32_BYTES];
+            gpu.hip
+                .memcpy_dtoh_at(&mut raw_row, &t.raw_keys.buf, row_offset)
+                .expect("read index-key row");
+            let mut pooled = vec![0u8; blocks * DIM * F32_BYTES];
+            gpu.hip
+                .memcpy_dtoh_at(&mut pooled, &t.pooled.buf, 0)
+                .expect("read pooled prefix");
+            Observed {
+                raw_row,
+                pooled,
+                selected: gpu.download_raw_bytes(&t.selected).expect("read selected"),
+                output: gpu.download_f32(&t.output).expect("read output"),
+            }
+        }
+
+        fn selected_tokens(observed: &Observed) -> Vec<i32> {
+            observed
+                .selected
+                .chunks_exact(4)
+                .map(|word| i32::from_ne_bytes(word.try_into().expect("selected word")))
+                .collect()
+        }
+
+        fn assert_same(label: &str, replayed: &Observed, reference: &Observed) {
+            assert_eq!(
+                replayed.raw_row, reference.raw_row,
+                "{label}: index-key row differs from the HIP reference"
+            );
+            assert!(
+                replayed.pooled == reference.pooled,
+                "{label}: pooled prefix differs from the HIP reference"
+            );
+            assert_eq!(
+                replayed.selected, reference.selected,
+                "{label}: selection differs from the HIP reference"
+            );
+            assert!(
+                replayed
+                    .output
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .eq(reference.output.iter().map(|value| value.to_bits())),
+                "{label}: attention output differs from the HIP reference: {:?} vs {:?}",
+                &replayed.output[..4],
+                &reference.output[..4]
+            );
+        }
+
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if gpu.arch != "gfx1201" {
+            eprintln!("skip: needs gfx1201, found {}", gpu.arch);
+            return;
+        }
+        let Ok(gran) = gpu.vmm_recommended_granularity() else {
+            eprintln!("skip: no VMM allocation granularity");
+            return;
+        };
+        // The retained PM4 route must be available on this very HSA agent, not
+        // merely configured: kernel admission and prepare failures below are
+        // real failures and must not be skipped.
+        let device_ordinal = gpu.device_id as usize;
+        let pm4_agent = redline_dispatch::aql::load_symbols()
+            .ok()
+            .and_then(|symbols| {
+                let runtime = redline_dispatch::aql::Runtime::initialize(symbols).ok()?;
+                let device = runtime
+                    .select_gpu(redline_dispatch::aql::GpuSelector::Ordinal(device_ordinal))
+                    .ok()?;
+                Some(device.name().eq_ignore_ascii_case("gfx1201"))
+            })
+            .unwrap_or(false);
+        if !pm4_agent {
+            eprintln!("skip: no gfx1201 HSA agent for retained PM4");
+            return;
+        }
+
+        // One row of every arena is DIM F32 values; the first granule holds
+        // `initial_rows` of them and each arena reserves three granules.
+        assert_eq!(gran % (DIM * F32_BYTES), 0, "granule must hold whole rows");
+        eprintln!("gfx1201 VMM granularity: {gran} bytes");
+        let initial_rows = gran / (DIM * F32_BYTES);
+        assert_eq!(initial_rows % COMPRESS, 0, "granule must hold whole blocks");
+        assert!(initial_rows > CAPTURE_POSITION + 1);
+        let reserved_rows = 3 * initial_rows;
+        let max_blocks = reserved_rows / COMPRESS;
+        assert!(
+            max_blocks * F32_BYTES + QSA_SELECT_BATCHED_STATIC_LDS_BYTES
+                <= QSA_SELECT_DYNAMIC_LDS_LIMIT_BYTES,
+            "granule {gran} reserves a select LDS row beyond the dynamic LDS limit"
+        );
+        // `(position + 1) % COMPRESS == 3`: each replay position has a full
+        // three-token tail that starts at a grown row and is always selected.
+        let p0 = CAPTURE_POSITION;
+        let p1 = initial_rows + 2;
+        let p2 = 2 * initial_rows + 2;
+        for position in [p1, p2] {
+            assert_eq!((position + 1) % COMPRESS, 3);
+            assert!(position + 1 <= reserved_rows);
+        }
+        assert!(p0 < initial_rows && p1 >= initial_rows && p1 < 2 * initial_rows);
+        assert!(p2 >= 2 * initial_rows && p2 < reserved_rows);
+
+        let device = gpu.device_id;
+        let baseline_vmm = gpu.vmm_allocation_count();
+        let vmm_tensor = |gpu: &mut Gpu, label: &str| {
+            // SAFETY: only the mapped prefix is touched until the arena grows.
+            unsafe {
+                gpu.alloc_vmm_tensor(&[reserved_rows * DIM], DType::F32, gran, &[device])
+            }
+            .unwrap_or_else(|error| panic!("{label} VMM tensor: {error}"))
+        };
+        let raw_keys = vmm_tensor(&mut gpu, "raw index keys");
+        let full_keys = vmm_tensor(&mut gpu, "full keys");
+        let full_values = vmm_tensor(&mut gpu, "full values");
+        assert_eq!(gpu.vmm_allocation_count(), baseline_vmm + 3);
+        for tensor in [&raw_keys, &full_keys, &full_values] {
+            assert_eq!(gpu.vmm_granularity(tensor), Some(gran));
+            assert_eq!(gpu.vmm_mapped_bytes(tensor), Some(gran));
+        }
+
+        let rows_f32 = |first: usize, count: usize, value: &dyn Fn(usize, usize) -> f32| {
+            let mut bytes = Vec::with_capacity(count * DIM * F32_BYTES);
+            for row in first..first + count {
+                for channel in 0..DIM {
+                    bytes.extend_from_slice(&value(row, channel).to_ne_bytes());
+                }
+            }
+            bytes
+        };
+        let raw_key = |row: usize, channel: usize| {
+            (((row * 13 + channel * 7) % 31) as f32 - 15.0) / 16.0
+        };
+        let full_key = |row: usize, channel: usize| {
+            (((row * 5 + channel * 3) % 11) as f32 - 5.0) / 20.0
+        };
+        // The value level steps by 256 per granule, so attention output that
+        // misses (or misreads) a grown row is far from the expected level.
+        let full_value = |row: usize, channel: usize| {
+            (row / initial_rows) as f32 * 256.0
+                + 1.0
+                + ((row * 7 + channel * 3) % 13) as f32 / 16.0
+        };
+
+        // The initial pages are written with plain HIP copies.
+        gpu.hip
+            .memcpy_htod(&raw_keys.buf, &rows_f32(0, initial_rows, &raw_key))
+            .expect("initial raw keys");
+        gpu.hip
+            .memcpy_htod(&full_keys.buf, &rows_f32(0, initial_rows, &full_key))
+            .expect("initial full keys");
+        gpu.hip
+            .memcpy_htod(&full_values.buf, &rows_f32(0, initial_rows, &full_value))
+            .expect("initial full values");
+
+        let index_source: Vec<f32> = (0..DIM)
+            .map(|channel| ((channel * 5 + 3) % 17) as f32 / 8.0 - 1.0)
+            .collect();
+        let index_row_bytes: Vec<u8> = index_source
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect();
+        let index_query: Vec<f32> = (0..INDEX_HEADS * DIM)
+            .map(|i| ((i * 3) % 7) as f32 * 0.1 + 0.05)
+            .collect();
+        let mut q_with_gate = Vec::with_capacity(N_HEADS * 2 * DIM);
+        for head in 0..N_HEADS {
+            q_with_gate.extend((0..DIM).map(|c| 0.02 * (1 + (c + head) % 5) as f32));
+            q_with_gate.extend(std::iter::repeat(0.5f32).take(DIM));
+        }
+
+        let mut t = Qsa {
+            reserved_rows,
+            raw_keys,
+            full_keys,
+            full_values,
+            pooled: gpu
+                .zeros(&[max_blocks * DIM], DType::F32)
+                .expect("pooled"),
+            index_src: gpu.upload_f32(&index_source, &[DIM]).expect("index source"),
+            query: gpu
+                .upload_f32(&index_query, &[INDEX_HEADS * DIM])
+                .expect("index query"),
+            q_with_gate: gpu
+                .upload_f32(&q_with_gate, &[N_HEADS * 2 * DIM])
+                .expect("q with gate"),
+            selected: gpu
+                .zeros(&[SELECTED_CAPACITY * 4], DType::Raw)
+                .expect("selected"),
+            output: gpu.zeros(&[N_HEADS * DIM], DType::F32).expect("output"),
+        };
+
+        // Record the tape at p0 while only the first granule is mapped.
+        gpu.replay = ReplayController::new_manual_pm4();
+        assert!(gpu.replay.uses_pm4_transport());
+        gpu.replay.begin_capture().expect("open recording window");
+        run_qsa(&mut gpu, &t, p0);
+        gpu.hip.device_synchronize().expect("sync capture");
+        gpu.replay.finish_capture().expect("close recording window");
+        let launches = gpu.replay.recorded_launches().len();
+        assert_eq!(launches, 4, "the recorded QSA sequence changed");
+        for launch in gpu.replay.recorded_launches() {
+            assert!(
+                !launch.declared_kernarg_bindings().is_empty(),
+                "{}: position bindings were not declared",
+                launch.kernel
+            );
+        }
+        let (dispatches, _, _) = gpu
+            .replay
+            .prepare_pm4_prefix(gpu.device_id as usize, launches)
+            .unwrap_or_else(|reason| panic!("PM4 prepare: {reason}"));
+        assert_eq!(dispatches, launches);
+        assert!(gpu.replay.prepared_pm4_plan_ready());
+        assert!(gpu.replay.uses_pm4_transport());
+
+        // Control inside the mapped granule, before any growth.
+        let replayed_p0 = observe(&mut gpu, &t, p0, true);
+        let reference_p0 = observe(&mut gpu, &t, p0, false);
+        assert_same("pre-growth p0", &replayed_p0, &reference_p0);
+        assert_eq!(replayed_p0.raw_row, index_row_bytes);
+
+        // Map two more granules into each arena in place; the tape is not told.
+        let bases = [
+            t.raw_keys.buf.as_ptr() as usize,
+            t.full_keys.buf.as_ptr() as usize,
+            t.full_values.buf.as_ptr() as usize,
+        ];
+        for tensor in [&mut t.raw_keys, &mut t.full_keys, &mut t.full_values] {
+            let mapped = gpu
+                .grow_vmm_tensor(tensor, 2 * gran, &[device])
+                .expect("grow VMM arena");
+            assert_eq!(mapped, 3 * gran);
+        }
+        for (tensor, base) in [&t.raw_keys, &t.full_keys, &t.full_values]
+            .into_iter()
+            .zip(bases)
+        {
+            assert_eq!(tensor.buf.as_ptr() as usize, base, "growth moved the arena");
+            let mapped = gpu.vmm_mapped_bytes(tensor).expect("registered VMM owner");
+            assert_eq!(mapped, 3 * gran);
+            assert!(mapped > gran);
+        }
+
+        // The grown pages are written with plain HIP copies after growth.
+        let grown_rows = reserved_rows - initial_rows;
+        gpu.hip
+            .memcpy_htod_offset(
+                &t.raw_keys.buf,
+                gran,
+                &rows_f32(initial_rows, grown_rows, &raw_key),
+            )
+            .expect("grown raw keys");
+        gpu.hip
+            .memcpy_htod_offset(
+                &t.full_keys.buf,
+                gran,
+                &rows_f32(initial_rows, grown_rows, &full_key),
+            )
+            .expect("grown full keys");
+        gpu.hip
+            .memcpy_htod_offset(
+                &t.full_values.buf,
+                gran,
+                &rows_f32(initial_rows, grown_rows, &full_value),
+            )
+            .expect("grown full values");
+
+        let mut replayed = Vec::new();
+        for position in [p1, p2] {
+            let blocks = (position + 1) / COMPRESS;
+            let tail_start = (blocks * COMPRESS) as i32;
+            let tape = observe(&mut gpu, &t, position, true);
+            let reference = observe(&mut gpu, &t, position, false);
+            let label = format!("grown position {position}");
+            assert_same(&label, &tape, &reference);
+
+            // The kernel wrote the index-key row into a newly mapped page.
+            assert_eq!(tape.raw_row, index_row_bytes, "{label}: index-key row");
+            // Every pooled block (grown raw keys included) replaced the poison.
+            assert!(
+                tape.pooled
+                    .chunks_exact(4)
+                    .all(|word| f32::from_ne_bytes(word.try_into().unwrap()).is_finite()),
+                "{label}: pooled prefix was not fully written"
+            );
+            // Selection: the chosen blocks' tokens, then the three-token tail
+            // that starts at a grown row.
+            let tokens = selected_tokens(&tape);
+            assert_eq!(tokens.len(), SELECTED_CAPACITY);
+            let chosen = BUDGET_BLOCKS * COMPRESS;
+            assert!(
+                tokens[..chosen]
+                    .iter()
+                    .all(|&token| token >= 0 && token < tail_start),
+                "{label}: chosen tokens {:?}",
+                &tokens[..chosen]
+            );
+            assert_eq!(&tokens[chosen..], &[tail_start, tail_start + 1, tail_start + 2]);
+            assert!(
+                tokens.iter().any(|&token| token as usize >= initial_rows),
+                "{label}: selection never reached the grown region"
+            );
+            // Attention reads the grown tail's values (level >= 257), so every
+            // channel lies far above the first granule's 1..2 level.
+            assert!(
+                tape.output.iter().all(|value| value.is_finite() && *value > 8.0),
+                "{label}: attention output {:?}",
+                &tape.output[..4]
+            );
+            replayed.push(tape);
+        }
+        assert!(
+            replayed[0]
+                .output
+                .iter()
+                .zip(&replayed[1].output)
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+            "positions in different grown granules produced identical outputs"
+        );
+
+        // The tape owns the addresses: keep every tensor live until it is gone.
+        gpu.replay.shutdown().expect("retained replay quiescence");
+        let Qsa {
+            raw_keys,
+            full_keys,
+            full_values,
+            pooled,
+            index_src,
+            query,
+            q_with_gate,
+            selected,
+            output,
+            ..
+        } = t;
+        for tensor in [
+            raw_keys,
+            full_keys,
+            full_values,
+            pooled,
+            index_src,
+            query,
+            q_with_gate,
+            selected,
+            output,
+        ] {
+            gpu.free_tensor(tensor).expect("free tensor");
+        }
+        assert_eq!(gpu.vmm_allocation_count(), baseline_vmm);
     }
 
     /// The retained-replay shape pin (a fixed grid or LDS bound larger than the
@@ -5634,6 +8895,7 @@ mod tests {
                     index_dim,
                     position: None,
                     grid_bound: bound,
+                    yarn: crate::rope::RopeYarn::OFF,
                 },
             )
             .expect("QSA pool/RoPE");
@@ -5647,6 +8909,76 @@ mod tests {
             pooled_pinned, pooled_derived,
             "a masked pool grid above the active block count changed the result"
         );
+
+        // ── incremental pool: `first_block > 0` at a large capacity ──
+        // The grid is `ceil(rows / compress)` offset by `first_block`, not the
+        // capacity: every block the rows complete must equal the full pool,
+        // and every block below `first_block` must stay untouched.
+        let inc_blocks = 40usize;
+        let inc_capacity = 65_536usize;
+        let inc_cells = inc_blocks * compress * index_dim;
+        let inc_raw: Vec<f32> = (0..inc_cells)
+            .map(|i| ((i * 37 % 251) as f32 - 125.0) / 37.0)
+            .collect();
+        let inc_raw_gpu = gpu.upload_f32(&inc_raw, &[inc_cells]).expect("raw upload");
+        let inc_pool = |gpu: &mut Gpu, position: Option<QsaPositionBinding>| {
+            let sentinel = vec![-7.5f32; inc_blocks * index_dim];
+            let pooled = gpu
+                .upload_f32(&sentinel, &[sentinel.len()])
+                .expect("pooled upload");
+            let p = IndexedAttentionPoolRope {
+                raw_keys: &inc_raw_gpu,
+                pooled: &pooled,
+                norm: None,
+                block_count: inc_blocks,
+                compress,
+                index_dim,
+                position,
+                grid_bound: inc_capacity,
+                yarn: crate::rope::RopeYarn::OFF,
+            };
+            match position {
+                Some(_) => indexed_attention_pool_rope_incremental(gpu, &p),
+                None => indexed_attention_pool_rope(gpu, &p),
+            }
+            .expect("QSA pool/RoPE");
+            let values = gpu.download_f32(&pooled).expect("pooled download");
+            gpu.free_tensor(pooled).expect("free pooled");
+            values
+        };
+        let full = inc_pool(&mut gpu, None);
+        assert!(full.iter().all(|v| *v != -7.5), "full pool left a block unwritten");
+        // `(position_start + rows) / compress == inc_blocks`, aligned and
+        // unaligned, completing zero to three blocks.
+        for (position_start, rows) in [
+            (150, 10),
+            (153, 7),
+            (155, 5),
+            (156, 4),
+            (157, 3),
+            (158, 2),
+            (159, 1),
+            (160, 3),
+        ] {
+            let inc = inc_pool(
+                &mut gpu,
+                Some(QsaPositionBinding {
+                    position_start,
+                    rows,
+                }),
+            );
+            let split = position_start / compress * index_dim;
+            assert!(
+                inc[..split].iter().all(|v| *v == -7.5),
+                "incremental pool at {position_start}+{rows} wrote below first_block"
+            );
+            assert_eq!(
+                inc[split..],
+                full[split..],
+                "incremental pool at {position_start}+{rows} diverged from the full pool"
+            );
+        }
+        gpu.free_tensor(inc_raw_gpu).expect("free raw");
 
         // ── select: a larger LDS reservation, at an active count and at zero ──
         let index_heads = 2usize;
@@ -5785,12 +9117,12 @@ mod tests {
         gpu.free_tensor(selected_gpu).expect("free selected");
     }
 
-    /// The grouped QSA attention kernel must equal the per-head batched kernel
-    /// bit for bit at the production shape (24 heads, 2 KV heads, head_dim
-    /// 256): permuted selections, invalid slots, a partial key tile and
-    /// rows with and without a tail all included.
+    /// The grouped QSA attention kernels must equal the per-head batched
+    /// kernel bit for bit (24 heads, head_dim 256; 2 KV heads is the
+    /// production shape): permuted selections, invalid slots, a partial key
+    /// tile and rows with and without a tail all included.
     #[test]
-    fn qsa_attention_hg4_is_bit_identical_to_per_head_kernel() {
+    fn qsa_attention_grouped_is_bit_identical_to_per_head_kernel() {
         let Some(mut gpu) = try_gpu() else {
             eprintln!("skip: no GPU");
             return;
@@ -5799,107 +9131,111 @@ mod tests {
             eprintln!("skip: needs a gfx11/gfx12 GPU");
             return;
         }
-        let (n_heads, n_kv_heads, head_dim, compress) = (24usize, 2usize, 256usize, 4usize);
-        // 600+ visible tokens with a 150-block budget: selections longer than
-        // one 256-row score pass, plus the causal tail.
-        let (rows, position_start, full_capacity) = (20usize, 610usize, 640usize);
-        let budget_blocks = 150usize;
-        let capacity = budget_blocks * compress + compress - 1;
-        let lcg = |seed: usize, n: usize| -> Vec<f32> {
-            (0..n)
-                .map(|i| {
-                    ((i.wrapping_mul(2_654_435_761).wrapping_add(seed) % 2003) as f32 - 1001.0)
-                        / 997.0
-                })
-                .collect()
-        };
-        let q = lcg(1, rows * n_heads * 2 * head_dim);
-        let keys = lcg(7, full_capacity * n_kv_heads * head_dim);
-        let values = lcg(13, full_capacity * n_kv_heads * head_dim);
-        let mut selected = vec![-1i32; rows * capacity];
-        for row in 0..rows {
-            let visible = position_start + row + 1;
-            let blocks = visible / compress;
-            let chosen = budget_blocks.min(blocks);
-            // Descending-stride block choice, then the tail, as the selector emits.
-            for slot in 0..chosen {
-                let block = (blocks - 1 - (slot * 7 + row) % blocks) as i32;
-                for r in 0..compress {
-                    selected[row * capacity + slot * compress + r] =
-                        block * compress as i32 + r as i32;
+        // hg12 (2 KV heads) over three and nine 256-row tiles, hg4 (6 KV heads).
+        for (n_kv_heads, position_start, full_capacity, budget_blocks) in [
+            (2usize, 610usize, 640usize, 150usize),
+            (2, 2100, 2200, 512),
+            (6, 610, 640, 150),
+        ] {
+            let (n_heads, head_dim, compress) = (24usize, 256usize, 4usize);
+            let rows = 20usize;
+            let capacity = budget_blocks * compress + compress - 1;
+            let lcg = |seed: usize, n: usize| -> Vec<f32> {
+                (0..n)
+                    .map(|i| {
+                        ((i.wrapping_mul(2_654_435_761).wrapping_add(seed) % 2003) as f32 - 1001.0)
+                            / 997.0
+                    })
+                    .collect()
+            };
+            let q = lcg(1, rows * n_heads * 2 * head_dim);
+            let keys = lcg(7, full_capacity * n_kv_heads * head_dim);
+            let values = lcg(13, full_capacity * n_kv_heads * head_dim);
+            let mut selected = vec![-1i32; rows * capacity];
+            for row in 0..rows {
+                let visible = position_start + row + 1;
+                let blocks = visible / compress;
+                let chosen = budget_blocks.min(blocks);
+                // Descending-stride block choice, then the tail, as the selector emits.
+                for slot in 0..chosen {
+                    let block = (blocks - 1 - (slot * 7 + row) % blocks) as i32;
+                    for r in 0..compress {
+                        selected[row * capacity + slot * compress + r] =
+                            block * compress as i32 + r as i32;
+                    }
                 }
+                let mut offset = chosen * compress;
+                for token in blocks * compress..visible {
+                    selected[row * capacity + offset] = token as i32;
+                    offset += 1;
+                }
+                // An invalid slot inside the active length must be skipped.
+                selected[row * capacity + 3] = -1;
             }
-            let mut offset = chosen * compress;
-            for token in blocks * compress..visible {
-                selected[row * capacity + offset] = token as i32;
-                offset += 1;
+            let q_gpu = gpu.upload_f32(&q, &[q.len()]).expect("q upload");
+            let keys_gpu = gpu.upload_f32(&keys, &[keys.len()]).expect("keys upload");
+            let values_gpu = gpu
+                .upload_f32(&values, &[values.len()])
+                .expect("values upload");
+            let selected_gpu = gpu
+                .zeros(&[selected.len() * std::mem::size_of::<i32>()], DType::Raw)
+                .expect("selected allocation");
+            let bytes = selected
+                .iter()
+                .flat_map(|v| v.to_ne_bytes())
+                .collect::<Vec<_>>();
+            gpu.hip
+                .memcpy_htod(&selected_gpu.buf, &bytes)
+                .expect("selected upload");
+            let run = |gpu: &mut Gpu, allow_fast: bool| {
+                let output = gpu
+                    .zeros(&[rows * n_heads * head_dim], DType::F32)
+                    .expect("output allocation");
+                indexed_attention_attention_batch_impl(
+                    gpu,
+                    &IndexedAttentionAttentionBatch {
+                        q_with_gate: &q_gpu,
+                        full_keys: &keys_gpu,
+                        full_values: &values_gpu,
+                        selected: &selected_gpu,
+                        output: &output,
+                        rows,
+                        position_start,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        budget_blocks,
+                        compress,
+                        capacity,
+                        full_capacity,
+                        format: QsaKvFormat::F32,
+                        shape_selected: capacity,
+                    },
+                    allow_fast,
+                )
+                .expect("QSA attention");
+                let values = gpu.download_f32(&output).expect("output download");
+                gpu.free_tensor(output).expect("free output");
+                values
+            };
+            let reference = run(&mut gpu, false);
+            let grouped = run(&mut gpu, true);
+            assert!(
+                reference.iter().any(|v| *v != 0.0),
+                "reference output is all zero"
+            );
+            let differing = reference
+                .iter()
+                .zip(&grouped)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                differing, 0,
+                "grouped QSA attention differs in {differing} cells"
+            );
+            for tensor in [q_gpu, keys_gpu, values_gpu, selected_gpu] {
+                gpu.free_tensor(tensor).expect("free");
             }
-            // An invalid slot inside the active length must be skipped.
-            selected[row * capacity + 3] = -1;
-        }
-        let q_gpu = gpu.upload_f32(&q, &[q.len()]).expect("q upload");
-        let keys_gpu = gpu.upload_f32(&keys, &[keys.len()]).expect("keys upload");
-        let values_gpu = gpu
-            .upload_f32(&values, &[values.len()])
-            .expect("values upload");
-        let selected_gpu = gpu
-            .zeros(&[selected.len() * std::mem::size_of::<i32>()], DType::Raw)
-            .expect("selected allocation");
-        let bytes = selected
-            .iter()
-            .flat_map(|v| v.to_ne_bytes())
-            .collect::<Vec<_>>();
-        gpu.hip
-            .memcpy_htod(&selected_gpu.buf, &bytes)
-            .expect("selected upload");
-        let run = |gpu: &mut Gpu, allow_fast: bool| {
-            let output = gpu
-                .zeros(&[rows * n_heads * head_dim], DType::F32)
-                .expect("output allocation");
-            indexed_attention_attention_batch_impl(
-                gpu,
-                &IndexedAttentionAttentionBatch {
-                    q_with_gate: &q_gpu,
-                    full_keys: &keys_gpu,
-                    full_values: &values_gpu,
-                    selected: &selected_gpu,
-                    output: &output,
-                    rows,
-                    position_start,
-                    n_heads,
-                    n_kv_heads,
-                    head_dim,
-                    budget_blocks,
-                    compress,
-                    capacity,
-                    full_capacity,
-                    format: QsaKvFormat::F32,
-                    shape_selected: capacity,
-                },
-                allow_fast,
-            )
-            .expect("QSA attention");
-            let values = gpu.download_f32(&output).expect("output download");
-            gpu.free_tensor(output).expect("free output");
-            values
-        };
-        let reference = run(&mut gpu, false);
-        let grouped = run(&mut gpu, true);
-        assert!(
-            reference.iter().any(|v| *v != 0.0),
-            "reference output is all zero"
-        );
-        let differing = reference
-            .iter()
-            .zip(&grouped)
-            .filter(|(a, b)| a.to_bits() != b.to_bits())
-            .count();
-        assert_eq!(
-            differing, 0,
-            "grouped QSA attention differs in {differing} cells"
-        );
-        for tensor in [q_gpu, keys_gpu, values_gpu, selected_gpu] {
-            gpu.free_tensor(tensor).expect("free");
         }
     }
 
@@ -6001,6 +9337,281 @@ mod tests {
         for tensor in [q_gpu, keys_gpu, values_gpu, selected_gpu] {
             gpu.free_tensor(tensor).expect("free");
         }
+    }
+
+    /// Device tensors of one gathered-route QSA case: `rows` query rows from
+    /// `position_start` over a `full_capacity`-row cache, 24 heads over 2
+    /// KV heads of 256, a 512-block budget of compress-4 blocks. Rows before
+    /// and past the budget, causal tails, a `-1` slot per row, and rows whose
+    /// blocks are emitted in descending token order (the per-token V path).
+    /// The query is scaled so the softmax is peaked: with the flat LCG query
+    /// a mis-paired key and value barely moves the output.
+    struct GatheredCase {
+        q: GpuTensor,
+        k: GpuTensor,
+        v: GpuTensor,
+        selected: GpuTensor,
+        output: GpuTensor,
+        rows: usize,
+        position_start: usize,
+        full_capacity: usize,
+        format: QsaKvFormat,
+    }
+
+    const GATHERED_BUDGET_BLOCKS: usize = 512;
+    const GATHERED_CAPACITY: usize = GATHERED_BUDGET_BLOCKS * 4 + 4 - 1;
+
+    impl GatheredCase {
+        fn new(
+            gpu: &mut Gpu,
+            format: QsaKvFormat,
+            rows: usize,
+            position_start: usize,
+            full_capacity: usize,
+        ) -> Self {
+            let (n_heads, n_kv_heads, head_dim, compress) = (24usize, 2usize, 256usize, 4usize);
+            let (budget_blocks, capacity) = (GATHERED_BUDGET_BLOCKS, GATHERED_CAPACITY);
+            let mut q = qsa_lcg(1, rows * n_heads * 2 * head_dim);
+            for head_row in q.chunks_mut(2 * head_dim) {
+                head_row[..head_dim].iter_mut().for_each(|v| *v *= 8.0);
+            }
+            let keys = qsa_lcg(7, full_capacity * n_kv_heads * head_dim);
+            let values = qsa_lcg(13, full_capacity * n_kv_heads * head_dim);
+            let mut selected = vec![-1i32; rows * capacity];
+            for row in 0..rows {
+                let visible = position_start + row + 1;
+                let blocks = visible / compress;
+                let chosen = budget_blocks.min(blocks);
+                for slot in 0..chosen {
+                    let block = (blocks - 1 - (slot * 7 + row) % blocks) as i32;
+                    for r in 0..compress {
+                        // Odd rows list each block's tokens in descending order.
+                        let token = if row % 2 == 1 { compress - 1 - r } else { r };
+                        selected[row * capacity + slot * compress + r] =
+                            block * compress as i32 + token as i32;
+                    }
+                }
+                let mut offset = chosen * compress;
+                for token in blocks * compress..visible {
+                    selected[row * capacity + offset] = token as i32;
+                    offset += 1;
+                }
+                selected[row * capacity + 3] = -1;
+            }
+            let q_gpu = gpu.upload_f32(&q, &[q.len()]).expect("q upload");
+            let keys_gpu = gpu.upload_f32(&keys, &[keys.len()]).expect("keys upload");
+            let values_gpu = gpu.upload_f32(&values, &[values.len()]).expect("values upload");
+            let (k, v) = if format == QsaKvFormat::F32 {
+                (keys_gpu, values_gpu)
+            } else {
+                let units = format.kv_row_units(n_kv_heads, head_dim);
+                let k = gpu.zeros(&[full_capacity * units], format.kv_dtype()).expect("K");
+                let v = gpu.zeros(&[full_capacity * units], format.kv_dtype()).expect("V");
+                indexed_attention_cache_append_batch(
+                    gpu,
+                    &IndexedAttentionCacheAppendBatch {
+                        key: &keys_gpu,
+                        value: &values_gpu,
+                        full_keys: &k,
+                        full_values: &v,
+                        rows: full_capacity,
+                        position_start: 0,
+                        kv_heads: n_kv_heads,
+                        head_dim,
+                        format,
+                    },
+                )
+                .expect("QSA append");
+                gpu.free_tensor(keys_gpu).expect("free");
+                gpu.free_tensor(values_gpu).expect("free");
+                (k, v)
+            };
+            let selected_gpu = gpu
+                .zeros(&[selected.len() * std::mem::size_of::<i32>()], DType::Raw)
+                .expect("selected allocation");
+            let bytes = selected.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<_>>();
+            gpu.hip.memcpy_htod(&selected_gpu.buf, &bytes).expect("selected upload");
+            let output = gpu
+                .zeros(&[rows * n_heads * head_dim], DType::F32)
+                .expect("output allocation");
+            Self {
+                q: q_gpu,
+                k,
+                v,
+                selected: selected_gpu,
+                output,
+                rows,
+                position_start,
+                full_capacity,
+                format,
+            }
+        }
+
+        fn params(&self) -> IndexedAttentionAttentionBatch<'_> {
+            IndexedAttentionAttentionBatch {
+                q_with_gate: &self.q,
+                full_keys: &self.k,
+                full_values: &self.v,
+                selected: &self.selected,
+                output: &self.output,
+                rows: self.rows,
+                position_start: self.position_start,
+                n_heads: 24,
+                n_kv_heads: 2,
+                head_dim: 256,
+                budget_blocks: GATHERED_BUDGET_BLOCKS,
+                compress: 4,
+                capacity: GATHERED_CAPACITY,
+                full_capacity: self.full_capacity,
+                format: self.format,
+                shape_selected: GATHERED_CAPACITY,
+            }
+        }
+
+        /// Output bytes of the gathered launches (hipcc, or the `pm`
+        /// module) over a poisoned output.
+        fn gathered(&self, gpu: &mut Gpu, pm: bool) -> Vec<u8> {
+            gpu.hip.memset(&self.output.buf, 0x7f, self.output.byte_size()).expect("poison");
+            let end = self.position_start + self.rows;
+            qsa_gathered_wmma_launch_with(gpu, &self.params(), end, GATHERED_CAPACITY, pm, None)
+                .expect("gathered QSA");
+            gpu.hip.device_synchronize().expect("sync");
+            let mut bytes = vec![0u8; self.output.byte_size()];
+            gpu.hip.memcpy_dtoh(&mut bytes, &self.output.buf).expect("download");
+            bytes
+        }
+
+        fn free(self, gpu: &mut Gpu) {
+            for tensor in [self.q, self.k, self.v, self.selected, self.output] {
+                gpu.free_tensor(tensor).expect("free");
+            }
+        }
+    }
+
+    /// State formats the gathered route serves on this device.
+    fn gathered_formats(gpu: &Gpu) -> Vec<QsaKvFormat> {
+        if gpu.arch_caps.is_gfx1151() {
+            vec![QsaKvFormat::F32, QsaKvFormat::Q8]
+        } else if gpu.arch_caps.is_gfx1201() {
+            vec![QsaKvFormat::Fp8]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The gathered F16 WMMA route must match the exact per-head kernel of
+    /// the same state format to F16-rounding accuracy ([`GatheredCase`]),
+    /// through the hipcc and the PM attend alike.
+    #[test]
+    fn qsa_gathered_wmma_matches_per_head_kernel() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let formats = gathered_formats(&gpu);
+        if formats.is_empty() {
+            eprintln!("skip: the gathered route is gfx1151 / gfx1201 only");
+            return;
+        }
+        for format in formats {
+            // Visible 1901..2420 against a 512-block budget: 475..605 blocks.
+            let case = GatheredCase::new(&mut gpu, format, 520, 1900, 2432);
+            let p = case.params();
+            indexed_attention_attention_batch_impl(&mut gpu, &p, false).expect("per-head QSA");
+            let reference = gpu.download_f32(&case.output).expect("reference download");
+            qsa_gathered_wmma(&mut gpu, &p, p.position_start + p.rows, p.capacity, None).expect("gathered QSA");
+            let gathered = gpu.download_f32(&case.output).expect("gathered download");
+            let rel = rel_l2(&reference, &gathered);
+            eprintln!("gathered QSA WMMA ({}) rel L2 {rel:.3e}", format.name());
+            // F16 operands and probabilities: ~1e-4 here; a wrong entry, head,
+            // dim or key/value pairing lands near 1e-1 or above.
+            assert!(rel < 5e-3, "gathered QSA WMMA ({}) rel L2 {rel:.3e}", format.name());
+            assert!(rel > 0.0, "gathered QSA WMMA route did not run");
+            let hip = case.gathered(&mut gpu, false);
+            let pm = case.gathered(&mut gpu, true);
+            assert!(hip == pm, "PM vs hipcc gathered bytes differ ({})", format.name());
+            case.free(&mut gpu);
+        }
+    }
+
+    /// Where admitted (`Gpu::qsa_gather_vmm_capable`), the gathered workspace
+    /// is one stable-VA reservation per cache, demand-mapped: each forward
+    /// maps exactly the granularity-rounded
+    /// prefix it touches (K rows plus whole V blocks to its end) at an
+    /// unchanged address, hipcc and the PM module stay byte-identical on it
+    /// across growth, the output equals a whole-context commit's, growth is
+    /// refused while a capture is armed, and weight-cache invalidation
+    /// releases the reservation.
+    #[test]
+    fn qsa_gathered_workspace_demand_maps_one_stable_reservation() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let Some(&format) = gathered_formats(&gpu).first() else {
+            eprintln!("skip: the gathered route is gfx1151 / gfx1201 only");
+            return;
+        };
+        if !qsa_gathered_wmma_enabled(&gpu, format) {
+            eprintln!("skip: the gathered route is disabled");
+            return;
+        }
+        if !gpu.qsa_gather_vmm_capable() {
+            eprintln!("skip: the gathered workspace keeps its legacy slot here");
+            return;
+        }
+        let (heads, capacity) = (2usize, 8192usize);
+        let bytes = |end: usize| qsa_gathered_wmma_scratch_bytes(heads, end).unwrap();
+        gpu.invalidate_weight_caches();
+        let owners = gpu.vmm_allocation_count();
+        let reserved = reserve_qsa_gathered_wmma_workspace(&mut gpu, format, heads, capacity)
+            .expect("reserve");
+        assert_eq!(reserved, bytes(capacity));
+        assert_eq!(gpu.qsa_gather_reserved_bytes(), reserved);
+        assert_eq!(gpu.vmm_allocation_count(), owners + 1);
+        assert!(gpu.scratch.qsa_gather_f16.is_none(), "legacy slot allocated on a VMM Gpu");
+        let workspace = gpu.scratch.qsa_gather_vmm.as_ref().unwrap();
+        let (base, granularity) = (workspace.buf.as_ptr(), gpu.vmm_granularity(workspace).unwrap());
+        assert_eq!(gpu.qsa_gather_scratch_bytes(), 0, "a reservation commits nothing");
+        // Chunk 1 ends at 523 (a partial V block), chunk 2 at 5003: several
+        // pages more, mapped in place.
+        let mut demand_output = Vec::new();
+        for (rows, start) in [(520usize, 3usize), (2480, 2523)] {
+            let end = start + rows;
+            let case = GatheredCase::new(&mut gpu, format, rows, start, capacity);
+            let hip = case.gathered(&mut gpu, false);
+            let pm = case.gathered(&mut gpu, true);
+            assert!(hip == pm, "PM vs hipcc gathered bytes differ at end {end}");
+            assert_eq!(gpu.qsa_gather_scratch_bytes(), bytes(end).next_multiple_of(granularity));
+            assert_eq!(gpu.scratch.qsa_gather_vmm.as_ref().unwrap().buf.as_ptr(), base, "address moved");
+            assert_eq!(gpu.vmm_allocation_count(), owners + 1);
+            demand_output = hip;
+            case.free(&mut gpu);
+        }
+        // Armed: a covered prefix is fine, any growth is refused.
+        let mapped = gpu.qsa_gather_scratch_bytes();
+        gpu.graphs.capture_mode = true;
+        let covered = ensure_qsa_gathered_wmma_workspace(&mut gpu, format, heads, 5003);
+        let grown = ensure_qsa_gathered_wmma_workspace(&mut gpu, format, heads, capacity);
+        gpu.graphs.capture_mode = false;
+        assert_eq!(covered.expect("covered while armed"), mapped);
+        assert!(grown.is_err(), "growth while armed must be refused");
+        assert_eq!(gpu.qsa_gather_scratch_bytes(), mapped);
+        // Invalidation releases it; the whole-context commit gives the same
+        // output bytes.
+        gpu.invalidate_weight_caches();
+        assert_eq!(gpu.qsa_gather_reserved_bytes(), 0);
+        assert_eq!(gpu.vmm_allocation_count(), owners);
+        assert_eq!(
+            reserve_qsa_gathered_wmma_scratch(&mut gpu, format, heads, capacity).expect("commit"),
+            reserved
+        );
+        assert!(gpu.qsa_gather_scratch_bytes() >= reserved);
+        let case = GatheredCase::new(&mut gpu, format, 2480, 2523, capacity);
+        assert!(case.gathered(&mut gpu, false) == demand_output, "demand-mapped output differs from whole commit");
+        case.free(&mut gpu);
+        gpu.invalidate_weight_caches();
+        assert_eq!(gpu.vmm_allocation_count(), owners);
     }
 
     struct SelectCase {
@@ -6125,6 +9736,108 @@ mod tests {
         );
     }
 
+    /// `indexed_attention_select_from_scores` on synthetic score rows with
+    /// tens of thousands of blocks tied at the threshold (65,536 is 262K
+    /// context at compress 4). The above/equal counts once shared one packed
+    /// int whose 16-bit equal field went negative past 32,767 ties and
+    /// wrapped past 65,535. Up to 65,536 blocks the old code only wrote to
+    /// negative LDS indices, which neither the output check nor the canary
+    /// can see; only the 70,000-block cases, where later ties wrap back into
+    /// the first selection slots, detect it. The rest pin the selection.
+    #[test]
+    fn select_from_scores_survives_tens_of_thousands_of_ties() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "indexed_attention_select_from_scores")
+            .expect("select kernel");
+        const CANARY: i32 = 0x5A5A_5A5A;
+        const GUARD: usize = 64;
+        let (compress, budget, tail) = (4usize, 512usize, 3usize);
+        let capacity = budget * compress + tail;
+        let tied = |blocks: usize| vec![1.0f32; blocks];
+        // 300 blocks scored above the tie, scattered, with some repeats so
+        // the above blocks also break ties by index.
+        let partial = |blocks: usize| {
+            let mut scores = vec![1.0f32; blocks];
+            for i in 0..300usize {
+                scores[(i * 7919 + 13) % blocks] = 2.0 + (i % 97) as f32 * 0.25;
+            }
+            scores
+        };
+        let cases: Vec<(&str, Vec<f32>)> = vec![
+            ("all tied 65536", tied(65_536)),
+            ("all tied 40000", tied(40_000)),
+            ("partial tie 65536", partial(65_536)),
+            ("partial tie 40000", partial(40_000)),
+            ("all tied 70000", tied(70_000)),
+            ("partial tie 70000", partial(70_000)),
+        ];
+        for (name, scores) in cases {
+            let blocks = scores.len();
+            // Visible spans every block plus `tail` tail tokens.
+            let position_start = blocks * compress + tail - 1;
+            let mut order: Vec<usize> = (0..blocks).collect();
+            order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+            let mut expected = vec![-1i32; capacity];
+            for (rank, &block) in order.iter().take(budget).enumerate() {
+                for slot in 0..compress {
+                    expected[rank * compress + slot] = (block * compress + slot) as i32;
+                }
+            }
+            for t in 0..tail {
+                expected[budget * compress + t] = (blocks * compress + t) as i32;
+            }
+            let scores_gpu = gpu.upload_f32(&scores, &[blocks]).expect("scores upload");
+            let init: Vec<u8> = std::iter::repeat(CANARY)
+                .take(capacity + GUARD)
+                .flat_map(i32::to_ne_bytes)
+                .collect();
+            let selected = gpu.upload_raw(&init, &[init.len()]).expect("selected upload");
+            let mut args = KernargBlob::new();
+            args.push_ptr(scores_gpu.buf.as_ptr());
+            args.push_i32(blocks as i32);
+            args.push_ptr(selected.buf.as_ptr());
+            args.push_i32(1);
+            args.push_i32(blocks as i32);
+            args.push_i32(budget as i32);
+            args.push_i32(compress as i32);
+            args.push_i32(position_start as i32);
+            args.push_i32(capacity as i32);
+            args.push_ptr(std::ptr::null_mut());
+            args.pad_to(16);
+            gpu.launch_blob_recorded(
+                "indexed_attention_select_from_scores",
+                [1, 1, 1],
+                [256, 1, 1],
+                0,
+                args.as_mut_slice(),
+                crate::dispatch::ReplayLaunchBindings::NONE,
+            )
+            .expect("select launch");
+            let mut bytes = vec![0u8; init.len()];
+            gpu.hip.memcpy_dtoh(&mut bytes, &selected.buf).expect("selected download");
+            gpu.free_tensor(selected).expect("free selected");
+            gpu.free_tensor(scores_gpu).expect("free scores");
+            let got: Vec<i32> = bytes
+                .chunks_exact(4)
+                .map(|chunk| i32::from_ne_bytes(chunk.try_into().expect("i32 chunk")))
+                .collect();
+            assert!(
+                got[capacity..].iter().all(|&v| v == CANARY),
+                "{name}: guard canary after the selection overwritten"
+            );
+            let first_bad = (0..capacity).find(|&i| got[i] != expected[i]);
+            assert!(
+                first_bad.is_none(),
+                "{name}: selection differs from CPU reference at slot {first_bad:?}: got {:?} want {:?}",
+                first_bad.map(|i| got[i]),
+                first_bad.map(|i| expected[i])
+            );
+        }
+    }
+
     /// The parallel rank path and the serial selection-sort fallback are two
     /// symbols for the same logical selection, chosen only by the LDS
     /// reservation; they must emit identical `selected` bytes. A
@@ -6144,14 +9857,26 @@ mod tests {
         for &compress in &[2usize, 4, 8] {
             for &index_dim in &[8usize, 128] {
                 for &index_heads in &[1usize, 4] {
-                    for &rows in &[1usize, 5] {
+                    // 37 rows: three sixteen-row scoring groups, the last
+                    // partial, each row with its own visible block count.
+                    for &rows in &[1usize, 5, 37] {
                         // `(position_start + rows) / compress` must equal the
                         // wrapper's declared block count.
-                        if rows > compress - 1 {
+                        if rows < 37 && rows > compress - 1 {
                             continue;
                         }
                         for &block_count in &[0usize, 1, 3, 17, 72, 128, 500] {
                             for &budget_blocks in &[1usize, 4, 64, 512] {
+                                // Many rows: the pinned geometry (the live
+                                // rows16 route), smaller budgets.
+                                let pinned = compress == 4 && index_heads == 4 && index_dim == 128;
+                                if rows == 37
+                                    && (!pinned
+                                        || budget_blocks > 64
+                                        || block_count * compress + compress - 1 < rows)
+                                {
+                                    continue;
+                                }
                                 let case = SelectCase {
                                     compress,
                                     index_heads,
@@ -6160,7 +9885,11 @@ mod tests {
                                     block_count,
                                     budget_blocks,
                                     capacity: budget_blocks * compress + compress - 1,
-                                    position_start: block_count * compress,
+                                    position_start: if rows < compress {
+                                        block_count * compress
+                                    } else {
+                                        block_count * compress + compress - 1 - rows
+                                    },
                                 };
                                 let pooled: Vec<f32> = (0..block_count * index_dim + index_dim)
                                     .map(|_| next())
@@ -6361,7 +10090,6 @@ mod tests {
         const HEAD_DIM: usize = 256;
         const HEAD_STRIDE: usize = 2 * HEAD_DIM;
         const ROTARY_DIM: usize = 64;
-        const POSITION: usize = 11;
         let mut input = vec![0.0f32; HEADS * HEAD_STRIDE];
         for head in 0..HEADS {
             for channel in 0..HEAD_DIM {
@@ -6371,68 +10099,84 @@ mod tests {
                     1000.0 + (head * HEAD_DIM + channel) as f32;
             }
         }
-        let values = gpu
-            .upload_f32(&input, &[input.len()])
-            .expect("query/gate upload");
         let norm = gpu
             .zeros(&[HEAD_DIM], DType::BF16)
             .expect("zero norm allocation");
-        indexed_attention_norm_rope(
-            &mut gpu,
-            &IndexedAttentionNormRope {
-                values: &values,
-                norm: &norm,
-                heads: HEADS,
-                head_dim: HEAD_DIM,
-                head_stride: HEAD_STRIDE,
-                position: POSITION,
-                rotary_dim: ROTARY_DIM,
-            },
-        )
-        .expect("QSA norm/RoPE");
-        let actual = gpu.download_f32(&values).expect("query/gate download");
-        let mut expected = input.clone();
-        for head in 0..HEADS {
-            let start = head * HEAD_STRIDE;
-            let inv = (input[start..start + HEAD_DIM]
-                .iter()
-                .map(|value| value * value)
-                .sum::<f32>()
-                / HEAD_DIM as f32
-                + 1.0e-6)
-                .sqrt()
-                .recip();
-            for channel in 0..HEAD_DIM {
-                expected[start + channel] = input[start + channel] * inv;
+        // Plain RoPE at a short position, and the Qwen3.8 README YaRN override
+        // (factor 4 over 262144) against the host HF reference, at a position
+        // where interpolated pairs and the cos/sin factor are both visible.
+        use crate::rope::{Rope, RopeScaling, Yarn};
+        let yarn = RopeScaling::Yarn(Yarn::new(4.0, 262_144, None, None, None, None));
+        for (scaling, position, tolerance) in [(RopeScaling::None, 11, 1.0e-4), (yarn, 4099, 2.0e-3)]
+        {
+            let rope = Rope { theta: 10_000_000.0, scaling };
+            let values = gpu
+                .upload_f32(&input, &[input.len()])
+                .expect("query/gate upload");
+            indexed_attention_norm_rope(
+                &mut gpu,
+                &IndexedAttentionNormRope {
+                    values: &values,
+                    norm: &norm,
+                    heads: HEADS,
+                    head_dim: HEAD_DIM,
+                    head_stride: HEAD_STRIDE,
+                    position,
+                    rotary_dim: ROTARY_DIM,
+                    yarn: rope.yarn(ROTARY_DIM),
+                },
+            )
+            .expect("QSA norm/RoPE");
+            let actual = gpu.download_f32(&values).expect("query/gate download");
+            gpu.free_tensor(values).expect("free query/gate");
+            let (inv_freq, mscale) = rope.inv_freq(ROTARY_DIM);
+            let mut expected = input.clone();
+            for head in 0..HEADS {
+                let start = head * HEAD_STRIDE;
+                let inv = (input[start..start + HEAD_DIM]
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f32>()
+                    / HEAD_DIM as f32
+                    + 1.0e-6)
+                    .sqrt()
+                    .recip();
+                for channel in 0..HEAD_DIM {
+                    expected[start + channel] = input[start + channel] * inv;
+                }
+                for channel in 0..ROTARY_DIM / 2 {
+                    let (sine, cosine) = (position as f64 * inv_freq[channel]).sin_cos();
+                    let (sine, cosine) = ((sine * mscale) as f32, (cosine * mscale) as f32);
+                    let first = input[start + channel] * inv;
+                    let second = input[start + ROTARY_DIM / 2 + channel] * inv;
+                    expected[start + channel] = first * cosine - second * sine;
+                    expected[start + ROTARY_DIM / 2 + channel] = first * sine + second * cosine;
+                }
             }
-            for channel in 0..ROTARY_DIM / 2 {
-                let angle = POSITION as f32
-                    / 10_000_000.0f32.powf(2.0 * channel as f32 / ROTARY_DIM as f32);
-                let (sine, cosine) = angle.sin_cos();
-                let first = input[start + channel] * inv;
-                let second = input[start + ROTARY_DIM / 2 + channel] * inv;
-                expected[start + channel] = first * cosine - second * sine;
-                expected[start + ROTARY_DIM / 2 + channel] = first * sine + second * cosine;
+            for (index, (got, want)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    (got - want).abs() <= tolerance,
+                    "QSA norm/RoPE {scaling:?} mismatch at {index}: got {got}, expected {want}"
+                );
             }
         }
-        for (index, (got, want)) in actual.iter().zip(&expected).enumerate() {
-            assert!(
-                (got - want).abs() <= 1.0e-4,
-                "QSA norm/RoPE mismatch at {index}: got {got}, expected {want}"
-            );
-        }
-        gpu.free_tensor(values).expect("free query/gate");
         gpu.free_tensor(norm).expect("free norm");
     }
 
-    /// Formats this device has QSA kernels for, beyond F32 (fp8: gfx12 only).
+    /// Formats this device has QSA kernels for, beyond F32 (fp8: gfx12 only;
+    /// q8: gfx11 and gfx12).
     fn quantized_qsa_formats(gpu: &Gpu) -> Vec<QsaKvFormat> {
+        let mut formats = Vec::new();
         if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
-            vec![QsaKvFormat::Fp8]
-        } else {
-            eprintln!("skip: fp8 QSA K/V needs a gfx12 GPU");
-            Vec::new()
+            formats.push(QsaKvFormat::Fp8);
         }
+        if gpu.arch_caps.has_gfx11_plus_simt() {
+            formats.push(QsaKvFormat::Q8);
+        }
+        if formats.is_empty() {
+            eprintln!("skip: quantized QSA K/V needs a gfx11 or gfx12 GPU");
+        }
+        formats
     }
 
     fn qsa_lcg(seed: usize, n: usize) -> Vec<f32> {
@@ -6489,6 +10233,11 @@ mod tests {
                     QsaKvFormat::Fp8 => {
                         let scale = half(base + kv_heads * head_dim + element / head_dim * 2);
                         e4m3_to_f32(bytes[base + element]) * scale
+                    }
+                    QsaKvFormat::Q8 => {
+                        let (head, d) = (element / head_dim, element % head_dim);
+                        let block = base + (head * (head_dim / 32) + d / 32) * 34;
+                        bytes[block + 2 + d % 32] as i8 as f32 * half(block)
                     }
                     QsaKvFormat::F32 => unreachable!("F32 rows are not quantized"),
                 });
@@ -6575,6 +10324,7 @@ mod tests {
                     position,
                     rows,
                     format,
+                    yarn: crate::rope::RopeYarn::OFF,
                 },
             )
             .expect("QSA prologue");
@@ -6627,13 +10377,35 @@ mod tests {
             let (k_rows, v_rows) = (tail(&decode_k), tail(&decode_v));
             let dequant_k = dequantize_qsa_rows(format, &k_rows, rows, kv_heads, head_dim);
             let dequant_v = dequantize_qsa_rows(format, &v_rows, rows, kv_heads, head_dim);
-            // E4M3 keeps 3 mantissa bits. A wrong head or scale lands near 1.
-            let tolerance = 5e-2;
-            for (reference, actual, what) in
-                [(&normed, &dequant_k, "keys"), (&values, &dequant_v, "values")]
-            {
+            // E4M3 keeps 3 mantissa bits, Q8_0 7 bits per 32-element block. A
+            // wrong head, block or scale lands near 1.
+            let tolerance = if format == QsaKvFormat::Q8 { 1e-2 } else { 5e-2 };
+            for (reference, actual, bytes, what) in [
+                (&normed, &dequant_k, &k_rows, "keys"),
+                (&values, &dequant_v, &v_rows, "values"),
+            ] {
                 let rel = rel_l2(reference, actual);
                 assert!(rel < tolerance, "{name} {what} rel L2 {rel:.3e}");
+                if format != QsaKvFormat::Q8 {
+                    continue;
+                }
+                // Q8_0 rounds against the f32 scale amax / 127 and stores it
+                // as f16: every element is within half an f32 step plus 127
+                // times the scale's f16 rounding. Blocks are consecutive
+                // 34-byte runs, in element order.
+                for (block, (want, got)) in
+                    reference.chunks_exact(32).zip(actual.chunks_exact(32)).enumerate()
+                {
+                    let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs())) / 127.0;
+                    let stored = f16_to_f32(u16::from_le_bytes([bytes[34 * block], bytes[34 * block + 1]]));
+                    let bound = 0.5 * scale * (1.0 + 1e-4) + 127.0 * (scale - stored).abs();
+                    for (w, g) in want.iter().zip(got) {
+                        assert!(
+                            (w - g).abs() <= bound,
+                            "{name} {what} block {block}: {g} vs {w} past the int8 bound {bound:.3e}"
+                        );
+                    }
+                }
             }
             for tensor in [
                 index_gpu, qgate_gpu, keys_gpu, values_gpu, index_norm, head_norm, decode_k,
@@ -6763,7 +10535,7 @@ mod tests {
                 .count();
             assert_eq!(differing, 0, "{name} grouped attention differs in {differing} cells");
             let rel = rel_l2(&reference, &per_head);
-            let tolerance = 5e-2;
+            let tolerance = if format == QsaKvFormat::Q8 { 1e-2 } else { 5e-2 };
             assert!(rel > 0.0 && rel < tolerance, "{name} attention rel L2 {rel:.3e}");
             // The single-row entry (explicit selection length) is the batched
             // per-head body for that row.
@@ -6857,6 +10629,7 @@ mod tests {
                     index_dim,
                     position: None,
                     grid_bound: block_count,
+                    yarn: crate::rope::RopeYarn::OFF,
                 },
             )
             .expect("QSA pool");
@@ -6909,6 +10682,606 @@ mod tests {
         }
         for tensor in [raw_f32, raw_bf16, norm, pooled_f32, pooled_bf16, query_gpu] {
             gpu.free_tensor(tensor).expect("free");
+        }
+    }
+
+    /// H4 shared-down fold: the BF16 shared-down GEMM that applies the scaled
+    /// add and the paired HC write in its epilogue must leave the HC streams
+    /// (and, when asked, the routed rows) bytewise as the F16 WMMA GEMM,
+    /// `bf16_scaled_add_batched` and `hyper_write` do, F32 and BF16-bit
+    /// streams, ragged row counts.
+    #[test]
+    fn shared_down_hcsd_is_bytewise_the_gemm_scaled_add_hyper_write_chain() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1151() {
+            eprintln!("skip: needs gfx1151");
+            return;
+        }
+        let (m, k) = (2560usize, 640usize);
+        let wide = 4 * m;
+        let mut weight = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(1, m * k, 0.3)), &[m * k * 2])
+            .expect("weight");
+        weight.dtype = DType::BF16;
+        weight.shape = vec![m * k];
+        let bits = |gpu: &Gpu, t: &GpuTensor| -> Vec<u32> {
+            gpu.download_f32(t)
+                .expect("download")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        for rows in [512usize, 530, 1100] {
+            assert!(gpu.gemm_bf16_xf32_f16_wmma_qwen4_hcsd_applies(&weight, m, k, rows));
+            let x = gpu
+                .upload_f32(&test_wave(2, rows * k, 2.0), &[rows * k])
+                .expect("x");
+            let selector = gpu
+                .upload_f32(&test_wave(3, rows, 1.0), &[rows])
+                .expect("selector");
+            let gates = gpu
+                .upload_f32(&test_wave(4, rows * 4, 1.5), &[rows * 4])
+                .expect("gates");
+            let routed_values = test_wave(5, rows * m, 3.0);
+            let normalized = gpu.zeros(&[rows * wide], DType::F32).expect("normalized");
+            for state_bf16 in [false, true] {
+                let initial = test_wave(6, rows * wide, 3.0);
+                let raw: Vec<u8> = if state_bf16 {
+                    let mut raw = bf16_le_bytes(&initial);
+                    raw.resize(rows * wide * 4, 0);
+                    raw
+                } else {
+                    initial.iter().flat_map(|v| v.to_le_bytes()).collect()
+                };
+                let mut streams = |gpu: &mut Gpu| {
+                    let mut t = gpu.upload_raw(&raw, &[rows * wide * 4]).expect("streams");
+                    t.dtype = DType::F32;
+                    t.shape = vec![rows * wide];
+                    t
+                };
+                let reference_streams = streams(&mut gpu);
+                let reference_routed = gpu
+                    .upload_f32(&routed_values, &[rows * m])
+                    .expect("routed");
+                let projected = gpu.zeros(&[rows * m], DType::F32).expect("projected");
+                assert!(gpu
+                    .gemm_bf16_xf32_f16_wmma_qwen4(&[(&weight, &projected, m)], &x, k, rows)
+                    .expect("gemm"));
+                bf16_scaled_add_batched(
+                    &mut gpu,
+                    &Bf16ScaledAddBatched {
+                        residual: &reference_routed,
+                        value: &projected,
+                        scalar: &selector,
+                        rows,
+                        elements: m,
+                    },
+                )
+                .expect("scaled add");
+                hyper_write(
+                    &mut gpu,
+                    &HyperWrite {
+                        input: &reference_streams,
+                        normalized: &normalized,
+                        mixed: &reference_routed,
+                        gates: &gates,
+                        output: &reference_streams,
+                        branches: 4,
+                        hidden: m,
+                        state_bf16,
+                    },
+                )
+                .expect("write");
+                for write_routed in [false, true] {
+                    let fused_streams = streams(&mut gpu);
+                    let fused_routed = gpu
+                        .upload_f32(&routed_values, &[rows * m])
+                        .expect("routed");
+                    gpu.gemm_bf16_xf32_f16_wmma_qwen4_hcsd(
+                        &weight,
+                        &x,
+                        m,
+                        k,
+                        rows,
+                        &fused_routed,
+                        &selector,
+                        &fused_streams,
+                        &gates,
+                        state_bf16,
+                        write_routed,
+                    )
+                    .expect("hcsd");
+                    let (want, got) = (bits(&gpu, &reference_streams), bits(&gpu, &fused_streams));
+                    assert_ne!(want.len(), 0);
+                    let differing = want.iter().zip(&got).filter(|(a, b)| a != b).count();
+                    assert_eq!(
+                        differing, 0,
+                        "{differing} stream words differ: rows={rows} state_bf16={state_bf16} \
+                         write_routed={write_routed}"
+                    );
+                    if write_routed {
+                        assert_eq!(
+                            bits(&gpu, &reference_routed),
+                            bits(&gpu, &fused_routed),
+                            "routed rows differ: rows={rows}"
+                        );
+                    } else {
+                        assert_eq!(
+                            routed_values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            bits(&gpu, &fused_routed),
+                            "routed rows were rewritten without hc_write_routed"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// HC row fold (`HIPFIRE_QWEN4_HC_ROW_FOLD`): the BF16-store shared-down GEMM
+    /// plus `hc_row_fold_norm_gate` must leave the HC streams, the next read's F16
+    /// normalized row and its paired write's gate logits bytewise as the
+    /// zero-initialized combine, the `hcsd` fold + HC write GEMM and
+    /// `hyper_norm_gate_outputs` do, with dead (-1) routes, tied experts and
+    /// ragged token counts.
+    #[test]
+    fn hc_row_fold_is_bytewise_combine_hcsd_norm_gate_chain() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1151() {
+            eprintln!("skip: needs gfx1151");
+            return;
+        }
+        let (m, k) = (2560usize, 640usize);
+        let wide = 4 * m;
+        let bf16_tensor = |gpu: &mut Gpu, values: &[f32]| -> GpuTensor {
+            let mut t = gpu
+                .upload_raw(&bf16_le_bytes(values), &[values.len() * 2])
+                .expect("bf16 upload");
+            t.dtype = DType::BF16;
+            t.shape = vec![values.len()];
+            t
+        };
+        let weight = bf16_tensor(&mut gpu, &test_wave(1, m * k, 0.3));
+        let norm_weight = bf16_tensor(&mut gpu, &test_wave(7, wide, 0.3));
+        let gate_weight = bf16_tensor(&mut gpu, &test_wave(8, 4 * wide, 0.05));
+        let ints = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        for rows in [512usize, 530, 1100] {
+            let grouped_rows = rows * 10 + 16;
+            let grouped = gpu
+                .upload_raw(&bf16_le_bytes(&test_wave(9, grouped_rows * m, 2.0)), &[grouped_rows * m * 2])
+                .expect("grouped");
+            let inverse: Vec<i32> = (0..rows * 10)
+                .map(|i| if i % 13 == 5 { -1 } else { ((i * 7919) % grouped_rows) as i32 })
+                .collect();
+            let experts: Vec<i32> = (0..rows * 10).map(|i| ((i * 37) % 64) as i32).collect();
+            let inverse = gpu.upload_raw(&ints(&inverse), &[rows * 40]).expect("inverse");
+            let experts = gpu.upload_raw(&ints(&experts), &[rows * 40]).expect("experts");
+            let route_weights: Vec<f32> =
+                test_wave(10, rows * 10, 1.0).iter().map(|v| v.abs() / 3.0).collect();
+            let route_weights = gpu.upload_f32(&route_weights, &[rows * 10]).expect("weights");
+            let order = gpu.zeros(&[rows * 20], DType::F32).expect("order");
+            let x = gpu.upload_f32(&test_wave(2, rows * k, 2.0), &[rows * k]).expect("x");
+            let selector = gpu.upload_f32(&test_wave(3, rows, 1.0), &[rows]).expect("selector");
+            let gates = gpu.upload_f32(&test_wave(4, rows * 4, 1.5), &[rows * 4]).expect("gates");
+            let mut raw = bf16_le_bytes(&test_wave(6, rows * wide, 3.0));
+            raw.resize(rows * wide * 4, 0);
+            let streams = |gpu: &mut Gpu| {
+                let mut t = gpu.upload_raw(&raw, &[rows * wide * 4]).expect("streams");
+                t.dtype = DType::F32;
+                t.shape = vec![rows * wide];
+                t
+            };
+            // Reference: zero-initialized combine, hcsd, hyper_norm_gate_outputs.
+            let routed = gpu.zeros(&[rows * m], DType::F32).expect("routed");
+            gpu.moe_down_combine_grouped_top10_bf16in(
+                &grouped, &inverse, &experts, &route_weights, &routed, &order, m, grouped_rows, rows, true,
+            )
+            .expect("combine");
+            let ref_streams = streams(&mut gpu);
+            gpu.gemm_bf16_xf32_f16_wmma_qwen4_hcsd(
+                &weight, &x, m, k, rows, &routed, &selector, &ref_streams, &gates, true, false,
+            )
+            .expect("hcsd");
+            let ref_gates = gpu.zeros(&[rows * 4], DType::F32).expect("ref gates");
+            let ref_row = gpu.zeros(&[rows * wide], DType::F16).expect("ref row");
+            hyper_norm_gate_outputs(
+                &mut gpu,
+                &HyperNormGateOutputs {
+                    input: &ref_streams,
+                    norm_weight: &norm_weight,
+                    gate_weight: &gate_weight,
+                    gates: &ref_gates,
+                    normalized_f16: &ref_row,
+                    rows,
+                    branches: 4,
+                    hidden: m,
+                    state_bf16: true,
+                },
+            )
+            .expect("norm gate");
+            // Row fold.
+            let new_streams = streams(&mut gpu);
+            let shared = gpu.zeros(&[rows * m], DType::F32).expect("shared");
+            let new_gates = gpu.zeros(&[rows * 4], DType::F32).expect("new gates");
+            let new_row = gpu.zeros(&[rows * wide], DType::F16).expect("new row");
+            gpu.moe_combine_order_top10(&inverse, &experts, &route_weights, &order, grouped_rows, rows)
+                .expect("order");
+            gpu.gemm_bf16_xf32_f16_wmma_qwen4_bf16st(&weight, &x, m, k, rows, &shared)
+                .expect("bf16st");
+            gpu.hc_row_fold_norm_gate(&crate::hc_row_fold::HcRowFold {
+                grouped_down: &grouped,
+                order: &order,
+                shared_bf16: &shared,
+                selector: &selector,
+                streams: &new_streams,
+                gates: &gates,
+                norm_weight: &norm_weight,
+                gate_weight: &gate_weight,
+                next_gates: &new_gates,
+                normalized_f16: &new_row,
+                rows,
+                hidden: m,
+            })
+            .expect("row fold");
+            let words = |gpu: &Gpu, t: &GpuTensor| gpu.download_raw_bytes(t).expect("download");
+            for (name, want, got) in [
+                ("streams", words(&gpu, &ref_streams), words(&gpu, &new_streams)),
+                ("gate logits", words(&gpu, &ref_gates), words(&gpu, &new_gates)),
+                ("normalized f16 row", words(&gpu, &ref_row), words(&gpu, &new_row)),
+            ] {
+                assert_ne!(want.len(), 0);
+                assert!(want == got, "{name} differ: rows={rows}");
+            }
+        }
+    }
+
+    const BF16_PM_ROWS: usize = 600;
+    const BF16_PM_BLOCKS: usize = 2000;
+    const BF16_PM_COMPRESS: usize = 4;
+    const BF16_PM_HEADS: usize = 4;
+    const BF16_PM_DIM: usize = 128;
+    const BF16_PM_BUDGET: usize = 256;
+    const BF16_PM_CAPACITY: usize = BF16_PM_BUDGET * BF16_PM_COMPRESS + BF16_PM_COMPRESS - 1;
+    /// Padded past `heads * dim` so the query row stride is not the extent.
+    const BF16_PM_QUERY_STRIDE: usize = BF16_PM_HEADS * BF16_PM_DIM + 16;
+    const BF16_PM_POISON: u8 = 0xa5;
+    /// Poisoned bytes after `selected` / `mirror`: a stray write shows.
+    const BF16_PM_CANARY: usize = 4096;
+
+    /// Prefill-sized BF16-pooled selection (600 rows, so the last sixteen-row
+    /// score group is ragged: 600 = 37 * 16 + 8; 2000 blocks) on synthetic
+    /// keys with many equal scores: a run of 40 and a run of 50 identical
+    /// blocks (the budget boundary falls inside the second), a 400-block
+    /// region of four constant key levels, a run of all-negative (ReLU zero)
+    /// keys, and every seventh block a copy of the block three before it.
+    struct Bf16PmSelect {
+        query: GpuTensor,
+        pooled: GpuTensor,
+        selected: GpuTensor,
+        mirror: GpuTensor,
+    }
+
+    struct Bf16PmOut {
+        selected: Vec<u8>,
+        mirror: Vec<u8>,
+        persisted: bool,
+    }
+
+    impl Bf16PmOut {
+        fn selected_len() -> usize {
+            BF16_PM_ROWS * BF16_PM_CAPACITY * 4
+        }
+
+        fn mirror_len() -> usize {
+            BF16_PM_CAPACITY * 4
+        }
+
+        fn canaries_intact(&self) -> bool {
+            self.selected[Self::selected_len()..].iter().all(|b| *b == BF16_PM_POISON)
+                && self.mirror[Self::mirror_len()..].iter().all(|b| *b == BF16_PM_POISON)
+        }
+
+        fn untouched(&self) -> bool {
+            self.selected.iter().all(|b| *b == BF16_PM_POISON)
+                && self.mirror.iter().all(|b| *b == BF16_PM_POISON)
+        }
+
+        fn last_row(&self) -> &[u8] {
+            &self.selected[Self::selected_len() - Self::mirror_len()..Self::selected_len()]
+        }
+
+        fn selected_entries(&self) -> usize {
+            self.selected[..Self::selected_len()]
+                .chunks_exact(4)
+                .filter(|w| i32::from_ne_bytes((*w).try_into().expect("i32 word")) >= 0)
+                .count()
+        }
+    }
+
+    impl Bf16PmSelect {
+        fn new(gpu: &mut Gpu) -> Self {
+            let mut state = 0x51ca_17b3u32;
+            let mut next = move || {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 8) as f32 / 16_777_216.0
+            };
+            // Positive queries: a block whose keys are all negative scores 0.
+            let query: Vec<f32> = (0..BF16_PM_ROWS * BF16_PM_QUERY_STRIDE).map(|_| next()).collect();
+            let mut keys = vec![0f32; BF16_PM_BLOCKS * BF16_PM_DIM];
+            for block in 0..BF16_PM_BLOCKS {
+                for d in 0..BF16_PM_DIM {
+                    let random = next();
+                    keys[block * BF16_PM_DIM + d] = match block {
+                        1000..=1039 => 0.9,
+                        1200..=1249 => 0.6,
+                        300..=699 => {
+                            [0.05f32, 0.15, 0.25, 0.35][(block.wrapping_mul(2_654_435_761) >> 5) & 3]
+                        }
+                        1500..=1599 => -random - 0.01,
+                        _ => random - 0.25,
+                    };
+                }
+            }
+            for block in (8..BF16_PM_BLOCKS).filter(|b| b % 7 == 3) {
+                keys.copy_within(
+                    (block - 3) * BF16_PM_DIM..(block - 2) * BF16_PM_DIM,
+                    block * BF16_PM_DIM,
+                );
+            }
+            let pooled_bytes: Vec<u8> = keys
+                .iter()
+                .flat_map(|v| {
+                    // Round to nearest even, the BF16 the index-key append stores.
+                    let bits = v.to_bits();
+                    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) >> 16;
+                    (rounded as u16).to_le_bytes()
+                })
+                .collect();
+            let mut pooled = gpu
+                .upload_raw(&pooled_bytes, &[pooled_bytes.len()])
+                .expect("pooled upload");
+            pooled.dtype = DType::BF16;
+            pooled.shape = vec![keys.len()];
+            let selected_len = Bf16PmOut::selected_len() + BF16_PM_CANARY;
+            let mirror_len = Bf16PmOut::mirror_len() + BF16_PM_CANARY;
+            Self {
+                query: gpu.upload_f32(&query, &[query.len()]).expect("query upload"),
+                pooled,
+                selected: gpu
+                    .upload_raw(&vec![BF16_PM_POISON; selected_len], &[selected_len])
+                    .expect("selected upload"),
+                mirror: gpu
+                    .upload_raw(&vec![BF16_PM_POISON; mirror_len], &[mirror_len])
+                    .expect("mirror upload"),
+            }
+        }
+
+        fn params(&self) -> IndexedAttentionSelectBatch<'_> {
+            IndexedAttentionSelectBatch {
+                query: &self.query,
+                pooled: &self.pooled,
+                selected: &self.selected,
+                rows: BF16_PM_ROWS,
+                query_row_stride: BF16_PM_QUERY_STRIDE,
+                block_count: BF16_PM_BLOCKS,
+                index_heads: BF16_PM_HEADS,
+                index_dim: BF16_PM_DIM,
+                budget_blocks: BF16_PM_BUDGET,
+                compress: BF16_PM_COMPRESS,
+                // (position_start + rows) / compress == block_count.
+                position_start: BF16_PM_BLOCKS * BF16_PM_COMPRESS - BF16_PM_ROWS,
+                capacity: BF16_PM_CAPACITY,
+                shape_blocks: BF16_PM_BLOCKS,
+            }
+        }
+
+        fn poison(&self, gpu: &Gpu) {
+            for t in [&self.selected, &self.mirror] {
+                gpu.hip
+                    .memset(&t.buf, BF16_PM_POISON as i32, t.byte_size())
+                    .expect("poison outputs");
+            }
+        }
+
+        fn download(&self, gpu: &Gpu, persisted: bool) -> Bf16PmOut {
+            Bf16PmOut {
+                selected: gpu.download_raw_bytes(&self.selected).expect("selected download"),
+                mirror: gpu.download_raw_bytes(&self.mirror).expect("mirror download"),
+                persisted,
+            }
+        }
+
+        /// The lab helper with `arm`, outputs poisoned first.
+        fn run_arm(&self, gpu: &mut Gpu, arm: QsaSelectPmArm, with_mirror: bool) -> Bf16PmOut {
+            self.poison(gpu);
+            let persisted = indexed_attention_select_batch_pm_arm(
+                gpu,
+                &self.params(),
+                with_mirror.then_some(&self.mirror),
+                arm,
+            )
+            .unwrap_or_else(|e| panic!("BF16 select arm {arm:?}: {e}"));
+            self.download(gpu, persisted)
+        }
+
+        /// The default route (`indexed_attention_select_batch[_mirrored]`),
+        /// outputs poisoned first.
+        fn run_default(&self, gpu: &mut Gpu, with_mirror: bool) -> Bf16PmOut {
+            self.poison(gpu);
+            let persisted = if with_mirror {
+                indexed_attention_select_batch_mirrored(gpu, &self.params(), &self.mirror)
+                    .expect("default mirrored BF16 select")
+            } else {
+                indexed_attention_select_batch(gpu, &self.params())
+                    .expect("default BF16 select");
+                false
+            };
+            self.download(gpu, persisted)
+        }
+
+        fn free(self, gpu: &mut Gpu) {
+            for t in [self.query, self.pooled, self.selected, self.mirror] {
+                gpu.free_tensor(t).expect("free");
+            }
+        }
+    }
+
+    /// The fused BF16 arm (`Hipcc`) is the reference; the builder score pair
+    /// (`ScoreOnly`, `Both`) must reproduce its selection, mirror and
+    /// persisted flag byte for byte, with and without a mirror. `SelectOnly`
+    /// has no hipcc BF16 rows score kernel and must refuse before any launch.
+    #[test]
+    fn qsa_bf16_pm_select_arms_match_the_fused_bf16_arm_byte_for_byte() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1151() {
+            eprintln!("skip: needs gfx1151");
+            return;
+        }
+        let case = Bf16PmSelect::new(&mut gpu);
+
+        // SelectOnly on BF16 keys: refused, and nothing was launched.
+        case.poison(&gpu);
+        let refused = indexed_attention_select_batch_pm_arm(
+            &mut gpu,
+            &case.params(),
+            Some(&case.mirror),
+            QsaSelectPmArm::SelectOnly,
+        );
+        assert!(refused.is_err(), "BF16 SelectOnly must be refused");
+        assert!(
+            case.download(&gpu, false).untouched(),
+            "refused BF16 SelectOnly wrote outputs (launched before refusing)"
+        );
+
+        let reference = case.run_arm(&mut gpu, QsaSelectPmArm::Hipcc, true);
+        assert!(reference.persisted, "fused BF16 arm did not persist the mirror");
+        assert!(reference.canaries_intact(), "fused BF16 arm wrote past its outputs");
+        // Every row emits its 256 blocks (1024 tokens); the rows' tails follow.
+        assert!(
+            reference.selected_entries() >= BF16_PM_ROWS * BF16_PM_BUDGET * BF16_PM_COMPRESS,
+            "fused BF16 arm selected too few tokens"
+        );
+        assert_eq!(
+            &reference.mirror[..Bf16PmOut::mirror_len()],
+            reference.last_row(),
+            "mirror is not the final row's selection"
+        );
+        for arm in [QsaSelectPmArm::ScoreOnly, QsaSelectPmArm::Both] {
+            let out = case.run_arm(&mut gpu, arm, true);
+            assert!(out.persisted, "{arm:?}: mirror not persisted");
+            assert!(out.canaries_intact(), "{arm:?}: wrote past its outputs");
+            assert!(out.selected == reference.selected, "{arm:?}: selection differs from the fused BF16 arm");
+            assert!(out.mirror == reference.mirror, "{arm:?}: mirror differs from the fused BF16 arm");
+        }
+        // Without a mirror: the same selection, nothing persisted, mirror untouched.
+        for arm in [QsaSelectPmArm::Hipcc, QsaSelectPmArm::ScoreOnly, QsaSelectPmArm::Both] {
+            let out = case.run_arm(&mut gpu, arm, false);
+            assert!(!out.persisted, "{arm:?}: persisted without a mirror");
+            assert!(out.selected == reference.selected, "{arm:?}: selection differs without a mirror");
+            assert!(
+                out.mirror.iter().all(|b| *b == BF16_PM_POISON),
+                "{arm:?}: wrote a mirror it was not given"
+            );
+        }
+        case.free(&mut gpu);
+    }
+
+    /// The default mirrored entry on BF16 keys (whichever arm the route's
+    /// environment picks) must equal the fused BF16 arm byte for byte.
+    #[test]
+    fn qsa_bf16_default_mirrored_select_matches_the_fused_bf16_arm() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        if !gpu.arch_caps.is_gfx1151() {
+            eprintln!("skip: needs gfx1151");
+            return;
+        }
+        let case = Bf16PmSelect::new(&mut gpu);
+        let reference = case.run_arm(&mut gpu, QsaSelectPmArm::Hipcc, true);
+        assert!(reference.persisted, "fused BF16 arm did not persist the mirror");
+        let mirrored = case.run_default(&mut gpu, true);
+        assert!(mirrored.persisted, "default BF16 route did not persist the mirror");
+        assert!(mirrored.canaries_intact(), "default BF16 route wrote past its outputs");
+        assert!(mirrored.selected == reference.selected, "default BF16 selection differs from the fused arm");
+        assert!(mirrored.mirror == reference.mirror, "default BF16 mirror differs from the fused arm");
+        let plain = case.run_default(&mut gpu, false);
+        assert!(!plain.persisted);
+        assert!(plain.selected == reference.selected, "default BF16 selection without a mirror differs");
+        case.free(&mut gpu);
+    }
+}
+
+#[cfg(test)]
+mod route_selector_tests {
+    use super::*;
+
+    #[test]
+    fn qsa_select_switches_preserve_all_four_arms() {
+        for fits in [false, true] {
+            for score in [false, true] {
+                for select in [false, true] {
+                    let old = if !fits { QsaSelectPmArm::Hipcc } else {
+                        match (score, select) {
+                            (false, false) => QsaSelectPmArm::Hipcc,
+                            (true, false) => QsaSelectPmArm::ScoreOnly,
+                            (false, true) => QsaSelectPmArm::SelectOnly,
+                            (true, true) => QsaSelectPmArm::Both,
+                        }
+                    };
+                    assert_eq!(qsa_select_pm_selected(fits, score, select), old);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn qsa_select_shape_thresholds_and_raw_offsets() {
+        for halo in [false, true] {
+            for dtype in [DType::F32, DType::BF16, DType::F16] {
+                for rows in [511usize, 512, 513] {
+                    for blocks in [0, QSA_SELECT_PM_MAX_BLOCKS - 1, QSA_SELECT_PM_MAX_BLOCKS, QSA_SELECT_PM_MAX_BLOCKS + 1] {
+                        for stride in [512, usize::MAX] {
+                            let below = |n: Option<usize>| n.is_some_and(|v| v < 0x7fff_ff00);
+                            let old = halo && matches!(dtype, DType::F32 | DType::BF16)
+                                && rows >= 512 && blocks <= QSA_SELECT_PM_MAX_BLOCKS
+                                && below(rows.checked_mul(stride).and_then(|v| v.checked_mul(4)))
+                                && below(blocks.checked_mul(128 * dtype.size()))
+                                && below(rows.checked_mul(1027).and_then(|v| v.checked_mul(4)));
+                            assert_eq!(qsa_select_pm_shape_fits(
+                                halo, dtype, rows, 4, 128, blocks, stride, 1027,
+                            ), old);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(!qsa_select_pm_shape_fits(true, DType::F32, 512, 3, 128, 128, 512, 1027));
+        assert!(!qsa_select_pm_shape_fits(true, DType::F32, 512, 4, 127, 128, 512, 1027));
+    }
+
+    #[test]
+    fn qsa_gathered_raw_offset_admission_is_unchanged() {
+        for capacity in [32767usize, 32768, 32769, (1 << 24) - 1, 1 << 24] {
+            for kv in [1usize, 4, 8] {
+                for heads in [4usize, 24, 32] {
+                    let scratch = capacity.div_ceil(4).checked_mul(4)
+                        .and_then(|t| t.checked_mul(kv * 512));
+                    let old = scratch.is_some_and(|v| v + 4096 <= 0x7fff_ff00)
+                        && heads.checked_mul(2048).is_some_and(|v| v + 4096 <= 0x7fff_ff00)
+                        && capacity < 1 << 24 && kv * 2048 < 1 << 24;
+                    assert_eq!(qsa_gathered_pm_shape_fits(capacity, kv, heads), old);
+                }
+            }
         }
     }
 }

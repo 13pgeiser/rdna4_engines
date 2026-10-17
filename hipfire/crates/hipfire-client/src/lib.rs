@@ -486,6 +486,15 @@ impl Engine {
                         | "aborted"
                         | "done"
                         | "error"
+                        // One-shot synchronous verbs (`embed`) reply with `id`
+                        // and `attempt_id: 0` — the key their caller registers
+                        // — so their result belongs to that transaction, not to
+                        // the single control slot below. Classifying it here is
+                        // what lets several embeds be in flight at once: the
+                        // control slot holds exactly one transaction, so an
+                        // unclassified reply goes to whichever request
+                        // registered last and every other one waits forever.
+                        | "embedded"
                 );
                 if is_lifecycle {
                     match route_lifecycle_event(ty, &value) {
@@ -547,17 +556,25 @@ impl Engine {
     /// environment map is reserved for non-hipfire bootstrap state inherited
     /// by external launchers. The daemon itself resolves `hardware.devices`,
     /// reserving the chosen cards in the same step, and lowers it to ROCr/HIP
-    /// visibility; resolving here could not hold those reservations.
+    /// visibility; resolving here could not hold those reservations. `model`
+    /// names the model the daemon is started for, which settles runtime
+    /// switches only readable before its GPU runtime loads (host memory for
+    /// a Qwen4 model on a discrete GPU).
     pub fn spawn_configured(
         daemon: impl AsRef<Path>,
         environment: &BTreeMap<String, String>,
         config: &hipfire_config::ProcessConfig,
+        model: Option<&Path>,
     ) -> Result<Self> {
         let engine = Self::spawn(daemon, environment)?;
-        let response = engine.request(&serde_json::json!({
+        let mut configure = serde_json::json!({
             "type": "configure",
             "config": config,
-        }))?;
+        });
+        if let Some(model) = model {
+            configure["model"] = serde_json::json!(model);
+        }
+        let response = engine.request(&configure)?;
         expect_type(&response, "configured")?;
         Ok(engine)
     }
@@ -724,6 +741,68 @@ impl Engine {
                         self.inner.dispatch.pending.lock().unwrap().remove(&key);
                         return Err(e);
                     }
+                }
+            }
+        }
+    }
+
+    /// Embedding encode request: send `embed`, return the terminal
+    /// `embedded` value (token embeddings matrix).
+    ///
+    /// The reply is keyed `(id, 0)` and routed through the `pending` map —
+    /// the reader classifies `embedded`/`error` as lifecycle events. This
+    /// function deliberately does NOT claim the shared `control` slot:
+    /// several embeds can be in flight at once (the multi-slot daemon
+    /// batches them), and a registered control sender would both steal an
+    /// id-less reply from a concurrent control verb and be clobbered by the
+    /// next one. Pending-keyed delivery alone covers every reply shape this
+    /// verb emits.
+    pub fn embed(&self, request: &Value) -> Result<Value> {
+        let request_id = request
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ClientError::Protocol("embed request missing id".into()))?
+            .to_owned();
+        let (tx, rx) = mpsc::channel();
+        let key = (request_id.clone(), 0u64);
+        {
+            let mut map = self.inner.dispatch.pending.lock().unwrap();
+            if map.contains_key(&key) {
+                return Err(ClientError::Protocol(format!(
+                    "duplicate live embed id={request_id} attempt_id=0"
+                )));
+            }
+            map.insert(key.clone(), tx.clone());
+        }
+        let cleanup = |inner: &EngineInner| {
+            inner.dispatch.pending.lock().unwrap().remove(&key);
+        };
+        let send_res = self.send(request);
+        if let Err(e) = send_res {
+            cleanup(&self.inner);
+            return Err(e);
+        }
+        loop {
+            let response = match self.recv_control(&rx) {
+                Ok(v) => v,
+                Err(e) => {
+                    cleanup(&self.inner);
+                    return Err(e);
+                }
+            };
+            match response.get("type").and_then(Value::as_str) {
+                Some("embedded") => {
+                    cleanup(&self.inner);
+                    return Ok(response);
+                }
+                Some("error") => {
+                    cleanup(&self.inner);
+                    return Err(daemon_error_from_value(&response));
+                }
+                _ => {
+                    // No progress events today; ignore anything else the
+                    // daemon interleaves (e.g. metrics).
                 }
             }
         }
@@ -2120,6 +2199,35 @@ mod tests {
     }
 
     #[test]
+    fn route_lifecycle_embed_reply_is_keyed_at_attempt_zero() {
+        // `embed` is a synchronous, attempt-less verb: its caller registers
+        // `(id, 0)`. An unclassified reply falls through to the single control
+        // slot, which holds ONE transaction — so two concurrent embeds would
+        // both deliver into whichever registered last and every other waiter
+        // would block forever. The classification is what makes the multi-slot
+        // embedding route able to have several requests in flight.
+        let reply = serde_json::json!({
+            "type": "embedded",
+            "id": "embed-7",
+            "attempt_id": 0,
+            "kind": "document",
+            "n_tokens": 3,
+            "dim": 128,
+            "embeddings": [0.0],
+        });
+        assert_eq!(
+            route_lifecycle_event("embedded", &reply),
+            LifecycleRoute::Pending(("embed-7".into(), 0))
+        );
+        // A reply that lost its id is quarantined, never fanned into peers.
+        let unkeyed = serde_json::json!({"type": "embedded", "attempt_id": 0});
+        assert_eq!(
+            route_lifecycle_event("embedded", &unkeyed),
+            LifecycleRoute::Drop
+        );
+    }
+
+    #[test]
     fn route_lifecycle_keyed_error_is_pending_only() {
         let err = serde_json::json!({
             "type": "error",
@@ -2471,7 +2579,7 @@ done
         const MAX_ATTEMPTS: usize = 8;
         let mut last = None;
         for attempt in 0..MAX_ATTEMPTS {
-            match Engine::spawn_configured(daemon, &BTreeMap::new(), config) {
+            match Engine::spawn_configured(daemon, &BTreeMap::new(), config, None) {
                 Ok(engine) => return engine,
                 Err(ClientError::Spawn { source, path })
                     if source.raw_os_error() == Some(ETXTBSY) =>

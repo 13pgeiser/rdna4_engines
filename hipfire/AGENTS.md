@@ -160,11 +160,21 @@ works, what to measure, what counts as pass/fail.
   prefill. MoE/A3B + MQ3 is refused at load time (no MoE-branched WMMA
   path).
 - **MQ2 is refused by default.** The quantizer requires
-  `--format mq2 --i-know-this-is-broken` to opt in. Severe quality
+  `--format mq2 --allow-mq2` (or `HIPFIRE_ALLOW_MQ2=1`) to opt in. Severe quality
   cliff confirmed; Lloyd-Max MQ2/MQ3 (qt=19/20) is the path forward.
-- **`dflash_mode=off` is the default.** Any test exercising DFlash
-  still needs `hipfire config set dflash_mode auto` or
-  `HIPFIRE_DFLASH_DRAFT=<path>` first.
+- **`dflash_mode=off` is the schema default.** Any test exercising DFlash
+  on a model without a registry DFlash policy still needs
+  `hipfire config set dflash_mode auto` or
+  `HIPFIRE_DFLASH_DRAFT=<path>` first. The one exception is the
+  Qwen3.8-27B tiers that declare a paired draft (`qwen3.8:27b`, `-mq3*`,
+  `-mq4*`, including the canonical `qwen3.8:27b-mq4-xts` fixture): the
+  registry layer sets `speculation.dflash=auto`, so a present paired file
+  activates DFlash with no config, an absent file keeps MTP `auto`, and an
+  explicit `dflash_mode off` (canonical `speculation.dflash=off`) is the
+  kill switch. `dflash_block` stays `auto` (L16 singleton, L8 on a
+  `serve.vmm_batch` serve with ≥ 4 lanes, IU4 verify gates unchanged).
+  DFlash greedy may differ from AR near argmax ties; judge it against the
+  MTP arm and the C1 == C8 state oracle, not byte-equality with AR.
 - **PFlash is deprecated since 0.4.0 and will be removed in 0.5.0.**
   It lives in `crates/hipfire-pflash` outside `crates/hipfire-arch-*`, still
   loads, warns when used (`prefill_compression` != `off`), and is not
@@ -229,6 +239,14 @@ works, what to measure, what counts as pass/fail.
    TypeScript/JavaScript runtime surface. `scripts/install.{sh,ps1}`, Nix, and
    the container build install the native `hipfire` binary. Python remains
    appropriate for developer-only orchestration and analysis scripts.
+7. **Run `scripts/pre-commit-ci.sh [origin/<base>]` before every commit.**
+   It runs the GPU-free CI checks that finish quickly: ratchets, crate
+   maps, scratch growth, changelog, ratchet-diff, cargo-deny
+   bans/licenses/sources, rustfmt on changed files, clippy, env docs and
+   lifecycle. It skips the tests and the release build. Pass the branch
+   your PR targets (for example `origin/beta`) so ratchet-diff compares
+   against it. Fix every failure before you commit. Install cargo-deny first
+   with `cargo install --locked cargo-deny`; missing tools fail the check.
 
 ---
 
@@ -244,7 +262,8 @@ DFlash draft sidecar (same mechanism as the MTP/DSpark sidecars):
 hipfire pull qwen3.8:27b-mq4-xts   # ~15 GB target + MQ4 DFlash draft sidecar
 # lands at ~/.hipfire/models/qwen3.8-27b.mq4-xts
 # measured draft identity (acceptance/perf pin):
-#   ~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq
+#   a local copy of the registry draft (same bytes as the
+#   qwen38-27b-dflash-mq4.hfq sidecar)
 #   (see §5 "Pinned Hugging Face bench fixture")
 
 # Smaller / faster smoke only (not the acceptance fixture):
@@ -258,8 +277,9 @@ Legacy `qwen3.{5,6}:{9b,27b}-draft` tags remain pullable.
 
 Files land at `~/.hipfire/models/<canonical-name>`.
 **Do not rename.** Load resolves the draft by its registry-declared
-filename; renaming breaks the pairing — `dflash_mode auto` then runs AR
-(one warning line), `on` fails the load.
+filename; renaming breaks the pairing — an explicit `dflash_mode auto` then
+runs AR (one warning line) and `on` fails the load; a Qwen3.8-27B tier
+(registry `auto`) keeps MTP `auto` when the draft file is absent.
 
 ### Verify hashes after pull (paranoid mode)
 
@@ -359,7 +379,8 @@ Standalone: `cargo run --release -p hipfire-runtime --example encode_prompt -- M
 - Registry draft sidecar: `qwen38-27b-dflash-mq4.hfq`
   (`hipfire pull qwen3.8:27b-mq4-xts` or `hipfire pull qwen3.8:27b-draft`)
 - Measured draft identity (acceptance/perf pin):
-  `~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq` (see §5)
+  a local copy of the registry draft (same bytes as the
+  `qwen38-27b-dflash-mq4.hfq` sidecar; see §5)
 
 Still pullable (smaller smoke / historical):
 
@@ -472,9 +493,10 @@ If you're testing an actual user UX flow:
 
 ```bash
 hipfire pull qwen3.8:27b-mq4-xts   # target + registry draft sidecar
-hipfire config set dflash_mode auto    # opt in (default since 2026-04-26: off)
+# Qwen3.8-27B paired tiers need no config: the registry resolves dflash=auto.
+# Other models: hipfire config set dflash_mode auto    # opt in (schema default: off)
 # Acceptance draft pin when measuring (optional override of registry sidecar):
-# export HIPFIRE_DFLASH_DRAFT=~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq
+# export HIPFIRE_DFLASH_DRAFT=/path/to/local-copy-of-registry-draft.hfq   # same bytes as the qwen38-27b-dflash-mq4.hfq sidecar
 hipfire run qwen3.8:27b-mq4-xts "Write a Python function to find the longest substring without repeating characters"
 # expected: loader logs 'DFlash draft loaded: ...'
 # on-disk target: ~/.hipfire/models/qwen3.8-27b.mq4-xts
@@ -579,8 +601,8 @@ The canonical dense trunk is whichever local artifact byte-matches
   three GPTQ scale-refit rounds on the v5 Hessian. It replaces the
   2026-09-23 `mq4-xts` test upload (QAT r7s200, `de8ee825…`), which is not
   comparable.
-- Paired draft (the registry sidecar `qwen38-27b-dflash-mq4.hfq`, same bytes):
-  `~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq`
+- Paired draft: the registry sidecar `qwen38-27b-dflash-mq4.hfq`, or a local
+  copy of the registry draft (the same bytes)
   (sha256 `d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc`)
 
 Before reporting dense 3.8 MQ4V2/DFlash results, verify the candidate
@@ -596,17 +618,52 @@ code24 `heldout-code24.gptqsym.kldref.bin` (sha256
 `43ab7591f2acf6b5b4058b77253109230d96591be02469ddef55235102ec7582`).
 A change that claims to be bit-exact must reproduce its arch's `.kldseq`
 byte for byte. A change that moves a pin on purpose re-pins it here.
+A re-pin must record, in the same commit: the evaluator build commit,
+the evaluator binary md5, and the receipt path. The public references and
+one-command reproduction live in `kld/VERIFY.md` on the model's Hugging Face
+repo (`hipfire-models/qwen3.8-27b`, `hipfire-models/qwen3.8-flash-next`);
+update it with the pin.
+
+Toolchain: **measured on ROCm 10.1 / HIP 7.16 / clang 24** (lld 24,
+code object v6). Each pin is reproduced in two fresh processes with separate
+HOME directories. gfx1201/gfx1100 use empty kernel caches; gfx1201 repeats
+use different R9700 cards. gfx1100/gfx1151 run serialized under a shared timing
+lock. **gfx1151 pins require a warm kernel cache**: populate it once, then
+reuse it for two scored runs with fresh HOME directories. Cold-JIT Halo runs
+can differ in chunk 0 only; warm-cache WT2/code24 repeats agree byte for byte.
+The gfx1201 KLD values remain unchanged at six decimals; their ROCm 10.1 sequence hashes
+are the expected re-pins, including the repaired native-FP8 producer route.
 
 | Arch | Route, KV flags | Corpus | KLD | `.kldseq` SHA-256 |
 |---|---|---|---:|---|
-| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | WT2 | 0.069571 | `483cfc58b4cc71ea3a9a71c657833e34aa847f513aceae50c1c0f0dfe65ae898` |
-| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | code24 | 0.052119 | `6339dc9e54bbd498774667cfe25c8405049d20c2c61e930ab7e783b662c5f13a` |
-| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | WT2 | 0.041859 | `19227d5fb08eb3bf10207eef6f5cc81addbb20befe90519a9692827d53c96508` |
-| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | code24 | 0.029867 | `5e7ac9dcd264a930e35b0bd627232bcecea11665ec669a8640cd014cfe22ba3a` |
-| gfx1100 | A4 (default), `--kv-mode q8` | WT2 | 0.068687 | `ccf95389f9dd5e45b3927c98bd8bafac93ae3922417e6730c280fd9e6dce6dcd` |
-| gfx1100 | A4 (default), `--kv-mode q8` | code24 | 0.052666 | `a7eac2b4d06bfd96ead1889dcbaa0cf230dc32cfdc55a82ae73bccedbcbe532f` |
-| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8` | WT2 | 0.068955 | `c1056943318f2abb667a149d73548e0087fb506724f48dfa14dc2e292d3bdff2` |
-| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8` | code24 | 0.051358 | `04f06883e2a95306ebeead6d6bf256e8381128e4c115c6593b99c95f594fb308` |
+| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | WT2 | 0.069571 | `ff88c49910be618a98a917afc40d4b01ceeb7c6299c62f1c553444c11b402841` |
+| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | code24 | 0.052119 | `9b0616316f50e9a654690d06d594d57466430d0a4a67041ec4ff0128d830910e` |
+| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | WT2 | 0.041859 | `a4f68b12cf777a99dfc8ac1f398f41ec96614da118e9071e02951ca80dc5b113` |
+| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | code24 | 0.029867 | `8373bc27da1fa88245b18bdb2ae90caebd275c06d1ecaf0dce1b9dc4855ca38e` |
+| gfx1100 | A4 (default), `--kv-mode q8 --kv-v q8` | WT2 | 0.069312 | `3169b09310d7598852a6eaa1f32f41aa54b531737c4d4ddd29b8dc90f546e7b2` |
+| gfx1100 | A4 (default), `--kv-mode q8 --kv-v q8` | code24 | 0.052757 | `27d837f388f3294d645b825d1cff7d1b06d219595f4459e9efc3fc4af2f93311` |
+| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8`, warm kernel cache | WT2 | 0.070054 | `2355f76cfd730cae26cdad027b3de00aeb14b0af8bb666eef934680bd14ca225` |
+| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8`, warm kernel cache | code24 | 0.050338 | `9caca85b4bf9c4049c921d85afc372ffcbb4698642313d5ce605eb1b2bb8feb0` |
+
+Cold-cache gfx1151 discriminator (not pins): WT2 measured 0.070054
+(`2355f76c…`) and 0.069878 (`a2f550a9…`); code24 measured 0.050417
+(`4e78f8e4…`) and 0.050338 (`9caca85b…`). Only sequence 0 differed.
+After one cache-populating WT2 run, both scored warm WT2 runs reproduced
+`2355f76c…`; code24 warmup and both scored warm runs reproduced `9caca85b…`.
+This ties the observed instability to the cold-JIT path; its root cause is
+not established, and empty-cache Halo determinism is not claimed.
+
+Historical HIP 7.15 pins (same row order as above): KLD
+`0.069571 / 0.052119 / 0.041859 / 0.029867 / 0.068687 / 0.052666 / 0.068955 / 0.051358`;
+`.kldseq` SHA-256 respectively:
+`483cfc58b4cc71ea3a9a71c657833e34aa847f513aceae50c1c0f0dfe65ae898`,
+`6339dc9e54bbd498774667cfe25c8405049d20c2c61e930ab7e783b662c5f13a`,
+`19227d5fb08eb3bf10207eef6f5cc81addbb20befe90519a9692827d53c96508`,
+`5e7ac9dcd264a930e35b0bd627232bcecea11665ec669a8640cd014cfe22ba3a`,
+`ccf95389f9dd5e45b3927c98bd8bafac93ae3922417e6730c280fd9e6dce6dcd`,
+`a7eac2b4d06bfd96ead1889dcbaa0cf230dc32cfdc55a82ae73bccedbcbe532f`,
+`c1056943318f2abb667a149d73548e0087fb506724f48dfa14dc2e292d3bdff2`,
+`04f06883e2a95306ebeead6d6bf256e8381128e4c115c6593b99c95f594fb308`.
 
 Historical: the previous dense pin was the asymmetric Qwen3.8-27B MQ4V2 XT
 (`hipfire-models/qwen3.8-27b` / `qwen3.8-27b.mq4-xt`, registry tag
@@ -650,34 +707,52 @@ against the A3B MoE DFlash perfmaxx line.
 
 ### Pinned Flash-Next bench fixture
 
-The canonical Flash-Next trunk is whichever local artifact byte-matches
-`qwen3.8-flash-next.mq4` from HF repo `hipfire-models/qwen3.8-flash-next`
-(registry tag `qwen3.8:flash-next`, since 2026-09-28):
+The canonical Flash-Next trunk (MQ4 XTS) is whichever local artifact byte-matches
+`qwen3.8-flash-next.mq4-xts` from HF repo `hipfire-models/qwen3.8-flash-next`
+(registry tag `qwen3.8:flash-next-mq4-xts`; existing tags
+`qwen3.8:flash-next`, `qwen3.8:flash-next-mq4` and
+`qwen3.8:flash-next-gptq3` resolve to the same pinned bytes).
+The short user-facing name `qwen3.8:flash` aliases `qwen3.8:flash-next`.
 
 - HF repo: `hipfire-models/qwen3.8-flash-next`
-- HF / local file: `qwen3.8-flash-next.mq4`
-- File size: `125288540696`
-- SHA-256: `8aa01cf41bf2a90b319b9a1c70837baf51a2f92811af551f59b59d418518f650`
-- MD5: `001878abd9b68218876ac0ae732e481b`
-- Recipe (r2): MQ6G256V2 trunk (240 tensors) and language head,
-  MQ4G256V2/MQ4G128V2 experts, Q8F16 embed/MTP-attention and PLE n-gram rows
-  (128 shards, external-resident, 54,400,261,120 B). Needs a build at or
-  after `cb566dab9` (qt=54 I64 metadata records).
-- Container revision 2026-09-29: the three I64 PLE metadata records were
-  re-tagged qt=52 -> qt=54 in place; payloads are byte-identical to the
-  2026-09-28 upload (sha256 `cd7cbb911d3d016e034b1d22be1be37b42873a21699c94f09337528f1eee9db6`),
-  so measurements taken on those bytes still apply.
+- HF / local file: `qwen3.8-flash-next.mq4-xts`
+- File size: `125288544792`
+- SHA-256: `8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972`
+- MD5: `be007fc3219e9f6cdb1d4dfa8380625f`
+- Recipe: MQ4 XTS, the r2 tiers (MQ6G256V2 trunk (240 tensors) and language head,
+  MQ4G256V2/MQ4G128V2 experts, Q8F16 embed/MTP-attention and PLE n-gram rows,
+  128 shards, external-resident, 54,400,261,120 B), with the routed experts
+  symmetric and GPTQ3-solved on the 262,144-token calibration corpus (no AWQ;
+  553/25,088 experts keep RTN). All 1227 non-expert tensors are byte-identical
+  to the prior pin. Needs a build at or after `cb566dab9` (qt=54 I64 metadata
+  records); validated on `fe77c0837`.
+
+The old filename `qwen3.8-flash-next-gptq3.mq4` remains a byte-identical alias
+through the 0.4.x line and at least 90 days. During that window, existing tags
+retain the old remote-registry wire filename for old clients; upgraded clients
+normalize this exact repo/size/SHA-256 pin to the canonical filename and migrate
+verified local bytes without downloading or copying the payload. The old HF
+object remains until explicit EOL approval. This is naming, not a recipe change.
 
 Before reporting Flash-Next results, verify the candidate trunk with
 `sha256sum` and require the digest above.
 
-Historical: the prior pin was `qwen3.8-flash-next.mq6q8-pleq8` (still on HF,
+Historical: from 2026-09-28 to 2026-10-02 the pin was the RTN-asymmetric
+`qwen3.8-flash-next.mq4` (still on HF under that name, tag
+`qwen3.8:flash-next-rtn-asym`; size `125288540696`, sha256
+`8aa01cf41bf2a90b319b9a1c70837baf51a2f92811af551f59b59d418518f650`, MD5
+`001878abd9b68218876ac0ae732e481b`; before the 2026-09-29 qt=54 re-tag, sha256
+`cd7cbb911d3d016e034b1d22be1be37b42873a21699c94f09337528f1eee9db6`, same
+payloads). Measurements below labelled `qwen3.8-flash-next.mq4` were taken on
+those bytes.
+
+Historical: the pin before that was `qwen3.8-flash-next.mq6q8-pleq8` (still on HF,
 tag `qwen3.8:flash-next-mq6q8-pleq8`; size `125467331096`, sha256
 `c0628b848077f02afed9ce5a4daa0598c379aa1d1e5ca0c0b24ddd04b49773a9` after the
 same qt=54 re-tag, `58fb4f586403000b3394413c38f58b0ec0d8845675f81c3d3c0b5de2cdaa4aed`
-before it); it differs
-only in its Q8F16 head. The caveats and measurements below were taken on that
-prior pin unless they say otherwise.
+before it); it differs from the RTN-asymmetric pin only in its Q8F16 head.
+Caveats and measurements below without a date were taken on that pin unless
+they say otherwise.
 
 Caveats that are part of the fixture, not trivia:
 
@@ -685,22 +760,96 @@ Caveats that are part of the fixture, not trivia:
   packed trunk tiers and whose external-PLE admission accepts both PLE tiers.
   Older builds refuse at load; that refusal is correct, not a corrupt file.
 - **MTP is on by default (`speculation.mtp = auto`) except on `.mq4r` loads,
-  which keep the retained Redline AR route; greedy requests only.** Each MTP
+  which keep the retained Redline AR route; it serves greedy and sampled
+  requests: `speculation.mtp_sampled` (`HIPFIRE_MTP_SAMPLED`, default on since
+  0.4.1; `0` sends sampled requests to AR) verifies sampled requests by
+  speculative rejection sampling against the AR sampler's distribution
+  (oracle: `crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs`).
+  Sampled MTP output matches AR in distribution, not byte for byte; requests
+  with non-neutral penalties still run AR.** Each MTP
   window picks its verification route: a batched `(K+1)`-row verify at the
   draft depth `K` that maximizes expected emitted tokens per window cost
   (per-depth draft agreement, decayed), or the interleaved route (one target
   row per draft, stop at the first rejection) when no depth pays.
+  A same-request AR floor guards the default route: the request's first
+  window is one ordinary target-only token, timed (a sampled draw included)
+  as the AR price and followed by one head append; up to three speculative
+  probe windows then run under the table-ordered route, and from then on only
+  options measured on this request are chosen (batched depth by its decayed
+  window time over the agreement-predicted tokens, interleaved by its time per
+  emitted token). When none costs strictly less per emitted token than AR (a
+  tie, or an invalid AR timing, counts as no win) the request retires to
+  head-free AR for good, unless n-gram windows keep it alive: a request stays
+  alive on a losing native route only while external (n-gram) windows are
+  measured and unblocked (cost per token below AR) and the decayed realized
+  per-token cost of all its windows, native and external, is strictly below
+  AR; it retires at the first window where that stops holding. A retired
+  request runs with no head append, copy, snapshot or replay, forced
+  advances fall back to the target alone, and only `configure_request`
+  (a new request) resets it, not `mtp_reset` or a prefill realign. At most one
+  calibration head append and three probe windows precede the first measured
+  decision; this bounds the speculation work, not the full-request time. Each
+  floor-observed native window ends with one device sync so its whole GPU tail
+  is priced (forced routes skip it unless phase timing is enabled), and the
+  retired token host-syncs its top-1, which the AR producer does not.
+  With `HIPFIRE_MTP_PHASE_TIMING=1`, batched `window_us` includes the snapshot
+  and commit tail; diagnostic forced routes synchronize for cost accuracy.
   `HIPFIRE_MTP_INCREMENTAL=0` forces batched at the full `mtp_k`; `1` forces
-  interleaved. The few-row (2..8) verify forward is bitwise the single-row
-  decode route, so greedy MTP emits AR's exact tokens on either route. On GPUs
-  whose GDN route captures per-row states (gfx11+ SIMT) a rejected suffix
-  rolls back without re-running the accepted rows; elsewhere the batched
-  route restores and replays. Drafts rank the vocabulary with an MQ2 copy of
-  the LM head and re-score its top 8 exactly against the head's own Q8_0 or
-  MQ6G256V2 rows (`HIPFIRE_MTP_DRAFT_HEAD`, default `mq2r`).
+  interleaved; either forced route is a diagnostic override that bypasses the
+  floor entirely. `HIPFIRE_MTP_AR_FLOOR=0` opts out of the floor (diagnostic
+  A/B): no calibration token, probe windows, retirement or floor sync, and the
+  per-window chooser routes as before the floor; the forced routes win if both
+  are set. Interleaved verification (`HIPFIRE_MTP_INCREMENTAL=1`) uses the
+  AR target's single-row route. With Q8 GDN recurrent state, the row-capture
+  verify/rollback kernel (gfx11+ SIMT, `kCapture && kQ8`) applies AR's
+  per-token Q8 boundary at each row's absolute position, so every captured
+  verify row, the final slot and every rollback keep-prefix equal sequential
+  single-row decode. Oracles: `gdn_q8_verify_matches_single_row`
+  (rdna-compute) and the ignored
+  `crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs` (canonical
+  GPTQ3 MQ4 Flash-Next, p1, 1200 greedy IDs): on gfx1151 forced batched,
+  forced interleaved, adaptive and full-head batched MTP all match AR in
+  three fresh-process runs (before the repair, batched first differed at
+  index 112 and adaptive at 130). This guarantee covers only that capture
+  path: it is not a claim for the unarmed few-row Q8 prefill/replay route
+  (used where rows are not captured) or for architectures the oracle has not
+  run on. On GPUs whose GDN route captures per-row states
+  (gfx11+ SIMT) a rejected suffix rolls back without re-running the accepted
+  rows; elsewhere the batched route restores and replays. Drafts rank the
+  vocabulary with an MQ2 copy of the LM head and re-score its top 8 exactly
+  against the head's own Q8_0 or MQ6G256V2 rows (`HIPFIRE_MTP_DRAFT_HEAD`,
+  default `mq2r`).
   Teacher-forced prompt and replay steps advance MTP state without computing
   an unused language-head prediction; prompt target chunks emit only their
   final logit row while retaining every wide hidden row.
+- **MTP + ngram-mod takeover (`speculation.mtp_ngram`, `HIPFIRE_MTP_NGRAM`,
+  default `auto`):** on for native Qwen4 MTP (arch 16) on gfx1151 and gfx1201
+  and off for every other producer; `on`/`1` arms every MTP producer that
+  supports it, `off`/`0` is the opt-out (env beats TOML beats default). It
+  serves greedy and sampled requests, thinking on or off (Qwen4 and
+  Qwen3.5/3.x). On Qwen4 a pool hit (request-local pool, cleared and
+  reseeded from the full prompt every request, so earlier requests never
+  influence candidates) takes the window only when the head's own first draft
+  (row-0 argmax, before any sampled draw) equals the first candidate and the
+  takeover's decayed emitted tokens per window over its verify cost
+  (`MTP_WINDOW_COST`) is at least the native chooser's best expected rate;
+  otherwise the window is native (the batched route reuses that row-0 step).
+  A takeover verifies `[seed, candidates..]` on the same batched verify
+  executor as native MTP windows (interleaved one-row route under
+  `HIPFIRE_MTP_INCREMENTAL=1`), rolls the target back to the consumed rows,
+  and appends exactly those rows to the head teacher-forced (token p, hidden
+  p). Greedy takeovers are exact;
+  sampled takeovers verify each candidate with the point-mass draft
+  distribution δ(candidate) through the shared rejection verify, so output
+  matches MTP-only in distribution, not byte for byte. The native chooser's
+  per-depth agreement relaxes toward its 0.8 prior for depths a window did not
+  compare (`MTP_AGREEMENT_RELAX`), so a depth rejected once is re-explored
+  instead of staying frozen below its threshold. Triple
+  `HIPFIRE_NGRAM_MOD_{N_MATCH,N_MIN,N_MAX}` is 5/3/3 on admitted Qwen4
+  targets and 24/48/64 elsewhere (per-component overrides; Qwen4 `n_max`
+  capped at 63, the 64-row verify). The load log prints `qwen4 native MTP
+  n-gram: on|off (n_match=.. n_min=.. n_max=..)`; `HIPFIRE_MTP_TRACE=1`
+  window events carry `source` (`ngram`/`mtp`) and `verify_route`.
 - **Measured, not an 80% claim:** on 2026-09-23, gfx1151, HIP 7.2, greedy,
   KV q8, `max_seq=2048`, graph off, three fresh daemon processes per mode and
   byte-identical committed prompts, median code decode was AR 19.4 versus
@@ -729,11 +878,21 @@ Caveats that are part of the fixture, not trivia:
   was 59.5 tok/s against AR 33.7 (55.4 without the re-score); the same file
   with a Q8_0 head reached 59.2 at AR 33.1. Method and caveats:
   [`docs/perf-checkpoints/2026-09-28-qwen4-mtp-mq6-rescore-gfx1151.md`](docs/perf-checkpoints/2026-09-28-qwen4-mtp-mq6-rescore-gfx1151.md).
-- `hipfire bench` cannot measure this model at all: the qwen4 contract pins
-  `max_seq` to 2048 while bench asks for the configured 32768 (still 5120 with
-  `memory.max_seq` forced to 2048), so it fails closed at load and never
-  reaches a measurement. Use the serve or probe path. The fix, if wanted, is a
-  bench-side `max_seq` knob — not an MTP change.
+- `hipfire bench` measures this model. The old fail-closed load had two
+  causes, both gone. The qwen4 contract admitted exactly `max_seq` 2048
+  (lifted in `432fa5c68`; the limit is now 262144, and an omitted value gets
+  32768). Bench's `load_params` also sent
+  `max(memory.max_seq, generation.max_tokens + 1024)` — the configured 32768,
+  or 4096 + 1024 = 5120 with `memory.max_seq` forced to 2048
+  (`822b48fb5:crates/hipfire-cli/src/main.rs:3000-3001`, removed in
+  `294c4ad9d`). `--matrix` now sizes the load to the run (largest `--pp`, or
+  `--ctx` + `--tg`, plus 32), and `--max-seq N` overrides it
+  ([CLI.md](docs/CLI.md#bench-context-max_seq)). Measured on 2026-10-04 on
+  a Strix Halo (gfx1151) host (one card, `qwen3.8-flash-next-gptq3.mq4`
+  `8b15b6fe…00972`): `--matrix --pp 8192 --tg 32 --runs 3 --warmups 1` loads
+  `max_seq` 20064 (the default `--ctx` tops out at 20000). pp8192 was
+  1927.3 / 1921.8 / 1918.3 tok/s, fast-PPT-limited for 48–55 % of each run.
+  The standard path keeps the automatic 32768.
 - Decode numbers are not comparable across instruments: the raw decode probe
   measured 22.74 tok/s (ctx128, graph off, kv q8), the serve path ~19.9 tok/s.
   Same model, different measurement; never average or compare them across.
@@ -755,6 +914,8 @@ Caveats that are part of the fixture, not trivia:
 | "Numbers don't match the README" | Forgot `HIPFIRE_NORMALIZE_PROMPT=1` (pre-2026-04-26) | Now default ON. Pull latest. If you opted out via `prompt_normalize=false`, that overrides the default — flip back. |
 | "27B DFlash regressed 30-40% suddenly" | PR #32 (cleanup-dead-wmma-kernels) on master removed `gemm_hfq4g256_residual_wmma{,2,_k4}.hip` thinking dead. Dispatch fell back to slower variants. | Verify against canonical 199 tok/s @ max=120 with default flags. If kernel files missing in `kernels/src/`, `git checkout` from a known-good commit (see commit 9a2c667 for the full recovery context). |
 | `HIPFIRE_GRAPH=1` reports plausible tok/s but output is garbage | Dangling stack-pointer kernargs from raw `self.hip.launch_kernel(...)` calls in `forward_scratch_layers` (kv_cache_write_*, attention_flash_*, fused_qkv_hfq4g256, rmsnorm_batched, rope_partial_interleaved_f32, gated_delta_net_q8, etc.) — captured pointers dangle past `end_graph_capture` | Bench tok/s alone never proves graph correctness. Always eyeball under `HIPFIRE_GRAPH=1` and run the claim-scoped VALIDATION serve route — never retired coherence-gate scripts as acceptance. Fix: migrate every raw-launch helper used in forward_scratch_layers to `launch_maybe_blob` (model after `conv1d_silu_split_f32_n`). |
+| `memory.offload_exec` modes disagree on greedy output, or `passback` differs between two identical runs | Expected: the modes run different GEMV engines, and `passback`'s row split is scheduled per process (probe + online arm timings). Measured (2B): `cpu`×2 and `pcie`×2 byte-identical; `cpu` vs `pcie` differ; `passback`×2 differ; `HIPFIRE_OFFLOAD_PASSBACK_SHARE=0` byte-identical to `cpu` | NEVER assert a greedy/golden reference across a mode pair (`cpu` vs `pcie` is not bit-identical either), and NEVER assert `passback` output with the share on `auto` — pin `memory.offload_passback_share`, or use `0` to reach the exact `cpu` twin. See [`docs/perf-checkpoints/2026-10-02-offload-passback-model-spread-gfx1201-amendment-1.md`](docs/perf-checkpoints/2026-10-02-offload-passback-model-spread-gfx1201-amendment-1.md) § 5. |
+| Offloaded MoE with `speculation.mtp=auto` runs AR (bench `spec_route` null, serve `timings.tau`/`mtp` null, no `MTP head loaded` line) | Native Qwen35 MTP `auto` declines after placement resolves host-mapped routed experts on either `pcie` or `cpu`, logging the count, seam and `opt in with --spec mtp`. Unset/null layer/expert budgets keep all weights resident; only explicit `auto`/`-1` or manual `N` requests placement changes | Use `--spec mtp` / `speculation.mtp=on`, subject to metadata-based refusal of uniform MQ6G256 V1 (qt15) Qwen35 MoE on gfx1200/gfx1201 with FP16 WMMA enabled whenever a head would attach (including resident `auto`). `--spec off` / `speculation.mtp=off` and auto-declined spill remain AR; `HIPFIRE_FP16=0` permits explicit MTP. Mixed/graded MQ4+MQ6, MQ6V2, gfx1151 and dense are outside the refusal. `speculation.dflash=on` still refuses without a DFlash draft and never aliases to MTP. No root WMMA fix is claimed |
 
 
 ---
@@ -777,9 +938,11 @@ Caveats that are part of the fixture, not trivia:
 | `HIPFIRE_LOCAL` | Force local-spawn (skip serve HTTP) | OFF |
 | `HIPFIRE_HOST_TIMING` | Per-cycle host timing probe | OFF |
 | `HIPFIRE_VERIFY_GRAPH` | Verify-forward graph capture (0 = off) | ON |
-| `HIPFIRE_GPU_LAYER_BUDGET` | Resident-layer budget for partial GPU offload: `N` keeps the last `N` layers on the GPU and spills the prefix to host RAM. Counts layers **on** the GPU, not offloaded — `3` on a 64-layer model spills 61. Unset/`auto`/`-1`/unparseable = fully resident (never forces offload). Sibling of `HIPFIRE_OFFLOAD_EXEC`. See [docs/plans/partial-gpu-offload-design.md](docs/plans/partial-gpu-offload-design.md). | unset (fully resident) |
-| `HIPFIRE_OFFLOAD_EXEC` | Which engine multiplies a spilled layer's host-mapped weights: `pcie` (default) or `cpu`. Sibling of `memory.gpu_layer_budget`; `cpu` executes the weight-reading GEMVs on the CPU instead of reading them over PCIe. See [docs/plans/partial-gpu-offload-design.md](docs/plans/partial-gpu-offload-design.md) § 6.2.1. | `pcie` |
+| `HIPFIRE_GPU_LAYER_BUDGET` | Resident-layer budget for partial GPU offload: `N` keeps the last `N` layers on the GPU and spills the prefix to host RAM. Counts layers **on** the GPU — `3` on a 64-layer model spills 61. Unset/null/empty/unparseable leaves weights device-resident on every model. Explicit `auto`/`-1` opts into fit-capacity placement, routed experts before whole layers. Manual `N` remains a hard pin. Sibling of `HIPFIRE_OFFLOAD_EXEC` (unchanged default `pcie`). See [docs/CONFIG.md](docs/CONFIG.md#memory). | unset (fully resident) |
+| `HIPFIRE_OFFLOAD_EXEC` | Which engine multiplies a spilled layer's host-mapped weights: `pcie` (default), `cpu`, or `passback` (scheduled co-inference — both engines run the same spilled step concurrently, divided by output rows). Sibling of `memory.gpu_layer_budget`; `cpu` executes the weight-reading GEMVs on the CPU instead of reading them over PCIe, and `passback` runs the `pcie` path on the step's first output rows and the `cpu` path on the rest, concurrently. See [docs/plans/partial-gpu-offload-design.md](docs/plans/partial-gpu-offload-design.md) § 6.2.1 and § 6.2.2. | `pcie` |
+| `HIPFIRE_OFFLOAD_PASSBACK_SHARE` | Schedule of a spilled step's output rows between the two engines under co-inference (`memory.offload_exec=passback` only): the GPU takes the first rows (the `pcie` arm), the CPU the rest (the `cpu` arm). `auto` (default) schedules it from this host's measured engine rates and refines it online; a number in `(0, 0.5]` pins it; `0` collapses it onto the CPU engine alone, so the mode is byte-identical to `cpu`. Inert (one notice at load) in any other mode. Measure or override with `hipfire offload-bench`. See [docs/plans/partial-gpu-offload-design.md](docs/plans/partial-gpu-offload-design.md) § 6.2.2. | `auto` |
 | `HIPFIRE_DDTREE_*` | Various DDTree diagnostics | various |
+| `HIPFIRE_SERVE_UI` | Serve the embedded chat UI at `/ui` on the serve listener (same as `hipfire serve --ui`; `--open` also launches the browser). Unauthenticated — warn-level on non-loopback binds. Chat history lives in the browser's IndexedDB; nothing is stored server-side. | OFF |
 
 | `hipfire bench` flag | Purpose |
 |---|---|

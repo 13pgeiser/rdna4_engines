@@ -33,6 +33,10 @@
 /// each other.
 pub mod common;
 
+/// Jev-compatible "decide": typed classification questions answered by
+/// next-token logit readout, orchestrated over the `Carrier` decide hooks.
+pub mod decide;
+
 /// The generic autoregressive generate path — the fallback every model
 /// without a specialised route takes, and the last daemon code that
 /// manipulates architecture types directly.
@@ -50,6 +54,10 @@ pub mod dense;
 /// Image generation: the `img_generate` wire body (FLUX.1/FLUX.2),
 /// including reference-image decode and the GPU/CPU denoise split.
 pub mod img;
+
+/// Embeddings: the `embed` wire body (arch 17, qwen3.5 multi-vector
+/// encoder) — assemble, encode, skiplist mask, L2 normalize.
+pub mod embed;
 /// Vision and OCR: Qwen3.5-VL and dots.ocr, including the text-only
 /// dots.ocr path.
 pub mod vision;
@@ -59,3 +67,10 @@ pub mod redline;
 
 /// Continuous-batch drivers and their admission predicates.
 pub mod batch;
+
+/// Flash-Next exact autoregressive request lanes.
+pub mod fn_batch;
+
+/// VMM batch route: per-request singleton semantics on batch lanes —
+/// conversation continuity (prefix pool) and think control.
+pub mod vmm_conv;

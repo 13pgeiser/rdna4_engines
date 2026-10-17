@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 use crate::{cfg::InstId, effects::{MemClass, OrderType}, reg::RegSet};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[repr(u8)]
@@ -20,6 +24,9 @@ pub struct EventId(pub u64);
 pub struct PendingEvent {
     pub id: EventId, pub inst: InstId, pub counters: CounterSet,
     pub units: [u8; N], pub satisfied: CounterSet,
+    /// Lower bound on younger outstanding units on paths where this event is pending.
+    /// Saturation at 255 preserves all representable wait thresholds.
+    pub younger: [u8; N],
     pub class: MemClass, pub defs: RegSet, pub src_locks: RegSet, pub in_order_type: OrderType,
 }
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

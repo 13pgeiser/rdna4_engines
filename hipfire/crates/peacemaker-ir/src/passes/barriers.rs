@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! C5: split-barrier pairing, gfx11 full barriers, and DS drain checks.
 //!
 //! Gfx11 `s_barrier` is one combined arrival and wait for the live waves of
@@ -244,7 +248,7 @@ pub fn analyze(body: &Body, arch: Arch) -> Result<BarrierAnalysis, BarrierError>
             return Err(BarrierError::DanglingInst { id: *id });
         }
     }
-    let replay = waits::replay(body, arch)?;
+    let replay = waits::replay(body, arch, crate::inst::Wave::Wave64)?;
     let ctx = Ctx::new(body);
     let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
     for (id, _, succs) in &ctx.blocks {

@@ -453,6 +453,13 @@ must fix.
   count as `PositionDivU32 { addend: rows, divisor: compress }`; the wrapper
   verifies the caller's count *equals* the declared formula, so the declaration
   cannot drift from the launch.
+- The incremental pool (every decode/prefill lowering) does not use the
+  capacity grid: its `grid.x` is `ceil(rows / compress)`, the most blocks a
+  launch of `rows` rows can complete, and the kernel offsets `blockIdx.x` by
+  `first_block` (`PositionDivU32 { addend: 0, divisor: compress }`). The grid is
+  still constant per launch shape, so retained programs stay valid. At the
+  automatic `max_seq` 262144 the capacity grid was 65,536 workgroups of which
+  1–2 worked, ~4% of Flash-Next C1 decode on gfx1151.
 - `IndexedAttentionSelectBatch` takes a declared `shape_blocks` (LDS + symbol come
   from the bound, not the active count) and declares both its active count and
   `position_start`. `IndexedAttentionAttentionBatch` takes a declared
@@ -709,6 +716,14 @@ Two fresh processes, `.mq4r` artifact, greedy, two different prompt lengths:
 `launched` is an independent count from `hip_bridge::launch_counters` (every
 launch, funnel or raw), so the comparison is not the recorder grading itself.
 
+The finalization hook treats an unequal census as a typed capture refusal:
+it poisons the retained route before closing or preparing the tape, logs the
+launched and recorded counts plus the HIP fallback, and leaves the completed
+warmup output intact. Later forwards use ordinary HIP. A matching census is
+necessary, not sufficient: effect and binding validation still gate preparation.
+Shared launchers, including `Gpu::silu_f32`, use `launch_maybe_blob` so graph
+capture and retained recording own their kernarg bytes rather than stack pointers.
+
 **What the census found.** Three things, only one of which was expected:
 
 1. **A recorder gap G1 missed.** The first run reconciled at 2786/2787: one kernel
@@ -925,7 +940,7 @@ runs recorded here:
 | GPU | AMD RYZEN AI MAX+ 395 w/ Radeon 8060S (Strix Halo, gfx1151) |
 | PCI | `1002:1586`, subsystem `2014:801D`, driver `amdgpu` |
 | Kernel | `7.0.9-cachyos-lto` |
-| Runtime | `libamdhip64.so.7.2.53211` (ROCm 7.2.x, via the merged root `/home/bjoern/.hipfire/rocm-merged`) |
+| Runtime | `libamdhip64.so.7.2.53211` (ROCm 7.2.x, via the merged root `$HOME/.hipfire/rocm-merged`) |
 | Timed prompt digest | `benchmarks/prompts/qwen4_ar_primes.txt` — md5 `0508eec29a44323f62e70fa77d92b834`, sha256 `16c282e391cce0c1ad4b702cdacc1b25c126c474de842f2e9c6d32b7ebd9a752` |
 | Clock policy | automatic (`automatic_clocks: true`), DPM settle + stationarity gate per arm |
 
@@ -1012,7 +1027,12 @@ reuse of the earlier one.
 the capture window (`effect-incomplete — … 1 memset(s)`), while a capture later
 in the same process reports zero. The plan still prepares, and gates 4–6 hold on
 those processes, which is consistent with a first-use lazy initialisation rather
-than per-token state. It is not yet named, so it stays open.
+than per-token state. *Closed 2026-10-01:* the memset is the one-time zeroing of
+the fused GDN rotation's head-pair counters (`tensor_ops::ensure_gdn_pair_counters`).
+The kernel resets those counters on every launch, so the memset was harmless. The
+retained-body boundary now runs it before arming the window. An automatic capture
+whose window holds any device copy, readback or memset is now refused at
+prepare (`ReplayController::refuse_effect_incomplete_window`).
 
 **Disposition:** this is evidence for gates 1–8 at this head, with gate 7
 collected at context 128 only. It is **not** a promotion or an admission:
@@ -1153,6 +1173,12 @@ Append-only. One line per landed change with the commit hash once it exists.
   `qwen3.8-flash-next.mq4`: gates 1–6 and 8 collected, gate 7 at context 128
   only (0.994); model swap no longer blocked. No promotion rule, no admission
   (see "Certification re-run").
+- 2026-10-11 — **Forced PM4 pre-replay staging-stream sync (forced/dev route only).**
+  Evidence `54ba6c5a6` isolated a race between HIP PLE staging and the independent
+  PM4 queue. Before each Qwen4 PM4 replay (forced PM4 or shadow plan route) the
+  forward synchronizes the active stream, or the default stream when none is set
+  (`stream_synchronize_default`); never the device. Failure poisons the route and
+  returns the typed forward error. Default HIP decode and Qwen3.5 are untouched.
 
 ### Next
 

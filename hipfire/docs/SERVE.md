@@ -36,38 +36,60 @@ chat completions. Default bind is `127.0.0.1` (loopback only); set
 ```bash
 hipfire serve                         # foreground; Ctrl-C stops (default bind 127.0.0.1)
 hipfire serve 127.0.0.1:11435         # loopback-only (preferred local bind)
-hipfire serve -d                      # background (setsid/nohup); polls /health up to 300s
+hipfire serve -d                      # background (setsid/nohup); polls /health up to 60s
 hipfire serve qwen3.5:9b -d           # pre-warm a specific tag this run
 hipfire serve 0.0.0.0:11435 -d        # all-interfaces bind — unauthenticated; see Security
 hipfire serve --no-prewarm -d         # bind first; load on first request
 hipfire serve --kv-mode q8 --idle-timeout 0 -d
 hipfire serve --tp 2 -d               # expert-parallel load (multi-GPU arches)
+hipfire serve --spec off -d           # plain AR (no MTP/DFlash) for every load, e.g. an A/B
+hipfire serve --max-seq 32768 -d      # KV context for every load (replaces memory.max_seq)
 
 hipfire ps                            # daemons / quantize / uploads + port state (Linux)
 hipfire stop                          # SIGTERM tracked pid in serve.pid (safe default)
-# Destructive — inspect first (hipfire ps, curl /health, port owner):
-hipfire stop --force                  # also pkill -x daemon + fuser -k <port>/tcp
+# Forceful — inspect first (hipfire ps, curl /health):
+hipfire stop --force                  # also kill this install's untracked daemons (TERM, KILL after 5s)
 hipfire stop --all                    # --force plus pkill orphan quantize jobs
 hipfire restart -d                    # stop --force semantics, then serve again
 ```
 
-**Destructive lifecycle flags.** Plain `hipfire stop` only SIGTERMs the tracked
-pid after ownership checks — use that by default. `--force`, `--all`, and
-`restart` call `reapOrphans`: system-wide `pkill -x daemon` (exact name), and
-`fuser -k <port>/tcp` which **SIGKILLs whichever process owns the port**.
-`--all` also runs `pkill -f` against release quantize binaries. Before using
-them, run `hipfire ps`, `curl -s http://127.0.0.1:<port>/health`, and confirm
-the port owner so you do not kill an unrelated daemon or listener.
+`serve -d` first checks `serve.pid` and `/health`. If a tracked server already
+answers on the same port it prints `hipfire serve already running (pid N, port
+P, log …)` and exits 0; a tracked server on another port, or a different
+process answering on the port, exits 1 with that reason. Readiness requires
+the `/health` `pid` to be the child it just spawned, and if the child exits
+early the error includes the last `FATAL`/`hipfire:` line from `serve.log`.
 
-Flags (also accepted by `restart`):
+**Forceful lifecycle flags.** Plain `hipfire stop` only SIGTERMs the tracked
+pid after ownership checks — use that by default. `--force`, `--all`, and
+`restart` also stop this install's other daemons: PIDs from the pidfile and
+the GPU lock, each verified by command line (this install's daemon binary)
+and matching `HIPFIRE_HOME`, sent SIGTERM and then SIGKILL after 5 s. They no
+longer kill processes by name or by port; if something else still holds the
+port, the CLI prints `port N is still in use by a process that is not this
+install's hipfire; not killing it`. `--all` also runs `pkill -f` against
+release quantize binaries.
+
+Flags (also accepted by `restart`). In detached mode (`-d`) the parent forwards
+these to the foreground child as CLI arguments; none of them is turned into an
+environment variable.
 
 | Flag | Effect |
 |---|---|
 | `-d` / `--detach` / `--background` | Fork detached child; log → `~/.hipfire/serve.log` |
+| `--model <m>` | Model tag/path to pre-warm for this process (same as the positional model) |
+| `--no-prewarm` | Bind first and load on the first request instead of pre-warming |
 | `--kv-mode <m>` | KV preset for models this service loads (sent as the `kv_mode` load param; same contract as `run --kv-mode`) |
-| `--idle-timeout <s>` | Sets `HIPFIRE_IDLE_TIMEOUT` (0..86400) |
-| `--no-prewarm` | Sets `HIPFIRE_NO_PREWARM=1` |
-| `--tp N` | Sets `HIPFIRE_TP` (1..64) for expert-parallel load |
+| `--kv-k <f>` / `--kv-v <f>` | Qwen-only K / V format override for models this service loads |
+| `--kv-backend legacy\|vmm` | KV storage backend for models this service loads |
+| `--max-seq N` | KV context for every load, within the `memory.max_seq` bounds (512..1048576); overrides the configured/automatic context |
+| `--spec <mode>` (alias `--speculation`) | Speculation mode for every load: `off`, `auto`, `ngram`, `dflash`, `mtp`, `dspark`; `off` disables MTP/DFlash |
+| `--idle-timeout <s>` | Idle model-unload timeout, 0..86400 s (`0` = never); overrides `serve.idle_timeout_seconds` |
+| `--tp N` | Tensor/expert-parallel degree (1..64) |
+| `--continuous-batch-size N` | Number of eligible concurrent batched lanes, 1..256 (`1` keeps sequential behavior), subject to memory admission; same range as the `serve.continuous_batch_size` config key. The runtime batch width is dynamic, and the 128/63 chunk sizes are not lane limits |
+| `--vision <path>` | Vision-tower sidecar wired into every model load; overrides the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`. Honored by foreground serve only: `-d` does not forward it to the child |
+| `--ui` | Serve the embedded chat UI (see below) |
+| `--open` | Open the chat UI in the default browser once serving; implies `--ui` |
 
 Positional forms: `[model] [host] [port]`, or `host:port` / `[ipv6]:port`.
 Without a model arg, pre-warm uses `HIPFIRE_MODEL` if set, else
@@ -84,6 +106,20 @@ Config and env owners for bind, idle, queue, and body limits:
 2. **Daemon.** Spawns the Rust `daemon` example over stdio JSON.
 3. **Pre-warm (default).** Loads the chosen model asynchronously. Failures log
    and leave the process serving; the model loads on the first real request.
+   A failure the config itself decides — a load-time refusal such as
+   `dflash_mode=on` with no DFlash draft and no MTP head — is not transient:
+   every later request reloads and is refused the same way, while `/health`
+   still answers `ok`. Fix the config (or pass `developer.dflash_draft`)
+   rather than retrying. The same holds for the partial-offload refusals, each
+   of which names its knob on screen: a pinned `memory.gpu_layer_budget` /
+   `memory.moe_expert_budget` placement that does not fit device weights, a
+   spill that exceeds pinned host RAM (+ 4 GiB headroom) or the GTT
+   `pages_limit`, an unpackable host-placed expert layer (neither the uniform
+   nor the graded packer applies), host-placed packed AWQ experts under
+   `memory.offload_exec=cpu`, a configured spill on a non-spillable load
+   (`tp > 1`, `pp > 1`, EP, VL tower, paged experts, REAP keep-map, or a
+   non-Qwen3.5 arch), and `memory.offload_exec=cpu` together with a
+   retained-replay (Redline) backend.
    Multi-slot serve (`serve.multi_slot = true`) fails closed instead: the slot
    engine is its only backend, so a failed pre-warm (for example, slot-engine
    allocations that do not fit beside another process on the card) logs the
@@ -92,11 +128,61 @@ Config and env owners for bind, idle, queue, and body limits:
    default: one generation holds the daemon at a time and later requests wait
    in a bounded queue (`serve.max_queue`). Continuous batching covers only
    thinking-off, single-turn Qwen requests (`serve.continuous_batch_size`).
+   The VMM continuous-batching route (`serve.vmm_batch`,
+   `HIPFIRE_SERVE_VMM_BATCH`, **default off, experimental**) instead batches
+   eligible TP1 Qwen3.5-family requests over the one resident weight set with
+   per-request VMM KV/DeltaNet owners (no fixed lanes, no second model). The
+   loaded ack then reports `continuous_batch_route: "vmm"` and the actual
+   owner receipt (`vmm_batch_kv_backend`, `vmm_batch_kv_mode`,
+   `vmm_batch_max_seq_bound`). By default it runs the **exact** route
+   (per request byte-identical to the singleton route; prefill uses the
+   singleton's own chunking, so a long prompt prefills in singleton-sized
+   chunks), staged only where the executor admits it (gfx1201, uniform
+   MQ4G256V2 dense layers); the ack reports `continuous_batch_exact: true`.
+   `serve.batch_nonexact` / `HIPFIRE_SERVE_BATCH_NONEXACT=1` selects the
+   non-exact shared slots body instead (`continuous_batch_nonexact: true`).
+   `serve.batch_sampled` / `HIPFIRE_SERVE_BATCH_SAMPLED` (default on; `0` is
+   the kill switch) additionally admits sampled (temperature>0) requests to the
+   exact route, each in the lane mode its singleton route selects (AR, native
+   MTP, FAST_SAMPLE selector-chain DFlash) and byte-identical to that
+   singleton for the same wire seed. A sampled request the batch cannot serve
+   in its own mode (stop strings or a think budget on a speculative lane, or
+   a prompt + `max_tokens` beyond the lane engine's cap, 32,768 for the MTP
+   head) stays on the singleton route, never an AR substitute;
+   sampled speculative singletons are not promoted mid-generation. The load
+   ack reports `continuous_batch_sampling: "sampled"` and
+   `continuous_batch_sampled_modes`; each batched request's
+   `continuous_batch` receipt carries `spec_mode`, `sampling` and
+   `equivalence: "singleton_exact"`. With the flag off sampled requests stay
+   on the serialized singleton route.
+   Greedy requests (and sampled ones under `serve.batch_sampled`) batch with
+   penalties applied as on the singleton route; `serve.batch_spec`
+   (`HIPFIRE_SERVE_BATCH_SPEC=0` disables it) lets lanes decode as
+   cross-request MTP/DFlash speculative verify rows. A request that is alone at
+   dispatch keeps the unchanged singleton
+   route (including native MTP/DFlash); requests arriving while a singleton
+   generation runs wait for it to finish, so their TTFT includes that
+   generation (known gap). The fixed-slot `serve.multi_slot` engine below is
+   the legacy route.
    With `serve.multi_slot = true`, up to `serve.multi_slot_slots` requests
    decode at once on the experimental multi-slot engine. Concurrent requests
    can produce different greedy text than serial requests at ≥4 slots; output
    is deterministic for a fixed batch composition. 2 slots matched serial in
-   testing. A waiter that is still queued after `serve.queue_timeout_ms`
+   earlier testing; on 35B-A3B MoE checkpoints they diverged from serial on
+   1–4 of 4 prompts.
+
+   The **embedding** route (arch 17) uses the same switch with a different
+   engine behind it: `POST /v1/embeddings` requests arriving together are
+   served as **one batched forward** rather than one at a time, and because the
+   encoder is deterministic (no KV, GDN state reset per sequence) that batch is
+   **bit-identical** to encoding each input alone — batching is a throughput
+   choice there, never an output change (`scripts/check_embed_multislot.py`
+   checks it bit-for-bit). `serve.multi_slot_slots` is the number of requests
+   one forward may hold and `serve.max_batch_tokens` its row budget; an
+   isolated request pays only the collector's window
+   (`HIPFIRE_EMBED_BATCH_WINDOW_US`, default 2 ms). Measured on gfx1101, eight
+   concurrent 9-token queries: 96 ms serial (83 req/s) against a 16 ms
+   concurrent batch (501 req/s, **6.0x**) — all eight in one forward. A waiter that is still queued after `serve.queue_timeout_ms`
    (default 10 minutes, long enough for one full generation; `0` waits
    forever) gets
    **503** "server busy" with `Retry-After`. A failed `accept` (for example,
@@ -123,12 +209,32 @@ Implemented paths (anything else → `404`):
 
 | Method | Path | Role |
 |---|---|---|
-| `GET` | `/health` | Liveness JSON: `status`, `model`, `loading_model`, `pid`, `native`, `capabilities` |
-| `GET` | `/v1/models` | `{ data: [{ id }, ...] }` from local model files |
-| `GET` | `/stats` | Serve telemetry: uptime, queue depth, requests served, recent decode tok/s |
+| `GET` | `/health` | Readiness JSON: `status`, `model`, `loading_model`, `pid`, `token`, `native`, `capabilities`, `n_ctx`, `reasoning_contract`, `reasoning_effort_native`, `reasoning_efforts`; `503` unless `status` is `ok` |
+| `GET` | `/v1/models` | `{ object: "list", data: [{ id, object: "model", owned_by, created?, meta?, architecture? }, ...] }` from local model files; the resident model is listed first and alone carries `meta` / `architecture` |
+| `GET` | `/stats` | Serve telemetry: `model`, `uptime_sec`, `queue_depth`, `requests_served`, `retries_attempted`, `retries_succeeded`, `recent_tok_s` |
+| `GET` | `/metrics` | Prometheus text exposition (v0.0.4); see below |
 | `POST` | `/v1/chat/completions` | Chat completions (stream or non-stream) |
+| `POST` | `/v1/messages` | Anthropic Messages API (stream or non-stream), adapted onto chat completions |
+| `POST` | `/v1/responses` | OpenAI Responses API (stream or non-stream), adapted onto chat completions |
+| `POST` | `/v1/images/generations` | OpenAI-shaped image generation on the resident FLUX checkpoint; see below |
+| `POST` | `/v1/images/edits` | Reference-image edit (multipart, FLUX.2 Klein); see below |
+| `GET` | `/`, `/ui`, `/ui/`, `/ui/index.html`, `/ui/app.js`, `/ui/db.js`, `/ui/render.js`, `/ui/style.css` | Embedded chat UI (opt-in; see below). Exactly these paths: `/` redirects (302) to `/ui`; other `/ui/...` paths are `404` |
 
 There is **no** `/v1/completions` route in the current CLI serve.
+
+### Embedded chat UI (`--ui` / `serve.ui` / `HIPFIRE_SERVE_UI`)
+
+Off by default. `hipfire serve --ui` (or `--open`, which implies `--ui`
+and launches the browser) serves a dependency-free chat frontend at
+`/ui` on the same listener; `serve.ui = true` or `HIPFIRE_SERVE_UI=1`
+enable it for any serve start, including detached ones. `GET /`
+redirects to `/ui` only while the UI is enabled.
+
+The UI talks to the same `/v1/chat/completions` gateway as any other
+client and keeps chat history in the browser's IndexedDB — serve stores
+nothing on its behalf. Like every serve endpoint it is **unauthenticated**:
+binding a non-loopback host with the UI enabled prints a warning, since
+that makes the gateway reachable from any browser on the network.
 
 For the sealed MQ4R reproduction, default-model handoff, and copyable Hermes
 Agent / Pi custom-provider configuration, see
@@ -144,12 +250,60 @@ multi-slot serve could not load its model (pre-warm, or the reload after a
 respawn), after which serve exits 1 so a service manager can restart it.
 `model` is the loaded tag/path or `null` when idle/unloaded or after a failed
 model switch; `loading_model` names an asynchronous pre-warm or post-restart
-reload.
+reload. `token` is a per-process instance token. `n_ctx` is the `max_seq` the
+resident model was loaded with (`null` while none is resident).
+`reasoning_contract`, `reasoning_effort_native` and `reasoning_efforts`
+publish the resident model's reasoning capability (see the reasoning contract
+below). All of these come from serve's own metadata, so `/health` never waits
+on a model load.
+
+Model switch lifecycle: a load request is first admitted read-only; a refused
+admission leaves the prior model (and its drafter) loaded. Once admitted, a
+single-device or pipeline-parallel load (Flash-Next/Qwen4 included) unloads
+the prior model and requires clean VMM state before constructing the new
+one, so a failure after admission leaves no model loaded and the error says
+`no model loaded`. Only tp>1 expert-parallel loads stage the new model before
+retiring the prior one. Flash-Next with VMM QSA state (gfx1151/gfx1201 automatic) owns
+VMM arenas of its own: the target and MTP context arenas and the gathered
+attention workspace. All of them are released when the model unloads, so the
+next load's clean-VMM check starts from zero owners in either swap direction.
 
 ```bash
 # Loopback example (safe default for local smoke):
 curl -s http://127.0.0.1:11435/health
 ```
+
+### `GET /metrics`
+
+Prometheus text format, read from gateway counters and `ServeMeta`, so a
+scrape never waits on a model load. Token counts, throughput and tau come
+from the daemon's `done` event and are recorded only when that event carries
+the field: a route that does not report one adds nothing, never a zero.
+TTFT, latency and TPOT are measured at the gateway.
+
+| Series | Type | Meaning |
+|---|---|---|
+| `hipfire_requests_total` | counter | Completed chat and image requests |
+| `hipfire_requests_failed_total` | counter | Requests answered with an error, or whose stream ended in one |
+| `hipfire_admission_rejected_total` | counter | Requests refused by admission (queue full or wait timed out) |
+| `hipfire_prompt_tokens_total` | counter | `done.prompt_tokens` (`prefill_tokens + cached_tokens` if absent, as in `usage`) |
+| `hipfire_completion_tokens_total` | counter | `done.tokens` (`done.completion_tokens` if absent) |
+| `hipfire_cached_prompt_tokens_total` | counter | `done.cached_tokens` |
+| `hipfire_retries_total`, `hipfire_retries_succeeded_total` | counter | Transient-failure retries attempted / that then completed |
+| `hipfire_queue_depth`, `hipfire_queue_capacity` | gauge | Requests in flight or queued; admission capacity |
+| `hipfire_uptime_seconds` | gauge | Seconds since serve started |
+| `hipfire_engine_up` | gauge | 1 while the daemon is up, 0 while restarting or unhealthy |
+| `hipfire_model_loading` | gauge | 1 while a model load is in progress |
+| `hipfire_context_capacity_tokens` | gauge | Context the resident model was loaded with (0 when none) |
+| `hipfire_model_info{model="…"}` | gauge | 1 for the resident model; no sample when none is resident |
+| `hipfire_ttft_milliseconds` | histogram | Time to first generated token (reasoning included), chat requests |
+| `hipfire_request_latency_milliseconds` | histogram | Wall time, chat and image requests |
+| `hipfire_time_per_output_token_milliseconds` | histogram | `(latency − ttft) / (tokens − 1)`; requests with at least 2 tokens |
+| `hipfire_decode_tokens_per_second`, `hipfire_prefill_tokens_per_second` | histogram | `done.decode_tok_s` (`done.tok_s` if absent), `done.prefill_tok_s` |
+| `hipfire_spec_tau` | summary (`_sum`/`_count`) | `done.tau`, speculative routes only |
+
+Buckets: TTFT and latency `10 … 60000` ms; TPOT `2 … 500` ms; throughput
+`1 … 5000` tok/s.
 
 ### `POST /v1/chat/completions`
 
@@ -159,9 +313,19 @@ curl -N http://127.0.0.1:11435/v1/chat/completions \
   -d '{
     "model": "qwen3.5:9b",
     "messages": [{"role": "user", "content": "hi"}],
+    "max_tokens": 512,
+    "chat_template_kwargs": {"enable_thinking": false},
     "stream": true
   }'
 ```
+
+> **`max_tokens` includes reasoning.** Qwen tags think by default
+> (`thinking = "on"`), and the `<think>` span counts against `max_tokens`. With
+> a modest cap the whole budget can go to reasoning, so the response carries
+> only `reasoning_content`, `content` is `""`, and `finish_reason` is `length`.
+> Most OpenAI clients show only `content`, so this looks like a blank answer.
+> Send `"chat_template_kwargs": {"enable_thinking": false}` (as above) for
+> direct answers, or raise `max_tokens` / omit it to keep thinking.
 
 - **`stream: true`** (typical clients): SSE `data: {chat.completion.chunk}`
   lines until `data: [DONE]`. The `200` and the role chunk go out when
@@ -190,12 +354,13 @@ through to per-model / registry / daemon defaults when omitted):
 | `messages` | OpenAI chat messages (required for useful chat) |
 | `messages[].content[].image_url` | One base64 PNG/JPEG data URI for VL models; remote URLs and multiple images are rejected |
 | `stream`, `stream_options.include_usage` | Streaming + optional usage on stream end |
-| `temperature`, `top_p`, `top_k`, `min_p`, `repeat_penalty` | Sampling; explicit request values win, otherwise per-model TOML / registry-card values are applied |
+| `temperature`, `top_p`, `top_k`, `min_p`, `repeat_penalty` | Sampling; explicit request values win, otherwise per-model TOML / registry-card values are applied. On the Qwen AR samplers (GPU kernel and the CPU sampler used by Flash-Next AR, grammar-constrained Qwen turns and the multi-slot VL first token) `top_k` keeps at most k candidates from a 64-wide gather (absent = 20; `0` or > 64 = 64) and `min_p` drops candidates below `min_p` × the top candidate's probability, both before `top_p`. At `temperature: 0` all three are no-ops. Other routes do not apply every field yet: Gemma4 eager, LFM2, Cohere2, MiniMax, DeepSeek V4 AR, LLaMA AR and single-slot Qwen3.5-VL image turns ignore the request `top_k`; those plus Muse Glimmer, DeepSeek V4 speculative and n-gram speculative decoding ignore `min_p`; Qwen2, Maple and dots.ocr text decode greedily. |
 | `seed` | OpenAI-compatible sampling seed: non-negative integer (≤ u64::MAX). Same seed is reproducible only when prompt, sampling parameters, and execution shape match. Cold vs prefix-resumed and solo vs co-batched shapes may differ until `serve.batch_invariant` is implemented; `null`/omitted = fresh entropy. Negative/fractional/non-integer values are rejected. |
 | `presence_penalty`, `frequency_penalty` | Forwarded natively to the daemon (≥ 0); `presence_penalty` also inherits per-model / registry defaults |
-| `max_tokens` | Generation cap |
-| `stop` | A string or an array of up to 4 strings, each ≤ 64 characters; any other value is a 400. Matched on the answer only (never inside reasoning), and the stop text is not returned. Honoured on the Qwen3.5-family routes (`qwen_ar`, `qwen_dflash`, which covers MTP); every other route answers 400 instead of ignoring it |
-| `tools` | Tool definitions (with structured `messages` when Jinja chat is on) |
+| `max_tokens` | Generation cap, shared by the `<think>` span and the answer (see the note under the example above) |
+| `stop` | A string or an array of up to 4 strings, each ≤ 64 characters; any other value is a 400. Matched on the answer only (never inside reasoning), across token boundaries; streaming holds back a possible partial match, the stop text and everything after it are not returned, and `finish_reason` is `stop` (or `tool_calls` when a call completed before the match). Honoured on the Qwen3.5-family routes (`qwen_ar`, `qwen_dflash`, which covers MTP) and Flash-Next (`qwen4_ar`, `qwen4_spec` = native MTP); every other route answers 400 instead of ignoring it |
+| `tools` | Tool definitions (with structured `messages` when Jinja chat is on). Flash-Next accepts them with native MTP attached: greedy tool turns run on MTP and match AR byte for byte |
+| `response_format` | **Not enforced on the standard route.** Any value (`json_object`, `json_schema`, `text`, even an unknown type) is accepted unvalidated with HTTP 200 and is not forwarded to the daemon; the model output is unconstrained (a model asked for JSON may still wrap it in a code fence). Only `serve.multi_slot = true` enforces `json_schema` (pre-sampling grammar mask) and refuses `json_object` / unknown types with 400 |
 | `chat_template_kwargs.enable_thinking` | Mode axis. `false` forces a no-think turn (Qwen native empty closed think). Independent of effort and cap. |
 | `chat_template_kwargs.preserve_thinking` | Keep `<think>` in final non-stream content |
 | `thinking` / `thinking.type` | Mode axis (`on`/`off`, or DeepSeek-style `enabled`/`disabled`). Thinking disabled wins and drops effort/cap with a warning. |
@@ -203,21 +368,156 @@ through to per-model / registry / daemon defaults when omitted):
 | `reasoning.max_tokens` / `max_think_tokens` | Explicit **integer** think-span cap on Qwen Jinja contracts. `0` or omitted = uncapped. DeepSeek, Gemma, Glimmer, and unsupported contracts drop it with a warning. Independent of effort. |
 | `thinking_budget` / `reasoning.budget` | Legacy **named** cap preset only on non-effort-native Qwen templates that still accept it. Dropped+warned elsewhere. |
 
+### `POST /v1/messages` (Anthropic Messages API)
+
+An adapter onto the chat-completions route, not a second generation path.
+The request becomes a chat-completions body, which then goes through the
+same admission (batching eligibility and model lease), tool gate, worker,
+tool-call parser, think routing and stop handling as `/v1/chat/completions`.
+Serve sends the daemon the same `generate` request as the matching chat
+request, so batching and the session cache behave the same. The response is
+rendered back as an Anthropic `message` object or SSE events.
+
+```bash
+curl -N http://127.0.0.1:11435/v1/messages \
+  -H "Content-Type: application/json" -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "qwen3.5:4b",
+    "max_tokens": 512,
+    "system": "Be brief.",
+    "messages": [{"role": "user", "content": "hi"}],
+    "stream": true
+  }'
+```
+
+| Messages field | Chat-completions equivalent |
+|---|---|
+| `model`, `max_tokens` (required) | `model`, `max_tokens` |
+| `system` (string or text blocks) | A leading `system` message. Text blocks are concatenated with no separator, as chat content parts are |
+| `messages[]` `text` blocks | Plain-string `content`. Text-only turns keep the plain-string shape the batch routes require |
+| `image` block (base64; `url` source) | One `image_url` part (only base64 PNG/JPEG is accepted, as on chat) |
+| assistant `thinking` blocks | `reasoning_content` (replayed as for chat; `signature` ignored). `redacted_thinking` is dropped |
+| assistant `tool_use` blocks | `tool_calls` (input serialized as the arguments string) |
+| user `tool_result` blocks | `tool` messages with `tool_call_id = tool_use_id`, placed before the turn's text. `is_error: true` prefixes the result with `Error: ` |
+| `tools` (`name`, `description`, `input_schema`) | Function tools. Server tools (`type` other than `custom`) → 400 |
+| `tool_choice` `auto` / `any` / `tool` / `none` | `auto` / `required` / named function / `none`. `disable_parallel_tool_use` is not enforced, like chat's `parallel_tool_calls` |
+| `thinking` `enabled` (+ `budget_tokens`) / `adaptive` / `disabled` | `thinking.type` enabled/disabled; `budget_tokens` → `max_think_tokens` |
+| `thinking` absent | Thinking **off** (the Messages API default). Send `thinking` to enable it |
+| `stop_sequences` | `stop` (same limits: up to 4, each ≤ 64 characters; an empty list is not forwarded) |
+| `temperature`, `top_p`, `top_k` | Same fields |
+| `stream` | SSE (below) |
+| `metadata`, `service_tier`, `cache_control` | Ignored |
+
+Refused with 400 rather than silently changed: a final assistant message
+(response prefill), `document` and other unsupported block types, images
+inside `tool_result`, server tools and `mcp_servers`.
+
+Response: `content` holds a `thinking` block (reasoning, `signature: ""`),
+then a `text` block, then the released `tool_use` blocks. Each appears only
+when it has content. Tool ids are the daemon's or `toolu_<request>_<n>`.
+`stop_reason`: `end_turn` (stop), `max_tokens` (length), `tool_use` (released
+tool calls). The daemon's terminal does not say which stop sequence matched,
+so a stop-sequence stop also reports `end_turn` with `stop_sequence: null`.
+`usage`: `input_tokens` is the prompt minus session-cache hits,
+`cache_read_input_tokens` is the cache hits, `cache_creation_input_tokens` is
+always 0, and `output_tokens` is the chat `completion_tokens`. `timings` and
+`hipfire` carry the same evidence as on chat.
+
+Streaming: `message_start`, then one `content_block_start` /
+`content_block_delta` (`thinking_delta` or `text_delta`) / `content_block_stop`
+run per thinking or text span, as generated. The released `tool_use` blocks
+follow at the end, each with one `input_json_delta` holding the full arguments.
+Then `message_delta` (`stop_reason`, `usage`) and `message_stop`. The
+`message_start` usage is zero, because token counts are known only at the
+terminal, and `message_delta` carries the real counts. Commit timing,
+keepalives and the pre-commit JSON errors work as on chat. A failure after
+commit ends the stream with `event: error`.
+
+Errors use the Anthropic shape `{"type": "error", "error": {"type", "message"}}`
+with chat's status mapping: 400 `invalid_request_error`, 404
+`not_found_error`, 413 `request_too_large`, 503 `overloaded_error` (with
+`Retry-After`), 500 `api_error`. `POST /v1/messages/count_tokens` is not
+implemented (404).
+
+### `POST /v1/responses` (OpenAI Responses API)
+
+An adapter onto the chat-completions route, like `/v1/messages`: same
+admission, batching eligibility, session cache, tool parsing, think routing
+and stop handling. Serve stores no responses. The client resends the
+conversation in `input` (`store` is always reported `false`).
+
+```bash
+curl -N http://127.0.0.1:11435/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5:4b",
+    "instructions": "Be brief.",
+    "input": "hi",
+    "max_output_tokens": 512,
+    "stream": true
+  }'
+```
+
+| Responses field | Chat-completions equivalent |
+|---|---|
+| `instructions` | A leading `system` message |
+| `input` string | One `user` message |
+| `input` message items (`user` / `system` / `developer` / `assistant`; `input_text` / `output_text` parts; `input_image` with `image_url`) | Chat messages with plain-string content (an image keeps the array form, as on chat) |
+| `reasoning` items | `reasoning_content` of the following assistant turn (`content` text, else the `summary` text) |
+| `function_call` items | `tool_calls` of the current assistant turn (`call_id` → id) |
+| `function_call_output` items | `tool` messages (`call_id` → `tool_call_id`) |
+| `tools` (`type: "function"`) | Function tools. Hosted tools → 400 |
+| `tool_choice` `auto` / `none` / `required` / `{type: function, name}` | Same |
+| `max_output_tokens` | `max_tokens` (omitted: fitted to the context as on chat) |
+| `temperature`, `top_p`; extensions `top_k`, `stop` | Same fields |
+| `reasoning.effort` | `reasoning_effort` (absent: the server's reasoning default, as on chat) |
+| `text.format` `json_schema` / `json_object` | `response_format` (enforced only where chat enforces it) |
+| `include`, `store`, `metadata`, `user`, `parallel_tool_calls`, `truncation` | Accepted; not enforced (`parallel_tool_calls` is ignored, as on chat) |
+
+Refused with 400: `previous_response_id`, `conversation`, `prompt`,
+`item_reference` items, `background: true`, hosted tools and `input_file`.
+
+Response: `output` holds a `reasoning` item (`content[0].reasoning_text`,
+empty `summary`), then a `message` item (`output_text`), then the released
+`function_call` items. Each appears only when it has content. Call ids are the
+daemon's or `call_<request>_<n>`. `status` is `completed`, or `incomplete`
+with `incomplete_details.reason: "max_output_tokens"` on length. `usage` has
+`input_tokens` (session-cache hits included and reported in
+`input_tokens_details.cached_tokens`), `output_tokens` and `total_tokens`.
+Reasoning tokens are not counted separately, so `output_tokens_details` is
+omitted.
+
+Streaming: `response.created`, `response.in_progress`, then per reasoning
+span `response.output_item.added` / `response.reasoning_text.delta` /
+`response.reasoning_text.done` / `response.output_item.done`, and per text
+span `output_item.added` / `content_part.added` / `output_text.delta` /
+`output_text.done` / `content_part.done` / `output_item.done`. Released
+function calls follow (`output_item.added`,
+`function_call_arguments.delta` with the full arguments,
+`function_call_arguments.done`, `output_item.done`), then
+`response.completed` (or `response.incomplete`) with the full response. Every
+event carries `sequence_number`. A failure after commit sends `error`, then
+`response.failed`. Errors before commit are OpenAI-shaped `{"error": {...}}`
+with chat's status mapping.
+
 ### `POST /v1/images/generations`
 
-OpenAI-shaped image generation on a loaded diffusion checkpoint (arch 40
-FLUX.1, arch 45 FLUX.2 Klein). Body fields: `model` (must already be loaded on
-this server), `prompt`, optional `width` /
-`height` (or OpenAI `size: "WxH"`), `steps` (defaults to the architecture
-default: 4 for `flux.schnell`, 28 for `flux.dev`), `seed`, `n` (must be 1),
-`response_format` (must be `b64_json`). References the same denoise path as the
-`img_generate` daemon message (`hipfire img`).
+OpenAI-shaped image generation on the **resident** diffusion checkpoint (arch 40
+FLUX.1, arch 45 FLUX.2 Klein). Serve does not switch models for this route:
+load the checkpoint first, and `model` is only echoed back in the response
+(it is not a selector). Body fields: `prompt` (required), optional `width` /
+`height` (or OpenAI `size: "WxH"`, which wins), `steps` (architecture default
+when omitted: 4 for `flux.schnell`, 28 for `flux.dev`), `seed`, `n` (must be
+1), `response_format` (must be `b64_json`), and the daemon-validated
+`sampler` (euler flow-match only), `negative_prompt` and `backend`
+(`cpu` or `gpu`). Same denoise path as the `img_generate` daemon message
+(`hipfire img`). Image requests share the admission queue with chat.
 
 ```json
 {"model": "flux.schnell:1", "prompt": "a tiny lighthouse on a rock, sunset", "size": "512x512", "response_format": "b64_json"}
 ```
 
-Response: `{ "data": [ { "b64_json": "…", "width": 512, "height": 512, "seed": 0, "steps": 4 } ], "model": "…", "hipfire": { "ms": 1234 } }`.
+Response: `{ "created": 1790000000, "model": "<loaded model path>", "data": [ { "b64_json": "…", "size": "512x512" } ], "hipfire": { "seed": 0, "steps": 4, "width": 512, "height": 512, "ms": 1234 } }`.
 
 This body takes no image input. A request with an `images` field is refused
 with a 400 that points at `/v1/images/edits`.
@@ -225,18 +525,20 @@ with a 400 that points at `/v1/images/edits`.
 ### `POST /v1/images/edits`
 
 OpenAI-shaped reference edit (FLUX.2 Klein, arch 45 only): `multipart/form-data`
-with one to four `image` file parts (PNG or JPEG, at most 32 MB each after
-upload) plus the text fields of `/v1/images/generations` (`prompt` required;
-`size`, `steps`, `seed`, `n`, `response_format`). The image bytes travel in
-the request; the server never reads a file the client names. Each reference
-is area-capped at 1 MP and floored to a multiple of 16, and conditions every
-denoise step without being denoised. Without `size` the output takes the
-first reference's size. The whole body counts against `serve.max_request_bytes`.
+with one to four `image` file parts (repeat the part; `image[]` is also
+accepted; PNG or JPEG, at most 32 MiB each) plus the text fields of
+`/v1/images/generations` (`prompt` required; `size`, `width`, `height`,
+`steps`, `seed`, `n`, `response_format`). Numeric fields must be non-negative
+integers. The image bytes travel in the request; the server never reads a file
+the client names. Each reference is area-capped at 1 MP and floored to a
+multiple of 16, and conditions every denoise step without being denoised.
+Without `size` the output takes the first reference's size. The whole body
+counts against `serve.max_request_bytes`.
 
 ```bash
-curl -s -X POST http://127.0.0.1:11580/v1/images/edits \
-  -F image=.png -F prompt="make the bicycle blue" -F steps=4 -F seed=0 \
-  | jq -r .data[0].b64_json | base64 -d > bike-blue.png
+curl -s -X POST http://127.0.0.1:11435/v1/images/edits \
+  -F image=@bike.png -F prompt="make the bicycle blue" -F steps=4 -F seed=0 \
+  | jq -r '.data[0].b64_json' | base64 -d > bike-blue.png
 ```
 
 Response: the same shape as `/v1/images/generations`.
@@ -258,6 +560,11 @@ map in [`CONFIG.md`](CONFIG.md). HTTP accepts the same meanings as CLI/config.
   positive integer cap (semantic effort stays independent of that cap). DeepSeek V4 and
   Muse Glimmer expose semantic effort but no independent parent-defined cap; cap fields
   are dropped+warned.
+- A request that omits effort (or sends `auto`) on Qwen3.8 or Ornith 1.5 defers to
+  configured effort, and if none is set resolves to hipfire's `medium` default (the
+  official template default is `xhigh`). An explicit non-`auto` `reasoning_effort` /
+  `reasoning.effort` in the request wins, so `"xhigh"` restores the old behavior.
+  Thinking off drops the effort. This default does not imply a cap.
 
 **Examples:**
 
@@ -269,14 +576,14 @@ curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application
   "chat_template_kwargs": {"enable_thinking": false}
 }'
 
-# Qwen3.8 — semantic effort only (still uncapped unless max_think_tokens is set)
+# Qwen3.8 — semantic effort only; omitted/auto resolves to medium, xhigh is explicit (still uncapped unless max_think_tokens is set)
 curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "qwen3.8:27b",
   "messages": [{"role": "user", "content": "plan a refactor"}],
-  "reasoning_effort": "medium"
+  "reasoning_effort": "xhigh"
 }'
 
-# Ornith 1.5 — Qwen3.8-compatible semantic effort (default xhigh; still uncapped unless max_think_tokens)
+# Ornith 1.5 — Qwen3.8-compatible semantic effort (omitted/auto resolves to medium; still uncapped unless max_think_tokens)
 curl -s http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model": "ornith-1.5:35b-a3b",
   "messages": [{"role": "user", "content": "plan a refactor"}],
@@ -327,7 +634,9 @@ When `messages` contains no `system` or `developer` role, the serve layer insert
 
 `finish_reason` values emitted to clients: `stop`, `length`, `tool_calls`. A
 turn that runs out of `max_tokens` while still reasoning ends with `length`:
-the partial `reasoning_content` is returned and `content` is empty.
+the partial `reasoning_content` is returned and `content` is empty. A turn
+the model ends (end-of-turn token) while still reasoning ends the same way
+with `stop`. Neither turn releases a tool call or is cached.
 
 Streaming error contract: a failure that happens BEFORE the first byte is a
 plain HTTP error status (no SSE body). A failure after the stream has started
@@ -337,9 +646,9 @@ a silently truncated `200`. Non-streaming failures keep the typed
 status mapping (`400` request/config, `503` + `Retry-After` overload or
 transient, `500` internal).
 
-Prefix-cache capable arches (daemon `cache_capable`, or arch allowlist
-`deepseek4` / `qwen3_5` / `qwen3_5_moe`) skip per-request `reset` so multi-turn
-LCP can hit. Other arches reset every request (stateless OpenAI shape).
+Loads whose ack reports `cache_capable: true`, or whose route is continuous-batch
+capable, skip the per-request `reset` so multi-turn longest-common-prefix reuse
+can hit. Other loads reset every request (stateless OpenAI shape).
 
 ### Client notes (Zed / OpenAI-compatible agents)
 
@@ -458,14 +767,77 @@ python3 scripts/serve_harness.py --model ~/.hipfire/models/<file> --tag qwen3.5:
 No-GPU CI (`.github/workflows/no-gpu-ci.yml` → `scripts/no-gpu-ci.sh`) never
 certifies GPU serve, model coherence, or throughput.
 
+## Flash-Next exact lane batching (qwen4, arch 16)
+
+Concurrent Qwen3.8 Flash-Next requests can share one trunk step on the exact
+**fn-lanes** route: each admitted request owns a lane (its own request state:
+QSA K/V, GDN recurrent state, PLE history) over the one resident weight set,
+and every committed token and state byte per request is identical to that
+request run alone on the singleton route. **Default off, experimental.**
+
+- **Enable:** `serve.vmm_batch = true` (`HIPFIRE_SERVE_VMM_BATCH=1`) **and**
+  `serve.continuous_batch_size >= 2` (`HIPFIRE_CONTINUOUS_BATCH_SIZE`); the
+  row budget per step is `serve.max_batch_tokens`. The QSA context backend must
+  be VMM and the lane store must fit the free device memory; otherwise the
+  load logs `[daemon] qwen4 lanes refused: <reason> — fallback to sequential`
+  and serves the singleton route exactly as before. With
+  `continuous_batch_size >= 2` but `serve.vmm_batch` off the load logs
+  `[daemon] qwen4 lanes need serve.vmm_batch — fallback to sequential` and
+  advertises `continuous_batch_capable: false`.
+- **Kill switch:** `HIPFIRE_SERVE_VMM_BATCH=0` (the compatibility spelling of
+  `serve.vmm_batch = false`) stages no lane store and restores today's serial
+  behavior.
+- **Eligible requests:** greedy decoding, plain text chat only — no tools,
+  images, logprobs or penalties. Ineligible requests keep the singleton route.
+- **Singleton when alone:** a request that is alone at dispatch runs the
+  unchanged singleton route (including native MTP).
+- **MTP lanes (default when the MTP head is loaded):** each lane runs its own
+  native MTP window per step: a step-synchronous batched draft for every
+  drafting lane, then one `(d+1)`-row verify per lane inside the shared lane
+  step (the step's row budget counts lanes, not rows). A lane that
+  drafts nothing, or that the floor retires, decodes one AR row per step.
+  `serve.batch_spec = false` (`HIPFIRE_SERVE_BATCH_SPEC=0`) keeps the AR lanes
+  of before (one token per lane per step). There is no per-lane session
+  cache, parking or promotion.
+- **Per-lane AR floor:** each lane keeps the singleton's MTP floor (probe
+  windows, sticky retirement, decayed per-depth costs), priced in AR-row
+  units from a measured model of the shared step (an AR row costs its
+  proportional share of an all-AR step; a window adds its verify rows'
+  marginal cost), so a lane whose drafts do not pay falls back to AR rows.
+- **Exact per lane:** every MTP lane window is byte-identical to the one
+  singleton window it takes (a batched window at the lane's draft depth, or
+  the singleton's AR step), on the lane's own states. Stateful stages (PLE
+  conv, GDN core, QSA core) run per lane on the lane's own state; a row-local
+  stage runs once over all lanes' rows only where the G0 byte-identity oracle
+  admitted it, otherwise per lane.
+  On gfx1151 G0 admitted every row-local stage (embedding, HC read/write, the
+  GDN/QSA projections, the MoE, final HC read, head, argmax); other cards run
+  every stage per lane until their own G0 run.
+
+The loaded ack reports `continuous_batch_route: "fn-lanes"`,
+`continuous_batch_history_capable: true` (the typed capability the serve
+gateway uses to admit appended multi-turn histories; it never matches route
+names),
+`continuous_batch_slots`, `continuous_batch_exact: true`,
+`continuous_batch_sampling: "greedy_only"`, the speculation state
+(`continuous_batch_spec`, `continuous_batch_spec_mode` = `"mtp"` or `"off"`,
+`continuous_batch_spec_k` with MTP lanes, `continuous_batch_spec_requested`)
+and the lane-store receipt:
+`fn_lanes_kv_backend`, `fn_lanes_qsa_format`, `fn_lanes_gdn_format`,
+`fn_lanes_ring_rows`, `fn_lanes_max_lanes`, `fn_lanes_row_budget`,
+`fn_lanes_mapped_bytes`, `fn_lanes_stage_policy` (the per-stage sharing
+policy) and `fn_lanes_stage_evidence` (the G0 receipt id for the production
+policy). Each lane's `done` event carries the singleton's MTP counters
+(`mtp`, `mtp_windows`, `ar_windows`, `mtp_retired`) plus `mtp_drafts` and
+`mtp_accepted`.
+
 ## Multi-process notes
 
 - One listener per bind; second serve on the same host/port exits.
-- Prefer plain `hipfire stop` when the pidfile is healthy. Reach for
-  `hipfire stop --force` / `restart` only after `hipfire ps` and `/health`
-  show a stuck orphan or port holder — those paths are destructive
-  (system-wide `pkill -x daemon` + `fuser -k` on the port). Avoid ad-hoc
-  `pkill` unless you know the exact process tree.
+- Prefer plain `hipfire stop` when the pidfile is healthy. `hipfire stop
+  --force` / `restart` also reap this install's untracked daemons, but never
+  another install's or a non-hipfire port holder. Avoid ad-hoc `pkill` unless
+  you know the exact process tree.
 - `hipfire chat` starts a tracked detached native service if none is healthy;
   stop it explicitly with `hipfire stop` when the session is done.
 

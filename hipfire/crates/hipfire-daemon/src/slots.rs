@@ -122,6 +122,10 @@ fn spawn_slot_engine(
 /// sequential arm keeps its own parsing; this owns the multi-slot route's.
 pub struct SlotLoadParams {
     pub mtp_k: usize,
+    /// The `params.mtp_mode` tri-state. `mtp_k > 0` cannot distinguish `auto`
+    /// from an explicit `on`, so this rides beside it into `EngineConfig`
+    /// for the host-spill decline.
+    pub mtp_mode: hipfire_config::MtpMode,
     /// Raw `params.kv_mode` (empty = env/config), resolved engine-side
     /// through `QWEN35_SLOTS_POLICY`.
     pub kv_mode_raw: String,
@@ -146,12 +150,26 @@ impl SlotLoadParams {
     pub fn from_load_msg(msg: &serde_json::Value) -> Self {
         let param = |k: &str| msg.get("params").and_then(|p| p.get(k));
         let param_str = |k: &str| param(k).and_then(|v| v.as_str());
-        // mtp_mode "on"/"auto" enables MTP; mtp_k sets depth (default 4).
-        let mtp_mode = param_str("mtp_mode").unwrap_or("off");
-        let mtp_k = if mtp_mode.is_empty() || mtp_mode == "off" {
+        // mtp_mode "on"/"auto" enables MTP; mtp_k sets depth. An integer param
+        // is explicit; the CLI's `"auto"` resolves to HIPFIRE_MTP_K/config, else
+        // MTP_K_DEFAULT (3); an absent param (non-CLI client) means 4.
+        // The tri-state survives beside mtp_k: the engine's host-spill
+        // decline reads the mode, not the depth. Absent normalizes to
+        // "off" (default Off); the mtp_k rule below (empty/off -> 0) is
+        // verbatim.
+        let mtp_mode_raw = param_str("mtp_mode").unwrap_or("off");
+        let mtp_mode = hipfire_config::MtpMode::parse(mtp_mode_raw);
+        let mtp_k = if mtp_mode_raw.is_empty() || mtp_mode_raw == "off" {
             0
         } else {
-            param("mtp_k").and_then(|v| v.as_u64()).unwrap_or(4) as usize
+            match param("mtp_k") {
+                None => 4,
+                Some(v) => v.as_u64().map(|k| k as usize).unwrap_or_else(|| {
+                    hipfire_runtime::config::get()
+                        .mtp_k
+                        .unwrap_or(hipfire_config::MTP_K_DEFAULT)
+                }),
+            }
         };
         // Same precedence as the sequential loader: load param > env/config.
         let kv_mode_raw = param_str("kv_mode").unwrap_or("").to_string();
@@ -193,6 +211,7 @@ impl SlotLoadParams {
         };
         Self {
             mtp_k,
+            mtp_mode,
             kv_mode_raw,
             kv_backend,
             kv_mode_resolved,
@@ -221,6 +240,11 @@ pub struct SlotBackend {
     /// over-budget request can be rejected with an actionable message
     /// before it occupies a slot.
     cap_tokens: usize,
+    /// Sampling-default inputs shared with the sequential route
+    /// ([`resolve_slot_sampling`]): carrier arch ladder + `.hfq` recs.
+    arch_id: u32,
+    rec_temperature: Option<f32>,
+    rec_top_p: Option<f32>,
     active: AtomicUsize,
     tool_grammar: bool,
     pending_tools: Mutex<PendingToolBroker>,
@@ -369,6 +393,7 @@ impl SlotBackend {
         cap_tokens: usize,
         prefill_chunk: usize,
         mtp_k: usize,
+        mtp_mode: hipfire_config::MtpMode,
         kv_mode_raw: &str,
         kv_backend: &str,
         dflash_draft: Option<PathBuf>,
@@ -388,6 +413,8 @@ impl SlotBackend {
         let tokenizer = preflight.tokenizer;
         let is_vl = preflight.is_vl;
         let vision_config = preflight.vision_config;
+        let rec_temperature = preflight.rec_temperature;
+        let rec_top_p = preflight.rec_top_p;
         // Read prefix cache config (spec §4.5–4.6). Keys are registered in
         // hipfire-config as serve.prefix_cache / serve.prefix_cache_max_bytes
         // with env HIPFIRE_SERVE_PREFIX_CACHE*. Default false/0.
@@ -447,43 +474,19 @@ impl SlotBackend {
         // registered in hipfire-config as serve.max_queue /
         // serve.max_queue_bytes / serve.queue_timeout_ms with env
         // HIPFIRE_SERVE_MAX_QUEUE / HIPFIRE_SERVE_MAX_QUEUE_BYTES /
-        // HIPFIRE_SERVE_QUEUE_TIMEOUT_MS. Defaults 64 / 256 MiB / 30000 ms
-        // (the registered config defaults). The CLI startup guard rejects
+        // HIPFIRE_SERVE_QUEUE_TIMEOUT_MS. Defaults are the registered
+        // `DefaultValue::Integer` entries in hipfire-config's field table:
+        // serve.max_queue = 64, serve.max_queue_bytes = 268435456 (256 MiB),
+        // serve.queue_timeout_ms = 600000 (10 min). The CLI startup guard rejects
         // serve.max_queue=0 for multi-slot; Rig::build also refuses
         // WaitQueue::new(0, _) as a backstop.
-        let wait_max_count = hipfire_config::active_or_local_process_config()
-            .values
-            .get("serve.max_queue")
-            .and_then(|v| {
-                if let hipfire_config::ConfigValue::Integer(i) = v {
-                    Some(*i as usize)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(64);
-        let wait_max_bytes = hipfire_config::active_or_local_process_config()
-            .values
-            .get("serve.max_queue_bytes")
-            .and_then(|v| {
-                if let hipfire_config::ConfigValue::Integer(i) = v {
-                    Some(*i as u64)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(268435456);
-        let queue_timeout_ms = hipfire_config::active_or_local_process_config()
-            .values
-            .get("serve.queue_timeout_ms")
-            .and_then(|v| {
-                if let hipfire_config::ConfigValue::Integer(i) = v {
-                    Some(*i as u64)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(30000);
+        let process_config = hipfire_config::active_or_local_process_config();
+        let wait_max_count =
+            integer_or_registered_default(&process_config.values, "serve.max_queue") as usize;
+        let wait_max_bytes =
+            integer_or_registered_default(&process_config.values, "serve.max_queue_bytes") as u64;
+        let queue_timeout_ms =
+            integer_or_registered_default(&process_config.values, "serve.queue_timeout_ms") as u64;
         // Read the structured-output jump-forward flag (spec §7.3 G3).
         // Key registered as serve.structured_jump_forward with env
         // HIPFIRE_SERVE_STRUCTURED_JUMP_FORWARD. Default false — no
@@ -527,6 +530,7 @@ impl SlotBackend {
                 host_budget_bytes: 16 * 1024 * 1024 * 1024,
                 swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
                 mtp_k,
+                mtp_mode,
                 is_vl,
                 vl_path,
                 kv_mode_raw: kv_mode_raw.to_string(),
@@ -555,6 +559,9 @@ impl SlotBackend {
             is_vl,
             vision_config,
             cap_tokens,
+            arch_id,
+            rec_temperature,
+            rec_top_p,
             active: AtomicUsize::new(0),
             tool_grammar,
             pending_tools: Mutex::new(PendingToolBroker::default()),
@@ -623,6 +630,57 @@ impl SlotBackend {
             return Err("unload refused: slot requests active".to_string());
         }
         self.engine.shutdown()
+    }
+
+    /// Embedding handler for experimental slot mode: parse the `embed` wire
+    /// body, hold an activity guard for the duration (so an unload or model
+    /// swap cannot tear the engine down mid-encode), run it on the engine, and
+    /// write the same `embedded` envelope the sequential route writes — the
+    /// CLI, the HTTP layer and the container client need no change to reach
+    /// the slot path.
+    ///
+    /// One wire request is one encode request. Concurrency comes from the
+    /// daemon spawning a worker per request (as the generate route does) and
+    /// from the engine merging the requests that arrive together into one
+    /// batched forward.
+    pub fn handle_embed<W: std::io::Write>(
+        &self,
+        msg: &serde_json::Value,
+        stdout: &mut W,
+        id: &str,
+    ) {
+        // Bound thread creation before spawning, same shape and reason as the
+        // generate route: a burst must not spawn a thread per rejected
+        // request, and the worker's own guard remains the hard bound.
+        //
+        // Embed replies are correlated by (id, attempt_id=0) — the worker
+        // never enters a BatchAttemptScope, so `emit_active_attempt_error`
+        // would write NOTHING (TLS 0 is the reserved uncorrelated channel)
+        // and the caller would wait forever. The uncorrelated emitter is the
+        // one whose envelope matches the pending key the caller registered.
+        if self.active_count() >= 32 {
+            hipfire_engine::emit::emit_uncorrelated_error(
+                stdout,
+                Some(id),
+                "too many concurrent slot requests (bounded worker limit hit)",
+                "overload",
+                true,
+                false,
+            );
+            return;
+        }
+        let Some(_guard) = self.acquire_guard() else {
+            hipfire_engine::emit::emit_uncorrelated_error(
+                stdout,
+                Some(id),
+                "too many concurrent slot requests (bounded worker limit hit)",
+                "overload",
+                true,
+                false,
+            );
+            return;
+        };
+        hipfire_generate::embed::generate_embed_slot(&*self.engine, stdout, id, msg);
     }
 
     /// Generate handler for experimental slot mode.
@@ -707,11 +765,22 @@ impl SlotBackend {
             return Ok(());
         }
 
-        let temperature = msg
-            .get("temperature")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0) as f32;
-        let top_p = msg.get("top_p").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+        let (temperature, top_p, max_tokens, fit) =
+            match resolve_slot_sampling(msg, self.arch_id, self.rec_temperature, self.rec_top_p) {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    hipfire_engine::emit::emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &err,
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return Ok(());
+                }
+            };
         let top_k = msg.get("top_k").and_then(|v| v.as_i64()).unwrap_or(0);
         if !(0..=i32::MAX as i64).contains(&top_k) {
             hipfire_engine::emit::emit_active_attempt_error(
@@ -796,23 +865,6 @@ impl SlotBackend {
             .unwrap_or(0.0)
             .max(0.0) as f32;
 
-        let max_tokens = match msg.get("max_tokens") {
-            None | Some(serde_json::Value::Null) => 512usize,
-            Some(value) => match value.as_u64().and_then(|v| usize::try_from(v).ok()) {
-                Some(v) if v > 0 => v,
-                _ => {
-                    hipfire_engine::emit::emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        "max_tokens must be a positive integer",
-                        "validation",
-                        false,
-                        false,
-                    );
-                    return Ok(());
-                }
-            },
-        };
         let max_think_tokens = msg
             .get("max_think_tokens")
             .and_then(|v| v.as_u64())
@@ -833,6 +885,16 @@ impl SlotBackend {
         let has_think = self.tokenizer.special_token_id("<think>").is_some();
         let thinking_enabled_opt = msg.get("thinking_enabled").and_then(|v| v.as_bool());
         let assistant_prefix_opt = msg.get("assistant_prefix").and_then(|v| v.as_str());
+        // Raw effort rung, spelled exactly as the sequential route consumes it
+        // (`reasoning_effort`, with the project-custom `thinking_mode` alias).
+        // Kept verbatim — no lowercasing and no rung validation here — so the
+        // template stays the authority on which rungs it accepts. A rejected
+        // rung surfaces as a render error (validation), never a silent
+        // downgrade.
+        let raw_reasoning_effort = msg
+            .get("reasoning_effort")
+            .or_else(|| msg.get("thinking_mode"))
+            .and_then(|v| v.as_str());
         if max_think_tokens == Some(1)
             && (thinking_enabled_opt == Some(true) || assistant_prefix_opt == Some("open_think"))
         {
@@ -941,8 +1003,19 @@ impl SlotBackend {
                 // max_think is fallback only, so when assistant_prefix present we ignore it, but if max_think==1 vs open_think contradiction we still prefer authority and ignore fallback.
                 (enabled, actual)
             } else {
-                // Fallback to max_think_tokens compatibility
-                let enabled = has_think && max_think_tokens != Some(1);
+                // Fallback: `thinking_enabled` and `assistant_prefix` are both
+                // absent, so defer to the shared sequential derivation — an
+                // explicit disable rung (`none`/`off`/`chat`) turns thinking
+                // off, and the immediate-close sentinel (1) does too. Same
+                // result as before, plus the disable rungs the sequential and
+                // batch routes already honour; still gated on this model
+                // actually carrying a `<think>` token.
+                let (enabled, _) = hipfire_engine::prompt::qwen_jinja_reasoning(
+                    None,
+                    raw_reasoning_effort,
+                    max_think_tokens.unwrap_or(0) as usize,
+                );
+                let enabled = enabled && has_think;
                 let exp = if enabled {
                     AssistantPrefix::OpenThink
                 } else if has_think {
@@ -954,6 +1027,12 @@ impl SlotBackend {
             };
         // Additional contradiction: if max_think==1 but thinking_enabled true? Already handled as authority wins, but spec says reject contradictions. If fallback path derived enabled true but max_think==1 would have been false, but since thinking_enabled absent we use max_think, so not contradictory.
         // If has_think false, ensure plain regardless.
+
+        // The effort rung handed to the Jinja template; see
+        // `slot_jinja_effort` for the suppression rule and why it is not keyed
+        // on this route's `enable_thinking`.
+        let jinja_effort =
+            slot_jinja_effort(thinking_enabled_opt, raw_reasoning_effort, max_think_tokens);
 
         // Consume only the gateway-projected tool contract. Raw OpenAI
         // tool_choice never reaches this owner.
@@ -1072,7 +1151,7 @@ impl SlotBackend {
         }
 
         let mut visual_data = None;
-        let (prompt_tokens, started_in_think) = if let Some(image) = slot_image {
+        let (prompt_tokens, prefix) = if let Some(image) = slot_image {
             // The projected message view carries the system text; fall back to
             // the top-level `system` field for prompt-only requests.
             let system = messages
@@ -1082,11 +1161,10 @@ impl SlotBackend {
                 .or_else(|| msg.get("system").and_then(|v| v.as_str()));
             match build_slot_vl_prompt(self, &image, system, &last_user.content, expected_prefix) {
                 Ok((tokens, vd)) => {
+                    // The VL builder frames the assistant turn itself from
+                    // `expected_prefix`, so that is authoritative here.
                     visual_data = Some(vd);
-                    (
-                        tokens,
-                        matches!(expected_prefix, AssistantPrefix::OpenThink),
-                    )
+                    (tokens, expected_prefix)
                 }
                 Err(reason) => {
                     hipfire_engine::emit::emit_active_attempt_error(
@@ -1110,7 +1188,7 @@ impl SlotBackend {
                 enable_thinking,
                 bos_token: None,
                 reasoning_strength: None,
-                reasoning_effort: None,
+                reasoning_effort: jinja_effort,
             };
             let rendered = match frame.render_messages(&messages, tools, None) {
                 Ok(rendered) => rendered,
@@ -1127,8 +1205,13 @@ impl SlotBackend {
                     return Ok(());
                 }
             };
-            let started = rendered.trim_end().ends_with("<think>");
-            (self.tokenizer.encode(&rendered), started)
+            // The template owns the generation suffix: read the assistant
+            // framing back from what it emitted. A thinking-on request that
+            // the template answers with a bare `assistant\n` (standard
+            // Qwen3-family behaviour — the model opens `<think>` itself)
+            // frames `Plain`, not `ClosedThink`.
+            let framing = hipfire_engine::emit::render_assistant_prefix(&rendered);
+            (self.tokenizer.encode(&rendered), framing)
         } else {
             if tools.is_some()
                 || messages
@@ -1158,37 +1241,24 @@ impl SlotBackend {
                 assistant_prefix: expected_prefix,
                 raw: false,
             };
-            (
-                frame.build_multi_turn(&history),
-                matches!(expected_prefix, AssistantPrefix::OpenThink),
-            )
+            // `ChatFrame` frames the assistant turn itself from
+            // `expected_prefix`, so that is authoritative here.
+            (frame.build_multi_turn(&history), expected_prefix)
         };
 
-        // Now prefix for continuation is expected_prefix but also must agree with started_in_think
-        let prefix = if started_in_think {
-            AssistantPrefix::OpenThink
-        } else if has_think {
-            AssistantPrefix::ClosedThink
-        } else {
-            AssistantPrefix::Plain
-        };
-        // Enforce that prefix matches expected_prefix and enable_thinking
-        if prefix != expected_prefix {
-            hipfire_engine::emit::emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!(
-                    "reasoning prefix mismatch: expected {:?} got {:?}",
-                    expected_prefix, prefix
-                ),
-                "validation",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return Ok(());
-        }
+        // Every branch above now reports the framing the prompt actually
+        // ends in. There is nothing left to reconcile: the Jinja render owns
+        // the generation suffix, and the two builders frame it themselves.
+        let started_in_think = matches!(prefix, AssistantPrefix::OpenThink);
         let prompt_len = prompt_tokens.len();
+        // A client that omitted max_tokens gets the default clamped to the
+        // room left after the prompt, exactly like the sequential route.
+        let max_tokens = hipfire_generate::common::fit_max_tokens_if(
+            fit,
+            max_tokens,
+            prompt_len,
+            self.cap_tokens,
+        );
         // vLLM-style admission: prompt + generation budget must fit the
         // slot's context cap. The engine's per-token ctx guard would stop
         // the decode at the cap anyway, but that surfaces as a silently
@@ -1347,34 +1417,17 @@ impl SlotBackend {
         let mut cached_tokens: usize = 0;
         let mut prefill_tokens: usize = prompt_len;
         let t_start = Instant::now();
+        // The parser's initial think state follows the prompt's framing, not
+        // the request's `enable_thinking`. `enable_thinking` is a Jinja input:
+        // a thinking-on Qwen3-family render frames no opener and the model
+        // emits `<think>` itself, so the parser must start outside the
+        // reasoning span and open it on that token. Equating the two rejected
+        // every thinking-on request.
         let think_mode = if started_in_think {
             ThinkMode::Low
         } else {
             ThinkMode::NonThink
         };
-        // Validate think_mode agrees with enable_thinking
-        let expected_think_mode = if enable_thinking {
-            ThinkMode::Low
-        } else {
-            ThinkMode::NonThink
-        };
-        if think_mode != expected_think_mode {
-            emit_qwen_ar_slot_error(
-                stdout,
-                id,
-                "think_mode mismatch with enable_thinking",
-                "internal",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            if let Some(sess) = accepted_session.take() {
-                self.close_session(sess);
-            } else if let Some(session) = claimed_session {
-                self.close_session(session);
-            }
-            return Ok(());
-        }
         let mut emitter = Qwen35Emit::from_ctx(SpecEmitCtx {
             tokenizer: &self.tokenizer,
             eos: self.tokenizer.eos_id,
@@ -1552,9 +1605,13 @@ impl SlotBackend {
         // exit, under its previous `malformed_protocol` label.
         let unsafe_reason = match summary.finish_reason {
             "truncated_tool_call" => Some("malformed_protocol"),
-            r @ ("malformed_protocol" | "open_think") => Some(r),
+            r @ "malformed_protocol" => Some(r),
             _ => None,
         };
+        // A turn that ended inside `<think>` is a reasoning-only stop. Its
+        // session is closed at commit instead of kept for reuse: the slot KV
+        // holds an unclosed think span that no rendered history reproduces.
+        let open_think = summary.open_think;
         if let Some(unsafe_reason) = unsafe_reason {
             if let Some(sess) = accepted_session.take() {
                 self.close_session(sess);
@@ -1587,6 +1644,7 @@ impl SlotBackend {
         // Stage normal done payload and await commit via keyed registry.
         let finish_reason = match reason {
             DoneReason::MaxTokens if !summary.decoded_eot => "length",
+            _ if open_think => "stop",
             _ => summary.finish_reason,
         };
         if finish_reason != "tool_calls" {
@@ -1628,17 +1686,29 @@ impl SlotBackend {
         stage_terminal_tool_calls(&mut pending_done, finish_reason, &terminal_tool_calls);
 
         // Mark ready with exact pending done, publish commit_ready, poll keyed Commit/Abort with normal timeout
-        let ticket = accepted_ticket.expect("accepted session binds a lane ticket");
+        let Some(ticket) = accepted_ticket else {
+            if let Some(sess) = accepted_session.take() {
+                self.close_session(sess);
+            } else if let Some(session) = claimed_session {
+                self.close_session(session);
+            }
+            emit_qwen_ar_slot_error(
+                stdout,
+                id,
+                "slot terminal without a bound lane ticket",
+                "internal",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return Ok(());
+        };
         let _ =
             batch_mark_ready_with_pending(id, attempt_id, admission, ticket, pending_done.clone());
-        let mut commit_ready = pending_done.clone();
-        if let Some(map) = commit_ready.as_object_mut() {
-            map.insert(
-                "type".to_string(),
-                serde_json::Value::String("commit_ready".to_string()),
-            );
-        }
-        let _ = writeln!(stdout, "{}", commit_ready);
+        // commit_ready is the staged done with only `type` changed.
+        pending_done["type"] = serde_json::Value::String("commit_ready".to_string());
+        let _ = writeln!(stdout, "{}", pending_done);
+        pending_done["type"] = serde_json::Value::String("done".to_string());
         let _ = stdout.flush();
 
         let decision =
@@ -1646,10 +1716,14 @@ impl SlotBackend {
         match decision {
             hipfire_engine::terminal::ClientTerminalDecision::Commit => {
                 if let Some(session) = accepted_session {
-                    self.pending_tools
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .register(session, convo.clone(), &terminal_tool_calls);
+                    if open_think {
+                        self.close_session(session);
+                    } else {
+                        self.pending_tools
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .register(session, convo.clone(), &terminal_tool_calls);
+                    }
                 }
                 // Emit byte-identical done through the route adapter so the
                 // keyed claim and route-start latch are retired together.
@@ -1693,6 +1767,9 @@ struct Preflight {
     /// Discovered .vl sidecar path. When set, the slot engine loads vision
     /// weights from this file instead of the trunk HFQ.
     vl_path: Option<PathBuf>,
+    /// `.hfq`-baked author sampling recommendation (`generation_config`).
+    rec_temperature: Option<f32>,
+    rec_top_p: Option<f32>,
 }
 
 fn cpu_preflight(
@@ -1700,6 +1777,33 @@ fn cpu_preflight(
     vision_mode: &str,
     vision: Option<&str>,
 ) -> Result<Preflight, String> {
+    // A carrier that owns the shape of its own slot checkpoint answers first.
+    // arch 17's encoder is why this exists: its checkpoint may be a
+    // safetensors directory (`HfqFile::open` cannot read one) and its geometry
+    // lives in HF config metadata, not the qwen35 HFQ layout. `None` = no
+    // carrier claims the path, so the HFQ preflight below owns both the
+    // reading and the refusals.
+    if let Some(over) = hipfire_loader::slot_preflight(std::path::Path::new(model_path)) {
+        let p = over?;
+        return Ok(Preflight {
+            arch_id: p.arch_id,
+            arch_str: p.arch_str,
+            dim: p.dim,
+            layers: p.layers,
+            vocab: p.vocab,
+            tokenizer: p.tokenizer,
+            // Generate-only fields, and this route has no generate verb: no
+            // chat template, no sampling recommendation, no VL splice. The
+            // tower is loaded and driven by the arch crate itself.
+            chat_template: None,
+            is_vl: p.is_vl,
+            vision_config: None,
+            vl_path: p.vl_path,
+            rec_temperature: None,
+            rec_top_p: None,
+        });
+    }
+
     let hfq =
         HfqFile::open(std::path::Path::new(model_path)).map_err(|e| format!("open model: {e}"))?;
     validate_arch_id(hfq.arch_id)?;
@@ -1772,12 +1876,11 @@ fn cpu_preflight(
     {
         return Err("empty chat_template".to_string());
     }
-    let arch_str = match hfq.arch_id {
-        5 => "qwen3_5".to_string(),
-        6 => "qwen3_5_moe".to_string(),
-        _ => unreachable!(),
-    };
+    let arch_str = hipfire_loader::arch_label(hfq.arch_id).to_string();
+    let rec = hfq.recommended_sampling();
     Ok(Preflight {
+        rec_temperature: rec.as_ref().and_then(|r| r.temperature),
+        rec_top_p: rec.as_ref().and_then(|r| r.top_p),
         arch_id: hfq.arch_id,
         arch_str,
         dim: config.dim,
@@ -1826,7 +1929,11 @@ fn discover_vl_sidecar(model_path: &str) -> Option<PathBuf> {
     hipfire_runtime::sidecar::resolve_vl_sidecar(model_path)
 }
 
-pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
+/// Capability gate for an experimental multi-slot load, run before any GPU
+/// work. `gpu_arch` is the initialized GPU's arch string (the caller reads
+/// it off the live `Gpu`), so the fp8 admission is exact on every host —
+/// tests parameterize it by string instead of assuming the host's card.
+pub fn validate_load_caps(msg: &serde_json::Value, gpu_arch: &str) -> Option<String> {
     // continuous_batch_size
     if let Some(v) = msg
         .get("params")
@@ -1904,24 +2011,51 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
     {
         return Some("adaptive KV not supported in experimental multi-slot".to_string());
     }
+    // The multi-slot DFlash2 path runs the default proposal width only
+    // (`auto` resolves to it: this route never stages VMM batching).
+    match hipfire_runtime::dflash::DflashBlockPolicy::from_param(params.and_then(|p| p.get("dflash_block"))) {
+        Err(e) => return Some(e),
+        Ok(policy) if policy.resolve(false, 1) != hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED => {
+            return Some(format!(
+                "speculation.dflash_block other than {} not supported in experimental multi-slot",
+                hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED
+            ));
+        }
+        Ok(_) => {}
+    }
     // The slot engine resolves the full static KV ladder (q8, asym{2,3,4},
-    // fwht{2,3,4}) plus the flat 2-byte tiers bf16/f16; the per-load string
-    // must be one the slots policy accepts. Rejected here — loudly, before
-    // any GPU work — rather than silently downgraded to the q8 default by
-    // the engine-side resolve.
+    // fwht{2,3,4}) plus the flat 2-byte tiers bf16/f16; fp8 is admitted on
+    // exact gfx1201 only (descriptor-aware fp8 write/attend kernels exist
+    // there). Rejected here — loudly, before any GPU work — rather than
+    // silently downgraded to the q8 default or failed deep inside the
+    // engine thread. The arch comes from the caller's initialized GPU so
+    // this gate is exact on every host (tests parameterize it by string).
     if let Some(raw) = params
         .and_then(|p| p.get("kv_mode"))
         .and_then(|v| v.as_str())
         .filter(|v| !v.is_empty())
     {
-        let resolved =
-            hipfire_runtime::kv_mode::resolve(raw, &hipfire_runtime::kv_mode::QWEN35_SLOTS_POLICY);
-        if resolved.warning.is_some() {
-            return Some(format!(
-                "experimental multi-slot does not support kv_mode='{raw}' \
-                 (accepted: q8|asym2|asym3|asym4|fwht2|fwht3|fwht4|bf16|f16; 'auto'/unset \
-                 = q8)"
-            ));
+        let accepted_list = "q8|asym2|asym3|asym4|fwht2|fwht3|fwht4|bf16|f16, \
+                             fp8 on gfx1201 only; 'auto'/unset = q8";
+        match hipfire_runtime::kv_mode::resolve_qwen35_slots(raw, gpu_arch) {
+            // Arch gate (or any future hard error): refuse with the named
+            // message verbatim — it already names the arch and the fix.
+            Err(e) => {
+                return Some(format!(
+                    "experimental multi-slot refuses kv_mode='{raw}': {e} \
+                     (accepted: {accepted_list})"
+                ));
+            }
+            // Unrecognized / unaccepted string: the pure resolver fell back
+            // to the default WITH a warning — refuse here too, so a typo'd
+            // tier is a loud load error, not a silent q8 downgrade.
+            Ok(resolved) if resolved.warning.is_some() => {
+                return Some(format!(
+                    "experimental multi-slot does not support kv_mode='{raw}' \
+                     (accepted: {accepted_list})"
+                ));
+            }
+            Ok(_) => {}
         }
     }
     if let Some(v) = params
@@ -1956,6 +2090,58 @@ pub fn is_experimental_generate(msg: &serde_json::Value) -> bool {
         return true;
     }
     false
+}
+
+/// Effective `(temperature, top_p, max_tokens, max_tokens_fit)` for a slot
+/// generate request. Defaults are the sequential route's
+/// ([`hipfire_engine::scheduler::resolve_temp_top_p`],
+/// [`hipfire_engine::scheduler::DEFAULT_GENERATE_MAX_TOKENS`], wire
+/// `max_tokens_fit`); a present-but-malformed `max_tokens` is refused.
+pub(crate) fn resolve_slot_sampling(
+    msg: &serde_json::Value,
+    arch_id: u32,
+    rec_temperature: Option<f32>,
+    rec_top_p: Option<f32>,
+) -> Result<(f32, f32, usize, bool), String> {
+    let (temperature, top_p) =
+        hipfire_engine::scheduler::resolve_temp_top_p(msg, arch_id, rec_temperature, rec_top_p);
+    let max_tokens = match msg.get("max_tokens") {
+        None | Some(serde_json::Value::Null) => {
+            hipfire_engine::scheduler::DEFAULT_GENERATE_MAX_TOKENS
+        }
+        Some(value) => match value.as_u64().and_then(|v| usize::try_from(v).ok()) {
+            Some(v) if v > 0 => v,
+            _ => return Err("max_tokens must be a positive integer".to_owned()),
+        },
+    };
+    let fit = msg.get("max_tokens_fit").and_then(|v| v.as_bool()) == Some(true);
+    Ok((temperature, top_p, max_tokens, fit))
+}
+
+/// The `reasoning_effort` rung handed to the Jinja template on this route.
+///
+/// Suppression mirrors `hipfire_engine::prompt::qwen_jinja_reasoning`: an
+/// explicit `thinking_enabled = false`, a disable rung, or the immediate-close
+/// sentinel (`max_think_tokens = 1`) leave the variable undefined so the
+/// template's own default applies. `auto` is the client's "no preference"
+/// spelling and is left undefined too. The rung itself is passed verbatim —
+/// the template is the authority on which values it accepts, and a rejected
+/// one fails the render as validation.
+///
+/// Deliberately NOT keyed on the route's `enable_thinking`: that flag
+/// describes the `<think>`-token ChatML framing, and a template that opens
+/// reasoning through a different token (e.g. `<ifm|think>`) keeps it false —
+/// keying on it would silence the dial on exactly the models that use it.
+fn slot_jinja_effort<'a>(
+    thinking_enabled: Option<bool>,
+    raw_effort: Option<&'a str>,
+    max_think_tokens: Option<u64>,
+) -> Option<&'a str> {
+    let disable_rung = matches!(raw_effort, Some("none") | Some("off") | Some("chat"));
+    if thinking_enabled == Some(false) || max_think_tokens == Some(1) || disable_rung {
+        return None;
+    }
+    raw_effort.filter(|rung| *rung != "auto")
 }
 
 pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
@@ -2114,13 +2300,10 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
             return Some("top_p must be within (0, 1]".to_string());
         }
     }
-    if msg
-        .get("reasoning_effort")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| !v.eq_ignore_ascii_case("none"))
-    {
-        return Some("reasoning_effort is not supported in experimental multi-slot".to_string());
-    }
+    // `reasoning_effort` is ACCEPTED: it is plumbed to the Jinja template (and
+    // used to derive the enable/disable pair) exactly as on the sequential and
+    // batch routes. A rung the model's template rejects surfaces as a render
+    // error, which is validation — not a silent downgrade.
     // max_think_tokens >= 2 is ACCEPTED here (was refused): the engine now
     // enforces finite think budgets — the grammar cursor force-closes the
     // span at the budget (vLLM thinking_token_budget parity). Enforced
@@ -2157,6 +2340,22 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
         return Some("suffix not supported in experimental multi-slot".to_string());
     }
     None
+}
+
+/// Integer config value for `key`, falling back to the registered default in
+/// hipfire-config's field table (single source of truth: a hard-coded
+/// fallback here drifts when the registered default changes).
+///
+/// Panics if `key` is not a registered integer field; that is a programmer
+/// error caught by `waiting_room_fallbacks_are_the_registered_defaults`.
+fn integer_or_registered_default(layer: &hipfire_config::ConfigLayer, key: &str) -> i64 {
+    if let Some(hipfire_config::ConfigValue::Integer(i)) = layer.values.get(key) {
+        return *i;
+    }
+    match hipfire_config::field(key).map(|f| f.default) {
+        Some(hipfire_config::DefaultValue::Integer(i)) => i,
+        _ => panic!("config key {key} is not a registered integer field"),
+    }
 }
 
 // ── Message projection (pure) ────────────────────────────────────────────────
@@ -2754,12 +2953,99 @@ mod tests {
     use hipfire_runtime::prompt_frame::Role;
     use serde_json::json;
 
+    /// The waiting-room fallbacks used when the process config lacks a key
+    /// must equal the registered defaults (a hard-coded 30000 ms once
+    /// drifted from the registered 600000 ms).
+    #[test]
+    fn waiting_room_fallbacks_are_the_registered_defaults() {
+        let empty = hipfire_config::ConfigLayer::default();
+        for (key, expected) in [
+            ("serve.max_queue", 64),
+            ("serve.max_queue_bytes", 268_435_456),
+            ("serve.queue_timeout_ms", 600_000),
+        ] {
+            let registered = hipfire_config::field(key).expect("registered key").default;
+            assert!(
+                matches!(registered, hipfire_config::DefaultValue::Integer(i) if i == expected),
+                "{key}: registered default is {registered:?}, expected {expected}"
+            );
+            assert_eq!(integer_or_registered_default(&empty, key), expected, "{key}");
+        }
+        let mut set = hipfire_config::ConfigLayer::default();
+        set.set("serve.queue_timeout_ms", hipfire_config::ConfigValue::Integer(1234))
+            .unwrap();
+        assert_eq!(integer_or_registered_default(&set, "serve.queue_timeout_ms"), 1234);
+    }
+
     #[test]
     fn arch_validation_accepts_5_and_6() {
         assert!(validate_arch_id(5).is_ok());
         assert!(validate_arch_id(6).is_ok());
         assert!(validate_arch_id(7).is_err());
         assert!(validate_arch_id(9).is_err());
+    }
+    #[test]
+    fn slot_mtp_parse_preserves_tri_state_and_k_default() {
+        // The tri-state must survive beside mtp_k: auto and an explicit on
+        // are indistinguishable downstream when only mtp_k travels, and a
+        // check alone cannot restore the distinction.
+        let parse = |params: serde_json::Value| {
+            SlotLoadParams::from_load_msg(&serde_json::json!({ "params": params }))
+        };
+        // Absent and off: Off with k forced to 0 (verbatim rule).
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({ "mtp_mode": "off", "mtp_k": 7 }),
+            serde_json::json!({ "mtp_mode": "", "mtp_k": 7 }),
+        ] {
+            let p = parse(params);
+            assert_eq!(p.mtp_mode, hipfire_config::MtpMode::Off);
+            assert_eq!(p.mtp_k, 0);
+        }
+        // auto and on keep the existing k default-4 rule verbatim.
+        let auto = parse(serde_json::json!({ "mtp_mode": "auto" }));
+        assert_eq!(auto.mtp_mode, hipfire_config::MtpMode::Auto);
+        assert_eq!(auto.mtp_k, 4);
+        let on = parse(serde_json::json!({ "mtp_mode": "on" }));
+        assert_eq!(on.mtp_mode, hipfire_config::MtpMode::On);
+        assert_eq!(on.mtp_k, 4);
+        // Explicit k still wins on both armed modes.
+        let auto_k = parse(serde_json::json!({ "mtp_mode": "auto", "mtp_k": 2 }));
+        assert_eq!(auto_k.mtp_mode, hipfire_config::MtpMode::Auto);
+        assert_eq!(auto_k.mtp_k, 2);
+        let on_k = parse(serde_json::json!({ "mtp_mode": "on", "mtp_k": 2 }));
+        assert_eq!(on_k.mtp_mode, hipfire_config::MtpMode::On);
+        assert_eq!(on_k.mtp_k, 2);
+    }
+
+    /// P10: a generate with no sampling fields resolves on the multi-slot
+    /// route to exactly what the sequential route resolves (arch ladder /
+    /// `.hfq` recs, default max_tokens 4096, the `max_tokens_fit` clamp) —
+    /// not the old slot-local 0.0 / 1.0 / 512 / no-fit.
+    #[test]
+    fn slot_sampling_defaults_match_sequential_route() {
+        use hipfire_engine::scheduler::{resolve_temp_top_p, DEFAULT_GENERATE_MAX_TOKENS};
+        let bare = json!({"type": "generate", "max_tokens_fit": true});
+        for (rec_t, rec_p) in [(None, None), (Some(0.6), Some(0.95)), (Some(0.7), None)] {
+            let (seq_t, seq_p) = resolve_temp_top_p(&bare, 5, rec_t, rec_p);
+            let (t, p, max_tokens, fit) = resolve_slot_sampling(&bare, 5, rec_t, rec_p).unwrap();
+            assert_eq!((t, p), (seq_t, seq_p));
+            assert_eq!(max_tokens, DEFAULT_GENERATE_MAX_TOKENS);
+            assert!(fit);
+        }
+        // Pinned values: qwen35 ladder, then per-knob .hfq recs.
+        assert_eq!(resolve_slot_sampling(&bare, 5, None, None).unwrap().0, 0.3);
+        assert_eq!(resolve_slot_sampling(&bare, 5, None, None).unwrap().1, 0.8);
+        let partial = resolve_slot_sampling(&bare, 5, Some(0.7), None).unwrap();
+        assert_eq!((partial.0, partial.1), (0.7, 0.8));
+        // Explicit fields win over recs, and an explicit max_tokens is never
+        // marked for fitting.
+        let explicit = json!({"max_tokens": 64, "temperature": 0.0, "top_p": 1.0});
+        assert_eq!(
+            resolve_slot_sampling(&explicit, 5, Some(0.6), Some(0.95)).unwrap(),
+            (0.0, 1.0, 64, false)
+        );
+        assert!(resolve_slot_sampling(&json!({"max_tokens": 0}), 5, None, None).is_err());
     }
 
     #[test]
@@ -2859,6 +3145,32 @@ mod tests {
         let msg = json!({ "image_base64": big });
         let err = extract_slot_image(&msg).unwrap_err();
         assert!(err.contains("maximum encoded size"), "unexpected: {err}");
+    }
+
+    /// The effort dial reaches the template only when the client actually
+    /// asked for reasoning. Keyed on the request, not on the route's
+    /// `<think>`-token framing: a template that opens reasoning with another
+    /// token keeps that framing false and must still get the rung.
+    #[test]
+    fn slot_effort_reaches_the_template_except_when_reasoning_is_off() {
+        // A rung is passed through verbatim, including ones the template may
+        // reject (that failure belongs to the render, as validation).
+        assert_eq!(slot_jinja_effort(None, Some("high"), None), Some("high"));
+        assert_eq!(slot_jinja_effort(None, Some("xhigh"), None), Some("xhigh"));
+        assert_eq!(slot_jinja_effort(Some(true), Some("low"), None), Some("low"));
+        // `auto` and absent mean "no preference": leave it undefined so the
+        // template's own default applies.
+        assert_eq!(slot_jinja_effort(None, Some("auto"), None), None);
+        assert_eq!(slot_jinja_effort(None, None, None), None);
+        // Reasoning off — explicitly, by a disable rung, or by the
+        // immediate-close sentinel — suppresses the dial entirely.
+        assert_eq!(slot_jinja_effort(Some(false), Some("high"), None), None);
+        assert_eq!(slot_jinja_effort(None, Some("none"), None), None);
+        assert_eq!(slot_jinja_effort(None, Some("off"), None), None);
+        assert_eq!(slot_jinja_effort(None, Some("chat"), None), None);
+        assert_eq!(slot_jinja_effort(Some(true), Some("high"), Some(1)), None);
+        // A finite budget is not a disable: the rung survives it.
+        assert_eq!(slot_jinja_effort(Some(true), Some("high"), Some(64)), Some("high"));
     }
 
     #[test]
@@ -2977,15 +3289,25 @@ mod tests {
     #[test]
     fn load_caps_rejects_continuous_and_tp_pp() {
         let m = json!({"params": {"continuous_batch_size": 2}});
-        assert!(validate_load_caps(&m).is_some());
+        assert!(validate_load_caps(&m, "gfx1100").is_some());
         let m2 = json!({"params": {"tp": 2}});
-        assert!(validate_load_caps(&m2).is_some());
+        assert!(validate_load_caps(&m2, "gfx1100").is_some());
         let m3 = json!({"params": {"pp": 2}});
-        assert!(validate_load_caps(&m3).is_some());
+        assert!(validate_load_caps(&m3, "gfx1100").is_some());
         let m4 = json!({"params": {"drafter": "some.hfq"}});
-        assert!(validate_load_caps(&m4).is_some());
+        assert!(validate_load_caps(&m4, "gfx1100").is_some());
         let m5 = json!({"params": {"prefill_compression": "on"}});
-        assert!(validate_load_caps(&m5).is_some());
+        assert!(validate_load_caps(&m5, "gfx1100").is_some());
+    }
+
+    #[test]
+    fn load_caps_admit_only_the_default_dflash_block() {
+        for ok in [json!({"params": {}}), json!({"params": {"dflash_block": 16}}), json!({"params": {"dflash_block": "auto"}})] {
+            assert!(validate_load_caps(&ok, "gfx1100").is_none(), "{ok} must be admitted");
+        }
+        for bad in [json!({"params": {"dflash_block": 8}}), json!({"params": {"dflash_block": 99}})] {
+            assert!(validate_load_caps(&bad, "gfx1100").is_some(), "{bad} must be refused");
+        }
     }
 
     #[test]
@@ -3193,22 +3515,35 @@ mod tests {
             "ngram_draft": false,
             "cask": false
         }});
-        assert_eq!(validate_load_caps(&supported), None);
+        assert_eq!(validate_load_caps(&supported, "gfx1100"), None);
         // The full static KV ladder plus the flat 2-byte native tiers is
         // accepted (engine resolves it through the slots site policy); only
-        // strings the policy rejects — fp8 (no slot readers), garbage — are
-        // refused here, loudly, before any GPU work.
+        // strings the policy rejects — garbage — and fp8 off gfx1201 are
+        // refused here, loudly, before any GPU work. The gate is exact per
+        // arch string, not per host card, so these run on any CI machine.
         for kv in [
             "asym3", "asym2", "asym4", "fwht2", "fwht3", "fwht4", "bf16", "f16", "auto",
         ] {
             assert_eq!(
-                validate_load_caps(&json!({"params": {"kv_mode": kv}})),
+                validate_load_caps(&json!({"params": {"kv_mode": kv}}), "gfx1100"),
                 None,
                 "ladder tier {kv} must be accepted"
             );
         }
+        // fp8: gfx1201 admits, every other arch refuses with a named error.
+        assert_eq!(
+            validate_load_caps(&json!({"params": {"kv_mode": "fp8"}}), "gfx1201"),
+            None,
+            "fp8 must be admitted on gfx1201"
+        );
+        for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1200", "gfx942"] {
+            let refused = validate_load_caps(&json!({"params": {"kv_mode": "fp8"}}), arch)
+                .expect("fp8 off gfx1201 must be refused");
+            assert!(refused.contains("fp8"), "{refused}");
+            assert!(refused.contains(arch), "{refused}");
+            assert!(refused.contains("gfx1201"), "{refused}");
+        }
         for params in [
-            json!({"kv_mode": "fp8"}),
             json!({"kv_mode": "garbage"}),
             json!({"kv_backend": "vmm"}),
             json!({"ngram_draft": true}),
@@ -3217,13 +3552,13 @@ mod tests {
             json!({"prefill_compression": "on"}),
         ] {
             assert!(
-                validate_load_caps(&json!({"params": params})).is_some(),
+                validate_load_caps(&json!({"params": params}), "gfx1201").is_some(),
                 "unsupported params passed: {params}"
             );
         }
         // MTP is now accepted in multi-slot (sequential per-slot path).
         assert_eq!(
-            validate_load_caps(&json!({"params": {"mtp_mode": "on"}})),
+            validate_load_caps(&json!({"params": {"mtp_mode": "on"}}), "gfx1100"),
             None,
             "mtp_mode on should be accepted in multi-slot"
         );
@@ -3237,7 +3572,7 @@ mod tests {
             json!({"draft": "/path/to/draft.hfq", "dflash_mode": "on"}),
         ] {
             assert_eq!(
-                validate_load_caps(&json!({"params": params})),
+                validate_load_caps(&json!({"params": params}), "gfx1100"),
                 None,
                 "dflash params must be accepted: {params}"
             );
@@ -3253,6 +3588,11 @@ mod tests {
             json!({"repeat_penalty": 1.05}),
             json!({"presence_penalty": 1.5}),
             json!({"min_p": 0.05}),
+            // The effort dial is honoured on this route: it reaches the Jinja
+            // template, so it is accepted at the door (a rung the template
+            // rejects fails the render instead).
+            json!({"reasoning_effort": "high"}),
+            json!({"reasoning_effort": "xhigh"}),
         ] {
             assert!(
                 validate_generate_caps(&request).is_none(),
@@ -3263,7 +3603,6 @@ mod tests {
             json!({"repeat_penalty": 2.5}),
             json!({"presence_penalty": -0.1}),
             json!({"min_p": 1.5}),
-            json!({"reasoning_effort": "high"}),
         ] {
             assert!(
                 validate_generate_caps(&request).is_some(),
@@ -3357,11 +3696,6 @@ mod tests {
             (
                 "submit",
                 "multi_slot submit: engine unavailable",
-                "internal",
-            ),
-            (
-                "think",
-                "think_mode mismatch with enable_thinking",
                 "internal",
             ),
             (

@@ -152,16 +152,17 @@ pub enum QwenArTerminalCause {
     /// A user `stop` sequence matched in the answer; the text from the match
     /// on is not emitted, so the turn is never cached.
     StopSequence,
-    /// Think span still open when the model itself ended the turn (decoded
-    /// EOT inside `<think>`) — fail-closed validation (no cache).
+    /// The turn ended inside `<think>` without running out of budget (decoded
+    /// EOT, or a natural stop, inside the span). A graceful `stop`: the
+    /// reasoning already streamed, no answer, no tool calls and no cache.
     OpenThink,
 }
 
 impl QwenArTerminalCause {
     /// Resolve cause. A matched stop sequence ends the answer, so it beats
     /// everything after it. Otherwise decoded EOT beats length on the same
-    /// token, and an open think span is only an error when the model ended the
-    /// turn inside it; running out of budget there is an ordinary length stop.
+    /// token. An open think span is a length stop when the budget ran out
+    /// there, and an `OpenThink` stop when the model ended the turn there.
     pub fn resolve(
         stopped_by_filter: bool,
         stop_sequence: bool,
@@ -184,34 +185,70 @@ impl QwenArTerminalCause {
     }
 }
 
+/// What the AR decode loop does after a committed token under an explicit
+/// `max_think_tokens` budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QwenArThinkBudgetAction {
+    Continue,
+    /// Run these close tokens next, each through the normal decode body.
+    Close(Vec<u32>),
+    /// The model re-opened `<think>` after the forced close and spent the
+    /// budget again: end the turn (a reasoning-only stop).
+    Stop,
+}
+
+/// Count the token just appended to `stream_bytes` against `budget`. Uses the
+/// raw-stream think scan and the template close the Qwen4 MTP emitter
+/// (`Qwen35Emit::from_ctx_template_think_close`) uses, so both splice the same
+/// tokens after the same token.
+pub fn qwen_ar_think_budget_step(
+    budget: &mut hipfire_runtime::emit_text::ThinkBudget,
+    stream_bytes: &[u8],
+    started_in_think: bool,
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+) -> QwenArThinkBudgetAction {
+    use hipfire_runtime::emit_text::{currently_in_think, ThinkBudgetStep};
+    if !budget.enabled() {
+        return QwenArThinkBudgetAction::Continue;
+    }
+    let in_think = currently_in_think(
+        std::str::from_utf8(stream_bytes).unwrap_or(""),
+        started_in_think,
+    );
+    match budget.observe(in_think) {
+        ThinkBudgetStep::Continue => QwenArThinkBudgetAction::Continue,
+        ThinkBudgetStep::ForceClose => {
+            let close = tokenizer.encode(hipfire_runtime::emit_text::QWEN_TEMPLATE_THINK_CLOSE);
+            budget.closing(close.len());
+            QwenArThinkBudgetAction::Close(close)
+        }
+        ThinkBudgetStep::Exhausted => QwenArThinkBudgetAction::Stop,
+    }
+}
+
 /// Finish the AR router. Length-cap (without EOT) never exposes tool_calls
 /// or primes asst_turn_cache. Decoded EOT on the final budget token still
 /// classifies as stop/tool_calls. Unclosed/malformed without length → Err.
 /// A stop sequence keeps calls completed before it, drops a call it cut off,
 /// and never primes asst_turn_cache (the KV holds the trimmed stop text).
-/// Open think → non-retryable validation terminal, no cache, no hidden bytes.
+/// Open think → `stop` with the reasoning only: no tool calls and no cache,
+/// because the KV holds an unclosed `<think>` span that no rendered history
+/// reproduces.
 pub fn qwen_ar_finish_route(
     router: ToolOutputRouter,
     cause: QwenArTerminalCause,
     visible_acc: &mut String,
 ) -> Result<QwenArRouteFinish, ToolRouteError> {
-    if matches!(cause, QwenArTerminalCause::OpenThink) {
-        return Ok(QwenArRouteFinish {
-            finish_reason: "error",
-            wire_tool_calls: Vec::new(),
-            store_cache: false,
-            trailing_visible: Vec::new(),
-            cause,
-        });
-    }
     let length_unsafe = matches!(cause, QwenArTerminalCause::LengthCap);
     let stop_sequence = matches!(cause, QwenArTerminalCause::StopSequence);
+    let open_think = matches!(cause, QwenArTerminalCause::OpenThink);
     let buffered_before = router.tool_calls().to_vec();
     match router.finish() {
         Err(err) => {
-            if length_unsafe || stop_sequence {
+            if length_unsafe || stop_sequence || open_think {
                 // Any pure-length terminal is unsafe: no calls, no cache. A
-                // stop sequence that cut a call short leaves no call either.
+                // stop sequence that cut a call short leaves no call either,
+                // and neither does a turn that ended inside `<think>`.
                 Ok(QwenArRouteFinish {
                     finish_reason: if length_unsafe { "length" } else { "stop" },
                     wire_tool_calls: Vec::new(),
@@ -237,11 +274,12 @@ pub fn qwen_ar_finish_route(
                     }
                 }
             }
-            if length_unsafe {
+            if length_unsafe || open_think {
                 // Length is never a tool-safe or cache-safe terminal —
                 // prose-only, complete hidden call, or trailing flush alike.
+                // Neither is a turn that ended inside `<think>`.
                 Ok(QwenArRouteFinish {
-                    finish_reason: "length",
+                    finish_reason: if length_unsafe { "length" } else { "stop" },
                     wire_tool_calls: Vec::new(),
                     store_cache: false,
                     trailing_visible,
@@ -265,17 +303,6 @@ pub fn qwen_ar_finish_route(
                 })
             }
         }
-    }
-}
-
-/// EosFilter config for Qwen AR contract-v2 producer path. EosFilter owns
-/// UTF-8/EOT filtering only; ThinkOutputRouter owns think-channel routing.
-pub fn qwen_ar_eos_filter_config() -> EosFilterConfig {
-    EosFilterConfig {
-        strip_think: false,
-        started_in_think: false,
-        stop_at: vec![b"<|im_end|>".to_vec(), b"<|endoftext|>".to_vec()],
-        holdback_prefixes: Vec::new(),
     }
 }
 
@@ -461,26 +488,6 @@ pub fn qwen_ar_done_value(
     envelope
 }
 
-/// Emit open-think fail-closed validation terminal: exactly one correlated
-/// non-retryable validation `error` and **no** `done` (terminal XOR).
-/// Uses the production fail-closed error writer; `rolled_back` must come from
-/// a completed [`crate::common::RollbackEpilogue`] (or false when no GPU reset ran).
-pub fn emit_qwen_ar_open_think_terminal(
-    stdout: &mut impl std::io::Write,
-    id: &str,
-    _generated: usize,
-    epilogue: &crate::common::RollbackEpilogue,
-) {
-    crate::common::emit_fail_closed_error(
-        stdout,
-        Some(id),
-        "open think span at end of generation (validation)",
-        "validation",
-        false,
-        epilogue,
-    );
-}
-
 /// Deterministic Qwen AR semantic producer used by production finish
 /// orchestration and unit tests. Owns filter + router state and emits only
 /// through the same helpers the GPU path uses.
@@ -511,7 +518,7 @@ impl QwenArSemanticProducer {
     ) -> Self {
         Self {
             id: id.into(),
-            filter: EosFilter::new(qwen_ar_eos_filter_config()),
+            filter: EosFilter::new(hipfire_runtime::eos_filter::qwen35_eos_filter_config()),
             think_router: ThinkOutputRouter::new(started_in_think),
             router: if tool_protocol_enabled {
                 ToolOutputRouter::new()
@@ -667,19 +674,6 @@ impl QwenArSemanticProducer {
             hit_length_cap,
             open_think,
         );
-        if matches!(cause, QwenArTerminalCause::OpenThink) {
-            // Fail-closed: no calls/cache/done. Caller owns the
-            // production rollback epilogue + single correlated error terminal
-            // (tests call `emit_qwen_ar_open_think_terminal` after finish).
-            let finish = QwenArRouteFinish {
-                finish_reason: "error",
-                wire_tool_calls: Vec::new(),
-                store_cache: false,
-                trailing_visible: Vec::new(),
-                cause,
-            };
-            return Ok((finish, String::new()));
-        }
         let finish = qwen_ar_finish_route(self.router, cause, &mut self.visible_acc)?;
         for trailing in &finish.trailing_visible {
             emit_visible_token(stdout, &self.id, trailing);
@@ -739,6 +733,49 @@ pub fn qwen_ar_forward_fail_action() -> QwenArForwardFailAction {
 
 pub fn qwen_ar_forward_fail_message(phase: &str, err: impl std::fmt::Display) -> String {
     format!("{phase}: {err}")
+}
+
+/// One KV-eviction step at the write slot `*seq_pos` just advanced to; moves
+/// it to the compacted physical slot when the policy evicts. A failure is
+/// returned, never unwrapped: a transient HIP error mid-request fails the
+/// request closed ([`qwen_ar_eviction_fail_closed`]) instead of panicking
+/// the daemon. `evict` is the policy call (`Ok(None)` without a policy).
+pub fn qwen_ar_evict<E: std::fmt::Debug>(
+    seq_pos: &mut usize,
+    evict: impl FnOnce(usize) -> Result<Option<hipfire_runtime::triattn::EvictionResult>, E>,
+) -> Result<(), String> {
+    if crate::common::take_eviction_fault() {
+        return Err("injected fault: eviction".to_owned());
+    }
+    match evict(*seq_pos) {
+        Ok(Some(result)) => {
+            *seq_pos = result.new_physical;
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(e) => Err(format!("{e:?}")),
+    }
+}
+
+/// Fail-closed terminal for a failed [`qwen_ar_evict`]: attested rollback
+/// and one correlated `gpu` error — no done, no cache store, no panic.
+pub fn qwen_ar_eviction_fail_closed(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    phase: &str,
+    err: &str,
+) {
+    let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+    crate::common::emit_fail_closed_error(
+        stdout,
+        Some(id),
+        &format!("KV eviction failed ({phase}): {err}"),
+        "gpu",
+        false,
+        &ep,
+    );
 }
 
 /// Bound an eviction-enabled Qwen prefill write while an adaptive cache still
@@ -860,8 +897,13 @@ impl GenerationRoute {
     ];
 
     /// Proven semantic-safe producers for non-empty tools.
-    /// Exactly: Qwen AR, Qwen DFlash/spec, DS4 AR, DS4 EP, DS4 spec, Glimmer
-    /// AR, Glimmer spec, Maple AR.
+    /// Exactly: Qwen AR, Qwen4 AR, Qwen4 native MTP, Qwen DFlash/spec, DS4 AR,
+    /// DS4 EP, DS4 spec, Glimmer AR, Glimmer spec, Maple AR.
+    ///
+    /// `Qwen4Spec` runs the same `<tool_call>` router (`Qwen35Emit` via the
+    /// Qwen4 carrier) over committed tokens that `Qwen4Ar` runs through
+    /// `QwenArSemanticProducer`, with the tool-call grammar forced off so the
+    /// greedy verify commits exactly the AR argmax stream (`generate_dflash`).
     ///
     /// `MapleAr` is admitted on the LEGACY contract, not semantic v2: its
     /// carrier keeps `semantic_contract_version: None` (no router-backed
@@ -879,6 +921,7 @@ impl GenerationRoute {
             self,
             Self::QwenAr
                 | Self::Qwen4Ar
+                | Self::Qwen4Spec
                 | Self::QwenDflash
                 | Self::Deepseek4Ar
                 | Self::Deepseek4Ep
@@ -891,10 +934,26 @@ impl GenerationRoute {
 
     /// Routes that honour OpenAI `stop`: the Qwen3.5-family semantic producers
     /// (single-GPU AR, dense TP and MoE EP via `QwenArSemanticProducer`;
-    /// DFlash/MTP via `Qwen35Emit`). Each matches only the answer channel,
-    /// holds a possible stop prefix back, and never emits the stop text. Every
-    /// other route would ignore `stop` or leak it, so `generate` refuses it.
+    /// DFlash/MTP via `Qwen35Emit`) and Qwen4 (AR via
+    /// `generate_ar_with_forward`'s `QwenArSemanticProducer`, native MTP via
+    /// `Qwen35Emit`). Each matches only the answer channel, holds a possible
+    /// stop prefix back, and never emits the stop text. Every other route
+    /// would ignore `stop` or leak it, so `generate` refuses it.
     pub const fn supports_stop(self) -> bool {
+        matches!(
+            self,
+            Self::QwenAr | Self::Qwen4Ar | Self::Qwen4Spec | Self::QwenDflash
+        )
+    }
+
+    /// Routes whose fall-through into `generate`'s generic AR body must take
+    /// the Qwen3.5 branch (cumulative KV + DeltaNet state on a
+    /// `Qwen35Bundle`). Both Qwen routes get there: `QwenAr`, and
+    /// `QwenDflash` when `generate_dflash` declines the request (prompt +
+    /// max_tokens over the drafter's ctx capacity) and falls back to AR. Only
+    /// the Qwen3.5 carrier (arch 5|6) declares Qwen DFlash caps, so no other
+    /// arch reaches these routes.
+    pub const fn runs_qwen35_ar_body(self) -> bool {
         matches!(self, Self::QwenAr | Self::QwenDflash)
     }
 
@@ -1586,6 +1645,9 @@ pub fn emit_active_route_cancel(output: &mut dyn Write, id: &str, completion_tok
 pub struct GenerationRouteInputs {
     pub arch_id: u32,
     pub ep: bool,
+    /// EP-shaped topology that is actually a dense tensor-parallel trunk
+    /// (`EpArch::Qwen35DenseTp`), the one mesh route that carries a drafter.
+    pub dense_tp: bool,
     pub pp: usize,
     pub has_speculator: bool,
     pub speculator_is_mtp: bool,
@@ -1594,8 +1656,10 @@ pub struct GenerationRouteInputs {
     pub temp: f32,
     pub user_explicit_sampling: bool,
     pub min_p: Option<f32>,
-    /// At least one repeat/presence/frequency penalty is non-neutral. Sampled
-    /// DFlash chain verify does not implement these controls and must use AR.
+    /// At least one repeat/presence/frequency penalty is non-neutral. Native
+    /// MTP verifiers apply them (Qwen4: sampled only; Qwen3.x: sampled and
+    /// greedy); DFlash verifiers (greedy, DDTree SWOR, selector chain) do not
+    /// implement these controls and must use AR.
     pub nonneutral_penalties: bool,
     pub force_ar_chat: bool,
     pub temp_spec_env_off: bool,
@@ -1611,8 +1675,22 @@ pub struct GenerationRouteInputs {
 
 /// Pure production route selector. Precedence is intentional and exhaustive.
 pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
-    // 1. Expert-parallel first (before any arch short-circuit).
+    // 1. Expert-parallel first (before any arch short-circuit). Dense TP is the
+    // one mesh topology that carries a speculator — its MTP drafter runs on the
+    // replicated rank-0 head and verifies across ranks — so a request it can
+    // serve takes the spec route; anything else stays on the EP AR arm, which
+    // is the only loop that can drive a sharded trunk.
     if i.ep {
+        let dense_tp_mtp = i.dense_tp
+            && i.arch_id == 5
+            && i.has_speculator
+            && i.speculator_is_mtp
+            && !i.force_ar_chat
+            && !i.kv_adaptive
+            && (i.temp <= 1e-6 || i.supports_temp_swor);
+        if dense_tp_mtp {
+            return GenerationRoute::QwenDflash;
+        }
         return match i.arch_id {
             5 | 6 => GenerationRoute::QwenAr,
             9 => GenerationRoute::Deepseek4Ep,
@@ -1625,17 +1703,27 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
     // 2. Arch short-circuits (Qwen2, DeepSeek4, LFM, Cohere, MiniMax, dots).
     match i.arch_id {
         16 => {
-            // Qwen4 native MTP verifies greedy picks only. At temperature 0
-            // the AR producer reduces to argmax and ignores top_p/top_k/min_p
-            // (see `greedy_on_gpu` in `generate_ar_with_forward`), so their
-            // presence on the wire must not demote the request: serve forwards
-            // top_p/top_k whenever the client or the registry sets one. Penalties do move
-            // the argmax, so non-neutral ones, adaptive KV, or a force-AR
-            // switch keep the request on the ordinary Qwen4 producer.
+            // Qwen4 native MTP verifies greedy picks, and sampled requests
+            // too when the drafter reports `supports_temp_verify`
+            // (`speculation.mtp_sampled`): speculative rejection sampling
+            // against the AR sampler's own distribution
+            // (`llama::sample_top_k_p`: temperature, the request's top_k and
+            // min_p, top_p; the verifier's target applies the same cuts, so
+            // they do not demote the request). At temperature 0 the AR producer
+            // reduces to argmax and ignores top_p/top_k/min_p (see
+            // `greedy_on_gpu` in `generate_ar_with_forward`), so their
+            // presence on the wire must not demote the request: serve
+            // forwards top_p/top_k whenever the client or the registry sets
+            // one. Sampled verification applies the request's penalties to
+            // every target row against the full prompt + emitted history
+            // (`hipfire_runtime::spec_sampling::PenaltyHistory`), so a
+            // penalized sampled request keeps the MTP route. A penalized
+            // greedy request, adaptive KV, or a force-AR switch keeps the
+            // request on the ordinary Qwen4 producer (penalize-then-argmax).
             let spec_ok = i.has_speculator
                 && i.speculator_is_mtp
-                && i.temp <= 1e-6
-                && !i.nonneutral_penalties
+                && (i.temp <= 1e-6 || i.supports_temp_swor)
+                && (!i.nonneutral_penalties || (i.temp > 1e-6 && i.supports_temp_swor))
                 && !i.force_ar_chat
                 && !i.temp_spec_env_off
                 && !i.kv_adaptive;
@@ -1717,6 +1805,10 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
     // Selector-chain nucleus may share supports_temp_swor with DDTree SWOR but
     // still takes the sampled chain route (user-explicit top_p/top_k allowed;
     // min_p>0 still blocked — DFlash ignores min_p).
+    // Token penalties: native MTP penalizes every verify row (sampled and
+    // greedy) on the GPU against the emitted history, so it keeps the route;
+    // DFlash verifiers (greedy, DDTree SWOR, selector chain) implement none
+    // and send a penalized request to AR instead of dropping the penalties.
     let caps = hipfire_loader::carrier_for(i.arch_id)
         .map(|c| c.caps())
         .unwrap_or_default();
@@ -1726,6 +1818,7 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
         && i.supports_temp_swor
         && !i.supports_chain_nucleus_verify
         && !i.user_explicit_sampling
+        && !i.nonneutral_penalties
         && !i.temp_spec_env_off;
     let chain_sample_route = !i.speculator_is_mtp
         && i.temp > 1e-6
@@ -1736,10 +1829,11 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
         && !i.nonneutral_penalties
         && !i.temp_spec_env_off;
     let mtp_sample_route = i.speculator_is_mtp && i.temp > 1e-6 && i.supports_temp_swor;
+    let qwen_greedy_route = i.temp <= 1e-6 && (!i.nonneutral_penalties || i.speculator_is_mtp);
     let qwen_dflash_route = caps.is_qwen_dflash()
-        && (i.temp <= 1e-6 || ddtree_swor_route || chain_sample_route || mtp_sample_route);
-    let llama_dflash_route =
-        caps.is_llama_dflash() && (i.temp <= 1e-6 || ddtree_swor_route || chain_sample_route);
+        && (qwen_greedy_route || ddtree_swor_route || chain_sample_route || mtp_sample_route);
+    let llama_dflash_route = caps.is_llama_dflash()
+        && ((i.temp <= 1e-6 && !i.nonneutral_penalties) || ddtree_swor_route || chain_sample_route);
     if i.has_speculator
         && !i.force_ar_chat
         && (qwen_dflash_route || llama_dflash_route)
@@ -1801,7 +1895,7 @@ pub fn llama_prefill_sample_seed(mut seed: u32, token_count: usize, temperature:
 /// allocate logits, mutate device state before publishing tokens, roll back on
 /// every forward/semantic/terminal failure, and emit exactly one terminal.
 #[allow(clippy::too_many_arguments)]
-pub fn generate_ar_with_forward<Prefill, Decode>(
+pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     stdout: &mut std::io::Stdout,
@@ -1823,8 +1917,18 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
     started_in_think: bool,
     stop: &[String],
     tool_protocol_enabled: bool,
+    // Prompt tokens the prefill restored rather than computed (reported as
+    // `cached_tokens`; prefill tok/s counts only the computed rest).
+    cached_tokens: usize,
+    // The decode callback penalizes the logits it argmaxes (`None` token)
+    // with the request's repeat/presence/frequency penalties over
+    // `m.conversation_tokens`, bit-identical to `sampler::sample_cpu`'s
+    // penalty stage: a penalized greedy request keeps the GPU argmax route.
+    decode_penalizes: bool,
     mut forward_chunk: Prefill,
     mut forward_token: Decode,
+    // Runs once after the client committed the terminal, before `done`.
+    on_commit: Commit,
 ) where
     Prefill: FnMut(
         &mut LoadedModel,
@@ -1833,13 +1937,15 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         &rdna_compute::GpuTensor,
     ) -> Result<(), String>,
     // Runs the token (`None`: the GPU argmax of the logits tensor, as the
-    // previous decode left it) and returns it.
+    // previous decode left it, penalized first when `decode_penalizes`) and
+    // returns it.
     Decode: FnMut(
         &mut LoadedModel,
         &mut rdna_compute::Gpu,
         Option<u32>,
         &rdna_compute::GpuTensor,
     ) -> Result<u32, String>,
+    Commit: FnOnce(&mut LoadedModel),
 {
     if vocab_size == 0 {
         emit_active_attempt_error(
@@ -1938,19 +2044,31 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         &m.conversation_tokens,
         &sampler_config,
     ));
-    // `sample_cpu` reduces to `llama::argmax` here: take it on the GPU and
-    // read back one index instead of the logits row.
+    // `sample_cpu` reduces to `llama::argmax` here (after its penalty stage,
+    // which the decode callback applies on the GPU when `decode_penalizes`):
+    // take it on the GPU and read back one index instead of the logits row.
     let greedy_on_gpu = sampler_config.temperature <= 0.0
-        && !(sampler_config.repeat_penalty != 1.0 && sampler_config.repeat_window > 0)
-        && !((sampler_config.presence_penalty > 0.0 || sampler_config.frequency_penalty > 0.0)
-            && sampler_config.repeat_window > 0)
-        && sampler_config.blocked_tokens.is_empty();
+        && sampler_config.blocked_tokens.is_empty()
+        && (decode_penalizes || sampler::PenaltyTable::flags_for(&sampler_config) == 0);
+    // User stop sequences gate the answer channel before it is emitted: a
+    // stop spanning a token boundary is held back, and the matched text and
+    // everything after it never reach the client.
     let mut semantic =
-        QwenArSemanticProducer::new_with_tool_protocol(id, started_in_think, tool_protocol_enabled);
+        QwenArSemanticProducer::new_with_tool_protocol(id, started_in_think, tool_protocol_enabled)
+            .with_stop(stop);
     let mut streamed_tokens = Vec::new();
     let mut generated = 0usize;
-    let mut bytes_fed_to_filter = 0usize;
+    // Raw bytes of `streamed_tokens`, grown one token at a time.
+    let mut stream_bytes: Vec<u8> = Vec::new();
     let mut natural_stop = false;
+    // An explicit `max_think_tokens` budget force-closes the think span with
+    // the template's own close, which the model then answers after. Same
+    // accounting and close as the Qwen4 MTP emitter, so greedy AR and MTP
+    // produce the same text.
+    let mut think_budget = hipfire_runtime::emit_text::ThinkBudget::new(max_think_tokens);
+    // Close tokens still to run; each goes through the decode body below
+    // exactly like a sampled token (KV write, commit, classify, stops).
+    let mut forced_close = std::collections::VecDeque::new();
     let t_decode = Instant::now();
 
     while generated < max_tokens {
@@ -1959,6 +2077,9 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
             let _ = gpu.free_tensor(decode_logits);
             emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return;
+        }
+        if let Some(token) = forced_close.pop_front() {
+            pending = Some(token);
         }
         let next_token = match forward_token(m, gpu, pending.take(), &decode_logits) {
             Ok(token) => token,
@@ -1977,10 +2098,12 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
             }
         };
 
-        let previous_bytes = bytes_fed_to_filter;
         let elapsed_ms = t0.elapsed().as_millis() as u64;
         let classify = {
             let tokenizer = m.tokenizer.as_ref().unwrap();
+            let fed = stream_bytes.len();
+            tokenizer.decode_token_bytes_into(next_token, &mut stream_bytes);
+            let new_bytes = &stream_bytes[fed..];
             semantic.commit_and_classify(
                 stdout,
                 next_token,
@@ -1992,9 +2115,6 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
                         next_token,
                         QwenArRawCommitDisposition::ClassifiedVisible,
                     );
-                    let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-                    let new_bytes = all_bytes[previous_bytes.min(all_bytes.len())..].to_vec();
-                    bytes_fed_to_filter = all_bytes.len();
                     (position, new_bytes)
                 },
                 |position, out| {
@@ -2019,25 +2139,8 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
             }
         };
         generated += 1;
-        if max_think_tokens > 0 && semantic.think_router.in_think() && generated >= max_think_tokens
-        {
-            let _ = gpu.free_tensor(decode_logits);
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
-            emit_fail_closed_error(
-                stdout,
-                Some(id),
-                &format!("{} think token budget exceeded", route.name()),
-                "validation",
-                false,
-                &ep,
-            );
-            return;
-        }
-        let custom_stop = stop
-            .iter()
-            .any(|value| !value.is_empty() && semantic.visible().ends_with(value));
+        // `filter_stop` also latches on a user stop-sequence match.
         if filter_stop
-            || custom_stop
             || next_token == eos_token
             || m.tokenizer
                 .as_ref()
@@ -2046,8 +2149,35 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
             natural_stop = true;
             break;
         }
+        match qwen_ar_think_budget_step(
+            &mut think_budget,
+            &stream_bytes,
+            started_in_think,
+            m.tokenizer.as_ref().unwrap(),
+        ) {
+            QwenArThinkBudgetAction::Continue => {}
+            QwenArThinkBudgetAction::Close(close) => {
+                eprintln!(
+                    "[think-cap] id={id} route={} think budget {max_think_tokens} reached at generated={generated}; closing with tokens {close:?}",
+                    route.name()
+                );
+                forced_close.extend(close);
+            }
+            QwenArThinkBudgetAction::Stop => {
+                eprintln!(
+                    "[think-cap] id={id} route={} think budget {max_think_tokens} spent again after the forced close; stopping",
+                    route.name()
+                );
+                natural_stop = true;
+                break;
+            }
+        }
         if generated >= max_tokens {
             break;
+        }
+        if !forced_close.is_empty() {
+            // The next forward runs the next close token instead of a sample.
+            continue;
         }
 
         if greedy_on_gpu {
@@ -2079,7 +2209,7 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
     }
 
     let hit_length_cap = generated >= max_tokens && !natural_stop;
-    let (finish, _) = match semantic.finish(stdout, hit_length_cap) {
+    let (finish, visible_for_cache) = match semantic.finish(stdout, hit_length_cap) {
         Ok(result) => result,
         Err(error) => {
             let _ = gpu.free_tensor(decode_logits);
@@ -2095,11 +2225,13 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
             return;
         }
     };
-    if matches!(finish.cause, QwenArTerminalCause::OpenThink) {
-        let _ = gpu.free_tensor(decode_logits);
-        let ep = production_fail_closed_rollback(m, gpu, None, None);
-        emit_qwen_ar_open_think_terminal(stdout, id, generated, &ep);
-        return;
+    if finish.cause == QwenArTerminalCause::OpenThink {
+        // Tells `<|im_end|>` from `<|endoftext|>` (both EOS) in captures.
+        eprintln!(
+            "[open-think] id={id} route={} model ended the turn inside reasoning; terminal token {:?}",
+            route.name(),
+            streamed_tokens.last()
+        );
     }
     let t_end = Instant::now();
     let total_ms = t_end.duration_since(t0).as_secs_f64() * 1000.0;
@@ -2110,7 +2242,7 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         0.0
     };
     let prefill_tok_s = if prefill_ms > 0.0 {
-        prompt_tokens.len() as f64 / (prefill_ms / 1000.0)
+        prompt_tokens.len().saturating_sub(cached_tokens) as f64 / (prefill_ms / 1000.0)
     } else {
         0.0
     };
@@ -2124,12 +2256,13 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         finish.finish_reason,
         generated,
         tok_s,
-        prompt_tokens.len(),
+        // Computed prompt tokens; serve adds `cached_tokens` back for usage.
+        prompt_tokens.len() - cached_tokens,
         prefill_ms,
         prefill_tok_s,
         decode_tok_s,
         prefill_ms,
-        0,
+        cached_tokens,
         "",
     );
     stage_terminal_tool_calls(
@@ -2143,6 +2276,36 @@ pub fn generate_ar_with_forward<Prefill, Decode>(
         let _ = gpu.free_tensor(decode_logits);
         emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
         return;
+    }
+    on_commit(m);
+    // Store the verbatim emitted assistant token span under the same
+    // fingerprint / trailer trim / value contract (`qwen_cached_turn_entry`) the
+    // MTP route stores, so the next turn of EITHER route splices these exact
+    // IDs instead of re-encoding the decoded text. `finish.store_cache` already
+    // excludes length-capped, stop-sequence, malformed and open-think
+    // terminals; a client abort returned above.
+    let cache_action = qwen_ar_cache_action(&finish, &visible_for_cache);
+    if cache_action.store {
+        let tok = m.tokenizer.as_ref().unwrap();
+        let im_end = tok.encode("<|im_end|>");
+        let im_end_token = if im_end.len() == 1 {
+            Some(im_end[0])
+        } else {
+            None
+        };
+        let nl_set: std::collections::HashSet<u32> = tok.encode("\n").into_iter().collect();
+        let cached_seq =
+            crate::qwen::qwen_dflash_cache_seq(&streamed_tokens, im_end_token, &nl_set);
+        let _ = qwen_ar_apply_cache_action(
+            |fp, seq| {
+                m.asst_turn_cache.insert(
+                    fp,
+                    crate::qwen::qwen_cached_turn_entry(tok, seq, started_in_think),
+                );
+            },
+            &cache_action,
+            cached_seq,
+        );
     }
     let _ = gpu.free_tensor(decode_logits);
     emit_active_route_done_value(stdout, &pending_done);
@@ -2216,6 +2379,10 @@ pub fn generate(
     let route_inputs = GenerationRouteInputs {
         arch_id: m.arch_id,
         ep: m.ep.is_some(),
+        dense_tp: matches!(
+            m.ep.as_ref().map(|e| &e.inner),
+            Some(hipfire_loader::EpArch::Qwen35DenseTp { .. })
+        ),
         pp: m.pp,
         has_speculator: m.speculator.is_some(),
         speculator_is_mtp: m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),
@@ -2293,37 +2460,6 @@ pub fn generate(
 
     match hipfire_loader::generation_early_route(m.arch_id) {
         Some(hipfire_loader::GenerationEarlyRoute::Gemma4) => {
-            // The loader publishes one of two mutually-exclusive Gemma4 states:
-            // eager dense (ModelState::Gemma4) and lowered/MoE
-            // (ModelState::Gemma4Lowered). Lowered models are served by
-            // generate_gemma4_lowered below; eager models continue through
-            // generate_gemma4.
-            if m.gemma4_lowered_mut().is_some() {
-                crate::dense::generate_gemma4_lowered(
-                    m,
-                    gpu,
-                    stdout,
-                    id,
-                    prompt,
-                    system_prompt,
-                    temp,
-                    top_p,
-                    top_k,
-                    min_p,
-                    max_tokens,
-                    repeat_penalty,
-                    repeat_window,
-                    presence_penalty,
-                    frequency_penalty,
-                    max_think_tokens,
-                    enable_thinking,
-                    tools,
-                    messages_history,
-                    logprobs_top_k,
-                    request_seed,
-                );
-                return;
-            }
             let _ = (
                 budget_alert_at_tok,
                 budget_alert_text,
@@ -2332,15 +2468,7 @@ pub fn generate(
                 pflash_cfg,
                 think_mode,
                 user_explicit_sampling,
-                top_k,
-                min_p,
                 cactus_delta,
-            );
-            let _ = (
-                repeat_penalty,
-                repeat_window,
-                presence_penalty,
-                frequency_penalty,
             );
             crate::dense::generate_gemma4(
                 m,
@@ -2349,8 +2477,18 @@ pub fn generate(
                 id,
                 prompt,
                 system_prompt,
-                temp,
-                top_p,
+                SamplerConfig {
+                    temperature: temp,
+                    top_p,
+                    repeat_penalty,
+                    repeat_window,
+                    presence_penalty,
+                    frequency_penalty,
+                    blocked_tokens: Vec::new(),
+                    top_k,
+                    min_p,
+                },
+                request_seed,
                 max_tokens,
                 max_think_tokens,
                 enable_thinking,
@@ -2444,8 +2582,12 @@ pub fn generate(
                 stop,
                 temp,
                 top_p,
-                top_k.map(|k| k as usize).unwrap_or(0),
+                top_k,
                 min_p.unwrap_or(0.0),
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
                 cactus_delta,
                 request_seed as u64,
                 reasoning_effort,
@@ -2591,8 +2733,12 @@ pub fn generate(
                 stop,
                 temp,
                 top_p,
-                top_k.map(|k| k as usize).unwrap_or(0),
+                top_k,
                 min_p.unwrap_or(0.0),
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
                 cactus_delta,
                 request_seed as u64,
                 reasoning_effort,
@@ -2758,8 +2904,12 @@ pub fn generate(
                 stop,
                 temp,
                 top_p,
-                top_k.map(|k| k as usize).unwrap_or(0),
+                top_k,
                 min_p.unwrap_or(0.0),
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
                 cactus_delta,
                 request_seed as u64,
                 reasoning_effort,
@@ -2836,8 +2986,12 @@ pub fn generate(
                 stop,
                 temp,
                 top_p,
-                top_k.map(|k| k as usize).unwrap_or(0),
+                top_k,
                 min_p.unwrap_or(0.0),
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
                 cactus_delta,
                 request_seed as u64,
                 reasoning_effort,
@@ -2914,8 +3068,12 @@ pub fn generate(
                 stop,
                 temp,
                 top_p,
-                top_k.map(|k| k as usize).unwrap_or(0),
+                top_k,
                 min_p.unwrap_or(0.0),
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
                 cactus_delta,
                 request_seed as u64,
                 reasoning_effort,
@@ -3079,20 +3237,18 @@ pub fn generate(
                 stop,
                 temp,
                 top_p,
-                top_k.map(|k| k as usize).unwrap_or(0),
+                top_k,
                 min_p.unwrap_or(0.0),
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
                 cactus_delta,
                 request_seed as u64,
                 reasoning_effort,
                 enable_thinking,
             ) {
-                let _ = (
-                    repeat_penalty,
-                    repeat_window,
-                    budget_alert_at_tok,
-                    budget_alert_text,
-                    pflash_state,
-                );
+                let _ = (budget_alert_at_tok, budget_alert_text, pflash_state);
                 return;
             }
             // ctx-capacity miss → fall through to default AR body below.
@@ -3149,7 +3305,8 @@ pub fn generate(
     // and a byte-fit implies a token-fit. Near-boundary requests still
     // measure exactly, so reset decisions are unchanged.
     let prompt_est = if m.eviction.is_none()
-        && m.seq_pos.saturating_add(prompt.len())
+        && m.seq_pos
+            .saturating_add(prompt.len())
             .saturating_add(20)
             .saturating_add(max_tokens)
             > m.max_seq
@@ -3625,11 +3782,15 @@ pub fn generate(
     // `build_cached_history_jinja` (verbatim assistant-turn splice through the
     // model's trained template) instead of the ChatScaffold `build_cached_history`,
     // so the LCP forward-extension cache now works under HIPFIRE_JINJA_CHAT too.
+    // VMM batch route: conversations finished on batch lanes (or parked
+    // between singleton turns) are kept in the store's prefix pool; one of
+    // them may be this request's resident conversation.
+    let vmm_pool = jinja_active && tools.is_none() && crate::vmm_conv::pool_active(m);
     let cache_eligible = !cache_kill_switch
         && messages_history.is_some()
         && m.eviction.is_none()
         && !pflash_active
-        && !m.conversation_tokens.is_empty();
+        && (!m.conversation_tokens.is_empty() || vmm_pool);
     if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
         .ok()
         .as_deref()
@@ -3662,16 +3823,6 @@ pub fn generate(
             // Qwen3.8 re-emits the empty-think block. Prepend the primer THIS
             // turn's cold render emitted only when the template does not, so
             // the spliced stream byte-matches `conversation_tokens`.
-            let primer: Vec<u32> = {
-                let im_start = tokenizer.special_token_id("<|im_start|>");
-                let opener_len = tokenizer.encode("<|im_start|>assistant\n").len();
-                match im_start.and_then(|id| new_tokens.iter().rposition(|&t| t == id)) {
-                    Some(q) if q + opener_len <= new_tokens.len() => {
-                        new_tokens[q + opener_len..].to_vec()
-                    }
-                    _ => Vec::new(),
-                }
-            };
             let template = m.chat_template.as_ref().unwrap();
             let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
                 tokenizer,
@@ -3683,30 +3834,16 @@ pub fn generate(
                 reasoning_strength: None,
                 reasoning_effort,
             };
-            let primer: Vec<u32> =
-                if hipfire_runtime::prompt_frame::template_emits_history_primer(&frame, &primer) {
-                    Vec::new()
-                } else {
-                    primer
-                };
-            let cache_ref = &mut m.asst_turn_cache;
-            let built = hipfire_runtime::prompt_frame::build_cached_history_jinja(
+            let built = crate::qwen::qwen_jinja_cached_history_tokens(
                 &frame,
+                &mut m.asst_turn_cache,
+                &new_tokens,
                 history,
                 tools,
-                |msg| {
-                    let hit = crate::qwen::qwen_jinja_lookup_turn(&mut *cache_ref, msg, &primer);
-                    if trace_cache {
-                        let normalized =
-                            crate::common::normalize_asst_turn_for_fingerprint(&msg.content);
-                        let fp = crate::common::asst_turn_fingerprint(&normalized, &msg.tool_calls);
-                        eprintln!(
-                            "[qwen-cache jinja lookup] fp={:#018x} role={:?} content.len={}/stripped.len={} primer={} hit={}",
-                            fp, msg.role, msg.content.len(), normalized.len(), primer.len(), hit.is_some(),
-                        );
-                    }
-                    hit
-                },
+                hipfire_runtime::prompt_frame::ToolTurnSplice::Envelopes,
+                "dense-ar",
+                // Exact-prefix guarded: a non-extending repair falls back to the safe miss.
+                Some(&m.conversation_tokens),
             );
             match built {
                 Ok(t) => t,
@@ -3771,6 +3908,19 @@ pub fn generate(
                 },
             )
         };
+        if vmm_pool {
+            // Make the kept conversation this render reuses most resident
+            // (parking the current one); the decision below is unchanged.
+            crate::vmm_conv::singleton_adopt(
+                &mut m.state,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                gpu,
+                &rendered,
+            );
+        }
         // LCP detection vs m.conversation_tokens.
         let prior_len = m.conversation_tokens.len();
         let max_match = prior_len.min(rendered.len());
@@ -4223,12 +4373,18 @@ pub fn generate(
     emit_generation_start(selected_route, stdout, id, started_in_think);
     let t0 = Instant::now();
 
-    if hipfire_loader::carrier_for(m.arch_id)
-        .map(|c| c.caps().has_deltanet)
-        .unwrap_or(false)
-    {
-        // Qwen3.5 / Qwen3.5-MoE — multi-turn: prefill only the NEW turn tokens,
-        // continuing from m.seq_pos (KV cache + DeltaNet state are cumulative)
+    // The Qwen3.5 multi-turn branch: prefill only the NEW turn tokens,
+    // continuing from `m.seq_pos` (KV cache + DeltaNet state are cumulative).
+    //
+    // Keyed on the ROUTE, not on `caps().has_deltanet`. The capability means
+    // "has GatedDeltaNet state", which is now true of an arch that is NOT
+    // Qwen35 — arch 17, the qwen3.5 multi-vector embedding encoder — so using
+    // it as a proxy for "the state is a `Qwen35Bundle`" made this branch
+    // downcast the wrong type and panic the daemon on a `generate` request.
+    // `GenerationRoute::runs_qwen35_ar_body` names the routes that land here
+    // with that bundle: `QwenAr`, and `QwenDflash` when the speculative arm
+    // declines the request and falls back to AR.
+    if selected_route.runs_qwen35_ar_body() {
         let b = m
             .state
             .as_mut()
@@ -4399,12 +4555,9 @@ pub fn generate(
                         }
                     }
                 }
-                if let Some(hipfire_runtime::triattn::EvictionResult {
-                    new_physical: new_phys,
-                    ..
-                }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
-                {
-                    m.seq_pos = new_phys;
+                if let Err(err) = qwen_ar_evict(&mut m.seq_pos, |at| ev.maybe_evict(gpu, kv, at)) {
+                    qwen_ar_eviction_fail_closed(m, gpu, stdout, id, "prefill", &err);
+                    return;
                 }
                 remaining = rest;
             }
@@ -4770,7 +4923,10 @@ pub fn generate(
 
         let mut generated = 0;
         let mut streamed_tokens: Vec<u32> = Vec::new();
-        let mut bytes_fed_to_filter = 0usize;
+        // Raw bytes of `streamed_tokens`, grown one token at a time
+        // (`decode_token_bytes_into`) instead of re-decoding the whole
+        // history every token. Its length is the filter's fed offset.
+        let mut stream_bytes: Vec<u8> = Vec::new();
         // Increment-A semantic producer: sole authority for client-visible text
         // and structured tool_calls on this AR path. Raw token commit stays
         // upstream via `commit_and_observe` (conversation_tokens / streamed /
@@ -4846,6 +5002,112 @@ pub fn generate(
                 crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
                 return;
             }
+            // VMM continuous batching: a serve-batched peer is waiting and
+            // this request may join the batch (the daemon granted a permit).
+            // Promote at this committed boundary — `next_token` is the
+            // pending seed, not yet fed — instead of making the peer wait
+            // for this whole generation. Features the batch lane does not
+            // carry (grammar, budget alerts, logprobs, eviction/adaptive KV)
+            // keep the request here; think budgets/latches continue per lane
+            // (`vmm_conv::ThinkCtl`) and stop strings in the moved producer.
+            if let Some(permit) = crate::batch::promotion_permit().filter(|_| {
+                crate::batch::promotion_wanted(generated)
+                    && !grammar_active
+                    && budget_alert_at_tok == 0
+                    && logprobs_top_k.is_none()
+                    && m.eviction.is_none()
+                    && m.kv_adaptive.is_none()
+            }) {
+                let boundary = crate::batch::SingletonBoundary {
+                    id,
+                    permit,
+                    config,
+                    kv: &mut *kv,
+                    dn: &mut *dn,
+                    position: m.seq_pos,
+                    pending_seed: next_token,
+                    sampler: SamplerConfig {
+                        temperature: temp,
+                        top_p,
+                        repeat_penalty,
+                        repeat_window: repeat_buf_cap,
+                        presence_penalty,
+                        frequency_penalty,
+                        blocked_tokens: Vec::new(),
+                        top_k,
+                        min_p,
+                    },
+                    rng_state,
+                    // The executor's history already holds the pending seed
+                    // (pushed at its pick); the singleton pushes it when fed.
+                    history: m.conversation_tokens[ngram_scope_start..]
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(next_token))
+                        .collect(),
+                    prompt_len: ngram_scope_start,
+                    conversation_tokens: m.conversation_tokens.clone(),
+                    streamed_tokens: streamed_tokens.clone(),
+                    bytes_fed_to_filter: stream_bytes.len(),
+                    created_at: t0,
+                    prefill_done_at: t_prefill,
+                    first_token_at: (generated > 0).then_some(t_prefill),
+                    started_in_think,
+                };
+                match crate::batch::promote_singleton(gpu, boundary) {
+                    Ok((pending, progress, state)) => {
+                        // The bundle now holds a fresh owner: its conversation
+                        // (tokens + resume checkpoints) moves with the swapped
+                        // KV/DN into the lane, which keeps it for the next turn.
+                        // The assistant-turn cache is not tied to an owner.
+                        m.seq_pos = 0;
+                        m.conversation_tokens.clear();
+                        let checkpoints = std::mem::take(&mut m.prefill_checkpoints);
+                        crate::common::free_checkpoints(&mut m.dflash_checkpoints, gpu);
+                        if let Some(spec) = m.speculator.as_mut() {
+                            if let Err(e) = spec.reset(gpu) {
+                                eprintln!("[vmm-promote] speculator reset after promotion: {e}");
+                            }
+                        }
+                        crate::common::fail_closed_invalidate_graphs_and_replay(gpu);
+                        // A prepared PM4/AQL replay route bakes the old KV/DN
+                        // addresses (no per-call binding check): drop it so
+                        // the next singleton forward re-records on the new
+                        // owners.
+                        gpu.replay.rearm_after_layout_growth();
+                        eprintln!(
+                            "[vmm-promote] id={id} promoted from AR singleton at generated={generated} position={}",
+                            progress.seq_pos
+                        );
+                        crate::batch::put_promoted(crate::batch::PromotedRequest {
+                            pending,
+                            progress,
+                            state,
+                            producer: semantic,
+                            loop_guard,
+                            kind: crate::batch::PromotedDecode::Ar,
+                            seed_emitted: false,
+                            conv: crate::vmm_conv::PromotedConv {
+                                think: Some(crate::vmm_conv::ThinkCtl {
+                                    max_think_tokens,
+                                    max_total_think,
+                                    post_latch_budget: post_latch_answer_budget,
+                                    think_count,
+                                    prev_in_think,
+                                    total_think_tokens,
+                                    force_answer_latched,
+                                    latch_gen_mark,
+                                }),
+                                checkpoints,
+                                cached_tokens: cached_tokens_count,
+                                prefill_tokens,
+                            },
+                        });
+                        return;
+                    }
+                    Err(e) => eprintln!("[vmm-promote] id={id} stays singleton: {e}"),
+                }
+            }
             // Write this token's K/V to the cache BEFORE any client-visible
             // emit so a VMM map/growth failure cannot stream a token whose
             // trunk write never committed. Successful path still advances
@@ -4893,9 +5155,12 @@ pub fn generate(
             }
             // Incremental UTF-8 + filter routing via producer-owned
             // commit-then-classify. Raw commit (conversation/stream/seq_pos)
-            // runs inside the closure before fallible classify; decode delta
-            // is computed after the real push.
-            let prev_fed = bytes_fed_to_filter;
+            // runs inside the closure before fallible classify; the token's
+            // bytes are appended to the stream buffer and handed over as its
+            // delta.
+            let fed = stream_bytes.len();
+            tokenizer.decode_token_bytes_into(next_token, &mut stream_bytes);
+            let new_bytes = &stream_bytes[fed..];
             let elapsed_ms = t0.elapsed().as_millis() as u64;
             match semantic.commit_and_classify(
                 stdout,
@@ -4908,9 +5173,6 @@ pub fn generate(
                         next_token,
                         QwenArRawCommitDisposition::ClassifiedVisible,
                     );
-                    let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-                    let new_bytes = all_bytes[prev_fed..].to_vec();
-                    bytes_fed_to_filter = all_bytes.len();
                     (pos, new_bytes)
                 },
                 |pos, out| {
@@ -4939,14 +5201,12 @@ pub fn generate(
                     ckpt_max(),
                 );
             }
-            if let Some(ref ev) = m.eviction {
-                if let Some(hipfire_runtime::triattn::EvictionResult {
-                    new_physical: new_phys,
-                    ..
-                }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
-                {
-                    m.seq_pos = new_phys;
-                }
+            if let Err(err) = qwen_ar_evict(&mut m.seq_pos, |at| match &m.eviction {
+                Some(ev) => ev.maybe_evict(gpu, kv, at),
+                None => Ok(None),
+            }) {
+                qwen_ar_eviction_fail_closed(m, gpu, stdout, id, "decode", &err);
+                return;
             }
             // Adaptive KV: downshift K/V precision as seq_pos crosses capacity
             // thresholds. `kv` (=m.kv_cache) and m.kv_adaptive are distinct
@@ -5017,8 +5277,7 @@ pub fn generate(
                 || force_answer_latched
                 || max_total_think > 0
             {
-                let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
-                let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+                let raw_str = std::str::from_utf8(&stream_bytes).unwrap_or("");
                 let in_think = currently_in_think(raw_str, started_in_think);
                 // Total-think bound (re-arm-proof). Count every think token; at the
                 // cap, latch force-answer (force-close + block <think>); a margin
@@ -5109,9 +5368,12 @@ pub fn generate(
                         if grammar_active {
                             grammar_matcher.advance(&tokenizer.decode(&[t]));
                         }
-                        let prev_fed = bytes_fed_to_filter;
+                        let fed = stream_bytes.len();
+                        tokenizer.decode_token_bytes_into(t, &mut stream_bytes);
+                        let new_bytes = &stream_bytes[fed..];
                         let elapsed_ms = t0.elapsed().as_millis() as u64;
-                        match semantic.commit_and_classify(
+                        let mut evict_failure = None;
+                        let classified = semantic.commit_and_classify(
                             stdout,
                             t,
                             || {
@@ -5122,24 +5384,25 @@ pub fn generate(
                                     t,
                                     QwenArRawCommitDisposition::ClassifiedVisible,
                                 );
-                                if let Some(ref ev) = m.eviction {
-                                    if let Some(hipfire_runtime::triattn::EvictionResult {
-                                        new_physical: new_phys,
-                                        ..
-                                    }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
-                                    {
-                                        m.seq_pos = new_phys;
-                                    }
+                                if let Err(err) =
+                                    qwen_ar_evict(&mut m.seq_pos, |at| match &m.eviction {
+                                        Some(ev) => ev.maybe_evict(gpu, kv, at),
+                                        None => Ok(None),
+                                    })
+                                {
+                                    evict_failure = Some(err);
                                 }
-                                let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-                                let new_bytes = all_bytes[prev_fed..].to_vec();
-                                bytes_fed_to_filter = all_bytes.len();
                                 (pos, new_bytes)
                             },
                             |pos, out| {
                                 crate::common::emit_committed_event(out, id, t, pos, elapsed_ms);
                             },
-                        ) {
+                        );
+                        if let Some(err) = evict_failure {
+                            qwen_ar_eviction_fail_closed(m, gpu, stdout, id, "think close", &err);
+                            return;
+                        }
+                        match classified {
                             Ok(true) => {
                                 generated += 1;
                                 break;
@@ -5199,8 +5462,7 @@ pub fn generate(
                 // answer with a system-alert string. Check the raw decoded
                 // text rather than token IDs since <think> tokenizes as a
                 // multi-token sequence in Qwen3.5's vocab.
-                let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
-                let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+                let raw_str = std::str::from_utf8(&stream_bytes).unwrap_or("");
                 let in_think = currently_in_think(raw_str, started_in_think);
                 if !in_think {
                     emit_qwen_ar_info(
@@ -5299,9 +5561,14 @@ pub fn generate(
                             }
                             return;
                         }
-                        let prev_fed = bytes_fed_to_filter;
+                        let fed = stream_bytes.len();
+                        tokenizer.decode_token_bytes_into(tok, &mut stream_bytes);
+                        // Injected text still goes through producer filter/router
+                        // so think markers never leak on the contract-v2 wire.
+                        let new_bytes = &stream_bytes[fed..];
                         let elapsed_ms = t0.elapsed().as_millis() as u64;
-                        match semantic.commit_and_classify(
+                        let mut evict_failure = None;
+                        let classified = semantic.commit_and_classify(
                             stdout,
                             tok,
                             || {
@@ -5312,26 +5579,25 @@ pub fn generate(
                                     tok,
                                     QwenArRawCommitDisposition::ClassifiedVisible,
                                 );
-                                if let Some(ref ev) = m.eviction {
-                                    if let Some(hipfire_runtime::triattn::EvictionResult {
-                                        new_physical: new_phys,
-                                        ..
-                                    }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
-                                    {
-                                        m.seq_pos = new_phys;
-                                    }
+                                if let Err(err) =
+                                    qwen_ar_evict(&mut m.seq_pos, |at| match &m.eviction {
+                                        Some(ev) => ev.maybe_evict(gpu, kv, at),
+                                        None => Ok(None),
+                                    })
+                                {
+                                    evict_failure = Some(err);
                                 }
-                                // Injected text still goes through producer filter/router
-                                // so think markers never leak on the contract-v2 wire.
-                                let all_bytes2 = tokenizer.decode_bytes(&streamed_tokens);
-                                let new_bytes2 = all_bytes2[prev_fed..].to_vec();
-                                bytes_fed_to_filter = all_bytes2.len();
-                                (pos, new_bytes2)
+                                (pos, new_bytes)
                             },
                             |pos, out| {
                                 crate::common::emit_committed_event(out, id, tok, pos, elapsed_ms);
                             },
-                        ) {
+                        );
+                        if let Some(err) = evict_failure {
+                            qwen_ar_eviction_fail_closed(m, gpu, stdout, id, "budget alert", &err);
+                            return;
+                        }
+                        match classified {
                             Ok(true) => {
                                 generated += 1;
                                 break;
@@ -5479,14 +5745,12 @@ pub fn generate(
                         |_pos, _out| {},
                     )
                     .expect("hidden commit never classifies");
-                if let Some(ref ev) = m.eviction {
-                    if let Some(hipfire_runtime::triattn::EvictionResult {
-                        new_physical: new_phys,
-                        ..
-                    }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap()
-                    {
-                        m.seq_pos = new_phys;
-                    }
+                if let Err(err) = qwen_ar_evict(&mut m.seq_pos, |at| match &m.eviction {
+                    Some(ev) => ev.maybe_evict(gpu, kv, at),
+                    None => Ok(None),
+                }) {
+                    qwen_ar_eviction_fail_closed(m, gpu, stdout, id, "trailer", &err);
+                    return;
                 }
             }
         }
@@ -5499,7 +5763,7 @@ pub fn generate(
         // Length-cap never exposes executable calls; malformed without
         // length fails closed (error, no tool_calls, no asst_turn_cache).
         // Decoded EOT on the final budget token beats length.
-        // Open think → validation terminal (no cache) via finish().
+        // Open think → reasoning-only stop (no calls, no cache) via finish().
         // finish() shares the same drain + classify path as unit tests.
         let hit_length_cap = generated >= max_tokens;
         let (finish, visible_for_cache) = match semantic.finish(stdout, hit_length_cap) {
@@ -5509,12 +5773,6 @@ pub fn generate(
                 return;
             }
         };
-        // Open-think: production owns epilogue + single correlated error terminal.
-        if matches!(finish.cause, QwenArTerminalCause::OpenThink) {
-            let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
-            emit_qwen_ar_open_think_terminal(stdout, id, generated, &ep);
-            return;
-        }
         //
         // Timing + pending done are fixed before handshake so commit_ready
         // carries the exact eventual done payload. Abort rolls back + emits
@@ -5619,34 +5877,14 @@ pub fn generate(
                         .collect::<String>(),
                 );
             }
-            // Whole-envelope store (Qwen branch only): FULL generated body
-            // verbatim plus the producer reasoning text. The shared lookup
-            // replays R...A as one span on think-envelope templates;
-            // no-reasoning turns keep the primer-prepended single-slot path.
+            // Shared AR/spec value contract (`qwen_cached_turn_entry`): FULL
+            // generated body verbatim plus the producer reasoning text.
             let tok = m.tokenizer.as_ref().unwrap();
             let _ = qwen_ar_apply_cache_action(
                 |fp, seq| {
-                    let reasoning = hipfire_runtime::prompt_frame::cached_producer_reasoning_text(
-                        tok,
-                        &seq,
-                        started_in_think,
-                    )
-                    .map(|text| {
-                        hipfire_runtime::prompt_frame::CachedAssistantBody {
-                            token_ids: Vec::new(),
-                            text,
-                        }
-                    });
                     m.asst_turn_cache.insert(
                         fp,
-                        hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                            reasoning,
-                            tools: Vec::new(),
-                            content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                                token_ids: seq,
-                                text: String::new(),
-                            }),
-                        },
+                        crate::qwen::qwen_cached_turn_entry(tok, seq, started_in_think),
                     )
                 },
                 &cache_action,
@@ -5792,12 +6030,11 @@ pub fn generate(
 
         let mut generated = 0;
         let mut streamed_tokens: Vec<u32> = Vec::new();
-        // `bytes_fed_to_filter` is the index into the freshly-decoded
-        // byte stream past which we have not yet handed bytes to the
-        // filter. The filter owns UTF-8 boundary buffering and any
-        // future arch quirks (Gemma 4 marker holdback, strip-think,
-        // byte-level stop_at); see crates/engine/src/eos_filter.rs.
-        let mut bytes_fed_to_filter = 0usize;
+        // Raw bytes of `streamed_tokens`, grown one token at a time; each
+        // token's delta goes to the filter, which owns UTF-8 boundary
+        // buffering and any future arch quirks (Gemma 4 marker holdback,
+        // strip-think, byte-level stop_at); see crates/engine/src/eos_filter.rs.
+        let mut stream_bytes: Vec<u8> = Vec::new();
         let mut filter = EosFilter::new(EosFilterConfig::default());
 
         for _ in 0..max_tokens {
@@ -5820,9 +6057,9 @@ pub fn generate(
                 streamed_tokens.len() - 1,
                 t0.elapsed().as_millis() as u64,
             );
-            let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-            let new_bytes = &all_bytes[bytes_fed_to_filter..];
-            bytes_fed_to_filter = all_bytes.len();
+            let fed = stream_bytes.len();
+            tokenizer.decode_token_bytes_into(next_token, &mut stream_bytes);
+            let new_bytes = &stream_bytes[fed..];
             if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
                 let text = std::str::from_utf8(&text_bytes).unwrap();
                 let _ = writeln!(

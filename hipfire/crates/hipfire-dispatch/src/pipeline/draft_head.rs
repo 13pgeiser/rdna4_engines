@@ -58,6 +58,22 @@ pub struct DraftHeadLayout {
     pub full_hold: u32,
 }
 
+/// See [`DraftHead::request_state`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DraftHeadRequestState {
+    pub full_steps: u32,
+    pub margin: f32,
+}
+
+impl Default for DraftHeadRequestState {
+    fn default() -> Self {
+        Self {
+            full_steps: 0,
+            margin: f32::INFINITY,
+        }
+    }
+}
+
 pub struct DraftHead {
     /// Lower-bit ranking copy, rows in the layout order (`None` = rank the
     /// source head).
@@ -65,7 +81,8 @@ pub struct DraftHead {
     /// Top-8 re-score scratch; present only when re-scoring.
     partial: Option<GpuTensor>,
     logits: GpuTensor,
-    /// Draft token id, then (with re-scoring) its f32 logit margin.
+    /// Draft token id, then (with re-scoring) its f32 logit margin, the 8
+    /// re-scored candidates and their exact logits.
     top1: GpuTensor,
     rotation: GpuTensor,
     /// 0 = whole vocabulary always, rows in token order.
@@ -76,6 +93,9 @@ pub struct DraftHead {
     full_hold: u32,
     full_steps: u32,
     margin: f32,
+    /// Last draft's re-scored `(token, exact logit)` candidates (re-scoring
+    /// only; zeroed otherwise).
+    candidates: [(u32, f32); 8],
 }
 
 /// Ranked row count and the `(front, special, tail)` order the re-score
@@ -91,44 +111,6 @@ fn ranking(
         (front, 0) => (front + vocab - special, (front, special, vocab - special)),
         (front, _) => (vocab, (front, special, vocab - special)),
     }
-}
-
-/// `head` (`vocab` equal rows) reordered `[0, front) ++ [special, vocab)
-/// ++ [front, special)`; `front == 0` keeps it.
-fn front_first(
-    gpu: &mut Gpu,
-    head: GpuTensor,
-    front: usize,
-    special: usize,
-    vocab: usize,
-) -> hip_bridge::HipResult<GpuTensor> {
-    if front == 0 {
-        return Ok(head);
-    }
-    let stride = head.buf.size() / vocab;
-    let out = match gpu.alloc_tensor(&head.shape, head.dtype) {
-        Ok(out) => out,
-        Err(error) => {
-            let _ = gpu.free_tensor(head);
-            return Err(error);
-        }
-    };
-    let mut dst = 0;
-    let mut copied = Ok(());
-    for (start, end) in [(0, front), (special, vocab), (front, special)] {
-        let bytes = (end - start) * stride;
-        copied = copied
-            .and_then(|_| gpu.memcpy_dtod_at_auto(&out.buf, dst, &head.buf, start * stride, bytes));
-        dst += bytes;
-    }
-    let copied = copied.and_then(|_| gpu.hip.device_synchronize());
-    // Back to the device: nothing else reuses a pooled vocab-sized copy.
-    let freed = gpu.release_tensor_immediate(head);
-    if let Err(error) = copied.and(freed) {
-        let _ = gpu.free_tensor(out);
-        return Err(error);
-    }
-    Ok(out)
 }
 
 /// What [`DraftHead::new`] builds for a `head_dtype` head: the ranking-copy
@@ -161,25 +143,25 @@ fn plan(
 impl DraftHead {
     /// `(resident, load scratch)` device bytes [`Self::new`] takes for a
     /// `head_dtype` head: what the head keeps, and the most it holds on top
-    /// of that while building — the F32 requant scratch, or the unordered
-    /// copy while rows are reordered. Both go back to the device, not the
-    /// pool, before `new` returns.
+    /// of that while building — the row-chunked F32 requant scratch
+    /// (`Gpu::REQUANT_G256_CHUNK_ROWS` rows), which goes back to the device,
+    /// not the pool, before `new` returns.
     pub fn device_bytes(
         head_dtype: DType,
         layout: DraftHeadLayout,
         policy: DraftHeadPolicy,
     ) -> Option<(usize, usize)> {
-        let (copy_format, rescore, front) = plan(head_dtype, layout, policy);
+        let (copy_format, rescore, _) = plan(head_dtype, layout, policy);
         let mut resident = layout
             .vocab
             .checked_mul(std::mem::size_of::<f32>())?
-            .checked_add(8)?
+            .checked_add(Gpu::TOPK8_OUT_BYTES)?
             .checked_add(layout.hidden.checked_mul(std::mem::size_of::<f32>())?)?;
         let mut scratch = 0;
         if let Some(format) = copy_format {
             let (values, copy) = Gpu::requant_g256_bytes(layout.vocab, layout.hidden, format)?;
             resident = resident.checked_add(copy)?;
-            scratch = if front == 0 { values } else { values.max(copy) };
+            scratch = values;
         }
         if rescore {
             resident = resident.checked_add(Gpu::TOPK8_PARTIAL_BYTES)?;
@@ -197,14 +179,21 @@ impl DraftHead {
         let mut owned: Vec<GpuTensor> = Vec::with_capacity(5);
         let allocated = (|| -> hip_bridge::HipResult<()> {
             if let Some(format) = copy_format {
-                let copy = gpu.requant_g256(head, layout.vocab, layout.hidden, format)?;
-                owned.push(front_first(gpu, copy, front, layout.special, layout.vocab)?);
+                // Requantized straight into the layout order: no unordered
+                // copy beside the ordered one.
+                let (front, special, vocab) = (front, layout.special, layout.vocab);
+                let ranges: &[(usize, usize)] = if front == 0 {
+                    &[(0, vocab)]
+                } else {
+                    &[(0, front), (special, vocab), (front, special)]
+                };
+                owned.push(gpu.requant_g256_rows(head, vocab, layout.hidden, format, ranges)?);
             }
             if rescore {
                 owned.push(gpu.zeros(&[Gpu::TOPK8_PARTIAL_BYTES], DType::Raw)?);
             }
             owned.push(gpu.zeros(&[layout.vocab], DType::F32)?);
-            owned.push(gpu.zeros(&[8], DType::Raw)?);
+            owned.push(gpu.zeros(&[Gpu::TOPK8_OUT_BYTES], DType::Raw)?);
             owned.push(gpu.zeros(&[layout.hidden], DType::F32)?);
             Ok(())
         })();
@@ -231,6 +220,7 @@ impl DraftHead {
             full_hold: layout.full_hold,
             full_steps: 0,
             margin: f32::INFINITY,
+            candidates: [(0, f32::NEG_INFINITY); 8],
         })
     }
 
@@ -242,6 +232,25 @@ impl DraftHead {
         }
     }
 
+    /// Request-local draft policy: the full-vocabulary hold left and the
+    /// last draft's margin. Ranking weights and scratch are not included.
+    pub fn request_state(&self) -> DraftHeadRequestState {
+        DraftHeadRequestState {
+            full_steps: self.full_steps,
+            margin: self.margin,
+        }
+    }
+
+    pub fn set_request_state(&mut self, state: DraftHeadRequestState) {
+        self.full_steps = state.full_steps;
+        self.margin = state.margin;
+    }
+
+    /// The policy a freshly built head starts from.
+    pub fn reset_request_state(&mut self) {
+        self.set_request_state(DraftHeadRequestState::default());
+    }
+
     /// Rank `hidden` (`[hidden]` F32) and return the draft token id.
     pub fn draft(
         &mut self,
@@ -249,6 +258,26 @@ impl DraftHead {
         head: &GpuTensor,
         hidden: &GpuTensor,
     ) -> Result<u32, DispatchError> {
+        let top1 = self.top1.sub_offset(0, Gpu::TOPK8_OUT_BYTES);
+        self.draft_enqueue(gpu, head, hidden, &top1)?;
+        let mut top = [0u8; Gpu::TOPK8_OUT_BYTES];
+        let read = if self.partial.is_some() { top.len() } else { 8 };
+        hip(gpu.hip.memcpy_dtoh(&mut top[..read], &top1.buf))?;
+        self.draft_finish(&top[..read])
+    }
+
+    /// The device work of [`Self::draft`]: rank `hidden` (`[hidden]` F32)
+    /// into `top1_out` (a Raw tensor of at least `Gpu::TOPK8_OUT_BYTES`
+    /// bytes): projection, then the re-score or the argmax. Counts down the
+    /// full-vocabulary hold exactly as `draft` does; the result is parsed by
+    /// [`Self::draft_finish`] once the caller has downloaded `top1_out`.
+    pub fn draft_enqueue(
+        &mut self,
+        gpu: &mut Gpu,
+        head: &GpuTensor,
+        hidden: &GpuTensor,
+        top1_out: &GpuTensor,
+    ) -> Result<(), DispatchError> {
         let (ranked, order) = ranking(self.front, self.special, self.vocab, self.full_steps);
         self.full_steps = self.full_steps.saturating_sub(1);
         let ranking_head = self.copy.as_ref().unwrap_or(head);
@@ -288,16 +317,39 @@ impl DraftHead {
                 head,
                 x,
                 partial,
-                &self.top1,
+                top1_out,
             ))?;
         } else {
-            execute_argmax(gpu, &self.logits, &self.top1, 1, ranked)?;
+            execute_argmax(gpu, &self.logits, top1_out, 1, ranked)?;
         }
-        let mut top = [0u8; 8];
-        hip(gpu.hip.memcpy_dtoh(&mut top, &self.top1.buf))?;
-        let token = u32::from_ne_bytes([top[0], top[1], top[2], top[3]]);
+        Ok(())
+    }
+
+    /// Parse a downloaded `top1_out` of [`Self::draft_enqueue`] (its first
+    /// `Gpu::TOPK8_OUT_BYTES` bytes with re-scoring, 8 bytes without): the
+    /// draft token, the margin and the re-scored candidates, as `draft`.
+    pub fn draft_finish(&mut self, top: &[u8]) -> Result<u32, DispatchError> {
+        let need = if self.partial.is_some() {
+            Gpu::TOPK8_OUT_BYTES
+        } else {
+            8
+        };
+        if top.len() < need {
+            return Err(DispatchError::Hip(format!(
+                "draft result holds {} bytes, expected {need}",
+                top.len()
+            )));
+        }
+        let word = |i: usize| [top[4 * i], top[4 * i + 1], top[4 * i + 2], top[4 * i + 3]];
+        let token = u32::from_ne_bytes(word(0));
         self.margin = if self.partial.is_some() {
-            f32::from_ne_bytes([top[4], top[5], top[6], top[7]])
+            for (w, candidate) in self.candidates.iter_mut().enumerate() {
+                *candidate = (
+                    u32::from_ne_bytes(word(2 + w)),
+                    f32::from_ne_bytes(word(10 + w)),
+                );
+            }
+            f32::from_ne_bytes(word(1))
         } else {
             f32::INFINITY
         };
@@ -314,6 +366,14 @@ impl DraftHead {
     /// re-scored candidates (infinite without re-scoring).
     pub fn margin(&self) -> f32 {
         self.margin
+    }
+
+    /// The last draft's 8 re-scored candidates as `(token, exact logit)`:
+    /// the support a sampled draft is drawn from. `None` without re-scoring,
+    /// where [`Self::logits`] is the whole vocabulary in token order (the
+    /// reordered layout is used only with re-scoring).
+    pub fn rescored_candidates(&self) -> Option<&[(u32, f32); 8]> {
+        self.partial.as_ref().map(|_| &self.candidates)
     }
 
     /// Logits of the last draft, rows in the ranking layout.

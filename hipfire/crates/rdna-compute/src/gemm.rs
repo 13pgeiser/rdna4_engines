@@ -5,7 +5,8 @@
 //! Batched GEMM prefill methods for RDNA GPUs.
 
 use crate::dispatch::{
-    DType, Gpu, GpuTensor, FP8_WMMA_MIN_BATCH, LLOYD_MQ3_GROUP_BYTES, LLOYD_MQ4_GROUP_BYTES,
+    launch_params_blob, DType, Gpu, GpuTensor, FP8_WMMA_MIN_BATCH, LLOYD_MQ3_GROUP_BYTES,
+    LLOYD_MQ4_GROUP_BYTES,
 };
 use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult};
@@ -24,6 +25,153 @@ pub struct F2GdnTargets<'a> {
     pub eps: f32,
 }
 
+// Dispatch settings are process-wide, like FeatureFlags; resolve off the hot path.
+static DISPATCH_IU4_SYMFOLD: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")
+});
+
+static DISPATCH_GFX1151_QKVZA_WAVE64: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_WAVE64", false)
+});
+
+static DISPATCH_GFX1151_QKV_ALL_BUFFER_CPOL: LazyLock<String> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_GFX1151_QKV_ALL_BUFFER_CPOL").unwrap_or_default().to_ascii_lowercase()
+});
+
+static DISPATCH_GFX1151_QKV_X_BUFFER: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_QKV_X_BUFFER", false)
+});
+
+static DISPATCH_GFX1151_WEIGHT_BUFFER_LOADS: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS", false)
+});
+
+static DISPATCH_GFX1151_WEIGHT_BUFFER_QKVZA: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_WEIGHT_BUFFER_QKVZA", false)
+});
+
+static DISPATCH_GFX1151_QKVZA_X_BUFFER_LARGE: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_X_BUFFER_LARGE", false)
+});
+
+static DISPATCH_GFX1151_QKVZA_ALL_BUFFER_CPOL: LazyLock<String> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_ALL_BUFFER_CPOL").unwrap_or_default().to_ascii_lowercase()
+});
+
+static DISPATCH_GFX1151_QKVZA_LDSX8_BUFFER: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_LDSX8_BUFFER", false)
+});
+
+static DISPATCH_GFX1151_QKVZA_PAIR_BUFFER: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_PAIR_BUFFER", false)
+});
+
+static DISPATCH_GFX1151_QKVZA_K2048_HOIST: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_K2048_HOIST", false)
+});
+
+static DISPATCH_GFX1151_QKVZA_R2: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_R2", false)
+});
+
+static DISPATCH_GFX1151_QKVZA_R2_BUFFER: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_R2_BUFFER", false)
+});
+
+static DISPATCH_GFX1151_QKVZA_R4_STREAM: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_R4_STREAM", false)
+});
+
+static DISPATCH_GFX1151_QKVZA_WAVE64_SHARE_X: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_WAVE64_SHARE_X", false)
+});
+
+static DISPATCH_RDNA3_QKVZA_R2: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_RDNA3_QKVZA_R2", false)
+});
+
+static DISPATCH_QKVZA_CPOL: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_QKVZA_CPOL").as_deref() == Ok("slc")
+});
+
+static DISPATCH_IU4_V2C: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_IU4_V2C").as_deref() != Ok("0")
+});
+
+static DISPATCH_IU4_V2B: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_IU4_V2B").as_deref() != Ok("0")
+});
+
+static DISPATCH_G12_RASTER: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_G12_RASTER").as_deref() != Ok("0")
+});
+
+static DISPATCH_IU4_X5: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_IU4_X5").as_deref() != Ok("0")
+});
+
+static DISPATCH_V2C_ADDEPI: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_V2C_ADDEPI").as_deref() != Ok("0")
+});
+
+static DISPATCH_V2B_ADDEPI: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_V2B_ADDEPI").as_deref() != Ok("0")
+});
+
+static DISPATCH_GFX1100_DENSE_GATE_UP_STAGE_X32: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32", true)
+});
+
+static DISPATCH_GFX1100_DENSE_GATE_UP_PAIR: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR", false)
+});
+
+static DISPATCH_GFX1100_DENSE_GATE_UP_PAIR2: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR2", false)
+});
+
+static DISPATCH_GFX1100_DENSE_GATE_UP_DOT_REFORM: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_DOT_REFORM", false)
+});
+
+static DISPATCH_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH", false)
+});
+
+static DISPATCH_GFX1100_DENSE_GATE_UP_SETPRIO: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_SETPRIO", false)
+});
+
+static DISPATCH_GFX1100_DENSE_GATE_UP_LANE0_HEADERS: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_LANE0_HEADERS", false)
+});
+
+static GATE_UP_BT: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(true)
+});
+
+#[inline]
+fn gfx12_bt_tile(batch_size: usize) -> usize {
+    if !*GATE_UP_BT || batch_size < 64 {
+        return 1;
+    }
+    // Exact divisors take precedence over masked tiles, including N >= 192.
+    const TILES: [(usize, usize); 3] = [(192, 12), (128, 8), (64, 4)];
+    for (tokens, tile) in TILES {
+        if batch_size % tokens == 0 {
+            return tile;
+        }
+    }
+    for (tokens, tile) in TILES {
+        if batch_size >= tokens {
+            return tile;
+        }
+    }
+    unreachable!("batch sizes below 64 returned above")
+}
+
 /// `HIPFIRE_QWEN4_F16_WMMA=0` keeps Qwen4 prefill on the bit-exact F32 arms
 /// (grouped MoE gate/up and down, BF16 dense projections).  The F16 WMMA arms
 /// are not bit-exact (F16 dequant/inputs); each was admitted by KLD against
@@ -31,18 +179,179 @@ pub struct F2GdnTargets<'a> {
 pub(crate) static QWEN4_F16_WMMA: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     hipfire_config::developer_var("HIPFIRE_QWEN4_F16_WMMA").map_or(true, |v| v.trim() != "0")
 });
-/// `HIPFIRE_QWEN4_F16_WMMA_GFX1201=1` opts gfx1201 into its gfx12 WMMA
-/// kernels for the F16 WMMA route (the BF16 projections and the HC read).
-/// Default off: the route is not bit-exact and has no Flash-Next KLD
-/// reference yet, so gfx1201 keeps the multirow/SIMT arms it ran before.
-/// Other arches are untouched.  Read once.
+/// `HIPFIRE_QWEN4_F16_WMMA_GFX1201` runs gfx1201's F16 WMMA route on its
+/// gfx12 WMMA kernels (the BF16 projections and the HC read). Default on:
+/// not bit-exact, admitted by the Flash-Next KLD check against the BF16
+/// teacher; `0` keeps the multirow/SIMT arms.
+/// The M=1 shared selector remains on exact multirow; U1a owns its fusion.
+/// Capture/retained recording and other arches keep their existing routes.
 pub(crate) static QWEN4_F16_WMMA_GFX1201: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| {
-        hipfire_config::developer_bool("HIPFIRE_QWEN4_F16_WMMA_GFX1201", false)
+        hipfire_config::developer_bool("HIPFIRE_QWEN4_F16_WMMA_GFX1201", true)
     });
+/// `HIPFIRE_QWEN4_MOE_X_LDS` (`auto` | `1` | `0`, default `auto`): on exact
+/// gfx1151 the F16 WMMA grouped MoE gate/up SiLU and down GEMMs take the
+/// entries whose row-tile waves share each expert run's X through LDS
+/// (`gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out_x4`,
+/// `gemm_mq4g128v2_moe_grouped_wmma_gfx1151_x8_bf16out`), bitwise the
+/// per-wave entries. See [`qwen4_moe_x_lds_armed`].  Read once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Qwen4MoeXLds {
+    /// Unset, `auto` or any other value: armed where the F16 WMMA MoE route runs.
+    Auto,
+    /// `1`: forced wherever admissible (exact gfx1151, F16 WMMA MoE route).
+    On,
+    /// `0`: the kill switch; the per-wave entries everywhere.
+    Off,
+}
+
+impl Qwen4MoeXLds {
+    fn parse(raw: Option<&str>) -> Self {
+        match raw {
+            Some("1") => Self::On,
+            Some("0") => Self::Off,
+            _ => Self::Auto,
+        }
+    }
+}
+
+pub(crate) static QWEN4_MOE_X_LDS: std::sync::LazyLock<Qwen4MoeXLds> = std::sync::LazyLock::new(|| {
+    Qwen4MoeXLds::parse(hipfire_config::process_value("HIPFIRE_QWEN4_MOE_X_LDS").as_deref())
+});
+
+/// Whether a Qwen4 grouped MoE GEMM takes the X-LDS entry. The entries exist
+/// for the F16 WMMA MoE route on exact gfx1151 only, so `auto` and `1` arm
+/// exactly when that route runs: a layer whose symmetric IU4 arm is selected
+/// (`HIPFIRE_QWEN4_MOE_SYM_IU4`, verified-symmetric experts) never reaches
+/// them, and other architectures keep the per-wave entries.
+pub(crate) fn qwen4_moe_x_lds_armed(mode: Qwen4MoeXLds, exact_gfx1151: bool, sym_iu4_selected: bool) -> bool {
+    mode != Qwen4MoeXLds::Off && exact_gfx1151 && !sym_iu4_selected
+}
+/// Fuse the BF16 shared-down fold into its incumbent WMMA store; opt-in.
+static QWEN4_SHARED_DOWN_EPI: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_SHARED_DOWN_EPI", false)
+});
+/// Virtual concatenation of F16 projection rows; default off until G0 gates.
+static QWEN4_PROJ_REGIONS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_PROJ_REGIONS", false)
+});
+/// `HIPFIRE_QWEN4_MQ6_X4_PM` (on unless `0`) runs gfx1201's MQ6 F32 overwrite
+/// trunk GEMM from the certified builder module (`kernels::QWEN4_MQ6_X4_PM_GFX1201`,
+/// same arguments and output bytes as `gemm_mq6g256v2_wmma_gfx12_bt8_x4`, its own
+/// 256-token grid) instead of the hipcc kernel, and gfx1151's large MQ6 overwrite
+/// launches (see [`QWEN4_MQ6_X4_PM_MIN_M_GFX1151`]) from
+/// `kernels::QWEN4_MQ6_X4_PM_GFX1151`. `0` keeps the hipcc kernels. Read once.
+static QWEN4_MQ6_X4_PM: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_MQ6_X4_PM", true)
+});
+/// `HIPFIRE_QWEN4_SHARED_GU_PM` (on unless `0`) runs gfx1151's Flash-Next shared-expert
+/// gate/up (the gate and up F16 WMMA GEMMs, `shared_expert_activation_bf16_f32` and the
+/// shared down's F32 -> F16 hidden conversion) as one launch of the certified builder module
+/// `kernels::QWEN4_SHARED_GU_PM_GFX1151`, byte-identical (F16 hidden, post-sigmoid selector,
+/// everything downstream). `0` keeps the chain. Read once.
+static QWEN4_SHARED_GU_PM: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_SHARED_GU_PM", true)
+});
+/// Waves (16 channels each) per workgroup of the entry the route launches: the
+/// `_w8` entry (128 channels x 128 tokens per workgroup). The `_w4` entry is the oracle's
+/// comparison arm.
+pub const QWEN4_SHARED_GU_PM_WAVES: u8 = 8;
+/// Shape limits of the fused shared gate/up kernel: `m` channels a multiple of 16, `k` a
+/// multiple of 64 (at least 64), at least one token, and the weight and X byte extents
+/// below 2^31 (32-bit buffer offsets).
+pub const fn qwen4_shared_gu_pm_shape(m: usize, k: usize, n: usize) -> bool {
+    m > 0
+        && m % 16 == 0
+        && k >= 64
+        && k % 64 == 0
+        && n > 0
+        && (m as u128) * (k as u128) * 2 < (1u128 << 31)
+        && (n as u128) * (k as u128) * 2 < (1u128 << 31)
+        && (n as u128) * (m as u128) * 2 < (1u128 << 31)
+}
+/// Channels per workgroup (eight waves of sixteen) of `mtp_dense_det_pm_gfx1151_w8`.
+pub const MTP_DENSE_DET_PM_TILE_M: usize = 128;
+/// Projection rows (tokens) per workgroup of `mtp_dense_det_pm_gfx1151_w8`.
+pub const MTP_DENSE_DET_PM_TILE_N: usize = 256;
+/// Entry of the standalone MTP dense DET module (`kernels::MTP_DENSE_DET_PM_GFX1151`).
+pub const MTP_DENSE_DET_PM_ENTRY: &str = "mtp_dense_det_pm_gfx1151_w8";
+/// Module and entry of the MTP append DET Q8_0 -> F16 weight converter
+/// (`kernels::MTP_Q8_DET_PM_GFX1151`, launched by `Gpu::ensure_q8_0_f16_shadow`).
+pub const MTP_Q8_DET_PM_MODULE: &str = "mtp_q8_det_pm_gfx1151";
+pub const MTP_Q8_DET_PM_ENTRY: &str = "mtp_q8_0_to_f16_pm_gfx1151";
+/// Shape limits of the standalone MTP dense DET F16 WMMA kernel: `m` channels a multiple of 16,
+/// `k` a multiple of 64 (at least 64), at least one projection row, the A16 (`m*k*2`), X16
+/// (`n*k*2`) and Y32 (`n*m*4`) byte extents below 2^31 (32-bit buffer offsets) and the
+/// `ceil(n / 256)` grid-y within 16 bits. One fixed tile, no split-K: no other bound.
+pub const fn mtp_dense_det_pm_shape(m: usize, k: usize, n: usize) -> bool {
+    m > 0
+        && m % 16 == 0
+        && k >= 64
+        && k % 64 == 0
+        && n > 0
+        && (m as u128) * (k as u128) * 2 < (1u128 << 31)
+        && (n as u128) * (k as u128) * 2 < (1u128 << 31)
+        && (n as u128) * (m as u128) * 4 < (1u128 << 31)
+        && ((n as u128) + (MTP_DENSE_DET_PM_TILE_N as u128) - 1) / (MTP_DENSE_DET_PM_TILE_N as u128) <= 0xffff
+}
+/// gfx1151 selective PM route (`HIPFIRE_QWEN4_MQ6_X4_PM`): the MQ6 X-LDS overwrite
+/// launches (F32, BF16 output, and the a/b/z regions fold, all 128-row `_w8` entries of
+/// `kernels::QWEN4_MQ6_X4_PM_GFX1151`, 256-token tiles) run from the certified builder
+/// module at `M >= QWEN4_MQ6_X4_PM_MIN_M_GFX1151` rows (regions: summed rows) and
+/// `N >= QWEN4_MQ6_X4_PM_MIN_N_GFX1151` tokens, the large FN pp8192 trunk shapes. Smaller
+/// launches, the `_w4` entries and the HC-write (`hcw`) entry stay on hipcc / U3.
+pub const QWEN4_MQ6_X4_PM_MIN_M_GFX1151: usize = 2560;
+/// See [`QWEN4_MQ6_X4_PM_MIN_M_GFX1151`].
+pub const QWEN4_MQ6_X4_PM_MIN_N_GFX1151: usize = 2048;
+/// `HIPFIRE_QWEN4_MQ4_X4_PM` (on unless `0`): exact gfx1151 MQ4G256V2 prefill
+/// (`Gpu::gemm_mq4g256v2_xf16` and its regions / HC-write siblings) runs from the
+/// certified builder module `kernels::QWEN4_MQ4_X4_PM_GFX1151`; `0` keeps hipcc
+/// `gemm_mq4g256v2_residual_wmma_gfx11_bt4` for the plain F32 launch (same bytes) and
+/// leaves BF16 output, regions and the HC-write fusion off. Read once.
+static QWEN4_MQ4_X4_PM: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_MQ4_X4_PM", true)
+});
+/// Smallest token count of the gfx1151 MQ4G256V2 shared-F16 prefill route: the floor of
+/// the hipcc BT4 route it replaces (below it the generic projection keeps its routes);
+/// one 256-token PM tile handles any partial N above it.
+pub const QWEN4_MQ4_X4_MIN_N_GFX1151: usize = 96;
+
+/// Header-planner counterpart of the launcher's selective native MQ6 arm.
+/// The process-frozen switch is supplied explicitly so shape policy is pure.
+pub(crate) fn mq6_x4_pm_gfx1151_selected(
+    arch: &str, enabled: bool, m: usize, n: usize,
+) -> bool {
+    enabled && arch == "gfx1151" && mq6_x4_pm_gfx1151_shape(m, n)
+}
+
+/// Shared HC-down tile admissions. Capture/recording retain their incumbent
+/// gfx1151 tile; gfx1201's split-K choice is independent of those modes.
+pub(crate) fn hc_down_tile_selected(
+    arch: &str, enabled: bool, m: usize, k: usize, rows: usize,
+    recording: bool, capturing: bool,
+) -> bool {
+    enabled && match arch {
+        "gfx1201" => m == 320 && k % 256 == 0,
+        "gfx1151" => m == 320 && k == 10240 && rows >= 2048
+            && !recording && !capturing,
+        _ => false,
+    }
+}
+
+/// gfx1201's symmetric MoE uses the native image even when the gfx1151
+/// native-image kill switch is off.
+pub(crate) fn qwen4_moe_sym_native_selected(arch: &str, enabled: bool) -> bool {
+    arch == "gfx1201" || (arch == "gfx1151" && enabled)
+}
+/// HC-down (320 x 10240) tile, default on, `0` keeps the incumbent tile. gfx1151 (rows >= 2048):
+/// 160 x 64 pipelined instead of 64 x 64. gfx1201: [`LdsTileSplitK::HC_DOWN_GFX1201`] instead
+/// of the 64 x 128 / k64 split-K tile.
+static QWEN4_HC_DOWN_TILE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_DOWN_TILE", true)
+});
 /// Tokens from which the F16 WMMA arms are used (measured on gfx1151; the MoE gate/up
 /// arm is slower below ~450; the others break even or win).
-pub(crate) const QWEN4_F16_WMMA_MIN_TOKENS: usize = 512;
+pub const QWEN4_F16_WMMA_MIN_TOKENS: usize = 512;
 
 /// One instantiation of the parameterised LDS-staged WMMA GEMM
 /// (`kernels/src/gemm_f16_x_f16_wmma_lds256.hip`).
@@ -145,8 +454,8 @@ impl LdsTile {
 
 /// One tile of the split-K LDS WMMA GEMM
 /// (`kernels/src/gemm_f16_x_f16_wmma_lds_splitk.hip`, gfx1201 and gfx1151):
-/// block `bm × bn`, wave `wm × wn`, K staged 64 at a time, optional software
-/// pipelining and a deterministic `split`-way K split.
+/// block `bm × bn`, wave `wm × wn`, K staged `ks` (64 unless [`LdsTileSplitK::k_stage`]) at
+/// a time, optional software pipelining and a deterministic `split`-way K split.
 /// [`LdsTileSplitK::entry`] names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LdsTileSplitK {
@@ -156,6 +465,7 @@ pub struct LdsTileSplitK {
     pub wn: usize,
     pub pipe: bool,
     pub split: usize,
+    pub ks: usize,
 }
 
 impl LdsTileSplitK {
@@ -167,21 +477,59 @@ impl LdsTileSplitK {
             wn,
             pipe,
             split,
+            ks: 64,
         }
     }
+
+    /// The same tile with K staged `ks` (32 or 64) elements per barrier pair.
+    pub const fn k_stage(self, ks: usize) -> Self {
+        Self { ks, ..self }
+    }
+
+    /// gfx1201 HC input_mix_down (M = 320, K % 256 == 0, `HIPFIRE_QWEN4_HC_DOWN_TILE`):
+    /// 160 x 80 of five 32 x 80 waves, K staged 32, the 64 x 128 p_s4 tile's four K
+    /// splits, so the partials (and the reduced output) are bytewise that tile's.
+    /// 15360 B of LDS per workgroup instead of 24576. R9700, 320 x 10240, lab harness
+    /// (`qcal/release-0.4.1/hc-down-g0`): 447 -> 384 us at B = 4096, 887 -> 714 us at 8192.
+    pub const HC_DOWN_GFX1201: Self = Self::new(160, 80, 32, 80, true, 4).k_stage(32);
 
     /// Kernel entry-point name, matching `SK_KERNEL` in the .hip.
     pub fn entry(&self) -> String {
         format!(
-            "qwen4_wmma_lds_{}_{}_{}_{}_k64{}{}",
+            "qwen4_wmma_lds_{}_{}_{}_{}_k{}{}{}",
             self.bm,
             self.bn,
             self.wm,
             self.wn,
+            self.ks,
             if self.pipe { "_p" } else { "" },
             if self.split > 1 { format!("_s{}", self.split) } else { String::new() }
         )
     }
+}
+
+/// Static entry names for the four admitted pitched, unsplit gfx1201 tiles.
+fn splitk_ld_entry(tile: LdsTileSplitK) -> Option<&'static str> {
+    match (
+        tile.bm, tile.bn, tile.wm, tile.wn, tile.pipe, tile.split, tile.ks,
+    ) {
+        (64, 64, 32, 64, true, 1, 64) => Some("qwen4_wmma_lds_64_64_32_64_k64_p_ld"),
+        (64, 128, 32, 64, true, 1, 64) => Some("qwen4_wmma_lds_64_128_32_64_k64_p_ld"),
+        (128, 128, 32, 64, false, 1, 64) => Some("qwen4_wmma_lds_128_128_32_64_k64_ld"),
+        (128, 256, 32, 64, false, 1, 64) => Some("qwen4_wmma_lds_128_256_32_64_k64_ld"),
+        _ => None,
+    }
+}
+
+/// Geometry admitted by the gfx1201-only pitched, unsplit LDS route.
+fn splitk_ld_supported(tile: LdsTileSplitK, k: usize, lda: usize, ldx: usize) -> bool {
+    k > 0
+        && k % 64 == 0
+        && lda >= k
+        && ldx >= k
+        && lda % 16 == 0
+        && ldx % 16 == 0
+        && splitk_ld_entry(tile).is_some()
 }
 
 /// Fused epilogue for [`Gpu::gemm_f16_x_f16_wmma_lds_epi`].
@@ -223,6 +571,9 @@ pub struct GemmEpilogue<'a> {
     /// F32 `[B, M]` residual the gated product is added to. Requires `gate`.
     /// May alias `y`.
     pub residual: Option<&'a GpuTensor>,
+    /// Round value, row gate, residual, product and sum to BF16 independently.
+    /// `gate` is `[B]`, rather than `[M]`; output remains BF16-rounded F32.
+    pub bf16_scaled_add: bool,
 }
 
 /// `GpuTensor` has no `Debug`, so print what actually identifies an epilogue:
@@ -247,6 +598,7 @@ impl<'a> GemmEpilogue<'a> {
     pub const ADDIN: u32 = 4;
     /// Bit 3 — `y = residual + gate[m] · value`.
     pub const GATED: u32 = 8;
+    pub const BF16_SCALED_ADD: u32 = 16;
 
     /// The compiled combinations, mask → entry-name suffix. These are the ones
     /// the FLUX single/double blocks use; the full 16-mask cross product is
@@ -258,6 +610,7 @@ impl<'a> GemmEpilogue<'a> {
         (Self::GATED, "_gr"),
         (Self::GATED | Self::ADDIN, "_gra"),
         (Self::ADDIN, "_a"),
+        (Self::BF16_SCALED_ADD, "_bsr"),
     ];
 
     /// The `EPI` bitmask this configuration selects. `0` is the plain
@@ -274,7 +627,9 @@ impl<'a> GemmEpilogue<'a> {
             mask |= Self::ADDIN;
         }
         // Validated as both-or-neither by the launcher before this is read.
-        if self.gate.is_some() || self.residual.is_some() {
+        if self.bf16_scaled_add {
+            mask |= Self::BF16_SCALED_ADD;
+        } else if self.gate.is_some() || self.residual.is_some() {
             mask |= Self::GATED;
         }
         mask
@@ -296,11 +651,12 @@ impl<'a> GemmEpilogue<'a> {
     fn describe(mask: u32) -> String {
         let mut out = String::new();
         for (bit, tag) in [
-            (Self::OUT_F16, "_o16"),
-            (Self::GELU, "g"),
-            (Self::GATED, "_gr"),
-            (Self::ADDIN, "a"),
-        ] {
+                    (Self::OUT_F16, "_o16"),
+                    (Self::GELU, "g"),
+                    (Self::GATED, "_gr"),
+                    (Self::ADDIN, "a"),
+                    (Self::BF16_SCALED_ADD, "_bsr"),
+                ] {
             if mask & bit != 0 {
                 // The first fragment carries the leading underscore; a bare
                 // GELU or ADDIN still needs one.
@@ -550,6 +906,13 @@ const PM_V2B_MODULE: &str = "gemm_mq4g256v2_residual_iu4_pm_v2b_gfx1151";
 const PM_V2B_SET: &str = "gemm_mq4g256v2_residual_iu4_pm_v2b_set_gfx1151";
 const PM_V2B_ADD: &str = "gemm_mq4g256v2_residual_iu4_pm_v2b_add_gfx1151";
 const PM_V2B_SILU: &str = "gemm_mq4g256v2_gate_up_silu_iu4_pm_v2b_gfx1151";
+/// A4-fusion stage-2 module (`kernels::GEMM_MQ4G256V2_GATE_UP_SILU_A4_IU4_PM_V2B_GFX1151`).
+const PM_V2B_A4_MODULE: &str = "gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151";
+/// Stage-1 retile twin of `PM_V2B_SILU` (same ABI; block 512, grid
+/// `[N/128, 2M/512]`), `HIPFIRE_V2B_A4_EPI=retile`.
+const PM_V2B_SILU_M512: &str = "gemm_mq4g256v2_gate_up_silu_iu4_pm_v2b_m512_gfx1151";
+/// Fused gate/up SiLU + down-proj A4 sidecar producer, `HIPFIRE_V2B_A4_EPI=1`.
+const PM_V2B_SILU_A4: &str = "gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151";
 /// The builder ADD touches the residual over epochs E-16..E-9, so it needs
 /// at least 16 K128 epochs.
 const PM_V2B_ADD_MIN_K: usize = 2048;
@@ -564,6 +927,42 @@ static V2B_PM_BUNDLE: LazyLock<BundleOverride> =
 #[inline]
 fn v2b_pm_image() -> HipResult<&'static [u8]> {
     g12_iu4_bundle(&V2B_PM_BUNDLE, kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151)
+}
+
+/// Developer same-binary A/B of the A4-fusion bundle:
+/// `HIPFIRE_V2B_A4_PM_BUNDLE=<path>` loads it from a file instead of the
+/// embedded image. Read once; an unreadable file fails every A4 launch.
+static V2B_A4_PM_BUNDLE: LazyLock<BundleOverride> =
+    LazyLock::new(|| g12_iu4_bundle_override("HIPFIRE_V2B_A4_PM_BUNDLE"));
+
+#[inline]
+fn v2b_a4_pm_image() -> HipResult<&'static [u8]> {
+    g12_iu4_bundle(
+        &V2B_A4_PM_BUNDLE,
+        kernels::GEMM_MQ4G256V2_GATE_UP_SILU_A4_IU4_PM_V2B_GFX1151,
+    )
+}
+
+/// `HIPFIRE_V2B_A4_EPI` arm of the gfx1151 V2B gate/up SiLU launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum A4Mode {
+    /// `retile`: the stage-1 m512 twin replaces the V2B SiLU launch; `h`
+    /// is written exactly as before.
+    Retile,
+    /// Unset, `1` or any other value (default): the fused kernel also writes
+    /// the down-proj A4 sidecar.
+    Fused,
+}
+
+/// Current `HIPFIRE_V2B_A4_EPI` arm. Read on every call (not cached) so one
+/// process can switch arms; `0` is the opt-out (unfused V2B SiLU + hin).
+/// Only exact gfx1151 V2B shapes are admitted (`Gpu::a4_epi_admitted`).
+fn v2b_a4_mode() -> Option<A4Mode> {
+    match hipfire_config::developer_var("HIPFIRE_V2B_A4_EPI").as_deref() {
+        Ok("0") => None,
+        Ok("retile") => Some(A4Mode::Retile),
+        _ => Some(A4Mode::Fused),
+    }
 }
 
 /// Builder twin of a hipcc V2B entry (gfx1151 only: the V2B tile is), with
@@ -641,6 +1040,30 @@ pub(crate) enum ResidualVerifyTier {
     Base,
 }
 
+/// Default MQ3-Lloyd mb4 (4x batch-tile) admission — the `HIPFIRE_MQ3_MB4`
+/// override dominates. Pure so CPU tests can pin the table.
+///
+/// gfx1100 bands measured 2026-10-09 on RX 7900 XTX, `qwen3.5-4b.mq3`
+/// (product bench, fresh-process interleaved arms): the 4x fanout loses
+/// below batch 64 (pp32 -12.3% forced), wins +17.1% at pp64 on the
+/// rows >= 4096 projections, and the residual kernel (rows 2560 < 4096)
+/// wins +7.4% forced at batch 128, is neutral at 256 (-0.9%) and loses at
+/// >= 512 (-8.8%). Other RDNA3 parts keep the historical
+/// batch >= 128 && rows >= 4096 floor pending their own measurement; the
+/// HFQ3-G256 (non-Lloyd) family keeps it too for the same reason.
+fn mq3_lloyd_mb4_default(arch: &str, arch_supports: bool, batch_size: usize, rows: usize) -> bool {
+    if !arch_supports {
+        return false;
+    }
+    if arch == "gfx1100" {
+        if rows >= 4096 {
+            return batch_size >= 64;
+        }
+        return (128..=191).contains(&batch_size);
+    }
+    batch_size >= 128 && rows >= 4096
+}
+
 fn mqv2_gfx11_bt_admitted(arch: &str, bits: u8) -> bool {
     match arch {
         "gfx1151" => matches!(bits, 2 | 3 | 5 | 6),
@@ -673,6 +1096,248 @@ fn mqv2_mw_waves(
         (Residual, 464..) => Some(8),
         (Residual, 416..=463) => Some(4),
         _ => None,
+    }
+}
+
+// Three-run Halo artifact sweeps for both output dtypes; unmeasured cases retain BT8/RW4.
+// This table is used by HIPFIRE_QWEN4_MQ6_X4_TILE=auto and, with it unset, inside the Qwen4 forward.
+// N=8192/2048 rows: cold-cache three-process sweep (qcal/release-0.4.1/mq6-exact/bench/profile.md).
+fn mq6_x4_halo_policy(m: usize, k: usize, n: usize) -> Option<[u8; 3]> {
+    match (m, k, n) {
+        (48, 2560, 1536 | 512 | 1131) => Some([8, 4, 2]),
+        (640, 2560, 1536) => Some([8, 8, 1]),
+        (640, 2560, 512) => Some([8, 4, 2]),
+        (640, 2560, 8192 | 2048) => Some([8, 8, 2]),
+        (512, 2560, 8192 | 2048) => Some([8, 8, 1]),
+        (2560, 6144, 1536 | 512 | 1131) => Some([8, 8, 1]),
+        (6144, 2560, 1536 | 512 | 1131) => Some([8, 8, 1]),
+        (10240 | 12288, 2560, 1536) => Some([12, 8, 2]),
+        (10240, 2560, 512) => Some([8, 8, 2]),
+        (10240, 2560, 1131 | 8192 | 2048) => Some([8, 8, 1]),
+        (12288, 2560, 512 | 1131 | 2048) => Some([8, 8, 1]),
+        (12288, 2560, 8192) => Some([8, 8, 2]),
+        _ => None,
+    }
+}
+
+// Regions (a/b/z fold, keyed on its total rows 48 + 48 + 6144) and HC-write twins: cold-cache
+// three-process sweep at the FN shapes, BF16 HC streams (qcal/release-0.4.1/pm-perf-fn/mq6timing).
+// N=8192: regions 7.18 -> 6.97 ms, HC-write 10.50 -> 10.10 ms. N=2048 HC-write keeps BT8/RW4.
+fn mq6_x4_halo_twin_policy(kind: Mq6X4Kind, m: usize, k: usize, n: usize) -> Option<[u8; 3]> {
+    match (kind, m, k, n) {
+        (Mq6X4Kind::Regions, 6240, 2560, 8192) => Some([8, 8, 2]),
+        (Mq6X4Kind::Regions, 6240, 2560, 2048) => Some([8, 8, 1]),
+        (Mq6X4Kind::Hcw, 2560, 6144, 8192) => Some([8, 8, 2]),
+        _ => None,
+    }
+}
+
+/// Whether an MQ6 overwrite launch of `m` rows (regions: summed rows) and `n` tokens is
+/// large enough for the gfx1151 PM module ([`QWEN4_MQ6_X4_PM_MIN_M_GFX1151`] /
+/// [`QWEN4_MQ6_X4_PM_MIN_N_GFX1151`]).
+const fn mq6_x4_pm_gfx1151_shape(m: usize, n: usize) -> bool {
+    m >= QWEN4_MQ6_X4_PM_MIN_M_GFX1151 && n >= QWEN4_MQ6_X4_PM_MIN_N_GFX1151
+}
+
+/// Largest output extent, in bytes, a gfx11 builder-module PM kernel can address. The
+/// PM entries build their Y (and HC-stream / mirror) buffer descriptors raw with
+/// `num_records = 0x7fffffff` and index them with 32-bit byte offsets, so a store at or
+/// past 2^31 bytes is silently dropped (and past 2^32 wraps onto the head of the
+/// buffer). The hipcc/U3 entries address with 64-bit pointers and are not bound by it.
+pub(crate) const PM_OUTPUT_EXTENT_LIMIT_BYTES: usize = i32::MAX as usize;
+
+/// `rows * width * elem_bytes` when it is a valid PM output extent
+/// (`<= PM_OUTPUT_EXTENT_LIMIT_BYTES`, i.e. `< 2^31`); `None` on overflow or when too large.
+pub(crate) fn pm_output_extent_bytes(rows: usize, width: usize, elem_bytes: usize) -> Option<usize> {
+    rows.checked_mul(width)?
+        .checked_mul(elem_bytes)
+        .filter(|&bytes| bytes <= PM_OUTPUT_EXTENT_LIMIT_BYTES)
+}
+
+/// Refuses a PM launch whose `what` output (`rows` of `width` elements of `elem_bytes`)
+/// reaches 2^31 bytes; call before any device write of the launch (X conversion, zeroing).
+/// Each output buffer is checked on its own, never an aggregate over regions.
+pub(crate) fn pm_check_output_extent(
+    what: &str, rows: usize, width: usize, elem_bytes: usize,
+) -> HipResult<()> {
+    if pm_output_extent_bytes(rows, width, elem_bytes).is_some() {
+        return Ok(());
+    }
+    let extent = rows
+        .checked_mul(width)
+        .and_then(|elems| elems.checked_mul(elem_bytes))
+        .map_or_else(|| "overflows usize".to_string(), |bytes| format!("{bytes} bytes"));
+    Err(hip_bridge::HipError::new(
+        1,
+        &format!(
+            "PM output extent: {what} {rows} rows x {width} x {elem_bytes} B = {extent} must be \
+             < 2^31 bytes (PM buffer descriptor and 32-bit byte offsets); slice the launch \
+             into token chunks whose output stays under 2^31 bytes"
+        ),
+    ))
+}
+
+/// Largest Y extent, in bytes, of the MoE symmetric IU4 builder-module down GEMM
+/// (`qwen4_moe_down_iu4_sym_pm_*`): it stores through the original Y base with a raw
+/// `0xffffffff` descriptor and a 32-bit global byte offset (`YOFF`), so the grouped-row
+/// BF16 output must stay `<= u32::MAX` bytes (>= 2^32 wraps onto the head of Y).
+pub(crate) const PM_MOE_DOWN_EXTENT_LIMIT_BYTES: usize = u32::MAX as usize;
+
+/// `grouped_rows * m * 2` (BF16 bytes of the `[grouped_rows, m]` down output) when it
+/// fits [`PM_MOE_DOWN_EXTENT_LIMIT_BYTES`]; `None` on overflow or when too large.
+pub(crate) fn pm_moe_down_extent_bytes(grouped_rows: usize, m: usize) -> Option<usize> {
+    grouped_rows
+        .checked_mul(m)?
+        .checked_mul(2)
+        .filter(|&bytes| bytes <= PM_MOE_DOWN_EXTENT_LIMIT_BYTES)
+}
+
+/// Refuses a MoE symmetric PM down launch whose actual grouped output (`grouped_rows`
+/// after tile padding, `m` output channels, BF16) exceeds the 32-bit byte offset.
+pub(crate) fn pm_check_moe_down_extent(func: &str, grouped_rows: usize, m: usize) -> HipResult<()> {
+    if pm_moe_down_extent_bytes(grouped_rows, m).is_some() {
+        return Ok(());
+    }
+    let extent = grouped_rows
+        .checked_mul(m)
+        .and_then(|elems| elems.checked_mul(2))
+        .map_or_else(|| "overflows usize".to_string(), |bytes| format!("{bytes} bytes"));
+    Err(hip_bridge::HipError::new(
+        0,
+        &format!(
+            "{func}: u32 PM MoE down extent {grouped_rows} grouped rows x {m} x 2 B = {extent} \
+             must be <= u32::MAX bytes (32-bit Y byte offset); slice the prefill into smaller \
+             row chunks"
+        ),
+    ))
+}
+
+/// Whether a PM launch's M/K/N kernel arguments and input descriptors are addressable:
+/// `m`, `k`, `n` fit the kernels' `i32` arguments, the weight stream
+/// `m * (k / 256) * group_bytes` stays within the raw `0x7fffffff` A descriptor
+/// (`<= i32::MAX`), and X (`n * k` F16) within its bounded `u32` descriptor field and
+/// 32-bit row offsets (`<= u32::MAX`). Checked math; overflow is `false`.
+pub(crate) fn pm_input_geometry_fits(m: usize, k: usize, n: usize, group_bytes: usize) -> bool {
+    let weight = m.checked_mul(k / 256).and_then(|groups| groups.checked_mul(group_bytes));
+    let x = n.checked_mul(k).and_then(|elems| elems.checked_mul(2));
+    m <= i32::MAX as usize
+        && k <= i32::MAX as usize
+        && n <= i32::MAX as usize
+        && weight.is_some_and(|bytes| bytes <= i32::MAX as usize)
+        && x.is_some_and(|bytes| bytes <= u32::MAX as usize)
+}
+
+/// Refuses a PM launch (`what`; regions: once per region with that region's `m`, so each
+/// weight is bounded on its own) whose geometry fails [`pm_input_geometry_fits`], before
+/// any device write of the launch.
+pub(crate) fn pm_check_input_geometry(
+    what: &str, m: usize, k: usize, n: usize, group_bytes: usize,
+) -> HipResult<()> {
+    if pm_input_geometry_fits(m, k, n, group_bytes) {
+        return Ok(());
+    }
+    Err(hip_bridge::HipError::new(
+        1,
+        &format!(
+            "PM input geometry: {what} M={m} K={k} N={n} (group {group_bytes} B) needs M, K, N <= \
+             i32::MAX, weight bytes M*(K/256)*{group_bytes} <= i32::MAX (raw A descriptor) and \
+             X bytes N*K*2 <= u32::MAX (bounded X descriptor); slice the launch"
+        ),
+    ))
+}
+
+/// [`pm_check_output_extent`] of an HC-stream buffer `[rows, 4 * m]`; `4 * m` is checked,
+/// an overflow is refused with the same extent error.
+pub(crate) fn pm_check_hc_streams_extent(
+    what: &str, rows: usize, m: usize, elem_bytes: usize,
+) -> HipResult<()> {
+    match m.checked_mul(4) {
+        Some(width) => pm_check_output_extent(what, rows, width, elem_bytes),
+        None => Err(hip_bridge::HipError::new(
+            1,
+            &format!(
+                "PM output extent: {what} stream width 4 * {m} overflows usize; slice the launch \
+                 into token chunks whose output stays under 2^31 bytes"
+            ),
+        )),
+    }
+}
+
+// U3 tiles: chosen by `mq6_x4_halo_policy` or an explicit HIPFIRE_QWEN4_MQ6_X4_TILE.
+fn mq6_x4_halo_tile(tile: [u8; 3], bf16: bool) -> (&'static str, usize, u32, usize) {
+    let kind = if bf16 { Mq6X4Kind::Bf16 } else { Mq6X4Kind::Plain };
+    let (name, rows, block) = mq6_x4_halo_entry(tile, kind);
+    (name, rows, block, tile[0] as usize)
+}
+
+/// Output form of a gfx1151 MQ6 X-LDS tile twin.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mq6X4Kind {
+    Plain,
+    Bf16,
+    Regions,
+    Hcw,
+}
+
+/// Pure U3 tile choice, shared by header planning and launch admission.
+/// `requested` is the already-resolved process flag/model-scope default.
+pub(crate) fn mq6_x4_tile_selected(
+    arch: &str, requested: Option<[u8; 3]>, kind: Mq6X4Kind,
+    m: usize, k: usize, n: usize,
+) -> Option<[u8; 3]> {
+    if arch != "gfx1151" {
+        return None;
+    }
+    let tile = match requested? {
+        [0, 0, 0] => match kind {
+            Mq6X4Kind::Plain | Mq6X4Kind::Bf16 => mq6_x4_halo_policy(m, k, n)?,
+            Mq6X4Kind::Regions | Mq6X4Kind::Hcw => mq6_x4_halo_twin_policy(kind, m, k, n)?,
+        },
+        explicit => explicit,
+    };
+    let twin = matches!(kind, Mq6X4Kind::Plain | Mq6X4Kind::Bf16);
+    (tile[0] != 12 || (twin && n % 192 == 0)).then_some(tile)
+}
+
+pub(crate) fn lds256_tile_source_selected(
+    is_gfx1151: bool, entry: &str,
+) -> (&'static str, &'static str) {
+    let qwen4_tile = matches!(
+        entry, "gemm_wmma_lds_64_64_32_64_k64" | "gemm_wmma_lds_64_64_32_64_k64_p"
+    );
+    if qwen4_tile && !is_gfx1151 {
+        ("qwen4_gemm_wmma_lds256", kernels::QWEN4_GEMM_F16_X_F16_WMMA_LDS256_SRC)
+    } else {
+        ("gemm_wmma_lds256", kernels::gemm_f16_x_f16_wmma_lds256_src(is_gfx1151))
+    }
+}
+
+/// Twin entry name, rows per workgroup (16 * RW) and block size (32 * RW).
+fn mq6_x4_halo_entry(tile: [u8; 3], kind: Mq6X4Kind) -> (&'static str, usize, u32) {
+    macro_rules! entry {
+        ($b:literal, $r:literal, $p:literal) => {
+            (match kind {
+                Mq6X4Kind::Plain => concat!("gemm_mq6g256v2_wmma_gfx11_u3_b", $b, "_r", $r, "_p", $p),
+                Mq6X4Kind::Bf16 => concat!("gemm_mq6g256v2_wmma_gfx11_u3_b", $b, "_r", $r, "_p", $p, "_bf16out"),
+                Mq6X4Kind::Regions => concat!("gemm_mq6g256v2_wmma_gfx11_u3_b", $b, "_r", $r, "_p", $p, "_regions"),
+                Mq6X4Kind::Hcw => concat!("gemm_mq6g256v2_wmma_gfx11_u3_b", $b, "_r", $r, "_p", $p, "_hcw"),
+            }, 16 * $r, 32 * $r)
+        };
+    }
+    match tile {
+        [8, 4, 1] => entry!(8, 4, 1),
+        [8, 4, 2] => entry!(8, 4, 2),
+        [8, 8, 1] => entry!(8, 8, 1),
+        [8, 8, 2] => entry!(8, 8, 2),
+        [12, 4, 1] => entry!(12, 4, 1),
+        [12, 4, 2] => entry!(12, 4, 2),
+        [12, 8, 1] => entry!(12, 8, 1),
+        [12, 8, 2] => entry!(12, 8, 2),
+        [16, 4, 1] => entry!(16, 4, 1),
+        [16, 4, 2] => entry!(16, 4, 2),
+        [16, 8, 1] => entry!(16, 8, 1),
+        [16, 8, 2] => entry!(16, 8, 2),
+        _ => unreachable!("tile override is parsed into the twelve supported entries"),
     }
 }
 
@@ -734,7 +1399,7 @@ impl Gpu {
     /// per-launch shape/pointer check ([`g12_iu4_b1_eligible`]).
     fn g12_iu4_isa_requested(&self) -> bool {
         self.mq4v2_symmetric
-            && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")
+            && *DISPATCH_IU4_SYMFOLD
             && self.flags.g12_iu4_isa
     }
 
@@ -967,32 +1632,35 @@ impl Gpu {
             return self.gemm_hfq4g128_mmq_gfx1151(a_raw, x, y, m, k, batch_size);
         }
         self.ensure_kernel("gemm_hfq4g128", kernels::GEMM_HFQ4G128_SRC, "gemm_hfq4g128")?;
-        let func = &self.functions["gemm_hfq4g128"];
-        let mut a_ptr = a_raw.buf.as_ptr();
-        let mut x_ptr = x.buf.as_ptr();
-        let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
-        let mut bs_val = batch_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut bs_val as *mut _ as *mut c_void,
-        ];
-        let batch_tiles = ((batch_size + 7) / 8) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, batch_tiles, 1],
+        let a_ptr = a_raw.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        // 8-row batch tiles ride grid.y: launch row pieces of at most
+        // GRID_YZ_MAX tiles with X/Y advanced to the piece's first row.
+        for (start, n) in crate::gemv::grid_yz_chunks(batch_size.div_ceil(8)) {
+            let row0 = start * 8;
+            let rows = (n * 8).min(batch_size - row0);
+            let x_ptr = crate::gemv::ptr_add_bytes(x.buf.as_ptr(), row0 * k * 4);
+            let y_ptr = crate::gemv::ptr_add_bytes(y.buf.as_ptr(), row0 * m * 4);
+            let bs_val = rows as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &a_ptr as *const _ as *mut c_void,
+                &x_ptr as *const _ as *mut c_void,
+                &y_ptr as *const _ as *mut c_void,
+                &m_val as *const _ as *mut c_void,
+                &k_val as *const _ as *mut c_void,
+                &bs_val as *const _ as *mut c_void,
+            ];
+            launch_params_blob!(
+                self,
+                "gemm_hfq4g128",
+                [m as u32, n as u32, 1],
                 [32, 1, 1],
                 0,
-                self.stream_ref(),
-                &mut params,
-            )
+                params; a_ptr, x_ptr, y_ptr, m_val, k_val, bs_val
+            )?;
         }
+        Ok(())
     }
 
     /// gfx1151 i8 MMQ dispatch helper for HFQ4-G128. Pre-quantizes X to
@@ -1927,7 +2595,7 @@ impl Gpu {
         let arch_supports_mb4 = self.arch_caps.supports_mq3_lloyd_mb4();
         let use_mb4 = match self.flags.mq3_mb4 {
             Some(_) => arch_supports_mb4,
-            None => arch_supports_mb4 && batch_size >= 128 && m >= 4096,
+            None => mq3_lloyd_mb4_default(self.arch.as_str(), arch_supports_mb4, batch_size, m),
         };
         if use_mb4 {
             return self.gemm_mq3g256_lloyd_residual_wmma_mb4(a_raw, x, y, m, k, batch_size);
@@ -2078,8 +2746,8 @@ impl Gpu {
         let total_m = qkv_m + z_m + beta_m + alpha_m;
         let arch_supports_mb4 = self.arch_caps.supports_mq3_lloyd_mb4();
         let use_mb4 = match self.flags.mq3_mb4 {
-            None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
+            None => mq3_lloyd_mb4_default(self.arch.as_str(), arch_supports_mb4, n, total_m),
         };
         if use_mb4 {
             return self.gemm_qkvza_mq3g256_lloyd_wmma_mb4(
@@ -2285,8 +2953,8 @@ impl Gpu {
         let total_m = q_m + k_m + v_m;
         let arch_supports_mb4 = self.arch_caps.supports_mq3_lloyd_mb4();
         let use_mb4 = match self.flags.mq3_mb4 {
-            None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
+            None => mq3_lloyd_mb4_default(self.arch.as_str(), arch_supports_mb4, n, total_m),
         };
         if use_mb4 {
             return self.gemm_qkv_mq3g256_lloyd_wmma_mb4(
@@ -2467,8 +3135,8 @@ impl Gpu {
         let total_m = gate_m + up_m;
         let arch_supports_mb4 = self.arch_caps.supports_mq3_lloyd_mb4();
         let use_mb4 = match self.flags.mq3_mb4 {
-            None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
+            None => mq3_lloyd_mb4_default(self.arch.as_str(), arch_supports_mb4, n, total_m),
         };
         if use_mb4 {
             return self.gemm_gate_up_mq3g256_lloyd_wmma_mb4(
@@ -3262,19 +3930,16 @@ impl Gpu {
         }
 
         let gfx1151_wave64 = self.arch_caps.is_gfx1151()
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_WAVE64", false);
-        let gfx1151_all_buffer_cpol_owned: String =
-            hipfire_config::developer_var("HIPFIRE_GFX1151_QKV_ALL_BUFFER_CPOL")
-                .unwrap_or_default()
-                .to_ascii_lowercase();
+            && *DISPATCH_GFX1151_QKVZA_WAVE64;
+        let gfx1151_all_buffer_cpol_owned: &str = &*DISPATCH_GFX1151_QKV_ALL_BUFFER_CPOL;
         let gfx1151_all_buffer_cpol = if self.arch_caps.is_gfx1151() && k == 2_048 {
-            gfx1151_all_buffer_cpol_owned.as_str()
+            gfx1151_all_buffer_cpol_owned
         } else {
             ""
         };
         let gfx1151_x_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKV_X_BUFFER", false);
+            && *DISPATCH_GFX1151_QKV_X_BUFFER;
         let cdna_wave64 = self.arch_caps.is_wave64_native()
             || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64)
             || gfx1151_wave64;
@@ -3661,39 +4326,36 @@ impl Gpu {
             self.arch_caps.is_gfx1100() && self.flags.rdna3_hfq4_qkvza_k2048 && k == 2_048;
         let gfx1151_k2048_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && (hipfire_config::developer_bool("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS", false)
-                || hipfire_config::developer_bool("HIPFIRE_GFX1151_WEIGHT_BUFFER_QKVZA", false));
+            && (*DISPATCH_GFX1151_WEIGHT_BUFFER_LOADS
+                || *DISPATCH_GFX1151_WEIGHT_BUFFER_QKVZA);
         let gfx1151_k2048_all_buffer = self.arch_caps.is_gfx1151() && k == 2_048;
         let gfx1151_k2048_hybrid_buffer =
             self.arch_caps.is_gfx1151() && k == 2_048 && total_m == 1_281;
         let gfx1151_k2048_x_buffer_large = self.arch_caps.is_gfx1151()
             && k == 2_048
             && total_m > 2_048
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_X_BUFFER_LARGE", false);
-        let gfx1151_k2048_all_buffer_cpol_owned: String =
-            hipfire_config::developer_var("HIPFIRE_GFX1151_QKVZA_ALL_BUFFER_CPOL")
-                .unwrap_or_default()
-                .to_ascii_lowercase();
+            && *DISPATCH_GFX1151_QKVZA_X_BUFFER_LARGE;
+        let gfx1151_k2048_all_buffer_cpol_owned: &str = &*DISPATCH_GFX1151_QKVZA_ALL_BUFFER_CPOL;
         let gfx1151_k2048_all_buffer_cpol = if self.arch_caps.is_gfx1151() && k == 2_048 {
-            gfx1151_k2048_all_buffer_cpol_owned.as_str()
+            gfx1151_k2048_all_buffer_cpol_owned
         } else {
             ""
         };
         let gfx1151_k2048_ldsx8_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_LDSX8_BUFFER", false);
+            && *DISPATCH_GFX1151_QKVZA_LDSX8_BUFFER;
         let gfx1151_k2048_pair_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_PAIR_BUFFER", false);
+            && *DISPATCH_GFX1151_QKVZA_PAIR_BUFFER;
         let gfx1151_k2048_hoist = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_K2048_HOIST", false);
+            && *DISPATCH_GFX1151_QKVZA_K2048_HOIST;
         let gfx1151_k2048_r2 = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_R2", false);
+            && *DISPATCH_GFX1151_QKVZA_R2;
         let gfx1151_k2048_r2_buffer = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_R2_BUFFER", false);
+            && *DISPATCH_GFX1151_QKVZA_R2_BUFFER;
         let gfx1151_k2048_r4_stream = self.arch_caps.is_gfx1151()
             && k == 2_048
             && total_m > 2_048
@@ -3701,14 +4363,14 @@ impl Gpu {
             && z_m.is_multiple_of(4)
             && beta_m.is_multiple_of(4)
             && alpha_m.is_multiple_of(4)
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_R4_STREAM", false);
+            && *DISPATCH_GFX1151_QKVZA_R4_STREAM;
         let gfx1151_wave64_share_x = self.arch_caps.is_gfx1151()
             && k == 2_048
-            && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_WAVE64_SHARE_X", false);
+            && *DISPATCH_GFX1151_QKVZA_WAVE64_SHARE_X;
         let rdna3_k2048_r2 =
-            rdna3_k2048 && hipfire_config::developer_bool("HIPFIRE_RDNA3_QKVZA_R2", false);
+            rdna3_k2048 && *DISPATCH_RDNA3_QKVZA_R2;
         let rdna3_k2048_cpol_slc = rdna3_k2048
-            && hipfire_config::developer_var("HIPFIRE_QKVZA_CPOL").as_deref() == Ok("slc");
+            && *DISPATCH_QKVZA_CPOL;
         let cdna_wave64 = self.arch_caps.is_wave64_native()
             || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64);
         let glimmer_qkvg_k6656_gfx1100 = self.arch_caps.is_gfx1100()
@@ -4045,7 +4707,6 @@ impl Gpu {
         }
         result
     }
-
     /// gfx1100/K=2048 QKVZA experiment that also prepares the DeltaNet beta
     /// and alpha scalars. The projection FMAs and reduction are identical to
     /// `fused_qkvza_hfq4g256`; only the two tiny output tails absorb the
@@ -4297,7 +4958,6 @@ impl Gpu {
             kernels::GEMM_QKVZA_TQ2G128_SRC,
             "gemm_qkvza_tq2g128",
         )?;
-        let func = &self.functions["gemm_qkvza_tq2g128"];
         let mut aqkv = a_qkv.buf.as_ptr();
         let mut az = a_z.buf.as_ptr();
         let mut ab = a_beta.buf.as_ptr();
@@ -4331,16 +4991,14 @@ impl Gpu {
             &mut n_val as *mut _ as *mut c_void,
         ];
         let total_m = (qkv_m + z_m + beta_m + alpha_m) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_size.div_ceil(8) as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        launch_params_blob!(
+            self,
+            "gemm_qkvza_tq2g128",
+            [total_m, batch_size.div_ceil(8) as u32, 1],
+            [32, 1, 1],
+            0,
+            params; aqkv, az, ab, aa, xp, yqkv, yz, yb, ya, q_m, z_m_val, b_m, a_m, k_val, n_val
+        )
     }
 
     pub fn gemm_qkvza_hfq4g256(
@@ -4653,7 +5311,6 @@ impl Gpu {
             )?;
             ("gemm_qkvza_hfq4g256", [32, 1, 1], 1)
         };
-        let func = &self.functions[func_name];
 
         let mut aq = a_qkv.buf.as_ptr();
         let mut az = a_z.buf.as_ptr();
@@ -4701,16 +5358,14 @@ impl Gpu {
             + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
             + crate::profile::gemv_hfq4g256_bytes(alpha_m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq4g256", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid_x, batch_tiles as u32, 1],
-                block,
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            func_name,
+            [grid_x, batch_tiles as u32, 1],
+            block,
+            0,
+            params; aq, az, ab, aa, xp, yq, yz, yb, ya, q_m, z_m_val, b_m, a_m, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -4777,7 +5432,6 @@ impl Gpu {
             kernels::GEMM_QKVZA_HFQ3G256_SRC,
             "gemm_qkvza_hfq3g256",
         )?;
-        let func = &self.functions["gemm_qkvza_hfq3g256"];
 
         let mut aqkv = a_qkv.buf.as_ptr();
         let mut az = a_z.buf.as_ptr();
@@ -4823,16 +5477,14 @@ impl Gpu {
             + crate::profile::gemm_hfq3g256_bytes(beta_m, k, batch_size)
             + crate::profile::gemm_hfq3g256_bytes(alpha_m, k, batch_size);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq3g256", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_qkvza_hfq3g256",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; aqkv, az, ab, aa, xp, yqkv, yz, yb, ya, q_m, z_m_val, b_m, a_m, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -4868,7 +5520,6 @@ impl Gpu {
             "gemm_qkvza_hfq3g256_dot2",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_qkvza_hfq3g256_dot2"];
 
         let mut aqkv = a_qkv.buf.as_ptr();
         let mut az = a_z.buf.as_ptr();
@@ -4916,16 +5567,14 @@ impl Gpu {
             + batch_size * k * 2;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq3g256_dot2", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_qkvza_hfq3g256_dot2",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; aqkv, az, ab, aa, xp, yqkv, yz, yb, ya, q_m, z_m_val, b_m, a_m, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -4961,7 +5610,6 @@ impl Gpu {
             "gemm_qkvza_hfq3g256_fp16",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_qkvza_hfq3g256_fp16"];
 
         let mut aqkv = a_qkv.buf.as_ptr();
         let mut az = a_z.buf.as_ptr();
@@ -5009,16 +5657,14 @@ impl Gpu {
             + batch_size * k * 2;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq3g256_fp16", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_qkvza_hfq3g256_fp16",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; aqkv, az, ab, aa, xp, yqkv, yz, yb, ya, q_m, z_m_val, b_m, a_m, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -5054,7 +5700,6 @@ impl Gpu {
             "gemm_qkvza_hfq4g256_fp16",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_qkvza_hfq4g256_fp16"];
 
         let mut aq = a_qkv.buf.as_ptr();
         let mut az = a_z.buf.as_ptr();
@@ -5104,16 +5749,14 @@ impl Gpu {
                   + batch_size * (qkv_m + z_m + beta_m + alpha_m) * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq4g256_fp16", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_qkvza_hfq4g256_fp16",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; aq, az, ab, aa, xp, yq, yz, yb, ya, q_m, z_m_val, b_m, a_m, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -5149,7 +5792,6 @@ impl Gpu {
             "gemm_qkvza_hfq4g256_fp16_wave64",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_qkvza_hfq4g256_fp16_wave64"];
 
         let mut aq = a_qkv.buf.as_ptr();
         let mut az = a_z.buf.as_ptr();
@@ -5204,16 +5846,14 @@ impl Gpu {
             "gemm_qkvza_hfq4g256_fp16_wave64",
             bytes,
         );
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid_x, batch_tiles as u32, 1],
-                [64, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_qkvza_hfq4g256_fp16_wave64",
+            [grid_x, batch_tiles as u32, 1],
+            [64, 1, 1],
+            0,
+            params; aq, az, ab, aa, xp, yq, yz, yb, ya, q_m, z_m_val, b_m, a_m, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -5249,7 +5889,6 @@ impl Gpu {
             "gemm_qkvza_hfq4g256_dot2",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_qkvza_hfq4g256_dot2"];
 
         let mut aq = a_qkv.buf.as_ptr();
         let mut az = a_z.buf.as_ptr();
@@ -5299,16 +5938,14 @@ impl Gpu {
             + batch_size * (qkv_m + z_m + beta_m + alpha_m) * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq4g256_dot2", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_qkvza_hfq4g256_dot2",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; aq, az, ab, aa, xp, yq, yz, yb, ya, q_m, z_m_val, b_m, a_m, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -5516,7 +6153,6 @@ impl Gpu {
             )?;
             ("gemm_qkv_hfq4g256", [32, 1, 1], 1)
         };
-        let func = &self.functions[func_name];
 
         let mut aq = a_q.buf.as_ptr();
         let mut ak = a_k.buf.as_ptr();
@@ -5557,16 +6193,14 @@ impl Gpu {
             + crate::profile::gemv_hfq4g256_bytes(k_m, k)
             + crate::profile::gemv_hfq4g256_bytes(v_m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq4g256", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid_x, batch_tiles as u32, 1],
-                block,
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            func_name,
+            [grid_x, batch_tiles as u32, 1],
+            block,
+            0,
+            params; aq, ak, av, xp, yq, yk, yv, q_m_val, k_m_val, v_m_val, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -5641,7 +6275,6 @@ impl Gpu {
             kernels::GEMM_QKV_HFQ3G256_SRC,
             "gemm_qkv_hfq3g256",
         )?;
-        let func = &self.functions["gemm_qkv_hfq3g256"];
 
         let mut aq = a_q.buf.as_ptr();
         let mut ak = a_k.buf.as_ptr();
@@ -5681,16 +6314,14 @@ impl Gpu {
             + crate::profile::gemm_hfq3g256_bytes(k_m, k, batch_size)
             + crate::profile::gemm_hfq3g256_bytes(v_m, k, batch_size);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq3g256", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_qkv_hfq3g256",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; aq, ak, av, xp, yq, yk, yv, q_m_val, k_m_val, v_m_val, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -5725,7 +6356,6 @@ impl Gpu {
             "gemm_qkv_hfq3g256_dot2",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_qkv_hfq3g256_dot2"];
 
         let mut aq = a_q.buf.as_ptr();
         let mut ak = a_k.buf.as_ptr();
@@ -5766,16 +6396,14 @@ impl Gpu {
             + crate::profile::gemm_hfq3g256_bytes(v_m, k, batch_size)
             + batch_size * k * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq3g256_dot2", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_qkv_hfq3g256_dot2",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; aq, ak, av, xp, yq, yk, yv, q_m_val, k_m_val, v_m_val, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -5807,7 +6435,6 @@ impl Gpu {
             "gemm_qkv_hfq3g256_fp16",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_qkv_hfq3g256_fp16"];
 
         let mut aq = a_q.buf.as_ptr();
         let mut ak = a_k.buf.as_ptr();
@@ -5848,16 +6475,14 @@ impl Gpu {
             + crate::profile::gemm_hfq3g256_bytes(v_m, k, batch_size)
             + batch_size * k * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq3g256_fp16", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_qkv_hfq3g256_fp16",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; aq, ak, av, xp, yq, yk, yv, q_m_val, k_m_val, v_m_val, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -5900,7 +6525,6 @@ impl Gpu {
             "gemm_qkv_hfq3g256_dp4a",
         )?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-        let func = &self.functions["gemm_qkv_hfq3g256_dp4a"];
 
         let mut aq = a_q.buf.as_ptr();
         let mut ak = a_k.buf.as_ptr();
@@ -5940,16 +6564,14 @@ impl Gpu {
                   + batch_size * k  // Q8_1 mmq X is ~1 byte per element
                   + batch_size * (q_m + k_m + v_m) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq3g256_dp4a", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_qkv_hfq3g256_dp4a",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; aq, ak, av, xq, yq, yk, yv, q_m_val, k_m_val, v_m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -5981,7 +6603,6 @@ impl Gpu {
             "gemm_qkv_hfq4g256_fp16",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_qkv_hfq4g256_fp16"];
 
         let mut aq = a_q.buf.as_ptr();
         let mut ak = a_k.buf.as_ptr();
@@ -6023,16 +6644,14 @@ impl Gpu {
                   + batch_size * k * 2  // FP16 X
                   + batch_size * (q_m + k_m + v_m) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq4g256_fp16", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_qkv_hfq4g256_fp16",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; aq, ak, av, xp, yq, yk, yv, q_m_val, k_m_val, v_m_val, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -6065,7 +6684,6 @@ impl Gpu {
             "gemm_qkv_hfq4g256_fp16_wave64",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_qkv_hfq4g256_fp16_wave64"];
 
         let mut aq = a_q.buf.as_ptr();
         let mut ak = a_k.buf.as_ptr();
@@ -6109,16 +6727,14 @@ impl Gpu {
                   + batch_size * (q_m + k_m + v_m) * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq4g256_fp16_wave64", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid_x, batch_tiles as u32, 1],
-                [64, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_qkv_hfq4g256_fp16_wave64",
+            [grid_x, batch_tiles as u32, 1],
+            [64, 1, 1],
+            0,
+            params; aq, ak, av, xp, yq, yk, yv, q_m_val, k_m_val, v_m_val, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -6150,7 +6766,6 @@ impl Gpu {
             "gemm_qkv_hfq4g256_dot2",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_qkv_hfq4g256_dot2"];
 
         let mut aq = a_q.buf.as_ptr();
         let mut ak = a_k.buf.as_ptr();
@@ -6192,16 +6807,14 @@ impl Gpu {
             + batch_size * k * 2
             + batch_size * (q_m + k_m + v_m) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq4g256_dot2", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_qkv_hfq4g256_dot2",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; aq, ak, av, xp, yq, yk, yv, q_m_val, k_m_val, v_m_val, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -6381,7 +6994,6 @@ impl Gpu {
             kernels::GEMM_GATE_UP_HFQ4G256_SRC,
             "gemm_gate_up_hfq4g256",
         )?;
-        let func = &self.functions["gemm_gate_up_hfq4g256"];
 
         let mut ag = a_gate.buf.as_ptr();
         let mut au = a_up.buf.as_ptr();
@@ -6414,16 +7026,14 @@ impl Gpu {
         let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
             + crate::profile::gemv_hfq4g256_bytes(up_m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq4g256", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_gate_up_hfq4g256",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; ag, au, xp, yg, yu, g_m, u_m, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -6452,7 +7062,6 @@ impl Gpu {
             "gemm_gate_up_hfq4g256_dot2",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_gate_up_hfq4g256_dot2"];
 
         let mut ag = a_gate.buf.as_ptr();
         let mut au = a_up.buf.as_ptr();
@@ -6488,16 +7097,14 @@ impl Gpu {
             + batch_size * (gate_m + up_m) * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq4g256_dot2", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_gate_up_hfq4g256_dot2",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; ag, au, xp, yg, yu, g_m, u_m, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -6558,7 +7165,6 @@ impl Gpu {
             kernels::GEMM_GATE_UP_HFQ3G256_SRC,
             "gemm_gate_up_hfq3g256",
         )?;
-        let func = &self.functions["gemm_gate_up_hfq3g256"];
 
         let mut ag = a_gate.buf.as_ptr();
         let mut au = a_up.buf.as_ptr();
@@ -6590,16 +7196,14 @@ impl Gpu {
         let bytes = crate::profile::gemm_hfq3g256_bytes(gate_m, k, batch_size)
             + crate::profile::gemm_hfq3g256_bytes(up_m, k, batch_size);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq3g256", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_gate_up_hfq3g256",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; ag, au, xp, yg, yu, gate_m_val, up_m_val, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -6627,7 +7231,6 @@ impl Gpu {
             "gemm_gate_up_hfq3g256_dot2",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_gate_up_hfq3g256_dot2"];
 
         let mut ag = a_gate.buf.as_ptr();
         let mut au = a_up.buf.as_ptr();
@@ -6661,16 +7264,14 @@ impl Gpu {
             + batch_size * k * 2;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq3g256_dot2", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_gate_up_hfq3g256_dot2",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; ag, au, xp, yg, yu, gate_m_val, up_m_val, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -6699,7 +7300,6 @@ impl Gpu {
             "gemm_gate_up_hfq3g256_fp16",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_gate_up_hfq3g256_fp16"];
 
         let mut ag = a_gate.buf.as_ptr();
         let mut au = a_up.buf.as_ptr();
@@ -6733,16 +7333,14 @@ impl Gpu {
             + batch_size * k * 2;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq3g256_fp16", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_gate_up_hfq3g256_fp16",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; ag, au, xp, yg, yu, gate_m_val, up_m_val, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -6780,7 +7378,6 @@ impl Gpu {
             "gemm_gate_up_hfq3g256_dp4a",
         )?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-        let func = &self.functions["gemm_gate_up_hfq3g256_dp4a"];
 
         let mut ag = a_gate.buf.as_ptr();
         let mut au = a_up.buf.as_ptr();
@@ -6814,16 +7411,14 @@ impl Gpu {
             + batch_size * (gate_m + up_m) * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq3g256_dp4a", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_gate_up_hfq3g256_dp4a",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; ag, au, xq, yg, yu, gate_m_val, up_m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -6919,7 +7514,6 @@ impl Gpu {
         );
         self.ensure_kernel(kernel_name, &inlined, kernel_name)?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-        let func = &self.functions[kernel_name];
 
         let mut ap = a_raw.buf.as_ptr();
         let mut xq = xq_ptr;
@@ -6951,16 +7545,14 @@ impl Gpu {
             + batch_size * k
             + batch_size * m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [row_tiles as u32, col_tiles as u32, 1],
-                [32, 4, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            kernel_name,
+            [row_tiles as u32, col_tiles as u32, 1],
+            [32, 4, 1],
+            shared_mem,
+            params; ap, xq, yp, m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -7164,7 +7756,6 @@ impl Gpu {
         );
         self.ensure_kernel(kernel_name, &inlined, kernel_name)?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-        let func = &self.functions[kernel_name];
 
         let mut aq = a_q.buf.as_ptr();
         let mut ak = a_k.buf.as_ptr();
@@ -7209,16 +7800,14 @@ impl Gpu {
             + batch_size * k
             + batch_size * total_m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [row_tiles as u32, col_tiles as u32, 1],
-                [32, 4, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            kernel_name,
+            [row_tiles as u32, col_tiles as u32, 1],
+            [32, 4, 1],
+            shared_mem,
+            params; aq, ak, av, xq, yq, yk, yv, q_m_val, k_m_val, v_m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -7434,7 +8023,6 @@ impl Gpu {
         );
         self.ensure_kernel(kernel_name, &inlined, kernel_name)?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-        let func = &self.functions[kernel_name];
 
         let mut ag = a_gate.buf.as_ptr();
         let mut au = a_up.buf.as_ptr();
@@ -7471,16 +8059,14 @@ impl Gpu {
             + batch_size * k
             + batch_size * total_m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [row_tiles as u32, col_tiles as u32, 1],
-                [32, 4, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            kernel_name,
+            [row_tiles as u32, col_tiles as u32, 1],
+            [32, 4, 1],
+            shared_mem,
+            params; ag, au, xq, yg, yu, gate_m_val, up_m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -7722,7 +8308,6 @@ impl Gpu {
         );
         self.ensure_kernel(kernel_name, &inlined, kernel_name)?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-        let func = &self.functions[kernel_name];
 
         let mut aqkv = a_qkv.buf.as_ptr();
         let mut az = a_z.buf.as_ptr();
@@ -7774,16 +8359,14 @@ impl Gpu {
             + batch_size * k
             + batch_size * total_m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [row_tiles as u32, col_tiles as u32, 1],
-                [32, 4, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            kernel_name,
+            [row_tiles as u32, col_tiles as u32, 1],
+            [32, 4, 1],
+            shared_mem,
+            params; aqkv, az, ab, aa, xq, yqkv, yz, yb, ya, qkv_m_val, z_m_val, beta_m_val, alpha_m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -7939,7 +8522,6 @@ impl Gpu {
         );
         self.ensure_kernel(kernel_name, &inlined, kernel_name)?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-        let func = &self.functions[kernel_name];
 
         let mut ap = a_raw.buf.as_ptr();
         let mut xq = xq_ptr;
@@ -7966,16 +8548,14 @@ impl Gpu {
         let bytes =
             crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k + batch_size * m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [row_tiles as u32, col_tiles as u32, 1],
-                [32, 4, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            kernel_name,
+            [row_tiles as u32, col_tiles as u32, 1],
+            [32, 4, 1],
+            shared_mem,
+            params; ap, xq, yp, m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -8097,7 +8677,6 @@ impl Gpu {
         );
         self.ensure_kernel(kernel_name, &inlined, kernel_name)?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-        let func = &self.functions[kernel_name];
 
         let mut a_q_p = a_q.buf.as_ptr();
         let mut a_k_p = a_k.buf.as_ptr();
@@ -8141,16 +8720,14 @@ impl Gpu {
             + batch_size * k
             + batch_size * (q_m + k_m + v_m) * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [row_tiles as u32, col_tiles as u32, 1],
-                [32, 4, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            kernel_name,
+            [row_tiles as u32, col_tiles as u32, 1],
+            [32, 4, 1],
+            shared_mem,
+            params; a_q_p, a_k_p, a_v_p, xq, y_q_p, y_k_p, y_v_p, q_m_val, k_m_val, v_m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -8277,7 +8854,6 @@ impl Gpu {
         );
         self.ensure_kernel(kernel_name, &inlined, kernel_name)?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-        let func = &self.functions[kernel_name];
 
         let mut a_gate_p = a_gate.buf.as_ptr();
         let mut a_up_p = a_up.buf.as_ptr();
@@ -8314,16 +8890,14 @@ impl Gpu {
             + batch_size * k
             + batch_size * (gate_m + up_m) * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [row_tiles as u32, col_tiles as u32, 1],
-                [32, 4, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            kernel_name,
+            [row_tiles as u32, col_tiles as u32, 1],
+            [32, 4, 1],
+            shared_mem,
+            params; a_gate_p, a_up_p, xq, y_gate_p, y_up_p, gate_m_val, up_m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -8441,7 +9015,6 @@ impl Gpu {
         );
         self.ensure_kernel(kernel_name, &inlined, kernel_name)?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-        let func = &self.functions[kernel_name];
 
         let mut a_qkv_p = a_qkv.buf.as_ptr();
         let mut a_z_p = a_z.buf.as_ptr();
@@ -8492,16 +9065,14 @@ impl Gpu {
             + batch_size * k
             + batch_size * total_m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [row_tiles as u32, col_tiles as u32, 1],
-                [32, 4, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            kernel_name,
+            [row_tiles as u32, col_tiles as u32, 1],
+            [32, 4, 1],
+            shared_mem,
+            params; a_qkv_p, a_z_p, a_beta_p, a_alpha_p, xq, y_qkv_p, y_z_p, y_beta_p, y_alpha_p, qkv_m_val, z_m_val, beta_m_val, alpha_m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -8647,7 +9218,6 @@ impl Gpu {
             "gemm_hfq4g256_residual_mmq_rdna2",
         )?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-        let func = &self.functions["gemm_hfq4g256_residual_mmq_rdna2"];
 
         let mut ap = a_raw.buf.as_ptr();
         let mut xq = xq_ptr;
@@ -8682,16 +9252,14 @@ impl Gpu {
             "gemm_hfq4g256_residual_mmq_rdna2",
             bytes,
         );
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [row_tiles as u32, col_tiles as u32, 1],
-                [32, 4, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_hfq4g256_residual_mmq_rdna2",
+            [row_tiles as u32, col_tiles as u32, 1],
+            [32, 4, 1],
+            shared_mem,
+            params; ap, xq, yp, m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -8720,7 +9288,6 @@ impl Gpu {
             "gemm_gate_up_hfq4g256_fp16",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_gate_up_hfq4g256_fp16"];
 
         let mut ag = a_gate.buf.as_ptr();
         let mut au = a_up.buf.as_ptr();
@@ -8756,16 +9323,14 @@ impl Gpu {
                   + batch_size * (gate_m + up_m) * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq4g256_fp16", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_gate_up_hfq4g256_fp16",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; ag, au, xp, yg, yu, g_m, u_m, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -8795,7 +9360,6 @@ impl Gpu {
             "gemm_gate_up_hfq4g256_fp16_wave64",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_gate_up_hfq4g256_fp16_wave64"];
 
         let mut ag = a_gate.buf.as_ptr();
         let mut au = a_up.buf.as_ptr();
@@ -8836,16 +9400,14 @@ impl Gpu {
             "gemm_gate_up_hfq4g256_fp16_wave64",
             bytes,
         );
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid_x, batch_tiles as u32, 1],
-                [64, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_gate_up_hfq4g256_fp16_wave64",
+            [grid_x, batch_tiles as u32, 1],
+            [64, 1, 1],
+            0,
+            params; ag, au, xp, yg, yu, g_m, u_m, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -9598,28 +10160,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Adaptive-B batch-tile (env HIPFIRE_GATE_UP_BT, shared with gate_up/residual).
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_hfq4g256_wmma_gfx12_bt12",
@@ -9871,7 +10412,7 @@ impl Gpu {
                 Ok(path) => {
                     let image = std::fs::read(&path)
                         .map_err(|e| hip_bridge::HipError::new(0, &format!("F2: bundle {path}: {e}")))?;
-                    self.ensure_embedded_kernel(GEMM_MODULE, &image, symbol)?;
+                    self.ensure_embedded_kernel(GEMM_MODULE, std::sync::Arc::<[u8]>::from(image), symbol)?;
                 }
                 Err(_) => self.ensure_embedded_kernel(GEMM_MODULE, kernels::GEMM_MQ4G256V2_WMMA_FP8_GFX12_B1, symbol)?,
             }
@@ -10936,7 +11477,14 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.iu4_verify_note_f16();
         self.bind_thread()?;
+        if self.fp8_verify_scope {
+            return self.gemm_qkvza_mq4g256v2_verify_fp8(
+                a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
+                alpha_m, k, batch_size,
+            );
+        }
         if self.a8_prefill_active(batch_size, k) {
             let xq = self.ensure_int8_mmq_x(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant_i8(a_qkv, xq, y_qkv, qkv_m, k, batch_size)?;
@@ -10989,28 +11537,15 @@ impl Gpu {
                 alpha_m, k, batch_size, 1,
             );
         }
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        // Speculative-verify window 16 < N < 64 (HIPFIRE_WMMA_BATCH_TILES): the
+        // byte-identical verify-tile twin (gemm_vt.rs).
+        if self.gfx12_verify_bt_active(batch_size, k) {
+            return self.gemm_qkvza_mq4g256v2_wmma_gfx12_vt(
+                a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
+                alpha_m, k, batch_size,
+            );
+        }
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc, func_name): (&str, &str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_hfq4g256_wmma_gfx12_bt12",
@@ -12255,84 +12790,92 @@ impl Gpu {
         let variant_override = self.flags.gate_up_variant.clone();
         // (kernel_name, kernel_src, m_tile, block_threads). m_tile is the
         // per-block row count; block_threads is the wave/block size.
-        let (kernel_name, kernel_src, m_tile, block_threads) = match variant_override.as_deref() {
-            Some("ldsx") => (
-                "gemm_gate_up_hfq4g256_wmma_ldsx",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC,
-                16,
-                32,
-            ),
-            // k4 = 4-tile pipeline (more in-flight B loads for better BW
-            // utilization). Opt-in default-off; bench-measured 2026-05-21.
-            Some("k4") => (
-                "gemm_gate_up_hfq4g256_wmma_k4",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_K4_SRC,
-                16,
-                32,
-            ),
-            // ldscoop = cooperative LDS weight staging for coalesced DRAM
-            // loads. All 32 threads load one row's weights at a time
-            // (128-byte coalesced cache lines), staged in LDS for the
-            // WMMA loop. Targets the 32% peak BW seen in base kernel.
-            Some("ldscoop") => (
-                "gemm_gate_up_hfq4g256_wmma_ldscoop",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC,
-                16,
-                32,
-            ),
-            // 2tile = 32 rows × 16 cols per block, 2 wave32 waves.
-            // Halves grid in M; both waves share the same X tile so
-            // L0/L1 cache absorbs the second wave's loads cheaply.
-            Some("2tile") => (
-                "gemm_gate_up_hfq4g256_wmma_2tile",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_2TILE_SRC,
-                32,
-                64,
-            ),
-            _ => {
-                let def = if self.arch_caps.is_rdna3p5() {
-                    // RDNA3.5 iGPU (gfx1150/1151/1152): narrow-BW LPDDR5; the
-                    // ldscoop_nosync variant wins here. gfx1152 previously fell
-                    // through to the RDNA4 `else` ldscoop arm because the old
-                    // string-prefix test ("gfx1151"/"gfx1150" starts_with) did
-                    // not match "gfx1152" — that was a misroute, now fixed by
-                    // gating on the is_rdna3p5 capability molecule.
-                    (
-                        "gemm_gate_up_hfq4g256_wmma_ldscoop_nosync",
-                        kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_NOSYNC_SRC,
-                        16,
-                        32,
-                    )
-                } else if self.arch_caps.is_rdna3_dgpu() {
-                    // gfx1100/1101/1102 (RDNA3 dGPU): ldscoop's LDS weight-staging
-                    // overhead exceeds its coalescing gain here. Falsified in
-                    // 303d69e9 ("ldscoop variant FALSIFIED — LDS overhead exceeds
-                    // coalescing gains") and re-confirmed by rocprofv3 2026-06-12:
-                    // on the 27B DFlash batched-verify gate_up the ldscoop variant
-                    // ran 0.343 ms/launch vs the plain WMMA 0.232 (+48%), the bulk
-                    // of a ~14% DFlash decode regression vs the ca30ca21 baseline.
-                    // e3232034 ("ldscoop on others") tuned the default for gfx1151
-                    // (nosync) but dumped RDNA3 dGPUs into the falsified ldscoop.
-                    // Restore the plain WMMA variant that ca30ca21 (dense-DFlash
-                    // perfmaxx) shipped. RDNA4 (else arm) is left on ldscoop pending
-                    // its own measurement on hiptrx/gfx1201.
-                    (
-                        "gemm_gate_up_hfq4g256_wmma",
-                        kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC,
-                        16,
-                        32,
-                    )
-                } else {
-                    (
-                        "gemm_gate_up_hfq4g256_wmma_ldscoop",
-                        kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC,
-                        16,
-                        32,
-                    )
-                };
-                def
-            }
-        };
+        let (kernel_name, kernel_src, m_tile, block_threads, n_tile) =
+            match variant_override.as_deref() {
+                Some("ldsx") => (
+                    "gemm_gate_up_hfq4g256_wmma_ldsx",
+                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC,
+                    16,
+                    32,
+                    16,
+                ),
+                // k4 = 4-tile pipeline (more in-flight B loads for better BW
+                // utilization). Opt-in default-off; bench-measured 2026-05-21.
+                Some("k4") => (
+                    "gemm_gate_up_hfq4g256_wmma_k4",
+                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_K4_SRC,
+                    16,
+                    32,
+                    16,
+                ),
+                // ldscoop = cooperative LDS weight staging for coalesced DRAM
+                // loads. All 32 threads load one row's weights at a time
+                // (128-byte coalesced cache lines), staged in LDS for the
+                // WMMA loop. Targets the 32% peak BW seen in base kernel.
+                Some("ldscoop") => (
+                    "gemm_gate_up_hfq4g256_wmma_ldscoop",
+                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC,
+                    16,
+                    32,
+                    16,
+                ),
+                // 2tile = 32 rows × 16 cols per block, 2 wave32 waves.
+                // Halves grid in M; both waves share the same X tile so
+                // L0/L1 cache absorbs the second wave's loads cheaply.
+                Some("2tile") => (
+                    "gemm_gate_up_hfq4g256_wmma_2tile",
+                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_2TILE_SRC,
+                    32,
+                    64,
+                    16,
+                ),
+                _ => {
+                    let def = if self.arch_caps.is_rdna3p5() {
+                        // RDNA3.5 iGPU (gfx1150/1151/1152): narrow-BW LPDDR5; the
+                        // ldscoop_nosync variant wins here. gfx1152 previously fell
+                        // through to the RDNA4 `else` ldscoop arm because the old
+                        // string-prefix test ("gfx1151"/"gfx1150" starts_with) did
+                        // not match "gfx1152" — that was a misroute, now fixed by
+                        // gating on the is_rdna3p5 capability molecule.
+                        (
+                            "gemm_gate_up_hfq4g256_wmma_ldscoop_nosync",
+                            kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_NOSYNC_SRC,
+                            16,
+                            32,
+                            16,
+                        )
+                    } else if self.arch_caps.is_rdna3_dgpu() {
+                        // gfx1100/1101/1102 (RDNA3 dGPU): ldscoop's LDS weight-staging
+                        // overhead exceeds its coalescing gain here. Falsified in
+                        // 303d69e9 ("ldscoop variant FALSIFIED — LDS overhead exceeds
+                        // coalescing gains") and re-confirmed by rocprofv3 2026-06-12:
+                        // on the 27B DFlash batched-verify gate_up the ldscoop variant
+                        // ran 0.343 ms/launch vs the plain WMMA 0.232 (+48%), the bulk
+                        // of a ~14% DFlash decode regression vs the ca30ca21 baseline.
+                        // e3232034 ("ldscoop on others") tuned the default for gfx1151
+                        // (nosync) but dumped RDNA3 dGPUs into the falsified ldscoop.
+                        // Restore the plain WMMA variant that ca30ca21 (dense-DFlash
+                        // perfmaxx) shipped. RDNA4 (else arm) is left on ldscoop pending
+                        // its own measurement on hiptrx/gfx1201.
+                        (
+                            "gemm_gate_up_hfq4g256_wmma",
+                            kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC,
+                            16,
+                            32,
+                            16,
+                        )
+                    } else {
+                        (
+                            "gemm_gate_up_hfq4g256_wmma_ldscoop",
+                            kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC,
+                            16,
+                            32,
+                            16,
+                        )
+                    };
+                    def
+                }
+            };
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -12360,7 +12903,7 @@ impl Gpu {
 
         let total_m = gate_m + up_m;
         let row_tiles = (total_m + m_tile - 1) / m_tile;
-        let batch_tiles = (batch_size + 15) / 16;
+        let batch_tiles = (batch_size + n_tile - 1) / n_tile;
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
             + crate::profile::gemv_hfq4g256_bytes(up_m, k)
@@ -12867,28 +13410,7 @@ impl Gpu {
         // accumulator chains hide the WMMA latency that caps the 1-acc kernel at ~19%
         // of peak. B = clamp(N/16, 1, 12), capped at 12 (B=16 spills VGPR). Byte-exact
         // vs the 1-acc kernel; +85% at N=192 on gfx1201.
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_hfq4g256_wmma_gfx12_bt12",
@@ -13050,28 +13572,7 @@ impl Gpu {
             return result;
         }
         // Adaptive-B batch-tile (env HIPFIRE_GATE_UP_BT, shared with gate_up/qkvza).
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_hfq4g256_residual_wmma_gfx12_bt12",
@@ -14576,6 +15077,7 @@ impl Gpu {
             m_total,
             x_src_rows,
             None,
+            16,
         )
     }
 
@@ -14594,6 +15096,9 @@ impl Gpu {
         m_total: usize,
         x_src_rows: usize,
         gfx11_entry: Option<&'static str>,
+        // 16: one row tile per 32-lane block; 64: the gfx1151 `_x4` entry's
+        // four row tiles per 128-lane block.
+        rows_per_block: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Arch-selecting, like the MQ2/MQ3-Lloyd grouped sisters: gfx11 takes
@@ -14663,7 +15168,7 @@ impl Gpu {
             &mt_val as *const _ as *mut c_void,
         ];
 
-        let row_tiles = ((m + 15) / 16) as u32;
+        let row_tiles = m.div_ceil(rows_per_block) as u32;
         let slot_tiles = ((m_total + 15) / 16) as u32;
         let bytes =
             m_total * k * 2 + (m_total * m) * 4 + (crate::profile::gemv_hfq4g256_bytes(m, k));
@@ -14671,7 +15176,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             kernel_name,
             [row_tiles, slot_tiles, 1],
-            [32, 1, 1],
+            [(2 * rows_per_block) as u32, 1, 1],
             0,
             &mut params,
             || {
@@ -15553,17 +16058,14 @@ impl Gpu {
         let bytes = (m_total * k) + (m_total * m) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         // Probe-only raw HIP launch: never enter the Redline recording seam.
-        let func = &self.functions[kernel_name];
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [row_tiles, slot_tiles, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            kernel_name,
+            [row_tiles, slot_tiles, 1],
+            [32, 1, 1],
+            0,
+            params; ep, tp, sp, xp, yp, m_val, k_val, xrd_val, mt_val, xsr_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -18008,7 +18510,56 @@ impl Gpu {
         m_total: usize,
         x_src_rows: usize,
     ) -> HipResult<()> {
+        self.gemm_mixed_moe_grouped_wmma_impl(
+            expert_weight_ptrs, expert_dtype_tags, expert_tile_ids, sorted_slot_index,
+            x_src, y_grouped, m, k, x_row_div, m_total, x_src_rows, false,
+        )
+    }
+
+    /// gfx1201 coalesced packed-weight variant, with the same grouped ABI.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mixed_moe_grouped_wmma_coalesced(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_dtype_tags: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.gemm_mixed_moe_grouped_wmma_impl(
+            expert_weight_ptrs, expert_dtype_tags, expert_tile_ids, sorted_slot_index,
+            x_src, y_grouped, m, k, x_row_div, m_total, x_src_rows, true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_mixed_moe_grouped_wmma_impl(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_dtype_tags: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+        coalesced: bool,
+    ) -> HipResult<()> {
         self.bind_thread()?;
+        if coalesced && !self.arch_caps.is_gfx1201() {
+            return Err(hip_bridge::HipError::new(
+                0, "coalesced grouped WMMA requires gfx1201",
+            ));
+        }
         let is_gfx12 = self.arch_caps.is_rdna4();
         if !is_gfx12 && !self.arch_caps.has_wmma_w32() {
             return Err(hip_bridge::HipError::new(
@@ -18022,7 +18573,12 @@ impl Gpu {
         }
         // 4-warp LDS-tiled variant (gfx11/RDNA3 only). Env-gated; default OFF.
         let use_4w = !is_gfx12 && self.flags.moe_grouped_4w;
-        let (kernel_name, kernel_src) = if is_gfx12 {
+        let (kernel_name, kernel_src) = if coalesced {
+            (
+                "gemm_mixed_moe_grouped_wmma_coalesced_gfx1201",
+                kernels::GEMM_MIXED_MOE_GROUPED_WMMA_COALESCED_GFX1201_SRC,
+            )
+        } else if is_gfx12 {
             (
                 "gemm_mixed_moe_grouped_wmma_gfx12",
                 kernels::GEMM_MIXED_MOE_GROUPED_WMMA_GFX12_SRC,
@@ -18301,7 +18857,6 @@ impl Gpu {
             )?;
             ("gemm_hfq4g256_residual", [32, 1, 1], 1)
         };
-        let func = &self.functions[func_name];
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
@@ -18328,16 +18883,14 @@ impl Gpu {
         let bytes =
             crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 4 + batch_size * m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_residual", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid_x, batch_tiles as u32, 1],
-                block,
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            func_name,
+            [grid_x, batch_tiles as u32, 1],
+            block,
+            0,
+            params; a_ptr, x_ptr, y_ptr, m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -18383,7 +18936,6 @@ impl Gpu {
             kernels::GEMM_HFQ3G256_RESIDUAL_SRC,
             "gemm_hfq3g256_residual",
         )?;
-        let func = &self.functions["gemm_hfq3g256_residual"];
 
         let mut ap = a_raw.buf.as_ptr();
         let mut xp = x.buf.as_ptr();
@@ -18407,16 +18959,14 @@ impl Gpu {
         };
         let bytes = crate::profile::gemm_hfq3g256_bytes(m, k, batch_size);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq3g256_residual", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_hfq3g256_residual",
+            [m as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; ap, xp, yp, m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -18442,7 +18992,6 @@ impl Gpu {
             "gemm_hfq3g256_residual_dot2",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_hfq3g256_residual_dot2"];
 
         let mut ap = a_raw.buf.as_ptr();
         let mut xp = x_f16_ptr;
@@ -18467,16 +19016,14 @@ impl Gpu {
         let bytes = crate::profile::gemm_hfq3g256_bytes(m, k, batch_size) + batch_size * k * 2;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq3g256_residual_dot2", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_hfq3g256_residual_dot2",
+            [m as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; ap, xp, yp, m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -18502,7 +19049,6 @@ impl Gpu {
             "gemm_hfq3g256_residual_fp16",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_hfq3g256_residual_fp16"];
 
         let mut ap = a_raw.buf.as_ptr();
         let mut xp = x_f16_ptr;
@@ -18527,16 +19073,14 @@ impl Gpu {
         let bytes = crate::profile::gemm_hfq3g256_bytes(m, k, batch_size) + batch_size * k * 2;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq3g256_residual_fp16", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_hfq3g256_residual_fp16",
+            [m as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; ap, xp, yp, m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -18565,7 +19109,6 @@ impl Gpu {
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         // FP16 GEMM
-        let func = &self.functions["gemm_hfq4g256_residual_fp16"];
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x_f16_ptr;
         let mut y_ptr = y.buf.as_ptr();
@@ -18592,16 +19135,14 @@ impl Gpu {
             + batch_size * m * 4 * 2;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_residual_fp16", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_hfq4g256_residual_fp16",
+            [m as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; a_ptr, x_ptr, y_ptr, m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -18654,16 +19195,14 @@ impl Gpu {
             "gemm_hfq4g256_residual_mfma_gfx942",
             bytes,
         );
-        let result = unsafe {
-            self.hip.launch_kernel(
-                &self.functions["gemm_hfq4g256_residual_mfma_gfx942"],
-                [grid_x, grid_y, 1],
-                [64, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_hfq4g256_residual_mfma_gfx942",
+            [grid_x, grid_y, 1],
+            [64, 1, 1],
+            0,
+            params; a_ptr, x_ptr, y_ptr, m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -18710,16 +19249,14 @@ impl Gpu {
             "gemm_hfq4g256_residual_mfma_v2_gfx942",
             bytes,
         );
-        let result = unsafe {
-            self.hip.launch_kernel(
-                &self.functions["gemm_hfq4g256_residual_mfma_v2_gfx942"],
-                [grid_x, grid_y, 1],
-                [256, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_hfq4g256_residual_mfma_v2_gfx942",
+            [grid_x, grid_y, 1],
+            [256, 1, 1],
+            0,
+            params; a_ptr, x_ptr, y_ptr, m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -18766,16 +19303,14 @@ impl Gpu {
             "gemm_hfq4g256_residual_mfma_v3_gfx942",
             bytes,
         );
-        let result = unsafe {
-            self.hip.launch_kernel(
-                &self.functions["gemm_hfq4g256_residual_mfma_v3_gfx942"],
-                [grid_x, grid_y, 1],
-                [256, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_hfq4g256_residual_mfma_v3_gfx942",
+            [grid_x, grid_y, 1],
+            [256, 1, 1],
+            0,
+            params; a_ptr, x_ptr, y_ptr, m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -18822,16 +19357,14 @@ impl Gpu {
             "gemm_hfq4g256_residual_mfma_v4_gfx942",
             bytes,
         );
-        let result = unsafe {
-            self.hip.launch_kernel(
-                &self.functions["gemm_hfq4g256_residual_mfma_v4_gfx942"],
-                [grid_x, grid_y, 1],
-                [256, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_hfq4g256_residual_mfma_v4_gfx942",
+            [grid_x, grid_y, 1],
+            [256, 1, 1],
+            0,
+            params; a_ptr, x_ptr, y_ptr, m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -18855,7 +19388,6 @@ impl Gpu {
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
-        let func = &self.functions["gemm_hfq4g256_residual_fp16_wave64"];
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x_f16_ptr;
         let mut y_ptr = y.buf.as_ptr();
@@ -18887,16 +19419,14 @@ impl Gpu {
             "gemm_hfq4g256_residual_fp16_wave64",
             bytes,
         );
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid_x, batch_tiles as u32, 1],
-                [64, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_hfq4g256_residual_fp16_wave64",
+            [grid_x, batch_tiles as u32, 1],
+            [64, 1, 1],
+            0,
+            params; a_ptr, x_ptr, y_ptr, m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -20145,13 +20675,21 @@ impl Gpu {
     }
 
     /// Pad F32 [N,K] to next multiple of 128 (zero pad rows). MMQ-LUT twin of
-    /// `pad_f32_batch_to_64`.
+    /// `pad_f32_batch_to_64`.  Eager-only: the pool temps are freed when the
+    /// call returns and the copies are synchronous, so a capture or PM4
+    /// recording would keep dead pointers.  Rejected like `prepare_mq4v2_fp8_x`.
     fn pad_f32_batch_to_128(
         &mut self,
         x: &GpuTensor,
         n: usize,
         k: usize,
     ) -> HipResult<(GpuTensor, usize)> {
+        if self.replay.is_recording() || self.graphs.capture_mode {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "lloyd MMQ pad-to-128: eager-only (capture/replay rejected)",
+            ));
+        }
         let n_padded = n.div_ceil(128) * 128;
         let padded = self.alloc_tensor(&[n_padded, k], DType::F32)?;
         self.hip.memcpy_dtod(&padded.buf, &x.buf, n * k * 4)?;
@@ -20526,7 +21064,7 @@ impl Gpu {
             && n % 128 == 0
             && self.mq4v2_symmetric
             && self.flags.gfx11_iu4_symfold
-            && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")
+            && *DISPATCH_IU4_SYMFOLD
             && !self.replay.is_recording()
             && !self.graphs.capture_mode;
         if !eligible {
@@ -20534,7 +21072,7 @@ impl Gpu {
         }
         match self.arch.as_str() {
             "gfx1100"
-                if hipfire_config::developer_var("HIPFIRE_IU4_V2C").as_deref() != Ok("0") =>
+                if *DISPATCH_IU4_V2C =>
             {
                 Some(Iu4V2Tile::V2c)
             }
@@ -20542,7 +21080,7 @@ impl Gpu {
                 if m % 256 == 0
                     && n % 256 == 0
                     && (m / 256) * (n / 256) >= self.cu_count_or_default()
-                    && hipfire_config::developer_var("HIPFIRE_IU4_V2B").as_deref() != Ok("0") =>
+                    && *DISPATCH_IU4_V2B =>
             {
                 Some(Iu4V2Tile::V2b)
             }
@@ -20597,7 +21135,7 @@ impl Gpu {
             // 128-K block; partial M/N handled natively (zero-filled slab /
             // guarded writeback). Block [256,1,1].
             let symfold = self.mq4v2_symmetric
-                && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0");
+                && *DISPATCH_IU4_SYMFOLD;
             // The ISA bundle has the K1 ABI/geometry but only the masked
             // b128 store. Unsupported shapes/pointers use hipcc `_v3`.
             let isa_requested = symfold && self.flags.g12_iu4_isa;
@@ -20606,7 +21144,7 @@ impl Gpu {
             // Banded CTA raster + wide epilogue (bit-identical outputs, see
             // the kernel header); `HIPFIRE_G12_RASTER=0` restores the
             // incumbent modules.
-            let g12r = hipfire_config::developer_var("HIPFIRE_G12_RASTER").as_deref() != Ok("0");
+            let g12r = *DISPATCH_G12_RASTER;
             // Slab-layout activations (a slab producer twin wrote the live
             // scratch) have exactly one reader: the `_b1s` bundle.
             let slab = self.scratch.int4_mmq_slab_at(x_i4_ptr);
@@ -20718,6 +21256,7 @@ impl Gpu {
             // LDS: 20480 B (A/W double-buffered + ping-pong DS/SZ; store
             // slots overlap).
             let lds_bytes: u32 = 20480;
+            self.iu4_verify_note_iu4(batch_size);
             let result = self.launch_maybe_blob(
                 kernel_name,
                 [row_tiles as u32, batch_tiles as u32, 1],
@@ -20745,7 +21284,7 @@ impl Gpu {
         let symfold_requested = matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
             && self.mq4v2_symmetric
             && self.flags.gfx11_iu4_symfold
-            && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0");
+            && *DISPATCH_IU4_SYMFOLD;
         // A partial N grid can still use FULL=true for every complete column
         // tile when M itself is full. The guarded wrapper below targets only
         // the one remaining column tile while retaining the original N stride.
@@ -20781,7 +21320,7 @@ impl Gpu {
             && k > 0
             && batch_size > 0
             && (self.arch.as_str() == "gfx1151" || shape_lf16)
-            && hipfire_config::developer_var("HIPFIRE_IU4_X5").as_deref() != Ok("0");
+            && *DISPATCH_IU4_X5;
         // GEMM v2 V2C (gfx1100) / V2B (gfx1151): see `iu4_v2_tile` for the
         // eligibility rule and kill switches.
         let v2_tile = self.iu4_v2_tile(m, k, batch_size);
@@ -20797,7 +21336,7 @@ impl Gpu {
                 (true, false) => "gemm_mq4g256v2_residual_iu4_pm_set_gfx1100",
                 (true, true) => "gemm_mq4g256v2_residual_iu4_pm_add_gfx1100",
                 (false, false) => "gemm_mq4g256v2_residual_iu4_v2c_set_gfx11",
-                (false, true) if hipfire_config::developer_var("HIPFIRE_V2C_ADDEPI").as_deref() != Ok("0") => {
+                (false, true) if *DISPATCH_V2C_ADDEPI => {
                     "gemm_mq4g256v2_residual_iu4_v2c_add_touch_gfx11"
                 }
                 (false, true) => "gemm_mq4g256v2_residual_iu4_v2c_add_gfx11",
@@ -20862,7 +21401,7 @@ impl Gpu {
             // otherwise touch the residual ahead of the epilogue
             // (`_add_touch`). Both are byte-identical to `_add`.
             let addepi =
-                add && hipfire_config::developer_var("HIPFIRE_V2B_ADDEPI").as_deref() != Ok("0");
+                add && *DISPATCH_V2B_ADDEPI;
             let fold = if addepi {
                 self.residual_fold_arm
                     .take()
@@ -20881,11 +21420,13 @@ impl Gpu {
             // 32 MiB MALL; grouping row tiles lets each dispatch round re-read
             // its X tiles from the MALL. Byte-identical to `_add_touch`.
             let swz_grp = if kernel_name == "gemm_mq4g256v2_residual_iu4_v2b_add_touch_gfx11" {
-                hipfire_config::developer_var("HIPFIRE_V2B_DOWN_SWZ")
-                    .ok()
-                    .and_then(|v| v.parse::<i32>().ok())
-                    .unwrap_or(V2B_DOWN_SWZ_GRP)
-                    .clamp(0, (m / 256) as i32)
+                static DOWN_SWZ: LazyLock<i32> = LazyLock::new(|| {
+                    hipfire_config::developer_var("HIPFIRE_V2B_DOWN_SWZ")
+                        .ok()
+                        .and_then(|v| v.parse::<i32>().ok())
+                        .unwrap_or(V2B_DOWN_SWZ_GRP)
+                });
+                (*DOWN_SWZ).clamp(0, (m / 256) as i32)
             } else {
                 0
             };
@@ -21045,13 +21586,6 @@ impl Gpu {
         const MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4";
         const GRIDSPEC_MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4_gridspec";
         const GRIDSPEC_TAIL: &str = "gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec";
-        const GRIDSPEC_SRC: &str = concat!(
-            include_str!("../../../kernels/src/block_i4_128_quant.hip"),
-            include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip"),
-            include_str!(
-                "../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_gridspec.gfx11.hip"
-            )
-        );
         const SYMFOLD_MODULE: &str =
             "gemm_mq4g256v2_residual_mmq_iu4_gfx11_symfold";
         const GRIDSPEC_SYMFOLD_MODULE: &str =
@@ -21067,7 +21601,7 @@ impl Gpu {
                     GRIDSPEC_SYMFOLD_MODULE,
                     kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GRIDSPEC_SYMFOLD_SRC,
                 ),
-                (true, false) => (GRIDSPEC_MODULE, GRIDSPEC_SRC),
+                (true, false) => (GRIDSPEC_MODULE, kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GRIDSPEC_SRC),
                 (false, true) => (
                     SYMFOLD_MODULE,
                     kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX11_SYMFOLD_SRC,
@@ -21379,10 +21913,6 @@ impl Gpu {
         self.bind_thread()?;
         // Compile both kernels (convert + WMMA GEMM share the FP16 convert)
         // Kernel variant selection
-        // MW16 path: dequant weights to FP16 per-call, then run no-dequant WMMA
-        if self.flags.mw16 {
-            return self.gemm_mw16_residual_wmma_via_dequant(a_raw, x, y, m, k, batch_size);
-        }
         // LDS-staged multi-wave residual (env HIPFIRE_HFQ4G256_LDSSTAGE=1).
         // gfx11 sister of the gfx12 ldsstage path. Reorders FP32 K accumulation;
         // K must be a multiple of 512. Batch ceiling: see the measured 3.6-trunk
@@ -21652,21 +22182,25 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        const K_SPLITS: u32 = 4;
-        self.ensure_kernel(
+        // (The batch-tiled B=2 / 2-split variants that used to be selected here
+        // were removed 2026-10-09 with the rest of the v1-only surface: their
+        // kernels are HFQ4-G256-only, and Magnum V2 dtypes take the
+        // `gemm_mq4g256v2_residual_wmma` family, which already ships its own
+        // batch-tiled arms upstream.)
+        let (kname, ksrc, n_tile, k_splits, fin_name, fin_src) = (
             "gemm_hfq4g256_residual_wmma_ksplit_det",
             kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_SRC,
-            "gemm_hfq4g256_residual_wmma_ksplit_det",
-        )?;
-        self.ensure_kernel(
+            16,
+            4u32,
             "gemm_ksplit_det_finalize",
             kernels::GEMM_KSPLIT_DET_FINALIZE_SRC,
-            "gemm_ksplit_det_finalize",
-        )?;
+        );
+        self.ensure_kernel(kname, ksrc, kname)?;
+        self.ensure_kernel(fin_name, fin_src, fin_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        // Partials scratch: [K_SPLITS][batch_size][M] fp32.
+        // Partials scratch: [k_splits][batch_size][M] fp32.
         let n_cells = batch_size * m;
-        let partials_ptr = self.ensure_ksplit_det_partials(K_SPLITS as usize * n_cells * 4)?;
+        let partials_ptr = self.ensure_ksplit_det_partials(k_splits as usize * n_cells * 4)?;
 
         // ── Phase 1: per-split partials (plain store, no atomic) ──
         let mut a_ptr = a_raw.buf.as_ptr();
@@ -21684,18 +22218,13 @@ impl Gpu {
             &mut bs_val as *mut _ as *mut c_void,
         ];
         let row_tiles = ((m + 15) / 16) as u32;
-        let batch_tiles = ((batch_size + 15) / 16) as u32;
+        let batch_tiles = ((batch_size + n_tile - 1) / n_tile) as u32;
         let bytes =
             crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "gemm",
-            "gemm_hfq4g256_residual_wmma_ksplit_det",
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
         self.launch_maybe_blob(
-            "gemm_hfq4g256_residual_wmma_ksplit_det",
-            [row_tiles, batch_tiles, K_SPLITS],
+            kname,
+            [row_tiles, batch_tiles, k_splits],
             [32, 1, 1],
             0,
             &mut params1,
@@ -21727,7 +22256,7 @@ impl Gpu {
         ];
         let fin_grid = ((n_cells + 255) / 256) as u32;
         let r = self.launch_maybe_blob(
-            "gemm_ksplit_det_finalize",
+            fin_name,
             [fin_grid, 1, 1],
             [256, 1, 1],
             0,
@@ -21986,95 +22515,6 @@ impl Gpu {
         self.gemm_hfq3g256_residual_wmma(a_raw, x_rot, y, m, k, batch_size)
     }
 
-    /// MW16: dequant 4-bit weights to FP16, then run the no-dequant WMMA kernel.
-    /// Per-call dequant (wasteful) — for benchmarking only. Production would
-    /// dequant at model load time.
-    fn gemm_mw16_residual_wmma_via_dequant(
-        &mut self,
-        a_raw: &GpuTensor,
-        x: &GpuTensor,
-        y: &GpuTensor,
-        m: usize,
-        k: usize,
-        batch_size: usize,
-    ) -> HipResult<()> {
-        self.ensure_kernel(
-            "dequant_hfq4g256_to_f16",
-            kernels::DEQUANT_HFQ4G256_TO_F16_SRC,
-            "dequant_hfq4g256_to_f16",
-        )?;
-        self.ensure_kernel(
-            "gemm_mw16_residual_wmma",
-            kernels::GEMM_MW16_RESIDUAL_WMMA_SRC,
-            "gemm_mw16_residual_wmma",
-        )?;
-        let x_f16 = self.ensure_fp16_x(x, batch_size * k)?;
-
-        // Dequant weights to FP16 scratch
-        let w_elems = m * k;
-        let w_f16 = self.hip.malloc(w_elems * 2)?;
-        {
-            let f = &self.functions["dequant_hfq4g256_to_f16"];
-            let groups = k / 256;
-            let mut ap = a_raw.buf.as_ptr();
-            let mut wp = w_f16.as_ptr();
-            let mut mv = m as i32;
-            let mut kv = k as i32;
-            let mut p: Vec<*mut c_void> = vec![
-                &mut ap as *mut _ as *mut c_void,
-                &mut wp as *mut _ as *mut c_void,
-                &mut mv as *mut _ as *mut c_void,
-                &mut kv as *mut _ as *mut c_void,
-            ];
-            unsafe {
-                self.hip.launch_kernel(
-                    f,
-                    [m as u32, groups as u32, 1],
-                    [32, 1, 1],
-                    0,
-                    self.stream_ref(),
-                    &mut p,
-                )?;
-            }
-        }
-
-        // MW16 WMMA GEMM
-        let f = &self.functions["gemm_mw16_residual_wmma"];
-        let mut wp = w_f16.as_ptr();
-        let mut xp = x_f16;
-        let mut yp = y.buf.as_ptr();
-        let mut mv = m as i32;
-        let mut kv = k as i32;
-        let mut nv = batch_size as i32;
-        let mut p: Vec<*mut c_void> = vec![
-            &mut wp as *mut _ as *mut c_void,
-            &mut xp as *mut _ as *mut c_void,
-            &mut yp as *mut _ as *mut c_void,
-            &mut mv as *mut _ as *mut c_void,
-            &mut kv as *mut _ as *mut c_void,
-            &mut nv as *mut _ as *mut c_void,
-        ];
-        let rows = (m + 15) / 16;
-        let batches = (batch_size + 15) / 16;
-        let bytes = m * k * 2 + batch_size * k * 2 + batch_size * m * 8;
-        let timer =
-            crate::profile::begin_timer(&self.hip, "gemm", "gemm_mw16_residual_wmma", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                f,
-                [rows as u32, batches as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut p,
-            )
-        };
-        if let Some(t) = timer {
-            t.finish(&self.hip);
-        }
-        drop(w_f16);
-        result
-    }
 
     /// Batched HFQ4-G256 GEMM: y[b][row] = A[row] · x[b] for all batch elements.
     /// x: [batch_size × K], y: [batch_size × M], both row-major.
@@ -23294,7 +23734,6 @@ impl Gpu {
             kernels::GEMM_HFQ6G256_RESIDUAL_SRC,
             "gemm_hfq6g256_residual",
         )?;
-        let func = &self.functions["gemm_hfq6g256_residual"];
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
@@ -23322,16 +23761,14 @@ impl Gpu {
             + batch_size * k * 4
             + batch_size * m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq6g256_residual", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_hfq6g256_residual",
+            [m as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; a_ptr, x_ptr, y_ptr, m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -23359,7 +23796,6 @@ impl Gpu {
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         // FP16 GEMM
-        let func = &self.functions["gemm_hfq6g256_residual_fp16"];
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x_f16_ptr;
         let mut y_ptr = y.buf.as_ptr();
@@ -23386,16 +23822,14 @@ impl Gpu {
             + batch_size * m * 4 * 2;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq6g256_residual_fp16", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_hfq6g256_residual_fp16",
+            [m as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; a_ptr, x_ptr, y_ptr, m_val, k_val, bs_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -23610,7 +24044,6 @@ impl Gpu {
             kernels::GEMM_QKVZA_HFQ6G256_SRC,
             "gemm_qkvza_hfq6g256",
         )?;
-        let func = &self.functions["gemm_qkvza_hfq6g256"];
 
         let mut aq = a_qkv.buf.as_ptr();
         let mut az = a_z.buf.as_ptr();
@@ -23657,16 +24090,14 @@ impl Gpu {
             + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
             + crate::profile::gemv_hfq4g256_bytes(alpha_m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq6g256", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_qkvza_hfq6g256",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; aq, az, ab, aa, xp, yq, yz, yb, ya, q_m, z_m_val, b_m, a_m, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -23702,7 +24133,6 @@ impl Gpu {
             "gemm_qkvza_hfq6g256_fp16",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_qkvza_hfq6g256_fp16"];
 
         let mut aq = a_qkv.buf.as_ptr();
         let mut az = a_z.buf.as_ptr();
@@ -23752,16 +24182,14 @@ impl Gpu {
                   + batch_size * (qkv_m + z_m + beta_m + alpha_m) * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq6g256_fp16", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_qkvza_hfq6g256_fp16",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; aq, az, ab, aa, xp, yq, yz, yb, ya, q_m, z_m_val, b_m, a_m, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -23895,7 +24323,6 @@ impl Gpu {
             "gemm_qkvza_hfq6g256_dot2",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_qkvza_hfq6g256_dot2"];
 
         let mut aq = a_qkv.buf.as_ptr();
         let mut az = a_z.buf.as_ptr();
@@ -23937,16 +24364,14 @@ impl Gpu {
         };
         let total_m = (qkv_m + z_m + beta_m + alpha_m) as u32;
 
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        launch_params_blob!(
+            self,
+            "gemm_qkvza_hfq6g256_dot2",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; aq, az, ab, aa, xp, yq, yz, yb, ya, q_m, z_m_val, b_m, a_m, k_val, n_val
+        )
     }
 
     /// WMMA-accelerated batched 4-way fused HFQ6-G256 GEMM (qkv + z + beta + alpha).
@@ -24219,7 +24644,6 @@ impl Gpu {
             kernels::GEMM_QKV_HFQ6G256_SRC,
             "gemm_qkv_hfq6g256",
         )?;
-        let func = &self.functions["gemm_qkv_hfq6g256"];
 
         let mut aq = a_q.buf.as_ptr();
         let mut ak = a_k.buf.as_ptr();
@@ -24259,16 +24683,14 @@ impl Gpu {
             + crate::profile::gemv_hfq4g256_bytes(k_m, k)
             + crate::profile::gemv_hfq4g256_bytes(v_m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq6g256", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_qkv_hfq6g256",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; aq, ak, av, xp, yq, yk, yv, q_m_val, k_m_val, v_m_val, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -24301,7 +24723,6 @@ impl Gpu {
             "gemm_qkv_hfq6g256_fp16",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_qkv_hfq6g256_fp16"];
 
         let mut aq = a_q.buf.as_ptr();
         let mut ak = a_k.buf.as_ptr();
@@ -24343,16 +24764,14 @@ impl Gpu {
                   + batch_size * k * 2  // FP16 X
                   + batch_size * (q_m + k_m + v_m) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq6g256_fp16", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_qkv_hfq6g256_fp16",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; aq, ak, av, xp, yq, yk, yv, q_m_val, k_m_val, v_m_val, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -24469,7 +24888,6 @@ impl Gpu {
             "gemm_qkv_hfq6g256_dot2",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_qkv_hfq6g256_dot2"];
 
         let mut aq = a_q.buf.as_ptr();
         let mut ak = a_k.buf.as_ptr();
@@ -24505,16 +24923,14 @@ impl Gpu {
         };
         let total_m = (q_m + k_m + v_m) as u32;
 
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        launch_params_blob!(
+            self,
+            "gemm_qkv_hfq6g256_dot2",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; aq, ak, av, xp, yq, yk, yv, q_m_val, k_m_val, v_m_val, k_val, n_val
+        )
     }
 
     /// WMMA-accelerated batched 3-way fused HFQ6-G256 GEMM (Q + K + V).
@@ -24757,7 +25173,6 @@ impl Gpu {
             kernels::GEMM_GATE_UP_HFQ6G256_SRC,
             "gemm_gate_up_hfq6g256",
         )?;
-        let func = &self.functions["gemm_gate_up_hfq6g256"];
 
         let mut ag = a_gate.buf.as_ptr();
         let mut au = a_up.buf.as_ptr();
@@ -24790,16 +25205,14 @@ impl Gpu {
         let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
             + crate::profile::gemv_hfq4g256_bytes(up_m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq6g256", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_gate_up_hfq6g256",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; ag, au, xp, yg, yu, g_m, u_m, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -24829,7 +25242,6 @@ impl Gpu {
             "gemm_gate_up_hfq6g256_fp16",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_gate_up_hfq6g256_fp16"];
 
         let mut ag = a_gate.buf.as_ptr();
         let mut au = a_up.buf.as_ptr();
@@ -24865,16 +25277,14 @@ impl Gpu {
                   + batch_size * (gate_m + up_m) * 4;
         let timer =
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq6g256_fp16", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            "gemm_gate_up_hfq6g256_fp16",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; ag, au, xp, yg, yu, g_m, u_m, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -24975,7 +25385,6 @@ impl Gpu {
             "gemm_gate_up_hfq6g256_dot2",
         )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        let func = &self.functions["gemm_gate_up_hfq6g256_dot2"];
 
         let mut ag = a_gate.buf.as_ptr();
         let mut au = a_up.buf.as_ptr();
@@ -25005,16 +25414,14 @@ impl Gpu {
         };
         let total_m = (gate_m + up_m) as u32;
 
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [total_m, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        launch_params_blob!(
+            self,
+            "gemm_gate_up_hfq6g256_dot2",
+            [total_m, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            params; ag, au, xp, yg, yu, g_m, u_m, k_val, n_val
+        )
     }
 
     /// WMMA-accelerated batched 2-way fused HFQ6-G256 GEMM (gate + up).
@@ -25546,7 +25953,7 @@ impl Gpu {
     ) -> HipResult<()> {
         // Few rows (speculative verify) on gfx1151: the decode kernels over
         // every row, weights read once.
-        if self.gemv_q8_0_staged_rows_supported(k, n) {
+        if self.gemv_q8_0_staged_rows_supported(k, self.route_rows(n)) {
             return self.gemv_q8_0_staged_rows(a_raw, x, y, m, k, n);
         }
         self.bind_thread()?;
@@ -26559,17 +26966,17 @@ impl Gpu {
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32", true);
+            && *DISPATCH_GFX1100_DENSE_GATE_UP_STAGE_X32;
         let dense_gate_up_pair_gfx1100 = self.arch_caps.is_gfx1100()
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR", false);
+            && *DISPATCH_GFX1100_DENSE_GATE_UP_PAIR;
         let dense_gate_up_pair2_gfx1100 = self.arch_caps.is_gfx1100()
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR2", false);
+            && *DISPATCH_GFX1100_DENSE_GATE_UP_PAIR2;
         // Qwen3.6-27B MQ4, W7900/gfx1100: two fresh-process alternating
         // campaigns measured +0.42% and +0.49% decode throughput. Keep this
         // explicit because the algebraic rewrite changes FP association even
@@ -26578,7 +26985,7 @@ impl Gpu {
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_DOT_REFORM", false);
+            && *DISPATCH_GFX1100_DENSE_GATE_UP_DOT_REFORM;
         // Qwen3.6-27B MQ4, W7900/gfx1100: a fresh-process 128-token
         // A/B/B/A measured +0.42% throughput and -0.42% p50 latency. Keep
         // opt-in: 92 VGPR remains spill-free, but the gain is too small to
@@ -26587,17 +26994,17 @@ impl Gpu {
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH", false);
+            && *DISPATCH_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH;
         let dense_gate_up_setprio_gfx1100 = self.arch_caps.is_gfx1100()
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_SETPRIO", false);
+            && *DISPATCH_GFX1100_DENSE_GATE_UP_SETPRIO;
         let dense_gate_up_lane0_headers_gfx1100 = self.arch_caps.is_gfx1100()
             && gate_m == 17_408
             && up_m == 17_408
             && k == 5_120
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_LANE0_HEADERS", false);
+            && *DISPATCH_GFX1100_DENSE_GATE_UP_LANE0_HEADERS;
         let dense_gate_up_dot_prefetch_gfx1100 =
             dense_gate_up_dot_reform_gfx1100 && dense_gate_up_quad_prefetch_gfx1100;
         let (func_name, block, grid_x) = if dense_gate_up_pair2_gfx1100 {
@@ -26771,7 +27178,9 @@ impl Gpu {
             &um as *const _ as *mut c_void,
             &kv as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(func_name, [grid_x, 1, 1], block, 0, &mut params, || {
+        let gu_bytes = (gate_m + up_m) * (k / 256) * 136 + k * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, gu_bytes);
+        let r = self.launch_maybe_blob(func_name, [grid_x, 1, 1], block, 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(ag);
             b.push_ptr(au);
@@ -26782,7 +27191,11 @@ impl Gpu {
             b.push_i32(um);
             b.push_i32(kv);
             b
-        })
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        r
     }
 
     /// Fused gate+up for Q8_0 weights: two Q8 GEMVs in one launch.
@@ -27220,7 +27633,7 @@ impl Gpu {
         result
     }
 
-    /// Batched `fused_sigmoid_alpha_gate_f32`. Grid.y is the batch dim.
+    /// Batched `fused_sigmoid_alpha_gate_f32`. Batch rows fold into grid.x.
     #[cfg(feature = "deltanet")]
     pub fn fused_sigmoid_alpha_gate_f32_batched(
         &mut self,
@@ -27250,7 +27663,9 @@ impl Gpu {
             &mut nn as *mut _ as *mut c_void,
         ];
         let block = 256u32;
-        let grid = ((n as u32) + block - 1) / block;
+        // Rows fold into grid.x (row = x / blocks_per_row); grid.y is bounded
+        // at 65535 and the explicit prefill chunk ceiling can exceed it.
+        let grid = crate::scratch::fold_rows_into_x(n.div_ceil(block as usize), batch_size)?;
         let bytes = n * 4 * 4 * batch_size;
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -27260,7 +27675,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "fused_sigmoid_alpha_gate_f32",
-            [grid, batch_size as u32, 1],
+            grid,
             [block, 1, 1],
             0,
             &mut params,
@@ -27341,7 +27756,7 @@ impl Gpu {
         result
     }
 
-    /// Batched `fused_qk_l2_norm_scale_f32`. Grid.y is the batch dim.
+    /// Batched `fused_qk_l2_norm_scale_f32`. Batch rows fold into grid.x.
     #[cfg(feature = "deltanet")]
     pub fn fused_qk_l2_norm_scale_f32_batched(
         &mut self,
@@ -27374,6 +27789,8 @@ impl Gpu {
             &mut ep as *mut _ as *mut c_void,
         ];
         let bytes = crate::profile::elementwise1_bytes(n_heads * head_dim) * 2 * batch_size;
+        // Rows fold into grid.x (row = x / n_heads), not bound by grid.y.
+        let grid = crate::scratch::fold_rows_into_x(n_heads, batch_size)?;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "fused",
@@ -27382,7 +27799,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "fused_qk_l2_norm_scale_f32",
-            [n_heads as u32, batch_size as u32, 1],
+            grid,
             [32, 1, 1],
             0,
             &mut params,
@@ -27453,6 +27870,8 @@ impl Gpu {
         ];
         let bytes =
             crate::profile::elementwise1_bytes(n_key_heads * ratio * head_dim) * 2 * batch_size;
+        // Rows fold into grid.x (row = x / n_key_heads), not bound by grid.y.
+        let grid = crate::scratch::fold_rows_into_x(n_key_heads, batch_size)?;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "fused",
@@ -27461,7 +27880,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "fused_qk_l2_norm_scale_interleave_f32_batched",
-            [n_key_heads as u32, batch_size as u32, 1],
+            grid,
             [32, 1, 1],
             0,
             &mut params,
@@ -27497,7 +27916,6 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gemm_f16", kernels::GEMM_F16_SRC, "gemm_f16")?;
-        let func = &self.functions["gemm_f16"];
         let mut wp = w.buf.as_ptr();
         let mut xp = x.buf.as_ptr();
         let mut yp = y.buf.as_ptr();
@@ -27512,16 +27930,14 @@ impl Gpu {
             &mut ki as *mut _ as *mut c_void,
             &mut ni as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, n as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        launch_params_blob!(
+            self,
+            "gemm_f16",
+            [m as u32, n as u32, 1],
+            [32, 1, 1],
+            0,
+            params; wp, xp, yp, mi, ki, ni
+        )
     }
 
     /// WMMA-accelerated batched GEMM for F16 weights × F32 activations (gfx1100+).
@@ -27538,7 +27954,6 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gemm_f16_wmma", kernels::GEMM_F16_WMMA_SRC, "gemm_f16_wmma")?;
-        let func = &self.functions["gemm_f16_wmma"];
         let mut wp = w.buf.as_ptr();
         let mut xp = x.buf.as_ptr();
         let mut yp = y.buf.as_ptr();
@@ -27555,16 +27970,14 @@ impl Gpu {
         ];
         let grid_m = ((m + 15) / 16) as u32;
         let grid_n = ((n + 15) / 16) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid_m, grid_n, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        launch_params_blob!(
+            self,
+            "gemm_f16_wmma",
+            [grid_m, grid_n, 1],
+            [32, 1, 1],
+            0,
+            params; wp, xp, yp, mi, ki, ni
+        )
     }
 
     /// Fused-transpose WMMA GEMM: Y[N,M] = W_f16[M,K] @ X_f32[N,K]^T.
@@ -27584,7 +27997,6 @@ impl Gpu {
             kernels::GEMM_F16_WMMA_MB4_SRC,
             "gemm_f16_wmma_mb4",
         )?;
-        let func = &self.functions["gemm_f16_wmma_mb4"];
         let mut wp = w.buf.as_ptr();
         let mut xp = x.buf.as_ptr();
         let mut yp = y.buf.as_ptr();
@@ -27601,16 +28013,14 @@ impl Gpu {
         ];
         let grid_m = ((m + 15) / 16) as u32;
         let grid_n = ((n + 63) / 64) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid_m, grid_n, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        launch_params_blob!(
+            self,
+            "gemm_f16_wmma_mb4",
+            [grid_m, grid_n, 1],
+            [32, 1, 1],
+            0,
+            params; wp, xp, yp, mi, ki, ni
+        )
     }
 
     /// MB=8 fused-transpose WMMA GEMM: 8 N-subtiles per block.
@@ -27646,7 +28056,6 @@ impl Gpu {
             ));
         };
         self.ensure_kernel(kernel_name, kernel_src, symbol)?;
-        let func = &self.functions[kernel_name];
         let mut wp = w.buf.as_ptr();
         let mut xp = x.buf.as_ptr();
         let mut yp = y.buf.as_ptr();
@@ -27663,16 +28072,14 @@ impl Gpu {
         ];
         let grid_m = ((m + 15) / 16) as u32;
         let grid_n = ((n + 127) / 128) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid_m, grid_n, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        launch_params_blob!(
+            self,
+            kernel_name,
+            [grid_m, grid_n, 1],
+            [32, 1, 1],
+            0,
+            params; wp, xp, yp, mi, ki, ni
+        )
     }
 
     /// Tiled F16 GEMM — 8-way ILP unrolled, lane-coalesced stride-32 reads,
@@ -27693,7 +28100,6 @@ impl Gpu {
             kernels::GEMM_F16_TILED_SRC,
             "gemm_f16_tiled",
         )?;
-        let func = &self.functions["gemm_f16_tiled"];
         let mut wp = w.buf.as_ptr();
         let mut xp = x.buf.as_ptr();
         let mut yp = y.buf.as_ptr();
@@ -27709,16 +28115,14 @@ impl Gpu {
             &mut ni as *mut _ as *mut c_void,
         ];
         // Same grid as naive: [M, N], block [32], no LDS
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, n as u32, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        launch_params_blob!(
+            self,
+            "gemm_f16_tiled",
+            [m as u32, n as u32, 1],
+            [32, 1, 1],
+            0,
+            params; wp, xp, yp, mi, ki, ni
+        )
     }
 
     /// Fused GEMM + bias: Y[N,M] = X[N,K] @ W_f16[M,K]^T + bias[M].
@@ -27736,7 +28140,6 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gemm_f16_bias", kernels::GEMM_F16_BIAS_SRC, "gemm_f16_bias")?;
-        let func = &self.functions["gemm_f16_bias"];
         let mut wp = w.buf.as_ptr();
         let mut xp = x.buf.as_ptr();
         let mut bp = bias.buf.as_ptr();
@@ -27754,16 +28157,14 @@ impl Gpu {
             &mut ni as *mut _ as *mut c_void,
         ];
         // One block per row of X, 256 threads, no LDS
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [n as u32, 1, 1],
-                [256, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        launch_params_blob!(
+            self,
+            "gemm_f16_bias",
+            [n as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            params; wp, xp, bp, yp, mi, ki, ni
+        )
     }
 
     /// Batched GEMM for F32: Y[M,N] = A[M,K] @ B[N,K]^T
@@ -27782,31 +28183,41 @@ impl Gpu {
             kernels::GEMM_F32_SRC,
             "gemm_f32_batched",
         )?;
-        let func = &self.functions["gemm_f32_batched"];
-        let mut ap = a.buf.as_ptr();
-        let mut bp = b.buf.as_ptr();
-        let mut yp = y.buf.as_ptr();
-        let mut mi = m as i32;
-        let mut ki = k as i32;
-        let mut ni = n as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut ap as *mut _ as *mut c_void,
-            &mut bp as *mut _ as *mut c_void,
-            &mut yp as *mut _ as *mut c_void,
-            &mut mi as *mut _ as *mut c_void,
-            &mut ki as *mut _ as *mut c_void,
-            &mut ni as *mut _ as *mut c_void,
-        ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, n as u32, 1],
+        // The kernel reads batch row `n` from blockIdx.y (<= 65535 blocks), so
+        // rows beyond that launch in chunks with B and Y advanced by whole
+        // rows; every row keeps the same K-loop and reduction as one launch.
+        const MAX_GRID_Y: usize = 65535;
+        let mut result = Ok(());
+        for chunk in 0..n.div_ceil(MAX_GRID_Y).max(1) {
+            let off = chunk * MAX_GRID_Y;
+            let take = (n - off).min(MAX_GRID_Y);
+            let mut ap = a.buf.as_ptr();
+            let mut bp = b.buf.as_ptr().wrapping_byte_add(off * k * std::mem::size_of::<f32>());
+            let mut yp = y.buf.as_ptr().wrapping_byte_add(off * m * std::mem::size_of::<f32>());
+            let mut mi = m as i32;
+            let mut ki = k as i32;
+            let mut ni = take as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut ap as *mut _ as *mut c_void,
+                &mut bp as *mut _ as *mut c_void,
+                &mut yp as *mut _ as *mut c_void,
+                &mut mi as *mut _ as *mut c_void,
+                &mut ki as *mut _ as *mut c_void,
+                &mut ni as *mut _ as *mut c_void,
+            ];
+            result = launch_params_blob!(
+                self,
+                "gemm_f32_batched",
+                [m as u32, take as u32, 1],
                 [32, 1, 1],
                 0,
-                self.stream_ref(),
-                &mut params,
-            )
+                params; ap, bp, yp, mi, ki, ni
+            );
+            if result.is_err() {
+                break;
+            }
         }
+        result
     }
     /// Native-BF16 weight × F32 input batched GEMM.
     ///
@@ -27873,7 +28284,7 @@ impl Gpu {
     pub fn qwen4_f16_wmma_applies(&self, weight: &GpuTensor, k: usize, batch_size: usize) -> bool {
         (self.arch_caps.has_wmma_w32() || self.qwen4_f16_wmma_gfx1201())
             && weight.dtype == DType::BF16
-            && batch_size >= QWEN4_F16_WMMA_MIN_TOKENS
+            && self.route_rows(batch_size) >= QWEN4_F16_WMMA_MIN_TOKENS
             && k % 64 == 0
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
@@ -27882,7 +28293,7 @@ impl Gpu {
 
     /// gfx1201 runs the Qwen4 F16 WMMA route on its own gfx12 kernels
     /// (`gemm_f16_x_f16_wmma_lds_splitk.hip`, `hyper_read_up_wmma.gfx1201.hip`)
-    /// only with `HIPFIRE_QWEN4_F16_WMMA_GFX1201=1` (opt-in, default off).
+    /// unless `HIPFIRE_QWEN4_F16_WMMA_GFX1201=0` (default on).
     /// Exact arch: gfx1200 and every other RDNA4 part stay on the multirow arms.
     pub fn qwen4_f16_wmma_gfx1201(&self) -> bool {
         self.arch_caps.is_gfx1201() && *QWEN4_F16_WMMA_GFX1201
@@ -27895,7 +28306,7 @@ impl Gpu {
     /// the forward decides once and hands the flag to every stream op.
     pub fn qwen4_bf16_streams(&self, rows: usize) -> bool {
         self.arch_caps.has_gfx11_plus_simt()
-            && rows >= QWEN4_F16_WMMA_MIN_TOKENS
+            && self.route_rows(rows) >= QWEN4_F16_WMMA_MIN_TOKENS
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && *QWEN4_F16_WMMA
@@ -27903,12 +28314,399 @@ impl Gpu {
 
     /// The shared FP16 activation scratch as an `elems`-long F16 view, for a
     /// producer that writes the F16 WMMA input itself.  Valid until the next
-    /// FP16 conversion.
+    /// FP16 conversion.  Growth frees the old buffer, so it invalidates
+    /// captured graphs / PM4 tapes first, like `ensure_fp16_x`.
     pub fn qwen4_f16_x_scratch(&mut self, elems: usize) -> HipResult<GpuTensor> {
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fp16_x_scratch_bytes,
+            self.scratch.fp16_x_scratch.is_some(),
+            elems * 2,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
         let ptr = self.scratch.fp16_x_scratch_writable(&self.hip, elems)?;
         Ok(GpuTensor {
             buf: unsafe { DeviceBuffer::from_raw(ptr, elems * 2) },
             shape: vec![elems],
+            dtype: DType::F16,
+        })
+    }
+
+    /// `x` (F32, `[n_elems]`) as its F16 conversion (the uncached `convert_f32_to_f16`
+    /// launch the F16 WMMA GEMMs of F32 operands issue ahead of themselves) in the
+    /// shared F16 scratch, as an F16 view. Valid until the next conversion. The
+    /// byte oracle of the fused shared gate/up (`examples/qwen4_shared_gu_pm.rs`)
+    /// uses it to launch the chain's own conversion.
+    pub fn qwen4_convert_f16_x(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<GpuTensor> {
+        let ptr = self.convert_fp16_x_uncached(x, n_elems)?;
+        Ok(GpuTensor {
+            buf: unsafe { DeviceBuffer::from_raw(ptr, n_elems * 2) },
+            shape: vec![n_elems],
+            dtype: DType::F16,
+        })
+    }
+
+    /// The F16 `[n_elems]` input of a Qwen4 F16 WMMA GEMM: `x` itself when its
+    /// producer already left it as F16 (the fused shared gate/up's hidden,
+    /// [`Gpu::gemm_bf16_xf32_f16_wmma_qwen4_shared_gu_pm`]), else the
+    /// (uncached) F32 -> F16 conversion of `x` in the shared F16 scratch. The
+    /// choice is the tensor's dtype: no hidden state.
+    pub(crate) fn f16_x_or_convert(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<*mut c_void> {
+        if x.dtype == DType::F16 {
+            assert!(x.numel() >= n_elems, "F16 GEMM input holds {} of {n_elems} elements", x.numel());
+            return Ok(x.buf.as_ptr());
+        }
+        self.convert_fp16_x_uncached(x, n_elems)
+    }
+
+    /// Whether the fused shared-expert gate/up kernel
+    /// ([`Gpu::gemm_bf16_xf32_f16_wmma_qwen4_shared_gu_pm`]) applies to the BF16
+    /// `[m × k]` gate and up weights at `batch_size` rows: exact gfx1151,
+    /// `HIPFIRE_QWEN4_SHARED_GU_PM` on (default), both weights on the Qwen4
+    /// F16 WMMA route (the chain's own GEMM: >= `QWEN4_F16_WMMA_MIN_TOKENS`
+    /// rows, no recorder or capture) and the kernel's shape limits
+    /// ([`qwen4_shared_gu_pm_shape`]).
+    pub fn qwen4_shared_gu_pm_applies(&self, gate: &GpuTensor, up: &GpuTensor, m: usize, k: usize, batch_size: usize) -> bool {
+        *QWEN4_SHARED_GU_PM
+            && self.arch_caps.is_gfx1151()
+            && qwen4_shared_gu_pm_shape(m, k, batch_size)
+            && self.qwen4_f16_wmma_applies(gate, k, batch_size)
+            && self.qwen4_f16_wmma_applies(up, k, batch_size)
+    }
+
+    /// One launch of the certified shared gate/up module's entry `wr` (4 or 8 waves
+    /// of 16 channels): `hidden` (F16 `[batch_size, m]`) and the in-place
+    /// post-sigmoid `selector` (F32 `[batch_size]`) from F16 `x16` (`[batch_size, k]`) and the
+    /// BF16 `gate` / `up` weights' F16 shadows, bitwise what the chain of the gate GEMM, the up
+    /// GEMM, `shared_expert_activation_bf16_f32` and the F32 -> F16 conversion of the hidden
+    /// leaves. The caller gates with [`Gpu::qwen4_shared_gu_pm_applies`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen4_shared_gu_pm_launch(
+        &mut self,
+        wr: u8,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        x16: &GpuTensor,
+        hidden: &GpuTensor,
+        selector: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        assert!(matches!(wr, 4 | 8), "shared gate/up PM entries are w4 and w8");
+        assert!(qwen4_shared_gu_pm_shape(m, k, batch_size), "shared gate/up PM shape {m}x{k}x{batch_size}");
+        assert_eq!((x16.dtype, hidden.dtype, selector.dtype), (DType::F16, DType::F16, DType::F32));
+        assert!(x16.numel() >= batch_size * k && hidden.numel() >= batch_size * m && selector.numel() >= batch_size);
+        self.bind_thread()?;
+        let entry = if wr == 8 { "qwen4_shared_gu_pm_gfx1151_w8" } else { "qwen4_shared_gu_pm_gfx1151_w4" };
+        let (wg, wu) = (self.ensure_bf16_f16_shadow(gate, m, k)?, self.ensure_bf16_f16_shadow(up, m, k)?);
+        self.ensure_embedded_kernel("qwen4_shared_gu_pm_gfx1151", kernels::QWEN4_SHARED_GU_PM_GFX1151, entry)?;
+        let (mut wgp, mut wup, mut xp) = (wg, wu, x16.buf.as_ptr());
+        let (mut yp, mut sp) = (hidden.buf.as_ptr(), selector.buf.as_ptr());
+        let (mut mi, mut ki, mut ni) = (m as i32, k as i32, batch_size as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &mut wgp as *mut _ as *mut c_void,
+            &mut wup as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let grid = [m.div_ceil(16 * usize::from(wr)) as u32, batch_size.div_ceil(128) as u32, 1];
+        let bytes = 2 * m * k * 2 + batch_size * k * 2 + batch_size * m * 2 + batch_size * 8;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", entry, bytes);
+        let result = self.launch_maybe_blob(entry, grid, [32 * u32::from(wr), 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(wgp);
+            b.push_ptr(wup);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_ptr(sp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(ni);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// The Flash-Next shared-expert gate/up in one launch: the router's and the selector's
+    /// F16 WMMA GEMMs (the groups `[router]`, `[selector]`, off one F16 conversion of `x`,
+    /// exactly as [`Gpu::gemm_bf16_xf32_f16_wmma_qwen4_groups`] launches them), then
+    /// [`Gpu::qwen4_shared_gu_pm_launch`] over that conversion in place of the gate and up
+    /// GEMMs, the activation and the hidden's conversion. `hidden` is the F16 `[batch_size, m]`
+    /// destination (the shared down reads it as its F16 input). Returns `false` with nothing
+    /// launched unless the route applies ([`Gpu::qwen4_shared_gu_pm_applies`] and the groups'
+    /// own conditions).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_xf32_f16_wmma_qwen4_shared_gu_pm(
+        &mut self,
+        router: (&GpuTensor, &GpuTensor, usize),
+        selector: (&GpuTensor, &GpuTensor, usize),
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        hidden: &GpuTensor,
+        x: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<bool> {
+        if !self.qwen4_shared_gu_pm_applies(gate, up, m, k, batch_size)
+            || !self.gemm_bf16_xf32_f16_wmma_qwen4_groups(&[&[router][..], &[selector][..]], x, k, batch_size)?
+        {
+            return Ok(false);
+        }
+        // Nothing since the groups' conversion wrote the F16 scratch: the view is the same bytes.
+        let x16 = self.qwen4_f16_x_scratch(batch_size * k)?;
+        self.qwen4_shared_gu_pm_launch(QWEN4_SHARED_GU_PM_WAVES, gate, up, &x16, hidden, selector.1, m, k, batch_size)?;
+        Ok(true)
+    }
+
+    /// Checks shared by the DET dense wrappers and their launch-only hooks: exact gfx1151, shape
+    /// limits ([`mtp_dense_det_pm_shape`]), operand dtypes (`weight` of `weight_dtype`: BF16 or
+    /// F16 `[m, k]`, or Q8_0 packed 34-byte blocks; `x` of `x_dtype`; `y` F32) and buffer
+    /// capacities (a Q8_0 weight needs `m * k / 32 * 34` bytes).
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_dense_det_pm_validate(
+        &self,
+        weight: &GpuTensor,
+        weight_dtype: DType,
+        x: &GpuTensor,
+        x_dtype: DType,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        let err = |msg: String| hip_bridge::HipError::new(0, &format!("mtp_dense_det_pm: {msg}"));
+        if self.arch != "gfx1151" {
+            return Err(err(format!("requires exact gfx1151 (device is {})", self.arch)));
+        }
+        if !mtp_dense_det_pm_shape(m, k, n) {
+            return Err(err(format!(
+                "shape M={m} K={k} N={n} outside the kernel's limits (M%16==0, K%64==0, N>=1, extents < 2^31)"
+            )));
+        }
+        if weight.dtype != weight_dtype || x.dtype != x_dtype || y.dtype != DType::F32 {
+            return Err(err(format!(
+                "dtypes must be weight {weight_dtype:?}, X {x_dtype:?}, Y F32 (got {:?}, {:?}, {:?})",
+                weight.dtype, x.dtype, y.dtype
+            )));
+        }
+        let x_elem = if x_dtype == DType::F16 { 2 } else { 4 };
+        let weight_bytes = if weight_dtype == DType::Q8_0 { m * (k / 32) * 34 } else { m * k * 2 };
+        if weight.buf.size() < weight_bytes || x.buf.size() < n * k * x_elem || y.buf.size() < n * m * 4 {
+            return Err(err("buffer capacity is too small".into()));
+        }
+        Ok(())
+    }
+
+    /// Launch-only hook of the standalone MTP dense DET GEMM
+    /// (`kernels::MTP_DENSE_DET_PM_GFX1151`, entry `mtp_dense_det_pm_gfx1151_w8`): `y` (F32
+    /// `[n, m]`) from F16 `x16` (`[n, k]`) and the model-lifetime F16 shadow of the BF16 `weight`
+    /// (`[m, k]`; created on first use, keyed by the weight pointer, so the weight must stay
+    /// alive). One fixed 128 x 256 tile and one ascending K16 WMMA chain per output, no split-K,
+    /// no epilogue; DET, not byte-equal to the BF16 incumbent. No X conversion is issued here.
+    /// Errors (nothing launched) outside exact gfx1151 or [`mtp_dense_det_pm_shape`], on a
+    /// dtype / capacity mismatch, a pointer not 16-byte aligned, or `y` overlapping an input.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mtp_dense_det_pm_launch(
+        &mut self,
+        weight: &GpuTensor,
+        x16: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.mtp_dense_det_pm_validate(weight, DType::BF16, x16, DType::F16, y, m, k, n)?;
+        let ap = self.ensure_bf16_f16_shadow(weight, m, k)?;
+        self.mtp_dense_det_pm_launch_a16(ap, x16, y, m, k, n)
+    }
+
+    /// [`Gpu::mtp_dense_det_pm_launch`] for an F16 `weight16` (`[m, k]`, used as A16 directly: no
+    /// shadow): the same kernel, entry, ABI and checks, so a row's bytes are those of the BF16 hook
+    /// over the same F16 values.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mtp_dense_det_pm_launch_f16(
+        &mut self,
+        weight16: &GpuTensor,
+        x16: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.mtp_dense_det_pm_validate(weight16, DType::F16, x16, DType::F16, y, m, k, n)?;
+        self.mtp_dense_det_pm_launch_a16(weight16.buf.as_ptr(), x16, y, m, k, n)
+    }
+
+    /// The one launch of `mtp_dense_det_pm_gfx1151_w8` over a validated F16 A16 device pointer
+    /// (an F16 weight or a model-lifetime shadow): 16-byte alignment, `y` non-overlap, grid and
+    /// kernarg. Callers validate dtypes, shape and capacities first.
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_dense_det_pm_launch_a16(
+        &mut self,
+        mut ap: *mut c_void,
+        x16: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        let err = |msg: String| hip_bridge::HipError::new(0, &format!("mtp_dense_det_pm: {msg}"));
+        let (mut xp, mut yp) = (x16.buf.as_ptr(), y.buf.as_ptr());
+        let (a_lo, x_lo, y_lo) = (ap as usize, xp as usize, yp as usize);
+        if a_lo % 16 != 0 || x_lo % 16 != 0 || y_lo % 16 != 0 {
+            return Err(err("A16, X16 and Y must be 16-byte aligned".into()));
+        }
+        let overlaps = |lo: usize, len: usize| y_lo < lo + len && lo < y_lo + n * m * 4;
+        if overlaps(a_lo, m * k * 2) || overlaps(x_lo, n * k * 2) {
+            return Err(err("Y overlaps an input".into()));
+        }
+        self.ensure_embedded_kernel("mtp_dense_det_pm_gfx1151", kernels::MTP_DENSE_DET_PM_GFX1151, MTP_DENSE_DET_PM_ENTRY)?;
+        let (mut mi, mut ki, mut ni) = (m as i32, k as i32, n as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let grid = [
+            m.div_ceil(MTP_DENSE_DET_PM_TILE_M) as u32,
+            n.div_ceil(MTP_DENSE_DET_PM_TILE_N) as u32,
+            1,
+        ];
+        let bytes = m * k * 2 + n * k * 2 + n * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", MTP_DENSE_DET_PM_ENTRY, bytes);
+        let result = self.launch_maybe_blob(MTP_DENSE_DET_PM_ENTRY, grid, [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(ap);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(ni);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Standalone MTP dense DET projection `Y[n, m] = Σ_k W[m, k]·X[n, k]` for a BF16 weight and
+    /// F32 X / Y, directly callable at any `n >= 1` (fc_hidden: `m = k = 2560`). Warms the
+    /// weight's model-lifetime F16 shadow (BF16 -> F32 exact widening -> F16 RNE, once), converts
+    /// X F32 -> F16 RNE uncached on every call, then launches
+    /// [`Gpu::mtp_dense_det_pm_launch`] on the same stream: each output is one ascending K16 WMMA
+    /// chain from +0 whatever `n` is, so a row's bytes do not depend on its batch. F16 has a
+    /// narrower exponent range than BF16/F32: under/overflow is possible and this is explicitly
+    /// DET, not byte-equal to [`Gpu::gemm_bf16_xf32_multirow`]. Called by the
+    /// `HIPFIRE_QWEN4_MTP_APPEND_DET` prompt-fill append route (default on, exact gfx1151;
+    /// fc_embedding, fc_hidden, HC up).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_xf32_mtp_dense_det_pm(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.mtp_dense_det_pm_validate(weight, DType::BF16, x, DType::F32, y, m, k, n)?;
+        let x16 = self.qwen4_convert_f16_x(x, n * k)?;
+        self.mtp_dense_det_pm_launch(weight, &x16, y, m, k, n)
+    }
+
+    /// The model-lifetime F16 shadow of the BF16 `[m, k]` `weight` (created on first use,
+    /// keyed by the weight pointer) as a non-owning F16 `[m*k]` view: what
+    /// [`Gpu::mtp_dense_det_pm_launch`] reads as A16, for the standalone DET harness's oracle
+    /// and conversion checks. Do not free the view; keep `weight` alive.
+    pub fn mtp_dense_det_pm_weight_shadow(&mut self, weight: &GpuTensor, m: usize, k: usize) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        if weight.dtype != DType::BF16 || m == 0 || k == 0 || weight.buf.size() < m * k * 2 {
+            return Err(hip_bridge::HipError::new(0, "mtp_dense_det_pm_weight_shadow: needs a BF16 weight of at least m*k elements"));
+        }
+        let ptr = self.ensure_bf16_f16_shadow(weight, m, k)?;
+        Ok(GpuTensor {
+            buf: unsafe { DeviceBuffer::from_raw(ptr, m * k * 2) },
+            shape: vec![m * k],
+            dtype: DType::F16,
+        })
+    }
+
+    /// Standalone MTP dense DET projection `Y[n, m] = Σ_k W[m, k]·X[n, k]` for a Q8_0 weight (packed
+    /// 34-byte blocks, contiguous `[m, k]`) and F32 X / Y: [`Gpu::gemm_bf16_xf32_mtp_dense_det_pm`]'s
+    /// kernel and tile with the weight read from its model-lifetime F16 shadow
+    /// ([`Gpu::ensure_q8_0_f16_shadow`]: element `F16-RNE(f32(scale) * f32(q))`, created on first
+    /// use, keyed by the weight pointer, so the weight must stay alive). X F32 -> F16 RNE is
+    /// converted uncached on every call; each output is one ascending K16 WMMA chain from +0
+    /// whatever `n` is, so a row's bytes do not depend on its batch. Shapes as
+    /// [`mtp_dense_det_pm_shape`] (`m % 16 == 0`, `k % 64 == 0`, `n >= 1`). DET, not byte-equal to
+    /// the staged Q8_0 GEMV: F16 operands narrow the exponent range (under/overflow of either
+    /// the converted weight or X is possible).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q8_0_xf32_mtp_dense_det_pm(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.mtp_dense_det_pm_validate(weight, DType::Q8_0, x, DType::F32, y, m, k, n)?;
+        let x16 = self.qwen4_convert_f16_x(x, n * k)?;
+        self.mtp_q8_det_pm_launch(weight, &x16, y, m, k, n)
+    }
+
+    /// Launch-only hook of the Q8_0 MTP dense DET GEMM, the Q8_0 analogue of
+    /// [`Gpu::mtp_dense_det_pm_launch`]: `y` (F32 `[n, m]`) from F16 `x16` (`[n, k]`) and the
+    /// model-lifetime F16 shadow of the Q8_0 `weight` ([`Gpu::ensure_q8_0_f16_shadow`], created on
+    /// first use, keyed by the weight pointer, so the weight must stay alive), then the one
+    /// dense launch. No X conversion is issued here, so one converted `x16` can feed several
+    /// projections of the same input. The shadow converter writes its own immutable tensor and
+    /// never touches the shared F16 X scratch, so `x16` may be converted before the weight's first
+    /// (lazy) shadow on the same stream. Errors (nothing launched) as the BF16 hook.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mtp_q8_det_pm_launch(
+        &mut self,
+        weight: &GpuTensor,
+        x16: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.mtp_dense_det_pm_validate(weight, DType::Q8_0, x16, DType::F16, y, m, k, n)?;
+        let ap = self.ensure_q8_0_f16_shadow(weight, m, k)?;
+        self.mtp_dense_det_pm_launch_a16(ap, x16, y, m, k, n)
+    }
+
+    /// The model-lifetime F16 shadow of the Q8_0 `[m, k]` `weight` (created on first use, keyed
+    /// by the weight pointer) as a non-owning F16 `[m*k]` view: what
+    /// [`Gpu::gemm_q8_0_xf32_mtp_dense_det_pm`] reads as A16, for the DET harness's conversion
+    /// checks. Do not free the view; keep `weight` alive.
+    pub fn mtp_q8_det_pm_weight_shadow(&mut self, weight: &GpuTensor, m: usize, k: usize) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let ptr = self.ensure_q8_0_f16_shadow(weight, m, k)?;
+        Ok(GpuTensor {
+            buf: unsafe { DeviceBuffer::from_raw(ptr, m * k * 2) },
+            shape: vec![m * k],
             dtype: DType::F16,
         })
     }
@@ -27928,6 +28726,15 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if *QWEN4_PROJ_REGIONS
+            && m == 320 && k == 10240
+            // gfx1201's incumbent HC-down is split-K=4, not ascending K.
+            && self.arch_caps.has_wmma_w32()
+        {
+            return self.gemm_bf16_xf16_f16_wmma_regions(
+                &[(weight, y, m)], x_f16, k, batch_size,
+            );
+        }
         let w16 = self.ensure_bf16_f16_shadow(weight, m, k)?;
         let w_view = GpuTensor {
             buf: unsafe { DeviceBuffer::from_raw(w16, m * k * 2) },
@@ -27935,8 +28742,37 @@ impl Gpu {
             dtype: DType::F16,
         };
         if self.arch_caps.is_gfx1201() {
-            let tile = Self::qwen4_lds_tile_gfx1201(m, k);
+            // HC-down keeps the incumbent 64 x 128 p_s4 tile's four K splits on the
+            // 160 x 80 / k32 tile (HIPFIRE_QWEN4_HC_DOWN_TILE), so the bytes match.
+            let tile = if hc_down_tile_selected(
+                self.arch.as_str(), *QWEN4_HC_DOWN_TILE, m, k, self.route_rows(batch_size),
+                self.replay.is_recording(), self.graphs.capture_mode,
+            ) {
+                LdsTileSplitK::HC_DOWN_GFX1201
+            } else {
+                Self::qwen4_lds_tile_gfx1201(m, k)
+            };
             return self.gemm_f16_x_f16_wmma_lds_splitk(&w_view, x_f16, y, m, k, batch_size, tile);
+        }
+        // Measured gfx1151 (flushed, N = 8192 / 2048 / 512): 3.66 / 1.75 / 0.60 ms on 64 x 64
+        // vs 3.10 / 1.54 / 1.12 ms on 160 x 64, so only the large batches take it.
+        if hc_down_tile_selected(
+            self.arch.as_str(), *QWEN4_HC_DOWN_TILE, m, k, self.route_rows(batch_size),
+            self.replay.is_recording(), self.graphs.capture_mode,
+        )
+        {
+            return self.gemm_f16_x_f16_wmma_lds_tiled_ld(
+                &w_view,
+                x_f16,
+                y,
+                None,
+                m,
+                k,
+                batch_size,
+                LdsTile::new(160, 64, 32, 64, 64, false).pipelined(),
+                k,
+                k,
+            );
         }
         // M < 512 (HC input_mix_down 320 x 10240, the shared-expert selector
         // 1 x 2560): the auto tile gives too few workgroups; 64 x 64 keeps
@@ -27964,6 +28800,70 @@ impl Gpu {
         )
     }
 
+    /// Virtually concatenated BF16 shadows, with ascending 16-element K steps.
+    /// Up to four matrices share one X tile; zero-row regions are skipped.
+    pub fn gemm_bf16_xf16_f16_wmma_regions(
+        &mut self,
+        projections: &[(&GpuTensor, &GpuTensor, usize)],
+        x_f16: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        assert!(!projections.is_empty() && projections.len() <= 4);
+        assert!(k > 0 && k % 64 == 0);
+        assert_eq!(x_f16.dtype, DType::F16);
+        if batch_size == 0 || projections.iter().all(|p| p.2 == 0) {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        let mut ap = [std::ptr::null_mut(); 4];
+        let mut yp = [std::ptr::null_mut(); 4];
+        let mut ms = [0i32; 4];
+        for (i, &(weight, y, m)) in projections.iter().enumerate() {
+            assert_eq!(weight.dtype, DType::BF16);
+            assert_eq!(y.dtype, DType::F32);
+            if m != 0 {
+                ap[i] = self.ensure_bf16_f16_shadow(weight, m, k)?;
+            }
+            yp[i] = y.buf.as_ptr();
+            ms[i] = i32::try_from(m).expect("region rows fit i32");
+        }
+        let entry = "gemm_f16_x_f16_wmma_lds_regions_128_128_32_64_k64_p";
+        self.ensure_kernel(
+            "qwen4_gemm_wmma_lds256",
+            kernels::QWEN4_GEMM_F16_X_F16_WMMA_LDS256_SRC,
+            entry,
+        )?;
+        let xp = x_f16.buf.as_ptr();
+        let ki = i32::try_from(k).expect("K fits i32");
+        let ni = i32::try_from(batch_size).expect("batch fits i32");
+        let mut params: [*mut c_void; 17] = std::array::from_fn(|i| match i {
+            0..=3 => &ap[i] as *const _ as *mut c_void,
+            4 => &xp as *const _ as *mut c_void,
+            5..=8 => &yp[i - 5] as *const _ as *mut c_void,
+            9..=12 => &ms[i - 9] as *const _ as *mut c_void,
+            14 => &ni as *const _ as *mut c_void,
+            _ => &ki as *const _ as *mut c_void,
+        });
+        let total: usize = projections.iter().map(|p| p.2).sum();
+        self.launch_maybe_blob(
+            entry, [total.div_ceil(128) as u32, batch_size.div_ceil(128) as u32, 1],
+            [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in ap { b.push_ptr(p); }
+                b.push_ptr(xp);
+                for p in yp { b.push_ptr(p); }
+                for m in ms { b.push_i32(m); }
+                b.push_i32(ki);
+                b.push_i32(ni);
+                b.push_i32(ki);
+                b.push_i32(ki);
+                b
+            },
+        )
+    }
+
     /// [`Gpu::gemm_bf16_xf16_f16_wmma`] from F32 X for each `(weight, y, m)`
     /// (all reading the same `[batch_size, k]` X, converted to F16 once) when
     /// the route applies to every weight; returns `false` with nothing
@@ -27979,39 +28879,308 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<bool> {
-        if projections.is_empty()
-            || !projections
-                .iter()
-                .all(|(weight, _, _)| self.qwen4_f16_wmma_applies(weight, k, batch_size))
+        self.gemm_bf16_xf32_f16_wmma_qwen4_groups(&[projections], x, k, batch_size)
+    }
+
+    /// [`Gpu::gemm_bf16_xf32_f16_wmma_qwen4`] for several projection groups
+    /// reading the same X, converted to F16 once for all of them: each group
+    /// launches exactly what its own call would (the opt-in region fold is
+    /// still decided per group), in group order, so every output's bytes are
+    /// unchanged.  Returns `false` with nothing launched unless the route
+    /// applies to every weight of every group.
+    pub fn gemm_bf16_xf32_f16_wmma_qwen4_groups(
+        &mut self,
+        groups: &[&[(&GpuTensor, &GpuTensor, usize)]],
+        x: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<bool> {
+        if groups.iter().any(|g| g.is_empty())
+            || !groups.iter().flat_map(|g| g.iter()).all(|(weight, _, _)| {
+                self.qwen4_f16_wmma_applies(weight, k, batch_size)
+            })
         {
             return Ok(false);
         }
         self.bind_thread()?;
         let gfx1201 = self.arch_caps.is_gfx1201();
         let short = move |m: usize| m < 16 && gfx1201;
-        for &(weight, y, m) in projections.iter().filter(|&&(_, _, m)| short(m)) {
-            self.gemm_bf16_xf32_multirow(weight, x, y, m, k, batch_size)?;
-        }
-        if projections.iter().all(|&(_, _, m)| short(m)) {
-            return Ok(true);
-        }
-        let x16 = self.convert_fp16_x_uncached(x, batch_size * k)?;
-        let x_view = GpuTensor {
-            buf: unsafe { DeviceBuffer::from_raw(x16, batch_size * k * 2) },
-            shape: vec![batch_size * k],
-            dtype: DType::F16,
-        };
-        for &(weight, y, m) in projections.iter().filter(|&&(_, _, m)| !short(m)) {
-            self.gemm_bf16_xf16_f16_wmma(weight, &x_view, y, m, k, batch_size)?;
+        let mut x_view: Option<GpuTensor> = None;
+        for projections in groups {
+            for &(weight, y, m) in projections.iter().filter(|&&(_, _, m)| short(m)) {
+                self.gemm_bf16_xf32_multirow(weight, x, y, m, k, batch_size)?;
+            }
+            if projections.iter().all(|&(_, _, m)| short(m)) {
+                continue;
+            }
+            // Nothing between the groups writes X or the F16 scratch.
+            if x_view.is_none() {
+                let x16 = self.convert_fp16_x_uncached(x, batch_size * k)?;
+                x_view = Some(GpuTensor {
+                    buf: unsafe { DeviceBuffer::from_raw(x16, batch_size * k * 2) },
+                    shape: vec![batch_size * k],
+                    dtype: DType::F16,
+                });
+            }
+            let x_view = x_view.as_ref().unwrap();
+            if *QWEN4_PROJ_REGIONS
+                && k == 2560 && projections.len() > 1
+                && projections.iter().all(|p| matches!(p.2, 1 | 512 | 640))
+                && (self.arch_caps.has_wmma_w32() || self.arch_caps.is_gfx1201())
+            {
+                let mut group = [projections[0]; 4];
+                let mut count = 0;
+                for &p in projections.iter().filter(|&&(_, _, m)| !short(m)) {
+                    group[count] = p;
+                    count += 1;
+                    if count == 4 {
+                        self.gemm_bf16_xf16_f16_wmma_regions(&group, x_view, k, batch_size)?;
+                        count = 0;
+                    }
+                }
+                if count != 0 {
+                    self.gemm_bf16_xf16_f16_wmma_regions(&group[..count], x_view, k, batch_size)?;
+                }
+                continue;
+            }
+            for &(weight, y, m) in projections.iter().filter(|&&(_, _, m)| !short(m)) {
+                self.gemm_bf16_xf16_f16_wmma(weight, x_view, y, m, k, batch_size)?;
+            }
         }
         Ok(true)
+    }
+    /// Opt-in shared-down fusion; retains the incumbent WMMA accumulation order.
+    /// Returns false without launching when the existing F16 route is unavailable.
+    pub fn qwen4_shared_down_bf16_epi(
+        &mut self, weight: &GpuTensor, x: &GpuTensor, residual: &GpuTensor,
+        scalar: &GpuTensor, m: usize, k: usize, rows: usize,
+    ) -> HipResult<bool> {
+        if !*QWEN4_SHARED_DOWN_EPI
+            || !self.qwen4_f16_wmma_applies(weight, k, rows)
+            || m < 1024
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        let wp = self.ensure_bf16_f16_shadow(weight, m, k)?;
+        let xp = self.f16_x_or_convert(x, rows * k)?;
+        if self.arch_caps.is_gfx1201() {
+            const ENTRY: &str = "qwen4_wmma_lds_128_256_32_64_k64_bsr";
+            self.ensure_kernel("gemm_wmma_lds_splitk", kernels::GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC, ENTRY)?;
+            assert_eq!(residual.dtype, DType::F32);
+            assert_eq!(scalar.dtype, DType::F32);
+            assert_eq!(residual.numel(), rows * m);
+            assert_eq!(scalar.numel(), rows);
+            let rp = residual.buf.as_ptr();
+            let sp = scalar.buf.as_ptr();
+            let mi = m as i32;
+            let ki = k as i32;
+            let ni = rows as i32;
+            let mut params = [
+                &wp as *const _ as *mut c_void, &xp as *const _ as *mut c_void,
+                &rp as *const _ as *mut c_void, &mi as *const _ as *mut c_void,
+                &ki as *const _ as *mut c_void, &ni as *const _ as *mut c_void,
+                &rp as *const _ as *mut c_void, &sp as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(ENTRY, [m.div_ceil(128) as u32, rows.div_ceil(256) as u32, 1],
+                [512, 1, 1], 0, &mut params, || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(wp); b.push_ptr(xp); b.push_ptr(rp);
+                    b.push_i32(mi); b.push_i32(ki); b.push_i32(ni);
+                    b.push_ptr(rp); b.push_ptr(sp); b
+                })?;
+            return Ok(true);
+        }
+        let w = GpuTensor {
+            buf: unsafe { DeviceBuffer::from_raw(wp, m * k * 2) },
+            shape: vec![m * k], dtype: DType::F16,
+        };
+        let xv = GpuTensor {
+            buf: unsafe { DeviceBuffer::from_raw(xp, rows * k * 2) },
+            shape: vec![rows * k], dtype: DType::F16,
+        };
+        let epi = GemmEpilogue {
+            gate: Some(scalar), residual: Some(residual), bf16_scaled_add: true,
+            ..Default::default()
+        };
+        self.gemm_f16_x_f16_wmma_lds_auto_epi(&w, &xv, residual, None, m, k, rows, &epi)?;
+        Ok(true)
+    }
+
+
+    /// Whether [`Gpu::gemm_bf16_xf32_f16_wmma_qwen4_hcsd`] applies to a
+    /// `[m × k]` BF16 weight at `batch_size` rows (H4 shared-down fold,
+    /// `HIPFIRE_QWEN4_HC_FUSE >= 3`): exact gfx1151 on the Qwen4 F16 WMMA
+    /// route, `m % 8 == 0`.
+    pub fn gemm_bf16_xf32_f16_wmma_qwen4_hcsd_applies(
+        &self,
+        weight: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> bool {
+        self.arch_caps.is_gfx1151()
+            && m % 8 == 0
+            && self.qwen4_f16_wmma_applies(weight, k, batch_size)
+    }
+
+    /// The shared-expert down projection, its BF16 scaled add into `routed` and
+    /// the paired HC write in one GEMM: [`Gpu::gemm_bf16_xf32_f16_wmma_qwen4`]
+    /// of `x` (F32, `[batch_size, k]`) followed by
+    /// `bf16_scaled_add_batched(routed, ·, selector)` and
+    /// `hyper_write(hc_streams, mixed = routed, hc_gates)`, bitwise.  `routed`
+    /// (`[batch_size, m]`) is rewritten with the scaled-add result only when
+    /// `hc_write_routed`; `hc_streams` is `[batch_size, 4 * m]` (BF16 bits when
+    /// `hc_bf16`), `hc_gates` `[batch_size, 4]` from the paired HC read.
+    /// Gate with [`Gpu::gemm_bf16_xf32_f16_wmma_qwen4_hcsd_applies`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_xf32_f16_wmma_qwen4_hcsd(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        routed: &GpuTensor,
+        selector: &GpuTensor,
+        hc_streams: &GpuTensor,
+        hc_gates: &GpuTensor,
+        hc_bf16: bool,
+        hc_write_routed: bool,
+    ) -> HipResult<()> {
+        if !self.gemm_bf16_xf32_f16_wmma_qwen4_hcsd_applies(weight, m, k, batch_size) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_bf16_xf32_f16_wmma_qwen4_hcsd: route does not apply",
+            ));
+        }
+        self.bind_thread()?;
+        let w16 = self.ensure_bf16_f16_shadow(weight, m, k)?;
+        let x16 = self.f16_x_or_convert(x, batch_size * k)?;
+        const ENTRY: &str = "gemm_wmma_lds_128_256_32_64_k64_hcsd";
+        let (module, source) = self.lds256_tile_module(ENTRY);
+        self.ensure_kernel(module, source, ENTRY)?;
+        let mut ap = w16;
+        let mut xp = x16;
+        let mut yp: *mut c_void = std::ptr::null_mut();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut rp = routed.buf.as_ptr();
+        let mut sp = selector.buf.as_ptr();
+        let mut streams_ptr = hc_streams.buf.as_ptr();
+        let mut gates_ptr = hc_gates.buf.as_ptr();
+        let mut bf16_val = hc_bf16 as i32;
+        let mut routed_val = hc_write_routed as i32;
+        let mut lai = k as i32;
+        let mut lxi = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut streams_ptr as *mut _ as *mut c_void,
+            &mut gates_ptr as *mut _ as *mut c_void,
+            &mut bf16_val as *mut _ as *mut c_void,
+            &mut routed_val as *mut _ as *mut c_void,
+            &mut lai as *mut _ as *mut c_void,
+            &mut lxi as *mut _ as *mut c_void,
+        ];
+        // 128 x 256 block tile, 32 x 64 wave tiles: (128/32) * (256/64) waves.
+        let grid = [m.div_ceil(128) as u32, batch_size.div_ceil(256) as u32, 1];
+        self.launch_maybe_blob(ENTRY, grid, [512, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(ap);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(bi);
+            b.push_ptr(rp);
+            b.push_ptr(sp);
+            b.push_ptr(streams_ptr);
+            b.push_ptr(gates_ptr);
+            b.push_i32(bf16_val);
+            b.push_i32(routed_val);
+            b.push_i32(lai);
+            b.push_i32(lxi);
+            b
+        })
+    }
+
+    /// The shared-down projection for the HC row fold (`HIPFIRE_QWEN4_HC_ROW_FOLD`):
+    /// [`Gpu::gemm_bf16_xf32_f16_wmma_qwen4_hcsd`]'s GEMM and BF16 rounding of
+    /// `acc + 0.0f`, stored as BF16 bits to `out` (`[batch_size, m]`, at least
+    /// `batch_size * m * 2` bytes; the fold and HC write are then
+    /// [`Gpu::hc_row_fold_norm_gate`]'s).  Gate with
+    /// [`Gpu::gemm_bf16_xf32_f16_wmma_qwen4_hcsd_applies`].
+    /// idea from Gufo upstream (gufo-org/gufo @1071b361, MIT)
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_xf32_f16_wmma_qwen4_bf16st(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        out: &GpuTensor,
+    ) -> HipResult<()> {
+        if !self.gemm_bf16_xf32_f16_wmma_qwen4_hcsd_applies(weight, m, k, batch_size)
+            || out.buf.size() < batch_size * m * 2
+        {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_bf16_xf32_f16_wmma_qwen4_bf16st: route does not apply",
+            ));
+        }
+        self.bind_thread()?;
+        let w16 = self.ensure_bf16_f16_shadow(weight, m, k)?;
+        let x16 = self.f16_x_or_convert(x, batch_size * k)?;
+        const ENTRY: &str = "gemm_wmma_lds_128_256_32_64_k64_bf16st";
+        let (module, source) = self.lds256_tile_module(ENTRY);
+        self.ensure_kernel(module, source, ENTRY)?;
+        let mut ap = w16;
+        let mut xp = x16;
+        let mut yp = out.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut lai = k as i32;
+        let mut lxi = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut lai as *mut _ as *mut c_void,
+            &mut lxi as *mut _ as *mut c_void,
+        ];
+        let grid = [m.div_ceil(128) as u32, batch_size.div_ceil(256) as u32, 1];
+        self.launch_maybe_blob(ENTRY, grid, [512, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(ap);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(bi);
+            b.push_i32(lai);
+            b.push_i32(lxi);
+            b
+        })
     }
 
     /// `Y[b, m] = Σ_k A[m, k]·X[b, k]` (A `[M, K]`, X `[B, K]` F16, Y `[B, M]`
     /// F32) on one tile of `GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC`.  With
     /// `tile.split > 1` the K-split partials go to the shared deterministic
     /// K-split scratch (`split·B·M` F32) and are added in ascending split
-    /// order.  gfx1201 and gfx1151 only; `K % (64·split) == 0`.
+    /// order.  gfx1201 and gfx1151 only; `K % (ks·split) == 0`.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_f16_x_f16_wmma_lds_splitk(
         &mut self,
@@ -28023,15 +29192,18 @@ impl Gpu {
         batch_size: usize,
         tile: LdsTileSplitK,
     ) -> HipResult<()> {
+        if m == 0 || batch_size == 0 {
+            return Ok(());
+        }
         assert!(
             self.arch_caps.is_gfx1201() || self.arch_caps.is_gfx1151(),
             "gemm_f16_x_f16_wmma_lds_splitk is gfx1201/gfx1151-only (arch {})",
             self.arch
         );
         assert!(
-            k > 0 && k % (64 * tile.split) == 0,
+            k > 0 && k % (tile.ks * tile.split) == 0,
             "gemm_f16_x_f16_wmma_lds_splitk: K must be a positive multiple of {} (got {k})",
-            64 * tile.split
+            tile.ks * tile.split
         );
         assert!(
             a_f16.numel() >= m * k && x_f16.numel() >= batch_size * k && y_f32.numel() >= batch_size * m,
@@ -28105,6 +29277,97 @@ impl Gpu {
                 b
             },
         )
+    }
+
+    /// Pitched F16 weights/activations to packed `[B, M]` F32 output on gfx1201.
+    /// Only the four supported unsplit k64 tiles are admitted: accumulation is
+    /// ascending K in one accumulator, with no split scratch or reduction.
+    /// `lda` and `ldx` are element pitches, at least K and divisible by 16.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16_x_f16_wmma_lds_splitk_ld(
+        &mut self,
+        a_f16: &GpuTensor,
+        x_f16: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        tile: LdsTileSplitK,
+        lda: usize,
+        ldx: usize,
+    ) -> HipResult<()> {
+        if m == 0 || batch_size == 0 {
+            return Ok(());
+        }
+        assert!(
+            self.arch_caps.is_gfx1201(),
+            "gemm_f16_x_f16_wmma_lds_splitk_ld is gfx1201-only (arch {})",
+            self.arch
+        );
+        assert_eq!(a_f16.dtype, DType::F16, "splitk_ld: A must be F16");
+        assert_eq!(x_f16.dtype, DType::F16, "splitk_ld: X must be F16");
+        assert_eq!(y_f32.dtype, DType::F32, "splitk_ld: Y must be F32");
+        assert!(
+            splitk_ld_supported(tile, k, lda, ldx),
+            "gemm_f16_x_f16_wmma_lds_splitk_ld: unsupported tile/K/pitch: {tile:?}, K={k}, lda={lda}, ldx={ldx}"
+        );
+        Self::check_lds_pitch(
+            "gemm_f16_x_f16_wmma_lds_splitk_ld",
+            a_f16,
+            x_f16,
+            m,
+            k,
+            batch_size,
+            lda,
+            ldx,
+        );
+        assert!(
+            y_f32.numel() >= batch_size * m,
+            "gemm_f16_x_f16_wmma_lds_splitk_ld: output too small for [{batch_size}, {m}]"
+        );
+        self.bind_thread()?;
+        let entry = splitk_ld_entry(tile).expect("validated pitched split1 tile");
+        self.ensure_kernel(
+            "gemm_wmma_lds_splitk",
+            kernels::GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC,
+            entry,
+        )?;
+        let ap = a_f16.buf.as_ptr();
+        let xp = x_f16.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let bi = batch_size as i32;
+        let lai = lda as i32;
+        let lxi = ldx as i32;
+        let mut params: [*mut c_void; 8] = [
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mi as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+            &bi as *const _ as *mut c_void,
+            &lai as *const _ as *mut c_void,
+            &lxi as *const _ as *mut c_void,
+        ];
+        let threads = ((tile.bm / tile.wm) * (tile.bn / tile.wn) * 32) as u32;
+        let grid = [
+            m.div_ceil(tile.bm) as u32,
+            batch_size.div_ceil(tile.bn) as u32,
+            1,
+        ];
+        self.launch_maybe_blob(entry, grid, [threads, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(ap);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(bi);
+            b.push_i32(lai);
+            b.push_i32(lxi);
+            b
+        })
     }
 
     /// gfx1201 tile for the Qwen4 BF16 projections, measured on the R9700
@@ -28200,9 +29463,14 @@ impl Gpu {
         //
         // The allowlist is unchanged; only the tile shape and grid inside this
         // route change.  blockIdx.y is sixteen bits, so a wave may only cover
-        // a token tile while the row groups fit that limit.
+        // a token tile while the row groups (r16w4t) and token tiles (r16w4)
+        // fit that limit.  No other bound on the token count: past 2048
+        // tokens the four-row kernel is 2.0-2.6x slower per row on gfx1201
+        // while r16w4 keeps its rate through 8192 (2560 x 2560 at 4096:
+        // 11.40 vs 5.52 ms; 320 x 10240 at 8192: 13.22 vs 5.27 ms).
         let r16_shape = self.arch_caps.has_gfx11_plus_simt()
-            && (64..=2048).contains(&batch_size)
+            && batch_size >= 64
+            && batch_size.div_ceil(8) <= 0xffff
             && m.div_ceil(16) <= 0xffff
             && matches!(
                 (m, k),
@@ -28319,6 +29587,73 @@ impl Gpu {
         }
         result
     }
+
+    /// The incumbent gfx1151 sixteen-row `gemm_bf16_xf32_multirow_r16w4_gfx1151` tile launched
+    /// unconditionally (grid `[ceil(m/16), ceil(n/8), 1]`, block 128), bypassing
+    /// [`Gpu::gemm_bf16_xf32_multirow`]'s allowlist: the same kernel and launch it selects for
+    /// an allowlisted `tokens_fast == false` shape (2560 x 2560 at `n = 4096`), for baselines at
+    /// other shapes. Admission mirrors the r16 route: exact gfx1151, BF16 weight, F32 X / Y,
+    /// `m % 16 == 0`, `k % 256 == 0`, `n >= 64`, 16-bit grid dimensions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_xf32_multirow_r16w4_forced(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let err = |msg: String| hip_bridge::HipError::new(0, &format!("multirow_r16w4_forced: {msg}"));
+        if self.arch != "gfx1151" {
+            return Err(err(format!("requires exact gfx1151 (device is {})", self.arch)));
+        }
+        if weight.dtype != DType::BF16 || x.dtype != DType::F32 || y.dtype != DType::F32 {
+            return Err(err("requires BF16 weights and F32 activations/output".into()));
+        }
+        if m == 0 || m % 16 != 0 || k == 0 || k % 256 != 0 || n < 64 || n.div_ceil(8) > 0xffff || m.div_ceil(16) > 0xffff {
+            return Err(err(format!("shape M={m} K={k} N={n} outside r16w4 (M%16==0, K%256==0, N>=64)")));
+        }
+        let (wb, xb, yb) = (m * k * 2, n * k * 4, n * m * 4);
+        if weight.buf.size() < wb || x.buf.size() < xb || y.buf.size() < yb {
+            return Err(err("buffer capacity is too small".into()));
+        }
+        let kernel = "gemm_bf16_xf32_multirow_r16w4_gfx1151";
+        self.ensure_kernel(kernel, kernels::GEMM_BF16_XF32_MULTIROW_R16_GFX1151_SRC, kernel)?;
+        let (wp, xp, yp) = (weight.buf.as_ptr(), x.buf.as_ptr(), y.buf.as_ptr());
+        let (mv, kv, nv) = (m as i32, k as i32, n as i32);
+        let mut params = [
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &nv as *const _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, wb + xb + yb);
+        let result = self.launch_maybe_blob(
+            kernel,
+            [m.div_ceil(16) as u32, n.div_ceil(8) as u32, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     /// Qwen4 qt=53 dense batched projection against G128-rotated rows.
     ///
     /// gfx1151 uses a four-row kernel that shares each decoded weight group
@@ -28335,12 +29670,12 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if batch_size == 1 {
+        if self.route_rows(batch_size) == 1 {
             return self.gemv_mq4g128v2(a_raw, x, y, m, k);
         }
 
         self.bind_thread()?;
-        let gfx1151_multirow = batch_size > 1 && self.arch_caps.has_gfx11_plus_simt();
+        let gfx1151_multirow = self.route_rows(batch_size) > 1 && self.arch_caps.has_gfx11_plus_simt();
         let (func, source, token_tiles) = if gfx1151_multirow {
             (
                 "gemm_mq4g128v2_multirow_gfx1151",
@@ -28672,17 +30007,14 @@ impl Gpu {
         let bytes = m * (k / 32) * 34 + batch_size * (k / 128) * 144 + batch_size * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         // Probe-only raw HIP launch: never enter the Redline recording seam.
-        let func = &self.functions[kernel_name];
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [row_tiles, col_tiles, 1],
-                [256, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = launch_params_blob!(
+            self,
+            kernel_name,
+            [row_tiles, col_tiles, 1],
+            [256, 1, 1],
+            0,
+            params; ap, xp, yp, m_val, k_val, n_val
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -28786,12 +30118,14 @@ impl Gpu {
             kernels::GEMM_Q8_0_WMMA_4W_SRC,
             "gemm_q8_0_wmma_4w",
         )?;
-        // Stage F32 → F16 input if needed.
+        // Stage F32 → F16 input if needed. Uncached: callers reuse one
+        // activation buffer with new contents per layer, which the
+        // pointer-keyed `ensure_fp16_x` would hand back stale.
         let xp_owned = x.buf.as_ptr();
         let mut xp = if matches!(x.dtype, DType::F16) {
             xp_owned
         } else {
-            self.ensure_fp16_x(x, batch_size * k)?
+            self.convert_fp16_x_uncached(x, batch_size * k)?
         };
 
         let mut a_p = a.buf.as_ptr();
@@ -28809,17 +30143,14 @@ impl Gpu {
         ];
         let row_tiles = (m + 63) / 64;
         let batch_tiles = (batch_size + 63) / 64;
-        let func = &self.functions["gemm_q8_0_wmma_4w"];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [row_tiles as u32, batch_tiles as u32, 1],
-                [128, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        launch_params_blob!(
+            self,
+            "gemm_q8_0_wmma_4w",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [128, 1, 1],
+            0,
+            params; a_p, xp, y_p, m_val, k_val, n_val
+        )
     }
     /// F16 weight × F16 input → F32 batched GEMM, arch-routed.
     ///
@@ -28853,28 +30184,26 @@ impl Gpu {
         };
         self.ensure_kernel(module, source, symbol)?;
         let ap = a_f16.buf.as_ptr();
-        let xp = x_f16.buf.as_ptr();
-        let yp = y_f32.buf.as_ptr();
-        let mut mi = m as i32;
-        let mut ki = k as i32;
-        let mut bi = batch_size as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &ap as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &yp as *const _ as *mut c_void,
-            &mut mi as *mut _ as *mut c_void,
-            &mut ki as *mut _ as *mut c_void,
-            &mut bi as *mut _ as *mut c_void,
-        ];
-        let grid_m = ((m + 15) / 16) as u32;
-        let grid_b = ((batch_size + 15) / 16) as u32;
-        self.launch_maybe_blob(
-            module,
-            [grid_m, grid_b, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
+        let mi = m as i32;
+        let ki = k as i32;
+        let grid_m = m.div_ceil(16) as u32;
+        // 16-row batch tiles ride grid.y: launch row pieces of at most
+        // GRID_YZ_MAX tiles with X/Y advanced to the piece's first row.
+        for (start, n) in crate::gemv::grid_yz_chunks(batch_size.div_ceil(16)) {
+            let row0 = start * 16;
+            let rows = (n * 16).min(batch_size - row0);
+            let xp = crate::gemv::ptr_add_bytes(x_f16.buf.as_ptr(), row0 * k * 2);
+            let yp = crate::gemv::ptr_add_bytes(y_f32.buf.as_ptr(), row0 * m * 4);
+            let bi = rows as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &ap as *const _ as *mut c_void,
+                &xp as *const _ as *mut c_void,
+                &yp as *const _ as *mut c_void,
+                &mi as *const _ as *mut c_void,
+                &ki as *const _ as *mut c_void,
+                &bi as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(module, [grid_m, n as u32, 1], [32, 1, 1], 0, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(ap);
                 b.push_ptr(xp);
@@ -28883,8 +30212,9 @@ impl Gpu {
                 b.push_i32(ki);
                 b.push_i32(bi);
                 b
-            },
-        )
+            })?;
+        }
+        Ok(())
     }
 
     /// LDS-staged 128×128 macro-tile GEMM: `Y[b, m] = bias[m] + Σ_k A[m,k]·X[b,k]`.
@@ -29148,22 +30478,7 @@ impl Gpu {
     /// except on gfx1151, where the shipped module already compiles that copy
     /// (one ~30 s JIT of this translation unit instead of two).
     fn lds256_tile_module(&self, entry: &str) -> (&'static str, &'static str) {
-        let is_gfx1151 = self.arch_caps.is_gfx1151();
-        let qwen4_tile = matches!(
-            entry,
-            "gemm_wmma_lds_64_64_32_64_k64" | "gemm_wmma_lds_64_64_32_64_k64_p"
-        );
-        if qwen4_tile && !is_gfx1151 {
-            (
-                "qwen4_gemm_wmma_lds256",
-                kernels::QWEN4_GEMM_F16_X_F16_WMMA_LDS256_SRC,
-            )
-        } else {
-            (
-                Self::LDS256_MODULE,
-                kernels::gemm_f16_x_f16_wmma_lds256_src(is_gfx1151),
-            )
-        }
+        lds256_tile_source_selected(self.arch_caps.is_gfx1151(), entry)
     }
 
     /// A/B knob for the coalesced (LDS-staged) epilogue: `HIPFIRE_LDS_EPI_DIRECT=1`
@@ -29290,6 +30605,9 @@ impl Gpu {
         // Short-M, long-K Qwen4 projections; see gemm_bf16_xf16_f16_wmma.
         LdsTile::new(64, 64, 32, 64, 64, false),
         LdsTile::new(64, 64, 32, 64, 64, false).pipelined(),
+        // HC input_mix_down 160 x 64 (HIPFIRE_QWEN4_HC_DOWN_TILE).
+        LdsTile::new(160, 64, 32, 64, 64, false),
+        LdsTile::new(160, 64, 32, 64, 64, false).pipelined(),
     ];
 
     /// Pick a tile and dispatch it.
@@ -29513,7 +30831,7 @@ impl Gpu {
         if let Some(g) = epi.gate {
             assert_eq!(
                 g.numel(),
-                m,
+                if epi.bf16_scaled_add { batch_size } else { m },
                 "gemm_f16_x_f16_wmma_lds_epi: `gate` must be [M] = [{m}]"
             );
             assert_eq!(
@@ -29521,6 +30839,12 @@ impl Gpu {
                 DType::F32,
                 "gemm_f16_x_f16_wmma_lds_epi: `gate` must be F32"
             );
+        }
+        if epi.bf16_scaled_add && (epi.gate.is_none() || epi.out_f16 || epi.gelu || epi.addin.is_some()) {
+            return Err(hip_bridge::HipError::new(0, "BF16 scaled add requires gate and residual, with no other epilogue"));
+        }
+        if batch_size == 0 || m == 0 {
+            return Ok(());
         }
 
         let mask = epi.mask();
@@ -29577,7 +30901,11 @@ impl Gpu {
         // One wave per wm×wn output patch, 32 threads each.
         let threads = ((tile.bm / tile.wm) * (tile.bn / tile.wn) * 32) as u32;
         self.bind_thread()?;
-        let (module, source) = self.lds256_source();
+        let (module, source) = if epi.bf16_scaled_add {
+            ("qwen4_gemm_wmma_lds256", std::borrow::Cow::Borrowed(kernels::QWEN4_GEMM_F16_X_F16_WMMA_LDS256_SRC))
+        } else {
+            self.lds256_source()
+        };
         self.ensure_kernel(module, &source, &entry)?;
         let ap = a_f16.buf.as_ptr();
         let xp = x_f16.buf.as_ptr();
@@ -29796,7 +31124,6 @@ impl Gpu {
             32u32,
         );
         self.ensure_kernel(kname, src, kname)?;
-        let func = &self.functions[kname];
         let mut ap = a.buf.as_ptr();
         let mut xp = x.buf.as_ptr();
         let mut yp = y.buf.as_ptr();
@@ -29812,16 +31139,14 @@ impl Gpu {
             &mut bs as *mut _ as *mut c_void,
         ];
         let grid_y = (batch_size as u32 + batch_tile - 1) / batch_tile;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, grid_y, 1],
-                [block_x, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        launch_params_blob!(
+            self,
+            kname,
+            [m as u32, grid_y, 1],
+            [block_x, 1, 1],
+            0,
+            params; ap, xp, yp, mi, ki, bs
+        )
     }
     /// Waves per block in the low-bit WMMA prefill GEMMs. Each wave owns a
     /// 16-row tile and they share one LDS-staged activation tile, so x is read
@@ -29893,7 +31218,6 @@ impl Gpu {
         assert_eq!(k % 128, 0, "{name}: k must be a multiple of 128, got {k}");
         self.bind_thread()?;
         self.ensure_kernel(name, src, name)?;
-        let func = &self.functions[name];
         let ap = a_raw.buf.as_ptr();
         let xp = x_f32.buf.as_ptr();
         let yp = y_f32.buf.as_ptr();
@@ -29908,22 +31232,20 @@ impl Gpu {
             &mut ki as *mut _ as *mut c_void,
             &mut bi as *mut _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                // 16 rows per wave x LOWBIT_WMMA_WAVES waves per block; the
-                // block shares one LDS-staged x tile.
-                [
-                    m.div_ceil(16 * Self::LOWBIT_WMMA_WAVES) as u32,
-                    batch_size.div_ceil(64) as u32,
-                    1,
-                ],
-                [32 * Self::LOWBIT_WMMA_WAVES as u32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        launch_params_blob!(
+            self,
+            name,
+            // 16 rows per wave x LOWBIT_WMMA_WAVES waves per block; the
+            // block shares one LDS-staged x tile.
+            [
+                m.div_ceil(16 * Self::LOWBIT_WMMA_WAVES) as u32,
+                batch_size.div_ceil(64) as u32,
+                1,
+            ],
+            [32 * Self::LOWBIT_WMMA_WAVES as u32, 1, 1],
+            0,
+            params; ap, xp, yp, mi, ki, bi
+        )
     }
 
     pub fn gemm_hfq4g256_wmma(
@@ -29941,7 +31263,6 @@ impl Gpu {
             kernels::GEMM_HFQ4G256_WMMA_SRC,
             "gemm_hfq4g256_wmma",
         )?;
-        let func = &self.functions["gemm_hfq4g256_wmma"];
         let ap = a_raw.buf.as_ptr();
         let xp = x_f16.buf.as_ptr();
         let yp = y_f32.buf.as_ptr();
@@ -29958,16 +31279,14 @@ impl Gpu {
         ];
         let grid_m = ((m + 15) / 16) as u32;
         let grid_b = ((batch_size + 15) / 16) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid_m, grid_b, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        launch_params_blob!(
+            self,
+            "gemm_hfq4g256_wmma",
+            [grid_m, grid_b, 1],
+            [32, 1, 1],
+            0,
+            params; ap, xp, yp, mi, ki, bi
+        )
     }
     pub fn gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
         &mut self,
@@ -31126,7 +32445,9 @@ impl Gpu {
             &m_val as *const _ as *mut c_void,
             &k_val as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(KERNEL, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+        // Eight rows per 256-thread workgroup, one wave per row.
+        let grid = [m.div_ceil(8) as u32, 1, 1];
+        self.launch_maybe_blob(KERNEL, grid, [256, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(pp);
             b.push_ptr(ip);
@@ -31134,6 +32455,78 @@ impl Gpu {
             b.push_ptr(sp);
             b.push_ptr(hp);
             b.push_ptr(rp);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        })
+    }
+    /// Grouped HFQ4-G128 MoE down: `y[r, :] = per_expert_scale[e] * W_e ·
+    /// act[sorted_slots[r]]` for every grouped row `r` of the 16-slot tiles
+    /// `tile_ids` (the `moe_scatter_fused_k8` layout); padding rows are not
+    /// written. `m_total` is a multiple of 16.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq4g128_moe_down_grouped(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        tile_ids: &GpuTensor,
+        sorted_slots: &GpuTensor,
+        per_expert_scale: &GpuTensor,
+        act: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        m_total: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // gfx1151: wave32 WMMA (F16 activations); the scalar kernel elsewhere.
+        let wmma = self.arch_caps.is_gfx1151() && k % 16 == 0;
+        let (kernel, src, grid, block): (&str, &str, [u32; 3], u32) = if wmma {
+            (
+                "gemm_hfq4g128_moe_down_grouped_wmma",
+                kernels::GEMM_HFQ4G128_MOE_DOWN_GROUPED_WMMA_SRC,
+                [m.div_ceil(16) as u32, (m_total / 16) as u32, 1],
+                32,
+            )
+        } else {
+            (
+                "gemv_hfq4g128_moe_down_grouped",
+                kernels::GEMV_HFQ4G128_MOE_DOWN_GROUPED_SRC,
+                [m.div_ceil(8) as u32, (m_total / 16) as u32, 1],
+                256,
+            )
+        };
+        self.ensure_kernel(kernel, src, kernel)?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let tp = tile_ids.buf.as_ptr();
+        let sp = sorted_slots.buf.as_ptr();
+        let ep = per_expert_scale.buf.as_ptr();
+        // Uncached: one activation buffer is reused with new contents per layer.
+        let ap = if wmma {
+            self.convert_fp16_x_uncached(act, act.numel())?
+        } else {
+            act.buf.as_ptr()
+        };
+        let yp = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(kernel, grid, [block, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(pp);
+            b.push_ptr(tp);
+            b.push_ptr(sp);
+            b.push_ptr(ep);
+            b.push_ptr(ap);
+            b.push_ptr(yp);
             b.push_i32(m_val);
             b.push_i32(k_val);
             b
@@ -31323,7 +32716,7 @@ impl Gpu {
             && self.iu4_producer_sidecar_active(n, k)
             && self.mq4v2_symmetric
             && self.flags.gfx11_iu4_symfold
-            && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")
+            && *DISPATCH_IU4_SYMFOLD
             && hipfire_config::developer_var("HIPFIRE_IU4_BAFOLD").as_deref() != Ok("0")
             && qkv_m > 0
             && qkv_m % 128 == 0
@@ -31370,6 +32763,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error("gemm_qkvza_mq4g256v2_wmma"));
+        }
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
@@ -31428,7 +32824,7 @@ impl Gpu {
                 self.arch.as_str(),
                 4,
                 MqV2PrefillProjection::Qkvza,
-                batch_size,
+                self.route_rows(batch_size),
             ) {
                 match self.arch.as_str() {
                     "gfx1100" => {
@@ -31446,6 +32842,12 @@ impl Gpu {
                     _ => {}
                 }
             }
+        }
+        if self.gfx1151_xlds_active(batch_size, k) {
+            return self.gemm_qkvza_mq4g256v2_wmma_gfx1151_xlds(
+                a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
+                alpha_m, k, batch_size,
+            );
         }
         self.bind_thread()?;
         let kname = "gemm_qkvza_mq4g256v2_wmma";
@@ -31590,7 +32992,7 @@ impl Gpu {
             && self.flags.iu4_prefill_enabled()
             && self.flags.g12_iu4_isa
             && !*G12_IU4_B1_CONTROL
-            && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")
+            && *DISPATCH_IU4_SYMFOLD
             && hipfire_config::developer_var("HIPFIRE_GDN_PREP_FUSED").as_deref() != Ok("0")
             && dims == [10240, 6144, 48, 48]
             && k > 0
@@ -31668,6 +33070,7 @@ impl Gpu {
         // An owed residual add must land before any further GEMM.
         self.flush_residual_fold()?;
         self.ensure_embedded_kernel(module, image, symbol)?;
+        self.iu4_verify_note_iu4(n);
         let mut ptrs = [a_qkv, a_z_fold].map(|t| t.buf.as_ptr());
         let mut xq_ptr = xq;
         let mut outs = [y_z, y_beta, y_alpha].map(|t| t.buf.as_ptr());
@@ -32132,6 +33535,12 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return self.gemm_qkv_mq4g256v2_verify_fp8(
+                a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
+            );
+        }
+        self.iu4_verify_note_f16();
         if self.a8_prefill_active(batch_size, k) {
             let xq = self.ensure_int8_mmq_x(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant_i8(a_q, xq, y_q, q_m, k, batch_size)?;
@@ -32167,6 +33576,13 @@ impl Gpu {
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size, 1,
             );
         }
+        // Speculative-verify window 16 < N < 64 (HIPFIRE_WMMA_BATCH_TILES): the
+        // byte-identical verify-tile twin (gemm_vt.rs).
+        if self.gfx12_verify_bt_active(batch_size, k) {
+            return self.gemm_qkv_mq4g256v2_wmma_gfx12_vt(
+                a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
+            );
+        }
         // Production MQ4V2 weight-reuse tile (gfx1201 QKV BT8 @ N>=96).
         // Capture/replay always keep the historical base launch contract.
         if !self.replay.is_recording() && !self.graphs.capture_mode {
@@ -32174,7 +33590,7 @@ impl Gpu {
                 self.arch.as_str(),
                 4,
                 MqV2PrefillProjection::Qkv,
-                batch_size,
+                self.route_rows(batch_size),
             ) {
                 if self.arch.as_str() == "gfx1201" {
                     return self.gemm_qkv_mq4g256v2_wmma_gfx1201_bt(
@@ -32279,6 +33695,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error("gemm_qkv_mq4g256v2_wmma"));
+        }
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
@@ -32306,7 +33725,7 @@ impl Gpu {
                 self.arch.as_str(),
                 4,
                 MqV2PrefillProjection::Qkv,
-                batch_size,
+                self.route_rows(batch_size),
             ) {
                 match self.arch.as_str() {
                     "gfx1100" => {
@@ -32324,6 +33743,11 @@ impl Gpu {
                     _ => {}
                 }
             }
+        }
+        if self.gfx1151_xlds_active(batch_size, k) {
+            return self.gemm_qkv_mq4g256v2_wmma_gfx1151_xlds(
+                a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
+            );
         }
         self.bind_thread()?;
         let kname = "gemm_qkv_mq4g256v2_wmma";
@@ -32761,7 +34185,13 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.iu4_verify_note_f16();
         self.bind_thread()?;
+        if self.fp8_verify_scope {
+            return self.gemm_gate_up_mq4g256v2_verify_fp8(
+                a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+            );
+        }
         if self.a8_prefill_active(batch_size, k) {
             let xq = self.ensure_int8_mmq_x(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant_i8(a_gate, xq, y_gate, gate_m, k, batch_size)?;
@@ -32859,28 +34289,14 @@ impl Gpu {
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size, 1,
             );
         }
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        // Speculative-verify window 16 < N < 64 (HIPFIRE_WMMA_BATCH_TILES): the
+        // byte-identical verify-tile twin (gemm_vt.rs).
+        if self.gfx12_verify_bt_active(batch_size, k) {
+            return self.gemm_gate_up_mq4g256v2_wmma_gfx12_vt(
+                a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+            );
+        }
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc, func_name): (&str, &str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_hfq4g256_wmma_gfx12_bt12",
@@ -33510,6 +34926,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error("gemm_gate_up_mq4g256v2_wmma"));
+        }
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
@@ -33556,7 +34975,7 @@ impl Gpu {
                 self.arch.as_str(),
                 4,
                 MqV2PrefillProjection::GateUp,
-                batch_size,
+                self.route_rows(batch_size),
             ) {
                 match self.arch.as_str() {
                     "gfx1100" => {
@@ -33572,6 +34991,11 @@ impl Gpu {
                     _ => {}
                 }
             }
+        }
+        if self.gfx1151_xlds_active(batch_size, k) {
+            return self.gemm_gate_up_mq4g256v2_wmma_gfx1151_xlds(
+                a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+            );
         }
         self.bind_thread()?;
         // Small-N eager HIP: exact-gfx1100 RAW-slab ldsstage default-on via
@@ -33736,22 +35160,30 @@ impl Gpu {
             ),
         };
         // gfx1151: the certified builder twin unless `HIPFIRE_V2B_PM=0`.
+        let a4_retile = tile == Iu4V2Tile::V2b
+            && v2b_a4_mode() == Some(A4Mode::Retile)
+            && self.a4_epi_admitted(Some(tile), gate_m, up_m, k, batch_size);
         let v2b_pm = match tile {
             Iu4V2Tile::V2b => v2b_pm_entry(kernel_name, 0, gate_m, k).map(|(name, _)| name),
             Iu4V2Tile::V2c => None,
         };
-        let kernel_name = match v2b_pm {
-            Some(name) => {
-                self.ensure_embedded_kernel(PM_V2B_MODULE, v2b_pm_image()?, name)?;
-                name
-            }
-            None if pm => {
-                self.ensure_embedded_kernel(module, gfx1100_pm_image()?, kernel_name)?;
-                kernel_name
-            }
-            None => {
-                self.ensure_kernel(module, source, kernel_name)?;
-                kernel_name
+        let kernel_name = if a4_retile {
+            self.ensure_embedded_kernel(PM_V2B_A4_MODULE, v2b_a4_pm_image()?, PM_V2B_SILU_M512)?;
+            PM_V2B_SILU_M512
+        } else {
+            match v2b_pm {
+                Some(name) => {
+                    self.ensure_embedded_kernel(PM_V2B_MODULE, v2b_pm_image()?, name)?;
+                    name
+                }
+                None if pm => {
+                    self.ensure_embedded_kernel(module, gfx1100_pm_image()?, kernel_name)?;
+                    kernel_name
+                }
+                None => {
+                    self.ensure_kernel(module, source, kernel_name)?;
+                    kernel_name
+                }
             }
         };
         let mut g_ptr = a_gate.buf.as_ptr();
@@ -33777,8 +35209,18 @@ impl Gpu {
         // Token tile on x, virtual (gate/up interleaved) row tile on y.
         let result = self.launch_maybe_blob(
             kernel_name,
-            [(batch_size / t) as u32, (2 * gate_m / t) as u32, 1],
-            if pm { [256, 1, 1] } else if v2b_pm.is_some() { [512, 1, 1] } else { [32, tile.waves(), 1] },
+            if a4_retile {
+                [(batch_size / 128) as u32, (2 * gate_m / 512) as u32, 1]
+            } else {
+                [(batch_size / t) as u32, (2 * gate_m / t) as u32, 1]
+            },
+            if pm {
+                [256, 1, 1]
+            } else if a4_retile || v2b_pm.is_some() {
+                [512, 1, 1]
+            } else {
+                [32, tile.waves(), 1]
+            },
             tile.lds_bytes(),
             &mut params,
             || {
@@ -33797,6 +35239,123 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result.map(|()| true)
+    }
+
+    /// A4-fusion admission shared by the `HIPFIRE_V2B_A4_EPI` arms: exact
+    /// gfx1151, `gate_m == up_m`, the V2B tile (which already excludes Redline
+    /// recording and graph capture), `gate_m % 256 == 0`,
+    /// `batch_size % 128 == 0`, `k % 256 == 0`, and neither `HIPFIRE_F1LITE=0`
+    /// nor `HIPFIRE_V2B_PM=0`. `tile` is `self.iu4_v2_tile(gate_m, k, batch_size)`.
+    fn a4_epi_admitted(
+        &self,
+        tile: Option<Iu4V2Tile>,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> bool {
+        self.arch == "gfx1151"
+            && gate_m == up_m
+            && tile == Some(Iu4V2Tile::V2b)
+            && gate_m % 256 == 0
+            && batch_size % 128 == 0
+            && k % 256 == 0
+            && hipfire_config::developer_var("HIPFIRE_F1LITE").as_deref() != Ok("0")
+            && hipfire_config::developer_var("HIPFIRE_V2B_PM").as_deref() != Ok("0")
+    }
+
+    /// A4-fusion stage 2 (`HIPFIRE_V2B_A4_EPI`, default on; `=0` opts out): the certified
+    /// V2B gate/up + SiLU GEMM that also writes the w_down A4 sidecar. The
+    /// kernel applies the `fused_silu_hin_rotate_mq_i4_batched` producer to its
+    /// own SiLU output and stores the byte-identical 72-byte `block_i4_128`
+    /// records (`[M/128][N]`, record `(2*group+half)*N + token`) into the
+    /// dedicated `int4_mmq_down_scratch`, so `h` is never written and the
+    /// separate hin producer is skipped. `awq` is w_down's `awq_scale`
+    /// (`f32[gate_m]`). Returns `Ok(None)` without launching unless the arm is
+    /// on and the shape is admitted (see [`Self::a4_epi_admitted`]); the
+    /// caller then runs the unfused path. The returned handle feeds
+    /// [`Self::gemm_mq4g256v2_residual_wmma_iu4_down_prepared`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_gate_up_silu_a4_mq4g256v2_iu4_prepared(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        awq: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<Option<crate::scratch::Int4MmqDownPrepared>> {
+        if v2b_a4_mode() != Some(A4Mode::Fused) {
+            return Ok(None);
+        }
+        let tile = self.iu4_v2_tile(gate_m, k, batch_size);
+        if !self.a4_epi_admitted(tile, gate_m, up_m, k, batch_size) {
+            return Ok(None);
+        }
+        self.bind_thread()?;
+        // Land any owed residual add a folded GEMM left before overwriting.
+        self.flush_residual_fold()?;
+        self.ensure_mq_signs()?;
+        // Reserve the down slot first: its growth may invalidate captured
+        // state, and it never touches the x sidecar `prepared` points into.
+        let res = self.reserve_int4_mmq_down(gate_m, batch_size)?;
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
+        self.ensure_embedded_kernel(PM_V2B_A4_MODULE, v2b_a4_pm_image()?, PM_V2B_SILU_A4)?;
+        let mut g_ptr = a_gate.buf.as_ptr();
+        let mut u_ptr = a_up.buf.as_ptr();
+        let mut xq_ptr = xq;
+        let mut awq_ptr = awq.buf.as_ptr();
+        let mut s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let mut s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let mut y4_ptr = res.ptr();
+        let mut m_val = gate_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut g_ptr as *mut _ as *mut c_void,
+            &mut u_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut awq_ptr as *mut _ as *mut c_void,
+            &mut s1_ptr as *mut _ as *mut c_void,
+            &mut s2_ptr as *mut _ as *mut c_void,
+            &mut y4_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let bytes = 2 * gate_m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES
+            + 72 * (gate_m / 128) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", PM_V2B_SILU_A4, bytes);
+        let result = self.launch_maybe_blob(
+            PM_V2B_SILU_A4,
+            [(batch_size / 128) as u32, (2 * gate_m / 512) as u32, 1],
+            [512, 1, 1],
+            65536,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(g_ptr);
+                b.push_ptr(u_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(awq_ptr);
+                b.push_ptr(s1_ptr);
+                b.push_ptr(s2_ptr);
+                b.push_ptr(y4_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        Ok(Some(crate::scratch::Int4MmqDownPrepared::from_reservation(
+            res,
+        )))
     }
 
     /// F1-lite on exact gfx1201: `gemm_mq4g256v2_gate_up_silu_mmq_iu4_symfold`
@@ -33839,6 +35398,7 @@ impl Gpu {
                 0, "bf16 h requires the production gfx1201 IU4 b1 SiLU object",
             ));
         }
+        self.iu4_verify_note_iu4(n);
         let slab = self.scratch.int4_mmq_slab_at(xq);
         if slab && !isa {
             return Err(hip_bridge::HipError::new(
@@ -33872,7 +35432,7 @@ impl Gpu {
                 kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC,
                 "gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3",
             )
-        } else if hipfire_config::developer_var("HIPFIRE_G12_RASTER").as_deref() != Ok("0") {
+        } else if *DISPATCH_G12_RASTER {
             (
                 "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold_g12r",
                 kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_G12R_SRC,
@@ -34269,14 +35829,17 @@ impl Gpu {
         x_pad: GpuTensor,
         n: usize,
     ) -> HipResult<()> {
-        for ((y, t), &m) in ys.iter().zip(tmps.iter()).zip(y_ms.iter()) {
-            self.hip.memcpy_dtod(&y.buf, &t.buf, n * m * 4)?;
-        }
+        let copied = ys
+            .iter()
+            .zip(tmps.iter())
+            .zip(y_ms.iter())
+            .try_for_each(|((y, t), &m)| self.hip.memcpy_dtod(&y.buf, &t.buf, n * m * 4));
+        // Free every temp before propagating a copy error, or they leak.
         for t in tmps {
             let _ = self.free_tensor(t);
         }
         let _ = self.free_tensor(x_pad);
-        Ok(())
+        copied
     }
 
     /// MQ4G256V2-Lloyd (qt=52) residual FP8 prefill, prepared-X form. LUT twin
@@ -35239,7 +36802,11 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.iu4_verify_note_f16();
         self.bind_thread()?;
+        if self.fp8_verify_scope {
+            return self.gemm_mq4g256v2_residual_verify_fp8(a_raw, x, y, m, k, batch_size);
+        }
         if self.a8_prefill_active(batch_size, k) {
             let xq = self.ensure_int8_mmq_x(x, batch_size, k)?;
             return self.gemm_mq4g256v2_mmq_add_prequant_i8(a_raw, xq, y, m, k, batch_size);
@@ -35323,28 +36890,12 @@ impl Gpu {
             return self
                 .gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8(a_raw, x, y, m, k, batch_size, 1);
         }
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        // Speculative-verify window 16 < N < 64 (HIPFIRE_WMMA_BATCH_TILES): the
+        // byte-identical verify-tile twin (gemm_vt.rs).
+        if self.gfx12_verify_bt_active(batch_size, k) {
+            return self.gemm_mq4g256v2_residual_wmma_gfx12_vt(a_raw, x, y, m, k, batch_size);
+        }
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc, func_name): (&str, &str, &str) = match bt_b {
             12 => (
                 "gemm_hfq4g256_residual_wmma_gfx12_bt12",
@@ -35427,6 +36978,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error("gemm_mq4g256v2_residual_wmma"));
+        }
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
@@ -35510,7 +37064,7 @@ impl Gpu {
                 self.arch.as_str(),
                 4,
                 MqV2PrefillProjection::Residual,
-                batch_size,
+                self.route_rows(batch_size),
             ) {
                 match self.arch.as_str() {
                     "gfx1100" => {
@@ -35526,6 +37080,9 @@ impl Gpu {
                     _ => {}
                 }
             }
+        }
+        if self.gfx1151_xlds_active(batch_size, k) {
+            return self.gemm_mq4g256v2_residual_wmma_gfx1151_xlds(a_raw, x, y, m, k, batch_size);
         }
         self.bind_thread()?;
         let kname = "gemm_mq4g256v2_residual_wmma";
@@ -35575,6 +37132,354 @@ impl Gpu {
     }
 
 
+    /// Exact-gfx1151 small-batch MQ4V2 WMMA route (`*_gfx1151_xlds`): 1..=16 rows,
+    /// K % 256 == 0, eager or HipGraph capture; Redline replay recording keeps the
+    /// base contract. `HIPFIRE_GFX1151_XLDS=0` restores the base kernels.
+    pub(crate) fn gfx1151_xlds_active(&self, batch_size: usize, k: usize) -> bool {
+        self.flags.gfx1151_xlds
+            && self.arch_caps.is_gfx1151()
+            && self.arch == "gfx1151"
+            && !self.replay.is_recording()
+            && (1..=16).contains(&batch_size)
+            && k > 0
+            && k % 256 == 0
+    }
+
+    /// Shared exact-gfx1151 / shape precondition of the `*_gfx1151_xlds` launchers.
+    fn gfx1151_xlds_check(&self, what: &str, batch_size: usize, k: usize) -> HipResult<()> {
+        if !(self.arch_caps.is_gfx1151() && self.arch == "gfx1151") {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!("{what}: exact gfx1151 only"),
+            ));
+        }
+        if !(1..=16).contains(&batch_size) || k == 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!("{what}: requires 1<=batch_size<=16 and K % 256 == 0"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Exact-gfx1151 MQ4V2 gate_up WMMA, 1..=16 rows. Byte-identical to
+    /// `gemm_gate_up_mq4g256v2_wmma` (same per-output WMMA chain and epilogue);
+    /// grid `[ceil((gate_m+up_m)/64), ceil(N/16), 1]`, block `[128, 1, 1]`,
+    /// 4 waves x 16 rows per block with the X slab staged in LDS.
+    pub fn gemm_gate_up_mq4g256v2_wmma_gfx1151_xlds(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        const KNAME: &str = "gemm_gate_up_mq4g256v2_wmma_gfx1151_xlds";
+        self.gfx1151_xlds_check(KNAME, batch_size, k)?;
+        self.bind_thread()?;
+        const MODULE: &str = "gemm_mq4g256v2_wmma_gfx1151_xlds";
+        self.ensure_kernel(MODULE, kernels::GEMM_MQ4G256V2_WMMA_GFX1151_XLDS_SRC, KNAME)?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut ag = a_gate.buf.as_ptr();
+        let mut au = a_up.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yg = y_gate.buf.as_ptr();
+        let mut yu = y_up.buf.as_ptr();
+        let mut g_m = gate_m as i32;
+        let mut u_m = up_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ag as *mut _ as *mut c_void,
+            &mut au as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yg as *mut _ as *mut c_void,
+            &mut yu as *mut _ as *mut c_void,
+            &mut g_m as *mut _ as *mut c_void,
+            &mut u_m as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let total_m = gate_m + up_m;
+        let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(up_m, k)
+            + batch_size * k * 2
+            + batch_size * total_m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", KNAME, bytes);
+        let result = self.launch_maybe_blob(
+            KNAME,
+            [total_m.div_ceil(64) as u32, batch_size.div_ceil(16) as u32, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ag);
+                b.push_ptr(au);
+                b.push_ptr(xp);
+                b.push_ptr(yg);
+                b.push_ptr(yu);
+                b.push_i32(g_m);
+                b.push_i32(u_m);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Exact-gfx1151 MQ4V2 qkvza WMMA, 1..=16 rows. Byte-identical to
+    /// `gemm_qkvza_mq4g256v2_wmma`; grid `[ceil(total_m/64), ceil(N/16), 1]`,
+    /// block `[128, 1, 1]`, 4 waves x 16 rows per block with X staged in LDS.
+    pub fn gemm_qkvza_mq4g256v2_wmma_gfx1151_xlds(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        const KNAME: &str = "gemm_qkvza_mq4g256v2_wmma_gfx1151_xlds";
+        self.gfx1151_xlds_check(KNAME, batch_size, k)?;
+        self.bind_thread()?;
+        const MODULE: &str = "gemm_mq4g256v2_wmma_gfx1151_xlds";
+        self.ensure_kernel(MODULE, kernels::GEMM_MQ4G256V2_WMMA_GFX1151_XLDS_SRC, KNAME)?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut aq = a_qkv.buf.as_ptr();
+        let mut az = a_z.buf.as_ptr();
+        let mut ab = a_beta.buf.as_ptr();
+        let mut aa = a_alpha.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yq = y_qkv.buf.as_ptr();
+        let mut yz = y_z.buf.as_ptr();
+        let mut yb = y_beta.buf.as_ptr();
+        let mut ya = y_alpha.buf.as_ptr();
+        let mut q_m = qkv_m as i32;
+        let mut z_m_val = z_m as i32;
+        let mut b_m = beta_m as i32;
+        let mut a_m = alpha_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut az as *mut _ as *mut c_void,
+            &mut ab as *mut _ as *mut c_void,
+            &mut aa as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yz as *mut _ as *mut c_void,
+            &mut yb as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void,
+            &mut q_m as *mut _ as *mut c_void,
+            &mut z_m_val as *mut _ as *mut c_void,
+            &mut b_m as *mut _ as *mut c_void,
+            &mut a_m as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let total_m = qkv_m + z_m + beta_m + alpha_m;
+        let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(z_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(alpha_m, k)
+            + batch_size * k * 2
+            + batch_size * total_m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", KNAME, bytes);
+        let result = self.launch_maybe_blob(
+            KNAME,
+            [total_m.div_ceil(64) as u32, batch_size.div_ceil(16) as u32, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(az);
+                b.push_ptr(ab);
+                b.push_ptr(aa);
+                b.push_ptr(xp);
+                b.push_ptr(yq);
+                b.push_ptr(yz);
+                b.push_ptr(yb);
+                b.push_ptr(ya);
+                b.push_i32(q_m);
+                b.push_i32(z_m_val);
+                b.push_i32(b_m);
+                b.push_i32(a_m);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Exact-gfx1151 MQ4V2 qkv WMMA, 1..=16 rows. Byte-identical to
+    /// `gemm_qkv_mq4g256v2_wmma`; grid `[ceil(total_m/64), ceil(N/16), 1]`,
+    /// block `[128, 1, 1]`, 4 waves x 16 rows per block with X staged in LDS.
+    pub fn gemm_qkv_mq4g256v2_wmma_gfx1151_xlds(
+        &mut self,
+        a_q: &GpuTensor,
+        a_k: &GpuTensor,
+        a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor,
+        y_k: &GpuTensor,
+        y_v: &GpuTensor,
+        q_m: usize,
+        k_m: usize,
+        v_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        const KNAME: &str = "gemm_qkv_mq4g256v2_wmma_gfx1151_xlds";
+        self.gfx1151_xlds_check(KNAME, batch_size, k)?;
+        self.bind_thread()?;
+        const MODULE: &str = "gemm_mq4g256v2_wmma_gfx1151_xlds";
+        self.ensure_kernel(MODULE, kernels::GEMM_MQ4G256V2_WMMA_GFX1151_XLDS_SRC, KNAME)?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut aq = a_q.buf.as_ptr();
+        let mut ak = a_k.buf.as_ptr();
+        let mut av = a_v.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yq = y_q.buf.as_ptr();
+        let mut yk = y_k.buf.as_ptr();
+        let mut yv = y_v.buf.as_ptr();
+        let mut q_m_val = q_m as i32;
+        let mut k_m_val = k_m as i32;
+        let mut v_m_val = v_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut ak as *mut _ as *mut c_void,
+            &mut av as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yk as *mut _ as *mut c_void,
+            &mut yv as *mut _ as *mut c_void,
+            &mut q_m_val as *mut _ as *mut c_void,
+            &mut k_m_val as *mut _ as *mut c_void,
+            &mut v_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let total_m = q_m + k_m + v_m;
+        let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(k_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(v_m, k)
+            + batch_size * k * 2
+            + batch_size * total_m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", KNAME, bytes);
+        let result = self.launch_maybe_blob(
+            KNAME,
+            [total_m.div_ceil(64) as u32, batch_size.div_ceil(16) as u32, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(ak);
+                b.push_ptr(av);
+                b.push_ptr(xp);
+                b.push_ptr(yq);
+                b.push_ptr(yk);
+                b.push_ptr(yv);
+                b.push_i32(q_m_val);
+                b.push_i32(k_m_val);
+                b.push_i32(v_m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Exact-gfx1151 MQ4V2 residual WMMA (`Y += W@X`), 1..=16 rows.
+    /// Byte-identical to `gemm_mq4g256v2_residual_wmma`; grid
+    /// `[ceil(m/64), ceil(N/16), 1]`, block `[128, 1, 1]`, 4 waves x 16 rows per
+    /// block with the X slab staged in LDS.
+    pub fn gemm_mq4g256v2_residual_wmma_gfx1151_xlds(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        const KNAME: &str = "gemm_mq4g256v2_residual_wmma_gfx1151_xlds";
+        self.gfx1151_xlds_check(KNAME, batch_size, k)?;
+        self.bind_thread()?;
+        const MODULE: &str = "gemm_mq4g256v2_wmma_gfx1151_xlds";
+        self.ensure_kernel(MODULE, kernels::GEMM_MQ4G256V2_WMMA_GFX1151_XLDS_SRC, KNAME)?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", KNAME, bytes);
+        let result = self.launch_maybe_blob(
+            KNAME,
+            [m.div_ceil(64) as u32, batch_size.div_ceil(16) as u32, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// C2 prepared IU4 residual consumer: never launches `quantize_int4_mmq_ds128`.
     /// ADD semantics (`Y += W@X`); matches `gemm_mq4g256v2_residual_wmma` IU4 branch.
     pub fn gemm_mq4g256v2_residual_wmma_iu4_prepared(
@@ -35587,6 +37492,24 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
+        self.gemm_mq4g256v2_mmq_add_prequant_iu4(a_raw, xq, y, m, k, batch_size)
+    }
+
+    /// Down-proj residual consumer of an A4-fused gate/up sidecar
+    /// ([`Self::gemm_gate_up_silu_a4_mq4g256v2_iu4_prepared`]): same ADD
+    /// semantics (`Y += W@X`) as [`Self::gemm_mq4g256v2_residual_wmma_iu4_prepared`],
+    /// reading the dedicated down scratch (generation-checked) instead of the
+    /// shared x sidecar.
+    pub fn gemm_mq4g256v2_residual_wmma_iu4_down_prepared(
+        &mut self,
+        a_raw: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqDownPrepared,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let xq = self.int4_mmq_down_prepared_ptr(prepared, k, batch_size)?;
         self.gemm_mq4g256v2_mmq_add_prequant_iu4(a_raw, xq, y, m, k, batch_size)
     }
 
@@ -36028,6 +37951,23 @@ impl Gpu {
         batch_size: usize,
         batch_tile: usize,
     ) -> HipResult<()> {
+        self.mq4g256v2_residual_wmma_gfx1151_bt_x(a_raw, x, y, m, k, batch_size, batch_tile, None)
+    }
+
+    /// [`Gpu::gemm_mq4g256v2_residual_wmma_gfx1151_bt`] with `x_f16` (when `Some`) the
+    /// already F16 `x` device pointer, skipping the F32 -> F16 conversion.
+    #[allow(clippy::too_many_arguments)]
+    fn mq4g256v2_residual_wmma_gfx1151_bt_x(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        batch_tile: usize,
+        x_f16: Option<*mut c_void>,
+    ) -> HipResult<()> {
         let func_name = match batch_tile {
             4 => "gemm_mq4g256v2_residual_wmma_gfx11_bt4",
             6 => "gemm_mq4g256v2_residual_wmma_gfx11_bt6",
@@ -36046,7 +37986,10 @@ impl Gpu {
             kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX11_BT_SRC,
             func_name,
         )?;
-        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let x_f16_ptr = match x_f16 {
+            Some(ptr) => ptr,
+            None => self.ensure_fp16_x(x, batch_size * k)?,
+        };
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x_f16_ptr;
         let mut y_ptr = y.buf.as_ptr();
@@ -36551,9 +38494,28 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let module_v2 = "fused_gate_up_hfq4g256_mq4v2";
-        let func_name = "fused_gate_up_mq4g256v2";
-        self.ensure_kernel(module_v2, kernels::FUSED_GATE_UP_MQ4G256V2_SRC, func_name)?;
+        let (module_v2, source, func_name) = if self.flags.mq4v2_gateup_k5120_enabled(gate_m, up_m, k) {
+            if self.arch == "gfx1201" {
+                (
+                    "fused_gate_up_mq4g256v2_k5120_gfx1201",
+                    kernels::fused_gate_up_mq4g256v2_k5120_gfx1201_src(),
+                    "fused_gate_up_mq4g256v2_k5120_gfx1201",
+                )
+            } else {
+                (
+                    "fused_gate_up_mq4g256v2_k5120_gfx1100",
+                    kernels::fused_gate_up_mq4g256v2_k5120_gfx1100_src(),
+                    "fused_gate_up_mq4g256v2_k5120_gfx1100",
+                )
+            }
+        } else {
+            (
+                "fused_gate_up_hfq4g256_mq4v2",
+                kernels::FUSED_GATE_UP_MQ4G256V2_SRC,
+                "fused_gate_up_mq4g256v2",
+            )
+        };
+        self.ensure_kernel(module_v2, source, func_name)?;
         let ag = a_gate.buf.as_ptr();
         let au = a_up.buf.as_ptr();
         let xp = x.buf.as_ptr();
@@ -37026,6 +38988,23 @@ impl Gpu {
         self.gemm_mq4g256v2_xbatch(a_raw, x, y, m, k, batch_size, false)
     }
 
+    /// Plain `Y = W·X` over `batch_size` rows with the x-batched scalar V2
+    /// GEMV (chunks of 4). Each row is byte-identical to the singleton
+    /// `gemv_mq4g256v2` on that row (same per-row accumulation order), on
+    /// every architecture — unlike [`Self::gemm_mq4g256v2`], which routes
+    /// WMMA arches through a different reduction.
+    pub fn gemv_mq4g256v2_xbatch(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mq4g256v2_xbatch(a_raw, x, y, m, k, batch_size, false)
+    }
+
     /// MQ4G256V2 without WMMA: the x-batched scalar GEMV decodes each weight
     /// row once for up to four input rows, keeping the scalar kernel's per-row
     /// accumulation order. `residual` selects `Y += W·X` over `Y = W·X`.
@@ -37040,6 +39019,9 @@ impl Gpu {
         batch_size: usize,
         residual: bool,
     ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error("gemm_mq4g256v2_xbatch"));
+        }
         let (func, source) = if residual {
             (
                 "gemv_mq4g256v2_xbatch_residual",
@@ -37122,6 +39104,11 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.fp8_verify_scope {
+            // Every row count (including n == 1) runs the FP8 `set` op: no
+            // GEMV shortcut, no memset, no F16 arm.
+            return self.gemm_mq4g256v2_lmhead_verify_fp8(a_raw, x, y, m, k, batch_size);
+        }
         if batch_size == 1 {
             return self.gemv_mq4g256v2(a_raw, x, y, m, k);
         }
@@ -37218,7 +39205,7 @@ impl Gpu {
             self.arch.as_str(),
             bits,
             MqV2PrefillProjection::Qkvza,
-            batch_size,
+            self.route_rows(batch_size),
         ) else {
             return Ok(false);
         };
@@ -37256,7 +39243,7 @@ impl Gpu {
             self.arch.as_str(),
             bits,
             MqV2PrefillProjection::Qkv,
-            batch_size,
+            self.route_rows(batch_size),
         ) else {
             return Ok(false);
         };
@@ -37301,7 +39288,7 @@ impl Gpu {
             self.arch.as_str(),
             bits,
             MqV2PrefillProjection::GateUp,
-            batch_size,
+            self.route_rows(batch_size),
         ) else {
             return Ok(false);
         };
@@ -37340,7 +39327,7 @@ impl Gpu {
             self.arch.as_str(),
             bits,
             MqV2PrefillProjection::Residual,
-            batch_size,
+            self.route_rows(batch_size),
         ) else {
             return Ok(false);
         };
@@ -37740,10 +39727,31 @@ impl Gpu {
         self.mqv2_wmma_gfx11_bt(bits, batch_tile, a_raw, x, y, m, k, batch_size, false, None)
     }
 
-    /// `overwrite` (`Y = W·X`, gfx1151 MQ6 BT8 only) equals zeroing Y and
-    /// then accumulating, in one launch.
     #[allow(clippy::too_many_arguments)]
     fn mqv2_wmma_gfx11_bt(
+        &mut self,
+        bits: u8,
+        batch_tile: usize,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        overwrite: bool,
+        x_f16: Option<*mut c_void>,
+    ) -> HipResult<()> {
+        self.mqv2_wmma_gfx11_bt_pm(
+            bits, batch_tile, a_raw, x, y, m, k, batch_size, overwrite, x_f16, *QWEN4_MQ6_X4_PM,
+        )
+    }
+
+    /// `overwrite` (`Y = W·X`, MQ6 BT8 X-LDS) equals zeroing Y and
+    /// then accumulating, in one launch.
+    /// `pm` runs the gfx1201 MQ6 F32 overwrite GEMM from the builder module
+    /// (`HIPFIRE_QWEN4_MQ6_X4_PM`): same arguments and output bytes, 256-token grid.
+    #[allow(clippy::too_many_arguments)]
+    fn mqv2_wmma_gfx11_bt_pm(
         &mut self,
         bits: u8,
         batch_tile: usize,
@@ -37757,6 +39765,7 @@ impl Gpu {
         // X already converted to F16 (e.g. by `rotate_x_mq_batched_f16`);
         // `None` converts `x` here.
         x_f16: Option<*mut c_void>,
+        pm: bool,
     ) -> HipResult<()> {
         let func_name: &'static str = match (bits, batch_tile) {
             (2, 4) => "gemm_mq2g256v2_residual_wmma_gfx11_bt4",
@@ -37779,20 +39788,52 @@ impl Gpu {
         // MQ6 BT8: four row tiles share each X chunk through LDS (bitwise
         // identical to BT8; the BT8 X re-reads were the bottleneck on gfx1151).
         let xlds = bits == 6 && batch_tile == 8;
-        let (func_name, rows_per_block, block) = match (xlds, overwrite) {
-            (true, false) => ("gemm_mq6g256v2_residual_wmma_gfx11_bt8_x4", 64, 128),
+        let gfx12 = self.arch_caps.has_wmma_w32_gfx12();
+        let (func_name, rows_per_block, block) = match (xlds, overwrite, gfx12) {
+            (true, false, true) => ("gemm_mq6g256v2_residual_wmma_gfx12_bt8_x4", 64, 128),
+            (true, true, true) if y.dtype == DType::BF16 => {
+                ("gemm_mq6g256v2_wmma_gfx12_bt8_x4_bf16out", 64, 128)
+            }
+            (true, true, true) => ("gemm_mq6g256v2_wmma_gfx12_bt8_x4", 64, 128),
+            (true, false, false) => ("gemm_mq6g256v2_residual_wmma_gfx11_bt8_x4", 64, 128),
             // A BF16 `y` takes the values rounded to BF16 (RNE) as BF16 bits.
-            (true, true) if y.dtype == DType::BF16 => {
+            (true, true, false) if y.dtype == DType::BF16 => {
                 ("gemm_mq6g256v2_wmma_gfx11_bt8_x4_bf16out", 64, 128)
             }
-            (true, true) => ("gemm_mq6g256v2_wmma_gfx11_bt8_x4", 64, 128),
-            (false, false) => (func_name, 16, 32),
-            (false, true) => {
+            (true, true, false) => ("gemm_mq6g256v2_wmma_gfx11_bt8_x4", 64, 128),
+            (false, false, _) => (func_name, 16, 32),
+            (false, true, _) => {
                 return Err(hip_bridge::HipError::new(
                     1,
-                    "mqv2_wmma_gfx11_bt: overwrite needs the gfx1151 MQ6 BT8 kernel",
+                    "mqv2_wmma_gfx11_bt: overwrite needs the MQ6 BT8 X-LDS kernel",
                 ));
             }
+        };
+        let kind = if y.dtype == DType::BF16 { Mq6X4Kind::Bf16 } else { Mq6X4Kind::Plain };
+        // gfx1151 PM (F32 and BF16 output, M/N from the selective thresholds, flag on):
+        // the 128-row `_w8` entry of the certified builder module replaces the hipcc entry
+        // and the U3 twin; everything smaller keeps U3 / hipcc.
+        let pm1151 = xlds && overwrite && self.mq6_x4_pm_gfx1151(pm, m, batch_size);
+        let halo = (xlds && overwrite && !pm1151)
+            .then(|| self.qwen4_mq6_x4_pick(kind, m, k, batch_size))
+            .flatten();
+        let pm1201 = pm
+            && xlds
+            && overwrite
+            && gfx12
+            && self.arch.as_str() == "gfx1201"
+            && y.dtype != DType::BF16
+            && halo.is_none();
+        let use_pm = pm1151 || pm1201;
+        let (func_name, rows_per_block, block, batch_tile) = match halo {
+            Some(tile) => mq6_x4_halo_tile(tile, kind == Mq6X4Kind::Bf16),
+            None if pm1151 && kind == Mq6X4Kind::Bf16 => {
+                ("qwen4_mq6_x4_pm_gfx1151_w8_bf16out", 128, 256, batch_tile)
+            }
+            None if pm1151 => ("qwen4_mq6_x4_pm_gfx1151_w8", 128, 256, batch_tile),
+            None if pm1201 && m <= 64 => ("qwen4_mq6_x4_pm_gfx1201_w4", 64, 128, batch_tile),
+            None if pm1201 => ("qwen4_mq6_x4_pm_gfx1201_w8", 128, 256, batch_tile),
+            None => (func_name, rows_per_block, block, batch_tile),
         };
         let group_bytes: usize = match bits {
             2 => crate::dispatch::MQ2G256V2_GROUP_BYTES,
@@ -37810,14 +39851,26 @@ impl Gpu {
                 "gemm_mqv2_residual_wmma_gfx11_bt: K must be a multiple of 256",
             ));
         }
+        // PM entries (gfx1151 `_w8[_bf16out]`, gfx1201 `_w4/_w8`) address Y through a raw
+        // 0x7fffffff descriptor with 32-bit byte offsets: refuse >= 2^31 bytes before the
+        // X conversion below writes anything. The hipcc/U3 entries are not bound by it.
+        if use_pm {
+            let elem_bytes = if y.dtype == DType::BF16 { 2 } else { 4 };
+            pm_check_output_extent("mqv2 PM Y", batch_size, m, elem_bytes)?;
+            pm_check_input_geometry("mqv2 PM", m, k, batch_size, group_bytes)?;
+        }
         self.bind_thread()?;
-        if xlds {
-            // #774's MQ6 BT8 X-LDS entries live in the Qwen4 copy only.
-            self.ensure_kernel(
-                "qwen4_gemm_mqv2_wmma_gfx11_bt",
-                kernels::QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC,
-                func_name,
-            )?;
+        if pm1151 {
+            self.ensure_embedded_kernel("qwen4_mq6_x4_pm_gfx1151", kernels::QWEN4_MQ6_X4_PM_GFX1151, func_name)?;
+        } else if pm1201 {
+            self.ensure_embedded_kernel("qwen4_mq6_x4_pm_gfx1201", kernels::QWEN4_MQ6_X4_PM_GFX1201, func_name)?;
+        } else if xlds {
+            let (module, source) = if gfx12 {
+                ("qwen4_gemm_mq6g256v2_wmma_gfx12_x4", kernels::QWEN4_GEMM_MQ6G256V2_WMMA_GFX12_X4_SRC)
+            } else {
+                ("qwen4_gemm_mqv2_wmma_gfx11_bt", kernels::QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC)
+            };
+            self.ensure_kernel(module, source, func_name)?;
         } else {
             let module: &'static str = if self.arch.as_str() == "gfx1151" {
                 "gemm_mqv2_wmma_gfx1151_bt"
@@ -37849,7 +39902,7 @@ impl Gpu {
             &mut bs_val as *mut _ as *mut c_void,
         ];
         let row_tiles = m.div_ceil(rows_per_block);
-        let n_tile = 16 * batch_tile;
+        let n_tile = if use_pm { 256 } else { 16 * batch_tile };
         let batch_tiles = batch_size.div_ceil(n_tile);
         let weight_bytes = m * (k / 256) * group_bytes;
         let bytes = weight_bytes + batch_size * k * 2 + batch_size * m * 4 * 2;
@@ -38231,28 +40284,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_mq5g256v2_wmma_gfx12_bt12",
@@ -38511,7 +40543,7 @@ impl Gpu {
                 self.arch.as_str(),
                 5,
                 MqV2PrefillProjection::Qkv,
-                batch_size,
+                self.route_rows(batch_size),
             ) == Some(8)
             {
                 return self.gemm_qkv_mqv2_wmma_gfx1201_bt8(
@@ -38725,28 +40757,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_mq5g256v2_wmma_gfx12_bt12",
@@ -38938,28 +40949,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_mq5g256v2_residual_wmma_gfx12_bt12",
@@ -39457,28 +41447,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_mq6g256v2_wmma_gfx12_bt12",
@@ -39737,7 +41706,7 @@ impl Gpu {
                 self.arch.as_str(),
                 6,
                 MqV2PrefillProjection::Qkv,
-                batch_size,
+                self.route_rows(batch_size),
             ) == Some(8)
             {
                 return self.gemm_qkv_mqv2_wmma_gfx1201_bt8(
@@ -39951,28 +41920,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_mq6g256v2_wmma_gfx12_bt12",
@@ -40163,29 +42111,33 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // From 1024 tokens BT12 beats the exact BT8/BT4 tiling whenever it
+        // still launches at least 256 waves, ragged last tile included
+        // (gfx1201, per-kernel event medians; BT8 -> BT12 at 2048 tokens:
+        // 10240 x 2560 2.91 -> 2.05 ms, 2560 x 6144 2.06 -> 1.04 ms,
+        // 512 x 2560 0.31 -> 0.21 ms).  Below that wave count (M = 48) or
+        // below 1024 tokens the exact-divisor order stays.
+        let bt12_waves = m.div_ceil(16) * batch_size.div_ceil(192);
+        let bt_b = if *GATE_UP_BT && batch_size >= 1024 && bt12_waves >= 256 { 12 } else { gfx12_bt_tile(batch_size) };
+        self.gemm_mq6g256v2_residual_wmma_gfx12_bt(a_raw, x, y, m, k, batch_size, bt_b)
+    }
+
+    /// [`Gpu::gemm_mq6g256v2_residual_wmma_gfx12`] with an explicit batch
+    /// tile: `bt_b` sixteen-token WMMA tiles per wave (4, 8 or 12), or 1 for
+    /// the base kernel.  Every tile runs each output's WMMA chain in the same
+    /// order, so the tile choice does not change a bit of `y`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq6g256v2_residual_wmma_gfx12_bt(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        bt_b: usize,
+    ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_mq6g256v2_residual_wmma_gfx12_bt12",
@@ -40199,10 +42151,16 @@ impl Gpu {
                 "gemm_mq6g256v2_residual_wmma_gfx12_bt4",
                 kernels::GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_BT_SRC,
             ),
-            _ => (
+            1 => (
                 "gemm_mq6g256v2_residual_wmma_gfx12",
                 kernels::GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_SRC,
             ),
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    &format!("gemm_mq6g256v2_residual_wmma_gfx12: no {bt_b}-tile kernel"),
+                ))
+            }
         };
         let module_v2 = format!("{}_mq5v2", kname);
         self.ensure_kernel(&module_v2, ksrc, kname)?;
@@ -40330,22 +42288,72 @@ impl Gpu {
         self.gemm_mq6g256v2_xbatch(a_raw, x, y, m, k, batch_size, true)
     }
 
+    /// U2: the gfx1201 MQ6 X-LDS overwrite route at `batch_size` rows.
+    /// Explicit `HIPFIRE_QWEN4_MQ6_X4_GFX1201` wins at every row count; unset,
+    /// on inside the Qwen4 forward for prefill chunks of
+    /// >= QWEN4_F16_WMMA_MIN_TOKENS rows (decode keeps its GEMV).
+    pub fn qwen4_mq6_x4_gfx1201(&self, batch_size: usize) -> bool {
+        self.flags
+            .qwen4_mq6_x4_gfx1201
+            .unwrap_or(self.qwen4_scope && self.route_rows(batch_size) >= QWEN4_F16_WMMA_MIN_TOKENS)
+    }
+
+    /// U3: the gfx1151 MQ6 X-LDS tile (`[0, 0, 0]` = measured table, `None` =
+    /// incumbent).  Explicit `HIPFIRE_QWEN4_MQ6_X4_TILE` wins; unset, the
+    /// table inside the Qwen4 forward on gfx1151.
+    pub fn qwen4_mq6_x4_tile(&self) -> Option<[u8; 3]> {
+        self.flags
+            .qwen4_mq6_x4_tile
+            .unwrap_or((self.qwen4_scope && self.arch.as_str() == "gfx1151").then_some([0, 0, 0]))
+    }
+
+    /// The gfx1151 X-LDS tile twin for one MQ6 launch of `kind`: an explicit
+    /// `HIPFIRE_QWEN4_MQ6_X4_TILE` wins, `auto`/the Qwen4 forward uses the
+    /// measured table, `None` keeps the incumbent entry.  BV12 needs
+    /// `n % 192 == 0` and has no regions/HC-write twins.
+    fn qwen4_mq6_x4_pick(&self, kind: Mq6X4Kind, m: usize, k: usize, n: usize) -> Option<[u8; 3]> {
+        mq6_x4_tile_selected(
+            self.arch.as_str(), self.qwen4_mq6_x4_tile(), kind, m, k, self.route_rows(n),
+        )
+    }
+
+    /// U3: the MQ6 a/b/z row-region fold.  Explicit
+    /// `HIPFIRE_QWEN4_MQ6_X4_REGIONS` wins; unset, on inside the Qwen4 forward
+    /// on gfx1151.
+    pub fn qwen4_mq6_x4_regions(&self) -> bool {
+        self.flags
+            .qwen4_mq6_x4_regions
+            .unwrap_or(self.qwen4_scope && self.arch.as_str() == "gfx1151")
+    }
+
+    /// gfx1151 selective PM route (`HIPFIRE_QWEN4_MQ6_X4_PM`, `pm`): an MQ6 X-LDS overwrite
+    /// launch of `m` rows (regions: summed rows) and `n` tokens runs from the certified
+    /// builder module `qwen4_mq6_x4_pm_gfx1151` from [`QWEN4_MQ6_X4_PM_MIN_M_GFX1151`] rows
+    /// and [`QWEN4_MQ6_X4_PM_MIN_N_GFX1151`] tokens up (256-token tiles, `_w8` entries).
+    fn mq6_x4_pm_gfx1151(&self, pm: bool, m: usize, n: usize) -> bool {
+        mq6_x4_pm_gfx1151_selected(self.arch.as_str(), pm, m, self.route_rows(n))
+    }
+
     /// Whether [`Gpu::gemm_mq6g256v2_xf16`] applies: the BT8 X-LDS
     /// overwrite route with no recorder or capture active.
     pub fn gemm_mq6g256v2_xf16_applies(&self, k: usize, batch_size: usize) -> bool {
-        self.arch_caps.has_wmma_w32()
+        (self.arch_caps.has_wmma_w32()
+            || (self.arch_caps.has_wmma_w32_gfx12()
+                && self.arch.as_str() == "gfx1201"
+                && self.qwen4_mq6_x4_gfx1201(batch_size)))
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && k % 256 == 0
-            && mqv2_prefill_batch_tile(
-                self.arch.as_str(),
-                6,
-                MqV2PrefillProjection::Residual,
-                batch_size,
-            ) == Some(8)
+            && (self.arch_caps.has_wmma_w32_gfx12()
+                || mqv2_prefill_batch_tile(
+                    self.arch.as_str(),
+                    6,
+                    MqV2PrefillProjection::Residual,
+                    self.route_rows(batch_size),
+                ) == Some(8))
     }
 
-    /// [`Gpu::gemm_mq6g256v2`] on the gfx1151 BT8 route with X already rotated
+    /// [`Gpu::gemm_mq6g256v2`] on the BT8 X-LDS route with X already rotated
     /// and converted to F16 (`x_f16`, `[batch_size × k]`): the bytes the F32
     /// entry produces, without its conversion pass.
     #[allow(clippy::too_many_arguments)]
@@ -40363,6 +42371,528 @@ impl Gpu {
         self.mqv2_wmma_gfx11_bt(6, 8, a_raw, x_f16, y, m, k, batch_size, true, Some(ptr))
     }
 
+    /// Three independent MQ6 F32 overwrite projections sharing prepared F16 X.
+    /// Returns false when the fold (`Gpu::qwen4_mq6_x4_regions`) is not applicable.
+    pub fn gemm_mq6g256v2_xf16_regions(
+        &mut self,
+        regions: &[(&GpuTensor, &GpuTensor, usize); 3],
+        x_f16: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<bool> {
+        if !self.qwen4_mq6_x4_regions() {
+            return Ok(false);
+        }
+        self.gemm_mq6g256v2_xf16_regions_pm(regions, x_f16, k, batch_size, *QWEN4_MQ6_X4_PM)
+    }
+
+    /// [`Gpu::gemm_mq6g256v2_xf16_regions`] past the fold flag, with the PM flag explicit
+    /// (gfx1151: the builder module's `_w8_regions` entry from the selective thresholds).
+    fn gemm_mq6g256v2_xf16_regions_pm(
+        &mut self,
+        regions: &[(&GpuTensor, &GpuTensor, usize); 3],
+        x_f16: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+        pm: bool,
+    ) -> HipResult<bool> {
+        if !matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
+            || !self.gemm_mq6g256v2_xf16_applies(k, batch_size)
+            || regions.iter().any(|(_, y, _)| y.dtype != DType::F32)
+        {
+            return Ok(false);
+        }
+        let total_m: usize = regions.iter().map(|(_, _, m)| *m).sum();
+        let pm1151 = self.mq6_x4_pm_gfx1151(pm, total_m, batch_size);
+        if pm1151 {
+            for (_, y, m) in regions {
+                pm_check_output_extent("MQ6 PM regions Y", batch_size, *m, y.dtype.size())?;
+                pm_check_input_geometry(
+                    "MQ6 PM regions", *m, k, batch_size, crate::dispatch::MQ6G256V2_GROUP_BYTES,
+                )?;
+            }
+        }
+        let (module, source, name, rows, block, n_tile) = if self.arch_caps.has_wmma_w32_gfx12() {
+            ("qwen4_gemm_mq6g256v2_wmma_gfx12_x4",
+                Some(kernels::QWEN4_GEMM_MQ6G256V2_WMMA_GFX12_X4_SRC),
+                "gemm_mq6g256v2_wmma_gfx12_bt8_x4_regions", 64, 128, 16 * 8)
+        } else if pm1151 {
+            ("qwen4_mq6_x4_pm_gfx1151", None, "qwen4_mq6_x4_pm_gfx1151_w8_regions", 128, 256, 256)
+        } else {
+            let (name, rows, block, bv) =
+                match self.qwen4_mq6_x4_pick(Mq6X4Kind::Regions, total_m, k, batch_size) {
+                    Some(tile) => {
+                        let (name, rows, block) = mq6_x4_halo_entry(tile, Mq6X4Kind::Regions);
+                        (name, rows, block, tile[0] as usize)
+                    }
+                    None => ("gemm_mq6g256v2_wmma_gfx11_bt8_x4_regions", 64, 128, 8),
+                };
+            ("qwen4_gemm_mqv2_wmma_gfx11_bt", Some(kernels::QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC),
+                name, rows, block, 16 * bv)
+        };
+        let row_tiles: usize = regions.iter().map(|(_, _, m)| m.div_ceil(rows)).sum();
+        if row_tiles == 0 || batch_size == 0 || k == 0 {
+            return Ok(true);
+        }
+        self.bind_thread()?;
+        match source {
+            Some(source) => self.ensure_kernel(module, source, name)?,
+            None => self.ensure_embedded_kernel(module, kernels::QWEN4_MQ6_X4_PM_GFX1151, name)?,
+        }
+        let mut ptrs = [
+            regions[0].0.buf.as_ptr(), regions[1].0.buf.as_ptr(), regions[2].0.buf.as_ptr(),
+            x_f16.buf.as_ptr(),
+            regions[0].1.buf.as_ptr(), regions[1].1.buf.as_ptr(), regions[2].1.buf.as_ptr(),
+        ];
+        let mut dims = [regions[0].2 as i32, regions[1].2 as i32, regions[2].2 as i32,
+            k as i32, batch_size as i32];
+        let mut params: [*mut c_void; 12] = std::array::from_fn(|i| {
+            if i < 7 {
+                ptrs.as_mut_ptr().wrapping_add(i).cast()
+            } else {
+                dims.as_mut_ptr().wrapping_add(i - 7).cast()
+            }
+        });
+        let bytes = total_m * (k / 256) * crate::dispatch::MQ6G256V2_GROUP_BYTES
+            + batch_size * k * 2 + batch_size * total_m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", name, bytes);
+        let result = self.launch_maybe_blob(
+            name, [row_tiles as u32, batch_size.div_ceil(n_tile) as u32, 1],
+            [block, 1, 1], 0, &mut params, || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                for ptr in ptrs { blob.push_ptr(ptr); }
+                for dim in dims { blob.push_i32(dim); }
+                blob
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result.map(|_| true)
+    }
+
+    /// Whether [`Gpu::gemm_mq6g256v2_hcw`] applies (H4 attention epilogue,
+    /// `HIPFIRE_QWEN4_HC_FUSE >= 2`): the exact gfx1151 BT8 X-LDS overwrite
+    /// route or gfx1201 with at least 64 tokens, no recorder or capture
+    /// active, `m % 8 == 0`, `k % 256 == 0`.
+    pub fn gemm_mq6g256v2_hcw_applies(&self, m: usize, k: usize, batch_size: usize) -> bool {
+        m % 8 == 0
+            && k % 256 == 0
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && match self.arch.as_str() {
+                "gfx1151" => {
+                    mqv2_prefill_batch_tile(
+                        "gfx1151",
+                        6,
+                        MqV2PrefillProjection::Residual,
+                        self.route_rows(batch_size),
+                    ) == Some(8)
+                }
+                "gfx1201" => self.route_rows(batch_size) >= 64,
+                _ => false,
+            }
+    }
+
+    /// `hyper_write(streams, mixed = W·X)` in the GEMM epilogue: the MQ6G256V2
+    /// output projection accumulates in the unfused kernel's order and
+    /// applies the HC residual write to `hc_streams` (`[batch_size, 4 * m]`,
+    /// BF16 bits when `hc_bf16`) with the gate logits `hc_gates`
+    /// (`[batch_size, 4]`) the paired HC read produced.  `mirror` receives the
+    /// GEMM output as the unfused route stores it.  `x` is the rotated input
+    /// (`x_is_f16`: already F16, else converted here).  Bitwise the
+    /// `gemm_mq6g256v2` + `hyper_write` pair; gate with
+    /// [`Gpu::gemm_mq6g256v2_hcw_applies`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq6g256v2_hcw(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        x_is_f16: bool,
+        mirror: Option<&GpuTensor>,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        hc_streams: &GpuTensor,
+        hc_gates: &GpuTensor,
+        hc_bf16: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        type Entry = (&'static str, &'static str, &'static str, usize, u32, usize);
+        let (module, source, func_name, rows, block, bv): Entry = match self.arch.as_str() {
+            "gfx1151" => {
+                let (name, rows, block, bv) =
+                    match self.qwen4_mq6_x4_pick(Mq6X4Kind::Hcw, m, k, batch_size) {
+                        Some(tile) => {
+                            let (name, rows, block) = mq6_x4_halo_entry(tile, Mq6X4Kind::Hcw);
+                            (name, rows, block, tile[0] as usize)
+                        }
+                        None => ("gemm_mq6g256v2_wmma_gfx11_bt8_x4_hcw", 64, 128, 8),
+                    };
+                ("qwen4_gemm_mqv2_wmma_gfx11_bt", kernels::QWEN4_GEMM_MQV2_WMMA_GFX11_BT_SRC,
+                    name, rows, block, bv)
+            }
+            "gfx1201" => (
+                "gemm_mq6g256v2_residual_wmma_gfx12_bt8_mq5v2",
+                kernels::GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_BT_SRC,
+                "gemm_mq6g256v2_wmma_gfx12_bt8_hcw",
+                64,
+                128,
+                8,
+            ),
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "gemm_mq6g256v2_hcw: gfx1151 or gfx1201 required",
+                ));
+            }
+        };
+        if m == 0 || batch_size == 0 || m % 8 != 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_mq6g256v2_hcw: m % 8 and k % 256 required",
+            ));
+        }
+        self.ensure_kernel(module, source, func_name)?;
+        let x_ptr = if x_is_f16 {
+            x.buf.as_ptr()
+        } else {
+            self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+            self.ensure_fp16_x(x, batch_size * k)?
+        };
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_ptr;
+        let mut y_ptr = mirror.map_or(std::ptr::null_mut(), |y| y.buf.as_ptr());
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut streams_ptr = hc_streams.buf.as_ptr();
+        let mut gates_ptr = hc_gates.buf.as_ptr();
+        let mut bf16_val = hc_bf16 as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut streams_ptr as *mut _ as *mut c_void,
+            &mut gates_ptr as *mut _ as *mut c_void,
+            &mut bf16_val as *mut _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_mq6g256v2_bytes(m, k)
+            + batch_size * k * 2
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
+            [m.div_ceil(rows) as u32, batch_size.div_ceil(16 * bv) as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_ptr(streams_ptr);
+                b.push_ptr(gates_ptr);
+                b.push_i32(bf16_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Whether the MQ4G256V2 shared-F16 prefill route applies (`HIPFIRE_QWEN4_MQ4_X4_PM`
+    /// decides only which kernel runs it): exact gfx1151, at least
+    /// [`QWEN4_MQ4_X4_MIN_N_GFX1151`] tokens, `k % 256 == 0`, no replay recording or graph
+    /// capture. [`Gpu::gemm_mq4g256v2_xf16`] then writes `Y = W·X` for F32 `y`.
+    pub fn gemm_mq4g256v2_xf16_applies(&self, k: usize, batch_size: usize) -> bool {
+        self.arch.as_str() == "gfx1151"
+            && batch_size >= QWEN4_MQ4_X4_MIN_N_GFX1151
+            && k % 256 == 0
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+    }
+
+    /// [`Gpu::gemm_mq4g256v2_xf16_applies`] with the certified builder module
+    /// (`HIPFIRE_QWEN4_MQ4_X4_PM`, on unless `0`) active: the route's BF16 output, the
+    /// a/b/z regions fold and the HC-write epilogue exist only there (the hipcc fallback
+    /// has no such twin), so their callers gate on this.
+    pub fn gemm_mq4g256v2_pm_applies(&self, k: usize, batch_size: usize) -> bool {
+        *QWEN4_MQ4_X4_PM && self.gemm_mq4g256v2_xf16_applies(k, batch_size)
+    }
+
+    /// Zero `y` (`n` rows of `m` F32) on the active stream.
+    fn zero_f32_rows(&mut self, y: &GpuTensor, m: usize, n: usize) -> HipResult<()> {
+        match self.active_stream.as_ref() {
+            Some(stream) => self.hip.memset_async(&y.buf, 0, n * m * 4, stream),
+            None => self.hip.memset(&y.buf, 0, n * m * 4),
+        }
+    }
+
+    /// MQ4G256V2 prefill GEMM `Y = W·X` on X already rotated and converted to F16
+    /// (`x_f16`, `[batch_size × k]`, e.g. by `rotate_x_mq_batched_f16`); gate with
+    /// [`Gpu::gemm_mq4g256v2_xf16_applies`]. `y` is F32, or BF16 (the values RNE-rounded
+    /// to BF16 bits) when the PM module is active ([`Gpu::gemm_mq4g256v2_pm_applies`]).
+    ///
+    /// PM on (`HIPFIRE_QWEN4_MQ4_X4_PM`): the `qwen4_mq4_x4_pm_gfx1151_{w8,w4}[_bf16out]`
+    /// entry of `kernels::QWEN4_MQ4_X4_PM_GFX1151` (`w4` for `m <= 64`, else `w8`; grid
+    /// `[ceil(m/(16*wr)), ceil(n/256)]`, block `32*wr`). Off: zero `y`, then the hipcc
+    /// `gemm_mq4g256v2_residual_wmma_gfx11_bt4` on the same F16 `x`. Both produce the same
+    /// bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq4g256v2_xf16(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_f16: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if !self.gemm_mq4g256v2_xf16_applies(k, batch_size) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_mq4g256v2_xf16: exact gfx1151, N >= 96, K % 256 == 0 and no recorder/capture required",
+            ));
+        }
+        let bf16 = y.dtype == DType::BF16;
+        let pm = *QWEN4_MQ4_X4_PM;
+        if bf16 && !pm {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_mq4g256v2_xf16: BF16 output needs the PM module (HIPFIRE_QWEN4_MQ4_X4_PM)",
+            ));
+        }
+        if m == 0 || batch_size == 0 {
+            return Ok(());
+        }
+        if pm {
+            pm_check_output_extent("MQ4 PM Y", batch_size, m, if bf16 { 2 } else { 4 })?;
+            pm_check_input_geometry("MQ4 PM", m, k, batch_size, crate::dispatch::MQ4V2_GROUP_BYTES)?;
+        }
+        self.bind_thread()?;
+        if !pm {
+            self.zero_f32_rows(y, m, batch_size)?;
+            let ptr = x_f16.buf.as_ptr();
+            return self.mq4g256v2_residual_wmma_gfx1151_bt_x(
+                a_raw, x_f16, y, m, k, batch_size, 4, Some(ptr),
+            );
+        }
+        let (name, wr): (&'static str, usize) = match (bf16, m <= 64) {
+            (false, false) => ("qwen4_mq4_x4_pm_gfx1151_w8", 8),
+            (false, true) => ("qwen4_mq4_x4_pm_gfx1151_w4", 4),
+            (true, false) => ("qwen4_mq4_x4_pm_gfx1151_w8_bf16out", 8),
+            (true, true) => ("qwen4_mq4_x4_pm_gfx1151_w4_bf16out", 4),
+        };
+        self.ensure_embedded_kernel("qwen4_mq4_x4_pm_gfx1151", kernels::QWEN4_MQ4_X4_PM_GFX1151, name)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let out_bytes = if bf16 { 2 } else { 4 };
+        let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES
+            + batch_size * k * 2
+            + batch_size * m * out_bytes;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", name, bytes);
+        let result = self.launch_maybe_blob(
+            name,
+            [m.div_ceil(16 * wr) as u32, batch_size.div_ceil(256) as u32, 1],
+            [(32 * wr) as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Three independent MQ4G256V2 F32 overwrite projections of one prepared F16 X in a
+    /// single `qwen4_mq4_x4_pm_gfx1151_w8_regions` launch (separate accumulators; bytes
+    /// equal three [`Gpu::gemm_mq4g256v2_xf16`] launches). Returns `false`, having
+    /// launched nothing, unless [`Gpu::gemm_mq4g256v2_pm_applies`] and every output is
+    /// F32; the caller then projects separately.
+    pub fn gemm_mq4g256v2_xf16_regions(
+        &mut self,
+        regions: &[(&GpuTensor, &GpuTensor, usize); 3],
+        x_f16: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<bool> {
+        if !self.gemm_mq4g256v2_pm_applies(k, batch_size)
+            || regions.iter().any(|(_, y, _)| y.dtype != DType::F32)
+        {
+            return Ok(false);
+        }
+        for (_, _, m) in regions {
+            pm_check_output_extent("MQ4 PM regions Y", batch_size, *m, 4)?;
+            pm_check_input_geometry(
+                "MQ4 PM regions", *m, k, batch_size, crate::dispatch::MQ4V2_GROUP_BYTES,
+            )?;
+        }
+        let total_m: usize = regions.iter().map(|(_, _, m)| *m).sum();
+        let row_tiles: usize = regions.iter().map(|(_, _, m)| m.div_ceil(128)).sum();
+        if row_tiles == 0 || batch_size == 0 {
+            return Ok(true);
+        }
+        self.bind_thread()?;
+        let name = "qwen4_mq4_x4_pm_gfx1151_w8_regions";
+        self.ensure_embedded_kernel("qwen4_mq4_x4_pm_gfx1151", kernels::QWEN4_MQ4_X4_PM_GFX1151, name)?;
+        let mut ptrs = [
+            regions[0].0.buf.as_ptr(), regions[1].0.buf.as_ptr(), regions[2].0.buf.as_ptr(),
+            x_f16.buf.as_ptr(),
+            regions[0].1.buf.as_ptr(), regions[1].1.buf.as_ptr(), regions[2].1.buf.as_ptr(),
+        ];
+        let mut dims = [regions[0].2 as i32, regions[1].2 as i32, regions[2].2 as i32,
+            k as i32, batch_size as i32];
+        let mut params: [*mut c_void; 12] = std::array::from_fn(|i| {
+            if i < 7 {
+                ptrs.as_mut_ptr().wrapping_add(i).cast()
+            } else {
+                dims.as_mut_ptr().wrapping_add(i - 7).cast()
+            }
+        });
+        let bytes = total_m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES
+            + batch_size * k * 2 + batch_size * total_m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", name, bytes);
+        let result = self.launch_maybe_blob(
+            name, [row_tiles as u32, batch_size.div_ceil(256) as u32, 1],
+            [256, 1, 1], 0, &mut params, || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                for ptr in ptrs { blob.push_ptr(ptr); }
+                for dim in dims { blob.push_i32(dim); }
+                blob
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result.map(|_| true)
+    }
+
+    /// Whether [`Gpu::gemm_mq4g256v2_hcw`] applies (H4 attention epilogue,
+    /// `HIPFIRE_QWEN4_HC_FUSE >= 2`): the PM module is active
+    /// ([`Gpu::gemm_mq4g256v2_pm_applies`]) and `m % 8 == 0`. There is no hipcc twin, so
+    /// `HIPFIRE_QWEN4_MQ4_X4_PM=0` keeps the unfused projection and HC write.
+    pub fn gemm_mq4g256v2_hcw_applies(&self, m: usize, k: usize, batch_size: usize) -> bool {
+        m % 8 == 0 && self.gemm_mq4g256v2_pm_applies(k, batch_size)
+    }
+
+    /// `hyper_write(streams, mixed = W·X)` in the epilogue of the MQ4G256V2 output
+    /// projection (`qwen4_mq4_x4_pm_gfx1151_w8_hcw`; the MQ6 contract of
+    /// [`Gpu::gemm_mq6g256v2_hcw`]): `x_f16` is the rotated F16 input, `hc_streams`
+    /// (`[batch_size, 4 * m]`, BF16 bits when `hc_bf16`) receives the HC write with the
+    /// gate logits `hc_gates` (`[batch_size, 4]`), `mirror` the F32 projection when
+    /// given. Bitwise [`Gpu::gemm_mq4g256v2_xf16`] followed by the unfused HC write; gate
+    /// with [`Gpu::gemm_mq4g256v2_hcw_applies`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq4g256v2_hcw(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_f16: &GpuTensor,
+        mirror: Option<&GpuTensor>,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        hc_streams: &GpuTensor,
+        hc_gates: &GpuTensor,
+        hc_bf16: bool,
+    ) -> HipResult<()> {
+        if !self.gemm_mq4g256v2_hcw_applies(m, k, batch_size) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemm_mq4g256v2_hcw: PM module, exact gfx1151, N >= 96, M % 8 == 0 and K % 256 == 0 required",
+            ));
+        }
+        if m == 0 || batch_size == 0 {
+            return Ok(());
+        }
+        // Streams are `[batch_size, 4 * m]` (BF16 bits or F32), the optional mirror
+        // `[batch_size, m]` F32 and the gates `[batch_size, 4]` F32; all go through raw
+        // 0x7fffffff descriptors in the PM entry.
+        pm_check_input_geometry("MQ4 PM HCW", m, k, batch_size, crate::dispatch::MQ4V2_GROUP_BYTES)?;
+        pm_check_hc_streams_extent("MQ4 PM HC streams", batch_size, m, if hc_bf16 { 2 } else { 4 })?;
+        if mirror.is_some() {
+            pm_check_output_extent("MQ4 PM HC mirror", batch_size, m, 4)?;
+        }
+        pm_check_output_extent("MQ4 PM HC gates", batch_size, 4, 4)?;
+        self.bind_thread()?;
+        let name = "qwen4_mq4_x4_pm_gfx1151_w8_hcw";
+        self.ensure_embedded_kernel("qwen4_mq4_x4_pm_gfx1151", kernels::QWEN4_MQ4_X4_PM_GFX1151, name)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16.buf.as_ptr();
+        let mut y_ptr = mirror.map_or(std::ptr::null_mut(), |y| y.buf.as_ptr());
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut streams_ptr = hc_streams.buf.as_ptr();
+        let mut gates_ptr = hc_gates.buf.as_ptr();
+        let mut bf16_val = hc_bf16 as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut streams_ptr as *mut _ as *mut c_void,
+            &mut gates_ptr as *mut _ as *mut c_void,
+            &mut bf16_val as *mut _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k * 2
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", name, bytes);
+        let result = self.launch_maybe_blob(
+            name,
+            [m.div_ceil(128) as u32, batch_size.div_ceil(256) as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_ptr(streams_ptr);
+                b.push_ptr(gates_ptr);
+                b.push_i32(bf16_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     pub fn gemm_mq6g256v2(
         &mut self,
         a_raw: &GpuTensor,
@@ -40378,16 +42908,7 @@ impl Gpu {
             // The memset + residual route below would take the BT8
             // X-LDS kernel; its overwrite form produces the same bytes in one
             // launch.  Capture/replay keep the historical contract.
-            if self.arch_caps.has_wmma_w32()
-                && !self.replay.is_recording()
-                && !self.graphs.capture_mode
-                && k % 256 == 0
-                && mqv2_prefill_batch_tile(
-                    self.arch.as_str(),
-                    6,
-                    MqV2PrefillProjection::Residual,
-                    batch_size,
-                ) == Some(8)
+            if self.gemm_mq6g256v2_xf16_applies(k, batch_size)
             {
                 return self.mqv2_wmma_gfx11_bt(6, 8, a_raw, x, y, m, k, batch_size, true, None);
             }
@@ -40749,28 +43270,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_mq3g256v2_wmma_gfx12_bt12",
@@ -41228,28 +43728,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_mq3g256v2_wmma_gfx12_bt12",
@@ -41441,28 +43920,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_mq3g256v2_residual_wmma_gfx12_bt12",
@@ -41960,28 +44418,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_mq2g256v2_wmma_gfx12_bt12",
@@ -42102,7 +44539,7 @@ impl Gpu {
                 self.arch.as_str(),
                 2,
                 MqV2PrefillProjection::Qkvza,
-                batch_size,
+                self.route_rows(batch_size),
             ) == Some(4)
             {
                 return self.gemm_qkvza_mqv2_wmma_gfx11_bt(
@@ -42248,7 +44685,7 @@ impl Gpu {
                 self.arch.as_str(),
                 2,
                 MqV2PrefillProjection::Qkv,
-                batch_size,
+                self.route_rows(batch_size),
             ) == Some(8)
             {
                 return self.gemm_qkv_mqv2_wmma_gfx1201_bt8(
@@ -42349,7 +44786,7 @@ impl Gpu {
                 self.arch.as_str(),
                 2,
                 MqV2PrefillProjection::Qkv,
-                batch_size,
+                self.route_rows(batch_size),
             ) == Some(4)
             {
                 return self.gemm_qkv_mqv2_wmma_gfx11_bt(
@@ -42470,28 +44907,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_mq2g256v2_wmma_gfx12_bt12",
@@ -42586,7 +45002,7 @@ impl Gpu {
                 self.arch.as_str(),
                 2,
                 MqV2PrefillProjection::GateUp,
-                batch_size,
+                self.route_rows(batch_size),
             ) == Some(12)
             {
                 return self.gemm_gate_up_mqv2_wmma_gfx11_bt(
@@ -42691,28 +45107,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_mq2g256v2_residual_wmma_gfx12_bt12",
@@ -42793,7 +45188,7 @@ impl Gpu {
                 self.arch.as_str(),
                 2,
                 MqV2PrefillProjection::Residual,
-                batch_size,
+                self.route_rows(batch_size),
             ) == Some(4)
             {
                 return self.gemm_mqv2_residual_wmma_gfx11_bt(2, 4, a_raw, x, y, m, k, batch_size);
@@ -43224,28 +45619,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_mq4cg256_wmma_gfx12_bt12",
@@ -43512,28 +45886,7 @@ impl Gpu {
             }
             return result;
         }
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_mq4cg256_wmma_gfx12_bt12",
@@ -43754,28 +46107,7 @@ impl Gpu {
             }
             return result;
         }
-        let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true)
-        {
-            if batch_size < 64 {
-                1
-            } else if batch_size % 192 == 0 {
-                12
-            } else if batch_size % 128 == 0 {
-                8
-            } else if batch_size % 64 == 0 {
-                4
-            } else if batch_size >= 192 {
-                12
-            } else if batch_size >= 128 {
-                8
-            } else {
-                4
-            }
-        } else {
-            1
-        };
+        let bt_b: usize = gfx12_bt_tile(batch_size);
         let (kname, ksrc): (&str, &str) = match bt_b {
             12 => (
                 "gemm_mq4cg256_residual_wmma_gfx12_bt12",
@@ -44267,7 +46599,7 @@ impl Gpu {
         self.arch_caps.has_wmma()
             && m == 1280
             && k == 2560
-            && x_src_rows >= QWEN4_F16_WMMA_MIN_TOKENS
+            && self.route_rows(x_src_rows) >= QWEN4_F16_WMMA_MIN_TOKENS
             && *QWEN4_F16_WMMA
     }
 
@@ -44289,6 +46621,7 @@ impl Gpu {
         grouped_rows: usize,
         x_src_rows: usize,
     ) -> HipResult<()> {
+        crate::moe::require_span(y_grouped, &[grouped_rows, m, 2], "gemm_mq4g256v2_moe_grouped_top10_bf16out grouped rows")?;
         self.gemm_mq4g256v2_moe_grouped_wmma_k2_impl(
             expert_weight_ptrs,
             expert_tile_ids,
@@ -44301,6 +46634,7 @@ impl Gpu {
             grouped_rows,
             x_src_rows,
             Some("gemm_mq4g256v2_moe_grouped_wmma_k2_bf16out"),
+            16,
         )
     }
 
@@ -44328,6 +46662,15 @@ impl Gpu {
                 "SwiGLU gate/up epilogue needs m % 16 == 0",
             ));
         }
+        crate::moe::require_span(y_grouped, &[grouped_rows, m / 2, 2], "gemm_mq4g256v2_moe_grouped_top10_silu_bf16out grouped rows")?;
+        // gfx1151 (`HIPFIRE_QWEN4_MOE_X_LDS`, default `auto`): four row tiles
+        // per workgroup share each multi-tile run's X through LDS (bitwise the
+        // per-wave entry). This launcher is the F16 WMMA MoE route's gate/up:
+        // the Qwen4 prefill dispatch reaches it only when the layer's
+        // symmetric IU4 arm is not selected.
+        let x4 = qwen4_moe_x_lds_armed(*QWEN4_MOE_X_LDS, self.arch_caps.is_gfx1151(), false)
+            && m.is_multiple_of(64)
+            && k.is_multiple_of(256);
         self.gemm_mq4g256v2_moe_grouped_wmma_k2_impl(
             expert_weight_ptrs,
             expert_tile_ids,
@@ -44339,7 +46682,12 @@ impl Gpu {
             x_row_div,
             grouped_rows,
             x_src_rows,
-            Some("gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out"),
+            Some(if x4 {
+                "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out_x4"
+            } else {
+                "gemm_mq4g256v2_moe_grouped_wmma_k2_silu_bf16out"
+            }),
+            if x4 { 64 } else { 16 },
         )
     }
 
@@ -44367,6 +46715,7 @@ impl Gpu {
                 "gemm_mq4g256v2_moe_grouped_top10: x_row_div must be sealed top-k=10",
             ));
         }
+        crate::moe::require_span(y_grouped, &[grouped_rows, m, 4], "gemm_mq4g256v2_moe_grouped_top10 grouped rows")?;
         // gfx1151, >= 512 tokens: the F16 WMMA grouped GEMM (60 VGPRs, 16
         // waves/SIMD) beats the F32 O4×R8 kernel (9.6 vs 14.7 ms at 1131
         // tokens; slower below ~450).  Not bit-exact — F16 dequant/inputs —
@@ -44573,9 +46922,1029 @@ impl Gpu {
     }
 }
 
+/// `HIPFIRE_QWEN4_MOE_SYM_IU4` selects the grouped symmetric IU4 MoE route
+/// (fn-moe-sym) for gfx1151 / gfx1201 Qwen4 prefill on layers whose every
+/// routed-expert header passed [`Gpu::qwen4_moe_sym_check`]: `1` requests it,
+/// `0` keeps the whole incumbent route (scatter, producers and GEMMs), and
+/// unset requests it on both arches (an asymmetric artifact fails the check
+/// and stays on the incumbent). Read once.
+pub(crate) static QWEN4_MOE_SYM_IU4: LazyLock<Option<bool>> =
+    LazyLock::new(|| match hipfire_config::developer_var("HIPFIRE_QWEN4_MOE_SYM_IU4").ok().as_deref() {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    });
+
+/// The route's GEMMs run from the certified builder modules
+/// (`kernels::QWEN4_MOE_IU4_SYM_PM_*`). `HIPFIRE_QWEN4_MOE_SYM_PM=0` restores
+/// the byte-identical gfx1151 hipcc entries (same-binary control); gfx1201 has
+/// only the builder module. Read once.
+static QWEN4_MOE_SYM_PM: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_SYM_PM", true));
+
+/// Prefill rows from which the symmetric IU4 MoE route applies: the F16 WMMA
+/// gate/up threshold it replaces. Smaller prefill, decode and verify stay on
+/// the incumbent.
+pub const QWEN4_MOE_SYM_IU4_MIN_ROWS: usize = QWEN4_F16_WMMA_MIN_TOKENS;
+const QWEN4_MOE_SYM_MODULE: &str = "qwen4_moe_iu4_sym_gfx1151";
+/// Expert-run tile entries (four 16-slot tiles per weight stream, block 128);
+/// bitwise the module's 16-slot entries, which the ORACLE keeps as the anchor.
+const QWEN4_MOE_SYM_GATE_UP: &str = "qwen4_moe_gate_up_silu_iu4_sym_gfx1151_nt4";
+const QWEN4_MOE_SYM_DOWN: &str = "qwen4_moe_down_iu4_sym_gfx1151_nt4";
+const QWEN4_MOE_SYM_CHECK: &str = "qwen4_moe_sym_check_gfx1151";
+const QWEN4_MOE_SYM_CHECK_GFX1201_MODULE: &str = "qwen4_moe_sym_check_gfx1201";
+const QWEN4_MOE_SYM_PM_MODULE: [&str; 2] = ["qwen4_moe_iu4_sym_pm_gfx1151", "qwen4_moe_iu4_sym_pm_gfx1201"];
+/// Expert-run entries `[arch][host_mapped]` (block 128, several 16-slot tiles
+/// per weight stream): NT4 on VRAM-resident experts; on gfx1201 NT8 when the
+/// layer's experts are host-mapped (twice the reuse per PCIe weight stream).
+/// Every entry is bitwise the module's 16-slot entries, the ORACLE's anchor.
+const QWEN4_MOE_SYM_PM_GATE_UP: [[&str; 2]; 2] = [
+    ["qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1151_nt4"],
+    ["qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4", "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt8"],
+];
+const QWEN4_MOE_SYM_PM_DOWN: [[&str; 2]; 2] = [
+    ["qwen4_moe_down_iu4_sym_pm_gfx1151_nt4", "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4"],
+    ["qwen4_moe_down_iu4_sym_pm_gfx1201_nt4", "qwen4_moe_down_iu4_sym_pm_gfx1201_nt8"],
+];
+/// gfx1151 builder down entries with a row repeat of 2 and 4 (NT4 expert-run
+/// tiles, `rr` contiguous 64-row blocks per workgroup), `[rr2, rr4]`. Same
+/// bytes as the rr1 entry above; the VRAM-resident and host-mapped residency
+/// share them (gfx1151 has one NT4 width).
+const QWEN4_MOE_SYM_PM_DOWN_GFX1151_RR: [&str; 2] =
+    ["qwen4_moe_down_iu4_sym_pm_gfx1151_nt4r2", "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4r4"];
+/// `HIPFIRE_QWEN4_MOE_SYM_DOWN_RR` (1, 2 or 4; unset = 1): down-GEMM row
+/// repeat on the gfx1151 builder entries, see [`Gpu::qwen4_moe_sym_down_rr`].
+/// `Err` holds a rejected value. Read once.
+static QWEN4_MOE_SYM_DOWN_RR: LazyLock<Result<usize, String>> =
+    LazyLock::new(|| match hipfire_config::developer_var("HIPFIRE_QWEN4_MOE_SYM_DOWN_RR").ok().as_deref() {
+        None | Some("1") => Ok(1),
+        Some("2") => Ok(2),
+        Some("4") => Ok(4),
+        Some(bad) => Err(bad.to_string()),
+    });
+/// Builder GEMMs divide `slot / x_row_div` through an f32 reciprocal that is
+/// exact (after two integer corrections) only for slots below 2^22.
+const QWEN4_MOE_SYM_PM_MAX_SLOTS: usize = 1 << 22;
+const QWEN4_MOE_GROUP_MODULE: &str = "qwen4_moe_scatter_stable_top10";
+const QWEN4_MOE_ROTATE128_I4: &str = "qwen4_moe_rotate128_i4";
+
+static QWEN4_TRUNK_IU4_RAGGED: LazyLock<bool> = LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_QWEN4_TRUNK_IU4_RAGGED").as_deref() != Ok("0")
+});
+
+/// Dense eligibility uses live rows, never a tensor's allocation capacity.
+pub fn qwen4_trunk_iu4_dense_rows(rows: usize) -> bool {
+    rows >= QWEN4_F16_WMMA_MIN_TOKENS && rows % 128 == 0
+}
+/// Padded V2B row count for ragged prefill; aligned chunks keep their old route.
+pub fn qwen4_trunk_iu4_ragged_rows(rows: usize) -> Option<usize> {
+    (rows >= QWEN4_F16_WMMA_MIN_TOKENS && rows % 128 != 0)
+        .then(|| rows.next_multiple_of(256))
+}
+
+#[cfg(test)]
+mod qwen4_trunk_ragged_tests {
+    #[test]
+    fn admission() {
+        for (rows, expected) in [
+            (511, None), (512, None), (8064, None), (8192, None),
+            (513, Some(768)), (777, Some(1024)), (1124, Some(1280)),
+            (1127, Some(1280)), (4097, Some(4352)), (8151, Some(8192)),
+            (8186, Some(8192)), (8191, Some(8192)),
+        ] {
+            assert_eq!(super::qwen4_trunk_iu4_ragged_rows(rows), expected);
+        }
+    }
+}
+
+/// Qwen4 symmetric MQ4 trunk (fn-trunk-iu4): header check, the GDN
+/// Z|beta|alpha fold SET, and the exact-activation MQ4 prefill fallback.
+impl Gpu {
+    /// The trunk route is requested and possible: `mask` (the load's
+    /// effective mask, [`crate::trunk_mask::qwen4_trunk_iu4_route`]: the
+    /// `HIPFIRE_QWEN4_TRUNK_IU4` override, else the artifact's embedded
+    /// default) selects at least one projection family,
+    /// exact gfx1151 and the IU4 prefill / symmetric-fold switches the dense
+    /// SET kernels need. The artifact's `mq4v2.symmetric` marker is not
+    /// required (Qwen4 artifacts record expert symmetry separately): the
+    /// forward verifies every MQ4 trunk header on the device and only then
+    /// claims the symmetric contract (`mq4v2_symmetric`) the dense SET
+    /// kernels read.
+    pub fn qwen4_trunk_iu4_requested(&self, mask: &crate::trunk_mask::Qwen4TrunkMask) -> bool {
+        !mask.is_empty()
+            && self.arch == "gfx1151"
+            && self.flags.iu4_prefill_enabled()
+            && self.flags.gfx11_iu4_symfold
+            && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")
+    }
+
+    /// Whether a `rows`-row trunk projection takes the IU4 route: verified
+    /// trunk, prefill of at least [`QWEN4_F16_WMMA_MIN_TOKENS`] rows in whole
+    /// 128-row tiles, eager (no replay recording or graph capture). A partial
+    /// N tile would reach the IU4 tail entry, whose fold differs from the
+    /// symmetric one (measured: tail outputs off by up to 4e-6 vs the dense
+    /// fold at N=1131); such chunks keep exact activations instead.
+    ///
+    /// Never under the batch-invariant prefill profile
+    /// ([`Gpu::prefill_invariant_scope`]): a row's bytes would depend on
+    /// whether it lands in a whole or a partial 128-row tile, i.e. on how many
+    /// other rows share the forward, so the profile takes the exact-activation
+    /// route at every row count.
+    pub fn qwen4_trunk_iu4_applies(&self, rows: usize) -> bool {
+        self.qwen4_trunk_iu4
+            && !self.prefill_invariant_scope
+            && qwen4_trunk_iu4_dense_rows(rows)
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+    }
+
+    /// Ragged Z|beta|alpha only, never decode, invariant prefill or capture.
+    pub fn qwen4_trunk_iu4_ragged(&self, rows: usize) -> Option<usize> {
+        if self.qwen4_trunk_iu4
+            && self.qwen4_trunk_iu4_prefill_scope
+            && !self.prefill_invariant_scope
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && *QWEN4_TRUNK_IU4_RAGGED
+        {
+            qwen4_trunk_iu4_ragged_rows(rows)
+        } else {
+            None
+        }
+    }
+
+    /// Production ragged sequence, shared with the hardware oracle. The caller
+    /// must establish that padded rows are dead, dedicated F32 scratch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen4_trunk_zba_ragged(
+        &mut self, input: &GpuTensor, rows: usize, n_pad: usize, k: usize,
+        fold_rows: &GpuTensor, z_m: usize, y_z_pad: &GpuTensor,
+        y_beta_pad: &GpuTensor, y_alpha_pad: &GpuTensor,
+    ) -> HipResult<bool> {
+        if self.qwen4_trunk_iu4_ragged(rows) != Some(n_pad)
+            || input.dtype != DType::F32
+            || input.byte_size() < n_pad * k * 4
+            || [(y_z_pad, z_m), (y_beta_pad, 48), (y_alpha_pad, 48)]
+                .iter().any(|(y, m)| y.dtype != DType::F32 || y.byte_size() < n_pad * m * 4)
+        {
+            return Ok(false);
+        }
+        let tail = input.buf.byte_view(rows * k * 4, (n_pad - rows) * k * 4);
+        match self.active_stream.as_ref() {
+            Some(stream) => self.hip.memset_async(&tail, 0, tail.size(), stream)?,
+            None => self.hip.memset(&tail, 0, tail.size())?,
+        }
+        // block_i4_128 is [K/128][N]: regenerate at N=n_pad, never reuse a
+        // rows-strided sidecar. Each row's producer and K-only reduction are
+        // identical to aligned IU4; zero input rows yield zero outputs.
+        let reservation = self.reserve_int4_mmq(k, n_pad)?;
+        let prepared = self.rotate_x_mq_i4_batched(input, None, None, reservation, k, n_pad)?;
+        self.gemm_qwen4_trunk_zba_iu4(
+            fold_rows, &prepared, y_z_pad, y_beta_pad, y_alpha_pad, z_m, k, n_pad,
+        )
+    }
+
+    /// Check every header of one `m x k` QT44 trunk matrix for the symmetric
+    /// grid (`zp == -8*sc`, finite) on the device.
+    pub fn qwen4_trunk_sym_check(&mut self, w: &GpuTensor, m: usize, k: usize) -> HipResult<bool> {
+        let row_bytes = k / 256 * crate::dispatch::MQ4V2_GROUP_BYTES;
+        if k % 256 != 0 || w.byte_size() < m * row_bytes {
+            return Ok(false);
+        }
+        let table = self.upload_raw(&(w.buf.as_ptr() as u64).to_le_bytes(), &[8])?;
+        let verdict = self.qwen4_moe_sym_check(&table, m, k, 1, 136);
+        self.free_tensor(table)?;
+        verdict
+    }
+
+    /// GDN Z|beta|alpha as one V2B SET over the folded rows `a_fold` (Z's
+    /// `z_m` rows, beta's 48, alpha's 48, zero rows up to `z_m + 256`) whose
+    /// epilogue writes Z `[n][z_m]`, beta and alpha `[n][48]` (the dense
+    /// `_set_zba` entry). `Ok(false)` when V2B does not take this shape; the
+    /// caller then runs the three SETs separately.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qwen4_trunk_zba_iu4(
+        &mut self,
+        a_fold: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        z_m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<bool> {
+        let row_bytes = k / 256 * crate::dispatch::MQ4V2_GROUP_BYTES;
+        let folded_m = z_m + 256;
+        if z_m % 256 != 0
+            || a_fold.byte_size() != folded_m * row_bytes
+            || self.iu4_v2_tile(folded_m, k, n) != Some(Iu4V2Tile::V2b)
+            || y_z.byte_size() < n * z_m * 4
+            || y_beta.byte_size() < n * 48 * 4
+            || y_alpha.byte_size() < n * 48 * 4
+            || hipfire_config::developer_var("HIPFIRE_V2B_ZBA_SCATTER").as_deref() == Ok("0")
+        {
+            return Ok(false);
+        }
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
+        self.gemm_zba_v2b_scatter(a_fold, xq, y_z, y_beta, y_alpha, z_m, k, n)?;
+        Ok(true)
+    }
+
+}
+
+/// Qwen4 symmetric IU4 MoE route (fn-moe-sym): header check, stable
+/// grouping, the two A4 producers and the two grouped IU4 GEMMs. gfx1151 and
+/// gfx1201 only; every launcher refuses other arches.
+impl Gpu {
+    /// The route is requested and possible on this device: the flag (unset =
+    /// requested), exact gfx1151 or gfx1201, and the frozen C2 producer
+    /// candidate set (`-DIU4_A4_CANDIDATES=2`, the default on both; any other
+    /// value keeps the incumbent). Row count and verified headers are checked
+    /// separately.
+    pub fn qwen4_moe_sym_iu4_requested(&self) -> bool {
+        let mut candidates = self
+            .flags
+            .hipcc_extra_flags
+            .split_whitespace()
+            .filter(|flag| flag.starts_with("-DIU4_A4_CANDIDATES="))
+            .peekable();
+        QWEN4_MOE_SYM_IU4.unwrap_or(true)
+            && self.qwen4_moe_sym_arch_index().is_some()
+            && candidates.peek().is_some()
+            && candidates.all(|flag| flag == "-DIU4_A4_CANDIDATES=2")
+    }
+
+    /// Whether a `rows`-row prefill takes the route (smaller prefill, decode
+    /// and speculative verify stay on the incumbent).
+    pub fn qwen4_moe_sym_iu4_applies(&self, rows: usize) -> bool {
+        self.route_rows(rows) >= QWEN4_MOE_SYM_IU4_MIN_ROWS && self.qwen4_moe_sym_iu4_requested()
+    }
+
+    /// Index of this arch in the route's per-arch tables (gfx1151, gfx1201).
+    fn qwen4_moe_sym_arch_index(&self) -> Option<usize> {
+        match self.arch.as_str() {
+            "gfx1151" => Some(0),
+            "gfx1201" => Some(1),
+            _ => None,
+        }
+    }
+
+    fn qwen4_moe_sym_arch(&self, what: &str) -> HipResult<usize> {
+        self.qwen4_moe_sym_arch_index().ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("{what}: the symmetric IU4 MoE route is gfx1151/gfx1201-only, got {}", self.arch),
+            )
+        })
+    }
+
+    /// `[gate/up, down]` entry names the route's GEMM launchers run on this
+    /// device for experts in VRAM or (`host_mapped`) in host-mapped memory:
+    /// the builder entries, or the gfx1151 hipcc entries under
+    /// `HIPFIRE_QWEN4_MOE_SYM_PM=0`. The down entry carries the row repeat of
+    /// [`Gpu::qwen4_moe_sym_down_rr`]; the launcher's `m % (64 * rr)` check
+    /// is what keeps its grid covering every row. `None` off gfx1151/gfx1201.
+    pub fn qwen4_moe_sym_gemm_symbols(&self, host_mapped: bool) -> Option<[&'static str; 2]> {
+        let arch = self.qwen4_moe_sym_arch_index()?;
+        let h = host_mapped as usize;
+        Some(if qwen4_moe_sym_native_selected(self.arch.as_str(), arch != 1 && *QWEN4_MOE_SYM_PM) {
+            let down = match self.qwen4_moe_sym_down_rr().unwrap_or(1) {
+                2 => QWEN4_MOE_SYM_PM_DOWN_GFX1151_RR[0],
+                4 => QWEN4_MOE_SYM_PM_DOWN_GFX1151_RR[1],
+                _ => QWEN4_MOE_SYM_PM_DOWN[arch][h],
+            };
+            [QWEN4_MOE_SYM_PM_GATE_UP[arch][h], down]
+        } else {
+            [QWEN4_MOE_SYM_GATE_UP, QWEN4_MOE_SYM_DOWN]
+        })
+    }
+
+    /// Down-GEMM row repeat: contiguous 64-row blocks one workgroup covers
+    /// (`grid.x = m / (64 * rr)`). `HIPFIRE_QWEN4_MOE_SYM_DOWN_RR` (1, 2 or 4)
+    /// applies on the gfx1151 builder (PM) entries only; every other path,
+    /// gfx1201 and `HIPFIRE_QWEN4_MOE_SYM_PM=0` included, is 1. A value other
+    /// than 1/2/4 is an error where it would apply.
+    pub fn qwen4_moe_sym_down_rr(&self) -> HipResult<usize> {
+        if self.arch != "gfx1151" || !*QWEN4_MOE_SYM_PM {
+            return Ok(1);
+        }
+        QWEN4_MOE_SYM_DOWN_RR
+            .clone()
+            .map_err(|bad| hip_bridge::HipError::new(0, &format!("HIPFIRE_QWEN4_MOE_SYM_DOWN_RR={bad}: expected 1, 2 or 4")))
+    }
+
+    /// Loads entry `func` of this arch's embedded builder module (the route's
+    /// GEMMs and their 16-slot anchors), for launch by name.
+    pub fn ensure_qwen4_moe_sym_pm_entry(&mut self, func: &str) -> HipResult<()> {
+        let arch = self.qwen4_moe_sym_arch(func)?;
+        let image = if arch == 0 { kernels::QWEN4_MOE_IU4_SYM_PM_GFX1151 } else { kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201 };
+        self.bind_thread()?;
+        self.ensure_embedded_kernel(QWEN4_MOE_SYM_PM_MODULE[arch], image, func)
+    }
+
+    /// True when every K128 header of `experts` experts behind `ptrs`
+    /// (`[experts]` device pointers) is finite and satisfies
+    /// `float(zp) == -8 * float(sc)`. `group_bytes` 136 = QT44 (`k % 256`),
+    /// 68 = QT53 (`k % 128`). Synchronous; load-time only, never captured.
+    pub fn qwen4_moe_sym_check(
+        &mut self,
+        ptrs: &GpuTensor,
+        m: usize,
+        k: usize,
+        experts: usize,
+        group_bytes: usize,
+    ) -> HipResult<bool> {
+        let arch = self.qwen4_moe_sym_arch("qwen4_moe_sym_check")?;
+        let shape_ok = match group_bytes {
+            136 => k % 256 == 0,
+            68 => k % 128 == 0,
+            _ => false,
+        };
+        let headers = experts
+            .checked_mul(m)
+            .and_then(|rows| rows.checked_mul(k / 128))
+            .filter(|&headers| headers > 0 && shape_ok);
+        let Some(headers) = headers else {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "qwen4_moe_sym_check: need m, k, experts > 0 and a QT44 (136) or QT53 (68) group",
+            ));
+        };
+        let words = headers.div_ceil(256);
+        let (Ok(grid), Ok(mv), Ok(kv), Ok(ev), Ok(gv)) = (
+            u32::try_from(words),
+            i32::try_from(m),
+            i32::try_from(k),
+            i32::try_from(experts),
+            i32::try_from(group_bytes),
+        ) else {
+            return Err(hip_bridge::HipError::new(0, "qwen4_moe_sym_check: extent overflow"));
+        };
+        self.bind_thread()?;
+        let check = if arch == 0 {
+            self.ensure_kernel(QWEN4_MOE_SYM_MODULE, kernels::QWEN4_MOE_IU4_SYM_GFX1151_SRC, QWEN4_MOE_SYM_CHECK)?;
+            QWEN4_MOE_SYM_CHECK
+        } else {
+            self.ensure_kernel(
+                QWEN4_MOE_SYM_CHECK_GFX1201_MODULE,
+                kernels::QWEN4_MOE_SYM_CHECK_GFX1201_SRC,
+                QWEN4_MOE_SYM_CHECK_GFX1201_MODULE,
+            )?;
+            QWEN4_MOE_SYM_CHECK_GFX1201_MODULE
+        };
+        let bad = self.alloc_tensor(&[words], DType::F32)?;
+        let pp = ptrs.buf.as_ptr();
+        let bp = bad.buf.as_ptr();
+        let mut params = [
+            &pp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &ev as *const _ as *mut c_void,
+            &gv as *const _ as *mut c_void,
+        ];
+        let launched = self.launch_maybe_blob(
+            check,
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(bp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(ev);
+                b.push_i32(gv);
+                b
+            },
+        );
+        let words_read = launched
+            .and_then(|()| self.hip.device_synchronize())
+            .and_then(|()| self.download_raw_bytes(&bad));
+        let freed = self.free_tensor(bad);
+        let words_read = words_read?;
+        freed?;
+        Ok(words_read.iter().all(|&byte| byte == 0))
+    }
+
+    /// Grow the route's scratch for prefills of up to `max_rows` tokens
+    /// (`k_top` routed slots each) before any graph capture: the grouping
+    /// scratch, the down sidecar and the shared gate/up `int4_mmq_x_scratch`.
+    pub fn reserve_qwen4_moe_sym(
+        &mut self,
+        max_rows: usize,
+        k_top: usize,
+        experts: usize,
+        hidden: usize,
+        intermediate: usize,
+    ) -> HipResult<()> {
+        self.qwen4_moe_sym_arch("reserve_qwen4_moe_sym")?;
+        let slots = max_rows.saturating_mul(k_top);
+        let group = crate::scratch::qwen4_moe_group_layout(slots, experts).bytes;
+        let down = intermediate / 128 * slots * 72;
+        let gate = crate::scratch::int4_mmq_reserve_needed(hidden, max_rows);
+        let scratch = &self.scratch;
+        if crate::scratch::scratch_will_grow(
+            scratch.qwen4_moe_group_scratch_bytes,
+            scratch.qwen4_moe_group_scratch.is_some(),
+            group,
+        ) || crate::scratch::scratch_will_grow(
+            scratch.qwen4_moe_down_i4_scratch_bytes,
+            scratch.qwen4_moe_down_i4_scratch.is_some(),
+            down,
+        ) || crate::scratch::scratch_will_grow(
+            scratch.int4_mmq_x_scratch_bytes,
+            scratch.int4_mmq_x_scratch.is_some(),
+            gate,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        self.bind_thread()?;
+        self.scratch.reserve_qwen4_moe_group(&self.hip, slots, experts)?;
+        self.scratch.reserve_qwen4_moe_down_i4(&self.hip, intermediate, slots)?;
+        self.scratch.reserve_int4_mmq(&self.hip, hidden, max_rows)?;
+        Ok(())
+    }
+
+    /// Stable `(expert, flat_slot)` pad16 grouping: the six outputs of
+    /// [`Gpu::moe_scatter_fused_top10`] (padded counts, offsets `[E+1]`,
+    /// sorted slots with -1 padding and tail, tile ids with -1 tail,
+    /// inverse permutation), in a deterministic order. Three launches, no
+    /// atomics, no pre-clear.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_scatter_stable_top10(
+        &mut self,
+        topk: &GpuTensor,
+        counts: &GpuTensor,
+        offsets: &GpuTensor,
+        sorted: &GpuTensor,
+        tiles: &GpuTensor,
+        inverse: &GpuTensor,
+        total_slots: usize,
+        experts: usize,
+        grouped_rows: usize,
+    ) -> HipResult<()> {
+        self.qwen4_moe_sym_arch("moe_scatter_stable_top10")?;
+        if total_slots == 0
+            || experts == 0
+            || experts > 1024
+            || grouped_rows % 16 != 0
+            || grouped_rows < total_slots
+            || i32::try_from(grouped_rows).is_err()
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "moe_scatter_stable_top10: need slots > 0, 0 < experts <= 1024, \
+                 grouped_rows >= slots and a multiple of 16",
+            ));
+        }
+        self.bind_thread()?;
+        for func in ["qwen4_moe_group_ranks", "qwen4_moe_group_prefix", "qwen4_moe_group_scatter"] {
+            self.ensure_kernel(
+                QWEN4_MOE_GROUP_MODULE,
+                kernels::QWEN4_MOE_SCATTER_STABLE_TOP10_SRC,
+                func,
+            )?;
+        }
+        let layout = crate::scratch::qwen4_moe_group_layout(total_slots, experts);
+        if crate::scratch::scratch_will_grow(
+            self.scratch.qwen4_moe_group_scratch_bytes,
+            self.scratch.qwen4_moe_group_scratch.is_some(),
+            layout.bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        self.scratch.reserve_qwen4_moe_group(&self.hip, total_slots, experts)?;
+        let base = self.scratch.qwen4_moe_group_scratch.as_ref().unwrap().as_ptr() as *mut u8;
+        // SAFETY: both offsets lie inside the allocation just sized for `layout`.
+        let (rank, partial, prefix) = unsafe {
+            (
+                base as *mut c_void,
+                base.add(layout.partial_offset) as *mut c_void,
+                base.add(layout.prefix_offset) as *mut c_void,
+            )
+        };
+        let tp = topk.buf.as_ptr();
+        let cp = counts.buf.as_ptr();
+        let op = offsets.buf.as_ptr();
+        let sp = sorted.buf.as_ptr();
+        let tip = tiles.buf.as_ptr();
+        let ip = inverse.buf.as_ptr();
+        let lv = total_slots as i32;
+        let ev = experts as i32;
+        let cv = layout.chunks as i32;
+        let pv = grouped_rows as i32;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "elementwise",
+            "moe_scatter_stable_top10",
+            (4 * total_slots + 3 * experts * layout.chunks + grouped_rows + total_slots) * 4,
+        );
+        let mut params = [
+            &tp as *const _ as *mut c_void,
+            &rank as *const _ as *mut c_void,
+            &partial as *const _ as *mut c_void,
+            &lv as *const _ as *mut c_void,
+            &ev as *const _ as *mut c_void,
+            &cv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "qwen4_moe_group_ranks",
+            [layout.chunks as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(tp);
+                b.push_ptr(rank);
+                b.push_ptr(partial);
+                b.push_i32(lv);
+                b.push_i32(ev);
+                b.push_i32(cv);
+                b
+            },
+        )?;
+        let mut params = [
+            &partial as *const _ as *mut c_void,
+            &prefix as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &ev as *const _ as *mut c_void,
+            &cv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "qwen4_moe_group_prefix",
+            [1, 1, 1],
+            [experts as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(partial);
+                b.push_ptr(prefix);
+                b.push_ptr(cp);
+                b.push_ptr(op);
+                b.push_i32(ev);
+                b.push_i32(cv);
+                b
+            },
+        )?;
+        let mut params = [
+            &tp as *const _ as *mut c_void,
+            &rank as *const _ as *mut c_void,
+            &prefix as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &tip as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &lv as *const _ as *mut c_void,
+            &ev as *const _ as *mut c_void,
+            &pv as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            "qwen4_moe_group_scatter",
+            [grouped_rows.div_ceil(256) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(tp);
+                b.push_ptr(rank);
+                b.push_ptr(prefix);
+                b.push_ptr(op);
+                b.push_ptr(sp);
+                b.push_ptr(tip);
+                b.push_ptr(ip);
+                b.push_i32(lv);
+                b.push_i32(ev);
+                b.push_i32(pv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Gate/up A4 producer: the shipped FWHT256 + `block_i4_128` sidecar
+    /// (`mq_rotate_x_i4`, C2) of F32 `x` `[rows, k]` into the shared
+    /// `int4_mmq_x_scratch`, epoch-major `[k/128, rows]`.
+    pub fn qwen4_moe_rotate256_i4(
+        &mut self,
+        x: &GpuTensor,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.qwen4_moe_sym_arch("qwen4_moe_rotate256_i4")?;
+        if x.dtype != DType::F32 {
+            return Err(hip_bridge::HipError::new(0, "qwen4_moe_rotate256_i4: F32 input only"));
+        }
+        crate::moe::require_span(x, &[rows, k, 4], "qwen4_moe_rotate256_i4 activations")?;
+        let reservation = self.reserve_int4_mmq(k, rows)?;
+        self.rotate_x_mq_i4_batched(x, None, None, reservation, k, rows)
+    }
+
+    /// Down A4 producer: grouped BF16 SwiGLU rows `h` `[grouped_rows, k]`
+    /// -> FWHT128 -> `block_i4_128` (C2) into the compact flat-slot down
+    /// sidecar `[k/128, total_slots]`, row `sorted[p]`; padding rows emit
+    /// nothing.
+    pub fn qwen4_moe_rotate128_i4(
+        &mut self,
+        h: &GpuTensor,
+        sorted: &GpuTensor,
+        k: usize,
+        grouped_rows: usize,
+        total_slots: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.qwen4_moe_sym_arch("qwen4_moe_rotate128_i4")?;
+        if k == 0 || k % 128 != 0 || grouped_rows == 0 || total_slots == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "qwen4_moe_rotate128_i4: need k % 128 == 0 and nonzero rows",
+            ));
+        }
+        crate::moe::require_span(h, &[grouped_rows, k, 2], "qwen4_moe_rotate128_i4 grouped BF16 rows")?;
+        crate::moe::require_span(sorted, &[grouped_rows, 4], "qwen4_moe_rotate128_i4 sorted slots")?;
+        // Fold the grouped row into grid x (p = x / (k/128), group = x % (k/128)):
+        // grid y is bounded at 65535 and grouped_rows can exceed it.
+        let grid_x = u32::try_from((k / 128) * grouped_rows).map_err(|_| {
+            hip_bridge::HipError::new(0, "qwen4_moe_rotate128_i4: grid exceeds u32")
+        })?;
+        self.bind_thread()?;
+        self.ensure_mq_signs_128()?;
+        self.ensure_kernel(
+            QWEN4_MOE_ROTATE128_I4,
+            kernels::QWEN4_MOE_ROTATE128_I4_SRC,
+            QWEN4_MOE_ROTATE128_I4,
+        )?;
+        let needed = k / 128 * total_slots * 72;
+        if crate::scratch::scratch_will_grow(
+            self.scratch.qwen4_moe_down_i4_scratch_bytes,
+            self.scratch.qwen4_moe_down_i4_scratch.is_some(),
+            needed,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        let reservation = self.scratch.reserve_qwen4_moe_down_i4(&self.hip, k, total_slots)?;
+        let hp = h.buf.as_ptr();
+        let sp = sorted.buf.as_ptr();
+        let xp = reservation.ptr();
+        let s1 = self.scratch.mq_signs1_128.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2_128.as_ref().unwrap().buf.as_ptr();
+        let kv = k as i32;
+        let pv = grouped_rows as i32;
+        let lv = total_slots as i32;
+        let mut params = [
+            &hp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &pv as *const _ as *mut c_void,
+            &lv as *const _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "fwht",
+            QWEN4_MOE_ROTATE128_I4,
+            grouped_rows * (k * 2 + 4) + needed,
+        );
+        let result = self.launch_maybe_blob(
+            QWEN4_MOE_ROTATE128_I4,
+            [grid_x, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(hp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_i32(kv);
+                b.push_i32(pv);
+                b.push_i32(lv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+    }
+
+    /// Grouped IU4 gate/up with the SwiGLU epilogue: `y` `[grouped_rows,
+    /// m/2]` BF16 bits of rt(silu(rt(g)) * rt(u)), padding rows +0, sentinel
+    /// tiles untouched. `xq` is the [`Gpu::qwen4_moe_rotate256_i4`] handle of
+    /// `x_src_rows` tokens; `x_row_div` = top-k. `host_mapped`: the experts
+    /// behind `ptrs` live in host-mapped memory (selects the entry width).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qwen4_moe_gate_up_silu_iu4_sym(
+        &mut self,
+        ptrs: &GpuTensor,
+        tiles: &GpuTensor,
+        sorted: &GpuTensor,
+        xq: &crate::scratch::Int4MmqPrepared,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+        x_src_rows: usize,
+        host_mapped: bool,
+    ) -> HipResult<()> {
+        if m == 0 || m % 64 != 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_qwen4_moe_gate_up_silu_iu4_sym: need m % 64 == 0 and k % 256 == 0",
+            ));
+        }
+        crate::moe::require_span(y, &[grouped_rows, m / 2, 2], "gemm_qwen4_moe_gate_up_silu_iu4_sym BF16 grouped rows")?;
+        crate::moe::require_span(sorted, &[grouped_rows, 4], "gemm_qwen4_moe_gate_up_silu_iu4_sym sorted slots")?;
+        let (generation, live) = self.scratch.int4_mmq_live();
+        let xp = xq.checked_ptr(generation, live, k, x_src_rows)?;
+        self.qwen4_moe_sym_gemm(
+            [false, host_mapped],
+            grouped_rows.div_ceil(16) as u32,
+            128,
+            [ptrs, tiles, sorted, y],
+            xp,
+            [m, k, x_row_div, grouped_rows, x_src_rows],
+        )
+    }
+
+    /// Grouped IU4 down: `y` `[grouped_rows, m]` BF16 per grouped row (no
+    /// residual, no combine), padding rows +0, sentinel tiles untouched.
+    /// `xq` is the [`Gpu::qwen4_moe_rotate128_i4`] handle of `x_src_rows`
+    /// flat slots; `x_row_div` = 1. `host_mapped` as for gate/up.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qwen4_moe_down_iu4_sym(
+        &mut self,
+        ptrs: &GpuTensor,
+        tiles: &GpuTensor,
+        sorted: &GpuTensor,
+        xq: &crate::scratch::Int4MmqPrepared,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+        x_src_rows: usize,
+        host_mapped: bool,
+    ) -> HipResult<()> {
+        if m == 0 || m % 64 != 0 || k % 128 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_qwen4_moe_down_iu4_sym: need m % 64 == 0 and k % 128 == 0",
+            ));
+        }
+        crate::moe::require_span(y, &[grouped_rows, m, 2], "gemm_qwen4_moe_down_iu4_sym BF16 grouped rows")?;
+        crate::moe::require_span(sorted, &[grouped_rows, 4], "gemm_qwen4_moe_down_iu4_sym sorted slots")?;
+        let (generation, live) = self.scratch.qwen4_moe_down_i4_live();
+        let xp = xq.checked_ptr(generation, live, k, x_src_rows)?;
+        self.qwen4_moe_sym_gemm(
+            [true, host_mapped],
+            grouped_rows.div_ceil(16) as u32,
+            128,
+            [ptrs, tiles, sorted, y],
+            xp,
+            [m, k, x_row_div, grouped_rows, x_src_rows],
+        )
+    }
+
+    /// Shared 60-byte kernarg launch of the two grouped IU4 GEMMs: the
+    /// certified builder entry, or with `HIPFIRE_QWEN4_MOE_SYM_PM=0` on gfx1151
+    /// the byte-identical hipcc entry.
+    fn qwen4_moe_sym_gemm(
+        &mut self,
+        [down, host_mapped]: [bool; 2],
+        tiles_y: u32,
+        block: u32,
+        [ptrs, tiles, sorted, y]: [&GpuTensor; 4],
+        xp: *mut c_void,
+        dims: [usize; 5],
+    ) -> HipResult<()> {
+        let what = if down { "gemm_qwen4_moe_down_iu4_sym" } else { "gemm_qwen4_moe_gate_up_silu_iu4_sym" };
+        let arch = self.qwen4_moe_sym_arch(what)?;
+        let pm = qwen4_moe_sym_native_selected(self.arch.as_str(), arch != 1 && *QWEN4_MOE_SYM_PM);
+        // Row blocks per workgroup: the down symbol and grid.x both come from
+        // this one value, so a launch never covers fewer rows than `m`.
+        let rr = if down { self.qwen4_moe_sym_down_rr()? } else { 1 };
+        let func = self
+            .qwen4_moe_sym_gemm_symbols(host_mapped)
+            .map(|[gate_up, dn]| if down { dn } else { gate_up })
+            .unwrap_or(what);
+        if dims[0] % (64 * rr) != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{func}: need m % {} == 0 (HIPFIRE_QWEN4_MOE_SYM_DOWN_RR={rr})", 64 * rr),
+            ));
+        }
+        let grid = [(dims[0] / (64 * rr)) as u32, tiles_y, 1];
+        let [Some(mv), Some(kv), Some(dv), Some(gv), Some(sv)] =
+            dims.map(|value| i32::try_from(value).ok())
+        else {
+            return Err(hip_bridge::HipError::new(0, &format!("{func}: extent overflow")));
+        };
+        if dv <= 0 || gv % 16 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{func}: need x_row_div > 0 and grouped_rows % 16 == 0"),
+            ));
+        }
+        if pm && dims[2].saturating_mul(dims[4]) > QWEN4_MOE_SYM_PM_MAX_SLOTS {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{func}: x_row_div * x_src_rows must not exceed {QWEN4_MOE_SYM_PM_MAX_SLOTS}"),
+            ));
+        }
+        // Builder down entries index Y with a 32-bit byte offset; the slot guard above
+        // does not bound Y. The incumbent hipcc entry (pm == false) is not bound.
+        if pm && down {
+            pm_check_moe_down_extent(func, dims[3], dims[0])?;
+        }
+        self.bind_thread()?;
+        if pm {
+            let image = if arch == 0 { kernels::QWEN4_MOE_IU4_SYM_PM_GFX1151 } else { kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201 };
+            self.ensure_embedded_kernel(QWEN4_MOE_SYM_PM_MODULE[arch], image, func)?;
+        } else {
+            self.ensure_kernel(QWEN4_MOE_SYM_MODULE, kernels::QWEN4_MOE_IU4_SYM_GFX1151_SRC, func)?;
+        }
+        let pp = ptrs.buf.as_ptr();
+        let tp = tiles.buf.as_ptr();
+        let sp = sorted.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mut params = [
+            &pp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &dv as *const _ as *mut c_void,
+            &gv as *const _ as *mut c_void,
+            &sv as *const _ as *mut c_void,
+        ];
+        let (m, k, rows) = (dims[0], dims[1], dims[3]);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func, rows * (k / 2 + m));
+        let result = self.launch_maybe_blob(func, grid, [block, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(pp);
+            b.push_ptr(tp);
+            b.push_ptr(sp);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mv);
+            b.push_i32(kv);
+            b.push_i32(dv);
+            b.push_i32(gv);
+            b.push_i32(sv);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splitk_ld_rejects_invalid_pitch_and_geometry() {
+        let tile = LdsTileSplitK::new(64, 64, 32, 64, true, 1);
+        assert!(splitk_ld_supported(tile, 64, 80, 96));
+        for (k, lda, ldx) in [
+            (0, 64, 64),
+            (32, 64, 64),
+            (64, 48, 64),
+            (64, 64, 48),
+            (64, 65, 64),
+            (64, 64, 65),
+        ] {
+            assert!(!splitk_ld_supported(tile, k, lda, ldx));
+        }
+        for invalid in [
+            LdsTileSplitK { split: 4, ..tile },
+            LdsTileSplitK { ks: 32, ..tile },
+            LdsTileSplitK { wm: 64, ..tile },
+            LdsTileSplitK {
+                pipe: false,
+                ..tile
+            },
+            LdsTileSplitK { bm: 256, ..tile },
+        ] {
+            assert!(!splitk_ld_supported(invalid, 64, 64, 64));
+        }
+    }
+
+    #[test]
+    fn splitk_ld_entries_match_source_and_registry() {
+        let registered = crate::kernel_registry::lookup("gfx1201", "gemm_wmma_lds_splitk", "")
+            .expect("gfx1201 split-K module");
+        for arch in ["gfx1100", "gfx1151"] {
+            assert!(crate::kernel_registry::lookup(arch, "gemm_wmma_lds_splitk", "").is_err());
+        }
+        for tile in [
+            LdsTileSplitK::new(64, 64, 32, 64, true, 1),
+            LdsTileSplitK::new(64, 128, 32, 64, true, 1),
+            LdsTileSplitK::new(128, 128, 32, 64, false, 1),
+            LdsTileSplitK::new(128, 256, 32, 64, false, 1),
+        ] {
+            assert!(splitk_ld_supported(tile, 128, 144, 160));
+            let entry = splitk_ld_entry(tile).expect("admitted pitched split1 tile");
+            assert!(registered.symbols.contains(&entry));
+            assert!(kernels::GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC
+                .contains(&format!("SK_KERNEL_LD({entry},")));
+        }
+        assert_eq!(
+            registered.source(),
+            kernels::GEMM_F16_X_F16_WMMA_LDS_SPLITK_SRC
+        );
+    }
+
+    #[test]
+    fn qwen4_moe_x_lds_parses_auto_on_off() {
+        assert_eq!(Qwen4MoeXLds::parse(None), Qwen4MoeXLds::Auto);
+        assert_eq!(Qwen4MoeXLds::parse(Some("auto")), Qwen4MoeXLds::Auto);
+        assert_eq!(Qwen4MoeXLds::parse(Some("1")), Qwen4MoeXLds::On);
+        assert_eq!(Qwen4MoeXLds::parse(Some("0")), Qwen4MoeXLds::Off);
+    }
+
+    #[test]
+    fn qwen4_moe_x_lds_auto_arms_only_on_the_gfx1151_f16_route() {
+        use Qwen4MoeXLds::{Auto, Off, On};
+        // IU4 selected (the GPTQ3 default on gfx1151): off.
+        assert!(!qwen4_moe_x_lds_armed(Auto, true, true));
+        // IU4 not selected (`HIPFIRE_QWEN4_MOE_SYM_IU4=0`, asymmetric experts) on gfx1151: on.
+        assert!(qwen4_moe_x_lds_armed(Auto, true, false));
+        // Any other arch: off, IU4 or not.
+        assert!(!qwen4_moe_x_lds_armed(Auto, false, false));
+        assert!(!qwen4_moe_x_lds_armed(Auto, false, true));
+        // `0` is the kill switch.
+        assert!(!qwen4_moe_x_lds_armed(Off, true, false));
+        assert!(!qwen4_moe_x_lds_armed(Off, true, true));
+        // `1` forces it where admissible, and only there.
+        assert!(qwen4_moe_x_lds_armed(On, true, false));
+        assert!(!qwen4_moe_x_lds_armed(On, true, true));
+        assert!(!qwen4_moe_x_lds_armed(On, false, false));
+    }
+
+    #[test]
+    #[ignore = "requires GPU, HIPFIRE_QWEN4_SHARED_DOWN_EPI=1 and the F16 WMMA route"]
+    fn qwen4_shared_down_epi_matches_separate_bf16_add() {
+        use crate::tensor_ops::{bf16_scaled_add_batched, Bf16ScaledAddBatched};
+        let mut gpu = Gpu::init().expect("GPU");
+        let (m, k) = (2560, 640);
+        let wb: Vec<u8> = (0..m * k).flat_map(|i| {
+            let w = ((i % 97) as f32 - 48.0) / 256.0;
+            ((w.to_bits() >> 16) as u16).to_le_bytes()
+        }).collect();
+        let mut w = gpu.upload_raw(&wb, &[m * k]).expect("weight");
+        w.dtype = DType::BF16;
+        let poison = gpu.upload_f32(&[f32::NAN], &[1]).expect("poison input");
+        let sentinel = gpu.upload_f32(&[-0.0], &[1]).expect("zero-row residual");
+        assert!(!gpu.qwen4_shared_down_bf16_epi(&w, &poison, &sentinel, &poison, m, k, 0)
+            .expect("zero-row admission"));
+        assert_eq!(gpu.download_f32(&sentinel).expect("zero-row residual")[0].to_bits(), (-0.0f32).to_bits());
+        for rows in [512, 1131, 1536] {
+            let xh: Vec<f32> = (0..rows * k).map(|i| {
+                if i < k { 0.0 } else { ((i % 113) as f32 - 56.0) / 128.0 }
+            }).collect();
+            let rh: Vec<f32> = (0..rows * m).map(|i| ((i % 127) as f32 - 63.0) / 256.0).collect();
+            let gh: Vec<f32> = (0..rows).map(|i| match i % 7 {
+                0 => f32::from_bits(1 << 16), 1 => 16384.0, 2 => -16384.0,
+                _ => (i % 13) as f32 / 16.0,
+            }).collect();
+            let x = gpu.upload_f32(&xh, &[rows * k]).expect("x");
+            let r = gpu.upload_f32(&rh, &[rows * m]).expect("residual");
+            let f = gpu.upload_f32(&rh, &[rows * m]).expect("fused residual");
+            let g = gpu.upload_f32(&gh, &[rows]).expect("gate");
+            let y = gpu.zeros(&[rows * m], DType::F32).expect("value");
+            assert!(gpu.gemm_bf16_xf32_f16_wmma_qwen4(&[(&w, &y, m)], &x, k, rows).expect("incumbent admitted"));
+            bf16_scaled_add_batched(&mut gpu, &Bf16ScaledAddBatched {
+                residual: &r, value: &y, scalar: &g, rows, elements: m,
+            }).expect("separate add");
+            assert!(gpu.qwen4_shared_down_bf16_epi(&w, &x, &f, &g, m, k, rows).expect("fused admitted"));
+            let expected = gpu.download_f32(&r).expect("reference");
+            let actual = gpu.download_f32(&f).expect("fused");
+            for (i, (a, b)) in expected.iter().zip(&actual).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "rows={rows} element={i}");
+            }
+        }
+    }
 
     #[test]
     fn builder_iu4_store_guard_routes_unsupported_operands_to_hipcc() {
@@ -44992,7 +48361,8 @@ mod tests {
 
     /// Every gfx1151 BF16 multirow route (R16 allowlist shapes and the
     /// four-row kernel, wide and scalar-tail K) must equal the batch-1 BF16
-    /// GEMV bit for bit, including partial token tiles (N = 131).
+    /// GEMV bit for bit, including partial token tiles (N = 131) and ragged
+    /// prefill chunks past 2048 tokens (r16w4 and r16w4t, 2049 and 4097).
     #[test]
     #[ignore = "requires a gfx11/gfx12 GPU and working HIP toolchain"]
     fn bf16_multirow_routes_are_bit_identical_to_gemv() {
@@ -45003,10 +48373,10 @@ mod tests {
                 return;
             }
         };
-        const N: usize = 131;
         for (m, k) in [
             (640usize, 2560usize),
             (512, 2560),
+            (2560, 2560),
             (320, 10240),
             (10240, 320),
             (2560, 640),
@@ -45023,36 +48393,42 @@ mod tests {
                 .expect("w upload");
             w.dtype = DType::BF16;
             w.shape = vec![m, k];
-            let x: Vec<f32> = (0..N * k)
-                .map(|i| ((i * 7919 % 3001) as f32 - 1500.0) / 977.0)
-                .collect();
-            let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x upload");
-            let y = gpu.zeros(&[N * m], DType::F32).expect("y");
-            gpu.gemm_bf16_xf32_multirow(&w, &x_gpu, &y, m, k, N)
-                .expect("multirow GEMM");
-            let y_ref = gpu.zeros(&[N * m], DType::F32).expect("y ref");
-            for n in 0..N {
-                gpu.gemv_bf16_xf32(
-                    &w,
-                    &x_gpu.sub_offset(n * k, k),
-                    &y_ref.sub_offset(n * m, m),
-                    m,
-                    k,
-                )
-                .expect("gemv row");
+            for n_rows in [131usize, 2049, 4097] {
+                let x: Vec<f32> = (0..n_rows * k)
+                    .map(|i| ((i * 7919 % 3001) as f32 - 1500.0) / 977.0)
+                    .collect();
+                let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x upload");
+                let y = gpu.zeros(&[n_rows * m], DType::F32).expect("y");
+                gpu.gemm_bf16_xf32_multirow(&w, &x_gpu, &y, m, k, n_rows)
+                    .expect("multirow GEMM");
+                let y_ref = gpu.zeros(&[n_rows * m], DType::F32).expect("y ref");
+                for n in 0..n_rows {
+                    gpu.gemv_bf16_xf32(
+                        &w,
+                        &x_gpu.sub_offset(n * k, k),
+                        &y_ref.sub_offset(n * m, m),
+                        m,
+                        k,
+                    )
+                    .expect("gemv row");
+                }
+                let got = gpu.download_f32(&y).expect("y download");
+                let want = gpu.download_f32(&y_ref).expect("y ref download");
+                assert!(want.iter().any(|v| *v != 0.0));
+                let differing = got
+                    .iter()
+                    .zip(&want)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                assert_eq!(
+                    differing, 0,
+                    "({m},{k}) N={n_rows}: multirow GEMM differs from GEMV in {differing} cells"
+                );
+                for t in [x_gpu, y, y_ref] {
+                    gpu.free_tensor(t).expect("free");
+                }
             }
-            let got = gpu.download_f32(&y).expect("y download");
-            let want = gpu.download_f32(&y_ref).expect("y ref download");
-            assert!(want.iter().any(|v| *v != 0.0));
-            let differing = got
-                .iter()
-                .zip(&want)
-                .filter(|(a, b)| a.to_bits() != b.to_bits())
-                .count();
-            assert_eq!(
-                differing, 0,
-                "({m},{k}): multirow GEMM differs from GEMV in {differing} cells"
-            );
+            gpu.free_tensor(w).expect("free w");
         }
     }
 
@@ -45204,15 +48580,23 @@ mod tests {
     /// Rotating straight to F16 and running the pre-converted MQ6 GEMM must
     /// produce the bytes of the F32 rotation + converting GEMM.
     #[test]
-    #[ignore = "requires a gfx11 WMMA GPU and working HIP toolchain"]
+    #[ignore = "requires a gfx11/gfx1201 WMMA GPU and working HIP toolchain"]
     fn mq6_xf16_matches_f32_rotation_path() {
         let mut gpu = match Gpu::init() {
-            Ok(gpu) if gpu.arch_caps.has_wmma_w32() => gpu,
+            Ok(gpu) if gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12() => gpu,
             _ => {
-                eprintln!("skip: needs gfx11 WMMA");
+                eprintln!("skip: needs gfx11/gfx1201 WMMA");
                 return;
             }
         };
+        if gpu.arch.as_str() == "gfx1201" {
+            std::sync::Arc::make_mut(&mut gpu.flags).qwen4_mq6_x4_gfx1201 = Some(false);
+            assert!(!gpu.gemm_mq6g256v2_xf16_applies(2560, 1131));
+            std::sync::Arc::make_mut(&mut gpu.flags).qwen4_mq6_x4_gfx1201 = Some(true);
+            gpu.graphs.capture_mode = true;
+            assert!(!gpu.gemm_mq6g256v2_xf16_applies(2560, 1131));
+            gpu.graphs.capture_mode = false;
+        }
         for (M, K, N) in [
             (200usize, 512usize, 131usize),
             (48, 2560, 1131),
@@ -45260,6 +48644,21 @@ mod tests {
                 differing, 0,
                 "xf16 path differs in {differing} cells at M={M} K={K} N={N}"
             );
+            let bf16_y = gpu.zeros(&[N * M], DType::BF16).expect("BF16 y");
+            gpu.gemm_mq6g256v2_xf16(&a, &x16, &bf16_y, M, K, N)
+                .expect("BF16 output");
+            let mut bytes = vec![0u8; N * M * 2];
+            gpu.hip.memcpy_dtoh(&mut bytes, &bf16_y.buf).expect("BF16 download");
+            for (cell, (&value, bits)) in want.iter().zip(bytes.chunks_exact(2)).enumerate() {
+                let u = value.to_bits();
+                let expected = if value.is_finite() {
+                    ((u.wrapping_add(0x7fff).wrapping_add((u >> 16) & 1)) >> 16) as u16
+                } else {
+                    (u >> 16) as u16
+                };
+                assert_eq!(u16::from_le_bytes([bits[0], bits[1]]), expected,
+                    "BF16 output differs at cell={cell} M={M} K={K} N={N}");
+            }
         }
     }
 
@@ -45321,6 +48720,331 @@ mod tests {
             .filter(|(a, b)| a.to_bits() != b.to_bits())
             .count();
         assert_eq!(differing, 0, "overwrite differs in {differing} cells");
+    }
+
+    /// Every gfx12 MQ6 residual batch tile (and the default tile choice) must
+    /// add the base kernel's bytes into a non-zero `Y` at ragged batches: a
+    /// row tail (M = 200), token tails inside the last 192-token tile, and
+    /// prefill chunk sizes that are not a multiple of 192 (2048, 2049).
+    #[test]
+    #[ignore = "requires a gfx12 WMMA GPU and working HIP toolchain"]
+    fn mq6_gfx12_residual_tiles_match_base_kernel() {
+        const M: usize = 200;
+        const K: usize = 512;
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) if gpu.arch_caps.has_wmma_w32_gfx12() => gpu,
+            _ => {
+                eprintln!("skip: needs gfx12 WMMA");
+                return;
+            }
+        };
+        let group = crate::dispatch::MQ6G256V2_GROUP_BYTES;
+        let mut weights = vec![0u8; M * K / 256 * group];
+        let mut state = 7u32;
+        for chunk in weights.chunks_mut(group) {
+            for byte in chunk.iter_mut() {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *byte = (state >> 24) as u8;
+            }
+            for (offset, bits) in [(0, 0x2000u16), (2, 0xa800), (4, 0x2100), (6, 0xa900)] {
+                chunk[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
+            }
+        }
+        let a = gpu
+            .upload_raw(&weights, &[weights.len()])
+            .expect("w upload");
+        for n in [131usize, 200, 383, 2048, 2049] {
+            let x: Vec<f32> = (0..n * K)
+                .map(|i| ((i * 7919 % 4001) as f32 - 2000.0) / 1777.0)
+                .collect();
+            let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x upload");
+            let y0: Vec<f32> = (0..n * M).map(|i| (i % 97) as f32 / 31.0 - 1.5).collect();
+            let run = |gpu: &mut Gpu, bt: Option<usize>| {
+                let y = gpu.upload_f32(&y0, &[y0.len()]).expect("y upload");
+                match bt {
+                    Some(bt) => gpu.gemm_mq6g256v2_residual_wmma_gfx12_bt(&a, &x_gpu, &y, M, K, n, bt),
+                    None => gpu.gemm_mq6g256v2_residual_wmma_gfx12(&a, &x_gpu, &y, M, K, n),
+                }
+                .expect("residual");
+                let out = gpu.download_f32(&y).expect("y download");
+                gpu.free_tensor(y).expect("free y");
+                out
+            };
+            let want = run(&mut gpu, Some(1));
+            assert!(want.iter().zip(&y0).any(|(w, y)| w != y));
+            for bt in [Some(4), Some(8), Some(12), None] {
+                let got = run(&mut gpu, bt);
+                let differing = got
+                    .iter()
+                    .zip(&want)
+                    .filter(|(g, w)| g.to_bits() != w.to_bits())
+                    .count();
+                assert_eq!(
+                    differing, 0,
+                    "tile {bt:?} differs from the base kernel in {differing} cells at N={n}"
+                );
+            }
+            gpu.free_tensor(x_gpu).expect("free x");
+        }
+    }
+
+    /// The builder-module MQ6 overwrite GEMM (`HIPFIRE_QWEN4_MQ6_X4_PM`) must
+    /// produce the hipcc `gemm_mq6g256v2_wmma_gfx12_bt8_x4` bytes: the 64-row
+    /// entry (M <= 64), the 128-row entry with a full and a ragged row tail,
+    /// and token tails inside the last 256-token tile.
+    #[test]
+    #[ignore = "requires a gfx1201 GPU and working HIP toolchain"]
+    fn mq6_x4_pm_matches_hipcc_bytes() {
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) if gpu.arch.as_str() == "gfx1201" => gpu,
+            _ => {
+                eprintln!("skip: needs exact gfx1201");
+                return;
+            }
+        };
+        for (m, k, n) in [(10240usize, 2560usize, 512usize), (64, 2560, 300), (1003, 512, 257)] {
+            let group = crate::dispatch::MQ6G256V2_GROUP_BYTES;
+            let mut weights = vec![0u8; m * k / 256 * group];
+            let mut state = 13u32;
+            for chunk in weights.chunks_mut(group) {
+                for byte in chunk.iter_mut() {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *byte = (state >> 24) as u8;
+                }
+                for (offset, bits) in [(0, 0x2000u16), (2, 0xa800), (4, 0x2100), (6, 0xa900)] {
+                    chunk[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
+                }
+            }
+            let a = gpu.upload_raw(&weights, &[weights.len()]).expect("w upload");
+            let x: Vec<f32> = (0..n * k)
+                .map(|i| ((i * 7919 % 4001) as f32 - 2000.0) / 1777.0)
+                .collect();
+            let x_gpu = gpu.upload_f32(&x, &[x.len()]).expect("x upload");
+            let sentinel = vec![f32::from_bits(0x7fc0_1234); n * m];
+            let run = |gpu: &mut Gpu, pm: bool| {
+                let y = gpu.upload_f32(&sentinel, &[sentinel.len()]).expect("y upload");
+                gpu.mqv2_wmma_gfx11_bt_pm(6, 8, &a, &x_gpu, &y, m, k, n, true, None, pm)
+                    .expect("overwrite");
+                let out = gpu.download_f32(&y).expect("y download");
+                gpu.free_tensor(y).expect("free y");
+                out
+            };
+            let want = run(&mut gpu, false);
+            let got = run(&mut gpu, true);
+            assert!(want.iter().any(|v| *v != 0.0));
+            let differing = got
+                .iter()
+                .zip(&want)
+                .filter(|(g, w)| g.to_bits() != w.to_bits())
+                .count();
+            assert_eq!(
+                differing, 0,
+                "builder module differs from hipcc in {differing} cells at M={m} K={k} N={n}"
+            );
+            gpu.free_tensor(x_gpu).expect("free x");
+            gpu.free_tensor(a).expect("free a");
+        }
+    }
+
+    /// The gfx1151 selective PM route takes only launches of at least
+    /// `QWEN4_MQ6_X4_PM_MIN_M_GFX1151` rows and `QWEN4_MQ6_X4_PM_MIN_N_GFX1151` tokens.
+    #[test]
+    fn mq6_x4_pm_gfx1151_shape_thresholds() {
+        assert_eq!((QWEN4_MQ6_X4_PM_MIN_M_GFX1151, QWEN4_MQ6_X4_PM_MIN_N_GFX1151), (2560, 2048));
+        // The FN pp8192 trunk shapes (N = 8192): plain 12288, bf16out 10240, regions 6240.
+        for m in [12288usize, 10240, 6240, 2560] {
+            assert!(mq6_x4_pm_gfx1151_shape(m, 8192), "M={m}");
+        }
+        assert!(mq6_x4_pm_gfx1151_shape(2560, 2048));
+        assert!(!mq6_x4_pm_gfx1151_shape(2559, 2048));
+        assert!(!mq6_x4_pm_gfx1151_shape(2560, 2047));
+        // Small projections (M 640 / 512 / 64) and short chunks stay on hipcc / U3.
+        for m in [640usize, 512, 64] {
+            assert!(!mq6_x4_pm_gfx1151_shape(m, 8192), "M={m}");
+        }
+        assert!(!mq6_x4_pm_gfx1151_shape(10240, 1131));
+        assert!(!mq6_x4_pm_gfx1151_shape(10240, 512));
+    }
+
+    /// The fused shared gate/up kernel's shape limits: 16-channel rows, 64-multiple K,
+    /// a token, and 32-bit byte extents of the weights, X and the hidden.
+    #[test]
+    fn qwen4_shared_gu_pm_shape_limits() {
+        // The Flash-Next shape, the K4 stress shape and the smallest legal one.
+        for (m, k, n) in [(640usize, 2560usize, 8192usize), (192, 256, 520), (16, 64, 1), (640, 2560, 1)] {
+            assert!(qwen4_shared_gu_pm_shape(m, k, n), "{m}x{k}x{n}");
+        }
+        for (m, k, n) in [(0usize, 2560usize, 8192usize), (648, 2560, 8192), (640, 0, 8192), (640, 2560 + 32, 8192), (640, 2560, 0), (640, 32, 8192)] {
+            assert!(!qwen4_shared_gu_pm_shape(m, k, n), "{m}x{k}x{n}");
+        }
+        // 2^31 byte extents: X (n * k * 2), weights (m * k * 2), hidden (n * m * 2).
+        assert!(!qwen4_shared_gu_pm_shape(640, 2560, 1 << 20));
+        assert!(!qwen4_shared_gu_pm_shape(1 << 20, 2560, 8192));
+        assert!(!qwen4_shared_gu_pm_shape(1 << 20, 64, 1 << 10));
+        assert_eq!(QWEN4_SHARED_GU_PM_WAVES, 8);
+    }
+
+    /// gfx1151: the builder-module `_w8` and `_w8_bf16out` entries (selected through
+    /// `mqv2_wmma_gfx11_bt_pm`) and the `_w8_regions` entry (through
+    /// `gemm_mq6g256v2_xf16_regions_pm`) must produce the bytes of the hipcc / U3 launches
+    /// (`pm = false`) on shapes at and above the thresholds, with ragged row and token
+    /// tails in the last 128-row block and 256-token tile.
+    #[test]
+    #[ignore = "requires a gfx1151 GPU and working HIP toolchain"]
+    fn mq6_x4_pm_gfx1151_matches_hipcc_bytes() {
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) if gpu.arch.as_str() == "gfx1151" => gpu,
+            _ => {
+                eprintln!("skip: needs exact gfx1151");
+                return;
+            }
+        };
+        let group = crate::dispatch::MQ6G256V2_GROUP_BYTES;
+        let weights_of = |rows: usize, k: usize, seed: u32| -> Vec<u8> {
+            let mut weights = vec![0u8; rows * k / 256 * group];
+            let mut state = seed;
+            for chunk in weights.chunks_mut(group) {
+                for byte in chunk.iter_mut() {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    *byte = (state >> 24) as u8;
+                }
+                for (offset, bits) in [(0, 0x2000u16), (2, 0xa800), (4, 0x2100), (6, 0xa900)] {
+                    chunk[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
+                }
+            }
+            weights
+        };
+        let x_of = |n: usize, k: usize| -> Vec<f32> {
+            (0..n * k).map(|i| ((i * 7919 % 4001) as f32 - 2000.0) / 1777.0).collect()
+        };
+        // Plain F32 and BF16 output overwrite.
+        for (m, k, n) in [(2560usize, 2560usize, 2048usize), (2563, 512, 2049), (6240, 2560, 2300)] {
+            let a = gpu.upload_raw(&weights_of(m, k, 13), &[m * k / 256 * group]).expect("w upload");
+            let x_gpu = gpu.upload_f32(&x_of(n, k), &[n * k]).expect("x upload");
+            let sentinel = vec![f32::from_bits(0x7fc0_1234); n * m];
+            let run_f32 = |gpu: &mut Gpu, pm: bool| {
+                let y = gpu.upload_f32(&sentinel, &[sentinel.len()]).expect("y upload");
+                gpu.mqv2_wmma_gfx11_bt_pm(6, 8, &a, &x_gpu, &y, m, k, n, true, None, pm)
+                    .expect("f32 overwrite");
+                let out = gpu.download_f32(&y).expect("y download");
+                gpu.free_tensor(y).expect("free y");
+                out
+            };
+            let want = run_f32(&mut gpu, false);
+            let got = run_f32(&mut gpu, true);
+            assert!(want.iter().any(|v| *v != 0.0));
+            let differing = got.iter().zip(&want).filter(|(g, w)| g.to_bits() != w.to_bits()).count();
+            assert_eq!(differing, 0, "plain: builder module differs from hipcc in {differing} cells at M={m} K={k} N={n}");
+            let run_bf16 = |gpu: &mut Gpu, pm: bool| {
+                let y = gpu.zeros(&[n * m], DType::BF16).expect("BF16 y");
+                gpu.mqv2_wmma_gfx11_bt_pm(6, 8, &a, &x_gpu, &y, m, k, n, true, None, pm)
+                    .expect("bf16 overwrite");
+                let mut bytes = vec![0u8; n * m * 2];
+                gpu.hip.memcpy_dtoh(&mut bytes, &y.buf).expect("BF16 download");
+                gpu.free_tensor(y).expect("free y");
+                bytes
+            };
+            let want = run_bf16(&mut gpu, false);
+            let got = run_bf16(&mut gpu, true);
+            assert!(want.iter().any(|b| *b != 0));
+            let differing = got.iter().zip(&want).filter(|(g, w)| g != w).count();
+            assert_eq!(differing, 0, "bf16out: builder module differs from hipcc in {differing} bytes at M={m} K={k} N={n}");
+            gpu.free_tensor(x_gpu).expect("free x");
+            gpu.free_tensor(a).expect("free a");
+        }
+        // Regions (a/b/z row fold): three F32 outputs, summed rows >= the M threshold.
+        for (ms, k, n) in [([48usize, 48, 6144], 2560usize, 2048usize), ([50, 49, 2561], 2560, 2049)] {
+            let regions_w: Vec<GpuTensor> = ms
+                .iter()
+                .enumerate()
+                .map(|(i, &m)| {
+                    gpu.upload_raw(&weights_of(m, k, 21 + i as u32), &[m * k / 256 * group]).expect("region w")
+                })
+                .collect();
+            let x_gpu = gpu.upload_f32(&x_of(n, k), &[n * k]).expect("x upload");
+            let x16 = gpu.rotate_x_mq_batched_f16(&x_gpu, k, n).expect("rotate f16");
+            let run = |gpu: &mut Gpu, pm: bool| -> Vec<Vec<f32>> {
+                let ys: Vec<GpuTensor> = ms
+                    .iter()
+                    .map(|&m| {
+                        let sentinel = vec![f32::from_bits(0x7fc0_1234); n * m];
+                        gpu.upload_f32(&sentinel, &[sentinel.len()]).expect("y upload")
+                    })
+                    .collect();
+                let regions = [
+                    (&regions_w[0], &ys[0], ms[0]),
+                    (&regions_w[1], &ys[1], ms[1]),
+                    (&regions_w[2], &ys[2], ms[2]),
+                ];
+                let launched = gpu
+                    .gemm_mq6g256v2_xf16_regions_pm(&regions, &x16, k, n, pm)
+                    .expect("regions overwrite");
+                assert!(launched, "regions fold did not apply at K={k} N={n}");
+                let out = ys.iter().map(|y| gpu.download_f32(y).expect("y download")).collect();
+                for y in ys {
+                    gpu.free_tensor(y).expect("free y");
+                }
+                out
+            };
+            let want = run(&mut gpu, false);
+            let got = run(&mut gpu, true);
+            for (region, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(w.iter().any(|v| *v != 0.0));
+                let differing = g.iter().zip(w).filter(|(g, w)| g.to_bits() != w.to_bits()).count();
+                assert_eq!(differing, 0, "regions: builder module differs from hipcc in {differing} cells of region {region} at M={ms:?} K={k} N={n}");
+            }
+            gpu.free_tensor(x16).expect("free x16");
+            gpu.free_tensor(x_gpu).expect("free x");
+            for w in regions_w {
+                gpu.free_tensor(w).expect("free w");
+            }
+        }
+    }
+
+    /// The gfx1201 HC-down tile (`HIPFIRE_QWEN4_HC_DOWN_TILE`) must produce the
+    /// 64 x 128 p_s4 tile's bytes: real 320-row shapes, a ragged token tail in
+    /// the last 80-token block and ragged rows in the last 160-row block.
+    #[test]
+    #[ignore = "requires a gfx1201 GPU and working HIP toolchain"]
+    fn hc_down_tile_gfx1201_matches_p_s4_bytes() {
+        let mut gpu = match Gpu::init() {
+            Ok(gpu) if gpu.arch.as_str() == "gfx1201" => gpu,
+            _ => {
+                eprintln!("skip: needs exact gfx1201");
+                return;
+            }
+        };
+        let incumbent = Gpu::qwen4_lds_tile_gfx1201(320, 10240);
+        assert_eq!(incumbent.entry(), "qwen4_wmma_lds_64_128_32_64_k64_p_s4");
+        for (m, k, n) in [(320usize, 10240usize, 512usize), (320, 10240, 1131), (320, 20480, 4097), (161, 256, 81)] {
+            // F16 bit patterns with magnitudes in [0.125, 0.5) and mixed signs.
+            let bits = |len: usize, seed: usize| -> Vec<u16> {
+                (0..len)
+                    .map(|i| 0x3000 | ((i * 7919 + seed) % 2048) as u16 | if (i + seed) % 3 == 0 { 0x8000 } else { 0 })
+                    .collect()
+            };
+            let a = gpu.upload_f16_bits(&bits(m * k, 3), &[m * k]).expect("a upload");
+            let x = gpu.upload_f16_bits(&bits(n * k, 11), &[n * k]).expect("x upload");
+            let sentinel = vec![f32::from_bits(0x7fc0_1234); n * m];
+            let run = |gpu: &mut Gpu, tile: LdsTileSplitK| {
+                let y = gpu.upload_f32(&sentinel, &[sentinel.len()]).expect("y upload");
+                gpu.gemm_f16_x_f16_wmma_lds_splitk(&a, &x, &y, m, k, n, tile).expect("split-K GEMM");
+                let out = gpu.download_f32(&y).expect("y download");
+                gpu.free_tensor(y).expect("free y");
+                out
+            };
+            let want = run(&mut gpu, incumbent);
+            let got = run(&mut gpu, LdsTileSplitK::HC_DOWN_GFX1201);
+            assert!(want.iter().all(|v| v.is_finite()));
+            let differing = got
+                .iter()
+                .zip(&want)
+                .filter(|(g, w)| g.to_bits() != w.to_bits())
+                .count();
+            assert_eq!(differing, 0, "HC-down tile differs in {differing} cells at M={m} K={k} N={n}");
+            gpu.free_tensor(x).expect("free x");
+            gpu.free_tensor(a).expect("free a");
+        }
     }
 }
 
@@ -45475,21 +49199,299 @@ mod lds_epi_tests {
         );
     }
 
+}
+
+#[cfg(test)]
+mod route_selector_tests {
+    use super::*;
+
     #[test]
-    fn epi_entry_names_match_the_kernel_source() {
-        let src = kernels::GEMM_F16_X_F16_WMMA_LDS256_SRC;
-        for &tile in Gpu::LDS_EPI_TILES {
-            assert!(
-                src.contains(&format!("WLDS_EPI_SET({},", tile.entry())),
-                "kernel source has no WLDS_EPI_SET for {}",
-                tile.entry()
-            );
+    fn mq3_lloyd_mb4_gfx1100_bands_and_row_boundary() {
+        for (batch, small_rows, large_rows) in [
+            (63, false, false),
+            (64, false, true),
+            (127, false, true),
+            (128, true, true),
+            (191, true, true),
+            (192, false, true),
+            (256, false, true),
+            (4096, false, true),
+        ] {
+            for rows in [2_560, 4_095] {
+                assert_eq!(
+                    mq3_lloyd_mb4_default("gfx1100", true, batch, rows),
+                    small_rows, "batch={batch} rows={rows}",
+                );
+            }
+            for rows in [4_096, 4_097] {
+                assert_eq!(
+                    mq3_lloyd_mb4_default("gfx1100", true, batch, rows),
+                    large_rows, "batch={batch} rows={rows}",
+                );
+            }
         }
-        for &(_, suffix) in GemmEpilogue::SUPPORTED {
-            assert!(
-                src.contains(&format!("BASE##{suffix},")),
-                "kernel source does not emit the {suffix} entry"
-            );
+    }
+
+    #[test]
+    fn mq3_lloyd_mb4_other_arches_and_unsupported_keep_original_floor() {
+        for arch in ["gfx1101", "gfx1102", "gfx1151", "gfx1201", "gfx942"] {
+            for batch in [63, 64, 127, 128, 191, 192, 4096] {
+                for rows in [2_560, 4_095, 4_096, 4_097] {
+                    assert_eq!(
+                        mq3_lloyd_mb4_default(arch, true, batch, rows),
+                        batch >= 128 && rows >= 4096,
+                        "{arch} batch={batch} rows={rows}",
+                    );
+                }
+            }
+        }
+        for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1201", "gfx942"] {
+            for batch in [64, 128, 191, 192, 4096] {
+                for rows in [4_095, 4_096] {
+                    assert!(!mq3_lloyd_mb4_default(arch, false, batch, rows));
+                }
+            }
+        }
+    }
+
+    /// The PM launchers' output guard (`pm_check_output_extent`, called by the plain / BF16
+    /// / regions / HC-write entries) refuses extents at or past 2^31 bytes.
+    #[test]
+    fn pm_output_extent_vocab_logits_boundary() {
+        let vocab = 248_320usize;
+        // F32 logits [tokens, vocab]: 2162 tokens fit, 2163 do not.
+        assert!(pm_check_output_extent("Y", 2048, vocab, 4).is_ok());
+        assert!(pm_check_output_extent("Y", 2162, vocab, 4).is_ok());
+        assert_eq!(pm_output_extent_bytes(2162, vocab, 4), Some(2_147_471_360));
+        for tokens in [2163usize, 4096, 4608, 8192] {
+            let err = pm_check_output_extent("Y", tokens, vocab, 4)
+                .expect_err("over-2^31 F32 output must be refused")
+                .to_string();
+            assert!(err.contains("PM output extent"), "{err}");
+            assert!(err.contains("2^31"), "{err}");
+            assert!(err.contains(&format!("{tokens} rows")), "{err}");
+        }
+    }
+
+    #[test]
+    fn pm_output_extent_exact_2_pow_31_boundary() {
+        // Extent 2^31 - 1 is the largest accepted; 2^31 is refused.
+        assert!(pm_check_output_extent("Y", 1, i32::MAX as usize, 1).is_ok());
+        assert!(pm_check_output_extent("Y", 1, 1 << 31, 1).is_err());
+        assert!(pm_check_output_extent("Y", 1 << 20, 1 << 10, 2).is_err()); // exactly 2^31
+        assert!(pm_check_output_extent("Y", (1 << 20) - 1, 1 << 10, 2).is_ok());
+        assert!(pm_output_extent_bytes(1 << 15, 1 << 15, 2).is_none()); // exactly 2^31
+        assert_eq!(pm_output_extent_bytes(0, usize::MAX, 4), Some(0));
+        assert!(pm_check_output_extent("Y", 0, 1 << 40, 4).is_ok());
+    }
+
+    #[test]
+    fn pm_output_extent_arithmetic_overflow_is_refused() {
+        let err = pm_check_output_extent("Y", usize::MAX, 2, 4)
+            .expect_err("usize overflow must be refused")
+            .to_string();
+        assert!(err.contains("overflows usize"), "{err}");
+        assert!(pm_check_output_extent("Y", 1 << 40, 1 << 40, 4).is_err());
+        assert!(pm_check_output_extent("Y", 2, usize::MAX / 2 + 1, 1).is_err());
+        // The HC-stream width `4 * m` is checked: overflow is refused, never wrapped.
+        let err = pm_check_hc_streams_extent("streams", 1, usize::MAX, 2)
+            .expect_err("4 * m overflow must be refused")
+            .to_string();
+        assert!(err.contains("overflows usize"), "{err}");
+        assert!(pm_check_hc_streams_extent("streams", 2, usize::MAX / 2 + 1, 2).is_err());
+        assert!(pm_check_hc_streams_extent("streams", 2, usize::MAX / 4, 1).is_err());
+    }
+
+    #[test]
+    fn pm_moe_down_extent_u32_byte_offset_bound() {
+        let (h, g_std) = (2560usize, 89_600usize);
+        // Standard R = 8192 chunk: G = ceil16(10R + 15 * min(10R, 512)) = 89600 rows.
+        let g_calc = (10 * 8192usize + 15 * (10 * 8192usize).min(512)).div_ceil(16) * 16;
+        assert_eq!(g_calc, g_std);
+        assert_eq!(pm_moe_down_extent_bytes(g_std, h), Some(458_752_000));
+        assert!(pm_check_moe_down_extent("down", g_std, h).is_ok());
+        // R = 83200: G = 839680 rows -> 4_299_161_600 bytes >= 2^32.
+        let g_big = (10 * 83_200usize + 15 * 512).div_ceil(16) * 16;
+        assert_eq!(g_big, 839_680);
+        assert_eq!(pm_moe_down_extent_bytes(g_big, h), None);
+        let err = pm_check_moe_down_extent("down", g_big, h)
+            .expect_err("over-4GiB grouped output must be refused")
+            .to_string();
+        assert!(err.contains("u32 PM MoE down extent"), "{err}");
+        assert!(err.contains("4299161600"), "{err}");
+        // Exact boundary: u32::MAX bytes allowed, 2^32 refused (2 B elements).
+        assert_eq!(pm_moe_down_extent_bytes(1, (u32::MAX as usize - 1) / 2), Some(u32::MAX as usize - 1));
+        assert_eq!(pm_moe_down_extent_bytes(1 << 16, 1 << 15), None); // exactly 2^32
+        assert!(pm_moe_down_extent_bytes((1 << 16) - 1, 1 << 15).is_some());
+        // Between 2^31 and 2^32 is allowed here (the MoE down uses the u32 offset).
+        assert!(pm_moe_down_extent_bytes(1 << 15, 1 << 15).is_some());
+        // Arithmetic overflow is refused with a clear message.
+        let err = pm_check_moe_down_extent("down", usize::MAX, 2)
+            .expect_err("usize overflow must be refused")
+            .to_string();
+        assert!(err.contains("overflows usize"), "{err}");
+        assert!(pm_moe_down_extent_bytes(1 << 40, 1 << 40).is_none());
+        assert!(pm_moe_down_extent_bytes(0, usize::MAX).is_some());
+    }
+
+    #[test]
+    fn pm_output_extent_bf16_bound_is_twice_the_f32_rows() {
+        let vocab = 248_320usize;
+        // BF16 output halves the element bytes: 4324 tokens fit, 4325 do not.
+        assert!(pm_check_output_extent("Y", 4324, vocab, 2).is_ok());
+        assert!(pm_check_output_extent("Y", 4325, vocab, 2).is_err());
+        assert!(pm_check_output_extent("Y", 4325, vocab, 4).is_err());
+        assert!(pm_check_output_extent("Y", 8192, vocab, 2).is_err());
+        // HC streams [tokens, 4 * m] in BF16 bits / F32.
+        let m = 5120usize;
+        assert!(pm_check_output_extent("streams", 52_428, 4 * m, 2).is_ok());
+        assert!(pm_check_output_extent("streams", 52_429, 4 * m, 2).is_err());
+        assert!(pm_check_output_extent("streams", 26_214, 4 * m, 4).is_ok());
+        assert!(pm_check_output_extent("streams", 26_215, 4 * m, 4).is_err());
+    }
+
+    #[test]
+    fn pm_output_extent_regions_are_checked_individually() {
+        // Three regions, each just under 2^31 bytes at F32: the aggregate is far past 2^31
+        // yet every region is a valid PM output, so each is accepted.
+        let tokens = 8192usize;
+        let m_region = (i32::MAX as usize) / (tokens * 4);
+        let regions = [m_region, m_region, m_region];
+        assert!(regions.iter().all(|&m| pm_check_output_extent("Y", tokens, m, 4).is_ok()));
+        assert!(regions.iter().sum::<usize>() * tokens * 4 > i32::MAX as usize);
+        // One region over the limit refuses regardless of the others.
+        let mixed = [64usize, m_region + 1, 64];
+        let refused: Vec<bool> = mixed
+            .iter()
+            .map(|&m| pm_check_output_extent("Y", tokens, m, 4).is_err())
+            .collect();
+        assert_eq!(refused, [false, true, false]);
+    }
+
+    #[test]
+    fn pm_input_geometry_i32_and_descriptor_bounds() {
+        let (g4, g6) = (crate::dispatch::MQ4V2_GROUP_BYTES, crate::dispatch::MQ6G256V2_GROUP_BYTES);
+        // Product shapes: vocab head and a trunk projection at N = 8192 fit.
+        assert!(pm_input_geometry_fits(248_320, 2048, 8192, g6));
+        assert!(pm_input_geometry_fits(248_320, 2048, 8192, g4));
+        assert!(pm_input_geometry_fits(12_288, 2560, 8192, g6));
+        // i32 argument casts.
+        let big = i32::MAX as usize + 1;
+        assert!(!pm_input_geometry_fits(big, 256, 1, 0));
+        assert!(!pm_input_geometry_fits(1, big, 1, 0));
+        assert!(!pm_input_geometry_fits(1, 256, big, g6));
+        assert!(pm_input_geometry_fits(i32::MAX as usize, 256, 1, 0));
+        // Raw A descriptor: weight bytes <= i32::MAX, the exact boundary.
+        let rows_fit = i32::MAX as usize / g6;
+        assert!(pm_input_geometry_fits(rows_fit, 256, 1, g6));
+        assert!(!pm_input_geometry_fits(rows_fit + 1, 256, 1, g6));
+        assert!(!pm_input_geometry_fits(usize::MAX, 256, 1, g6)); // arithmetic overflow
+        // Bounded X descriptor: N*K*2 <= u32::MAX.
+        assert!(pm_input_geometry_fits(1, 256, (u32::MAX as usize / 2) / 256, g6));
+        assert!(!pm_input_geometry_fits(1, 1 << 20, 1 << 12, g6)); // N*K*2 = 2^33
+        assert!(!pm_input_geometry_fits(1, 1 << 30, 1 << 30, g6)); // product wraps u32
+        assert!(!pm_input_geometry_fits(1, i32::MAX as usize, i32::MAX as usize, g6));
+        // Regions bound each weight on its own: three regions at the A limit are each fine.
+        assert!([rows_fit; 3].iter().all(|&m| pm_input_geometry_fits(m, 256, 8192, g6)));
+        let err = pm_check_input_geometry("MQ6 PM regions", rows_fit + 1, 256, 1, g6)
+            .expect_err("over-limit weight must be refused")
+            .to_string();
+        assert!(err.contains("PM input geometry"), "{err}");
+        assert!(pm_check_input_geometry("MQ4 PM", 4096, 2048, 8192, g4).is_ok());
+    }
+
+    #[test]
+    fn native_mq6_admission_matches_incumbent_at_thresholds() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            for enabled in [false, true] {
+                for m in [2559, 2560, 2561] {
+                    for n in [2047, 2048, 2049] {
+                        assert_eq!(
+                            mq6_x4_pm_gfx1151_selected(arch, enabled, m, n),
+                            enabled && arch == "gfx1151"
+                                && mq6_x4_pm_gfx1151_shape(m, n),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hc_tile_admission_matches_incumbent_in_all_capture_modes() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            for enabled in [false, true] {
+                for m in [319, 320, 321] {
+                    for k in [10239, 10240, 10241, 10496] {
+                        for rows in [2047, 2048, 2049] {
+                            for recording in [false, true] {
+                                for capturing in [false, true] {
+                                    let previous = if arch == "gfx1201" {
+                                        enabled && m == 320 && k % 256 == 0
+                                    } else {
+                                        enabled && m == 320 && k == 10240
+                                            && rows >= 2048 && arch == "gfx1151"
+                                            && !recording && !capturing
+                                    };
+                                    assert_eq!(hc_down_tile_selected(
+                                        arch, enabled, m, k, rows, recording, capturing,
+                                    ), previous);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn symmetric_moe_native_kill_switch_is_gfx1151_only() {
+        for enabled in [false, true] {
+            assert_eq!(qwen4_moe_sym_native_selected("gfx1151", enabled), enabled);
+            assert!(qwen4_moe_sym_native_selected("gfx1201", enabled));
+        }
+    }
+
+    #[test]
+    fn mq6_tile_choices_preserve_auto_explicit_and_regions_rules() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            for requested in [None, Some([0, 0, 0]), Some([8, 4, 2]), Some([12, 8, 1])] {
+                for kind in [Mq6X4Kind::Plain, Mq6X4Kind::Bf16, Mq6X4Kind::Regions, Mq6X4Kind::Hcw] {
+                    for m in [48, 640, 2560, 6240] {
+                        for n in [511, 512, 513, 1131, 1535, 1536, 1537, 2048, 8192] {
+                            let previous = (|| {
+                                if arch != "gfx1151" { return None; }
+                                let tile = match requested? {
+                                    [0, 0, 0] => match kind {
+                                        Mq6X4Kind::Plain | Mq6X4Kind::Bf16 => mq6_x4_halo_policy(m, 2560, n)?,
+                                        Mq6X4Kind::Regions | Mq6X4Kind::Hcw => mq6_x4_halo_twin_policy(kind, m, 2560, n)?,
+                                    },
+                                    explicit => explicit,
+                                };
+                                let twin = matches!(kind, Mq6X4Kind::Plain | Mq6X4Kind::Bf16);
+                                (tile[0] != 12 || (twin && n % 192 == 0)).then_some(tile)
+                            })();
+                            assert_eq!(mq6_x4_tile_selected(arch, requested, kind, m, 2560, n), previous);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lds_module_source_choice_preserves_special_tiles() {
+        for halo in [false, true] {
+            for entry in ["gemm_wmma_lds_64_64_32_64_k64", "gemm_wmma_lds_64_64_32_64_k64_p", "gemm_wmma_lds_128_128_32_64_k64_p"] {
+                let special = entry.starts_with("gemm_wmma_lds_64_64");
+                let previous = if special && !halo {
+                    ("qwen4_gemm_wmma_lds256", kernels::QWEN4_GEMM_F16_X_F16_WMMA_LDS256_SRC)
+                } else {
+                    ("gemm_wmma_lds256", kernels::gemm_f16_x_f16_wmma_lds256_src(halo))
+                };
+                assert_eq!(lds256_tile_source_selected(halo, entry), previous);
+            }
         }
     }
 }

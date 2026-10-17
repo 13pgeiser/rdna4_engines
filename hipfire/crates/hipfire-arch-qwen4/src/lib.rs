@@ -13,13 +13,24 @@
 pub mod admission;
 pub mod artifact;
 pub mod bundle;
+#[cfg(any(test, feature = "reference-parity"))]
+pub mod cache_quality;
+pub mod chunk_dump;
 pub mod config;
+pub mod ep;
 pub mod expert_residency;
 pub mod gpu_forward;
+pub mod gpu_forward_lanes;
+pub mod kv_backend;
+pub mod lane;
+pub mod lane_exec;
 pub mod mtp_gpu;
+pub mod mtp_lanes;
 pub mod mtp_spec;
+pub mod npu_trunk;
 pub mod ops;
 pub mod ple;
+pub(crate) mod ple_stage;
 pub mod program;
 pub(crate) mod projection;
 #[cfg(any(test, feature = "reference-parity"))]
@@ -29,6 +40,7 @@ pub mod reference_mtp;
 pub mod state;
 #[cfg(any(test, feature = "reference-parity"))]
 pub mod state_parity;
+pub mod trunk_overlay;
 pub mod weights;
 
 pub use admission::{
@@ -37,15 +49,31 @@ pub use admission::{
     Qwen4Artifact, Qwen4ArtifactFormat, Qwen4Capabilities, Qwen4Capability, Qwen4QuantGeometry,
     RequestKind,
 };
-pub use artifact::{admit_hfqm_artifact, Qwen4ArtifactError, Qwen4HfqmArtifact};
-pub use config::{
-    LayerType, Qwen4Config, Qwen4MtpConfig, RecurrentStateDType, SourceDType, ARCHITECTURE_NAME,
-    ARCH_ID, MODEL_TYPE, QWEN4_DEFAULT_CONTEXT, QWEN4_MAX_CONTEXT, TEXT_MODEL_TYPE,
+pub use artifact::{
+    admit_hfqm_artifact, admit_inventory_headers, Qwen4ArtifactError, Qwen4HfqmArtifact,
+    Qwen4InventoryReceipt, Qwen4PleRows, SidecarRows,
 };
+#[cfg(feature = "qwen4-dev-profiles")]
+pub use artifact::admit_developer_inventory_headers;
+pub use config::{
+    ple_head_vocab_sizes, LayerType, Qwen4Config, Qwen4EquationSource, Qwen4FfnConfig,
+    Qwen4MtpConfig, Qwen4PleConfig, Qwen4Profile, Qwen4SyntheticProfile, RecurrentStateDType,
+    SourceDType, ARCHITECTURE_NAME, ARCH_ID, MODEL_TYPE, QWEN4_DEFAULT_CONTEXT, QWEN4_MAX_CONTEXT,
+    TEXT_MODEL_TYPE,
+};
+pub use gpu_forward::{
+    qwen4_compact_scratch_possible, qwen4_forward_device_bytes, qwen4_forward_scratch_mode,
+    Qwen4ForwardScratchMode, QWEN4_COMPACT_FALLBACK_ROWS, QWEN4_COMPACT_SCRATCH_ENV,
+};
+pub use kv_backend::{qwen4_vmm_refusal, qwen4_vmm_supported, Qwen4ContextCommit, Qwen4KvBackend};
 pub use ple::{
     PleHashMetadata, PleHistory, PleMetadataError, PleRowId, PLE_HEAD_COUNT, PLE_HEAD_OFFSETS,
+    PLE_MAX_HEAD_COUNT,
     PLE_HEAD_VOCAB_SIZES, PLE_MULTIPLIERS, PLE_MULTIPLIER_COUNT, PLE_PADDED_ROWS,
     PLE_PADDING_MULTIPLE, PLE_ROW_WIDTH, PLE_VALID_ROWS,
 };
 pub use rdna_compute::tensor_ops::{GdnStateFormat, QsaKvFormat};
 pub use state::{resolve_gdn_format, resolve_qsa_format, resolve_state_format, Qwen4StateFormat};
+pub use weights::{Qwen4ManifestIdentity, Qwen4TierRecipe};
+pub use trunk_overlay::{resolve_trunk_overlay, Qwen4TrunkOverlay, TrunkOverlayPolicy};
+pub use gpu_forward_lanes::{WaveHead, WaveLane};

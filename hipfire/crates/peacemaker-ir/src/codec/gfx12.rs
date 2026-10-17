@@ -1,8 +1,27 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Table-gated gfx1201 decoder and encoder. No provenance bytes participate in encoding.
 use smallvec::SmallVec;
-use crate::{inst::{Arch, Form, FormFields, Inst, NamedField}, isa::{self, FieldClass, OpRow}, operand::{CacheScope, DelayAluHint, Dpp, Half, ImmField, InlineConst, Modifiers, Msg, Omod, Operand, Special, VmemToken}, provenance::Provenance, reg::{Kind, RegRef}, wait::{Counter, WaitImm}};
+use crate::{inst::{Arch, Form, FormFields, Inst, NamedField}, isa::{self, FieldClass, OpRow}, operand::{CachePolicy, CacheScope, DelayAluHint, Dpp, Half, ImmField, InlineConst, Modifiers, Msg, Omod, Operand, Special, VmemToken}, provenance::Provenance, reg::{Kind, RegRef}, wait::{Counter, WaitImm}};
 use super::forms::{self, Field};
 
+/// Encoding tables reserve 64-bit lane-mask slots even in wave32. Keep the
+/// raw codec wave-neutral, but consumers with kernel metadata must use this
+/// width for explicit scalar masks, not for genuine scalar data pairs.
+pub fn operand_register(arch: Arch, wave: crate::inst::Wave, inst: &Inst, index: usize) -> Option<RegRef> {
+    let mut reg = match inst.operands.get(index)? { Operand::Reg(r) | Operand::Half(r, _) => *r, _ => return None };
+    let name = inst.op.name(arch).unwrap_or("");
+    let mask_output = (name.starts_with("v_cmp") && index == 0)
+        || ((name.starts_with("v_div_scale_") || name.starts_with("v_") && name.contains("_co_")) && index == 1);
+    let mask_input = (name.starts_with("v_cndmask_") || name.starts_with("v_") && name.contains("_co_ci_"))
+        && index + 1 == inst.operands.len();
+    if reg.kind == Kind::S && (mask_output || mask_input) {
+        reg.len = if wave == crate::inst::Wave::Wave32 { 1 } else { 2 };
+    }
+    Some(reg)
+}
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
     #[error("unrecognized machine instruction at byte offset {offset}: {reason}")]
@@ -26,10 +45,14 @@ fn select(code: u32, width: u8, scalar_dest: bool, literal: Option<u32>) -> Resu
         106 => Operand::Special(Special::VccLo), 107 => Operand::Special(Special::VccHi),
         108 => Operand::Special(Special::Ttmp(0)), 109 => Operand::Special(Special::Ttmp(1)),
         110..=123 => Operand::Reg(RegRef { kind: Kind::Ttmp, base: (code - 108) as u16, len: width }),
-        124 => Operand::Special(Special::M0), 125 => Operand::Special(Special::Null),
+        // gfx11+ selectors: 124 is `null`, 125 is `m0` (sources and destinations alike).
+        124 => Operand::Special(Special::Null), 125 => Operand::Special(Special::M0),
         126 => Operand::Special(Special::ExecLo), 127 => Operand::Special(Special::ExecHi),
         128..=192 => Operand::Inline(InlineConst::Integer((code - 128) as i8)),
         193..=208 => Operand::Inline(InlineConst::Integer((192 - code as i32) as i8)),
+        // Aperture sources (RDNA3/RDNA4 SSRC encodings).
+        235 => Operand::Special(Special::SrcSharedBase), 236 => Operand::Special(Special::SrcSharedLimit),
+        237 => Operand::Special(Special::SrcPrivateBase), 238 => Operand::Special(Special::SrcPrivateLimit),
         240..=247 => Operand::Inline(InlineConst::FloatBits(match code {
             240 => 0x3f000000, 241 => 0xbf000000, 242 => 0x3f800000, 243 => 0xbf800000,
             244 => 0x40000000, 245 => 0xc0000000, 246 => 0x40800000, _ => 0xc0800000,
@@ -39,7 +62,7 @@ fn select(code: u32, width: u8, scalar_dest: bool, literal: Option<u32>) -> Resu
         _ => return Err(reject(format!("unknown source selector {code:#x}"))),
     })
 }
-fn selector(operand: &Operand, width: u8, scalar_dest: bool) -> Result<u32, DecodeError> {
+fn selector(operand: &Operand, width: u8) -> Result<u32, DecodeError> {
     match operand {
         Operand::Reg(r) | Operand::Half(r, _) => {
             if r.len != width { return Err(reject(format!("register width mismatch: {} instead of {width}", r.len))); }
@@ -47,9 +70,10 @@ fn selector(operand: &Operand, width: u8, scalar_dest: bool) -> Result<u32, Deco
         }
         Operand::Special(s) => Ok(match s {
             Special::VccLo | Special::Vcc => 106, Special::VccHi => 107,
-            Special::Ttmp(n) => u32::from(*n) + 108, Special::M0 if scalar_dest => 125,
-            Special::M0 => 124, Special::Null if scalar_dest => 124, Special::Null => 125,
+            Special::Ttmp(n) => u32::from(*n) + 108, Special::M0 => 125, Special::Null => 124,
             Special::ExecLo | Special::Exec => 126, Special::ExecHi => 127,
+            Special::SrcSharedBase => 235, Special::SrcSharedLimit => 236,
+            Special::SrcPrivateBase => 237, Special::SrcPrivateLimit => 238,
             _ => return Err(reject(format!("unencodable special register {s:?}"))),
         }),
         Operand::Inline(InlineConst::Integer(n)) if (0..=64).contains(n) => Ok((*n as u32) + 128),
@@ -107,16 +131,30 @@ fn operand(arch: Arch, name: &str, bits: u16, code: u32, literal: Option<u32>, r
             && field_value(arch, "IDXEN", row, words) ^ field_value(arch, "OFFEN", row, words) == 1 {
             return Ok(Operand::Reg(RegRef { len: 1, ..r }));
         }
+        // GLOBAL with an SGPR base consumes a 32-bit vector offset on both
+        // RDNA3 and RDNA4. With SADDR=off it consumes a 64-bit vector address.
+        if form == Form::Vmem(crate::inst::VmemForm::Global) && matches!(name, "VADDR" | "ADDR")
+            && field_value(arch, "SADDR", row, words) != 124 {
+            return Ok(Operand::Reg(RegRef { len: 1, ..r }));
+        }
         if form == Form::Vmem(crate::inst::VmemForm::Scratch) && name == "VADDR" {
             return Ok(Operand::Reg(RegRef { len: 1, ..r }));
         }
         return Ok(Operand::Reg(r));
     }
+    // SRC_SCC (253) is a precise 32-bit scalar source; it is never a destination
+    // (SDST is 7-bit and the 8-bit VOP3 compare destination is rejected by `select`).
+    if code == 253 {
+        if matches!(form, Form::Sop1 | Form::Sop2 | Form::Sopc) && bits == 32 { return Ok(Operand::Special(Special::Scc)); }
+        return Err(reject("SCC source selector 0xfd is decoded only for 32-bit SOP1/SOP2/SOPC sources"));
+    }
     let src=select(code, width, false, literal)?;
     if bits == 16 {
         if let Operand::Reg(r) = &src {
             if r.kind == Kind::V {
-                return Ok(Operand::Half(*r, if field_value(arch, "OPSEL", row, words) & 1 != 0 { Half::Hi } else { Half::Lo }));
+                // OPSEL bit n selects the half of source n (SRC0 bit 0, SRC1 bit 1, SRC2 bit 2).
+                let bit = match name { "SRC1" => 2, "SRC2" => 4, _ => 1 };
+                return Ok(Operand::Half(*r, if field_value(arch, "OPSEL", row, words) & bit != 0 { Half::Hi } else { Half::Lo }));
             }
         }
     }
@@ -143,19 +181,17 @@ fn encoded_operand(arch: Arch, name: &str, bits: u16, op: &Operand, form: Form) 
         }
         (_, Operand::Reg(r)) if name.starts_with('V') || name.starts_with("DATA") || name == "ADDR" => {
             if r.kind != Kind::V && !(name == "VDST" && (form == Form::Vop1 || form == Form::Vop3)) { return Err(reject("vector operand has wrong register bank")); }
-            if r.len != (bits / 32).max(1) as u8 && !(name=="VADDR" && (form==Form::Vmem(crate::inst::VmemForm::Buffer) || form==Form::Vmem(crate::inst::VmemForm::Scratch)) && r.len==1) { return Err(reject(format!("{name} register width mismatch"))); }
+            let short_address = r.len == 1 && ((name == "VADDR" && matches!(form, Form::Vmem(crate::inst::VmemForm::Buffer | crate::inst::VmemForm::Scratch)))
+                || (matches!(name, "VADDR" | "ADDR") && form == Form::Vmem(crate::inst::VmemForm::Global)));
+            if r.len != (bits / 32).max(1) as u8 && !short_address { return Err(reject(format!("{name} register width mismatch"))); }
             Ok(u32::from(r.base))
         }
-        ("VDST", Operand::Special(s)) if form == Form::Vop3 => selector(&Operand::Special(*s), (bits/32).max(1) as u8, true),
+        ("VDST", Operand::Special(s)) if form == Form::Vop3 => selector(&Operand::Special(*s), (bits/32).max(1) as u8),
         ("VDST" | "SRC0", Operand::Half(r, _)) => Ok(if name=="VDST" { u32::from(r.base) } else { u32::from(r.base) + 256 }),
-        (_, _) => selector(op, (bits / 32).max(1) as u8, name == "SDST"),
+        (n, Operand::Special(Special::Scc)) if n.starts_with("SSRC") && bits == 32
+            && matches!(form, Form::Sop1 | Form::Sop2 | Form::Sopc) => Ok(253),
+        (_, _) => selector(op, (bits / 32).max(1) as u8),
     }
-}
-fn grammars(row: &OpRow) -> impl Iterator<Item = (&str, u16)> {
-    row.grammar.split(',').filter_map(|part| {
-        let (name, bits) = part.split_once(':')?;
-        Some((name, bits.parse().ok()?))
-    })
 }
 fn width(arch: Arch, row: &OpRow, words: &[u32]) -> Result<usize, DecodeError> {
     let base = match row.form { Form::Sop1 | Form::Sop2 | Form::Sopc | Form::Sopk | Form::Sopp | Form::Vop1 | Form::Vop2 | Form::Vopc => 1,
@@ -163,10 +199,10 @@ fn width(arch: Arch, row: &OpRow, words: &[u32]) -> Result<usize, DecodeError> {
     if words.len() < base { return Err(reject(format!("truncated {} instruction (need {base} words)", row.name))); }
     let literal = match row.form {
         Form::Sop1 | Form::Sop2 | Form::Sopc | Form::Vop1 | Form::Vop2 | Form::Vopc | Form::Vop3 | Form::Vop3p | Form::Vopd => {
-            grammars(row).any(|(name, _)| {
+            row.slots(false).any(|(name, _)| {
                 let source = name.starts_with("SRC") || name.starts_with("SSRC");
                 source && forms::field_for(arch, row.form, name).is_some_and(|f| value(Some(f), words) == 255)
-            }) || row.grammar.contains("literal@last") && matches!(row.name, "s_fmamk_f32" | "v_fmaak_f32" | "v_fmamk_f32" | "v_dual_fmaak_f32" | "v_dual_fmamk_f32")
+            }) || row.grammar.contains("literal@last") && matches!(row.name, "s_fmaak_f32" | "s_fmamk_f32" | "v_fmaak_f32" | "v_fmamk_f32" | "v_dual_fmaak_f32" | "v_dual_fmamk_f32")
                 || row.form == Form::Vopd && (
                     forms::field_for(arch, row.form, "SRCY0").is_some_and(|f| value(Some(f),words)==255)
                     || isa::table(arch).iter().any(|y| y.form==Form::Vopd && y.op.id==((words[0]>>17)&31) as u16
@@ -185,6 +221,17 @@ fn field_value(arch: Arch, name: &str, row: &OpRow, words: &[u32]) -> u32 {
 fn encode_field(arch: Arch, name: &str, row: &OpRow, words: &mut [u32], value: u32) -> Result<(), DecodeError> {
     if name == "SDST" && row.form == Form::Vop3 { return assign(Field::new("SDST",8,7),words,value); }
     assign(forms::field_for(arch, row.form, name).ok_or_else(|| reject(format!("unknown bitfield {name} in {}",row.name)))?,words,value)
+}
+/// Typed cache policy of an SMEM/VMEM word; default for every other form.
+fn cache_policy(arch: Arch, row: &OpRow, words: &[u32]) -> CachePolicy {
+    if row.form != Form::Smem && !matches!(row.form, Form::Vmem(_)) { return CachePolicy::default(); }
+    if arch == Arch::Gfx1201 {
+        CachePolicy { th: field_value(arch, "TH", row, words) as u8, scope: field_value(arch, "SCOPE", row, words) as u8,
+            nv: field_value(arch, "NV", row, words) != 0, ..CachePolicy::default() }
+    } else {
+        CachePolicy { glc: field_value(arch, "GLC", row, words) != 0, slc: field_value(arch, "SLC", row, words) != 0,
+            dlc: field_value(arch, "DLC", row, words) != 0, ..CachePolicy::default() }
+    }
 }
 fn special_mods(arch: Arch, row: &OpRow, words: &[u32], mods: &mut Modifiers) {
     if row.form == Form::Vop3 {
@@ -208,17 +255,7 @@ fn special_mods(arch: Arch, row: &OpRow, words: &[u32], mods: &mut Modifiers) {
         mods.neg=(field_value(arch, "SRC0_NEG", row, words) | field_value(arch, "SRC1_NEG", row, words)<<1) as u8;
         mods.abs=(field_value(arch, "SRC0_ABS", row, words) | field_value(arch, "SRC1_ABS", row, words)<<1) as u8;
     }
-    if row.form == Form::Smem || matches!(row.form,Form::Vmem(_)) {
-        if arch == Arch::Gfx1201 {
-            mods.cpol.th = field_value(arch, "TH", row, words) as u8;
-            mods.cpol.scope = field_value(arch, "SCOPE", row, words) as u8;
-            mods.cpol.nv = field_value(arch, "NV", row, words) != 0;
-        } else {
-            mods.cpol.glc = field_value(arch, "GLC", row, words) != 0;
-            mods.cpol.slc = field_value(arch, "SLC", row, words) != 0;
-            mods.cpol.dlc = field_value(arch, "DLC", row, words) != 0;
-        }
-    }
+    mods.cpol = cache_policy(arch, row, words);
     if matches!(arch, Arch::Gfx1100 | Arch::Gfx1151) && row.name.starts_with("s_waitcnt") {
         let bits = words[0] as u16;
         let mut wait = WaitImm::default();
@@ -315,7 +352,9 @@ pub fn decode_for(arch: Arch, words: &[u32]) -> Result<(Inst, usize), DecodeErro
     if matches!(row.form,Form::Vop1Dpp|Form::Vop2Dpp) { consumed[0]|=0x1ff; }
     let mut operands = SmallVec::new();
     let mut mods = Modifiers::default();
-    for (name,_) in grammars(row) {
+    // A gfx11 VMEM atomic's `VDST@rtn` slot exists only when GLC selects the return.
+    let returns = isa::atomic_returns(arch, &cache_policy(arch, row, words));
+    for (name,_) in row.slots(returns) {
         if let Some(f)=forms::field_for(arch, row.form, name) { consumed[usize::from(f.bit / 32)] |= f.mask(); }
     }
     if row.form == Form::Vop3 && row.grammar.contains("SDST:") { consumed[0] |= 0x7f00; }
@@ -326,7 +365,7 @@ pub fn decode_for(arch: Arch, words: &[u32]) -> Result<(Inst, usize), DecodeErro
     if row.form == Form::Vopc && row.name.starts_with("v_cmp_") {
         operands.push(Operand::Special(Special::VccLo));
     }
-    for (name,bits) in grammars(row) {
+    for (name,bits) in row.slots(returns) {
         let v = field_value(arch, name, row, words);
         if row.form==Form::Vop3 && name=="VDST" && row.name.starts_with("v_cmpx_") {
             if v!=126 { return Err(reject("VOP3 cmpx requires implicit EXEC destination")); }
@@ -364,8 +403,14 @@ pub fn decode_for(arch: Arch, words: &[u32]) -> Result<(Inst, usize), DecodeErro
     if matches!(row.form,Form::Vmem(_)) {
         let off=field_value(arch, "IOFFSET", row, words);
         if off!=0 {
-            let bits = if arch == Arch::Gfx1201 { 24 } else if row.form == Form::Vmem(crate::inst::VmemForm::Buffer) { 12 } else { 13 };
-            operands.push(Operand::Imm(ImmField::VmemOffset(((off << (32-bits)) as i32) >> (32-bits))));
+            // gfx11 MUBUF OFFSET is an unsigned 12-bit byte offset (0..=4095);
+            // FLAT/GLOBAL/SCRATCH (13-bit) and gfx12 (24-bit) offsets are signed.
+            if arch != Arch::Gfx1201 && row.form == Form::Vmem(crate::inst::VmemForm::Buffer) {
+                operands.push(Operand::Imm(ImmField::VmemOffset(off as i32)));
+            } else {
+                let bits = if arch == Arch::Gfx1201 { 24 } else { 13 };
+                operands.push(Operand::Imm(ImmField::VmemOffset(((off << (32-bits)) as i32) >> (32-bits))));
+            }
         }
         if row.form == Form::Vmem(crate::inst::VmemForm::Buffer) && field_value(arch, "OFFEN", row, words)==1 {
             operands.push(Operand::Vmem(VmemToken::Offen));
@@ -384,8 +429,12 @@ pub fn decode_for(arch: Arch, words: &[u32]) -> Result<(Inst, usize), DecodeErro
                     2 => operands.push(Operand::Scope(CacheScope::Dev)),
                     _ => operands.push(Operand::Scope(CacheScope::Sys)),
                 }
-            } else if row.name=="global_inv" && field_value(arch, "SCOPE", row, words)==1 {
-                operands.push(Operand::Scope(CacheScope::Se));
+            } else if row.name=="global_inv" {
+                match field_value(arch, "SCOPE", row, words) {
+                    0 => {}, 1 => operands.push(Operand::Scope(CacheScope::Se)),
+                    2 => operands.push(Operand::Scope(CacheScope::Dev)),
+                    _ => operands.push(Operand::Scope(CacheScope::Sys)),
+                }
             }
         }
         let field = forms::field_for(arch, row.form, "IOFFSET").expect("VMEM IOFFSET");
@@ -396,7 +445,7 @@ pub fn decode_for(arch: Arch, words: &[u32]) -> Result<(Inst, usize), DecodeErro
         let y = isa::table(arch).iter().find(|r| r.form == Form::Vopd && r.op.id == y_id).ok_or_else(|| reject("unknown VOPD Y opcode"))?;
         consumed[0] |= Field::new("OPY",17,5).mask();
         let count = operands.len() as u8;
-        for (name,bits) in grammars(y) {
+        for (name,bits) in y.slots(false) {
             if name=="LITERAL" {
                 operands.push(Operand::Literal(literal.ok_or_else(||reject("missing VOPD Y literal"))?));
                 continue;
@@ -457,6 +506,16 @@ pub fn encode(inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeError> { encode_f
 pub fn encode_for(arch: Arch, inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeError> {
     inst.validate(arch).map_err(|e|reject(e.to_string()))?;
     let row=isa::lookup(arch,inst.op,inst.form).ok_or_else(||reject("unknown opcode/form"))?;
+    if row.form == Form::Vmem(crate::inst::VmemForm::Global) {
+        let address = row.slots(isa::atomic_returns(arch, &inst.mods.cpol)).position(|(name, _)| matches!(name, "VADDR" | "ADDR"));
+        let scalar = row.slots(isa::atomic_returns(arch, &inst.mods.cpol)).position(|(name, _)| name == "SADDR");
+        if let (Some(a), Some(s)) = (address, scalar) {
+            if let Some(Operand::Reg(r)) = inst.operands.get(a) {
+                let expected = if inst.operands.get(s) == Some(&Operand::Vmem(VmemToken::Off)) { 2 } else { 1 };
+                if r.len != expected { return Err(reject("GLOBAL VADDR width disagrees with SADDR mode")); }
+            }
+        }
+    }
     let mut words=[0u32;3];
     let (_,prefix)=forms::prefix_for(arch, row.form).ok_or_else(||reject("unsupported form"))?; words[0]=prefix;
     assign(forms::opcode_for(arch, row.form).expect("form opcode"),&mut words,inst.op.id.into())?;
@@ -466,7 +525,7 @@ pub fn encode_for(arch: Arch, inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeE
         && operands.next() != Some(&Operand::Special(Special::VccLo)) {
         return Err(reject("VOPC compare destination must be vcc_lo"));
     }
-    for (name,bits) in grammars(row) {
+    for (name,bits) in row.slots(isa::atomic_returns(arch, &inst.mods.cpol)) {
         if row.form==Form::Vop3 && name=="VDST" && row.name.starts_with("v_cmpx_") {
             encode_field(arch, name, row, &mut words, 126)?;
             continue;
@@ -490,10 +549,10 @@ pub fn encode_for(arch: Arch, inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeE
     }
     if row.form == Form::Vopd {
         if let FormFields::Vopd { y_op,x_operands } = &inst.fields {
-            if usize::from(*x_operands) != grammars(row).count() { return Err(reject("VOPD half boundary mismatch")); }
+            if usize::from(*x_operands) != row.slots(false).count() { return Err(reject("VOPD half boundary mismatch")); }
             let y=isa::lookup(arch,*y_op,Form::Vopd).ok_or_else(||reject("unknown VOPD Y opcode"))?;
             assign(Field::new("OPY",17,5),&mut words,y.op.id.into())?;
-            for (name,bits) in grammars(y) {
+            for (name,bits) in y.slots(false) {
                 let mapped=match name { "VDSTX"=>"VDSTY", "SRCX0"=>"SRCY0", "VSRCX1"=>"VSRCY1", _=>name };
                 let op=operands.next().ok_or_else(||reject(format!("missing Y {mapped} operand")))?;
                 if name=="LITERAL" {
@@ -546,8 +605,8 @@ pub fn encode_for(arch: Arch, inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeE
                     encode_field(arch, "SCOPE", row, &mut words, match scope { CacheScope::Cu=>0,CacheScope::Se=>1,CacheScope::Dev=>2,CacheScope::Sys=>3 })?,
                 Operand::CacheTh(th) if row.form==Form::Vmem(crate::inst::VmemForm::Buffer) =>
                     encode_field(arch, "TH", row, &mut words, u32::from(*th))?,
-                Operand::Scope(CacheScope::Se) if row.name=="global_inv" =>
-                    encode_field(arch, "SCOPE", row, &mut words, 1)?,
+                Operand::Scope(scope) if row.name=="global_inv" =>
+                    encode_field(arch, "SCOPE", row, &mut words, match scope { CacheScope::Cu=>0,CacheScope::Se=>1,CacheScope::Dev=>2,CacheScope::Sys=>3 })?,
                 _ => return Err(reject("invalid VMEM modifier operand")),
             }
         }
@@ -625,6 +684,21 @@ pub fn encode_for(arch: Arch, inst: &Inst) -> Result<SmallVec<[u32; 3]>, DecodeE
 mod tests {
     use super::*;
 
+
+    /// LLVM gfx1201 `v_min_u32_e64 v72, s92, v24`, used by GDN scan.
+    #[test]
+    fn gdn_unsigned_min_roundtrip_and_sgpr_use() {
+        let words = [0xd513_0048, 0x0202_305c];
+        let (inst, consumed) = decode(&words).unwrap();
+        assert_eq!(consumed, 2);
+        assert_eq!(inst.op.name(Arch::Gfx1201), Some("v_min_u32_e64"));
+        assert_eq!(inst.effects.defs.as_slice(), &[RegRef {kind: Kind::V, base: 72, len: 1}]);
+        assert_eq!(inst.effects.uses.as_slice(), &[
+            RegRef {kind: Kind::S, base: 92, len: 1},
+            RegRef {kind: Kind::V, base: 24, len: 1},
+        ]);
+        assert_eq!(encode(&inst).unwrap().as_slice(), &words);
+    }
     #[test]
     fn every_declared_example_roundtrips() {
         let mut failures = Vec::new();
@@ -644,6 +718,119 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
+    /// One pinned word per row added for the gfx1201/gfx11 JIT caches at
+    /// fe77c0837 (`llvm-mc --disassemble`, AMD LLVM 23.0.0git, in the comment).
+    /// Each must decode to the LLVM mnemonic and re-encode byte-exact; gfx11
+    /// rows also hold on gfx1151, which inherits the gfx1100 table.
+    const JIT_CACHE_ROWS: &[(Arch, &str, &[u32])] = &[
+        (Arch::Gfx1201, "ds_add_rtn_u32", &[0xd880_0000, 0x0100_0701]), // ds_add_rtn_u32 v1, v1, v7
+        (Arch::Gfx1201, "ds_add_u32", &[0xd800_0000, 0x0000_0407]), // ds_add_u32 v7, v4
+        (Arch::Gfx1201, "ds_load_2addr_b64", &[0xd9dc_0100, 0x0000_0037]), // ds_load_2addr_b64 v[0:3], v55 offset1:1
+        (Arch::Gfx1201, "ds_load_b96", &[0xdbf8_0512, 0x2200_0025]), // ds_load_b96 v[34:36], v37 offset:1298
+        (Arch::Gfx1201, "ds_load_u16_d16_hi", &[0xda9c_0088, 0x0800_002a]), // ds_load_u16_d16_hi v8, v42 offset:136
+        (Arch::Gfx1201, "ds_or_b32", &[0xd828_0000, 0x0000_0100]), // ds_or_b32 v0, v1
+        (Arch::Gfx1201, "flat_load_b128", &[0xec05_c07c, 0x0000_0001, 0x0000_1003]), // flat_load_b128 v[1:4], v[3:4] offset:16
+        (Arch::Gfx1201, "flat_load_b32", &[0xec05_007c, 0x0000_0001, 0x0000_0006]), // flat_load_b32 v1, v[6:7]
+        (Arch::Gfx1201, "flat_load_b64", &[0xec05_407c, 0x0000_0020, 0x0000_0009]), // flat_load_b64 v[32:33], v[9:10]
+        (Arch::Gfx1201, "flat_load_d16_b16", &[0xec08_007c, 0x0000_0001, 0x0000_0407]), // flat_load_d16_b16 v1, v[7:8] offset:4
+        (Arch::Gfx1201, "flat_load_d16_hi_b16", &[0xec08_c07c, 0x0000_0001, 0x0000_0407]), // flat_load_d16_hi_b16 v1, v[7:8] offset:4
+        (Arch::Gfx1201, "flat_store_b128", &[0xec07_407c, 0x0100_0000, 0x0000_1018]), // flat_store_b128 v[24:25], v[2:5] offset:16
+        (Arch::Gfx1201, "flat_store_b32", &[0xec06_807c, 0x0100_0000, 0x0000_0000]), // flat_store_b32 v[0:1], v2
+        (Arch::Gfx1201, "global_atomic_add_u32", &[0xee0d_4004, 0x0198_0002, 0x0000_0002]), // global_atomic_add_u32 v2, v2, v3, s[4:5] th:TH_ATOMIC_RETURN scope:SCOPE_DEV
+        (Arch::Gfx1201, "global_load_d16_hi_b16", &[0xee08_c07c, 0x0000_0000, 0x0000_0006]), // global_load_d16_hi_b16 v0, v[6:7], off
+        (Arch::Gfx1201, "s_bcnt1_i32_b32", &[0xbe80_1805]), // s_bcnt1_i32_b32 s0, s5
+        (Arch::Gfx1201, "s_bfe_i32", &[0x9380_ff75, 0x0001_001d]), // s_bfe_i32 s0, ttmp9, 0x1001d
+        (Arch::Gfx1201, "s_bitcmp0_b32", &[0xbf0c_8018]), // s_bitcmp0_b32 s24, 0
+        (Arch::Gfx1201, "s_cmp_nge_f32", &[0xbf49_8000]), // s_cmp_nge_f32 s0, 0
+        (Arch::Gfx1201, "s_cvt_f32_f16", &[0xbe90_6903]), // s_cvt_f32_f16 s16, s3
+        (Arch::Gfx1201, "s_cvt_hi_f32_f16", &[0xbe80_6a00]), // s_cvt_hi_f32_f16 s0, s0
+        (Arch::Gfx1201, "s_fmaak_f32", &[0xa283_0503, 0x3586_37bd]), // s_fmaak_f32 s3, s3, s5, 0x358637bd
+        (Arch::Gfx1201, "s_load_u16", &[0xf401_6b4f, 0xf800_0000]), // s_load_u16 s45, s[30:31], 0x0
+        (Arch::Gfx1201, "s_pack_lh_b32_b16", &[0x9980_2780]), // s_pack_lh_b32_b16 s0, 0, s39
+        (Arch::Gfx1201, "v_add_nc_u32_dpp", &[0x4a00_0afa, 0xff09_6205]), // v_add_nc_u32_dpp v0, v5, v5 row_xmask:2 row_mask:0xf bank_mask:0xf bound_ctrl:1
+        (Arch::Gfx1201, "v_cmp_eq_u64_e32", &[0x7cb4_0e80]), // v_cmp_eq_u64_e32 vcc_lo, 0, v[7:8]
+        (Arch::Gfx1201, "v_cmp_eq_u64_e64", &[0xd45a_0000, 0x0202_3480]), // v_cmp_eq_u64_e64 s0, 0, v[26:27]
+        (Arch::Gfx1201, "v_cmp_lt_i64_e32", &[0x7ca2_104a]), // v_cmp_lt_i64_e32 vcc_lo, s[74:75], v[8:9]
+        (Arch::Gfx1201, "v_cmp_ne_u64_e64", &[0xd45d_0001, 0x0202_1280]), // v_cmp_ne_u64_e64 s1, 0, v[9:10]
+        (Arch::Gfx1201, "v_cmp_neq_f16_e64", &[0xd40d_0000, 0x0202_1680]), // v_cmp_neq_f16_e64 s0, 0, v11.l
+        (Arch::Gfx1201, "v_cmp_nge_f32_e64", &[0xd419_0000, 0x0202_32ff, 0x7b80_0000]), // v_cmp_nge_f32_e64 s0, 0x7b800000, v25
+        (Arch::Gfx1201, "v_cmp_nle_f32_e32", &[0x7c38_32ff, 0x2680_0000]), // v_cmp_nle_f32_e32 vcc_lo, 0x26800000, v25
+        (Arch::Gfx1201, "v_cmp_nle_f32_e64", &[0xd41c_0002, 0x0202_22ff, 0x0d80_0000]), // v_cmp_nle_f32_e64 s2, 0xd800000, v17
+        (Arch::Gfx1201, "v_cmpx_eq_f32_e32", &[0x7d24_0d04]), // v_cmpx_eq_f32_e32 v4, v6
+        (Arch::Gfx1201, "v_cmpx_eq_u16_e32", &[0x7d74_1281]), // v_cmpx_eq_u16_e32 1, v9.l
+        (Arch::Gfx1201, "v_cmpx_eq_u32_e64", &[0xd4ca_007e, 0x0202_1204]), // v_cmpx_eq_u32_e64 s4, v9
+        (Arch::Gfx1201, "v_cmpx_gt_i64_e64", &[0xd4d4_007e, 0x0202_0610]), // v_cmpx_gt_i64_e64 s[16:17], v[3:4]
+        (Arch::Gfx1201, "v_cmpx_le_f32_e32", &[0x7d26_0880]), // v_cmpx_le_f32_e32 0, v4
+        (Arch::Gfx1201, "v_cmpx_lt_u32_e32", &[0x7d92_0087]), // v_cmpx_lt_u32_e32 7, v0
+        (Arch::Gfx1201, "v_cmpx_ne_u16_e32", &[0x7d7a_0280]), // v_cmpx_ne_u16_e32 0, v1.l
+        (Arch::Gfx1201, "v_cmpx_ngt_f32_e32", &[0x7d36_0104]), // v_cmpx_ngt_f32_e32 v4, v0
+        (Arch::Gfx1201, "v_cmpx_nlg_f32_e32", &[0x7d34_02ff, 0xff80_0000]), // v_cmpx_nlg_f32_e32 0xff800000, v1
+        (Arch::Gfx1201, "v_cvt_f32_ubyte1_e32", &[0x7e4c_251d]), // v_cvt_f32_ubyte1_e32 v38, v29
+        (Arch::Gfx1201, "v_cvt_f32_ubyte2_e32", &[0x7e4e_271d]), // v_cvt_f32_ubyte2_e32 v39, v29
+        (Arch::Gfx1201, "v_cvt_f32_ubyte3_e32", &[0x7e14_290a]), // v_cvt_f32_ubyte3_e32 v10, v10
+        (Arch::Gfx1201, "v_cvt_f64_i32_e32", &[0x7e08_0904]), // v_cvt_f64_i32_e32 v[4:5], v4
+        (Arch::Gfx1201, "v_cvt_f64_u32_e32", &[0x7e08_2d05]), // v_cvt_f64_u32_e32 v[4:5], v5
+        (Arch::Gfx1201, "v_cvt_i32_f64_e32", &[0x7e08_0704]), // v_cvt_i32_f64_e32 v4, v[4:5]
+        (Arch::Gfx1201, "v_dual_min_num_f32", &[0xcad4_0f06, 0x0606_0f08]), // v_dual_min_num_f32 v6, v6, v7 :: v_dual_max_num_f32 v7, v8, v7
+        (Arch::Gfx1201, "v_fmac_f16_e64", &[0xd536_4080, 0x0202_ff80]), // v_fmac_f16_e64 v128.h, v128.l, v127.l op_sel:[0,0,0,1]
+        (Arch::Gfx1201, "v_lshlrev_b16", &[0xd738_0000, 0x0202_0088]), // v_lshlrev_b16 v0.l, 8, v0.l
+        (Arch::Gfx1201, "v_maximumminimum_f32", &[0xd66d_001c, 0x03fc_1122, 0x4300_0000]), // v_maximumminimum_f32 v28, v34, s8, 0x43000000
+        (Arch::Gfx1201, "v_maxmin_num_f32", &[0xd669_0001, 0x03fc_0b01, 0x42fe_0000]), // v_maxmin_num_f32 v1, v1, s5, 0x42fe0000
+        (Arch::Gfx1201, "v_min3_i32", &[0xd61a_0001, 0x0404_1208]), // v_min3_i32 v1, s8, s9, v1
+        (Arch::Gfx1201, "v_min3_num_f32", &[0xd629_0006, 0x0432_1706]), // v_min3_num_f32 v6, v6, v11, v12
+        (Arch::Gfx1201, "v_min_i32_dpp", &[0x2208_08fa, 0xff09_6104]), // v_min_i32_dpp v4, v4, v4 row_xmask:1 row_mask:0xf bank_mask:0xf bound_ctrl:1
+        (Arch::Gfx1201, "v_min_num_f32_e32", &[0x2a10_0905]), // v_min_num_f32_e32 v8, v5, v4
+        (Arch::Gfx1201, "v_min_num_f64_e32", &[0x1a08_0908]), // v_min_num_f64_e32 v[4:5], v[8:9], v[4:5]
+        (Arch::Gfx1201, "v_minimum3_f32", &[0xd62d_024a, 0x0532_754b]), // v_minimum3_f32 v74, v75, |v58|, v76
+        (Arch::Gfx1201, "v_minimum_f32", &[0xd765_024a, 0x0202_814a]), // v_minimum_f32 v74, v74, |v64|
+        (Arch::Gfx1201, "v_or_b16", &[0xd763_0003, 0x0202_0706]), // v_or_b16 v3.l, v6.l, v3.l
+        (Arch::Gfx1201, "v_or_b32_dpp", &[0x3802_02fa, 0xff09_0101]), // v_or_b32_dpp v1, v1, v1 row_shl:1 row_mask:0xf bank_mask:0xf bound_ctrl:1
+        (Arch::Gfx1201, "v_xad_u32", &[0xd645_0005, 0x0005_8300]), // v_xad_u32 v5, v0, -1, s1
+        (Arch::Gfx1100, "scratch_load_d16_b16", &[0xdc81_0000, 0x04fc_0002]), // scratch_load_d16_b16 v4, v2, off
+        (Arch::Gfx1100, "v_cmpx_eq_f32_e32", &[0x7d24_84ff, 0xff80_0000]), // v_cmpx_eq_f32_e32 0xff800000, v66
+        (Arch::Gfx1100, "v_cvt_f16_u16_e64", &[0xd5d0_0095, 0x0201_0195]), // v_cvt_f16_u16_e64 v149.l, v149.l
+        (Arch::Gfx1100, "v_fmac_f16_e64", &[0xd536_4086, 0x0202_d586]), // v_fmac_f16_e64 v134.h, v134.l, v106.l op_sel:[0,0,0,1]
+        (Arch::Gfx1100, "v_min3_i32", &[0xd61a_0001, 0x0404_0a04]), // v_min3_i32 v1, s4, s5, v1
+        (Arch::Gfx1201, "global_load_b32", &[0xee05_007c, 0x0008_000d, 0x0000_1c0d]), // global_load_b32 v13, v[13:14], off offset:28 scope:SCOPE_DEV
+        (Arch::Gfx1201, "global_inv", &[0xee0a_c07c, 0x0008_0000, 0x0000_0000]), // global_inv scope:SCOPE_DEV
+        (Arch::Gfx1201, "s_mov_b64", &[0xbe82_01eb]), // s_mov_b64 s[2:3], src_shared_base
+    ];
+
+    #[test]
+    fn jit_cache_rows_decode_to_llvm_mnemonic_and_reencode_exactly() {
+        let mut failures = Vec::new();
+        for &(arch, name, words) in JIT_CACHE_ROWS {
+            let arches: &[Arch] = if arch == Arch::Gfx1100 { &[Arch::Gfx1100, Arch::Gfx1151] } else { &[arch] };
+            for &arch in arches {
+                let result = decode_for(arch, words).and_then(|(inst, len)| {
+                    if len != words.len() { return Err(reject(format!("width {len} != {}", words.len()))); }
+                    // FLAT/GLOBAL/BUFFER and e32/DPP share opcode ids; the form disambiguates.
+                    let decoded = isa::lookup(arch, inst.op, inst.form).map_or("?", |row| row.name);
+                    if decoded != name { return Err(reject(format!("decoded as {decoded}"))); }
+                    let bytes = encode_for(arch, &inst)?;
+                    if &bytes[..] != words { return Err(reject(format!("re-encoded {bytes:08x?}"))); }
+                    Ok(())
+                });
+                if let Err(error) = result { failures.push(format!("{arch:?} {name}: {error}")); }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn flat_aperture_and_scoped_invalidate_are_typed() {
+        let (flat, _) = decode(&[0xec05_007c, 0x0000_0001, 0x0000_0006]).unwrap();
+        let counters = &flat.effects.mem.as_ref().expect("flat load is a memory op").counters;
+        assert!(counters.contains(Counter::Load) && counters.contains(Counter::Ds));
+        let (mov, _) = decode(&[0xbe82_01eb]).unwrap();
+        assert_eq!(mov.operands.last(), Some(&Operand::Special(Special::SrcSharedBase)));
+        let (inv, _) = decode(&[0xee0a_c07c, 0x0008_0000, 0x0000_0000]).unwrap();
+        assert_eq!(inv.operands.last(), Some(&Operand::Scope(CacheScope::Dev)));
+        let (atomic, _) = decode(&[0xee0d_4004, 0x0198_0002, 0x0000_0002]).unwrap();
+        assert!(atomic.effects.mem.as_ref().unwrap().counters.contains(Counter::Load));
+        assert_eq!(atomic.mods.cpol.th & 1, 1);
+    }
+
     #[test]
     fn buffer_cache_policy_is_typed_and_preserved() {
         let base = [0xc405_005c, 0x4080_50b8, 0x0000_00b6];
@@ -659,6 +846,20 @@ mod tests {
                     (th != 0).then_some(&Operand::CacheTh(th as u8)));
                 assert_eq!(encode(&inst).unwrap().as_slice(), &words);
             }
+        }
+    }
+
+    /// gfx11+ selector 124 is `null` and 125 is `m0` in source operands as
+    /// in destinations: a `null` buffer SOFFSET must not read M0.
+    #[test]
+    fn source_null_and_m0_selectors() {
+        let (store, _) = decode(&[0xc407_407c, 0x4080_6800, 0x0000_00b9]).unwrap();
+        assert!(store.operands.contains(&Operand::Special(Special::Null)));
+        assert!(!store.operands.contains(&Operand::Special(Special::M0)));
+        for (word, special) in [(0xbe84_007c, Special::Null), (0xbe84_007d, Special::M0)] {
+            let (mov, _) = decode(&[word]).unwrap();
+            assert_eq!(mov.operands.last(), Some(&Operand::Special(special)));
+            assert_eq!(encode(&mov).unwrap().as_slice(), &[word]);
         }
     }
 
@@ -917,6 +1118,329 @@ mod tests {
             let (decoded,count)=decode(&encoded).unwrap();
             proptest::prop_assert_eq!(count,encoded.len());
             proptest::prop_assert_eq!(decoded,inst);
+        }
+    }
+    #[test]
+    fn global_address_width_matches_llvm_disassembly_in_both_modes() {
+        use std::{io::Write, process::{Command, Stdio}};
+        // Oracle test: needs ROCm's llvm-mc. The no-GPU CI runner has no ROCm,
+        // so skip there instead of panicking on spawn; ROCm hosts still run it.
+        let llvm_mc = crate::rocm_llvm_mc();
+        if crate::rocm::tests_disabled() {
+            eprintln!("skipping: explicitly disabled ROCm toolchain");
+            return;
+        }
+        for (arch, cpu) in [(Arch::Gfx1100, "gfx1100"), (Arch::Gfx1151, "gfx1151"), (Arch::Gfx1201, "gfx1201")] {
+            for (saddr, width) in [(4u32, 1u8), (124, 2)] {
+                let words = if arch == Arch::Gfx1201 { vec![0xee050000 | saddr, 10, 20] }
+                    else { vec![0xdc520000, 0x0a000014 | saddr << 16] };
+                let input = words.iter().flat_map(|w| w.to_le_bytes()).map(|b| format!("0x{b:02x}")).collect::<Vec<_>>().join(" ");
+                let mut mc = Command::new(&llvm_mc)
+                    .args(["-triple=amdgcn-amd-amdhsa", &format!("-mcpu={cpu}"), "-disassemble"])
+                    .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+                mc.stdin.take().unwrap().write_all(format!("{input}\n").as_bytes()).unwrap();
+                let out = mc.wait_with_output().unwrap();
+                assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+                let text = String::from_utf8_lossy(&out.stdout);
+                assert!(text.contains(if width == 1 { "v10, v20, s[4:5]" } else { "v10, v[20:21], off" }), "{text}");
+                let (mut inst, _) = decode_for(arch, &words).unwrap();
+                let addr = RegRef { kind: Kind::V, base: 20, len: width };
+                assert!(inst.effects.uses.contains(&addr));
+                assert!(!inst.effects.uses.iter().any(|r| r.kind == Kind::V && r.base == 20 && r.len != width));
+                assert_eq!(encode_for(arch, &inst).unwrap().as_slice(), words.as_slice());
+                let slot = inst.operands.iter().position(|o| *o == Operand::Reg(addr)).unwrap();
+                inst.operands[slot] = Operand::Reg(RegRef { len: 3 - width, ..addr });
+                assert!(encode_for(arch, &inst).is_err());
+            }
+        }
+    }
+}
+
+/// MQ4 RADV/ACO gfx1201 binary (full5476/executable5456, SHA d860d885...a680) scalar gaps,
+/// disassembled from the raw words by ROCm llvm-mc; opcodes cross-checked against Mesa
+/// 60e95b7 `aco_opcodes.py` (s_bfm_b32 gfx11+ = 0x2a, defs U32 only; s_cmp_lg_i32 = 0x01, defs SCC).
+#[cfg(test)]
+mod aco_pilot_scalar_tests {
+    use super::*;
+    use crate::effects::ImplicitSet;
+
+    fn pinned(words: &[u32]) -> Inst {
+        let (inst, used) = decode(words).unwrap();
+        assert_eq!(used, words.len());
+        assert_eq!(encode(&inst).unwrap().as_slice(), words);
+        // Re-derive from typed fields alone; no decoded provenance participates.
+        let rebuilt = Inst::from_parts(Arch::Gfx1201, inst.op, inst.form, inst.fields.clone(),
+            inst.operands.clone(), inst.mods.clone(), inst.literal, Provenance::default()).unwrap();
+        assert_eq!(encode(&rebuilt).unwrap().as_slice(), words);
+        inst
+    }
+    fn s20() -> Operand { Operand::Reg(RegRef { kind: Kind::S, base: 20, len: 1 }) }
+
+    /// `s_mov_b32 s20, src_scc` (offset 164): SCC is a read of the implicit SCC bit, not a register.
+    #[test]
+    fn s_mov_b32_src_scc_is_a_precise_scc_read() {
+        let inst = pinned(&[0xbe94_00fd]);
+        assert_eq!(inst.op.name(Arch::Gfx1201), Some("s_mov_b32"));
+        assert_eq!(inst.operands.as_slice(), &[s20(), Operand::Special(Special::Scc)]);
+        assert_eq!(inst.effects.defs.as_slice(), &[RegRef { kind: Kind::S, base: 20, len: 1 }]);
+        assert!(inst.effects.uses.is_empty());
+        assert_eq!(inst.effects.implicit.reads, ImplicitSet::SCC);
+        assert_eq!(inst.effects.implicit.writes, 0);
+        assert_eq!(inst.text(Arch::Gfx1201).unwrap(), "s_mov_b32 s20, scc");
+    }
+    #[test]
+    fn scc_selector_is_a_32_bit_scalar_source_only() {
+        // SCC cannot be a destination: the typed operand does not encode as SDST.
+        let (mov, _) = decode(&[0xbe94_0080]).unwrap();
+        let as_dest = Inst::from_parts(Arch::Gfx1201, mov.op, mov.form, FormFields::None,
+            smallvec::smallvec![Operand::Special(Special::Scc), s20()], Modifiers::default(), None, Provenance::default()).unwrap();
+        assert!(encode(&as_dest).is_err());
+        // The 8-bit VOP3 compare destination field never decodes selector 0xfd as SCC.
+        let e = decode(&[0xd44a_00fd, 0x0202_0e80]).unwrap_err().to_string();
+        assert!(e.contains("unknown source selector 0xfd"), "{e}");
+        // Not witnessed outside SOP1/SOP2/SOPC 32-bit sources: refused, not guessed.
+        let e = decode(&[0x7e00_02fd]).unwrap_err().to_string(); // v_mov_b32_e32 v0, src_scc
+        assert!(e.contains("SCC source selector"), "{e}");
+    }
+    /// `s_bfm_b32 vcc_lo, 16, 0` (offsets 1044/3168/3916/4648): explicit VCC_LO destination,
+    /// no SCC effect (Mesa defines only the U32 result).
+    #[test]
+    fn s_bfm_b32_vcc_lo_defines_vcc_without_scc() {
+        let inst = pinned(&[0x956a_8090]);
+        assert_eq!(inst.op.name(Arch::Gfx1201), Some("s_bfm_b32"));
+        assert_eq!(inst.form, Form::Sop2);
+        assert_eq!(inst.operands.as_slice(), &[Operand::Special(Special::VccLo),
+            Operand::Inline(InlineConst::Integer(16)), Operand::Inline(InlineConst::Integer(0))]);
+        assert!(inst.effects.defs.is_empty() && inst.effects.uses.is_empty());
+        assert_eq!(inst.effects.implicit.writes, ImplicitSet::VCC);
+        assert_eq!(inst.effects.implicit.reads, 0);
+        // An ordinary SGPR destination has no implicit effect at all.
+        let inst = pinned(&[0x9514_8090]); // s_bfm_b32 s20, 16, 0
+        assert_eq!(inst.effects.defs.as_slice(), &[RegRef { kind: Kind::S, base: 20, len: 1 }]);
+        assert_eq!((inst.effects.implicit.reads, inst.effects.implicit.writes), (0, 0));
+    }
+    /// `s_cmp_lg_i32 s20, 0` (offset 5320): SOPC compare writes SCC and reads only its sources.
+    #[test]
+    fn s_cmp_lg_i32_writes_scc() {
+        let inst = pinned(&[0xbf01_8014]);
+        assert_eq!(inst.op.name(Arch::Gfx1201), Some("s_cmp_lg_i32"));
+        assert_eq!(inst.form, Form::Sopc);
+        assert_eq!(inst.operands.as_slice(), &[s20(), Operand::Inline(InlineConst::Integer(0))]);
+        assert!(inst.effects.defs.is_empty());
+        assert_eq!(inst.effects.uses.as_slice(), &[RegRef { kind: Kind::S, base: 20, len: 1 }]);
+        assert_eq!(inst.effects.implicit.writes, ImplicitSet::SCC);
+        assert_eq!(inst.effects.implicit.reads, 0);
+    }
+    /// The new rows exist only in the gfx1201 table; targets without a row reject table-gated.
+    #[test]
+    fn new_rows_are_gated_to_the_gfx1201_table() {
+        for words in [[0x956a_8090u32], [0xbf01_8014]] {
+            for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1030] {
+                let e = decode_for(arch, &words).unwrap_err().to_string();
+                assert!(e.contains("undefined"), "{arch:?} {words:08x?}: {e}");
+            }
+        }
+    }
+}
+
+/// Opcode-fill census for gfx1201: 37 emitted-gap identities plus the Mesa 60e95b7 WMMA, dot and
+/// SWMMAC identities (14 added here; (VOP3P,0x16), (VOP3P,0x44) and (VOP3P,0x56) already existed).
+/// Samples are pinned ROCm `llvm-mc -mcpu=gfx1201` words; each opcode is cross-checked against
+/// Mesa `aco_opcodes.py` (gfx12 column; VOP3-promoted VOPC/VOP2/VOP1 add +0/+0x100/+0x180).
+#[cfg(test)]
+mod opcode_fill_rows_tests {
+    use super::*;
+    use crate::effects::ImplicitSet;
+
+    /// (table row, llvm-mc words, llvm text = table sample, Mesa name, Mesa format, Mesa gfx12 opcode)
+    type Pinned = (&'static str, &'static [u32], &'static str, &'static str, &'static str, u16);
+    const NEW_ROWS: &[Pinned] = &[
+        ("flat_load_i8", &[0xec04_407c, 0x0000_0001, 0x0000_0402], "flat_load_i8 v1, v[2:3] offset:4", "flat_load_sbyte", "FLAT", 0x11),
+        ("flat_load_b96", &[0xec05_807c, 0x0000_0001, 0x0000_0804], "flat_load_b96 v[1:3], v[4:5] offset:8", "flat_load_dwordx3", "FLAT", 0x16),
+        ("flat_store_b8", &[0xec06_007c, 0x0080_0000, 0x0000_0402], "flat_store_b8 v[2:3], v1 offset:4", "flat_store_byte", "FLAT", 0x18),
+        ("flat_store_b16", &[0xec06_407c, 0x0080_0000, 0x0000_0202], "flat_store_b16 v[2:3], v1 offset:2", "flat_store_short", "FLAT", 0x19),
+        ("flat_store_b96", &[0xec07_007c, 0x0200_0000, 0x0000_0c02], "flat_store_b96 v[2:3], v[4:6] offset:12", "flat_store_dwordx3", "FLAT", 0x1c),
+        ("flat_load_d16_u8", &[0xec07_807c, 0x0000_0001, 0x0000_0102], "flat_load_d16_u8 v1, v[2:3] offset:1", "flat_load_ubyte_d16", "FLAT", 0x1e),
+        ("flat_store_d16_hi_b16", &[0xec09_407c, 0x0080_0000, 0x0000_0202], "flat_store_d16_hi_b16 v[2:3], v1 offset:2", "flat_store_short_d16_hi", "FLAT", 0x25),
+        ("s_sext_i32_i8", &[0xbe87_0e07], "s_sext_i32_i8 s7, s7", "s_sext_i32_i8", "SOP1", 0xe),
+        ("s_bitset1_b32", &[0xbe86_129f], "s_bitset1_b32 s6, 31", "s_bitset1_b32", "SOP1", 0x12),
+        ("s_nor_b32", &[0x8f03_0403], "s_nor_b32 s3, s3, s4", "s_nor_b32", "SOP2", 0x1e),
+        ("v_nop", &[0x7e00_0000], "v_nop", "v_nop", "VOP1", 0x0),
+        ("v_sqrt_f32_e32", &[0x7e02_6702], "v_sqrt_f32_e32 v1, v2", "v_sqrt_f32", "VOP1", 0x33),
+        ("v_cls_i32_e32", &[0x7e02_7702], "v_cls_i32_e32 v1, v2", "v_ffbh_i32", "VOP1", 0x3b),
+        ("v_cvt_f16_i16_e32", &[0x7e02_a302], "v_cvt_f16_i16_e32 v1.l, v2.l", "v_cvt_f16_i16", "VOP1", 0x51),
+        ("v_cvt_u32_u16_e32", &[0x7e02_d702], "v_cvt_u32_u16_e32 v1, v2.l", "v_cvt_u32_u16", "VOP1", 0x6b),
+        ("v_sub_co_ci_u32_e32", &[0x4202_0b02], "v_sub_co_ci_u32_e32 v1, vcc_lo, v2, v5, vcc_lo", "v_subb_co_u32", "VOP2", 0x21),
+        ("v_mul_f16_e32", &[0x6a02_0702], "v_mul_f16_e32 v1.l, v2.l, v3.l", "v_mul_f16", "VOP2", 0x35),
+        ("v_cmp_nlg_f32_e64", &[0xd41a_0000, 0x0202_0501], "v_cmp_nlg_f32_e64 s0, v1, v2", "v_cmp_nlg_f32", "VOPC", 0x1a),
+        ("v_cmp_gt_i16_e64", &[0xd434_0000, 0x0202_0501], "v_cmp_gt_i16_e64 s0, v1.l, v2.l", "v_cmp_gt_i16", "VOPC", 0x34),
+        ("v_cmpx_le_u64_e64", &[0xd4db_007e, 0x0202_0610], "v_cmpx_le_u64_e64 s[16:17], v[3:4]", "v_cmpx_le_u64", "VOPC", 0xdb),
+        ("v_mul_f16_e64", &[0xd535_0001, 0x0202_0702], "v_mul_f16_e64 v1.l, v2.l, v3.l", "v_mul_f16", "VOP2", 0x35),
+        ("v_cvt_f16_i16_e64", &[0xd5d1_0001, 0x0201_0102], "v_cvt_f16_i16_e64 v1.l, v2.l", "v_cvt_f16_i16", "VOP1", 0x51),
+        ("v_cvt_u32_u16_e64", &[0xd5eb_0001, 0x0201_0102], "v_cvt_u32_u16_e64 v1, v2.l", "v_cvt_u32_u16", "VOP1", 0x6b),
+        ("v_mad_i32_i24", &[0xd60a_0001, 0x0412_0702], "v_mad_i32_i24 v1, v2, v3, v4", "v_mad_i32_i24", "VOP3", 0x20a),
+        ("v_subrev_co_u32", &[0xd702_0102, 0x0202_0f09], "v_subrev_co_u32 v2, s1, v9, v7", "v_subrev_co_u32_e64", "VOP3", 0x302),
+        ("v_mul_lo_u16", &[0xd705_0001, 0x0202_0702], "v_mul_lo_u16 v1.l, v2.l, v3.l", "v_mul_lo_u16_e64", "VOP3", 0x305),
+        ("v_lshrrev_b64", &[0xd73d_0009, 0x0202_0709], "v_lshrrev_b64 v[9:10], v9, v[3:4]", "v_lshrrev_b64", "VOP3", 0x33d),
+        ("v_wmma_f32_16x16x16_bf16", &[0xcc41_4000, 0x1c02_1908], "v_wmma_f32_16x16x16_bf16 v[0:7], v[8:11], v[12:15], v[0:7]", "v_wmma_f32_16x16x16_bf16", "VOP3P", 0x41),
+        ("v_wmma_bf16_16x16x16_bf16", &[0xcc43_4000, 0x1c02_1104], "v_wmma_bf16_16x16x16_bf16 v[0:3], v[4:7], v[8:11], v[0:3]", "v_wmma_bf16_16x16x16_bf16", "VOP3P", 0x43),
+        ("v_swmmac_f32_16x16x32_f16", &[0xcc50_4000, 0x1c52_1908], "v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[12:19], v20", "v_swmmac_f32_16x16x32_f16", "VOP3P", 0x50),
+        ("v_swmmac_f32_16x16x32_bf16", &[0xcc51_4000, 0x1c52_1908], "v_swmmac_f32_16x16x32_bf16 v[0:7], v[8:11], v[12:19], v20", "v_swmmac_f32_16x16x32_bf16", "VOP3P", 0x51),
+        ("v_swmmac_f16_16x16x32_f16", &[0xcc52_4000, 0x1c42_1104], "v_swmmac_f16_16x16x32_f16 v[0:3], v[4:7], v[8:15], v16", "v_swmmac_f16_16x16x32_f16", "VOP3P", 0x52),
+        ("v_swmmac_bf16_16x16x32_bf16", &[0xcc53_4000, 0x1c42_1104], "v_swmmac_bf16_16x16x32_bf16 v[0:3], v[4:7], v[8:15], v16", "v_swmmac_bf16_16x16x32_bf16", "VOP3P", 0x53),
+        ("v_swmmac_i32_16x16x32_iu8", &[0xcc54_4000, 0x1c3a_1508], "v_swmmac_i32_16x16x32_iu8 v[0:7], v[8:9], v[10:13], v14", "v_swmmac_i32_16x16x32_iu8", "VOP3P", 0x54),
+        ("v_swmmac_i32_16x16x32_iu4", &[0xcc55_4000, 0x1c2e_1308], "v_swmmac_i32_16x16x32_iu4 v[0:7], v8, v[9:10], v11", "v_swmmac_i32_16x16x32_iu4", "VOP3P", 0x55),
+        ("v_swmmac_f32_16x16x32_fp8_fp8", &[0xcc57_4000, 0x1c3a_1508], "v_swmmac_f32_16x16x32_fp8_fp8 v[0:7], v[8:9], v[10:13], v14", "v_swmmac_f32_16x16x32_fp8_fp8", "VOP3P", 0x57),
+        ("v_swmmac_f32_16x16x32_fp8_bf8", &[0xcc58_4000, 0x1c3a_1508], "v_swmmac_f32_16x16x32_fp8_bf8 v[0:7], v[8:9], v[10:13], v14", "v_swmmac_f32_16x16x32_fp8_bf8", "VOP3P", 0x58),
+        ("v_swmmac_f32_16x16x32_bf8_fp8", &[0xcc59_4000, 0x1c3a_1508], "v_swmmac_f32_16x16x32_bf8_fp8 v[0:7], v[8:9], v[10:13], v14", "v_swmmac_f32_16x16x32_bf8_fp8", "VOP3P", 0x59),
+        ("v_swmmac_f32_16x16x32_bf8_bf8", &[0xcc5a_4000, 0x1c3a_1508], "v_swmmac_f32_16x16x32_bf8_bf8 v[0:7], v[8:9], v[10:13], v14", "v_swmmac_f32_16x16x32_bf8_bf8", "VOP3P", 0x5a),
+        ("v_dot2_f32_f16", &[0xcc13_4000, 0x1c0e_0501], "v_dot2_f32_f16 v0, v1, v2, v3", "v_dot2_f32_f16", "VOP3P", 0x13),
+        ("v_dot2_f32_bf16", &[0xcc1a_4000, 0x1c0e_0501], "v_dot2_f32_bf16 v0, v1, v2, v3", "v_dot2_f32_bf16", "VOP3P", 0x1a),
+        ("v_dot8_i32_iu4", &[0xcc18_4000, 0x7c0e_0501], "v_dot8_i32_iu4 v0, v1, v2, v3 neg_lo:[1,1,0]", "v_dot8_i32_iu4", "VOP3P", 0x18),
+        ("v_cmp_nlg_f32_e32", &[0x7c34_0501], "v_cmp_nlg_f32_e32 vcc_lo, v1, v2", "v_cmp_nlg_f32", "VOPC", 0x1a),
+        ("v_cmp_le_u64_e32", &[0x7cb6_0602], "v_cmp_le_u64_e32 vcc_lo, s[2:3], v[3:4]", "v_cmp_le_u64", "VOPC", 0x5b),
+        ("v_cmp_gt_u64_e32", &[0x7cb8_0602], "v_cmp_gt_u64_e32 vcc_lo, s[2:3], v[3:4]", "v_cmp_gt_u64", "VOPC", 0x5c),
+        ("v_cmp_ne_u64_e32", &[0x7cba_0e80], "v_cmp_ne_u64_e32 vcc_lo, 0, v[7:8]", "v_cmp_lg_u64", "VOPC", 0x5d),
+        ("v_cmpx_ge_i32_e32", &[0x7d8c_0501], "v_cmpx_ge_i32_e32 v1, v2", "v_cmpx_ge_i32", "VOPC", 0xc6),
+        ("v_cmpx_ge_u32_e32", &[0x7d9c_1a0f], "v_cmpx_ge_u32_e32 s15, v13", "v_cmpx_ge_u32", "VOPC", 0xce),
+        ("v_cmpx_lt_i64_e32", &[0x7da2_0602], "v_cmpx_lt_i64_e32 s[2:3], v[3:4]", "v_cmpx_lt_i64", "VOPC", 0xd1),
+        ("v_cmpx_eq_u64_e32", &[0x7db4_0e80], "v_cmpx_eq_u64_e32 0, v[7:8]", "v_cmpx_eq_u64", "VOPC", 0xda),
+        ("v_cmpx_gt_u64_e32", &[0x7db8_0602], "v_cmpx_gt_u64_e32 s[2:3], v[3:4]", "v_cmpx_gt_u64", "VOPC", 0xdc),
+    ];
+    /// Rows that predate the fill. `(VOP3P,0x16)` is `v_dot4_i32_iu8` (canonical ACO/LLVM name; the old
+    /// alias `v_dot4_i32_i8` is iu8 with neg_lo:[1,1,0]); operand signedness comes from neg_lo.
+    const EXISTING_USEFUL: &[Pinned] = &[
+        ("v_dot4_i32_iu8", &[0xcc16_4000, 0x7c0e_0501], "v_dot4_i32_iu8 v0, v1, v2, v3 neg_lo:[1,1,0]", "v_dot4_i32_iu8", "VOP3P", 0x16),
+        ("v_dot4_i32_iu8", &[0xcc16_4000, 0x1c0e_0501], "v_dot4_i32_iu8 v0, v1, v2, v3", "v_dot4_i32_iu8", "VOP3P", 0x16),
+        ("v_wmma_i32_16x16x16_iu8", &[0xcc44_4008, 0x7c22_0900], "v_wmma_i32_16x16x16_iu8 v[8:15], v[0:1], v[4:5], v[8:15] neg_lo:[1,1,0]", "v_wmma_i32_16x16x16_iu8", "VOP3P", 0x44),
+        ("v_swmmac_i32_16x16x64_iu4", &[0xcc56_4000, 0x1c3a_1508], "v_swmmac_i32_16x16x64_iu4 v[0:7], v[8:9], v[10:13], v14", "v_swmmac_i32_16x16x64_iu4", "VOP3P", 0x56),
+    ];
+
+    fn mesa_family(form: Form) -> &'static [&'static str] {
+        match form {
+            Form::Sop1 => &["SOP1"], Form::Sop2 => &["SOP2"], Form::Vop1 => &["VOP1"], Form::Vop2 => &["VOP2"],
+            Form::Vopc => &["VOPC"], Form::Vop3p => &["VOP3P"], Form::Vmem(crate::inst::VmemForm::Flat) => &["FLAT"],
+            Form::Vop3 => &["VOP3", "VOPC", "VOP2", "VOP1"],
+            other => panic!("unexpected form {other:?}"),
+        }
+    }
+    fn mesa_offset(mesa_format: &str, form: Form) -> u16 {
+        match (mesa_format, form) { ("VOP2", Form::Vop3) => 0x100, ("VOP1", Form::Vop3) => 0x180, _ => 0 }
+    }
+    fn v(base: u16, len: u8) -> RegRef { RegRef { kind: Kind::V, base, len } }
+    fn s(base: u16, len: u8) -> RegRef { RegRef { kind: Kind::S, base, len } }
+    fn inst(words: &[u32]) -> Inst { decode(words).unwrap().0 }
+
+    #[test]
+    fn every_filled_row_matches_mesa_table_and_llvm_words() {
+        let mut failures = Vec::new();
+        for (pinned, check_table) in NEW_ROWS.iter().map(|p| (p, true)).chain(EXISTING_USEFUL.iter().map(|p| (p, false))) {
+            let &(name, words, text, mesa_name, mesa_format, mesa_op) = pinned;
+            let result = (|| -> Result<(), String> {
+                let (inst, used) = decode(words).map_err(|e| e.to_string())?;
+                if used != words.len() { return Err(format!("width {used} != {}", words.len())); }
+                if inst.op.name(Arch::Gfx1201) != Some(name) {
+                    return Err(format!("decoded as {:?}", inst.op.name(Arch::Gfx1201)));
+                }
+                let row = isa::lookup(Arch::Gfx1201, inst.op, inst.form).ok_or("no table row")?;
+                if check_table {
+                    let table: Vec<u32> = row.encoding.split_whitespace().map(|w| u32::from_str_radix(w, 16).unwrap()).collect();
+                    if row.sample != text || table != words { return Err(format!("table sample {:?} {:?} != pinned {text:?} {words:08x?}", row.sample, row.encoding)); }
+                }
+                if !mesa_family(inst.form).contains(&mesa_format) { return Err(format!("{mesa_name} is Mesa {mesa_format}, row is {:?}", inst.form)); }
+                if inst.op.id != mesa_op + mesa_offset(mesa_format, inst.form) {
+                    return Err(format!("{mesa_name} gfx12 opcode {mesa_op:#x} does not map to row opcode {:#x}", inst.op.id));
+                }
+                if encode(&inst).map_err(|e| e.to_string())?.as_slice() != words { return Err("re-encode differs".into()); }
+                // Typed fields alone (no decoded provenance) rebuild the same words.
+                let rebuilt = Inst::from_parts(Arch::Gfx1201, inst.op, inst.form, inst.fields.clone(), inst.operands.clone(),
+                    inst.mods.clone(), inst.literal, Provenance::default()).map_err(|e| e.to_string())?;
+                if encode(&rebuilt).map_err(|e| e.to_string())?.as_slice() != words { return Err("typed rebuild differs".into()); }
+                if decode(&encode(&inst).unwrap()).map_err(|e| e.to_string())?.0 != inst { return Err("decode(encode(i)) != i".into()); }
+                Ok(())
+            })();
+            if let Err(error) = result { failures.push(format!("{name} {words:08x?}: {error}")); }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+        assert_eq!(NEW_ROWS.len(), 51);
+    }
+
+    #[test]
+    fn filled_rows_carry_source_verified_effects() {
+        // SWMMAC reads and writes its accumulator VDST and reads the A, B and sparse-index registers.
+        let swmmac = inst(&[0xcc50_4000, 0x1c52_1908]); // v_swmmac_f32_16x16x32_f16 v[0:7], v[8:11], v[12:19], v20
+        assert_eq!(swmmac.effects.defs.as_slice(), &[v(0, 8)]);
+        for reg in [v(0, 8), v(8, 4), v(12, 8), v(20, 1)] { assert!(swmmac.effects.uses.contains(&reg), "{reg:?}"); }
+        let wmma = inst(&[0xcc41_4000, 0x1c02_1908]); // v_wmma_f32_16x16x16_bf16 v[0:7], v[8:11], v[12:15], v[0:7]
+        assert_eq!(wmma.effects.defs.as_slice(), &[v(0, 8)]);
+        for reg in [v(8, 4), v(12, 4), v(0, 8)] { assert!(wmma.effects.uses.contains(&reg), "{reg:?}"); }
+        let dot = inst(&[0xcc13_4000, 0x1c0e_0501]); // v_dot2_f32_f16 v0, v1, v2, v3
+        assert_eq!(dot.effects.defs.as_slice(), &[v(0, 1)]);
+        assert_eq!(dot.effects.uses.as_slice(), &[v(1, 1), v(2, 1), v(3, 1)]);
+        // FLAT: Load/Ds and Store/Ds counters; D16 loads preserve the other half of VDST.
+        let load = inst(&[0xec07_807c, 0x0000_0001, 0x0000_0102]); // flat_load_d16_u8 v1, v[2:3] offset:1
+        assert_eq!(load.effects.defs.as_slice(), &[v(1, 1)]);
+        assert!(load.effects.uses.contains(&v(1, 1)) && load.effects.uses.contains(&v(2, 2)));
+        let counters = &load.effects.mem.as_ref().unwrap().counters;
+        assert!(counters.contains(Counter::Load) && counters.contains(Counter::Ds));
+        let store = inst(&[0xec07_007c, 0x0200_0000, 0x0000_0c02]); // flat_store_b96 v[2:3], v[4:6] offset:12
+        assert!(store.effects.defs.is_empty());
+        assert!(store.effects.uses.contains(&v(2, 2)) && store.effects.uses.contains(&v(4, 3)));
+        let counters = &store.effects.mem.as_ref().unwrap().counters;
+        assert!(counters.contains(Counter::Store) && counters.contains(Counter::Ds));
+        // SALU.
+        let nor = inst(&[0x8f03_0403]); // s_nor_b32 s3, s3, s4: writes SCC
+        assert_eq!((nor.effects.implicit.reads, nor.effects.implicit.writes), (0, ImplicitSet::SCC));
+        let bitset = inst(&[0xbe86_129f]); // s_bitset1_b32 s6, 31: read-modify-write of SDST, SCC untouched
+        assert_eq!(bitset.effects.defs.as_slice(), &[s(6, 1)]);
+        assert!(bitset.effects.uses.contains(&s(6, 1)));
+        assert_eq!((bitset.effects.implicit.reads, bitset.effects.implicit.writes), (0, 0));
+        // VALU implicit state.
+        let nop = inst(&[0x7e00_0000]);
+        assert!(nop.effects.defs.is_empty() && nop.effects.uses.is_empty() && nop.operands.is_empty());
+        assert_eq!((nop.effects.implicit.reads, nop.effects.implicit.writes), (0, 0));
+        let subb = inst(&[0x4202_0b02]); // v_sub_co_ci_u32_e32 v1, vcc_lo, v2, v5, vcc_lo
+        assert_eq!((subb.effects.implicit.reads, subb.effects.implicit.writes), (ImplicitSet::VCC, ImplicitSet::VCC));
+        let cmp = inst(&[0x7cb6_0602]); // v_cmp_le_u64_e32 vcc_lo, s[2:3], v[3:4]
+        assert_eq!((cmp.effects.implicit.reads, cmp.effects.implicit.writes), (0, ImplicitSet::VCC));
+        assert!(cmp.effects.defs.is_empty());
+        assert!(cmp.effects.uses.contains(&s(2, 2)) && cmp.effects.uses.contains(&v(3, 2)));
+        for words in [&[0x7d8c_0501u32][..], &[0xd4db_007e, 0x0202_0610]] { // v_cmpx_ge_i32_e32, v_cmpx_le_u64_e64
+            let cmpx = inst(words);
+            assert_eq!((cmpx.effects.implicit.reads, cmpx.effects.implicit.writes), (0, ImplicitSet::EXEC));
+            assert!(cmpx.effects.defs.is_empty());
+        }
+        let subrev = inst(&[0xd702_0102, 0x0202_0f09]); // v_subrev_co_u32 v2, s1, v9, v7
+        assert!(subrev.effects.defs.contains(&v(2, 1)) && subrev.effects.defs.contains(&s(1, 2)));
+        // 16-bit destinations write one half and therefore read the old VGPR.
+        for words in [&[0x7e02_a302u32][..], &[0x6a02_0702], &[0xd535_0001, 0x0202_0702], &[0xd5d1_0001, 0x0201_0102], &[0xd705_0001, 0x0202_0702]] {
+            let half = inst(words);
+            assert_eq!(half.effects.defs.as_slice(), &[v(1, 1)], "{words:08x?}");
+            assert!(half.effects.uses.contains(&v(1, 1)), "{words:08x?}");
+        }
+    }
+
+    /// Every declared don't-care / literal combination of the new rows roundtrips on its own sample.
+    #[test]
+    fn filled_rows_roundtrip_all_declared_dont_care_values() {
+        for &(name, words, ..) in NEW_ROWS {
+            let (inst, _) = decode(words).unwrap();
+            let row = isa::lookup(Arch::Gfx1201, inst.op, inst.form).unwrap();
+            for rule in row.fields.iter().filter(|r| r.class == FieldClass::Ignored) {
+                let Some(placement) = (match rule.name {
+                    "w0_extra" => Some((0, 0)), "w1_extra" | "vsrc_unused" => Some((1, 0)),
+                    "src2_unused" => Some((1, 18)), "src1_unused" => Some((1, 9)),
+                    _ => None,
+                }) else { continue };
+                for &allowed in &rule.allowed {
+                    let mut variant = words.to_vec();
+                    let mask = rule.mask << placement.1;
+                    variant[placement.0] = (variant[placement.0] & !mask) | (allowed << placement.1);
+                    let (decoded, used) = decode(&variant).unwrap_or_else(|e| panic!("{name} {variant:08x?}: {e}"));
+                    assert_eq!(used, variant.len(), "{name}");
+                    assert_eq!(encode(&decoded).unwrap().as_slice(), variant.as_slice(), "{name} {variant:08x?}");
+                }
+            }
         }
     }
 }

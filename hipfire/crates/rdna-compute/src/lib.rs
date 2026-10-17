@@ -7,7 +7,9 @@
 pub mod arch_caps;
 pub mod attention;
 pub mod cdna;
+pub mod code_object;
 mod compiler;
+pub mod compile_jobs;
 pub mod dflash_draft_fusion;
 pub mod dflash_gdn_pre;
 pub mod dflash_gdn_replay;
@@ -19,38 +21,75 @@ pub mod feature_flags;
 #[cfg(feature = "flash-attn-ck")]
 pub mod flash_attn_ck;
 pub mod flux_fused;
+pub mod gap_timing;
 pub mod gemm;
+mod gemm_fp8_verify;
+mod gemm_vt;
 mod packed_mq4;
 mod gemma4_ext;
 mod gemma4_ops;
 pub mod gemv;
 pub mod graph;
 pub mod grouped_ops;
+pub mod hc_row_fold;
 pub mod kernel_pack;
 pub mod kernel_registry;
-mod kernels;
+pub mod kernels;
 pub mod kv_slots;
 pub mod moe;
 pub mod mq_f16_producers;
 pub mod mq_f16_residual_producers;
+#[cfg(feature = "deltanet")]
+pub mod fn_gdn_dense;
 pub mod norm;
+pub mod pm_decode_twins;
+pub mod pm_xbatch;
+pub mod pm_mtp_gemm;
+pub mod lane_rows_pm;
+pub mod npu_trunk;
+pub mod verify_twins;
 pub mod page_pool;
 pub mod pool;
+pub mod prefill_invariant;
 pub mod profile;
 pub mod profile_rocprof;
 pub mod profiler;
 pub mod qwen35_fa_batch;
 pub mod rdna;
+pub mod railgun_check;
 pub mod replay;
+pub mod rope;
 pub mod sampling;
 pub mod scratch;
 pub mod select_regrid;
-pub use scratch::{Int4MmqPrepared, Int4MmqReservation, Int8MmqPrepared, Int8MmqReservation, Mq4v2Fp8Prepared};
+pub mod lane_gdn;
+pub mod lane_fa;
+pub mod draft_lane_conv;
+pub mod draft_lane_rows;
+pub mod sampled_rows_compact;
+pub mod dflash_sampled_accept;
+pub mod spec_sampling_cpu_ar;
+pub mod tape_copy;
+pub use scratch::{
+    Int4MmqDownPrepared, Int4MmqDownReservation, Int4MmqPrepared, Int4MmqReservation, Int8MmqPrepared,
+    Int8MmqReservation, Mq4v2Fp8Prepared,
+};
 pub use gemm::F2GdnTargets;
+pub use gemm_fp8_verify::{
+    fp8_verify_symbol, fp8_verify_tile, Fp8VerifyOp, Fp8VerifyReceipt, Fp8VerifyTarget, Fp8VerifyTile,
+    Fp8VerifyX,
+};
 pub mod slot_pool;
 pub mod tensor_ops;
 pub mod text_encoder;
+pub mod uma_memory;
 pub mod vae;
+pub mod trunk_mask;
+pub use trunk_mask::{
+    qwen4_trunk_iu4_route, Qwen4TrunkIu4Route, Qwen4TrunkMask, TrunkFamily, TrunkIu4Default,
+    TrunkIu4MaskSource, TRUNK_ALL_BITS, TRUNK_GDN_BITS, TRUNK_IU4_DEFAULT_KEY, TRUNK_IU4_ENV,
+    TRUNK_QSA_BITS,
+};
 
 pub use compiler::KernelCompiler;
 pub use dispatch::{
@@ -58,8 +97,10 @@ pub use dispatch::{
     GL_CB2, GL_CB3, GL_GROUP_SCALE_BYTES, GL_MQ2_GROUP_IDX_BYTES, GL_MQ3_GROUP_IDX_BYTES,
     LLOYD_MQ3_GROUP_BYTES, LLOYD_MQ4_GROUP_BYTES, MMQ_CURRENT_LAYER, MQ2G256V2_GROUP_BYTES,
     MQ3G256V2_GROUP_BYTES, MQ4C_GROUP_BYTES, MQ4G128V2_GROUP_BYTES, MQ4V2_GROUP_BYTES,
-    MQ5G256V2_GROUP_BYTES, MQ6G256V2_GROUP_BYTES,
+    MQ5G256V2_GROUP_BYTES, MQ6G256V2_GROUP_BYTES, VmmPrefixSet, VmmPrefixSpec, VmmResourceMove,
 };
+#[cfg(target_os = "linux")]
+pub use dispatch::{ExportedWeightAllocation, ImportedWeightAllocationDesc, EXPORT_WEIGHT_TAIL_PAD_BYTES};
 pub use feature_flags::FeatureFlags;
 pub use hip_bridge::{HipError, HipResult};
 use hipfire_config::developer_bool;

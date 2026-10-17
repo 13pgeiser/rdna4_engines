@@ -21,6 +21,79 @@ use rdna_compute::DType;
 use rdna_compute::Gpu;
 use rdna_compute::GpuTensor;
 
+/// Refuse the author-disclosed native-MTP verify corruption, not AR or graded MQ4/MQ6.
+/// Call only after a native head resolves and higher-priority drafters decline.
+pub fn native_mtp_refusal(
+    layers: &[LayerWeights],
+    arch: &str,
+    fp16_disabled: bool,
+) -> Option<&'static str> {
+    let dtypes = layers.iter().filter_map(|layer| match layer {
+        LayerWeights::DeltaNetMoe(layer) => Some(&layer.ffn),
+        LayerWeights::FullAttnMoe(layer) => Some(&layer.ffn),
+        _ => None,
+    }).flat_map(|ffn| {
+        // Prefer the loaded tensors. Paged/EP layers retain full-model dtype
+        // metadata in their immutable execution plan even without local tensors.
+        ffn.experts.iter()
+            .filter(move |_| ffn.global_expert_dtypes.is_none())
+            .map(|expert| (expert.gate_up.gpu_dtype, expert.down.gpu_dtype))
+            .chain(ffn.expert_execution_plan.experts().iter()
+                .filter(move |_| ffn.experts.is_empty() || ffn.global_expert_dtypes.is_some())
+                .map(|expert| (expert.gate.dtype, expert.down.dtype)))
+    });
+    native_mtp_uniform_mq6_refused(arch, fp16_disabled, dtypes).then_some(
+        "native MTP refused: uniform MQ6/qt15 routed experts with gfx12 FP16 WMMA \
+         corrupt verify windows; use --spec off / speculation.mtp=off or HIPFIRE_FP16=0",
+    )
+}
+
+fn native_mtp_uniform_mq6_refused(
+    arch: &str,
+    fp16_disabled: bool,
+    experts: impl IntoIterator<Item = (DType, DType)>,
+) -> bool {
+    if fp16_disabled || !matches!(arch, "gfx1200" | "gfx1201") {
+        return false;
+    }
+    let mut nonempty = false;
+    for (gate_up, down) in experts {
+        nonempty = true;
+        if gate_up != DType::MQ6G256 || down != DType::MQ6G256 {
+            return false;
+        }
+    }
+    nonempty
+}
+
+#[cfg(test)]
+mod native_mtp_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn native_mtp_uniform_mq6_truth_table() {
+        let mq6 = (DType::MQ6G256, DType::MQ6G256);
+        for arch in ["gfx1200", "gfx1201"] {
+            assert!(native_mtp_uniform_mq6_refused(arch, false, [mq6; 2]));
+            assert!(!native_mtp_uniform_mq6_refused(arch, true, [mq6]));
+            assert!(!native_mtp_uniform_mq6_refused(arch, false, []));
+            assert!(!native_mtp_uniform_mq6_refused(
+                arch, false, [mq6, (DType::MQ4G256, DType::MQ6G256)],
+            ));
+            assert!(!native_mtp_uniform_mq6_refused(
+                arch, false, [(DType::MQ6G256, DType::MQ4G256)],
+            ));
+            assert!(!native_mtp_uniform_mq6_refused(
+                arch, false, [(DType::MQ6G256V2, DType::MQ6G256V2)],
+            ));
+            assert!(native_mtp_refusal(&[], arch, false).is_none());
+        }
+        for arch in ["gfx1151", "gfx1100", "gfx942"] {
+            assert!(!native_mtp_uniform_mq6_refused(arch, false, [mq6]));
+        }
+    }
+}
+
 // ─── Weight structs ─────────────────────────────────────────────────────
 
 /// Weights for a DeltaNet (linear attention) layer.
@@ -126,15 +199,35 @@ pub(crate) fn bind_live_expert_cache(
         .map_err(HipError::from)
 }
 
-/// Owning storage for a layer's packed uniform-MQ4 routed experts.
+/// Owning storage for a layer's packed routed experts.
 ///
-/// `experts` still carries one [`WeightTensor`] view per routed expert so the
-/// CPU fallback and every existing indexed dispatch keep their exact metadata
-/// and pointer-table ABI. Those views are non-owning subranges of these two
-/// buffers; only this owner pair may be returned to the GPU pool.
+/// Uniform raw layers pack into exactly one bucket per projection
+/// (`gate_up.len() == down.len() == 1`); graded (mixed-dtype) host layers
+/// pack one blob per distinct `(gate_up, down)` tag bucket. `experts` still
+/// carries one [`WeightTensor`] view per routed expert so the CPU fallback
+/// and every existing indexed dispatch keep their exact metadata and
+/// pointer-table ABI. Those views are non-owning subranges of these buffers;
+/// only these owner vecs may be returned to the GPU pool.
 pub(crate) struct PackedExpertOwners {
-    pub(crate) gate_up: GpuTensor,
-    pub(crate) down: GpuTensor,
+    pub(crate) gate_up: Vec<GpuTensor>,
+    pub(crate) down: Vec<GpuTensor>,
+}
+
+impl PackedExpertOwners {
+    /// Uniform packing has one owner per projection; graded packing creates
+    /// only host-mapped buckets. Residency is therefore uniform within each
+    /// projection, and its first owner is authoritative even when every expert
+    /// tensor is a non-owning subrange.
+    pub(crate) fn host_mapped_projections(&self) -> (bool, bool) {
+        (
+            self.gate_up
+                .first()
+                .is_some_and(|owner| owner.buf.is_host_mapped()),
+            self.down
+                .first()
+                .is_some_and(|owner| owner.buf.is_host_mapped()),
+        )
+    }
 }
 
 /// SP2: build the per-expert (gate_up, down) quant-tier tables that
@@ -239,6 +332,7 @@ pub(crate) fn dtype_from_quant_type(qt: u8) -> HipResult<DType> {
         19 => Ok(DType::MQ2G256Lloyd),
         20 => Ok(DType::MQ3G256Lloyd),
         30 => Ok(DType::MQ4G256Lloyd),
+        31 => Ok(DType::MQ5G256),
         34 => Ok(DType::MFP4G32E8),
         36 => Ok(DType::MFP3G32E8),
         38 => Ok(DType::MQ2G256GL),
@@ -305,6 +399,58 @@ pub(crate) struct MoeExpertSourceRecord {
     pub(crate) gate: Option<MoeProjectionSource>,
     pub(crate) up: Option<MoeProjectionSource>,
     pub(crate) down: MoeProjectionSource,
+}
+
+/// One-shot trace of the routed-expert arm's inputs, under `HIPFIRE_LOAD_TRACE=1`.
+///
+/// The arm the shared dispatch chooses depends on these values, and the
+/// selection code is not in this crate, so logging them is the only way to see
+/// which arm a given model takes. Fires once per stage per process.
+pub(crate) fn trace_moe_arm(
+    stage: &str,
+    routed_gate_up: DType,
+    routed_down: DType,
+    all_gate_up_mq4: bool,
+    host_mapped_experts: bool,
+    has_tier_tags: bool,
+) {
+    use std::sync::Once;
+    static PREFILL: Once = Once::new();
+    static DECODE: Once = Once::new();
+    // Gated on the developer env var directly: this used to call the load-trace
+    // helper that shipped with PR #814, which this branch no longer carries. The
+    // diagnostic itself is unchanged.
+    if hipfire_config::developer_var("HIPFIRE_LOAD_TRACE").is_err() {
+        return;
+    }
+    let once = if stage == "prefill" {
+        &PREFILL
+    } else {
+        &DECODE
+    };
+    once.call_once(|| {
+        eprintln!(
+            "[moe-arm] {stage}: routed_gate_up={routed_gate_up:?} routed_down={routed_down:?} \
+             all_gate_up_mq4={all_gate_up_mq4} expert_tier_tags={has_tier_tags} \
+             experts_host_mapped={host_mapped_experts}"
+        );
+    });
+}
+
+/// True when `name` is one of a layer's *routed-expert* weight tensors — the
+/// tensors `memory.moe_expert_budget` may move to host RAM.
+///
+/// Name knowledge stays in the arch: the shared `hipfire_runtime::offload`
+/// module never parses tensor names, it only consumes the byte census this
+/// classifier feeds.
+///
+/// Deliberately excludes the router (`mlp.gate.weight`), the shared expert
+/// (`mlp.shared_expert.*`), `mlp.shared_expert_gate` and the AWQ sidecars
+/// (`*.awq_scale.weight`): those stay with the layer, whose own residency
+/// decides their placement.
+pub(crate) fn is_routed_expert_weight(name: &str) -> bool {
+    name.contains(".mlp.experts.")
+        && (name.ends_with(".gate_up_proj.weight") || name.ends_with(".down_proj.weight"))
 }
 
 fn source_metadata(
@@ -1208,6 +1354,19 @@ pub struct MoeFfnWeights {
     /// kernel's output so the indexed MoE GEMV can stay capture-safe.
     pub expert_gate_up_ptrs: GpuTensor, // [num_experts * 2] f32 slots = num_experts × u64
     pub expert_down_ptrs: GpuTensor,      // [num_experts * 2] f32 slots = num_experts × u64
+    /// `memory.offload_exec=cpu` armed the host-side routed-expert splice on this
+    /// host-placed packed layer (`HIPFIRE_MOE_CPU_EXPERTS=0` is the kill-switch).
+    /// Single-token decode and the narrow (`<= 4`-row) batched forwards that
+    /// share its target arithmetic (the speculative verify and its accepted-
+    /// prefix rollback replay) defer the routed FFN to
+    /// [`hipfire_dispatch::cpu_exec::moe_cpu_experts`], which recomputes it from
+    /// the intact host blobs and accumulates it into the residual; the sealed
+    /// program then skips the routed GPU stages. Ordinary prompt prefill keeps
+    /// the real expert tables and the GPU grouped PCIe read — the CPU expert FFN
+    /// is compute-bound and loses to it by >10x at chunk sizes (measured 15x on
+    /// ornith/gfx1201), so `memory.offload_exec=cpu` applies to decode and narrow
+    /// verify only, matching llama.cpp's per-op batch routing.
+    pub(crate) cpu_deferred_experts: bool,
 
     /// Route A MoE-AWQ: per-expert down `awq_scale` pointer table
     /// (`[num_experts * 2]` f32 = num_experts × u64). `Some` only when the
@@ -1707,6 +1866,12 @@ pub struct WeightTensorDescriptor {
     pub buf: GpuTensorDescriptor,
     pub awq_scale: Option<GpuTensorDescriptor>,
     pub paro: Option<ParoDescriptor>,
+    /// MQ4G256V2-Lloyd centered codebook LUTs (host values). All three are
+    /// `Some` for a Lloyd tensor and are part of the seal: a missing LUT must
+    /// never silently decode on the uniform grid.
+    pub lloyd_lut_e4m3: Option<[u32; 4]>,
+    pub lloyd_lut_f16: Option<[u32; 8]>,
+    pub lloyd_lut_c16: Option<[u32; 4]>,
 }
 
 impl WeightTensorDescriptor {
@@ -1726,6 +1891,9 @@ impl WeightTensorDescriptor {
                 theta: GpuTensorDescriptor::from_tensor(&p.theta),
                 channel_scales: GpuTensorDescriptor::from_tensor(&p.channel_scales),
             }),
+            lloyd_lut_e4m3: w.lloyd_lut_e4m3,
+            lloyd_lut_f16: w.lloyd_lut_f16,
+            lloyd_lut_c16: w.lloyd_lut_c16,
         }
     }
 }
@@ -2073,6 +2241,20 @@ pub struct Qwen35Weights {
 }
 
 impl Qwen35Weights {
+    /// True when the loaded placement defers at least one layer's routed MoE FFN
+    /// to the CPU splice (`memory.offload_exec=cpu` on a host-placed packed
+    /// layer). Resolved placement state read from the loaded weights — the
+    /// per-layer `cpu_deferred_experts` flag armed at load — not a configuration
+    /// intent. Fully resident, PCIe grouped-read, and dense CPU loads report
+    /// false. Native MTP admission uses this as a cross-crate capability query.
+    pub fn has_cpu_deferred_experts(&self) -> bool {
+        self.layers.iter().any(|layer| match layer {
+            LayerWeights::DeltaNetMoe(l) => l.ffn.cpu_deferred_experts,
+            LayerWeights::FullAttnMoe(l) => l.ffn.cpu_deferred_experts,
+            _ => false,
+        })
+    }
+
     /// Return all GPU buffers to the pool (drained on unload). Consumes self.
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.token_embd);
@@ -2232,6 +2414,506 @@ impl Qwen35Weights {
     }
 }
 
+// ─── Dense typed traversal, validation and hydration (shared weights) ────
+//
+// Canonical role names (unique, deterministic; traversal order is the order
+// below, NOT lexicographic):
+//   `token_embd`, `output_norm`, then the `output` weight, then per layer
+//   `layers.{i:04}.<field>`.
+// A plain tensor field (norms, `a_log`, `dt_bias`, `conv_weight`,
+// `norm_weight`) is its own role. A `WeightTensor` field `<w>` contributes
+// `<w>.buf`, then `<w>.awq_scale` (if present), then `<w>.paro.pairs`,
+// `<w>.paro.theta`, `<w>.paro.channel_scales` (if present). Lloyd LUTs are
+// host values and are carried by the seal descriptor, not by a tensor role.
+// A tied lm_head keeps its `output.buf` role: it is a non-owning view of
+// `token_embd` (`buf.is_borrowed()`), while `output.awq_scale` / `output.paro.*`
+// remain independent owners.
+
+fn dense_unsupported(what: &str) -> HipError {
+    HipError::new(0, &format!("qwen35 dense shared weights: {what}"))
+}
+
+type DenseVisit<'a> = &'a mut dyn FnMut(&str, &GpuTensor) -> HipResult<()>;
+type DenseVisitMut<'a> = &'a mut dyn FnMut(&str, &mut GpuTensor) -> HipResult<()>;
+
+fn visit_weight(prefix: &str, w: &WeightTensor, f: DenseVisit<'_>) -> HipResult<()> {
+    f(&format!("{prefix}.buf"), &w.buf)?;
+    if let Some(awq) = &w.awq_scale {
+        f(&format!("{prefix}.awq_scale"), awq)?;
+    }
+    if let Some(paro) = &w.paro {
+        f(&format!("{prefix}.paro.pairs"), &paro.pairs)?;
+        f(&format!("{prefix}.paro.theta"), &paro.theta)?;
+        f(&format!("{prefix}.paro.channel_scales"), &paro.channel_scales)?;
+    }
+    Ok(())
+}
+
+fn visit_weight_mut(prefix: &str, w: &mut WeightTensor, f: DenseVisitMut<'_>) -> HipResult<()> {
+    f(&format!("{prefix}.buf"), &mut w.buf)?;
+    if let Some(awq) = &mut w.awq_scale {
+        f(&format!("{prefix}.awq_scale"), awq)?;
+    }
+    if let Some(paro) = &mut w.paro {
+        f(&format!("{prefix}.paro.pairs"), &mut paro.pairs)?;
+        f(&format!("{prefix}.paro.theta"), &mut paro.theta)?;
+        f(&format!("{prefix}.paro.channel_scales"), &mut paro.channel_scales)?;
+    }
+    Ok(())
+}
+
+/// One definition of the dense per-layer field order, instantiated for the
+/// shared (`[&]`) and exclusive (`[&mut]`) traversals.
+macro_rules! walk_dense_layer {
+    ($layer:expr, $idx:expr, $f:ident, $weight:ident, [$($b:tt)+]) => {{
+        let p = format!("layers.{:04}", $idx);
+        match $layer {
+            LayerWeights::DeltaNet(l) => {
+                $f(&format!("{p}.attn_norm"), $($b)+ l.attn_norm)?;
+                $weight(&format!("{p}.wqkv"), $($b)+ l.wqkv, $f)?;
+                $weight(&format!("{p}.wz"), $($b)+ l.wz, $f)?;
+                $weight(&format!("{p}.w_alpha"), $($b)+ l.w_alpha, $f)?;
+                $weight(&format!("{p}.w_beta"), $($b)+ l.w_beta, $f)?;
+                $f(&format!("{p}.a_log"), $($b)+ l.a_log)?;
+                $f(&format!("{p}.dt_bias"), $($b)+ l.dt_bias)?;
+                $f(&format!("{p}.conv_weight"), $($b)+ l.conv_weight)?;
+                $f(&format!("{p}.norm_weight"), $($b)+ l.norm_weight)?;
+                $weight(&format!("{p}.wo"), $($b)+ l.wo, $f)?;
+                $f(&format!("{p}.ffn_norm"), $($b)+ l.ffn_norm)?;
+                $weight(&format!("{p}.w_gate"), $($b)+ l.w_gate, $f)?;
+                $weight(&format!("{p}.w_up"), $($b)+ l.w_up, $f)?;
+                $weight(&format!("{p}.w_down"), $($b)+ l.w_down, $f)?;
+            }
+            LayerWeights::FullAttn(l) => {
+                $f(&format!("{p}.attn_norm"), $($b)+ l.attn_norm)?;
+                $weight(&format!("{p}.wq"), $($b)+ l.wq, $f)?;
+                $weight(&format!("{p}.wk"), $($b)+ l.wk, $f)?;
+                $weight(&format!("{p}.wv"), $($b)+ l.wv, $f)?;
+                $weight(&format!("{p}.wo"), $($b)+ l.wo, $f)?;
+                $f(&format!("{p}.q_norm"), $($b)+ l.q_norm)?;
+                $f(&format!("{p}.k_norm"), $($b)+ l.k_norm)?;
+                $f(&format!("{p}.ffn_norm"), $($b)+ l.ffn_norm)?;
+                $weight(&format!("{p}.w_gate"), $($b)+ l.w_gate, $f)?;
+                $weight(&format!("{p}.w_up"), $($b)+ l.w_up, $f)?;
+                $weight(&format!("{p}.w_down"), $($b)+ l.w_down, $f)?;
+            }
+            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => {
+                return Err(dense_unsupported(&format!("layer {} is MoE", $idx)));
+            }
+        }
+    }};
+}
+
+/// A hydration failure. `acquired` holds every tensor the supplier had
+/// already handed over (role, tensor), including a tensor rejected for not
+/// matching its descriptor, so the caller can return it to its own pool.
+/// Hydration itself performs no GPU work and frees nothing.
+pub struct Qwen35DenseHydrateError {
+    pub error: HipError,
+    pub acquired: Vec<(String, GpuTensor)>,
+}
+
+impl std::fmt::Debug for Qwen35DenseHydrateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Qwen35DenseHydrateError")
+            .field("error", &self.error)
+            .field(
+                "acquired_roles",
+                &self.acquired.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl std::fmt::Display for Qwen35DenseHydrateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ({} tensor(s) acquired before failure)",
+            self.error,
+            self.acquired.len()
+        )
+    }
+}
+
+impl std::error::Error for Qwen35DenseHydrateError {}
+
+fn placeholder_tensor(d: &GpuTensorDescriptor) -> GpuTensor {
+    GpuTensor {
+        // Non-owning null view sized to the descriptor; replaced by hydration.
+        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut(), d.byte_len) },
+        shape: d.shape.clone(),
+        dtype: d.dtype,
+    }
+}
+
+fn placeholder_weight(d: &WeightTensorDescriptor) -> WeightTensor {
+    WeightTensor {
+        buf: placeholder_tensor(&d.buf),
+        gpu_dtype: d.gpu_dtype,
+        m: d.m,
+        k: d.k,
+        row_stride: d.row_stride,
+        paro: d
+            .paro
+            .as_ref()
+            .map(|p| hipfire_runtime::llama::ParoRotation {
+                pairs: placeholder_tensor(&p.pairs),
+                theta: placeholder_tensor(&p.theta),
+                channel_scales: placeholder_tensor(&p.channel_scales),
+                krot: p.krot,
+                group_size: p.group_size,
+                is_alias: p.is_alias,
+            }),
+        awq_scale: d.awq_scale.as_ref().map(placeholder_tensor),
+        lloyd_lut_e4m3: d.lloyd_lut_e4m3,
+        lloyd_lut_f16: d.lloyd_lut_f16,
+        lloyd_lut_c16: d.lloyd_lut_c16,
+    }
+}
+
+fn validate_dense_weight_descriptor(role: &str, d: &WeightTensorDescriptor) -> HipResult<()> {
+    let luts = d.lloyd_lut_e4m3.is_some() as u8
+        + d.lloyd_lut_f16.is_some() as u8
+        + d.lloyd_lut_c16.is_some() as u8;
+    if luts != 0 && luts != 3 {
+        return Err(dense_unsupported(&format!(
+            "{role}: Lloyd LUT descriptor is partial ({luts} of 3 arrays)"
+        )));
+    }
+    if d.gpu_dtype == DType::MQ4G256V2Lloyd && luts != 3 {
+        return Err(dense_unsupported(&format!(
+            "{role}: MQ4G256V2Lloyd weight is missing its codebook LUTs"
+        )));
+    }
+    if d.paro.as_ref().is_some_and(|p| p.is_alias) {
+        return Err(dense_unsupported(&format!(
+            "{role}: aliased Paro sidecars are not dense-owned"
+        )));
+    }
+    Ok(())
+}
+
+impl Qwen35RankSeal {
+    /// Dense-only seal check: rejects MoE layers, expert metadata, pager and
+    /// MQ6-MoE flags, partial/missing Lloyd LUTs and aliased Paro sidecars,
+    /// and requires a tied `output.buf` descriptor to equal `token_embd`'s.
+    pub fn validate_dense(&self) -> HipResult<()> {
+        if self.has_pager {
+            return Err(dense_unsupported("weight pager is not supported"));
+        }
+        if self.moe_has_mq6 {
+            return Err(dense_unsupported("MoE MQ6 models are not supported"));
+        }
+        if self.global_expert_dtypes.iter().any(|v| !v.is_empty())
+            || self.local_expert_descriptors.iter().any(|v| !v.is_empty())
+        {
+            return Err(dense_unsupported("expert/EP metadata is not supported"));
+        }
+        if self.lm_head_aliases_embd && self.output.buf != self.token_embd {
+            return Err(dense_unsupported(
+                "tied output.buf descriptor differs from token_embd",
+            ));
+        }
+        validate_dense_weight_descriptor("output", &self.output)?;
+        for (i, layer) in self.layer_seals.iter().enumerate() {
+            let check = |name: &str, d: &WeightTensorDescriptor| {
+                validate_dense_weight_descriptor(&format!("layers.{i:04}.{name}"), d)
+            };
+            match layer {
+                Qwen35LayerSeal::DeltaNet {
+                    wqkv,
+                    wz,
+                    w_alpha,
+                    w_beta,
+                    wo,
+                    w_gate,
+                    w_up,
+                    w_down,
+                    ..
+                } => {
+                    check("wqkv", wqkv)?;
+                    check("wz", wz)?;
+                    check("w_alpha", w_alpha)?;
+                    check("w_beta", w_beta)?;
+                    check("wo", wo)?;
+                    check("w_gate", w_gate)?;
+                    check("w_up", w_up)?;
+                    check("w_down", w_down)?;
+                }
+                Qwen35LayerSeal::FullAttn {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    w_gate,
+                    w_up,
+                    w_down,
+                    ..
+                } => {
+                    check("wq", wq)?;
+                    check("wk", wk)?;
+                    check("wv", wv)?;
+                    check("wo", wo)?;
+                    check("w_gate", w_gate)?;
+                    check("w_up", w_up)?;
+                    check("w_down", w_down)?;
+                }
+                Qwen35LayerSeal::DeltaNetMoe { .. } | Qwen35LayerSeal::FullAttnMoe { .. } => {
+                    return Err(dense_unsupported(&format!("layer {i} is MoE")));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validated dense seal of `weights` (single rank, no expert map).
+    pub fn capture_dense(weights: &Qwen35Weights) -> HipResult<Self> {
+        weights.validated_dense_seal()
+    }
+}
+
+impl Qwen35Weights {
+    fn require_dense_structure(&self) -> HipResult<()> {
+        if self.pager.is_some() {
+            return Err(dense_unsupported("weight pager is not supported"));
+        }
+        if self.ep_shard.is_some() {
+            return Err(dense_unsupported("EP shards are not supported"));
+        }
+        if self.moe_has_mq6 {
+            return Err(dense_unsupported("MoE MQ6 models are not supported"));
+        }
+        for (i, layer) in self.layers.iter().enumerate() {
+            if !matches!(layer, LayerWeights::DeltaNet(_) | LayerWeights::FullAttn(_)) {
+                return Err(dense_unsupported(&format!("layer {i} is MoE")));
+            }
+        }
+        Ok(())
+    }
+
+    fn walk_dense(&self, f: DenseVisit<'_>) -> HipResult<()> {
+        self.require_dense_structure()?;
+        f("token_embd", &self.token_embd)?;
+        f("output_norm", &self.output_norm)?;
+        visit_weight("output", &self.output, f)?;
+        for (i, layer) in self.layers.iter().enumerate() {
+            walk_dense_layer!(layer, i, f, visit_weight, [&]);
+        }
+        Ok(())
+    }
+
+    fn walk_dense_mut(&mut self, f: DenseVisitMut<'_>) -> HipResult<()> {
+        self.require_dense_structure()?;
+        f("token_embd", &mut self.token_embd)?;
+        f("output_norm", &mut self.output_norm)?;
+        visit_weight_mut("output", &mut self.output, f)?;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            walk_dense_layer!(layer, i, f, visit_weight_mut, [&mut]);
+        }
+        Ok(())
+    }
+
+    fn validated_dense_seal(&self) -> HipResult<Qwen35RankSeal> {
+        self.require_dense_structure()?;
+        let seal = Qwen35RankSeal::capture(self, None, 0);
+        seal.validate_dense()?;
+        let tied = self.lm_head_aliases_embd;
+        let mut owners = std::collections::HashSet::new();
+        self.walk_dense(&mut |role, t| {
+            if tied && role == "output.buf" {
+                if !t.buf.is_borrowed()
+                    || t.buf.as_ptr() != self.token_embd.buf.as_ptr()
+                    || t.buf.size() != self.token_embd.buf.size()
+                {
+                    return Err(dense_unsupported(
+                        "tied output.buf is not a borrowed view of token_embd",
+                    ));
+                }
+                return Ok(());
+            }
+            if t.buf.is_borrowed() || t.buf.is_host_mapped() {
+                return Err(dense_unsupported(&format!(
+                    "{role}: not a unique GPU-allocation owner (borrowed or host-mapped)"
+                )));
+            }
+            let ptr = t.buf.as_ptr() as usize;
+            if ptr != 0 && !owners.insert(ptr) {
+                return Err(dense_unsupported(&format!(
+                    "{role}: owner pointer is shared with another tensor role"
+                )));
+            }
+            Ok(())
+        })?;
+        Ok(seal)
+    }
+
+    /// Full dense validation: structure (no MoE/pager/EP/MQ6), seal-level
+    /// descriptor rules (complete Lloyd LUTs, no aliased Paro), and ownership
+    /// (every role is a unique non-borrowed, non-host-mapped owner; a tied
+    /// `output.buf` is a borrowed view of `token_embd`).
+    pub fn validate_dense(&self) -> HipResult<()> {
+        self.validated_dense_seal().map(|_| ())
+    }
+
+    /// Visit every dense GPU tensor in canonical role order after
+    /// [`validate_dense`](Self::validate_dense). A tied `output.buf` is
+    /// visited too; recognize it with `buf.is_borrowed()`.
+    pub fn for_each_dense_tensor(
+        &self,
+        f: &mut dyn FnMut(&str, &GpuTensor) -> HipResult<()>,
+    ) -> HipResult<()> {
+        self.validate_dense()?;
+        self.walk_dense(f)
+    }
+
+    /// Exclusive-access twin of
+    /// [`for_each_dense_tensor`](Self::for_each_dense_tensor); same roles and
+    /// order, so a caller can rebind every slot (owners and aliases).
+    pub fn for_each_dense_tensor_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut GpuTensor) -> HipResult<()>,
+    ) -> HipResult<()> {
+        self.validate_dense()?;
+        self.walk_dense_mut(f)
+    }
+
+    /// Rebuild complete dense weights from a seal. `take(role, descriptor)`
+    /// is called once per owner role in canonical order (never for a tied
+    /// `output.buf`, which becomes a view of `token_embd`) and must return a
+    /// tensor whose descriptor equals the sealed one. Hydration allocates
+    /// nothing and frees nothing; on failure every tensor already supplied is
+    /// returned in [`Qwen35DenseHydrateError::acquired`].
+    pub fn from_dense_seal(
+        seal: &Qwen35RankSeal,
+        take: &mut dyn FnMut(&str, &GpuTensorDescriptor) -> HipResult<GpuTensor>,
+    ) -> Result<Self, Qwen35DenseHydrateError> {
+        let fail = |error: HipError, acquired: Vec<(String, GpuTensor)>| {
+            Qwen35DenseHydrateError { error, acquired }
+        };
+        seal.validate_dense().map_err(|e| fail(e, Vec::new()))?;
+        let mut layers = Vec::with_capacity(seal.layer_seals.len());
+        for layer in &seal.layer_seals {
+            layers.push(match layer {
+                Qwen35LayerSeal::DeltaNet {
+                    attn_norm,
+                    wqkv,
+                    wz,
+                    w_alpha,
+                    w_beta,
+                    a_log,
+                    dt_bias,
+                    conv_weight,
+                    norm_weight,
+                    wo,
+                    ffn_norm,
+                    w_gate,
+                    w_up,
+                    w_down,
+                } => LayerWeights::DeltaNet(DeltaNetLayerWeights {
+                    attn_norm: placeholder_tensor(attn_norm),
+                    wqkv: placeholder_weight(wqkv),
+                    wz: placeholder_weight(wz),
+                    w_alpha: placeholder_weight(w_alpha),
+                    w_beta: placeholder_weight(w_beta),
+                    a_log: placeholder_tensor(a_log),
+                    dt_bias: placeholder_tensor(dt_bias),
+                    conv_weight: placeholder_tensor(conv_weight),
+                    norm_weight: placeholder_tensor(norm_weight),
+                    wo: placeholder_weight(wo),
+                    ffn_norm: placeholder_tensor(ffn_norm),
+                    w_gate: placeholder_weight(w_gate),
+                    w_up: placeholder_weight(w_up),
+                    w_down: placeholder_weight(w_down),
+                }),
+                Qwen35LayerSeal::FullAttn {
+                    attn_norm,
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    q_norm,
+                    k_norm,
+                    ffn_norm,
+                    w_gate,
+                    w_up,
+                    w_down,
+                } => LayerWeights::FullAttn(FullAttnLayerWeights {
+                    attn_norm: placeholder_tensor(attn_norm),
+                    wq: placeholder_weight(wq),
+                    wk: placeholder_weight(wk),
+                    wv: placeholder_weight(wv),
+                    wo: placeholder_weight(wo),
+                    q_norm: placeholder_tensor(q_norm),
+                    k_norm: placeholder_tensor(k_norm),
+                    ffn_norm: placeholder_tensor(ffn_norm),
+                    w_gate: placeholder_weight(w_gate),
+                    w_up: placeholder_weight(w_up),
+                    w_down: placeholder_weight(w_down),
+                }),
+                Qwen35LayerSeal::DeltaNetMoe { .. } | Qwen35LayerSeal::FullAttnMoe { .. } => {
+                    return Err(fail(dense_unsupported("MoE layer seal"), Vec::new()));
+                }
+            });
+        }
+        // Descriptor-exact skeleton: every tensor slot is a null non-owning
+        // placeholder until its role is supplied. Role names come only from
+        // the traversal below, so supply and assembly cannot disagree.
+        let mut weights = Qwen35Weights {
+            token_embd: placeholder_tensor(&seal.token_embd),
+            embd_format: seal.embd_format,
+            output_norm: placeholder_tensor(&seal.output_norm),
+            output: placeholder_weight(&seal.output),
+            layers,
+            moe_has_mq6: false,
+            pager: None,
+            lm_head_aliases_embd: seal.lm_head_aliases_embd,
+            ep_shard: None,
+        };
+        let tied = seal.lm_head_aliases_embd;
+        let mut acquired: Vec<(String, GpuTensor)> = Vec::new();
+        let supplied = weights.walk_dense(&mut |role, slot| {
+            if tied && role == "output.buf" {
+                return Ok(());
+            }
+            let desc = GpuTensorDescriptor::from_tensor(slot);
+            let tensor = take(role, &desc)?;
+            let matches = GpuTensorDescriptor::from_tensor(&tensor) == desc;
+            acquired.push((role.to_string(), tensor));
+            if matches {
+                Ok(())
+            } else {
+                Err(dense_unsupported(&format!(
+                    "{role}: supplied tensor does not match its sealed descriptor"
+                )))
+            }
+        });
+        if let Err(error) = supplied {
+            return Err(fail(error, acquired));
+        }
+        let mut table: std::collections::HashMap<String, GpuTensor> = acquired.into_iter().collect();
+        let assembled = weights.walk_dense_mut(&mut |role, slot| {
+            if tied && role == "output.buf" {
+                return Ok(());
+            }
+            match table.remove(role) {
+                Some(tensor) => {
+                    *slot = tensor;
+                    Ok(())
+                }
+                None => Err(dense_unsupported(&format!("{role}: no supplied tensor"))),
+            }
+        });
+        if let Err(error) = assembled {
+            return Err(fail(error, table.into_iter().collect()));
+        }
+        if tied {
+            weights.output.buf = weights.token_embd.shallow_clone();
+        }
+        Ok(weights)
+    }
+}
+
 impl MmqScreenable for Qwen35Weights {
     fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize) {
         let (mut safe, mut unsafe_count) = (0usize, 0usize);
@@ -2368,8 +3050,9 @@ pub(crate) fn free_moe_ffn_with(ffn: MoeFfnWeights, free: &mut impl FnMut(GpuTen
             free_weight_metadata_with(e.gate_up, free);
             free_weight_metadata_with(e.down, free);
         }
-        free(owners.gate_up);
-        free(owners.down);
+        for owner in owners.gate_up.into_iter().chain(owners.down) {
+            free(owner);
+        }
     } else {
         for e in ffn.experts {
             free_weight_with(e.gate_up, free);
@@ -2627,8 +3310,16 @@ impl DeltaNetState {
 
     /// Free all GPU tensors. Call before drop to return VRAM.
     pub fn free_gpu(self, gpu: &mut Gpu) {
+        // Q8/Q4 S matrices are direct `hip.malloc` allocations (never drawn
+        // from the pool): return them to HIP, or every retired state would
+        // park its S bytes on a pool free list nothing allocates from.
+        let direct = matches!(self.quant, StateQuant::Q8 | StateQuant::Q4);
         for t in self.s_matrices {
-            let _ = gpu.free_tensor(t);
+            if direct {
+                let _ = gpu.hip.free(t.buf);
+            } else {
+                let _ = gpu.free_tensor(t);
+            }
         }
         for t in self.s_scales {
             let _ = gpu.free_tensor(t);
@@ -2810,6 +3501,180 @@ impl DeltaNetState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn metadata_weight(buf: GpuTensor) -> WeightTensor {
+        WeightTensor {
+            buf,
+            gpu_dtype: DType::F32,
+            m: 1,
+            k: 1,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
+        }
+    }
+
+    fn metadata_owner(storage: &mut [u8], host_mapped: bool) -> GpuTensor {
+        // Metadata-only ownership descriptors, following hip-bridge's owner-tag
+        // tests. The live backing storage permits sub_offset pointer arithmetic.
+        // Neither descriptor nor its views is dereferenced by HIP or freed.
+        let ptr = storage.as_mut_ptr().cast();
+        let buf = unsafe {
+            if host_mapped {
+                hip_bridge::DeviceBuffer::from_host_mapped(ptr, storage.len())
+            } else {
+                hip_bridge::DeviceBuffer::from_vmm_owner(ptr, storage.len())
+            }
+        };
+        GpuTensor {
+            buf,
+            shape: vec![storage.len()],
+            dtype: DType::Raw,
+        }
+    }
+
+    fn metadata_moe(
+        experts: Vec<ExpertWeights>,
+        packed_expert_owners: Option<PackedExpertOwners>,
+    ) -> MoeFfnWeights {
+        let (expert_execution_plan, expert_table, expert_binding) =
+            test_expert_binding().expect("test expert metadata");
+        MoeFfnWeights {
+            router: metadata_weight(GpuTensor::null_for_test()),
+            experts,
+            packed_expert_owners,
+            shared_expert: SharedExpertWeights {
+                gate: metadata_weight(GpuTensor::null_for_test()),
+                up: metadata_weight(GpuTensor::null_for_test()),
+                down: metadata_weight(GpuTensor::null_for_test()),
+            },
+            shared_expert_gate: metadata_weight(GpuTensor::null_for_test()),
+            expert_gate_up_ptrs: GpuTensor::null_for_test(),
+            expert_down_ptrs: GpuTensor::null_for_test(),
+            expert_down_awq_ptrs: None,
+            cpu_deferred_experts: false,
+            expert_dtype_tags: None,
+            layer_idx: 0,
+            expert_shape: None,
+            paro_shared: None,
+            global_expert_dtypes: None,
+            ep_dummy_buffers: Vec::new(),
+            ep_dummy_experts: Vec::new(),
+            retired_expert_weights: Vec::new(),
+            mixed_expert_gate_up_tiers: None,
+            mixed_expert_down_tiers: None,
+            expert_execution_plan,
+            expert_table,
+            expert_binding,
+        }
+    }
+
+    #[test]
+    fn packed_projection_residency_comes_from_owners_not_borrowed_views() {
+        use hipfire_dispatch::families::moe::RoutedExpertWeights;
+
+        for gate_host in [false, true] {
+            for down_host in [false, true] {
+                let mut gate_storage = [0u8; 16];
+                let mut down_storage = [0u8; 16];
+                let gate_owner = metadata_owner(&mut gate_storage, gate_host);
+                let down_owner = metadata_owner(&mut down_storage, down_host);
+                let expert = ExpertWeights {
+                    gate_up: metadata_weight(gate_owner.sub_offset(4, 4)),
+                    down: metadata_weight(down_owner.sub_offset(8, 4)),
+                };
+                let ffn = metadata_moe(
+                    vec![expert],
+                    Some(PackedExpertOwners {
+                        gate_up: vec![gate_owner],
+                        down: vec![down_owner],
+                    }),
+                );
+                let (gate, down) = ffn.get(0).expect("packed expert views");
+                assert!(gate.buf.buf.is_borrowed());
+                assert!(down.buf.buf.is_borrowed());
+                assert!(!gate.buf.buf.is_host_mapped());
+                assert!(!down.buf.buf.is_host_mapped());
+                assert_eq!(ffn.host_mapped_projections(), (gate_host, down_host));
+
+                // Without owner metadata, the generic adapter must not infer
+                // host residency merely because these same views are borrowed.
+                assert_eq!(
+                    ResidentExpertWeights(&ffn.experts).host_mapped_projections(),
+                    (false, false)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unpacked_projection_residency_uses_direct_owners_and_empty_fails_closed() {
+        use hipfire_dispatch::families::moe::RoutedExpertWeights;
+
+        for gate_host in [false, true] {
+            for down_host in [false, true] {
+                let mut gate_storage = [0u8; 16];
+                let mut down_storage = [0u8; 16];
+                let ffn = metadata_moe(
+                    vec![ExpertWeights {
+                        gate_up: metadata_weight(metadata_owner(&mut gate_storage, gate_host)),
+                        down: metadata_weight(metadata_owner(&mut down_storage, down_host)),
+                    }],
+                    None,
+                );
+                assert_eq!(ffn.host_mapped_projections(), (gate_host, down_host));
+                assert_eq!(
+                    ResidentExpertWeights(&ffn.experts).host_mapped_projections(),
+                    (gate_host, down_host)
+                );
+            }
+        }
+        assert_eq!(
+            metadata_moe(Vec::new(), None).host_mapped_projections(),
+            (false, false)
+        );
+        assert_eq!(
+            metadata_moe(
+                Vec::new(),
+                Some(PackedExpertOwners {
+                    gate_up: Vec::new(),
+                    down: Vec::new(),
+                }),
+            )
+            .host_mapped_projections(),
+            (false, false)
+        );
+    }
+
+    /// The classifier decides which tensors `memory.moe_expert_budget` may move,
+    /// so its accept/reject sets are the contract. Every spelling below is one
+    /// `qwen35_tensor_name_candidates` actually emits for the trunk.
+    #[test]
+    fn routed_expert_classifier_accepts_only_the_expert_projections() {
+        for accepted in [
+            "layers.0.mlp.experts.255.gate_up_proj.weight",
+            "model.language_model.layers.7.mlp.experts.0.down_proj.weight",
+            "model.layers.12.mlp.experts.3.gate_up_proj.weight",
+        ] {
+            assert!(is_routed_expert_weight(accepted), "{accepted}");
+        }
+        for rejected in [
+            "layers.0.mlp.gate.weight",
+            "layers.0.mlp.shared_expert.gate_proj.weight",
+            "layers.0.mlp.shared_expert.up_proj.weight",
+            "layers.0.mlp.shared_expert.down_proj.weight",
+            "layers.0.mlp.shared_expert_gate.weight",
+            "layers.0.mlp.experts.0.down_proj.awq_scale.weight",
+            "layers.0.mlp.experts.0.gate_up_proj.awq_scale.weight",
+            "layers.0.self_attn.q_proj.weight",
+            "layers.0.linear_attn.in_proj_qkv.weight",
+        ] {
+            assert!(!is_routed_expert_weight(rejected), "{rejected}");
+        }
+    }
     use rdna_compute::DType;
 
     #[test]
@@ -2987,5 +3852,269 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod dense_shared_tests {
+    use super::*;
+    use hipfire_runtime::llama::ParoRotation;
+    use std::collections::HashMap;
+
+    /// CPU-only fixture allocator: distinct fake VMM-owner pointers, never
+    /// dereferenced or freed.
+    struct Fake(usize);
+
+    impl Fake {
+        fn tensor(&mut self, shape: &[usize], dtype: DType, bytes: usize) -> GpuTensor {
+            let ptr = self.0;
+            self.0 += bytes.max(256).next_multiple_of(256);
+            GpuTensor {
+                buf: unsafe {
+                    hip_bridge::DeviceBuffer::from_vmm_owner(ptr as *mut std::ffi::c_void, bytes)
+                },
+                shape: shape.to_vec(),
+                dtype,
+            }
+        }
+
+        fn weight(&mut self, dtype: DType, m: usize, k: usize) -> WeightTensor {
+            WeightTensor {
+                buf: self.tensor(&[m * 8], DType::Raw, m * 8),
+                gpu_dtype: dtype,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
+            }
+        }
+
+        fn lloyd(&mut self, m: usize, k: usize) -> WeightTensor {
+            let mut w = self.weight(DType::MQ4G256V2Lloyd, m, k);
+            w.lloyd_lut_e4m3 = Some([1, 2, 3, 4]);
+            w.lloyd_lut_f16 = Some([1, 2, 3, 4, 5, 6, 7, 8]);
+            w.lloyd_lut_c16 = Some([5, 6, 7, 8]);
+            w
+        }
+    }
+
+    fn dense_fixture(tied: bool) -> Qwen35Weights {
+        let mut a = Fake(0x1000_0000);
+        let token_embd = a.tensor(&[16, 8], DType::F32, 512);
+        let mut output = if tied {
+            let mut w = a.weight(DType::F32, 16, 8);
+            w.buf = token_embd.shallow_clone();
+            w
+        } else {
+            a.lloyd(16, 8)
+        };
+        output.awq_scale = Some(a.tensor(&[8], DType::F16, 16));
+        let output_norm = a.tensor(&[8], DType::F32, 32);
+        let mut wz = a.weight(DType::ParoQ4G128, 4, 8);
+        wz.paro = Some(ParoRotation {
+            pairs: a.tensor(&[2, 8], DType::Raw, 32),
+            theta: a.tensor(&[2, 4], DType::F16, 16),
+            channel_scales: a.tensor(&[8], DType::F16, 16),
+            krot: 2,
+            group_size: 128,
+            is_alias: false,
+        });
+        let delta = DeltaNetLayerWeights {
+            attn_norm: a.tensor(&[8], DType::F32, 32),
+            wqkv: a.lloyd(12, 8),
+            wz,
+            w_alpha: a.weight(DType::MQ4G256, 2, 8),
+            w_beta: a.weight(DType::MQ4G256, 2, 8),
+            a_log: a.tensor(&[2], DType::F32, 8),
+            dt_bias: a.tensor(&[2], DType::F32, 8),
+            conv_weight: a.tensor(&[12, 1, 4], DType::F32, 192),
+            norm_weight: a.tensor(&[4], DType::F32, 16),
+            wo: a.weight(DType::MQ4G256, 8, 4),
+            ffn_norm: a.tensor(&[8], DType::F32, 32),
+            w_gate: a.weight(DType::MQ4G256, 16, 8),
+            w_up: a.weight(DType::MQ4G256, 16, 8),
+            w_down: a.weight(DType::MQ4G256, 8, 16),
+        };
+        let mut wq = a.weight(DType::MQ4G256, 8, 8);
+        wq.awq_scale = Some(a.tensor(&[8], DType::F16, 16));
+        let full = FullAttnLayerWeights {
+            attn_norm: a.tensor(&[8], DType::F32, 32),
+            wq,
+            wk: a.weight(DType::MQ4G256, 4, 8),
+            wv: a.weight(DType::MQ4G256, 4, 8),
+            wo: a.weight(DType::MQ4G256, 8, 8),
+            q_norm: a.tensor(&[4], DType::F32, 16),
+            k_norm: a.tensor(&[4], DType::F32, 16),
+            ffn_norm: a.tensor(&[8], DType::F32, 32),
+            w_gate: a.weight(DType::MQ4G256, 16, 8),
+            w_up: a.weight(DType::MQ4G256, 16, 8),
+            w_down: a.weight(DType::MQ4G256, 8, 16),
+        };
+        Qwen35Weights {
+            token_embd,
+            embd_format: EmbeddingFormat::F32,
+            output_norm,
+            output,
+            layers: vec![LayerWeights::DeltaNet(delta), LayerWeights::FullAttn(full)],
+            moe_has_mq6: false,
+            pager: None,
+            lm_head_aliases_embd: tied,
+            ep_shard: None,
+        }
+    }
+
+    fn roles(weights: &Qwen35Weights) -> Vec<String> {
+        let mut roles = Vec::new();
+        weights
+            .walk_dense(&mut |role, _| {
+                roles.push(role.to_string());
+                Ok(())
+            })
+            .expect("walk");
+        roles
+    }
+
+    fn supplier(weights: &Qwen35Weights) -> HashMap<String, GpuTensor> {
+        let mut table = HashMap::new();
+        weights
+            .for_each_dense_tensor(&mut |role, t| {
+                table.insert(role.to_string(), t.shallow_clone());
+                Ok(())
+            })
+            .expect("visit");
+        table
+    }
+
+    #[test]
+    fn dense_roles_are_unique_complete_and_mut_matches_ref() {
+        for tied in [false, true] {
+            let mut weights = dense_fixture(tied);
+            let ref_roles = roles(&weights);
+            let unique: std::collections::HashSet<_> = ref_roles.iter().collect();
+            assert_eq!(unique.len(), ref_roles.len());
+            assert_eq!(ref_roles[0], "token_embd");
+            assert!(ref_roles.iter().any(|r| r == "output.buf"));
+            assert!(ref_roles.iter().any(|r| r == "output.awq_scale"));
+            assert!(ref_roles.iter().any(|r| r == "layers.0000.wz.paro.theta"));
+            assert!(ref_roles.iter().any(|r| r == "layers.0001.wq.awq_scale"));
+            let mut mut_roles = Vec::new();
+            weights
+                .for_each_dense_tensor_mut(&mut |role, _| {
+                    mut_roles.push(role.to_string());
+                    Ok(())
+                })
+                .expect("mut visit");
+            assert_eq!(ref_roles, mut_roles);
+        }
+    }
+
+    #[test]
+    fn dense_seal_hydration_roundtrips_including_luts_and_tied_alias() {
+        for tied in [false, true] {
+            let weights = dense_fixture(tied);
+            let seal = Qwen35RankSeal::capture_dense(&weights).expect("seal");
+            if !tied {
+                assert!(seal.output.lloyd_lut_f16.is_some());
+            }
+            let mut table = supplier(&weights);
+            let mut requested = Vec::new();
+            let hydrated = Qwen35Weights::from_dense_seal(&seal, &mut |role, desc| {
+                requested.push(role.to_string());
+                let t = table
+                    .remove(role)
+                    .ok_or_else(|| HipError::new(0, "missing role"))?;
+                assert_eq!(&GpuTensorDescriptor::from_tensor(&t), desc);
+                Ok(t)
+            })
+            .expect("hydrate");
+            assert_eq!(
+                requested.iter().any(|r| r == "output.buf"),
+                !tied,
+                "tied output.buf must not be requested"
+            );
+            assert_eq!(roles(&hydrated), roles(&weights));
+            assert_eq!(Qwen35RankSeal::capture(&hydrated, None, 0), seal);
+            assert_eq!(hydrated.lm_head_aliases_embd, tied);
+            if tied {
+                assert_eq!(
+                    hydrated.output.buf.buf.as_ptr(),
+                    hydrated.token_embd.buf.as_ptr()
+                );
+                assert!(hydrated.output.awq_scale.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn dense_hydration_failure_returns_acquired_tensors() {
+        let weights = dense_fixture(false);
+        let seal = Qwen35RankSeal::capture_dense(&weights).expect("seal");
+        let mut table = supplier(&weights);
+        let mut calls = 0usize;
+        let err = Qwen35Weights::from_dense_seal(&seal, &mut |role, _| {
+            calls += 1;
+            if calls == 4 {
+                return Err(HipError::new(0, "supplier failed"));
+            }
+            Ok(table.remove(role).expect("role"))
+        })
+        .err()
+        .expect("must fail");
+        assert_eq!(err.acquired.len(), 3);
+
+        // A mismatching tensor is returned too.
+        let mut table = supplier(&weights);
+        let err = Qwen35Weights::from_dense_seal(&seal, &mut |role, _| {
+            let mut t = table.remove(role).expect("role");
+            if role == "output_norm" {
+                t.shape = vec![9];
+            }
+            Ok(t)
+        })
+        .err()
+        .expect("must fail");
+        assert_eq!(err.acquired.len(), 2);
+        assert_eq!(err.acquired[1].0, "output_norm");
+    }
+
+    #[test]
+    fn dense_validation_rejects_unsupported_and_ownership_violations() {
+        let mut weights = dense_fixture(false);
+        weights.moe_has_mq6 = true;
+        assert!(weights.validate_dense().is_err());
+
+        let mut weights = dense_fixture(false);
+        weights.output.lloyd_lut_c16 = None;
+        assert!(weights.validate_dense().is_err(), "partial LUT set");
+
+        let mut weights = dense_fixture(false);
+        weights.output.lloyd_lut_e4m3 = None;
+        weights.output.lloyd_lut_f16 = None;
+        weights.output.lloyd_lut_c16 = None;
+        assert!(weights.validate_dense().is_err(), "Lloyd dtype without LUTs");
+
+        let mut weights = dense_fixture(false);
+        weights.output_norm = weights.output_norm.shallow_clone();
+        assert!(weights.validate_dense().is_err(), "borrowed owner");
+
+        let mut weights = dense_fixture(false);
+        weights.output_norm.buf = unsafe {
+            hip_bridge::DeviceBuffer::from_vmm_owner(
+                weights.token_embd.buf.as_ptr(),
+                weights.output_norm.buf.size(),
+            )
+        };
+        assert!(weights.validate_dense().is_err(), "duplicate owner pointer");
+
+        let mut weights = dense_fixture(true);
+        weights.output.buf = weights.output_norm.shallow_clone();
+        assert!(weights.validate_dense().is_err(), "tied alias of wrong buffer");
+
+        assert!(dense_fixture(false).validate_dense().is_ok());
+        assert!(dense_fixture(true).validate_dense().is_ok());
     }
 }

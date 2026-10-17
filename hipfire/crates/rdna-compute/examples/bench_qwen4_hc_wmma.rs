@@ -26,8 +26,8 @@
 //!
 //! Run: cargo run --release --features lab --example bench_qwen4_hc_wmma -p rdna-compute
 //! `SHAPES=MxKxB,...` (projections), `READS=HIDDENxROWS,...`, `REPS=n`.
-//! On gfx1201 the route is opt-in: set `HIPFIRE_QWEN4_F16_WMMA_GFX1201=1`
-//! (the gfx1201 legs of the `gemm`/`tensor_ops` route unit tests need it too).
+//! On gfx1201 the route is on by default; `HIPFIRE_QWEN4_F16_WMMA_GFX1201=0`
+//! turns it off (the gfx1201 legs of the `gemm`/`tensor_ops` route unit tests need it on).
 
 use rdna_compute::gemm::LdsTileSplitK;
 use rdna_compute::tensor_ops::{hyper_read_up_fused, hyper_read_up_wmma, HyperReadUpFused};
@@ -245,7 +245,7 @@ fn reads(gpu: &mut Gpu, reps: usize) {
     }
 }
 
-/// `bm_bn_wm_wn_k64[_p][_sN]` -> tile.
+/// `bm_bn_wm_wn_k{32,64}[_p][_sN]` -> tile.
 fn tile_of(name: &str) -> LdsTileSplitK {
     let parts: Vec<&str> = name.split('_').collect();
     let n = |i: usize| parts[i].parse::<usize>().unwrap();
@@ -254,7 +254,8 @@ fn tile_of(name: &str) -> LdsTileSplitK {
         .iter()
         .find_map(|p| p.strip_prefix('s').and_then(|v| v.parse().ok()))
         .unwrap_or(1);
-    LdsTileSplitK::new(n(0), n(1), n(2), n(3), pipe, split)
+    let ks = parts[4].strip_prefix('k').and_then(|v| v.parse().ok()).unwrap_or(64);
+    LdsTileSplitK::new(n(0), n(1), n(2), n(3), pipe, split).k_stage(ks)
 }
 
 fn sweep(gpu: &mut Gpu, reps: usize) {
@@ -285,7 +286,7 @@ fn sweep(gpu: &mut Gpu, reps: usize) {
             flop / t_prod / 1e9
         );
         for tile in &tiles {
-            if k % (64 * tile.split) != 0 {
+            if k % (tile.ks * tile.split) != 0 {
                 continue;
             }
             let t = time_ms(gpu, reps, |g| {

@@ -4,8 +4,8 @@
 """Generate and drift-check per-crate map.md files.
 
 Each crate may carry a map.md at its crate root. The mechanical half of the
-map — module inventory with line counts, public API surface, direct and
-reverse dependencies, test counts — lives between explicit markers:
+map — source module list with each module's exported symbols, direct and
+reverse dependencies — lives between explicit markers:
 
     <!-- crate-map:generated:begin -->
     ...
@@ -15,22 +15,44 @@ and is regenerated from the tree by this script. Everything outside the
 markers is hand-written judgement (purpose, status, gotchas) and is preserved
 byte-for-byte on regeneration.
 
+The block deliberately carries no volatile stats (line/item/test counts) and
+no totals: it changes only when a file is added/removed, an exported symbol is
+added/removed/renamed, or a dependency edge changes. Every list (exports are a
+sub-list under their module) is sorted alphabetically with one entry per line,
+so two branches that each add an entry merge without conflict unless the
+entries are adjacent.
+
 Usage:
     scripts/check-crate-maps.py <crate>...        generate/refresh those maps
-    scripts/check-crate-maps.py --check [crate...]  fail on drift
+    scripts/check-crate-maps.py --check [crate...]  fail on drift or broken links
         (no crate named = every map.md present under crates/)
 
+--check validates two things per map.md:
+  1. The generated block matches the tree (modules from actual src/**/*.rs
+     files, exports, dependencies, reverse dependencies, link hrefs).
+  2. Every local markdown link in the WHOLE file -- inside and outside the
+     markers, even when the generated block is otherwise fresh -- resolves to
+     an existing path. Inline links, images and reference definitions are
+     checked; targets are relative to the crate directory (a leading `/` is
+     relative to the repo root), `#fragment` / `?query` suffixes are stripped
+     before the lookup, and fragment-only links, external schemes (https:,
+     mailto:, ...) and `//host` links are ignored. Fenced code, inline code and
+     HTML comments are not scanned. Anchors themselves are not verified.
+
 Exit codes in --check mode (mirrors scripts/check-env-docs.py):
-    0 - every checked map matches the tree
-    1 - drift found (details printed, one line per finding)
+    0 - every checked map matches the tree and all local links resolve
+    1 - drift or a broken local link found (details printed, one line per
+        finding, with the map.md line number for link problems)
     2 - usage error or a named crate has no map.md
 """
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parents[1]
 CRATES = ROOT / "crates"
@@ -52,50 +74,43 @@ PUB_ITEM = re.compile(
     r"^\s*pub\s+(?:unsafe\s+)?(?:async\s+)?(?:default\s+)?"
     r"(fn|struct|enum|trait|type|const|static|mod|use)\s+([A-Za-z_][A-Za-z0-9_]*)"
 )
-TEST_ATTR = re.compile(r"#\[(?:[A-Za-z_:]+::)?test\]")
-NAME_CAP = 12
 
-
-def line_count(path: Path) -> int:
-    with path.open("rb") as fh:
-        return sum(1 for _ in fh)
+# Local-link validation. Code is masked first so examples such as `[x](y)` in
+# prose or fences are not mistaken for real links.
+FENCED_CODE = re.compile(
+    r"^[ \t]*(`{3,}|~{3,})[^\n]*\n.*?(?:^[ \t]*\1[`~]*[ \t]*$|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+INLINE_CODE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", re.DOTALL)
+# `[text](target "title")`, also images; target may be `<...>`-wrapped.
+INLINE_LINK = re.compile(
+    r"\[(?:[^\]\\]|\\.)*\]\(\s*(<[^>\n]*>|[^)\s]*)(?:\s+(?:\"[^\"]*\"|'[^']*'))?\s*\)"
+)
+REF_DEFINITION = re.compile(r"^[ \t]{0,3}\[[^\]\n]+\]:[ \t]*(<[^>\n]*>|\S+)", re.MULTILINE)
+URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 
 
 def public_items(path: Path) -> list[str]:
-    names: list[str] = []
-    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        m = PUB_ITEM.match(line)
-        if m and m.group(2) not in names:
-            names.append(m.group(2))
-    return names
+    """Unique `pub` item names, alphabetical (case-insensitive, ties by case)."""
+    names = {
+        m.group(2)
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        if (m := PUB_ITEM.match(line))
+    }
+    return sorted(names, key=lambda n: (n.casefold(), n))
 
 
-def test_count(crate: Path) -> int:
-    total = 0
-    for sub in ("src", "tests"):
-        base = crate / sub
-        if not base.is_dir():
-            continue
-        for rs in base.rglob("*.rs"):
-            total += len(TEST_ATTR.findall(rs.read_text(encoding="utf-8", errors="ignore")))
-    return total
-
-
-def module_inventory(crate: Path) -> list[tuple[str, int, list[str]]]:
-    """(relative path, line count, public item names) for every src/**/*.rs."""
+def module_inventory(crate: Path) -> list[tuple[str, list[str]]]:
+    """(relative path, sorted exported names) for every src/**/*.rs."""
     src = crate / "src"
     if not src.is_dir():
         return []
-    out = []
-    for rs in sorted(src.rglob("*.rs")):
-        rel = rs.relative_to(crate).as_posix()
-        out.append((rel, line_count(rs), public_items(rs)))
-    return out
-
-
-def example_count(crate: Path) -> int:
-    ex = crate / "examples"
-    return len(list(ex.glob("*.rs"))) if ex.is_dir() else 0
+    return [
+        (rs.relative_to(crate).as_posix(), public_items(rs))
+        for rs in sorted(src.rglob("*.rs"), key=lambda p: p.relative_to(crate).as_posix())
+        if rs.is_file()
+    ]
 
 
 def parse_manifest(crate: Path) -> dict[str, list[str]]:
@@ -147,97 +162,123 @@ def reverse_dependencies(crate: Path) -> list[str]:
     return sorted(rev)
 
 
-def fmt_names(names: list[str]) -> str:
-    shown = names[:NAME_CAP]
-    body = ", ".join(f"`{n}`" for n in shown)
-    if len(names) > NAME_CAP:
-        body += f", +{len(names) - NAME_CAP} more"
-    return body
-
-
-def dep_line(label: str, names: list[str]) -> str:
-    return f"- {label}: " + (", ".join(f"`{n}`" for n in names) if names else "—")
+def bullet_list(names: list[str]) -> list[str]:
+    return [f"- `{n}`" for n in names] or ["—"]
 
 
 def generated_block(crate: Path) -> str:
-    modules = module_inventory(crate)
     deps = parse_manifest(crate)
-    revdeps = reverse_dependencies(crate)
-    n_tests = test_count(crate)
-    n_examples = example_count(crate)
-    total_lines = sum(n for _, n, _ in modules)
-    total_pub = sum(len(names) for _, _, names in modules)
-
     lines = [
         BEGIN,
         "",
         "_Generated by `scripts/check-crate-maps.py` from the tree — do not edit "
         "inside the markers._",
         "",
-        "### Modules",
-        "",
-        "| File | Lines | Public items | Tests |",
-        "|---|---:|---:|---:|",
-    ]
-    for rel, n, names in modules:
-        n_file_tests = len(TEST_ATTR.findall((crate / rel).read_text(
-            encoding="utf-8", errors="ignore")))
-        lines.append(f"| [`{rel}`]({rel}) | {n:,} | {len(names)} | {n_file_tests} |")
-    lines += [
-        "",
-        "### Public API surface",
+        "### Modules and exported symbols",
         "",
     ]
-    for rel, _, names in modules:
-        shown = fmt_names(names) if names else "—"
-        lines.append(f"- [`{rel}`]({rel}): {shown}")
+    modules = module_inventory(crate)
+    for rel, names in modules:
+        lines.append(f"- [`{rel}`]({rel})")
+        lines += [f"  - `{n}`" for n in names]
+    if not modules:
+        lines.append("—")
+    lines += ["", "### Dependencies (from `Cargo.toml`)", ""]
+    for kind in ("path", "external", "dev", "build"):
+        lines += [f"#### {kind}", "", *bullet_list(deps[kind]), ""]
     lines += [
-        "",
-        "### Dependencies (from `Cargo.toml`)",
-        "",
-        dep_line("path", deps["path"]),
-        dep_line("external", deps["external"]),
-        dep_line("dev", deps["dev"]),
-        dep_line("build", deps["build"]),
-        "",
         "### Reverse dependencies",
         "",
-        "- workspace crates with a path dependency on this crate: "
-        + (", ".join(f"`{n}`" for n in revdeps) if revdeps else "—"),
+        "Workspace crates with a path dependency on this crate:",
         "",
-        "### Totals",
-        "",
-        f"- {len(modules)} modules · {total_lines:,} lines · {total_pub} public items "
-        f"· {n_tests} tests · {n_examples} examples",
+        *bullet_list(reverse_dependencies(crate)),
         "",
         END,
     ]
     return "\n".join(lines)
 
 
-def parse_block_modules(block: str) -> set[str]:
-    return set(re.findall(r"^\| \[`(src/[^`]+)`\]", block, re.MULTILINE))
-
-
-def parse_block_deps(block: str) -> set[str]:
-    deps: set[str] = set()
-    in_deps = False
+def parse_block_sections(block: str) -> dict[str, set[str]]:
+    """First backticked name of every top-level `- ` line, keyed by its `### ` section."""
+    out: dict[str, set[str]] = {}
+    section = ""
     for line in block.splitlines():
-        if line.startswith("### Dependencies"):
-            in_deps = True
-            continue
         if line.startswith("### "):
-            in_deps = False
-        if in_deps and line.startswith("- ") and "—" not in line:
-            deps.update(re.findall(r"`([^`]+)`", line))
-    return deps
+            section = line[4:]
+            out[section] = set()
+        elif section and line.startswith("- "):
+            m = re.search(r"`([^`]+)`", line)
+            if m:
+                out[section].add(m.group(1))
+    return out
 
 
-def parse_block_revdeps(block: str) -> set[str]:
-    m = re.search(r"### Reverse dependencies\n\n- [^\n]*", block)
-    if not m or "—" in m.group(0):
-        return set()
-    return set(re.findall(r"`([^`]+)`", m.group(0)))
+def parse_block_modules(block: str) -> dict[str, set[str]]:
+    """Module path -> its exported-symbol sub-list."""
+    out: dict[str, set[str]] = {}
+    rel = None
+    for line in block.splitlines():
+        if m := re.match(r"- \[`(src/[^`]+)`\]", line):
+            rel = m.group(1)
+            out[rel] = set()
+        elif rel and (m := re.match(r"  - `([^`]+)`", line)):
+            out[rel].add(m.group(1))
+        elif not line.startswith("  "):
+            rel = None
+    return out
+
+
+def parse_block_hrefs(block: str) -> dict[str, str]:
+    """Module path -> the href its generated bullet links to."""
+    return dict(re.findall(r"^- \[`(src/[^`]+)`\]\(([^)]*)\)$", block, re.MULTILINE))
+
+
+def mask_non_link_text(text: str) -> str:
+    """Blank out fenced code, HTML comments and inline code spans, keeping
+    every offset and newline so line numbers of the remaining text survive."""
+
+    def blank(m: re.Match[str]) -> str:
+        return re.sub(r"[^\n]", " ", m.group(0))
+
+    for pattern in (FENCED_CODE, HTML_COMMENT, INLINE_CODE):
+        text = pattern.sub(blank, text)
+    return text
+
+
+def local_link_path(target: str) -> str | None:
+    """Filesystem part of a link target, or None when it is not a local file
+    link (external scheme, protocol-relative, or fragment/query-only)."""
+    target = target.strip()
+    if target.startswith("<") and target.endswith(">"):
+        target = target[1:-1].strip()
+    if not target or target.startswith("//") or URL_SCHEME.match(target):
+        return None
+    path = re.split(r"[#?]", target, maxsplit=1)[0]
+    return unquote(path) or None
+
+
+def check_links(crate: Path, text: str) -> list[str]:
+    """Every local markdown link in the whole map.md (inside and outside the
+    generated markers) must resolve to an existing path. Targets are relative
+    to the crate directory; a leading `/` is relative to the repo root."""
+    problems: list[str] = []
+    masked = mask_non_link_text(text)
+    for pattern in (INLINE_LINK, REF_DEFINITION):
+        for m in pattern.finditer(masked):
+            target = m.group(1)
+            path = local_link_path(target)
+            if path is None:
+                continue
+            resolved = ROOT / path.lstrip("/") if path.startswith("/") else crate / path
+            if resolved.exists():
+                continue
+            line = text.count("\n", 0, m.start(1)) + 1
+            shown = os.path.normpath(resolved).replace(os.sep, "/")
+            problems.append(
+                f"{crate.name}: map.md:{line}: link target does not exist: "
+                f"{target.strip()} (resolved to {shown})"
+            )
+    return problems
 
 
 def check_crate(crate: Path) -> list[str]:
@@ -247,40 +288,51 @@ def check_crate(crate: Path) -> list[str]:
     text = map_path.read_text(encoding="utf-8", errors="ignore")
     if BEGIN not in text or END not in text:
         return [f"{crate.name}: map.md is missing the generated-block markers"]
+    link_problems = check_links(crate, text)
     old_block = text[text.index(BEGIN):text.index(END) + len(END)]
     fresh = generated_block(crate)
     if old_block == fresh:
-        return []
+        return link_problems
 
     problems: list[str] = []
-    old_modules, new_modules = parse_block_modules(old_block), {
-        rel for rel, _, _ in module_inventory(crate)
-    }
-    for rel in sorted(new_modules - old_modules):
+    old = parse_block_sections(old_block)
+    old_modules = parse_block_modules(old_block)
+    new_modules = {rel: set(names) for rel, names in module_inventory(crate)}
+    for rel in sorted(new_modules.keys() - old_modules.keys()):
         problems.append(f"{crate.name}: module exists with no map entry: {rel}")
-    for rel in sorted(old_modules - new_modules):
+    for rel in sorted(old_modules.keys() - new_modules.keys()):
         problems.append(f"{crate.name}: map lists a module that no longer exists: {rel}")
+    for rel in sorted(new_modules.keys() & old_modules.keys()):
+        for name in sorted(new_modules[rel] - old_modules[rel]):
+            problems.append(f"{crate.name}: export missing from map: {rel}::{name}")
+        for name in sorted(old_modules[rel] - new_modules[rel]):
+            problems.append(f"{crate.name}: map lists a removed export: {rel}::{name}")
 
-    old_deps = parse_block_deps(old_block)
-    new_deps_raw = parse_manifest(crate)
-    new_deps = set(new_deps_raw["path"]) | set(new_deps_raw["external"]) | set(new_deps_raw["dev"]) | set(new_deps_raw["build"])
+    old_deps = old.get("Dependencies (from `Cargo.toml`)", set())
+    new_deps = set().union(*parse_manifest(crate).values())
     for name in sorted(old_deps - new_deps):
         problems.append(f"{crate.name}: stale declared dependency in map: {name}")
     for name in sorted(new_deps - old_deps):
         problems.append(f"{crate.name}: dependency missing from map: {name}")
 
-    old_rev, new_rev = parse_block_revdeps(old_block), set(reverse_dependencies(crate))
+    old_rev, new_rev = old.get("Reverse dependencies", set()), set(reverse_dependencies(crate))
     for name in sorted(old_rev - new_rev):
         problems.append(f"{crate.name}: stale reverse dependency in map: {name}")
     for name in sorted(new_rev - old_rev):
         problems.append(f"{crate.name}: reverse dependency missing from map: {name}")
 
+    for rel, href in sorted(parse_block_hrefs(old_block).items()):
+        if href != rel and rel in new_modules:
+            problems.append(
+                f"{crate.name}: map link for {rel} points at {href}, expected {rel}"
+            )
+
     if not problems:
         problems.append(
-            f"{crate.name}: generated counts/content are stale — "
+            f"{crate.name}: generated block is stale — "
             f"run scripts/check-crate-maps.py {crate.name}"
         )
-    return problems
+    return problems + link_problems
 
 
 def generate_crate(crate: Path) -> bool:
@@ -347,7 +399,7 @@ def main(argv: list[str]) -> int:
             problems.extend(check_crate(crate))
         without = len(list(CRATES.glob("*/Cargo.toml"))) - len(crates)
         if problems:
-            print("crate maps have drifted from the tree:")
+            print("crate maps have drifted from the tree or contain broken links:")
             for p in problems:
                 print(f"  {p}")
             return 1

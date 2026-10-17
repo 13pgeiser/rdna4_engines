@@ -26,20 +26,30 @@ pub use sealed_moe::{
 pub(crate) mod moe_program;
 pub(crate) mod qt44_qt53_prefill;
 pub use moe_program::{MoeStage, SealedMoeOp};
+pub mod moe_dump;
 pub(crate) mod draft_head;
-pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy};
+pub use draft_head::{DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState};
 pub(crate) mod layer_ops;
+pub mod sandwich;
 pub(crate) mod steps;
 pub use layer_ops::{
-    execute_argmax, execute_broadcast_add, execute_clear, execute_embedding, execute_final_hyper,
-    execute_gated_delta_net, execute_grouped_depthwise, execute_hyper_norm, execute_hyper_read,
-    execute_hyper_write, execute_indexed_attention, execute_lm_head, execute_project,
-    project_weight, validate_lm_head, BroadcastAddOp, ClearOp, EmbeddingOp, GatedDeltaNetOp,
-    GdnRowCapture, GroupedDepthwiseOp, HyperNormOp, HyperReadOp, HyperWriteOp,
-    IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, ProjectOp,
+    execute_argmax, execute_broadcast_add, execute_clear, execute_dense_ffn, execute_embedding,
+    execute_final_hyper, execute_gated_delta_net, execute_grouped_depthwise, execute_hyper_norm,
+    execute_hyper_read, execute_hyper_write, execute_indexed_attention, execute_lm_head,
+    execute_project, project_weight, project_weights, qsa_projection_hook_installed,
+    reset_qsa_projection_slot, set_qsa_projection_hook, validate_lm_head, BroadcastAddOp, ClearOp,
+    DenseFfnOp, DenseFfnRecipe, EmbeddingOp, GatedDeltaNetOp, GdnRowCapture, GroupedDepthwiseOp,
+    HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
+    IndexedAttentionState, MixerPhase, ProjectOp, QsaProjectionHook,
+    execute_gated_delta_net_arena, execute_indexed_attention_arena, GdnTrunkArenas, QsaTrunkArenas,
+    execute_gated_delta_net_uncovered, execute_indexed_attention_uncovered, gdn_qkv_projection_bf16,
+    execute_gated_delta_net_core_rows, execute_grouped_depthwise_rows, execute_indexed_attention_core_rows,
+    CoreWindow,
 };
 pub use steps::{
-    execute_steps, execute_validated_steps, validate_steps, FusedPattern, GemvInput, Step,
+    execute_steps, execute_validated_steps, execute_validated_steps_window,
+    execute_validated_steps_with_moe_hooks, validate_steps, FusedPattern, GemvInput,
+    HcFusionCursor, MoeStepHooks, Step,
 };
 
 // #397 Ship 6 — forward-as-pipeline C-design lowered super-op substrate (types
@@ -101,7 +111,7 @@ fn select_grouped_route(
         table.map_or(true, |values| values.iter().all(|dtype| *dtype == expected))
     };
     match policy.capability {
-        MoeRouteCapability::Qt44Qt53Grouped
+        MoeRouteCapability::Qt44Qt53Grouped | MoeRouteCapability::Qt44Qt53GroupedSymmetric
             if policy.capability.admitted_on()
                 && crate::families::moe::grouped_route_geometry_supported(
                     &policy,
@@ -1877,11 +1887,18 @@ fn dispatch_grouped_gemm(
     force_mq4_fp16: bool,
     paro_i8: bool,
     paro_i8_k8: bool,
+    coalesced: bool,
 ) -> Result<(), DispatchError> {
     reject_mq4g128v2(dtype, "moe")?;
     // Mixed per-expert: the merged grouped kernel carries the per-expert stride
     // via the dtype_tags table; takes priority over the uniform dtype dispatch.
     if let Some(tags) = expert_dtype_tags {
+        if coalesced {
+            return hip!(gpu.gemm_mixed_moe_grouped_wmma_coalesced(
+                ptrs, tags, tile_ids, sorted_slot_index, x, y,
+                m, k, x_row_div, m_total, rows,
+            ));
+        }
         return hip!(gpu.gemm_mixed_moe_grouped_wmma(
             ptrs,
             tags,
@@ -2951,7 +2968,7 @@ fn decode_gate_side_stage(
                 shared_up_w.m,
                 p.router.k,
             ))?;
-        } else if route == Some(MoeRouteCapability::Qt44Qt53Grouped)
+        } else if route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
             && [&p.router, shared_expert_gate, shared_gate_w, shared_up_w]
                 .iter()
                 .all(|w| w.awq_scale.is_none() && w.k == p.router.k)
@@ -3107,7 +3124,7 @@ fn decode_gate_side_stage(
       // grouped route's consumers round what they read themselves (the top-10
       // router its logits, `shared_expert_activation_bf16_f32` the selector
       // and the shared gate/up), so no pass is owed here.
-    if p.recipe.bf16_round_trip() && route != Some(MoeRouteCapability::Qt44Qt53Grouped) {
+    if p.recipe.bf16_round_trip() && !route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
         // The decode step program is single-row (`build_moe_decode` binds
         // `batch_size: 1`), but every scratch buffer is sized for the prefill
         // chunk cap (512 rows). Rounding the whole buffer would carry 512x the
@@ -3166,7 +3183,7 @@ fn decode_route_gpu_stage(
       // the root-authoritative IDs (a per-rank re-ranking is exactly the
       // divergence this removes).
     if !skip_routing {
-        if route == Some(MoeRouteCapability::Qt44Qt53Grouped) {
+        if route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             hip!(gpu.moe_router_softmax_top10_f32(
                 p.router_logits,
                 p.topk_indices,
@@ -3223,7 +3240,7 @@ fn decode_route_gpu_stage(
             ))?;
         }
         // The grouped top-10 router stores its weights BF16-rounded itself.
-        if p.recipe.bf16_round_trip() && route != Some(MoeRouteCapability::Qt44Qt53Grouped) {
+        if p.recipe.bf16_round_trip() && !route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
             // Only the selected slots are live; scratch may be prefill-sized.
             hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(p.topk_weights, 0, p.k)))?;
         }
@@ -3255,7 +3272,7 @@ fn decode_shared_down_stage(
     // still ran above (fused with the router GEMV) — only the down/accumulate
     // is skipped here. Accumulates into `out_target` (= the EP partial when
     // `routed_out` is set, else `x_residual`).
-    if route == Some(MoeRouteCapability::Qt44Qt53Grouped) && !p.skip_shared {
+    if route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) && !p.skip_shared {
         #[cfg(feature = "deltanet")]
         {
             // Single-row decode consumes only selector scalar[0] for the
@@ -3504,7 +3521,7 @@ fn decode_gate_up_stage(
     // before representative MQ4V2/MQ6V2/V1 arms. Uniform shortcut only
     // when gate_up exact DType equality (per_expert_gate_up uniform).
     let gate_up_varies = gate_up_varies(p.dtypes.per_expert_gate_up.as_deref());
-    if route == Some(MoeRouteCapability::Qt44Qt53Grouped) {
+    if route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
         let routed_slots = 10usize
             .checked_mul(p.mi)
             .ok_or_else(|| DispatchError::Hip("QT44/QT53 routed slot width overflow".into()))?;
@@ -3720,7 +3737,7 @@ fn qt44_shared_activation_in_routed(
     p: &crate::families::moe::MoeParams<'_>,
     route: Option<MoeRouteCapability>,
 ) -> bool {
-    route == Some(MoeRouteCapability::Qt44Qt53Grouped)
+    route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
         && p.recipe.bf16_round_trip()
         && !p.skip_shared
         && p.ep_mode == crate::families::moe::MoeEpMode::None
@@ -3736,7 +3753,7 @@ fn decode_activation_stage(
     route: Option<MoeRouteCapability>,
     shared_views: Option<(&GpuTensor, &GpuTensor)>,
 ) -> Result<(), DispatchError> {
-    if route == Some(MoeRouteCapability::Qt44Qt53Grouped) {
+    if route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
         let routed_slots =
             p.k.checked_mul(p.mi)
                 .ok_or_else(|| DispatchError::Hip("MoE routed slot width overflows".into()))?;
@@ -3856,7 +3873,7 @@ fn decode_down_stage(
     let out_target = target;
     let down_m = p.routed_down_m;
     let down_k = p.routed_down_k;
-    if route == Some(MoeRouteCapability::Qt44Qt53Grouped) {
+    if route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped) {
         let routed_slots = 10usize
             .checked_mul(p.mi)
             .ok_or_else(|| DispatchError::Hip("QT44/QT53 routed slot width overflow".into()))?;
@@ -4376,7 +4393,9 @@ fn decode_combine_stage(
     target: &GpuTensor,
     route: Option<MoeRouteCapability>,
 ) -> Result<(), DispatchError> {
-    if route == Some(MoeRouteCapability::Qt44Qt53Grouped) {
+    let grouped = route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped);
+    let dump = moe_dump::fold_begin(gpu, p.layer_idx as usize, p.hidden, p.x_residual, target)?;
+    if grouped {
         let down_expanded = slice_moe_f32_view(p.down_expanded, 0, 10 * p.hidden);
         hip!(gpu.moe_down_combine_top10_batched(
             &down_expanded,
@@ -4399,13 +4418,41 @@ fn decode_combine_stage(
     // The grouped route's shared stage then adds into this same target with
     // `bf16_scaled_add`, which rounds the residual it reads: the round trip is
     // owed only when nothing follows (mirrors the grouped prefill combine).
-    let shared_add_follows = route == Some(MoeRouteCapability::Qt44Qt53Grouped)
+    let shared_add_follows = route.is_some_and(MoeRouteCapability::is_qt44_qt53_grouped)
         && p.recipe.shared_after_combine()
         && !p.skip_shared
         && p.ep_mode == crate::families::moe::MoeEpMode::None;
     if p.recipe.bf16_round_trip() && !shared_add_follows {
         // One live row: the target may be allocated to the prefill chunk cap.
         hip!(gpu.bf16_round_trip_f32(&slice_moe_f32_view(target, 0, p.hidden)))?;
+    }
+    if dump.is_some() {
+        // Dump-only: the rows the kernel above actually read (stride = its `m`).
+        let (slots, stride) = if grouped {
+            (10, p.hidden)
+        } else {
+            (p.k, p.routed_down_m)
+        };
+        moe_dump::fold_end(
+            gpu,
+            dump,
+            target,
+            p.routed_out.is_some(),
+            &moe_dump::FoldInfo {
+                path: if grouped {
+                    "expanded_top10_combine"
+                } else {
+                    "expanded_k8_combine"
+                },
+                ep_mode: &format!("{:?}", p.ep_mode),
+                hidden: p.hidden,
+                slots,
+                expanded: Some((p.down_expanded, stride)),
+                indices: p.topk_indices,
+                weights: p.topk_weights,
+                expanded_absent_reason: "",
+            },
+        )?;
     }
     Ok(())
 }
@@ -4461,6 +4508,7 @@ fn prefill_gate_up_stage(
     res: &crate::families::moe::MoePrefillResolution,
     path2_m_total: usize,
     force_mq4_grouped_fp16: bool,
+    coalesced_verify: bool,
 ) -> Result<(), DispatchError> {
     let (n, mi, k_top) = (p.batch_size, p.mi, p.k_top);
     let gate_up_k = p.gate_up_k;
@@ -4497,6 +4545,7 @@ fn prefill_gate_up_stage(
             force_mq4_grouped_fp16,
             res.use_paro_i8,
             res.use_paro_i8_k8,
+            coalesced_verify && p.routed_experts.host_mapped_projections().0,
         )?;
         // The explicit unscatter stage follows this grouped GEMM.
     } else {
@@ -4844,6 +4893,7 @@ fn prefill_down_stage(
     path2_m_total: usize,
     total_slots: usize,
     force_mq4_grouped_fp16: bool,
+    coalesced_verify: bool,
 ) -> Result<(), DispatchError> {
     let (n, k_top) = (p.batch_size, p.k_top);
     let (down_m, down_k) = (p.down_m, p.down_k);
@@ -4868,6 +4918,7 @@ fn prefill_down_stage(
             force_mq4_grouped_fp16,
             res.use_paro_i8,
             res.use_paro_i8_k8,
+            coalesced_verify && p.routed_experts.host_mapped_projections().1,
         )?;
         // Publication is deferred to the explicit combine stage.
     } else if res.down_path0 {

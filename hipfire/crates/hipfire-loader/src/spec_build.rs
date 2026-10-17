@@ -44,6 +44,10 @@ pub struct Qwen35SlotGuard<'m> {
     // `Option` only so `Drop` can move the contents out; it is `Some` for the
     // guard's entire observable lifetime.
     parked: Option<Parked>,
+    /// The VMM continuous-batch store parked for the guard's lifetime:
+    /// `ModelSlot::from_bundle` refuses a bundle that still owns it, and the
+    /// singleton spec route never touches batch request state.
+    vmm_store: Option<hipfire_arch_qwen35::forward_slots::vmm::Qwen35VmmStore>,
 }
 
 // Both variants hold the same ~5.6 KB of live model state by value — that is
@@ -79,13 +83,15 @@ impl<'m> Qwen35SlotGuard<'m> {
         let Some(state_box) = state.take() else {
             unreachable!("guarded by the matches! above")
         };
-        let bundle = *(state_box as Box<dyn Any>)
+        let mut bundle = *(state_box as Box<dyn Any>)
             .downcast::<Qwen35Bundle>()
             .unwrap();
+        let vmm_store = bundle.vmm_store.take();
         Ok(Self {
             state_back: state,
             model_path: model_path.to_string(),
             parked: Some(Parked::Bundle(bundle)),
+            vmm_store,
         })
     }
 
@@ -119,13 +125,14 @@ impl<'m> Qwen35SlotGuard<'m> {
 
 impl Drop for Qwen35SlotGuard<'_> {
     fn drop(&mut self) {
-        let bundle = match self.parked.take() {
+        let mut bundle = match self.parked.take() {
             Some(Parked::Bundle(b)) => b,
             // slot.hfq (mmap), slot.name, slot.slot_config drop inside
             // `into_bundle`; the five live pieces go back into the bundle.
             Some(Parked::Slot(slot)) => slot.into_bundle(),
             None => return, // only reachable if `Drop` ran twice — it cannot.
         };
+        bundle.vmm_store = self.vmm_store.take();
         *self.state_back = Some(Box::new(bundle));
     }
 }
@@ -133,6 +140,89 @@ impl Drop for Qwen35SlotGuard<'_> {
 impl SpecTargetGuard for Qwen35SlotGuard<'_> {
     fn slot(&mut self) -> Result<&mut dyn SpecTarget, String> {
         Ok(self.model_slot()? as &mut dyn SpecTarget)
+    }
+}
+
+/// Moves the dense-TP mesh out of `EpState` for one spec-decode request and
+/// puts it back on drop: the `ep` twin of [`Qwen35SlotGuard`].
+pub struct Qwen35DenseTpGuard<'m> {
+    ep: &'m mut Option<crate::EpState>,
+    target: Option<hipfire_arch_qwen35::mtp_dense_tp::Qwen35DenseTpTarget>,
+}
+
+/// True when `ep` holds a dense-TP Qwen trunk (the one mesh that speculates).
+pub fn is_qwen35_dense_tp(ep: &Option<crate::EpState>) -> bool {
+    matches!(
+        ep.as_ref().map(|e| &e.inner),
+        Some(crate::EpArch::Qwen35DenseTp { .. })
+    )
+}
+
+impl<'m> Qwen35DenseTpGuard<'m> {
+    /// Take the dense-TP mesh out of `ep`. Refuses before `take()` so a
+    /// non-dense-TP state is never moved out and dropped (that would free
+    /// every rank's weights and KV).
+    pub fn take(ep: &'m mut Option<crate::EpState>) -> Result<Self, String> {
+        if !is_qwen35_dense_tp(ep) {
+            return Err("dense TP guard: model is not a dense-TP Qwen3.5 mesh".to_string());
+        }
+        let Some(crate::EpState { gpus, inner }) = ep.take() else {
+            unreachable!("checked above");
+        };
+        let crate::EpArch::Qwen35DenseTp {
+            shard,
+            configs,
+            weights,
+            kv_caches,
+            dn_states,
+            scratches,
+        } = inner
+        else {
+            unreachable!("variant checked before take");
+        };
+        let eos_token = configs[0].eos_token;
+        let ctx_capacity = kv_caches[0].max_seq;
+        Ok(Self {
+            ep,
+            target: Some(hipfire_arch_qwen35::mtp_dense_tp::Qwen35DenseTpTarget {
+                gpus,
+                shard,
+                weights,
+                configs,
+                kv_caches,
+                dn_states,
+                scratches,
+                eos_token,
+                ctx_capacity,
+            }),
+        })
+    }
+}
+
+impl SpecTargetGuard for Qwen35DenseTpGuard<'_> {
+    fn slot(&mut self) -> Result<&mut dyn SpecTarget, String> {
+        self.target
+            .as_mut()
+            .map(|t| t as &mut dyn SpecTarget)
+            .ok_or_else(|| "dense TP guard: target already returned".to_string())
+    }
+}
+
+impl Drop for Qwen35DenseTpGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(t) = self.target.take() {
+            *self.ep = Some(crate::EpState {
+                gpus: t.gpus,
+                inner: crate::EpArch::Qwen35DenseTp {
+                    shard: t.shard,
+                    configs: t.configs,
+                    weights: t.weights,
+                    kv_caches: t.kv_caches,
+                    dn_states: t.dn_states,
+                    scratches: t.scratches,
+                },
+            });
+        }
     }
 }
 
@@ -191,7 +281,11 @@ pub fn build_speculator(
         if eviction_is_none && matches!(arch_id, 5 | 6) {
             let max_n = spec
                 .mtp_k
-                .unwrap_or(hipfire_runtime::config::get().mtp_k)
+                .unwrap_or(
+                    hipfire_runtime::config::get()
+                        .mtp_k
+                        .unwrap_or(hipfire_config::MTP_K_DEFAULT),
+                )
                 .clamp(1, 10);
             eprintln!("  qwen35 MTP speculator enabled (compressed-serial, K={max_n})");
             return Some(hipfire_arch_qwen35::build_qwen35_mtp_speculator(

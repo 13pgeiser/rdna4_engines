@@ -30,6 +30,15 @@ fn main() -> Result<(), String> {
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| e.to_string())?;
     let receipt = admit_hfqm_artifact(&hfq).map_err(|e| e.to_string())?;
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+    // The loader's forward scratch plan, decided from the actual payload
+    // while the mapping is readable.
+    let scratch_mode = hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+        &gpu,
+        &hfq,
+        &receipt.config,
+        &receipt.manifest,
+    )
+    .map_err(|e| e.to_string())?;
     if gpu.is_uma() {
         hfq.drop_mmap();
     }
@@ -59,18 +68,21 @@ fn main() -> Result<(), String> {
         &gpu,
         &receipt.config,
     )?;
+    let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
     let mut bundle = Qwen4Bundle::assemble_with_metadata(
         receipt.config,
+        &receipt.manifest.identity.recipe,
         transaction,
         &receipt.placements,
         &mut gpu,
         n_ctx,
         receipt.ple,
         state_format,
+        backend,
     )
     .map_err(|e| e.to_string())?;
     bundle
-        .attach_forward(&mut gpu, n_ctx)
+        .attach_forward(&mut gpu, n_ctx, scratch_mode)
         .map_err(|e| e.to_string())?;
     let logits = gpu
         .zeros(&[8 * vocab], DType::F32)

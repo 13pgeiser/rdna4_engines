@@ -676,10 +676,10 @@ def a4(t):
             vals.setdefault(m.group(1), []).append(float(m.group(3)))
     for name in ("hipfire_requests_total", "hipfire_requests_failed_total",
                  "hipfire_admission_rejected_total", "hipfire_queue_depth",
-                 "hipfire_queue_capacity", "hipfire_uptime_seconds", "hipfire_model_loaded"):
+                 "hipfire_queue_capacity", "hipfire_uptime_seconds", "hipfire_model_info"):
         t.check(name in vals, "metric %s missing" % name)
     t.check(vals["hipfire_requests_total"][0] >= 1, "requests_total 0")
-    t.check(vals["hipfire_model_loaded"][0] == 1, "model_loaded != 1")
+    t.check(vals.get("hipfire_model_info") == [1.0], "model_info != [1]")
     for hname in ("hipfire_ttft_milliseconds", "hipfire_request_latency_milliseconds",
                   "hipfire_decode_tokens_per_second"):
         t.check(hname + "_bucket" in text or hname in text, "histogram %s missing" % hname)
@@ -1324,11 +1324,11 @@ def e15(t):
 # --------------------------------------------------------------------------
 
 
-# Gateway-side request validation prefixes its refusals with a typed tag so
-# the HTTP layer maps them to 400 by CLASS, not by message wording
-# (`REQUEST_VALIDATION_TAG` in hipfire-cli/src/serve/mod.rs). The contract a
-# client observes is "HTTP 400 naming the refused field/knob"; the exact
-# sentence is an implementation detail, so accept either spelling.
+# Gateway-side request validation is typed (`InvalidRequest` in
+# hipfire-cli/src/serve/mod.rs), so the HTTP layer maps it to 400 by TYPE, not
+# by message wording. The contract a client observes is "HTTP 400 naming the
+# refused field/knob"; the exact sentence is an implementation detail. Older
+# gateways prefixed the message with this tag, so accept either spelling.
 REFUSAL_TAG = "[request validation] "
 
 

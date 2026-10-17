@@ -1,9 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/hipfire-arch-qwen35-embed",
     "crates/peacemaker-ir",
     "crates/peacemaker-lift",
-    "crates/hipfire-isa",
+    "crates/peacemaker-author",
+    "crates/railgun",
+    "crates/railgun-cert",
+    "crates/railgun-corpus",
+    "crates/railgun-jitcorpus",
+    "crates/peacemaker-isa",
+    "crates/peacemaker-rip",
     "crates/hip-bridge",
     "crates/va-bridge",
     "crates/hsa-bridge",
@@ -51,10 +58,12 @@ members = [
     "crates/hipfire-daemon",
     "crates/saddle-lab",
     "crates/hipfire-xdna",
+    "crates/peacemaker-npu",
+    "crates/npu-tools",
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.2+patch.1"
 edition = "2021"
 # Outbound license for the work as a whole. Individual files whose authors
 # have not elected Apache-2.0 keep an MIT SPDX header; see LICENSE and NOTICE.

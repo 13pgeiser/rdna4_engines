@@ -24,8 +24,7 @@ pub use batch::{
 };
 pub use config::{
     apply_reap_plan, config_from_hfq, config_from_metadata_json, config_from_safetensors,
-    dense_tp_rank_layouts, local_dense_tp_config, offload_residency_report,
-    offload_topology_refusal, validate_dense_tp, DenseTpRankLayout,
+    dense_tp_rank_layouts, local_dense_tp_config, validate_dense_tp, DenseTpRankLayout,
     DflashFusionCtx, LayerType, MaskEmbedOverride, MropeCtx, Qwen35BatchCompatibility,
     Qwen35BatchLoadConfig, Qwen35BatchParallelism, Qwen35Config, Qwen35EpBatchReceipt,
     Qwen35EpReduce, Qwen35EpTopology, TreeVerifyCtx,
@@ -35,14 +34,15 @@ pub use ep_batch::{
     validate_ep_batch_compatibility, Qwen35DecodeBatchEpState,
 };
 pub use forward::{
-    dump_expert_stats, forward, forward_gpu, forward_prefill_dense_tp, forward_scratch,
-    forward_scratch_dense_tp, forward_scratch_embed, forward_scratch_embed_mrope,
-    forward_scratch_mrope, forward_scratch_with_hidden, forward_with_embedding,
-    prepare_scratch_inputs, shard_all_moe_layers, shard_all_moe_layers_with_fault,
-    shard_moe_experts, Qwen35Scratch, Qwen35ScratchSet,
+    dump_expert_stats, forward, forward_gpu, forward_prefill_dense_tp,
+    forward_prefill_dense_tp_with_hidden, forward_scratch, forward_scratch_dense_tp,
+    forward_scratch_embed, forward_scratch_embed_mrope, forward_scratch_mrope,
+    forward_scratch_with_hidden, forward_with_embedding, prepare_scratch_inputs,
+    shard_all_moe_layers, shard_all_moe_layers_with_fault, shard_moe_experts, Qwen35Scratch,
+    Qwen35ScratchSet,
 };
 pub use load::{
-    load_weights, load_weights_dense_tp_rank, load_weights_ep_rank,
+    host_mapped_expert_accounting, load_weights, load_weights_dense_tp_rank, load_weights_ep_rank,
     load_weights_ep_rank_with_fault, load_weights_with_fault, preflight_weights_dense_tp, EpFault,
     EpLoadStage, HfqSource, Layout, ParoSource, StagedLoadFault,
 };

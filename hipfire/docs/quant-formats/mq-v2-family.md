@@ -250,6 +250,50 @@ tile. Thresholds are N≥96 unless a band is noted. Source of truth:
 | **gfx1100** | 4 (MQ4V2) | adaptive (see bands) | adaptive | adaptive | adaptive |
 | **gfx1100** | 2 / 3 / 5 / 6 | base WMMA | base | base | base |
 
+Qwen4 MQ6 Halo tuning is **default on gfx1151 inside the Qwen4 forward**:
+unset there (or `HIPFIRE_QWEN4_MQ6_X4_TILE=auto` anywhere) uses the
+artifact-sweep table and `0` keeps the incumbent (entries are `BV/RW/prefetch`; `base` retains the incumbent):
+
+| M,K | N=1536 | N=512 | N=1131 | N=8192 | N=2048 |
+|---|---|---|---|---|---|
+| 48,2560 | 8/4/2 | 8/4/2 | 8/4/2 | base | base |
+| 512,2560 | base | base | base | 8/8/1 | 8/8/1 |
+| 640,2560 | 8/8/1 | 8/4/2 | base | 8/8/2 | 8/8/2 |
+| 2560,6144 | 8/8/1 | 8/8/1 | 8/8/1 | base | base |
+| 6144,2560 | 8/8/1 | 8/8/1 | 8/8/1 | base | base |
+| 10240,2560 | 12/8/2 | 8/8/2 | 8/8/1 | 8/8/1 | 8/8/1 |
+| 12288,2560 | 12/8/2 | 8/8/1 | 8/8/1 | 8/8/2 | 8/8/1 |
+
+The a/b/z region fold (`48 + 48 + 6144` rows, K=2560) and the HC-write epilogue
+launch (`2560,6144`) pick from their own BV8 twins: regions `8/8/2` at
+N=8192 and `8/8/1` at N=2048; HC-write `8/8/2` at N=8192, base at N=2048.
+The cold three-process Halo sweep (BF16 HC streams) measured regions
+`7.177 → 6.972 ms` and HC-write `10.502 → 10.100 ms` at N=8192
+(isolated-kernel medians, not full-prefill savings). The packed-dequant
+(`_dq`) entries measured no gain over the same tile without it and are not
+routed.
+
+Unmeasured shapes and token counts retain the incumbent. The table uses one
+conservative tile for both output dtypes. Explicit overrides use `BVxRWxprefetch`
+with `BV ∈ {8,12,16}`, `RW ∈ {4,8}`, and prefetch depth `∈ {1,2}`;
+BV12 overrides fall back to the incumbent unless `N % 192 == 0`.
+`HIPFIRE_QWEN4_MQ6_X4_REGIONS` independently controls the three-F32-output
+MQ6 a/b/z region fold on the admitted prepared-F16 route: on by default in
+the Qwen4 forward on gfx1151 (`0` off), opt-in `1` on gfx1201.
+Both switches preserve independent WMMA chains and the existing shared rotation.
+
+The Halo three-run artifact F32 sweep at `N=1536` measured medians
+`1.559106 → 1.455083 ms` for `(2560,6144)` and
+`2.216403 → 2.089681 ms` for `(10240,2560)`; the latter's BF16 output
+measured `2.174003 → 2.021261 ms`. These are isolated-kernel measurements,
+**not** full-prefill or MQ6-group savings. In the initial synthetic sweep,
+`s_setprio` slowed the first winner from `1.402878` to `1.620221 ms` and
+was rejected. Artifact-bitwise
+checks cover all seven trunk shapes, F32/BF16 outputs, `N=1536/512/1131/16`,
+K=10240 row tails, extreme headers, zero guards, and poisoned output pads.
+The three-output fold also matches independent incumbent launches, including
+`N=0`.
+
 MQ4V2 adaptive bands on **gfx1100** (fuller narrative in `mq4-v2.md` §9):
 
 - QKV / QKVZA: BT4 @ N≥96, BT12 @ N≥192
@@ -292,13 +336,19 @@ Codec MSE is **not** a KLD proxy. Product quality is §8 / the ladder checkpoint
 
 ---
 
-## 8 · Product admission boundary (measured, not claimed shipping)
+## 8 · Product admission boundary (historical August sweep; not current quality pins)
 
-Evidence host: hiptrx, 4×gfx1201, ROCm/HIP 7.14. Fixture: Qwen3.8-27B,
+The data in this section is a **historical, fixture-bound** August 2026 sweep,
+kept separate from current quality pins (see
+[`ladder.md`](ladder.md#current-quality-methodology) and
+[`../../AGENTS.md`](../../AGENTS.md) § 5). It records evidence, not shipping
+status. Full record:
+[`../perf-checkpoints/2026-08-20-qwen38-mq-v2-product-ladder.md`](../perf-checkpoints/2026-08-20-qwen38-mq-v2-product-ladder.md).
+
+Evidence host: 4×gfx1201, ROCm/HIP 7.14. Fixture: Qwen3.8-27B,
 26,895,998,464 params. Scoring: WT2 + v6sel, 24 chunks, prompt md5
 `253c7ac50857fe6d0e10fb0d2c5e35c0`. Ladder summary generated
-`2026-08-20T14:13:16Z`, commit `bfe3cfead5856c5ee85e972b609712b0badbd1b1`,
-source `ssh://hiptrx/home/kaden/qcal/ladder-v2/summary.json`.
+`2026-08-20T14:13:16Z`, commit `bfe3cfead5856c5ee85e972b609712b0badbd1b1`.
 
 Acceptance rate from native generate is **null**
 (`acceptance_reason: unavailable_in_native_generate_v1`).
@@ -354,8 +404,8 @@ Fixed-tier overlays (product recipe, not wire):
 MQ2V2 **codec math is valid** (encoder round-trips, kernels decode, parity
 gate covers qt=50). Product quality is not:
 
-- WT2/v6sel KLD ≈ 12–14 on every mq2 rung (three orders of magnitude above
-  mq3+).
+- WT2/v6sel KLD ≈ 12–14 on every mq2 rung, substantially higher than mq3–mq6
+  on this fixture.
 - Serve battery (`serve-mq2.json`): no attractor/empty flags, but outputs are
   coherent-yet-degraded / repetitive (`runaway` on the 5-prompt battery).
 - Do **not** advertise MQ2V2 as a shipping body format. Wire support remains
@@ -435,8 +485,8 @@ byte consumption explicit per dtype.
 - [`qt-register.txt`](qt-register.txt) — qt 47–50 passthrough rows
 - [`mq4-v2.md`](mq4-v2.md) — qt=44/45 detailed sibling
 - [`ladder.md`](ladder.md) — product names / rungs / honesty invariant
-- `docs/perf-checkpoints/2026-08-20-qwen38-mq-v2-product-ladder.md` — immutable
-  ladder checkpoint (peer-owned; historical fixture scope)
+- [`../perf-checkpoints/2026-08-20-qwen38-mq-v2-product-ladder.md`](../perf-checkpoints/2026-08-20-qwen38-mq-v2-product-ladder.md) — immutable
+  ladder checkpoint (historical fixture scope; measured ladder summary)
 - `docs/perf-checkpoints/2026-08-23-mq-v2-crossarch-prefill-reuse.md` — multi-arch
   prefill weight-reuse (gfx1151 all ops bits2–6; gfx1201 QKV BT8 bits2/5/6, MQ3 base)
 - `crates/rdna-compute/src/dispatch.rs` — group-byte constants, AWQ allow-list
@@ -446,4 +496,4 @@ byte consumption explicit per dtype.
 - `crates/hipfire-runtime/examples/mqv2_family_parity.rs` — parity gate
 - `crates/rdna-compute/examples/test_mqv2_bt_gfx11.rs`,
   `test_mqv2_qkv_bt_gfx1201.rs` — ladder BT screens
-- `ssh://hiptrx/home/kaden/qcal/ladder-v2/summary.{json,md,csv}` — measured ladder
+- [`kld/VERIFY.md`](https://huggingface.co/hipfire-models/qwen3.8-27b/blob/main/kld/VERIFY.md) — public current quality-pin reproduction

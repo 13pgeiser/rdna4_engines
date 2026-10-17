@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Check 11 `definedness` (architecture.md §3): every register an instruction reads —
 //! implicit EXEC, VCC, SCC and M0 included — must be defined on every incoming CFG path,
 //! by the code or by the kernel's ABI entry live-ins.
@@ -13,7 +17,7 @@ use std::collections::BTreeSet;
 
 use peacemaker_ir::cfg::{Body, InstId};
 use peacemaker_ir::effects::{preserved_vgpr_destination, ImplicitSet};
-use peacemaker_ir::inst::{Abi, Form, Inst, Kernel, Wave};
+use peacemaker_ir::inst::{Abi, EntryCell, Form, Inst, Kernel, Wave};
 use peacemaker_ir::operand::Operand;
 use peacemaker_ir::reg::{Kind, RegRef};
 
@@ -80,7 +84,8 @@ fn access(inst: &Inst, wave: Wave) -> (Vec<usize>, Vec<usize>) {
     (reads, defs)
 }
 
-/// Locations defined at the kernel entry (the hardware-initialised state).
+/// Locations defined at the kernel entry: the hardware-initialised state of an HSA
+/// descriptor, or exactly the declared entry facts of a raw kernel.
 fn entry(kernel: &Kernel) -> Set {
     let mut set = Set::EMPTY;
     let (user, wg_x, wg_yz) = match &kernel.abi {
@@ -88,7 +93,24 @@ fn entry(kernel: &Kernel) -> Set {
             let rsrc2 = descriptor.compute_pgm_rsrc2.0;
             ((rsrc2 >> 1 & 0x1f) as usize, rsrc2 >> 7 & 1 != 0, rsrc2 >> 8 & 3 != 0)
         }
-        Abi::Raw { .. } => (0, true, true),
+        Abi::Raw(raw) => {
+            // Facts that do not validate define nothing.
+            for (cell, _) in raw.entry_cells().unwrap_or_default() {
+                match cell {
+                    EntryCell::Vgpr(n) => set.insert(V0 + usize::from(n)),
+                    EntryCell::Sgpr(n) => set.insert(S0 + usize::from(n)),
+                    EntryCell::Ttmp(n) => set.insert(T0 + usize::from(n)),
+                    EntryCell::VccLo => set.insert(VCC_LO),
+                    EntryCell::VccHi => set.insert(VCC_HI),
+                    EntryCell::ExecLo => set.insert(EXEC_LO),
+                    EntryCell::ExecHi => set.insert(EXEC_HI),
+                    EntryCell::Scc => set.insert(SCC),
+                    EntryCell::M0 => set.insert(M0),
+                    _ => {}
+                }
+            }
+            return set;
+        }
     };
     for s in 0..user { set.insert(S0 + s); }
     if wg_x { set.insert(T0 + 9); }

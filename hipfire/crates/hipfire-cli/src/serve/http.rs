@@ -2,17 +2,19 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! OpenAI HTTP gateway.
+//! HTTP gateway: OpenAI chat completions, plus the Anthropic Messages and
+//! OpenAI Responses adapters onto the same pipeline.
 //!
 //! Concern: request routing, JSON body limits, streaming vs non-streaming
 //! framing, SSE acknowledgement, CORS/health endpoints. Isolates Hyper
 //! I/O from business logic.
 
 use crate::serve::complete::{
-    complete_request_cancellable, completion_json, gate_chat_completions_tools,
-    openai_stream_delta_for_event, openai_stream_terminal_chunks, Completion,
+    complete_request_cancellable, completion_json, gate_endpoint_tools,
+    openai_stream_delta_for_event, openai_stream_terminal_chunks, Completion, EndpointAdapterKind,
 };
 use crate::serve::metrics::Metrics;
+use crate::serve::{anthropic, responses};
 use crate::serve::{is_batch_eligible_request, ServeShared};
 use crate::serve::{AdmissionError, AdmissionGuard, LoadedInfo};
 use crate::{is_standalone_model, list_local_models, unix_timestamp};
@@ -26,7 +28,7 @@ use hyper::{
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::VecDeque,
     convert::Infallible,
     future::Future,
@@ -58,7 +60,7 @@ where
     UnsyncBoxBody::new(body)
 }
 
-fn boxed_full(bytes: Vec<u8>) -> BoxBody {
+pub(crate) fn boxed_full(bytes: Vec<u8>) -> BoxBody {
     boxed(Full::new(bytes.into()).map_err(|never: Infallible| match never {}))
 }
 
@@ -119,15 +121,216 @@ pub(crate) fn openai_error(message: &str, status: u16) -> Response<BoxBody> {
 }
 
 pub(crate) fn admission_error_response(
+    api: WireApi,
     metrics: &Metrics,
     error: &AdmissionError,
 ) -> Response<BoxBody> {
     metrics.record_admission_rejected();
-    let mut resp = openai_error(&error.message, 503);
+    let mut resp = api.error_response(&error.message, 503);
     if let Ok(retry_after) = header::HeaderValue::from_str(&error.retry_after_seconds.to_string()) {
         resp.headers_mut().insert(header::RETRY_AFTER, retry_after);
     }
     resp
+}
+
+// ---------------------------------------------------------------------------
+// Generation APIs — every one lowers onto the chat-completions pipeline
+// ---------------------------------------------------------------------------
+
+/// The HTTP API a generation request arrived on. Each lowers onto the
+/// chat-completions body and then shares that route's admission, tool gate
+/// and worker; only request lowering and response rendering differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WireApi {
+    /// `POST /v1/chat/completions`.
+    ChatCompletions,
+    /// `POST /v1/messages` ([`anthropic`]).
+    AnthropicMessages,
+    /// `POST /v1/responses` ([`responses`]).
+    OpenAiResponses,
+}
+
+impl WireApi {
+    fn adapter_kind(self) -> EndpointAdapterKind {
+        match self {
+            Self::ChatCompletions => EndpointAdapterKind::OpenAiChatCompletions,
+            Self::AnthropicMessages => EndpointAdapterKind::AnthropicMessages,
+            Self::OpenAiResponses => EndpointAdapterKind::OpenAiResponses,
+        }
+    }
+
+    /// An error response in this API's shape: Anthropic's
+    /// `{"type": "error", "error": {...}}`, else OpenAI's `{"error": {...}}`.
+    pub(crate) fn error_response(self, message: &str, status: u16) -> Response<BoxBody> {
+        match self {
+            Self::AnthropicMessages => {
+                json_response_result(&anthropic::error_body(message, status), status)
+                    .unwrap_or_else(|_| static_server_error())
+            }
+            Self::ChatCompletions | Self::OpenAiResponses => openai_error(message, status),
+        }
+    }
+
+    /// Lower a request body onto the chat-completions body. A chat request
+    /// passes through untouched. `Err` is a client error (400).
+    fn lower(self, body: serde_json::Value) -> Result<GenerationRequest, String> {
+        match self {
+            Self::ChatCompletions => {
+                let stream = body.get("stream").and_then(|v| v.as_bool()) == Some(true);
+                let include_usage = body
+                    .pointer("/stream_options/include_usage")
+                    .and_then(|v| v.as_bool())
+                    == Some(true);
+                Ok(GenerationRequest {
+                    chat: body,
+                    stream,
+                    encoding: ResponseEncoding::Chat { include_usage },
+                })
+            }
+            Self::AnthropicMessages => {
+                let lowered = anthropic::lower_request(&body)?;
+                Ok(GenerationRequest {
+                    chat: lowered.chat,
+                    stream: lowered.stream,
+                    encoding: ResponseEncoding::Anthropic,
+                })
+            }
+            Self::OpenAiResponses => {
+                let lowered = responses::lower_request(&body)?;
+                Ok(GenerationRequest {
+                    chat: lowered.chat,
+                    stream: lowered.stream,
+                    encoding: ResponseEncoding::Responses(lowered.echo),
+                })
+            }
+        }
+    }
+}
+
+/// A generation request lowered onto the chat-completions body.
+struct GenerationRequest {
+    chat: serde_json::Value,
+    stream: bool,
+    encoding: ResponseEncoding,
+}
+
+/// How a completion (and its stream) is rendered for the client's API.
+enum ResponseEncoding {
+    Chat { include_usage: bool },
+    Anthropic,
+    Responses(responses::ResponseEcho),
+}
+
+impl ResponseEncoding {
+    fn api(&self) -> WireApi {
+        match self {
+            Self::Chat { .. } => WireApi::ChatCompletions,
+            Self::Anthropic => WireApi::AnthropicMessages,
+            Self::Responses(_) => WireApi::OpenAiResponses,
+        }
+    }
+
+    /// The non-streaming response body.
+    fn completion_body(&self, completion: &Completion) -> serde_json::Value {
+        match self {
+            Self::Chat { .. } => completion_json(completion),
+            Self::Anthropic => anthropic::message_json(completion),
+            Self::Responses(echo) => responses::response_json(completion, echo),
+        }
+    }
+
+    fn stream(self, id: &str, created: u64, model: &str) -> StreamEncoder {
+        match self {
+            Self::Chat { include_usage } => StreamEncoder::Chat {
+                id: id.to_owned(),
+                created,
+                model: model.to_owned(),
+                include_usage,
+            },
+            Self::Anthropic => StreamEncoder::Anthropic(anthropic::MessageStream::new(id, model)),
+            Self::Responses(echo) => {
+                StreamEncoder::Responses(responses::ResponseStream::new(echo, id, created, model))
+            }
+        }
+    }
+}
+
+/// SSE framing of one streamed response in the client's API.
+enum StreamEncoder {
+    /// OpenAI `data: {chat.completion.chunk}` frames ending in `data: [DONE]`.
+    Chat {
+        id: String,
+        created: u64,
+        model: String,
+        include_usage: bool,
+    },
+    Anthropic(anthropic::MessageStream),
+    Responses(responses::ResponseStream),
+}
+
+impl StreamEncoder {
+    /// The frame the 200 commits with (chat role chunk, `message_start`,
+    /// `response.created`).
+    fn preamble(&mut self) -> Vec<u8> {
+        match self {
+            Self::Chat {
+                id, created, model, ..
+            } => sse_data(&serde_json::json!({
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
+            })),
+            Self::Anthropic(stream) => stream.preamble(),
+            Self::Responses(stream) => stream.preamble(),
+        }
+    }
+
+    /// One folded pipeline event; `None` when it has nothing to send.
+    fn event(&mut self, event: &serde_json::Value) -> Option<Vec<u8>> {
+        match self {
+            Self::Chat {
+                id, created, model, ..
+            } => {
+                let delta = openai_stream_delta_for_event(event)?;
+                Some(sse_data(&serde_json::json!({
+                    "id": id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
+                })))
+            }
+            Self::Anthropic(stream) => stream.event(event),
+            Self::Responses(stream) => stream.event(event),
+        }
+    }
+
+    /// The terminal frame: released tool calls, finish and usage.
+    fn terminal(&mut self, completion: &Completion) -> Vec<u8> {
+        match self {
+            Self::Chat { include_usage, .. } => {
+                let mut bytes = Vec::new();
+                for chunk in openai_stream_terminal_chunks(completion, *include_usage) {
+                    bytes.extend_from_slice(&sse_data(&chunk));
+                }
+                bytes.extend_from_slice(b"data: [DONE]\n\n");
+                bytes
+            }
+            Self::Anthropic(stream) => stream.terminal(completion),
+            Self::Responses(stream) => stream.terminal(completion),
+        }
+    }
+
+    /// The frame ending a stream that fails after it committed.
+    fn failure(&mut self, failure: &RequestFailure) -> Vec<u8> {
+        match self {
+            Self::Chat { .. } => failure.sse_event(),
+            Self::Anthropic(stream) => stream.failure(&failure.message, failure.status),
+            Self::Responses(stream) => stream.failure(&failure.message, failure.status),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -288,7 +491,7 @@ pub(crate) struct ResponseChunk {
     bytes: Vec<u8>,
     ack: Option<AckSender>,
     fail: bool,
-    /// Ends with `data: [DONE]`: nothing, not even a keepalive, may follow.
+    /// The response's final frame: nothing, not even a keepalive, may follow.
     last: bool,
 }
 
@@ -301,7 +504,7 @@ impl ResponseChunk {
             last: false,
         }
     }
-    /// The final frame of a response (its bytes end with `data: [DONE]`).
+    /// The final frame of a response (chat: ends with `data: [DONE]`).
     fn last(bytes: Vec<u8>, ack: Option<AckSender>) -> Self {
         Self {
             bytes,
@@ -656,10 +859,21 @@ fn model_entry(
             } else {
                 vec!["text"]
             };
-            entry["architecture"] = serde_json::json!({
+            // Same facts /health publishes from `meta.loaded`, so a client
+            // discovering models the OpenAI way doesn't also need a bespoke
+            // /health probe to learn the effort rungs. `reasoning_contract`
+            // is skipped while empty (load window: ack not yet in).
+            let mut architecture = serde_json::json!({
                 "input_modalities": input_modalities,
                 "output_modalities": ["text"],
             });
+            if !loaded.reasoning_contract.is_empty() {
+                architecture["reasoning_contract"] = serde_json::json!(loaded.reasoning_contract);
+                architecture["reasoning_effort_native"] =
+                    serde_json::json!(loaded.reasoning_effort_native);
+                architecture["reasoning_efforts"] = serde_json::json!(loaded.reasoning_efforts);
+            }
+            entry["architecture"] = architecture;
         }
     }
     entry
@@ -678,6 +892,13 @@ async fn handle_request(
         .unwrap_or(req.uri().path())
         .to_owned();
     let method = req.method().clone();
+    // Opt-in embedded chat UI (`serve.ui` / `--ui`). A GET on a UI path
+    // resolves embedded assets; anything else falls through to 404.
+    if shared.ui_enabled && method == Method::GET {
+        if let Some(resp) = crate::serve::ui::ui_asset(&path) {
+            return resp;
+        }
+    }
 
     match (method, path.as_str()) {
         (Method::GET, "/health") => {
@@ -687,7 +908,8 @@ async fn handle_request(
             // (prewarm at startup and request-time loads alike), so reading
             // through it would block this endpoint — the one every readiness
             // probe polls — for the duration and report serve as down
-            // (`docs/SERVE.md` § "Detached readiness").
+            // (`docs/SERVE.md` § "Detached readiness"). Reasoning capability
+            // therefore publishes through `meta.loaded` too.
             let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
             // 503 while the daemon is dead or being respawned, so probes and
             // service managers see that requests cannot be served.
@@ -707,6 +929,12 @@ async fn handle_request(
                 // and not the trained window. `null` while no model is resident
                 // (`n_ctx == 0`), so a client cannot read 0 as "zero context".
                 "n_ctx": (meta.n_ctx > 0).then_some(meta.n_ctx),
+                // Reasoning capability is live state, published on
+                // `meta.loaded` at the load ack (see `ensure_model`) so this
+                // endpoint never touches the runtime lock.
+                "reasoning_contract": meta.loaded.reasoning_contract,
+                "reasoning_effort_native": meta.loaded.reasoning_effort_native,
+                "reasoning_efforts": meta.loaded.reasoning_efforts,
             });
             let status = if state == crate::serve::EngineState::Up {
                 200
@@ -729,16 +957,14 @@ async fn handle_request(
             json_response(body, 200)
         }
         (Method::GET, "/metrics") => {
-            let (uptime, model) = {
+            let body = {
                 let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
-                (meta.started.elapsed().as_secs(), meta.current_model.clone())
+                shared.metrics.render(
+                    &meta,
+                    shared.admission.inflight(),
+                    shared.admission.capacity(),
+                )
             };
-            let body = shared.metrics.render(
-                shared.admission.inflight(),
-                shared.admission.capacity(),
-                uptime,
-                model.as_deref(),
-            );
             let mut resp = Response::builder()
                 .status(200)
                 .header(
@@ -822,7 +1048,7 @@ async fn handle_request(
                 .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                 .header(
                     header::ACCESS_CONTROL_ALLOW_HEADERS,
-                    "Content-Type, Authorization",
+                    "Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta",
                 )
                 .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS")
                 .body(boxed_empty())
@@ -830,6 +1056,20 @@ async fn handle_request(
             resp
         }
         (Method::POST, "/v1/chat/completions") => {
+            handle_generation(req, shared, acks, WireApi::ChatCompletions).await
+        }
+        (Method::POST, "/v1/messages") => {
+            handle_generation(req, shared, acks, WireApi::AnthropicMessages).await
+        }
+        (Method::POST, "/v1/responses") => {
+            handle_generation(req, shared, acks, WireApi::OpenAiResponses).await
+        }
+        // OpenAI-shaped embeddings. The late-interaction extension: each
+        // data object carries `n_tokens` (the embedding field is the flat
+        // K×dim token matrix, not a single pooled vector) and the request
+        // may set `"kind": "query" | "document"` (default document) — the
+        // two sides use different markers and truncation limits.
+        (Method::POST, "/v1/embeddings") => {
             let max_bytes = shared.max_request_bytes;
             if req
                 .headers()
@@ -848,58 +1088,15 @@ async fn handle_request(
                     return openai_error(&msg, status);
                 }
             };
-
-            let (is_eligible, model_for_lease) = {
-                let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
-                let tp = runtime.tp;
-                let arch = runtime.current_arch.clone();
-                let batch_capable = runtime.continuous_batch_capable;
-                let multi_slot = runtime.multi_slot_enabled;
-                drop(runtime);
-                // The admission gate is transport concurrency, not a batch-mode
-                // selector. Experimental slots overlap independent requests
-                // while remaining separate from ContinuousBatchScheduler.
-                let eligible = multi_slot
-                    || is_batch_eligible_request(&body_val, tp, arch.as_deref(), batch_capable);
-                let model = body_val
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_owned());
-                (eligible, model)
-            };
-
-            let mut cancel_guard = CancelOnDrop::new();
-            let cancel = cancel_guard.token();
-            let cancelled = cancel_guard.cancelled();
-
-            let guard = if is_eligible {
-                match shared
-                    .admission
-                    .acquire_for_async(true, model_for_lease.as_deref(), cancel.clone())
-                    .await
-                {
-                    Ok(g) => g,
-                    Err(e) => return admission_error_response(&shared.metrics, &e),
+            match handle_embeddings(Arc::clone(&shared), body_val).await {
+                Ok(resp) => resp,
+                Err(message) => {
+                    let status = embeddings_error_status(&message);
+                    // /v1/embeddings answers in the OpenAI error shape.
+                    RequestFailure::new(message, status)
+                        .respond(WireApi::ChatCompletions, &shared.metrics)
                 }
-            } else {
-                match shared.admission.acquire_async(cancel.clone()).await {
-                    Ok(g) => g,
-                    Err(e) => return admission_error_response(&shared.metrics, &e),
-                }
-            };
-
-            if let Err(error) = gate_chat_completions_tools(&body_val) {
-                return RequestFailure::new(error.to_string(), 400).respond(&shared.metrics);
             }
-
-            let is_stream = body_val.get("stream").and_then(|v| v.as_bool()) == Some(true);
-            let response = if is_stream {
-                handle_streaming(shared, body_val, guard, cancelled, acks).await
-            } else {
-                handle_nonstreaming(shared, body_val, guard, cancelled, acks).await
-            };
-            cancel_guard.disarm();
-            response
         }
         (Method::POST, "/v1/images/generations") => {
             let max_bytes = shared.max_request_bytes;
@@ -924,7 +1121,8 @@ async fn handle_request(
                 Ok(resp) => resp,
                 Err(message) => {
                     let status = images_error_status(&message);
-                    RequestFailure::new(message, status).respond(&shared.metrics)
+                    RequestFailure::new(message, status)
+                        .respond(WireApi::ChatCompletions, &shared.metrics)
                 }
             }
         }
@@ -973,12 +1171,147 @@ async fn handle_request(
                 Ok(resp) => resp,
                 Err(message) => {
                     let status = images_error_status(&message);
-                    RequestFailure::new(message, status).respond(&shared.metrics)
+                    RequestFailure::new(message, status)
+                        .respond(WireApi::ChatCompletions, &shared.metrics)
                 }
             }
         }
+        (Method::POST, "/v1/systemone") => {
+            let max_bytes = shared.max_request_bytes;
+            if req
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|length| length > max_bytes)
+            {
+                return openai_error(&format!("request body exceeds {max_bytes} bytes"), 413);
+            }
+            let body_val = match read_json_body(req.into_body(), max_bytes).await {
+                Ok(v) => v,
+                Err(err) => {
+                    let msg = err.to_string();
+                    let status = if msg.contains("exceeds") { 413 } else { 400 };
+                    return openai_error(&msg, status);
+                }
+            };
+
+            // Same exclusive admission as non-batch chat: the single-daemon
+            // backend serialises decide against chat traffic. The
+            // CancellationToken lets a client disconnect while queued abort
+            // the wait promptly; once acquired, `guard` moves into
+            // `handle_decide`'s spawn_blocking and is held until the daemon
+            // call finishes, not merely until this future is dropped.
+            let mut cancel_guard = CancelOnDrop::new();
+            let cancel = cancel_guard.token();
+            let guard = match shared.admission.acquire_async(cancel.clone()).await {
+                Ok(g) => g,
+                Err(e) => {
+                    return admission_error_response(WireApi::ChatCompletions, &shared.metrics, &e)
+                }
+            };
+            let response = crate::serve::decide::handle_decide(shared, body_val, guard).await;
+            cancel_guard.disarm();
+            response
+        }
         _ => openai_error("not found", 404),
     }
+}
+
+/// One generation request on any [`WireApi`]: body limit, lowering onto the
+/// chat-completions body, then the chat route's admission (same batching
+/// eligibility, same model lease), tool gate and worker. A Messages or
+/// Responses request is admitted exactly as its lowered chat twin.
+async fn handle_generation(
+    req: Request<Incoming>,
+    shared: Arc<ServeShared>,
+    acks: FlushAcks,
+    api: WireApi,
+) -> Response<BoxBody> {
+    let max_bytes = shared.max_request_bytes;
+    if req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > max_bytes)
+    {
+        return api.error_response(&format!("request body exceeds {max_bytes} bytes"), 413);
+    }
+    let raw_body = match read_json_body(req.into_body(), max_bytes).await {
+        Ok(v) => v,
+        Err(err) => {
+            let msg = err.to_string();
+            let status = if msg.contains("exceeds") { 413 } else { 400 };
+            return api.error_response(&msg, status);
+        }
+    };
+    let GenerationRequest {
+        chat: body_val,
+        stream: is_stream,
+        encoding,
+    } = match api.lower(raw_body) {
+        Ok(request) => request,
+        Err(message) => return api.error_response(&message, 400),
+    };
+
+    let (is_eligible, model_for_lease) = {
+        let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
+        let tp = runtime.tp;
+        let arch = runtime.current_arch.clone();
+        let batch_capable = runtime.continuous_batch_capable;
+        let batch_history = runtime.continuous_batch_history;
+        let multi_slot = runtime.multi_slot_enabled;
+        drop(runtime);
+        // The admission gate is transport concurrency, not a batch-mode
+        // selector. Experimental slots overlap independent requests
+        // while remaining separate from ContinuousBatchScheduler.
+        let eligible = multi_slot
+            || is_batch_eligible_request(
+                &body_val,
+                tp,
+                arch.as_deref(),
+                batch_capable,
+                batch_history,
+            );
+        let model = body_val
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned());
+        (eligible, model)
+    };
+
+    let mut cancel_guard = CancelOnDrop::new();
+    let cancel = cancel_guard.token();
+    let cancelled = cancel_guard.cancelled();
+
+    let guard = if is_eligible {
+        match shared
+            .admission
+            .acquire_for_async(true, model_for_lease.as_deref(), cancel.clone())
+            .await
+        {
+            Ok(g) => g,
+            Err(e) => return admission_error_response(api, &shared.metrics, &e),
+        }
+    } else {
+        match shared.admission.acquire_async(cancel.clone()).await {
+            Ok(g) => g,
+            Err(e) => return admission_error_response(api, &shared.metrics, &e),
+        }
+    };
+
+    if let Err(error) = gate_endpoint_tools(&body_val, api.adapter_kind()) {
+        return RequestFailure::new(error.to_string(), 400).respond(api, &shared.metrics);
+    }
+
+    let response = if is_stream {
+        handle_streaming(shared, body_val, encoding, guard, cancelled, acks).await
+    } else {
+        handle_nonstreaming(shared, body_val, encoding, guard, cancelled, acks).await
+    };
+    cancel_guard.disarm();
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -990,10 +1323,227 @@ async fn handle_request(
 /// PNG as `b64_json`. The daemon (not the gateway) is the authority on
 /// sampler/geometry validation — everything it refuses surfaces as a 4xx
 /// here with its message.
+/// `POST /v1/embeddings` — the qwen3.5 multi-vector encoder (arch 17).
+///
+/// Body: `{"input": <string | [string] | {text, image_base64}>, "model"?,
+/// "kind"?: "query"|"document"}`. Reply is OpenAI-shaped `{object:"list",
+/// data:[{object:"embedding", index, n_tokens, embedding:[f32…]}], model,
+/// usage}` where `embedding` is the flat `n_tokens × dim` token matrix
+/// (late interaction), not a pooled vector.
+async fn handle_embeddings(
+    shared: Arc<ServeShared>,
+    body: serde_json::Value,
+) -> Result<Response<BoxBody>, String> {
+    let kind = match body
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("document")
+    {
+        "query" => "query",
+        "document" | "doc" => "document",
+        other => {
+            return Err(format!(
+                "kind {other:?} unsupported: expected \"query\" or \"document\""
+            ))
+        }
+    };
+    // One input per HTTP request; the multi-slot engine batches concurrent
+    // requests behind this endpoint. A list of length 1 is accepted; longer
+    // lists refuse rather than silently dropping inputs.
+    let input = body
+        .get("input")
+        .ok_or_else(|| "input is required".to_string())?;
+    let input = match input {
+        serde_json::Value::Array(items) => match items.as_slice() {
+            [one] => one.clone(),
+            other => {
+                return Err(format!(
+                    "input has {} entries; this endpoint accepts one input per request",
+                    other.len()
+                ))
+            }
+        },
+        other => other.clone(),
+    };
+
+    let request_model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+
+    // Exclusive admission serialized exactly the requests a multi-slot serve
+    // exists to batch; admit the sharing (batch-eligible) class whenever the
+    // serve advertises multi_slot, the same gate the chat route applies. The
+    // request names the resident model (enforced below), so the admission
+    // lease keys on it like a chat request's.
+    let is_eligible = {
+        let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
+        runtime.multi_slot_enabled
+    };
+    let _guard = if is_eligible {
+        match shared
+            .admission
+            .acquire_for_async(true, request_model.as_deref(), CancellationToken::new())
+            .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Ok(admission_error_response(
+                    WireApi::ChatCompletions,
+                    &shared.metrics,
+                    &error,
+                ))
+            }
+        }
+    } else {
+        match shared.admission.acquire_async(CancellationToken::new()).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Ok(admission_error_response(
+                    WireApi::ChatCompletions,
+                    &shared.metrics,
+                    &error,
+                ))
+            }
+        }
+    };
+
+    // Ensure a model is resident before asking the daemon. Unlike the chat
+    // path, an embeddings request carries no model in the general case, so the
+    // fallback is the operator's pre-warm model — which survives
+    // `clear_resident` on the request policy precisely so an evicted serve can
+    // reload. Without this, the first request after the idle timeout failed
+    // with "no model loaded" while chat (which always names a model) kept
+    // working.
+    let (engine, loaded_model) = {
+        let mut runtime = shared
+            .runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if runtime.current_path.is_none() {
+            let name = request_model
+                .clone()
+                .or_else(|| runtime.request_policy.operator_model.clone());
+            let Some(name) = name else {
+                return Err(
+                    "no model resident and this serve has no default model; name one with \
+                     \"model\" or start serve with --model"
+                        .to_string(),
+                );
+            };
+            // A name the REQUESTER supplied is a request load: honor the
+            // request policy (allow_request_paths / allow_pull). Only the
+            // operator's own configured default is an Operator load.
+            let origin = if request_model.as_deref() == Some(name.as_str()) {
+                crate::serve::ModelOrigin::Request
+            } else {
+                crate::serve::ModelOrigin::Operator
+            };
+            runtime
+                .ensure_model(&name, &shared.meta, origin)
+                .map_err(|e| format!("loading {name}: {e}"))?;
+        }
+        (runtime.engine.clone(), runtime.current_path.clone())
+    };
+    // A request that names a DIFFERENT model than the resident one would be
+    // silently answered by the resident checkpoint — the response looks like
+    // a 200 with embeddings from a model the caller didn't ask for. Refuse
+    // instead of swapping (embeddings are cheap and bursty; an implicit
+    // swap per request would thrash the GPU for every other caller).
+    if let Some(name) = request_model.as_deref() {
+        // Resolve the name to its on-disk path when it resolves at all; a
+        // registry tag, an alias and the literal path of the resident model
+        // must all compare equal. An unresolvable name is a mismatch too —
+        // refusing it here is cleaner than letting the daemon answer with
+        // the resident checkpoint.
+        let named_path = {
+            let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
+            crate::resolve_model_path(&runtime.paths, &runtime.registry, name)
+                .ok()
+                .flatten()
+        };
+        let matches = match (&named_path, &loaded_model) {
+            (Some(named), Some(resident)) => named == resident,
+            // No resident model (shouldn't happen — the ensure above either
+            // loaded one or errored) or an unresolvable name: refuse.
+            _ => false,
+        };
+        if !matches {
+            return Err(format!(
+                "requested model {name:?} is not the resident model ({}); \
+                 this serve encodes with the resident model only",
+                loaded_model
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ));
+        }
+    }
+    let model_echo = loaded_model
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .or(request_model)
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let id = request_id();
+    let request = serde_json::json!({
+        "type": "embed",
+        "id": id,
+        "kind": kind,
+        "input": input,
+    });
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<serde_json::Value, String>>();
+    tokio::task::spawn_blocking(move || {
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.embed(&request)));
+        let result = match outcome {
+            Ok(Ok(done)) => Ok(done),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(payload) => Err(format!(
+                "embedding worker panicked: {}",
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string())
+            )),
+        };
+        let _ = tx.send(result);
+    });
+    let done = rx
+        .await
+        .map_err(|_| "embedding worker disconnected".to_string())?
+        .map_err(|e| e)?;
+
+    let n_tokens = done.get("n_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let dim = done.get("dim").and_then(|v| v.as_u64()).unwrap_or(0);
+    let embeddings = done
+        .get("embeddings")
+        .cloned()
+        .unwrap_or(serde_json::Value::Array(vec![]));
+    let payload = serde_json::json!({
+        "object": "list",
+        "data": [{
+            "object": "embedding",
+            "index": 0,
+            "n_tokens": n_tokens,
+            "embedding": embeddings,
+        }],
+        "model": model_echo,
+        "usage": { "prompt_tokens": done.get("n_input_tokens").cloned().unwrap_or(serde_json::json!(0)),
+                   "total_tokens": done.get("n_input_tokens").cloned().unwrap_or(serde_json::json!(0)) },
+        // dim is reported top-level for clients that expect one vector.
+        "dim": dim,
+    });
+    Ok(json_response(payload, 200))
+}
+
 async fn handle_images_generations(
     shared: Arc<ServeShared>,
     body: serde_json::Value,
 ) -> Result<Response<BoxBody>, String> {
+    let started = Instant::now();
     let prompt = body
         .get("prompt")
         .and_then(|v| v.as_str())
@@ -1064,7 +1614,13 @@ async fn handle_images_generations(
         .await
     {
         Ok(guard) => guard,
-        Err(error) => return Ok(admission_error_response(&shared.metrics, &error)),
+        Err(error) => {
+            return Ok(admission_error_response(
+                WireApi::ChatCompletions,
+                &shared.metrics,
+                &error,
+            ))
+        }
     };
 
     let (engine, loaded_model) = {
@@ -1164,6 +1720,9 @@ async fn handle_images_generations(
         let mut meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
         meta.requests_served += 1;
     }
+    shared
+        .metrics
+        .observe_request(started.elapsed().as_secs_f64() * 1000.0);
     let response = serde_json::json!({
         "created": unix_timestamp(),
         "model": model_echo,
@@ -1327,6 +1886,27 @@ fn edits_form_to_body(
     Ok(serde_json::Value::Object(body))
 }
 
+/// Status for `/v1/embeddings` failures. The daemon's overload refusal
+/// ("too many concurrent slot requests") is transient capacity → 429 so a
+/// client retries instead of treating it as a request bug; engine and
+/// worker failures are internal → 500; everything else is the caller's
+/// request → 400. Mirrors [`images_error_status`].
+fn embeddings_error_status(message: &str) -> u16 {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("too many concurrent") || lower.contains("overload") {
+        return 429;
+    }
+    if lower.contains("engine thread exited")
+        || lower.contains("engine is shut down")
+        || lower.contains("worker panicked")
+        || lower.contains("worker disconnected")
+        || lower.contains("daemon closed")
+    {
+        return 500;
+    }
+    400
+}
+
 fn images_error_status(message: &str) -> u16 {
     let lower = message.to_ascii_lowercase();
     if [
@@ -1366,38 +1946,33 @@ const SSE_SILENCE_LIMIT: Duration = Duration::from_secs(15);
 async fn handle_streaming(
     shared: Arc<ServeShared>,
     body: serde_json::Value,
+    encoding: ResponseEncoding,
     guard: AdmissionGuard,
     cancelled: Arc<AtomicBool>,
     acks: FlushAcks,
 ) -> Response<BoxBody> {
+    let api = encoding.api();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ResponseChunk>(32);
     let commit = Arc::new(Mutex::new(StreamCommit::Pending));
+    let id = request_id();
+    let created = unix_timestamp();
+    let model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_owned();
+    let mut encoder = encoding.stream(&id, created, &model);
+    let mut first = VecDeque::from([ResponseChunk::plain(encoder.preamble())]);
     let sink = SseSink {
         tx,
         commit: Arc::clone(&commit),
         committed: Cell::new(false),
         terminal_sent: Cell::new(false),
-        id: request_id(),
-        created: unix_timestamp(),
-        model: body
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_owned(),
-        include_usage: body
-            .pointer("/stream_options/include_usage")
-            .and_then(|v| v.as_bool())
-            == Some(true),
+        id,
+        created,
+        encoder: RefCell::new(encoder),
         stall_timeout: shared.stream_stall_timeout,
     };
-    let role = serde_json::json!({
-        "id": sink.id,
-        "object": "chat.completion.chunk",
-        "created": sink.created,
-        "model": sink.model,
-        "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
-    });
-    let mut first = VecDeque::from([ResponseChunk::plain(sse_data(&role))]);
 
     let body_cancelled = Arc::clone(&cancelled);
     let worker_shared = Arc::clone(&shared);
@@ -1431,15 +2006,15 @@ async fn handle_streaming(
             Some(chunk) => first.push_back(chunk),
             None => {
                 return match commit_stream(&commit) {
-                    Err(failure) => failure.respond(&shared.metrics),
+                    Err(failure) => failure.respond(api, &shared.metrics),
                     Ok(()) => RequestFailure::new("generation ended without a response", 500)
-                        .respond(&shared.metrics),
+                        .respond(api, &shared.metrics),
                 };
             }
         },
         _ = tokio::time::sleep(SSE_SILENCE_LIMIT) => {
             if let Err(failure) = commit_stream(&commit) {
-                return failure.respond(&shared.metrics);
+                return failure.respond(api, &shared.metrics);
             }
         }
     }
@@ -1457,10 +2032,12 @@ async fn handle_streaming(
 async fn handle_nonstreaming(
     shared: Arc<ServeShared>,
     body: serde_json::Value,
+    encoding: ResponseEncoding,
     guard: AdmissionGuard,
     cancelled: Arc<AtomicBool>,
     acks: FlushAcks,
 ) -> Response<BoxBody> {
+    let api = encoding.api();
     // Staged terminal channel: Ok((bytes, ack_tx)) for success, Err(failure) for preterminal.
     let (staged_tx, staged_rx) = tokio::sync::oneshot::channel::<
         Result<(Vec<u8>, std::sync::mpsc::Sender<Result<(), ()>>), RequestFailure>,
@@ -1476,11 +2053,12 @@ async fn handle_nonstreaming(
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let staged_for_terminal = Arc::clone(&staged_tx_for_worker);
             let terminal = |completion: &Completion| {
-                let bytes = serde_json::to_vec(&completion_json(completion)).map_err(|err| {
-                    hipfire_client::ClientError::Protocol(format!(
-                        "completion json serialize failed: {err}"
-                    ))
-                })?;
+                let bytes =
+                    serde_json::to_vec(&encoding.completion_body(completion)).map_err(|err| {
+                        hipfire_client::ClientError::Protocol(format!(
+                            "completion json serialize failed: {err}"
+                        ))
+                    })?;
                 if bytes.is_empty() {
                     return Err(hipfire_client::ClientError::Protocol(
                         "nonstream terminal body must be non-empty".into(),
@@ -1550,9 +2128,9 @@ async fn handle_nonstreaming(
                 .unwrap();
             resp
         }
-        Ok(Err(failure)) => failure.respond(&shared.metrics),
+        Ok(Err(failure)) => failure.respond(api, &shared.metrics),
         Err(_) => {
-            RequestFailure::new("generation worker disconnected", 500).respond(&shared.metrics)
+            RequestFailure::new("generation worker disconnected", 500).respond(api, &shared.metrics)
         }
     }
 }
@@ -1564,8 +2142,8 @@ async fn handle_nonstreaming(
 /// Retry-After for a typed `transient` daemon failure (HTTP 503).
 const TRANSIENT_RETRY_AFTER_SECS: u64 = 1;
 
-/// A failed chat completion. Before a stream commits it is an OpenAI JSON
-/// error with `status`; after, the same body goes out as an SSE error event.
+/// A failed completion. Before a stream commits it is a JSON error in the
+/// request's API shape with `status`; after, the stream's error frame.
 #[derive(Debug)]
 pub(crate) struct RequestFailure {
     message: String,
@@ -1585,9 +2163,9 @@ impl RequestFailure {
     }
 
     /// The JSON error response ending this request; counts it as failed.
-    fn respond(&self, metrics: &Metrics) -> Response<BoxBody> {
+    fn respond(&self, api: WireApi, metrics: &Metrics) -> Response<BoxBody> {
         metrics.record_failure();
-        let mut resp = openai_error(&self.message, self.status);
+        let mut resp = api.error_response(&self.message, self.status);
         if self.status == 503 {
             resp.headers_mut().insert(
                 header::RETRY_AFTER,
@@ -1597,7 +2175,7 @@ impl RequestFailure {
         resp
     }
 
-    /// The error event and `[DONE]` that end a stream failing after commit.
+    /// The error event and `[DONE]` that end a chat stream failing after commit.
     fn sse_event(&self) -> Vec<u8> {
         let mut bytes = sse_data(&openai_error_body(&self.message, self.status));
         bytes.extend_from_slice(b"data: [DONE]\n\n");
@@ -1605,12 +2183,13 @@ impl RequestFailure {
     }
 }
 
-/// HTTP status for a failed completion. A typed daemon error maps on its wire
-/// `class`, never on its message: `validation`, `context_length` and
-/// `unsupported` are the client's to fix (400), `transient` and the
-/// multi-slot engine's `overload` (capacity) are worth a retry (503), and
-/// every other class is a server fault (500). Only gateway-side errors, which
-/// carry no class, fall back to their validation tag, then their message.
+/// HTTP status for a failed completion, by error TYPE, never by message. A
+/// typed daemon error maps on its wire `class`: `validation`,
+/// `context_length` and `unsupported` are the client's to fix (400),
+/// `transient` and the multi-slot engine's `overload` (capacity) are worth a
+/// retry (503), and every other class is a server fault (500). Gateway-side
+/// errors are 400 when they carry [`InvalidRequest`](crate::serve::InvalidRequest),
+/// 404 for [`ModelNotFound`](crate::serve::ModelNotFound), else 500.
 pub(crate) fn request_error_status(error: &anyhow::Error) -> u16 {
     use hipfire_client::error_class;
     let typed = error
@@ -1624,22 +2203,16 @@ pub(crate) fn request_error_status(error: &anyhow::Error) -> u16 {
             _ => 500,
         };
     }
-    let message = error.to_string();
-    if message.contains(crate::serve::REQUEST_VALIDATION_TAG) {
-        return 400;
-    }
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("model not found") {
-        404
-    } else if lower.contains("kv budget")
-        || lower.contains("max_tokens")
-        || lower.contains("invalid")
-        || lower.contains("required")
-        || lower.contains("endpoint adapter")
-        || lower.contains("lossy")
-        || lower.contains("malformed canonical tool call")
+    if error
+        .chain()
+        .any(|cause| cause.is::<crate::serve::InvalidRequest>())
     {
         400
+    } else if error
+        .chain()
+        .any(|cause| cause.is::<crate::serve::ModelNotFound>())
+    {
+        404
     } else {
         500
     }
@@ -1664,7 +2237,29 @@ pub(crate) fn request_id() -> String {
 }
 
 pub(crate) fn sse_data(value: &serde_json::Value) -> Vec<u8> {
-    format!("data: {}\n\n", value).into_bytes()
+    let mut bytes = Vec::with_capacity(128);
+    bytes.extend_from_slice(b"data: ");
+    serde_json::to_writer(&mut bytes, value).expect("serializing a JSON value cannot fail");
+    bytes.extend_from_slice(b"\n\n");
+    bytes
+}
+
+/// One named SSE event (`event:` and `data:` lines), the framing of the
+/// Anthropic Messages and OpenAI Responses streams.
+pub(crate) fn sse_event(name: &str, value: &serde_json::Value) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(160);
+    bytes.extend_from_slice(b"event: ");
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.extend_from_slice(b"\ndata: ");
+    serde_json::to_writer(&mut bytes, value).expect("serializing a JSON value cannot fail");
+    bytes.extend_from_slice(b"\n\n");
+    bytes
+}
+
+/// The per-process part of a [`request_id`] (`chatcmpl-PID-N` → `PID-N`),
+/// from which the Anthropic `msg_…` and Responses `resp_…` ids derive.
+pub(crate) fn id_suffix(request_id: &str) -> &str {
+    request_id.strip_prefix("chatcmpl-").unwrap_or(request_id)
 }
 
 /// Commit point of one SSE response, shared by the handler and its worker.
@@ -1687,7 +2282,7 @@ fn commit_stream(commit: &Mutex<StreamCommit>) -> Result<(), RequestFailure> {
     }
 }
 
-/// Worker end of one OpenAI SSE response.
+/// Worker end of one SSE response, in the request's API framing.
 struct SseSink {
     tx: tokio::sync::mpsc::Sender<ResponseChunk>,
     commit: Arc<Mutex<StreamCommit>>,
@@ -1697,8 +2292,8 @@ struct SseSink {
     terminal_sent: Cell<bool>,
     id: String,
     created: u64,
-    model: String,
-    include_usage: bool,
+    /// Frames the stream for the client's API; only the worker touches it.
+    encoder: RefCell<StreamEncoder>,
     /// Multi-slot route only (`serve.stream_stall_timeout_ms`): how long a
     /// consumer may leave the response channel full, or the terminal frame
     /// unflushed, before the request is aborted and its permit released.
@@ -1774,27 +2369,16 @@ impl SseSink {
     /// plain (no-ack) SSE bytes. No-delta mid-stream events are silent —
     /// terminal ack handles pure-tool delivery.
     fn forward_event(&self, event: &serde_json::Value) -> Result<(), hipfire_client::ClientError> {
-        let Some(delta) = openai_stream_delta_for_event(event) else {
+        let Some(bytes) = self.encoder.borrow_mut().event(event) else {
             return Ok(());
         };
-        let chunk = serde_json::json!({
-            "id": self.id,
-            "object": "chat.completion.chunk",
-            "created": self.created,
-            "model": self.model,
-            "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
-        });
-        self.send(ResponseChunk::plain(sse_data(&chunk)))
+        self.send(ResponseChunk::plain(bytes))
     }
 
-    /// Serialize terminal tool_calls (if safe), finish, optional usage, and
-    /// `[DONE]` into one acknowledged chunk; wait until the socket flushed it.
+    /// Serialize the terminal (released tool calls, finish, usage; chat adds
+    /// `[DONE]`) into one acknowledged chunk; wait until the socket flushed it.
     fn deliver_terminal(&self, completion: &Completion) -> Result<(), hipfire_client::ClientError> {
-        let mut bytes = Vec::new();
-        for chunk in openai_stream_terminal_chunks(completion, self.include_usage) {
-            bytes.extend_from_slice(&sse_data(&chunk));
-        }
-        bytes.extend_from_slice(b"data: [DONE]\n\n");
+        let bytes = self.encoder.borrow_mut().terminal(completion);
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
         self.terminal_sent.set(true);
         self.send(ResponseChunk::last(bytes, Some(ack_tx)))?;
@@ -1806,8 +2390,9 @@ impl SseSink {
     /// - Success or cancel: nothing more to send.
     /// - Failure before the first frame: hand it to the handler, which answers
     ///   with its status instead of a 200.
-    /// - Failure after commit: an SSE error event, then `[DONE]`.
-    /// - Failure after the acknowledged `[DONE]` (e.g. the daemon commit):
+    /// - Failure after commit: the API's error frame (chat: an SSE error
+    ///   event, then `[DONE]`).
+    /// - Failure after the acknowledged terminal (e.g. the daemon commit):
     ///   nothing may follow it, so the body fails and the reader sees it torn.
     fn finish(self, result: Result<Completion>, metrics: &Metrics) {
         let Err(error) = result else {
@@ -1838,9 +2423,8 @@ impl SseSink {
             // The handler committed on its deadline while the worker was silent.
         }
         metrics.record_failure();
-        let _ = self
-            .tx
-            .blocking_send(ResponseChunk::last(failure.sse_event(), None));
+        let bytes = self.encoder.borrow_mut().failure(&failure);
+        let _ = self.tx.blocking_send(ResponseChunk::last(bytes, None));
     }
 }
 
@@ -2127,8 +2711,8 @@ mod tests {
         ))
     }
 
-    /// A typed daemon error gets its status from `class`, whatever its text
-    /// says; only classless gateway errors are matched by message.
+    /// A typed daemon error gets its status from `class`, a gateway error
+    /// from its type; no message text is ever read.
     #[test]
     fn request_error_status_maps_daemon_class_before_message() {
         for (class, status) in [
@@ -2146,8 +2730,8 @@ mod tests {
                 "class {class}"
             );
         }
-        // Text that the gateway fallback reads as a client error does not
-        // override a server-fault class, and vice versa.
+        // Text that reads like a client error does not override a
+        // server-fault class, and vice versa.
         assert_eq!(
             request_error_status(&typed_daemon_error("internal", "invalid state: required")),
             500
@@ -2164,15 +2748,36 @@ mod tests {
             ),
             503
         );
-        // Classless gateway errors keep the message fallback.
+        // Gateway errors map by type, through context layers.
         assert_eq!(
-            request_error_status(&anyhow!("max_tokens must be between 1 and 393216")),
+            request_error_status(
+                &crate::serve::invalid_request!("unsupported tool_choice value: x")
+                    .context("projecting request")
+            ),
             400
         );
-        assert_eq!(request_error_status(&anyhow!("model not found: x")), 404);
+        assert_eq!(
+            request_error_status(&anyhow::Error::new(crate::serve::ModelNotFound(
+                "model not found: x".into()
+            ))),
+            404
+        );
+        // Untyped errors are server faults, whatever their wording.
+        for message in [
+            "boom",
+            "max_tokens must be between 1 and 393216",
+            "model not found: x",
+            "invalid state: required",
+        ] {
+            assert_eq!(
+                request_error_status(&anyhow!("{message}")),
+                500,
+                "{message}"
+            );
+        }
         assert_eq!(
             request_error_status(&anyhow::Error::new(hipfire_client::ClientError::Protocol(
-                "failed to serialize request".into()
+                "malformed canonical tool call: x".into()
             ))),
             500
         );
@@ -2184,6 +2789,9 @@ mod tests {
             vision: false,
             n_embd: 2048,
             n_vocab: 248320,
+            reasoning_contract: String::new(),
+            reasoning_effort_native: false,
+            reasoning_efforts: Vec::new(),
         };
         let resident = model_entry("qwen3.5:2b", Some(1790385975), Some((&loaded, 82944)));
         assert_eq!(resident["created"], serde_json::json!(1790385975u64));
@@ -2213,6 +2821,9 @@ mod tests {
             vision: true,
             n_embd: 5120,
             n_vocab: 248320,
+            reasoning_contract: String::new(),
+            reasoning_effort_native: false,
+            reasoning_efforts: Vec::new(),
         };
         let entry = model_entry("qwen3.8:27b", None, Some((&vision, 150000)));
         assert_eq!(
@@ -2230,5 +2841,33 @@ mod tests {
         assert!(entry.get("created").is_none());
         assert!(entry.get("meta").is_none());
         assert!(entry.get("architecture").is_none());
+    }
+
+    #[test]
+    fn model_entry_publishes_reasoning_facts_for_resident_model() {
+        // The same facts /health serves from meta.loaded, on the model
+        // discovery surface, and skipped while the contract is unknown
+        // (load window / non-reasoning default-empty).
+        let loaded = LoadedInfo {
+            reasoning_contract: "qwen_jinja".into(),
+            reasoning_effort_native: false,
+            reasoning_efforts: vec!["low".into(), "high".into()],
+            n_embd: 2048,
+            ..LoadedInfo::default()
+        };
+        let entry = model_entry("qwen3.5:4b", None, Some((&loaded, 8192)));
+        assert_eq!(entry["architecture"]["reasoning_contract"], "qwen_jinja");
+        assert_eq!(entry["architecture"]["reasoning_effort_native"], false);
+        assert_eq!(
+            entry["architecture"]["reasoning_efforts"],
+            serde_json::json!(["low", "high"])
+        );
+        // Empty contract (ack not in): no reasoning keys at all.
+        let unknown = LoadedInfo {
+            n_embd: 2048,
+            ..LoadedInfo::default()
+        };
+        let bare = model_entry("qwen3.5:4b", None, Some((&unknown, 8192)));
+        assert!(bare["architecture"].get("reasoning_contract").is_none());
     }
 }

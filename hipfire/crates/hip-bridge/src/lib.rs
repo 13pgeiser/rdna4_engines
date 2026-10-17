@@ -12,34 +12,41 @@
 mod error;
 mod ffi;
 mod kernarg;
+mod launch_grid;
 mod rccl;
+pub mod registry;
 mod rocblas;
 mod rocsolver;
 mod vmm;
 
 pub use error::{
     HipError, HipErrorCode, HipResult, LaunchContext, HIP_ERROR_INVALID_IMAGE,
-    HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_NOT_ENABLED,
-    HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
+    HIP_ERROR_OUT_OF_MEMORY, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
+    HIP_ERROR_PEER_ACCESS_NOT_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
-pub use ffi::arm_hip_fault;
-pub use ffi::launch_counters;
+pub use ffi::{arm_hip_fault, keep_host_memory_out_of_reclaim};
+pub use ffi::{launch_counters, memory_effects};
 pub use ffi::{
     Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp,
-    HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, Module, Stream,
+    HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, Module,
+    PinnedHostBuffer, PinnedTransferBuffer, Stream,
     HIP_ERROR_NOT_READY, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
-    HIP_HOST_MALLOC_MAPPED, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM,
-    HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED, HIP_MEM_LOCATION_TYPE_DEVICE,
-    HIP_MEM_LOCATION_TYPE_HOST, QWEN4_EXPERT_VRAM_LAYERS_ENV,
+    HIP_HOST_MALLOC_MAPPED, HIP_MEM_ACCESS_FLAGS_PROT_READ, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM,
+    HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED, HIP_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+    HIP_MEM_LOCATION_TYPE_DEVICE, HIP_MEM_LOCATION_TYPE_HOST, QWEN4_EXPERT_VRAM_LAYERS_ENV,
 };
 pub use kernarg::KernargBlob;
+pub use launch_grid::{check_launch_grid, grid_yz_limit_for_arch, GFX1201_MAX_GRID_YZ};
 pub use rccl::{RcclComms, RcclDataType, RcclError, RcclRedOp, RcclResult, NCCL_SUCCESS};
 pub use rocblas::{Rocblas, RocblasDatatype, RocblasError, RocblasOperation, RocblasResult};
 pub use rocsolver::{
     RocblasDiagonal, RocblasFill, Rocsolver, RocsolverError, RocsolverResult,
     ROCSOLVER_STATUS_SUCCESS,
 };
-pub use vmm::{clear_vmm_faults, inject_vmm_fault, retired_va_bytes, VmmArena, VmmFaultKind};
+pub use vmm::{
+    clear_vmm_faults, inject_vmm_fault, retired_va_bytes, retry_pending_granule_releases,
+    vmm_live_granule_bytes, VmmArena, VmmFaultKind, VmmPhysicalId, VmmSharedPrefix,
+};
 
 /// Re-export memory copy direction for callers.
 #[repr(u32)]

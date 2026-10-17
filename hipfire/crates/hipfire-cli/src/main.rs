@@ -16,14 +16,15 @@ use hipfire_client::{
 use hipfire_config::{
     apply_config_profile, canonical_config_key, create_config_profile, developer_env_for_key,
     field, fields, is_developer_key, load_catalog, load_env_layer, load_global, resolve,
-    write_catalog_toml, write_global_toml, CatalogFormat, ConfigFormat, ConfigLayer, ConfigPaths,
-    ConfigSource, NamedLayer, ValueRule, CONFIG_SCHEMA_VERSION,
+    unknown_key, write_catalog_toml, write_global_toml, CatalogFormat, ConfigFormat, ConfigLayer,
+    ConfigPaths, ConfigSource, NamedLayer, ValueRule, CONFIG_SCHEMA_VERSION,
 };
 use hipfire_registry::{
     load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
-    Sidecar,
+    Sidecar, TrunkOverlayPin, TRUNK_OVERLAY_PINS,
 };
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::offload_calibrate::{CalibrateOptions, CalibrationReport};
 use hipfire_runtime::prompt_frame::ToolCall;
 use saddle_core::caps::ReasoningContract;
 use saddle_core::kv::KvBackend;
@@ -49,8 +50,11 @@ use std::{
 };
 
 mod bench_concurrency;
-mod serve;
+mod bench_power;
 mod kernel_pack;
+mod npu_trunk;
+mod ple;
+mod serve;
 mod setup;
 use crate::serve::complete::next_attempt_id;
 use crate::serve::http::request_id;
@@ -99,6 +103,7 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Commands {
+    /// View or change settings (global or per-model); no arguments opens the TUI.
     Config(ConfigArgs),
     /// Inspect or refresh the signed-model-registry migration surface.
     Registry(RegistryArgs),
@@ -117,6 +122,8 @@ pub(crate) enum Commands {
     Ps(OutputArgs),
     /// Benchmark a model through the native daemon protocol.
     Bench(BenchArgs),
+    /// Measure this host's GPU share for a split offload step.
+    OffloadBench(OffloadBenchArgs),
     /// Report compiled kernel inventory for the detected architecture.
     Profile(ProfileArgs),
     /// Print build, source-checkout, and installed-daemon identity.
@@ -136,6 +143,9 @@ pub(crate) enum Commands {
     Run(RunArgs),
     /// Generate an image (txt2img) through a fresh native daemon process.
     Img(ImgArgs),
+    /// Encode text (or an image) with an embedding model; optionally score a
+    /// query against a document with late-interaction MaxSim.
+    Embed(EmbedArgs),
     /// Start an interactive conversation through the native HTTP service.
     Chat(ChatArgs),
     /// Start the native OpenAI-compatible HTTP service.
@@ -144,6 +154,10 @@ pub(crate) enum Commands {
     Stop(StopArgs),
     /// Stop and start the native HTTP service.
     Restart(ServeArgs),
+    /// Derive or split the Flash-Next PLE row sidecars (`<model>.ple-q4`, `<base>.ple-q8`).
+    Ple(ple::PleArgs),
+    /// Write a keyed NPU trunk calibration from offline measurement inputs.
+    CalibrateNpuTrunk(npu_trunk::CalibrateArgs),
 }
 
 #[derive(Args, Debug)]
@@ -395,6 +409,11 @@ pub(crate) struct PullArgs {
     /// Replace an existing target after downloading and verifying a new copy.
     #[arg(long)]
     force: bool,
+    /// Which PLE row sidecar a split model pulls next to its base: `auto`
+    /// (memory.ple_format, else q4 on gfx1151 and q8 elsewhere), `q4`, `q8`,
+    /// `all`, or `none` (fetched on first load).
+    #[arg(long, value_enum, default_value_t = ple::PleSelection::Auto)]
+    ple: ple::PleSelection,
 }
 
 #[derive(Args, Debug)]
@@ -452,6 +471,10 @@ struct RunArgs {
     /// Tensor/expert-parallel degree for this model load (same admission as `serve --tp` / `bench --tp`).
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
     tp: Option<u64>,
+    /// KV context (`max_seq`) for this model load, within the `memory.max_seq`
+    /// bounds; overrides the configured/automatic context.
+    #[arg(long, value_parser = parse_max_seq_arg, value_name = "N")]
+    max_seq: Option<u64>,
     /// Select one speculative mechanism: off, auto, ngram, dflash, mtp, or dspark.
     #[arg(long = "spec", alias = "speculation")]
     speculation: Option<String>,
@@ -477,6 +500,9 @@ struct RunArgs {
     #[arg(short = 'j', long)]
     /// Emit one JSON result object.
     json: bool,
+    #[arg(long)]
+    /// Print authoritative generation metrics on stderr (except with --json).
+    stats: bool,
     #[arg(long)]
     /// Buffer visible output instead of streaming it.
     no_stream: bool,
@@ -523,6 +549,35 @@ struct ImgArgs {
     #[arg(long)]
     backend: Option<String>,
     /// Emit one JSON result object instead of the progress lines.
+    #[arg(short = 'j', long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct EmbedArgs {
+    /// Model tag, alias, or path to an embedding checkpoint dir (HF
+    /// snapshot of e.g. `pplx-embed-v2-late-0.6b`) or a raw-dtype `.hfq`.
+    model: String,
+    /// Text to encode (query- or document-side per `--kind`). Quote it to
+    /// preserve exact whitespace.
+    #[arg(num_args = 0..)]
+    text: Vec<String>,
+    /// Query-side text. With `--doc`, prints the MaxSim score of query
+    /// against document.
+    #[arg(long)]
+    query: Option<String>,
+    /// Document-side text (with `--query`).
+    #[arg(long)]
+    doc: Option<String>,
+    /// Side for the positional text: `query` or `document` (default
+    /// `document`).
+    #[arg(long)]
+    kind: Option<String>,
+    /// Image input (PNG/JPEG); encoded with the checkpoint's vision tower.
+    #[arg(long = "image", value_name = "PATH")]
+    image: Option<PathBuf>,
+    /// Emit the full JSON result (token-embedding matrix / score object)
+    /// instead of the human summary.
     #[arg(short = 'j', long)]
     json: bool,
 }
@@ -580,9 +635,10 @@ pub(crate) struct BenchArgs {
     ctx: Vec<usize>,
     #[arg(long, default_value_t = 128)]
     tg: usize,
-    /// Generated tokens per standard-bench measurement run.
-    #[arg(long, default_value_t = 128)]
-    max_tokens: usize,
+    /// Generated tokens per measured request: default 128 on the standard
+    /// bench, 256 on the `--concurrency` `steady` shape.
+    #[arg(long)]
+    max_tokens: Option<usize>,
     #[arg(long)]
     sustained_tg: Option<usize>,
     #[arg(long, value_delimiter = ',', default_value = "128,8192")]
@@ -601,6 +657,12 @@ pub(crate) struct BenchArgs {
     #[arg(long, value_parser = parse_kv_backend_arg, value_name = "legacy|vmm")]
     /// KV storage backend override (`legacy` or `vmm`).
     kv_backend: Option<String>,
+    /// KV context (`max_seq`) for the benchmark load, within the
+    /// `memory.max_seq` bounds. Omitted, `--matrix`/`--redline` size the load
+    /// to the run (largest `--pp`, or `--ctx` + `--tg`, plus 32) and every
+    /// other path keeps the configured/automatic context.
+    #[arg(long, value_parser = parse_max_seq_arg, value_name = "N")]
+    max_seq: Option<u64>,
     #[arg(long)]
     redline: bool,
     /// Speculation mode to benchmark (off, dflash, mtp, ngram, dspark, or auto).
@@ -612,17 +674,37 @@ pub(crate) struct BenchArgs {
     /// Pair this with `--max-tokens` large enough for the span to close.
     #[arg(long = "reasoning-on")]
     reasoning_on: bool,
-    /// Sweep concurrent stream counts, e.g. `1,2,3,4`. Absent leaves bench
-    /// on its single-stream path, unchanged.
+    /// Sweep closed-loop concurrency levels, e.g. `1,2,4,8`: at each level K,
+    /// K client lanes drain the shape's N requests. Absent leaves bench on
+    /// its single-stream path, unchanged.
     #[arg(long)]
     concurrency: Option<String>,
-    /// Which backend to drive: slots (multi-slot engine), noslots (sequential
-    /// daemon baseline), batch (beta continuous batching), or both.
+    /// Which backend to drive: slots (multi-slot engine), noslots (one
+    /// request at a time, lanes queue), batch (the VMM continuous-batching
+    /// route of `hipfire serve` with `serve.vmm_batch`), or both (all three).
     #[arg(long, value_parser = ["slots", "noslots", "batch", "both"], default_value = "both")]
     backend: String,
-    /// Which workload arm to run: stateless, multiturn, or both.
+    /// Which workload arm to run: stateless, multiturn (two-turn chats, the
+    /// follow-up sent on the same lane), or both.
     #[arg(long, value_parser = ["stateless", "multiturn", "both"], default_value = "both")]
     workload: String,
+    /// `--concurrency` request population: `steady` (64 long-answer code
+    /// prompts, fixed --max-tokens, greedy) or `betterbench` (BetterBench
+    /// 0.6.0's concurrency workload over --bb-corpus).
+    #[arg(long, value_parser = ["steady", "betterbench"], default_value = "steady")]
+    bench_shape: String,
+    /// BetterBench corpus directory (`*.jsonl` per category) for
+    /// `--bench-shape betterbench`.
+    #[arg(long, value_name = "DIR")]
+    bb_corpus: Option<PathBuf>,
+    /// `--concurrency` measured requests per sample (default 64 `steady`,
+    /// 48 `betterbench`); request i is prompt i modulo the shape's list.
+    #[arg(long, value_name = "N")]
+    num_prompts: Option<usize>,
+    /// `--concurrency` sampling temperature (default 0 `steady`, 0.7
+    /// `betterbench`).
+    #[arg(long)]
+    temperature: Option<f64>,
     /// Prompt words for the standard benchmark.
     #[arg(num_args = 0..)]
     prompt: Vec<String>,
@@ -630,6 +712,36 @@ pub(crate) struct BenchArgs {
     /// no trimming). Mutually exclusive with positional PROMPT words.
     #[arg(long, conflicts_with = "prompt")]
     prompt_file: Option<PathBuf>,
+}
+
+impl BenchArgs {
+    /// `--max-tokens` on the standard (single-stream) bench, default 128.
+    fn standard_max_tokens(&self) -> usize {
+        self.max_tokens.unwrap_or(128)
+    }
+}
+
+#[derive(Args, Debug)]
+struct OffloadBenchArgs {
+    /// Emit machine-readable JSON.
+    #[arg(short = 'j', long)]
+    json: bool,
+    /// Measure one format instead of the default matrix: a quant name (`mq4`,
+    /// `mq4g256v2`, …) or a `.hfq` wire quant_type number.
+    #[arg(long, value_name = "NAME|QT")]
+    format: Option<String>,
+    /// Activation width to measure at (default: the 9B trunk's hidden size).
+    #[arg(long, value_name = "N")]
+    k: Option<usize>,
+    /// Weight megabytes per format.
+    #[arg(long, value_name = "MB")]
+    buffer_mb: Option<usize>,
+    /// Timed reps per engine; the median is reported.
+    #[arg(long, value_name = "N")]
+    reps: Option<usize>,
+    /// Persist the recommended share (the median over the largest measurements).
+    #[arg(long)]
+    write: bool,
 }
 
 #[derive(Args, Debug)]
@@ -731,9 +843,28 @@ pub(crate) struct ServeArgs {
     /// Tensor/expert-parallel degree.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
     tp: Option<u64>,
+    /// Speculation mode for models loaded by this service: off, auto, ngram,
+    /// dflash, mtp, or dspark. Overrides `speculation.mode` and per-model
+    /// speculation settings; `--spec off` disables MTP/DFlash.
+    #[arg(
+        long = "spec",
+        alias = "speculation",
+        value_parser = ["off", "auto", "ngram", "dflash", "mtp", "dspark"]
+    )]
+    speculation: Option<String>,
+    /// KV context (`max_seq`) for models loaded by this service, within the
+    /// `memory.max_seq` bounds; overrides the configured/automatic context.
+    #[arg(long, value_parser = parse_max_seq_arg, value_name = "N")]
+    max_seq: Option<u64>,
     /// Maximum concurrent eligible batched lanes; 1 preserves sequential behavior.
-    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=256))]
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=hipfire_config::MAX_CONTINUOUS_BATCH_SIZE))]
     continuous_batch_size: Option<u64>,
+    /// Serve the embedded chat UI at /ui on the serve listener.
+    #[arg(long)]
+    ui: bool,
+    /// Open the chat UI in the default browser once serving (implies --ui).
+    #[arg(long)]
+    open: bool,
     /// Internal marker used by the detached child.
     #[arg(long, hide = true)]
     foreground_child: bool,
@@ -788,6 +919,24 @@ fn run() -> Result<()> {
             argument
         }
     }));
+    // Print-only commands die quietly on a closed stdout (`hipfire list -r |
+    // head -1`) like any Unix filter instead of panicking in `println!`.
+    // Commands that drive a daemon, server or child over pipes keep Rust's
+    // ignored SIGPIPE so a dead peer is an EPIPE error, not a silent exit.
+    if matches!(
+        cli.command,
+        Some(
+            Commands::List(_)
+                | Commands::Registry(_)
+                | Commands::Config(_)
+                | Commands::Ps(_)
+                | Commands::Version(_)
+                | Commands::Rm(_)
+        )
+    ) {
+        // SAFETY: restores the default disposition before any thread starts.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
     let paths = Paths::discover();
     match cli.command {
         None => launch_tui(&paths, &[]),
@@ -796,10 +945,13 @@ fn run() -> Result<()> {
         Some(Commands::Registry(args)) => registry_command(&paths, args),
         Some(Commands::List(args)) => list_command(&paths, args),
         Some(Commands::Pull(args)) => pull_command(&paths, args),
+        Some(Commands::Ple(args)) => ple::ple_command(&paths, args),
+        Some(Commands::CalibrateNpuTrunk(args)) => npu_trunk::calibrate_command(args),
         Some(Commands::Rm(args)) => rm_command(&paths, args),
         Some(Commands::Diag(output)) => diag_command(&paths, output),
         Some(Commands::Ps(output)) => ps_command(&paths, output),
         Some(Commands::Bench(args)) => bench_command(&paths, args),
+        Some(Commands::OffloadBench(args)) => offload_bench_command(&paths, args),
         Some(Commands::Profile(args)) => profile_command(&paths, args),
         Some(Commands::Version(output)) => version_command(&paths, output),
         Some(Commands::Update(args)) => update_command(&paths, args),
@@ -811,6 +963,7 @@ fn run() -> Result<()> {
         Some(Commands::SidecarGen(args)) => sidecar_command(&paths, args),
         Some(Commands::Run(args)) => run_command(&paths, args),
         Some(Commands::Img(args)) => img_command(&paths, args),
+        Some(Commands::Embed(args)) => embed_command(&paths, args),
         Some(Commands::Chat(args)) => chat_command(&paths, args),
         Some(Commands::Serve(args)) => crate::serve::serve_command(&paths, args),
         Some(Commands::Stop(args)) => crate::serve::stop_command(&paths, args),
@@ -940,8 +1093,7 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
         }
         ConfigAction::Get { key, output } => {
             let (_, resolved) = resolved_global(paths, true)?;
-            let canonical = canonical_config_key(&key)
-                .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let canonical = canonical_config_key(&key).ok_or_else(|| unknown_key(&key))?;
             let schema = field(&canonical);
             let value = resolved
                 .get(&canonical)
@@ -965,8 +1117,7 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
             let mut loaded = load_global(&paths.config)?;
             loaded.layer.set_cli(&key, &value)?;
             write_global_toml(&paths.config, &loaded.layer)?;
-            let canonical = canonical_config_key(&key)
-                .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let canonical = canonical_config_key(&key).ok_or_else(|| unknown_key(&key))?;
             let value = loaded
                 .layer
                 .get(&canonical)
@@ -984,8 +1135,7 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
         ConfigAction::Reset { key } => {
             let mut loaded = load_global(&paths.config)?;
             if let Some(key) = key {
-                let canonical = canonical_config_key(&key)
-                    .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+                let canonical = canonical_config_key(&key).ok_or_else(|| unknown_key(&key))?;
                 let existed = loaded.layer.remove(&canonical)?.is_some();
                 write_global_toml(&paths.config, &loaded.layer)?;
                 if existed {
@@ -1001,8 +1151,7 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
         }
         ConfigAction::Explain { key, output } => {
             let (loaded, resolved) = resolved_global(paths, true)?;
-            let canonical = canonical_config_key(&key)
-                .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let canonical = canonical_config_key(&key).ok_or_else(|| unknown_key(&key))?;
             let value = resolved
                 .get(&canonical)
                 .ok_or_else(|| anyhow!("configuration key '{canonical}' is not set"))?;
@@ -1054,8 +1203,7 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
                 }
                 return Ok(());
             }
-            let schema = field(&canonical)
-                .ok_or_else(|| anyhow!("unknown configuration key '{canonical}'"))?;
+            let schema = field(&canonical).ok_or_else(|| unknown_key(&canonical))?;
             if output.json {
                 println!(
                     "{}",
@@ -1325,7 +1473,7 @@ fn model_config_command(
                 bail!("developer configuration is global process policy; omit the model argument");
             }
             let resolved = resolved_for_model(paths, model_name, tag.as_deref(), entry)?;
-            let schema = field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let schema = field(&key).ok_or_else(|| unknown_key(&key))?;
             let value = resolved
                 .get(schema.key)
                 .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
@@ -1365,8 +1513,7 @@ fn model_config_command(
                     record.registry_tag = tag.clone();
                 }
                 record.overrides.set_cli(&key, &value)?;
-                let schema =
-                    field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+                let schema = field(&key).ok_or_else(|| unknown_key(&key))?;
                 let saved = record
                     .overrides
                     .get(schema.key)
@@ -1397,8 +1544,7 @@ fn model_config_command(
                 anyhow!("model '{model_name}' has no catalog entry for id '{id}'")
             })?;
             if let Some(key) = key {
-                let schema =
-                    field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+                let schema = field(&key).ok_or_else(|| unknown_key(&key))?;
                 let existed = record.overrides.remove(schema.key)?.is_some();
                 if existed {
                     println!("{id} {} override removed", schema.key);
@@ -1417,7 +1563,7 @@ fn model_config_command(
                 bail!("developer configuration is global process policy; omit the model argument");
             }
             let resolved = resolved_for_model(paths, model_name, tag.as_deref(), entry)?;
-            let schema = field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let schema = field(&key).ok_or_else(|| unknown_key(&key))?;
             let value = resolved
                 .get(schema.key)
                 .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
@@ -1547,7 +1693,7 @@ fn registry_command(paths: &Paths, args: RegistryArgs) -> Result<()> {
                     let (canonical, entry) = loaded
                         .registry
                         .model(&tag)
-                        .ok_or_else(|| anyhow!("unknown model '{tag}'"))?;
+                        .ok_or_else(|| unknown_model_error(&loaded.registry, &tag))?;
                     if output.json {
                         println!(
                             "{}",
@@ -1653,7 +1799,7 @@ fn list_command(paths: &Paths, args: ListArgs) -> Result<()> {
         return Ok(());
     }
     if local.is_empty() {
-        println!("No local models. Pull one:\n  hipfire pull qwen3.6:35b-a3b-mq4r");
+        println!("No local models. Pull one:\n  hipfire pull qwen3.5:4b");
     } else {
         println!("Local models:\n");
         for model in &local {
@@ -1802,11 +1948,21 @@ pub(crate) fn local_model_paths(paths: &Paths, registry: &RegistryV1) -> Result<
 }
 
 pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
+    pull_with_overlay_pins(paths, args, TRUNK_OVERLAY_PINS)
+}
+
+/// [`pull_command`] with an explicit trunk-overlay pin table (production passes
+/// [`TRUNK_OVERLAY_PINS`]; tests inject fixture pins).
+fn pull_with_overlay_pins(
+    paths: &Paths,
+    args: PullArgs,
+    overlay_pins: &[TrunkOverlayPin],
+) -> Result<()> {
     let loaded = load_registry(&paths.registry);
     let (tag, entry) = loaded
         .registry
         .model(&args.model)
-        .ok_or_else(|| anyhow!("unknown model '{}'", args.model))?;
+        .ok_or_else(|| unknown_model_error(&loaded.registry, &args.model))?;
     if entry.repo.is_empty() {
         bail!(
             "cannot pull {tag}: registry entry is local-only; place {} in {}",
@@ -1817,8 +1973,16 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
     fs::create_dir_all(&paths.models)
         .with_context(|| format!("failed to create {}", paths.models.display()))?;
     let destination = paths.models.join(&entry.file);
+    let migrated = if args.force {
+        None
+    } else {
+        migrate_flash_next_xts(paths, entry)?
+    };
     let needs_base = if args.force {
         true
+    } else if let Some(path) = migrated {
+        eprintln!("Already downloaded: {}", path.display());
+        false
     } else if destination.exists() {
         if existing_artifact_valid(&destination, entry.sha256.as_deref(), entry.size_bytes) {
             eprintln!("Already downloaded: {}", destination.display());
@@ -1830,6 +1994,9 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
     } else {
         true
     };
+    let ple_plan = entry
+        .has_ple_sidecars()
+        .then(|| ple::announce_pull_plan(paths, &loaded.registry, entry, args.ple, !needs_base));
     if needs_base {
         let url = artifact_url(entry, &entry.file);
         eprintln!("Pulling {tag} ({:.2} GB)...", entry.size_gb);
@@ -1840,6 +2007,32 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
             entry.size_bytes,
             false,
         )?;
+        if entry.is_flash_next_xts() {
+            // The download has already verified the canonical payload.
+            let legacy = paths
+                .models
+                .join(hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE);
+            if install_verified_link(&destination, &legacy)?
+                && !same_installed_file(&destination, &legacy)
+            {
+                verified_metadata(
+                    &legacy,
+                    entry.sha256.as_deref().expect("pinned digest"),
+                    entry.size_bytes.expect("pinned size"),
+                )?;
+            }
+        }
+    }
+    if let Some(plan) = &ple_plan {
+        for (format, sidecar) in &plan.sidecars {
+            ple::fetch_ple_sidecar(
+                entry,
+                *format,
+                sidecar,
+                &paths.models.join(&sidecar.file),
+                args.force,
+            )?;
+        }
     }
     for (label, sidecar) in [
         ("TriAttention", entry.triattn.as_ref()),
@@ -1853,31 +2046,20 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
         ("Qwen3", entry.qwen3.as_ref()),
         ("VAE", entry.vae.as_ref()),
     ] {
-        let Some(sidecar) = sidecar else {
-            continue;
-        };
-        let destination = paths.models.join(&sidecar.file);
-        if destination.exists() && !args.force {
-            if existing_artifact_valid(&destination, sidecar.sha256.as_deref(), sidecar.size_bytes)
-            {
-                eprintln!("  {label} sidecar already present: {}", sidecar.file);
-                continue;
-            }
-            eprintln!("  {label} sidecar stale, refreshing: {}", sidecar.file);
-        } else if destination.exists() && args.force {
-            // force always refreshes
+        if let Some(sidecar) = sidecar {
+            fetch_registry_sidecar(label, &entry.repo, sidecar, &paths.models, args.force);
         }
-        eprintln!("  Fetching {label} sidecar: {}", sidecar.file);
-        let url = artifact_url(entry, &sidecar.file);
-        if let Err(error) = download_verified(
-            &url,
-            &destination,
-            sidecar.sha256.as_deref(),
-            sidecar.size_bytes,
-            true,
-        ) {
-            eprintln!("  warning: {label} sidecar unavailable: {error:#}");
-        }
+    }
+    // The trunk overlay is not a registry field: the client carries its pin,
+    // keyed by the exact base artifact (`TRUNK_OVERLAY_PINS`).
+    if let Some(overlay) = hipfire_registry::trunk_overlay_in(entry, overlay_pins) {
+        fetch_registry_sidecar(
+            "Trunk overlay",
+            overlay.repo,
+            &overlay.sidecar,
+            &paths.models,
+            args.force,
+        );
     }
     for (name, sidecar) in &entry.heads {
         let destination = paths.models.join(&sidecar.file);
@@ -1902,17 +2084,43 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
     Ok(())
 }
 
+/// Fetch one optional registry sidecar into `models`: an existing valid file is
+/// kept, a stale one (or any under `force`) is refreshed through
+/// [`download_verified`]. A failed download only warns; the base stays usable.
+fn fetch_registry_sidecar(label: &str, repo: &str, sidecar: &Sidecar, models: &Path, force: bool) {
+    let destination = models.join(&sidecar.file);
+    if destination.exists() && !force {
+        if existing_artifact_valid(&destination, sidecar.sha256.as_deref(), sidecar.size_bytes) {
+            eprintln!("  {label} sidecar already present: {}", sidecar.file);
+            return;
+        }
+        eprintln!("  {label} sidecar stale, refreshing: {}", sidecar.file);
+    }
+    eprintln!("  Fetching {label} sidecar: {}", sidecar.file);
+    if let Err(error) = download_verified(
+        &artifact_url_in(repo, &sidecar.file),
+        &destination,
+        sidecar.sha256.as_deref(),
+        sidecar.size_bytes,
+        true,
+    ) {
+        eprintln!("  warning: {label} sidecar unavailable: {error:#}");
+    }
+}
+
 pub(crate) fn artifact_url(entry: &ModelEntry, file: &str) -> String {
+    artifact_url_in(&entry.repo, file)
+}
+
+fn artifact_url_in(repo: &str, file: &str) -> String {
     let base = env::var("HIPFIRE_HF_BASE")
         .or_else(|_| env::var("HF_ENDPOINT"))
         .unwrap_or_else(|_| "https://huggingface.co".into());
-    format!(
-        "{}/{}/resolve/main/{}",
-        base.trim_end_matches('/'),
-        entry.repo,
-        file
-    )
+    format!("{}/{}/resolve/main/{}", base.trim_end_matches('/'), repo, file)
 }
+
+#[cfg(test)]
+thread_local! { static DOWNLOAD_INVOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
 pub(crate) fn download_verified(
     url: &str,
@@ -1921,6 +2129,8 @@ pub(crate) fn download_verified(
     expected_size: Option<u64>,
     quiet: bool,
 ) -> Result<()> {
+    #[cfg(test)]
+    DOWNLOAD_INVOCATIONS.with(|count| count.set(count.get() + 1));
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(24 * 60 * 60)))
         .http_status_as_error(false)
@@ -2060,17 +2270,34 @@ fn rm_command(paths: &Paths, args: RmArgs) -> Result<()> {
 /// shared: several registry entries can name the same `dflash.file` (e.g.
 /// `qwen3.8:27b`, `qwen3.8:27b-mq4-pro`, and `qwen3.8:27b-mq4-xt` all declare
 /// `qwen38-27b-dflash-mq4.hfq`). Deleting it while a sibling declarer is
-/// still on disk leaves those siblings running AR under `dflash_mode=auto`
+/// still on disk leaves those siblings without their paired draft under `dflash_mode=auto`
 /// or refusing to load under `on`, so the sidecar is kept — with one stderr
 /// line — whenever any OTHER entry declaring the same file still has its own
 /// target file present in the models dir. The `vision` tower sidecar follows
 /// the same shared-keeper rule (every `qwen3.8:27b*` tier declares the one
 /// `qwen3.8-27b-vision.hfq`).
 fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Result<()> {
+    rm_with_overlay_pins(paths, registry, TRUNK_OVERLAY_PINS, args)
+}
+
+/// [`rm_with_registry`] with an explicit trunk-overlay pin table (production
+/// passes [`TRUNK_OVERLAY_PINS`]; tests inject fixture pins).
+fn rm_with_overlay_pins(
+    paths: &Paths,
+    registry: &RegistryV1,
+    overlay_pins: &[TrunkOverlayPin],
+    args: RmArgs,
+) -> Result<()> {
     let resolved = registry_entry_for_path(paths, registry, &args.model);
     let path = find_model_path(paths, registry, &args.model)
         .unwrap_or_else(|| paths.models.join(&args.model));
     if !path.is_file() {
+        if let Some((tag, _)) = registry.model(&args.model) {
+            bail!("{tag} is not downloaded; nothing to remove");
+        }
+        if !args.model.contains(std::path::MAIN_SEPARATOR) {
+            return Err(unknown_model_error(registry, &args.model));
+        }
         bail!("model not found: {}", path.display());
     }
     let mut targets = BTreeSet::from([path.clone()]);
@@ -2101,6 +2328,12 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
             .map(|sidecar| paths.models.join(&sidecar.file))
             .filter(|path| path.is_file()),
         );
+        if let Some(overlay) = hipfire_registry::trunk_overlay_in(entry, overlay_pins) {
+            let overlay_path = paths.models.join(&overlay.sidecar.file);
+            if overlay_path.is_file() {
+                targets.insert(overlay_path);
+            }
+        }
         if let Some(sidecar) = entry.dflash.as_ref() {
             let sidecar_path = paths.models.join(&sidecar.file);
             if sidecar_path.is_file() {
@@ -2236,6 +2469,19 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
             );
         }
     }
+    // The PLE row sidecars (and their hot-row packs) ride with the model file
+    // that was resolved, whichever layout it is.
+    targets.extend(
+        ple::ple_sidecar_paths(&path)
+            .into_iter()
+            .filter(|sidecar| sidecar.is_file()),
+    );
+    // A trunk overlay rides with its base: the pinned overlay file (also
+    // reached through a legacy-named link) and `<resolved file>.trunk-overlay`.
+    let overlay = hipfire_config::memory::trunk_overlay_sidecar_path(&path);
+    if overlay.is_file() {
+        targets.insert(overlay);
+    }
     if let Some((file, _)) = kept_mtp.as_ref() {
         // The stem sweep matched the shared head beside the trunk; keep it.
         let kept = paths.models.join(file);
@@ -2280,9 +2526,9 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let (canonical, entry) = registry_entry_for_path(paths, registry, &args.model)
         .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
         .unwrap_or((None, None));
-    let mut model_path = find_model_path(paths, registry, &args.model);
+    let mut model_path = resolve_model_path(paths, registry, &args.model)?;
     if model_path.is_none() {
-        if let Some(entry) = entry {
+        if entry.is_some() {
             eprintln!(
                 "Model not found locally. Pulling {}...",
                 canonical.as_deref().unwrap_or(&args.model)
@@ -2292,12 +2538,20 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
                 PullArgs {
                     model: args.model.clone(),
                     force: false,
+                    ple: ple::PleSelection::Auto,
                 },
             )?;
-            model_path = Some(paths.models.join(&entry.file));
+            // pull already verified either the downloaded canonical or legacy fallback.
+            model_path = find_model_path(paths, registry, &args.model);
         }
     }
-    let model_path = model_path.ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+    let model_path = model_path.ok_or_else(|| {
+        anyhow!(
+            "model not found: {}{}",
+            args.model,
+            model_suggestions(registry, &args.model)
+        )
+    })?;
     if let Some(image) = &args.image {
         if !image.is_file() {
             bail!("image not found: {}", image.display());
@@ -2354,7 +2608,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         args.prompt.join(" ")
     };
     let host = config_string(&resolved, "serve.host")?;
-    let port = config_u64(&resolved, "serve.port")? as u16;
+    let port = serve_probe_port(paths, config_u64(&resolved, "serve.port")? as u16);
     let force_local = run_should_force_local(&args);
     if !force_local && service_ready(&host, port, Duration::from_millis(150)) {
         return run_via_http(
@@ -2372,14 +2626,28 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
             max_tokens,
             args.json,
             args.no_stream,
+            args.stats,
         );
     }
+    ple::ensure_ple_sidecar(
+        registry,
+        entry,
+        canonical.as_deref(),
+        &model_path,
+        ple::request_from_config(&resolved),
+        true,
+    )?;
 
     let daemon = find_daemon(paths).ok_or_else(|| {
         anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
     })?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
-    let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
+    let mut engine = Engine::spawn_configured(
+        &daemon,
+        &BTreeMap::new(),
+        &process_config,
+        Some(&model_path),
+    )?;
     engine.ping()?;
     let mut params = load_params(
         &resolved,
@@ -2402,6 +2670,10 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     // daemon takes the EP/dense-TP route instead of the single-GPU one.
     if let Some(tp) = args.tp.filter(|&tp| tp > 1) {
         params["tp"] = serde_json::json!(tp);
+    }
+    // `--max-seq` replaces any configured value, exactly as `bench --max-seq`.
+    if let Some(max_seq) = args.max_seq {
+        params["max_seq"] = serde_json::json!(max_seq);
     }
     apply_speculation_selector(&mut params, &selector)?;
     // Final effective selector wins: re-project inherited draft only when DFlash
@@ -2494,6 +2766,11 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     insert_optional_f64(&mut request, "min_p", min_p);
     insert_optional_f64(&mut request, "presence_penalty", presence_penalty);
     insert_optional_f64(&mut request, "repeat_penalty", repeat_penalty);
+    if args.max_tokens.is_none() {
+        // The configured default is only a ceiling: the daemon fits it to the
+        // context left after the prompt, as serve does for an omitted value.
+        request["max_tokens_fit"] = serde_json::Value::Bool(true);
+    }
     if let Some(system) = system_prompt {
         request["system"] = serde_json::Value::String(system);
     }
@@ -2530,15 +2807,26 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
 
     let mut content = String::new();
     let stream = !args.no_stream && !args.json;
+    // End the streamed answer's line at `commit_ready`, before the commit is
+    // sent, so later daemon stderr never lands on the answer's line.
+    let mut line_ended = false;
     let done = engine.generate(&request, |event| {
-        if event.get("type").and_then(serde_json::Value::as_str) == Some("token") {
-            if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
-                content.push_str(text);
-                if stream {
-                    print!("{text}");
-                    std::io::stdout().flush()?;
+        match event.get("type").and_then(serde_json::Value::as_str) {
+            Some("token") => {
+                if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
+                    content.push_str(text);
+                    if stream {
+                        print!("{text}");
+                        std::io::stdout().flush()?;
+                    }
                 }
             }
+            Some("commit_ready") if stream && !line_ended => {
+                println!();
+                std::io::stdout().flush()?;
+                line_ended = true;
+            }
+            _ => {}
         }
         Ok(())
     })?;
@@ -2554,10 +2842,179 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         );
     } else if args.no_stream {
         println!("{content}");
-    } else {
+    } else if !line_ended {
         println!();
     }
+    if args.stats && !args.json {
+        eprintln!(
+            "{}",
+            format_run_stats(
+                done.get("tokens").and_then(serde_json::Value::as_u64),
+                &done
+            )
+        );
+    }
     let _ = engine.unload();
+    Ok(())
+}
+
+/// PIDs named by a live `~/.hipfire/daemon*.pid`.
+///
+/// Advisory by construction: it cannot prevent a daemon started mid-benchmark, but
+/// it stops the common case (a serve instance already running), which would make
+/// both engine rates meaningless. A real fix would move the measurement behind the
+/// daemon protocol, which is deliberately not done here.
+fn live_daemon_pids(paths: &Paths) -> Vec<i32> {
+    let mut live = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&paths.root) else {
+        return live;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("daemon") || !name.ends_with(".pid") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(pid) = raw.trim().parse::<i32>() else {
+            continue;
+        };
+        // Safety: signal 0 only probes for existence and permission.
+        if pid > 0 && unsafe { libc::kill(pid, 0) } == 0 {
+            live.push(pid);
+        }
+    }
+    live.sort_unstable();
+    live.dedup();
+    live
+}
+
+/// The share `offload-bench` recommends from a measurement matrix.
+///
+/// The recommendation comes from the largest measurements: a real spilled
+/// projection is MBs of weight bytes, and the matrix's smallest entry is where the
+/// copies and the launch overhead distort the balance most. Every format is
+/// measured over the same `buffer_mb` by construction, so "the largest" is usually
+/// the whole matrix — a *set* — and the **median** share over it is the honest
+/// single number (a singleton when `--format` pinned one format). Split out from
+/// the command so the tie behavior is pinned by a test rather than by
+/// `max_by_key`'s iteration order, which silently picked whichever format came
+/// last.
+fn recommended_share(reports: &[CalibrationReport]) -> Option<(String, f64)> {
+    let largest = reports.iter().map(|r| r.bytes).max()?;
+    let biggest: Vec<&CalibrationReport> =
+        reports.iter().filter(|r| r.bytes == largest).collect();
+    let mut shares: Vec<f64> = biggest.iter().map(|r| r.share).collect();
+    shares.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let label = if biggest.len() == 1 {
+        biggest[0].format.clone()
+    } else {
+        format!("the {} largest measured formats", biggest.len())
+    };
+    Some((label, shares[shares.len() / 2]))
+}
+
+/// `hipfire offload-bench`: measure this host's GPU share for a split offload step
+/// (`memory.offload_exec=passback`, `memory.offload_passback_share`).
+///
+/// A raw device benchmark — no model, no daemon — so it refuses while a daemon pid
+/// file names a live process.
+fn offload_bench_command(paths: &Paths, args: OffloadBenchArgs) -> Result<()> {
+    let live = live_daemon_pids(paths);
+    if !live.is_empty() {
+        bail!(
+            "a hipfire daemon is live (pid {}); stop it first (`hipfire stop`) — offload-bench \
+             measures the device directly, and a concurrent daemon makes both engine rates \
+             meaningless",
+            live.iter()
+                .map(|pid| pid.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let mut gpu = rdna_compute::Gpu::init()
+        .map_err(|e| anyhow!("offload-bench needs a GPU: {} [code {}]", e.message, e.code))?;
+    let opts = CalibrateOptions {
+        format: args.format.clone(),
+        k: args.k,
+        buffer_mb: args
+            .buffer_mb
+            .unwrap_or(hipfire_runtime::offload_calibrate::DEFAULT_BUFFER_MB),
+        reps: args
+            .reps
+            .unwrap_or(hipfire_runtime::offload_calibrate::DEFAULT_REPS),
+    };
+    let reports = hipfire_runtime::offload_calibrate::calibrate(&mut gpu, &opts)?;
+    let recommended = recommended_share(&reports);
+    if args.json {
+        let rows: Vec<serde_json::Value> = reports
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "format": r.format,
+                    "m": r.m,
+                    "k": r.k,
+                    "bytes": r.bytes,
+                    "cpu_bytes_per_s": r.cpu_bytes_per_s,
+                    "gpu_bytes_per_s": r.gpu_bytes_per_s,
+                    "share": r.share,
+                    "predicted_speedup": r.predicted_speedup,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "arch": gpu.arch,
+                "recommended": recommended
+                    .as_ref()
+                    .map(|(format, share)| serde_json::json!({ "format": format, "share": share })),
+                "formats": rows,
+            }))?
+        );
+    } else {
+        println!(
+            "arch {} — GPU share for a split offload step (memory.offload_exec=passback)",
+            gpu.arch
+        );
+        println!(
+            "{:<12} {:>8} {:>6} {:>8} {:>12} {:>12} {:>7} {:>9}",
+            "format", "m", "k", "MiB", "cpu GB/s", "gpu GB/s", "share", "speedup"
+        );
+        for r in &reports {
+            println!(
+                "{:<12} {:>8} {:>6} {:>8.1} {:>12.1} {:>12.1} {:>7.3} {:>8.2}x",
+                r.format,
+                r.m,
+                r.k,
+                r.bytes as f64 / (1 << 20) as f64,
+                r.cpu_bytes_per_s / 1e9,
+                r.gpu_bytes_per_s / 1e9,
+                r.share,
+                r.predicted_speedup,
+            );
+        }
+        if let Some((format, share)) = recommended.as_ref() {
+            println!();
+            println!("recommended for {format}: memory.offload_passback_share = {share:.3}");
+        }
+    }
+    if args.write {
+        let Some((_, share)) = recommended.as_ref() else {
+            bail!("offload-bench: nothing measured, nothing to write");
+        };
+        let mut loaded = load_global(&paths.config)?;
+        loaded
+            .layer
+            .set_cli("memory.offload_passback_share", &format!("{share:.3}"))?;
+        write_global_toml(&paths.config, &loaded.layer)?;
+        println!(
+            "wrote memory.offload_passback_share = {share:.3} to {}",
+            paths.config.config_toml.display()
+        );
+    }
     Ok(())
 }
 
@@ -2657,6 +3114,7 @@ fn img_command(paths: &Paths, args: ImgArgs) -> Result<()> {
                 PullArgs {
                     model: args.model.clone(),
                     force: false,
+                    ple: ple::PleSelection::Auto,
                 },
             )?;
             model_path = Some(paths.models.join(&entry.file));
@@ -2679,7 +3137,12 @@ fn img_command(paths: &Paths, args: ImgArgs) -> Result<()> {
         anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
     })?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
-    let engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
+    let engine = Engine::spawn_configured(
+        &daemon,
+        &BTreeMap::new(),
+        &process_config,
+        Some(&model_path),
+    )?;
     engine.ping()?;
     let _loaded = engine.load(&model_path, serde_json::json!({}))?;
     let mut request = serde_json::json!({
@@ -2758,6 +3221,176 @@ fn img_command(paths: &Paths, args: ImgArgs) -> Result<()> {
     Ok(())
 }
 
+/// `hipfire embed`: encode text (or an image) with an embedding model, or —
+/// with both `--query` and `--doc` — score the pair by late-interaction
+/// MaxSim. Mirrors `img_command`'s engine lifecycle (fresh daemon, load,
+/// request, unload).
+fn embed_command(paths: &Paths, args: EmbedArgs) -> Result<()> {
+    let kind = args.kind.as_deref().unwrap_or("document");
+    if !matches!(kind, "query" | "document") {
+        bail!("--kind must be \"query\" or \"document\", got {kind:?}");
+    }
+    if args.query.is_none() && args.doc.is_none() && args.text.is_empty() && args.image.is_none() {
+        bail!(
+            "nothing to encode: pass text (positional or --query/--doc) and/or --image \
+             (e.g. `hipfire embed <model> --query \"what is rust\" --doc \"Rust is …\"`)"
+        );
+    }
+    if args.doc.is_some() && args.query.is_none() {
+        bail!("--doc without --query: encode the document alone with the positional text + --kind document");
+    }
+    let image_b64: Option<String> = args
+        .image
+        .as_ref()
+        .map(|p| -> Result<String> {
+            use base64::Engine as _;
+            let bytes = std::fs::read(p)
+                .with_context(|| format!("--image {}: cannot read file", p.display()))?;
+            Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+        })
+        .transpose()?;
+
+    let loaded_registry = load_registry(&paths.registry);
+    let registry = &loaded_registry.registry;
+    // Embedding checkpoints are directories (an HF snapshot), which
+    // `find_model_path` does not accept (it is file-only for the registry's
+    // HFQ entries). Take a direct existing file OR directory first, then fall
+    // back to the registry.
+    let model_path = {
+        let direct = PathBuf::from(&args.model);
+        if direct.exists() {
+            std::fs::canonicalize(&direct).unwrap_or(direct)
+        } else {
+            find_model_path(paths, registry, &args.model)
+                .ok_or_else(|| anyhow!("model not found: {}", args.model))?
+        }
+    };
+    let resolved = resolved_for_model(paths, &args.model, None, None)?;
+    let daemon = find_daemon(paths).ok_or_else(|| {
+        anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
+    })?;
+    let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
+    let engine = Engine::spawn_configured(
+        &daemon,
+        &BTreeMap::new(),
+        &process_config,
+        Some(&model_path),
+    )?;
+    engine.ping()?;
+    let _loaded = engine.load(&model_path, serde_json::json!({}))?;
+
+    let encode =
+        |id: &str, kind: &str, text: &str, image: Option<&str>| -> Result<serde_json::Value> {
+            let mut input = serde_json::Map::new();
+            if !text.is_empty() {
+                input.insert("text".into(), serde_json::json!(text));
+            }
+            if let Some(b64) = image {
+                input.insert("image_base64".into(), serde_json::json!(b64));
+            }
+            let request = serde_json::json!({
+                "type": "embed",
+                "id": id,
+                "kind": kind,
+                "input": input,
+            });
+            engine
+                .embed(&request)
+                .map_err(|e| anyhow!("embed request failed: {e}"))
+        };
+
+    let positional = args.text.join(" ");
+    let mut result_json = None;
+    if let (Some(q), Some(d)) = (&args.query, args.doc.as_deref()) {
+        let q_res = encode("q", "query", q, image_b64.as_deref())?;
+        let d_res = encode("d", "document", d, None)?;
+        let dim = q_res
+            .get("dim")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
+        let q_tokens = q_res
+            .get("n_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
+        let d_tokens = d_res
+            .get("n_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
+        let q_emb = q_res
+            .get("embeddings")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_f64().map(|x| x as f32))
+                    .collect::<Vec<f32>>()
+            })
+            .unwrap_or_default();
+        let d_emb = d_res
+            .get("embeddings")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_f64().map(|x| x as f32))
+                    .collect::<Vec<f32>>()
+            })
+            .unwrap_or_default();
+        // Late interaction, same math as hipfire-arch-qwen35-embed::maxsim
+        // (kept local: the CLI deliberately declares no arch-crate dep).
+        let score = (0..q_tokens)
+            .map(|qi| {
+                (0..d_tokens)
+                    .map(|di| {
+                        q_emb[qi * dim..(qi + 1) * dim]
+                            .iter()
+                            .zip(&d_emb[di * dim..(di + 1) * dim])
+                            .map(|(a, b)| a * b)
+                            .sum::<f32>()
+                    })
+                    .fold(f32::MIN, f32::max)
+            })
+            .sum::<f32>();
+        if args.json {
+            result_json = Some(serde_json::json!({
+                "score": score,
+                "query_tokens": q_tokens,
+                "doc_tokens": d_tokens,
+                "dim": dim,
+            }));
+        } else {
+            println!("{score:.4}");
+        }
+    } else {
+        let text = if args.query.is_some() {
+            args.query.clone().unwrap_or_default()
+        } else {
+            positional
+        };
+        let kind = if args.query.is_some() { "query" } else { kind };
+        let res = encode("e", kind, &text, image_b64.as_deref())?;
+        if args.json {
+            result_json = Some(res);
+        } else {
+            println!(
+                "{} token embeddings ({} dims), {} input tokens — pass --json for the matrix",
+                res.get("n_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                res.get("dim")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                res.get("n_input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            );
+        }
+    }
+    let _ = engine.unload();
+    if let Some(j) = result_json {
+        println!("{}", serde_json::to_string(&j)?);
+    }
+    Ok(())
+}
+
 fn process_truthy(name: &str) -> bool {
     hipfire_config::process_value(name).is_some_and(|value| {
         !matches!(
@@ -2775,12 +3408,46 @@ pub(crate) fn run_should_force_local(args: &RunArgs) -> bool {
         || args.kv_v.is_some()
         || args.kv_backend.is_some()
         || args.tp.is_some_and(|tp| tp > 1)
+        || args.max_seq.is_some()
         || args.head.is_some()
         || args.speculation.is_some()
         || args.model_draft.is_some()
         || args.vision.is_some()
         || args.draft_max.is_some()
         || args.dspark_conf_threshold.is_some()
+}
+
+fn format_run_stats(tokens: Option<u64>, timings: &serde_json::Value) -> String {
+    let metric = |key: &str, precision: usize| {
+        timings
+            .get(key)
+            .and_then(serde_json::Value::as_f64)
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .map(|value| format!("{value:.precision$}"))
+            .unwrap_or_else(|| "n/a".to_owned())
+    };
+    let mut footer = format!(
+        "[stats] tokens={} decode={} tok/s ttft={} ms",
+        tokens
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_owned()),
+        metric("decode_tok_s", 2),
+        metric("ttft_ms", 1)
+    );
+    let routes = ["dflash", "mtp", "mtp_ngram"];
+    let has_route = routes.iter().any(|key| {
+        timings
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .is_some()
+    });
+    let speculative = routes
+        .iter()
+        .any(|key| timings.get(key).and_then(serde_json::Value::as_bool) == Some(true));
+    if (!has_route || speculative) && timings.get("tau").is_some_and(|value| !value.is_null()) {
+        footer.push_str(&format!(" tau={}", metric("tau", 2)));
+    }
+    footer
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2799,6 +3466,7 @@ fn run_via_http(
     max_tokens: u64,
     json: bool,
     no_stream: bool,
+    stats: bool,
 ) -> Result<()> {
     let mut messages = Vec::new();
     if let Some(system) = system {
@@ -2817,6 +3485,10 @@ fn run_via_http(
     insert_optional_f64(&mut body, "presence_penalty", presence_penalty);
     insert_optional_f64(&mut body, "repeat_penalty", repeat_penalty);
     let timeout = Duration::from_secs(60 * 60);
+    let stats = stats && !json;
+    if stats && !no_stream {
+        body["stream_options"] = serde_json::json!({"include_usage": true});
+    }
     if json || no_stream {
         let response = complete_openai_chat(host, port, body, timeout)?;
         let content = response
@@ -2835,10 +3507,23 @@ fn run_via_http(
             );
         } else {
             println!("{content}");
+            if stats {
+                eprintln!(
+                    "{}",
+                    format_run_stats(
+                        response
+                            .pointer("/usage/completion_tokens")
+                            .and_then(serde_json::Value::as_u64),
+                        &response["timings"],
+                    )
+                );
+            }
         }
         return Ok(());
     }
 
+    let mut tokens = None;
+    let mut timings = serde_json::Value::Null;
     stream_openai_chat(
         host,
         port,
@@ -2850,17 +3535,24 @@ fn run_via_http(
                     print!("{text}");
                     std::io::stdout().flush()?;
                 }
-                OpenAiSseEvent::Role { .. }
-                | OpenAiSseEvent::ToolCall { .. }
-                | OpenAiSseEvent::Finish { .. }
-                | OpenAiSseEvent::Usage { .. }
-                | OpenAiSseEvent::Done => {}
+                OpenAiSseEvent::Finish { timings: value, .. } if stats => {
+                    timings = value.unwrap_or(serde_json::Value::Null);
+                }
+                OpenAiSseEvent::Usage { usage } if stats => {
+                    tokens = usage
+                        .get("completion_tokens")
+                        .and_then(serde_json::Value::as_u64);
+                }
+                _ => {}
             }
             Ok(())
         },
         || false,
     )?;
     println!();
+    if stats {
+        eprintln!("{}", format_run_stats(tokens, &timings));
+    }
     Ok(())
 }
 
@@ -2901,8 +3593,12 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             vision: None,
             idle_timeout: None,
             tp: None,
+            speculation: None,
+            max_seq: None,
             continuous_batch_size: None,
             foreground_child: false,
+            ui: false,
+            open: false,
         };
         detach_serve(paths, &serve_args, &host, port)?;
     }
@@ -3000,6 +3696,17 @@ pub(crate) fn resolved_for_model(
     entry: Option<&ModelEntry>,
 ) -> Result<hipfire_config::ResolvedConfig> {
     let loaded = load_global(&paths.config)?;
+    // config.toml warnings name retired keys the load ignored. serve resolves
+    // per model load, so report them once per process; legacy JSON migration
+    // notes stay with the `config` commands.
+    if loaded.format == ConfigFormat::Toml {
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        REPORTED.call_once(|| {
+            for warning in &loaded.warnings {
+                eprintln!("warning: {warning}");
+            }
+        });
+    }
     let mut layers = Vec::new();
     if let (Some(tag), Some(entry)) = (tag, entry) {
         layers.push(NamedLayer {
@@ -3107,11 +3814,182 @@ pub(crate) fn registry_entry_for_path<'registry>(
     if input.contains('/') || input.contains('\\') || candidate.is_file() {
         let canonical_input = fs::canonicalize(candidate).ok()?;
         return registry.models.iter().find_map(|(tag, entry)| {
-            let canonical_installed = fs::canonicalize(paths.models.join(&entry.file)).ok()?;
-            (canonical_installed == canonical_input).then(|| (tag.as_str(), entry))
+            let installed = paths.models.join(&entry.file);
+            let legacy = paths
+                .models
+                .join(hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE);
+            (same_installed_file(&installed, &canonical_input)
+                || (entry.is_flash_next_xts() && same_installed_file(&legacy, &canonical_input)))
+            .then(|| (tag.as_str(), entry))
         });
     }
     registry.model(input)
+}
+
+pub(crate) fn same_installed_file(a: &Path, b: &Path) -> bool {
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(a), Ok(b)) => same_artifact_metadata(&a, &b),
+        _ => false,
+    }
+}
+
+/// Fallible pinned migration stays outside generic, cheap local discovery.
+pub(crate) fn resolve_model_path(
+    paths: &Paths,
+    registry: &RegistryV1,
+    model: &str,
+) -> Result<Option<PathBuf>> {
+    let explicit = Path::new(model);
+    // A directory is a valid model source (an HF safetensors snapshot — the
+    // loader's `ModelSource::Dir`), not just an HFQ file. Resolve it here so
+    // every entry point (serve prewarm, run, embed) accepts one path spelling.
+    if explicit.is_dir() {
+        return Ok(fs::canonicalize(explicit)
+            .ok()
+            .or_else(|| Some(explicit.to_path_buf())));
+    }
+    let catalog_path = load_catalog(&paths.config).ok().is_some_and(|catalog| {
+        catalog
+            .catalog
+            .model(model)
+            .is_some_and(|(_, record)| record.path.as_ref().is_some_and(|path| path.is_file()))
+    });
+    if !explicit.is_file() && !model.contains('/') && !model.contains('\\') && !catalog_path {
+        if let Some((_, entry)) = registry.model(model) {
+            if entry.is_flash_next_xts() {
+                return migrate_flash_next_xts(paths, entry);
+            }
+            // The split base is absent: verify (and link the legacy spelling of)
+            // the pinned monolithic it was cut from, exactly as its own tag does.
+            if entry.has_ple_sidecars() && !paths.models.join(&entry.file).is_file() {
+                if let Some((_, sibling)) = registry
+                    .monolithic_sibling(entry)
+                    .filter(|(_, sibling)| sibling.is_flash_next_xts())
+                {
+                    if let Some(path) = migrate_flash_next_xts(paths, sibling)? {
+                        return Ok(Some(path));
+                    }
+                }
+            }
+        }
+    }
+    Ok(find_model_path(paths, registry, model))
+}
+
+fn migrate_flash_next_xts(paths: &Paths, entry: &ModelEntry) -> Result<Option<PathBuf>> {
+    if !entry.is_flash_next_xts() {
+        return Ok(None);
+    }
+    migrate_verified_artifact(
+        &paths
+            .models
+            .join(hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE),
+        &paths
+            .models
+            .join(hipfire_registry::FLASH_NEXT_XTS_CANONICAL_FILE),
+        entry.sha256.as_deref().expect("pinned digest"),
+        entry.size_bytes.expect("pinned size"),
+    )
+}
+
+fn same_artifact_metadata(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        a.dev() == b.dev()
+            && a.ino() == b.ino()
+            && a.len() == b.len()
+            && a.mtime() == b.mtime()
+            && a.mtime_nsec() == b.mtime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        a.len() == b.len() && a.modified().ok() == b.modified().ok()
+    }
+}
+
+fn verified_metadata(path: &Path, digest: &str, size: u64) -> Result<(fs::File, fs::Metadata)> {
+    let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let before = file.metadata()?;
+    if !before.is_file() || before.len() != size {
+        bail!("size mismatch: {}", path.display());
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    if !format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(digest) {
+        bail!("SHA-256 mismatch: {}", path.display());
+    }
+    let after = file.metadata()?;
+    let current = fs::metadata(path)?;
+    if !same_artifact_metadata(&before, &after) || !same_artifact_metadata(&before, &current) {
+        bail!("artifact changed during verification: {}", path.display());
+    }
+    Ok((file, before))
+}
+
+// Never copy or move payloads. Unsupported/read-only link installation leaves
+// the verified source usable. Existing destinations are handled by the caller.
+fn install_verified_link(source: &Path, destination: &Path) -> Result<bool> {
+    match fs::hard_link(source, destination) {
+        Ok(()) => return Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(true),
+        Err(_) => {}
+    }
+    #[cfg(unix)]
+    {
+        let target = fs::canonicalize(source)?;
+        match std::os::unix::fs::symlink(target, destination) {
+            Ok(()) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(true),
+            Err(_) => {}
+        }
+    }
+    Ok(false)
+}
+
+fn migrate_verified_artifact(
+    old: &Path,
+    canonical: &Path,
+    digest: &str,
+    size: u64,
+) -> Result<Option<PathBuf>> {
+    match fs::symlink_metadata(canonical) {
+        Ok(_) => {
+            verified_metadata(canonical, digest, size)?;
+            return Ok(Some(canonical.to_owned()));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    match fs::symlink_metadata(old) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    // Keep the opened inode alive until installation and stability checks finish.
+    let (_file, verified) = verified_metadata(old, digest, size)?;
+    if install_verified_link(old, canonical)? {
+        let installed = fs::metadata(canonical)?;
+        if !same_artifact_metadata(&verified, &installed) {
+            // A concurrent installer won: verify its bytes, never clobber it.
+            verified_metadata(canonical, digest, size)?;
+        }
+        if !same_artifact_metadata(&verified, &fs::metadata(old)?) {
+            bail!("artifact changed during migration: {}", old.display());
+        }
+        return Ok(Some(canonical.to_owned()));
+    }
+    if !same_artifact_metadata(&verified, &fs::metadata(old)?) {
+        bail!("artifact changed during migration: {}", old.display());
+    }
+    Ok(Some(old.to_owned()))
 }
 
 pub(crate) fn find_model_path(
@@ -3129,6 +4007,29 @@ pub(crate) fn find_model_path(
                 return fs::canonicalize(path).ok().or_else(|| Some(path.clone()));
             }
         }
+    }
+    if let Some((_, entry)) = registry
+        .model(model)
+        .filter(|(_, entry)| entry.is_flash_next_xts())
+    {
+        return [
+            entry.file.as_str(),
+            hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE,
+        ]
+        .into_iter()
+        .map(|file| paths.models.join(file))
+        .find(|path| path.is_file());
+    }
+    if let Some((_, entry)) = registry
+        .model(model)
+        .filter(|(_, entry)| entry.has_ple_sidecars())
+    {
+        // A split tag serves its base, else the grandfathered monolithic it was
+        // cut from, so nobody is forced to re-download after the registry switch.
+        return ple::split_model_files(registry, entry)
+            .iter()
+            .map(|file| paths.models.join(file))
+            .find(|path| path.is_file());
     }
     // An exact on-disk spelling outranks a registry alias that would rewrite it.
     // The registry maps a model NAME to its canonical FILE, which is what makes
@@ -3210,6 +4111,21 @@ fn parse_kv_backend_arg(raw: &str) -> std::result::Result<String, String> {
     raw.parse::<KvBackend>()
         .map(|backend| backend.as_str().to_owned())
         .map_err(|err| err.to_string())
+}
+
+/// Clap value parser for `--max-seq`: the `memory.max_seq` schema field parses
+/// and bounds it, so serve/bench flags and the config key accept the same values.
+fn parse_max_seq_arg(raw: &str) -> std::result::Result<u64, String> {
+    match field("memory.max_seq")
+        .expect("schema field")
+        .parse_cli(raw)
+        .map_err(|err| err.to_string())?
+    {
+        hipfire_config::ConfigValue::Integer(value) => {
+            u64::try_from(value).map_err(|_| format!("max_seq {value} is negative"))
+        }
+        other => Err(format!("max_seq must be an integer, got {other:?}")),
+    }
 }
 
 /// Layer an authored typed K/V axis from resolved config. Built-in empty defaults
@@ -3380,8 +4296,19 @@ pub(crate) fn load_params(
         "dflash_mode": config_string(resolved, "speculation.dflash")?,
         "vision_mode": config_string(resolved, "vision.mode")?,
         "dflash_adaptive_b": config_bool(resolved, "speculation.dflash_adaptive_b")?,
+        // `auto` or a fixed width (schema-validated); the daemon resolves
+        // `auto` against the route it actually stages.
+        "dflash_block": match config_value(resolved, "speculation.dflash_block")? {
+            hipfire_config::ConfigValue::Integer(b) => serde_json::json!(b),
+            _ => serde_json::json!("auto"),
+        },
         "mtp_mode": config_string(resolved, "speculation.mtp")?,
-        "mtp_k": config_u64(resolved, "speculation.mtp_k")?,
+        // `auto` or an explicit 1-10 (schema-validated); the daemon/loader
+        // resolves `auto` per model arch and GPU.
+        "mtp_k": match config_value(resolved, "speculation.mtp_k")? {
+            hipfire_config::ConfigValue::Integer(k) => serde_json::json!(k),
+            _ => serde_json::json!("auto"),
+        },
         "ngram_draft": matches!(config_string(resolved, "speculation.ngram")?.as_str(), "on" | "auto"),
         "ngram_k": config_u64(resolved, "speculation.ngram_k")?,
         "ngram_min_count": config_u64(resolved, "speculation.ngram_min_count")?,
@@ -3468,16 +4395,17 @@ pub(crate) fn load_params(
 /// Call only once the final `dflash_mode` is known. When the mode is `auto`
 /// or `on`, no explicit draft is set (`params["draft"]`, e.g. from
 /// `developer.dflash_draft`), and `entry.dflash` names a pulled file, wire
-/// it: `on` without the file fails closed, `auto` logs one line and runs AR.
+/// it: `on` without the file fails closed, `auto` logs one line and falls
+/// back to the remaining speculation policy (MTP `auto` when a head exists).
 /// With no entry at all the artifact is not registry-managed (e.g. a path
-/// that merely shares a basename with an entry file): `auto` runs AR as a
-/// bare artifact, but `on` fails closed instead of silently running AR.
+/// that merely shares a basename with an entry file): `auto` wires no draft
+/// for a bare artifact, but `on` fails closed instead of silently running AR.
 /// The sidecar is looked up in `models_dir` first — `find_model_path`
 /// canonicalizes, so a symlinked target's parent is wherever the artifact
 /// really lives, not the models directory the draft was pulled into — then
 /// next to the target. An explicit draft always wins; a final `off` never
 /// carries a draft (`project_dflash_draft` strips it) and returns early.
-fn resolve_dflash_sidecar(
+pub(crate) fn resolve_dflash_sidecar(
     params: &mut serde_json::Value,
     entry: Option<&ModelEntry>,
     models_dir: &Path,
@@ -3497,7 +4425,7 @@ fn resolve_dflash_sidecar(
     let Some(sidecar) = entry.and_then(|entry| entry.dflash.as_ref()) else {
         if params["dflash_mode"].as_str() == Some("on") && model_path.is_file() {
             bail!(
-                "DFlash draft required (dflash_mode=on) but {} is not a registry-managed artifact; pass developer.dflash_draft or use the registry tag",
+                "DFlash needs a draft model: {} is not a registry-managed artifact; add --model-draft <draft.hfq>, or run the model by its registry tag (which pairs its draft)",
                 model_path.display()
             );
         }
@@ -3520,7 +4448,7 @@ fn resolve_dflash_sidecar(
         );
     }
     eprintln!(
-        "[hipfire] DFlash draft {} not pulled; running AR — `hipfire pull {tag}`",
+        "[hipfire] DFlash draft {} not pulled; no paired draft, speculation falls back — `hipfire pull {tag}`",
         sidecar.file
     );
     Ok(())
@@ -3751,7 +4679,10 @@ fn developer_dflash_draft(resolved: &hipfire_config::ResolvedConfig) -> Option<&
     }
 }
 
-fn apply_speculation_selector(params: &mut serde_json::Value, selector: &str) -> Result<()> {
+pub(crate) fn apply_speculation_selector(
+    params: &mut serde_json::Value,
+    selector: &str,
+) -> Result<()> {
     match selector {
         "off" => {
             params["dflash_mode"] = serde_json::json!("off");
@@ -3801,6 +4732,11 @@ pub(crate) struct ReasoningResolution {
     pub warnings: Vec<String>,
 }
 
+/// Concrete effort resolved for effort-native QwenJinja when the request/config
+/// leaves effort unset or `auto`. The raw Jinja templates still default to
+/// `xhigh`; this CLI resolution layer supplies the concrete value.
+const QWEN_JINJA_DEFAULT_EFFORT: &str = "medium";
+
 pub(crate) fn apply_http_reasoning_request(
     body: &serde_json::Value,
     resolved: &hipfire_config::ResolvedConfig,
@@ -3827,7 +4763,7 @@ pub(crate) fn apply_http_reasoning_request(
     if body.get("enable_thinking").is_some() {
         if let Some(value) = body.get("enable_thinking") {
             if !value.is_boolean() && !value.is_null() {
-                bail!("enable_thinking must be a boolean");
+                serve::bail_invalid!("enable_thinking must be a boolean");
             }
         }
     }
@@ -3840,7 +4776,7 @@ pub(crate) fn apply_http_reasoning_request(
     {
         if let Some(value) = body.pointer("/chat_template_kwargs/enable_thinking") {
             if !value.is_boolean() && !value.is_null() {
-                bail!("chat_template_kwargs.enable_thinking must be a boolean");
+                serve::bail_invalid!("chat_template_kwargs.enable_thinking must be a boolean");
             }
         }
     }
@@ -3853,7 +4789,7 @@ pub(crate) fn apply_http_reasoning_request(
     let mut thinking_type_str: Option<&str> = None;
     if let Some(raw) = thinking_type_raw {
         if !raw.is_string() {
-            bail!("thinking.type must be enabled or disabled");
+            serve::bail_invalid!("thinking.type must be enabled or disabled");
         } else {
             let s = raw.as_str().unwrap();
             if s == "enabled" || s == "disabled" {
@@ -3884,14 +4820,14 @@ pub(crate) fn apply_http_reasoning_request(
             .pointer("/chat_template_kwargs/reasoning_effort")
             .is_some();
     if effort_present && effort_raw.is_none() {
-        bail!("reasoning_effort must be a string");
+        serve::bail_invalid!("reasoning_effort must be a string");
     }
     let body_budget_present = body.get("thinking_budget").is_some();
     let body_budget_str = body
         .get("thinking_budget")
         .and_then(serde_json::Value::as_str);
     if body_budget_present && body_budget_str.is_none() {
-        bail!("thinking_budget must be a string preset");
+        serve::bail_invalid!("thinking_budget must be a string preset");
     }
     let body_top_max_present = body.get("max_think_tokens").is_some();
     let body_nested_max_present = body.pointer("/reasoning/max_tokens").is_some();
@@ -3900,14 +4836,14 @@ pub(crate) fn apply_http_reasoning_request(
             serde_json::Value::Number(number) => {
                 if let Some(parsed) = number.as_u64() {
                     if parsed > 393_216 {
-                        bail!("{field} must be between 0 and 393216");
+                        serve::bail_invalid!("{field} must be between 0 and 393216");
                     }
                     Ok(parsed)
                 } else {
-                    bail!("{field} must be between 0 and 393216");
+                    serve::bail_invalid!("{field} must be between 0 and 393216");
                 }
             }
-            _ => bail!("{field} must be between 0 and 393216"),
+            _ => serve::bail_invalid!("{field} must be between 0 and 393216"),
         }
     };
     let top_max_opt = if body_top_max_present {
@@ -4345,14 +5281,13 @@ pub(crate) fn apply_http_reasoning_request(
                 }
                 effective_effort = None;
             } else if has_explicit_effort || config_effort_is_explicit {
-                let raw = if let Some(value) = effort_raw {
-                    value.to_owned()
-                } else {
-                    config_effort.clone()
-                };
+                let raw = effort_raw
+                    .filter(|value| *value != "auto")
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| config_effort.clone());
                 if raw == "auto" {
-                    effective_effort = Some("xhigh".to_string());
-                    request["reasoning_effort"] = serde_json::json!("xhigh");
+                    effective_effort = Some(QWEN_JINJA_DEFAULT_EFFORT.to_string());
+                    request["reasoning_effort"] = serde_json::json!(QWEN_JINJA_DEFAULT_EFFORT);
                 } else {
                     match raw.as_str() {
                         "low" | "medium" | "xhigh" => {
@@ -4361,8 +5296,9 @@ pub(crate) fn apply_http_reasoning_request(
                                     "reasoning_effort '{}' dropped: not in supported {:?}",
                                     raw, supported_efforts
                                 ));
-                                effective_effort = Some("xhigh".to_string());
-                                request["reasoning_effort"] = serde_json::json!("xhigh");
+                                effective_effort = Some(QWEN_JINJA_DEFAULT_EFFORT.to_string());
+                                request["reasoning_effort"] =
+                                    serde_json::json!(QWEN_JINJA_DEFAULT_EFFORT);
                             } else {
                                 effective_effort = Some(raw.clone());
                                 request["reasoning_effort"] = serde_json::json!(raw);
@@ -4373,21 +5309,23 @@ pub(crate) fn apply_http_reasoning_request(
                                 "reasoning_effort '{}' dropped for qwen_jinja: expected low|medium|xhigh",
                                 raw
                             ));
-                            effective_effort = Some("xhigh".to_string());
-                            request["reasoning_effort"] = serde_json::json!("xhigh");
+                            effective_effort = Some(QWEN_JINJA_DEFAULT_EFFORT.to_string());
+                            request["reasoning_effort"] =
+                                serde_json::json!(QWEN_JINJA_DEFAULT_EFFORT);
                         }
                         other => {
                             push_warn(format!(
-                                "reasoning_effort '{}' normalized to qwen_jinja default xhigh",
-                                other
+                                "reasoning_effort '{}' normalized to qwen_jinja default {}",
+                                other, QWEN_JINJA_DEFAULT_EFFORT
                             ));
-                            effective_effort = Some("xhigh".to_string());
-                            request["reasoning_effort"] = serde_json::json!("xhigh");
+                            effective_effort = Some(QWEN_JINJA_DEFAULT_EFFORT.to_string());
+                            request["reasoning_effort"] =
+                                serde_json::json!(QWEN_JINJA_DEFAULT_EFFORT);
                         }
                     }
                 }
             } else {
-                let default = "xhigh".to_string();
+                let default = QWEN_JINJA_DEFAULT_EFFORT.to_string();
                 effective_effort = Some(default.clone());
                 request["reasoning_effort"] = serde_json::json!(default);
             }
@@ -4640,7 +5578,7 @@ fn scan_auxiliary_processes() -> (Vec<ProcessRecord>, Vec<ProcessRecord>) {
 fn ps_command(paths: &Paths, output: OutputArgs) -> Result<()> {
     let (_, resolved) = resolved_global(paths, true)?;
     let host = config_string(&resolved, "serve.host")?;
-    let port = config_u64(&resolved, "serve.port")? as u16;
+    let port = serve_probe_port(paths, config_u64(&resolved, "serve.port")? as u16);
     let pid_path = paths.root.join("serve.pid");
     let pid_record = fs::read_to_string(&pid_path)
         .ok()
@@ -4831,6 +5769,17 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp && (args.matrix || args.redline) {
         bail!("--exp cannot be combined with matrix or Redline options");
     }
+    // The matrix is the synthetic `bench_prefill`/`bench_decode` protocol:
+    // its prefill rows are fixed token ids on the plain prefill route, never a
+    // prompt and never the speculative prompt prefill `serve` runs. Refuse a
+    // prompt instead of silently measuring something else.
+    if (args.matrix || args.redline) && (args.prompt_file.is_some() || !args.prompt.is_empty()) {
+        bail!(
+            "--matrix/--redline measure synthetic token ids (bench_prefill) and cannot take a prompt; \
+             for a prompt's prefill with the configured speculation use the standard bench \
+             (`hipfire bench MODEL --prompt-file FILE --max-tokens 1`)"
+        );
+    }
     if args.ttft && args.matrix {
         bail!("--ttft cannot be combined with --matrix (it measures the standard generate path)");
     }
@@ -4882,7 +5831,9 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp {
         return bench_experimental(paths, &args);
     }
-    let (mut engine, loaded, pre_diag, post_diag) = open_bench_engine(paths, &args, None, &BenchLoadOpts::default())?;
+    let (mut engine, loaded, pre_diag, post_diag, devices_spec, max_seq, load_speculation) =
+        open_bench_engine(paths, &args, None, &BenchLoadOpts::default())?;
+    let max_seq_json = max_seq.json(&loaded);
     let prompt = resolve_bench_prompt(&args)?;
     let prompt_md5 = bench_prompt_md5(&prompt);
     let prompt_chars = prompt.chars().count() as u64;
@@ -4903,11 +5854,21 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             .unwrap_or("unknown")
     );
     eprintln!("  runs:   {}", args.runs);
-    eprintln!("  max_tokens: {}", args.max_tokens);
+    eprintln!("  max_tokens: {}", args.standard_max_tokens());
     eprintln!("  prompt_md5: {prompt_md5}");
     eprintln!("  prompt_chars: {prompt_chars}");
+    print_bench_max_seq(&max_seq, &loaded);
+    let power = bench_power_probe(devices_spec.as_deref(), &post_diag);
     if args.matrix || args.redline {
-        bench_matrix(&mut engine, &args, &loaded, &post_diag)
+        bench_matrix(
+            &mut engine,
+            &args,
+            &loaded,
+            &post_diag,
+            &power,
+            &max_seq_json,
+            &load_speculation,
+        )
     } else if args.ttft {
         bench_ttft(
             &mut engine,
@@ -4917,6 +5878,8 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             prompt_chars,
             &loaded,
             &post_diag,
+            &power,
+            &max_seq_json,
         )
     } else {
         // The warmup exists to populate kernel caches and its output is
@@ -4929,13 +5892,18 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         let mut wall = Vec::new();
         let mut ttft = Vec::new();
         let mut prompt_tokens: Option<u64> = None;
+        let mut spec_routes: Vec<Option<String>> = Vec::new();
+        let mut spec_tau: Vec<Option<f64>> = Vec::new();
+        let mut power_runs = Vec::new();
         for _ in 0..args.runs {
+            let sampler = power.start_run();
             let done = bench_generate_with_reasoning(
                 &mut engine,
                 &prompt,
-                args.max_tokens as u64,
+                args.standard_max_tokens() as u64,
                 args.reasoning_on,
             )?;
+            power_runs.push(sampler.finish());
             // Every run uses the same prompt, so the daemon's tokenized
             // prompt length is run-invariant; keep the first report. The
             // done event reports the prompt as `prefill_tokens` (rows the
@@ -4944,6 +5912,13 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             if prompt_tokens.is_none() {
                 prompt_tokens = bench_prompt_tokens_from_done(&done);
             }
+            let route = bench_spec_route(&done);
+            spec_tau.push(
+                route
+                    .as_ref()
+                    .and_then(|_| done.get("tau").and_then(serde_json::Value::as_f64)),
+            );
+            spec_routes.push(route);
             if let Some(value) = done.get("decode_tok_s").and_then(serde_json::Value::as_f64) {
                 decode.push(value);
             }
@@ -4969,6 +5944,11 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         let warnings: Vec<String> = prompt_tokens
             .and_then(bench_prompt_warning)
             .into_iter()
+            .chain(bench_power::throttle_warning(&power_runs))
+            .chain(bench_spec_warning(
+                args.speculation.as_deref(),
+                &spec_routes,
+            ))
             .collect();
         if let Some(tokens) = prompt_tokens {
             eprintln!("  prompt_tokens: {tokens}");
@@ -4983,17 +5963,24 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
                 "loaded": loaded,
                 "gpu": post_diag,
                 "vram_free_before_mb": pre_diag.get("vram_free_mb"),
-                "max_tokens": args.max_tokens,
+                "max_seq": max_seq_json,
+                "max_tokens": args.standard_max_tokens(),
                 "runs": args.runs,
                 "batch": 1,
                 "prompt_tokens": prompt_tokens,
                 "prompt_md5": prompt_md5,
                 "prompt_chars": prompt_chars,
                 "warnings": warnings,
+                "power_device": power.device_json(),
+                "power": bench_power::runs_json(&power_runs),
                 "decode_tok_s": sample_stats(&decode),
                 "prefill_tok_s": sample_stats(&prefill),
                 "wall_tok_s": sample_stats(&wall),
                 "ttft_ms": sample_stats(&ttft),
+                "spec_requested": args.speculation,
+                "load_speculation": load_speculation,
+                "spec_route": spec_routes,
+                "spec_tau": spec_tau,
                 "samples": { "decode": decode, "prefill": prefill, "wall": wall, "ttft_ms": ttft },
             }),
             &loaded,
@@ -5010,12 +5997,12 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     }
 }
 
-/// Concurrency sweep across both concurrent backends. Only reached when
-/// `--concurrency` is given; the single-stream path above is untouched.
+/// Closed-loop concurrency sweep (see `bench_concurrency`). Only reached
+/// when `--concurrency` is given; the single-stream path above is untouched.
 fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Result<()> {
     use crate::bench_concurrency::{
-        parse_concurrency, render_table, sweep_backend, BackendSel, ConcurrencyBackend,
-        DaemonDriver, Point, SequentialDriver, SlotDriver, WorkloadSel,
+        betterbench_workload, parse_concurrency, render_table, steady_workload, sweep_backend,
+        BackendSel, BenchShape, Driver, Point, WorkloadSel, STEADY_DEFAULT_MAX_TOKENS,
     };
 
     let points = parse_concurrency(spec)?;
@@ -5031,46 +6018,94 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         "multiturn" => vec![WorkloadSel::Multiturn],
         _ => vec![WorkloadSel::Stateless, WorkloadSel::Multiturn],
     };
+    let shape = match args.bench_shape.as_str() {
+        "betterbench" => BenchShape::BetterBench,
+        _ => BenchShape::Steady,
+    };
+    let mut workload = match shape {
+        BenchShape::Steady => {
+            if args.bb_corpus.is_some() {
+                bail!("--bb-corpus needs --bench-shape betterbench");
+            }
+            let max_tokens = args
+                .max_tokens
+                .map_or(STEADY_DEFAULT_MAX_TOKENS, |n| n as u64);
+            steady_workload(args.num_prompts, max_tokens)?
+        }
+        BenchShape::BetterBench => {
+            if args.max_tokens.is_some() {
+                bail!(
+                    "--max-tokens does not apply to --bench-shape betterbench: \
+                     every corpus prompt carries its own max_tokens"
+                );
+            }
+            let dir = args.bb_corpus.as_deref().ok_or_else(|| {
+                anyhow!("--bench-shape betterbench needs --bb-corpus <BetterBench corpus dir>")
+            })?;
+            betterbench_workload(dir, args.num_prompts)?
+        }
+    };
+    if let Some(t) = args.temperature {
+        workload.sampling.temperature = t;
+    }
+    // The load-time knobs `hipfire serve` reads from the same configuration:
+    // its default system prompt and the VMM batch route parameters.
+    let registry = load_registry(&paths.registry).registry;
+    let (tag, entry) = registry_entry_for_path(paths, &registry, &args.model)
+        .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry.clone())))
+        .unwrap_or((None, None));
+    let resolved = resolved_for_model(paths, &args.model, tag.as_deref(), entry.as_ref())?;
+    if let Some(system) = request_string(&resolved, "prompt.system", None)? {
+        workload.inject_system(&system);
+    }
 
-    eprintln!("hipfire bench — concurrency sweep");
+    eprintln!("hipfire bench — concurrency sweep (closed loop)");
     eprintln!("  model:       {}", args.model);
     eprintln!("  concurrency: {points:?}");
     eprintln!("  runs/point:  {}", args.runs);
-    eprintln!("  max_tokens:  {}", args.max_tokens);
+    eprintln!(
+        "  shape:       {} ({} requests/sample, source md5 {}, {} warmup requests of {} tokens/sample)",
+        shape.label(),
+        workload.measure.len(),
+        workload.source_md5,
+        workload.warmup.len(),
+        crate::bench_concurrency::WARMUP_TOKENS,
+    );
+    if shape == BenchShape::Steady {
+        eprintln!("  max_tokens:  {}", workload.measure[0].max_tokens);
+    }
+    eprintln!("  sampling:    {:?}", workload.sampling);
 
     let mut out: Vec<Point> = Vec::new();
 
-    // The two backends run STRICTLY SEQUENTIALLY, and the scope below is what
-    // enforces it. Each holds a full copy of the model's weights -- 18.7 GB for
-    // a 35B-A3B mq4r -- so overlapping them doubles resident footprint. On a
-    // box with no swap that is not "slower", it is an OOM kill. `SlotEngine`'s
-    // Drop closes its channel and joins the worker thread that owns the Gpu,
-    // weights and KV arenas, so leaving this scope is what actually frees the
-    // first model before the daemon loads the second.
+    // The backends run STRICTLY SEQUENTIALLY, and the scopes below enforce
+    // it. Each holds a full copy of the model's weights -- 18.7 GB for a
+    // 35B-A3B mq4r -- so overlapping them doubles resident footprint. On a
+    // box with no swap that is not "slower", it is an OOM kill. Dropping a
+    // driver drops its engine, which stops that daemon before the next loads.
     if matches!(backend_sel, BackendSel::Slots | BackendSel::Both) {
         preflight_headroom_for_model(paths, &args.model)?;
         let mut slot_args = args.clone();
         slot_args.concurrency = None;
-        // 2048-token slots, not the serve default of 8192: the sweep's prompts
-        // are one short turn and --max-tokens is small, so a larger arena buys
-        // nothing and multiplies per-slot KV by four.
-        let (engine, loaded, _, _) = open_bench_engine_slots(paths, &slot_args, max_k, 2048)?;
+        // Small per-slot arenas, not the serve default of 8192: the steady
+        // shape's turns stay under 1K tokens and BetterBench's under 4K, and a
+        // larger arena multiplies per-slot KV for nothing.
+        let slot_ctx = match shape {
+            BenchShape::Steady => 2048,
+            BenchShape::BetterBench => 4096,
+        };
+        let (engine, loaded, _, _, _, max_seq, _) =
+            open_bench_engine_slots(paths, &slot_args, max_k, slot_ctx)?;
+        print_bench_max_seq(&max_seq, &loaded);
         let slot_capable = loaded
             .get("experimental_multi_slot")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        match SlotDriver::start(engine, max_k, slot_capable) {
+        match Driver::slots(engine, max_k, slot_capable, args.reasoning_on) {
             Ok(mut d) => {
                 eprintln!("  slots backend up ({max_k} slots)");
-                let r = sweep_backend(
-                    &mut d as &mut dyn ConcurrencyBackend,
-                    &arms,
-                    &points,
-                    args.runs,
-                    args.max_tokens as u64,
-                    &mut out,
-                );
-                // Free the weights before the batch backend loads its own copy,
+                let r = sweep_backend(&mut d, &workload, &arms, &points, args.runs, &mut out);
+                // Free the weights before the next backend loads its own copy,
                 // even on the error path.
                 drop(d);
                 r?;
@@ -5080,24 +6115,19 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         }
     }
 
-    // No-slots baseline: k requests one after another through the ordinary
-    // daemon path. Runs after the slots engine has been dropped, so only one
-    // copy of the weights is ever resident.
+    // No-batching baseline: the daemon serves one request at a time and the
+    // other lanes queue client-side, as `hipfire serve` queues them with
+    // batching off.
     if matches!(backend_sel, BackendSel::Sequential | BackendSel::Both) {
         preflight_headroom_for_model(paths, &args.model)?;
         let mut seq_args = args.clone();
         seq_args.concurrency = None;
-        let (engine, _, _, _) = open_bench_engine(paths, &seq_args, None, &BenchLoadOpts::default())?;
-        let mut d = SequentialDriver::start(engine, max_k)?;
-        eprintln!("  noslots backend up (sequential daemon path)");
-        let r = sweep_backend(
-            &mut d as &mut dyn ConcurrencyBackend,
-            &arms,
-            &points,
-            args.runs,
-            args.max_tokens as u64,
-            &mut out,
-        );
+        let (engine, loaded, _, _, _, max_seq, _) =
+            open_bench_engine(paths, &seq_args, None, &BenchLoadOpts::default())?;
+        print_bench_max_seq(&max_seq, &loaded);
+        let mut d = Driver::sequential(engine, max_k, args.reasoning_on);
+        eprintln!("  noslots backend up (one request at a time)");
+        let r = sweep_backend(&mut d, &workload, &arms, &points, args.runs, &mut out);
         drop(d);
         r?;
     }
@@ -5106,28 +6136,30 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         preflight_headroom_for_model(paths, &args.model)?;
         let mut batch_args = args.clone();
         batch_args.concurrency = None;
-        let (engine, loaded, _, _) = open_bench_engine_batched(paths, &batch_args, max_k)?;
-        let capable = loaded
-            .get("continuous_batch_capable")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        match DaemonDriver::start(engine, max_k, capable) {
+        // The VMM route needs at least two lanes; a lone request at k=1
+        // takes the singleton route either way, as it does under serve.
+        let lanes = max_k.max(2);
+        let vmm = crate::serve::VmmBatchFlags::from_config(&resolved)?;
+        let vmm_params = vmm.load_params(config_u64(&resolved, "serve.max_batch_tokens")?);
+        let (engine, loaded, _, _, _, max_seq, _) =
+            open_bench_engine_batched(paths, &batch_args, lanes, vmm_params)?;
+        print_bench_max_seq(&max_seq, &loaded);
+        match Driver::batch(engine, max_k, &loaded, args.reasoning_on) {
             Ok(mut d) => {
-                eprintln!("  batch backend up (continuous_batch_size={max_k})");
-                sweep_backend(
-                    &mut d as &mut dyn ConcurrencyBackend,
-                    &arms,
-                    &points,
-                    args.runs,
-                    args.max_tokens as u64,
-                    &mut out,
-                )?;
+                let field = |key: &str| loaded.get(key).cloned().unwrap_or_default();
+                eprintln!(
+                    "  batch backend up (VMM route, continuous_batch_size={lanes}, exact={}, spec_mode={}, row_budget={})",
+                    field("continuous_batch_exact"),
+                    field("continuous_batch_spec_mode"),
+                    field("continuous_batch_row_budget"),
+                );
+                sweep_backend(&mut d, &workload, &arms, &points, args.runs, &mut out)?;
             }
             Err(e) => eprintln!("  batch backend unavailable: {e}"),
         }
     }
 
-    println!("{}", render_table(&out));
+    println!("{}", render_table(&out, shape));
     Ok(())
 }
 
@@ -5182,25 +6214,23 @@ fn preflight_headroom_for_model(paths: &Paths, model: &str) -> Result<()> {
     Ok(())
 }
 
-/// `open_bench_engine`, but loading with `continuous_batch_size` set so the
-/// daemon allocates batch lanes and advertises `continuous_batch_capable`.
-/// The value is fixed per load, which is why the sweep holds it at max.
+/// `open_bench_engine`, loading the VMM continuous-batching route the way
+/// `hipfire serve` does with `serve.vmm_batch` on: `continuous_batch_size`
+/// lanes plus the `serve_vmm_batch` parameter object. Without the latter the
+/// daemon would batch on the legacy fixed-slot route serve never runs. The
+/// lane count is fixed per load, which is why the sweep holds it at max.
 fn open_bench_engine_batched(
     paths: &Paths,
     args: &BenchArgs,
     batch_size: usize,
-) -> Result<(
-    Engine,
-    serde_json::Value,
-    serde_json::Value,
-    serde_json::Value,
-)> {
+    vmm_batch: serde_json::Value,
+) -> Result<BenchEngine> {
     open_bench_engine(
         paths,
         args,
         None,
         &BenchLoadOpts {
-            continuous_batch: Some(batch_size),
+            continuous_batch: Some((batch_size, vmm_batch)),
             ..Default::default()
         },
     )
@@ -5214,12 +6244,7 @@ fn open_bench_engine_slots(
     args: &BenchArgs,
     slots: usize,
     ctx: usize,
-) -> Result<(
-    Engine,
-    serde_json::Value,
-    serde_json::Value,
-    serde_json::Value,
-)> {
+) -> Result<BenchEngine> {
     open_bench_engine(
         paths,
         args,
@@ -5231,6 +6256,200 @@ fn open_bench_engine_slots(
     )
 }
 
+/// `open_bench_engine`'s result: the engine, its `loaded` reply, `diag`
+/// before and after the load, the `hardware.devices` selector the daemon
+/// was configured with (the bench's power sampler resolves the same card),
+/// how the load's `max_seq` was chosen, and the speculation the load asked
+/// for ([`bench_load_speculation`]).
+type BenchEngine = (
+    Engine,
+    serde_json::Value,
+    serde_json::Value,
+    serde_json::Value,
+    Option<String>,
+    BenchMaxSeq,
+    serde_json::Value,
+);
+
+/// The speculation selectors of a bench load's params (`mtp_mode`,
+/// `dflash_mode`, `dspark_mode`, `ngram_draft`; null when the params leave
+/// one unset), so a report states which speculative route the loaded model
+/// could take.
+fn bench_load_speculation(params: &serde_json::Value) -> serde_json::Value {
+    let field = |key: &str| params.get(key).cloned().unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "mtp_mode": field("mtp_mode"),
+        "dflash_mode": field("dflash_mode"),
+        "dspark_mode": field("dspark_mode"),
+        "ngram_draft": field("ngram_draft"),
+    })
+}
+
+/// Positions past the measured ones that the daemon's `bench_prefill` and
+/// `bench_decode` guards require (`tokens + 32 <= physical_cap`).
+const BENCH_SEQ_HEADROOM: u64 = 32;
+
+/// Where a bench load's `max_seq` came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BenchMaxSeqSource {
+    /// `--max-seq N`.
+    Flag,
+    /// Sized to the `--matrix`/`--redline` shape.
+    RunShape,
+    /// An authored `memory.max_seq` forwarded by `load_params`.
+    Config,
+    /// Not sent; the daemon's admission chooses the context.
+    Automatic,
+}
+
+impl BenchMaxSeqSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Flag => "flag",
+            Self::RunShape => "run_shape",
+            Self::Config => "config",
+            Self::Automatic => "automatic",
+        }
+    }
+}
+
+/// How a bench load's `max_seq` was chosen; reported beside the effective
+/// value the daemon loaded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BenchMaxSeq {
+    /// The value sent with the load; `None` leaves it to admission.
+    requested: Option<u64>,
+    source: BenchMaxSeqSource,
+    /// Positions the matrix touches plus headroom; `None` off the matrix.
+    run_need: Option<u64>,
+    /// The model's declared context, when it was read.
+    model_limit: Option<u64>,
+}
+
+impl BenchMaxSeq {
+    /// The report's `max_seq` object. `effective` is what the daemon loaded.
+    fn json(&self, loaded: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "effective": loaded.get("max_seq"),
+            "requested": self.requested,
+            "source": self.source.as_str(),
+            "run_need": self.run_need,
+            "model_limit": self.model_limit,
+        })
+    }
+}
+
+/// Context the `--matrix`/`--redline` run touches: the largest prefill, the
+/// largest decode context plus its decode length (sustained rows only when
+/// `--sustained-tg` runs them), plus the daemon's probe headroom.
+fn bench_matrix_seq_need(
+    pp: &[usize],
+    ctx: &[usize],
+    tg: usize,
+    sustained: Option<(usize, &[usize])>,
+) -> u64 {
+    let longest = |values: &[usize], decode: usize| {
+        values
+            .iter()
+            .map(|&value| value as u64 + decode as u64)
+            .max()
+            .unwrap_or(0)
+    };
+    let sustained = sustained.map_or(0, |(tg, ctx)| longest(ctx, tg));
+    longest(pp, 0)
+        .max(longest(ctx, tg))
+        .max(sustained)
+        .saturating_add(BENCH_SEQ_HEADROOM)
+}
+
+/// The model's declared context window: `max_position_embeddings` under
+/// `config.text_config`, `config`, or the top level of the source metadata,
+/// extended by YaRN RoPE scaling (checkpoint or `attention.yarn_factor`), the
+/// same lookup admission uses for a model's trained context.
+fn declared_context_from_metadata(metadata_json: &str) -> Option<u64> {
+    let meta: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
+    let config = meta.get("config").unwrap_or(&meta);
+    let text = config.get("text_config").unwrap_or(config);
+    let native = text
+        .get("max_position_embeddings")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|&context| context > 0)?;
+    let scaling = hipfire_runtime::rope::rope_scaling(text).unwrap_or_default();
+    Some(scaling.context_limit(native as usize) as u64)
+}
+
+/// [`declared_context_from_metadata`] for a model file or directory. `None`
+/// when the source cannot be opened or declares no context; the daemon's
+/// admission is then the only bound.
+fn bench_declared_context(path: &Path) -> Option<u64> {
+    let source = hipfire_runtime::model_source::open_model(path).ok()?;
+    declared_context_from_metadata(source.metadata_json())
+}
+
+/// Choose the bench load's `max_seq` before the daemon starts.
+///
+/// `--max-seq` wins but must hold the run. Without it a matrix run is sized
+/// to `run_need` (raised to the `memory.max_seq` minimum, never above the
+/// model's declared context) instead of the configured global value; any other
+/// path stays automatic. A matrix shape past the model's declared context
+/// fails here, naming both numbers, instead of at load or mid-run.
+fn plan_bench_max_seq(
+    flag: Option<u64>,
+    run_need: Option<u64>,
+    model_limit: Option<u64>,
+    model: &str,
+) -> Result<BenchMaxSeq> {
+    if let (Some(need), Some(limit)) = (run_need, model_limit) {
+        if need > limit {
+            bail!(
+                "bench run needs max_seq {need} (largest --pp, or --ctx + --tg, plus \
+                 {BENCH_SEQ_HEADROOM} headroom) but {model} declares a maximum context of \
+                 {limit}; shrink --pp/--ctx/--tg"
+            );
+        }
+    }
+    let (requested, source) = match (flag, run_need) {
+        (Some(value), Some(need)) if value < need => bail!(
+            "--max-seq {value} is below this run's need of {need} (largest --pp, or --ctx + \
+             --tg, plus {BENCH_SEQ_HEADROOM} headroom); raise --max-seq or shrink the matrix"
+        ),
+        (Some(value), _) => (Some(value), BenchMaxSeqSource::Flag),
+        (None, Some(need)) => {
+            let ValueRule::Integer { min, .. } =
+                field("memory.max_seq").expect("schema field").rule
+            else {
+                unreachable!("memory.max_seq is an integer field");
+            };
+            let sized = need.max(min as u64);
+            let sized = model_limit.map_or(sized, |limit| sized.min(limit));
+            (Some(sized), BenchMaxSeqSource::RunShape)
+        }
+        (None, None) => (None, BenchMaxSeqSource::Automatic),
+    };
+    Ok(BenchMaxSeq {
+        requested,
+        source,
+        run_need,
+        model_limit,
+    })
+}
+
+/// Print the effective `max_seq` and how it was chosen.
+fn print_bench_max_seq(max_seq: &BenchMaxSeq, loaded: &serde_json::Value) {
+    let effective = loaded
+        .get("max_seq")
+        .and_then(serde_json::Value::as_u64)
+        .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+    let mut detail = max_seq.source.as_str().to_owned();
+    if let Some(need) = max_seq.run_need {
+        detail.push_str(&format!("; run needs {need}"));
+    }
+    if let Some(limit) = max_seq.model_limit {
+        detail.push_str(&format!("; model declares {limit}"));
+    }
+    eprintln!("  max_seq: {effective} ({detail})");
+}
+
 /// Optional load-time knobs for `open_bench_engine`, threaded explicitly
 /// rather than via `std::env::set_var` — `hipfire_config::developer_var`
 /// reads the OnceLock process-config snapshot, not the ambient environment,
@@ -5238,7 +6457,8 @@ fn open_bench_engine_slots(
 #[derive(Default)]
 struct BenchLoadOpts {
     multi_slot: Option<(usize, usize)>,
-    continuous_batch: Option<usize>,
+    /// `continuous_batch_size` and the `serve_vmm_batch` load parameter.
+    continuous_batch: Option<(usize, serde_json::Value)>,
 }
 
 fn open_bench_engine(
@@ -5246,29 +6466,45 @@ fn open_bench_engine(
     args: &BenchArgs,
     rdna2_variant: Option<u8>,
     load_opts: &BenchLoadOpts,
-) -> Result<(
-    Engine,
-    serde_json::Value,
-    serde_json::Value,
-    serde_json::Value,
-)> {
+) -> Result<BenchEngine> {
     let registry = load_registry(&paths.registry).registry;
     let (tag, entry) = registry_entry_for_path(paths, &registry, &args.model)
         .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry.clone())))
         .unwrap_or((None, None));
-    let mut path = find_model_path(paths, &registry, &args.model);
+    let mut path = resolve_model_path(paths, &registry, &args.model)?;
     if path.is_none() && entry.is_some() {
         pull_command(
             paths,
             PullArgs {
                 model: args.model.clone(),
                 force: false,
+                ple: ple::PleSelection::Auto,
             },
         )?;
-        path = entry.as_ref().map(|entry| paths.models.join(&entry.file));
+        // Do not hash a payload twice after a verified pull.
+        path = find_model_path(paths, &registry, &args.model);
     }
     let path = path.ok_or_else(|| anyhow!("model not found: {}", args.model))?;
     let resolved = resolved_for_model(paths, &args.model, tag.as_deref(), entry.as_ref())?;
+    ple::ensure_ple_sidecar(
+        &registry,
+        entry.as_ref(),
+        tag.as_deref(),
+        &path,
+        ple::request_from_config(&resolved),
+        true,
+    )?;
+    let run_need = (args.matrix || args.redline).then(|| {
+        bench_matrix_seq_need(
+            &args.pp,
+            &args.ctx,
+            args.tg,
+            args.sustained_tg
+                .map(|tg| (tg, args.sustained_ctx.as_slice())),
+        )
+    });
+    let model_limit = run_need.and_then(|_| bench_declared_context(&path));
+    let mut max_seq = plan_bench_max_seq(args.max_seq, run_need, model_limit, &args.model)?;
     let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
     let environment = BTreeMap::new();
     let mut process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
@@ -5287,18 +6523,9 @@ fn open_bench_engine(
             .values
             .set_cli("diagnostic.kernel.rdna2_variant", &variant.to_string())?;
     }
-    let mut engine = Engine::spawn_configured(daemon, &environment, &process_config)?;
+    let mut engine = Engine::spawn_configured(daemon, &environment, &process_config, Some(&path))?;
     engine.ping()?;
     let pre_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
-    let longest_prefill = args.pp.iter().copied().max().unwrap_or(0) as u64;
-    let longest_decode = args
-        .ctx
-        .iter()
-        .chain(args.sustained_ctx.iter())
-        .copied()
-        .max()
-        .unwrap_or(0) as u64
-        + args.sustained_tg.unwrap_or(args.tg) as u64;
     let max_tokens = config_u64(&resolved, "generation.max_tokens")?;
     let mut params = load_params(
         &resolved,
@@ -5334,21 +6561,19 @@ fn open_bench_engine(
         &args.model,
         tag.as_deref(),
     );
-    if args.matrix || args.redline {
-        let requested = longest_prefill.max(longest_decode).saturating_add(32);
-        // Automatic max_seq stays omitted so admission can derive the bound.
-        // An explicit user value is never silently inflated — refuse if too small.
-        if let Some(configured) = params.get("max_seq").and_then(|v| v.as_u64()) {
-            if configured < requested {
-                bail!(
-                    "memory.max_seq={configured} is below bench requirement {requested} \
-                     (longest prefill/decode + 32); raise max_seq or shrink the matrix"
-                );
+    match max_seq.requested {
+        // The flag and the matrix sizing replace any configured value.
+        Some(value) => params["max_seq"] = serde_json::json!(value),
+        None => {
+            max_seq.requested = params.get("max_seq").and_then(serde_json::Value::as_u64);
+            if max_seq.requested.is_some() {
+                max_seq.source = BenchMaxSeqSource::Config;
             }
         }
     }
-    if let Some(n) = load_opts.continuous_batch {
-        params["continuous_batch_size"] = serde_json::json!(n as u64);
+    if let Some((n, vmm_batch)) = &load_opts.continuous_batch {
+        params["continuous_batch_size"] = serde_json::json!(*n as u64);
+        params["serve_vmm_batch"] = vmm_batch.clone();
     }
     if let Some(tp) = args.tp.filter(|&tp| tp > 1) {
         params["tp"] = serde_json::json!(tp);
@@ -5358,9 +6583,11 @@ fn open_bench_engine(
         params["experimental_multi_slot_slots"] = serde_json::json!(slots as u64);
         params["experimental_multi_slot_ctx"] = serde_json::json!(ctx as u64);
     }
+    let load_speculation = bench_load_speculation(&params);
     let loaded = engine.load(&path, params)?;
     let post_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
-    Ok((engine, loaded, pre_diag, post_diag))
+    let devices_spec = process_config.legacy_value("HIPFIRE_DEVICES");
+    Ok((engine, loaded, pre_diag, post_diag, devices_spec, max_seq, load_speculation))
 }
 
 /// The standard benchmark generate: greedy, fixed budget, and **answer mode**.
@@ -5390,7 +6617,10 @@ fn bench_generate_request_reasoning(
         "prompt": prompt,
         "temperature": 0.0,
         "top_p": 1.0,
-        "repeat_penalty": 1.1,
+        // Neutral on every path: any non-neutral penalty routes the daemon to
+        // the plain AR decoder, which made `--spec` silently measure AR, and a
+        // shared value keeps `--spec off` and speculative runs the same workload.
+        "repeat_penalty": 1.0,
         "max_tokens": max_tokens,
         "attempt_id": 1,
     });
@@ -5400,6 +6630,44 @@ fn bench_generate_request_reasoning(
         request["reasoning_effort"] = serde_json::json!("none");
     }
     request
+}
+
+/// The speculation route a generate `done` event reports, or `None` when the
+/// plain AR decoder ran (no `tau` stats, or zero speculative cycles).
+fn bench_spec_route(done: &serde_json::Value) -> Option<String> {
+    let cycles = done
+        .get("cycles")
+        .or_else(|| done.get("rounds"))
+        .and_then(serde_json::Value::as_u64);
+    if done.get("tau").is_none() || cycles == Some(0) {
+        return None;
+    }
+    if let Some(spec) = done.get("spec").and_then(serde_json::Value::as_str) {
+        return Some(spec.to_string());
+    }
+    let flag = |key: &str| done.get(key).and_then(serde_json::Value::as_bool) == Some(true);
+    let route = if flag("mtp_ngram") {
+        "mtp+ngram"
+    } else if flag("mtp") {
+        "mtp"
+    } else if flag("dflash") {
+        "dflash"
+    } else {
+        "speculative"
+    };
+    Some(route.to_string())
+}
+
+/// Warning when a speculative selector was requested but every measured run
+/// went through AR.
+fn bench_spec_warning(selector: Option<&str>, routes: &[Option<String>]) -> Option<String> {
+    let selector = selector?;
+    if selector == "off" || routes.is_empty() || routes.iter().any(Option::is_some) {
+        return None;
+    }
+    Some(format!(
+        "--spec {selector} requested but no speculation ran; these numbers measure AR decode"
+    ))
 }
 
 fn bench_generate(engine: &mut Engine, prompt: &str, max_tokens: u64) -> Result<serde_json::Value> {
@@ -5438,6 +6706,38 @@ fn bench_probe(
     }
 }
 
+/// [`bench_probe`] for one measured run, sampling the GPU power state across
+/// it into `runs`.
+fn bench_probe_sampled(
+    engine: &mut Engine,
+    power: &bench_power::PowerProbe,
+    runs: &mut Vec<bench_power::RunPower>,
+    message: serde_json::Value,
+    expected: &str,
+) -> Result<serde_json::Value> {
+    let sampler = power.start_run();
+    let response = bench_probe(engine, message, expected)?;
+    runs.push(sampler.finish());
+    Ok(response)
+}
+
+/// The bench's power sampler, aimed at the card the daemon was given:
+/// `hardware.devices`, else the inherited `ROCR_VISIBLE_DEVICES` the daemon
+/// also sees, else the first ROCr agent of the daemon's reported arch.
+fn bench_power_probe(
+    devices_spec: Option<&str>,
+    diag: &serde_json::Value,
+) -> bench_power::PowerProbe {
+    let rocr_visible = env::var("ROCR_VISIBLE_DEVICES").ok();
+    let probe = bench_power::PowerProbe::new(
+        devices_spec,
+        rocr_visible.as_deref(),
+        diag.get("arch").and_then(serde_json::Value::as_str),
+    );
+    eprintln!("  power:  {}", probe.describe());
+    probe
+}
+
 /// Client-side TTFT on the standard generate path: per run, generate a
 /// single token with thinking off and time wall clock from request send to
 /// the first streamed `token` event. `pp_tok_s = prompt_tokens / ttft_s` is
@@ -5445,6 +6745,7 @@ fn bench_probe(
 /// prompt_tokens/TTFT p50 at an HTTP client). Warmups run the same shape
 /// and are discarded. `--reasoning-on` is intentionally ignored here: the
 /// metric is defined with thinking off.
+#[allow(clippy::too_many_arguments)]
 fn bench_ttft(
     engine: &mut Engine,
     args: &BenchArgs,
@@ -5453,6 +6754,8 @@ fn bench_ttft(
     prompt_chars: u64,
     loaded: &serde_json::Value,
     diag: &serde_json::Value,
+    power: &bench_power::PowerProbe,
+    max_seq: &serde_json::Value,
 ) -> Result<()> {
     // The shared bench banner prints args.max_tokens; the ttft path always
     // generates exactly one token with thinking off, so say so explicitly.
@@ -5462,10 +6765,12 @@ fn bench_ttft(
     }
     let mut ttft_ms_samples = Vec::new();
     let mut prompt_tokens: Option<u64> = None;
+    let mut power_runs = Vec::new();
     for _ in 0..args.runs {
         let start = Instant::now();
         let mut first: Option<Duration> = None;
         let request = bench_generate_request(prompt, 1);
+        let sampler = power.start_run();
         let done = engine.generate(&request, |event| {
             if first.is_none()
                 && event.get("type").and_then(serde_json::Value::as_str) == Some("token")
@@ -5477,6 +6782,7 @@ fn bench_ttft(
         let elapsed = first.ok_or_else(|| {
             anyhow!("no streamed token observed; cannot measure client-side TTFT")
         })?;
+        power_runs.push(sampler.finish());
         ttft_ms_samples.push(elapsed.as_secs_f64() * 1000.0);
         if prompt_tokens.is_none() {
             prompt_tokens = bench_prompt_tokens_from_done(&done);
@@ -5487,6 +6793,12 @@ fn bench_ttft(
     eprintln!();
     if let Some(tokens) = prompt_tokens {
         eprintln!("  prompt_tokens: {tokens}");
+    }
+    let warnings: Vec<String> = bench_power::throttle_warning(&power_runs)
+        .into_iter()
+        .collect();
+    for warning in &warnings {
+        eprintln!("  warning: {warning}");
     }
     let pp_samples: Vec<f64> = match prompt_tokens {
         Some(tokens) if tokens > 0 => ttft_ms_samples
@@ -5503,6 +6815,7 @@ fn bench_ttft(
             "model": args.model,
             "loaded": loaded,
             "gpu": diag,
+            "max_seq": max_seq,
             "max_tokens": 1,
             "runs": args.runs,
             "warmups": args.warmups,
@@ -5519,6 +6832,9 @@ fn bench_ttft(
             },
             "pp_tok_s": pp_stats,
             "pp_tok_s_samples": pp_samples,
+            "warnings": warnings,
+            "power_device": power.device_json(),
+            "power": bench_power::runs_json(&power_runs),
         }),
         loaded,
     );
@@ -5536,6 +6852,9 @@ fn bench_matrix(
     args: &BenchArgs,
     loaded: &serde_json::Value,
     diag: &serde_json::Value,
+    power: &bench_power::PowerProbe,
+    max_seq: &serde_json::Value,
+    load_speculation: &serde_json::Value,
 ) -> Result<()> {
     for size in &args.pp {
         let _ = bench_probe(
@@ -5553,11 +6872,15 @@ fn bench_matrix(
         )?;
     }
     let mut pp_rows = Vec::new();
+    let mut all_power = Vec::new();
     for size in &args.pp {
         let mut samples = Vec::new();
+        let mut row_power = Vec::new();
         for _ in 0..args.runs {
-            let result = bench_probe(
+            let result = bench_probe_sampled(
                 engine,
+                power,
+                &mut row_power,
                 serde_json::json!({ "type": "bench_prefill", "tokens": size }),
                 "prefill_result",
             )?;
@@ -5572,7 +6895,8 @@ fn bench_matrix(
             "  pp{size}: {:.2} tok/s median",
             sample_stats(&samples).unwrap().median
         );
-        pp_rows.push(serde_json::json!({ "tokens": size, "stats": sample_stats(&samples), "samples": samples }));
+        pp_rows.push(serde_json::json!({ "tokens": size, "stats": sample_stats(&samples), "samples": samples, "power": bench_power::runs_json(&row_power) }));
+        all_power.extend(row_power);
     }
     let mut decode_rows = Vec::new();
     for context in &args.ctx {
@@ -5582,9 +6906,12 @@ fn bench_matrix(
             "decode_result",
         )?;
         let mut samples = Vec::new();
+        let mut row_power = Vec::new();
         for _ in 0..args.runs {
-            let result = bench_probe(
+            let result = bench_probe_sampled(
                 engine,
+                power,
+                &mut row_power,
                 serde_json::json!({ "type": "bench_decode", "context_tokens": context, "iterations": args.tg }),
                 "decode_result",
             )?;
@@ -5601,7 +6928,8 @@ fn bench_matrix(
             context,
             sample_stats(&samples).unwrap().median
         );
-        decode_rows.push(serde_json::json!({ "context": context, "tokens": args.tg, "stats": sample_stats(&samples), "samples": samples }));
+        decode_rows.push(serde_json::json!({ "context": context, "tokens": args.tg, "stats": sample_stats(&samples), "samples": samples, "power": bench_power::runs_json(&row_power) }));
+        all_power.extend(row_power);
     }
     let mut sustained_rows = Vec::new();
     if let Some(tg) = args.sustained_tg {
@@ -5612,9 +6940,12 @@ fn bench_matrix(
                 "decode_result",
             )?;
             let mut samples = Vec::new();
+            let mut row_power = Vec::new();
             for _ in 0..args.runs {
-                let result = bench_probe(
+                let result = bench_probe_sampled(
                     engine,
+                    power,
+                    &mut row_power,
                     serde_json::json!({ "type": "bench_decode", "context_tokens": context, "iterations": tg }),
                     "decode_result",
                 )?;
@@ -5629,8 +6960,15 @@ fn bench_matrix(
                 "  tg{tg}@{context}: {:.2} tok/s median",
                 sample_stats(&samples).unwrap().median
             );
-            sustained_rows.push(serde_json::json!({ "context": context, "tokens": tg, "stats": sample_stats(&samples), "samples": samples }));
+            sustained_rows.push(serde_json::json!({ "context": context, "tokens": tg, "stats": sample_stats(&samples), "samples": samples, "power": bench_power::runs_json(&row_power) }));
+            all_power.extend(row_power);
         }
+    }
+    let warnings: Vec<String> = bench_power::throttle_warning(&all_power)
+        .into_iter()
+        .collect();
+    for warning in &warnings {
+        eprintln!("  warning: {warning}");
     }
     let report = with_loaded_kv_backend_fields(
         serde_json::json!({
@@ -5638,9 +6976,17 @@ fn bench_matrix(
             "model": args.model,
             "loaded": loaded,
             "gpu": diag,
+            "max_seq": max_seq,
             "redline_pm4": args.redline,
             "kv_mode": args.kv_mode,
+            "spec_requested": args.speculation,
+            "load_speculation": load_speculation,
+            // `bench_prefill` never drafts: the prompt prefill of a
+            // speculative load (MTP's head fill) is not what these rows time.
+            "prefill_route": "bench_prefill (synthetic ids, no speculative prompt fill)",
             "runs": args.runs,
+            "warnings": warnings,
+            "power_device": power.device_json(),
             "prefill": pp_rows,
             "decode": decode_rows,
             "sustained": sustained_rows,
@@ -5656,7 +7002,8 @@ fn bench_matrix(
 fn bench_experimental(paths: &Paths, args: &BenchArgs) -> Result<()> {
     let mut rows = Vec::new();
     for variant in 1..=5 {
-        let (mut engine, _, _, diag) = open_bench_engine(paths, args, Some(variant), &BenchLoadOpts::default())?;
+        let (mut engine, _, _, diag, _, _, _) =
+            open_bench_engine(paths, args, Some(variant), &BenchLoadOpts::default())?;
         let arch = diag
             .get("arch")
             .and_then(serde_json::Value::as_str)
@@ -5710,7 +7057,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             pp: vec![128],
             ctx: vec![128],
             tg: 1,
-            max_tokens: 128,
+            max_tokens: None,
             sustained_tg: None,
             sustained_ctx: vec![128],
             warmups: 1,
@@ -5718,23 +7065,30 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             kv_k: None,
             kv_v: None,
             kv_backend: None,
+            max_seq: None,
             redline: false,
             speculation: None,
             reasoning_on: false,
             concurrency: None,
             backend: "both".to_owned(),
             workload: "both".to_owned(),
+            bench_shape: "steady".to_owned(),
+            bb_corpus: None,
+            num_prompts: None,
+            temperature: None,
             prompt: Vec::new(),
             prompt_file: None,
         };
-        let (mut engine, _, _, _) = open_bench_engine(paths, &bench, None, &BenchLoadOpts::default())?;
+        let (mut engine, _, _, _, _, _, _) =
+            open_bench_engine(paths, &bench, None, &BenchLoadOpts::default())?;
         let _ = bench_generate(&mut engine, "Hello", 1)?;
         engine
     } else {
         let (_, resolved) = resolved_global(paths, true)?;
         let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
         let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
-        let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
+        let mut engine =
+            Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, None)?;
         engine.ping()?;
         engine
     };
@@ -6836,7 +8190,9 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
 
 // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
 fn sidecar_command(paths: &Paths, args: SidecarArgs) -> Result<()> {
-    eprintln!("warning: CASK is deprecated and will be removed in 0.5.0; not supported (sidecar-gen)");
+    eprintln!(
+        "warning: CASK is deprecated and will be removed in 0.5.0; not supported (sidecar-gen)"
+    );
     if !(1..=1_000_000).contains(&args.max_tokens) {
         bail!("--max-tokens must be between 1 and 1000000");
     }
@@ -6957,7 +8313,7 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
         let (_, resolved) = resolved_global(paths, true).ok()?;
         let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved).ok()?;
         let mut engine =
-            Engine::spawn_configured(daemon, &BTreeMap::new(), &process_config).ok()?;
+            Engine::spawn_configured(daemon, &BTreeMap::new(), &process_config, None).ok()?;
         engine.ping().ok()?;
         engine.request(&serde_json::json!({ "type": "diag" })).ok()
     });
@@ -7228,6 +8584,222 @@ fn find_daemon_in(paths: &Paths, workspace: &std::path::Path, windows: bool) -> 
     candidates.into_iter().find(|path| path.is_file())
 }
 
+/// The hipfire home a process runs under, read from its environment with the
+/// `ConfigPaths::discover` rule (`HIPFIRE_HOME`, else `$HOME/.hipfire`).
+/// `None` when the environment is unreadable (another user's process).
+fn process_hipfire_home(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let environ = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let mut hipfire_home = None;
+    let mut home = None;
+    for var in environ.split(|byte| *byte == 0) {
+        if let Some(value) = var.strip_prefix(b"HIPFIRE_HOME=") {
+            hipfire_home = Some(PathBuf::from(std::ffi::OsStr::from_bytes(value)));
+        } else if let Some(value) = var.strip_prefix(b"HOME=") {
+            home = Some(PathBuf::from(std::ffi::OsStr::from_bytes(value)));
+        }
+    }
+    hipfire_home.or_else(|| home.map(|home| home.join(".hipfire")))
+}
+
+fn same_file_path(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// A live (non-zombie) process whose `argv[0]` is `daemon` (this install's
+/// daemon binary) and whose hipfire home is `root`.
+fn is_install_daemon(pid: u32, daemon: &Path, root: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let argv0 = cmdline.split(|byte| *byte == 0).next().unwrap_or_default();
+    !argv0.is_empty()
+        && same_file_path(Path::new(std::ffi::OsStr::from_bytes(argv0)), daemon)
+        && process_hipfire_home(pid).is_some_and(|home| same_file_path(&home, root))
+}
+
+fn process_gone(pid: u32) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // The state follows the parenthesised command name; `Z` is a zombie.
+        Ok(stat) => stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with('Z')),
+        Err(_) => true,
+    }
+}
+
+/// PIDs this install may own a daemon under: the daemon pidfiles
+/// (`daemon*.pid` in the home and in `$HOME/.hipfire`, where the daemon writes
+/// them), the GPU-lock holders, and the children of the recorded serve PID.
+/// Every candidate is still verified by [`is_install_daemon`].
+fn install_daemon_candidates(paths: &Paths) -> BTreeSet<u32> {
+    let mut candidates = BTreeSet::new();
+    let first_pid = |raw: &str| raw.split_whitespace().next()?.parse::<u32>().ok();
+    let mut pid_dirs = vec![paths.root.clone()];
+    if let Some(home) = env::var_os("HOME") {
+        pid_dirs.push(PathBuf::from(home).join(".hipfire"));
+    }
+    let lock_dirs = match env::var_os("HIPFIRE_LOCK_DIR") {
+        Some(dir) => vec![PathBuf::from(dir)],
+        None => vec![
+            PathBuf::from("/run/lock/hipfire"),
+            PathBuf::from("/tmp/hipfire-locks"),
+        ],
+    };
+    let scan = |dir: &Path, prefix: &str, suffix: &str, out: &mut BTreeSet<u32>| {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(prefix) && name.ends_with(suffix) {
+                if let Some(pid) = fs::read_to_string(entry.path())
+                    .ok()
+                    .and_then(|raw| first_pid(&raw))
+                {
+                    out.insert(pid);
+                }
+            }
+        }
+    };
+    for dir in &pid_dirs {
+        scan(dir, "daemon", ".pid", &mut candidates);
+    }
+    for dir in &lock_dirs {
+        scan(dir, "gpu-", ".lock", &mut candidates);
+    }
+    if let Some(serve) = fs::read_to_string(paths.root.join("serve.pid"))
+        .ok()
+        .and_then(|raw| parse_pid_record(&raw))
+    {
+        if let Ok(tasks) = fs::read_dir(format!("/proc/{}/task", serve.pid)) {
+            for task in tasks.flatten() {
+                if let Ok(children) = fs::read_to_string(task.path().join("children")) {
+                    candidates.extend(
+                        children
+                            .split_whitespace()
+                            .filter_map(|pid| pid.parse::<u32>().ok()),
+                    );
+                }
+            }
+        }
+    }
+    candidates
+}
+
+/// `stop --force`: stop only this install's daemon processes — candidates from
+/// its pidfiles/GPU locks whose `argv[0]` is this install's daemon binary and
+/// whose hipfire home is this home. SIGTERM, then SIGKILL after 5 s for the
+/// ones still running (re-verified first). Returns the signalled PIDs.
+pub(crate) fn reap_install_daemons(paths: &Paths) -> Result<Vec<u32>> {
+    let Some(daemon) = find_daemon(paths) else {
+        return Ok(Vec::new());
+    };
+    let own = std::process::id();
+    let targets = install_daemon_candidates(paths)
+        .into_iter()
+        .filter(|&pid| pid != own && is_install_daemon(pid, &daemon, &paths.root))
+        .collect::<Vec<_>>();
+    for &pid in &targets {
+        // SAFETY: plain kill(2) on a verified positive PID.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !targets.iter().all(|&pid| process_gone(pid)) {
+        thread::sleep(Duration::from_millis(100));
+    }
+    for &pid in &targets {
+        if !process_gone(pid) && is_install_daemon(pid, &daemon, &paths.root) {
+            eprintln!("daemon PID {pid} ignored SIGTERM for 5 s; sending SIGKILL");
+            // SAFETY: as above, re-verified immediately before signalling.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+    }
+    Ok(targets)
+}
+
+/// Something accepts TCP connections on `host:port`.
+pub(crate) fn port_in_use(host: &str, port: u16) -> bool {
+    use std::net::ToSocketAddrs;
+    (host, port).to_socket_addrs().is_ok_and(|mut addrs| {
+        addrs.any(|addr| {
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
+        })
+    })
+}
+
+/// Port of the running serve: the live `serve.pid` record's port (a serve
+/// started with a host:port positional or `-d` on another port), else
+/// `serve.port`.
+fn serve_probe_port(paths: &Paths, configured: u16) -> u16 {
+    fs::read_to_string(paths.root.join("serve.pid"))
+        .ok()
+        .and_then(|raw| parse_pid_record(&raw))
+        .filter(|record| Path::new(&format!("/proc/{}", record.pid)).exists())
+        .and_then(|record| record.port)
+        .unwrap_or(configured)
+}
+
+/// Levenshtein distance over chars.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b = b.chars().collect::<Vec<_>>();
+    let mut row = (0..=b.len()).collect::<Vec<_>>();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (above + 1)
+                .min(row[j] + 1)
+                .min(diagonal + usize::from(ca != *cb));
+            diagonal = above;
+        }
+    }
+    row[b.len()]
+}
+
+/// Up to three registry tags/aliases close to `input` (case-insensitive edit
+/// distance), then a pointer to the full list. Empty for path-like input.
+fn model_suggestions(registry: &RegistryV1, input: &str) -> String {
+    if input.contains(std::path::MAIN_SEPARATOR) {
+        return String::new();
+    }
+    let needle = input.to_lowercase();
+    let limit = (needle.chars().count() / 4).max(2);
+    let mut close = registry
+        .models
+        .keys()
+        .chain(registry.aliases.keys())
+        .map(|tag| (edit_distance(&needle, &tag.to_lowercase()), tag.as_str()))
+        .filter(|(distance, _)| *distance <= limit)
+        .collect::<Vec<_>>();
+    close.sort_unstable();
+    close.dedup_by(|a, b| a.1 == b.1);
+    let mut message = String::new();
+    if !close.is_empty() {
+        let tags = close
+            .iter()
+            .take(3)
+            .map(|(_, tag)| *tag)
+            .collect::<Vec<_>>();
+        message.push_str(&format!("\n  did you mean: {}?", tags.join(", ")));
+    }
+    message.push_str("\n  see: hipfire list -r");
+    message
+}
+
+fn unknown_model_error(registry: &RegistryV1, input: &str) -> anyhow::Error {
+    anyhow!(
+        "unknown model '{input}'{}",
+        model_suggestions(registry, input)
+    )
+}
+
 pub(crate) fn request_f64(
     resolved: &hipfire_config::ResolvedConfig,
     key: &str,
@@ -7351,7 +8923,7 @@ fn is_model_file(name: &str) -> bool {
 /// `"tokenizer": "{}"`, so loading it as a trunk fails with
 /// `tokenizer metadata field missing or wrong type: model`.
 fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
-    registry
+    let mut files: BTreeSet<&str> = registry
         .models
         .values()
         .flat_map(|entry| {
@@ -7365,13 +8937,18 @@ fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
                 entry.vae.as_ref(),
                 entry.dflash.as_ref(),
                 entry.vision.as_ref(),
+                entry.ple_q4.as_ref(),
+                entry.ple_q8.as_ref(),
             ]
             .into_iter()
             .flatten()
             .map(|sidecar: &Sidecar| sidecar.file.as_str())
             .chain(entry.heads.values().map(|sidecar| sidecar.file.as_str()))
         })
-        .collect()
+        .collect();
+    // The trunk overlays are compiled-in pins, not registry fields.
+    files.extend(TRUNK_OVERLAY_PINS.iter().map(|pin| pin.file));
+    files
 }
 
 /// True when `name` is a model file worth showing in a local listing.
@@ -7381,7 +8958,17 @@ fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
 /// from `MODEL_SUFFIXES` (`qwen3.8-27b.mq3-xt`, `-pro`, `.bq1`, `.tq2`), and a
 /// suffix-only test hides exactly those models.
 pub(crate) fn is_listable_model_file(name: &str, registry: &RegistryV1) -> bool {
-    is_model_file(name) || registry.models.values().any(|entry| entry.file == name)
+    !ple::is_ple_sidecar_name(name)
+        && !is_trunk_overlay_name(name)
+        && (is_model_file(name) || registry.models.values().any(|entry| entry.file == name))
+}
+
+/// True for a Flash-Next trunk overlay sidecar (`<base>.trunk-overlay`): an
+/// HFQM container of pre-encoded QT44 tensors that belongs to its base and is
+/// never a model on its own.
+fn is_trunk_overlay_name(name: &str) -> bool {
+    name.to_ascii_lowercase()
+        .ends_with(hipfire_config::memory::TRUNK_OVERLAY_SIDECAR_SUFFIX)
 }
 
 /// True when `name` can actually serve a completion, as opposed to merely
@@ -7408,7 +8995,7 @@ pub(crate) fn is_listable_model_file(name: &str, registry: &RegistryV1) -> bool 
 /// [`HfqFile::probe_arch_id`] reports a [`SERVE_TRUNK_ARCH_IDS`] id. The
 /// registry cannot answer for it — the catalog only knows the files it ships.
 pub(crate) fn is_standalone_model(path: &Path, name: &str, registry: &RegistryV1) -> bool {
-    if registry_sidecar_files(registry).contains(name) {
+    if ple::is_ple_sidecar_name(name) || registry_sidecar_files(registry).contains(name) {
         return false;
     }
     if !is_listable_model_file(name, registry) {
@@ -7440,8 +9027,9 @@ pub(crate) fn is_standalone_model(path: &Path, name: &str, registry: &RegistryV1
 /// generation components, served through `hipfire img` / `/v1/images/*`, not
 /// completion trunks a `/v1/models` pick can generate text from. `8`
 /// (dots.ocr) and `11` (LFM2.5 / LFM2.5-VL) are present: both answer text
-/// completions.
-pub(crate) const SERVE_TRUNK_ARCH_IDS: &[u32] = &[0, 1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+/// completions. `16` (Qwen4 / Flash-Next) is present as a text-serving primary
+/// arch: an unregistered local Flash-Next trunk must be advertised too.
+pub(crate) const SERVE_TRUNK_ARCH_IDS: &[u32] = &[0, 1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
 fn source_label(source: &ConfigSource) -> String {
     match source {
@@ -7493,6 +9081,12 @@ fn config_rule_json(rule: ValueRule) -> serde_json::Value {
         ValueRule::KvBackend => {
             serde_json::json!({ "type": "string", "enum": ["legacy", "vmm"] })
         }
+        ValueRule::AutoInteger { min, max } => serde_json::json!({
+            "type": ["integer", "string"],
+            "enum": ["auto"],
+            "minimum": min,
+            "maximum": max,
+        }),
         ValueRule::AutoBool => serde_json::json!({
             "type": ["boolean", "string"],
             "enum": [true, false, "auto"],
@@ -7510,6 +9104,13 @@ fn config_rule_json(rule: ValueRule) -> serde_json::Value {
             "minimum": min,
             "maximum": max,
         }),
+        ValueRule::NullableIntegerOrAuto { min, max } => serde_json::json!({
+            "type": ["integer", "string", "null"],
+            "minimum": min,
+            "maximum": max,
+            "enum": ["auto"],
+            "nullable": true,
+        }),
         ValueRule::NullableFloat { min, max } => serde_json::json!({
             "type": ["number", "null"],
             "minimum": min,
@@ -7518,6 +9119,10 @@ fn config_rule_json(rule: ValueRule) -> serde_json::Value {
         ValueRule::KvAdaptive => serde_json::json!({
             "type": "string",
             "format": "kv-adaptive-policy",
+        }),
+        ValueRule::PassbackShare => serde_json::json!({
+            "type": "string",
+            "format": "auto-or-share",
         }),
         ValueRule::Deepseek4Placement => serde_json::json!({
             "type": "string",
@@ -7538,11 +9143,14 @@ fn config_rule_label(rule: ValueRule) -> &'static str {
         ValueRule::Enum(_) => "enum",
         ValueRule::KvBackend => "kv-backend",
         ValueRule::AutoBool => "auto-bool",
+        ValueRule::AutoInteger { .. } => "auto|integer",
         ValueRule::NullableString => "string|null",
         ValueRule::NullableEnum(_) => "enum|null",
         ValueRule::NullableInteger { .. } => "integer|null",
+        ValueRule::NullableIntegerOrAuto { .. } => "integer|auto|null",
         ValueRule::NullableFloat { .. } => "number|null",
         ValueRule::KvAdaptive => "kv-adaptive",
+        ValueRule::PassbackShare => "auto-or-share",
         ValueRule::Deepseek4Placement => "deepseek4-placement",
     }
 }
@@ -7600,6 +9208,174 @@ mod tests {
             config,
         }
     }
+    #[test]
+    fn run_stats_are_authoritative_and_missing_is_not_wall_rate() {
+        assert_eq!(
+            format_run_stats(
+                Some(256),
+                &serde_json::json!({
+                    "decode_tok_s":123.3, "ttft_ms":42.1, "tau":7.15, "dflash":true
+                })
+            ),
+            "[stats] tokens=256 decode=123.30 tok/s ttft=42.1 ms tau=7.15"
+        );
+        assert_eq!(
+            format_run_stats(None, &serde_json::json!({"tok_s":99.0})),
+            "[stats] tokens=n/a decode=n/a tok/s ttft=n/a ms"
+        );
+        assert_eq!(
+            format_run_stats(
+                Some(0),
+                &serde_json::json!({"decode_tok_s":-1,"ttft_ms":null,"tau":"bad"})
+            ),
+            "[stats] tokens=0 decode=n/a tok/s ttft=n/a ms tau=n/a"
+        );
+        assert_eq!(
+            format_run_stats(
+                None,
+                &serde_json::json!({
+                    "decode_tok_s": f64::INFINITY, "ttft_ms": f64::NAN
+                })
+            ),
+            "[stats] tokens=n/a decode=n/a tok/s ttft=n/a ms"
+        );
+        assert_eq!(
+            format_run_stats(
+                Some(1),
+                &serde_json::json!({
+                    "tau":1, "dflash":false, "mtp":false
+                })
+            ),
+            "[stats] tokens=1 decode=n/a tok/s ttft=n/a ms"
+        );
+    }
+
+    #[test]
+    fn verified_migration_zero_transfer_race_and_corruption() {
+        let paths = test_paths("verified-migration");
+        fs::create_dir_all(&paths.models).unwrap();
+        let old = paths.models.join("old");
+        let new = paths.models.join("new");
+        let sidecar = paths.models.join("sidecar");
+        let bytes = b"tiny XTS fixture";
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        fs::write(&old, bytes).unwrap();
+        fs::write(&sidecar, b"preserved").unwrap();
+        let mut joins = Vec::new();
+        for _ in 0..4 {
+            let (old, new, digest) = (old.clone(), new.clone(), digest.clone());
+            joins.push(std::thread::spawn(move || {
+                DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+                let result = migrate_verified_artifact(&old, &new, &digest, bytes.len() as u64);
+                DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 0));
+                result
+            }));
+        }
+        for join in joins {
+            assert_eq!(join.join().unwrap().unwrap(), Some(new.clone()));
+        }
+        assert!(same_installed_file(&old, &new));
+        assert_eq!(fs::read(&sidecar).unwrap(), b"preserved");
+        assert_eq!(
+            migrate_verified_artifact(&old, &new, &digest, bytes.len() as u64).unwrap(),
+            Some(new.clone())
+        );
+        fs::remove_file(&new).unwrap();
+        fs::write(&old, vec![b'x'; bytes.len()]).unwrap();
+        assert!(migrate_verified_artifact(&old, &new, &digest, bytes.len() as u64).is_err());
+        assert!(!new.exists());
+        fs::write(&old, bytes).unwrap();
+        fs::write(&new, vec![b'x'; bytes.len()]).unwrap();
+        assert!(migrate_verified_artifact(&old, &new, &digest, bytes.len() as u64).is_err());
+        fs::remove_dir_all(paths.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_migration_preserves_external_symlink() {
+        let paths = test_paths("migration-symlink");
+        fs::create_dir_all(&paths.models).unwrap();
+        let external = paths.root.join("external");
+        let old = paths.models.join("old");
+        let new = paths.models.join("new");
+        fs::write(&external, b"fixture").unwrap();
+        std::os::unix::fs::symlink(&external, &old).unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"fixture"));
+        assert_eq!(
+            migrate_verified_artifact(&old, &new, &digest, 7).unwrap(),
+            Some(new.clone())
+        );
+        assert!(fs::symlink_metadata(&old).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(new).unwrap(), b"fixture");
+        fs::remove_dir_all(paths.root).unwrap();
+    }
+    #[test]
+    fn pinned_migration_never_selects_rtn_and_link_failure_keeps_old_path() {
+        let paths = test_paths("migration-fallback");
+        fs::create_dir_all(&paths.models).unwrap();
+        let old = paths.models.join("old");
+        fs::write(&old, b"fixture").unwrap();
+        let unavailable = paths.root.join("missing-parent/canonical");
+        let digest = format!("{:x}", Sha256::digest(b"fixture"));
+        assert_eq!(
+            migrate_verified_artifact(&old, &unavailable, &digest, 7).unwrap(),
+            Some(old.clone())
+        );
+        #[cfg(target_os = "linux")]
+        {
+            // procfs does not permit arbitrary new links even for root.
+            let read_only = Path::new("/proc").join(paths.root.file_name().unwrap());
+            assert_eq!(
+                migrate_verified_artifact(&old, &read_only, &digest, 7).unwrap(),
+                Some(old.clone())
+            );
+            assert_eq!(fs::read(&old).unwrap(), b"fixture");
+        }
+        let registry = hipfire_registry::bundled().unwrap();
+        let (_, entry) = registry.model("qwen3.8:flash-next").unwrap();
+        assert!(entry.is_flash_next_xts());
+        let rtn = paths.models.join("qwen3.8-flash-next.mq4");
+        fs::write(&rtn, b"historical RTN").unwrap();
+        assert_eq!(migrate_flash_next_xts(&paths, entry).unwrap(), None);
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "qwen3.8:flash-next").unwrap(),
+            None
+        );
+        let (_, rtn_entry) = registry.model("qwen3.8:flash-next-rtn-asym").unwrap();
+        assert!(!rtn_entry.is_flash_next_xts());
+        assert_eq!(migrate_flash_next_xts(&paths, rtn_entry).unwrap(), None);
+        fs::remove_dir_all(paths.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_migration_cross_device_uses_symlink_without_copy() {
+        use std::os::unix::fs::MetadataExt;
+        let paths = test_paths("migration-cross-device");
+        fs::create_dir_all(&paths.models).unwrap();
+        let shared = Path::new("/dev/shm");
+        if !shared.is_dir()
+            || fs::metadata(shared).unwrap().dev() == fs::metadata(&paths.root).unwrap().dev()
+        {
+            fs::remove_dir_all(paths.root).unwrap();
+            return;
+        }
+        let old = paths.models.join("old");
+        fs::write(&old, b"fixture").unwrap();
+        let canonical = shared.join(paths.root.file_name().unwrap());
+        let digest = format!("{:x}", Sha256::digest(b"fixture"));
+        assert_eq!(
+            migrate_verified_artifact(&old, &canonical, &digest, 7).unwrap(),
+            Some(canonical.clone())
+        );
+        assert!(fs::symlink_metadata(&canonical)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(same_installed_file(&old, &canonical));
+        fs::remove_file(canonical).unwrap();
+        fs::remove_dir_all(paths.root).unwrap();
+    }
 
     fn idle_test_meta() -> ServeMeta {
         ServeMeta {
@@ -7608,6 +9384,79 @@ mod tests {
             last_activity: Instant::now() - Duration::from_secs(600),
             ..ServeMeta::new("test".to_owned())
         }
+    }
+
+    /// `offload-bench` is a raw device benchmark: it must name a live daemon and
+    /// measure nothing. The predicate behind that refusal is pure filesystem +
+    /// `kill(pid, 0)`, so it is testable without a GPU or a real daemon — and it is
+    /// the only thing standing between a user and two engines sharing the device.
+    #[test]
+    fn live_daemon_pids_sees_live_pid_files_only() {
+        let paths = test_paths("offload-bench-pids");
+        std::fs::create_dir_all(&paths.root).unwrap();
+        // Our own pid is alive; a pid above the kernel's `pid_max` cannot be.
+        std::fs::write(paths.root.join("daemon.pid"), format!("{}\n", std::process::id())).unwrap();
+        std::fs::write(paths.root.join("daemon-GPU-0abc_pci-0000:14:00.0.pid"), "999999999\n")
+            .unwrap();
+        // Not pid files, and not a pid: ignored, never an error.
+        std::fs::write(paths.root.join("daemon.pid.bak"), "1\n").unwrap();
+        std::fs::write(paths.root.join("daemon-garbage.pid"), "not-a-pid\n").unwrap();
+        std::fs::write(paths.root.join("serve.pid"), format!("{}\n", std::process::id())).unwrap();
+
+        assert_eq!(live_daemon_pids(&paths), vec![std::process::id() as i32]);
+
+        // The same file naming a dead process is no longer a live daemon.
+        std::fs::write(paths.root.join("daemon.pid"), "999999999\n").unwrap();
+        assert!(live_daemon_pids(&paths).is_empty());
+
+        // A missing root is empty, not a panic.
+        let _ = std::fs::remove_dir_all(&paths.root);
+        assert!(live_daemon_pids(&paths).is_empty());
+    }
+
+    /// The recommendation a user pins: a singleton when one format was measured,
+    /// otherwise the **median** of the largest measurements. The tie is the point —
+    /// every format is measured over the same `buffer_mb`, so picking by
+    /// `max_by_key(bytes)` silently returned whichever format came last in the
+    /// matrix (q8_0), whose rate profile is not the model's.
+    #[test]
+    fn recommended_share_takes_the_median_of_the_largest() {
+        let report = |format: &str, bytes: usize, share: f64| CalibrationReport {
+            arch: "gfx1201".into(),
+            format: format.into(),
+            m: bytes / 2720,
+            k: 5120,
+            bytes,
+            cpu_bytes_per_s: 4.0e10,
+            gpu_bytes_per_s: 2.5e10,
+            share,
+            predicted_speedup: 1.5,
+        };
+
+        assert!(recommended_share(&[]).is_none());
+
+        // One pinned format: itself, named.
+        let one = vec![report("mq4g256", 201_328_960, 0.375)];
+        assert_eq!(recommended_share(&one), Some(("mq4g256".to_string(), 0.375)));
+
+        // A tie on size takes the median share of the tied set, and says so.
+        let tied = vec![
+            report("a", 100, 0.10),
+            report("b", 100, 0.20),
+            report("c", 100, 0.50),
+            report("small", 50, 0.99),
+        ];
+        assert_eq!(
+            recommended_share(&tied),
+            Some(("the 3 largest measured formats".to_string(), 0.20))
+        );
+
+        // A strictly larger entry wins outright, wherever it sits in the matrix.
+        let mixed = vec![report("small", 50, 0.99), report("big", 200, 0.30)];
+        assert_eq!(
+            recommended_share(&mixed),
+            Some(("big".to_string(), 0.30))
+        );
     }
 
     /// A minimal real HFQ container carrying `arch_id`, so the discovery
@@ -7712,6 +9561,11 @@ mod tests {
         // A locally quantized trunk of a primary arch: advertised.
         write_hfq_fixture(&paths.models.join("local-trunk.mq4"), 5);
         assert!(classify("local-trunk.mq4"));
+
+        // A locally produced Flash-Next (Qwen4) trunk, arch 16, is a text-serving
+        // primary: advertised even though the registry does not name the file.
+        write_hfq_fixture(&paths.models.join("local-flash-next.mq4"), 16);
+        assert!(classify("local-flash-next.mq4"));
 
         // Locally produced sidecars: never advertised, whatever the registry
         // knows. 20 = DFlash draft, 23 = Muse Glimmer drafter.
@@ -9088,10 +10942,257 @@ mod tests {
         )
         .unwrap();
         assert_eq!(params["dflash_mode"], "auto");
+        assert_eq!(params["mtp_mode"], "auto", "MTP auto stays in effect");
         assert!(
             params.get("draft").is_none(),
-            "auto without a pulled draft runs AR"
+            "auto without a pulled draft wires no draft"
         );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    fn qwen38_27b_dflash_registry() -> RegistryV1 {
+        let dflash = r#""dflash":{"file":"qwen38-27b-dflash-mq4.hfq"}"#;
+        let raw = format!(
+            r#"{{
+            "schema_version":1,
+            "generated_at":"2026-09-01T00:00:00Z",
+            "models":{{
+                "qwen3.8:27b":{{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:27b-mq4-pro":{{"repo":"x","file":"qwen3.8-27b.mq4-pro","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:27b-mq5":{{"repo":"x","file":"qwen3.8-27b.mq5","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5}},
+                "qwen3.8:27boops":{{"repo":"x","file":"qwen3.8-27boops.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5,{dflash}}},
+                "qwen3.8:flash-next":{{"repo":"x","file":"qwen3.8-flash-next.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":16,{dflash}}},
+                "qwen3.8:27b-draft-mq4":{{"repo":"x","file":"qwen38-27b-draft.hfq","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":20,{dflash}}},
+                "qwen3.6:27b":{{"repo":"x","file":"qwen3.6-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}},
+                "qwen3.5:9b":{{"repo":"x","file":"qwen3.5-9b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x",{dflash}}}
+            }},
+            "aliases":{{"qwen3.8":"qwen3.8:27b","qwen3.8:27b-mq4":"qwen3.8:27b"}}
+        }}"#
+        );
+        RegistryV1::parse(&raw, "test").unwrap()
+    }
+
+    #[test]
+    pub(crate) fn resolved_for_model_defaults_dflash_auto_only_for_paired_qwen38_27b() {
+        // Registry layer lowers dflash=auto only for canonical qwen3.8:27b[-*]
+        // trunks that declare a dflash sidecar; BuiltIn off and MTP auto
+        // stay for everything else, including the no-registry path.
+        let paths = test_paths("registry-dflash-default-scope");
+        fs::create_dir_all(&paths.root).unwrap();
+        let registry = qwen38_27b_dflash_registry();
+        for (input, expected) in [
+            ("qwen3.8:27b", "auto"),
+            ("qwen3.8", "auto"),
+            ("qwen3.8:27b-mq4", "auto"),
+            ("qwen3.8:27b-mq4-pro", "auto"),
+            ("qwen3.8:27b-mq5", "off"),
+            ("qwen3.8:27boops", "off"),
+            ("qwen3.8:flash-next", "off"),
+            ("qwen3.8:27b-draft-mq4", "off"),
+            ("qwen3.6:27b", "off"),
+            ("qwen3.5:9b", "off"),
+        ] {
+            let (tag, entry) = registry.model(input).unwrap();
+            let resolved = resolved_for_model(&paths, input, Some(tag), Some(entry)).unwrap();
+            assert_eq!(
+                config_string(&resolved, "speculation.dflash").unwrap(),
+                expected,
+                "{input}->{tag}"
+            );
+            assert_eq!(
+                config_string(&resolved, "speculation.mtp").unwrap(),
+                "auto",
+                "{input}->{tag}"
+            );
+            assert_eq!(
+                config_string(&resolved, "speculation.mode").unwrap(),
+                "auto",
+                "{input}->{tag}"
+            );
+        }
+        // No registry tag/entry (bare artifact path): BuiltIn off.
+        let bare = resolved_for_model(&paths, "qwen3.8-27b.mq4", None, None).unwrap();
+        assert_eq!(config_string(&bare, "speculation.dflash").unwrap(), "off");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_wires_default_dflash_draft_for_qwen38_27b_only_when_pulled() {
+        // Paired file present: auto + draft wired. Missing: no draft, MTP auto
+        // unchanged. Non-eligible models never wire a draft even with the file
+        // on disk.
+        let paths = test_paths("registry-dflash-default-load");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = qwen38_27b_dflash_registry();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let (tag, entry) = registry.model("qwen3.8:27b").unwrap();
+        let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
+        let load = |resolved: &hipfire_config::ResolvedConfig, tag: &str, entry: &ModelEntry| {
+            load_params(
+                resolved,
+                Some(entry),
+                &paths.models,
+                &model_path,
+                64,
+                Some("q8"),
+                None,
+                Some(tag),
+                false,
+                None,
+            )
+            .unwrap()
+        };
+
+        let missing = load(&resolved, tag, entry);
+        assert_eq!(missing["dflash_mode"], "auto");
+        assert_eq!(missing["mtp_mode"], "auto");
+        assert!(missing.get("draft").is_none(), "no pulled draft, no wiring");
+
+        let draft_path = paths.models.join("qwen38-27b-dflash-mq4.hfq");
+        fs::write(&draft_path, b"draft").unwrap();
+        let present = load(&resolved, tag, entry);
+        assert_eq!(present["dflash_mode"], "auto");
+        assert_eq!(present["mtp_mode"], "auto");
+        assert_eq!(present["draft"], draft_path.display().to_string());
+
+        for input in [
+            "qwen3.8:27b-mq5",
+            "qwen3.8:27boops",
+            "qwen3.8:flash-next",
+            "qwen3.8:27b-draft-mq4",
+            "qwen3.6:27b",
+            "qwen3.5:9b",
+        ] {
+            let (tag, entry) = registry.model(input).unwrap();
+            let resolved = resolved_for_model(&paths, input, Some(tag), Some(entry)).unwrap();
+            let params = load(&resolved, tag, entry);
+            assert_eq!(params["dflash_mode"], "off", "{input}");
+            assert_eq!(params["mtp_mode"], "auto", "{input}");
+            assert!(params.get("draft").is_none(), "{input}");
+        }
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn qwen38_27b_default_dflash_yields_to_explicit_off_and_blocks_developer_draft() {
+        // The registry layer sits below global/model/one-shot config: an
+        // explicit dflash=off (or speculation.mode=off) wins and strips both
+        // the paired sidecar and a developer.dflash_draft.
+        let paths = test_paths("registry-dflash-default-off-wins");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = qwen38_27b_dflash_registry();
+        let (tag, entry) = registry.model("qwen3.8:27b").unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let draft_path = paths.models.join("qwen38-27b-dflash-mq4.hfq");
+        fs::write(&draft_path, b"draft").unwrap();
+        let developer_draft = "/tmp/developer-draft.hfq";
+        let registry_layer = || NamedLayer {
+            source: ConfigSource::RegistryModel {
+                tag: tag.to_owned(),
+                revision: "v1".into(),
+            },
+            layer: hipfire_registry::config_layer_for_tag(tag, entry).unwrap(),
+        };
+        let load = |resolved: &hipfire_config::ResolvedConfig| {
+            load_params(
+                resolved,
+                Some(entry),
+                &paths.models,
+                &model_path,
+                64,
+                Some("q8"),
+                None,
+                Some(tag),
+                false,
+                None,
+            )
+            .unwrap()
+        };
+        let global = |layer: ConfigLayer| NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: PathBuf::from("/tmp/global.toml"),
+            },
+            layer,
+        };
+        let model_user = |layer: ConfigLayer| NamedLayer {
+            source: ConfigSource::ModelUser {
+                model: tag.to_owned(),
+                path: PathBuf::from("/tmp/model.toml"),
+            },
+            layer,
+        };
+
+        // Baseline: registry default is on (auto), the pulled draft is wired.
+        let baseline = resolve(vec![registry_layer()]).unwrap();
+        let params = load(&baseline);
+        assert_eq!(params["dflash_mode"], "auto");
+        assert_eq!(params["draft"], draft_path.display().to_string());
+
+        // A developer draft with default auto still wins over the paired file.
+        let mut dev_only = ConfigLayer::default();
+        dev_only
+            .set_cli("developer.dflash_draft", developer_draft)
+            .unwrap();
+        let params = load(&resolve(vec![registry_layer(), global(dev_only)]).unwrap());
+        assert_eq!(params["dflash_mode"], "auto");
+        assert_eq!(params["draft"], developer_draft);
+
+        // Explicit global/model off wins and drops sidecar + developer draft.
+        for scope in ["global", "model"] {
+            let mut user = ConfigLayer::default();
+            user.set_cli("speculation.dflash", "off").unwrap();
+            user.set_cli("developer.dflash_draft", developer_draft)
+                .unwrap();
+            let user_layer = if scope == "global" {
+                global(user)
+            } else {
+                model_user(user)
+            };
+            let resolved = resolve(vec![registry_layer(), user_layer]).unwrap();
+            assert_eq!(
+                config_string(&resolved, "speculation.dflash").unwrap(),
+                "off",
+                "{scope}"
+            );
+            let params = load(&resolved);
+            assert_eq!(params["dflash_mode"], "off", "{scope}");
+            assert!(
+                params.get("draft").is_none(),
+                "{scope}: off blocks sidecar and developer draft"
+            );
+        }
+
+        // One-shot off (as `--set speculation.dflash=off`) wins over a model-user auto.
+        let mut model_auto = ConfigLayer::default();
+        model_auto.set_cli("speculation.dflash", "auto").unwrap();
+        let params = load(
+            &resolve(vec![
+                registry_layer(),
+                model_user(model_auto),
+                NamedLayer {
+                    source: ConfigSource::OneShot {
+                        argument: "speculation.dflash=off".into(),
+                    },
+                    layer: {
+                        let mut layer = ConfigLayer::default();
+                        layer.set_cli("speculation.dflash", "off").unwrap();
+                        layer
+                    },
+                },
+            ])
+            .unwrap(),
+        );
+        assert_eq!(params["dflash_mode"], "off");
+        assert!(params.get("draft").is_none());
+
+        // speculation.mode=off disables DFlash through the selector as well.
+        let mut mode_off = ConfigLayer::default();
+        mode_off.set_cli("speculation.mode", "off").unwrap();
+        let params = load(&resolve(vec![registry_layer(), global(mode_off)]).unwrap());
+        assert_eq!(params["dflash_mode"], "off");
+        assert!(params.get("draft").is_none());
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -9621,6 +11722,125 @@ mod tests {
     }
 
     #[test]
+    fn unknown_model_suggests_close_tags_and_list() {
+        let registry = rm_test_registry(&[
+            ("qwen3.5:4b", "qwen3.5-4b.mq4", None),
+            ("qwen3.5:9b", "qwen3.5-9b.mq4", None),
+            ("qwen3.8:27b-mq4", "qwen3.8-27b.mq4", None),
+        ]);
+        let message = unknown_model_error(&registry, "qwen3.5:4bb").to_string();
+        assert!(
+            message.starts_with("unknown model 'qwen3.5:4bb'"),
+            "{message}"
+        );
+        assert!(message.contains("did you mean: qwen3.5:4b"), "{message}");
+        assert!(message.ends_with("see: hipfire list -r"), "{message}");
+        let message = unknown_model_error(&registry, "QWEN35:4B").to_string();
+        assert!(message.contains("did you mean: qwen3.5:4b"), "{message}");
+        let message = unknown_model_error(&registry, "llama3:8b").to_string();
+        assert!(!message.contains("did you mean"), "{message}");
+        assert!(message.contains("see: hipfire list -r"), "{message}");
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+    }
+
+    #[test]
+    fn rm_of_known_tag_not_downloaded_says_so() {
+        let paths = test_paths("rm-not-downloaded");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = rm_test_registry(&[("qwen3.8:27b", "qwen3.8-27b.mq4", None)]);
+        let rm = |model: &str| {
+            rm_with_registry(
+                &paths,
+                &registry,
+                RmArgs {
+                    model: model.into(),
+                    yes: true,
+                },
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        assert_eq!(
+            rm("qwen3.8:27b"),
+            "qwen3.8:27b is not downloaded; nothing to remove"
+        );
+        assert!(rm("qwen3.8:27bb").contains("did you mean: qwen3.8:27b"));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn continuous_batch_size_schema_and_cli_share_maximum() {
+        let max = hipfire_config::MAX_CONTINUOUS_BATCH_SIZE;
+        let field = field("serve.continuous_batch_size").expect("continuous_batch_size schema");
+        let hipfire_config::ValueRule::Integer {
+            min: schema_min,
+            max: schema_max,
+        } = field.rule
+        else {
+            panic!("serve.continuous_batch_size must be an integer rule")
+        };
+        assert_eq!(schema_min, 1);
+        assert_eq!(schema_max, i64::try_from(max).unwrap());
+        for lanes in 1..=max {
+            field
+                .validate(&hipfire_config::ConfigValue::Integer(
+                    i64::try_from(lanes).unwrap(),
+                ))
+                .unwrap_or_else(|err| panic!("schema rejected {lanes}: {err}"));
+            let parsed = Cli::try_parse_from([
+                "hipfire",
+                "serve",
+                "--continuous-batch-size",
+                &lanes.to_string(),
+            ])
+            .unwrap_or_else(|err| panic!("CLI rejected {lanes}: {err}"));
+            let Some(Commands::Serve(args)) = parsed.command else {
+                panic!("expected serve command")
+            };
+            assert_eq!(args.continuous_batch_size, Some(lanes));
+        }
+        for lanes in [0, max + 1] {
+            assert!(field
+                .validate(&hipfire_config::ConfigValue::Integer(
+                    i64::try_from(lanes).unwrap()
+                ))
+                .is_err());
+            assert!(Cli::try_parse_from([
+                "hipfire",
+                "serve",
+                "--continuous-batch-size",
+                &lanes.to_string(),
+            ])
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn serve_and_run_accept_spec_and_max_seq() {
+        let parsed =
+            Cli::try_parse_from(["hipfire", "serve", "--spec", "off", "--max-seq", "8192"])
+                .unwrap();
+        let Some(Commands::Serve(args)) = parsed.command else {
+            panic!("expected serve command")
+        };
+        assert_eq!(args.speculation.as_deref(), Some("off"));
+        assert_eq!(args.max_seq, Some(8192));
+        assert!(Cli::try_parse_from(["hipfire", "serve", "--spec", "bogus"]).is_err());
+        assert!(Cli::try_parse_from(["hipfire", "serve", "--max-seq", "1"]).is_err());
+        let parsed =
+            Cli::try_parse_from(["hipfire", "run", "qwen3.5:4b", "--max-seq", "4096", "hi"])
+                .unwrap();
+        let Some(Commands::Run(args)) = parsed.command else {
+            panic!("expected run command")
+        };
+        assert_eq!(args.max_seq, Some(4096));
+        assert!(
+            run_should_force_local(&args),
+            "--max-seq needs a local load"
+        );
+    }
+
+    #[test]
     fn rm_keeps_shared_dflash_sidecar_while_sibling_target_present() {
         // The hw-gate regression on PR #686: `qwen3.8:27b`, `qwen3.8:27b-mq4-pro`,
         // and `qwen3.8:27b-mq4-xt` all declare `qwen38-27b-dflash-mq4.hfq`.
@@ -10140,7 +12360,7 @@ mod tests {
         // `on` + a path with no registry entry + no explicit draft fails
         // closed with the not-managed message instead of silently running AR
         // (Fable's earlier note on unregistered basenames). `auto` on the
-        // same file still runs AR as a bare artifact.
+        // same file wires no draft as a bare artifact.
         let paths = test_paths("dflash-on-foreign-path");
         fs::create_dir_all(&paths.models).unwrap();
         let foreign_dir = paths.root.join("elsewhere");
@@ -10175,7 +12395,7 @@ mod tests {
             message.contains("not a registry-managed artifact"),
             "{message}"
         );
-        assert!(message.contains("developer.dflash_draft"), "{message}");
+        assert!(message.contains("--model-draft"), "{message}");
         let resolved = resolved_with_dflash_mode("auto", None);
         let params = load_params(
             &resolved,
@@ -10195,6 +12415,42 @@ mod tests {
             params.get("draft").is_none(),
             "auto on a bare artifact runs AR"
         );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn dflash_on_refuses_without_draft_even_with_mtp_head() {
+        let paths = test_paths("dflash-on-no-draft-with-mtp");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.6-35b-a3b.mq4p");
+        fs::write(&model_path, b"trunk").unwrap();
+        let head = paths.models.join("qwen3.6-35b-a3b.mtp");
+        fs::write(&head, b"head").unwrap();
+        let entry = ModelEntry {
+            file: "qwen3.6-35b-a3b.mq4p".into(),
+            mtp: Some(Sidecar {
+                file: "qwen3.6-35b-a3b.mtp".into(),
+                sha256: None,
+                size_bytes: None,
+            }),
+            ..Default::default()
+        };
+        for mtp_mode in ["auto", "on", "off"] {
+            let mut params = serde_json::json!({
+                "dflash_mode": "on",
+                "mtp_mode": mtp_mode,
+            });
+            let error = resolve_dflash_sidecar(
+                &mut params,
+                Some(&entry),
+                &paths.models,
+                &model_path,
+                Some("qwen3.6:35b-a3b-mq4p"),
+            ).expect_err("DFlash on requires a DFlash draft, not an MTP head");
+            assert!(error.to_string().contains("--model-draft"), "{error:#}");
+            assert_eq!(params["mtp_mode"], mtp_mode);
+            assert!(params.get("draft").is_none());
+        }
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -10266,6 +12522,9 @@ mod tests {
             }
         }
 
+        // `HIPFIRE_HF_BASE` is process-global: the pull tests point it at
+        // their local servers under the same lock.
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _hf_base = EnvRestore("HIPFIRE_HF_BASE", env::var_os("HIPFIRE_HF_BASE"));
         let _hf_endpoint = EnvRestore("HF_ENDPOINT", env::var_os("HF_ENDPOINT"));
         let registry = hipfire_registry::bundled().unwrap();
@@ -11197,6 +13456,8 @@ mod tests {
         assert!(include_reasoning_content(Some("qwen36")));
         assert!(include_reasoning_content(Some("Qwen3.6-A3B")));
         assert!(include_reasoning_content(Some("qwen3.5")));
+        assert!(include_reasoning_content(Some("qwen4")));
+        assert!(!include_reasoning_content(Some("deepseek4")));
         assert!(!include_reasoning_content(Some("llama")));
         assert!(!include_reasoning_content(Some("gemma4")));
         assert!(!include_reasoning_content(Some("qwen2")));
@@ -11587,7 +13848,7 @@ mod tests {
             let mut engine = None;
             let mut last = None;
             for attempt in 0..8 {
-                match Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config) {
+                match Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, None) {
                     Ok(e) => {
                         engine = Some(e);
                         break;
@@ -11628,6 +13889,7 @@ mod tests {
                     30000,
                     None,
                     64 << 20,
+                    false,
                 ),
                 metrics: crate::serve::metrics::Metrics::default(),
                 runtime: Mutex::new(ServeRuntime {
@@ -11640,6 +13902,7 @@ mod tests {
                     current_reasoning_effort_native: false,
                     current_reasoning_efforts: Vec::new(),
                     continuous_batch_capable: false,
+                    continuous_batch_history: false,
                     current_max_seq: 0,
                     cache_capable: false,
                     kv_override: None,
@@ -11648,7 +13911,10 @@ mod tests {
                     kv_backend_override: None,
                     vision_override: None,
                     tp: None,
+                    speculation_override: None,
+                    max_seq_override: None,
                     continuous_batch_size: 1,
+                    vmm_batch: crate::serve::VmmBatchFlags::default(),
                     multi_slot_enabled: false,
                     multi_slot_slots: 4,
                     multi_slot_ctx: 8192,
@@ -11675,6 +13941,7 @@ mod tests {
                 retry_backoff,
                 backoff_hook: Mutex::new(None),
                 stream_stall_timeout: None,
+                ui_enabled: false,
             });
 
             let std_listener =
@@ -11889,6 +14156,32 @@ mod tests {
         assert!(generates[2].get("max_tokens_fit").is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn serve_max_seq_override_reaches_model_load() {
+        let h = Task11HttpHarness::spawn("max-seq-override");
+        h.shared.runtime.lock().unwrap().max_seq_override = Some(65_536);
+
+        let (status, _, text) = post_status(h.port(), &h.base_body("t11-stop-text", false));
+        assert_eq!(status, 200, "{text}");
+
+        let second_model = "t11-fixture-max-seq-override-second.hfq";
+        fs::write(h.paths.models.join(second_model), b"task11-dummy-model").unwrap();
+        let mut second_body = h.base_body("t11-stop-text", false);
+        second_body["model"] = serde_json::json!(second_model);
+        let (status, _, text) = post_status(h.port(), &second_body);
+        assert_eq!(status, 200, "{text}");
+
+        let log = h.read_requests_log();
+        let loads = Task11HttpHarness::ops_of_type(&log, "load");
+        assert_eq!(loads.len(), 2);
+        assert!(
+            loads
+                .iter()
+                .all(|load| load["params"]["max_seq"] == 65_536)
+        );
+    }
+
     /// A request may not load a file outside the installed models, nor start
     /// a registry download; an installed model still loads.
     #[cfg(unix)]
@@ -11910,6 +14203,36 @@ mod tests {
         assert_eq!(status, 200, "{text}");
     }
 
+    /// HA-13: a turn the model ended inside `<think>` reaches the client as
+    /// reasoning only, `finish_reason: "stop"`, and no error, both streamed
+    /// and non-streamed.
+    #[cfg(unix)]
+    #[test]
+    fn reasoning_only_stop_streams_and_completes_without_error() {
+        let harness = Task11HttpHarness::spawn("open-think-stop");
+        let port = harness.port();
+        let reasoning = "Schedule: \"0 8 * * *\" — every day at 8 AM.\n\nNow let's create the job.";
+
+        let cap = capture_stream(port, harness.base_body("t11-open-think-stop", true))
+            .expect("stream ends without an error event");
+        assert_eq!(cap.reasoning, reasoning);
+        assert!(cap.content.is_empty(), "no answer: {:?}", cap.content);
+        assert!(cap.tool_calls.is_empty());
+        assert_eq!(cap.finish.as_deref(), Some("stop"));
+        assert!(cap.saw_done);
+
+        let json = complete_nonstream(port, harness.base_body("t11-open-think-stop", false))
+            .expect("non-stream completes with 200");
+        let choice = &json["choices"][0];
+        assert_eq!(choice["finish_reason"], "stop");
+        assert_eq!(choice["message"]["reasoning_content"], reasoning);
+        assert!(
+            choice["message"]["content"].is_null() || choice["message"]["content"] == "",
+            "{json}"
+        );
+        assert!(choice["message"].get("tool_calls").is_none(), "{json}");
+    }
+
     /// After a failed switch the daemon holds nothing (tp<=1 unloads first):
     /// `/health` must stop naming the old model and the next request for it
     /// must reload instead of generating against an empty daemon.
@@ -11921,7 +14244,11 @@ mod tests {
         assert_eq!(status, 200, "{text}");
         let health = serve_health(h.port()).1;
         assert_eq!(health["model"], serde_json::json!(h.model()));
-        assert_eq!(health["n_ctx"], serde_json::json!(4096), "the load ack's max_seq");
+        assert_eq!(
+            health["n_ctx"],
+            serde_json::json!(4096),
+            "the load ack's max_seq"
+        );
 
         fs::write(h.paths.models.join("t20-load-fail.hfq"), b"x").unwrap();
         let mut bad = h.base_body("t11-stop-text", false);
@@ -11930,12 +14257,18 @@ mod tests {
         assert_ne!(status, 200, "{text}");
         let health = serve_health(h.port()).1;
         assert!(health["model"].is_null());
-        assert!(health["n_ctx"].is_null(), "no context is advertised with nothing resident");
+        assert!(
+            health["n_ctx"].is_null(),
+            "no context is advertised with nothing resident"
+        );
 
         let (status, _, text) = post_status(h.port(), &h.base_body("t11-stop-text", false));
         assert_eq!(status, 200, "{text}");
         let loads = Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").len();
-        assert_eq!(loads, 3, "initial load, failed switch, reload of the old model");
+        assert_eq!(
+            loads, 3,
+            "initial load, failed switch, reload of the old model"
+        );
     }
 
     /// A daemon that exits (crash, or a sticky GPU fault after which it exits
@@ -11964,7 +14297,10 @@ mod tests {
     #[test]
     fn serve_health_is_unhealthy_until_the_daemon_is_back() {
         let h = Task11HttpHarness::spawn("respawn-health");
-        assert_eq!(post_status(h.port(), &h.base_body("t11-stop-text", false)).0, 200);
+        assert_eq!(
+            post_status(h.port(), &h.base_body("t11-stop-text", false)).0,
+            200
+        );
         let daemon = {
             let mut runtime = h.shared.runtime.lock().unwrap();
             std::mem::replace(
@@ -11986,7 +14322,10 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(health["status"], "ok");
         assert_eq!(health["model"], serde_json::json!(h.model()));
-        assert_eq!(post_status(h.port(), &h.base_body("t11-stop-text", false)).0, 200);
+        assert_eq!(
+            post_status(h.port(), &h.base_body("t11-stop-text", false)).0,
+            200
+        );
         // The supervisor reloaded the model; the request did not load again.
         let loads = Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").len();
         assert_eq!(loads, 2);
@@ -12080,8 +14419,7 @@ mod tests {
         let choice = &json["choices"][0];
         assert_eq!(choice["finish_reason"], "tool_calls", "{text}");
         assert_eq!(
-            choice["message"]["tool_calls"][0]["function"]["name"],
-            "read_file",
+            choice["message"]["tool_calls"][0]["function"]["name"], "read_file",
             "{text}"
         );
     }
@@ -12267,10 +14605,17 @@ mod tests {
     /// Raw non-stream POST; returns HTTP status and body bytes (no client parse).
     #[cfg(unix)]
     fn raw_nonstream_post(port: u16, body: &serde_json::Value) -> (u16, Vec<u8>) {
+        raw_post(port, "/v1/chat/completions", body)
+    }
+
+    /// Raw `POST path` with `Connection: close`: HTTP status and the
+    /// de-chunked body (a whole SSE stream for streaming requests).
+    #[cfg(unix)]
+    fn raw_post(port: u16, path: &str, body: &serde_json::Value) -> (u16, Vec<u8>) {
         use std::net::TcpStream;
         let payload = body.to_string();
         let request = format!(
-            "POST /v1/chat/completions HTTP/1.1\r\n\
+            "POST {path} HTTP/1.1\r\n\
              Host: 127.0.0.1:{port}\r\n\
              Content-Type: application/json\r\n\
              Content-Length: {}\r\n\
@@ -12333,6 +14678,395 @@ mod tests {
             remaining = &remaining[size + 2..];
         }
         (status, decoded)
+    }
+
+    /// `(event, data)` pairs of a named-event SSE body (keepalives skipped).
+    #[cfg(unix)]
+    fn named_sse_events(bytes: &[u8]) -> Vec<(String, serde_json::Value)> {
+        String::from_utf8(bytes.to_vec())
+            .expect("SSE body is UTF-8")
+            .split("\n\n")
+            .filter(|frame| !frame.trim().is_empty() && !frame.starts_with(':'))
+            .map(|frame| {
+                let mut event = None;
+                let mut data = None;
+                for line in frame.lines() {
+                    if let Some(name) = line.strip_prefix("event: ") {
+                        event = Some(name.to_owned());
+                    } else if let Some(json) = line.strip_prefix("data: ") {
+                        data = Some(serde_json::from_str(json).expect("SSE data is JSON"));
+                    }
+                }
+                (
+                    event.unwrap_or_else(|| panic!("frame without event: {frame}")),
+                    data.unwrap_or_else(|| panic!("frame without data: {frame}")),
+                )
+            })
+            .collect()
+    }
+
+    /// The last `generate` the fake daemon received, minus its per-request
+    /// wire ids, so two HTTP requests can be compared as daemon requests.
+    #[cfg(unix)]
+    fn last_generate_without_ids(h: &Task11HttpHarness) -> serde_json::Value {
+        let log = h.read_requests_log();
+        let mut generate = (*Task11HttpHarness::ops_of_type(&log, "generate")
+            .last()
+            .expect("a generate reached the daemon"))
+        .clone();
+        let obj = generate.as_object_mut().unwrap();
+        obj.remove("id");
+        obj.remove("attempt_id");
+        generate
+    }
+
+    /// A Messages or Responses request reaches the daemon as exactly the
+    /// generate its chat-completions twin sends: same messages, sampling,
+    /// stops and reasoning controls. Admission, batching eligibility and the
+    /// session cache all key on that request, so they behave identically.
+    #[cfg(unix)]
+    #[test]
+    fn messages_and_responses_reach_the_daemon_as_their_chat_twin() {
+        let h = Task11HttpHarness::spawn("adapter-twins");
+        let chat = serde_json::json!({
+            "model": h.model(),
+            "max_tokens": 64,
+            "messages": [
+                { "role": "system", "content": "Be brief." },
+                { "role": "user", "content": "t11-stop-text please" },
+            ],
+            "stop": ["END"],
+            "temperature": 0.2,
+            "top_k": 20,
+            "thinking": { "type": "disabled" },
+        });
+        assert_eq!(raw_post(h.port(), "/v1/chat/completions", &chat).0, 200);
+        let chat_generate = last_generate_without_ids(&h);
+
+        let messages = serde_json::json!({
+            "model": h.model(),
+            "max_tokens": 64,
+            "system": "Be brief.",
+            "messages": [{ "role": "user", "content": [{ "type": "text", "text": "t11-stop-text please" }] }],
+            "stop_sequences": ["END"],
+            "temperature": 0.2,
+            "top_k": 20,
+        });
+        assert_eq!(raw_post(h.port(), "/v1/messages", &messages).0, 200);
+        assert_eq!(last_generate_without_ids(&h), chat_generate);
+
+        let mut chat_effort = chat.clone();
+        chat_effort.as_object_mut().unwrap().remove("thinking");
+        chat_effort["reasoning_effort"] = serde_json::json!("low");
+        assert_eq!(
+            raw_post(h.port(), "/v1/chat/completions", &chat_effort).0,
+            200
+        );
+        let chat_generate = last_generate_without_ids(&h);
+        let responses = serde_json::json!({
+            "model": h.model(),
+            "max_output_tokens": 64,
+            "instructions": "Be brief.",
+            "input": [{ "role": "user", "content": [{ "type": "input_text", "text": "t11-stop-text please" }] }],
+            "stop": ["END"],
+            "temperature": 0.2,
+            "top_k": 20,
+            "reasoning": { "effort": "low" },
+        });
+        assert_eq!(raw_post(h.port(), "/v1/responses", &responses).0, 200);
+        assert_eq!(last_generate_without_ids(&h), chat_generate);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anthropic_messages_nonstream_and_stream_shapes() {
+        let h = Task11HttpHarness::spawn("anthropic-messages");
+        let body = serde_json::json!({
+            "model": h.model(),
+            "max_tokens": 64,
+            "thinking": { "type": "enabled", "budget_tokens": 1024 },
+            "messages": [{ "role": "user", "content": "t21-think-text please" }],
+        });
+        let (status, bytes) = raw_post(h.port(), "/v1/messages", &body);
+        let message: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 200, "{message}");
+        assert_eq!(message["type"], "message");
+        assert_eq!(message["role"], "assistant");
+        assert!(message["id"].as_str().unwrap().starts_with("msg_"));
+        assert_eq!(
+            message["content"],
+            serde_json::json!([
+                { "type": "thinking", "thinking": "plan it", "signature": "" },
+                { "type": "text", "text": "answer text" },
+            ])
+        );
+        assert_eq!(message["stop_reason"], "end_turn");
+        assert_eq!(
+            message["usage"],
+            serde_json::json!({ "input_tokens": 9, "cache_creation_input_tokens": 0,
+                                "cache_read_input_tokens": 2, "output_tokens": 5 })
+        );
+
+        let mut stream_body = body.clone();
+        stream_body["stream"] = serde_json::json!(true);
+        let (status, bytes) = raw_post(h.port(), "/v1/messages", &stream_body);
+        assert_eq!(status, 200);
+        let events = named_sse_events(&bytes);
+        let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        let thinking: String = events
+            .iter()
+            .filter_map(|(_, data)| data.pointer("/delta/thinking").and_then(|t| t.as_str()))
+            .collect();
+        let text: String = events
+            .iter()
+            .filter_map(|(_, data)| data.pointer("/delta/text").and_then(|t| t.as_str()))
+            .collect();
+        assert_eq!(
+            (thinking.as_str(), text.as_str()),
+            ("plan it", "answer text")
+        );
+        assert_eq!(events[9].1["delta"]["stop_reason"], "end_turn");
+        assert_eq!(events[9].1["usage"]["output_tokens"], 5);
+
+        // Errors keep the Anthropic shape and the chat route's status mapping.
+        let (status, bytes) = raw_post(
+            h.port(),
+            "/v1/messages",
+            &serde_json::json!({ "model": h.model(), "messages": [] }),
+        );
+        let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 400);
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+        let mut unknown = body.clone();
+        unknown["model"] = serde_json::json!("qwen3.5:0.8b");
+        let (status, bytes) = raw_post(h.port(), "/v1/messages", &unknown);
+        let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 404);
+        assert_eq!(error["error"]["type"], "not_found_error");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anthropic_messages_tool_use_round_trip() {
+        let h = Task11HttpHarness::spawn("anthropic-tools");
+        let tools = serde_json::json!([{
+            "name": "read_file",
+            "description": "read a file",
+            "input_schema": { "type": "object", "properties": { "path": { "type": "string" } } },
+        }]);
+        let first = serde_json::json!({
+            "model": h.model(),
+            "max_tokens": 64,
+            "tools": tools,
+            "messages": [{ "role": "user", "content": "t11-mixed-tool please" }],
+        });
+        let (status, bytes) = raw_post(h.port(), "/v1/messages", &first);
+        let message: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 200, "{message}");
+        assert_eq!(message["stop_reason"], "tool_use");
+        let content = message["content"].as_array().unwrap();
+        assert_eq!(
+            content[0],
+            serde_json::json!({ "type": "text", "text": "I'll look that up." })
+        );
+        assert_eq!(content[1]["type"], "tool_use");
+        assert_eq!(content[1]["name"], "read_file");
+        assert_eq!(
+            content[1]["input"],
+            serde_json::json!({ "path": "mixed.rs" })
+        );
+        let tool_id = content[1]["id"].as_str().unwrap().to_owned();
+
+        let mut stream_body = first.clone();
+        stream_body["stream"] = serde_json::json!(true);
+        let (status, bytes) = raw_post(h.port(), "/v1/messages", &stream_body);
+        assert_eq!(status, 200);
+        let events = named_sse_events(&bytes);
+        let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_eq!(events[4].1["content_block"]["type"], "tool_use");
+        assert_eq!(events[4].1["index"], 1);
+        assert_eq!(
+            events[5].1["delta"],
+            serde_json::json!({ "type": "input_json_delta", "partial_json": "{\"path\":\"mixed.rs\"}" })
+        );
+        assert_eq!(events[7].1["delta"]["stop_reason"], "tool_use");
+
+        // Send the tool result back: the daemon gets the chat tool turn.
+        let second = serde_json::json!({
+            "model": h.model(),
+            "max_tokens": 64,
+            "tools": tools,
+            "messages": [
+                { "role": "user", "content": "t11-mixed-tool please" },
+                { "role": "assistant", "content": message["content"] },
+                { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": tool_id, "content": "fn main() {}" }] },
+            ],
+        });
+        assert_eq!(raw_post(h.port(), "/v1/messages", &second).0, 200);
+        let generate = last_generate_without_ids(&h);
+        let sent = generate["messages"].as_array().unwrap();
+        assert_eq!(sent[1]["role"], "assistant");
+        assert_eq!(sent[1]["tool_calls"][0]["name"], "read_file");
+        assert_eq!(
+            sent[1]["tool_calls"][0]["arguments"],
+            serde_json::json!({ "path": "mixed.rs" })
+        );
+        assert_eq!(sent[1]["tool_calls"][0]["id"], serde_json::json!(tool_id));
+        assert_eq!(sent[2]["role"], "tool");
+        assert_eq!(sent[2]["content"], "fn main() {}");
+        assert_eq!(sent[2]["tool_call_id"], serde_json::json!(tool_id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn openai_responses_shapes_and_function_call_round_trip() {
+        let h = Task11HttpHarness::spawn("openai-responses");
+        let body = serde_json::json!({
+            "model": h.model(),
+            "input": "t21-think-text please",
+            "max_output_tokens": 64,
+        });
+        let (status, bytes) = raw_post(h.port(), "/v1/responses", &body);
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 200, "{response}");
+        assert_eq!(response["object"], "response");
+        assert_eq!(response["status"], "completed");
+        assert!(response["id"].as_str().unwrap().starts_with("resp_"));
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["content"][0]["text"], "plan it");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "answer text");
+        assert_eq!(
+            response["usage"],
+            serde_json::json!({ "input_tokens": 11, "input_tokens_details": { "cached_tokens": 2 },
+                                "output_tokens": 5, "total_tokens": 16 })
+        );
+
+        let mut stream_body = body.clone();
+        stream_body["stream"] = serde_json::json!(true);
+        let (status, bytes) = raw_post(h.port(), "/v1/responses", &stream_body);
+        assert_eq!(status, 200);
+        let events = named_sse_events(&bytes);
+        let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.reasoning_text.delta",
+                "response.reasoning_text.delta",
+                "response.reasoning_text.done",
+                "response.output_item.done",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        for (seq, (_, data)) in events.iter().enumerate() {
+            assert_eq!(data["sequence_number"], serde_json::json!(seq));
+        }
+        assert_eq!(events[11].1["text"], "answer text");
+
+        let tools = serde_json::json!([{
+            "type": "function",
+            "name": "read_file",
+            "description": "read a file",
+            "parameters": { "type": "object", "properties": { "path": { "type": "string" } } },
+        }]);
+        let call = serde_json::json!({ "model": h.model(), "input": "t11-pure-tool please", "tools": tools });
+        let (status, bytes) = raw_post(h.port(), "/v1/responses", &call);
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 200, "{response}");
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "function_call");
+        assert_eq!(output[0]["name"], "read_file");
+        assert_eq!(output[0]["arguments"], "{\"path\":\"a.rs\"}");
+        let call_id = output[0]["call_id"].as_str().unwrap().to_owned();
+
+        let mut stream_call = call.clone();
+        stream_call["stream"] = serde_json::json!(true);
+        let (status, bytes) = raw_post(h.port(), "/v1/responses", &stream_call);
+        assert_eq!(status, 200);
+        let names: Vec<String> = named_sse_events(&bytes)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+
+        let mut input =
+            vec![serde_json::json!({ "role": "user", "content": "t11-pure-tool please" })];
+        input.extend(output.iter().cloned());
+        input.push(serde_json::json!({ "type": "function_call_output", "call_id": call_id, "output": "fn main() {}" }));
+        let round_trip = serde_json::json!({ "model": h.model(), "input": input, "tools": tools });
+        assert_eq!(raw_post(h.port(), "/v1/responses", &round_trip).0, 200);
+        let generate = last_generate_without_ids(&h);
+        let sent = generate["messages"].as_array().unwrap();
+        assert_eq!(
+            sent[1]["tool_calls"][0]["arguments"],
+            serde_json::json!({ "path": "a.rs" })
+        );
+        assert_eq!(sent[1]["tool_calls"][0]["id"], serde_json::json!(call_id));
+        assert_eq!(sent[2]["role"], "tool");
+        assert_eq!(sent[2]["tool_call_id"], serde_json::json!(call_id));
+
+        let (status, bytes) = raw_post(
+            h.port(),
+            "/v1/responses",
+            &serde_json::json!({ "model": h.model(), "input": "x", "previous_response_id": "resp_1" }),
+        );
+        let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 400);
+        assert_eq!(error["error"]["type"], "invalid_request_error");
     }
 
     /// Write a non-stream request and return the live TCP stream without reading status.
@@ -12415,6 +15149,573 @@ mod tests {
         assert!(
             response.starts_with("HTTP/1.1 413"),
             "oversized declaration was not rejected immediately: {response:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn post_systemone(port: u16, body: &serde_json::Value) -> (u16, String, String) {
+        let payload = serde_json::to_vec(body).unwrap();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect serve");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let head = format!(
+            "POST /v1/systemone HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(&payload).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let status: u16 = response[9..12].parse().unwrap();
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        (status, headers.to_string(), body.to_string())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_named_model_returns_jev_shape() {
+        let harness = Task11HttpHarness::spawn("systemone-named");
+        let (status, headers, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": harness.model(),
+                "state": "hello",
+                "questions": {"q": {"type": "choice", "instructions": "i",
+                                    "criteria": {"a": "x", "b": "y"}}}
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["answers"]["q"]["type"], "choice");
+        assert_eq!(v["usage"]["output_tokens"], 0);
+        assert!(
+            v.get("timing").is_none(),
+            "timing must not leak into the Jev body"
+        );
+        assert!(
+            headers.to_ascii_lowercase().contains("x-hipfire-timing:"),
+            "{headers}"
+        );
+        let mut keys: Vec<&str> = v
+            .as_object()
+            .expect("Jev body is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["answers", "model", "usage"],
+            "Jev body must carry exactly {{model, answers, usage}}, no extras: {body}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_jev_latest_without_loaded_model_is_503() {
+        let harness = Task11HttpHarness::spawn("systemone-unloaded");
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": "jev-latest", "state": "s",
+                "questions": {"q": {"type": "noul", "instructions": "i"}}
+            }),
+        );
+        assert_eq!(status, 503, "{body}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_jev_latest_uses_loaded_model() {
+        let harness = Task11HttpHarness::spawn("systemone-loaded");
+        let named = serde_json::json!({"model": harness.model(), "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let (named_status, _, named_body) = post_systemone(harness.port(), &named);
+        assert_eq!(named_status, 200, "{named_body}");
+        let named_v: serde_json::Value = serde_json::from_str(&named_body).unwrap();
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": "jev-latest", "state": "s",
+                "questions": {"q": {"type": "noul", "instructions": "i"}}
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_ne!(v["model"], "jev-latest");
+        assert_eq!(
+            v["model"], named_v["model"],
+            "jev-latest must echo the same model the named request loaded"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_daemon_validation_error_maps_to_422() {
+        let harness = Task11HttpHarness::spawn("systemone-422");
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": harness.model(), "state": 5, "questions": {}
+            }),
+        );
+        assert_eq!(status, 422, "{body}");
+    }
+
+    #[cfg(unix)]
+    fn timing_header(headers: &str) -> serde_json::Value {
+        let raw = headers
+            .lines()
+            .find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.trim()
+                    .eq_ignore_ascii_case("x-hipfire-timing")
+                    .then(|| v.trim().to_string())
+            })
+            .expect("x-hipfire-timing header");
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn session_body(model: &str, tool_choice: Option<&str>) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"},
+                         {"role": "assistant", "content": "yo"}],
+            "tools": [{"type": "function", "function": {
+                "name": "lookup", "description": "d",
+                "parameters": {"type": "object", "properties": {}}}}],
+            "questions": {"q": {"type": "noul", "instructions": "i"}}
+        });
+        if let Some(tc) = tool_choice {
+            body["tool_choice"] = serde_json::json!(tc);
+        }
+        body
+    }
+
+    /// Session mode (spec §12.6): serve forwards the chat projection of
+    /// `messages` and `tools`, and the Jev body shape is unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_session_forwards_projected_messages_and_tools() {
+        let harness = Task11HttpHarness::spawn("systemone-session");
+        let (status, headers, body) =
+            post_systemone(harness.port(), &session_body(harness.model(), None));
+        assert_eq!(status, 200, "{body}");
+        let t = timing_header(&headers);
+        assert_eq!(t["mode"], "session", "{t}");
+        let roles: Vec<&str> = t["session_roles"]
+            .as_array()
+            .expect("session_roles")
+            .iter()
+            .map(|r| r.as_str().unwrap())
+            .collect();
+        assert!(roles.ends_with(&["user", "assistant"]), "{roles:?}");
+        assert_eq!(t["session_tools"], 1, "{t}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["answers"]["q"]["type"], "noul");
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["answers", "model", "usage"], "{body}");
+    }
+
+    /// `tool_choice: "none"` drops tools exactly as the chat projection
+    /// does, proving serve projects rather than passes `tools` through.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_session_applies_tool_choice_projection() {
+        let harness = Task11HttpHarness::spawn("systemone-session-tc");
+        let (status, headers, body) =
+            post_systemone(harness.port(), &session_body(harness.model(), Some("none")));
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(timing_header(&headers)["session_tools"], 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_state_and_messages_together_is_422() {
+        let harness = Task11HttpHarness::spawn("systemone-both");
+        let mut body = session_body(harness.model(), None);
+        body["state"] = serde_json::json!("s");
+        let (status, _, body) = post_systemone(harness.port(), &body);
+        assert_eq!(status, 422, "{body}");
+    }
+
+    /// Serve refuses a session `messages` that is not a non-empty array, that
+    /// the chat projection would reduce to only the injected default system
+    /// message, or that carries an image part (spec §12.6), all as 422 and
+    /// before any daemon round trip. The harness model gets a per-model
+    /// `prompt.system` override, so the default system message really is
+    /// injected (the control request shows it).
+    #[cfg(unix)]
+    #[test]
+    fn systemone_session_refuses_messages_the_projection_would_empty() {
+        let harness = Task11HttpHarness::spawn("systemone-session-empty");
+        let mut overrides = ConfigLayer::default();
+        overrides
+            .set_cli("prompt.system", "injected default system")
+            .unwrap();
+        let mut catalog = hipfire_config::ModelCatalog::default();
+        catalog.models.insert(
+            "t11-session".into(),
+            hipfire_config::LocalModelConfig {
+                path: Some(PathBuf::from(harness.model())),
+                registry_tag: None,
+                overrides,
+            },
+        );
+        write_catalog_toml(&harness.paths.config, &catalog).unwrap();
+        let mut body = session_body(harness.model(), None);
+        let (status, headers, text) = post_systemone(harness.port(), &body);
+        assert_eq!(status, 200, "{text}");
+        let roles = timing_header(&headers)["session_roles"].clone();
+        assert_eq!(roles, serde_json::json!(["system", "user", "assistant"]));
+        let image = serde_json::json!([{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,aa"}}]}]);
+        let cases = [
+            serde_json::json!([]),
+            serde_json::json!("hi"),
+            serde_json::json!([{"role": "bogus", "content": "x"}]),
+            image,
+        ];
+        for messages in cases {
+            body["messages"] = messages.clone();
+            let (status, _, text) = post_systemone(harness.port(), &body);
+            assert_eq!(status, 422, "{messages}: {text}");
+            assert!(text.contains("messages"), "{messages}: {text}");
+        }
+        let log = harness.read_requests_log();
+        assert_eq!(
+            Task11HttpHarness::ops_of_type(&log, "decide").len(),
+            1,
+            "only the control request reached the daemon; log={log:?}"
+        );
+    }
+
+    /// A daemon 422 with `required_max_seq` is returned to the client as-is,
+    /// `required_max_seq` included, without any reload: serve never grows
+    /// `max_seq` on a request's behalf.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_required_max_seq_returns_422_without_reload() {
+        let harness = Task11HttpHarness::spawn("systemone-huge-ctx");
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": harness.model(), "state": "t-needs-huge-ctx",
+                "questions": {"q": {"type": "noul", "instructions": "i"}}
+            }),
+        );
+        assert_eq!(status, 422, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["required_max_seq"], 10_000_000u64, "{body}");
+        let log = harness.read_requests_log();
+        let loads = Task11HttpHarness::ops_of_type(&log, "load");
+        assert_eq!(
+            loads.len(),
+            1,
+            "only the initial load; no reload; log={log:?}"
+        );
+        assert_eq!(
+            Task11HttpHarness::ops_of_type(&log, "decide").len(),
+            1,
+            "no retry past the ceiling; log={log:?}"
+        );
+    }
+
+    /// `_debug_no_snapshot` is a daemon-only gate knob: serve must not
+    /// forward it, only `state` and `questions`.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_does_not_forward_debug_no_snapshot() {
+        let harness = Task11HttpHarness::spawn("systemone-no-debug");
+        let (status, _, body) = post_systemone(
+            harness.port(),
+            &serde_json::json!({
+                "model": harness.model(), "state": "s", "_debug_no_snapshot": true,
+                "questions": {"q": {"type": "noul", "instructions": "i"}}
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+        let log = harness.read_requests_log();
+        let decides = Task11HttpHarness::ops_of_type(&log, "decide");
+        assert_eq!(decides.len(), 1, "log={log:?}");
+        assert!(
+            decides[0].get("_debug_no_snapshot").is_none(),
+            "serve forwarded _debug_no_snapshot: {:?}",
+            decides[0]
+        );
+        assert_eq!(decides[0]["state"], "s");
+    }
+
+    /// Spec §13.2: write a per-model `decide.calibration` override for the
+    /// harness fixture into the harness's own models.toml.
+    #[cfg(unix)]
+    fn write_decide_calibration(harness: &Task11HttpHarness, table: &str) {
+        let catalog = format!(
+            "schema_version = 1\n\n[models.\"fixture\"]\npath = {:?}\n\n\
+             [models.\"fixture\".overrides.decide.calibration]\n{table}\n",
+            harness.model()
+        );
+        fs::write(&harness.paths.config.models_toml, catalog).unwrap();
+    }
+
+    /// POST a decide (must succeed) and return the message serve forwarded.
+    #[cfg(unix)]
+    fn forwarded_decide(
+        harness: &Task11HttpHarness,
+        body: &serde_json::Value,
+    ) -> serde_json::Value {
+        let (status, _, text) = post_systemone(harness.port(), body);
+        assert_eq!(status, 200, "{text}");
+        let log = harness.read_requests_log();
+        let decides = Task11HttpHarness::ops_of_type(&log, "decide");
+        (*decides.last().expect("a forwarded decide")).clone()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_forwards_the_per_model_calibration() {
+        let harness = Task11HttpHarness::spawn("systemone-cal");
+        write_decide_calibration(&harness, "choice = 1.5\nnoul = 0.8");
+        let body = serde_json::json!({"model": harness.model(), "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let d = forwarded_decide(&harness, &body);
+        assert_eq!(
+            d["calibration"],
+            serde_json::json!({"choice": 1.5, "score": 1.0, "noul": 0.8})
+        );
+        // Session mode forwards it too.
+        let d = forwarded_decide(&harness, &session_body(harness.model(), None));
+        assert_eq!(d["calibration"]["choice"], 1.5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_sends_no_calibration_without_an_override() {
+        let harness = Task11HttpHarness::spawn("systemone-cal-none");
+        let body = serde_json::json!({"model": harness.model(), "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let d = forwarded_decide(&harness, &body);
+        assert!(d.get("calibration").is_none(), "{d}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn systemone_client_cannot_set_calibration() {
+        let harness = Task11HttpHarness::spawn("systemone-cal-client");
+        let body = serde_json::json!({"model": harness.model(), "state": "s",
+            "calibration": {"choice": 9.0},
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let d = forwarded_decide(&harness, &body);
+        assert!(
+            d.get("calibration").is_none(),
+            "client calibration forwarded: {d}"
+        );
+        write_decide_calibration(&harness, "noul = 0.8");
+        let d = forwarded_decide(&harness, &body);
+        assert_eq!(
+            d["calibration"],
+            serde_json::json!({"choice": 1.0, "score": 1.0, "noul": 0.8})
+        );
+    }
+
+    /// A `jev-latest`-style request (no local match, spec §12.5's "use
+    /// whatever is loaded" fallback) resolves `runtime.current_path` — the
+    /// path `find_model_path` returned for the originally named request —
+    /// back to the per-model catalog record for a PATH-ONLY model (no
+    /// registry tag). The override is written through the real `hipfire
+    /// config <model> set` code path (`config_command`), not hand-rolled
+    /// TOML, so the catalog's `path` field and table key are exactly what
+    /// production writes. The harness label deliberately avoids "jev" and
+    /// "latest": `find_model_path`'s separator-stripped fuzzy match would
+    /// otherwise resolve the literal string "jev-latest" straight to a
+    /// same-labelled fixture file and never exercise the fallback branch
+    /// at all (caught empirically while writing this test).
+    #[cfg(unix)]
+    #[test]
+    fn systemone_forwards_calibration_for_jev_latest_on_a_path_only_model() {
+        let harness = Task11HttpHarness::spawn("systemone-cal-fallback");
+        config_command(
+            &harness.paths,
+            ConfigArgs {
+                model: Some(harness.model().to_string()),
+                action: Some(ConfigAction::Set {
+                    key: "decide.calibration.noul".to_string(),
+                    value: "0.8".to_string(),
+                }),
+            },
+        )
+        .unwrap();
+
+        // A named request first, so the model actually loads and
+        // `runtime.current_path` is populated.
+        let named = serde_json::json!({"model": harness.model(), "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let d = forwarded_decide(&harness, &named);
+        assert_eq!(
+            d["calibration"],
+            serde_json::json!({"choice": 1.0, "score": 1.0, "noul": 0.8}),
+            "named request must resolve the override: {d}"
+        );
+
+        // `jev-latest` is not itself a local model: is_local_model is
+        // false, so run_decide falls back to runtime.current_path.
+        let latest = serde_json::json!({"model": "jev-latest", "state": "s",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}});
+        let d = forwarded_decide(&harness, &latest);
+        assert_eq!(
+            d["calibration"],
+            serde_json::json!({"choice": 1.0, "score": 1.0, "noul": 0.8}),
+            "jev-latest fallback must resolve the same per-model override: {d}"
+        );
+    }
+
+    /// The response `model` is the served model name chat and `/health`
+    /// report (`meta.current_model`, the tag when a tag was requested), not
+    /// the resolved filesystem path.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_model_echo_is_served_model_name() {
+        let harness = Task11HttpHarness::spawn("systemone-echo");
+        let req = |model: &str| {
+            serde_json::json!({"model": model, "state": "s",
+                "questions": {"q": {"type": "noul", "instructions": "i"}}})
+        };
+        let (status, _, body) = post_systemone(harness.port(), &req(harness.model()));
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let served = harness
+            .shared
+            .meta
+            .lock()
+            .unwrap()
+            .current_model
+            .clone()
+            .expect("a model is loaded");
+        assert_eq!(v["model"], served.as_str());
+        // Stand in a tag-style served name for the loaded model (what a tag
+        // request records): the echo must follow it, not the path.
+        harness.shared.meta.lock().unwrap().current_model = Some("qwen3.5:4b".to_owned());
+        let (status, _, body) = post_systemone(harness.port(), &req("jev-latest"));
+        assert_eq!(status, 200, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["model"], "qwen3.5:4b", "{body}");
+    }
+
+    /// Write a `/v1/systemone` request and return the live TCP stream
+    /// without reading the response — mirrors `open_nonstream_request`.
+    #[cfg(unix)]
+    fn open_systemone_request(port: u16, body: &serde_json::Value) -> std::net::TcpStream {
+        use std::net::TcpStream;
+        let payload = body.to_string();
+        let request = format!(
+            "POST /v1/systemone HTTP/1.1\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {payload}",
+            payload.len(),
+        );
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect serve");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("write timeout");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("read timeout");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let _ = stream.flush();
+        stream
+    }
+
+    /// A client disconnect mid-decide must not release the admission slot
+    /// before the daemon's (deliberately slow) `decided` reply lands.
+    /// Decide's daemon round trip (`Engine::request`) has no cancellation
+    /// hook, so releasing the slot the instant hyper notices the client is
+    /// gone would let a second decide race the daemon while the first is
+    /// still, invisibly, in flight — corrupting the single-daemon
+    /// serialisation `Admission` exists to guarantee.
+    ///
+    /// This checks `harness.shared.admission.inflight()` directly (the same
+    /// technique `nonstream_client_disconnect_aborts_and_releases_admission`
+    /// uses), not the fake daemon's request log: the fake daemon is a
+    /// single-threaded Python script blocked in `time.sleep(1)` while
+    /// processing the slow decide, so it would not read/log a second
+    /// request's bytes until it finishes regardless of when serve released
+    /// admission — log-ordering alone cannot distinguish early-release from
+    /// held-to-completion here, only `inflight()` can.
+    #[cfg(unix)]
+    #[test]
+    fn systemone_client_disconnect_does_not_release_admission_early() {
+        let harness = Task11HttpHarness::spawn("systemone-disconnect");
+        let port = harness.port();
+        let slow_body = serde_json::json!({
+            "model": harness.model(), "state": "t-slow",
+            "questions": {"q": {"type": "noul", "instructions": "i"}}
+        });
+
+        let stream = open_systemone_request(port, &slow_body);
+
+        // Wait for the daemon to actually receive the slow decide (proving
+        // the request is admitted and dispatched) before disconnecting, so
+        // the guard is provably held mid-flight.
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        let slow_decide_seen = |harness: &Task11HttpHarness| {
+            Task11HttpHarness::ops_of_type(&harness.read_requests_log(), "decide")
+                .iter()
+                .any(|row| row.get("state").and_then(|v| v.as_str()) == Some("t-slow"))
+        };
+        while Instant::now() < ready_deadline && !slow_decide_seen(&harness) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            slow_decide_seen(&harness),
+            "slow decide never reached the fake daemon within 5s; log={:?}",
+            harness.read_requests_log()
+        );
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            1,
+            "precondition: exactly one decide holds admission"
+        );
+
+        drop(stream);
+
+        // Poll admission for up to 300ms right after disconnecting. If the
+        // guard were released the instant hyper notices the client is gone
+        // (the bug), inflight would drop to 0 within this short window, well
+        // before the fake daemon's 1s sleep can possibly have elapsed.
+        let short_deadline = Instant::now() + Duration::from_millis(300);
+        let mut dropped_early = false;
+        while Instant::now() < short_deadline {
+            if harness.shared.admission.inflight() == 0 {
+                dropped_early = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !dropped_early,
+            "admission released within 300ms of disconnect — the slot must stay held for the \
+             full ~1s daemon round trip, not release the instant the client vanishes"
+        );
+
+        // It must still release once the daemon's slow decide actually
+        // completes, within a generous bound past the 1s sleep.
+        let release_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < release_deadline && harness.shared.admission.inflight() != 0 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            0,
+            "admission must eventually release once the slow daemon call completes"
         );
     }
 
@@ -12776,6 +16077,45 @@ mod tests {
         assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(128));
     }
 
+    /// Any non-neutral repeat penalty routes the daemon to the plain AR
+    /// decoder, so every bench generate must carry exactly 1.0.
+    #[test]
+    fn bench_generate_request_uses_neutral_repeat_penalty() {
+        for req in [
+            bench_generate_request("p", 1),
+            bench_generate_request_reasoning("p", 128, false),
+            bench_generate_request_reasoning("p", 128, true),
+        ] {
+            assert_eq!(
+                req.get("repeat_penalty").and_then(|v| v.as_f64()),
+                Some(1.0)
+            );
+        }
+    }
+
+    #[test]
+    fn bench_spec_route_reads_done_stats() {
+        let ar = serde_json::json!({"type": "done", "decode_tok_s": 35.0});
+        assert_eq!(bench_spec_route(&ar), None);
+        let mtp = serde_json::json!({"mtp": true, "tau": 2.4, "cycles": 40});
+        assert_eq!(bench_spec_route(&mtp).as_deref(), Some("mtp"));
+        let dflash = serde_json::json!({"dflash": true, "tau": 3.1, "cycles": 9});
+        assert_eq!(bench_spec_route(&dflash).as_deref(), Some("dflash"));
+        let idle = serde_json::json!({"dflash": true, "tau": 0.0, "cycles": 0});
+        assert_eq!(bench_spec_route(&idle), None);
+        let eagle = serde_json::json!({"spec": "gemma4_eagle", "tau": 1.8, "rounds": 7});
+        assert_eq!(bench_spec_route(&eagle).as_deref(), Some("gemma4_eagle"));
+    }
+
+    #[test]
+    fn bench_spec_warning_only_when_spec_requested_and_never_ran() {
+        let ar = vec![None, None];
+        assert!(bench_spec_warning(Some("mtp"), &ar).is_some());
+        assert!(bench_spec_warning(Some("off"), &ar).is_none());
+        assert!(bench_spec_warning(None, &ar).is_none());
+        assert!(bench_spec_warning(Some("auto"), &[None, Some("mtp".into())]).is_none());
+    }
+
     fn bench_args_for_test(prompt: Vec<String>, prompt_file: Option<PathBuf>) -> BenchArgs {
         BenchArgs {
             model: "qwen:test".to_owned(),
@@ -12788,7 +16128,7 @@ mod tests {
             pp: vec![128],
             ctx: vec![128],
             tg: 128,
-            max_tokens: 128,
+            max_tokens: None,
             sustained_tg: None,
             sustained_ctx: vec![128],
             warmups: 1,
@@ -12796,12 +16136,17 @@ mod tests {
             kv_k: None,
             kv_v: None,
             kv_backend: None,
+            max_seq: None,
             redline: false,
             speculation: None,
             reasoning_on: false,
             concurrency: None,
             backend: "both".to_owned(),
             workload: "both".to_owned(),
+            bench_shape: "steady".to_owned(),
+            bb_corpus: None,
+            num_prompts: None,
+            temperature: None,
             prompt,
             prompt_file,
         }
@@ -12822,6 +16167,153 @@ mod tests {
             err.to_string().contains("--prompt-file"),
             "conflict error should name the flag: {err}"
         );
+    }
+
+    #[test]
+    fn bench_matrix_refuses_a_prompt() {
+        for (prompt, prompt_file) in [
+            (Vec::new(), Some(PathBuf::from("prompt.txt"))),
+            (vec!["hello".to_owned()], None),
+        ] {
+            for redline in [false, true] {
+                let mut args = bench_args_for_test(prompt.clone(), prompt_file.clone());
+                args.matrix = !redline;
+                args.redline = redline;
+                let err = bench_command(&test_paths("bench-matrix-prompt"), args).unwrap_err();
+                assert!(
+                    err.to_string().contains("cannot take a prompt"),
+                    "matrix with a prompt must be refused before any load: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bench_max_seq_flag_takes_the_memory_max_seq_bounds() {
+        let parse = |value: &str| -> std::result::Result<Option<u64>, clap::Error> {
+            let cli = Cli::try_parse_from(["hipfire", "bench", "qwen:test", "--max-seq", value])?;
+            match cli.command {
+                Some(Commands::Bench(args)) => Ok(args.max_seq),
+                other => panic!("expected bench, got {other:?}"),
+            }
+        };
+        assert_eq!(parse("512").unwrap(), Some(512));
+        assert_eq!(parse("1048576").unwrap(), Some(1_048_576));
+        assert!(parse("511").is_err(), "below the memory.max_seq minimum");
+        assert!(
+            parse("1048577").is_err(),
+            "above the memory.max_seq maximum"
+        );
+        assert!(parse("8k").is_err());
+    }
+
+    #[test]
+    fn bench_matrix_seq_need_is_the_longest_probe_plus_headroom() {
+        // Decode rows dominate the default-like shape: 20000 + 128 + 32.
+        assert_eq!(
+            bench_matrix_seq_need(&[128, 8192], &[128, 20000], 128, None),
+            20_160
+        );
+        // A long prefill dominates a short decode row.
+        assert_eq!(bench_matrix_seq_need(&[8192], &[128], 32, None), 8_224);
+        // Sustained rows count with their own decode length...
+        assert_eq!(
+            bench_matrix_seq_need(&[512], &[128], 32, Some((256, &[8192, 30000]))),
+            30_288
+        );
+        // ...and not at all when `--sustained-tg` does not run them.
+        assert_eq!(bench_matrix_seq_need(&[512], &[128], 32, None), 544);
+    }
+
+    #[test]
+    fn bench_max_seq_sizes_a_matrix_run_within_the_model_limit() {
+        let plan = plan_bench_max_seq(None, Some(8_224), Some(262_144), "m").unwrap();
+        assert_eq!(
+            plan,
+            BenchMaxSeq {
+                requested: Some(8_224),
+                source: BenchMaxSeqSource::RunShape,
+                run_need: Some(8_224),
+                model_limit: Some(262_144),
+            }
+        );
+        // A tiny matrix is raised to the memory.max_seq minimum...
+        let plan = plan_bench_max_seq(None, Some(160), None, "m").unwrap();
+        assert_eq!(plan.requested, Some(512));
+        // ...but never past what the model declares.
+        let plan = plan_bench_max_seq(None, Some(160), Some(400), "m").unwrap();
+        assert_eq!(plan.requested, Some(400));
+        // The need itself may sit exactly at the limit.
+        let plan = plan_bench_max_seq(None, Some(4_096), Some(4_096), "m").unwrap();
+        assert_eq!(plan.requested, Some(4_096));
+    }
+
+    #[test]
+    fn bench_max_seq_refuses_a_shape_past_the_model_limit() {
+        for flag in [None, Some(1_048_576)] {
+            let err = plan_bench_max_seq(flag, Some(262_177), Some(262_144), "flash")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("262177") && err.contains("262144") && err.contains("flash"),
+                "must name the need, the limit and the model: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn bench_max_seq_flag_wins_but_must_hold_the_run() {
+        let err = plan_bench_max_seq(Some(8_192), Some(8_224), Some(262_144), "m")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("8192") && err.contains("8224"),
+            "must name the flag and the need: {err}"
+        );
+        let plan = plan_bench_max_seq(Some(8_224), Some(8_224), None, "m").unwrap();
+        assert_eq!(
+            (plan.requested, plan.source),
+            (Some(8_224), BenchMaxSeqSource::Flag)
+        );
+        // The declared context bounds the run shape, not the flag: past it,
+        // the daemon's admission decides.
+        let plan = plan_bench_max_seq(Some(300_000), Some(8_224), Some(262_144), "m").unwrap();
+        assert_eq!(plan.requested, Some(300_000));
+        // Off the matrix the flag is sent as given.
+        let plan = plan_bench_max_seq(Some(4_096), None, None, "m").unwrap();
+        assert_eq!(
+            (plan.requested, plan.source),
+            (Some(4_096), BenchMaxSeqSource::Flag)
+        );
+    }
+
+    #[test]
+    fn bench_max_seq_stays_automatic_off_the_matrix_without_a_flag() {
+        let plan = plan_bench_max_seq(None, None, None, "m").unwrap();
+        assert_eq!(
+            (plan.requested, plan.source),
+            (None, BenchMaxSeqSource::Automatic)
+        );
+    }
+
+    #[test]
+    fn declared_context_reads_max_position_embeddings_like_admission() {
+        let read = |json: &str| declared_context_from_metadata(json);
+        assert_eq!(
+            read(
+                r#"{"config":{"max_position_embeddings":4096,"text_config":{"max_position_embeddings":262144}}}"#
+            ),
+            Some(262_144),
+            "text_config wins over the outer config"
+        );
+        assert_eq!(
+            read(r#"{"config":{"max_position_embeddings":131072}}"#),
+            Some(131_072)
+        );
+        assert_eq!(read(r#"{"max_position_embeddings":40960}"#), Some(40_960));
+        assert_eq!(read(r#"{"config":{"max_position_embeddings":0}}"#), None);
+        assert_eq!(read(r#"{"config":{}}"#), None);
+        assert_eq!(read("not json"), None);
     }
 
     #[test]
@@ -13556,6 +17048,7 @@ mod tests {
             head: Some("q4k".into()),
             kv_backend: None,
             tp: None,
+            max_seq: None,
             speculation: None,
             model_draft: None,
             vision: None,
@@ -13564,6 +17057,7 @@ mod tests {
             system: None,
             image: None,
             json: false,
+            stats: false,
             no_stream: false,
         };
         let without_head = RunArgs {
@@ -13830,6 +17324,7 @@ mod tests {
             PullArgs {
                 model: "test-model".into(),
                 force: false,
+                ple: ple::PleSelection::Auto,
             },
         )
         .unwrap();
@@ -13901,6 +17396,7 @@ mod tests {
             PullArgs {
                 model: "test-model".into(),
                 force: false,
+                ple: ple::PleSelection::Auto,
             },
         )
         .unwrap();
@@ -14484,5 +17980,635 @@ mod tests {
         drop(early);
         let (status, _, _) = raw_chat_post(port, &harness.base_body("t11-stop-text", false));
         assert_eq!(status, 200);
+    }
+
+    // ---- PLE split layout: pull, on-demand, tag fallback, rm, listings --------
+
+    fn ple_sha(data: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(data))
+    }
+
+    /// Serves exactly `files.len()` requests, matching the LAST path segment
+    /// exactly (the shared `tiny_http_server` matches substrings, which cannot
+    /// tell `x-base.mq4` from `x-base.mq4.ple-q8`).
+    fn exact_http_server(
+        files: std::collections::HashMap<String, Vec<u8>>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let expected = files.len();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..expected {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let target = request
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|path| path.rsplit('/').next())
+                    .unwrap_or_default()
+                    .to_owned();
+                match files.get(&target) {
+                    Some(data) => {
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            data.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes());
+                        let _ = stream.write_all(data);
+                    }
+                    None => {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                }
+                let _ = stream.flush();
+            }
+        });
+        (base, handle)
+    }
+
+    const PLE_BASE: &[u8] = b"split-base-bytes";
+    const PLE_Q8: &[u8] = b"q8-rows-bytes";
+    const PLE_Q4: &[u8] = b"q4-rows";
+
+    /// `split-model` is the split entry (base + both slots); `split-model:mono`
+    /// is its non-pinned monolithic sibling.
+    fn split_registry_raw() -> String {
+        format!(
+            r#"{{
+            "schema_version":1,
+            "generated_at":"2099-01-01T00:00:00Z",
+            "models":{{
+                "split-model":{{
+                    "repo":"test/repo","file":"split-model-base.mq4","size_gb":0.001,
+                    "min_vram_gb":1,"desc":"x","sha256":"{}","size_bytes":{},
+                    "ple_q8":{{"file":"split-model-base.mq4.ple-q8","sha256":"{}","size_bytes":{}}},
+                    "ple_q4":{{"file":"split-model-base.mq4.ple-q4","sha256":"{}","size_bytes":{}}}
+                }},
+                "split-model:mono":{{
+                    "repo":"test/repo","file":"split-model.mq4","size_gb":0.001,
+                    "min_vram_gb":1,"desc":"x"
+                }}
+            }},
+            "aliases":{{}}
+        }}"#,
+            ple_sha(PLE_BASE),
+            PLE_BASE.len(),
+            ple_sha(PLE_Q8),
+            PLE_Q8.len(),
+            ple_sha(PLE_Q4),
+            PLE_Q4.len(),
+        )
+    }
+
+    #[test]
+    fn pull_downloads_the_base_and_only_the_selected_ple_sidecars() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let cases = [
+            (ple::PleSelection::Q8, false, true),
+            (ple::PleSelection::Q4, true, false),
+            (ple::PleSelection::All, true, true),
+            (ple::PleSelection::Skip, false, false),
+        ];
+        for (index, (selection, want_q4, want_q8)) in cases.into_iter().enumerate() {
+            let paths = test_paths(&format!("ple-pull-{index}"));
+            write_test_registry_cache(&paths, &split_registry_raw());
+            let mut files = std::collections::HashMap::new();
+            files.insert("split-model-base.mq4".to_owned(), PLE_BASE.to_vec());
+            if want_q8 {
+                files.insert("split-model-base.mq4.ple-q8".to_owned(), PLE_Q8.to_vec());
+            }
+            if want_q4 {
+                files.insert("split-model-base.mq4.ple-q4".to_owned(), PLE_Q4.to_vec());
+            }
+            let (base, handle) = exact_http_server(files);
+            let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+            pull_command(
+                &paths,
+                PullArgs {
+                    model: "split-model".into(),
+                    force: false,
+                    ple: selection,
+                },
+            )
+            .unwrap();
+            handle.join().unwrap();
+            let models = &paths.models;
+            assert_eq!(
+                fs::read(models.join("split-model-base.mq4")).unwrap(),
+                PLE_BASE
+            );
+            assert_eq!(
+                fs::read(models.join("split-model-base.mq4.ple-q8")).ok(),
+                want_q8.then(|| PLE_Q8.to_vec()),
+                "{selection:?}"
+            );
+            assert_eq!(
+                fs::read(models.join("split-model-base.mq4.ple-q4")).ok(),
+                want_q4.then(|| PLE_Q4.to_vec()),
+                "{selection:?}"
+            );
+            fs::remove_dir_all(&paths.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn pull_rejects_a_ple_sidecar_that_fails_verification() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("ple-pull-corrupt");
+        write_test_registry_cache(&paths, &split_registry_raw());
+        let mut files = std::collections::HashMap::new();
+        files.insert("split-model-base.mq4".to_owned(), PLE_BASE.to_vec());
+        files.insert(
+            "split-model-base.mq4.ple-q8".to_owned(),
+            b"tampered-rows".to_vec(),
+        );
+        let (base, handle) = exact_http_server(files);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        let error = pull_command(
+            &paths,
+            PullArgs {
+                model: "split-model".into(),
+                force: false,
+                ple: ple::PleSelection::Q8,
+            },
+        )
+        .unwrap_err();
+        handle.join().unwrap();
+        assert!(format!("{error:#}").contains("mismatch"), "{error:#}");
+        assert!(
+            !paths.models.join("split-model-base.mq4.ple-q8").exists(),
+            "a failed verification must not leave the sidecar installed"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn on_demand_downloads_the_selected_sidecar_once_and_leaves_usable_files_alone() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let paths = test_paths("ple-on-demand");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = RegistryV1::parse(&split_registry_raw(), "ple on-demand").unwrap();
+        let (tag, entry) = registry.model("split-model").unwrap();
+        let model = paths.models.join(&entry.file);
+        fs::write(&model, PLE_BASE).unwrap();
+        let q8 = paths.models.join("split-model-base.mq4.ple-q8");
+        let q4 = paths.models.join("split-model-base.mq4.ple-q4");
+
+        // q8 requested and absent: one verified download.
+        let mut files = std::collections::HashMap::new();
+        files.insert("split-model-base.mq4.ple-q8".to_owned(), PLE_Q8.to_vec());
+        let (base, handle) = exact_http_server(files);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+        ple::ensure_ple_sidecar(
+            &registry,
+            Some(entry),
+            Some(tag),
+            &model,
+            hipfire_config::memory::PleFormatRequest::Q8,
+            true,
+        )
+        .unwrap();
+        handle.join().unwrap();
+        assert_eq!(fs::read(&q8).unwrap(), PLE_Q8);
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 1));
+
+        // Present now: q8 and q4 requests, and auto, download nothing (no server).
+        for request in [
+            hipfire_config::memory::PleFormatRequest::Q8,
+            hipfire_config::memory::PleFormatRequest::Q4,
+            hipfire_config::memory::PleFormatRequest::Auto,
+        ] {
+            ple::ensure_ple_sidecar(&registry, Some(entry), Some(tag), &model, request, true)
+                .unwrap();
+        }
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 1));
+        assert!(
+            !q4.exists(),
+            "q4 is derived locally from the q8 rows, never downloaded"
+        );
+
+        // q4 requested with neither file present: the q4 sidecar is fetched.
+        fs::remove_file(&q8).unwrap();
+        let mut files = std::collections::HashMap::new();
+        files.insert("split-model-base.mq4.ple-q4".to_owned(), PLE_Q4.to_vec());
+        let (base, handle) = exact_http_server(files);
+        let _hf2 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        ple::ensure_ple_sidecar(
+            &registry,
+            Some(entry),
+            Some(tag),
+            &model,
+            hipfire_config::memory::PleFormatRequest::Q4,
+            true,
+        )
+        .unwrap();
+        handle.join().unwrap();
+        assert_eq!(fs::read(&q4).unwrap(), PLE_Q4);
+        assert!(!q8.exists());
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 2));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn split_tag_serves_a_local_monolithic_instead_of_forcing_a_download() {
+        let paths = test_paths("ple-tag-fallback");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = RegistryV1::parse(&split_registry_raw(), "ple fallback").unwrap();
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "split-model").unwrap(),
+            None
+        );
+        assert_eq!(find_model_path(&paths, &registry, "split-model"), None);
+
+        let mono = paths.models.join("split-model.mq4");
+        fs::write(&mono, b"monolithic").unwrap();
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "split-model").unwrap(),
+            Some(mono.clone()),
+            "the split tag falls back to the local monolithic sibling"
+        );
+        // The sibling's own tag is unaffected.
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "split-model:mono").unwrap(),
+            Some(mono.clone())
+        );
+
+        // Once the split base is installed it wins.
+        let base = paths.models.join("split-model-base.mq4");
+        fs::write(&base, PLE_BASE).unwrap();
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "split-model").unwrap(),
+            Some(base.clone())
+        );
+        assert_eq!(
+            find_model_path(&paths, &registry, "split-model"),
+            Some(base)
+        );
+        // The split tag never fuzzy-matches an unrelated local file.
+        fs::remove_file(paths.models.join("split-model-base.mq4")).unwrap();
+        fs::remove_file(&mono).unwrap();
+        fs::write(paths.models.join("split-model.mq4r"), b"other tier").unwrap();
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "split-model").unwrap(),
+            None
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn split_tag_verifies_the_pinned_monolithic_like_its_own_tag() {
+        let paths = test_paths("ple-tag-fallback-pinned");
+        fs::create_dir_all(&paths.models).unwrap();
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"2099-01-01T00:00:00Z",
+            "models":{
+                "qwen3.8:flash-next":{
+                    "repo":"hipfire-models/qwen3.8-flash-next",
+                    "file":"qwen3.8-flash-next-base.mq4-xts","size_gb":70.9,"min_vram_gb":8,"desc":"split",
+                    "ple_q8":{"file":"qwen3.8-flash-next-base.mq4-xts.ple-q8"}
+                },
+                "qwen3.8:flash-next-mq4-xts":{
+                    "repo":"hipfire-models/qwen3.8-flash-next",
+                    "file":"qwen3.8-flash-next.mq4-xts","size_gb":125.29,"min_vram_gb":8,"desc":"pin",
+                    "sha256":"8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
+                    "size_bytes":125288544792
+                }
+            },
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "ple pinned").unwrap();
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "qwen3.8:flash-next").unwrap(),
+            None
+        );
+        // A wrong-size file under either grandfathered spelling is a verification
+        // error (never silently served), exactly as for the monolithic tag.
+        for name in [
+            "qwen3.8-flash-next.mq4-xts",
+            hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE,
+        ] {
+            let path = paths.models.join(name);
+            fs::write(&path, b"not the pinned bytes").unwrap();
+            let error = resolve_model_path(&paths, &registry, "qwen3.8:flash-next")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("size mismatch"), "{name}: {error}");
+            fs::remove_file(&path).unwrap();
+        }
+        // With the split base installed the monolithic is never touched.
+        fs::write(
+            paths.models.join("qwen3.8-flash-next.mq4-xts"),
+            b"not the pinned bytes",
+        )
+        .unwrap();
+        let base = paths.models.join("qwen3.8-flash-next-base.mq4-xts");
+        fs::write(&base, b"base").unwrap();
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "qwen3.8:flash-next").unwrap(),
+            Some(base)
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_removes_ple_sidecars_with_either_layout() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("ple-rm");
+        write_test_registry_cache(&paths, &split_registry_raw());
+        fs::create_dir_all(&paths.models).unwrap();
+        let split_files = [
+            "split-model-base.mq4",
+            "split-model-base.mq4.ple-q4",
+            "split-model-base.mq4.ple-q8",
+            "split-model-base.mq4.ple-q4.plehotrows",
+            "split-model-base.mq4.ple-q8.plehotrows",
+            "split-model-base.mq4.plehot",
+        ];
+        for file in split_files {
+            fs::write(paths.models.join(file), b"x").unwrap();
+        }
+        fs::write(paths.models.join("untouched.mq4"), b"x").unwrap();
+        rm_command(
+            &paths,
+            RmArgs {
+                model: "split-model".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        for file in split_files {
+            assert!(!paths.models.join(file).exists(), "{file} must be removed");
+        }
+        assert!(paths.models.join("untouched.mq4").exists());
+
+        // A monolithic served under the split tag takes its derived q4 with it.
+        for file in ["split-model.mq4", "split-model.mq4.ple-q4"] {
+            fs::write(paths.models.join(file), b"x").unwrap();
+        }
+        rm_command(
+            &paths,
+            RmArgs {
+                model: "split-model".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!paths.models.join("split-model.mq4").exists());
+        assert!(!paths.models.join("split-model.mq4.ple-q4").exists());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn ple_sidecars_are_never_listed_or_served_as_models() {
+        let paths = test_paths("ple-listing");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = RegistryV1::parse(&split_registry_raw(), "ple listing").unwrap();
+        let sidecars = [
+            "split-model-base.mq4.ple-q4",
+            "split-model-base.mq4.ple-q8",
+            "split-model-base.mq4.plehot",
+            "split-model-base.mq4.plehotrows",
+            "split-model-base.mq4.ple-q8.plehotrows",
+            "split-model.mq4.ple-q4",
+            "unregistered-base.mq4.ple-q8",
+        ];
+        for name in sidecars {
+            assert!(!is_listable_model_file(name, &registry), "{name}");
+            assert!(
+                !is_standalone_model(&paths.models.join(name), name, &registry),
+                "{name}"
+            );
+        }
+        for name in ["split-model-base.mq4", "split-model.mq4"] {
+            assert!(is_listable_model_file(name, &registry), "{name}");
+            assert!(
+                is_standalone_model(&paths.models.join(name), name, &registry),
+                "{name}"
+            );
+        }
+        for name in sidecars
+            .iter()
+            .chain(&["split-model-base.mq4", "split-model.mq4"])
+        {
+            fs::write(paths.models.join(name), b"x").unwrap();
+        }
+        let mut listed: Vec<String> = local_model_paths(&paths, &registry)
+            .unwrap()
+            .iter()
+            .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+            .collect();
+        listed.sort();
+        assert_eq!(listed, ["split-model-base.mq4", "split-model.mq4"]);
+        assert!(registry_sidecar_files(&registry).contains("split-model-base.mq4.ple-q8"));
+        assert!(registry_sidecar_files(&registry).contains("split-model-base.mq4.ple-q4"));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    // ---- Flash-Next trunk overlay sidecar: pull, rm, listings -----------------
+
+    const OVERLAY_BASE: &[u8] = b"overlay-base-bytes";
+    const OVERLAY_BYTES: &[u8] = b"pre-encoded-qt44-overlay-bytes";
+
+    /// The registry entry carries no overlay field: the overlay comes only from
+    /// the injected pin table, keyed by the base's sha256/size.
+    fn overlay_registry_raw() -> String {
+        format!(
+            r#"{{
+            "schema_version":1,
+            "generated_at":"2099-01-01T00:00:00Z",
+            "models":{{
+                "overlay-model":{{
+                    "repo":"test/repo","file":"overlay-model.mq4","size_gb":0.001,
+                    "min_vram_gb":1,"desc":"x","sha256":"{}","size_bytes":{}
+                }}
+            }},
+            "aliases":{{}}
+        }}"#,
+            ple_sha(OVERLAY_BASE),
+            OVERLAY_BASE.len(),
+        )
+    }
+
+    fn overlay_pins() -> Vec<TrunkOverlayPin> {
+        vec![TrunkOverlayPin {
+            base_sha256: ple_sha(OVERLAY_BASE).leak(),
+            base_size: OVERLAY_BASE.len() as u64,
+            repo: "test/repo",
+            file: "overlay-model.mq4.trunk-overlay",
+            sha256: ple_sha(OVERLAY_BYTES).leak(),
+            size_bytes: OVERLAY_BYTES.len() as u64,
+        }]
+    }
+
+    fn pull_overlay_model(paths: &Paths, force: bool) {
+        pull_with_overlay_pins(
+            paths,
+            PullArgs {
+                model: "overlay-model".into(),
+                force,
+                ple: ple::PleSelection::Auto,
+            },
+            &overlay_pins(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pull_downloads_and_verifies_the_trunk_overlay_once() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("overlay-pull");
+        write_test_registry_cache(&paths, &overlay_registry_raw());
+        let overlay = paths.models.join("overlay-model.mq4.trunk-overlay");
+
+        let mut files = std::collections::HashMap::new();
+        files.insert("overlay-model.mq4".to_owned(), OVERLAY_BASE.to_vec());
+        files.insert(
+            "overlay-model.mq4.trunk-overlay".to_owned(),
+            OVERLAY_BYTES.to_vec(),
+        );
+        let (base, handle) = exact_http_server(files);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+        pull_overlay_model(&paths, false);
+        handle.join().unwrap();
+        assert_eq!(
+            fs::read(paths.models.join("overlay-model.mq4")).unwrap(),
+            OVERLAY_BASE
+        );
+        assert_eq!(fs::read(&overlay).unwrap(), OVERLAY_BYTES);
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 2));
+
+        // A valid file on disk is not downloaded again (an empty server would
+        // refuse any request; the invocation counter proves none was made).
+        let (base, handle) = exact_http_server(std::collections::HashMap::new());
+        let _hf2 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_overlay_model(&paths, false);
+        handle.join().unwrap();
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 2));
+        assert_eq!(fs::read(&overlay).unwrap(), OVERLAY_BYTES);
+
+        // A stale overlay is refreshed and re-verified.
+        fs::write(&overlay, b"stale").unwrap();
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "overlay-model.mq4.trunk-overlay".to_owned(),
+            OVERLAY_BYTES.to_vec(),
+        );
+        let (base, handle) = exact_http_server(files);
+        let _hf3 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_overlay_model(&paths, false);
+        handle.join().unwrap();
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 3));
+        assert_eq!(fs::read(&overlay).unwrap(), OVERLAY_BYTES);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn pull_never_installs_a_trunk_overlay_that_fails_verification() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("overlay-pull-corrupt");
+        write_test_registry_cache(&paths, &overlay_registry_raw());
+        let mut files = std::collections::HashMap::new();
+        files.insert("overlay-model.mq4".to_owned(), OVERLAY_BASE.to_vec());
+        // Same length as the pinned payload, different bytes: the digest rejects it.
+        files.insert(
+            "overlay-model.mq4.trunk-overlay".to_owned(),
+            vec![b'x'; OVERLAY_BYTES.len()],
+        );
+        let (base, handle) = exact_http_server(files);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_overlay_model(&paths, false);
+        handle.join().unwrap();
+        assert!(paths.models.join("overlay-model.mq4").is_file());
+        assert!(
+            !paths.models.join("overlay-model.mq4.trunk-overlay").exists(),
+            "a failed verification must not leave the overlay installed"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_removes_the_trunk_overlay_with_its_base() {
+        let paths = test_paths("overlay-rm");
+        let registry = RegistryV1::parse(&overlay_registry_raw(), "overlay rm").unwrap();
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in ["overlay-model.mq4", "overlay-model.mq4.trunk-overlay", "untouched.mq4"] {
+            fs::write(paths.models.join(file), b"x").unwrap();
+        }
+        rm_with_overlay_pins(
+            &paths,
+            &registry,
+            &overlay_pins(),
+            RmArgs {
+                model: "overlay-model".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!paths.models.join("overlay-model.mq4").exists());
+        assert!(!paths.models.join("overlay-model.mq4.trunk-overlay").exists());
+        assert!(paths.models.join("untouched.mq4").exists());
+
+        // An unregistered base takes its `<file>.trunk-overlay` with it too.
+        for file in ["local.mq4", "local.mq4.trunk-overlay"] {
+            fs::write(paths.models.join(file), b"x").unwrap();
+        }
+        rm_with_overlay_pins(
+            &paths,
+            &registry,
+            &overlay_pins(),
+            RmArgs {
+                model: "local.mq4".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!paths.models.join("local.mq4").exists());
+        assert!(!paths.models.join("local.mq4.trunk-overlay").exists());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn trunk_overlays_are_never_listed_or_served_as_models() {
+        let paths = test_paths("overlay-listing");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = RegistryV1::parse(&overlay_registry_raw(), "overlay listing").unwrap();
+        let overlays = [
+            "overlay-model.mq4.trunk-overlay",
+            "qwen3.8-flash-next.mq4-xts.trunk-overlay",
+            "unregistered.mq4.trunk-overlay",
+        ];
+        for name in overlays {
+            assert!(!is_listable_model_file(name, &registry), "{name}");
+            assert!(
+                !is_standalone_model(&paths.models.join(name), name, &registry),
+                "{name}"
+            );
+        }
+        assert!(registry_sidecar_files(&registry).contains(TRUNK_OVERLAY_PINS[0].file));
+        for name in overlays.iter().chain(&["overlay-model.mq4"]) {
+            fs::write(paths.models.join(name), b"x").unwrap();
+        }
+        let listed: Vec<String> = local_model_paths(&paths, &registry)
+            .unwrap()
+            .iter()
+            .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+            .collect();
+        assert_eq!(listed, ["overlay-model.mq4"]);
+        fs::remove_dir_all(&paths.root).unwrap();
     }
 }

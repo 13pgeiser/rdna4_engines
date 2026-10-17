@@ -8,9 +8,10 @@
 use crate::error::{HipError, HipResult};
 use crate::{DeviceBuffer, MemcpyKind};
 use libloading::{Library, Symbol};
-use std::ffi::{c_char, c_int, c_uint, c_void, CString};
+use std::ffi::{c_char, c_int, c_uint, c_void, CString, OsStr, OsString};
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Per-thread accumulators for time spent inside HIP FFI calls. Used by
 /// Phase 3a host-vs-GPU diagnostics to attribute the forward pass wall
@@ -104,6 +105,81 @@ pub mod launch_counters {
     counter!(graph_launch);
 }
 
+/// Per-thread tally of the HIP memory operations issued on this thread.
+///
+/// A retained Redline tape replays recorded kernel dispatches only, so a
+/// device copy, readback or memset issued inside its capture window is state
+/// the tape cannot reproduce. The replay controller differences two snapshots
+/// around the window. Unlike [`launch_counters`] this tally is never reset, so
+/// a profiler resetting its counters mid-window cannot hide an effect, and
+/// every synchronous and asynchronous variant counts.
+pub mod memory_effects {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct MemoryEffects {
+        /// Host→device uploads.
+        pub htod: u64,
+        /// Device→device copies, including peer copies.
+        pub dtod: u64,
+        /// Device→host readbacks.
+        pub dtoh: u64,
+        /// Memsets.
+        pub memset: u64,
+    }
+
+    impl MemoryEffects {
+        /// The operations issued since `earlier`, a snapshot taken on this thread.
+        pub fn since(self, earlier: Self) -> Self {
+            Self {
+                htod: self.htod - earlier.htod,
+                dtod: self.dtod - earlier.dtod,
+                dtoh: self.dtoh - earlier.dtoh,
+                memset: self.memset - earlier.memset,
+            }
+        }
+
+        /// Whether a capture window with these effects is fully described by
+        /// its recorded dispatches. Host→device uploads are excluded: a
+        /// retained-body boundary re-stages its inputs on every replay.
+        pub fn replayable(self) -> bool {
+            self.dtod == 0 && self.dtoh == 0 && self.memset == 0
+        }
+    }
+
+    thread_local! {
+        static TALLY: Cell<MemoryEffects> = const {
+            Cell::new(MemoryEffects { htod: 0, dtod: 0, dtoh: 0, memset: 0 })
+        };
+    }
+
+    /// This thread's running tally.
+    pub fn snapshot() -> MemoryEffects {
+        TALLY.with(Cell::get)
+    }
+
+    fn bump(update: impl FnOnce(&mut MemoryEffects)) {
+        TALLY.with(|tally| {
+            let mut value = tally.get();
+            update(&mut value);
+            tally.set(value);
+        });
+    }
+
+    pub(crate) fn htod() {
+        bump(|value| value.htod += 1);
+    }
+    pub(crate) fn dtod() {
+        bump(|value| value.dtod += 1);
+    }
+    pub(crate) fn dtoh() {
+        bump(|value| value.dtoh += 1);
+    }
+    pub(crate) fn memset() {
+        bump(|value| value.memset += 1);
+    }
+}
+
 // Opaque HIP handles (pointers to internal structs)
 type HipStream = *mut c_void;
 type HipModule = *mut c_void;
@@ -139,6 +215,26 @@ static HIP_FAULT_SYNC: AtomicUsize = AtomicUsize::new(HIP_FAULT_UNSET);
 /// call re-checks.
 fn fault_spec() -> Option<Option<String>> {
     hipfire_config::active_process_config().map(|config| config.legacy_value("HIPFIRE_FAULT_HIP"))
+}
+
+/// Developer-only module-load audit (`HIPFIRE_MODULE_LOAD_AUDIT=1`, default
+/// off): one stderr line per `hipModuleLoad`/`hipModuleLoadData`/
+/// `hipModuleGetFunction`, keyed by the opaque module handle, so an offline
+/// route-closure audit can attribute every resolved symbol to its loaded
+/// image. Read per call from the installed process config (module loads are
+/// cold-path); nothing is logged before the config is installed.
+fn module_load_audit_enabled() -> bool {
+    hipfire_config::active_process_config()
+        .and_then(|config| config.legacy_value("HIPFIRE_MODULE_LOAD_AUDIT"))
+        .as_deref()
+        == Some("1")
+}
+
+/// FNV-1a 64 over an embedded image; identifies the image in the audit line.
+fn module_image_fnv64(image: &[u8]) -> u64 {
+    image.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 /// Arm `count` injected failures for one fault class (`upload`, `launch`,
@@ -218,6 +314,10 @@ pub const HIP_MEM_LOCATION_TYPE_DEVICE: u32 = 1;
 pub const HIP_MEM_LOCATION_TYPE_HOST: u32 = 2;
 pub const HIP_MEM_ALLOCATION_TYPE_PINNED: u32 = 1;
 pub const HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE: u32 = 3;
+/// `hipMemAccessFlagsProtRead`: read-only mapping access.
+pub const HIP_MEM_ACCESS_FLAGS_PROT_READ: u32 = 1;
+/// `hipMemHandleTypePosixFileDescriptor`: shareable-handle type of a POSIX FD.
+pub const HIP_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR: u32 = 1;
 pub const HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM: u32 = 0;
 pub const HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED: u32 = 1;
 /// Dependency event: omit profiling state and retain the default system fence.
@@ -311,6 +411,14 @@ impl HipMemAllocationProp {
             },
         }
     }
+
+    /// Device pinned allocation exportable as a POSIX file descriptor
+    /// (`requestedHandleTypes = hipMemHandleTypePosixFileDescriptor`).
+    pub fn device_pinned_posix_fd(device: i32) -> Self {
+        let mut prop = Self::device_pinned(device);
+        prop.requested_handle_types = HIP_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+        prop
+    }
 }
 
 #[repr(C)]
@@ -327,11 +435,19 @@ impl HipMemAccessDesc {
             flags: HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE,
         }
     }
+
+    /// Read-only access for one device.
+    pub fn read_only_device(device: i32) -> Self {
+        Self {
+            location: HipMemLocation::device(device),
+            flags: HIP_MEM_ACCESS_FLAGS_PROT_READ,
+        }
+    }
 }
 
 /// Loaded HIP runtime — holds the dlopen'd library and resolved function pointers.
 pub struct HipRuntime {
-    _lib: Library,
+    _lib: Arc<Library>,
 
     // Init
     fn_init: unsafe extern "C" fn(c_uint) -> u32,
@@ -368,6 +484,20 @@ pub struct HipRuntime {
     fn_memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32,
     fn_memcpy_async:
         unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32,
+    /// `hipMemcpy2DAsync(dst, dpitch, src, spitch, width, height, kind, stream)`.
+    /// Pitches and width are bytes; height is rows.
+    fn_memcpy_2d_async: unsafe extern "C" fn(
+        *mut c_void,
+        usize,
+        *const c_void,
+        usize,
+        usize,
+        usize,
+        c_uint,
+        HipStream,
+    ) -> u32,
+    /// `hipMemcpyDtoD(dst, src, bytes)` (driver-style device pointers).
+    fn_memcpy_dtod: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> u32>,
     fn_memset: unsafe extern "C" fn(*mut c_void, c_int, usize) -> u32,
     fn_memset_async: unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32,
     fn_memset_d32_async: unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32,
@@ -393,6 +523,17 @@ pub struct HipRuntime {
     fn_mem_set_access:
         Option<unsafe extern "C" fn(*mut c_void, usize, *const HipMemAccessDesc, usize) -> u32>,
     fn_mem_release: Option<unsafe extern "C" fn(HipMemGenericAllocationHandle) -> u32>,
+    /// `hipMemExportToShareableHandle(void *out, handle, type, flags)`.
+    fn_mem_export_to_shareable_handle: Option<
+        unsafe extern "C" fn(*mut c_void, HipMemGenericAllocationHandle, u32, u64) -> u32,
+    >,
+    /// `hipMemImportFromShareableHandle(handle *out, void *osHandle, type)`.
+    fn_mem_import_from_shareable_handle: Option<
+        unsafe extern "C" fn(*mut HipMemGenericAllocationHandle, *mut c_void, u32) -> u32,
+    >,
+    /// `hipMemGetAccess(unsigned long long *flags, const hipMemLocation *, void *ptr)`.
+    fn_mem_get_access:
+        Option<unsafe extern "C" fn(*mut u64, *const HipMemLocation, *mut c_void) -> u32>,
 
     // Streams
     fn_stream_create: unsafe extern "C" fn(*mut HipStream) -> u32,
@@ -436,6 +577,7 @@ pub struct HipRuntime {
     // Graph capture & replay
     fn_stream_begin_capture: unsafe extern "C" fn(HipStream, c_uint) -> u32,
     fn_stream_end_capture: unsafe extern "C" fn(HipStream, *mut HipGraph) -> u32,
+    fn_stream_is_capturing: unsafe extern "C" fn(HipStream, *mut c_uint) -> u32,
     fn_graph_instantiate:
         unsafe extern "C" fn(*mut HipGraphExec, HipGraph, *mut HipGraph, *mut c_void, usize) -> u32,
     fn_graph_launch: unsafe extern "C" fn(HipGraphExec, HipStream) -> u32,
@@ -449,6 +591,12 @@ pub struct HipRuntime {
     fn_get_device_properties: unsafe extern "C" fn(*mut u8, c_int) -> u32,
     fn_get_device_attribute: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32,
     fn_mem_get_info: unsafe extern "C" fn(*mut usize, *mut usize) -> u32,
+    /// `gridDim.y`/`gridDim.z` ceiling (`u32::MAX` = unguarded, the default).
+    /// Per-runtime, not per-device or per-thread: it is set once by the owner
+    /// of a runtime bound to a single device (`Gpu::init_with_device`) via
+    /// `set_launch_grid_limit_for_arch`. A standalone `HipRuntime` that nobody
+    /// configures is unguarded.
+    launch_grid_yz_limit: AtomicU32,
 }
 
 // HipRuntime is Send+Sync — the underlying HIP runtime is thread-safe for API calls.
@@ -491,7 +639,8 @@ const GPU_PINNED_MIN_XFER_SIZE: &str = "GPU_PINNED_MIN_XFER_SIZE";
 const STAGE_ALL_PAGEABLE_COPIES_MB: &str = "100000";
 
 /// Keep host memory the GPU reads out of the kernel's reclaim path, unless
-/// the operator set the switches.
+/// the operator set the switches. `reason` names why, in the log line that
+/// reports the switches set.
 ///
 /// Under ROCm's defaults, host pages that the GPU reads are registered as
 /// KFD userptr BOs. That covers every `hipHostMalloc` block, which is shared
@@ -509,24 +658,135 @@ const STAGE_ALL_PAGEABLE_COPIES_MB: &str = "100000";
 /// caps them instead. `GPU_PINNED_MIN_XFER_SIZE` set past any copy size
 /// routes every pageable copy through clr's staging buffer, which is itself
 /// `hipHostMalloc` memory. libhsakmt and clr read both switches once, when
-/// the runtime initializes, so they are set before it loads. APUs ignore the
-/// first switch.
+/// the runtime initializes, so this must run before the first HIP runtime
+/// call, while the process is still single-threaded. APUs ignore the first
+/// switch.
 ///
-/// Both switches are process-global, and together they slow other loads: on
-/// gfx1201, H2's weight sweep took 1.20-1.22 s with them instead of
-/// 1.00-1.01 s. So they are set only in a process configured to host-map
-/// Qwen4 experts ([`QWEN4_EXPERT_VRAM_LAYERS_ENV`]), the one known to hold
-/// tens of GB of host memory the GPU reads.
-fn keep_host_memory_out_of_reclaim() {
-    if !cfg!(target_os = "linux") || !host_maps_qwen4_experts() {
+/// The two switches cover the two classes of userptr page, and they are priced
+/// very differently, so they are armed differently:
+///
+/// * `GPU_PINNED_MIN_XFER_SIZE` covers the **pageable copy source** — the
+///   mapped model file's page-cache pages, which clr otherwise pins in place
+///   for every large weight upload. That source exists on *every* weight load,
+///   on every architecture, so it is armed in every Linux process, by
+///   [`HipRuntime::load`] before the runtime is dlopen'd. Measured free on
+///   gfx1201 / Qwen3.8-27B MQ3-Pro (warm cache, three reps each): weight sweep
+///   1190-1198 ms armed vs 1204-1210 ms unarmed.
+/// * `HSA_USERPTR_FOR_PAGED_MEM=0` covers `hipHostMalloc` blocks, and it is
+///   the half that costs (same model and box: +8-11 % on the sweep; the commit
+///   that introduced the gate measured ~+20 % on H2), so it stays scoped to a
+///   process that loads a Qwen4 model, the one known to hold tens of GB of host
+///   memory the GPU reads: [`HipRuntime::load`] sets it in a process configured
+///   to host-map Qwen4 experts ([`QWEN4_EXPERT_VRAM_LAYERS_ENV`]), and a
+///   process about to load a Qwen4 model on a discrete GPU calls this before
+///   the runtime loads (`hipfire_loader::prepare_host_memory_for`).
+///
+/// Neither name is a published interface. `GPU_PINNED_MIN_XFER_SIZE` is absent
+/// from HIP's own environment-variable reference and from AMD's env-var page
+/// (checked against ROCm 7.2), and `HSA_USERPTR_FOR_PAGED_MEM` is a libhsakmt
+/// knob; clr/libhsakmt read each once, at runtime initialization, so both are
+/// set before the runtime is dlopen'd. They are used here because the
+/// alternative is the stall described above (ROCm/rocm-systems#12528), and
+/// `f5731a506` relied on them first, for host-mapped Qwen4 experts.
+/// `docs/env-vars.md` records that provenance so neither reads as supported
+/// API.
+///
+/// Evidence: under an 8 GiB host-memory ballast, an unarmed 27B load stalls at
+/// a varying `loading layer N/64` on both a partial-GPU-offload and a
+/// fully-resident configuration; `GPU_PINNED_MIN_XFER_SIZE` alone loads 7/7.
+/// See the `fix/host-memory-reclaim-stall` branch commit for the full table.
+pub fn keep_host_memory_out_of_reclaim(reason: &str) {
+    if !cfg!(target_os = "linux") {
         return;
     }
+    let mut set = Vec::new();
     for (name, value) in [
         (HSA_USERPTR_FOR_PAGED_MEM, "0"),
         (GPU_PINNED_MIN_XFER_SIZE, STAGE_ALL_PAGEABLE_COPIES_MB),
     ] {
         if std::env::var_os(name).is_none() {
             std::env::set_var(name, value);
+            set.push(format!("{name}={value}"));
+        }
+    }
+    if !set.is_empty() {
+        eprintln!("[hip-bridge] {} ({reason}): host memory out of reclaim", set.join(" "));
+    }
+}
+
+/// Exact opt-out from the process-wide [`GPU_PINNED_MIN_XFER_SIZE`] default:
+/// when it is `0`, [`keep_pageable_copies_out_of_reclaim`] leaves the switch
+/// unset, so clr keeps its own built-in threshold. That is an exact
+/// restoration of the pre-default behavior, which setting
+/// `GPU_PINNED_MIN_XFER_SIZE=0` is not (it pins every pageable copy source in
+/// place, including copies below clr's built-in threshold).
+const PINNED_XFER_DEFAULT_ENV: &str = "HIPFIRE_PINNED_XFER_DEFAULT";
+
+/// What [`keep_pageable_copies_out_of_reclaim`] does with
+/// `GPU_PINNED_MIN_XFER_SIZE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageableCopyStaging {
+    /// The operator already set the switch: respected untouched, whatever the
+    /// opt-out says.
+    Preset,
+    /// [`PINNED_XFER_DEFAULT_ENV`] is `0`: leave the switch unset.
+    OptedOut,
+    /// Set the switch to [`STAGE_ALL_PAGEABLE_COPIES_MB`].
+    Arm,
+}
+
+/// The decision behind [`keep_pageable_copies_out_of_reclaim`], pure so the
+/// tests never touch the process environment. `opt_out` is the value of
+/// [`PINNED_XFER_DEFAULT_ENV`] and `preset` that of `GPU_PINNED_MIN_XFER_SIZE`;
+/// only an `opt_out` of exactly `0` opts out.
+fn pageable_copy_staging(opt_out: Option<&OsStr>, preset: Option<&OsStr>) -> PageableCopyStaging {
+    if preset.is_some() {
+        PageableCopyStaging::Preset
+    } else if opt_out == Some(OsStr::new("0")) {
+        PageableCopyStaging::OptedOut
+    } else {
+        PageableCopyStaging::Arm
+    }
+}
+
+/// [`PINNED_XFER_DEFAULT_ENV`] as this process sees it: the installed process
+/// config when there is one, otherwise the ambient environment. Like
+/// [`host_maps_qwen4_experts`], it never installs the local fallback config, so
+/// it is safe before the HIP runtime loads.
+fn pinned_xfer_default_opt_out() -> Option<OsString> {
+    match hipfire_config::active_process_config() {
+        Some(config) => config.legacy_value(PINNED_XFER_DEFAULT_ENV).map(OsString::from),
+        None => std::env::var_os(PINNED_XFER_DEFAULT_ENV),
+    }
+}
+
+/// Arm clr's pageable-copy staging threshold (`GPU_PINNED_MIN_XFER_SIZE`) in
+/// every Linux process, before the HIP runtime is dlopen'd, unless the operator
+/// already set it or opted out with `HIPFIRE_PINNED_XFER_DEFAULT=0` (see
+/// [`pageable_copy_staging`]). Separate from [`keep_host_memory_out_of_reclaim`]
+/// because this switch is priced free while the `HSA_USERPTR_FOR_PAGED_MEM`
+/// half is not, so the two are scoped differently. This is the tier that
+/// covers the mapped-file copy source on *every* HFQ load:
+/// [`HipRuntime::load`] is the one site every load path in every process
+/// reaches before its first weight copy, where
+/// `hipfire_loader::prepare_host_memory_for` runs earlier but only in a daemon
+/// started for a model.
+fn keep_pageable_copies_out_of_reclaim() {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let opt_out = pinned_xfer_default_opt_out();
+    let preset = std::env::var_os(GPU_PINNED_MIN_XFER_SIZE);
+    match pageable_copy_staging(opt_out.as_deref(), preset.as_deref()) {
+        PageableCopyStaging::Preset => {}
+        PageableCopyStaging::OptedOut => eprintln!(
+            "[hip-bridge] {PINNED_XFER_DEFAULT_ENV}=0: {GPU_PINNED_MIN_XFER_SIZE} left unset (clr default)"
+        ),
+        PageableCopyStaging::Arm => {
+            std::env::set_var(GPU_PINNED_MIN_XFER_SIZE, STAGE_ALL_PAGEABLE_COPIES_MB);
+            eprintln!(
+                "[hip-bridge] {GPU_PINNED_MIN_XFER_SIZE}={STAGE_ALL_PAGEABLE_COPIES_MB}: pageable weight copies staged out of reclaim"
+            );
         }
     }
 }
@@ -553,7 +813,10 @@ impl HipRuntime {
     /// Uses the shared ROCm resolver so runtime, headers, and hipcc stay within
     /// one selected installation.
     pub fn load() -> HipResult<Self> {
-        keep_host_memory_out_of_reclaim();
+        keep_pageable_copies_out_of_reclaim();
+        if host_maps_qwen4_experts() {
+            keep_host_memory_out_of_reclaim(&format!("{QWEN4_EXPERT_VRAM_LAYERS_ENV} set"));
+        }
         // Windows and Unix share one candidate policy in hipfire_config::rocm so a
         // selected/configured root never falls through to another install's DLL
         // (user cache or bare PATH names). HIP_RUNTIME_LIBRARIES already encodes
@@ -737,6 +1000,27 @@ impl HipRuntime {
                     ) -> u32
                 ) },
                 // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_memcpy_2d_async: unsafe { load_fn!(
+                    lib,
+                    "hipMemcpy2DAsync",
+                    unsafe extern "C" fn(
+                        *mut c_void,
+                        usize,
+                        *const c_void,
+                        usize,
+                        usize,
+                        usize,
+                        c_uint,
+                        HipStream,
+                    ) -> u32
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_memcpy_dtod: unsafe { load_optional_fn!(
+                    lib,
+                    "hipMemcpyDtoD",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> u32
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
                 fn_memset: unsafe { load_fn!(
                     lib,
                     "hipMemset",
@@ -815,6 +1099,33 @@ impl HipRuntime {
                     lib,
                     "hipMemRelease",
                     unsafe extern "C" fn(HipMemGenericAllocationHandle) -> u32
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_mem_export_to_shareable_handle: unsafe { load_optional_fn!(
+                    lib,
+                    "hipMemExportToShareableHandle",
+                    unsafe extern "C" fn(
+                        *mut c_void,
+                        HipMemGenericAllocationHandle,
+                        u32,
+                        u64,
+                    ) -> u32
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_mem_import_from_shareable_handle: unsafe { load_optional_fn!(
+                    lib,
+                    "hipMemImportFromShareableHandle",
+                    unsafe extern "C" fn(
+                        *mut HipMemGenericAllocationHandle,
+                        *mut c_void,
+                        u32,
+                    ) -> u32
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_mem_get_access: unsafe { load_optional_fn!(
+                    lib,
+                    "hipMemGetAccess",
+                    unsafe extern "C" fn(*mut u64, *const HipMemLocation, *mut c_void) -> u32
                 ) },
                 // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
                 fn_stream_create: unsafe { load_fn!(
@@ -951,6 +1262,12 @@ impl HipRuntime {
                     unsafe extern "C" fn(HipStream, *mut HipGraph) -> u32
                 ) },
                 // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
+                fn_stream_is_capturing: unsafe { load_fn!(
+                    lib,
+                    "hipStreamIsCapturing",
+                    unsafe extern "C" fn(HipStream, *mut c_uint) -> u32
+                ) },
+                // SAFETY: resolve one HIP symbol from the live `Library`; pointer stays valid while `_lib` owns the mapping.
                 fn_graph_instantiate: unsafe { load_fn!(
                     lib,
                     "hipGraphInstantiate",
@@ -1016,7 +1333,8 @@ impl HipRuntime {
                     "hipMemGetInfo",
                     unsafe extern "C" fn(*mut usize, *mut usize) -> u32
                 ) },
-                _lib: lib,
+                _lib: Arc::new(lib),
+                launch_grid_yz_limit: AtomicU32::new(u32::MAX),
         };
 
         // Empirically required on ROCm 7.2 — hipcc-linked binaries get an
@@ -1198,6 +1516,7 @@ impl HipRuntime {
                 size,
             )
         };
+        memory_effects::dtod();
         self.check(code, "hipMemcpyPeer")
     }
 
@@ -1234,6 +1553,7 @@ impl HipRuntime {
                 stream.0,
             )
         };
+        memory_effects::dtod();
         self.check(code, "hipMemcpyPeerAsync")
     }
 
@@ -1254,6 +1574,7 @@ impl HipRuntime {
         // HIP symbols were resolved at load. Returned pointers are opaque to Rust.
         let code = unsafe { (self.fn_malloc)(&mut ptr, size) };
         self.check(code, "hipMalloc")?;
+        crate::registry::record(ptr as usize, size, crate::registry::AllocationKind::Malloc);
         Ok(DeviceBuffer {
             ptr,
             size,
@@ -1279,6 +1600,7 @@ impl HipRuntime {
         // HIP symbols were resolved at load. Returned pointers are opaque to Rust.
         let code = unsafe { ext_malloc(&mut ptr, size, HIP_MALLOC_SIGNAL_MEMORY) };
         self.check(code, "hipExtMallocWithFlags(hipMallocSignalMemory)")?;
+        crate::registry::record(ptr as usize, size, crate::registry::AllocationKind::Signal);
         Ok(DeviceBuffer {
             ptr,
             size,
@@ -1298,7 +1620,9 @@ impl HipRuntime {
         // SAFETY: buf.ptr is a live hipMalloc allocation (ownership checked above);
         // caller must ensure GPU work on it is quiesced (documented on free).
         let code = unsafe { (self.fn_free)(buf.ptr) };
-        self.check(code, "hipFree")
+        self.check(code, "hipFree")?;
+        crate::registry::forget(buf.ptr as usize);
+        Ok(())
     }
 
     /// Allocate host-pinned memory the GPU can read directly over PCIe.
@@ -1342,6 +1666,41 @@ impl HipRuntime {
         // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(host) };
         self.check(code, "hipHostFree")
+    }
+
+    /// Own reusable pinned host storage, portable across devices. The library
+    /// stays loaded until the allocation is freed, even if the runtime drops.
+    pub fn host_buffer(&self, size: usize) -> HipResult<PinnedHostBuffer> {
+        if size == 0 {
+            return Err(HipError::new(0, "host_buffer requires non-zero size"));
+        }
+        let free = self.missing_vmm_symbol("hipHostFree", self.fn_host_free)?;
+        // hipHostMallocPortable: this thread-local stage may outlive a Gpu or
+        // be reused with another device after a model swap.
+        let ptr = self.host_malloc(size, 1)?;
+        // SAFETY: hipHostMalloc succeeded with a non-zero extent. Initialize
+        // once so as_bytes_mut can expose ordinary initialized Rust bytes.
+        unsafe { std::ptr::write_bytes(ptr.cast::<u8>(), 0, size) };
+        Ok(PinnedHostBuffer {
+            ptr,
+            size,
+            free,
+            _lib: Arc::clone(&self._lib),
+        })
+    }
+
+    /// Reusable pinned CPU/GPU transfer storage. Same-stream downloads may be
+    /// queued after an outstanding upload without exposing host references.
+    pub fn transfer_buffer(&self, size: usize) -> HipResult<PinnedTransferBuffer> {
+        Ok(PinnedTransferBuffer {
+            storage: Some(self.host_buffer(size)?),
+            device: self.current_device()?,
+            stream: ptr::null_mut(),
+            pending: false,
+            get_device: self.fn_get_device,
+            set_device: self.fn_set_device,
+            synchronize: self.fn_device_synchronize,
+        })
     }
 
     pub fn mem_get_allocation_granularity(
@@ -1429,7 +1788,9 @@ impl HipRuntime {
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
         // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(ptr, size, 0, handle, 0) };
-        self.check(code, "hipMemMap")
+        self.check(code, "hipMemMap")?;
+        crate::registry::record(ptr as usize, size, crate::registry::AllocationKind::VmmChunk);
+        Ok(())
     }
 
     /// # Safety
@@ -1439,7 +1800,9 @@ impl HipRuntime {
         // SAFETY: resolved VMM/host HIP symbol; pointer/handle args meet the method's
         // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(ptr, size) };
-        self.check(code, "hipMemUnmap")
+        self.check(code, "hipMemUnmap")?;
+        crate::registry::forget(ptr as usize);
+        Ok(())
     }
 
     /// # Safety
@@ -1467,6 +1830,90 @@ impl HipRuntime {
         // # Safety or documented preconditions; out-params are stack locals.
         let code = unsafe { func(handle) };
         self.check(code, "hipMemRelease")
+    }
+
+    /// Export a live exportable (POSIX-FD) physical allocation handle as a new
+    /// file descriptor. The FD is an independent reference to the allocation:
+    /// the physical memory outlives `mem_release(handle)` until every FD and
+    /// importer reference is gone. The exporting runtime must have created
+    /// `handle` with `HipMemAllocationProp::device_pinned_posix_fd`.
+    ///
+    /// `handle` is an opaque HIP allocation handle; Rust never dereferences it.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn mem_export_posix(
+        &self,
+        handle: HipMemGenericAllocationHandle,
+    ) -> HipResult<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd;
+        let func = self.missing_vmm_symbol(
+            "hipMemExportToShareableHandle",
+            self.fn_mem_export_to_shareable_handle,
+        )?;
+        // The runtime writes an integer FD through the output address.
+        let mut fd: c_int = -1;
+        // SAFETY: `fd` is a live stack c_int receiving the descriptor; the
+        // handle is an opaque runtime handle; flags are zero per the HIP API.
+        let code = unsafe {
+            func(
+                &mut fd as *mut c_int as *mut c_void,
+                handle,
+                HIP_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+                0,
+            )
+        };
+        self.check(code, "hipMemExportToShareableHandle")?;
+        if fd < 0 {
+            return Err(HipError::new(
+                0,
+                "hipMemExportToShareableHandle returned success with an invalid file descriptor",
+            ));
+        }
+        // SAFETY: on success the runtime transferred a fresh FD to this caller;
+        // nothing else owns it.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// Import a POSIX-FD shareable handle exported by another process (or
+    /// this one). The FD is passed by value (`(void *)(intptr_t)fd`, the
+    /// convention G0 verified on the installed runtime) and is NOT consumed:
+    /// the caller keeps ownership and may close it after import. The returned
+    /// handle is owned by the caller and must be released with `mem_release`
+    /// after every mapping of it is unmapped.
+    pub fn mem_import_posix(
+        &self,
+        fd: std::os::fd::BorrowedFd<'_>,
+    ) -> HipResult<HipMemGenericAllocationHandle> {
+        use std::os::fd::AsRawFd;
+        let func = self.missing_vmm_symbol(
+            "hipMemImportFromShareableHandle",
+            self.fn_mem_import_from_shareable_handle,
+        )?;
+        let mut handle: HipMemGenericAllocationHandle = ptr::null_mut();
+        // SAFETY: `handle` is a stack out-param; the FD is encoded by value as
+        // the runtime expects and stays valid (borrowed) for the call.
+        let code = unsafe {
+            func(
+                &mut handle,
+                fd.as_raw_fd() as isize as *mut c_void,
+                HIP_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+            )
+        };
+        self.check(code, "hipMemImportFromShareableHandle")?;
+        Ok(handle)
+    }
+
+    /// Query the access flags (`HIP_MEM_ACCESS_FLAGS_PROT_*`) `location` has
+    /// on the mapped VMM address `ptr` (`hipMemGetAccess`). Optional symbol:
+    /// errors when this runtime lacks it. `ptr` is an opaque GPU address.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn mem_get_access(&self, location: &HipMemLocation, ptr: *mut c_void) -> HipResult<u32> {
+        let func = self.missing_vmm_symbol("hipMemGetAccess", self.fn_mem_get_access)?;
+        let mut flags: u64 = 0;
+        // SAFETY: `flags` and `location` are valid for the call; `ptr` is an
+        // opaque GPU address the runtime validates.
+        let code = unsafe { func(&mut flags, location as *const HipMemLocation, ptr) };
+        self.check(code, "hipMemGetAccess")?;
+        Ok(flags as u32)
     }
 
     /// Return the base and byte extent of the HIP allocation containing
@@ -1522,6 +1969,7 @@ impl HipRuntime {
                 MemcpyKind::HostToDevice as c_uint,
             )
         };
+        memory_effects::htod();
         self.check(code, "hipMemcpy H2D offset")
     }
 
@@ -1550,6 +1998,7 @@ impl HipRuntime {
             (self.fn_memcpy)(dst_ptr, src_ptr, size, MemcpyKind::DeviceToDevice as c_uint)
         };
         crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
+        memory_effects::dtod();
         self.check(code, "hipMemcpy D2D at offset")
     }
 
@@ -1574,6 +2023,7 @@ impl HipRuntime {
             (self.fn_memcpy)(dst.ptr, src_ptr, size, MemcpyKind::DeviceToDevice as c_uint)
         };
         crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
+        memory_effects::dtod();
         self.check(code, "hipMemcpy D2D offset")
     }
 
@@ -1600,6 +2050,7 @@ impl HipRuntime {
             )
         };
         crate::ffi::launch_counters::memcpy_htod::record(t.elapsed().as_nanos() as u64);
+        memory_effects::htod();
         self.check(code, "hipMemcpy H2D")
     }
 
@@ -1642,6 +2093,7 @@ impl HipRuntime {
                 loc.line()
             );
         }
+        memory_effects::dtoh();
         self.check(code, "hipMemcpy D2H")
     }
 
@@ -1695,6 +2147,7 @@ impl HipRuntime {
                 loc.line()
             );
         }
+        memory_effects::dtoh();
         self.check(code, "hipMemcpy D2H at offset")
     }
 
@@ -1718,7 +2171,31 @@ impl HipRuntime {
             )
         };
         crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
+        memory_effects::dtod();
         self.check(code, "hipMemcpy D2D")
+    }
+
+    /// `hipMemcpyDtoD(dst, src, size)` on raw device addresses.
+    ///
+    /// # Safety
+    /// `[src, src+size)` and `[dst, dst+size)` must lie in live device
+    /// allocations and must not overlap.
+    pub unsafe fn memcpy_dtod_raw(
+        &self,
+        dst: *mut c_void,
+        src: *const c_void,
+        size: usize,
+    ) -> HipResult<()> {
+        let f = self.fn_memcpy_dtod.ok_or_else(|| {
+            HipError::new(0, "hipMemcpyDtoD is not exported by the loaded HIP runtime")
+        })?;
+        let t = std::time::Instant::now();
+        // SAFETY: the caller guarantees both ranges lie in live, disjoint
+        // device allocations; Rust does not deref device pointers.
+        let code = unsafe { f(dst, src as *mut c_void, size) };
+        crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
+        memory_effects::dtod();
+        self.check(code, "hipMemcpyDtoD")
     }
 
     #[track_caller]
@@ -1748,6 +2225,7 @@ impl HipRuntime {
                 loc.line()
             );
         }
+        memory_effects::memset();
         self.check(code, "hipMemset")
     }
 
@@ -1766,6 +2244,7 @@ impl HipRuntime {
         // asserted to fit. Same-device/stream and host-buffer lifetime across
         // async copies are the caller's contract; Rust does not deref device ptrs.
         let code = unsafe { (self.fn_memset_d32_async)(buf.ptr, value, count, stream_raw) };
+        memory_effects::memset();
         self.check(code, "hipMemsetD32Async")
     }
 
@@ -1804,6 +2283,7 @@ impl HipRuntime {
                 loc.line()
             );
         }
+        memory_effects::memset();
         self.check(code, "hipMemsetAsync")
     }
 
@@ -1844,6 +2324,15 @@ impl HipRuntime {
         self.check(code, "hipStreamSynchronize")
     }
 
+    /// Synchronize the legacy default (NULL) stream: the stream HIP uses when a
+    /// caller passes no stream. Same fault injection and `stream_sync` counter as
+    /// [`Self::stream_synchronize`]. It waits on that one stream only, never the
+    /// whole device. `Stream` has no `Drop`, so the temporary NULL handle is never
+    /// destroyed.
+    pub fn stream_synchronize_default(&self) -> HipResult<()> {
+        self.stream_synchronize(&Stream(ptr::null_mut()))
+    }
+
     pub fn stream_destroy(&self, stream: Stream) -> HipResult<()> {
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -1863,6 +2352,9 @@ impl HipRuntime {
         // unsafe fn caller's contract when applicable.
         let code = unsafe { (self.fn_module_load)(&mut module, c_path.as_ptr()) };
         self.check(code, "hipModuleLoad")?;
+        if module_load_audit_enabled() {
+            eprintln!("HIPFIRE_MODULE_LOAD_AUDIT\tload\t{:p}\t{path}", module);
+        }
         Ok(Module(module))
     }
 
@@ -1874,6 +2366,14 @@ impl HipRuntime {
             // unsafe fn caller's contract when applicable.
             unsafe { (self.fn_module_load_data)(&mut module, image.as_ptr() as *const c_void) };
         self.check(code, "hipModuleLoadData")?;
+        if module_load_audit_enabled() {
+            eprintln!(
+                "HIPFIRE_MODULE_LOAD_AUDIT\tload_data\t{:p}\t{}\t{:016x}",
+                module,
+                image.len(),
+                module_image_fnv64(image)
+            );
+        }
         Ok(Module(module))
     }
 
@@ -1886,7 +2386,34 @@ impl HipRuntime {
         // unsafe fn caller's contract when applicable.
         let code = unsafe { (self.fn_module_get_function)(&mut func, module.0, c_name.as_ptr()) };
         self.check(code, "hipModuleGetFunction")?;
+        if module_load_audit_enabled() {
+            eprintln!("HIPFIRE_MODULE_LOAD_AUDIT\tget_function\t{:p}\t{name}", module.0);
+        }
         Ok(Function(func))
+    }
+
+    /// Install the `gridDim.y`/`gridDim.z` ceiling for the architecture this
+    /// runtime launches on ([`crate::launch_grid::grid_yz_limit_for_arch`]).
+    /// Architectures without a recorded ceiling clear the guard.
+    pub fn set_launch_grid_limit_for_arch(&self, arch: &str) {
+        let limit = crate::launch_grid::grid_yz_limit_for_arch(arch).unwrap_or(u32::MAX);
+        self.launch_grid_yz_limit.store(limit, Ordering::Relaxed);
+    }
+
+    /// The installed `gridDim.y`/`gridDim.z` ceiling, if any.
+    pub fn launch_grid_yz_limit(&self) -> Option<u32> {
+        match self.launch_grid_yz_limit.load(Ordering::Relaxed) {
+            u32::MAX => None,
+            limit => Some(limit),
+        }
+    }
+
+    /// Fail-closed geometry check shared by the raw launch entry points and
+    /// the dispatch record/capture funnels. Never clamps; see
+    /// [`crate::launch_grid::check_launch_grid`].
+    #[inline]
+    pub fn validate_launch_grid(&self, grid: [u32; 3]) -> HipResult<()> {
+        crate::launch_grid::check_launch_grid(grid, self.launch_grid_yz_limit())
     }
 
     /// Launch a kernel on the GPU.
@@ -1902,6 +2429,7 @@ impl HipRuntime {
         stream: Option<&Stream>,
         params: &mut [*mut c_void],
     ) -> HipResult<()> {
+        self.validate_launch_grid(grid)?;
         if hip_fault_consume(1, "launch") {
             return Err(hip_fault_err("launch"));
         }
@@ -1957,6 +2485,7 @@ impl HipRuntime {
         stream: Option<&Stream>,
         kernarg_blob: &mut [u8],
     ) -> HipResult<()> {
+        self.validate_launch_grid(grid)?;
         if hip_fault_consume(1, "launch") {
             return Err(hip_fault_err("launch"));
         }
@@ -2146,6 +2675,7 @@ impl HipRuntime {
                 stream.0,
             )
         };
+        memory_effects::htod();
         self.check(code, "hipMemcpyAsync H2D")
     }
 
@@ -2165,6 +2695,7 @@ impl HipRuntime {
                 ptr::null_mut(),
             )
         };
+        memory_effects::htod();
         self.check(code, "hipMemcpyAsync H2D default stream")
     }
 
@@ -2172,7 +2703,7 @@ impl HipRuntime {
         &self,
         dst: &mut [u8],
         src: &DeviceBuffer,
-        stream: &Stream,
+        stream: Option<&Stream>,
     ) -> HipResult<()> {
         assert!(dst.len() <= src.size);
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
@@ -2184,9 +2715,10 @@ impl HipRuntime {
                 src.ptr as *const c_void,
                 dst.len(),
                 MemcpyKind::DeviceToHost as c_uint,
-                stream.0,
+                stream.map_or(ptr::null_mut(), |s| s.0),
             )
         };
+        memory_effects::dtoh();
         self.check(code, "hipMemcpyAsync D2H")
     }
 
@@ -2223,6 +2755,7 @@ impl HipRuntime {
                 stream.0,
             )
         };
+        memory_effects::dtod();
         self.check(code, "hipMemcpyAsync D2D offset")
     }
 
@@ -2259,7 +2792,89 @@ impl HipRuntime {
                 ptr::null_mut(),
             )
         };
+        memory_effects::dtod();
         self.check(code, "hipMemcpyAsync D2D offset default stream")
+    }
+
+    /// Host-asynchronous pitched D→D copy (`hipMemcpy2DAsync`) of `height`
+    /// rows of `width` bytes each, with a byte offset and a row pitch on
+    /// each side.
+    ///
+    /// Units: `*_offset`, `*_pitch` and `width` are bytes; `height` is a row
+    /// count. Row `r` copies `width` bytes from `src + src_offset +
+    /// r * src_pitch` to `dst + dst_offset + r * dst_pitch`.
+    ///
+    /// Empty copies (`width == 0` or `height == 0`) return `Ok(())` before
+    /// any pointer arithmetic, HIP call, counter or memory-effect update.
+    ///
+    /// Bounds: requires `width <= dst_pitch` and `width <= src_pitch`, and
+    /// each side's last-row span `offset + (height - 1) * pitch + width`
+    /// (not `height * pitch`) must fit in its buffer; overflow or violation
+    /// panics before HIP is invoked.
+    ///
+    /// Async/lifetime: the copy is enqueued on `stream` (`None` = legacy/null
+    /// stream) and may complete after this returns; both allocations must stay
+    /// live until it completes, and the caller owns same-device, non-overlap
+    /// and stream-ordering. This helper never synchronizes or allocates.
+    /// hipGraph capture requires an explicit `Some(stream)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn memcpy_dtod_2d_async_at(
+        &self,
+        dst: &DeviceBuffer,
+        dst_offset: usize,
+        dst_pitch: usize,
+        src: &DeviceBuffer,
+        src_offset: usize,
+        src_pitch: usize,
+        width: usize,
+        height: usize,
+        stream: Option<&Stream>,
+    ) -> HipResult<()> {
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        assert!(width <= dst_pitch, "memcpy_dtod_2d: width exceeds dst pitch");
+        assert!(width <= src_pitch, "memcpy_dtod_2d: width exceeds src pitch");
+        let dst_end = (height - 1)
+            .checked_mul(dst_pitch)
+            .and_then(|v| v.checked_add(width))
+            .and_then(|v| v.checked_add(dst_offset))
+            .expect("memcpy_dtod_2d: dst span overflows usize");
+        let src_end = (height - 1)
+            .checked_mul(src_pitch)
+            .and_then(|v| v.checked_add(width))
+            .and_then(|v| v.checked_add(src_offset))
+            .expect("memcpy_dtod_2d: src span overflows usize");
+        assert!(dst_end <= dst.size, "memcpy_dtod_2d: dst span exceeds buffer");
+        assert!(src_end <= src.size, "memcpy_dtod_2d: src span exceeds buffer");
+        // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
+        // `u8::add` stays in the same live allocation; no host deref of device memory.
+        let dst_ptr = unsafe { (dst.ptr as *mut u8).add(dst_offset) as *mut c_void };
+        // SAFETY: byte offset was bounds-checked against the DeviceBuffer size;
+        // `u8::add` stays in the same live allocation; no host deref of device memory.
+        let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
+        let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        let t = std::time::Instant::now();
+        // SAFETY: pointers are live HIP allocations; the full strided span of
+        // both sides (last row ends at offset + (height-1)*pitch + width) was
+        // asserted to fit, and width <= both pitches. Same-device/stream and
+        // allocation lifetime until completion are the caller's contract; Rust
+        // does not deref device ptrs.
+        let code = unsafe {
+            (self.fn_memcpy_2d_async)(
+                dst_ptr,
+                dst_pitch,
+                src_ptr,
+                src_pitch,
+                width,
+                height,
+                MemcpyKind::DeviceToDevice as c_uint,
+                stream_raw,
+            )
+        };
+        crate::ffi::launch_counters::memcpy_dtod::record(t.elapsed().as_nanos() as u64);
+        memory_effects::dtod();
+        self.check(code, "hipMemcpy2DAsync D2D at offset")
     }
 
     // ── Graph capture & replay ──────────────────────────────────
@@ -2283,6 +2898,18 @@ impl HipRuntime {
         let code = unsafe { (self.fn_stream_end_capture)(stream.0, &mut graph) };
         self.check(code, "hipStreamEndCapture")?;
         Ok(Graph(graph))
+    }
+
+    /// Whether `stream` is inside a `hipStreamBeginCapture` window. An
+    /// invalidated capture still counts: work issued to it is not executed.
+    pub fn stream_is_capturing(&self, stream: &Stream) -> HipResult<bool> {
+        let mut status: c_uint = 0;
+        // SAFETY: `stream` is a live opaque HIP handle owned by the wrapper;
+        // `status` is a stack out-param.
+        let code = unsafe { (self.fn_stream_is_capturing)(stream.0, &mut status) };
+        self.check(code, "hipStreamIsCapturing")?;
+        // hipStreamCaptureStatusNone = 0; Active = 1, Invalidated = 2.
+        Ok(status != 0)
     }
 
     /// Instantiate an executable graph from a captured graph.
@@ -2439,6 +3066,197 @@ impl HipRuntime {
 
 // ── Handle wrappers ─────────────────────────────────────────────
 
+/// Owned, initialized `hipHostMallocPortable` storage. Async users must finish
+/// all copies before accessing or dropping it. On an unrecoverable drain error,
+/// retain/leak the owner rather than freeing memory still used by the device.
+pub struct PinnedHostBuffer {
+    ptr: *mut c_void,
+    size: usize,
+    free: unsafe extern "C" fn(*mut c_void) -> u32,
+    _lib: Arc<Library>,
+}
+
+impl PinnedHostBuffer {
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: this owner holds size initialized bytes until Drop. The
+        // mutable borrow excludes other host access; GPU quiescence is the
+        // caller's async-copy contract.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.cast(), self.size) }
+    }
+}
+
+impl Drop for PinnedHostBuffer {
+    fn drop(&mut self) {
+        // SAFETY: unique hipHostMalloc owner; its library is still live. The
+        // caller must have drained async copies before dropping the owner.
+        let _ = unsafe { (self.free)(self.ptr) };
+    }
+}
+
+/// Pinned transfer storage whose outstanding GPU accesses survive a CPU call.
+///
+/// Host access is available only after `complete` drains the queued downloads.
+/// Uploads and following downloads on the same stream reuse the allocation
+/// without an intervening host wait. Stream changes and teardown must retire
+/// the old accesses first; a failed teardown retains the allocation.
+pub struct PinnedTransferBuffer {
+    storage: Option<PinnedHostBuffer>,
+    device: i32,
+    stream: HipStream,
+    pending: bool,
+    get_device: unsafe extern "C" fn(*mut c_int) -> u32,
+    set_device: unsafe extern "C" fn(c_int) -> u32,
+    synchronize: unsafe extern "C" fn() -> u32,
+}
+
+impl PinnedTransferBuffer {
+    pub fn size(&self) -> usize {
+        self.storage.as_ref().expect("live transfer storage").size()
+    }
+
+    pub fn device(&self) -> i32 {
+        self.device
+    }
+
+    /// The runtime must be bound to this buffer's device, and the stream and
+    /// device allocation must remain live until their queued work completes.
+    pub fn download_async(
+        &mut self,
+        hip: &HipRuntime,
+        src: &DeviceBuffer,
+        offset: usize,
+        size: usize,
+        stream: Option<&Stream>,
+    ) -> HipResult<()> {
+        self.check_span(offset, size)?;
+        if size > src.size() {
+            return Err(HipError::new(0, "pinned download exceeds device buffer"));
+        }
+        self.begin(hip, stream)?;
+        let storage = self.storage.as_ref().expect("live transfer storage");
+        // SAFETY: checked allocation extent; no host reference exists while
+        // pending. Same-stream copies order prior upload reads before these
+        // writes, and the owner drains before host reuse/free.
+        let code = unsafe {
+            (hip.fn_memcpy_async)(
+                storage.ptr.cast::<u8>().add(offset).cast(),
+                src.ptr,
+                size,
+                MemcpyKind::DeviceToHost as c_uint,
+                self.stream,
+            )
+        };
+        memory_effects::dtoh();
+        hip.check(code, "hipMemcpyAsync pinned D2H")
+    }
+
+    /// Enqueue a return from owned storage, not a caller's temporary slice.
+    /// The runtime, stream and destination obey `download_async`'s contract.
+    pub fn upload_async(
+        &mut self,
+        hip: &HipRuntime,
+        dst: &DeviceBuffer,
+        offset: usize,
+        size: usize,
+        stream: Option<&Stream>,
+    ) -> HipResult<()> {
+        self.check_span(offset, size)?;
+        if size > dst.size() {
+            return Err(HipError::new(0, "pinned upload exceeds device buffer"));
+        }
+        if hip_fault_consume(0, "upload") {
+            return Err(hip_fault_err("upload"));
+        }
+        self.begin(hip, stream)?;
+        let storage = self.storage.as_ref().expect("live transfer storage");
+        // SAFETY: checked source extent, and no host access is allowed until
+        // complete drains the stream. The pinned owner survives this enqueue.
+        let code = unsafe {
+            (hip.fn_memcpy_async)(
+                dst.ptr,
+                storage.ptr.cast::<u8>().add(offset).cast(),
+                size,
+                MemcpyKind::HostToDevice as c_uint,
+                self.stream,
+            )
+        };
+        memory_effects::htod();
+        hip.check(code, "hipMemcpyAsync pinned H2D")
+    }
+
+    /// Complete the caller's existing D2H readiness boundary.
+    pub fn complete(&mut self, hip: &HipRuntime) -> HipResult<()> {
+        if self.pending {
+            if self.stream.is_null() {
+                hip.stream_synchronize_default()?;
+            } else {
+                hip.stream_synchronize(&Stream(self.stream))?;
+            }
+            self.pending = false;
+        }
+        Ok(())
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        assert!(!self.pending, "host access before pinned transfer completion");
+        self.storage.as_mut().expect("live transfer storage").as_bytes_mut()
+    }
+
+    fn check_span(&self, offset: usize, size: usize) -> HipResult<()> {
+        if offset.checked_add(size).is_none_or(|end| end > self.size()) {
+            return Err(HipError::new(0, "pinned transfer extent exceeds storage"));
+        }
+        Ok(())
+    }
+
+    fn begin(&mut self, hip: &HipRuntime, stream: Option<&Stream>) -> HipResult<()> {
+        let raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        if self.pending && self.stream != raw {
+            // The old stream may have been destroyed already. Drain the owning
+            // device, not a potentially stale handle, on this rare transition.
+            hip.device_synchronize()?;
+            self.pending = false;
+        }
+        self.stream = raw;
+        // Mark before submission: even a failed API call must not release or
+        // expose storage while an earlier copy might still be using it.
+        self.pending = true;
+        Ok(())
+    }
+}
+
+impl Drop for PinnedTransferBuffer {
+    fn drop(&mut self) {
+        if !self.pending {
+            return;
+        }
+        let mut previous = 0;
+        // SAFETY: the pinned owner keeps the function-pointer library live.
+        // Bind its device before draining; restore the caller's device so
+        // cached thread binding remains valid outside this destructor.
+        let drained = unsafe {
+            if (self.get_device)(&mut previous) != HIP_SUCCESS {
+                false
+            } else if (self.set_device)(self.device) != HIP_SUCCESS {
+                false
+            } else {
+                let code = (self.synchronize)();
+                let restored = (self.set_device)(previous);
+                code == HIP_SUCCESS && restored == HIP_SUCCESS
+            }
+        };
+        if !drained {
+            // Retain both allocation and library rather than freeing memory
+            // that the device may still access after a failed drain.
+            std::mem::forget(self.storage.take());
+        }
+    }
+}
+
 /// GPU stream handle.
 pub struct Stream(HipStream);
 impl Stream {
@@ -2490,3 +3308,39 @@ pub struct GraphExec(HipGraphExec);
 // between threads is fine; it is not Sync. Concurrent use needs
 // external stream synchronization; destroy only when idle.
 unsafe impl Send for GraphExec {}
+
+#[cfg(test)]
+mod pageable_copy_staging_tests {
+    use super::{pageable_copy_staging, PageableCopyStaging};
+    use std::ffi::OsStr;
+
+    fn decide(opt_out: Option<&str>, preset: Option<&str>) -> PageableCopyStaging {
+        pageable_copy_staging(opt_out.map(OsStr::new), preset.map(OsStr::new))
+    }
+
+    #[test]
+    fn both_unset_arms_the_default() {
+        assert_eq!(decide(None, None), PageableCopyStaging::Arm);
+    }
+
+    #[test]
+    fn opt_out_zero_leaves_the_switch_unset() {
+        assert_eq!(decide(Some("0"), None), PageableCopyStaging::OptedOut);
+    }
+
+    #[test]
+    fn any_other_opt_out_value_still_arms() {
+        for value in ["1", "", "00", "false", " 0", "0 "] {
+            assert_eq!(decide(Some(value), None), PageableCopyStaging::Arm, "opt-out {value:?}");
+        }
+    }
+
+    #[test]
+    fn a_preset_switch_is_always_respected() {
+        for preset in ["0", "100000", "64", ""] {
+            assert_eq!(decide(None, Some(preset)), PageableCopyStaging::Preset, "preset {preset:?}");
+            assert_eq!(decide(Some("0"), Some(preset)), PageableCopyStaging::Preset, "preset {preset:?} with opt-out");
+            assert_eq!(decide(Some("1"), Some(preset)), PageableCopyStaging::Preset, "preset {preset:?} with =1");
+        }
+    }
+}

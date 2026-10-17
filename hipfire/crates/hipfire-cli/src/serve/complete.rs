@@ -10,7 +10,9 @@
 //! transformations that convert daemon events into OpenAI responses.
 
 use crate::serve::http::request_id;
-use crate::serve::{Admission, AdmissionGuard, ModelOrigin, ServeMeta, ServeShared};
+use crate::serve::{
+    bail_invalid, invalid_request, Admission, AdmissionGuard, ModelOrigin, ServeMeta, ServeShared,
+};
 use crate::{
     apply_http_reasoning_request, config_bool, config_string, config_u64, insert_optional_f64,
     insert_optional_u64, request_f64, request_string, request_u64, unix_timestamp,
@@ -302,16 +304,109 @@ fn json_kind(value: &serde_json::Value) -> &'static str {
     }
 }
 
-fn schema_expects(schema: &serde_json::Value, ty: &str) -> bool {
-    if let Some(t) = schema.get("type").and_then(|v| v.as_str()) {
-        return t == ty;
+/// Declared JSON-schema types of one parameter, in declaration order, read the
+/// way vLLM's `JsonParamType::from_schema` does: `type` (string or array), else
+/// the members of `anyOf`/`oneOf`, else `enum` (string; nullable when it lists
+/// `null`), `items` (array), `properties`/`additionalProperties` (object).
+/// Empty when the schema declares no known type.
+fn schema_types(schema: &serde_json::Value) -> Vec<&'static str> {
+    const KNOWN: [&str; 7] = [
+        "string", "integer", "number", "boolean", "object", "array", "null",
+    ];
+    let known = |name: &str| KNOWN.into_iter().find(|k| *k == name);
+    let mut types = Vec::new();
+    match schema.get("type") {
+        Some(serde_json::Value::String(name)) => types.extend(known(name)),
+        Some(serde_json::Value::Array(names)) => types.extend(
+            names
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(known),
+        ),
+        Some(_) => {}
+        None => {
+            if let Some(members) = schema
+                .get("anyOf")
+                .or_else(|| schema.get("oneOf"))
+                .and_then(serde_json::Value::as_array)
+            {
+                for ty in members.iter().flat_map(schema_types) {
+                    if !types.contains(&ty) {
+                        types.push(ty);
+                    }
+                }
+            } else if let Some(values) = schema.get("enum").and_then(serde_json::Value::as_array) {
+                types.push("string");
+                if values.iter().any(serde_json::Value::is_null) {
+                    types.push("null");
+                }
+            } else if schema.get("items").is_some() {
+                types.push("array");
+            } else if schema.get("properties").is_some()
+                || schema.get("additionalProperties").is_some()
+            {
+                types.push("object");
+            }
+        }
     }
-    if let Some(arr) = schema.get("type").and_then(|v| v.as_array()) {
-        return arr.iter().any(|v| v.as_str() == Some(ty));
-    }
-    false
+    types
 }
 
+/// Type one string argument by its declared types (vLLM
+/// `convert_with_optional_schema`): a `null`/`None` literal becomes JSON null
+/// unless the parameter is a plain `string`; otherwise the first declared type
+/// the text converts to wins, and reaching `string` first keeps the text
+/// verbatim. `None` means keep the string exactly as the model wrote it.
+fn type_string_arg(text: &str, types: &[&str]) -> Option<serde_json::Value> {
+    if types.is_empty() {
+        return None;
+    }
+    if types != ["string"]
+        && (text.eq_ignore_ascii_case("null") || text.eq_ignore_ascii_case("none"))
+    {
+        return Some(serde_json::Value::Null);
+    }
+    for ty in types {
+        let typed = match *ty {
+            "string" => return None,
+            "integer" => text.parse::<i64>().ok().map(serde_json::Value::from),
+            "number" => text
+                .parse::<i64>()
+                .ok()
+                .map(serde_json::Value::from)
+                .or_else(|| {
+                    text.parse::<f64>()
+                        .ok()
+                        .and_then(serde_json::Number::from_f64)
+                        .map(serde_json::Value::Number)
+                }),
+            "boolean" => match text.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" => Some(serde_json::Value::Bool(true)),
+                "false" | "0" => Some(serde_json::Value::Bool(false)),
+                _ => None,
+            },
+            "object" if text.is_empty() => Some(serde_json::Value::Object(Default::default())),
+            "array" if text.is_empty() => Some(serde_json::Value::Array(Vec::new())),
+            "object" => serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .filter(serde_json::Value::is_object),
+            "array" => serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .filter(serde_json::Value::is_array),
+            _ => None,
+        };
+        if typed.is_some() {
+            return typed;
+        }
+    }
+    None
+}
+
+/// Type tool-call arguments by the request's declared schema. Strings (every
+/// native-XML parameter arrives as one) are typed per [`type_string_arg`], so a
+/// `string` parameter keeps the exact text even when it looks like JSON. A
+/// structured value in a slot that accepts only `string` (a JSON-format model
+/// emitting an object for a string field) is serialized to its JSON text.
 fn normalize_value(
     value: &mut serde_json::Value,
     schema: &serde_json::Value,
@@ -319,79 +414,36 @@ fn normalize_value(
     path: &str,
 ) {
     let before_kind = json_kind(value);
-    let mut repaired = false;
-    let mut expected = String::new();
-    match value {
-        serde_json::Value::String(s) => {
-            let owned = s.clone();
-            if schema_expects(schema, "boolean") {
-                let lower = owned.to_ascii_lowercase();
-                if lower == "true" || lower == "false" {
-                    let new_val = serde_json::Value::Bool(lower == "true");
-                    expected = "boolean".to_owned();
-                    *value = new_val;
-                    repaired = true;
-                }
-            } else if schema_expects(schema, "integer") {
-                if let Ok(n) = owned.parse::<i64>() {
-                    // Ensure the whole string was an integer (parse succeeded implies that,
-                    // but reject strings with whitespace which parse would fail anyway).
-                    expected = "integer".to_owned();
-                    *value = serde_json::Value::Number(serde_json::Number::from(n));
-                    repaired = true;
-                }
-            } else if schema_expects(schema, "number") {
-                if let Ok(n) = owned.parse::<i64>() {
-                    expected = "number".to_owned();
-                    *value = serde_json::Value::Number(serde_json::Number::from(n));
-                    repaired = true;
-                } else if let Ok(f) = owned.parse::<f64>() {
-                    if f.is_finite() {
-                        if let Some(num) = serde_json::Number::from_f64(f) {
-                            expected = "number".to_owned();
-                            *value = serde_json::Value::Number(num);
-                            repaired = true;
-                        }
-                    }
-                }
-            } else if schema_expects(schema, "object") {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&owned) {
-                    if parsed.is_object() {
-                        expected = "object".to_owned();
-                        *value = parsed;
-                        repaired = true;
-                    }
-                }
-            } else if schema_expects(schema, "array") {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&owned) {
-                    if parsed.is_array() {
-                        expected = "array".to_owned();
-                        *value = parsed;
-                        repaired = true;
-                    }
-                }
-            }
-        }
+    let types = schema_types(schema);
+    let repaired = match value {
+        serde_json::Value::String(s) => type_string_arg(s, &types),
         serde_json::Value::Bool(_)
         | serde_json::Value::Number(_)
         | serde_json::Value::Object(_)
         | serde_json::Value::Array(_) => {
-            if schema_expects(schema, "string") {
-                if let Ok(s) = serde_json::to_string(&*value) {
-                    expected = "string".to_owned();
-                    *value = serde_json::Value::String(s);
-                    repaired = true;
+            let accepts_own = match value {
+                serde_json::Value::Number(n) if n.is_i64() || n.is_u64() => {
+                    types.contains(&"integer") || types.contains(&"number")
                 }
+                _ => types.contains(&before_kind),
+            };
+            if types.contains(&"string") && !accepts_own {
+                serde_json::to_string(&*value)
+                    .ok()
+                    .map(serde_json::Value::String)
+            } else {
+                None
             }
         }
-        serde_json::Value::Null => {}
-    }
-    if repaired {
+        serde_json::Value::Null => None,
+    };
+    if let Some(new_value) = repaired {
+        *value = new_value;
         let after_kind = json_kind(value);
         let display_path = if path.is_empty() { "<root>" } else { path };
         eprintln!(
             "[hipfire] tool_args_normalize tool={} path={} expected={} {}->{}",
-            tool_name, display_path, expected, before_kind, after_kind
+            tool_name, display_path, after_kind, before_kind, after_kind
         );
     }
     match value {
@@ -515,20 +567,20 @@ fn parse_tool_choice_policy(
             "none" => Ok(ToolChoicePolicy::None),
             "required" => {
                 if !has_tools {
-                    bail!("tool_choice \"required\" requires a non-empty tools array");
+                    bail_invalid!("tool_choice \"required\" requires a non-empty tools array");
                 }
                 Ok(ToolChoicePolicy::Required)
             }
-            other => bail!("unsupported tool_choice value: {other}"),
+            other => bail_invalid!("unsupported tool_choice value: {other}"),
         };
     }
     let Some(obj) = choice.as_object() else {
-        bail!("tool_choice must be a string, null, or function object");
+        bail_invalid!("tool_choice must be a string, null, or function object");
     };
     match obj.get("type").and_then(serde_json::Value::as_str) {
         Some("function") => {}
-        Some(other) => bail!("tool_choice object type must be \"function\", got {other}"),
-        None => bail!("tool_choice object requires type \"function\""),
+        Some(other) => bail_invalid!("tool_choice object type must be \"function\", got {other}"),
+        None => bail_invalid!("tool_choice object requires type \"function\""),
     }
     let name = obj
         .get("function")
@@ -536,16 +588,16 @@ fn parse_tool_choice_policy(
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|n| !n.is_empty())
-        .ok_or_else(|| anyhow!("tool_choice function object requires function.name"))?;
+        .ok_or_else(|| invalid_request!("tool_choice function object requires function.name"))?;
     if !has_tools {
-        bail!("tool_choice specific function requires a non-empty tools array");
+        bail_invalid!("tool_choice specific function requires a non-empty tools array");
     }
     let present = tools_arr
         .expect("has_tools")
         .iter()
         .any(|tool| tool_schema_name(tool) == Some(name));
     if !present {
-        bail!("tool_choice function `{name}` is not present in tools");
+        bail_invalid!("tool_choice function `{name}` is not present in tools");
     }
     Ok(ToolChoicePolicy::Function(name.to_owned()))
 }
@@ -673,6 +725,21 @@ pub(crate) fn finalize_tool_calls_for_choice(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EndpointAdapterKind {
     OpenAiChatCompletions,
+    /// `/v1/messages`: lowered onto chat completions (`serve::anthropic`).
+    AnthropicMessages,
+    /// `/v1/responses`: lowered onto chat completions (`serve::responses`).
+    OpenAiResponses,
+}
+
+impl EndpointAdapterKind {
+    /// The HTTP path this adapter serves.
+    pub(crate) fn endpoint(self) -> &'static str {
+        match self {
+            Self::OpenAiChatCompletions => "/v1/chat/completions",
+            Self::AnthropicMessages => "/v1/messages",
+            Self::OpenAiResponses => "/v1/responses",
+        }
+    }
 }
 
 /// Capability status of an endpoint adapter for non-empty tools requests.
@@ -739,6 +806,11 @@ impl EndpointAdapterRegistry {
         match kind {
             // OpenAI chat completions lowering is present and lossless for ToolCall.
             EndpointAdapterKind::OpenAiChatCompletions => EndpointAdapterStatus::AvailableLossless,
+            // Messages `tool_use` / Responses `function_call` carry the same
+            // canonical ToolCall (id, name, JSON arguments) both ways.
+            EndpointAdapterKind::AnthropicMessages | EndpointAdapterKind::OpenAiResponses => {
+                EndpointAdapterStatus::AvailableLossless
+            }
         }
     }
 }
@@ -747,10 +819,12 @@ pub(crate) fn endpoint_adapter_status(kind: EndpointAdapterKind) -> EndpointAdap
     EndpointAdapterRegistry::status(kind)
 }
 
-/// Gate `/v1/chat/completions` when the request carries a non-empty `tools` array.
-/// Tool-free requests are unchanged. Adapter availability never overrides producer safety.
-pub(crate) fn gate_chat_completions_tools(
+/// Gate a generation endpoint when its lowered chat body carries a non-empty
+/// `tools` array. Tool-free requests are unchanged. Adapter availability never
+/// overrides producer safety.
+pub(crate) fn gate_endpoint_tools(
     body: &serde_json::Value,
+    kind: EndpointAdapterKind,
 ) -> Result<(), EndpointAdapterError> {
     let has_tools = body
         .get("tools")
@@ -781,13 +855,13 @@ pub(crate) fn gate_chat_completions_tools(
             });
         }
     }
-    match endpoint_adapter_status(EndpointAdapterKind::OpenAiChatCompletions) {
+    match endpoint_adapter_status(kind) {
         EndpointAdapterStatus::AvailableLossless => Ok(()),
         EndpointAdapterStatus::Unavailable => Err(EndpointAdapterError::Unavailable {
-            endpoint: "/v1/chat/completions",
+            endpoint: kind.endpoint(),
         }),
         EndpointAdapterStatus::Lossy => Err(EndpointAdapterError::Lossy {
-            endpoint: "/v1/chat/completions",
+            endpoint: kind.endpoint(),
         }),
     }
 }
@@ -1631,18 +1705,19 @@ pub(crate) struct RequestContract {
     /// after the prompt (wire `max_tokens_fit`).
     pub max_tokens_fit: bool,
     pub messages: serde_json::Value,
-    /// Normalized/default-system-projected messages before tool-choice prompt
-    /// instructions are added.  Slot ownership uses this stable view so a
-    /// normal tool-result request may change `tool_choice` without changing
-    /// conversation identity.
-    pub conversation_messages: serde_json::Value,
+    /// Multi-slot only: normalized/default-system-projected messages before
+    /// tool-choice prompt instructions are added. Slot ownership uses this
+    /// stable view so a normal tool-result request may change `tool_choice`
+    /// without changing conversation identity.
+    pub conversation_messages: Option<serde_json::Value>,
     pub tool_choice_policy: ToolChoicePolicy,
     pub forwarded_tools: Option<serde_json::Value>,
-    /// Validated `response_format` (spec §7 G1). `None` when the request
-    /// carries no `response_format` or it is `json_object` (which the
-    /// non-slot path already handles via tool-call grammar). A `json_schema`
-    /// value is parsed, validated against the supported subset, and forwarded
-    /// to the daemon so the slot engine can apply pre-sampling grammar masks.
+    /// Validated `response_format` (spec §7 G1), multi-slot route only. A
+    /// `json_schema` value is parsed, validated against the supported subset,
+    /// and forwarded to the daemon so the slot engine can apply pre-sampling
+    /// grammar masks (`json_object` is refused there). On the standard route
+    /// this is always `None`: `response_format` is neither validated nor
+    /// forwarded, so it is not enforced.
     pub response_format: Option<ResponseFormat>,
 }
 
@@ -1662,28 +1737,15 @@ pub(crate) struct ResponseFormat {
     pub name: Option<String>,
 }
 
-/// Architectures that surface reasoning content in multi-turn message history
-/// (`muse_glimmer` and Qwen3.5/3.6-family arches).
+/// Whether the loaded architecture surfaces reasoning content in multi-turn
+/// message history ([`saddle_core::caps::arch_replays_history_reasoning`]).
 /// Single source of truth for daemon request projection.
 pub(crate) fn include_reasoning_content(arch: Option<&str>) -> bool {
-    let Some(arch) = arch else {
-        return false;
-    };
-    if arch == "muse_glimmer" {
-        return true;
-    }
-    let lower = arch.to_ascii_lowercase();
-    lower == "qwen35"
-        || lower == "qwen35-vl"
-        || lower.starts_with("qwen35")
-        || lower.starts_with("qwen36")
-        || lower.starts_with("qwen3_5")
-        || lower.starts_with("qwen3_6")
-        || lower.contains("qwen3.5")
-        || lower.contains("qwen3.6")
-        || lower.contains("qwen3_5")
-        || lower.contains("qwen3_6")
+    arch.is_some_and(saddle_core::caps::arch_replays_history_reasoning)
 }
+
+/// Largest `max_tokens` a chat request may ask for.
+pub(crate) const MAX_TOKENS_CEILING: u64 = 393_216;
 
 /// Project the HTTP body into the typed request contract. `multi_slot` is the
 /// route: the multi-slot engine adds its field refusals and sampling-range
@@ -1703,16 +1765,17 @@ pub(crate) fn project_request_contract(
         Some(max_tokens) => max_tokens,
         None => config_u64(resolved, "generation.max_tokens")?,
     };
-    if max_tokens == 0 || max_tokens > 393_216 {
-        bail!("max_tokens must be between 1 and 393216");
+    if max_tokens == 0 || max_tokens > MAX_TOKENS_CEILING {
+        bail_invalid!("max_tokens must be between 1 and 393216");
     }
+    validate_single_choice(body)?;
     if multi_slot {
         validate_multi_slot_request_fields(body)?;
     }
     let mut messages = normalize_openai_messages(body.get("messages"), include_reasoning);
     let default_system = request_string(resolved, "prompt.system", None)?;
     inject_default_system_message(&mut messages, default_system.as_deref());
-    let conversation_messages = messages.clone();
+    let conversation_messages = multi_slot.then(|| messages.clone());
     let (tool_choice_policy, forwarded_tools) =
         project_tool_choice(body.get("tool_choice"), body.get("tools"), &mut messages)?;
     let response_format = if multi_slot {
@@ -1731,6 +1794,19 @@ pub(crate) fn project_request_contract(
     })
 }
 
+/// Every serve route returns one completion per request: `n` other than 1
+/// is refused rather than silently answered with a single choice.
+fn validate_single_choice(body: &serde_json::Value) -> Result<()> {
+    if let Some(n) = body.get("n").filter(|n| !n.is_null()) {
+        if n.as_u64() != Some(1) {
+            bail_invalid!(
+                "n != 1 is not supported on this serve route (one completion per request)"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Multi-slot request-field checks. Unsupported OpenAI request fields must be
 /// refused, never silently dropped. The daemon's `validate_generate_caps` has
 /// typed refusals for exactly these, but this gateway builds the generate
@@ -1743,19 +1819,14 @@ fn validate_multi_slot_request_fields(body: &serde_json::Value) -> Result<()> {
     for field in ["max_tokens", "max_completion_tokens"] {
         if let Some(value) = body.get(field).filter(|v| !v.is_null()) {
             if value.as_u64().is_none() {
-                bail!("max_tokens must be an integer between 1 and 393216");
+                bail_invalid!("max_tokens must be an integer between 1 and 393216");
             }
-        }
-    }
-    if let Some(n) = body.get("n") {
-        if n.as_u64() != Some(1) {
-            bail!("n != 1 is not supported on this serve route (one completion per request)");
         }
     }
     for field in ["best_of", "logit_bias", "echo", "suffix"] {
         if let Some(v) = body.get(field) {
             if !v.is_null() {
-                bail!("{field} is not supported on this serve route");
+                bail_invalid!("{field} is not supported on this serve route");
             }
         }
     }
@@ -1764,9 +1835,9 @@ fn validate_multi_slot_request_fields(body: &serde_json::Value) -> Result<()> {
             let number = value
                 .as_f64()
                 .filter(|v| v.is_finite())
-                .ok_or_else(|| anyhow!("{field} must be a finite number"))?;
+                .ok_or_else(|| invalid_request!("{field} must be a finite number"))?;
             if number < min || number > max || field == "top_p" && number == 0.0 {
-                bail!(
+                bail_invalid!(
                     "{field} must be within {}",
                     if field == "top_p" { "(0, 1]" } else { "[0, 2]" }
                 );
@@ -1776,7 +1847,7 @@ fn validate_multi_slot_request_fields(body: &serde_json::Value) -> Result<()> {
     if let Some(value) = body.get("repeat_window").filter(|v| !v.is_null()) {
         match value.as_u64() {
             Some(v) if v <= 2048 => {}
-            _ => bail!("repeat_window must be an integer between 0 and 2048"),
+            _ => bail_invalid!("repeat_window must be an integer between 0 and 2048"),
         }
     }
     // Token penalties + min_p + top_k: the daemon's slot sampler honors
@@ -1794,16 +1865,16 @@ fn validate_multi_slot_request_fields(body: &serde_json::Value) -> Result<()> {
             let number = value
                 .as_f64()
                 .filter(|v| v.is_finite())
-                .ok_or_else(|| anyhow!("{field} must be a finite number"))?;
+                .ok_or_else(|| invalid_request!("{field} must be a finite number"))?;
             if number < min || number > max {
-                bail!("{field} must be within [{min}, {max}]");
+                bail_invalid!("{field} must be within [{min}, {max}]");
             }
         }
     }
     if let Some(value) = body.get("top_k").filter(|v| !v.is_null()) {
         match value.as_u64() {
             Some(v) if v >= 1 => {}
-            _ => bail!("top_k must be a positive integer"),
+            _ => bail_invalid!("top_k must be a positive integer"),
         }
     }
     if let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) {
@@ -1811,7 +1882,7 @@ fn validate_multi_slot_request_fields(body: &serde_json::Value) -> Result<()> {
             let role = message
                 .get("role")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow!("each message must have a string role"))?;
+                .ok_or_else(|| invalid_request!("each message must have a string role"))?;
             if !matches!(
                 role,
                 "developer"
@@ -1822,7 +1893,7 @@ fn validate_multi_slot_request_fields(body: &serde_json::Value) -> Result<()> {
                     | "toolResult"
                     | "tool_result"
             ) {
-                bail!("unknown message role: {role}");
+                bail_invalid!("unknown message role: {role}");
             }
         }
     }
@@ -1837,7 +1908,7 @@ fn validate_multi_slot_request_fields(body: &serde_json::Value) -> Result<()> {
 ///   validates the schema against the supported strict subset and returns
 ///   a [`ResponseFormat``.
 ///
-/// Rejects (HTTP 400 via `bail!`):
+/// Rejects (HTTP 400 via `bail_invalid!`):
 /// - `{"type": "json_object"}`: the multi-slot serve route has no
 ///   json_object enforcement — silently dropping the requested constraint
 ///   and returning 200 would be exactly the "silent semantic downgrade"
@@ -1860,10 +1931,10 @@ pub(crate) fn validate_response_format(
     let ty = value
         .get("type")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("response_format.type is required"))?;
+        .ok_or_else(|| invalid_request!("response_format.type is required"))?;
     match ty {
         "json_object" => {
-            bail!(
+            bail_invalid!(
                 "response_format type 'json_object' is not supported on this \
                  serve route (no enforcement exists; only json_schema strict \
                  output is supported)"
@@ -1872,15 +1943,15 @@ pub(crate) fn validate_response_format(
         "json_schema" => {
             let js = value
                 .get("json_schema")
-                .ok_or_else(|| anyhow!("response_format.json_schema is required"))?;
+                .ok_or_else(|| invalid_request!("response_format.json_schema is required"))?;
             if !js.is_object() {
-                bail!("response_format.json_schema must be an object");
+                bail_invalid!("response_format.json_schema must be an object");
             }
-            let schema = js
-                .get("schema")
-                .ok_or_else(|| anyhow!("response_format.json_schema.schema is required"))?;
+            let schema = js.get("schema").ok_or_else(|| {
+                invalid_request!("response_format.json_schema.schema is required")
+            })?;
             if !schema.is_object() {
-                bail!("response_format.json_schema.schema must be an object");
+                bail_invalid!("response_format.json_schema.schema must be an object");
             }
             // Validate the schema against the supported strict subset (spec
             // §7.1 G1). Reject unsupported keywords before generation so no
@@ -1903,7 +1974,7 @@ pub(crate) fn validate_response_format(
             Ok(None)
         }
         other => {
-            bail!("response_format.type '{other}' is not supported");
+            bail_invalid!("response_format.type '{other}' is not supported");
         }
     }
 }
@@ -1978,14 +2049,14 @@ const REJECTED_ASSERTION_KEYWORDS: &[&str] = &[
 /// different constraints server-side.
 fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result<()> {
     if !schema.is_object() {
-        bail!("schema at {path} must be an object");
+        bail_invalid!("schema at {path} must be an object");
     }
     let obj = schema.as_object().unwrap();
 
     // Check for rejected keywords first.
     for &kw in REJECTED_ASSERTION_KEYWORDS {
         if obj.contains_key(kw) {
-            bail!(
+            bail_invalid!(
                 "unsupported JSON Schema keyword '{kw}' at {path} \
                  (strict subset does not allow this assertion)"
             );
@@ -2016,7 +2087,7 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
     ];
     for key in obj.keys() {
         if !KNOWN_KEYWORDS.contains(&key.as_str()) {
-            bail!(
+            bail_invalid!(
                 "unsupported JSON Schema keyword '{key}' at {path} \
                  (strict subset default-deny: not in the compiler's allowlist)"
             );
@@ -2028,23 +2099,23 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
     // pre-flighted schema die at admit). Match the compiler's refusals.
     if let Some(v) = obj.get("enum") {
         if !v.is_array() {
-            bail!("enum at {path} must be an array");
+            bail_invalid!("enum at {path} must be an array");
         }
     }
     if let Some(v) = obj.get("properties") {
         if !v.is_object() {
-            bail!("properties at {path} must be an object");
+            bail_invalid!("properties at {path} must be an object");
         }
     }
     if let Some(v) = obj.get("required") {
         if !v.is_array() {
-            bail!("required at {path} must be an array of strings");
+            bail_invalid!("required at {path} must be an array of strings");
         }
     }
     for kw in ["minItems", "maxItems"] {
         if let Some(v) = obj.get(kw) {
             if v.as_u64().is_none() {
-                bail!("{kw} at {path} must be a non-negative integer");
+                bail_invalid!("{kw} at {path} must be a non-negative integer");
             }
         }
     }
@@ -2057,13 +2128,13 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
         match tv.as_str() {
             Some(ty) => {
                 if !SUPPORTED_TYPE_VALUES.contains(&ty) {
-                    bail!(
+                    bail_invalid!(
                         "unsupported JSON Schema type '{ty}' at {path} \
                          (supported: {SUPPORTED_TYPE_VALUES:?})"
                     );
                 }
             }
-            None => bail!(
+            None => bail_invalid!(
                 "unsupported JSON Schema 'type' at {path}: union/array forms \
                  are outside the strict subset"
             ),
@@ -2074,7 +2145,7 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
     // `enum` must be a non-empty array; `const` can be any value.
     if let Some(arr) = obj.get("enum").and_then(|v| v.as_array()) {
         if arr.is_empty() {
-            bail!("enum at {path} must be a non-empty array");
+            bail_invalid!("enum at {path} must be a non-empty array");
         }
     }
 
@@ -2089,7 +2160,7 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
         // AND in the compiler — it used to be accepted by this validator
         // while the compiler silently flattened it to `true`.
         if !ap.is_boolean() {
-            bail!(
+            bail_invalid!(
                 "additionalProperties at {path} must be a boolean (schema form \
                  is outside the strict subset)"
             );
@@ -2098,7 +2169,7 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
     if let Some(req) = obj.get("required").and_then(|v| v.as_array()) {
         for item in req {
             if !item.is_string() {
-                bail!("required at {path} must be an array of strings");
+                bail_invalid!("required at {path} must be an array of strings");
             }
         }
     }
@@ -2111,13 +2182,13 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
         if items.is_object() {
             validate_json_schema_subset(items, &format!("{path}.items"))?;
         } else {
-            bail!("items at {path} must be a schema object (boolean form is outside the supported subset)");
+            bail_invalid!("items at {path} must be a schema object (boolean form is outside the supported subset)");
         }
     }
     if let Some(n) = obj.get("minItems").and_then(|v| v.as_u64()) {
         if let Some(max) = obj.get("maxItems").and_then(|v| v.as_u64()) {
             if n > max {
-                bail!("minItems ({n}) > maxItems ({max}) at {path}: contradictory schema");
+                bail_invalid!("minItems ({n}) > maxItems ({max}) at {path}: contradictory schema");
             }
         }
     }
@@ -2159,8 +2230,14 @@ pub(crate) fn complete_request_attempt(
 
     // Latch retry-disabling observations on every event bound for the client.
     let mut event_callback = |event: &serde_json::Value| {
+        // A reasoning token is a generated token. Counting only `token` made
+        // TTFT on a thinking model the time to the first answer token, and TPOT
+        // would spread only the answer span over all of `done.tokens`.
         if first_token_at.get().is_none()
-            && event.get("type").and_then(serde_json::Value::as_str) == Some("token")
+            && matches!(
+                event.get("type").and_then(serde_json::Value::as_str),
+                Some("token" | "reasoning")
+            )
         {
             first_token_at.set(Some(attempt_started.elapsed()));
         }
@@ -2170,7 +2247,7 @@ pub(crate) fn complete_request_attempt(
     let model = body
         .get("model")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow!("model is required"))?
+        .ok_or_else(|| invalid_request!("model is required"))?
         .to_owned();
     let image_base64 = request_image_base64(body.get("messages"))?;
     // Acquire runtime, ensure model, and build the generate request while
@@ -2212,7 +2289,7 @@ pub(crate) fn complete_request_attempt(
             runtime.current_max_seq
         };
         if !contract.max_tokens_fit && context > 0 && max_tokens >= context {
-            bail!(
+            bail_invalid!(
                 "max_tokens={max_tokens} does not fit the loaded context window of {context} \
                  tokens, which the prompt shares; lower max_tokens, or omit it to use the room \
                  left after the prompt"
@@ -2226,7 +2303,7 @@ pub(crate) fn complete_request_attempt(
         let response_format = contract.response_format;
         let mut generate = serde_json::json!({
             "type": "generate",
-            "id": request_id(),
+            "id": identity.0.clone(),
             "prompt": last_user_prompt(&normalized_messages).unwrap_or_else(|| "Hello".into()),
             "messages": normalized_messages,
             "max_tokens": max_tokens,
@@ -2326,15 +2403,12 @@ pub(crate) fn complete_request_attempt(
             effort_native,
             &supported_efforts,
         )?;
-        let (id, created) = identity.clone();
-        generate["id"] = serde_json::Value::String(id.clone());
-        generate["attempt_id"] = serde_json::json!(attempt_id);
         if guard.is_eligible && !runtime.multi_slot_enabled {
             generate["serve_continuous_batch"] = serde_json::Value::Bool(true);
         }
         if runtime.multi_slot_enabled {
             generate["experimental_multi_slot"] = serde_json::Value::Bool(true);
-            generate["conversation_messages"] = conversation_messages;
+            generate["conversation_messages"] = conversation_messages.unwrap_or_default();
             // The gateway has already validated and projected the raw OpenAI
             // choice. Carry only that typed decision across the slot wire;
             // the daemon must never reinterpret the original HTTP body.
@@ -2350,12 +2424,7 @@ pub(crate) fn complete_request_attempt(
             // Re-check the fully projected wire request, not only the raw HTTP
             // body: registry/config defaults may have inserted a
             // reasoning control the slot sampler cannot honor.
-            if let Err(reason) = multi_slot_request_supported(&generate) {
-                bail!(
-                    "{}experimental multi-slot does not support this request: {reason}",
-                    crate::serve::REQUEST_VALIDATION_TAG
-                );
-            }
+            require_multi_slot_support(&generate)?;
         }
         let engine_clone = runtime.engine.clone();
         (
@@ -2380,7 +2449,8 @@ pub(crate) fn complete_request_attempt(
     let mut legacy_reasoning = String::new();
     let mut legacy_tool_calls: Vec<ToolCall> = Vec::new();
     let mut legacy_done: Option<serde_json::Value> = None;
-    let mut terminal_delivered = false;
+    // The completion delivered at commit_ready; it is the attempt's result.
+    let mut committed: Option<Completion> = None;
     let preserve_thinking = body
         .pointer("/chat_template_kwargs/preserve_thinking")
         .and_then(serde_json::Value::as_bool)
@@ -2402,7 +2472,7 @@ pub(crate) fn complete_request_attempt(
         // Fold/validate a type=done clone and deliver HTTP terminal before Ok.
         if event_type == Some("commit_ready") {
             latches.borrow_mut().commit_ready_seen = true;
-            if terminal_delivered {
+            if committed.is_some() {
                 return Err(hipfire_client::ClientError::Protocol(
                     "duplicate commit_ready".into(),
                 ));
@@ -2509,7 +2579,7 @@ pub(crate) fn complete_request_attempt(
                 }
             };
             terminal_callback(&preview)?;
-            terminal_delivered = true;
+            committed = Some(preview);
             return Ok(());
         }
 
@@ -2605,7 +2675,7 @@ pub(crate) fn complete_request_attempt(
                     Some("done") => {
                         // Prefer staged commit_ready terminal; keep post-commit done
                         // only as payload fill if staging was skipped (legacy path).
-                        if !terminal_delivered {
+                        if committed.is_none() {
                             forward_think_fragments(
                                 legacy_router.finish(),
                                 &mut legacy_content,
@@ -2650,13 +2720,16 @@ pub(crate) fn complete_request_attempt(
     // Same payload the gateway already had; previously only `tok_s` survived, as a
     // scalar overwritten by the next request. Distributions are what make a stall
     // visible.
-    shared.metrics.observe_done(&done);
-    shared.metrics.observe_timing(
+    shared.metrics.observe_done(
+        &done,
         first_token_at.get().map(|d| d.as_secs_f64() * 1000.0),
         attempt_started.elapsed().as_secs_f64() * 1000.0,
     );
     meta.last_activity = Instant::now();
 
+    if let Some(completion) = committed {
+        return Ok(completion);
+    }
     if contract_gate.is_v2() {
         let mut done = fold.done().cloned().unwrap_or(done);
         let logprobs = if logprobs_requested && !logprobs_entries.is_empty() {
@@ -2746,6 +2819,13 @@ fn multi_slot_request_has_image(body: &serde_json::Value) -> bool {
     false
 }
 
+/// [`multi_slot_request_supported`] as a typed client error (HTTP 400).
+fn require_multi_slot_support(request: &serde_json::Value) -> Result<()> {
+    multi_slot_request_supported(request).map_err(|reason| {
+        invalid_request!("experimental multi-slot does not support this request: {reason}")
+    })
+}
+
 pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(), String> {
     let has_image = multi_slot_request_has_image(body)
         || body.get("image").is_some_and(|value| !value.is_null())
@@ -2799,13 +2879,12 @@ pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(
             return Err("min_p must be within [0, 1]".to_owned());
         }
     }
-    if body
-        .get("reasoning_effort")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| !value.eq_ignore_ascii_case("none"))
-    {
-        return Err("reasoning_effort is not supported".to_owned());
-    }
+    // `reasoning_effort` is not refused here: `apply_http_reasoning_request`
+    // already owns the field end-to-end — it normalises qwen_jinja's
+    // vocabulary (low|medium|xhigh), maps the OpenAI spellings onto it, drops
+    // the dial with a warning when the loaded template does not natively
+    // honour it, and drops it when thinking is off. Refusing it here rejected
+    // requests the sequential route accepts, and pre-empted that logic.
     // Finite caps (>= 2) are ENFORCED end-to-end on the multi-slot route
     // (the grammar cursor force-closes the span at the budget —
     // vLLM thinking_token_budget parity), so they are forwarded, not
@@ -2864,12 +2943,7 @@ pub(crate) fn complete_request_cancellable(
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if runtime.multi_slot_enabled {
-            if let Err(reason) = multi_slot_request_supported(body) {
-                bail!(
-                    "{}experimental multi-slot does not support this request: {reason}",
-                    crate::serve::REQUEST_VALIDATION_TAG
-                );
-            }
+            require_multi_slot_support(body)?;
         }
     }
 
@@ -3023,22 +3097,26 @@ pub(crate) fn request_image_base64(messages: Option<&serde_json::Value>) -> Resu
             let url = part
                 .pointer("/image_url/url")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| anyhow!("image_url content part requires image_url.url"))?;
+                .ok_or_else(|| invalid_request!("image_url content part requires image_url.url"))?;
             let payload = ["data:image/png;base64,", "data:image/jpeg;base64,"]
                 .into_iter()
                 .find_map(|prefix| url.strip_prefix(prefix))
                 .ok_or_else(|| {
                     if url.starts_with("data:") {
-                        anyhow!("only base64 PNG and JPEG image_url data URIs are supported")
+                        invalid_request!(
+                            "only base64 PNG and JPEG image_url data URIs are supported"
+                        )
                     } else {
-                        anyhow!("remote image_url values are unsupported; send a base64 data URI")
+                        invalid_request!(
+                            "remote image_url values are unsupported; send a base64 data URI"
+                        )
                     }
                 })?;
             if payload.is_empty() {
-                bail!("image_url data URI has an empty base64 payload");
+                bail_invalid!("image_url data URI has an empty base64 payload");
             }
             if image.replace(payload.to_owned()).is_some() {
-                bail!("at most one image_url is supported per request");
+                bail_invalid!("at most one image_url is supported per request");
             }
         }
     }
@@ -3249,25 +3327,25 @@ pub(crate) fn validate_logprobs_request(body: &serde_json::Value) -> Result<()> 
     if let Some(v) = body.get("top_logprobs") {
         let logprobs_true = body.get("logprobs").and_then(|x| x.as_bool()) == Some(true);
         if !logprobs_true {
-            bail!("top_logprobs requires logprobs to be true");
+            bail_invalid!("top_logprobs requires logprobs to be true");
         }
         let n = if let Some(n) = v.as_u64() {
             n
         } else if let Some(n) = v.as_i64() {
             if n < 0 {
-                bail!("top_logprobs must be an integer between 0 and 20");
+                bail_invalid!("top_logprobs must be an integer between 0 and 20");
             }
             n as u64
         } else {
-            bail!("top_logprobs must be an integer between 0 and 20");
+            bail_invalid!("top_logprobs must be an integer between 0 and 20");
         };
         if n > 20 {
-            bail!("top_logprobs must be an integer between 0 and 20");
+            bail_invalid!("top_logprobs must be an integer between 0 and 20");
         }
     }
     if let Some(v) = body.get("logprobs") {
         if !v.is_boolean() {
-            bail!("logprobs must be a boolean");
+            bail_invalid!("logprobs must be a boolean");
         }
     }
     Ok(())
@@ -3373,6 +3451,11 @@ pub(crate) fn completion_json(completion: &Completion) -> serde_json::Value {
         "hipfire": completion_hipfire(completion),
     })
 }
+/// `completion_tokens` is the daemon's `done.tokens` verbatim (committed
+/// tokens; drafted/rejected spec tokens never count). Terminator policy is
+/// per arch and pinned, not unified, for 0.4.1: Qwen AR/spec/batch count the
+/// EOS token, DS4 AR/spec and LFM batch do not
+/// (`spec_usage_counts_eos_for_qwen_not_ds4`).
 pub(crate) fn completion_usage(completion: &Completion) -> serde_json::Value {
     let cached_tokens = completion
         .done
@@ -3411,7 +3494,12 @@ pub(crate) fn completion_timings(completion: &Completion) -> serde_json::Value {
         "ttft_ms": done.get("ttft_ms"),
         "prefill_ms": done.get("prefill_ms"),
         "prefill_tok_s": done.get("prefill_tok_s"),
-        "decode_tok_s": done.get("decode_tok_s").or_else(|| done.get("tok_s")),
+        // Pure passthrough: relaying the wall-inclusive `tok_s` under
+        // `decode_tok_s` (the slots route reports only the former) made
+        // clients present prefill time as decode speed — measured ~3x low
+        // on gfx1101 multi-slot. `hipfire.tok_s` carries the wall number
+        // for clients that want it.
+        "decode_tok_s": done.get("decode_tok_s"),
         "latency_ms": done.get("latency_ms"),
         "tau": done.get("tau"),
         "cycles": done.get("cycles"),
@@ -4269,8 +4357,9 @@ mod tests {
             &qwen_supported,
         )
         .unwrap();
-        assert_eq!(qwen_default["reasoning_effort"], "xhigh");
-        assert_eq!(res_default.effective_effort.as_deref(), Some("xhigh"));
+        assert_eq!(qwen_default["reasoning_effort"], "medium");
+        assert_eq!(res_default.effective_effort.as_deref(), Some("medium"));
+        assert!(res_default.warnings.is_empty());
         let mut qwen_capped = serde_json::json!({});
         let res_capped = apply_http_reasoning_request(
             &serde_json::json!({ "reasoning_effort": "low", "max_think_tokens": 2048 }),
@@ -4550,10 +4639,10 @@ mod tests {
             &qwen_supported,
         )
         .unwrap();
-        assert_eq!(qwen_unknown["reasoning_effort"], "xhigh");
+        assert_eq!(qwen_unknown["reasoning_effort"], "medium");
         assert_eq!(
             qwen_unknown_resolution.effective_effort.as_deref(),
-            Some("xhigh")
+            Some("medium")
         );
         assert!(!qwen_unknown_resolution.warnings.is_empty());
         assert!(apply_http_reasoning_request(
@@ -4594,7 +4683,7 @@ mod tests {
             &qwen_supported,
         )
         .unwrap();
-        assert_eq!(qwen_high["reasoning_effort"], "xhigh");
+        assert_eq!(qwen_high["reasoning_effort"], "medium");
         assert!(!res_qhigh.warnings.is_empty());
         let completion = Completion {
             id: "chatcmpl_test".into(),
@@ -4618,7 +4707,7 @@ mod tests {
         let json = completion_json(&completion);
         assert_eq!(json["hipfire"]["reasoning"]["contract"], "qwen_jinja");
         assert_eq!(json["hipfire"]["reasoning"]["mode"], "enabled");
-        assert_eq!(json["hipfire"]["reasoning"]["effort"], "xhigh");
+        assert_eq!(json["hipfire"]["reasoning"]["effort"], "medium");
         assert_eq!(
             json["hipfire"]["config_warnings"],
             serde_json::json!(res_default.warnings)
@@ -4630,6 +4719,239 @@ mod tests {
             terminal["hipfire"]["config_warnings"],
             serde_json::json!(res_default.warnings)
         );
+    }
+
+    fn qwen_effort_resolved(
+        layers: Vec<(hipfire_config::ConfigSource, &str)>,
+    ) -> hipfire_config::ResolvedConfig {
+        use hipfire_config::{resolve, ConfigLayer, NamedLayer};
+        resolve(
+            layers
+                .into_iter()
+                .map(|(source, effort)| {
+                    let mut layer = ConfigLayer::default();
+                    layer.set_cli("reasoning.effort", effort).unwrap();
+                    NamedLayer { source, layer }
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    fn qwen_effort_request(
+        body: serde_json::Value,
+        resolved: &hipfire_config::ResolvedConfig,
+    ) -> (serde_json::Value, crate::ReasoningResolution) {
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        let mut request = serde_json::json!({});
+        let resolution = apply_http_reasoning_request(
+            &body,
+            resolved,
+            &mut request,
+            saddle_core::caps::ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        (request, resolution)
+    }
+
+    #[test]
+    fn qwen_effort_native_default_and_auto_resolve_medium() {
+        use hipfire_config::{resolve, NamedLayer};
+        let builtin = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let (unset, unset_res) = qwen_effort_request(serde_json::json!({}), &builtin);
+        assert_eq!(unset["reasoning_effort"], "medium");
+        assert_eq!(unset_res.effective_effort.as_deref(), Some("medium"));
+        assert!(unset_res.warnings.is_empty());
+        // Request-level `auto` and config-level `auto` are both "no preference".
+        let (auto_body, auto_body_res) =
+            qwen_effort_request(serde_json::json!({ "reasoning_effort": "auto" }), &builtin);
+        assert_eq!(auto_body["reasoning_effort"], "medium");
+        assert_eq!(auto_body_res.effective_effort.as_deref(), Some("medium"));
+        let auto_cfg = qwen_effort_resolved(vec![(
+            hipfire_config::ConfigSource::GlobalUser {
+                path: std::path::PathBuf::from("config.toml"),
+            },
+            "auto",
+        )]);
+        let (auto_config, auto_config_res) = qwen_effort_request(serde_json::json!({}), &auto_cfg);
+        assert_eq!(auto_config["reasoning_effort"], "medium");
+        assert_eq!(auto_config_res.effective_effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn qwen_effort_resolution_order_config_cli_request() {
+        use hipfire_config::ConfigSource;
+        let global = || ConfigSource::GlobalUser {
+            path: std::path::PathBuf::from("config.toml"),
+        };
+        let one_shot = || ConfigSource::OneShot {
+            argument: "--set reasoning.effort".into(),
+        };
+        // Explicit config wins over the built-in medium default.
+        for effort in ["low", "xhigh"] {
+            let cfg = qwen_effort_resolved(vec![(global(), effort)]);
+            let (req, res) = qwen_effort_request(serde_json::json!({}), &cfg);
+            assert_eq!(req["reasoning_effort"], effort);
+            assert_eq!(res.effective_effort.as_deref(), Some(effort));
+            assert!(res.warnings.is_empty());
+        }
+        // An explicit medium config is also honoured (not just the default).
+        let medium_cfg = qwen_effort_resolved(vec![(global(), "medium")]);
+        let (req_medium, _) = qwen_effort_request(serde_json::json!({}), &medium_cfg);
+        assert_eq!(req_medium["reasoning_effort"], "medium");
+        // One-shot CLI layer beats the global user config.
+        let layered = qwen_effort_resolved(vec![(global(), "low"), (one_shot(), "xhigh")]);
+        let (req_cli, res_cli) = qwen_effort_request(serde_json::json!({}), &layered);
+        assert_eq!(req_cli["reasoning_effort"], "xhigh");
+        assert_eq!(res_cli.effective_effort.as_deref(), Some("xhigh"));
+        // HTTP request beats the resolved config / CLI layer.
+        let (req_body, res_body) =
+            qwen_effort_request(serde_json::json!({ "reasoning_effort": "low" }), &layered);
+        assert_eq!(req_body["reasoning_effort"], "low");
+        assert_eq!(res_body.effective_effort.as_deref(), Some("low"));
+        // Request `auto` is no preference; the explicit config / CLI layer wins.
+        let (req_auto, _) =
+            qwen_effort_request(serde_json::json!({ "reasoning_effort": "auto" }), &layered);
+        assert_eq!(req_auto["reasoning_effort"], "xhigh");
+    }
+
+    #[test]
+    fn qwen_effort_thinking_off_and_non_native_drop_effort() {
+        use hipfire_config::{resolve, NamedLayer};
+        use saddle_core::caps::ReasoningContract;
+        let builtin = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let (off, off_res) = qwen_effort_request(
+            serde_json::json!({ "enable_thinking": false }),
+            &builtin,
+        );
+        assert!(off.get("reasoning_effort").is_none());
+        assert_eq!(off["thinking_enabled"], false);
+        assert_eq!(off_res.effective_mode, "disabled");
+        assert_eq!(off_res.effective_effort, None);
+        let cfg = qwen_effort_resolved(vec![(
+            hipfire_config::ConfigSource::GlobalUser {
+                path: std::path::PathBuf::from("config.toml"),
+            },
+            "xhigh",
+        )]);
+        let (off_cfg, off_cfg_res) = qwen_effort_request(
+            serde_json::json!({ "thinking": { "type": "disabled" }, "reasoning_effort": "low" }),
+            &cfg,
+        );
+        assert!(off_cfg.get("reasoning_effort").is_none());
+        assert_eq!(off_cfg_res.effective_effort, None);
+        // Non-effort-native Qwen keeps dropping the dial instead of defaulting it.
+        let mut qwen36 = serde_json::json!({});
+        let res36 = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &builtin,
+            &mut qwen36,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(qwen36.get("reasoning_effort").is_none());
+        assert_eq!(res36.effective_effort, None);
+        assert!(res36.warnings.is_empty());
+        // Other contracts keep their own `high` default.
+        for contract in [
+            ReasoningContract::DeepSeek4,
+            ReasoningContract::MuseGlimmer,
+        ] {
+            let mut req = serde_json::json!({});
+            let res = apply_http_reasoning_request(
+                &serde_json::json!({}),
+                &builtin,
+                &mut req,
+                contract,
+                true,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(req["reasoning_effort"], "high");
+            assert_eq!(res.effective_effort.as_deref(), Some("high"));
+        }
+    }
+
+    /// Raw-template layer stays `xhigh` when the variable is undefined; the
+    /// CLI resolver supplies a concrete `medium`, which must render exactly like
+    /// an explicit `reasoning_effort: "medium"` request and differently from
+    /// the raw (undefined) xhigh default.
+    #[test]
+    fn qwen_effort_resolved_medium_renders_like_explicit_medium() {
+        use hipfire_config::{resolve, NamedLayer};
+        use hipfire_runtime::prompt_frame::{JinjaChatFrame, Message, Role};
+        use hipfire_runtime::tokenizer::Tokenizer;
+        const TEMPLATE: &str = "\
+{%- set instructions = '' -%}\
+{%- if enable_thinking is undefined or enable_thinking is true -%}\
+{%- set resolved = reasoning_effort|default('xhigh') -%}\
+{%- if resolved not in ('xhigh', 'medium', 'low') -%}\
+{{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '.') -}}\
+{%- endif -%}\
+{%- set instructions = resolved|upper -%}\
+{%- endif -%}\
+{%- if instructions %}[I:{{ instructions }}]{%- endif -%}\
+{%- for m in messages %}[{{ m.role }}:{{ m.content }}]{%- endfor -%}\
+{%- if add_generation_prompt -%}\
+{%- if enable_thinking is defined and enable_thinking is false -%}{{- '<think>\\n\\n</think>\\n\\n' -}}{%- else -%}{{- '<think>\\n' -}}{%- endif -%}\
+{%- endif -%}";
+        let tokenizer = Tokenizer::from_hf_json(
+            r#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[]}}"#,
+        )
+        .unwrap();
+        let messages = vec![Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }];
+        // Mirrors the slot route: the resolved request carries the concrete
+        // rung; the frame receives it verbatim when thinking is enabled.
+        let render = |request: &serde_json::Value| {
+            let enabled = request["thinking_enabled"].as_bool().unwrap();
+            JinjaChatFrame {
+                tokenizer: &tokenizer,
+                template: TEMPLATE,
+                system: None,
+                user: "",
+                enable_thinking: enabled,
+                bos_token: Some(""),
+                reasoning_strength: None,
+                reasoning_effort: request
+                    .get("reasoning_effort")
+                    .and_then(serde_json::Value::as_str),
+            }
+            .render_messages(&messages, None, None)
+            .unwrap()
+        };
+        let builtin = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let (default_req, _) = qwen_effort_request(serde_json::json!({}), &builtin);
+        let (explicit_req, _) =
+            qwen_effort_request(serde_json::json!({ "reasoning_effort": "medium" }), &builtin);
+        assert_eq!(default_req["reasoning_effort"], "medium");
+        let default_render = render(&default_req);
+        assert_eq!(default_render, render(&explicit_req));
+        assert!(default_render.contains("[I:MEDIUM]"));
+        // Raw template default (effort undefined) is untouched: xhigh.
+        let raw_render = render(&serde_json::json!({ "thinking_enabled": true }));
+        assert!(raw_render.contains("[I:XHIGH]"));
+        assert_ne!(default_render, raw_render);
+        // Thinking off: effort omitted, closed think block, no instructions.
+        let (off_req, _) = qwen_effort_request(
+            serde_json::json!({ "enable_thinking": false }),
+            &builtin,
+        );
+        let off_render = render(&off_req);
+        assert!(!off_render.contains("[I:"));
+        assert!(off_render.ends_with("<think>\n\n</think>\n\n"));
     }
 
     #[test]
@@ -6374,7 +6696,7 @@ mod tests {
 
         let mutations = AtomicUsize::new(0);
         let mut fire_if_allowed = |body: &serde_json::Value| -> Result<(), EndpointAdapterError> {
-            gate_chat_completions_tools(body)?;
+            gate_endpoint_tools(body, EndpointAdapterKind::OpenAiChatCompletions)?;
             mutations.fetch_add(1, Ordering::SeqCst);
             Ok(())
         };
@@ -6385,10 +6707,16 @@ mod tests {
             "messages": []
         });
 
-        assert_eq!(
-            endpoint_adapter_status(EndpointAdapterKind::OpenAiChatCompletions),
-            EndpointAdapterStatus::AvailableLossless
-        );
+        for kind in [
+            EndpointAdapterKind::OpenAiChatCompletions,
+            EndpointAdapterKind::AnthropicMessages,
+            EndpointAdapterKind::OpenAiResponses,
+        ] {
+            assert_eq!(
+                endpoint_adapter_status(kind),
+                EndpointAdapterStatus::AvailableLossless
+            );
+        }
         fire_if_allowed(&with_tools).expect("lossless adapter allows tools");
         assert_eq!(mutations.load(Ordering::SeqCst), 1);
 
@@ -6440,7 +6768,7 @@ mod tests {
         .to_string();
         assert!(msg.contains("lossy"), "{msg}");
 
-        assert!(gate_chat_completions_tools(&with_tools).is_ok());
+        assert!(gate_endpoint_tools(&with_tools, EndpointAdapterKind::AnthropicMessages).is_ok());
     }
 
     #[test]
@@ -6452,7 +6780,8 @@ mod tests {
             serde_json::json!({ "model": "m", "tools": null, "messages": [] }),
         ];
         for body in &bodies {
-            gate_chat_completions_tools(body).expect("tool-free must bypass adapter capability");
+            gate_endpoint_tools(body, EndpointAdapterKind::OpenAiResponses)
+                .expect("tool-free must bypass adapter capability");
             mutations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         assert_eq!(
@@ -6464,12 +6793,18 @@ mod tests {
 
     #[test]
     fn endpoint_adapter_registry_covers_all_declared_kinds() {
-        const ALL_KINDS: &[EndpointAdapterKind] = &[EndpointAdapterKind::OpenAiChatCompletions];
+        const ALL_KINDS: &[EndpointAdapterKind] = &[
+            EndpointAdapterKind::OpenAiChatCompletions,
+            EndpointAdapterKind::AnthropicMessages,
+            EndpointAdapterKind::OpenAiResponses,
+        ];
 
         for kind in ALL_KINDS {
             let status = endpoint_adapter_status(*kind);
             match kind {
-                EndpointAdapterKind::OpenAiChatCompletions => {
+                EndpointAdapterKind::OpenAiChatCompletions
+                | EndpointAdapterKind::AnthropicMessages
+                | EndpointAdapterKind::OpenAiResponses => {
                     assert_eq!(status, EndpointAdapterStatus::AvailableLossless);
                 }
             }
@@ -6948,6 +7283,190 @@ mod tests {
         let before2 = calls2[0].arguments.clone();
         normalize_tool_calls(&mut calls2, &body2);
         assert_eq!(calls2[0].arguments, before2);
+    }
+
+    /// Parse native-XML tool-call text with the daemon's parser, then type
+    /// the arguments against `tools` the way the gateway does.
+    fn parse_and_normalize_xml(text: &str, tools: serde_json::Value) -> Vec<ToolCall> {
+        let mut calls = hipfire_runtime::emit_text::extract_tool_calls_from_text(text);
+        normalize_tool_calls(&mut calls, &tool_body(tools));
+        calls
+    }
+
+    /// HA-12 (hermesagent20 p1 `http/00201`): the `skill_manage` file must land
+    /// as the exact 88 bytes, final newline included. `parameters` is the
+    /// captured request's schema, descriptions dropped.
+    #[test]
+    fn tool_xml_ha12_file_content_exact_bytes() {
+        let text = "<tool_call>\n<function=skill_manage>\n<parameter=action>\nwrite_file\n</parameter>\n<parameter=name>\nrelease-check\n</parameter>\n<parameter=file_path>\nscripts/validate_release.py\n</parameter>\n<parameter=file_content>\ndef validate_release(tag: str) -> bool:\n    return tag.startswith('v') and len(tag) > 1\n\n</parameter>\n</function>\n</tool_call>";
+        let calls = parse_and_normalize_xml(
+            text,
+            serde_json::json!([{"type":"function","function":{"name":"skill_manage","parameters":{
+                "type":"object",
+                "properties":{
+                    "action":{"type":"string","enum":["create","patch","edit","delete","write_file","remove_file"]},
+                    "name":{"type":"string"},
+                    "content":{"type":"string"},
+                    "old_string":{"type":"string"},
+                    "new_string":{"type":"string"},
+                    "replace_all":{"type":"boolean"},
+                    "category":{"type":"string"},
+                    "file_path":{"type":"string"},
+                    "file_content":{"type":"string"}
+                },
+                "required":["action","name"]
+            }}}]),
+        );
+        let file = calls[0].arguments["file_content"].as_str().expect("string");
+        assert_eq!(
+            file,
+            "def validate_release(tag: str) -> bool:\n    return tag.startswith('v') and len(tag) > 1\n"
+        );
+        assert_eq!(file.len(), 88);
+        assert_eq!(calls[0].arguments["action"], "write_file");
+    }
+
+    /// HA-17 (hermesagent20 p1 `http/00313-00324`): `{"sum": 10}` written to a
+    /// `string` parameter must not come back as `{"sum":10}`. Schemas are the
+    /// captured `write_file`/`patch` ones, descriptions dropped.
+    #[test]
+    fn tool_xml_ha17_json_text_in_string_param_is_verbatim() {
+        let tools = serde_json::json!([
+            {"type":"function","function":{"name":"write_file","parameters":{
+                "type":"object",
+                "properties":{"path":{"type":"string"},"content":{"type":"string"}},
+                "required":["path","content"]
+            }}},
+            {"type":"function","function":{"name":"patch","parameters":{
+                "type":"object",
+                "properties":{
+                    "mode":{"type":"string","enum":["replace","patch"],"default":"replace"},
+                    "path":{"type":"string"},
+                    "old_string":{"type":"string"},
+                    "new_string":{"type":"string"},
+                    "replace_all":{"type":"boolean"},
+                    "patch":{"type":"string"}
+                },
+                "required":["mode"]
+            }}}
+        ]);
+        let text = "<tool_call>\n<function=write_file>\n<parameter=path>\nresults/part_a.json\n</parameter>\n<parameter=content>\n{\"sum\": 10}\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=patch>\n<parameter=mode>\nreplace\n</parameter>\n<parameter=path>\nresults/part_a.json\n</parameter>\n<parameter=old_string>\n{\"sum\":10}\n</parameter>\n<parameter=new_string>\n{\"sum\": 10}\n</parameter>\n<parameter=replace_all>\nfalse\n</parameter>\n</function>\n</tool_call>";
+        let calls = parse_and_normalize_xml(text, tools);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].arguments["content"], "{\"sum\": 10}");
+        assert_eq!(calls[1].arguments["old_string"], "{\"sum\":10}");
+        assert_eq!(calls[1].arguments["new_string"], "{\"sum\": 10}");
+        assert_eq!(calls[1].arguments["replace_all"], false);
+    }
+
+    #[test]
+    fn tool_xml_params_typed_by_declared_schema() {
+        let tools = serde_json::json!([{"type":"function","function":{"name":"probe","parameters":{
+            "type":"object",
+            "properties":{
+                "count":{"type":"integer"},
+                "ratio":{"type":"number"},
+                "whole":{"type":"number"},
+                "on":{"type":"boolean"},
+                "off":{"type":"boolean"},
+                "label":{"type":"string"},
+                "flag_text":{"type":"string"},
+                "nested_text":{"type":"string"},
+                "options":{"type":"object","properties":{"depth":{"type":"integer"}}},
+                "tags":{"type":"array","items":{"type":"string"}},
+                "no_options":{"type":"object"},
+                "maybe":{"type":["integer","null"]},
+                "literal_null":{"type":"string"},
+                "union_int_first":{"type":["integer","string"]},
+                "union_str_first":{"type":["string","integer"]},
+                "any_of":{"anyOf":[{"type":"integer"},{"type":"string"}]},
+                "any_of_text":{"anyOf":[{"type":"integer"},{"type":"string"}]},
+                "enum_null":{"enum":["a",null]},
+                "padded":{"type":"string"},
+                "bad_int":{"type":"integer"}
+            }
+        }}}]);
+        let p = |k: &str, v: &str| format!("<parameter={k}>\n{v}\n</parameter>\n");
+        let text = [
+            "<tool_call>\n<function=probe>\n".to_owned(),
+            p("count", "42"),
+            p("ratio", "1.25"),
+            p("whole", "3"),
+            p("on", "True"),
+            p("off", "0"),
+            p("label", "42"),
+            p("flag_text", "true"),
+            p("nested_text", "{\"a\": {\"b\": [1, 2]}}"),
+            p("options", "{\"depth\": 2}"),
+            p("tags", "[\"x\", \"y\"]"),
+            p("no_options", ""),
+            p("maybe", "null"),
+            p("literal_null", "null"),
+            p("union_int_first", "7"),
+            p("union_str_first", "7"),
+            p("any_of", "8"),
+            p("any_of_text", "eight"),
+            p("enum_null", "None"),
+            p("padded", "  two spaces\n"),
+            p("bad_int", "12.5"),
+            p("undeclared", "{\"keep\": true}"),
+            "</function>\n</tool_call>".to_owned(),
+        ]
+        .concat();
+        let calls = parse_and_normalize_xml(&text, tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({
+                "count": 42,
+                "ratio": 1.25,
+                "whole": 3,
+                "on": true,
+                "off": false,
+                "label": "42",
+                "flag_text": "true",
+                "nested_text": "{\"a\": {\"b\": [1, 2]}}",
+                "options": {"depth": 2},
+                "tags": ["x", "y"],
+                "no_options": {},
+                "maybe": null,
+                "literal_null": "null",
+                "union_int_first": 7,
+                "union_str_first": "7",
+                "any_of": 8,
+                "any_of_text": "eight",
+                "enum_null": null,
+                "padded": "  two spaces\n",
+                "bad_int": "12.5",
+                // No schema: the raw string, as vLLM.
+                "undeclared": "{\"keep\": true}"
+            })
+        );
+    }
+
+    #[test]
+    fn tool_normalize_keeps_structured_value_a_union_accepts() {
+        // JSON-format models emit typed values; only a slot that accepts
+        // nothing but `string` gets the value's JSON text.
+        let body = tool_body(
+            serde_json::json!([{"type":"function","function":{"name":"f","parameters":{
+                "type":"object",
+                "properties":{
+                    "n":{"type":["integer","string"]},
+                    "o":{"anyOf":[{"type":"object"},{"type":"string"}]},
+                    "s":{"type":"string"}
+                }
+            }}}]),
+        );
+        let mut calls = vec![sample_tc(
+            "f",
+            serde_json::json!({"n": 5, "o": {"k": 1}, "s": 5}),
+        )];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"n": 5, "o": {"k": 1}, "s": "5"})
+        );
     }
 
     #[test]
@@ -7462,6 +7981,38 @@ mod tests {
         assert!(project_request_contract(&body, &resolved, false, true).is_ok());
     }
 
+    /// `n != 1` is refused as a typed 400 on BOTH routes (standard and
+    /// multi-slot); `n: 1` and an absent/null `n` pass on both.
+    #[test]
+    fn project_request_contract_refuses_n_on_every_route() {
+        let resolved = contract_resolved_with_system("");
+        for multi_slot in [false, true] {
+            for bad in [
+                serde_json::json!(2),
+                serde_json::json!(0),
+                serde_json::json!("1"),
+            ] {
+                let body = serde_json::json!({
+                    "max_tokens": 16, "n": bad,
+                    "messages": [{ "role": "user", "content": "hi" }]
+                });
+                let err = project_request_contract(&body, &resolved, false, multi_slot)
+                    .expect_err("n != 1 must be refused");
+                assert!(
+                    err.downcast_ref::<super::super::InvalidRequest>().is_some(),
+                    "multi_slot={multi_slot} n={bad}: not a typed invalid request: {err}"
+                );
+            }
+            for ok in [serde_json::json!(1), serde_json::Value::Null] {
+                let body = serde_json::json!({
+                    "max_tokens": 16, "n": ok,
+                    "messages": [{ "role": "user", "content": "hi" }]
+                });
+                assert!(project_request_contract(&body, &resolved, false, multi_slot).is_ok());
+            }
+        }
+    }
+
     /// `response_format: {"type": "text"}` is OpenAI's DEFAULT format —
     /// accept it as unconstrained instead of erroring.
     #[test]
@@ -7553,15 +8104,141 @@ mod tests {
                 { "role": "user", "content": "hi" }
             ]
         });
-        let contract = project_request_contract(&body, &resolved, false, false).expect("specific");
+        let contract = project_request_contract(&body, &resolved, false, true).expect("specific");
         assert_eq!(
-            contract.conversation_messages[0]["content"],
+            contract.conversation_messages.as_ref().unwrap()[0]["content"],
             "stable system"
         );
         assert_eq!(
             contract.messages[0]["content"],
             "stable system\n\nYou must call the `echo` tool."
         );
+    }
+
+    /// Every gateway-side client mistake is answered 400 by type, whatever
+    /// its wording; a model-output failure stays a 500.
+    #[test]
+    fn gateway_client_faults_map_to_http_400() {
+        use crate::serve::http::request_error_status;
+        use saddle_core::caps::ReasoningContract;
+        let resolved = hipfire_config::resolve(Vec::<hipfire_config::NamedLayer>::new()).unwrap();
+        let status = |result: Result<()>| {
+            let error = result.expect_err("client fault must be refused");
+            (request_error_status(&error), error.to_string())
+        };
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
+        let image = |url: &str| serde_json::json!({"type": "image_url", "image_url": {"url": url}});
+        let reasoning = |body: serde_json::Value| -> Result<()> {
+            apply_http_reasoning_request(
+                &body,
+                &resolved,
+                &mut serde_json::json!({}),
+                ReasoningContract::QwenJinja,
+                true,
+                &[],
+            )
+            .map(drop)
+        };
+        let contract = |body: serde_json::Value| -> Result<()> {
+            project_request_contract(&body, &resolved, false, true).map(drop)
+        };
+        let cases: Vec<(&str, Result<()>)> = vec![
+            (
+                "experimental multi-slot does not support this request",
+                require_multi_slot_support(&serde_json::json!({"stop": ["\n"]})),
+            ),
+            (
+                "top_logprobs requires logprobs to be true",
+                validate_logprobs_request(&serde_json::json!({"top_logprobs": 2})),
+            ),
+            (
+                "logprobs must be a boolean",
+                validate_logprobs_request(&serde_json::json!({"logprobs": "yes"})),
+            ),
+            (
+                "unsupported tool_choice value: x",
+                parse_tool_choice_policy(Some(&serde_json::json!("x")), Some(&tools)).map(drop),
+            ),
+            (
+                "is not present in tools",
+                parse_tool_choice_policy(
+                    Some(&serde_json::json!({"type": "function", "function": {"name": "g"}})),
+                    Some(&tools),
+                )
+                .map(drop),
+            ),
+            (
+                "remote image_url values are unsupported",
+                request_image_base64(Some(&serde_json::json!([
+                    {"role": "user", "content": [image("https://x/y.png")]}
+                ])))
+                .map(drop),
+            ),
+            (
+                "at most one image_url",
+                request_image_base64(Some(&serde_json::json!([
+                    {"role": "user", "content": [
+                        image("data:image/png;base64,AA"),
+                        image("data:image/png;base64,AA")
+                    ]}
+                ])))
+                .map(drop),
+            ),
+            (
+                "max_tokens must be between",
+                contract(serde_json::json!({"max_tokens": 0})),
+            ),
+            (
+                "n != 1",
+                contract(serde_json::json!({"max_tokens": 8, "n": 2})),
+            ),
+            (
+                "temperature must be within",
+                contract(serde_json::json!({"max_tokens": 8, "temperature": 3.0})),
+            ),
+            (
+                "unknown message role",
+                contract(serde_json::json!({"max_tokens": 8, "messages": [{"role": "x"}]})),
+            ),
+            (
+                "response_format type 'json_object' is not supported",
+                contract(serde_json::json!({
+                    "max_tokens": 8, "response_format": {"type": "json_object"}
+                })),
+            ),
+            (
+                "unsupported JSON Schema keyword 'pattern'",
+                contract(serde_json::json!({"max_tokens": 8, "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"schema": {"type": "string", "pattern": "a"}}
+                }})),
+            ),
+            (
+                "enable_thinking must be a boolean",
+                reasoning(serde_json::json!({"enable_thinking": "true"})),
+            ),
+            (
+                "thinking_budget must be a string preset",
+                reasoning(serde_json::json!({"thinking_budget": 3})),
+            ),
+            (
+                "max_think_tokens must be between",
+                reasoning(serde_json::json!({"max_think_tokens": -1})),
+            ),
+        ];
+        for (needle, result) in cases {
+            let (code, message) = status(result);
+            assert!(message.contains(needle), "{message:?} lacks {needle:?}");
+            assert_eq!(code, 400, "{message}");
+        }
+        // The model, not the client, failed to honor tool_choice.
+        let (code, _) = status(finalize_tool_calls_for_choice(
+            &ToolChoicePolicy::Required,
+            &mut Vec::new(),
+            &mut serde_json::json!({}),
+            &serde_json::json!({}),
+        ));
+        assert_eq!(code, 500);
     }
 
     /// Experimental multi-slot accepts sampling that the daemon slot engine

@@ -20,6 +20,7 @@ use hipfire_generate::common::*;
 /// Baseline inputs that select nothing special (unknown arch, no EP/PP/spec).
 fn base() -> GenerationRouteInputs {
     GenerationRouteInputs {
+        dense_tp: false,
         arch_id: 255,
         ep: false,
         pp: 1,
@@ -270,6 +271,9 @@ fn capability_rows() -> Vec<(GenerationRoute, GenerationRouteInputs)> {
 const SAFE_ROUTES: &[GenerationRoute] = &[
     GenerationRoute::QwenAr,
     GenerationRoute::Qwen4Ar,
+    // Native Qwen4 MTP: same `<tool_call>` router as Qwen4 AR over committed
+    // tokens, tool grammar forced off, so greedy tools match AR byte-for-byte.
+    GenerationRoute::Qwen4Spec,
     GenerationRoute::QwenDflash,
     GenerationRoute::Deepseek4Ar,
     GenerationRoute::Deepseek4Ep,
@@ -343,6 +347,37 @@ fn route_capability_table_covers_all_variants() {
             "capability row for {:?} selected {:?}",
             expected, got
         );
+    }
+}
+
+/// `generate` falls through to its generic AR body on `QwenAr` and, when
+/// `generate_dflash` declines a request over the drafter's ctx capacity, on
+/// `QwenDflash`; both need that body's `Qwen35Bundle` branch. No other route
+/// may take it, only the Qwen3.5 carrier (arch 5|6) selects the two, and
+/// arch 17 (the embedding encoder, GatedDeltaNet state but no Qwen DFlash
+/// caps) must not.
+#[test]
+fn qwen35_ar_body_is_taken_by_qwen_ar_and_a_declined_qwen_dflash() {
+    for &route in GenerationRoute::ALL {
+        let expected = matches!(route, GenerationRoute::QwenAr | GenerationRoute::QwenDflash);
+        assert_eq!(route.runs_qwen35_ar_body(), expected, "{route:?}");
+    }
+    for (route, inputs) in capability_rows() {
+        if route.runs_qwen35_ar_body() {
+            assert!(
+                matches!(inputs.arch_id, 5 | 6),
+                "{route:?} selected for arch {}",
+                inputs.arch_id
+            );
+        }
+    }
+    for has_speculator in [false, true] {
+        let embed = GenerationRouteInputs {
+            arch_id: 17,
+            has_speculator,
+            ..base()
+        };
+        assert!(!select_generation_route(&embed).runs_qwen35_ar_body());
     }
 }
 
@@ -457,18 +492,197 @@ fn qwen4_native_mtp_route_requires_explicit_greedy_request() {
         );
     }
 }
-#[test]
-fn qwen4_mtp_cache_planner_forces_cold_after_ar_transition() {
-    // Native Qwen4 MTP replays the whole prefix cold.
-    assert!(hipfire_generate::qwen::spec_cache_disabled_for(true, false));
-    // Qwen3.5/3.6/3.8 MTP and DFlash keep the prompt cache: the rule is keyed
-    // on the loaded family, not on the speculator name "mtp".
-    assert!(!hipfire_generate::qwen::spec_cache_disabled_for(
-        false, false
-    ));
-    // HIPFIRE_QWEN_PROMPT_CACHE=0 still disables it for every family.
-    assert!(hipfire_generate::qwen::spec_cache_disabled_for(false, true));
 
+#[test]
+fn qwen4_sampled_mtp_route_honors_penalties() {
+    let sampled = GenerationRouteInputs {
+        arch_id: 16,
+        has_speculator: true,
+        speculator_is_mtp: true,
+        supports_temp_swor: true,
+        temp: 0.7,
+        user_explicit_sampling: true,
+        ..base()
+    };
+    assert_eq!(
+        select_generation_route(&sampled),
+        GenerationRoute::Qwen4Spec
+    );
+    // Sampled MTP honors repeat/presence/frequency penalties: the verifier's
+    // target applies the same host policy as the AR sampler.
+    assert_eq!(
+        select_generation_route(&GenerationRouteInputs {
+            nonneutral_penalties: true,
+            ..sampled
+        }),
+        GenerationRoute::Qwen4Spec,
+        "sampled Qwen4 MTP with penalties must stay on native MTP"
+    );
+    // The verifier's target applies min_p as the AR sampler does, so it does
+    // not demote.
+    assert_eq!(
+        select_generation_route(&GenerationRouteInputs {
+            min_p: Some(0.05),
+            ..sampled
+        }),
+        GenerationRoute::Qwen4Spec
+    );
+    // Every other refusal keeps the request on AR, with or without penalties.
+    for penalties in [false, true] {
+        for refused in [
+            GenerationRouteInputs {
+                supports_temp_swor: false,
+                nonneutral_penalties: penalties,
+                ..sampled
+            },
+            GenerationRouteInputs {
+                force_ar_chat: true,
+                nonneutral_penalties: penalties,
+                ..sampled
+            },
+            GenerationRouteInputs {
+                temp_spec_env_off: true,
+                nonneutral_penalties: penalties,
+                ..sampled
+            },
+            GenerationRouteInputs {
+                kv_adaptive: true,
+                nonneutral_penalties: penalties,
+                ..sampled
+            },
+        ] {
+            assert_eq!(
+                select_generation_route(&refused),
+                GenerationRoute::Qwen4Ar,
+                "sampled Qwen4 request must stay on AR: {refused:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn qwen35_mtp_route_honors_penalties_but_dflash_stays_ar() {
+    // --- Arch 5 native MTP: penalties never demote a servable request. ---
+    let mtp = GenerationRouteInputs {
+        arch_id: 5,
+        has_speculator: true,
+        speculator_is_mtp: true,
+        supports_temp_swor: true,
+        nonneutral_penalties: true,
+        ..base()
+    };
+    let sampled = GenerationRouteInputs {
+        temp: 0.7,
+        user_explicit_sampling: true,
+        ..mtp
+    };
+    assert_eq!(
+        select_generation_route(&sampled),
+        GenerationRoute::QwenDflash,
+        "sampled Qwen3.x MTP + penalties"
+    );
+    let greedy = GenerationRouteInputs { temp: 0.0, ..mtp };
+    assert_eq!(
+        select_generation_route(&greedy),
+        GenerationRoute::QwenDflash,
+        "greedy Qwen3.x MTP + penalties"
+    );
+    // Dense-TP EP carries the MTP drafter and honors penalties too.
+    for temp in [0.7_f32, 0.0] {
+        let dense = GenerationRouteInputs {
+            ep: true,
+            dense_tp: true,
+            temp,
+            ..mtp
+        };
+        assert_eq!(
+            select_generation_route(&dense),
+            GenerationRoute::QwenDflash,
+            "dense-TP EP MTP + penalties at temp {temp}"
+        );
+    }
+    for temp in [0.7_f32, 0.0] {
+        let forced = GenerationRouteInputs {
+            force_ar_chat: true,
+            temp,
+            ..mtp
+        };
+        assert_eq!(
+            select_generation_route(&forced),
+            GenerationRoute::QwenAr,
+            "force_ar_chat + penalties must stay AR at temp {temp}"
+        );
+    }
+
+    // --- Arch 5 DFlash (not MTP): penalties keep the request on AR. ---
+    let dflash = GenerationRouteInputs {
+        arch_id: 5,
+        has_speculator: true,
+        speculator_is_mtp: false,
+        ..base()
+    };
+    assert_eq!(
+        select_generation_route(&GenerationRouteInputs {
+            temp: 0.0,
+            ..dflash
+        }),
+        GenerationRoute::QwenDflash,
+        "greedy DFlash without penalties"
+    );
+    assert_eq!(
+        select_generation_route(&GenerationRouteInputs {
+            temp: 0.0,
+            nonneutral_penalties: true,
+            ..dflash
+        }),
+        GenerationRoute::QwenAr,
+        "greedy DFlash + penalties"
+    );
+    // DDTree SWOR (temp>0, supports_temp_swor, no chain nucleus, no
+    // user-explicit sampling).
+    let ddtree = GenerationRouteInputs {
+        supports_temp_swor: true,
+        supports_chain_nucleus_verify: false,
+        user_explicit_sampling: false,
+        temp: 0.7,
+        ..dflash
+    };
+    assert_eq!(
+        select_generation_route(&ddtree),
+        GenerationRoute::QwenDflash,
+        "DDTree SWOR without penalties"
+    );
+    assert_eq!(
+        select_generation_route(&GenerationRouteInputs {
+            nonneutral_penalties: true,
+            ..ddtree
+        }),
+        GenerationRoute::QwenAr,
+        "DDTree SWOR + penalties"
+    );
+}
+
+#[test]
+fn llama_dflash_greedy_route_refuses_penalties() {
+    // Arch 1 is a llama-DFlash carrier (caps().is_llama_dflash()).
+    let greedy = GenerationRouteInputs {
+        arch_id: 1,
+        has_speculator: true,
+        temp: 0.0,
+        ..base()
+    };
+    assert_eq!(select_generation_route(&greedy), GenerationRoute::LlamaSpec);
+    assert_eq!(
+        select_generation_route(&GenerationRouteInputs {
+            nonneutral_penalties: true,
+            ..greedy
+        }),
+        GenerationRoute::LlamaAr
+    );
+}
+
+#[test]
+fn qwen_cache_planner_is_ineligible_cold() {
     let plan = hipfire_generate::qwen::plan_from_rendered(
         &[10, 11],
         vec![10, 11, 12],
@@ -480,11 +694,281 @@ fn qwen4_mtp_cache_planner_forces_cold_after_ar_transition() {
     assert!(!plan.cache_hit);
     assert_eq!(plan.start_pos, 0);
     assert_eq!(plan.cached_tokens, 0);
+    assert_eq!(plan.resume_from, None);
     assert_eq!(plan.new_tokens, vec![10, 11, 12]);
 }
 
+/// Native Qwen4 MTP never uses the shared conversation planner, including on a
+/// transition from an AR turn: its reusable prefixes are the bundle's session
+/// cache (`ArchModel::session_plan` with `SessionRoute::Mtp`), planned
+/// separately.
 #[test]
-fn exact_safe_set_is_qwen_ar_qwen4_ar_dflash_ds4_ar_ep_spec_glimmer_ar_spec_and_maple_ar() {
+fn qwen4_mtp_cache_planner_forces_cold_after_ar_transition() {
+    // Native Qwen4 MTP bypasses the shared planner.
+    assert!(hipfire_generate::qwen::spec_cache_disabled_for(true, false));
+    // Qwen3.5/3.6/3.8 MTP and DFlash keep the prompt cache: the rule is keyed
+    // on the loaded family, not on the speculator name "mtp".
+    assert!(!hipfire_generate::qwen::spec_cache_disabled_for(
+        false, false
+    ));
+    // HIPFIRE_QWEN_PROMPT_CACHE=0 still disables it for every family.
+    assert!(hipfire_generate::qwen::spec_cache_disabled_for(false, true));
+}
+
+/// Asserts every `PromptCachePlan` field against the expected start and resume.
+/// `start == 0` means a cold miss.
+fn assert_plan(
+    plan: &hipfire_generate::qwen::PromptCachePlan,
+    rendered: &[u32],
+    start: usize,
+    resume: Option<usize>,
+    what: &str,
+) {
+    assert_eq!(plan.rendered, rendered, "{what}: rendered");
+    assert_eq!(plan.start_pos, start, "{what}: start_pos");
+    assert_eq!(plan.cached_tokens, start, "{what}: cached_tokens");
+    assert_eq!(plan.cache_hit, start > 0, "{what}: cache_hit");
+    assert_eq!(plan.resume_from, resume, "{what}: resume_from");
+    assert_eq!(
+        plan.new_tokens,
+        rendered[start..].to_vec(),
+        "{what}: new_tokens"
+    );
+}
+
+/// Shared planner (Qwen3.5-family AR/DFlash): lineage = the committed live
+/// tokens, one exact end-of-prompt checkpoint at an arbitrary
+/// (non-chunk-aligned) position `p`.
+#[test]
+fn eop_checkpoint_plans_use_the_shared_planner() {
+    use hipfire_generate::qwen::plan_from_rendered as plan;
+    // Distinct divergent suffix tokens never collide with the 0..n lineage.
+    let fork = |keep: usize, extra: usize| -> Vec<u32> {
+        (0..keep as u32)
+            .chain((0..extra as u32).map(|i| 1_000_000 + i))
+            .collect()
+    };
+    for (p, l) in [(37usize, 50usize), (1903, 2100)] {
+        let lineage: Vec<u32> = (0..l as u32).collect();
+        let ckpts = [p];
+
+        // (a) live extension: the lineage is a strict prefix of the request.
+        let rendered: Vec<u32> = (0..(l + 20) as u32).collect();
+        let got = plan(&lineage, rendered.clone(), true, &ckpts, true, "t");
+        assert_plan(&got, &rendered, l, None, "live extension");
+
+        // (b) divergence with p <= lcp < l: rewind to the checkpoint.
+        let rendered = fork(p + 8, 3);
+        let got = plan(&lineage, rendered.clone(), true, &ckpts, true, "t");
+        assert_plan(
+            &got,
+            &rendered,
+            p,
+            Some(p),
+            "divergence past the checkpoint",
+        );
+
+        // (c) divergence exactly at the checkpoint.
+        let rendered = fork(p, 2);
+        let got = plan(&lineage, rendered.clone(), true, &ckpts, true, "t");
+        assert_plan(&got, &rendered, p, Some(p), "divergence at the checkpoint");
+
+        // (d) lcp below the checkpoint: cold.
+        let rendered = fork(p - 17, 4);
+        let got = plan(&lineage, rendered.clone(), true, &ckpts, true, "t");
+        assert_plan(&got, &rendered, 0, None, "lcp below the checkpoint");
+
+        // (e) exact match: resume from the checkpoint when it leaves a tail.
+        let got = plan(&lineage, lineage.clone(), true, &ckpts, true, "t");
+        assert_plan(&got, &lineage, p, Some(p), "exact match, p < n");
+        // Exact match whose length equals the checkpoint leaves nothing to
+        // replay: cold.
+        let at_p: Vec<u32> = (0..p as u32).collect();
+        let got = plan(&at_p, at_p.clone(), true, &ckpts, true, "t");
+        assert_plan(&got, &at_p, 0, None, "exact match, p == n");
+
+        // (f) shorter request that still covers the checkpoint.
+        let rendered: Vec<u32> = (0..(p + 7) as u32).collect();
+        let got = plan(&lineage, rendered.clone(), true, &ckpts, true, "t");
+        assert_plan(&got, &rendered, p, Some(p), "shorter request, lcp >= p");
+        // A shorter request ending exactly at the checkpoint has no tail: cold.
+        let got = plan(&lineage, at_p.clone(), true, &ckpts, true, "t");
+        assert_plan(&got, &at_p, 0, None, "shorter request ending at p");
+
+        // (g) checkpoint-only lineage extended: strict-extension branch, no resume.
+        let rendered: Vec<u32> = (0..(p + 23) as u32).collect();
+        let got = plan(&at_p, rendered.clone(), true, &ckpts, true, "t");
+        assert_plan(&got, &rendered, p, None, "checkpoint-only lineage extended");
+
+        // (h) cache ineligible: cold even on a divergence that would resume.
+        let rendered = fork(p + 8, 3);
+        let got = plan(&lineage, rendered.clone(), false, &ckpts, true, "t");
+        assert_plan(&got, &rendered, 0, None, "cache ineligible");
+
+        // (i) resume disabled: divergence is cold, a pure extension still hits.
+        let got = plan(&lineage, rendered.clone(), true, &ckpts, false, "t");
+        assert_plan(&got, &rendered, 0, None, "resume disabled, divergence");
+        let ext: Vec<u32> = (0..(l + 20) as u32).collect();
+        let got = plan(&lineage, ext.clone(), true, &ckpts, false, "t");
+        assert_plan(&got, &ext, l, None, "resume disabled, extension");
+    }
+}
+
+// Qwen4 does not plan through the shared conversation planner: its AR and
+// native-MTP prefixes come from the bundle's session cache
+// (`ArchModel::session_plan` with `SessionRoute::{Ar,Mtp}`), which returns a
+// bare `usize` start and never continues a live session. The tests below pin
+// the shared `plan_from_rendered` planner that the Qwen3.5-family AR/DFlash
+// routes still use.
+
+/// Inputs reach the shared planner unchanged: the local Live/EOP candidate is
+/// `plan.start_pos`. An empty lineage (no live record, no EOP record) is a
+/// plain miss.
+#[test]
+fn empty_lineage_is_a_local_miss() {
+    use hipfire_generate::qwen::plan_from_rendered as plan;
+    let rendered: Vec<u32> = (0..64).collect();
+    for ckpts in [&[][..], &[16usize][..], &[16usize, 40][..]] {
+        for resume in [false, true] {
+            let got = plan(&[], rendered.clone(), true, ckpts, resume, "q35");
+            assert_plan(&got, &rendered, 0, None, "empty lineage");
+        }
+    }
+    // Live record plus an EOP checkpoint: the candidate stays the lineage's
+    // own deepest hit.
+    let live: Vec<u32> = (0..40).collect();
+    let got = plan(&live, rendered.clone(), true, &[16], true, "q35");
+    assert_plan(&got, &rendered, 40, None, "live candidate");
+    // EOP-only lineage (checkpoint-length record) yields the EOP candidate.
+    let eop: Vec<u32> = (0..16).collect();
+    let got = plan(&eop, rendered.clone(), true, &[16], true, "q35");
+    assert_plan(&got, &rendered, 16, None, "EOP candidate");
+}
+
+/// A candidate equal to the prompt length leaves no suffix to prefill, so it is
+/// never a hit: every plan keeps a nonempty `new_tokens` tail and
+/// `start_pos < rendered.len()`.
+#[test]
+fn local_candidate_never_covers_the_whole_prompt() {
+    use hipfire_generate::qwen::plan_from_rendered as plan;
+    let seq = |n: usize| -> Vec<u32> { (0..n as u32).collect() };
+    for n in 1..=24usize {
+        let rendered = seq(n);
+        let mut lineages = vec![Vec::new(), seq(n), seq(n + 3)];
+        for keep in 0..=n {
+            // Shared prefix of `keep` tokens, then diverging ids.
+            lineages.push(
+                seq(keep)
+                    .into_iter()
+                    .chain([900_000, 900_001])
+                    .collect::<Vec<u32>>(),
+            );
+            lineages.push(seq(keep));
+        }
+        for lineage in &lineages {
+            for ckpts in [
+                vec![],
+                vec![n],
+                vec![n + 1],
+                vec![(n - 1).max(1)],
+                vec![1, (n / 2).max(1), n],
+            ] {
+                for (eligible, resume) in [(true, true), (true, false), (false, true)] {
+                    let ctx = format!(
+                        "n={n} lineage_len={} ckpts={ckpts:?} eligible={eligible} resume={resume}",
+                        lineage.len()
+                    );
+                    let got = plan(lineage, rendered.clone(), eligible, &ckpts, resume, "q35");
+                    assert!(got.start_pos < n, "{ctx}: start_pos {} >= n", got.start_pos);
+                    assert!(!got.new_tokens.is_empty(), "{ctx}: empty suffix");
+                    assert_eq!(got.new_tokens, rendered[got.start_pos..].to_vec(), "{ctx}");
+                    assert_eq!(got.cached_tokens, got.start_pos, "{ctx}");
+                    assert_eq!(got.cache_hit, got.start_pos > 0, "{ctx}");
+                    assert_eq!(got.rendered, rendered, "{ctx}");
+                }
+            }
+        }
+    }
+}
+
+/// A disabled cache (`HIPFIRE_QWEN_PROMPT_CACHE=0` or eviction active) reaches
+/// the shared planner as `cache_eligible = false`: cold even where a live
+/// extension or checkpoint resume would hit.
+#[test]
+fn cache_disabled_inputs_plan_cold_through_the_shared_planner() {
+    use hipfire_generate::qwen::plan_from_rendered as plan;
+    let lineage: Vec<u32> = (0..50).collect();
+    let extension: Vec<u32> = (0..70).collect();
+    let divergent: Vec<u32> = (0..45).chain(1_000_000..1_000_003).collect();
+    for rendered in [&extension, &divergent] {
+        let got = plan(&lineage, rendered.clone(), false, &[37], true, "q35");
+        assert_plan(&got, rendered, 0, None, "cache disabled");
+    }
+    // The same inputs with the cache enabled hit, so the cold plans above are
+    // due to eligibility alone.
+    let got = plan(&lineage, extension.clone(), true, &[37], true, "q35");
+    assert_plan(&got, &extension, 50, None, "cache enabled extension");
+    let got = plan(&lineage, divergent.clone(), true, &[37], true, "q35");
+    assert_plan(&got, &divergent, 37, Some(37), "cache enabled divergence");
+}
+
+/// Route isolation: only the native MTP speculator selects the Qwen4 spec
+/// route; an n-gram (non-MTP) speculator on arch 16 stays on Qwen4 AR even
+/// when it can sample. Both routes plan their prefix through the bundle's
+/// session cache (`SessionRoute::Ar` / `SessionRoute::Mtp`), never through the
+/// shared conversation planner.
+#[test]
+fn non_mtp_speculators_on_qwen4_stay_on_ar() {
+    for ngram_can_sample in [false, true] {
+        let ngram = GenerationRouteInputs {
+            arch_id: 16,
+            has_speculator: true,
+            speculator_is_mtp: false,
+            ngram_can_sample,
+            ..base()
+        };
+        assert_eq!(
+            select_generation_route(&ngram),
+            GenerationRoute::Qwen4Ar,
+            "{ngram:?}"
+        );
+    }
+}
+
+/// Native MTP stays the native Qwen4 route whether or not an n-gram-style
+/// sampling capability flag is present, and AR routes remain independent of it.
+#[test]
+fn qwen4_native_mtp_with_ngram_flag_remains_the_native_route() {
+    let mtp = GenerationRouteInputs {
+        arch_id: 16,
+        has_speculator: true,
+        speculator_is_mtp: true,
+        ..base()
+    };
+    for ngram_can_sample in [false, true] {
+        assert_eq!(
+            select_generation_route(&GenerationRouteInputs {
+                ngram_can_sample,
+                ..mtp
+            }),
+            GenerationRoute::Qwen4Spec,
+            "ngram_can_sample={ngram_can_sample}"
+        );
+        assert_eq!(
+            select_generation_route(&GenerationRouteInputs {
+                has_speculator: false,
+                speculator_is_mtp: false,
+                ngram_can_sample,
+                ..mtp
+            }),
+            GenerationRoute::Qwen4Ar,
+            "ngram_can_sample={ngram_can_sample} without speculator"
+        );
+    }
+}
+
+#[test]
+fn exact_safe_set_is_qwen_ar_qwen4_ar_mtp_dflash_ds4_ar_ep_spec_glimmer_ar_spec_and_maple_ar() {
     let mut from_all: Vec<GenerationRoute> = GenerationRoute::ALL
         .iter()
         .copied()
@@ -494,13 +978,96 @@ fn exact_safe_set_is_qwen_ar_qwen4_ar_dflash_ds4_ar_ep_spec_glimmer_ar_spec_and_
     let mut expected = SAFE_ROUTES.to_vec();
     expected.sort_by_key(|r| r.name());
     assert_eq!(from_all, expected);
-    assert_eq!(from_all.len(), 9);
+    assert_eq!(from_all.len(), 10);
     // Negative: every other ALL member is denied for tools.
     for &r in GenerationRoute::ALL {
         if !SAFE_ROUTES.contains(&r) {
             assert!(!r.supports_tools(), "{:?} must not be tool-safe", r);
         }
     }
+}
+
+#[test]
+fn stop_sequences_are_honoured_exactly_on_the_qwen_semantic_producers() {
+    // Qwen4 AR and native MTP joined the Qwen3.5-family AR/DFlash routes: an
+    // eval request with `stop` on Flash-Next used to be refused with 400.
+    let mut with_stop: Vec<&str> = GenerationRoute::ALL
+        .iter()
+        .filter(|r| r.supports_stop())
+        .map(|r| r.name())
+        .collect();
+    with_stop.sort_unstable();
+    assert_eq!(
+        with_stop,
+        ["qwen4_ar", "qwen4_spec", "qwen_ar", "qwen_dflash"]
+    );
+    // Both Qwen4 routes a Flash-Next load can select carry tools AND stop, so
+    // attaching MTP never changes which request shapes are accepted.
+    for route in [GenerationRoute::Qwen4Ar, GenerationRoute::Qwen4Spec] {
+        assert!(route.supports_tools() && route.supports_stop(), "{route:?}");
+    }
+}
+
+#[test]
+fn dense_tp_qwen_with_mtp_takes_the_spec_route_only_when_it_can_serve() {
+    // Dense TP (arch 5 under an EP-shaped topology) with an MTP drafter serves
+    // greedy and sampled-verify requests on the spec route; anything it cannot
+    // verify stays on the EP AR arm.
+    let tp_mtp = GenerationRouteInputs {
+        arch_id: 5,
+        ep: true,
+        dense_tp: true,
+        has_speculator: true,
+        speculator_is_mtp: true,
+        supports_temp_swor: true,
+        temp: 0.0,
+        ..base()
+    };
+    assert_eq!(
+        select_generation_route(&tp_mtp),
+        GenerationRoute::QwenDflash
+    );
+    let sampled = GenerationRouteInputs {
+        temp: 0.7,
+        ..tp_mtp
+    };
+    assert_eq!(
+        select_generation_route(&sampled),
+        GenerationRoute::QwenDflash
+    );
+    // A drafter that cannot verify sampled output keeps temp>0 on the AR arm.
+    let greedy_only = GenerationRouteInputs {
+        temp: 0.7,
+        supports_temp_swor: false,
+        ..tp_mtp
+    };
+    assert_eq!(
+        select_generation_route(&greedy_only),
+        GenerationRoute::QwenAr
+    );
+    // Forced AR chat, adaptive KV and non-MTP drafters never reach it.
+    let forced_ar = GenerationRouteInputs {
+        force_ar_chat: true,
+        ..tp_mtp
+    };
+    assert_eq!(select_generation_route(&forced_ar), GenerationRoute::QwenAr);
+    let adaptive = GenerationRouteInputs {
+        kv_adaptive: true,
+        ..tp_mtp
+    };
+    assert_eq!(select_generation_route(&adaptive), GenerationRoute::QwenAr);
+    let ngram = GenerationRouteInputs {
+        speculator_is_mtp: false,
+        ..tp_mtp
+    };
+    assert_eq!(select_generation_route(&ngram), GenerationRoute::QwenAr);
+    // The MoE EP topology keeps its EP route even with a drafter attached.
+    let moe = GenerationRouteInputs {
+        arch_id: 6,
+        dense_tp: false,
+        ..tp_mtp
+    };
+    assert_eq!(select_generation_route(&moe), GenerationRoute::QwenAr);
 }
 
 #[test]
@@ -1079,4 +1646,15 @@ fn route_cancel_releases_start_latch_and_claims_once() {
     );
     clear_terminal_control();
     set_active_attempt_id(0);
+}
+
+/// VL and pipeline-parallel `done` carry `finish_reason`: a budget that runs
+/// out is `length`, a terminator (even on the last budget token) is `stop`.
+#[test]
+fn vl_and_pp_done_report_length_on_budget_exhaustion() {
+    assert_eq!(length_or_stop(16, 16, false), "length");
+    assert_eq!(length_or_stop(16, 16, true), "stop");
+    assert_eq!(length_or_stop(5, 16, true), "stop");
+    // Early exit without a terminator (loop guard / forced EOS) is a stop.
+    assert_eq!(length_or_stop(5, 16, false), "stop");
 }

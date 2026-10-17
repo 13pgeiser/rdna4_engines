@@ -17,6 +17,7 @@ arch-qwen35-vl = ["dep:hipfire-arch-qwen35-vl"]
 arch-llama = ["dep:hipfire-arch-llama"]
 arch-qwen2 = ["dep:hipfire-arch-qwen2"]
 arch-deepseek4 = ["dep:hipfire-arch-deepseek4"]
+qwen4-dev-profiles = ["hipfire-arch-qwen4/qwen4-dev-profiles"]
 # Test-only: compile the HIPFIRE_EP_FAIL_RANK partial-load fault injector. OFF by
 # default so production builds can never synthetically fail an EP load.
 ep-fault-inject = []
@@ -25,6 +26,7 @@ ep-fault-inject = []
 rdna-compute = { path = "../rdna-compute" }
 hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-dispatch = { path = "../hipfire-dispatch" }
 hip-bridge = { path = "../hip-bridge" }
 saddle-core = { path = "../saddle-core" }
 # Optional arch crate deps — feature-gated.
@@ -38,6 +40,7 @@ hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
 # Public accessor types (Lfm2MoeBundle.vision_* fields are lfm2-vl types).
 hipfire-arch-lfm2-vl = { path = "../hipfire-arch-lfm2-vl" }
 hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
+hipfire-arch-qwen35-embed = { path = "../hipfire-arch-qwen35-embed" }
 hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
 hipfire-arch-maple = { path = "../hipfire-arch-maple" }
 hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
@@ -46,6 +49,12 @@ hipfire-arch-qwen4 = { path = "../hipfire-arch-qwen4" }
 hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
 hipfire-arch-diffusion = { path = "../hipfire-arch-diffusion" }
 serde_json.workspace = true
+
+# fn_ep_oracle (lab example) only: the MoE dump context hook, SHA-256 and the
+# Qwen4 lab head-state digest (`lab_resident_head_items`).
+[dev-dependencies]
+hipfire-arch-qwen4 = { path = "../hipfire-arch-qwen4", features = ["lab"] }
+sha2.workspace = true
 
 # ---------------------------------------------------------------------------
 # Archived research probes.
@@ -66,4 +75,8 @@ serde_json.workspace = true
 # ---------------------------------------------------------------------------
 [[example]]
 name = "dspark_qwen3_1window"
+required-features = ["lab"]
+
+[[example]]
+name = "fn_ep_oracle"
 required-features = ["lab"]

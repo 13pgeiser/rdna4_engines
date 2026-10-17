@@ -595,6 +595,11 @@ mod imp {
 
         /// Mutable view of the BO memory. Caller must hold no other live
         /// slice of the same BO.
+        // A `Bo` is a cheap `Clone` handle over `Arc<BoState>`, so `&mut self`
+        // would not buy real exclusivity (a clone can hand out the same view);
+        // the invariant is the caller contract documented above, which is the
+        // pattern clippy's `mut_from_ref` cannot model.
+        #[allow(clippy::mut_from_ref)]
         pub fn as_mut_slice(&self) -> &mut [u8] {
             // SAFETY: as above; device writes only happen between submit and
             // wait, during which the caller must not touch the memory.
@@ -752,11 +757,9 @@ mod imp {
                 unsafe { libc::close(fd) };
                 return Err(e);
             }
-            // mlock attempted; failure only degrades (probe behavior).
-            // SAFETY: our mapping.
-            unsafe {
-                libc::mlock(heap_cpu, HEAP_SIZE);
-            }
+            // No mlock: the driver keeps BO pages resident (pinned, unevictable shmem) and maps them
+            // VM_PFNMAP, where mlock only tests RLIMIT_MEMLOCK and locks nothing. See railgun::npu
+            // `Device::map_heap` for the amdxdna/mm citations.
 
             // --- hardware context ---
             let qos = super::QosInfo::default(); // reference QoS: all zero
@@ -829,10 +832,6 @@ mod imp {
                 unsafe { libc::close(fd) };
                 return Err(e);
             }
-            // SAFETY: our mapping.
-            unsafe {
-                libc::mlock(cmd_ptr, map_len);
-            }
 
             Ok(Self {
                 inner: Arc::new(DeviceInner {
@@ -893,10 +892,6 @@ mod imp {
                     let e = XdnaError::os("alloc-map");
                     cleanup_handle(inner.fd, handle);
                     return Err(e);
-                }
-                // SAFETY: our mapping.
-                unsafe {
-                    libc::mlock(p, map_len);
                 }
                 (p as *mut u8, map_len)
             };
@@ -1232,6 +1227,9 @@ mod imp_stub {
         pub fn as_slice(&self) -> &[u8] {
             &[]
         }
+        // See the linux `Bo::as_mut_slice`: `Bo` is a shared handle, so the
+        // lint's suggested `&mut self` is not the right shape here either.
+        #[allow(clippy::mut_from_ref)]
         pub fn as_mut_slice(&self) -> &mut [u8] {
             // SAFETY: zero-length, aligned, never dereferenced for I/O.
             unsafe { &mut *std::ptr::slice_from_raw_parts_mut(std::ptr::NonNull::dangling().as_ptr(), 0) }

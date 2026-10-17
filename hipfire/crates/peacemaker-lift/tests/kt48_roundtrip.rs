@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! C7: KT48 end-to-end round-trip gates (core.md §8, T1–T10) plus the F2/iu4 bundle round
 //! trips, exercised only through public APIs: `lift_object` → typed program → `emit`.
 //! Errata (Main): KT48's selected kernel has 25 args (11 explicit + 14 hidden); the sound
@@ -161,9 +165,9 @@ fn selected_kernel_stream_is_reencoded_not_copied() {
 #[test]
 fn builder_bundles_round_trip() {
     for (relative, sha, kernels, bytes) in [
-        ("../../kernels/gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco", "73168098cae2d414ad8e0c97883b0c953350fbd2795af763d34a367085dcce4e", 12, 362_032),
-        ("../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco", "c6e714e7d189e26bea6c4d7ee178e6a1834a77dec19b3354f172ba38373769f8", 5, 83_224),
-        ("../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco", "d5190d97df5e15fbf53aef47593d5fff49dd0732ef4fc13ed641d63c03015d63", 5, 83_504),
+        ("../../kernels/gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco", "1efb0b8b16b510407446dae8dc4ec137955de27d818b424daeb84383c8191fa7", 12, 361_976),
+        ("../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1.hxaco", "f166cf72f3c49c286aacbc627beeb204b6022fbf5865db8785dc7b54bce3321d", 5, 83_120),
+        ("../../kernels/gemm_mq4g256v2_residual_mmq_iu4_gfx12_b1s.hxaco", "5114752c0a7c5f0f41f3fb44a58806010bb819ba8e034949df7302c1943bd1dc", 5, 83_400),
     ] {
         let input = load(relative, sha);
         assert_eq!(input.len(), bytes);
@@ -329,9 +333,12 @@ fn rejection(result: Result<Lifted<Program>, LiftError>) -> (Option<String>, u64
     }
 }
 
+#[path = "../../rocm.rs"]
+mod rocm;
+
 /// Pinned second-opinion toolchain: `PEACEMAKER_ROCM` must hold the tools (fail, never
-/// skip); `PEACEMAKER_NO_ROCM` forces the committed-fixture path; otherwise the default
-/// install is used when present.
+/// skip); `PEACEMAKER_NO_ROCM` forces the committed-fixture path; otherwise `ROCM_PATH`
+/// (default `/opt/rocm`) is required unless explicitly disabled.
 struct Tools {
     objdump: PathBuf,
     mc: PathBuf,
@@ -344,11 +351,13 @@ fn toolchain() -> Option<Tools> {
         assert!(tools.objdump.is_file() && tools.mc.is_file(), "PEACEMAKER_ROCM={root:?} holds no llvm-objdump/llvm-mc");
         return Some(tools);
     }
-    if std::env::var_os("PEACEMAKER_NO_ROCM").is_some() {
+    if std::env::var_os("PEACEMAKER_NO_ROCM").is_some() || rocm::tests_disabled() {
         return None;
     }
-    let tools = at(Path::new("/opt/rocm/core-10.0"));
-    (tools.objdump.is_file() && tools.mc.is_file()).then_some(tools)
+    let root = rocm::root();
+    let tools = at(&root);
+    assert!(tools.objdump.is_file() && tools.mc.is_file(), "required ROCm tools missing from {}", root.display());
+    Some(tools)
 }
 
 #[derive(Debug, PartialEq)]
@@ -462,7 +471,7 @@ fn wait_facts_and_obligations() {
     assert_eq!(counts.kmcnt, vec![0; 7]);
     assert_eq!((counts.loadcnt, counts.dscnt, counts.loadcnt_dscnt, counts.alu), (16, 28, 3, 142));
 
-    let facts = replay(body, ARCH).unwrap();
+    let facts = replay(body, ARCH, kernel.wave).unwrap();
     assert_eq!(facts.obligations.len(), 124);
     let ds_stores: Vec<_> = facts.events.iter()
         .filter(|e| name(body.insts.get(e.inst).unwrap()) == "ds_store_2addr_b64")
@@ -494,7 +503,7 @@ fn wait_facts_and_obligations() {
     mutated[at..at + 4].copy_from_slice(&0xbfc7_0001u32.to_le_bytes());
     let weakened = lift(&mutated, Frontend::Hipcc);
     let body = &selected(&weakened.program).body;
-    let facts = replay(body, ARCH).unwrap();
+    let facts = replay(body, ARCH, selected(&weakened.program).wave).unwrap();
     let load = body.insts.get(smem[0].inst).unwrap();
     assert_eq!(name(load), "s_load_b128");
     let stranded: Vec<_> = facts.obligations.iter()
@@ -514,7 +523,7 @@ fn wait_facts_and_obligations() {
 fn replay_follows_feasible_paths_only() {
     let lifted = lift(&kt48_co(), Frontend::Hipcc);
     let kernel = selected(&lifted.program);
-    let facts = peacemaker_ir::passes::waits::replay(&kernel.body, ARCH).unwrap();
+    let facts = peacemaker_ir::passes::waits::replay(&kernel.body, ARCH, kernel.wave).unwrap();
     let sites: BTreeSet<usize> = facts.obligations.iter().map(|o| position(kernel, o.insts[0])).collect();
     for site in [956, 957, 973, 974] {
         assert!(sites.contains(&site), "feasible first-iteration site {site}");

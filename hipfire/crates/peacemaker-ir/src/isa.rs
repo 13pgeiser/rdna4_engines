@@ -1,6 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Per-target opcode/encoding rows. Tables are backed by AMD XML and pinned LLVM samples.
 use std::sync::LazyLock;
 use crate::inst::{Arch, Family, Form, Opcode, VmemForm};
+use crate::operand::CachePolicy;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FieldClass { Ignored, Honored }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -12,6 +17,40 @@ pub struct OpRow {
     pub implicit: &'static str, pub counter: &'static str,
     pub sample: &'static str, pub encoding: &'static str,
     pub benign_src2: Vec<u16>, pub fields: Vec<FieldRule>,
+}
+impl OpRow {
+    /// Printed operand slots `(field, bits)` in grammar order. A slot tagged
+    /// `@rtn` (a gfx11 VMEM atomic's `VDST`) exists only in the returning form;
+    /// untyped markers (`literal@last`, `-`) are not slots.
+    pub fn slots(&self, returns: bool) -> impl Iterator<Item = (&'static str, u16)> {
+        let grammar: &'static str = self.grammar;
+        grammar.split(',').filter_map(move |part| {
+            let (name, bits) = part.split_once(':')?;
+            let bits = bits.parse().ok()?;
+            match name.strip_suffix("@rtn") {
+                Some(name) => returns.then_some((name, bits)),
+                None => Some((name, bits)),
+            }
+        })
+    }
+    /// Counter rules `(counter, units)`. A rule tagged `@rtn` / `@nortn` applies
+    /// only to the returning / non-returning form of a VMEM atomic.
+    pub fn counter_rules(&self, returns: bool) -> impl Iterator<Item = (&'static str, &'static str)> {
+        let counter: &'static str = self.counter;
+        counter.split(',').filter_map(move |pair| {
+            let (counter, units) = pair.split_once(':')?;
+            match units.split_once('@') {
+                Some((units, "rtn")) => returns.then_some((counter, units)),
+                Some((units, "nortn")) => (!returns).then_some((counter, units)),
+                _ => Some((counter, units)),
+            }
+        })
+    }
+}
+/// Whether a VMEM atomic returns its pre-op value: `glc` on gfx11, `th` bit 0
+/// (`TH_ATOMIC_RETURN`) on gfx12. Only rows with `@rtn`/`@nortn` tags consult it.
+pub fn atomic_returns(arch: Arch, cpol: &CachePolicy) -> bool {
+    if arch == Arch::Gfx1201 { cpol.th & 1 != 0 } else { cpol.glc }
 }
 #[derive(Debug, thiserror::Error)]
 pub enum TableError {
@@ -39,10 +78,14 @@ fn family(form: Form) -> Family {
         Form::Vop1 | Form::Vop1Dpp => Family::Vop1, Form::Vop2 | Form::Vop2Dpp => Family::Vop2, Form::Vopc => Family::Vopc,
         Form::Vop3 => Family::Vop3, Form::Vop3p => Family::Vop3p,
         Form::Vopd => Family::Vopd, Form::Vinterp => Family::Vinterp, Form::Ds => Family::Ds,
-        Form::Vmem(_) => Family::Vmem, Form::Export => Family::Export,
+        Form::Vmem(VmemForm::Global) => Family::VmemGlobal, Form::Vmem(VmemForm::Scratch) => Family::VmemScratch,
+        Form::Vmem(VmemForm::Flat) => Family::VmemFlat, Form::Vmem(VmemForm::Buffer) => Family::VmemBuffer,
+        Form::Vmem(VmemForm::Image) => Family::VmemImage, Form::Export => Family::Export,
     }
 }
 /// Tab-separated: `name form opcode grammar defs uses implicit counter sample words field-rules`.
+/// A VMEM atomic whose return is a cache-policy bit (gfx11 `glc`) is one row: its
+/// destination slot is tagged `VDST@rtn:N` and its counter rules `@rtn` / `@nortn`.
 pub fn parse_gfx12() -> Result<Vec<OpRow>, TableError> {
     parse(include_str!("../isa/gfx12.tbl"))
 }
@@ -67,6 +110,14 @@ fn parse(contents: &'static str) -> Result<Vec<OpRow>, TableError> {
                 .collect::<Result<Vec<_>, _>>()?;
             if parts[0] == "src2_unused" { benign_src2 = allowed.iter().map(|&v| v as u16).collect(); }
             rule_fields.push(FieldRule { name: parts[0], class, mask, allowed });
+        }
+        let tagged_slot = fields[3].split(',').filter(|part| part.contains('@') && *part != "literal@last")
+            .map(|part| part.split(':').next().unwrap_or("").ends_with("@rtn")).reduce(|a, b| a && b);
+        let tagged_counter = fields[7].split(',').filter_map(|pair| pair.split_once('@'))
+            .map(|(_, tag)| matches!(tag, "rtn" | "nortn")).reduce(|a, b| a && b);
+        if tagged_slot == Some(false) || tagged_counter == Some(false) { return Err(fail("unknown return-form tag")); }
+        if (tagged_slot.is_some() || tagged_counter.is_some()) && !matches!(kind, Form::Vmem(_)) {
+            return Err(fail("return-form tags apply to VMEM atomics only"));
         }
         let row = OpRow { op: Opcode { family: family(kind), id }, form: kind, name: fields[0],
             grammar: fields[3], defs: fields[4], uses: fields[5], implicit: fields[6], counter: fields[7],

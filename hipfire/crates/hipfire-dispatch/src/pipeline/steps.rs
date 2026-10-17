@@ -5,6 +5,7 @@
 //! fusion table (all per-op fallback).
 
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::ops::Range;
 use std::sync::OnceLock;
 
 use crate::context::DispatchCtx;
@@ -12,6 +13,7 @@ use crate::cpu_exec;
 use crate::families::fused_qkv::{FusedQkvBiasParams, FusedQkvFamily, FusedQkvParams};
 use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
 use crate::families::rotation::{RotationFamily, RotationParams};
+use crate::pipeline::layer_ops::MixerPhase;
 use crate::pipeline::sealed_moe;
 use crate::types::GemvVariant;
 use crate::types::{DispatchError, KernelKey, PipelineOp, RotationPlan, RotationVariant};
@@ -104,6 +106,22 @@ pub enum Step<'a> {
     Project(crate::pipeline::layer_ops::ProjectOp<'a>),
     /// Per-row broadcast add of one activation row.
     BroadcastAdd(crate::pipeline::layer_ops::BroadcastAddOp<'a>),
+    /// Dense gated feed-forward block (gate/up projections, SiLU product,
+    /// down projection) with the source's BF16 storage boundaries.  Opaque to
+    /// fusion: no HC read/write pairing or epilogue fold crosses it.
+    DenseFfn(crate::pipeline::layer_ops::DenseFfnOp<'a>),
+    /// Sandwich-norm attention sublayer.
+    SandwichAttention(crate::pipeline::sandwich::SandwichAttentionOp<'a>),
+    /// Sandwich-norm gated MLP sublayer.
+    SandwichMlp(crate::pipeline::sandwich::SandwichMlpOp<'a>),
+    /// Parallel dense + routed-expert MLP sublayer.
+    ParallelMoeMlp(crate::pipeline::sandwich::ParallelMoeMlpOp<'a>),
+    /// Sandwich-norm per-layer-input branch.
+    PerLayerInput(crate::pipeline::sandwich::PerLayerInputOp<'a>),
+    /// In-place scalar multiply.
+    Scale(crate::pipeline::sandwich::ScaleOp<'a>),
+    /// In-place final-logit soft cap.
+    Softcap(crate::pipeline::sandwich::SoftcapOp<'a>),
     /// Complete validated MoE program; granular operands come from its shared lowerer.
     Moe(sealed_moe::SealedMoeCall<'a>),
     /// Validated granular MoE stage; the sealed call is still the public authority.
@@ -135,7 +153,14 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::Project(_)
         | Step::BroadcastAdd(_)
         | Step::Moe(_)
-        | Step::MoeStage(..) => None,
+        | Step::DenseFfn(_)
+        | Step::MoeStage(..)
+        | Step::SandwichAttention(_)
+        | Step::SandwichMlp(_)
+        | Step::ParallelMoeMlp(_)
+        | Step::PerLayerInput(_)
+        | Step::Scale(_)
+        | Step::Softcap(_) => None,
     }
 }
 
@@ -756,6 +781,7 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::HyperNorm(op) => op.validate_for_gpu(gpu)?,
             Step::Project(op) => op.validate_for_gpu(gpu)?,
             Step::BroadcastAdd(op) => op.validate_for_gpu(gpu)?,
+            Step::DenseFfn(op) => op.validate_for_gpu(gpu)?,
             _ => {}
         }
     }
@@ -771,6 +797,28 @@ pub fn execute_steps<'a>(
     execute_validated_steps(gpu, ctx, steps)
 }
 
+/// Host work a caller interleaves around every `Step::Moe` of a program run
+/// by [`execute_validated_steps_with_moe_hooks`] (Qwen4's G2 expert staging:
+/// wait for a staged layer's experts, then free / refill its stage).
+pub trait MoeStepHooks {
+    /// Before the call's first launch (its target's zero fill included when
+    /// the call takes that fill over).
+    fn before_moe(&mut self, gpu: &mut Gpu) -> Result<(), DispatchError>;
+    /// Right after the call's last launch.
+    fn after_moe(&mut self, gpu: &mut Gpu) -> Result<(), DispatchError>;
+}
+
+struct NoMoeHooks;
+
+impl MoeStepHooks for NoMoeHooks {
+    fn before_moe(&mut self, _gpu: &mut Gpu) -> Result<(), DispatchError> {
+        Ok(())
+    }
+    fn after_moe(&mut self, _gpu: &mut Gpu) -> Result<(), DispatchError> {
+        Ok(())
+    }
+}
+
 /// Execute a list after [`validate_steps`] has completed.  This entry point is
 /// for architecture owners that must preflight the entire list before other
 /// request effects begin.
@@ -779,17 +827,223 @@ pub fn execute_validated_steps<'a>(
     ctx: &DispatchCtx,
     steps: &[Step<'a>],
 ) -> Result<(), DispatchError> {
-    let mut i = 0;
+    execute_validated_steps_with_moe_hooks(gpu, ctx, steps, &mut NoMoeHooks)
+}
+
+/// [`execute_validated_steps`] with `hooks` run around each `Step::Moe`, so a
+/// caller that must act between MoE calls still hands the interpreter the
+/// whole program and every fusion across a MoE call (HC read/write pairing,
+/// the combine zero-init, the shared-down fold) stays admitted.
+pub fn execute_validated_steps_with_moe_hooks<'a>(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    steps: &[Step<'a>],
+    hooks: &mut dyn MoeStepHooks,
+) -> Result<(), DispatchError> {
+    execute_window(
+        gpu,
+        ctx,
+        steps,
+        0..steps.len(),
+        &mut HcFusionCursor::default(),
+        hooks,
+    )
+}
+
+/// HC fusion pairing state of one program, carried between the windows of a
+/// program that its owner executes piecewise (the NPU pair route runs each
+/// layer as prepare `[start..mixer)`, an out-of-interpreter mixer Core, then
+/// `[mixer..end)`).  Indices are into the whole program.  A fresh cursor per
+/// program run; the tensors a pending entry refers to (the paired write's
+/// `gates`, BF16 streams) must survive whatever the owner runs between
+/// windows.
+#[derive(Debug, Default)]
+pub struct HcFusionCursor {
     // A fused hyper write that produced the gate quarters of the hyper write
     // at this index, and the quarter slot it used.
-    let mut gates_ready: Option<(usize, usize)> = None;
-    while i < steps.len() {
+    gates_ready: Option<(usize, usize)>,
+    // The hyper write at this index takes its gates from its paired read
+    // (`HIPFIRE_QWEN4_HC_FUSE` >= 1, see `paired_hyper_write`).
+    pregated: Option<usize>,
+    // The hyper read at this index had its norm + paired-write gates produced
+    // by the preceding MoE call's HC row fold (`HIPFIRE_QWEN4_HC_ROW_FOLD`).
+    prenormed: Option<usize>,
+}
+
+/// [`execute_validated_steps`] over `program[window]`, with the HC pairings
+/// looked up in the whole `program` and their state kept in `cursor` across
+/// calls.  A fusion only consumes steps inside `window`; a pairing that
+/// reaches past `window.end` stays pending in `cursor` for the window that
+/// runs that step.  A paired read hands its gates past the window only to a
+/// BF16-stream write, whose kernel reads the gates and streams but not the
+/// shared `normalized` scratch.
+pub fn execute_validated_steps_window<'a>(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    program: &[Step<'a>],
+    window: std::ops::Range<usize>,
+    cursor: &mut HcFusionCursor,
+) -> Result<(), DispatchError> {
+    execute_window(gpu, ctx, program, window, cursor, &mut NoMoeHooks)
+}
+
+fn execute_window<'a>(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    steps: &[Step<'a>],
+    window: std::ops::Range<usize>,
+    cursor: &mut HcFusionCursor,
+    hooks: &mut dyn MoeStepHooks,
+) -> Result<(), DispatchError> {
+    let end = window.end;
+    let mut i = window.start;
+    let HcFusionCursor {
+        gates_ready,
+        pregated,
+        prenormed,
+    } = cursor;
+    let hc_level = if cpu_exec::cpu_exec_enabled() {
+        0
+    } else {
+        gpu.flags.qwen4_hc_fuse_level()
+    };
+    let hc_fuse = hc_level >= 1;
+    let moe_zinit = !cpu_exec::cpu_exec_enabled() && gpu.flags.qwen4_moe_combine_zinit_enabled();
+    while i < end {
+        if hc_fuse {
+            use crate::pipeline::layer_ops::{
+                execute_gated_delta_net_hc, execute_hyper_read_paired,
+                execute_hyper_read_prenormed, execute_hyper_write_pregated,
+                execute_indexed_attention_hc, hyper_read_pairs_write,
+            };
+            match &steps[i] {
+                Step::HyperWrite(write) if *pregated == Some(i) => {
+                    *pregated = None;
+                    execute_hyper_write_pregated(gpu, write)?;
+                    i += 1;
+                    continue;
+                }
+                Step::HyperRead(read) => {
+                    if let Some((j, write)) = paired_hyper_write(steps, i + 1, read)
+                        .filter(|(j, write)| *j < end || write.state_bf16)
+                    {
+                        if hyper_read_pairs_write(gpu, read, write) {
+                            if *prenormed == Some(i) {
+                                *prenormed = None;
+                                execute_hyper_read_prenormed(gpu, read, write)?;
+                                *pregated = Some(j);
+                            } else if execute_hyper_read_paired(gpu, read, write)? {
+                                *pregated = Some(j);
+                            }
+                            gpu.scratch.prerotated = None;
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+                // H4 (`HIPFIRE_QWEN4_HC_FUSE` >= 2): the mixer whose paired
+                // write already has its gates carries that write in its output
+                // projection's epilogue; unfused when its projection is not
+                // covered (the write then runs pregated as at level 1).
+                Step::GatedDeltaNet(op)
+                    if hc_level >= 2
+                        && i + 1 < end
+                        && *pregated == Some(i + 1)
+                        && matches!(op.phase, MixerPhase::Whole | MixerPhase::OutProj) =>
+                {
+                    if let Step::HyperWrite(write) = &steps[i + 1] {
+                        let mut fused = false;
+                        execute_gated_delta_net_hc(gpu, op, Some(write), &mut fused)?;
+                        gpu.scratch.prerotated = None;
+                        if fused {
+                            *pregated = None;
+                        }
+                        i += 1 + usize::from(fused);
+                        continue;
+                    }
+                }
+                Step::IndexedAttention(op)
+                    if hc_level >= 2
+                        && i + 1 < end
+                        && *pregated == Some(i + 1)
+                        && matches!(op.phase, MixerPhase::Whole | MixerPhase::OutProj) =>
+                {
+                    if let Step::HyperWrite(write) = &steps[i + 1] {
+                        let mut fused = false;
+                        execute_indexed_attention_hc(gpu, op, Some(write), &mut fused)?;
+                        gpu.scratch.prerotated = None;
+                        if fused {
+                            *pregated = None;
+                        }
+                        i += 1 + usize::from(fused);
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A sealed MoE call after its target's zero fill.  H8a
+        // (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`): the call's qt44 combine takes
+        // over the fill when it can start from +0.0, else the fill runs first
+        // inside the call.  H4 level 3 (`HIPFIRE_QWEN4_HC_FUSE` >= 3): when the
+        // hyper write that closes the block already has its gates, the shared
+        // down may carry it; a write so carried is skipped.
+        if moe_zinit || hc_level >= 3 {
+            if let (Step::Clear(clear), Some(Step::Moe(call))) =
+                (&steps[i], steps[..end].get(i + 1))
+            {
+                let write = match steps[..end].get(i + 2) {
+                    Some(Step::HyperWrite(write)) if hc_level >= 3 && *pregated == Some(i + 2) => {
+                        Some(write)
+                    }
+                    _ => None,
+                };
+                // Row fold lookahead: the HyperRead of the same streams right
+                // after the write, with its own paired write (the same pairing
+                // the read itself will take), on the F16 WMMA read route.  The
+                // read may open the caller's next window of this program.
+                let next = match (write, steps.get(i + 3)) {
+                    (Some(write), Some(Step::HyperRead(read)))
+                        if gpu.flags.qwen4_hc_row_fold_enabled()
+                            && read.input.buf.as_ptr() == write.output.buf.as_ptr()
+                            && read.rows == write.rows =>
+                    {
+                        paired_hyper_write(steps, i + 4, read)
+                            .filter(|(_, next_write)| {
+                                crate::pipeline::layer_ops::hyper_read_prenorm_applies(
+                                    gpu, read, next_write,
+                                )
+                            })
+                            .map(|(j, next_write)| (j, read, next_write))
+                    }
+                    _ => None,
+                };
+                gpu.scratch.prerotated = None;
+                hooks.before_moe(gpu)?;
+                let done = crate::pipeline::sealed_moe::execute_sealed_after_clear(
+                    gpu,
+                    call,
+                    clear,
+                    write,
+                    next.map(|(_, read, next_write)| (read, next_write)),
+                )?;
+                hooks.after_moe(gpu)?;
+                if done.folded {
+                    *pregated = None;
+                }
+                if done.row_folded {
+                    *prenormed = Some(i + 3);
+                }
+                i += 2 + usize::from(done.folded);
+                continue;
+            }
+        }
         // Fusion is bypassed for a window that contains a CPU-executed step: a
         // fused entry is one kernel launch over several weights, so it cannot
         // half-land on the CPU seam, and splitting it costs launches it was
         // there to save — nothing else. (Fusion has no numerical contract to
         // preserve here; see the module docs on the tolerance contract.)
-        let fused = match_prefix(FUSED_TABLE, &steps[i..], ctx).filter(|(_, len)| {
+        let fused = match_prefix(FUSED_TABLE, &steps[i..end], ctx).filter(|(_, len)| {
             !cpu_exec::cpu_exec_enabled()
                 || !steps[i..i + *len]
                     .iter()
@@ -812,18 +1066,34 @@ pub fn execute_validated_steps<'a>(
             launch_fused(gpu, ctx, key, &steps[i..i + len])?;
             i += len;
         } else if let Some(plan) = cpu_exec::plan_step(gpu, &steps[i]) {
-            cpu_exec::run_step(gpu, &plan)?;
+            let moe = matches!(steps[i], Step::Moe(_));
+            if moe {
+                hooks.before_moe(gpu)?;
+            }
+            // `memory.offload_exec=passback` may split this step across both
+            // engines; `Ok(false)` (the mode is off, or this shape is not
+            // splittable) leaves it wholly to the CPU, which is `cpu` mode's own
+            // route — never `pcie`.
+            if !crate::offload_split::run(gpu, ctx, &steps[i])? {
+                cpu_exec::run_step(gpu, &plan)?;
+            }
+            if moe {
+                hooks.after_moe(gpu)?;
+            }
             i += 1;
         } else {
             if cpu_exec::cpu_exec_enabled() && cpu_exec::reads_host_mapped_weight(gpu, &steps[i]) {
-                // Host-mapped weight that the CPU could not take: an unsupported
-                // quant format, or a step shape that never reached the seam. Counted
-                // so the failure is visible instead of silent (see the coverage
-                // line at load and `cpu_exec_counters`).
+                // Host-mapped GEMV weight that the CPU could not take: an
+                // unsupported quant format, or a step shape that never reached the
+                // seam. Counted so the failure is visible instead of silent (see
+                // the coverage line at load and `cpu_exec_counters`). This counter
+                // covers GEMV/GEMV-residual steps in the step seam only; the MoE
+                // tier's coverage is reported by the load-time coverage line, which
+                // remains the authority there.
                 cpu_exec::count_host_mapped_gpu_step();
             }
             if let (Step::HyperWrite(write), Some(Step::HyperRead(read))) =
-                (&steps[i], steps.get(i + 1))
+                (&steps[i], steps[..end].get(i + 1))
             {
                 use crate::pipeline::layer_ops::{
                     execute_hyper_write_then_read, hyper_gate_quarters,
@@ -832,15 +1102,16 @@ pub fn execute_validated_steps<'a>(
                     .filter(|(at, _)| *at == i)
                     .and_then(|(_, slot)| hyper_gate_quarters(write, slot));
                 let slot = gates_ready.map_or(0, |(_, slot)| slot ^ 1);
-                let next =
-                    next_fused_hyper_write(steps, i + 2, read).and_then(|j| match &steps[j] {
+                let next = next_fused_hyper_write(steps, i + 2, read)
+                    .filter(|&j| j < end)
+                    .and_then(|j| match &steps[j] {
                         Step::HyperWrite(next) => {
                             hyper_gate_quarters(next, slot).map(|q| (j, next, q))
                         }
                         _ => None,
                     });
                 // A Clear right after the read is folded into the same launch.
-                let clear = match steps.get(i + 2) {
+                let clear = match steps[..end].get(i + 2) {
                     Some(Step::Clear(op)) => Some(op),
                     _ => None,
                 };
@@ -848,11 +1119,19 @@ pub fn execute_validated_steps<'a>(
                 // the read writes that rotation too (consumed by the mixer's
                 // first rotate, cleared after that step).
                 let mixed = read.mixed.buf.as_ptr();
-                let rotate_into = match steps.get(i + if clear.is_some() { 3 } else { 2 }) {
-                    Some(Step::GatedDeltaNet(op)) if op.input.buf.as_ptr() == mixed => {
+                let rotate_into = match steps[..end].get(i + if clear.is_some() { 3 } else { 2 }) {
+                    // Only a phase that rotates its `input` can take the read's
+                    // rotation: the core and the output projection never do.
+                    Some(Step::GatedDeltaNet(op))
+                        if op.input.buf.as_ptr() == mixed
+                            && matches!(op.phase, MixerPhase::Whole | MixerPhase::InProj) =>
+                    {
                         Some(op.rotation)
                     }
-                    Some(Step::IndexedAttention(op)) if op.input.buf.as_ptr() == mixed => {
+                    Some(Step::IndexedAttention(op))
+                        if op.input.buf.as_ptr() == mixed
+                            && matches!(op.phase, MixerPhase::Whole | MixerPhase::InProj) =>
+                    {
                         Some(op.rotation)
                     }
                     Some(Step::Moe(call)) => call
@@ -883,12 +1162,19 @@ pub fn execute_validated_steps<'a>(
                     clear,
                     rotate_into,
                 )? {
-                    gates_ready = next.filter(|_| produced).map(|(j, _, _)| (j, slot));
+                    *gates_ready = next.filter(|_| produced).map(|(j, _, _)| (j, slot));
                     i += if clear.is_some() { 3 } else { 2 };
                     continue;
                 }
             }
+            let moe = matches!(steps[i], Step::Moe(_));
+            if moe {
+                hooks.before_moe(gpu)?;
+            }
             launch_op(gpu, ctx, &steps[i])?;
+            if moe {
+                hooks.after_moe(gpu)?;
+            }
             // A pending prerotated input lives until its consumer step ran;
             // a sealed MoE consumes it in one of its granular stages.
             if !matches!(steps[i], Step::Moe(_) | Step::MoeStage(..)) {
@@ -898,6 +1184,32 @@ pub fn execute_validated_steps<'a>(
         }
     }
     Ok(())
+}
+
+/// The hyper write that closes `read`'s block: the first `HyperWrite` of the
+/// same streams from `from`, with only mixer steps (which never write the
+/// streams) between.  Anything else, or a write of other streams, ends the
+/// search: the read and write are then not paired.
+fn paired_hyper_write<'s, 'a>(
+    steps: &'s [Step<'a>],
+    from: usize,
+    read: &crate::pipeline::layer_ops::HyperReadOp<'_>,
+) -> Option<(usize, &'s crate::pipeline::layer_ops::HyperWriteOp<'a>)> {
+    let streams = read.input.buf.as_ptr();
+    for (j, step) in steps.iter().enumerate().skip(from) {
+        match step {
+            Step::GatedDeltaNet(_)
+            | Step::IndexedAttention(_)
+            | Step::Clear(_)
+            | Step::Moe(_)
+            | Step::MoeStage(..) => {}
+            Step::HyperWrite(write) if write.input.buf.as_ptr() == streams => {
+                return Some((j, write));
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// The index of the next hyper write of `read`'s streams when it is itself
@@ -1031,49 +1343,114 @@ fn launch_fused_qkv_with_bias<'a>(
     )
 }
 
-/// Per-op fallback. FULL enum match (no catch-all) so the compiler forces every
-/// op to have an arm (spec F4 — a missing arm would be a silent runtime error).
-fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), DispatchError> {
-    match step {
-        Step::Gemv {
-            w,
-            input: GemvInput::Raw(x),
-            out,
-        } => {
-            let gemv = GEMV.get_or_init(GemvFamily::new);
-            gemv.run_auto(ctx, gpu, w, x, out)
+/// A step's row-range launch failed for a structural reason (not a kernel error).
+fn row_err(msg: &str) -> DispatchError {
+    DispatchError::Hip(format!("row-split launch: {msg}"))
+}
+
+/// The views a row-restricted launch needs: the weight's byte range, and the
+/// output (plus the residual, for the residual form) element ranges. Owned here
+/// so the borrows they back live for the whole launch, and built once per call.
+struct RowViews {
+    w: GpuTensor,
+    out: GpuTensor,
+    residual: Option<GpuTensor>,
+}
+
+impl RowViews {
+    /// `rows` must be a sub-range of the weight's rows; the caller refuses any
+    /// weight whose byte length is not an exact `m * row_bytes` (padded strides),
+    /// because the view math below depends on it.
+    fn build(step: &Step, rows: Range<usize>) -> Result<Self, DispatchError> {
+        let (w, out, residual) = match step {
+            Step::Gemv { w, out, .. } => (*w, *out, None),
+            Step::GemvResidual {
+                w, residual, out, ..
+            } => (*w, *out, Some(*residual)),
+            _ => {
+                return Err(row_err(
+                    "only GEMV and GEMV-with-residual steps have independent output rows",
+                ))
+            }
+        };
+        let row_bytes = crate::families::gemv::weight_row_bytes(w)
+            .ok_or_else(|| row_err("weight byte length is not a whole number of rows"))?;
+        Ok(RowViews {
+            w: GpuTensor {
+                buf: w
+                    .buf
+                    .buf
+                    .byte_view(rows.start * row_bytes, rows.len() * row_bytes),
+                shape: vec![rows.len(), w.k],
+                dtype: w.buf.dtype,
+            },
+            out: out.sub_offset(rows.start, rows.len()),
+            residual: residual.map(|t| t.sub_offset(rows.start, rows.len())),
+        })
+    }
+}
+
+/// `w`'s metadata with a row view's buffer and row count: the weight as the GPU
+/// arm of a split step sees it. `m` must follow the view, not the whole tensor,
+/// and `row_stride` is 0 because the view starts exactly at a row boundary (the
+/// caller refuses a padded stride rather than trusting this).
+fn restricted_weight<'a>(w: &WeightRef<'a>, view: &'a GpuTensor) -> WeightRef<'a> {
+    let base: WeightRef<'a> = *w;
+    WeightRef {
+        buf: view,
+        m: view.shape[0],
+        row_stride: 0,
+        ..base
+    }
+}
+
+/// Launch one weight-reading step, optionally over a row range.
+///
+/// The four shapes here are the four `Gemv`/`GemvResidual` input forms: `Raw`
+/// (the family self-rotates) and `Prerotated` (the producer already rotated),
+/// each with and without an in-place residual accumulate. With `views: Some`,
+/// every one of them runs against the row-restricted twins of the weight, output
+/// and residual.
+fn launch_gemv<'a>(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    w: &WeightRef<'a>,
+    input: &GemvInput<'a>,
+    out: &'a GpuTensor,
+    residual: Option<&'a GpuTensor>,
+    views: Option<&'a RowViews>,
+) -> Result<(), DispatchError> {
+    let gemv = GEMV.get_or_init(GemvFamily::new);
+    // Shadow the step's tensors with the row views when there are any: `w_row`
+    // outlives this match so the borrow below is sound.
+    let w_row;
+    let (w, out, residual) = match views {
+        Some(v) => {
+            w_row = restricted_weight(w, &v.w);
+            (&w_row, &v.out, v.residual.as_ref())
         }
-        Step::Gemv {
-            w,
-            input: GemvInput::Prerotated(xr),
-            out,
-        } => {
-            let gemv = GEMV.get_or_init(GemvFamily::new);
-            gemv.run(
-                ctx,
-                gpu,
-                &GemvParams {
-                    w,
-                    x: xr,
-                    y: out,
-                    variant: GemvVariant::Prerotated,
-                    residual: None,
-                    gate: None,
-                    up: None,
-                },
-            )
-        }
-        Step::GemvResidual {
-            w,
-            input: GemvInput::Prerotated(xr),
-            residual,
-            out: _,
-        } => {
+        None => (w, out, residual),
+    };
+    match (input, residual) {
+        (GemvInput::Raw(x), None) => gemv.run_auto(ctx, gpu, w, x, out),
+        (GemvInput::Prerotated(xr), None) => gemv.run(
+            ctx,
+            gpu,
+            &GemvParams {
+                w,
+                x: xr,
+                y: out,
+                variant: GemvVariant::Prerotated,
+                residual: None,
+                gate: None,
+                up: None,
+            },
+        ),
+        (GemvInput::Prerotated(xr), Some(residual)) => {
             // MQ-family with a fused residual kernel: writes `residual` in-place via
             // GemvVariant::WithResidual. `out` is NOT written — it is scratch for the
             // fallback path only (see the Raw arm below). Nothing downstream reads
             // `out` after this step in either qwen2 or llama decode paths.
-            let gemv = GEMV.get_or_init(GemvFamily::new);
             gemv.run(
                 ctx,
                 gpu,
@@ -1088,19 +1465,25 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                 },
             )
         }
-        Step::GemvResidual {
-            w,
-            input: GemvInput::Raw(x),
-            residual,
-            out,
-        } => {
+        (GemvInput::Raw(x), Some(residual)) => {
+            // A row-restricted raw-residual step would need a row-offset scratch and
+            // a row-offset accumulate for the non-fused fallback below; refuse rather
+            // than launch a whole-tensor add into a row view. (The pass-back's gate
+            // refuses this shape for the same reason — this is the belt to that
+            // brace.) `views == None` is the ordinary whole-tensor path.
+            if views.is_some() && KernelKey::for_gemv_residual(w.dtype).is_err() {
+                return Err(row_err(
+                    "GemvResidual with a Raw input and no fused residual kernel cannot be \
+                     row-restricted (its fallback scratch and accumulate are whole-tensor)",
+                ));
+            }
             // For dtypes WITHOUT a fused residual kernel (Q8_0, Q4K, F32), the
             // fallback path runs a plain GEMV then `residual += result`. `out` may
             // be used as scratch ONLY when it does not alias `residual`; when it
             // does (the common qwen35 o_proj / dn_out case where out == residual ==
             // &s.x), a dedicated persistent temp is used instead.
             // Nothing reads `out` after this step in any model decode path.
-            let gemv = GEMV.get_or_init(GemvFamily::new);
+            //
             // Dtypes with a fused `gemv_*_residual` kernel use it in one launch.
             // Dtypes without one (Q8_0, ParoQ4G128, …) fall back to plain GEMV into
             // the `out` scratch + `residual += out` — reuses the pre-allocated `out`
@@ -1173,6 +1556,49 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                 Ok(())
             }
         }
+    }
+}
+
+/// Per-op fallback. FULL enum match (no catch-all) so the compiler forces every
+/// op to have an arm (spec F4 — a missing arm would be a silent runtime error).
+///
+/// This is [`launch_op_rows`] with no row restriction.
+fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), DispatchError> {
+    launch_op_rows(gpu, ctx, step, None)
+}
+
+/// Per-op fallback restricted to a range of the weight's output rows.
+///
+/// `None` passes every tensor exactly as `step` carries it, so an unrestricted
+/// launch is byte-identical to the pre-split path. `Some(r)` builds the views
+/// once — a byte view of the weight's rows `[r.start, r.end)` and `sub_offset`
+/// views of the output (and the residual, for the residual form) — then runs the
+/// same kernels. Every row-splittable GEMV kernel indexes its weight as
+/// `A + row*row_stride` from the passed base and writes `y[row]`, so a
+/// row-shifted base *is* a row-shifted launch: no kernel change and no new
+/// numerics.
+///
+/// Only [`Step::Gemv`] and [`Step::GemvResidual`] are splittable; every other
+/// step kind has coupled rows and is refused when a range is asked for (never at
+/// `None`, which is the ordinary path).
+pub(crate) fn launch_op_rows(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    step: &Step,
+    rows: Option<Range<usize>>,
+) -> Result<(), DispatchError> {
+    let views = match rows {
+        Some(r) => Some(RowViews::build(step, r)?),
+        None => None,
+    };
+    match step {
+        Step::Gemv { w, input, out } => launch_gemv(gpu, ctx, w, input, out, None, views.as_ref()),
+        Step::GemvResidual {
+            w,
+            input,
+            residual,
+            out,
+        } => launch_gemv(gpu, ctx, w, input, out, Some(residual), views.as_ref()),
         Step::RmsnormAutomatic {
             x,
             norm_weight,
@@ -1267,8 +1693,19 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         Step::HyperNorm(op) => crate::pipeline::layer_ops::execute_hyper_norm(gpu, op),
         Step::Project(op) => crate::pipeline::layer_ops::execute_project(gpu, op),
         Step::BroadcastAdd(op) => crate::pipeline::layer_ops::execute_broadcast_add(gpu, op),
+        Step::DenseFfn(op) => crate::pipeline::layer_ops::execute_dense_ffn(gpu, op),
         Step::Moe(call) => sealed_moe::execute_sealed(gpu, call),
         Step::MoeStage(op, stage) => op.execute_stage(gpu, *stage),
+        Step::SandwichAttention(op) => {
+            crate::pipeline::sandwich::execute_sandwich_attention(gpu, ctx, op)
+        }
+        Step::SandwichMlp(op) => crate::pipeline::sandwich::execute_sandwich_mlp(gpu, ctx, op),
+        Step::ParallelMoeMlp(op) => {
+            crate::pipeline::sandwich::execute_parallel_moe_mlp(gpu, ctx, op)
+        }
+        Step::PerLayerInput(op) => crate::pipeline::sandwich::execute_per_layer_input(gpu, ctx, op),
+        Step::Scale(op) => crate::pipeline::sandwich::execute_scale(gpu, op),
+        Step::Softcap(op) => crate::pipeline::sandwich::execute_softcap(gpu, op),
     }
 }
 fn rmsnorm_out<'a>(step: &Step<'a>) -> &'a rdna_compute::GpuTensor {

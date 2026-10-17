@@ -52,6 +52,11 @@ pub mod dflash_slot;
 /// based draft verify.
 #[cfg(feature = "deltanet")]
 pub mod dflash_spec;
+/// Minimal DFlash batched-lane seam (lane state wrapper, lane draft, shared
+/// verify head) used by the Gate 0 replay probe. Deltanet-gated like
+/// `dflash_spec`.
+#[cfg(feature = "deltanet")]
+pub mod dflash_cb;
 /// Retained-PM4 route state for the fixed B=16 DFlash2 target-verify forward
 /// (`DflashVerifyPm4`). Owns the phase machine, admission binding, and
 /// route-proof counters; `speculative` owns the GPU half.
@@ -70,6 +75,8 @@ pub(crate) mod layer_driver;
 #[cfg(feature = "deltanet")]
 pub mod mtp_compose;
 #[cfg(feature = "deltanet")]
+pub mod mtp_dense_tp;
+#[cfg(feature = "deltanet")]
 pub mod mtp_head;
 #[cfg(feature = "deltanet")]
 pub mod mtp_probe;
@@ -83,6 +90,10 @@ pub mod mtp_speculator;
 pub(crate) mod paro_moe;
 #[cfg(feature = "deltanet")]
 pub mod qwen35;
+/// Shared-weight host v1: typed export/import of a dense Qwen3.5 weight set
+/// as read-only POSIX-FD VMM allocations. Linux only.
+#[cfg(all(feature = "deltanet", target_os = "linux"))]
+pub mod shared_weights;
 #[cfg(feature = "deltanet")]
 #[cfg(feature = "deltanet")]
 pub mod serve_engine;

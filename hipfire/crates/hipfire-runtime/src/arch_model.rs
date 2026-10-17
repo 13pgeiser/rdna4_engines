@@ -86,6 +86,31 @@ pub trait ArchModel: Send + std::any::Any {
         Ok(())
     }
 
+    /// Whether a [`crate::session_cache::SessionCache`] is attached, i.e. the
+    /// model reports reusable prompt prefixes itself.
+    fn session_cache_attached(&self) -> bool {
+        false
+    }
+
+    /// Prompt tokens the next prefill on `route` can restore instead of
+    /// computing; 0 when nothing is cached.
+    fn session_plan(&self, _prompt: &[u32], _route: crate::session_cache::SessionRoute) -> usize {
+        0
+    }
+
+    /// Publish the snapshots the last prefill captured. Call once the turn's
+    /// output is committed to the client.
+    fn session_commit(&mut self) {}
+
+    /// Publish this turn's snapshots (as [`Self::session_commit`]) AND keep
+    /// the live state for a continuation whose prompt extends `consumed`, the
+    /// consumed host history (empty = none, e.g. after an unrepaired
+    /// terminal). A live continuation is session-exact (its state descends
+    /// from decode), not cold-exact. The default publishes only.
+    fn session_commit_live(&mut self, _consumed: &[u32]) {
+        self.session_commit()
+    }
+
     /// Downcast hatch for the architecture composition root.
     ///
     /// `hipfire-generate` legitimately needs the concrete bundle to call a

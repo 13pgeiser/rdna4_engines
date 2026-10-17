@@ -3,30 +3,12 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-#![allow(
-    dead_code,
-    unused_imports,
-    unused_variables,
-    non_snake_case,
-    clippy::all
-)]
-
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
 
-use crate::e8;
-use crate::e8_gptq;
-use crate::gguf_input;
 use crate::pipeline_gguf::GgufFormat;
 use crate::reap_overlay;
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::hessian_io;
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 
 // ─── HFQ File Format ────────────────────────────────────────────────────────
 
@@ -192,7 +174,7 @@ pub(crate) enum QuantType {
     // dequant w=(code-1)*d. Byte-identical to GGUF ggml_type Q2_0=42.
     // See findings/prismml-q2_0-layout.md.
     BQ1G128 = 41, // BQ1G128: PrismML Q1_0-compatible scale-only binary, g128, 18 B/blk
-    // (1.14 bpw). [FP16 d][16B sign bits], bit set for +d.
+    // (exactly 1.125 bpw = 18 B * 8 / 128 weights). [FP16 d][16B sign bits], bit set for +d.
     /// MQ4-G256 v2 (qt=44): FWHT-rotated 4-bit, per-128 asymmetric. 136 B/group,
     /// byte-identical to qt=13 (MQ4G256) except the 8 header bytes. Payload is
     /// unchanged: 128 B of 4-bit nibbles at offset 8, lane `t` reading the u32 at
@@ -251,8 +233,10 @@ pub(crate) enum QuantType {
     /// Each logical row is independently tiled as `ceil(K/128)` groups; every
     /// group is 68 B: `[0..2)` fp16 scale, `[2..4)` fp16 zero, `[4..68)`
     /// 64 B low-nibble-even packed payload. The final partial group is zero
-    /// padded before FWHT. This is a CPU/wire format only until a dedicated
-    /// GPU decoder is implemented; it must never be interpreted as qt=44 or
+    /// padded before FWHT. Loaded and decoded on GPU (`gemv_mq4g128v2*`
+    /// kernels); it is the Flash-Next routed-expert down_proj role
+    /// (`ROUTED_DOWN_DTYPE` in hipfire-arch-qwen4). Exactly 4.25 bpw
+    /// (68 B * 8 / 128 weights). It must never be interpreted as qt=44 or
     /// the legacy MQ4G128.
     MQ4G128V2 = 53,
 }
@@ -279,92 +263,19 @@ pub(crate) enum QuantLevel {
     Base,
 }
 
-/// Default kmap promote target for a given base format. Preserves the
-/// pre-`--kmap-promote` behavior byte-for-byte: MQ-family bases promote to
-/// MQ6, HFQ-family to HFQ6, FP4-family is a no-op (no FP6 sibling).
-pub(crate) fn default_promote_target(base: GgufFormat) -> GgufFormat {
-    match base {
-        GgufFormat::Mq2
-        | GgufFormat::Mq3
-        | GgufFormat::Mq4
-        | GgufFormat::Mq4V2
-        | GgufFormat::Mq4V2Lloyd
-        | GgufFormat::Mq4C
-        | GgufFormat::Mq5
-        | GgufFormat::Mq6
-        | GgufFormat::Mq2Lloyd
-        | GgufFormat::Mq2LloydAnchored
-        | GgufFormat::Mq3Lloyd
-        | GgufFormat::Mq4Lloyd => GgufFormat::Mq6,
-        GgufFormat::Mq2V2 | GgufFormat::Mq3V2 | GgufFormat::Mq5V2 | GgufFormat::Mq6V2 => {
-            GgufFormat::Mq6V2
-        }
-        GgufFormat::Hfq4 | GgufFormat::Hfq6 => GgufFormat::Hfq6,
-        GgufFormat::Hfp4 => GgufFormat::Hfp4,
-        GgufFormat::Mfp4 => GgufFormat::Mfp4,
-        GgufFormat::Mfp4Lloyd => GgufFormat::Mfp4Lloyd,
-        GgufFormat::Mfp4P => GgufFormat::Mfp4P,
-        GgufFormat::Mfp4E8 => GgufFormat::Mfp4E8,
-        GgufFormat::Mfp4E8Soa => GgufFormat::Mfp4E8Soa,
-        GgufFormat::Mfp3E8 => GgufFormat::Mfp3E8,
-        GgufFormat::Mfp2E8 => GgufFormat::Mfp2E8,
-        GgufFormat::Ternary => GgufFormat::Ternary,
-        GgufFormat::Binary => GgufFormat::Binary,
-    }
+/// Whether K-map `Promote6` under the MQ4 V2 family (`mq4`/`mq4v2`, V2 Lloyd)
+/// may emit MQ6G256V2 (qt47) for this `arch_id`. Only loader families whose
+/// runtime accepts qt47 on every promoted role are listed: Llama (0, 1),
+/// Qwen3.5 dense/MoE (5, 6) and Qwen2 (7, 8). Every other arch (MiniMax 10,
+/// LFM2-MoE 11, Cohere2-MoE 12, Gemma4 13/22, Glimmer 14/23, and any arch not
+/// yet audited) keeps its unchanged legacy encoder routes: ordinary MQ4 V2
+/// and nonexpert V2 Lloyd promotions use MQ6G256 (qt15), while V2 Lloyd
+/// stacked experts remain unpromoted MQ4G256 (qt13).
+pub(crate) fn mq6v2_promote_supported(arch_id: u32) -> bool {
+    matches!(arch_id, 0 | 1 | 5 | 6 | 7 | 8)
 }
 
-/// Allowlist for explicit `--kmap-promote` overrides. Runtime mixed-format
-/// dispatch (post-#257) is validated only within same-rotation-family,
-/// upward-in-bit-width pairings. Cross-family (MQ↔HFQ, MQ↔HFP) and
-/// downward-in-bits promotions are rejected at parse time.
-pub(crate) fn is_promote_pair_supported(base: GgufFormat, promote: GgufFormat) -> bool {
-    if base == promote {
-        return true; // no-op promotion is always safe
-    }
-    match (base, promote) {
-        // Lloyd-to-Lloyd only — Lloyd variants use different codebooks +
-        // different runtime kernel families from standard MQ. Lloyd→non-Lloyd
-        // mixed-format dispatch has no runtime support today; the plan's
-        // "Future expansion" section targets the MQ2-Lloyd + MQ3-Lloyd pair
-        (GgufFormat::Mq2Lloyd | GgufFormat::Mq2LloydAnchored, GgufFormat::Mq3Lloyd) => true,
-        (GgufFormat::Mq2LloydAnchored, GgufFormat::Mq2LloydAnchored) => true,
-        (GgufFormat::Mq2Lloyd | GgufFormat::Mq2LloydAnchored | GgufFormat::Mq3Lloyd, _) => false,
-        (_, GgufFormat::Mq2Lloyd | GgufFormat::Mq2LloydAnchored | GgufFormat::Mq3Lloyd) => false,
-        // MQ-family upward bit-width (non-Lloyd)
-        (
-            GgufFormat::Mq2,
-            GgufFormat::Mq3
-            | GgufFormat::Mq4
-            | GgufFormat::Mq4V2
-            | GgufFormat::Mq4C
-            | GgufFormat::Mq5
-            | GgufFormat::Mq6,
-        ) => true,
-        (
-            GgufFormat::Mq3,
-            GgufFormat::Mq4
-            | GgufFormat::Mq4V2
-            | GgufFormat::Mq4C
-            | GgufFormat::Mq5
-            | GgufFormat::Mq6,
-        ) => true,
-        (
-            GgufFormat::Mq4 | GgufFormat::Mq4V2 | GgufFormat::Mq4C,
-            GgufFormat::Mq5 | GgufFormat::Mq6,
-        ) => true,
-        (GgufFormat::Mq5, GgufFormat::Mq6) => true,
-        (GgufFormat::Mq2V2, GgufFormat::Mq3V2 | GgufFormat::Mq5V2 | GgufFormat::Mq6V2) => true,
-        (GgufFormat::Mq3V2, GgufFormat::Mq5V2 | GgufFormat::Mq6V2) => true,
-        (GgufFormat::Mq5V2, GgufFormat::Mq6V2) => true,
-        // HFQ-family upward bit-width
-        (GgufFormat::Hfq4, GgufFormat::Hfq6) => true,
 
-        // Everything else: explicitly not in the supported matrix.
-        // Cross-family (MQ↔HFQ↔FP4) rejected — runtime mixed-format dispatch
-        // (post-#257) is only same-rotation-family-safe.
-        _ => false,
-    }
-}
 
 /// Extract layer index from a tensor name.
 /// Handles both safetensors (`layers.{N}.`) and GGUF (`blk.{N}.`) patterns.
@@ -422,6 +333,7 @@ pub(crate) fn is_positional_promote(idx: usize, n_layers: usize, stride: usize) 
     (idx - 2) % stride == 0
 }
 
+#[cfg(test)]
 /// Resolve the quantization level for a tensor based on its name, the model's
 /// layer count, whether the model is MoE, and the K-map mode.
 ///
@@ -638,6 +550,10 @@ impl TensorSpill {
         Ok(data.len() as u64)
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub(crate) fn flush(&mut self) -> std::io::Result<()> {
         use std::io::Write;
         self.file.flush()
@@ -658,23 +574,43 @@ impl Drop for TensorSpill {
 
 /// Spill tensors whose data is in memory to the spill file, freeing RAM.
 /// Called after each layer's expert batch to keep peak RSS bounded.
-pub(crate) fn maybe_spill(tensors: &mut [HfqTensor], spill: &mut TensorSpill, threshold: usize) {
+///
+/// An `Err` means tensor bytes may already be lost (moved into a buffer that
+/// failed to reach disk), so the run cannot produce a correct artifact; the
+/// caller must abort (see [`spill_or_exit`]).
+pub(crate) fn maybe_spill(
+    tensors: &mut [HfqTensor],
+    spill: &mut TensorSpill,
+    threshold: usize,
+) -> std::io::Result<()> {
     let in_mem: usize = tensors
         .iter()
         .filter(|t| t.spilled_len == 0)
         .map(|t| t.data.len())
         .sum();
     if in_mem < threshold {
-        return;
+        return Ok(());
     }
     for t in tensors.iter_mut() {
         if t.spilled_len == 0 && !t.data.is_empty() {
-            let len = spill.spill(&t.data).unwrap_or(0);
-            t.spilled_len = len;
+            t.spilled_len = spill.spill(&t.data)?;
             t.data = Vec::new(); // free the memory
         }
     }
-    let _ = spill.flush();
+    spill.flush()
+}
+
+/// [`maybe_spill`] for the quantize loop: a spill failure aborts the run with
+/// exit 2 (removing the spill file) instead of writing a truncated model.
+pub(crate) fn spill_or_exit(tensors: &mut [HfqTensor], spill: &mut TensorSpill, threshold: usize) {
+    if let Err(e) = maybe_spill(tensors, spill, threshold) {
+        eprintln!(
+            "error: tensor spill to {} failed: {e}; no output written",
+            spill.path.display()
+        );
+        let _ = std::fs::remove_file(&spill.path);
+        std::process::exit(2);
+    }
 }
 
 /// The arch-correct config field naming the routed-expert count, as the arch's
@@ -728,6 +664,9 @@ pub(crate) fn patch_expert_count_metadata(
     serde_json::to_string(&v).map_err(|e| format!("re-serialize metadata: {e}"))
 }
 
+/// Write an HFQ container atomically: the bytes go to `<path>.tmp.<pid>` in
+/// the same directory, are fsynced, then renamed over `path`. On any error the
+/// temp file is removed and an existing `path` is left untouched.
 pub(crate) fn write_hfq(
     path: &Path,
     arch: u32,
@@ -735,7 +674,30 @@ pub(crate) fn write_hfq(
     tensors: &[HfqTensor],
     spill: Option<&mut TensorSpill>,
 ) -> std::io::Result<()> {
-    let mut f = File::create(path)?;
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    let result = File::create(&tmp).and_then(|mut f| {
+        write_hfq_to(&mut f, arch, metadata_json, tensors, spill)?;
+        f.flush()?;
+        f.sync_all()
+    });
+    match result.and_then(|()| std::fs::rename(&tmp, path)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+fn write_hfq_to(
+    f: &mut File,
+    arch: u32,
+    metadata_json: &str,
+    tensors: &[HfqTensor],
+    spill: Option<&mut TensorSpill>,
+) -> std::io::Result<()> {
 
     let metadata_bytes = metadata_json.as_bytes();
 
@@ -796,7 +758,7 @@ pub(crate) fn write_hfq(
 
     // Write tensor data — from spill file or from memory
     if let Some(spill) = spill {
-        let _ = spill.flush();
+        spill.flush()?;
         let mut spill_reader = std::io::BufReader::new(File::open(&spill.path)?);
         let mut buf = vec![0u8; 4 * 1024 * 1024]; // 4 MB copy buffer
         for t in tensors {

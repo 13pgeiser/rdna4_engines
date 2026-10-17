@@ -11,25 +11,123 @@
 
 use crate::config::Qwen4Config;
 use crate::gpu_forward::{
-    dense_ref, hyper_desc, hyper_read_desc, qsa_desc, seal_moe_decode, Qwen4GpuForwardError,
-    Qwen4MoeLayerRuntime, Qwen4MoeScratch,
+    dense_ref, hyper_desc, hyper_read_desc, program_dims, qsa_desc, seal_moe_decode, MtpEpGather,
+    Qwen4EpDummyExpert, Qwen4GpuForwardError, Qwen4MoeLayerRuntime, Qwen4MoeScratch,
 };
-use crate::program::{Qwen4HyperReadWeights, Qwen4HyperWriteWeights};
-use crate::weights::{Qwen4Weights, WeightError};
+use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
+use crate::program::{
+    Qwen4FfnDims, Qwen4HyperReadWeights, Qwen4HyperWriteWeights, Qwen4QsaWeights,
+    QWEN4_QSA_KERNEL_ROPE_THETA,
+};
+use crate::state::{meta_bytes, meta_words, whole_part};
+use crate::weights::{Qwen4EpPlacement, Qwen4FfnWeights, Qwen4Weights, WeightError};
 use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::families::gemv::WeightRef;
+use hipfire_dispatch::families::moe::MoeRowGather;
 use hipfire_dispatch::pipeline::{
-    execute_validated_steps, validate_steps, BroadcastAddOp, ClearOp, DraftHead, DraftHeadLayout,
-    DraftHeadPolicy, EmbeddingOp, HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode,
-    IndexedAttentionOp, IndexedAttentionState, ProjectOp, Step,
+    execute_validated_steps, validate_steps, BroadcastAddOp, ClearOp, DenseFfnOp, DenseFfnRecipe,
+    DraftHead, DraftHeadLayout, DraftHeadPolicy, DraftHeadRequestState, EmbeddingOp, HyperNormOp,
+    HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState,
+    MixerPhase, ProjectOp, Step,
 };
 use hipfire_dispatch::types::DispatchError;
+use hipfire_runtime::kv_backend::{
+    KvChunkPlan, DEFAULT_KV_CHUNK_TOKENS, DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+};
+use hipfire_runtime::session_cache::{RowStream, StateLayout};
 use hipfire_runtime::spec::SpecGrammar;
-use rdna_compute::tensor_ops::QsaKvFormat;
+use rdna_compute::tensor_ops::{
+    hc_activation_fused_f32, hyper_norm, hyper_read_projected, indexed_attention_append_prologue,
+    indexed_attention_pool_rope_incremental, HcActivationFused, HyperNorm, HyperReadProjected,
+    IndexedAttentionAppendPrologue, IndexedAttentionPoolRope, QsaKvFormat, QsaPositionBinding,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use smallvec::SmallVec;
 use std::fmt;
 
-const MTP_BRANCHES: usize = 4;
+/// HC branches of the Flash-Next batched Append route
+/// (`Qwen4MtpGpu::append_rows`); every other MTP path takes `config.hc_count`.
+const MTP_APPEND_BRANCHES: usize = 4;
+/// Rows of every MTP HC read and write: one token.
+const MTP_HC_ROWS: usize = 1;
+/// Metadata words of an MTP head session snapshot: a reserved zero word and
+/// the state mark.
+const MTP_SESSION_WORDS: usize = 7;
+/// Prompt rows one batched Append pass (`Qwen4MtpGpu::append_rows`) runs per
+/// launch sequence: the capacity of [`MtpAppendScratch`].
+pub(crate) const MTP_FILL_ROWS: usize = 1024;
+
+/// `HIPFIRE_QWEN4_MTP_APPEND_DET`: the DET route of the batched prompt-fill
+/// Append ([`MtpFillContext::PromptFill`] only), on by default on exact
+/// gfx1151; `0` is the kill switch.
+pub(crate) const MTP_APPEND_DET_ENV: &str = "HIPFIRE_QWEN4_MTP_APPEND_DET";
+/// Default of [`MTP_APPEND_DET_ENV`] when it is unset (or neither `0` nor
+/// `1`): requested, so exact gfx1151 takes DET and every other arch keeps the
+/// incumbent kernels ([`append_det_active`]).
+const MTP_APPEND_DET_DEFAULT: bool = true;
+
+/// Which caller a batched Append pass (`Qwen4MtpGpu::append_rows`) serves. It
+/// is stated by every caller and never inferred from the hidden row, the
+/// scratch or any option: only [`Self::PromptFill`] can take the DET route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MtpFillContext {
+    /// `mtp_prefill` / lane prompt tiles: the head consumes prompt rows after
+    /// the trunk's chunked forward.
+    PromptFill,
+    /// The decode takeover step's head fill of the accepted window rows. Always
+    /// the incumbent kernels, whatever `HIPFIRE_QWEN4_MTP_APPEND_DET` says.
+    DecodeFill,
+}
+
+/// `HIPFIRE_QWEN4_MTP_APPEND_DET` as requested: on unless `0`
+/// ([`MTP_APPEND_DET_DEFAULT`]); read at every prompt fill. See
+/// [`mtp_append_det_enabled`] for the effective gate.
+pub(crate) fn mtp_append_det_requested() -> bool {
+    hipfire_config::developer_bool(MTP_APPEND_DET_ENV, MTP_APPEND_DET_DEFAULT)
+}
+
+/// The DET gate from its two inputs: requested and exact gfx1151 (gfx1150,
+/// gfx1152, gfx1201 and every other arch never take it).
+fn append_det_active(requested: bool, exact_gfx1151: bool) -> bool {
+    requested && exact_gfx1151
+}
+
+/// Whether DET (`HIPFIRE_QWEN4_MTP_APPEND_DET`, default on) is in force on this GPU: exact
+/// gfx1151 only. This is the machine-level gate; whether one Append pass takes
+/// the DET route also depends on its [`MtpFillContext`] ([`append_rows_det`]).
+pub(crate) fn mtp_append_det_enabled(gpu: &Gpu) -> bool {
+    append_det_active(mtp_append_det_requested(), gpu.arch_caps.is_gfx1151())
+}
+
+/// Whether an Append pass of `context` takes the DET route when the machine
+/// gate `det_enabled` is on: prompt fill only.
+fn append_rows_det(context: MtpFillContext, det_enabled: bool) -> bool {
+    det_enabled && context == MtpFillContext::PromptFill
+}
+
+/// Fewest rows one `append_rows` pass takes: the incumbent multirow
+/// projections need two rows or more, the DET kernels take any `n >= 1`.
+fn append_rows_min(det: bool) -> usize {
+    if det {
+        1
+    } else {
+        2
+    }
+}
+
+/// Whether a prompt-fill sub-chunk of `rows` rows runs through
+/// `append_rows` (and so its scratch): always under DET, where a lone row
+/// takes the same kernels as every other row; otherwise only from two rows,
+/// a lone row staying the per-row `append_token`.
+pub(crate) fn prompt_fill_uses_rows(det: bool, rows: usize) -> bool {
+    rows >= append_rows_min(det)
+}
+
+/// The DET dense kernel's shape limits (`gemm_bf16_xf32_mtp_dense_det_pm`):
+/// `M % 16 == 0`, `K % 64 == 0`, `N >= 1`.
+fn det_dense_shape_ok(m: usize, k: usize, n: usize) -> bool {
+    m != 0 && m % 16 == 0 && k != 0 && k % 64 == 0 && n >= 1
+}
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_MTP_MODEL_ID: AtomicU64 = AtomicU64::new(1);
@@ -59,7 +157,7 @@ fn hc_read<'a>(
         up: &scratch.hc_up,
         mixed: &scratch.hc_mixed,
         bf16_scratch: &scratch.hc_bf16,
-        rows: 1,
+        rows: MTP_HC_ROWS,
         branches: config.hc_count,
         hidden: config.hidden_size,
         low_rank: config.hc_lowrank,
@@ -83,7 +181,7 @@ fn hc_write<'a>(
         mixed,
         gates: &scratch.hc_gates,
         output: &scratch.wide,
-        rows: 1,
+        rows: MTP_HC_ROWS,
         branches: config.hc_count,
         hidden: config.hidden_size,
         rotation: &scratch.rotation,
@@ -171,7 +269,7 @@ pub struct MtpGpuScratch {
     moe_gate: GpuTensor,
     moe_up: GpuTensor,
     moe_hidden: GpuTensor,
-    moe_output: GpuTensor,
+    ffn_output: GpuTensor,
     moe_gate_batch: GpuTensor,
     moe_up_batch: GpuTensor,
     moe_rot_batch: GpuTensor,
@@ -189,7 +287,8 @@ impl MtpGpuScratch {
     /// Element count and dtype of each scratch tensor, in field order.
     fn shapes(config: &Qwen4Config) -> Result<[(usize, DType); MTP_SCRATCH_TENSORS], MtpGpuError> {
         let hidden = config.hidden_size;
-        let wide = MTP_BRANCHES
+        let wide = config
+            .hc_count
             .checked_mul(hidden)
             .ok_or_else(|| invalid("MTP wide dimension overflow"))?;
         let q_width = config
@@ -203,12 +302,38 @@ impl MtpGpuScratch {
         let index_width = (config.indexer_n_heads + config.indexer_kv_heads)
             .checked_mul(config.indexer_head_dim)
             .ok_or_else(|| invalid("MTP index width overflow"))?;
-        let hc_up = wide
-            .checked_mul(config.hc_lowrank)
+        let hc_up = hc_up_elements(MTP_HC_ROWS, wide, config.hc_lowrank)
             .ok_or_else(|| invalid("MTP HC up scratch overflow"))?;
-        let max_rotation = wide.max(hidden).max(config.hc_lowrank).max(q_width);
-        let routed = config.num_experts_per_tok * config.moe_intermediate_size;
-        Ok([
+        // FFN extents come from the typed dims: a MoE profile's routed and
+        // shared widths, or a dense profile's one intermediate width (MoE
+        // extents are zero for dense, dense for MoE; every buffer is then
+        // raised to one element below).
+        let (num_experts, top_k, moe_intermediate, shared_intermediate, dense_intermediate) =
+            match program_dims(config).ffn {
+                Qwen4FfnDims::Moe {
+                    num_experts,
+                    experts_per_token,
+                    intermediate,
+                    shared_intermediate,
+                } => (
+                    num_experts,
+                    experts_per_token,
+                    intermediate,
+                    shared_intermediate,
+                    0,
+                ),
+                Qwen4FfnDims::Dense { intermediate } => (0, 0, 0, 0, intermediate),
+            };
+        let max_rotation = wide
+            .max(hidden)
+            .max(config.hc_lowrank)
+            .max(q_width)
+            .max(dense_intermediate);
+        let routed = top_k * moe_intermediate;
+        // One-token gate/up rows: routed slots * intermediate for MoE (the
+        // per-token batch scratch), the dense intermediate otherwise.
+        let ffn_batch = routed.max(dense_intermediate);
+        let mut shapes = [
             (std::mem::size_of::<i32>(), DType::Raw),
             (hidden, DType::F32),
             (hidden, DType::F32),
@@ -237,24 +362,26 @@ impl MtpGpuScratch {
                 config.qsa_selected_capacity() * std::mem::size_of::<i32>(),
                 DType::Raw,
             ),
-            (config.num_experts, DType::F32),
+            (num_experts, DType::F32),
             (hidden, DType::F32),
-            (2 * config.moe_intermediate_size, DType::F32),
-            (config.moe_intermediate_size, DType::F32),
-            (config.moe_intermediate_size, DType::F32),
-            (config.moe_intermediate_size, DType::F32),
+            (2 * moe_intermediate, DType::F32),
+            (moe_intermediate, DType::F32),
+            (moe_intermediate, DType::F32),
+            (moe_intermediate, DType::F32),
             (hidden, DType::F32),
+            (ffn_batch, DType::F32),
+            (ffn_batch, DType::F32),
             (routed, DType::F32),
-            (routed, DType::F32),
-            (routed, DType::F32),
-            (config.num_experts_per_tok, DType::F32),
-            (config.num_experts_per_tok, DType::F32),
-            (
-                config.num_experts_per_tok * hidden + hidden.div_ceil(4),
-                DType::F32,
-            ),
-            (config.shared_expert_intermediate_size.max(1), DType::F32),
-        ])
+            (top_k, DType::F32),
+            (top_k, DType::F32),
+            (top_k * hidden + hidden.div_ceil(4), DType::F32),
+            (shared_intermediate, DType::F32),
+        ];
+        for shape in &mut shapes {
+            // Every buffer holds at least one element.
+            shape.0 = shape.0.max(1);
+        }
+        Ok(shapes)
     }
 
     /// Device bytes [`Self::new`] allocates.
@@ -310,7 +437,7 @@ impl MtpGpuScratch {
             moe_gate: next(),
             moe_up: next(),
             moe_hidden: next(),
-            moe_output: next(),
+            ffn_output: next(),
             moe_gate_batch: next(),
             moe_up_batch: next(),
             moe_rot_batch: next(),
@@ -352,7 +479,7 @@ impl MtpGpuScratch {
             self.moe_gate,
             self.moe_up,
             self.moe_hidden,
-            self.moe_output,
+            self.ffn_output,
             self.moe_gate_batch,
             self.moe_up_batch,
             self.moe_rot_batch,
@@ -369,6 +496,399 @@ impl MtpGpuScratch {
         }
         first
     }
+}
+
+/// Row widths shared by [`MtpAppendScratch`] and `Qwen4MtpGpu::append_rows`.
+#[derive(Clone, Copy)]
+struct AppendWidths {
+    hidden: usize,
+    /// `hc_count * hidden`: one row of the HC streams.
+    wide: usize,
+    /// Index query heads then index key: `(indexer_n_heads + indexer_kv_heads) * indexer_head_dim`.
+    index_width: usize,
+    index_kv_width: usize,
+    kv_width: usize,
+}
+
+impl AppendWidths {
+    fn new(config: &Qwen4Config) -> Option<Self> {
+        let index_kv_width = config
+            .indexer_kv_heads
+            .checked_mul(config.indexer_head_dim)?;
+        Some(Self {
+            hidden: config.hidden_size,
+            wide: config.hc_count.checked_mul(config.hidden_size)?,
+            index_width: config
+                .indexer_n_heads
+                .checked_mul(config.indexer_head_dim)?
+                .checked_add(index_kv_width)?,
+            index_kv_width,
+            kv_width: config.num_key_value_heads.checked_mul(config.head_dim)?,
+        })
+    }
+}
+
+/// Allocations of one [`MtpAppendScratch`], in field order.
+const MTP_APPEND_TENSORS: usize = 15;
+
+/// Row-batched operator buffers of the prompt-fill Append pass
+/// (`Qwen4MtpGpu::append_rows`): the per-row [`MtpGpuScratch`] tensors that an
+/// Append step touches, each with `rows` rows. Never aliases the per-row scratch.
+///
+/// Also owns the prompt chunk's token ids ([`Self::upload_prompt_ids`]): the
+/// whole target chunk uploads once, and each sub-chunk's `append_rows` reads
+/// its rows in place through [`Self::prompt_ids_view`].
+pub(crate) struct MtpAppendScratch {
+    /// Row capacity.
+    rows: usize,
+    /// `rows` i32 token ids, as raw bytes.
+    token_ids: GpuTensor,
+    token_embedding: GpuTensor,
+    embedding_norm: GpuTensor,
+    projected_embedding: GpuTensor,
+    hidden_norm: GpuTensor,
+    projected_hidden: GpuTensor,
+    wide: GpuTensor,
+    hc_normalized: GpuTensor,
+    hc_low: GpuTensor,
+    hc_up: GpuTensor,
+    hc_mixed: GpuTensor,
+    index: GpuTensor,
+    qsa_k: GpuTensor,
+    qsa_v: GpuTensor,
+    /// `id_rows` i32 token ids of one prompt chunk, as raw bytes.
+    prompt_ids: GpuTensor,
+    /// Token-id row capacity of `prompt_ids`.
+    id_rows: usize,
+    host_token_bytes: Vec<u8>,
+    host_prompt_ids: Vec<u8>,
+}
+
+impl MtpAppendScratch {
+    /// Row capacity: the most rows one `append_rows` call takes.
+    pub(crate) fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Token-id row capacity of [`Self::upload_prompt_ids`].
+    pub(crate) fn prompt_id_rows(&self) -> usize {
+        self.id_rows
+    }
+
+    /// Element count and dtype of each scratch tensor, in field order.
+    fn shapes(
+        config: &Qwen4Config,
+        rows: usize,
+        id_rows: usize,
+    ) -> Option<[(usize, DType); MTP_APPEND_TENSORS]> {
+        let w = AppendWidths::new(config)?;
+        let per = |width: usize| rows.checked_mul(width);
+        Some([
+            (rows.checked_mul(std::mem::size_of::<i32>())?, DType::Raw),
+            (per(w.hidden)?, DType::F32),
+            (per(w.hidden)?, DType::F32),
+            (per(w.hidden)?, DType::F32),
+            (per(w.wide)?, DType::F32),
+            (per(w.wide)?, DType::F32),
+            (per(w.wide)?, DType::F32),
+            (per(w.wide)?, DType::F32),
+            (per(config.hc_lowrank)?, DType::F32),
+            (per(w.wide)?, DType::F32),
+            (per(w.hidden)?, DType::F32),
+            (per(w.index_width)?, DType::F32),
+            (per(w.kv_width)?, DType::F32),
+            (per(w.kv_width)?, DType::F32),
+            (id_rows.checked_mul(std::mem::size_of::<i32>())?, DType::Raw),
+        ])
+    }
+
+    /// Device bytes [`Self::new`] allocates for `rows` rows and `id_rows`
+    /// prompt-chunk token ids.
+    pub(crate) fn device_bytes(config: &Qwen4Config, rows: usize, id_rows: usize) -> Option<usize> {
+        Self::shapes(config, rows, id_rows)?
+            .iter()
+            .try_fold(0usize, |total, &(elements, dtype)| {
+                total.checked_add(elements.checked_mul(dtype.size())?)
+            })
+    }
+
+    pub(crate) fn new(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        rows: usize,
+        id_rows: usize,
+    ) -> Result<Self, MtpGpuError> {
+        if rows == 0 || id_rows == 0 {
+            return Err(invalid("MTP append scratch needs at least one row"));
+        }
+        let shapes = Self::shapes(config, rows, id_rows)
+            .ok_or_else(|| invalid("MTP append scratch extent overflow"))?;
+        let mut allocated = Vec::with_capacity(MTP_APPEND_TENSORS);
+        for (elements, dtype) in shapes {
+            match gpu.zeros(&[elements], dtype) {
+                Ok(tensor) => allocated.push(tensor),
+                Err(error) => {
+                    for tensor in allocated {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+        let mut tensors = allocated.into_iter();
+        let mut next = || tensors.next().expect("append scratch tensor count");
+        Ok(Self {
+            rows,
+            token_ids: next(),
+            token_embedding: next(),
+            embedding_norm: next(),
+            projected_embedding: next(),
+            hidden_norm: next(),
+            projected_hidden: next(),
+            wide: next(),
+            hc_normalized: next(),
+            hc_low: next(),
+            hc_up: next(),
+            hc_mixed: next(),
+            index: next(),
+            qsa_k: next(),
+            qsa_v: next(),
+            prompt_ids: next(),
+            id_rows,
+            host_token_bytes: vec![0; rows * std::mem::size_of::<i32>()],
+            host_prompt_ids: vec![0; id_rows * std::mem::size_of::<i32>()],
+        })
+    }
+
+    /// Upload `tokens` (at most the id-row capacity) as the prompt chunk's i32
+    /// ids: the same bytes `append_rows` would upload per sub-chunk. The copy
+    /// is a blocking `hipMemcpy`, so call it where the device is already idle
+    /// (after the target forward's readback) and after every earlier
+    /// `append_rows` that reads the previous chunk's ids has been enqueued.
+    pub(crate) fn upload_prompt_ids(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+    ) -> Result<(), MtpGpuError> {
+        if tokens.is_empty() || tokens.len() > self.id_rows {
+            return Err(invalid(format!(
+                "MTP prompt ids of {} rows need 1..={}",
+                tokens.len(),
+                self.id_rows
+            )));
+        }
+        for (bytes, &token) in self.host_prompt_ids.chunks_exact_mut(4).zip(tokens) {
+            bytes.copy_from_slice(&(token as i32).to_ne_bytes());
+        }
+        gpu.memcpy_htod_auto(
+            &self.prompt_ids.buf,
+            &self.host_prompt_ids[..tokens.len() * std::mem::size_of::<i32>()],
+        )?;
+        Ok(())
+    }
+
+    /// Non-owning view of `rows` prompt-chunk ids from row `first` of the
+    /// last [`Self::upload_prompt_ids`] upload, for `append_rows`'s
+    /// `device_ids`. The view must not be freed.
+    pub(crate) fn prompt_ids_view(
+        &self,
+        first: usize,
+        rows: usize,
+    ) -> Result<GpuTensor, MtpGpuError> {
+        match first.checked_add(rows) {
+            Some(end) if end <= self.id_rows => Ok(self.prompt_ids.sub_offset(
+                first * std::mem::size_of::<i32>(),
+                rows * std::mem::size_of::<i32>(),
+            )),
+            _ => Err(invalid("MTP prompt id view is outside the id capacity")),
+        }
+    }
+
+    pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
+        let tensors = [
+            self.token_ids,
+            self.token_embedding,
+            self.embedding_norm,
+            self.projected_embedding,
+            self.hidden_norm,
+            self.projected_hidden,
+            self.wide,
+            self.hc_normalized,
+            self.hc_low,
+            self.hc_up,
+            self.hc_mixed,
+            self.index,
+            self.qsa_k,
+            self.qsa_v,
+            self.prompt_ids,
+        ];
+        let mut first = None;
+        for tensor in tensors {
+            if let Err(error) = gpu.free_tensor(tensor) {
+                first.get_or_insert(error);
+            }
+        }
+        first.map_or(Ok(()), |error| Err(error.into()))
+    }
+}
+
+/// The MTP weights an Append step reads, resolved and shape-checked once for
+/// the batched pass (the per-row path resolves the same handles through its
+/// `Step` descriptors, `forward_token`).
+struct AppendWeights<'a> {
+    embedding: &'a GpuTensor,
+    norm_embedding: &'a GpuTensor,
+    norm_hidden: &'a GpuTensor,
+    fc_embedding: WeightRef<'a>,
+    fc_hidden: WeightRef<'a>,
+    /// Attention-side HC read: its norm, down (`wide -> hc_lowrank`) and up
+    /// (`hc_lowrank -> wide`) projections.
+    hc: Qwen4HyperReadWeights<'a>,
+    qsa: Qwen4QsaWeights<'a>,
+}
+
+/// The bound native MTP head; a profile without one has no MTP executor.
+fn bound_mtp(weights: &Qwen4Weights) -> Result<&crate::weights::Qwen4MtpWeights, MtpGpuError> {
+    weights
+        .mtp
+        .as_ref()
+        .ok_or_else(|| invalid("profile has no native MTP head"))
+}
+
+impl<'a> AppendWeights<'a> {
+    fn resolve(
+        weights: &'a Qwen4Weights,
+        config: &Qwen4Config,
+        w: &AppendWidths,
+    ) -> Result<Self, MtpGpuError> {
+        if !config.profile.is_flash_next() {
+            return Err(invalid(format!(
+                "MTP batched append is the Flash-Next route (K = 2560 staged Q8_0 \
+                 projections, {MTP_APPEND_BRANCHES} HC branches); profile {} takes the per-row route",
+                config.profile.id()
+            )));
+        }
+        if config.hc_count != MTP_APPEND_BRANCHES {
+            return Err(invalid("MTP batched append needs four HC branches"));
+        }
+        let check = |label: &str,
+                     weight: &WeightRef<'_>,
+                     dtype: DType,
+                     m: usize,
+                     k: usize|
+         -> Result<(), MtpGpuError> {
+            if weight.dtype != dtype || weight.m != m || weight.k != k {
+                return Err(invalid(format!(
+                    "MTP batched append {label} is {:?} [{}x{}], expected {dtype:?} [{m}x{k}]",
+                    weight.dtype, weight.m, weight.k
+                )));
+            }
+            Ok(())
+        };
+        let embedding = weights.resident(&weights.root.embedding)?;
+        if embedding.dtype != DType::Q8_0 {
+            return Err(invalid("MTP batched append needs a Q8_0 embedding table"));
+        }
+        let mtp = bound_mtp(weights)?;
+        let fc_embedding = dense_ref(weights, &mtp.fc_embedding)?;
+        check(
+            "fc_embedding",
+            &fc_embedding,
+            DType::BF16,
+            w.hidden,
+            w.hidden,
+        )?;
+        let fc_hidden = dense_ref(weights, &mtp.fc_hidden)?;
+        check("fc_hidden", &fc_hidden, DType::BF16, w.hidden, w.hidden)?;
+        let hc = hyper_desc(weights, &mtp.attn_hyper)?.read;
+        if !w.wide.is_multiple_of(32) {
+            return Err(invalid("MTP batched append HC down needs K % 32 == 0"));
+        }
+        check(
+            "HC down",
+            &hc.input_mix_down,
+            DType::BF16,
+            config.hc_lowrank,
+            w.wide,
+        )?;
+        check(
+            "HC up",
+            &hc.input_mix_up,
+            DType::BF16,
+            w.wide,
+            config.hc_lowrank,
+        )?;
+        let qsa = qsa_desc(weights, &mtp.attention)?;
+        // The tiled Q8_0 projection is the K = 2560 staged kernel.
+        if w.hidden != 2560 {
+            return Err(invalid(
+                "MTP batched append Q8_0 projections need hidden 2560",
+            ));
+        }
+        check(
+            "indexer_qk",
+            &qsa.indexer_qk,
+            DType::Q8_0,
+            w.index_width,
+            w.hidden,
+        )?;
+        check("k_proj", &qsa.k, DType::Q8_0, w.kv_width, w.hidden)?;
+        check("v_proj", &qsa.v, DType::Q8_0, w.kv_width, w.hidden)?;
+        Ok(Self {
+            embedding,
+            norm_embedding: weights.resident(&mtp.pre_fc_norm_embedding)?,
+            norm_hidden: weights.resident(&mtp.pre_fc_norm_hidden)?,
+            fc_embedding,
+            fc_hidden,
+            hc,
+            qsa,
+        })
+    }
+}
+
+/// One BF16 dense projection of `append_rows` over `rows` rows (`weight` is
+/// `[m, k]`, `x` F32 `[rows, k]`, `y` F32 `[rows, m]`): the incumbent
+/// `gemm_bf16_xf32_multirow` (G1), or with `det` the fixed-row F16 WMMA
+/// `gemm_bf16_xf32_mtp_dense_det_pm`.
+fn append_dense_projection(
+    gpu: &mut Gpu,
+    det: bool,
+    weight: &WeightRef<'_>,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    rows: usize,
+) -> Result<(), MtpGpuError> {
+    if det {
+        gpu.gemm_bf16_xf32_mtp_dense_det_pm(weight.buf, x, y, weight.m, weight.k, rows)?;
+    } else {
+        gpu.gemm_bf16_xf32_multirow(weight.buf, x, y, weight.m, weight.k, rows)?;
+    }
+    Ok(())
+}
+
+/// F32 elements of every subview the shared HC read takes from its `up`
+/// buffer for `rows` rows: the F32 up projection (`rows × wide`), and on the
+/// WMMA read route the packed BF16 `low`, staged as a `rows × rank` view of
+/// the same F32 tensor before its dtype is relabelled (`layer_ops.rs`
+/// `execute_hyper_read_inner`). The up weight itself is never staged here.
+fn hc_up_elements(rows: usize, wide: usize, rank: usize) -> Option<usize> {
+    Some(rows.checked_mul(wide)?.max(rows.checked_mul(rank)?))
+}
+
+/// Refuse an HC read whose `up` subviews exceed the allocated scratch.
+fn require_hc_up(up: &GpuTensor, rows: usize, wide: usize, rank: usize) -> Result<(), MtpGpuError> {
+    let needed =
+        hc_up_elements(rows, wide, rank).ok_or_else(|| invalid("MTP HC up extent overflow"))?;
+    let needed_bytes = needed
+        .checked_mul(DType::F32.size())
+        .ok_or_else(|| invalid("MTP HC up extent overflow"))?;
+    if up.dtype != DType::F32 || up.numel() < needed || up.buf.size() < needed_bytes {
+        return Err(invalid(format!(
+            "MTP HC up scratch holds {} F32 elements; {rows} HC rows use {needed}",
+            up.numel()
+        )));
+    }
+    Ok(())
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MtpSnapshotDimensions {
@@ -523,6 +1043,7 @@ impl MtpGpuStateSnapshotArena {
         first
     }
 }
+
 fn validate_mtp_mark(mark: &MtpStateMark, state: &MtpGpuState) -> Result<(), MtpGpuError> {
     if mark.full_len > state.full_capacity
         || mark.raw_len > state.raw_capacity
@@ -531,6 +1052,51 @@ fn validate_mtp_mark(mark: &MtpStateMark, state: &MtpGpuState) -> Result<(), Mtp
         || mark.position > state.full_capacity
     {
         return Err(invalid("MTP snapshot mark exceeds state capacity"));
+    }
+    Ok(())
+}
+
+/// Map more of one VMM context arena so it covers `rows` rows of a
+/// `capacity`-row tensor (byte stride = reserved size / capacity), by the
+/// shared [`KvChunkPlan`] policy, and zero the newly mapped bytes.
+fn grow_context_arena(
+    gpu: &mut Gpu,
+    tensor: &mut GpuTensor,
+    capacity: usize,
+    rows: usize,
+) -> Result<(), MtpGpuError> {
+    let mapped = gpu
+        .vmm_mapped_bytes(tensor)
+        .ok_or_else(|| invalid("MTP QSA arena is not a registered VMM owner"))?;
+    let granularity = gpu
+        .vmm_granularity(tensor)
+        .ok_or_else(|| invalid("MTP QSA arena has no VMM granularity"))?;
+    let plan = KvChunkPlan::new(
+        tensor.byte_size() / capacity,
+        capacity,
+        DEFAULT_KV_CHUNK_TOKENS,
+        granularity,
+        DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+    )
+    .map_err(|error| invalid(format!("MTP QSA chunk plan: {error}")))?;
+    let Some(growth) = plan
+        .growth(mapped, rows)
+        .map_err(|error| invalid(format!("MTP QSA growth: {error}")))?
+    else {
+        return Ok(());
+    };
+    let device_id = gpu.device_id;
+    gpu.grow_vmm_tensor(tensor, growth.size_bytes, &[device_id])?;
+    // The accessible prefix stops at the logical size even when the last
+    // page maps past it.
+    let end = (growth.offset_bytes + growth.size_bytes).min(tensor.buf.size());
+    if end > growth.offset_bytes {
+        let element = tensor.dtype.size();
+        let fresh = tensor.sub_offset(
+            growth.offset_bytes / element,
+            (end - growth.offset_bytes) / element,
+        );
+        gpu.hip.memset(&fresh.buf, 0, fresh.buf.size())?;
     }
     Ok(())
 }
@@ -548,6 +1114,12 @@ pub struct MtpGpuState {
     raw_capacity: usize,
     pooled_capacity: usize,
     selected_capacity: usize,
+    /// Index compression ratio: one pooled row per `compress` tokens.
+    compress: usize,
+    backend: Qwen4KvBackend,
+    /// Tokens every context arena's mapped prefix covers (the fast no-growth
+    /// gate); legacy storage covers its full capacity.
+    mapped_tokens: usize,
     position: usize,
     full_len: usize,
     raw_len: usize,
@@ -604,91 +1176,93 @@ impl MtpGpuState {
             step_index: self.step_index,
         }
     }
-    /// Device bytes [`Self::new`] allocates: the context-sized QSA arenas,
-    /// then the selection and wide-hidden carry, twice with their snapshot
-    /// backups.
-    fn device_bytes(config: &Qwen4Config, max_seq: usize) -> Option<usize> {
+    /// Device bytes [`Self::new_with_backend`] commits: the context-sized
+    /// QSA arenas as `context` commits them (legacy: all of them; VMM: the
+    /// first chunk's mapped pages, the rest being virtual until forwards
+    /// map it), then the selection and wide-hidden carry, twice with their
+    /// snapshot backups.
+    pub(crate) fn device_bytes(
+        config: &Qwen4Config,
+        context: &Qwen4ContextCommit,
+    ) -> Option<usize> {
         let carry = config
             .qsa_selected_capacity()
             .checked_mul(std::mem::size_of::<i32>())?
             .checked_add(std::mem::size_of::<i32>())?
             .checked_add(
-                MTP_BRANCHES
+                config
+                    .hc_count
                     .checked_mul(config.hidden_size)?
                     .checked_mul(std::mem::size_of::<f32>())?,
             )?;
-        config
-            .qsa_context_arena_bytes(max_seq, QsaKvFormat::F32)?
+        context
+            .committed_layer_bytes(config, QsaKvFormat::F32)?
             .checked_add(carry.checked_mul(2)?)
     }
+    /// Legacy full-capacity state; see [`Self::new_with_backend`].
     pub(crate) fn new(
         gpu: &mut Gpu,
         config: &Qwen4Config,
         max_seq: usize,
     ) -> Result<Self, MtpGpuError> {
+        Self::new_with_backend(gpu, config, max_seq, Qwen4KvBackend::Legacy)
+    }
+
+    /// State whose context arenas (full K/V, raw and pooled index keys) are
+    /// `backend` storage of `max_seq` logical tokens: legacy arenas are full
+    /// zeroed allocations; VMM arenas reserve that VA and map nothing until
+    /// [`Self::ensure_mapped_capacity`]. The fixed carry is always allocated.
+    pub(crate) fn new_with_backend(
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+        max_seq: usize,
+        backend: Qwen4KvBackend,
+    ) -> Result<Self, MtpGpuError> {
         let full_width = config.num_key_value_heads * config.head_dim;
         let raw_width = config.indexer_kv_heads * config.indexer_head_dim;
-        let pooled_capacity = max_seq.div_ceil(config.indexer_compress_ratio);
+        let compress = config.indexer_compress_ratio;
+        let pooled_capacity = max_seq.div_ceil(compress);
         let selected_capacity = config.qsa_selected_capacity();
-        let full_keys = gpu.zeros(&[max_seq * full_width], DType::F32)?;
-        let full_values = match gpu.zeros(&[max_seq * full_width], DType::F32) {
-            Ok(tensor) => tensor,
-            Err(error) => {
-                let _ = gpu.free_tensor(full_keys);
-                return Err(error.into());
+        let device_id = gpu.device_id;
+        let shapes = [
+            (max_seq * full_width, DType::F32, true),
+            (max_seq * full_width, DType::F32, true),
+            (max_seq * raw_width, DType::F32, true),
+            (pooled_capacity * raw_width, DType::F32, true),
+            (
+                selected_capacity * std::mem::size_of::<i32>(),
+                DType::Raw,
+                false,
+            ),
+            (std::mem::size_of::<i32>(), DType::Raw, false),
+            (config.hc_count * config.hidden_size, DType::F32, false),
+        ];
+        let mut allocated = Vec::with_capacity(shapes.len());
+        for (elements, dtype, context) in shapes {
+            let tensor = match (context, backend) {
+                // SAFETY: every access to a VMM context arena is bounded by
+                // `mapped_tokens`, which `ensure_mapped_capacity` raises only
+                // after mapping and zeroing the covering pages.
+                (true, Qwen4KvBackend::Vmm) => unsafe {
+                    gpu.alloc_vmm_tensor(&[elements], dtype, 0, &[device_id])
+                },
+                _ => gpu.zeros(&[elements], dtype),
+            };
+            match tensor {
+                Ok(tensor) => allocated.push(tensor),
+                Err(error) => {
+                    for tensor in allocated {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    return Err(error.into());
+                }
             }
-        };
-        let raw_index_keys = match gpu.zeros(&[max_seq * raw_width], DType::F32) {
-            Ok(tensor) => tensor,
-            Err(error) => {
-                let _ = gpu.free_tensor(full_keys);
-                let _ = gpu.free_tensor(full_values);
-                return Err(error.into());
-            }
-        };
-        let pooled_keys = match gpu.zeros(&[pooled_capacity * raw_width], DType::F32) {
-            Ok(tensor) => tensor,
-            Err(error) => {
-                let _ = gpu.free_tensor(full_keys);
-                let _ = gpu.free_tensor(full_values);
-                let _ = gpu.free_tensor(raw_index_keys);
-                return Err(error.into());
-            }
-        };
-        let selected_bytes = selected_capacity * std::mem::size_of::<i32>();
-        let selected_indices = match gpu.zeros(&[selected_bytes], DType::Raw) {
-            Ok(tensor) => tensor,
-            Err(error) => {
-                let _ = gpu.free_tensor(full_keys);
-                let _ = gpu.free_tensor(full_values);
-                let _ = gpu.free_tensor(raw_index_keys);
-                let _ = gpu.free_tensor(pooled_keys);
-                return Err(error.into());
-            }
-        };
-        let selected_len_out = match gpu.zeros(&[std::mem::size_of::<i32>()], DType::Raw) {
-            Ok(tensor) => tensor,
-            Err(error) => {
-                let _ = gpu.free_tensor(full_keys);
-                let _ = gpu.free_tensor(full_values);
-                let _ = gpu.free_tensor(raw_index_keys);
-                let _ = gpu.free_tensor(pooled_keys);
-                let _ = gpu.free_tensor(selected_indices);
-                return Err(error.into());
-            }
-        };
-        let wide_hidden = match gpu.zeros(&[MTP_BRANCHES * config.hidden_size], DType::F32) {
-            Ok(tensor) => tensor,
-            Err(error) => {
-                let _ = gpu.free_tensor(full_keys);
-                let _ = gpu.free_tensor(full_values);
-                let _ = gpu.free_tensor(raw_index_keys);
-                let _ = gpu.free_tensor(pooled_keys);
-                let _ = gpu.free_tensor(selected_indices);
-                let _ = gpu.free_tensor(selected_len_out);
-                return Err(error.into());
-            }
-        };
+        }
+        let mut tensors = allocated.into_iter();
+        let mut next = || tensors.next().expect("one tensor per MTP state shape");
+        let (full_keys, full_values, raw_index_keys, pooled_keys) =
+            (next(), next(), next(), next());
+        let (selected_indices, selected_len_out, wide_hidden) = (next(), next(), next());
         let model_id = next_mtp_model_id();
         let snapshot_arena = match MtpGpuStateSnapshotArena::new(
             gpu,
@@ -707,13 +1281,17 @@ impl MtpGpuState {
         ) {
             Ok(arena) => arena,
             Err(error) => {
-                let _ = gpu.free_tensor(full_keys);
-                let _ = gpu.free_tensor(full_values);
-                let _ = gpu.free_tensor(raw_index_keys);
-                let _ = gpu.free_tensor(pooled_keys);
-                let _ = gpu.free_tensor(selected_indices);
-                let _ = gpu.free_tensor(selected_len_out);
-                let _ = gpu.free_tensor(wide_hidden);
+                for tensor in [
+                    full_keys,
+                    full_values,
+                    raw_index_keys,
+                    pooled_keys,
+                    selected_indices,
+                    selected_len_out,
+                    wide_hidden,
+                ] {
+                    let _ = gpu.free_tensor(tensor);
+                }
                 return Err(error);
             }
         };
@@ -729,6 +1307,12 @@ impl MtpGpuState {
             raw_capacity: max_seq,
             pooled_capacity,
             selected_capacity,
+            compress,
+            backend,
+            mapped_tokens: match backend {
+                Qwen4KvBackend::Legacy => max_seq,
+                Qwen4KvBackend::Vmm => 0,
+            },
             position: 0,
             full_len: 0,
             raw_len: 0,
@@ -742,6 +1326,97 @@ impl MtpGpuState {
         })
     }
 
+    /// Map (VMM) the context arenas to cover tokens `0..required_tokens`
+    /// before any access to them: full K/V and raw index keys by token,
+    /// pooled keys by `ceil(required_tokens / compress)` blocks, each with its
+    /// own byte stride and the shared [`KvChunkPlan`] growth policy. Newly
+    /// mapped pages are zeroed, as legacy arenas are. A request beyond the
+    /// admitted capacity is refused before any mapping; legacy storage only
+    /// checks that bound. Never maps during graph capture. After a failed
+    /// map the completed arenas stay mapped and the coverage is unchanged.
+    pub(crate) fn ensure_mapped_capacity(
+        &mut self,
+        gpu: &mut Gpu,
+        required_tokens: usize,
+    ) -> Result<(), MtpGpuError> {
+        if required_tokens > self.full_capacity {
+            return Err(invalid(format!(
+                "MTP QSA requires {required_tokens} tokens; admitted capacity is {}",
+                self.full_capacity
+            )));
+        }
+        if required_tokens <= self.mapped_tokens {
+            return Ok(());
+        }
+        // Legacy coverage is the full capacity, so only VMM reaches here.
+        if gpu.graphs.capture_mode {
+            return Err(invalid("MTP QSA growth requested during graph capture"));
+        }
+        let pooled_required = required_tokens.div_ceil(self.compress);
+        let (full, raw, pooled) = (self.full_capacity, self.raw_capacity, self.pooled_capacity);
+        for (tensor, capacity, rows) in [
+            (&mut self.full_keys, full, required_tokens),
+            (&mut self.full_values, full, required_tokens),
+            (&mut self.raw_index_keys, raw, required_tokens),
+            (&mut self.pooled_keys, pooled, pooled_required),
+        ] {
+            grow_context_arena(gpu, tensor, capacity, rows)?;
+        }
+        self.mapped_tokens = self.mapped_token_coverage(gpu)?;
+        debug_assert!(self.mapped_tokens >= required_tokens);
+        Ok(())
+    }
+
+    /// Tokens every context arena's mapped prefix covers.
+    fn mapped_token_coverage(&self, gpu: &Gpu) -> Result<usize, MtpGpuError> {
+        let rows = |tensor: &GpuTensor, capacity: usize| -> Result<usize, MtpGpuError> {
+            let mapped = gpu
+                .vmm_mapped_bytes(tensor)
+                .ok_or_else(|| invalid("MTP QSA arena is not a registered VMM owner"))?;
+            Ok((mapped / (tensor.byte_size() / capacity)).min(capacity))
+        };
+        let full = rows(&self.full_keys, self.full_capacity)?
+            .min(rows(&self.full_values, self.full_capacity)?)
+            .min(rows(&self.raw_index_keys, self.raw_capacity)?);
+        let pooled = rows(&self.pooled_keys, self.pooled_capacity)?
+            .saturating_mul(self.compress)
+            .min(self.full_capacity);
+        Ok(full.min(pooled))
+    }
+
+    /// Physical bytes committed to the context arenas: the mapped prefixes
+    /// (VMM), or the full allocations (legacy).
+    pub(crate) fn mapped_context_bytes(&self, gpu: &Gpu) -> Result<usize, MtpGpuError> {
+        let arenas = [
+            &self.full_keys,
+            &self.full_values,
+            &self.raw_index_keys,
+            &self.pooled_keys,
+        ];
+        let mut bytes = 0usize;
+        for tensor in arenas {
+            let committed = match self.backend {
+                Qwen4KvBackend::Legacy => tensor.byte_size(),
+                Qwen4KvBackend::Vmm => gpu
+                    .vmm_mapped_bytes(tensor)
+                    .ok_or_else(|| invalid("MTP QSA arena is not a registered VMM owner"))?,
+            };
+            bytes = bytes
+                .checked_add(committed)
+                .ok_or_else(|| invalid("MTP QSA mapped bytes overflow"))?;
+        }
+        Ok(bytes)
+    }
+
+    /// Tokens the context arenas may currently be accessed for.
+    pub(crate) fn mapped_tokens(&self) -> usize {
+        self.mapped_tokens
+    }
+
+    pub(crate) fn backend(&self) -> Qwen4KvBackend {
+        self.backend
+    }
+
     pub(crate) fn reset(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
         self.snapshot_arena.invalidate();
         for tensor in [
@@ -753,7 +1428,10 @@ impl MtpGpuState {
             &self.selected_len_out,
             &self.wide_hidden,
         ] {
-            gpu.hip.memset(&tensor.buf, 0, tensor.buf.size())?;
+            // An unmapped VMM arena has an empty accessible prefix.
+            if tensor.buf.size() > 0 {
+                gpu.hip.memset(&tensor.buf, 0, tensor.buf.size())?;
+            }
         }
         self.position = 0;
         self.full_len = 0;
@@ -765,6 +1443,12 @@ impl MtpGpuState {
         self.generation = self.generation.wrapping_add(1);
         Ok(())
     }
+
+    /// A snapshot ticket of this state's arena is outstanding.
+    pub(crate) fn snapshot_active(&self) -> bool {
+        self.snapshot_arena.active
+    }
+
     pub(crate) fn snapshot(&mut self, gpu: &mut Gpu) -> Result<MtpGpuStateSnapshot, MtpGpuError> {
         let dimensions = MtpGpuStateSnapshotArena::dimensions(self);
         let mark = self.mark();
@@ -951,6 +1635,122 @@ impl MtpGpuState {
         self.step_index = metadata.step_index;
     }
 
+    /// Layout of the state at `mark`: full K/V, raw and pooled rows below it,
+    /// then selection, device selected length and wide hidden.
+    fn session_layout(&self, mark: &MtpStateMark) -> StateLayout<'_> {
+        StateLayout {
+            fixed: vec![
+                whole_part(&self.selected_indices),
+                whole_part(&self.selected_len_out),
+                whole_part(&self.wide_hidden),
+            ],
+            rows: [
+                (&self.full_keys, self.full_capacity, mark.full_len),
+                (&self.full_values, self.full_capacity, mark.full_len),
+                (&self.raw_index_keys, self.raw_capacity, mark.raw_len),
+                (&self.pooled_keys, self.pooled_capacity, mark.pooled_len),
+            ]
+            .into_iter()
+            .map(|(tensor, capacity, rows)| RowStream {
+                buf: &tensor.buf,
+                row_bytes: tensor.byte_size() / capacity,
+                rows,
+            })
+            .collect(),
+        }
+    }
+
+    /// Session-cache capture: `MTP_SESSION_WORDS` metadata words and the
+    /// device ranges of the live state.
+    fn session_parts(&self) -> Result<(Vec<u64>, StateLayout<'_>), MtpGpuError> {
+        let mark = self.mark();
+        validate_mtp_mark(&mark, self)?;
+        let words = [
+            mark.full_len,
+            mark.raw_len,
+            mark.pooled_len,
+            mark.selected_len,
+            mark.position,
+            mark.step_index,
+        ]
+        .map(|value| value as u64);
+        Ok((
+            [0].into_iter().chain(words).collect(),
+            self.session_layout(&mark),
+        ))
+    }
+
+    fn parse_session_mark(&self, words: &[u64]) -> Result<MtpStateMark, MtpGpuError> {
+        if words.len() != MTP_SESSION_WORDS {
+            return Err(invalid("MTP session snapshot shape mismatch"));
+        }
+        let mark = MtpStateMark {
+            full_len: words[1] as usize,
+            raw_len: words[2] as usize,
+            pooled_len: words[3] as usize,
+            selected_len: words[4] as usize,
+            position: words[5] as usize,
+            step_index: words[6] as usize,
+        };
+        validate_mtp_mark(&mark, self)?;
+        Ok(mark)
+    }
+
+    /// Map the context arenas to cover every row the snapshot holds and, like
+    /// a reset, start a new request epoch that retires every speculative
+    /// ticket. Live buffers stay in place: the caller copies into the
+    /// returned destination layout.
+    fn prepare_session_restore(
+        &mut self,
+        gpu: &mut Gpu,
+        words: &[u64],
+    ) -> Result<StateLayout<'_>, MtpGpuError> {
+        let mark = self.parse_session_mark(words)?;
+        let required = mark.position.max(mark.full_len).max(mark.raw_len).max(
+            mark.pooled_len
+                .saturating_mul(self.compress)
+                .min(self.full_capacity),
+        );
+        self.ensure_mapped_capacity(gpu, required)?;
+        self.snapshot_arena.invalidate();
+        self.request_epoch = self.request_epoch.wrapping_add(1);
+        self.generation = self.generation.wrapping_add(1);
+        Ok(self.session_layout(&mark))
+    }
+
+    fn finish_session_restore(&mut self, words: &[u64]) -> Result<(), MtpGpuError> {
+        let mark = self.parse_session_mark(words)?;
+        self.full_len = mark.full_len;
+        self.raw_len = mark.raw_len;
+        self.pooled_len = mark.pooled_len;
+        self.selected_len = mark.selected_len;
+        self.position = mark.position;
+        self.step_index = mark.step_index;
+        Ok(())
+    }
+
+    /// Context-arena bytes still unmapped below `through` tokens (at most
+    /// capacity; 0 for legacy).
+    fn context_growth_bytes(&self, through: usize) -> u64 {
+        if self.backend == Qwen4KvBackend::Legacy || self.full_capacity == 0 {
+            return 0;
+        }
+        let capacity: u64 = [
+            &self.full_keys,
+            &self.full_values,
+            &self.raw_index_keys,
+            &self.pooled_keys,
+        ]
+        .iter()
+        .map(|tensor| tensor.byte_size() as u64)
+        .sum();
+        capacity
+            * through
+                .min(self.full_capacity)
+                .saturating_sub(self.mapped_tokens) as u64
+            / self.full_capacity as u64
+    }
+
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
         let Self {
             full_keys,
@@ -981,17 +1781,108 @@ impl MtpGpuState {
     }
 }
 
+/// Every byte family of a head state: full K/V and raw/pooled index rows
+/// below their lengths, the selected indices up to `selected_len`, the
+/// device selected length, the wide hidden, and the marks, position and step
+/// index as little-endian u64s.
+#[cfg(feature = "lab")]
+pub fn lab_head_items(gpu: &Gpu, head: &MtpGpuState) -> Result<Vec<(String, Vec<u8>)>, String> {
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| format!("Qwen4 MTP lab head sync: {error}"))?;
+    let download = |tensor: &GpuTensor, bytes: usize| -> Result<Vec<u8>, String> {
+        let mut out = vec![0u8; bytes];
+        if bytes > 0 {
+            if bytes > tensor.buf.size() {
+                return Err(format!(
+                    "Qwen4 MTP lab head read of {bytes} bytes exceeds the {} mapped",
+                    tensor.buf.size()
+                ));
+            }
+            gpu.hip
+                .memcpy_dtoh(&mut out, &tensor.buf)
+                .map_err(|error| format!("Qwen4 MTP lab head download: {error}"))?;
+        }
+        Ok(out)
+    };
+    let rows = |tensor: &GpuTensor, capacity: usize, len: usize| -> Result<Vec<u8>, String> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let row_bytes = tensor
+            .byte_size()
+            .checked_div(capacity)
+            .ok_or_else(|| "Qwen4 MTP lab head arena has no capacity".to_string())?;
+        download(tensor, len * row_bytes)
+    };
+    let words = [
+        head.full_len,
+        head.raw_len,
+        head.pooled_len,
+        head.selected_len,
+        head.position,
+        head.step_index,
+    ]
+    .iter()
+    .flat_map(|&word| (word as u64).to_le_bytes())
+    .collect::<Vec<u8>>();
+    Ok(vec![
+        (
+            "head.full_keys".to_string(),
+            rows(&head.full_keys, head.full_capacity, head.full_len)?,
+        ),
+        (
+            "head.full_values".to_string(),
+            rows(&head.full_values, head.full_capacity, head.full_len)?,
+        ),
+        (
+            "head.raw_index_keys".to_string(),
+            rows(&head.raw_index_keys, head.raw_capacity, head.raw_len)?,
+        ),
+        (
+            "head.pooled_keys".to_string(),
+            rows(&head.pooled_keys, head.pooled_capacity, head.pooled_len)?,
+        ),
+        (
+            "head.selected_indices".to_string(),
+            download(
+                &head.selected_indices,
+                head.selected_len * std::mem::size_of::<i32>(),
+            )?,
+        ),
+        (
+            "head.selected_len_out".to_string(),
+            download(&head.selected_len_out, head.selected_len_out.byte_size())?,
+        ),
+        (
+            "head.wide_hidden".to_string(),
+            download(&head.wide_hidden, head.wide_hidden.byte_size())?,
+        ),
+        ("head.marks".to_string(), words),
+    ])
+}
+
 /// Model-owned native MTP operator and state.
 pub struct Qwen4MtpGpu {
     pub(crate) scratch: MtpGpuScratch,
     pub(crate) state: MtpGpuState,
-    pub(crate) moe: Qwen4MoeLayerRuntime,
+    /// The MTP layer's routed-expert runtime: `Some` exactly for a MoE FFN.
+    pub(crate) moe: Option<Qwen4MoeLayerRuntime>,
     pub(crate) max_seq: usize,
     /// Draft ranking (`HIPFIRE_MTP_DRAFT_HEAD=mq2..mq6[r]`, default `mq2r`;
     /// anything else = the model's own head). On the shipped Q8_0 head an
     /// MQ2 copy with exact re-scoring of its top 8 drafts the Q8_0 head's own
     /// argmax at a quarter of its read; plain MQ3 loses acceptance.
     pub(crate) draft: DraftHead,
+    /// The head's MoE runtime is an EP decode table (the rank-compact
+    /// experts + the zero dummy expert): each MoE head step then exchanges
+    /// its expanded rows through the forward's row gather.
+    pub(crate) ep_bound: bool,
+    /// MoE head steps sealed under EP so far: a monotonic invocation counter
+    /// (never reset, never part of a state snapshot) whose parity picks the
+    /// head's gather buffer `2 + j % 2`, so a probe-and-restore never reuses
+    /// a buffer on two consecutive invocations.
+    pub(crate) moe_steps: u64,
 }
 
 /// Draft-head front: tokens below this id, plus EOS and the control ids
@@ -1015,13 +1906,28 @@ pub(crate) enum MtpStep {
     Append,
 }
 
+/// The FFN call of one non-Append MTP step, in the profile's FFN kind.
+enum MtpFfnCall<'a> {
+    Moe(hipfire_dispatch::pipeline::sealed_moe::SealedMoeCall<'a>),
+    Dense(DenseFfnOp<'a>),
+}
+
 /// Draft ranking policy (`HIPFIRE_MTP_DRAFT_HEAD`, default `mq2r`) and row
-/// layout of the MTP draft head.
+/// layout of the MTP draft head. Only the Flash-Next head takes the
+/// quantized ranking copy (its requant and re-score kernels are K = 2560 /
+/// 256-group shaped); a developer profile ranks the model's own head.
 fn draft_head_config(config: &Qwen4Config) -> (DraftHeadPolicy, DraftHeadLayout) {
-    let policy = DraftHeadPolicy::parse(
-        &hipfire_config::developer_var("HIPFIRE_MTP_DRAFT_HEAD")
-            .unwrap_or_else(|_| "mq2r".to_string()),
-    );
+    let policy = if config.profile.is_flash_next() {
+        DraftHeadPolicy::parse(
+            &hipfire_config::developer_var("HIPFIRE_MTP_DRAFT_HEAD")
+                .unwrap_or_else(|_| "mq2r".to_string()),
+        )
+    } else {
+        DraftHeadPolicy {
+            copy: None,
+            rescore: false,
+        }
+    };
     let layout = DraftHeadLayout {
         vocab: config.vocab_size,
         hidden: config.hidden_size,
@@ -1032,51 +1938,139 @@ fn draft_head_config(config: &Qwen4Config) -> (DraftHeadPolicy, DraftHeadLayout)
     (policy, layout)
 }
 
+/// The config half of [`admit_mtp`]: the profile declares a head and its RoPE
+/// base is the one the QSA kernels implement. Flash-Next keeps its pinned
+/// `Qwen4MtpConfig::validate` contract unchanged.
+fn admit_mtp_config(config: &Qwen4Config) -> Result<(), MtpGpuError> {
+    let mtp = config
+        .mtp
+        .as_ref()
+        .ok_or_else(|| invalid("profile has no native MTP head"))?;
+    if config.profile.is_flash_next() {
+        mtp.validate().map_err(MtpGpuError::Invalid)?;
+    } else {
+        mtp.validate_shape().map_err(MtpGpuError::Invalid)?;
+        // The MTP QSA runs the trunk's RoPE kernels, which hard-code the base.
+        if mtp.rope_theta != QWEN4_QSA_KERNEL_ROPE_THETA {
+            return Err(invalid(format!(
+                "profile {} MTP rope_theta {} differs from the {} base hard-coded in the QSA RoPE kernels",
+                config.profile.id(),
+                mtp.rope_theta,
+                QWEN4_QSA_KERNEL_ROPE_THETA
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Admit the head before anything is allocated: the config contract of
+/// [`admit_mtp_config`] and FFN weights of the profile's FFN kind and width.
+fn admit_mtp(weights: &Qwen4Weights, config: &Qwen4Config) -> Result<(), MtpGpuError> {
+    admit_mtp_config(config)?;
+    let head = bound_mtp(weights)?;
+    match (&config.ffn, &head.ffn) {
+        (crate::config::Qwen4FfnConfig::Moe { .. }, Qwen4FfnWeights::Moe(_)) => Ok(()),
+        (
+            crate::config::Qwen4FfnConfig::Dense { intermediate_size },
+            Qwen4FfnWeights::Dense(dense),
+        ) => {
+            let gate = dense_ref(weights, &dense.gate)?;
+            let up = dense_ref(weights, &dense.up)?;
+            let down = dense_ref(weights, &dense.down)?;
+            if (gate.m, gate.k) != (*intermediate_size, config.hidden_size)
+                || (up.m, up.k) != (*intermediate_size, config.hidden_size)
+                || (down.m, down.k) != (config.hidden_size, *intermediate_size)
+            {
+                return Err(invalid(format!(
+                    "MTP dense FFN is gate {}x{} / up {}x{} / down {}x{}, profile expects intermediate {intermediate_size} and hidden {}",
+                    gate.m, gate.k, up.m, up.k, down.m, down.k, config.hidden_size
+                )));
+            }
+            Ok(())
+        }
+        _ => Err(invalid(
+            "MTP FFN weights are not of the profile's FFN kind (dense/MoE)",
+        )),
+    }
+}
+
 impl Qwen4MtpGpu {
-    /// `(resident, load scratch)` device bytes [`Self::new`] takes at
-    /// `max_seq` for a language head stored as `head_dtype`: what the
-    /// attached head keeps, and the draft head's build scratch on top of it
-    /// (`DraftHead::device_bytes`), released before `new` returns.
+    /// `(resident, load scratch)` device bytes [`Self::new_with_backend`]
+    /// commits for QSA context storage `context` and a language head stored
+    /// as `head_dtype`: what the attached head keeps, and the draft head's
+    /// build scratch on top of it (`DraftHead::device_bytes`), released
+    /// before construction returns.
     pub(crate) fn device_bytes(
         config: &Qwen4Config,
-        max_seq: usize,
+        context: &Qwen4ContextCommit,
         head_dtype: DType,
     ) -> Option<(usize, usize)> {
         let (policy, layout) = draft_head_config(config);
         let (draft, scratch) = DraftHead::device_bytes(head_dtype, layout, policy)?;
         let resident = MtpGpuScratch::device_bytes(config)
             .ok()?
-            .checked_add(MtpGpuState::device_bytes(config, max_seq)?)?
+            .checked_add(MtpGpuState::device_bytes(config, context)?)?
             .checked_add(Qwen4MoeLayerRuntime::device_bytes(config)?)?
             .checked_add(draft)?;
         Some((resident, scratch))
     }
 
-    pub(crate) fn new(
+    /// MTP head whose QSA context arenas are `backend` storage (admission
+    /// resolves it); see [`MtpGpuState::new_with_backend`]. Under expert
+    /// parallelism `ep` is the rank's binding from its attached forward (the
+    /// placement the weights were loaded with and the rank's zero dummy
+    /// expert): the head's MoE runtime is then the rank's EP decode table.
+    pub(crate) fn new_with_backend(
         gpu: &mut Gpu,
         weights: &Qwen4Weights,
         config: &Qwen4Config,
         max_seq: usize,
+        backend: Qwen4KvBackend,
+        ep: Option<(Qwen4EpPlacement, &Qwen4EpDummyExpert)>,
     ) -> Result<Self, MtpGpuError> {
-        config.mtp.validate().map_err(MtpGpuError::Invalid)?;
-        if max_seq == 0 || max_seq > config.max_position_embeddings {
+        admit_mtp(weights, config)?;
+        if weights.ep_placement() != ep.map(|(placement, _)| placement) {
+            return Err(invalid(
+                "the MTP head's EP binding must be the forward's placement the weights were loaded with (EP weights are rank-compact)",
+            ));
+        }
+        let ep_bound = ep.is_some();
+        if max_seq == 0 || max_seq > config.context_limit() {
             return Err(invalid("MTP max_seq is outside model capacity"));
         }
+        let head = bound_mtp(weights)?;
         let scratch = MtpGpuScratch::new(gpu, config)?;
-        let state = match MtpGpuState::new(gpu, config, max_seq) {
+        let state = match MtpGpuState::new_with_backend(gpu, config, max_seq, backend) {
             Ok(state) => state,
             Err(error) => {
                 let _ = scratch.free_gpu(gpu);
                 return Err(error);
             }
         };
-        let moe = match Qwen4MoeLayerRuntime::from_moe(gpu, weights, &weights.mtp.moe, 0, config) {
-            Ok(moe) => moe,
-            Err(error) => {
-                let _ = state.free_gpu(gpu);
-                let _ = scratch.free_gpu(gpu);
-                return Err(error.into());
+        let moe = match head.ffn.moe() {
+            Some(moe_weights) => {
+                let built = match ep {
+                    Some((placement, dummy)) => Qwen4MoeLayerRuntime::from_moe_ep(
+                        gpu,
+                        weights,
+                        moe_weights,
+                        0,
+                        config,
+                        placement,
+                        dummy,
+                    ),
+                    None => Qwen4MoeLayerRuntime::from_moe(gpu, weights, moe_weights, 0, config),
+                };
+                match built {
+                    Ok(moe) => Some(moe),
+                    Err(error) => {
+                        let _ = state.free_gpu(gpu);
+                        let _ = scratch.free_gpu(gpu);
+                        return Err(error.into());
+                    }
+                }
             }
+            None => None,
         };
         let (policy, layout) = draft_head_config(config);
         let draft = weights
@@ -1086,7 +2080,7 @@ impl Qwen4MtpGpu {
         let draft = match draft {
             Ok(draft) => draft,
             Err(error) => {
-                let _ = moe.free_gpu(gpu);
+                let _ = moe.map(|moe| moe.free_gpu(gpu));
                 let _ = state.free_gpu(gpu);
                 let _ = scratch.free_gpu(gpu);
                 return Err(error);
@@ -1098,6 +2092,8 @@ impl Qwen4MtpGpu {
             moe,
             max_seq,
             draft,
+            ep_bound,
+            moe_steps: 0,
         })
     }
 
@@ -1112,7 +2108,7 @@ impl Qwen4MtpGpu {
         let draft_error = draft.free_gpu(gpu);
         let scratch_error = scratch.free_gpu(gpu);
         let state_error = state.free_gpu(gpu);
-        let moe_error = moe.free_gpu(gpu);
+        let moe_error = moe.and_then(|moe| moe.free_gpu(gpu));
         draft_error
             .or(scratch_error)
             .or(state_error)
@@ -1130,7 +2126,7 @@ impl Qwen4MtpGpu {
             &self.scratch.moe_gate,
             &self.scratch.moe_up,
             &self.scratch.moe_hidden,
-            &self.scratch.moe_output,
+            &self.scratch.ffn_output,
             &self.scratch.moe_gate_batch,
             &self.scratch.moe_up_batch,
             &self.scratch.moe_rot_batch,
@@ -1144,8 +2140,76 @@ impl Qwen4MtpGpu {
         Ok(())
     }
 
+    /// A cold request also starts the draft policy fresh: the full-vocabulary
+    /// hold and margin are request-local, never inherited from the previous
+    /// request.
     pub(crate) fn reset(&mut self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
+        self.draft.reset_request_state();
         self.state.reset(gpu)
+    }
+
+    /// See [`MtpGpuState::ensure_mapped_capacity`].
+    pub(crate) fn ensure_mapped_capacity(
+        &mut self,
+        gpu: &mut Gpu,
+        required_tokens: usize,
+    ) -> Result<(), MtpGpuError> {
+        self.state.ensure_mapped_capacity(gpu, required_tokens)
+    }
+
+    /// See [`MtpGpuState::mapped_context_bytes`].
+    pub(crate) fn mapped_context_bytes(&self, gpu: &Gpu) -> Result<usize, MtpGpuError> {
+        self.state.mapped_context_bytes(gpu)
+    }
+
+    /// Session-cache capture of the head state plus the draft policy.
+    /// Prompt appends only `observe` (a qualifying input sets the full hold);
+    /// drafts are the only decrement, so at a prompt boundary the policy is
+    /// the canonical prompt summary.
+    pub(crate) fn session_parts(&self) -> Result<(Vec<u8>, StateLayout<'_>), MtpGpuError> {
+        let (mut words, parts) = self.state.session_parts()?;
+        let policy = self.draft.request_state();
+        words.extend([
+            u64::from(policy.full_steps),
+            u64::from(policy.margin.to_bits()),
+        ]);
+        Ok((meta_bytes(&words), parts))
+    }
+
+    fn session_words(meta: &[u8]) -> Result<Vec<u64>, MtpGpuError> {
+        meta_words(meta)
+            .filter(|words| words.len() == MTP_SESSION_WORDS + 2)
+            .ok_or_else(|| invalid("MTP session snapshot shape mismatch"))
+    }
+
+    pub(crate) fn prepare_session_restore(
+        &mut self,
+        gpu: &mut Gpu,
+        meta: &[u8],
+    ) -> Result<StateLayout<'_>, MtpGpuError> {
+        let words = Self::session_words(meta)?;
+        self.state
+            .prepare_session_restore(gpu, &words[..MTP_SESSION_WORDS])
+    }
+
+    pub(crate) fn finish_session_restore(&mut self, meta: &[u8]) -> Result<(), MtpGpuError> {
+        let words = Self::session_words(meta)?;
+        self.state
+            .finish_session_restore(&words[..MTP_SESSION_WORDS])?;
+        let policy = &words[MTP_SESSION_WORDS..];
+        self.draft.set_request_state(DraftHeadRequestState {
+            full_steps: u32::try_from(policy[0])
+                .map_err(|_| invalid("MTP session draft policy"))?,
+            margin: f32::from_bits(
+                u32::try_from(policy[1]).map_err(|_| invalid("MTP session draft policy"))?,
+            ),
+        });
+        Ok(())
+    }
+
+    /// See [`MtpGpuState::context_growth_bytes`].
+    pub(crate) fn context_growth_bytes(&self, through: usize) -> u64 {
+        self.state.context_growth_bytes(through)
     }
     pub(crate) fn snapshot(&mut self, gpu: &mut Gpu) -> Result<MtpGpuStateSnapshot, MtpGpuError> {
         self.state.snapshot(gpu)
@@ -1200,6 +2264,7 @@ impl Qwen4MtpGpu {
         position: usize,
         fresh_qsa_selection: bool,
         logits: &GpuTensor,
+        ep: Option<MtpEpGather<'_>>,
     ) -> Result<u32, MtpGpuError> {
         if logits.dtype != DType::F32 || logits.numel() != self.draft.logits().numel() {
             return Err(invalid("MTP logits destination shape mismatch"));
@@ -1214,6 +2279,7 @@ impl Qwen4MtpGpu {
                 position,
                 fresh_qsa_selection,
                 MtpStep::Predict,
+                ep,
             )?
             .ok_or_else(|| invalid("MTP prediction requested but no token produced"))?;
         gpu.copy_d2d(self.draft.logits(), logits, logits.byte_size())?;
@@ -1230,8 +2296,119 @@ impl Qwen4MtpGpu {
         position: usize,
         fresh_qsa_selection: bool,
         step: MtpStep,
+        ep: Option<MtpEpGather<'_>>,
     ) -> Result<Option<u32>, MtpGpuError> {
-        let wide = MTP_BRANCHES
+        let lengths = self.head_block(
+            gpu,
+            weights,
+            config,
+            token,
+            backbone_hidden,
+            position,
+            fresh_qsa_selection,
+            step,
+            ep,
+        )?;
+        let next_token = if step == MtpStep::Predict {
+            let head = weights.resident(&weights.root.lm_head)?;
+            Some(self.draft.draft(gpu, head, &self.scratch.hc_mixed)?)
+        } else {
+            None
+        };
+        self.finish_head_step(gpu, step, lengths)?;
+        Ok(next_token)
+    }
+
+    /// [`Self::forward_token`] with [`MtpStep::Predict`] and the draft read
+    /// deferred: the head block, the draft's device work into `top1_out`
+    /// (Raw, at least `Gpu::TOPK8_OUT_BYTES`; parsed later by
+    /// `self.draft.draft_finish`), the wide-hidden copy and the state
+    /// bookkeeping, in `forward_token`'s order.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_token_deferred(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+        token: u32,
+        backbone_hidden: Option<&GpuTensor>,
+        position: usize,
+        fresh_qsa_selection: bool,
+        top1_out: &GpuTensor,
+        ep: Option<MtpEpGather<'_>>,
+    ) -> Result<(), MtpGpuError> {
+        if top1_out.dtype != DType::Raw || top1_out.byte_size() < Gpu::TOPK8_OUT_BYTES {
+            return Err(invalid(format!(
+                "MTP deferred draft output must be Raw with at least {} bytes",
+                Gpu::TOPK8_OUT_BYTES
+            )));
+        }
+        let lengths = self.head_block(
+            gpu,
+            weights,
+            config,
+            token,
+            backbone_hidden,
+            position,
+            fresh_qsa_selection,
+            MtpStep::Predict,
+            ep,
+        )?;
+        let head = weights.resident(&weights.root.lm_head)?;
+        self.draft
+            .draft_enqueue(gpu, head, &self.scratch.hc_mixed, top1_out)?;
+        self.finish_head_step(gpu, MtpStep::Predict, lengths)
+    }
+
+    /// The tail of a head step the draft does not touch: the wide-hidden
+    /// copy (every step but an append) and the state bookkeeping.
+    fn finish_head_step(
+        &mut self,
+        gpu: &mut Gpu,
+        step: MtpStep,
+        (full_len, raw_len, pooled_len, selected_len, next_position): (
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+        ),
+    ) -> Result<(), MtpGpuError> {
+        if step != MtpStep::Append {
+            gpu.copy_d2d(
+                &self.scratch.wide,
+                &self.state.wide_hidden,
+                self.scratch.wide.byte_size(),
+            )?;
+        }
+        let state = &mut self.state;
+        state.position = next_position;
+        state.full_len = full_len;
+        state.raw_len = raw_len;
+        state.pooled_len = pooled_len;
+        state.selected_len = selected_len;
+        state.step_index = state.step_index.wrapping_add(1);
+        Ok(())
+    }
+
+    /// The head step's checks and device work up to (not including) the
+    /// draft: returns the lengths the step publishes in
+    /// [`Self::finish_head_step`].
+    #[allow(clippy::too_many_arguments)]
+    fn head_block(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+        token: u32,
+        backbone_hidden: Option<&GpuTensor>,
+        position: usize,
+        fresh_qsa_selection: bool,
+        step: MtpStep,
+        ep: Option<MtpEpGather<'_>>,
+    ) -> Result<(usize, usize, usize, usize, usize), MtpGpuError> {
+        let wide = config
+            .hc_count
             .checked_mul(config.hidden_size)
             .ok_or_else(|| invalid("MTP wide dimension overflow"))?;
         if let Some(hidden) = backbone_hidden {
@@ -1256,22 +2433,31 @@ impl Qwen4MtpGpu {
         if position >= self.max_seq {
             return Err(invalid("MTP position exceeds QSA capacity"));
         }
+        // Mapping is the caller's (`ensure_mapped_capacity`), never here.
+        if position >= self.state.mapped_tokens {
+            return Err(invalid(format!(
+                "MTP position {position} is past the mapped QSA coverage of {} tokens",
+                self.state.mapped_tokens
+            )));
+        }
+        require_hc_up(&self.scratch.hc_up, MTP_HC_ROWS, wide, config.hc_lowrank)?;
         self.draft.observe(token);
         self.scratch
             .host_token_bytes
             .copy_from_slice(&(token as i32).to_ne_bytes());
         gpu.memcpy_htod_auto(&self.scratch.token_ids.buf, &self.scratch.host_token_bytes)?;
 
-        let (full_len, raw_len, pooled_len, selected_len, next_position) = {
+        let mtp = bound_mtp(weights)?;
+        let lengths = {
             let scratch = &self.scratch;
             let state = &self.state;
             let backbone_hidden = backbone_hidden.unwrap_or(&scratch.backbone_hidden);
             let hidden = config.hidden_size;
             let ctx = DispatchCtx::new(gpu);
-            let attn = hyper_desc(weights, &weights.mtp.attn_hyper)?;
-            let mlp = hyper_desc(weights, &weights.mtp.mlp_hyper)?;
-            let final_read = hyper_read_desc(weights, &weights.mtp.final_hyper)?;
-            let qsa = qsa_desc(weights, &weights.mtp.attention)?;
+            let attn = hyper_desc(weights, &mtp.attn_hyper)?;
+            let mlp = hyper_desc(weights, &mtp.mlp_hyper)?;
+            let final_read = hyper_read_desc(weights, &mtp.final_hyper)?;
+            let qsa = qsa_desc(weights, &mtp.attention)?;
             let mode = match (step, fresh_qsa_selection) {
                 (MtpStep::Append, _) => IndexedAttentionMode::AppendOnly,
                 (_, true) => IndexedAttentionMode::Full,
@@ -1297,6 +2483,7 @@ impl Qwen4MtpGpu {
                     raw_index_keys: &state.raw_index_keys,
                     pooled_keys: &state.pooled_keys,
                     selected_indices: &state.selected_indices,
+                    f16_arena: None,
                     full_capacity: state.full_capacity,
                     raw_capacity: state.raw_capacity,
                     pooled_capacity: state.pooled_capacity,
@@ -1326,40 +2513,94 @@ impl Qwen4MtpGpu {
                 heads: config.num_attention_heads,
                 kv_heads: config.num_key_value_heads,
                 head_dim: config.head_dim,
+                rotary_dim: config.rotary_dim(),
+                rope: config.rope(),
                 input_width: hidden,
                 rotation: &scratch.rotation,
                 mode,
+                trunk_a4: 0,
+                phase: MixerPhase::Whole,
             };
             let lengths = attention.next_lengths()?;
-            let moe = if step == MtpStep::Append {
+            // Under EP a MoE head step exchanges its expanded rows through the
+            // forward's row gather: gather buffer `2 + j % 2` and layer index
+            // `trunk_layers + j % 2` for the head's monotonic MoE invocation
+            // counter `j` (one increment per MoE head step, never rewound).
+            let moe_ep: Option<(usize, &GpuTensor, &dyn MoeRowGather)> = if self.ep_bound
+                && step != MtpStep::Append
+                && matches!(&mtp.ffn, Qwen4FfnWeights::Moe(_))
+            {
+                let ep = ep
+                    .ok_or_else(|| invalid("an EP MTP head step needs the forward's row gather"))?;
+                let parity = (self.moe_steps % 2) as usize;
+                self.moe_steps = self.moe_steps.wrapping_add(1);
+                Some((
+                    config.num_hidden_layers + parity,
+                    ep.buffers[2 + parity],
+                    ep.hook as &dyn MoeRowGather,
+                ))
+            } else {
+                None
+            };
+            // The MTP layer's FFN is the trunk's kind (`attach` refuses a
+            // head whose FFN weights disagree with the profile).
+            let ffn = if step == MtpStep::Append {
                 None
             } else {
-                Some(seal_moe_decode(
-                    &ctx,
-                    config,
-                    0,
-                    &self.moe,
-                    &scratch.hc_mixed,
-                    &scratch.moe_output,
-                    Qwen4MoeScratch {
-                        router_logits: &scratch.router_logits,
-                        scalar_buf: &scratch.moe_scalar,
-                        x_rot_local: &scratch.moe_x_rot,
-                        gate_up_buf: &scratch.moe_gate_up,
-                        gate_buf: &scratch.moe_gate,
-                        up_buf: &scratch.moe_up,
-                        ffn_hidden: &scratch.moe_hidden,
-                        // The shared down projection must not overwrite the
-                        // routed accumulator.
-                        ffn_out: &scratch.projected_embedding,
-                        gate_batch: &scratch.moe_gate_batch,
-                        up_batch: &scratch.moe_up_batch,
-                        rot_batch: &scratch.moe_rot_batch,
-                        topk_indices: &scratch.moe_topk_indices,
-                        topk_weights: &scratch.moe_topk_weights,
-                        down_expanded: &scratch.moe_down_expanded,
-                    },
-                )?)
+                Some(match (&mtp.ffn, self.moe.as_ref()) {
+                    (Qwen4FfnWeights::Moe(_), Some(runtime)) => {
+                        MtpFfnCall::Moe(seal_moe_decode(
+                            &ctx,
+                            config,
+                            moe_ep.map_or(0, |(layer, _, _)| layer),
+                            runtime,
+                            &scratch.hc_mixed,
+                            &scratch.ffn_output,
+                            Qwen4MoeScratch {
+                                router_logits: &scratch.router_logits,
+                                scalar_buf: &scratch.moe_scalar,
+                                x_rot_local: &scratch.moe_x_rot,
+                                gate_up_buf: &scratch.moe_gate_up,
+                                gate_buf: &scratch.moe_gate,
+                                up_buf: &scratch.moe_up,
+                                ffn_hidden: &scratch.moe_hidden,
+                                // The shared down projection must not
+                                // overwrite the routed accumulator.
+                                ffn_out: &scratch.projected_embedding,
+                                gate_batch: &scratch.moe_gate_batch,
+                                up_batch: &scratch.moe_up_batch,
+                                rot_batch: &scratch.moe_rot_batch,
+                                topk_indices: &scratch.moe_topk_indices,
+                                topk_weights: &scratch.moe_topk_weights,
+                                down_expanded: match moe_ep {
+                                    Some((_, buffer, _)) => buffer,
+                                    None => &scratch.moe_down_expanded,
+                                },
+                            },
+                            moe_ep.map(|(_, _, hook)| hook),
+                        )?)
+                    }
+                    (Qwen4FfnWeights::Dense(dense), None) => {
+                        let gate = dense_ref(weights, &dense.gate)?;
+                        MtpFfnCall::Dense(DenseFfnOp {
+                            recipe: DenseFfnRecipe::SiluBf16Source,
+                            intermediate: gate.m,
+                            gate,
+                            up: dense_ref(weights, &dense.up)?,
+                            down: dense_ref(weights, &dense.down)?,
+                            input: &scratch.hc_mixed,
+                            // The MoE batch scratch, sized to the dense
+                            // intermediate for a dense profile.
+                            gate_scratch: &scratch.moe_gate_batch,
+                            up_scratch: &scratch.moe_up_batch,
+                            output: &scratch.ffn_output,
+                            rotation: &scratch.rotation,
+                            rows: 1,
+                            hidden,
+                        })
+                    }
+                    _ => return Err(invalid("MTP FFN weights and runtime disagree")),
+                })
             };
             let mut steps: SmallVec<[Step<'_>; 16]> = SmallVec::new();
             steps.push(Step::Embed(EmbeddingOp {
@@ -1372,14 +2613,14 @@ impl Qwen4MtpGpu {
             }));
             steps.push(Step::HyperNorm(HyperNormOp {
                 input: &scratch.token_embedding,
-                norm_weight: weights.resident(&weights.mtp.pre_fc_norm_embedding)?,
+                norm_weight: weights.resident(&mtp.pre_fc_norm_embedding)?,
                 normalized: &scratch.embedding_norm,
                 branches: 1,
                 hidden,
                 state_bf16: false,
             }));
             steps.push(Step::Project(ProjectOp {
-                weight: dense_ref(weights, &weights.mtp.fc_embedding)?,
+                weight: dense_ref(weights, &mtp.fc_embedding)?,
                 input: &scratch.embedding_norm,
                 output: &scratch.projected_embedding,
                 rows: 1,
@@ -1387,30 +2628,30 @@ impl Qwen4MtpGpu {
             }));
             steps.push(Step::HyperNorm(HyperNormOp {
                 input: backbone_hidden,
-                norm_weight: weights.resident(&weights.mtp.pre_fc_norm_hidden)?,
+                norm_weight: weights.resident(&mtp.pre_fc_norm_hidden)?,
                 normalized: &scratch.hidden_norm,
-                branches: MTP_BRANCHES,
+                branches: config.hc_count,
                 hidden,
                 state_bf16: false,
             }));
             // Both branch rows in one projection (each bitwise its own).
             steps.push(Step::Project(ProjectOp {
-                weight: dense_ref(weights, &weights.mtp.fc_hidden)?,
+                weight: dense_ref(weights, &mtp.fc_hidden)?,
                 input: &scratch.hidden_norm,
                 output: &scratch.projected_hidden,
-                rows: MTP_BRANCHES,
+                rows: config.hc_count,
                 rotation: Some(&scratch.rotation),
             }));
             steps.push(Step::BroadcastAdd(BroadcastAddOp {
                 rows_input: &scratch.projected_hidden,
                 row: &scratch.projected_embedding,
                 output: &scratch.wide,
-                rows: MTP_BRANCHES,
+                rows: config.hc_count,
                 width: hidden,
             }));
             steps.push(Step::HyperRead(hc_read(&attn.read, scratch, config)));
             steps.push(Step::IndexedAttention(attention));
-            if let Some(moe) = moe {
+            if let Some(ffn) = ffn {
                 steps.push(Step::HyperWrite(hc_write(
                     &attn.write,
                     &scratch.projected_embedding,
@@ -1418,14 +2659,19 @@ impl Qwen4MtpGpu {
                     config,
                 )));
                 steps.push(Step::HyperRead(hc_read(&mlp.read, scratch, config)));
-                steps.push(Step::Clear(ClearOp {
-                    tensor: &scratch.moe_output,
-                    elements: hidden,
-                }));
-                steps.push(Step::Moe(moe));
+                match ffn {
+                    MtpFfnCall::Moe(moe) => {
+                        steps.push(Step::Clear(ClearOp {
+                            tensor: &scratch.ffn_output,
+                            elements: hidden,
+                        }));
+                        steps.push(Step::Moe(moe));
+                    }
+                    MtpFfnCall::Dense(dense) => steps.push(Step::DenseFfn(dense)),
+                }
                 steps.push(Step::HyperWrite(hc_write(
                     &mlp.write,
-                    &scratch.moe_output,
+                    &scratch.ffn_output,
                     scratch,
                     config,
                 )));
@@ -1437,28 +2683,523 @@ impl Qwen4MtpGpu {
             execute_validated_steps(gpu, &ctx, &steps)?;
             lengths
         };
+        Ok(lengths)
+    }
 
-        let next_token = if step == MtpStep::Predict {
-            let head = weights.resident(&weights.root.lm_head)?;
-            Some(self.draft.draft(gpu, head, &self.scratch.hc_mixed)?)
-        } else {
-            None
+    /// Whether [`Self::append_rows`] can run for this model on this GPU:
+    /// exact gfx1151 or gfx1201 (the tiled Q8_0 projection repeats the dot
+    /// of the per-row Q8_0 GEMV there: the K = 2560 staged GEMV on gfx1151,
+    /// `gemv_q8_0` on gfx1201; other arches have no proven batched twin)
+    /// and the shipped weight formats and shapes.
+    pub(crate) fn append_rows_supported(
+        gpu: &Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+    ) -> bool {
+        (gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201())
+            && AppendWidths::new(config)
+                .is_some_and(|w| AppendWeights::resolve(weights, config, &w).is_ok())
+    }
+
+    /// [`MtpStep::Append`] for `tokens.len()` consecutive prompt rows starting
+    /// at `position`, row `i` paired with `hidden` row `i` (the per-row loop's
+    /// (token p, hidden p) pairing). Runs the per-row `forward_token` Append
+    /// op sequence once over all rows, calling the rdna-compute entry points
+    /// directly (never the `Step` dispatcher or `project_weight`, whose
+    /// multi-row routes change the arithmetic): each op is the single-row
+    /// kernel with a rows grid, or a multi-row kernel whose per-row
+    /// reduction order is the single-row kernel's.
+    ///
+    /// `hidden` holds at least `tokens.len()` rows of `hc_count * hidden`
+    /// F32. Draft request state sees every token in order, as `forward_token`
+    /// observes each; the QSA state commits `position + tokens.len()` rows.
+    /// `wide_hidden`, the selection and its length are not touched (the
+    /// per-row Append leaves them alone too).
+    ///
+    /// `context` names the caller. [`MtpFillContext::PromptFill`] takes the
+    /// DET route (all seven projections through the fixed-row native kernels)
+    /// on exact gfx1151 (`HIPFIRE_QWEN4_MTP_APPEND_DET`, default on), which also takes
+    /// a lone row; [`MtpFillContext::DecodeFill`] always runs the incumbent
+    /// kernels (at least two rows).
+    ///
+    /// `device_ids`, when given, holds `tokens` as `tokens.len()` device i32
+    /// ids (at least that many bytes) that the embedding gather reads in place
+    /// of the scratch upload: the trunk forward's uploaded rows, or the
+    /// caller's once-per-chunk `MtpAppendScratch::upload_prompt_ids` rows.
+    /// The backing allocation must remain live and any later writes must be
+    /// ordered after the enqueued embedding gather; returning from this call
+    /// does not imply device completion. With `device_ids` this call never
+    /// blocks the host; without it the scratch upload is a blocking
+    /// `hipMemcpy` that waits for all previously queued device work.
+    pub(crate) fn append_rows(
+        &mut self,
+        gpu: &mut Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+        context: MtpFillContext,
+        scratch: &mut MtpAppendScratch,
+        tokens: &[u32],
+        hidden: &GpuTensor,
+        device_ids: Option<&GpuTensor>,
+        position: usize,
+    ) -> Result<(), MtpGpuError> {
+        let rows = tokens.len();
+        let w = AppendWidths::new(config).ok_or_else(|| invalid("MTP append width overflow"))?;
+        let det = append_rows_det(context, mtp_append_det_enabled(gpu));
+        let min_rows = append_rows_min(det);
+        if rows < min_rows || rows > scratch.rows {
+            return Err(invalid(format!(
+                "MTP batched append of {rows} rows needs {min_rows}..={} (scratch capacity{})",
+                scratch.rows,
+                if det {
+                    ""
+                } else {
+                    "; the incumbent multirow projections take two rows or more"
+                }
+            )));
+        }
+        let hidden_elements = rows
+            .checked_mul(w.wide)
+            .ok_or_else(|| invalid("MTP batched append hidden extent overflow"))?;
+        if hidden.dtype != DType::F32 || hidden.numel() < hidden_elements {
+            return Err(invalid(format!(
+                "MTP batched append hidden must be F32 with at least {hidden_elements} elements"
+            )));
+        }
+        if !(gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201()) {
+            return Err(invalid("MTP batched append needs exact gfx1151 or gfx1201"));
+        }
+        if position != self.state.position {
+            return Err(invalid(format!(
+                "MTP position mismatch: expected {}, got {position}",
+                self.state.position
+            )));
+        }
+        let end = position
+            .checked_add(rows)
+            .ok_or_else(|| invalid("MTP batched append position overflow"))?;
+        if end > self.max_seq {
+            return Err(invalid("MTP position exceeds QSA capacity"));
+        }
+        // Mapping is the caller's (`ensure_mapped_capacity`), never here.
+        if end > self.state.mapped_tokens {
+            return Err(invalid(format!(
+                "MTP rows through position {} are past the mapped QSA coverage of {} tokens",
+                end - 1,
+                self.state.mapped_tokens
+            )));
+        }
+        let ids_bytes = rows
+            .checked_mul(std::mem::size_of::<i32>())
+            .ok_or_else(|| invalid("MTP batched append token id extent overflow"))?;
+        if let Some(ids) = device_ids {
+            if ids.buf.size() < ids_bytes {
+                return Err(invalid(format!(
+                    "MTP batched append device token ids hold {} bytes, need {ids_bytes}",
+                    ids.buf.size()
+                )));
+            }
+        }
+        let compress = config.indexer_compress_ratio;
+        if compress == 0 {
+            return Err(invalid("MTP indexer compress ratio is zero"));
+        }
+        let mw = AppendWeights::resolve(weights, config, &w)?;
+        if det {
+            // Refused before the draft state observes anything: the DET dense
+            // kernel's M / K limits against the seven projection weights.
+            for (label, weight) in [
+                ("fc_embedding", &mw.fc_embedding),
+                ("fc_hidden", &mw.fc_hidden),
+                ("HC down", &mw.hc.input_mix_down),
+                ("HC up", &mw.hc.input_mix_up),
+                ("indexer_qk", &mw.qsa.indexer_qk),
+                ("k_proj", &mw.qsa.k),
+                ("v_proj", &mw.qsa.v),
+            ] {
+                if !det_dense_shape_ok(weight.m, weight.k, rows) {
+                    return Err(invalid(format!(
+                        "MTP DET append {label} [{}x{}] is outside the DET kernel's limits (M % 16 == 0, K % 64 == 0)",
+                        weight.m, weight.k
+                    )));
+                }
+            }
+        }
+        for &token in tokens {
+            self.draft.observe(token);
+        }
+        // Given device ids (the trunk's already uploaded rows or the prompt
+        // chunk's one upload, same bytes as `tokens`) skip the host fill and
+        // copy; otherwise the scratch uploads.
+        let token_ids = match device_ids {
+            Some(ids) => ids,
+            None => {
+                for (bytes, &token) in scratch.host_token_bytes.chunks_exact_mut(4).zip(tokens) {
+                    bytes.copy_from_slice(&(token as i32).to_ne_bytes());
+                }
+                gpu.memcpy_htod_auto(
+                    &scratch.token_ids.buf,
+                    &scratch.host_token_bytes[..rows * std::mem::size_of::<i32>()],
+                )?;
+                &scratch.token_ids
+            }
         };
-        if step != MtpStep::Append {
-            gpu.copy_d2d(
-                &self.scratch.wide,
-                &self.state.wide_hidden,
-                self.scratch.wide.byte_size(),
+
+        // Exactly-`rows` views: HC norm and read derive their row count from
+        // the tensor extent.
+        let view = |tensor: &GpuTensor, width: usize| tensor.sub_offset(0, rows * width);
+        let backbone = view(hidden, w.wide);
+        let token_embedding = view(&scratch.token_embedding, w.hidden);
+        let embedding_norm = view(&scratch.embedding_norm, w.hidden);
+        let projected_embedding = view(&scratch.projected_embedding, w.hidden);
+        let hidden_norm = view(&scratch.hidden_norm, w.wide);
+        let projected_hidden = view(&scratch.projected_hidden, w.wide);
+        let wide = view(&scratch.wide, w.wide);
+        let hc_normalized = view(&scratch.hc_normalized, w.wide);
+        let hc_low = view(&scratch.hc_low, config.hc_lowrank);
+        let hc_up = view(&scratch.hc_up, w.wide);
+        let hc_mixed = view(&scratch.hc_mixed, w.hidden);
+        let index = view(&scratch.index, w.index_width);
+        let qsa_k = view(&scratch.qsa_k, w.kv_width);
+        let qsa_v = view(&scratch.qsa_v, w.kv_width);
+
+        // Embed (`Step::Embed`): the Q8_0 table, one grid row per token.
+        gpu.embedding_lookup_q8_batched(mw.embedding, &token_embedding, token_ids, rows, w.hidden)?;
+        hyper_norm(
+            gpu,
+            &HyperNorm {
+                input: &token_embedding,
+                norm_weight: mw.norm_embedding,
+                normalized: &embedding_norm,
+                branches: 1,
+                hidden: w.hidden,
+                state_bf16: false,
+            },
+        )?;
+        // Incumbent (the default, and every `DecodeFill`): G1 (byte identity vs
+        // the per-row reference) governs every `gemm_bf16_xf32_multirow` and
+        // tiled projection below; the reference
+        // is the per-row kernel of each operator on the running arch:
+        //   - fc_embedding and HC up: singleton `gemv_bf16_xf32` (gfx1201
+        //     runs the shipped `gemv_bf16_xf32` kernel);
+        //   - fc_hidden (four branch rows per token): on gfx1201
+        //     `gemv_bf16_xf32_x4_rows_r4`, not four singleton GEMVs;
+        //   - HC down: the K4 singleton (`gemv_bf16_xf32_k4`, scale 1/4);
+        //   - QSA indexer_qk / K / V (Q8_0): on gfx1151 the K = 2560 staged
+        //     `gemv_q8_0`, on gfx1201 the unstaged `gemv_q8_0` (the staged
+        //     tiled kernel repeats the same dot arithmetic).
+        // On gfx1151 `gemm.rs` selects by (m, k, batch): (2560, 2560) is on
+        // the r16 allowlist for batch >= 64 (`r16w4t` / `r16w4` / `r16`,
+        // documented bitwise to the four-row kernel) and the base four-row
+        // kernel below that; (10240, 320) is not on the allowlist and
+        // K = 320 takes the `pto2` tile (257..=512, LDS weights, also
+        // documented bitwise to the four-row kernel). The same selector
+        // runs on gfx1201 (the `r16*_gfx1151` names are not gfx1151-only).
+        // If G1 shows any difference for a pair, replace that call
+        // with a rows-grid twin of the single-row kernel (`blockIdx.y`
+        // token tile over `gemv_bf16_xf32_rows_body`) before tuning
+        // anything. Never route these through `project_weight` /
+        // `gemm_bf16_xf32_f16_wmma_qwen4` (F16 WMMA from 512 rows).
+        //
+        // DET (`PromptFill` on exact gfx1151, `HIPFIRE_QWEN4_MTP_APPEND_DET`
+        // on unless `0`, `det` below): all seven projections run the fixed-row
+        // native kernels instead (F16 WMMA, F32 accumulate, one ascending-K
+        // chain per output, no split-K, no epilogue). That arithmetic is
+        // deterministic and row-invariant (a row's bytes do not depend on its
+        // batch or sub-chunk) but it is NOT G1: the operands are F16-narrowed
+        // (BF16 weights through a model-lifetime F16 shadow, X rounded to F16
+        // per call; a narrower exponent range than BF16/F32) and the
+        // gfx11 WMMA's internal dot order is its own, so the outputs are not
+        // byte-equal to the incumbent kernels or to the per-row reference.
+        append_dense_projection(
+            gpu,
+            det,
+            &mw.fc_embedding,
+            &embedding_norm,
+            &projected_embedding,
+            rows,
+        )?;
+        hyper_norm(
+            gpu,
+            &HyperNorm {
+                input: &backbone,
+                norm_weight: mw.norm_hidden,
+                normalized: &hidden_norm,
+                branches: config.hc_count,
+                hidden: w.hidden,
+                state_bf16: false,
+            },
+        )?;
+        // The four branch rows of a token are four projection rows
+        // (per-row: `gemv_bf16_xf32_x4_rows` over rows = hc_count).
+        append_dense_projection(
+            gpu,
+            det,
+            &mw.fc_hidden,
+            &hidden_norm,
+            &projected_hidden,
+            rows * config.hc_count,
+        )?;
+        gpu.broadcast_add_rows_f32(
+            &projected_hidden,
+            &projected_embedding,
+            &wide,
+            config.hc_count,
+            w.hidden,
+            rows,
+        )?;
+
+        // Attention-side HC read (`execute_hyper_read_inner`, rows = 1 route).
+        hyper_norm(
+            gpu,
+            &HyperNorm {
+                input: &wide,
+                norm_weight: mw.hc.norm,
+                normalized: &hc_normalized,
+                branches: config.hc_count,
+                hidden: w.hidden,
+                state_bf16: false,
+            },
+        )?;
+        if det {
+            // DET: the raw fixed-ascending-K F16 WMMA down projection, then the
+            // HC read activation (`hc_activation_fused_f32`, scale 1/branches,
+            // in place over the F32 `hc_low` rows) the incumbent fuses into the
+            // K4 GEMV epilogue; the same SiLU expression, not a second one.
+            gpu.gemm_bf16_xf32_mtp_dense_det_pm(
+                mw.hc.input_mix_down.buf,
+                &hc_normalized,
+                &hc_low,
+                mw.hc.input_mix_down.m,
+                mw.hc.input_mix_down.k,
+                rows,
+            )?;
+            hc_activation_fused_f32(
+                gpu,
+                &HcActivationFused {
+                    values: &hc_low,
+                    scale: 1.0 / config.hc_count as f32,
+                    bf16_out: None,
+                },
+            )?;
+        } else {
+            // The long-K down projection keeps the K4 quarter fold and applies
+            // the 1/branches activation in its epilogue, as the per-row route does.
+            gpu.gemv_bf16_xf32_k4_rows_tiled(
+                mw.hc.input_mix_down.buf,
+                &hc_normalized,
+                &hc_low,
+                mw.hc.input_mix_down.m,
+                mw.hc.input_mix_down.k,
+                Some(1.0 / config.hc_count as f32),
+                rows,
             )?;
         }
+        append_dense_projection(gpu, det, &mw.hc.input_mix_up, &hc_low, &hc_up, rows)?;
+        hyper_read_projected(
+            gpu,
+            &HyperReadProjected {
+                input: &wide,
+                norm_weight: mw.hc.norm,
+                up: &hc_up,
+                normalized: &hc_normalized,
+                mixed: &hc_mixed,
+                branches: config.hc_count,
+                hidden: w.hidden,
+            },
+        )?;
+
+        // QSA append-only: index, K and V projections of the mixed row.
+        if det {
+            // DET: the fixed-row Q8_0 projection (`mtp_q8_det_pm_launch`), not
+            // the staged GEMV's arithmetic. The mixed row converts F32 -> F16
+            // RNE once (the shared X scratch, same stream) for all three
+            // projections; each launch reads it in place.
+            let mixed16 = gpu.qwen4_convert_f16_x(&hc_mixed, rows * w.hidden)?;
+            for (weight, output) in [
+                (&mw.qsa.indexer_qk, &index),
+                (&mw.qsa.k, &qsa_k),
+                (&mw.qsa.v, &qsa_v),
+            ] {
+                gpu.mtp_q8_det_pm_launch(weight.buf, &mixed16, output, weight.m, weight.k, rows)?;
+            }
+        } else {
+            gpu.gemv_q8_0_k2560_staged_rows_tiled(
+                mw.qsa.indexer_qk.buf,
+                &hc_mixed,
+                &index,
+                mw.qsa.indexer_qk.m,
+                rows,
+            )?;
+            gpu.gemv_q8_0_k2560_staged_rows_tiled(
+                mw.qsa.k.buf,
+                &hc_mixed,
+                &qsa_k,
+                mw.qsa.k.m,
+                rows,
+            )?;
+            gpu.gemv_q8_0_k2560_staged_rows_tiled(
+                mw.qsa.v.buf,
+                &hc_mixed,
+                &qsa_v,
+                mw.qsa.v.m,
+                rows,
+            )?;
+        }
+        {
+            let state = &self.state;
+            indexed_attention_append_prologue(
+                gpu,
+                &IndexedAttentionAppendPrologue {
+                    index_row: &index,
+                    keys: &qsa_k,
+                    values: &qsa_v,
+                    full_keys: &state.full_keys,
+                    full_values: &state.full_values,
+                    raw_index_keys: &state.raw_index_keys,
+                    index_q_norm: mw.qsa.indexer_q_norm,
+                    k_norm: mw.qsa.k_norm,
+                    index_heads: config.indexer_n_heads,
+                    index_dim: config.indexer_head_dim,
+                    index_kv_width: w.index_kv_width,
+                    kv_heads: config.num_key_value_heads,
+                    head_dim: config.head_dim,
+                    position,
+                    rows,
+                    // The one MTP layer keeps the exact F32 QSA state.
+                    format: QsaKvFormat::F32,
+                    yarn: config.rope().yarn(config.head_dim.min(64)),
+                },
+            )?;
+            // Pool exactly the blocks these rows complete, from raw keys the
+            // prologue just wrote (a block straddling `end` waits for the next
+            // call, whose first block is `position / compress`).
+            let complete = end / compress;
+            if complete > 0 {
+                indexed_attention_pool_rope_incremental(
+                    gpu,
+                    &IndexedAttentionPoolRope {
+                        raw_keys: &state.raw_index_keys,
+                        pooled: &state.pooled_keys,
+                        norm: Some(mw.qsa.indexer_k_norm),
+                        block_count: complete,
+                        compress,
+                        index_dim: w.index_kv_width,
+                        position: Some(QsaPositionBinding {
+                            position_start: position,
+                            rows,
+                        }),
+                        grid_bound: state.pooled_capacity,
+                        yarn: config.rope().yarn(w.index_kv_width.min(64)),
+                    },
+                )?;
+            }
+        }
+
         let state = &mut self.state;
-        state.position = next_position;
-        state.full_len = full_len;
-        state.raw_len = raw_len;
-        state.pooled_len = pooled_len;
-        state.selected_len = selected_len;
-        state.step_index = state.step_index.wrapping_add(1);
-        Ok(next_token)
+        state.position = end;
+        state.full_len = end;
+        state.raw_len = end;
+        state.pooled_len = end / compress;
+        state.selected_len = 0;
+        state.step_index = state.step_index.wrapping_add(rows);
+        Ok(())
+    }
+}
+
+/// One developer-profile MTP head row read back to the host
+/// ([`crate::bundle::Qwen4Bundle::mtp_dev_row`]).
+#[cfg(feature = "qwen4-dev-profiles")]
+pub struct MtpDevRow {
+    /// The draft token the head ranked.
+    pub draft_token: u32,
+    /// Head logits over the vocabulary (the model's own LM head, token order).
+    pub logits: Vec<f32>,
+    /// The mixed `[hidden]` row the LM head reads (after the final HC read).
+    pub sample_hidden: Vec<f32>,
+    /// The `[hc_count * hidden]` streams after the layer's MLP HC write.
+    pub multi_hidden: Vec<f32>,
+}
+
+#[cfg(feature = "qwen4-dev-profiles")]
+impl crate::bundle::Qwen4Bundle {
+    /// Developer-profile direct input of the native MTP head: one Predict
+    /// step of `token` at `position` (the head's next position) conditioned
+    /// on the caller's `[hc_count * hidden]` backbone streams `backbone`
+    /// instead of the head's own previous hidden, with a fresh QSA
+    /// selection. The step is the production `forward_token`; only the
+    /// hidden source and the read-back are different. Refused for the
+    /// pinned Flash-Next profile.
+    pub fn mtp_dev_row(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        backbone: &[f32],
+        position: usize,
+    ) -> Result<MtpDevRow, crate::bundle::BundleError> {
+        use crate::bundle::BundleError;
+        let forward = |message: String| BundleError::Forward(message);
+        if self.config.profile.is_flash_next() {
+            return Err(forward(
+                "the direct MTP row feed is for developer profiles only".into(),
+            ));
+        }
+        let wide = self
+            .config
+            .hc_count
+            .checked_mul(self.config.hidden_size)
+            .ok_or_else(|| forward("MTP wide dimension overflow".into()))?;
+        if backbone.len() != wide {
+            return Err(forward(format!(
+                "MTP backbone row has {} values, expected {wide}",
+                backbone.len()
+            )));
+        }
+        let mtp = self
+            .mtp
+            .as_mut()
+            .ok_or_else(|| forward("Qwen4 MTP resources are not attached".into()))?;
+        let required = position
+            .checked_add(1)
+            .ok_or_else(|| forward("Qwen4 MTP position overflows".into()))?;
+        mtp.ensure_mapped_capacity(gpu, required)
+            .map_err(|error| forward(error.to_string()))?;
+        let input = gpu
+            .upload_f32(backbone, &[wide])
+            .map_err(BundleError::Hip)?;
+        let step = mtp.forward_token(
+            gpu,
+            &self.weights,
+            &self.config,
+            token,
+            Some(&input),
+            position,
+            true,
+            MtpStep::Predict,
+            // Developer profiles never run under EP.
+            None,
+        );
+        let freed = gpu.free_tensor(input);
+        let draft_token = step
+            .map_err(|error| forward(error.to_string()))?
+            .ok_or_else(|| forward("MTP prediction requested but no token produced".into()))?;
+        freed.map_err(BundleError::Hip)?;
+        gpu.hip.device_synchronize().map_err(BundleError::Hip)?;
+        let mut row = MtpDevRow {
+            draft_token,
+            logits: Vec::new(),
+            sample_hidden: Vec::new(),
+            multi_hidden: Vec::new(),
+        };
+        for (tensor, out) in [
+            (mtp.draft.logits(), &mut row.logits),
+            (&mtp.scratch.hc_mixed, &mut row.sample_hidden),
+            (&mtp.state.wide_hidden, &mut row.multi_hidden),
+        ] {
+            gpu.download_f32_into(tensor, out)
+                .map_err(BundleError::Hip)?;
+        }
+        Ok(row)
     }
 }
 
@@ -1466,7 +3207,79 @@ impl Qwen4MtpGpu {
 mod tests {
     use super::*;
     use crate::config::compact_test_config;
-    use crate::state::{Qwen4State, StateError};
+    use crate::state::Qwen4State;
+
+    #[test]
+    fn append_det_is_exact_gfx1151_only_and_zero_kills_it() {
+        // `0` (not requested): never on, on any arch.
+        assert!(!append_det_active(false, true));
+        assert!(!append_det_active(false, false));
+        // Requested: only exact gfx1151 (`is_gfx1151` is `arch == "gfx1151"`,
+        // so gfx1150 / gfx1152 / gfx1201 all arrive as `false`).
+        assert!(append_det_active(true, true));
+        assert!(!append_det_active(true, false));
+        assert_eq!(MTP_APPEND_DET_ENV, "HIPFIRE_QWEN4_MTP_APPEND_DET");
+    }
+
+    #[test]
+    fn append_det_default_resolves_on_for_gfx1151_only() {
+        // Unset resolves to the default: on for exact gfx1151, off on every
+        // other arch through the same `ArchCaps::is_gfx1151` predicate
+        // `mtp_append_det_enabled` reads.
+        use rdna_compute::arch_caps::ArchCaps;
+        use rdna_compute::feature_flags::FeatureFlags;
+        for arch in [
+            "gfx1151", "gfx1150", "gfx1152", "gfx1100", "gfx1201", "gfx942",
+        ] {
+            let caps = ArchCaps::new(arch, std::sync::Arc::new(FeatureFlags::for_test(arch)));
+            assert_eq!(
+                append_det_active(MTP_APPEND_DET_DEFAULT, caps.is_gfx1151()),
+                arch == "gfx1151",
+                "{arch}",
+            );
+        }
+    }
+
+    #[test]
+    fn only_prompt_fill_takes_the_det_route() {
+        for enabled in [false, true] {
+            // The decode takeover never takes DET, whatever the machine gate.
+            assert!(!append_rows_det(MtpFillContext::DecodeFill, enabled));
+        }
+        assert!(append_rows_det(MtpFillContext::PromptFill, true));
+        // Without the gate prompt fill keeps the incumbent route.
+        assert!(!append_rows_det(MtpFillContext::PromptFill, false));
+    }
+
+    #[test]
+    fn lone_prompt_row_takes_rows_only_under_det() {
+        // Default: a lone row stays the per-row `append_token`.
+        assert!(!prompt_fill_uses_rows(false, 1));
+        assert!(!prompt_fill_uses_rows(false, 0));
+        assert!(prompt_fill_uses_rows(false, 2));
+        assert!(prompt_fill_uses_rows(false, 1024));
+        // DET: one row is the same kernels; an empty pass is still no pass.
+        assert!(prompt_fill_uses_rows(true, 1));
+        assert!(prompt_fill_uses_rows(true, 2));
+        assert!(!prompt_fill_uses_rows(true, 0));
+        assert_eq!(append_rows_min(false), 2);
+        assert_eq!(append_rows_min(true), 1);
+    }
+
+    #[test]
+    fn det_dense_shape_limits_cover_the_append_projections() {
+        // fc_embedding / fc_hidden, HC down (320 x 10240), HC up (10240 x 320)
+        // and the Q8_0 projections' K = 2560, at one row and at a full pass.
+        for (m, k) in [(2560, 2560), (320, 10240), (10240, 320)] {
+            for n in [1, 2, 4096] {
+                assert!(det_dense_shape_ok(m, k, n), "{m}x{k} n={n}");
+            }
+        }
+        assert!(!det_dense_shape_ok(2560, 2560, 0));
+        assert!(!det_dense_shape_ok(2568, 2560, 1));
+        assert!(!det_dense_shape_ok(2560, 2592, 1));
+        assert!(!det_dense_shape_ok(0, 2560, 1));
+    }
 
     fn try_gpu() -> Option<Gpu> {
         Gpu::init().ok().or_else(|| {
@@ -1653,6 +3466,402 @@ mod tests {
         if let Some(error) = mtp.free_gpu(&mut gpu) {
             panic!("free MTP state: {error:?}");
         }
+    }
+
+    /// Non-owning F32/BF16 descriptor of `elements` for host-side bound
+    /// checks; never dereferenced.
+    fn descriptor(elements: usize, dtype: DType) -> GpuTensor {
+        GpuTensor {
+            buf: unsafe {
+                hip_bridge::DeviceBuffer::from_raw(
+                    std::ptr::null_mut::<std::ffi::c_void>(),
+                    elements * dtype.size(),
+                )
+            },
+            shape: vec![elements],
+            dtype,
+        }
+    }
+
+    /// One-token scratch census at canonical geometry (H 2560, W 10240,
+    /// rank 320): `hc_up` is one W-wide F32 row, the 36-tensor total is
+    /// 659,824 bytes, and the shrink saves (W×320 − W)×4 = 13,066,240 bytes
+    /// (12.4609375 MiB) from the former 13,726,064-byte (13.0902 MiB) set.
+    #[test]
+    fn mtp_scratch_hc_up_is_one_row_census() {
+        let config = compact_test_config();
+        let shapes = MtpGpuScratch::shapes(&config).expect("canonical scratch shapes");
+        let wide = config.hc_count * config.hidden_size;
+        assert_eq!(shapes[11], (wide, DType::F32), "hc_up is rows x W F32");
+        let bytes = MtpGpuScratch::device_bytes(&config).expect("scratch bytes");
+        assert_eq!(bytes, 659_824);
+        let former = 13_726_064usize;
+        assert_eq!(former - bytes, 13_066_240);
+        assert_eq!((former - bytes) as f64 / (1u64 << 20) as f64, 12.4609375);
+    }
+
+    fn flash_next_mtp_plan_bytes(config: &Qwen4Config) -> usize {
+        // The pre-profile-derived plan, written out from the MoE scalars: 36
+        // tensors, F32 unless noted.
+        let h = config.hidden_size;
+        let w = config.hc_count * h;
+        let q = config.num_attention_heads * config.head_dim;
+        let kv = config.num_key_value_heads * config.head_dim;
+        let index = (config.indexer_n_heads + config.indexer_kv_heads) * config.indexer_head_dim;
+        let hc_up = hc_up_elements(1, w, config.hc_lowrank).unwrap();
+        let rotation = w.max(h).max(config.hc_lowrank).max(q);
+        let routed = config.num_experts_per_tok * config.moe_intermediate_size;
+        let bf16 = h.max(config.hc_lowrank).max(q).max(kv);
+        let raw = 4 + config.qsa_selected_capacity() * 4;
+        let f32_elements = h
+            + h
+            + h
+            + w
+            + h
+            + w
+            + w
+            + w
+            + w
+            + config.hc_lowrank
+            + hc_up
+            + h
+            + config.hc_count
+            + rotation
+            + index
+            + 2 * q
+            + kv
+            + kv
+            + q
+            + config.num_experts
+            + h
+            + 2 * config.moe_intermediate_size
+            + 3 * config.moe_intermediate_size
+            + h
+            + 3 * routed
+            + 2 * config.num_experts_per_tok
+            + config.num_experts_per_tok * h
+            + h.div_ceil(4)
+            + config.shared_expert_intermediate_size;
+        f32_elements * 4 + raw + bf16 * 2
+    }
+
+    #[test]
+    fn flash_next_mtp_scratch_bytes_are_unchanged() {
+        let config = compact_test_config();
+        assert_eq!(
+            MtpGpuScratch::device_bytes(&config).unwrap(),
+            flash_next_mtp_plan_bytes(&config)
+        );
+    }
+
+    fn tiny_dense() -> Qwen4Config {
+        crate::config::synthetic_test_config(
+            crate::config::Qwen4FfnConfig::Dense {
+                intermediate_size: 8,
+            },
+            16,
+            4,
+            true,
+            true,
+        )
+    }
+
+    #[test]
+    fn dense_mtp_scratch_is_profile_derived_and_never_empty() {
+        let config = tiny_dense();
+        let shapes = MtpGpuScratch::shapes(&config).unwrap();
+        assert!(shapes.iter().all(|&(elements, _)| elements >= 1));
+        // Two HC branches, not the Flash-Next four.
+        let wide = config.hc_count * config.hidden_size;
+        assert_eq!(wide, 32);
+        assert_eq!(shapes[7], (wide, DType::F32), "wide streams");
+        assert_eq!(shapes[8], (wide, DType::F32), "backbone hidden");
+        // Dense gate/up rows reuse the batch scratch at the intermediate width.
+        assert_eq!(shapes[29], (8, DType::F32));
+        assert_eq!(shapes[30], (8, DType::F32));
+        // MoE-only buffers are the one-element floor.
+        for index in [22, 24, 25, 26, 27, 31, 32, 33, 35] {
+            assert_eq!(shapes[index].0, 1, "tensor {index}");
+        }
+        // The FWHT basis scratch covers the dense intermediate width.
+        assert!(shapes[15].0 >= 8);
+        assert!(MtpGpuScratch::device_bytes(&config).is_ok());
+    }
+
+    #[test]
+    fn mtp_refuses_a_rope_base_the_qsa_kernels_do_not_implement() {
+        let mut config = tiny_dense();
+        let message = admit_mtp_config(&config).unwrap_err().to_string();
+        assert!(
+            message.contains("10000 ")
+                && message.contains(&QWEN4_QSA_KERNEL_ROPE_THETA.to_string()),
+            "{message}"
+        );
+        config.mtp.as_mut().unwrap().rope_theta = QWEN4_QSA_KERNEL_ROPE_THETA;
+        admit_mtp_config(&config).expect("kernel base admitted");
+        config.mtp = None;
+        assert!(admit_mtp_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("no native MTP head"));
+        admit_mtp_config(&compact_test_config()).expect("Flash-Next head admitted");
+    }
+
+    #[test]
+    fn developer_profiles_rank_their_own_head() {
+        let (policy, _) = draft_head_config(&tiny_dense());
+        assert_eq!((policy.copy, policy.rescore), (None, false));
+    }
+
+    /// Every subview the shared HC read takes from `up` must fit the
+    /// scratch: a second row (either the F32 projection or the BF16 packing
+    /// view), a rank wider than the row, or a non-F32 buffer is refused.
+    #[test]
+    fn hc_up_subview_larger_than_scratch_is_rejected() {
+        let config = compact_test_config();
+        let wide = config.hc_count * config.hidden_size;
+        let rank = config.hc_lowrank;
+        let up = descriptor(
+            hc_up_elements(MTP_HC_ROWS, wide, rank).expect("one-row extent"),
+            DType::F32,
+        );
+        require_hc_up(&up, MTP_HC_ROWS, wide, rank).expect("one-row read fits");
+        assert!(invalid_contains(
+            require_hc_up(&up, 2, wide, rank),
+            "2 HC rows use"
+        ));
+        // BF16 packing view (`rows × rank` of the F32 tensor) wider than a row.
+        assert!(invalid_contains(
+            require_hc_up(&up, 1, wide, wide + 1),
+            "1 HC rows use"
+        ));
+        let short = descriptor(wide - 1, DType::F32);
+        assert!(invalid_contains(
+            require_hc_up(&short, 1, wide, rank),
+            "HC rows use"
+        ));
+        let bf16 = descriptor(2 * wide, DType::BF16);
+        assert!(invalid_contains(
+            require_hc_up(&bf16, 1, wide, rank),
+            "HC rows use"
+        ));
+        // The prior W×rank allocation is far above every one-row subview.
+        assert!(hc_up_elements(MTP_HC_ROWS, wide, rank).unwrap() < wide * rank);
+    }
+
+    /// Readback census of the allocated one-token scratch on the device.
+    #[test]
+    fn mtp_scratch_allocation_matches_census() {
+        let Some(mut gpu) = try_gpu() else {
+            return;
+        };
+        let config = compact_test_config();
+        let scratch = MtpGpuScratch::new(&mut gpu, &config).expect("canonical MTP scratch");
+        let wide = config.hc_count * config.hidden_size;
+        assert_eq!(scratch.hc_up.numel(), wide);
+        assert_eq!(scratch.hc_up.buf.size(), wide * 4);
+        let shapes = MtpGpuScratch::shapes(&config).expect("shapes");
+        let tensors = [
+            &scratch.token_ids,
+            &scratch.embedding_rot,
+            &scratch.token_embedding,
+            &scratch.embedding_norm,
+            &scratch.hidden_norm,
+            &scratch.projected_embedding,
+            &scratch.projected_hidden,
+            &scratch.wide,
+            &scratch.backbone_hidden,
+            &scratch.hc_normalized,
+            &scratch.hc_low,
+            &scratch.hc_up,
+            &scratch.hc_mixed,
+            &scratch.hc_gates,
+            &scratch.hc_bf16,
+            &scratch.rotation,
+            &scratch.index,
+            &scratch.q_and_gate,
+            &scratch.qsa_k,
+            &scratch.qsa_v,
+            &scratch.qsa_output,
+            &scratch.qsa_selected,
+            &scratch.router_logits,
+            &scratch.moe_x_rot,
+            &scratch.moe_gate_up,
+            &scratch.moe_gate,
+            &scratch.moe_up,
+            &scratch.moe_hidden,
+            &scratch.ffn_output,
+            &scratch.moe_gate_batch,
+            &scratch.moe_up_batch,
+            &scratch.moe_rot_batch,
+            &scratch.moe_topk_indices,
+            &scratch.moe_topk_weights,
+            &scratch.moe_down_expanded,
+            &scratch.moe_scalar,
+        ];
+        let mut allocated = 0usize;
+        for (tensor, (elements, dtype)) in tensors.iter().zip(shapes) {
+            assert_eq!((tensor.numel(), tensor.dtype), (elements, dtype));
+            assert!(tensor.buf.size() >= tensor.byte_size());
+            allocated += tensor.byte_size();
+        }
+        assert_eq!(allocated, MtpGpuScratch::device_bytes(&config).unwrap());
+        assert_eq!(allocated, 659_824);
+        if let Some(error) = scratch.free_gpu(&mut gpu) {
+            panic!("free MTP scratch: {error:?}");
+        }
+    }
+
+    fn read_bytes(gpu: &mut Gpu, tensor: &GpuTensor, offset: usize, len: usize) -> Vec<u8> {
+        let view = tensor.sub_offset(offset / tensor.dtype.size(), len / tensor.dtype.size());
+        let mut bytes = vec![0u8; len];
+        gpu.hip
+            .memcpy_dtoh(&mut bytes, &view.buf)
+            .expect("download");
+        bytes
+    }
+
+    /// Legacy: full allocation, ensure is only the admitted-capacity bound.
+    #[test]
+    fn legacy_mtp_state_ensure_is_a_bounds_check() {
+        let Some(mut gpu) = try_gpu() else {
+            return;
+        };
+        let config = compact_test_config();
+        let max_seq = 4096;
+        let mut state =
+            MtpGpuState::new_with_backend(&mut gpu, &config, max_seq, Qwen4KvBackend::Legacy)
+                .expect("legacy MTP state");
+        let full = config
+            .qsa_context_arena_bytes(max_seq, QsaKvFormat::F32)
+            .unwrap();
+        assert_eq!(state.mapped_tokens(), max_seq);
+        assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), full);
+        state
+            .ensure_mapped_capacity(&mut gpu, max_seq)
+            .expect("within capacity");
+        assert!(invalid_contains(
+            state.ensure_mapped_capacity(&mut gpu, max_seq + 1),
+            "admitted capacity"
+        ));
+        assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), full);
+        if let Some(error) = state.free_gpu(&mut gpu) {
+            panic!("free MTP state: {error:?}");
+        }
+    }
+
+    /// VMM: nothing mapped at construction; each arena grows by its own
+    /// stride (pooled by ceil(tokens / compress)) through the shared chunk
+    /// plan, earlier rows survive growth, fresh pages read zero, and a
+    /// request past the admitted capacity maps nothing.
+    #[test]
+    fn vmm_mtp_state_maps_on_demand() {
+        let Some(mut gpu) = try_gpu() else {
+            return;
+        };
+        if !crate::kv_backend::qwen4_vmm_supported(&gpu) {
+            eprintln!("skip: Qwen4 VMM unsupported on {}", gpu.arch);
+            return;
+        }
+        let config = compact_test_config();
+        let max_seq = 16384;
+        let mut state =
+            MtpGpuState::new_with_backend(&mut gpu, &config, max_seq, Qwen4KvBackend::Vmm)
+                .expect("VMM MTP state");
+        assert_eq!(state.backend(), Qwen4KvBackend::Vmm);
+        assert_eq!(state.mapped_tokens(), 0);
+        assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), 0);
+        // Reset of an unmapped state touches no context page.
+        state.reset(&mut gpu).expect("reset unmapped state");
+
+        state
+            .ensure_mapped_capacity(&mut gpu, 1)
+            .expect("first token");
+        let arenas = |state: &MtpGpuState| {
+            [
+                (&state.full_keys, state.full_capacity, 1usize),
+                (&state.full_values, state.full_capacity, 1),
+                (&state.raw_index_keys, state.raw_capacity, 1),
+                (&state.pooled_keys, state.pooled_capacity, state.compress),
+            ]
+            .map(|(tensor, capacity, per_row)| {
+                let plan = KvChunkPlan::new(
+                    tensor.byte_size() / capacity,
+                    capacity,
+                    DEFAULT_KV_CHUNK_TOKENS,
+                    gpu.vmm_granularity(tensor).expect("VMM granularity"),
+                    DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+                )
+                .expect("chunk plan");
+                (plan, per_row, gpu.vmm_mapped_bytes(tensor).expect("mapped"))
+            })
+        };
+        let first = arenas(&state);
+        let mut sum = 0;
+        let mut coverage = usize::MAX;
+        for (plan, per_row, mapped) in first {
+            let rows = 1usize.div_ceil(per_row);
+            assert_eq!(mapped, plan.mapped_bytes_for_tokens(rows).unwrap());
+            sum += mapped;
+            coverage = coverage.min(plan.token_capacity(mapped) * per_row);
+        }
+        assert_eq!(state.mapped_tokens(), coverage.min(max_seq));
+        assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), sum);
+        let full = config
+            .qsa_context_arena_bytes(max_seq, QsaKvFormat::F32)
+            .unwrap();
+        assert!(
+            sum < full,
+            "first map {sum} must stay below the full {full}"
+        );
+
+        // A growth boundary: pattern the full-key rows below it, grow past it.
+        let boundary = state.mapped_tokens();
+        assert!(boundary < max_seq);
+        let row = state.full_keys.byte_size() / state.full_capacity;
+        let pattern: Vec<u8> = (0..boundary * row).map(|i| (i % 251) as u8 + 1).collect();
+        gpu.hip
+            .memcpy_htod(&state.full_keys.buf, &pattern)
+            .expect("pattern mapped rows");
+        let unchanged = state.mapped_context_bytes(&gpu).unwrap();
+        assert!(invalid_contains(
+            state.ensure_mapped_capacity(&mut gpu, max_seq + 1),
+            "admitted capacity"
+        ));
+        assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), unchanged);
+        state
+            .ensure_mapped_capacity(&mut gpu, boundary)
+            .expect("no growth");
+        assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), unchanged);
+        state
+            .ensure_mapped_capacity(&mut gpu, boundary + 1)
+            .expect("grow");
+        assert!(state.mapped_tokens() > boundary);
+        assert!(state.mapped_context_bytes(&gpu).unwrap() > unchanged);
+        assert_eq!(
+            read_bytes(&mut gpu, &state.full_keys, 0, pattern.len()),
+            pattern
+        );
+        let fresh = read_bytes(&mut gpu, &state.full_keys, boundary * row, row);
+        assert!(fresh.iter().all(|&byte| byte == 0), "fresh page is zeroed");
+
+        // Reset zeroes the mapped prefix and keeps the mapping.
+        let mapped = state.mapped_context_bytes(&gpu).unwrap();
+        state.reset(&mut gpu).expect("reset mapped state");
+        assert_eq!(state.mapped_context_bytes(&gpu).unwrap(), mapped);
+        let cleared = read_bytes(&mut gpu, &state.full_keys, 0, pattern.len());
+        assert!(cleared.iter().all(|&byte| byte == 0));
+
+        state
+            .ensure_mapped_capacity(&mut gpu, max_seq)
+            .expect("full map");
+        assert_eq!(state.mapped_tokens(), max_seq);
+        let mapped_full = state.mapped_context_bytes(&gpu).unwrap();
+        assert!(mapped_full >= full);
+        if let Some(error) = state.free_gpu(&mut gpu) {
+            panic!("free MTP state: {error:?}");
+        }
+        assert_eq!(gpu.vmm_allocation_count(), 0, "VMM owners released");
     }
 }
 

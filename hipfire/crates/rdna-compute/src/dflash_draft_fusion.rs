@@ -19,8 +19,8 @@ pub(crate) const COLLAPSE_SRC: &str = include_str!("../../../kernels/src/dflash_
 ///
 /// Mirrors the default variant selection in
 /// [`Gpu::gemm_hfq4g256_residual_wmma`]: `m >= 8192` runs the k2 schedule,
-/// smaller M runs deterministic ksplit. Any non-default policy (mw16,
-/// ldsstage, explicit `HIPFIRE_WO_WMMA_VARIANT`) resolves to [`Off`](DraftCollapseGemm::Off)
+/// smaller M runs deterministic ksplit. Any non-default policy (ldsstage,
+/// explicit `HIPFIRE_WO_WMMA_VARIANT`) resolves to [`Off`](DraftCollapseGemm::Off)
 /// so the caller keeps today's path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DraftCollapseGemm {
@@ -87,7 +87,7 @@ impl Gpu {
         if k % 256 != 0 {
             return DraftCollapseGemm::Off;
         }
-        if self.flags.mw16 || self.flags.hfq4g256_ldsstage_wmma {
+        if self.flags.hfq4g256_ldsstage_wmma {
             return DraftCollapseGemm::Off;
         }
         if self.flags.wo_wmma_variant.is_some() {
@@ -137,6 +137,156 @@ impl Gpu {
             }
             _ => DraftCollapseV2::Off,
         }
+    }
+
+    /// Open (`on == true`) or close (`false`) the 64-row draft scope
+    /// ([`Gpu::draft_rows64_scope`]) and return the previous state for
+    /// [`Self::draft_rows64_exit`]. Only the batched DFlash draft forward
+    /// enters it with `true`; lets
+    /// [`Self::gemm_mq4g256v2_overwrite_gfx12_dflash`] admit exactly 64 rows.
+    pub fn draft_rows64_enter(&mut self, on: bool) -> bool {
+        // bind_thread: skip — updates a CPU-side scope flag, no device call.
+        let prev = self.draft_rows64_scope;
+        self.draft_rows64_scope = on;
+        prev
+    }
+
+    /// Restore the scope state returned by [`Self::draft_rows64_enter`].
+    pub fn draft_rows64_exit(&mut self, prev: bool) {
+        // bind_thread: skip — updates a CPU-side scope flag, no device call.
+        self.draft_rows64_scope = prev;
+    }
+
+    /// Device-free admission predicate of
+    /// [`Self::gemm_mq4g256v2_overwrite_gfx12_dflash`]: `true` iff that call
+    /// with these `k` / `batch_size` would launch (never returns `Ok(false)`),
+    /// given the current flags, verify scopes, draft 64-row scope and
+    /// capture/replay/G0 state. The lane-batched draft context fill decides
+    /// its routing with this BEFORE it writes any state.
+    pub fn draft_overwrite_gfx12_admitted(&self, k: usize, batch_size: usize) -> bool {
+        !(self.arch != "gfx1201"
+            || self.flags.draft_collapse_off
+            || self.fp8_verify_scope
+            || self.iu4_verify_scope
+            || (!(2..=63).contains(&batch_size)
+                && !(batch_size == 64 && self.draft_rows64_scope))
+            || k % 256 != 0
+            || !self.arch_caps.has_wmma_w32_gfx12()
+            || self.flags.fp16_disabled
+            || self.flags.lm_head_wmma_disabled
+            || self.a8_prefill_active(batch_size, k)
+            || (self.flags.hfq4g256_ldsstage_wmma
+                && k % 512 == 0
+                && batch_size <= crate::gemm::LDSSTAGE_MAX_BATCH)
+            || self.replay.is_recording()
+            || self.graphs.capture_mode
+            || self.replay.is_g0_observing()
+            || (batch_size == 64 && !self.flags.wmma_batch_tiles))
+    }
+
+    /// gfx1201 DFlash-draft MQ4G256V2 overwrite GEMM: the pre-zero-free twin of
+    /// `gemm_mq4g256v2_batched_lmhead` for the shapes whose legacy route ends
+    /// in the one-tile (`gemm_mq4g256v2_residual_wmma_gfx12`) or 128-K verify-tile
+    /// (`..._residual_wmma_gfx12_vt*`) residual kernel. `x` is the ROTATED F32
+    /// activation ([batch, k]); `y` is F32 ([batch, m]).
+    ///
+    /// Returns `Ok(false)` WITHOUT touching the device when the legacy call
+    /// would not have ended in one of those two kernels (caller then runs
+    /// `gemm_mq4g256v2_batched_lmhead` unchanged). Admission: exact gfx1201,
+    /// `HIPFIRE_DRAFT_COLLAPSE_OFF` unset, no fp8/iu4 verify scope, no replay
+    /// recording / graph capture / G0 observation, `2 <= batch <= 63` (or
+    /// exactly 64 inside [`Self::draft_rows64_enter`]'s scope, which also
+    /// needs `HIPFIRE_WMMA_BATCH_TILES`), `k % 256 == 0`, the `wmma_eligible`
+    /// gate of the legacy lm_head, no A8 prefill, and not the `_ldsstage` arm.
+    ///
+    /// N = 64 is per-row identical to the one-tile kernel (the `_vt4` core's
+    /// arithmetic), NOT to the legacy `>= 64` arms (A8 / IU4 / bt-tile / fp8),
+    /// which is why it is admitted only inside the scope.
+    ///
+    /// Byte-exactness: legacy memsets `y` to +0.0f then does one `Y += acc` per
+    /// output; the overwrite kernels store `acc + 0.0f` once per output, which
+    /// is bit-identical (including `acc == -0.0f`).
+    pub fn gemm_mq4g256v2_overwrite_gfx12_dflash(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<bool> {
+        if !self.draft_overwrite_gfx12_admitted(k, batch_size) {
+            return Ok(false);
+        }
+        if batch_size == 64 {
+            // Scope-gated 64-row chunk: the batch-tile `_vt4` overwrite kernel
+            // (`bt = 4`, one grid-y block). The vt core keeps the one-tile
+            // kernel's per-output arithmetic, so every row matches the same row
+            // of a 48/16-row chunk. Needs the batch-tiles family.
+            // (`wmma_batch_tiles` is part of `draft_overwrite_gfx12_admitted`.)
+            self.bind_thread()?;
+            self.iu4_verify_note_f16();
+            self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+            self.gemm_mq4g256v2_overwrite_wmma_gfx12_vt(a_raw, x, y, m, k, batch_size)?;
+            return Ok(true);
+        }
+        self.bind_thread()?;
+        self.iu4_verify_note_f16();
+        self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+        if self.gfx12_verify_bt_active(batch_size, k) {
+            self.gemm_mq4g256v2_overwrite_wmma_gfx12_vt(a_raw, x, y, m, k, batch_size)?;
+            return Ok(true);
+        }
+        // batch < 64: `gfx12_bt_tile(batch_size) == 1`, i.e. the legacy one-tile kernel.
+        const MODULE: &str = "gemm_mq4g256v2_overwrite_wmma_gfx12";
+        const SYM: &str = "gemm_mq4g256v2_overwrite_wmma_gfx12";
+        self.ensure_kernel(
+            MODULE,
+            crate::kernels::GEMM_MQ4G256V2_OVERWRITE_WMMA_GFX12_SRC,
+            SYM,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", SYM, bytes);
+        let result = self.launch_maybe_blob(
+            SYM,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        Ok(true)
     }
 
     /// Overwrite split-K LDS MQ4G256V2 GEMM: `y = W @ x_f16` (no residual,

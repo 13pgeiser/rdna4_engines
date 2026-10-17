@@ -22,8 +22,11 @@ Audience: first install on an AMD GPU host. Goal: install → verify → pull a 
   [README.md](../README.md)). **ROCm 6.4+** for RDNA4 (`gfx1200`/`gfx1201`);
   **ROCm 7.2+** for Strix Halo / gfx115x. hipfire's path resolver does not
   hardcode a required release — install a supported stack for your GPU.
-- **Windows:** [AMD HIP SDK](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html) (`hipcc` + `amdhip64.dll`).
-- **WSL2:** install AMD WSL GPU support first (`sudo amdgpu-install --usecase=wsl`), then use the Linux installer inside the distro.
+- **Windows (recommended): WSL2 with ROCm 7.2.1 and AMD's ROCDXG library.**
+  hipfire runs as the ordinary Linux build inside the distro; see
+  [Windows — WSL2](#windows--wsl2-recommended) for the driver, ROCm and
+  `librocdxg` steps and the supported GPU list.
+- **Windows (native, best-effort):** [AMD HIP SDK](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html) (`hipcc` + `amdhip64.dll`). Slower and narrower than WSL2; see [the limits](#windows--native-best-effort).
 - Disk space for models under `~/.hipfire/models/` (a few GB for small tags; tens of GB for 27B+).
 
 Live model tags, VRAM floors, and formats: [MODELS.md](MODELS.md). Full env list: [env-vars.md](env-vars.md).
@@ -69,7 +72,7 @@ Both `master` and `beta` are mutable. For a reproducible install, pin and
 inspect the installer itself, then ask it to install the same tag or commit:
 
 ```bash
-PIN=v0.2.1
+PIN=v0.4.1
 curl -fsSL "https://raw.githubusercontent.com/warpfront/hipfire/${PIN}/scripts/install.sh" \
   -o /tmp/hipfire-install.sh
 sha256sum /tmp/hipfire-install.sh
@@ -77,7 +80,7 @@ less /tmp/hipfire-install.sh
 bash /tmp/hipfire-install.sh --ref "$PIN"
 ```
 
-Use `--tag v0.2.1` when the kind is known, or `--commit <full-sha>` for an
+Use `--tag v0.4.1` when the kind is known, or `--commit <full-sha>` for an
 immutable commit. Fetching a pinned script but omitting the selector installs
 `master`, so keep the two pins together.
 
@@ -92,6 +95,18 @@ The bin directory can be added to `PATH`; reload the shell afterward.
 
 GPUs not in the admitted registry remain JIT-only and need hipcc at runtime;
 they cannot run with `HIPFIRE_NO_DEVICE_COMPILER=1`.
+
+Other `install.sh` options (`bash install.sh --help` lists them all; the ones
+marked "setup" are forwarded to `hipfire setup`):
+
+| Option | Effect |
+|---|---|
+| `--branch NAME`, `--ref REF`, `--tag TAG`, `--commit SHA` | Source revision; at most one. `HIPFIRE_INSTALL_REF` is a generic `--ref` for automation |
+| `--compile-kernels`, `--kernel-pack-url URL` | Skip or relocate the [prebuilt kernel pack](#prebuilt-kernel-packs) (setup) |
+| `--rocm-root PATH`, `--hipcc PATH`, `--strict-rocm` | Pin the ROCm root, the device compiler, or require the compiler under the selected root (setup) |
+| `--gpu-arch ARCH` | Override the detected GPU architecture (setup) |
+| `--profile auto\|hip\|redline` | Replay profile; `auto` leaves `replay.backend=auto` (setup) |
+| `--yes`, `-y`, `--non-interactive` | Do not prompt, for example for the source channel |
 
 ### Prebuilt kernel packs
 
@@ -133,12 +148,15 @@ restore kernels on a machine without hipcc.
 
 Maintainers: the tag-triggered `release-kernel-packs` workflow
 (`.github/workflows/release.yml`) builds every arch in a ROCm dev image and
-attaches the assets to the release. The default image,
-`rocm/dev-ubuntu-26.04:10.0.0-full`, carries the same ROCm 10.0.0 packages
-(HIP 7.15.26333) as the project's GPU hosts, so its packs admit ROCm
-[10.0, 11.0) and install on hosts with that hipcc. A pack only installs where
-the local hipcc, if any, is the build that compiled it; hosts on another ROCm
-compile locally. Repository variables choose another image
+attaches the assets to the release. The default image is
+`docker.io/rocm/dev-ubuntu-26.04` (image tag `10.1.0-full`, pinned by the digest
+`sha256:4f5ed1bf6532a4b9920400401b0ad0f706af356dae61e40afefbfd6c8073f0ce`; the
+full reference is `<image>:<tag>@<digest>`)
+(ROCm 10.1.0 packages `10.1.0-3`, HIP 7.16.26385, clang 24), so its packs admit
+ROCm [10.1, 11.0). A pack only installs where the local hipcc, if any, is the
+build that compiled it: a host whose hipcc differs (for example ROCm 10.0)
+compiles locally, while a host with no compiler accepts an admitted pack.
+Repository variables choose another image
 (`HIPFIRE_ROCM_IMAGE`) and, optionally, a wider admitted range
 (`HIPFIRE_PACK_ROCM_MIN` and `HIPFIRE_PACK_ROCM_MAX_EXCLUSIVE`, set both). To
 publish from a local toolchain instead:
@@ -154,7 +172,78 @@ no `HIPFIRE_*` feature overrides, verifies every index against that toolchain,
 and writes byte-reproducible tarballs. `--rocm-min X.Y --rocm-max-exclusive X.Y`
 declares a range other than the default; it must contain the build's ROCm.
 
-### Windows — select a branch, tag, or commit
+### Windows — WSL2 (recommended)
+
+WSL2 is the supported way to run hipfire on Windows. Inside the distro hipfire
+is the Linux build (Linux installer, `hipfire update`, file locks, signals);
+ROCm reaches the GPU through AMD's ROCDXG library and Microsoft's DXCore
+device `/dev/dxg`, while the Windows Adrenalin driver owns the card. AMD's
+current method (ROCm 7.2.1, ROCDXG; the older `amdgpu-install --usecase=wsl`
+/ roc4wsl packaging stops at ROCm 7.2) is documented in
+[WSL How-to — Use ROCm on Radeon](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/wsl/howto_wsl.html),
+[WSL How-to — Use ROCm on Ryzen](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installryz/wsl/howto_wsl.html)
+and the [librocdxg Quickstart](https://github.com/ROCm/librocdxg#quickstart):
+
+1. On Windows 11, install **AMD Software: Adrenalin Edition 26.2.2 for
+   WSL2** ([release notes](https://www.amd.com/en/resources/support-articles/release-notes/RN-RAD-WIN-26-2-2.html)).
+   It is the first driver with Ryzen Strix / Strix Halo support on WSL; the
+   Radeon [WSL support matrix](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/compatibility/compatibilityrad/wsl/wsl_compatibility.html)
+   lists 26.1.1 as the minimum for discrete cards.
+2. Install WSL2 with **Ubuntu 24.04 or 22.04**
+   ([Microsoft: install WSL](https://learn.microsoft.com/en-us/windows/wsl/install)).
+3. In the distro, install the **ROCm 7.2.1** packages with the
+   [ROCm Linux quick start](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/quick-start.html).
+   Install ROCm userspace only; there is no Linux kernel driver to install
+   under WSL.
+4. Install **librocdxg** (1.2.x for ROCm 7.2.x): the prebuilt
+   `rocdxg-roct_<version>_amd64.deb` from the
+   [librocdxg releases](https://github.com/ROCm/librocdxg/releases)
+   (`sudo dpkg -i rocdxg-roct_<version>_amd64.deb`), or build it from source
+   as the Quickstart describes. Its source now lives in
+   [rocm-systems](https://github.com/ROCm/rocm-systems/tree/develop/projects/rocr-runtime/libhsakmt/src/dxg).
+5. ROCm releases before 7.13 (so 7.2.1) need DXG detection switched on. Add it
+   to your shell profile so the hipfire daemon inherits it:
+
+   ```bash
+   echo 'export HSA_ENABLE_DXG_DETECTION=1' >> ~/.bashrc && source ~/.bashrc
+   ```
+6. Check that `rocminfo` lists your GPU as an agent (`Name: gfx1201`, …),
+   then run the [Linux installer](#linux--master-or-beta-in-one-command)
+   inside the distro.
+
+Supported GPUs for ROCm 7.2.x on WSL (librocdxg 1.2.0 matrix; hipfire's tuned
+targets are gfx1201, gfx1100 and gfx1151):
+
+| arch | products |
+|---|---|
+| gfx1201 | Radeon AI PRO R9700, RX 9070, RX 9070 XT, RX 9070 GRE |
+| gfx1200 | RX 9060, RX 9060 XT |
+| gfx1100 | RX 7900 XTX, RX 7900 XT, RX 7900 GRE, PRO W7900 (incl. Dual Slot), PRO W7800 (incl. 48GB) |
+| gfx1101 | RX 7800 XT, PRO W7700 |
+| gfx1151 | Ryzen AI Max+ 395, Ryzen AI Max 390, Ryzen AI Max 385 (Strix Halo) |
+| gfx1150 | Ryzen AI 9 HX 375, Ryzen AI 9 HX 370, Ryzen AI 9 365 |
+
+What differs from native Linux until each piece is certified on WSL hardware:
+
+- The daemon identifies cards from HIP's UUID and PCI address (there is no
+  KFD topology), so `hardware.devices` is refused; select cards with
+  `HIP_VISIBLE_DEVICES`. AMD does not support multi-GPU under WSL.
+- The retained Redline PM4 default falls back to the HIP graph with one
+  `[redline] retained default refused` log line (historically measured about
+  4–6% slower decode on the routes that default to PM4), and an explicit `replay.backend=redline`
+  is refused. `HIPFIRE_UNSAFE_WSL_REDLINE=1` lifts this; it is **unsafe
+  until certified**.
+- The KV cache uses the legacy backend; an explicit `kv_backend=vmm` is
+  refused. `HIPFIRE_UNSAFE_WSL_VMM_KV=1` lifts this; it is **unsafe until
+  certified** (WDDM VA growth may alias earlier KV pages, as it does on native
+  Windows).
+- Host RAM guards see the WSL VM's memory. On Strix Halo the GPU pool is also
+  bounded by the `.wslconfig` `memory=` setting
+  ([ROCm#6022](https://github.com/ROCm/ROCm/issues/6022)); raise it for large
+  models. `rocm-smi`/`amd-smi` are limited and the ROCm profiler and debugger
+  are unsupported under WSL.
+
+### Windows — native (best-effort)
 
 ```powershell
 # Current master:
@@ -168,7 +257,7 @@ iex (irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/inst
 For a reviewed, pinned installation:
 
 ```powershell
-$Pin = "v0.2.1"
+$Pin = "v0.4.1"
 Invoke-WebRequest -Uri "https://raw.githubusercontent.com/warpfront/hipfire/$Pin/scripts/install.ps1" `
   -OutFile "$env:TEMP\hipfire-install.ps1"
 Get-FileHash "$env:TEMP\hipfire-install.ps1" -Algorithm SHA256
@@ -176,7 +265,7 @@ notepad "$env:TEMP\hipfire-install.ps1"
 & "$env:TEMP\hipfire-install.ps1" -Ref $Pin
 ```
 
-PowerShell also accepts `-Branch beta`, `-Tag v0.2.1`, and `-Commit <sha>`.
+PowerShell also accepts `-Branch beta`, `-Tag v0.4.1`, and `-Commit <sha>`.
 The native `hipfire update` command remains Linux-only because Windows cannot
 atomically replace the running executable; re-run `install.ps1` with the
 desired selector instead.
@@ -194,12 +283,34 @@ upgrading: copying bare `.hsaco` files is insufficient.
 Unsupported GPU architectures likewise require hipcc JIT at runtime; the
 installer does not copy bare checkout objects into the installed cache.
 
+Native Windows is best-effort: it builds and runs, but it is slower and
+narrower than WSL2 on the same card. Known limits:
+
+- **No Redline PM4.** The Windows HIP SDK ships no ROCr (`libhsa-runtime64`),
+  so decode runs on the HIP graph: historically measured about 4–6% slower than the
+  Linux/WSL PM4 default (one gfx1201 Qwen3.8 27B tg128 at 8K measurement,
+  ≈38.2 instead of 40.3 tok/s; not a current baseline).
+  An explicit `replay.backend=redline` is refused.
+- **Legacy KV only.** HIP VMM growth is not certified on Windows; automatic
+  KV selects legacy and `kv_backend=vmm` is refused.
+- **No tensor or pipeline parallel**: the HIP SDK has no RCCL. One GPU per
+  daemon; `hardware.devices` is unavailable, so select the card with
+  `HIP_VISIBLE_DEVICES`.
+- GPU locks are `LockFileEx` files under `%ProgramData%\hipfire\locks`
+  (or `HIPFIRE_LOCK_DIR`); a second daemon on the same card reports the
+  holder PID, as on Linux.
+- hipfire resolves its home and kernel cache from `HOME`; when `HOME` is not
+  set they land in the current directory. Set it once with
+  `setx HOME "%USERPROFILE%"`.
+- `hipfire update` is Linux-only (re-run `install.ps1`), and `hipfire stop`
+  cannot find a native `serve` process; stop it with Ctrl-C.
+
 ### Source checkout
 
 ```bash
 git clone https://github.com/warpfront/hipfire
 cd hipfire
-cargo build --release --features deltanet --example daemon -p hipfire-runtime
+cargo build --release -p hipfire-daemon
 cargo build --release -p hipfire-cli
 cargo build --release -p hipfire-quantize
 # optional TUI:
@@ -251,7 +362,7 @@ and config overrides.
 hipfire update                  # advance the currently selected branch
 hipfire update @beta            # auto-detect branch/tag/commit
 hipfire update --branch master
-hipfire update --tag v0.2.1
+hipfire update --tag v0.4.1
 hipfire update --commit <sha>
 ```
 
@@ -266,6 +377,8 @@ under `refs/hipfire/backups/` and stashes dirty files with a recoverable
 hipfire pull qwen3.5:4b
 hipfire run  qwen3.5:4b "Explain FFT in one line"
 ```
+
+Which tag fits your card: [PICK-A-MODEL.md](PICK-A-MODEL.md).
 
 - `pull` downloads the registry artifact into `~/.hipfire/models/` (and published sidecars when the registry entry lists them).
 - `run` accepts a registry tag, alias, or path. **Recognized registry tags that are not local yet are auto-pulled** (can be multi-GB). Unresolved tags, aliases, or paths error with a `pull` / `list --remote` hint — they do not download.
@@ -288,6 +401,8 @@ hipfire stop                   # graceful stop of the tracked daemon
 ```
 
 Defaults (overridable in config): bind **`127.0.0.1:11435`** (loopback only), pre-warm **`default_model`** (`qwen3.5:9b` unless you set another). HTTP surface: [SERVE.md](SERVE.md). Subcommand flags: [CLI.md](CLI.md).
+
+`hipfire serve --ui` also serves the embedded chat UI at `/ui` on the same listener (`--open` launches it in the default browser and implies `--ui`).
 
 > **No auth / no TLS:** the serve HTTP API has **neither authentication nor TLS**. The default bind `127.0.0.1` accepts connections from this machine only. `hipfire config set host 0.0.0.0` (or `hipfire serve 0.0.0.0 11435`) listens on all interfaces and exposes inference to any reachable network (including chat-spawned serves). Expose beyond localhost only on a trusted/firewalled network **or** behind an **authenticated TLS-terminating reverse proxy** you control — never publish the raw port to the internet.
 
@@ -313,7 +428,7 @@ Defaults that matter on day one (from the native schema; full table in [CONFIG.m
 | `temperature` | `0.3` | Stored global default only for run/serve send (see above); Chat session seed |
 | `max_tokens` | `4096` | Per-request generation cap for `run` / API fallback |
 | `kv_cache` | `auto` | Resolves via a registry non-q8 `default_kv_mode`, else the architecture default: Qwen native `fp8` on eligible exact gfx1201, `q8` on gfx1100 / gfx1151 and elsewhere. `fwht3` is an optional headroom mode |
-| `dflash_mode` | **`off`** | DFlash is opt-in; pulling a draft does not enable it |
+| `dflash_mode` | **`off`** (schema) | DFlash is opt-in; pulling a draft does not enable it. Exception: Qwen3.8-27B tiers with a registry-declared draft (`qwen3.8:27b`, `-mq3*`, `-mq4*`) resolve `auto` through the registry layer, so the pulled draft is used there; if the draft file is absent the load keeps MTP `auto`. `hipfire config set dflash_mode off` is the kill switch ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)). |
 | `speculation` | `auto` | Mechanism selector; DFlash stays off when `dflash_mode=off`, but eligible **MTP / DSpark** paths may still activate under `auto`. Use `speculation=off` to force plain AR. |
 | `thinking` | `on` | Reasoning models may emit `<think>`; display strip is CLI/API-side |
 | `host` / `port` | `127.0.0.1` / `11435` | Serve bind (no auth, no TLS) |
@@ -326,7 +441,7 @@ hipfire pull qwen3.5:9b-draft
 hipfire config set dflash_mode auto    # or on / per-model
 ```
 
-`auto` uses a pulled draft when present; `on` fails the load without it.
+`auto` uses a pulled draft when present; `on` fails the load without it. Qwen3.8-27B paired tiers already resolve `auto` from the registry, so no `config set` is needed there.
 `developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` override the registry sidecar.
 Several tags can share one draft file — `hipfire rm` keeps that sidecar while
 another installed target still declares it (see [CLI.md](CLI.md)).
@@ -337,6 +452,20 @@ Long context needs no extra setup beyond `max_seq` and VRAM; for KV headroom
 pick a compact `kv_cache` mode (see [CONFIG.md](CONFIG.md)). CASK/TriAttention
 eviction is deprecated and will be removed in 0.5.0 — off by default, not
 supported, and not a recommended route to long context.
+
+**YaRN context extension (0.4.2, Qwen3.8-Flash-Next only).** The engine can
+apply YaRN RoPE scaling at load through `attention.yarn_factor` (env
+`HIPFIRE_YARN_FACTOR`): unset/`null` keeps the checkpoint's own
+`rope_parameters`, a value above 1 extends the admitted context to
+`factor × original` positions, and `1` disables a checkpoint's YaRN. It is
+static scaling, so it also changes outputs at short context: set it only for
+long-context loads. Other families ignore it.
+
+```bash
+hipfire config qwen3.8:flash-next set attention.yarn_factor 4
+```
+
+Admitted `max_seq` and measured reach: [CONFIG.md](CONFIG.md#attention).
 
 ### Measured capacity (Qwen3.5/3.6 35B-A3B-class, 24GB)
 
@@ -349,6 +478,26 @@ tokens and should not be read as full-context Q8 support. Long-context decode
 slowdown is expected O(N) full-attention bandwidth, not by itself an admission
 regression.
 
+## Flash-Next on 0.4.2 (beta)
+
+These behaviors are on the 0.4.2 line (CHANGELOG "Unreleased (0.4.2)"); the
+latest tagged release is v0.4.1. Install them with `--branch beta` until 0.4.2
+is tagged.
+
+- **Strix Halo NPU trunk (gfx1151).** `fusions.npu_trunk` /
+  `HIPFIRE_QWEN4_NPU_TRUNK` (`off|auto|on|emulate`) defaults to `auto`. Auto
+  arms only with an open XDNA2 NPU and a matching calibration; otherwise it
+  logs one reason and runs GPU-only. Every other architecture resolves auto
+  silently to off. `off` is the kill switch; timings are fixture-bound and live
+  in the CHANGELOG, not here. Keys: [CONFIG.md](CONFIG.md).
+- **EP2 owner-routed prefill and expert staging (gfx1201, two cards).** With
+  `topology.ep = 2`, `HIPFIRE_EP_OWNER_ROUTED_PREFILL` and
+  `HIPFIRE_EP_EXPERT_STAGE` default on when every admission condition holds;
+  the exact value `0` disables each. EP4 owner-routed prefill is refused at
+  admission (`EP4 owner-routed prefill not yet gated`) and keeps the full-table
+  chunk route; single-card runs are unchanged. Setup and gates:
+  [multi-gpu.md](multi-gpu.md); variable semantics: [env-vars.md](env-vars.md).
+
 ## If something fails
 
 | Symptom | What to try |
@@ -357,8 +506,8 @@ regression.
 | HIP / `/dev/kfd` / arch errors | `hipfire diag`; match ROCm/HIP version to arch (above) |
 | Model not found | `hipfire list` / `hipfire list -r`; `hipfire pull <tag>` |
 | Port in use / stale serve | `hipfire ps`; `hipfire stop --force`; check `~/.hipfire/serve.pid` and (detached only) `serve.log` |
-| Draft pulled but no speedup | Expected: `dflash_mode` defaults to **off** |
-| Truncated answers on thinking models | Raise `max_tokens` / `thinking_budget`; see [MODELS.md](MODELS.md) thinking section |
+| Draft pulled but no speedup | Expected for most models: the schema `dflash_mode` default is **off** (Qwen3.8-27B paired tiers resolve `auto` from the registry; check `hipfire config <tag>` and that the draft file is present, else only MTP runs) |
+| Truncated answers, or empty `content` from an OpenAI client, on thinking models | `max_tokens` covers the `<think>` span too: raise `max_tokens` / `thinking_budget`, or send `"chat_template_kwargs": {"enable_thinking": false}` (see [SERVE.md](SERVE.md)); [MODELS.md](MODELS.md) thinking section |
 
 ```bash
 hipfire diag
@@ -369,10 +518,13 @@ tail -f ~/.hipfire/serve.log
 
 | Doc | When |
 |---|---|
+| [PICK-A-MODEL.md](PICK-A-MODEL.md) | Which tag and speculation setting for your VRAM |
 | [CLI.md](CLI.md) | Every subcommand and flag surface |
 | [CHAT.md](CHAT.md) | Interactive chat, thinking display, daemon attach |
 | [SERVE.md](SERVE.md) | OpenAI-compatible HTTP |
 | [MODELS.md](MODELS.md) | Tags, VRAM, BYO quantize, thinking/templates |
+| [multi-gpu.md](multi-gpu.md) | Tensor / expert parallel setup and the Flash-Next EP2 route |
+| [env-vars.md](env-vars.md) | Environment variables (developer/diagnostic levers) |
 | [CONFIG.md](CONFIG.md) | All config keys |
 | [QUANTIZE.md](QUANTIZE.md) | `hipfire quantize` operator guide |
 | [INDEX.md](INDEX.md) | Ownership map for the rest of `docs/` |

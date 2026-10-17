@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! C2: HIP offload bundle read/write, and the `Source` (ELF or bundled ELF) codec.
 //!
 //! Uncompressed `clang-offload-bundler` format: the 24-byte magic, a little-endian `u64`
@@ -212,7 +216,7 @@ mod tests {
         assert_eq!(triples, ["host-x86_64-unknown-linux-gnu-", "hipv4-amdgcn-amd-amdhsa--gfx1201"]);
         assert_eq!(bundle.entries.iter().map(|e| e.offset).collect::<Vec<_>>(), [0x1000, 0x1000]);
         let device = bundle.device_entry(Arch::Gfx1201).unwrap();
-        assert_eq!((payloads[0].len(), payloads[device].len()), (0, 0x57630));
+        assert_eq!((payloads[0].len(), payloads[device].len()), (0, 0x575f8));
         assert!(payloads[device].starts_with(b"\x7fELF"));
         assert_eq!(bundle.write(&payloads).unwrap(), hxaco);
     }

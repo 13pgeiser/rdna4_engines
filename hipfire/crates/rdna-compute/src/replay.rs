@@ -16,23 +16,27 @@
 //! selection disables the automatic default.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
+use hip_bridge::memory_effects::{self, MemoryEffects};
 use hip_bridge::HipRuntime;
 use radiowave::{CodeObjectCertification, KernelArgumentAccess, MutableReadCache};
 use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, FenceScope, Gfx10DispatchInitiatorPolicy,
     Gfx10Pm4CommandBuffer, Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy,
-    Gfx11DispatchInterleave, Gfx12DispatchPacing, Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming,
-    GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry,
-    PhasedMultiQueuePm4Ib, QueuePolicy, Quiescence, RecordedDispatch, Runtime,
-    SingleQueueBatchGraph, SingleQueuePm4Ib,
+    Gfx11DispatchInterleave, Gfx12DispatchPacing, Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy,
+    GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector, HeaderPolicy, KernargBuffer,
+    KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy, Quiescence,
+    RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
 };
 use redline_dispatch::{
     AllocationPolicy, BindingRevision, KernargAbi, KernargField, Recorder, ReplayBindings,
     ResourceBinding, ResourceId,
 };
+
+use crate::code_object::{CodeObjectId, RecordedArtifact};
+use crate::dispatch::VmmResourceMove;
+
+pub(crate) mod railgun_shadow;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayQuiescence {
@@ -430,6 +434,14 @@ impl Pm4Commands {
         }
     }
 
+    /// The gfx12 command dwords (railgun's shadow diff reads both tapes).
+    fn gfx12_dwords(&self) -> Option<&[u32]> {
+        match self {
+            Self::Gfx12(commands) => Some(commands.dwords()),
+            Self::Legacy { .. } => None,
+        }
+    }
+
     fn dispatch(
         &mut self,
         kernel: &Kernel,
@@ -473,7 +485,12 @@ impl Pm4Commands {
         boundaries: &mut [Pm4DispatchBoundary],
     ) -> Result<(), String> {
         let Self::Gfx12(commands) = self else {
-            return Err("per-dispatch PM4 profiling currently requires gfx12".to_owned());
+            // Legacy boundary flags were recorded while planning; the first
+            // dispatch follows the entry acquire.
+            if let Some(first) = boundaries.first_mut() {
+                first.entry_acquire = true;
+            }
+            return Ok(());
         };
         let attributions = commands
             .dispatch_span_attributions()
@@ -511,7 +528,17 @@ impl Pm4Commands {
                 architecture: Pm4Architecture::Gfx11,
                 commands,
                 ..
-            } => SingleQueuePm4Ib::create_profiled_gfx11(device, pool, commands),
+            } => {
+                if dispatch_profile {
+                    SingleQueuePm4Ib::create_boundary_profiled_legacy(device, pool, commands)
+                } else if let Some(ib_pool) = ib_pool {
+                    SingleQueuePm4Ib::create_profiled_legacy_with_ib_pool(
+                        device, pool, ib_pool, commands,
+                    )
+                } else {
+                    SingleQueuePm4Ib::create_profiled_gfx11(device, pool, commands)
+                }
+            }
             Self::Legacy {
                 architecture: Pm4Architecture::Gfx12,
                 ..
@@ -543,52 +570,63 @@ impl Pm4Commands {
     }
 }
 
-/// Load exact-object Radiowave certifications once per retained tape.
-/// Missing, malformed, or hash-stale manifests are omitted and therefore
-/// retain the conservative scalar-cache acquire.
+/// Collect the exact-object Radiowave certifications of a retained tape's
+/// admitted images. Certification was verified once at module admission;
+/// missing, malformed, or hash-stale manifests left none and therefore retain
+/// the conservative scalar-cache acquire.
 fn radiowave_certifications(
     recorded: &[RecordedHipLaunch],
     prefix: usize,
-) -> BTreeMap<PathBuf, CodeObjectCertification> {
+) -> BTreeMap<CodeObjectId, CodeObjectCertification> {
     let mut certifications = BTreeMap::new();
-    let mut attempted = BTreeSet::new();
     for launch in recorded.iter().take(prefix) {
         let Some(artifact) = launch.artifact.as_ref() else {
             continue;
         };
-        if !attempted.insert(artifact.clone()) {
-            continue;
-        }
-        if let Some(certification) = load_radiowave_certification(artifact) {
-            certifications.insert(artifact.clone(), certification);
+        if let Some(certification) = artifact.radiowave() {
+            certifications
+                .entry(artifact.id())
+                .or_insert_with(|| certification.clone());
         }
     }
     certifications
 }
 
-fn load_radiowave_certification(artifact: &Path) -> Option<CodeObjectCertification> {
-    let manifest = artifact.with_extension("radiowave.json");
-    let code = std::fs::read(artifact).ok()?;
-    let encoded = std::fs::read_to_string(manifest).ok()?;
-    CodeObjectCertification::from_json(&code, &encoded).ok()
-}
-
 fn radiowave_vmem_only_consumer(
-    certifications: &BTreeMap<PathBuf, CodeObjectCertification>,
+    certifications: &BTreeMap<CodeObjectId, CodeObjectCertification>,
     launch: &RecordedHipLaunch,
 ) -> bool {
     let Some(artifact) = launch.artifact.as_ref() else {
         return false;
     };
-    certifications.get(artifact).is_some_and(|certification| {
+    certifications.get(&artifact.id()).is_some_and(|certification| {
         certification.mutable_read_cache(&launch.kernel) == MutableReadCache::VmemOnly
     })
+}
+
+/// Where Redline's resource effects for `launch` came from: the object's
+/// Radiowave sidecar, the name-keyed `pointer_effects` table, or neither
+/// (railgun shadow report).
+fn redline_effect_source(launch: &RecordedHipLaunch) -> String {
+    let radiowave = launch
+        .artifact
+        .as_ref()
+        .and_then(|artifact| artifact.radiowave())
+        .is_some_and(|certification| certification.argument_effects(&launch.kernel).is_some());
+    if radiowave {
+        "radiowave"
+    } else if launch.accesses.is_some() {
+        "table"
+    } else {
+        "none"
+    }
+    .to_owned()
 }
 
 fn pm4_vmem_acquire_enabled(
     architecture: Pm4Architecture,
     configured: bool,
-    certifications: &BTreeMap<PathBuf, CodeObjectCertification>,
+    certifications: &BTreeMap<CodeObjectId, CodeObjectCertification>,
     launch: &RecordedHipLaunch,
 ) -> bool {
     pm4_vmem_acquire_arch_enabled(architecture, configured)
@@ -622,7 +660,7 @@ fn pm4_gfx12_vmem_acquire_from_value(value: Option<String>) -> bool {
 /// Legacy flag (which `pm4_vmem_acquire_arch_enabled` keeps gfx12-excluded).
 fn pm4_gfx12_vmem_acquire_enabled(
     configured: bool,
-    certifications: &BTreeMap<PathBuf, CodeObjectCertification>,
+    certifications: &BTreeMap<CodeObjectId, CodeObjectCertification>,
     launch: &RecordedHipLaunch,
 ) -> bool {
     configured && radiowave_vmem_only_consumer(certifications, launch)
@@ -692,20 +730,54 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     // The repacker completely overwrites all three planes on each launch.
     // ADD is a read-modify-write of Y0, represented conservatively as Write.
     if kernel == "mq4v2_fp8_fragment_repack_gfx1201" {
-        return Some(vec![read(0), read(8), read(16), read(24),
-            write(32), write(40), write(48)]);
+        return Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            write(32),
+            write(40),
+            write(48),
+        ]);
     }
     match kernel {
         "gemm_mq4g256v2_fp8_set_row_b1"
         | "gemm_mq4g256v2_fp8_add_row_b1"
-        | "gemm_mq4g256v2_fp8_silu_row_b1" =>
-            return Some(vec![read(0), read(8), read(16), read(24), read(32), write(40)]),
-        "gemm_mq4g256v2_fp8_qkv_row_b1" =>
-            return Some(vec![read(0), read(8), read(16), read(24), read(32),
-                write(40), write(48), write(56)]),
-        "gemm_mq4g256v2_fp8_qkvza_row_b1" =>
-            return Some(vec![read(0), read(8), read(16), read(24), read(32),
-                write(40), write(48), write(56), write(64)]),
+        | "gemm_mq4g256v2_fp8_silu_row_b1" => {
+            return Some(vec![
+                read(0),
+                read(8),
+                read(16),
+                read(24),
+                read(32),
+                write(40),
+            ])
+        }
+        "gemm_mq4g256v2_fp8_qkv_row_b1" => {
+            return Some(vec![
+                read(0),
+                read(8),
+                read(16),
+                read(24),
+                read(32),
+                write(40),
+                write(48),
+                write(56),
+            ])
+        }
+        "gemm_mq4g256v2_fp8_qkvza_row_b1" => {
+            return Some(vec![
+                read(0),
+                read(8),
+                read(16),
+                read(24),
+                read(32),
+                write(40),
+                write(48),
+                write(56),
+                write(64),
+            ])
+        }
         _ => {}
     }
     if matches!(
@@ -721,6 +793,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "fused_gate_up_hfq4g256_lane0_headers_gfx1100"
             | "fused_gate_up_hfq4g256_stage_x32_gfx1100"
             | "fused_gate_up_mq4g256v2"
+            | "fused_gate_up_mq4g256v2_k5120_gfx1100"
+            | "fused_gate_up_mq4g256v2_k5120_gfx1201"
     ) {
         return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
     }
@@ -882,6 +956,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         kernel,
         "gemm_mixed_moe_grouped_wmma_k2"
             | "gemm_mixed_moe_grouped_wmma_gfx12"
+            | "gemm_mixed_moe_grouped_wmma_coalesced_gfx1201"
             | "gemm_mixed_moe_grouped_wmma_4w_k2"
     ) {
         // expert_weight_ptrs, dtype_tags, tile_ids, sorted_slot_index, X_src (read); Y_grouped (write)
@@ -944,6 +1019,16 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"
     ) {
         return Some(vec![read(0), read(8), write(16)]);
+    }
+    // Exact-gfx1100 small-N gate/up LDS-stage GEMM. Five pointers followed by
+    // gate_m, up_m, K, N: weights and X are read, split outputs are overwritten.
+    if kernel == "gemm_gate_up_mq4g256v2_wmma_gfx1100_ldsstage" {
+        return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
+    }
+    // Typed F32 copy used when hidden-state staging is recorded for retained
+    // replay: dst, src, n.
+    if kernel == "copy_f32_buffer" {
+        return Some(vec![write(0), read(8)]);
     }
     // F16 dense batched GEMM (Maple router + DeepSeek compressor shapes). 3 pointers
     // + 3 i32 (M,K,B) = 36 explicit bytes. A@0 and X@8 are reads; Y@16 is a pure
@@ -1028,11 +1113,20 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     match kernel {
         "add_inplace_f32" => Some(vec![write(0), read(8)]),
         "fused_rmsnorm_mq_rotate"
+        | "fused_rmsnorm_mq_rotate_f16"
         | "fused_rmsnorm_mq_rotate_vecsum"
         | "fused_rmsnorm_mq_rotate_vecsum_sign_const"
         | "fused_rmsnorm_mq_rotate_vecsum_sign_lds" => {
             Some(vec![read(0), read(8), read(16), read(24), write(32)])
         }
+        "fused_rmsnorm_mq_rotate_awq_f16" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+        ]),
         "fused_rmsnorm_mq_rotate_wavegrid" => Some(vec![
             read(0),
             read(8),
@@ -1040,6 +1134,16 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(24),
             write(32),
             write(40),
+        ]),
+        // x, weight, awq_scale, signs1, signs2, x_rot, persistent rendezvous scratch.
+        "fused_rmsnorm_mq_rotate_awq_wavegrid" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+            write(48),
         ]),
         "rmsnorm_reduce_gfx1100" => Some(vec![read(0), write(8)]),
         "compressor_add_ape_f32_buf" => Some(vec![write(0), read(8), read(16)]),
@@ -1229,6 +1333,22 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             read(48),
         ]),
+        // FA prep with folded Q8_0 KV epilogue:
+        // [0]=q_interleaved(r) [8]=q(w) [16]=gate(w) [24]=k(w) [32]=v_src(r)
+        // [40]=k_cache(w) [48]=v_cache(w) [56]=q_weight(r) [64]=k_weight(r)
+        // [72]=pos_buf(r)
+        "qwen35_fa_prep_kvwrite_gfx1100" => Some(vec![
+            read(0),
+            write(8),
+            write(16),
+            write(24),
+            read(32),
+            write(40),
+            write(48),
+            read(56),
+            read(64),
+            read(72),
+        ]),
         "kv_cache_write_q8_0_pair" => Some(vec![write(0), write(8), read(16), read(24), read(32)]),
         "mq_rotate_x" => Some(vec![read(0), write(8), read(16), read(24)]),
         "gemv_hfq4g256"
@@ -1327,16 +1447,28 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(40),
             read(48),
         ]),
+        // gfx1100 split-KV verifier: preconvert writes persistent Q16 scratch;
+        // the partial pass scans Q16/K/V/positions into split records; merge
+        // reads those records and writes the final attention output.
+        "attention_fa2_q_preconvert_gfx1100" => Some(vec![read(0), write(8), read(16), read(24)]),
+        "attention_q8_0_fa2_gqa_partial_gfx1100" => {
+            Some(vec![read(0), read(8), read(16), write(24), read(32)])
+        }
+        "attention_q8_0_fa2_gqa_merge_gfx1100" => Some(vec![read(0), write(8)]),
         // The gfx1201 GQA fp8, gfx1100 GQA Q8_0 and gfx1151 GQA Q8_0 decode
         // tiles and the head-dim-split reduces keep their reference twins'
         // 13/7-argument ABIs and pointer effects.
         "attention_flash_q8_0_tile"
+        | "attention_flash_q8_0_tile_swa"
         | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
         | "attention_flash_q8_0_tile_gqa_gfx1100"
-        | "attention_flash_q8_0_tile_gqa_gfx1151" => {
+        | "attention_flash_q8_0_tile_gqa_gfx1151"
+        | "attention_flash_q8_0_tile_gqa_d256g2_gfx1151"
+        | "attention_flash_q8_0_tile_gqa_d512g8_gfx1151" => {
             Some(vec![read(0), read(8), read(16), write(24), read(32)])
         }
         "attention_flash_q8_0_reduce"
+        | "attention_flash_q8_0_reduce_skip"
         | "attention_flash_reduce_dsplit_gfx1201"
         | "attention_flash_reduce_dsplit_gfx1151" => Some(vec![read(0), write(8), read(24)]),
         "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
@@ -1356,14 +1488,23 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
 }
 
 fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
+    if kernel == "fused_rmsnorm_mq_rotate_f16" {
+        return Some(48);
+    }
+    if kernel == "fused_rmsnorm_mq_rotate_awq_f16" {
+        return Some(64);
+    }
     if kernel == "mq4v2_fp8_fragment_repack_gfx1201" {
         return Some(80);
     }
-    if matches!(kernel, "gemm_mq4g256v2_fp8_set_row_b1"
-        | "gemm_mq4g256v2_fp8_add_row_b1"
-        | "gemm_mq4g256v2_fp8_silu_row_b1"
-        | "gemm_mq4g256v2_fp8_qkv_row_b1"
-        | "gemm_mq4g256v2_fp8_qkvza_row_b1") {
+    if matches!(
+        kernel,
+        "gemm_mq4g256v2_fp8_set_row_b1"
+            | "gemm_mq4g256v2_fp8_add_row_b1"
+            | "gemm_mq4g256v2_fp8_silu_row_b1"
+            | "gemm_mq4g256v2_fp8_qkv_row_b1"
+            | "gemm_mq4g256v2_fp8_qkvza_row_b1"
+    ) {
         return Some(96);
     }
     if matches!(
@@ -1462,6 +1603,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "fused_gate_up_hfq4g256_lane0_headers_gfx1100"
             | "fused_gate_up_hfq4g256_stage_x32_gfx1100"
             | "fused_gate_up_mq4g256v2"
+            | "fused_gate_up_mq4g256v2_k5120_gfx1100"
+            | "fused_gate_up_mq4g256v2_k5120_gfx1201"
     ) {
         return Some(64);
     }
@@ -1591,6 +1734,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_mixed_moe_down_k8_indexed_batched_expanded"
             | "gemm_mixed_moe_grouped_wmma_k2"
             | "gemm_mixed_moe_grouped_wmma_gfx12"
+            | "gemm_mixed_moe_grouped_wmma_coalesced_gfx1201"
             | "gemm_mixed_moe_grouped_wmma_4w_k2"
     ) {
         return Some(64);
@@ -1640,6 +1784,15 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"
     ) {
         return Some(48);
+    }
+    // Five pointers + four i32 = 56 explicit bytes, padded to the recorder's
+    // required 16-byte boundary.
+    if kernel == "gemm_gate_up_mq4g256v2_wmma_gfx1100_ldsstage" {
+        return Some(64);
+    }
+    // Two pointers + one i32 = 20 explicit bytes, padded to 32.
+    if kernel == "copy_f32_buffer" {
+        return Some(32);
     }
     // F16 dense batched GEMM: 3 ptr + M,K,B = 36 → 48 padded. gfx11 and gfx12
     // share one ABI — see `Gpu::gemm_f16_x_f16_wmma`, whose blob builder pushes
@@ -1701,7 +1854,11 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "hc_input_map_4stream"
         | "sigmoid_mul_f32" => Some(32),
         "gemma4_ple_gelu_mul_strided_f32" => Some(48),
+        "attention_fa2_q_preconvert_gfx1100" => Some(48),
+        "attention_q8_0_fa2_gqa_partial_gfx1100" => Some(64),
+        "attention_q8_0_fa2_gqa_merge_gfx1100" => Some(32),
         "attention_flash_q8_0_reduce"
+        | "attention_flash_q8_0_reduce_skip"
         | "attention_flash_reduce_dsplit_gfx1201"
         | "attention_flash_reduce_dsplit_gfx1151"
         | "fused_rmsnorm_mq_rotate"
@@ -1752,16 +1909,22 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201"
         | "fused_rmsnorm_mq_rotate_wavegrid"
+        | "fused_rmsnorm_mq_rotate_awq_wavegrid"
         | "rotate_with_rms_gfx1100"
         | "attention_q8_0_kv" => Some(64),
+        // 10 pointers + eps + freq_base = 88 explicit bytes, padded to 16 B.
+        "qwen35_fa_prep_kvwrite_gfx1100" => Some(96),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum"
         | "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151" => Some(72),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
         "attention_flash_q8_0_tile"
+        | "attention_flash_q8_0_tile_swa"
         | "attention_flash_fp8_e4m3_tile_gqa_gfx1201"
         | "gated_norm_mq_rotate_awq_k6144_gfx1201"
         | "attention_flash_q8_0_tile_gqa_gfx1100"
         | "attention_flash_q8_0_tile_gqa_gfx1151"
+        | "attention_flash_q8_0_tile_gqa_d256g2_gfx1151"
+        | "attention_flash_q8_0_tile_gqa_d512g8_gfx1151"
         | "fused_qkv_hfq4g256"
         | "fused_qkv_mq4g256v2"
         | "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100"
@@ -1939,15 +2102,22 @@ fn encode_bound_kernarg(
     let mut encoded = snapshot.to_vec();
     for slot in &layout.slots {
         let binding = bindings.resource(slot.resource).ok_or_else(|| {
-            format!("{kernel}: pointer slot at offset {} has no bound resource", slot.offset)
+            format!(
+                "{kernel}: pointer slot at offset {} has no bound resource",
+                slot.offset
+            )
         })?;
         let base = binding.base().as_ptr() as usize as u64;
         let address = base.checked_add(slot.interior_offset).ok_or_else(|| {
-            format!("{kernel}: pointer slot at offset {} base overflows", slot.offset)
+            format!(
+                "{kernel}: pointer slot at offset {} base overflows",
+                slot.offset
+            )
         })?;
-        let end = slot.offset.checked_add(8).ok_or_else(|| {
-            format!("{kernel}: pointer slot at offset {} overflows", slot.offset)
-        })?;
+        let end = slot
+            .offset
+            .checked_add(8)
+            .ok_or_else(|| format!("{kernel}: pointer slot at offset {} overflows", slot.offset))?;
         if end > encoded.len() {
             return Err(format!(
                 "{kernel}: pointer slot at offset {} out of bounds (len {})",
@@ -1965,11 +2135,7 @@ fn encode_bound_kernarg(
 /// except the moved pointer slots — checked by the refresh path with its own
 /// slot mask). `debug_assert` covers debug builds; `HIPFIRE_REPLAY_BINDINGS_VERIFY=1`
 /// promotes the check to a hard error in release for the harness.
-fn verify_bound_kernarg(
-    kernel: &str,
-    snapshot: &[u8],
-    encoded: &[u8],
-) -> Result<(), String> {
+fn verify_bound_kernarg(kernel: &str, snapshot: &[u8], encoded: &[u8]) -> Result<(), String> {
     let mismatch = bound_kernarg_mismatch_message(kernel, snapshot, encoded);
     debug_assert!(
         mismatch.is_none(),
@@ -1987,11 +2153,7 @@ fn verify_bound_kernarg(
 /// Pure mismatch description for the snapshot gate: `None` when the
 /// re-encoded segment equals the snapshot, else the fail-closed message with
 /// the launch name and the first differing offset.
-fn bound_kernarg_mismatch_message(
-    kernel: &str,
-    snapshot: &[u8],
-    encoded: &[u8],
-) -> Option<String> {
+fn bound_kernarg_mismatch_message(kernel: &str, snapshot: &[u8], encoded: &[u8]) -> Option<String> {
     if snapshot == encoded {
         return None;
     }
@@ -2008,6 +2170,405 @@ fn bound_kernarg_mismatch_message(
 fn bindings_verify_enabled() -> bool {
     hipfire_config::process_value("HIPFIRE_REPLAY_BINDINGS_VERIFY")
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"))
+}
+
+/// One `VmmResourceMove` widened to `u64`; ranges are kept sorted by
+/// `old_start` and never overlap (`relocation_ranges`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RelocationRange {
+    old_start: u64,
+    old_end: u64,
+    new_start: u64,
+    new_end: u64,
+    /// Bytes mapped at `new_start`.
+    mapped: u64,
+}
+
+enum RangeMatch<'a> {
+    Outside,
+    Inside(&'a RelocationRange),
+    Straddles(&'a RelocationRange),
+}
+
+/// One tape resource a relocation rebinds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlannedRelocation {
+    resource: ResourceId,
+    old_key: (u64, u64),
+    new_key: (u64, u64),
+    /// Bytes mapped at the new location starting at `new_key.0`.
+    coverage: u64,
+}
+
+/// Validate `moves` and return them widened and sorted by old base. Rejects a
+/// null/empty/self move, `mapped > reserved`, address overflow, duplicate or
+/// overlapping sources, overlapping destinations, and a destination that
+/// overlaps any source (a chain inside one call would be ambiguous).
+fn relocation_ranges(moves: &[VmmResourceMove]) -> Result<Vec<RelocationRange>, String> {
+    let mut ranges = Vec::with_capacity(moves.len());
+    for (index, relocation) in moves.iter().enumerate() {
+        let widen = |value: usize, what: &str| {
+            u64::try_from(value).map_err(|_| format!("VMM move {index}: {what} exceeds u64"))
+        };
+        let old_start = widen(relocation.old_base, "old_base")?;
+        let new_start = widen(relocation.new_base, "new_base")?;
+        let reserved = widen(relocation.reserved_bytes, "reserved_bytes")?;
+        let mapped = widen(relocation.mapped_bytes, "mapped_bytes")?;
+        if old_start == 0 || new_start == 0 {
+            return Err(format!("VMM move {index}: null base"));
+        }
+        if old_start == new_start {
+            return Err(format!("VMM move {index}: old and new base are both {old_start:#x}"));
+        }
+        if reserved == 0 {
+            return Err(format!("VMM move {index}: zero reserved bytes"));
+        }
+        if mapped > reserved {
+            return Err(format!(
+                "VMM move {index}: mapped {mapped:#x} exceeds reserved {reserved:#x}"
+            ));
+        }
+        let old_end = old_start
+            .checked_add(reserved)
+            .ok_or_else(|| format!("VMM move {index}: old range overflows"))?;
+        let new_end = new_start
+            .checked_add(reserved)
+            .ok_or_else(|| format!("VMM move {index}: new range overflows"))?;
+        ranges.push(RelocationRange {
+            old_start,
+            old_end,
+            new_start,
+            new_end,
+            mapped,
+        });
+    }
+    ranges.sort_unstable_by_key(|range| range.old_start);
+    for pair in ranges.windows(2) {
+        if pair[0].old_end > pair[1].old_start {
+            return Err(if pair[0].old_start == pair[1].old_start {
+                format!("duplicate VMM move for old base {:#x}", pair[0].old_start)
+            } else {
+                format!(
+                    "overlapping VMM move sources {:#x}..{:#x} and {:#x}..{:#x}",
+                    pair[0].old_start, pair[0].old_end, pair[1].old_start, pair[1].old_end
+                )
+            });
+        }
+    }
+    let mut destinations: Vec<(u64, u64)> = ranges
+        .iter()
+        .map(|range| (range.new_start, range.new_end))
+        .collect();
+    destinations.sort_unstable();
+    for pair in destinations.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return Err(format!(
+                "overlapping VMM move destinations {:#x}..{:#x} and {:#x}..{:#x}",
+                pair[0].0, pair[0].1, pair[1].0, pair[1].1
+            ));
+        }
+    }
+    for source in &ranges {
+        for destination in &ranges {
+            if source.old_start < destination.new_end && destination.new_start < source.old_end {
+                return Err(format!(
+                    "VMM move destination {:#x}..{:#x} overlaps source {:#x}..{:#x}",
+                    destination.new_start, destination.new_end, source.old_start, source.old_end
+                ));
+            }
+        }
+    }
+    Ok(ranges)
+}
+
+/// Classify `start..end` against sorted, non-overlapping `ranges`.
+fn classify_range(ranges: &[RelocationRange], start: u64, end: u64) -> RangeMatch<'_> {
+    let at = ranges.partition_point(|range| range.old_start <= start);
+    if let Some(range) = at.checked_sub(1).map(|index| &ranges[index]) {
+        if start < range.old_end {
+            return if end <= range.old_end {
+                RangeMatch::Inside(range)
+            } else {
+                RangeMatch::Straddles(range)
+            };
+        }
+    }
+    match ranges.get(at) {
+        Some(range) if range.old_start < end => RangeMatch::Straddles(range),
+        _ => RangeMatch::Outside,
+    }
+}
+
+/// Pure relocation plan: every `tape_resources` key `(base, size)` contained
+/// in a move's `[old_base, old_base + reserved_bytes)` becomes
+/// `(new_base + (base - old_base), size)`. Fails closed on an invalid move
+/// set, a key straddling a move boundary, a key not fully mapped at the new
+/// location (`new_off + size > mapped_bytes`), or a new key overlapping a
+/// resource that stays. Keys outside every move are untouched and never
+/// probed. The result is ordered by old key.
+fn plan_relocation(
+    tape_resources: &BTreeMap<(u64, u64), ResourceId>,
+    moves: &[VmmResourceMove],
+) -> Result<Vec<PlannedRelocation>, String> {
+    let ranges = relocation_ranges(moves)?;
+    let mut plan = Vec::new();
+    for (&(base, size), &resource) in tape_resources {
+        let end = base
+            .checked_add(size)
+            .ok_or_else(|| format!("tape resource {resource:?} {base:#x}+{size:#x} overflows"))?;
+        match classify_range(&ranges, base, end) {
+            RangeMatch::Outside => {}
+            RangeMatch::Straddles(range) => {
+                return Err(format!(
+                    "tape resource {resource:?} {base:#x}+{size:#x} straddles VMM move source \
+                     {:#x}..{:#x}",
+                    range.old_start, range.old_end
+                ));
+            }
+            RangeMatch::Inside(range) => {
+                let offset = base - range.old_start;
+                let coverage = range
+                    .mapped
+                    .checked_sub(offset)
+                    .filter(|coverage| size <= *coverage)
+                    .ok_or_else(|| {
+                        format!(
+                            "tape resource {resource:?} {base:#x}+{size:#x} is not fully mapped at \
+                             its new location (mapped {:#x} bytes, offset {offset:#x})",
+                            range.mapped
+                        )
+                    })?;
+                plan.push(PlannedRelocation {
+                    resource,
+                    old_key: (base, size),
+                    new_key: (range.new_start + offset, size),
+                    coverage,
+                });
+            }
+        }
+    }
+    for planned in &plan {
+        let (new_base, new_size) = planned.new_key;
+        let new_end = new_base + new_size;
+        if tape_resources
+            .keys()
+            .any(|&(base, size)| base < new_end && new_base < base.saturating_add(size))
+        {
+            return Err(format!(
+                "relocated tape resource {:?} would overlap a tape resource at \
+                 {new_base:#x}..{new_end:#x}",
+                planned.resource
+            ));
+        }
+    }
+    Ok(plan)
+}
+
+/// `Some(message)` when an untyped launch (no pointer slots) cannot be proven
+/// clear of every relocated range: unknown accesses, or an access overlapping
+/// a move source. Raw kernarg bytes of such a launch cannot be rewritten.
+fn untyped_launch_relocation_hazard(
+    launch: &RecordedHipLaunch,
+    ranges: &[RelocationRange],
+) -> Option<String> {
+    let Some(accesses) = launch.accesses.as_ref() else {
+        return Some(format!(
+            "{}: untyped launch has unknown pointer accesses while VMM ranges relocate; \
+             port the pointer declaration",
+            launch.kernel
+        ));
+    };
+    accesses
+        .iter()
+        .any(|access| {
+            !matches!(
+                classify_range(
+                    ranges,
+                    access.allocation_base,
+                    access.allocation_base.saturating_add(access.allocation_bytes),
+                ),
+                RangeMatch::Outside
+            )
+        })
+        .then(|| {
+            format!(
+                "{}: untyped launch touches a VMM range being relocated; \
+                 port the pointer declaration",
+                launch.kernel
+            )
+        })
+}
+
+/// Shift every access whose allocation lies inside a move source to the new
+/// location. `None` when no access moved; a straddling access fails closed.
+fn relocate_accesses(
+    kernel: &str,
+    accesses: &[RecordedResourceAccess],
+    ranges: &[RelocationRange],
+) -> Result<Option<Vec<RecordedResourceAccess>>, String> {
+    let mut relocated: Option<Vec<RecordedResourceAccess>> = None;
+    for (index, access) in accesses.iter().enumerate() {
+        let end = access.allocation_base.saturating_add(access.allocation_bytes);
+        match classify_range(ranges, access.allocation_base, end) {
+            RangeMatch::Outside => {}
+            RangeMatch::Straddles(range) => {
+                return Err(format!(
+                    "{kernel}: recorded access {:#x}+{:#x} straddles VMM move source {:#x}..{:#x}",
+                    access.allocation_base, access.allocation_bytes, range.old_start, range.old_end
+                ));
+            }
+            RangeMatch::Inside(range) => {
+                let shifted = |address: u64| {
+                    address
+                        .checked_sub(range.old_start)
+                        .and_then(|offset| range.new_start.checked_add(offset))
+                        .ok_or_else(|| {
+                            format!("{kernel}: recorded access address {address:#x} cannot relocate")
+                        })
+                };
+                let out = relocated.get_or_insert_with(|| accesses.to_vec());
+                out[index].allocation_base = shifted(access.allocation_base)?;
+                out[index].access_base = shifted(access.access_base)?;
+            }
+        }
+    }
+    Ok(relocated)
+}
+
+/// Copy of `snapshot` with every pointer slot bound to a moved resource
+/// rewritten to `new_base + interior_offset`; `None` when no slot references a
+/// moved resource. Fails closed when a slot's 8 bytes lie past the coverage
+/// mapped at the new location. Every non-slot byte is the snapshot's.
+fn relocate_kernarg_slots(
+    kernel: &str,
+    snapshot: &[u8],
+    layout: &LaunchBindingLayout,
+    moved: &BTreeMap<ResourceId, PlannedRelocation>,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut relocated: Option<Vec<u8>> = None;
+    for slot in &layout.slots {
+        let Some(planned) = moved.get(&slot.resource) else {
+            continue;
+        };
+        let reach = slot.interior_offset.checked_add(8).ok_or_else(|| {
+            format!("{kernel}: pointer slot at offset {} interior overflows", slot.offset)
+        })?;
+        if reach > planned.coverage {
+            return Err(format!(
+                "{kernel}: pointer slot at offset {} reaches {reach:#x} bytes into a resource with \
+                 only {:#x} bytes mapped at its new location",
+                slot.offset, planned.coverage
+            ));
+        }
+        let address = planned
+            .new_key
+            .0
+            .checked_add(slot.interior_offset)
+            .ok_or_else(|| format!("{kernel}: pointer slot at offset {} base overflows", slot.offset))?;
+        let end = slot
+            .offset
+            .checked_add(8)
+            .filter(|end| *end <= snapshot.len())
+            .ok_or_else(|| {
+                format!(
+                    "{kernel}: pointer slot at offset {} out of bounds (len {})",
+                    slot.offset,
+                    snapshot.len()
+                )
+            })?;
+        let out = relocated.get_or_insert_with(|| snapshot.to_vec());
+        out[slot.offset..end].copy_from_slice(&address.to_ne_bytes());
+    }
+    Ok(relocated)
+}
+
+/// Fail-closed gate for a prepared PM4 segment: every byte of `current`
+/// outside the `exempt` `(offset, len)` ranges (sorted by offset) must equal
+/// `expected`. Exempt ranges are the pointer slots and the u32 dynamic
+/// kernarg bindings, which replay patches each launch.
+fn verify_non_slot_bytes_identical(
+    kernel: &str,
+    current: &[u8],
+    expected: &[u8],
+    exempt: &[(usize, usize)],
+) -> Result<(), String> {
+    if current.len() != expected.len() {
+        return Err(format!(
+            "{kernel}: relocated kernarg length {} differs from the prepared segment prefix {}",
+            expected.len(),
+            current.len()
+        ));
+    }
+    let mismatch = |from: usize, to: usize| -> Option<usize> {
+        if current[from..to] == expected[from..to] {
+            return None;
+        }
+        current[from..to]
+            .iter()
+            .zip(&expected[from..to])
+            .position(|(old, new)| old != new)
+            .map(|position| from + position)
+    };
+    let failure = |offset: usize| {
+        format!(
+            "{kernel}: relocated kernarg differs from the prepared segment at non-slot offset \
+             {offset}"
+        )
+    };
+    let mut cursor = 0usize;
+    for &(offset, len) in exempt {
+        let stop = offset.min(current.len());
+        if cursor < stop {
+            if let Some(at) = mismatch(cursor, stop) {
+                return Err(failure(at));
+            }
+        }
+        cursor = cursor.max(offset.saturating_add(len));
+    }
+    if cursor < current.len() {
+        if let Some(at) = mismatch(cursor, current.len()) {
+            return Err(failure(at));
+        }
+    }
+    Ok(())
+}
+
+/// Per prepared dispatch, the sorted `(offset, len)` kernarg ranges a
+/// relocation must not hold to snapshot equality: typed pointer slots (8
+/// bytes), declared/synthesized/GDN u32 dynamic bindings (4 bytes), and the
+/// legacy GDN frame word at 76. Computed once when the PM4 tape is prepared.
+fn bound_exempt_kernarg_ranges(
+    launches: &[RecordedHipLaunch],
+    prefix: usize,
+    dynamic_bindings: &[(usize, ReplayKernargBinding)],
+    legacy_gdn_frames: &[usize],
+) -> Vec<Vec<(usize, usize)>> {
+    let mut ranges: Vec<Vec<(usize, usize)>> = launches
+        .iter()
+        .take(prefix)
+        .map(|launch| {
+            launch
+                .binding_layout
+                .as_ref()
+                .map(|layout| layout.slots.iter().map(|slot| (slot.offset, 8)).collect())
+                .unwrap_or_default()
+        })
+        .collect();
+    for (dispatch, binding) in dynamic_bindings {
+        if let Some(entry) = ranges.get_mut(*dispatch) {
+            entry.push((binding.offset(), 4));
+        }
+    }
+    for dispatch in legacy_gdn_frames {
+        if let Some(entry) = ranges.get_mut(*dispatch) {
+            entry.push((76, 4));
+        }
+    }
+    for entry in &mut ranges {
+        entry.sort_unstable();
+        entry.dedup();
+    }
+    ranges
 }
 
 #[derive(Default)]
@@ -2641,10 +3202,25 @@ impl Pm4RegisterPolicy {
     }
 }
 
+/// Diagnostic opt-in, default off: `HIPFIRE_GFX1100_PM4_EXPERIMENTS=1` lets
+/// the gfx1151 initiator / interleave / resource-limits knobs apply to gfx1100
+/// as well. Without it gfx1100 keeps the legacy encoding byte-for-byte.
+fn gfx1100_experiment_alias(architecture: Pm4Architecture, device_name: &str) -> &str {
+    if architecture == Pm4Architecture::Gfx11
+        && device_name.eq_ignore_ascii_case("gfx1100")
+        && hipfire_config::process_value("HIPFIRE_GFX1100_PM4_EXPERIMENTS").as_deref() == Some("1")
+    {
+        "gfx1151"
+    } else {
+        device_name
+    }
+}
+
 fn gfx10_dispatch_initiator_policy(
     architecture: Pm4Architecture,
     device_name: &str,
 ) -> Gfx10DispatchInitiatorPolicy {
+    let device_name = gfx1100_experiment_alias(architecture, device_name);
     let value = hipfire_config::process_value("HIPFIRE_GFX1151_PM4_INITIATOR")
         .unwrap_or_else(|| "legacy".to_owned());
     let policy = gfx10_dispatch_initiator_policy_from_value(architecture, device_name, &value)
@@ -2683,6 +3259,7 @@ fn gfx1151_dispatch_interleave(
     architecture: Pm4Architecture,
     device_name: &str,
 ) -> Option<Gfx11DispatchInterleave> {
+    let device_name = gfx1100_experiment_alias(architecture, device_name);
     let value = hipfire_config::process_value("HIPFIRE_GFX1151_PM4_INTERLEAVE")
         .unwrap_or_else(|| "inherit".to_owned());
     let interleave = gfx1151_dispatch_interleave_from_value(architecture, device_name, &value)
@@ -2725,6 +3302,7 @@ fn gfx1151_resource_limits_policy(
     architecture: Pm4Architecture,
     device_name: &str,
 ) -> Gfx11ComputeResourceLimitsPolicy {
+    let device_name = gfx1100_experiment_alias(architecture, device_name);
     let value = hipfire_config::process_value("HIPFIRE_GFX1151_PM4_RESOURCE_LIMITS")
         .unwrap_or_else(|| "legacy".to_owned());
     let policy = gfx1151_resource_limits_policy_from_value(architecture, device_name, &value)
@@ -3216,10 +3794,23 @@ pub enum ReplayState {
     Fallback,
 }
 
+/// One launch seen by the G0 eager arm: the eager branch's kernel, geometry
+/// and exact padded kernarg bytes (the same bytes a recording would keep).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct G0Launch {
+    pub kernel: String,
+    pub grid: [u32; 3],
+    pub block: [u32; 3],
+    pub shared_mem: u32,
+    pub kernarg: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordedHipLaunch {
     pub kernel: String,
-    pub artifact: Option<PathBuf>,
+    /// Admitted code object that owns the launched symbol; replay loads its
+    /// retained bytes, never a file.
+    pub artifact: Option<RecordedArtifact>,
     pub grid: [u32; 3],
     pub block: [u32; 3],
     pub shared_mem: u32,
@@ -3545,6 +4136,15 @@ pub(crate) fn is_gdn_kernel(kernel: &str) -> bool {
     kernel == "gated_delta_net_q8_fast" || kernel.starts_with("gated_delta_net_q8_compact")
 }
 
+/// Fail-closed gate for the PM4/AQL lowering, which turns a recorded HIP
+/// geometry (or the prepared maximum of a position-bound grid) into a direct
+/// dispatch. HIP rejects such a grid on the device's grid.y/grid.z ceiling, so
+/// the retained transport must not accept a geometry the raw launch refuses.
+fn check_prepared_grid(device_name: &str, symbol: &str, grid: [u32; 3]) -> Result<(), String> {
+    hip_bridge::check_launch_grid(grid, hip_bridge::grid_yz_limit_for_arch(device_name))
+        .map_err(|error| format!("{symbol}: {}", error.message))
+}
+
 fn is_plausible_device_address(value: u64) -> bool {
     // Heuristic: real device pointers are at least page-aligned and in a
     // high virtual range. Small integers (positions, scales, sizes) are
@@ -3823,6 +4423,17 @@ pub fn gfx1201_pm4_pacing_from_config() -> Gfx12DispatchPacing {
         eprintln!("[redline] ignoring HIPFIRE_GFX1201_PM4_PACING: {reason}");
         GFX1201_DEFAULT_PM4_PACING
     })
+}
+
+/// An explicit `HIPFIRE_GFX1201_PM4_PACING` (`off` / `nop:N`), or `None` when
+/// it is unset, `auto` or unparseable. railgun's gfx1201 lowering keeps its
+/// own per-arch pacing (`railgun::plan::ArchLowering`) unless this is set.
+pub(crate) fn gfx1201_pm4_pacing_override() -> Option<Gfx12DispatchPacing> {
+    let value = hipfire_config::process_value("HIPFIRE_GFX1201_PM4_PACING")?;
+    if matches!(value.trim().to_ascii_lowercase().as_str(), "" | "auto") {
+        return None;
+    }
+    parse_gfx1201_pm4_pacing(Some(&value)).ok()
 }
 
 fn parse_gfx1201_pm4_pacing(value: Option<&str>) -> Result<Gfx12DispatchPacing, String> {
@@ -4375,6 +4986,10 @@ pub struct PreparedPm4Replay {
     /// segments are encoded at. Unchanged revision ⇒ the buffers are current
     /// and the replay hot path does no re-encode work.
     bound_explicit_lens: Vec<usize>,
+    /// Per prepared dispatch (aligned with `kernargs`): sorted `(offset, len)`
+    /// ranges excluded from the relocation non-slot-bytes gate (pointer slots
+    /// and u32 dynamic bindings). Precomputed once at prepare time.
+    bound_exempt_ranges: Vec<Vec<(usize, usize)>>,
     encoded_revision: BindingRevision,
 }
 
@@ -4408,6 +5023,7 @@ impl PreparedPm4Replay {
                 });
             }
         }
+        let patch_started = crate::gap_timing::now();
         // Patch typed kernarg bindings while queue is quiescent.
         // Single code path shared with recorded-HIP replay: both transports
         // must apply the identical binding set via `apply_kernarg_bindings_for_dispatch`.
@@ -4480,16 +5096,30 @@ impl PreparedPm4Replay {
         if let Some(index) = self.kernarg_publish {
             self.kernargs[index].publish_host_writes();
         }
+        crate::gap_timing::add_since(crate::gap_timing::Slot::Patch, patch_started);
+        let wait_started = crate::gap_timing::now();
         // SAFETY: forwarded from the caller that owns the model allocations.
-        unsafe { self.graph.replay_and_wait_profiled_checked() }.map_err(|(error, quiescence)| {
-            RetainedReplayFailure {
+        let result = unsafe { self.graph.replay_and_wait_profiled_checked() }.map_err(
+            |(error, quiescence)| RetainedReplayFailure {
                 error: error.to_string(),
                 quiescence: match quiescence {
                     Quiescence::Proven => ReplayQuiescence::Proven,
                     Quiescence::Unknown => ReplayQuiescence::Unknown,
                 },
-            }
-        })
+            },
+        );
+        crate::gap_timing::add_since(crate::gap_timing::Slot::SubmitWait, wait_started);
+        if let Ok(timing) = &result {
+            crate::gap_timing::add_ns(
+                crate::gap_timing::Slot::GpuSpan,
+                timing
+                    .last_end
+                    .saturating_sub(timing.first_start)
+                    .saturating_mul(1_000_000_000)
+                    / timing.frequency_hz.max(1),
+            );
+        }
+        result
     }
 
     /// Replay one instrumented retained graph exactly once.
@@ -4583,8 +5213,11 @@ pub struct ReplayController {
     prepared_pm4: Option<PreparedPm4Replay>,
     auto_lifecycle: bool,
     forward_eligible: bool,
+    /// The model owns host-mapped weights the CPU multiplies; a CPU step is a host
+    /// sync point, so a retained tape can neither record nor replay it. Set by the
+    /// loader from the resolved placement; cleared on unload.
+    host_cpu_weights: bool,
     replay_observation: ReplayObservation,
-    radiowave_effect_certifications: BTreeMap<PathBuf, Option<CodeObjectCertification>>,
     radiowave_effect_launches: usize,
     fallback_effect_launches: usize,
     unknown_effect_launches: usize,
@@ -4615,8 +5248,26 @@ pub struct ReplayController {
     /// active; drained by the post-growth refresh before the next launch or
     /// replay. A replay that observes it armed fails closed (route re-armed).
     binding_refresh_pending: bool,
+    /// This thread's [`memory_effects`] tally when the open capture window
+    /// began, and the memory operations issued inside the last closed window.
+    window_effects_base: MemoryEffects,
+    window_effects: MemoryEffects,
     /// Shadow-only executor override for the next eligible forward.
     shadow_body_route: Option<ShadowBodyRoute>,
+    /// G0 recording-invariance eager arm (railgun design §5 G0): `Some`
+    /// while every funnel launch is observed with `is_recording()` false, so
+    /// recording-dependent predicates take their eager branch.
+    g0_observation: Option<Vec<G0Launch>>,
+    /// railgun M1 shadow (`HIPFIRE_RAILGUN_SHADOW`): authors railgun's
+    /// program next to every recording and diffs its PM4 lowering against
+    /// the prepared tape. Never changes the route.
+    railgun_shadow: Option<railgun_shadow::RailgunShadow>,
+    /// railgun M2 check mode (`HIPFIRE_RAILGUN_CHECK`): run by
+    /// `Gpu::replay_pm4_routed`, parked here between steps.
+    pub(crate) railgun_check: Option<Box<crate::railgun_check::CheckState>>,
+    /// Count of PM4 programs prepared by this controller: the check mode's
+    /// once-per-program weights verification keys on it.
+    pm4_generation: u64,
 }
 
 /// Which executor the retained body uses on the next eligible forward.
@@ -4682,8 +5333,8 @@ impl ReplayController {
             prepared_pm4: None,
             auto_lifecycle: false,
             forward_eligible: true,
+            host_cpu_weights: false,
             replay_observation: ReplayObservation::default(),
-            radiowave_effect_certifications: BTreeMap::new(),
             unknown_effect_launches: 0,
             radiowave_effect_launches: 0,
             fallback_effect_launches: 0,
@@ -4698,6 +5349,12 @@ impl ReplayController {
             binding_revision: BindingRevision(0),
             tape_resources: BTreeMap::new(),
             binding_refresh_pending: false,
+            window_effects_base: MemoryEffects::default(),
+            window_effects: MemoryEffects::default(),
+            g0_observation: None,
+            railgun_shadow: railgun_shadow::RailgunShadow::from_config(),
+            railgun_check: crate::railgun_check::CheckState::from_config().map(Box::new),
+            pm4_generation: 0,
         }
     }
 
@@ -4802,7 +5459,6 @@ impl ReplayController {
         self.auto_lifecycle = auto_lifecycle;
         self.forward_eligible = true;
         self.replay_observation = ReplayObservation::default();
-        self.radiowave_effect_certifications.clear();
         self.radiowave_effect_launches = 0;
         self.fallback_effect_launches = 0;
         self.unknown_effect_launches = 0;
@@ -4816,6 +5472,10 @@ impl ReplayController {
         self.binding_revision = BindingRevision(0);
         self.tape_resources.clear();
         self.binding_refresh_pending = false;
+        self.window_effects = MemoryEffects::default();
+        if let Some(shadow) = self.railgun_shadow.as_mut() {
+            shadow.reset();
+        }
     }
 
     /// Drop a prepared route after a model-owned allocation/geometry bucket
@@ -4963,6 +5623,52 @@ impl ReplayController {
         self.state == ReplayState::RecordingWarmup && self.forward_eligible
     }
 
+    /// Start the G0 eager arm (railgun design §5 G0). Launches through the
+    /// recorder funnels are observed (kernel, geometry, exact kernarg bytes)
+    /// while [`Self::is_recording`] stays false, so every recording-dependent
+    /// predicate takes its eager branch. Refused while a recording is live.
+    pub fn begin_g0_observation(&mut self) -> Result<(), &'static str> {
+        if self.is_recording() {
+            return Err("G0 observation cannot overlap a replay recording");
+        }
+        if self.g0_observation.is_some() {
+            return Err("G0 observation is already active");
+        }
+        self.g0_observation = Some(Vec::new());
+        Ok(())
+    }
+
+    #[inline]
+    pub fn is_g0_observing(&self) -> bool {
+        self.g0_observation.is_some()
+    }
+
+    pub(crate) fn observe_g0_launch(
+        &mut self,
+        kernel: &str,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_mem: u32,
+        kernarg: &[u8],
+    ) {
+        if let Some(launches) = self.g0_observation.as_mut() {
+            launches.push(G0Launch {
+                kernel: kernel.to_owned(),
+                grid,
+                block,
+                shared_mem,
+                kernarg: kernarg.to_vec(),
+            });
+        }
+    }
+
+    /// Close the G0 eager arm and return the observed launches.
+    pub fn finish_g0_observation(&mut self) -> Result<Vec<G0Launch>, &'static str> {
+        self.g0_observation
+            .take()
+            .ok_or("no G0 observation is active")
+    }
+
     /// Apply the model's one-shot plain-AR eligibility decision to this
     /// forward. Speculative/MTP re-seed and verify calls must neither populate
     /// the plain-AR capture nor route its prepared replay.
@@ -5015,13 +5721,10 @@ impl ReplayController {
                 continue;
             }
             let artifact = launch.artifact.as_ref().ok_or_else(|| {
-                format!("captured kernel {:?} has no owning HSACO", launch.kernel)
+                format!("captured kernel {:?} has no owning code object", launch.kernel)
             })?;
-            let bytes: Arc<[u8]> = std::fs::read(artifact)
-                .map_err(|error| format!("read {}: {error}", artifact.display()))?
-                .into();
-            let executable = Executable::load(&device, bytes)
-                .map_err(|error| format!("load {}: {error}", artifact.display()))?;
+            let executable = Executable::load(&device, artifact.image().clone())
+                .map_err(|error| format!("load {artifact}: {error}"))?;
             let symbol = format!("{}.kd", launch.kernel);
             let kernel = executable
                 .kernel(&symbol)
@@ -5066,33 +5769,58 @@ impl ReplayController {
                 self.recorded.len()
             ));
         }
+        self.refuse_effect_incomplete_window()?;
+        // The linear AQL graph submits every recorded kernarg verbatim; only the
+        // GDN requant frame is patched per replay. A position-derived field or
+        // grid would replay at its capture-time value, so such a tape is the
+        // PM4 transport's (which applies every binding) or HIP's.
+        if let Some((dispatch, binding)) = self
+            .retained_kernarg_bindings(prefix)?
+            .into_iter()
+            .find(|(_, binding)| !matches!(binding, ReplayKernargBinding::GdnFrameU32 { .. }))
+        {
+            return Err(format!(
+                "linear AQL cannot rebind the position-derived kernarg at offset {} of dispatch \
+                 {dispatch} ({}); the tape needs the PM4 transport",
+                binding.offset(),
+                self.recorded[dispatch].kernel
+            ));
+        }
+        if let Some(launch) = self.recorded[..prefix]
+            .iter()
+            .find(|launch| launch.grid_binding.is_some())
+        {
+            return Err(format!(
+                "linear AQL cannot rebind the position-derived grid of {}; the tape needs the \
+                 PM4 transport",
+                launch.kernel
+            ));
+        }
         let runtime = Runtime::initialize(load_symbols().map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
         let device = runtime
             .select_gpu(GpuSelector::Ordinal(device_ordinal))
             .map_err(|error| error.to_string())?;
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
-        let mut executables = BTreeMap::<PathBuf, Executable>::new();
-        let mut kernels = BTreeMap::<(PathBuf, String), Kernel>::new();
+        let mut executables = BTreeMap::<CodeObjectId, Executable>::new();
+        let mut kernels = BTreeMap::<(CodeObjectId, String), Kernel>::new();
         let mut dispatches = Vec::with_capacity(prefix);
         let mut dynamic_gdn_frames = Vec::new();
 
         for launch in self.recorded.iter().take(prefix) {
-            let artifact = launch.artifact.clone().ok_or_else(|| {
-                format!("captured kernel {:?} has no owning HSACO", launch.kernel)
+            let artifact = launch.artifact.as_ref().ok_or_else(|| {
+                format!("captured kernel {:?} has no owning code object", launch.kernel)
             })?;
-            if !executables.contains_key(&artifact) {
-                let bytes: Arc<[u8]> = std::fs::read(&artifact)
-                    .map_err(|error| format!("read {}: {error}", artifact.display()))?
-                    .into();
-                let executable = Executable::load(&device, bytes)
-                    .map_err(|error| format!("load {}: {error}", artifact.display()))?;
-                executables.insert(artifact.clone(), executable);
+            let id = artifact.id();
+            if !executables.contains_key(&id) {
+                let executable = Executable::load(&device, artifact.image().clone())
+                    .map_err(|error| format!("load {artifact}: {error}"))?;
+                executables.insert(id, executable);
             }
             let symbol = format!("{}.kd", launch.kernel);
-            let key = (artifact.clone(), symbol.clone());
+            let key = (id, symbol.clone());
             if !kernels.contains_key(&key) {
-                let kernel = executables[&artifact]
+                let kernel = executables[&id]
                     .kernel(&symbol)
                     .map_err(|error| format!("resolve {symbol}: {error}"))?;
                 kernels.insert(key.clone(), kernel);
@@ -5108,6 +5836,7 @@ impl ReplayController {
                 workgroup[axis] = u16::try_from(value)
                     .map_err(|_| format!("{symbol}: workgroup dimension {value} exceeds u16"))?;
             }
+            check_prepared_grid(device.name(), &symbol, launch.grid)?;
             let geometry = LaunchGeometry::from_hip_workgroups(launch.grid, workgroup)
                 .map_err(|error| format!("{symbol}: {error}"))?;
             let dispatch = RecordedDispatch::new(0, kernel, geometry, kernarg)
@@ -5306,14 +6035,15 @@ impl ReplayController {
                 self.recorded.len()
             ));
         }
+        self.refuse_effect_incomplete_window()?;
         let runtime = Runtime::initialize(load_symbols().map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
         let device = runtime
             .select_gpu(GpuSelector::Ordinal(device_ordinal))
             .map_err(|error| error.to_string())?;
         let pm4_architecture = Pm4Architecture::from_device(&device)?;
-        if dispatch_profile && pm4_architecture != Pm4Architecture::Gfx12 {
-            return Err("per-dispatch PM4 profiling currently requires gfx12".to_owned());
+        if dispatch_profile && pm4_architecture == Pm4Architecture::Gfx10 {
+            return Err("per-dispatch PM4 profiling requires gfx11 or gfx12".to_owned());
         }
         let dispatch_initiator_policy =
             gfx10_dispatch_initiator_policy(pm4_architecture, device.name());
@@ -5324,8 +6054,8 @@ impl ReplayController {
         let entry_acquire_policy = gfx1151_entry_acquire_policy(pm4_architecture, device.name());
         let pool = KernargPool::discover(&device).map_err(|error| error.to_string())?;
         let kernarg_pool = retained_kernarg_pool(&device, &pool, entry_acquire_policy);
-        let mut executables = BTreeMap::<PathBuf, Executable>::new();
-        let mut resolved = BTreeMap::<(PathBuf, String), Kernel>::new();
+        let mut executables = BTreeMap::<CodeObjectId, Executable>::new();
+        let mut resolved = BTreeMap::<(CodeObjectId, String), Kernel>::new();
         let mut kernels = Vec::with_capacity(prefix);
         let mut kernargs = Vec::with_capacity(prefix);
         let mut geometries = Vec::with_capacity(prefix);
@@ -5334,21 +6064,19 @@ impl ReplayController {
         let mut dynamic_grids = Vec::new();
 
         for launch in self.recorded.iter().take(prefix) {
-            let artifact = launch.artifact.clone().ok_or_else(|| {
-                format!("captured kernel {:?} has no owning HSACO", launch.kernel)
+            let artifact = launch.artifact.as_ref().ok_or_else(|| {
+                format!("captured kernel {:?} has no owning code object", launch.kernel)
             })?;
-            if !executables.contains_key(&artifact) {
-                let bytes: Arc<[u8]> = std::fs::read(&artifact)
-                    .map_err(|error| format!("read {}: {error}", artifact.display()))?
-                    .into();
-                let executable = Executable::load(&device, bytes)
-                    .map_err(|error| format!("load {}: {error}", artifact.display()))?;
-                executables.insert(artifact.clone(), executable);
+            let id = artifact.id();
+            if !executables.contains_key(&id) {
+                let executable = Executable::load(&device, artifact.image().clone())
+                    .map_err(|error| format!("load {artifact}: {error}"))?;
+                executables.insert(id, executable);
             }
             let symbol = format!("{}.kd", launch.kernel);
-            let key = (artifact.clone(), symbol.clone());
+            let key = (id, symbol.clone());
             if !resolved.contains_key(&key) {
-                let kernel = executables[&artifact]
+                let kernel = executables[&id]
                     .kernel(&symbol)
                     .map_err(|error| format!("resolve {symbol}: {error}"))?;
                 resolved.insert(key.clone(), kernel);
@@ -5399,6 +6127,7 @@ impl ReplayController {
                     // Keep launch.grid replaced for geometry; dynamic_grids stores prepared_grid.
                 }
             }
+            check_prepared_grid(device.name(), &symbol, geometry_grid)?;
             let geometry = LaunchGeometry::from_hip_workgroups(geometry_grid, workgroup)
                 .map_err(|error| format!("{symbol}: {error}"))?;
             device
@@ -5451,7 +6180,7 @@ impl ReplayController {
                 .recorded
                 .iter()
                 .take(prefix)
-                .filter_map(|launch| launch.artifact.as_ref())
+                .filter_map(|launch| launch.artifact.as_ref().map(|artifact| artifact.id()))
                 .collect::<BTreeSet<_>>();
             let vmem_launches = self
                 .recorded
@@ -5618,6 +6347,8 @@ impl ReplayController {
             let mut resource_frontier = ResourceFrontier::default();
             let mut dependency_waits = 0usize;
             let mut dependency_acquires = 0usize;
+            let shadow_on = self.railgun_shadow.is_some();
+            let mut shadow_decisions = Vec::new();
             for (position, index) in order.iter().copied().enumerate() {
                 let mut boundary = Pm4DispatchBoundary::default();
                 if position != 0 {
@@ -5682,8 +6413,24 @@ impl ReplayController {
                         );
                         commands.acquire_inter_node(gfx12_gcr_trim, boundary.acquire_vmem);
                     }
+                    if shadow_on {
+                        shadow_decisions.push(railgun::shadow::RedlineDecision {
+                            effects: redline_effect_source(current_launch),
+                            resource_independent: resources_independent,
+                            name_acquire: self
+                                .pm4_mid_acquire_policy
+                                .acquire_between(previous, current),
+                            pre_dispatch_name: gfx12_pre_dispatch_acquire,
+                        });
+                    }
                 } else {
                     resource_frontier.advance(&self.recorded[index], false);
+                    if shadow_on {
+                        shadow_decisions.push(railgun::shadow::RedlineDecision {
+                            effects: redline_effect_source(&self.recorded[index]),
+                            ..Default::default()
+                        });
+                    }
                 }
                 commands
                     .dispatch(
@@ -5763,6 +6510,81 @@ impl ReplayController {
                     }
                 }
             }
+            // railgun M1 shadow: prepare railgun's lowering of the same tape
+            // and diff it against this one. Nothing railgun builds is
+            // submitted; the route below is unchanged.
+            if let Some(shadow) = self.railgun_shadow.as_mut() {
+                let skip = if pm4_architecture != Pm4Architecture::Gfx12 {
+                    Some("railgun M1 authors gfx12 tapes only")
+                } else if reorder_window.is_some() {
+                    Some("the single-IB reorder permutes the recorded order")
+                } else if dispatch_profile {
+                    Some("per-dispatch profile tape")
+                } else {
+                    None
+                };
+                match skip {
+                    Some(reason) if shadow.backend_railgun() => {
+                        return Err(format!("railgun backend refused: {reason}"));
+                    }
+                    Some(reason) => eprintln!("[railgun] shadow skipped: {reason}"),
+                    None => {
+                        let register_policy = self.pm4_register_policy;
+                        let new_commands = || {
+                            Pm4Commands::new_with_dependency(
+                                pm4_architecture,
+                                register_policy,
+                                dispatch_initiator_policy,
+                                dispatch_interleave,
+                                resource_limits_policy,
+                                LegacyDependencyMode::CsPartialFlush,
+                            )
+                        };
+                        let kernarg_images = kernargs
+                            .iter_mut()
+                            .map(|buffer| {
+                                let address = buffer.address() as usize as u64;
+                                (buffer.as_mut_bytes().to_vec(), address)
+                            })
+                            .collect();
+                        let resources = self
+                            .tape_resources
+                            .iter()
+                            .map(|(&(base, bytes), id)| (id.index(), (base, bytes)))
+                            .collect();
+                        let executable = shadow.compare(
+                            railgun_shadow::RedlinePrepared {
+                                device_name: device.name(),
+                                launches: recorded,
+                                ib: commands.gfx12_dwords().unwrap_or(&[]),
+                                kernels: &kernels,
+                                kernargs: kernarg_images,
+                                decisions: std::mem::take(&mut shadow_decisions),
+                                word_patches: &dynamic_kernarg_bindings,
+                                grid_patches: &dynamic_grids,
+                                resources,
+                            },
+                            railgun_shadow::Transport {
+                                pool: &pool,
+                                new_commands: &new_commands,
+                                gcr_trim: gfx12_gcr_trim,
+                                entry_policy: entry_acquire_policy,
+                            },
+                        );
+                        // HIPFIRE_RAILGUN_BACKEND=railgun (M2): the prepared
+                        // tape runs railgun's lowering; a refusal fails the
+                        // prepare closed, never back to this planner's IB.
+                        match executable {
+                            None => {}
+                            Some(Ok(railgun_commands)) => commands = railgun_commands,
+                            Some(Err(reason)) => {
+                                return Err(format!("railgun backend refused: {reason}"))
+                            }
+                        }
+                    }
+                }
+            }
+            let command_dwords = commands.len_dwords();
             // HIPFIRE_REDLINE_IB_POOL=vmem: allocate the retained indirect
             // buffer from a GPU-agent (VRAM) pool so the command processor
             // fetches the tape from VRAM instead of re-reading it over the
@@ -5796,6 +6618,16 @@ impl ReplayController {
             )?;
             (PreparedPm4Graph::Single(graph), command_dwords)
         } else {
+            if self
+                .railgun_shadow
+                .as_ref()
+                .is_some_and(railgun_shadow::RailgunShadow::backend_railgun)
+            {
+                return Err(
+                    "railgun backend refused: multi-queue PM4 tapes are not lowered by railgun"
+                        .to_owned(),
+                );
+            }
             let min_parallel_width = pm4_min_parallel_width_from_config();
             let min_parallel_workgroups = pm4_min_parallel_workgroups_from_config();
             let max_parallel_phases = pm4_max_parallel_phases_from_config();
@@ -6053,6 +6885,13 @@ impl ReplayController {
             self.binding_revision.0,
             backlog.join(" "),
         );
+        self.pm4_generation += 1;
+        let bound_exempt_ranges = bound_exempt_kernarg_ranges(
+            &self.recorded,
+            prefix,
+            &dynamic_kernarg_bindings,
+            &dynamic_gdn_frames,
+        );
         self.prepared_pm4 = Some(PreparedPm4Replay {
             graph,
             _kernels: kernels,
@@ -6070,6 +6909,7 @@ impl ReplayController {
             dispatch_boundaries: dispatch_profile.then_some(dispatch_boundaries),
             prepared_max_position: self.prepared_max_position,
             bound_explicit_lens,
+            bound_exempt_ranges,
             encoded_revision: self.binding_revision,
         });
         self.state = ReplayState::Ready;
@@ -6152,6 +6992,37 @@ impl ReplayController {
         self.observe_replay_result(position, result)
     }
 
+    /// The HIP twin's inputs (railgun check mode, design §2.4): each prepared
+    /// dispatch's kernarg bytes exactly as the last PM4 replay submitted them
+    /// (bindings already applied for that position). Refused while the tape
+    /// patches grids, which the twin would have to re-derive.
+    pub(crate) fn prepared_pm4_submitted_kernargs(&mut self) -> Result<Vec<Vec<u8>>, String> {
+        let prepared = self.prepared_pm4.as_mut().ok_or("no prepared PM4 replay")?;
+        if !prepared.dynamic_grids.is_empty() {
+            return Err(format!(
+                "{} dynamic grid patches",
+                prepared.dynamic_grids.len()
+            ));
+        }
+        Ok(prepared
+            .kernargs
+            .iter_mut()
+            .map(|k| k.as_mut_bytes().to_vec())
+            .collect())
+    }
+
+    /// Generation of the prepared PM4 program (see `pm4_generation`).
+    pub(crate) fn prepared_pm4_generation(&self) -> u64 {
+        self.pm4_generation
+    }
+
+    /// The prepared railgun program's surfaces (`None` without the shadow).
+    pub(crate) fn railgun_program_surfaces(&self) -> Option<railgun_shadow::ProgramSurfaces> {
+        self.railgun_shadow
+            .as_ref()
+            .and_then(|s| s.surfaces().cloned())
+    }
+
     pub fn prepared_pm4_dispatch_boundaries(&self) -> Option<&[Pm4DispatchBoundary]> {
         self.prepared_pm4
             .as_ref()
@@ -6225,15 +7096,27 @@ impl ReplayController {
         Ok(())
     }
 
+    /// Record whether the loaded model owns CPU-executed (host) weights. Set once
+    /// per load from the resolved placement; cleared on unload.
+    pub fn set_host_cpu_weights(&mut self, on: bool) {
+        self.host_cpu_weights = on;
+    }
+
     /// Start one explicitly delimited prefill or decode capture. This clears
     /// only the prior launch sequence; validation observations and the backend
     /// request remain intact.
     pub fn begin_capture(&mut self) -> Result<(), &'static str> {
+        if self.host_cpu_weights {
+            return Err("the model owns CPU-executed (host) weights");
+        }
         match self.state {
             ReplayState::Hip => return Err("replay backend is disabled"),
             ReplayState::Fallback => return Err("replay controller is in sticky fallback"),
             ReplayState::Ready => return Err("cannot capture after a prepared plan is installed"),
             _ => {}
+        }
+        if self.g0_observation.is_some() {
+            return Err("cannot capture during a G0 observation");
         }
         self.recorded.clear();
         self.radiowave_effect_launches = 0;
@@ -6248,6 +7131,11 @@ impl ReplayController {
         self.binding_revision = BindingRevision(0);
         self.tape_resources.clear();
         self.binding_refresh_pending = false;
+        self.window_effects_base = memory_effects::snapshot();
+        self.window_effects = MemoryEffects::default();
+        if let Some(shadow) = self.railgun_shadow.as_mut() {
+            shadow.reset();
+        }
         self.state = ReplayState::RecordingWarmup;
         Ok(())
     }
@@ -6258,6 +7146,7 @@ impl ReplayController {
         if self.state != ReplayState::RecordingWarmup {
             return Err("no replay capture is active");
         }
+        self.window_effects = memory_effects::snapshot().since(self.window_effects_base);
         let summary = self.capture_summary();
         self.state = if self.certified_speedups.len() >= 2 {
             ReplayState::ShadowValidated
@@ -6265,6 +7154,34 @@ impl ReplayController {
             ReplayState::Captured
         };
         Ok(summary)
+    }
+
+    /// The memory operations issued on this thread inside the open capture
+    /// window, or inside the last closed one.
+    pub fn capture_window_effects(&self) -> MemoryEffects {
+        if self.state == ReplayState::RecordingWarmup {
+            memory_effects::snapshot().since(self.window_effects_base)
+        } else {
+            self.window_effects
+        }
+    }
+
+    /// Refuse to prepare an automatic forward body whose window issued a device
+    /// copy, readback or memset: the tape replays dispatches only, so that
+    /// state would be missing on every replay. Every adapter treats a prepare
+    /// error as sticky fallback, so the route runs on HIP. Manual captures
+    /// (benchmarks, speculative verify bodies) delimit windows spanning several
+    /// forwards and keep their own contracts.
+    fn refuse_effect_incomplete_window(&self) -> Result<(), String> {
+        let effects = self.capture_window_effects();
+        if self.auto_lifecycle && !effects.replayable() {
+            return Err(format!(
+                "effect-incomplete capture: {} device copy(ies), {} readback(s) and {} \
+                 memset(s) inside the window are state the tape cannot replay",
+                effects.dtod, effects.dtoh, effects.memset
+            ));
+        }
+        Ok(())
     }
 
     pub fn capture_summary(&self) -> ReplayCaptureSummary {
@@ -6461,43 +7378,39 @@ impl ReplayController {
         Ok(count)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_hip_launch_typed_bound(
         &mut self,
         hip: &HipRuntime,
         kernel: &str,
-        artifact: Option<PathBuf>,
+        artifact: Option<RecordedArtifact>,
         grid: [u32; 3],
         block: [u32; 3],
         shared_mem: u32,
         kernarg: &[u8],
         grid_binding: Option<ReplayGridBinding>,
         declared_kernarg_bindings: &[ReplayKernargBinding],
+        compiler: Option<&crate::compiler::KernelCompiler>,
+        declared_words: &[railgun::kernel::DeclaredWord],
     ) {
         if !self.is_recording() {
             return;
         }
-        let certified_effects = artifact.as_ref().and_then(|artifact| {
-            if !self.radiowave_effect_certifications.contains_key(artifact) {
-                let certification = load_radiowave_certification(artifact);
-                self.radiowave_effect_certifications
-                    .insert(artifact.clone(), certification);
-            }
-            self.radiowave_effect_certifications
-                .get(artifact)
-                .and_then(Option::as_ref)
-                .and_then(|certification| certification.argument_effects(kernel))
-                .map(|effects| {
-                    effects
-                        .into_iter()
-                        .map(|(offset, access)| match access {
-                            KernelArgumentAccess::ReadOnly => read(offset),
-                            KernelArgumentAccess::WriteOnly | KernelArgumentAccess::ReadWrite => {
-                                write(offset)
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                })
-        });
+        let certified_effects = artifact
+            .as_ref()
+            .and_then(|artifact| artifact.radiowave())
+            .and_then(|certification| certification.argument_effects(kernel))
+            .map(|effects| {
+                effects
+                    .into_iter()
+                    .map(|(offset, access)| match access {
+                        KernelArgumentAccess::ReadOnly => read(offset),
+                        KernelArgumentAccess::WriteOnly | KernelArgumentAccess::ReadWrite => {
+                            write(offset)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            });
         let certified = certified_effects.is_some();
         let accesses =
             recorded_resource_accesses(hip, kernel, kernarg, certified_effects.as_deref());
@@ -6512,7 +7425,9 @@ impl ReplayController {
         // tape-global `ResourceId` now, while the allocations are live. Any
         // unresolvable slot (or unknown kernel) leaves the launch untyped on
         // the raw snapshot path — never a partial slot set.
-        let binding_layout = self.build_binding_layout(hip, kernel, kernarg, certified_effects.as_deref());
+        let binding_layout =
+            self.build_binding_layout(hip, kernel, kernarg, certified_effects.as_deref());
+        let before = self.recorded.len();
         self.record_hip_launch_with_accesses(
             kernel,
             artifact,
@@ -6525,13 +7440,19 @@ impl ReplayController {
             accesses,
             binding_layout,
         );
+        if self.recorded.len() > before {
+            if let Some(shadow) = self.railgun_shadow.as_mut() {
+                let artifact = self.recorded.last().and_then(|launch| launch.artifact.as_ref()).map(|artifact| artifact.id());
+                shadow.observe(hip, compiler, kernel, artifact, grid, block, shared_mem, kernarg, declared_words);
+            }
+        }
     }
 
     #[cfg(test)]
     fn record_hip_launch(
         &mut self,
         kernel: &str,
-        artifact: Option<PathBuf>,
+        artifact: Option<RecordedArtifact>,
         grid: [u32; 3],
         block: [u32; 3],
         shared_mem: u32,
@@ -6553,7 +7474,7 @@ impl ReplayController {
     fn record_hip_launch_with_accesses(
         &mut self,
         kernel: &str,
-        artifact: Option<PathBuf>,
+        artifact: Option<RecordedArtifact>,
         grid: [u32; 3],
         block: [u32; 3],
         shared_mem: u32,
@@ -6756,7 +7677,9 @@ impl ReplayController {
             .as_mut()
             .expect("prepared PM4 route checked above");
         if prepared.bound_explicit_lens.len() != prepared.kernargs.len() {
-            return Err("retained PM4 binding cache disagrees with prepared kernarg count".to_owned());
+            return Err(
+                "retained PM4 binding cache disagrees with prepared kernarg count".to_owned(),
+            );
         }
         for (index, kernarg) in prepared.kernargs.iter_mut().enumerate() {
             let explicit_len = prepared.bound_explicit_lens[index];
@@ -6766,8 +7689,12 @@ impl ReplayController {
             let Some(layout) = launch.binding_layout.as_ref() else {
                 continue;
             };
-            let encoded =
-                encode_bound_kernarg(&launch.kernarg, layout, &self.replay_bindings, &launch.kernel)?;
+            let encoded = encode_bound_kernarg(
+                &launch.kernarg,
+                layout,
+                &self.replay_bindings,
+                &launch.kernel,
+            )?;
             let bytes = kernarg.as_mut_bytes();
             if explicit_len > encoded.len() || explicit_len > bytes.len() {
                 return Err(format!(
@@ -6811,6 +7738,245 @@ impl ReplayController {
                 self.tape_resources.len(),
                 reencoded,
                 grown
+            );
+        }
+        Ok(BindingRefreshReport::Refreshed {
+            resources: self.tape_resources.len(),
+            reencoded,
+            revision: next_revision,
+        })
+    }
+
+    fn unchanged_relocation_report(&self) -> BindingRefreshReport {
+        BindingRefreshReport::Refreshed {
+            resources: self.tape_resources.len(),
+            reencoded: 0,
+            revision: self.binding_revision,
+        }
+    }
+
+    /// Typed VMM relocation: rebind the tape resources that lie inside
+    /// `moves` to their new bases without re-recording or re-preparing.
+    ///
+    /// `NoRoute` when nothing is recorded or prepared. `Err` (state untouched)
+    /// when a refresh is pending, a move set is invalid, a moved resource is
+    /// not fully mapped at its new location, an untyped launch (no pointer
+    /// slots) has unknown accesses or touches a moved range, or an AQL
+    /// prepared replay references a moved range. Resources outside every move
+    /// are untouched and never probed. No HIP query is made: the caller
+    /// (`Gpu::relocate_qsa_resources`) already validated the new owners.
+    ///
+    /// All changes are staged first and committed together at
+    /// `binding_revision.next()`: rebound ids, rekeyed `tape_resources`, the
+    /// prepared PM4 kernarg slot bytes (non-slot bytes are gated to stay
+    /// identical; the indirect buffer, prepared generation and kernarg
+    /// allocation addresses never change), `encoded_revision`, the recorded
+    /// kernarg snapshots (HIP oracle) and the recorded access bases. When no
+    /// tape resource lies in any move the report carries the current revision
+    /// and `reencoded: 0`, and nothing changes (the revision is not bumped).
+    /// `reencoded` counts rewritten prepared PM4 segments, or rewritten
+    /// recorded snapshots when no PM4 route is installed.
+    pub fn relocate_resources(
+        &mut self,
+        _hip: &HipRuntime,
+        moves: &[VmmResourceMove],
+    ) -> Result<BindingRefreshReport, String> {
+        self.relocate_bindings(moves)
+    }
+
+    fn relocate_bindings(
+        &mut self,
+        moves: &[VmmResourceMove],
+    ) -> Result<BindingRefreshReport, String> {
+        if self.recorded.is_empty() && self.prepared.is_none() && self.prepared_pm4.is_none() {
+            return Ok(BindingRefreshReport::NoRoute);
+        }
+        if self.binding_refresh_pending {
+            return Err(
+                "cannot relocate VMM resources while a scratch-growth binding refresh is pending"
+                    .to_owned(),
+            );
+        }
+        if moves.is_empty() {
+            return Ok(self.unchanged_relocation_report());
+        }
+        let ranges = relocation_ranges(moves)?;
+        for launch in &self.recorded {
+            if launch.binding_layout.is_none() {
+                if let Some(hazard) = untyped_launch_relocation_hazard(launch, &ranges) {
+                    return Err(hazard);
+                }
+            }
+        }
+        let plan = plan_relocation(&self.tape_resources, moves)?;
+        if self.prepared.is_some() {
+            let touched = !plan.is_empty()
+                || self.recorded.iter().any(|launch| {
+                    launch.accesses.as_ref().is_some_and(|accesses| {
+                        accesses.iter().any(|access| {
+                            !matches!(
+                                classify_range(
+                                    &ranges,
+                                    access.allocation_base,
+                                    access.allocation_base.saturating_add(access.allocation_bytes),
+                                ),
+                                RangeMatch::Outside
+                            )
+                        })
+                    })
+                });
+            if touched {
+                return Err(
+                    "prepared AQL replay holds raw kernargs that reference a relocated VMM range"
+                        .to_owned(),
+                );
+            }
+        }
+        if plan.is_empty() {
+            return Ok(self.unchanged_relocation_report());
+        }
+        let next_revision = self.binding_revision.next();
+        let moved: BTreeMap<ResourceId, PlannedRelocation> =
+            plan.iter().map(|planned| (planned.resource, *planned)).collect();
+
+        // Stage 1: every tape resource rebinds at the next revision (moved
+        // ones at their new base), like the post-growth refresh.
+        let mut staged_bindings: Vec<(ResourceId, ResourceBinding)> =
+            Vec::with_capacity(self.tape_resources.len());
+        for (&(base, size), &id) in &self.tape_resources {
+            let current = self.replay_bindings.resource(id).ok_or_else(|| {
+                format!("tape resource {id:?} has no bound resource; route must re-capture")
+            })?;
+            if current.base().as_ptr() as usize as u64 != base || current.size() != size {
+                return Err(format!(
+                    "tape resource {id:?} binding disagrees with its key {base:#x}+{size:#x}"
+                ));
+            }
+            let target = moved.get(&id).map_or(base, |planned| planned.new_key.0);
+            // SAFETY: a moved resource's new range is mapped for `size` bytes
+            // by the new VMM owner (`plan_relocation` coverage check, owners
+            // validated by the caller); an unmoved one keeps its live base.
+            // The revision bumps with this relocation per the
+            // `ResourceBinding::new` contract.
+            let binding = unsafe {
+                ResourceBinding::new(
+                    target as usize as *mut std::ffi::c_void,
+                    size,
+                    next_revision,
+                    current.policy(),
+                )
+            }
+            .map_err(|_| format!("tape resource {id:?} cannot rebind after relocation"))?;
+            staged_bindings.push((id, binding));
+        }
+
+        // Stage 2: rewritten kernarg snapshots and accesses per launch.
+        struct StagedLaunch {
+            index: usize,
+            kernarg: Option<Vec<u8>>,
+            accesses: Option<Vec<RecordedResourceAccess>>,
+        }
+        let mut staged: Vec<StagedLaunch> = Vec::new();
+        for (index, launch) in self.recorded.iter().enumerate() {
+            let Some(layout) = launch.binding_layout.as_ref() else {
+                continue;
+            };
+            let kernarg = relocate_kernarg_slots(&launch.kernel, &launch.kernarg, layout, &moved)?;
+            let accesses = match launch.accesses.as_deref() {
+                Some(accesses) => relocate_accesses(&launch.kernel, accesses, &ranges)?,
+                None => None,
+            };
+            if kernarg.is_some() || accesses.is_some() {
+                staged.push(StagedLaunch {
+                    index,
+                    kernarg,
+                    accesses,
+                });
+            }
+        }
+
+        // Stage 3: gate every prepared PM4 segment before touching any byte.
+        if let Some(prepared) = self.prepared_pm4.as_mut() {
+            if prepared.bound_explicit_lens.len() != prepared.kernargs.len()
+                || prepared.bound_exempt_ranges.len() != prepared.kernargs.len()
+            {
+                return Err(
+                    "retained PM4 binding cache disagrees with prepared kernarg count".to_owned(),
+                );
+            }
+            for entry in &staged {
+                let Some(encoded) = entry.kernarg.as_deref() else {
+                    continue;
+                };
+                if entry.index >= prepared.kernargs.len() {
+                    continue;
+                }
+                let kernel = &self.recorded[entry.index].kernel;
+                let explicit_len = prepared.bound_explicit_lens[entry.index];
+                let bytes = prepared.kernargs[entry.index].as_mut_bytes();
+                if explicit_len > encoded.len() || explicit_len > bytes.len() {
+                    return Err(format!(
+                        "{kernel}: explicit prefix {explicit_len} exceeds segment ({} vs {})",
+                        encoded.len(),
+                        bytes.len()
+                    ));
+                }
+                verify_non_slot_bytes_identical(
+                    kernel,
+                    &bytes[..explicit_len],
+                    &encoded[..explicit_len],
+                    &prepared.bound_exempt_ranges[entry.index],
+                )?;
+            }
+        }
+
+        // Commit: nothing below can fail.
+        for (id, binding) in staged_bindings {
+            self.replay_bindings.bind_resource(id, binding);
+        }
+        for planned in &plan {
+            self.tape_resources.remove(&planned.old_key);
+        }
+        for planned in &plan {
+            self.tape_resources.insert(planned.new_key, planned.resource);
+        }
+        self.binding_revision = next_revision;
+        let mut prepared_rewritten = 0usize;
+        let mut snapshots_rewritten = 0usize;
+        for entry in staged {
+            let launch = &mut self.recorded[entry.index];
+            if let Some(kernarg) = entry.kernarg {
+                if let Some(prepared) = self.prepared_pm4.as_mut() {
+                    if entry.index < prepared.kernargs.len() {
+                        let explicit_len = prepared.bound_explicit_lens[entry.index];
+                        prepared.kernargs[entry.index].as_mut_bytes()[..explicit_len]
+                            .copy_from_slice(&kernarg[..explicit_len]);
+                        prepared_rewritten += 1;
+                    }
+                }
+                launch.kernarg = kernarg;
+                snapshots_rewritten += 1;
+            }
+            if let Some(accesses) = entry.accesses {
+                launch.accesses = Some(accesses);
+            }
+        }
+        if let Some(prepared) = self.prepared_pm4.as_mut() {
+            prepared.encoded_revision = next_revision;
+        }
+        let reencoded = if self.prepared_pm4.is_some() {
+            prepared_rewritten
+        } else {
+            snapshots_rewritten
+        };
+        if self.route_proof_log {
+            eprintln!(
+                "HIPFIRE_REPLAY_ROUTE_PROOF transport=pm4 revision={} \
+                 event=relocated_resources resources={} moved={} reencoded={}",
+                next_revision.0,
+                self.tape_resources.len(),
+                plan.len(),
+                reencoded
             );
         }
         Ok(BindingRefreshReport::Refreshed {
@@ -7119,8 +8285,12 @@ mod tests {
         snapshot[16..24].copy_from_slice(&base_b.to_ne_bytes());
         snapshot[24..28].copy_from_slice(&0x0000_0007u32.to_ne_bytes());
         let mut issuer = Recorder::new();
-        let resource_a = issuer.resource("fixture-a", 0x1_0000).expect("valid resource");
-        let resource_b = issuer.resource("fixture-b", 0x2_0000).expect("valid resource");
+        let resource_a = issuer
+            .resource("fixture-a", 0x1_0000)
+            .expect("valid resource");
+        let resource_b = issuer
+            .resource("fixture-b", 0x2_0000)
+            .expect("valid resource");
         let mut bindings = ReplayBindings::new();
         // SAFETY: synthetic non-deref'd addresses used only as binding identity
         // in unit tests; sizes match the fixture resources; never launched.
@@ -7223,6 +8393,7 @@ mod tests {
         "fused_rmsnorm_mq_rotate_vecsum_sign_const",
         "fused_rmsnorm_mq_rotate_vecsum_sign_lds",
         "fused_rmsnorm_mq_rotate_wavegrid",
+        "fused_rmsnorm_mq_rotate_awq_wavegrid",
         "rmsnorm_reduce_gfx1100",
         "rotate_with_rms_gfx1100",
         "fused_qkvza_hfq4g256",
@@ -7238,6 +8409,8 @@ mod tests {
         "fused_qkv_mq4g256v2",
         "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100",
         "fused_gate_up_mq4g256v2",
+        "fused_gate_up_mq4g256v2_k5120_gfx1100",
+        "fused_gate_up_mq4g256v2_k5120_gfx1201",
         "fused_sigmoid_alpha_gate_f32",
         "conv1d_silu_split_f32",
         "conv1d_silu_split_qknorm_b256_scalar_prep",
@@ -7256,6 +8429,7 @@ mod tests {
         "qwen35_fa_prep_gfx1151",
         "qwen35_fa_prep_gfx1201",
         "qwen36_27b_fa_prep_gfx1201",
+        "qwen35_fa_prep_kvwrite_gfx1100",
         "mq_rotate_x",
         "gemv_hfq4g256_residual",
         "gemv_hfq4g256_residual_cpol_rt",
@@ -7382,10 +8556,14 @@ mod tests {
         };
         let certifications = BTreeMap::new();
         assert!(!radiowave_vmem_only_consumer(&certifications, &launch));
-        launch.artifact = Some("/missing/kernel.hsaco".into());
+        launch.artifact = Some(std::sync::Arc::new(crate::code_object::CodeObjectArtifact::native_embedded(
+            "m",
+            (b"uncertified" as &'static [u8]).into(),
+            None,
+        )));
         assert!(!radiowave_vmem_only_consumer(&certifications, &launch));
 
-        let artifact = PathBuf::from("/certified/fused_rmsnorm_mq_rotate.hsaco");
+        let artifact = "native:m";
         let manifest = format!(
             r#"{{
                 "schema_version": 3,
@@ -7416,13 +8594,27 @@ mod tests {
                     }}]
                 }}
             }}"#,
-            artifact.display()
+            artifact
         );
-        let certification = CodeObjectCertification::from_json(&[], &manifest).unwrap();
-        let certifications = BTreeMap::from([(artifact.clone(), certification)]);
-        launch.artifact = Some(artifact);
+        let certified = |manifest: Option<&str>| {
+            std::sync::Arc::new(crate::code_object::CodeObjectArtifact::native_embedded("m", (&[] as &'static [u8]).into(), manifest))
+        };
+        // The certification travels with the admitted image, keyed by digest.
+        launch.artifact = Some(certified(Some(&manifest)));
+        let certifications = radiowave_certifications(std::slice::from_ref(&launch), 1);
+        assert_eq!(certifications.len(), 1);
         assert!(radiowave_vmem_only_consumer(&certifications, &launch));
+        assert_eq!(redline_effect_source(&launch), "none", "vmem_only alone declares no argument effects");
         launch.kernel = "unknown_kernel".to_owned();
+        assert!(!radiowave_vmem_only_consumer(&certifications, &launch));
+        // A manifest that does not bind this image's hash certifies nothing.
+        launch.kernel = "fused_rmsnorm_mq_rotate".to_owned();
+        launch.artifact = Some(std::sync::Arc::new(crate::code_object::CodeObjectArtifact::native_embedded(
+            "m",
+            (b"other" as &'static [u8]).into(),
+            Some(&manifest),
+        )));
+        assert!(radiowave_certifications(std::slice::from_ref(&launch), 1).is_empty());
         assert!(!radiowave_vmem_only_consumer(&certifications, &launch));
     }
 
@@ -7977,6 +9169,198 @@ mod tests {
     }
 
     #[test]
+    fn gfx1100_campaign_fusions_keep_padded_replay_contract() {
+        use RecordedAccessMode::{Read, Write};
+        let prep = "qwen35_fa_prep_kvwrite_gfx1100";
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..10 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_f32(0.0);
+        blob.push_f32(0.0);
+        assert_eq!(blob.len(), 88);
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(prep), Some(blob.len()));
+        let modes: Vec<_> = pointer_effects(prep)
+            .expect("folded FA prep contract")
+            .iter()
+            .map(|e| (e.offset, e.mode))
+            .collect();
+        assert_eq!(
+            modes,
+            vec![
+                (0, Read), (8, Write), (16, Write), (24, Write), (32, Read),
+                (40, Write), (48, Write), (56, Read), (64, Read), (72, Read),
+            ]
+        );
+
+        let awq = "fused_rmsnorm_mq_rotate_awq_wavegrid";
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..7 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(2_048);
+        blob.push_f32(0.0);
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(awq), Some(blob.len()));
+        let modes: Vec<_> = pointer_effects(awq)
+            .expect("AWQ wavegrid contract")
+            .iter()
+            .map(|e| (e.offset, e.mode))
+            .collect();
+        assert_eq!(
+            modes,
+            vec![(0, Read), (8, Read), (16, Read), (24, Read), (32, Read), (40, Write), (48, Write)]
+        );
+    }
+
+    #[test]
+    fn gfx1100_fa2_split_verify_keeps_padded_replay_contracts() {
+        use RecordedAccessMode::{Read, Write};
+
+        let preconvert = "attention_fa2_q_preconvert_gfx1100";
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..4 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(0);
+        blob.push_i32(0);
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(preconvert), Some(blob.len()));
+        assert_eq!(
+            pointer_effects(preconvert)
+                .unwrap()
+                .iter()
+                .map(|effect| (effect.offset, effect.mode))
+                .collect::<Vec<_>>(),
+            vec![(0, Read), (8, Write), (16, Read), (24, Read)]
+        );
+
+        let partial = "attention_q8_0_fa2_gqa_partial_gfx1100";
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..5 {
+            blob.push_ptr(std::ptr::null());
+        }
+        for _ in 0..4 {
+            blob.push_i32(0);
+        }
+        blob.push_f32(0.0);
+        blob.push_i32(0);
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(partial), Some(blob.len()));
+        assert_eq!(
+            pointer_effects(partial)
+                .unwrap()
+                .iter()
+                .map(|effect| (effect.offset, effect.mode))
+                .collect::<Vec<_>>(),
+            vec![(0, Read), (8, Read), (16, Read), (24, Write), (32, Read)]
+        );
+
+        let merge = "attention_q8_0_fa2_gqa_merge_gfx1100";
+        let mut blob = hip_bridge::KernargBlob::new();
+        blob.push_ptr(std::ptr::null());
+        blob.push_ptr(std::ptr::null());
+        for _ in 0..4 {
+            blob.push_i32(0);
+        }
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(merge), Some(blob.len()));
+        assert_eq!(
+            pointer_effects(merge)
+                .unwrap()
+                .iter()
+                .map(|effect| (effect.offset, effect.mode))
+                .collect::<Vec<_>>(),
+            vec![(0, Read), (8, Write)]
+        );
+    }
+
+    #[test]
+    fn gfx1100_f16_projection_producers_keep_replay_contracts() {
+        use RecordedAccessMode::{Read, Write};
+
+        let base = "fused_rmsnorm_mq_rotate_f16";
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..5 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(0);
+        blob.push_f32(0.0);
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(base), Some(blob.len()));
+        assert_eq!(
+            pointer_effects(base)
+                .unwrap()
+                .iter()
+                .map(|effect| (effect.offset, effect.mode))
+                .collect::<Vec<_>>(),
+            vec![(0, Read), (8, Read), (16, Read), (24, Read), (32, Write)]
+        );
+
+        let awq = "fused_rmsnorm_mq_rotate_awq_f16";
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..6 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(0);
+        blob.push_f32(0.0);
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(awq), Some(blob.len()));
+        assert_eq!(
+            pointer_effects(awq)
+                .unwrap()
+                .iter()
+                .map(|effect| (effect.offset, effect.mode))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, Read),
+                (8, Read),
+                (16, Read),
+                (24, Read),
+                (32, Read),
+                (40, Write),
+            ]
+        );
+
+        let gate_up = "gemm_gate_up_mq4g256v2_wmma_gfx1100_ldsstage";
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..5 {
+            blob.push_ptr(std::ptr::null());
+        }
+        for _ in 0..4 {
+            blob.push_i32(0);
+        }
+        blob.pad_to(16);
+        assert_eq!(blob.len(), 64);
+        assert_eq!(expected_kernarg_bytes(gate_up), Some(blob.len()));
+        assert_eq!(
+            pointer_effects(gate_up)
+                .unwrap()
+                .iter()
+                .map(|effect| (effect.offset, effect.mode))
+                .collect::<Vec<_>>(),
+            vec![(0, Read), (8, Read), (16, Read), (24, Write), (32, Write)]
+        );
+
+        let copy = "copy_f32_buffer";
+        let mut blob = hip_bridge::KernargBlob::new();
+        blob.push_ptr(std::ptr::null());
+        blob.push_ptr(std::ptr::null());
+        blob.push_i32(0);
+        blob.pad_to(16);
+        assert_eq!(expected_kernarg_bytes(copy), Some(blob.len()));
+        assert_eq!(
+            pointer_effects(copy)
+                .unwrap()
+                .iter()
+                .map(|effect| (effect.offset, effect.mode))
+                .collect::<Vec<_>>(),
+            vec![(0, Write), (8, Read)]
+        );
+    }
+
+    #[test]
     fn gfx1201_qwen36_27b_decode_fusions_keep_padded_replay_contract() {
         use RecordedAccessMode::{Read, Write};
         // Gated norm/MQ rotation launcher: x, z, weight, [awq_scale], signs1,
@@ -8023,7 +9407,15 @@ mod tests {
             .collect();
         assert_eq!(
             modes,
-            vec![(0, Read), (8, Write), (16, Write), (24, Write), (32, Read), (40, Read), (48, Read)]
+            vec![
+                (0, Read),
+                (8, Write),
+                (16, Write),
+                (24, Write),
+                (32, Read),
+                (40, Read),
+                (48, Read)
+            ]
         );
     }
 
@@ -8471,6 +9863,7 @@ mod tests {
         for symbol in [
             "gemm_mixed_moe_grouped_wmma_k2",
             "gemm_mixed_moe_grouped_wmma_gfx12",
+            "gemm_mixed_moe_grouped_wmma_coalesced_gfx1201",
             "gemm_mixed_moe_grouped_wmma_4w_k2",
         ] {
             let mut blob = hip_bridge::KernargBlob::new();
@@ -8809,6 +10202,24 @@ mod tests {
     }
 
     #[test]
+    fn fused_gate_up_mq4v2_k5120_matches_generic_replay_contract() {
+        for candidate in [
+            "fused_gate_up_mq4g256v2_k5120_gfx1100",
+            "fused_gate_up_mq4g256v2_k5120_gfx1201",
+        ] {
+            let baseline = "fused_gate_up_mq4g256v2";
+            assert_eq!(expected_kernarg_bytes(candidate), Some(64));
+            let got = pointer_effects(candidate).unwrap();
+            let want = pointer_effects(baseline).unwrap();
+            assert_eq!(got.len(), want.len());
+            for (got, want) in got.iter().zip(want.iter()) {
+                assert_eq!(got.offset, want.offset);
+                assert_eq!(got.mode, want.mode);
+            }
+        }
+    }
+
+    #[test]
     fn moe_shared_down_and_routed_gate_up_are_independent_siblings() {
         assert!(independent_sibling(
             "gemv_hfq4g256_moe_gate_k8_indexed_k2048_gfx1151",
@@ -9018,6 +10429,15 @@ mod tests {
             gfx1151_resource_limits_policy_from_value(Pm4Architecture::Gfx11, "gfx1151", "invalid",),
             None
         );
+    }
+
+    #[test]
+    fn prepared_grid_rejects_oversized_yz_on_gfx1201_only() {
+        assert!(check_prepared_grid("gfx1201", "k.kd", [7, 65_536, 1]).is_ok());
+        assert!(check_prepared_grid("gfx1201", "k.kd", [1 << 20, 1, 65_536]).is_ok());
+        assert!(check_prepared_grid("gfx1201", "k.kd", [7, 65_537, 1]).is_err());
+        assert!(check_prepared_grid("gfx1201", "k.kd", [7, 1, 65_537]).is_err());
+        assert!(check_prepared_grid("gfx1100", "k.kd", [7, 65_537, 65_537]).is_ok());
     }
 
     #[test]
@@ -9842,6 +11262,36 @@ mod tests {
     }
 
     #[test]
+    fn g0_observation_keeps_the_eager_branch_and_excludes_recording() {
+        let mut controller = ReplayController::new_armed(ReplayBackendRequest::Shadow);
+        controller.begin_g0_observation().unwrap();
+        // The eager arm must not look like a recording to any predicate, and
+        // a recording cannot start underneath it.
+        assert!(!controller.is_recording());
+        assert!(controller.begin_capture().is_err());
+        assert!(controller.begin_g0_observation().is_err());
+        controller.observe_g0_launch("a", [1, 2, 3], [32, 1, 1], 0, &[1, 2]);
+        controller.observe_g0_launch("b", [4, 1, 1], [64, 1, 1], 128, &[3]);
+        // Observed launches never enter the replay tape.
+        assert!(controller.recorded_launches().is_empty());
+        let seen = controller.finish_g0_observation().unwrap();
+        assert_eq!(
+            seen.iter()
+                .map(|l| (l.kernel.as_str(), l.grid, l.shared_mem, l.kernarg.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("a", [1, 2, 3], 0, vec![1, 2]),
+                ("b", [4, 1, 1], 128, vec![3])
+            ]
+        );
+        assert!(controller.finish_g0_observation().is_err());
+
+        controller.begin_capture().unwrap();
+        assert!(controller.is_recording());
+        assert!(controller.begin_g0_observation().is_err());
+    }
+
+    #[test]
     fn manual_capture_is_bounded_and_sequence_stable() {
         let mut controller = ReplayController::new_armed(ReplayBackendRequest::Shadow);
         controller.record_hip_launch("ignored", None, [1; 3], [1; 3], 0, &[]);
@@ -10140,7 +11590,7 @@ mod tests {
             None,
             &declared,
             None,
-        None,
+            None,
         );
         let snapshot = earlier.snapshot_recorded_kernargs();
 
@@ -10158,7 +11608,7 @@ mod tests {
             None,
             &declared,
             None,
-        None,
+            None,
         );
 
         let synthesized = current
@@ -10198,7 +11648,7 @@ mod tests {
             None,
             &declared,
             None,
-        None,
+            None,
         );
         let launches = controller.recorded_launches().to_vec();
         let mut bindings: Vec<(usize, ReplayKernargBinding)> = vec![(
@@ -10212,6 +11662,39 @@ mod tests {
             .expect_err("second owner for one offset must be rejected");
         assert!(error.contains("already has an owner"), "{error}");
         assert_eq!(bindings.len(), 1, "the rejected binding is not pushed");
+    }
+
+    #[test]
+    fn linear_aql_refuses_a_tape_with_position_bindings() {
+        // Linear AQL submits recorded kernargs verbatim. A declared position
+        // field (here a QSA-style length) would replay frozen at the capture
+        // position, so prepare must refuse before any device work and leave the
+        // route unprepared.
+        let declared = [ReplayKernargBinding::PositionPlusU32 {
+            offset: 8,
+            addend: 1,
+        }];
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        for declared in [&[][..], &declared[..]] {
+            controller.record_hip_launch_with_accesses(
+                "qsa_select",
+                None,
+                [1, 1, 1],
+                [256, 1, 1],
+                0,
+                &[0u8; 16],
+                None,
+                declared,
+                None,
+                None,
+            );
+        }
+        controller.finish_capture().unwrap();
+        let error = controller
+            .prepare_linear_aql(0)
+            .expect_err("a position-bound tape must not prepare on linear AQL");
+        assert!(error.contains("offset 8 of dispatch 1"), "{error}");
+        assert_ne!(controller.state(), ReplayState::Ready);
     }
 
     #[test]
@@ -10234,7 +11717,7 @@ mod tests {
             None,
             &declared,
             None,
-        None,
+            None,
         );
         let launches = controller.recorded_launches().to_vec();
         let mut bindings: Vec<(usize, ReplayKernargBinding)> = Vec::new();
@@ -10260,7 +11743,7 @@ mod tests {
                 None,
                 declared,
                 None,
-            None,
+                None,
             );
             replay_sequence_hash(controller.recorded_launches())
         };
@@ -10981,5 +12464,367 @@ mod tests {
         for bad in ["nop:0", "nop:16385", "align:64", "64", "pad:8"] {
             assert!(parse_gfx1201_pm4_pacing(Some(bad)).is_err(), "{bad}");
         }
+    }
+
+    fn relocation_move(old_base: u64, new_base: u64, reserved: usize, mapped: usize) -> VmmResourceMove {
+        VmmResourceMove {
+            old_base: old_base as usize,
+            new_base: new_base as usize,
+            reserved_bytes: reserved,
+            mapped_bytes: mapped,
+            owner_generation: 7,
+        }
+    }
+
+    const FIXTURE_A_BYTES: u64 = 0x1_0000;
+    const FIXTURE_B_BYTES: u64 = 0x2_0000;
+    const RESERVED: usize = 0x20_0000;
+    const MOVED_A: u64 = 0x7f00_0100_0000;
+    const MOVED_A2: u64 = 0x7f00_0200_0000;
+
+    fn fixture_access(base: u64, bytes: u64, at: u64) -> RecordedResourceAccess {
+        RecordedResourceAccess {
+            allocation_base: base,
+            allocation_bytes: bytes,
+            access_base: at,
+            mode: RecordedAccessMode::Read,
+        }
+    }
+
+    /// Controller holding the slice-1 fixture as one typed recorded launch
+    /// with its two tape resources (A at slot 0, B at slot 16).
+    fn relocation_controller() -> (ReplayController, u64, u64) {
+        let (snapshot, layout, bindings, base_a, base_b) = bound_segment_fixture();
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        controller
+            .tape_resources
+            .insert((base_a, FIXTURE_A_BYTES), layout.slots[0].resource);
+        controller
+            .tape_resources
+            .insert((base_b, FIXTURE_B_BYTES), layout.slots[1].resource);
+        controller.replay_bindings = bindings;
+        let mut launch = test_launch("typed_fixture");
+        launch.kernarg = snapshot;
+        launch.binding_layout = Some(layout);
+        launch.accesses = Some(vec![
+            fixture_access(base_a, FIXTURE_A_BYTES, base_a + 0x40),
+            fixture_access(base_b, FIXTURE_B_BYTES, base_b),
+        ]);
+        controller.recorded.push(launch);
+        (controller, base_a, base_b)
+    }
+
+    fn bound_base(controller: &ReplayController, resource: ResourceId) -> (u64, BindingRevision) {
+        let binding = controller.replay_bindings.resource(resource).expect("bound");
+        (binding.base().as_ptr() as usize as u64, binding.revision())
+    }
+
+    #[test]
+    fn relocation_rewrites_only_the_moved_slot_and_bumps_revision() {
+        let (mut controller, base_a, base_b) = relocation_controller();
+        let before = controller.recorded[0].kernarg.clone();
+        let resource_a = controller.recorded[0].binding_layout.as_ref().unwrap().slots[0].resource;
+        let resource_b = controller.recorded[0].binding_layout.as_ref().unwrap().slots[1].resource;
+        let report = controller
+            .relocate_bindings(&[relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize)])
+            .expect("relocates");
+        assert_eq!(
+            report,
+            BindingRefreshReport::Refreshed {
+                resources: 2,
+                reencoded: 1,
+                revision: BindingRevision(1),
+            }
+        );
+        assert_eq!(controller.binding_revision(), BindingRevision(1));
+        let after = &controller.recorded[0].kernarg;
+        assert_eq!(&after[0..8], &(MOVED_A + 0x40).to_ne_bytes());
+        assert_eq!(&after[8..], &before[8..]);
+        assert!(controller.tape_resources.contains_key(&(MOVED_A, FIXTURE_A_BYTES)));
+        assert!(!controller.tape_resources.contains_key(&(base_a, FIXTURE_A_BYTES)));
+        assert!(controller.tape_resources.contains_key(&(base_b, FIXTURE_B_BYTES)));
+        assert_eq!(bound_base(&controller, resource_a), (MOVED_A, BindingRevision(1)));
+        assert_eq!(bound_base(&controller, resource_b), (base_b, BindingRevision(1)));
+        let accesses = controller.recorded[0].accesses.as_ref().unwrap();
+        assert_eq!(accesses[0].allocation_base, MOVED_A);
+        assert_eq!(accesses[0].access_base, MOVED_A + 0x40);
+        assert_eq!(accesses[1], fixture_access(base_b, FIXTURE_B_BYTES, base_b));
+    }
+
+    #[test]
+    fn relocated_recorded_snapshot_equals_encoding_of_new_bindings() {
+        let (mut controller, base_a, _) = relocation_controller();
+        controller
+            .relocate_bindings(&[relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize)])
+            .expect("relocates");
+        let launch = &controller.recorded[0];
+        let encoded = encode_bound_kernarg(
+            &launch.kernarg,
+            launch.binding_layout.as_ref().unwrap(),
+            &controller.replay_bindings,
+            "typed_fixture",
+        )
+        .expect("encodes");
+        assert_eq!(encoded, launch.kernarg);
+        verify_bound_kernarg("typed_fixture", &launch.kernarg, &encoded).expect("verifies");
+    }
+
+    #[test]
+    fn chained_relocation_follows_the_rekeyed_resource() {
+        let (mut controller, base_a, _) = relocation_controller();
+        controller
+            .relocate_bindings(&[relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize)])
+            .expect("A to B");
+        let report = controller
+            .relocate_bindings(&[relocation_move(MOVED_A, MOVED_A2, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize)])
+            .expect("B to C");
+        assert_eq!(
+            report,
+            BindingRefreshReport::Refreshed {
+                resources: 2,
+                reencoded: 1,
+                revision: BindingRevision(2),
+            }
+        );
+        assert_eq!(
+            &controller.recorded[0].kernarg[0..8],
+            &(MOVED_A2 + 0x40).to_ne_bytes()
+        );
+        assert!(controller.tape_resources.contains_key(&(MOVED_A2, FIXTURE_A_BYTES)));
+        assert!(!controller.tape_resources.contains_key(&(MOVED_A, FIXTURE_A_BYTES)));
+    }
+
+    #[test]
+    fn resources_outside_every_move_are_untouched_and_revision_holds() {
+        let (mut controller, _, _) = relocation_controller();
+        let before = controller.recorded[0].kernarg.clone();
+        let keys: Vec<_> = controller.tape_resources.keys().copied().collect();
+        let report = controller
+            .relocate_bindings(&[relocation_move(
+                0x7e00_0000_0000,
+                0x7e00_1000_0000,
+                RESERVED,
+                RESERVED,
+            )])
+            .expect("unrelated move");
+        assert_eq!(
+            report,
+            BindingRefreshReport::Refreshed {
+                resources: 2,
+                reencoded: 0,
+                revision: BindingRevision(0),
+            }
+        );
+        assert_eq!(controller.binding_revision(), BindingRevision(0));
+        assert_eq!(controller.recorded[0].kernarg, before);
+        assert_eq!(controller.tape_resources.keys().copied().collect::<Vec<_>>(), keys);
+    }
+
+    #[test]
+    fn failed_relocation_leaves_every_piece_of_state_unchanged() {
+        let (mut controller, base_a, _) = relocation_controller();
+        // Slot 0 would read 8 bytes at the very end of the mapped coverage.
+        controller.recorded[0].binding_layout.as_mut().unwrap().slots[0].interior_offset = 0xFFFC;
+        let before = controller.recorded[0].clone();
+        let keys: Vec<_> = controller.tape_resources.keys().copied().collect();
+        let error = controller
+            .relocate_bindings(&[relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize)])
+            .expect_err("slot past coverage");
+        assert!(error.contains("mapped"), "{error}");
+        assert_eq!(controller.recorded[0], before);
+        assert_eq!(controller.binding_revision(), BindingRevision(0));
+        assert_eq!(controller.tape_resources.keys().copied().collect::<Vec<_>>(), keys);
+        let resource_a = before.binding_layout.as_ref().unwrap().slots[0].resource;
+        assert_eq!(bound_base(&controller, resource_a), (base_a, BindingRevision(0)));
+    }
+
+    #[test]
+    fn mapped_bytes_smaller_than_the_resource_is_rejected() {
+        let (controller, base_a, _) = relocation_controller();
+        let error = plan_relocation(
+            &controller.tape_resources,
+            &[relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, 0x8000)],
+        )
+        .expect_err("not fully mapped");
+        assert!(error.contains("not fully mapped"), "{error}");
+    }
+
+    #[test]
+    fn plan_rekeys_with_interior_offset_and_orders_by_old_key() {
+        let (controller, base_a, base_b) = relocation_controller();
+        let plan = plan_relocation(
+            &controller.tape_resources,
+            &[
+                relocation_move(base_b, MOVED_A2, FIXTURE_B_BYTES as usize, FIXTURE_B_BYTES as usize),
+                relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize),
+            ],
+        )
+        .expect("plans");
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].old_key, (base_a, FIXTURE_A_BYTES));
+        assert_eq!(plan[0].new_key, (MOVED_A, FIXTURE_A_BYTES));
+        assert_eq!(plan[0].coverage, FIXTURE_A_BYTES);
+        assert_eq!(plan[1].new_key, (MOVED_A2, FIXTURE_B_BYTES));
+    }
+
+    #[test]
+    fn overlapping_duplicate_and_aliasing_moves_are_rejected() {
+        let (controller, base_a, _) = relocation_controller();
+        let tape = &controller.tape_resources;
+        let overlapping = plan_relocation(
+            tape,
+            &[
+                relocation_move(base_a, MOVED_A, RESERVED, RESERVED),
+                relocation_move(base_a + 0x1000, MOVED_A2, RESERVED, RESERVED),
+            ],
+        )
+        .expect_err("overlapping sources");
+        assert!(overlapping.contains("overlapping VMM move sources"), "{overlapping}");
+        let duplicate = plan_relocation(
+            tape,
+            &[
+                relocation_move(base_a, MOVED_A, RESERVED, RESERVED),
+                relocation_move(base_a, MOVED_A2, RESERVED, RESERVED),
+            ],
+        )
+        .expect_err("duplicate source");
+        assert!(duplicate.contains("duplicate VMM move"), "{duplicate}");
+        let destinations = plan_relocation(
+            tape,
+            &[
+                relocation_move(base_a, MOVED_A, RESERVED, RESERVED),
+                relocation_move(0x7e00_0000_0000, MOVED_A + 0x1000, RESERVED, RESERVED),
+            ],
+        )
+        .expect_err("overlapping destinations");
+        assert!(destinations.contains("destinations"), "{destinations}");
+        let chained = plan_relocation(
+            tape,
+            &[
+                relocation_move(base_a, MOVED_A, RESERVED, RESERVED),
+                relocation_move(MOVED_A, MOVED_A2, RESERVED, RESERVED),
+            ],
+        )
+        .expect_err("destination overlapping a source");
+        assert!(chained.contains("overlaps source"), "{chained}");
+        for bad in [
+            relocation_move(base_a, MOVED_A, 0, 0),
+            relocation_move(base_a, MOVED_A, 0x1000, 0x2000),
+            relocation_move(0, MOVED_A, RESERVED, RESERVED),
+            relocation_move(base_a, base_a, RESERVED, RESERVED),
+        ] {
+            assert!(plan_relocation(tape, &[bad]).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn straddling_and_colliding_tape_resources_are_rejected() {
+        let (controller, base_a, base_b) = relocation_controller();
+        // The move source ends inside resource A.
+        let straddle = plan_relocation(
+            &controller.tape_resources,
+            &[relocation_move(base_a - 0x8000, MOVED_A, 0x10000, 0x10000)],
+        )
+        .expect_err("straddles");
+        assert!(straddle.contains("straddles"), "{straddle}");
+        // The new range for A lands on resource B, which stays.
+        let collision = plan_relocation(
+            &controller.tape_resources,
+            &[relocation_move(
+                base_a,
+                base_b + 0x1000,
+                FIXTURE_A_BYTES as usize,
+                FIXTURE_A_BYTES as usize,
+            )],
+        );
+        assert!(collision.is_err(), "{collision:?}");
+    }
+
+    #[test]
+    fn untyped_launch_touching_a_moved_range_is_rejected() {
+        let (mut controller, base_a, _) = relocation_controller();
+        let moved = relocation_move(base_a, MOVED_A, FIXTURE_A_BYTES as usize, FIXTURE_A_BYTES as usize);
+        let mut untyped = test_launch("legacy_kernel");
+        untyped.accesses = Some(vec![fixture_access(base_a, FIXTURE_A_BYTES, base_a)]);
+        controller.recorded.push(untyped);
+        let error = controller.relocate_bindings(&[moved]).expect_err("touches range");
+        assert!(
+            error.contains("legacy_kernel") && error.contains("port the pointer declaration"),
+            "{error}"
+        );
+        assert_eq!(controller.binding_revision(), BindingRevision(0));
+
+        controller.recorded[1].accesses = None;
+        let error = controller.relocate_bindings(&[moved]).expect_err("unknown accesses");
+        assert!(
+            error.contains("legacy_kernel") && error.contains("port the pointer declaration"),
+            "{error}"
+        );
+
+        controller.recorded[1].accesses =
+            Some(vec![fixture_access(0x7e00_0000_0000, 0x1000, 0x7e00_0000_0000)]);
+        controller.relocate_bindings(&[moved]).expect("clear of every move");
+        assert_eq!(controller.binding_revision(), BindingRevision(1));
+    }
+
+    #[test]
+    fn relocation_reports_no_route_without_tape_and_rejects_pending_refresh() {
+        let mut empty = ReplayController::new(ReplayBackendRequest::Auto);
+        let report = empty
+            .relocate_bindings(&[relocation_move(0x7f00_0001_0000, MOVED_A, RESERVED, RESERVED)])
+            .expect("no tape");
+        assert_eq!(report, BindingRefreshReport::NoRoute);
+
+        let (mut controller, base_a, _) = relocation_controller();
+        controller.arm_binding_refresh_for_scratch_growth();
+        let error = controller
+            .relocate_bindings(&[relocation_move(base_a, MOVED_A, RESERVED, RESERVED)])
+            .expect_err("refresh pending");
+        assert!(error.contains("pending"), "{error}");
+    }
+
+    #[test]
+    fn non_slot_bytes_gate_ignores_slots_and_dynamic_words_only() {
+        let exempt = [(0usize, 8usize), (8, 4), (16, 8)];
+        let expected = vec![0x11u8; 32];
+        let mut current = expected.clone();
+        // Pointer slot and dynamic u32 differences are allowed.
+        current[1] ^= 0xff;
+        current[9] ^= 0xff;
+        current[23] ^= 0xff;
+        verify_non_slot_bytes_identical("k", &current, &expected, &exempt).expect("exempt only");
+        let mut corrupt = current.clone();
+        corrupt[13] ^= 0xff;
+        let error = verify_non_slot_bytes_identical("k", &corrupt, &expected, &exempt)
+            .expect_err("non-slot corruption");
+        assert!(error.contains("non-slot offset 13"), "{error}");
+        let mut tail = current.clone();
+        tail[31] ^= 0xff;
+        let error = verify_non_slot_bytes_identical("k", &tail, &expected, &exempt)
+            .expect_err("tail corruption");
+        assert!(error.contains("non-slot offset 31"), "{error}");
+        assert!(verify_non_slot_bytes_identical("k", &current[..31], &expected, &exempt).is_err());
+    }
+
+    #[test]
+    fn exempt_ranges_cover_slots_dynamic_bindings_and_legacy_gdn_frames() {
+        let (snapshot, layout, _, _, _) = bound_segment_fixture();
+        let mut typed = test_launch("typed_fixture");
+        typed.kernarg = snapshot;
+        typed.binding_layout = Some(layout);
+        let untyped = test_launch("untyped");
+        let ranges = bound_exempt_kernarg_ranges(
+            &[typed, untyped],
+            2,
+            &[
+                (0, ReplayKernargBinding::PositionPlusU32 { offset: 12, addend: 0 }),
+                (1, ReplayKernargBinding::PositionPlusU32 { offset: 4, addend: 0 }),
+                (9, ReplayKernargBinding::PositionPlusU32 { offset: 4, addend: 0 }),
+            ],
+            &[0],
+        );
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0], vec![(0, 8), (12, 4), (16, 8), (76, 4)]);
+        assert_eq!(ranges[1], vec![(4, 4)]);
     }
 }

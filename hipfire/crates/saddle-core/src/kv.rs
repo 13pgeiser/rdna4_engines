@@ -36,7 +36,10 @@ pub enum KvMode {
     /// row (`[Hkv x D codes][Hkv f16 scales]`, 1032 bytes/row/side at
     /// Hkv=4/D=256). K/V pair is indivisible: fp8 on both sides.
     /// Legacy-backend, single-GPU, Qwen dense H24/Hkv4/D256 only;
-    /// no VMM / adaptive / compaction / slots support.
+    /// no VMM / adaptive / compaction support. Slots support is
+    /// gfx1201-gated: descriptor-aware fp8 write/attend kernels exist for
+    /// the slot engine (head_dim 256 only), and every non-gfx1201 entry
+    /// point fails closed with a named error before any allocation.
     Fp8,
 }
 
@@ -382,10 +385,12 @@ pub struct SlotKvTierPlan {
 }
 
 impl SlotKvTierPlan {
-    /// Resolve the plan for `mode` (+ static Q8 V, the multi-slot ladder).
-    /// Geometry gates mirror the contiguous `new_gpu_*_filtered`
-    /// constructors: asym3/fwht3 need head_dim 256, the other rotated tiers
-    /// need 128 or 256, every packed tier needs head_dim divisible by 32.
+    /// Resolve the plan for `mode` (static Q8 V on the rotated tiers, fp8 V
+    /// on the fp8 tier — the multi-slot ladder). Geometry gates mirror the
+    /// contiguous `new_gpu_*_filtered` constructors: asym3/fwht3 need
+    /// head_dim 256, the other rotated tiers need 128 or 256, every packed
+    /// tier needs head_dim divisible by 32, and fp8 needs the kernels' fixed
+    /// 256 (32 lanes × 8 dims per head).
     pub fn resolve(mode: KvMode, n_kv_heads: usize, head_dim: usize) -> HipResult<Self> {
         if n_kv_heads == 0 {
             return Err(hip_bridge::HipError::new(
@@ -447,14 +452,26 @@ impl SlotKvTierPlan {
                 quant_gate("asym4", head_dim == 128 || head_dim == 256)?;
                 4 + head_dim / 2
             }
-            // Native fp8 has no slot-reader support on the slot engine:
-            // refuse the tier plan so the site cannot describe a layout it
-            // cannot serve (the policy gate refuses fp8 before this too).
+            // Native fp8-E4M3: one byte per element plus one f16 scale per KV
+            // head, stored inline at the end of each token row
+            // (`[Hkv*D codes][Hkv f16 scales]` — `n_kv_heads*(head_dim+2)`
+            // bytes/pos/side, matching `fp8_e4m3_row_bytes`). Both arenas are
+            // fp8 (K and V strides EQUAL — the tile kernel decodes V with the
+            // same per-pos stride as K), so the pool's descriptors carry one
+            // slab base per side and both write launches resolve the shared
+            // K base. The fp8 writer/reader kernels' fixed geometry reads
+            // exactly 32 lanes × 8 dims per head, so head_dim must be 256 —
+            // the only shape the sequential fp8 path admits too. Admission is
+            // gfx1201-only (OCP E4M3FN cvt); the policy/engine gates enforce
+            // the arch before this geometry is ever allocated.
             KvMode::Fp8 => {
-                return Err(hip_bridge::HipError::new(
-                    0,
-                    "KV mode fp8 has no slot-reader support on the slot engine",
-                ));
+                if head_dim != 256 {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!("fp8 slot KV requires head_dim 256 (got {head_dim})"),
+                    ));
+                }
+                head_dim + 2
             }
         };
         let k_bytes_per_pos = match mode {
@@ -466,8 +483,12 @@ impl SlotKvTierPlan {
                 .ok_or_else(|| hip_bridge::HipError::new(0, "slot KV K stride overflowed"))?,
         };
         let v_bytes_per_pos = match mode {
-            // Flat tiers store V exactly like K.
-            KvMode::Bf16 | KvMode::F16 => k_bytes_per_pos,
+            // Flat tiers store V exactly like K. fp8 is not flat, but its K
+            // and V rows share the same `[Hkv*D codes][Hkv f16 scales]`
+            // layout (the fp8 tile decodes V with K's per-pos stride), so V
+            // takes K's stride too — NOT the static Q8_0 V the rotated
+            // tiers use.
+            KvMode::Bf16 | KvMode::F16 | KvMode::Fp8 => k_bytes_per_pos,
             _ => {
                 // Static multi-slot ladder stores V at Q8_0 — the same
                 // per-head layout the asym/fwht constructors allocate.
@@ -2114,6 +2135,26 @@ impl KvCache {
         gpu: &Gpu,
         required_tokens: usize,
     ) -> HipResult<usize> {
+        self.planned_mapped_bytes(gpu, required_tokens, false)
+    }
+
+    /// Physical bytes an owner shaped like this one maps to hold
+    /// `required_tokens` from an empty mapping: the admission cost of a new
+    /// request owner under the same chunk plan and encoding strides.
+    pub fn planned_mapped_bytes_from_empty(
+        &self,
+        gpu: &Gpu,
+        required_tokens: usize,
+    ) -> HipResult<usize> {
+        self.planned_mapped_bytes(gpu, required_tokens, true)
+    }
+
+    fn planned_mapped_bytes(
+        &self,
+        gpu: &Gpu,
+        required_tokens: usize,
+        from_empty: bool,
+    ) -> HipResult<usize> {
         if !self.uses_vmm_backend() {
             return Ok(0);
         }
@@ -2130,9 +2171,13 @@ impl KvCache {
                     }
                     continue;
                 }
-                let mapped = gpu.vmm_mapped_bytes(tensor).ok_or_else(|| {
-                    hip_bridge::HipError::new(0, "VMM KV tensor is not registered with its GPU")
-                })?;
+                let mapped = if from_empty {
+                    0
+                } else {
+                    gpu.vmm_mapped_bytes(tensor).ok_or_else(|| {
+                        hip_bridge::HipError::new(0, "VMM KV tensor is not registered with its GPU")
+                    })?
+                };
                 let granularity = gpu.vmm_granularity(tensor).ok_or_else(|| {
                     hip_bridge::HipError::new(0, "VMM KV tensor has no allocation granularity")
                 })?;
@@ -2206,6 +2251,152 @@ impl KvCache {
             self.physical_cap, self.max_seq,
         );
         Ok(())
+    }
+
+    /// Context bound a per-request VMM owner can address: positions
+    /// `[0, logical_bound)`. Never silently below the request's admitted
+    /// context — admission compares against this and refuses.
+    pub fn vmm_logical_bound(&self) -> usize {
+        self.max_seq.min(self.physical_cap)
+    }
+
+    /// `_vmm` kernel format of this per-request owner. Only Q8 (K+V Q8_0)
+    /// and native fp8 have a validated VMM descriptor implementation;
+    /// everything else is refused, never routed through a legacy arena.
+    pub fn vmm_kv_format(&self) -> HipResult<rdna_compute::attention::VmmKvFormat> {
+        use rdna_compute::attention::VmmKvFormat;
+        if !self.uses_vmm_backend() {
+            return Err(hip_bridge::HipError::new(0, "KV cache is not a VMM owner"));
+        }
+        if self.compact_offset != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "VMM request owner was compacted; absolute VA addressing requires compact_offset == 0",
+            ));
+        }
+        match self.current_kv_mode()? {
+            KvMode::Fp8 => Ok(VmmKvFormat::Fp8E4M3),
+            KvMode::Q8 if self.v_mode == VMode::Q8 => Ok(VmmKvFormat::Q8),
+            other => Err(hip_bridge::HipError::new(
+                0,
+                &format!("KV mode {other:?} has no validated per-request VMM descriptor"),
+            )),
+        }
+    }
+
+    /// Physical bytes this owner must map to hold `positions` tokens, after
+    /// refusing anything past [`Self::vmm_logical_bound`]. Pure planning —
+    /// the admission check for one request against a shared budget.
+    pub fn vmm_admission_bytes(&self, gpu: &Gpu, positions: usize) -> HipResult<usize> {
+        self.vmm_kv_format()?;
+        let bound = self.vmm_logical_bound();
+        if positions > bound {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("VMM admission refused: {positions} positions exceed logical bound {bound}"),
+            ));
+        }
+        self.planned_mapped_growth_bytes(gpu, positions)
+    }
+
+    /// Provision (map) this request's prefix to cover `positions` tokens,
+    /// outside graph capture, refusing — without mapping anything — if the
+    /// growth exceeds `budget_bytes` (caller's remaining shared physical
+    /// budget) or the logical bound. Growth is monotonic and keeps every
+    /// owner at its VA. Returns the mapped bytes consumed by this call.
+    pub fn provision_vmm_positions(
+        &mut self,
+        gpu: &mut Gpu,
+        positions: usize,
+        budget_bytes: usize,
+    ) -> HipResult<usize> {
+        let need = self.vmm_admission_bytes(gpu, positions)?;
+        if need > budget_bytes {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "VMM admission refused: mapping {positions} positions needs {need} B, budget {budget_bytes} B"
+                ),
+            ));
+        }
+        if need > 0 {
+            self.ensure_mapped_capacity(gpu, positions)?;
+        }
+        Ok(need)
+    }
+
+    /// Request-wide owner generation: the registration generation of this
+    /// owner's first real K tensor. Generations are monotonic per GPU and
+    /// never reused, so it identifies this owner instance across abort and
+    /// slot reuse; every layer descriptor carries the same value.
+    pub fn vmm_owner_generation(&self, gpu: &Gpu) -> HipResult<u64> {
+        let k = self
+            .k_gpu
+            .iter()
+            .find(|t| t.buf.is_vmm_owner())
+            .ok_or_else(|| hip_bridge::HipError::new(0, "KV cache has no VMM K owner"))?;
+        gpu.vmm_owner_generation(k)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "VMM K owner is not registered with this GPU"))
+    }
+
+    /// Per-layer VMM descriptors for this request (index = model layer;
+    /// non-KV layers are [`VmmKvSlotDesc::MASKED`]). Addresses are the
+    /// owners' stable VAs; `mapped_positions` is the actual mapped prefix
+    /// over K and V, `owner_generation` the request-wide
+    /// [`Self::vmm_owner_generation`]. A view borrows: it never transfers or clones ownership,
+    /// and is invalid after [`Self::release_vmm_after`].
+    pub fn vmm_slot_descs(
+        &self,
+        gpu: &Gpu,
+    ) -> HipResult<Vec<rdna_compute::kv_slots::VmmKvSlotDesc>> {
+        use rdna_compute::kv_slots::VmmKvSlotDesc;
+        self.vmm_kv_format()?;
+        let mapped = self.mapped_token_capacity()?.unwrap_or(0);
+        let to_u32 = |v: usize, what: &str| {
+            u32::try_from(v).map_err(|_| {
+                hip_bridge::HipError::new(0, &format!("VMM {what} {v} exceeds u32"))
+            })
+        };
+        let mapped_positions = to_u32(mapped.min(self.vmm_logical_bound()), "mapped prefix")?;
+        let logical_bound = to_u32(self.vmm_logical_bound(), "logical bound")?;
+        let owner_generation = self.vmm_owner_generation(gpu)?;
+        self.k_gpu
+            .iter()
+            .zip(&self.v_gpu)
+            .map(|(k, v)| {
+                if !k.buf.is_vmm_owner() {
+                    return Ok(VmmKvSlotDesc::MASKED);
+                }
+                if !v.buf.is_vmm_owner() {
+                    return Err(hip_bridge::HipError::new(0, "VMM K owner paired with non-VMM V"));
+                }
+                gpu.vmm_owner_generation(k).ok_or_else(|| {
+                    hip_bridge::HipError::new(0, "VMM K owner is not registered with this GPU")
+                })?;
+                Ok(VmmKvSlotDesc {
+                    k_base: k.buf.as_ptr() as u64,
+                    v_base: v.buf.as_ptr() as u64,
+                    mapped_positions,
+                    logical_bound,
+                    owner_generation,
+                })
+            })
+            .collect()
+    }
+
+    /// Release the request owner once its last reader has completed:
+    /// synchronizes `completion` (the event recorded after the final step
+    /// that read or wrote this KV, including graph replays) before unmapping.
+    /// Never call with readers still in flight and no event.
+    pub fn release_vmm_after(
+        self,
+        gpu: &mut Gpu,
+        completion: Option<&hip_bridge::Event>,
+    ) -> HipResult<()> {
+        if let Some(event) = completion {
+            gpu.hip.event_synchronize(event)?;
+        }
+        self.free_gpu(gpu)
     }
 
     /// Bytes of V-cache per token-position (all heads) for a given V mode.
@@ -6298,6 +6489,40 @@ mod slot_kv_plan_tests {
         assert!(err.contains("f16"), "{err}");
     }
 
+    /// fp8 stores BOTH arenas in the `[Hkv*D codes][Hkv f16 scales]` row
+    /// layout (the fp8 tile decodes V with K's per-pos stride), so K and V
+    /// strides are EQUAL and no rotation table exists. Hkv=4/D=256 →
+    /// 4*258 = 1032 B/pos/side, the same number `fp8_e4m3_row_bytes`
+    /// computes on the kernel side.
+    #[test]
+    fn fp8_is_scale_inline_strided_and_table_free() {
+        let p = SlotKvTierPlan::resolve(KvMode::Fp8, 4, 256).unwrap();
+        assert_eq!(p.k_bytes_per_pos, 4 * 258);
+        assert_eq!(p.v_bytes_per_pos, p.k_bytes_per_pos);
+        assert!(!p.kv_strides_differ());
+        assert!(p.givens_len.is_none());
+        assert!(p.fwht_len.is_none());
+        // The stride scales with Hkv at the fixed D256 the kernels pin.
+        let p8 = SlotKvTierPlan::resolve(KvMode::Fp8, 8, 256).unwrap();
+        assert_eq!(p8.k_bytes_per_pos, 8 * 258);
+        assert_eq!(p8.v_bytes_per_pos, p8.k_bytes_per_pos);
+    }
+
+    /// The fp8 write/read kernels read exactly 32 lanes × 8 dims per head,
+    /// so head_dim must be 256 — anything else is refused with a named
+    /// error instead of describing a layout no kernel can serve.
+    #[test]
+    fn fp8_head_dim_gate_is_256_only() {
+        for hd in [64usize, 128, 512] {
+            let err = SlotKvTierPlan::resolve(KvMode::Fp8, 4, hd)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("fp8"), "hd={hd}: {err}");
+            assert!(err.contains("256"), "hd={hd}: {err}");
+        }
+        assert!(SlotKvTierPlan::resolve(KvMode::Fp8, 4, 256).is_ok());
+    }
+
     #[test]
     fn rotation_tables_match_tier_family() {
         for m in [KvMode::Asym2, KvMode::Asym3, KvMode::Asym4] {
@@ -6331,9 +6556,9 @@ mod slot_kv_plan_tests {
         for m in [KvMode::Q8, KvMode::Asym3, KvMode::Fwht4] {
             assert!(SlotKvTierPlan::resolve(m, 2, 100).is_err(), "{m:?} @100");
         }
-        // fp8 is native-only on the slot engine: no slot reader exists, so
-        // the plan refuses it fail-closed like the sentinel.
-        assert!(SlotKvTierPlan::resolve(KvMode::Fp8, 2, 256).is_err());
+        // fp8 is pinned to the kernels' fixed 32x8/head geometry: 256 only
+        // (see fp8_head_dim_gate_is_256_only for the named-error shape).
+        assert!(SlotKvTierPlan::resolve(KvMode::Fp8, 2, 128).is_err());
         // Zero heads refused.
         assert!(SlotKvTierPlan::resolve(KvMode::Q8, 0, 256).is_err());
     }

@@ -1,5 +1,9 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Profiler client (architecture.md §4 `insert_before/after`, §6 "Profiler"): the
-//! `peacemaker profile` instrumentation (`hipfire-isa/src/profile.rs`, `f537e3fd1`) as a
+//! `peacemaker profile` instrumentation (`peacemaker-isa/src/profile.rs`, `f537e3fd1`) as a
 //! script of core edits on a lifted kernel.
 //!
 //! The rules, register choice, site numbering and instruction sequences are the text

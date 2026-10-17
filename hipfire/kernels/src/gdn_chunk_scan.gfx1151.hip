@@ -44,7 +44,16 @@ __device__ __forceinline__ gs_bfrag gs_frag(const unsigned short*p,int pitch,int
 #pragma unroll
  for(int e=0;e<16;++e)u.h[e]=p[r*pitch+k0+e];
  return u.v;}
-#define GS_BAR() do{__builtin_amdgcn_fence(__ATOMIC_RELEASE,"workgroup","local");__builtin_amdgcn_s_barrier();__builtin_amdgcn_fence(__ATOMIC_ACQUIRE,"workgroup","local");}while(0)
+// LDS-only workgroup barrier: the "local" fences keep in-flight global
+// prefetches in flight. Each wave waits for its own LDS ops (lgkmcnt(0), vmcnt
+// and expcnt left open: gfx11 s_waitcnt 0xFC07) before it signals. The fence's
+// own wait is a soft s_waitcnt that SIInsertWaitcnts may erase as redundant
+// without seeing loop-carried stores (llvm/llvm-project#220357); in WGP mode
+// the waves span both CUs, whose LDS queues are not ordered, so a read after
+// the barrier could overtake another wave's queued store (the gfx1151
+// VerifyAttn race). The explicit wait cannot be erased.
+#define GS_WAIT_LGKM0 0xFC07
+#define GS_BAR() do{__builtin_amdgcn_fence(__ATOMIC_RELEASE,"workgroup","local");__builtin_amdgcn_s_waitcnt(GS_WAIT_LGKM0);__builtin_amdgcn_s_barrier();__builtin_amdgcn_fence(__ATOMIC_ACQUIRE,"workgroup","local");}while(0)
 
 struct __attribute__((aligned(16))) GsLds{
  unsigned short score[GS_C][GS_AP];
@@ -171,6 +180,10 @@ __global__ void gdn_chunk_scan_gfx1151(
   for(int kk=0;kk<4;++kk){gs_bfrag score=gs_frag(&sm.score[0][0],GS_AP,mt*16,kk*16,lane);
 #pragma unroll
    for(int j=0;j<2;++j)O[j]=gs_mma(gs_frag(&sm.d[0][0],GS_AP,(ntb+j)*16,kk*16,lane),score,O[j]);}
+  // WMMA needs every lane active. Without this pin, clang sinks the O
+  // WMMAs (only used by the store) into `if(tok<rows)`, and on a partial
+  // chunk the masked lanes' operand rows come out undefined.
+  asm volatile("" : "+v"(O[0]), "+v"(O[1]));
   const int tok=mt*16+lo;
   if(tok<rows){float*ob=out+((unsigned long long)(parent0+tok)*48+head)*GS_D+vbase;
 #pragma unroll
