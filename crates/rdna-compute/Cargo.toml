@@ -418,6 +418,10 @@ name = "gdn_chunk_parity"
 required-features = ["lab"]
 
 [[example]]
+name = "gdn_state_precision_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "gfx11_generic_smoke"
 required-features = ["lab"]
 
