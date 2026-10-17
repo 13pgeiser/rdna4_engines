@@ -762,6 +762,17 @@ inline bool linear_is_w8(const RadEncoding& e) {
            sc->block[0] == 1 && sc->block[1] == RAD_FP8_BLOCK;
 }
 
+/* The same planes rotated by the unnormalised 128-wide Hadamard along K, the 1/128 in the scale
+ * (libquant's `transform=fwht128`), served at i8a8h behind had_quant_act_i8g. */
+inline bool linear_is_w8h(const RadEncoding& e) {
+    if (!rad_enc_is(&e, "affine") || e.n_planes != 2 ||
+        std::strncmp(e.transform, "fwht128", RAD_ENC_STR) != 0)
+        return false;
+    const RadEncPlane* sc = rad_enc_plane(&e, "scale");
+    return e.plane[0].dtype == RAD_I8 && e.plane[0].block[1] == 1 && sc && sc->dtype == RAD_BF16 &&
+           sc->block[0] == 1 && sc->block[1] == RAD_FP8_BLOCK;
+}
+
 /* The OCP-MXFP4 weight LinearFP8 serves at mxfp4a8: e2m1 codes and an E8M0 exponent per [1 x 32],
  * no transform (libr4d's MXFP4 layout hook). */
 enum { RAD_MX_GROUP = 32 };
@@ -823,7 +834,7 @@ inline int LinearFP8::probe(RadBuilder* b, Names& nm, const Geom& g, const char*
     const bool known = weight_enc(b, wn, &enc);
     const bool plain = known && rad_enc_is(&enc, "plain") && enc.n_planes == 1 &&
                        enc.plane[0].dtype == RAD_BF16;
-    probed_i8 = known && linear_is_w8(enc);
+    probed_i8 = known && (linear_is_w8(enc) || linear_is_w8h(enc));
     /* A rotated weight rotates and quantises the bf16 plane itself; a 4-bit one casts or
      * quantises it. */
     const bool rotated = known && (linear_is_paro_mxfp4(enc) || linear_is_paro_w5(enc));
@@ -981,9 +992,18 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
     /* ---- int8 weight, `gemm_nt_q` at i8a8 over the input's `a.q8` / `a.s8`. The scale plane is
      * one bf16 per row per 128 of K: row parts and row slices apply as is, column slices in groups
      * of 128. The codes come from the producer (ActFP8::q8_fed) or from op_q over `a.x` (probe()
-     * set reads_x). The model must have declared the pair (ActFP8::declare_qs's `i8`). */
-    i8 = known && linear_is_w8(enc);
+     * set reads_x). The model must have declared the pair (ActFP8::declare_qs's `i8`).
+     *
+     * A rotated weight (i8a8h) takes had_quant_act_i8g instead, so it always quantises its own
+     * input: a producer's codes are unrotated. */
+    const bool rot8 = known && linear_is_w8h(enc);
+    i8 = known && (linear_is_w8(enc) || rot8);
     if (i8) {
+        if (rot8 && a.q8_fed) {
+            fprintf(stderr, "radiance: '%s' is a rotated int8 weight and its input is fed codes "
+                            "its producer wrote unrotated\n", wn);
+            return RAD_E_DTYPE;
+        }
         if (!a.x || !a.q8 || !a.s8) {
             fprintf(stderr, "radiance: '%s' is an int8 weight and its input lacks the bf16 plane "
                             "or the int8 code pair (the model declared its input before learning "
@@ -1018,14 +1038,15 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         }
         const int64_t hi = max_rows > 0 ? max_rows : g.max_tok;
         if (!a.q8_fed)
-            op_q = rw(b, RAD_OP(b, "quant_act_i8g",
+            op_q = rw(b, RAD_OP(b, rot8 ? "had_quant_act_i8g" : "quant_act_i8g",
                      RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("n", K),
                                 RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "bf16")),
                      RAD_NOWEIGHTS),
                   { a.x }, { a.q8, a.s8 });
         op = rw(b, RAD_OP(b, "gemm_nt_q",
                    RAD_PARAMS(RAD_RANGE("M", 1, hi), RAD_INT("N", N), RAD_INT("K", K),
-                              RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", "i8a8")),
+                              RAD_INT("group", RAD_FP8_BLOCK),
+                              RAD_STR("dtype", rot8 ? "i8a8h" : "i8a8")),
                    RAD_WEIGHTS(w, ws)),
                { a.q8, a.s8 }, { y });
         return (op_q || a.q8_fed) && op ? RAD_OK : RAD_E_INVAL;
