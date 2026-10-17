@@ -181,6 +181,10 @@ pub struct Qwen4Bundle {
     pub(crate) spec_top1: Option<GpuTensor>,
     pub(crate) spec_hidden: Option<GpuTensor>,
     pub(crate) spec_host_top1: Vec<u8>,
+    /// Lab observation of every speculative forward's logits; unarmed it
+    /// records nothing (`crate::lab_window`).
+    #[cfg(feature = "lab")]
+    lab_logits: crate::lab_window::LabLogitsTap,
     /// Staging of the GPU penalty prepass (`apply_penalty_table`), allocated
     /// by the first penalized row and kept until unload.
     penalty_stage: Option<PenaltyTableStage>,
@@ -243,7 +247,11 @@ pub fn session_snapshot_bytes(
     p: usize,
 ) -> Option<u64> {
     let part = |bytes: usize| bytes.checked_next_multiple_of(256);
-    let gdn_recurrent = format.gdn.state_units(
+    // A Q8Ef snapshot carries the plain Q8 payload only: the live F16
+    // residual plane is never snapshotted (it is zeroed on every restore), so
+    // the size is the `storage()` format's, equal to Q8's.
+    let gdn_storage = format.gdn.storage();
+    let gdn_recurrent = gdn_storage.state_units(
         config.linear_num_value_heads,
         config.linear_key_head_dim,
         config.linear_value_head_dim,
@@ -255,7 +263,7 @@ pub fn session_snapshot_bytes(
                 .linear_num_value_heads
                 .checked_mul(config.linear_value_head_dim)?,
         )?;
-    let gdn = part(gdn_recurrent.checked_mul(format.gdn.dtype().size())?)?.checked_add(part(
+    let gdn = part(gdn_recurrent.checked_mul(gdn_storage.dtype().size())?)?.checked_add(part(
         conv_channels
             .checked_mul(config.linear_conv_kernel_dim.saturating_sub(1))?
             .checked_mul(4)?,
@@ -330,7 +338,10 @@ impl PpSessionPolicy {
 }
 
 /// The session-cache scope of one bundle. Single (`band == None`) is exactly the
-/// historical string; a PP band appends its band identity (index/count, layers,
+/// historical string for the F32 and Q8 GDN formats; Q8Ef appends the distinct
+/// `/q8_ef-reset` spelling after the format (its snapshots carry Q8 payload
+/// only and restore zeroes the live residual, so they never alias a plain Q8
+/// or F32 scope). A PP band appends its band identity (index/count, layers,
 /// complete placement, devices, mesh and load epoch) and the shared schedule
 /// policy, so no two bands, placements, devices, meshes or loads alias.
 pub(crate) fn session_scope(
@@ -343,7 +354,11 @@ pub(crate) fn session_scope(
     // Message-end snapshots split prefill off the plain chunk schedule, so
     // they never share a domain with chunk-only ones.
     let turns = if turns { "/turns" } else { "" };
-    let mut scope = format!("qwen4/{route:?}/chunk{chunk}/{format:?}{turns}");
+    let gdn_abi = match format.gdn {
+        crate::GdnStateFormat::F32 | crate::GdnStateFormat::Q8 => "",
+        crate::GdnStateFormat::Q8Ef => "/q8_ef-reset",
+    };
+    let mut scope = format!("qwen4/{route:?}/chunk{chunk}/{format:?}{gdn_abi}{turns}");
     if let Some((band, policy)) = band {
         scope.push_str(&band.scope_tag());
         scope.push_str(&policy.scope_tag());
@@ -827,6 +842,8 @@ impl Qwen4Bundle {
             spec_top1: None,
             spec_hidden: None,
             spec_host_top1: Vec::new(),
+            #[cfg(feature = "lab")]
+            lab_logits: crate::lab_window::LabLogitsTap::default(),
             penalty_stage: None,
             session: None,
             pair_session_stage: None,
@@ -1742,6 +1759,8 @@ impl Qwen4Bundle {
         forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
         result?;
+        #[cfg(feature = "lab")]
+        self.lab_note_forward(gpu, tokens, &logits, output_count, prefill)?;
         if !download_picks {
             return Ok(Vec::new());
         }
@@ -1984,6 +2003,8 @@ impl Qwen4Bundle {
             .map_err(|error| BundleError::Forward(error.to_string()));
         self.execution = Some(forward);
         result?;
+        #[cfg(feature = "lab")]
+        self.lab_note_forward(gpu, std::slice::from_ref(&token), &logits, 1, false)?;
         gpu.hip
             .memcpy_dtoh(&mut self.spec_host_top1[..top1_bytes], &top1.buf)
             .map_err(BundleError::Hip)?;
@@ -2109,6 +2130,51 @@ impl Qwen4Bundle {
             .draft
             .draft_finish(top)
             .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// Arm (or disarm and clear) the lab taps: the speculative-forward logits
+    /// tap (`keep_logits` also keeps the rows) and the state's residual/ring
+    /// event tap. Arm before a restore to observe its pre-window events.
+    #[cfg(feature = "lab")]
+    pub fn lab_observe(&mut self, armed: bool, keep_logits: bool) {
+        self.lab_logits.set_armed(armed, keep_logits);
+        self.state.lab_observe_state(armed);
+    }
+
+    /// The lab taps are armed.
+    #[cfg(feature = "lab")]
+    pub fn lab_observed(&self) -> bool {
+        self.lab_logits.armed()
+    }
+
+    /// Drain the speculative forwards' logits observations recorded since
+    /// the last take.
+    #[cfg(feature = "lab")]
+    pub fn lab_take_forward_logits(&mut self) -> Vec<crate::lab_window::LabForwardLogits> {
+        self.lab_logits.take()
+    }
+
+    /// Record one speculative forward's output rows while the lab tap is
+    /// armed: a blocking read of the resident `logits` (`rows` rows). Does
+    /// nothing, and reads nothing back, unarmed.
+    #[cfg(feature = "lab")]
+    fn lab_note_forward(
+        &mut self,
+        gpu: &Gpu,
+        tokens: &[u32],
+        logits: &GpuTensor,
+        rows: usize,
+        prefill: bool,
+    ) -> Result<(), BundleError> {
+        if !self.lab_logits.armed() {
+            return Ok(());
+        }
+        let mut host = Vec::new();
+        gpu.download_f32_into(logits, &mut host)
+            .map_err(BundleError::Hip)?;
+        self.lab_logits
+            .record(tokens, prefill, rows, self.config.vocab_size, &host);
+        Ok(())
     }
 
     /// Every byte family of the resident MTP head state

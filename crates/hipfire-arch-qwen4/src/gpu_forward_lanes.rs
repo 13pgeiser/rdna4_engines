@@ -1453,6 +1453,10 @@ fn forward_lanes_scoped(
                                 norm: weights.norm,
                                 output: weights.output,
                                 recurrent: &gdn.recurrent,
+                                // The lane's own live EF companion (never shared
+                                // across lanes, never in the ring/snapshot).
+                                format: state.gdn_format(),
+                                residual: gdn.ef_residual.as_ref(),
                                 conv_state: &gdn.conv,
                                 projection: &v.projection,
                                 projection2: &v.projection2,

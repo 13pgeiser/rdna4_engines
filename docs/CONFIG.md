@@ -462,7 +462,7 @@ model's contract still accepts the named-cap route):
 | `kv_v` | empty (unset) | Qwen-only: `q8`, `lloyd2`–`lloyd4` |
 | `kv_adaptive` | `"off"` | `off`, `conservative`, `balanced`, `aggressive`, or `advanced:k=<fwht4\|fwht3\|fwht2>,v=<lloyd4\|lloyd3\|lloyd2>` |
 | `kv_backend` | schema `"vmm"`; automatic when not authored | `legacy` \| `vmm` |
-| `state_quant` | `"auto"` | `auto`, `q8`/`int8`, `fp32`/`f32`, `q4`/`int4` (Qwen3.5 only). GDN/DeltaNet recurrent-state storage (`memory.state_quant`, env `HIPFIRE_STATE_QUANT`); `auto` = Flash-Next F32 on exact gfx1151, Q8 on every other arch; explicit values honored or refused, never rewritten; semantics in the Qwen4 paragraph below the Flash-Next table |
+| `state_quant` | `"auto"` | `auto`, `q8`/`int8`, `q8_ef` (Qwen3.8-Flash-Next only), `fp32`/`f32`, `q4`/`int4` (Qwen3.5 only). GDN/DeltaNet recurrent-state storage (`memory.state_quant`, env `HIPFIRE_STATE_QUANT`); `auto` = Flash-Next F32 on exact gfx1151, Q8 on every other arch, and never selects `q8_ef`; explicit values honored or refused, never rewritten; semantics in the Qwen4 paragraph below the Flash-Next table |
 
 ### Mode, K, and V
 
@@ -546,7 +546,8 @@ LFM2-MoE resolve `auto` to q8).
 sets the storage of the QSA full-attention K/V arenas. The GatedDeltaNet
 recurrent state is separate and follows `memory.state_quant` (below the
 table): `auto` is F32 on exact gfx1151 and Qwen3.5's Q8 DeltaNet format on
-every other arch; `q8` is the kill switch and `fp32` the explicit opt-in.
+every other arch; `q8` is the kill switch, `fp32` the explicit opt-in and
+`q8_ef` the explicit-only error-feedback variant of `q8`.
 
 | `kv_cache` | gfx1201 | gfx1151 (Halo), gfx1100 (7900 XTX) | other gfx11/gfx12 | gfx942 (MI300X) | other arches |
 |---|---|---|---|---|---|
@@ -594,19 +595,85 @@ the quantization.
 
 **GDN recurrent state: `memory.state_quant`.** Storage of the
 GatedDeltaNet/DeltaNet recurrent state, separate from `kv_cache`. Values
-`auto` (default), `q8`/`int8`, `fp32`/`f32`, `q4`/`int4`; legacy key
+`auto` (default), `q8`/`int8`, `q8_ef`, `fp32`/`f32`, `q4`/`int4`; legacy key
 `state_quant`, env `HIPFIRE_STATE_QUANT`, CLI `hipfire config set state_quant
 <value>`. `auto` is the per-model/arch default: on Qwen3.8-Flash-Next it is
 **F32 on exact gfx1151 (Halo)** and Q8 on gfx1100, gfx1201 and every other
 arch (each promoted independently); on the stock-FP8 profile (gfx942) F32 is
-pinned and `q8` is refused; Qwen3.5 keeps Q8. `q4`/`int4` is Qwen3.5-only. An
+pinned and `q8` and `q8_ef` are refused; Qwen3.5 keeps Q8. `q4`/`int4` is
+Qwen3.5-only and `q8_ef` is Qwen3.8-Flash-Next-only (Qwen3.5 refuses it). An
 explicit value is honored or refused for the model/arch, never rewritten, and
-there is no free-memory fallback from F32 to Q8. The Q8 format needs 128×128
-heads; Flash-Next qualifies.
+there is no free-memory fallback from F32 to Q8. The Q8 and `q8_ef` formats
+need 128×128 heads; Flash-Next qualifies.
 
 **Kill switch:** `hipfire config set state_quant q8`, `state_quant = "q8"` in
 the TOML, or `HIPFIRE_STATE_QUANT=q8` restores the Q8 recurrent state on
 gfx1151.
+
+**`q8_ef` (explicit opt-in).** `q8_ef` is plain Q8 recurrent state plus one
+**live f16 error-feedback residual** per GDN layer per live owner (the request
+state and each lane owner): the rounding error of each Q8 requantization is
+kept in the residual and added back into the next step's state, so the
+per-token requantization error is fed forward instead of dropped. It is never
+selected by `auto`, by any default, or on any arch: it is used only when
+`memory.state_quant = "q8_ef"`, `hipfire config set state_quant q8_ef` or
+`HIPFIRE_STATE_QUANT=q8_ef` asks for it explicitly, and it is refused on the
+stock-FP8 profile, on Qwen3.5 and without 128×128 heads. It is also refused on
+every arch when the `HIPFIRE_QWEN4_GDN_Q8_INLINE=1` developer flag is set:
+no GPU has run a `q8_ef` inline-WY chunk kernel, so none ships, and a `q8_ef`
+chunked prefill always runs on its F32 reconstruction; unset one of them. Only
+the live residual
+carries EF: the capture ring, the transaction mirror and every session-cache,
+prefix and disk snapshot hold **plain Q8** codes and scales, byte-identical in
+layout to `q8`, so no snapshot or cache entry grows. The residual is zeroed,
+in stream order, on initial reset, keep-0 rollback, partial rollback (the Q8
+ring is replayed with the incumbent Q8 rollback kernel and the residual is then
+zeroed), transaction restore, session/prefix/disk restore and lane reinit; an
+uninterrupted AR step, a prefill launch and a full all-accept commit keep the
+final residual. No historical residual is stored or restored.
+
+**`q8_ef` numerics and scope.** A restored or rolled-back continuation
+**intentionally differs** from the uninterrupted EF continuation, because the
+residual restarts from zero after the restore or rollback. **MTP == AR is not
+guaranteed** under `q8_ef`: native MTP resets the residual on rejection and
+plain AR does not, so greedy IDs and live state may differ between routes, and
+cold versus restored continuations may differ; those cross-route differences
+are reported as diagnostics, while same-route, same-history determinism is
+required. `q8_ef` is not bit-identical to `q8` or `fp32`. It uses its own
+session-cache scope, `q8_ef-reset`; a `q8_ef` snapshot is never restored into a
+`q8` or `fp32` scope and the reverse. The cost is **+54 MiB per live owner**
+on Flash-Next (36 layers × 1,572,864 B, the storage size of the residual, not a
+measured cost), independent of the capture-ring rows R and with no growth of
+the ring, mirror or any cache entry; each reset also writes that plane once.
+Admission charges the live plane once per owner.
+
+**q8_ef: sampled requests use AR until the sampled-MTP law is verified.**
+Under `q8_ef`, temperature > 0 requests run AR instead of native MTP (the
+native-MTP drafter of a `q8_ef` load has sampled verification off, the same
+route `speculation.mtp_sampled = false` takes), and the load logs `qwen4 native
+MTP sampled: off for GDN q8_ef (sampled requests use AR until the sampled-MTP
+law is verified)`. Greedy native MTP is unchanged, and `q8`, `fp32` and the
+default keep `speculation.mtp_sampled`. The rejection-sampling law under the EF
+reset history has not been verified on a GPU.
+
+**`q8_ef` measurements.** Decode KLD against the BF16 reference on code24
+(24 chunks × 512, paired per chunk, 95% bootstrap CI, graph off):
+
+| Card | Default | `q8` | F32 | `q8_ef` | `q8_ef` − `q8` | `q8_ef` − F32 |
+|---|---|---:|---:|---:|---|---|
+| Strix Halo (gfx1151) | F32 | 0.078394 | 0.071546 | 0.071987 | −0.006406 (−0.008538 to −0.004098) | +0.000441 (−0.001301 to +0.002306) |
+| R9700 (gfx1201) | `q8` | 0.082302 | 0.074518 | 0.073598 | −0.008704 (−0.011854 to −0.005680) | −0.000919 (−0.004398 to +0.002255) |
+
+The R9700 arms ran with `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=14` (routed experts
+of layers 0–14 in VRAM, the rest host-mapped). The GDN state oracle has 0 hard
+mismatches for `q8`, F32 and `q8_ef` on both cards, and each native-MTP route
+(AR, batched, incremental, adaptive, full-head) gives identical IDs and live
+state in two fresh processes (on Strix Halo the adaptive route's wall-clock
+chooser decided differently between two runs, which is not required to
+repeat). On gfx1201 the walked route plans cover the default `q8` state only:
+a `q8_ef` load has no closed route plan (`gdn = q8_ef is outside the walked
+["q8"]`) and compiles its kernels on first use. Timing for `q8_ef` has **not
+been measured**, so nothing here is a performance claim.
 
 **Numerical change.** F32 state has no per-token requantization. The gfx1151
 default output is therefore **not bit-identical** to the previous Q8 default;
@@ -888,7 +955,7 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 | `dflash_ngram_block` | `"auto"` | `true` \| `false` \| `"auto"` | Verify-path n-gram defense; auto size-gates. |
 | `mtp_mode` | `"auto"` | `off` \| `on` \| `auto` | Built-in MTP when a head is present: the DeepSeek V4 trunk's MTP layer, or for Qwen a bundled `.mq4-mtp` trailer or a `.mtp` sidecar (the registry `mtp` slot; Qwen3.8-27B ships one — [MODELS.md](MODELS.md#dflash-draft-artifacts-registry)). `auto` uses an eligible present head; `on` fails the load without one. On Qwen3.5-class MoE, `auto` declines to AR after placement resolves a host-mapped routed-expert spill, on either `memory.offload_exec=pcie` or `cpu`, logging the count, seam and `opt in with --spec mtp`. `on` / `--spec mtp` opts in, except that uniform MQ6G256 V1 (qt15) Qwen35 MoE with FP16 WMMA enabled on gfx1200/gfx1201 is refused before serving/generation whenever a native MTP head would attach, including resident `auto` attachment. The guard uses tensor metadata, not filenames. `--spec off` / `speculation.mtp=off` or an auto-declined spill stays AR; `HIPFIRE_FP16=0` permits explicit MTP. Mixed/graded MQ4+MQ6, MQ6V2, gfx1151 and dense models are outside this refusal. Other resident attachment behavior is unchanged; this is admission protection, not a fix for the underlying WMMA defect. |
 | `mtp_k` | `"auto"` | `"auto"` \| int 1–10 | MTP draft cap (`speculation.mtp_k`, env `HIPFIRE_MTP_K`). **Default `auto`** = 7 for native Qwen4 MTP (Flash-Next, arch 16) on gfx1151, else 3; on gfx1151 the adaptive chooser picks each window's depth up to the cap, starting a request with no measured history at `min(3, cap)` and growing to the cap on evidence. An explicit 1–10 overrides on every model; `4` restores the previous gfx1151 cap. |
-| `mtp_sampled` | `true` | bool | Default true. Native Qwen4 MTP uses distribution-preserving speculative rejection sampling for temperature >0, including supported repeat/presence/frequency penalties: target verification and draft probabilities use the same AR history, penalty window and sampling policy. False/`HIPFIRE_MTP_SAMPLED=0` leaves sampled requests on AR; greedy MTP is unchanged. This is distribution preservation, not identical seeded sampled token streams. DFlash/other drafters without this policy still fall back to AR for unsupported penalty requests. |
+| `mtp_sampled` | `true` | bool | Default true. Native Qwen4 MTP uses distribution-preserving speculative rejection sampling for temperature >0, including supported repeat/presence/frequency penalties: target verification and draft probabilities use the same AR history, penalty window and sampling policy. False/`HIPFIRE_MTP_SAMPLED=0` leaves sampled requests on AR; greedy MTP is unchanged. Under `memory.state_quant = "q8_ef"` sampled requests use AR until the sampled-MTP law is verified, whatever this key says (see [`q8_ef`](#kv-cache)). This is distribution preservation, not identical seeded sampled token streams. DFlash/other drafters without this policy still fall back to AR for unsupported penalty requests. |
 | `mtp_ngram` | `"auto"` | `on` \| `off` \| `auto` (also `1` / `0`) | **Default `auto` (0.4.1).** N-gram takeover windows inside native MTP (ngram-mod). `auto` arms native Qwen4 MTP (arch 16, Flash-Next) on gfx1151 and gfx1201 and leaves every other producer off; `on`/`1` arms every MTP producer that supports it; `off`/`0` is the opt-out (kill switch). Env `HIPFIRE_MTP_NGRAM` beats TOML beats default. Eligible requests are greedy and sampled, thinking on or off (Qwen4 and Qwen3.5/3.x). A sampled takeover verifies each candidate with the point-mass draft distribution δ(candidate) through the shared rejection verify: lossless in distribution, not bit-identical to MTP-only output. The pool is request-local (cleared and reseeded from the full prompt every request), so candidates never depend on earlier requests. Triple (`HIPFIRE_NGRAM_MOD_N_MATCH` / `_N_MIN` / `_N_MAX`, overridable per component): 5/3/3 on admitted Qwen4 targets, 24/48/64 elsewhere; on Qwen4 `n_max` is capped at 63 (the 64-row verify). On Qwen4 a pool hit takes the window only when the MTP head's own first draft equals the first candidate and the takeover's measured yield (decayed emitted tokens per takeover window over its verify cost) is at least the native window's best expected rate; otherwise the window is native. The Qwen4 takeover uses the same batched verify executor as native MTP windows (interleaved one-row route under `HIPFIRE_MTP_INCREMENTAL=1`) and appends the consumed rows to the MTP head teacher-forced (token p, target hidden p - 1), matching the draft steps' pairing. Load marker: `qwen4 native MTP n-gram: on\|off (n_match=.. n_min=.. n_max=..)`; `HIPFIRE_MTP_TRACE=1` window events carry `source` / `verify_route`. The 5/3/3 pool described here is the copy lane's `off` state; `speculation.mtp_ngram_copy` / `HIPFIRE_MTP_NGRAM_COPY` (`on` arms the 5/1/63 copy lane, default `auto` = off) switches it. |
 | `mtp_ngram_copy` | `"auto"` | `on` \| `off` \| `auto` (also `1` / `0`) | Native Qwen4 MTP n-gram copy lane (verbatim-copy matcher, adaptive take of up to the row-exact verify rows minus one, row-0 confirmation only until the copy source is established, kept on floor-retired requests). on/1 arms it wherever the native Qwen4 n-gram source is armed (triple 5/1/63); off/0 keeps the 5/3/3 pool with row-0 confirmation on every takeover; auto (default) is off on every GPU for now. Env `HIPFIRE_MTP_NGRAM_COPY` beats TOML beats default. |
 | `dspark_conf_threshold` | `null` | `null` or number 0.0–1.0 | `null` ⇒ per-arch carrier default (qwen3 0.1 / deepseek4 0.3 in comments). |
@@ -1167,7 +1234,7 @@ Compat env: `HIPFIRE_GPU_LAYER_BUDGET`, `HIPFIRE_MOE_EXPERT_BUDGET`, `HIPFIRE_OF
 | `memory.ple_format` | `auto` | `auto` \| `q4` \| `q8`; which PLE row table a Flash-Next (Qwen4) load reads. `q8` = the exact Q8F16 rows (the `<model>.ple-q8` sidecar of a split base, which is the stock MQ4 XTS layout, or the rows embedded in a grandfathered monolithic MQ4 XTS install); `q4` = the 4-bit Lloyd-Max rows `<model>.ple-q4`, decode equal to the tested q4 table, a load never derives it: a missing file is refused naming both searched locations (the model path as given, then its canonical symlink target), `hipfire pull <tag> --ple q4` and `hipfire ple derive --format q4 <model>` (derives it from the local Q8 rows, about 1 minute, progress on stderr). `auto` = q4 on gfx1151 (unified-memory Strix Halo), q8 elsewhere; `auto` never derives or downloads and falls back to the other available format with a note. An explicit `q8` on a split base needs `<model>.ple-q8` (`hipfire pull <tag> --ple q8`; `serve` downloads it on demand for registry models). See [Qwen4 PLE row tables](#qwen4-ple-row-tables). Env: `HIPFIRE_PLE_FORMAT` ([`env-vars.md`](env-vars.md)). |
 | `memory.ple_prewarm_bytes` | `auto` | `auto` or int 0–1 TiB; idle-only page-cache prewarm of the q4 PLE table `<model>.ple-q4` after the model is ready (a rank-ordered table: hottest tier first, then tier 0 again, the hot-row store's prewarm; a row-ordered one: sequentially). `auto` is derived from the host RAM left once the model is loaded: the base budget is `MemAvailable` − CMA region − 8 GiB, sampled once after the pinned experts and the rest of the model are loaded (so the weights are already subtracted and the reserve is never charged twice). On a unified-memory GPU and on a discrete GPU whose experts are all resident in VRAM, `auto` = min(15 GiB, that budget) (the hottest rows, where the value per GB of warm rows is highest). Only on a discrete GPU with host-placed experts (pinned or host-mapped expert tensors) is `auto` uncapped, so a host with more free RAM keeps more of the table warm, hottest rows first. Every `auto` budget is capped at the table's data bytes; an unreadable `MemAvailable` resolves `auto` to 0 (off). `0` = off (kill switch); an explicit N is that many bytes, is never capped at 15 GiB or otherwise rewritten, and overrides the RAM derivation (the table still caps it). The pages are clean, reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission. See [Qwen4 PLE row tables](#qwen4-ple-row-tables). Env: `HIPFIRE_PLE_PREWARM_BYTES` ([`env-vars.md`](env-vars.md)). |
 | `memory.ple_load_fill_bytes` | `auto` | `auto` or int 0–1 TiB; bytes of a rank-ordered q4 PLE table `<model>.ple-q4` read into the page cache **while the model loads**, hottest rows first, at most 0.2 GB/s so the weight upload keeps the drive. The upload streams the model file through the same cache and evicts the oldest pages first, so the fill re-reads evicted pages of its prefix (found with `mincore`), hottest first, until ready. Ready never waits for it; the resident prefix serves the first request, and the prewarm after ready (`memory.ple_prewarm_bytes`) continues at its end. `auto` = 14 GiB on every GPU (the smallest prefix whose modelled prose and agentic 8K prefill is within 1% of the 15 GiB prewarm's); any value is capped at the table, at an explicit `memory.ple_prewarm_bytes`, and at the host RAM available at load start (`MemAvailable` minus the CMA region, plus TTM's page pool) minus the weights the load puts in host RAM minus 8 GiB. `0` = off. Clean, reclaimable page cache, not charged in admission. Env: `HIPFIRE_PLE_LOAD_FILL_BYTES` ([`env-vars.md`](env-vars.md)). |
-| `memory.state_quant` | `auto` | `auto` \| `q8` \| `int8` \| `fp32` \| `f32` \| `q4` \| `int4`. GDN/DeltaNet recurrent-state storage; `auto` per-model/arch default (Qwen3.8-Flash-Next: F32 on exact gfx1151, Q8 elsewhere; Qwen3.5: Q8). Explicit values honored or refused, never rewritten; q4/int4 Qwen3.5-only. Kill switch: `hipfire config set state_quant q8` or `HIPFIRE_STATE_QUANT=q8`. Env: `HIPFIRE_STATE_QUANT` ([`env-vars.md`](env-vars.md)). See [KV cache](#kv-cache) for the Qwen4 format, numerical and memory-owner semantics. |
+| `memory.state_quant` | `auto` | `auto` \| `q8` \| `int8` \| `q8_ef` \| `fp32` \| `f32` \| `q4` \| `int4`. GDN/DeltaNet recurrent-state storage; `auto` per-model/arch default (Qwen3.8-Flash-Next: F32 on exact gfx1151, Q8 elsewhere; Qwen3.5: Q8) and never `q8_ef`. Explicit values honored or refused, never rewritten; q4/int4 Qwen3.5-only; `q8_ef` (explicit opt-in) Qwen3.8-Flash-Next-only: Q8 plus a live f16 error-feedback residual zeroed on rollback/restore, own `q8_ef-reset` cache scope, restored/rolled-back continuation differs from uninterrupted EF, MTP == AR not guaranteed, sampled requests use AR until the sampled-MTP law is verified, refused with `HIPFIRE_QWEN4_GDN_Q8_INLINE=1`. Kill switch: `hipfire config set state_quant q8` or `HIPFIRE_STATE_QUANT=q8`. Env: `HIPFIRE_STATE_QUANT` ([`env-vars.md`](env-vars.md)). See [KV cache](#kv-cache) for the Qwen4 format, numerical and memory-owner semantics. |
 
 Qwen AR, MTP and DFlash multi-turn reuse store each completed assistant turn as the
 **verbatim generated token span** (whole envelope: full body tokens, plus
@@ -1859,7 +1926,7 @@ uses ambient variables in engine hot paths.
 | `ple_load_fill_bytes` | `memory.ple_load_fill_bytes` | `HIPFIRE_PLE_LOAD_FILL_BYTES` | `auto` (read the hottest 14 GiB of a rank-ordered q4 PLE table during load at ≤ 0.2 GB/s; `0` off) |
 | `session_cache_disk_bytes` | `memory.session_cache_disk_bytes` | `HIPFIRE_SESSION_CACHE_DISK_BYTES` | 0 (off) |
 | `session_cache_dir` | `memory.session_cache_dir` | `HIPFIRE_SESSION_CACHE_DIR` | `$HIPFIRE_HOME/session-cache` |
-| `state_quant` | `memory.state_quant` | `HIPFIRE_STATE_QUANT` | `"auto"` (Flash-Next: F32 on exact gfx1151, Q8 elsewhere; Qwen3.5: Q8) |
+| `state_quant` | `memory.state_quant` | `HIPFIRE_STATE_QUANT` | `"auto"` (Flash-Next: F32 on exact gfx1151, Q8 elsewhere; Qwen3.5: Q8; `q8_ef` only when explicit) |
 | `devices` | `hardware.devices` | `HIPFIRE_DEVICES` (alias `HIPFIRE_DEVICE`) | unset |
 | `allow_mixed_arch` | `hardware.allow_mixed_arch` | `HIPFIRE_ALLOW_MIXED_ARCH` | false unless `1` |
 | `uniform_vram_tolerance_gb` | `hardware.uniform_vram_tolerance_gb` | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | unset |

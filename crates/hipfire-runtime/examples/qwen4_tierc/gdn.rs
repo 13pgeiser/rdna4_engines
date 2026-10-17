@@ -356,6 +356,7 @@ fn gdn_step_args<'a>(
     gate: &'a GpuTensor,
     beta: &'a GpuTensor,
     state: &'a GpuTensor,
+    format: GdnStateFormat,
     output: &'a GpuTensor,
     position: usize,
 ) -> GatedDeltaStep<'a> {
@@ -366,6 +367,8 @@ fn gdn_step_args<'a>(
         gate,
         beta,
         state,
+        format,
+        residual: None,
         output,
         key_heads: KH,
         value_heads: VH,
@@ -596,7 +599,7 @@ fn step_f32_gated(gpu: &mut Gpu) -> Result<String, String> {
         );
         let (g_row, b_row) = (view(&gate, row, VH), view(&beta, row, VH));
         let rec_row = view(&rec, row, VW);
-        let step = gdn_step_args(&q, &k, &v, &g_row, &b_row, &state, &rec_row, START_POSITION + row);
+        let step = gdn_step_args(&q, &k, &v, &g_row, &b_row, &state, GdnStateFormat::F32, &rec_row, START_POSITION + row);
         let gate_args = GatedDeltaGate {
             recurrent_output: &rec_row,
             z: &view(&z_t, row, VW),
@@ -689,7 +692,7 @@ fn step_q8_gated(gpu: &mut Gpu) -> Result<String, String> {
         let (g_row, b_row) = (view(&gate, row, VH), view(&beta, row, VH));
         let rec_row = view(&rec, row, VW);
         let out_row = view(&out, row, VW);
-        let step = gdn_step_args(&q, &k, &v, &g_row, &b_row, &state, &rec_row, START_POSITION + row);
+        let step = gdn_step_args(&q, &k, &v, &g_row, &b_row, &state, GdnStateFormat::Q8, &rec_row, START_POSITION + row);
         let gate_args = GatedDeltaGate {
             recurrent_output: &rec_row,
             z: &view(&z_t, row, VW),
@@ -870,6 +873,8 @@ fn step_batched(gpu: &mut Gpu) -> Result<String, String> {
                 gate: &gate,
                 beta: &beta,
                 state: &state_b,
+                format: GdnStateFormat::F32,
+                residual: None,
                 output: &out_b,
                 row_states: None,
                 rows,
@@ -895,7 +900,7 @@ fn step_batched(gpu: &mut Gpu) -> Result<String, String> {
             let o_row = view(&out_s, row, VW);
             gated_delta_step(
                 gpu,
-                &gdn_step_args(&q, &k, &v, &g_row, &b_row, &state_s, &o_row, START_POSITION + row),
+                &gdn_step_args(&q, &k, &v, &g_row, &b_row, &state_s, GdnStateFormat::F32, &o_row, START_POSITION + row),
             )
             .map_err(e)?;
         }

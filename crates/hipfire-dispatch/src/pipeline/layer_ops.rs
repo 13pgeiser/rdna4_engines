@@ -1699,6 +1699,13 @@ pub struct GatedDeltaNetOp<'a> {
     pub norm: &'a GpuTensor,
     pub output: WeightRef<'a>,
     pub recurrent: &'a GpuTensor,
+    /// Storage format of `recurrent` (and of a row capture's ring: the plain
+    /// `format.storage()` slot). Declared by the owner of the state; never
+    /// inferred from the tensor.
+    pub format: GdnStateFormat,
+    /// Live F16 residual of a `Q8Ef` state (`Some` exactly when
+    /// `format.has_residual()`); the same owner as `recurrent`.
+    pub residual: Option<&'a GpuTensor>,
     pub conv_state: &'a GpuTensor,
     pub projection: &'a GpuTensor,
     pub projection2: &'a GpuTensor,
@@ -1815,9 +1822,7 @@ impl GatedDeltaNetOp<'_> {
                 DType::F32,
                 "gated delta projection scratch",
             )?;
-            let state_format = GdnStateFormat::of(self.recurrent).map_err(|error| {
-                DispatchError::Hip(format!("gated delta state: {error}"))
-            })?;
+            let state_format = self.format;
             if !state_format.supports(self.key_dim, self.value_dim) {
                 return Err(DispatchError::Hip(format!(
                     "gated delta {} state needs 128x128 heads",
@@ -1830,6 +1835,27 @@ impl GatedDeltaNetOp<'_> {
                 state_format.dtype(),
                 "gated delta state",
             )?;
+            match (state_format.has_residual(), self.residual) {
+                (true, Some(residual)) => require_tensor(
+                    residual,
+                    state_format.residual_units(self.value_heads, self.key_dim, self.value_dim),
+                    DType::F16,
+                    "gated delta state residual",
+                )?,
+                (true, None) => {
+                    return Err(DispatchError::Hip(format!(
+                        "gated delta {} state needs its live F16 residual",
+                        state_format.name()
+                    )));
+                }
+                (false, Some(_)) => {
+                    return Err(DispatchError::Hip(format!(
+                        "gated delta {} state takes no residual",
+                        state_format.name()
+                    )));
+                }
+                (false, None) => {}
+            }
             require_tensor(
                 self.conv_state,
                 checked_mul(self.conv_kernel - 1, qkv_width, "gated delta conv state")?,
@@ -1951,6 +1977,8 @@ pub fn gdn_qkv_projection_bf16(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool {
         gate: op.gate,
         beta: op.beta,
         state: op.recurrent,
+        format: op.format,
+        residual: op.residual,
         output: op.recurrent_output,
         row_states: None,
         rows: op.rows,
@@ -2330,6 +2358,8 @@ fn execute_gated_delta_net_hc_impl(
         gate: &gate,
         beta: &beta,
         state: op.recurrent,
+        format: op.format,
+        residual: op.residual,
         output: &recurrent_output,
         row_states: capture.map(|c| &c.states),
         rows,
@@ -2613,6 +2643,8 @@ fn execute_gated_delta_net_hc_impl(
                     gate: &gate_row,
                     beta: &beta_row,
                     state: op.recurrent,
+                    format: op.format,
+                    residual: op.residual,
                     output: &recurrent_output,
                     key_heads: op.key_heads,
                     value_heads: op.value_heads,
@@ -4589,6 +4621,8 @@ mod tests {
                 norm: &self.norm,
                 output: weight(&self.output, 2, 2),
                 recurrent: &self.recurrent,
+                format: GdnStateFormat::F32,
+                residual: None,
                 conv_state: &self.conv_state,
                 projection: &self.projection,
                 projection2: &self.projection2,

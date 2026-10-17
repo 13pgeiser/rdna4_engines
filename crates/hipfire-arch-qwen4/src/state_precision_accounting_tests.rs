@@ -39,16 +39,19 @@ fn format_of(qsa: QsaKvFormat, gdn: GdnStateFormat) -> Qwen4StateFormat {
     }
 }
 
+/// Recurrent slot bytes per layer. Q8Ef stores plain Q8 codes+scales in the
+/// slot (its live f16 residual is a separate owner, charged once per live
+/// state and never in the ring/mirror/snapshot; see `gdn_q8ef_reset_lifecycle`).
 fn slot_of(gdn: GdnStateFormat) -> usize {
     match gdn {
-        GdnStateFormat::Q8 => Q8_SLOT,
+        GdnStateFormat::Q8 | GdnStateFormat::Q8Ef => Q8_SLOT,
         GdnStateFormat::F32 => F32_SLOT,
     }
 }
 
 fn ring_of(gdn: GdnStateFormat, index: usize) -> usize {
     match gdn {
-        GdnStateFormat::Q8 => RING_Q8[index],
+        GdnStateFormat::Q8 | GdnStateFormat::Q8Ef => RING_Q8[index],
         GdnStateFormat::F32 => RING_F32[index],
     }
 }

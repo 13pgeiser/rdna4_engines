@@ -82,9 +82,9 @@
 //! # GDN state mode and graph policy
 //!
 //! `HIPFIRE_GDN_TEST_STATE_QUANT=q8|fp32` picks the GDN recurrent-state format
-//! (unset = `q8`, the historical fixture; `q8_ef` is reserved and refuses with
-//! "not available in this build" until Track B lands; anything else is
-//! refused). The value is passed as `state_request` to `resolve_state_format`
+//! (unset = `q8`, the historical fixture). `q8_ef` refuses before model loading:
+//! use `q8_ef_product_routes_hw`, where cross-route equality is diagnostic.
+//! The value is passed as `state_request` to `resolve_state_format`
 //! and the run fails unless the resolved `GdnStateFormat` is the requested one
 //! (the product's `HIPFIRE_STATE_QUANT` is never read). The parent resolves the
 //! mode once and sets it in every child's environment, so it is part of each
@@ -343,6 +343,11 @@ const NGRAM_ARMS: [Arm; 5] = [
 ];
 
 fn model_path() -> PathBuf {
+    let (_, format) = hw_identity::gdn_test_state_quant().unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        format != hipfire_arch_qwen4::GdnStateFormat::Q8Ef,
+        "q8_ef cross-route equality is diagnostic; run q8_ef_product_routes_hw instead of greedy_mtp_identity_hw"
+    );
     let path = std::env::var_os(MODEL_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| panic!("{MODEL_ENV} must name qwen3.8-flash-next-gptq3.mq4"));

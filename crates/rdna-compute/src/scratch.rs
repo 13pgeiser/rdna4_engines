@@ -315,7 +315,7 @@ pub struct ScratchState {
     /// `QSA_SELECT_GLOBAL_ROWS` rows of the arena's padded block count.
     pub qsa_select_scores: Option<DeviceBuffer>,
     pub qsa_select_scores_bytes: usize,
-    /// F32 dequantization of one Q8 GDN state for the chunked prefill route.
+    /// F32 dequantization of one Q8 / Q8Ef GDN state for the chunked prefill route.
     pub gdn_state_f32: Option<DeviceBuffer>,
     pub gdn_state_f32_bytes: usize,
     /// F16 K and block-transposed V of the QSA cache rows the gathered WMMA
@@ -1354,6 +1354,17 @@ pub const MQ_FIXED_WORKSPACE_BYTES: usize = (2 * MQ_FWHT_SIGNS_G256
     + MQ_X_Q8_BYTES
     + MQ_X_SCALES_BYTES;
 
+/// Whether the exact-gfx1201 dense GDN scan (`fn_gdn_dense`) admits a GDN state stored in
+/// `format`: plain Q8 and live-EF Q8Ef; never F32 and never another architecture (gfx942 is
+/// F32-only). Geometry, row floor and flags are the route's own checks.
+pub fn qwen4_dense_gdn_admits(arch: &str, format: crate::tensor_ops::GdnStateFormat) -> bool {
+    arch == "gfx1201"
+        && matches!(
+            format,
+            crate::tensor_ops::GdnStateFormat::Q8 | crate::tensor_ops::GdnStateFormat::Q8Ef
+        )
+}
+
 /// Model dimensions the Qwen4 prefill workspace census reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Qwen4PrefillWorkspaceDims {
@@ -1363,10 +1374,12 @@ pub struct Qwen4PrefillWorkspaceDims {
     pub top_k: usize,
     pub hc_count: usize,
     pub hc_lowrank: usize,
-    /// The dense GDN scan's thread-local A / EF scratch is reachable (exact
-    /// gfx1201 route). Needs the `deltanet` feature: without it the scratch
-    /// cannot be sized and a `true` here yields `None`.
-    pub dense_gdn: bool,
+    /// GDN state format whose dense-scan scratch is reachable (exact gfx1201 route,
+    /// [`qwen4_dense_gdn_admits`]); `None` when the route is not. `Q8` and `Q8Ef` charge the A
+    /// scratch; only `Q8` also charges the thread-local zero-entry EF scratch (`Q8Ef` scans
+    /// against the owner's live residual, which the state owner charges, not this census). Needs
+    /// the `deltanet` feature: without it the scratch cannot be sized and `Some` yields `None`.
+    pub gdn_format: Option<crate::tensor_ops::GdnStateFormat>,
     /// Include the GDN head-pair counters the short-tail remainder steps
     /// allocate.
     pub include_short_tails: bool,
@@ -1385,7 +1398,7 @@ pub struct Qwen4PrefillWorkspaceDims {
 /// `gdn_pair_counters`. Every term is the owning allocator's size query, not a
 /// copy of its formula. Excludes F16 weight shadows, `State::device_bytes`, the
 /// QSA selector / gather scratch and stage buffers. `None` on overflow, a
-/// dimension an owning allocator rejects, or `dense_gdn` without `deltanet`.
+/// dimension an owning allocator rejects, or `gdn_format` without `deltanet`.
 pub fn qwen4_prefill_workspace_terms(
     rows: usize,
     dims: &Qwen4PrefillWorkspaceDims,
@@ -1415,16 +1428,15 @@ pub fn qwen4_prefill_workspace_terms(
         0
     };
     #[cfg(feature = "deltanet")]
-    let (gdn_a, gdn_ef) = if dims.dense_gdn {
-        (
-            crate::fn_gdn_dense::workspace_a_bytes(rows)?,
-            crate::fn_gdn_dense::workspace_ef_bytes(rows),
-        )
-    } else {
-        (0, 0)
+    let (gdn_a, gdn_ef) = match dims.gdn_format {
+        Some(format) => (
+            crate::fn_gdn_dense::workspace_a_bytes_for(format, rows)?,
+            crate::fn_gdn_dense::workspace_ef_bytes_for(format, rows),
+        ),
+        None => (0, 0),
     };
     #[cfg(not(feature = "deltanet"))]
-    let (gdn_a, gdn_ef) = if dims.dense_gdn { return None } else { (0usize, 0usize) };
+    let (gdn_a, gdn_ef) = if dims.gdn_format.is_some() { return None } else { (0usize, 0usize) };
     let pair_counters = if dims.include_short_tails {
         crate::tensor_ops::GDN_PAIR_COUNTERS_BYTES
     } else {
@@ -3668,7 +3680,7 @@ mod scratch_growth_tests {
 mod prefill_workspace_tests {
     use super::*;
 
-    fn flash_next(dense_gdn: bool, include_short_tails: bool) -> Qwen4PrefillWorkspaceDims {
+    fn flash_next(gdn_format: Option<crate::tensor_ops::GdnStateFormat>, include_short_tails: bool) -> Qwen4PrefillWorkspaceDims {
         Qwen4PrefillWorkspaceDims {
             hidden_size: 2560,
             moe_intermediate_size: 640,
@@ -3676,7 +3688,7 @@ mod prefill_workspace_tests {
             top_k: 10,
             hc_count: 4,
             hc_lowrank: 320,
-            dense_gdn,
+            gdn_format,
             include_short_tails,
             routed_i4: true,
         }
@@ -3707,7 +3719,7 @@ mod prefill_workspace_tests {
     #[test]
     fn flash_next_4096_workspace_terms() {
         let sum = |terms: [(&str, u64); 11]| terms.iter().map(|t| t.1).sum::<u64>();
-        let terms = qwen4_prefill_workspace_terms(4096, &flash_next(true, true)).unwrap();
+        let terms = qwen4_prefill_workspace_terms(4096, &flash_next(Some(crate::tensor_ops::GdnStateFormat::Q8), true)).unwrap();
         let names: Vec<&str> = terms.iter().map(|t| t.0).collect();
         assert_eq!(
             names,
@@ -3725,23 +3737,63 @@ mod prefill_workspace_tests {
             ]
         );
         assert_eq!(sum(terms), 153_261_832);
-        let no_tails = qwen4_prefill_workspace_terms(4096, &flash_next(true, false)).unwrap();
+        let no_tails = qwen4_prefill_workspace_terms(4096, &flash_next(Some(crate::tensor_ops::GdnStateFormat::Q8), false)).unwrap();
         assert_eq!(sum(no_tails), 153_260_808);
-        let no_gdn = qwen4_prefill_workspace_terms(4096, &flash_next(false, false)).unwrap();
+        let no_gdn = qwen4_prefill_workspace_terms(4096, &flash_next(None, false)).unwrap();
         assert_eq!(sum(no_gdn), 153_260_808 - 25_165_824 - 1_572_864);
+    }
+
+    /// The dense scan's A scratch is charged for every admitted GDN state (Q8, Q8Ef); the
+    /// 1.5 MiB thread-local zero-entry EF scratch only for plain Q8 (Q8Ef scans against the
+    /// live residual, charged by the state owner); F32 never reaches the route.
+    #[cfg(feature = "deltanet")]
+    #[test]
+    fn dense_gdn_workspace_terms_charge_by_format() {
+        use crate::tensor_ops::GdnStateFormat;
+        let terms = |format| qwen4_prefill_workspace_terms(4096, &flash_next(format, true)).unwrap();
+        let gdn = |format| {
+            let t = terms(format);
+            assert_eq!(t[8].0, "gdn_dense_a");
+            assert_eq!(t[9].0, "gdn_dense_ef");
+            (t[8].1, t[9].1)
+        };
+        assert_eq!(gdn(Some(GdnStateFormat::Q8)), (25_165_824, 1_572_864));
+        assert_eq!(gdn(Some(GdnStateFormat::Q8Ef)), (25_165_824, 0));
+        assert_eq!(gdn(Some(GdnStateFormat::F32)), (0, 0));
+        assert_eq!(gdn(None), (0, 0));
+        // Every other term is format-independent.
+        for format in [GdnStateFormat::Q8, GdnStateFormat::Q8Ef, GdnStateFormat::F32] {
+            let (with, without) = (terms(Some(format)), terms(None));
+            for index in (0..11).filter(|index| *index != 8 && *index != 9) {
+                assert_eq!(with[index], without[index], "{format:?} term {index}");
+            }
+        }
+    }
+
+    #[test]
+    fn dense_gdn_admission_is_exact_gfx1201_q8_family() {
+        use crate::tensor_ops::GdnStateFormat::{Q8, Q8Ef, F32};
+        for arch in ["gfx1100", "gfx1151", "gfx942", "gfx1200", "gfx12010", ""] {
+            for format in [F32, Q8, Q8Ef] {
+                assert!(!qwen4_dense_gdn_admits(arch, format), "{arch} {format:?}");
+            }
+        }
+        assert!(qwen4_dense_gdn_admits("gfx1201", Q8));
+        assert!(qwen4_dense_gdn_admits("gfx1201", Q8Ef));
+        assert!(!qwen4_dense_gdn_admits("gfx1201", F32));
     }
 
     #[test]
     fn workspace_terms_overflow_and_invalid_dims_are_none() {
-        assert!(qwen4_prefill_workspace_terms(usize::MAX, &flash_next(false, false)).is_none());
-        let mut dims = flash_next(false, false);
+        assert!(qwen4_prefill_workspace_terms(usize::MAX, &flash_next(None, false)).is_none());
+        let mut dims = flash_next(None, false);
         dims.hidden_size = 2561; // int4 sidecar needs k % 256 == 0
         assert!(qwen4_prefill_workspace_terms(4096, &dims).is_none());
     }
 
     #[test]
     fn dense_profile_without_routed_i4_charges_only_generic_terms() {
-        let mut dims = flash_next(false, false);
+        let mut dims = flash_next(None, false);
         dims.num_experts = 0;
         dims.top_k = 0;
         dims.moe_intermediate_size = 0;
@@ -3772,7 +3824,7 @@ mod prefill_workspace_tests {
             top_k: 0,
             hc_count: 4,
             hc_lowrank: 32,
-            dense_gdn: false,
+            gdn_format: None,
             include_short_tails: true,
             routed_i4: true,
         };

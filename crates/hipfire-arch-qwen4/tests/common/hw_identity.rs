@@ -99,8 +99,9 @@ pub fn env_snapshot(overrides: EnvOverrides<'_>, exclude: &[&str]) -> BTreeMap<S
 }
 
 /// The test-mode variable that picks the GDN recurrent-state format the
-/// hardware tests run under (`q8` default, `fp32`; `q8_ef` is reserved and
-/// refuses). The product's `HIPFIRE_STATE_QUANT` is never read here.
+/// hardware tests run under (`q8` default, `fp32`, `q8_ef`: Q8 plus the live
+/// f16 error-feedback residual). The product's `HIPFIRE_STATE_QUANT` is never
+/// read here.
 pub const GDN_TEST_STATE_QUANT_ENV: &str = "HIPFIRE_GDN_TEST_STATE_QUANT";
 
 /// A test-mode value: the canonical request string handed to
@@ -111,11 +112,9 @@ pub fn parse_gdn_test_state_quant(
     match value {
         None | Some("q8") => Ok(("q8", GdnStateFormat::Q8)),
         Some("fp32") => Ok(("fp32", GdnStateFormat::F32)),
-        Some("q8_ef") => Err(format!(
-            "{GDN_TEST_STATE_QUANT_ENV}=q8_ef is not available in this build"
-        )),
+        Some("q8_ef") => Ok(("q8_ef", GdnStateFormat::Q8Ef)),
         Some(other) => Err(format!(
-            "{GDN_TEST_STATE_QUANT_ENV}={other:?} is not a known mode (accepted: q8, fp32)"
+            "{GDN_TEST_STATE_QUANT_ENV}={other:?} is not a known mode (accepted: q8, fp32, q8_ef)"
         )),
     }
 }
@@ -644,8 +643,10 @@ mod lever_state_tests {
             parse_gdn_test_state_quant(Some("fp32")),
             Ok(("fp32", GdnStateFormat::F32))
         );
-        let ef = parse_gdn_test_state_quant(Some("q8_ef")).unwrap_err();
-        assert!(ef.contains("q8_ef is not available in this build"), "{ef}");
+        assert_eq!(
+            parse_gdn_test_state_quant(Some("q8_ef")),
+            Ok(("q8_ef", GdnStateFormat::Q8Ef))
+        );
         for other in ["", "f32", "int8", "auto", "FP32", "q4"] {
             let error = parse_gdn_test_state_quant(Some(other)).unwrap_err();
             assert!(error.contains("accepted: q8, fp32"), "{other:?}: {error}");

@@ -6,8 +6,12 @@
 //!
 //! The fused producer preserves the lab route's serial BF16 Q/K norm,
 //! F16 packing and chunk-local gate cumsum. The consumer reads the scan's
-//! BF16 output directly. The Q8 state aliases the scan's codes/scales; EF
-//! enters as zero and is discarded on exit (FN keeps none). Exit Q8 uses
+//! BF16 output directly. The Q8 state aliases the scan's codes/scales. A plain Q8 state's EF
+//! enters as zero (thread-local scratch, cleared by the producer) and is discarded on exit
+//! (FN keeps none). A Q8Ef state scans against its live per-layer residual (`p.residual`,
+//! F16 `[head][row][key]`): the producer's clear is disabled (`ef_words == 0`), the scan
+//! rebuilds `code * scale + ef` on entry and stores the new residual on exit, so the residual
+//! persists across prefill launches. Exit Q8 uses
 //! round-to-nearest-even, not the pipe128 recurrence's stochastic rounding.
 //! Default on for admitted steps; `HIPFIRE_FN_GDN_DENSE_SCAN=0` opts out.
 
@@ -37,23 +41,51 @@ pub fn workspace_a_bytes(rows: usize) -> Option<usize> {
     rows.div_ceil(64).checked_mul(64)?.checked_mul(A_ROW_BYTES)
 }
 
-/// Bytes of the thread-local zero-entry EF scratch (one per allocation, rows-independent);
-/// 0 below the [`applies`] row floor.
+/// Bytes of the thread-local zero-entry EF scratch of a plain Q8 state (one per allocation,
+/// rows-independent); 0 below the [`applies`] row floor. A Q8Ef state scans against its live
+/// residual instead and never allocates this ([`workspace_ef_bytes_for`]).
 pub fn workspace_ef_bytes(rows: usize) -> usize {
     if rows < MIN_ROWS { 0 } else { EF_BYTES }
 }
 
-/// Total thread-local workspace (A + EF) of the dense scan for `rows` rows,
-/// `None` on overflow. Excludes the aliased Q/K/V/G/scan-output views.
+/// A scratch bytes the dense scan charges for a state stored in `format`: the
+/// [`workspace_a_bytes`] of an admitted Q8 / Q8Ef state, 0 for F32 (the route is unreachable).
+pub fn workspace_a_bytes_for(format: GdnStateFormat, rows: usize) -> Option<usize> {
+    match format {
+        GdnStateFormat::Q8 | GdnStateFormat::Q8Ef => workspace_a_bytes(rows),
+        GdnStateFormat::F32 => Some(0),
+    }
+}
+
+/// Thread-local EF scratch bytes the dense scan charges for `format`: [`workspace_ef_bytes`]
+/// for plain Q8 only. A Q8Ef state's persistent residual belongs to the state owner and is
+/// not charged here; F32 never reaches the route.
+pub fn workspace_ef_bytes_for(format: GdnStateFormat, rows: usize) -> usize {
+    match format {
+        GdnStateFormat::Q8 => workspace_ef_bytes(rows),
+        GdnStateFormat::Q8Ef | GdnStateFormat::F32 => 0,
+    }
+}
+
+/// Total thread-local workspace (A + EF) of the dense scan for `rows` rows of a plain Q8
+/// state, `None` on overflow. Excludes the aliased Q/K/V/G/scan-output views.
 pub fn workspace_bytes(rows: usize) -> Option<usize> {
-    workspace_a_bytes(rows)?.checked_add(workspace_ef_bytes(rows))
+    workspace_bytes_for(GdnStateFormat::Q8, rows)
+}
+
+/// [`workspace_bytes`] for a state stored in `format`.
+pub fn workspace_bytes_for(format: GdnStateFormat, rows: usize) -> Option<usize> {
+    workspace_a_bytes_for(format, rows)?.checked_add(workspace_ef_bytes_for(format, rows))
 }
 
 struct Scratch {
     rows: usize,
     a: GpuTensor,
-    ef: GpuTensor,
+    /// Zero-entry EF plane of a plain Q8 state; allocated on first plain-Q8 use and never for
+    /// Q8Ef (which scans against the owner's live residual).
+    ef: Option<GpuTensor>,
 }
+
 
 thread_local! {
     /// One scratch per device id: a single submission thread can drive several
@@ -70,13 +102,21 @@ fn raw(t: &GpuTensor, off: usize, len: usize) -> GpuTensor {
     }
 }
 
-/// Exact gfx1201 FN geometry, Q8 state, no capture/recording, and the mseg
-/// segment geometry. Other steps retain the incumbent recurrence.
+/// Pure admission by architecture, state format and live residual: exact gfx1201
+/// ([`crate::scratch::qwen4_dense_gdn_admits`]), a plain Q8 state (scratch EF, no residual
+/// tensor) or a Q8Ef state with its live residual. F32 and every other architecture retain
+/// the incumbent recurrence.
+fn admits_state(arch: &str, format: GdnStateFormat, has_residual: bool) -> bool {
+    crate::scratch::qwen4_dense_gdn_admits(arch, format) && has_residual == format.has_residual()
+}
+
+/// Exact gfx1201 FN geometry, Q8 or Q8Ef state (with its live residual), no
+/// capture/recording, and the mseg segment geometry. Other steps retain the
+/// incumbent recurrence.
 pub fn applies(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool {
     let n = p.rows;
     gpu.flags.fn_gdn_dense_scan
-        && gpu.arch == "gfx1201"
-        && matches!(GdnStateFormat::of(p.state), Ok(GdnStateFormat::Q8))
+        && admits_state(&gpu.arch, p.format, p.residual.is_some())
         && p.row_states.is_none()
         && p.key_heads == 16
         && p.value_heads == 48
@@ -109,6 +149,16 @@ pub fn run(
     params: &GatedDeltaParamsBatched<'_>,
     p: &GatedDeltaStepBatched<'_>,
 ) -> HipResult<()> {
+    // Refuse before any launch: only an admitted format with its exact residual is run.
+    if !admits_state(&gpu.arch, p.format, p.residual.is_some()) {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "fn_gdn_dense: GDN state format/residual not admitted by the dense scan",
+        ));
+    }
+    crate::tensor_ops::validate_gdn_state(
+        p.format, p.state, p.residual, None, p.rows, p.value_heads, p.key_dim, p.value_dim,
+    )?;
     let n = p.rows;
     let n64 = n.div_ceil(64) * 64;
     // KKT clamps K loads to the last real row and guards G/beta; mseg clamps
@@ -133,9 +183,11 @@ pub fn run(
     if slot.as_ref().is_some_and(|s| s.rows < n64) {
         let s = slot.take().unwrap();
         gpu.free_tensor(s.a)?;
-        gpu.free_tensor(s.ef)?;
+        if let Some(ef) = s.ef {
+            gpu.free_tensor(ef)?;
+        }
     }
-    let s = match slot {
+    let mut s = match slot {
         Some(s) => s,
         None => Scratch {
             rows: n64,
@@ -145,10 +197,29 @@ pub fn run(
                 })?],
                 DType::Raw,
             )?,
-            ef: gpu.zeros(&[EF_BYTES], DType::Raw)?,
+            ef: None,
         },
     };
+    if p.residual.is_none() && s.ef.is_none() {
+        match gpu.zeros(&[EF_BYTES], DType::Raw) {
+            Ok(ef) => s.ef = Some(ef),
+            Err(error) => {
+                SCRATCH.with(|c| c.borrow_mut().push((gpu.device_id, s)));
+                return Err(error);
+            }
+        }
+    }
     let result = (|| -> HipResult<()> {
+        // Plain Q8: the cleared thread-local scratch (`ef_words` words zeroed by the
+        // producer's block x=81). Q8Ef: the owner's live residual, which the producer must
+        // not clear (`ef_words == 0`) and the scan reads on entry and rewrites on exit.
+        let (ef_plane, ef_words): (&GpuTensor, usize) = match (p.residual, s.ef.as_ref()) {
+            (Some(residual), _) => (residual, 0),
+            (None, Some(ef)) => (ef, EF_BYTES / 4),
+            (None, None) => {
+                return Err(hip_bridge::HipError::new(0, "fn_gdn_dense: missing EF plane"));
+            }
+        };
         let mut args = KernargBlob::new();
         for t in [
             conv.input, conv.kernel, conv.history, conv.next_history,
@@ -157,20 +228,20 @@ pub fn run(
         ] {
             args.push_ptr(t.buf.as_ptr());
         }
-        args.push_ptr(s.ef.buf.as_ptr());
+        args.push_ptr(ef_plane.buf.as_ptr());
         args.push_i32(n as i32);
         args.push_i32(n64 as i32);
         args.push_i32(conv.start_cursor as i32);
         args.push_i32(i32::from(conv.input.dtype == DType::BF16));
         args.push_f32((p.key_dim as f32).sqrt().recip());
-        args.push_i32((EF_BYTES / 4) as i32);
+        args.push_i32(ef_words as i32);
         launch(gpu, "fn_gdn_dense_producer", [82, (n64 / 32) as u32, 1], 256, &mut args)?;
         gpu.gdn_chunk_kkt_solve_batched(&k, p.gate, p.beta, &s.a, n)?;
         let codes = raw(p.state, 0, 48 * 128 * 128);
         let scales = raw(p.state, 48 * 128 * 128, 48 * 128 * 4);
         gpu.gdn_chunk_scan_layer_mseg(
             &q, &k, &v, &s.a, p.gate, p.beta,
-            &codes, &scales, &s.ef, &out, n,
+            &codes, &scales, ef_plane, &out, n,
         )
     })();
     SCRATCH.with(|c| c.borrow_mut().push((gpu.device_id, s)));
@@ -222,5 +293,57 @@ mod tests {
         assert_eq!(workspace_a_bytes(65), workspace_a_bytes(128));
         assert_eq!(workspace_bytes(63), Some(0));
         assert_eq!(workspace_a_bytes(usize::MAX), None);
+    }
+
+    /// Dense A is charged for every admitted state; the 1.5 MiB thread-local EF scratch
+    /// only for plain Q8 (Q8Ef scans against the owner's live residual, which this scratch
+    /// census never charges); F32 never reaches the route.
+    #[test]
+    fn fn_gdn_dense_workspace_charges_by_format() {
+        const A_4096: usize = 25_165_824;
+        const EF: usize = 1_572_864;
+        assert_eq!(EF_BYTES, EF);
+        for (format, a, ef) in [
+            (GdnStateFormat::Q8, A_4096, EF),
+            (GdnStateFormat::Q8Ef, A_4096, 0),
+            (GdnStateFormat::F32, 0, 0),
+        ] {
+            assert_eq!(workspace_a_bytes_for(format, 4096), Some(a), "{format:?} A");
+            assert_eq!(workspace_ef_bytes_for(format, 4096), ef, "{format:?} EF");
+            assert_eq!(workspace_bytes_for(format, 4096), Some(a + ef), "{format:?} total");
+            // Below the row floor the route never allocates, whatever the format.
+            assert_eq!(workspace_bytes_for(format, MIN_ROWS - 1), Some(0), "{format:?} floor");
+        }
+        assert_eq!(workspace_bytes(4096), workspace_bytes_for(GdnStateFormat::Q8, 4096));
+        // The residual tensor Q8Ef scans against is exactly the scratch plane's extent.
+        assert_eq!(GdnStateFormat::Q8Ef.residual_bytes(48, 128, 128), EF_BYTES);
+        for format in [GdnStateFormat::Q8, GdnStateFormat::Q8Ef, GdnStateFormat::F32] {
+            assert_eq!(workspace_a_bytes_for(format, usize::MAX), if format == GdnStateFormat::F32 { Some(0) } else { None });
+        }
+    }
+
+    /// `applies`' format/architecture/residual predicate: exact gfx1201, Q8 without a
+    /// residual tensor, Q8Ef with one; never F32, never another architecture (gfx942 is
+    /// F32-only), never a residual/format mismatch.
+    #[test]
+    fn fn_gdn_dense_admission_table() {
+        use GdnStateFormat::{Q8, Q8Ef, F32};
+        let arches = ["gfx1201", "gfx1151", "gfx1100", "gfx942", "gfx1200", ""];
+        for arch in arches {
+            for (format, residual, want) in [
+                (Q8, false, true),
+                (Q8, true, false),
+                (Q8Ef, true, true),
+                (Q8Ef, false, false),
+                (F32, false, false),
+                (F32, true, false),
+            ] {
+                assert_eq!(
+                    admits_state(arch, format, residual),
+                    arch == "gfx1201" && want,
+                    "{arch} {format:?} residual={residual}"
+                );
+            }
+        }
     }
 }

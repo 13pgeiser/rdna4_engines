@@ -6,6 +6,12 @@
 //!
 //! `Qwen4State` owns the GPU buffers and releases them through `free_gpu`.
 //! `Reference*` structs are used only by CPU equation tests and parity probes.
+//!
+//! Q8Ef owns one separate F16 residual per live GDN layer. The recurrent
+//! tensors, verify ring, transaction mirror and session/prefix/disk payloads
+//! remain plain Q8. Restores discard EF history through a recorded zero
+//! dispatch; uninterrupted forwards and all-accept commits retain it. The
+//! live plane is charged once per owner, never once per snapshot or ring row.
 
 use crate::config::{LayerType, Qwen4Config};
 use crate::kv_backend::{Qwen4ContextCommit, Qwen4KvBackend};
@@ -20,9 +26,9 @@ use rdna_compute::qsa_pooled_mirror::{
     qsa_pooled_bf16_mirror_enabled, QsaPooledBf16MirrorRef, QsaPooledBf16ValidBlocks,
 };
 use rdna_compute::tensor_ops::{
-    copy_regions, gated_delta_rollback_layers, qsa_f16_arena_rows, CopyRegion,
-    GatedDeltaRollbackLayers, GdnStateFormat, QsaF16ArenaRef, QsaF16ValidLen, QsaKvFormat,
-    QsaStateLayout,
+    copy_regions, gated_delta_rollback_layers, gdn_q8ef_residual_zero, qsa_f16_arena_rows,
+    CopyRegion, GatedDeltaRollbackLayers, GdnStateFormat, QsaF16ArenaRef, QsaF16ValidLen,
+    QsaKvFormat, QsaStateLayout,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::fmt;
@@ -260,12 +266,76 @@ pub struct ReferenceHyperConnectionState {
 }
 
 /// A production GDN state block: the recurrent state in the state's
-/// `GdnStateFormat` (F32, or a Raw Q8 slot) and the F32 convolution history.
+/// `GdnStateFormat` (F32, or a Raw Q8 slot), optional live-only F16 error
+/// feedback, and the F32 convolution history. Snapshots never own feedback.
 /// The tensors must be freed by `Qwen4State::free_gpu`; no `Drop` attempts
 /// to call HIP.
 pub struct GdnGpuState {
     pub recurrent: GpuTensor,
+    pub ef_residual: Option<GpuTensor>,
     pub conv: GpuTensor,
+}
+
+/// Whether a transition discards the uninterrupted live EF history. Session,
+/// prefix and disk restores share `Restore`; lane reinitialization uses `Reset`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GdnResidualTransition {
+    Reset,
+    Restore,
+    PartialRollback,
+    #[cfg(test)]
+    Keep,
+}
+
+/// The lab event kind of a residual transition that dispatched a zero
+/// sequence.
+#[cfg(feature = "lab")]
+fn lab_residual_kind(event: GdnResidualTransition) -> Option<crate::lab_window::LabResidualKind> {
+    use crate::lab_window::LabResidualKind as Kind;
+    match event {
+        GdnResidualTransition::Reset => Some(Kind::Reset),
+        GdnResidualTransition::Restore => Some(Kind::Restore),
+        GdnResidualTransition::PartialRollback => Some(Kind::PartialRollback),
+        #[cfg(test)]
+        GdnResidualTransition::Keep => None,
+    }
+}
+
+fn gdn_residual_reset_required(format: GdnStateFormat, event: GdnResidualTransition) -> bool {
+    format.has_residual()
+        && match event {
+            GdnResidualTransition::Reset
+            | GdnResidualTransition::Restore
+            | GdnResidualTransition::PartialRollback => true,
+            #[cfg(test)]
+            GdnResidualTransition::Keep => false,
+        }
+}
+
+/// Keep the legacy Q8/F32 metadata byte-for-byte. EF has Q8 payload extents,
+/// but a distinct restore ABI even when a caller bypasses the cache domain.
+fn gdn_session_tag(scope: u64, format: GdnStateFormat) -> u64 {
+    match format {
+        GdnStateFormat::F32 | GdnStateFormat::Q8 => scope,
+        GdnStateFormat::Q8Ef => scope ^ 0x7138_5f65_662d_7273,
+    }
+}
+
+fn validate_gdn_session_tag(scope: u64, format: GdnStateFormat, tag: u64) -> Result<(), StateError> {
+    if tag == gdn_session_tag(scope, format) {
+        Ok(())
+    } else {
+        Err(StateError::SnapshotShape)
+    }
+}
+
+fn validate_gdn_profile(config: &Qwen4Config, format: GdnStateFormat) -> Result<(), StateError> {
+    if config.profile.is_ar_only() && format.has_residual() {
+        return Err(StateError::Config(
+            "qwen4: stock-FP8 pins F32 GDN state; q8_ef is refused".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// A QSA layer's persistent F16 K/V arena, derived from the layer's F32 K/V
@@ -793,7 +863,7 @@ pub fn resolve_gdn_format(request: &str, config: &Qwen4Config) -> Result<GdnStat
     if config.profile.is_ar_only() {
         return match request.as_str() {
             "" | "auto" | "fp32" | "f32" => Ok(GdnStateFormat::F32),
-            "q8" | "int8" => Err(format!(
+            "q8" | "int8" | "q8_ef" => Err(format!(
                 "qwen4: the stock-FP8 artifact pins the F32 GDN recurrent state (its numerical \
                  contract); state_quant '{request}' is refused, use fp32 or leave it unset"
             )),
@@ -808,11 +878,14 @@ pub fn resolve_gdn_format(request: &str, config: &Qwen4Config) -> Result<GdnStat
         "" | "auto" if q8 => Ok(GdnStateFormat::Q8),
         "" | "auto" | "fp32" | "f32" => Ok(GdnStateFormat::F32),
         "q8" | "int8" if q8 => Ok(GdnStateFormat::Q8),
-        "q8" | "int8" => Err(format!(
-            "qwen4: q8 GDN state needs 128x128 heads (have {key_dim} x {value_dim}); use fp32"
+        // Explicit-only Q8 with a live f16 error-feedback residual (Track B,
+        // option (a)); `auto` never selects it.
+        "q8_ef" if q8 => Ok(GdnStateFormat::Q8Ef),
+        "q8" | "int8" | "q8_ef" => Err(format!(
+            "qwen4: {request} GDN state needs 128x128 heads (have {key_dim} x {value_dim}); use fp32"
         )),
         other => Err(format!(
-            "qwen4: unsupported GDN state_quant '{other}' (expected auto|q8|fp32)"
+            "qwen4: unsupported GDN state_quant '{other}' (expected auto|q8|q8_ef|fp32)"
         )),
     }
 }
@@ -825,10 +898,16 @@ pub fn resolve_gdn_format(request: &str, config: &Qwen4Config) -> Result<GdnStat
 /// gfx1201 and the rest keep Q8 for `auto`, the stock-FP8 profile stays pinned
 /// to F32, and explicit `q8|int8|fp32|f32` values are honored or refused,
 /// never rewritten.
+///
+/// `q8_inline` is the raw `HIPFIRE_QWEN4_GDN_Q8_INLINE` developer flag. A
+/// resolved `q8_ef` with it set is refused on every architecture: `q8_ef` has
+/// no inline WY kernel (none has run on a GPU), and the flag is never silently
+/// ignored. No other result depends on it.
 fn resolve_gdn_format_for_arch(
     request: &str,
     config: &Qwen4Config,
     arch: &str,
+    q8_inline: bool,
 ) -> Result<GdnStateFormat, String> {
     let auto = matches!(request.trim().to_ascii_lowercase().as_str(), "" | "auto");
     if auto
@@ -838,7 +917,15 @@ fn resolve_gdn_format_for_arch(
     {
         return Ok(GdnStateFormat::F32);
     }
-    resolve_gdn_format(request, config)
+    let format = resolve_gdn_format(request, config)?;
+    if q8_inline && format == GdnStateFormat::Q8Ef {
+        return Err(
+            "qwen4: state_quant q8_ef does not support the inline WY developer route \
+                    (HIPFIRE_QWEN4_GDN_Q8_INLINE=1) yet; unset one of them"
+                .into(),
+        );
+    }
+    Ok(format)
 }
 
 /// Storage formats of a Qwen4 request state.
@@ -886,7 +973,9 @@ impl Qwen4StateFormat {
 /// numerically different from the former Q8 default; gfx1100, gfx1201 and the
 /// other architectures keep Q8. The stock-FP8 profile pins F32 everywhere.
 /// The kill switch is `state_quant = "q8"` / `HIPFIRE_STATE_QUANT=q8`
-/// (explicit values are honored or refused, never rewritten).
+/// (explicit values are honored or refused, never rewritten). `q8_ef` together
+/// with the raw `HIPFIRE_QWEN4_GDN_Q8_INLINE=1` developer flag is refused on
+/// every architecture (`q8_ef` has no inline kernel yet).
 pub fn resolve_state_format(
     kv_request: &str,
     state_request: &str,
@@ -896,7 +985,12 @@ pub fn resolve_state_format(
     let qsa = resolve_qsa_format(kv_request, gpu, config)?;
     Ok(Qwen4StateFormat {
         qsa,
-        gdn: resolve_gdn_format_for_arch(state_request, config, &gpu.arch)?,
+        gdn: resolve_gdn_format_for_arch(
+            state_request,
+            config,
+            &gpu.arch,
+            gpu.flags.qwen4_gdn_q8_inline,
+        )?,
         qsa_f16_arena: rdna_compute::tensor_ops::qsa_f16_arena_enabled(gpu, qsa, config.head_dim),
         qsa_pooled_bf16: qsa_pooled_bf16_mirror_enabled(
             gpu,
@@ -1440,6 +1534,7 @@ pub(crate) fn scope_layer_counts(config: &Qwen4Config, scope: &Qwen4BandScope) -
 /// Shape constants every state allocation derives from `config`/`format`.
 struct StateGeometry {
     gdn_recurrent: usize,
+    gdn_residual: usize,
     conv_len: usize,
     full_width: usize,
     full_row_units: usize,
@@ -1454,11 +1549,33 @@ impl StateGeometry {
         format: &Qwen4StateFormat,
         max_seq_len: usize,
     ) -> Result<Self, StateError> {
-        let gdn_recurrent = format.gdn.state_units(
+        let state_elements = config
+            .linear_num_value_heads
+            .checked_mul(config.linear_key_head_dim)
+            .and_then(|n| n.checked_mul(config.linear_value_head_dim))
+            .ok_or(StateError::DimensionOverflow)?;
+        let storage = format.gdn.storage();
+        let gdn_recurrent = match storage {
+            GdnStateFormat::F32 => state_elements,
+            GdnStateFormat::Q8 => state_elements
+                .checked_add(
+                    config
+                        .linear_num_value_heads
+                        .checked_mul(config.linear_value_head_dim)
+                        .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+                        .ok_or(StateError::DimensionOverflow)?,
+                )
+                .ok_or(StateError::DimensionOverflow)?,
+            GdnStateFormat::Q8Ef => unreachable!("storage excludes live EF mode"),
+        };
+        let gdn_residual = format.gdn.residual_units(
             config.linear_num_value_heads,
             config.linear_key_head_dim,
             config.linear_value_head_dim,
         );
+        gdn_residual
+            .checked_mul(DType::F16.size())
+            .ok_or(StateError::DimensionOverflow)?;
         let conv_channels = config
             .linear_num_key_heads
             .checked_mul(config.linear_key_head_dim)
@@ -1491,6 +1608,7 @@ impl StateGeometry {
             / config.indexer_compress_ratio;
         Ok(Self {
             gdn_recurrent,
+            gdn_residual,
             conv_len,
             full_width,
             full_row_units,
@@ -1524,7 +1642,7 @@ impl StateTensorSpec {
 }
 
 /// Allocation order of a state over `map`: owned layers in absolute order (a
-/// GDN layer's recurrent then conv; a QSA layer's seven fixed/context tensors,
+/// GDN layer's recurrent, optional EF residual, then conv; a QSA layer's seven fixed/context tensors,
 /// then the F16 arena K/V, then the pooled BF16 mirror), then, on the input
 /// scope only, the PLE convolution history (PLE profiles) and
 /// `hyper_feedback`. Under the whole-model map this is exactly the order the
@@ -1546,9 +1664,17 @@ fn state_tensor_plan(
                 plan.push(StateTensorSpec::new(
                     format!("gdn[L{abs}].recurrent"),
                     geometry.gdn_recurrent,
-                    format.gdn.dtype(),
+                    format.gdn.storage().dtype(),
                     false,
                 ));
+                if format.gdn.has_residual() {
+                    plan.push(StateTensorSpec::new(
+                        format!("gdn[L{abs}].ef_residual"),
+                        geometry.gdn_residual,
+                        DType::F16,
+                        false,
+                    ));
+                }
                 plan.push(StateTensorSpec::new(
                     format!("gdn[L{abs}].conv"),
                     geometry.conv_len,
@@ -1718,6 +1844,7 @@ enum DigestRow {
     QsaMappedTokens,
     QsaMarks(usize),
     GdnRecurrent(usize),
+    GdnResidual(usize),
     GdnConv(usize),
     Qsa(usize, QsaDigestField),
     PleConv,
@@ -1821,6 +1948,7 @@ fn digest_key(map: &Qwen4StateMap, row: DigestRow, canonical: bool) -> String {
         DigestRow::QsaMappedTokens => "qsa_mapped_tokens".into(),
         DigestRow::QsaMarks(slot) => format!("{}.marks", qsa(slot)),
         DigestRow::GdnRecurrent(slot) => format!("{}.recurrent", gdn(slot)),
+        DigestRow::GdnResidual(slot) => format!("{}.ef_residual", gdn(slot)),
         DigestRow::GdnConv(slot) => format!("{}.conv", gdn(slot)),
         DigestRow::Qsa(slot, field) => format!("{}.{}", qsa(slot), field.name()),
         DigestRow::PleConv => "ple_conv".into(),
@@ -1876,8 +2004,14 @@ pub struct Qwen4State {
     /// Storage of every GDN layer's recurrent state (and its ring slots).
     gdn_format: GdnStateFormat,
     gdn_value_heads: usize,
+    /// Successful full-owner EF reset dispatch sequences, never serialized.
+    gdn_residual_resets: u64,
     /// Set only around a speculative verify forward.
     pub(crate) row_capture_armed: bool,
+    /// Lab observation of GDN residual resets and capture-ring events;
+    /// unarmed it records nothing (`crate::lab_window`).
+    #[cfg(feature = "lab")]
+    lab: crate::lab_window::LabStateTap,
     /// Storage of the QSA context arenas (full K/V, raw and pooled keys).
     qsa_backend: Qwen4KvBackend,
     /// Tokens every QSA context arena's accessible prefix covers: the
@@ -1990,6 +2124,7 @@ impl Qwen4State {
             return Err(StateError::InvalidCapacity);
         }
         let gdn_format = format.gdn;
+        validate_gdn_profile(config, gdn_format)?;
         if !gdn_format.supports(config.linear_key_head_dim, config.linear_value_head_dim) {
             return Err(StateError::Config(format!(
                 "GDN {} state needs 128x128 heads, not {} x {}",
@@ -2040,7 +2175,7 @@ impl Qwen4State {
 
         let expected_tensors = map
             .gdn_count()
-            .checked_mul(2)
+            .checked_mul(2 + usize::from(format.gdn.has_residual()))
             .and_then(|gdn| {
                 map.qsa_count()
                     .checked_mul(
@@ -2071,8 +2206,9 @@ impl Qwen4State {
             match config.layer_types[abs] {
                 LayerType::LinearAttention => {
                     let recurrent = next_tensor();
+                    let ef_residual = format.gdn.has_residual().then(|| next_tensor());
                     let conv = next_tensor();
-                    gdn.push(GdnGpuState { recurrent, conv });
+                    gdn.push(GdnGpuState { recurrent, ef_residual, conv });
                 }
                 LayerType::FullAttention => {
                     let full_keys = next_tensor();
@@ -2123,16 +2259,23 @@ impl Qwen4State {
         let hyper_feedback = map.owns_input().then(|| next_tensor());
         let model_id = next_qwen4_model_id();
         let ple_history = PleHistory::new(config.eos_token_id);
-        let snapshot_arena = match Qwen4StateSnapshotArena::new(
-            gpu,
-            &gdn,
-            &qsa,
-            ple_conv.as_ref(),
-            hyper_feedback.as_ref(),
-            model_id,
-            ple_history,
-            0,
-        ) {
+        let snapshot_arena = match (|| {
+            for layer in &gdn {
+                if let Some(residual) = &layer.ef_residual {
+                    gdn_q8ef_residual_zero(gpu, residual).map_err(StateError::Hip)?;
+                }
+            }
+            Qwen4StateSnapshotArena::new(
+                gpu,
+                &gdn,
+                &qsa,
+                ple_conv.as_ref(),
+                hyper_feedback.as_ref(),
+                model_id,
+                ple_history,
+                0,
+            )
+        })() {
             Ok(arena) => arena,
             Err(error) => {
                 // Reverse of allocation: feedback, PLE, then layers last to first.
@@ -2148,6 +2291,7 @@ impl Qwen4State {
                         LayerType::LinearAttention => {
                             let layer = gdn.remove(0);
                             owned.push(layer.recurrent);
+                            owned.extend(layer.ef_residual);
                             owned.push(layer.conv);
                         }
                         LayerType::FullAttention => {
@@ -2190,7 +2334,10 @@ impl Qwen4State {
             gdn_live: 0,
             gdn_format: format.gdn,
             gdn_value_heads: config.linear_num_value_heads,
+            gdn_residual_resets: u64::from(format.gdn.has_residual() && map.gdn_count() != 0),
             row_capture_armed: false,
+            #[cfg(feature = "lab")]
+            lab: crate::lab_window::LabStateTap::default(),
             qsa_backend: backend,
             qsa_mapped_tokens: match backend {
                 Qwen4KvBackend::Legacy => max_seq_len,
@@ -2205,7 +2352,7 @@ impl Qwen4State {
     }
 
     /// Device bytes one request state commits: every allocation
-    /// [`Self::new_with_backend`] makes (GDN recurrent and conv, the QSA
+    /// [`Self::new_with_backend`] makes (GDN recurrent, live-only EF and conv, the QSA
     /// fixed arenas and, as `context` commits them, the context arenas, PLE
     /// conv, hyper feedback) plus the snapshot arena's mirror of the state
     /// the forwards overwrite in place. The verify ring
@@ -2231,12 +2378,22 @@ impl Qwen4State {
         let f32_bytes = std::mem::size_of::<f32>();
         let recurrent = format
             .gdn
+            .storage()
             .state_units(
                 config.linear_num_value_heads,
                 config.linear_key_head_dim,
                 config.linear_value_head_dim,
             )
-            .checked_mul(format.gdn.dtype().size())?;
+            .checked_mul(format.gdn.storage().dtype().size())?;
+        let residual = if format.gdn.has_residual() {
+            config
+                .linear_num_value_heads
+                .checked_mul(config.linear_key_head_dim)?
+                .checked_mul(config.linear_value_head_dim)?
+                .checked_mul(DType::F16.size())?
+        } else {
+            0
+        };
         let conv_channels = config
             .linear_num_key_heads
             .checked_mul(config.linear_key_head_dim)?
@@ -2273,7 +2430,10 @@ impl Qwen4State {
             .checked_mul(f32_bytes)?;
         let context_arenas = context.committed_layer_bytes(config, format.layout())?;
         // Live state plus the snapshot arena's mirror of each in-place part.
-        let gdn_layer = recurrent.checked_add(conv)?.checked_mul(2)?;
+        let gdn_layer = recurrent
+            .checked_add(conv)?
+            .checked_mul(2)?
+            .checked_add(residual)?;
         let qsa_fixed = partial_keys
             .checked_add(partial_values)?
             .checked_add(selected)?
@@ -2291,6 +2451,68 @@ impl Qwen4State {
             .checked_mul(gdn_layers)?
             .checked_add(qsa_layer.checked_mul(qsa_layers)?)?
             .checked_add(per_request)
+    }
+
+    /// Explicit numerical mode: Raw dtype alone cannot distinguish Q8 and EF.
+    pub fn gdn_format(&self) -> GdnStateFormat {
+        self.gdn_format
+    }
+
+    /// Full-owner reset sequences submitted on this state's stream. Never
+    /// snapshot-restored: a restore itself contributes one reset event.
+    pub fn gdn_residual_resets(&self) -> u64 {
+        self.gdn_residual_resets
+    }
+
+    /// Arm (or disarm and clear) the lab residual/ring event tap.
+    #[cfg(feature = "lab")]
+    pub fn lab_observe_state(&mut self, armed: bool) {
+        self.lab.set_armed(armed);
+    }
+
+    /// The lab state tap is armed.
+    #[cfg(feature = "lab")]
+    pub fn lab_state_observed(&self) -> bool {
+        self.lab.armed()
+    }
+
+    /// Drain the residual-reset and ring events recorded since the last take.
+    #[cfg(feature = "lab")]
+    pub fn lab_take_state_events(&mut self) -> crate::lab_window::LabStateEvents {
+        self.lab.take()
+    }
+
+    /// Live capture-ring slot of every GDN layer's recurrent state.
+    #[cfg(feature = "lab")]
+    pub fn lab_gdn_live(&self) -> usize {
+        self.gdn_live
+    }
+
+    /// The ring half (0 or 1) the next armed multi-row verify would write
+    /// (`capture_base` of the live slot); `None` without a capture ring.
+    #[cfg(feature = "lab")]
+    pub fn lab_next_verify_ring_half(&self) -> Option<u8> {
+        (self.row_capture_rows != 0).then(|| u8::from(self.capture_base(self.gdn_live) != 0))
+    }
+
+    fn reset_gdn_residual(
+        &mut self,
+        gpu: &mut Gpu,
+        event: GdnResidualTransition,
+    ) -> Result<(), StateError> {
+        if !gdn_residual_reset_required(self.gdn_format, event) || self.gdn.is_empty() {
+            return Ok(());
+        }
+        for layer in &self.gdn {
+            let residual = layer.ef_residual.as_ref().ok_or(StateError::AllocationBookkeeping)?;
+            gdn_q8ef_residual_zero(gpu, residual).map_err(StateError::Hip)?;
+        }
+        self.gdn_residual_resets = self.gdn_residual_resets.saturating_add(1);
+        #[cfg(feature = "lab")]
+        if let Some(kind) = lab_residual_kind(event) {
+            self.lab.residual(kind, self.gdn_residual_resets);
+        }
+        Ok(())
     }
 
     /// A snapshot ticket of this state's arena is outstanding.
@@ -2326,6 +2548,7 @@ impl Qwen4State {
     fn reset_inner(&mut self, gpu: &mut Gpu, clear_rows: bool) -> Result<(), StateError> {
         self.reset_epoch = self.reset_epoch.wrapping_add(1);
         self.snapshot_arena.invalidate();
+        self.reset_gdn_residual(gpu, GdnResidualTransition::Reset)?;
         for layer in &self.gdn {
             gpu.hip
                 .memset(&layer.recurrent.buf, 0, layer.recurrent.buf.size())
@@ -2508,10 +2731,10 @@ impl Qwen4State {
     /// Device rows are `"<sha256 hex> bytes=<n>"` (fixed-size state) or
     /// `"<sha256 hex> bytes=<n> rows=<r>"` (QSA arenas):
     /// * fixed-size state every forward fully owns, hashed whole
-    ///   (`buf.size()`): every GDN recurrent (the live ring-slot view) and
-    ///   conv, PLE conv, hyper feedback, and the verify row-capture
-    ///   rings/inputs/recurrence/output when allocated. All are zero-filled at
-    ///   allocation (`gpu.zeros`) and by `reset` (memset);
+    ///   (`byte_size()`): every GDN recurrent (the live ring-slot view), live
+    ///   EF residual when present, conv, PLE conv, hyper feedback, and verify
+    ///   row-capture rings/inputs/recurrence/output when allocated. EF is
+    ///   reset by recorded dispatch; serialized layouts never include it.
     /// * QSA arenas, hashed over exactly the ACTIVE prefix the layer's marks
     ///   name (rows beyond it, and freshly mapped VMM pages, are not
     ///   guaranteed written): `full_keys` / `full_values` the first
@@ -2595,12 +2818,15 @@ impl Qwen4State {
                 Ok(format!("{hex} bytes={bytes} rows={live}"))
             };
         let missing = || StateError::AllocationBookkeeping;
-        let plan = digest_plan(
+        let mut plan = digest_plan(
             &self.map,
             canonical,
             !self.row_capture.is_empty(),
             self.row_capture_output.is_some(),
         );
+        if self.gdn_format.has_residual() {
+            plan.extend((0..self.gdn.len()).map(DigestRow::GdnResidual));
+        }
         let mut rows = Vec::with_capacity(plan.len());
         for row in plan {
             let value = match row {
@@ -2627,6 +2853,10 @@ impl Qwen4State {
                 DigestRow::GdnRecurrent(slot) => {
                     device(&self.gdn.get(slot).ok_or_else(missing)?.recurrent)?
                 }
+                DigestRow::GdnResidual(slot) => device(
+                    self.gdn.get(slot).ok_or_else(missing)?
+                        .ef_residual.as_ref().ok_or_else(missing)?,
+                )?,
                 DigestRow::GdnConv(slot) => device(&self.gdn.get(slot).ok_or_else(missing)?.conv)?,
                 DigestRow::Qsa(slot, field) => {
                     let layer = self.qsa.get(slot).ok_or_else(missing)?;
@@ -2741,7 +2971,7 @@ impl Qwen4State {
         history: PleHistory,
         commits: Option<&[(usize, usize, usize, usize, usize)]>,
     ) -> Result<(Vec<u8>, StateLayout<'_>), StateError> {
-        let mut words = vec![self.map.session_tag(), position as u64];
+        let mut words = vec![gdn_session_tag(self.map.session_tag(), self.gdn_format), position as u64];
         if self.ple_conv.is_some() {
             let [ple0, ple1] = history.previous();
             words.extend([u64::from(ple0), u64::from(ple1)]);
@@ -2801,10 +3031,8 @@ impl Qwen4State {
         if words.len() * 8 != self.session_meta_bytes() {
             return Err(StateError::SnapshotShape);
         }
-        // The reserved word carries the band identity (0 = whole model).
-        if words[0] != self.map.session_tag() {
-            return Err(StateError::SnapshotShape);
-        }
+        // The reserved word carries band identity and the live-only EF ABI.
+        validate_gdn_session_tag(self.map.session_tag(), self.gdn_format, words[0])?;
         let ple_words = self.session_ple_words();
         let ple = if ple_words == 0 {
             self.ple_history
@@ -2864,6 +3092,7 @@ impl Qwen4State {
         self.reset_epoch = self.reset_epoch.wrapping_add(1);
         self.snapshot_arena.invalidate();
         self.invalidate_f16_arenas();
+        self.reset_gdn_residual(gpu, GdnResidualTransition::Restore)?;
         self.session_layout(&marks)
     }
 
@@ -2967,9 +3196,13 @@ impl Qwen4State {
         let result = (|| -> Result<(), StateError> {
             if let Some(live) = self.snapshot_arena.gdn_live {
                 self.set_gdn_live(live);
+                #[cfg(feature = "lab")]
+                self.lab
+                    .ring(crate::lab_window::LabRingEvent::Restore { live });
             }
             let copies = arena_regions(self, &self.snapshot_arena, false)?;
             copy_regions(gpu, &copies).map_err(StateError::Hip)?;
+            self.reset_gdn_residual(gpu, GdnResidualTransition::Restore)?;
             let arena = &mut self.snapshot_arena;
             for (index, layer) in self.qsa.iter_mut().enumerate() {
                 let mark = arena.qsa_marks[index];
@@ -3073,6 +3306,9 @@ impl Qwen4State {
             if !ringed {
                 free(layer.recurrent);
             }
+            if let Some(residual) = layer.ef_residual {
+                free(residual);
+            }
             free(layer.conv);
         }
         for layer in self.qsa {
@@ -3136,12 +3372,13 @@ impl Qwen4State {
         }
         let value_heads = config.linear_num_value_heads;
         let ring = gdn
+            .storage()
             .state_units(
                 value_heads,
                 config.linear_key_head_dim,
                 config.linear_value_head_dim,
             )
-            .checked_mul(gdn.dtype().size())?
+            .checked_mul(gdn.storage().dtype().size())?
             .checked_mul(rows.checked_mul(2)?)?;
         let qkv = (2 * config.linear_num_key_heads)
             .checked_mul(config.linear_key_head_dim)?
@@ -3181,6 +3418,8 @@ impl Qwen4State {
             // agrees with them.
             self.row_capture_rows = rows;
             self.gdn_live = 0;
+            #[cfg(feature = "lab")]
+            self.lab.ring(crate::lab_window::LabRingEvent::Realloc { ring_rows: rows });
             return Ok(());
         }
         let mut next = Vec::with_capacity(self.gdn.len());
@@ -3243,6 +3482,8 @@ impl Qwen4State {
         }
         self.row_capture_rows = rows;
         self.gdn_live = 0;
+        #[cfg(feature = "lab")]
+        self.lab.ring(crate::lab_window::LabRingEvent::Realloc { ring_rows: rows });
         Ok(())
     }
 
@@ -3292,7 +3533,18 @@ impl Qwen4State {
     pub(crate) fn commit_row_capture(&mut self, rows: usize) {
         if self.row_capture_armed && rows >= 2 && rows <= self.row_capture_rows {
             let base = self.capture_base(self.gdn_live);
+            #[cfg(feature = "lab")]
+            let live_before = self.gdn_live;
             self.set_gdn_live(base + rows - 1);
+            #[cfg(feature = "lab")]
+            self.lab.ring(crate::lab_window::LabRingEvent::Verify {
+                rows,
+                ring_rows: self.row_capture_rows,
+                live_before,
+                base,
+                half: u8::from(base != 0),
+                live_after: self.gdn_live,
+            });
         }
     }
 
@@ -3360,7 +3612,7 @@ impl Qwen4State {
                 &GatedDeltaRollbackLayers {
                     table,
                     discard: output,
-                    format: self.gdn_format,
+                    format: self.gdn_format.storage(),
                     layers: self.gdn.len(),
                     rows,
                     keep,
@@ -3374,7 +3626,18 @@ impl Qwen4State {
             )
             .map_err(StateError::Hip)?;
         }
+        self.reset_gdn_residual(gpu, GdnResidualTransition::PartialRollback)?;
         self.set_gdn_live(base + keep - 1);
+        #[cfg(feature = "lab")]
+        self.lab.ring(crate::lab_window::LabRingEvent::Rollback {
+            rows,
+            keep,
+            ring_rows: self.row_capture_rows,
+            live_before: before,
+            base,
+            half: u8::from(base != 0),
+            live_after: self.gdn_live,
+        });
         let arena = &self.snapshot_arena;
         let ple_rollback = match (&self.ple_conv, &arena.ple_conv) {
             (Some(live), Some(saved)) => {
@@ -3654,6 +3917,144 @@ impl std::error::Error for StateError {}
 mod tests {
     use super::*;
 
+    #[test]
+    fn gdn_q8ef_reset_lifecycle() {
+        let config = crate::config::compact_test_config();
+        let scope = Qwen4BandScope::single(&config);
+        let map = Qwen4StateMap::new(&config, &scope).unwrap();
+        let format = |gdn| Qwen4StateFormat { gdn, ..Qwen4StateFormat::F32 };
+        let plan = |gdn| {
+            let format = format(gdn);
+            let geometry = StateGeometry::new(&config, &format, 1024).unwrap();
+            state_tensor_plan(&config, &format, 1024, &geometry, &map).unwrap()
+        };
+        let q8 = plan(GdnStateFormat::Q8);
+        let ef = plan(GdnStateFormat::Q8Ef);
+        let residuals: Vec<_> = ef.iter()
+            .filter(|part| part.key.ends_with(".ef_residual")).collect();
+        assert_eq!(residuals.len(), 36);
+        assert!(residuals.iter().all(|part| part.dtype == DType::F16
+            && part.elements == 48 * 128 * 128 && !part.context_arena));
+        for plain in [GdnStateFormat::F32, GdnStateFormat::Q8] {
+            assert!(!plain.has_residual());
+            assert!(plan(plain).iter().all(|part| !part.key.ends_with(".ef_residual")));
+        }
+        // Removing only the live companions leaves exactly the old allocation
+        // plan, so mirror and serialized recurrent extents cannot grow with EF.
+        let stored: Vec<_> = ef.iter()
+            .filter(|part| !part.key.ends_with(".ef_residual")).cloned().collect();
+        assert_eq!(stored, q8);
+        assert_eq!(residuals.iter().map(|part| part.elements * part.dtype.size()).sum::<usize>(),
+            54 * 1024 * 1024);
+        let context = Qwen4ContextCommit::legacy(1024);
+        let live = |gdn| Qwen4State::device_bytes(&config, format(gdn), &context).unwrap();
+        assert_eq!(live(GdnStateFormat::Q8Ef) - live(GdnStateFormat::Q8), 54 * 1024 * 1024);
+        for rows in [4, 8, 32] {
+            let ring = |gdn| Qwen4State::row_capture_bytes(&config, gdn, rows).unwrap();
+            assert_eq!(ring(GdnStateFormat::Q8Ef), ring(GdnStateFormat::Q8));
+            assert_eq!(
+                live(GdnStateFormat::Q8Ef) + ring(GdnStateFormat::Q8Ef)
+                    - live(GdnStateFormat::Q8) - ring(GdnStateFormat::Q8),
+                54 * 1024 * 1024,
+            );
+            for native_mtp in [false, true] {
+                assert_eq!(
+                    crate::bundle::session_snapshot_bytes(&config, format(GdnStateFormat::Q8Ef), native_mtp, rows),
+                    crate::bundle::session_snapshot_bytes(&config, format(GdnStateFormat::Q8), native_mtp, rows),
+                );
+            }
+        }
+        // Every PP/lane owner charges only its own live residual, not another
+        // owner's history; together PP bands equal the whole-model owner.
+        let pp_residual: usize = pp_scopes(&[24, 24]).iter().map(|band| {
+            Qwen4State::device_bytes_scoped(&config, format(GdnStateFormat::Q8Ef), &context, band).unwrap()
+                - Qwen4State::device_bytes_scoped(&config, format(GdnStateFormat::Q8), &context, band).unwrap()
+        }).sum();
+        assert_eq!(pp_residual, 54 * 1024 * 1024);
+    }
+
+    #[test]
+    fn gdn_q8ef_reset_lifecycle_events() {
+        use GdnResidualTransition::{Keep, PartialRollback, Reset, Restore};
+        for (label, event, clears) in [
+            ("initialize", Reset, true),
+            ("reset", Reset, true),
+            ("keep0", Restore, true),
+            ("partial rollback", PartialRollback, true),
+            ("transaction restore", Restore, true),
+            ("session restore", Restore, true),
+            ("prefix restore", Restore, true),
+            ("disk restore", Restore, true),
+            ("lane reinit", Reset, true),
+            ("all accept", Keep, false),
+            ("uninterrupted AR", Keep, false),
+            ("uninterrupted prefill", Keep, false),
+        ] {
+            // Two owners start with distinct residuals. A reset of one owner
+            // never writes the other; retained histories keep their exact bits.
+            let mut residual = [0x3800u16, 0xb800];
+            let other = [0x3400u16, 0xb400];
+            if gdn_residual_reset_required(GdnStateFormat::Q8Ef, event) {
+                residual.fill(0);
+            }
+            assert_eq!(residual, if clears { [0, 0] } else { [0x3800, 0xb800] }, "{label}");
+            assert_eq!(other, [0x3400, 0xb400], "{label}");
+            for plain in [GdnStateFormat::F32, GdnStateFormat::Q8] {
+                assert!(!gdn_residual_reset_required(plain, event), "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn gdn_q8ef_reset_lifecycle_cache_abi() {
+        use hipfire_runtime::session_cache::SessionRoute;
+        let config = crate::config::compact_test_config();
+        let map = Qwen4StateMap::new(&config, &Qwen4BandScope::single(&config)).unwrap();
+        let format = |gdn| Qwen4StateFormat { gdn, ..Qwen4StateFormat::F32 };
+        let scope = |gdn| crate::bundle::session_scope(SessionRoute::Ar, 256, format(gdn), false, None);
+        let ef_scope = scope(GdnStateFormat::Q8Ef);
+        assert!(ef_scope.contains("q8_ef-reset"), "{ef_scope}");
+        let ef_tag = gdn_session_tag(map.session_tag(), GdnStateFormat::Q8Ef);
+        assert!(validate_gdn_session_tag(map.session_tag(), GdnStateFormat::Q8Ef, ef_tag).is_ok());
+        for plain in [GdnStateFormat::F32, GdnStateFormat::Q8] {
+            assert_ne!(ef_scope, scope(plain));
+            let tag = gdn_session_tag(map.session_tag(), plain);
+            assert!(matches!(
+                validate_gdn_session_tag(map.session_tag(), plain, ef_tag),
+                Err(StateError::SnapshotShape),
+            ));
+            assert!(matches!(
+                validate_gdn_session_tag(map.session_tag(), GdnStateFormat::Q8Ef, tag),
+                Err(StateError::SnapshotShape),
+            ));
+        }
+        assert_ne!(
+            digest_key(&map, DigestRow::GdnResidual(0), true),
+            digest_key(&map, DigestRow::GdnRecurrent(0), true),
+        );
+    }
+
+    #[test]
+    fn gdn_q8ef_reset_lifecycle_overflow() {
+        let mut config = crate::config::compact_test_config();
+        config.linear_num_value_heads = usize::MAX;
+        let format = Qwen4StateFormat { gdn: GdnStateFormat::Q8Ef, ..Qwen4StateFormat::F32 };
+        assert!(matches!(StateGeometry::new(&config, &format, 1024), Err(StateError::DimensionOverflow)));
+        // The plain Q8 slot fits, but its separate F16 companion does not.
+        config.linear_num_value_heads = usize::MAX / (128 * 128 * 2) + 1;
+        assert!(matches!(StateGeometry::new(&config, &format, 1024), Err(StateError::DimensionOverflow)));
+    }
+
+    #[test]
+    fn gdn_q8ef_reset_lifecycle_stock_fp8_refusal() {
+        let flash = crate::config::compact_test_config();
+        assert!(validate_gdn_profile(&flash, GdnStateFormat::Q8Ef).is_ok());
+        let stock = flash.into_ar_only().unwrap();
+        let error = validate_gdn_profile(&stock, GdnStateFormat::Q8Ef).unwrap_err();
+        assert!(error.to_string().contains("stock-FP8") && error.to_string().contains("q8_ef"));
+        assert!(validate_gdn_profile(&stock, GdnStateFormat::F32).is_ok());
+    }
+
     /// The AR-only (stock-FP8) profile pins the F32 GDN recurrent state:
     /// `auto`/unset/fp32 resolve to F32 and an explicit q8 is refused; the
     /// checkpoint profile keeps its Q8 default.
@@ -3711,20 +4112,20 @@ mod tests {
                 };
                 for request in auto_requests {
                     assert_eq!(
-                        resolve_gdn_format_for_arch(request, config, arch),
+                        resolve_gdn_format_for_arch(request, config, arch, false),
                         Ok(auto_expected),
                         "{request:?} on {arch} / {name}"
                     );
                 }
                 for request in ["fp32", "f32"] {
                     assert_eq!(
-                        resolve_gdn_format_for_arch(request, config, arch),
+                        resolve_gdn_format_for_arch(request, config, arch, false),
                         Ok(GdnStateFormat::F32),
                         "{request:?} on {arch} / {name}"
                     );
                 }
                 for request in ["q8", "int8"] {
-                    let result = resolve_gdn_format_for_arch(request, config, arch);
+                    let result = resolve_gdn_format_for_arch(request, config, arch, false);
                     if name == "ordinary" {
                         assert_eq!(
                             result,
@@ -3736,13 +4137,52 @@ mod tests {
                     }
                 }
                 assert!(
-                    resolve_gdn_format_for_arch("bf16", config, arch).is_err(),
+                    resolve_gdn_format_for_arch("bf16", config, arch, false).is_err(),
                     "bf16 on {arch} / {name}"
                 );
             }
         }
         // The arch-agnostic export keeps the old meaning.
         assert_eq!(resolve_gdn_format("", &ordinary), Ok(GdnStateFormat::Q8));
+    }
+
+    /// `q8_ef` has no inline WY kernel (none has run on a GPU), so a load that
+    /// asks for both it and `HIPFIRE_QWEN4_GDN_Q8_INLINE=1` is refused on every
+    /// architecture; the inline flag changes no other request's result.
+    #[test]
+    fn q8_ef_refuses_inline_wy_developer_route() {
+        const REFUSAL: &str = "qwen4: state_quant q8_ef does not support the inline WY developer \
+                               route (HIPFIRE_QWEN4_GDN_Q8_INLINE=1) yet; unset one of them";
+        let ordinary = crate::config::compact_test_config();
+        for arch in ["gfx1151", "gfx1100", "gfx1201", "gfx942", "gfx1030"] {
+            assert_eq!(
+                resolve_gdn_format_for_arch("q8_ef", &ordinary, arch, true),
+                Err(REFUSAL.to_string()),
+                "q8_ef + inline on {arch}"
+            );
+            assert_eq!(
+                resolve_gdn_format_for_arch("q8_ef", &ordinary, arch, false),
+                Ok(GdnStateFormat::Q8Ef),
+                "q8_ef on {arch}"
+            );
+            assert_eq!(
+                resolve_gdn_format_for_arch("q8", &ordinary, arch, true),
+                Ok(GdnStateFormat::Q8),
+                "q8 + inline on {arch}"
+            );
+            assert_eq!(
+                resolve_gdn_format_for_arch("fp32", &ordinary, arch, true),
+                Ok(GdnStateFormat::F32),
+                "fp32 + inline on {arch}"
+            );
+            for request in ["", "auto"] {
+                assert_eq!(
+                    resolve_gdn_format_for_arch(request, &ordinary, arch, true),
+                    resolve_gdn_format_for_arch(request, &ordinary, arch, false),
+                    "{request:?} + inline on {arch}"
+                );
+            }
+        }
     }
 
     #[test]

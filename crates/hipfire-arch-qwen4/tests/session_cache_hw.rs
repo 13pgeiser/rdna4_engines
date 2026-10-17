@@ -120,12 +120,30 @@ fn assert_resolved_gdn_state(bundle: &Qwen4Bundle, request: &str, state_format: 
             want,
             "GDN layer {layer} recurrent bytes"
         );
+        let residual = state_format.gdn.residual_bytes(
+            config.linear_num_value_heads,
+            config.linear_key_head_dim,
+            config.linear_value_head_dim,
+        );
+        match (&state.ef_residual, state_format.gdn.has_residual()) {
+            (None, false) => {}
+            (Some(ef), true) => {
+                assert_eq!(ef.dtype, DType::F16, "GDN layer {layer} residual dtype");
+                assert_eq!(ef.byte_size(), residual, "GDN layer {layer} residual bytes");
+            }
+            (have, want) => panic!(
+                "GDN layer {layer}: residual present={} but format {:?} wants {want}",
+                have.is_some(),
+                state_format.gdn
+            ),
+        }
     }
     let scope = SessionState::snapshot_scope(bundle, SessionRoute::Ar).expect("session scope");
     let other = Qwen4StateFormat {
         gdn: match state_format.gdn {
             GdnStateFormat::F32 => GdnStateFormat::Q8,
             GdnStateFormat::Q8 => GdnStateFormat::F32,
+            GdnStateFormat::Q8Ef => GdnStateFormat::Q8,
         },
         ..state_format
     };

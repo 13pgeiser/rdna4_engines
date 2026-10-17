@@ -1552,6 +1552,18 @@ fn trace_rows(drafts: &[u32], picks: &[u32]) -> String {
         .join(",")
 }
 
+/// The `,"gdn_residual_resets":N` suffix of a `QWEN4_MTP_TRACE` window line:
+/// the submitted full-owner live EF residual zero sequences of `state`
+/// (initial reset, restores, partial rollbacks); empty unless the GDN format
+/// carries a live residual, so Q8/F32 trace lines are unchanged.
+fn gdn_residual_trace_field(state: &crate::state::Qwen4State) -> String {
+    if state.gdn_format().has_residual() {
+        format!(",\"gdn_residual_resets\":{}", state.gdn_residual_resets())
+    } else {
+        String::new()
+    }
+}
+
 /// Speculative windows (native or external, `k > 0`) the AR floor observes
 /// before its first measured decision.  Together with the one calibration
 /// token this bounds the speculation work that precedes the first decision:
@@ -2672,6 +2684,10 @@ struct SampledVerify {
     /// downloads no argmax picks unless trace or phase timers need them
     /// ([`Self::device_skip_picks`]).
     sampled_picks: bool,
+    /// The window being observed (`Qwen4MtpDrafter::lab_observe_windows`);
+    /// `None` unarmed, so every hook is a single test and does no work.
+    #[cfg(feature = "lab")]
+    lab: Option<Box<crate::lab_window::LabWindow>>,
 }
 
 impl SampledVerify {
@@ -2717,6 +2733,8 @@ impl SampledVerify {
             device_eligible,
             route_device: false,
             sampled_picks: mtp_sampled_picks_enabled(),
+            #[cfg(feature = "lab")]
+            lab: None,
         }
     }
 
@@ -2788,7 +2806,12 @@ impl SampledVerify {
         } else {
             (&self.policy, self.history.row(hist_row))
         };
-        Ok(sample_cpu(&mut self.host, history, policy))
+        let token = sample_cpu(&mut self.host, history, policy);
+        #[cfg(feature = "lab")]
+        if let Some(lab) = self.lab.as_mut() {
+            lab.note_naive_draw(hist_row, token);
+        }
+        Ok(token)
     }
 
     /// Draw the draft token from the last MTP prediction's `q` (penalized by
@@ -2816,7 +2839,14 @@ impl SampledVerify {
                 q,
             )
             .map_err(|error| error.to_string())?;
-        Ok(q.sample(self.rng.next_f32()))
+        #[cfg(feature = "lab")]
+        let lab_before = self.rng;
+        let token = q.sample(self.rng.next_f32());
+        #[cfg(feature = "lab")]
+        if let Some(lab) = self.lab.as_mut() {
+            lab.note_draft(token, q.entries(), &lab_before);
+        }
+        Ok(token)
     }
 
     /// Load physical verify row `row`'s `p` (penalized by history row
@@ -2847,7 +2877,12 @@ impl SampledVerify {
                 &mut self.scratch,
                 &mut self.target,
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        #[cfg(feature = "lab")]
+        if let Some(lab) = self.lab.as_mut() {
+            lab.note_row(hist_row, self.target.entries(), false);
+        }
+        Ok(())
     }
 
     /// Leviathan acceptance over a batched verify: `drafts[i]` is verified
@@ -2870,6 +2905,8 @@ impl SampledVerify {
         if self.gpu_rows {
             self.penalize_rows(gpu, bundle, 0, 0..drafts.len() + 1)?;
         }
+        #[cfg(feature = "lab")]
+        let lab_before = self.rng;
         if self.device_ready(drafts.len()) {
             return self.accept_leviathan_device(gpu, bundle, drafts, point_mass, eos);
         }
@@ -2885,6 +2922,8 @@ impl SampledVerify {
             target,
             drafts: draft_dists,
             points,
+            #[cfg(feature = "lab")]
+            lab,
             ..
         } = self;
         let qs = leviathan_qs(&mut *points, &*draft_dists, drafts, point_mass)?;
@@ -2893,7 +2932,7 @@ impl SampledVerify {
         let gpu_rows = *gpu_rows;
         let gpu = &*gpu;
         let bundle = &*bundle;
-        accept_sampled_prefix(drafts, qs, Some(eos), rng, target, |row, out| {
+        let acceptance = accept_sampled_prefix(drafts, qs, Some(eos), rng, target, |row, out| {
             let (policy, row_history) = if gpu_rows {
                 (&*row_policy, &[][..])
             } else {
@@ -2901,8 +2940,27 @@ impl SampledVerify {
             };
             bundle
                 .spec_row_dist(gpu, row, spec, row_history, policy, host, scratch, out)
-                .map_err(|error| error.to_string())
-        })
+                .map_err(|error| error.to_string())?;
+            #[cfg(feature = "lab")]
+            if let Some(lab) = lab.as_mut() {
+                lab.note_row(row, out.entries(), false);
+            }
+            Ok(())
+        })?;
+        #[cfg(feature = "lab")]
+        if let Some(lab) = lab.as_mut() {
+            lab.note_batched(
+                drafts,
+                qs,
+                point_mass,
+                &acceptance.committed,
+                acceptance.accepted,
+                acceptance.hit_eos,
+                &lab_before,
+                None,
+            );
+        }
+        Ok(acceptance)
     }
 
     /// Naive acceptance over a batched verify: row `i`'s draw is penalized
@@ -2922,11 +2980,56 @@ impl SampledVerify {
         if self.gpu_rows {
             self.penalize_rows(gpu, bundle, 0, 0..drafts.len() + 1)?;
         }
-        accept_naive_prefix(drafts, Some(eos), |row| {
+        let acceptance = accept_naive_prefix(drafts, Some(eos), |row| {
             let draw = self.draw_penalized(gpu, bundle, row, row)?;
             picks[row] = draw;
             Ok(draw)
-        })
+        })?;
+        #[cfg(feature = "lab")]
+        if let Some(lab) = self.lab.as_mut() {
+            lab.note_naive_batched(
+                drafts,
+                &acceptance.committed,
+                acceptance.accepted,
+                acceptance.hit_eos,
+            );
+        }
+        Ok(acceptance)
+    }
+
+    /// Host one-draft verdict of an interleaved window against `self.target`
+    /// (`p`, loaded by [`Self::load_target`]) and the window's draft
+    /// distribution 0, or with `point_mass` the point mass `points[0]` the
+    /// caller set on `draft`. Consumes one uniform on accept, two on reject.
+    #[cfg_attr(not(feature = "lab"), allow(clippy::let_and_return))]
+    fn host_step_verdict(&mut self, draft: u32, point_mass: bool) -> DraftVerdict {
+        let q = if point_mass {
+            &self.points[0]
+        } else {
+            &self.drafts[0]
+        };
+        #[cfg(feature = "lab")]
+        let lab_before = self.rng;
+        let verdict = verify_sampled_draft(&self.target, q, draft, &mut self.rng);
+        #[cfg(feature = "lab")]
+        if let Some(lab) = self.lab.as_mut() {
+            lab.note_step(draft, q.entries(), point_mass, verdict, &lab_before);
+        }
+        verdict
+    }
+
+    /// The bonus draw of an all-accepted interleaved window, or the target
+    /// draw of a target-only window, from `self.target`: one uniform.
+    #[cfg_attr(not(feature = "lab"), allow(clippy::let_and_return))]
+    fn host_bonus(&mut self) -> u32 {
+        #[cfg(feature = "lab")]
+        let lab_before = self.rng;
+        let token = self.target.sample(self.rng.next_f32());
+        #[cfg(feature = "lab")]
+        if let Some(lab) = self.lab.as_mut() {
+            lab.note_bonus(token, &lab_before);
+        }
+        token
     }
 }
 
@@ -3323,6 +3426,58 @@ impl DeviceAccept {
             .map_err(|error| format!("Qwen4 sampled MTP device target rows: {error}"))
     }
 
+    /// Read target rows `0..rows` of the resident device distributions back
+    /// as `SparseDist::entries()`-ordered rows (blocking). Lab only: the
+    /// production accept never reads the rows back.
+    #[cfg(feature = "lab")]
+    fn lab_target_rows(
+        &self,
+        gpu: &Gpu,
+        rows: usize,
+    ) -> Result<Vec<crate::lab_window::LabDist>, String> {
+        if rows > self.target.capacity_rows {
+            return Err(format!(
+                "Qwen4 sampled MTP lab target rows: {rows} exceed capacity {}",
+                self.target.capacity_rows
+            ));
+        }
+        let cap = SPEC_CPU_AR_CAP;
+        let read = |tensor: &GpuTensor| {
+            gpu.download_raw_bytes(tensor)
+                .map_err(|error| format!("Qwen4 sampled MTP lab target rows readback: {error}"))
+        };
+        let counts = read(&self.target.counts)?;
+        let ids = read(&self.target.ids)?;
+        let probabilities = read(&self.target.probabilities)?;
+        let word = |bytes: &[u8], index: usize| {
+            [
+                bytes[4 * index],
+                bytes[4 * index + 1],
+                bytes[4 * index + 2],
+                bytes[4 * index + 3],
+            ]
+        };
+        (0..rows)
+            .map(|row| {
+                let count = u32::from_ne_bytes(word(&counts, row)) as usize;
+                if count > cap {
+                    return Err(format!(
+                        "Qwen4 sampled MTP lab target row {row} holds {count} entries (cap {cap})"
+                    ));
+                }
+                Ok((0..count)
+                    .map(|slot| {
+                        let at = row * cap + slot;
+                        (
+                            u32::from_ne_bytes(word(&ids, at)),
+                            f32::from_ne_bytes(word(&probabilities, at)),
+                        )
+                    })
+                    .collect())
+            })
+            .collect()
+    }
+
     /// One ordered accept over the resident target rows `0..=k`: uploads the
     /// draft rows `qs`, the `proposals` and the next `k + 1` uniforms of `rng`
     /// (the stream itself is not advanced) with stream-ordered asynchronous
@@ -3522,6 +3677,8 @@ impl SampledVerify {
             drafts,
             points,
             route_device,
+            #[cfg(feature = "lab")]
+            lab,
             ..
         } = self;
         let q = if point_mass {
@@ -3538,10 +3695,25 @@ impl SampledVerify {
         let device = device
             .as_mut()
             .ok_or_else(|| "Qwen4 sampled MTP device accept is not provisioned".to_string())?;
+        #[cfg(feature = "lab")]
+        let lab_before = *rng;
         let words = device.accept(gpu, std::slice::from_ref(q), &[draft], rng, draft)?;
         let verdict = decode_device_verdict(&[draft], words, SPEC_CPU_AR_EOS_NONE)?;
         advance_rng(rng, verdict.consumed);
         *route_device = true;
+        #[cfg(feature = "lab")]
+        if let Some(lab) = lab.as_mut() {
+            let rows = device.lab_target_rows(&*gpu, 1)?;
+            lab.device_route = true;
+            lab.device_words.push(words);
+            let row = lab.rows.len();
+            lab.note_row(row, &rows[0], true);
+            let observed = match verdict.terminal {
+                None => DraftVerdict::Accept,
+                Some(token) => DraftVerdict::Reject(token),
+            };
+            lab.note_step(draft, q.entries(), point_mass, observed, &lab_before);
+        }
         Ok(match verdict.terminal {
             None => DraftVerdict::Accept,
             Some(token) => DraftVerdict::Reject(token),
@@ -3555,15 +3727,30 @@ impl SampledVerify {
             device,
             rng,
             route_device,
+            #[cfg(feature = "lab")]
+            lab,
             ..
         } = self;
         let device = device
             .as_mut()
             .ok_or_else(|| "Qwen4 sampled MTP device accept is not provisioned".to_string())?;
+        #[cfg(feature = "lab")]
+        let lab_before = *rng;
         let words = device.accept(gpu, &[], &[], rng, SPEC_CPU_AR_EOS_NONE)?;
         let verdict = decode_device_verdict(&[], words, SPEC_CPU_AR_EOS_NONE)?;
         advance_rng(rng, verdict.consumed);
         *route_device = true;
+        #[cfg(feature = "lab")]
+        if let Some(lab) = lab.as_mut() {
+            let rows = device.lab_target_rows(&*gpu, 1)?;
+            lab.device_route = true;
+            lab.device_words.push(words);
+            let row = lab.rows.len();
+            lab.note_row(row, &rows[0], true);
+            if let Some(token) = verdict.terminal {
+                lab.note_bonus(token, &lab_before);
+            }
+        }
         verdict
             .terminal
             .ok_or_else(|| "Qwen4 sampled MTP device bonus returned no token".to_string())
@@ -3594,6 +3781,8 @@ impl SampledVerify {
             drafts: draft_dists,
             points,
             route_device,
+            #[cfg(feature = "lab")]
+            lab,
             ..
         } = self;
         let qs = leviathan_qs(&mut *points, &*draft_dists, drafts, point_mass)?;
@@ -3601,10 +3790,33 @@ impl SampledVerify {
             .as_mut()
             .ok_or_else(|| "Qwen4 sampled MTP device accept is not provisioned".to_string())?;
         device.build_rows(gpu, &logits, vocab, k + 1, policy)?;
+        #[cfg(feature = "lab")]
+        let lab_before = *rng;
         let words = device.accept(gpu, qs, drafts, rng, eos)?;
         let verdict = decode_device_verdict(drafts, words, eos)?;
         advance_rng(rng, verdict.consumed);
         *route_device = true;
+        #[cfg(feature = "lab")]
+        if let Some(lab) = lab.as_mut() {
+            // The rows the ordered accept read: through the rejection (or
+            // bonus) row, or only the accepted rows of a stopping accept.
+            let read = verdict.accepted + usize::from(verdict.terminal.is_some());
+            for (row, p) in device.lab_target_rows(&*gpu, read)?.iter().enumerate() {
+                lab.note_row(row, p, true);
+            }
+            lab.device_route = true;
+            let observed = device_accept_result(drafts, &verdict);
+            lab.note_batched(
+                drafts,
+                qs,
+                point_mass,
+                &observed.committed,
+                observed.accepted,
+                observed.hit_eos,
+                &lab_before,
+                Some(words),
+            );
+        }
         Ok(device_accept_result(drafts, &verdict))
     }
 }
@@ -3684,6 +3896,7 @@ pub(crate) struct ReplicaParams {
     end_of_turn: Option<u32>,
     ngram_config: Option<NgramModConfig>,
     copy_lane: bool,
+    sampled_enabled: bool,
 }
 
 /// The host-visible part of a window every EP rank must agree on:
@@ -3964,6 +4177,15 @@ pub struct Qwen4MtpDrafter {
     /// The last native window, priced for the floor only when the next
     /// window is planned (see [`Self::finish_floor_window`]).
     floor_pending: Option<FloorPending>,
+    /// Lab window observation arming (`lab_observe_windows`).
+    #[cfg(feature = "lab")]
+    lab_arm: crate::lab_window::LabWindowArm,
+    /// The window of a request without sampled verification, while open.
+    #[cfg(feature = "lab")]
+    lab_open: Option<Box<crate::lab_window::LabWindow>>,
+    /// Closed window observations awaiting `lab_take_window_observation`.
+    #[cfg(feature = "lab")]
+    lab_done: std::collections::VecDeque<crate::lab_window::LabWindow>,
 }
 
 /// A finished native window awaiting its floor price.
@@ -4045,6 +4267,12 @@ impl Qwen4MtpDrafter {
             warm_depths: 0,
             warm_ar: false,
             floor_pending: None,
+            #[cfg(feature = "lab")]
+            lab_arm: crate::lab_window::LabWindowArm::default(),
+            #[cfg(feature = "lab")]
+            lab_open: None,
+            #[cfg(feature = "lab")]
+            lab_done: std::collections::VecDeque::new(),
         }
     }
 
@@ -4062,6 +4290,14 @@ impl Qwen4MtpDrafter {
     /// ([`Self::with_ngram`]) and the request arms n-gram; off by default.
     pub fn with_copy_lane(mut self, on: bool) -> Self {
         self.copy_lane = on;
+        self
+    }
+
+    /// Restrict sampled verification to loads that allow it: `false` turns
+    /// it off (sampled requests stay on AR), `true` keeps what
+    /// `speculation.mtp_sampled` resolved to; it never turns it on.
+    pub fn with_sampled_allowed(mut self, allowed: bool) -> Self {
+        self.sampled_enabled &= allowed;
         self
     }
 
@@ -4359,7 +4595,7 @@ impl Qwen4MtpDrafter {
                 }
                 committed.push(match sampled.as_deref_mut() {
                     Some(s) if device_rows => s.device_bonus(ops.gpu()?)?,
-                    Some(s) if s.draws_drafts() => s.target.sample(s.rng.next_f32()),
+                    Some(s) if s.draws_drafts() => s.host_bonus(),
                     _ => pick,
                 });
                 break;
@@ -4382,7 +4618,7 @@ impl Qwen4MtpDrafter {
                     if device_rows {
                         s.device_step_verdict(ops.gpu()?, draft, false)?
                     } else {
-                        verify_sampled_draft(&s.target, &s.drafts[0], draft, &mut s.rng)
+                        s.host_step_verdict(draft, false)
                     }
                 }
                 _ if draft == pick => DraftVerdict::Accept,
@@ -4456,8 +4692,9 @@ impl Qwen4MtpDrafter {
                 })
                 .collect::<Vec<_>>()
                 .join(",");
+            let gdn_resets = gdn_residual_trace_field(&Self::bundle(target)?.state);
             eprintln!(
-                "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"mtp\",\"verify_route\":\"interleaved\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{k},\"accepted\":{accepted},\"rows\":[{rows}],\"committed\":{committed:?}}}",
+                "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"mtp\",\"verify_route\":\"interleaved\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{k},\"accepted\":{accepted},\"rows\":[{rows}],\"committed\":{committed:?}{gdn_resets}}}",
                 accept_route_label(sampled.as_deref())
             );
         }
@@ -4713,7 +4950,7 @@ impl Qwen4MtpDrafter {
                 }
                 Some(s) => {
                     s.load_target(ops.gpu()?, Self::bundle(target)?, 0, 0)?;
-                    pick = s.target.sample(s.rng.next_f32());
+                    pick = s.host_bonus();
                 }
                 None => {}
             }
@@ -5875,8 +6112,9 @@ impl Qwen4MtpDrafter {
                 .copy_spec_hidden_row_to(gpu, target_accept_len, pending_hidden)
                 .map_err(|error| error.to_string())?;
             if trace && !self.follower {
+                let gdn_resets = gdn_residual_trace_field(&bundle.state);
                 eprintln!(
-                    "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"ngram\",\"verify_route\":\"batched\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{n},\"accepted\":{},\"rows\":[{}],\"committed\":{:?},\"baseline\":true}}",
+                    "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"ngram\",\"verify_route\":\"batched\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{n},\"accepted\":{},\"rows\":[{}],\"committed\":{:?},\"baseline\":true{gdn_resets}}}",
                     accept_route_label(sampled.as_deref()),
                     acceptance.accepted,
                     trace_rows(candidates, &target_picks),
@@ -6084,7 +6322,7 @@ impl Qwen4MtpDrafter {
             if row == n {
                 committed.push(match sampled.as_deref_mut() {
                     Some(s) if device_rows => s.device_bonus(gpu)?,
-                    Some(s) if s.draws_drafts() => s.target.sample(s.rng.next_f32()),
+                    Some(s) if s.draws_drafts() => s.host_bonus(),
                     _ => pick,
                 });
                 break;
@@ -6099,7 +6337,7 @@ impl Qwen4MtpDrafter {
                     if device_rows {
                         s.device_step_verdict(gpu, candidate, true)?
                     } else {
-                        verify_sampled_draft(&s.target, &s.points[0], candidate, &mut s.rng)
+                        s.host_step_verdict(candidate, true)
                     }
                 }
                 _ if candidate == pick => DraftVerdict::Accept,
@@ -6149,8 +6387,9 @@ impl Qwen4MtpDrafter {
             ));
         }
         if trace && !self.follower {
+            let gdn_resets = gdn_residual_trace_field(&bundle.state);
             eprintln!(
-                "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"ngram\",\"verify_route\":\"interleaved\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{n},\"accepted\":{accepted},\"rows\":[{}],\"committed\":{committed:?}}}",
+                "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"ngram\",\"verify_route\":\"interleaved\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{n},\"accepted\":{accepted},\"rows\":[{}],\"committed\":{committed:?}{gdn_resets}}}",
                 accept_route_label(sampled.as_deref()),
                 trace_rows(candidates, &picks)
             );
@@ -6883,6 +7122,7 @@ impl Qwen4MtpDrafter {
             end_of_turn: self.end_of_turn,
             ngram_config: self.ngram_config,
             copy_lane: self.copy_lane,
+            sampled_enabled: self.sampled_enabled,
         }
     }
 
@@ -6891,6 +7131,7 @@ impl Qwen4MtpDrafter {
         let mut replica = Self::new(params.max_k, params.ctx_capacity, params.end_of_turn)
             .with_ngram(params.ngram_config)
             .with_copy_lane(params.copy_lane);
+        replica.sampled_enabled = params.sampled_enabled;
         replica.follower = true;
         replica
     }
@@ -6997,9 +7238,34 @@ impl Qwen4MtpDrafter {
     }
 
     /// [`Self::run_window`] over an operation context: the one window body of
-    /// a single card and of a PP mesh.
+    /// a single card and of a PP mesh. With `feature = "lab"` and the drafter
+    /// armed (`lab_observe_windows`) the window is also observed; nothing of
+    /// that touches the window's result.
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(not(feature = "lab"), allow(clippy::let_and_return))]
     pub(crate) fn run_window_ops(
+        &mut self,
+        ops: &mut Qwen4Ops<'_>,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        emitted: &[u32],
+        eos: u32,
+        plan: &WindowPlan,
+    ) -> Result<MtpWindow, String> {
+        #[cfg(feature = "lab")]
+        let observed = self.lab_window_begin(target, position, seed, plan);
+        let result = self.run_window_ops_body(ops, target, position, seed, emitted, eos, plan);
+        #[cfg(feature = "lab")]
+        if observed {
+            self.lab_window_end(target, &result);
+        }
+        result
+    }
+
+    /// The window body of [`Self::run_window_ops`].
+    #[allow(clippy::too_many_arguments)]
+    fn run_window_ops_body(
         &mut self,
         ops: &mut Qwen4Ops<'_>,
         target: &mut dyn SpecTarget,
@@ -7321,8 +7587,9 @@ impl Qwen4MtpDrafter {
                     })
                     .collect::<Vec<_>>()
                     .join(",");
+                let gdn_resets = gdn_residual_trace_field(&picks.state);
                 eprintln!(
-                    "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"mtp\",\"verify_route\":\"batched\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{k},\"accepted\":{accepted_drafts},\"rows\":[{rows}],\"committed\":{:?},\"baseline\":true}}",
+                    "QWEN4_MTP_TRACE {{\"event\":\"window\",\"source\":\"mtp\",\"verify_route\":\"batched\",\"accept_route\":\"{}\",\"position\":{position},\"k\":{k},\"accepted\":{accepted_drafts},\"rows\":[{rows}],\"committed\":{:?},\"baseline\":true{gdn_resets}}}",
                     accept_route_label(sampled.as_ref()),
                     acceptance.committed
                 );
@@ -7923,6 +8190,111 @@ impl Qwen4MtpDrafter {
             .map_err(|error| format!("Qwen4 MTP lab pending hidden download: {error}"))?;
         Ok(bytes)
     }
+
+    /// Arm (or disarm) the production-window observation. Armed, every
+    /// `mtp_step` window leaves one [`crate::lab_window::LabWindow`] for
+    /// [`Self::lab_take_window_observation`]; the bundle's state and
+    /// forward-logits taps are armed at each window's start. Disarming drops
+    /// every unread observation. Read-only: nothing here changes a draw, a
+    /// verdict, a route or a launch.
+    pub fn lab_observe_windows(&mut self, arm: crate::lab_window::LabWindowArm) {
+        self.lab_arm = arm;
+        if !arm.armed {
+            self.lab_open = None;
+            self.lab_done.clear();
+            if let Some(sampled) = self.sampled.as_mut() {
+                sampled.lab = None;
+            }
+        }
+    }
+
+    /// The oldest unread window observation (one per observed `mtp_step`).
+    pub fn lab_take_window_observation(&mut self) -> Option<crate::lab_window::LabWindow> {
+        self.lab_done.pop_front()
+    }
+
+    /// Every unread window observation, oldest first.
+    pub fn lab_take_window_observations(&mut self) -> Vec<crate::lab_window::LabWindow> {
+        self.lab_done.drain(..).collect()
+    }
+
+    /// Open the window record before `plan` runs; `false` when unarmed (no
+    /// work done).
+    fn lab_window_begin(
+        &mut self,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        plan: &WindowPlan,
+    ) -> bool {
+        use crate::lab_window::{LabVerifyRoute, LabWindow};
+        if !self.lab_arm.armed {
+            return false;
+        }
+        let Ok(bundle) = Self::bundle(target) else {
+            return false;
+        };
+        bundle.lab_observe(true, self.lab_arm.keep_logits);
+        let pre_state = bundle.state.lab_take_state_events();
+        let pre_forwards = bundle.lab_take_forward_logits();
+        let resets = bundle.state.gdn_residual_resets();
+        let route = match plan.route {
+            WindowRoute::ArRetired | WindowRoute::ArRouted | WindowRoute::ArCalibrate => {
+                LabVerifyRoute::TargetOnly
+            }
+            WindowRoute::Native { depth: 0 } => LabVerifyRoute::Interleaved,
+            WindowRoute::Native { .. } => LabVerifyRoute::Batched,
+        };
+        let (sampled, naive, rng) = match self.sampled.as_ref() {
+            Some(s) => (true, s.naive, Some(s.rng)),
+            None => (false, false, None),
+        };
+        let window = Box::new(LabWindow::begin(
+            position,
+            seed,
+            format!("{:?}", plan.route),
+            plan.k,
+            plan.ngram_hit,
+            route,
+            sampled,
+            naive,
+            rng,
+            resets,
+            pre_state,
+            pre_forwards,
+        ));
+        match self.sampled.as_mut() {
+            Some(s) => s.lab = Some(window),
+            None => self.lab_open = Some(window),
+        }
+        true
+    }
+
+    /// Close the window record `lab_window_begin` opened and queue it.
+    fn lab_window_end(&mut self, target: &mut dyn SpecTarget, result: &Result<MtpWindow, String>) {
+        let open = self.sampled.as_mut().and_then(|s| s.lab.take());
+        let Some(mut window) = open.or_else(|| self.lab_open.take()) else {
+            return;
+        };
+        let (state, forwards, resets) = match Self::bundle(target) {
+            Ok(bundle) => (
+                bundle.state.lab_take_state_events(),
+                bundle.lab_take_forward_logits(),
+                bundle.state.gdn_residual_resets(),
+            ),
+            Err(_) => (
+                crate::lab_window::LabStateEvents::default(),
+                Vec::new(),
+                window.gdn_residual_resets_before,
+            ),
+        };
+        let rng_end = self.sampled.as_ref().map(|s| s.rng);
+        if let Some(s) = self.sampled.as_ref() {
+            window.device_route |= s.route_device;
+        }
+        window.finish(result, rng_end.as_ref(), resets, state, forwards);
+        self.lab_done.push_back(*window);
+    }
 }
 
 impl Qwen4MtpDrafter {
@@ -8361,7 +8733,9 @@ impl MtpDrafter for Qwen4MtpDrafter {
 /// `think_close` is the tokenizer's `</think>` id, when it has one;
 /// `ngram` is the n-gram pool configuration requests may arm, and
 /// `copy_lane` runs that pool as the copy lane
-/// (`hipfire_config::mtp_ngram_copy_enabled_for_arch`).
+/// (`hipfire_config::mtp_ngram_copy_enabled_for_arch`); `gdn` is the loaded
+/// GDN state format, which gates sampled verification
+/// ([`qwen4_mtp_sampled_allowed`]).
 pub fn build_qwen4_mtp_speculator(
     max_k: usize,
     ctx_capacity: usize,
@@ -8369,12 +8743,26 @@ pub fn build_qwen4_mtp_speculator(
     think_close: Option<u32>,
     ngram: Option<NgramModConfig>,
     copy_lane: bool,
+    gdn: crate::GdnStateFormat,
 ) -> Box<dyn Speculator> {
     let mut drafter = Qwen4MtpDrafter::new(max_k, ctx_capacity, end_of_turn)
         .with_ngram(ngram)
-        .with_copy_lane(copy_lane);
+        .with_copy_lane(copy_lane)
+        .with_sampled_allowed(qwen4_mtp_sampled_allowed(gdn));
     drafter.think_close = think_close;
     Box::new(MtpSpeculator::new(drafter))
+}
+
+/// Whether a load with GDN state format `gdn` may verify sampled requests
+/// (temperature > 0) through native MTP. Under `q8_ef` they run AR instead
+/// until the sampled-MTP law (G5) is verified on a GPU; greedy native MTP is
+/// unchanged. Every other format keeps `speculation.mtp_sampled`. The match
+/// is exhaustive so a new format forces a decision here.
+pub fn qwen4_mtp_sampled_allowed(gdn: crate::GdnStateFormat) -> bool {
+    match gdn {
+        crate::GdnStateFormat::Q8Ef => false,
+        crate::GdnStateFormat::F32 | crate::GdnStateFormat::Q8 => true,
+    }
 }
 
 /// The n-gram pool configuration for a `(n_match, n_min, n_max)` triple
@@ -9725,6 +10113,43 @@ mod tests {
         assert!(replica.pending_replay().is_empty());
         replica.mirror_ngram_active(true);
         assert!(replica.ngram_active());
+    }
+
+    #[test]
+    fn q8_ef_sampled_requests_route_to_ar() {
+        use crate::GdnStateFormat;
+        assert!(!qwen4_mtp_sampled_allowed(GdnStateFormat::Q8Ef));
+        assert!(qwen4_mtp_sampled_allowed(GdnStateFormat::Q8));
+        assert!(qwen4_mtp_sampled_allowed(GdnStateFormat::F32));
+        let speculator =
+            build_qwen4_mtp_speculator(3, 4096, None, None, None, false, GdnStateFormat::Q8Ef);
+        assert!(speculator.requires_greedy());
+        assert!(!speculator.supports_temp_verify());
+
+        // A replica mirrors its leader's sampled gate.
+        let leader = Qwen4MtpDrafter::new(3, 4096, None).with_sampled_allowed(false);
+        assert!(!leader.sampled_enabled);
+        let replica = Qwen4MtpDrafter::new_replica(leader.replica_params());
+        assert!(!replica.sampled_enabled);
+        let leader = Qwen4MtpDrafter::new(3, 4096, None);
+        let replica = Qwen4MtpDrafter::new_replica(leader.replica_params());
+        assert_eq!(replica.sampled_enabled, leader.sampled_enabled);
+    }
+
+    #[test]
+    fn q8_and_fp32_sampled_mtp_unchanged() {
+        use crate::GdnStateFormat;
+        let sampled = hipfire_config::mtp_sampled_enabled();
+        let plain = Qwen4MtpDrafter::new(3, 4096, None);
+        assert_eq!(plain.sampled_enabled, sampled);
+        for gdn in [GdnStateFormat::Q8, GdnStateFormat::F32] {
+            let speculator = build_qwen4_mtp_speculator(3, 4096, None, None, None, false, gdn);
+            assert_eq!(speculator.supports_temp_verify(), sampled, "{gdn:?}");
+            assert_eq!(speculator.requires_greedy(), !sampled, "{gdn:?}");
+            let gated = Qwen4MtpDrafter::new(3, 4096, None)
+                .with_sampled_allowed(qwen4_mtp_sampled_allowed(gdn));
+            assert_eq!(gated.sampled_enabled, plain.sampled_enabled, "{gdn:?}");
+        }
     }
 
     #[test]
@@ -11575,6 +12000,97 @@ mod tests {
         assert!(!SampledVerify::new(penalized, 4, SampledMode::Leviathan).device_eligible);
         assert_eq!(accept_route_label(None), "host");
         assert_eq!(accept_route_label(Some(&s)), "host");
+    }
+
+    #[cfg(feature = "lab")]
+    #[test]
+    fn lab_window_hooks_do_nothing_unarmed_and_never_move_the_stream() {
+        use crate::lab_window::{LabVerdict, LabVerifyRoute, LabWindow};
+        let cfg = SpecRequestConfig {
+            temp: 0.7,
+            ..SpecRequestConfig::default()
+        };
+        let rng_word = |rng: &SpecRng| format!("{rng:?}");
+        // Unarmed: the hooks leave no record and draw exactly what the plain
+        // acceptance primitives draw.
+        let mut plain = SampledVerify::new(cfg, 4, SampledMode::Leviathan);
+        assert!(plain.lab.is_none());
+        plain.target.set_point_mass(5);
+        plain.drafts[0].set_point_mass(5);
+        let mut reference = plain.rng;
+        let verdict = plain.host_step_verdict(5, false);
+        assert_eq!(
+            verdict,
+            verify_sampled_draft(&dev_point(5), &dev_point(5), 5, &mut reference)
+        );
+        assert_eq!(plain.host_bonus(), 5);
+        reference.next_f32();
+        assert!(plain.lab.is_none(), "an unarmed hook records nothing");
+        assert_eq!(rng_word(&plain.rng), rng_word(&reference));
+        // Armed: the same draws, observed.
+        let mut armed = SampledVerify::new(cfg, 4, SampledMode::Leviathan);
+        armed.target.set_point_mass(5);
+        armed.drafts[0].set_point_mass(5);
+        let start = armed.rng;
+        armed.lab = Some(Box::new(LabWindow::begin(
+            0,
+            1,
+            "Native { depth: 0 }".to_string(),
+            4,
+            false,
+            LabVerifyRoute::Interleaved,
+            true,
+            false,
+            Some(start),
+            0,
+            Default::default(),
+            Vec::new(),
+        )));
+        armed
+            .lab
+            .as_mut()
+            .expect("armed")
+            .note_row(0, armed.target.entries(), false);
+        assert_eq!(armed.host_step_verdict(5, false), verdict);
+        armed
+            .lab
+            .as_mut()
+            .expect("armed")
+            .note_row(1, armed.target.entries(), false);
+        assert_eq!(armed.host_bonus(), 5);
+        assert_eq!(rng_word(&armed.rng), rng_word(&reference), "observing moved no draw");
+        let window = armed.lab.take().expect("armed");
+        let tape = crate::lab_window::peek_uniforms(&start, 2);
+        assert_eq!(window.proposals.len(), 1);
+        assert_eq!(window.proposals[0].token, 5);
+        assert_eq!(
+            window.proposals[0].verdict,
+            Some(LabVerdict::Accept {
+                draw: crate::lab_window::LabDraw { index: 0, u: tape[0] }
+            })
+        );
+        let bonus = window.bonus.expect("bonus noted");
+        assert_eq!((bonus.row, bonus.token, bonus.draw.index), (1, 5, 1));
+        assert_eq!(bonus.draw.u, tape[1]);
+        assert_eq!(window.rows.len(), 2);
+    }
+
+    #[cfg(feature = "lab")]
+    #[test]
+    fn lab_drafter_arm_is_off_by_default_and_disarming_drops_observations() {
+        use crate::lab_window::LabWindowArm;
+        let mut drafter = Qwen4MtpDrafter::new(4, 128, None);
+        assert!(!drafter.lab_arm.armed);
+        assert!(drafter.lab_take_window_observation().is_none());
+        assert!(drafter.lab_take_window_observations().is_empty());
+        drafter.lab_observe_windows(LabWindowArm {
+            armed: true,
+            keep_logits: true,
+        });
+        assert!(drafter.lab_arm.armed && drafter.lab_arm.keep_logits);
+        drafter.lab_observe_windows(LabWindowArm::default());
+        assert!(!drafter.lab_arm.armed);
+        assert!(drafter.lab_open.is_none() && drafter.lab_done.is_empty());
     }
 
     /// An n-gram acceptance table with `ratio` at every depth backed by

@@ -2520,14 +2520,21 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gated_delta_step_f32",
                 "gated_delta_step_gate_norm128_gfx1151",
                 "gated_delta_step_gate_norm128_q8",
+                "gated_delta_step_gate_norm128_q8ef",
                 "gated_delta_step_halves_state128_persistent256_capture_f32",
                 "gated_delta_step_halves_state128_persistent256_capture_q8",
+                "gated_delta_step_halves_state128_persistent256_capture_q8ef",
                 "gated_delta_step_halves_state128_persistent256_f32",
                 "gated_delta_step_halves_state128_persistent256_q8",
+                "gated_delta_step_halves_state128_persistent256_q8ef",
                 "gated_delta_step_norm128_q8",
+                "gated_delta_step_norm128_q8ef",
                 "gated_delta_step_shared_norm128_gfx1151",
+                "gdn_q8ef_residual_zero",
                 "gdn_state_f32_to_q8",
+                "gdn_state_f32_to_q8ef",
                 "gdn_state_q8_to_f32",
+                "gdn_state_q8ef_to_f32",
                 "hc_activation_fused_f32",
                 "hc_state_bf16_add_f32",
                 "hc_state_bf16_to_f32",
@@ -2663,16 +2670,24 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gated_delta_step_f32",
                 "gated_delta_step_gate_norm128_gfx1151",
                 "gated_delta_step_gate_norm128_q8",
+                "gated_delta_step_gate_norm128_q8ef",
                 "gated_delta_step_halves_state128_persistent256_capture_f32",
                 "gated_delta_step_halves_state128_persistent256_capture_q8",
+                "gated_delta_step_halves_state128_persistent256_capture_q8ef",
                 "gated_delta_step_halves_state128_persistent256_f32",
                 "gated_delta_step_halves_state128_persistent256_q8",
+                "gated_delta_step_halves_state128_persistent256_q8ef",
                 "gated_delta_step_norm128_q8",
+                "gated_delta_step_norm128_q8ef",
                 "gated_delta_step_pipe128_f32",
                 "gated_delta_step_pipe128_q8",
+                "gated_delta_step_pipe128_q8ef",
                 "gated_delta_step_shared_norm128_gfx1151",
+                "gdn_q8ef_residual_zero",
                 "gdn_state_f32_to_q8",
+                "gdn_state_f32_to_q8ef",
                 "gdn_state_q8_to_f32",
+                "gdn_state_q8ef_to_f32",
                 "hc_activation_fused_f32",
                 "hc_state_bf16_add_f32",
                 "hc_state_bf16_to_f32",
@@ -6810,6 +6825,37 @@ mod tests {
                 "{arch} must not inventory the gfx1151 module"
             );
         }
+    }
+
+    /// Every Q8 GDN entry the `tensor_ops` inventory carries has its Q8Ef twin
+    /// and the residual zero kernel, and each exported symbol is defined by
+    /// the source; no inline-WY EF module is inventoried.
+    #[test]
+    fn gdn_q8ef_twins_are_inventoried() {
+        for arch in ["gfx1151", "gfx1201"] {
+            let entry = lookup(arch, "tensor_ops", "").unwrap();
+            assert!(entry.symbols.contains(&"gdn_q8ef_residual_zero"), "{arch}");
+            for symbol in entry.symbols.iter().filter(|s| {
+                s.starts_with("gdn_state_") || s.starts_with("gated_delta_step_")
+            }) {
+                if let Some(base) = symbol.strip_suffix("_q8") {
+                    let twin = format!("{base}_q8ef");
+                    assert!(entry.symbols.iter().any(|s| *s == twin), "{arch}: {twin}");
+                    assert!(entry.source().contains(&format!("void {twin}(")), "{arch}: {twin}");
+                }
+            }
+            assert!(!entry.symbols.iter().any(|s| s.starts_with("gated_delta_rollback_layers_q8ef")));
+        }
+        // The Q8Ef inline modules were removed until they have a GPU gate: no arch (gfx1151
+        // included) inventories them.
+        for arch in SUPPORTED_ARCHES {
+            assert!(lookup(arch, "gated_delta_chunk_q8ef_wmma", "").is_err(), "{arch}");
+            assert!(lookup(arch, "gated_delta_chunk_q8ef_wmma_arena", "").is_err(), "{arch}");
+        }
+        let plain = lookup("gfx1151", "gated_delta_chunk_q8_wmma", "").unwrap();
+        let plain_arena = lookup("gfx1151", "gated_delta_chunk_q8_wmma_arena", "").unwrap();
+        assert!(!plain.source().contains("q8ef"));
+        assert!(!plain_arena.source().contains("q8ef"));
     }
     #[test]
     fn dense_dflash_cold_helpers_preserve_runtime_identity() {

@@ -39,6 +39,9 @@ pub mod gpu_forward_lanes;
 /// Measured host-to-device link class (narrow-link G2 and chunk defaults).
 pub mod host_link;
 pub mod kv_backend;
+/// Read-only lab observation of the production sampled MTP accepting window.
+#[cfg(feature = "lab")]
+pub mod lab_window;
 pub mod lane;
 pub mod lane_exec;
 pub mod mesh_bindings;

@@ -19,6 +19,15 @@
 //! Lane device states are allocated on a slot's first admission and kept
 //! across releases: a later admission into that slot resets the state in
 //! place instead of allocating again.
+//!
+//! Under `q8_ef` each lane's [`Qwen4State`] also owns its live F16 GDN
+//! residual companions (`GdnGpuState::ef_residual`): allocated and freed
+//! with the lane state, zeroed by the state's own reset/restore/rollback
+//! (so slot reuse in `admit` and a window's partial rollback reset the
+//! lane's residual, and an all-accept commit keeps it), never shared across
+//! lanes and never part of the capture ring or any snapshot. Lane forwards
+//! pass each lane's own residual and the state's actual `gdn_format()` to
+//! the GDN step.
 
 use crate::bundle::Qwen4Bundle;
 use crate::config::Qwen4Config;

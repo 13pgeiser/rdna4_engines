@@ -159,6 +159,8 @@ pub(super) fn build_program<'a>(owner: &'a Qwen4GpuForward, scratch: &'a Qwen4Gp
                         norm: weights.norm,
                         output: weights.output,
                         recurrent: &state.recurrent,
+                        format: bundle.state.gdn_format(),
+                        residual: state.ef_residual.as_ref(),
                         conv_state: &state.conv,
                         projection: &scratch.projection,
                         projection2: &scratch.projection2,

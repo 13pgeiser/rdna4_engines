@@ -9088,6 +9088,8 @@ impl Qwen4GpuForward {
                         norm: weights.norm,
                         output: weights.output,
                         recurrent: &state.recurrent,
+                        format: bundle.state.gdn_format(),
+                        residual: state.ef_residual.as_ref(),
                         conv_state: &state.conv,
                         projection: &self.scratch.projection,
                         projection2: &self.scratch.projection2,

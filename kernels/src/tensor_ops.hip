@@ -73,6 +73,41 @@ static __device__ __forceinline__ float gdn_q8_code(int4 word, int b) {
     return (float)(signed char)(lane >> ((b & 3) * 8));
 }
 
+// Q8-EF (`q8_ef`) helpers. The recurrent slot stays the plain Q8 layout above;
+// a separate live F16 residual plane `ef` (one f16 per code, same element
+// index `(head * 128 + row) * 128 + column`) carries the requantization error.
+// This module is compiled with the default FP contraction, so every EF
+// boundary expression uses explicit non-contracted intrinsics and a
+// nearest-even rint: no RNG, no frame, and the residual is added exactly once
+// (to the incoming state), never again at the store.
+static __device__ __forceinline__ float gdn_q8ef_f16(unsigned int bits) {
+    return (float)__builtin_bit_cast(_Float16, (unsigned short)bits);
+}
+
+// f32 -> f16 bits, round-to-nearest-even (the default rounding mode); overflow
+// yields an infinity and NaN stays NaN, so a non-finite row stays visible.
+static __device__ __forceinline__ unsigned short gdn_q8ef_f16_bits(float value) {
+    return __builtin_bit_cast(unsigned short, (_Float16)value);
+}
+
+// Incoming state element: f32(code) * scale + f32(f16 residual), the product
+// and the sum each rounded once.
+static __device__ __forceinline__ float gdn_q8ef_recon(float code, float scale, float residual) {
+    return __fadd_rn(__fmul_rn(code, scale), residual);
+}
+
+// Code of an updated state element: round-half-even(value * inv), clamped to
+// the signed byte range, as a float holding an integer.
+static __device__ __forceinline__ float gdn_q8ef_code(float value, float inv) {
+    return fminf(fmaxf(rintf(__fmul_rn(value, inv)), -128.0f), 127.0f);
+}
+
+// F16 residual bits against the stored F32 scale and the stored integer code.
+static __device__ __forceinline__ unsigned short gdn_q8ef_residual_bits(
+    float value, float code, float scale) {
+    return gdn_q8ef_f16_bits(__fsub_rn(value, __fmul_rn(code, scale)));
+}
+
 
 
 // q/k/v are source BF16 activations promoted to the explicit F32 recurrent
@@ -160,7 +195,7 @@ extern "C" __global__ void gated_delta_step_f32(
 // step + gated-norm kernel below. `kQ8`: `state` is a Q8 GDN state slot
 // (see gdn_q8_row) and `frame` seeds its requantization; else F32
 // [head][key][value] and `frame` is unused.
-template <bool kQ8>
+template <bool kQ8, bool kEf = false>
 static __device__ __forceinline__ bool gated_delta_step_norm128_body(
     const float* q,
     const float* k,
@@ -174,7 +209,8 @@ static __device__ __forceinline__ bool gated_delta_step_norm128_body(
     int value_dim,
     float query_scale,
     unsigned int frame,
-    float* out_value) {
+    float* out_value,
+    unsigned short* ef = nullptr) {
     const int value_head = (int)blockIdx.x;
     const int value_index = (int)(blockIdx.y * blockDim.x + threadIdx.x);
     const bool exact_shape = key_dim == 128 && value_dim == 128;
@@ -251,6 +287,81 @@ static __device__ __forceinline__ bool gated_delta_step_norm128_body(
     const float beta_value = beta[value_head];
     const __hip_bfloat16 v_value = bf16_round(
         v[value_head * 128 + value_index]);
+    if constexpr (kEf) {
+        // Q8-EF: the same three passes as the Q8 branch below, but every pass
+        // reconstructs the incoming element as code * scale + f16 residual
+        // (explicit roundings), the new row is quantized nearest-even, and the
+        // residual against the stored scale goes to the live `ef` plane. The
+        // row's code/residual words are read and rewritten only by this thread.
+        static_assert(kQ8, "q8_ef needs the Q8 slot layout");
+        int4* row = reinterpret_cast<int4*>(gdn_q8_row(state, value_head, value_index));
+        float* scale_slot = gdn_q8_scales(state, value_heads) + value_head * 128 + value_index;
+        int4* ef_row =
+            reinterpret_cast<int4*>(ef + ((size_t)value_head * 128 + value_index) * 128);
+        const float scale = *scale_slot;
+        float kv_mem = 0.0f;
+        for (int word = 0; word < 8; ++word) {
+            const int4 codes = row[word];
+            int4 efw[2] = {ef_row[2 * word], ef_row[2 * word + 1]};
+            const unsigned short* efh = reinterpret_cast<const unsigned short*>(efw);
+#pragma unroll
+            for (int b = 0; b < 16; ++b) {
+                const int kd = word * 16 + b;
+                const float kv = bf16_to_f32(k_norm[kd]);
+                const float s_in =
+                    gdn_q8ef_recon(gdn_q8_code(codes, b), scale, gdn_q8ef_f16(efh[b]));
+                const float decayed = s_in * decay;
+                kv_mem += decayed * kv;
+            }
+        }
+        const float delta = (bf16_to_f32(v_value) - kv_mem) * beta_value;
+        float out = 0.0f;
+        float peak = 0.0f;
+        for (int word = 0; word < 8; ++word) {
+            const int4 codes = row[word];
+            int4 efw[2] = {ef_row[2 * word], ef_row[2 * word + 1]};
+            const unsigned short* efh = reinterpret_cast<const unsigned short*>(efw);
+#pragma unroll
+            for (int b = 0; b < 16; ++b) {
+                const int kd = word * 16 + b;
+                const float kv = bf16_to_f32(k_norm[kd]);
+                const float s_in =
+                    gdn_q8ef_recon(gdn_q8_code(codes, b), scale, gdn_q8ef_f16(efh[b]));
+                const float decayed = fmaf(kv, delta, s_in * decay);
+                peak = fmaxf(peak, fabsf(decayed));
+                float qv = bf16_to_f32(q_norm[kd]);
+                qv *= query_scale;
+                out += decayed * qv;
+            }
+        }
+        const float inv = gdn_q8_inv(peak);
+        const float new_scale = gdn_q8_scale(peak);
+        for (int word = 0; word < 8; ++word) {
+            const int4 codes = row[word];
+            int4 efw[2] = {ef_row[2 * word], ef_row[2 * word + 1]};
+            const unsigned short* efh = reinterpret_cast<const unsigned short*>(efw);
+            int packed[4] = {0, 0, 0, 0};
+            int4 efo[2];
+            unsigned short* efo_h = reinterpret_cast<unsigned short*>(efo);
+#pragma unroll
+            for (int b = 0; b < 16; ++b) {
+                const int kd = word * 16 + b;
+                const float kv = bf16_to_f32(k_norm[kd]);
+                const float s_in =
+                    gdn_q8ef_recon(gdn_q8_code(codes, b), scale, gdn_q8ef_f16(efh[b]));
+                const float decayed = fmaf(kv, delta, s_in * decay);
+                const float code = gdn_q8ef_code(decayed, inv);
+                packed[b >> 2] |= ((int)(signed char)code & 0xff) << ((b & 3) * 8);
+                efo_h[b] = gdn_q8ef_residual_bits(decayed, code, new_scale);
+            }
+            row[word] = make_int4(packed[0], packed[1], packed[2], packed[3]);
+            ef_row[2 * word] = efo[0];
+            ef_row[2 * word + 1] = efo[1];
+        }
+        *scale_slot = new_scale;
+        *out_value = out;
+        return true;
+    }
     if constexpr (kQ8) {
         // The thread's value row: 128 key-channel codes, read 16 at a time
         // (a 16-byte word per step, from cache after the first pass) and
@@ -353,6 +464,19 @@ extern "C" __global__ void gated_delta_step_norm128_q8(
         output[blockIdx.x * 128 + (blockIdx.y * blockDim.x + threadIdx.x)] = out;
 }
 
+// gated_delta_step_norm128_q8 with a live f16 error-feedback residual plane `ef`
+// (kernargs: the Q8 twin's, `ef` right after `state`, no frame).
+extern "C" __global__ void gated_delta_step_norm128_q8ef(
+    const float* q, const float* k, const float* v, const float* gate, const float* beta,
+    signed char* state, unsigned short* ef, float* output, int key_heads, int value_heads,
+    int key_dim, int value_dim, float query_scale) {
+    float out;
+    if (gated_delta_step_norm128_body<true, true>(q, k, v, gate, beta, state, key_heads,
+                                                  value_heads, key_dim, value_dim, query_scale,
+                                                  0u, &out, ef))
+        output[blockIdx.x * 128 + (blockIdx.y * blockDim.x + threadIdx.x)] = out;
+}
+
 
 // Workgroup barrier ordering LDS only: every handoff in the persistent GDN
 // step is through LDS, and a full __syncthreads would also wait at each
@@ -422,7 +546,7 @@ static __device__ __forceinline__ float gdn_q8_halves_peak(
 // as described above. The `canon_q8` entry sets it without `kCapture`: the
 // final state is stored to `state` (not a ring slot), so the result is the
 // token-canonical recurrence, independent of how rows split into launches.
-template <bool kCapture, bool kQ8 = false, bool kTokenQ8 = kCapture>
+template <bool kCapture, bool kQ8 = false, bool kTokenQ8 = kCapture, bool kEf = false>
 __device__ __forceinline__ void gated_delta_step_persistent256_body(
     const float* projection,
     const float* gate,
@@ -437,7 +561,8 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
     int key_dim,
     int value_dim,
     float query_scale,
-    unsigned int frame = 0u) {
+    unsigned int frame = 0u,
+    unsigned short* ef = nullptr) {
     const int value_head = (int)blockIdx.x;
     const int thread = (int)threadIdx.x;
     const int value_index = thread & 127;
@@ -475,8 +600,22 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
         #pragma unroll
         for (int i = 0; i < 4; ++i) packed[i] = codes4[i];
         const signed char* codes = reinterpret_cast<const signed char*>(packed);
+        if constexpr (kEf) {
+            // Q8-EF: code * scale + the live f16 residual, once.
+            const int4* ef4 = reinterpret_cast<const int4*>(
+                ef + ((size_t)value_head * 128 + value_index) * 128 + kd_base);
+            int4 efw[8];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) efw[i] = ef4[i];
+            const unsigned short* efh = reinterpret_cast<const unsigned short*>(efw);
+            #pragma unroll
+            for (int kd = 0; kd < 64; ++kd) {
+                state_half[kd] = gdn_q8ef_recon((float)codes[kd], scale, gdn_q8ef_f16(efh[kd]));
+            }
+        } else {
         #pragma unroll
         for (int kd = 0; kd < 64; ++kd) state_half[kd] = scale * (float)codes[kd];
+        }
     } else {
         #pragma unroll
         for (int kd = 0; kd < 64; ++kd) {
@@ -686,11 +825,23 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
                     const float inv = gdn_q8_inv(peak);
                     const float scale = gdn_q8_scale(peak);
                     const unsigned int row_frame = frame - (unsigned int)(rows - 1 - row);
+                    if constexpr (kEf) {
+                        // Q8-EF: the next row's S_in is rebuilt in registers from
+                        // the new code, the new scale and the f16-rounded residual.
+                        #pragma unroll
+                        for (int kd = 0; kd < 64; ++kd) {
+                            const float code = gdn_q8ef_code(state_half[kd], inv);
+                            const float residual = gdn_q8ef_f16(
+                                gdn_q8ef_residual_bits(state_half[kd], code, scale));
+                            state_half[kd] = gdn_q8ef_recon(code, scale, residual);
+                        }
+                    } else {
                     #pragma unroll
                     for (int kd = 0; kd < 64; ++kd) {
                         state_half[kd] = scale * (float)gdn_q8_round(
                             state_half[kd], inv, value_head, value_index, kd_base + kd,
                             row_frame);
+                    }
                     }
                 }
             }
@@ -706,15 +857,37 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
             : state;
         int4 packed[4];
         signed char* codes = reinterpret_cast<signed char*>(packed);
+        int4 efp[kEf ? 8 : 1];
+        unsigned short* efh = reinterpret_cast<unsigned short*>(efp);
+        if constexpr (kEf) {
+            // Q8-EF: fresh codes, and the residual against the stored scale; the
+            // old residual already entered the state and is not added again.
+            const float new_scale = gdn_q8_scale(peak);
+            #pragma unroll
+            for (int kd = 0; kd < 64; ++kd) {
+                const float code = gdn_q8ef_code(state_half[kd], inv);
+                codes[kd] = (signed char)code;
+                efh[kd] = gdn_q8ef_residual_bits(state_half[kd], code, new_scale);
+            }
+        } else {
         #pragma unroll
         for (int kd = 0; kd < 64; ++kd) {
             codes[kd] = gdn_q8_round(state_half[kd], inv, value_head, value_index,
                                      kd_base + kd, frame);
         }
+        }
         int4* dst =
             reinterpret_cast<int4*>(gdn_q8_row(final_slot, value_head, value_index) + kd_base);
         #pragma unroll
         for (int i = 0; i < 4; ++i) dst[i] = packed[i];
+        if constexpr (kEf) {
+            // The final residual goes to the live plane, also when capturing: a
+            // ring slot holds Q8 codes and scales only.
+            int4* ef_dst = reinterpret_cast<int4*>(
+                ef + ((size_t)value_head * 128 + value_index) * 128 + kd_base);
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) ef_dst[i] = efp[i];
+        }
         if (half == 0) {
             gdn_q8_scales(final_slot, value_heads)[value_head * 128 + value_index] =
                 gdn_q8_scale(peak);
@@ -784,6 +957,40 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_canon_
     gated_delta_step_persistent256_body<false, true, true>(projection, gate, beta, state,
         output, nullptr, rows, qkv_width, key_heads, value_heads, key_dim, value_dim,
         query_scale, frame);
+}
+
+// The three persistent kernels above with a live f16 error-feedback residual
+// plane `ef` (Q8 twin's kernargs, `ef` right after `state`, no frame). Capture
+// reads the live slot + `ef`, writes the final Q8 slot to ring slot rows-1 and
+// the final residual to `ef`; the live Q8 slot is never written.
+__launch_bounds__(256)
+extern "C" __global__ void gated_delta_step_halves_state128_persistent256_q8ef(
+    const float* projection, const float* gate, const float* beta, signed char* state,
+    unsigned short* ef, float* output, int rows, int qkv_width, int key_heads,
+    int value_heads, int key_dim, int value_dim, float query_scale) {
+    gated_delta_step_persistent256_body<false, true, false, true>(projection, gate, beta,
+        state, output, nullptr, rows, qkv_width, key_heads, value_heads, key_dim, value_dim,
+        query_scale, 0u, ef);
+}
+
+__launch_bounds__(256)
+extern "C" __global__ void gated_delta_step_halves_state128_persistent256_capture_q8ef(
+    const float* projection, const float* gate, const float* beta, signed char* state,
+    unsigned short* ef, float* output, signed char* row_states, int rows, int qkv_width,
+    int key_heads, int value_heads, int key_dim, int value_dim, float query_scale) {
+    gated_delta_step_persistent256_body<true, true, true, true>(projection, gate, beta,
+        state, output, row_states, rows, qkv_width, key_heads, value_heads, key_dim,
+        value_dim, query_scale, 0u, ef);
+}
+
+__launch_bounds__(256)
+extern "C" __global__ void gated_delta_step_halves_state128_persistent256_canon_q8ef(
+    const float* projection, const float* gate, const float* beta, signed char* state,
+    unsigned short* ef, float* output, int rows, int qkv_width, int key_heads,
+    int value_heads, int key_dim, int value_dim, float query_scale) {
+    gated_delta_step_persistent256_body<false, true, true, true>(projection, gate, beta,
+        state, output, nullptr, rows, qkv_width, key_heads, value_heads, key_dim, value_dim,
+        query_scale, 0u, ef);
 }
 
 #if defined(__GFX12__) || defined(__gfx942__)
@@ -986,7 +1193,7 @@ static __device__ __forceinline__ void gdn_pipe128_out_decay_kv(
 // pinned __fmul_rn / __fmaf_rn / __fsub_rn form of persistent256's gfx942
 // branch (same operand order, serial kd chains), because the register state
 // would otherwise let the compiler contract the decay product.
-template <bool kQ8>
+template <bool kQ8, bool kEf = false>
 __device__ __forceinline__ void gated_delta_step_pipe128_body(
     const float* projection,
     const float* gate,
@@ -1000,7 +1207,8 @@ __device__ __forceinline__ void gated_delta_step_pipe128_body(
     int key_dim,
     int value_dim,
     float query_scale,
-    unsigned int frame = 0u) {
+    unsigned int frame = 0u,
+    unsigned short* ef = nullptr) {
     const int value_head = (int)blockIdx.x;
     const int c = (int)threadIdx.x;
     const int lane_zero = gdn_pipe128_lane_zero();
@@ -1036,8 +1244,24 @@ __device__ __forceinline__ void gated_delta_step_pipe128_body(
         #pragma unroll
         for (int i = 0; i < 8; ++i) packed[i] = codes4[i];
         const signed char* codes = reinterpret_cast<const signed char*>(packed);
+        if constexpr (kEf) {
+            // Q8-EF: code * scale + the live f16 residual, once.
+            const int4* ef4 =
+                reinterpret_cast<const int4*>(ef + ((size_t)value_head * 128 + c) * 128);
+            #pragma unroll
+            for (int g = 0; g < 16; ++g) {
+                const int4 efw = ef4[g];
+                const unsigned short* efh = reinterpret_cast<const unsigned short*>(&efw);
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    s[g * 8 + e] = gdn_q8ef_recon(
+                        (float)codes[g * 8 + e], scale, gdn_q8ef_f16(efh[e]));
+                }
+            }
+        } else {
         #pragma unroll
         for (int kd = 0; kd < 128; ++kd) s[kd] = scale * (float)codes[kd];
+        }
     } else {
         #pragma unroll
         for (int kd = 0; kd < 128; ++kd) {
@@ -1197,13 +1421,33 @@ __device__ __forceinline__ void gated_delta_step_pipe128_body(
         const float inv = gdn_q8_inv(peak);
         int4 packed[8];
         signed char* codes = reinterpret_cast<signed char*>(packed);
+        int4 efp[kEf ? 16 : 1];
+        unsigned short* efh = reinterpret_cast<unsigned short*>(efp);
+        if constexpr (kEf) {
+            // Q8-EF: one boundary at launch end; the old residual already
+            // entered `s` and is not added again.
+            const float new_scale = gdn_q8_scale(peak);
+            #pragma unroll
+            for (int kd = 0; kd < 128; ++kd) {
+                const float code = gdn_q8ef_code(s[kd], inv);
+                codes[kd] = (signed char)code;
+                efh[kd] = gdn_q8ef_residual_bits(s[kd], code, new_scale);
+            }
+        } else {
         #pragma unroll
         for (int kd = 0; kd < 128; ++kd) {
             codes[kd] = gdn_q8_round(s[kd], inv, value_head, c, kd, frame);
         }
+        }
         int4* dst = reinterpret_cast<int4*>(gdn_q8_row(state, value_head, c));
         #pragma unroll
         for (int i = 0; i < 8; ++i) dst[i] = packed[i];
+        if constexpr (kEf) {
+            int4* ef_dst =
+                reinterpret_cast<int4*>(ef + ((size_t)value_head * 128 + c) * 128);
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) ef_dst[i] = efp[i];
+        }
         gdn_q8_scales(state, value_heads)[value_head * 128 + c] = gdn_q8_scale(peak);
         return;
     }
@@ -1231,6 +1475,17 @@ extern "C" __global__ void gated_delta_step_pipe128_q8(
     int key_dim, int value_dim, float query_scale, unsigned int frame) {
     gated_delta_step_pipe128_body<true>(projection, gate, beta, state, output, rows,
         qkv_width, key_heads, value_heads, key_dim, value_dim, query_scale, frame);
+}
+
+// gated_delta_step_pipe128_q8 with a live f16 error-feedback residual plane `ef`
+// (Q8 twin's kernargs, `ef` right after `state`, no frame).
+__launch_bounds__(128)
+extern "C" __global__ void gated_delta_step_pipe128_q8ef(
+    const float* projection, const float* gate, const float* beta, signed char* state,
+    unsigned short* ef, float* output, int rows, int qkv_width, int key_heads,
+    int value_heads, int key_dim, int value_dim, float query_scale) {
+    gated_delta_step_pipe128_body<true, true>(projection, gate, beta, state, output, rows,
+        qkv_width, key_heads, value_heads, key_dim, value_dim, query_scale, 0u, ef);
 }
 #endif
 #endif
@@ -1310,6 +1565,56 @@ extern "C" __global__ __launch_bounds__(128) void gdn_state_f32_to_q8(
     gdn_q8_row(slot, head, row)[column] =
         gdn_q8_round(value, gdn_q8_inv(peak), head, row, column, frame);
     if (column == 0) gdn_q8_scales(slot, value_heads)[flat] = gdn_q8_scale(peak);
+}
+
+// gdn_state_q8_to_f32 with the live f16 residual added once:
+// f32(code) * scale + f32(ef) (grid value_heads * 128, block 128).
+extern "C" __global__ __launch_bounds__(128) void gdn_state_q8ef_to_f32(
+    signed char* slot, const unsigned short* ef, float* state, int value_heads) {
+    const int flat = (int)blockIdx.x;
+    const int head = flat >> 7;
+    const int row = flat & 127;
+    const int column = (int)threadIdx.x;
+    if (head >= value_heads) return;
+    const float scale = gdn_q8_scales(slot, value_heads)[flat];
+    state[((size_t)head * 128 + column) * 128 + row] = gdn_q8ef_recon(
+        (float)gdn_q8_row(slot, head, row)[column], scale,
+        gdn_q8ef_f16(ef[(size_t)flat * 128 + column]));
+}
+
+// F32 [head][key][value] state into a Q8 slot plus its live f16 residual
+// plane: fresh nearest-even codes, scales and residuals; any old residual is
+// ignored (it entered the F32 state through gdn_state_q8ef_to_f32). Grid
+// value_heads * 128, block 128; the row peak reduction is gdn_state_f32_to_q8's.
+extern "C" __global__ __launch_bounds__(128) void gdn_state_f32_to_q8ef(
+    const float* state, signed char* slot, unsigned short* ef, int value_heads) {
+    const int flat = (int)blockIdx.x;
+    const int head = flat >> 7;
+    const int row = flat & 127;
+    const int column = (int)threadIdx.x;
+    if (head >= value_heads) return;
+    __shared__ float peaks[128];
+    const float value = state[((size_t)head * 128 + column) * 128 + row];
+    peaks[column] = fabsf(value);
+    __syncthreads();
+    for (int stride = 64; stride > 0; stride >>= 1) {
+        if (column < stride) peaks[column] = fmaxf(peaks[column], peaks[column + stride]);
+        __syncthreads();
+    }
+    const float peak = peaks[0];
+    const float scale = gdn_q8_scale(peak);
+    const float code = gdn_q8ef_code(value, gdn_q8_inv(peak));
+    gdn_q8_row(slot, head, row)[column] = (signed char)code;
+    ef[(size_t)flat * 128 + column] = gdn_q8ef_residual_bits(value, code, scale);
+    if (column == 0) gdn_q8_scales(slot, value_heads)[flat] = scale;
+}
+
+// Zero `count` f16 residual elements (live-EF reset). Grid ceil(count / 256),
+// block 256.
+extern "C" __global__ __launch_bounds__(256) void gdn_q8ef_residual_zero(
+    unsigned short* ef, unsigned int count) {
+    const unsigned int i = blockIdx.x * 256u + threadIdx.x;
+    if (i < count) ef[i] = 0;
 }
 
 
@@ -2800,7 +3105,7 @@ extern "C" __global__ void gated_delta_gate_bf16_f32(
 // The decode step and its gated RMSNorm in one launch: the head's recurrent
 // output stays in LDS for the norm (same values the separate launches pass
 // through memory, so bitwise equal). The recurrent output is not stored.
-template <bool kQ8>
+template <bool kQ8, bool kEf = false>
 static __device__ __forceinline__ void gated_delta_step_gate_norm128_body(
     const float* q,
     const float* k,
@@ -2820,12 +3125,14 @@ static __device__ __forceinline__ void gated_delta_step_gate_norm128_body(
     const float* signs1,
     const float* signs2,
     unsigned int* pair_counters,
-    unsigned int frame) {
+    unsigned int frame,
+    unsigned short* ef = nullptr) {
     __shared__ float head_values[128];
     __shared__ int rotate_pair;
     float out;
-    if (!gated_delta_step_norm128_body<kQ8>(q, k, v, gate, beta, state, key_heads, value_heads,
-                                            key_dim, value_dim, query_scale, frame, &out))
+    if (!gated_delta_step_norm128_body<kQ8, kEf>(q, k, v, gate, beta, state, key_heads,
+                                                 value_heads, key_dim, value_dim, query_scale,
+                                                 frame, &out, ef))
         return;
     const int channel = (int)threadIdx.x;
     head_values[channel] = out;
@@ -2877,6 +3184,19 @@ extern "C" __global__ void gated_delta_step_gate_norm128_q8(
     gated_delta_step_gate_norm128_body<true>(q, k, v, gate, beta, state, z, norm, output,
         key_heads, value_heads, key_dim, value_dim, query_scale, rotated, signs1, signs2,
         pair_counters, frame);
+}
+
+// gated_delta_step_gate_norm128_q8 with a live f16 error-feedback residual plane
+// `ef` (Q8 twin's kernargs, `ef` right after `state`, no frame).
+extern "C" __global__ void gated_delta_step_gate_norm128_q8ef(
+    const float* q, const float* k, const float* v, const float* gate, const float* beta,
+    signed char* state, unsigned short* ef, const float* z, const __hip_bfloat16* norm,
+    float* output, int key_heads, int value_heads, int key_dim, int value_dim,
+    float query_scale, float* rotated, const float* signs1, const float* signs2,
+    unsigned int* pair_counters) {
+    gated_delta_step_gate_norm128_body<true, true>(q, k, v, gate, beta, state, z, norm, output,
+        key_heads, value_heads, key_dim, value_dim, query_scale, rotated, signs1, signs2,
+        pair_counters, 0u, ef);
 }
 // Row-batched gated RMSNorm. The recurrent output is rounded in place before
 // the norm reduction, matching the scalar BF16 boundary.  One wave owns one

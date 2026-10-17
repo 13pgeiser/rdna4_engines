@@ -256,7 +256,7 @@ fn chunk_arena(
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
-    let format = GdnStateFormat::of(p.state)?;
+    let format = p.format;
     for tensor in [p.gate, p.beta] {
         ensure_f32(tensor)?;
     }
@@ -273,7 +273,7 @@ fn chunk_arena(
         || p.projection.numel() < p.rows * p.qkv_width
         || p.gate.numel() < p.rows * p.value_heads
         || p.beta.numel() < p.rows * p.value_heads
-        || p.state.numel() != format.state_units(p.value_heads, p.key_dim, p.value_dim)
+        || validate_gdn_state(format, p.state, p.residual, None, p.rows, p.value_heads, p.key_dim, p.value_dim).is_err()
         || gate.rows != p.rows
         || gate.value_heads != p.value_heads
         || gate.value_dim != p.value_dim
@@ -297,19 +297,15 @@ fn chunk_arena(
             "gated_delta_qk_norm_bf16_batched",
         )?;
     }
-    if arms.q8_inline {
-        gpu.ensure_kernel_public(
-            "gated_delta_chunk_q8_wmma_arena",
-            CHUNK_Q8_ARENA_SRC,
-            "gated_delta_chunk_gate_q8_wmma_arena",
-        )?;
-    } else {
-        gpu.ensure_kernel_public(
-            "gated_delta_chunk_wmma_arena",
-            CHUNK_ARENA_SRC,
-            "gated_delta_chunk_gate_wmma_arena",
-        )?;
-    }
+    // The kernel, module and source follow the state format and the inline/bracket arm; the
+    // plain Q8 inline module is its own registry entry over its own arena source.
+    let chunk_kernel = gdn_chunk_kernel_name(format, arms.q8_inline, true);
+    let chunk_module = gdn_chunk_module_name(format, arms.q8_inline, true);
+    gpu.ensure_kernel_public(
+        chunk_module,
+        gdn_chunk_source(format, arms.q8_inline, true),
+        chunk_kernel,
+    )?;
     // With `qk_prenormed` the convolution already stored the normalized Q/K
     // in this same scratch (`gated_delta_conv_params_qknorm_batched`).
     if !arms.qk_prenormed {
@@ -330,55 +326,53 @@ fn chunk_arena(
             crate::dispatch::ReplayLaunchBindings::NONE,
         )?;
     }
-    // A Q8 state runs the chunk on its F32 dequantization (the state scratch)
-    // and is requantized from it after the chunk, seeded by the last row.
-    // The inline arm (`gated_delta_chunk_gate_q8_wmma`) does both inside the
-    // kernel on the slot itself.  Both seed the requantization with the last
-    // row's absolute position, `position + rows - 1`.  The route excludes a
-    // recorder and graph capture (`gated_delta_chunk_route`), so the frame is
-    // never a replayed kernarg and needs no mutable-frame binding.
+    // A Q8/Q8Ef state not on the inline arm runs the chunk on its F32 dequantization (the
+    // state scratch) and is requantized from it after the chunk: Q8 seeded by the last row,
+    // Q8Ef (no frame, nearest-even) rebuilding `code * scale + residual` once on entry and
+    // writing fresh codes/scales/residual on exit.  Only the plain Q8 inline arm
+    // (`gated_delta_chunk_gate_q8_wmma`) does both inside the kernel on the slot itself.  Q8
+    // seeds with the last row's absolute position, `position + rows - 1`.  The route excludes
+    // a recorder and graph capture (`gated_delta_chunk_route`), so the frame is never a
+    // replayed kernarg and needs no mutable-frame binding.
     let frame = match format {
-        GdnStateFormat::F32 => 0,
         GdnStateFormat::Q8 => checked_u32(p.position + p.rows - 1, "GDN Q8 frame")?,
+        GdnStateFormat::F32 | GdnStateFormat::Q8Ef => 0,
     };
-    let state = match format {
-        GdnStateFormat::F32 => p.state.buf.as_ptr(),
-        GdnStateFormat::Q8 if arms.q8_inline => p.state.buf.as_ptr(),
-        GdnStateFormat::Q8 => {
+    let slot = p.state.buf.as_ptr();
+    let residual = p.residual.map(|residual| residual.buf.as_ptr());
+    // A Q8Ef inline request never reaches here: `arms.q8_inline &&
+    // !gated_delta_q8_inline_geometry` above already refused it (Q8Ef has no
+    // inline kernel), so a Q8Ef chunk always takes the scratch arm.
+    let (chunk_state, bracket) = match (format, arms.q8_inline) {
+        (GdnStateFormat::F32, _) => (GdnChunkState::F32 { state: slot }, None),
+        (GdnStateFormat::Q8, true) => (GdnChunkState::Q8Inline { state: slot, frame }, None),
+        (GdnStateFormat::Q8, false) | (GdnStateFormat::Q8Ef, _) => {
             let scratch = gpu.gdn_state_f32_scratch(
                 GdnStateFormat::F32.state_bytes(p.value_heads, p.key_dim, p.value_dim),
             )?;
-            gdn_state_convert(gpu, "gdn_state_q8_to_f32", p.state.buf.as_ptr(), scratch, p.value_heads, None)?;
-            scratch
+            gdn_state_to_f32(gpu, format, slot, residual, scratch, p.value_heads)?;
+            (GdnChunkState::F32 { state: scratch }, Some(scratch))
         }
     };
-    let mut args = KernargBlob::new();
-    args.push_ptr(p.projection.buf.as_ptr());
-    args.push_ptr(qp);
-    args.push_ptr(kp);
-    args.push_ptr(p.gate.buf.as_ptr());
-    args.push_ptr(p.beta.buf.as_ptr());
-    args.push_ptr(state);
-    for tensor in [src.tensor, gate.norm, gate.output] {
-        args.push_ptr(tensor.buf.as_ptr());
-    }
-    args.push_i32(rows);
-    args.push_i32(qkv_width);
-    args.push_i32(key_heads);
-    args.push_i32(value_heads);
-    args.push_f32((p.key_dim as f32).sqrt().recip());
-    args.push_i32(i32::from(output_bf16));
-    if arms.q8_inline {
-        args.push_i32(1);
-        args.push_u32(frame);
-    }
+    let mut args = gdn_chunk_kernargs(&GdnChunkKernargs {
+        projection: p.projection.buf.as_ptr(),
+        qn: qp,
+        kn: kp,
+        gate: p.gate.buf.as_ptr(),
+        beta: p.beta.buf.as_ptr(),
+        state: chunk_state,
+        z: src.tensor.buf.as_ptr(),
+        norm: gate.norm.buf.as_ptr(),
+        output: gate.output.buf.as_ptr(),
+        rows,
+        qkv_width,
+        key_heads,
+        value_heads,
+        query_scale: (p.key_dim as f32).sqrt().recip(),
+        output_bf16: i32::from(output_bf16),
+    });
     src.args(&mut args)?;
     args.pad_to(16);
-    let chunk_kernel = if arms.q8_inline {
-        "gated_delta_chunk_gate_q8_wmma_arena"
-    } else {
-        "gated_delta_chunk_gate_wmma_arena"
-    };
     gpu.launch_blob_recorded(
         chunk_kernel,
         [checked_u32(p.value_heads, "GDN chunk head grid")?, 1, 1],
@@ -387,8 +381,8 @@ fn chunk_arena(
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )?;
-    if format == GdnStateFormat::Q8 && !arms.q8_inline {
-        gdn_state_convert(gpu, "gdn_state_f32_to_q8", state, p.state.buf.as_ptr(), p.value_heads, Some(frame))?;
+    if let Some(scratch) = bracket {
+        gdn_state_from_f32(gpu, format, scratch, slot, residual, p.value_heads, frame)?;
     }
     Ok(())
 }
@@ -930,6 +924,19 @@ mod tests {
         assert!(!GATED_DELTA_CHUNK_WMMA_SRC.contains("#define NPU_TRUNK_ARENA"));
         assert!(!GATED_DELTA_CHUNK_Q8_WMMA_SRC.contains("#define NPU_TRUNK_ARENA"));
         assert!(ARENA_SRC.starts_with("#define NPU_TRUNK_ARENA 1"));
+    }
+    /// The Q8 arena source renames only the plain Q8 slot entry and carries no EF text, so the
+    /// plain Q8 kernel's code object is its own.
+    #[test]
+    fn arena_q8_source_aliases_plain_entry_only() {
+        assert!(CHUNK_Q8_ARENA_SRC.starts_with("#define NPU_TRUNK_ARENA 1"));
+        assert!(CHUNK_Q8_ARENA_SRC.contains(
+            "#define gated_delta_chunk_gate_q8_wmma gated_delta_chunk_gate_q8_wmma_arena\n"
+        ));
+        assert!(GATED_DELTA_CHUNK_Q8_WMMA_SRC.contains("void gated_delta_chunk_gate_q8_wmma("));
+        assert_eq!(CHUNK_Q8_ARENA_SRC.matches("#define gated_delta_chunk_gate_").count(), 1);
+        assert!(!CHUNK_Q8_ARENA_SRC.contains("q8ef"));
+        assert!(!GATED_DELTA_CHUNK_Q8_WMMA_SRC.contains("q8ef"));
     }
     /// The arena QSA norm/RoPE twin equals the incumbent batched launch bit for
     /// bit (every column, including the untouched gate / index-key tails),

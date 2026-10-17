@@ -38,7 +38,7 @@ use rdna_compute::tensor_ops::{
     bf16_roundtrip_f32, gated_delta_params_f32, gated_delta_step, hyper_read, hyper_write,
     indexed_attention_attention, indexed_attention_cache_append, indexed_attention_norm_rope,
     indexed_attention_pool_rope, indexed_attention_select, Bf16Roundtrip, GatedDeltaStep,
-    HyperRead, HyperWrite, IndexedAttentionAttention, IndexedAttentionCacheAppend,
+    GdnStateFormat, HyperRead, HyperWrite, IndexedAttentionAttention, IndexedAttentionCacheAppend,
     IndexedAttentionNormRope, IndexedAttentionPoolRope, IndexedAttentionSelect, QsaKvFormat,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -1383,6 +1383,8 @@ fn run_gdn_sequence(
                     gate: &gate_t,
                     beta: &beta_t,
                     state: &state,
+                    format: GdnStateFormat::F32,
+                    residual: None,
                     output: &output,
                     key_heads,
                     value_heads,

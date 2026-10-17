@@ -214,8 +214,9 @@ pub(crate) fn blocks(elements: usize) -> HipResult<u32> {
 }
 
 /// Storage format of a GDN recurrent state (`kernels/src/tensor_ops.hip`,
-/// "Q8 GDN recurrent state"); the launchers read it from the state tensor's
-/// dtype.
+/// "Q8 GDN recurrent state").  The launchers take it explicitly
+/// (`GatedDeltaStep::format`, `GatedDeltaStepBatched::format`): a Raw slot
+/// is plain Q8 or Q8Ef, which the tensor dtype cannot tell apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GdnStateFormat {
     /// F32 `[value_head][key][value]`: the exact reference.
@@ -224,6 +225,15 @@ pub enum GdnStateFormat {
     /// rows (value channel) of 128 i8 key-channel codes, then one F32 scale
     /// per row. 128x128 heads only.
     Q8,
+    /// Q8 with a live F16 error-feedback residual: the recurrent slot is the
+    /// plain [`GdnStateFormat::Q8`] slot (codes + scales; the ring, mirrors,
+    /// snapshots and cache payloads carry only it), and the residual of the
+    /// last requantization is a separate live F16 tensor per GDN layer and
+    /// live owner ([`GdnStateFormat::residual_units`], element index
+    /// `(head * 128 + row) * 128 + column`, the Q8 code index).  The kernels
+    /// add the incoming residual once and requantize with round-to-nearest-even
+    /// (no RNG, so no frame kernarg).  Explicit-only: `auto` never selects it.
+    Q8Ef,
 }
 
 impl GdnStateFormat {
@@ -231,45 +241,226 @@ impl GdnStateFormat {
         match self {
             Self::F32 => "f32",
             Self::Q8 => "q8",
+            Self::Q8Ef => "q8_ef",
         }
     }
 
     pub const fn supports(self, key_dim: usize, value_dim: usize) -> bool {
         match self {
             Self::F32 => key_dim > 0 && value_dim > 0,
-            Self::Q8 => key_dim == 128 && value_dim == 128,
+            Self::Q8 | Self::Q8Ef => key_dim == 128 && value_dim == 128,
         }
     }
 
+    /// Dtype of the recurrent slot (the residual of [`Self::Q8Ef`] is a
+    /// separate `DType::F16` tensor).
     pub const fn dtype(self) -> DType {
         match self {
             Self::F32 => DType::F32,
-            Self::Q8 => DType::Raw,
+            Self::Q8 | Self::Q8Ef => DType::Raw,
         }
     }
 
     /// `dtype` units (F32 elements or bytes) of one state of `value_heads`
-    /// heads of `key_dim x value_dim`.
+    /// heads of `key_dim x value_dim`; Q8Ef's slot equals Q8's.
     pub const fn state_units(self, value_heads: usize, key_dim: usize, value_dim: usize) -> usize {
         match self {
             Self::F32 => value_heads * key_dim * value_dim,
-            Self::Q8 => value_heads * value_dim * (key_dim + 4),
+            Self::Q8 | Self::Q8Ef => value_heads * value_dim * (key_dim + 4),
         }
     }
 
     pub const fn state_bytes(self, value_heads: usize, key_dim: usize, value_dim: usize) -> usize {
         match self {
             Self::F32 => self.state_units(value_heads, key_dim, value_dim) * 4,
-            Self::Q8 => self.state_units(value_heads, key_dim, value_dim),
+            Self::Q8 | Self::Q8Ef => self.state_units(value_heads, key_dim, value_dim),
         }
     }
 
-    /// The format of a state tensor (F32, or a Raw Q8 slot).
-    pub fn of(state: &GpuTensor) -> HipResult<Self> {
-        match state.dtype {
-            DType::F32 => Ok(Self::F32),
-            DType::Raw => Ok(Self::Q8),
-            _ => Err(HipError::new(0, &ComputeError::WrongDtype.to_string())),
+    /// The format of the recurrent slot itself: what the ring, the
+    /// transaction mirror, snapshots and cache payloads hold (Q8Ef -> Q8).
+    pub const fn storage(self) -> Self {
+        match self {
+            Self::Q8Ef => Self::Q8,
+            Self::F32 | Self::Q8 => self,
+        }
+    }
+
+    /// Whether the format carries a separate live residual tensor.
+    pub const fn has_residual(self) -> bool {
+        match self {
+            Self::Q8Ef => true,
+            Self::F32 | Self::Q8 => false,
+        }
+    }
+
+    /// F16 elements of the live residual of one state (0 without one).
+    pub const fn residual_units(
+        self,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+    ) -> usize {
+        match self {
+            Self::Q8Ef => value_heads * value_dim * key_dim,
+            Self::F32 | Self::Q8 => 0,
+        }
+    }
+
+    /// Bytes of the live residual of one state (2 per F16 element).
+    pub const fn residual_bytes(
+        self,
+        value_heads: usize,
+        key_dim: usize,
+        value_dim: usize,
+    ) -> usize {
+        2 * self.residual_units(value_heads, key_dim, value_dim)
+    }
+
+    /// Whether the plain-Q8 twin of a kernel takes a trailing `u32`
+    /// requantization frame (stochastic rounding); Q8Ef rounds nearest-even
+    /// and F32 never requantizes, so neither does.
+    const fn has_frame_kernarg(self) -> bool {
+        match self {
+            Self::Q8 => true,
+            Self::F32 | Self::Q8Ef => false,
+        }
+    }
+}
+
+/// Strict check of a GDN state descriptor shared by every launcher: `state`
+/// is `format`'s slot (dtype and extent), a residual is present exactly for a
+/// residual format and is an F16 tensor of [`GdnStateFormat::residual_units`]
+/// elements that overlaps neither the state nor the ring, and a `row_states`
+/// ring (verify capture) holds `rows` states of `format.storage()`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_gdn_state(
+    format: GdnStateFormat,
+    state: &GpuTensor,
+    residual: Option<&GpuTensor>,
+    row_states: Option<&GpuTensor>,
+    rows: usize,
+    value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+) -> HipResult<()> {
+    if !format.supports(key_dim, value_dim) {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    if state.dtype != format.dtype() {
+        return Err(HipError::new(0, &ComputeError::WrongDtype.to_string()));
+    }
+    let state_units = format.state_units(value_heads, key_dim, value_dim);
+    if state.numel() != state_units {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    if residual.is_some() != format.has_residual() {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "GDN state format {} {} a live residual tensor",
+                format.name(),
+                if format.has_residual() {
+                    "requires"
+                } else {
+                    "does not take"
+                }
+            ),
+        ));
+    }
+    let state_range = tensor_byte_range(state, format.state_bytes(value_heads, key_dim, value_dim));
+    if let Some(residual) = residual {
+        if residual.dtype != DType::F16 {
+            return Err(HipError::new(0, &ComputeError::WrongDtype.to_string()));
+        }
+        let units = format.residual_units(value_heads, key_dim, value_dim);
+        let bytes = format.residual_bytes(value_heads, key_dim, value_dim);
+        if residual.numel() != units || residual.buf.size() < bytes {
+            return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+        }
+        if ranges_overlap(tensor_byte_range(residual, bytes), state_range) {
+            return Err(HipError::new(0, "GDN residual overlaps the state slot"));
+        }
+    }
+    if let Some(ring) = row_states {
+        let storage = format.storage();
+        let slot = storage.state_units(value_heads, key_dim, value_dim);
+        let needed = rows
+            .checked_mul(slot)
+            .ok_or_else(|| HipError::new(0, "GDN ring size overflow"))?;
+        if ring.dtype != storage.dtype() || ring.numel() < needed {
+            return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+        }
+        if let Some(residual) = residual {
+            let bytes = format.residual_bytes(value_heads, key_dim, value_dim);
+            let ring_bytes = needed * storage.dtype().size();
+            if ranges_overlap(
+                tensor_byte_range(residual, bytes),
+                tensor_byte_range(ring, ring_bytes),
+            ) {
+                return Err(HipError::new(0, "GDN residual overlaps the state ring"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `[start, end)` device address range of the first `bytes` of `tensor`.
+fn tensor_byte_range(tensor: &GpuTensor, bytes: usize) -> (usize, usize) {
+    let start = tensor.buf.as_ptr() as usize;
+    (start, start.saturating_add(bytes))
+}
+
+fn ranges_overlap(left: (usize, usize), right: (usize, usize)) -> bool {
+    left.0 < right.1 && right.0 < left.1
+}
+
+/// A GDN state as a kernel receives it: the slot pointer and, for
+/// [`GdnStateFormat::Q8Ef`], the live F16 residual pointer that the kernel ABI
+/// places **immediately after the slot pointer**.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GdnStateKernarg {
+    format: GdnStateFormat,
+    state: *mut std::ffi::c_void,
+    residual: Option<*mut std::ffi::c_void>,
+}
+
+impl GdnStateKernarg {
+    /// Refuses a residual that does not match [`GdnStateFormat::has_residual`].
+    pub(crate) fn new(
+        format: GdnStateFormat,
+        state: *mut std::ffi::c_void,
+        residual: Option<*mut std::ffi::c_void>,
+    ) -> HipResult<Self> {
+        if residual.is_some() != format.has_residual() {
+            return Err(HipError::new(
+                0,
+                &format!("GDN state format {} residual pointer mismatch", format.name()),
+            ));
+        }
+        Ok(Self {
+            format,
+            state,
+            residual,
+        })
+    }
+
+    /// The slot pointer, then the residual pointer iff the format has one.
+    fn push_slot(&self, args: &mut KernargBlob) {
+        args.push_ptr(self.state);
+        if let Some(residual) = self.residual {
+            args.push_ptr(residual);
+        }
+    }
+
+    /// The trailing `u32` requantization frame iff the format takes one;
+    /// returns its kernarg offset.
+    fn push_frame(&self, args: &mut KernargBlob, frame: u32) -> Option<usize> {
+        if self.format.has_frame_kernarg() {
+            args.push_u32(frame);
+            Some(args.len() - 4)
+        } else {
+            None
         }
     }
 }
@@ -280,15 +471,21 @@ pub struct GatedDeltaStep<'a> {
     pub v: &'a GpuTensor,
     pub gate: &'a GpuTensor,
     pub beta: &'a GpuTensor,
-    /// F32, or a Q8 slot ([`GdnStateFormat`]).
+    /// The recurrent slot in `format`'s storage: F32, or a Raw Q8 slot
+    /// (also for Q8Ef).
     pub state: &'a GpuTensor,
+    /// Format of `state`; strictly validated against its dtype and extent.
+    pub format: GdnStateFormat,
+    /// The live F16 residual: `Some` exactly for [`GdnStateFormat::Q8Ef`].
+    pub residual: Option<&'a GpuTensor>,
     pub output: &'a GpuTensor,
     pub key_heads: usize,
     pub value_heads: usize,
     pub key_dim: usize,
     pub value_dim: usize,
     /// The token's position: seeds a Q8 state's requantization (declared to
-    /// the recorder, so a replayed decode reseeds per position).
+    /// the recorder, so a replayed decode reseeds per position).  Q8Ef has no
+    /// frame and ignores it.
     pub position: usize,
 }
 
@@ -351,23 +548,139 @@ pub fn gated_delta_step_gated(
     Ok(rotate_into.is_some())
 }
 
+/// `(kernel, shared_norm128)` of a single-token GDN step.  `gfx11_128`:
+/// gfx11+ SIMT with 128x128 heads (the F32 shared-norm bodies).  Every Q8
+/// family kernel is the 128x128 body on the dequantized state, so those
+/// always take the shared-norm (128-thread) geometry; the Q8Ef entries are
+/// the Q8 twins with a residual kernarg.
+fn gdn_step_single_kernel(
+    format: GdnStateFormat,
+    gated: bool,
+    gfx11_128: bool,
+) -> (&'static str, bool) {
+    match format {
+        GdnStateFormat::Q8 => (
+            if gated {
+                "gated_delta_step_gate_norm128_q8"
+            } else {
+                "gated_delta_step_norm128_q8"
+            },
+            true,
+        ),
+        GdnStateFormat::Q8Ef => (
+            if gated {
+                "gated_delta_step_gate_norm128_q8ef"
+            } else {
+                "gated_delta_step_norm128_q8ef"
+            },
+            true,
+        ),
+        GdnStateFormat::F32 => match (gated, gfx11_128) {
+            (true, true) => ("gated_delta_step_gate_norm128_gfx1151", true),
+            (false, true) => ("gated_delta_step_shared_norm128_gfx1151", true),
+            (_, false) => ("gated_delta_step_f32", false),
+        },
+    }
+}
+
+/// Output arguments of a single-token GDN step launch.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GdnStepOutput {
+    /// The recurrent output tensor.
+    Recurrent { output: *mut std::ffi::c_void },
+    /// Fused with the gate: `z`, `norm`, gated `output`, then (shared-norm
+    /// kernels only) the rotation `[rotated, signs1, signs2, counters]`
+    /// pointers, null when no rotation was asked for.
+    Gated {
+        z: *mut std::ffi::c_void,
+        norm: *mut std::ffi::c_void,
+        output: *mut std::ffi::c_void,
+        rotate: Option<[*mut std::ffi::c_void; 4]>,
+    },
+}
+
+/// Resolved arguments of one single-token GDN step launch
+/// ([`gdn_step_kernargs`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GdnStepKernargs {
+    pub q: *mut std::ffi::c_void,
+    pub k: *mut std::ffi::c_void,
+    pub v: *mut std::ffi::c_void,
+    pub gate: *mut std::ffi::c_void,
+    pub beta: *mut std::ffi::c_void,
+    pub state: GdnStateKernarg,
+    pub output: GdnStepOutput,
+    pub key_heads: i32,
+    pub value_heads: i32,
+    pub key_dim: i32,
+    pub value_dim: i32,
+    pub query_scale: f32,
+    /// The token's position (a Q8 frame; unused by F32 and Q8Ef).
+    pub frame: u32,
+}
+
+/// The unpadded kernarg blob of a single-token GDN step and, when the format
+/// takes a frame (plain Q8 only), the frame's offset for the replay binding.
+/// Q8Ef: the residual pointer right after the slot pointer, no frame.
+pub(crate) fn gdn_step_kernargs(a: &GdnStepKernargs) -> (KernargBlob, Option<usize>) {
+    let mut args = KernargBlob::new();
+    args.push_ptr(a.q);
+    args.push_ptr(a.k);
+    args.push_ptr(a.v);
+    args.push_ptr(a.gate);
+    args.push_ptr(a.beta);
+    a.state.push_slot(&mut args);
+    match a.output {
+        GdnStepOutput::Recurrent { output } => args.push_ptr(output),
+        GdnStepOutput::Gated {
+            z, norm, output, ..
+        } => {
+            args.push_ptr(z);
+            args.push_ptr(norm);
+            args.push_ptr(output);
+        }
+    }
+    args.push_i32(a.key_heads);
+    args.push_i32(a.value_heads);
+    args.push_i32(a.key_dim);
+    args.push_i32(a.value_dim);
+    args.push_f32(a.query_scale);
+    if let GdnStepOutput::Gated {
+        rotate: Some(rotate),
+        ..
+    } = a.output
+    {
+        for ptr in rotate {
+            args.push_ptr(ptr);
+        }
+    }
+    let frame_offset = a.state.push_frame(&mut args, a.frame);
+    (args, frame_offset)
+}
+
 fn gated_delta_step_launch(
     gpu: &mut Gpu,
     p: &GatedDeltaStep<'_>,
     gated: Option<&GatedDeltaGate<'_>>,
     rotate_into: Option<&GpuTensor>,
 ) -> HipResult<()> {
-    let format = GdnStateFormat::of(p.state)?;
+    let format = p.format;
     for tensor in [p.q, p.k, p.v, p.gate, p.beta, p.output] {
         ensure_f32(tensor)?;
     }
-    if p.key_heads == 0
-        || p.value_heads == 0
-        || p.value_heads % p.key_heads != 0
-        || !format.supports(p.key_dim, p.value_dim)
-    {
+    if p.key_heads == 0 || p.value_heads == 0 || p.value_heads % p.key_heads != 0 {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
+    validate_gdn_state(
+        format,
+        p.state,
+        p.residual,
+        None,
+        1,
+        p.value_heads,
+        p.key_dim,
+        p.value_dim,
+    )?;
     let key_elements = checked_product(p.key_heads, p.key_dim, "GDN key extent")?;
     let value_elements = checked_product(p.value_heads, p.value_dim, "GDN value extent")?;
     checked_product(value_elements, p.key_dim, "GDN state extent")?;
@@ -376,7 +689,6 @@ fn gated_delta_step_launch(
         || p.v.numel() != value_elements
         || p.gate.numel() != p.value_heads
         || p.beta.numel() != p.value_heads
-        || p.state.numel() != format.state_units(p.value_heads, p.key_dim, p.value_dim)
         || p.output.numel() != value_elements
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
@@ -387,70 +699,71 @@ fn gated_delta_step_launch(
     let value_dim = checked_i32(p.value_dim, "GDN value width")?;
     let value_heads_grid = checked_u32(p.value_heads, "GDN value-head grid")?;
     let value_dim_grid = blocks(p.value_dim)?;
-    let q8 = format == GdnStateFormat::Q8;
-    // The Q8 kernels are the 128x128 bodies on the dequantized state.
-    let shared_norm128 =
-        q8 || gpu.arch_caps.has_gfx11_plus_simt() && p.key_dim == 128 && p.value_dim == 128;
-    let kernel = match (gated, shared_norm128, q8) {
-        (Some(_), _, true) => "gated_delta_step_gate_norm128_q8",
-        (None, _, true) => "gated_delta_step_norm128_q8",
-        (Some(_), true, false) => "gated_delta_step_gate_norm128_gfx1151",
-        (None, true, false) => "gated_delta_step_shared_norm128_gfx1151",
-        _ => "gated_delta_step_f32",
-    };
+    let gfx11_128 = gpu.arch_caps.has_gfx11_plus_simt() && p.key_dim == 128 && p.value_dim == 128;
+    let (kernel, shared_norm128) = gdn_step_single_kernel(format, gated.is_some(), gfx11_128);
     let block_x = if shared_norm128 { 128 } else { 256 };
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
-    let mut args = KernargBlob::new();
-    args.push_ptr(p.q.buf.as_ptr());
-    args.push_ptr(p.k.buf.as_ptr());
-    args.push_ptr(p.v.buf.as_ptr());
-    args.push_ptr(p.gate.buf.as_ptr());
-    args.push_ptr(p.beta.buf.as_ptr());
-    args.push_ptr(p.state.buf.as_ptr());
-    match gated {
+    let output = match gated {
         Some(g) => {
-            args.push_ptr(g.z.buf.as_ptr());
-            args.push_ptr(g.norm.buf.as_ptr());
-            args.push_ptr(g.output.buf.as_ptr());
-        }
-        None => args.push_ptr(p.output.buf.as_ptr()),
-    }
-    args.push_i32(key_heads);
-    args.push_i32(value_heads);
-    args.push_i32(key_dim);
-    args.push_i32(value_dim);
-    args.push_f32((p.key_dim as f32).sqrt().recip());
-    if gated.is_some() && shared_norm128 {
-        let null = std::ptr::null_mut();
-        let (rotated, signs1, signs2, counters) = match rotate_into {
-            Some(rotated) => {
-                gpu.ensure_mq_signs()?;
-                ensure_gdn_pair_counters(gpu)?;
-                if p.value_heads / 2 > GDN_PAIR_COUNTERS {
-                    return Err(HipError::new(0, "GDN rotate: too many head pairs"));
-                }
-                (
-                    rotated.buf.as_ptr(),
-                    gpu.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr(),
-                    gpu.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr(),
-                    gpu.scratch.gdn_pair_counters.as_ref().unwrap().as_ptr(),
-                )
+            let rotate = if shared_norm128 {
+                let null = std::ptr::null_mut();
+                Some(match rotate_into {
+                    Some(rotated) => {
+                        gpu.ensure_mq_signs()?;
+                        ensure_gdn_pair_counters(gpu)?;
+                        if p.value_heads / 2 > GDN_PAIR_COUNTERS {
+                            return Err(HipError::new(0, "GDN rotate: too many head pairs"));
+                        }
+                        [
+                            rotated.buf.as_ptr(),
+                            gpu.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr(),
+                            gpu.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr(),
+                            gpu.scratch.gdn_pair_counters.as_ref().unwrap().as_ptr(),
+                        ]
+                    }
+                    None => [null, null, null, null],
+                })
+            } else {
+                None
+            };
+            GdnStepOutput::Gated {
+                z: g.z.buf.as_ptr(),
+                norm: g.norm.buf.as_ptr(),
+                output: g.output.buf.as_ptr(),
+                rotate,
             }
-            None => (null, null, null, null),
-        };
-        for ptr in [rotated, signs1, signs2, counters] {
-            args.push_ptr(ptr);
         }
-    }
-    let mut frame_binding = None;
-    if q8 {
-        args.push_u32(checked_u32(p.position, "GDN Q8 frame")?);
-        frame_binding = Some([crate::replay::ReplayKernargBinding::PositionPlusU32 {
-            offset: args.len() - 4,
-            addend: 0,
-        }]);
-    }
+        None => GdnStepOutput::Recurrent {
+            output: p.output.buf.as_ptr(),
+        },
+    };
+    let (mut args, frame_offset) = gdn_step_kernargs(&GdnStepKernargs {
+        q: p.q.buf.as_ptr(),
+        k: p.k.buf.as_ptr(),
+        v: p.v.buf.as_ptr(),
+        gate: p.gate.buf.as_ptr(),
+        beta: p.beta.buf.as_ptr(),
+        state: GdnStateKernarg::new(
+            format,
+            p.state.buf.as_ptr(),
+            p.residual.map(|residual| residual.buf.as_ptr()),
+        )?,
+        output,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        query_scale: (p.key_dim as f32).sqrt().recip(),
+        frame: if format.has_frame_kernarg() {
+            checked_u32(p.position, "GDN Q8 frame")?
+        } else {
+            0
+        },
+    });
     args.pad_to(16);
+    let frame_binding = frame_offset.map(|offset| {
+        [crate::replay::ReplayKernargBinding::PositionPlusU32 { offset, addend: 0 }]
+    });
     gpu.launch_blob_recorded(
         kernel,
         [value_heads_grid, value_dim_grid, 1],
@@ -475,12 +788,19 @@ pub struct GatedDeltaStepBatched<'a> {
     pub projection: &'a GpuTensor,
     pub gate: &'a GpuTensor,
     pub beta: &'a GpuTensor,
-    /// F32, or a Q8 slot ([`GdnStateFormat`]).
+    /// The recurrent slot in `format`'s storage: F32, or a Raw Q8 slot
+    /// (also for Q8Ef).
     pub state: &'a GpuTensor,
+    /// Format of `state`; strictly validated against its dtype and extent.
+    pub format: GdnStateFormat,
+    /// The live F16 residual: `Some` exactly for [`GdnStateFormat::Q8Ef`].
+    pub residual: Option<&'a GpuTensor>,
     pub output: &'a GpuTensor,
-    /// Optional `[rows]` ring of states in `state`'s format: the recurrent
-    /// state after the last row lands in slot `rows - 1` instead of updating
-    /// `state` (speculative verify; `state` keeps the pre-call value).
+    /// Optional `[rows]` ring of `format.storage()` states (a Q8Ef ring is
+    /// plain Q8, residual-free): the recurrent state after the last row lands
+    /// in slot `rows - 1` instead of updating `state` (speculative verify;
+    /// `state` keeps the pre-call value).  A Q8Ef capture also writes the
+    /// final residual into the live `residual` plane.
     pub row_states: Option<&'a GpuTensor>,
     pub rows: usize,
     pub qkv_width: usize,
@@ -491,11 +811,136 @@ pub struct GatedDeltaStepBatched<'a> {
     /// The first row's position; a Q8 state's requantization is seeded by
     /// the last row's. With `row_states` (verify capture) each row also
     /// requantizes at its own position, token-exact with [`gated_delta_step`].
+    /// Q8Ef has no frame and ignores it.
     pub position: usize,
 }
 
+/// Inputs of the batched GDN recurrence kernel choice
+/// ([`gdn_batched_kernel`]).
+#[derive(Clone, Copy, Debug)]
+struct GdnBatchedSelect {
+    /// `row_states` present (verify capture).
+    captured: bool,
+    format: GdnStateFormat,
+    /// `Gpu::qwen4_scope`.
+    qwen4_scope: bool,
+    /// `HIPFIRE_QWEN4_GDN_PREFILL`; read only for an uncaptured Q8-family
+    /// state in the Qwen4 scope (other launches never resolve it, and carry
+    /// `Wy` here).
+    policy: Qwen4GdnPrefill,
+    /// `gpu.arch == "gfx1201"`.
+    arch_gfx1201: bool,
+    /// `gpu.arch == "gfx942"`.
+    arch_gfx942: bool,
+    /// `HIPFIRE_QWEN4_GDN_PIPE`.
+    pipe_enabled: bool,
+}
+
+impl GdnBatchedSelect {
+    /// Whether the policy is consulted at all (see [`Self::policy`]).
+    const fn reads_policy(
+        captured: bool,
+        format: GdnStateFormat,
+        qwen4_scope: bool,
+    ) -> bool {
+        !captured && qwen4_scope && matches!(format, GdnStateFormat::Q8 | GdnStateFormat::Q8Ef)
+    }
+}
+
+/// `(kernel, pipe128)` of a batched GDN recurrence launch.
+///
+/// `HIPFIRE_QWEN4_GDN_PREFILL=canon` (lab): a Q8-family state (Q8 or Q8Ef)
+/// inside the Qwen4 forward (`Gpu::qwen4_scope`, so the arm also works with
+/// the invariant profile off) runs the token-canonical persistent recurrence,
+/// which requantizes every row at its own position and stores to `state`: the
+/// result no longer depends on how rows are split into launches.  An F32
+/// state keeps the persistent kernel (already token-exact).
+///
+/// gfx1201 (F32, Q8, Q8Ef) and gfx942 (F32 only) non-capture: the
+/// register-resident one-thread-per-column recurrence (bitwise the
+/// persistent256 kernel's result), 128 threads.
+///
+/// The Q8Ef entries are the Q8 twins (`..._q8` -> `..._q8ef`) taking the live
+/// residual after the state pointer and no frame.
+fn gdn_batched_kernel(s: &GdnBatchedSelect) -> (&'static str, bool) {
+    let canon = GdnBatchedSelect::reads_policy(s.captured, s.format, s.qwen4_scope)
+        && s.policy == Qwen4GdnPrefill::Canon;
+    let pipe128_arch = s.arch_gfx1201
+        || (s.arch_gfx942
+            && match s.format {
+                GdnStateFormat::F32 => true,
+                GdnStateFormat::Q8 | GdnStateFormat::Q8Ef => false,
+            });
+    let pipe128 = !canon && !s.captured && pipe128_arch && s.pipe_enabled;
+    let kernel = match (s.captured, s.format) {
+        (true, GdnStateFormat::F32) => "gated_delta_step_halves_state128_persistent256_capture_f32",
+        (false, GdnStateFormat::F32) if pipe128 => "gated_delta_step_pipe128_f32",
+        (false, GdnStateFormat::F32) => "gated_delta_step_halves_state128_persistent256_f32",
+        (true, GdnStateFormat::Q8) => "gated_delta_step_halves_state128_persistent256_capture_q8",
+        (false, GdnStateFormat::Q8) if canon => {
+            "gated_delta_step_halves_state128_persistent256_canon_q8"
+        }
+        (false, GdnStateFormat::Q8) if pipe128 => "gated_delta_step_pipe128_q8",
+        (false, GdnStateFormat::Q8) => "gated_delta_step_halves_state128_persistent256_q8",
+        (true, GdnStateFormat::Q8Ef) => {
+            "gated_delta_step_halves_state128_persistent256_capture_q8ef"
+        }
+        (false, GdnStateFormat::Q8Ef) if canon => {
+            "gated_delta_step_halves_state128_persistent256_canon_q8ef"
+        }
+        (false, GdnStateFormat::Q8Ef) if pipe128 => "gated_delta_step_pipe128_q8ef",
+        (false, GdnStateFormat::Q8Ef) => "gated_delta_step_halves_state128_persistent256_q8ef",
+    };
+    (kernel, pipe128)
+}
+
+/// Resolved arguments of one batched GDN recurrence launch
+/// ([`gdn_batched_kernargs`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GdnBatchedKernargs {
+    pub projection: *mut std::ffi::c_void,
+    pub gate: *mut std::ffi::c_void,
+    pub beta: *mut std::ffi::c_void,
+    pub state: GdnStateKernarg,
+    pub output: *mut std::ffi::c_void,
+    pub row_states: Option<*mut std::ffi::c_void>,
+    pub rows: i32,
+    pub qkv_width: i32,
+    pub key_heads: i32,
+    pub value_heads: i32,
+    pub key_dim: i32,
+    pub value_dim: i32,
+    pub query_scale: f32,
+    /// The last row's absolute position (a Q8 frame; unused by F32 and Q8Ef).
+    pub frame: u32,
+}
+
+/// The unpadded kernarg blob of a batched GDN recurrence launch: the Q8 twin's
+/// kernargs with the Q8Ef residual pointer **right after the state pointer**
+/// (before `output` / `row_states`) and without the trailing frame.
+pub(crate) fn gdn_batched_kernargs(a: &GdnBatchedKernargs) -> KernargBlob {
+    let mut args = KernargBlob::new();
+    args.push_ptr(a.projection);
+    args.push_ptr(a.gate);
+    args.push_ptr(a.beta);
+    a.state.push_slot(&mut args);
+    args.push_ptr(a.output);
+    if let Some(states) = a.row_states {
+        args.push_ptr(states);
+    }
+    args.push_i32(a.rows);
+    args.push_i32(a.qkv_width);
+    args.push_i32(a.key_heads);
+    args.push_i32(a.value_heads);
+    args.push_i32(a.key_dim);
+    args.push_i32(a.value_dim);
+    args.push_f32(a.query_scale);
+    a.state.push_frame(&mut args, a.frame);
+    args
+}
+
 pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) -> HipResult<()> {
-    let format = GdnStateFormat::of(p.state)?;
+    let format = p.format;
     for tensor in [p.projection, p.gate, p.beta, p.output] {
         ensure_f32(tensor)?;
     }
@@ -508,6 +953,16 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
+    validate_gdn_state(
+        format,
+        p.state,
+        p.residual,
+        p.row_states,
+        p.rows,
+        p.value_heads,
+        p.key_dim,
+        p.value_dim,
+    )?;
     let qk = checked_product(p.key_heads, p.key_dim, "GDN batched qk extent")?;
     let value = checked_product(p.value_heads, p.value_dim, "GDN batched value extent")?;
     let expected_qkv = checked_add(
@@ -518,16 +973,11 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     let rows_qkv = checked_product(p.rows, expected_qkv, "GDN batched projection extent")?;
     let rows_value = checked_product(p.rows, value, "GDN batched output extent")?;
     let rows_heads = checked_product(p.rows, p.value_heads, "GDN batched parameter extent")?;
-    let state_units = format.state_units(p.value_heads, p.key_dim, p.value_dim);
     if p.qkv_width != expected_qkv
         || p.projection.numel() != rows_qkv
         || p.gate.numel() != rows_heads
         || p.beta.numel() != rows_heads
-        || p.state.numel() != state_units
         || p.output.numel() != rows_value
-        || p.row_states.is_some_and(|states| {
-            states.dtype != p.state.dtype || states.numel() < p.rows * state_units
-        })
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
@@ -538,51 +988,46 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     let key_dim = checked_i32(p.key_dim, "GDN batched key width")?;
     let value_dim = checked_i32(p.value_dim, "GDN batched value width")?;
     let value_heads_grid = checked_u32(p.value_heads, "GDN batched value-head grid")?;
-    // `HIPFIRE_QWEN4_GDN_PREFILL=canon` (lab): a Q8 state inside the Qwen4
-    // forward (`Gpu::qwen4_scope`, so the arm also works with the invariant
-    // profile off) runs the token-canonical persistent recurrence, which
-    // requantizes every row at its own position and stores to `state`: the
-    // result no longer depends on how rows are split into launches.  An F32
-    // state keeps the persistent kernel (already token-exact).
-    let canon = p.row_states.is_none()
-        && format == GdnStateFormat::Q8
-        && gpu.qwen4_scope
-        && qwen4_gdn_prefill() == Qwen4GdnPrefill::Canon;
-    // gfx1201 (F32 and Q8) and gfx942 (F32 only) non-capture: the
-    // register-resident one-thread-per-column recurrence (bitwise the
-    // persistent256 kernel's result), 128 threads.
-    let pipe128_arch =
-        gpu.arch == "gfx1201" || (gpu.arch == "gfx942" && format == GdnStateFormat::F32);
-    let pipe128 = !canon && p.row_states.is_none() && pipe128_arch && *QWEN4_GDN_PIPE;
-    let kernel = match (p.row_states.is_some(), format) {
-        (true, GdnStateFormat::F32) => "gated_delta_step_halves_state128_persistent256_capture_f32",
-        (false, GdnStateFormat::F32) if pipe128 => "gated_delta_step_pipe128_f32",
-        (false, GdnStateFormat::F32) => "gated_delta_step_halves_state128_persistent256_f32",
-        (true, GdnStateFormat::Q8) => "gated_delta_step_halves_state128_persistent256_capture_q8",
-        (false, GdnStateFormat::Q8) if canon => {
-            "gated_delta_step_halves_state128_persistent256_canon_q8"
-        }
-        (false, GdnStateFormat::Q8) if pipe128 => "gated_delta_step_pipe128_q8",
-        (false, GdnStateFormat::Q8) => "gated_delta_step_halves_state128_persistent256_q8",
-    };
+    let captured = p.row_states.is_some();
+    let (kernel, pipe128) = gdn_batched_kernel(&GdnBatchedSelect {
+        captured,
+        format,
+        qwen4_scope: gpu.qwen4_scope,
+        policy: if GdnBatchedSelect::reads_policy(captured, format, gpu.qwen4_scope) {
+            qwen4_gdn_prefill()
+        } else {
+            Qwen4GdnPrefill::Wy
+        },
+        arch_gfx1201: gpu.arch == "gfx1201",
+        arch_gfx942: gpu.arch == "gfx942",
+        pipe_enabled: *QWEN4_GDN_PIPE,
+    });
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
-    let mut args = KernargBlob::new();
-    for tensor in [p.projection, p.gate, p.beta, p.state, p.output] {
-        args.push_ptr(tensor.buf.as_ptr());
-    }
-    if let Some(states) = p.row_states {
-        args.push_ptr(states.buf.as_ptr() as *const _);
-    }
-    args.push_i32(rows);
-    args.push_i32(qkv_width);
-    args.push_i32(key_heads);
-    args.push_i32(value_heads);
-    args.push_i32(key_dim);
-    args.push_i32(value_dim);
-    args.push_f32((p.key_dim as f32).sqrt().recip());
-    if format == GdnStateFormat::Q8 {
-        args.push_u32(checked_u32(p.position + p.rows - 1, "GDN Q8 frame")?);
-    }
+    let frame = if format.has_frame_kernarg() {
+        checked_u32(p.position + p.rows - 1, "GDN Q8 frame")?
+    } else {
+        0
+    };
+    let mut args = gdn_batched_kernargs(&GdnBatchedKernargs {
+        projection: p.projection.buf.as_ptr(),
+        gate: p.gate.buf.as_ptr(),
+        beta: p.beta.buf.as_ptr(),
+        state: GdnStateKernarg::new(
+            format,
+            p.state.buf.as_ptr(),
+            p.residual.map(|residual| residual.buf.as_ptr()),
+        )?,
+        output: p.output.buf.as_ptr(),
+        row_states: p.row_states.map(|states| states.buf.as_ptr()),
+        rows,
+        qkv_width,
+        key_heads,
+        value_heads,
+        key_dim,
+        value_dim,
+        query_scale: (p.key_dim as f32).sqrt().recip(),
+        frame,
+    });
     args.pad_to(16);
     gpu.launch_blob_recorded(
         kernel,
@@ -594,12 +1039,28 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     )
 }
 
+/// Rollback kernel of a state's STORAGE format (`format.storage()`): the Q8Ef
+/// rollback is the plain-Q8 replay (the ring is plain Q8); the Q8Ef entry set
+/// has no rollback kernel.
+fn gdn_rollback_kernel(storage: GdnStateFormat) -> &'static str {
+    match storage.storage() {
+        GdnStateFormat::F32 => "gated_delta_rollback_layers_f32",
+        GdnStateFormat::Q8 | GdnStateFormat::Q8Ef => "gated_delta_rollback_layers_q8",
+    }
+}
+
 /// Few-row verify rollback of every GDN layer in one launch (kernel
 /// `gated_delta_rollback_layers_{f32,q8}`): `table` is `layers` pairs of
-/// device pointers (captured recurrence input, ring of `format` states);
-/// each layer re-runs its first `keep` of `rows` captured rows from ring
-/// slot `from` and leaves the last kept row's state in slot
+/// device pointers (captured recurrence input, ring of `format.storage()`
+/// states); each layer re-runs its first `keep` of `rows` captured rows from
+/// ring slot `from` and leaves the last kept row's state in slot
 /// `to + keep - 1`. 128-wide heads.
+///
+/// Rollback is storage-based: there is no EF rollback kernel.  A
+/// [`GdnStateFormat::Q8Ef`] rollback replays the plain-Q8 ring with
+/// `gated_delta_rollback_layers_q8` (the ring holds no residual), and the
+/// CALLER then zeroes every rolled-back layer's live residual with
+/// [`gdn_q8ef_residual_zero`] in stream order.
 pub struct GatedDeltaRollbackLayers<'a> {
     pub table: &'a GpuTensor,
     pub discard: &'a GpuTensor,
@@ -632,10 +1093,8 @@ pub fn gated_delta_rollback_layers(
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
-    let kernel = match p.format {
-        GdnStateFormat::F32 => "gated_delta_rollback_layers_f32",
-        GdnStateFormat::Q8 => "gated_delta_rollback_layers_q8",
-    };
+    let storage = p.format.storage();
+    let kernel = gdn_rollback_kernel(storage);
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
     let mut args = KernargBlob::new();
     args.push_ptr(p.table.buf.as_ptr());
@@ -652,7 +1111,7 @@ pub fn gated_delta_rollback_layers(
         args.push_i32(checked_i32(value, label)?);
     }
     args.push_f32(128f32.sqrt().recip());
-    if p.format == GdnStateFormat::Q8 {
+    if storage.has_frame_kernarg() {
         args.push_u32(checked_u32(p.position, "GDN Q8 frame")?);
     }
     args.pad_to(16);
@@ -687,14 +1146,23 @@ pub fn gated_delta_chunk_route(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool
 }
 
 /// Whether H6's inline-Q8 chunk kernel (`gated_delta_chunk_gate_q8_wmma`) can
-/// run this step, flag aside: exact gfx1151 on the chunked route, a Q8 slot
-/// whose base is 16-byte aligned (the kernel loads codes as `int4`).
+/// run this step, flag aside: exact gfx1151 on the chunked route, a plain Q8
+/// slot without a residual (F32 never; Q8Ef has no inline kernel, so it is
+/// never admitted and always runs on its F32 reconstruction) whose base is
+/// 16-byte aligned (the kernel loads codes as `int4`).
 pub fn gated_delta_q8_inline_geometry(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool {
     gpu.arch_caps.is_gfx1151()
         && gpu.arch_caps.has_wmma_w32()
         && gated_delta_chunk_route(gpu, p)
-        && matches!(GdnStateFormat::of(p.state), Ok(GdnStateFormat::Q8))
+        && gdn_chunk_inline_format(p.format, p.residual.is_some())
         && (p.state.buf.as_ptr() as usize) % 16 == 0
+}
+
+/// Format part of the inline chunk geometry: only plain Q8 without a residual
+/// tensor.  F32 has no inline kernel, and Q8Ef has none either (it is not
+/// GPU-gated yet).
+const fn gdn_chunk_inline_format(format: GdnStateFormat, has_residual: bool) -> bool {
+    matches!(format, GdnStateFormat::Q8) && !has_residual
 }
 
 /// [`gated_delta_q8_inline_geometry`] under `HIPFIRE_QWEN4_GDN_Q8_INLINE=1`
@@ -747,7 +1215,8 @@ pub fn gated_delta_conv_qknorm_route(
 struct GatedDeltaChunkArms {
     /// The convolution already wrote the normalized Q/K into the scratch.
     qk_prenormed: bool,
-    /// Q8 state decoded/requantized inside the recurrence kernel.
+    /// Q8-family (Q8 or Q8Ef) state decoded/requantized inside the
+    /// recurrence kernel.
     q8_inline: bool,
 }
 
@@ -786,6 +1255,130 @@ pub fn gated_delta_step_gate_wmma_qknormed(
     gated_delta_step_gate_wmma_arms(gpu, p, gate, arms)
 }
 
+/// The chunk kernel module of a state: only the inline plain-Q8 kernel has its
+/// own module over its own chunk source (it carries no EF text, so its code
+/// object is the plain Q8 kernel's alone); every other launch (F32, or a
+/// Q8-family state run on its F32 scratch, Q8Ef always) uses the plain F32
+/// chunk kernel.  `arena`: the direct-arena twin.
+pub(crate) const fn gdn_chunk_module_name(
+    format: GdnStateFormat,
+    inline: bool,
+    arena: bool,
+) -> &'static str {
+    match (format, inline, arena) {
+        (GdnStateFormat::Q8, true, false) => "gated_delta_chunk_q8_wmma",
+        (GdnStateFormat::Q8, true, true) => "gated_delta_chunk_q8_wmma_arena",
+        (GdnStateFormat::F32 | GdnStateFormat::Q8Ef, _, false)
+        | (GdnStateFormat::Q8, false, false) => "gated_delta_chunk_wmma",
+        (GdnStateFormat::F32 | GdnStateFormat::Q8Ef, _, true)
+        | (GdnStateFormat::Q8, false, true) => "gated_delta_chunk_wmma_arena",
+    }
+}
+
+/// Source text of [`gdn_chunk_module_name`]'s module: the inline Q8 kernel
+/// lives in its own source file, so the plain F32 code object is unchanged.
+pub(crate) const fn gdn_chunk_source(
+    format: GdnStateFormat,
+    inline: bool,
+    arena: bool,
+) -> &'static str {
+    match (format, inline, arena) {
+        (GdnStateFormat::Q8, true, false) => GATED_DELTA_CHUNK_Q8_WMMA_SRC,
+        (GdnStateFormat::Q8, true, true) => npu_arena::CHUNK_Q8_ARENA_SRC,
+        (GdnStateFormat::F32 | GdnStateFormat::Q8Ef, _, false)
+        | (GdnStateFormat::Q8, false, false) => GATED_DELTA_CHUNK_WMMA_SRC,
+        (GdnStateFormat::F32 | GdnStateFormat::Q8Ef, _, true)
+        | (GdnStateFormat::Q8, false, true) => npu_arena::CHUNK_ARENA_SRC,
+    }
+}
+
+/// Entry point of [`gdn_chunk_module_name`]'s module.
+pub(crate) const fn gdn_chunk_kernel_name(
+    format: GdnStateFormat,
+    inline: bool,
+    arena: bool,
+) -> &'static str {
+    match (format, inline, arena) {
+        (GdnStateFormat::Q8, true, false) => "gated_delta_chunk_gate_q8_wmma",
+        (GdnStateFormat::Q8, true, true) => "gated_delta_chunk_gate_q8_wmma_arena",
+        (GdnStateFormat::F32 | GdnStateFormat::Q8Ef, _, false)
+        | (GdnStateFormat::Q8, false, false) => "gated_delta_chunk_gate_wmma",
+        (GdnStateFormat::F32 | GdnStateFormat::Q8Ef, _, true)
+        | (GdnStateFormat::Q8, false, true) => "gated_delta_chunk_gate_wmma_arena",
+    }
+}
+
+/// The state argument of a chunk kernel launch.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GdnChunkState {
+    /// An F32 state (the state itself, or the F32 scratch of a Q8-family state
+    /// converted around the launch): `float* state`, no mode, no frame.
+    F32 { state: *mut std::ffi::c_void },
+    /// Inline plain-Q8 slot: mode 1, trailing requantization `frame`.
+    Q8Inline {
+        state: *mut std::ffi::c_void,
+        frame: u32,
+    },
+}
+
+/// Resolved arguments of one chunk GDN kernel launch
+/// ([`gdn_chunk_kernargs`]); `z` is the gate `z` source (or the arena).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GdnChunkKernargs {
+    pub projection: *mut std::ffi::c_void,
+    pub qn: *mut std::ffi::c_void,
+    pub kn: *mut std::ffi::c_void,
+    pub gate: *mut std::ffi::c_void,
+    pub beta: *mut std::ffi::c_void,
+    pub state: GdnChunkState,
+    pub z: *mut std::ffi::c_void,
+    pub norm: *mut std::ffi::c_void,
+    pub output: *mut std::ffi::c_void,
+    pub rows: i32,
+    pub qkv_width: i32,
+    pub key_heads: i32,
+    pub value_heads: i32,
+    pub query_scale: f32,
+    /// `1` when the gated output is stored as BF16 bits, else `0`.
+    pub output_bf16: i32,
+}
+
+/// The UNPADDED kernarg blob of a chunk GDN launch (the arena twin appends its
+/// pitch arguments, then the caller pads): `projection, qn, kn, gate, beta,
+/// state, z, norm, output, rows, qkv_width, key_heads, value_heads,
+/// query_scale, output_bf16`, then for the inline plain-Q8 kernel `i32 mode = 1`
+/// and the `u32` frame.
+pub(crate) fn gdn_chunk_kernargs(a: &GdnChunkKernargs) -> KernargBlob {
+    let mut args = KernargBlob::new();
+    args.push_ptr(a.projection);
+    args.push_ptr(a.qn);
+    args.push_ptr(a.kn);
+    args.push_ptr(a.gate);
+    args.push_ptr(a.beta);
+    match a.state {
+        GdnChunkState::F32 { state } | GdnChunkState::Q8Inline { state, .. } => {
+            args.push_ptr(state)
+        }
+    }
+    args.push_ptr(a.z);
+    args.push_ptr(a.norm);
+    args.push_ptr(a.output);
+    args.push_i32(a.rows);
+    args.push_i32(a.qkv_width);
+    args.push_i32(a.key_heads);
+    args.push_i32(a.value_heads);
+    args.push_f32(a.query_scale);
+    args.push_i32(a.output_bf16);
+    match a.state {
+        GdnChunkState::F32 { .. } => {}
+        GdnChunkState::Q8Inline { frame, .. } => {
+            args.push_i32(1);
+            args.push_u32(frame);
+        }
+    }
+    args
+}
+
 fn gated_delta_step_gate_wmma_arms(
     gpu: &mut Gpu,
     p: &GatedDeltaStepBatched<'_>,
@@ -798,7 +1391,17 @@ fn gated_delta_step_gate_wmma_arms(
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
-    let format = GdnStateFormat::of(p.state)?;
+    let format = p.format;
+    validate_gdn_state(
+        format,
+        p.state,
+        p.residual,
+        None,
+        1,
+        p.value_heads,
+        p.key_dim,
+        p.value_dim,
+    )?;
     for tensor in [p.gate, p.beta, gate.z] {
         ensure_f32(tensor)?;
     }
@@ -813,7 +1416,6 @@ fn gated_delta_step_gate_wmma_arms(
         || p.projection.numel() < p.rows * p.qkv_width
         || p.gate.numel() < p.rows * p.value_heads
         || p.beta.numel() < p.rows * p.value_heads
-        || p.state.numel() != format.state_units(p.value_heads, p.key_dim, p.value_dim)
         || gate.rows != p.rows
         || gate.value_heads != p.value_heads
         || gate.value_dim != p.value_dim
@@ -838,19 +1440,11 @@ fn gated_delta_step_gate_wmma_arms(
             "gated_delta_qk_norm_bf16_batched",
         )?;
     }
-    if arms.q8_inline {
-        gpu.ensure_kernel_public(
-            "gated_delta_chunk_q8_wmma",
-            GATED_DELTA_CHUNK_Q8_WMMA_SRC,
-            "gated_delta_chunk_gate_q8_wmma",
-        )?;
-    } else {
-        gpu.ensure_kernel_public(
-            "gated_delta_chunk_wmma",
-            GATED_DELTA_CHUNK_WMMA_SRC,
-            "gated_delta_chunk_gate_wmma",
-        )?;
-    }
+    gpu.ensure_kernel_public(
+        gdn_chunk_module_name(format, arms.q8_inline, false),
+        gdn_chunk_source(format, arms.q8_inline, false),
+        gdn_chunk_kernel_name(format, arms.q8_inline, false),
+    )?;
     // With `qk_prenormed` the convolution already stored the normalized Q/K
     // in this same scratch (`gated_delta_conv_params_qknorm_batched`).
     if !arms.qk_prenormed {
@@ -871,108 +1465,214 @@ fn gated_delta_step_gate_wmma_arms(
             crate::dispatch::ReplayLaunchBindings::NONE,
         )?;
     }
-    // A Q8 state runs the chunk on its F32 dequantization (the state scratch)
-    // and is requantized from it after the chunk, seeded by the last row.
-    // The inline arm (`gated_delta_chunk_gate_q8_wmma`) does both inside the
-    // kernel on the slot itself.  Both seed the requantization with the last
+    // A Q8-family state runs the chunk on its F32 reconstruction (the state
+    // scratch; Q8Ef adds the live residual) and is requantized from it after
+    // the chunk (plain Q8 seeded by the last row; Q8Ef round-to-nearest-even
+    // writing fresh codes, scales and residual).  Only the plain Q8 inline arm
+    // (`gated_delta_chunk_gate_q8_wmma`) does both inside the kernel on the
+    // slot itself.  A plain Q8 launch seeds the requantization with the last
     // row's absolute position, `position + rows - 1`.  The route excludes a
     // recorder and graph capture (`gated_delta_chunk_route`), so the frame is
     // never a replayed kernarg and needs no mutable-frame binding.
-    let frame = match format {
-        GdnStateFormat::F32 => 0,
-        GdnStateFormat::Q8 => checked_u32(p.position + p.rows - 1, "GDN Q8 frame")?,
+    let frame = if format.has_frame_kernarg() {
+        checked_u32(p.position + p.rows - 1, "GDN Q8 frame")?
+    } else {
+        0
     };
-    let state = match format {
-        GdnStateFormat::F32 => p.state.buf.as_ptr(),
-        GdnStateFormat::Q8 if arms.q8_inline => p.state.buf.as_ptr(),
-        GdnStateFormat::Q8 => {
-            let scratch = gpu.gdn_state_f32_scratch(GdnStateFormat::F32.state_bytes(
+    let slot = p.state.buf.as_ptr();
+    let residual = p.residual.map(|residual| residual.buf.as_ptr());
+    let mut scratch = None;
+    // A Q8Ef inline request never reaches here: `arms.q8_inline &&
+    // !gated_delta_q8_inline_geometry` above already refused it (Q8Ef has no
+    // inline kernel), so a Q8Ef chunk always takes the scratch arm.
+    let chunk_state = match (format, arms.q8_inline) {
+        (GdnStateFormat::F32, _) => GdnChunkState::F32 { state: slot },
+        (GdnStateFormat::Q8, true) => GdnChunkState::Q8Inline { state: slot, frame },
+        (GdnStateFormat::Q8, false) | (GdnStateFormat::Q8Ef, _) => {
+            let f32_state = gpu.gdn_state_f32_scratch(GdnStateFormat::F32.state_bytes(
                 p.value_heads,
                 p.key_dim,
                 p.value_dim,
             ))?;
-            gdn_state_convert(
-                gpu,
-                "gdn_state_q8_to_f32",
-                p.state.buf.as_ptr(),
-                scratch,
-                p.value_heads,
-                None,
-            )?;
-            scratch
+            gdn_state_to_f32(gpu, format, slot, residual, f32_state, p.value_heads)?;
+            scratch = Some(f32_state);
+            GdnChunkState::F32 { state: f32_state }
         }
     };
-    let mut args = KernargBlob::new();
-    args.push_ptr(p.projection.buf.as_ptr());
-    args.push_ptr(qp);
-    args.push_ptr(kp);
-    args.push_ptr(p.gate.buf.as_ptr());
-    args.push_ptr(p.beta.buf.as_ptr());
-    args.push_ptr(state);
-    for tensor in [gate.z, gate.norm, gate.output] {
-        args.push_ptr(tensor.buf.as_ptr());
-    }
-    args.push_i32(rows);
-    args.push_i32(qkv_width);
-    args.push_i32(key_heads);
-    args.push_i32(value_heads);
-    args.push_f32((p.key_dim as f32).sqrt().recip());
-    args.push_i32(i32::from(output_bf16));
-    if arms.q8_inline {
-        args.push_i32(1);
-        args.push_u32(frame);
-    }
+    let mut args = gdn_chunk_kernargs(&GdnChunkKernargs {
+        projection: p.projection.buf.as_ptr(),
+        qn: qp,
+        kn: kp,
+        gate: p.gate.buf.as_ptr(),
+        beta: p.beta.buf.as_ptr(),
+        state: chunk_state,
+        z: gate.z.buf.as_ptr(),
+        norm: gate.norm.buf.as_ptr(),
+        output: gate.output.buf.as_ptr(),
+        rows,
+        qkv_width,
+        key_heads,
+        value_heads,
+        query_scale: (p.key_dim as f32).sqrt().recip(),
+        output_bf16: i32::from(output_bf16),
+    });
     args.pad_to(16);
-    let chunk_kernel = if arms.q8_inline {
-        "gated_delta_chunk_gate_q8_wmma"
-    } else {
-        "gated_delta_chunk_gate_wmma"
-    };
     gpu.launch_blob_recorded(
-        chunk_kernel,
+        gdn_chunk_kernel_name(format, arms.q8_inline, false),
         [checked_u32(p.value_heads, "GDN chunk head grid")?, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
     )?;
-    if format == GdnStateFormat::Q8 && !arms.q8_inline {
-        gdn_state_convert(
-            gpu,
-            "gdn_state_f32_to_q8",
-            state,
-            p.state.buf.as_ptr(),
-            p.value_heads,
-            Some(frame),
-        )?;
+    if let Some(f32_state) = scratch {
+        gdn_state_from_f32(gpu, format, f32_state, slot, residual, p.value_heads, frame)?;
     }
     Ok(())
 }
 
-/// One of the Q8 GDN state conversions (`gdn_state_q8_to_f32`, or
-/// `gdn_state_f32_to_q8` with its requantization `frame`): grid
+/// Converter kernel of a Q8-family `format`: `to_f32` reconstructs the F32
+/// state (Q8Ef adds the live residual once), otherwise requantizes an F32
+/// state (Q8Ef writes fresh codes, scales and residual and never re-adds the
+/// old residual).  An F32 state needs no conversion and is refused.
+fn gdn_convert_kernel(format: GdnStateFormat, to_f32: bool) -> HipResult<&'static str> {
+    match (format, to_f32) {
+        (GdnStateFormat::Q8, true) => Ok("gdn_state_q8_to_f32"),
+        (GdnStateFormat::Q8, false) => Ok("gdn_state_f32_to_q8"),
+        (GdnStateFormat::Q8Ef, true) => Ok("gdn_state_q8ef_to_f32"),
+        (GdnStateFormat::Q8Ef, false) => Ok("gdn_state_f32_to_q8ef"),
+        (GdnStateFormat::F32, _) => Err(HipError::new(
+            0,
+            "GDN state conversion: an F32 state has no Q8 slot",
+        )),
+    }
+}
+
+/// The unpadded kernarg blob of a state converter.  `to_f32`:
+/// `(slot, [ef], f32_dst, value_heads)`; from F32: `(f32_src, slot, [ef],
+/// value_heads, [frame])`, the frame for plain Q8 only.
+fn gdn_convert_kernargs(
+    to_f32: bool,
+    state: &GdnStateKernarg,
+    f32_state: *mut std::ffi::c_void,
+    value_heads: i32,
+    frame: u32,
+) -> KernargBlob {
+    let mut args = KernargBlob::new();
+    if to_f32 {
+        state.push_slot(&mut args);
+        args.push_ptr(f32_state);
+        args.push_i32(value_heads);
+    } else {
+        args.push_ptr(f32_state);
+        state.push_slot(&mut args);
+        args.push_i32(value_heads);
+        state.push_frame(&mut args, frame);
+    }
+    args
+}
+
+/// Reconstruct the F32 state `[value_head][key][value]` of a Q8-family slot
+/// into `f32_dst`: `gdn_state_q8_to_f32`, or for Q8Ef
+/// `gdn_state_q8ef_to_f32(slot, ef, dst, value_heads)` with `residual` the
+/// live F16 residual (`Some` exactly for Q8Ef, else an error).  Grid
 /// `value_heads * 128` value rows, block 128.
+pub(crate) fn gdn_state_to_f32(
+    gpu: &mut Gpu,
+    format: GdnStateFormat,
+    slot: *mut std::ffi::c_void,
+    residual: Option<*mut std::ffi::c_void>,
+    f32_dst: *mut std::ffi::c_void,
+    value_heads: usize,
+) -> HipResult<()> {
+    gdn_state_convert(gpu, format, true, slot, residual, f32_dst, value_heads, 0)
+}
+
+/// Requantize an F32 state into a Q8-family slot: `gdn_state_f32_to_q8` seeded
+/// by `frame`, or for Q8Ef `gdn_state_f32_to_q8ef(src, slot, ef, value_heads)`
+/// writing fresh codes, scales and `residual`; Q8Ef takes no frame (ignored
+/// here, never a kernarg).
+pub(crate) fn gdn_state_from_f32(
+    gpu: &mut Gpu,
+    format: GdnStateFormat,
+    f32_src: *mut std::ffi::c_void,
+    slot: *mut std::ffi::c_void,
+    residual: Option<*mut std::ffi::c_void>,
+    value_heads: usize,
+    frame: u32,
+) -> HipResult<()> {
+    gdn_state_convert(gpu, format, false, slot, residual, f32_src, value_heads, frame)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn gdn_state_convert(
     gpu: &mut Gpu,
-    kernel: &str,
-    source: *mut std::ffi::c_void,
-    destination: *mut std::ffi::c_void,
+    format: GdnStateFormat,
+    to_f32: bool,
+    slot: *mut std::ffi::c_void,
+    residual: Option<*mut std::ffi::c_void>,
+    f32_state: *mut std::ffi::c_void,
     value_heads: usize,
-    frame: Option<u32>,
+    frame: u32,
 ) -> HipResult<()> {
+    let kernel = gdn_convert_kernel(format, to_f32)?;
+    let state = GdnStateKernarg::new(format, slot, residual)?;
+    let heads = checked_i32(value_heads, "GDN state heads")?;
+    let grid = checked_u32(
+        checked_product(value_heads, 128, "GDN state row grid")?,
+        "GDN state row grid",
+    )?;
     gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)?;
-    let mut args = KernargBlob::new();
-    args.push_ptr(source);
-    args.push_ptr(destination);
-    args.push_i32(checked_i32(value_heads, "GDN state heads")?);
-    if let Some(frame) = frame {
-        args.push_u32(frame);
-    }
+    let mut args = gdn_convert_kernargs(to_f32, &state, f32_state, heads, frame);
     args.pad_to(16);
     gpu.launch_blob_recorded(
         kernel,
-        [checked_u32(value_heads * 128, "GDN state row grid")?, 1, 1],
+        [grid, 1, 1],
         [128, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
+/// Kernargs of `gdn_q8ef_residual_zero(unsigned short* ef, unsigned int count)`.
+fn gdn_q8ef_zero_kernargs(ef: *mut std::ffi::c_void, count: u32) -> KernargBlob {
+    let mut args = KernargBlob::new();
+    args.push_ptr(ef);
+    args.push_u32(count);
+    args
+}
+
+/// Zero a live Q8Ef residual (`gdn_q8ef_residual_zero`: grid
+/// `ceil(count / 256)`, block 256).  Recorded as a kernel dispatch, so it is
+/// stream-ordered and graph/replay-visible (no `hipMemset` inside a
+/// dispatch-only tape).  The lifecycle points that reset a Q8Ef state call it
+/// per GDN layer: initial reset, keep-0 restore, partial rollback (after
+/// [`gated_delta_rollback_layers`]), transaction/session/prefix/disk restore
+/// and lane reinit.  An uninterrupted AR step, prefill launch or all-accept
+/// commit keeps the residual.  Any non-empty F16 tensor is accepted (the
+/// kernel zeroes `numel` elements); a non-F16 tensor is `WrongDtype`, an empty
+/// or undersized one `WrongShape`.
+pub fn gdn_q8ef_residual_zero(gpu: &mut Gpu, residual: &GpuTensor) -> HipResult<()> {
+    if residual.dtype != DType::F16 {
+        return Err(HipError::new(0, &ComputeError::WrongDtype.to_string()));
+    }
+    let count = residual.numel();
+    if count == 0 || residual.buf.size() < checked_product(count, 2, "GDN residual bytes")? {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let count32 = checked_u32(
+        checked_extent(count, "GDN residual extent")?,
+        "GDN residual extent",
+    )?;
+    let grid = blocks(count)?;
+    gpu.ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, "gdn_q8ef_residual_zero")?;
+    let mut args = gdn_q8ef_zero_kernargs(residual.buf.as_ptr(), count32);
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        "gdn_q8ef_residual_zero",
+        [grid, 1, 1],
+        [KERNEL_BLOCK as u32, 1, 1],
         0,
         args.as_mut_slice(),
         crate::dispatch::ReplayLaunchBindings::NONE,
@@ -10942,6 +11642,8 @@ mod tests {
                 gate: &gate_gpu,
                 beta: &beta_gpu,
                 state: &batched_state,
+                format: GdnStateFormat::F32,
+                residual: None,
                 output: &batched_out,
                 row_states: None,
                 rows,
@@ -10967,6 +11669,8 @@ mod tests {
                     gate: &gate_gpu.sub_offset(row * value_heads, value_heads),
                     beta: &beta_gpu.sub_offset(row * value_heads, value_heads),
                     state: &row_state,
+                    format: GdnStateFormat::F32,
+                    residual: None,
                     output: &row_out.sub_offset(row * value, value),
                     key_heads,
                     value_heads,
@@ -11062,13 +11766,14 @@ mod tests {
         let state0_gpu = gpu.upload_f32(&state0, &[state0.len()]).expect("state0");
         let slot0 = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
         if !is_gfx942 {
-            gdn_state_convert(
+            gdn_state_from_f32(
                 &mut gpu,
-                "gdn_state_f32_to_q8",
+                GdnStateFormat::Q8,
                 state0_gpu.buf.as_ptr(),
                 slot0.buf.as_ptr(),
+                None,
                 value_heads,
-                Some(7),
+                7,
             )
             .expect("quantize");
         }
@@ -11246,6 +11951,8 @@ mod tests {
                 gate: &gate_gpu,
                 beta: &beta_gpu,
                 state: &state,
+                format: GdnStateFormat::F32,
+                residual: None,
                 output: &recurrent,
                 row_states: None,
                 rows,
@@ -11337,6 +12044,8 @@ mod tests {
                     gate: &gate.sub_offset(row * value_heads, value_heads),
                     beta: &beta.sub_offset(row * value_heads, value_heads),
                     state: slot,
+                    format: GdnStateFormat::Q8,
+                    residual: None,
                     output: &out.sub_offset(row * value, value),
                     key_heads,
                     value_heads,
@@ -11405,13 +12114,14 @@ mod tests {
         let beta_gpu = gpu.upload_f32(&beta, &[beta.len()]).expect("beta");
         let state0_gpu = gpu.upload_f32(&state0, &[state0.len()]).expect("state0");
         let slot0 = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
-        gdn_state_convert(
+        gdn_state_from_f32(
             &mut gpu,
-            "gdn_state_f32_to_q8",
+            GdnStateFormat::Q8,
             state0_gpu.buf.as_ptr(),
             slot0.buf.as_ptr(),
+            None,
             value_heads,
-            Some(start as u32 - 1),
+            start as u32 - 1,
         )
         .expect("quantize");
         let bytes = |gpu: &Gpu, t: &GpuTensor| -> Vec<u8> {
@@ -11477,6 +12187,8 @@ mod tests {
                             gate: &gate_gpu.sub_offset(0, n * value_heads),
                             beta: &beta_gpu.sub_offset(0, n * value_heads),
                             state: &live,
+                            format,
+                            residual: None,
                             output: &out,
                             row_states: Some(&ring),
                             rows: n,
@@ -11659,13 +12371,14 @@ mod tests {
         let beta_gpu = gpu.upload_f32(&beta, &[beta.len()]).expect("beta");
         let state0_gpu = gpu.upload_f32(&state0, &[state0.len()]).expect("state0");
         let slot0 = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
-        gdn_state_convert(
+        gdn_state_from_f32(
             &mut gpu,
-            "gdn_state_f32_to_q8",
+            GdnStateFormat::Q8,
             state0_gpu.buf.as_ptr(),
             slot0.buf.as_ptr(),
+            None,
             value_heads,
-            Some(7),
+            7,
         )
         .expect("quantize");
         let bytes = |gpu: &Gpu, t: &GpuTensor| -> Vec<u8> {
@@ -11680,13 +12393,13 @@ mod tests {
         };
         let dequant = |gpu: &mut Gpu, slot: &GpuTensor| -> Vec<f32> {
             let f = gpu.zeros(&[value * dim], DType::F32).expect("f32");
-            gdn_state_convert(
+            gdn_state_to_f32(
                 gpu,
-                "gdn_state_q8_to_f32",
+                GdnStateFormat::Q8,
                 slot.buf.as_ptr(),
+                None,
                 f.buf.as_ptr(),
                 value_heads,
-                None,
             )
             .expect("dequantize");
             let values = gpu.download_f32(&f).expect("download");
@@ -11722,6 +12435,12 @@ mod tests {
                         gate: &gate_gpu.sub_offset(row * value_heads, value_heads),
                         beta: &beta_gpu.sub_offset(row * value_heads, value_heads),
                         state,
+                        format: if state.dtype == DType::F32 {
+                            GdnStateFormat::F32
+                        } else {
+                            GdnStateFormat::Q8
+                        },
+                        residual: None,
                         output: &out.sub_offset(row * value, value),
                         key_heads,
                         value_heads,
@@ -11760,6 +12479,12 @@ mod tests {
                         gate: &gate_gpu.sub_offset(0, n * value_heads),
                         beta: &beta_gpu.sub_offset(0, n * value_heads),
                         state,
+                        format: if state.dtype == DType::F32 {
+                            GdnStateFormat::F32
+                        } else {
+                            GdnStateFormat::Q8
+                        },
+                        residual: None,
                         output: &out,
                         row_states: ring,
                         rows: n,
@@ -11967,13 +12692,14 @@ mod tests {
         let slot_bytes = GdnStateFormat::Q8.state_units(value_heads, dim, dim);
         let state0_gpu = gpu.upload_f32(&state0, &[state0.len()]).expect("state0");
         let seed_slot = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
-        gdn_state_convert(
+        gdn_state_from_f32(
             &mut gpu,
-            "gdn_state_f32_to_q8",
+            GdnStateFormat::Q8,
             state0_gpu.buf.as_ptr(),
             seed_slot.buf.as_ptr(),
+            None,
             value_heads,
-            Some(3),
+            3,
         )
         .expect("quantize");
         let run = |gpu: &mut Gpu, state: &GpuTensor, n: usize| -> Vec<f32> {
@@ -11984,6 +12710,12 @@ mod tests {
                 gate: &gate_gpu.sub_offset(0, n * value_heads),
                 beta: &beta_gpu.sub_offset(0, n * value_heads),
                 state,
+                format: if state.dtype == DType::F32 {
+                    GdnStateFormat::F32
+                } else {
+                    GdnStateFormat::Q8
+                },
+                residual: None,
                 output: &recurrent,
                 row_states: None,
                 rows: n,
@@ -12025,26 +12757,26 @@ mod tests {
             gpu.copy_d2d(&seed_slot, &slot, slot_bytes)
                 .expect("copy slot");
             let f32_state = gpu.zeros(&[value * dim], DType::F32).expect("state");
-            gdn_state_convert(
+            gdn_state_to_f32(
                 &mut gpu,
-                "gdn_state_q8_to_f32",
+                GdnStateFormat::Q8,
                 slot.buf.as_ptr(),
+                None,
                 f32_state.buf.as_ptr(),
                 value_heads,
-                None,
             )
             .expect("dequantize");
             let f32_out = run(&mut gpu, &f32_state, n);
             let q8_out = run(&mut gpu, &slot, n);
             let f32_final = gpu.download_f32(&f32_state).expect("download");
             let q8_final = gpu.zeros(&[value * dim], DType::F32).expect("state");
-            gdn_state_convert(
+            gdn_state_to_f32(
                 &mut gpu,
-                "gdn_state_q8_to_f32",
+                GdnStateFormat::Q8,
                 slot.buf.as_ptr(),
+                None,
                 q8_final.buf.as_ptr(),
                 value_heads,
-                None,
             )
             .expect("dequantize");
             let q8_final_values = gpu.download_f32(&q8_final).expect("download");
@@ -12219,6 +12951,8 @@ mod tests {
                 gate: &gate,
                 beta: &beta,
                 state: &state,
+                format: GdnStateFormat::F32,
+                residual: None,
                 output: &recurrent,
                 row_states: None,
                 rows,
@@ -12338,6 +13072,8 @@ mod tests {
             gate: &gate,
             beta: &gate,
             state: &state,
+            format: GdnStateFormat::F32,
+            residual: None,
             output: &recurrent,
             row_states: None,
             rows,
@@ -12451,13 +13187,14 @@ mod tests {
         let slot_bytes = GdnStateFormat::Q8.state_units(value_heads, dim, dim);
         let state0_gpu = gpu.upload_f32(&state0, &[state0.len()]).expect("state0");
         let seed_slot = gpu.zeros(&[slot_bytes], DType::Raw).expect("slot");
-        gdn_state_convert(
+        gdn_state_from_f32(
             &mut gpu,
-            "gdn_state_f32_to_q8",
+            GdnStateFormat::Q8,
             state0_gpu.buf.as_ptr(),
             seed_slot.buf.as_ptr(),
+            None,
             value_heads,
-            Some(3),
+            3,
         )
         .expect("quantize");
         let bytes = |gpu: &Gpu, t: &GpuTensor| -> Vec<u8> {
@@ -12485,6 +13222,8 @@ mod tests {
                     gate: &gate_gpu.sub_offset(0, n * value_heads),
                     beta: &beta_gpu.sub_offset(0, n * value_heads),
                     state: &slot,
+                    format: GdnStateFormat::Q8,
+                    residual: None,
                     output: &recurrent,
                     row_states: None,
                     rows: n,
@@ -12539,6 +13278,8 @@ mod tests {
             gate: &gate_gpu,
             beta: &beta_gpu,
             state: &f32_state,
+            format: GdnStateFormat::F32,
+            residual: None,
             output: &f32_state,
             row_states: None,
             rows: 512,
@@ -12753,6 +13494,8 @@ mod tests {
             gate: &gate,
             beta: &beta,
             state: &state,
+            format: GdnStateFormat::F32,
+            residual: None,
             output: &output,
             key_heads: 1,
             value_heads: 3,
@@ -17328,6 +18071,722 @@ mod hc_up_twin_route_tests {
                 want,
                 "enabled={enabled} exact_gfx1151={exact} rows={rows}"
             );
+        }
+    }
+}
+
+/// CPU-only tests of the Q8Ef live-layout ABI: format metadata, strict state
+/// validation, kernel selection and the kernargs the production launchers
+/// build (the tests call the very builders the launchers call).
+#[cfg(test)]
+mod gdn_q8ef_tests {
+    use super::*;
+    use hip_bridge::DeviceBuffer;
+    use std::ffi::c_void;
+
+    const F32: GdnStateFormat = GdnStateFormat::F32;
+    const Q8: GdnStateFormat = GdnStateFormat::Q8;
+    const EF: GdnStateFormat = GdnStateFormat::Q8Ef;
+    const FORMATS: [GdnStateFormat; 3] = [F32, Q8, EF];
+
+    fn ptr(address: usize) -> *mut c_void {
+        address as *mut c_void
+    }
+
+    /// A non-owning tensor over fabricated device addresses (never launched).
+    fn tensor(address: usize, shape: &[usize], dtype: DType, bytes: usize) -> GpuTensor {
+        GpuTensor {
+            buf: unsafe { DeviceBuffer::from_raw(ptr(address), bytes) },
+            shape: shape.to_vec(),
+            dtype,
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Arg {
+        P(usize),
+        I(i32),
+        U(u32),
+        F(f32),
+    }
+
+    /// The kernarg bytes of a hand-written argument list.
+    fn expected(spec: &[Arg]) -> Vec<u8> {
+        let mut blob = KernargBlob::new();
+        for arg in spec {
+            match *arg {
+                Arg::P(value) => blob.push_ptr(ptr(value)),
+                Arg::I(value) => blob.push_i32(value),
+                Arg::U(value) => blob.push_u32(value),
+                Arg::F(value) => blob.push_f32(value),
+            }
+        }
+        blob.as_bytes().to_vec()
+    }
+
+    const HEADS: usize = 2;
+    const STATE_BASE: usize = 0x1_0000_0000;
+    const RESIDUAL_BASE: usize = 0x2_0000_0000;
+    const RING_BASE: usize = 0x3_0000_0000;
+
+    fn state_tensor(format: GdnStateFormat) -> GpuTensor {
+        tensor(
+            STATE_BASE,
+            &[format.state_units(HEADS, 128, 128)],
+            format.dtype(),
+            format.state_bytes(HEADS, 128, 128),
+        )
+    }
+
+    fn residual_tensor(address: usize) -> GpuTensor {
+        let units = EF.residual_units(HEADS, 128, 128);
+        tensor(address, &[units], DType::F16, EF.residual_bytes(HEADS, 128, 128))
+    }
+
+    fn ring_tensor(format: GdnStateFormat, rows: usize) -> GpuTensor {
+        let storage = format.storage();
+        tensor(
+            RING_BASE,
+            &[rows * storage.state_units(HEADS, 128, 128)],
+            storage.dtype(),
+            rows * storage.state_bytes(HEADS, 128, 128),
+        )
+    }
+
+    fn validate(
+        format: GdnStateFormat,
+        state: &GpuTensor,
+        residual: Option<&GpuTensor>,
+        ring: Option<&GpuTensor>,
+        rows: usize,
+    ) -> HipResult<()> {
+        validate_gdn_state(format, state, residual, ring, rows, HEADS, 128, 128)
+    }
+
+    #[test]
+    fn gdn_q8ef_live_layout() {
+        assert_eq!(EF.name(), "q8_ef");
+        assert_eq!(Q8.name(), "q8");
+        assert_eq!(F32.name(), "f32");
+        assert_eq!(EF.storage(), Q8);
+        assert_eq!(Q8.storage(), Q8);
+        assert_eq!(F32.storage(), F32);
+        assert!(EF.has_residual());
+        assert!(!Q8.has_residual());
+        assert!(!F32.has_residual());
+        for (heads, key, value) in [(48, 128, 128), (16, 128, 128), (1, 128, 128), (48, 64, 128)] {
+            assert_eq!(EF.supports(key, value), Q8.supports(key, value));
+            assert_eq!(EF.dtype(), Q8.dtype());
+            assert_eq!(EF.dtype(), DType::Raw);
+            assert_eq!(
+                EF.state_units(heads, key, value),
+                Q8.state_units(heads, key, value)
+            );
+            assert_eq!(
+                EF.state_bytes(heads, key, value),
+                Q8.state_bytes(heads, key, value)
+            );
+            assert_eq!(F32.residual_units(heads, key, value), 0);
+            assert_eq!(Q8.residual_units(heads, key, value), 0);
+            assert_eq!(Q8.residual_bytes(heads, key, value), 0);
+        }
+        assert!(!EF.supports(64, 128));
+        // 48 value heads: 811,008 Q8 slot bytes, 1,572,864 residual bytes per
+        // layer, 54 MiB over 36 layers.
+        assert_eq!(EF.state_bytes(48, 128, 128), 811_008);
+        assert_eq!(EF.residual_units(48, 128, 128), 48 * 128 * 128);
+        assert_eq!(EF.residual_bytes(48, 128, 128), 1_572_864);
+        assert_eq!(36 * EF.residual_bytes(48, 128, 128), 54 * 1024 * 1024);
+        // The residual index is the Q8 code index: (head * 128 + row) * 128 + col.
+        let index = |head: usize, row: usize, col: usize| (head * 128 + row) * 128 + col;
+        assert_eq!(index(0, 0, 0), 0);
+        assert_eq!(index(47, 127, 127), EF.residual_units(48, 128, 128) - 1);
+    }
+
+    #[test]
+    fn gdn_q8ef_live_layout_validation() {
+        let state = state_tensor(EF);
+        let residual = residual_tensor(RESIDUAL_BASE);
+        let ring = ring_tensor(EF, 4);
+        validate(EF, &state, Some(&residual), None, 1).expect("Q8Ef state");
+        validate(EF, &state, Some(&residual), Some(&ring), 4).expect("Q8Ef capture ring");
+        validate(Q8, &state_tensor(Q8), None, Some(&ring_tensor(Q8, 4)), 4).expect("Q8 ring");
+        validate(F32, &state_tensor(F32), None, Some(&ring_tensor(F32, 2)), 2).expect("F32 ring");
+
+        // A residual is present exactly for a residual format.
+        assert!(validate(EF, &state, None, None, 1).is_err());
+        assert!(validate(Q8, &state_tensor(Q8), Some(&residual), None, 1).is_err());
+        assert!(validate(F32, &state_tensor(F32), Some(&residual), None, 1).is_err());
+        // Residual dtype and extent.
+        let wrong_dtype = tensor(
+            RESIDUAL_BASE,
+            &[EF.residual_units(HEADS, 128, 128)],
+            DType::F32,
+            EF.residual_bytes(HEADS, 128, 128),
+        );
+        assert_eq!(
+            validate(EF, &state, Some(&wrong_dtype), None, 1)
+                .unwrap_err()
+                .to_string(),
+            HipError::new(0, &ComputeError::WrongDtype.to_string()).to_string()
+        );
+        let short = tensor(
+            RESIDUAL_BASE,
+            &[EF.residual_units(HEADS, 128, 128) - 1],
+            DType::F16,
+            EF.residual_bytes(HEADS, 128, 128),
+        );
+        assert_eq!(
+            validate(EF, &state, Some(&short), None, 1)
+                .unwrap_err()
+                .to_string(),
+            HipError::new(0, &ComputeError::WrongShape.to_string()).to_string()
+        );
+        let long = tensor(
+            RESIDUAL_BASE,
+            &[EF.residual_units(HEADS, 128, 128) + 1],
+            DType::F16,
+            EF.residual_bytes(HEADS, 128, 128) + 2,
+        );
+        assert!(validate(EF, &state, Some(&long), None, 1).is_err());
+        let undersized_buffer = tensor(
+            RESIDUAL_BASE,
+            &[EF.residual_units(HEADS, 128, 128)],
+            DType::F16,
+            EF.residual_bytes(HEADS, 128, 128) - 2,
+        );
+        assert!(validate(EF, &state, Some(&undersized_buffer), None, 1).is_err());
+        // State dtype and extent follow the format (Q8Ef is a Raw slot).
+        assert!(validate(EF, &state_tensor(F32), Some(&residual), None, 1).is_err());
+        assert!(validate(F32, &state_tensor(EF), None, None, 1).is_err());
+        let short_state = tensor(
+            STATE_BASE,
+            &[EF.state_units(HEADS, 128, 128) - 1],
+            DType::Raw,
+            EF.state_bytes(HEADS, 128, 128),
+        );
+        assert!(validate(EF, &short_state, Some(&residual), None, 1).is_err());
+        // Geometry: Q8 family is 128x128 only.
+        assert!(validate_gdn_state(EF, &state, Some(&residual), None, 1, HEADS, 64, 128).is_err());
+        // The ring is plain Q8 (storage) with `rows` slots.
+        let f32_ring = ring_tensor(F32, 4);
+        assert!(validate(EF, &state, Some(&residual), Some(&f32_ring), 4).is_err());
+        assert!(validate(EF, &state, Some(&residual), Some(&ring_tensor(EF, 3)), 4).is_err());
+        assert!(validate(F32, &state_tensor(F32), None, Some(&ring_tensor(Q8, 4)), 4).is_err());
+        // The residual never aliases the state or the ring.
+        let in_state = residual_tensor(STATE_BASE + 4096);
+        assert!(validate(EF, &state, Some(&in_state), None, 1).is_err());
+        let in_ring = residual_tensor(RING_BASE + 16);
+        assert!(validate(EF, &state, Some(&in_ring), Some(&ring), 4).is_err());
+        // The state itself may sit adjacent to the residual.
+        let adjacent = residual_tensor(STATE_BASE + EF.state_bytes(HEADS, 128, 128));
+        validate(EF, &state, Some(&adjacent), None, 1).expect("adjacent ranges do not overlap");
+    }
+
+    #[test]
+    fn gdn_q8ef_live_layout_kernarg_state_refuses_mismatch() {
+        for format in FORMATS {
+            let with = GdnStateKernarg::new(format, ptr(1), Some(ptr(2)));
+            let without = GdnStateKernarg::new(format, ptr(1), None);
+            assert_eq!(with.is_ok(), format.has_residual(), "{}", format.name());
+            assert_eq!(without.is_ok(), !format.has_residual(), "{}", format.name());
+        }
+    }
+
+    /// `(kernel, pipe128)` of one batched launch for a format.
+    fn batched(
+        format: GdnStateFormat,
+        captured: bool,
+        qwen4_scope: bool,
+        policy: Qwen4GdnPrefill,
+        arch: &str,
+        pipe_enabled: bool,
+    ) -> (&'static str, bool) {
+        gdn_batched_kernel(&GdnBatchedSelect {
+            captured,
+            format,
+            qwen4_scope,
+            policy,
+            arch_gfx1201: arch == "gfx1201",
+            arch_gfx942: arch == "gfx942",
+            pipe_enabled,
+        })
+    }
+
+    /// The pre-Q8Ef selector, verbatim, for F32 and Q8.
+    fn frozen_plain(
+        format: GdnStateFormat,
+        captured: bool,
+        qwen4_scope: bool,
+        policy: Qwen4GdnPrefill,
+        arch: &str,
+        pipe_enabled: bool,
+    ) -> (&'static str, bool) {
+        let canon = !captured && format == Q8 && qwen4_scope && policy == Qwen4GdnPrefill::Canon;
+        let pipe128_arch = arch == "gfx1201" || (arch == "gfx942" && format == F32);
+        let pipe128 = !canon && !captured && pipe128_arch && pipe_enabled;
+        let kernel = match (captured, format) {
+            (true, F32) => "gated_delta_step_halves_state128_persistent256_capture_f32",
+            (false, F32) if pipe128 => "gated_delta_step_pipe128_f32",
+            (false, F32) => "gated_delta_step_halves_state128_persistent256_f32",
+            (true, Q8) => "gated_delta_step_halves_state128_persistent256_capture_q8",
+            (false, Q8) if canon => "gated_delta_step_halves_state128_persistent256_canon_q8",
+            (false, Q8) if pipe128 => "gated_delta_step_pipe128_q8",
+            (false, Q8) => "gated_delta_step_halves_state128_persistent256_q8",
+            (_, GdnStateFormat::Q8Ef) => unreachable!("not a plain format"),
+        };
+        (kernel, pipe128)
+    }
+
+    #[test]
+    fn gdn_q8ef_live_layout_batched_selection() {
+        let policies = [
+            Qwen4GdnPrefill::Wy,
+            Qwen4GdnPrefill::Persistent,
+            Qwen4GdnPrefill::Canon,
+        ];
+        let mut checked = 0usize;
+        for captured in [false, true] {
+            for scope in [false, true] {
+                for policy in policies {
+                    for arch in ["gfx1151", "gfx1201", "gfx942", "gfx1100"] {
+                        for pipe in [false, true] {
+                            // Plain F32 / Q8 selection is the frozen selector.
+                            for format in [F32, Q8] {
+                                assert_eq!(
+                                    batched(format, captured, scope, policy, arch, pipe),
+                                    frozen_plain(format, captured, scope, policy, arch, pipe),
+                                    "{} captured={captured} scope={scope} {policy:?} {arch} pipe={pipe}",
+                                    format.name()
+                                );
+                            }
+                            // Q8Ef is the Q8 twin in every branch: same
+                            // branch structure and pipe128 geometry, `_q8` ->
+                            // `_q8ef`.
+                            let (q8_kernel, q8_pipe) =
+                                batched(Q8, captured, scope, policy, arch, pipe);
+                            let (ef_kernel, ef_pipe) =
+                                batched(EF, captured, scope, policy, arch, pipe);
+                            let twin = format!("{}ef", q8_kernel);
+                            assert!(q8_kernel.ends_with("_q8"), "{q8_kernel}");
+                            assert_eq!(ef_kernel, twin);
+                            assert_eq!(ef_pipe, q8_pipe);
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 2 * 2 * 3 * 4 * 2);
+        // The named branches of the Q8Ef set.
+        let wy = Qwen4GdnPrefill::Wy;
+        assert_eq!(
+            batched(EF, true, true, wy, "gfx1201", true),
+            (
+                "gated_delta_step_halves_state128_persistent256_capture_q8ef",
+                false
+            )
+        );
+        assert_eq!(
+            batched(EF, false, true, Qwen4GdnPrefill::Canon, "gfx1201", true),
+            (
+                "gated_delta_step_halves_state128_persistent256_canon_q8ef",
+                false
+            )
+        );
+        // Canon needs the Qwen4 scope.
+        assert_eq!(
+            batched(EF, false, false, Qwen4GdnPrefill::Canon, "gfx1201", true),
+            ("gated_delta_step_pipe128_q8ef", true)
+        );
+        assert_eq!(
+            batched(EF, false, false, wy, "gfx1151", true),
+            ("gated_delta_step_halves_state128_persistent256_q8ef", false)
+        );
+        // gfx942 pipes F32 only.
+        assert_eq!(
+            batched(EF, false, false, wy, "gfx942", true),
+            ("gated_delta_step_halves_state128_persistent256_q8ef", false)
+        );
+        assert_eq!(
+            batched(F32, false, false, wy, "gfx942", true),
+            ("gated_delta_step_pipe128_f32", true)
+        );
+        // Only a Q8-family state outside capture in the scope reads the policy.
+        for (captured, scope, format, reads) in [
+            (false, true, Q8, true),
+            (false, true, EF, true),
+            (false, true, F32, false),
+            (true, true, Q8, false),
+            (true, true, EF, false),
+            (false, false, EF, false),
+        ] {
+            assert_eq!(
+                GdnBatchedSelect::reads_policy(captured, format, scope),
+                reads
+            );
+        }
+    }
+
+    #[test]
+    fn gdn_q8ef_live_layout_single_step_selection() {
+        for gated in [false, true] {
+            for gfx11_128 in [false, true] {
+                // Plain formats: frozen selection.
+                let (q8, q8_shared) = gdn_step_single_kernel(Q8, gated, gfx11_128);
+                assert!(q8_shared);
+                assert_eq!(
+                    q8,
+                    if gated {
+                        "gated_delta_step_gate_norm128_q8"
+                    } else {
+                        "gated_delta_step_norm128_q8"
+                    }
+                );
+                let (f32_kernel, f32_shared) = gdn_step_single_kernel(F32, gated, gfx11_128);
+                assert_eq!(f32_shared, gfx11_128);
+                assert_eq!(
+                    f32_kernel,
+                    match (gated, gfx11_128) {
+                        (true, true) => "gated_delta_step_gate_norm128_gfx1151",
+                        (false, true) => "gated_delta_step_shared_norm128_gfx1151",
+                        _ => "gated_delta_step_f32",
+                    }
+                );
+                // Q8Ef: the Q8 twin on the same shared-norm geometry.
+                let (ef, ef_shared) = gdn_step_single_kernel(EF, gated, gfx11_128);
+                assert!(ef_shared);
+                assert_eq!(ef, format!("{q8}ef"));
+            }
+        }
+    }
+
+    #[test]
+    fn gdn_q8ef_live_layout_rollback_converters_and_chunk_selection() {
+        // Storage-based rollback: no EF rollback kernel.
+        assert_eq!(gdn_rollback_kernel(F32), "gated_delta_rollback_layers_f32");
+        assert_eq!(gdn_rollback_kernel(Q8), "gated_delta_rollback_layers_q8");
+        assert_eq!(
+            gdn_rollback_kernel(EF.storage()),
+            "gated_delta_rollback_layers_q8"
+        );
+        assert_eq!(gdn_rollback_kernel(EF), "gated_delta_rollback_layers_q8");
+        assert!(EF.storage().has_frame_kernarg());
+        // Frames: plain Q8 only.
+        assert!(Q8.has_frame_kernarg());
+        assert!(!EF.has_frame_kernarg());
+        assert!(!F32.has_frame_kernarg());
+        // Converters.
+        assert_eq!(gdn_convert_kernel(Q8, true).unwrap(), "gdn_state_q8_to_f32");
+        assert_eq!(gdn_convert_kernel(Q8, false).unwrap(), "gdn_state_f32_to_q8");
+        assert_eq!(
+            gdn_convert_kernel(EF, true).unwrap(),
+            "gdn_state_q8ef_to_f32"
+        );
+        assert_eq!(
+            gdn_convert_kernel(EF, false).unwrap(),
+            "gdn_state_f32_to_q8ef"
+        );
+        assert!(gdn_convert_kernel(F32, true).is_err());
+        assert!(gdn_convert_kernel(F32, false).is_err());
+        // Chunk kernels and modules (registry names).
+        let table = [
+            (Q8, true, false, "gated_delta_chunk_q8_wmma", "gated_delta_chunk_gate_q8_wmma"),
+            (
+                Q8,
+                true,
+                true,
+                "gated_delta_chunk_q8_wmma_arena",
+                "gated_delta_chunk_gate_q8_wmma_arena",
+            ),
+        ];
+        for (format, inline, arena, module, kernel) in table {
+            assert_eq!(gdn_chunk_module_name(format, inline, arena), module);
+            assert_eq!(gdn_chunk_kernel_name(format, inline, arena), kernel);
+        }
+        for format in FORMATS {
+            assert_eq!(
+                gdn_chunk_module_name(format, false, false),
+                "gated_delta_chunk_wmma"
+            );
+            assert_eq!(
+                gdn_chunk_kernel_name(format, false, false),
+                "gated_delta_chunk_gate_wmma"
+            );
+            assert_eq!(
+                gdn_chunk_module_name(format, false, true),
+                "gated_delta_chunk_wmma_arena"
+            );
+            assert_eq!(
+                gdn_chunk_kernel_name(format, false, true),
+                "gated_delta_chunk_gate_wmma_arena"
+            );
+        }
+        // Sources follow the format: only the plain Q8 inline kernel has its own file (it
+        // carries no EF text, so its code object is the plain Q8 kernel's alone), every other
+        // launch is the F32 chunk source.
+        for (format, inline, arena, source) in [
+            (Q8, true, false, GATED_DELTA_CHUNK_Q8_WMMA_SRC),
+            (Q8, true, true, npu_arena::CHUNK_Q8_ARENA_SRC),
+        ] {
+            assert_eq!(gdn_chunk_source(format, inline, arena), source);
+        }
+        for format in FORMATS {
+            assert_eq!(gdn_chunk_source(format, false, false), GATED_DELTA_CHUNK_WMMA_SRC);
+            assert_eq!(gdn_chunk_source(format, false, true), npu_arena::CHUNK_ARENA_SRC);
+        }
+        for source in [GATED_DELTA_CHUNK_Q8_WMMA_SRC, npu_arena::CHUNK_Q8_ARENA_SRC] {
+            assert!(!source.contains("q8ef"), "the plain Q8 source must not carry the EF entry");
+            assert!(!source.contains("ef_row"), "the plain Q8 source must not carry EF code");
+        }
+        // Inline format predicate: only plain Q8 without a residual; Q8Ef has no inline kernel.
+        for (format, has_residual, want) in [
+            (F32, false, false),
+            (F32, true, false),
+            (Q8, false, true),
+            (Q8, true, false),
+            (EF, true, false),
+            (EF, false, false),
+        ] {
+            assert_eq!(
+                gdn_chunk_inline_format(format, has_residual),
+                want,
+                "{} residual={has_residual}",
+                format.name()
+            );
+        }
+        assert!(!gdn_chunk_inline_format(GdnStateFormat::Q8Ef, true));
+        assert!(!gdn_chunk_inline_format(GdnStateFormat::Q8Ef, false));
+        assert!(gdn_chunk_inline_format(GdnStateFormat::Q8, false));
+        assert!(!gdn_chunk_inline_format(GdnStateFormat::Q8, true));
+        assert!(!gdn_chunk_inline_format(GdnStateFormat::F32, false));
+        // A Q8Ef chunk always runs the F32 chunk kernel on its reconstruction.
+        assert_eq!(
+            gdn_chunk_module_name(GdnStateFormat::Q8Ef, false, false),
+            "gated_delta_chunk_wmma"
+        );
+        assert_eq!(
+            gdn_chunk_module_name(GdnStateFormat::Q8Ef, false, true),
+            "gated_delta_chunk_wmma_arena"
+        );
+    }
+
+    #[test]
+    fn gdn_q8ef_live_layout_step_kernargs() {
+        let base = |state: GdnStateKernarg, output: GdnStepOutput, frame: u32| GdnStepKernargs {
+            q: ptr(0x10),
+            k: ptr(0x20),
+            v: ptr(0x30),
+            gate: ptr(0x40),
+            beta: ptr(0x50),
+            state,
+            output,
+            key_heads: 16,
+            value_heads: 48,
+            key_dim: 128,
+            value_dim: 128,
+            query_scale: 0.0883883,
+            frame,
+        };
+        let head = |tail: &[Arg]| {
+            let mut spec = vec![Arg::P(0x10), Arg::P(0x20), Arg::P(0x30), Arg::P(0x40), Arg::P(0x50)];
+            spec.extend_from_slice(tail);
+            spec
+        };
+        let dims = [Arg::I(16), Arg::I(48), Arg::I(128), Arg::I(128), Arg::F(0.0883883)];
+        let recurrent = GdnStepOutput::Recurrent { output: ptr(0x60) };
+
+        // Plain Q8: state, output, dims, trailing frame (+ replay offset).
+        let q8 = GdnStateKernarg::new(Q8, ptr(0x70), None).unwrap();
+        let (blob, frame_offset) = gdn_step_kernargs(&base(q8, recurrent, 9));
+        let mut spec = head(&[Arg::P(0x70), Arg::P(0x60)]);
+        spec.extend_from_slice(&dims);
+        spec.push(Arg::U(9));
+        assert_eq!(blob.as_bytes(), expected(&spec));
+        assert_eq!(frame_offset, Some(blob.len() - 4));
+
+        // F32: no frame.
+        let f32_state = GdnStateKernarg::new(F32, ptr(0x70), None).unwrap();
+        let (blob, frame_offset) = gdn_step_kernargs(&base(f32_state, recurrent, 9));
+        let mut spec = head(&[Arg::P(0x70), Arg::P(0x60)]);
+        spec.extend_from_slice(&dims);
+        assert_eq!(blob.as_bytes(), expected(&spec));
+        assert_eq!(frame_offset, None);
+
+        // Q8Ef: ef right after the state pointer, no frame, no replay binding.
+        let ef = GdnStateKernarg::new(EF, ptr(0x70), Some(ptr(0x80))).unwrap();
+        let (blob, frame_offset) = gdn_step_kernargs(&base(ef, recurrent, 9));
+        let mut spec = head(&[Arg::P(0x70), Arg::P(0x80), Arg::P(0x60)]);
+        spec.extend_from_slice(&dims);
+        assert_eq!(blob.as_bytes(), expected(&spec));
+        assert_eq!(frame_offset, None);
+
+        // Gated + rotation: z, norm, output, dims, rotation pointers (then
+        // the Q8 frame for plain Q8 only).
+        let gated = GdnStepOutput::Gated {
+            z: ptr(0x90),
+            norm: ptr(0xa0),
+            output: ptr(0xb0),
+            rotate: Some([ptr(0xc0), ptr(0xd0), ptr(0xe0), ptr(0xf0)]),
+        };
+        let (blob, frame_offset) = gdn_step_kernargs(&base(ef, gated, 9));
+        let mut spec = head(&[
+            Arg::P(0x70),
+            Arg::P(0x80),
+            Arg::P(0x90),
+            Arg::P(0xa0),
+            Arg::P(0xb0),
+        ]);
+        spec.extend_from_slice(&dims);
+        spec.extend_from_slice(&[Arg::P(0xc0), Arg::P(0xd0), Arg::P(0xe0), Arg::P(0xf0)]);
+        assert_eq!(blob.as_bytes(), expected(&spec));
+        assert_eq!(frame_offset, None);
+        let (blob, frame_offset) = gdn_step_kernargs(&base(q8, gated, 9));
+        let mut spec = head(&[Arg::P(0x70), Arg::P(0x90), Arg::P(0xa0), Arg::P(0xb0)]);
+        spec.extend_from_slice(&dims);
+        spec.extend_from_slice(&[Arg::P(0xc0), Arg::P(0xd0), Arg::P(0xe0), Arg::P(0xf0), Arg::U(9)]);
+        assert_eq!(blob.as_bytes(), expected(&spec));
+        assert_eq!(frame_offset, Some(blob.len() - 4));
+    }
+
+    #[test]
+    fn gdn_q8ef_live_layout_batched_kernargs() {
+        let make = |state: GdnStateKernarg, ring: Option<*mut c_void>| GdnBatchedKernargs {
+            projection: ptr(0x10),
+            gate: ptr(0x20),
+            beta: ptr(0x30),
+            state,
+            output: ptr(0x50),
+            row_states: ring,
+            rows: 4,
+            qkv_width: 10240,
+            key_heads: 16,
+            value_heads: 48,
+            key_dim: 128,
+            value_dim: 128,
+            query_scale: 0.0883883,
+            frame: 77,
+        };
+        let dims = [
+            Arg::I(4),
+            Arg::I(10240),
+            Arg::I(16),
+            Arg::I(48),
+            Arg::I(128),
+            Arg::I(128),
+            Arg::F(0.0883883),
+        ];
+        let q8 = GdnStateKernarg::new(Q8, ptr(0x40), None).unwrap();
+        let ef = GdnStateKernarg::new(EF, ptr(0x40), Some(ptr(0x45))).unwrap();
+        let f32_state = GdnStateKernarg::new(F32, ptr(0x40), None).unwrap();
+        for ring in [None, Some(ptr(0x60))] {
+            let ring_arg: Vec<Arg> = ring.iter().map(|_| Arg::P(0x60)).collect();
+            // Plain Q8: ..., state, output, [ring], dims, frame.
+            let blob = gdn_batched_kernargs(&make(q8, ring));
+            let mut spec = vec![Arg::P(0x10), Arg::P(0x20), Arg::P(0x30), Arg::P(0x40), Arg::P(0x50)];
+            spec.extend_from_slice(&ring_arg);
+            spec.extend_from_slice(&dims);
+            spec.push(Arg::U(77));
+            assert_eq!(blob.as_bytes(), expected(&spec), "Q8 ring={}", ring.is_some());
+            // F32: no frame.
+            let blob = gdn_batched_kernargs(&make(f32_state, ring));
+            let mut spec = vec![Arg::P(0x10), Arg::P(0x20), Arg::P(0x30), Arg::P(0x40), Arg::P(0x50)];
+            spec.extend_from_slice(&ring_arg);
+            spec.extend_from_slice(&dims);
+            assert_eq!(blob.as_bytes(), expected(&spec), "F32 ring={}", ring.is_some());
+            // Q8Ef: ef right after state (before output / ring), no frame.
+            let blob = gdn_batched_kernargs(&make(ef, ring));
+            let mut spec = vec![
+                Arg::P(0x10),
+                Arg::P(0x20),
+                Arg::P(0x30),
+                Arg::P(0x40),
+                Arg::P(0x45),
+                Arg::P(0x50),
+            ];
+            spec.extend_from_slice(&ring_arg);
+            spec.extend_from_slice(&dims);
+            assert_eq!(blob.as_bytes(), expected(&spec), "Q8Ef ring={}", ring.is_some());
+        }
+    }
+
+    #[test]
+    fn gdn_q8ef_live_layout_chunk_kernargs() {
+        let make = |state: GdnChunkState| GdnChunkKernargs {
+            projection: ptr(0x10),
+            qn: ptr(0x20),
+            kn: ptr(0x30),
+            gate: ptr(0x40),
+            beta: ptr(0x50),
+            state,
+            z: ptr(0x70),
+            norm: ptr(0x80),
+            output: ptr(0x90),
+            rows: 512,
+            qkv_width: 10240,
+            key_heads: 16,
+            value_heads: 48,
+            query_scale: 0.0883883,
+            output_bf16: 1,
+        };
+        let head = [Arg::P(0x10), Arg::P(0x20), Arg::P(0x30), Arg::P(0x40), Arg::P(0x50)];
+        let tail = [Arg::P(0x70), Arg::P(0x80), Arg::P(0x90)];
+        let dims = [
+            Arg::I(512),
+            Arg::I(10240),
+            Arg::I(16),
+            Arg::I(48),
+            Arg::F(0.0883883),
+            Arg::I(1),
+        ];
+        let build = |state: &[Arg], mode: &[Arg]| {
+            let mut spec = head.to_vec();
+            spec.extend_from_slice(state);
+            spec.extend_from_slice(&tail);
+            spec.extend_from_slice(&dims);
+            spec.extend_from_slice(mode);
+            expected(&spec)
+        };
+        // F32 chunk: no mode, no frame.
+        let blob = gdn_chunk_kernargs(&make(GdnChunkState::F32 { state: ptr(0x60) }));
+        assert_eq!(blob.as_bytes(), build(&[Arg::P(0x60)], &[]));
+        // Inline Q8: mode 1, frame.
+        let blob = gdn_chunk_kernargs(&make(GdnChunkState::Q8Inline {
+            state: ptr(0x60),
+            frame: 531,
+        }));
+        assert_eq!(blob.as_bytes(), build(&[Arg::P(0x60)], &[Arg::I(1), Arg::U(531)]));
+    }
+
+    #[test]
+    fn gdn_q8ef_live_layout_converter_and_zero_kernargs() {
+        let q8 = GdnStateKernarg::new(Q8, ptr(0x10), None).unwrap();
+        let ef = GdnStateKernarg::new(EF, ptr(0x10), Some(ptr(0x20))).unwrap();
+        // To F32: (slot, [ef], dst, heads).
+        assert_eq!(
+            gdn_convert_kernargs(true, &q8, ptr(0x30), 48, 5).as_bytes(),
+            expected(&[Arg::P(0x10), Arg::P(0x30), Arg::I(48)])
+        );
+        assert_eq!(
+            gdn_convert_kernargs(true, &ef, ptr(0x30), 48, 5).as_bytes(),
+            expected(&[Arg::P(0x10), Arg::P(0x20), Arg::P(0x30), Arg::I(48)])
+        );
+        // From F32: (src, slot, [ef], heads, [frame]); the frame is Q8's only.
+        assert_eq!(
+            gdn_convert_kernargs(false, &q8, ptr(0x30), 48, 5).as_bytes(),
+            expected(&[Arg::P(0x30), Arg::P(0x10), Arg::I(48), Arg::U(5)])
+        );
+        assert_eq!(
+            gdn_convert_kernargs(false, &ef, ptr(0x30), 48, 5).as_bytes(),
+            expected(&[Arg::P(0x30), Arg::P(0x10), Arg::P(0x20), Arg::I(48)])
+        );
+        // Residual zero: (ef, count), grid ceil(count / 256).
+        assert_eq!(
+            gdn_q8ef_zero_kernargs(ptr(0x40), 1_572_864 / 2).as_bytes(),
+            expected(&[Arg::P(0x40), Arg::U(1_572_864 / 2)])
+        );
+        for (count, grid) in [(1usize, 1u32), (256, 1), (257, 2), (48 * 128 * 128, 3072)] {
+            assert_eq!(blocks(count).unwrap(), grid, "count {count}");
         }
     }
 }

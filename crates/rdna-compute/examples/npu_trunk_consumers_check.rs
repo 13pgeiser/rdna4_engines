@@ -69,7 +69,7 @@ fn params<'a>(a: &'a GpuTensor, b: &'a GpuTensor, al: &'a GpuTensor, dt: &'a Gpu
     GatedDeltaParamsBatched { a,b,a_log:al,dt_bias:dt,gate,beta,rows,heads:48 }
 }
 fn step<'a>(projection: &'a GpuTensor, gate: &'a GpuTensor, beta: &'a GpuTensor, state: &'a GpuTensor, output: &'a GpuTensor, rows: usize) -> GatedDeltaStepBatched<'a> {
-    GatedDeltaStepBatched { projection,gate,beta,state,output,row_states:None,rows,qkv_width:10240,key_heads:16,value_heads:48,key_dim:128,value_dim:128,position:3 }
+    GatedDeltaStepBatched { projection,gate,beta,state,format:GdnStateFormat::F32,residual:None,output,row_states:None,rows,qkv_width:10240,key_heads:16,value_heads:48,key_dim:128,value_dim:128,position:3 }
 }
 fn gdn(g: &mut Gpu, rows: usize) {
     let pitch = 16640;

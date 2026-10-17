@@ -880,6 +880,7 @@ impl Carrier for Qwen4Carrier {
                 meta.tokenizer.special_token_id("</think>"),
                 true,
                 verify_rows,
+                loaded.bundle.state_format().gdn,
             )
         });
 
@@ -1038,7 +1039,9 @@ fn qwen4_native_mtp_k(spec: SpecLoadCfg, gpu_arch: &str) -> usize {
 /// so no request can arm a takeover.
 /// `verify_rows` is the verify window the n-gram copy lane's take cap reads:
 /// the per-GPU row-exact rows, or the 4-row CPU splice window when host-placed
-/// routed experts run on the CPU.
+/// routed experts run on the CPU. `gdn` is the loaded GDN state format; under
+/// `q8_ef` sampled requests stay on AR
+/// ([`hipfire_arch_qwen4::mtp_spec::qwen4_mtp_sampled_allowed`]).
 fn qwen4_native_mtp_speculator(
     max_k: usize,
     max_seq: usize,
@@ -1047,8 +1050,16 @@ fn qwen4_native_mtp_speculator(
     think_close: Option<u32>,
     ngram_modifier: bool,
     verify_rows: usize,
+    gdn: hipfire_arch_qwen4::GdnStateFormat,
 ) -> Box<dyn hipfire_runtime::spec::Speculator> {
     eprintln!("  qwen4 native MTP speculator enabled (K={max_k})");
+    if hipfire_config::mtp_sampled_enabled()
+        && !hipfire_arch_qwen4::mtp_spec::qwen4_mtp_sampled_allowed(gdn)
+    {
+        eprintln!(
+            "  qwen4 native MTP sampled: off for GDN q8_ef (sampled requests use AR until the sampled-MTP law is verified)"
+        );
+    }
     let arch = hipfire_arch_qwen4::ARCH_ID;
     let mut copy_lane = false;
     let ngram = if !ngram_modifier {
@@ -1089,6 +1100,7 @@ fn qwen4_native_mtp_speculator(
         think_close,
         ngram,
         copy_lane,
+        gdn,
     )
 }
 
@@ -1489,10 +1501,12 @@ fn qwen4_placement_inputs(
     // The kernels' pool workspaces at the largest requested chunk, exactly
     // (every short-tail remainder included). The dense GDN scan's scratch is
     // charged wherever `fn_gdn_dense::applies` can hold at load: exact gfx1201,
-    // Q8 GDN state and the pinned 16-key/48-value-head, 128-dim, 10240-wide
-    // geometry (its opt-out flag only lowers the charge, so it is ignored).
-    let dense_gdn = gpu.arch == "gfx1201"
-        && state_format.gdn == hipfire_arch_qwen4::GdnStateFormat::Q8
+    // Q8 or Q8Ef GDN state (`qwen4_dense_gdn_admits`) and the pinned
+    // 16-key/48-value-head, 128-dim, 10240-wide geometry (its opt-out flag
+    // only lowers the charge, so it is ignored). The census charges A for both
+    // formats and the thread-local EF scratch only for plain Q8; a Q8Ef live
+    // residual is charged once by the state owner, not here.
+    let dense_gdn = rdna_compute::scratch::qwen4_dense_gdn_admits(&gpu.arch, state_format.gdn)
         && config.linear_num_key_heads == 16
         && config.linear_num_value_heads == 48
         && config.linear_key_head_dim == 128
@@ -1517,7 +1531,7 @@ fn qwen4_placement_inputs(
         top_k: config.num_experts_per_tok,
         hc_count: config.hc_count,
         hc_lowrank: config.hc_lowrank,
-        dense_gdn,
+        gdn_format: dense_gdn.then_some(state_format.gdn),
         routed_i4,
         include_short_tails: true,
     };
@@ -3755,6 +3769,7 @@ fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedMode
             meta.tokenizer.special_token_id("</think>"),
             false,
             rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(&ctx.gpu.arch),
+            bundle.state_format().gdn,
         )
     });
     let mut model = LoadedModel {

@@ -306,7 +306,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "b82826f2644122c8cacece509ca2baf0955f1bf0398bd16e64368b25b7c31999",
+      "sha256": "6b9430e9463c21941227c90b457cb1c1c37a0c57ab2df813458fc318cc492ff4",
       "symbols": [
         "fn_gdn_dense_gate_rotate_bf16in",
         "fn_gdn_dense_producer"
@@ -2259,7 +2259,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "1420f04ed87c085346d76efb35d31c76cb72a3212c8d7f5420182d03397522b6",
+      "sha256": "025735d483ef906c80c9d023d9af401552d40d177403c0f68ea24301c8b7bd2a",
       "symbols": [
         "argmax_f32",
         "bf16_scaled_add_batched_f32",
@@ -2969,7 +2969,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "b82826f2644122c8cacece509ca2baf0955f1bf0398bd16e64368b25b7c31999",
+          "sha256": "6b9430e9463c21941227c90b457cb1c1c37a0c57ab2df813458fc318cc492ff4",
           "symbols": [
             "fn_gdn_dense_gate_rotate_bf16in",
             "fn_gdn_dense_producer"
@@ -4489,7 +4489,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "1420f04ed87c085346d76efb35d31c76cb72a3212c8d7f5420182d03397522b6",
+          "sha256": "025735d483ef906c80c9d023d9af401552d40d177403c0f68ea24301c8b7bd2a",
           "symbols": [
             "argmax_f32",
             "bf16_scaled_add_batched_f32",

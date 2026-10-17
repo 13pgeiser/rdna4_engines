@@ -32,6 +32,8 @@ pub mod flux_fused;
 pub mod fn_gdn_dense;
 pub mod fp8_e4m3;
 pub mod gap_timing;
+#[cfg(test)]
+mod gdn_q8ef_reference;
 pub mod gemm;
 mod gemm_fp8_verify;
 mod gemm_vt;

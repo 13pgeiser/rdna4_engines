@@ -174,7 +174,7 @@ fn run_case(gpu: &mut Gpu, case: &Case, tag: &str, rows: usize, norm_w: &[f32], 
     let state = gpu.zeros(&[VALUE_HEADS * DIM * DIM], DType::F32).map_err(|e| err("alloc state", &e))?;
     let output = gpu.zeros(&[rows * VALUE_WIDTH], DType::F32).map_err(|e| err("alloc output", &e))?;
     let step = GatedDeltaStepBatched {
-        projection: &projection, gate: &gate, beta: &beta, state: &state, output: &output, row_states: None,
+        projection: &projection, gate: &gate, beta: &beta, state: &state, format: GdnStateFormat::F32, residual: None, output: &output, row_states: None,
         rows, qkv_width: QKV_WIDTH, key_heads: KEY_HEADS, value_heads: VALUE_HEADS, key_dim: DIM, value_dim: DIM, position: 0,
     };
     if !gated_delta_chunk_route(gpu, &step) {

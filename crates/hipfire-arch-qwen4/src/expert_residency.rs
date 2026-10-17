@@ -466,7 +466,11 @@ pub struct StateCensus {
 ///   (VMM: each arena's mapped pages rounded to the driver granularity).
 /// - `state`: the rest of `Qwen4State::device_bytes` (GDN recurrent and
 ///   conv with the snapshot arena's mirror, the QSA fixed arenas, PLE conv,
-///   hyper feedback), the QSA context counted once in `qsa_context`.
+///   hyper feedback), the QSA context counted once in `qsa_context`. For a
+///   `Q8Ef` GDN format the state also carries the one live F16 residual
+///   plane per GDN layer (`Qwen4State::device_bytes` adds it once, 54 MiB over
+///   36 layers: not per ring row, snapshot mirror or session); this census
+///   adds nothing on top, so the plane is never charged twice.
 /// - `forward`: [`crate::gpu_forward::qwen4_forward_device_bytes`] at
 ///   `chunk_rows` in `mode`.
 pub fn state_census(
@@ -1142,6 +1146,9 @@ pub struct NativeMtpCensusInputs {
     pub max_k: usize,
     /// The GDN storage format and ring rows of the verify-row capture where
     /// the route captures rows (`mtp_spec::native_mtp_capture`), else `None`.
+    /// A `Q8Ef` format charges its plain Q8 ring (`row_capture_bytes*` size by
+    /// `storage()`): the live residual plane is charged once by the state
+    /// census, never per ring row, so the reserve adds no residual bytes.
     pub row_capture: Option<(crate::GdnStateFormat, usize)>,
     /// Whether the request allocates the batched prompt-fill scratch
     /// (`mtp_spec::native_mtp_fill_scratch`).
@@ -2709,7 +2716,7 @@ mod tests {
             top_k: config.num_experts_per_tok,
             hc_count: config.hc_count,
             hc_lowrank: config.hc_lowrank,
-            dense_gdn: true,
+            gdn_format: Some(rdna_compute::tensor_ops::GdnStateFormat::Q8),
             routed_i4: true,
             include_short_tails: true,
         };
@@ -3083,7 +3090,7 @@ mod tests {
             top_k: config.num_experts_per_tok,
             hc_count: config.hc_count,
             hc_lowrank: config.hc_lowrank,
-            dense_gdn: false,
+            gdn_format: None,
             routed_i4: true,
             include_short_tails: true,
         };

@@ -131,7 +131,10 @@ static __device__ __forceinline__ float fn_gdn_dense_params_flat(
 //   x < 80  : v head x - 32, 128 channels, same thread mapping.
 //   x == 80 : params + beta + chunk64 cumsum into g for chunk y / 2 (even y).
 //   x == 81 : zero `ef` (ef_words u32 words, a multiple of 4), grid-strided
-//             over y.
+//             over y. ef_words == 0 (live-EF Q8Ef state: `ef` is the owner's
+//             persistent residual, which the scan reads on entry) stores
+//             nothing; plain Q8 passes the thread-local scratch and its full
+//             word count, cleared on every invocation.
 // input [rows][10240] F32 (input_bf16 == 0) or BF16 bits; q16/k16 [n64][2048]
 // and v16 [n64][6144] F16 bits (q scaled by query_scale; pad rows [rows, n64)
 // zeroed); g and beta [rows][48] (pad rows are not written).
