@@ -4,7 +4,7 @@ CURDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # -------------------------------
 # model selection (multiple choice)
 # -------------------------------
-# Servable gguf models under /models. Multi-part sets list their 00001 part;
+# Servable gguf models under /models/llama.cpp. Multi-part sets list their 00001 part;
 # llama.cpp auto-loads the siblings. mtp-* auxiliary heads are not servable
 # standalone and are intentionally omitted.
 FILES=(
@@ -48,14 +48,14 @@ elif [ ! -t 0 ]; then
       # non-interactive, no arg: keep the current default
       MODEL_FILE="${FILES[0]}"
 else
-      echo "Available gguf models in /models:"
+      echo "Available gguf models in /models/llama.cpp:"
       for i in "${!FILES[@]}"; do echo "     $((i+1))) ${LABELS[$i]}"; done
       read -rp "Select model [1-${#FILES[@]}] (default 1): " pick
       pick=${pick:-1}
       MODEL_FILE="$(resolve_model "$pick")" || { echo "invalid selection: $pick" >&2; exit 1; }
 fi
-[ -e "/models/$MODEL_FILE" ] || { echo "model not found: /models/$MODEL_FILE" >&2; exit 1; }
-echo "serving /models/$MODEL_FILE"
+[ -e "/models/llama.cpp/$MODEL_FILE" ] || { echo "model not found: /models/llama.cpp/$MODEL_FILE" >&2; exit 1; }
+echo "serving /models/llama.cpp/$MODEL_FILE"
 
 # -------------------------------
 # docker image (build only if missing)
@@ -75,6 +75,17 @@ fi
 # -------------------------------
 sudo bash -c "echo "210000000" > $(echo /sys/class/drm/card0/device/hwmon/hwmon*/)power1_cap"
 docker rm -f llama_cpp_server
-docker run -d --name llama_cpp_server --network host --device=/dev/kfd --device=/dev/dri -v /models/:/models "$IMAGE" -m "/models/$MODEL_FILE" --host 0.0.0.0 --port 9931 -np 1  --jinja --cache-type-k q8_0 --cache-type-v q8_0 \
+docker run -it --name llama_cpp_server --network host --device=/dev/kfd --device=/dev/dri -v /models/llama.cpp/:/models "$IMAGE" -m "/models/$MODEL_FILE" --host 0.0.0.0 --port 9931 -np 1  --jinja --cache-type-k q8_0 --cache-type-v q8_0 \
  -c 262144 --ctx-checkpoints 64 -b 1024 -ub 512 --reasoning-preserve --reasoning-effort high -ncmoe 36 --flash-attn on \
  --temperature 1.0 --top-p 0.95 --top-k 40
+
+#phoenix@debian00d861dabdae:~/ai/my_ai_scripts$ llm-bench run --openai-base-url http://localhost:9931/v1 --models openai:qwen3.8:27b-mq4-xts --prompts "Write a rust function to parse JSON safely."
+#→ Benchmarking 1 model(s) × 1 prompt(s) × 3 run(s) = 3 total requests
+#
+#Results: 3 succeeded, 0 failed (100% success rate)
+#
+#╭──────────┬─────────────────────┬──────────┬──────────┬───────┬──────────┬────────────┬─────────╮
+#│ Provider │ Model               │ P50 (ms) │ P99 (ms) │ Tok/s │ Avg Cost │ Total Cost │ Success │
+#├──────────┼─────────────────────┼──────────┼──────────┼───────┼──────────┼────────────┼─────────┤
+#│ openai   │ qwen3.8:27b-mq4-xts │    38119 │    57313 │  16.4 │      n/a │        n/a │    100% │
+#╰──────────┴─────────────────────┴──────────┴──────────┴───────┴──────────┴────────────┴─────────╯
