@@ -1037,7 +1037,8 @@ fn run_perf(ctx: &mut Ctx, checks: &mut Checks, out: &mut serde_json::Map<String
         }
     }
     let mut rows_out = Vec::new();
-    for rows in [512usize, 8192, 16384] {
+    let perf_rows = ctx.fixture.perf_rows.clone();
+    for rows in perf_rows {
         let name = format!("perf.pp{rows}");
         let Some(prompt) = ctx
             .fixture
@@ -1109,7 +1110,7 @@ fn run_perf(ctx: &mut Ctx, checks: &mut Checks, out: &mut serde_json::Map<String
 
 fn perf_required(fixture: &Fixture) -> Vec<String> {
     let mut names = vec!["perf.warmup".to_string()];
-    for rows in [512usize, 8192, 16384] {
+    for &rows in &fixture.perf_rows {
         if fixture
             .prompts
             .iter()
