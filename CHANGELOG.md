@@ -10,6 +10,7 @@
 
 ## Unreleased (0.4.3)
 
+- **Flash-Next scratch admission skips routed payload scans when compact scratch cannot be selected.** The aggregate IU4 route still requires explicit compact opt-in and complete symmetric-header proof; slab artifacts still need no header scan. Scratch modes and forward outputs are unchanged.
 - **Fixed: experimental multislot no longer drops Qwen3.8's supported reasoning effort.** Its load acknowledgement hardcoded `reasoning_effort_native: false` and `reasoning_efforts: []`, so HTTP/config resolution discarded valid `low`, `medium`, and `xhigh` values. It now probes the actual slot template, as the ordinary loader does. The bug was present in v0.4.2.
 - **Reasoning-effort warnings describe the loaded template, not a guessed Qwen version.** A template without semantic effort support no longer gets mislabeled Qwen3.6; HTTP and config warnings explain that native effort is unavailable and recommend `thinking_budget` or `max_think_tokens` for a cap. `native` is not an effort value; the Qwen diagnostic names `low|medium|xhigh` and its existing fallback. Config documentation explains template capability reporting and supported families.
   - A failed effort-capability probe now logs its render/missing-template reason and effective template source. `/health.reasoning_effort_probe_error` carries the reason (`null` after a successful probe), distinguishing a failed probe from a template that simply ignores effort. A CPU regression probes the exact registry Qwen3.8-27B MQ6 template, which supports `low`, `medium`, and `xhigh`.

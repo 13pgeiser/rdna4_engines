@@ -2003,18 +2003,30 @@ pub fn source_forward_scratch_mode(
     config: &Qwen4Config,
     manifest: &Qwen4Manifest,
 ) -> Result<Qwen4ForwardScratchMode, Qwen4ArtifactError> {
-    if qwen4_forward_scratch_mode(gpu, config, true, true, true) == Qwen4ForwardScratchMode::Full {
-        return Ok(Qwen4ForwardScratchMode::Full);
-    }
     let ple_bf16 = ple_key_value_bf16(manifest);
     let slab = matches!(
         manifest.identity.recipe,
         crate::weights::Qwen4TierRecipe::FlashNextSlab { .. }
     );
-    let symmetric = ple_bf16 && !slab && routed_headers_symmetric(hfq, manifest)?;
-    Ok(qwen4_forward_scratch_mode(
-        gpu, config, symmetric, slab, ple_bf16,
-    ))
+    select_source_scratch_mode(
+        slab,
+        |symmetric| qwen4_forward_scratch_mode(gpu, config, symmetric, slab, ple_bf16),
+        || routed_headers_symmetric(hfq, manifest),
+    )
+}
+
+// Only a potentially compact aggregate route needs payload proof. Keep the
+// selector injected so the scan boundary can be exercised without a GPU.
+fn select_source_scratch_mode<E>(
+    slab: bool,
+    select: impl Fn(bool) -> Qwen4ForwardScratchMode,
+    scan: impl FnOnce() -> Result<bool, E>,
+) -> Result<Qwen4ForwardScratchMode, E> {
+    let possible = select(true);
+    if possible == Qwen4ForwardScratchMode::Full || slab {
+        return Ok(possible);
+    }
+    Ok(select(scan()?))
 }
 
 /// The geometry facts of a PLE table header that admission checks against the
@@ -2368,6 +2380,74 @@ mod tests {
     use hipfire_runtime::ple_sidecar::ple_shard_name;
     use serde_json::json;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn source_scratch_scan_matches_beta_for_every_route() {
+        use crate::gpu_forward::CompactScratchTerms;
+        use std::cell::Cell;
+
+        let mut cases = 0;
+        for knob in [None, Some(false), Some(true)] {
+            for bits in 0..128 {
+                let terms = CompactScratchTerms {
+                    knob,
+                    exact_gfx1201: bits & 1 != 0,
+                    grouped_gemm: bits & 2 != 0,
+                    sym_iu4_requested: bits & 4 != 0,
+                    source_slab: bits & 8 != 0,
+                    ple_key_value_bf16: bits & 16 != 0,
+                    flash_next_profile: bits & 32 != 0,
+                    source_symmetric: bits & 64 != 0,
+                };
+                let select = |source_symmetric| {
+                    CompactScratchTerms {
+                        source_symmetric,
+                        ..terms
+                    }
+                    .mode()
+                };
+                // Beta first assumed slab + BF16 PLE, then used the real route.
+                let cheap_beta = CompactScratchTerms {
+                    source_symmetric: true,
+                    source_slab: true,
+                    ple_key_value_bf16: true,
+                    ..terms
+                }
+                .mode();
+                let beta = if cheap_beta == Qwen4ForwardScratchMode::Full {
+                    cheap_beta
+                } else {
+                    select(terms.ple_key_value_bf16 && !terms.source_slab && terms.source_symmetric)
+                };
+                let scans = Cell::new(0);
+                let actual = select_source_scratch_mode(terms.source_slab, select, || {
+                    scans.set(scans.get() + 1);
+                    Ok::<_, ()>(terms.source_symmetric)
+                })
+                .unwrap();
+                assert_eq!(actual, beta, "{terms:?}");
+                let needs_proof =
+                    !terms.source_slab && select(true) != Qwen4ForwardScratchMode::Full;
+                assert_eq!(scans.get(), usize::from(needs_proof), "{terms:?}");
+
+                // Unreadable payloads matter only when aggregate proof is needed.
+                let errors = Cell::new(0);
+                let result = select_source_scratch_mode(terms.source_slab, select, || {
+                    errors.set(errors.get() + 1);
+                    Err("unreadable payload")
+                });
+                assert_eq!(errors.get(), usize::from(needs_proof), "{terms:?}");
+                if needs_proof {
+                    assert_eq!(result, Err("unreadable payload"));
+                } else {
+                    assert_eq!(result, Ok(beta), "{terms:?}");
+                }
+                cases += 1;
+            }
+        }
+        assert_eq!(cases, 384);
+    }
+
     fn slab_metadata() -> String {
         json!({
             (expert_slabs::EXPERT_SLABS_METADATA_KEY): expert_slabs::ExpertSlabsV1::fn_v1().to_json_value()
@@ -2564,10 +2644,18 @@ mod tests {
         // arena arch refusal); a W3 + E8P layer is refused either way (the arch refusal, or the
         // two-cold-codecs refusal when admitted).
         let e8p_on_gfx1151 = expert_slab_plan(&slab_metadata(), &headers(E8pI4), Some("gfx1151"));
-        assert_eq!(e8p_on_gfx1151.is_ok(), SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED);
+        assert_eq!(
+            e8p_on_gfx1151.is_ok(),
+            SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED
+        );
         if !SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED {
             let error = e8p_on_gfx1151.unwrap_err();
-            assert!(error.to_string().contains("no sealed-route kernels on gfx1151"), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("no sealed-route kernels on gfx1151"),
+                "{error}"
+            );
         }
         assert!(expert_slab_plan(&slab_metadata(), &mixed_layer(0), Some("gfx1151")).is_err());
         assert_eq!(
