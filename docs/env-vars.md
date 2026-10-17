@@ -1480,6 +1480,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GFX1151_WEIGHT_BUFFER_SIGMOID` | crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_GFX1151_XLDS` | crates/railgun-cert/src/recording.rs, crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_GFX11_A4_CANDIDATES` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
+| `HIPFIRE_GFX11_A8_PREFILL` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_GFX11_FA2_PREFILL` | crates/hipfire-config/src/lib.rs, crates/hipfire-dispatch/src/families/attention.rs | stable |
 | `HIPFIRE_GFX11_IU4_GRIDSPEC` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | stable |
 | `HIPFIRE_GFX11_IU4_SHAPE` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
@@ -2202,8 +2203,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_RMSNORM_KERNEL` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_RMSNORM_MQ_TIGHT_LDS` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_RMSNORM_P1A_BATCHED` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernel_registry.rs | developer |
-| `HIPFIRE_RMSNORM_P1A_DRAIN` | crates/rdna-compute/src/kernels.rs | developer |
-| `HIPFIRE_RMSNORM_P1A_MAX8` | crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_RMSNORM_P1A_DRAIN` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_RMSNORM_P1A_MAX8` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_ROCBLAS_ALL_ARCHS` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/dispatch.rs | experimental |
 | `HIPFIRE_ROCBLAS_MIN_BATCH` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/dispatch.rs | experimental |
 | `HIPFIRE_ROCBLAS_OFF` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/examples/test_mfp4e8_soa_rocblas_gfx942.rs | stable |
