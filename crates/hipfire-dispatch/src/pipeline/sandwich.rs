@@ -361,6 +361,9 @@ pub enum RopeKind {
     RotateHalf,
     /// The first `rot_pairs` pairs of each half rotate; the rest pass through.
     PartialHalved { rot_pairs: usize },
+    /// Rotate-half over the first `rot_dim` channels of each head (pair
+    /// `(i, i + rot_dim / 2)`); channels `rot_dim..` pass through.
+    PrefixHalfSplit { rot_dim: usize },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -370,11 +373,64 @@ pub struct Rope {
 }
 
 impl Rope {
-    fn rot_pairs(&self, head_dim: usize) -> usize {
+    /// Rotated pairs in the whole-head rotate-half pairing; `None` when the
+    /// pairing is a prefix of the head.
+    fn halved_pairs(&self, head_dim: usize) -> Option<usize> {
         match self.kind {
-            RopeKind::RotateHalf => head_dim / 2,
-            RopeKind::PartialHalved { rot_pairs } => rot_pairs,
+            RopeKind::RotateHalf => Some(head_dim / 2),
+            RopeKind::PartialHalved { rot_pairs } => Some(rot_pairs),
+            RopeKind::PrefixHalfSplit { .. } => None,
         }
+    }
+
+    /// RoPE of one row at the position in `pos_buf`; `n_kv_heads == 0` leaves
+    /// K untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_row(
+        &self,
+        gpu: &mut Gpu,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(), DispatchError> {
+        let theta = self.theta;
+        match self.kind {
+            RopeKind::RotateHalf => {
+                gpu.rope_f32(q, k, pos_buf, n_heads, n_kv_heads, head_dim, theta)
+            }
+            RopeKind::PartialHalved { rot_pairs } => gpu.rope_partial_halved_f32(
+                q, k, pos_buf, n_heads, n_kv_heads, head_dim, rot_pairs, theta,
+            ),
+            RopeKind::PrefixHalfSplit { rot_dim } => {
+                // The launcher takes the half-split kernel unless the legacy
+                // interleaved probe is on, which would change the pairing.
+                if gpu.flags.rope_interleaved_legacy {
+                    return Err(DispatchError::Hip(
+                        "prefix half-split RoPE refuses HIPFIRE_ROPE_INTERLEAVED_LEGACY".into(),
+                    ));
+                }
+                #[cfg(feature = "deltanet")]
+                {
+                    gpu.rope_partial_interleaved_f32(
+                        q, k, pos_buf, n_heads, n_kv_heads, head_dim, rot_dim, theta,
+                    )
+                }
+                #[cfg(not(feature = "deltanet"))]
+                {
+                    let _ = rot_dim;
+                    return Err(DispatchError::UnsupportedVariant {
+                        family: "rope",
+                        variant: "prefix-half-split-requires-deltanet",
+                        arch: "",
+                        quant: "",
+                    });
+                }
+            }
+        }
+        .map_err(hip)
     }
 }
 
@@ -563,7 +619,8 @@ impl SandwichAttentionOp<'_> {
             gpu.rmsnorm_batched(self.v, ones, self.v, rows * n_kv, hd, eps)
                 .map_err(hip)?;
         }
-        if let (1, Some(p), true) = (rows, &self.kv_proj, !*EAGLE_STRICT) {
+        let fused_pairs = self.rope.halved_pairs(hd).filter(|_| !*EAGLE_STRICT);
+        if let (1, Some(p), Some(rot_pairs)) = (rows, &self.kv_proj, fused_pairs) {
             return gpu
                 .fused_gemma4_qk_norm_rope_f32(
                     self.q,
@@ -574,7 +631,7 @@ impl SandwichAttentionOp<'_> {
                     n_heads,
                     n_kv,
                     hd,
-                    self.rope.rot_pairs(hd),
+                    rot_pairs,
                     self.q_scale,
                     self.rope.theta,
                     eps,
@@ -589,42 +646,39 @@ impl SandwichAttentionOp<'_> {
         }
         scale(gpu, self.q, self.q_scale)?;
         let rope_kv = if self.kv_proj.is_some() { n_kv } else { 0 };
+        if rows == 1 {
+            return self
+                .rope
+                .apply_row(gpu, self.q, self.k, self.pos_buf, n_heads, rope_kv, hd);
+        }
         let theta = self.rope.theta;
-        match (self.rope.kind, rows) {
-            (RopeKind::RotateHalf, 1) => {
-                gpu.rope_f32(self.q, self.k, self.pos_buf, n_heads, rope_kv, hd, theta)
+        match self.rope.kind {
+            RopeKind::RotateHalf => gpu.rope_batched_f32(
+                self.q,
+                self.k,
+                self.positions()?,
+                n_heads,
+                rope_kv,
+                hd,
+                theta,
+                rows,
+            ),
+            RopeKind::PartialHalved { rot_pairs } => gpu.rope_partial_halved_f32_batched(
+                self.q,
+                self.k,
+                self.positions()?,
+                n_heads,
+                rope_kv,
+                hd,
+                rot_pairs,
+                theta,
+                rows,
+            ),
+            RopeKind::PrefixHalfSplit { .. } => {
+                return Err(DispatchError::Hip(
+                    "sandwich attention: prefix half-split RoPE is single-row only".into(),
+                ))
             }
-            (RopeKind::PartialHalved { rot_pairs }, 1) => gpu.rope_partial_halved_f32(
-                self.q,
-                self.k,
-                self.pos_buf,
-                n_heads,
-                rope_kv,
-                hd,
-                rot_pairs,
-                theta,
-            ),
-            (RopeKind::RotateHalf, _) => gpu.rope_batched_f32(
-                self.q,
-                self.k,
-                self.positions()?,
-                n_heads,
-                rope_kv,
-                hd,
-                theta,
-                rows,
-            ),
-            (RopeKind::PartialHalved { rot_pairs }, _) => gpu.rope_partial_halved_f32_batched(
-                self.q,
-                self.k,
-                self.positions()?,
-                n_heads,
-                rope_kv,
-                hd,
-                rot_pairs,
-                theta,
-                rows,
-            ),
         }
         .map_err(hip)
     }

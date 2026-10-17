@@ -15,7 +15,7 @@ use crate::context::DispatchCtx;
 use crate::cpu_exec;
 use crate::families::moe::{
     MoeNormalization, MoeParams, MoePrefillParams, MoePrefillResolution, MoeQ8RouterPolicy,
-    MoeRecipe, MoeResolution, MoeRouteCapability, NARROW_VERIFY_MAX_ROWS,
+    MoeRecipe, MoeResolution, MoeRouteCapability, MOE_BIASED_SIGMOID_MAX_K, NARROW_VERIFY_MAX_ROWS,
 };
 use crate::pipeline::sealed_moe::{MoeProtocol, MoeRouterInput, SealedMoeCall};
 use crate::types::DispatchError;
@@ -1983,10 +1983,10 @@ pub(super) fn select_decode(
         resolution.needs_x_rot_local = true;
     }
     if params.selection_bias.is_some() {
-        // The bias-aware selector writes any width up to eight; of the indexed
-        // routed kernels only the uniform FWHT-basis MQ4G256 and MQ6G256
-        // gate/up, activation, down and combine read that width at run time
-        // (the generic GPU route is top-8 only).
+        // The bias-aware selector writes any width up to eight. At top-8 every
+        // generic indexed route applies; below it, of the indexed routed
+        // kernels only the uniform FWHT-basis MQ4G256 and MQ6G256 gate/up,
+        // activation, down and combine read that width at run time.
         use rdna_compute::DType::{MQ4G256, MQ6G256};
         let runtime_width = matches!(
             (params.dtypes.routed_gate_up, params.dtypes.routed_down),
@@ -1995,7 +1995,7 @@ pub(super) fn select_decode(
             && params.expert_dtype_tags.is_none()
             && params.expert_down_awq_ptrs.is_none()
             && params.routed_gate_up_paro.is_none();
-        if !runtime_width {
+        if params.k < MOE_BIASED_SIGMOID_MAX_K && !runtime_width {
             return Err(DispatchError::UnsupportedVariant {
                 family: "moe",
                 variant: "biased-sigmoid-router-needs-runtime-width-experts",

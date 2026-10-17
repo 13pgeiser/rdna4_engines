@@ -7052,6 +7052,52 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(feature = "deltanet")]
+    fn biased_sigmoid_decode_admits_lloyd_experts_only_at_top8() {
+        use crate::families::moe::{MoeEpMode, MoeRecipe, MoeSelectionBias};
+        let table = table(8, DType::MQ2G256Lloyd);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0x99_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1151");
+        let scratch = decode_scratch(0x9a_0000);
+        let bias = f32_elems(0x9b_0000, 8);
+        let params = |k| {
+            let mut params = ep_decode_params(
+                &scratch,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                0,
+                k,
+                8,
+                MoeEpMode::None,
+                None,
+                false,
+            );
+            params.recipe = MoeRecipe::SigmoidRoutedNoShared;
+            params.shared = None;
+            params.dtypes.shared = None;
+            params.dtypes.experts_all_gate_up_mq4 = false;
+            params.dtypes.routed_gate_up = DType::MQ2G256Lloyd;
+            params.dtypes.routed_down = DType::MQ2G256Lloyd;
+            params.norm_topk_prob = true;
+            params.selection_bias = Some(MoeSelectionBias {
+                bias: &bias,
+                route_scale: 1.0,
+            });
+            params
+        };
+        let call = seal_decode(experts, &ctx, params(8)).unwrap();
+        assert_eq!(call.router_input(), MoeRouterInput::SigmoidTopK);
+        // The Lloyd routed kernels read a fixed top-8 width.
+        let error = seal_decode(experts, &ctx, params(4))
+            .err()
+            .expect("biased Lloyd k=4 must fail");
+        assert!(format!("{error:?}").contains("runtime-width"), "{error:?}");
+    }
     #[cfg(not(feature = "deltanet"))]
     #[test]
     fn sigmoid_decode_refuses_before_publication_without_deltanet() {
