@@ -44,10 +44,12 @@ The sealed MoE admits the biased router at top-8 for every indexed format
 
 Every launch of the old lowered route is kept; the only change in order is the
 routed-expert input rotation, which now runs after the router GEMV and sigmoid
-(independent buffers). The MQ2-/MQ3-Lloyd MoE down projections accumulate with
-atomics, so beta itself is not bit-reproducible run to run on those tiers;
-parity there is token identity plus a logit difference within beta's own
-run-to-run spread. Evidence: #666 G7 hand-off.
+(independent buffers). On `MiniMax-M2.7.mq2` token ids, every logit's bits,
+the K/V cache and `n_tokens` match beta at 174 positions, eager and hipGraph.
+The MQ2-/MQ3-Lloyd MoE down GEMV accumulates with atomics: on a tiny 512-wide
+random-weight fixture beta itself differs run to run in the last logit bits,
+so small-fixture parity on those tiers is token identity plus beta's own
+spread. Evidence: #666 G7 hand-off.
 
 ## COR-007
 
