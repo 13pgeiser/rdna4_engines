@@ -775,9 +775,14 @@ fn resolve_qsa_format_for_arch(
 }
 
 /// The GDN recurrent state format for a `state_quant` request (Qwen3.5's
-/// DeltaNet knob): `auto`/`q8` is Qwen3.5's Q8 state where its kernels apply
-/// (128x128 heads), `fp32` the exact reference state. An explicit request the
-/// model cannot serve is refused, never rewritten.
+/// DeltaNet knob), independent of the device: `auto`/`q8` is Qwen3.5's Q8
+/// state where its kernels apply (128x128 heads), `fp32` the exact reference
+/// state. An explicit request the model cannot serve is refused, never
+/// rewritten.
+///
+/// This is the arch-agnostic meaning; the product path resolves through
+/// [`resolve_state_format`], whose `auto` is per-architecture (gfx1151 F32,
+/// see there).
 ///
 /// The AR-only Flash-Next profile is the stock-FP8 recipe's
 /// (`Qwen4TierRecipe::StockFp8` is its only recipe), whose numerical contract
@@ -810,6 +815,30 @@ pub fn resolve_gdn_format(request: &str, config: &Qwen4Config) -> Result<GdnStat
             "qwen4: unsupported GDN state_quant '{other}' (expected auto|q8|fp32)"
         )),
     }
+}
+
+/// [`resolve_gdn_format`] with the per-architecture `auto` policy: on exactly
+/// `gfx1151`, a non-AR-only profile with Q8-capable (128x128) GDN heads and an
+/// empty/`auto` request resolves to the exact F32 recurrent state (chosen by
+/// KLD; this differs numerically from the former Q8 default). Every other
+/// request or architecture is `resolve_gdn_format` unchanged: gfx1100,
+/// gfx1201 and the rest keep Q8 for `auto`, the stock-FP8 profile stays pinned
+/// to F32, and explicit `q8|int8|fp32|f32` values are honored or refused,
+/// never rewritten.
+fn resolve_gdn_format_for_arch(
+    request: &str,
+    config: &Qwen4Config,
+    arch: &str,
+) -> Result<GdnStateFormat, String> {
+    let auto = matches!(request.trim().to_ascii_lowercase().as_str(), "" | "auto");
+    if auto
+        && arch == "gfx1151"
+        && !config.profile.is_ar_only()
+        && GdnStateFormat::Q8.supports(config.linear_key_head_dim, config.linear_value_head_dim)
+    {
+        return Ok(GdnStateFormat::F32);
+    }
+    resolve_gdn_format(request, config)
 }
 
 /// Storage formats of a Qwen4 request state.
@@ -851,6 +880,13 @@ impl Qwen4StateFormat {
 /// Both state formats: `kv_request` is `memory.kv_cache`, `state_request`
 /// the `state_quant` load option. The exact F16 prefill arena is on by
 /// default only for gfx1151 F32 QSA K/V with head_dim 256.
+///
+/// The GDN `auto` is per-architecture: gfx1151 (non-AR-only profile, 128x128
+/// heads) resolves to the exact F32 reference state, chosen by KLD, which is
+/// numerically different from the former Q8 default; gfx1100, gfx1201 and the
+/// other architectures keep Q8. The stock-FP8 profile pins F32 everywhere.
+/// The kill switch is `state_quant = "q8"` / `HIPFIRE_STATE_QUANT=q8`
+/// (explicit values are honored or refused, never rewritten).
 pub fn resolve_state_format(
     kv_request: &str,
     state_request: &str,
@@ -860,7 +896,7 @@ pub fn resolve_state_format(
     let qsa = resolve_qsa_format(kv_request, gpu, config)?;
     Ok(Qwen4StateFormat {
         qsa,
-        gdn: resolve_gdn_format(state_request, config)?,
+        gdn: resolve_gdn_format_for_arch(state_request, config, &gpu.arch)?,
         qsa_f16_arena: rdna_compute::tensor_ops::qsa_f16_arena_enabled(gpu, qsa, config.head_dim),
         qsa_pooled_bf16: qsa_pooled_bf16_mirror_enabled(
             gpu,
@@ -3645,6 +3681,69 @@ mod tests {
             );
         }
         assert!(resolve_gdn_format("bf16", &stock).is_err());
+    }
+
+    /// The per-architecture GDN `auto`: exact gfx1151 with the ordinary
+    /// profile and 128x128 heads resolves F32 (KLD-chosen); every other
+    /// architecture keeps Q8; non-128 geometry and the stock-FP8 profile are
+    /// F32 everywhere. Explicit values are unchanged on every architecture.
+    #[test]
+    fn gdn_auto_precision_policy() {
+        let ordinary = crate::config::compact_test_config();
+        let stock = ordinary.clone().into_ar_only().unwrap();
+        let mut narrow = ordinary.clone();
+        narrow.linear_key_head_dim = 64;
+        assert!(!GdnStateFormat::Q8.supports(
+            narrow.linear_key_head_dim,
+            narrow.linear_value_head_dim
+        ));
+        let profiles = [
+            ("ordinary", &ordinary),
+            ("stock-fp8", &stock),
+            ("non-128", &narrow),
+        ];
+        let auto_requests = ["", "auto", " AUTO "];
+        for arch in ["gfx1151", "gfx1100", "gfx1201", "gfx942", "gfx1030"] {
+            for (name, config) in profiles {
+                let auto_expected = if name == "ordinary" && arch != "gfx1151" {
+                    GdnStateFormat::Q8
+                } else {
+                    GdnStateFormat::F32
+                };
+                for request in auto_requests {
+                    assert_eq!(
+                        resolve_gdn_format_for_arch(request, config, arch),
+                        Ok(auto_expected),
+                        "{request:?} on {arch} / {name}"
+                    );
+                }
+                for request in ["fp32", "f32"] {
+                    assert_eq!(
+                        resolve_gdn_format_for_arch(request, config, arch),
+                        Ok(GdnStateFormat::F32),
+                        "{request:?} on {arch} / {name}"
+                    );
+                }
+                for request in ["q8", "int8"] {
+                    let result = resolve_gdn_format_for_arch(request, config, arch);
+                    if name == "ordinary" {
+                        assert_eq!(
+                            result,
+                            Ok(GdnStateFormat::Q8),
+                            "{request:?} on {arch} / {name}"
+                        );
+                    } else {
+                        assert!(result.is_err(), "{request:?} on {arch} / {name}");
+                    }
+                }
+                assert!(
+                    resolve_gdn_format_for_arch("bf16", config, arch).is_err(),
+                    "bf16 on {arch} / {name}"
+                );
+            }
+        }
+        // The arch-agnostic export keeps the old meaning.
+        assert_eq!(resolve_gdn_format("", &ordinary), Ok(GdnStateFormat::Q8));
     }
 
     #[test]

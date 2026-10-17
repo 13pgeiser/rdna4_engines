@@ -631,6 +631,11 @@ const KV_MODES: &[&str] = &[
     "fp8",
     "legacy-asym3",
 ];
+// GDN/DeltaNet recurrent-state storage names accepted by `memory.state_quant`.
+// A schema allow-list only: the Qwen3.5 (`parse_state_quant`) and Qwen4
+// (`resolve_state_format`) loaders each honor or refuse what they cannot serve
+// (`q4`/`int4` are Qwen3.5-only).
+const STATE_QUANT_MODES: &[&str] = &["auto", "q8", "int8", "fp32", "f32", "q4", "int4"];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
 /// VL image decode path: `cpu` (default) / `vcn` / `auto` (VCN when probed).
 const IMAGE_DECODE_MODES: &[&str] = &["cpu", "vcn", "auto"];
@@ -792,6 +797,18 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_KV_ADAPTIVE"),
         "Runtime VRAM-fit KV precision policy."
+    ),
+    field!(
+        "memory.state_quant",
+        "state_quant",
+        Memory,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(STATE_QUANT_MODES),
+        true,
+        false,
+        Some("HIPFIRE_STATE_QUANT"),
+        "GDN/DeltaNet recurrent-state storage; auto = per-model/arch default (Qwen3.8-Flash-Next: F32 on gfx1151, Q8 elsewhere; Qwen3.5: Q8). Explicit values are honored or refused, never rewritten; set q8 to keep Q8 state on gfx1151. q4/int4 are Qwen3.5-only."
     ),
     field!(
         "memory.gpu_layer_budget",

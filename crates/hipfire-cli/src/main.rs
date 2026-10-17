@@ -4596,6 +4596,22 @@ pub(crate) fn load_params(
     {
         params["kv_backend"] = serde_json::json!(kv_backend);
     }
+    // GDN/DeltaNet state precision: forwarded only when authored (user,
+    // per-model, one-shot or `HIPFIRE_STATE_QUANT`), so the daemon applies
+    // its per-model/arch `auto` for built-in and registry provenance.
+    let state_quant_source = &resolved
+        .get("memory.state_quant")
+        .expect("schema field")
+        .source;
+    if matches!(
+        state_quant_source,
+        ConfigSource::GlobalUser { .. }
+            | ConfigSource::ModelUser { .. }
+            | ConfigSource::OneShot { .. }
+            | ConfigSource::LegacyEnv { .. }
+    ) {
+        params["state_quant"] = serde_json::json!(config_string(resolved, "memory.state_quant")?);
+    }
     // Authored K/V axes only: CLI is applied by callers via apply_kv_axis_overrides
     // after this returns so serve can share the same helper. Empty/BuiltIn/registry
     // defaults are omitted from IPC.
@@ -12003,6 +12019,68 @@ effort = "high"
         )
         .unwrap();
         assert_eq!(params["deepseek4_experts_per_token"], 4);
+    }
+
+    #[test]
+    pub(crate) fn load_params_forwards_explicit_state_quant() {
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+        let load = |resolved: &hipfire_config::ResolvedConfig| {
+            load_params(
+                resolved,
+                None,
+                model_path.parent().unwrap(),
+                &model_path,
+                64,
+                Some("q8"),
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap()
+        };
+        // The built-in `auto` default is not forwarded: the daemon applies its
+        // per-model/arch default.
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        assert!(load(&defaults).get("state_quant").is_none());
+
+        let sources = [
+            (
+                "q8",
+                ConfigSource::OneShot {
+                    argument: "memory.state_quant=q8".into(),
+                },
+            ),
+            (
+                "fp32",
+                ConfigSource::GlobalUser {
+                    path: PathBuf::from("/tmp/global.toml"),
+                },
+            ),
+            (
+                "auto",
+                ConfigSource::ModelUser {
+                    model: "test-model".into(),
+                    path: PathBuf::from("/tmp/model.toml"),
+                },
+            ),
+            (
+                "f32",
+                ConfigSource::LegacyEnv {
+                    name: "HIPFIRE_*".into(),
+                },
+            ),
+        ];
+        for (value, source) in sources {
+            let mut explicit = ConfigLayer::default();
+            explicit.set_cli("memory.state_quant", value).unwrap();
+            let resolved = resolve([NamedLayer {
+                source,
+                layer: explicit,
+            }])
+            .unwrap();
+            assert_eq!(load(&resolved)["state_quant"], value, "{value}");
+        }
     }
 
     #[test]
