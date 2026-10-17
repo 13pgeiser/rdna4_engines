@@ -97,6 +97,12 @@ pub struct FeatureFlags {
     /// Multi-lane fn-lanes GDN decode core (`HIPFIRE_QWEN4_GDN_LANES`), default
     /// on for gfx1151, off elsewhere.
     pub qwen4_gdn_lanes: bool,
+    /// Qwen4 MQ4G128V2 K=640 indexed MoE down with four weight rows per wave
+    /// (`HIPFIRE_QWEN4_MOE_DOWN_R4`), default on for gfx1151.
+    pub qwen4_moe_down_r4: bool,
+    /// Single-token Q8 K=640 shared-expert down + BF16 scaled add in one
+    /// launch (`HIPFIRE_QWEN4_SHARED_DOWN_FUSE`), default on for gfx1151.
+    pub qwen4_shared_down_fuse: bool,
     /// Exact single-token GDN a/b/z MQ4 projection fusion
     /// (`HIPFIRE_QWEN4_DECODE_ZBA_X3`), default on only for gfx1151.
     pub qwen4_decode_zba_x3: bool,
@@ -854,6 +860,9 @@ impl FeatureFlags {
             qwen4_hc_row_fold: parse_bool("HIPFIRE_QWEN4_HC_ROW_FOLD").unwrap_or(halo_hyper_default),
             qwen4_router_fast: parse_bool("HIPFIRE_QWEN4_ROUTER_FAST").unwrap_or(exact_unit_default),
             qwen4_gdn_lanes: parse_bool("HIPFIRE_QWEN4_GDN_LANES").unwrap_or(arch == "gfx1151"),
+            qwen4_moe_down_r4: parse_bool("HIPFIRE_QWEN4_MOE_DOWN_R4").unwrap_or(arch == "gfx1151"),
+            qwen4_shared_down_fuse: parse_bool("HIPFIRE_QWEN4_SHARED_DOWN_FUSE")
+                .unwrap_or(arch == "gfx1151"),
             qwen4_decode_zba_x3: parse_bool("HIPFIRE_QWEN4_DECODE_ZBA_X3")
                 .unwrap_or(arch == "gfx1151"),
             qwen4_decode_head_fuse: parse_bool("HIPFIRE_QWEN4_DECODE_HEAD_FUSE")
@@ -1313,6 +1322,14 @@ impl FeatureFlags {
         self.qwen4_gdn_lanes && self.arch == "gfx1151"
     }
 
+    pub fn qwen4_moe_down_r4_enabled(&self) -> bool {
+        self.qwen4_moe_down_r4 && self.arch == "gfx1151"
+    }
+
+    pub fn qwen4_shared_down_fuse_enabled(&self) -> bool {
+        self.qwen4_shared_down_fuse && self.arch == "gfx1151"
+    }
+
     pub fn qwen4_router_fast_enabled(&self) -> bool {
         self.qwen4_router_fast && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
     }
@@ -1472,6 +1489,8 @@ impl FeatureFlags {
             qwen4_hc_row_fold: false,
             qwen4_router_fast: false,
             qwen4_gdn_lanes: false,
+            qwen4_moe_down_r4: false,
+            qwen4_shared_down_fuse: false,
             qwen4_decode_zba_x3: false,
             qwen4_decode_head_fuse: false,
             qwen4_ple_fuse: false,

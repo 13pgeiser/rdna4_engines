@@ -2134,7 +2134,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded",
             kernels::GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC,
-            ["gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded",]
+            [
+                "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded",
+                "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_k640_r4",
+            ]
         );
         add!(
             "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched",
@@ -3173,6 +3176,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::QWEN4_GEMV_Q8_0_WIDE_SRC,
             [
                 "gemv_q8_0_wide_k640_staged",
+                "gemv_q8_0_wide_k640_staged_bf16_scaled_add",
                 "gemv_q8_0_wide_rows",
                 "gemv_q8_0_wide_rows_wide_r16",
                 "gemv_q8_0_wide_rows_wide_r32",
