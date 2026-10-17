@@ -226,9 +226,10 @@ fn not_used_on_gpu(out: &mut Effective) {
 }
 
 /// `memory.kv_cache = auto`. Qwen4 (`model_arch` 16) mirrors
-/// `kv_mode::resolve_qwen4` (fp8 on exact gfx1201, bf16 elsewhere); every
-/// other Qwen-family model mirrors `kv_mode::resolve_kv_pair`'s auto default
-/// (fp8 on exact gfx1201 with one GPU, else q8).
+/// `kv_mode::resolve_qwen4` (fp8 on exact gfx1201, q8 on gfx1151/gfx1100,
+/// bf16 = the exact F32 state elsewhere); every other Qwen-family model
+/// mirrors `kv_mode::resolve_kv_pair`'s auto default (fp8 on exact gfx1201
+/// with one GPU, else q8).
 fn kv_auto(out: &mut Effective, ctx: &ArchCtx) {
     let arch = ctx.arch();
     let set = |out: &mut Effective, value: &str, arch_rule: bool, reason: String| {
@@ -237,15 +238,20 @@ fn kv_auto(out: &mut Effective, ctx: &ArchCtx) {
         out.reason = Some(reason);
     };
     if ctx.model_arch_id == Some(QWEN4_ARCH_ID) {
-        if arch == "gfx1201" {
-            set(out, "fp8", true, "auto: fp8 on exact gfx1201, Qwen".into());
-        } else {
-            set(
+        match arch {
+            "gfx1201" => set(out, "fp8", true, "auto: fp8 on exact gfx1201, Qwen".into()),
+            "gfx1151" | "gfx1100" => set(
+                out,
+                "q8",
+                true,
+                format!("auto: q8 on {arch} (bf16 keeps the exact state), Qwen"),
+            ),
+            _ => set(
                 out,
                 "bf16",
                 false,
                 "auto: bf16 (exact state; fp8 only on exact gfx1201), Qwen".into(),
-            );
+            ),
         }
         return;
     }
@@ -647,7 +653,12 @@ mod tests {
         let mut c = ctx("gfx1201");
         c.model_arch_id = Some(16);
         assert_eq!(eff(KV_KEY, &c).value, s("fp8"));
-        for arch in ["gfx1100", "gfx1151", "gfx942"] {
+        for arch in ["gfx1100", "gfx1151"] {
+            let mut c = ctx(arch);
+            c.model_arch_id = Some(16);
+            assert_eq!(eff(KV_KEY, &c).value, s("q8"), "{arch}");
+        }
+        for arch in ["gfx942", "gfx1030"] {
             let mut c = ctx(arch);
             c.model_arch_id = Some(16);
             assert_eq!(eff(KV_KEY, &c).value, s("bf16"), "{arch}");
