@@ -742,6 +742,27 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ]
         );
         add!(
+            "gemm_mq4g256v2_overwrite_wmma_gfx12",
+            kernels::GEMM_MQ4G256V2_OVERWRITE_WMMA_GFX12_SRC,
+            ["gemm_mq4g256v2_overwrite_wmma_gfx12"]
+        );
+        add!(
+            "gemm_mq4g256v2_overwrite_wmma_gfx12_vt",
+            kernels::GEMM_MQ4G256V2_OVERWRITE_WMMA_GFX12_VT_SRC,
+            [
+                "gemm_mq4g256v2_overwrite_wmma_gfx12_vt2w4",
+                "gemm_mq4g256v2_overwrite_wmma_gfx12_vt2w8",
+                "gemm_mq4g256v2_overwrite_wmma_gfx12_vt3w4",
+                "gemm_mq4g256v2_overwrite_wmma_gfx12_vt3w8",
+                "gemm_mq4g256v2_overwrite_wmma_gfx12_vt4w4",
+                "gemm_mq4g256v2_overwrite_wmma_gfx12_vt4w8",
+                "gemm_mq4g256v2_overwrite_wmma_gfx12_vt4w4_k32",
+                "gemm_mq4g256v2_overwrite_wmma_gfx12_vt4w8_k32",
+                "gemm_mq4g256v2_overwrite_wmma_gfx12_vt8w4_k32",
+                "gemm_mq4g256v2_overwrite_wmma_gfx12_vt8w8_k32"
+            ]
+        );
+        add!(
             "gemm_hfq4g256_residual_wmma_gfx12_mq4v2",
             kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC,
             ["gemm_mq4g256v2_residual_wmma_gfx12"]
@@ -6599,11 +6620,14 @@ mod tests {
         // the separately registered pruned E512/top10 router
         // `moe_router_softmax_top10_masked_f32`, plus the Q8 small-K wide module
         // `qwen4_gemv_q8_0_wide` (S2 exact-wide twin on the raw gfx1201 Q8 oracle;
-        // gfx1151 already packaged it) are additional to P0's 92. Existing
+        // gfx1151 already packaged it) and the gfx1201 DFlash-draft MQ4G256V2
+        // overwrite WMMA twins `gemm_mq4g256v2_overwrite_wmma_gfx12` and
+        // `gemm_mq4g256v2_overwrite_wmma_gfx12_vt` (default draft lm_head and
+        // projections; the 27B draft cold-compiled them) are additional to P0's 92. Existing
         // module digests above remain unchanged.
         assert_eq!(
             registry.len(),
-            count + 156,
+            count + 158,
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
@@ -6901,6 +6925,57 @@ mod tests {
                     Some("default"),
                     "{module}"
                 );
+            }
+        }
+    }
+
+    /// The gfx1201 DFlash-draft MQ4G256V2 overwrite WMMA twins
+    /// (`gemm_mq4g256v2_overwrite_gfx12_dflash`, default 27B draft route) are
+    /// packaged under the exact module keys and symbols their launchers pass to
+    /// `ensure_kernel` / `launch_gemm_vt` (the one-tile kernel, and every
+    /// `_vt{2,3,4}w{4,8}` symbol of `vt_symbols!`), with the launchers' sources,
+    /// on exact gfx1201 only.
+    #[test]
+    fn gfx1201_draft_overwrite_twins_are_packaged() {
+        let one_tile = lookup("gfx1201", "gemm_mq4g256v2_overwrite_wmma_gfx12", "").unwrap();
+        assert_eq!(one_tile.symbols, ["gemm_mq4g256v2_overwrite_wmma_gfx12"]);
+        assert_eq!(
+            one_tile.source(),
+            kernels::GEMM_MQ4G256V2_OVERWRITE_WMMA_GFX12_SRC
+        );
+        let vt = lookup("gfx1201", "gemm_mq4g256v2_overwrite_wmma_gfx12_vt", "").unwrap();
+        assert_eq!(
+            vt.source(),
+            kernels::GEMM_MQ4G256V2_OVERWRITE_WMMA_GFX12_VT_SRC
+        );
+        assert_eq!(
+            vt.symbols,
+            [
+                "gemm_mq4g256v2_overwrite_wmma_gfx12_vt2w4",
+                "gemm_mq4g256v2_overwrite_wmma_gfx12_vt2w8",
+                "gemm_mq4g256v2_overwrite_wmma_gfx12_vt3w4",
+                "gemm_mq4g256v2_overwrite_wmma_gfx12_vt3w8",
+                "gemm_mq4g256v2_overwrite_wmma_gfx12_vt4w4",
+                "gemm_mq4g256v2_overwrite_wmma_gfx12_vt4w8",
+                "gemm_mq4g256v2_overwrite_wmma_gfx12_vt4w4_k32",
+                "gemm_mq4g256v2_overwrite_wmma_gfx12_vt4w8_k32",
+                "gemm_mq4g256v2_overwrite_wmma_gfx12_vt8w4_k32",
+                "gemm_mq4g256v2_overwrite_wmma_gfx12_vt8w8_k32",
+            ]
+        );
+        // The vt symbol set is the residual twin's, symbol for symbol.
+        let residual = lookup("gfx1201", "gemm_mq4g256v2_residual_wmma_gfx12_vt", "").unwrap();
+        let rename = |symbol: &&str| symbol.replace("_residual_", "_overwrite_");
+        assert_eq!(
+            residual.symbols.iter().map(rename).collect::<Vec<_>>(),
+            vt.symbols
+        );
+        for module in [
+            "gemm_mq4g256v2_overwrite_wmma_gfx12",
+            "gemm_mq4g256v2_overwrite_wmma_gfx12_vt",
+        ] {
+            for arch in ["gfx1100", "gfx1151", "gfx906", "gfx942"] {
+                assert!(lookup(arch, module, "").is_err(), "{arch}: leaked {module}");
             }
         }
     }
