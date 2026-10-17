@@ -968,7 +968,52 @@ pub(crate) struct RingCore<B: PanelBackend> {
     stats: PanelStats,
     records: Vec<SpanRec>,
     marks: Vec<LayerMark>,
-    backend: B,
+    /// Never dropped implicitly while device work may be queued: see the
+    /// `Drop` impl.
+    backend: std::mem::ManuallyDrop<B>,
+    /// Any device operation was issued since the last SUCCESSFUL drain. A
+    /// retired/free logical state is not GPU completion, so only a completed
+    /// [`Self::drain`] clears this.
+    dirty: bool,
+    backend_taken: bool,
+}
+
+impl<B: PanelBackend> Drop for RingCore<B> {
+    fn drop(&mut self) {
+        if self.backend_taken {
+            return;
+        }
+        if self.dirty {
+            // Device work may still read the pool, tables and pinned sources
+            // and the owner may not hold a `Gpu` to drain with: leak the
+            // backend (never dropped: `ManuallyDrop`) and every retained
+            // source owner rather than free memory in flight.
+            for page in &mut self.pages {
+                if let Some(owner) = page.retained.take() {
+                    std::mem::forget(owner);
+                }
+            }
+            return;
+        }
+        // SAFETY: not taken (checked above) and dropped exactly once, here;
+        // no work was issued since the last completed drain (or ever).
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.backend) };
+    }
+}
+
+impl<B: PanelBackend> RingCore<B> {
+    /// Hand the backend to its owner for explicit release. Only after a
+    /// completed drain; the core then never drops it.
+    pub(crate) fn take_backend(&mut self) -> R<B> {
+        if self.dirty || self.backend_taken {
+            return Err(invalid(
+                "panel ring backend can only be taken after a completed drain",
+            ));
+        }
+        self.backend_taken = true;
+        // SAFETY: taken at most once (flag above); `Drop` skips it afterwards.
+        Ok(unsafe { std::mem::ManuallyDrop::take(&mut self.backend) })
+    }
 }
 
 impl<B: PanelBackend> RingCore<B> {
@@ -987,7 +1032,9 @@ impl<B: PanelBackend> RingCore<B> {
             stats: PanelStats::default(),
             records: Vec::with_capacity(spec.timeline_records),
             marks: Vec::with_capacity(spec.timeline_layers),
-            backend,
+            backend: std::mem::ManuallyDrop::new(backend),
+            dirty: false,
+            backend_taken: false,
         })
     }
 
@@ -1090,6 +1137,9 @@ impl<B: PanelBackend> RingCore<B> {
 
     /// Run a mutating device sequence; a failure quarantines the ring.
     fn run<T>(&mut self, f: impl FnOnce(&mut Self) -> R<T>) -> R<T> {
+        // From here on the device may hold queued work that reads this
+        // ring's pages, tables and pinned sources.
+        self.dirty = true;
         let result = f(self);
         if result.is_err() {
             self.poisoned = true;
@@ -1385,6 +1435,8 @@ impl<B: PanelBackend> RingCore<B> {
             self.poisoned = true;
             return Err(error);
         }
+        // Both streams completed: nothing queued by this ring is in flight.
+        self.dirty = false;
         for page in &mut self.pages {
             page.state = PageState::Free;
             page.retained = None;
@@ -1672,6 +1724,40 @@ impl PanelSchedule {
 
 // ── HIP backend and public ring ──────────────────────────────────────
 
+/// The pool's pinned host staging for the per-page pointer tables.
+///
+/// `hip_bridge::PinnedHostBuffer` holds a raw `hipHostMalloc` pointer and is
+/// therefore not `Send`; `Qwen4GpuForward` (and with it the architecture model
+/// object) must be, so the ring's owner asserts the narrow invariant here
+/// instead of widening anything in `hip-bridge` or the bundle.
+struct PinnedStaging(hip_bridge::PinnedHostBuffer);
+
+// SAFETY: `PinnedStaging` is the unique owner of its hipHostMalloc allocation:
+// nothing aliases or caches the pointer, and the only host access is
+// `as_bytes_mut` through `&mut self`, so moving the owner to another thread
+// cannot create concurrent access. The allocation does not move with its
+// owner and the HIP library it frees through is thread-agnostic and kept
+// alive by the buffer itself. Device-side reads of the staging (the async
+// table uploads) are fenced by the ring: the next write to a page's staging
+// waits on that page's `ready` event on the host (`await_copy_done`), and
+// `drain` / `free_gpu` synchronize both streams before the buffer can be
+// dropped (a failed drain leaks it rather than freeing it). Deliberately NOT
+// `Sync`: concurrent host access is unsupported.
+unsafe impl Send for PinnedStaging {}
+
+impl PinnedStaging {
+    fn as_bytes_mut(&mut self) -> &mut [u8] {
+        self.0.as_bytes_mut()
+    }
+}
+
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<HipPanelBackend>();
+    assert_send::<ExpertPanelRing>();
+    assert_send::<PanelSchedule>();
+};
+
 /// Real device resources of the pool.
 pub(crate) struct HipPanelBackend {
     copy: hip_bridge::Stream,
@@ -1681,7 +1767,7 @@ pub(crate) struct HipPanelBackend {
     ready: Vec<hip_bridge::Event>,
     free: Vec<hip_bridge::Event>,
     /// Pinned host staging of every page's two pointer tables.
-    staging: hip_bridge::PinnedHostBuffer,
+    staging: PinnedStaging,
     table_len: usize,
     base: Option<hip_bridge::Event>,
     /// Four per record: copy start/end, compute begin/end.
@@ -1701,7 +1787,7 @@ impl HipPanelBackend {
         let reserve = spec
             .reserve()
             .ok_or_else(|| invalid("panel pool byte size overflows"))?;
-        let staging = gpu.hip.host_buffer(reserve.staging)?;
+        let staging = PinnedStaging(gpu.hip.host_buffer(reserve.staging)?);
         gpu.ensure_capture_stream()?;
         let copy = gpu.hip.stream_create_non_blocking()?;
         let mut backend = Self {
@@ -2124,11 +2210,11 @@ impl ExpertPanelRing {
     /// Drain, then free the pool. A failed drain leaks the device and pinned
     /// memory rather than freeing what the device may still use.
     pub(crate) fn free_gpu(mut self, gpu: &mut Gpu) -> R<()> {
-        if let Err(error) = self.core.drain(&*gpu) {
-            std::mem::forget(self);
-            return Err(error);
-        }
-        self.core.backend.release(gpu)
+        // A failed drain returns here with `self` still dirty: its `Drop`
+        // leaks the pool and every retained source instead of freeing them.
+        self.core.drain(&*gpu)?;
+        let backend = self.core.take_backend()?;
+        backend.release(gpu)
     }
 }
 
@@ -2534,6 +2620,142 @@ mod slowlink_ring {
     use super::*;
     use std::collections::HashMap;
 
+    fn counted() -> (RingCore<Mock>, Arc<std::sync::atomic::AtomicUsize>) {
+        let mock = Mock::new(1);
+        let drops = Arc::clone(&mock.dropped);
+        (RingCore::new(spec(1, 0), mock).unwrap(), drops)
+    }
+
+    fn backend_drops(drops: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        drops.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// One group enqueued, read and retired: logically free, GPU unproven.
+    fn used_ring(owner: &Arc<u8>) -> (RingCore<Mock>, Arc<std::sync::atomic::AtomicUsize>) {
+        let any: Arc<dyn Any + Send + Sync> = owner.clone();
+        let s = sources_with(0, any, |_| 1);
+        let (mut ring, drops) = counted();
+        ring.begin_window(&()).unwrap();
+        ring.set_layers(Some(0), None).unwrap();
+        let t = ring.enqueue(&(), &group(&s, 0), &s).unwrap();
+        ring.acquire(&(), t).unwrap();
+        ring.retire(&(), t).unwrap();
+        (ring, drops)
+    }
+
+    #[test]
+    fn slowlink_ring_implicit_drop_of_an_unused_ring_releases_the_backend() {
+        let (ring, drops) = counted();
+        drop(ring);
+        assert_eq!(backend_drops(&drops), 1);
+    }
+
+    #[test]
+    fn slowlink_ring_implicit_drop_after_undrained_work_leaks_backend_and_sources() {
+        let owner = Arc::new(0u8);
+        let (ring, drops) = used_ring(&owner);
+        // Retired and logically free, but never proven complete on the GPU.
+        assert_eq!(
+            Arc::strong_count(&owner),
+            2,
+            "the page retains the source owner"
+        );
+        drop(ring);
+        assert_eq!(
+            backend_drops(&drops),
+            0,
+            "the pool/tables/staging were leaked"
+        );
+        assert_eq!(
+            Arc::strong_count(&owner),
+            2,
+            "the retained source owner was leaked, not released"
+        );
+        // Even a window start (a queued event record) makes the ring dirty.
+        let (mut started, drops) = counted();
+        started.begin_window(&()).unwrap();
+        drop(started);
+        assert_eq!(backend_drops(&drops), 0);
+    }
+
+    #[test]
+    fn slowlink_ring_implicit_drop_after_successful_drain_releases_everything() {
+        let owner = Arc::new(0u8);
+        let (mut ring, drops) = used_ring(&owner);
+        ring.drain(&()).unwrap();
+        drop(ring);
+        assert_eq!(backend_drops(&drops), 1);
+        assert_eq!(
+            Arc::strong_count(&owner),
+            1,
+            "drain released the retained owner"
+        );
+        // Work after a drain makes it dirty again.
+        let (mut again, drops) = counted();
+        again.begin_window(&()).unwrap();
+        again.drain(&()).unwrap();
+        again.begin_window(&()).unwrap();
+        drop(again);
+        assert_eq!(backend_drops(&drops), 0);
+    }
+
+    #[test]
+    fn slowlink_ring_implicit_drop_after_failed_drain_or_failed_enqueue_leaks() {
+        let owner = Arc::new(0u8);
+        let (mut ring, drops) = used_ring(&owner);
+        ring.backend.fail_drain = true;
+        assert!(ring.drain(&()).is_err());
+        drop(ring);
+        assert_eq!(backend_drops(&drops), 0);
+        assert_eq!(Arc::strong_count(&owner), 2);
+        // A device failure mid-enqueue (quarantine) leaks too.
+        let any: Arc<dyn Any + Send + Sync> = owner.clone();
+        let s = sources_with(0, any, |_| 1);
+        let (mut ring, drops) = counted();
+        ring.begin_window(&()).unwrap();
+        ring.set_layers(Some(0), None).unwrap();
+        ring.backend.fail_at = Some(ring.backend.ops.len() + 2);
+        assert!(ring.enqueue(&(), &group(&s, 0), &s).is_err());
+        assert!(ring.is_quarantined());
+        drop(ring);
+        assert_eq!(backend_drops(&drops), 0);
+    }
+
+    #[test]
+    fn slowlink_ring_backend_is_taken_only_after_a_completed_drain() {
+        let owner = Arc::new(0u8);
+        let (mut ring, drops) = used_ring(&owner);
+        assert!(
+            ring.take_backend().is_err(),
+            "dirty ring cannot hand out its backend"
+        );
+        ring.drain(&()).unwrap();
+        let backend = ring.take_backend().unwrap();
+        assert!(ring.take_backend().is_err(), "taken once");
+        drop(ring);
+        assert_eq!(
+            backend_drops(&drops),
+            0,
+            "the core never drops a taken backend"
+        );
+        drop(backend);
+        assert_eq!(
+            backend_drops(&drops),
+            1,
+            "the new owner drops it exactly once"
+        );
+    }
+
+    #[test]
+    fn slowlink_ring_transport_owners_are_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<PinnedStaging>();
+        assert_send::<HipPanelBackend>();
+        assert_send::<ExpertPanelRing>();
+        assert_send::<PanelSchedule>();
+        assert_send::<LayerExpertSources>();
+    }
+
     const GU: usize = 4096;
     const DN: usize = 2048;
     const HOST: usize = 0x7000_0000;
@@ -2563,6 +2785,15 @@ mod slowlink_ring {
         /// Fail the nth (0-based) op.
         fail_at: Option<usize>,
         fail_drain: bool,
+        /// Counts backend drops: a leaked backend never increments it.
+        dropped: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for Mock {
+        fn drop(&mut self) {
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     impl Mock {
@@ -2577,6 +2808,7 @@ mod slowlink_ring {
                 starved: false,
                 fail_at: None,
                 fail_drain: false,
+                dropped: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             }
         }
 
