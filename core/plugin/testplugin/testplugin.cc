@@ -623,6 +623,10 @@ const RadPluginInfo* rad_plugin_info(void) { return &kInfo; }
 const char* rad_arch_id(void) { return RADTEST_ARCH_ID; }
 /* The other half of the selection key (spec §2.4); "" is an unquantised container. */
 const char* rad_arch_quant(void) { return RADTEST_ARCH_QUANT; }
+#if defined(RADTEST_ARCHQ_NO_IMPORTS)
+/* Quantised, but never the plugin an imported checkpoint is handed to. */
+int rad_arch_serves_imports(void) { return 0; }
+#endif
 /* The core loads and identifies architecture plugins; the build component drives them. Neither
  * hook is called by anything this test exercises, and declare refuses rather than pretending. */
 int  rad_arch_declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {

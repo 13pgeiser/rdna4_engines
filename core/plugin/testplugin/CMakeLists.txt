@@ -60,6 +60,11 @@ foreach(q plain fp8 w4)
                              RADTEST_ARCHQ_NAME="radtest_archq_${q}"
                              RADTEST_ARCHQ_QUANT="${_rad_q}")
 endforeach()
+# A fourth member, quantised but declining imported checkpoints (rad_arch_serves_imports).
+rad_add_plugin(radtest_archq_w8 testarchq SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/testplugin.cc)
+target_compile_definitions(radtest_archq_w8 PRIVATE RADTEST_ARCHQ=1
+                           RADTEST_ARCHQ_NAME="radtest_archq_w8" RADTEST_ARCHQ_QUANT="w8"
+                           RADTEST_ARCHQ_NO_IMPORTS=1)
 
 # KV tier transfer test plugin. Unlike the others it computes (byte-row gather and scatter in the
 # device domain, on host backend memory), so only tests/mem_test.cpp loads it, by path. It calls

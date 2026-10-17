@@ -1331,6 +1331,11 @@ inline int drafter_kv_group(RadBuilder* b, Names& nm, const RadBuildCtx* ctx, Ge
         return NS::audio_format(m);                                                            \
     }
 
+/* Optional: RAD_ARCH_SERVES_IMPORTS(0) keeps a family's second quantised plugin out of the pick for
+ * an imported checkpoint (rad_builder.h, rad_arch_serves_imports). */
+#define RAD_ARCH_SERVES_IMPORTS(V)                                                             \
+    extern "C" int rad_arch_serves_imports(void) { return V; }
+
 }  /* namespace arch */
 }  /* namespace rad */
 

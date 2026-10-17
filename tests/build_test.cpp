@@ -1944,7 +1944,8 @@ TEST(the_home_search_path_splits_on_colons_and_the_first_home_with_a_file_wins) 
  * selected by the (id, quantisation) pair, exactly. A checkpoint whose quantisation was imported
  * weight by weight names its producing tool, which no plugin claims: the family's one quantised
  * plugin serves it (or its only plugin), and two quantised plugins are refused by name rather than
- * chosen between. */
+ * chosen between. A plugin that declines imports (rad_arch_serves_imports, radtest_archq_w8) is
+ * still selected by its own descriptor, but is neither counted nor picked for an import. */
 TEST(the_architecture_plugin_is_picked_by_id_and_quantisation) {
     const std::string archq = home() + "/testarchq";
     NEED_ARTIFACT(archq + "/radtest_archq_fp8.so");
@@ -1978,7 +1979,9 @@ TEST(the_architecture_plugin_is_picked_by_id_and_quantisation) {
     const std::string all = make_home({ "plain", "fp8", "w4" });
     const std::string one = make_home({ "plain", "fp8" });
     const std::string bare = make_home({ "plain" });
-    REQUIRE(!all.empty() && !one.empty() && !bare.empty());
+    const std::string w8 = make_home({ "plain", "fp8", "w8" });
+    const std::string plain_w8 = make_home({ "plain", "w8" });
+    REQUIRE(!all.empty() && !one.empty() && !bare.empty() && !w8.empty() && !plain_w8.empty());
 
     LoadedPlugins lp;
     std::string log;
@@ -2000,6 +2003,16 @@ TEST(the_architecture_plugin_is_picked_by_id_and_quantisation) {
     CHECK_OK(pick(bare, "quark-mxfp4", true, &lp, &log));
     CHECK_EQ(lp.arch_plugin, std::string("radtest_archq_plain"));
     CHECK_EQ(pick(all, "fp8", false, &lp, &log), RAD_OK);
+
+    /* A second quantised plugin that declines imports leaves them to the first. */
+    CHECK_OK(pick(w8, "quark-mxfp4", true, &lp, &log));
+    CHECK_EQ(lp.arch_plugin, std::string("radtest_archq_fp8"));
+    CHECK(!has(log, "more than one quantised plugin"));
+    CHECK_OK(pick(w8, "w8", false, &lp, &log));
+    CHECK_EQ(lp.arch_plugin, std::string("radtest_archq_w8"));
+    CHECK_EQ(lp.arch_quant, std::string("w8"));
+    CHECK_OK(pick(plain_w8, "quark-mxfp4", true, &lp, &log));
+    CHECK_EQ(lp.arch_plugin, std::string("radtest_archq_plain"));
     rad_tools_registry().close();
 }
 

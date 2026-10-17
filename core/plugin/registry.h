@@ -94,6 +94,9 @@ struct Plugin {
     int64_t (*arch_text_prepare)(int, const char*, char*, int64_t) = nullptr;
     /* Required of a video generator (rad_builder.h); null for every other plugin. */
     int64_t (*arch_video_positions)(int, const RadVideoGeom*, float*, int64_t) = nullptr;
+    /* Optional (rad_builder.h, rad_arch_serves_imports); absent is true. False keeps the plugin
+     * out of the pick for an imported checkpoint (startup.h). */
+    bool arch_serves_imports = true;
 
     RadPluginCloseFn close = nullptr;
 };

@@ -926,6 +926,14 @@ const char* rad_arch_id(void);
  * served at: (unquantised)". */
 const char* rad_arch_quant(void);
 
+/* Whether this plugin may serve a checkpoint whose quantisation was imported weight by weight
+ * (Quark, ParoQuant, GPTQ, NVFP4, ...). Such a descriptor names the producing tool, which no plugin
+ * claims, so the family's one quantised plugin serves it, and two are refused (startup.h). A
+ * family's second quantised plugin that reads only its own containers returns 0 and leaves imports
+ * to the first. Optional: absent or non-zero is yes. Additive export; RAD_ABI_VERSION does not
+ * move. */
+int rad_arch_serves_imports(void);
+
 /* What the plugin can say before it declares anything. Optional: a plugin that does not export
  * it answers zero to everything, each field's default.
  *
