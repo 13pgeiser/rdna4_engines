@@ -287,6 +287,21 @@ impl PromptRouteLayout {
         gate_up + down
     }
 
+    /// Bytes of the grouped-scatter Gpu scratch at FULL window size: exactly what
+    /// `qwen4_moe_group_layout(rows * 10, n_exp)` reserves (rank, per-chunk partial counts and
+    /// chunk prefixes).  Gpu scratch, grow-only, NOT part of [`Self::total_bytes`]; the
+    /// 1536-row tile's own scatter scratch may already be reserved (this is the full size, not
+    /// the net growth).
+    pub fn group_scatter_bytes(&self) -> usize {
+        rdna_compute::scratch::qwen4_moe_group_layout(self.dims.rows * K_TOP, self.dims.n_exp).bytes
+    }
+
+    /// Everything the window charges: the route region, the A4 sidecars and the grouped-scatter
+    /// scratch.
+    pub fn charged_bytes(&self) -> usize {
+        self.total_bytes() + self.a4_sidecar_bytes() + self.group_scatter_bytes()
+    }
+
     /// Saved prepared input, F32 `[rows, hidden]`.
     pub fn x_norm_bytes(&self) -> usize {
         self.dims.rows * self.dims.hidden * F32_BYTES
@@ -2489,6 +2504,27 @@ mod slowlink_panel_tests {
             }
         }
         ids
+    }
+
+    #[test]
+    fn slowlink_panel_charged_bytes_are_region_a4_and_full_window_scatter_scratch() {
+        // The real MQ4 layer identity: H2560, mi 640, E512, shared I640, a 16384-row window
+        // with up to 48 K1 rows.
+        let mut d = dims(16_384);
+        d.k1_rows = 48;
+        let l = PromptRouteLayout::new(&d).unwrap();
+        assert_eq!(l.total_bytes(), 385_825_024);
+        assert_eq!(l.a4_sidecar_bytes(), 82_575_360);
+        assert_eq!(l.group_scatter_bytes(), 3_278_848);
+        assert_eq!(
+            l.group_scatter_bytes(),
+            rdna_compute::scratch::qwen4_moe_group_layout(163_840, 512).bytes
+        );
+        assert_eq!(l.charged_bytes(), 471_679_232);
+        // The 1536-row tile's scratch is a strict subset of the full-window size.
+        let tile = PromptRouteLayout::new(&dims(1536)).unwrap();
+        assert_eq!(tile.group_scatter_bytes(), 309_248);
+        assert!(tile.group_scatter_bytes() < l.group_scatter_bytes());
     }
 
     #[test]
