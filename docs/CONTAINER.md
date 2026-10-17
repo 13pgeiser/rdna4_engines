@@ -44,7 +44,7 @@ cp .env.example .env
 | `HIPFIRE_UI` | `0` | `1` serves the web UI at `/ui` |
 | `HIPFIRE_SERVE_ARGS` | empty | Extra `hipfire serve` arguments (for example `--api-key-file …`) |
 | `HIPFIRE_MODELS_PATH` | `hipfire-models` | Named volume, or a host directory to reuse existing models |
-| `HIPFIRE_IMAGE` / `HIPFIRE_IMAGE_TARGET` | `ghcr.io/warpfront/hipfire:latest` / `full` | Image tag and build target |
+| `HIPFIRE_IMAGE` / `HIPFIRE_IMAGE_TARGET` | `ghcr.io/warpfront/hipfire:latest` / `runtime` | Image tag and build target |
 | `HF_TOKEN` | unset | Optional Hugging Face token for the pull |
 | `COMPOSE_FILE` | unset | Set to `compose.yml:compose.halo.yml` for the Halo override |
 
@@ -63,12 +63,13 @@ the `hipfire-config` and `hipfire-kernels` volumes.
 | Radeon AI PRO R9700 | gfx1201 | 32 GB; the default tag fits. |
 | RX 7900 XTX | gfx1100 | 24 GB; the default tag fits. |
 
-Prebuilt kernels for gfx1100, gfx1151 and gfx1201 are baked into the image, so
-the first run loads packaged kernels instead of compiling them. A route whose
-kernel is not in the packs yet compiles once into the `hipfire-kernels` cache
-(measured on R9700 with the default tag: the two DFlash draft overwrite GEMMs,
-about 1.4 s on the first request). Other arches need a build with the
-`HIPFIRE_GPU_ARCHES` build arg.
+Indexed kernel packs for gfx1100, gfx1151 and gfx1201 are baked into the
+default image, so the first run loads packaged kernels instead of compiling
+them. The default tag `qwen3.8:27b-mq4-xts` runs on the default `runtime`
+image on gfx1201 with its DFlash draft (measured on R9700 after the pack gained
+`gemm_mq4g256v2_overwrite_wmma_gfx12{,_vt}`: chat request served, `/health`
+healthy, no hipcc in the image). Other arches need `HIPFIRE_IMAGE_TARGET=full`
+(the image then has hipcc) or a build with the `HIPFIRE_GPU_ARCHES` build arg.
 
 Multi-GPU host: export `HIPFIRE_DEVICES` or `ROCR_VISIBLE_DEVICES` in the shell
 before `docker compose up`; both are passed through to the containers.
@@ -92,8 +93,8 @@ docker compose run --rm --no-deps hipfire doctor --npu
 
 | Target | Contents | Size on disk / download |
 |---|---|---|
-| `full` (default) | ROCm 10.1 runtime plus hipcc, LLVM and HIP headers, so a route without a prebuilt kernel compiles it once | 4.29 GB / 713 MB |
-| `runtime` | ubuntu 26.04, the HIP runtime library closure only (no compiler), daemon, CLI, baked kernels | 781 MB / 192 MB |
+| `runtime` (default) | ubuntu 26.04, the HIP runtime library closure only (no compiler), daemon, CLI, baked indexed kernel packs | 781 MB / 192 MB |
+| `full` | ROCm 10.1 runtime plus hipcc, LLVM and HIP headers, so a route without a packaged kernel compiles it once | 4.29 GB / 713 MB |
 
 Measured with docker 29 on x86-64 (download = compressed layers). The previous
 single image (ROCm 7.2.4 dev base) was 5.44 GB / 1.27 GB.
@@ -103,16 +104,16 @@ Both use ROCm 10.1, the same toolchain that builds the release kernel packs.
 are baked.
 
 ```bash
-docker build -f Containerfile --target full    -t hipfire:full .
 docker build -f Containerfile --target runtime -t hipfire .
-HIPFIRE_IMAGE_TARGET=runtime docker compose up -d --build
+docker build -f Containerfile --target full    -t hipfire:full .
+HIPFIRE_IMAGE_TARGET=full docker compose up -d --build
 docker build -f Containerfile --build-arg HIPFIRE_GPU_ARCHES="gfx1030" --target full -t hipfire:full .
 ```
 
 Without hipcc, a kernel module missing from the baked pack is a hard error, not
-a fallback, so `runtime` only suits models whose routes the packs fully cover
-(measured on R9700: `qwen3.5:0.8b` yes; `qwen3.8:27b-mq4-xts` no, its DFlash
-draft needs `gemm_mq4g256v2_overwrite_wmma_gfx12{,_vt}`).
+a fallback; the default route is measured covered on gfx1201.
+With hipcc (`full`) a module outside the packs compiles into the
+`hipfire-kernels` cache.
 
 Non-root: the entrypoint starts as root only to add the groups that own
 `/dev/kfd`, `/dev/dri` and `/dev/accel`, then drops to user `hipfire`
@@ -195,7 +196,7 @@ sudo docker/hipfire-halo-tune.sh apply
 - **Unhealthy while loading:** the healthcheck allows a 15 minute `start_period`.
   `/health` reports `loading_model` with the tag while a load is in progress.
 - **Packaged kernel missing on the `runtime` image** (`no usable cached kernel
-  image exists, but hipcc is unavailable`): use the default `full` target.
+  image exists, but hipcc is unavailable`): use `HIPFIRE_IMAGE_TARGET=full` so hipcc is available.
 - **NPU not used:** enable `compose.halo.yml`, confirm the memlock limit, and run
   `doctor --npu` as above.
 - **Port in use:** change `HIPFIRE_PORT`.
