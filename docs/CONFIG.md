@@ -134,6 +134,7 @@ differs from the resolved one or carries a reason, for example
 With none, it prints `No per-model overrides (~/.hipfire/models.toml has none).`
 JSON carries `count`, `models` and `overrides[]` (`model`, `key`, `value`,
 `all_models`).
+
 **Precedence (operator view):** one-shot CLI values **>** legacy-compatible
 process env **>** per-model override **>** global TOML **>** registry card
 (`recommended_settings`) **>** built-in defaults. `hipfire config explain`
