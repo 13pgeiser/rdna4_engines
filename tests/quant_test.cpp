@@ -81,6 +81,30 @@ TEST(a_rotated_int4_group_decodes_back_through_the_hadamard) {
     CHECK(eb < ea);
 }
 
+TEST(a_rotated_int8_group_decodes_back_through_the_hadamard) {
+    NEED_LIBQUANT();
+    /* What gemm_nt_q reads at dtype i8a8h: i8 codes with a bf16 scale a (row, 128), each group
+     * rotated by the unnormalised Hadamard and the 1/128 in the stored scale. A scale that kept
+     * the factor, or lost it twice, decodes 128 times off, and a skipped rotation to noise. */
+    const int64_t R = 32, C = 512;
+    const std::vector<float> w = draw(R * C, 2, 30.0f);
+    Opts plain, rot;
+    plain.s("codes", "i8").i("group", 128).s("scale", "bf16");
+    rot.s("codes", "i8").i("group", 128).s("scale", "bf16").s("transform", "fwht128");
+    Quantised a = quantise(quantizer("rtn"), plain, "x", R, C, w);
+    Quantised b = quantise(quantizer("rtn"), rot, "x", R, C, w);
+    REQUIRE_EQ(a.status, RAD_OK);
+    REQUIRE_EQ(b.status, RAD_OK);
+    CHECK_EQ(enc_name(b.enc), std::string("i8*bf16[1x128]/fwht128"));
+    const double ea = rel_err(w, decode(a, R, C)), eb = rel_err(w, decode(b, R, C));
+    std::fprintf(stderr, "    int8 g128: plain %.5f, rotated %.5f\n", ea, eb);
+    /* An int8 grid's error is a few parts in a thousand; with outliers the rotation is again the
+     * better grid. */
+    CHECK(ea < 0.03);
+    CHECK(eb < 0.01);
+    CHECK(eb < ea);
+}
+
 TEST(the_w4nl_table_is_exact_in_e4m3_and_beats_minus_8_to_7_after_the_rotation) {
     NEED_LIBQUANT();
     /* The sixteen levels libr4d's w4nla8h kernel decodes, in its code order, as a container
