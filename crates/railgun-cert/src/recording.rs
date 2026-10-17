@@ -1212,12 +1212,23 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-lane-rows-pm",
         predicates: &[IsRecording, CaptureMode],
-        condition: "Gpu::lane_rows_pm_enabled (lane_rows_pm.rs): HIPFIRE_FN_LANE_PM_ROWS (gfx1151 default on, 0 kills), exact gfx1151, Gpu::lane_rows_scope (set by forward_lanes) and `!is_recording() && !capture_mode`",
+        condition: "Gpu::lane_rows_pm_enabled (lane_rows_pm.rs): HIPFIRE_FN_LANE_PM_ROWS (gfx1151 default on, 0 kills), exact gfx1151, Gpu::lane_rows_scope (set by forward_lanes and the single-GPU Qwen4 MTP verify forward) and `!is_recording() && !capture_mode`",
         effect: KernelSelection,
-        switches: "eager lane step: qwen4_lane_rows_pm (gemv_mq6g256v2_xbatch_pm, its x4 form, gemv_q8_0_k8_xbatch_pm, gemv_q8_0_k320_xbatch_pm) at rows 2..=8; recorded: incumbent rows kernels",
+        switches: "eager lane step and MTP verify: qwen4_lane_rows_pm (gemv_mq6g256v2_xbatch_pm, its x4 form, gemv_q8_0_k8_xbatch_pm, gemv_q8_0_k320_xbatch_pm) at rows 2..=8; recorded: incumbent rows kernels",
         kernels: &["gemm_mq6g256v2_f32_rows", "gemm_mq6g256v2_f32_rows_x4", "gemv_q8_0_k8_rows", "gemv_q8_0_staged_rows"],
         verdict: ByteExact,
         evidence: "rdna-compute examples/lane_rows_pm_oracle on gfx1151 (fn-batch S7 r1-rows): 15 shapes x B=1..8, 225 launches, 0 bad bytes PM vs 1-row incumbent and vs incumbent rows (output allocation and guards)",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-gdn-core-lanes",
+        predicates: &[IsRecording],
+        condition: "gated_delta_core_lanes (tensor_ops.rs): 2..=GDN_CORE_LANES_MAX consecutive one-row GDN Core steps with Q8 states, HIPFIRE_QWEN4_GDN_LANES (exact gfx1151 default on, 0 kills) and `!is_recording()`",
+        effect: KernelSelection,
+        switches: "eager lane step: gdn_lanes (gated_delta_conv_params_bf16_f32_lanes, gated_delta_step_gate_norm128_q8_lanes), one launch per kernel for every lane; recorded: the per-lane incumbent launches",
+        kernels: &["gated_delta_conv_params_bf16_f32", "gated_delta_step_gate_norm128_q8"],
+        verdict: ByteExact,
+        evidence: "fn_lane_oracle on gfx1151 (Flash-Next GPTQ3 MQ4): k = 1/2/8 lanes, every lane step and state checkpoint byte-identical to the singleton forward",
         reaches: &[],
     },
     Decision {
@@ -3038,6 +3049,12 @@ pub const SITES: &[Site] = &[
         function: "gated_delta_chunk_route",
         occurrences: 2,
         decisions: &["qwen4-f16-wmma-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "gated_delta_core_lanes",
+        occurrences: 1,
+        decisions: &["qwen4-gdn-core-lanes"],
     },
     Site {
         file: "rdna-compute/src/tensor_ops.rs",
