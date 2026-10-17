@@ -120,7 +120,8 @@ with HF file:line references.
 - **Registry entry: landed as a local-only row.** Publishing was never a
   prerequisite: `repo: ""` is the registry's local-only shape (`pull` refuses
   with "place \<file\> in \<models dir\>" instead of 404ing), which is how the
-  staged Flash-Next ZAB row already ships. `embeddinggemma-2:q8f16` (default,
+  other local-only rows ship (the Flash-Next trunk tier is no longer a row: it
+  is the default overlay on the stock tags). `embeddinggemma-2:q8f16` (default,
   also the `embeddinggemma-2` alias) and `embeddinggemma-2:mq4v2` declare their
   `<trunk>.vl` pack in the `vision` slot with the real digests, and
   `scripts/registry_gen.py` gained the arch-18 family mapping. Verified end to

@@ -435,6 +435,131 @@ pub fn grandfathered_monolithic_in<'a>(
     })
 }
 
+/// A model the registry no longer publishes but this client still runs from a
+/// verified local copy.
+///
+/// The pin is the retired entry's exact artifact identity (repo, file, SHA-256,
+/// size) plus the card fields a load needs ([`RetiredModel::entry`]), compiled
+/// into the client like [`GrandfatheredMonolithic`]. `hipfire pull` refuses a
+/// retired tag and no resolver downloads one; a local file serves the tag, its
+/// file name, or its installed path only after its bytes verify against
+/// `sha256` / `size_bytes`. The Hugging Face files stay published for older
+/// clients; this client never fetches them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RetiredModel {
+    /// The retired registry tag.
+    pub tag: &'static str,
+    /// Hugging Face repo that still hosts the file.
+    pub repo: &'static str,
+    /// Artifact file name in the models directory.
+    pub file: &'static str,
+    /// SHA-256 of the artifact.
+    pub sha256: &'static str,
+    /// Size in bytes of the artifact.
+    pub size_bytes: u64,
+    pub size_gb: f64,
+    pub min_vram_gb: f64,
+    pub desc: &'static str,
+    pub arch_id: u32,
+    pub quant: &'static str,
+    /// Tag a user moves to.
+    pub replacement: &'static str,
+}
+
+impl RetiredModel {
+    /// The registry card the retired entry carried, so a verified local copy
+    /// loads with the same identity, sampling defaults and sidecar pins (the
+    /// sha256/size keyed [`TRUNK_OVERLAY_PINS`] and [`EXPERT_HOTSET_PINS`]) it
+    /// had while published. It declares no sidecar slots.
+    pub fn entry(&self) -> ModelEntry {
+        ModelEntry {
+            repo: self.repo.to_owned(),
+            file: self.file.to_owned(),
+            size_gb: self.size_gb,
+            min_vram_gb: self.min_vram_gb,
+            desc: self.desc.to_owned(),
+            recommended_settings: Some(RecommendedSettings {
+                temperature: Some(1.0),
+                top_p: Some(0.95),
+                top_k: Some(20),
+                ..RecommendedSettings::default()
+            }),
+            sha256: Some(self.sha256.to_owned()),
+            size_bytes: Some(self.size_bytes),
+            arch_id: Some(self.arch_id),
+            quant: Some(self.quant.to_owned()),
+            ..ModelEntry::default()
+        }
+    }
+
+    /// [`RetiredModel::entry`] without rebuilding it per query: the compiled
+    /// pins' cards are built once and borrowed. A pin that is not exactly one
+    /// of [`RETIRED_MODELS`] (a test fixture) gets an owned card.
+    pub fn card(&self) -> std::borrow::Cow<'static, ModelEntry> {
+        static CARDS: std::sync::LazyLock<Vec<ModelEntry>> =
+            std::sync::LazyLock::new(|| RETIRED_MODELS.iter().map(RetiredModel::entry).collect());
+        match RETIRED_MODELS.iter().position(|pin| pin == self) {
+            Some(index) => std::borrow::Cow::Borrowed(&CARDS[index]),
+            None => std::borrow::Cow::Owned(self.entry()),
+        }
+    }
+
+    /// The one-line refusal `hipfire pull` prints for this tag.
+    pub fn refusal(&self) -> String {
+        format!(
+            "{} is retired; the file still runs if you have it; replacement {}",
+            self.tag, self.replacement
+        )
+    }
+}
+
+/// Models the compiled client keeps running from a verified local copy after
+/// the registry dropped them.
+pub const RETIRED_MODELS: &[RetiredModel] = &[
+    // 2026-09-28 to 2026-10-02: RTN asymmetric experts, MQ6G256V2 language head.
+    RetiredModel {
+        tag: "qwen3.8:flash-next-rtn-asym",
+        repo: FLASH_NEXT_XTS_REPO,
+        file: "qwen3.8-flash-next.mq4",
+        sha256: "8aa01cf41bf2a90b319b9a1c70837baf51a2f92811af551f59b59d418518f650",
+        size_bytes: 125_288_540_696,
+        size_gb: 125.3,
+        min_vram_gb: 128.0,
+        desc: "Qwen3.8-Flash-Next / Qwen4 HFQM (arch 16), retired RTN-asymmetric MQ4 rung \
+               (2026-09-28 to 2026-10-02): MQ6G256V2 trunk and language head, MQ4 routed \
+               experts, Q8F16 PLE rows embedded. Replaced by qwen3.8:flash-next.",
+        arch_id: 16,
+        quant: "mq4",
+        replacement: "qwen3.8:flash-next",
+    },
+    // 2026-09-22 to 2026-09-28: the same rung with a Q8F16 language head.
+    RetiredModel {
+        tag: "qwen3.8:flash-next-mq6q8-pleq8",
+        repo: FLASH_NEXT_XTS_REPO,
+        file: "qwen3.8-flash-next.mq6q8-pleq8",
+        sha256: "c0628b848077f02afed9ce5a4daa0598c379aa1d1e5ca0c0b24ddd04b49773a9",
+        size_bytes: 125_467_331_096,
+        size_gb: 125.5,
+        min_vram_gb: 128.0,
+        desc: "Qwen3.8-Flash-Next / Qwen4 HFQM (arch 16), retired MQ6/Q8 rung (2026-09-22 to \
+               2026-09-28): MQ6G256V2 trunk, Q8F16 language head, MQ4 routed experts, Q8F16 PLE \
+               rows embedded. Replaced by qwen3.8:flash-next.",
+        arch_id: 16,
+        quant: "mq6q8-pleq8",
+        replacement: "qwen3.8:flash-next",
+    },
+];
+
+/// The pin in `pins` named by `input`: its exact tag or its bare file name. A
+/// path never matches (callers compare canonical installed paths instead).
+pub fn retired_model_named<'a>(input: &str, pins: &'a [RetiredModel]) -> Option<&'a RetiredModel> {
+    if input.contains('/') || input.contains('\\') {
+        return None;
+    }
+    pins.iter()
+        .find(|pin| input == pin.tag || input == pin.file)
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SamplingDefaults {
@@ -880,6 +1005,7 @@ impl RegistryV1 {
             })?;
         registry.validate(&source_name)?;
         registry.normalize_flash_next_xts();
+        registry.strip_retired(RETIRED_MODELS);
         // An alias is non-authoritative convenience data. Match v1 behavior by
         // dropping dangling redirects instead of rejecting an otherwise valid
         // registry.
@@ -887,6 +1013,16 @@ impl RegistryV1 {
             .aliases
             .retain(|_, target| registry.models.contains_key(target));
         Ok(registry)
+    }
+
+    /// Drop the retired tags in `pins` from the available catalog, whatever
+    /// delivered them (an older remote payload, a cache written before the
+    /// retirement). The compiled pins, not the delivered entries, define a
+    /// retired model; the stripped tag stays runnable from a verified local
+    /// copy through [`RETIRED_MODELS`] but is never offered or pulled.
+    pub fn strip_retired(&mut self, pins: &[RetiredModel]) {
+        self.models
+            .retain(|tag, _| !pins.iter().any(|pin| pin.tag == tag));
     }
 
     fn normalize_flash_next_xts(&mut self) {
@@ -1415,6 +1551,7 @@ fn read_cache(path: &Path, url: &str, warnings: &mut Vec<String>) -> Option<Regi
         return None;
     }
     cache.registry.normalize_flash_next_xts();
+    cache.registry.strip_retired(RETIRED_MODELS);
     cache
         .registry
         .aliases
@@ -1666,58 +1803,17 @@ mod tests {
                 );
             }
         }
-        assert_eq!(
-            parsed.models["qwen3.8:flash-next-rtn-asym"].file,
-            "qwen3.8-flash-next.mq4"
-        );
-    }
-
-    #[test]
-    fn flash_next_zab_named_tier_preserves_stock_aliases() {
-        let wire: RegistryV1 = serde_json::from_str(BUNDLED_REGISTRY).unwrap();
-        let curated: serde_json::Value =
-            serde_json::from_str(include_str!("../../../registry/models.json")).unwrap();
-        let tag = "qwen3.8:flash-next-mq4-xts-zab";
-        let zab = &wire.models[tag];
-        assert!(zab.repo.is_empty(), "staged artifact must not be pullable");
-        assert_eq!(zab.file, "qwen3.8-flash-next.mq4-xts-zab");
-        assert_eq!(zab.arch_id, Some(16));
-        assert_eq!(zab.quant.as_deref(), Some("mq4"));
-        assert_eq!(
-            zab.sha256.as_deref(),
-            Some("a85a00d192ee7a352d5d1f55f0421691a2553fe90f05d9ae1d7e59fec5b686fa")
-        );
-        assert_eq!(zab.size_bytes, Some(125144775192));
-        let curated_zab: ModelEntry =
-            serde_json::from_value(curated["models"][tag].clone()).unwrap();
-        assert_eq!(zab.sha256, curated_zab.sha256);
-        assert_eq!(zab.size_bytes, curated_zab.size_bytes);
-        assert!(!zab.is_flash_next_xts());
-        assert!(zab.desc.contains("LOCAL-ONLY"));
-        assert!(zab.desc.contains("108 GDN"));
-        assert!(zab.desc.contains("symmetric QT44"));
-        assert!(zab.desc.contains("non-zab bytes unchanged"));
-        assert!(zab.desc.contains("qwen4_trunk_iu4_default=gfx1151-zab-v1"));
-        assert!(zab.desc.contains("HIPFIRE_QWEN4_TRUNK_IU4=0"));
-        assert!(zab.desc.contains("NOT uploaded/pullable"));
-        let settings = zab.recommended_settings.as_ref().unwrap();
-        assert_eq!(settings.temperature, Some(1.0));
-        assert_eq!(settings.top_p, Some(0.95));
-        assert_eq!(settings.top_k, Some(20));
-        assert_eq!(
-            serde_json::to_value(&wire.aliases).unwrap(),
-            curated["aliases"]
-        );
-        assert_eq!(wire.aliases["qwen3.8:flash"], "qwen3.8:flash-next");
-        assert!(!wire.aliases.values().any(|target| target == tag));
-        let stock = stock_split_base_entry();
-        for tag in FLASH_NEXT_FIXTURE_TAGS {
-            let entry = &wire.models[tag];
-            assert_eq!(entry.repo, FLASH_NEXT_XTS_REPO);
-            assert_eq!(entry.sha256, stock.sha256);
-            assert_eq!(entry.size_bytes, stock.size_bytes);
-            assert_eq!(entry.file, FLASH_NEXT_XTS_SPLIT_BASE_FILE);
-            assert_eq!(entry.recommended_settings, zab.recommended_settings);
+        for pin in RETIRED_MODELS {
+            assert!(
+                !parsed.models.contains_key(pin.tag),
+                "{}: a retired tag is not in the available catalog",
+                pin.tag
+            );
+            assert!(
+                !parsed.models.values().any(|entry| entry.file == pin.file),
+                "{}: no available entry names the retired file",
+                pin.tag
+            );
         }
     }
 
@@ -1812,12 +1908,9 @@ mod tests {
         let mut expected = FLASH_NEXT_FIXTURE_TAGS.to_vec();
         expected.sort_unstable();
         assert_eq!(resolved, expected);
-        assert!(parsed.models["qwen3.8:flash-next-rtn-asym"]
-            .trunk_overlay()
-            .is_none());
-        assert!(parsed.models["qwen3.8:flash-next-mq4-xts-zab"]
-            .trunk_overlay()
-            .is_none());
+        for pin in RETIRED_MODELS {
+            assert!(pin.entry().trunk_overlay().is_none(), "{}", pin.tag);
+        }
         let first = parsed.models["qwen3.8:flash-next"].trunk_overlay().unwrap();
         for tag in FLASH_NEXT_FIXTURE_TAGS {
             assert_eq!(
@@ -1975,12 +2068,9 @@ mod tests {
         let mut expected = FLASH_NEXT_FIXTURE_TAGS.to_vec();
         expected.sort_unstable();
         assert_eq!(resolved, expected);
-        assert!(parsed.models["qwen3.8:flash-next-rtn-asym"]
-            .expert_hotset()
-            .is_none());
-        assert!(parsed.models["qwen3.8:flash-next-mq4-xts-zab"]
-            .expert_hotset()
-            .is_none());
+        for pin in RETIRED_MODELS {
+            assert!(pin.entry().expert_hotset().is_none(), "{}", pin.tag);
+        }
         let first = parsed.models["qwen3.8:flash-next"].expert_hotset().unwrap();
         for tag in FLASH_NEXT_FIXTURE_TAGS {
             assert_eq!(
@@ -2798,6 +2888,211 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("newer")));
+    }
+
+    #[test]
+    fn retired_pins_are_the_dropped_flash_next_artifacts_with_their_original_identity() {
+        let tags: Vec<&str> = RETIRED_MODELS.iter().map(|pin| pin.tag).collect();
+        assert_eq!(
+            tags,
+            [
+                "qwen3.8:flash-next-rtn-asym",
+                "qwen3.8:flash-next-mq6q8-pleq8"
+            ]
+        );
+        let rtn = &RETIRED_MODELS[0];
+        assert_eq!(rtn.file, "qwen3.8-flash-next.mq4");
+        assert_eq!(rtn.size_bytes, 125_288_540_696);
+        assert_eq!(
+            rtn.sha256,
+            "8aa01cf41bf2a90b319b9a1c70837baf51a2f92811af551f59b59d418518f650"
+        );
+        let pleq8 = &RETIRED_MODELS[1];
+        assert_eq!(pleq8.file, "qwen3.8-flash-next.mq6q8-pleq8");
+        assert_eq!(pleq8.size_bytes, 125_467_331_096);
+        assert_eq!(
+            pleq8.sha256,
+            "c0628b848077f02afed9ce5a4daa0598c379aa1d1e5ca0c0b24ddd04b49773a9"
+        );
+        for pin in RETIRED_MODELS {
+            assert_eq!(pin.repo, FLASH_NEXT_XTS_REPO, "{}", pin.tag);
+            assert_eq!(pin.replacement, "qwen3.8:flash-next", "{}", pin.tag);
+            let entry = pin.entry();
+            assert_eq!(entry.file, pin.file);
+            assert_eq!(entry.sha256.as_deref(), Some(pin.sha256));
+            assert_eq!(entry.size_bytes, Some(pin.size_bytes));
+            assert_eq!(entry.arch_id, Some(16));
+            assert!(!entry.has_ple_sidecars());
+            assert!(!entry.is_flash_next_xts(), "{}", pin.tag);
+            assert!(entry.grandfathered_monolithic().is_none());
+            // The card lowers to the same sampling defaults it published.
+            config_layer_for_tag(pin.tag, &entry).unwrap();
+            let settings = entry.recommended_settings.as_ref().unwrap();
+            assert_eq!(settings.temperature, Some(1.0));
+            assert_eq!(settings.top_p, Some(0.95));
+            assert_eq!(settings.top_k, Some(20));
+            // No two pins share a tag or a file, and none collides with the
+            // grandfathered monolithic spellings.
+            assert_eq!(
+                RETIRED_MODELS
+                    .iter()
+                    .filter(|other| other.tag == pin.tag || other.file == pin.file)
+                    .count(),
+                1
+            );
+            assert_ne!(pin.file, FLASH_NEXT_XTS_CANONICAL_FILE);
+            assert_ne!(pin.file, FLASH_NEXT_XTS_LEGACY_FILE);
+            assert_ne!(pin.sha256, FLASH_NEXT_XTS_SHA256);
+        }
+    }
+
+    #[test]
+    fn retired_refusal_is_one_line_naming_the_replacement() {
+        for pin in RETIRED_MODELS {
+            let message = pin.refusal();
+            assert!(!message.contains('\n'));
+            assert_eq!(
+                message,
+                format!(
+                    "{} is retired; the file still runs if you have it; replacement \
+                     qwen3.8:flash-next",
+                    pin.tag
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn retired_cards_are_cached_for_compiled_pins_and_owned_for_any_other_identity() {
+        for pin in RETIRED_MODELS {
+            let card = pin.card();
+            assert!(matches!(card, std::borrow::Cow::Borrowed(_)), "{}", pin.tag);
+            assert_eq!(*card, pin.entry());
+            // Every query borrows the same cached card.
+            let again = pin.card();
+            assert!(std::ptr::eq(&*card, &*again));
+        }
+        // A fixture with a different digest is not a compiled identity: it gets
+        // its own card, never another pin's.
+        let fixture = RetiredModel {
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            size_bytes: 7,
+            ..RETIRED_MODELS[0]
+        };
+        let card = fixture.card();
+        assert!(matches!(card, std::borrow::Cow::Owned(_)));
+        assert_eq!(card.size_bytes, Some(7));
+        assert_eq!(card.sha256.as_deref(), Some(fixture.sha256));
+    }
+
+    #[test]
+    fn retired_model_named_matches_a_tag_or_bare_file_but_never_a_path() {
+        let rtn = &RETIRED_MODELS[0];
+        assert_eq!(retired_model_named(rtn.tag, RETIRED_MODELS), Some(rtn));
+        assert_eq!(retired_model_named(rtn.file, RETIRED_MODELS), Some(rtn));
+        for lookalike in [
+            format!("./{}", rtn.file),
+            format!("/tmp/{}", rtn.file),
+            format!("models\\{}", rtn.file),
+            format!("{}x", rtn.file),
+            "qwen3.8:flash-next".to_owned(),
+            "qwen3.8:flash-next-mq4".to_owned(),
+            FLASH_NEXT_XTS_CANONICAL_FILE.to_owned(),
+            FLASH_NEXT_XTS_LEGACY_FILE.to_owned(),
+        ] {
+            assert!(
+                retired_model_named(&lookalike, RETIRED_MODELS).is_none(),
+                "{lookalike}"
+            );
+        }
+        assert!(retired_model_named(rtn.tag, &[]).is_none());
+    }
+
+    #[test]
+    fn retired_files_stay_listable_though_the_catalog_no_longer_names_them() {
+        let registry = bundled().unwrap();
+        for pin in RETIRED_MODELS {
+            assert!(
+                names_registry_model(pin.file, &registry, GRANDFATHERED_MONOLITHICS),
+                "{}",
+                pin.file
+            );
+            assert!(is_listable_model_file(
+                pin.file,
+                &registry,
+                GRANDFATHERED_MONOLITHICS
+            ));
+        }
+        // Sidecars of a retired file are still never listed as models.
+        assert!(!is_listable_model_file(
+            "qwen3.8-flash-next.mq6q8-pleq8.ple-q4",
+            &registry,
+            GRANDFATHERED_MONOLITHICS
+        ));
+    }
+
+    #[test]
+    fn retired_tags_are_stripped_from_every_delivered_catalog_view() {
+        let mut wire = flash_next_wire_registry("2099-01-01T00:00:00Z");
+        for pin in RETIRED_MODELS {
+            wire.models.insert(pin.tag.to_owned(), pin.entry());
+            wire.aliases
+                .insert(format!("{}-alias", pin.tag), pin.tag.to_owned());
+        }
+        // A strict parse of an older payload that still carries the retired
+        // entries drops them (and the aliases that pointed at them).
+        let parsed = RegistryV1::parse(&serde_json::to_string(&wire).unwrap(), "old remote")
+            .unwrap();
+        for pin in RETIRED_MODELS {
+            assert!(parsed.model(pin.tag).is_none(), "{}", pin.tag);
+            assert!(parsed.model(pin.file).is_none(), "{}", pin.file);
+            assert!(
+                !parsed.aliases.contains_key(&format!("{}-alias", pin.tag)),
+                "{}",
+                pin.tag
+            );
+        }
+        assert_flash_next_xts(&parsed, &FLASH_NEXT_FIXTURE_TAGS);
+
+        let dir = RegistryTestDir::new();
+        let paths = RegistryPaths {
+            cache: dir.0.join("registry.cache.json"),
+        };
+        let (url, server) = serve_registry_once(&wire);
+        let remote = load_with_options(&paths, Some(&url));
+        server.join().unwrap();
+        assert_eq!(remote.source, RegistrySource::Network);
+        for pin in RETIRED_MODELS {
+            assert!(!remote.registry.models.contains_key(pin.tag), "network");
+        }
+        // A cache written before the retirement still carries the tags.
+        let legacy_cache = RegistryCache {
+            fetched_at: epoch_millis(),
+            url: url.clone(),
+            registry: wire.clone(),
+        };
+        write_cache(&paths.cache, &legacy_cache).unwrap();
+        let cached = load_with_options(&paths, Some(&url));
+        assert_eq!(cached.source, RegistrySource::Cache);
+        let mut stale = legacy_cache;
+        stale.fetched_at = 0;
+        write_cache(&paths.cache, &stale).unwrap();
+        let stale_loaded = load_with_options(&paths, Some(&url));
+        assert_eq!(stale_loaded.source, RegistrySource::StaleCache);
+        for loaded in [&cached, &stale_loaded] {
+            for pin in RETIRED_MODELS {
+                assert!(
+                    !loaded.registry.models.contains_key(pin.tag),
+                    "{:?}",
+                    loaded.source
+                );
+            }
+        }
+        // The bundled offline floor never lists them either.
+        let bundled = bundled().unwrap();
+        for pin in RETIRED_MODELS {
+            assert!(!bundled.models.contains_key(pin.tag));
+        }
     }
 
     #[test]

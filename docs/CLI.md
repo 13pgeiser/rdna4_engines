@@ -41,6 +41,36 @@ This does not download or copy the payload. Conflicting canonical files fail
 clearly; the historical RTN `.mq4` artifact is never migrated. See
 [MODELS.md](MODELS.md#qwen-38-flash-next-mq4-xts) for the compatibility window.
 
+### Retired Flash-Next tags
+
+`qwen3.8:flash-next-rtn-asym` (`qwen3.8-flash-next.mq4`) and
+`qwen3.8:flash-next-mq6q8-pleq8` (`qwen3.8-flash-next.mq6q8-pleq8`) are
+retired. `hipfire pull` refuses either tag or bare filename before auth/network,
+including an already installed copy and `--force`, with this one-line error:
+`<tag> is retired; the file still runs if you have it; replacement qwen3.8:flash-next`.
+
+`hipfire run` and `hipfire serve` accept the old tag, bare filename or installed
+model path after SHA-256 and size verification, without redownloading it. A
+copy elsewhere loaded by explicit path remains a plain-file load, not a
+name-based retired identity. A missing retired file errors instead of pulling
+(serve: HTTP 404). `hipfire list` marks installed models `[retired]` (JSON:
+`"retired": true`); the available catalog (including `list --remote`) omits them.
+
+Compiled `RETIRED_MODELS` pins preserve the original repo/file/SHA-256/size;
+neither artifact had sidecar, overlay or hotset pins. Verification reuses
+`<HIPFIRE_HOME>/cache/verified-artifacts.json` (`VerifiedCache`). This does not
+create new overlay/hotset identities or delete or alter any Hugging Face file.
+Both entries are removed from the raw remote registry and new bundled/loaded
+available views, without adding retirement wire fields. Code inspection shows
+that 0.4.2 rejects the generic `ple` schema and falls back to cache or bundle;
+this is not an exercised old-binary test. Monolithic Hugging Face files must
+stay published while 0.4.2 clients exist: their bundles still reference them.
+The obsolete local-only `qwen3.8:flash-next-mq4-xts-zab` entry is removed
+outright from the registry with no retired pin; its trunk tier ships as the
+default overlay on the stock tags. The split `flash-next` / `-mq4` / `-gptq3` /
+`-mq4-xts` aliases, MQ2/MQ3 tiers and overlay pins are unchanged.
+
+
 ### Flash-Next split PLE layout
 
 A split registry entry (`file` = `<name>-base.<ext>`, e.g.
@@ -122,8 +152,8 @@ weights and `=1` applies the overlay on any architecture.
   overlay with the other sidecars; a valid file already on disk is not
   downloaded again, a stale one is refreshed. As for other sidecars, a failed
   overlay download prints a warning and the pull still succeeds (the base loads
-  unchanged). Any other registry entry (e.g. the RTN-asym file or the local-only
-  zab tier) has no overlay.
+  unchanged). Any other registry entry (e.g. the RTN-asym file) has no
+  overlay.
 - **`rm` and listings.** `rm <tag>` removes the overlay with the base
   (`<file>.trunk-overlay`). `*.trunk-overlay` files are sidecars: never listed
   or served as models.
@@ -149,7 +179,7 @@ published registry.
   the pinned base identity; a valid file already on disk is not downloaded again,
   a stale one is refreshed. As for other sidecars, a failed hotset download
   prints a warning and the pull still succeeds. Any other registry entry (e.g.
-  the RTN-asym file or the local-only zab tier) has no hotset.
+  the RTN-asym file) has no hotset.
 - **Runtime.** The hotset applies by default on a single R9700 (gfx1201) when
   the sidecar is present and bound to the base by size and index SHA-256.
 - **`rm` and listings.** `rm <tag>` removes the hotset with the base

@@ -148,22 +148,51 @@ it. `hipfire pull <tag> --force` pulls the split base instead, and
 The four tag names are unchanged, and the registry no longer references the
 monolithic files. v0.4.2.1 clients reject a registry that names the shared
 sidecar pair and fall back to their cached or bundled registry, which still
-points at the monolithic files. The monolithic Hugging Face objects stay in
-place until they are removed, as the last step, after the master registry has
-stopped referencing them.
+points at the monolithic files. No Hugging Face files are deleted or altered
+by the tag retirement below.
 The historical RTN-asymmetric `qwen3.8-flash-next.mq4`
 (`qwen3.8:flash-next-rtn-asym`) is a different artifact and is never migrated.
 Fixture identity and recipe history: [`AGENTS.md`](../AGENTS.md#pinned-flash-next-bench-fixture).
 
 **Known limit: host RAM on a 16 GB card.** Measured sizing finding: an RX 9070 XT (16 GB) host with 64 GB RAM (TTM cap 31 GiB) cannot load Qwen3.8 Flash-Next, whose 38–61 GB of host-mapped routed experts exceed that cap. Flash-Next on a 16 GB card needs at least 128 GB of host RAM. (Details and the `HIPFIRE_EMU=rx9070xt` capacity profile: [`EMU.md`](EMU.md#measured-sizing-finding-flash-next-on-a-16-gb-card).)
 
-Other Flash-Next registry entries, retained for provenance and not the default:
+Other Flash-Next identities, retained for provenance and not the default:
 
 | Tag | File | Size GB | Min VRAM | Notes |
 |---|---|---:|---:|---|
-| `qwen3.8:flash-next-mq4-xts-zab` | `qwen3.8-flash-next.mq4-xts-zab` | 125.1 | 128 | **Local-only** (empty `repo`): not uploaded, not pullable |
-| `qwen3.8:flash-next-rtn-asym` | `qwen3.8-flash-next.mq4` | 125.3 | 128 | Previous canonical rung (RTN-asymmetric experts), superseded by MQ4 XTS |
-| `qwen3.8:flash-next-mq6q8-pleq8` | `qwen3.8-flash-next.mq6q8-pleq8` | 125.5 | 128 | Earlier canonical rung, superseded |
+| `qwen3.8:flash-next-rtn-asym` | `qwen3.8-flash-next.mq4` | 125.3 | 128 | **Retired**; previous RTN-asymmetric rung; existing verified local file still supported |
+| `qwen3.8:flash-next-mq6q8-pleq8` | `qwen3.8-flash-next.mq6q8-pleq8` | 125.5 | 128 | **Retired**; earlier rung; existing verified local file still supported |
+
+Only the two tags marked **Retired** are retired. New clients refuse
+`hipfire pull <retired-tag>` and name `qwen3.8:flash-next` as the replacement;
+this also applies when the old file is already installed or `--force` is used.
+`run` and `serve` accept the old tag, bare filename or installed model path
+after SHA-256 and size verification, without redownloading it. An explicit
+path to a copy elsewhere remains a plain-file load, not a name-based retired
+identity. A missing retired file produces a clear error, never an automatic
+download. Local `hipfire list` marks installed models `[retired]` (JSON:
+`"retired": true`); the new client's bundled and loaded available views
+exclude them.
+
+A compiled `RETIRED_MODELS` table preserves the repository, filename, SHA-256
+and size independently of the available catalog. Neither retired artifact had
+sidecar, overlay or hotset pins; none are invented. Local
+verification reuses the existing `VerifiedCache` in
+`<HIPFIRE_HOME>/cache/verified-artifacts.json`; unchanged verified files avoid
+another full hash. Retirement does not invent overlay or hotset identities
+where none existed, migrate the old bytes, or delete or alter any Hugging Face
+object.
+
+Both retired entries are removed from the raw remote registry as well as the
+new client's bundled/loaded available view; no retirement wire fields are
+added. Source inspection shows that 0.4.2 rejects the new generic `ple` schema
+and falls back to its cache or bundle, not that it accepts the current wire
+registry. This is code-derived behavior, not an exercised old-binary test.
+The monolithic Hugging Face files **must stay published while 0.4.2 clients
+exist**, because their bundled entries still point to them. The split-base
+MQ4 aliases and the MQ2/MQ3 tiers above are unchanged. The obsolete local-only
+`qwen3.8:flash-next-mq4-xts-zab` entry is removed outright with no retired pin;
+the overlay pins and the `gfx1151-zab-v1` default stay as they are.
 
 **Split bases and the shared PLE pair.** The Flash-Next MQ4 XTS base
 (`qwen3.8-flash-next-base.mq4-xts`, 70.9 GB, the four MQ4 tags above) and the
@@ -261,7 +290,7 @@ MTP-head **loading** is registry-driven too. Every Qwen3.8-27B trunk tier above 
 
 Flash-Next trunk-overlay **loading** is pinned in the client, not declared in the registry. The four stock Flash-Next MQ4 XTS tags (`qwen3.8:flash-next`, `-mq4`, `-gptq3`, `-mq4-xts`) resolve to the split base (sha256 `eafaff94…`, 70888270360 B), and the client carries a compiled-in pin for it naming the re-bound overlay `qwen3.8-flash-next-base.mq4-xts.trunk-overlay` (305543168 B, sha256 `e3e352ca…`, always the base file name plus `.trunk-overlay`) in `hipfire-models/qwen3.8-flash-next`. Its payload is identical to the pre-split overlay; only the base binding changed. `hipfire pull <tag>` fetches it next to the base. The client also keeps the pre-split pin, bound to the monolithic file (sha256 `8b15b6fe…`, 125288544792 B): `qwen3.8-flash-next.mq4-xts.trunk-overlay` (sha256 `df49bc0a…`), installed beside a grandfathered monolithic install instead. There is no registry schema change: older clients keep parsing the published `registry/v1.json`. It is the zab tier as an overlay: an HFQM container with the 108 GDN `in_proj_{z,a,b}` projections encoded as symmetric QT44, bound to the base by file size and index SHA-256, that the Qwen4 loader substitutes for the base's MQ6 tensors and then arms the `gfx1151-zab-v1` A4 trunk route. The bytes are the ones the developer map `HIPFIRE_QWEN4_REQUANT="...=qt44:<dir>"` applies.
 - `HIPFIRE_QWEN4_TRUNK_OVERLAY` unset or `auto` applies the overlay only on gfx1151 (the exact architecture of the `gfx1151-zab-v1` trunk default); `0` never applies it (kill switch, the stock base weights load); `1` applies it on any architecture (the A4 route itself still arms by default only on gfx1151; elsewhere `HIPFIRE_QWEN4_TRUNK_IU4` must select it); any other value is a load error.
-- `hipfire rm` removes the overlay with its base; the local-only `qwen3.8:flash-next-mq4-xts-zab` tier is the same bytes baked into one file and declares no overlay.
+- `hipfire rm` removes the overlay with its base. The obsolete local-only `qwen3.8:flash-next-mq4-xts-zab` baked tier is removed from the registry (no retired pin); the overlay on the stock tags supersedes it.
 
 Flash-Next expert-hotset **fetching** is likewise pinned in the client, not declared in the registry. The same four stock tags resolve through the split base identity (sha256 `eafaff94…`, 70888270360 B) to the re-bound `qwen3.8-flash-next-base.mq4-xts.expert-hotset` (217675 B, ~213 KiB, sha256 `91143074…`, always the base file name plus `.expert-hotset`) in `hipfire-models/qwen3.8-flash-next`. The pre-split pin, bound to the monolithic file (sha256 `8b15b6fe…`, 125288544792 B; `qwen3.8-flash-next.mq4-xts.expert-hotset`, 217676 B, sha256 `7f6760e1…`), is kept for grandfathered monolithic installs. `hipfire pull <tag>` selects it by default; the interactive `hipfire pull` prompt offers it as an independent default-on yes/no **Expert hot set (R9700 decode, 213 KB)** choice (the "213 KB" is the rounded display label; the file is about 217.7 KB), shown in the summary only when selected; `--yes` and the TUI's Models-tab pull keep the default. It is verified by SHA-256 and stored at the sidecar path of the local base file, which may be a renamed local file that matches a pinned base identity. `registry/v1.json` is unchanged. At runtime it applies by default on a single R9700 (gfx1201) when present and bound to the base by size and index SHA-256. `hipfire rm` removes it with its base, and `*.expert-hotset` files are sidecars, never listed or served as models. See [`CLI.md`](CLI.md#flash-next-expert-hotset).
 

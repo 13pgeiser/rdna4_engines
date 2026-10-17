@@ -755,10 +755,11 @@ hot set `qwen3.8-flash-next-base.mq4-xts.expert-hotset` (sha256 `91143074…`);
 the monolith-bound overlay (`df49bc0a…`) and hot set (`7f6760e1…`) serve
 grandfathered monolithic installs.
 
-HF removal plan: the monolithic HF objects (`qwen3.8-flash-next.mq4-xts`,
-`qwen3.8-flash-next-gptq3.mq4`) are removed last, only on explicit approval,
-and only after the master registry stops referencing them. Until then the old
-objects stay in place. The monolith-bound overlay, hot set,
+HF preservation policy: the monolithic HF objects (`qwen3.8-flash-next.mq4-xts`,
+`qwen3.8-flash-next-gptq3.mq4` and the two retired artifacts below) must stay
+published while 0.4.2 clients exist, because their bundles reference them.
+Removing current registry entries is not permission to delete those objects.
+The monolith-bound overlay, hot set,
 `kld/qwen3.8-flash-next.mq4-xts.plehot` and the shared q4 stay on HF. This is
 packaging, not a recipe change.
 
@@ -786,6 +787,28 @@ same qt=54 re-tag, `58fb4f586403000b3394413c38f58b0ec0d8845675f81c3d3c0b5de2cdaa
 before it); it differs from the RTN-asymmetric pin only in its Q8F16 head.
 Caveats and measurements below without a date were taken on that pin unless
 they say otherwise.
+
+These two historical tags (`qwen3.8:flash-next-rtn-asym` and
+`qwen3.8:flash-next-mq6q8-pleq8`) are retired, not deleted fixtures.
+New `hipfire pull` requests refuse them and name `qwen3.8:flash-next` as the
+replacement. Existing SHA-256- and size-verified installed files remain
+supported by old tag, bare filename or installed path in `run`/`serve`, without
+redownload; missing files error rather than auto-download. Explicit paths to
+copies elsewhere remain ordinary plain-file loads. Local `list` marks installed
+models retired; the new available view excludes them. Compiled `RETIRED_MODELS`
+pins retain repo/file/SHA-256/size, reusing `VerifiedCache` rather than rehashing
+unchanged files. Neither artifact had sidecar, overlay or hotset pins.
+No overlay/hotset pins are invented, and no Hugging Face files are deleted or
+altered by retirement. Both retired entries are removed from the raw remote
+registry and new bundled/loaded available views, without new wire fields.
+Code inspection shows 0.4.2 rejects the generic `ple` schema and falls back
+to cache or bundle; this is not an exercised old-binary test. Monolithic HF
+files **must stay published while 0.4.2 clients exist**, because their bundled
+entries still reference them.
+The obsolete local-only `qwen3.8:flash-next-mq4-xts-zab` entry is removed
+outright from the registry with no retired pin (its trunk tier ships as the
+default overlay on the stock tags); the canonical split-base aliases, MQ2/MQ3
+fixture rows and all overlay pins are unchanged.
 
 Caveats that are part of the fixture, not trivia:
 

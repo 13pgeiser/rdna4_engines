@@ -2904,13 +2904,13 @@ mod render_tests {
             downloaded,
             has_mtp,
         };
-        app.active_model = "qwen3.8:flash-next-mq4-xts-zab".into();
+        app.active_model = "qwen3.8:local-fixture-long-tag".into();
         app.registry.models = vec![
             row("alpha:a", false, false),
             row("alpha:b", false, false),
             row("beta:a", false, false),
             row("beta:b", false, false),
-            row("qwen3.8:flash-next-mq4-xts-zab", true, true),
+            row("qwen3.8:local-fixture-long-tag", true, true),
             row("qwen3.8:flash-next-mq3-xts", false, false),
         ];
         // The `.ple-q4` row file is on disk but is a sidecar, never a Models row.
@@ -2963,7 +2963,7 @@ mod render_tests {
     fn models_tab_wide_screen_shows_long_tag_and_separate_active_marker() {
         let text = render_models(160, 48);
         assert!(
-            text.contains("* qwen3.8:flash-next-mq4-xts-zab"),
+            text.contains("* qwen3.8:local-fixture-long-tag"),
             "the long tag is fully visible with the active marker beside it"
         );
         assert!(

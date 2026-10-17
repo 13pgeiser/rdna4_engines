@@ -291,10 +291,8 @@ pub(crate) struct ModelScope {
 
 impl ModelScope {
     pub(crate) fn load(paths: &Paths, registry: &RegistryV1, model: &str) -> Result<Self> {
-        let (tag, entry) = registry
-            .model(model)
-            .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
-            .unwrap_or((None, None));
+        let card = crate::model_card_by_name(registry, model);
+        let (tag, entry) = (card.tag().map(str::to_owned), card.entry());
         let catalog = load_catalog(&paths.config)?;
         let overrides = catalog
             .catalog

@@ -109,20 +109,23 @@ def test_flash_next_xts_wire_contract():
     assert not any(
         entry.get("file") in rg.FLASH_NEXT_XTS_MONOLITHIC_FILES for entry in models.values()
     )
-    rtn = models["qwen3.8:flash-next-rtn-asym"]
-    assert rtn["file"] == "qwen3.8-flash-next.mq4"
-    assert rtn["sha256"] != rg.FLASH_NEXT_XTS_SPLIT_BASE_SHA256
+    # The retired rungs are gone from the published registry too; the client
+    # keeps compiled pins for a verified local copy (hipfire-registry RETIRED_MODELS).
+    curated = _load(REPO_ROOT / "registry" / "models.json")["models"]
+    for tag in ("qwen3.8:flash-next-rtn-asym", "qwen3.8:flash-next-mq6q8-pleq8"):
+        assert tag not in models and tag not in curated
+    for retired_file in ("qwen3.8-flash-next.mq4", "qwen3.8-flash-next.mq6q8-pleq8"):
+        assert not any(entry.get("file") == retired_file for entry in models.values())
+    # The obsolete local-only ZAB tier is removed outright (no retired pin either).
+    assert "qwen3.8:flash-next-mq4-xts-zab" not in models
+    assert "qwen3.8:flash-next-mq4-xts-zab" not in curated
+    assert not any(
+        entry.get("file") == "qwen3.8-flash-next.mq4-xts-zab" for entry in models.values()
+    )
     v1 = _load(REPO_ROOT / "registry" / "v1.json")
     assert v1["aliases"]["qwen3.8:flash"] == "qwen3.8:flash-next"
     assert models["qwen3.8:flash-next"]["desc"].startswith("Qwen3.8-Flash-Next MQ4 XTS")
     assert all("GPTQ3" not in entry["desc"] for entry in models.values())
-
-
-def test_flash_next_zab_local_only_quant():
-    file = "qwen3.8-flash-next.mq4-xts-zab"
-    assert rg.quant_for(file) == "mq4"
-    assert rg.arch_id_for("qwen3.8:flash-next-mq4-xts-zab", {"file": file}) == 16
-    assert rg.quant_for("unrelated.mq4-xts-zab") is None
 
 
 def test_flash_next_mq2_xts_split_base_quant_and_arch():
@@ -136,28 +139,7 @@ def test_flash_next_mq2_xts_split_base_quant_and_arch():
     assert rg.quant_for("x.mq2-xts-abc") is None
 
 
-def test_flash_next_zab_local_identity_roundtrip(monkeypatch):
-    curated = _load(REPO_ROOT / "registry" / "models.json")
-    tag = "qwen3.8:flash-next-mq4-xts-zab"
-    entry = curated["models"][tag]
-    assert entry["repo"] == ""
-    assert "hipfire-models/qwen3.8-flash-next" in entry["desc"]
-    assert "NOT uploaded/pullable" in entry["desc"]
-
-    def no_remote_probe(repo, token):
-        raise AssertionError(f"local-only artifact must not probe {repo}")
-
-    monkeypatch.setattr(rg, "repo_tree", no_remote_probe)
-    built, errors = rg.build_registry({"models": {tag: entry}, "aliases": {}}, None)
-    assert not errors, "\n".join(errors)
-    result = built["models"][tag]
-    assert result["sha256"] == entry["sha256"]
-    assert result["size_bytes"] == entry["size_bytes"]
-    assert result["arch_id"] == 16
-    assert result["quant"] == "mq4"
-
-
-@pytest.mark.parametrize("target", [None, "qwen3.8:flash-next-rtn-asym"])
+@pytest.mark.parametrize("target", [None, "qwen3.8:flash-next-mq4"])
 def test_flash_next_short_alias_invariant_rejects_drift(monkeypatch, target):
     v1 = _load(REPO_ROOT / "registry" / "v1.json")
     curated = _load(REPO_ROOT / "registry" / "models.json")

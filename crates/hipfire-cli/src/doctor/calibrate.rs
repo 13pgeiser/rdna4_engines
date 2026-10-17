@@ -118,16 +118,13 @@ impl DaemonSession {
         let model_path = target.model_path.as_path();
         let model_arg = model_path.to_string_lossy().into_owned();
         let registry = hipfire_registry::load(&paths.registry).registry;
-        let found = crate::registry_entry_for_path(paths, &registry, &model_arg).or_else(|| {
-            target
-                .model_tag
-                .as_deref()
-                .and_then(|tag| registry.model(tag))
-        });
-        let (tag, entry) = match found {
-            Some((tag, entry)) => (Some(tag.to_owned()), Some(entry.clone())),
-            None => (None, None),
-        };
+        let mut card = crate::model_card(paths, &registry, &model_arg);
+        if card.pair().is_none() {
+            if let Some(tag) = target.model_tag.as_deref() {
+                card = crate::model_card_by_name(&registry, tag);
+            }
+        }
+        let (tag, entry) = (card.tag().map(str::to_owned), card.entry().cloned());
         let resolved = crate::resolved_for_model(
             paths,
             tag.as_deref().unwrap_or(&model_arg),

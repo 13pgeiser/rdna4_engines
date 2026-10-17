@@ -21,8 +21,8 @@ use hipfire_config::{
 };
 use hipfire_registry::{
     load as load_registry, ExpertHotsetPin, GrandfatheredMonolithic, LoadedRegistry, ModelEntry,
-    RegistryPaths, RegistrySource, RegistryV1, Sidecar, TrunkOverlayPin, EXPERT_HOTSET_PINS,
-    GRANDFATHERED_MONOLITHICS, TRUNK_OVERLAY_PINS,
+    RegistryPaths, RegistrySource, RegistryV1, RetiredModel, Sidecar, TrunkOverlayPin,
+    EXPERT_HOTSET_PINS, GRANDFATHERED_MONOLITHICS, RETIRED_MODELS, TRUNK_OVERLAY_PINS,
 };
 use hipfire_runtime::offload_calibrate::{CalibrateOptions, CalibrationReport};
 use hipfire_runtime::prompt_frame::ToolCall;
@@ -1372,10 +1372,8 @@ fn model_config_command_to(
     action: Option<ConfigAction>,
     out: &mut dyn std::io::Write,
 ) -> Result<()> {
-    let (tag, entry) = registry
-        .model(model_name)
-        .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
-        .unwrap_or((None, None));
+    let card = model_card_by_name(registry, model_name);
+    let (tag, entry) = (card.tag().map(str::to_owned), card.entry());
     let action = action.unwrap_or(ConfigAction::List(ConfigListArgs::default()));
     if matches!(
         action,
@@ -1632,6 +1630,26 @@ struct LocalModel {
     /// to OpenAI's required `created`. `0` when the platform cannot report one.
     created: u64,
     registry_tag: Option<String>,
+    /// The registry no longer publishes this file's tag; the client still runs
+    /// it from a verified local copy ([`RetiredModel`]).
+    retired: bool,
+}
+
+/// One `hipfire list` row of a local model: file, size, registry tag, and a
+/// `[retired]` marker when the registry no longer publishes the file's tag.
+fn local_model_line(model: &LocalModel) -> String {
+    let tag = model
+        .registry_tag
+        .as_deref()
+        .map(|tag| format!(" ({tag})"))
+        .unwrap_or_default();
+    format!(
+        "  {:<42} {:>7.2} GB{}{}",
+        model.name,
+        model.size_bytes as f64 / 1e9,
+        tag,
+        if model.retired { " [retired]" } else { "" }
+    )
 }
 
 fn list_command(paths: &Paths, args: ListArgs) -> Result<()> {
@@ -1675,17 +1693,7 @@ fn list_command(paths: &Paths, args: ListArgs) -> Result<()> {
     } else {
         println!("Local models:\n");
         for model in &local {
-            let tag = model
-                .registry_tag
-                .as_deref()
-                .map(|tag| format!(" ({tag})"))
-                .unwrap_or_default();
-            println!(
-                "  {:<42} {:>7.2} GB{}",
-                model.name,
-                model.size_bytes as f64 / 1e9,
-                tag
-            );
+            println!("{}", local_model_line(model));
         }
     }
     if args.remote || local.is_empty() {
@@ -1726,6 +1734,7 @@ pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<
                 .filter(|path| path.is_file()),
         );
     }
+    let retired_pins = retired_table();
     let mut seen = BTreeSet::new();
     let mut models = Vec::new();
     for path in candidates {
@@ -1748,6 +1757,12 @@ pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<
         if !is_listable_model_file(&name, registry, &grandfather_table()) {
             continue;
         }
+        // A retired model is the installed artifact itself (same file as
+        // `models/<pin.file>`), never a same-named lookalike elsewhere.
+        let retired = retired_pins
+            .iter()
+            .find(|pin| same_installed_file(&paths.models.join(pin.file), &canonical))
+            .copied();
         let registry_tag = registry
             .models
             .iter()
@@ -1757,7 +1772,9 @@ pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<
                         .is_some_and(|pin| name == pin.canonical_file || name == pin.legacy_file))
                 .then(|| tag.clone())
             })
+            .or_else(|| retired.map(|pin| pin.tag.to_owned()))
             .or_else(|| catalog_tags.get(&canonical).cloned());
+        let retired = retired.is_some_and(|pin| registry_tag.as_deref() == Some(pin.tag));
         let created = metadata
             .modified()
             .ok()
@@ -1770,6 +1787,7 @@ pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<
             size_bytes: metadata.len(),
             created,
             registry_tag,
+            retired,
         });
     }
     models.sort_by(|left, right| left.name.cmp(&right.name));
@@ -1849,6 +1867,11 @@ fn pull_with_sidecar_pins(
     hotset_pins: &[ExpertHotsetPin],
     grandfather_pins: &[GrandfatheredMonolithic],
 ) -> Result<Option<PathBuf>> {
+    // A retired tag is refused before any credential check or network work,
+    // with or without --force: the registry no longer publishes it.
+    if let Some(pin) = hipfire_registry::retired_model_named(&args.model, &retired_table()) {
+        bail!("{}", pin.refusal());
+    }
     // A malformed HF_TOKEN would otherwise surface only as the HTTP client's
     // generic "failed to parse header value" after the registry work, or as a
     // mere warning on an optional sidecar: refuse it before anything is fetched.
@@ -2275,14 +2298,15 @@ fn rm_with_sidecar_pins(
     hotset_pins: &[ExpertHotsetPin],
     args: RmArgs,
 ) -> Result<()> {
-    let resolved = registry_entry_for_path(paths, registry, &args.model);
+    let card = model_card(paths, registry, &args.model);
+    let resolved = card.pair();
     // Removal acts on the artifact itself, so it resolves symlinks (the
-    // selected path `find_model_path` returns keeps them for sidecar lookup).
-    let path = find_model_path(paths, registry, &args.model)
+    // selected path `find_local_model_path` returns keeps them for sidecar lookup).
+    let path = find_local_model_path(paths, registry, &args.model)
         .map(|selected| fs::canonicalize(&selected).unwrap_or(selected))
         .unwrap_or_else(|| paths.models.join(&args.model));
     if !path.is_file() {
-        if let Some((tag, _)) = registry.model(&args.model) {
+        if let Some((tag, _)) = card.pair() {
             bail!("{tag} is not downloaded; nothing to remove");
         }
         if !args.model.contains(std::path::MAIN_SEPARATOR) {
@@ -2584,12 +2608,11 @@ fn rm_with_sidecar_pins(
 fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let loaded_registry = load_registry(&paths.registry);
     let registry = &loaded_registry.registry;
-    let (canonical, entry) = registry_entry_for_path(paths, registry, &args.model)
-        .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
-        .unwrap_or((None, None));
+    let card = model_card(paths, registry, &args.model);
+    let (canonical, entry) = (card.tag().map(str::to_owned), card.entry());
     let mut model_path = resolve_model_path(paths, registry, &args.model)?;
     if model_path.is_none() {
-        if entry.is_some() {
+        if card.pullable().is_some() {
             eprintln!(
                 "Model not found locally. Pulling {}...",
                 canonical.as_deref().unwrap_or(&args.model)
@@ -3953,6 +3976,237 @@ pub(crate) fn same_installed_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Fixture retired pins, process-wide so a serve harness's request threads see
+/// them. [`RetiredOverride`] serializes the tests that set it.
+#[cfg(test)]
+static RETIRED_OVERRIDE: std::sync::Mutex<Option<Vec<RetiredModel>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static RETIRED_OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test guard: [`retired_table`] returns the fixture `pins` (on every thread)
+/// until dropped. Holding it excludes other retired-fixture tests.
+#[cfg(test)]
+pub(crate) struct RetiredOverride(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+#[cfg(test)]
+impl RetiredOverride {
+    pub(crate) fn set(pins: &[RetiredModel]) -> Self {
+        let guard = RETIRED_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *RETIRED_OVERRIDE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(pins.to_vec());
+        Self(guard)
+    }
+}
+
+#[cfg(test)]
+impl Drop for RetiredOverride {
+    fn drop(&mut self) {
+        *RETIRED_OVERRIDE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+}
+
+/// The retired models this client still runs from a verified local copy: the
+/// compiled [`RETIRED_MODELS`] (tests substitute small fixture pins).
+pub(crate) fn retired_table() -> std::borrow::Cow<'static, [RetiredModel]> {
+    #[cfg(test)]
+    if let Some(table) = RETIRED_OVERRIDE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+    {
+        return std::borrow::Cow::Owned(table);
+    }
+    std::borrow::Cow::Borrowed(RETIRED_MODELS)
+}
+
+/// What a model input names: a catalog entry, a retired model, or neither.
+///
+/// A retired model keeps the card it had while published ([`RetiredModel::entry`]),
+/// so a verified local copy loads with the same sampling defaults and
+/// sidecar pins. It is not in [`RegistryV1`]: it is never offered, never
+/// pulled ([`ModelCard::pullable`]), and only runs once
+/// [`resolve_model_path`] has verified its bytes.
+// The retired card is borrowed from the compiled pins' one-time cache
+// (`RetiredModel::card`), so no variant allocates; the size gap is only stack.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ModelCard<'r> {
+    Unregistered,
+    Registry {
+        tag: &'r str,
+        entry: &'r ModelEntry,
+    },
+    Retired {
+        pin: RetiredModel,
+        entry: std::borrow::Cow<'r, ModelEntry>,
+    },
+}
+
+impl ModelCard<'_> {
+    /// The tag and card entry, whether published or retired.
+    pub(crate) fn pair(&self) -> Option<(&str, &ModelEntry)> {
+        match self {
+            Self::Unregistered => None,
+            Self::Registry { tag, entry } => Some((*tag, *entry)),
+            Self::Retired { pin, entry } => Some((pin.tag, entry.as_ref())),
+        }
+    }
+
+    pub(crate) fn tag(&self) -> Option<&str> {
+        self.pair().map(|(tag, _)| tag)
+    }
+
+    pub(crate) fn entry(&self) -> Option<&ModelEntry> {
+        self.pair().map(|(_, entry)| entry)
+    }
+
+    /// The entry a missing local file may be downloaded for. A retired model
+    /// has none: it is never pulled, not even implicitly by `run` or `serve`.
+    pub(crate) fn pullable(&self) -> Option<&ModelEntry> {
+        match self {
+            Self::Registry { entry, .. } => Some(entry),
+            Self::Unregistered | Self::Retired { .. } => None,
+        }
+    }
+
+    pub(crate) fn retired(&self) -> Option<&RetiredModel> {
+        match self {
+            Self::Retired { pin, .. } => Some(pin),
+            _ => None,
+        }
+    }
+}
+
+/// [`registry_entry_for_path`] widened to the retired models: the card a
+/// path-form or name input receives. A path is a retired model only when it IS
+/// the installed artifact (`models/<pin.file>`, compared by file identity); a
+/// same-named lookalike elsewhere is an unregistered file.
+pub(crate) fn model_card<'r>(
+    paths: &Paths,
+    registry: &'r RegistryV1,
+    input: &str,
+) -> ModelCard<'r> {
+    if let Some((tag, entry)) = registry_entry_for_path(paths, registry, input) {
+        return ModelCard::Registry { tag, entry };
+    }
+    let candidate = Path::new(input);
+    let table = retired_table();
+    let pin = if input.contains('/') || input.contains('\\') || candidate.is_file() {
+        fs::canonicalize(candidate).ok().and_then(|canonical| {
+            table
+                .iter()
+                .find(|pin| same_installed_file(&paths.models.join(pin.file), &canonical))
+        })
+    } else {
+        hipfire_registry::retired_model_named(input, &table)
+    };
+    match pin {
+        Some(pin) => ModelCard::Retired {
+            pin: *pin,
+            entry: pin.card(),
+        },
+        None => ModelCard::Unregistered,
+    }
+}
+
+/// The card of a tag, alias or bare file name: [`model_card`] without path
+/// identity, for callers that never receive paths.
+pub(crate) fn model_card_by_name<'r>(registry: &'r RegistryV1, input: &str) -> ModelCard<'r> {
+    if let Some((tag, entry)) = registry.model(input) {
+        return ModelCard::Registry { tag, entry };
+    }
+    let table = retired_table();
+    match hipfire_registry::retired_model_named(input, &table) {
+        Some(pin) => ModelCard::Retired {
+            pin: *pin,
+            entry: pin.card(),
+        },
+        None => ModelCard::Unregistered,
+    }
+}
+
+/// A retired model's pinned file is not in the models directory. The client
+/// never downloads it; `serve` reports it as a missing model.
+#[derive(Debug)]
+pub(crate) struct RetiredMissing(pub(crate) String);
+
+impl std::fmt::Display for RetiredMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RetiredMissing {}
+
+/// Prove `file` is the artifact `pin` names: SHA-256 and size (a previously
+/// verified, unchanged file is not hashed again, see [`VerifiedCache`]).
+fn verify_retired_file(paths: &Paths, pin: &RetiredModel, file: &Path) -> Result<()> {
+    verified_metadata(
+        &VerifiedCache::in_home(&paths.root),
+        file,
+        pin.sha256,
+        pin.size_bytes,
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        anyhow!(
+            "{} is not the pinned {}; {} ({error:#}); move it aside or use {}",
+            file.display(),
+            pin.tag,
+            pin.refusal(),
+            pin.replacement
+        )
+    })
+}
+
+/// The installed file of a retired model, once its bytes verify against the
+/// pin. `selected` is the path the user named, kept as written so sidecar
+/// lookup sees the spelling they chose. Nothing is downloaded or written.
+fn resolve_retired_path(
+    paths: &Paths,
+    pin: &RetiredModel,
+    selected: Option<PathBuf>,
+) -> Result<PathBuf> {
+    let installed = paths.models.join(pin.file);
+    match fs::symlink_metadata(&installed) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(RetiredMissing(format!(
+                "{}; {} is not in {} and is never downloaded",
+                pin.refusal(),
+                pin.file,
+                paths.models.display()
+            ))
+            .into());
+        }
+        Err(error) => return Err(error.into()),
+    }
+    verify_retired_file(paths, pin, &installed)?;
+    Ok(selected.unwrap_or(installed))
+}
+
+/// [`find_model_path`] plus the retired models' installed files. Existence
+/// only, with no verification: for callers that remove, list, compare or probe
+/// a model. Anything that loads one goes through [`resolve_model_path`].
+pub(crate) fn find_local_model_path(
+    paths: &Paths,
+    registry: &RegistryV1,
+    model: &str,
+) -> Option<PathBuf> {
+    find_model_path(paths, registry, model).or_else(|| match model_card(paths, registry, model) {
+        ModelCard::Retired { pin, .. } => {
+            Some(paths.models.join(pin.file)).filter(|path| path.is_file())
+        }
+        _ => None,
+    })
+}
+
 /// Fallible pinned migration stays outside generic, cheap local discovery.
 pub(crate) fn resolve_model_path(
     paths: &Paths,
@@ -3968,12 +4222,30 @@ pub(crate) fn resolve_model_path(
             .ok()
             .or_else(|| Some(explicit.to_path_buf())));
     }
-    let catalog_path = load_catalog(&paths.config).ok().is_some_and(|catalog| {
+    let catalog_file = load_catalog(&paths.config).ok().and_then(|catalog| {
         catalog
             .catalog
             .model(model)
-            .is_some_and(|(_, record)| record.path.as_ref().is_some_and(|path| path.is_file()))
+            .and_then(|(_, record)| record.path.clone())
+            .filter(|path| path.is_file())
     });
+    let catalog_path = catalog_file.is_some();
+    // A retired model is no longer in the catalog, but its pinned local copy
+    // still runs once its bytes verify. It is never downloaded: a missing or
+    // mismatching file is an error, not a pull. A catalog path registered
+    // under the retired identity is held to the same pin.
+    if let ModelCard::Retired { pin, .. } = model_card(paths, registry, model) {
+        return match catalog_file {
+            Some(file) => {
+                verify_retired_file(paths, &pin, &file)?;
+                Ok(Some(lexical_absolute(&file)))
+            }
+            None => {
+                let selected = explicit.is_file().then(|| lexical_absolute(explicit));
+                resolve_retired_path(paths, &pin, selected).map(Some)
+            }
+        };
+    }
     if !explicit.is_file() && !model.contains('/') && !model.contains('\\') && !catalog_path {
         if let Some((_, entry)) = registry.model(model) {
             if entry.is_flash_next_xts() {
@@ -10247,9 +10519,10 @@ mod tests {
             resolve_model_path(&paths, &registry, "qwen3.8:flash-next").unwrap(),
             None
         );
-        let (_, rtn_entry) = registry.model("qwen3.8:flash-next-rtn-asym").unwrap();
+        assert!(registry.model("qwen3.8:flash-next-rtn-asym").is_none());
+        let rtn_entry = RETIRED_MODELS[0].entry();
         assert!(!rtn_entry.is_flash_next_xts());
-        assert_eq!(migrate_flash_next_xts(&paths, rtn_entry).unwrap(), None);
+        assert_eq!(migrate_flash_next_xts(&paths, &rtn_entry).unwrap(), None);
         fs::remove_dir_all(paths.root).unwrap();
     }
 
@@ -22345,5 +22618,499 @@ effort = "high"
             .collect();
         assert_eq!(listed, ["real-model.mq4"]);
         fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    // ── Retired Flash-Next tags (rtn-asym, mq6q8-pleq8) ──
+
+    const RETIRED_RTN_BYTES: &[u8] = b"retired rtn-asym fixture bytes";
+    const RETIRED_Q8_BYTES: &[u8] = b"retired mq6q8-pleq8 fixture bytes";
+
+    static RETIRED_RTN_SHA: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| format!("{:x}", Sha256::digest(RETIRED_RTN_BYTES)));
+
+    static RETIRED_Q8_SHA: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| format!("{:x}", Sha256::digest(RETIRED_Q8_BYTES)));
+
+    fn retired_rtn_sha() -> &'static str {
+        RETIRED_RTN_SHA.as_str()
+    }
+
+    fn retired_q8_sha() -> &'static str {
+        RETIRED_Q8_SHA.as_str()
+    }
+
+    /// The two compiled retired identities (real tags and file names) pinned
+    /// to tiny fixture payloads instead of the 125 GB originals.
+    fn retired_fixture_pins() -> Vec<RetiredModel> {
+        vec![
+            RetiredModel {
+                sha256: retired_rtn_sha(),
+                size_bytes: RETIRED_RTN_BYTES.len() as u64,
+                ..RETIRED_MODELS[0]
+            },
+            RetiredModel {
+                sha256: retired_q8_sha(),
+                size_bytes: RETIRED_Q8_BYTES.len() as u64,
+                ..RETIRED_MODELS[1]
+            },
+        ]
+    }
+
+    fn hash_count() -> usize {
+        HASH_INVOCATIONS.with(|count| count.get())
+    }
+
+    fn download_count() -> usize {
+        DOWNLOAD_INVOCATIONS.with(|count| count.get())
+    }
+
+    #[test]
+    fn retired_tags_refuse_pull_with_one_line_even_forced_before_any_work() {
+        let paths = test_paths("retired-pull");
+        DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+        for pin in RETIRED_MODELS {
+            for model in [pin.tag, pin.file] {
+                for force in [false, true] {
+                    let mut args = PullArgs::defaults(model);
+                    args.force = force;
+                    let error = pull_command(&paths, args).unwrap_err();
+                    assert_eq!(error.to_string(), pin.refusal(), "{model} force={force}");
+                    assert!(!error.to_string().contains('\n'));
+                    assert!(error.to_string().contains(
+                        "retired; the file still runs if you have it; replacement qwen3.8:flash-next"
+                    ));
+                }
+            }
+        }
+        assert_eq!(download_count(), 0);
+        assert!(!paths.root.exists(), "a refused pull creates nothing");
+    }
+
+    #[test]
+    fn only_the_two_retired_tags_are_retired_and_every_other_flash_next_tag_is_unchanged() {
+        let registry = hipfire_registry::bundled().unwrap();
+        for pin in RETIRED_MODELS {
+            assert!(registry.model(pin.tag).is_none(), "{}", pin.tag);
+            assert!(registry.model(pin.file).is_none(), "{}", pin.file);
+        }
+        // Shipped split / MQ3 / MQ2 tags still resolve to their own files.
+        let expected = [
+            ("qwen3.8:flash-next", "qwen3.8-flash-next-base.mq4-xts"),
+            ("qwen3.8:flash-next-mq4", "qwen3.8-flash-next-base.mq4-xts"),
+            ("qwen3.8:flash-next-gptq3", "qwen3.8-flash-next-base.mq4-xts"),
+            ("qwen3.8:flash-next-mq4-xts", "qwen3.8-flash-next-base.mq4-xts"),
+            ("qwen3.8:flash-next-mq3-xts", "qwen3.8-flash-next-base.mq3-xts"),
+            ("qwen3.8:flash-next-mq2-xts", "qwen3.8-flash-next-base.mq2-xts"),
+            (
+                "qwen3.8:flash-next-mq2-xts-4500",
+                "qwen3.8-flash-next-base.mq2-xts-4500",
+            ),
+            ("qwen3.8:flash", "qwen3.8-flash-next-base.mq4-xts"),
+        ];
+        // The obsolete local-only ZAB tier is removed outright: no catalog row, no
+        // retired pin (its trunk tier ships as the default overlay on the stock tags).
+        let zab = "qwen3.8:flash-next-mq4-xts-zab";
+        assert!(registry.model(zab).is_none());
+        assert!(registry.model("qwen3.8-flash-next.mq4-xts-zab").is_none());
+        assert!(hipfire_registry::retired_model_named(zab, RETIRED_MODELS).is_none());
+        for (tag, file) in expected {
+            let (resolved, entry) = registry.model(tag).unwrap_or_else(|| panic!("{tag}"));
+            assert_eq!(entry.file, file, "{tag} ({resolved})");
+            assert!(hipfire_registry::retired_model_named(tag, RETIRED_MODELS).is_none());
+            assert!(
+                matches!(
+                    model_card_by_name(&registry, tag),
+                    ModelCard::Registry { .. }
+                ),
+                "{tag}"
+            );
+        }
+        for tag in [
+            "qwen3.8:flash-next",
+            "qwen3.8:flash-next-mq4",
+            "qwen3.8:flash-next-gptq3",
+            "qwen3.8:flash-next-mq4-xts",
+        ] {
+            let (_, entry) = registry.model(tag).unwrap();
+            assert!(grandfather_pin(entry).is_some(), "{tag} stays grandfathered");
+            assert!(entry.trunk_overlay().is_some() && entry.expert_hotset().is_some());
+        }
+    }
+
+    #[test]
+    fn verified_retired_tag_file_and_path_resolve_without_download_and_reuse_the_cache() {
+        let paths = test_paths("retired-resolve");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = hipfire_registry::bundled().unwrap();
+        let _pins = RetiredOverride::set(&retired_fixture_pins());
+        let pin = RETIRED_MODELS[0];
+        let installed = paths.models.join(pin.file);
+        DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+        HASH_INVOCATIONS.with(|count| count.set(0));
+
+        // Not installed: a clear retired/missing error, never a download.
+        for input in [pin.tag, pin.file] {
+            let error = resolve_model_path(&paths, &registry, input).unwrap_err();
+            assert!(error.downcast_ref::<RetiredMissing>().is_some(), "{input}");
+            assert!(error.to_string().contains(&pin.refusal()), "{error}");
+            assert!(error.to_string().contains("never downloaded"), "{error}");
+            let card = model_card(&paths, &registry, input);
+            assert_eq!(card.tag(), Some(pin.tag));
+            assert!(card.pullable().is_none(), "a retired model is never pulled");
+        }
+        assert_eq!(find_model_path(&paths, &registry, pin.tag), None);
+        assert_eq!(find_local_model_path(&paths, &registry, pin.tag), None);
+
+        fs::write(&installed, RETIRED_RTN_BYTES).unwrap();
+        let link = paths.root.join("link.mq4");
+        std::os::unix::fs::symlink(&installed, &link).unwrap();
+        let card = model_card(&paths, &registry, pin.tag);
+        assert_eq!(card.retired().map(|retired| retired.tag), Some(pin.tag));
+        let entry = card.entry().unwrap();
+        assert_eq!(entry.file, pin.file);
+        assert_eq!(entry.arch_id, Some(16));
+        assert_eq!(
+            entry.recommended_settings.as_ref().and_then(|s| s.top_k),
+            Some(20)
+        );
+        for (input, expected) in [
+            (pin.tag.to_owned(), installed.clone()),
+            (pin.file.to_owned(), installed.clone()),
+            (installed.display().to_string(), installed.clone()),
+            // The spelling the user selected survives (sidecar lookup).
+            (link.display().to_string(), link.clone()),
+        ] {
+            assert_eq!(
+                resolve_model_path(&paths, &registry, &input).unwrap(),
+                Some(expected),
+                "{input}"
+            );
+            assert_eq!(model_card(&paths, &registry, &input).tag(), Some(pin.tag));
+        }
+        assert_eq!(hash_count(), 1, "one hash; every spelling reuses the record");
+        let record = VerifiedCache::in_home(&paths.root)
+            .record_of(&installed)
+            .expect("the verification is cached");
+        assert!(record.sha256.eq_ignore_ascii_case(retired_rtn_sha()));
+        assert_eq!(
+            find_local_model_path(&paths, &registry, pin.tag),
+            Some(installed.clone())
+        );
+
+        // A same-named file elsewhere is not the retired artifact: no identity,
+        // no verification, loaded as a bare file (even with different bytes).
+        let other = paths.root.join("elsewhere");
+        fs::create_dir_all(&other).unwrap();
+        let lookalike = other.join(pin.file);
+        fs::write(&lookalike, b"not the pinned bytes at all").unwrap();
+        let input = lookalike.display().to_string();
+        assert!(matches!(
+            model_card(&paths, &registry, &input),
+            ModelCard::Unregistered
+        ));
+        assert_eq!(
+            resolve_model_path(&paths, &registry, &input).unwrap(),
+            Some(lookalike.clone())
+        );
+        assert_eq!(hash_count(), 1);
+
+        // A catalog path registered under the retired tag is held to the same
+        // pin: wrong bytes are an explicit error (never a pull, never a silent
+        // load); the pinned bytes serve at the path the catalog selected.
+        hipfire_config::set_model_override(
+            &paths.config,
+            Some(pin.tag),
+            Some(lookalike.clone()),
+            pin.tag,
+            "memory.kv_cache",
+            "q8",
+        )
+        .unwrap();
+        let error = resolve_model_path(&paths, &registry, pin.tag).unwrap_err();
+        assert!(error.downcast_ref::<RetiredMissing>().is_none());
+        let text = error.to_string();
+        assert!(text.contains("is not the pinned"), "{text}");
+        assert!(text.contains(&lookalike.display().to_string()), "{text}");
+        fs::write(&lookalike, RETIRED_RTN_BYTES).unwrap();
+        assert_eq!(
+            resolve_model_path(&paths, &registry, pin.tag).unwrap(),
+            Some(lookalike)
+        );
+        assert_eq!(download_count(), 0);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn retired_size_and_sha_mismatches_error_for_tag_file_and_path_and_never_pull() {
+        let paths = test_paths("retired-mismatch");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = hipfire_registry::bundled().unwrap();
+        let _pins = RetiredOverride::set(&retired_fixture_pins());
+        let pin = RETIRED_MODELS[1];
+        let installed = paths.models.join(pin.file);
+        DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+
+        let wrong_size = b"short";
+        let mut wrong_sha = RETIRED_Q8_BYTES.to_vec();
+        wrong_sha[0] ^= 0xff;
+        for (bytes, expected) in [
+            (wrong_size.to_vec(), "size mismatch"),
+            (wrong_sha, "SHA-256 mismatch"),
+        ] {
+            fs::write(&installed, &bytes).unwrap();
+            for input in [
+                pin.tag.to_owned(),
+                pin.file.to_owned(),
+                installed.display().to_string(),
+            ] {
+                let error = resolve_model_path(&paths, &registry, &input).unwrap_err();
+                assert!(error.downcast_ref::<RetiredMissing>().is_none(), "{input}");
+                let text = error.to_string();
+                assert!(text.contains(expected), "{input}: {text}");
+                assert!(text.contains("is not the pinned"), "{input}: {text}");
+                assert!(text.contains(&pin.refusal()), "{input}: {text}");
+                let card = model_card(&paths, &registry, &input);
+                assert!(card.retired().is_some());
+                assert!(card.pullable().is_none());
+            }
+            assert!(VerifiedCache::in_home(&paths.root)
+                .record_of(&installed)
+                .is_none());
+        }
+        assert_eq!(download_count(), 0, "a mismatch is never repaired by a pull");
+
+        // The right bytes then verify and serve.
+        fs::write(&installed, RETIRED_Q8_BYTES).unwrap();
+        assert_eq!(
+            resolve_model_path(&paths, &registry, pin.tag).unwrap(),
+            Some(installed)
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn local_listing_marks_the_installed_retired_files_and_the_catalog_never_offers_them() {
+        let paths = test_paths("retired-list");
+        let registry = hipfire_registry::bundled().unwrap();
+        let _pins = RetiredOverride::set(&retired_fixture_pins());
+        fs::create_dir_all(paths.models.join("other")).unwrap();
+        let rtn = paths.models.join(RETIRED_MODELS[0].file);
+        let q8 = paths.models.join(RETIRED_MODELS[1].file);
+        let lookalike = paths.models.join("other").join(RETIRED_MODELS[0].file);
+        fs::write(&rtn, RETIRED_RTN_BYTES).unwrap();
+        fs::write(&q8, RETIRED_Q8_BYTES).unwrap();
+        fs::write(&lookalike, b"a different artifact").unwrap();
+
+        let local = list_local_models(&paths, &registry).unwrap();
+        let by_path = |path: &Path| {
+            local
+                .iter()
+                .find(|model| model.path == fs::canonicalize(path).unwrap())
+                .unwrap_or_else(|| panic!("{} is listed", path.display()))
+        };
+        let rtn_row = by_path(&rtn);
+        assert_eq!(rtn_row.registry_tag.as_deref(), Some(RETIRED_MODELS[0].tag));
+        assert!(rtn_row.retired);
+        let q8_row = by_path(&q8);
+        assert_eq!(q8_row.registry_tag.as_deref(), Some(RETIRED_MODELS[1].tag));
+        assert!(q8_row.retired);
+        let lookalike_row = by_path(&lookalike);
+        assert_eq!(lookalike_row.registry_tag, None);
+        assert!(!lookalike_row.retired);
+
+        // Text and JSON marking.
+        let line = local_model_line(rtn_row);
+        assert!(line.contains("(qwen3.8:flash-next-rtn-asym) [retired]"), "{line}");
+        assert!(!local_model_line(lookalike_row).contains("retired"));
+        let json = serde_json::to_value(rtn_row).unwrap();
+        assert_eq!(json["retired"], true);
+        assert_eq!(json["registry_tag"], RETIRED_MODELS[0].tag);
+        assert_eq!(serde_json::to_value(lookalike_row).unwrap()["retired"], false);
+
+        // The available catalog (what `list --remote` and the TUI offer) has neither.
+        for pin in RETIRED_MODELS {
+            assert!(!registry.models.contains_key(pin.tag), "{}", pin.tag);
+            assert!(!registry.models.values().any(|entry| entry.file == pin.file));
+        }
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_removes_an_installed_retired_file_by_tag_and_reports_a_missing_one() {
+        let paths = test_paths("retired-rm");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = hipfire_registry::bundled().unwrap();
+        let _pins = RetiredOverride::set(&retired_fixture_pins());
+        let pin = RETIRED_MODELS[0];
+        let installed = paths.models.join(pin.file);
+        let error = rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: pin.tag.to_owned(),
+                yes: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("{} is not downloaded; nothing to remove", pin.tag)
+        );
+        // Removal never verifies: a file that is not the pinned bytes still goes.
+        fs::write(&installed, b"whatever is there").unwrap();
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: pin.tag.to_owned(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!installed.exists());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// `hipfire run` reaches the daemon's `load` with the verified retired
+    /// file for the tag and for its installed path, refuses a missing or
+    /// mismatching file before spawning anything, and never pulls.
+    #[cfg(unix)]
+    #[test]
+    fn run_loads_a_verified_retired_tag_and_path_and_never_pulls() {
+        // Sets process env (daemon binary, offline registry): hold the shared
+        // env lock so the pull tests' registry loads never see it. Declared
+        // first so the EnvGuards restore before the lock releases.
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let paths = test_paths("retired-run");
+        fs::create_dir_all(&paths.models).unwrap();
+        let _pins = RetiredOverride::set(&retired_fixture_pins());
+        let pin = RETIRED_MODELS[0];
+        let installed = paths.models.join(pin.file);
+        let daemon = write_task11_fake_daemon(&paths.root);
+        let _bin = EnvGuard::set("HIPFIRE_DAEMON_BIN", daemon.to_str().unwrap());
+        let _offline = EnvGuard::set("HIPFIRE_NO_REGISTRY_FETCH", "1");
+        DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+        let run = |model: &str| -> Result<()> {
+            let cli = Cli::try_parse_from([
+                "hipfire",
+                "run",
+                "--json",
+                "--kv-mode",
+                "q8",
+                model,
+                "hello",
+            ])
+            .unwrap();
+            let Some(Commands::Run(args)) = cli.command else {
+                panic!("expected run command");
+            };
+            // The script was just written: bounded ETXTBSY retry like the
+            // other fake-daemon spawns.
+            for attempt in 0..8u64 {
+                match run_command(&paths, args.clone()) {
+                    Err(error) if format!("{error:#}").contains("os error 26") => {
+                        thread::sleep(Duration::from_millis(5 * (1 + attempt)));
+                    }
+                    other => return other,
+                }
+            }
+            bail!("fake daemon spawn kept failing with ETXTBSY")
+        };
+        let loads = || -> Vec<serde_json::Value> {
+            let raw = fs::read_to_string(paths.root.join("requests.log")).unwrap_or_default();
+            raw.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|row| row["type"] == "load")
+                .collect()
+        };
+
+        // Missing: refused with the retirement line, nothing spawned or pulled.
+        let error = run(pin.tag).unwrap_err();
+        assert!(error.to_string().contains(&pin.refusal()), "{error:#}");
+        assert!(loads().is_empty());
+        // Wrong bytes: refused before the daemon starts.
+        fs::write(&installed, b"short").unwrap();
+        let error = run(pin.tag).unwrap_err();
+        assert!(error.to_string().contains("is not the pinned"), "{error:#}");
+        assert!(loads().is_empty());
+
+        fs::write(&installed, RETIRED_RTN_BYTES).unwrap();
+        for input in [pin.tag.to_owned(), installed.display().to_string()] {
+            let before = loads().len();
+            let _ = run(&input);
+            let after = loads();
+            assert_eq!(after.len(), before + 1, "{input}");
+            assert_eq!(
+                after[before]["model"],
+                installed.display().to_string(),
+                "{input}"
+            );
+        }
+        assert_eq!(download_count(), 0);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// The shared serve request path: a request naming the retired tag or its
+    /// installed path loads only the verified file; a missing, short or
+    /// altered file and a lookalike path never load, and nothing is pulled.
+    #[cfg(unix)]
+    #[test]
+    fn serve_requests_load_a_verified_retired_tag_and_installed_path_only() {
+        let _pins = RetiredOverride::set(&retired_fixture_pins());
+        let h = Task11HttpHarness::spawn("retired-serve");
+        let pin = RETIRED_MODELS[0];
+        let installed = h.paths.models.join(pin.file);
+        let mut body = h.base_body("t11-stop-text", false);
+        let load_count = |h: &Task11HttpHarness| {
+            Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").len()
+        };
+
+        // Not installed: 404 naming the retirement, not a pull instruction.
+        body["model"] = serde_json::json!(pin.tag);
+        let (status, _, text) = post_status(h.port(), &body);
+        assert_eq!(status, 404, "{text}");
+        assert!(text.contains("is retired; the file still runs"), "{text}");
+        assert!(!text.contains("hipfire pull"), "{text}");
+        assert_eq!(load_count(&h), 0);
+
+        // Short and same-size-altered files fail verification.
+        let mut altered = RETIRED_RTN_BYTES.to_vec();
+        altered[0] ^= 0xff;
+        for bytes in [b"short".to_vec(), altered] {
+            fs::write(&installed, bytes).unwrap();
+            let (status, _, text) = post_status(h.port(), &body);
+            assert!(status >= 400 && status != 200, "{status} {text}");
+            assert!(text.contains("is not the pinned"), "{text}");
+            assert_eq!(load_count(&h), 0);
+        }
+
+        // The pinned bytes load, by tag and by installed path (one load: the
+        // same file stays resident).
+        fs::write(&installed, RETIRED_RTN_BYTES).unwrap();
+        let (status, _, text) = post_status(h.port(), &body);
+        assert_eq!(status, 200, "{text}");
+        let loads = Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load")
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0]["model"], installed.display().to_string());
+        body["model"] = serde_json::json!(installed.display().to_string());
+        let (status, _, text) = post_status(h.port(), &body);
+        assert_eq!(status, 200, "{text}");
+        assert_eq!(load_count(&h), 1);
+        assert!(h.paths.root.join("cache/verified-artifacts.json").is_file());
+
+        // A same-named, same-bytes copy outside the models directory is just
+        // a request path: refused, never given the retired identity.
+        let elsewhere = h.paths.root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let lookalike = elsewhere.join(pin.file);
+        fs::write(&lookalike, RETIRED_RTN_BYTES).unwrap();
+        body["model"] = serde_json::json!(lookalike.display().to_string());
+        let (status, _, text) = post_status(h.port(), &body);
+        assert_eq!(status, 404, "{text}");
+        assert!(text.contains("serve.allow_request_paths"), "{text}");
+        assert_eq!(load_count(&h), 1);
     }
 }

@@ -11,7 +11,7 @@
 
 use crate::{
     grandfathered_monolithic_in, is_ple_format_token, GrandfatheredMonolithic, RegistryV1, Sidecar,
-    EXPERT_HOTSET_PINS, TRUNK_OVERLAY_PINS,
+    EXPERT_HOTSET_PINS, RETIRED_MODELS, TRUNK_OVERLAY_PINS,
 };
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -168,19 +168,22 @@ pub fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
     files
 }
 
-/// True when `name` is some registry entry's own `file`, or a spelling of the
+/// True when `name` is some registry entry's own `file`, a spelling of the
 /// pinned monolithic a split entry is grandfathered with in `pins` (a verified
-/// local install keeps serving, so its files are the registry's models).
+/// local install keeps serving, so its files are the registry's models), or the
+/// file of a compiled [`RETIRED_MODELS`] pin (a retired model still runs from a
+/// verified local copy, though the catalog no longer lists it).
 pub fn names_registry_model(
     name: &str,
     registry: &RegistryV1,
     pins: &[GrandfatheredMonolithic],
 ) -> bool {
-    registry.models.values().any(|entry| {
-        entry.file == name
-            || grandfathered_monolithic_in(entry, pins)
-                .is_some_and(|pin| name == pin.canonical_file || name == pin.legacy_file)
-    })
+    RETIRED_MODELS.iter().any(|pin| pin.file == name)
+        || registry.models.values().any(|entry| {
+            entry.file == name
+                || grandfathered_monolithic_in(entry, pins)
+                    .is_some_and(|pin| name == pin.canonical_file || name == pin.legacy_file)
+        })
 }
 
 /// True when `name` is a model file worth showing in a local listing.

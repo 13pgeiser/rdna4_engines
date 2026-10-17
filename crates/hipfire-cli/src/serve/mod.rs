@@ -1332,8 +1332,9 @@ pub(crate) fn resolve_serve_positionals(
             }
             continue;
         }
-        let is_model =
-            registry.model(value).is_some() || find_model_path(paths, &registry, value).is_some();
+        let is_model = registry.model(value).is_some()
+            || crate::find_local_model_path(paths, &registry, value).is_some()
+            || crate::model_card(paths, &registry, value).retired().is_some();
         if is_model && model.is_none() {
             model = Some(value.clone());
         } else if host.replace(value.clone()).is_some() {
@@ -2167,11 +2168,18 @@ impl ServeRuntime {
             self.restart_engine(meta)?;
             set_engine_state(meta, EngineState::Up);
         }
-        let (tag, entry) = crate::registry_entry_for_path(&self.paths, &self.registry, model)
-            .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
-            .unwrap_or((None, None));
-        let mut path = crate::resolve_model_path(&self.paths, &self.registry, model)?;
-        if path.is_none() && entry.is_some() {
+        let card = crate::model_card(&self.paths, &self.registry, model);
+        let (tag, entry) = (card.tag().map(str::to_owned), card.entry());
+        // A retired model resolves only to its verified local file; a missing
+        // one is a missing model, never a download.
+        let mut path = match crate::resolve_model_path(&self.paths, &self.registry, model) {
+            Ok(path) => path,
+            Err(error) if error.downcast_ref::<crate::RetiredMissing>().is_some() => {
+                return Err(ModelNotFound(error.to_string()).into());
+            }
+            Err(error) => return Err(error),
+        };
+        if path.is_none() && card.pullable().is_some() {
             if origin == ModelOrigin::Request && !self.request_policy.allow_pull {
                 return Err(ModelNotFound(format!(
                     "model not found locally: {model}; run `hipfire pull {model}` on the server \
@@ -2425,7 +2433,7 @@ impl ServeRuntime {
                 .request_policy
                 .operator_model
                 .as_deref()
-                .and_then(|model| find_model_path(&self.paths, &self.registry, model))
+                .and_then(|model| crate::find_local_model_path(&self.paths, &self.registry, model))
                 .is_some_and(|operator| same(&operator))
     }
 
