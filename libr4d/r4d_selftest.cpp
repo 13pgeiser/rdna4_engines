@@ -10884,7 +10884,9 @@ static void qkv_norm_rope_numeric(const Plugin& pl) {
     for (const Cls& cl : { Cls{ 256, 16, 8, 256, "rotary", 10000.0, false, true },
                            Cls{ 512, 16, 2, 128, "head", 1000000.0, true, true },
                            Cls{ 128, 16, 8, 128, "rotary", 10000.0, false, false } }) {
-        for (const int64_t M : { (int64_t)1, (int64_t)4, (int64_t)40 }) {
+        /* 8 rows of the head-256 class are 8 x 32 workgroups of 8 wavefronts, a full card: the
+         * launch adds an idle row past the cliff (r4d_cliff_rows), which must not change a byte. */
+        for (const int64_t M : { (int64_t)1, (int64_t)4, (int64_t)8, (int64_t)40 }) {
             const int64_t QD = cl.nq * cl.hd, KD = cl.nkv * cl.hd;
             std::vector<uint16_t> hq((size_t)M * QD), hk((size_t)M * KD), hv((size_t)M * KD);
             std::vector<uint16_t> hqw((size_t)cl.hd), hkw((size_t)cl.hd);

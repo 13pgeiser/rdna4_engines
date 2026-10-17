@@ -209,9 +209,10 @@ __device__ __forceinline__ float act_f32(float v) { return v; }
 template <bool WF32, uint32_t THR, typename TX = uint16_t>
 __global__ __launch_bounds__(THR) void rmsnorm_kernel(
     const TX* __restrict__ x, const void* __restrict__ w, uint16_t* __restrict__ y,
-    uint32_t n, float eps, float wadd, float mult, uint32_t x_ld, uint32_t y_ld) {
+    uint32_t n, float eps, float wadd, float mult, uint32_t x_ld, uint32_t y_ld, uint32_t M) {
     __shared__ float lds[THR / kWave];
     const uint32_t m = blockIdx.x;
+    if (m >= M) return;   // a row the launch added past the full-card cliff (r4d_cliff_rows)
     const TX* __restrict__ xr = x + (size_t)m * x_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
 
@@ -231,9 +232,10 @@ __global__ __launch_bounds__(THR) void rmsnorm_kernel(
 // rmsnorm does, so the two agree bit for bit where rmsnorm's gain is one.
 __global__ __launch_bounds__(kThreads) void rmsnorm_p_kernel(
     const uint16_t* __restrict__ x, uint16_t* __restrict__ y,
-    uint32_t n, float eps, uint32_t x_ld, uint32_t y_ld) {
+    uint32_t n, float eps, uint32_t x_ld, uint32_t y_ld, uint32_t M) {
     __shared__ float lds[kThreads / kWave];
     const uint32_t m = blockIdx.x;
+    if (m >= M) return;   // a row the launch added past the full-card cliff (r4d_cliff_rows)
     const uint16_t* __restrict__ xr = x + (size_t)m * x_ld;
     uint16_t* __restrict__ yr = y + (size_t)m * y_ld;
     float ss = 0.0f;
@@ -771,10 +773,12 @@ extern "C" int r4d_rmsnorm_mult_bf16(long x, long w, long y, int M, int n, float
     // columns a thread folds into the sum of squares and the fused kernel must be byte-identical
     // to this one followed by the quantiser.
     const int thr = r4d_act_threads(M, n);
+    // A drafter's 256-row head norm at 256 threads is exactly a full card; step past the cliff.
 #define R4D_RN_T(wf, T)                                                                         \
-    hipLaunchKernelGGL((rmsnorm_kernel<wf, T>), dim3((uint32_t)M), dim3(T), 0,                  \
+    hipLaunchKernelGGL((rmsnorm_kernel<wf, T>), dim3(r4d_cliff_rows((uint32_t)M, 1, T / kWave)),  \
+                       dim3(T), 0,                                                              \
                        (hipStream_t)stream, (const uint16_t*)x, (const void*)w, (uint16_t*)y,   \
-                       (uint32_t)n, eps, wadd, mult, (uint32_t)x_ld, (uint32_t)y_ld)
+                       (uint32_t)n, eps, wadd, mult, (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)M)
 #define R4D_RN(wf)                                                                              \
     do { if (thr == 1024)     R4D_RN_T(wf, 1024);                                               \
          else if (thr == 512) R4D_RN_T(wf, 512);                                                \
@@ -800,9 +804,10 @@ extern "C" int r4d_rmsnorm_p_bf16(long x, long y, int M, int n, float eps,
     if (M <= 0 || n <= 0) return -2;
     if (!x_ld) x_ld = n;
     if (!y_ld) y_ld = n;
-    hipLaunchKernelGGL(rmsnorm_p_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
+    hipLaunchKernelGGL(rmsnorm_p_kernel, dim3(r4d_cliff_rows((uint32_t)M, 1, kThreads / kWave)),
+                       dim3(kThreads), 0, (hipStream_t)stream,
                        (const uint16_t*)x, (uint16_t*)y, (uint32_t)n, eps,
-                       (uint32_t)x_ld, (uint32_t)y_ld);
+                       (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)M);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -1351,7 +1356,7 @@ static int rmsnorm_x_f32(const float* x, const void* w, uint16_t* y, int M, int 
 #define R4D_RNF_T(wf, T)                                                                        \
     hipLaunchKernelGGL((rmsnorm_kernel<wf, T, float>), dim3((uint32_t)M), dim3(T), 0,          \
                        (hipStream_t)stream, x, w, y, (uint32_t)n, eps, wadd, mult,              \
-                       (uint32_t)x_ld, (uint32_t)y_ld)
+                       (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)M)
 #define R4D_RNF(wf)                                                                             \
     do { if (thr == 1024)     R4D_RNF_T(wf, 1024);                                              \
          else if (thr == 512) R4D_RNF_T(wf, 512);                                               \

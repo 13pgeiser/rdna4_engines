@@ -78,10 +78,12 @@ __global__ __launch_bounds__(HD) void qkv_norm_rope_kernel(
     const int32_t* __restrict__ pos, const void* __restrict__ qw, const void* __restrict__ kw,
     uint32_t nq, uint32_t nkv, uint32_t pq, uint32_t pk, uint32_t pv,
     uint32_t q_ld, uint32_t k_ld, uint32_t v_ld, float eps, float wadd,
-    uint32_t rot, uint32_t nfreq, int den, float theta, float rscale, uint32_t n_pos) {
+    uint32_t rot, uint32_t nfreq, int den, float theta, float rscale, uint32_t n_pos,
+    uint32_t m_rows) {
     __shared__ float l1[HD / kWave], l2[HD / kWave];
     __shared__ uint16_t nb[HD];
     const uint32_t m = blockIdx.x, hh = blockIdx.y, t = threadIdx.x;
+    if (m >= m_rows) return;   // a row the launch added past the full-card cliff (r4d_cliff_rows)
     const float div = rscale != 0.0f ? rscale : 1.0f;
     // rope rotates only the rows its positions cover; a row past them is normed and not rotated
     const float p0 = m < n_pos ? (float)pos[m] / div : 0.0f;
@@ -172,12 +174,16 @@ extern "C" int r4d_rad_qkv_norm_rope(const RadArgs* a, RadStream stream) {
     const float wadd  = (float)r4d_getf(a, "wadd", 0.0);
     const float theta = (float)r4d_getf(a, "theta", 10000.0);
     const float rsc   = (float)r4d_getf(a, "scale", 1.0);
-    const dim3 grid((uint32_t)M, (uint32_t)(nq + nkv + ((vk || !vn) ? 0 : nkv)));
+    const uint32_t heads = (uint32_t)(nq + nkv + ((vk || !vn) ? 0 : nkv));
+    // A tp-4 verify of the 31B is 16 rows x 16 heads of 8 wavefronts: exactly a full card, the
+    // cliff r4d_cliff_rows steps past with one idle row.
+    const dim3 grid(r4d_cliff_rows((uint32_t)M, heads, (uint32_t)(hd / kWave)), heads);
 
 #define R4D_QNR_T(HD, WF, VK) emit_rc = R4D_EMIT(stream, (qkv_norm_rope_kernel<HD, WF, VK>), grid, dim3(HD), 0, \
     (uint16_t*)r4d_wp(q), (uint16_t*)r4d_wp(k), (uint16_t*)r4d_wp(v), (const int32_t*)r4d_p(ps),           \
     r4d_p(qw), r4d_p(kw), (uint32_t)nq, (uint32_t)nkv, pq, pk, pv, (uint32_t)q_ld, (uint32_t)k_ld,          \
-    (uint32_t)v_ld, eps, wadd, (uint32_t)rot_l, (uint32_t)nfreq, (int)den, theta, rsc, (uint32_t)Mp)
+    (uint32_t)v_ld, eps, wadd, (uint32_t)rot_l, (uint32_t)nfreq, (int)den, theta, rsc, (uint32_t)Mp,        \
+    (uint32_t)M)
 #define R4D_QNR(HD)                                                                                     \
     do { if (qw->dtype == RAD_F32) { if (vk) R4D_QNR_T(HD, true, true);  else R4D_QNR_T(HD, true, false); } \
          else                      { if (vk) R4D_QNR_T(HD, false, true); else R4D_QNR_T(HD, false, false); } } while (0)
