@@ -739,6 +739,10 @@ fn value_text(key: &str, value: &ConfigValue) -> String {
         "memory.gpu_layer_budget" | "memory.moe_expert_budget" => layers_label(&raw),
         "memory.offload_exec" => offload_exec_label(&raw),
         "memory.offload_passback_share" => passback_share_label(&raw),
+        // An empty K/V axis takes its half of `memory.kv_cache`'s pair.
+        "memory.kv_k" | "memory.kv_v" if matches!(value, ConfigValue::String(text) if text.is_empty()) => {
+            "(follows KV)".to_owned()
+        }
         _ => match value {
             ConfigValue::Bool(flag) => knobs::curated_knob(key)
                 .and_then(|knob| {

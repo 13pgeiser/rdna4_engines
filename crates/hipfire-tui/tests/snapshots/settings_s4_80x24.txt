@@ -10,8 +10,8 @@
  │> KV cache precision        fp8 (auto)        default · gfx1201  Memory     │
  │  KV fit-to-memory          off               default            Memory     │
  │  KV cache layout           vmm               default            Memory     │
- │  KV key format             (empty)           default            Memory     │
- │  KV value format           (empty)           default            Memory     │
+ │  KV key format             (follows KV)      default            Memory     │
+ │  KV value format           (follows KV)      default            Memory     │
  │  memory.unsafe_wsl_vmm_kv  off               default            Memory     │
  └────────────────────────────────────────────────────────── rows 1–6 of 30 ↓ ┘
  ┌ KV cache precision ────────────────────────────────────────────────────────┐
