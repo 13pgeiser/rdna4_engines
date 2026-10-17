@@ -738,6 +738,21 @@ pub fn a4_sidecar_bytes(geometry: &ModelGeometry, rows: usize) -> Result<u64, St
     })
 }
 
+/// Device bytes of the window-size grouped-scatter Gpu scratch
+/// (`qwen4_moe_group_layout(rows * top-k, n_exp)`) the single count barrier
+/// grows, from the dispatch crate's own layout. Excluded from
+/// [`route_storage_bytes`] and [`a4_sidecar_bytes`].
+pub fn group_scatter_bytes(geometry: &ModelGeometry, rows: usize) -> Result<u64, String> {
+    hipfire_dispatch::pipeline::slowlink_prefill::PromptRouteLayout::new(&route_dims(
+        geometry, rows,
+    ))
+    .map_err(|error| error.to_string())
+    .and_then(|layout| {
+        u64::try_from(layout.group_scatter_bytes())
+            .map_err(|_| "slow-link prefill group scatter overflows".to_string())
+    })
+}
+
 /// Everything the S1 profile costs beyond the incumbent's 1,536-row reserve,
 /// term by term. [`Self::total`] is the one number placement charges
 /// ([`crate::expert_residency::PlacementCharges::slowlink`]).
@@ -753,6 +768,12 @@ pub struct SlowlinkCensus {
     pub route_storage: u64,
     /// The window-wide A4 activation sidecars ([`a4_sidecar_bytes`]).
     pub a4_sidecars: u64,
+    /// The window-size grouped-scatter Gpu scratch of the single count barrier
+    /// ([`group_scatter_bytes`], `qwen4_moe_group_layout` at window slots): the
+    /// FULL window figure, charged on top of the 1536-row tile workspace the
+    /// base reserve already holds (the grown buffer frees the old one, so the
+    /// replacement peak holds both).
+    pub group_scatter: u64,
     /// The architecture-owned HC-stream arena ([`PromptArenaLayout`]).
     pub arena: u64,
     /// [`S1_MAX_BOUNDARY_SNAPSHOTS`] boundary stages of the target's session
@@ -764,12 +785,13 @@ pub struct SlowlinkCensus {
 
 impl SlowlinkCensus {
     /// Every term, named, in log order.
-    pub fn terms(&self) -> [(&'static str, u64); 6] {
+    pub fn terms(&self) -> [(&'static str, u64); 7] {
         [
             ("expert ring", self.ring),
             ("expert lookahead", self.lookahead),
             ("route storage", self.route_storage),
             ("A4 sidecars", self.a4_sidecars),
+            ("group scatter", self.group_scatter),
             ("HC arena", self.arena),
             ("boundary state", self.boundary_state),
         ]
@@ -925,6 +947,7 @@ pub fn admit(inputs: &AdmissionInputs) -> Result<SlowlinkProfile, SlowlinkDeclin
             lookahead: pages.lookahead_bytes()?,
             route_storage: route_storage_bytes(&inputs.geometry, window_rows)?,
             a4_sidecars: a4_sidecar_bytes(&inputs.geometry, window_rows)?,
+            group_scatter: group_scatter_bytes(&inputs.geometry, window_rows)?,
             arena: arena.total_bytes,
             boundary_state: checked_mul(
                 S1_MAX_BOUNDARY_SNAPSHOTS as u64,
@@ -1422,6 +1445,7 @@ mod tests {
         pages.total_bytes().unwrap()
             + route_storage_bytes(&inputs.geometry, inputs.window_rows).unwrap()
             + a4_sidecar_bytes(&inputs.geometry, inputs.window_rows).unwrap()
+            + group_scatter_bytes(&inputs.geometry, inputs.window_rows).unwrap()
             + arena.total_bytes
             + S1_MAX_BOUNDARY_SNAPSHOTS as u64 * inputs.fixed_state_bytes
             + inputs.pending_save_bytes
@@ -1845,6 +1869,11 @@ mod tests {
             a4_sidecar_bytes(&profile.geometry, profile.window_rows).unwrap()
         );
         assert!(profile.census.a4_sidecars > 0 && profile.census.route_storage > 0);
+        assert_eq!(
+            profile.census.group_scatter,
+            group_scatter_bytes(&profile.geometry, profile.window_rows).unwrap()
+        );
+        assert!(profile.census.group_scatter > 0);
         assert_eq!(profile.reserve_bytes().unwrap(), census_total(&inputs));
         assert_eq!(profile.tile_rows, 1536);
         assert!(profile.tile_rows <= 1536);
@@ -2099,6 +2128,14 @@ mod tests {
             "census and allocation read one layout"
         );
         assert_eq!(profile.census.a4_sidecars, layout.a4_sidecar_bytes() as u64);
+        assert_eq!(
+            profile.census.group_scatter,
+            layout.group_scatter_bytes() as u64
+        );
+        // Full window grouped-scatter scratch at N=16384 slots=163840, E=512:
+        // the 1536-tile's 309,248 B stays in the base reserve (replacement
+        // peak holds old + new), so the full figure is charged on top.
+        assert_eq!(profile.census.group_scatter, 3_278_848);
     }
 
     #[test]
