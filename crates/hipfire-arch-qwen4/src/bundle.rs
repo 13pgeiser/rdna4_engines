@@ -5182,6 +5182,63 @@ mod tests {
         assert_eq!(full_f32, 118_230_528 + 40_960);
     }
 
+    fn precision_state_format(gdn: rdna_compute::tensor_ops::GdnStateFormat) -> Qwen4StateFormat {
+        Qwen4StateFormat {
+            gdn,
+            ..Qwen4StateFormat::F32
+        }
+    }
+
+    /// The session-cache scope (the cache's key domain for every snapshot) is
+    /// qualified by the full state format, so a Q8-state snapshot is never
+    /// planned, matched or restored into an F32-state bundle, or the reverse.
+    #[test]
+    fn gdn_precision_owner_accounting_session_scope_is_format_qualified() {
+        use rdna_compute::tensor_ops::GdnStateFormat;
+        let q8 = precision_state_format(GdnStateFormat::Q8);
+        let f32 = precision_state_format(GdnStateFormat::F32);
+        for route in [SessionRoute::Ar, SessionRoute::Mtp] {
+            for chunk in [256usize, 4096] {
+                for turns in [false, true] {
+                    let scope = |format| session_scope(route, chunk, format, turns, None);
+                    let (q8_scope, f32_scope) = (scope(q8), scope(f32));
+                    assert_ne!(q8_scope, f32_scope, "{route:?} chunk {chunk} turns {turns}");
+                    assert!(q8_scope.contains("gdn: Q8") && !q8_scope.contains("gdn: F32"));
+                    assert!(f32_scope.contains("gdn: F32") && !f32_scope.contains("gdn: Q8"));
+                    // The GDN format is the only difference.
+                    assert_eq!(
+                        q8_scope.replace("gdn: Q8", "gdn: F32"),
+                        f32_scope,
+                        "{route:?} chunk {chunk} turns {turns}"
+                    );
+                    // Same format, same scope.
+                    assert_eq!(scope(q8), q8_scope);
+                    assert_eq!(scope(f32), f32_scope);
+                }
+            }
+        }
+    }
+
+    /// A snapshot's fixed parts have the live state's byte lengths. Q8 and F32
+    /// recurrent parts differ in length, so the restore's per-part length check
+    /// (`hipfire-runtime` `session_cache`: "snapshot layout mismatch") refuses
+    /// one format's snapshot in the other format's state; no code converts it.
+    #[test]
+    fn gdn_precision_owner_accounting_session_entries_are_not_interchangeable() {
+        use rdna_compute::tensor_ops::GdnStateFormat;
+        let config = crate::config::compact_test_config();
+        let q8 = precision_state_format(GdnStateFormat::Q8);
+        let f32 = precision_state_format(GdnStateFormat::F32);
+        let recurrent_delta = (config.n_linear_layers() * (3_145_728 - 811_008)) as u64;
+        for native in [false, true] {
+            for p in [0usize, 1, 1536, 4096] {
+                let q8_bytes = session_snapshot_bytes(&config, q8, native, p).unwrap();
+                let f32_bytes = session_snapshot_bytes(&config, f32, native, p).unwrap();
+                assert_eq!(f32_bytes - q8_bytes, recurrent_delta, "native {native} p {p}");
+            }
+        }
+    }
+
     #[test]
     fn a_head_free_profile_refuses_native_mtp_with_a_typed_error() {
         assert!(Qwen4Bundle::require_mtp_head("tiny-dense", true).is_ok());

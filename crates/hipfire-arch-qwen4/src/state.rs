@@ -5096,3 +5096,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "state_precision_accounting_tests.rs"]
+mod precision_accounting_tests;

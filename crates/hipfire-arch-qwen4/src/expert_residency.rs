@@ -4964,4 +4964,151 @@ mod tests {
             assert!(error.contains("expert parallelism"), "{error}");
         }
     }
+
+    /// One recurrent layer's F32 storage minus its Q8 storage (3145728 - 811008).
+    const GDN_SLOT_DELTA: u64 = 2_334_720;
+
+    fn precision_format(qsa: QsaKvFormat, gdn: crate::GdnStateFormat) -> crate::Qwen4StateFormat {
+        crate::Qwen4StateFormat {
+            qsa,
+            gdn,
+            qsa_f16_arena: false,
+            qsa_pooled_bf16: false,
+        }
+    }
+
+    #[test]
+    fn state_census_charges_f32_gdn_as_live_plus_mirror_over_q8() {
+        let config = crate::config::compact_test_config();
+        let gdn_layers = config.n_linear_layers() as u64;
+        assert_eq!(gdn_layers, 36);
+        let max_seq = 17_408;
+        let granularity = 2 << 20;
+        for backend in [crate::Qwen4KvBackend::Legacy, crate::Qwen4KvBackend::Vmm] {
+            let full = crate::Qwen4ContextCommit::new(backend, max_seq, max_seq, granularity);
+            for qsa in [QsaKvFormat::Fp8, F32, QsaKvFormat::Q8] {
+                let q8 = state_census(
+                    &config,
+                    precision_format(qsa, crate::GdnStateFormat::Q8),
+                    &full,
+                    4096,
+                    Full,
+                )
+                .unwrap();
+                let f32 = state_census(
+                    &config,
+                    precision_format(qsa, crate::GdnStateFormat::F32),
+                    &full,
+                    4096,
+                    Full,
+                )
+                .unwrap();
+                // Exactly (F32 - Q8) x (live + mirror) x the 36 GDN layers:
+                // 2 x 80.15625 MiB. The context, forward scratch and every
+                // other term are the same inputs: nothing is lowered.
+                assert_eq!(
+                    f32.state - q8.state,
+                    2 * gdn_layers * GDN_SLOT_DELTA,
+                    "{backend:?} {qsa:?}"
+                );
+                assert_eq!(f32.state - q8.state, 168_099_840);
+                assert_eq!(f32.qsa_context, q8.qsa_context, "{backend:?} {qsa:?}");
+                assert_eq!(f32.forward, q8.forward, "{backend:?} {qsa:?}");
+                // The reserve's total moves by the same bytes and no more.
+                let total = |census: StateCensus| {
+                    census_with(census.qsa_context, census.state, census.forward, 0, 0)
+                        .total()
+                        .unwrap()
+                };
+                assert_eq!(total(f32) - total(q8), 168_099_840);
+            }
+        }
+    }
+
+    #[test]
+    fn state_census_scope_charges_local_gdn_layers_and_ep_replicates() {
+        let config = crate::config::compact_test_config();
+        let context = crate::Qwen4ContextCommit::legacy(1024);
+        let q8 = precision_format(QsaKvFormat::Fp8, crate::GdnStateFormat::Q8);
+        let f32 = precision_format(QsaKvFormat::Fp8, crate::GdnStateFormat::F32);
+        let delta = |scope: &Qwen4BandScope| {
+            let q8 = state_census_scope(&config, q8, &context, 256, Full, scope).unwrap();
+            let f32 = state_census_scope(&config, f32, &context, 256, Full, scope).unwrap();
+            assert_eq!(q8.qsa_context, f32.qsa_context);
+            assert_eq!(q8.forward, f32.forward);
+            f32.state - q8.state
+        };
+        let whole = delta(&Qwen4BandScope::single(&config));
+        assert_eq!(whole, 2 * 36 * GDN_SLOT_DELTA);
+        // PP: each band is charged its own GDN layers (live + mirror); the
+        // bands sum to the whole model, nothing is divided or duplicated.
+        for counts in [&[24usize, 24][..], &[9, 8, 8, 8, 8, 7][..]] {
+            let mut sum = 0;
+            for scope in band_scopes(&config, counts) {
+                let (gdn_layers, _) = crate::state::scope_layer_counts(&config, &scope);
+                assert!(gdn_layers > 0 && gdn_layers < 36);
+                let band = delta(&scope);
+                assert_eq!(band, 2 * gdn_layers as u64 * GDN_SLOT_DELTA, "{counts:?}");
+                sum += band;
+            }
+            assert_eq!(sum, whole, "{counts:?}");
+        }
+        // EP: every rank replicates the recurrent state, so the census of a
+        // whole-model rank is the single census at any rank count, and a band
+        // never combines with EP.
+        let single = Qwen4BandScope::single(&config);
+        for ranks in 1..=8 {
+            assert_eq!(refuse_band_with_expert_parallel(&config, &single, ranks), Ok(()));
+            assert_eq!(
+                state_census_scope(&config, f32, &context, 256, Full, &single).unwrap(),
+                state_census(&config, f32, &context, 256, Full).unwrap(),
+                "{ranks} ranks"
+            );
+        }
+        for scope in band_scopes(&config, &[24, 24]) {
+            assert!(refuse_band_with_expert_parallel(&config, &scope, 2).is_err());
+        }
+    }
+
+    #[test]
+    fn state_census_native_mtp_reserve_charges_the_f32_ring_per_band() {
+        let config = crate::config::compact_test_config();
+        let manifest = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        let weights = &manifest.weights;
+        let context = crate::Qwen4ContextCommit::legacy(1024);
+        let inputs = |gdn, ring| NativeMtpCensusInputs {
+            max_k: 3,
+            row_capture: Some((gdn, ring)),
+            batched_fill: false,
+        };
+        for ring in [4usize, 8, 32] {
+            let census = |gdn, scope: &Qwen4BandScope| {
+                native_mtp_census_scope(&config, weights, &context, 256, &inputs(gdn, ring), scope)
+                    .unwrap()
+            };
+            for counts in [&[48usize][..], &[24, 24][..], &[9, 8, 8, 8, 8, 7][..]] {
+                for scope in band_scopes(&config, counts) {
+                    let (gdn_layers, _) = crate::state::scope_layer_counts(&config, &scope);
+                    let q8 = census(crate::GdnStateFormat::Q8, &scope);
+                    let f32 = census(crate::GdnStateFormat::F32, &scope);
+                    // The band's own 2R ring slots per local GDN layer.
+                    assert_eq!(
+                        f32.row_capture - q8.row_capture,
+                        gdn_layers as u64 * 2 * ring as u64 * GDN_SLOT_DELTA,
+                        "{counts:?} {:?} R={ring}",
+                        scope.band
+                    );
+                    // The head and request terms do not depend on the format.
+                    assert_eq!(f32.head_resident, q8.head_resident);
+                    assert_eq!(f32.request, q8.request);
+                    assert_eq!(
+                        f32.reserve().unwrap() - q8.reserve().unwrap(),
+                        f32.row_capture - q8.row_capture,
+                        "{counts:?} {:?} R={ring}",
+                        scope.band
+                    );
+                }
+            }
+        }
+    }
 }

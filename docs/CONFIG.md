@@ -462,6 +462,7 @@ model's contract still accepts the named-cap route):
 | `kv_v` | empty (unset) | Qwen-only: `q8`, `lloyd2`–`lloyd4` |
 | `kv_adaptive` | `"off"` | `off`, `conservative`, `balanced`, `aggressive`, or `advanced:k=<fwht4\|fwht3\|fwht2>,v=<lloyd4\|lloyd3\|lloyd2>` |
 | `kv_backend` | schema `"vmm"`; automatic when not authored | `legacy` \| `vmm` |
+| `state_quant` | `"auto"` | `auto`, `q8`/`int8`, `fp32`/`f32`, `q4`/`int4` (Qwen3.5 only). GDN/DeltaNet recurrent-state storage (`memory.state_quant`, env `HIPFIRE_STATE_QUANT`); `auto` = Flash-Next F32 on exact gfx1151, Q8 on every other arch; explicit values honored or refused, never rewritten; semantics in the Qwen4 paragraph below the Flash-Next table |
 
 ### Mode, K, and V
 
@@ -543,8 +544,9 @@ LFM2-MoE resolve `auto` to q8).
 
 **Qwen3.8-Flash-Next / Qwen4 (arch 16)** has its own table: `kv_cache`
 sets the storage of the QSA full-attention K/V arenas. The GatedDeltaNet
-recurrent state is separate: Qwen3.5's Q8 DeltaNet format by default on every
-arch, `fp32` through the `state_quant` load parameter.
+recurrent state is separate and follows `memory.state_quant` (below the
+table): `auto` is F32 on exact gfx1151 and Qwen3.5's Q8 DeltaNet format on
+every other arch; `q8` is the kill switch and `fp32` the explicit opt-in.
 
 | `kv_cache` | gfx1201 | gfx1151 (Halo), gfx1100 (7900 XTX) | other gfx11/gfx12 | gfx942 (MI300X) | other arches |
 |---|---|---|---|---|---|
@@ -589,6 +591,48 @@ Q8 GDN state is 3.88× smaller than F32. `memory.max_seq` goes up to the
 native 262,144. Index keys hold the same values in every format, so
 selection is unchanged; only the attention over the selected K/V rows sees
 the quantization.
+
+**GDN recurrent state: `memory.state_quant`.** Storage of the
+GatedDeltaNet/DeltaNet recurrent state, separate from `kv_cache`. Values
+`auto` (default), `q8`/`int8`, `fp32`/`f32`, `q4`/`int4`; legacy key
+`state_quant`, env `HIPFIRE_STATE_QUANT`, CLI `hipfire config set state_quant
+<value>`. `auto` is the per-model/arch default: on Qwen3.8-Flash-Next it is
+**F32 on exact gfx1151 (Halo)** and Q8 on gfx1100, gfx1201 and every other
+arch (each promoted independently); on the stock-FP8 profile (gfx942) F32 is
+pinned and `q8` is refused; Qwen3.5 keeps Q8. `q4`/`int4` is Qwen3.5-only. An
+explicit value is honored or refused for the model/arch, never rewritten, and
+there is no free-memory fallback from F32 to Q8. The Q8 format needs 128×128
+heads; Flash-Next qualifies.
+
+**Kill switch:** `hipfire config set state_quant q8`, `state_quant = "q8"` in
+the TOML, or `HIPFIRE_STATE_QUANT=q8` restores the Q8 recurrent state on
+gfx1151.
+
+**Numerical change.** F32 state has no per-token requantization. The gfx1151
+default output is therefore **not bit-identical** to the previous Q8 default;
+explicit `q8` is the previous route. Switching the format between loads changes
+the session-cache scope (`Q8` vs `F32` in the state-format part of the key), and
+a snapshot of one format is never restored into the other (the fixed-part
+lengths differ, and the restore refuses a length mismatch).
+
+**Memory owners (storage sizes of the format, not measured costs).** For
+Flash-Next (36 GDN layers, 48 value heads, 128×128): 811,008 B (Q8) or
+3,145,728 B (F32) per layer, 27.84375 or 108 MiB per recurrent set, so each
+live set is **+80.15625 MiB** under F32. The transaction (snapshot) mirror is
+one more set: live + mirror 55.6875 → 216 MiB. Native MTP replaces the live
+set by a ring of 2R slots (R = the actual capture-ring rows, logged at load,
+not inferred from K) plus one separately allocated mirror, so ring + mirror
+grows by 160.3125·R + 80.15625 MiB (R = 4: 250.59375 → 972 MiB; R = 8: Q8 ring
+445.5 → F32 1728 MiB; R = 32: 1782 → 6912 MiB). Every session-cache or prefix
+entry holds one fixed set: +80.15625 MiB per entry whatever its row count.
+Conv state and the QSA K/V arenas do not change with the format. Lanes
+multiply these owners, pipeline-parallel bands charge their own GDN layers, and
+expert-parallel ranks each replicate the recurrent state (it is never divided
+by the rank count). Admission and the placement reserve charge the F32 bytes
+(live + mirror and the full capture ring); hipfire never lowers context, cache
+budget or lane count to make F32 fit, and where a limit is already derived from
+free memory (the unified-memory context cap) the F32 bytes enter that
+arithmetic.
 
 **Kill switch:** `HIPFIRE_QWEN_KV_DEFAULT_Q8=0` (developer variable) restores
 the prior *implicit Qwen* per-site default wherever `auto` does not pick
@@ -1095,6 +1139,7 @@ Compat env: `HIPFIRE_GPU_LAYER_BUDGET`, `HIPFIRE_MOE_EXPERT_BUDGET`, `HIPFIRE_OF
 | `memory.ple_format` | `auto` | `auto` \| `q4` \| `q8`; which PLE row table a Flash-Next (Qwen4) load reads. `q8` = the exact Q8F16 rows (embedded in the monolithic `qwen3.8:flash-next-mq4-xts`, or the `<model>.ple-q8` sidecar of a split base); `q4` = the 4-bit Lloyd-Max rows `<model>.ple-q4`, decode equal to the tested q4 table, a load never derives it: a missing file is refused naming both searched locations (the model path as given, then its canonical symlink target), `hipfire pull <tag> --ple q4` and `hipfire ple derive --format q4 <model>` (derives it from the local Q8 rows, about 1 minute, progress on stderr). `auto` = q4 on gfx1151 (unified-memory Strix Halo), q8 elsewhere; `auto` never derives or downloads and falls back to the other available format with a note. An explicit `q8` on a split base needs `<model>.ple-q8` (`hipfire pull <tag> --ple q8`; `serve` downloads it on demand for registry models). See [Qwen4 PLE row tables](#qwen4-ple-row-tables). Env: `HIPFIRE_PLE_FORMAT` ([`env-vars.md`](env-vars.md)). |
 | `memory.ple_prewarm_bytes` | `auto` | `auto` or int 0–1 TiB; idle-only page-cache prewarm of the q4 PLE table `<model>.ple-q4` after the model is ready (a rank-ordered table: hottest tier first, then tier 0 again, the hot-row store's prewarm; a row-ordered one: sequentially). `auto` = 15 GiB (the hottest rows, where the value per GB of warm rows is highest), capped at `MemAvailable` minus 8 GiB at ready and at the table; `0` = off (kill switch); an explicit N is that many bytes. The pages are clean, reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission. See [Qwen4 PLE row tables](#qwen4-ple-row-tables). Env: `HIPFIRE_PLE_PREWARM_BYTES` ([`env-vars.md`](env-vars.md)). |
 | `memory.ple_load_fill_bytes` | `auto` | `auto` or int 0–1 TiB; bytes of a rank-ordered q4 PLE table `<model>.ple-q4` read into the page cache **while the model loads**, hottest rows first, at most 0.2 GB/s so the weight upload keeps the drive. The upload streams the model file through the same cache and evicts the oldest pages first, so the fill re-reads evicted pages of its prefix (found with `mincore`), hottest first, until ready. Ready never waits for it; the resident prefix serves the first request, and the prewarm after ready (`memory.ple_prewarm_bytes`) continues at its end. `auto` = 14 GiB (the smallest prefix whose modelled prose and agentic 8K prefill is within 1% of the 15 GiB prewarm's); any value is capped at the table, at an explicit `memory.ple_prewarm_bytes`, and at the host RAM available at load start (`MemAvailable` minus the CMA region, plus TTM's page pool) minus the weights the load puts in host RAM minus 8 GiB. `0` = off. Clean, reclaimable page cache, not charged in admission. Env: `HIPFIRE_PLE_LOAD_FILL_BYTES` ([`env-vars.md`](env-vars.md)). |
+| `memory.state_quant` | `auto` | `auto` \| `q8` \| `int8` \| `fp32` \| `f32` \| `q4` \| `int4`. GDN/DeltaNet recurrent-state storage; `auto` per-model/arch default (Qwen3.8-Flash-Next: F32 on exact gfx1151, Q8 elsewhere; Qwen3.5: Q8). Explicit values honored or refused, never rewritten; q4/int4 Qwen3.5-only. Kill switch: `hipfire config set state_quant q8` or `HIPFIRE_STATE_QUANT=q8`. Env: `HIPFIRE_STATE_QUANT` ([`env-vars.md`](env-vars.md)). See [KV cache](#kv-cache) for the Qwen4 format, numerical and memory-owner semantics. |
 
 Qwen AR, MTP and DFlash multi-turn reuse store each completed assistant turn as the
 **verbatim generated token span** (whole envelope: full body tokens, plus
@@ -1766,6 +1811,7 @@ uses ambient variables in engine hot paths.
 | `ple_load_fill_bytes` | `memory.ple_load_fill_bytes` | `HIPFIRE_PLE_LOAD_FILL_BYTES` | `auto` (read the hottest 14 GiB of a rank-ordered q4 PLE table during load at ≤ 0.2 GB/s; `0` off) |
 | `session_cache_disk_bytes` | `memory.session_cache_disk_bytes` | `HIPFIRE_SESSION_CACHE_DISK_BYTES` | 0 (off) |
 | `session_cache_dir` | `memory.session_cache_dir` | `HIPFIRE_SESSION_CACHE_DIR` | `$HIPFIRE_HOME/session-cache` |
+| `state_quant` | `memory.state_quant` | `HIPFIRE_STATE_QUANT` | `"auto"` (Flash-Next: F32 on exact gfx1151, Q8 elsewhere; Qwen3.5: Q8) |
 | `devices` | `hardware.devices` | `HIPFIRE_DEVICES` (alias `HIPFIRE_DEVICE`) | unset |
 | `allow_mixed_arch` | `hardware.allow_mixed_arch` | `HIPFIRE_ALLOW_MIXED_ARCH` | false unless `1` |
 | `uniform_vram_tolerance_gb` | `hardware.uniform_vram_tolerance_gb` | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | unset |
@@ -2042,6 +2088,7 @@ misspelled key is unknown and fails the load with
 | `memory.session_cache_bytes` | `session_cache_bytes` | `HIPFIRE_SESSION_CACHE_BYTES` | stable |
 | `memory.session_cache_dir` | `session_cache_dir` | `HIPFIRE_SESSION_CACHE_DIR` | stable |
 | `memory.session_cache_disk_bytes` | `session_cache_disk_bytes` | `HIPFIRE_SESSION_CACHE_DISK_BYTES` | stable |
+| `memory.state_quant` | `state_quant` | `HIPFIRE_STATE_QUANT` | stable |
 | `memory.unsafe_wsl_vmm_kv` | `unsafe_wsl_vmm_kv` | `HIPFIRE_UNSAFE_WSL_VMM_KV` | experimental |
 | `model.deepseek4_experts_per_token` | `deepseek4_experts_per_token` |  | stable |
 | `prefill.chunk_rows` | `prefill_chunk_rows` | `HIPFIRE_PREFILL_CHUNK_ROWS` | stable |
