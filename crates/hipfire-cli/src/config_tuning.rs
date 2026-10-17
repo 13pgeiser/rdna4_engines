@@ -902,6 +902,29 @@ mod tests {
         assert_eq!(doc["status"], "preset");
         assert_eq!(doc["preset"], "quality-first");
 
+        // `config list` attributes the preset-owned keys to the preset.
+        fs::write(
+            paths.config.root.join("install.json"),
+            r#"{"gpu_arch":"gfx1201"}"#,
+        )
+        .unwrap();
+        let mut listed = Vec::new();
+        crate::config_view::list_global_to(
+            &paths,
+            &crate::ConfigListArgs {
+                group: Some("quality".into()),
+                ..Default::default()
+            },
+            &mut listed,
+        )
+        .unwrap();
+        let listed = String::from_utf8(listed).unwrap();
+        let iu4 = listed
+            .lines()
+            .find(|line| line.trim_start().starts_with("kernel.iu4_prefill "))
+            .unwrap_or_else(|| panic!("{listed}"));
+        assert!(iu4.contains(" false ") && iu4.contains(" preset "), "{iu4}");
+
         let again = exec(&paths, &rt, set(Preset::QualityFirst, true), "");
         assert!(again.out.contains("nothing to change"), "{}", again.out);
 

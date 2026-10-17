@@ -12,9 +12,10 @@ use std::io::Write;
 
 use anyhow::{anyhow, bail, Result};
 use hipfire_config::effective::{
-    effective, install_gpu_arch, origin_of, A8Prefill, ArchCtx, Effective, Origin,
+    effective, install_gpu_arch, A8Prefill, ArchCtx, Effective, Origin,
 };
 use hipfire_config::intent::{field_matches, intent_of, key_matches, Intent};
+use hipfire_config::tuning::{attribute, TuningState};
 use hipfire_config::{
     canonical_config_key, detect_config_profile, developer_env_for_key, field, fields,
     is_developer_key, load_catalog, load_config_profile, load_global, unknown_key, ConfigField,
@@ -167,6 +168,8 @@ pub(crate) struct View<'a> {
     /// The layer whose keys count as "overridden" in this scope.
     overridden_in: &'a ConfigLayer,
     profile: Option<(String, ConfigLayer)>,
+    /// `~/.hipfire/tuning.toml`: keys the applied preset owns read `preset`.
+    tuning: TuningState,
 }
 
 impl<'a> View<'a> {
@@ -198,11 +201,15 @@ impl<'a> View<'a> {
             let bundle = load_config_profile(&paths.config, &name).ok()?;
             Some((name, bundle))
         });
+        // An unreadable tuning.toml only loses the `preset` attribution; the
+        // listing itself must not fail on it.
+        let tuning = TuningState::load(&paths.config).unwrap_or_default();
         Self {
             ctx,
             resolved,
             overridden_in,
             profile,
+            tuning,
         }
     }
 
@@ -213,11 +220,12 @@ impl<'a> View<'a> {
     pub(crate) fn row(&self, key: &str) -> Row<'a> {
         let canonical = hipfire_config::canonical_config_key(key).unwrap_or_else(|| key.to_owned());
         let effective = effective(&canonical, self.resolved, &self.ctx);
-        let origin = origin_of(
+        let origin = attribute(
             &canonical,
             self.resolved,
             &effective,
             &self.ctx,
+            &self.tuning,
             self.profile
                 .as_ref()
                 .map(|(name, bundle)| (name.as_str(), bundle)),
