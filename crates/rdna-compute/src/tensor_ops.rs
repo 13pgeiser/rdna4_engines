@@ -2019,7 +2019,7 @@ fn gated_delta_conv_launch(
 /// `tensor_ops.hip` plus the multi-lane GDN core kernels (`gdn_lanes.hip`):
 /// the lane kernels inline the same device bodies under the same flags, and
 /// the `tensor_ops` module's source stays untouched.
-const GDN_LANES_SRC: &str = concat!(
+pub(crate) const GDN_LANES_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_fwht256.h"),
     include_str!("../../../kernels/src/rope_yarn.h"),
     include_str!("../../../kernels/src/tensor_ops.hip"),
@@ -2058,7 +2058,7 @@ pub fn gated_delta_core_lanes(
     if lanes.len() < 2
         || lanes.len() > GDN_CORE_LANES_MAX
         || gpu.replay.is_recording()
-        || !gpu.arch_caps.has_gfx11_plus_simt()
+        || !gpu.flags.qwen4_gdn_lanes_enabled()
     {
         return Ok(false);
     }

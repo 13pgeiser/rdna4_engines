@@ -2000,6 +2000,15 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::ROPE_PARTIAL_HALFSPLIT_HEADGRID_SRC,
             ["rope_partial_halfsplit_f32_headgrid"]
         );
+        // Exact-gfx1151 multi-lane fn-lanes GDN decode core (default on; =0 kill switch HIPFIRE_QWEN4_GDN_LANES; tensor_ops.rs gated_delta_core_lanes).
+        add!(
+            "gdn_lanes",
+            crate::tensor_ops::GDN_LANES_SRC,
+            [
+                "gated_delta_conv_params_bf16_f32_lanes",
+                "gated_delta_step_gate_norm128_q8_lanes"
+            ]
+        );
     }
     // Qwen3.8-Flash-Next (Qwen4) load, AR prefill/decode and native MTP:
     // every module a kernel-load trace (tests/fixtures/kernel-trace-qwen4-

@@ -94,6 +94,9 @@ pub struct FeatureFlags {
     /// (`HIPFIRE_QWEN4_ROUTER_FAST`), default on for gfx1151 and gfx1201, off
     /// elsewhere.
     pub qwen4_router_fast: bool,
+    /// Multi-lane fn-lanes GDN decode core (`HIPFIRE_QWEN4_GDN_LANES`), default
+    /// on for gfx1151, off elsewhere.
+    pub qwen4_gdn_lanes: bool,
     /// Exact single-token GDN a/b/z MQ4 projection fusion
     /// (`HIPFIRE_QWEN4_DECODE_ZBA_X3`), default on only for gfx1151.
     pub qwen4_decode_zba_x3: bool,
@@ -850,6 +853,7 @@ impl FeatureFlags {
                 .unwrap_or(exact_unit_default),
             qwen4_hc_row_fold: parse_bool("HIPFIRE_QWEN4_HC_ROW_FOLD").unwrap_or(halo_hyper_default),
             qwen4_router_fast: parse_bool("HIPFIRE_QWEN4_ROUTER_FAST").unwrap_or(exact_unit_default),
+            qwen4_gdn_lanes: parse_bool("HIPFIRE_QWEN4_GDN_LANES").unwrap_or(arch == "gfx1151"),
             qwen4_decode_zba_x3: parse_bool("HIPFIRE_QWEN4_DECODE_ZBA_X3")
                 .unwrap_or(arch == "gfx1151"),
             qwen4_decode_head_fuse: parse_bool("HIPFIRE_QWEN4_DECODE_HEAD_FUSE")
@@ -1303,6 +1307,12 @@ impl FeatureFlags {
 
     /// Wave-per-token E512/top-10 router for batched prefill
     /// (`HIPFIRE_QWEN4_ROUTER_FAST`). Exact gfx1151 / gfx1201.
+    /// Multi-lane fn-lanes GDN decode core (`HIPFIRE_QWEN4_GDN_LANES`). Exact
+    /// gfx1151 only.
+    pub fn qwen4_gdn_lanes_enabled(&self) -> bool {
+        self.qwen4_gdn_lanes && self.arch == "gfx1151"
+    }
+
     pub fn qwen4_router_fast_enabled(&self) -> bool {
         self.qwen4_router_fast && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
     }
@@ -1461,6 +1471,7 @@ impl FeatureFlags {
             qwen4_moe_combine_zinit: false,
             qwen4_hc_row_fold: false,
             qwen4_router_fast: false,
+            qwen4_gdn_lanes: false,
             qwen4_decode_zba_x3: false,
             qwen4_decode_head_fuse: false,
             qwen4_ple_fuse: false,
