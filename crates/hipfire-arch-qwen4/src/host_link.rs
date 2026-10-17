@@ -8,12 +8,20 @@
 //! long-prefill route depends on how wide that link really is, which no arch
 //! string says (a gfx1100 in a Gen4 x16 slot and in a Gen3 x4 riser are the
 //! same card).  [`host_link`] therefore *measures* it once per device at load
-//! and every consumer reads the cached value: the chunk default
-//! ([`crate::gpu_forward::qwen4_prefill_chunk_requested`]), the G2 stage
-//! switch ([`expert_stage_default`], used by both the load admission charge
-//! and `Qwen4ExpertStage::new`) and the stage `min_rows` default.  One value
-//! per device per process means admission and the constructor can never
-//! disagree.
+//! and every consumer reads the cached value: the opportunistic chunk ceiling
+//! ([`crate::gpu_forward::qwen4_prefill_chunk_requested`]) and the G2 stage
+//! switch ([`expert_stage_default`], read by `Qwen4ExpertStage::new` for the
+//! borrowed-donor stage and the stage `min_rows` default).  One value per
+//! device per process means the loader's admission and the constructor can
+//! never disagree.
+//!
+//! The link is deliberately **not** an input of the expert placement: the
+//! loader sizes and freezes placement from probe-free inputs (the placement
+//! chunk [`crate::gpu_forward::qwen4_prefill_chunk_placement_requested`] and
+//! the stage switch [`crate::expert_residency::expert_stage_placement_enabled`])
+//! before it measures anything, then spends only the VRAM the frozen
+//! placement leaves on a wider chunk
+//! ([`crate::expert_residency::admit_prefill_chunk`]).
 //!
 //! # Probe semantics
 //!
