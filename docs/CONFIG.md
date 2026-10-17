@@ -1579,18 +1579,21 @@ unless X is this machine's GPU (`install.json`). `--json` carries `lines[]`
 
 | Line | gfx1151 (Strix Halo) | gfx1201 (R9700 / RX 9070) | gfx1100 (RX 7900) |
 |---|---|---|---|
-| **Quality-first** · Prompt processing (dense MQ4V2) | #902 not landed: `kernel.iu4_prefill = false`; opt-in: `kernel.gfx11_a8_prefill = true`; default-on: nothing (already accurate) | `kernel.iu4_prefill = false` (native fp8) | `kernel.iu4_prefill = false` |
+| **Quality-first** · Prompt processing (dense MQ4V2) | `kernel.gfx11_a8_prefill = true` (the opt-in W4A8 route; IU4 W4A4 stays the default) | `kernel.iu4_prefill = false` (native fp8) | `kernel.iu4_prefill = false` (A8 is not offered: no gfx1100 quality run) |
 | **Quality-first** · Flash-Next experts | `developer.qwen4_moe_sym_iu4 = false` | `developer.qwen4_moe_sym_iu4 = false` | nothing |
 | **Quality-first** · Flash-Next word table | `memory.ple_format = "q8"`, ticked only when every installed Flash-Next split base has its `.ple-q8` (or the shared `qwen3.8-flash-next.ple-q8`); a monolithic embeds the q8 rows | nothing (auto is already q8) | nothing |
 | **Low-power** · Shorter thinking | `reasoning.effort = "low"` | same | same |
-| **Low-power** · Prompt processing | #902 default-on: `kernel.gfx11_a8_prefill = false` (back to IU4); otherwise nothing | nothing | nothing |
+| **Low-power** · Prompt processing | nothing (IU4 W4A4, the fastest prompt math, is already the default) | nothing | nothing |
 | **Balanced** | writes nothing; gives back the keys the applied preset still owns | same | same |
 
 Any other GPU gets only arch-neutral lines and the note "no measured quality
 switches for <arch> yet". The Prompt processing line is read from the same
 choices as the Settings virtual row (`hipfire_config::effective::
-quality_choices_for`); PR #902 is detected by schema
-(`hipfire_config::field("kernel.gfx11_a8_prefill")`), never by version. The
+quality_choices_for`). `kernel.gfx11_a8_prefill` is detected by schema
+(`hipfire_config::field("kernel.gfx11_a8_prefill")`), never by version: were its
+default ever turned on, Quality-first would write nothing for prompts on
+gfx1151 and Low-power would write it `false`. Without the key, Quality-first
+writes `kernel.iu4_prefill = false` instead. The
 sym IU4 key is a typed boolean and is written as a TOML boolean. "Shorter
 thinking" relies on a chat request without `reasoning_effort` forwarding the
 global `reasoning.effort` to an effort-native model (pinned by a `hipfire-cli`
