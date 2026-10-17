@@ -12,7 +12,7 @@ the parsed observations. It never downloads anything, generates no teacher or
 reference, starts no second runtime, pins no hidden route, and never infers a
 PASS: every verdict field names the rule it applied.
 
-    collect.py --stage smoke|quality|restore|memory|perf|sampled \\
+    collect.py --stage smoke|quality|restore|memory|perf|sampled|greedy \\
         --binary-dir ABS --model ABS --wt2-ref ABS --code-ref ABS \\
         --modes q8,fp32[,q8_ef] --runs 3 --max-seq N --out ABS
 
@@ -47,7 +47,7 @@ from typing import Callable, Iterable, Optional
 # Frozen constants
 # ---------------------------------------------------------------------------
 
-STAGES = ("smoke", "quality", "restore", "memory", "perf", "sampled")
+STAGES = ("smoke", "quality", "restore", "memory", "perf", "sampled", "greedy")
 KNOWN_MODES = ("q8", "fp32", "q8_ef")
 BASELINE_MODE = "q8"
 
@@ -112,6 +112,7 @@ DEFAULT_GRAPHS = {
     "memory": ("unset",),
     "perf": ("unset",),
     "sampled": ("unset",),
+    "greedy": ("1",),
 }
 DEFAULT_RUNS = {
     "smoke": 1,
@@ -120,7 +121,21 @@ DEFAULT_RUNS = {
     "memory": 1,
     "perf": 3,
     "sampled": 3,
+    "greedy": 1,
 }
+
+#: ``--max-chunks`` of the quality stage (paired analysis needs >= 2 chunks).
+DEFAULT_MAX_CHUNKS = 24
+MIN_MAX_CHUNKS = 2
+
+#: Greedy kill experiment: ``hipfire run --spec`` arms compared per (run, graph, mode).
+GREEDY_SPECS = ("off", "mtp")
+DEFAULT_GREEDY_TOKENS = 64
+MAX_GREEDY_TOKENS = 4096
+#: Linux MAX_ARG_STRLEN (32 pages): one argv string must be shorter than this.
+MAX_ARG_STRLEN = 131072
+#: Daemon log lines the greedy analysis keeps per child (admission evidence).
+GREEDY_ADMISSION_KEYS = ("max_seq", "card_cap", "admission")
 GPU_STAGES = STAGES
 
 QUALITY_CORPORA = ("code24", "wt2")
@@ -311,7 +326,7 @@ def required_binaries(stage: str, modes: tuple[str, ...], oracle_only: bool = Fa
         if ef:
             bins.append(BIN_EF_ROUTES)
         return tuple(bins)
-    if stage in ("memory", "perf"):
+    if stage in ("memory", "perf", "greedy"):
         return (BIN_HIPFIRE, BIN_DAEMON)
     if stage == "sampled":
         return (BIN_SAMPLED,)
@@ -456,6 +471,9 @@ class Config:
     keep_going: bool = False
     oracle_only: bool = False
     dry_run: bool = False
+    max_chunks: int = DEFAULT_MAX_CHUNKS
+    greedy_tokens: int = DEFAULT_GREEDY_TOKENS
+    only: tuple[str, ...] = ()
     binaries: dict = field(default_factory=dict)  # base -> {path,name,sha256}
 
     @property
@@ -625,7 +643,7 @@ def plan_quality(cfg: Config) -> list[Child]:
                 )
                 c.argv = [
                     cfg.exe(BIN_QWEN4_KLD), "eval", "--model", str(cfg.model), "--ref", str(refs[corpus]),
-                    "--output", str(c.dir / "out.kldseq"), "--max-chunks", "24", *flags,
+                    "--output", str(c.dir / "out.kldseq"), "--max-chunks", str(cfg.max_chunks), *flags,
                 ]
                 children.append(c)
     return children
@@ -773,6 +791,37 @@ def plan_sampled(cfg: Config) -> list[Child]:
     return children
 
 
+def read_prompt_text(path: Path) -> str:
+    """Greedy prompt: the file as UTF-8 text with trailing newlines stripped."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CollectError(f"--prompt-file {path} is not readable UTF-8 text: {exc}") from exc
+    return text.rstrip("\n")
+
+
+def plan_greedy(cfg: Config) -> list[Child]:
+    """P0 kill experiment: greedy ``hipfire run`` with MTP off vs on, per (run, graph, mode)."""
+    assert cfg.prompt_file is not None
+    prompt = read_prompt_text(cfg.prompt_file)
+    children: list[Child] = []
+    for run, graph, mode in _arms(cfg):
+        for spec in GREEDY_SPECS:
+            argv = [
+                cfg.exe(BIN_HIPFIRE), "run", str(cfg.model), "--temp", "0", "--spec", spec,
+                "--max-tokens", str(cfg.greedy_tokens), "--max-seq", str(cfg.max_seq), "--json", prompt,
+            ]
+            children.append(
+                _child(
+                    cfg, run, graph, mode, f"greedy-spec-{spec}", "greedy_run", argv,
+                    bench_env(cfg, mode), BIN_HIPFIRE,
+                    inputs=[("model", cfg.model), ("prompt", cfg.prompt_file)],
+                    sample_memory=True,
+                )
+            )
+    return children
+
+
 PLANNERS = {
     "smoke": plan_smoke,
     "quality": plan_quality,
@@ -780,12 +829,24 @@ PLANNERS = {
     "memory": plan_memory,
     "perf": plan_perf,
     "sampled": plan_sampled,
+    "greedy": plan_greedy,
 }
 
 
 def plan_children(cfg: Config) -> list[Child]:
-    """The ordered child processes of a stage, with ``@CHILD@`` resolved."""
+    """The ordered child processes of a stage, with ``@CHILD@`` resolved and ``--only`` applied."""
     children = PLANNERS[cfg.stage](cfg)
+    if cfg.only:
+        planned = {c.label for c in children}
+        unknown = [label for label in cfg.only if label not in planned]
+        if unknown:
+            raise CollectError(
+                f"--only names no planned child of stage {cfg.stage}: {', '.join(unknown)} "
+                f"(planned labels: {', '.join(sorted(planned))})"
+            )
+        children = [c for c in children if c.label in cfg.only]
+        if not children:
+            raise CollectError(f"--only {','.join(cfg.only)} leaves no child to run in stage {cfg.stage}")
     for c in children:
         c.extra_env = {k: v.replace("@CHILD@", str(c.dir)) for k, v in c.extra_env.items()}
     return children
@@ -822,6 +883,15 @@ def parse_graphs(raw: str) -> tuple[str, ...]:
     return graphs
 
 
+def parse_only(raw: str) -> tuple[str, ...]:
+    labels = tuple(x.strip() for x in raw.split(",") if x.strip())
+    if not labels:
+        raise CollectError("--only is empty")
+    if len(set(labels)) != len(labels):
+        raise CollectError(f"--only repeats a label: {raw}")
+    return labels
+
+
 def make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="collect.py",
@@ -837,20 +907,20 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--code-ref", help="ABS code24 .kldref teacher")
     p.add_argument("--modes", help="comma list of q8,fp32,q8_ef (q8 is the paired baseline)")
     p.add_argument("--runs", type=int, help="fresh runs per arm (default: 3 quality/restore/perf/sampled, 1 smoke/memory)")
-    p.add_argument("--max-seq", type=int, help="context N for bench --ctx / memory declared context")
+    p.add_argument("--max-seq", type=int, help="context N for bench --ctx / memory declared context; stage greedy: `hipfire run --max-seq N`")
     p.add_argument("--out", help="ABS output root; writes <out>/<stage>/<run-id>/")
     p.add_argument("--dry-run", action="store_true", help="print the exact commands; execute nothing; no hold needed")
     p.add_argument("--analyze", action="store_true", help="CPU-only: recompute quality/perf statistics from an existing --out run dir")
     p.add_argument("--prehash", action="store_true", help="CPU-only: fill <out>/hash-cache.json with MD5+SHA256 of every input (outside a hold)")
     p.add_argument("--run-id", help="run directory name (default: UTC timestamp+pid); with --analyze: the run to analyse (default: latest)")
-    p.add_argument("--prompt-file", help="ABS prompt file for stage memory and perf (frozen committed prompt)")
+    p.add_argument("--prompt-file", help="ABS prompt file for stage memory, perf and greedy (frozen committed prompt; greedy reads it as UTF-8 text, trailing newlines stripped)")
     p.add_argument("--long-prompt-file", help="ABS long prompt file for the perf --ttft command")
     p.add_argument(
         "--graph",
         help="comma list of 0,1,unset per arm. quality/memory/perf: HIPFIRE_GRAPH; identity/session/sampled/EF hw tests: "
         "HIPFIRE_REPLAY_BACKEND (0=hip eager, 1=auto retained replay; recorded as replay_backend, not hipGraph); "
         "oracle: --graph. unset sets nothing (product default). "
-        "Defaults: smoke 0,1; quality 0; restore 0,1; memory/perf/sampled unset",
+        "Defaults: smoke 0,1; quality 0; restore 0,1; memory/perf/sampled unset; greedy 1",
     )
     p.add_argument("--child-timeout-secs", type=int, default=1700, help="per-child GPU timeout (default 1700)")
     p.add_argument("--sampled-trials", type=int, default=MIN_SAMPLED_TRIALS, help="HIPFIRE_SAMPLED_MTP_TRIALS (>= 2000)")
@@ -861,6 +931,23 @@ def make_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="stage smoke: run only the gdn_state_precision_oracle invocations (no Flash-Next load: the hold guard "
         "still requires the FABRIC_JOB wrapper ancestor but not hostmem-flashnext.lock; the model is not hashed)",
+    )
+    p.add_argument(
+        "--only",
+        help="LABEL[,LABEL...] (all stages): run only the planned children with these labels, in planned order; "
+        "an unknown label is refused. Labels: smoke oracle,identity-seasons; quality <code24|wt2>-<decode|append256|whole>; "
+        "restore session-cache,identity,ef-product-routes; memory memory-mtp-ctx; "
+        "perf stateless-spec-off,stateless-spec-mtp,ttft-long,matrix-pp8192-tg32; sampled sampled-ar,sampled-law; "
+        "greedy greedy-spec-off,greedy-spec-mtp",
+    )
+    p.add_argument(
+        "--max-chunks", type=int, default=None,
+        help=f"stage quality only: qwen4_kld eval --max-chunks N (default {DEFAULT_MAX_CHUNKS}, >= {MIN_MAX_CHUNKS}); "
+        "paired analysis needs equal chunk counts between arms",
+    )
+    p.add_argument(
+        "--greedy-tokens", type=int, default=None,
+        help=f"stage greedy only: `hipfire run --max-tokens N` (default {DEFAULT_GREEDY_TOKENS}, 1..{MAX_GREEDY_TOKENS})",
     )
     return p
 
@@ -875,8 +962,8 @@ def validate(args: argparse.Namespace, environ: dict) -> Config:
         if args.analyze and args.prehash:
             raise CollectError("--analyze and --prehash are mutually exclusive")
     if args.analyze:
-        if args.stage not in ("quality", "perf"):
-            raise CollectError("--analyze recomputes statistics for --stage quality or perf only")
+        if args.stage not in ("quality", "perf", "greedy"):
+            raise CollectError("--analyze recomputes statistics for --stage quality or perf (or greedy) only")
         if not out.is_dir():
             raise CollectError(f"--analyze: --out {out} does not exist")
         return Config(
@@ -890,8 +977,13 @@ def validate(args: argparse.Namespace, environ: dict) -> Config:
     if not binary_dir.is_dir():
         raise CollectError(f"--binary-dir {binary_dir} is not a directory")
     model = require_file("--model", args.model or "")
-    wt2 = require_file("--wt2-ref", args.wt2_ref or "")
-    code = require_file("--code-ref", args.code_ref or "")
+    if args.stage == "greedy":
+        # The greedy stage reads neither teacher: they are optional and only validated when given.
+        wt2 = require_file("--wt2-ref", args.wt2_ref) if args.wt2_ref else Path("/")
+        code = require_file("--code-ref", args.code_ref) if args.code_ref else Path("/")
+    else:
+        wt2 = require_file("--wt2-ref", args.wt2_ref or "")
+        code = require_file("--code-ref", args.code_ref or "")
     if args.max_seq is None or args.max_seq <= 0:
         raise CollectError("--max-seq must be a positive integer")
     runs = args.runs if args.runs is not None else DEFAULT_RUNS[args.stage]
@@ -905,10 +997,34 @@ def validate(args: argparse.Namespace, environ: dict) -> Config:
     if args.stage in ("quality", "perf") and BASELINE_MODE not in modes:
         raise CollectError(f"stage {args.stage} compares against the {BASELINE_MODE} baseline: add it to --modes")
     prompt = long_prompt = None
-    if args.stage in ("memory", "perf"):
+    if args.stage in ("memory", "perf", "greedy"):
         if not args.prompt_file:
             raise CollectError(f"stage {args.stage} requires --prompt-file")
         prompt = require_file("--prompt-file", args.prompt_file)
+    if args.stage == "greedy":
+        text = read_prompt_text(prompt)
+        if not text.strip():
+            raise CollectError(f"--prompt-file {prompt} is empty")
+        if "\0" in text:
+            raise CollectError(f"--prompt-file {prompt} contains a NUL byte (cannot be passed as an argument)")
+        if text.startswith("-"):
+            raise CollectError(f"--prompt-file {prompt} starts with '-': `hipfire run` would parse the prompt as a flag")
+        if len(text.encode("utf-8")) >= MAX_ARG_STRLEN:
+            raise CollectError(
+                f"--prompt-file {prompt} is {len(text.encode('utf-8'))} bytes: a single argv string must be "
+                f"< {MAX_ARG_STRLEN} bytes (Linux MAX_ARG_STRLEN) and `hipfire run` takes the prompt as an argument"
+            )
+    if args.max_chunks is not None:
+        if args.stage != "quality":
+            raise CollectError("--max-chunks applies to --stage quality only")
+        if args.max_chunks < MIN_MAX_CHUNKS:
+            raise CollectError(f"--max-chunks must be >= {MIN_MAX_CHUNKS} (paired analysis needs >= 2 chunks)")
+    if args.greedy_tokens is not None:
+        if args.stage != "greedy":
+            raise CollectError("--greedy-tokens applies to --stage greedy only")
+        if not 1 <= args.greedy_tokens <= MAX_GREEDY_TOKENS:
+            raise CollectError(f"--greedy-tokens must be in 1..{MAX_GREEDY_TOKENS}")
+    only = parse_only(args.only) if args.only is not None else ()
     if args.stage == "perf":
         if not args.long_prompt_file:
             raise CollectError("stage perf requires --long-prompt-file (the --ttft command)")
@@ -924,8 +1040,13 @@ def validate(args: argparse.Namespace, environ: dict) -> Config:
         prompt_file=prompt, long_prompt_file=long_prompt, child_timeout_secs=args.child_timeout_secs,
         sampled_trials=args.sampled_trials, bench_max_seq=args.bench_max_seq, keep_going=args.keep_going,
         dry_run=args.dry_run, oracle_only=args.oracle_only,
+        max_chunks=args.max_chunks if args.max_chunks is not None else DEFAULT_MAX_CHUNKS,
+        greedy_tokens=args.greedy_tokens if args.greedy_tokens is not None else DEFAULT_GREEDY_TOKENS,
+        only=only,
     )
     cfg.binaries = resolve_and_verify_binaries(binary_dir, required_binaries(args.stage, modes, args.oracle_only))
+    if cfg.only:
+        plan_children(cfg)  # refuses unknown labels / an empty selection before any launch
     if not (args.dry_run or args.prehash):
         run_dir = cfg.run_dir
         if run_dir.exists() and any(run_dir.iterdir()):
@@ -1288,6 +1409,15 @@ def analyze_quality(run_dir: Path, children: list[dict]) -> dict:
                     closures.append(
                         {"graph": graph, "run": run, **gap_closure(k["q8"], k["fp32"], k["q8_ef"])}
                     )
+    # A filtered (--only) or partially failed run has gaps: a (graph, corpus, route) cell that lacks a mode
+    # other cells have is reported as a missing cell, never silently dropped.
+    seen_modes = sorted({m for by_mode in arms.values() for m in by_mode})
+    missing_cells: list[dict] = []
+    for key in sorted(arms):
+        absent = [m for m in seen_modes if m not in arms[key]]
+        if absent:
+            missing_cells.append({"graph": key[0], "corpus": key[1], "route": key[2], "missing_modes": absent})
+            errors.append(f"g{key[0]}/{key[1]}/{key[2]}: no arm for mode(s) {','.join(absent)} (missing cell)")
     verdicts = [p.get("rule_applied") for p in pairs]
     return {
         "rule": RULE_TEXT,
@@ -1297,6 +1427,7 @@ def analyze_quality(run_dir: Path, children: list[dict]) -> dict:
         "pairs_rule_applied_all_pass": (all(v == "PASS" for v in verdicts) if verdicts else None),
         "code24_decode_gap_closure": closures,
         "same_route_determinism": determinism,
+        "missing_cells": missing_cells,
         "errors": errors,
     }
 
@@ -1395,6 +1526,120 @@ def analyze_perf(children: list[dict]) -> dict:
                 )
             rows.append(row)
     return {"rows": rows, "errors": errors}
+
+
+def _first_diff(a: str, b: str) -> Optional[int]:
+    """Offset of the first differing character; ``None`` when equal; the shorter length for a strict prefix."""
+    if a == b:
+        return None
+    for i in range(min(len(a), len(b))):
+        if a[i] != b[i]:
+            return i
+    return min(len(a), len(b))
+
+
+def _all_or_none(flags: list[bool], missing: int) -> Optional[bool]:
+    """False if any compared pair differs; None (never a pass) when pairs are missing or none exist."""
+    if any(f is False for f in flags):
+        return False
+    if missing or not flags:
+        return None
+    return True
+
+
+def analyze_greedy(children: list[dict]) -> dict:
+    """P0 kill experiment: greedy MTP vs AR text equality per (run, graph, mode)."""
+    errors: list[str] = []
+    seen: dict = {}  # (run, graph, mode) -> {spec: child id}
+    cells: dict = {}  # (run, graph, mode) -> {spec: observations of an ok child}
+    per_child: list[dict] = []
+    greedy = [c for c in children if c.get("kind") == "greedy_run"]
+    for c in greedy:
+        obs = c.get("observations") or {}
+        spec = str(c.get("label", "")).removeprefix("greedy-spec-")
+        key = (c["run"], c["graph"], c["mode"])
+        seen.setdefault(key, {})[spec] = c["id"]
+        per_child.append(
+            {
+                "id": c["id"], "spec": spec, "outcome": c.get("outcome"),
+                "daemon_admission_lines": [
+                    line for line in obs.get("daemon_log_lines") or [] if any(k in line for k in GREEDY_ADMISSION_KEYS)
+                ],
+            }
+        )
+        if spec not in GREEDY_SPECS:
+            errors.append(f"{c['id']}: unknown greedy spec {spec!r}")
+        elif c.get("outcome") == "ok" and isinstance(obs.get("content"), str):
+            cells.setdefault(key, {})[spec] = obs
+        else:
+            errors.append(f"{c['id']}: outcome {c.get('outcome')} ({obs.get('error') or 'no usable content'}); not compared")
+    pairs: list[dict] = []
+    missing_by_mode: dict = {}
+    for key in sorted(seen):
+        run, graph, mode = key
+        off, mtp = cells.get(key, {}).get("off"), cells.get(key, {}).get("mtp")
+        if off is None or mtp is None:
+            absent = [s for s, o in (("off", off), ("mtp", mtp)) if o is None]
+            errors.append(f"run{run}/g{graph}/{mode}: no spec-{'/'.join(absent)} result: AR-vs-MTP pair missing")
+            missing_by_mode[mode] = missing_by_mode.get(mode, 0) + 1
+            continue
+        pairs.append(
+            {
+                "run": run, "graph": graph, "mode": mode,
+                "equal": off["content"] == mtp["content"],
+                "first_diff_char": _first_diff(off["content"], mtp["content"]),
+                "len_off": len(off["content"]), "len_mtp": len(mtp["content"]),
+                "tokens_off": off.get("tokens"), "tokens_mtp": mtp.get("tokens"),
+                "sha256_off": off.get("content_sha256"), "sha256_mtp": mtp.get("content_sha256"),
+            }
+        )
+    modes = sorted({k[2] for k in seen})
+    per_mode: dict = {}
+    for mode in modes:
+        flags = [p["equal"] for p in pairs if p["mode"] == mode]
+        per_mode[mode] = {
+            "pairs_compared": len(flags),
+            "pairs_missing": missing_by_mode.get(mode, 0),
+            "mtp_equals_ar": _all_or_none(flags, missing_by_mode.get(mode, 0)),
+        }
+    cross: list[dict] = []
+    by_group: dict = {}
+    for (run, graph, mode), specs in seen.items():
+        for spec in specs:
+            by_group.setdefault((run, graph, spec), set()).add(mode)
+    for (run, graph, spec) in sorted(by_group):
+        if not {"q8", "fp32"} <= by_group[(run, graph, spec)]:
+            continue
+        q8 = cells.get((run, graph, "q8"), {}).get(spec)
+        f32 = cells.get((run, graph, "fp32"), {}).get(spec)
+        if q8 is None or f32 is None:
+            errors.append(f"run{run}/g{graph}/spec-{spec}: q8-vs-fp32 content pair missing (diagnostic not compared)")
+            continue
+        cross.append(
+            {
+                "run": run, "graph": graph, "spec": spec,
+                "equal": q8["content"] == f32["content"],
+                "first_diff_char": _first_diff(q8["content"], f32["content"]),
+                "len_q8": len(q8["content"]), "len_fp32": len(f32["content"]),
+            }
+        )
+    if not greedy:
+        errors.append("no greedy_run children")
+    return {
+        "labels": {
+            "fp32_mtp_equals_ar": "GATE (Track A F32 tripwire)",
+            "q8_mtp_equals_ar": "DIAGNOSTIC",
+            "cross_mode_q8_vs_fp32": "DIAGNOSTIC",
+        },
+        "pairs": pairs,
+        "per_mode": per_mode,
+        "fp32_mtp_equals_ar": per_mode.get("fp32", {}).get("mtp_equals_ar"),
+        "q8_mtp_equals_ar": per_mode.get("q8", {}).get("mtp_equals_ar"),
+        "cross_mode_q8_vs_fp32": cross,
+        "all_loaded": bool(greedy) and all(c.get("outcome") == "ok" for c in greedy),
+        "children": per_child,
+        "errors": errors,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1640,6 +1885,33 @@ def observe_child(child: Child, cdir: Path, rc: Optional[int], timed_out: bool, 
         obs["kldseq_present"] = seq.is_file()
         ok = rc == 0 and bool(parsed["summaries"]) and seq.is_file()
         return ("timeout" if timed_out else ("ok" if ok else "failed")), obs
+    if kind == "greedy_run":
+        report = find_json_object(stdout)
+        content = report.get("content") if report is not None else None
+        if report is None:
+            obs["error"] = "no JSON line on stdout"
+        elif not isinstance(content, str):
+            obs["error"] = "JSON line has no string content"
+        else:
+            obs["content"] = content
+            obs["content_sha256"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            obs["content_chars"] = len(content)
+            if content == "":
+                obs["error"] = "empty content"
+        if report is not None:
+            obs["tokens"] = report.get("tokens")
+            obs["tok_s"] = report.get("tok_s")
+            obs["finish_reason"] = report.get("finish_reason")
+        # The result line carries generated text: scan only the remaining stdout for daemon/refusal lines.
+        log_stdout = "\n".join(line for line in stdout.splitlines() if not line.startswith('{"content"'))
+        obs["daemon_log_lines"] = daemon_log_lines(stderr, log_stdout)
+        obs["refusal_lines"] = refusal_lines(stderr, log_stdout)
+        mem = cdir / "memory_samples.jsonl"
+        if mem.is_file():
+            samples = [json.loads(line) for line in mem.read_text().splitlines() if line.strip()]
+            obs["memory"] = summarize_memory(samples, None)
+        ok = rc == 0 and isinstance(content, str) and content != ""
+        return ("timeout" if timed_out else ("ok" if ok else "failed")), obs
     if kind.startswith("bench_"):
         report = find_json_object(stdout)
         if report is None:
@@ -1681,7 +1953,8 @@ def input_roles(cfg: Config) -> list[tuple[str, Path]]:
         sidecar = Path(str(cfg.model) + suffix)
         if sidecar.is_file():
             roles.append((f"model{suffix}", sidecar))
-    roles += [("wt2-ref", cfg.wt2_ref), ("code-ref", cfg.code_ref)]
+    if cfg.stage != "greedy":
+        roles += [("wt2-ref", cfg.wt2_ref), ("code-ref", cfg.code_ref)]
     if cfg.prompt_file:
         roles.append(("prompt", cfg.prompt_file))
     if cfg.long_prompt_file:
@@ -1799,6 +2072,8 @@ def stage_analysis(stage: str, run_dir: Path, children: list[dict]) -> Optional[
         return analyze_quality(run_dir, children)
     if stage == "perf":
         return analyze_perf(children)
+    if stage == "greedy":
+        return analyze_greedy(children)
     return None
 
 
@@ -1816,6 +2091,9 @@ def render_report(receipt: dict) -> str:
         "",
         f"- start {receipt['start']}  end {receipt['end']}",
         f"- modes {','.join(receipt['modes'])}  graphs {','.join(receipt['graphs'])}  runs {receipt['runs']}  max_seq {receipt['max_seq']}",
+        f"- only {','.join(receipt['only'])}" if receipt.get("only") else "- only (all planned children)",
+        f"- max_chunks {receipt['max_chunks']}" if receipt.get("max_chunks") is not None else "- max_chunks n/a",
+        f"- greedy_tokens {receipt['greedy_tokens']}" if receipt.get("greedy_tokens") is not None else "- greedy_tokens n/a",
         f"- fabric job {receipt['host'].get('FABRIC_JOB')}  cards {receipt['host'].get('FABRIC_CARDS')}  host {receipt['host'].get('host')}",
         f"- exit code {receipt['exit_code']}  not run: {len(receipt['not_run'])}",
         "",
@@ -1865,6 +2143,25 @@ def render_report(receipt: dict) -> str:
             )
         if analysis["errors"]:
             lines += ["", "## Analysis errors", ""] + [f"- {e}" for e in analysis["errors"]]
+    elif analysis and receipt["stage"] == "greedy":
+        lines += ["", "## Greedy MTP vs AR text (spec off vs mtp, `--temp 0`)", "",
+                  f"- fp32_mtp_equals_ar [{analysis['labels']['fp32_mtp_equals_ar']}]: {analysis['fp32_mtp_equals_ar']}",
+                  f"- q8_mtp_equals_ar [{analysis['labels']['q8_mtp_equals_ar']}]: {analysis['q8_mtp_equals_ar']}",
+                  f"- all_loaded (explicit --max-seq admission held for every arm): {analysis['all_loaded']}", "",
+                  "| run | graph | mode | equal | first diff char | len off | len mtp | tokens off | tokens mtp |", "|---|---|---|---|---|---|---|---|---|"]
+        for p in analysis["pairs"]:
+            lines.append(
+                f"| {p['run']} | {p['graph']} | {p['mode']} | {p['equal']} | {_fmt(p['first_diff_char'])} | {p['len_off']} | "
+                f"{p['len_mtp']} | {_fmt(p['tokens_off'])} | {_fmt(p['tokens_mtp'])} |"
+            )
+        if analysis["cross_mode_q8_vs_fp32"]:
+            lines += ["", f"### q8 vs fp32 content [{analysis['labels']['cross_mode_q8_vs_fp32']}]", ""]
+            lines += [f"- {json.dumps(x, sort_keys=True)}" for x in analysis["cross_mode_q8_vs_fp32"]]
+        lines += ["", "### Admission log lines (max_seq / card_cap / admission)", ""]
+        for ch in analysis["children"]:
+            lines.append(f"- {ch['id']} ({ch['outcome']}): {ch['daemon_admission_lines']}")
+        if analysis["errors"]:
+            lines += ["", "## Analysis errors", ""] + [f"- {e}" for e in analysis["errors"]]
     for c in receipt["children"]:
         obs = c.get("observations") or {}
         if obs.get("g5_result"):
@@ -1905,6 +2202,12 @@ def print_dry_run(cfg: Config, children: list[Child]) -> None:
     print(f"# dry run: stage {cfg.stage}  run dir {cfg.run_dir}  {len(children)} child process(es)")
     print(f"# scrub: unset every HIPFIRE_* except {', '.join(KEEP_HIPFIRE_ENV)}; per-child isolated HOME/HIPFIRE_HOME/HIPFIRE_LOCK_DIR")
     print(f"# per-child timeout {cfg.child_timeout_secs} s; fabric hold required for a real run (FABRIC_JOB wrapper = ancestor, {HOSTMEM_LOCK} held)")
+    if cfg.only:
+        print(f"# only: {','.join(cfg.only)}")
+    if cfg.stage == "quality":
+        print(f"# max-chunks: {cfg.max_chunks}")
+    if cfg.stage == "greedy":
+        print(f"# greedy-tokens: {cfg.greedy_tokens}")
     for child in children:
         env = explicit_env(cfg, child)
         print(f"[{child.id}]")
@@ -1946,7 +2249,9 @@ def run_stage(cfg: Config, environ: dict) -> int:
         "modes": list(cfg.modes), "graphs": list(cfg.graphs), "runs": cfg.runs, "max_seq": cfg.max_seq,
         "child_timeout_secs": cfg.child_timeout_secs, "host": host_record(environ),
         "identity": "identity.json", "children": done, "not_run": not_run,
-        "analysis": analysis, "exit_code": exit_code,
+        "analysis": analysis, "exit_code": exit_code, "only": list(cfg.only),
+        "max_chunks": cfg.max_chunks if cfg.stage == "quality" else None,
+        "greedy_tokens": cfg.greedy_tokens if cfg.stage == "greedy" else None,
     }
     write_json(run_dir / "receipt.json", receipt)
     write_text(run_dir / "report.md", render_report(receipt))

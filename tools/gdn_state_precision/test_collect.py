@@ -1009,5 +1009,422 @@ class OracleOnlyTests(TempCase):
         self.assertEqual(ident["inputs"], {})
 
 
+class OnlyAndMaxChunksTests(TempCase):
+    def setUp(self):
+        super().setUp()
+        self.fx = Fixture(self.root)
+
+    def plan(self, stage, *extra, modes="q8,fp32", runs="1"):
+        cfg = self.fx.config(stage, *extra, modes=modes, runs=runs)
+        return cfg, collect.plan_children(cfg)
+
+    def test_only_keeps_selected_labels_in_planned_order(self):
+        _, full = self.plan("quality")
+        _, kids = self.plan("quality", "--only", "wt2-whole,code24-decode")
+        self.assertEqual(
+            [k.id for k in kids],
+            [k.id for k in full if k.label in ("code24-decode", "wt2-whole")],
+        )
+        self.assertEqual(len(kids), 4)
+        self.assertEqual([k.label for k in kids][:2], ["code24-decode", "wt2-whole"])
+        _, perf = self.plan("perf", "--only", "ttft-long")
+        self.assertEqual([(k.mode, k.label) for k in perf], [("q8", "ttft-long"), ("fp32", "ttft-long")])
+        _, smoke = self.plan("smoke", "--only", "oracle")
+        self.assertEqual({k.label for k in smoke}, {"oracle"})
+        self.assertEqual(self.plan("memory", "--only", "memory-mtp-ctx")[0].only, ("memory-mtp-ctx",))
+
+    def test_only_refuses_unknown_and_unplanned_labels(self):
+        with self.assertRaisesRegex(collect.CollectError, "no-such-label"):
+            self.fx.config("quality", "--only", "code24-decode,no-such-label")
+        # ef-product-routes is planned only for q8_ef
+        with self.assertRaisesRegex(collect.CollectError, "ef-product-routes"):
+            self.fx.config("restore", "--only", "ef-product-routes")
+        _, kids = self.plan("restore", "--only", "ef-product-routes", "--graph", "0", modes="q8,q8_ef")
+        self.assertEqual([k.mode for k in kids], ["q8_ef"])
+        with self.assertRaisesRegex(collect.CollectError, "--only is empty"):
+            self.fx.config("quality", "--only", " , ")
+        with self.assertRaisesRegex(collect.CollectError, "repeats"):
+            self.fx.config("quality", "--only", "code24-decode,code24-decode")
+        # the refusal also fires through the CLI entry point, before any launch
+        with self.assertRaisesRegex(collect.CollectError, "bogus"):
+            collect.run(self.fx.argv("perf", "--dry-run", "--only", "bogus"), {})
+        self.assertFalse(self.fx.out.exists())
+
+    def test_only_is_recorded_in_config_and_dry_run(self):
+        cfg = self.fx.config("quality", "--only", "code24-decode")
+        self.assertEqual(cfg.only, ("code24-decode",))
+        self.assertEqual(self.fx.config("quality").only, ())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = collect.run(self.fx.argv("quality", "--dry-run", "--only", "code24-decode,wt2-whole", runs="1"), {})
+        self.assertEqual(rc, 0)
+        self.assertIn("# only: code24-decode,wt2-whole", buf.getvalue())
+        self.assertIn("# max-chunks: 24", buf.getvalue())
+        self.assertEqual(buf.getvalue().count("\n[run"), 4)
+
+    def test_max_chunks_propagates_and_defaults(self):
+        _, kids = self.plan("quality", "--max-chunks", "6")
+        for k in kids:
+            i = k.argv.index("--max-chunks")
+            self.assertEqual(k.argv[i + 1], "6")
+        _, kids = self.plan("quality")
+        self.assertEqual(kids[0].argv[kids[0].argv.index("--max-chunks") + 1], "24")
+        self.assertEqual(self.fx.config("quality", "--max-chunks", "2").max_chunks, 2)
+
+    def test_max_chunks_refusals(self):
+        for bad in ("1", "0", "-3"):
+            with self.assertRaisesRegex(collect.CollectError, "max-chunks"):
+                self.fx.config("quality", "--max-chunks", bad)
+        for stage in ("perf", "memory", "smoke", "greedy"):
+            with self.assertRaisesRegex(collect.CollectError, "quality only"):
+                self.fx.config(stage, "--max-chunks", "8", "--graph", "0")
+
+    def test_filtered_quality_run_records_filter_and_analyzes(self):
+        (self.root / "e2e").mkdir()
+        fx = Fixture(self.root / "e2e", fake_kld=True)
+        cfg = fx.config("quality", "--only", "code24-decode", "--max-chunks", "5", runs="1")
+        cfg.dry_run = False
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = collect.run_stage(cfg, {"PATH": os.environ.get("PATH", ""), "FABRIC_JOB": "1:2:halo"})
+        self.assertEqual(rc, 0)
+        receipt = json.loads((cfg.run_dir / "receipt.json").read_text())
+        self.assertEqual(receipt["only"], ["code24-decode"])
+        self.assertEqual(receipt["max_chunks"], 5)
+        self.assertIsNone(receipt["greedy_tokens"])
+        self.assertEqual([c["id"] for c in receipt["children"]], ["run0/g0/q8/code24-decode", "run0/g0/fp32/code24-decode"])
+        self.assertEqual(receipt["not_run"], [])
+        self.assertEqual(len(receipt["analysis"]["pairs"]), 1)
+        self.assertEqual(receipt["analysis"]["errors"], [])
+        self.assertIn("only code24-decode", (cfg.run_dir / "report.md").read_text())
+        # --analyze of the filtered run dir still works
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(collect.run(["--stage", "quality", "--analyze", "--out", str(fx.out), "--run-id", "rid"], {}), 0)
+        self.assertEqual(len(json.loads(buf.getvalue())["pairs"]), 1)
+
+    def test_quality_analysis_reports_missing_cells_without_crashing(self):
+        run_dir, children = synth_quality_run(self.root, {"q8": 0.0, "fp32": -0.002}, runs=1)
+        children = [c for c in children if c["id"] != "run0/g0/fp32/wt2-append256"]
+        a = collect.analyze_quality(run_dir, children)
+        self.assertEqual(len(a["pairs"]), 1)  # only the code24-decode cell is paired
+        self.assertEqual(
+            a["missing_cells"],
+            [{"graph": "0", "corpus": "wt2", "route": "append256", "missing_modes": ["fp32"]}],
+        )
+        self.assertTrue(any("wt2/append256" in e and "missing cell" in e for e in a["errors"]))
+        # a lone non-baseline arm is an error, not a crash or a pass
+        only_fp32 = [c for c in children if c["mode"] == "fp32"]
+        b = collect.analyze_quality(run_dir, only_fp32)
+        self.assertEqual(b["pairs"], [])
+        self.assertTrue(b["errors"])
+        self.assertIsNone(b["pairs_rule_applied_all_pass"])
+
+    def test_perf_analysis_of_a_filtered_run(self):
+        report = {"protocol": "client-ttft-v1", "prompt_tokens": 9, "ttft": {"median": 2000.0}, "pp_tok_s": {"median": 4500.0}}
+        obs = collect.extract_bench(report)
+        obs["protocol"] = report["protocol"]
+        kids = [
+            {"id": f"run0/gunset/{m}/ttft-long", "kind": "bench_ttft", "label": "ttft-long", "graph": "unset",
+             "mode": m, "run": 0, "observations": dict(obs)}
+            for m in ("q8", "fp32")
+        ]
+        rows = collect.analyze_perf(kids)["rows"]
+        self.assertEqual({r["label"] for r in rows}, {"ttft-long"})
+        self.assertEqual(collect.analyze_perf([])["rows"], [])
+
+
+FAKE_HIPFIRE_RUN = """#!{python}
+import json, os, sys
+a = sys.argv
+assert a[1] == "run" and a[a.index("--temp") + 1] == "0" and "--json" in a
+spec = a[a.index("--spec") + 1]
+mode = os.environ["HIPFIRE_STATE_QUANT"]
+sys.stderr.write("daemon: max_seq " + a[a.index("--max-seq") + 1] + " card_cap 1000\\n")
+sys.stderr.write("  qwen4 state: QSA fp8 K/V, GDN " + mode + " recurrent\\n")
+text = "the quick brown fox"
+if spec == "mtp" and mode == "q8":
+    text = "the quick brown cat jumps"
+print(json.dumps({{"content": text, "tokens": 5, "tok_s": 12.5, "finish_reason": "length"}}))
+"""
+
+
+def greedy_child(run, mode, spec, content, outcome="ok", tokens=None, lines=None, graph="1"):
+    obs = {"kind": "greedy_run"}
+    if content is not None:
+        obs.update(content=content, content_sha256=sha256_bytes(content.encode()), tokens=tokens)
+    obs["daemon_log_lines"] = ["daemon: max_seq 4096 card_cap 1000", "GDN unrelated line"] if lines is None else lines
+    return {
+        "id": f"run{run}/g{graph}/{mode}/greedy-spec-{spec}", "label": f"greedy-spec-{spec}", "kind": "greedy_run",
+        "run": run, "graph": graph, "mode": mode, "outcome": outcome, "observations": obs,
+    }
+
+
+class GreedyStageTests(TempCase):
+    def setUp(self):
+        super().setUp()
+        self.fx = Fixture(self.root)
+        self.fx.prompt.write_text("line one\nline two\n\n")
+        self.hip = str(self.fx.bin / BIN_NAMES["hipfire"])
+        self.daemon = str(self.fx.bin / BIN_NAMES["daemon"])
+
+    def greedy_argv(self, *extra, runs="1", modes="q8,fp32", drop=()):
+        """Greedy needs no teachers, no long prompt."""
+        argv = self.fx.argv("greedy", *extra, modes=modes, runs=runs)
+        for flag in ("--wt2-ref", "--code-ref", "--long-prompt-file", *drop):
+            i = argv.index(flag)
+            del argv[i:i + 2]
+        return argv
+
+    def config(self, *extra, **kw):
+        args = collect.make_parser().parse_args(self.greedy_argv("--dry-run", "--run-id", "rid", *extra, **kw))
+        return collect.validate(args, {})
+
+    def test_plan_argv_env_and_graph_default(self):
+        cfg = self.config()
+        kids = collect.plan_children(cfg)
+        self.assertEqual(
+            [k.id for k in kids],
+            ["run0/g1/q8/greedy-spec-off", "run0/g1/q8/greedy-spec-mtp",
+             "run0/g1/fp32/greedy-spec-off", "run0/g1/fp32/greedy-spec-mtp"],
+        )
+        k = kids[1]
+        self.assertEqual(
+            k.argv,
+            [self.hip, "run", str(self.fx.model), "--temp", "0", "--spec", "mtp", "--max-tokens", "64",
+             "--max-seq", "4096", "--json", "line one\nline two"],  # trailing newlines stripped
+        )
+        self.assertEqual(k.kind, "greedy_run")
+        self.assertEqual(k.label, "greedy-spec-mtp")
+        self.assertEqual(
+            k.extra_env,
+            {"HIPFIRE_STATE_QUANT": "q8", "HIPFIRE_DAEMON_BIN": self.daemon, "HIPFIRE_GRAPH": "1"},
+        )
+        self.assertEqual(kids[2].extra_env["HIPFIRE_STATE_QUANT"], "fp32")
+        self.assertEqual(kids[2].argv[kids[2].argv.index("--spec") + 1], "off")
+        self.assertTrue(all(c.sample_memory for c in kids))
+        self.assertEqual([r for r, _ in k.inputs], ["model", "prompt"])
+        self.assertEqual(cfg.graphs, ("1",))
+        self.assertEqual(cfg.runs, 1)
+        self.assertEqual(sorted(cfg.binaries), ["daemon", "hipfire"])
+        self.assertEqual(collect.graph_axis("greedy_run"), "HIPFIRE_GRAPH")
+        self.assertEqual([r for r, _ in collect.input_roles(cfg)], ["model", "model.ple-q4", "prompt"])
+
+    def test_default_runs_graph_override_tokens_and_ab_ba(self):
+        args = collect.make_parser().parse_args(self.greedy_argv("--dry-run", "--run-id", "rid", drop=("--runs",)))
+        self.assertEqual(collect.validate(args, {}).runs, 1)
+        cfg = self.config("--graph", "0,1", "--greedy-tokens", "128", runs="2")
+        kids = collect.plan_children(cfg)
+        self.assertEqual(len(kids), 2 * 2 * 2 * 2)
+        self.assertEqual({k.argv[k.argv.index("--max-tokens") + 1] for k in kids}, {"128"})
+        g0 = [k for k in kids if k.graph == "0"]
+        self.assertEqual(g0[0].extra_env["HIPFIRE_GRAPH"], "0")
+        self.assertEqual([k.mode for k in kids if k.run == 0 and k.graph == "1" and k.label == "greedy-spec-off"], ["q8", "fp32"])
+        self.assertEqual([k.mode for k in kids if k.run == 1 and k.graph == "1" and k.label == "greedy-spec-off"], ["fp32", "q8"])
+        unset = collect.plan_children(self.config("--graph", "unset"))
+        self.assertNotIn("HIPFIRE_GRAPH", unset[0].extra_env)
+
+    def test_only_selects_one_spec(self):
+        kids = collect.plan_children(self.config("--only", "greedy-spec-mtp"))
+        self.assertEqual([k.id for k in kids], ["run0/g1/q8/greedy-spec-mtp", "run0/g1/fp32/greedy-spec-mtp"])
+        with self.assertRaisesRegex(collect.CollectError, "greedy-spec-dflash"):
+            self.config("--only", "greedy-spec-dflash")
+
+    def test_required_flag_and_prompt_refusals(self):
+        with self.assertRaisesRegex(collect.CollectError, "requires --prompt-file"):
+            collect.run(self.greedy_argv("--dry-run", drop=("--prompt-file",)), {})
+        with self.assertRaisesRegex(collect.CollectError, "--max-seq"):
+            collect.run(self.greedy_argv("--dry-run", drop=("--max-seq",)), {})
+        for bad in ("0", "4097", "-1"):
+            with self.assertRaisesRegex(collect.CollectError, "greedy-tokens"):
+                self.config("--greedy-tokens", bad)
+        for stage in ("quality", "perf", "memory", "smoke"):
+            with self.assertRaisesRegex(collect.CollectError, "greedy-tokens applies to --stage greedy only"):
+                self.fx.config(stage, "--greedy-tokens", "8", "--graph", "0")
+        self.fx.prompt.write_text("\n\n")
+        with self.assertRaisesRegex(collect.CollectError, "empty"):
+            self.config()
+        self.fx.prompt.write_text("--looks like a flag")
+        with self.assertRaisesRegex(collect.CollectError, "flag"):
+            self.config()
+        self.fx.prompt.write_bytes(b"\xff\xfe not utf8")
+        with self.assertRaisesRegex(collect.CollectError, "UTF-8"):
+            self.config()
+        self.fx.prompt.write_text("x" * collect.MAX_ARG_STRLEN)
+        with self.assertRaisesRegex(collect.CollectError, "MAX_ARG_STRLEN"):
+            self.config()
+        self.fx.prompt.write_text("x" * (collect.MAX_ARG_STRLEN - 1))
+        self.config()
+
+    def test_missing_binary_refused_and_hold_required(self):
+        for omitted in ("hipfire", "daemon"):
+            with tempfile.TemporaryDirectory() as t:
+                fx = Fixture(Path(t).resolve(), omit=(omitted,))
+                argv = fx.argv("greedy", "--dry-run")
+                with self.assertRaisesRegex(collect.CollectError, omitted):
+                    collect.run(argv, {})
+        with self.assertRaisesRegex(collect.CollectError, "no fabric hold"):
+            collect.run(self.greedy_argv(), {})
+
+    def test_dry_run_lists_four_children(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = collect.run(self.greedy_argv("--dry-run", "--run-id", "rid"), {})
+        self.assertEqual(rc, 0)
+        text = buf.getvalue()
+        self.assertIn("4 child process(es)", text)
+        self.assertEqual(text.count("\n[run0/g1/"), 4)
+        self.assertEqual(text.count("--temp 0 --spec off"), 2)
+        self.assertEqual(text.count("--temp 0 --spec mtp"), 2)
+        self.assertIn("# greedy-tokens: 64", text)
+        self.assertIn("HIPFIRE_GRAPH=1", text)
+        self.assertFalse(self.fx.out.exists())
+
+    def test_observation_parses_stdout_json(self):
+        cfg = self.config()
+        child = collect.plan_children(cfg)[1]
+        cdir = self.root / "child"
+        cdir.mkdir()
+        text = "h\u00e9llo wor\u2603ld"
+        line = json.dumps({"content": text, "tokens": 7, "tok_s": 31.5, "finish_reason": "stop"})
+        (cdir / "stdout.txt").write_text(line + "\n")
+        (cdir / "stderr.txt").write_text("daemon: max_seq 4096 card_cap 900\nunrelated\nadmission refused for x\n")
+        (cdir / "memory_samples.jsonl").write_text(
+            json.dumps({"mem_available_kib": 1000}) + "\n" + json.dumps({"mem_available_kib": 800}) + "\n"
+        )
+        outcome, obs = collect.observe_child(child, cdir, 0, False, "1")
+        self.assertEqual(outcome, "ok")
+        self.assertEqual(obs["content"], text)
+        self.assertEqual(obs["content_sha256"], sha256_bytes(text.encode("utf-8")))
+        self.assertEqual((obs["tokens"], obs["tok_s"], obs["finish_reason"]), (7, 31.5, "stop"))
+        self.assertEqual(obs["daemon_log_lines"], ["daemon: max_seq 4096 card_cap 900", "admission refused for x"])
+        self.assertEqual(obs["refusal_lines"], ["admission refused for x"])
+        self.assertEqual(obs["memory"]["host_peak_drop_kib"], 200)
+        # non-zero rc, empty content, missing JSON, or a timeout are never ok
+        self.assertEqual(collect.observe_child(child, cdir, 1, False, "1")[0], "failed")
+        self.assertEqual(collect.observe_child(child, cdir, 0, True, "1")[0], "timeout")
+        (cdir / "stdout.txt").write_text(json.dumps({"content": "", "tokens": 0}) + "\n")
+        self.assertEqual(collect.observe_child(child, cdir, 0, False, "1")[0], "failed")
+        (cdir / "stdout.txt").write_text("not json\n")
+        outcome, obs = collect.observe_child(child, cdir, 0, False, "1")
+        self.assertEqual(outcome, "failed")
+        self.assertIn("no JSON", obs["error"])
+        (cdir / "stdout.txt").write_text(json.dumps({"content": None, "tokens": None}) + "\n")
+        self.assertEqual(collect.observe_child(child, cdir, 0, False, "1")[0], "failed")
+
+    def test_analyze_equal(self):
+        kids = []
+        for mode in ("q8", "fp32"):
+            kids += [greedy_child(0, mode, "off", "same text", tokens=4), greedy_child(0, mode, "mtp", "same text", tokens=4)]
+        a = collect.analyze_greedy(kids)
+        self.assertEqual(a["errors"], [])
+        self.assertIs(a["fp32_mtp_equals_ar"], True)
+        self.assertIs(a["q8_mtp_equals_ar"], True)
+        self.assertEqual(a["labels"]["fp32_mtp_equals_ar"], "GATE (Track A F32 tripwire)")
+        self.assertEqual(a["labels"]["q8_mtp_equals_ar"], "DIAGNOSTIC")
+        self.assertIs(a["all_loaded"], True)
+        p = [x for x in a["pairs"] if x["mode"] == "fp32"][0]
+        self.assertEqual(
+            (p["equal"], p["first_diff_char"], p["len_off"], p["len_mtp"], p["tokens_off"], p["tokens_mtp"]),
+            (True, None, 9, 9, 4, 4),
+        )
+        self.assertEqual([x["equal"] for x in a["cross_mode_q8_vs_fp32"]], [True, True])
+        self.assertEqual(a["labels"]["cross_mode_q8_vs_fp32"], "DIAGNOSTIC")
+        # per-child admission lines keep only max_seq / card_cap / admission
+        self.assertEqual(a["children"][0]["daemon_admission_lines"], ["daemon: max_seq 4096 card_cap 1000"])
+        self.assertEqual(collect.stage_analysis("greedy", Path("/"), kids), a)
+
+    def test_analyze_first_diff_and_cross_mode(self):
+        kids = [
+            greedy_child(0, "fp32", "off", "abcdef", tokens=3), greedy_child(0, "fp32", "mtp", "abcdef", tokens=3),
+            greedy_child(0, "q8", "off", "abcdef", tokens=3), greedy_child(0, "q8", "mtp", "abcdXf!", tokens=4),
+        ]
+        a = collect.analyze_greedy(kids)
+        self.assertIs(a["fp32_mtp_equals_ar"], True)
+        self.assertIs(a["q8_mtp_equals_ar"], False)
+        p = [x for x in a["pairs"] if x["mode"] == "q8"][0]
+        self.assertEqual((p["equal"], p["first_diff_char"], p["len_off"], p["len_mtp"]), (False, 4, 6, 7))
+        cross = {x["spec"]: x for x in a["cross_mode_q8_vs_fp32"]}
+        self.assertTrue(cross["off"]["equal"] and cross["off"]["first_diff_char"] is None)
+        self.assertFalse(cross["mtp"]["equal"])
+        self.assertEqual(cross["mtp"]["first_diff_char"], 4)
+        self.assertEqual((cross["mtp"]["len_q8"], cross["mtp"]["len_fp32"]), (7, 6))
+        # strict prefix: first difference is the shorter length
+        b = collect.analyze_greedy([greedy_child(0, "fp32", "off", "abcd"), greedy_child(0, "fp32", "mtp", "abcdef")])
+        self.assertEqual(b["pairs"][0]["first_diff_char"], 4)
+        self.assertIs(b["fp32_mtp_equals_ar"], False)
+        self.assertIsNone(b["q8_mtp_equals_ar"])
+
+    def test_analyze_missing_pairs_are_errors_never_passes(self):
+        a = collect.analyze_greedy([greedy_child(0, "fp32", "off", "x", tokens=1)])
+        self.assertIsNone(a["fp32_mtp_equals_ar"])
+        self.assertEqual(a["pairs"], [])
+        self.assertTrue(any("run0/g1/fp32" in e and "missing" in e for e in a["errors"]))
+        self.assertEqual(a["per_mode"]["fp32"]["pairs_missing"], 1)
+        # a failed child leaves its pair uncompared and all_loaded false
+        kids = [
+            greedy_child(0, "fp32", "off", "x", tokens=1), greedy_child(0, "fp32", "mtp", None, outcome="failed"),
+            greedy_child(1, "fp32", "off", "x", tokens=1), greedy_child(1, "fp32", "mtp", "x", tokens=1),
+        ]
+        b = collect.analyze_greedy(kids)
+        self.assertIsNone(b["fp32_mtp_equals_ar"])  # one pair equal, one missing: not a pass
+        self.assertIs(b["all_loaded"], False)
+        self.assertEqual(len(b["pairs"]), 1)
+        self.assertTrue(any("greedy-spec-mtp" in e for e in b["errors"]))
+        # a definite mismatch stays False even when another pair is missing
+        c = collect.analyze_greedy(kids + [greedy_child(2, "fp32", "off", "a"), greedy_child(2, "fp32", "mtp", "b")])
+        self.assertIs(c["fp32_mtp_equals_ar"], False)
+        d = collect.analyze_greedy([])
+        self.assertIsNone(d["fp32_mtp_equals_ar"])
+        self.assertIsNone(d["q8_mtp_equals_ar"])
+        self.assertIs(d["all_loaded"], False)
+        self.assertTrue(d["errors"])
+        # cross-mode diagnostic with a missing arm is reported, not compared
+        e = collect.analyze_greedy([greedy_child(0, "q8", "off", "x"), greedy_child(0, "fp32", "off", None, outcome="failed")])
+        self.assertEqual(e["cross_mode_q8_vs_fp32"], [])
+        self.assertTrue(any("q8-vs-fp32" in x for x in e["errors"]))
+
+    def test_end_to_end_with_fake_hipfire_and_analyze_cli(self):
+        (self.root / "e2e").mkdir()
+        fx = Fixture(self.root / "e2e", fakes={"hipfire": FAKE_HIPFIRE_RUN})
+        fx.prompt.write_text("the prompt\n")
+        argv = fx.argv("greedy", "--dry-run", "--run-id", "rid", runs="1")
+        for flag in ("--wt2-ref", "--code-ref", "--long-prompt-file"):
+            i = argv.index(flag)
+            del argv[i:i + 2]
+        argv[argv.index("--max-seq") + 1] = "262144"
+        cfg = collect.validate(collect.make_parser().parse_args(argv), {})
+        cfg.dry_run = False
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = collect.run_stage(cfg, {"PATH": os.environ.get("PATH", ""), "FABRIC_JOB": "1:2:halo"})
+        self.assertEqual(rc, 0)
+        receipt = json.loads((cfg.run_dir / "receipt.json").read_text())
+        self.assertEqual(len(receipt["children"]), 4)
+        self.assertEqual(receipt["greedy_tokens"], 64)
+        self.assertIsNone(receipt["max_chunks"])
+        a = receipt["analysis"]
+        self.assertIs(a["fp32_mtp_equals_ar"], True)
+        self.assertIs(a["q8_mtp_equals_ar"], False)
+        self.assertIs(a["all_loaded"], True)
+        self.assertEqual(a["errors"], [])
+        bad = [p for p in a["pairs"] if p["mode"] == "q8"][0]
+        self.assertEqual(bad["first_diff_char"], 16)
+        self.assertTrue(all("max_seq 262144" in c["daemon_admission_lines"][0] for c in a["children"]))
+        child_dir = Path(cfg.run_dir) / receipt["children"][1]["dir"]
+        env = json.loads((child_dir / "env.json").read_text())
+        self.assertEqual(env["HIPFIRE_GRAPH"], "1")
+        self.assertEqual(env["HIPFIRE_STATE_QUANT"], "q8")
+        self.assertIn("--spec mtp", (child_dir / "command.txt").read_text())
+        report = (cfg.run_dir / "report.md").read_text()
+        self.assertIn("GATE (Track A F32 tripwire)", report)
+        self.assertIn("DIAGNOSTIC", report)
+        # --analyze recomputes the same analysis from the run dir
+        (cfg.run_dir / "analysis.json").unlink()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(collect.run(["--stage", "greedy", "--analyze", "--out", str(fx.out), "--run-id", "rid"], {}), 0)
+        self.assertEqual(json.loads(buf.getvalue()), a)
+        self.assertTrue((cfg.run_dir / "analysis.json").is_file())
+
+
 if __name__ == "__main__":
     unittest.main()
