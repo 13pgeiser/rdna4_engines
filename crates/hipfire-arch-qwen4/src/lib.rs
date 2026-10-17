@@ -66,6 +66,7 @@ pub(crate) mod projection;
 pub mod reference_forward;
 #[cfg(any(test, feature = "reference-parity"))]
 pub mod reference_mtp;
+pub mod slowlink_admission;
 pub mod state;
 #[cfg(any(test, feature = "reference-parity"))]
 pub mod state_parity;
