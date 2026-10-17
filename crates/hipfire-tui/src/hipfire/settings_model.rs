@@ -11,10 +11,6 @@
 //! active model, registry, [`ArchCtx`], env layer), so tests never read the
 //! real `~/.hipfire` or the process environment.
 
-// Rendered by the Settings pane rewrite; until it lands only tests read most of
-// the model.
-#![allow(dead_code)]
-
 use hipfire_config::{
     canonical_config_key, detect_config_profile,
     effective::{active_choice, origin_of, quality_choices, ArchCtx, Choice, Effective, Origin},
@@ -27,6 +23,7 @@ use hipfire_config::{
 use hipfire_registry::RegistryV1;
 
 use super::config::{layers_label, offload_exec_label, passback_share_label};
+use super::dashboard::LoadedConfig;
 use super::knobs::{self, ExplainCtx, PROMPT_PROCESSING_ID};
 use super::registry::RegistryState;
 use super::search::row_matches;
@@ -42,6 +39,15 @@ const RAW_PREFILL_KEYS: [&str; 2] = [IU4_KEY, A8_KEY];
 
 /// Why a row cannot be edited for one model (spec §3.5).
 pub const MODEL_SCOPE_LOCK: &str = "all models only (locked)";
+
+/// One step of the "why this value" chain (spec §4 L1): the layer, the value
+/// it held, and whether it is the one in use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChainEntry {
+    pub label: String,
+    pub value: String,
+    pub used: bool,
+}
 
 const NOT_USED_ON_GPU: &str = "— not used on this GPU";
 
@@ -90,6 +96,9 @@ pub struct SettingsRow {
     pub resolved: ConfigValue,
     pub effective: Effective,
     pub origin: Origin,
+    /// How the value was reached, lowest priority first, the used entry last
+    /// (the "why this value" pane). Empty when no layer has the key.
+    pub chain: Vec<ChainEntry>,
     /// The "Using now" text.
     pub display: String,
     /// Why the row cannot be edited right now (an environment variable owns it).
@@ -115,6 +124,7 @@ impl SettingsRow {
         self.origin.marked()
     }
 
+    #[cfg(test)]
     pub fn is_virtual(&self) -> bool {
         matches!(self.id, RowId::Virtual(_))
     }
@@ -155,7 +165,6 @@ impl RowFilter {
 pub struct SettingsModel {
     pub rows: Vec<SettingsRow>,
     pub arch: ArchCtx,
-    pub active_model: String,
     /// Name of the profile whose bundle the global config contains, if any.
     pub profile: Option<String>,
     /// `config.toml` / resolve warnings the screen can show.
@@ -228,7 +237,6 @@ impl SettingsModel {
         Self {
             rows,
             arch: arch.clone(),
-            active_model: active_model.to_owned(),
             profile: profile.map(|(name, _)| name),
             warnings,
         }
@@ -268,18 +276,24 @@ impl SettingsModel {
         self.rows.iter().find(|row| &row.id == id)
     }
 
-    /// The four-line explainer of `row` (spec §3.7); `None` for a row with no
-    /// curated entry (the Advanced rows, which use the schema help text).
-    pub fn explainer(&self, row: &SettingsRow) -> Option<[String; 4]> {
-        knobs::explainer(
-            row.id.knob_id(),
-            &ExplainCtx {
-                arch: &self.arch,
-                effective: &row.effective,
-                origin: &row.origin,
-                locked: row.locked.as_deref(),
-            },
-        )
+    /// The four-line explainer of `row` (spec §3.7): the curated entry, or
+    /// the schema help for a row with none (the Advanced rows). `live` is the
+    /// value serve reports for the resident model, `restart` is set when
+    /// `config.toml` is newer than serve.
+    pub fn explainer(&self, row: &SettingsRow, live: Option<&str>, restart: bool) -> [String; 4] {
+        let ctx = ExplainCtx {
+            arch: &self.arch,
+            effective: &row.effective,
+            origin: &row.origin,
+            locked: row.locked.as_deref(),
+            display: &row.display,
+            live,
+            restart,
+        };
+        match row.id.key() {
+            Some(key) if knobs::curated_knob(key).is_none() => knobs::schema_explainer(key, &ctx),
+            _ => knobs::explainer(row.id.knob_id(), &ctx).expect("a curated row has a knob entry"),
+        }
     }
 }
 
@@ -425,6 +439,7 @@ impl Builder<'_> {
         let display = self.display(&canonical, &effective);
         let locked = lock_text(&origin);
         let title = row_title(&canonical);
+        let chain = self.chain(&canonical, &effective, &display);
         SettingsRow {
             id: RowId::Key(canonical.clone()),
             title,
@@ -432,6 +447,7 @@ impl Builder<'_> {
             resolved,
             effective,
             origin,
+            chain,
             display,
             locked,
             deprecated: is_deprecated_key(&canonical),
@@ -519,6 +535,7 @@ impl Builder<'_> {
                 self.profile,
             ))
         });
+        let chain = self.virtual_chain(&choices, &origin, &display);
         // No route on this GPU: report it through `effective` too, so the
         // hide-unused filter drops the row.
         let mut effective = effective;
@@ -534,6 +551,7 @@ impl Builder<'_> {
             resolved,
             effective,
             origin,
+            chain,
             display,
             locked,
             deprecated: false,
@@ -543,13 +561,83 @@ impl Builder<'_> {
         }
     }
 
+    /// The resolution chain of a key row, from `ResolvedValue.shadowed`
+    /// (lowest priority first) ending with the value in use.
+    fn chain(&self, key: &str, effective: &Effective, display: &str) -> Vec<ChainEntry> {
+        let Some(slot) = self.resolved.get(key) else {
+            return Vec::new();
+        };
+        let arch = self.arch.gpu_arch.as_deref();
+        let mut chain: Vec<ChainEntry> = slot
+            .shadowed
+            .iter()
+            .map(|candidate| ChainEntry {
+                label: source_label(&candidate.source, false, arch),
+                value: value_text(key, &candidate.value),
+                used: false,
+            })
+            .collect();
+        let builtin = matches!(slot.source, ConfigSource::BuiltIn);
+        chain.push(ChainEntry {
+            label: source_label(&slot.source, effective.by_arch_rule && builtin, arch),
+            // A rule-derived built-in (`auto` → `fp8`) shows what it became.
+            value: if builtin {
+                display.to_owned()
+            } else {
+                value_text(key, &slot.value)
+            },
+            used: true,
+        });
+        chain
+    }
+
+    /// The Prompt processing chain: the built-in route for this GPU, then the
+    /// layer that changed it, if any.
+    fn virtual_chain(&self, choices: &[Choice], origin: &Origin, display: &str) -> Vec<ChainEntry> {
+        if choices.is_empty() {
+            return Vec::new();
+        }
+        let arch = self.arch.gpu_arch.as_deref();
+        let builtin_label = choices
+            .iter()
+            .find(|choice| choice.builtin_default)
+            .map_or("", |choice| choice.label)
+            .to_owned();
+        let default_origin = matches!(origin, Origin::Default | Origin::DefaultArch(_));
+        let mut chain = vec![ChainEntry {
+            label: match arch {
+                Some(arch) => format!("built-in default · {arch}"),
+                None => "built-in default".to_owned(),
+            },
+            value: builtin_label,
+            used: default_origin,
+        }];
+        if !default_origin {
+            chain.push(ChainEntry {
+                label: match origin {
+                    Origin::You => "config.toml".to_owned(),
+                    other => other.label(),
+                },
+                value: display.to_owned(),
+                used: true,
+            });
+        }
+        chain
+    }
+
     /// The "Using now" text of a key row (spec §3.2).
     fn display(&self, key: &str, effective: &Effective) -> String {
         if !effective.used_on_gpu {
             return NOT_USED_ON_GPU.to_owned();
         }
         if effective.used_by_model == Some(false) {
-            return format!("— not used by {}", self.model_label);
+            // A tag with no size reads whole; keep the cell short.
+            let model = if self.model_label.chars().count() > 8 {
+                "this model"
+            } else {
+                self.model_label.as_str()
+            };
+            return format!("— not used by {model}");
         }
         let text = value_text(key, &effective.value);
         let auto = effective
@@ -561,6 +649,50 @@ impl Builder<'_> {
         } else {
             text
         }
+    }
+}
+
+/// The layer a value came from, in words (the "why this value" chain).
+/// `by_arch_rule` appends the GPU for a built-in the arch rules resolved.
+fn source_label(source: &ConfigSource, by_arch_rule: bool, arch: Option<&str>) -> String {
+    match source {
+        ConfigSource::BuiltIn => match arch {
+            Some(arch) if by_arch_rule => format!("built-in default · {arch}"),
+            _ => "built-in default".to_owned(),
+        },
+        ConfigSource::RegistryModel { tag, .. } => format!("model card · {tag}"),
+        ConfigSource::RegistryTarget { tag, arch, .. } => format!("model card · {tag} · {arch}"),
+        ConfigSource::GlobalUser { .. } => "config.toml".to_owned(),
+        ConfigSource::ModelUser { model, .. } => format!("models.toml · {model}"),
+        ConfigSource::LegacyEnv { name } => format!("env {name}"),
+        ConfigSource::OneShot { .. } => "command line".to_owned(),
+    }
+}
+
+/// A config value as the text the editors and the enum cycle start from
+/// (`Null` reads empty).
+pub fn value_string(value: &ConfigValue) -> String {
+    match value {
+        ConfigValue::Null => String::new(),
+        ConfigValue::String(text) => text.clone(),
+        ConfigValue::Integer(number) => number.to_string(),
+        ConfigValue::Float(number) => number.to_string(),
+        ConfigValue::Bool(flag) => flag.to_string(),
+    }
+}
+
+/// What the resident model was loaded with for `key`, from serve's
+/// `/stats` `loaded_config` (KV mode, KV backend, context); `None` for any
+/// other key or a field serve did not report.
+pub fn live_text(key: &str, loaded: &LoadedConfig) -> Option<String> {
+    match key {
+        "memory.kv_cache" => loaded.kv_mode.clone(),
+        "memory.kv_backend" => loaded.kv_backend.clone(),
+        "memory.max_seq" => loaded
+            .max_seq
+            .and_then(|tokens| i64::try_from(tokens).ok())
+            .map(|tokens| format!("{} tokens", thousands(tokens))),
+        _ => None,
     }
 }
 
@@ -1080,13 +1212,66 @@ mod tests {
         let prompt = model
             .row(&RowId::Virtual(VirtualRow::PromptProcessing))
             .unwrap();
-        let lines = model.explainer(prompt).unwrap();
+        let lines = model.explainer(prompt, None, false);
         assert!(
             lines[1].starts_with("Accurate: 42% closer to the full model"),
             "{lines:?}"
         );
         assert!(lines[3].contains("kernel.iu4_prefill"), "{lines:?}");
-        assert!(model.explainer(row(&model, "kernel.iu4_prefill")).is_none());
+        // A row with no curated entry reads the schema help instead.
+        let raw = model.explainer(row(&model, "kernel.iu4_prefill"), None, false);
+        assert!(raw[3].starts_with("kernel.iu4_prefill ·"), "{raw:?}");
+        assert!(raw.iter().all(|line| line.chars().count() <= 76), "{raw:?}");
+        // Live and restart states reach line three.
+        let kv = row(&model, "memory.kv_cache");
+        let live = model.explainer(kv, Some("q8"), false);
+        assert!(live[2].starts_with("Live from serve: q8;"), "{live:?}");
+        let restart = model.explainer(kv, None, true);
+        assert!(restart[2].contains("↻ restart to apply"), "{restart:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn chain_ends_with_the_used_layer_and_live_text_maps_loaded_config() {
+        let (paths, root) = fixture_home("chain");
+        write_config(&paths, "[reasoning]\neffort = \"low\"\n");
+        let model = build(
+            &paths,
+            &registry(CARD),
+            &arch("gfx1201", A8Prefill::NotLanded),
+            &ConfigLayer::default(),
+        );
+        let effort = row(&model, "reasoning.effort");
+        assert!(effort.chain.len() >= 2, "{:?}", effort.chain);
+        let last = effort.chain.last().unwrap();
+        assert_eq!(
+            (last.label.as_str(), last.value.as_str(), last.used),
+            ("config.toml", "low", true)
+        );
+        assert!(effort.chain[..effort.chain.len() - 1]
+            .iter()
+            .all(|entry| !entry.used));
+        assert_eq!(effort.chain[0].label, "built-in default");
+        let kv = row(&model, "memory.kv_cache");
+        let kv_last = kv.chain.last().unwrap();
+        assert!(kv_last.used && kv_last.label.starts_with("built-in default · gfx1201"));
+
+        let loaded = LoadedConfig {
+            model: "qwen3.8:27b".into(),
+            kv_mode: Some("q8".into()),
+            kv_backend: Some("vmm".into()),
+            max_seq: Some(32768),
+        };
+        assert_eq!(live_text("memory.kv_cache", &loaded).as_deref(), Some("q8"));
+        assert_eq!(
+            live_text("memory.kv_backend", &loaded).as_deref(),
+            Some("vmm")
+        );
+        assert_eq!(
+            live_text("memory.max_seq", &loaded).as_deref(),
+            Some("32,768 tokens")
+        );
+        assert_eq!(live_text("reasoning.effort", &loaded), None);
         let _ = std::fs::remove_dir_all(root);
     }
 

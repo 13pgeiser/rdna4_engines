@@ -13,7 +13,7 @@ use hipfire_config::{
     developer_env_for_key,
     effective::{quality_choices, ArchCtx, Choice, Effective, Origin},
     evidence::{evidence_for, format_closer, format_slower, two_sig},
-    field,
+    field, is_deprecated_key,
 };
 
 use crate::hipfire::writer::FieldKind;
@@ -410,7 +410,6 @@ pub const EXPLAINER_COLS: usize = 76;
 
 /// The honesty line every explainer pane ends with until serve reports the
 /// values it admitted (spec §3.3.4).
-#[allow(dead_code)] // consumed by the Settings pane rewrite
 pub const PREDICTION_NOTE: &str =
     "Predicted from your config, the model card and GPU rules; serve decides at load (see Logs).";
 
@@ -738,19 +737,113 @@ pub fn curated_knob(id: &str) -> Option<&'static SettingKnob> {
 
 /// What an explainer is rendered for: the row's computed state.
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // consumed by the Settings pane rewrite
 pub struct ExplainCtx<'a> {
     pub arch: &'a ArchCtx,
     pub effective: &'a Effective,
     pub origin: &'a Origin,
     /// The row's lock text (`set by HIPFIRE_KV_MODE; unset it to change`).
     pub locked: Option<&'a str>,
+    /// The "Using now" text of the row (the prediction).
+    pub display: &'a str,
+    /// The value serve reports for the resident model, when the row has one.
+    pub live: Option<&'a str>,
+    /// `config.toml` is newer than serve and the row is read at load/start.
+    pub restart: bool,
+}
+
+/// Line 3 of an explainer: why the row has this value and when it applies.
+/// A lock outranks everything; a live serve value replaces the prediction.
+fn why_line(ctx: &ExplainCtx<'_>) -> String {
+    let applies = if ctx.restart {
+        "↻ restart to apply".to_owned()
+    } else {
+        format!("Applies: {}", ctx.effective.applies.label())
+    };
+    match (ctx.locked, ctx.live) {
+        (Some(lock), _) => capitalize(lock),
+        (None, Some(live)) => {
+            format!(
+                "Live from serve: {live}; config predicts {}. {applies}.",
+                ctx.display
+            )
+        }
+        (None, None) => {
+            let reason = match (&ctx.effective.reason, ctx.effective.used_by_model) {
+                (_, Some(false)) => "The active model does not read this setting".to_owned(),
+                (Some(reason), _) => capitalize(reason),
+                (None, _) => origin_phrase(ctx.origin),
+            };
+            format!("{reason}. {applies}.")
+        }
+    }
+}
+
+/// Dedicated line for a key with no curated entry (Advanced rows): the
+/// schema help over two lines, then why/when, then the key and its controls.
+pub fn schema_explainer(key: &str, ctx: &ExplainCtx<'_>) -> [String; 4] {
+    let schema = field(key);
+    let legacy = schema.and_then(|schema| knob_info(schema.legacy_key));
+    let mut text = match (legacy, schema) {
+        (Some(info), _) => format!("{} {}", info.summary, info.effect),
+        (None, Some(schema)) => schema.help.to_owned(),
+        (None, None) => format!("{key} has no schema help."),
+    };
+    if schema.is_some_and(|schema| is_deprecated_key(schema.key)) {
+        text = format!("Deprecated (removal 0.5.0), read-only here. {text}");
+    }
+    let mut wrapped = wrap_cols(&text, EXPLAINER_COLS);
+    let (first, second) = match wrapped.len() {
+        0 => (String::new(), String::new()),
+        1 => (wrapped.remove(0), String::new()),
+        _ => {
+            let first = wrapped.remove(0);
+            let mut second = wrapped.remove(0);
+            if !wrapped.is_empty() {
+                second = second.chars().take(EXPLAINER_COLS - 1).collect();
+                second.push('…');
+            }
+            (first, second)
+        }
+    };
+    let controls = match crate::hipfire::writer::field_kind(key) {
+        _ if schema.is_some_and(|schema| is_deprecated_key(schema.key)) => {
+            "read-only; hipfire config set"
+        }
+        Some(FieldKind::Enum(_)) => "←/→ preview, Enter saves",
+        Some(FieldKind::Bool) => "←/→ toggles",
+        Some(_) => "Enter edits",
+        None => "edit with hipfire config set",
+    };
+    let keys_line = match env_name(key) {
+        Some(env) => format!("{key} · {env} · {controls}"),
+        None => format!("{key} · {controls}"),
+    };
+    [fit(first), fit(second), fit(why_line(ctx)), fit(keys_line)]
+}
+
+/// Greedy word wrap at `cols` columns.
+fn wrap_cols(text: &str, cols: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let extra = usize::from(!line.is_empty()) + word.chars().count();
+        if !line.is_empty() && line.chars().count() + extra > cols {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// The four-line explainer of a curated row (what / trade-off / why it has
 /// this value and when it applies / key · env · controls), each at most
 /// [`EXPLAINER_COLS`] columns. `None` when `id` has no curated entry.
-#[allow(dead_code)] // consumed by the Settings pane rewrite
 pub fn explainer(id: &str, ctx: &ExplainCtx<'_>) -> Option<[String; 4]> {
     let knob = curated_knob(id)?;
     let choices = (id == PROMPT_PROCESSING_ID).then(|| quality_choices(ctx.arch));
@@ -765,17 +858,7 @@ pub fn explainer(id: &str, ctx: &ExplainCtx<'_>) -> Option<[String; 4]> {
         }
     };
 
-    let why = match ctx.locked {
-        Some(lock) => capitalize(lock),
-        None => {
-            let reason = match (&ctx.effective.reason, ctx.effective.used_by_model) {
-                (_, Some(false)) => "The active model does not read this setting".to_owned(),
-                (Some(reason), _) => capitalize(reason),
-                (None, _) => origin_phrase(ctx.origin),
-            };
-            format!("{reason}. Applies: {}.", ctx.effective.applies.label())
-        }
-    };
+    let why = why_line(ctx);
 
     let (key_text, env_text, controls) = match &choices {
         Some(choices) => {
@@ -818,22 +901,6 @@ pub fn explainer(id: &str, ctx: &ExplainCtx<'_>) -> Option<[String; 4]> {
         fit(why),
         fit(keys_line),
     ])
-}
-
-/// The qualifier that goes with a measured trade-off (cross-card numbers, old
-/// checkpoints), for the wide pane; `None` when the row has none.
-#[allow(dead_code)] // consumed by the Settings pane rewrite
-pub fn evidence_caveat(id: &str, arch: &ArchCtx) -> Option<&'static str> {
-    let knob = curated_knob(id)?;
-    let Tradeoff::Evidence { line, .. } = knob.tradeoff else {
-        return None;
-    };
-    evidence_for(
-        line,
-        arch.gpu_arch.as_deref().unwrap_or(""),
-        arch.a8_prefill,
-    )?
-    .caveat
 }
 
 fn evidence_text(line: &str, side: &str, extra: Option<&str>, arch: &ArchCtx) -> String {
@@ -916,7 +983,7 @@ fn choice_keys(choices: &[Choice]) -> Vec<&'static str> {
 }
 
 /// The `HIPFIRE_*` variable that sets `key`, if it has one.
-fn env_name(key: &str) -> Option<String> {
+pub fn env_name(key: &str) -> Option<String> {
     field(key)
         .and_then(|schema| schema.env_compat.map(str::to_owned))
         .or_else(|| developer_env_for_key(key))
@@ -1100,6 +1167,9 @@ mod tests {
                 effective: &effective,
                 origin: &origin,
                 locked: None,
+                display: "",
+                live: None,
+                restart: false,
             },
         )
         .unwrap_or_else(|| panic!("no explainer for {id}"))
@@ -1218,6 +1288,9 @@ mod tests {
                 effective: &effective,
                 origin: &origin,
                 locked: Some("set by HIPFIRE_KV_MODE; unset it to change"),
+                display: "q8",
+                live: None,
+                restart: false,
             },
         )
         .unwrap();

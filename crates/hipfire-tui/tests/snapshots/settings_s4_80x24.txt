@@ -1,0 +1,24 @@
+         hipfire · control panel    serve: offline    model: qwen3.8:27b
+
+ Home  |  Dashboard  |  Chat  |  Models  |  Settings  |  System  |  Logs
+
+────────────────────────────────────────────────────────────────────────────────
+ GPU: gfx1201    Editing: all models
+ Search: kv█                                             30 matches · Esc clear
+ ┌ Search results — name, key, env var or description ────────────────────────┐
+ │  Setting                   Using now         From               Group      │
+ │> Context length            32,768 tokens     default            Memory     │
+ │  KV cache precision        fp8 (auto)        default · gfx1201  Memory     │
+ │  KV fit-to-memory          off               default            Memory     │
+ │  Expert layers kept on GPU all on GPU        default            Memory     │
+ │  Who multiplies spilled la…over PCIe         default            Memory     │
+ │  memory.kv_backend         vmm               default            Memory     │
+ └────────────────────────────────────────────────────────── rows 1–6 of 30 ↓ ┘
+ ┌ Context length ────────────────────────────────────────────────────────────┐
+ │How many tokens of conversation the model can hold.                         │
+ │Longer context reserves more memory up front; shorter leaves room.          │
+ │Built-in default. Applies: next model load.                                 │
+ │memory.max_seq · Enter edits                                                │
+ └────────────────────────────────────────────────────────────────────────────┘
+type to filter · ↑↓ move · Enter results · Esc clear search
+

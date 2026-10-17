@@ -15,22 +15,21 @@ use ratatui::{
 use crate::{
     app::{App, Tab},
     hipfire::dashboard::{LoadState, VramState},
-    hipfire::knobs,
     hipfire::metrics::MetricsView,
     hipfire::pull_choice::PullChoice,
     hipfire::registry::ModelListItem,
     hipfire::serve_ctrl::ServeAction,
 };
 
-const BG: Color = Color::Rgb(7, 7, 9);
-const PANEL: Color = Color::Rgb(18, 16, 18);
-const PANEL_2: Color = Color::Rgb(40, 24, 27);
-const TEXT: Color = Color::Rgb(222, 226, 232);
-const MUTED: Color = Color::Rgb(142, 150, 163);
-const ACCENT: Color = Color::Rgb(237, 45, 57);
-const GREEN: Color = Color::Rgb(102, 217, 139);
-const YELLOW: Color = Color::Rgb(238, 190, 95);
-const RED: Color = Color::Rgb(255, 95, 104);
+pub(crate) const BG: Color = Color::Rgb(7, 7, 9);
+pub(crate) const PANEL: Color = Color::Rgb(18, 16, 18);
+pub(crate) const PANEL_2: Color = Color::Rgb(40, 24, 27);
+pub(crate) const TEXT: Color = Color::Rgb(222, 226, 232);
+pub(crate) const MUTED: Color = Color::Rgb(142, 150, 163);
+pub(crate) const ACCENT: Color = Color::Rgb(237, 45, 57);
+pub(crate) const GREEN: Color = Color::Rgb(102, 217, 139);
+pub(crate) const YELLOW: Color = Color::Rgb(238, 190, 95);
+pub(crate) const RED: Color = Color::Rgb(255, 95, 104);
 
 /// Tab-bar divider, shared between the renderer (`Tabs::divider`) and the mouse
 /// hit-test math in `draw_header` so the two cannot drift (the hit-test advances
@@ -55,7 +54,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Tab::Dashboard => draw_dashboard(frame, app, root[1]),
         Tab::Chat => draw_chat(frame, app, root[1]),
         Tab::Models => draw_models(frame, app, root[1]),
-        Tab::Settings => draw_settings(frame, app, root[1]),
+        Tab::Settings => crate::ui_settings::draw_settings(frame, app, root[1]),
         Tab::System => draw_system(frame, app, root[1]),
         Tab::Logs => draw_logs(frame, app, root[1]),
     }
@@ -330,15 +329,36 @@ fn footer_segments(app: &App) -> Vec<String> {
                     "Backspace delete",
                     "Esc cancel",
                 ])
+            } else if app.settings_search_typing() {
+                segs(&[
+                    "type to filter",
+                    "↑↓ move",
+                    "Enter results",
+                    "Esc clear search",
+                ])
+            } else if app.settings_search.is_some() {
+                segs(&[
+                    "↑↓ move",
+                    "←→ change",
+                    "Enter save",
+                    "Esc clear search",
+                    "/ edit search",
+                    "? help",
+                    "r refresh",
+                    "Tab/Shift+Tab switch",
+                    "q quit",
+                ])
             } else {
                 segs(&[
-                    "e easy",
-                    "a advanced",
+                    "↑↓ move",
+                    "←→ change",
+                    "Del default",
+                    "/ search",
+                    "1-6 group",
                     "? help",
-                    "Up/Down select",
-                    "Enter commit/edit",
-                    "Left/Right/Space change",
-                    "Del reset",
+                    "Enter save",
+                    "c changed",
+                    "h hide unused",
                     "R reset-all",
                     "r refresh",
                     "Tab/Shift+Tab switch",
@@ -1480,527 +1500,6 @@ fn draw_models_status(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// Action hint for the SELECTED settings row, accurate to its field kind: enums
-/// preview-then-commit, booleans toggle immediately, numbers/strings open an
-/// editor (5b — the copy must not promise preview semantics for booleans).
-/// Deprecated and non-editable rows name the CLI command that does edit them.
-fn selected_action_hint(app: &App) -> String {
-    use crate::hipfire::writer::{self, FieldKind};
-    let Some(key) = app.selected_setting_key() else {
-        // A composite easy row (Model / Serve): its help key names the CLI key.
-        return match settings_help_key(app) {
-            Some(key) => format!("Not editable inline — edit with `hipfire config set {key}`."),
-            None => "Not editable inline.".to_owned(),
-        };
-    };
-    if hipfire_config::is_deprecated_key(&key) {
-        return format!("Deprecated, read-only here — edit with `hipfire config set {key}`.");
-    }
-    match writer::field_spec(&key).map(|s| s.kind) {
-        Some(FieldKind::Enum(_)) => "Left/Right/Space preview values, Enter commits.".to_owned(),
-        Some(FieldKind::Bool) => {
-            "Left/Right/Space toggles on/off (applies immediately).".to_owned()
-        }
-        Some(FieldKind::Int) | Some(FieldKind::Float) | Some(FieldKind::FreeStr { .. }) => {
-            match writer::schema_range(&key) {
-                Some(range) => format!("Enter to edit the value (range {range})."),
-                None => "Enter to edit the value.".to_owned(),
-            }
-        }
-        None => format!("Not editable inline — edit with `hipfire config set {key}`."),
-    }
-}
-
-/// The config key whose help the Settings explainer shows: every easy row maps
-/// through `easy_help_keys` (incl. the composite Model/Serve rows), advanced rows
-/// are the key itself.
-fn settings_help_key(app: &App) -> Option<String> {
-    if app.settings_easy {
-        app.config
-            .easy_help_keys()
-            .get(app.settings_selected)
-            .map(|k| k.to_string())
-    } else {
-        app.selected_setting_key()
-    }
-}
-
-/// Visible-range text for a scrolling list: `"rows 1–6 of 13 ↓"`, with `↑`/`↓`
-/// marking rows cut above/below. Empty when every row is on screen.
-fn scroll_indicator(start: usize, visible: usize, total: usize) -> String {
-    if total <= visible {
-        return String::new();
-    }
-    let end = (start + visible).min(total);
-    let up = if start > 0 { "↑" } else { "" };
-    let down = if end < total { "↓" } else { "" };
-    format!("  rows {}–{} of {} {}{}", start + 1, end, total, up, down)
-        .trim_end()
-        .to_owned()
-}
-
-/// Rows `line` occupies when word-wrapped to `width` columns (greedy).
-fn wrapped_rows(line: &Line, width: usize) -> usize {
-    let width = width.max(1);
-    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    let mut rows = 1;
-    let mut used = 0;
-    for word in text.split(' ') {
-        let len = word.chars().count();
-        if used > 0 && used + 1 + len > width {
-            rows += 1;
-            used = len;
-        } else {
-            used += if used == 0 { len } else { len + 1 };
-        }
-        while used > width {
-            rows += 1;
-            used -= width;
-        }
-    }
-    rows
-}
-
-/// Keep only the lines that start within `height` rows once wrapped to `width`, and never
-/// end on an orphaned section header (`Options:` with none of its rows visible).
-fn fit_explainer_lines(
-    mut lines: Vec<Line<'static>>,
-    width: usize,
-    height: usize,
-) -> Vec<Line<'static>> {
-    let mut rows = 0;
-    let mut keep = lines.len();
-    for (i, line) in lines.iter().enumerate() {
-        // A line that starts inside the pane stays (its tail may clip).
-        if rows >= height {
-            keep = i;
-            break;
-        }
-        rows += wrapped_rows(line, width);
-    }
-    lines.truncate(keep);
-    while lines.last().is_some_and(|l| {
-        let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
-        text == "Options:"
-    }) {
-        lines.pop();
-    }
-    lines
-}
-
-/// The staged enum-preview value for `key`, if a preview (5b) is active for it.
-/// `None` when there's no preview or it targets a different key.
-fn preview_for(app: &App, key: Option<&str>) -> Option<String> {
-    let key = key?;
-    match &app.settings_pending {
-        Some(p) if p.key == key => Some(p.value.clone()),
-        _ => None,
-    }
-}
-
-/// Value cell + row style for one settings row, encoding the 5b preview state and
-/// the 5c override-vs-default distinction at a glance:
-///   * staged preview   → "● {v} (preview)", YELLOW italic (a pending override)
-///   * committed override → "● {v}", bright + bold (this is yours)
-///   * inherited default → "  {v}", dimmed (untouched)
-///   * composite row     → "  {v}", neutral (set elsewhere, no override status)
-/// A staged preview takes precedence (it IS the active, uncommitted row) and uses
-/// the highlight background (PANEL_2) with a distinct YELLOW italic, so it reads
-/// as both selected and unsaved. For non-preview rows the cursor highlight
-/// (ACCENT on PANEL_2) wins so the selected row stays legible.
-/// `override_state`: Some(true)=override, Some(false)=default, None=composite.
-fn settings_row_display(
-    committed: &str,
-    preview: Option<&str>,
-    override_state: Option<bool>,
-    selected: bool,
-) -> (String, Style) {
-    if let Some(pv) = preview {
-        return (
-            format!("● {pv} (preview)"),
-            Style::default()
-                .fg(YELLOW)
-                .bg(PANEL_2)
-                .add_modifier(Modifier::ITALIC),
-        );
-    }
-    let is_override = override_state == Some(true);
-    let marker = if is_override { "● " } else { "  " };
-    let shown = format!("{marker}{committed}");
-    let style = if selected {
-        Style::default().fg(ACCENT).bg(PANEL_2)
-    } else {
-        match override_state {
-            Some(true) => Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            Some(false) => Style::default().fg(MUTED),
-            None => Style::default().fg(TEXT),
-        }
-    };
-    (shown, style)
-}
-
-/// Tag appended to deprecated CASK/PFlash rows in the Advanced view.
-const DEPRECATED_TAG: &str = "(deprecated, removal 0.5.0)";
-
-/// The Settings header while a value is being edited: the buffer with the char
-/// under the cursor drawn reversed (a reversed space at the end of the buffer).
-fn settings_edit_line(mode: &str, edit: &crate::app::EditState) -> Line<'static> {
-    let chars: Vec<char> = edit.buffer.chars().collect();
-    let cursor = edit.cursor.min(chars.len());
-    let before: String = chars[..cursor].iter().collect();
-    let under = chars.get(cursor).copied().unwrap_or(' ');
-    let after: String = chars.iter().skip(cursor + 1).collect();
-    Line::from(vec![
-        Span::raw(format!("{mode}    editing {} = {before}", edit.key)),
-        Span::styled(
-            under.to_string(),
-            Style::default().add_modifier(Modifier::REVERSED),
-        ),
-        Span::raw(format!("{after}  (Enter save, Esc cancel, ←/→ move)")),
-    ])
-}
-
-fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
-    // header · table · explainer-for-selected-key (5e). The explainer takes a
-    // fixed slice; the table keeps the elastic middle so it never disappears.
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(10),
-            Constraint::Min(8),
-        ])
-        .split(pad(area, 1, 0));
-    if app.confirm_reset_all {
-        // Destructive: clears all overrides in config.toml (default_model / host / port
-        // included). RED-bordered, like the Models delete-confirm.
-        frame.render_widget(
-            Paragraph::new(
-                "Reset ALL settings to defaults? This clears ~/.hipfire/config.toml.  \
-                 y = confirm · n / Esc = cancel",
-            )
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(RED))
-                    .title(" Confirm reset-all "),
-            )
-            .style(Style::default().fg(TEXT).bg(PANEL)),
-            chunks[0],
-        );
-    } else {
-        let mode = if app.settings_easy {
-            "Easy settings"
-        } else {
-            "Advanced settings"
-        };
-        let note = if let Some(p) = &app.settings_pending {
-            // 5b: a staged enum preview is not yet written.
-            format!(
-                "preview {} = {} (uncommitted) — Enter commit, Esc cancel",
-                p.key, p.value
-            )
-        } else if app.settings_edit.is_some() {
-            String::new() // rendered below with a visible cursor
-        } else {
-            // Tailor the hint to the SELECTED row's kind so the copy never
-            // overstates preview semantics (booleans toggle immediately; only
-            // enums preview-then-commit).
-            let action = selected_action_hint(app);
-            let switch = if app.settings_easy {
-                "a for advanced"
-            } else {
-                "e for easy"
-            };
-            format!("{action}  Del resets. Press {switch}.")
-        };
-        let line = match &app.settings_edit {
-            Some(edit) if app.settings_pending.is_none() => settings_edit_line(mode, edit),
-            _ => Line::from(format!("{mode}    {note}")),
-        };
-        frame.render_widget(
-            Paragraph::new(line)
-                .block(block("Settings"))
-                .style(Style::default().fg(TEXT).bg(PANEL)),
-            chunks[0],
-        );
-    }
-
-    if app.settings_easy {
-        let easy_keys = app.config.easy_keys();
-        // Override status for EVERY easy row (incl. the composite Model/Serve rows
-        // whose editable key is None) so the 5c marker matches the advanced view.
-        let override_states = app.config.easy_override_state();
-        let rows_all = app
-            .config
-            .easy_rows()
-            .into_iter()
-            .enumerate()
-            .collect::<Vec<_>>();
-        let start = scroll_start(app.settings_selected, chunks[1].height, 3);
-        let visible = visible_rows(chunks[1].height, 3);
-        let indicator = scroll_indicator(start, visible, rows_all.len());
-        let rows = rows_all
-            .into_iter()
-            .skip(start)
-            .take(visible)
-            .map(|(idx, (label, value, desc))| {
-                let row_key = easy_keys.get(idx).and_then(|k| *k);
-                let preview = preview_for(app, row_key);
-                // Every easy row has a definite override status (composite rows
-                // resolve theirs from default_model / host|port).
-                let override_state = override_states.get(idx).copied();
-                let (shown, style) = settings_row_display(
-                    &value,
-                    preview.as_deref(),
-                    override_state,
-                    idx == app.settings_selected,
-                );
-                Row::new([label.to_string(), shown, desc.to_string()]).style(style)
-            })
-            .collect::<Vec<_>>();
-        frame.render_widget(
-            Table::new(
-                rows,
-                [
-                    Constraint::Length(16),
-                    Constraint::Length(24),
-                    Constraint::Min(30),
-                ],
-            )
-            .header(Row::new(["Setting", "Value", "Meaning"]).style(Style::default().fg(MUTED)))
-            .block(block(&format!(
-                "User-safe controls  (● = your override){indicator}"
-            )))
-            .style(Style::default().fg(TEXT).bg(PANEL)),
-            chunks[1],
-        );
-    } else {
-        // Deprecated CASK/PFlash keys sort after every other key.
-        let keys = app.config.advanced_keys();
-        let start = scroll_start(app.settings_selected, chunks[1].height, 3);
-        let visible = visible_rows(chunks[1].height, 3);
-        let indicator = scroll_indicator(start, visible, keys.len());
-        let rows = keys
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(visible)
-            .map(|(idx, k)| {
-                let v = app.config.values.get(k.as_str()).map_or("", String::as_str);
-                let selected = idx == app.settings_selected;
-                if hipfire_config::is_deprecated_key(k) {
-                    // Read-only, dimmed, tagged; never previewed.
-                    let marker = if app.config.is_override(k) {
-                        "● "
-                    } else {
-                        "  "
-                    };
-                    let mut style = Style::default().fg(MUTED).add_modifier(Modifier::DIM);
-                    if selected {
-                        style = style.bg(PANEL_2);
-                    }
-                    return Row::new([(*k).clone(), format!("{marker}{v}  {DEPRECATED_TAG}")])
-                        .style(style);
-                }
-                let preview = preview_for(app, Some(k.as_str()));
-                // Every advanced row maps to a real config key.
-                let override_state = Some(app.config.is_override(k));
-                let (shown, style) =
-                    settings_row_display(v, preview.as_deref(), override_state, selected);
-                Row::new([(*k).clone(), shown]).style(style)
-            })
-            .collect::<Vec<_>>();
-        frame.render_widget(
-            Table::new(rows, [Constraint::Length(28), Constraint::Min(20)])
-                .header(Row::new(["Key", "Value"]).style(Style::default().fg(MUTED)))
-                .block(block(&format!(
-                    "Advanced config.toml view  (● = your override){indicator}"
-                )))
-                .style(Style::default().fg(TEXT).bg(PANEL)),
-            chunks[1],
-        );
-    }
-
-    draw_settings_explainer(frame, app, chunks[2]);
-}
-
-/// The 5e explainer pane: for the selected settings row, show what the key is,
-/// what it does (with its tradeoff), the default, when to use it, and any
-/// load-bearing interaction. Falls back to an honest "no extended help" line for
-/// keys without a curated entry (e.g. low-level advanced keys).
-fn draw_settings_explainer(frame: &mut Frame, app: &App, area: Rect) {
-    let help_key: Option<String> = settings_help_key(app);
-
-    // Current committed value + any staged 5b preview for the selected key, so the
-    // options list can mark "where you are" and "what you're about to commit".
-    let cur = help_key
-        .as_deref()
-        .map(|k| app.config.values.get(k).cloned().unwrap_or_default())
-        .unwrap_or_default();
-    let pending = help_key.as_deref().and_then(|k| preview_for(app, Some(k)));
-
-    let mut lines: Vec<Line> = Vec::new();
-    match help_key.as_deref().and_then(knobs::knob_info) {
-        Some(info) => {
-            let mut head = vec![
-                Span::styled(
-                    info.title,
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("  ({})", info.key), Style::default().fg(MUTED)),
-                Span::styled(
-                    format!("   default: {}", default_display(info.default)),
-                    Style::default().fg(MUTED),
-                ),
-            ];
-            if !cur.is_empty() {
-                head.push(Span::styled(
-                    format!("   now: {cur}"),
-                    Style::default().fg(TEXT),
-                ));
-            }
-            lines.push(Line::from(head));
-            lines.push(Line::from(Span::styled(
-                info.summary,
-                Style::default().fg(TEXT),
-            )));
-            lines.push(Line::from(vec![
-                Span::styled("Effect: ", Style::default().fg(YELLOW)),
-                Span::styled(info.effect, Style::default().fg(TEXT)),
-            ]));
-            // Per-option help: what each selectable value does, with the current
-            // value marked "▸" (accent) and a staged preview marked "●" (yellow).
-            if !info.options.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "Options:",
-                    Style::default().fg(YELLOW),
-                )));
-                for (val, desc) in info.options {
-                    let is_pending = pending.as_deref() == Some(*val);
-                    let is_current = !is_pending && cur == *val;
-                    let (marker, vstyle) = if is_pending {
-                        (
-                            "● ",
-                            Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
-                        )
-                    } else if is_current {
-                        (
-                            "▸ ",
-                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                        )
-                    } else {
-                        ("  ", Style::default().fg(TEXT))
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{marker}{val}"), vstyle),
-                        Span::styled(format!(" — {desc}"), Style::default().fg(MUTED)),
-                    ]));
-                }
-            }
-            lines.push(Line::from(vec![
-                Span::styled("When: ", Style::default().fg(YELLOW)),
-                Span::styled(info.when, Style::default().fg(TEXT)),
-            ]));
-            if let Some(note) = info.note {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "Note: ",
-                        Style::default().fg(RED).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(note, Style::default().fg(TEXT)),
-                ]));
-            }
-        }
-        None => {
-            // No curated entry: fall back to the schema's own help text (every
-            // key has one) rather than claiming there is none.
-            let label = help_key.clone().unwrap_or_else(|| "this row".into());
-            let schema = help_key.as_deref().and_then(hipfire_config::field);
-            let deprecated = help_key
-                .as_deref()
-                .is_some_and(hipfire_config::is_deprecated_key);
-            let mut head = vec![Span::styled(
-                label.clone(),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            )];
-            if let Some(field) = schema {
-                if field.key != label {
-                    head.push(Span::styled(
-                        format!("  ({})", field.key),
-                        Style::default().fg(MUTED),
-                    ));
-                }
-                head.push(Span::styled(
-                    format!(
-                        "   default: {}",
-                        default_display(
-                            &crate::hipfire::config::default_value(field.key).unwrap_or_default()
-                        )
-                    ),
-                    Style::default().fg(MUTED),
-                ));
-            }
-            if !cur.is_empty() {
-                head.push(Span::styled(
-                    format!("   now: {cur}"),
-                    Style::default().fg(TEXT),
-                ));
-            }
-            lines.push(Line::from(head));
-            if deprecated {
-                lines.push(Line::from(Span::styled(
-                    DEPRECATED_TAG
-                        .trim_matches(|c| c == '(' || c == ')')
-                        .to_uppercase(),
-                    Style::default().fg(RED).add_modifier(Modifier::BOLD),
-                )));
-            }
-            match schema {
-                Some(field) => lines.push(Line::from(Span::styled(
-                    field.help,
-                    Style::default().fg(TEXT),
-                ))),
-                None => lines.push(Line::from(Span::styled(
-                    format!("No help text for {label}."),
-                    Style::default().fg(MUTED),
-                ))),
-            }
-            if deprecated {
-                lines.push(Line::from(Span::styled(
-                    format!("Read-only here — edit with `hipfire config set {label}`."),
-                    Style::default().fg(MUTED),
-                )));
-            }
-        }
-    }
-
-    // Drop what cannot fit, and never end on an orphaned "Options:" header.
-    let lines = fit_explainer_lines(
-        lines,
-        area.width.saturating_sub(2) as usize,
-        area.height.saturating_sub(2) as usize,
-    );
-
-    frame.render_widget(
-        Paragraph::new(lines)
-            // trim:false so the per-option indent / markers keep their column.
-            .wrap(Wrap { trim: false })
-            .block(block("About this setting"))
-            .style(Style::default().fg(TEXT).bg(PANEL)),
-        area,
-    );
-}
-
-/// Render a default value for display: an empty default reads as "(unset)".
-fn default_display(default: &str) -> String {
-    if default.is_empty() {
-        "(unset)".to_string()
-    } else {
-        default.to_string()
-    }
-}
-
 fn draw_system(frame: &mut Frame, app: &App, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -2301,7 +1800,7 @@ fn draw_logs(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn block(title: &str) -> Block<'static> {
+pub(crate) fn block(title: &str) -> Block<'static> {
     Block::default()
         .title(Span::styled(
             format!(" {title} "),
@@ -2312,7 +1811,7 @@ fn block(title: &str) -> Block<'static> {
         .style(Style::default().bg(PANEL))
 }
 
-fn pad(area: Rect, x: u16, y: u16) -> Rect {
+pub(crate) fn pad(area: Rect, x: u16, y: u16) -> Rect {
     Rect {
         x: area.x.saturating_add(x),
         y: area.y.saturating_add(y),
@@ -2512,116 +2011,6 @@ mod render_tests {
         buf.content().iter().map(|c| c.symbol()).collect()
     }
 
-    /// The easy settings list is only useful if its rows actually DRAW, and the
-    /// explainer pane only if the row's help key resolves to a curated entry.
-    /// `easy_mode_lists_stay_positionally_parallel` and
-    /// `easy_help_keys_have_explainers` both pass on data structures alone, so a
-    /// row that aligns and resolves but never renders would slip past both.
-    ///
-    /// Both renderings are pinned explicitly by setting the value in-test.
-    /// `render_with` builds on `App::load()`, which reads the developer's real
-    /// `~/.hipfire/config.toml` — asserting the unset rendering against whatever
-    /// happens to be loaded makes this test fail for anyone who has set a value,
-    /// which is precisely the bug it should be reporting an absence of.
-    #[test]
-    fn settings_easy_draws_the_offload_row_and_its_explainer() {
-        let idx = App::load()
-            .expect("App::load")
-            .config
-            .easy_keys()
-            .iter()
-            .position(|k| matches!(k, Some("gpu_layer_budget")))
-            .expect("offload row present in the easy list");
-
-        let render = |value: &str| {
-            let text = render_with(|app| {
-                app.tab = Tab::Settings;
-                app.settings_easy = true;
-                app.config
-                    .values
-                    .insert("gpu_layer_budget".into(), value.to_string());
-                // Also clear the override set: a real user config that has this
-                // key set draws a "●" override marker between the label and the
-                // value, which would make the adjacency assertion below depend on
-                // the developer's own config.
-                app.config.overrides.clear();
-                app.settings_selected = idx;
-            });
-            // Match the LABEL+VALUE pair, not the bare label: a bare
-            // `contains("GPU layers")` also matches a mangled label like
-            // "GPU layersXX", which passes on exactly the regression this exists
-            // to catch. Verified by renaming the row and watching it fail.
-            text.split_whitespace().collect::<Vec<_>>().join(" ")
-        };
-
-        let unset = render("");
-        assert!(
-            unset.contains("GPU layers all on GPU"),
-            "an unset budget must render as a readable state, not a blank cell"
-        );
-
-        let set = render("32");
-        assert!(
-            set.contains("GPU layers 32 on GPU"),
-            "a set budget must render its value with the same units as the label"
-        );
-
-        assert!(
-            set.contains("Layers kept on the GPU"),
-            "selecting the row must render its curated explainer"
-        );
-    }
-
-    /// The row's *other* half: the exec side must draw too, with the value in the
-    /// same cell grammar as its sibling and its own explainer. Values are pinned
-    /// in-test because `render_with` builds on `App::load()`, which reads the
-    /// developer's real config.
-    #[test]
-    fn settings_easy_draws_the_offload_exec_row_and_its_explainer() {
-        let idx = App::load()
-            .expect("App::load")
-            .config
-            .easy_keys()
-            .iter()
-            .position(|k| matches!(k, Some("offload_exec")))
-            .expect("offload_exec row present in the easy list");
-
-        let render = |value: &str| {
-            let text = render_with(|app| {
-                app.tab = Tab::Settings;
-                app.settings_easy = true;
-                app.config
-                    .values
-                    .insert("offload_exec".into(), value.to_string());
-                // A real config that has the key set draws a "●" override marker
-                // between the label and the value; clear it so the adjacency
-                // assertion does not depend on the developer's own config.
-                app.config.overrides.clear();
-                app.settings_selected = idx;
-            });
-            text.split_whitespace().collect::<Vec<_>>().join(" ")
-        };
-
-        assert!(
-            render("pcie").contains("Offload exec over PCIe"),
-            "the default arm must draw as a readable state"
-        );
-        assert!(
-            render("cpu").contains("Offload exec on CPU"),
-            "the CPU arm must draw as a readable state"
-        );
-        let text = render_with(|app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = true;
-            app.config.overrides.clear();
-            app.settings_selected = idx;
-        });
-        assert!(
-            text.contains("Who multiplies a spilled layer"),
-            "selecting the row must render its curated explainer"
-        );
-    }
-
     fn dash_with_system(system: SystemInfo) -> Dashboard {
         let mut d = Dashboard::offline(
             "127.0.0.1:11435".into(),
@@ -2712,7 +2101,10 @@ mod render_tests {
             settings.contains("change"),
             "settings footer mentions change"
         );
-        assert!(settings.contains("easy"), "settings footer mentions easy");
+        assert!(
+            settings.contains("search"),
+            "settings footer mentions search"
+        );
 
         let models = render_with(|app| app.tab = Tab::Models);
         assert!(models.contains("select"), "models footer mentions select");
@@ -2901,274 +2293,8 @@ mod render_tests {
     fn settings_footer_shows_reset_controls() {
         // 5a: reset + reset-all are discoverable in the Settings footer.
         let text = render_with(|app| app.tab = Tab::Settings);
-        assert!(text.contains("Del reset"), "single-key reset hint");
+        assert!(text.contains("Del default"), "single-key reset hint");
         assert!(text.contains("R reset-all"), "reset-all hint");
-    }
-
-    #[test]
-    fn settings_row_display_encodes_override_state() {
-        use ratatui::style::Modifier;
-        // 5c: override -> "● " marker + bold; default -> "  " (no marker) + dim
-        // MUTED; composite (None) -> neutral, no marker; preview wins (5b).
-        let (s, st) = settings_row_display("q8", None, Some(true), false);
-        assert_eq!(s, "● q8");
-        assert!(st.add_modifier.contains(Modifier::BOLD), "override is bold");
-        assert_eq!(st.fg, Some(TEXT));
-
-        let (s, st) = settings_row_display("auto", None, Some(false), false);
-        assert_eq!(s, "  auto", "default has no bullet");
-        assert_eq!(st.fg, Some(MUTED), "default is dimmed");
-
-        let (s, st) = settings_row_display("qwen3.5:9b", None, None, false);
-        assert_eq!(s, "  qwen3.5:9b", "composite row has no bullet");
-        assert_eq!(st.fg, Some(TEXT), "composite row is neutral, not dimmed");
-
-        // Selected override stays marked but uses the cursor highlight.
-        let (s, st) = settings_row_display("q8", None, Some(true), true);
-        assert_eq!(s, "● q8");
-        assert_eq!(st.fg, Some(ACCENT), "selected row uses the cursor color");
-
-        // Preview overrides everything.
-        let (s, st) = settings_row_display("auto", Some("on"), Some(false), false);
-        assert_eq!(s, "● on (preview)");
-        assert_eq!(st.fg, Some(YELLOW));
-        assert!(st.add_modifier.contains(Modifier::ITALIC));
-
-        // Preview on the SELECTED row still reads as highlighted: it keeps the
-        // PANEL_2 highlight background (not just yellow text floating on PANEL).
-        let (_s, st) = settings_row_display("auto", Some("on"), Some(false), true);
-        assert_eq!(st.fg, Some(YELLOW), "preview keeps its distinct yellow");
-        assert_eq!(
-            st.bg,
-            Some(PANEL_2),
-            "preview row uses the highlight background"
-        );
-    }
-
-    #[test]
-    fn easy_override_state_is_row_parallel() {
-        // 5c review #1: easy_override_state must stay aligned with easy_rows /
-        // easy_keys so the marker lands on the right row.
-        let app = App::load().expect("App::load");
-        let rows = app.config.easy_rows().len();
-        assert_eq!(app.config.easy_override_state().len(), rows);
-        assert_eq!(app.config.easy_keys().len(), rows);
-    }
-
-    #[test]
-    fn settings_marks_overrides_with_legend() {
-        // 5c render: an override row carries the ● marker and the table titles
-        // explain what it means.
-        let text = render_with(|app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = false;
-            app.config.overrides.clear();
-            app.config.overrides.insert("kv_cache".into());
-            // Put the override row under the cursor so it is on-screen.
-            app.settings_selected = app
-                .config
-                .advanced_keys()
-                .iter()
-                .position(|k| k.as_str() == "kv_cache")
-                .unwrap();
-        });
-        assert!(text.contains("● "), "override row marked with a bullet");
-        assert!(text.contains("your override"), "legend explains the marker");
-    }
-
-    #[test]
-    fn easy_model_row_marks_default_model_override() {
-        // 5c review #1: the composite Model row (editable key None) must still
-        // show the override marker when default_model is set — consistent with
-        // the advanced view, where the same key is marked.
-        let text = render_with(|app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = true;
-            app.config.overrides.clear();
-            app.config.overrides.insert("default_model".into());
-            app.settings_selected = 0; // Model row
-        });
-        // Only default_model is overridden, so the single bullet is the Model row.
-        assert!(
-            text.contains("● "),
-            "Model composite row marked via default_model override"
-        );
-    }
-
-    #[test]
-    fn settings_explainer_shows_selected_key_help() {
-        // 5e: selecting dflash_mode shows its explainer incl. the load-bearing
-        // thinking interaction and its default.
-        let text = render_with(|app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = false;
-            app.settings_selected = app
-                .config
-                .advanced_keys()
-                .iter()
-                .position(|k| k.as_str() == "dflash_mode")
-                .unwrap();
-        });
-        assert!(
-            text.contains("About this setting"),
-            "explainer pane present"
-        );
-        assert!(text.contains("DFlash eligibility"), "shows the knob title");
-        assert!(
-            text.contains("thinking"),
-            "surfaces the thinking↔dflash interaction"
-        );
-        assert!(text.contains("default:"), "shows the default");
-    }
-
-    #[test]
-    fn settings_explainer_lists_options_with_current_marked() {
-        // 5e+: selecting an enum shows each option's meaning in the in-tab pane,
-        // marking the current value with the ▸ pointer.
-        let text = render_with(|app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = false;
-            app.settings_selected = app
-                .config
-                .advanced_keys()
-                .iter()
-                .position(|k| k.as_str() == "kv_adaptive")
-                .unwrap();
-        });
-        assert!(text.contains("Options:"), "options section present");
-        assert!(text.contains("aggressive"), "an option value is listed");
-        // The three presets are now distinct tiers — balanced is the middle floor.
-        assert!(
-            text.contains("Middle floor"),
-            "an option description is shown"
-        );
-        assert!(
-            text.contains("▸"),
-            "the current option is marked with a pointer"
-        );
-    }
-
-    #[test]
-    fn settings_explainer_easy_composite_row_has_help() {
-        // The composite Model row (no inline-editable key) still gets help via
-        // easy_help_keys -> default_model.
-        let text = render_with(|app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = true;
-            app.settings_selected = 0; // Model row
-        });
-        assert!(
-            text.contains("Default model"),
-            "Model row resolves to default_model help"
-        );
-    }
-
-    #[test]
-    fn settings_explainer_falls_back_to_schema_help_for_uncurated_key() {
-        // A key without a curated entry shows the schema's own help text, not a
-        // "no extended help" dead end.
-        let text = render_with(|app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = false;
-            app.config.values.clear();
-            app.config.values.insert("mtp_k".into(), "auto".into());
-            app.config
-                .values
-                .insert("kv_backend".into(), "legacy".into());
-            app.settings_selected = app
-                .config
-                .advanced_keys()
-                .iter()
-                .position(|k| k.as_str() == "kv_backend")
-                .unwrap();
-        });
-        assert!(!text.contains("No extended help"), "{text}");
-        let help = hipfire_config::field("kv_backend").unwrap().help;
-        let first_words: String = help.chars().take(24).collect();
-        assert!(
-            text.contains(&first_words),
-            "schema help text shown: wanted {first_words:?}"
-        );
-    }
-
-    #[test]
-    fn settings_deprecated_rows_are_dimmed_tagged_and_last() {
-        let text = render_with(|app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = false;
-            app.config.values.clear();
-            app.config.values.insert("cask".into(), "false".into());
-            app.config.values.insert("cask_budget".into(), "512".into());
-            app.config.values.insert("zzz_last".into(), "x".into());
-            app.settings_selected = 0;
-        });
-        // `cask*` sort after `zzz_last` in the advanced list.
-        assert!(
-            text.find("zzz_last").unwrap() < text.find("cask_budget").unwrap(),
-            "deprecated rows come last"
-        );
-        assert!(text.contains("(deprecated, removal 0.5.0)"), "{text}");
-    }
-
-    #[test]
-    fn settings_hint_is_honest_per_row_kind() {
-        // 5b review: the action hint must NOT promise preview semantics on a
-        // boolean row (it toggles immediately), but must on an enum row.
-        let bool_text = render_with(|app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = false;
-            app.settings_selected = app
-                .config
-                .advanced_keys()
-                .iter()
-                .position(|k| k.as_str() == "prompt_normalize")
-                .unwrap();
-        });
-        assert!(
-            bool_text.contains("toggles on/off") && bool_text.contains("immediately"),
-            "boolean row advertises immediate toggle, not preview"
-        );
-
-        let enum_text = render_with(|app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = false;
-            app.settings_selected = app
-                .config
-                .advanced_keys()
-                .iter()
-                .position(|k| k.as_str() == "kv_cache")
-                .unwrap();
-        });
-        assert!(
-            enum_text.contains("preview values") && enum_text.contains("Enter commits"),
-            "enum row advertises preview-then-commit"
-        );
-    }
-
-    #[test]
-    fn settings_enum_preview_renders_distinctly() {
-        // 5b: a staged preview shows the value with "(preview)" + a commit/cancel
-        // footer, signalling it is NOT yet written.
-        let text = render_with(|app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = false;
-            // Select the previewed row so it's on-screen (scroll follows selection).
-            app.settings_selected = app
-                .config
-                .advanced_keys()
-                .iter()
-                .position(|k| k.as_str() == "dflash_mode")
-                .unwrap();
-            app.settings_pending = Some(crate::app::PendingEnum {
-                key: "dflash_mode".into(),
-                value: "auto".into(),
-            });
-        });
-        assert!(text.contains("auto (preview)"), "previewed value is marked");
-        assert!(
-            text.contains("Enter commit"),
-            "commit/cancel guidance shown"
-        );
     }
 
     #[test]
@@ -3797,150 +2923,6 @@ mod render_tests {
             "a bundled registry is named with its date, not `missing`"
         );
         assert!(text.contains("remote") && text.contains("local"));
-    }
-
-    /// Render the whole UI at an explicit terminal size.
-    fn render_sized(width: u16, height: u16, setup: impl FnOnce(&mut App)) -> String {
-        let mut app = App::load().expect("App::load");
-        setup(&mut app);
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .expect("draw must not panic");
-        let buf = terminal.backend().buffer().clone();
-        // Row-major text with a newline per row so line-oriented asserts work.
-        let mut out = String::new();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                out.push_str(buf[(x, y)].symbol());
-            }
-            out.push('\n');
-        }
-        out
-    }
-
-    #[test]
-    fn easy_settings_have_no_pflash_and_show_speculation() {
-        for (w, h) in [(80, 24), (160, 48)] {
-            let text = render_sized(w, h, |app| {
-                app.tab = Tab::Settings;
-                app.settings_easy = true;
-                app.settings_selected = 0;
-            });
-            assert!(!text.to_lowercase().contains("pflash"), "{w}x{h}:\n{text}");
-            assert!(!text.contains("Prefill"), "{w}x{h}:\n{text}");
-            assert!(text.contains("Speculation"), "{w}x{h}:\n{text}");
-            assert!(!text.contains("Spec decode"), "{w}x{h}:\n{text}");
-        }
-    }
-
-    #[test]
-    fn easy_settings_show_a_scroll_indicator_when_rows_are_cut() {
-        let text = render_sized(80, 24, |app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = true;
-            app.settings_selected = 0;
-        });
-        let total = App::load().unwrap().config.easy_rows().len();
-        assert!(
-            text.contains(&format!("of {total} ↓")),
-            "cut rows must say so:\n{text}"
-        );
-        // Selecting the last row scrolls down and flips the arrow.
-        let text = render_sized(80, 24, |app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = true;
-            app.settings_selected = total - 1;
-        });
-        assert!(text.contains(&format!("{total} of {total} ↑")), "{text}");
-        // A tall terminal shows everything and no indicator.
-        let text = render_sized(160, 80, |app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = true;
-        });
-        assert!(!text.contains(&format!("of {total}")), "{text}");
-    }
-
-    #[test]
-    fn scroll_indicator_text() {
-        assert_eq!(scroll_indicator(0, 6, 6), "");
-        assert_eq!(scroll_indicator(0, 6, 13), "  rows 1–6 of 13 ↓");
-        assert_eq!(scroll_indicator(3, 6, 13), "  rows 4–9 of 13 ↑↓");
-        assert_eq!(scroll_indicator(7, 6, 13), "  rows 8–13 of 13 ↑");
-    }
-
-    #[test]
-    fn explainer_never_ends_on_an_orphaned_options_header() {
-        let line = |t: &str| Line::from(t.to_owned());
-        let lines = vec![
-            line("title"),
-            line("summary"),
-            line("Options:"),
-            line("a — x"),
-        ];
-        // Room for exactly three rows: the header would be last, so it goes too.
-        let kept = fit_explainer_lines(lines.clone(), 40, 3);
-        let text: Vec<String> = kept
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
-        assert_eq!(text, ["title", "summary"]);
-        // Enough room keeps the header and its row.
-        assert_eq!(fit_explainer_lines(lines, 40, 4).len(), 4);
-    }
-
-    #[test]
-    fn settings_edit_draws_a_visible_cursor_at_its_position() {
-        let (width, height) = (120, 32);
-        let mut app = App::load().expect("App::load");
-        app.tab = Tab::Settings;
-        app.settings_easy = false;
-        let mut edit = crate::app::EditState::new("max_seq".into(), "32768".into());
-        edit.home();
-        edit.right();
-        edit.right(); // cursor on the '7' of 32|768
-        app.settings_edit = Some(edit);
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let reversed: Vec<String> = (0..buf.area.height)
-            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
-            .filter(|&(x, y)| buf[(x, y)].modifier.contains(Modifier::REVERSED))
-            .map(|(x, y)| buf[(x, y)].symbol().to_owned())
-            .collect();
-        assert_eq!(
-            reversed,
-            ["7"],
-            "exactly the char under the cursor is reversed"
-        );
-    }
-
-    #[test]
-    fn non_editable_row_hint_names_the_cli_not_elsewhere() {
-        let text = render_sized(160, 48, |app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = true;
-            app.settings_selected = 0; // Model row
-        });
-        assert!(!text.contains("set elsewhere"), "{text}");
-        assert!(text.contains("hipfire config set default_model"), "{text}");
-    }
-
-    #[test]
-    fn deprecated_row_hint_and_explainer_say_deprecated() {
-        let text = render_sized(160, 48, |app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = false;
-            app.settings_selected = app
-                .config
-                .advanced_keys()
-                .iter()
-                .position(|k| k.as_str() == "cask")
-                .unwrap();
-        });
-        assert!(text.contains("Deprecated, read-only here"), "{text}");
-        assert!(text.contains("DEPRECATED, REMOVAL 0.5.0"), "{text}");
-        assert!(text.contains("hipfire config set cask"), "{text}");
     }
 
     #[test]

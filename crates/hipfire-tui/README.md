@@ -29,13 +29,23 @@ Tabs:
   model makes it the default model; `p` pulls with `hipfire pull <tag> --yes`
   (a chooser offers PLE rows and draft sidecars when the entry has them), `c`
   cancels the pull, `d` deletes after a y/n.
-- **Settings**: easy and advanced views over the typed global config
-  (`~/.hipfire/config.toml`); every non-deprecated key is editable inline
-  (editor kind comes from the schema's value rule), deprecated keys are
-  read-only. Rows come from `SettingsModel` (`src/hipfire/settings_model.rs`):
-  intent groups, the value predicted for the active model on this GPU, the
-  layer it came from, and a lock on values an environment variable owns.
-  Per-model overlays stay with `hipfire config <tag> set ...`.
+- **Settings**: the typed global config (`~/.hipfire/config.toml`) grouped by
+  intent (Quality, Speed, Memory & context, Speculation, Hardware & devices,
+  Advanced), with *Using now* (the value predicted for the active model on
+  this GPU, or serve's live KV mode / backend / context when its resident
+  model is the active one), *From* (default, registry, you, `env HIPFIRE_*`,
+  ...) and, at 160 columns, *Applies* plus a "why this value" pane. Keys:
+  `1`-`6` / `[` `]` switch group, `/` searches every key (all printable keys
+  go into the buffer; `Esc` restores the group and row), `c` changed only,
+  `h` hide unused, `←/→/Space` preview an enum (`Enter` saves) or toggle a
+  boolean, `Enter` edits a number or text, `Del` goes back to inherited, `R`
+  resets all. Values an environment variable owns are locked. Every
+  non-deprecated key is editable (editor kind from the schema's value rule);
+  deprecated keys are read-only. Rows come from `SettingsModel`
+  (`src/hipfire/settings_model.rs`), drawn by `src/ui_settings.rs`. Golden
+  layouts live in `tests/snapshots/`; regenerate them with
+  `UPDATE_SNAPSHOTS=1 cargo test -p hipfire-tui golden_`. Per-model overlays
+  stay with `hipfire config <tag> set ...`.
 - **System**: GPU, HIP and path diagnostics; `d` runs `hipfire diag`.
 - **Logs**: the tail of `serve.log`.
 

@@ -6,6 +6,10 @@ mod app;
 mod hipfire;
 mod ui;
 mod ui_chat;
+mod ui_settings;
+
+#[cfg(test)]
+mod test_support;
 
 use std::{io, panic};
 
@@ -294,9 +298,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
-    // While a settings value is being edited, keystrokes (including q/e/a/r)
-    // feed the edit buffer rather than triggering global shortcuts.
-    let editing_setting = app.tab == app::Tab::Settings && app.settings_edit.is_some();
+    // While a settings value is being edited or the `/` search buffer has
+    // focus, keystrokes (including q/r/?) feed it rather than triggering
+    // global shortcuts.
+    let editing_setting = app.tab == app::Tab::Settings
+        && (app.settings_edit.is_some() || app.settings_search_typing());
     if editing_setting && !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
         app.handle_tab_key(key);
         return false;
@@ -315,7 +321,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             // generation, the chat input focus); it never quits. With nothing to
             // cancel it does nothing. Help and the y/n modals are handled above.
             if app.tab == app::Tab::Settings
-                && (app.settings_edit.is_some() || app.settings_pending.is_some())
+                && (app.settings_edit.is_some()
+                    || app.settings_pending.is_some()
+                    || app.settings_search.is_some())
             {
                 app.handle_tab_key(key);
             } else if app.tab == app::Tab::Chat && app.has_queued_send() {
@@ -331,8 +339,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Tab => app.next_tab(),
         KeyCode::BackTab => app.prev_tab(),
         KeyCode::Char('r') if !chat_capturing => app.reload(),
-        KeyCode::Char('e') if app.tab == app::Tab::Settings => app.set_settings_easy(true),
-        KeyCode::Char('a') if app.tab == app::Tab::Settings => app.set_settings_easy(false),
         // `?` opens the keybinding help overlay (unless the chat input is
         // capturing text, where `?` is a literal character).
         KeyCode::Char('?') if !chat_capturing => app.show_help = true,
@@ -518,11 +524,14 @@ mod tests {
     #[test]
     fn scroll_moves_list_selection() {
         // The wheel must actually move the active list (its real purpose), not
-        // just dismiss the overlay. Settings easy-mode has a fixed row set, so
-        // the selection movement is deterministic.
+        // just dismiss the overlay. The Quality group always has several rows,
+        // so the selection movement is deterministic.
         let mut app = test_app();
         app.tab = Tab::Settings;
-        app.settings_easy = true;
+        app.settings_group = hipfire_config::intent::Intent::Quality;
+        app.settings_search = None;
+        app.settings_changed_only = false;
+        app.settings_hide_unused = false;
         app.settings_selected = 0;
         handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, 0, 0));
         assert_eq!(
@@ -532,6 +541,25 @@ mod tests {
         handle_mouse(&mut app, mouse(MouseEventKind::ScrollUp, 0, 0));
         assert_eq!(app.settings_selected, 0, "scroll up retreats it");
     }
+
+    #[test]
+    fn settings_search_keeps_q_r_and_help_keys_as_text() {
+        let mut fixture = crate::test_support::FixtureBuilder::new("gfx1201").build();
+        let app = &mut fixture.app;
+        assert!(!handle_key(app, k(KeyCode::Char('/'))));
+        for c in ['q', 'r', '?', 'e'] {
+            assert!(!handle_key(app, k(KeyCode::Char(c))), "{c} quit");
+        }
+        assert_eq!(app.settings_search.as_ref().unwrap().query, "qr?e");
+        assert!(!app.show_help);
+        // Esc clears the search; with the buffer unfocused, q quits again.
+        assert!(!handle_key(app, k(KeyCode::Esc)));
+        assert!(app.settings_search.is_none());
+        assert!(!handle_key(app, k(KeyCode::Char('/'))));
+        assert!(!handle_key(app, k(KeyCode::Enter)));
+        assert!(handle_key(app, k(KeyCode::Char('q'))));
+    }
+
     #[test]
     fn esc_never_quits_on_any_non_chat_tab() {
         for tab in [

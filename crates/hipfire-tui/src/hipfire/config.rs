@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire - see LICENSE and NOTICE in the project root.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use hipfire_client::ServiceEndpoint;
@@ -19,12 +19,6 @@ pub struct ConfigState {
     pub port: u16,
     pub default_model: String,
     pub values: BTreeMap<String, String>,
-    /// Keys explicitly present in `~/.hipfire/config.toml` — i.e. user overrides,
-    /// as opposed to inherited/hardcoded defaults. `values` always carries every
-    /// default key merged with the disk overlay, so this set is the only way to
-    /// tell an override apart from a default (drives reset gating + the 5c
-    /// override marker).
-    pub overrides: BTreeSet<String>,
     pub per_model_count: usize,
     pub loaded_from_disk: bool,
     pub warning: Option<String>,
@@ -33,7 +27,6 @@ pub struct ConfigState {
 impl ConfigState {
     pub fn load(paths: &HipfirePaths) -> Self {
         let mut values = defaults();
-        let mut overrides = BTreeSet::new();
         let mut loaded_from_disk = false;
         let mut warning = None;
 
@@ -42,7 +35,6 @@ impl ConfigState {
                 loaded_from_disk = loaded.format != ConfigFormat::Empty;
                 for (canonical, value) in loaded.layer.values {
                     if let Some(schema) = field(&canonical) {
-                        overrides.insert(schema.legacy_key.to_owned());
                         values.insert(schema.legacy_key.to_owned(), value_to_string(&value));
                     }
                 }
@@ -99,18 +91,10 @@ impl ConfigState {
             port,
             default_model,
             values,
-            overrides,
             per_model_count,
             loaded_from_disk,
             warning,
         }
-    }
-
-    /// True when `key` is an explicit user override in config.toml (vs an
-    /// inherited/hardcoded default). Drives reset gating ("already default") and
-    /// the override marker in the Settings view.
-    pub fn is_override(&self, key: &str) -> bool {
-        self.overrides.contains(key)
     }
 
     /// The hardcoded default map, for cross-checking the knob explainer defaults
@@ -147,205 +131,6 @@ impl ConfigState {
             )
         };
         ServiceEndpoint::local(&self.host, self.port, bearer).map_err(|error| error.to_string())
-    }
-
-    /// The Advanced view's row order: every key in the config map, with the
-    /// deprecated CASK/PFlash keys after all the others (each group sorted).
-    pub fn advanced_keys(&self) -> Vec<&String> {
-        let (live, deprecated): (Vec<&String>, Vec<&String>) = self
-            .values
-            .keys()
-            .partition(|key| !hipfire_config::is_deprecated_key(key));
-        live.into_iter().chain(deprecated).collect()
-    }
-
-    /// Config keys behind each easy-mode row, in display order. `None` marks a
-    /// row that is composite/non-editable inline (e.g. the `host:port` serve
-    /// row, or the Model row which is set from the Models tab). The TUI editor
-    /// uses this to resolve a selected easy row to a writable config key.
-    pub fn easy_keys(&self) -> Vec<Option<&'static str>> {
-        vec![
-            None,                // Model (set via Models tab)
-            Some("max_seq"),     // Context
-            Some("speculation"), // Speculation (speculation.mode)
-            Some("kv_cache"),
-            Some("gpu_layer_budget"),       // Offload
-            Some("moe_expert_budget"),      // Offload (MoE experts)
-            Some("offload_exec"),           // Offload exec
-            Some("offload_passback_share"), // Pass-back GPU share
-            Some("ple_format"),             // PLE format
-            Some("thinking"),
-            Some("reasoning_effort"),
-            Some("thinking_budget"),
-            None, // Serve host:port (composite)
-        ]
-    }
-
-    /// Per-easy-row override status, parallel to [`easy_rows`]/[`easy_keys`].
-    /// Unlike `easy_keys` (which is `None` for the non-inline-editable Model /
-    /// Serve composite rows), this resolves override status for EVERY row from
-    /// its underlying config key(s), so the 5c override marker is consistent with
-    /// the advanced view — a user-set `default_model` / `host` / `port` shows as
-    /// changed in easy mode too, not just advanced.
-    pub fn easy_override_state(&self) -> Vec<bool> {
-        vec![
-            self.is_override("default_model"),                    // Model
-            self.is_override("max_seq"),                          // Context
-            self.is_override("speculation"),                      // Speculation
-            self.is_override("kv_cache"),                         // KV cache
-            self.is_override("gpu_layer_budget"),                 // Offload
-            self.is_override("moe_expert_budget"),                // Offload (MoE experts)
-            self.is_override("offload_exec"),                     // Offload exec
-            self.is_override("offload_passback_share"),           // Pass-back GPU share
-            self.is_override("ple_format"),                       // PLE format
-            self.is_override("thinking"),                         // Thinking
-            self.is_override("reasoning_effort"),                 // Reasoning effort
-            self.is_override("thinking_budget"),                  // Reasoning budget
-            self.is_override("host") || self.is_override("port"), // Serve
-        ]
-    }
-
-    /// Help-lookup key for each easy row, parallel to [`easy_rows`]/[`easy_keys`].
-    /// Unlike `easy_keys`, this maps the composite Model/Serve rows to a
-    /// representative key (default_model / host) so the 5e explainer pane has
-    /// something to show for every row.
-    pub fn easy_help_keys(&self) -> Vec<&'static str> {
-        vec![
-            "default_model",          // Model
-            "max_seq",                // Context
-            "speculation",            // Speculation
-            "kv_cache",               // KV cache
-            "gpu_layer_budget",       // Offload
-            "moe_expert_budget",      // Offload (MoE experts)
-            "offload_exec",           // Offload exec
-            "offload_passback_share", // Pass-back GPU share
-            "ple_format",             // PLE format
-            "thinking",               // Thinking
-            "reasoning_effort",       // Reasoning effort
-            "thinking_budget",        // Reasoning budget
-            "host",                   // Serve
-        ]
-    }
-
-    pub fn easy_rows(&self) -> Vec<(&'static str, String, &'static str)> {
-        vec![
-            (
-                "Model",
-                self.default_model.clone(),
-                "Default model pre-warmed by serve and used by chat.",
-            ),
-            (
-                "Context",
-                self.values
-                    .get("max_seq")
-                    .cloned()
-                    .unwrap_or_else(|| "32768".into()),
-                "KV cache capacity allocated at load.",
-            ),
-            (
-                "Speculation",
-                self.values
-                    .get("speculation")
-                    .cloned()
-                    .unwrap_or_else(|| "auto".into()),
-                "Which speculative-decoding mechanism drafts tokens: auto, a forced one, or off.",
-            ),
-            (
-                "KV cache",
-                self.values
-                    .get("kv_cache")
-                    .cloned()
-                    .unwrap_or_else(|| "auto".into()),
-                "Precision/memory tradeoff for attention cache.",
-            ),
-            (
-                // Says GPU, not "offload": this value counts layers LEFT ON the
-                // GPU, and an "Offload" label invites reading it as the inverse.
-                "GPU layers",
-                // Short: the easy table's value column is 24 wide (ui.rs).
-                layers_label(
-                    self.values
-                        .get("gpu_layer_budget")
-                        .map(String::as_str)
-                        .unwrap_or(""),
-                ),
-                "How many layers stay on the GPU; the rest spill to system RAM. Frees VRAM, but much slower.",
-            ),
-            (
-                // The routed-expert tier: a MoE model's experts usually dwarf its
-                // attention weights, so this is the row that makes an over-VRAM
-                // MoE model loadable.
-                "Expert layers",
-                layers_label(
-                    self.values
-                        .get("moe_expert_budget")
-                        .map(String::as_str)
-                        .unwrap_or(""),
-                ),
-                "MoE only: how many layers keep their routed experts on the GPU. Only experts move; attention, router, shared expert and KV stay.",
-            ),
-            (
-                // The other half of the offload decision: placement is the row
-                // above, who multiplies is this one.
-                "Offload exec",
-                offload_exec_label(
-                    self.values
-                        .get("offload_exec")
-                        .map(String::as_str)
-                        .unwrap_or(""),
-                ),
-                "Who multiplies a spilled layer's weights: the GPU over the link, or the CPU.",
-            ),
-            (
-                // The pass-back's modifier: read only by the mode above, which is
-                // why the row says so rather than pretending it is standalone.
-                "Pass-back GPU share",
-                passback_share_label(
-                    self.values
-                        .get("offload_passback_share")
-                        .map(String::as_str)
-                        .unwrap_or(""),
-                ),
-                "Share of each spilled step's rows the GPU takes back, for the passback mode.",
-            ),
-            (
-                "PLE format",
-                self.values
-                    .get("ple_format")
-                    .cloned()
-                    .unwrap_or_else(|| "auto".into()),
-                "Qwen4 only: which PLE row table loads (q4 smaller, q8 exact; auto picks per GPU).",
-            ),
-            (
-                "Thinking",
-                self.values
-                    .get("thinking")
-                    .cloned()
-                    .unwrap_or_else(|| "on".into()),
-                "Whether reasoning models emit a hidden think block.",
-            ),
-            (
-                "Reasoning effort",
-                self.values
-                    .get("reasoning_effort")
-                    .cloned()
-                    .unwrap_or_else(|| "auto".into()),
-                "How hard the model is told to think, in its own vocabulary.",
-            ),
-            (
-                "Reasoning budget",
-                self.values
-                    .get("thinking_budget")
-                    .cloned()
-                    .unwrap_or_else(|| "med".into()),
-                "A CAP, not a dial — truncates. Prefer effort where the model has one.",
-            ),
-            (
-                "Serve",
-                format!("{}:{}", self.host, self.port),
-                "OpenAI-compatible endpoint used by chat and API clients.",
-            ),
-        ]
     }
 }
 
@@ -401,13 +186,6 @@ fn default_map() -> &'static BTreeMap<String, String> {
     })
 }
 
-/// The built-in default of `key` (canonical or legacy flat name), as display
-/// text; empty for an unset (null) default. `None` for an unknown key.
-pub fn default_value(key: &str) -> Option<String> {
-    let schema = field(key)?;
-    default_map().get(schema.legacy_key).cloned()
-}
-
 fn value_to_string(value: &ConfigValue) -> String {
     match value {
         ConfigValue::String(value) => value.clone(),
@@ -422,34 +200,10 @@ fn value_to_string(value: &ConfigValue) -> String {
 mod tests {
     use super::*;
 
-    /// The four easy-mode lists are positional: row i in `easy_rows` is edited
-    /// through `easy_keys[i]`, marked by `easy_override_state[i]`, and
-    /// explained by `easy_help_keys[i]`. Nothing but this test stops them
-    /// drifting — adding a row to three of the four silently misattributes
-    /// every row after it.
-    #[test]
-    fn easy_mode_lists_stay_positionally_parallel() {
-        let c = state_with(&[]);
-        let n = c.easy_rows().len();
-        assert_eq!(c.easy_keys().len(), n, "easy_keys drifted from easy_rows");
-        assert_eq!(
-            c.easy_override_state().len(),
-            n,
-            "easy_override_state drifted from easy_rows"
-        );
-        assert_eq!(
-            c.easy_help_keys().len(),
-            n,
-            "easy_help_keys drifted from easy_rows"
-        );
-    }
-
     /// A ConfigState seeded from an explicit value map (defaults overlaid).
     fn state_with(pairs: &[(&str, &str)]) -> ConfigState {
         let mut values = defaults();
-        let mut overrides = BTreeSet::new();
         for (k, v) in pairs {
-            overrides.insert((*k).to_string());
             values.insert((*k).to_string(), (*v).to_string());
         }
         ConfigState {
@@ -457,7 +211,6 @@ mod tests {
             port: 11435,
             default_model: "qwen3.5:9b".into(),
             values,
-            overrides,
             per_model_count: 0,
             loaded_from_disk: true,
             warning: None,
@@ -483,197 +236,43 @@ mod tests {
             .is_err());
     }
 
+    /// The layer-count label is the one cell grammar of the GPU-layers rows:
+    /// `-1` is the schema's *auto* spelling, not a count of layers, and a
+    /// cleared key reads as unset rather than as the string the JSON layer
+    /// produces for null.
     #[test]
-    fn easy_rows_drop_deprecated_pflash_and_rename_spec_decode() {
-        let st = state_with(&[]);
-        let labels: Vec<&str> = st.easy_rows().iter().map(|(l, _, _)| *l).collect();
-        assert!(labels.contains(&"Speculation"), "{labels:?}");
-        assert!(labels.contains(&"PLE format"), "{labels:?}");
-        assert!(!labels.contains(&"Spec decode"), "{labels:?}");
-        assert!(!labels.contains(&"Prefill"), "{labels:?}");
-        let keys: Vec<&str> = st.easy_keys().into_iter().flatten().collect();
-        assert!(keys.contains(&"speculation"), "{keys:?}");
-        assert!(keys.contains(&"ple_format"), "{keys:?}");
-        for key in st
-            .easy_keys()
-            .into_iter()
-            .flatten()
-            .chain(st.easy_help_keys())
-        {
-            assert!(
-                !hipfire_config::is_deprecated_key(key),
-                "easy row surfaces deprecated key {key}"
-            );
-        }
-        for (_, value, desc) in st.easy_rows() {
-            let text = format!("{value} {desc}").to_lowercase();
-            assert!(!text.contains("pflash"), "{text}");
-        }
-    }
-
-    #[test]
-    fn speculation_row_reads_the_speculation_key_with_schema_default() {
-        let row = |pairs: &[(&str, &str)]| {
-            state_with(pairs)
-                .easy_rows()
-                .into_iter()
-                .find(|(l, _, _)| *l == "Speculation")
-                .map(|(_, v, _)| v)
-                .unwrap()
-        };
-        assert_eq!(row(&[]), "auto");
-        assert_eq!(row(&[("speculation", "mtp")]), "mtp");
-        // The old row edited dflash_mode; it must not drive this one.
-        assert_eq!(row(&[("dflash_mode", "on")]), "auto");
-    }
-
-    #[test]
-    fn advanced_keys_sort_deprecated_last() {
-        let st = state_with(&[]);
-        let keys = st.advanced_keys();
-        assert_eq!(keys.len(), st.values.len());
-        let first_dep = keys
-            .iter()
-            .position(|k| hipfire_config::is_deprecated_key(k))
-            .expect("schema carries deprecated keys");
-        assert!(keys[first_dep..]
-            .iter()
-            .all(|k| hipfire_config::is_deprecated_key(k)));
-        assert!(keys[..first_dep]
-            .iter()
-            .all(|k| !hipfire_config::is_deprecated_key(k)));
-        // Each partition keeps the map's own (sorted) order.
-        assert!(keys[..first_dep].windows(2).all(|w| w[0] < w[1]));
-        assert!(keys[first_dep..].windows(2).all(|w| w[0] < w[1]));
-    }
-
-    #[test]
-    fn easy_view_vectors_stay_parallel() {
-        // All four easy vectors must stay equal length (5d adds a row, 5e adds
-        // help keys) or the marker/help attaches to the wrong row.
-        let st = state_with(&[]);
-        let n = st.easy_rows().len();
-        assert_eq!(st.easy_keys().len(), n);
-        assert_eq!(st.easy_override_state().len(), n);
-        assert_eq!(st.easy_help_keys().len(), n);
-    }
-
-    /// A row marked inline-editable (`Some(key)`) that has no `EDITABLE_FIELDS`
-    /// spec cannot actually be edited: `App::handle_settings_key` looks the spec up
-    /// and, on `None`, refuses — Enter never opens a buffer and no value can be
-    /// typed. `gpu_layer_budget` and `reasoning_effort` both shipped that way, in
-    /// `easy_keys()` with no spec, and nothing failed.
-    #[test]
-    fn every_inline_editable_easy_row_has_a_field_spec() {
-        for key in state_with(&[]).easy_keys().into_iter().flatten() {
-            assert!(
-                crate::hipfire::writer::field_spec(key).is_some(),
-                "easy row {key} is marked inline-editable but has no EDITABLE_FIELDS \
-                 spec, so the editor refuses to type a value into it"
-            );
-        }
-    }
-
-    /// The GPU-layers row must render every state it can hold, and render it
-    /// honestly: `-1` is the schema's *auto* spelling, not a count of layers, and
-    /// a cleared key must read as unset rather than as the string the JSON layer
-    /// happens to produce for null.
-    #[test]
-    fn offload_layer_row_renders_unset_count_and_auto() {
-        let row = |pairs: &[(&str, &str)]| {
-            state_with(pairs)
-                .easy_rows()
-                .into_iter()
-                .find(|(l, _, _)| *l == "GPU layers")
-                .map(|(_, value, _)| value)
-                .expect("GPU layers row present")
-        };
-
+    fn layer_label_renders_unset_count_and_auto() {
         // Unset never spills, including on a MoE model.
-        assert_eq!(row(&[]), "all on GPU");
-        assert_eq!(row(&[("gpu_layer_budget", "32")]), "32 on GPU");
+        assert_eq!(layers_label(""), "all on GPU");
+        assert_eq!(layers_label("32"), "32 on GPU");
         assert_eq!(
-            row(&[("gpu_layer_budget", "-1")]),
+            layers_label("-1"),
             "auto (fits to card)",
             "-1 means auto, not -1 layers on the GPU"
         );
         assert_eq!(
-            row(&[("gpu_layer_budget", "auto")]),
+            layers_label("auto"),
             "auto (fits to card)",
             "the literal auto spelling (accepted by the value rule) is not a count"
         );
-        // A cleared key is unset, not the literal string the JSON layer produces
-        // for null — the bug this replaced rendered "null on GPU".
-        assert_eq!(row(&[("gpu_layer_budget", "")]), "all on GPU");
     }
 
-    /// The routed-expert row: same cell grammar as its `GPU layers` sibling, and
-    /// distinct labels so the two offload tiers cannot be confused in the UI.
+    /// The exec label's two arms.
     #[test]
-    fn offload_expert_row_renders_unset_count_and_auto() {
-        let row = |pairs: &[(&str, &str)]| {
-            state_with(pairs)
-                .easy_rows()
-                .into_iter()
-                .find(|(l, _, _)| *l == "Expert layers")
-                .map(|(_, value, _)| value)
-                .expect("Expert layers row present")
-        };
-        assert_eq!(row(&[]), "all on GPU");
-        assert_eq!(row(&[("moe_expert_budget", "26")]), "26 on GPU");
-        assert_eq!(row(&[("moe_expert_budget", "-1")]), "auto (fits to card)");
-        assert_eq!(row(&[("moe_expert_budget", "auto")]), "auto (fits to card)");
-        assert_eq!(row(&[("moe_expert_budget", "")]), "all on GPU");
+    fn offload_exec_label_renders_both_arms() {
+        assert_eq!(offload_exec_label(""), "over PCIe");
+        assert_eq!(offload_exec_label("pcie"), "over PCIe");
+        assert_eq!(offload_exec_label("cpu"), "on CPU");
+        assert_eq!(offload_exec_label("passback"), "passback (CPU + GPU)");
     }
 
-    /// The exec row's two arms, in the same cell grammar as its sibling.
+    /// Unset and `auto` both mean "the engine schedules it", and a pinned
+    /// number renders as itself.
     #[test]
-    fn offload_exec_row_renders_both_arms() {
-        let row = |pairs: &[(&str, &str)]| {
-            state_with(pairs)
-                .easy_rows()
-                .into_iter()
-                .find(|(l, _, _)| *l == "Offload exec")
-                .map(|(_, value, _)| value)
-                .expect("Offload exec row present")
-        };
-
-        assert_eq!(row(&[]), "over PCIe");
-        assert_eq!(row(&[("offload_exec", "pcie")]), "over PCIe");
-        assert_eq!(row(&[("offload_exec", "cpu")]), "on CPU");
-        assert_eq!(row(&[("offload_exec", "passback")]), "passback (CPU + GPU)");
-    }
-
-    /// The pass-back share row: unset and `auto` both mean "the engine schedules
-    /// it", and a pinned number renders as itself.
-    #[test]
-    fn offload_passback_share_row_renders_scheduled_and_pinned() {
-        let row = |pairs: &[(&str, &str)]| {
-            state_with(pairs)
-                .easy_rows()
-                .into_iter()
-                .find(|(l, _, _)| *l == "Pass-back GPU share")
-                .map(|(_, value, _)| value)
-                .expect("Pass-back GPU share row present")
-        };
-
-        assert_eq!(row(&[]), "auto (scheduled)");
-        assert_eq!(
-            row(&[("offload_passback_share", "auto")]),
-            "auto (scheduled)"
-        );
-        assert_eq!(row(&[("offload_passback_share", "0")]), "0");
-        assert_eq!(row(&[("offload_passback_share", "0.375")]), "0.375");
-    }
-
-    #[test]
-    fn easy_help_keys_have_explainers() {
-        // 5e: every easy row's help key must resolve to a curated explainer.
-        for key in state_with(&[]).easy_help_keys() {
-            assert!(
-                crate::hipfire::knobs::knob_info(key).is_some(),
-                "easy help key {key} has no explainer"
-            );
-        }
+    fn passback_share_label_renders_scheduled_and_pinned() {
+        assert_eq!(passback_share_label(""), "auto (scheduled)");
+        assert_eq!(passback_share_label("auto"), "auto (scheduled)");
+        assert_eq!(passback_share_label("0"), "0");
+        assert_eq!(passback_share_label("0.375"), "0.375");
     }
 }

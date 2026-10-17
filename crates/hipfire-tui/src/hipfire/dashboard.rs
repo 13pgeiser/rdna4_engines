@@ -2014,7 +2014,6 @@ mod tests {
             port,
             default_model: String::new(),
             values: Default::default(),
-            overrides: Default::default(),
             per_model_count: 0,
             loaded_from_disk: false,
             warning: None,
