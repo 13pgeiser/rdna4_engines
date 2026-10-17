@@ -553,8 +553,9 @@ pub const COUNTER_COLUMNS: [&str; 10] = [
 /// it: `expected` must equal the file's contents.
 pub fn require_same_config(config_path: &Path, expected: &Value) -> Result<(), String> {
     let recorded: Value = match fs::read(config_path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|e| format!("{}: {e}", config_path.display()))?,
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", config_path.display()))?
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(format!(
                 "{} does not exist: the result's config is unknown; remove the result or use another output directory",
@@ -590,7 +591,10 @@ mod lever_state_tests {
     fn lever_state_is_unsupported_unless_declared_and_opt_in_when_declared() {
         let prefix = lever_prefix();
         for (suffix, default_on) in CANDIDATE_LEVERS {
-            assert!(!default_on, "{suffix}: the candidate default is off (opt-in)");
+            assert!(
+                !default_on,
+                "{suffix}: the candidate default is off (opt-in)"
+            );
             let name = format!("{prefix}{suffix}");
             let declared = declared_in_compiled_source(&name);
             for (value, expect_on) in [

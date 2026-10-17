@@ -3693,10 +3693,9 @@ mod tests {
         let stock = ordinary.clone().into_ar_only().unwrap();
         let mut narrow = ordinary.clone();
         narrow.linear_key_head_dim = 64;
-        assert!(!GdnStateFormat::Q8.supports(
-            narrow.linear_key_head_dim,
-            narrow.linear_value_head_dim
-        ));
+        assert!(
+            !GdnStateFormat::Q8.supports(narrow.linear_key_head_dim, narrow.linear_value_head_dim)
+        );
         let profiles = [
             ("ordinary", &ordinary),
             ("stock-fp8", &stock),

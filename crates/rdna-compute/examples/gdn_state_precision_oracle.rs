@@ -158,7 +158,10 @@ fn parse_format(name: &str) -> Res<GdnStateFormat> {
 }
 
 fn parse_number(flag: &str, value: &str) -> Res<u64> {
-    let parsed = match value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+    let parsed = match value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
         Some(hex) => u64::from_str_radix(&hex.replace('_', ""), 16),
         None => value.replace('_', "").parse::<u64>(),
     };
@@ -561,7 +564,8 @@ fn capture_graph(
         return Err(format!("graph capture body: {error}"));
     }
     ctx(
-        gpu.graphs.end_graph_capture(&gpu.hip, gpu.device_id, stream),
+        gpu.graphs
+            .end_graph_capture(&gpu.hip, gpu.device_id, stream),
         "end graph capture",
     )?;
     let launches = gpu.graphs.ar_forward_blobs.len();
@@ -917,11 +921,36 @@ fn snapshot(
 
 fn check_determinism(prefix: &str, a: &Snap, b: &Snap) -> Vec<Failure> {
     [
-        compare(&format!("{prefix}nondeterministic_output"), &b.out, &a.out, Some(VW * 4)),
-        compare(&format!("{prefix}nondeterministic_discard"), &b.discard, &a.discard, Some(VW * 4)),
-        compare(&format!("{prefix}nondeterministic_final_state"), &b.final_state, &a.final_state, None),
-        compare(&format!("{prefix}nondeterministic_kept_state"), &b.kept, &a.kept, None),
-        compare(&format!("{prefix}nondeterministic_source"), &b.source, &a.source, None),
+        compare(
+            &format!("{prefix}nondeterministic_output"),
+            &b.out,
+            &a.out,
+            Some(VW * 4),
+        ),
+        compare(
+            &format!("{prefix}nondeterministic_discard"),
+            &b.discard,
+            &a.discard,
+            Some(VW * 4),
+        ),
+        compare(
+            &format!("{prefix}nondeterministic_final_state"),
+            &b.final_state,
+            &a.final_state,
+            None,
+        ),
+        compare(
+            &format!("{prefix}nondeterministic_kept_state"),
+            &b.kept,
+            &a.kept,
+            None,
+        ),
+        compare(
+            &format!("{prefix}nondeterministic_source"),
+            &b.source,
+            &a.source,
+            None,
+        ),
     ]
     .into_iter()
     .flatten()
@@ -935,10 +964,25 @@ fn check_candidate_only(
     source_bytes: &[u8],
 ) -> Vec<Failure> {
     [
-        compare("candidate_only_output", &snap.out, &reference.out, Some(VW * 4)),
+        compare(
+            "candidate_only_output",
+            &snap.out,
+            &reference.out,
+            Some(VW * 4),
+        ),
         nonfinite("candidate_only_nonfinite_output", &snap.out, VW * 4),
-        compare("candidate_only_final_state", &snap.final_state, &reference.states[rows - 1], None),
-        compare("candidate_only_source_modified", &snap.source, source_bytes, None),
+        compare(
+            "candidate_only_final_state",
+            &snap.final_state,
+            &reference.states[rows - 1],
+            None,
+        ),
+        compare(
+            "candidate_only_source_modified",
+            &snap.source,
+            source_bytes,
+            None,
+        ),
     ]
     .into_iter()
     .flatten()
@@ -955,9 +999,19 @@ fn check_case(
     [
         compare("candidate_output", &snap.out, &reference.out, Some(VW * 4)),
         nonfinite("nonfinite_output", &snap.out, VW * 4),
-        compare("rollback_discard", &snap.discard, &reference.out[..keep * VW * 4], Some(VW * 4)),
+        compare(
+            "rollback_discard",
+            &snap.discard,
+            &reference.out[..keep * VW * 4],
+            Some(VW * 4),
+        ),
         nonfinite("nonfinite_discard", &snap.discard, VW * 4),
-        compare("final_state", &snap.final_state, &reference.states[rows - 1], None),
+        compare(
+            "final_state",
+            &snap.final_state,
+            &reference.states[rows - 1],
+            None,
+        ),
         compare("kept_state", &snap.kept, &reference.states[keep - 1], None),
         compare("source_modified", &snap.source, source_bytes, None),
     ]
@@ -1182,7 +1236,10 @@ fn run_cases(
             // The committed final slot is the next window's source.
             source = base + rows - 1;
         }
-        eprintln!("{format_label} graph={graph} rows={rows}/{} done", cli.max_rows);
+        eprintln!(
+            "{format_label} graph={graph} rows={rows}/{} done",
+            cli.max_rows
+        );
     }
     report.kernels.extend(kernels);
     Ok(())
@@ -1345,7 +1402,10 @@ fn run(cli: &Cli) -> Res<i32> {
             "formats": formats,
         });
         let text = ctx(serde_json::to_string_pretty(&doc), "serialize json")?;
-        ctx(std::fs::write(path, text), &format!("write {}", path.display()))?;
+        ctx(
+            std::fs::write(path, text),
+            &format!("write {}", path.display()),
+        )?;
     }
     Ok(i32::from(mismatches > 0))
 }
@@ -1402,7 +1462,10 @@ mod tests {
     #[test]
     fn cli_rejects_q8_ef() {
         let error = parse_args(&args("--formats q8,q8_ef")).unwrap_err();
-        assert!(error.contains("q8_ef") && error.contains("not available"), "{error}");
+        assert!(
+            error.contains("q8_ef") && error.contains("not available"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1469,10 +1532,19 @@ mod tests {
     fn bf16_rounding_is_rne_and_inputs_stay_in_range() {
         assert_eq!(bf16_round(1.0), 1.0);
         assert_eq!(bf16_round(f32::from_bits(0x3F80_8000)), 1.0);
-        assert_eq!(bf16_round(f32::from_bits(0x3F81_8000)), f32::from_bits(0x3F82_0000));
+        assert_eq!(
+            bf16_round(f32::from_bits(0x3F81_8000)),
+            f32::from_bits(0x3F82_0000)
+        );
         let steps = make_steps(2, window_seed(1, 2, 0));
-        assert_eq!((steps.proj.len(), steps.gate.len(), steps.beta.len()), (2 * QKV, 2 * VH, 2 * VH));
-        assert!(steps.proj.iter().all(|v| bf16_round(*v) == *v && v.abs() <= 2.0));
+        assert_eq!(
+            (steps.proj.len(), steps.gate.len(), steps.beta.len()),
+            (2 * QKV, 2 * VH, 2 * VH)
+        );
+        assert!(steps
+            .proj
+            .iter()
+            .all(|v| bf16_round(*v) == *v && v.abs() <= 2.0));
         assert!(steps.gate.iter().all(|g| (-0.3..-0.02).contains(g)));
         assert!(steps.beta.iter().all(|b| (0.1..0.9).contains(b)));
     }

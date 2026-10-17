@@ -5058,7 +5058,10 @@ mod tests {
         // never combines with EP.
         let single = Qwen4BandScope::single(&config);
         for ranks in 1..=8 {
-            assert_eq!(refuse_band_with_expert_parallel(&config, &single, ranks), Ok(()));
+            assert_eq!(
+                refuse_band_with_expert_parallel(&config, &single, ranks),
+                Ok(())
+            );
             assert_eq!(
                 state_census_scope(&config, f32, &context, 256, Full, &single).unwrap(),
                 state_census(&config, f32, &context, 256, Full).unwrap(),

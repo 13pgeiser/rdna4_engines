@@ -173,9 +173,8 @@ fn gdn_precision_owner_accounting() {
 
     // Live + the snapshot arena's mirror: the census doubles the live set.
     let context = Qwen4ContextCommit::legacy(1024);
-    let device = |gdn| {
-        Qwen4State::device_bytes(&config, format_of(QsaKvFormat::Q8, gdn), &context).unwrap()
-    };
+    let device =
+        |gdn| Qwen4State::device_bytes(&config, format_of(QsaKvFormat::Q8, gdn), &context).unwrap();
     assert_eq!(
         device(GdnStateFormat::F32) - device(GdnStateFormat::Q8),
         2 * SET_DELTA
@@ -354,8 +353,8 @@ fn gdn_precision_owner_accounting_ring_growth_holds_old_and_new_rings() {
     let config = compact_test_config();
     let context = Qwen4ContextCommit::legacy(1024);
     for gdn in FORMATS {
-        let state = Qwen4State::device_bytes(&config, format_of(QsaKvFormat::Q8, gdn), &context)
-            .unwrap();
+        let state =
+            Qwen4State::device_bytes(&config, format_of(QsaKvFormat::Q8, gdn), &context).unwrap();
         let live = live_set(&config, gdn);
         for (old, new) in [(4usize, 8usize), (8, 32), (4, 32)] {
             let ring = |r: usize| Qwen4State::row_capture_bytes(&config, gdn, r).unwrap();
@@ -401,7 +400,12 @@ fn gdn_precision_owner_accounting_pp_and_lane_counts() {
             gdn_total += gdn_layers;
             let band = Qwen4State::device_bytes_scoped(&config, f32, &context, &scope).unwrap()
                 - Qwen4State::device_bytes_scoped(&config, q8, &context, &scope).unwrap();
-            assert_eq!(band, 2 * gdn_layers * slot_delta, "{counts:?} {:?}", scope.band);
+            assert_eq!(
+                band,
+                2 * gdn_layers * slot_delta,
+                "{counts:?} {:?}",
+                scope.band
+            );
             for r in RINGS {
                 let ring = |gdn| {
                     Qwen4State::row_capture_bytes_scoped(&config, gdn, r, gdn_layers).unwrap()
@@ -431,8 +435,8 @@ fn gdn_precision_owner_accounting_pp_and_lane_counts() {
                 .unwrap()
         };
         let one = store(f32, 1) - store(q8, 1);
-        let per_lane = 2 * GDN_LAYERS * slot_delta
-            + k.map_or(0, |k| GDN_LAYERS * 2 * (k + 1) * slot_delta);
+        let per_lane =
+            2 * GDN_LAYERS * slot_delta + k.map_or(0, |k| GDN_LAYERS * 2 * (k + 1) * slot_delta);
         assert_eq!(one, per_lane as u64, "{k:?}");
         for lanes in [2usize, 4, 8] {
             assert_eq!(
@@ -577,10 +581,13 @@ fn gdn_precision_owner_accounting_live_session_parts_differ_by_format() {
         assert_eq!(parts[0], slot_of(gdn), "{gdn:?}");
         assert_eq!(
             parts,
-            planned_session_fixed_parts(&config, Qwen4StateFormat {
-                gdn,
-                ..Qwen4StateFormat::F32
-            }),
+            planned_session_fixed_parts(
+                &config,
+                Qwen4StateFormat {
+                    gdn,
+                    ..Qwen4StateFormat::F32
+                }
+            ),
             "{gdn:?}"
         );
         lens.push(parts);
