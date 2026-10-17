@@ -2886,9 +2886,13 @@ impl Qwen4MoeLayerRuntime {
             )));
         }
         let cpu_admission = cpu_splice::CpuSpliceAdmission {
+            // `qwen4.expert_keep` payloads are compact (kept experts only), so the
+            // original-id indexed CPU owners can never address them: pruned
+            // layers stay single-device fully resident.
             enabled: hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
                 && allow_tiers
-                && layer_label < config.num_hidden_layers,
+                && layer_label < config.num_hidden_layers
+                && kept_ids.is_none(),
             host_mapped: local_host_mapped && down_source.buf.is_host_mapped(),
             ep: weights.ep_placement().is_some(),
             slab: false,
