@@ -60,6 +60,14 @@ hipGraph) for the identity/session/sampled/EF tests; `--graph` on the oracle's a
 `unset` sets nothing. Defaults: smoke 0,1; quality 0; restore 0,1; memory/perf/sampled unset; greedy 1.
 Arms interleave per run: even run = modes as given, odd run = reversed.
 
+`--child-env KEY=VALUE` (repeatable, `KEY` = `HIPFIRE_[A-Z0-9_]+`) adds a pair to every
+child after the fixed knobs, for settings a child needs that the scrub would otherwise
+drop, e.g. `--child-env HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=14` for the R9700 expert
+placement of a Flash-Next `qwen4_kld` run. It is recorded in each child's `env.json` and
+`identity.json` and in the receipt. Keys the collector sets itself are refused. A parent
+`HIPFIRE_*` that the scrub would drop (other than the `HIPFIRE_TORCH_*` host tool paths)
+refuses the run before any child starts: pass it with `--child-env` or unset it.
+
 ## Output layout
 
 `<out>/<stage>/<run-id>/` holds `command.txt`, `identity.json` (MD5+SHA256 of every binary

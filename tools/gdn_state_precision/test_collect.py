@@ -540,6 +540,102 @@ class CommandConstructionTests(TempCase):
             collect.build_child_env(parent, cfg, kids[1])["HOME"], env["HOME"]
         )
 
+    def test_child_env_option_reaches_build_child_env_and_dry_run(self):
+        cfg, kids = self.plan(
+            "quality", "--child-env", "HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=14", "--child-env", "HIPFIRE_QWEN4_EXPERT_HOTSET=x=y",
+        )
+        self.assertEqual(cfg.child_env, {"HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS": "14", "HIPFIRE_QWEN4_EXPERT_HOTSET": "x=y"})
+        self.assertEqual(list(cfg.child_env), ["HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS", "HIPFIRE_QWEN4_EXPERT_HOTSET"])
+        # build_child_env is called directly (bypassing validate): the unrelated parent variable is still dropped
+        env = collect.build_child_env({"PATH": "/usr/bin", "HIPFIRE_FOO": "1"}, cfg, kids[0])
+        self.assertEqual(env["HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS"], "14")
+        self.assertEqual(env["HIPFIRE_QWEN4_EXPERT_HOTSET"], "x=y")
+        self.assertNotIn("HIPFIRE_FOO", env)
+        shown = collect.explicit_env(cfg, kids[0])
+        self.assertEqual(shown["HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS"], "14")
+        self.assertEqual(shown["HIPFIRE_QWEN4_EXPERT_HOTSET"], "x=y")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = collect.run(
+                self.fx.argv("quality", "--dry-run", "--run-id", "rid", "--child-env",
+                             "HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=14", runs="1"), {},
+            )
+        self.assertEqual(rc, 0)
+        text = buf.getvalue()
+        self.assertIn("# child-env: HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=14\n", text)
+        self.assertIn("HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=14 ", text)
+        # without the option: default is empty and the variable is absent
+        cfg0, kids0 = self.plan("quality")
+        self.assertEqual(cfg0.child_env, {})
+        self.assertNotIn("HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS", collect.build_child_env({}, cfg0, kids0[0]))
+
+    def test_child_env_owned_keys_refused(self):
+        owned = [
+            *collect.KEEP_HIPFIRE_ENV, "HIPFIRE_HOME", "HIPFIRE_KERNEL_CACHE", "HIPFIRE_GRAPH",
+            "HIPFIRE_REPLAY_BACKEND", "HIPFIRE_STATE_QUANT", "HIPFIRE_GDN_TEST_STATE_QUANT",
+            *(k for k, _ in collect.FIXED_RECEIPT_KNOBS),
+        ]
+        self.assertIn("HIPFIRE_PLE_FORMAT", owned)
+        for key in owned:
+            with self.assertRaisesRegex(collect.CollectError, f"--child-env {key}: the collector sets {key}"):
+                self.fx.config("quality", "--child-env", f"{key}=1")
+
+    def test_child_env_malformed_values_refused(self):
+        cases = (
+            ("HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS", "must be KEY=VALUE"),
+            ("=1", "empty key"),
+            ("PATH=/x", "must match"),
+            ("HIPFIRE_lower=1", "must match"),
+            ("HIPFIRE_=1", "must match"),
+        )
+        for raw, why in cases:
+            with self.assertRaisesRegex(collect.CollectError, why):
+                self.fx.config("quality", "--child-env", raw)
+        with self.assertRaisesRegex(collect.CollectError, "HIPFIRE_QWEN4_EXPERT_HOTSET is given twice"):
+            self.fx.config(
+                "quality", "--child-env", "HIPFIRE_QWEN4_EXPERT_HOTSET=1", "--child-env", "HIPFIRE_QWEN4_EXPERT_HOTSET=2"
+            )
+
+    def test_stray_parent_hipfire_env_refused_unless_passed_through(self):
+        with self.assertRaises(collect.CollectError) as cm:
+            self.fx.config(
+                "quality",
+                env={"HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS": "14", "HIPFIRE_QWEN4_EXPERT_HOTSET": "1", "PATH": "/usr/bin"},
+            )
+        self.assertEqual(
+            str(cm.exception),
+            "parent environment sets HIPFIRE_QWEN4_EXPERT_HOTSET, HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS; the child scrub would drop "
+            "them silently: pass the ones a child needs with --child-env KEY=VALUE and unset the rest",
+        )
+        for stage in ("smoke", "memory", "perf", "greedy"):
+            with self.assertRaisesRegex(collect.CollectError, "parent environment sets HIPFIRE_QWEN4_EXPERT_HOTSET"):
+                self.fx.config(stage, env={"HIPFIRE_QWEN4_EXPERT_HOTSET": "1"})
+        # a parent variable that --child-env passes explicitly is not a silent drop
+        cfg = self.fx.config(
+            "quality", "--child-env", "HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=14",
+            env={"HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS": "14"},
+        )
+        self.assertEqual(cfg.child_env, {"HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS": "14"})
+
+    def test_parent_env_with_ignored_prefix_and_keep_names_accepted(self):
+        # Built from the constant: a literal host tool name would enter the env inventory.
+        torch_python = collect.IGNORED_PARENT_HIPFIRE_PREFIXES[0] + "PYTHON"
+        cfg = self.fx.config(
+            "quality",
+            env={
+                torch_python: "/opt/torch/bin/python", "HIPFIRE_DEVICES": "0",
+                "HIPFIRE_LOCK_DIR": "/parent/lock", "HIPFIRE_FABRIC_ADMISSION": "x",
+            },
+        )
+        self.assertEqual(cfg.child_env, {})
+
+    def test_analyze_and_prehash_not_refused_by_stray_parent_env(self):
+        stray = {"HIPFIRE_QWEN4_EXPERT_HOTSET": "1"}
+        args = collect.make_parser().parse_args(["--stage", "quality", "--analyze", "--out", str(self.root)])
+        self.assertEqual(collect.validate(args, stray).stage, "quality")
+        args = collect.make_parser().parse_args(self.fx.argv("quality", "--prehash"))
+        self.assertEqual(collect.validate(args, stray).stage, "quality")
+
 
 class StatisticsTests(unittest.TestCase):
     def test_constant_delta_has_degenerate_exact_ci(self):
@@ -912,6 +1008,21 @@ class EndToEndTests(TempCase):
         # a second invocation into the same run dir is refused
         with self.assertRaisesRegex(collect.CollectError, "already exists"):
             collect.validate(collect.make_parser().parse_args(fx.argv("quality", "--run-id", "rid")), {"FABRIC_JOB": "1:2:halo"})
+
+    def test_child_env_reaches_child_and_is_recorded(self):
+        fx = Fixture(self.root, fake_kld=True)
+        cfg = fx.config("quality", "--only", "code24-decode", "--child-env", "HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=14")
+        cfg.dry_run = False
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = collect.run_stage(cfg, {"PATH": os.environ.get("PATH", ""), "FABRIC_JOB": "1:2:halo"})
+        self.assertEqual(rc, 0)
+        receipt = json.loads((cfg.run_dir / "receipt.json").read_text())
+        self.assertEqual(receipt["child_env"], {"HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS": "14"})
+        child_dir = cfg.run_dir / receipt["children"][0]["dir"]
+        env = json.loads((child_dir / "env.json").read_text())
+        self.assertEqual(env["HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS"], "14")
+        ident = json.loads((child_dir / "identity.json").read_text())
+        self.assertEqual(ident["child"]["child_env"], {"HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS": "14"})
 
     def test_failing_child_stops_and_exits_nonzero(self):
         fx = Fixture(self.root)  # fake qwen4_kld is a shell stub that prints nothing and writes no .kldseq

@@ -7,7 +7,8 @@
 Launches the real, hash-verified binaries of the gate commands in
 ``release-0.4.3/gdn-state-precision/PLAN.md`` section 5 (G0..G5), one fresh
 process per arm, interleaved AB/BA, each in an isolated HOME with a scrubbed
-``HIPFIRE_*`` environment, and persists the exact argv/env/identity/rc plus
+``HIPFIRE_*`` environment (only the fabric/device trio and repeatable ``--child-env KEY=VALUE``
+pairs pass; a parent ``HIPFIRE_*`` the scrub would drop is refused, never dropped silently), and persists the exact argv/env/identity/rc plus
 the parsed observations. It never downloads anything, generates no teacher or
 reference, starts no second runtime, pins no hidden route, and never infers a
 PASS: every verdict field names the rule it applied.
@@ -67,6 +68,15 @@ FIXED_RECEIPT_KNOBS = (
     ("HIPFIRE_PLE_FORMAT", "q4"),
     ("HIPFIRE_NORMALIZE_PROMPT", "0"),
 )
+#: HIPFIRE_* variables the collector sets itself per child (never accepted through --child-env).
+COLLECTOR_OWNED_HIPFIRE_ENV = (
+    "HIPFIRE_HOME", "HIPFIRE_KERNEL_CACHE", "HIPFIRE_GRAPH", "HIPFIRE_REPLAY_BACKEND",
+    "HIPFIRE_STATE_QUANT", "HIPFIRE_GDN_TEST_STATE_QUANT",
+)
+#: Parent HIPFIRE_* prefixes the scrub may drop without a refusal: host Python tool paths set in user
+#: shells; nothing in the tree reads them.
+IGNORED_PARENT_HIPFIRE_PREFIXES = ("HIPFIRE_TORCH_",)
+_CHILD_ENV_KEY = re.compile(r"^HIPFIRE_[A-Z0-9_]+$")
 
 HOSTMEM_LOCK = "hostmem-flashnext.lock"
 MANIFEST_NAME = "BINARIES.sha256"
@@ -489,6 +499,7 @@ class Config:
     max_chunks: int = DEFAULT_MAX_CHUNKS
     greedy_tokens: int = DEFAULT_GREEDY_TOKENS
     only: tuple[str, ...] = ()
+    child_env: dict = field(default_factory=dict)  # --child-env KEY=VALUE, in the order given
     binaries: dict = field(default_factory=dict)  # base -> {path,name,sha256}
 
     @property
@@ -540,6 +551,7 @@ def build_child_env(parent: dict, cfg: Config, child: Child) -> dict:
     }
     for key, value in FIXED_RECEIPT_KNOBS:
         env[key] = value
+    env.update(cfg.child_env)
     # The graph axis (HIPFIRE_GRAPH or HIPFIRE_REPLAY_BACKEND) lives in extra_env.
     env["HIPFIRE_KERNEL_CACHE"] = str(cfg.out / "kcache")
     home = child.dir / "home"
@@ -553,6 +565,7 @@ def build_child_env(parent: dict, cfg: Config, child: Child) -> dict:
 def explicit_env(cfg: Config, child: Child) -> dict:
     """Only the variables the collector sets (for dry-run display)."""
     shown = {key: value for key, value in FIXED_RECEIPT_KNOBS}
+    shown.update(cfg.child_env)
     # The graph axis (HIPFIRE_GRAPH or HIPFIRE_REPLAY_BACKEND) lives in extra_env.
     shown["HIPFIRE_KERNEL_CACHE"] = str(cfg.out / "kcache")
     shown["HOME"] = str(child.dir / "home")
@@ -1015,7 +1028,36 @@ def make_parser() -> argparse.ArgumentParser:
         "--greedy-tokens", type=int, default=None,
         help=f"stage greedy only: `hipfire run --max-tokens N` (default {DEFAULT_GREEDY_TOKENS}, 1..{MAX_GREEDY_TOKENS})",
     )
+    p.add_argument(
+        "--child-env", action="append", default=[], metavar="KEY=VALUE",
+        help="passes KEY=VALUE into every child's scrubbed environment and records it in the receipts; repeatable; "
+        "e.g. --child-env HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=14 for the R9700 expert placement "
+        "(KEY must be HIPFIRE_[A-Z0-9_]+; keys the collector sets itself are refused)",
+    )
     return p
+
+
+def parse_child_env(values: list[str]) -> dict:
+    """``--child-env KEY=VALUE`` pairs -> ordered dict; refuses what the collector owns."""
+    owned = set(KEEP_HIPFIRE_ENV) | set(COLLECTOR_OWNED_HIPFIRE_ENV) | {k for k, _ in FIXED_RECEIPT_KNOBS}
+    result: dict[str, str] = {}
+    for raw in values:
+        if "=" not in raw:
+            raise CollectError(f"--child-env {raw!r} must be KEY=VALUE")
+        key, value = raw.split("=", 1)
+        if not key:
+            raise CollectError(f"--child-env {raw!r} has an empty key")
+        if not _CHILD_ENV_KEY.match(key):
+            raise CollectError(
+                f"--child-env key {key!r} must match ^HIPFIRE_[A-Z0-9_]+$ "
+                "(non-HIPFIRE variables already pass through the scrub)"
+            )
+        if key in owned:
+            raise CollectError(f"--child-env {key}: the collector sets {key} itself")
+        if key in result:
+            raise CollectError(f"--child-env {key} is given twice")
+        result[key] = value
+    return result
 
 
 def validate(args: argparse.Namespace, environ: dict) -> Config:
@@ -1099,6 +1141,20 @@ def validate(args: argparse.Namespace, environ: dict) -> Config:
         raise CollectError("smoke needs an explicit --graph 0 or 1 (the oracle takes --graph)")
     if args.oracle_only and args.stage != "smoke":
         raise CollectError("--oracle-only applies to --stage smoke only")
+    child_env = parse_child_env(args.child_env)
+    if not args.prehash:
+        stripped = sorted(
+            name for name in environ
+            if name.startswith("HIPFIRE_")
+            and name not in KEEP_HIPFIRE_ENV
+            and name not in child_env
+            and not name.startswith(IGNORED_PARENT_HIPFIRE_PREFIXES)
+        )
+        if stripped:
+            raise CollectError(
+                f"parent environment sets {', '.join(stripped)}; the child scrub would drop them silently: "
+                "pass the ones a child needs with --child-env KEY=VALUE and unset the rest"
+            )
     run_id = run_id or (_dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-p{os.getpid()}")
     cfg = Config(
         stage=args.stage, binary_dir=binary_dir, model=model, wt2_ref=wt2, code_ref=code,
@@ -1108,7 +1164,7 @@ def validate(args: argparse.Namespace, environ: dict) -> Config:
         dry_run=args.dry_run, oracle_only=args.oracle_only,
         max_chunks=args.max_chunks if args.max_chunks is not None else DEFAULT_MAX_CHUNKS,
         greedy_tokens=args.greedy_tokens if args.greedy_tokens is not None else DEFAULT_GREEDY_TOKENS,
-        only=only,
+        only=only, child_env=child_env,
     )
     cfg.binaries = resolve_and_verify_binaries(binary_dir, required_binaries(args.stage, modes, args.oracle_only))
     if cfg.only:
@@ -2114,6 +2170,7 @@ def run_child(cfg: Config, child: Child, identity: dict, environ: dict) -> dict:
         "id": child.id, "mode": child.mode, "graph": child.graph, "binary": child.binary,
         "state_quant_env": {k: v for k, v in child.extra_env.items() if k in ("HIPFIRE_STATE_QUANT", "HIPFIRE_GDN_TEST_STATE_QUANT")},
         "home_files": dict(child.home_files),
+        "child_env": dict(cfg.child_env),
     }
     write_json(cdir / "identity.json", cid)
     sampler = MemorySampler(cdir / "memory_samples.jsonl") if child.sample_memory else None
@@ -2296,7 +2353,13 @@ def analyze_existing(cfg: Config) -> int:
 
 def print_dry_run(cfg: Config, children: list[Child]) -> None:
     print(f"# dry run: stage {cfg.stage}  run dir {cfg.run_dir}  {len(children)} child process(es)")
-    print(f"# scrub: unset every HIPFIRE_* except {', '.join(KEEP_HIPFIRE_ENV)}; per-child isolated HOME/HIPFIRE_HOME/HIPFIRE_LOCK_DIR")
+    print(
+        f"# scrub: unset every HIPFIRE_* except {', '.join(KEEP_HIPFIRE_ENV)} and the --child-env KEY=VALUE pairs; "
+        "per-child isolated HOME/HIPFIRE_HOME/HIPFIRE_LOCK_DIR; a parent HIPFIRE_* the scrub would drop is refused "
+        "(pass it with --child-env or unset it)"
+    )
+    if cfg.child_env:
+        print("# child-env: " + " ".join(f"{k}={shlex.quote(v)}" for k, v in cfg.child_env.items()))
     print(f"# per-child timeout {cfg.child_timeout_secs} s; fabric hold required for a real run (FABRIC_JOB wrapper = ancestor, {HOSTMEM_LOCK} held)")
     if cfg.only:
         print(f"# only: {','.join(cfg.only)}")
@@ -2347,6 +2410,7 @@ def run_stage(cfg: Config, environ: dict) -> int:
         "child_timeout_secs": cfg.child_timeout_secs, "host": host_record(environ),
         "identity": "identity.json", "children": done, "not_run": not_run,
         "analysis": analysis, "exit_code": exit_code, "only": list(cfg.only),
+        "child_env": dict(cfg.child_env),
         "max_chunks": cfg.max_chunks if cfg.stage == "quality" else None,
         "greedy_tokens": cfg.greedy_tokens if cfg.stage == "greedy" else None,
     }
