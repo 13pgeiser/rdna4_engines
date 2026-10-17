@@ -36,6 +36,8 @@ pub mod expert_tier_owners;
 pub mod expert_tier_plan;
 pub mod gpu_forward;
 pub mod gpu_forward_lanes;
+/// Measured host-to-device link class (narrow-link G2 and chunk defaults).
+pub mod host_link;
 pub mod kv_backend;
 pub mod lane;
 pub mod lane_exec;

@@ -78,6 +78,8 @@ mod npu_forward;
 
 pub(crate) const EPSILON: f32 = 1.0e-6;
 const GFX942_PREFILL_CHUNK_ROWS: usize = 1536;
+/// gfx1100 chunk on a narrow discrete host link (`crate::host_link`).
+const GFX1100_NARROW_LINK_PREFILL_CHUNK_ROWS: usize = 8192;
 
 /// Default rows of one Qwen4 prefill chunk (the reusable forward scratch).
 ///
@@ -91,37 +93,57 @@ const GFX942_PREFILL_CHUNK_ROWS: usize = 1536;
 /// layers, so the rung is the fastest pp8192 within 3% of the 2048-row
 /// rung's tg64: 4096 rows (14 layers at max_seq 66,560) measured pp8192
 /// +14.1% over 2048 rows (16 layers) at -2.9% tg64; 8192 rows (11 layers)
-/// measured +22.6% at -6.9% tg64.  Other architectures keep the measured
-/// 1536.
-pub fn qwen4_prefill_chunk_default(arch: &str) -> usize {
+/// measured +22.6% at -6.9% tg64.
+///
+/// gfx1100 keeps 1536 on a fast link and takes 8192 on a *narrow* discrete
+/// host link ([`crate::host_link::HostLink::is_narrow_discrete`], measured
+/// below 16 GB/s): every chunk re-streams the host experts through the
+/// narrow link, so the chunk's row count divides that cost, and G2 staging
+/// ([`crate::host_link::expert_stage_default`]) hides the copy behind the
+/// chunk's compute. `link` is only evaluated for gfx1100, so no other arch
+/// pays for the probe here. Other architectures keep the measured 1536.
+pub fn qwen4_prefill_chunk_default(
+    arch: &str,
+    link: impl FnOnce() -> crate::host_link::HostLink,
+) -> usize {
     match arch {
         "gfx1151" => 8192,
         "gfx1201" => 4096,
         "gfx942" => GFX942_PREFILL_CHUNK_ROWS,
+        "gfx1100" if link().is_narrow_discrete() => GFX1100_NARROW_LINK_PREFILL_CHUNK_ROWS,
         _ => 1536,
     }
 }
 
 /// Requested prefill chunk ceiling: `prefill.chunk_rows`
 /// (`HIPFIRE_PREFILL_CHUNK_ROWS`) rounded down to whole 256-row GEMM tiles,
-/// else [`qwen4_prefill_chunk_default`]; never above `max_seq`.  Load-time
-/// admission ([`qwen4_prefill_chunk_rungs`]) may still pick a smaller rung.
-pub fn qwen4_prefill_chunk_requested(arch: &str, max_seq: usize) -> usize {
+/// else [`qwen4_prefill_chunk_default`] for `gpu` (its host link is measured
+/// once per device, see [`crate::host_link`]); never above `max_seq`. An
+/// explicit value never probes. Load-time admission
+/// ([`qwen4_prefill_chunk_rungs`]) may still pick a smaller rung.
+pub fn qwen4_prefill_chunk_requested(gpu: &Gpu, max_seq: usize) -> usize {
     prefill_chunk_requested_from(
-        arch,
+        &gpu.arch,
         hipfire_config::developer_var("HIPFIRE_PREFILL_CHUNK_ROWS")
             .ok()
             .as_deref(),
         max_seq,
+        || crate::host_link::host_link(gpu),
     )
 }
 
-/// [`qwen4_prefill_chunk_requested`] with the `HIPFIRE_PREFILL_CHUNK_ROWS` value supplied.
-fn prefill_chunk_requested_from(arch: &str, env: Option<&str>, max_seq: usize) -> usize {
+/// [`qwen4_prefill_chunk_requested`] with the `HIPFIRE_PREFILL_CHUNK_ROWS`
+/// value and the (lazily measured) host link supplied.
+fn prefill_chunk_requested_from(
+    arch: &str,
+    env: Option<&str>,
+    max_seq: usize,
+    link: impl FnOnce() -> crate::host_link::HostLink,
+) -> usize {
     env.and_then(|value| value.trim().parse::<usize>().ok())
         .map(|rows| rows / 256 * 256)
         .filter(|&rows| rows >= 256)
-        .unwrap_or_else(|| qwen4_prefill_chunk_default(arch))
+        .unwrap_or_else(|| qwen4_prefill_chunk_default(arch, link))
         .min(max_seq)
 }
 
@@ -399,7 +421,10 @@ const QWEN4_STEP_INLINE_CAPACITY: usize = 384;
 const QWEN4_QSA_INLINE_CAPACITY: usize = 12;
 
 /// Long-prefill host-expert staging (G2). `1`/`0` force it on/off; unset it
-/// is on for gfx1201 only, the card it was measured on. Placement is not
+/// is on for gfx1201 (the card it was measured on, whatever its link) and for
+/// any discrete device whose measured H2D link is narrow, below 16 GB/s
+/// ([`crate::host_link::expert_stage_default`]); it stays off for unified
+/// memory and when the link could not be measured. Placement is not
 /// touched: a staged prefill borrows the VRAM of the last two resident expert
 /// layers as its two DMA stages, and restores them from pinned host copies
 /// before the forward returns, so decode keeps today's residency.
@@ -426,6 +451,13 @@ pub const QWEN4_EXPERT_STAGE_CAPTURE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE_CAP
 /// ([`resolve_expert_stage_min_rows`]).
 const QWEN4_EXPERT_STAGE_MIN_ROWS_DEFAULT: usize = 2048;
 
+/// Default stage threshold on a narrow discrete host link
+/// ([`crate::host_link::HostLink::is_narrow_discrete`]) off gfx1201: the
+/// mapped read of a host layer costs more per forward the narrower the link,
+/// so the copy pays from a shorter forward. Capped at the chunk like the
+/// 2048 default.
+const QWEN4_EXPERT_STAGE_NARROW_LINK_MIN_ROWS: usize = 768;
+
 /// One Flash-Next routed expert's QT44 gate/up and QT53 down bytes.
 const QWEN4_EXPERT_STAGE_GATE_UP_BYTES: usize = 1_740_800;
 const QWEN4_EXPERT_STAGE_DOWN_BYTES: usize = 870_400;
@@ -450,12 +482,15 @@ impl StageMinRowsSource {
 /// prefill chunk capacity (the largest forward it will ever see). An explicit
 /// [`QWEN4_EXPERT_STAGE_MIN_ROWS_ENV`] (integer >= 2) is authoritative. The
 /// default is `min(2048, chunk_rows)`, so a full chunk always qualifies on an
-/// arch whose chunk is below 2048 (gfx1100: 1536). gfx1201 keeps 2048
-/// whatever its admitted rung (K3: 1536-row forwards expose the DMA), so its
+/// arch whose chunk is below 2048 (gfx1100 on a fast link: 1536); on a
+/// `narrow_link` (measured narrow discrete host link) off gfx1201 it is
+/// `min(768, chunk_rows)`. gfx1201 keeps 2048 whatever its admitted rung
+/// (K3: 1536-row forwards expose the DMA) and whatever its link, so its
 /// behavior is unchanged.
 fn resolve_expert_stage_min_rows(
     arch: &str,
     chunk_rows: usize,
+    narrow_link: bool,
     env: Option<&str>,
 ) -> (usize, StageMinRowsSource) {
     if let Some(rows) = env
@@ -466,27 +501,33 @@ fn resolve_expert_stage_min_rows(
     }
     let rows = if arch == "gfx1201" {
         QWEN4_EXPERT_STAGE_MIN_ROWS_DEFAULT
+    } else if narrow_link {
+        QWEN4_EXPERT_STAGE_NARROW_LINK_MIN_ROWS.min(chunk_rows.max(2))
     } else {
         QWEN4_EXPERT_STAGE_MIN_ROWS_DEFAULT.min(chunk_rows.max(2))
     };
     (rows, StageMinRowsSource::Default)
 }
 
-fn qwen4_expert_stage_min_rows(arch: &str, chunk_rows: usize) -> (usize, StageMinRowsSource) {
-    resolve_expert_stage_min_rows(
-        arch,
-        chunk_rows,
-        hipfire_config::developer_var(QWEN4_EXPERT_STAGE_MIN_ROWS_ENV)
-            .ok()
-            .as_deref(),
-    )
+fn qwen4_expert_stage_min_rows(gpu: &Gpu, chunk_rows: usize) -> (usize, StageMinRowsSource) {
+    // gfx1201 and an explicit threshold never read the link, so they never probe.
+    let env = hipfire_config::developer_var(QWEN4_EXPERT_STAGE_MIN_ROWS_ENV).ok();
+    let narrow_link = gpu.arch != "gfx1201"
+        && !env
+            .as_deref()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .is_some_and(|rows| rows >= 2)
+        && crate::host_link::host_link(gpu).is_narrow_discrete();
+    resolve_expert_stage_min_rows(&gpu.arch, chunk_rows, narrow_link, env.as_deref())
 }
 
 /// Whether long-prefill expert staging would stage a window of at most
 /// [`hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS`] rows: staging on and
-/// `HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS` forced to the cap or below. The
-/// default threshold is `min(2048, prefill chunk)` (hundreds of rows at
-/// least), so only the forced value can reach a narrow window. A staged forward
+/// `HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS` forced to the cap or below. Every
+/// default threshold (2048 on gfx1201, the fixed 768 of a narrow link,
+/// `min(2048, prefill chunk)` otherwise) is hundreds of rows at least, so only
+/// the forced value can reach a narrow window and the link is irrelevant here
+/// (resolved as not narrow, which needs no probe). A staged forward
 /// swaps the layer's pointer tables for the stage's, which the CPU tier split's
 /// masked route does not cover, so the split refuses to arm (one log line)
 /// instead of failing each narrow call.
@@ -496,7 +537,7 @@ fn expert_stage_takes_narrow_windows(
     min_rows_env: Option<&str>,
 ) -> bool {
     stage_on
-        && resolve_expert_stage_min_rows(arch, usize::MAX, min_rows_env).0
+        && resolve_expert_stage_min_rows(arch, usize::MAX, false, min_rows_env).0
             <= hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS
 }
 
@@ -3699,8 +3740,14 @@ impl Qwen4ExpertStage {
                 return Ok(None);
             }
         }
-        if !hipfire_config::developer_bool(QWEN4_EXPERT_STAGE_ENV, gpu.arch == "gfx1201") {
+        if !crate::expert_residency::expert_stage_enabled(gpu) {
             return Ok(None);
+        }
+        // Settle the host link (probe or cache hit) before any stage buffer
+        // takes VRAM: the `min_rows` default reads it, and the 64 MiB probe
+        // must not compete with the buffers. gfx1201 never reads it.
+        if gpu.arch != "gfx1201" {
+            let _ = crate::host_link::host_link(gpu);
         }
         let Some(first_host) = moe
             .iter()
@@ -3817,7 +3864,7 @@ impl Qwen4ExpertStage {
             }
         }
         gpu.ensure_capture_stream()?;
-        let (min_rows, min_rows_source) = qwen4_expert_stage_min_rows(&gpu.arch, chunk_rows);
+        let (min_rows, min_rows_source) = qwen4_expert_stage_min_rows(gpu, chunk_rows);
         let mut stage = Self {
             min_rows,
             min_rows_source,
@@ -10756,9 +10803,78 @@ mod tests {
             );
             assert!(!super::trunk_prefill_invariant_scope(true, "gfx1201", knob));
         }
-        assert_eq!(super::qwen4_prefill_chunk_default("gfx942"), 1536);
-        assert_eq!(super::qwen4_prefill_chunk_default("gfx1151"), 8192);
-        assert_eq!(super::qwen4_prefill_chunk_default("gfx1201"), 4096);
+        let unmeasured = || crate::host_link::HostLink::Unmeasured;
+        assert_eq!(
+            super::qwen4_prefill_chunk_default("gfx942", unmeasured),
+            1536
+        );
+        assert_eq!(
+            super::qwen4_prefill_chunk_default("gfx1151", unmeasured),
+            8192
+        );
+        assert_eq!(
+            super::qwen4_prefill_chunk_default("gfx1201", unmeasured),
+            4096
+        );
+    }
+
+    #[test]
+    fn gfx1100_chunk_is_8192_only_on_a_measured_narrow_discrete_link() {
+        use super::prefill_chunk_requested_from;
+        use crate::host_link::HostLink::{self, Discrete, Unified, Unmeasured};
+        let chunk = |arch: &str, link: HostLink| {
+            prefill_chunk_requested_from(arch, None, usize::MAX, move || link)
+        };
+        // Narrow discrete link: the larger admitted rung.
+        assert_eq!(chunk("gfx1100", Discrete { gbps: 12.0 }), 8192);
+        assert_eq!(chunk("gfx1100", Discrete { gbps: 15.9 }), 8192);
+        // Fast, unmeasured and unified links keep today's 1536.
+        assert_eq!(chunk("gfx1100", Discrete { gbps: 16.0 }), 1536);
+        assert_eq!(chunk("gfx1100", Discrete { gbps: 26.0 }), 1536);
+        assert_eq!(chunk("gfx1100", Unmeasured), 1536);
+        assert_eq!(chunk("gfx1100", Unified), 1536);
+        // No other arch changes: gfx1201 stays 4096 on any link (Gen5 x16
+        // R9700 included), gfx1151 stays 8192, the rest 1536.
+        for link in [
+            Discrete { gbps: 4.0 },
+            Discrete { gbps: 27.3 },
+            Unmeasured,
+            Unified,
+        ] {
+            assert_eq!(chunk("gfx1201", link), 4096, "{link:?}");
+            assert_eq!(chunk("gfx1151", link), 8192, "{link:?}");
+            assert_eq!(chunk("gfx942", link), 1536, "{link:?}");
+            assert_eq!(chunk("gfx1030", link), 1536, "{link:?}");
+        }
+        // Only gfx1100 evaluates the link (so the other arches never probe),
+        // and an explicit chunk request never does.
+        for (arch, rows) in [
+            ("gfx1201", 4096),
+            ("gfx1151", 8192),
+            ("gfx942", 1536),
+            ("gfx1030", 1536),
+        ] {
+            assert_eq!(
+                prefill_chunk_requested_from(arch, None, usize::MAX, || unreachable!("probed")),
+                rows,
+                "{arch}"
+            );
+        }
+        assert_eq!(
+            prefill_chunk_requested_from("gfx1100", Some("2048"), usize::MAX, || {
+                unreachable!("probed")
+            }),
+            2048
+        );
+        // The admitted ceiling still caps it, and rung admission can step down.
+        assert_eq!(
+            prefill_chunk_requested_from("gfx1100", None, 4096, || Discrete { gbps: 8.0 }),
+            4096
+        );
+        assert_eq!(
+            super::qwen4_prefill_chunk_rungs(8192).collect::<Vec<_>>(),
+            [8192, 4096, 2048, 1536]
+        );
     }
 
     #[test]
@@ -10767,39 +10883,55 @@ mod tests {
             prefill_chunk_requested_from, resolve_expert_stage_min_rows as resolve,
             StageMinRowsSource::{Default, Env},
         };
-        let chunk =
-            |arch: &str, env: Option<&str>| prefill_chunk_requested_from(arch, env, usize::MAX);
-        // gfx1100: the 1536-row chunk is the threshold, so a full chunk stages.
+        use crate::host_link::HostLink::{Discrete, Unmeasured};
+        let chunk = |arch: &str, env: Option<&str>| {
+            prefill_chunk_requested_from(arch, env, usize::MAX, || Unmeasured)
+        };
+        // gfx1100 on a fast/unmeasured link: the 1536-row chunk is the
+        // threshold, so a full chunk stages.
         assert_eq!(chunk("gfx1100", None), 1536);
         assert_eq!(
-            resolve("gfx1100", chunk("gfx1100", None), None),
+            resolve("gfx1100", chunk("gfx1100", None), false, None),
             (1536, Default)
         );
         // gfx1201: chunk 4096 (>= 2048) keeps 2048, even if admission picks 1536.
         assert_eq!(chunk("gfx1201", None), 4096);
         assert_eq!(
-            resolve("gfx1201", chunk("gfx1201", None), None),
+            resolve("gfx1201", chunk("gfx1201", None), false, None),
             (2048, Default)
         );
-        assert_eq!(resolve("gfx1201", 1536, None), (2048, Default));
-        // An explicit threshold wins on every arch and chunk.
-        assert_eq!(resolve("gfx1100", 1536, Some("512")), (512, Env));
-        assert_eq!(resolve("gfx1201", 4096, Some(" 3072 ")), (3072, Env));
+        assert_eq!(resolve("gfx1201", 1536, false, None), (2048, Default));
+        // An explicit threshold wins on every arch, chunk and link.
+        assert_eq!(resolve("gfx1100", 1536, false, Some("512")), (512, Env));
+        assert_eq!(resolve("gfx1100", 8192, true, Some("512")), (512, Env));
+        assert_eq!(resolve("gfx1201", 4096, false, Some(" 3072 ")), (3072, Env));
         // Below 2 or unparsable keeps the default.
-        assert_eq!(resolve("gfx1100", 1536, Some("1")), (1536, Default));
-        assert_eq!(resolve("gfx1100", 1536, Some("x")), (1536, Default));
-        // A larger chunk request caps at the 2048 ceiling.
+        assert_eq!(resolve("gfx1100", 1536, false, Some("1")), (1536, Default));
+        assert_eq!(resolve("gfx1100", 1536, false, Some("x")), (1536, Default));
+        assert_eq!(resolve("gfx1100", 8192, true, Some("1")), (768, Default));
+        // A larger chunk request caps at the 2048 ceiling on a fast link.
         assert_eq!(chunk("gfx1100", Some("8192")), 8192);
         assert_eq!(
-            resolve("gfx1100", chunk("gfx1100", Some("8192")), None),
+            resolve("gfx1100", chunk("gfx1100", Some("8192")), false, None),
             (2048, Default)
         );
         // A smaller chunk request lowers it; rounding to 256-row tiles applies.
         assert_eq!(chunk("gfx1100", Some("1100")), 1024);
         assert_eq!(
-            resolve("gfx1100", chunk("gfx1100", Some("1100")), None),
+            resolve("gfx1100", chunk("gfx1100", Some("1100")), false, None),
             (1024, Default)
         );
+        // A measured narrow discrete link stages from 768 rows (capped at the
+        // chunk): the gfx1100 8192-row chunk, and any other arch forced on.
+        let narrow = Discrete { gbps: 12.0 }.is_narrow_discrete();
+        assert!(narrow);
+        assert_eq!(resolve("gfx1100", 8192, narrow, None), (768, Default));
+        assert_eq!(resolve("gfx1100", 1536, narrow, None), (768, Default));
+        assert_eq!(resolve("gfx1030", 1536, narrow, None), (768, Default));
+        assert_eq!(resolve("gfx1100", 512, narrow, None), (512, Default));
+        // gfx1201 keeps 2048 on a narrow link too: its behavior is unchanged.
+        assert_eq!(resolve("gfx1201", 4096, narrow, None), (2048, Default));
+        assert_eq!(resolve("gfx1201", 8192, narrow, None), (2048, Default));
     }
 
     #[test]

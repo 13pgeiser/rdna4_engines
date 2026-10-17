@@ -348,7 +348,7 @@ impl Qwen4ExpertStage {
             }
         }
         gpu.ensure_capture_stream()?;
-        let (min_rows, min_rows_source) = qwen4_expert_stage_min_rows(&gpu.arch, chunk_rows);
+        let (min_rows, min_rows_source) = qwen4_expert_stage_min_rows(gpu, chunk_rows);
         let mut stage = Self {
             min_rows,
             min_rows_source,
@@ -587,7 +587,7 @@ impl Qwen4ExpertStage {
                 return Err(error.into());
             }
         };
-        let (min_rows, min_rows_source) = qwen4_expert_stage_min_rows(&gpu.arch, chunk_rows);
+        let (min_rows, min_rows_source) = qwen4_expert_stage_min_rows(gpu, chunk_rows);
         let mut stage = Self {
             min_rows,
             min_rows_source,

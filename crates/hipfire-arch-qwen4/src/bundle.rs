@@ -761,7 +761,7 @@ impl Qwen4Bundle {
                 // in a single row-store request, so staging holds the
                 // requested chunk.
                 let staging_rows =
-                    qwen4_prefill_chunk_requested(&gpu.arch, max_seq_len) * ple_config.head_count;
+                    qwen4_prefill_chunk_requested(gpu, max_seq_len) * ple_config.head_count;
                 match build_ple_row_store(
                     &inputs.source,
                     &transaction,
@@ -1060,7 +1060,7 @@ impl Qwen4Bundle {
             }
             _ => usize::MAX,
         };
-        let requested = qwen4_prefill_chunk_requested(&gpu.arch, max_chunk).min(ple_rows_cap);
+        let requested = qwen4_prefill_chunk_requested(gpu, max_chunk).min(ple_rows_cap);
         if requested == 0 {
             return Err(BundleError::Forward(
                 "Qwen4 PLE row store cannot stage one chunk row".to_string(),

@@ -1343,8 +1343,7 @@ fn qwen4_placement_inputs(
     let qsa_format = state_format.qsa;
     let (non_expert, layer_experts) = residency::resident_split_ranks(weights, bytes_of, ranks)
         .map_err(|error| format!("qwen4: {error}"))?;
-    let chunk_rows =
-        hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu.arch, max_seq);
+    let chunk_rows = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq);
     let context = hipfire_arch_qwen4::Qwen4ContextCommit::for_expert_reserve(
         backend,
         use_ranges,
@@ -2101,7 +2100,7 @@ fn load_qwen4_rank_scoped(
     // dedicated long-prefill stage buffers sized from the largest layer.
     // The hot set path charges its own margin and tier-plan stage.
     let slab_stage = residency::dedicated_slab_stage(
-        residency::expert_stage_enabled(&ctx.gpu.arch),
+        residency::expert_stage_enabled(ctx.gpu),
         matches!(
             manifest.identity.recipe,
             hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab { .. }
@@ -2201,7 +2200,7 @@ fn load_qwen4_rank_scoped(
                     .map_err(|skip| skip.to_string())?;
             // Retain the automatic fixed point for stage buffers. Under a
             // pin, reserve those buffers alongside the unchanged hot budget.
-            let stage_enabled = residency::expert_stage_enabled(&ctx.gpu.arch);
+            let stage_enabled = residency::expert_stage_enabled(ctx.gpu);
             let mut stage = 0u64;
             let (plan, budget) = loop {
                 let available = hotsets::require_budget(total.checked_sub(stage).ok_or_else(|| {
@@ -2480,7 +2479,7 @@ fn load_qwen4_rank_scoped(
         })
         .transpose()?;
     let mut whole_first_plan = None;
-    let borrowed_stage_donors = residency::expert_stage_enabled(&ctx.gpu.arch)
+    let borrowed_stage_donors = residency::expert_stage_enabled(ctx.gpu)
         && matches!(
             manifest.identity.recipe,
             hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextPacked { .. }
@@ -2880,10 +2879,8 @@ fn load_qwen4_rank_scoped(
     if let Some(scope) = band {
         // `attach_forward` searches smaller chunk rungs when the largest does
         // not fit; a band never shrinks the canonical chunk on its own.
-        let canonical = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(
-            &ctx.gpu.arch,
-            ctx.max_seq,
-        );
+        let canonical =
+            hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(ctx.gpu, ctx.max_seq);
         if bundle.spec_chunk_rows() != Some(canonical) {
             let got = bundle.spec_chunk_rows();
             let _ = bundle.free_gpu(ctx.gpu);
@@ -3433,8 +3430,7 @@ fn load_qwen4_pp_bundle(
         let scratch_mode =
             q4::artifact::source_forward_scratch_mode(daemon, hfq, &config, &receipt.manifest)
                 .map_err(|error| error.to_string())?;
-        let chunk_rows =
-            q4::gpu_forward::qwen4_prefill_chunk_requested(&daemon.arch, shared.max_seq);
+        let chunk_rows = q4::gpu_forward::qwen4_prefill_chunk_requested(daemon, shared.max_seq);
         let context = q4::Qwen4ContextCommit::new(
             shared.backend,
             shared.max_seq,

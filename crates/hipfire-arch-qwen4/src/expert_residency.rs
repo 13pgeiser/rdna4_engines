@@ -1505,13 +1505,34 @@ pub fn expert_hotset_budget(
         })
 }
 
-/// Whether a load on `arch` builds the long-prefill expert stage (the same
+/// Whether a load on `gpu` builds the long-prefill expert stage (the same
 /// switch `Qwen4ExpertStage::new` reads), so its buffers need a budget.
-pub fn expert_stage_enabled(arch: &str) -> bool {
-    hipfire_config::developer_bool(
-        crate::gpu_forward::QWEN4_EXPERT_STAGE_ENV,
-        arch == "gfx1201",
+/// Admission and the constructor both call this with the same `gpu`, so they
+/// share one input: `HIPFIRE_QWEN4_EXPERT_STAGE` (`1`/`0`) when set, else
+/// [`crate::host_link::expert_stage_default`] on the device's cached measured
+/// host link. An explicit value or gfx1201 never triggers the H2D probe.
+pub fn expert_stage_enabled(gpu: &rdna_compute::Gpu) -> bool {
+    expert_stage_switch(
+        &gpu.arch,
+        hipfire_config::developer_var(crate::gpu_forward::QWEN4_EXPERT_STAGE_ENV)
+            .ok()
+            .as_deref(),
+        || crate::host_link::host_link(gpu),
     )
+}
+
+/// [`expert_stage_enabled`] with the env value and the (lazily measured)
+/// link supplied; the strict `1`/`0` spelling of `developer_bool`.
+fn expert_stage_switch(
+    arch: &str,
+    env: Option<&str>,
+    link: impl FnOnce() -> crate::host_link::HostLink,
+) -> bool {
+    match env {
+        Some("1") => true,
+        Some("0") => false,
+        _ => crate::host_link::expert_stage_default(arch, link),
+    }
 }
 
 /// Device bytes the tier long-prefill staging allocates for `plan`: one VRAM
@@ -2524,7 +2545,10 @@ mod tests {
         );
         // gfx1201's 4096-row chunk spends that and one layer more on
         // forward scratch.
-        let reserve = reserve(crate::gpu_forward::qwen4_prefill_chunk_default("gfx1201"));
+        let reserve = reserve(crate::gpu_forward::qwen4_prefill_chunk_default(
+            "gfx1201",
+            || crate::host_link::HostLink::Unmeasured,
+        ));
         assert!(reserve > measured_chunk);
         assert_eq!(
             auto_vram_layers(free, 5_364_000_000, 1_336_900_000, 48, reserve),
@@ -2673,7 +2697,9 @@ mod tests {
         census_at(
             config,
             max_seq,
-            crate::gpu_forward::qwen4_prefill_chunk_default("gfx1201"),
+            crate::gpu_forward::qwen4_prefill_chunk_default("gfx1201", || {
+                crate::host_link::HostLink::Unmeasured
+            }),
             Full,
             0,
         )
@@ -3196,6 +3222,42 @@ mod tests {
         // 48 routers, 2 PLE.
         let target: u64 = 1_298_923_520;
         assert_eq!(target, 1238 * (1 << 20) + (3 << 18));
+    }
+
+    #[test]
+    fn stage_switch_is_env_first_then_gfx1201_or_narrow_link() {
+        use crate::host_link::HostLink::{self, Discrete, Unified, Unmeasured};
+        fn no_probe() -> HostLink {
+            unreachable!("the link was probed")
+        }
+        let narrow = || Discrete { gbps: 12.0 };
+        let wide = || Discrete { gbps: 27.3 };
+        // Unset: gfx1201 on regardless of link (and never probes); every
+        // other arch only on a measured narrow discrete link.
+        assert!(expert_stage_switch("gfx1201", None, no_probe));
+        assert!(expert_stage_switch("gfx1201", None, || Unmeasured));
+        assert!(expert_stage_switch("gfx1201", None, wide));
+        assert!(expert_stage_switch("gfx1100", None, narrow));
+        assert!(!expert_stage_switch("gfx1100", None, wide));
+        assert!(!expert_stage_switch("gfx1100", None, || Unmeasured));
+        assert!(!expert_stage_switch("gfx1151", None, || Unified));
+        // Anything but the strict `1`/`0` is unset.
+        assert!(expert_stage_switch("gfx1100", Some("on"), narrow));
+        assert!(!expert_stage_switch("gfx1100", Some(""), wide));
+        // Explicit values win over arch and link, and never probe.
+        assert!(expert_stage_switch("gfx1100", Some("1"), no_probe));
+        assert!(expert_stage_switch("gfx1151", Some("1"), || Unified));
+        assert!(!expert_stage_switch("gfx1100", Some("0"), no_probe));
+        assert!(!expert_stage_switch("gfx1201", Some("0"), wide));
+        // The admission charge follows the same switch: a narrow-link
+        // gfx1100 slab load now charges the two dedicated stage buffers.
+        let charged = |arch, link: fn() -> HostLink| {
+            dedicated_slab_stage(expert_stage_switch(arch, None, link), true, false)
+        };
+        assert!(charged("gfx1100", narrow));
+        assert!(!charged("gfx1100", wide));
+        assert!(!charged("gfx1100", || Unmeasured));
+        assert!(charged("gfx1201", wide));
     }
 
     #[test]

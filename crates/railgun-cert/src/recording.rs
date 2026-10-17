@@ -1278,7 +1278,7 @@ pub const DECISIONS: &[Decision] = &[
         switches: "eager: host layers' QT44/QT53 expert bytes DMA-copied into the donor layers' VRAM, the MoE launches read them through the stage pointer tables, donors restored before the forward returns; stream capture: the same MoE kernels read the host-mapped experts",
         kernels: &[],
         verdict: ByteExact,
-        evidence: "no arithmetic changes, only where the unchanged expert bytes are read from; Flash-Next 16K logits on gfx1201 are byte-identical with HIPFIRE_QWEN4_EXPERT_STAGE on and off (CHANGELOG 0.4.1, Flash-Next performance); default on for exact gfx1201 only, and no railgun default program is a qwen4 program",
+        evidence: "no arithmetic changes, only where the unchanged expert bytes are read from; Flash-Next 16K logits on gfx1201 are byte-identical with HIPFIRE_QWEN4_EXPERT_STAGE on and off (CHANGELOG 0.4.1, Flash-Next performance); default on for exact gfx1201 and for any discrete device whose load-time measured host-to-device link is narrow (< 16 GB/s; unified memory and an unmeasured link stay off), and no railgun default program is a qwen4 program",
         reaches: &[],
     },
     Decision {

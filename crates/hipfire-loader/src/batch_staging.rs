@@ -575,7 +575,7 @@ fn stage_qwen4_lanes(
         return refuse("QSA context backend is not VMM");
     }
     let row_budget = req.row_budget.max(requested);
-    let chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu.arch, max_seq);
+    let chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq);
     let context = Qwen4ContextCommit::new(
         Qwen4KvBackend::Vmm,
         max_seq,

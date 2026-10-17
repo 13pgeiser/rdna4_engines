@@ -1279,9 +1279,8 @@ fn main() -> Result<()> {
                         .map(|(_, bytes)| bytes.len() as u64)
                 })
                 .map_err(err)?;
-                let chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(
-                    &gpu.arch, n_ctx,
-                );
+                let chunk =
+                    hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu, n_ctx);
                 let context = hipfire_arch_qwen4::Qwen4ContextCommit::new(
                     backend,
                     n_ctx,
@@ -1400,7 +1399,7 @@ fn main() -> Result<()> {
     eprintln!("text: {} tokens", tokens.len());
 
     let requested_chunk =
-        hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu.arch, n_ctx);
+        hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&gpu, n_ctx);
     let probe = Arc::new(Mutex::new(Probe {
         phase: "prefill",
         ctx: 0,
