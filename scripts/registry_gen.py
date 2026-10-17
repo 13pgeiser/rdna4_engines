@@ -297,6 +297,13 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
     if family == "decider":
         return 5
 
+    # EmbeddingGemma 2 (`google/embeddinggemma-2`) — the arch-18 single-vector
+    # embedding encoder: a Gemma-4-family bidirectional trunk with no LM head,
+    # served only by the `embed` verb. Its towers ride a `<trunk-stem>.vl`
+    # sidecar, declared per entry below like the Qwen3.8-27B vision slot.
+    if family in ("embeddinggemma", "embeddinggemma-2"):
+        return 18
+
     if family == "nex-n2":
         return 6  # Nex-N2-mini = Qwen3.5-35B-A3B MoE (a3b not in tag name)
     # Ornith 1.5 = Qwen3.5-family VL finetune. 35B-A3B is qwen3_5_moe (6), the
