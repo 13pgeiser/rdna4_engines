@@ -634,6 +634,23 @@ budget or lane count to make F32 fit, and where a limit is already derived from
 free memory (the unified-memory context cap) the F32 bytes enter that
 arithmetic.
 
+**Capture-ring growth (a bound, not charged).** The native-MTP reserve charges
+the ring at the R a singleton request uses, R = max(K + 1, the GPU's row-exact
+verify rows: 8 on gfx1151), and that request creates the ring at R on first
+use, so with the defaults (K = 7 on gfx1151) the ring never grows. Only
+experimental multislot (`serve.multi_slot`) can hand the resident state a
+smaller ring: a promoted MTP lane's state carries a `k + 1`-row ring (lane
+k = min(K, 7)), and a later singleton request on that state grows it to R when
+K ≠ 7. Growth builds the new ring before it frees the old one (whose first
+slot is the live state), so for that moment the recurrent owners exceed the
+reserve by ring(R_old) minus one live set: at most 1,642.8 MiB (F32) or
+440.4 MiB (Q8) for an 8-row old ring (K = 8–10), and 1,423.9 or 381.9 MiB for
+a 7-row one (K = 6). Admission does not charge this transient, and the 2 GiB
+Qwen4 admission headroom is sized for the first long request's other lazy
+allocations (about 1.9 GiB measured on Strix Halo), so it does not cover it
+either. A growth allocation that fails fails that request; hipfire does not
+lower the context or fall back to Q8.
+
 **Kill switch:** `HIPFIRE_QWEN_KV_DEFAULT_Q8=0` (developer variable) restores
 the prior *implicit Qwen* per-site default wherever `auto` does not pick
 native fp8: HFQ `auto`/unset → FWHT3 K + Q8 V, PaRo `auto` → FWHT3/Q8,
