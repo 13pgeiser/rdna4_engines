@@ -1306,6 +1306,40 @@ fn resolve_carrier(src: &ModelSource) -> Result<&'static dyn Carrier, String> {
     Ok(carrier)
 }
 
+/// Pure DFlash lm-head refusal: `Some(message)` when a draft is attached but the
+/// target's lm_head/embed quant type is not admitted for DFlash's batched
+/// lm-head verify on `gpu_arch`. MQ V2 (qt 44/47/48/49/50) and MQ3 (qt 17)
+/// lm_heads reach `gemm_mq*g256v2_batched_lmhead` / the MQ3 batched lm-head in
+/// the DFlash verify; DFlash admits them only on the gfx11/gfx12 WMMA set, where
+/// that path is validated. gfx1030 (RDNA2, no WMMA) is outside it (#771): the
+/// generic non-WMMA x-batch scalar fallback exists in rdna-compute but has not
+/// been validated for DFlash verify, so the load refuses here instead of
+/// failing at the first `spec_step` after the prior model was torn down.
+fn dflash_lm_head_refusal(lm_qt: Option<u8>, gpu_arch: &str) -> Option<String> {
+    if crate::dflash_lm_head_quant_supported(lm_qt, gpu_arch) {
+        return None;
+    }
+    let qt_desc = match lm_qt {
+        Some(44) => "quant_type=44, MQ4G256V2".to_string(),
+        Some(47) => "quant_type=47, MQ6G256V2".to_string(),
+        Some(48) => "quant_type=48, MQ5G256V2".to_string(),
+        Some(49) => "quant_type=49, MQ3G256V2".to_string(),
+        Some(50) => "quant_type=50, MQ2G256V2".to_string(),
+        Some(17) => "quant_type=17, MQ3G256".to_string(),
+        Some(qt) => format!("quant_type={qt}"),
+        None => "no lm_head/embed_tokens tensor found".to_string(),
+    };
+    Some(format!(
+        "DFlash draft requested but batched lm_head admission for this model's output layer \
+         ({qt_desc}) is unsupported on {gpu_arch}: DFlash's batched lm_head verify is validated \
+         only on gfx11/gfx12 WMMA GPUs for this weight format. Run autoregressive decoding \
+         instead: turn DFlash off (speculation.dflash = off, e.g. `hipfire config <model> set \
+         dflash_mode off` or `--spec off`; unset developer.dflash_draft / \
+         HIPFIRE_DFLASH_DRAFT), or load a build of the model whose output layer is \
+         Q8/HFQ4/MQ4G256 (qt 3/6/13). Autoregressive decode of this model is unaffected"
+    ))
+}
+
 /// Read-only DFlash lm-head quant refusal: a draft is attached but the target's
 /// lm_head/embed quant type is not admitted for the batched GEMM verify paths.
 /// Mirrors the gemma4-entry pre-allocation check (lib.rs) so the refusal fires
@@ -1324,19 +1358,10 @@ fn df_lash_lm_head_admission(
         .or_else(|| hfq.tensor_data("model.language_model.embed_tokens.weight"))
         .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
         .map(|(info, _)| info.quant_type);
-    if !crate::dflash_lm_head_quant_supported(lm_qt, gpu_arch) {
-        let qt_desc = match lm_qt {
-            Some(qt) => format!("quant_type={qt}"),
-            None => "no lm_head/embed_tokens tensor found".to_string(),
-        };
-        return Err(format!(
-            "DFlash draft requested but this model's output layer ({qt_desc}) is stored in a \
-             weight format DFlash cannot use on {gpu_arch}. Turn DFlash off \
-             (speculation.dflash = off) or load a build of the model with a supported output \
-             layer format"
-        ));
+    match dflash_lm_head_refusal(lm_qt, gpu_arch) {
+        Some(message) => Err(message),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// FLUX/Klein image-gen arch refusal: the trunk GEMM (`gemm_wmma_lds256`)
@@ -2832,6 +2857,82 @@ pub fn admit_source_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #771: gfx1030 + qwen3.8 MQ4V2 (qt=44) + DFlash reached
+    /// `gemm_mq4g256v2_batched_lmhead` at the first `spec_step`. The gate
+    /// refuses at admission with an actionable message; every other arch /
+    /// quant / non-DFlash combination is untouched.
+    mod dflash_lm_head_refusal_771 {
+        use super::*;
+
+        #[test]
+        fn gfx1030_mq4v2_refuses_with_actionable_message() {
+            let msg = dflash_lm_head_refusal(Some(44), "gfx1030")
+                .expect("qt=44 + DFlash on gfx1030 must refuse at admission");
+            for needle in [
+                "gfx1030",
+                "quant_type=44",
+                "MQ4G256V2",
+                "batched lm_head admission",
+                "unsupported",
+                "speculation.dflash = off",
+                "autoregressive",
+            ] {
+                assert!(
+                    msg.to_lowercase().contains(&needle.to_lowercase()),
+                    "refusal must mention {needle:?}: {msg}"
+                );
+            }
+            // A generic non-WMMA x-batch fallback exists; the refusal is an
+            // admission/validation boundary, not a missing-kernel claim.
+            for banned in ["no batched", "missing", "no v2 source", "no kernel"] {
+                assert!(
+                    !msg.to_lowercase().contains(banned),
+                    "refusal must not claim a missing kernel ({banned:?}): {msg}"
+                );
+            }
+        }
+
+        #[test]
+        fn other_non_wmma_arches_refuse_v2_and_mq3_lm_heads() {
+            for arch in ["gfx1030", "gfx1010", "gfx942", "gfx906"] {
+                for qt in [17u8, 44, 47, 48, 49, 50] {
+                    let msg = dflash_lm_head_refusal(Some(qt), arch)
+                        .unwrap_or_else(|| panic!("qt={qt} on {arch} must refuse"));
+                    assert!(msg.contains(arch), "{msg}");
+                    assert!(msg.contains(&format!("quant_type={qt}")), "{msg}");
+                }
+            }
+        }
+
+        #[test]
+        fn wmma_arches_keep_mq4v2_dflash() {
+            for arch in [
+                "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+            ] {
+                for qt in [44u8, 47, 48, 49, 50, 17] {
+                    assert_eq!(dflash_lm_head_refusal(Some(qt), arch), None, "{arch} qt={qt}");
+                }
+            }
+        }
+
+        #[test]
+        fn gfx1030_keeps_dflash_for_supported_lm_head_quants() {
+            // Q8_0 (3), HFQ4G256 (6), MQ4G256 (13) lm_heads never reach a V2
+            // batched lm_head kernel; they stay admitted on gfx1030.
+            for qt in [3u8, 6, 13] {
+                assert_eq!(dflash_lm_head_refusal(Some(qt), "gfx1030"), None, "qt={qt}");
+            }
+        }
+
+        #[test]
+        fn refusal_message_for_unknown_and_missing_lm_head() {
+            let missing = dflash_lm_head_refusal(None, "gfx1030").expect("missing refuses");
+            assert!(missing.contains("no lm_head/embed_tokens tensor"), "{missing}");
+            let other = dflash_lm_head_refusal(Some(45), "gfx1100").expect("qt45 refuses");
+            assert!(other.contains("quant_type=45") && other.contains("gfx1100"), "{other}");
+        }
+    }
 
     mod mesh_normalization {
         use super::*;
