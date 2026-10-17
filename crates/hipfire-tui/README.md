@@ -30,8 +30,12 @@ Tabs:
   (a chooser offers PLE rows and draft sidecars when the entry has them), `c`
   cancels the pull, `d` deletes after a y/n.
 - **Settings**: easy and advanced views over the typed global config
-  (`~/.hipfire/config.toml`); deprecated keys are read-only. Per-model overlays
-  stay with `hipfire config <tag> set ...`.
+  (`~/.hipfire/config.toml`); every non-deprecated key is editable inline
+  (editor kind comes from the schema's value rule), deprecated keys are
+  read-only. Rows come from `SettingsModel` (`src/hipfire/settings_model.rs`):
+  intent groups, the value predicted for the active model on this GPU, the
+  layer it came from, and a lock on values an environment variable owns.
+  Per-model overlays stay with `hipfire config <tag> set ...`.
 - **System**: GPU, HIP and path diagnostics; `d` runs `hipfire diag`.
 - **Logs**: the tail of `serve.log`.
 

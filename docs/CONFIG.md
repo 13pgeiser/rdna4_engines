@@ -50,6 +50,18 @@ Edit global settings interactively with `hipfire config`. Per-model overlays use
 the typed commands: `hipfire config <tag> list|get|set|reset ...`. Global
 non-interactive edits use `hipfire config list|get|set|reset ...`.
 
+In the TUI Settings tab every non-deprecated key is editable inline: its editor
+kind (cycle an enum, toggle a boolean, type a number or text) is derived from
+the schema's value rule, so the TUI offers exactly what `hipfire config set`
+accepts. `memory.kv_cache` offers `auto`, `q8`, `fwht4`, `fwht3`, `fwht2`, `fp8`,
+`bf16`, `f16` and `f32` (the deprecated `asymN`/`turboN` aliases stay settable
+only from the CLI). `developer.qwen4_moe_sym_iu4` is written as a TOML boolean.
+The tab reads the same layers as `hipfire config explain` (built-in defaults,
+the model's registry card, `config.toml`, `models.toml`, the environment) and
+shows, per row, the value predicted for the active model on your GPU and the
+layer that set it. A value set by an environment variable is locked in the
+TUI: unset the variable to change it.
+
 ### Reading settings: `list`, `explain`, `overrides`
 
 `hipfire config list` groups every key by what it does for you, in the same six
@@ -122,7 +134,6 @@ differs from the resolved one or carries a reason, for example
 With none, it prints `No per-model overrides (~/.hipfire/models.toml has none).`
 JSON carries `count`, `models` and `overrides[]` (`model`, `key`, `value`,
 `all_models`).
-
 **Precedence (operator view):** one-shot CLI values **>** legacy-compatible
 process env **>** per-model override **>** global TOML **>** registry card
 (`recommended_settings`) **>** built-in defaults. `hipfire config explain`

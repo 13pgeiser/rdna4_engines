@@ -262,25 +262,13 @@ impl ConfigState {
                 // Says GPU, not "offload": this value counts layers LEFT ON the
                 // GPU, and an "Offload" label invites reading it as the inverse.
                 "GPU layers",
-                {
-                    // Unset keeps every layer resident on every model. Name
-                    // the state rather than leaving a blank value column; the
-                    // editor seeds its buffer from `values`, not from this label.
-                    // Short: the easy table's value column is 24 wide (ui.rs).
-                    match self
-                        .values
+                // Short: the easy table's value column is 24 wide (ui.rs).
+                layers_label(
+                    self.values
                         .get("gpu_layer_budget")
                         .map(String::as_str)
-                        .unwrap_or("")
-                    {
-                        "" => "all on GPU".into(),
-                        // `-1` is the schema's reserved auto spelling, and the
-                        // rule also accepts a literal `auto`; both mean fit-to-card
-                        // and neither is a layer count.
-                        "-1" | "auto" => "auto (fits to card)".into(),
-                        v => format!("{v} on GPU"),
-                    }
-                },
+                        .unwrap_or(""),
+                ),
                 "How many layers stay on the GPU; the rest spill to system RAM. Frees VRAM, but much slower.",
             ),
             (
@@ -288,53 +276,36 @@ impl ConfigState {
                 // attention weights, so this is the row that makes an over-VRAM
                 // MoE model loadable.
                 "Expert layers",
-                {
-                    match self
-                        .values
+                layers_label(
+                    self.values
                         .get("moe_expert_budget")
                         .map(String::as_str)
-                        .unwrap_or("")
-                    {
-                        // Unset never spills routed experts.
-                        "" => "all on GPU".into(),
-                        "-1" | "auto" => "auto (fits to card)".into(),
-                        v => format!("{v} on GPU"),
-                    }
-                },
+                        .unwrap_or(""),
+                ),
                 "MoE only: how many layers keep their routed experts on the GPU. Only experts move; attention, router, shared expert and KV stay.",
             ),
             (
                 // The other half of the offload decision: placement is the row
                 // above, who multiplies is this one.
                 "Offload exec",
-                match self
-                    .values
-                    .get("offload_exec")
-                    .map(String::as_str)
-                    .unwrap_or("")
-                {
-                    "" | "pcie" => "over PCIe".into(),
-                    "cpu" => "on CPU".into(),
-                    "passback" => "passback (CPU + GPU)".into(),
-                    // Only reachable if the schema's list grows: show it rather
-                    // than mislabel it.
-                    other => other.to_string(),
-                },
+                offload_exec_label(
+                    self.values
+                        .get("offload_exec")
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                ),
                 "Who multiplies a spilled layer's weights: the GPU over the link, or the CPU.",
             ),
             (
                 // The pass-back's modifier: read only by the mode above, which is
                 // why the row says so rather than pretending it is standalone.
                 "Pass-back GPU share",
-                match self
-                    .values
-                    .get("offload_passback_share")
-                    .map(String::as_str)
-                    .unwrap_or("")
-                {
-                    "" | "auto" => "auto (scheduled)".into(),
-                    other => other.to_string(),
-                },
+                passback_share_label(
+                    self.values
+                        .get("offload_passback_share")
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                ),
                 "Share of each spilled step's rows the GPU takes back, for the passback mode.",
             ),
             (
@@ -375,6 +346,41 @@ impl ConfigState {
                 "OpenAI-compatible endpoint used by chat and API clients.",
             ),
         ]
+    }
+}
+
+/// Plain label for a layer-count budget (`memory.gpu_layer_budget`,
+/// `memory.moe_expert_budget`). The editor seeds its buffer from `values`, not
+/// from this label.
+pub(crate) fn layers_label(raw: &str) -> String {
+    match raw {
+        // Unset keeps every layer resident on every model. Name the state rather
+        // than leaving a blank value column.
+        "" => "all on GPU".into(),
+        // `-1` is the schema's reserved auto spelling, and the rule also accepts
+        // a literal `auto`; both mean fit-to-card and neither is a layer count.
+        "-1" | "auto" => "auto (fits to card)".into(),
+        v => format!("{v} on GPU"),
+    }
+}
+
+/// Plain label for `memory.offload_exec`.
+pub(crate) fn offload_exec_label(raw: &str) -> String {
+    match raw {
+        "" | "pcie" => "over PCIe".into(),
+        "cpu" => "on CPU".into(),
+        "passback" => "passback (CPU + GPU)".into(),
+        // Only reachable if the schema's list grows: show it rather than
+        // mislabel it.
+        other => other.to_string(),
+    }
+}
+
+/// Plain label for `memory.offload_passback_share`.
+pub(crate) fn passback_share_label(raw: &str) -> String {
+    match raw {
+        "" | "auto" => "auto (scheduled)".into(),
+        other => other.to_string(),
     }
 }
 

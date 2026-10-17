@@ -14,7 +14,9 @@ pub mod model_actions;
 pub mod profile_wizard;
 pub mod pull_choice;
 pub mod registry;
+pub mod search;
 pub mod serve_ctrl;
+pub mod settings_model;
 pub mod status;
 pub mod ui_state;
 pub mod writer;
@@ -78,11 +80,18 @@ impl HipfirePaths {
             .map(PathBuf::from)
             .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".hipfire")))
             .unwrap_or_else(|| PathBuf::from(".hipfire"));
-        let models = env::var_os("HIPFIRE_MODELS_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| root.join("models"));
+        let models = env::var_os("HIPFIRE_MODELS_DIR").map(PathBuf::from);
+        let mut paths = Self::under(root);
+        if let Some(models) = models {
+            paths.models = models;
+        }
+        paths
+    }
+
+    /// Every path under `root`, reading no environment (fixture homes).
+    pub fn under(root: PathBuf) -> Self {
         Self {
-            models,
+            models: root.join("models"),
             config: root.join("config.toml"),
             legacy_config: root.join("config.json"),
             models_catalog: root.join("models.toml"),

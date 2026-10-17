@@ -20,6 +20,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
+use super::search::field_matches;
 use super::HipfirePaths;
 
 const BG: Color = Color::Rgb(7, 7, 9);
@@ -325,47 +326,6 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
         }
     }
     Ok(())
-}
-
-fn field_matches(field: &ConfigField, query: &str) -> bool {
-    if query.is_empty() {
-        return true;
-    }
-    let query = query.to_ascii_lowercase();
-    let env = field.env_compat.unwrap_or_default();
-    let registry = if field.registry_allowed {
-        "allowed"
-    } else {
-        "not allowed"
-    };
-    let experimental = if field.experimental {
-        "experimental"
-    } else {
-        "stable"
-    };
-    [
-        field.key.to_owned(),
-        field.legacy_key.to_owned(),
-        field.help.to_owned(),
-        env.to_owned(),
-        format!("{:?}", field.category),
-        format!("{:?}", field.scope),
-        format!("{:?}", field.rule),
-        registry.to_owned(),
-        experimental.to_owned(),
-    ]
-    .iter()
-    .any(|candidate| {
-        let candidate = candidate.to_ascii_lowercase();
-        if !candidate.contains(&query) {
-            return false;
-        }
-        // Details-pane "not allowed" must not match a bare "allowed" query.
-        if query == "allowed" && candidate == "not allowed" {
-            return false;
-        }
-        true
-    })
 }
 
 fn draw(frame: &mut Frame, wizard: &ProfileWizard) {

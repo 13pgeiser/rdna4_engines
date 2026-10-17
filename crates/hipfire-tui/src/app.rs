@@ -15,6 +15,7 @@ use std::{
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use hipfire_config::effective::ArchCtx;
 
 use crate::hipfire::{
     chat::{stream_chat, ChatEvent, ChatMessage},
@@ -28,6 +29,7 @@ use crate::hipfire::{
     pull_choice::PullChoice,
     registry::{RegistryAction, RegistryState},
     serve_ctrl::{self, ServeAction, ServeOutcome},
+    settings_model::{self, SettingsModel},
     status::{start_background_serve, StatusState},
     ui_state::UiState,
     writer::{self, FieldKind},
@@ -223,6 +225,15 @@ const PULL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct App {
     pub paths: HipfirePaths,
     pub config: ConfigState,
+    /// GPU and active-model context the effective values are predicted for.
+    pub arch: ArchCtx,
+    /// The `HIPFIRE_*` environment layer, captured at load (injected in tests).
+    pub env_layer: hipfire_config::ConfigLayer,
+    /// Settings rows (intent groups, effective values, origins). The
+    /// easy/advanced `config` view above is still the one on screen; the
+    /// Settings rewrite renders from this model.
+    #[allow(dead_code)]
+    pub settings: SettingsModel,
     pub registry: RegistryState,
     pub status: StatusState,
     pub active_model: String,
@@ -304,12 +315,54 @@ pub struct App {
 }
 
 impl App {
+    /// Load from the real `~/.hipfire` (or `HIPFIRE_HOME`), the GPU recorded in
+    /// its `install.json`, and the process environment.
     pub fn load() -> Result<Self> {
         let paths = HipfirePaths::discover();
+        let (env, env_warning) = match hipfire_config::load_env_layer() {
+            Ok(layer) => (layer, None),
+            Err(error) => (
+                hipfire_config::ConfigLayer::default(),
+                Some(format!("environment: {error}")),
+            ),
+        };
+        let mut app = Self::assemble(paths, None, env)?;
+        if let Some(message) = env_warning {
+            app.config.warning = Some(match app.config.warning.take() {
+                Some(previous) => format!("{previous}; {message}"),
+                None => message,
+            });
+        }
+        Ok(app)
+    }
+
+    /// Load from explicit inputs: the state root, the GPU/model context and the
+    /// environment layer. Reads neither `~/.hipfire` nor the process
+    /// environment, so tests are hermetic.
+    #[allow(dead_code)] // consumed by the Settings pane rewrite and the tests
+    pub fn load_from_paths(
+        paths: HipfirePaths,
+        arch: ArchCtx,
+        env: hipfire_config::ConfigLayer,
+    ) -> Result<Self> {
+        Self::assemble(paths, Some(arch), env)
+    }
+
+    /// `arch: None` derives the context from `install.json` and the active
+    /// model's registry card.
+    fn assemble(
+        paths: HipfirePaths,
+        arch: Option<ArchCtx>,
+        env_layer: hipfire_config::ConfigLayer,
+    ) -> Result<Self> {
         let config = ConfigState::load(&paths);
         let mut registry = RegistryState::load(&paths);
         let status = StatusState::load_local(&paths);
         let active_model = config.default_model.clone();
+        let registry_v1 = settings_model::registry_v1(&registry);
+        let arch = arch
+            .unwrap_or_else(|| settings_model::arch_ctx(&paths.root, &registry_v1, &active_model));
+        let settings = SettingsModel::build(&paths, &active_model, &registry_v1, &arch, &env_layer);
         let dashboard_worker = DashboardWorker::spawn(config.clone());
         let log_tailer = LogTailer::spawn(paths.serve_log.clone());
 
@@ -324,6 +377,9 @@ impl App {
         Ok(Self {
             paths,
             config,
+            arch,
+            env_layer,
+            settings,
             registry,
             status,
             active_model,
@@ -358,6 +414,20 @@ impl App {
             dashboard_worker,
             queued_send: None,
         })
+    }
+
+    /// Rebuild the Settings rows from disk, the loaded registry and the
+    /// captured environment layer (after a config write or an active-model
+    /// change).
+    pub fn rebuild_settings(&mut self) {
+        let registry_v1 = settings_model::registry_v1(&self.registry);
+        self.settings = SettingsModel::build(
+            &self.paths,
+            &self.active_model,
+            &registry_v1,
+            &self.arch,
+            &self.env_layer,
+        );
     }
 
     /// Mirror the latest serve.log tail from the background tailer, and tell it
@@ -791,6 +861,7 @@ impl App {
         let expanded = self.registry.expanded_groups.clone();
         self.registry = RegistryState::load(&self.paths);
         self.registry.expanded_groups = expanded;
+        self.rebuild_settings();
         // Preserve the live overlay (serve health / gpu_lines) already mirrored
         // from the workers; only the local fields are refreshed.
         let mut status = StatusState::load_local(&self.paths);
@@ -1624,6 +1695,7 @@ impl App {
                     self.config.overrides.insert(key.to_string());
                 }
                 self.config.loaded_from_disk = true;
+                self.rebuild_settings();
                 self.toast_info(format!("{key} saved"));
                 (
                     true,
@@ -1646,6 +1718,8 @@ impl App {
     /// reset can't change them.
     fn reload_config_after_reset(&mut self) {
         let prev_key = self.selected_setting_key();
+        // The config on disk changed under the Settings rows.
+        self.rebuild_settings();
         self.config = ConfigState::load(&self.paths);
         // Follow the previously-selected key to its new row, else clamp in range.
         let restored = prev_key.and_then(|k| self.settings_key_index(&k));
@@ -4167,11 +4241,13 @@ mod tests {
             app.last_reload
         );
         assert!(!app.last_reload.contains("elsewhere"));
-        // An advanced key with no inline editor.
-        select_advanced(&mut app, "kv_backend");
+        // An advanced key with no inline editor. Every non-deprecated schema key
+        // is editable now (kind derived from its rule), so only a deprecated
+        // key is left read-only.
+        select_advanced(&mut app, "cask");
         app.handle_settings_key(key(KeyCode::Enter));
         assert!(
-            app.last_reload.contains("hipfire config set kv_backend"),
+            app.last_reload.contains("hipfire config set cask"),
             "{}",
             app.last_reload
         );
@@ -4384,5 +4460,58 @@ mod tests {
             Some("pull not started")
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `load_from_paths` reads only what it is handed: a fixture root, an
+    /// injected GPU/model context and an injected environment layer.
+    #[test]
+    fn load_from_paths_uses_the_injected_arch_env_and_root() {
+        use hipfire_config::{
+            effective::{A8Prefill, Origin},
+            ConfigValue,
+        };
+        let _guard = crate::hipfire::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("HIPFIRE_NO_REGISTRY_FETCH", "1");
+        let root = std::env::temp_dir().join(format!(
+            "hipfire-tui-load-from-paths-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("config.toml"), "[reasoning]\neffort = \"low\"\n").unwrap();
+        let arch = ArchCtx {
+            gpu_arch: Some("gfx1151".into()),
+            gpu_count: 1,
+            model_arch_id: Some(5),
+            registry_tag: Some("qwen3.8:27b".into()),
+            a8_prefill: A8Prefill::NotLanded,
+        };
+        let mut env = hipfire_config::ConfigLayer::default();
+        env.set("memory.kv_cache", ConfigValue::String("q8".into()))
+            .unwrap();
+
+        let app =
+            App::load_from_paths(HipfirePaths::under(root.clone()), arch.clone(), env.clone())
+                .unwrap();
+        std::env::remove_var("HIPFIRE_NO_REGISTRY_FETCH");
+        assert_eq!(app.arch, arch);
+        assert_eq!(app.env_layer, env);
+        assert_eq!(app.paths.root, root);
+        let row = |key: &str| {
+            app.settings
+                .rows
+                .iter()
+                .find(|row| row.id.key() == Some(key))
+                .unwrap_or_else(|| panic!("no row {key}"))
+        };
+        assert_eq!(row("reasoning.effort").display, "low");
+        assert_eq!(row("reasoning.effort").origin, Origin::You);
+        assert_eq!(
+            row("memory.kv_cache").origin,
+            Origin::Env("HIPFIRE_KV_MODE".into())
+        );
+        assert!(row("memory.kv_cache").locked.is_some());
+        let _ = std::fs::remove_dir_all(root);
     }
 }
