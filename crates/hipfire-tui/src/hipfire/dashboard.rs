@@ -587,7 +587,12 @@ pub fn parse_stats(body: &str) -> Option<ServeStats> {
         .filter(|f| f.is_finite() && *f > 0.0);
     Some(ServeStats {
         model,
-        uptime_s: as_u64("uptime_s"),
+        // serve emits `uptime_sec`; `uptime_s` is the older test-fixture spelling.
+        uptime_s: v
+            .get("uptime_sec")
+            .or_else(|| v.get("uptime_s"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
         queue_depth: as_u64("queue_depth"),
         requests_served: as_u64("requests_served"),
         recent_tok_s,
@@ -1757,6 +1762,13 @@ mod tests {
         assert_eq!(s.queue_depth, 2);
         assert_eq!(s.requests_served, 42);
         assert_eq!(s.recent_tok_s, Some(151.24));
+    }
+
+    #[test]
+    fn stats_reads_serve_uptime_sec() {
+        // The real serve `/stats` spells it `uptime_sec` (serve/http.rs).
+        let b = r#"{"model":"q","uptime_sec":120,"queue_depth":0,"requests_served":0}"#;
+        assert_eq!(parse_stats(b).expect("parse").uptime_s, 120);
     }
 
     #[test]
