@@ -17,7 +17,7 @@ use hipfire_config::{
     apply_config_profile, canonical_config_key, create_config_profile, developer_env_for_key,
     field, fields, is_developer_key, load_catalog, load_env_layer, load_global, resolve,
     unknown_key, write_catalog_toml, write_global_toml, CatalogFormat, ConfigFormat, ConfigLayer,
-    ConfigPaths, ConfigSource, NamedLayer, ValueRule, CONFIG_SCHEMA_VERSION,
+    ConfigPaths, ConfigSource, NamedLayer, RemoveModelOverride, ValueRule, CONFIG_SCHEMA_VERSION,
 };
 use hipfire_registry::{
     load as load_registry, ExpertHotsetPin, GrandfatheredMonolithic, LoadedRegistry, ModelEntry,
@@ -1460,13 +1460,7 @@ fn model_config_command(
     action: Option<ConfigAction>,
 ) -> Result<()> {
     let registry = load_registry(&paths.registry).registry;
-    model_config_command_to(
-        paths,
-        &registry,
-        model_name,
-        action,
-        &mut std::io::stdout(),
-    )
+    model_config_command_to(paths, &registry, model_name, action, &mut std::io::stdout())
 }
 
 fn model_config_command_to(
@@ -1593,33 +1587,16 @@ fn model_config_command_to(
             if is_developer_key(&key) {
                 bail!("developer configuration is global process policy; omit the model argument");
             }
-            let mut loaded = load_catalog(&paths.config)?;
-            let id = loaded
-                .catalog
-                .model_id(model_name)
-                .map(str::to_owned)
-                .unwrap_or_else(|| tag.clone().unwrap_or_else(|| model_name.to_owned()));
-            let local_path = find_model_path(paths, registry, model_name);
-            let (canonical, saved) = {
-                let record = loaded.catalog.models.entry(id.clone()).or_default();
-                if record.path.is_none() {
-                    record.path = local_path;
-                }
-                if record.registry_tag.is_none() {
-                    record.registry_tag = tag.clone();
-                }
-                record.overrides.set_cli(&key, &value)?;
-                let schema = field(&key).ok_or_else(|| unknown_key(&key))?;
-                let saved = record
-                    .overrides
-                    .get(schema.key)
-                    .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?
-                    .clone();
-                (schema.key, saved)
-            };
-            write_catalog_toml(&paths.config, &loaded.catalog)?;
-            writeln!(out, "{id} {canonical} = {saved}")?;
-            if loaded.format == CatalogFormat::LegacyJson {
+            let saved = hipfire_config::set_model_override(
+                &paths.config,
+                tag.as_deref(),
+                find_model_path(paths, registry, model_name),
+                model_name,
+                &key,
+                &value,
+            )?;
+            writeln!(out, "{} {} = {}", saved.id, saved.key, saved.value)?;
+            if saved.migrated_legacy_json {
                 writeln!(
                     out,
                     "migrated model catalog to {}; preserved legacy JSON as rollback copies",
@@ -1632,27 +1609,21 @@ fn model_config_command_to(
             if key.as_deref().is_some_and(is_developer_key) {
                 bail!("developer configuration is global process policy; omit the model argument");
             }
-            let mut loaded = load_catalog(&paths.config)?;
-            let Some(id) = loaded.catalog.model_id(model_name).map(str::to_owned) else {
-                writeln!(out, "{model_name} has no per-model overrides")?;
-                return Ok(());
-            };
-            let record = loaded.catalog.models.get_mut(&id).ok_or_else(|| {
-                anyhow!("model '{model_name}' has no catalog entry for id '{id}'")
-            })?;
-            if let Some(key) = key {
-                let schema = field(&key).ok_or_else(|| unknown_key(&key))?;
-                let existed = record.overrides.remove(schema.key)?.is_some();
-                if existed {
-                    writeln!(out, "{id} {} override removed", schema.key)?;
-                } else {
-                    writeln!(out, "{id} {} was already inherited", schema.key)?;
+            match hipfire_config::remove_model_override(&paths.config, model_name, key.as_deref())?
+            {
+                RemoveModelOverride::NoOverrides => {
+                    writeln!(out, "{model_name} has no per-model overrides")?
                 }
-            } else {
-                record.overrides = ConfigLayer::default();
-                writeln!(out, "all {id} overrides removed")?;
+                RemoveModelOverride::KeyRemoved { id, key } => {
+                    writeln!(out, "{id} {key} override removed")?
+                }
+                RemoveModelOverride::KeyInherited { id, key } => {
+                    writeln!(out, "{id} {key} was already inherited")?
+                }
+                RemoveModelOverride::AllRemoved { id } => {
+                    writeln!(out, "all {id} overrides removed")?
+                }
             }
-            write_catalog_toml(&paths.config, &loaded.catalog)?;
             Ok(())
         }
         ConfigAction::Explain { key, output } => {
@@ -4077,60 +4048,22 @@ pub(crate) fn resolved_for_model(
     tag: Option<&str>,
     entry: Option<&ModelEntry>,
 ) -> Result<hipfire_config::ResolvedConfig> {
-    let loaded = load_global(&paths.config)?;
+    let resolved = hipfire_registry::resolve_for_model(
+        &paths.config,
+        model_name,
+        tag.zip(entry),
+        load_env_layer()?,
+    )?;
     // config.toml warnings name retired keys the load ignored. serve resolves
     // per model load, so report them once per process; legacy JSON migration
     // notes stay with the `config` commands.
-    if loaded.format == ConfigFormat::Toml {
-        static REPORTED: std::sync::Once = std::sync::Once::new();
-        REPORTED.call_once(|| {
-            for warning in &loaded.warnings {
-                eprintln!("warning: {warning}");
-            }
-        });
-    }
-    let mut layers = Vec::new();
-    if let (Some(tag), Some(entry)) = (tag, entry) {
-        layers.push(NamedLayer {
-            source: ConfigSource::RegistryModel {
-                tag: tag.to_owned(),
-                revision: "v1".into(),
-            },
-            layer: hipfire_registry::config_layer_for_tag(tag, entry)
-                .map_err(|error| anyhow!("invalid registry model defaults: {error}"))?,
-        });
-    }
-    layers.push(NamedLayer {
-        source: ConfigSource::GlobalUser { path: loaded.path },
-        layer: loaded.layer,
-    });
-    let catalog = load_catalog(&paths.config)?;
-    let model_override = catalog
-        .catalog
-        .model(model_name)
-        .or_else(|| tag.and_then(|tag| catalog.catalog.model(tag)))
-        .or_else(|| entry.and_then(|entry| catalog.catalog.model(entry.file.as_str())));
-    if let Some((model_id, model)) = model_override {
-        if !model.overrides.values.is_empty() {
-            layers.push(NamedLayer {
-                source: ConfigSource::ModelUser {
-                    model: model_id.to_owned(),
-                    path: catalog.path,
-                },
-                layer: model.overrides.clone(),
-            });
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    REPORTED.call_once(|| {
+        for warning in &resolved.warnings {
+            eprintln!("warning: {warning}");
         }
-    }
-    let env_layer = load_env_layer()?;
-    if !env_layer.values.is_empty() {
-        layers.push(NamedLayer {
-            source: ConfigSource::LegacyEnv {
-                name: "HIPFIRE_*".into(),
-            },
-            layer: env_layer,
-        });
-    }
-    Ok(resolve(layers)?)
+    });
+    Ok(resolved.resolved)
 }
 
 /// How [`scan_local_models`] compares an input against on-disk filenames.
@@ -11356,11 +11289,7 @@ mod tests {
                 key: Some("no.such.key".into()),
             },
         );
-        step(
-            "reset all",
-            "qwen3:8b",
-            ConfigAction::Reset { key: None },
-        );
+        step("reset all", "qwen3:8b", ConfigAction::Reset { key: None });
         step(
             "reset model without overrides",
             "never-seen",

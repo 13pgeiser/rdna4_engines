@@ -9,7 +9,10 @@
 //! cache, network, stale cache, then bundled. A malformed registry is rejected
 //! wholesale; model code never consumes a partially validated catalog.
 
-use hipfire_config::{ConfigLayer, ConfigValue};
+use hipfire_config::{
+    load_catalog, load_global, resolve, ConfigFormat, ConfigLayer, ConfigPaths, ConfigSource,
+    ConfigValue, NamedLayer, ResolvedConfig,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -147,6 +150,10 @@ pub enum RegistryError {
         #[source]
         source: std::io::Error,
     },
+    #[error("invalid registry model defaults: {0}")]
+    ModelDefaults(String),
+    #[error(transparent)]
+    Config(#[from] hipfire_config::ConfigError),
 }
 
 pub type Result<T> = std::result::Result<T, RegistryError>;
@@ -707,6 +714,84 @@ pub fn config_layer_for_tag(
             .map_err(|error| error.to_string())?;
     }
     Ok(layer)
+}
+
+/// Result of [`resolve_for_model`].
+#[derive(Clone, Debug)]
+pub struct ResolvedForModel {
+    /// Layers merged built-in → registry card → global → model → env.
+    pub resolved: ResolvedConfig,
+    /// `config.toml` warnings (retired keys the load ignored). Empty unless the
+    /// global config is TOML; legacy-JSON migration notes stay with `config`.
+    pub warnings: Vec<String>,
+    /// `models.toml` identity whose overrides matched the model, if any.
+    pub model_id: Option<String>,
+}
+
+/// Resolve the effective configuration for one model.
+///
+/// Layer order, lowest first: registry card defaults (`card` is the registry
+/// tag with its entry), global `config.toml`, the `models.toml` entry (found by
+/// `model_name`, then the card's tag, then the card's file), and `env` when it
+/// holds any value.
+pub fn resolve_for_model(
+    paths: &ConfigPaths,
+    model_name: &str,
+    card: Option<(&str, &ModelEntry)>,
+    env: ConfigLayer,
+) -> Result<ResolvedForModel> {
+    let loaded = load_global(paths)?;
+    let warnings = if loaded.format == ConfigFormat::Toml {
+        loaded.warnings
+    } else {
+        Vec::new()
+    };
+    let mut layers = Vec::new();
+    if let Some((tag, entry)) = card {
+        layers.push(NamedLayer {
+            source: ConfigSource::RegistryModel {
+                tag: tag.to_owned(),
+                revision: "v1".into(),
+            },
+            layer: config_layer_for_tag(tag, entry).map_err(RegistryError::ModelDefaults)?,
+        });
+    }
+    layers.push(NamedLayer {
+        source: ConfigSource::GlobalUser { path: loaded.path },
+        layer: loaded.layer,
+    });
+    let catalog = load_catalog(paths)?;
+    let model_override = catalog
+        .catalog
+        .model(model_name)
+        .or_else(|| card.and_then(|(tag, _)| catalog.catalog.model(tag)))
+        .or_else(|| card.and_then(|(_, entry)| catalog.catalog.model(entry.file.as_str())));
+    let mut model_id = None;
+    if let Some((id, model)) = model_override {
+        model_id = Some(id.to_owned());
+        if !model.overrides.values.is_empty() {
+            layers.push(NamedLayer {
+                source: ConfigSource::ModelUser {
+                    model: id.to_owned(),
+                    path: catalog.path.clone(),
+                },
+                layer: model.overrides.clone(),
+            });
+        }
+    }
+    if !env.values.is_empty() {
+        layers.push(NamedLayer {
+            source: ConfigSource::LegacyEnv {
+                name: "HIPFIRE_*".into(),
+            },
+            layer: env,
+        });
+    }
+    Ok(ResolvedForModel {
+        resolved: resolve(layers)?,
+        warnings,
+        model_id,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -4315,5 +4400,120 @@ mod tests {
         }"#;
         RegistryV1::parse(sidecars, "test")
             .expect("draft/dflash sidecars must allow thinking_budget");
+    }
+
+    fn resolve_fixture_registry() -> RegistryV1 {
+        RegistryV1::parse(
+            r#"{
+                "schema_version":1,
+                "generated_at":"2026-09-01T00:00:00Z",
+                "models":{"qwen3.5:4b":{"repo":"x","file":"qwen3.5-4b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+                "aliases":{}
+            }"#,
+            "test",
+        )
+        .unwrap()
+    }
+
+    fn max_tokens(resolved: &ResolvedForModel) -> (ConfigValue, ConfigSource) {
+        let item = resolved.resolved.get("generation.max_tokens").unwrap();
+        (item.value.clone(), item.source.clone())
+    }
+
+    #[test]
+    fn resolve_for_model_layers_registry_global_model_env_in_order() {
+        let dir = RegistryTestDir::new();
+        let paths = ConfigPaths::under(&dir.0);
+        let registry = resolve_fixture_registry();
+        let (tag, entry) = registry.model("qwen3.5:4b").unwrap();
+        let card = Some((tag, entry));
+
+        let resolved = resolve_for_model(&paths, tag, card, ConfigLayer::default()).unwrap();
+        let (value, source) = max_tokens(&resolved);
+        assert_eq!(value, ConfigValue::Integer(81920));
+        assert!(matches!(source, ConfigSource::RegistryModel { .. }));
+        assert_eq!(resolved.model_id, None);
+        assert!(resolved.warnings.is_empty());
+
+        fs::write(&paths.config_toml, "[generation]\nmax_tokens = 1234\n").unwrap();
+        let resolved = resolve_for_model(&paths, tag, card, ConfigLayer::default()).unwrap();
+        let (value, source) = max_tokens(&resolved);
+        assert_eq!(value, ConfigValue::Integer(1234));
+        assert!(matches!(source, ConfigSource::GlobalUser { .. }));
+
+        hipfire_config::set_model_override(
+            &paths,
+            Some(tag),
+            None,
+            tag,
+            "generation.max_tokens",
+            "777",
+        )
+        .unwrap();
+        let resolved = resolve_for_model(&paths, tag, card, ConfigLayer::default()).unwrap();
+        let (value, source) = max_tokens(&resolved);
+        assert_eq!(value, ConfigValue::Integer(777));
+        assert!(matches!(source, ConfigSource::ModelUser { .. }));
+        assert_eq!(resolved.model_id.as_deref(), Some(tag));
+
+        let mut env_layer = ConfigLayer::default();
+        env_layer
+            .set("generation.max_tokens", ConfigValue::Integer(555))
+            .unwrap();
+        let resolved = resolve_for_model(&paths, tag, card, env_layer).unwrap();
+        let (value, source) = max_tokens(&resolved);
+        assert_eq!(value, ConfigValue::Integer(555));
+        assert!(matches!(source, ConfigSource::LegacyEnv { .. }));
+
+        // Without the card the registry layer is absent and the model entry is
+        // still found by name.
+        let resolved = resolve_for_model(&paths, tag, None, ConfigLayer::default()).unwrap();
+        assert_eq!(max_tokens(&resolved).0, ConfigValue::Integer(777));
+    }
+
+    #[test]
+    fn resolve_for_model_finds_the_model_entry_by_tag_and_by_entry_file() {
+        let registry = resolve_fixture_registry();
+        let (tag, entry) = registry.model("qwen3.5:4b").unwrap();
+
+        // By registry tag: the caller named the model some other way.
+        let dir = RegistryTestDir::new();
+        let paths = ConfigPaths::under(&dir.0);
+        hipfire_config::set_model_override(&paths, None, None, tag, "generation.max_tokens", "777")
+            .unwrap();
+        let resolved = resolve_for_model(
+            &paths,
+            "my-local-name",
+            Some((tag, entry)),
+            ConfigLayer::default(),
+        )
+        .unwrap();
+        assert_eq!(resolved.model_id.as_deref(), Some(tag));
+        assert_eq!(max_tokens(&resolved).0, ConfigValue::Integer(777));
+        let unmatched =
+            resolve_for_model(&paths, "my-local-name", None, ConfigLayer::default()).unwrap();
+        assert_eq!(unmatched.model_id, None);
+
+        // By the entry's file name.
+        let dir = RegistryTestDir::new();
+        let paths = ConfigPaths::under(&dir.0);
+        hipfire_config::set_model_override(
+            &paths,
+            None,
+            None,
+            &entry.file,
+            "generation.max_tokens",
+            "888",
+        )
+        .unwrap();
+        let resolved = resolve_for_model(
+            &paths,
+            "my-local-name",
+            Some((tag, entry)),
+            ConfigLayer::default(),
+        )
+        .unwrap();
+        assert_eq!(resolved.model_id.as_deref(), Some(entry.file.as_str()));
+        assert_eq!(max_tokens(&resolved).0, ConfigValue::Integer(888));
     }
 }

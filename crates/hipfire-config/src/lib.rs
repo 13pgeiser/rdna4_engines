@@ -68,6 +68,9 @@ pub enum ConfigError {
     },
     #[error("{0}")]
     Home(String),
+    /// Catalog state that cannot be edited as requested.
+    #[error("{0}")]
+    Catalog(String),
 }
 
 pub type Result<T> = std::result::Result<T, ConfigError>;
@@ -5411,27 +5414,146 @@ pub fn write_catalog_toml(paths: &ConfigPaths, catalog: &ModelCatalog) -> Result
     atomic_write(&paths.models_toml, rendered.as_bytes())
 }
 
+/// Whether `key` may appear in a per-model override layer.
+///
+/// Developer keys are global process policy; process/diagnostic scoped fields
+/// are not valid per model. This is the per-key rule `models.toml` validation
+/// applies to every override.
+pub fn model_override_allowed(key: &str) -> Result<()> {
+    if is_developer_key(key) {
+        return Err(ConfigError::InvalidValue {
+            key: key.to_owned(),
+            message: "developer fields are global process policy and not valid per-model".into(),
+        });
+    }
+    let Some(schema) = field(key) else {
+        return Err(unknown_key(key));
+    };
+    if matches!(schema.scope, ConfigScope::Process | ConfigScope::Diagnostic) {
+        return Err(ConfigError::InvalidValue {
+            key: key.to_owned(),
+            message: "field is not valid in a per-model override".into(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_model_layer(layer: &ConfigLayer) -> Result<()> {
     layer.validate()?;
     for key in layer.values.keys() {
-        if is_developer_key(key) {
-            return Err(ConfigError::InvalidValue {
-                key: key.clone(),
-                message: "developer fields are global process policy and not valid per-model"
-                    .into(),
-            });
-        }
-        let Some(schema) = field(key) else {
-            return Err(unknown_key(key));
-        };
-        if matches!(schema.scope, ConfigScope::Process | ConfigScope::Diagnostic) {
-            return Err(ConfigError::InvalidValue {
-                key: key.clone(),
-                message: "field is not valid in a per-model override".into(),
-            });
-        }
+        model_override_allowed(key)?;
     }
     Ok(())
+}
+
+/// What [`set_model_override`] saved, for the caller to report.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetModelOverride {
+    /// Catalog identity the override was written under.
+    pub id: String,
+    /// Canonical key that was set.
+    pub key: &'static str,
+    /// Value as stored in the override layer.
+    pub value: ConfigValue,
+    /// The catalog was read from legacy JSON and has now been written as TOML.
+    pub migrated_legacy_json: bool,
+}
+
+/// Outcome of [`remove_model_override`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoveModelOverride {
+    /// The catalog has no entry for the model; nothing was written.
+    NoOverrides,
+    /// The key's override was removed.
+    KeyRemoved { id: String, key: &'static str },
+    /// The key had no override; the catalog was rewritten unchanged.
+    KeyInherited { id: String, key: &'static str },
+    /// Every override of the model was removed.
+    AllRemoved { id: String },
+}
+
+/// Set one per-model override and write `models.toml`.
+///
+/// The catalog id is the existing identity for `model`, else `registry_tag`,
+/// else `model` itself. `local_path` and `registry_tag` backfill the record
+/// only when it has none.
+pub fn set_model_override(
+    paths: &ConfigPaths,
+    registry_tag: Option<&str>,
+    local_path: Option<PathBuf>,
+    model: &str,
+    key: &str,
+    raw: &str,
+) -> Result<SetModelOverride> {
+    let mut loaded = load_catalog(paths)?;
+    let id = loaded
+        .catalog
+        .model_id(model)
+        .map(str::to_owned)
+        .unwrap_or_else(|| registry_tag.unwrap_or(model).to_owned());
+    let (canonical, saved) = {
+        let record = loaded.catalog.models.entry(id.clone()).or_default();
+        if record.path.is_none() {
+            record.path = local_path;
+        }
+        if record.registry_tag.is_none() {
+            record.registry_tag = registry_tag.map(str::to_owned);
+        }
+        record.overrides.set_cli(key, raw)?;
+        let schema = field(key).ok_or_else(|| unknown_key(key))?;
+        let saved = record
+            .overrides
+            .get(schema.key)
+            .ok_or_else(|| {
+                ConfigError::Catalog(format!("configuration key '{}' is not set", schema.key))
+            })?
+            .clone();
+        (schema.key, saved)
+    };
+    write_catalog_toml(paths, &loaded.catalog)?;
+    Ok(SetModelOverride {
+        id,
+        key: canonical,
+        value: saved,
+        migrated_legacy_json: loaded.format == CatalogFormat::LegacyJson,
+    })
+}
+
+/// Remove one per-model override (`key`) or all of them (`None`) and write
+/// `models.toml`. A model with no catalog entry writes nothing.
+pub fn remove_model_override(
+    paths: &ConfigPaths,
+    model: &str,
+    key: Option<&str>,
+) -> Result<RemoveModelOverride> {
+    let mut loaded = load_catalog(paths)?;
+    let Some(id) = loaded.catalog.model_id(model).map(str::to_owned) else {
+        return Ok(RemoveModelOverride::NoOverrides);
+    };
+    let record = loaded.catalog.models.get_mut(&id).ok_or_else(|| {
+        ConfigError::Catalog(format!(
+            "model '{model}' has no catalog entry for id '{id}'"
+        ))
+    })?;
+    let outcome = if let Some(key) = key {
+        let schema = field(key).ok_or_else(|| unknown_key(key))?;
+        if record.overrides.remove(schema.key)?.is_some() {
+            RemoveModelOverride::KeyRemoved {
+                id,
+                key: schema.key,
+            }
+        } else {
+            RemoveModelOverride::KeyInherited {
+                id,
+                key: schema.key,
+            }
+        }
+    } else {
+        record.overrides = ConfigLayer::default();
+        RemoveModelOverride::AllRemoved { id }
+    };
+    write_catalog_toml(paths, &loaded.catalog)?;
+    Ok(outcome)
 }
 
 fn load_legacy_catalog(paths: &ConfigPaths) -> Result<(ModelCatalog, Vec<String>)> {
@@ -6638,6 +6760,105 @@ mod tests {
             error.contains("not valid in a per-model override"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn model_override_allowed_applies_the_per_model_key_rule() {
+        assert!(model_override_allowed("reasoning.effort").is_ok());
+        let process = model_override_allowed("kernel.iu4_prefill")
+            .unwrap_err()
+            .to_string();
+        assert!(process.contains("kernel.iu4_prefill"), "{process}");
+        assert!(
+            process.contains("not valid in a per-model override"),
+            "{process}"
+        );
+        let developer = model_override_allowed("developer.qwen4_moe_sym_iu4")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            developer
+                .contains("developer fields are global process policy and not valid per-model"),
+            "{developer}"
+        );
+        assert!(matches!(
+            model_override_allowed("no.such.key"),
+            Err(ConfigError::UnknownKey(_))
+        ));
+    }
+
+    #[test]
+    fn set_and_remove_model_override_round_trip() {
+        let root = temp_root("model-override-round-trip");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let paths = ConfigPaths::under(&root);
+
+        let saved = set_model_override(
+            &paths,
+            Some("qwen3:8b"),
+            Some(PathBuf::from("/models/qwen3-8b.mq4")),
+            "qwen3:8b",
+            "reasoning.effort",
+            "high",
+        )
+        .unwrap();
+        assert_eq!(saved.id, "qwen3:8b");
+        assert_eq!(saved.key, "reasoning.effort");
+        assert_eq!(saved.value, ConfigValue::String("high".into()));
+        assert!(!saved.migrated_legacy_json);
+
+        let loaded = load_catalog(&paths).unwrap();
+        let record = &loaded.catalog.models["qwen3:8b"];
+        assert_eq!(record.registry_tag.as_deref(), Some("qwen3:8b"));
+        assert_eq!(
+            record.path.as_deref(),
+            Some(Path::new("/models/qwen3-8b.mq4"))
+        );
+        assert_eq!(
+            record.overrides.get("reasoning.effort"),
+            Some(&ConfigValue::String("high".into()))
+        );
+
+        assert_eq!(
+            remove_model_override(&paths, "qwen3:8b", Some("reasoning.effort")).unwrap(),
+            RemoveModelOverride::KeyRemoved {
+                id: "qwen3:8b".into(),
+                key: "reasoning.effort"
+            }
+        );
+        assert_eq!(
+            remove_model_override(&paths, "qwen3:8b", Some("reasoning.effort")).unwrap(),
+            RemoveModelOverride::KeyInherited {
+                id: "qwen3:8b".into(),
+                key: "reasoning.effort"
+            }
+        );
+        set_model_override(&paths, None, None, "qwen3:8b", "reasoning.effort", "low").unwrap();
+        assert_eq!(
+            remove_model_override(&paths, "qwen3:8b", None).unwrap(),
+            RemoveModelOverride::AllRemoved {
+                id: "qwen3:8b".into()
+            }
+        );
+        assert!(load_catalog(&paths).unwrap().catalog.models["qwen3:8b"]
+            .overrides
+            .values
+            .is_empty());
+        assert_eq!(
+            remove_model_override(&paths, "never-seen", None).unwrap(),
+            RemoveModelOverride::NoOverrides
+        );
+        assert!(matches!(
+            remove_model_override(&paths, "qwen3:8b", Some("no.such.key")),
+            Err(ConfigError::UnknownKey(_))
+        ));
+
+        // A process-scoped key is rejected when the catalog is written.
+        assert!(
+            set_model_override(&paths, None, None, "qwen3:8b", "kernel.iu4_prefill", "0").is_err()
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// The cached lookup behind `process_value` answers exactly what the
