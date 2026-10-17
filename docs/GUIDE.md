@@ -268,6 +268,7 @@ and runs.
 | `llama_fp8`, `llama_dense_fp8` | LLaMA-shaped decoders: MiniCPM5, Llama 3, anything reporting `model_type: llama` |
 | `qwen35_bf16` | Qwen3.5 / 3.6 / 3.8 dense (0.8B–27B), bf16 |
 | `qwen35_fp8` | the same, block-scaled fp8 |
+| `qwen35_w8a8` | the same, an int8 trunk rotated by a 128-wide Hadamard |
 | `qwen35moe_fp8` | Qwen3.5 / 3.6 MoE (35B-A3B), 256 experts, 8 a token |
 | `qwen4exp_fp8` | Qwen4-Exp / Qwen3.8-Flash-Next: hybrid Gated DeltaNet + gated attention, 512 experts |
 | `gemma4` | Gemma 4 text decoders (26B-A4B MoE and the dense members): bf16 trunk, routed experts bf16 or block fp8, and the DFlash drafter |

@@ -464,6 +464,12 @@ extern "C" int rad_memset_async(void* dst, int value, int64_t bytes, RadStream s
 #undef QWEN35_NS
 #undef QWEN35_ARCH_ID
 #include "../arch/qwen35moe_fp8/qwen35moe_fp8.cpp"
+/* The same source a third time, as qwen35_w8a8: the int8 trunk. */
+#undef QWEN35_MOE
+#undef QWEN35_W8A8
+#undef QWEN35_NS
+#undef QWEN35_ARCH_ID
+#include "../arch/qwen35_w8a8/qwen35_w8a8.cpp"
 /* The LLaMA family from a dense checkpoint: llama_fp8 under its other descriptor. */
 #undef LLAMA_DENSE_SRC
 #undef LLAMA_NS
@@ -5939,6 +5945,126 @@ TEST(the_qwen35_family_refuses_a_layer_schedule_that_contradicts_its_interval) {
              RAD_E_UNSUPPORTED);
 }
 
+/* ==================================================================== qwen35_w8a8 */
+
+namespace {
+
+/* The dense fixture as data/recipes/q38-27b-w8a8-df2.recipe states it: w8a8 / fwht128. */
+MetaKV q35w8a8_meta() {
+    MetaKV k = q35fp8_meta();
+    k.m.quant = "w8a8_fwht128";
+    k.m.name  = "test-qwen35-27b-w8a8";
+    k.set("quantization_config.quant_method", "w8a8").set("quantization_config.fmt", "fwht128");
+    return k;
+}
+
+/* The recipe's encodings by declared name: the eight trunk linears int8 (`/fwht128` unless
+ * `rotated` is false, which the plugin refuses), an int8 lm_head, and the DFlash2 drafter's MXFP4
+ * linears with its 2-bit head. The drafter's keys come first because its names contain the
+ * trunk's (dflash.blk.0.attn_k.weight), and the head's last because `output.weight` is in
+ * `attn_output.weight`. */
+void w8a8_encs(RadBuilder* b, bool rotated = true) {
+    RadEncoding i8 = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+    if (rotated) rad_enc_copy_str(i8.transform, "fwht128");
+    RadEncoding u2 = rad_enc_affine(RAD_U2, RAD_F16, 1, 128);
+    rad_enc_add_plane(&u2, "zero", RAD_U8, 1, 128);
+    b->encs = { { "dflash.draft_head", u2 },
+                { "dflash.", rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32) } };
+    for (const char* t : { "attn_qg.weight", "attn_k.weight", "attn_v.weight",
+                           "attn_output.weight", "ssm_inz.weight", "ssm_out.weight",
+                           "ffn_gate_up.weight", "ffn_down.weight" })
+        b->encs.push_back({ t, i8 });
+    b->encs.push_back({ "output.weight", rad_enc_affine(RAD_I8, RAD_BF16, 1, 128) });
+}
+
+/* qwen35_w8a8::declare with the recipe's encodings, in lint_qwen35_fp8_family's shape. */
+int w8a8_declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
+    w8a8_encs(b);
+    return qwen35_w8a8::declare(b, meta, ctx);
+}
+
+}  /* namespace */
+
+/* Every trunk linear of a rotated int8 container is an i8a8h GEMM right behind its own
+ * had_quant_act_i8g, at one rank and two: 2 attention layers of four linears, 6 delta-net layers
+ * of two and 8 feed-forwards of two. None is left at fp8, which is what a linear that missed the
+ * encoding falls back to, and the MLP declares no gated fold (an fp8a8 tile over E4M3 codes). The
+ * four trunk activations carry an int8 pair; the delta net's `gdn_in` feeds no int8 linear. */
+TEST(qwen35_w8a8_serves_every_trunk_linear_rotated_int8) {
+    MetaKV mk = q35w8a8_meta();
+    for (int world : { 1, 2 }) {
+        RadBuilder b;
+        w8a8_encs(&b);
+        RadBuildCtx ctx = build_ctx(0, world);
+        REQUIRE_EQ(qwen35_w8a8::declare(&b, mk.meta(), &ctx), RAD_OK);
+        int rot = 0, paired = 0;
+        for (size_t i = 0; i < b.ops.size(); ++i) {
+            const RecOp& o = b.ops[i];
+            if (o.op != "gemm_nt_q") continue;
+            CHECK_EQ(pstr(&o, "dtype"), std::string("i8a8h"));
+            if (pstr(&o, "dtype") != "i8a8h") continue;
+            ++rot;
+            paired += i > 0 && b.ops[i - 1].op == "had_quant_act_i8g";
+        }
+        CHECK_EQ(rot, 2 * 4 + 6 * 2 + 8 * 2);
+        CHECK_EQ(paired, rot);
+        CHECK_EQ(count_op(b, "quant_act_i8g"), 0);
+        CHECK_EQ(count_op(b, "gemm_nt_q_gated"), 0);
+        for (const char* a : { "h.q8", "attn_out.q8", "gdn_o.q8", "ffn.q8" })
+            CHECK(find_b(b, a) != nullptr);
+        CHECK(find_b(b, "gdn_in.q8") == nullptr);
+    }
+}
+
+/* What the int8 build refuses: a trunk that is not int8 (no stated encoding, which a block-fp8
+ * plugin reads as fp8), a plain int8 trunk (the descriptor names the rotation, and a plain weight
+ * served behind the rotated quantiser would be wrong), and a container stated for another format
+ * or without the rotation's `fmt`. */
+TEST(qwen35_w8a8_refuses_what_is_not_a_rotated_int8_trunk) {
+    RadBuildCtx ctx = build_ctx();
+    {
+        MetaKV mk = q35w8a8_meta();
+        RadBuilder b;
+        CHECK_EQ(stderr_of_rc([&] { return qwen35_w8a8::declare(&b, mk.meta(), &ctx); }),
+                 RAD_E_DTYPE);
+    }
+    {
+        MetaKV mk = q35w8a8_meta();
+        RadBuilder b;
+        w8a8_encs(&b, false);
+        CHECK_EQ(stderr_of_rc([&] { return qwen35_w8a8::declare(&b, mk.meta(), &ctx); }),
+                 RAD_E_DTYPE);
+    }
+    {
+        MetaKV mk = q35w8a8_meta();
+        mk.set("quantization_config.quant_method", "fp8").set("quantization_config.fmt", "e4m3");
+        RadBuilder b;
+        w8a8_encs(&b);
+        CHECK_EQ(stderr_of_rc([&] { return qwen35_w8a8::declare(&b, mk.meta(), &ctx); }),
+                 RAD_E_UNSUPPORTED);
+    }
+    {
+        MetaKV mk = q35w8a8_meta();
+        mk.drop("quantization_config.fmt");
+        RadBuilder b;
+        w8a8_encs(&b);
+        CHECK_EQ(stderr_of_rc([&] { return qwen35_w8a8::declare(&b, mk.meta(), &ctx); }),
+                 RAD_E_UNSUPPORTED);
+    }
+}
+
+/* Every engine step lints clean at one and two ranks, with the MTP head's passes and with the
+ * DFlash2 drafter's, whose depth the probe fixes at its trained block as qwen35_fp8's does. */
+TEST(qwen35_w8a8_steps_lint_clean_with_its_mtp_head_and_a_dflash2_drafter) {
+    MetaKV mtp = q35w8a8_meta();
+    lint_qwen35_fp8_family(w8a8_declare, qwen35_w8a8::step, mtp.meta(), 3, false, 0);
+    MetaKV df = with_dflash2(q35w8a8_meta());
+    lint_qwen35_fp8_family(w8a8_declare, qwen35_w8a8::step, df.meta(), 7, true, 8);
+    RadArchProbe p{};
+    CHECK_OK(qwen35_w8a8::probe(df.meta(), &p));
+    CHECK_EQ(p.draft_depth, 7);
+}
+
 /* ==================================================================== llama_fp8 and DSpark */
 
 namespace {
@@ -6805,6 +6931,7 @@ struct ArchCase {
 /* Every architecture in the tree, at the fixtures above. */
 struct ArchCases {
     MetaKV q35 = q35fp8_meta(), q35df = with_dflash2(q35fp8_meta()), q35moe = q35moe_meta();
+    MetaKV q35w8df = with_dflash2(q35w8a8_meta());
     MetaKV lla = with_dspark(llama_meta()), eg2 = eg2_meta(), qimg = qimg_meta();
     MetaKV q4s = q4_small();
     RadModelMeta q35b = qwen35_meta(), q4 = *q4s.meta(), lfm = lfm2_meta();
@@ -6843,6 +6970,12 @@ struct ArchCases {
         add("qwen35_fp8 + DFlash2", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 7); return qwen35_fp8::declare(b, q35df.meta(), &c); },
             qwen35_fp8::step, 7, {}, 0xb5691456a0ce7e9dull);
+        add("qwen35_w8a8 + DFlash2", [this, sc](RadBuilder* b) {
+                auto c = sc(1, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
+            qwen35_w8a8::step, 7, {}, 0x88e964c824896422ull);
+        add("qwen35_w8a8 + DFlash2, two ranks", [this, sc](RadBuilder* b) {
+                auto c = sc(2, 7); return w8a8_declare(b, q35w8df.meta(), &c); },
+            nullptr, 7, { "ar_rmsnorm_quant_fp8" }, 0x7c73e987c475e40dull);
         add("qwen35moe_fp8 + MTP", [this, sc](RadBuilder* b) {
                 auto c = sc(1, 3); return qwen35moe_fp8::declare(b, q35moe.meta(), &c); },
             qwen35moe_fp8::step, 3, {}, 0x3157a986f13a9a72ull);

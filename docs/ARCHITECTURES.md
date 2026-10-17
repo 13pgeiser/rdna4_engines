@@ -11,6 +11,7 @@ plugin claims.
 | `arch/llama_dense_fp8` | `llama` | *(empty)* | the same graph from a bf16 checkpoint, linears made block fp8 by a recipe or kept bf16. MiniCPM5-2B |
 | `arch/qwen35_bf16` | `qwen35` | *(empty)* | the Qwen3.5/3.6/3.8 dense hybrid, served bf16 |
 | `arch/qwen35_fp8` | `qwen35` | `fp8_e4m3` | the same, block-scaled FP8 weights and activations |
+| `arch/qwen35_w8a8` | `qwen35` | `w8a8_fwht128` | `qwen35_fp8` with an int8 trunk: i8 weights with a bf16 scale per 128 of K, rotated by a 128-wide Hadamard, against int8 activations under the same rotation (`data/recipes/q38-27b-w8a8-df2.recipe`) |
 | `arch/qwen35moe_fp8` | `qwen35moe` | `fp8_e4m3` | `qwen35_fp8` with the feed-forward routed |
 | `arch/qwen4exp_fp8` | `qwen4exp` | *(empty)* | Qwen4-Exp (Qwen3.8-Flash-Next), a bf16 checkpoint quantised at convert |
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16, one rank |
@@ -234,6 +235,29 @@ gated delta net, the layer schedule, the rope, the vocabulary edges and the MTP 
 and every difference is behind `#if QWEN35_MOE` in the shared source. It is a second translation
 unit rather than a branch on `n_expert` because the id is half the selection key, and one `.so`
 cannot claim both ids.
+
+## `qwen35_w8a8`
+
+The dense build again, behind `#if QWEN35_W8A8`, for a container `data/recipes/q38-27b-w8a8-df2.recipe`
+converts from the bf16 checkpoint: the trunk's linears (the set Qwen's FP8 release quantises) as
+`i8*bf16[1x128]/fwht128`, each 128 of K rotated by the unnormalised Hadamard before rounding, served
+by `gemm_nt_q` at `i8a8h`. The descriptor `w8a8_fwht128` is what the convert's `--set` keys state;
+a probe of the first delta-net input projection holds the weights to it before the activations are
+declared, since only an int8 trunk gives them an int8 code pair. The descriptor names the rotation, so
+a plain int8 trunk is refused.
+
+- **The 1/128 is the weight's.** `had_quant_act_i8g` rotates the activation and folds nothing, as
+  `had_quant_act_fp8` does; the per-row `had_*_i8` forms fold 1/sqrt(128) into the activation's
+  scale and against this weight give an output sqrt(128) too small.
+- **The encoding is the only guard.** Rotated and plain int8 have the same bytes and extents, and
+  the rotated weight against the plain quantiser measures rel_l2 ~1.0 (r4d_selftest, `i8a8h_rot`),
+  so each dtype's layout hook takes only its own transform.
+- **Each rotated linear quantises its own input** from the bf16 plane its producer writes: q, k and
+  v quantise one input three times, and no producer writes rotated codes yet. The MLP's gated fold
+  is an fp8a8 tile over E4M3 codes, so an int8 gate_up runs the pair.
+- **It declines imported checkpoints** (`RAD_ARCH_SERVES_IMPORTS(0)`). An imported quantisation
+  goes to the family's one quantised plugin, and a second one would refuse every Quark, ParoQuant,
+  GPTQ or NVFP4 Qwen3.8 release; they stay with `qwen35_fp8`.
 
 ---
 

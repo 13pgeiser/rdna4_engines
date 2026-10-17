@@ -12,6 +12,7 @@
 #include <set>
 #include <string>
 #include <utility>
+#include <vector>
 
 using namespace rad;
 
@@ -90,7 +91,8 @@ TEST(the_shipped_architectures_load_with_distinct_selection_keys) {
         { "breeze", "" }, { "embeddinggemma2", "" }, { "gemma4", "" },
         { "gemma4", "compressed-tensors" }, { "lfm2", "" }, { "llama", "" }, { "llama", "fp8_e4m3" },
         { "qwen35", "" },
-        { "qwen35", "fp8_e4m3" }, { "qwen35moe", "fp8_e4m3" }, { "qwen3asr", "" },
+        { "qwen35", "fp8_e4m3" }, { "qwen35", "w8a8_fwht128" }, { "qwen35moe", "fp8_e4m3" },
+        { "qwen3asr", "" },
         { "minimaxh3", "" }, { "minimaxmusic3", "" }, { "qwen4exp", "" }, { "qwenimage21", "" } };
     std::set<std::pair<std::string, std::string>> got;
     for (const auto& [k, name] : keys) got.insert(k);
@@ -99,6 +101,34 @@ TEST(the_shipped_architectures_load_with_distinct_selection_keys) {
             fprintf(stderr, "    %s claims (%s, '%s')\n", name.c_str(), k.first.c_str(),
                     k.second.c_str());
     CHECK(got == want);
+}
+
+/* A checkpoint whose quantisation was imported weight by weight (Quark, ParoQuant, GPTQ, NVFP4)
+ * names a tool no plugin claims, so the family's one quantised plugin serves it, and two are
+ * refused (startup.h). So each family has at most one quantised plugin that takes imports:
+ * qwen35_w8a8 declines them (rad_arch_serves_imports), leaving Qwen3.8 imports to qwen35_fp8. */
+TEST(every_shipped_family_has_at_most_one_plugin_for_an_imported_checkpoint) {
+    Registry r;
+    const int st = r.load_dir(dir_of("architectures"), {});
+    if (st == RAD_E_IO && r.plugins().empty())
+        ARTIFACT_MISSING("the architecture plugins under " + dir_of("architectures"));
+    CHECK_OK(st);
+    std::map<std::string, std::vector<std::string>> takers;
+    for (const Plugin& p : r.plugins())
+        if (p.kind == RAD_PLUGIN_ARCH && !p.arch_quant.empty() && p.arch_serves_imports)
+            takers[p.arch_id].push_back(p.name);
+    for (const auto& [id, names] : takers) {
+        if (names.size() > 1)
+            for (const auto& n : names)
+                fprintf(stderr, "    '%s' would take an imported %s checkpoint\n", n.c_str(),
+                        id.c_str());
+        CHECK_EQ(names.size(), 1u);
+    }
+    REQUIRE(takers.count("qwen35"));
+    CHECK_EQ(takers["qwen35"][0], std::string("qwen35_fp8"));
+    const Plugin* w8 = r.plugin("qwen35_w8a8");
+    REQUIRE(w8 != nullptr);
+    CHECK(!w8->arch_serves_imports);
 }
 
 RAD_TEST_MAIN()
