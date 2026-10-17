@@ -515,6 +515,9 @@ pub struct FixturePrompt {
     pub id: String,
     pub kind: String,
     pub prompt_ids: Vec<u32>,
+    /// Natural-text prompts: tokenized by the gate after the load
+    /// (`prompt_ids` is empty until then).
+    pub text: Option<String>,
     /// Resume: the first `entry` ids are a previously prefilled prefix.
     pub entry: usize,
     /// Original launch cuts (row indices) the prompt is driven through.
@@ -526,7 +529,6 @@ pub struct FixturePrompt {
 #[derive(Clone, Debug)]
 pub struct Fixture {
     pub max_seq: usize,
-    pub expert_vram_layers: Option<usize>,
     pub decode_tokens: usize,
     pub repeats: usize,
     pub head_rows: usize,
@@ -602,14 +604,6 @@ impl Fixture {
             .filter(|&n| n >= 1)
             .ok_or("fixture perf_repeats is not a positive integer")?
             as usize;
-        let expert_vram_layers = match value.get("expert_vram_layers") {
-            None | Some(Value::Null) => None,
-            Some(v) => Some(
-                v.as_u64()
-                    .ok_or("fixture expert_vram_layers is not an unsigned integer")?
-                    as usize,
-            ),
-        };
         let mut prompts = Vec::new();
         for item in value
             .get("prompts")
@@ -630,8 +624,20 @@ impl Fixture {
                 return Err(format!("prompt {id}: unknown kind {kind}"));
             }
             let prompt_ids = u32_list(item.get("prompt_ids"), &format!("prompt {id} prompt_ids"))?;
-            if prompt_ids.is_empty() {
-                return Err(format!("prompt {id}: empty prompt_ids"));
+            // A natural-text prompt carries `text` instead of ids: the gate
+            // tokenizes it with the artifact's own tokenizer after the load.
+            let text = match item.get("text") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) if !s.trim().is_empty() => Some(s.clone()),
+                Some(_) => return Err(format!("prompt {id}: text must be a non-empty string")),
+            };
+            if kind != "natural" && text.is_some() {
+                return Err(format!("prompt {id}: only a natural prompt may carry text"));
+            }
+            if prompt_ids.is_empty() == text.is_none() {
+                return Err(format!(
+                    "prompt {id}: give exactly one of prompt_ids and text"
+                ));
             }
             let entry = item.get("entry").and_then(Value::as_u64).unwrap_or(0) as usize;
             let launch_cuts =
@@ -652,8 +658,9 @@ impl Fixture {
                     "prompt {id}: launch_cuts must be strictly ascending interior row indices"
                 ));
             }
-            if prompt_ids.len() + value["decode_tokens"].as_u64().unwrap_or(0) as usize + 1
-                > max_seq
+            if !prompt_ids.is_empty()
+                && prompt_ids.len() + value["decode_tokens"].as_u64().unwrap_or(0) as usize + 1
+                    > max_seq
             {
                 return Err(format!(
                     "prompt {id}: {} rows + decode do not fit max_seq {max_seq}",
@@ -664,6 +671,7 @@ impl Fixture {
                 id,
                 kind,
                 prompt_ids,
+                text,
                 entry,
                 launch_cuts,
                 requested_boundaries,
@@ -710,7 +718,6 @@ impl Fixture {
         }
         Ok(Self {
             max_seq,
-            expert_vram_layers,
             decode_tokens,
             repeats,
             head_rows,
