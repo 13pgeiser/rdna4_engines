@@ -31,11 +31,13 @@ use crate::hipfire::{
     serve_ctrl::{self, ServeAction, ServeOutcome},
     settings_model::{self, SettingsModel},
     status::{start_background_serve, StatusState},
+    tuning_view::TuningView,
     ui_state::UiState,
     writer, HipfirePaths,
 };
 
 mod settings;
+mod tuning;
 
 pub use settings::SettingsSearch;
 
@@ -255,6 +257,14 @@ pub struct App {
     /// A staged-but-uncommitted enum value preview (5b). `Some` only while the
     /// user is cycling an enum and hasn't pressed Enter (commit) / Esc (cancel).
     pub settings_pending: Option<PendingEnum>,
+    /// Settings tab: the Tuning chooser / preview / undo screen (`p`, `u`).
+    pub tuning_view: Option<TuningView>,
+    /// The last frame was 160×48 or larger (the Tuning cards + preview layout).
+    pub tuning_wide: bool,
+    /// Test seam: every serve lifecycle command [`App::start_serve_command`]
+    /// started, in order.
+    #[cfg(test)]
+    pub serve_commands: Vec<ServeAction>,
     pub chat: ChatState,
     pub last_reload: String,
     /// Transient over-footer status toast (action failures + confirmations).
@@ -418,6 +428,10 @@ impl App {
             settings_hide_unused: false,
             settings_edit: None,
             settings_pending: None,
+            tuning_view: None,
+            tuning_wide: false,
+            #[cfg(test)]
+            serve_commands: Vec::new(),
             chat: ChatState::default(),
             last_reload: "loaded hipfire state".into(),
             toast: None,
@@ -697,6 +711,8 @@ impl App {
             self.toast_info("a serve command is already running");
             return;
         }
+        #[cfg(test)]
+        self.serve_commands.push(action);
         self.serve_cmd = Some(serve_ctrl::run(action));
         self.serve_cmd_label = action.label().to_string();
         self.toast_info(format!("serve {}\u{2026}", action.label()));

@@ -18,6 +18,7 @@ pub mod search;
 pub mod serve_ctrl;
 pub mod settings_model;
 pub mod status;
+pub mod tuning_view;
 pub mod ui_state;
 pub mod writer;
 

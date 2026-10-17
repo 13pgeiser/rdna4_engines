@@ -196,7 +196,8 @@ enum ConfigAction {
         #[command(subcommand)]
         action: Option<ConfigProfileAction>,
     },
-    /// Preview, apply and undo tuning presets (speed vs. answer quality).
+    /// Preview, apply and undo tuning presets (speed vs. answer quality); with
+    /// no subcommand, opens the TUI on the preset chooser.
     Tuning {
         #[command(subcommand)]
         action: Option<ConfigTuningAction>,
@@ -1314,7 +1315,10 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
             Ok(())
         }
         ConfigAction::Profile { action } => config_profile_command(paths, action),
-        ConfigAction::Tuning { action } => config_tuning::config_tuning_command(paths, action),
+        ConfigAction::Tuning { action } => match action {
+            Some(action) => config_tuning::config_tuning_command(paths, action),
+            None => launch_tui(paths, &config_tuning::tui_args()),
+        },
     }
 }
 
@@ -4264,7 +4268,7 @@ pub(crate) fn find_model_path(
     {
         // A split tag serves its base, else the grandfathered monolithic it was
         // cut from, so nobody is forced to re-download after the registry switch.
-        return ple::split_model_files(entry)
+        return hipfire_registry::split_model_files_in(entry, &grandfather_table())
             .iter()
             .map(|file| paths.models.join(file))
             .find(|path| path.is_file());

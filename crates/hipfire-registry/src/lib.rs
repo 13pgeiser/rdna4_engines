@@ -126,6 +126,71 @@ pub fn shared_ple_file(base_file: &str, key: &str) -> Option<String> {
         .then(|| format!("{SHARED_PLE_FAMILY}{}", ple_sidecar_suffix(key)))
 }
 
+/// Local file names that serve a split `entry`, best first: the split base,
+/// then its grandfathered monolithic (both pinned spellings), from the pin
+/// table `pins`. This is what lets a user who never migrated keep using the
+/// local monolithic under the split tag instead of re-downloading.
+pub fn split_model_files_in(entry: &ModelEntry, pins: &[GrandfatheredMonolithic]) -> Vec<String> {
+    let mut files = vec![entry.file.clone()];
+    if let Some(pin) = grandfathered_monolithic_in(entry, pins) {
+        files.push(pin.canonical_file.to_owned());
+        files.push(pin.legacy_file.to_owned());
+    }
+    files
+}
+
+/// [`split_model_files_in`] over the compiled-in [`GRANDFATHERED_MONOLITHICS`].
+pub fn split_model_files(entry: &ModelEntry) -> Vec<String> {
+    split_model_files_in(entry, GRANDFATHERED_MONOLITHICS)
+}
+
+/// Native Qwen4 (Flash-Next) `model_arch` id.
+const FLASH_NEXT_ARCH_ID: u32 = 16;
+
+/// Which installed Flash-Next models have their q8 PLE rows (the local facts
+/// the tuning plan needs, spec §2.2). A Flash-Next model is a registry entry
+/// with `arch_id` 16 whose file (or grandfathered monolithic) is on disk. A
+/// monolithic file embeds the q8 rows; a split base (`<name>-base.<ext>`)
+/// needs `<base>.ple-q8` beside it, the entry's published q8 file, or the
+/// family-shared q8 file.
+pub fn tuning_plan_env(
+    models_dir: &Path,
+    registry: &RegistryV1,
+) -> hipfire_config::tuning::PlanEnv {
+    use hipfire_config::memory::{ple_sidecar_path, PleFormat};
+    let mut env = hipfire_config::tuning::PlanEnv::default();
+    let mut seen = std::collections::BTreeSet::new();
+    for (tag, entry) in &registry.models {
+        if entry.arch_id != Some(FLASH_NEXT_ARCH_ID) {
+            continue;
+        }
+        let Some(file) = split_model_files(entry)
+            .into_iter()
+            .find(|file| models_dir.join(file).is_file())
+        else {
+            continue;
+        };
+        if !seen.insert(file.clone()) {
+            continue;
+        }
+        env.flash_next_installed = true;
+        let model = models_dir.join(&file);
+        let split_base = monolithic_file_for_split_base(&file).is_some();
+        let present = !split_base
+            || ple_sidecar_path(&model, PleFormat::Q8).is_file()
+            || entry
+                .ple_sidecar("q8")
+                .is_some_and(|sidecar| models_dir.join(&sidecar.file).is_file())
+            || shared_ple_file(&file, "q8").is_some_and(|shared| models_dir.join(shared).is_file());
+        if !present {
+            env.ple_q8_missing.push(file);
+            env.pull_tag.get_or_insert_with(|| tag.clone());
+        }
+    }
+    env.ple_q8_present = env.flash_next_installed && env.ple_q8_missing.is_empty();
+    env
+}
+
 #[derive(Debug, Error)]
 pub enum RegistryError {
     #[error("failed to read {path}: {source}")]
@@ -4515,5 +4580,90 @@ mod tests {
         .unwrap();
         assert_eq!(resolved.model_id.as_deref(), Some(entry.file.as_str()));
         assert_eq!(max_tokens(&resolved).0, ConfigValue::Integer(888));
+    }
+
+    fn flash_next_plan_registry() -> RegistryV1 {
+        let sidecar =
+            |key: &str| serde_json::json!({ "file": format!("qwen3.8-flash-next.ple-{key}") });
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "generated_at": "2099-01-01T00:00:00Z",
+            "models": {
+                "qwen3.8:flash-next": {
+                    "repo": "x/y", "file": "qwen3.8-flash-next-gptq3.mq4",
+                    "size_gb": 1, "min_vram_gb": 1, "desc": "mono", "arch_id": 16
+                },
+                "qwen3.8:flash-next-mq3-xts": {
+                    "repo": "x/y", "file": "qwen3.8-flash-next-base.mq3-xts",
+                    "size_gb": 1, "min_vram_gb": 1, "desc": "split", "arch_id": 16,
+                    "ple": { "q4": sidecar("q4"), "q8": sidecar("q8") }
+                }
+            },
+            "aliases": {}
+        });
+        RegistryV1::parse(&value.to_string(), "tuning test").unwrap()
+    }
+
+    #[test]
+    fn tuning_plan_env_reads_installed_flash_next_and_its_q8_files() {
+        use hipfire_config::tuning::PlanEnv;
+        let dir = env::temp_dir().join(format!(
+            "hipfire-registry-plan-env-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let registry = flash_next_plan_registry();
+        assert_eq!(tuning_plan_env(&dir, &registry), PlanEnv::default());
+
+        // A monolithic embeds the q8 rows.
+        fs::write(dir.join("qwen3.8-flash-next-gptq3.mq4"), b"x").unwrap();
+        let mono = tuning_plan_env(&dir, &registry);
+        assert!(mono.flash_next_installed && mono.ple_q8_present, "{mono:?}");
+
+        // A split base with only the q4 rows has no q8.
+        fs::write(dir.join("qwen3.8-flash-next-base.mq3-xts"), b"x").unwrap();
+        fs::write(dir.join("qwen3.8-flash-next.ple-q4"), b"x").unwrap();
+        let split = tuning_plan_env(&dir, &registry);
+        assert!(
+            split.flash_next_installed && !split.ple_q8_present,
+            "{split:?}"
+        );
+        assert_eq!(
+            split.ple_q8_missing,
+            vec!["qwen3.8-flash-next-base.mq3-xts"]
+        );
+        assert_eq!(
+            split.pull_tag.as_deref(),
+            Some("qwen3.8:flash-next-mq3-xts")
+        );
+
+        // The shared q8 file satisfies it.
+        fs::write(dir.join("qwen3.8-flash-next.ple-q8"), b"x").unwrap();
+        let shared = tuning_plan_env(&dir, &registry);
+        assert!(shared.ple_q8_present, "{shared:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn split_model_files_lists_base_then_grandfathered_monolithics() {
+        let registry = flash_next_plan_registry();
+        // An entry without a pin serves only its own file.
+        assert_eq!(
+            split_model_files(&registry.models["qwen3.8:flash-next-mq3-xts"]),
+            ["qwen3.8-flash-next-base.mq3-xts"]
+        );
+        let pinned = stock_split_base_entry();
+        assert_eq!(
+            split_model_files(&pinned),
+            [
+                FLASH_NEXT_XTS_SPLIT_BASE_FILE,
+                FLASH_NEXT_XTS_CANONICAL_FILE,
+                FLASH_NEXT_XTS_LEGACY_FILE
+            ]
+        );
     }
 }

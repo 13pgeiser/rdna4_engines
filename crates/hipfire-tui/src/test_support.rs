@@ -131,7 +131,11 @@ pub struct FixtureBuilder {
     config: String,
     env: ConfigLayer,
     card_kv_mode: Option<String>,
+    flash_next_split: bool,
 }
+
+/// Split-base file of the Flash-Next fixture card (no `.ple-q8` beside it).
+pub const FLASH_NEXT_BASE_FILE: &str = "qwen3.8-flash-next-base.mq4-xts";
 
 impl FixtureBuilder {
     pub fn new(gpu: &str) -> Self {
@@ -141,7 +145,16 @@ impl FixtureBuilder {
             config: String::new(),
             env: ConfigLayer::default(),
             card_kv_mode: None,
+            flash_next_split: false,
         }
+    }
+
+    /// A registry card `qwen3.8:flash-next` (`arch_id` 16, split base) whose
+    /// placeholder base file exists in the fixture models dir. No `.ple-q8`
+    /// exists, so the Quality-first word-table line is unmet.
+    pub fn flash_next_split_base(mut self) -> Self {
+        self.flash_next_split = true;
+        self
     }
 
     /// The PR #902 state to inject (a gfx1151 fixture mirroring mockup S1
@@ -162,6 +175,15 @@ impl FixtureBuilder {
         self.env
             .set(key, ConfigValue::String(value.to_owned()))
             .expect("fixture env key is valid");
+        self
+    }
+
+    /// One key of the injected environment layer, parsed like the env loader
+    /// does (`HIPFIRE_IU4_PREFILL=1` → `kernel.iu4_prefill`).
+    pub fn env_cli(mut self, key: &str, raw: &str) -> Self {
+        self.env
+            .set_cli(key, raw)
+            .expect("fixture env key and value are valid");
         self
     }
 
@@ -213,6 +235,25 @@ impl FixtureBuilder {
             downloaded: false,
             has_mtp: false,
         }];
+        if self.flash_next_split {
+            std::fs::create_dir_all(&app.paths.models).expect("create fixture models dir");
+            std::fs::write(app.paths.models.join(FLASH_NEXT_BASE_FILE), b"")
+                .expect("write placeholder split base");
+            app.registry.models.push(ModelRow {
+                tag: "qwen3.8:flash-next".to_owned(),
+                entry: ModelEntry {
+                    repo: "hipfire-models/qwen3.8-flash-next".into(),
+                    file: FLASH_NEXT_BASE_FILE.into(),
+                    size_gb: 70.9,
+                    min_vram_gb: 8.0,
+                    desc: "Qwen3.8 Flash-Next (split base)".into(),
+                    arch_id: Some(16),
+                    ..ModelEntry::default()
+                },
+                downloaded: true,
+                has_mtp: false,
+            });
+        }
         app.rebuild_settings();
         app.tab = Tab::Settings;
         // Serve offline, not "checking": the health poller never ran.

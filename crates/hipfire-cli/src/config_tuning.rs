@@ -10,12 +10,10 @@
 //! #902 schema state, `.ple-q8` files), prints the preview and asks before
 //! writing.
 
-use std::collections::BTreeSet;
 use std::io::{BufRead, Write};
 
 use anyhow::{bail, Result};
 use hipfire_config::effective::{install_gpu_arch, A8Prefill, ArchCtx};
-use hipfire_config::memory::{ple_sidecar_path, PleFormat};
 use hipfire_config::tuning::{
     self, current_value, display_value, evidence_summary, find_conflicts, Conflict, PlanEnv,
     Preset, TuningPlan, TuningState, TuningStatus,
@@ -23,14 +21,9 @@ use hipfire_config::tuning::{
 use hipfire_config::{
     load_catalog, load_env_layer, load_global, ConfigFormat, ConfigLayer, ConfigLayerDiff,
 };
-use hipfire_registry::{
-    load as load_registry, monolithic_file_for_split_base, shared_ple_file, RegistryV1,
-};
+use hipfire_registry::{load as load_registry, tuning_plan_env};
 
 use crate::{ConfigTuningAction, OutputArgs, Paths};
-
-/// Native Qwen4 (Flash-Next) `model_arch` id.
-const FLASH_NEXT_ARCH_ID: u32 = 16;
 
 /// Facts about this machine and process; explicit so tests drive every case.
 pub(crate) struct TuningRuntime {
@@ -53,7 +46,7 @@ impl TuningRuntime {
         Ok(Self {
             arch: install_gpu_arch(&paths.config.root),
             a8: A8Prefill::detect(),
-            plan_env: detect_plan_env(paths, &registry),
+            plan_env: tuning_plan_env(&paths.models, &registry),
             interactive: std::io::stdin().is_terminal(),
             env: load_env_layer()?,
             now: std::time::SystemTime::now()
@@ -61,46 +54,6 @@ impl TuningRuntime {
                 .map_or(0, |elapsed| elapsed.as_secs()),
         })
     }
-}
-
-/// Which installed Flash-Next models have their q8 PLE rows (spec §2.2). A
-/// Flash-Next model is a registry entry with `arch_id` 16 whose file (or
-/// grandfathered monolithic) is on disk. A monolithic file embeds the q8
-/// rows; a split base (`<name>-base.<ext>`) needs `<base>.ple-q8` beside it,
-/// the entry's published q8 file, or the family-shared q8 file.
-fn detect_plan_env(paths: &Paths, registry: &RegistryV1) -> PlanEnv {
-    let mut env = PlanEnv::default();
-    let mut seen = BTreeSet::new();
-    for (tag, entry) in &registry.models {
-        if entry.arch_id != Some(FLASH_NEXT_ARCH_ID) {
-            continue;
-        }
-        let Some(file) = crate::ple::split_model_files(entry)
-            .into_iter()
-            .find(|file| paths.models.join(file).is_file())
-        else {
-            continue;
-        };
-        if !seen.insert(file.clone()) {
-            continue;
-        }
-        env.flash_next_installed = true;
-        let model = paths.models.join(&file);
-        let split_base = monolithic_file_for_split_base(&file).is_some();
-        let present = !split_base
-            || ple_sidecar_path(&model, PleFormat::Q8).is_file()
-            || entry
-                .ple_sidecar("q8")
-                .is_some_and(|sidecar| paths.models.join(&sidecar.file).is_file())
-            || shared_ple_file(&file, "q8")
-                .is_some_and(|shared| paths.models.join(shared).is_file());
-        if !present {
-            env.ple_q8_missing.push(file);
-            env.pull_tag.get_or_insert_with(|| tag.clone());
-        }
-    }
-    env.ple_q8_present = env.flash_next_installed && env.ple_q8_missing.is_empty();
-    env
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,12 +64,14 @@ pub(crate) enum Outcome {
     Refused,
 }
 
-pub(crate) fn config_tuning_command(
-    paths: &Paths,
-    action: Option<ConfigTuningAction>,
-) -> Result<()> {
+/// Bare `hipfire config tuning` opens the TUI on the Tuning chooser (like
+/// `config profile` opens its wizard).
+pub(crate) fn tui_args() -> Vec<String> {
+    vec!["--tuning".to_owned()]
+}
+
+pub(crate) fn config_tuning_command(paths: &Paths, action: ConfigTuningAction) -> Result<()> {
     let runtime = TuningRuntime::detect(paths)?;
-    let action = action.unwrap_or(ConfigTuningAction::Status(OutputArgs { json: false }));
     let stdin = std::io::stdin();
     let outcome = run(
         paths,
@@ -1088,10 +1043,39 @@ mod tests {
     }
 
     #[test]
+    fn bare_config_tuning_launches_the_tui_on_the_chooser() {
+        use clap::Parser;
+        let parsed = crate::Cli::try_parse_from(["hipfire", "config", "tuning"]).unwrap();
+        let Some(crate::Commands::Config(args)) = parsed.command else {
+            panic!("expected config command")
+        };
+        assert!(matches!(
+            args.action,
+            Some(ConfigAction::Tuning { action: None })
+        ));
+        assert_eq!(tui_args(), ["--tuning"]);
+        // A subcommand still runs headless.
+        let parsed = crate::Cli::try_parse_from(["hipfire", "config", "tuning", "status"]).unwrap();
+        let Some(crate::Commands::Config(args)) = parsed.command else {
+            panic!("expected config command")
+        };
+        assert!(matches!(
+            args.action,
+            Some(ConfigAction::Tuning { action: Some(_) })
+        ));
+    }
+
+    #[test]
     fn model_argument_is_rejected_for_tuning() {
         // `hipfire config MODEL tuning` is global-only like profile/migrate.
         let paths = test_paths("model-tuning");
-        let registry = flash_next_registry();
+        let registry = hipfire_registry::RegistryV1 {
+            schema_version: 1,
+            generated_at: "2099-01-01T00:00:00Z".to_owned(),
+            _comment: None,
+            models: Default::default(),
+            aliases: Default::default(),
+        };
         let error = crate::model_config_command_to(
             &paths,
             &registry,
@@ -1103,63 +1087,5 @@ mod tests {
         .to_string();
         fs::remove_dir_all(&paths.root).ok();
         assert!(error.contains("are global"), "{error}");
-    }
-
-    fn flash_next_registry() -> RegistryV1 {
-        let sidecar =
-            |key: &str| serde_json::json!({ "file": format!("qwen3.8-flash-next.ple-{key}") });
-        let value = serde_json::json!({
-            "schema_version": 1,
-            "generated_at": "2099-01-01T00:00:00Z",
-            "models": {
-                "qwen3.8:flash-next": {
-                    "repo": "x/y", "file": "qwen3.8-flash-next-gptq3.mq4",
-                    "size_gb": 1, "min_vram_gb": 1, "desc": "mono", "arch_id": 16
-                },
-                "qwen3.8:flash-next-mq3-xts": {
-                    "repo": "x/y", "file": "qwen3.8-flash-next-base.mq3-xts",
-                    "size_gb": 1, "min_vram_gb": 1, "desc": "split", "arch_id": 16,
-                    "ple": { "q4": sidecar("q4"), "q8": sidecar("q8") }
-                }
-            },
-            "aliases": {}
-        });
-        RegistryV1::parse(&value.to_string(), "tuning test").unwrap()
-    }
-
-    #[test]
-    fn plan_env_reads_installed_flash_next_and_its_q8_files() {
-        let paths = test_paths("plan-env");
-        let registry = flash_next_registry();
-        assert_eq!(detect_plan_env(&paths, &registry), PlanEnv::default());
-
-        fs::create_dir_all(&paths.models).unwrap();
-        // A monolithic embeds the q8 rows.
-        fs::write(paths.models.join("qwen3.8-flash-next-gptq3.mq4"), b"x").unwrap();
-        let mono = detect_plan_env(&paths, &registry);
-        assert!(mono.flash_next_installed && mono.ple_q8_present, "{mono:?}");
-
-        // A split base with only the q4 rows has no q8.
-        fs::write(paths.models.join("qwen3.8-flash-next-base.mq3-xts"), b"x").unwrap();
-        fs::write(paths.models.join("qwen3.8-flash-next.ple-q4"), b"x").unwrap();
-        let split = detect_plan_env(&paths, &registry);
-        assert!(
-            split.flash_next_installed && !split.ple_q8_present,
-            "{split:?}"
-        );
-        assert_eq!(
-            split.ple_q8_missing,
-            vec!["qwen3.8-flash-next-base.mq3-xts"]
-        );
-        assert_eq!(
-            split.pull_tag.as_deref(),
-            Some("qwen3.8:flash-next-mq3-xts")
-        );
-
-        // The shared q8 file satisfies it.
-        fs::write(paths.models.join("qwen3.8-flash-next.ple-q8"), b"x").unwrap();
-        let shared = detect_plan_env(&paths, &registry);
-        assert!(shared.ple_q8_present, "{shared:?}");
-        fs::remove_dir_all(&paths.root).unwrap();
     }
 }

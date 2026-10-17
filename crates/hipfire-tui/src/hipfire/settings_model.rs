@@ -11,9 +11,10 @@
 //! active model, registry, [`ArchCtx`], env layer), so tests never read the
 //! real `~/.hipfire` or the process environment.
 
+use hipfire_config::tuning::{self, TuningState, TuningStatus};
 use hipfire_config::{
     canonical_config_key, detect_config_profile,
-    effective::{active_choice, origin_of, quality_choices, ArchCtx, Choice, Effective, Origin},
+    effective::{active_choice, quality_choices, ArchCtx, Choice, Effective, Origin},
     field, fields,
     intent::{intent_of, Intent},
     is_deprecated_key, is_developer_key, load_config_profile, load_global, model_override_allowed,
@@ -167,6 +168,8 @@ pub struct SettingsModel {
     pub arch: ArchCtx,
     /// Name of the profile whose bundle the global config contains, if any.
     pub profile: Option<String>,
+    /// Where the global config stands against `tuning.toml` (header item).
+    pub tuning: TuningStatus,
     /// `config.toml` / resolve warnings the screen can show.
     pub warnings: Vec<String>,
 }
@@ -176,6 +179,8 @@ struct Builder<'a> {
     arch: &'a ArchCtx,
     profile: Option<(&'a str, &'a ConfigLayer)>,
     global: &'a ConfigLayer,
+    /// Which keys the applied tuning preset owns (the From column's `preset`).
+    tuning: &'a TuningState,
     model_label: String,
 }
 
@@ -214,6 +219,9 @@ impl SettingsModel {
                 .ok()
                 .map(|bundle| (name, bundle))
         });
+        // An unreadable `tuning.toml` reads as no preset applied.
+        let tuning_state = TuningState::load(&config_paths).unwrap_or_default();
+        let tuning = tuning::status(&global, &tuning_state, arch);
         let model_label = short_model_name(arch.registry_tag.as_deref().unwrap_or(active_model));
         let builder = Builder {
             resolved: &resolved,
@@ -222,6 +230,7 @@ impl SettingsModel {
                 .as_ref()
                 .map(|(name, bundle)| (name.as_str(), bundle)),
             global: &global,
+            tuning: &tuning_state,
             model_label,
         };
 
@@ -238,6 +247,7 @@ impl SettingsModel {
             rows,
             arch: arch.clone(),
             profile: profile.map(|(name, _)| name),
+            tuning,
             warnings,
         }
     }
@@ -430,6 +440,19 @@ fn group_keys(group: Intent, resolved: &ResolvedConfig) -> Vec<String> {
 }
 
 impl Builder<'_> {
+    /// Which layer set `key`, with the applied tuning preset's keys read as
+    /// [`Origin::Preset`].
+    fn origin(&self, key: &str, effective: &Effective) -> Origin {
+        tuning::attribute(
+            key,
+            self.resolved,
+            effective,
+            self.arch,
+            self.tuning,
+            self.profile,
+        )
+    }
+
     fn key_row(&self, key: &str, group: Intent) -> SettingsRow {
         let canonical = canonical_config_key(key).unwrap_or_else(|| key.to_owned());
         let resolved = self
@@ -437,13 +460,7 @@ impl Builder<'_> {
             .get(&canonical)
             .map_or(ConfigValue::Null, |slot| slot.value.clone());
         let effective = hipfire_config::effective::effective(&canonical, self.resolved, self.arch);
-        let origin = origin_of(
-            &canonical,
-            self.resolved,
-            &effective,
-            self.arch,
-            self.profile,
-        );
+        let origin = self.origin(&canonical, &effective);
         let display = self.display(&canonical, &effective);
         let locked = lock_text(&origin);
         let title = row_title(&canonical);
@@ -491,14 +508,13 @@ impl Builder<'_> {
         let effective = hipfire_config::effective::effective(&primary, self.resolved, self.arch);
 
         let origin = {
-            let primary_origin =
-                origin_of(&primary, self.resolved, &effective, self.arch, self.profile);
+            let primary_origin = self.origin(&primary, &effective);
             let marked = keys
                 .iter()
                 .filter(|key| field(key).is_some())
                 .map(|key| {
                     let eff = hipfire_config::effective::effective(key, self.resolved, self.arch);
-                    origin_of(key, self.resolved, &eff, self.arch, self.profile)
+                    self.origin(key, &eff)
                 })
                 .find(|origin| origin.marked() || matches!(origin, Origin::Registry));
             match (marked, &self.arch.gpu_arch) {
@@ -535,13 +551,7 @@ impl Builder<'_> {
         });
         let locked = keys.iter().find_map(|key| {
             let eff = hipfire_config::effective::effective(key, self.resolved, self.arch);
-            lock_text(&origin_of(
-                key,
-                self.resolved,
-                &eff,
-                self.arch,
-                self.profile,
-            ))
+            lock_text(&self.origin(key, &eff))
         });
         let chain = self.virtual_chain(&choices, &origin, &display);
         // No route on this GPU: report it through `effective` too, so the

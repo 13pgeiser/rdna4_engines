@@ -144,7 +144,7 @@ impl App {
 
     /// A config write landed: rebuild the rows and the dashboard's view of
     /// host/port, and keep the cursor on its row.
-    fn after_config_write(&mut self) {
+    pub(super) fn after_config_write(&mut self) {
         let id = self.selected_row().map(|row| row.id.clone());
         self.rebuild_settings();
         self.config = self.load_config();
@@ -357,6 +357,11 @@ impl App {
     }
 
     pub(crate) fn handle_settings_key(&mut self, key: KeyEvent) {
+        // A Tuning screen (chooser / preview / undo confirm) owns the keyboard.
+        if self.tuning_open() {
+            self.handle_tuning_key(key);
+            return;
+        }
         // A reset-all confirmation is modal: only y / n / Esc act while armed.
         if self.confirm_reset_all {
             match key.code {
@@ -393,6 +398,14 @@ impl App {
             KeyCode::Char('[') => self.settings_step_group(false),
             KeyCode::Char(']') => self.settings_step_group(true),
             KeyCode::Char('/') => self.open_settings_search(),
+            KeyCode::Char('p') => {
+                self.discard_settings_preview();
+                self.open_tuning();
+            }
+            KeyCode::Char('u') => {
+                self.discard_settings_preview();
+                self.open_tuning_undo();
+            }
             KeyCode::Char('c') => {
                 self.discard_settings_preview();
                 self.settings_changed_only = !self.settings_changed_only;

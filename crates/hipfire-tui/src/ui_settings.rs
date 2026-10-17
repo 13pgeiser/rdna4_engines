@@ -94,7 +94,7 @@ fn title_copy(group: Intent) -> String {
 
 /// `text` in a `width`-column cell that always ends in a space, so adjacent
 /// columns never touch: padded when it fits, else cut with an ellipsis.
-fn cell(text: &str, width: usize) -> String {
+pub(crate) fn cell(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
@@ -109,7 +109,7 @@ fn cell(text: &str, width: usize) -> String {
 }
 
 /// Greedy word wrap at `cols` columns.
-fn wrap(text: &str, cols: usize) -> Vec<String> {
+pub(crate) fn wrap(text: &str, cols: usize) -> Vec<String> {
     let cols = cols.max(8);
     let mut lines = Vec::new();
     let mut line = String::new();
@@ -130,6 +130,10 @@ fn wrap(text: &str, cols: usize) -> Vec<String> {
 }
 
 pub fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
+    if let Some(view) = &app.tuning_view {
+        crate::ui_tuning::draw_tuning(frame, app, view, area);
+        return;
+    }
     if area.width >= WIDE_COLS && area.height >= WIDE_ROWS {
         draw_wide(frame, app, area);
     } else {
@@ -413,7 +417,7 @@ fn list_lines(
 
 /// The GPU text of the header: the probe's name when there is one, the arch
 /// from `install.json`, and a note when the live probe disagrees.
-fn gpu_text(app: &App, wide: bool) -> String {
+pub(crate) fn gpu_text(app: &App, wide: bool) -> String {
     use crate::hipfire::dashboard::Probe;
     let system = app.dashboard.as_ref().and_then(|dash| dash.system.as_ref());
     let name = system.and_then(|info| match &info.gpu_name {
@@ -484,6 +488,12 @@ fn header_line(app: &App, wide: bool) -> Line<'static> {
     if let Some(profile) = app.settings.profile.as_deref().filter(|_| wide) {
         text.push_str(&format!("    Profile: {profile}"));
     }
+    // The Tuning preset in effect leads the header (spec §4 S1 / L1).
+    let tuning_key = if wide { " (p)" } else { "  p" };
+    text.insert_str(
+        0,
+        &format!("Tuning: {}{tuning_key}    ", app.settings.tuning.label()),
+    );
     let warning = app.settings.warnings.first();
     let mut spans = vec![Span::styled(text, Style::default().fg(TEXT))];
     if let Some(warning) = warning {
@@ -1485,7 +1495,7 @@ mod tests {
         let rows = render_rows(&mut fixture.app, 80, 24);
         assert!(
             rows.iter().any(
-                |row| row.contains("GPU: Radeon AI PRO R9700 (gfx1201)    Editing: all models")
+                |row| row.contains("Tuning: Balanced  p    GPU: Radeon AI PRO R9700 (gfx1201)")
             ),
             "{rows:#?}"
         );
@@ -1642,18 +1652,11 @@ mod tests {
             "Applies",
             "next message",
             "Editing: all models",
+            "Tuning: Custom (p)",
         ] {
             assert!(text.contains(want), "missing {want:?}:\n{text}");
         }
-        for gone in [
-            "Tuning",
-            "(m)",
-            "(o)",
-            "(p)",
-            "(u)",
-            "Profiles",
-            "Per-model (o)",
-        ] {
+        for gone in ["(m)", "(o)", "(u)", "Profiles", "Per-model (o)"] {
             assert!(
                 !text.contains(gone),
                 "deferred item {gone:?} advertised:\n{text}"

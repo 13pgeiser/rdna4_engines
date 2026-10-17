@@ -3,7 +3,7 @@
  Home  |  Dashboard  |  Chat  |  Models  |  Settings  |  System  |  Logs
 
 ────────────────────────────────────────────────────────────────────────────────
- GPU: gfx1151    Editing: all models
+ Tuning: Custom  p    GPU: gfx1151    Editing: all models
  [Quality]  Speed  Memory  Speculation  Hardware  Advanced             / search
  ┌ Quality — changes the answers; better is usually slower ───────────────────┐
  │  Setting                       Using now               From                │
@@ -20,5 +20,5 @@
  │Built-in default for gfx1151. Applies: serve restart.                       │
  │kernel.gfx11_a8_prefill · HIPFIRE_GFX11_A8_PREFILL · ←/→ choose, Enter saves│
  └────────────────────────────────────────────────────────────────────────────┘
-↑↓ move · ←→ change · Del default · / search · 1-6 group · ? help · Enter save
+↑↓ move · ←→ change · Del default · / search · p tuning · 1-6 group · ? help
 

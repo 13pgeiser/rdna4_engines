@@ -1559,6 +1559,7 @@ A preset is a bundle of **global** `config.toml` writes (never `models.toml`);
 nothing is written until you confirm.
 
 ```bash
+hipfire config tuning                       # open the Settings TUI on the preset chooser
 hipfire config tuning status [--json]       # which preset is applied, which keys it owns
 hipfire config tuning show quality-first    # preview: lines, measured trade-offs, net change
 hipfire config tuning show quality-first --arch gfx1201 --json
@@ -1604,6 +1605,24 @@ example "43% closer (WT2 KLD 0.0695 -> 0.0394), prompts 1.6× slower, typing
 unchanged"); an unmeasured number is said to be unmeasured. Not changed by any
 preset: KV cache (fp8 vs exact within noise on Flash-Next), speculation
 (designed lossless), and context, devices, offload and model choices.
+
+**In the TUI.** `p` on the Settings tab (or bare `hipfire config tuning`,
+which launches `hipfire-tui --tuning`) opens the chooser: Balanced,
+Quality-first and Low-power with a one-line description each and `●` on the
+applied one. `Enter` opens the preview, which lists every line with `[x]` /
+`[ ]`, its `from → to` change and the measured numbers from
+`hipfire_config::evidence` ("not measured on this GPU" when absent). `Space`
+ticks or unticks a line; a line whose requirement is unmet (a missing
+`.ple-q8`) cannot be ticked and `Space` says why and what fixes it. The Checks
+section flags an environment variable that overrides a written key, a
+`models.toml` value that shadows it, and a running serve that still has the old
+values. `y` writes exactly the ticked net diff and records ownership in
+`tuning.toml`; `Y` does the same and then restarts serve (the Dashboard `R`
+path, no second prompt). `config.toml` is byte-identical until `y`. Balanced
+lists the keys it gives back. `u` (Settings or the chooser) shows the keys
+undo restores and `y` applies it. At 160×48 and up the three presets are cards
+over one full-width preview table (`←/→` switch preset). The Settings header
+reads `Tuning: <preset>` (`Quality-first (edited)` after a hand edit).
 
 **State.** `~/.hipfire/tuning.toml` (a control-plane file beside `config.toml`,
 never inside it) records what the applied preset wrote, so the Settings "From"

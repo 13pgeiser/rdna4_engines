@@ -38,6 +38,7 @@ const TAB_DIVIDER: &str = " | ";
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    app.tuning_wide = crate::ui_tuning::is_wide(area);
     frame.render_widget(Clear, area);
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -310,7 +311,9 @@ fn footer_segments(app: &App) -> Vec<String> {
             }
         }
         Tab::Settings => {
-            if app.confirm_reset_all {
+            if let Some(view) = &app.tuning_view {
+                crate::ui_tuning::footer_segments(app, view)
+            } else if app.confirm_reset_all {
                 segs(&[
                     "Reset ALL settings to defaults?",
                     "y confirm",
@@ -354,12 +357,13 @@ fn footer_segments(app: &App) -> Vec<String> {
                     "←→ change",
                     "Del default",
                     "/ search",
+                    "p tuning",
                     "1-6 group",
                     "? help",
                     "Enter save",
+                    "R reset-all",
                     "c changed",
                     "h hide unused",
-                    "R reset-all",
                     "r refresh",
                     "Tab/Shift+Tab switch",
                     "q quit",
@@ -490,6 +494,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(fg).add_modifier(Modifier::BOLD),
                 ),
             ]))
+            .wrap(Wrap { trim: false })
             .style(Style::default().bg(BG)),
             area,
         );

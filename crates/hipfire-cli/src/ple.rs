@@ -344,19 +344,6 @@ pub(crate) fn classify_layout(entry: &ModelEntry, file_name: &str) -> ModelLayou
     }
 }
 
-/// Local file names that serve a split `entry`, best first: the split base,
-/// then its grandfathered monolithic (both pinned spellings). This is what
-/// lets a user who never migrated keep using the local monolithic under the
-/// split tag instead of re-downloading.
-pub(crate) fn split_model_files(entry: &ModelEntry) -> Vec<String> {
-    let mut files = vec![entry.file.clone()];
-    if let Some(pin) = crate::grandfather_pin(entry) {
-        files.push(pin.canonical_file.to_owned());
-        files.push(pin.legacy_file.to_owned());
-    }
-    files
-}
-
 /// Path of the PLE sidecar of format `key` beside `model`
 /// (`<model file name>.ple-<key>`): [`ple_sidecar_path`] for any key, including
 /// ones this client cannot load.
@@ -1739,7 +1726,7 @@ mod tests {
         }
         assert_eq!(classify_layout(split, "plain.mq4"), ModelLayout::Other);
         assert_eq!(
-            split_model_files(split),
+            hipfire_registry::split_model_files(split),
             [
                 "qwen3.8-flash-next-base.mq4-xts",
                 "qwen3.8-flash-next.mq4-xts",
@@ -1748,7 +1735,7 @@ mod tests {
         );
         // An entry without a pin serves only its own file.
         let plain = &registry.models["unrelated"];
-        assert_eq!(split_model_files(plain), ["plain.mq4"]);
+        assert_eq!(hipfire_registry::split_model_files(plain), ["plain.mq4"]);
     }
 
     #[test]

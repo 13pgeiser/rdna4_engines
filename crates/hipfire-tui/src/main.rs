@@ -7,6 +7,7 @@ mod hipfire;
 mod ui;
 mod ui_chat;
 mod ui_settings;
+mod ui_tuning;
 
 #[cfg(test)]
 mod test_support;
@@ -33,6 +34,7 @@ fn main() -> Result<()> {
     // Only the first argument is inspected — every branch returns/exits, so
     // there is never a second iteration.
     let mut start_settings = false;
+    let mut start_tuning = false;
     let profile_wizard = if let Some(arg) = std::env::args().nth(1) {
         match arg.as_str() {
             "--version" | "-V" => {
@@ -53,6 +55,13 @@ fn main() -> Result<()> {
                 start_settings = true;
                 false
             }
+            // `hipfire config tuning` launches with this: Settings with the
+            // Tuning preset chooser open.
+            "--tuning" => {
+                start_settings = true;
+                start_tuning = true;
+                false
+            }
             other => {
                 eprintln!("hipfire-tui: unknown argument '{other}'");
                 print_help();
@@ -67,7 +76,7 @@ fn main() -> Result<()> {
     let result = if profile_wizard {
         hipfire::profile_wizard::run(&mut terminal)
     } else {
-        run(&mut terminal, start_settings)
+        run(&mut terminal, start_settings, start_tuning)
     };
     restore_terminal(&mut terminal)?;
     result
@@ -91,7 +100,9 @@ fn help_text() -> String {
                  --config-profile-wizard\n                         \
                                       Select/create profiles and browse config variables\n    \
                  --settings           Open on the Settings tab for this launch (what\n                         \
-                                      `hipfire config` runs); the saved tab is kept\n\
+                                      `hipfire config` runs); the saved tab is kept\n    \
+                 --tuning             Open on Settings with the Tuning preset chooser\n                         \
+                                      (what `hipfire config tuning` runs)\n\
          \n\
          With no flags, hipfire-tui launches the interactive ratatui UI (requires a TTY).\n\
          Tabs: Home, Dashboard, Chat, Models, Settings, System, Logs. Tab/Shift+Tab to switch, ? for help, q to quit.\n\
@@ -178,9 +189,16 @@ fn apply_launch_tab(app: &mut App, start_settings: bool) -> Option<app::Tab> {
     start_settings.then(|| std::mem::replace(&mut app.tab, app::Tab::Settings))
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, start_settings: bool) -> Result<()> {
+fn run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    start_settings: bool,
+    start_tuning: bool,
+) -> Result<()> {
     let mut app = App::load()?;
     let launch_saved = apply_launch_tab(&mut app, start_settings);
+    if start_tuning {
+        app.open_tuning();
+    }
     let result = event_loop(terminal, &mut app);
     app.tab = tab_to_persist(app.tab, launch_saved);
     // Persist session UI state (active tab + expanded Models groups) on ANY exit
@@ -279,6 +297,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // The Models pull chooser (PLE / draft) is modal as well: every key goes to
     // the tab handler so q / r / ? / Tab cannot act while it is open.
     if app.tab == app::Tab::Models && app.pull_choice.is_some() {
+        app.handle_tab_key(key);
+        return false;
+    }
+
+    // A Settings Tuning screen (chooser, preview, undo confirm) owns every key:
+    // the preview must not be left by a global `q`, `r` or Tab by accident.
+    if app.tab == app::Tab::Settings && app.tuning_open() {
         app.handle_tab_key(key);
         return false;
     }

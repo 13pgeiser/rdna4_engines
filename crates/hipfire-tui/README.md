@@ -9,6 +9,7 @@ cargo run -p hipfire-tui
 ```
 
 `hipfire-tui --settings` opens on the Settings tab (what `hipfire config` runs),
+`--tuning` opens it with the Tuning preset chooser (`hipfire config tuning`),
 `--config-profile-wizard` opens the profile wizard (`hipfire config profile`),
 and `--check` loads config, registry and local models without a terminal.
 
@@ -39,7 +40,10 @@ Tabs:
   go into the buffer; `Esc` restores the group and row), `c` changed only,
   `h` hide unused, `←/→/Space` preview an enum (`Enter` saves) or toggle a
   boolean, `Enter` edits a number or text, `Del` goes back to inherited, `R`
-  resets all. Values an environment variable owns are locked. Every
+  resets all, `p` opens the Tuning presets (chooser, preview with measured
+  trade-offs, `y` save / `Y` save and restart serve, `u` undo last tuning;
+  state in `src/hipfire/tuning_view.rs`, keys in `src/app/tuning.rs`, screens
+  in `src/ui_tuning.rs`). The header leads with `Tuning: <preset>`. Values an environment variable owns are locked. Every
   non-deprecated key is editable (editor kind from the schema's value rule);
   deprecated keys are read-only. Rows come from `SettingsModel`
   (`src/hipfire/settings_model.rs`), drawn by `src/ui_settings.rs`. Golden
