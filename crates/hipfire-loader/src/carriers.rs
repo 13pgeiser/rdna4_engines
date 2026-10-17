@@ -2141,10 +2141,11 @@ fn load_qwen4_rank_scoped(
     // dedicated long-prefill stage buffers sized from the largest layer.
     // The hot set path charges its own margin and tier-plan stage.
     // The stage switch here is the placement switch that ignores the
-    // measured link (explicit `HIPFIRE_QWEN4_EXPERT_STAGE`, else gfx1201), so
-    // a dedicated stage the link alone would enable is not charged and is
-    // refused at construction instead (`Qwen4ExpertStage::new`): what is
-    // charged is what can allocate.
+    // measured link (explicit `HIPFIRE_QWEN4_EXPERT_STAGE`, else gfx1201). A
+    // slab stage the link alone would enable is not charged because it
+    // allocates nothing: it borrows two resident slab layers as its stage
+    // buffers (`Qwen4ExpertStage::new_slab`, `borrowed`), so it can neither
+    // take uncharged VRAM nor displace a resident layer.
     let slab_stage = residency::dedicated_slab_stage(
         residency::expert_stage_placement_enabled(&ctx.gpu.arch),
         matches!(

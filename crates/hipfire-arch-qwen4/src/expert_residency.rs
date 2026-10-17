@@ -1545,8 +1545,10 @@ fn expert_stage_switch(
 /// reads the host link (the gfx1100 narrow-link chunk is the only way the
 /// link reaches the placement). A dedicated stage (slab or
 /// tier layout) is therefore charged only where it can actually allocate
-/// (`Qwen4ExpertStage::new` refuses those layouts otherwise); the borrowed
-/// packed stage is charged nothing, it lends resident donor layers.
+/// (`Qwen4ExpertStage::new` allocates those layouts only under this switch);
+/// the borrowed stage, packed or slab, is charged nothing: it lends resident
+/// donor layers, so a stage the measured link alone enables never takes
+/// uncharged VRAM nor a resident layer.
 pub fn expert_stage_placement_enabled(arch: &str) -> bool {
     expert_stage_placement_switch(
         arch,
@@ -1586,13 +1588,15 @@ pub fn expert_tier_stage_bytes(plan: &crate::expert_tier_plan::ExpertTierPlan) -
 }
 
 /// Whether a whole-layer (slab arena) load allocates the two dedicated
-/// long-prefill stage buffers at load: the stage switch is on
-/// ([`expert_stage_enabled`]), the artifact is a slab-arena recipe (the
-/// legacy aggregate layout borrows resident donor layers and allocates
-/// nothing; a tier lease charges its own stage in the hot set fixed point)
-/// and the load is not expert-parallel (`Qwen4ExpertStage::new_slab` has no
-/// EP route). Not conditioned on the prefill length: the buffers exist from
-/// load, even if every prompt stays under `HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS`.
+/// long-prefill stage buffers at load: the probe-free placement switch is on
+/// ([`expert_stage_placement_enabled`]; a stage the measured link alone
+/// enables borrows resident slab layers instead and is charged nothing), the
+/// artifact is a slab-arena recipe (the legacy aggregate layout borrows
+/// resident donor layers and allocates nothing; a tier lease charges its own
+/// stage in the hot set fixed point) and the load is not expert-parallel
+/// (`Qwen4ExpertStage::new_slab` has no EP route). Not conditioned on the
+/// prefill length: the buffers exist from load, even if every prompt stays
+/// under `HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS`.
 pub fn dedicated_slab_stage(stage_enabled: bool, slab_recipe: bool, expert_parallel: bool) -> bool {
     stage_enabled && slab_recipe && !expert_parallel
 }
@@ -1980,6 +1984,20 @@ pub(crate) fn expert_stage_mirror_bytes(layer_bytes: usize, ranks: usize) -> Res
         .and_then(|bytes| bytes.checked_mul(ranks as u64))
         .filter(|_| ranks > 0)
         .ok_or_else(|| "expert stage mirror host charge overflow or zero ranks".to_string())
+}
+
+/// Pinned host RAM/GTT the borrowed slab stage's two donor restore copies take
+/// (`gpu_forward::slab_stage`): the overwritten arena prefix of each parity
+/// (`window`: the largest cold arena plus tail pad, or the whole donor
+/// allocation when the donor is a little smaller than that,
+/// `slab_stage::plan_slab_donors`) in one pinned allocation each, including
+/// that allocation's padding. Taken at load and held on top of the placement's
+/// pinned experts.
+pub(crate) fn slab_stage_mirror_bytes(window: [usize; 2]) -> Result<u64, String> {
+    (window[0] as u64)
+        .checked_add(window[1] as u64)
+        .and_then(|bytes| bytes.checked_add(2 * HOST_MAPPED_PAD_BYTES))
+        .ok_or_else(|| "slab stage mirror host charge overflows".to_string())
 }
 
 /// Rank `rank`'s share of an entry's payload: a routed expert stack (logical
@@ -3910,6 +3928,73 @@ mod tests {
     }
 
     #[test]
+    fn slab_stage_mirrors_are_the_two_overwritten_arena_prefixes_plus_their_pads() {
+        // mq2-xts: 512 E8P experts of 1,305,600 B per arena, plus the 4096 B
+        // tail pad, one pinned restore copy per layer parity.
+        let need = 512 * 1_305_600 + crate::expert_arena::ARENA_TAIL_PAD_BYTES;
+        assert_eq!(
+            slab_stage_mirror_bytes([need; 2]).unwrap(),
+            2 * need as u64 + 2 * HOST_MAPPED_PAD_BYTES
+        );
+        // Two 637.5 MiB arenas: 1275 MiB of host copies, against the packed
+        // stage's 2550 MiB, and never any VRAM.
+        assert_eq!(
+            (slab_stage_mirror_bytes([need; 2]).unwrap() - 2 * HOST_MAPPED_PAD_BYTES) >> 20,
+            1275
+        );
+        // Uneven parities and overflow.
+        assert_eq!(
+            slab_stage_mirror_bytes([1000, 24]).unwrap(),
+            1024 + 2 * HOST_MAPPED_PAD_BYTES
+        );
+        assert!(slab_stage_mirror_bytes([usize::MAX, 1]).is_err());
+    }
+
+    #[test]
+    fn narrow_link_slab_stage_is_borrowed_charged_nothing_and_keeps_every_layer() {
+        use crate::host_link::HostLink::Discrete;
+        let narrow = Discrete { gbps: 7.1 };
+        // The measured narrow link turns the stage on, but only the probe-free
+        // switch charges placement, so a slab load is charged no dedicated
+        // stage here: the stage it builds must borrow resident layers.
+        assert!(expert_stage_switch("gfx1100", None, || narrow));
+        assert!(!expert_stage_placement_switch("gfx1100", None));
+        assert!(!dedicated_slab_stage(
+            expert_stage_placement_switch("gfx1100", None),
+            true,
+            false
+        ));
+        // Same free VRAM: identical placement to the packed (borrowed) load
+        // and to stage=0, and the chunk admission charges no stage either.
+        let slab = xtx_dryrun("gfx1100", XTX_FREE_CAND, None, None, narrow, true);
+        let packed = xtx_dryrun("gfx1100", XTX_FREE_CAND, None, None, narrow, false);
+        let off = xtx_dryrun("gfx1100", XTX_FREE_CAND, None, Some("0"), narrow, true);
+        for run in [&slab, &off] {
+            assert_eq!(run.resident_layers, packed.resident_layers);
+            assert_eq!(run.host_tensors, packed.host_tensors);
+            assert_eq!(run.host_bytes, packed.host_bytes);
+            assert_eq!(run.resident_bytes, packed.resident_bytes);
+        }
+        assert_eq!(slab.placement_rows, packed.placement_rows);
+        assert_eq!(slab.placement_rows, off.placement_rows);
+        // Both donors are the last two resident layers of that frozen
+        // placement (whatever chunk policy sized it), parity ordered.
+        let last = slab.resident_layers;
+        let mut donors = [last - 2, last - 1];
+        donors.sort_by_key(|layer| layer % 2);
+        assert_eq!(slab.donors, Some(donors));
+        // Explicit `1` keeps the charged dedicated stage (fewer layers), and
+        // gfx1201 keeps its charged default, exactly as before.
+        let explicit = xtx_dryrun("gfx1100", XTX_FREE_CAND, None, Some("1"), narrow, true);
+        assert!(explicit.resident_layers < slab.resident_layers);
+        assert!(dedicated_slab_stage(
+            expert_stage_placement_switch("gfx1201", None),
+            true,
+            false
+        ));
+    }
+
+    #[test]
     fn ep4_stage_mirrors_charge_all_four_ranks_against_host_and_gtt() {
         let full = 512 * (1_740_800 + 870_400);
         let charge = expert_stage_mirror_bytes(full / 4, 4).unwrap();
@@ -5530,5 +5615,195 @@ mod tests {
                 rows
             );
         }
+    }
+
+    // ---- mq2-xts (mixed-codec slab) XTX placement + borrowed-stage dryrun ----
+    //
+    // The 48 trunk layers of `qwen3.8-flash-next.mq2-xts` come from the
+    // checked-in layout fixture (`tests/fixtures/mq2_xts_expert_layout.txt`:
+    // each layer's 512 experts' codec, read from the artifact's tensor index;
+    // its header records the artifact's stat and SHA-256): a layer's physical
+    // arena is the sum of its experts' gate/up + down payloads. Mixed MQ4/E8P
+    // layers: 782-840 MiB each, the largest layer 38 (840.45 MiB) being the
+    // placement's per-layer charge (the receipt's "840 MiB per expert layer").
+    // The MTP head keeps the legacy aggregates: 891,289,600 B gate/up +
+    // 445,644,800 B down.
+    use crate::gpu_forward::slab_stage::mq2_xts_layout as layout;
+    const MQ2_XTS_MTP_GATE_UP: u64 = 891_289_600;
+    const MQ2_XTS_MTP_DOWN: u64 = 445_644_800;
+
+    fn mq2_xts_manifest() -> Vec<WeightEntry> {
+        let mut weights = vec![entry("model.language_model.embed_tokens.weight", 0)];
+        weights[0].layer = None;
+        for layer in 0..48 {
+            weights.push(arena_entry(layer, layout::arena_bytes(layer)));
+        }
+        for suffix in ["gate_up_proj", "down_proj"] {
+            let mut mtp = entry(&format!("mtp.layers.0.mlp.experts.{suffix}"), 0);
+            mtp.layer = Some(0);
+            weights.push(mtp);
+        }
+        weights
+    }
+
+    fn mq2_xts_bytes(entry: &WeightEntry) -> Option<u64> {
+        Some(if entry.name.ends_with(crate::expert_arena::ARENA_SUFFIX) {
+            entry.logical_shape[0] as u64
+        } else if entry.name.ends_with("experts.gate_up_proj") {
+            MQ2_XTS_MTP_GATE_UP
+        } else if entry.name.ends_with("experts.down_proj") {
+            MQ2_XTS_MTP_DOWN
+        } else {
+            XTX_NON_EXPERT
+        })
+    }
+
+    /// `(resident layers, host expert tensors, pinned host bytes, per-layer
+    /// charge)` of one gfx1100 mq2-xts load at the receipt's free VRAM, the
+    /// slab recipe with the given stage env, on a measured narrow link.
+    fn mq2_xts_placement(stage_env: Option<&str>) -> (usize, usize, u64, u64) {
+        let narrow = crate::host_link::HostLink::Discrete { gbps: 7.1 };
+        let mut weights = mq2_xts_manifest();
+        let (non_expert, layer) = resident_split(&weights, mq2_xts_bytes).unwrap();
+        assert_eq!(non_expert, XTX_NON_EXPERT);
+        let rows =
+            crate::gpu_forward::prefill_chunk_requested_from("gfx1100", None, XTX_MAX_SEQ, || {
+                narrow
+            });
+        assert_eq!(rows, 8192, "the shipped narrow-link default chunk");
+        let charges = PlacementCharges::new(
+            layer,
+            dedicated_slab_stage(
+                expert_stage_placement_switch("gfx1100", stage_env),
+                true,
+                false,
+            ),
+        )
+        .unwrap();
+        let reserve = xtx_reserve(rows);
+        let resident_layers = auto_placement_layers(
+            XTX_FREE_CAND,
+            non_expert,
+            layer,
+            48,
+            reserve.bytes(),
+            &charges,
+        )
+        .unwrap();
+        let host_tensors = place_routed_experts(&mut weights, resident_layers);
+        let host_bytes = host_mapped_bytes(&weights, mq2_xts_bytes).unwrap();
+        (resident_layers, host_tensors, host_bytes, layer)
+    }
+
+    #[test]
+    fn mq2_xts_narrow_link_stage_overflow_keeps_7_resident_layers_and_33_4_gib_host() {
+        use crate::expert_arena::ARENA_TAIL_PAD_BYTES as PAD;
+        use crate::gpu_forward::slab_stage::{
+            borrowed_stage_need, layer_stage_cut, plan_slab_donors, stage_layer_report,
+            stage_split_counts,
+        };
+        // The shipped placement (8192-row chunk, 12622 MiB reserve, no stage
+        // charge): 7 resident layers, 43 host tensors, 33.4 GiB pinned. The
+        // stage-off load places identically, so the borrowed stage is free.
+        let (resident_layers, host_tensors, host_bytes, layer) = mq2_xts_placement(None);
+        assert_eq!(layer, 881_280_000, "layer 38, 840.45 MiB, is the charge");
+        assert_eq!(layer >> 20, 840);
+        assert_eq!(
+            (resident_layers, host_tensors),
+            (7, 43),
+            "layers 0..7 in VRAM, 43 expert tensors in pinned host RAM"
+        );
+        assert_eq!(
+            format!("{:.1}", host_bytes as f64 / (1u64 << 30) as f64),
+            "33.4"
+        );
+        let off = mq2_xts_placement(Some("0"));
+        assert_eq!(
+            (off.0, off.1, off.2),
+            (resident_layers, host_tensors, host_bytes)
+        );
+        // Explicit `1` charges the dedicated buffers and cedes layers.
+        assert!(mq2_xts_placement(Some("1")).0 < resident_layers);
+
+        // Borrowed stage: the largest cold arena of each parity over the
+        // host layers 7..48, the resident layers 0..7 as donors.
+        let need = borrowed_stage_need(
+            (resident_layers..48).map(|layer| (layer, layout::arena_bytes(layer))),
+        )
+        .unwrap();
+        // Even host layer 38 is 840.45 MiB; the largest odd one is layer 35.
+        assert_eq!(need, [881_280_000 + PAD, 853_862_400 + PAD]);
+        let resident: Vec<Option<usize>> = (0..resident_layers)
+            .map(|layer| Some(layout::arena_bytes(layer) + PAD))
+            .collect();
+        // Before: no even resident layer holds 840.45 MiB (the largest, layer 2,
+        // is 806.84 MiB), the `no resident slab layer of parity 0` refusal.
+        assert!(resident
+            .iter()
+            .step_by(2)
+            .all(|bytes| bytes.unwrap() < need[0]));
+        // After: parity 0 lends layer 2 (its whole allocation is the window,
+        // 33.6 MiB short of the stage), parity 1 lends layer 1, which holds
+        // the 814.31 MiB layer 35 whole.
+        let (donors, window) = plan_slab_donors(need, &resident).unwrap();
+        assert_eq!(donors, [2, 1]);
+        assert_eq!(window, [846_028_800 + PAD, need[1]]);
+        assert!(donors.iter().all(|&donor| donor < resident_layers));
+        // Residency is untouched: no VRAM is added, no resident layer is
+        // given up, and the only extra is the two pinned restore copies.
+        assert_eq!(
+            slab_stage_mirror_bytes(window).unwrap() - 2 * HOST_MAPPED_PAD_BYTES,
+            (window[0] + window[1]) as u64
+        );
+
+        // Per host layer, with the real expert layout: which layers overflow
+        // and how much of their arena stays reading host memory in place. The
+        // cut is always an expert boundary (an expert is staged or read in
+        // place whole), and each layer reports once, as at load.
+        let (arena_base, mut overflowing, mut worst) = (0x7f00_0000_0000usize, Vec::new(), 0usize);
+        let mut reports = Vec::new();
+        for layer in resident_layers..48 {
+            let (experts, arena) = layout::experts(layer);
+            let (gate_up, down) = layout::tables(&experts, arena_base);
+            let cut = layer_stage_cut(&gate_up, &down, arena_base, arena, window[layer % 2]);
+            assert!(cut + PAD <= window[layer % 2]);
+            assert!(
+                cut == arena || experts.iter().any(|e| e[0] == cut),
+                "layer {layer} cut {cut} is not an expert boundary"
+            );
+            let in_place = arena - cut;
+            reports.push(stage_layer_report(
+                layer,
+                donors[layer % 2],
+                arena,
+                cut,
+                stage_split_counts([&gate_up, &down], arena_base, cut),
+            ));
+            if in_place > 0 {
+                overflowing.push(layer);
+                worst = worst.max(in_place);
+                // Never more than the overflow plus one MQ4 expert, and never
+                // above 5% of the layer.
+                assert!(in_place <= arena + PAD - window[layer % 2] + 2_611_200);
+                assert!(in_place * 20 <= arena);
+            }
+        }
+        assert_eq!(overflowing, [10, 12, 18, 22, 26, 38, 42]);
+        assert_eq!(reports.len(), 41);
+        for report in &reports {
+            println!("{report}");
+        }
+        assert!(worst < 40 << 20, "worst layer reads {worst} B in place");
+        println!(
+            "[dryrun mq2-xts] placement chunk 8192 rows -> {resident_layers} resident layers, \
+             {host_tensors} host expert tensors ({:.1} GiB pinned); G2 borrowed stage: donors \
+             {donors:?}, windows {} + {} MiB (pinned restore copies, dedicated VRAM 0 MiB), \
+             {} of 41 host layers overflow, at most {} MiB of one layer reads in place",
+            host_bytes as f64 / (1u64 << 30) as f64,
+            window[0] >> 20,
+            window[1] >> 20,
+            overflowing.len(),
+            worst >> 20,
+        );
     }
 }

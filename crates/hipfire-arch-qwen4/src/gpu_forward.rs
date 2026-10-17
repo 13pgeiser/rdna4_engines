@@ -446,20 +446,27 @@ const QWEN4_STEP_INLINE_CAPACITY: usize = 384;
 const QWEN4_QSA_INLINE_CAPACITY: usize = 12;
 
 /// Long-prefill host-expert staging (G2). `1`/`0` force it on/off; unset it
-/// is on for gfx1201 (the card it was measured on, whatever its link) and for
-/// the borrowed-donor (packed) stage on any discrete device whose measured H2D
-/// link is narrow, below 16 GB/s ([`crate::host_link::expert_stage_default`]);
-/// it stays off for unified memory and when the link could not be measured.
+/// is on for gfx1201 (the card it was measured on, whatever its link) and
+/// for the borrowed-donor stage (packed aggregate and slab-arena layouts) on
+/// any discrete device whose measured H2D link is narrow, below 16 GB/s
+/// ([`crate::host_link::expert_stage_default`]); it stays off for unified
+/// memory and when the link could not be measured.
 /// The stage switch itself never changes placement: the expert placement
 /// charges the probe-free switch
 /// ([`crate::expert_residency::expert_stage_placement_enabled`], explicit
 /// value else gfx1201), not this link-aware default. A
-/// staged prefill borrows the VRAM of the last two resident expert layers as
-/// its two DMA stages (no dedicated VRAM; slab and tier layouts, which would
-/// allocate dedicated buffers, stage only under the probe-free switch), and
-/// restores them from pinned host copies (additional host RAM, separate from
-/// the placement's pinned experts) before the forward returns, so decode keeps
-/// today's residency.
+/// staged prefill borrows the VRAM of resident expert layers as its two DMA
+/// stages (no dedicated VRAM: the last two resident layers of a packed
+/// artifact, the latest resident slab layer of each parity that holds a cold
+/// arena for a slab artifact, or the parity's largest resident slab layer
+/// when it is within a sixteenth of its largest cold arena, whose overflowing
+/// cold layers then read their trailing experts in place; a tier layout,
+/// which would allocate dedicated buffers, stages only under the probe-free
+/// switch), and restores them from
+/// pinned host copies (additional host RAM, separate from the placement's
+/// pinned experts) before the forward returns, so decode keeps today's
+/// residency. Under the probe-free switch a slab artifact keeps its charged
+/// dedicated stage buffers instead.
 pub const QWEN4_EXPERT_STAGE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE";
 
 /// Forwards of at least this many rows stage ([`QWEN4_EXPERT_STAGE_ENV`]);
@@ -3718,13 +3725,15 @@ pub(crate) struct Qwen4ExpertStage {
     /// Sticky until the donors are back: a failed forward leaves it set,
     /// and every later forward restores first ([`Self::restore_blocking`]).
     state: std::cell::Cell<[DonorState; 2]>,
-    /// `Some` for a slab-arena stage: dedicated VRAM stage buffers (in
-    /// `mirrors`) instead of donor layers, per-layer rebased tables (in
-    /// `tables`), and the host sources ([`slab_stage`]).
+    /// `Some` for a slab-arena stage: per-layer rebased tables (in `tables`)
+    /// and the host sources ([`slab_stage`]). Its stage buffers are either
+    /// dedicated VRAM buffers (in `mirrors`) or, when `borrowed`, two
+    /// resident slab layers (`donors`, `donor_views`) restored from pinned
+    /// copies in `mirrors`.
     slab: Option<slab_stage::SlabStageMeta>,
 }
 
-mod slab_stage;
+pub(crate) mod slab_stage;
 
 impl Qwen4ExpertStage {
     const EP_ENV: &'static str = "HIPFIRE_EP_EXPERT_STAGE";
@@ -3789,25 +3798,38 @@ impl Qwen4ExpertStage {
         else {
             return Ok(None);
         };
-        // Slab arenas and tier layers use dedicated VRAM stage buffers.
-        // Only legacy aggregate placement may borrow resident donor layers.
-        // Dedicated buffers take fresh VRAM that only the probe-free placement
-        // switch charges to the frozen placement
-        // (`expert_stage_placement_enabled`: explicit `1`, or gfx1201); a
-        // default turned on by the measured link alone would allocate bytes no
-        // placement reserved, so it keeps the zero-copy
-        // mapped reads instead.
+        // Slab arenas and tier layers: dedicated VRAM stage buffers take fresh
+        // VRAM that only the probe-free placement switch charges to the frozen
+        // placement (`expert_stage_placement_enabled`: explicit `1`, or
+        // gfx1201). A stage the measured link alone turned on (a narrow
+        // discrete link, e.g. gfx1100) may not allocate bytes no placement
+        // reserved, and must not give resident layers up for
+        // them, so a slab arena load borrows two resident slab layers as the
+        // stage instead (restored from pinned host copies, like the legacy
+        // donors); a tier layout has no borrowed form and keeps the zero-copy
+        // mapped reads.
         if moe.iter().flatten().any(|layer| layer.slab.is_some())
             || bundle.weights.expert_tiers().is_some()
         {
-            if !crate::expert_residency::expert_stage_placement_enabled(&gpu.arch) {
-                eprintln!(
-                    "  qwen4 long-prefill expert staging: off (dedicated stage buffers are not charged to placement on {} unless {QWEN4_EXPERT_STAGE_ENV}=1; zero-copy mapped reads)",
-                    gpu.arch
-                );
-                return Ok(None);
-            }
-            return Self::new_slab(gpu, bundle, moe, first_host, chunk_rows);
+            let kind = slab_stage::slab_stage_kind(
+                crate::expert_residency::expert_stage_placement_enabled(&gpu.arch),
+                bundle.weights.expert_tiers().is_some(),
+            );
+            return match kind {
+                slab_stage::SlabStageKind::Dedicated => {
+                    Self::new_slab(gpu, bundle, moe, first_host, chunk_rows, false)
+                }
+                slab_stage::SlabStageKind::Borrowed => {
+                    Self::new_slab(gpu, bundle, moe, first_host, chunk_rows, true)
+                }
+                slab_stage::SlabStageKind::Off => {
+                    eprintln!(
+                        "  qwen4 long-prefill expert staging: off (dedicated tier stage buffers are not charged to placement on {} unless {QWEN4_EXPERT_STAGE_ENV}=1; zero-copy mapped reads)",
+                        gpu.arch
+                    );
+                    Ok(None)
+                }
+            };
         }
         let config = &bundle.config;
         // G2's stage layout is the frozen Flash-Next QT44/QT53 geometry.
@@ -4260,7 +4282,7 @@ impl Qwen4ExpertStage {
     /// charging what the trunk did not hide to this forward.
     fn join(&self, gpu: &Gpu) -> Result<(), Qwen4GpuForwardError> {
         if self.slab.is_some() {
-            return Ok(());
+            return self.slab_join(gpu);
         }
         for parity in 0..2 {
             if self.state.get()[parity] == DonorState::Overwritten {
@@ -4284,8 +4306,9 @@ impl Qwen4ExpertStage {
     /// anything reads the donors.
     fn restore_blocking(&self, gpu: &Gpu) -> Result<(), Qwen4GpuForwardError> {
         if self.slab.is_some() {
-            // Dedicated stage buffers: no donor was overwritten, nothing to restore.
-            return Ok(());
+            // Dedicated and tier stage buffers never overwrite an owner; a
+            // borrowed slab stage restores its donor arenas.
+            return self.slab_restore_blocking(gpu);
         }
         if self.state.get() == [DonorState::Resident; 2] {
             return Ok(());
