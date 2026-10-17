@@ -40,12 +40,57 @@ fi
 # -------------------------------
 # vmemoff shim (KMT workaround, see radiance-vmemoff/vmemoff.c)
 # -------------------------------
-# HSA runtime 1.21's KMT page-table path hangs on this host's kernel: hsaKmtMemoryVaMap
-# waits on a KIQ TLB-flush fence that is never signalled (reproducible with a 64 MiB
-# standalone HSA program; no driver timeout). The shim forces RUNTIME_ALLOC_REC_GRANULE
-# to 0, so the KV pool uses one-shot allocation through the plain path.
-# VMEMOFF=0 ./radiance.sh runs plain local/radiance without it (e.g. once an upstream
-# fix or a ROCm 7.14.1 build is verified).
+# WHY THIS EXISTS -- radiance hangs at startup on this host, with nothing wrong in radiance.
+#
+# Symptom: the server dies after loading weights and printing "chunk geometry", before
+# /health ever answers. GPU sits idle (~15 W), the stallwatch never fires (it skips
+# threads blocked in a driver ioctl), and every amdgpu ring shows clean fences.
+#
+# The hang point (gdb stack of the hung process, all inside libhsa-runtime64.so.1.21.0):
+#
+#   core/mem/kv.cpp  KV pool "backing" commit      (elastic vmem pool, configure_kv)
+#     -> core/device/aql.cpp  a_vmem_commit()
+#        -> hsa_amd_vmem_set_access(GPU)
+#           -> rocr::core::Runtime::VMemorySetAccess
+#              -> MappedHandleAllowedAgent::EnableAccess
+#                 -> rocr::AMD::KfdDriver::Map
+#                    -> hsaKmtMemoryVaMap                      (KMT = KFD Memory Table)
+#                       -> DRM_IOCTL_SYNCOBJ_ARRAY_WAIT        (renderD128) -- never returns
+#
+# KMT maps the pool's virtual range into the GPU page tables by having KIQ issue a TLB
+# flush, and then waits on the resulting fence through a DRM syncobj. On this box
+# (kernel 6.12.113+deb13, gfx1201/RDNA4) that fence is never signalled: ftrace shows a
+# kernel worker spinning on MES/KIQ registers forever, the flush never completes, and the
+# driver has no timeout or reset on this path.
+#
+# How it was established (2026-10): reproduced without any radiance code by a 64 MiB
+# standalone HSA program doing reserve -> map -> set_access; the GPU-access call hangs,
+# the CPU-access call on the same mapping returns instantly; every size tested hangs; the
+# hang is intermittent (one success out of eight tries), which is why the log looks random.
+# hipfire, llama.cpp and the vLLM stack all work fine on this same HSA runtime because
+# none of them use the HSA vmem (KMT) path -- they use plain hipMalloc.
+#
+# THE WORKAROUND: radiance has a supported "no virtual memory management" mode.
+# VMem::supported() (core/device/dispatch.cpp:231) is false when the VRAM pool reports a
+# zero RUNTIME_ALLOC_REC_GRANULE, and Pool::init_elastic() then falls back to init(): the
+# KV pool is allocated whole, once, through the plain allocation path -- which works here.
+# The vmemoff.so shim (radiance-vmemoff/) intercepts hsa_amd_memory_pool_get_info and
+# zeroes exactly that one field; nothing else is touched.
+#
+# COST: the KV pool holds its full budget for the whole run instead of committing elastically.
+# Irrelevant at TP=1 with one model served, this is a memory-flexibility trade, not a
+# correctness one.
+#
+# TESTING A REAL FIX: VMEMOFF=0 ./run_radiance.sh runs plain local/radiance without the shim.
+# Candidates: a ROCm 7.14.1 build (Dockerfile's commented ARG), a newer host kernel, or an
+# upstream fix in the ROCm HSA runtime's KMT code (this is worth reporting to AMD: fence
+# never signalled, no driver timeout). Once one is verified, drop this block and the
+# PRELOAD line below it.
+#
+# MECHANICS: vmemoff.so is gitignored (only the source is tracked); if missing it
+# is rebuilt from vmemoff.c inside the radiance-build image. local/radiance-vmemoff is
+# derived from local/radiance with the shim at /opt/vmemoff.so, only while it is missing,
+# so it survives docker system prune -a.
 VMEMOFF="${VMEMOFF:-1}"
 if [ "$VMEMOFF" = 1 ]; then
     shim="$CURDIR/radiance-vmemoff/vmemoff.so"

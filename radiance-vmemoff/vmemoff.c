@@ -7,10 +7,10 @@
  * virtual memory management" and its KV pool falls back to one-shot allocation
  * through the plain path, which works.
  *
- * radiance.sh derives local/radiance-vmemoff from local/radiance with this shim
- * at /opt/vmemoff.so and sets LD_PRELOAD. vmemoff.so is committed as a build
- * cache; it is rebuilt from vmemoff.c inside the radiance-build image when
- * missing. VMEMOFF=0 ./radiance.sh runs plain local/radiance without it.
+ * run_radiance.sh derives local/radiance-vmemoff from local/radiance with this
+ * shim at /opt/vmemoff.so and sets LD_PRELOAD. vmemoff.so is gitignored but kept
+ * on disk; it is rebuilt from vmemoff.c inside the radiance-build image when
+ * missing. VMEMOFF=0 ./run_radiance.sh runs plain local/radiance without it.
  *
  * Build:  gcc -shared -fPIC -o vmemoff.so vmemoff.c -I/opt/rocm/include
  */
