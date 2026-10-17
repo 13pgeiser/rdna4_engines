@@ -98,9 +98,10 @@ inline int MlpFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, co
     RAD_ARCH_TRY(down.probe(b, nm, g, down_base, { src.down }));
     RAD_ARCH_TRY(gq_ffn.declare(b, g, w.gate_up, w.ffn, g.n_ff, "silu", 0, down.reads_x));
 
-    /* The fold (decl_gated_fold), an fp8a8 tile, so bf16, MXFP4, rotated 5-bit and 4-bit gate_up
-     * weights take the pair. */
-    if (!gate_up.bf16 && !gate_up.mx && !gate_up.paro5 && !gate_up.w4)
+    /* The fold (decl_gated_fold), an fp8a8 tile, so bf16, MXFP4, rotated 5-bit, 4-bit and int8
+     * gate_up weights take the pair. Declared over int8 codes, only a host kernel would take it,
+     * and that would pin the layer's weights to the host. */
+    if (!gate_up.bf16 && !gate_up.mx && !gate_up.paro5 && !gate_up.w4 && !gate_up.i8)
         op_gated = decl_gated_fold(b, g.max_tok, gate_up.N, gate_up.K, gate_up.w, gate_up.ws,
                                    { w.h.q, w.h.s },
                                    gq_ffn.want_x
