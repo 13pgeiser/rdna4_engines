@@ -3990,6 +3990,7 @@ const TYPED_BOOL_DEVELOPER_KEYS: &[&str] = &[
     "developer.qwen4_moe_sym_iu4",
     "developer.qwen4_d2_default",
     "developer.moe_sym_iu4",
+    "developer.qwen4_slowlink_prefill",
 ];
 
 pub fn is_typed_bool_developer_key(key: &str) -> bool {
@@ -6782,6 +6783,41 @@ mod tests {
                 "{raw}"
             );
             layer.validate().unwrap();
+        }
+    }
+
+    /// S1 slow-link prefill selector: `1` lab candidate, `0` incumbent kill
+    /// switch, unset automatic. Typed so a stray spelling is a loud load
+    /// error, never a silent unset.
+    #[test]
+    fn developer_slowlink_prefill_is_a_typed_tristate_key() {
+        const KEY: &str = "developer.qwen4_slowlink_prefill";
+        assert_eq!(
+            developer_key_for_env("HIPFIRE_QWEN4_SLOWLINK_PREFILL").as_deref(),
+            Some(KEY)
+        );
+        assert_eq!(
+            developer_env_for_key(KEY).as_deref(),
+            Some("HIPFIRE_QWEN4_SLOWLINK_PREFILL")
+        );
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("False", false)] {
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(KEY, raw).unwrap();
+            assert_eq!(layer.get(KEY), Some(&ConfigValue::Bool(want)), "{raw}");
+            layer.validate().unwrap();
+            assert_eq!(typed_developer_bool_value(KEY, Some(raw)), Some(want));
+        }
+        assert_eq!(typed_developer_bool_value(KEY, None), None);
+        for bad in ["", "2", "on", "off", "auto", "yes"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(KEY, bad).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == KEY),
+                "{bad:?}: {error}"
+            );
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
         }
     }
 
