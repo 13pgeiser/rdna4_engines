@@ -147,29 +147,19 @@ fn dflash_gemm_q8_lmhead(
         );
     }
 
-    const Q8_LM_MAX: usize = 64;
-    let mut chunk_start = 0usize;
-    while chunk_start < n {
-        let chunk_end = (chunk_start + Q8_LM_MAX).min(n);
-        let chunk_n = chunk_end - chunk_start;
-        let x_chunk = x.sub_offset(chunk_start * w_out.k, chunk_n * w_out.k);
-        let y_chunk = y.sub_offset(chunk_start * w_out.m, chunk_n * w_out.m);
-        // #397 Ship 5.3: GemmQ8_0Batched routes to the identical
-        // gpu.gemm_q8_0_batched the prior direct call used.
-        run_spec_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmQ8_0Batched,
-            &w_out.buf,
-            w_out.gpu_dtype,
-            &x_chunk,
-            &y_chunk,
-            w_out.m,
-            w_out.k,
-            chunk_n,
-        )?;
-        chunk_start = chunk_end;
-    }
-    Ok(())
+    // The dispatch key is the scalar Q8 kernel chunked at its 64-row cap
+    // (`rdna_compute::gemm::q8_0_batched_chunks`); pass all `n` rows.
+    run_spec_gemm_key(
+        gpu,
+        hipfire_dispatch::types::KernelKey::GemmQ8_0Batched,
+        &w_out.buf,
+        w_out.gpu_dtype,
+        x,
+        y,
+        w_out.m,
+        w_out.k,
+        n,
+    )
 }
 
 /// Shared MQ{2,3,4,5,6}G256V2 batched lm_head launcher used by the five

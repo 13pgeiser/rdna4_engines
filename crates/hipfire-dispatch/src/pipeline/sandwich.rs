@@ -143,9 +143,8 @@ pub fn gemm_rows(
             .gemm_f32_batched(w.buf, x, y, w.m, w.k, rows)
             .map_err(hip),
         DType::Q8_0 if *EAGLE_STRICT => {
-            // The scalar kernel holds at most 64 rows.
-            for off in (0..rows).step_by(64) {
-                let n = (rows - off).min(64);
+            // The bare scalar kernel holds at most `Q8_0_BATCHED_MAX_BATCH` rows.
+            for (off, n) in rdna_compute::gemm::q8_0_batched_chunks(rows) {
                 gpu.gemm_q8_0_batched(
                     w.buf,
                     &x.sub_offset(off * w.k, n * w.k),

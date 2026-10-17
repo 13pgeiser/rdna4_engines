@@ -1019,7 +1019,9 @@ fn forward_rows(
                 let logits_b = bufs.alloc(b * vocab, "spec_logits_b")?;
                 // Not `_chunked`: verify stays on the scalar kernel rather
                 // than the gfx12 WMMA variant, whose drift accumulates in KV.
-                let lm_result = gpu.gemm_q8_0_batched(
+                // `_f32_chunked` is that scalar kernel split at its 64-row
+                // cap, so a block wider than 64 rows cannot assert (#732).
+                let lm_result = gpu.gemm_q8_0_batched_f32_chunked(
                     &weights.lm_head.buf,
                     normed_hidden,
                     &logits_b,

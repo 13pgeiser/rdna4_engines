@@ -13,6 +13,23 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 use std::sync::{LazyLock, OnceLock};
 
+/// Most activation rows one `gemm_q8_0_batched` launch takes: the kernel keeps
+/// one accumulator per row and `gemm_q8_0_batched` asserts above this. Callers
+/// with more rows go through [`Gpu::gemm_q8_0_batched_f32_chunked`], which
+/// splits with [`q8_0_batched_chunks`].
+pub const Q8_0_BATCHED_MAX_BATCH: usize = 64;
+
+/// The `(row_offset, rows)` launches [`Gpu::gemm_q8_0_batched_f32_chunked`]
+/// makes for `n` activation rows: consecutive, non-overlapping, covering
+/// `0..n` exactly, each at most [`Q8_0_BATCHED_MAX_BATCH`] rows (the last takes
+/// the remainder). `n == 0` yields no launch. Pure; the single place the
+/// split is decided.
+pub fn q8_0_batched_chunks(n: usize) -> impl Iterator<Item = (usize, usize)> {
+    (0..n)
+        .step_by(Q8_0_BATCHED_MAX_BATCH)
+        .map(move |off| (off, (n - off).min(Q8_0_BATCHED_MAX_BATCH)))
+}
+
 /// `gdn_chunk_prep` targets of the fused F2 QKVZA epilogue
 /// ([`Gpu::gemm_qkvza_mq4g256v2_fp8_gdn_prepared`]).
 pub struct F2GdnTargets<'a> {
@@ -26251,9 +26268,10 @@ impl Gpu {
 
     /// Y[batch, M] = X[batch, K] @ A_q8[M, K]^T — batched Q8_0 GEMM.
     /// One block per output row (32 threads, one wave). Each thread holds
-    /// MAX_BATCH=16 per-batch accumulators and broadcasts each weight load.
-    /// Drops the (batch_size − 1)× weight re-reads of the GEMV-loop path
-    /// without splitting launches.
+    /// `Q8_0_BATCHED_MAX_BATCH` (64) per-batch accumulators and broadcasts each
+    /// weight load. Drops the (batch_size − 1)× weight re-reads of the GEMV-loop
+    /// path. One launch only: `batch_size` above 64 asserts, so callers that can
+    /// see more rows use [`Self::gemm_q8_0_batched_f32_chunked`] (#732).
     pub fn gemm_q8_0_batched(
         &mut self,
         a_raw: &GpuTensor,
@@ -26265,8 +26283,8 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         assert!(
-            batch_size <= 64,
-            "gemm_q8_0_batched: batch_size {batch_size} exceeds kernel MAX_BATCH=64"
+            batch_size <= Q8_0_BATCHED_MAX_BATCH,
+            "gemm_q8_0_batched: batch_size {batch_size} exceeds kernel MAX_BATCH={Q8_0_BATCHED_MAX_BATCH}; use gemm_q8_0_batched_f32_chunked"
         );
         self.ensure_kernel(
             "gemm_q8_0_batched",
@@ -26452,14 +26470,10 @@ impl Gpu {
             return self.gemv_q8_0_staged_rows(a_raw, x, y, m, k, n);
         }
         self.bind_thread()?;
-        const MAX_BATCH: usize = 64;
-        let mut off = 0;
-        while off < n {
-            let take = (n - off).min(MAX_BATCH);
+        for (off, take) in q8_0_batched_chunks(n) {
             let x_sub = x.sub_offset(off * k, take * k);
             let y_sub = y.sub_offset(off * m, take * m);
             self.gemm_q8_0_batched(a_raw, &x_sub, &y_sub, m, k, take)?;
-            off += take;
         }
         Ok(())
     }

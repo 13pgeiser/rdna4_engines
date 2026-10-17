@@ -1638,9 +1638,14 @@ pub(crate) fn lm_head_batched(
     batch_size: usize,
 ) -> HipResult<()> {
     match output.gpu_dtype {
-        DType::Q8_0 => {
-            gpu.gemm_q8_0_batched(&output.buf, hidden, logits, output.m, output.k, batch_size)
-        }
+        DType::Q8_0 => gpu.gemm_q8_0_batched_f32_chunked(
+            &output.buf,
+            hidden,
+            logits,
+            output.m,
+            output.k,
+            batch_size,
+        ),
         DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(
             &output.buf,
             hidden,
