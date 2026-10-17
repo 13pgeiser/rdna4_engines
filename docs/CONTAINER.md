@@ -120,6 +120,17 @@ Non-root: the entrypoint starts as root only to add the groups that own
 (uid 1000) with `setpriv`. Rootless podman keeps the invoking user's groups
 through the `run.oci.keep_original_groups` annotation set in `compose.yml`.
 
+Host model directory (`HIPFIRE_MODELS_PATH=/path/to/models`): rootless podman
+maps container root to your host user and uid 1000 to a subordinate id that owns
+none of your files, so `hipfire` cannot write a directory you own (the pull of a
+missing sidecar fails with `Permission denied`). When the entrypoint sees a
+rootless user namespace and the models directory is not writable by `hipfire`,
+it keeps the namespace's root instead of dropping (it logs one line saying so);
+that root is exactly your host user, and files the pull writes are owned by you.
+No `chown`, `chmod` or `podman unshare` is needed. Rootful docker still drops,
+so a bind-mounted directory there must be writable by uid 1000
+(`chown 1000:1000 /path/to/models`) or be a named volume.
+
 ## Profiles
 
 ### `monitoring`
@@ -188,6 +199,10 @@ sudo docker/hipfire-halo-tune.sh apply
 - **`permission denied` on `/dev/kfd`:** the user needs the `render` group on the
   host. Rootless podman relies on the keep-groups annotation; check that your
   podman honors it. `HIPFIRE_RUN_AS_ROOT=1` skips the privilege drop and is a last resort.
+- **`Permission denied` creating a model file under a host `HIPFIRE_MODELS_PATH`:**
+  rootful docker: `chown 1000:1000` the directory (or use the default named
+  volume). Rootless podman handles this itself, see Non-root above; if it
+  persists, the image predates that entrypoint, rebuild it.
 - **`docker compose` not found:** install the compose plugin. `podman compose`
   needs a compose provider (`docker-compose` or `podman-compose`).
 - **Model pull fails:** check network access and, for gated repos, `HF_TOKEN`.

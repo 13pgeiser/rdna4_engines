@@ -786,7 +786,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1658
+**Count:** 1659
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1707,6 +1707,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MMQ_SCREEN_THRESHOLD` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | stable |
 | `HIPFIRE_MODEL` | crates/hipfire-config/src/lib.rs, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py | stable |
 | `HIPFIRE_MODELS_DIR` | autoresearch/ar/gate/run.py, benchmarks/quality-baselines/harness/spe_ablation.sh | stable |
+| `HIPFIRE_MODELS_PATH` | docker/hipfire-entrypoint.sh | harness |
 | `HIPFIRE_MODEL_PATH` | autoresearch/ar/census.py | harness |
 | `HIPFIRE_MODEL_STORE` | scripts/baseline_quant_smoke.sh | harness |
 | `HIPFIRE_MODULE_LOAD_AUDIT` | crates/hip-bridge/src/ffi.rs, crates/hipfire-arch-qwen4/src/mtp_spec.rs | developer |

@@ -53,9 +53,27 @@ if [ "$(id -u)" -eq 0 ] && [ "${HIPFIRE_RUN_AS_ROOT:-0}" != 1 ]; then
         esac
     done
     if [ "$keep" = 1 ]; then
-        exec setpriv --reuid=hipfire --regid=hipfire --keep-groups -- "$@"
+        drop="setpriv --reuid=hipfire --regid=hipfire --keep-groups --"
+    else
+        drop="setpriv --reuid=hipfire --regid=hipfire --groups=$groups --"
     fi
-    exec setpriv --reuid=hipfire --regid=hipfire --groups="$groups" -- "$@"
+    # Rootless runtimes map container root to the invoking host user and uid
+    # 1000 (hipfire) to a subordinate id that owns none of that user's files, so
+    # a bind-mounted host model directory (HIPFIRE_MODELS_PATH=/path) is not
+    # writable by hipfire and the pull of a missing sidecar fails. There, root
+    # inside the namespace is no more privileged than the user who started the
+    # container, so keep it instead of dropping. A rootful runtime, or a
+    # directory hipfire can write, still drops.
+    models=${HIPFIRE_HOME:-/home/hipfire/.hipfire}/models
+    host_root=$(awk '$1 == 0 { print $2; exit }' /proc/self/uid_map 2>/dev/null || :)
+    # shellcheck disable=SC2086 # $drop is a fixed word list
+    if [ -d "$models" ] && [ -n "$host_root" ] && [ "$host_root" != 0 ] &&
+        ! $drop test -w "$models" -a -x "$models"; then
+        printf '%s\n' "hipfire: $models is not writable by uid 1000 (rootless user namespace); running as the container root, which is your host user" >&2
+        exec "$@"
+    fi
+    # shellcheck disable=SC2086 # $drop is a fixed word list
+    exec $drop "$@"
 fi
 
 exec "$@"
