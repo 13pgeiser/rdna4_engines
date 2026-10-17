@@ -1201,11 +1201,38 @@ def write_kldseq(path: Path, chunks: list[tuple[float, float, float]]) -> None:
     path.write_bytes(b"HFKSEQ\0\0" + struct.pack("<III", 2, len(chunks), 0) + body)
 
 
-_TEST_LINE = re.compile(r"^test (\S+) \.\.\. (ok|FAILED|ignored)", re.M)
+_TEST_HEAD = re.compile(r"^test (\S+) \.\.\. ?(.*)$")
+_TEST_STATUS = re.compile(r"(ok|FAILED|ignored)\b")
+_BARE_STATUS = re.compile(r"^(ok|FAILED|ignored)\s*$")
 _TEST_RESULT = re.compile(
     r"^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out", re.M
 )
 _RUNNING = re.compile(r"^running (\d+) tests?", re.M)
+
+
+def parse_test_lines(text: str) -> list[dict]:
+    """Per-test statuses in completion order. libtest prints ``test NAME ... ``
+    and then the status, but anything the test writes to the shared stdout in
+    between (e.g. the ``--nocapture`` child libtest run that
+    ``disk_snapshots_restore_after_restart_on_flash_next`` spawns) pushes the
+    status onto a later line of its own. A header without a status waits on a
+    stack; the next bare status line completes the innermost pending test (a
+    nested run finishes before its parent)."""
+    tests: list[dict] = []
+    pending: list[str] = []
+    for line in text.splitlines():
+        head = _TEST_HEAD.match(line)
+        if head:
+            status = _TEST_STATUS.match(head.group(2))
+            if status:
+                tests.append({"name": head.group(1), "status": status.group(1)})
+            else:
+                pending.append(head.group(1))
+            continue
+        bare = _BARE_STATUS.match(line)
+        if bare and pending:
+            tests.append({"name": pending.pop(), "status": bare.group(1)})
+    return tests
 
 
 def parse_cargo_test(text: str) -> dict:
@@ -1216,7 +1243,7 @@ def parse_cargo_test(text: str) -> dict:
     ]
     return {
         "running": [int(m.group(1)) for m in _RUNNING.finditer(text)],
-        "tests": [{"name": m.group(1), "status": m.group(2)} for m in _TEST_LINE.finditer(text)],
+        "tests": parse_test_lines(text),
         "results": results,
         "passed": sum(r["passed"] for r in results),
         "failed": sum(r["failed"] for r in results),

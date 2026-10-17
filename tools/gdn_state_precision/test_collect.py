@@ -812,6 +812,26 @@ class TestOutputTests(TempCase):
         self.assertEqual(collect.classify_test(0, False, skipped, ("sampled_x",))[0], "incomplete")
         self.assertEqual(collect.classify_test(0, False, collect.parse_cargo_test("garbage"), ())[0], "incomplete")
 
+    def test_status_split_by_nested_nocapture_child(self):
+        # j1749 disk_snapshots_restore_after_restart_on_flash_next stdout shape: the test re-runs
+        # itself as a --nocapture child, whose output lands between the parent's `test NAME ... `
+        # header and its status, so both statuses arrive on bare lines (child first).
+        name = "disk_snapshots_restore_after_restart_on_flash_next"
+        res = "test result: {}. 1 passed; {} failed; 0 ignored; 0 measured; 11 filtered out; finished in 1s\n"
+        nested = (f"\nrunning 1 test\ntest {name} ... \nrunning 1 test\n"
+                  f"test {name} ... HIPFIRE_GDN_TEST_STATE_QUANT state_quant=fp32 gdn_format=f32\nok\n\n"
+                  + res.format("ok", 0) + "\nok\n\n" + res.format("ok", 0))
+        p = collect.parse_cargo_test(nested)
+        self.assertEqual(p["tests"], [{"name": name, "status": "ok"}, {"name": name, "status": "ok"}])
+        self.assertEqual(collect.classify_test(0, False, p, (name,)), ("ok", []))
+        failed = nested.replace("\n\nok\n\n" + res.format("ok", 0), "\n\nFAILED\n\n" + res.format("FAILED", 1))
+        p = collect.parse_cargo_test(failed)
+        self.assertEqual([t["status"] for t in p["tests"]], ["ok", "FAILED"])
+        self.assertEqual(collect.classify_test(0, False, p, (name,))[0], "failed")
+        # A header whose status never arrives stays incomplete.
+        cut = f"running 1 test\ntest {name} ... \n" + res.format("ok", 0)
+        self.assertEqual(collect.classify_test(0, False, collect.parse_cargo_test(cut), (name,))[0], "incomplete")
+
     def sampled_child(self, cfg_dir: Path, stdout: str, rc=0, coverage=None, config_text="mode q8_ef", graph="unset"):
         cdir = cfg_dir
         (cdir / "sampled").mkdir(parents=True)
