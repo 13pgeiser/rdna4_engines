@@ -2430,6 +2430,7 @@ mod render_tests {
                 queue_depth: 1,
                 requests_served: 7,
                 recent_tok_s: Some(151.2),
+                loaded_config: None,
             }),
             model_ids: vec!["qwen3.5:9b".into(), "qwen3.5:27b".into()],
             vram: VramState::Available(vec![GpuMem {

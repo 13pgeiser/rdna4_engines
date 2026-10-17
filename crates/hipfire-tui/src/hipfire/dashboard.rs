@@ -91,6 +91,16 @@ pub enum LoadState {
     Unavailable(String),
 }
 
+/// Values the resident model was actually loaded with, as reported by the
+/// serve's load ack (`/stats` `loaded_config`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoadedConfig {
+    pub model: String,
+    pub kv_mode: Option<String>,
+    pub kv_backend: Option<String>,
+    pub max_seq: Option<u64>,
+}
+
 /// Stats parsed from the serve's GET /stats endpoint.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ServeStats {
@@ -99,6 +109,8 @@ pub struct ServeStats {
     pub queue_depth: u64,
     pub requests_served: u64,
     pub recent_tok_s: Option<f64>,
+    /// `None` on an older serve without the field, or while nothing is resident.
+    pub loaded_config: Option<LoadedConfig>,
 }
 
 /// A full Dashboard snapshot. `serve_up` is the single source of truth for the
@@ -579,6 +591,29 @@ pub fn parse_stats(body: &str) -> Option<ServeStats> {
         queue_depth: as_u64("queue_depth"),
         requests_served: as_u64("requests_served"),
         recent_tok_s,
+        loaded_config: parse_loaded_config(v.get("loaded_config")),
+    })
+}
+
+/// Parse the `/stats` `loaded_config` object. A missing field, a non-object
+/// (`null` while no model is resident) or an object without a model name is
+/// `None`, so an older serve that lacks the field still parses; the inner
+/// KV/context fields stay `None` individually when null or mistyped.
+fn parse_loaded_config(value: Option<&Value>) -> Option<LoadedConfig> {
+    let obj = value?.as_object()?;
+    let model = match obj.get("model") {
+        Some(Value::String(s)) if !s.is_empty() => s.clone(),
+        _ => return None,
+    };
+    let text = |key: &str| match obj.get(key) {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    };
+    Some(LoadedConfig {
+        model,
+        kv_mode: text("kv_mode"),
+        kv_backend: text("kv_backend"),
+        max_seq: obj.get("max_seq").and_then(|x| x.as_u64()),
     })
 }
 
@@ -1672,6 +1707,45 @@ mod tests {
         assert_eq!(parse_health_model("not json"), None);
         assert_eq!(parse_health_model(""), None);
         assert_eq!(parse_health_model("[1,2,3]"), None);
+    }
+
+    #[test]
+    fn stats_loaded_config_present() {
+        let b = r#"{"model":"q","uptime_s":1,"queue_depth":0,"requests_served":0,"recent_tok_s":null,"loaded_config":{"model":"qwen3.5:4b","kv_mode":"asym3","kv_backend":"paged","max_seq":32768}}"#;
+        let s = parse_stats(b).expect("parse");
+        assert_eq!(
+            s.loaded_config,
+            Some(LoadedConfig {
+                model: "qwen3.5:4b".into(),
+                kv_mode: Some("asym3".into()),
+                kv_backend: Some("paged".into()),
+                max_seq: Some(32768),
+            })
+        );
+    }
+
+    #[test]
+    fn stats_loaded_config_absent_or_null_is_none() {
+        // Older serve: no field at all.
+        let old = r#"{"model":"q","uptime_s":1,"queue_depth":0,"requests_served":0}"#;
+        assert_eq!(parse_stats(old).unwrap().loaded_config, None);
+        // No model resident: serve sends null.
+        let none = r#"{"model":null,"uptime_s":1,"queue_depth":0,"requests_served":0,"loaded_config":null}"#;
+        assert_eq!(parse_stats(none).unwrap().loaded_config, None);
+    }
+
+    #[test]
+    fn stats_loaded_config_null_fields_stay_none() {
+        let b = r#"{"model":"q","loaded_config":{"model":"q","kv_mode":null,"kv_backend":null,"max_seq":null}}"#;
+        assert_eq!(
+            parse_stats(b).unwrap().loaded_config,
+            Some(LoadedConfig {
+                model: "q".into(),
+                kv_mode: None,
+                kv_backend: None,
+                max_seq: None,
+            })
+        );
     }
 
     #[test]

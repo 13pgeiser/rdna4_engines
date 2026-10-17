@@ -318,6 +318,13 @@ pub(crate) struct LoadedInfo {
     /// Full render error from the daemon's baseline effort probe for the
     /// resident model's chat template; `None` when the probe rendered.
     pub(crate) reasoning_effort_probe_error: Option<String>,
+    /// KV mode the daemon resolved for this load (`kv_mode` in the ack);
+    /// `None` when the ack did not carry one.
+    pub(crate) kv_mode: Option<String>,
+    /// KV backend the daemon admitted (`kv_backend` in the ack).
+    pub(crate) kv_backend: Option<String>,
+    /// `max_seq` the daemon reported in the ack (not the requested value).
+    pub(crate) max_seq: Option<u64>,
 }
 
 /// Rollout switches for the VMM continuous-batching route (PLAN §6 Slice1C).
@@ -2353,6 +2360,15 @@ impl ServeRuntime {
                 reasoning_effort_native: self.current_reasoning_effort_native,
                 reasoning_efforts: self.current_reasoning_efforts.clone(),
                 reasoning_effort_probe_error: ack_reasoning_effort_probe_error(&loaded),
+                kv_mode: loaded
+                    .get("kv_mode")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                kv_backend: loaded
+                    .get("kv_backend")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                max_seq: loaded.get("max_seq").and_then(serde_json::Value::as_u64),
             };
             // Report the model the way it was requested. A path-form
             // request now resolves its registry entry (for sidecars and
@@ -3967,6 +3983,9 @@ mod tests {
                 reasoning_effort_native: true,
                 reasoning_efforts: vec!["low".into(), "high".into()],
                 reasoning_effort_probe_error: Some("render failed".into()),
+                kv_mode: Some("asym3".into()),
+                kv_backend: Some("paged".into()),
+                max_seq: Some(32768),
             },
             ..ServeMeta::new("test".to_owned())
         });

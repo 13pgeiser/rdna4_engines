@@ -814,6 +814,21 @@ async fn serve_connection(
     }
 }
 
+/// `/stats` `loaded_config`: the KV mode, KV backend and context the daemon
+/// reported in the resident model's load ack. `null` while no model is
+/// resident; individual fields are `null` when the ack did not carry them.
+fn loaded_config_json(meta: &crate::serve::ServeMeta) -> serde_json::Value {
+    let Some(model) = &meta.current_model else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "model": model,
+        "kv_mode": meta.loaded.kv_mode,
+        "kv_backend": meta.loaded.kv_backend,
+        "max_seq": meta.loaded.max_seq,
+    })
+}
+
 /// Format one `/v1/models` entry.
 ///
 /// `runtime` is `Some((load facts, effective ctx))` only for the resident
@@ -1032,6 +1047,7 @@ async fn handle_request(
                 "retries_attempted": meta.retries_attempted,
                 "retries_succeeded": meta.retries_succeeded,
                 "recent_tok_s": meta.recent_tok_s,
+                "loaded_config": loaded_config_json(&meta),
             });
             json_response(body, 200)
         }
@@ -2942,6 +2958,7 @@ mod tests {
             reasoning_effort_native: false,
             reasoning_efforts: Vec::new(),
             reasoning_effort_probe_error: None,
+            ..LoadedInfo::default()
         };
         let resident = model_entry("qwen3.5:2b", Some(1790385975), Some((&loaded, 82944)));
         assert_eq!(resident["created"], serde_json::json!(1790385975u64));
@@ -2977,6 +2994,7 @@ mod tests {
             reasoning_effort_native: false,
             reasoning_efforts: Vec::new(),
             reasoning_effort_probe_error: None,
+            ..LoadedInfo::default()
         };
         let entry = model_entry("qwen3.8:27b", None, Some((&vision, 150000)));
         assert_eq!(
@@ -3033,6 +3051,45 @@ mod tests {
         assert!(entry.get("created").is_none());
         assert!(entry.get("meta").is_none());
         assert!(entry.get("architecture").is_none());
+    }
+
+    #[test]
+    fn loaded_config_json_reports_the_resident_models_ack_facts() {
+        let mut meta = crate::serve::ServeMeta::new("test".to_owned());
+        meta.current_model = Some("qwen3.5:4b".to_owned());
+        meta.loaded = LoadedInfo {
+            kv_mode: Some("asym3".to_owned()),
+            kv_backend: Some("paged".to_owned()),
+            max_seq: Some(32768),
+            ..LoadedInfo::default()
+        };
+        assert_eq!(
+            loaded_config_json(&meta),
+            serde_json::json!({
+                "model": "qwen3.5:4b",
+                "kv_mode": "asym3",
+                "kv_backend": "paged",
+                "max_seq": 32768u64,
+            })
+        );
+
+        // Resident, but the ack carried none of the facts: object with nulls.
+        meta.loaded = LoadedInfo::default();
+        assert_eq!(
+            loaded_config_json(&meta),
+            serde_json::json!({
+                "model": "qwen3.5:4b",
+                "kv_mode": null,
+                "kv_backend": null,
+                "max_seq": null,
+            })
+        );
+    }
+
+    #[test]
+    fn loaded_config_json_is_null_without_a_resident_model() {
+        let meta = crate::serve::ServeMeta::new("test".to_owned());
+        assert_eq!(loaded_config_json(&meta), serde_json::Value::Null);
     }
 
     #[test]

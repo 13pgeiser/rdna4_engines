@@ -296,7 +296,7 @@ Implemented paths (anything else → `404`):
 |---|---|---|
 | `GET` | `/health` | Readiness JSON: `status`, `model`, `loading_model`, `pid`, `token`, `native`, `capabilities`, `n_ctx`, `reasoning_contract`, `reasoning_effort_native`, `reasoning_efforts`, `reasoning_effort_probe_error`; `503` unless `status` is `ok` |
 | `GET` | `/v1/models` | `{ object: "list", data: [{ id, object: "model", owned_by, created?, meta?, architecture? }, ...] }` from local model files; the resident model is listed first and alone carries `meta` / `architecture`. `architecture.input_modalities` is the post-gate truth from the load ack: `text` always, `image` on a resident vision tower, `audio` on a resident audio tower, `video` on the embed route's video leg (arch 18) — an arch that refuses a modality by name never advertises it |
-| `GET` | `/stats` | Serve telemetry: `model`, `uptime_sec`, `queue_depth`, `requests_served`, `retries_attempted`, `retries_succeeded`, `recent_tok_s` |
+| `GET` | `/stats` | Serve telemetry: `model`, `uptime_sec`, `queue_depth`, `requests_served`, `retries_attempted`, `retries_succeeded`, `recent_tok_s`, `loaded_config`. `loaded_config` is `{ model, kv_mode, kv_backend, max_seq }` — the values the resident model was actually loaded with, from the daemon's load ack (a field is `null` when the ack did not carry it); the whole object is `null` while no model is resident |
 | `GET` | `/metrics` | Prometheus text exposition (v0.0.4); see below |
 | `POST` | `/v1/chat/completions` | Chat completions (stream or non-stream) |
 | `POST` | `/v1/messages` | Anthropic Messages API (stream or non-stream), adapted onto chat completions |
