@@ -84,6 +84,7 @@ mod emu_daemon;
 use emu_daemon::{gpu_memory_text, validate};
 mod gpu_lock;
 use gpu_lock::GpuLocks;
+mod effort_probe;
 mod npu_route;
 mod process_init;
 mod request_guards;
@@ -1530,6 +1531,12 @@ fn main() {
                             let vl = backend.is_vl();
                             let audio = backend.is_audio();
                             let video = backend.is_video();
+                            // Same probe + ack fields as the single-slot path,
+                            // computed from the template this route renders.
+                            backend
+                                .effort_probe()
+                                .log_failure(backend.chat_template_source());
+                            let effort_fields = backend.effort_probe().ack_fields();
                             // Ensure ordinary model stays None — exactly one weight copy.
                             model = None;
                             slot_backend = Some(std::sync::Arc::new(backend));
@@ -1538,7 +1545,7 @@ fn main() {
                                 ..slot_kv_diag.clone()
                             });
                             // Per contract: continuous_batch_capable false, cache_capable true, reasoning_contract qwen_jinja, plus experimental flag.
-                            let ack = serde_json::json!({
+                            let mut ack = serde_json::json!({
                                 "type": "loaded",
                                 "arch": arch,
                                 "dim": dim,
@@ -1548,8 +1555,6 @@ fn main() {
                                 "audio": audio,
                                 "video": video,
                                 "reasoning_contract": "qwen_jinja",
-                                "reasoning_effort_native": false,
-                                "reasoning_efforts": [],
                                 "cache_capable": true,
                                 "retry_reset_eligible": false,
                                 "continuous_batch_capable": false,
@@ -1562,6 +1567,9 @@ fn main() {
                                 "kv_mode": slot_params.kv_mode_resolved,
                                 "pp": 1,
                             });
+                            ack.as_object_mut()
+                                .expect("loaded ack is a JSON object")
+                                .extend(effort_fields);
                             let _ = writeln!(stdout, "{ack}");
                             let _ = stdout.flush();
                         }
@@ -2637,28 +2645,17 @@ fn main() {
                         let reasoning_contract = hipfire_loader::carrier_for(m.arch_id)
                             .map(|c| c.caps().reasoning_contract.wire_name())
                             .unwrap_or("unsupported");
-                        // Probe reasoning effort capability only for QwenJinja;
-                        // all other contracts emit safe false/[] without probing.
-                        let (reasoning_effort_native, reasoning_efforts): (bool, Vec<&str>) = {
-                            let is_qwen_jinja = reasoning_contract == "qwen_jinja";
-                            if is_qwen_jinja {
-                                if let (Some(tok), Some(tmpl)) =
-                                    (m.tokenizer.as_ref(), m.chat_template.as_ref())
-                                {
-                                    let cap =
-                                        hipfire_runtime::prompt_frame::probe_effort_capability(
-                                            tok, tmpl,
-                                        );
-                                    (cap.native, cap.supported)
-                                } else {
-                                    (false, Vec::new())
-                                }
-                            } else {
-                                (false, Vec::new())
-                            }
-                        };
-                        let reasoning_efforts_json = serde_json::to_string(&reasoning_efforts)
-                            .unwrap_or_else(|_| "[]".to_string());
+                        // Contract-gated effort probe; failures are logged once and acked.
+                        let (
+                            reasoning_effort_native,
+                            reasoning_efforts_json,
+                            reasoning_effort_probe_error_json,
+                        ) = effort_probe::loaded_ack_parts(
+                            reasoning_contract,
+                            m.tokenizer.as_ref(),
+                            m.chat_template.as_deref(),
+                            m.chat_template_source.as_deref(),
+                        );
                         let backend_reason_json = serde_json::to_string(&pending_kv_diag.reason)
                             .expect("backend reason is serializable");
                         let backend_warning_json = serde_json::to_string(&pending_kv_diag.warning)
@@ -2672,7 +2669,7 @@ fn main() {
                         if staged_ep_batch {
                             let _ = writeln!(
                                 stdout,
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"pp":{},"audio":{},"video":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32","kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"pp":{},"audio":{},"video":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"reasoning_effort_probe_error":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32","kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
                                 layers,
@@ -2684,6 +2681,7 @@ fn main() {
                                 reasoning_contract,
                                 reasoning_effort_native,
                                 reasoning_efforts_json,
+                                reasoning_effort_probe_error_json,
                                 cache_capable,
                                 retry_reset_eligible,
                                 continuous_batch_capable,
@@ -2703,7 +2701,7 @@ fn main() {
                             );
                         } else {
                             let ack = format!(
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"pp":{},"audio":{},"video":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"pp":{},"audio":{},"video":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"reasoning_effort_probe_error":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
                                 layers,
@@ -2715,6 +2713,7 @@ fn main() {
                                 reasoning_contract,
                                 reasoning_effort_native,
                                 reasoning_efforts_json,
+                                reasoning_effort_probe_error_json,
                                 cache_capable,
                                 retry_reset_eligible,
                                 continuous_batch_capable,

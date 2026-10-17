@@ -294,7 +294,7 @@ Implemented paths (anything else → `404`):
 
 | Method | Path | Role |
 |---|---|---|
-| `GET` | `/health` | Readiness JSON: `status`, `model`, `loading_model`, `pid`, `token`, `native`, `capabilities`, `n_ctx`, `reasoning_contract`, `reasoning_effort_native`, `reasoning_efforts`; `503` unless `status` is `ok` |
+| `GET` | `/health` | Readiness JSON: `status`, `model`, `loading_model`, `pid`, `token`, `native`, `capabilities`, `n_ctx`, `reasoning_contract`, `reasoning_effort_native`, `reasoning_efforts`, `reasoning_effort_probe_error`; `503` unless `status` is `ok` |
 | `GET` | `/v1/models` | `{ object: "list", data: [{ id, object: "model", owned_by, created?, meta?, architecture? }, ...] }` from local model files; the resident model is listed first and alone carries `meta` / `architecture`. `architecture.input_modalities` is the post-gate truth from the load ack: `text` always, `image` on a resident vision tower, `audio` on a resident audio tower, `video` on the embed route's video leg (arch 18) — an arch that refuses a modality by name never advertises it |
 | `GET` | `/stats` | Serve telemetry: `model`, `uptime_sec`, `queue_depth`, `requests_served`, `retries_attempted`, `retries_succeeded`, `recent_tok_s` |
 | `GET` | `/metrics` | Prometheus text exposition (v0.0.4); see below |
@@ -340,7 +340,8 @@ reload. `token` is a per-process instance token. `n_ctx` is the `max_seq` the
 resident model was loaded with (`null` while none is resident).
 `reasoning_contract`, `reasoning_effort_native` and `reasoning_efforts`
 publish the resident model's reasoning capability (see the reasoning contract
-below). All of these come from serve's own metadata, so `/health` never waits
+below); `reasoning_effort_probe_error` is the full render error when the
+daemon's baseline effort probe failed, `null` otherwise. All of these come from serve's own metadata, so `/health` never waits
 on a model load.
 
 Model switch lifecycle: a load request is first admitted read-only; a refused

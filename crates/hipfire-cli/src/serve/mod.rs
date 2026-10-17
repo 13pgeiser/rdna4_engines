@@ -310,6 +310,9 @@ pub(crate) struct LoadedInfo {
     pub(crate) reasoning_effort_native: bool,
     /// Effort rungs the resident model's chat template accepts.
     pub(crate) reasoning_efforts: Vec<String>,
+    /// Full render error from the daemon's baseline effort probe for the
+    /// resident model's chat template; `None` when the probe rendered.
+    pub(crate) reasoning_effort_probe_error: Option<String>,
 }
 
 /// Rollout switches for the VMM continuous-batching route (PLAN §6 Slice1C).
@@ -1135,6 +1138,16 @@ pub(crate) fn ack_history_capable(loaded: &serde_json::Value) -> bool {
             .unwrap_or(false)
     };
     flag("continuous_batch_capable") && flag("continuous_batch_history_capable")
+}
+
+/// Load-ack `reasoning_effort_probe_error`: `Some` only for a non-empty string,
+/// so a missing, `null`, or non-string field reads as "probe succeeded".
+pub(crate) fn ack_reasoning_effort_probe_error(loaded: &serde_json::Value) -> Option<String> {
+    loaded
+        .get("reasoning_effort_probe_error")
+        .and_then(serde_json::Value::as_str)
+        .filter(|error| !error.is_empty())
+        .map(str::to_owned)
 }
 
 /// HTTP/OpenAI `messages` are batch-eligible only when absent/empty (prompt
@@ -2334,6 +2347,7 @@ impl ServeRuntime {
                 reasoning_contract: self.current_reasoning_contract.wire_name().to_owned(),
                 reasoning_effort_native: self.current_reasoning_effort_native,
                 reasoning_efforts: self.current_reasoning_efforts.clone(),
+                reasoning_effort_probe_error: ack_reasoning_effort_probe_error(&loaded),
             };
             // Report the model the way it was requested. A path-form
             // request now resolves its registry entry (for sidecars and
@@ -3945,6 +3959,7 @@ mod tests {
                 reasoning_contract: "qwen_jinja".into(),
                 reasoning_effort_native: true,
                 reasoning_efforts: vec!["low".into(), "high".into()],
+                reasoning_effort_probe_error: Some("render failed".into()),
             },
             ..ServeMeta::new("test".to_owned())
         });
@@ -4065,6 +4080,20 @@ mod tests {
             })
             .unwrap_or_default();
         assert!(empty_efforts.is_empty());
+        assert_eq!(ack_reasoning_effort_probe_error(&empty_loaded), None);
+        assert_eq!(
+            ack_reasoning_effort_probe_error(
+                &serde_json::json!({ "reasoning_effort_probe_error": null })
+            ),
+            None
+        );
+        assert_eq!(
+            ack_reasoning_effort_probe_error(
+                &serde_json::json!({ "reasoning_effort_probe_error": "template error: boom" })
+            )
+            .as_deref(),
+            Some("template error: boom")
+        );
     }
 
     #[test]

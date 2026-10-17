@@ -8,6 +8,7 @@ use crate::spec_build::Qwen35SlotGuard;
 use crate::Carrier;
 use crate::{
     finish_qwen35_load, resolve_chat_template, resolve_chat_template_overrides, LoadedModel,
+    SRC_DIR_JINJA, SRC_DIR_TOKENIZER_CONFIG,
 };
 use hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors, MiniMaxState};
 use hipfire_runtime::device_mesh::DeviceMesh;
@@ -44,6 +45,8 @@ use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 struct SourceMeta {
     tokenizer: hipfire_runtime::tokenizer::Tokenizer,
     chat_template: Option<String>,
+    /// Provenance description of `chat_template` (see `LoadedModel::chat_template_source`).
+    chat_template_source: Option<String>,
     arch_id: u32,
 }
 
@@ -352,22 +355,66 @@ fn start_ple_table_worker(
 
 fn resolve_source_meta(src: &ModelSource, path: &str) -> Result<SourceMeta, String> {
     match src {
-        ModelSource::Hfq(hfq) => Ok(SourceMeta {
-            tokenizer: hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-                .map_err(|e| format!("tokenizer not found: {e}"))?,
-            chat_template: resolve_chat_template(hfq, path),
-            arch_id: hfq.arch_id,
-        }),
+        ModelSource::Hfq(hfq) => {
+            let tokenizer =
+                hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+                    .map_err(|e| format!("tokenizer not found: {e}"))?;
+            let (chat_template, chat_template_source) = resolve_chat_template(hfq, path);
+            Ok(SourceMeta {
+                tokenizer,
+                chat_template,
+                chat_template_source,
+                arch_id: hfq.arch_id,
+            })
+        }
         ModelSource::Dir(source) => {
             let arch_id = source.arch_id();
+            let (chat_template, chat_template_source) =
+                resolve_dir_chat_template(source, path, arch_id);
             Ok(SourceMeta {
                 tokenizer: tokenizer_from_dir(source)?,
-                chat_template: resolve_chat_template_overrides(path)
-                    .or_else(|| source.chat_template())
-                    .or_else(|| arch_default_template(arch_id)),
+                chat_template,
+                chat_template_source,
                 arch_id,
             })
         }
+    }
+}
+
+/// Safetensors-directory template selection with provenance: user overrides,
+/// then the directory's own `chat_template.jinja` / `tokenizer_config.json`,
+/// then the arch's built-in default. `path` is the model directory.
+fn resolve_dir_chat_template(
+    source: &hipfire_runtime::safetensors_source::SafetensorsSource,
+    path: &str,
+    arch_id: u32,
+) -> (Option<String>, Option<String>) {
+    if let Some((template, description)) = resolve_chat_template_overrides(path) {
+        return (Some(template), Some(description));
+    }
+    if let Some(template) = source.chat_template() {
+        return (Some(template), Some(dir_template_description(path)));
+    }
+    match arch_default_template(arch_id) {
+        Some(template) => (
+            Some(template),
+            Some(format!(
+                "built-in fallback: arch {arch_id} default template (model dir has no chat template)"
+            )),
+        ),
+        None => (None, None),
+    }
+}
+
+/// Mirrors `SafetensorsSource::chat_template`'s file order: a non-blank
+/// `chat_template.jinja` wins, else `tokenizer_config.json`.
+fn dir_template_description(dir: &str) -> String {
+    let jinja = std::path::Path::new(dir).join("chat_template.jinja");
+    if std::fs::read_to_string(&jinja).is_ok_and(|s| !s.trim().is_empty()) {
+        format!("{SRC_DIR_JINJA} {}", jinja.display())
+    } else {
+        let config = std::path::Path::new(dir).join("tokenizer_config.json");
+        format!("{SRC_DIR_TOKENIZER_CONFIG} {}", config.display())
     }
 }
 
@@ -507,6 +554,7 @@ impl Carrier for Qwen2Carrier {
                 ctx.max_seq,
                 ctx.path.to_string(),
                 meta.chat_template,
+                meta.chat_template_source,
             )
         })
     }
@@ -823,6 +871,7 @@ impl Carrier for Qwen4Carrier {
                 max_seq,
                 ctx.path.to_string(),
                 meta.chat_template,
+                meta.chat_template_source,
             )
         };
         apply_qwen4_native_mtp(&mut model, native_mtp, max_k, ctx.spec);
@@ -3565,6 +3614,7 @@ fn load_qwen4_pp_model(src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedMode
             max_seq,
             ctx.path.to_string(),
             meta.chat_template,
+            meta.chat_template_source,
         )
     };
     apply_qwen4_native_mtp(&mut model, native_mtp, max_k, ctx.spec);
@@ -3740,6 +3790,7 @@ fn load_qwen35_pp(
             ctx.max_seq,
             ctx.path.to_string(),
             meta.chat_template,
+            meta.chat_template_source,
             pp,
             gpus,
             la_to_device,
@@ -4082,6 +4133,7 @@ impl Carrier for Qwen35Carrier {
                     physical_cap,
                     meta.arch_id,
                     meta.chat_template,
+                    meta.chat_template_source,
                     ctx,
                     vision_config,
                     vision_weights,
@@ -4298,6 +4350,7 @@ impl Carrier for Qwen35Carrier {
                         ctx.max_seq,
                         ctx.path.to_string(),
                         meta.chat_template,
+                        meta.chat_template_source,
                     )
                 })
             }
@@ -4729,6 +4782,7 @@ impl Carrier for LlamaCarrier {
                 ctx.max_seq,
                 ctx.path.to_string(),
                 meta.chat_template,
+                meta.chat_template_source,
             )
         })
     }
@@ -4874,6 +4928,7 @@ impl Carrier for DotsOcrCarrier {
                 ctx.max_seq,
                 ctx.path.to_string(),
                 meta.chat_template,
+                meta.chat_template_source,
             )
         })
     }
@@ -5005,6 +5060,7 @@ impl Carrier for Deepseek4Carrier {
                     advertised_context,
                     ctx.path.to_string(),
                     meta.chat_template,
+                    meta.chat_template_source,
                 )
             });
         }
@@ -5106,6 +5162,7 @@ impl Carrier for Deepseek4Carrier {
                 advertised_context,
                 ctx.path.to_string(),
                 meta.chat_template,
+                meta.chat_template_source,
             )
         })
     }
@@ -5213,6 +5270,7 @@ impl Carrier for MinimaxCarrier {
                 ctx.max_seq,
                 ctx.path.to_string(),
                 meta.chat_template,
+                meta.chat_template_source,
             )
         })
     }
@@ -5383,6 +5441,7 @@ impl Carrier for Lfm2MoeCarrier {
                 ctx.max_seq,
                 ctx.path.to_string(),
                 meta.chat_template,
+                meta.chat_template_source,
             )
         })
     }
@@ -5533,6 +5592,7 @@ impl Carrier for Cohere2MoeCarrier {
                 ctx.max_seq,
                 ctx.path.to_string(),
                 meta.chat_template,
+                meta.chat_template_source,
             )
         })
     }
@@ -5646,6 +5706,7 @@ impl Carrier for MapleCarrier {
                 ctx.max_seq,
                 ctx.path.to_string(),
                 meta.chat_template,
+                meta.chat_template_source,
             )
         })
     }
@@ -5866,6 +5927,7 @@ impl Carrier for Gemma4Carrier {
                 ctx.max_seq,
                 ctx.path.to_string(),
                 meta.chat_template,
+                meta.chat_template_source,
             )
         })
     }
@@ -6238,6 +6300,9 @@ impl Carrier for MuseGlimmerCarrier {
                     },
                     None => None,
                 };
+                let chat_template_source = meta
+                    .chat_template_source
+                    .map(|s| format!("{s} (muse-glimmer onyx rewrite)"));
                 Ok(LoadedModel {
                     state: Some(Box::new(crate::MuseGlimmerBundle {
                         config,
@@ -6255,6 +6320,7 @@ impl Carrier for MuseGlimmerCarrier {
                         ctx.max_seq,
                         ctx.path.to_string(),
                         chat_template,
+                        chat_template_source,
                     )
                 })
             }
@@ -6423,6 +6489,7 @@ impl Carrier for FluxDiffusionCarrier {
                 4096,
                 ctx.path.to_string(),
                 None,
+                None,
             )
         })
     }
@@ -6489,6 +6556,7 @@ impl Carrier for Qwen35EmbedCarrier {
                 ctx.max_seq,
                 ctx.path.to_string(),
                 meta.chat_template,
+                meta.chat_template_source,
             )
         })
     }
@@ -6575,6 +6643,7 @@ impl Carrier for EmbeddingGemma2Carrier {
                 ctx.max_seq,
                 ctx.path.to_string(),
                 meta.chat_template,
+                meta.chat_template_source,
             )
         })
     }
@@ -7096,5 +7165,39 @@ mod qwen4_pp_native_mtp_tests {
             assert_eq!(qwen4_pp_session_budget(false, configured), configured);
             assert_eq!(qwen4_pp_session_budget(true, configured), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod dir_template_provenance_tests {
+    use super::dir_template_description;
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-dir-template-provenance-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn non_blank_jinja_file_is_named_with_its_exact_path() {
+        let dir = scratch_dir("jinja");
+        std::fs::write(dir.join("chat_template.jinja"), "{{ messages }}").unwrap();
+        let described = dir_template_description(dir.to_str().unwrap());
+        assert!(described.starts_with(crate::SRC_DIR_JINJA));
+        assert!(described.ends_with(dir.join("chat_template.jinja").to_str().unwrap()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn blank_or_absent_jinja_falls_to_tokenizer_config_path() {
+        let dir = scratch_dir("blank");
+        std::fs::write(dir.join("chat_template.jinja"), "  \n").unwrap();
+        let described = dir_template_description(dir.to_str().unwrap());
+        assert!(described.starts_with(crate::SRC_DIR_TOKENIZER_CONFIG));
+        assert!(described.ends_with(dir.join("tokenizer_config.json").to_str().unwrap()));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

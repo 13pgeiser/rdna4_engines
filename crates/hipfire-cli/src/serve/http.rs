@@ -1011,6 +1011,9 @@ async fn handle_request(
                 "reasoning_contract": meta.loaded.reasoning_contract,
                 "reasoning_effort_native": meta.loaded.reasoning_effort_native,
                 "reasoning_efforts": meta.loaded.reasoning_efforts,
+                // Baseline render error of the daemon's effort probe, `null`
+                // when it rendered (or no model is resident).
+                "reasoning_effort_probe_error": meta.loaded.reasoning_effort_probe_error,
             });
             let status = if state == crate::serve::EngineState::Up {
                 200
@@ -1475,7 +1478,11 @@ async fn handle_embeddings(
             }
         }
     } else {
-        match shared.admission.acquire_async(CancellationToken::new()).await {
+        match shared
+            .admission
+            .acquire_async(CancellationToken::new())
+            .await
+        {
             Ok(guard) => guard,
             Err(error) => {
                 return Ok(admission_error_response(
@@ -1495,10 +1502,7 @@ async fn handle_embeddings(
     // with "no model loaded" while chat (which always names a model) kept
     // working.
     let (engine, loaded_model) = {
-        let mut runtime = shared
-            .runtime
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
         if runtime.current_path.is_none() {
             let name = request_model
                 .clone()
@@ -2540,8 +2544,15 @@ mod tests {
         let key = BearerToken::new(text.clone()).unwrap();
         let mut headers = hyper::HeaderMap::new();
         assert!(!bearer_authorized(&headers, &key));
-        for value in ["Bearer".to_owned(), format!("Basic {text}"), format!("Bearer {text}x")] {
-            headers.insert(header::AUTHORIZATION, header::HeaderValue::from_str(&value).unwrap());
+        for value in [
+            "Bearer".to_owned(),
+            format!("Basic {text}"),
+            format!("Bearer {text}x"),
+        ] {
+            headers.insert(
+                header::AUTHORIZATION,
+                header::HeaderValue::from_str(&value).unwrap(),
+            );
             assert!(!bearer_authorized(&headers, &key));
         }
         headers.insert(
@@ -2549,7 +2560,10 @@ mod tests {
             header::HeaderValue::from_str(&format!("bEaReR {text}")).unwrap(),
         );
         assert!(bearer_authorized(&headers, &key));
-        headers.append(header::AUTHORIZATION, header::HeaderValue::from_static("Bearer other"));
+        headers.append(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Bearer other"),
+        );
         assert!(!bearer_authorized(&headers, &key));
     }
 
@@ -2927,6 +2941,7 @@ mod tests {
             reasoning_contract: String::new(),
             reasoning_effort_native: false,
             reasoning_efforts: Vec::new(),
+            reasoning_effort_probe_error: None,
         };
         let resident = model_entry("qwen3.5:2b", Some(1790385975), Some((&loaded, 82944)));
         assert_eq!(resident["created"], serde_json::json!(1790385975u64));
@@ -2961,6 +2976,7 @@ mod tests {
             reasoning_contract: String::new(),
             reasoning_effort_native: false,
             reasoning_efforts: Vec::new(),
+            reasoning_effort_probe_error: None,
         };
         let entry = model_entry("qwen3.8:27b", None, Some((&vision, 150000)));
         assert_eq!(

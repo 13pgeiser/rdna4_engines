@@ -315,8 +315,26 @@ model's contract still accepts the named-cap route):
   `[WARN: INVALID CONFIG]` (server log + OpenAI response metadata under
   `hipfire.reasoning` / `hipfire.config_warnings`). Malformed types and
   out-of-range integers remain hard errors.
-- Template probing only checks whether semantic effort is native; it never
-  changes field meaning.
+- Template probing checks the **loaded template**, not the model name: effort
+  must change rendered prompt text. The registry Qwen3.8-27B MQ6 template
+  supports `low`, `medium`, and `xhigh`. The ordinary loader prefers a
+  configured/per-model template override; experimental multislot loads the
+  embedded HFQ template directly. Both probe their effective template.
+  Before 0.4.3, experimental multislot incorrectly reported `false` / `[]`
+  without probing, causing valid effort settings to be dropped. Check `/health`:
+  `reasoning_effort_native: false` means native effort was not established.
+  An empty `reasoning_efforts` can also mean the baseline template render failed,
+  or the tokenizer/template was missing, not that the model family lacks effort.
+  `/health.reasoning_effort_probe_error` is `null` when the probe succeeds,
+  including a template that simply ignores effort; otherwise it contains the
+  failure reason. A load-time probe-error log also identifies the effective
+  template source (including the path for a user override).
+  For a genuinely non-effort-native Qwen template, use `thinking_budget` or
+  `max_think_tokens` for a cap instead. Effort is never converted to a cap.
+- `native` is **not** a `reasoning_effort` value or an alias for `auto`.
+  Use a supported value from `/health.reasoning_efforts` (Qwen3.8:
+  `low`, `medium`, `xhigh`). Unsupported strings can fall back to the
+  configured/default effort; they do not enable missing template support.
 
 **Family examples** (full HTTP surface: [`SERVE.md`](SERVE.md)):
 

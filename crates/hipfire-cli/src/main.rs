@@ -5841,13 +5841,13 @@ pub(crate) fn apply_http_reasoning_request(
             if !effort_native {
                 if has_explicit_effort {
                     push_warn(format!(
-                        "reasoning_effort '{}' dropped: template does not natively support effort (Qwen3.6); use thinking_budget or max_think_tokens for cap",
+                        "reasoning_effort '{}' dropped: loaded chat template does not natively support effort, so native effort is unavailable for this model; use thinking_budget or max_think_tokens to cap thinking",
                         effort_raw.unwrap()
                     ));
                 }
                 if config_effort_is_explicit && config_effort != "auto" {
                     push_warn(format!(
-                        "reasoning.effort '{}' dropped: template does not natively support effort",
+                        "reasoning.effort '{}' dropped: loaded chat template does not natively support effort, so native effort is unavailable for this model; use thinking_budget or max_think_tokens to cap thinking",
                         config_effort
                     ));
                 }
@@ -5880,6 +5880,15 @@ pub(crate) fn apply_http_reasoning_request(
                             push_warn(format!(
                                 "reasoning_effort '{}' dropped for qwen_jinja: expected low|medium|xhigh",
                                 raw
+                            ));
+                            effective_effort = Some(QWEN_JINJA_DEFAULT_EFFORT.to_string());
+                            request["reasoning_effort"] =
+                                serde_json::json!(QWEN_JINJA_DEFAULT_EFFORT);
+                        }
+                        "native" => {
+                            push_warn(format!(
+                                "reasoning_effort 'native' is not a supported effort value for effort-native qwen_jinja: expected low|medium|xhigh; using default {}",
+                                QWEN_JINJA_DEFAULT_EFFORT
                             ));
                             effective_effort = Some(QWEN_JINJA_DEFAULT_EFFORT.to_string());
                             request["reasoning_effort"] =
@@ -18215,6 +18224,107 @@ mod tests {
     }
 
     #[test]
+    fn http_reasoning_qwen_non_native_effort_warning_is_template_based_and_keeps_caps() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning_effort": "low",
+                "max_think_tokens": 2048
+            }),
+            &resolved,
+            &mut req,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(req.get("reasoning_effort").is_none());
+        assert_eq!(res.effective_effort, None);
+        assert_eq!(req["max_think_tokens"], 2048);
+        assert_eq!(res.effective_cap, Some(2048));
+        assert_eq!(res.cap_source, "explicit:body:max_think_tokens");
+        let warning = res
+            .warnings
+            .iter()
+            .find(|w| w.contains("reasoning_effort 'low'"))
+            .expect("non-native effort warning");
+        assert!(warning.contains("loaded chat template does not natively support effort"));
+        assert!(warning.contains("native effort is unavailable for this model"));
+        assert!(warning.contains("thinking_budget"));
+        assert!(warning.contains("max_think_tokens"));
+        assert!(!warning.contains("Qwen3.6"));
+
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("reasoning.effort", "high").unwrap();
+        layer.set_cli("reasoning.budget", "high").unwrap();
+        let cfg = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "test".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let mut cfg_req = serde_json::json!({});
+        let cfg_res = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &cfg,
+            &mut cfg_req,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(cfg_req.get("reasoning_effort").is_none());
+        assert_eq!(cfg_res.effective_effort, None);
+        assert_eq!(cfg_req["max_think_tokens"], 8192);
+        assert_eq!(cfg_res.effective_cap, Some(8192));
+        assert_eq!(cfg_res.cap_source, "config:reasoning.budget");
+        let cfg_warning = cfg_res
+            .warnings
+            .iter()
+            .find(|w| w.contains("reasoning.effort 'high'"))
+            .expect("non-native config effort warning");
+        assert!(cfg_warning.contains("loaded chat template does not natively support effort"));
+        assert!(cfg_warning.contains("native effort is unavailable for this model"));
+        assert!(cfg_warning.contains("thinking_budget"));
+        assert!(cfg_warning.contains("max_think_tokens"));
+        assert!(!cfg_warning.contains("Qwen3.6"));
+    }
+
+    #[test]
+    fn http_reasoning_qwen_native_effort_value_native_warns_and_falls_back_to_medium() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let supported = ["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning_effort": "native",
+                "max_think_tokens": 2048
+            }),
+            &resolved,
+            &mut req,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(req["reasoning_effort"], "medium");
+        assert_eq!(res.effective_effort.as_deref(), Some("medium"));
+        assert_eq!(req["max_think_tokens"], 2048);
+        assert_eq!(res.effective_cap, Some(2048));
+        assert_eq!(res.cap_source, "explicit:body:max_think_tokens");
+        let warning = res
+            .warnings
+            .iter()
+            .find(|w| w.contains("reasoning_effort 'native'"))
+            .expect("native effort warning");
+        assert!(warning.contains("not a supported effort value"));
+        assert!(warning.contains("low|medium|xhigh"));
+        assert!(warning.contains("medium"));
+    }
+
+    #[test]
     fn http_reasoning_deepseek_explicit_caps_dropped() {
         let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
         let mut req = serde_json::json!({});
@@ -18800,7 +18910,9 @@ mod tests {
     /// request is sent, with an error naming the variable (issue #655).
     #[test]
     fn pull_rejects_malformed_hf_token_before_any_request() {
-        let _env_lock = TEST_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let paths = test_paths("pull-bad-hf-token");
         // An unreachable endpoint: any attempted download would fail differently.
         let _base = EnvGuard::set("HIPFIRE_HF_BASE", "http://127.0.0.1:1");
@@ -18819,18 +18931,29 @@ mod tests {
             assert!(!text.contains("secret"), "{text}");
             assert!(!text.contains("download request failed"), "{text}");
         }
-        assert!(!paths.models.exists(), "nothing is created before the check");
+        assert!(
+            !paths.models.exists(),
+            "nothing is created before the check"
+        );
     }
 
     #[test]
     fn download_verified_rejects_malformed_token_without_creating_files() {
-        let _env_lock = TEST_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _token = EnvGuard::set("HF_TOKEN", "hf_bad token");
         let dir = std::env::temp_dir().join(format!("hipfire-bad-token-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let destination = dir.join("model.mq4");
-        let error = download_verified("http://127.0.0.1:1/model.mq4", &destination, None, None, true)
-            .expect_err("malformed token must be refused");
+        let error = download_verified(
+            "http://127.0.0.1:1/model.mq4",
+            &destination,
+            None,
+            None,
+            true,
+        )
+        .expect_err("malformed token must be refused");
         let text = format!("{error:#}");
         assert!(text.contains("environment variable HF_TOKEN"), "{text}");
         assert!(text.contains("a space at character 7"), "{text}");

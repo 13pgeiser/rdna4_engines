@@ -220,9 +220,18 @@ impl SlotLoadParams {
     }
 }
 
+/// The multi-slot route renders `hfq.chat_template()` directly.
+const SLOT_CHAT_TEMPLATE_SOURCE: &str =
+    "embedded HFQ tokenizer_config.chat_template (multi-slot route renders it directly)";
+
 /// Daemon-owned slot backend. Owns one weight copy via SlotEngine.
 pub struct SlotBackend {
     chat_template: Option<String>,
+    /// `reasoning_effort` capability of the template this route actually
+    /// renders, probed once at load.
+    effort_probe: crate::effort_probe::EffortProbe,
+    /// Provenance of `chat_template` (`None` iff there is no template).
+    chat_template_source: Option<&'static str>,
     engine: AnySlotEngine,
     tokenizer: Tokenizer,
     arch_str: String,
@@ -551,8 +560,16 @@ impl SlotBackend {
             },
         )?;
 
+        // This route renders the HFQ's embedded template directly (no loader
+        // overrides / built-in fallback), so that is the template probed and
+        // the source reported.
+        let effort_probe =
+            crate::effort_probe::probe_loaded_effort(Some(&tokenizer), chat_template.as_deref());
+        let chat_template_source = chat_template.as_ref().map(|_| SLOT_CHAT_TEMPLATE_SOURCE);
         Ok(Self {
             engine,
+            effort_probe,
+            chat_template_source,
             tokenizer,
             arch_str,
             dim,
@@ -593,6 +610,16 @@ impl SlotBackend {
     }
     pub fn is_video(&self) -> bool {
         self.is_video
+    }
+
+    /// Load-time `reasoning_effort` probe of the rendered template.
+    pub fn effort_probe(&self) -> &crate::effort_probe::EffortProbe {
+        &self.effort_probe
+    }
+
+    /// Provenance of the rendered chat template, for the probe diagnostic.
+    pub fn chat_template_source(&self) -> Option<&'static str> {
+        self.chat_template_source
     }
 
     pub fn active_count(&self) -> usize {

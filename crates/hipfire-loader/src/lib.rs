@@ -8,8 +8,8 @@ pub mod admission;
 pub mod batch_staging;
 mod carriers;
 pub use carriers::*;
-mod qwen4_slab;
 pub mod decide;
+mod qwen4_slab;
 
 /// Speculative-decode build/glue (RAII slot guard now; `DflashSpeculator` +
 /// `build_speculator` at Stages 1-2). Lives here at the top of the DAG where
@@ -1140,6 +1140,11 @@ pub struct LoadedModel {
     /// the `DflashSpeculator` impl behind this trait object.
     pub speculator: Option<Box<dyn Speculator>>,
     pub chat_template: Option<String>,
+    /// Where `chat_template` came from after override/embedded/fallback
+    /// selection (`None` iff `chat_template` is `None`): human-readable,
+    /// names user-override file paths exactly. Published only in the daemon's
+    /// effort-probe diagnostic line.
+    pub chat_template_source: Option<String>,
     // Author-recommended sampling defaults, baked into the .hfq's
     // `generation_config` metadata and read at load time on the HFQ source
     // path (raw-safetensors PP path leaves them `None`). The generate handler
@@ -1165,6 +1170,7 @@ impl LoadedModel {
         physical_cap: usize,
         model_path: String,
         chat_template: Option<String>,
+        chat_template_source: Option<String>,
     ) -> Self {
         LoadedModel {
             arch_id,
@@ -1194,6 +1200,7 @@ impl LoadedModel {
             model_path,
             speculator: None,
             chat_template,
+            chat_template_source,
             rec_temperature: None,
             rec_top_p: None,
             rec_top_k: None,
@@ -1531,6 +1538,7 @@ impl LoadedModel {
         physical_cap: usize,
         model_path: String,
         chat_template: Option<String>,
+        chat_template_source: Option<String>,
         pp: usize,
         pp_gpus: Gpus,
         pp_dn_la_to_device: Vec<u8>,
@@ -1546,6 +1554,7 @@ impl LoadedModel {
                 physical_cap,
                 model_path,
                 chat_template,
+                chat_template_source,
             )
         }
     }
@@ -1635,14 +1644,24 @@ impl EpArch {
 
 // ─── Helper functions ─────────────────────────────────────────────────
 
+/// Provenance text for the embedded HFQ tokenizer_config template.
+const SRC_EMBEDDED_HFQ: &str = "embedded HFQ tokenizer_config.chat_template";
+/// Provenance text for the safetensors-directory template files.
+pub(crate) const SRC_DIR_JINJA: &str = "model-dir chat_template.jinja";
+pub(crate) const SRC_DIR_TOKENIZER_CONFIG: &str = "model-dir tokenizer_config.json chat_template";
+
 /// Layer 1 (resolved config) + Layer 2 (per-model ~/.hipfire/templates).
-fn resolve_chat_template_overrides(model_path: &str) -> Option<String> {
+/// Returns `(template, source)`; the source names the exact override file.
+fn resolve_chat_template_overrides(model_path: &str) -> Option<(String, String)> {
     if let Some(config_path) = hipfire_runtime::config::get().chat_template_file.as_deref() {
         if !config_path.is_empty() {
             match std::fs::read_to_string(config_path) {
                 Ok(s) => {
                     eprintln!("[chat_template] using configured template {config_path}");
-                    return Some(s);
+                    return Some((
+                        s,
+                        format!("user override: configured chat_template_file {config_path}"),
+                    ));
                 }
                 Err(e) => eprintln!(
                     "[chat_template] configured template {config_path} failed to read ({e}); falling through"
@@ -1667,7 +1686,9 @@ fn resolve_chat_template_overrides(model_path: &str) -> Option<String> {
                             "[chat_template] using per-model override {}",
                             per_model.display()
                         );
-                        return Some(s);
+                        let source =
+                            format!("user override: per-model template {}", per_model.display());
+                        return Some((s, source));
                     }
                     Err(e) => eprintln!(
                         "[chat_template] per-model file {} failed to read ({e}); falling through",
@@ -1680,55 +1701,79 @@ fn resolve_chat_template_overrides(model_path: &str) -> Option<String> {
     None
 }
 
-fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
-    if let Some(s) = resolve_chat_template_overrides(model_path) {
-        return Some(s);
+/// Effective template for an HFQ load plus its provenance description.
+/// `(None, None)` when the artifact has no template and no built-in applies.
+fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> (Option<String>, Option<String>) {
+    if let Some((s, source)) = resolve_chat_template_overrides(model_path) {
+        return (Some(s), Some(source));
     }
     match hfq.arch_id {
         // Prefer HFQ-embedded tokenizer_config.chat_template (Qwen3.8 official
         // low/medium/xhigh reasoning_effort). Fall back to froggeric for older
         // Qwen3.5/3.6 files that lack one.
         5 | 6 => {
-            return Some(qwen35_template_from_embedded(
-                hfq.chat_template(),
-                model_path,
-            ));
+            let (t, source) = qwen35_template_from_embedded(hfq.chat_template(), model_path);
+            return (Some(t), Some(source));
         }
         11 => {
             if let Some(t) = hfq.chat_template() {
-                return Some(t);
+                return (Some(t), Some(SRC_EMBEDDED_HFQ.to_string()));
             }
-            return Some(LFM2_TEMPLATE.to_string());
+            return (
+                Some(LFM2_TEMPLATE.to_string()),
+                Some("built-in fallback: LFM2 liquidai template".to_string()),
+            );
         }
         12 => {
             if let Some(t) = hfq.chat_template_named("tool_use") {
-                return Some(
-                    t.replace("<|START_RESPONSE|>", "<|START_TEXT|>")
-                        .replace("<|END_RESPONSE|>", "<|END_TEXT|>")
-                        .replace("{{message.tool_plan}}", "{{ message.tool_plan or '' }}")
-                        .replace("{{ tc['function']['name'] }}", "{{ tc.name }}")
-                        .replace(
-                            "{{ tc['function']['arguments']|tojson }}",
-                            "{{ tc.arguments|tojson }}",
-                        ),
+                return (
+                    Some(
+                        t.replace("<|START_RESPONSE|>", "<|START_TEXT|>")
+                            .replace("<|END_RESPONSE|>", "<|END_TEXT|>")
+                            .replace("{{message.tool_plan}}", "{{ message.tool_plan or '' }}")
+                            .replace("{{ tc['function']['name'] }}", "{{ tc.name }}")
+                            .replace(
+                                "{{ tc['function']['arguments']|tojson }}",
+                                "{{ tc.arguments|tojson }}",
+                            ),
+                    ),
+                    Some(
+                        "embedded HFQ tokenizer_config.chat_template[tool_use] (rewritten for cohere2moe)"
+                            .to_string(),
+                    ),
                 );
             }
         }
         _ => {}
     }
-    hfq.chat_template()
+    let t = hfq.chat_template();
+    let source = t.as_ref().map(|_| SRC_EMBEDDED_HFQ.to_string());
+    (t, source)
 }
 
 /// Arch 5/6 template after configured/per-model overrides: embedded HFQ
 /// `tokenizer_config.chat_template` when present, else froggeric fallback.
 /// Ornith 1.5 basenames get a load-time Qwen3.8-shaped `reasoning_effort`
 /// adaptation of the embedded (non-native) parent template; other models and
-/// the froggeric missing-template path are left alone.
-fn qwen35_template_from_embedded(embedded: Option<String>, model_path: &str) -> String {
+/// the froggeric missing-template path are left alone. Returns the template
+/// and its provenance description.
+fn qwen35_template_from_embedded(embedded: Option<String>, model_path: &str) -> (String, String) {
     match embedded {
-        Some(t) if is_ornith15_artifact(model_path) => adapt_ornith15_embedded_chat_template(t),
-        Some(t) => t,
-        None => FROGGERIC_QWEN35_TEMPLATE.to_string(),
+        Some(t) if is_ornith15_artifact(model_path) => {
+            let (t, adapted) = adapt_ornith15_embedded_chat_template(t);
+            let source = if adapted {
+                format!("{SRC_EMBEDDED_HFQ} (ornith-1.5 reasoning_effort adapter applied)")
+            } else {
+                SRC_EMBEDDED_HFQ.to_string()
+            };
+            (t, source)
+        }
+        Some(t) => (t, SRC_EMBEDDED_HFQ.to_string()),
+        None => (
+            FROGGERIC_QWEN35_TEMPLATE.to_string(),
+            "built-in fallback: froggeric qwen35 template (artifact has no embedded chat_template)"
+                .to_string(),
+        ),
     }
 }
 
@@ -1825,17 +1870,17 @@ const ORNITH_NO_TOOLS_SYSTEM_BRANCH_ADAPTED: &str = concat!(
 /// official Qwen3.8 `reasoning_effort` low/medium/xhigh system-prompt contract
 /// via exact-marker rewrite. Already-native templates and marker drift are
 /// returned unchanged so `probe_effort_capability` stays honest.
-fn adapt_ornith15_embedded_chat_template(template: String) -> String {
+fn adapt_ornith15_embedded_chat_template(template: String) -> (String, bool) {
     if template.contains("reasoning_effort") {
-        return template;
+        return (template, false);
     }
     match try_adapt_ornith15_qwen35_to_effort_native(&template) {
-        Ok(adapted) => adapted,
+        Ok(adapted) => (adapted, true),
         Err(reason) => {
             eprintln!(
                 "[chat_template] ornith-1.5 reasoning_effort adapter skipped ({reason}); keeping embedded template"
             );
-            template
+            (template, false)
         }
     }
 }
@@ -2215,6 +2260,7 @@ fn finish_qwen35_load(
     physical_cap: usize,
     arch_id: u32,
     chat_template: Option<String>,
+    chat_template_source: Option<String>,
     ctx: &mut LoadCtx,
     vision_config: Option<qwen35_vl::VisionConfig>,
     vision_weights: Option<qwen35_vl::VisionWeights>,
@@ -2630,6 +2676,7 @@ fn finish_qwen35_load(
             physical_cap,
             ctx.path.to_string(),
             chat_template,
+            chat_template_source,
         )
     };
     model.mtp_weights_present = mtp_present;
@@ -3079,18 +3126,32 @@ fn resolve_qwen4_route_plan(
     if crate::admission::qwen4_kv_adaptive_requested(req.kv_adaptive_override) {
         return Err("adaptive KV".into());
     }
-    if hipfire_runtime::config::retained_redline_default(&gpu.arch, "qwen4", req.path, req.pp, 1, ep, true) {
+    if hipfire_runtime::config::retained_redline_default(
+        &gpu.arch, "qwen4", req.path, req.pp, 1, ep, true,
+    ) {
         return Err("retained Redline route".into());
     }
     let default_k = hipfire_config::mtp_k_default_for_arch(hipfire_arch_qwen4::ARCH_ID, &gpu.arch);
-    if let Some(k) = req.spec.mtp_k.or(hipfire_runtime::config::get().mtp_k).filter(|&k| k != default_k) {
+    if let Some(k) = req
+        .spec
+        .mtp_k
+        .or(hipfire_runtime::config::get().mtp_k)
+        .filter(|&k| k != default_k)
+    {
         return Err(format!("MTP K={k} (walked K={default_k})"));
     }
     let native_mtp =
         crate::admission::qwen4_native_mtp(req.spec, &gpu.arch, req.path, req.pp, 1, ep)?;
     let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(hfq, Some(&gpu.arch))
         .map_err(|error| error.to_string())?;
-    if hipfire_arch_qwen4::resolve_trunk_overlay(hfq, Path::new(req.path), &gpu.arch, &receipt.config)?.is_some() {
+    if hipfire_arch_qwen4::resolve_trunk_overlay(
+        hfq,
+        Path::new(req.path),
+        &gpu.arch,
+        &receipt.config,
+    )?
+    .is_some()
+    {
         return Err("trunk overlay".into());
     }
     let kv_mode = req
@@ -3115,16 +3176,29 @@ fn resolve_qwen4_route_plan(
     let on_off = |on: bool| if on { "on" } else { "off" }.to_owned();
     let axes = [
         ("qsa", qsa.to_owned()),
-        ("kv_backend", hipfire_arch_qwen4::Qwen4KvBackend::from(req.kv_backend).name().to_owned()),
+        (
+            "kv_backend",
+            hipfire_arch_qwen4::Qwen4KvBackend::from(req.kv_backend)
+                .name()
+                .to_owned(),
+        ),
         ("gdn", state.gdn.name().to_owned()),
         ("qsa_f16_arena", on_off(state.qsa_f16_arena)),
         ("qsa_pooled_bf16", on_off(state.qsa_pooled_bf16)),
     ];
-    let spec = if native_mtp { KernelSpecRoute::NativeMtp } else { KernelSpecRoute::Ar };
+    let spec = if native_mtp {
+        KernelSpecRoute::NativeMtp
+    } else {
+        KernelSpecRoute::Ar
+    };
     let owned = hipfire_runtime::loader_api::header_tensor_meta(hfq);
     let tensors: Vec<KernelTensorMeta<'_>> = owned
         .iter()
-        .map(|t| KernelTensorMeta { name: &t.name, dtype: t.dtype, shape: &t.shape })
+        .map(|t| KernelTensorMeta {
+            name: &t.name,
+            dtype: t.dtype,
+            shape: &t.shape,
+        })
         .collect();
     let plan = rdna_compute::kernel_registry::route_entries(&RouteKernelInput {
         arch: gpu.arch.as_str(),
@@ -3176,8 +3250,9 @@ fn begin_route_kernels(
     };
     // Walked plans (Flash-Next) preload but stay open: a kernel the walks
     // missed loads lazily with a warning instead of failing the request.
-    let open = matches!(req.source, ModelSource::Hfq(hfq) if hfq.arch_id == hipfire_arch_qwen4::ARCH_ID)
-        .then(|| format!("Flash-Next {} {spec:?}", gpu.arch));
+    let open =
+        matches!(req.source, ModelSource::Hfq(hfq) if hfq.arch_id == hipfire_arch_qwen4::ARCH_ID)
+            .then(|| format!("Flash-Next {} {spec:?}", gpu.arch));
     let cores = std::thread::available_parallelism()
         .map(usize::from)
         .map_err(|e| format!("cannot determine compile CPU affinity: {e}"))?;
@@ -3468,7 +3543,7 @@ fn load_cohere2moe(
             .or_else(|| try_one("<|endoftext|>"))
             .unwrap_or(255001)
     };
-    let chat_template = resolve_chat_template(&hfq, path);
+    let (chat_template, chat_template_source) = resolve_chat_template(&hfq, path);
     Ok(LoadedModel {
         state: Some(Box::new(Cohere2MoeBundle {
             config,
@@ -3483,6 +3558,7 @@ fn load_cohere2moe(
             max_seq,
             path.to_string(),
             chat_template,
+            chat_template_source,
         )
     })
 }
@@ -4188,7 +4264,7 @@ fn load_model_ep_ds4(
     // ds4 EP path; see project_gfx12_hipgraph_late_host_alloc_clobber. The EP graph
     // itself (deepseek4 forward.rs begin_graph_capture) is untouched — it still
     // captures + engages; this only settles the heap before it instantiates.
-    let chat_template = resolve_chat_template(&hfq, path);
+    let (chat_template, chat_template_source) = resolve_chat_template(&hfq, path);
     let rec = hfq.recommended_sampling();
 
     let gpus =
@@ -4409,6 +4485,7 @@ fn load_model_ep_ds4(
             max_seq,
             path.to_string(),
             chat_template,
+            chat_template_source,
         )
     })
 }
@@ -4433,7 +4510,7 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
     // minimax EP path; see project_gfx12_hipgraph_late_host_alloc_clobber. The EP
     // graph itself (minimax forward.rs begin_graph_capture) is untouched — it still
     // captures + engages; this only settles the heap before it instantiates.
-    let chat_template = resolve_chat_template(&hfq, path);
+    let (chat_template, chat_template_source) = resolve_chat_template(&hfq, path);
     let rec = hfq.recommended_sampling();
 
     let gpus =
@@ -4542,6 +4619,7 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
             max_seq,
             path.to_string(),
             chat_template,
+            chat_template_source,
         )
     })
 }
@@ -4621,11 +4699,14 @@ fn load_model_ep_qwen35(
         return Err("EP qwen35: paged_experts must be false".to_string());
     }
     if config.reap_keep.is_some() {
-        return Err("EP qwen35: this REAP-pruned model cannot run with expert parallelism; set tp=1".to_string());
+        return Err(
+            "EP qwen35: this REAP-pruned model cannot run with expert parallelism; set tp=1"
+                .to_string(),
+        );
     }
     let arch_id = hfq_probe.arch_id;
     let n_exp = config.num_experts;
-    let chat_template = resolve_chat_template(&hfq_probe, path);
+    let (chat_template, chat_template_source) = resolve_chat_template(&hfq_probe, path);
     let rec = hfq_probe.recommended_sampling();
     let gpus = Gpus::init_ep(tp, config.n_layers).map_err(|e| format!("init_ep: {e:?}"))?;
     let n = gpus.devices.len();
@@ -4814,6 +4895,7 @@ fn load_model_ep_qwen35(
             max_seq,
             path.to_string(),
             chat_template,
+            chat_template_source,
         )
     })
 }
@@ -4875,7 +4957,7 @@ fn load_model_tp_qwen35_dense(
         .map(|layout| qwen35::local_dense_tp_config(&config, layout))
         .collect::<Vec<_>>();
     let arch_id = hfq.arch_id;
-    let chat_template = resolve_chat_template(&hfq, path);
+    let (chat_template, chat_template_source) = resolve_chat_template(&hfq, path);
     let rec = hfq.recommended_sampling();
     let eos_tok = {
         let ids = tokenizer.encode("<|im_end|>");
@@ -5069,6 +5151,7 @@ fn load_model_tp_qwen35_dense(
             max_seq,
             path.to_string(),
             chat_template,
+            chat_template_source,
         )
     })
 }
@@ -5564,7 +5647,10 @@ mod ep_admission_tests {
                 Ok(()) => panic!("arch {arch} + EP must refuse"),
                 Err(e) => e,
             };
-            assert!(err.contains("expert parallelism (tp>1) is not supported"), "reason: {err}");
+            assert!(
+                err.contains("expert parallelism (tp>1) is not supported"),
+                "reason: {err}"
+            );
             assert!(
                 err.contains(&arch.to_string()),
                 "reason names the arch: {err}"
@@ -6523,19 +6609,22 @@ mod registry_tests {
     fn qwen_embedded_template_wins_over_froggeric() {
         // Qwen3.8-style embedded template carries official reasoning_effort.
         let embedded = "{% if reasoning_effort %}{{ reasoning_effort }}{% endif %}".to_string();
-        let got = super::qwen35_template_from_embedded(Some(embedded.clone()), "qwen3.8-27b.mq4");
+        let (got, source) =
+            super::qwen35_template_from_embedded(Some(embedded.clone()), "qwen3.8-27b.mq4");
         assert_eq!(got, embedded);
         assert!(got.contains("reasoning_effort"));
         assert_ne!(got.as_str(), super::FROGGERIC_QWEN35_TEMPLATE);
+        assert_eq!(source, super::SRC_EMBEDDED_HFQ);
     }
 
     #[test]
     fn qwen_missing_template_uses_froggeric_fallback() {
         // Legacy Qwen3.5/3.6 HFQs without tokenizer_config.chat_template.
         // Ornith path without embedded also keeps plain froggeric (no adapt).
-        let got = super::qwen35_template_from_embedded(None, "ornith-1.5-35b-a3b.mq4");
+        let (got, source) = super::qwen35_template_from_embedded(None, "ornith-1.5-35b-a3b.mq4");
         assert_eq!(got.as_str(), super::FROGGERIC_QWEN35_TEMPLATE);
-        let got2 = super::qwen35_template_from_embedded(None, "qwen3.6-35b.mq4");
+        assert!(source.starts_with("built-in fallback: froggeric"));
+        let (got2, _) = super::qwen35_template_from_embedded(None, "qwen3.6-35b.mq4");
         assert_eq!(got2.as_str(), super::FROGGERIC_QWEN35_TEMPLATE);
     }
 
@@ -6674,6 +6763,24 @@ mod registry_tests {
             Some(ornith_parent_template_skeleton()),
             "ornith-1.5-35b-a3b.mq4",
         )
+        .0
+    }
+
+    #[test]
+    fn ornith_adapter_provenance_reports_applied_vs_plain_embedded() {
+        let (adapted, source) = super::qwen35_template_from_embedded(
+            Some(ornith_parent_template_skeleton()),
+            "ornith-1.5-35b-a3b.mq4",
+        );
+        assert!(adapted.contains("reasoning_effort"));
+        assert!(source.starts_with(super::SRC_EMBEDDED_HFQ));
+        assert!(source.contains("adapter applied"));
+        // Marker drift: the adapter is skipped, the embedded text is kept.
+        let drifted = "{{ messages }}".to_string();
+        let (kept, source) =
+            super::qwen35_template_from_embedded(Some(drifted.clone()), "ornith-1.5-35b-a3b.mq4");
+        assert_eq!(kept, drifted);
+        assert_eq!(source, super::SRC_EMBEDDED_HFQ);
     }
 
     fn render_ornith(
@@ -6720,7 +6827,11 @@ mod registry_tests {
             "/models/ornith1.5-35b-a3b.mq4",
             "ornith1.5-35b-a3b.mq4r",
         ] {
-            let got = super::qwen35_template_from_embedded(Some(skeleton.clone()), path);
+            let (got, source) = super::qwen35_template_from_embedded(Some(skeleton.clone()), path);
+            assert!(
+                source.contains("adapter applied"),
+                "path {path} must report the adapter in its source: {source}"
+            );
             assert!(
                 got.contains("reasoning_effort|default('xhigh')"),
                 "path {path} must adapt: missing default"
@@ -6765,8 +6876,9 @@ mod registry_tests {
             "ornith-2.0-35b-a3b.mq4",
             "not-ornith-1.5-35b.mq4",
         ] {
-            let got = super::qwen35_template_from_embedded(Some(skeleton.clone()), path);
+            let (got, source) = super::qwen35_template_from_embedded(Some(skeleton.clone()), path);
             assert_eq!(got, skeleton, "path {path} must not adapt");
+            assert_eq!(source, super::SRC_EMBEDDED_HFQ, "path {path}");
             assert!(!got.contains("reasoning_effort"), "path {path}");
         }
     }
@@ -6784,8 +6896,9 @@ mod registry_tests {
             "/models/ORNITH-1.5-35B-A3B.hfq",
             "ornith-1.5-35b-a3b.mq4r.bak",
         ] {
-            let got = super::qwen35_template_from_embedded(Some(skeleton.clone()), path);
+            let (got, source) = super::qwen35_template_from_embedded(Some(skeleton.clone()), path);
             assert_eq!(got, skeleton, "path {path} must not adapt (extension gate)");
+            assert_eq!(source, super::SRC_EMBEDDED_HFQ, "path {path}");
             assert!(
                 !got.contains("reasoning_effort"),
                 "path {path} must not gain effort"
@@ -6801,9 +6914,10 @@ mod registry_tests {
             ornith_parent_template_skeleton()
         );
         assert!(native.contains("reasoning_effort"));
-        let got =
+        let (got, source) =
             super::qwen35_template_from_embedded(Some(native.clone()), "ornith-1.5-35b-a3b.mq4");
         assert_eq!(got, native, "already-native must not be rewritten");
+        assert_eq!(source, super::SRC_EMBEDDED_HFQ);
     }
 
     #[test]
@@ -6813,8 +6927,9 @@ mod registry_tests {
             "{}\n{{%- set ns = namespace(x=1) %}}",
             super::ORNITH_TOOLS_SYSTEM_OPEN
         );
-        let got =
+        let (got, source) =
             super::qwen35_template_from_embedded(Some(drifted.clone()), "ornith-1.5-35b-a3b.mq4");
+        assert_eq!(source, super::SRC_EMBEDDED_HFQ);
         assert_eq!(
             got, drifted,
             "drift must keep original so probe stays honest"
@@ -6827,9 +6942,10 @@ mod registry_tests {
             gate = super::ORNITH_TOOLS_GATE,
             no_tools = super::ORNITH_NO_TOOLS_SYSTEM_BRANCH
         );
-        let got2 =
+        let (got2, source2) =
             super::qwen35_template_from_embedded(Some(dup.clone()), "ornith1.5-35b-a3b.mq4r");
         assert_eq!(got2, dup);
+        assert_eq!(source2, super::SRC_EMBEDDED_HFQ);
     }
 
     #[test]
