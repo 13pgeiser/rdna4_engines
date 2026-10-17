@@ -1140,9 +1140,9 @@ pub struct NativeMtpCensusInputs {
     /// Single load passes `native_mtp_proposal_drafts` (n-gram takeover
     /// width); a PP load has no n-gram pool or copy lane, so passes its K.
     pub max_k: usize,
-    /// The GDN storage format of the verify-row capture where the route
-    /// captures rows (`mtp_spec::native_mtp_row_capture`), else `None`.
-    pub row_capture: Option<crate::GdnStateFormat>,
+    /// The GDN storage format and ring rows of the verify-row capture where
+    /// the route captures rows (`mtp_spec::native_mtp_capture`), else `None`.
+    pub row_capture: Option<(crate::GdnStateFormat, usize)>,
     /// Whether the request allocates the batched prompt-fill scratch
     /// (`mtp_spec::native_mtp_fill_scratch`).
     pub batched_fill: bool,
@@ -1218,10 +1218,10 @@ pub fn native_mtp_census_scope(
         })
         .count();
     let row_capture = match mtp.row_capture {
-        Some(gdn) => crate::state::Qwen4State::row_capture_bytes_scoped(
+        Some((gdn, ring_rows)) => crate::state::Qwen4State::row_capture_bytes_scoped(
             config,
             gdn,
-            crate::mtp_spec::native_mtp_window_rows(mtp.max_k),
+            ring_rows.max(crate::mtp_spec::native_mtp_window_rows(mtp.max_k)),
             gdn_layers,
         )
         .and_then(|bytes| u64::try_from(bytes).ok())
@@ -3127,7 +3127,7 @@ mod tests {
             )
             .unwrap()
         };
-        let mtp = native(&measured, 3, Some(crate::GdnStateFormat::Q8));
+        let mtp = native(&measured, 3, Some((crate::GdnStateFormat::Q8, 4)));
         let with_mtp = auto_vram_reserve(
             &config,
             &measured,
@@ -3179,13 +3179,26 @@ mod tests {
         assert_eq!(mtp, resident + verify + capture4);
         assert_eq!(native(&measured, 3, None), resident + verify);
         assert_eq!(native(&measured, 10, None), resident + verify);
+        // A row-exact verify limit wider than the MTP window (gfx1151: 32)
+        // charges its whole ring; a narrower one never shrinks the window's.
+        let capture32 =
+            crate::state::Qwen4State::row_capture_bytes(&config, crate::GdnStateFormat::Q8, 32)
+                .unwrap() as u64;
+        assert_eq!(
+            native(&measured, 3, Some((crate::GdnStateFormat::Q8, 32))),
+            resident + verify + capture32
+        );
+        assert_eq!(
+            native(&measured, 3, Some((crate::GdnStateFormat::Q8, 2))),
+            mtp
+        );
         // The 11-row GDN capture is charged in the state's real GDN format.
         for gdn in [crate::GdnStateFormat::Q8, crate::GdnStateFormat::F32] {
             let capture =
                 crate::state::Qwen4State::row_capture_bytes(&config, gdn, 11).unwrap() as u64;
             let request = (AUTO_VRAM_RESERVE_CHUNK as u64 + 2) * hidden_row + capture;
             assert_eq!(
-                native(&measured, 10, Some(gdn)),
+                native(&measured, 10, Some((gdn, 11))),
                 resident + scratch.max(request)
             );
             // The gfx1151 batched prompt fill adds its row scratch (sub-chunks
@@ -3204,7 +3217,7 @@ mod tests {
                 AUTO_VRAM_RESERVE_CHUNK,
                 10,
                 DType::MQ6G256V2,
-                Some(gdn),
+                Some((gdn, 11)),
                 true,
             )
             .unwrap();
@@ -4070,8 +4083,8 @@ mod tests {
         let context = crate::Qwen4ContextCommit::legacy(1024);
         for gdn in [
             None,
-            Some(crate::GdnStateFormat::Q8),
-            Some(crate::GdnStateFormat::F32),
+            Some((crate::GdnStateFormat::Q8, 32)),
+            Some((crate::GdnStateFormat::F32, 32)),
         ] {
             for batched_fill in [false, true] {
                 for max_k in [1usize, 3, 10, 64] {
@@ -4112,7 +4125,7 @@ mod tests {
         let gdn = crate::GdnStateFormat::Q8;
         let inputs = NativeMtpCensusInputs {
             max_k: 3,
-            row_capture: Some(gdn),
+            row_capture: Some((gdn, 4)),
             batched_fill: true,
         };
         let whole = native_mtp_census_scope(
@@ -4195,7 +4208,7 @@ mod tests {
         let context = crate::Qwen4ContextCommit::legacy(1024);
         let inputs = NativeMtpCensusInputs {
             max_k: 3,
-            row_capture: Some(crate::GdnStateFormat::Q8),
+            row_capture: Some((crate::GdnStateFormat::Q8, 4)),
             batched_fill: false,
         };
         for scope in band_scopes(&config, &[24, 24]) {

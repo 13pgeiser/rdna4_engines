@@ -929,6 +929,9 @@ Caveats that are part of the fixture, not trivia:
   rows when the n-gram source arms (`native_mtp_proposal_drafts`, which the
   loader passes to `native_mtp_device_bytes` / `native_mtp_request_bytes`),
   and the drafter grows its row capture and verify scratch to the armed cap.
+  The capture ring itself is charged at the wider of that window and the
+  arch's row-exact verify rows (`native_mtp_capture`, shared with the
+  runtime's `native_mtp_capture_rows`).
   **A request the floor retired keeps the copy lane.** Retirement says native
   drafting loses to AR, nothing about the copy source, whose acceptance the
   shadow table measures independently (on R9700 at the agentic chain's

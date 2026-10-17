@@ -4130,14 +4130,14 @@ impl Qwen4MtpDrafter {
                 // Verify blocks up to the arch's row-exact limit keep capture
                 // rollback: the ring holds the wider of the window (a copy
                 // lane's `proposal_capacity + 1`, else an MTP window
-                // `max_k + 1`) and the per-GPU row-exact verify rows.
+                // `max_k + 1`) and the per-GPU row-exact verify rows (the
+                // census charges the same ring, `native_mtp_capture`).
                 let window_rows = if copy_lane {
                     capacity + 1
                 } else {
                     self.max_k + 1
                 };
-                let capture_rows =
-                    window_rows.max(crate::gpu_forward::qwen4_row_exact_verify_rows(ops.gpu()?));
+                let capture_rows = native_mtp_capture_rows(ops.gpu()?, window_rows);
                 bundle.ops_ensure_row_capture(ops, capture_rows)?;
             }
             bundle.ops_chunk_rows(ops).unwrap_or(1).max(1)
@@ -8354,6 +8354,31 @@ pub fn native_mtp_row_capture(gpu: &Gpu, config: &crate::Qwen4Config) -> bool {
         && config.linear_conv_kernel_dim == 4
 }
 
+/// Rows of the native MTP GDN capture ring on this GPU for a window of
+/// `window_rows` rows: the wider of the window and the arch's row-exact verify
+/// rows, so verify blocks up to the row-exact limit keep capture rollback.
+pub fn native_mtp_capture_rows(gpu: &Gpu, window_rows: usize) -> usize {
+    window_rows.max(crate::gpu_forward::qwen4_row_exact_verify_rows(gpu))
+}
+
+/// The `row_capture` argument of [`native_mtp_device_bytes`] /
+/// [`native_mtp_request_bytes`] for this GPU: the GDN state format and the
+/// ring rows ([`native_mtp_capture_rows`] of a `max_k`-draft window) where
+/// [`native_mtp_row_capture`], else `None`.
+pub fn native_mtp_capture(
+    gpu: &Gpu,
+    config: &crate::Qwen4Config,
+    gdn: crate::GdnStateFormat,
+    max_k: usize,
+) -> Option<(crate::GdnStateFormat, usize)> {
+    native_mtp_row_capture(gpu, config).then(|| {
+        (
+            gdn,
+            native_mtp_capture_rows(gpu, native_mtp_window_rows(max_k)),
+        )
+    })
+}
+
 /// Whether a native MTP request on this GPU allocates the prompt-fill Append
 /// scratch (`MtpAppendScratch`): exact gfx1151 or gfx1201 with
 /// `HIPFIRE_QWEN4_MTP_BATCHED_FILL` on, or exact gfx1151 with
@@ -8372,8 +8397,8 @@ pub fn native_mtp_fill_scratch(gpu: &Gpu) -> bool {
 /// at attach) and what the first speculative request allocates after it —
 /// the verify hidden rows (`max_k + 1` rows or one forward chunk, whichever
 /// is larger), the pending and row hidden carries, with `row_capture`
-/// (the GDN state format, where [`native_mtp_row_capture`]) the
-/// `max_k + 1`-row GDN capture in that format, and with `batched_fill`
+/// (the GDN state format and ring rows, [`native_mtp_capture`]) the GDN
+/// capture ring in that format, and with `batched_fill`
 /// (where [`native_mtp_fill_scratch`]) the prompt-fill Append scratch.
 pub fn native_mtp_device_bytes(
     config: &crate::Qwen4Config,
@@ -8381,7 +8406,7 @@ pub fn native_mtp_device_bytes(
     chunk_rows: usize,
     max_k: usize,
     head_dtype: rdna_compute::DType,
-    row_capture: Option<crate::GdnStateFormat>,
+    row_capture: Option<(crate::GdnStateFormat, usize)>,
     batched_fill: bool,
 ) -> Option<u64> {
     let request = native_mtp_request_bytes(
@@ -8413,14 +8438,14 @@ pub(crate) fn native_mtp_window_rows(max_k: usize) -> usize {
 /// verify hidden rows (`max_k + 1` rows or one `chunk_rows` forward chunk,
 /// whichever is larger; `on` reserves two chunks), the pending and row hidden
 /// carries, with
-/// `row_capture` the `max_k + 1`-row GDN capture in that format, and with
+/// `row_capture` (format, ring rows) the GDN capture ring, and with
 /// `batched_fill` the batched prompt-fill scratch and one chunk of prompt ids.
 pub fn native_mtp_request_bytes(
     config: &crate::Qwen4Config,
     max_seq: usize,
     chunk_rows: usize,
     max_k: usize,
-    row_capture: Option<crate::GdnStateFormat>,
+    row_capture: Option<(crate::GdnStateFormat, usize)>,
     batched_fill: bool,
 ) -> Option<u64> {
     let rows = native_mtp_window_rows(max_k);
@@ -8434,7 +8459,9 @@ pub fn native_mtp_request_bytes(
         crate::npu_trunk::NpuTrunkMode::from_env().ok() == Some(crate::npu_trunk::NpuTrunkMode::On),
     )?;
     let capture = match row_capture {
-        Some(gdn) => crate::state::Qwen4State::row_capture_bytes(config, gdn, rows)?,
+        Some((gdn, ring_rows)) => {
+            crate::state::Qwen4State::row_capture_bytes(config, gdn, ring_rows.max(rows))?
+        }
         None => 0,
     };
     let fill = if batched_fill {

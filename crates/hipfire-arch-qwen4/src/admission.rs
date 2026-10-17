@@ -470,7 +470,8 @@ impl Qwen4QuantGeometry {
             )
         } else {
             (
-                self.routed_gate_up.payload_bytes(ROUTED_GATE_UP_ROWS) == Some(ROUTED_GATE_UP_BYTES),
+                self.routed_gate_up.payload_bytes(ROUTED_GATE_UP_ROWS)
+                    == Some(ROUTED_GATE_UP_BYTES),
                 self.routed_down.payload_bytes(ROUTED_DOWN_ROWS) == Some(ROUTED_DOWN_BYTES),
             )
         };
@@ -591,7 +592,9 @@ pub enum AdmissionError {
     },
     /// A stock-FP8 artifact (qt=55 experts) on a device without FP8 expert
     /// kernels (anything but [`FP8_EXPERTS_ARCH`]).
-    Fp8ExpertsUnsupported { gpu_arch: Option<String> },
+    Fp8ExpertsUnsupported {
+        gpu_arch: Option<String>,
+    },
     /// Native MTP requested for the AR-only stock-FP8 artifact.
     ArOnlyArtifact,
     /// The stock-FP8 artifact is admitted fully resident on one device only
@@ -816,7 +819,13 @@ pub fn admit_recipe_on_device(
     }
     .on_device(gpu_arch);
     if recipe.fp8_experts() {
-        check_fp8_device(capabilities, Some(gpu_arch), mesh, native_mtp, host_mapped_experts)?;
+        check_fp8_device(
+            capabilities,
+            Some(gpu_arch),
+            mesh,
+            native_mtp,
+            host_mapped_experts,
+        )?;
     }
     Ok(capabilities)
 }
@@ -1226,7 +1235,10 @@ mod tests {
             geometry
         );
         // One block: S(R,K) = round_up(R*K + 2*ceil(R/128)*ceil(K/128), 256).
-        assert_eq!(geometry.routed_gate_up.payload_bytes(1_280), Some(3_277_312));
+        assert_eq!(
+            geometry.routed_gate_up.payload_bytes(1_280),
+            Some(3_277_312)
+        );
         assert_eq!(geometry.routed_down.payload_bytes(2_560), Some(1_638_656));
         assert_eq!(
             geometry.routed_gate_up.expert_payload_bytes(512, 1_280),
@@ -1241,8 +1253,14 @@ mod tests {
             QuantTensorGeometry::fp8e4m3b128(129).payload_bytes(3),
             Some((3usize * 129 + 2 * 2).div_ceil(256) * 256)
         );
-        assert_eq!(geometry.matrix_aligned.payload_bytes(2), Some(2 * 2_560 * 2));
-        assert_eq!(geometry.matrix_unaligned.payload_bytes(2), Some(2 * 640 * 2));
+        assert_eq!(
+            geometry.matrix_aligned.payload_bytes(2),
+            Some(2 * 2_560 * 2)
+        );
+        assert_eq!(
+            geometry.matrix_unaligned.payload_bytes(2),
+            Some(2 * 640 * 2)
+        );
         assert_eq!(geometry.ple_row_dtype, QuantFormat::Fp8E4M3PerTensor);
 
         let mut mixed = Qwen4QuantGeometry::manifest();
@@ -1279,7 +1297,13 @@ mod tests {
             Qwen4Admission::admit(&ar_only, &request(Some("gfx942"))).expect("gfx942 admits");
         assert!(admitted.capabilities.fp8_experts);
         assert!(!admitted.native_mtp && !admitted.capabilities.native_mtp);
-        for arch in [Some("gfx1201"), Some("gfx1151"), Some("gfx1100"), Some("gfx940"), None] {
+        for arch in [
+            Some("gfx1201"),
+            Some("gfx1151"),
+            Some("gfx1100"),
+            Some("gfx940"),
+            None,
+        ] {
             let error = Qwen4Admission::admit(&ar_only, &request(arch)).unwrap_err();
             assert_eq!(
                 error,
@@ -1310,11 +1334,9 @@ mod tests {
             Err(AdmissionError::Fp8ProfileMismatch(_))
         ));
         // The packed artifact stays device-neutral at this boundary.
-        let packed = Qwen4AdmissionRequest::text_ar(
-            EffectiveMesh::single(),
-            Qwen4Artifact::manifest_hfqm(),
-        )
-        .on_device("gfx1201");
+        let packed =
+            Qwen4AdmissionRequest::text_ar(EffectiveMesh::single(), Qwen4Artifact::manifest_hfqm())
+                .on_device("gfx1201");
         let packed = Qwen4Admission::admit(&config(), &packed).expect("packed on gfx1201");
         assert!(!packed.capabilities.fp8_experts);
     }
@@ -1466,7 +1488,7 @@ mod tests {
             let gdn = crate::GdnStateFormat::Q8;
             let mtp = NativeMtpCensusInputs {
                 max_k: 3,
-                row_capture: Some(gdn),
+                row_capture: Some((gdn, 4)),
                 batched_fill: false,
             };
             let free = [u64::MAX; 6];

@@ -998,10 +998,7 @@ fn qwen4_native_mtp_speculator(
                 if ngram_on && copy_lane {
                     eprintln!(
                         "  qwen4 native MTP n-gram copy lane: on (take_cap={})",
-                        hipfire_arch_qwen4::mtp_spec::qwen4_ngram_take_cap(
-                            &config,
-                            verify_rows,
-                        )
+                        hipfire_arch_qwen4::mtp_spec::qwen4_ngram_take_cap(&config, verify_rows,)
                     );
                 }
                 Some(config)
@@ -1325,14 +1322,19 @@ fn qwen4_placement_inputs(
             }
             let head = residency::language_head_dtype(weights)
                 .ok_or("qwen4: manifest has no language head")?;
-            let row_capture = hipfire_arch_qwen4::mtp_spec::native_mtp_row_capture(gpu, config)
-                .then_some(state_format.gdn);
+            let drafts = hipfire_arch_qwen4::mtp_spec::native_mtp_proposal_drafts(max_k, &gpu.arch);
+            let row_capture = hipfire_arch_qwen4::mtp_spec::native_mtp_capture(
+                gpu,
+                config,
+                state_format.gdn,
+                drafts,
+            );
             Ok(Some(
                 hipfire_arch_qwen4::mtp_spec::native_mtp_device_bytes(
                     config,
                     context,
                     chunk_rows,
-                    hipfire_arch_qwen4::mtp_spec::native_mtp_proposal_drafts(max_k, &gpu.arch),
+                    drafts,
                     head,
                     row_capture,
                     hipfire_arch_qwen4::mtp_spec::native_mtp_fill_scratch(gpu),
@@ -2804,13 +2806,19 @@ fn load_qwen4_rank_scoped(
         || -> Result<crate::admission::Qwen4MemoryAdmission, String> {
             let mtp_request = if native_mtp {
                 let config = &bundle.config;
+                let drafts =
+                    hipfire_arch_qwen4::mtp_spec::native_mtp_proposal_drafts(max_k, &ctx.gpu.arch);
                 hipfire_arch_qwen4::mtp_spec::native_mtp_request_bytes(
                     config,
                     ctx.max_seq,
                     bundle.spec_chunk_rows().unwrap_or(1).max(1),
-                    hipfire_arch_qwen4::mtp_spec::native_mtp_proposal_drafts(max_k, &ctx.gpu.arch),
-                    hipfire_arch_qwen4::mtp_spec::native_mtp_row_capture(ctx.gpu, config)
-                        .then_some(state_format.gdn),
+                    drafts,
+                    hipfire_arch_qwen4::mtp_spec::native_mtp_capture(
+                        ctx.gpu,
+                        config,
+                        state_format.gdn,
+                        drafts,
+                    ),
                     hipfire_arch_qwen4::mtp_spec::native_mtp_fill_scratch(ctx.gpu),
                 )
                 .ok_or("qwen4: native MTP request bytes overflow")?
@@ -3337,8 +3345,12 @@ fn load_qwen4_pp_bundle(
         )?;
         let native_mtp_inputs = native_mtp.then(|| q4::expert_residency::NativeMtpCensusInputs {
             max_k: shared.max_k,
-            row_capture: q4::mtp_spec::native_mtp_row_capture(daemon, &config)
-                .then_some(state_format.gdn),
+            row_capture: q4::mtp_spec::native_mtp_capture(
+                daemon,
+                &config,
+                state_format.gdn,
+                shared.max_k,
+            ),
             batched_fill: q4::mtp_spec::native_mtp_fill_scratch(daemon),
         });
         let fits =

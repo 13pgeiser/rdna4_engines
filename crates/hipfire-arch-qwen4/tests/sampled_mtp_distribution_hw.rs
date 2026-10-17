@@ -919,9 +919,12 @@ fn load(model: &Path) -> Result<Loaded, String> {
         // Every oracle arm reserves the same native MTP footprint.
         let head = residency::language_head_dtype(&weights)
             .ok_or("qwen4: manifest has no language head")?;
-        let row_capture =
-            hipfire_arch_qwen4::mtp_spec::native_mtp_row_capture(&gpu, &receipt.config)
-                .then_some(state_format.gdn);
+        let row_capture = hipfire_arch_qwen4::mtp_spec::native_mtp_capture(
+            &gpu,
+            &receipt.config,
+            state_format.gdn,
+            MTP_K,
+        );
         let mtp = hipfire_arch_qwen4::mtp_spec::native_mtp_device_bytes(
             &receipt.config,
             &context,
