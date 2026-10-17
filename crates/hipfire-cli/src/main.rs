@@ -14,10 +14,10 @@ use hipfire_client::{
     stream_openai_chat, Engine, OpenAiSseEvent, ServiceEndpoint,
 };
 use hipfire_config::{
-    apply_config_profile, canonical_config_key, create_config_profile, developer_env_for_key,
-    field, fields, is_developer_key, load_catalog, load_env_layer, load_global, resolve,
-    unknown_key, write_catalog_toml, write_global_toml, CatalogFormat, ConfigFormat, ConfigLayer,
-    ConfigPaths, ConfigSource, NamedLayer, RemoveModelOverride, ValueRule, CONFIG_SCHEMA_VERSION,
+    apply_config_profile, canonical_config_key, create_config_profile, field, fields,
+    is_developer_key, load_catalog, load_env_layer, load_global, resolve, unknown_key,
+    write_catalog_toml, write_global_toml, CatalogFormat, ConfigFormat, ConfigLayer, ConfigPaths,
+    ConfigSource, NamedLayer, RemoveModelOverride, ValueRule, CONFIG_SCHEMA_VERSION,
 };
 use hipfire_registry::{
     load as load_registry, ExpertHotsetPin, GrandfatheredMonolithic, LoadedRegistry, ModelEntry,
@@ -51,6 +51,7 @@ use std::{
 
 mod bench_concurrency;
 mod bench_power;
+mod config_view;
 #[cfg(target_os = "linux")]
 mod doctor;
 mod emu;
@@ -162,8 +163,8 @@ struct ConfigArgs {
 
 #[derive(Subcommand, Debug)]
 enum ConfigAction {
-    /// Print every effective key, its source, and override state.
-    List(OutputArgs),
+    /// Print every setting by intent group with its effective value and origin.
+    List(ConfigListArgs),
     /// Print one effective value.
     Get {
         key: String,
@@ -177,9 +178,14 @@ enum ConfigAction {
     /// Explain a key's type, scope, default, effective value, and provenance.
     Explain {
         key: String,
+        /// Explain the key for one model (same as `hipfire config MODEL explain KEY`).
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
         #[command(flatten)]
         output: OutputArgs,
     },
+    /// List every per-model value in models.toml next to the all-models value.
+    Overrides(OutputArgs),
     /// Print the authoritative typed configuration schema.
     Schema(OutputArgs),
     /// Convert legacy config.json to sparse config.toml without deleting JSON.
@@ -193,7 +199,7 @@ enum ConfigAction {
 
 #[derive(Subcommand, Debug)]
 enum ConfigProfileAction {
-    /// Replace the global sparse config with a built-in or custom profile.
+    /// Merge a built-in or custom profile into the global sparse config.
     Set {
         /// Built-in (`default`, `dev`, `hip`, `redline`) or custom profile name.
         name: String,
@@ -207,6 +213,25 @@ enum ConfigProfileAction {
 
 #[derive(Args, Debug, Clone, Copy)]
 struct OutputArgs {
+    /// Emit machine-readable JSON.
+    #[arg(short, long)]
+    json: bool,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+struct ConfigListArgs {
+    /// Show one intent group: quality, speed, memory, speculation, hardware, advanced.
+    #[arg(long, value_name = "GROUP")]
+    group: Option<String>,
+    /// Only settings set by something other than the defaults or the model card.
+    #[arg(long)]
+    changed: bool,
+    /// Only settings matching TEXT (key, legacy key, help, env var, category, scope).
+    #[arg(long, value_name = "TEXT")]
+    search: Option<String>,
+    /// List for one model (same as `hipfire config MODEL list`).
+    #[arg(long, value_name = "MODEL")]
+    model: Option<String>,
     /// Emit machine-readable JSON.
     #[arg(short, long)]
     json: bool,
@@ -1074,7 +1099,18 @@ pub(crate) fn set_global_config(paths: &Paths, key: &str, value: &str) -> Result
 }
 
 fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
-    if let Some(model) = args.model {
+    let flag_model = match &args.action {
+        Some(ConfigAction::List(list)) => list.model.clone(),
+        Some(ConfigAction::Explain { model, .. }) => model.clone(),
+        _ => None,
+    };
+    let model = match (args.model, flag_model) {
+        (Some(positional), Some(flag)) if positional != flag => {
+            bail!("model given twice: '{positional}' and --model '{flag}'")
+        }
+        (positional, flag) => positional.or(flag),
+    };
+    if let Some(model) = model {
         return model_config_command(paths, &model, args.action);
     }
     let Some(action) = args.action else {
@@ -1082,99 +1118,8 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
         return launch_tui(paths, &["--settings".to_owned()]);
     };
     match action {
-        ConfigAction::List(output) => {
-            let (loaded, resolved) = resolved_global(paths, true)?;
-            if output.json {
-                let mut values = fields()
-                    .iter()
-                    .map(|field| {
-                        let item = resolved.get(field.key).ok_or_else(|| {
-                            anyhow!("configuration key '{}' is not set", field.key)
-                        })?;
-                        Ok::<_, anyhow::Error>((
-                            field.key.to_owned(),
-                            serde_json::json!({
-                                "legacy_key": field.legacy_key,
-                                "value": item.value,
-                                "default": format_default(field),
-                                "source": item.source,
-                                "overridden": loaded.layer.get(field.key).is_some(),
-                            }),
-                        ))
-                    })
-                    .collect::<Result<serde_json::Map<_, _>>>()?;
-                for (key, item) in resolved
-                    .values
-                    .iter()
-                    .filter(|(key, _)| is_developer_key(key))
-                {
-                    values.insert(
-                        key.clone(),
-                        serde_json::json!({
-                            "legacy_key": null,
-                            "value": item.value,
-                            "default": null,
-                            "source": item.source,
-                            "overridden": loaded.layer.get(key).is_some(),
-                        }),
-                    );
-                }
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "scope": "global",
-                        "path": loaded.path,
-                        "format": format!("{:?}", loaded.format).to_lowercase(),
-                        "values": values,
-                        "warnings": loaded.warnings,
-                    }))?
-                );
-            } else {
-                println!("Global configuration: {}", loaded.path.display());
-                if loaded.format == ConfigFormat::LegacyJson {
-                    println!("  legacy JSON is active; the next write will create config.toml");
-                }
-                println!();
-                for schema in fields() {
-                    let item = resolved
-                        .get(schema.key)
-                        .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
-                    let marker = if loaded.layer.get(schema.key).is_some() {
-                        "override"
-                    } else {
-                        "inherited"
-                    };
-                    println!(
-                        "  {:<43} {:<16} {:<9} {}",
-                        schema.key,
-                        item.value,
-                        marker,
-                        source_label(&item.source)
-                    );
-                }
-                for (key, item) in resolved
-                    .values
-                    .iter()
-                    .filter(|(key, _)| is_developer_key(key))
-                {
-                    let marker = if loaded.layer.get(key).is_some() {
-                        "override"
-                    } else {
-                        "inherited"
-                    };
-                    println!(
-                        "  {:<43} {:<16} {:<9} {}",
-                        key,
-                        item.value,
-                        marker,
-                        source_label(&item.source)
-                    );
-                }
-                for warning in loaded.warnings {
-                    eprintln!("warning: {warning}");
-                }
-            }
-            Ok(())
+        ConfigAction::List(list) => {
+            config_view::list_global_to(paths, &list, &mut std::io::stdout())
         }
         ConfigAction::Get { key, output } => {
             let (_, resolved) = resolved_global(paths, true)?;
@@ -1219,104 +1164,11 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
             }
             Ok(())
         }
-        ConfigAction::Explain { key, output } => {
-            let (loaded, resolved) = resolved_global(paths, true)?;
-            let canonical = canonical_config_key(&key).ok_or_else(|| unknown_key(&key))?;
-            let value = resolved
-                .get(&canonical)
-                .ok_or_else(|| anyhow!("configuration key '{canonical}' is not set"))?;
-            if is_developer_key(&canonical) {
-                let env_compat = developer_env_for_key(&canonical).ok_or_else(|| {
-                    anyhow!("developer key '{canonical}' has no legacy env spelling")
-                })?;
-                if output.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "key": canonical,
-                            "legacy_key": null,
-                            "value": value.value,
-                            "source": value.source,
-                            "shadowed": value.shadowed,
-                            "default": null,
-                            "category": "diagnostic",
-                            "scope": "process",
-                            "registry_allowed": false,
-                            "experimental": true,
-                            "env_compat": env_compat,
-                            "help": "Experimental process-scoped override. Prefer a typed field when one exists.",
-                            "config_path": loaded.path,
-                        }))?
-                    );
-                } else {
-                    println!("{canonical}");
-                    println!("  value:       {}", value.value);
-                    println!("  source:      {}", source_label(&value.source));
-                    println!("  default:     unset");
-                    println!("  category:    Diagnostic");
-                    println!("  scope:       Process");
-                    println!("  registry:    false");
-                    println!("  legacy env:  {env_compat}");
-                    println!(
-                        "  about:       Experimental process-scoped override. Prefer a typed field when one exists."
-                    );
-                    if !value.shadowed.is_empty() {
-                        println!("  shadowed:");
-                        for candidate in value.shadowed.iter().rev() {
-                            println!(
-                                "    {:<16} {}",
-                                candidate.value,
-                                source_label(&candidate.source)
-                            );
-                        }
-                    }
-                }
-                return Ok(());
-            }
-            let schema = field(&canonical).ok_or_else(|| unknown_key(&canonical))?;
-            if output.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "key": schema.key,
-                        "legacy_key": schema.legacy_key,
-                        "value": value.value,
-                        "source": value.source,
-                        "shadowed": value.shadowed,
-                        "default": format_default(schema),
-                        "category": schema.category,
-                        "scope": schema.scope,
-                        "registry_allowed": schema.registry_allowed,
-                        "experimental": schema.experimental,
-                        "env_compat": schema.env_compat,
-                        "help": schema.help,
-                        "config_path": loaded.path,
-                    }))?
-                );
-            } else {
-                println!("{}", schema.key);
-                println!("  value:       {}", value.value);
-                println!("  source:      {}", source_label(&value.source));
-                println!("  default:     {}", format_default(schema));
-                println!("  category:    {:?}", schema.category);
-                println!("  scope:       {:?}", schema.scope);
-                println!("  registry:    {}", schema.registry_allowed);
-                if let Some(env) = schema.env_compat {
-                    println!("  legacy env:  {env}");
-                }
-                println!("  about:       {}", schema.help);
-                if !value.shadowed.is_empty() {
-                    println!("  shadowed:");
-                    for candidate in value.shadowed.iter().rev() {
-                        println!(
-                            "    {:<16} {}",
-                            candidate.value,
-                            source_label(&candidate.source)
-                        );
-                    }
-                }
-            }
-            Ok(())
+        ConfigAction::Explain { key, output, .. } => {
+            config_view::explain_global_to(paths, &key, output.json, &mut std::io::stdout())
+        }
+        ConfigAction::Overrides(output) => {
+            config_view::overrides_to(paths, output.json, &mut std::io::stdout())
         }
         ConfigAction::Schema(output) => {
             let schema = fields()
@@ -1474,88 +1326,20 @@ fn model_config_command_to(
         .model(model_name)
         .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
         .unwrap_or((None, None));
-    let action = action.unwrap_or(ConfigAction::List(OutputArgs { json: false }));
+    let action = action.unwrap_or(ConfigAction::List(ConfigListArgs::default()));
     if matches!(
         action,
-        ConfigAction::Migrate | ConfigAction::Schema(_) | ConfigAction::Profile { .. }
+        ConfigAction::Migrate
+            | ConfigAction::Schema(_)
+            | ConfigAction::Profile { .. }
+            | ConfigAction::Overrides(_)
     ) {
-        bail!("config migrate/schema/profile are global; omit the model argument");
+        bail!("config migrate/schema/profile/overrides are global; omit the model argument");
     }
 
     match action {
-        ConfigAction::List(output) => {
-            let catalog = load_catalog(&paths.config)?;
-            let record = catalog
-                .catalog
-                .model(model_name)
-                .or_else(|| tag.as_deref().and_then(|tag| catalog.catalog.model(tag)));
-            let overrides = record
-                .map(|(_, model)| &model.overrides)
-                .cloned()
-                .unwrap_or_default();
-            let resolved = resolved_for_model(paths, model_name, tag.as_deref(), entry)?;
-            if output.json {
-                let values = fields()
-                    .iter()
-                    .map(|schema| {
-                        let item = resolved.get(schema.key).ok_or_else(|| {
-                            anyhow!("configuration key '{}' is not set", schema.key)
-                        })?;
-                        Ok::<_, anyhow::Error>((
-                            schema.key.to_owned(),
-                            serde_json::json!({
-                                "legacy_key": schema.legacy_key,
-                                "value": item.value,
-                                "source": item.source,
-                                "overridden": overrides.get(schema.key).is_some(),
-                            }),
-                        ))
-                    })
-                    .collect::<Result<serde_json::Map<_, _>>>()?;
-                writeln!(
-                    out,
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "scope": "model",
-                        "model": model_name,
-                        "canonical_tag": tag,
-                        "path": catalog.path,
-                        "format": format!("{:?}", catalog.format).to_lowercase(),
-                        "values": values,
-                        "warnings": catalog.warnings,
-                    }))?
-                )?;
-            } else {
-                writeln!(out, "Model configuration: {model_name}")?;
-                writeln!(
-                    out,
-                    "Catalog: {} ({:?})\n",
-                    catalog.path.display(),
-                    catalog.format
-                )?;
-                for schema in fields() {
-                    let item = resolved
-                        .get(schema.key)
-                        .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
-                    let marker = if overrides.get(schema.key).is_some() {
-                        "override"
-                    } else {
-                        "inherited"
-                    };
-                    writeln!(
-                        out,
-                        "  {:<43} {:<16} {:<9} {}",
-                        schema.key,
-                        item.value,
-                        marker,
-                        source_label(&item.source)
-                    )?;
-                }
-                for warning in catalog.warnings {
-                    eprintln!("warning: {warning}");
-                }
-            }
-            Ok(())
+        ConfigAction::List(list) => {
+            config_view::list_model_to(paths, registry, model_name, &list, out)
         }
         ConfigAction::Get { key, output } => {
             if is_developer_key(&key) {
@@ -1626,51 +1410,13 @@ fn model_config_command_to(
             }
             Ok(())
         }
-        ConfigAction::Explain { key, output } => {
-            if is_developer_key(&key) {
-                bail!("developer configuration is global process policy; omit the model argument");
-            }
-            let resolved = resolved_for_model(paths, model_name, tag.as_deref(), entry)?;
-            let schema = field(&key).ok_or_else(|| unknown_key(&key))?;
-            let value = resolved
-                .get(schema.key)
-                .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
-            if output.json {
-                writeln!(
-                    out,
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "model": model_name,
-                        "key": schema.key,
-                        "value": value.value,
-                        "source": value.source,
-                        "shadowed": value.shadowed,
-                        "scope": schema.scope,
-                        "help": schema.help,
-                    }))?
-                )?;
-            } else {
-                writeln!(out, "{}", schema.key)?;
-                writeln!(out, "  model:       {model_name}")?;
-                writeln!(out, "  value:       {}", value.value)?;
-                writeln!(out, "  source:      {}", source_label(&value.source))?;
-                writeln!(out, "  scope:       {:?}", schema.scope)?;
-                writeln!(out, "  about:       {}", schema.help)?;
-                if !value.shadowed.is_empty() {
-                    writeln!(out, "  shadowed:")?;
-                    for candidate in value.shadowed.iter().rev() {
-                        writeln!(
-                            out,
-                            "    {:<16} {}",
-                            candidate.value,
-                            source_label(&candidate.source)
-                        )?;
-                    }
-                }
-            }
-            Ok(())
+        ConfigAction::Explain { key, output, .. } => {
+            config_view::explain_model_to(paths, registry, model_name, &key, output.json, out)
         }
-        ConfigAction::Migrate | ConfigAction::Schema(_) | ConfigAction::Profile { .. } => {
+        ConfigAction::Migrate
+        | ConfigAction::Schema(_)
+        | ConfigAction::Profile { .. }
+        | ConfigAction::Overrides(_) => {
             unreachable!()
         }
     }
@@ -11202,17 +10948,31 @@ mod tests {
             transcript.push_str(&match result {
                 Ok(()) if label.starts_with("list") => {
                     // The full list tracks the whole schema; pin the header and
-                    // the rows these steps change or inherit.
+                    // the rows these steps change or inherit, each under its
+                    // group title.
                     const PINNED: [&str; 4] = [
                         "generation.max_tokens",
                         "generation.temperature",
                         "memory.max_seq",
                         "reasoning.effort",
                     ];
+                    let titles = hipfire_config::intent::Intent::ALL.map(|group| group.title());
                     let mut kept = String::new();
-                    for line in String::from_utf8(out).unwrap().lines() {
-                        let key = line.split_whitespace().next().unwrap_or("");
-                        if !line.starts_with("  ") || PINNED.contains(&key) {
+                    let mut title: Option<&str> = None;
+                    let text = String::from_utf8(out).unwrap();
+                    for line in text.lines() {
+                        if titles.contains(&line) {
+                            title = Some(line);
+                        } else if line.starts_with("  ") {
+                            let key = line.split_whitespace().next().unwrap_or("");
+                            if PINNED.contains(&key) {
+                                if let Some(title) = title.take() {
+                                    kept.push_str(&format!("\n{title}\n"));
+                                }
+                                kept.push_str(line);
+                                kept.push('\n');
+                            }
+                        } else if !line.is_empty() {
                             kept.push_str(line);
                             kept.push('\n');
                         }
@@ -11225,7 +10985,7 @@ mod tests {
             transcript.push_str("-- models.toml\n");
             transcript.push_str(&fs::read_to_string(&paths.config.models_toml).unwrap_or_default());
         };
-        let list = || ConfigAction::List(OutputArgs { json: false });
+        let list = || ConfigAction::List(ConfigListArgs::default());
         step("list", "qwen3:8b", list());
         step(
             "set reasoning.effort high",
@@ -11304,12 +11064,431 @@ mod tests {
     #[test]
     fn model_config_list_set_reset_output_is_stable() {
         let transcript = model_config_golden_transcript();
-        // Captured from the handler before the set/reset logic moved into
-        // `hipfire_config`; the move must not change a byte.
+        // set/reset output is the original capture; the list blocks follow the
+        // grouped settings view (using now / from / applies), changed
+        // intentionally with `config list` redesign.
         assert_eq!(
             transcript,
             include_str!("../tests/fixtures/model_config_transcript.txt")
         );
+    }
+
+    /// A fixture HOME: optional `config.toml`, `models.toml` and
+    /// `install.json` under a fresh root.
+    fn settings_fixture(
+        label: &str,
+        config_toml: Option<&str>,
+        models_toml: Option<&str>,
+        install_json: Option<&str>,
+    ) -> Paths {
+        let paths = test_paths(label);
+        fs::create_dir_all(&paths.root).unwrap();
+        if let Some(text) = config_toml {
+            fs::write(&paths.config.config_toml, text).unwrap();
+        }
+        if let Some(text) = models_toml {
+            fs::write(&paths.config.models_toml, text).unwrap();
+        }
+        if let Some(text) = install_json {
+            fs::write(paths.config.root.join("install.json"), text).unwrap();
+        }
+        paths
+    }
+
+    fn squash(line: &str) -> String {
+        line.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn list_global_text(paths: &Paths, args: ConfigListArgs) -> String {
+        let mut out = Vec::new();
+        config_view::list_global_to(paths, &args, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    const LOW_EFFORT: &str = "[reasoning]\neffort = \"low\"\n";
+    const GFX1201: &str = "{\"gpu_arch\":\"gfx1201\"}";
+
+    #[test]
+    fn config_list_group_quality_shows_value_origin_and_applies() {
+        let paths = settings_fixture("cfg-list-quality", Some(LOW_EFFORT), None, Some(GFX1201));
+        let text = list_global_text(
+            &paths,
+            ConfigListArgs {
+                group: Some("QUALITY".into()),
+                ..ConfigListArgs::default()
+            },
+        );
+        assert!(text.contains("GPU: gfx1201 (install.json)"), "{text}");
+        assert!(text.contains("\nQuality\n"), "{text}");
+        for other in ["Speed", "Memory & context", "Speculation", "Advanced"] {
+            assert!(!text.contains(&format!("\n{other}\n")), "{text}");
+        }
+        let rows: Vec<String> = text.lines().map(squash).collect();
+        assert!(
+            rows.iter()
+                .any(|row| row == "reasoning.effort low you next message"),
+            "{text}"
+        );
+        assert!(!text.contains("memory.kv_cache"), "{text}");
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn config_list_unknown_group_lists_valid_names_and_aliases_work() {
+        let paths = settings_fixture("cfg-list-group-names", None, None, None);
+        let mut out = Vec::new();
+        let error = config_view::list_global_to(
+            &paths,
+            &ConfigListArgs {
+                group: Some("nope".into()),
+                ..ConfigListArgs::default()
+            },
+            &mut out,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unknown group 'nope'"), "{error}");
+        for name in [
+            "quality",
+            "speed",
+            "memory",
+            "speculation",
+            "hardware",
+            "advanced",
+        ] {
+            assert!(error.contains(name), "{error}");
+        }
+        for (alias, title) in [
+            ("memory-context", "Memory & context"),
+            ("Memory", "Memory & context"),
+            ("hardware-devices", "Hardware & devices"),
+            ("hardware", "Hardware & devices"),
+        ] {
+            let text = list_global_text(
+                &paths,
+                ConfigListArgs {
+                    group: Some(alias.into()),
+                    ..ConfigListArgs::default()
+                },
+            );
+            assert!(text.contains(&format!("\n{title}\n")), "{alias}: {text}");
+        }
+        assert!(list_global_text(
+            &paths,
+            ConfigListArgs {
+                group: Some("memory".into()),
+                ..ConfigListArgs::default()
+            }
+        )
+        .contains("GPU: unknown (no gpu_arch in install.json)"));
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn config_list_changed_hides_default_rows_and_search_filters() {
+        let paths = settings_fixture("cfg-list-changed", Some(LOW_EFFORT), None, Some(GFX1201));
+        let changed = list_global_text(
+            &paths,
+            ConfigListArgs {
+                changed: true,
+                ..ConfigListArgs::default()
+            },
+        );
+        // The process may carry HIPFIRE_* variables (env rows are marked too);
+        // every kept row must be marked and the default rows must be gone.
+        let rows: Vec<String> = changed
+            .lines()
+            .filter(|line| line.starts_with("  "))
+            .map(squash)
+            .collect();
+        assert!(
+            rows.iter()
+                .any(|row| row == "reasoning.effort low you next message"),
+            "{changed}"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| !row.contains(" default ") && !row.contains(" registry ")),
+            "{changed}"
+        );
+        assert!(!changed.contains("memory.kv_cache"), "{changed}");
+
+        let searched = list_global_text(
+            &paths,
+            ConfigListArgs {
+                search: Some("KV".into()),
+                ..ConfigListArgs::default()
+            },
+        );
+        assert!(searched.contains("memory.kv_cache"), "{searched}");
+        assert!(!searched.contains("reasoning.effort"), "{searched}");
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn config_list_json_adds_view_fields_and_keeps_existing_ones() {
+        let paths = settings_fixture("cfg-list-json", Some(LOW_EFFORT), None, Some(GFX1201));
+        let text = {
+            let mut out = Vec::new();
+            config_view::list_global_to(
+                &paths,
+                &ConfigListArgs {
+                    json: true,
+                    ..ConfigListArgs::default()
+                },
+                &mut out,
+            )
+            .unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(doc["scope"], "global");
+        assert_eq!(doc["gpu_arch"], "gfx1201");
+        let effort = &doc["values"]["reasoning.effort"];
+        assert_eq!(effort["value"], "low");
+        assert_eq!(effort["overridden"], true);
+        assert!(effort["legacy_key"].is_string());
+        assert!(effort["default"].is_string());
+        assert!(effort["source"].is_object() || effort["source"].is_string());
+        assert_eq!(effort["group"], "quality");
+        assert_eq!(effort["effective"]["value"], "low");
+        assert_eq!(effort["origin"], "you");
+        assert_eq!(effort["from"], "you");
+        assert_eq!(effort["applies"], "next message");
+        let kv = &doc["values"]["memory.kv_cache"];
+        assert_eq!(kv["group"], "memory-context");
+        assert_eq!(kv["effective"]["value"], "fp8");
+        assert_eq!(kv["origin"], "default");
+        assert_eq!(kv["from"], "default · gfx1201");
+        assert_eq!(kv["overridden"], false);
+
+        // Filters apply to JSON too.
+        let mut out = Vec::new();
+        config_view::list_global_to(
+            &paths,
+            &ConfigListArgs {
+                json: true,
+                changed: true,
+                ..ConfigListArgs::default()
+            },
+            &mut out,
+        )
+        .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        // The process may carry HIPFIRE_* variables (env rows are marked too);
+        // every kept row must be marked and the default rows must be gone.
+        let rows = doc["values"].as_object().unwrap();
+        assert!(rows.contains_key("reasoning.effort"));
+        assert!(!rows.contains_key("memory.kv_cache"));
+        assert!(rows
+            .values()
+            .all(|row| !matches!(row["origin"].as_str(), Some("default" | "registry"))));
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn config_model_list_marks_rows_the_model_does_not_use() {
+        let paths = settings_fixture(
+            "cfg-list-model",
+            None,
+            None,
+            Some("{\"gpu_arch\":\"gfx1151\"}"),
+        );
+        let registry = RegistryV1::parse(
+            r#"{
+                "schema_version":1,
+                "generated_at":"2026-09-01T00:00:00Z",
+                "models":{
+                    "dense:8b":{"repo":"x","file":"dense-8b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","arch_id":5}
+                },
+                "aliases":{}
+            }"#,
+            "test",
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        model_config_command_to(
+            &paths,
+            &registry,
+            "dense:8b",
+            Some(ConfigAction::List(ConfigListArgs {
+                group: Some("quality".into()),
+                ..ConfigListArgs::default()
+            })),
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with("Model configuration: dense:8b\n"),
+            "{text}"
+        );
+        assert!(text.contains("GPU: gfx1151 (install.json)"), "{text}");
+        let ple = text
+            .lines()
+            .find(|line| line.trim_start().starts_with("memory.ple_format"))
+            .unwrap();
+        assert!(ple.ends_with("   (not used by this model)"), "{ple}");
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn config_list_model_flag_routes_to_the_model_form() {
+        let parsed = Cli::try_parse_from([
+            "hipfire",
+            "config",
+            "list",
+            "--model",
+            "qwen:test",
+            "--group",
+            "quality",
+        ])
+        .unwrap();
+        let Some(Commands::Config(args)) = parsed.command else {
+            panic!("expected config command")
+        };
+        assert!(args.model.is_none());
+        assert!(matches!(
+            &args.action,
+            Some(ConfigAction::List(ConfigListArgs { model: Some(m), .. })) if m == "qwen:test"
+        ));
+
+        let paths = settings_fixture("cfg-model-twice", None, None, None);
+        let error = config_command(
+            &paths,
+            ConfigArgs {
+                model: Some("a".into()),
+                action: Some(ConfigAction::List(ConfigListArgs {
+                    model: Some("b".into()),
+                    ..ConfigListArgs::default()
+                })),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("model given twice"), "{error}");
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    const THREE_OVERRIDES: &str = r#"schema_version = 1
+
+[models."local-thing.mq4".overrides.generation]
+temperature = 0.5
+
+[models."qwen3:8b"]
+registry_tag = "qwen3:8b"
+
+[models."qwen3:8b".overrides.memory]
+max_seq = 4096
+
+[models."qwen3:8b".overrides.reasoning]
+effort = "high"
+"#;
+
+    #[test]
+    fn config_overrides_text_and_json_compare_with_all_models() {
+        let paths = settings_fixture(
+            "cfg-overrides",
+            Some(LOW_EFFORT),
+            Some(THREE_OVERRIDES),
+            None,
+        );
+        let mut out = Vec::new();
+        config_view::overrides_to(&paths, false, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let rows: Vec<String> = text.lines().map(squash).collect();
+        assert_eq!(
+            rows,
+            [
+                "local-thing.mq4 generation.temperature 0.5 (all models: 0.3)",
+                "qwen3:8b memory.max_seq 4096 (all models: 32768)",
+                "qwen3:8b reasoning.effort high (all models: low)",
+                "",
+                "3 overrides on 2 models.",
+            ],
+            "{text}"
+        );
+        // The documented column layout.
+        assert!(text.contains(&format!(
+            "  {:<22} {:<32} {:<10} (all models: low)",
+            "qwen3:8b", "reasoning.effort", "high"
+        )));
+
+        let mut out = Vec::new();
+        config_view::overrides_to(&paths, true, &mut out).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(doc["count"], 3);
+        assert_eq!(doc["models"], 2);
+        let list = doc["overrides"].as_array().unwrap();
+        assert_eq!(list.len(), 3);
+        assert!(list.iter().any(|row| row["model"] == "qwen3:8b"
+            && row["key"] == "reasoning.effort"
+            && row["value"] == "high"
+            && row["all_models"] == "low"));
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn config_overrides_reports_none_when_models_toml_is_empty() {
+        let paths = settings_fixture("cfg-overrides-empty", None, None, None);
+        let mut out = Vec::new();
+        config_view::overrides_to(&paths, false, &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "No per-model overrides (~/.hipfire/models.toml has none).\n"
+        );
+        let mut out = Vec::new();
+        config_view::overrides_to(&paths, true, &mut out).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(doc["count"], 0);
+        assert_eq!(doc["overrides"], serde_json::json!([]));
+        let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    #[test]
+    fn config_explain_shows_effective_value_origin_group_and_applies() {
+        let paths = settings_fixture("cfg-explain", None, None, Some(GFX1201));
+        let mut out = Vec::new();
+        config_view::explain_global_to(&paths, "memory.kv_cache", false, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let effective = text
+            .lines()
+            .find(|line| line.starts_with("  effective:   "))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            effective.starts_with("  effective:   fp8 (auto"),
+            "{effective}"
+        );
+        assert!(
+            text.contains("\n  from:        default · gfx1201\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n  group:       Memory & context\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n  applies:     next model load\n"),
+            "{text}"
+        );
+
+        // A plain default with no rule has no `effective:` line.
+        let mut out = Vec::new();
+        config_view::explain_global_to(&paths, "generation.temperature", false, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("effective:"), "{text}");
+        assert!(text.contains("\n  from:        default\n"), "{text}");
+
+        let mut out = Vec::new();
+        config_view::explain_global_to(&paths, "memory.kv_cache", true, &mut out).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(doc["effective"]["value"], "fp8");
+        assert_eq!(doc["origin"], "default");
+        assert_eq!(doc["from"], "default · gfx1201");
+        assert_eq!(doc["group"], "memory-context");
+        assert!(doc["applies"].is_string());
+        assert!(doc["shadowed"].is_array(), "existing fields stay");
+        let _ = fs::remove_dir_all(&paths.root);
     }
 
     #[test]

@@ -50,6 +50,79 @@ Edit global settings interactively with `hipfire config`. Per-model overlays use
 the typed commands: `hipfire config <tag> list|get|set|reset ...`. Global
 non-interactive edits use `hipfire config list|get|set|reset ...`.
 
+### Reading settings: `list`, `explain`, `overrides`
+
+`hipfire config list` groups every key by what it does for you, in the same six
+groups the Settings tab uses (**Quality**, **Speed**, **Memory & context**,
+**Speculation**, **Hardware & devices**, **Advanced**). Each row shows what the
+key will do *now* on this GPU and who set it:
+
+```text
+Global configuration: /home/u/.hipfire/config.toml
+GPU: gfx1201 (install.json)
+
+Quality
+  kernel.iu4_prefill                          true             default            serve restart
+  reasoning.effort                            low              you                next message
+
+Memory & context
+  memory.kv_cache                             fp8 (auto)       default · gfx1201  next model load
+```
+
+- **Using now** is the *predicted* effective value: an `auto` (or an
+  arch-gated default such as `fp8` KV on gfx1201) is resolved to the concrete
+  value for the GPU in `~/.hipfire/install.json` and, in the model form, the
+  model's registry card. ` (auto)` marks a value an arch rule or `auto` chose.
+  serve decides at load; see its log. Without `gpu_arch` in `install.json` the
+  header says `GPU: unknown (no gpu_arch in install.json)` and arch rules fall
+  back to their arch-neutral answer.
+- **From** names the layer that set the value: `default`, `default · gfx1201`
+  (an arch rule), `registry`, `profile dev`, `you` (config.toml), `this model`
+  (models.toml) or `env HIPFIRE_*`. **Applies** says when a change takes effect
+  (`next message`, `new chat`, `next model load`, `serve restart`).
+- A row ends with `(not used by this model)` / `(not used on this GPU)` when the
+  key has no effect there.
+
+Flags (all combine; they also apply to `--json`):
+
+| Flag | Effect |
+|---|---|
+| `--group G` | one group: `quality`, `speed`, `memory` (`memory-context`), `speculation`, `hardware` (`hardware-devices`), `advanced`; case-insensitive; an unknown name errors with the valid list |
+| `--changed` | only rows something other than the defaults or the model card set (`profile`, `preset`, `you`, `this model`, `env`) |
+| `--search TEXT` | only rows matching `TEXT` across key, legacy key, help, env var, category, scope (the Settings tab search) |
+| `--model M` | list for one model; same as `hipfire config M list` |
+| `--json` | machine-readable output |
+
+`hipfire config MODEL list [--group G] [--changed] [--search TEXT] [--json]`
+shows the same rows for one model: registry card and `models.toml` values apply,
+and "from" says `this model` for a per-model value.
+
+`--json` keeps the earlier per-key fields (`legacy_key`, `value`, `default`,
+`source`, `overridden`) and adds `group` (kebab-case group name), `effective`
+(`{"value", "reason"}`), `origin` (`default`, `registry`, `profile`, `preset`,
+`you`, `model`, `env`, `one-shot`), `from` (the label above) and `applies`; the
+top level gains `gpu_arch`.
+
+`hipfire config explain KEY [--model M]` (also `hipfire config MODEL explain KEY`)
+adds four lines after `source:`: `effective:` (shown when the predicted value
+differs from the resolved one or carries a reason, for example
+`fp8 (auto: fp8 on exact gfx1201, one GPU, Qwen)`), `from:`, `group:` and
+`applies:`. Its JSON adds `effective`, `origin`, `from`, `group` and `applies`.
+
+`hipfire config overrides [--json]` lists every per-model value in
+`~/.hipfire/models.toml` next to the all-models value it overrides:
+
+```text
+  qwen3:8b               memory.max_seq                   4096       (all models: 32768)
+  qwen3:8b               reasoning.effort                 high       (all models: low)
+
+2 overrides on 1 model.
+```
+
+With none, it prints `No per-model overrides (~/.hipfire/models.toml has none).`
+JSON carries `count`, `models` and `overrides[]` (`model`, `key`, `value`,
+`all_models`).
+
 **Precedence (operator view):** one-shot CLI values **>** legacy-compatible
 process env **>** per-model override **>** global TOML **>** registry card
 (`recommended_settings`) **>** built-in defaults. `hipfire config explain`

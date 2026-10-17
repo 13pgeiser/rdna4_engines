@@ -1,11 +1,17 @@
 == list
 Model configuration: qwen3:8b
 Catalog: <ROOT>/models.toml (Empty)
+GPU: unknown (no gpu_arch in install.json)
 
-  generation.temperature                      0.3 inherited built-in
-  generation.max_tokens                       1234 inherited global user (<ROOT>/config.toml)
-  memory.max_seq                              32768 inherited built-in
-  reasoning.effort                            auto inherited built-in
+Quality
+  reasoning.effort                            auto             default            next message
+
+Memory & context
+  memory.max_seq                              32768            default            next model load
+
+Advanced
+  generation.max_tokens                       1234             you                next message
+  generation.temperature                      0.3              default            next message
 -- models.toml
 == set reasoning.effort high
 qwen3:8b reasoning.effort = high
@@ -20,11 +26,17 @@ effort = "high"
 == list after set
 Model configuration: qwen3:8b
 Catalog: <ROOT>/models.toml (Toml)
+GPU: unknown (no gpu_arch in install.json)
 
-  generation.temperature                      0.3 inherited built-in
-  generation.max_tokens                       1234 inherited global user (<ROOT>/config.toml)
-  memory.max_seq                              32768 inherited built-in
-  reasoning.effort                            high override  model user qwen3:8b (<ROOT>/models.toml)
+Quality
+  reasoning.effort                            high             this model         next message
+
+Memory & context
+  memory.max_seq                              32768            default            next model load
+
+Advanced
+  generation.max_tokens                       1234             you                next message
+  generation.temperature                      0.3              default            next message
 -- models.toml
 schema_version = 1
 
@@ -156,11 +168,17 @@ registry_tag = "qwen3:8b"
 == list local after sets
 Model configuration: local-thing.mq4
 Catalog: <ROOT>/models.toml (Toml)
+GPU: unknown (no gpu_arch in install.json)
 
-  generation.temperature                      0.5 override  model user local-thing.mq4 (<ROOT>/models.toml)
-  generation.max_tokens                       1234 inherited global user (<ROOT>/config.toml)
-  memory.max_seq                              32768 inherited built-in
-  reasoning.effort                            auto inherited built-in
+Quality
+  reasoning.effort                            auto             default            next message
+
+Memory & context
+  memory.max_seq                              32768            default            next model load
+
+Advanced
+  generation.max_tokens                       1234             you                next message
+  generation.temperature                      0.5              this model         next message
 -- models.toml
 schema_version = 1
 
