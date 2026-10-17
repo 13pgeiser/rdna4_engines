@@ -29,6 +29,7 @@ use crate::{
 
 const KV_KEY: &str = "memory.kv_cache";
 const PLE_KEY: &str = "memory.ple_format";
+const STATE_QUANT_KEY: &str = "memory.state_quant";
 const MTP_K_KEY: &str = "speculation.mtp_k";
 const IU4_KEY: &str = "kernel.iu4_prefill";
 const A8_KEY: &str = "kernel.gfx11_a8_prefill";
@@ -199,6 +200,7 @@ pub fn effective(key: &str, resolved: &ResolvedConfig, ctx: &ArchCtx) -> Effecti
                 ple_auto(&mut out, ctx);
             }
         }
+        STATE_QUANT_KEY if builtin && is_auto(&out.value) => state_quant_auto(&mut out, ctx),
         MTP_K_KEY if builtin && is_auto(&out.value) => mtp_k_auto(&mut out, ctx),
         IU4_KEY => {
             if !matches!(ctx.arch(), "" | "gfx1100" | "gfx1151" | "gfx1201") {
@@ -298,6 +300,35 @@ fn ple_auto(out: &mut Effective, ctx: &ArchCtx) {
     } else {
         "auto: q8".into()
     });
+}
+
+/// `memory.state_quant = auto`. Flash-Next (`model_arch` 16) mirrors
+/// `hipfire_arch_qwen4::state::resolve_gdn_format_for_arch`: the exact F32
+/// GDN state on exact gfx1151, Q8 elsewhere (the AR-only stock-FP8 profile is
+/// F32-only, which this view cannot see). Other models keep `auto`; Qwen3.5
+/// resolves it to Q8 at load.
+fn state_quant_auto(out: &mut Effective, ctx: &ArchCtx) {
+    if ctx.model_arch_id != Some(QWEN4_ARCH_ID) {
+        return;
+    }
+    let arch = ctx.arch();
+    let (value, reason) = match arch {
+        "gfx1151" => (
+            "fp32",
+            "auto: fp32 on gfx1151 (exact GDN state), Flash-Next".to_string(),
+        ),
+        "" => (
+            "q8",
+            "auto: q8 (GPU unknown; fp32 on gfx1151), Flash-Next".to_string(),
+        ),
+        _ => (
+            "q8",
+            format!("auto: q8 on {arch} (fp32 only on gfx1151), Flash-Next"),
+        ),
+    };
+    out.value = ConfigValue::String(value.into());
+    out.by_arch_rule = arch == "gfx1151";
+    out.reason = Some(reason);
 }
 
 /// `speculation.mtp_k = auto` → `mtp_k_default_for_arch`.
@@ -744,6 +775,36 @@ mod tests {
             effective(MTP_K_KEY, &resolved, &c).value,
             ConfigValue::Integer(5)
         );
+    }
+
+    #[test]
+    fn state_quant_auto_is_fp32_for_flash_next_on_gfx1151_else_q8() {
+        let mut c = ctx("gfx1151");
+        c.model_arch_id = Some(16);
+        let e = eff(STATE_QUANT_KEY, &c);
+        assert_eq!(e.value, s("fp32"));
+        assert!(e.by_arch_rule);
+        assert_eq!(e.applies, Applies::NextModelLoad);
+        for arch in ["gfx1100", "gfx1201", ""] {
+            let mut c = ctx(arch);
+            c.model_arch_id = Some(16);
+            let e = eff(STATE_QUANT_KEY, &c);
+            assert_eq!(e.value, s("q8"), "{arch}");
+            assert!(!e.by_arch_rule, "{arch}");
+        }
+        // Other or unknown models keep `auto`.
+        for model in [Some(5), None] {
+            let mut c = ctx("gfx1151");
+            c.model_arch_id = model;
+            assert_eq!(eff(STATE_QUANT_KEY, &c).value, s("auto"), "{model:?}");
+        }
+        // An explicit value is kept.
+        let resolved = resolve([user_layer(&[(STATE_QUANT_KEY, s("q8"))])]).unwrap();
+        let mut c = ctx("gfx1151");
+        c.model_arch_id = Some(16);
+        let e = effective(STATE_QUANT_KEY, &resolved, &c);
+        assert_eq!(e.value, s("q8"));
+        assert!(!e.by_arch_rule);
     }
 
     #[test]
