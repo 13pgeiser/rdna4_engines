@@ -797,58 +797,50 @@ mod tests {
 
     #[test]
     fn quality_choices_match_spec_for_every_arch_and_a8_state() {
-        let fast = |writes| (FAST_LABEL, writes);
-        let acc = |label, writes| (label, writes);
-        let summary = |arch: &str, a8| {
+        type Row = (&'static str, Vec<(&'static str, Option<ConfigValue>)>, bool);
+        let row = |label, writes, default| -> Row { (label, writes, default) };
+        let summary = |arch: &str, a8| -> Vec<Row> {
             quality_choices_for(&ctx(arch), a8)
                 .into_iter()
                 .map(|c| (c.label, key_writes(&c), c.builtin_default))
-                .collect::<Vec<_>>()
-        };
-        let expect = |rows: Vec<(
-            (&'static str, Vec<(&'static str, Option<ConfigValue>)>),
-            bool,
-        )>| {
-            rows.into_iter()
-                .map(|((l, w), d)| (l, w, d))
-                .collect::<Vec<_>>()
+                .collect()
         };
         assert_eq!(
             summary("gfx1151", A8Prefill::NotLanded),
-            expect(vec![
-                (fast(vec![(IU4_KEY, None)]), true),
-                (acc(ACCURATE_LABEL, vec![(IU4_KEY, b(false))]), false),
-            ])
+            [
+                row(FAST_LABEL, vec![(IU4_KEY, None)], true),
+                row(ACCURATE_LABEL, vec![(IU4_KEY, b(false))], false),
+            ]
         );
         assert_eq!(
             summary("gfx1151", A8Prefill::OptIn),
-            expect(vec![
-                (fast(vec![(A8_KEY, None)]), true),
-                (acc(ACCURATE_LABEL, vec![(A8_KEY, b(true))]), false),
-            ])
+            [
+                row(FAST_LABEL, vec![(A8_KEY, None)], true),
+                row(ACCURATE_LABEL, vec![(A8_KEY, b(true))], false),
+            ]
         );
         assert_eq!(
             summary("gfx1151", A8Prefill::DefaultOn),
-            expect(vec![
-                (fast(vec![(A8_KEY, b(false))]), false),
-                (acc(ACCURATE_LABEL, vec![(A8_KEY, None)]), true),
-            ])
+            [
+                row(FAST_LABEL, vec![(A8_KEY, b(false))], false),
+                row(ACCURATE_LABEL, vec![(A8_KEY, None)], true),
+            ]
         );
         for a8 in [A8Prefill::NotLanded, A8Prefill::OptIn, A8Prefill::DefaultOn] {
             assert_eq!(
                 summary("gfx1201", a8),
-                expect(vec![
-                    (fast(vec![(IU4_KEY, None)]), true),
-                    (acc(ACCURATE_FP8_LABEL, vec![(IU4_KEY, b(false))]), false),
-                ])
+                [
+                    row(FAST_LABEL, vec![(IU4_KEY, None)], true),
+                    row(ACCURATE_FP8_LABEL, vec![(IU4_KEY, b(false))], false),
+                ]
             );
             // A8 is never offered on gfx1100.
             assert_eq!(
                 summary("gfx1100", a8),
-                expect(vec![
-                    (fast(vec![(IU4_KEY, None)]), true),
-                    (acc(ACCURATE_LABEL, vec![(IU4_KEY, b(false))]), false),
-                ])
+                [
+                    row(FAST_LABEL, vec![(IU4_KEY, None)], true),
+                    row(ACCURATE_LABEL, vec![(IU4_KEY, b(false))], false),
+                ]
             );
             for arch in ["gfx1030", "gfx1101", "gfx942"] {
                 assert!(summary(arch, a8).is_empty(), "{arch}");
