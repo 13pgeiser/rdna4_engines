@@ -26145,8 +26145,6 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("fused_qkv_q4k", kernels::FUSED_QKV_Q4K_SRC, "fused_qkv_q4k")?;
-        let func = &self.functions["fused_qkv_q4k"];
-
         let mut aq = wq.buf.as_ptr();
         let mut ak = wk.buf.as_ptr();
         let mut av = wv.buf.as_ptr();
@@ -26172,10 +26170,23 @@ impl Gpu {
             &mut kk as *mut _ as *mut c_void,
         ];
         let grid = (q_m + k_m + v_m) as u32;
-        unsafe {
-            self.hip
-                .launch_kernel(func, [grid, 1, 1], [32, 1, 1], 0, None, &mut params)
-        }
+        self.launch_maybe_blob(
+            "fused_qkv_q4k",
+            [grid, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in [aq, ak, av, xp, yqp, ykp, yvp] {
+                    b.push_ptr(p);
+                }
+                for v in [qm, km, vm, kk] {
+                    b.push_i32(v);
+                }
+                b
+            },
+        )
     }
 
     /// `fused_qkv_q4k` with an optional Q/K/V bias folded into the kernel's
@@ -26205,8 +26216,6 @@ impl Gpu {
             kernels::FUSED_QKV_Q4K_QWEN2_BIAS_SRC,
             "fused_qkv_q4k_qwen2_bias",
         )?;
-        let func = &self.functions["fused_qkv_q4k_qwen2_bias"];
-
         let mut aq = wq.buf.as_ptr();
         let mut ak = wk.buf.as_ptr();
         let mut av = wv.buf.as_ptr();
@@ -26240,10 +26249,26 @@ impl Gpu {
         ];
 
         let grid = (q_m + k_m + v_m) as u32;
-        unsafe {
-            self.hip
-                .launch_kernel(func, [grid, 1, 1], [32, 1, 1], 0, None, &mut params)
-        }
+        self.launch_maybe_blob(
+            "fused_qkv_q4k_qwen2_bias",
+            [grid, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in [aq, ak, av, xp, yqp, ykp, yvp] {
+                    b.push_ptr(p);
+                }
+                for v in [qm, km, vm, kk] {
+                    b.push_i32(v);
+                }
+                for p in [bq, bk, bv] {
+                    b.push_ptr(p);
+                }
+                b
+            },
+        )
     }
 
     /// Fused Gate+Up: two Q4_K GEMVs in one launch (saves 1 kernel launch per layer).
@@ -26265,8 +26290,6 @@ impl Gpu {
             kernels::FUSED_GATE_UP_Q4K_SRC,
             "fused_gate_up_q4k",
         )?;
-        let func = &self.functions["fused_gate_up_q4k"];
-
         let mut ag = w_gate.buf.as_ptr();
         let mut au = w_up.buf.as_ptr();
         let mut xp = x.buf.as_ptr();
@@ -26288,10 +26311,23 @@ impl Gpu {
         ];
 
         let grid = (gate_m + up_m) as u32;
-        unsafe {
-            self.hip
-                .launch_kernel(func, [grid, 1, 1], [32, 1, 1], 0, None, &mut params)
-        }
+        self.launch_maybe_blob(
+            "fused_gate_up_q4k",
+            [grid, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in [ag, au, xp, ygp, yup] {
+                    b.push_ptr(p);
+                }
+                for v in [gm, um, kk] {
+                    b.push_i32(v);
+                }
+                b
+            },
+        )
     }
 
     /// y = A_q8_0 * x (quantized GEMV for Q8_0)
