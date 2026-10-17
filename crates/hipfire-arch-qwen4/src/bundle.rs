@@ -486,6 +486,22 @@ impl SessionState for Qwen4Bundle {
         Ok(layout)
     }
 
+    /// An MTP snapshot is restorable only when its head metadata passes the
+    /// same checks `restore_parts` runs first (shape, mark, and the boundary
+    /// row for its own position), so the session cache plans around one an
+    /// older build captured without the row: its prefix is prefilled again.
+    /// Without attached head resources the restore itself reports that.
+    fn snapshot_restorable(&self, route: SessionRoute, meta: &[u8]) -> bool {
+        if route != SessionRoute::Mtp {
+            return true;
+        }
+        let Some(mtp) = self.mtp.as_ref() else {
+            return true;
+        };
+        meta.split_at_checked(self.state.session_meta_bytes())
+            .is_some_and(|(_, mtp_meta)| mtp.check_session_restore(mtp_meta).is_ok())
+    }
+
     fn finish_restore(
         &mut self,
         gpu: &mut Gpu,

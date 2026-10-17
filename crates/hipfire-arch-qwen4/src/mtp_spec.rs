@@ -6227,6 +6227,15 @@ pub(crate) fn mtp_prefill_chunk(
                 return Ok(ControlFlow::Break(()));
             }
             if piece.end < chunk.len() {
+                // The pair's interior snapshot row is a prompt boundary like
+                // any other: `pending` is the target hidden of its last row
+                // (`piece.end - 1`) after this piece's head append, and the
+                // snapshot must carry it or every restore refuses it.
+                if bundle.session_next_boundary() == Some(pos + piece.end) {
+                    bundle
+                        .session_save_boundary_hidden(ops.gpu()?, pending)
+                        .map_err(|e| e.to_string())?;
+                }
                 bundle
                     .publish_pair_session_boundary(ops.gpu()?, pos + piece.end)
                     .map_err(|e| e.to_string())?;
@@ -7461,7 +7470,23 @@ impl Qwen4MtpDrafter {
             // session record is begun or published on the MTP route.
             Self::bundle(target)?.ops_reset(ops)?;
         } else {
-            Self::bundle(target)?
+            let bundle = Self::bundle(target)?;
+            // A bounded side request may park the committed live conversation
+            // inside `session_begin`, a capture at the live position that no
+            // prefill boundary produced. A restore of that park refuses a
+            // snapshot without the boundary row, so keep the live one: with
+            // target and head aligned, `pending` is the target hidden of row
+            // `position - 1`. The row is position-stamped; a capture at any
+            // other position never reads it.
+            if let Some(pending) = self.pending_hidden.as_ref() {
+                let position = bundle.state.position;
+                if position > 0 && bundle.mtp_position().is_ok_and(|head| head == position) {
+                    bundle
+                        .session_save_boundary_hidden(ops.gpu()?, pending)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            bundle
                 .session_begin(ops.gpu()?, prompt_tokens, reused, SessionRoute::Mtp)
                 .map_err(|error| error.to_string())?;
         }

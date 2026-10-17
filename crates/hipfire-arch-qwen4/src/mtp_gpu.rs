@@ -1060,6 +1060,22 @@ fn validate_mtp_mark(mark: &MtpStateMark, state: &MtpGpuState) -> Result<(), Mtp
     Ok(())
 }
 
+/// Word 0 of an MTP session capture at `position`: the position plus one when
+/// the boundary row was saved for exactly that position, else 0 (the row is
+/// stale and a restore refuses the snapshot).
+fn boundary_word(saved: Option<usize>, position: usize) -> u64 {
+    match saved {
+        Some(saved) if saved == position => position as u64 + 1,
+        _ => 0,
+    }
+}
+
+/// Whether word 0 of a snapshot at `position` names a boundary row saved for
+/// that position.
+fn boundary_word_names(word: u64, position: usize) -> bool {
+    word == position as u64 + 1
+}
+
 /// Map more of one VMM context arena so it covers `rows` rows of a
 /// `capacity`-row tensor (byte stride = reserved size / capacity), by the
 /// shared [`KvChunkPlan`] policy, and zero the newly mapped bytes.
@@ -1754,10 +1770,7 @@ impl MtpGpuState {
             mark.step_index,
         ]
         .map(|value| value as u64);
-        let boundary = match self.boundary_saved {
-            Some(position) if position == mark.position => position as u64 + 1,
-            _ => 0,
-        };
+        let boundary = boundary_word(self.boundary_saved, mark.position);
         Ok((
             [boundary].into_iter().chain(words).collect(),
             self.session_layout(&mark),
@@ -1780,7 +1793,7 @@ impl MtpGpuState {
         // Word 0 is the boundary row's position plus one: a snapshot whose
         // row was not saved for its own position cannot be restored (the
         // row would be stale), so the cache entry is refused.
-        if words[0] != mark.position as u64 + 1 {
+        if !boundary_word_names(words[0], mark.position) {
             return Err(invalid(format!(
                 "MTP session snapshot at {} holds no boundary hidden for its position",
                 mark.position
@@ -3449,6 +3462,31 @@ mod tests {
     use super::*;
     use crate::config::compact_test_config;
     use crate::state::Qwen4State;
+
+    /// A capture carries a restorable boundary row only when the row was saved
+    /// for exactly the captured position, at any position (a prefill chunk
+    /// boundary such as 8192, or a live-position park such as 17051).
+    #[test]
+    fn boundary_word_is_restorable_only_for_the_position_it_was_saved_at() {
+        for position in [1usize, 4096, 8192, 17051, 32767] {
+            let word = boundary_word(Some(position), position);
+            assert_eq!(word, position as u64 + 1);
+            assert!(boundary_word_names(word, position));
+            // Never saved: the capture is refused at restore.
+            let unsaved = boundary_word(None, position);
+            assert_eq!(unsaved, 0);
+            assert!(!boundary_word_names(unsaved, position));
+            // Saved for another position: stale, refused.
+            for other in [0usize, position - 1, position + 1, 2 * position] {
+                let stale = boundary_word(Some(other), position);
+                assert_eq!(stale, 0, "saved {other}, captured {position}");
+                assert!(!boundary_word_names(stale, position));
+            }
+            // A word carrying another position never names this one.
+            assert!(!boundary_word_names(position as u64, position));
+            assert!(!boundary_word_names(position as u64 + 2, position));
+        }
+    }
 
     #[test]
     fn append_det_is_exact_gfx1151_only_and_zero_kills_it() {

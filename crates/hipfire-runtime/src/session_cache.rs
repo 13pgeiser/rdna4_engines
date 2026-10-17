@@ -147,6 +147,15 @@ pub trait SessionState {
         route: SessionRoute,
         meta: &[u8],
     ) -> Result<StateLayout<'_>, String>;
+    /// Whether the snapshot described by `meta` can still be restored on
+    /// `route` (a stored snapshot the state would refuse, such as one an
+    /// older build captured without a field a restore needs). [`Self::plan`]
+    /// never plans such a snapshot, so its prefix is prefilled again (or
+    /// resumed from an older restorable boundary) instead of failing the
+    /// request at restore.
+    fn snapshot_restorable(&self, _route: SessionRoute, _meta: &[u8]) -> bool {
+        true
+    }
     /// Apply host metadata after the device bytes were copied.
     fn finish_restore(
         &mut self,
@@ -648,8 +657,28 @@ impl SessionCache {
                 .is_some_and(|disk| disk.pool.contains(domain, p, fp))
     }
 
+    /// Published on the device or on disk and still restorable by `state` on
+    /// `route` ([`SessionState::snapshot_restorable`]).
+    fn usable(
+        &self,
+        state: &dyn SessionState,
+        route: SessionRoute,
+        domain: &CacheDomain,
+        p: u64,
+        fp: u64,
+    ) -> bool {
+        let snapshot = self.pool.peek(domain, p, fp).or_else(|| {
+            self.disk
+                .as_ref()
+                .and_then(|disk| disk.pool.peek(domain, p, fp))
+        });
+        snapshot.is_some_and(|snapshot| state.snapshot_restorable(route, &snapshot.meta))
+    }
+
     /// Longest cached prefix of `prompt` (always shorter than the prompt, so
-    /// prefill computes at least the last token); 0 on a miss.
+    /// prefill computes at least the last token); 0 on a miss. A stored
+    /// snapshot the state refuses to restore is skipped like a miss, so the
+    /// plan falls back to the deepest restorable boundary below it (or 0).
     pub fn plan(&self, state: &dyn SessionState, prompt: &[u32], route: SessionRoute) -> usize {
         let Some(scope) = state.snapshot_scope(route) else {
             return 0;
@@ -661,12 +690,15 @@ impl SessionCache {
         let resident = [self.resident.as_ref(), self.tail.as_ref()]
             .into_iter()
             .flatten()
-            .map(|resident| &resident.key)
-            .filter(|(d, p, fp)| {
+            .filter(|resident| {
+                let (d, p, fp) = &resident.key;
                 let p = *p as usize;
-                *d == domain && p < prompt.len() && *fp == prefix_fingerprint(&prompt[..p])
+                *d == domain
+                    && p < prompt.len()
+                    && *fp == prefix_fingerprint(&prompt[..p])
+                    && state.snapshot_restorable(route, &resident.meta)
             })
-            .map(|key| key.1 as usize)
+            .map(|resident| resident.key.1 as usize)
             .max()
             .unwrap_or(0);
         // Only a strictly deeper pool snapshot beats the resident one (no row
@@ -678,7 +710,8 @@ impl SessionCache {
             .rev()
             .find(|&p| {
                 let fp = prefix_fingerprint(&prompt[..p]);
-                self.present(&domain, p as u64, fp) || self.present(&exact, p as u64, fp)
+                self.usable(state, route, &domain, p as u64, fp)
+                    || self.usable(state, route, &exact, p as u64, fp)
             })
             .unwrap_or(resident);
         if planned > 0
@@ -926,7 +959,12 @@ impl SessionCache {
         );
         let mut cold_exact = true;
         let mut tail_hit = false;
-        let restored = if reused > 0 && self.tail.as_ref().is_some_and(|r| r.key == key) {
+        let restored = if reused > 0
+            && self
+                .tail
+                .as_ref()
+                .is_some_and(|r| r.key == key && state.snapshot_restorable(route, &r.meta))
+        {
             cold_exact = false;
             tail_hit = true;
             // Message-end snapshots may sit above the tail when enabled.
@@ -939,7 +977,12 @@ impl SessionCache {
                 free_device(gpu, self.resident.take().unwrap().buf);
             }
             restore_resident(gpu, state, route, self.tail.as_ref().unwrap())
-        } else if reused > 0 && self.resident.as_ref().is_some_and(|r| r.key == key) {
+        } else if reused > 0
+            && self
+                .resident
+                .as_ref()
+                .is_some_and(|r| r.key == key && state.snapshot_restorable(route, &r.meta))
+        {
             if !stash {
                 if let Some(tail) = self.tail.take() {
                     free_device(gpu, tail.buf);
@@ -956,7 +999,7 @@ impl SessionCache {
                 self.reset_state(gpu, state)
             } else {
                 // The cold-exact snapshot wins a tie with a session-exact one.
-                let (from, exact) = self.restore_domain(&domain, key.1, key.2);
+                let (from, exact) = self.restore_domain(state, route, &domain, key.1, key.2);
                 cold_exact = exact;
                 self.restore(gpu, state, route, &from, &prompt[..reused], prompt.len())
             }
@@ -1814,9 +1857,17 @@ impl SessionCache {
 
     /// Domain a restore of the `p`-token snapshot with prefix fingerprint
     /// `fp` reads, and whether it is cold-exact: the cold-exact domain when
-    /// it holds the snapshot, else the session-exact one.
-    fn restore_domain(&self, domain: &CacheDomain, p: u64, fp: u64) -> (CacheDomain, bool) {
-        if self.present(domain, p, fp) {
+    /// it holds a restorable snapshot ([`SessionState::snapshot_restorable`]),
+    /// else the session-exact one.
+    fn restore_domain(
+        &self,
+        state: &dyn SessionState,
+        route: SessionRoute,
+        domain: &CacheDomain,
+        p: u64,
+        fp: u64,
+    ) -> (CacheDomain, bool) {
+        if self.usable(state, route, domain, p, fp) {
             (domain.clone(), true)
         } else {
             (session_exact_domain(domain), false)
@@ -1829,11 +1880,14 @@ impl SessionCache {
         self.parked.as_ref().map(|parked| parked.through)
     }
 
-    /// Whether a park exists for `route` under the state's current scope.
+    /// Whether a park exists for `route` under the state's current scope and
+    /// the state can still restore it ([`SessionState::snapshot_restorable`]):
+    /// a refused park is dropped by the next request instead of failing it.
     fn parked_valid(&self, state: &dyn SessionState, route: SessionRoute) -> bool {
         self.parked.as_ref().is_some_and(|parked| {
             parked.route == route
                 && state.snapshot_scope(route).as_deref() == Some(parked.scope.as_str())
+                && state.snapshot_restorable(route, &parked.meta)
         })
     }
 
@@ -4009,6 +4063,8 @@ mod tests {
     /// stream's last row is partial and `ceil` differs from `floor`.
     const SIDE_THROUGH: usize = 501;
     const SHARED_LCP: usize = 17;
+    /// Metadata of a stored snapshot [`HostState`] refuses to restore.
+    const REFUSED_META: &[u8] = &[0xFF];
 
     fn host_hashes(hist: &[u32]) -> Vec<u64> {
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -4124,6 +4180,9 @@ mod tests {
         }
         fn snapshot_boundaries(&self, prompt: &[u32], after: usize, up_to: usize) -> Vec<usize> {
             stride_boundaries(STRIDE, prompt, None, after, up_to)
+        }
+        fn snapshot_restorable(&self, _route: SessionRoute, meta: &[u8]) -> bool {
+            meta != REFUSED_META
         }
         fn snapshot_parts(
             &mut self,
@@ -4638,6 +4697,82 @@ mod tests {
         assert_eq!(mtp.plan(&state, &next, AR), 0);
     }
 
+    /// [`publish`] with the snapshot's metadata set to `meta`.
+    fn publish_with_meta(
+        cache: &mut SessionCache,
+        scope: &str,
+        cold_exact: bool,
+        hist: &[u32],
+        p: usize,
+        meta: &[u8],
+    ) {
+        let domain = capture_domain(&cache.domain.scoped(scope), cold_exact);
+        let mut snapshot = fake_snapshot(p);
+        snapshot.meta = meta.to_vec();
+        cache
+            .pending
+            .push(((domain, p as u64, prefix_fingerprint(&hist[..p])), snapshot));
+        cache.commit();
+    }
+
+    #[test]
+    fn a_snapshot_the_state_refuses_is_planned_around_never_into() {
+        let state = HostState::new("host");
+        let mut cache = SessionCache::new(domain(), 1 << 20);
+        let scope = state.snapshot_scope(AR).unwrap();
+        let cold = cache.domain.scoped(&scope);
+        let exact = session_exact_domain(&cold);
+        let c = prompt(5, 4 * STRIDE + 40);
+        let fp = |p: usize| prefix_fingerprint(&c[..p]);
+
+        publish_with_meta(&mut cache, &scope, true, &c, 2 * STRIDE, &[]);
+        publish_with_meta(&mut cache, &scope, true, &c, 3 * STRIDE, REFUSED_META);
+        publish_with_meta(&mut cache, &scope, true, &c, 4 * STRIDE, REFUSED_META);
+        // The refused deeper snapshots are skipped: the plan resumes from the
+        // deepest restorable boundary instead of failing the restore.
+        assert_eq!(cache.plan(&state, &c, AR), 2 * STRIDE);
+        // Every snapshot refused: a plain miss, the whole prompt prefills.
+        let mut all_refused = SessionCache::new(domain(), 1 << 20);
+        publish_with_meta(&mut all_refused, &scope, true, &c, 2 * STRIDE, REFUSED_META);
+        publish_with_meta(&mut all_refused, &scope, true, &c, 3 * STRIDE, REFUSED_META);
+        assert_eq!(all_refused.plan(&state, &c, AR), 0);
+
+        // A restorable session-exact snapshot of the refused prefix serves it,
+        // and the restore reads that domain, not the refused cold-exact one.
+        publish_with_meta(&mut cache, &scope, false, &c, 3 * STRIDE, &[]);
+        assert!(cache.present(&cold, 3 * STRIDE as u64, fp(3 * STRIDE)));
+        assert!(cache.present(&exact, 3 * STRIDE as u64, fp(3 * STRIDE)));
+        assert_eq!(cache.plan(&state, &c, AR), 3 * STRIDE);
+        assert_eq!(
+            cache.restore_domain(&state, AR, &cold, 3 * STRIDE as u64, fp(3 * STRIDE)),
+            (exact.clone(), false)
+        );
+        // The restorable cold-exact snapshot still wins its tie.
+        assert_eq!(
+            cache.restore_domain(&state, AR, &cold, 2 * STRIDE as u64, fp(2 * STRIDE)),
+            (cold.clone(), true)
+        );
+    }
+
+    #[test]
+    fn a_refused_park_is_not_valid_and_never_serves_the_plan() {
+        let main = prompt(1, 3072);
+        let mut next = main.clone();
+        next.extend([1, 2, 3]);
+        let mut state = HostState::new("host");
+        state.write(&main, DECODED);
+        let mut driver = parked_driver(&state, &main, MTP);
+        assert_eq!(driver.plan(&state, &next, MTP), 3072);
+        assert!(driver.plan_is_live(&state, &next, MTP, 3072));
+        // The same park captured without its restore metadata (a live-position
+        // capture no prefill boundary produced): refused, so the request
+        // prefills again instead of restoring it.
+        driver.cache.parked.as_mut().unwrap().meta = REFUSED_META.to_vec();
+        assert!(!driver.cache.parked_valid(&state, MTP));
+        assert_eq!(driver.plan(&state, &next, MTP), 0);
+        assert!(!driver.plan_is_live(&state, &next, MTP, 3072));
+    }
+
     #[test]
     fn parked_history_expires_unless_a_bounded_side_extension_keeps_it() {
         // Only an extension of the live side lineage that stays within the
@@ -4727,7 +4862,7 @@ mod tests {
         assert_eq!(cache.plan(&state, &next, MTP), 0);
         let fp = prefix_fingerprint(&next[..3 * STRIDE]);
         assert_eq!(
-            cache.restore_domain(&cold, 3 * STRIDE as u64, fp),
+            cache.restore_domain(&state, AR, &cold, 3 * STRIDE as u64, fp),
             (exact.clone(), false)
         );
 
@@ -4735,7 +4870,7 @@ mod tests {
         publish(&mut cache, &scope, true, &next, 3 * STRIDE);
         assert_eq!(cache.pool.len(), 3);
         assert_eq!(
-            cache.restore_domain(&cold, 3 * STRIDE as u64, fp),
+            cache.restore_domain(&state, AR, &cold, 3 * STRIDE as u64, fp),
             (cold.clone(), true)
         );
         assert_eq!(cache.plan(&state, &next, AR), 3 * STRIDE);
@@ -4747,6 +4882,8 @@ mod tests {
         assert!(!fresh.present(&exact, STRIDE as u64, prefix_fingerprint(&c[..STRIDE])));
         assert_eq!(
             fresh.restore_domain(
+                &state,
+                AR,
                 &cold,
                 2 * STRIDE as u64,
                 prefix_fingerprint(&c[..2 * STRIDE])
