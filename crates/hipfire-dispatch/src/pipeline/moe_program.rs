@@ -89,6 +89,31 @@ fn router_shared_fuse_allowed(
         && env_enabled
 }
 
+/// Opt-in gfx1100 decode down+last-combine admission. The fused kernel is a
+/// K=512 (two-group) body, so any other expert-down K (`mi`) stays on the
+/// expanded down + separate combine path. `env_enabled` is evaluated last and
+/// only when every structural condition holds.
+#[allow(clippy::too_many_arguments)]
+fn down_last_combine_allowed(
+    ep_none: bool,
+    is_gfx1100: bool,
+    batch_size: usize,
+    topk: usize,
+    has_expert_dtype_tags: bool,
+    routed_down: rdna_compute::DType,
+    down_k: usize,
+    env_enabled: impl FnOnce() -> bool,
+) -> bool {
+    ep_none
+        && is_gfx1100
+        && batch_size == 1
+        && topk == 8
+        && !has_expert_dtype_tags
+        && routed_down == rdna_compute::DType::MQ4G256
+        && down_k == 512
+        && env_enabled()
+}
+
 /// Static decode choices resolved while sealing, before the call is published.
 /// This record contains no borrowed call data and no executable instruction
 /// sequence.
@@ -2126,15 +2151,20 @@ pub(super) fn select_decode(
     );
 
     static DOWN_LAST_COMBINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let down_last_combine = params.ep_mode == crate::families::moe::MoeEpMode::None
-        && ctx.arch.is_gfx1100()
-        && params.batch_size == 1
-        && params.k == 8
-        && params.expert_dtype_tags.is_none()
-        && params.dtypes.routed_down == rdna_compute::DType::MQ4G256
-        && *DOWN_LAST_COMBINE.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_MOE_DOWN_LAST_COMBINE").as_deref() == Ok("1")
-        });
+    let down_last_combine = down_last_combine_allowed(
+        params.ep_mode == crate::families::moe::MoeEpMode::None,
+        ctx.arch.is_gfx1100(),
+        params.batch_size,
+        params.k,
+        params.expert_dtype_tags.is_some(),
+        params.dtypes.routed_down,
+        params.mi,
+        || {
+            *DOWN_LAST_COMBINE.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_MOE_DOWN_LAST_COMBINE").as_deref() == Ok("1")
+            })
+        },
+    );
 
     static MOE_NINEPATH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         hipfire_config::developer_var("HIPFIRE_MOE_NINEPATH").unwrap_or_default()
@@ -2464,5 +2494,73 @@ mod tests {
             false,
             true,
         ));
+    }
+
+    fn last_combine(
+        ep_none: bool,
+        is_gfx1100: bool,
+        batch_size: usize,
+        topk: usize,
+        has_tags: bool,
+        down: rdna_compute::DType,
+        down_k: usize,
+    ) -> bool {
+        down_last_combine_allowed(
+            ep_none,
+            is_gfx1100,
+            batch_size,
+            topk,
+            has_tags,
+            down,
+            down_k,
+            || true,
+        )
+    }
+
+    #[test]
+    fn down_last_combine_admits_only_k512() {
+        let mq4 = rdna_compute::DType::MQ4G256;
+        assert!(last_combine(true, true, 1, 8, false, mq4, 512));
+        for k in [1792, 1536, 256, 0, 1024] {
+            assert!(!last_combine(true, true, 1, 8, false, mq4, k), "K={k}");
+        }
+    }
+
+    #[test]
+    fn down_last_combine_keeps_other_predicate_restrictions() {
+        let mq4 = rdna_compute::DType::MQ4G256;
+        assert!(!last_combine(false, true, 1, 8, false, mq4, 512));
+        assert!(!last_combine(true, false, 1, 8, false, mq4, 512));
+        assert!(!last_combine(true, true, 2, 8, false, mq4, 512));
+        assert!(!last_combine(true, true, 1, 4, false, mq4, 512));
+        assert!(!last_combine(true, true, 1, 8, true, mq4, 512));
+        assert!(!last_combine(
+            true,
+            true,
+            1,
+            8,
+            false,
+            rdna_compute::DType::F32,
+            512
+        ));
+    }
+
+    #[test]
+    fn down_last_combine_env_is_last_and_short_circuited() {
+        let mq4 = rdna_compute::DType::MQ4G256;
+        let calls = std::cell::Cell::new(0);
+        let probe = |ep_none: bool, down_k: usize, env: bool| {
+            down_last_combine_allowed(ep_none, true, 1, 8, false, mq4, down_k, || {
+                calls.set(calls.get() + 1);
+                env
+            })
+        };
+        assert!(!probe(true, 1792, true));
+        assert!(!probe(false, 512, true));
+        assert_eq!(calls.get(), 0);
+        assert!(!probe(true, 512, false));
+        assert_eq!(calls.get(), 1);
+        assert!(probe(true, 512, true));
+        assert_eq!(calls.get(), 2);
     }
 }
