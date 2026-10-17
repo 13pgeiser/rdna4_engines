@@ -406,11 +406,14 @@ Ownership is sealed once per load (`Qwen4EpSeal`, `crates/hipfire-arch-qwen4/src
 one EP mesh epoch, every rank's physical device, and one sealed expert plan
 per routed-expert group (48 trunk layers plus the MTP head), planned by the
 shared `sealed_moe::plan_packed_expert_parallel` from the source's tensor
-index. Every rank derives its compact spans from those plans (checked against
-the `e % N` stride the exchange kernels use) and loads its weights under the
-seal's identity for it (mesh epoch, logical rank, physical device). The mesh
-refuses a peer that was loaded from another source generation or is bound to
-another seal, rank or device. The load log names the epoch:
+index. Each rank's compact spans follow the `e % N` stride the exchange kernels
+use; the seal checks that its plans give exactly that stride. Each rank loads
+its weights under the seal's identity for it (mesh epoch, logical rank,
+physical device). The seal also binds the source generation: the base file,
+the PLE rows sidecar and the trunk-overlay sidecar, which every rank resolves
+for itself. A rank whose files differ from the ones rank 0 sealed is refused
+before it allocates, and the mesh refuses a peer bound to another seal, rank or
+device. The load log names the epoch:
 `qwen4 EP plan: N ranks on devices [...] (mesh epoch E, 49 sealed expert groups), …`.
 
 ### Flash-Next EP: per-rank expert fit

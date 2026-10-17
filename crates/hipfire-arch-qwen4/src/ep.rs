@@ -1270,8 +1270,10 @@ impl Qwen4Bundle {
                 let fingerprint = fingerprint.clone();
                 let seal = seal.clone();
                 Box::new(move |rank: usize| {
-                    let (gpu, mut bundle) = loader(rank)?;
+                    // Before the load: no early return may drop a loaded peer
+                    // without its teardown.
                     let placement = seal.placement(rank).map_err(|error| error.to_string())?;
+                    let (gpu, mut bundle) = loader(rank)?;
                     align_peer_session(&mut bundle, placement, &fingerprint);
                     let peer = Qwen4EpPeer {
                         rank,

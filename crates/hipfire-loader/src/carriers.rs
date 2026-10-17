@@ -1274,12 +1274,19 @@ fn plan_qwen4_ep(
     let identity = hfq
         .source_identity()
         .map_err(|error| format!("qwen4: EP source identity: {error}"))?;
+    // Admission attached rank 0's PLE rows: the generation binds them and the
+    // trunk-overlay sidecar with the base file.
+    let generation = hipfire_arch_qwen4::ep_seal::qwen4_source_generation(
+        hfq,
+        std::path::Path::new(&shared.path),
+    )?;
     let seal = hipfire_arch_qwen4::ep_seal::Qwen4EpSeal::seal(
         &receipt.manifest,
         receipt.config.num_hidden_layers,
         ep,
         &devices,
         &identity,
+        &generation,
     )
     .map_err(|error| format!("qwen4: {error}"))?;
     Ok(Some(Qwen4EpPlan {
@@ -1786,20 +1793,12 @@ fn load_qwen4_rank_scoped(
     let placement_policy = hipfire_arch_qwen4::expert_hotset::PlacementPolicy::from_env()?;
     let hotset_budget = hipfire_arch_qwen4::expert_hotset::HotsetBudget::from_env()?;
     let ep = match &ep_seal {
-        Some(bound) => {
-            if let ModelSource::Hfq(hfq) = &src {
-                let identity = hfq
-                    .source_identity()
-                    .map_err(|error| format!("qwen4: EP source identity: {error}"))?;
-                bound.seal.check_source(&identity)?;
-            }
-            Some(
-                bound
-                    .seal
-                    .placement(bound.rank)
-                    .map_err(|error| format!("qwen4: {error}"))?,
-            )
-        }
+        Some(bound) => Some(
+            bound
+                .seal
+                .placement(bound.rank)
+                .map_err(|error| format!("qwen4: {error}"))?,
+        ),
         None => None,
     };
     let ep_ranks = ep.map_or(1, |placement| placement.ranks);
@@ -1883,6 +1882,17 @@ fn load_qwen4_rank_scoped(
     )?;
     if band.is_some() && trunk_overlay.is_some() {
         return Err("qwen4: a trunk overlay sidecar cannot be used with pipeline parallelism (topology.pp > 1); set topology.pp = 1 or remove the overlay".into());
+    }
+    // An EP rank must load the sealed source generation: base file, the PLE
+    // rows just resolved and the trunk-overlay sidecar just bound. Checked
+    // after both are bound, before any allocation, so a sidecar created or
+    // replaced in between is refused (fail closed).
+    if let Some(bound) = &ep_seal {
+        let generation = hipfire_arch_qwen4::ep_seal::qwen4_source_generation(
+            &hfq,
+            std::path::Path::new(ctx.path),
+        )?;
+        bound.seal.check_source(&generation)?;
     }
     // The profile is known: the head-free MTP and developer-PLE refusals
     // happen here, before any allocation (source admission applies the

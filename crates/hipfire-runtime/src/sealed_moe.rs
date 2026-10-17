@@ -1786,12 +1786,14 @@ pub struct PackedExpertGroup {
     pub down: String,
 }
 
-/// The source generation a sealed plan binds: every file's identity (path,
-/// device, inode, length, mtime), so a rank that opens a replaced or modified
-/// artifact is told apart from the generation the plan was sealed from.
-pub fn source_generation_fingerprint(source: &crate::model_source::SourceIdentity) -> String {
-    source
-        .files
+/// The source generation a sealed plan binds: the identity (path, device,
+/// inode, length, mtime) of every file the load reads, so a rank that opens a
+/// replaced or modified artifact, or a different sidecar, is told apart from
+/// the generation the plan was sealed from. A family passes its source's
+/// files plus every sidecar it attaches (a sidecar that appears or vanishes
+/// changes the list).
+pub fn source_generation_fingerprint(files: &[crate::model_source::SourceFileIdentity]) -> String {
+    files
         .iter()
         .map(|file| {
             format!(
@@ -1814,13 +1816,14 @@ pub fn source_generation_fingerprint(source: &crate::model_source::SourceIdentit
 /// `e % ranks == r`, compact in ascending `e`) and the router replicates, so
 /// ownership, compact local slots, rank devices and the collective rows come
 /// from the ordinary manifest and expert planners. Every source carries
-/// [`source_generation_fingerprint`]; `execution` names the family's EP
-/// protocol. One plan per group, in `groups` order.
+/// `generation` ([`source_generation_fingerprint`]); `execution` names the
+/// family's EP protocol. One plan per group, in `groups` order.
 pub fn plan_packed_expert_parallel(
     groups: &[PackedExpertGroup],
     family: &str,
     execution: &str,
     source: &crate::model_source::SourceIdentity,
+    generation: &str,
     mesh: &DeviceMesh,
     physical_devices: &[i32],
 ) -> Result<Vec<ExpertExecutionPlan>, String> {
@@ -1834,7 +1837,6 @@ pub fn plan_packed_expert_parallel(
             mesh.axes()
         ));
     }
-    let fingerprint = source_generation_fingerprint(source);
     let metadata = |name: &str| -> Result<(ExpertSourceMetadata, Vec<usize>), String> {
         let range = source
             .manifest
@@ -1854,7 +1856,7 @@ pub fn plan_packed_expert_parallel(
         let basis = format!("{:?}", hipfire_dispatch::types::dtype_rotation_plan(dtype));
         let metadata = ExpertSourceMetadata::new(
             name,
-            fingerprint.as_str(),
+            generation,
             shape.clone(),
             dtype,
             bytes,
@@ -2569,8 +2571,8 @@ mod tests {
         };
         let mesh = DeviceMesh::rect(&[(DimKind::Ep, 4)]).unwrap();
         let devices = [3, 1, 2, 0];
-        let plans =
-            plan_packed_expert_parallel(&groups, "t", "x", &source, &mesh, &devices).unwrap();
+        let plans = plan_packed_expert_parallel(&groups, "t", "x", &source, "gen", &mesh, &devices)
+            .unwrap();
         assert_eq!(plans.len(), 2);
         for (plan, group) in plans.iter().zip(&groups) {
             assert_eq!(plan.layer(), Some(group.layer));
@@ -2591,15 +2593,19 @@ mod tests {
             assert_eq!(owned, vec![vec![0, 4], vec![1, 5], vec![2], vec![3]]);
         }
         let single = DeviceMesh::single().unwrap();
-        assert!(plan_packed_expert_parallel(&groups, "t", "x", &source, &single, &[0]).is_err());
+        assert!(
+            plan_packed_expert_parallel(&groups, "t", "x", &source, "gen", &single, &[0]).is_err()
+        );
         let mut missing = groups.clone();
         missing[1].down = "absent".into();
         let error =
-            plan_packed_expert_parallel(&missing, "t", "x", &source, &mesh, &devices).unwrap_err();
+            plan_packed_expert_parallel(&missing, "t", "x", &source, "gen", &mesh, &devices)
+                .unwrap_err();
         assert!(error.contains("'absent' is absent"), "{error}");
         // Two ranks on one device need logical emulation.
-        let error = plan_packed_expert_parallel(&groups, "t", "x", &source, &mesh, &[0, 1, 1, 2])
-            .unwrap_err();
+        let error =
+            plan_packed_expert_parallel(&groups, "t", "x", &source, "gen", &mesh, &[0, 1, 1, 2])
+                .unwrap_err();
         assert!(error.contains("duplicate"), "{error}");
     }
 

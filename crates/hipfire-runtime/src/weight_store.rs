@@ -1579,7 +1579,7 @@ fn upload_expert_compact(
             compact_of(bytes)?,
         ),
         // Unified memory reads its weights through source ranges: only the
-        // owned experts' spans are read, each released once uploaded.
+        // owned experts' spans are read, each released from the page cache once read.
         SourcePayload::Range(descriptor) => {
             let len = usize::try_from(descriptor.length)
                 .map_err(|_| "source range length does not fit usize".to_string())?;
