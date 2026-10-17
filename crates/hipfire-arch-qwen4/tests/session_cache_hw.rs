@@ -43,10 +43,27 @@
 //! (Halo: `--card halo --mem-gb 120 --hostmem-lock`.) [`load`] refuses to run
 //! outside such a hold, naming the processes that hold the host lock, and
 //! without `--test-threads=1`.
+//!
+//! # GDN state mode
+//!
+//! `HIPFIRE_GDN_TEST_STATE_QUANT=q8|fp32` picks the GDN recurrent-state format
+//! the loaded bundle runs under (unset = `q8`, the historical fixture; `q8_ef`
+//! is reserved and refuses with "not available in this build" until Track B
+//! lands; anything else is refused). [`load`] passes it as `state_request` to
+//! `resolve_state_format` and fails unless the resolved `GdnStateFormat` is the
+//! requested one; the product's `HIPFIRE_STATE_QUANT` is never read. After the
+//! load, every GDN layer's recurrent tensor must have that format's dtype and
+//! `GdnStateFormat::state_bytes`, and the bundle's session-cache scope must
+//! carry the resolved state format and not the other format's (so Q8 and F32
+//! snapshots never alias a domain); `load` prints the request, resolved
+//! format, per-layer recurrent bytes and scope as its evidence line. Every
+//! state digest also checks that its recurrent parts are those tensors, so the
+//! compared bytes are the resolved format's. Example (inside a hold):
+//! `HIPFIRE_GDN_TEST_STATE_QUANT=fp32 HIPFIRE_SESSION_CACHE_MODEL=$M <test-bin> --ignored --test-threads=1 --exact restored_prefill_matches_cold_on_flash_next`.
 
 use hipfire_arch_qwen4::bundle::{session_snapshot_bytes, Qwen4Bundle};
 use hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter;
-use hipfire_arch_qwen4::{admit_hfqm_artifact, Qwen4KvBackend, Qwen4StateFormat};
+use hipfire_arch_qwen4::{admit_hfqm_artifact, GdnStateFormat, Qwen4KvBackend, Qwen4StateFormat};
 use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
@@ -59,6 +76,9 @@ use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin
 use rdna_compute::{DType, Gpu, GpuTensor};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+
+#[path = "common/hw_identity.rs"]
+mod hw_identity;
 
 const MODEL_ENV: &str = "HIPFIRE_SESSION_CACHE_MODEL";
 const MAX_SEQ: usize = 32768;
@@ -76,6 +96,55 @@ fn prompt(seed: u64, len: usize) -> Vec<u32> {
         .collect()
 }
 
+/// The loaded bundle's GDN recurrent state is the format the test mode
+/// requested: every layer's recurrent tensor has that format's dtype and
+/// `GdnStateFormat::state_bytes`, and the session-cache scope names the
+/// resolved state format (so it differs from the other format's scope).
+/// Prints the evidence line.
+fn assert_resolved_gdn_state(bundle: &Qwen4Bundle, request: &str, state_format: Qwen4StateFormat) {
+    let config = &bundle.config;
+    let want = state_format.gdn.state_bytes(
+        config.linear_num_value_heads,
+        config.linear_key_head_dim,
+        config.linear_value_head_dim,
+    );
+    assert!(!bundle.state.gdn.is_empty(), "no GDN layers loaded");
+    for (layer, state) in bundle.state.gdn.iter().enumerate() {
+        assert_eq!(
+            state.recurrent.dtype,
+            state_format.gdn.dtype(),
+            "GDN layer {layer} recurrent dtype"
+        );
+        assert_eq!(
+            state.recurrent.byte_size(),
+            want,
+            "GDN layer {layer} recurrent bytes"
+        );
+    }
+    let scope = SessionState::snapshot_scope(bundle, SessionRoute::Ar).expect("session scope");
+    let other = Qwen4StateFormat {
+        gdn: match state_format.gdn {
+            GdnStateFormat::F32 => GdnStateFormat::Q8,
+            GdnStateFormat::Q8 => GdnStateFormat::F32,
+        },
+        ..state_format
+    };
+    assert!(
+        scope.contains(&format!("{state_format:?}")),
+        "session scope {scope:?} does not carry the resolved state format {state_format:?}"
+    );
+    assert!(
+        !scope.contains(&format!("{other:?}")),
+        "session scope {scope:?} carries the other GDN format {other:?}"
+    );
+    println!(
+        "{} state_quant={request} gdn_format={} gdn_layers={} recurrent_bytes_per_layer={want} scope={scope}",
+        hw_identity::GDN_TEST_STATE_QUANT_ENV,
+        state_format.gdn.name(),
+        bundle.state.gdn.len()
+    );
+}
+
 /// SHA-256 of every part of the live state at `position` on `route`: the
 /// metadata, each fixed part, then the valid rows of each row stream.
 fn state_digests(
@@ -84,8 +153,24 @@ fn state_digests(
     route: SessionRoute,
     position: usize,
 ) -> Vec<[u8; 32]> {
+    let recurrent_bytes: Vec<usize> = bundle
+        .state
+        .gdn
+        .iter()
+        .map(|layer| layer.recurrent.byte_size())
+        .collect();
     let SnapshotParts { meta, layout } =
         SessionState::snapshot_parts(bundle, route, position).expect("state parts");
+    // Fixed parts are `[recurrent, conv]` per GDN layer first: the digested
+    // recurrent bytes are exactly the resolved format's state.
+    for (layer, bytes) in recurrent_bytes.iter().enumerate() {
+        assert_eq!(
+            layout.fixed[2 * layer].bytes,
+            *bytes,
+            "snapshot part {} is not GDN layer {layer}'s recurrent state",
+            2 * layer
+        );
+    }
     gpu.hip.device_synchronize().expect("sync");
     let mut digests = vec![Sha256::digest(&meta).into()];
     let ranges = layout
@@ -435,9 +520,8 @@ fn load(turn_snapshots: bool, budget: u64, disk: Option<&Path>) -> Loaded {
         },
     )
     .expect("weights");
-    let state_format = hipfire_arch_qwen4::resolve_state_format(
+    let (state_request, state_format) = hw_identity::resolve_gdn_test_state_format(
         &hipfire_runtime::config::get().kv_mode,
-        "",
         &gpu,
         &receipt.config,
     )
@@ -460,6 +544,7 @@ fn load(turn_snapshots: bool, budget: u64, disk: Option<&Path>) -> Loaded {
     bundle
         .attach_forward(&mut gpu, MAX_SEQ, scratch_mode)
         .expect("forward");
+    assert_resolved_gdn_state(&bundle, state_request, state_format);
     let cache = SessionCache::new(domain, budget);
     bundle.attach_session_cache(match disk {
         Some(dir) => cache.with_disk(dir, 1 << 40),

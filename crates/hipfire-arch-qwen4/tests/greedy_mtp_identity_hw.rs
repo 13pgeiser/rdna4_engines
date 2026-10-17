@@ -14,8 +14,9 @@
 //! in pinned host RAM; auto reserves native MTP and QSA gather workspace.
 //! Prompts, identity/coverage assertions and production-source checks are unchanged.
 //!
-//! The rendered `tests/fixtures/qwen4_mtp_identity_p1.txt` prompt (Q8 GDN
-//! recurrent state, `max_seq` 16384, K=3, temperature 0) is prefilled once per
+//! The rendered `tests/fixtures/qwen4_mtp_identity_p1.txt` prompt (GDN
+//! recurrent state per `HIPFIRE_GDN_TEST_STATE_QUANT`, Q8 by default,
+//! `max_seq` 16384, K=3, temperature 0) is prefilled once per
 //! arm and 1200 greedy token IDs are generated in process through the public
 //! bundle and `MtpDrafter` contracts, not the daemon wire. Every arm runs in
 //! its own fresh child process of this test binary, because route knobs are
@@ -77,13 +78,42 @@
 //! MTP arms also write `<arm>.windows.json`: per window the position, drafts,
 //! accepted, committed, the drafter's own window / retirement counters and the
 //! HIP call-count deltas around the step; the decoded text is `<arm>.txt`.
+//!
+//! # GDN state mode and graph policy
+//!
+//! `HIPFIRE_GDN_TEST_STATE_QUANT=q8|fp32` picks the GDN recurrent-state format
+//! (unset = `q8`, the historical fixture; `q8_ef` is reserved and refuses with
+//! "not available in this build" until Track B lands; anything else is
+//! refused). The value is passed as `state_request` to `resolve_state_format`
+//! and the run fails unless the resolved `GdnStateFormat` is the requested one
+//! (the product's `HIPFIRE_STATE_QUANT` is never read). The parent resolves the
+//! mode once and sets it in every child's environment, so it is part of each
+//! arm's identity (`config.env`) and a child started without it refuses; every
+//! arm records `gdn_state` (`request`, resolved `name`) in `<arm>.identity.json`
+//! and the parent writes both as the `summary.txt` header. The per-arm expert
+//! placement and native-MTP sizing use the resolved format. G2 (F32 MTP == AR)
+//! runs as
+//! `HIPFIRE_GDN_TEST_STATE_QUANT=fp32 HIPFIRE_MTP_IDENTITY_MODEL=$M <test-bin> --ignored --test-threads=1 greedy_mtp_matches_ar_on_flash_next`.
+//!
+//! Qwen4 reads no `HIPFIRE_GRAPH` / `HIPFIRE_AR_GRAPH` / `HIPFIRE_GRAPH_MOE`
+//! (only Qwen3.5 does; `gpu_forward.rs` documents that no Qwen4 production path
+//! opens a hipGraph capture). Its graph-like switch is the retained-replay
+//! backend `HIPFIRE_REPLAY_BACKEND` (`Gpu::init` ->
+//! `ReplayController::from_config`): `hip` (default when unset here) launches
+//! eagerly, `auto` records the AR decode forward once and replays it; verify
+//! forwards (2+ rows) always launch eager. The parent resolves it (`hip`/`off`
+//! -> `hip`, `auto`/`redline` -> `auto`, `shadow`; others refused), forwards it
+//! to every child, each child fails unless `gpu.replay.request()` is that
+//! backend, and `<arm>.identity.json` (`graph_policy`) plus the `summary.txt`
+//! header record it. Run G2 as a "graph0" parent with `HIPFIRE_REPLAY_BACKEND=hip`
+//! and a "graph1" parent with `HIPFIRE_REPLAY_BACKEND=auto`.
 
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::expert_residency as residency;
 use hipfire_arch_qwen4::mtp_spec::{
     native_mtp_row_capture, qwen4_ngram_mod_config, Qwen4MtpDrafter,
 };
-use hipfire_arch_qwen4::{GdnStateFormat, Qwen4KvBackend};
+use hipfire_arch_qwen4::Qwen4KvBackend;
 use hipfire_dispatch::pipeline::DraftHeadPolicy;
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
@@ -110,6 +140,42 @@ const ARM_TEST: &str = "greedy_mtp_identity_arm";
 /// Harness-control variables: they differ between a parent and each child
 /// without changing what the arm computes, so identities exclude them.
 const CONTROL_ENV: [&str; 4] = [MODEL_ENV, OUT_ENV, ARM_ENV, CASE_ENV];
+/// The launch-backend variable, the only graph-like switch Qwen4 honors in
+/// process: `ReplayController::from_config` (`rdna-compute/src/replay.rs`,
+/// called from `Gpu::init`) reads it. `HIPFIRE_GRAPH` / `HIPFIRE_AR_GRAPH` /
+/// `HIPFIRE_GRAPH_MOE` are read by Qwen3.5 only; no Qwen4 source reads them.
+const REPLAY_BACKEND_ENV: &str = "HIPFIRE_REPLAY_BACKEND";
+const GRAPH_POLICY_NOTE: &str = "graph policy is the retained-replay backend: hip = eager launches, auto = AR decode records then replays a retained body; verify forwards (2+ rows) always launch eager; HIPFIRE_GRAPH is not read by Qwen4";
+
+/// The launch backend this process requests, canonical (`hip`, `auto`,
+/// `shadow`); unset or empty is `hip`, as `ReplayBackendRequest::from_config`
+/// reads it. An unknown value is refused, never relabelled.
+fn replay_backend_request() -> Result<&'static str, String> {
+    match std::env::var(REPLAY_BACKEND_ENV) {
+        Err(std::env::VarError::NotPresent) => Ok("hip"),
+        Err(std::env::VarError::NotUnicode(value)) => {
+            Err(format!("{REPLAY_BACKEND_ENV}={value:?} is not UTF-8"))
+        }
+        Ok(value) => match value.to_ascii_lowercase().as_str() {
+            "" | "hip" | "off" => Ok("hip"),
+            "auto" | "redline" => Ok("auto"),
+            "shadow" => Ok("shadow"),
+            other => Err(format!(
+                "{REPLAY_BACKEND_ENV}={other:?} is not a known backend (accepted: hip, off, auto, redline, shadow)"
+            )),
+        },
+    }
+}
+
+/// The canonical name of the backend the runtime resolved.
+fn replay_backend_name(request: rdna_compute::replay::ReplayBackendRequest) -> &'static str {
+    use rdna_compute::replay::ReplayBackendRequest;
+    match request {
+        ReplayBackendRequest::Hip => "hip",
+        ReplayBackendRequest::Shadow => "shadow",
+        ReplayBackendRequest::Auto => "auto",
+    }
+}
 /// Column names of a `<arm>.windows.json` row (the HIP call counts follow).
 const WINDOW_COLUMNS: [&str; 11] = [
     "index",
@@ -464,17 +530,23 @@ fn greedy_mtp_ngram_batched_is_deterministic_on_flash_next_copy() {
 struct ArmRun {
     ids: Vec<u32>,
     stderr: String,
+    /// `summary.txt` header lines: the arm's recorded GDN format and graph policy.
+    header: String,
 }
 
 /// What a parent changes in an arm's child environment: everything that can
 /// force a route or alter the drafter is cleared, then the arm's own settings
-/// are applied. The AR floor is left at its default (on) for every arm.
-fn arm_overrides(arm: Arm) -> Vec<(&'static str, Option<&'static str>)> {
+/// are applied. The AR floor is left at its default (on) for every arm. The
+/// GDN test mode (`HIPFIRE_GDN_TEST_STATE_QUANT`, default `q8`) and the launch
+/// backend (`HIPFIRE_REPLAY_BACKEND`, default `hip`) are resolved once by the
+/// parent and forwarded explicitly, so a child never runs a different mode.
+fn arm_overrides(arm: Arm) -> Result<Vec<(&'static str, Option<&'static str>)>, String> {
     let (n_match, n_min, n_max) = match arm.ngram_triple {
         Some((n_match, n_min, n_max)) => (Some(n_match), Some(n_min), Some(n_max)),
         None => (None, None, None),
     };
-    vec![
+    let (state_request, _) = hw_identity::gdn_test_state_quant()?;
+    Ok(vec![
         ("HIPFIRE_MTP_AR_FLOOR", None),
         ("HIPFIRE_MTP_PHASE_TIMING", None),
         ("HIPFIRE_MTP_NGRAM", None),
@@ -484,16 +556,18 @@ fn arm_overrides(arm: Arm) -> Vec<(&'static str, Option<&'static str>)> {
         ("HIPFIRE_NGRAM_MOD_N_MATCH", n_match),
         ("HIPFIRE_NGRAM_MOD_N_MIN", n_min),
         ("HIPFIRE_NGRAM_MOD_N_MAX", n_max),
-    ]
+        (hw_identity::GDN_TEST_STATE_QUANT_ENV, Some(state_request)),
+        (REPLAY_BACKEND_ENV, Some(replay_backend_request()?)),
+    ])
 }
 
 /// The child must already run under its arm's environment.
 fn require_arm_env(arm: Arm) -> Result<(), String> {
-    for (name, want) in arm_overrides(arm) {
+    for (name, want) in arm_overrides(arm)? {
         let have = std::env::var(name).ok();
         if have.as_deref() != want {
             return Err(format!(
-                "{name} is {have:?} but arm {} requires {want:?}",
+                "{name} is {have:?} but arm {} requires {want:?} (the parent forwards it explicitly)",
                 arm.name
             ));
         }
@@ -507,7 +581,10 @@ fn spawn_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> ArmRun {
     let exe = std::env::current_exe().expect("test binary path");
     let model_id = hw_identity::model_identity(model, dir).unwrap_or_else(|e| panic!("{e}"));
     let expected = hw_identity::config_identity(
-        &hw_identity::env_snapshot(&arm_overrides(arm), &CONTROL_ENV),
+        &hw_identity::env_snapshot(
+            &arm_overrides(arm).unwrap_or_else(|e| panic!("{e}")),
+            &CONTROL_ENV,
+        ),
         &model_id,
     );
     // An earlier result of this arm must never stand in for this run.
@@ -528,7 +605,7 @@ fn spawn_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> ArmRun {
         .env(MODEL_ENV, model)
         .env(OUT_ENV, dir)
         .stdin(Stdio::null());
-    for (name, value) in arm_overrides(arm) {
+    for (name, value) in arm_overrides(arm).unwrap_or_else(|e| panic!("{e}")) {
         match value {
             Some(value) => {
                 child.env(name, value);
@@ -560,6 +637,9 @@ fn spawn_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> ArmRun {
         &fs::read(dir.join(format!("{}.identity.json", arm.name))).expect("arm identity"),
     )
     .expect("arm identity json");
+    let (want_request, want_format) =
+        hw_identity::gdn_test_state_quant().unwrap_or_else(|e| panic!("{e}"));
+    let want_backend = replay_backend_request().unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(
         recorded["config"],
         expected,
@@ -567,7 +647,32 @@ fn spawn_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> ArmRun {
         arm.name,
         dir.display()
     );
-    ArmRun { ids, stderr }
+    assert_eq!(
+        recorded["gdn_state"],
+        serde_json::json!({"request": want_request, "resolved": want_format.name()}),
+        "{} arm resolved a different GDN state format than {} requests (logs in {})",
+        arm.name,
+        hw_identity::GDN_TEST_STATE_QUANT_ENV,
+        dir.display()
+    );
+    assert_eq!(
+        recorded["graph_policy"]["replay_backend"],
+        serde_json::json!(want_backend),
+        "{} arm ran a different launch backend than {REPLAY_BACKEND_ENV} requests (logs in {})",
+        arm.name,
+        dir.display()
+    );
+    let header = format!(
+        "gdn_state_quant={want_request} gdn_format={}\nreplay_backend={want_backend} replay_state={} HIPFIRE_GRAPH={} ({GRAPH_POLICY_NOTE})\n",
+        want_format.name(),
+        recorded["graph_policy"]["replay_state"],
+        recorded["graph_policy"]["HIPFIRE_GRAPH"],
+    );
+    ArmRun {
+        ids,
+        stderr,
+        header,
+    }
 }
 
 fn run_case(case: Case, arms: &[Arm], dir_name: &str) {
@@ -577,6 +682,7 @@ fn run_case(case: Case, arms: &[Arm], dir_name: &str) {
     let mut ids: Vec<(Arm, Vec<u32>)> = Vec::new();
     let mut failures = Vec::new();
     let mut summary = String::new();
+    let mut header = String::new();
     for &arm in arms {
         let run = spawn_arm(arm, case, &model, &dir);
         let arm_ids = run.ids;
@@ -616,10 +722,14 @@ fn run_case(case: Case, arms: &[Arm], dir_name: &str) {
             },
         };
         eprint!("{line}");
+        if header.is_empty() {
+            header = run.header.clone();
+            eprint!("{header}");
+        }
         summary.push_str(&line);
         ids.push((arm, arm_ids));
     }
-    fs::write(dir.join("summary.txt"), &summary).unwrap();
+    fs::write(dir.join("summary.txt"), format!("{header}{summary}")).unwrap();
     assert!(
         failures.is_empty(),
         "greedy MTP differs from AR (logs in {}):\n{}",
@@ -735,6 +845,13 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
         }
     }
     let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+    let replay_backend = replay_backend_name(gpu.replay.request());
+    let requested_backend = replay_backend_request()?;
+    if replay_backend != requested_backend {
+        return Err(format!(
+            "{REPLAY_BACKEND_ENV} resolved to the {replay_backend} backend, not the {requested_backend} the parent forwarded"
+        ));
+    }
     // Admission is GPU-arch aware: an expert-slab artifact admits only on a
     // supported arch. Initialising the GPU allocates no model memory.
     let receipt = hipfire_arch_qwen4::admit_hfqm_artifact_on(&hfq, Some(&gpu.arch))
@@ -748,18 +865,11 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
         &receipt.manifest,
     )
     .map_err(|e| e.to_string())?;
-    let state_format = hipfire_arch_qwen4::resolve_state_format(
+    let (state_request, state_format) = hw_identity::resolve_gdn_test_state_format(
         &hipfire_runtime::config::get().kv_mode,
-        "",
         &gpu,
         &receipt.config,
     )?;
-    if state_format.gdn != GdnStateFormat::Q8 {
-        return Err(format!(
-            "GDN recurrent state resolved to {:?}, not Q8",
-            state_format.gdn
-        ));
-    }
     let backend = Qwen4KvBackend::automatic(&gpu);
     let use_ranges = gpu.is_uma();
     let mut weights = receipt.manifest.weights.clone();
@@ -937,10 +1047,11 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
         ));
     }
     println!(
-        "ARM {} arch={} prompt_tokens={} state={state_format:?} backend={} row_capture={capture} draft_head={head}",
+        "ARM {} arch={} prompt_tokens={} state_quant={state_request} gdn_format={} state={state_format:?} replay_backend={replay_backend} backend={} row_capture={capture} draft_head={head}",
         arm.name,
         gpu.arch,
         tokens.len(),
+        state_format.gdn.name(),
         backend.name()
     );
     let mut ids = Vec::with_capacity(case.generated() + MTP_K);
@@ -1063,6 +1174,16 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
             "arm": arm.name,
             "case": case.name(),
             "config": identity,
+            "gdn_state": {
+                "request": state_request,
+                "resolved": state_format.gdn.name(),
+            },
+            "graph_policy": {
+                "replay_backend": replay_backend,
+                "replay_state": format!("{:?}", gpu.replay.state()),
+                "HIPFIRE_GRAPH": std::env::var("HIPFIRE_GRAPH").ok(),
+                "note": GRAPH_POLICY_NOTE,
+            },
             "receipt": hw_identity::receipt(&gpu, model),
         }))
         .map_err(|e| e.to_string())?,

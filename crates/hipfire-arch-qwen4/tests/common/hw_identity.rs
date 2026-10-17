@@ -22,6 +22,7 @@
 
 #![allow(dead_code)]
 
+use hipfire_arch_qwen4::{GdnStateFormat, Qwen4StateFormat};
 use rdna_compute::Gpu;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -95,6 +96,58 @@ pub fn env_snapshot(overrides: EnvOverrides<'_>, exclude: &[&str]) -> BTreeMap<S
         }
     }
     env
+}
+
+/// The test-mode variable that picks the GDN recurrent-state format the
+/// hardware tests run under (`q8` default, `fp32`; `q8_ef` is reserved and
+/// refuses). The product's `HIPFIRE_STATE_QUANT` is never read here.
+pub const GDN_TEST_STATE_QUANT_ENV: &str = "HIPFIRE_GDN_TEST_STATE_QUANT";
+
+/// A test-mode value: the canonical request string handed to
+/// `resolve_state_format` and the format it must resolve to.
+pub fn parse_gdn_test_state_quant(
+    value: Option<&str>,
+) -> Result<(&'static str, GdnStateFormat), String> {
+    match value {
+        None | Some("q8") => Ok(("q8", GdnStateFormat::Q8)),
+        Some("fp32") => Ok(("fp32", GdnStateFormat::F32)),
+        Some("q8_ef") => Err(format!(
+            "{GDN_TEST_STATE_QUANT_ENV}=q8_ef is not available in this build"
+        )),
+        Some(other) => Err(format!(
+            "{GDN_TEST_STATE_QUANT_ENV}={other:?} is not a known mode (accepted: q8, fp32)"
+        )),
+    }
+}
+
+/// [`parse_gdn_test_state_quant`] of this process's environment (unset: `q8`).
+pub fn gdn_test_state_quant() -> Result<(&'static str, GdnStateFormat), String> {
+    match std::env::var(GDN_TEST_STATE_QUANT_ENV) {
+        Ok(value) => parse_gdn_test_state_quant(Some(&value)),
+        Err(std::env::VarError::NotPresent) => parse_gdn_test_state_quant(None),
+        Err(std::env::VarError::NotUnicode(value)) => Err(format!(
+            "{GDN_TEST_STATE_QUANT_ENV}={value:?} is not UTF-8 (accepted: q8, fp32)"
+        )),
+    }
+}
+
+/// Resolve the product state format for the test mode: the mode's canonical
+/// request goes to `resolve_state_format` and the resolved GDN format must be
+/// the requested one. Returns the request string with the resolved formats.
+pub fn resolve_gdn_test_state_format(
+    kv_request: &str,
+    gpu: &Gpu,
+    config: &hipfire_arch_qwen4::Qwen4Config,
+) -> Result<(&'static str, Qwen4StateFormat), String> {
+    let (request, want) = gdn_test_state_quant()?;
+    let state_format = hipfire_arch_qwen4::resolve_state_format(kv_request, request, gpu, config)?;
+    if state_format.gdn != want {
+        return Err(format!(
+            "{GDN_TEST_STATE_QUANT_ENV}={request} resolved to GDN state {:?}, expected {want:?}",
+            state_format.gdn
+        ));
+    }
+    Ok((request, state_format))
 }
 
 /// The native-MTP route class an environment selects.
@@ -571,5 +624,27 @@ mod lever_state_tests {
         let state = lever_state(&env_with(&[(other.as_str(), "1"), ("HIPFIRE_GRAPH", "1")]));
         assert_eq!(state["unlisted_env"][&other], json!("1"));
         assert!(state["unlisted_env"].get("HIPFIRE_GRAPH").is_none());
+    }
+
+    #[test]
+    fn gdn_test_state_quant_parses_only_known_modes() {
+        assert_eq!(
+            parse_gdn_test_state_quant(None),
+            Ok(("q8", GdnStateFormat::Q8))
+        );
+        assert_eq!(
+            parse_gdn_test_state_quant(Some("q8")),
+            Ok(("q8", GdnStateFormat::Q8))
+        );
+        assert_eq!(
+            parse_gdn_test_state_quant(Some("fp32")),
+            Ok(("fp32", GdnStateFormat::F32))
+        );
+        let ef = parse_gdn_test_state_quant(Some("q8_ef")).unwrap_err();
+        assert!(ef.contains("q8_ef is not available in this build"), "{ef}");
+        for other in ["", "f32", "int8", "auto", "FP32", "q4"] {
+            let error = parse_gdn_test_state_quant(Some(other)).unwrap_err();
+            assert!(error.contains("accepted: q8, fp32"), "{other:?}: {error}");
+        }
     }
 }

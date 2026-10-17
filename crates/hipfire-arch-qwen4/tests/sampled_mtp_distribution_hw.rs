@@ -76,6 +76,21 @@
 //! different config is a hard error. Use one `HIPFIRE_SAMPLED_MTP_OUT`
 //! directory per config (e.g. `.../neutral`, `.../presence1.5`).
 //!
+//! # GDN state mode
+//!
+//! `HIPFIRE_GDN_TEST_STATE_QUANT=q8|fp32` picks the GDN recurrent-state format
+//! (unset = `q8`, the historical fixture; `q8_ef` is reserved and refuses with
+//! "not available in this build" until Track B lands; anything else is
+//! refused). The load passes it as `state_request` to `resolve_state_format`
+//! and fails unless the resolved `GdnStateFormat` is the requested one; the
+//! product's `HIPFIRE_STATE_QUANT` is never read. The parent resolves the mode
+//! once and sets it in every child's environment (`arm_overrides`), so it is
+//! part of every arm's recorded identity (`config.env` of the `.config.json`)
+//! and a result produced under another mode is a hard config mismatch, never
+//! reused. A separately launched arm must set it itself (like the other
+//! variables `require_arm_env` pins) and fails naming it otherwise. Each arm
+//! prints the request and the resolved format (`state_quant=... gdn_format=...`).
+//!
 //! # N-gram composition arms
 //!
 //! `sampled_mtp_ngram_matches_ar_distribution_on_flash_next` repeats the
@@ -870,9 +885,8 @@ fn load(model: &Path) -> Result<Loaded, String> {
         &receipt.manifest,
     )
     .map_err(|e| e.to_string())?;
-    let state_format = hipfire_arch_qwen4::resolve_state_format(
+    let (state_request, state_format) = hw_identity::resolve_gdn_test_state_format(
         &hipfire_runtime::config::get().kv_mode,
-        "",
         &gpu,
         &receipt.config,
     )?;
@@ -1058,7 +1072,10 @@ fn load(model: &Path) -> Result<Loaded, String> {
         bundle,
         tokenizer,
         template,
-        state: format!("{state_format:?}"),
+        state: format!(
+            "state_quant={state_request} gdn_format={} {state_format:?}",
+            state_format.gdn.name()
+        ),
     })
 }
 
@@ -1706,6 +1723,8 @@ fn arm_overrides(arm: &str, mode: &'static str) -> Vec<(&'static str, Option<&'s
             overrides.push((FLOOR_ENV, None));
         }
     }
+    let (state_request, _) = hw_identity::gdn_test_state_quant().unwrap_or_else(|e| panic!("{e}"));
+    overrides.push((hw_identity::GDN_TEST_STATE_QUANT_ENV, Some(state_request)));
     overrides
 }
 
@@ -1713,6 +1732,9 @@ fn arm_overrides(arm: &str, mode: &'static str) -> Vec<(&'static str, Option<&'s
 /// arm's environment: a stale shell variable is an error, not a silently
 /// different configuration.
 fn require_arm_env(arm: &str, mode: &'static str) -> Result<(), String> {
+    // An unknown test mode (or q8_ef) is refused before the overrides below
+    // resolve it.
+    hw_identity::gdn_test_state_quant()?;
     for (name, want) in arm_overrides(arm, mode) {
         let have = std::env::var(name).ok();
         if have.as_deref() != want {
@@ -4027,6 +4049,23 @@ mod coverage_logic {
     #[test]
     fn probe_budget_is_read_from_the_source_under_test() {
         assert!(floor_probe_budget().unwrap() >= 1);
+    }
+
+    /// Every arm's child is given the resolved GDN test mode explicitly.
+    #[test]
+    fn every_arm_forwards_the_gdn_test_mode() {
+        let (request, _) = hw_identity::gdn_test_state_quant().unwrap();
+        for arm in ["ar", "batched", "interleaved", "adaptive"] {
+            let forwarded: Vec<_> = arm_overrides(arm, "leviathan")
+                .into_iter()
+                .filter(|(name, _)| *name == hw_identity::GDN_TEST_STATE_QUANT_ENV)
+                .collect();
+            assert_eq!(
+                forwarded,
+                vec![(hw_identity::GDN_TEST_STATE_QUANT_ENV, Some(request))],
+                "{arm}"
+            );
+        }
     }
 
     #[test]
