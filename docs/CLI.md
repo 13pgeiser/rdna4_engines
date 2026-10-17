@@ -401,7 +401,7 @@ Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq al
 | Command | Purpose |
 |---|---|
 | `hipfire bench <model> [opts] [prompt]` | Prefill/decode timing. `--runs N` (default 5), `--json`, `--exp` (RDNA2 variant sweep), `--max-seq N` ([context](#bench-context-max_seq)). `--prompt-file PATH` reads the prompt verbatim; JSON records `prompt_tokens`/`prompt_md5`/`prompt_chars`/`warnings` (short prompts warn that `prefill_tok_s` is launch overhead), the load's `max_seq`, and the GPU power and memory state of every measured run ([below](#bench-power-and-memory-state)). |
-| `hipfire bench <model> --matrix ...` | Synthetic PP/context/TG matrix (`--pp`, `--ctx`, `--tg`, `--sustained-tg`, `--sustained-ctx`, `--warmups`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq`, `--redline`). Same KV contract as `run`/`serve`, except that the load's `max_seq` is sized to the matrix ([context](#bench-context-max_seq)); `--json` surfaces the effective loaded `kv_mode` and backend fields, and each row carries a `power` entry per run. |
+| `hipfire bench <model> --matrix ...` | Synthetic PP/context/TG matrix (`--pp`, `--ctx`, `--tg`, `--sustained-tg`, `--sustained-ctx`, `--warmups`, `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--max-seq`, `--redline`). Same KV contract as `run`/`serve`, except that the load's `max_seq` is sized to the matrix ([context](#bench-context-max_seq)); `--json` surfaces the effective loaded `kv_mode` and backend fields and the loaded `topology` (`{pp,tp,ep,cards[]}`, [below](#bench-matrix-topology)), and each row carries a `power` entry per run. |
 | `hipfire bench <model> --spec <m> ...` | Every bench generate sends greedy sampling with the neutral `repeat_penalty 1.0` (any other value routes the daemon to the plain AR decoder), so `--spec mtp\|dflash\|ngram\|dspark\|auto` measures the speculative decoder and `--spec off` the AR decoder on the same workload. JSON records `spec_requested`, a per-run `spec_route` (`"mtp"`, `"mtp+ngram"`, `"dflash"`, a daemon `spec` name, or `null` when AR ran) and per-run `spec_tau`; when `--spec` is not `off` but no run speculated, the bench prints a `warning:` and adds it to `warnings`. `spec_tau` averages over every window, including native MTP's AR floor tokens, which draft nothing, so a request the floor retired reads near zero whatever its drafts accepted. The per-run `spec_mtp` (`null` unless native MTP ran) splits the windows: `windows_mtp` (windows before retirement: native and n-gram windows plus the floor's timed AR tokens), `windows_floor_ar` (those timed AR tokens: the calibration token and any retirement probes), `windows_ar_retired` (head-free AR tokens after retirement), `retired_at` (index of the first retired window, `null` if the request never retired), `accepted` (the daemon's `done.accepted`) and `tau_mtp` = `accepted / (windows_mtp - windows_floor_ar)`, the acceptance of the windows that drafted (`null` from a daemon without `accepted` or `floor_ar_windows`). |
 | `hipfire bench <model> --concurrency 1,2,4,8 ...` | Closed-loop serving sweep over the daemon wire: at each K, K lanes drain the same N requests, after a discarded warmup at that K. Reports output tok/s, steady-window tok/s, TTFT/TPOT p50/p99, achieved concurrency, τ, finish reasons and routes ([below](#bench-concurrency---concurrency)). `--json` is not supported on this path. |
 | `hipfire bench <model> --emu <id\|off> ...` | SKU application-capacity profile for **every** spawned bench daemon arm (standard, `--matrix`, `--ttft`, `--concurrency`, `--exp`): sets `developer.emu` in each child's process snapshot, overrides `HIPFIRE_EMU` including `--emu off`, validates the id before anything spawns, and logs the effective value on stderr (`emu: effective profile ...`; silent when no profile is requested). The host still runs at full speed; only application memory capacity is capped. With a profile active the bench JSON `gpu` object (the daemon `diag`) gains an `emu` object (budgeted free/total, ledger); the `vram_free_mb`/`vram_total_mb` beside it stay physical. See [EMU.md](EMU.md). |
@@ -431,7 +431,7 @@ Perf claim protocol (warmup, fresh-process, noise): [methodology/perf-benchmarki
 | `--tp N` | Tensor/expert-parallel degree for the bench daemon, `1..=64`. |
 | `-j`, `--json` | JSON report; not supported with `--exp` or `--concurrency`. |
 | `--exp` | RDNA2 kernel-variant sweep in isolated daemon processes; cannot combine with `--matrix`/`--redline`, `--json` or `--reasoning-on`. |
-| `--matrix` / `--redline` | Synthetic token-id rows; neither takes a prompt. `--redline` additionally selects the Redline replay backend (PM4 transport, graph AR/forward). |
+| `--matrix` / `--redline` | Synthetic token-id rows; neither takes a prompt. Runs on every topology `serve` admits (single card, `--tp` / `topology.pp` PP, TP, EP) and reports the loaded `topology` ([below](#bench-matrix-topology)). `--redline` additionally selects the Redline replay backend (PM4 transport, graph AR/forward). |
 | `--pp`, `--ctx` | Comma lists for the matrix; default `128,512,2048,4096,8192,20000`. |
 | `--tg N` | Matrix decode length; default `128`. |
 | `--sustained-tg N`, `--sustained-ctx` | Sustained-decode rows run when `--sustained-tg` is set; `--sustained-ctx` defaults to `128,8192`. |
@@ -502,6 +502,21 @@ Every JSON report has a `max_seq` object:
 - `model_limit`: the declared context, or `null`.
 
 The bench also prints a `max_seq:` line.
+
+### Bench matrix topology
+
+`--matrix` measures the model on whatever topology the load admitted: one card, pipeline-parallel (`topology.pp`, 2 or more stages), dense tensor-parallel (`--tp` / `topology.tp`) or expert-parallel (EP). Admission is `serve`'s own, so a load `serve` refuses is refused by the bench with the same message. The rows are synthetic: fixed token ids on the plain prefill route and a primed synthetic decode context. They time the loaded topology's forward, not a prompt, speculation or the HTTP path, and a multi-card load's rows carry that load's cross-card traffic. Time a real prompt with `--prompt-file` (see the standard bench).
+
+The `--matrix` JSON gains a `topology` object, taken from the daemon's own `prefill_result` / `decode_result` answers and not derived from the flags:
+
+| Field | Meaning |
+|---|---|
+| `pp` | Pipeline stages (`1` when not pipelined). |
+| `tp` | Dense tensor-parallel ranks (`1` when none). |
+| `ep` | Expert-parallel ranks (`1` when none). |
+| `cards` | Identifiers of the cards that actually hold the model, as a non-empty array of strings (HIP device ordinals in mesh rank order, each card listed once). |
+
+A single-card load is `{"pp":1,"tp":1,"ep":1,"cards":["0"]}`; a PP3 load `{"pp":3,"tp":1,"ep":1,"cards":["0","1","2"]}`; `tp` and `ep` are reported separately, never merged. All rows of one run must report the same topology (including the card list), and `topology.pp` must equal the report's `pp` (the loaded value), otherwise the bench fails instead of labeling the run. A daemon that reports no topology yields `"topology": null`, never an assumed single card. Every other `--matrix` field is unchanged.
 
 ### Bench power and memory state
 

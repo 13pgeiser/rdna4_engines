@@ -1799,8 +1799,8 @@ pub const SITES: &[Site] = &[
         decisions: &["eager-only-refusals"],
     },
     Site {
-        file: "hipfire-daemon/src/main.rs",
-        function: "main",
+        file: "hipfire-daemon/src/bench.rs",
+        function: "handle_bench_decode",
         occurrences: 1,
         decisions: &["redline-oracle-diagnostics"],
     },

@@ -7179,6 +7179,105 @@ fn bench_ttft(
     Ok(())
 }
 
+/// The loaded parallel topology as the daemon's `bench_prefill` /
+/// `bench_decode` answers report it: pipeline stages, tensor ranks, expert
+/// ranks and the identifiers of the cards actually holding the model. A
+/// single-card load is `{pp:1, tp:1, ep:1, cards:["<id>"]}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BenchTopology {
+    pp: u64,
+    tp: u64,
+    ep: u64,
+    cards: Vec<String>,
+}
+
+impl BenchTopology {
+    /// Read `response.topology`. `Ok(None)` when the daemon sent none (the
+    /// report then says `null`, never a guessed single card); an error when
+    /// it is present but `pp`/`tp`/`ep` are not positive integers or `cards`
+    /// is not a non-empty array of strings.
+    fn from_response(response: &serde_json::Value) -> Result<Option<Self>> {
+        let Some(topology) = response.get("topology") else {
+            return Ok(None);
+        };
+        let field = |name: &str| -> Result<u64> {
+            topology
+                .get(name)
+                .and_then(serde_json::Value::as_u64)
+                .filter(|value| *value >= 1)
+                .ok_or_else(|| {
+                    anyhow!("daemon bench topology {topology} has no positive integer `{name}`")
+                })
+        };
+        let cards = topology
+            .get("cards")
+            .and_then(serde_json::Value::as_array)
+            .filter(|cards| !cards.is_empty())
+            .and_then(|cards| {
+                cards
+                    .iter()
+                    .map(|card| card.as_str().map(str::to_owned))
+                    .collect::<Option<Vec<String>>>()
+            })
+            .ok_or_else(|| {
+                anyhow!("daemon bench topology {topology} has no non-empty string array `cards`")
+            })?;
+        Ok(Some(Self {
+            pp: field("pp")?,
+            tp: field("tp")?,
+            ep: field("ep")?,
+            cards,
+        }))
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({ "pp": self.pp, "tp": self.tp, "ep": self.ep, "cards": self.cards })
+    }
+}
+
+/// Collects the topology reported by every probe of one matrix run. All rows
+/// of a run measure one loaded model, so they must agree.
+#[derive(Debug, Default)]
+struct BenchTopologyTracker {
+    seen: Option<BenchTopology>,
+}
+
+impl BenchTopologyTracker {
+    fn observe(&mut self, response: &serde_json::Value) -> Result<()> {
+        let Some(topology) = BenchTopology::from_response(response)? else {
+            return Ok(());
+        };
+        if let Some(first) = &self.seen {
+            if *first != topology {
+                bail!(
+                    "daemon bench rows disagree on the loaded topology: {} then {}",
+                    first.to_json(),
+                    topology.to_json()
+                );
+            }
+        }
+        self.seen = Some(topology);
+        Ok(())
+    }
+
+    /// The report's `topology` value, checked against the load's own `pp`
+    /// so a pipeline or expert-parallel load is never labeled single-card.
+    fn finish(self, loaded: &serde_json::Value) -> Result<serde_json::Value> {
+        let Some(topology) = self.seen else {
+            return Ok(serde_json::Value::Null);
+        };
+        if let Some(loaded_pp) = loaded.get("pp").and_then(serde_json::Value::as_u64) {
+            if loaded_pp != topology.pp {
+                bail!(
+                    "daemon bench topology {} disagrees with the loaded pp={loaded_pp}",
+                    topology.to_json()
+                );
+            }
+        }
+        Ok(topology.to_json())
+    }
+}
+
 fn bench_matrix(
     engine: &mut Engine,
     args: &BenchArgs,
@@ -7188,20 +7287,23 @@ fn bench_matrix(
     max_seq: &serde_json::Value,
     load_speculation: &serde_json::Value,
 ) -> Result<()> {
+    let mut topology = BenchTopologyTracker::default();
     for size in &args.pp {
-        let _ = bench_probe(
+        let response = bench_probe(
             engine,
             serde_json::json!({ "type": "bench_prefill", "tokens": size }),
             "prefill_result",
         )?;
+        topology.observe(&response)?;
     }
     let warm_context = args.ctx[0];
     for _ in 0..args.warmups {
-        let _ = bench_probe(
+        let response = bench_probe(
             engine,
             serde_json::json!({ "type": "bench_decode", "context_tokens": warm_context, "iterations": args.tg }),
             "decode_result",
         )?;
+        topology.observe(&response)?;
     }
     let mut pp_rows = Vec::new();
     let mut all_power = Vec::new();
@@ -7216,6 +7318,7 @@ fn bench_matrix(
                 serde_json::json!({ "type": "bench_prefill", "tokens": size }),
                 "prefill_result",
             )?;
+            topology.observe(&result)?;
             samples.push(
                 result
                     .get("tok_s")
@@ -7232,11 +7335,12 @@ fn bench_matrix(
     }
     let mut decode_rows = Vec::new();
     for context in &args.ctx {
-        let _ = bench_probe(
+        let response = bench_probe(
             engine,
             serde_json::json!({ "type": "bench_decode", "context_tokens": context, "iterations": args.tg }),
             "decode_result",
         )?;
+        topology.observe(&response)?;
         let mut samples = Vec::new();
         let mut row_power = Vec::new();
         for _ in 0..args.runs {
@@ -7247,6 +7351,7 @@ fn bench_matrix(
                 serde_json::json!({ "type": "bench_decode", "context_tokens": context, "iterations": args.tg }),
                 "decode_result",
             )?;
+            topology.observe(&result)?;
             samples.push(
                 result
                     .get("tok_s")
@@ -7266,11 +7371,12 @@ fn bench_matrix(
     let mut sustained_rows = Vec::new();
     if let Some(tg) = args.sustained_tg {
         for context in &args.sustained_ctx {
-            let _ = bench_probe(
+            let response = bench_probe(
                 engine,
                 serde_json::json!({ "type": "bench_decode", "context_tokens": context, "iterations": tg }),
                 "decode_result",
             )?;
+            topology.observe(&response)?;
             let mut samples = Vec::new();
             let mut row_power = Vec::new();
             for _ in 0..args.runs {
@@ -7281,6 +7387,7 @@ fn bench_matrix(
                     serde_json::json!({ "type": "bench_decode", "context_tokens": context, "iterations": tg }),
                     "decode_result",
                 )?;
+                topology.observe(&result)?;
                 samples.push(
                     result
                         .get("tok_s")
@@ -7302,6 +7409,7 @@ fn bench_matrix(
     for warning in &warnings {
         eprintln!("  warning: {warning}");
     }
+    let topology = topology.finish(loaded)?;
     let report = with_loaded_kv_backend_fields(
         serde_json::json!({
             "protocol": "synthetic-pp-tg-matrix-v1",
@@ -7322,6 +7430,7 @@ fn bench_matrix(
             "prefill": pp_rows,
             "decode": decode_rows,
             "sustained": sustained_rows,
+            "topology": topology,
         }),
         loaded,
     );
@@ -17866,6 +17975,78 @@ effort = "high"
         );
         // ...and not at all when `--sustained-tg` does not run them.
         assert_eq!(bench_matrix_seq_need(&[512], &[128], 32, None), 544);
+    }
+
+    #[test]
+    fn bench_matrix_topology_is_the_daemons_actual_pp_tp_ep_cards() {
+        let probe = |pp: u64, tp: u64, ep: u64, cards: &[&str]| {
+            serde_json::json!({
+                "type": "prefill_result",
+                "tokens": 128,
+                "topology": { "pp": pp, "tp": tp, "ep": ep, "cards": cards },
+            })
+        };
+        let report = |responses: &[serde_json::Value], loaded_pp: u64| {
+            let mut tracker = BenchTopologyTracker::default();
+            for response in responses {
+                tracker.observe(response)?;
+            }
+            tracker.finish(&serde_json::json!({ "pp": loaded_pp }))
+        };
+        // Single, PP, dense TP and EP each report their own shape and card
+        // identifiers; TP and EP stay distinct and none collapses to Single.
+        let shapes: [(u64, u64, u64, &[&str]); 4] = [
+            (1, 1, 1, &["0"]),
+            (3, 1, 1, &["0", "1", "2"]),
+            (1, 2, 1, &["0", "1"]),
+            (1, 1, 3, &["0", "1", "2"]),
+        ];
+        for (pp, tp, ep, cards) in shapes {
+            let value = report(&[probe(pp, tp, ep, cards), probe(pp, tp, ep, cards)], pp).unwrap();
+            assert_eq!(
+                value,
+                serde_json::json!({ "pp": pp, "tp": tp, "ep": ep, "cards": cards })
+            );
+        }
+        // A daemon that reports no topology yields null, never a guessed Single.
+        let bare = serde_json::json!({ "type": "decode_result", "tok_s": 1.0 });
+        assert_eq!(report(&[bare.clone()], 1).unwrap(), serde_json::Value::Null);
+        // A decode answer without it does not erase an earlier prefill answer.
+        assert_eq!(
+            report(&[probe(3, 1, 1, &["0", "1", "2"]), bare], 3).unwrap(),
+            serde_json::json!({ "pp": 3, "tp": 1, "ep": 1, "cards": ["0", "1", "2"] })
+        );
+        // Rows that disagree (including on the card list), a malformed
+        // object, a numeric/empty card list, and a topology that contradicts
+        // the load's pp are all errors.
+        let err = report(
+            &[probe(1, 1, 1, &["0"]), probe(3, 1, 1, &["0", "1", "2"])],
+            1,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("disagree"), "{err}");
+        let err = report(&[probe(1, 1, 1, &["0"]), probe(1, 1, 1, &["1"])], 1).unwrap_err();
+        assert!(err.to_string().contains("disagree"), "{err}");
+        let malformed = serde_json::json!({
+            "type": "prefill_result",
+            "topology": { "pp": 1, "tp": 1, "ep": 0, "cards": ["0"] },
+        });
+        let err = report(&[malformed], 1).unwrap_err();
+        assert!(err.to_string().contains("`ep`"), "{err}");
+        for cards in [
+            serde_json::json!(1),
+            serde_json::json!([]),
+            serde_json::json!([0]),
+        ] {
+            let bad = serde_json::json!({
+                "type": "prefill_result",
+                "topology": { "pp": 1, "tp": 1, "ep": 1, "cards": cards },
+            });
+            let err = report(&[bad], 1).unwrap_err();
+            assert!(err.to_string().contains("`cards`"), "{err}");
+        }
+        let err = report(&[probe(1, 1, 1, &["0"])], 3).unwrap_err();
+        assert!(err.to_string().contains("loaded pp=3"), "{err}");
     }
 
     #[test]

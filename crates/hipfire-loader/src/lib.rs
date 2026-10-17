@@ -6,6 +6,7 @@
 
 pub mod admission;
 pub mod batch_staging;
+pub mod bench_topology;
 mod carriers;
 pub use carriers::*;
 pub mod decide;

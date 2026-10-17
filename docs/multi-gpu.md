@@ -682,7 +682,7 @@ string or a blanket “always refuse at load.”
 | Non-PP carriers at `pp>1` | Carrier-specific error strings (not one universal quote). Examples at the audited ref: `qwen2: pipeline-parallel (pp>1) unsupported`; `llama:` / `dots_ocr:` / `deepseek4:` / `minimax:` / `lfm2moe:` `pipeline-parallel (pp>1) unsupported` on HFQ (and distinct `safetensors + pp>1 unsupported` on dirs); **`cohere2moe: pp>1 unsupported via registry`** (different wording). |
 | Qwen3.5 **safetensors directory** + `pp>1` | Error: `qwen35: safetensors + pp>1 unsupported` |
 | Qwen3.5 / 3.6 **VL HFQ** + `pp>1` | **Not a hard refuse.** `load_qwen35_pp` is the text HFQ loader only — vision weights are **not** loaded on that path, so VL artifacts **silently become text-only** under PP. Serve real VL at `pp=1`. |
-| `bench_prefill` / multi-GPU EP or PP | Daemon refuses `bench_prefill` (the synthetic `hipfire bench --matrix` prefill rows) when `pp>1` or EP is active: `bench_prefill requires a single-GPU model (pp=1, non-EP)`. Time PP with a real prompt (`hipfire bench --prompt-file`) |
+| `hipfire bench --matrix` on a multi-GPU load (PP, TP or EP) | **Not a refusal.** The synthetic `bench_prefill` / `bench_decode` rows run on every topology `serve` admits (the earlier `bench_prefill requires a single-GPU model (pp=1, non-EP)` refusal is gone) and the JSON reports the loaded `topology` as `{pp, tp, ep, cards}` from the daemon's own answers. Rows are synthetic token ids (no prompt, speculation or HTTP path); time a real prompt with `hipfire bench --prompt-file`. See [CLI.md](CLI.md#bench-matrix-topology) |
 | Flash-Next (Qwen4) `pp>1`, unsupported options | `qwen4: pipeline parallelism (topology.pp = N) does not support <subject>; drop the option or set topology.pp = 1`, subjects: DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, CASK, PFlash, an experts-per-token override, a non-Single compute placement, the MTP n-gram modifier. Full list: [refusals](#flash-next-pipeline-parallelism-host-staged) |
 | Flash-Next (Qwen4) `pp>1`, environment and config requests | Same sentence with subjects host-mapped routed experts (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`), the expert hotset, expert staging, session snapshots, the session cache disk tier, the NPU trunk |
 | Flash-Next (Qwen4) `pp>1`, mesh, bands and budget | Refused before any allocation, naming `topology.pp`: pp outside `2..=8` or `tp`/`ep` ≠ 1, `HIPFIRE_EMULATE_GPUS`, too few visible devices, unknown PCI identity, an arch other than gfx1100/gfx1201, mixed arches, `HIPFIRE_MESH_TRANSPORT=peer`, a bad `HIPFIRE_PP_LAYERS`, a band that does not fit its card |
@@ -907,8 +907,9 @@ Mesh, rank, band and budget refusals use the prefix
   trunk-overlay sidecar and a set `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`
   (`qwen4: topology.pp does not admit … (host-mapped expert layers)`).
 
-Also refused under PP: lane batching, `bench_prefill`, and the daemon-level
-`tp > 1 && pp > 1` (`mutually exclusive`).
+Also refused under PP: lane batching and the daemon-level `tp > 1 && pp > 1`
+(`mutually exclusive`). The synthetic `hipfire bench --matrix` probes
+(`bench_prefill` / `bench_decode`) are **not** refused under PP, TP or EP.
 
 #### Qualify a box: `fn-ep-gate` mode `pp`
 

@@ -61,9 +61,11 @@ impl ArchModel for Deepseek4Bundle {
         // This clears n_tokens + mtp_last_hidden + ar_forward_warmed_up and
         // zero-fills every position-indexed SWA / compressed-KV / indexer
         // cache so the next conversation cannot bleed prior-turn residue.
-        // Pairs with daemon's gpu.invalidate_graph_state() after this call.
+        // The captured decode graph is invalidated here, with the state it
+        // replays, so no caller names this arch to pair the two.
         self.state.reset();
         self.state.zero_decode_caches(gpu);
+        gpu.invalidate_graph_state();
         Ok(())
     }
 

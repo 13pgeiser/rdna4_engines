@@ -364,6 +364,251 @@ pub fn ep_emit_token(stdout: &mut std::io::Stdout, id: &str, piece: &str) {
     let _ = stdout.flush();
 }
 
+// ── Shared mesh forward entrypoints ───────────────────────────────────────
+// One definition of each expert-/tensor-parallel prefill and decode forward.
+// The serve loops below and the daemon's synthetic `bench_prefill` /
+// `bench_decode` probes (`crate::bench_topology`) both call these, so the
+// benchmark times the forward `serve` runs and never a second copy of it.
+
+/// Dense-TP prefill chunk length: the rank's prefill batch, not a fixed 32 (M=32
+/// misses the MMQ batch floor and fires the per-layer collectives 16x more often
+/// than the chunk the TP prefill re-chunks to internally).
+pub fn dense_tp_prefill_chunk_len(m: &LoadedModel) -> Result<usize, String> {
+    match m.ep.as_ref() {
+        Some(EpState { gpus, .. }) => {
+            Ok(qwen35::prefill_max_batch_tp(&gpus.devices[0], gpus.devices.len()).max(1))
+        }
+        None => Err("dense TP serve without EP state".to_string()),
+    }
+}
+
+/// One dense-TP prefill chunk written at absolute position `start_pos`.
+pub fn dense_tp_prefill_chunk(
+    m: &mut LoadedModel,
+    chunk: &[u32],
+    start_pos: usize,
+) -> Result<(), String> {
+    let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+        return Err("dense TP prefill without EP state".to_string());
+    };
+    let EpArch::Qwen35DenseTp {
+        shard,
+        configs,
+        weights,
+        kv_caches,
+        dn_states,
+        scratches,
+    } = inner
+    else {
+        return Err("EP arch mismatch (expected dense Qwen TP)".to_string());
+    };
+    qwen35::forward_prefill_dense_tp(
+        gpus, shard, weights, configs, chunk, start_pos, kv_caches, dn_states, scratches,
+    )
+    .map_err(|e| format!("dense TP prefill: {e:?}"))
+}
+
+/// One dense-TP single-token decode forward at KV position `pos`.
+pub fn dense_tp_decode_forward(m: &mut LoadedModel, token: u32, pos: usize) -> Result<(), String> {
+    let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+        return Err("dense TP decode without EP state".to_string());
+    };
+    let EpArch::Qwen35DenseTp {
+        shard,
+        configs,
+        weights,
+        kv_caches,
+        dn_states,
+        scratches,
+    } = inner
+    else {
+        return Err("EP arch mismatch (expected dense Qwen TP)".to_string());
+    };
+    qwen35::forward_scratch_dense_tp(
+        gpus, shard, weights, configs, token, pos, kv_caches, dn_states, scratches,
+    )
+    .map_err(|e| format!("dense TP decode: {e:?}"))
+}
+
+/// One batched Qwen3.5-MoE EP prefill window starting at `off` into
+/// `prompt_ids`; returns the end offset. Windows are `<=` the common prefill
+/// scratch `max_batch`; the absolute `start_pos` is the window offset (the
+/// caller reset KV/DN). Scratch source: load-owned `prefill_pbs` /
+/// `prefill_partials` when `batch` is `None`; when a batch owner is staged the
+/// loader drains those and the sequential fallthrough reuses the batch seed
+/// scratch via `sequential_prefill_scratch_mut`. Missing or empty scratch
+/// fails closed before any GPU mutation. No token fallback.
+pub fn qwen35_moe_ep_prefill_window(
+    m: &mut LoadedModel,
+    prompt_ids: &[u32],
+    off: usize,
+) -> Result<usize, String> {
+    let prompt_n = prompt_ids.len();
+    let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+        return Err("qwen35 MoE EP prefill without EP state".to_string());
+    };
+    let EpArch::Qwen35 {
+        config,
+        weights,
+        kv_caches,
+        dn_states,
+        scratches,
+        batch,
+        prefill_pbs,
+        prefill_partials,
+        ..
+    } = inner
+    else {
+        return Err("EP arch mismatch (expected qwen35 MoE EP)".to_string());
+    };
+    let n_rank = gpus.devices.len();
+    // Select prefill scratch once per window: seed when batch staged, else
+    // load-owned sequential buffers.
+    if let Some(batch_state) = batch.as_mut() {
+        // Disjoint borrow from the concrete batch owner: seed scratch plus the
+        // SAME live lease `prefill_lane`/`forward_tick` reduce under, so the MoE
+        // partial sum uses the leased rooted API the lease guard requires. No
+        // new pool, no re-acquire, no release.
+        let (pbs, parts, peer_lease) = batch_state.sequential_prefill_scratch_mut();
+        if pbs.is_empty() || parts.is_empty() || pbs.len() != n_rank || parts.len() != n_rank {
+            Err("qwen35 MoE EP prefill missing batch seed scratch".to_string())
+        } else {
+            let max_batch = pbs[0].max_batch;
+            if max_batch == 0 {
+                Err("qwen35 MoE EP prefill seed max_batch is zero".to_string())
+            } else {
+                let end = (off + max_batch).min(prompt_n);
+                let start_pos = off;
+                qwen35::forward_prefill_batch_ep(
+                    gpus,
+                    weights,
+                    config,
+                    &prompt_ids[start_pos..end],
+                    start_pos,
+                    kv_caches,
+                    dn_states,
+                    scratches,
+                    pbs,
+                    parts,
+                    peer_lease,
+                )
+                .map(|_| end)
+                .map_err(|e| format!("qwen35 MoE EP prefill: {e:?}"))
+            }
+        }
+    } else if prefill_pbs.is_empty()
+        || prefill_partials.is_empty()
+        || prefill_pbs.len() != n_rank
+        || prefill_partials.len() != n_rank
+    {
+        Err("qwen35 MoE EP prefill missing load-owned prefill scratch".to_string())
+    } else {
+        let max_batch = prefill_pbs[0].max_batch;
+        if max_batch == 0 {
+            Err("qwen35 MoE EP prefill scratch max_batch is zero".to_string())
+        } else {
+            let end = (off + max_batch).min(prompt_n);
+            let start_pos = off;
+            // Plain sequential without batch: no live lease, so the unleased
+            // selection inside is unchanged.
+            qwen35::forward_prefill_batch_ep(
+                gpus,
+                weights,
+                config,
+                &prompt_ids[start_pos..end],
+                start_pos,
+                kv_caches,
+                dn_states,
+                scratches,
+                prefill_pbs,
+                prefill_partials,
+                None,
+            )
+            .map(|_| end)
+            .map_err(|e| format!("qwen35 MoE EP prefill: {e:?}"))
+        }
+    }
+}
+
+/// One Qwen3.5-MoE EP single-token decode forward at KV position `pos`.
+pub fn qwen35_moe_ep_decode_forward(
+    m: &mut LoadedModel,
+    token: u32,
+    pos: usize,
+) -> Result<(), String> {
+    let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+        return Err("qwen35 MoE EP decode without EP state".to_string());
+    };
+    let EpArch::Qwen35 {
+        config,
+        weights,
+        kv_caches,
+        dn_states,
+        scratches,
+        partials,
+        batch,
+        ..
+    } = inner
+    else {
+        return Err("EP arch mismatch (expected qwen35 MoE EP)".to_string());
+    };
+    // Batch-staged sequential fallback borrows the SAME live lease the batch
+    // owner reduces under; ordinary sequential keeps None.
+    let peer_lease = batch.as_ref().and_then(|b| b.peer_reduce_lease());
+    qwen35::forward_ep(
+        gpus, weights, config, token, pos, kv_caches, dn_states, scratches, partials, peer_lease,
+    )
+    .map_err(|e| format!("qwen35 MoE EP decode: {e:?}"))
+}
+
+/// DeepSeek4 EP prompt prefill from position 0: the batched chunked route when
+/// the load staged its prefill scratch, else the token-at-a-time `forward_ep`.
+/// `aborted` is polled before a batched prefill and before every token of the
+/// token loop; `Ok(true)` means it fired (nothing further ran). `Err` carries
+/// the wire message, already quote-sanitized.
+pub fn ds4_ep_prefill(
+    m: &mut LoadedModel,
+    prompt_ids: &[u32],
+    mut aborted: impl FnMut() -> bool,
+) -> Result<bool, String> {
+    let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
+        return Err("EP arch mismatch (expected ds4)".to_string());
+    };
+    let EpArch::Ds4 {
+        config,
+        weights,
+        state,
+        partials,
+        prefill,
+    } = inner
+    else {
+        return Err("EP arch mismatch (expected ds4)".to_string());
+    };
+    if !prefill.is_empty() {
+        if aborted() {
+            return Ok(true);
+        }
+        deepseek4::forward::forward_ep_prefill_batch_chunked(
+            gpus, weights, config, state, prefill, prompt_ids, 0,
+        )
+        .map_err(|e| {
+            format!(
+                "forward_ep batched prefill: {}",
+                format!("{e}").replace('"', "'")
+            )
+        })?;
+    } else {
+        for (pos, &t) in prompt_ids.iter().enumerate() {
+            if aborted() {
+                return Ok(true);
+            }
+            deepseek4::forward::forward_ep(gpus, weights, config, state, partials, t, pos as u32)
+                .map_err(|e| format!("forward_ep prefill: {}", format!("{e}").replace('"', "'")))?;
+        }
+    }
+    Ok(false)
+}
+
 /// Dense Qwen TP2..TP5 serving loop with batched tensor-parallel prefill and
 /// Qwen contract-v2 semantic streaming.
 #[allow(clippy::too_many_arguments)]
@@ -442,19 +687,10 @@ pub fn ep_serve_qwen35_dense_tp(
     // batch floor (128) and fires the per-layer collectives 16x more often
     // than the chunk the TP prefill re-chunks to internally (8k prompt on
     // 2x gfx1100: 72.1 -> 54.7 s wall).
-    let tp_prefill_chunk = match m.ep.as_ref() {
-        Some(EpState { gpus, .. }) => {
-            qwen35::prefill_max_batch_tp(&gpus.devices[0], gpus.devices.len()).max(1)
-        }
-        None => {
-            dense_tp_fail_closed_error(
-                m,
-                stdout,
-                id,
-                "dense TP serve without EP state",
-                "validation",
-                false,
-            );
+    let tp_prefill_chunk = match dense_tp_prefill_chunk_len(m) {
+        Ok(chunk) => chunk,
+        Err(message) => {
+            dense_tp_fail_closed_error(m, stdout, id, &message, "validation", false);
             let _ = stdout.flush();
             return;
         }
@@ -470,58 +706,8 @@ pub fn ep_serve_qwen35_dense_tp(
             );
             return;
         }
-        let result = {
-            let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
-                dense_tp_fail_closed_error(
-                    m,
-                    stdout,
-                    id,
-                    "dense TP prefill without EP state",
-                    "validation",
-                    false,
-                );
-                return;
-            };
-            let EpArch::Qwen35DenseTp {
-                shard,
-                configs,
-                weights,
-                kv_caches,
-                dn_states,
-                scratches,
-            } = inner
-            else {
-                dense_tp_fail_closed_error(
-                    m,
-                    stdout,
-                    id,
-                    "EP arch mismatch (expected dense Qwen TP)",
-                    "validation",
-                    false,
-                );
-                return;
-            };
-            qwen35::forward_prefill_dense_tp(
-                gpus,
-                shard,
-                weights,
-                configs,
-                chunk,
-                chunk_index * tp_prefill_chunk,
-                kv_caches,
-                dn_states,
-                scratches,
-            )
-        };
-        if let Err(e) = result {
-            dense_tp_fail_closed_error(
-                m,
-                stdout,
-                id,
-                &format!("dense TP prefill: {e:?}"),
-                "validation",
-                false,
-            );
+        if let Err(message) = dense_tp_prefill_chunk(m, chunk, chunk_index * tp_prefill_chunk) {
+            dense_tp_fail_closed_error(m, stdout, id, &message, "validation", false);
             let _ = stdout.flush();
             return;
         }
@@ -593,26 +779,7 @@ pub fn ep_serve_qwen35_dense_tp(
 
         // KV write before any client-visible classify/emit (same contract as AR).
         let write_pos = m.seq_pos;
-        let forward_result: Result<(), String> = (|| {
-            let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
-                return Err("dense TP decode without EP state".to_string());
-            };
-            let EpArch::Qwen35DenseTp {
-                shard,
-                configs,
-                weights,
-                kv_caches,
-                dn_states,
-                scratches,
-            } = inner
-            else {
-                return Err("EP arch mismatch (expected dense Qwen TP)".to_string());
-            };
-            qwen35::forward_scratch_dense_tp(
-                gpus, shard, weights, configs, next, write_pos, kv_caches, dn_states, scratches,
-            )
-            .map_err(|e| format!("dense TP decode: {e:?}"))
-        })();
+        let forward_result: Result<(), String> = dense_tp_decode_forward(m, next, write_pos);
         if let Err(message) = forward_result {
             dense_tp_fail_closed_error(m, stdout, id, &message, "validation", false);
             return;
@@ -875,112 +1042,7 @@ pub fn ep_serve_qwen35_moe(
             aborted_in_prefill = true;
             break;
         }
-        let result = {
-            let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
-                qwen35_moe_fail_closed_error(
-                    m,
-                    stdout,
-                    id,
-                    "qwen35 MoE EP prefill without EP state",
-                    "validation",
-                    false,
-                );
-                return;
-            };
-            let EpArch::Qwen35 {
-                config,
-                weights,
-                kv_caches,
-                dn_states,
-                scratches,
-                batch,
-                prefill_pbs,
-                prefill_partials,
-                ..
-            } = inner
-            else {
-                qwen35_moe_fail_closed_error(
-                    m,
-                    stdout,
-                    id,
-                    "EP arch mismatch (expected qwen35 MoE EP)",
-                    "validation",
-                    false,
-                );
-                return;
-            };
-            let n_rank = gpus.devices.len();
-            // Select prefill scratch once per window: seed when batch staged,
-            // else load-owned sequential buffers.
-            if let Some(batch_state) = batch.as_mut() {
-                // Disjoint borrow from the concrete batch owner: seed scratch plus
-                // the SAME live lease `prefill_lane`/`forward_tick` reduce under,
-                // so the MoE partial sum uses the leased rooted API the lease
-                // guard requires. No new pool, no re-acquire, no release.
-                let (pbs, parts, peer_lease) = batch_state.sequential_prefill_scratch_mut();
-                if pbs.is_empty()
-                    || parts.is_empty()
-                    || pbs.len() != n_rank
-                    || parts.len() != n_rank
-                {
-                    Err("qwen35 MoE EP prefill missing batch seed scratch".to_string())
-                } else {
-                    let max_batch = pbs[0].max_batch;
-                    if max_batch == 0 {
-                        Err("qwen35 MoE EP prefill seed max_batch is zero".to_string())
-                    } else {
-                        let end = (off + max_batch).min(prompt_n);
-                        let start_pos = off;
-                        qwen35::forward_prefill_batch_ep(
-                            gpus,
-                            weights,
-                            config,
-                            &prompt_ids[start_pos..end],
-                            start_pos,
-                            kv_caches,
-                            dn_states,
-                            scratches,
-                            pbs,
-                            parts,
-                            peer_lease,
-                        )
-                        .map(|_| end)
-                        .map_err(|e| format!("qwen35 MoE EP prefill: {e:?}"))
-                    }
-                }
-            } else if prefill_pbs.is_empty()
-                || prefill_partials.is_empty()
-                || prefill_pbs.len() != n_rank
-                || prefill_partials.len() != n_rank
-            {
-                Err("qwen35 MoE EP prefill missing load-owned prefill scratch".to_string())
-            } else {
-                let max_batch = prefill_pbs[0].max_batch;
-                if max_batch == 0 {
-                    Err("qwen35 MoE EP prefill scratch max_batch is zero".to_string())
-                } else {
-                    let end = (off + max_batch).min(prompt_n);
-                    let start_pos = off;
-                    // Plain sequential without batch: no live lease, so the
-                    // unleased selection inside is unchanged.
-                    qwen35::forward_prefill_batch_ep(
-                        gpus,
-                        weights,
-                        config,
-                        &prompt_ids[start_pos..end],
-                        start_pos,
-                        kv_caches,
-                        dn_states,
-                        scratches,
-                        prefill_pbs,
-                        prefill_partials,
-                        None,
-                    )
-                    .map(|_| end)
-                    .map_err(|e| format!("qwen35 MoE EP prefill: {e:?}"))
-                }
-            }
-        };
+        let result = qwen35_moe_ep_prefill_window(m, prompt_ids, off);
         match result {
             Ok(end) => off = end,
             Err(message) => {
@@ -1058,32 +1120,7 @@ pub fn ep_serve_qwen35_moe(
 
         // KV write before any client-visible classify/emit (same contract as AR).
         let write_pos = m.seq_pos;
-        let forward_result: Result<(), String> = (|| {
-            let Some(EpState { gpus, inner }) = m.ep.as_mut() else {
-                return Err("qwen35 MoE EP decode without EP state".to_string());
-            };
-            let EpArch::Qwen35 {
-                config,
-                weights,
-                kv_caches,
-                dn_states,
-                scratches,
-                partials,
-                batch,
-                ..
-            } = inner
-            else {
-                return Err("EP arch mismatch (expected qwen35 MoE EP)".to_string());
-            };
-            // Batch-staged sequential fallback borrows the SAME live lease the
-            // batch owner reduces under; ordinary sequential keeps None.
-            let peer_lease = batch.as_ref().and_then(|b| b.peer_reduce_lease());
-            qwen35::forward_ep(
-                gpus, weights, config, next, write_pos, kv_caches, dn_states, scratches, partials,
-                peer_lease,
-            )
-            .map_err(|e| format!("qwen35 MoE EP decode: {e:?}"))
-        })();
+        let forward_result: Result<(), String> = qwen35_moe_ep_decode_forward(m, next, write_pos);
         if let Err(message) = forward_result {
             qwen35_moe_fail_closed_error(m, stdout, id, &message, "validation", false);
             return;
@@ -1655,95 +1692,26 @@ pub fn ep_serve_ds4(
     );
 
     let t_prefill = Instant::now();
-    // FIX #1 (ep-prefill-abort): set when check_abort fires inside the prefill
-    // loop. Declared outside the borrow scope so the post-loop abort guard can
-    // read it after the `gpus`/`state` borrow is dropped.
-    let mut aborted_in_prefill = false;
-    {
-        let EpState { gpus, inner } = m.ep.as_mut().unwrap();
-        let EpArch::Ds4 {
-            config,
-            weights,
-            state,
-            partials,
-            prefill,
-        } = inner
-        else {
+    // FIX #1 (ep-prefill-abort): the shared prefill checks the cancel signal at
+    // the top of every prefill iteration (and once before a batched prefill),
+    // not just after it; `aborted_in_prefill` is consumed by the post-prefill
+    // abort guard below once the `gpus`/`state` borrow is dropped.
+    let aborted_in_prefill = match ds4_ep_prefill(m, prompt_ids, || check_abort(id)) {
+        Ok(aborted) => aborted,
+        Err(message) => {
             crate::ar::emit_generation_error(
                 crate::ar::GenerationRoute::Deepseek4Ep,
                 stdout,
                 Some(id),
-                "EP arch mismatch (expected ds4)",
+                &message,
                 "validation",
                 false,
                 false,
             );
             let _ = stdout.flush();
             return;
-        };
-        if !prefill.is_empty() {
-            if check_abort(id) {
-                aborted_in_prefill = true;
-            } else if let Err(e) = deepseek4::forward::forward_ep_prefill_batch_chunked(
-                gpus,
-                weights,
-                config,
-                state,
-                prefill,
-                &prompt_ids,
-                0,
-            ) {
-                crate::ar::emit_generation_error(
-                    crate::ar::GenerationRoute::Deepseek4Ep,
-                    stdout,
-                    Some(id),
-                    &format!(
-                        "forward_ep batched prefill: {}",
-                        format!("{e}").replace('"', "'")
-                    ),
-                    "validation",
-                    false,
-                    false,
-                );
-                let _ = stdout.flush();
-                return;
-            }
-        } else {
-            for (pos, &t) in prompt_ids.iter().enumerate() {
-                // FIX #1 (ep-prefill-abort): check the cancel signal at the TOP of
-                // every prefill iteration, not just after the loop. A long prompt
-                // (thousands of tokens) means the post-loop check below would still
-                // run the entire multi-GPU prefill before honoring a cancel. Mirror
-                // the decode loop: on abort, emit aborted+done, reset KV cursors,
-                // and stop. We must drop the `gpus`/`state` borrow before calling
-                // `ep_emit_abort` (which re-borrows `m.ep`), so break out and let
-                // the post-loop guard fire — but set the abort flag is consumed by
-                // check_abort, so call it here and short-circuit via a flag.
-                if check_abort(id) {
-                    // Drop the EpState borrow by breaking; the post-loop guard
-                    // re-checks via a sentinel. Simpler: emit + return is blocked
-                    // by the borrow, so we set `aborted` and break.
-                    aborted_in_prefill = true;
-                    break;
-                }
-                if let Err(e) = deepseek4::forward::forward_ep(
-                    gpus, weights, config, state, partials, t, pos as u32,
-                ) {
-                    crate::ar::emit_generation_error(
-                        crate::ar::GenerationRoute::Deepseek4Ep,
-                        stdout,
-                        Some(id),
-                        &format!("forward_ep prefill: {}", format!("{e}").replace('"', "'")),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    return;
-                }
-            }
         }
-    }
+    };
     // FIX #1 / FIX #3 (ep-no-abort): a client cancel during the (potentially
     // long) prefill should stop here instead of running the whole decode loop.
     // `aborted_in_prefill` is set when check_abort fired mid-loop (it already
@@ -10666,7 +10634,7 @@ pub fn generate_qwen4_ar(
 /// Disjoint borrows of the Qwen4 bundle and the model's PP `Gpus` (`Some` only
 /// for a pipeline-parallel load), so a mesh forward can run the bundle against
 /// the `Gpus` without a second owner.
-fn qwen4_bundle_and_mesh(
+pub(crate) fn qwen4_bundle_and_mesh(
     model: &mut LoadedModel,
 ) -> Option<(
     &mut hipfire_arch_qwen4::bundle::Qwen4Bundle,
