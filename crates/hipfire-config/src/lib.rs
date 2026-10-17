@@ -2569,7 +2569,7 @@ pub static FIELDS: &[ConfigField] = &[
         ValueRule::Integer { min: 2, max: 1048576 },
         false,
         "HIPFIRE_PREFILL_CHUNK_ROWS",
-        "Widened ordinary-prefill chunk ceiling in rows (arch default 8192 on exact gfx1100/gfx1151/gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH overrides; per-device VRAM admission may select a smaller rung). Qwen4 (Flash-Next) rounds it down to 256 rows; its placement chunk (what the auto expert placement is sized from) is the explicit value, else 8192 on exact gfx1151, 4096 on exact gfx1201, 1536 elsewhere, and never reads the host link; exact gfx1100 on a measured narrow discrete host link (below 16 GB/s, probed after placement is frozen) additionally has an 8192-row ceiling admitted only from the VRAM the frozen placement leaves (an explicit 8192 instead charges the 8192-row reserve and keeps fewer resident expert layers)."
+        "Widened ordinary-prefill chunk ceiling in rows (arch default 8192 on exact gfx1100/gfx1151/gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH overrides; per-device VRAM admission may select a smaller rung). Qwen4 (Flash-Next) rounds it down to 256 rows; its auto expert placement is sized from the same chunk: the explicit value, else 8192 on exact gfx1151, 4096 on exact gfx1201, 1536 elsewhere; exact gfx1100 on a measured narrow discrete host link (below 16 GB/s, probed before placement is sized) defaults to 8192, ceding resident expert layers for the wider chunk (an explicit value never probes and is authoritative for placement; 1536 opts out)."
     ),
     process_bool_field!(
         "speculation.draft_f16",

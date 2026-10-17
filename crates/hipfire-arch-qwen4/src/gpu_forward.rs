@@ -95,19 +95,17 @@ const GFX1100_NARROW_LINK_PREFILL_CHUNK_ROWS: usize = 8192;
 /// +14.1% over 2048 rows (16 layers) at -2.9% tg64; 8192 rows (11 layers)
 /// measured +22.6% at -6.9% tg64.
 ///
-/// gfx1100 keeps 1536 as its *placement* chunk ([`qwen4_prefill_chunk_baseline_default`],
-/// [`qwen4_prefill_chunk_placement_requested`]) and takes 8192 as an
-/// *opportunistic ceiling* on a narrow discrete host link
+/// gfx1100 takes 8192 only on a measured narrow discrete host link
 /// ([`crate::host_link::HostLink::is_narrow_discrete`], measured below
-/// 16 GB/s): every chunk re-streams the host experts through the narrow link,
-/// so the chunk's row count divides that cost, and G2 staging
-/// ([`crate::host_link::expert_stage_default`]) hides the copy behind the
-/// chunk's compute. The expert placement is sized from the placement chunk and
-/// frozen first; the ceiling is spent only on the residual VRAM the frozen
-/// placement leaves ([`crate::expert_residency::admit_prefill_chunk`]), so a
-/// wider chunk never evicts a resident expert layer. `link` is only evaluated
-/// for gfx1100, so no other arch pays for the probe here. Other architectures
-/// keep the measured 1536.
+/// 16 GB/s; the same predicate as the G2 default,
+/// [`crate::host_link::expert_stage_default`]): every chunk re-streams the
+/// host experts through the narrow link, so the chunk's row count divides
+/// that cost, and G2 staging hides the copy behind the chunk's compute. The
+/// expert placement is sized from this same chunk
+/// ([`qwen4_prefill_chunk_requested`]), so the 8192-row reserve cedes
+/// resident expert layers there; fast, unmeasured and unified links keep
+/// 1536. `link` is only evaluated for gfx1100, so no other arch pays for the
+/// probe here. Other architectures keep the measured 1536.
 pub fn qwen4_prefill_chunk_default(
     arch: &str,
     link: impl FnOnce() -> crate::host_link::HostLink,
@@ -118,9 +116,9 @@ pub fn qwen4_prefill_chunk_default(
     }
 }
 
-/// The probe-free default chunk every placement charge is sized from (the
-/// pre-link-policy defaults): gfx1151 8192, gfx1201 4096, gfx942 and every
-/// other arch 1536. Never reads the host link.
+/// The default chunk before any link policy: gfx1151 8192, gfx1201 4096,
+/// gfx942 and every other arch 1536. Never reads the host link; gfx1100 uses
+/// it unless [`qwen4_prefill_chunk_default`] sees a narrow discrete link.
 pub fn qwen4_prefill_chunk_baseline_default(arch: &str) -> usize {
     match arch {
         "gfx1151" => 8192,
@@ -130,16 +128,18 @@ pub fn qwen4_prefill_chunk_baseline_default(arch: &str) -> usize {
     }
 }
 
-/// Requested prefill chunk ceiling: `prefill.chunk_rows`
+/// Requested prefill chunk: `prefill.chunk_rows`
 /// (`HIPFIRE_PREFILL_CHUNK_ROWS`) rounded down to whole 256-row GEMM tiles,
 /// else [`qwen4_prefill_chunk_default`] for `gpu` (its host link is measured
-/// once per device, see [`crate::host_link`]); never above `max_seq`. An
-/// explicit value never probes. Load-time admission
+/// once per device, see [`crate::host_link`], and only on gfx1100); never
+/// above `max_seq`. An explicit value never probes. Load-time admission
 /// ([`qwen4_prefill_chunk_rungs`]) may still pick a smaller rung.
 ///
-/// This is the opportunistic ceiling, not the chunk the expert placement is
-/// sized from: the loader sizes placement from
-/// [`qwen4_prefill_chunk_placement_requested`] before anything probes.
+/// This is also the chunk the loader sizes the expert placement reserve,
+/// forward census and pool workspace from, so on a measured narrow discrete
+/// gfx1100 link the default 8192 rows are charged to the placement (ceding
+/// resident expert layers), and an explicit `HIPFIRE_PREFILL_CHUNK_ROWS`
+/// stays authoritative for placement and chunk alike.
 pub fn qwen4_prefill_chunk_requested(gpu: &Gpu, max_seq: usize) -> usize {
     prefill_chunk_requested_from(
         &gpu.arch,
@@ -149,36 +149,6 @@ pub fn qwen4_prefill_chunk_requested(gpu: &Gpu, max_seq: usize) -> usize {
         max_seq,
         || crate::host_link::host_link(gpu),
     )
-}
-
-/// The chunk the expert placement reserve, forward census and pool workspace
-/// are sized from: `prefill.chunk_rows` (`HIPFIRE_PREFILL_CHUNK_ROWS`, rounded
-/// down to 256-row tiles, authoritative) else
-/// [`qwen4_prefill_chunk_baseline_default`]; never above `max_seq`. Takes the
-/// arch string only, so it can never probe the host link: placement is
-/// resolved from it before the link is measured, and an explicit
-/// `HIPFIRE_PREFILL_CHUNK_ROWS=8192` still charges the 8192-row reserve (the
-/// opt-in that trades resident expert layers for a wider chunk).
-pub fn qwen4_prefill_chunk_placement_requested(arch: &str, max_seq: usize) -> usize {
-    prefill_chunk_placement_requested_from(
-        arch,
-        hipfire_config::developer_var("HIPFIRE_PREFILL_CHUNK_ROWS")
-            .ok()
-            .as_deref(),
-        max_seq,
-    )
-}
-
-/// [`qwen4_prefill_chunk_placement_requested`] with the
-/// `HIPFIRE_PREFILL_CHUNK_ROWS` value supplied.
-pub(crate) fn prefill_chunk_placement_requested_from(
-    arch: &str,
-    env: Option<&str>,
-    max_seq: usize,
-) -> usize {
-    explicit_prefill_chunk_rows(env)
-        .unwrap_or_else(|| qwen4_prefill_chunk_baseline_default(arch))
-        .min(max_seq)
 }
 
 /// The explicit `HIPFIRE_PREFILL_CHUNK_ROWS` value rounded down to whole
@@ -480,9 +450,10 @@ const QWEN4_QSA_INLINE_CAPACITY: usize = 12;
 /// the borrowed-donor (packed) stage on any discrete device whose measured H2D
 /// link is narrow, below 16 GB/s ([`crate::host_link::expert_stage_default`]);
 /// it stays off for unified memory and when the link could not be measured.
-/// Placement is not touched, and never probes: expert placement is sized with
-/// the probe-free switch ([`crate::expert_residency::expert_stage_placement_enabled`],
-/// explicit value else gfx1201) and frozen before the link is measured. A
+/// The stage switch itself never changes placement: the expert placement
+/// charges the probe-free switch
+/// ([`crate::expert_residency::expert_stage_placement_enabled`], explicit
+/// value else gfx1201), not this link-aware default. A
 /// staged prefill borrows the VRAM of the last two resident expert layers as
 /// its two DMA stages (no dedicated VRAM; slab and tier layouts, which would
 /// allocate dedicated buffers, stage only under the probe-free switch), and
@@ -3824,7 +3795,7 @@ impl Qwen4ExpertStage {
         // switch charges to the frozen placement
         // (`expert_stage_placement_enabled`: explicit `1`, or gfx1201); a
         // default turned on by the measured link alone would allocate bytes no
-        // placement or chunk admission reserved, so it keeps the zero-copy
+        // placement reserved, so it keeps the zero-copy
         // mapped reads instead.
         if moe.iter().flatten().any(|layer| layer.slab.is_some())
             || bundle.weights.expert_tiers().is_some()
@@ -10942,7 +10913,7 @@ mod tests {
             }),
             2048
         );
-        // The admitted ceiling still caps it, and rung admission can step down.
+        // max_seq still caps it, and the attach-time rung search can step down.
         assert_eq!(
             prefill_chunk_requested_from("gfx1100", None, 4096, || Discrete { gbps: 8.0 }),
             4096
@@ -10954,44 +10925,63 @@ mod tests {
     }
 
     #[test]
-    fn placement_chunk_is_probe_free_and_never_follows_the_link_default() {
-        use super::{
-            prefill_chunk_placement_requested_from as placement, prefill_chunk_requested_from,
-        };
-        use crate::host_link::HostLink::Discrete;
-        // The beta defaults, whatever the link: gfx1100 keeps its 1536 placement
-        // chunk even where the opportunistic ceiling is 8192.
+    fn placement_chunk_is_the_requested_chunk_and_only_gfx1100_reads_the_link() {
+        use super::prefill_chunk_requested_from as chunk;
+        use crate::host_link::HostLink::{Discrete, Unified, Unmeasured};
+        // The expert placement reserve is sized from the requested chunk, so
+        // a measured narrow discrete gfx1100 link is the one default that
+        // places for 8192 rows (ceding resident layers); every other link
+        // on gfx1100 keeps its 1536-row placement.
+        assert_eq!(
+            chunk("gfx1100", None, usize::MAX, || Discrete { gbps: 7.1 }),
+            8192
+        );
+        for link in [
+            Discrete { gbps: 16.0 },
+            Discrete { gbps: 26.0 },
+            Unmeasured,
+            Unified,
+        ] {
+            assert_eq!(chunk("gfx1100", None, usize::MAX, || link), 1536, "{link:?}");
+        }
+        // Every other arch keeps its baseline and never evaluates the link
+        // (gfx1201, gfx1151 and the rest never probe).
         for (arch, rows) in [
-            ("gfx1100", 1536),
             ("gfx1151", 8192),
             ("gfx1201", 4096),
             ("gfx942", 1536),
             ("gfx1030", 1536),
         ] {
-            assert_eq!(placement(arch, None, usize::MAX), rows, "{arch}");
             assert_eq!(super::qwen4_prefill_chunk_baseline_default(arch), rows);
+            assert_eq!(
+                chunk(arch, None, usize::MAX, || unreachable!("probed")),
+                rows,
+                "{arch}"
+            );
         }
+        // An explicit value is authoritative on every arch and link and never
+        // probes, rounded to tiles and capped by max_seq; unparsable or
+        // sub-tile values fall back to the default for the link.
+        let probe = || unreachable!("probed");
+        assert_eq!(chunk("gfx1100", Some("8192"), usize::MAX, probe), 8192);
+        assert_eq!(chunk("gfx1100", Some("1536"), usize::MAX, probe), 1536);
+        assert_eq!(chunk("gfx1100", Some(" 2100 "), usize::MAX, probe), 2048);
+        assert_eq!(chunk("gfx1100", Some("8192"), 4096, probe), 4096);
         assert_eq!(
-            prefill_chunk_requested_from("gfx1100", None, usize::MAX, || Discrete { gbps: 7.1 }),
-            8192,
-            "the ceiling above the placement chunk is the link default"
+            chunk("gfx1100", Some("128"), usize::MAX, || Unmeasured),
+            1536
         );
-        // An explicit value is authoritative for placement too (the opt-in
-        // that trades resident layers for a wider chunk), rounded to tiles and
-        // capped by max_seq; unparsable or sub-tile values fall back.
-        assert_eq!(placement("gfx1100", Some("8192"), usize::MAX), 8192);
-        assert_eq!(placement("gfx1100", Some(" 2100 "), usize::MAX), 2048);
-        assert_eq!(placement("gfx1100", Some("8192"), 4096), 4096);
-        assert_eq!(placement("gfx1100", Some("128"), usize::MAX), 1536);
-        assert_eq!(placement("gfx1100", Some("junk"), usize::MAX), 1536);
-        assert_eq!(placement("gfx1100", None, 1024), 1024);
-        // Explicit placement and ceiling agree, so the opt-in never widens
-        // past what the reserve was sized for.
         assert_eq!(
-            prefill_chunk_requested_from("gfx1100", Some("8192"), usize::MAX, || unreachable!(
-                "probed"
-            )),
-            placement("gfx1100", Some("8192"), usize::MAX)
+            chunk("gfx1100", Some("junk"), usize::MAX, || Unmeasured),
+            1536
+        );
+        assert_eq!(
+            chunk("gfx1100", Some("junk"), usize::MAX, || Discrete { gbps: 7.1 }),
+            8192
+        );
+        assert_eq!(
+            chunk("gfx1100", None, 1024, || Discrete { gbps: 7.1 }),
+            1024
         );
     }
 

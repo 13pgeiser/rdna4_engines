@@ -1333,10 +1333,9 @@ pub fn attach_qwen4_ep_peers(
 /// its native MTP and QSA gather parts,
 /// returned too. The one place this is computed, for the load and for
 /// [`qwen4_ep_vram_layers`]. `chunk_rows` is the chunk the reserve is sized
-/// from: the load passes the probe-free placement chunk
-/// ([`hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_placement_requested`])
-/// for the frozen placement, and each wider rung when it judges the residual
-/// ([`hipfire_arch_qwen4::expert_residency::admit_prefill_chunk`]).
+/// from: the load passes the requested prefill chunk
+/// ([`hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested`])
+/// for the placement.
 #[allow(clippy::too_many_arguments)]
 fn qwen4_placement_inputs(
     gpu: &rdna_compute::Gpu,
@@ -1660,10 +1659,7 @@ pub fn qwen4_ep_vram_layers(
         state_format,
         scratch_mode,
         ranks,
-        hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_placement_requested(
-            &gpu.arch,
-            shared.max_seq,
-        ),
+        hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(gpu, shared.max_seq),
     )?;
     // Same charges as each rank's load applies to an expert-parallel split
     // (no slab stage: `new_slab` has no EP route), so the agreed split never
@@ -2088,27 +2084,27 @@ fn load_qwen4_rank_scoped(
         })
     };
     // `native_mtp` as the placement sees it: the later host-spill decline
-    // must not move the reserve of a rung judged after the placement.
+    // must not move the reserve the placement was sized with.
     let placement_native_mtp = native_mtp;
     // The chunk the expert placement reserve, forward census and pool
-    // workspace are sized from: the probe-free placement chunk (explicit
-    // `HIPFIRE_PREFILL_CHUNK_ROWS`, else the arch baseline: gfx1100 stays
-    // 1536). The host link is never measured before the placement is
-    // resolved and frozen; the opportunistic wider ceiling is judged against
-    // the residual afterwards ([`residency::admit_prefill_chunk`]).
-    let placement_chunk =
-        hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_placement_requested(
-            &ctx.gpu.arch,
-            ctx.max_seq,
-        );
+    // workspace are sized from: the requested chunk (explicit
+    // `HIPFIRE_PREFILL_CHUNK_ROWS`, else the arch default). On gfx1100 that
+    // default measures the host link once (cached per device; a unified
+    // device is classified without a copy) and is 8192 only on a narrow
+    // discrete link, so the placement cedes resident layers for the wider
+    // chunk there. Every other arch and any explicit value never probes.
+    let placement_chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(
+        &*ctx.gpu,
+        ctx.max_seq,
+    );
     // What `auto` sizes its placement from: free VRAM, the non-expert and
     // per-layer expert bytes, and the reserve (with its native MTP and
-    // QSA gather parts) at `chunk_rows`. Unified memory charges context
+    // QSA gather parts) at `placement_chunk`. Unified memory charges context
     // arenas as committed (VMM: the first chunk's pages; legacy: all of
     // `max_seq`), never their virtual extent; a discrete card charges legacy
     // storage of `max_seq` whatever the backend, so VMM growth stays inside
     // the reserve and placement matches legacy.
-    let auto_inputs_at = |chunk_rows: usize| -> Result<(u64, u64, u64, residency::AutoReserve, Option<u64>, Option<u64>), String> {
+    let auto_inputs = || -> Result<(u64, u64, u64, residency::AutoReserve, Option<u64>, Option<u64>), String> {
         let (free, _) = ctx
             .gpu
             .device_mem_info()
@@ -2129,7 +2125,7 @@ fn load_qwen4_rank_scoped(
             state_format,
             scratch_mode,
             ep_ranks,
-            chunk_rows,
+            placement_chunk,
         )?;
         Ok((
             free as u64,
@@ -2140,16 +2136,15 @@ fn load_qwen4_rank_scoped(
             gather_bytes,
         ))
     };
-    let auto_inputs = || auto_inputs_at(placement_chunk);
     // What a whole-layer placement keeps free beyond the reserve: the safety
     // margin and, on a slab load that allocates them (`staged`), the two
     // dedicated long-prefill stage buffers sized from the largest layer.
     // The hot set path charges its own margin and tier-plan stage.
-    // The stage switch here is the probe-free placement switch (explicit
-    // `HIPFIRE_QWEN4_EXPERT_STAGE`, else gfx1201): placement is resolved
-    // before the host link is measured, and a dedicated stage the link alone
-    // would enable is refused at construction instead
-    // (`Qwen4ExpertStage::new`), so what is charged is what can allocate.
+    // The stage switch here is the placement switch that ignores the
+    // measured link (explicit `HIPFIRE_QWEN4_EXPERT_STAGE`, else gfx1201), so
+    // a dedicated stage the link alone would enable is not charged and is
+    // refused at construction instead (`Qwen4ExpertStage::new`): what is
+    // charged is what can allocate.
     let slab_stage = residency::dedicated_slab_stage(
         residency::expert_stage_placement_enabled(&ctx.gpu.arch),
         matches!(
@@ -2536,78 +2531,6 @@ fn load_qwen4_rank_scoped(
             hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextPacked { .. }
         )
         && ep.is_none();
-    // Placement-first chunk admission. The expert placement above is sized
-    // from `placement_chunk` and frozen; only then is the opportunistic
-    // ceiling (`qwen4_prefill_chunk_requested`, the one place the host link
-    // is measured) spent on the VRAM the frozen placement leaves, rung by
-    // rung with each rung's complete reserve against the original manifest
-    // (before `place_routed_experts` mutates it). Whole-device single loads
-    // only: expert parallelism, bands, unified memory and the hot set keep
-    // the placement chunk, exactly their previous behavior. `chunk_ceiling`
-    // is what `attach_forward` may use at most; it can narrow further there
-    // but never widen.
-    let admission_eligible = ep.is_none()
-        && band.is_none()
-        && !use_ranges
-        && hotset_plan.is_none()
-        && expert_vram_layers.is_none();
-    let mut chunk_ceiling = placement_chunk;
-    let admit_chunk = |free: Option<u64>,
-                       staged: bool,
-                       resident: u64|
-     -> Result<residency::PrefillChunkAdmission, String> {
-        // The placement's own free VRAM; when its path never queried it
-        // (an explicit layer count), read it before the link probe below.
-        let free = match free {
-            Some(free) => free,
-            None => {
-                ctx.gpu
-                    .device_mem_info()
-                    .map_err(|error| format!("qwen4: device memory query: {error}"))?
-                    .0 as u64
-            }
-        };
-        let requested = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(
-            &*ctx.gpu,
-            ctx.max_seq,
-        );
-        let (non_expert, layer_experts) =
-            residency::resident_split_ranks(&manifest.weights, bytes_of, ep_ranks)
-                .map_err(|error| format!("qwen4: {error}"))?;
-        let charges = placement_charges(layer_experts, staged)?;
-        residency::admit_prefill_chunk(
-            placement_chunk,
-            requested,
-            free,
-            non_expert,
-            resident,
-            &charges,
-            |rows| auto_inputs_at(rows).map(|inputs| inputs.3),
-        )
-    };
-    let log_admission = |admission: &residency::PrefillChunkAdmission, resident: u64| {
-        if admission.requested_rows > admission.placement_rows {
-            eprintln!(
-                "  qwen4 prefill chunk admission: expert placement frozen first ({} MiB routed experts resident, reserve sized for {} rows); {}",
-                resident / MIB,
-                admission.placement_rows,
-                admission.describe()
-            );
-        }
-    };
-    if admission_eligible && placement.is_none() {
-        let resident = residency::resident_routed_expert_bytes(&manifest.weights, bytes_of)
-            .map_err(|error| format!("qwen4: {error}"))?;
-        match admit_chunk(measured.as_ref().map(|inputs| inputs.0), false, resident) {
-            Ok(admission) => {
-                log_admission(&admission, resident);
-                chunk_ceiling = admission.admitted_rows;
-            }
-            Err(error) => eprintln!(
-                "  qwen4 prefill chunk admission: {error}; keeping the {placement_chunk}-row placement chunk"
-            ),
-        }
-    }
     let mut applied_layers = moe_layers;
     if let Some(policy) = placement {
         if use_ranges {
@@ -2616,7 +2539,6 @@ fn load_qwen4_rank_scoped(
                 residency::EXPERT_VRAM_LAYERS_ENV
             ));
         }
-        let mut placement_free = None::<u64>;
         let vram_layers = match policy {
             residency::ExpertVramLayers::Layers(layers) => layers,
             residency::ExpertVramLayers::Auto => {
@@ -2625,7 +2547,6 @@ fn load_qwen4_rank_scoped(
                         Some(inputs) => inputs,
                         None => auto_inputs()?,
                     };
-                placement_free = Some(free);
                 let gather_note = gather_bytes
                     .map(|bytes| format!(", {} MiB QSA gather scratch", bytes / MIB))
                     .unwrap_or_default();
@@ -2679,23 +2600,6 @@ fn load_qwen4_rank_scoped(
                 }
             }
         };
-        if admission_eligible {
-            let resident = residency::resident_routed_expert_bytes_after_placement(
-                &manifest.weights,
-                bytes_of,
-                vram_layers,
-            )
-            .map_err(|error| format!("qwen4: {error}"))?;
-            match admit_chunk(placement_free, true, resident) {
-                Ok(admission) => {
-                    log_admission(&admission, resident);
-                    chunk_ceiling = admission.admitted_rows;
-                }
-                Err(error) => eprintln!(
-                    "  qwen4 prefill chunk admission: {error}; keeping the {placement_chunk}-row placement chunk"
-                ),
-            }
-        }
         let moved = residency::place_routed_experts(&mut manifest.weights, vram_layers);
         applied_layers = vram_layers.min(config.num_hidden_layers);
         // This rank's pinned bytes; the host check covers every rank that
@@ -3022,7 +2926,7 @@ fn load_qwen4_rank_scoped(
             return Err(format!("qwen4: trunk overlay setup failed: {detail}"));
         }
     }
-    if let Err(error) = bundle.attach_forward(ctx.gpu, chunk_ceiling, scratch_mode) {
+    if let Err(error) = bundle.attach_forward(ctx.gpu, placement_chunk, scratch_mode) {
         let detail = error.to_string();
         let _ = bundle.free_gpu(ctx.gpu);
         return Err(format!("qwen4: forward setup failed: {detail}"));
@@ -3030,7 +2934,7 @@ fn load_qwen4_rank_scoped(
     if let Some(scope) = band {
         // `attach_forward` searches smaller chunk rungs when the largest does
         // not fit; a band never shrinks the canonical chunk on its own. A band
-        // keeps the placement chunk (no widening admission runs for it).
+        // keeps the placement chunk.
         let canonical = placement_chunk;
         if bundle.spec_chunk_rows() != Some(canonical) {
             let got = bundle.spec_chunk_rows();
@@ -3588,10 +3492,7 @@ fn load_qwen4_pp_bundle(
         let scratch_mode =
             q4::artifact::source_forward_scratch_mode(daemon, hfq, &config, &receipt.manifest)
                 .map_err(|error| error.to_string())?;
-        let chunk_rows = q4::gpu_forward::qwen4_prefill_chunk_placement_requested(
-            &daemon.arch,
-            shared.max_seq,
-        );
+        let chunk_rows = q4::gpu_forward::qwen4_prefill_chunk_requested(daemon, shared.max_seq);
         let context = q4::Qwen4ContextCommit::new(
             shared.backend,
             shared.max_seq,

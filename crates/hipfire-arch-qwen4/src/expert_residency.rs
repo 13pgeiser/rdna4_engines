@@ -1539,11 +1539,11 @@ fn expert_stage_switch(
     }
 }
 
-/// The probe-free stage switch every placement charge reads: the explicit
+/// The stage switch every placement charge reads: the explicit
 /// `HIPFIRE_QWEN4_EXPERT_STAGE` value, else gfx1201 only. It is
 /// [`expert_stage_enabled`] with the link taken as unmeasured, so it never
-/// measures the host link: the placement is resolved (and frozen) from the
-/// same free VRAM beta reads, before any probe. A dedicated stage (slab or
+/// reads the host link (the gfx1100 narrow-link chunk is the only way the
+/// link reaches the placement). A dedicated stage (slab or
 /// tier layout) is therefore charged only where it can actually allocate
 /// (`Qwen4ExpertStage::new` refuses those layouts otherwise); the borrowed
 /// packed stage is charged nothing, it lends resident donor layers.
@@ -1651,157 +1651,6 @@ impl PlacementCharges {
             self.stage / MIB
         )
     }
-}
-
-/// One prefill chunk rung's verdict against a frozen placement
-/// ([`admit_prefill_chunk`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PrefillRungVerdict {
-    pub rows: usize,
-    /// The complete reserve at this rung ([`AutoReserve::bytes`]: historical
-    /// floor or census, including workspace, native MTP and the full-context
-    /// obligations), not just chunk scratch.
-    pub reserve: u64,
-    /// Non-expert weights + the frozen resident experts + this rung's reserve
-    /// + [`PlacementCharges`] (margin and any dedicated stage).
-    pub need: u64,
-    pub fits: bool,
-}
-
-/// The chunk a load admits beside an already-frozen expert placement
-/// ([`admit_prefill_chunk`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PrefillChunkAdmission {
-    /// The chunk the frozen placement reserve was sized from.
-    pub placement_rows: usize,
-    /// The opportunistic ceiling (link default or explicit value).
-    pub requested_rows: usize,
-    /// The rows handed to `attach_forward` as its ceiling; never above
-    /// `requested_rows`, never below `placement_rows.min(requested_rows)`.
-    pub admitted_rows: usize,
-    /// Free VRAM every rung was judged against (the placement's own value).
-    pub free: u64,
-    /// Every rung above the placement chunk that was judged, largest first,
-    /// stopping at the first that fits.
-    pub tried: Vec<PrefillRungVerdict>,
-}
-
-impl PrefillChunkAdmission {
-    /// The load-log text: placement chunk, ceiling, admitted rows and each
-    /// judged rung's bytes.
-    pub fn describe(&self) -> String {
-        const MIB: u64 = 1 << 20;
-        let tried = self
-            .tried
-            .iter()
-            .map(|rung| {
-                format!(
-                    "{} rows: {} MiB reserve, {} MiB needed {} {} MiB free",
-                    rung.rows,
-                    rung.reserve / MIB,
-                    rung.need / MIB,
-                    if rung.fits { "<=" } else { ">" },
-                    self.free / MIB
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        format!(
-            "{} rows requested over the {}-row placement chunk, {} admitted{}",
-            self.requested_rows,
-            self.placement_rows,
-            self.admitted_rows,
-            if tried.is_empty() {
-                String::new()
-            } else {
-                format!(" [{tried}]")
-            }
-        )
-    }
-}
-
-/// Bytes one chunk rung needs beside the frozen placement:
-/// `non_expert + resident_experts + reserve + charges` (checked).
-pub fn prefill_rung_need(
-    non_expert: u64,
-    resident_experts: u64,
-    reserve: &AutoReserve,
-    charges: &PlacementCharges,
-) -> Result<u64, String> {
-    charges
-        .reserve(reserve.bytes())
-        .and_then(|reserve| {
-            non_expert
-                .checked_add(resident_experts)
-                .and_then(|bytes| bytes.checked_add(reserve))
-                .ok_or_else(|| "prefill rung byte need overflows".to_string())
-        })
-}
-
-/// Whether a chunk rung whose full reserve is `reserve` fits `free` beside
-/// the non-expert weights, the already-frozen `resident_experts` and
-/// `charges`: `non_expert + resident_experts + reserve + charges <= free`.
-/// The complete reserve is charged, so a rung that only fits its chunk
-/// scratch but not the workspace, MTP or full-context obligations is refused.
-pub fn prefill_rung_fits(
-    free: u64,
-    non_expert: u64,
-    resident_experts: u64,
-    reserve: &AutoReserve,
-    charges: &PlacementCharges,
-) -> Result<bool, String> {
-    prefill_rung_need(non_expert, resident_experts, reserve, charges).map(|need| need <= free)
-}
-
-/// Spend the VRAM a frozen expert placement leaves on a wider prefill chunk.
-///
-/// The placement (resident layers and which experts are host-mapped) is
-/// decided first from the `placement_rows` reserve, never from the ceiling;
-/// this picks the largest rung of
-/// [`crate::gpu_forward::qwen4_prefill_chunk_rungs`]`(requested_rows)` above
-/// `placement_rows` whose complete reserve (`reserve_of(rows)`, evaluated by
-/// the caller against the unmutated manifest) still fits beside it
-/// ([`prefill_rung_fits`]), and falls back to `placement_rows` (zero-copy
-/// mapped reads, no widening) when none does. It never changes the
-/// placement and never returns a chunk above `requested_rows`. `free` is the
-/// same free VRAM the placement was sized from. The ceiling it returns is
-/// what `Qwen4Bundle::attach_forward` receives; attachment may narrow
-/// further against live memory but never widens.
-pub fn admit_prefill_chunk(
-    placement_rows: usize,
-    requested_rows: usize,
-    free: u64,
-    non_expert: u64,
-    resident_experts: u64,
-    charges: &PlacementCharges,
-    mut reserve_of: impl FnMut(usize) -> Result<AutoReserve, String>,
-) -> Result<PrefillChunkAdmission, String> {
-    let mut tried = Vec::new();
-    let mut admitted_rows = placement_rows.min(requested_rows);
-    for rows in crate::gpu_forward::qwen4_prefill_chunk_rungs(requested_rows)
-        .filter(|&rows| rows > placement_rows)
-    {
-        let reserve = reserve_of(rows)?;
-        let need = prefill_rung_need(non_expert, resident_experts, &reserve, charges)?;
-        let fits = need <= free;
-        tried.push(PrefillRungVerdict {
-            rows,
-            reserve: reserve.bytes(),
-            need,
-            fits,
-        });
-        if fits {
-            admitted_rows = rows;
-            break;
-        }
-    }
-    Ok(PrefillChunkAdmission {
-        placement_rows,
-        requested_rows,
-        admitted_rows,
-        free,
-        tried,
-    })
 }
 
 /// The long-prefill stage a `whole-first` load runs with
@@ -2007,35 +1856,6 @@ pub fn resident_routed_expert_bytes(
             entry.residency == WeightResidency::Resident
                 && is_routed_expert(&entry.name)
                 && !matches!(entry.policy, ShardPolicy::Tied { .. })
-        })
-        .try_fold(0u64, |total, entry| {
-            let bytes =
-                bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
-            total
-                .checked_add(bytes)
-                .ok_or_else(|| "resident routed-expert byte census overflows".to_string())
-        })
-}
-
-/// The bytes [`resident_routed_expert_bytes`] will report after
-/// [`place_routed_experts`]`(weights, vram_layers)`, computed without
-/// mutating (or cloning) `weights`: the still-resident routed-expert entries
-/// of trunk layers below `vram_layers` (the MTP layer's always move to host).
-/// Lets the prefill-chunk admission judge the frozen placement against the
-/// original manifest ([`admit_prefill_chunk`]).
-pub fn resident_routed_expert_bytes_after_placement(
-    weights: &[WeightEntry],
-    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
-    vram_layers: usize,
-) -> Result<u64, String> {
-    weights
-        .iter()
-        .filter(|entry| {
-            entry.residency == WeightResidency::Resident
-                && is_routed_expert(&entry.name)
-                && !matches!(entry.policy, ShardPolicy::Tied { .. })
-                && !entry.name.starts_with("mtp.")
-                && entry.layer.is_some_and(|layer| layer < vram_layers)
         })
         .try_fold(0u64, |total, entry| {
             let bytes =
@@ -5384,7 +5204,7 @@ mod tests {
         }
     }
 
-    // ---- placement-first admission: receipt-driven CPU dryrun -------------
+    // ---- XTX placement: receipt-driven CPU dryrun --------------------------
     //
     // Inputs are the real gfx1100 XTX hold receipts
     // (`g2-xtx-default/hold-20261017T102413Z/pf-{base,cand}/stderr.txt`):
@@ -5457,19 +5277,17 @@ mod tests {
         })
     }
 
-    /// What one load resolves, in the loader's order: placement from the
-    /// placement chunk with the probe-free stage switch, frozen; then the
-    /// admitted ceiling from the residual.
+    /// What one load resolves, in the loader's order: the requested chunk
+    /// (the link is read only on gfx1100 without an explicit value), then the
+    /// placement sized from it with the placement stage switch.
     struct XtxDryrun {
         placement_rows: usize,
-        requested_rows: usize,
         resident_layers: usize,
         host_tensors: usize,
         host_bytes: u64,
         resident_bytes: u64,
         donors: Option<[usize; 2]>,
         mirror_bytes: u64,
-        admission: PrefillChunkAdmission,
     }
 
     fn xtx_dryrun(
@@ -5483,11 +5301,12 @@ mod tests {
         let mut weights = xtx_manifest();
         let (non_expert, layer) = resident_split(&weights, xtx_bytes).unwrap();
         assert_eq!((non_expert, layer), (XTX_NON_EXPERT, XTX_GATE_UP + XTX_DOWN));
-        // Placement: probe-free chunk, probe-free stage switch.
-        let placement_rows = crate::gpu_forward::prefill_chunk_placement_requested_from(
+        // Placement: the requested chunk, the placement stage switch.
+        let placement_rows = crate::gpu_forward::prefill_chunk_requested_from(
             arch,
             chunk_env,
             XTX_MAX_SEQ,
+            || link,
         );
         let charges = PlacementCharges::new(
             layer,
@@ -5497,31 +5316,9 @@ mod tests {
         let reserve = xtx_reserve(placement_rows);
         let resident_layers =
             auto_placement_layers(free, non_expert, layer, 48, reserve.bytes(), &charges).unwrap();
-        // The loader judges rungs against the manifest before it mutates.
-        let predicted =
-            resident_routed_expert_bytes_after_placement(&weights, xtx_bytes, resident_layers)
-                .unwrap();
         let host_tensors = place_routed_experts(&mut weights, resident_layers);
         let host_bytes = host_mapped_bytes(&weights, xtx_bytes).unwrap();
         let resident_bytes = resident_routed_expert_bytes(&weights, xtx_bytes).unwrap();
-        assert_eq!(predicted, resident_bytes);
-        // Only now may the link be read: the opportunistic ceiling.
-        let requested_rows = crate::gpu_forward::prefill_chunk_requested_from(
-            arch,
-            chunk_env,
-            XTX_MAX_SEQ,
-            || link,
-        );
-        let admission = admit_prefill_chunk(
-            placement_rows,
-            requested_rows,
-            free,
-            non_expert,
-            resident_bytes,
-            &charges,
-            |rows| Ok(xtx_reserve(rows)),
-        )
-        .unwrap();
         // The borrowed packed stage lends the last two resident layers; its
         // restore copies are separate pinned host RAM.
         let donors = (resident_layers >= 2).then(|| {
@@ -5532,14 +5329,12 @@ mod tests {
         let mirror_bytes = expert_stage_mirror_bytes(layer as usize, 1).unwrap();
         XtxDryrun {
             placement_rows,
-            requested_rows,
             resident_layers,
             host_tensors,
             host_bytes,
             resident_bytes,
             donors,
             mirror_bytes,
-            admission,
         }
     }
 
@@ -5549,7 +5344,7 @@ mod tests {
             let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
             println!(
                 "[dryrun {label}] placement chunk {} rows -> {} resident layers ({} MiB experts), \
-                 {} host expert tensors ({:.1} GiB pinned, placement only); admission: {}; \
+                 {} host expert tensors ({:.1} GiB pinned, placement only); \
                  G2 borrowed stage: donors {:?}, dedicated VRAM 0 MiB, restore mirrors {} MiB \
                  pinned host RAM charged separately",
                 self.placement_rows,
@@ -5557,7 +5352,6 @@ mod tests {
                 self.resident_bytes / MIB,
                 self.host_tensors,
                 gib(self.host_bytes),
-                self.admission.describe(),
                 self.donors,
                 (self.mirror_bytes - 4 * HOST_MAPPED_PAD_BYTES) / MIB,
             );
@@ -5565,10 +5359,10 @@ mod tests {
     }
 
     #[test]
-    fn placement_first_reserves_match_the_xtx_receipts() {
+    fn xtx_placement_reserves_match_the_receipts() {
         // The receipts' logged reserves (floored MiB): base 5261 at the
-        // 1536-row chunk, 12110 at 8192. The mid rungs the admission judges
-        // grow by the forward-resource deltas of the same formula.
+        // 1536-row chunk, 12110 at 8192; the mid rungs grow by the
+        // forward-resource deltas of the same formula.
         let at = |rows| xtx_reserve(rows).bytes() >> 20;
         assert_eq!(at(1536), 5261);
         assert_eq!(at(8192), 12110);
@@ -5588,13 +5382,24 @@ mod tests {
     }
 
     #[test]
-    fn placement_first_xtx_default_keeps_the_beta_placement_whatever_the_link() {
-        use crate::host_link::HostLink::{Discrete, Unmeasured};
+    fn xtx_placement_default_cedes_layers_only_on_a_measured_narrow_link() {
+        use crate::host_link::HostLink::{Discrete, Unified, Unmeasured};
         // pf-base: no link policy, beta chunk and stage defaults.
         let beta = xtx_dryrun("gfx1100", XTX_FREE_BASE, None, None, Unmeasured, false);
+        // A fast link keeps the beta 1536-row placement on the candidate's
+        // free VRAM, as do unified and unmeasured links.
+        let fast = xtx_dryrun(
+            "gfx1100",
+            XTX_FREE_CAND,
+            None,
+            None,
+            Discrete { gbps: 26.0 },
+            false,
+        );
+        let unified = xtx_dryrun("gfx1100", XTX_FREE_CAND, None, None, Unified, false);
         // The failed candidate's environment: a measured 7.1 GB/s narrow link
         // and 146 MiB less free VRAM, nothing set explicitly.
-        let fixed = xtx_dryrun(
+        let narrow = xtx_dryrun(
             "gfx1100",
             XTX_FREE_CAND,
             None,
@@ -5603,8 +5408,9 @@ mod tests {
             false,
         );
         beta.print("beta (pf-base inputs)");
-        fixed.print("placement-first default (pf-cand inputs)");
-        for run in [&beta, &fixed] {
+        fast.print("fast link (pf-cand inputs)");
+        narrow.print("narrow link default (pf-cand inputs)");
+        for run in [&beta, &fast, &unified] {
             assert_eq!(run.placement_rows, 1536);
             assert_eq!(run.resident_layers, 10);
             assert_eq!(run.host_tensors, 78);
@@ -5621,57 +5427,37 @@ mod tests {
             // The borrowed donors of ten resident layers, parity ordered.
             assert_eq!(run.donors, Some([8, 9]));
         }
-        assert_eq!(beta.resident_layers, fixed.resident_layers);
-        assert_eq!(beta.host_bytes, fixed.host_bytes);
-        assert_eq!(beta.resident_bytes, fixed.resident_bytes);
-        // Beta never widens; the fixed default spends only the residual: 2048
-        // rows fit beside the frozen ten layers, 4096 and 8192 do not.
-        assert_eq!(beta.requested_rows, 1536);
-        assert_eq!(beta.admission.admitted_rows, 1536);
-        assert!(beta.admission.tried.is_empty());
-        assert_eq!(fixed.requested_rows, 8192);
-        assert_eq!(fixed.admission.admitted_rows, 2048);
-        let tried: Vec<_> = fixed
-            .admission
-            .tried
-            .iter()
-            .map(|rung| (rung.rows, rung.fits))
-            .collect();
-        assert_eq!(tried, [(8192, false), (4096, false), (2048, true)]);
-        for rung in &fixed.admission.tried {
-            assert_eq!(rung.fits, rung.need <= XTX_FREE_CAND);
-        }
+        // The narrow-link default places for the 8192-row reserve: it cedes
+        // layers (the receipt's five-layer split) for the wider chunk.
+        assert_eq!(narrow.placement_rows, 8192);
+        assert_eq!(narrow.resident_layers, 5);
+        assert_eq!(narrow.host_tensors, 88);
+        assert_eq!(narrow.donors, Some([4, 3]));
+        assert!(narrow.resident_bytes < beta.resident_bytes);
+        assert!(narrow.host_bytes > beta.host_bytes);
         // The restore mirrors are a separate host charge: two donor layers,
-        // 2550 MiB of copies (plus four tensor pads in the host check) --
-        // identical placement does not mean identical total pinned bytes.
-        assert_eq!(fixed.mirror_bytes - 4 * HOST_MAPPED_PAD_BYTES, 2550 << 20);
-        assert_eq!(fixed.mirror_bytes, beta.mirror_bytes);
+        // 2550 MiB of copies (plus four tensor pads in the host check).
+        assert_eq!(narrow.mirror_bytes - 4 * HOST_MAPPED_PAD_BYTES, 2550 << 20);
+        assert_eq!(narrow.mirror_bytes, beta.mirror_bytes);
     }
 
     #[test]
-    fn placement_first_explicit_8192_is_the_opt_in_that_trades_layers_for_the_chunk() {
-        use crate::host_link::HostLink::Discrete;
-        // HIPFIRE_PREFILL_CHUNK_ROWS=8192 stays authoritative for placement:
-        // it reproduces the failed candidate's five-layer split (the receipt
-        // placement, 88 host tensors, donors 4 and 3), with the link never
-        // read and nothing left to admit.
-        let opt_in = xtx_dryrun(
-            "gfx1100",
-            XTX_FREE_CAND,
-            Some("8192"),
-            None,
-            Discrete { gbps: 7.1 },
-            false,
-        );
-        opt_in.print("explicit HIPFIRE_PREFILL_CHUNK_ROWS=8192 (opt-in)");
-        assert_eq!(opt_in.placement_rows, 8192);
-        assert_eq!(opt_in.requested_rows, 8192);
-        assert_eq!(opt_in.resident_layers, 5);
-        assert_eq!(opt_in.host_tensors, 88);
-        assert_eq!(opt_in.donors, Some([4, 3]));
-        assert_eq!(opt_in.admission.admitted_rows, 8192);
-        assert!(opt_in.admission.tried.is_empty());
-        // An explicit smaller value is honoured exactly, never widened.
+    fn xtx_placement_explicit_chunk_is_authoritative_whatever_the_link() {
+        use crate::host_link::HostLink::{Discrete, Unmeasured};
+        // HIPFIRE_PREFILL_CHUNK_ROWS=8192 sizes the placement exactly as the
+        // narrow-link default does (the failed candidate's five-layer split:
+        // the receipt placement, 88 host tensors, donors 4 and 3), and never
+        // reads the link: a fast or unmeasured link places the same.
+        for link in [Discrete { gbps: 7.1 }, Discrete { gbps: 26.0 }, Unmeasured] {
+            let opt_in = xtx_dryrun("gfx1100", XTX_FREE_CAND, Some("8192"), None, link, false);
+            opt_in.print("explicit HIPFIRE_PREFILL_CHUNK_ROWS=8192");
+            assert_eq!(opt_in.placement_rows, 8192);
+            assert_eq!(opt_in.resident_layers, 5);
+            assert_eq!(opt_in.host_tensors, 88);
+            assert_eq!(opt_in.donors, Some([4, 3]));
+        }
+        // An explicit smaller value (the 1536 opt-out) is honoured exactly,
+        // even on a narrow link.
         let small = xtx_dryrun(
             "gfx1100",
             XTX_FREE_CAND,
@@ -5681,119 +5467,36 @@ mod tests {
             false,
         );
         assert_eq!(small.placement_rows, 1536);
-        assert_eq!(small.requested_rows, 1536);
-        assert_eq!(small.admission.admitted_rows, 1536);
         assert_eq!(small.resident_layers, 10);
     }
 
     #[test]
-    fn placement_first_falls_back_without_touching_placement_and_widens_when_abundant() {
+    fn xtx_placement_wider_default_chunk_cedes_layers_and_abundant_vram_keeps_all() {
         use crate::host_link::HostLink::Discrete;
         let narrow = Discrete { gbps: 7.1 };
-        let base = xtx_dryrun("gfx1100", XTX_FREE_BASE, None, None, narrow, false);
-        // 18,377 MiB hold the frozen ten layers, the non-expert weights and
-        // the margin; 100 MiB past the 1536-row reserve places the same ten
-        // layers but leaves no room for the 2048-row reserve (+527 MiB).
-        let tight_free = (18377 + 5261 + 100) << 20;
-        let tight = xtx_dryrun("gfx1100", tight_free, None, None, narrow, false);
-        tight.print("tight residual (nofit)");
-        assert_eq!(tight.resident_layers, 10);
-        assert_eq!(tight.resident_layers, base.resident_layers);
-        assert_eq!(tight.host_bytes, base.host_bytes);
-        assert_eq!(tight.requested_rows, 8192);
-        assert_eq!(
-            tight.admission.admitted_rows, 1536,
-            "no rung fits: zero-copy at the placement chunk, never fewer resident layers"
+        // The narrow-link placement is sized for the full 8192-row reserve.
+        let ceded = xtx_dryrun("gfx1100", XTX_FREE_BASE, None, None, narrow, false);
+        let beta = xtx_dryrun(
+            "gfx1100",
+            XTX_FREE_BASE,
+            None,
+            None,
+            Discrete { gbps: 26.0 },
+            false,
         );
-        assert!(tight.admission.tried.iter().all(|rung| !rung.fits));
-        assert_eq!(tight.admission.tried.len(), 3);
-        // Abundant VRAM keeps the full 8192 ceiling.
+        ceded.print("narrow link, base free VRAM");
+        assert_eq!(ceded.placement_rows, 8192);
+        assert!(ceded.resident_layers < beta.resident_layers);
+        assert!(ceded.host_bytes > beta.host_bytes);
+        // Abundant VRAM keeps every layer resident at the 8192 reserve.
         let rich = xtx_dryrun("gfx1100", 100_000 << 20, None, None, narrow, false);
         rich.print("abundant VRAM");
-        assert_eq!(rich.placement_rows, 1536);
+        assert_eq!(rich.placement_rows, 8192);
         assert_eq!(rich.resident_layers, 48);
-        assert_eq!(rich.admission.admitted_rows, 8192);
-        assert_eq!(rich.admission.tried.len(), 1);
-        assert!(rich.admission.tried[0].fits);
     }
 
     #[test]
-    fn placement_first_rung_check_charges_the_complete_reserve_and_every_stage() {
-        let layer = XTX_GATE_UP + XTX_DOWN;
-        let packed = PlacementCharges::new(layer, false).unwrap();
-        let slab = PlacementCharges::new(layer, true).unwrap();
-        let reserve = xtx_reserve(2048);
-        let resident = 10 * layer;
-        let need = prefill_rung_need(XTX_NON_EXPERT, resident, &reserve, &packed).unwrap();
-        assert_eq!(
-            need,
-            XTX_NON_EXPERT + resident + reserve.bytes() + packed.margin
-        );
-        // The dedicated slab stage comes out of the same budget: it moves the
-        // threshold by exactly its two buffers, so it can never consume the
-        // reserve a rung was admitted with.
-        let staged = prefill_rung_need(XTX_NON_EXPERT, resident, &reserve, &slab).unwrap();
-        assert_eq!(staged - need, slab.stage);
-        assert!(slab.stage > 0);
-        assert_eq!(
-            prefill_rung_fits(need, XTX_NON_EXPERT, resident, &reserve, &packed),
-            Ok(true)
-        );
-        assert_eq!(
-            prefill_rung_fits(need - 1, XTX_NON_EXPERT, resident, &reserve, &packed),
-            Ok(false)
-        );
-        assert_eq!(
-            prefill_rung_fits(need, XTX_NON_EXPERT, resident, &reserve, &slab),
-            Ok(false)
-        );
-        // The census can win; the rung is charged the larger complete reserve
-        // (native MTP, workspace and context terms included).
-        let mut census = census_with(0, 0, 0, 0, 0);
-        census.mtp = 8 << 30;
-        let with_mtp = AutoReserve::new(reserve.historical, census).unwrap();
-        assert_eq!(with_mtp.winner(), "census");
-        assert!(with_mtp.bytes() > reserve.bytes());
-        let bigger = prefill_rung_need(XTX_NON_EXPERT, resident, &with_mtp, &packed).unwrap();
-        assert_eq!(bigger - need, with_mtp.bytes() - reserve.bytes());
-        // Overflow is an error, not a wrapped fit.
-        assert!(prefill_rung_need(u64::MAX, 1, &reserve, &packed).is_err());
-    }
-
-    #[test]
-    fn placement_first_ceiling_never_exceeds_the_request_or_judges_rungs_not_above_placement() {
-        let packed = PlacementCharges::new(XTX_GATE_UP + XTX_DOWN, false).unwrap();
-        let never =
-            |_: usize| -> Result<AutoReserve, String> { unreachable!("a rung was judged") };
-        // Placement chunk already at the ceiling (gfx1201's 4096, an explicit
-        // value, or a chunk capped by max_seq): nothing to admit.
-        for (placement, requested) in [(4096, 4096), (8192, 8192), (1024, 1024), (4096, 1536)] {
-            let admission =
-                admit_prefill_chunk(placement, requested, u64::MAX, 0, 0, &packed, never).unwrap();
-            assert_eq!(admission.admitted_rows, placement.min(requested));
-            assert!(admission.tried.is_empty());
-        }
-        // A rung error surfaces instead of being swallowed.
-        let error = admit_prefill_chunk(1536, 8192, u64::MAX, 0, 0, &packed, |_| {
-            Err("reserve overflows".to_string())
-        })
-        .unwrap_err();
-        assert!(error.contains("overflows"));
-        // Only rungs between the placement chunk and the ceiling are judged:
-        // from a 2048 placement under an 8192 ceiling, 8192 and 4096, never
-        // 2048 itself or 1536.
-        let mut judged = Vec::new();
-        let admission = admit_prefill_chunk(2048, 8192, 0, 0, 0, &packed, |rows| {
-            judged.push(rows);
-            Ok(xtx_reserve(rows))
-        })
-        .unwrap();
-        assert_eq!(judged, [8192, 4096]);
-        assert_eq!(admission.admitted_rows, 2048);
-    }
-
-    #[test]
-    fn placement_first_stage_charge_is_probe_free_and_keeps_explicit_and_gfx1201_semantics() {
+    fn xtx_placement_stage_charge_is_probe_free_and_keeps_explicit_and_gfx1201_semantics() {
         use crate::host_link::HostLink::Discrete;
         // Never reads the link: the placement switch is env-first, then
         // gfx1201, so a narrow-link gfx1100 is not charged a stage.
@@ -5817,16 +5520,12 @@ mod tests {
         let explicit = xtx_dryrun("gfx1100", XTX_FREE_CAND, None, Some("1"), narrow, true);
         assert_eq!(default.resident_layers, off.resident_layers);
         assert!(explicit.resident_layers < default.resident_layers);
-        // Unified memory, EP and gfx1201 take their previous paths: the
-        // chunk defaults they read are the unchanged arch defaults.
+        // gfx1151 (unified memory), gfx1201 and gfx942 keep their arch chunk
+        // defaults, and the link is never evaluated for them.
         for (arch, rows) in [("gfx1151", 8192), ("gfx1201", 4096), ("gfx942", 1536)] {
             assert_eq!(
-                crate::gpu_forward::prefill_chunk_placement_requested_from(arch, None, usize::MAX),
-                rows
-            );
-            assert_eq!(
                 crate::gpu_forward::prefill_chunk_requested_from(arch, None, usize::MAX, || {
-                    Discrete { gbps: 7.1 }
+                    unreachable!("probed")
                 }),
                 rows
             );

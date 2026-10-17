@@ -8,20 +8,20 @@
 //! long-prefill route depends on how wide that link really is, which no arch
 //! string says (a gfx1100 in a Gen4 x16 slot and in a Gen3 x4 riser are the
 //! same card).  [`host_link`] therefore *measures* it once per device at load
-//! and every consumer reads the cached value: the opportunistic chunk ceiling
-//! ([`crate::gpu_forward::qwen4_prefill_chunk_requested`]) and the G2 stage
+//! and every consumer reads the cached value: the gfx1100 prefill chunk
+//! ([`crate::gpu_forward::qwen4_prefill_chunk_requested`], which also sizes the
+//! expert placement reserve) and the G2 stage
 //! switch ([`expert_stage_default`], read by `Qwen4ExpertStage::new` for the
 //! borrowed-donor stage and the stage `min_rows` default).  One value per
 //! device per process means the loader's admission and the constructor can
 //! never disagree.
 //!
-//! The link is deliberately **not** an input of the expert placement: the
-//! loader sizes and freezes placement from probe-free inputs (the placement
-//! chunk [`crate::gpu_forward::qwen4_prefill_chunk_placement_requested`] and
-//! the stage switch [`crate::expert_residency::expert_stage_placement_enabled`])
-//! before it measures anything, then spends only the VRAM the frozen
-//! placement leaves on a wider chunk
-//! ([`crate::expert_residency::admit_prefill_chunk`]).
+//! Both consumers read one predicate, [`HostLink::is_narrow_discrete`].  The
+//! chunk follows it on gfx1100 only, and the placement reserve is sized from
+//! that chunk, so a narrow gfx1100 link cedes resident expert layers for the
+//! 8192-row chunk; the stage switch the placement charges
+//! ([`crate::expert_residency::expert_stage_placement_enabled`]) still ignores
+//! the link.
 //!
 //! # Probe semantics
 //!

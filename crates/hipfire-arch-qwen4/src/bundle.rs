@@ -1039,10 +1039,10 @@ impl Qwen4Bundle {
     ///
     /// `max_chunk` caps the chunk: the requested rows
     /// ([`qwen4_prefill_chunk_requested`]) are taken `min` it, so it can only
-    /// narrow them. The loader passes the placement-first admitted ceiling
-    /// ([`crate::expert_residency::admit_prefill_chunk`], never above the
-    /// request and never widened here); other callers pass `max_seq`. The rung
-    /// search below may still pick a smaller rung against live free memory.
+    /// narrow them. The loader passes the chunk its expert placement was
+    /// sized from (the same requested chunk, never widened here); other
+    /// callers pass `max_seq`. The rung search below may still pick a smaller
+    /// rung against live free memory.
     pub fn attach_forward(
         &mut self,
         gpu: &mut Gpu,
