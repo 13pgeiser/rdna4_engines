@@ -1711,18 +1711,6 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
-        function: "batch_chunk_fa_attend_ragged_fp8q",
-        occurrences: 2,
-        decisions: &["kv-tier-capture-forces-flash"],
-    },
-    Site {
-        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
-        function: "execute_fa_attend_step",
-        occurrences: 2,
-        decisions: &["kv-tier-capture-forces-flash"],
-    },
-    Site {
-        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
         function: "fa_pair_merge_admitted",
         occurrences: 4,
         decisions: &["gfx1151-fa-pair-merge"],
@@ -1752,27 +1740,10 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
-        function: "gfx12_fa_prep_fp8q_admitted",
-        occurrences: 2,
-        decisions: &["kv-tier-capture-forces-flash"],
-    },
-    Site {
-        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
-        function: "mq_f16_projection_fast_route",
-        occurrences: 2,
-        decisions: &["gfx1100-f16-projection-fast-route"],
-    },
-    Site {
-        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+
         function: "ordinary_call_facts",
         occurrences: 3,
         decisions: &["widened-prefill-batching"],
-    },
-    Site {
-        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
-        function: "q8_multirow_attn_admitted",
-        occurrences: 4,
-        decisions: &["q8-multirow-verify-attention"],
     },
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
@@ -1988,6 +1959,36 @@ pub const SITES: &[Site] = &[
         function: "q8_attend_key",
         occurrences: 2,
         decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/batched.rs",
+        function: "mq_f16_projection_fast_route",
+        occurrences: 2,
+        decisions: &["gfx1100-f16-projection-fast-route"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/batched_attention.rs",
+        function: "batch_chunk_fa_attend_ragged_fp8q",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/batched_attention.rs",
+        function: "execute_fa_attend_step",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/batched_attention.rs",
+        function: "gfx12_fa_prep_fp8q_admitted",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/batched_attention.rs",
+        function: "q8_multirow_attn_admitted",
+        occurrences: 4,
+        decisions: &["q8-multirow-verify-attention"],
     },
     Site {
         file: "hipfire-dispatch/src/pipeline/hybrid.rs",

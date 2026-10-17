@@ -12,8 +12,6 @@ use super::config::LayerType;
 use super::config::MropeCtx;
 use super::config::Qwen35Config;
 use super::prefill::trace_finite_if_enabled;
-use super::prefill::BatchEpilogue;
-use super::prefill::DenseBatchMath;
 use super::prefill::PREFILL_MAX_BATCH;
 use super::weights::DeltaNetState;
 use super::weights::ExpertWeights;
@@ -27,6 +25,7 @@ use hip_bridge::HipError;
 use hip_bridge::HipResult;
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::moe::{routed_codebook_pair_batched_supported, MoeEpMode};
+use hipfire_dispatch::pipeline::batched::{BatchEpilogue, DenseBatchMath};
 use hipfire_dispatch::pipeline::dump_hidden_localize;
 use hipfire_dispatch::pipeline::execute_steps;
 use hipfire_dispatch::pipeline::hybrid;
@@ -5226,7 +5225,9 @@ fn forward_prefill_dense_tp_batched(
             let mut kv_layer_idx: usize = 0;
             // Precompute per-rank wmma flags.
             let q8_flags: Vec<bool> = (0..tp)
-                .map(|r| crate::qwen35::prefill::q8_prefill_wmma_enabled(&gpus.devices[r]))
+                .map(|r| {
+                    hipfire_dispatch::pipeline::batched::q8_prefill_wmma_enabled(&gpus.devices[r])
+                })
                 .collect();
             for layer_idx in 0..n_layers {
                 match configs[0].layer_types[layer_idx] {
@@ -5245,12 +5246,12 @@ fn forward_prefill_dense_tp_batched(
                             let v_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
                             let n_v_heads = cfg.linear_num_value_heads;
                             let hd = cfg.linear_key_head_dim;
-                            if let Err(e) = crate::qwen35::prefill::batch_chunk_delta_net_attn(
+                            if let Err(e) = hipfire_dispatch::pipeline::batched_deltanet::batch_chunk_delta_net_attn(
                                 &mut gpus.devices[rank],
-                                layer,
-                                cfg,
-                                pbs_vec[rank],
-                                &mut dn_states[rank],
+                                &layer.mixer_view(),
+                                &super::program::hybrid_dims(cfg),
+                                &pbs_vec[rank].view(),
+                                &super::program::deltanet_state_view(&dn_states[rank]),
                                 n,
                                 dim,
                                 k_dim,
@@ -5261,7 +5262,9 @@ fn forward_prefill_dense_tp_batched(
                                 None,
                                 captures
                                     .as_ref()
-                                    .and_then(|caps| caps[rank].tape.as_deref()),
+                                    .and_then(|caps| caps[rank].tape.as_deref())
+                                    .map(super::program::gdn_tape_view)
+                                    .as_ref(),
                                 0,
                                 delta_layer_idx,
                                 q8_flags[rank],
@@ -5315,20 +5318,22 @@ fn forward_prefill_dense_tp_batched(
                             else {
                                 unreachable!();
                             };
-                            if let Err(e) = crate::qwen35::prefill::batch_chunk_delta_net_ffn(
-                                &mut gpus.devices[rank],
-                                layer,
-                                &configs[rank],
-                                pbs_vec[rank],
-                                n,
-                                dim,
-                                configs[rank].hidden_dim,
-                                q8_flags[rank],
-                                q8_flags[rank],
-                                BatchEpilogue::Partial(partials[rank]),
-                                DflashFusionCtx::Off,
-                                DenseBatchMath::Product,
-                            ) {
+                            if let Err(e) =
+                                hipfire_dispatch::pipeline::batched::execute_swiglu_ffn_batched(
+                                    &mut gpus.devices[rank],
+                                    &layer.ffn_view(),
+                                    configs[rank].norm_eps,
+                                    &pbs_vec[rank].view(),
+                                    n,
+                                    dim,
+                                    configs[rank].hidden_dim,
+                                    q8_flags[rank],
+                                    q8_flags[rank],
+                                    BatchEpilogue::Partial(partials[rank]),
+                                    DflashFusionCtx::Off,
+                                    DenseBatchMath::Product,
+                                )
+                            {
                                 process_res = Err(e);
                                 break;
                             }
@@ -5382,14 +5387,17 @@ fn forward_prefill_dense_tp_batched(
                             };
                             let max_ctx = chunk_start + n;
                             let ctx = DispatchCtx::new(&gpus.devices[rank]);
-                            if let Err(e) = crate::qwen35::prefill::batch_chunk_full_attn_attn(
+                            let cfg = &configs[rank];
+                            let tap_fn = super::program::batched_attention_tap(cfg);
+                            let tap = tap_fn.get();
+                            if let Err(e) = hipfire_dispatch::pipeline::batched_attention::batch_chunk_full_attn_attn(
                                 &mut gpus.devices[rank],
                                 false,
-                                layer,
-                                &configs[rank],
-                                pbs_vec[rank],
-                                &scratches[rank],
-                                &mut kv_caches[rank],
+                                &layer.mixer_view(),
+                                &super::program::hybrid_dims(cfg),
+                                &pbs_vec[rank].view(),
+                                &super::program::flash_scratch(&scratches[rank]),
+                                &super::program::kv_view(&kv_caches[rank]),
                                 n,
                                 dim,
                                 chunk_start,
@@ -5404,6 +5412,7 @@ fn forward_prefill_dense_tp_batched(
                                 BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
                                 None, // commit_stride: TP ranks keep legacy cadence
+                                tap,
                             ) {
                                 process_res = Err(e);
                                 break;
@@ -5449,20 +5458,22 @@ fn forward_prefill_dense_tp_batched(
                             else {
                                 unreachable!();
                             };
-                            if let Err(e) = crate::qwen35::prefill::batch_chunk_full_attn_ffn(
-                                &mut gpus.devices[rank],
-                                layer,
-                                &configs[rank],
-                                pbs_vec[rank],
-                                n,
-                                dim,
-                                configs[rank].hidden_dim,
-                                q8_flags[rank],
-                                q8_flags[rank],
-                                BatchEpilogue::Partial(partials[rank]),
-                                DflashFusionCtx::Off,
-                                DenseBatchMath::Product,
-                            ) {
+                            if let Err(e) =
+                                hipfire_dispatch::pipeline::batched::execute_swiglu_ffn_batched(
+                                    &mut gpus.devices[rank],
+                                    &layer.ffn_view(),
+                                    configs[rank].norm_eps,
+                                    &pbs_vec[rank].view(),
+                                    n,
+                                    dim,
+                                    configs[rank].hidden_dim,
+                                    q8_flags[rank],
+                                    q8_flags[rank],
+                                    BatchEpilogue::Partial(partials[rank]),
+                                    DflashFusionCtx::Off,
+                                    DenseBatchMath::Product,
+                                )
+                            {
                                 process_res = Err(e);
                                 break;
                             }

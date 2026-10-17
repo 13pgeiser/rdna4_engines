@@ -10,16 +10,29 @@
 //! shared `hipfire_dispatch::pipeline::hybrid` operations; route selection and
 //! executor bodies live in dispatch.
 
+use super::batch::PrefillBatchScratch;
 use super::config::Qwen35Config;
 use super::forward::Qwen35Scratch;
-use super::weights::{DeltaNetState, LayerWeights, StateQuant};
+use super::weights::{
+    DeltaNetLayerWeights, DeltaNetState, FullAttnLayerWeights, LayerWeights, StateQuant,
+};
+use crate::speculative::GdnTape;
+use hip_bridge::HipResult;
 use hipfire_dispatch::families::kv_tier::KvTierInputs;
+use hipfire_dispatch::pipeline::batched::{BatchScratch, FfnLayerView};
+use hipfire_dispatch::pipeline::batched_attention::{
+    AttentionLayerView, BatchedAttentionTap, FlashScratch, KvView,
+};
+use hipfire_dispatch::pipeline::batched_deltanet::{
+    DeltaNetLayerView, DeltaNetStateView, GdnTapeView,
+};
 use hipfire_dispatch::pipeline::hybrid::{
     AttentionKv, AttentionRow, AttentionTap, DeltaNetMixerOp, GatedAttentionOp, GdnState,
     HybridDims, SwigluFfnOp,
 };
 use hipfire_dispatch::pipeline::Step;
 use hipfire_runtime::llama::{self, KvCacheExt};
+use rdna_compute::{Gpu, GpuTensor};
 
 pub(crate) fn hybrid_dims(config: &Qwen35Config) -> HybridDims {
     HybridDims {
@@ -241,4 +254,211 @@ impl<'a> DecodeBinding<'a> {
             hidden: &s.ffn_hidden,
         }))
     }
+}
+
+// ── Batched (prefill / verify) bindings ─────────────────────────────────────
+
+impl PrefillBatchScratch {
+    /// The batched executors' view of these scratch rows.
+    pub(crate) fn view(&self) -> BatchScratch<'_> {
+        BatchScratch {
+            lean: self.lean,
+            x_batch: &self.x_batch,
+            x_rot_batch: &self.x_rot_batch,
+            x_rot_f16_batch: &self.x_rot_f16_batch,
+            gate_ffn_batch: &self.gate_ffn_batch,
+            up_batch: &self.up_batch,
+            ffn_hidden_batch: &self.ffn_hidden_batch,
+            ffn_hidden_f16_batch: &self.ffn_hidden_f16_batch,
+            dn_qkv_batch: &self.dn_qkv_batch,
+            dn_z_batch: &self.dn_z_batch,
+            dn_z_fold_batch: &self.dn_z_fold_batch,
+            dn_alpha_batch: &self.dn_alpha_batch,
+            dn_beta_batch: &self.dn_beta_batch,
+            dn_q_raw_batch: &self.dn_q_raw_batch,
+            dn_k_raw_batch: &self.dn_k_raw_batch,
+            dn_v_batch: &self.dn_v_batch,
+            dn_q_batch: &self.dn_q_batch,
+            dn_k_batch: &self.dn_k_batch,
+            dn_attn_out_batch: &self.dn_attn_out_batch,
+            dn_normed_batch: &self.dn_normed_batch,
+            dn_normed_rot_batch: &self.dn_normed_rot_batch,
+            dn_normed_rot_f16_batch: &self.dn_normed_rot_f16_batch,
+            dn_s_tape_q8: self.dn_s_tape_q8.as_ref(),
+            dn_s_tape_scales: self.dn_s_tape_scales.as_ref(),
+            dn_s_tape_f32: self.dn_s_tape_f32.as_ref(),
+            fa_q_full_batch: &self.fa_q_full_batch,
+            fa_q_batch: &self.fa_q_batch,
+            fa_gate_batch: &self.fa_gate_batch,
+            fa_k_batch: &self.fa_k_batch,
+            fa_v_batch: &self.fa_v_batch,
+            fa_attn_out_batch: &self.fa_attn_out_batch,
+            fa_attn_out_rot_batch: &self.fa_attn_out_rot_batch,
+            fa_attn_out_rot_f16_batch: &self.fa_attn_out_rot_f16_batch,
+            positions: &self.positions,
+            rope_positions: &self.rope_positions,
+        }
+    }
+}
+
+impl DeltaNetLayerWeights {
+    pub(crate) fn mixer_view(&self) -> DeltaNetLayerView<'_> {
+        DeltaNetLayerView {
+            attn_norm: &self.attn_norm,
+            wqkv: self.wqkv.dispatch_ref(),
+            wz: self.wz.dispatch_ref(),
+            w_alpha: self.w_alpha.dispatch_ref(),
+            w_beta: self.w_beta.dispatch_ref(),
+            a_log: &self.a_log,
+            dt_bias: &self.dt_bias,
+            conv_weight: &self.conv_weight,
+            norm_weight: &self.norm_weight,
+            wo: self.wo.dispatch_ref(),
+            w_gate: self.w_gate.dispatch_ref(),
+        }
+    }
+
+    pub(crate) fn ffn_view(&self) -> FfnLayerView<'_> {
+        FfnLayerView {
+            ffn_norm: &self.ffn_norm,
+            w_gate: self.w_gate.dispatch_ref(),
+            w_up: self.w_up.dispatch_ref(),
+            w_down: self.w_down.dispatch_ref(),
+            kind: "LA",
+        }
+    }
+}
+
+impl FullAttnLayerWeights {
+    pub(crate) fn mixer_view(&self) -> AttentionLayerView<'_> {
+        AttentionLayerView {
+            attn_norm: &self.attn_norm,
+            wq: self.wq.dispatch_ref(),
+            wk: self.wk.dispatch_ref(),
+            wv: self.wv.dispatch_ref(),
+            q_norm: &self.q_norm,
+            k_norm: &self.k_norm,
+            wo: self.wo.dispatch_ref(),
+            w_gate: self.w_gate.dispatch_ref(),
+        }
+    }
+
+    pub(crate) fn ffn_view(&self) -> FfnLayerView<'_> {
+        FfnLayerView {
+            ffn_norm: &self.ffn_norm,
+            w_gate: self.w_gate.dispatch_ref(),
+            w_up: self.w_up.dispatch_ref(),
+            w_down: self.w_down.dispatch_ref(),
+            kind: "FA",
+        }
+    }
+}
+
+/// The batched executors' view of the KV cache.
+pub(crate) fn kv_view(kv: &llama::KvCache) -> KvView<'_> {
+    KvView {
+        k_gpu: &kv.k_gpu,
+        v_gpu: &kv.v_gpu,
+        givens_cos: &kv.givens_cos,
+        givens_sin: &kv.givens_sin,
+        compact_offset: kv.compact_offset,
+        physical_cap: kv.physical_cap,
+        quant_q8: kv.quant_q8,
+        quant_fp8: kv.quant_fp8,
+        v_q8: matches!(kv.v_mode, llama::VMode::Q8),
+        tier: kv.tier_inputs(),
+        vmm_backend: kv.uses_vmm_backend(),
+    }
+}
+
+pub(crate) fn flash_scratch(s: &Qwen35Scratch) -> FlashScratch<'_> {
+    FlashScratch {
+        flash_partials: &s.flash_partials,
+        pos_buf: &s.pos_buf,
+        flash_mode: s.flash_mode,
+    }
+}
+
+pub(crate) fn deltanet_state_view(state: &DeltaNetState) -> DeltaNetStateView<'_> {
+    DeltaNetStateView {
+        s_matrices: &state.s_matrices,
+        s_scales: &state.s_scales,
+        conv_states: &state.conv_states,
+        s_ef_residual: &state.s_ef_residual,
+        quant: state.quant,
+    }
+}
+
+pub(crate) fn gdn_tape_view(tape: &GdnTape) -> GdnTapeView<'_> {
+    GdnTapeView {
+        max_n: tape.max_n,
+        qkv_dim: tape.qkv_dim,
+        qkv_bufs: &tape.qkv_bufs,
+        alpha_bufs: &tape.alpha_bufs,
+        beta_bufs: &tape.beta_bufs,
+    }
+}
+
+/// The batched attention tap of one forward, bound to `config`. `get()`
+/// is the tap exactly when `triattn::tap_enabled()`, so no caller can drop the
+/// calibration or admit a fused FA prep while the tap is active.
+pub(crate) struct BatchedTap<F>(F);
+
+pub(crate) fn batched_attention_tap(
+    config: &Qwen35Config,
+) -> BatchedTap<impl Fn(&mut Gpu, usize, &GpuTensor, &GpuTensor, usize) -> HipResult<()> + '_> {
+    BatchedTap(
+        move |gpu: &mut Gpu, layer: usize, q: &GpuTensor, k: &GpuTensor, rows: usize| {
+            record_batched_attention_tap(gpu, config, layer, q, k, rows)
+        },
+    )
+}
+
+impl<F: Fn(&mut Gpu, usize, &GpuTensor, &GpuTensor, usize) -> HipResult<()>> BatchedTap<F> {
+    pub(crate) fn get(&self) -> Option<BatchedAttentionTap<'_>> {
+        hipfire_runtime::triattn::tap_enabled().then_some(&self.0 as BatchedAttentionTap<'_>)
+    }
+}
+
+/// TriAttention pre-RoPE tap of the batched attention prep: the GPU reduce
+/// when `install_tap_gpu()` was used, else a host readback of Q (and K).
+pub(crate) fn record_batched_attention_tap(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    layer_idx: usize,
+    q: &GpuTensor,
+    k: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    let gpu_handled = hipfire_runtime::triattn::record_prerope_q_batch_gpu_if_applicable(
+        gpu,
+        layer_idx,
+        &q.buf,
+        n,
+        config.n_heads,
+        config.head_dim,
+    )?;
+    if !gpu_handled {
+        let n_q = config.n_heads * config.head_dim;
+        let q_cpu = gpu.download_f32(q)?;
+        if hipfire_runtime::triattn::tap_needs_k() {
+            let n_k = config.n_kv_heads * config.head_dim;
+            let k_cpu = gpu.download_f32(k)?;
+            for b in 0..n {
+                hipfire_runtime::triattn::record_prerope_qk(
+                    layer_idx,
+                    &q_cpu[b * n_q..(b + 1) * n_q],
+                    Some(&k_cpu[b * n_k..(b + 1) * n_k]),
+                );
+            }
+        } else {
+            for b in 0..n {
+                hipfire_runtime::triattn::record_prerope_q(
+                    layer_idx,
+                    &q_cpu[b * n_q..(b + 1) * n_q],
+                );
+            }
+        }
+    }
+    Ok(())
 }

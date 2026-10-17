@@ -3430,7 +3430,8 @@ fn forward_scratch_layers_multi(
                             None => &s.tmp,
                         };
                         if matches!(dt, DType::MQ4CG256 | DType::MQ4G256V2 | DType::MQ6G256V2) {
-                            let key = crate::forward_slots::fused_qkvza_key_for(dt);
+                            let key =
+                                hipfire_dispatch::families::fused_qkv::fused_qkvza_key_for(dt);
                             let ctx = DispatchCtx::new(gpu);
                             let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
                                 kind: key,
@@ -3717,7 +3718,7 @@ fn forward_scratch_layers_multi(
                             None => &s.tmp,
                         };
                         if matches!(dt, DType::MQ4CG256 | DType::MQ4G256V2 | DType::MQ6G256V2) {
-                            let key = crate::forward_slots::fused_qkv_key_for(dt);
+                            let key = hipfire_dispatch::families::fused_qkv::fused_qkv_key_for(dt);
                             let ctx = DispatchCtx::new(gpu);
                             let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
                                 kind: key,
@@ -4205,7 +4206,8 @@ fn forward_scratch_layers_multi(
                             None => &s.tmp,
                         };
                         if matches!(dt, DType::MQ4CG256 | DType::MQ4G256V2 | DType::MQ6G256V2) {
-                            let key = crate::forward_slots::fused_qkvza_key_for(dt);
+                            let key =
+                                hipfire_dispatch::families::fused_qkv::fused_qkvza_key_for(dt);
                             let ctx = DispatchCtx::new(gpu);
                             let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
                                 kind: key,
@@ -4423,7 +4425,7 @@ fn forward_scratch_layers_multi(
                             None => &s.tmp,
                         };
                         if matches!(dt, DType::MQ4CG256 | DType::MQ4G256V2 | DType::MQ6G256V2) {
-                            let key = crate::forward_slots::fused_qkv_key_for(dt);
+                            let key = hipfire_dispatch::families::fused_qkv::fused_qkv_key_for(dt);
                             let ctx = DispatchCtx::new(gpu);
                             let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
                                 kind: key,
