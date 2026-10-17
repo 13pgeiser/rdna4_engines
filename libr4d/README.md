@@ -1,3 +1,10 @@
+# ------------ DEPRECATION WARNING ------------
+This project is has moved repositories. I ditched vLLM and moved to a
+standalone inference engine project, which now houses the canonical version of libr4d. The version in this repository is very outdated and not being maintained. That poject is available at https://codeberg.org/StillDeadcode/radiance.
+# ------------ DEPRECATION WARNING ------------
+
+
+
 # libr4d
 
 R4D is a library of specialized HIP kernels for **gfx1201 (RDNA4, Radeon AI PRO R9700)**.
