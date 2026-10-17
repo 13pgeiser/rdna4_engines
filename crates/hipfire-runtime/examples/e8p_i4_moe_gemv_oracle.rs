@@ -66,7 +66,7 @@
 //!
 //! # Receipts
 //! One JSON (stdout and `--out`): schema, mode, argv, build command, device identity (uuid/bdf/arch/card), fabric fields,
-//! sha256 of the harness source, of the K-E0 reference source (pinned `17b9e138..`), of the launcher source and of the
+//! sha256 of the harness source, of the K-E0 reference source (pinned `bc55ff77..`), of the launcher source and of the
 //! code objects, record file/manifest pins, per case input sha256, actual launch / word / mismatch / guard-region counts,
 //! poison checks and `rc`.
 //!
@@ -115,8 +115,9 @@ const BUILD_COMMAND: &str =
 const HARNESS_SRC: &[u8] = include_bytes!("e8p_i4_moe_gemv_oracle.rs");
 const REFERENCE_SRC: &[u8] = include_bytes!("../src/e8p_i4_reference.rs");
 const LAUNCHER_SRC: &[u8] = include_bytes!("../../rdna-compute/src/e8p_moe_decode.rs");
-/// Frozen K-E0 reference source (`runtime/e8p_i4_reference.rs`).
-const REFERENCE_SHA256: &str = "17b9e138a045ec14f744017f9e5080c41b33b19bd0e2ca99bf19908bea8dae3b";
+/// Frozen K-E0 reference source (`runtime/e8p_i4_reference.rs`). Re-pinned from `17b9e138..` after the rc5 land
+/// rustfmt'd it and moved two test-only fixture env reads to `hipfire_config::developer_var` (no non-test change).
+const REFERENCE_SHA256: &str = "bc55ff77a110a679ea0e71b1b0b52144a653384821afe4730840304ea5bbe130";
 const MANIFEST_SHA256: &str = "b60856a1260919c63bdf47523053399aeaca04f1e75fbda9a4efb7020add4611";
 const L0_GATE_SHA256: &str = "b62e40c7119b8aee26c6204937bcd80666f3705aab58fe1702ca336fcef14dfc";
 const L0_DOWN_SHA256: &str = "7ccdc29ae35fb2775ac292c49ebcc0e7e5ac9db40c344d5dd0aa70ecfb643bac";
