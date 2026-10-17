@@ -1721,7 +1721,7 @@ impl Gpu {
 
     /// Fold the K1 cohort's route ids into the stable grouping's count words: `counts[id] +=
     /// 1 << 20` per valid id of `ids` (`n` I32).  The caller guarantees the padded K2 counts
-    /// stay below `1 << 20` and each expert's K1 slots below `1 << 10`.
+    /// stay below `1 << 20` and each expert's K1 slots below `1 << 11` (bits 20..30).
     pub fn slowlink_fold_k1_counts(
         &mut self,
         ids: &GpuTensor,
