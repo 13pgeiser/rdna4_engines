@@ -23,8 +23,8 @@
 //!
 //! Freedom used (tiling, layout and scheduling only):
 //!  * a wave owns 16 rows x 256 tokens (16 accumulator tiles), so one A
-//!    dequant feeds 16 WMMAs (hipcc: 8); a workgroup is `WR` waves (64 or 128
-//!    rows) x 256 tokens;
+//!    dequant feeds 16 WMMAs (hipcc: 8); a workgroup is `WR` waves (64, 128
+//!    or 256 rows) x 256 tokens;
 //!  * X is staged in 32-K chunks, double-buffered in LDS (two 20480-byte
 //!    slots, 80-byte token pitch), one barrier per chunk;
 //!  * B fragments rotate through an 8-deep register ring loaded eight WMMAs
@@ -33,7 +33,10 @@
 //!  * each lane loads only its own 48 code bits per K-step (two dwords at
 //!    `12j + 4*lane_half`) and gathers them with four `v_perm_b32`;
 //!  * X loads go through a descriptor bounded at `N*K*2` bytes, so tokens
-//!    past N read zeros (their outputs are never stored).
+//!    past N read zeros (their outputs are never stored);
+//!  * W8/W16 stage the output (`M % 8 == 0`) through LDS in `WR/2` passes of
+//!    `512/WR` tokens, so each store writes contiguous rows of one token
+//!    (whole 128-byte lines); W4 and ragged M store straight from the tiles.
 //!
 //! Launch: block `32*WR`, grid `[ceil(M/(16*WR)), ceil(N/256), 1]`, kernargs
 //! `(A, X, Y, M, K, N)` (36 bytes), no dynamic LDS. K is a multiple of 256
@@ -51,7 +54,7 @@ type R = Result<(), String>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Spec { pub arch: Arch, pub wr: u8 }
 impl Spec {
-    pub const ALL: [u8; 2] = [4, 8];
+    pub const ALL: [u8; 3] = [4, 8, 16];
     pub fn symbol(&self) -> String { format!("qwen4_mq6_x4_pm_gfx1201_w{}", self.wr) }
     pub fn module(arch: Arch) -> String { format!("qwen4_mq6_x4_pm_{}", arch.name()) }
     pub fn validate(&self) -> R {
@@ -66,6 +69,9 @@ impl Spec {
     fn xpt(&self) -> u8 { (TOK * 4 / u32::from(self.threads())) as u8 }
     /// Token rows between a thread's X uint4s.
     fn xrow_step(&self) -> u32 { u32::from(self.threads()) / 4 }
+    /// W8/W16 stage the `M % 8 == 0` output through LDS for coalesced
+    /// stores; W4 keeps the direct per-tile stores.
+    fn staged_epilogue(&self) -> bool { self.wr >= 8 }
 }
 
 /// Tokens per workgroup (and per wave): 16 tiles of 16.
@@ -427,35 +433,47 @@ fn body(b: &mut Builder, spec: &Spec) -> R {
 
 fn epilogue(b: &mut Builder, spec: &Spec) -> R {
     b.wait_all()?;
+    if spec.staged_epilogue() {
+        // Retire the last X slot on the loop-exit path, so both paths reach
+        // `epi` with every slot Free (K < 256 branches before any slot is touched).
+        b.barrier(&[Transition::Retire(0)])?;
+    }
     b.label(&lbl(spec, "epi"))?;
     for n in 0..8 * BT { op(b, format!("v_add_f32_e32 v{0}, 0, v{0}", ACC + n), &[v(ACC + n)], &[v(ACC + n)])?; }
-    // Tile t: token + 16t, Y offset + t*16*M*4 in v[RINGB+t] (the B ring is
-    // dead here), so no store source is redefined while stores are in flight.
-    sop(b, format!("s_lshl_b32 s{YSTEP}, s{SM}, 6"), &[YSTEP], &[SM])?;
-    sop(b, format!("s_mov_b32 s{SZERO}, 0"), &[SZERO], &[])?;
-    op(b, format!("v_mov_b32_e32 v{RINGB}, v{VYOFF}"), &[v(RINGB)], &[v(VYOFF)])?;
-    for t in 1..BT {
-        op(b, format!("v_add_nc_u32_e32 v{}, s{YSTEP}, v{}", RINGB + t, RINGB + t - 1), &[v(RINGB + t)], &[s(YSTEP), v(RINGB + t - 1)])?;
+    if spec.staged_epilogue() {
+        sop(b, format!("s_and_b32 s{ST0}, s{SM}, 7"), &[ST0], &[SM])?;
+        sop(b, format!("s_cmp_lg_u32 s{ST0}, 0"), &[], &[ST0])?;
+        op(b, format!("s_cbranch_scc1 {}", lbl(spec, "scalar")), &[], &[])?;
+        staged_stores(b, spec)?;
+        // The staged stores' sources (B ring offsets) are reused by the ragged
+        // path below: release them so its offsets need no store-count wait.
+        b.release_store_sources()?;
+        op(b, format!("s_branch {}", lbl(spec, "end")), &[], &[])?;
+        b.label(&lbl(spec, "scalar"))?;
+        tile_offsets(b)?;
+        sop(b, format!("s_mov_b32 s{SNB}, s{SN}"), &[SNB], &[SN])?;
+    } else {
+        tile_offsets(b)?;
+        sop(b, format!("s_mov_b32 s{SNB}, s{SN}"), &[SNB], &[SN])?;
+        sop(b, format!("s_and_b32 s{ST0}, s{SM}, 7"), &[ST0], &[SM])?;
+        sop(b, format!("s_cmp_lg_u32 s{ST0}, 0"), &[], &[ST0])?;
+        op(b, format!("s_cbranch_scc1 {}", lbl(spec, "scalar")), &[], &[])?;
+        // M % 8 == 0: whole 8-row runs (row0 < M implies row0+8 <= M).
+        op(b, format!("v_cmp_gt_i32_e64 s{MASK1}, s{SM}, v{VROW0}"), &[s(MASK1)], &[s(SM), v(VROW0)])?;
+        for t in 0..BT {
+            op(b, format!("v_cmp_gt_i32_e64 s{MASK0}, s{SNB}, v{VTOK}"), &[s(MASK0)], &[s(SNB), v(VTOK)])?;
+            wait_alu(b, "depctr_va_sdst(0)")?;
+            op(b, format!("s_and_b32 exec_lo, s{MASK0}, s{MASK1}"), &[], &[s(MASK0), s(MASK1)])?;
+            let acc = ACC + 8 * t;
+            bstore(b, 4, acc, RINGB + t, SRD_Y, SZERO, 0)?;
+            bstore(b, 4, acc + 4, RINGB + t, SRD_Y, SZERO, 16)?;
+            op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
+            sop(b, format!("s_add_co_i32 s{SNB}, s{SNB}, -16"), &[SNB], &[SNB])?;
+        }
+        op(b, format!("s_branch {}", lbl(spec, "end")), &[], &[])?;
+        b.label(&lbl(spec, "scalar"))?;
     }
-    sop(b, format!("s_mov_b32 s{SNB}, s{SN}"), &[SNB], &[SN])?;
-    sop(b, format!("s_and_b32 s{ST0}, s{SM}, 7"), &[ST0], &[SM])?;
-    sop(b, format!("s_cmp_lg_u32 s{ST0}, 0"), &[], &[ST0])?;
-    op(b, format!("s_cbranch_scc1 {}", lbl(spec, "scalar")), &[], &[])?;
-    // M % 8 == 0: whole 8-row runs (row0 < M implies row0+8 <= M).
-    op(b, format!("v_cmp_gt_i32_e64 s{MASK1}, s{SM}, v{VROW0}"), &[s(MASK1)], &[s(SM), v(VROW0)])?;
-    for t in 0..BT {
-        op(b, format!("v_cmp_gt_i32_e64 s{MASK0}, s{SNB}, v{VTOK}"), &[s(MASK0)], &[s(SNB), v(VTOK)])?;
-        wait_alu(b, "depctr_va_sdst(0)")?;
-        op(b, format!("s_and_b32 exec_lo, s{MASK0}, s{MASK1}"), &[], &[s(MASK0), s(MASK1)])?;
-        let acc = ACC + 8 * t;
-        bstore(b, 4, acc, RINGB + t, SRD_Y, SZERO, 0)?;
-        bstore(b, 4, acc + 4, RINGB + t, SRD_Y, SZERO, 16)?;
-        op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
-        sop(b, format!("s_add_co_i32 s{SNB}, s{SNB}, -16"), &[SNB], &[SNB])?;
-    }
-    op(b, format!("s_branch {}", lbl(spec, "end")), &[], &[])?;
     // Ragged M: per element, row0 + e < M.
-    b.label(&lbl(spec, "scalar"))?;
     for t in 0..BT {
         op(b, format!("v_cmp_gt_i32_e64 s{MASK0}, s{SNB}, v{VTOK}"), &[s(MASK0)], &[s(SNB), v(VTOK)])?;
         sop(b, format!("s_mov_b32 s{SMJ}, s{SM}"), &[SMJ], &[SM])?;
@@ -472,6 +490,148 @@ fn epilogue(b: &mut Builder, spec: &Spec) -> R {
     b.label(&lbl(spec, "end"))?;
     b.release_store_sources()?;
     b.control(Sop::End.encode(Arch::Gfx1201)?)
+}
+
+/// Tile t: token + 16t, Y offset + t*16*M*4 in v[RINGB+t] (the B ring is
+/// dead here), so no store source is redefined while stores are in flight.
+/// Also zeroes the stores' soffset.
+fn tile_offsets(b: &mut Builder) -> R {
+    sop(b, format!("s_lshl_b32 s{YSTEP}, s{SM}, 6"), &[YSTEP], &[SM])?;
+    sop(b, format!("s_mov_b32 s{SZERO}, 0"), &[SZERO], &[])?;
+    op(b, format!("v_mov_b32_e32 v{RINGB}, v{VYOFF}"), &[v(RINGB)], &[v(VYOFF)])?;
+    for t in 1..BT {
+        op(b, format!("v_add_nc_u32_e32 v{}, s{YSTEP}, v{}", RINGB + t, RINGB + t - 1), &[v(RINGB + t)], &[s(YSTEP), v(RINGB + t - 1)])?;
+    }
+    Ok(())
+}
+
+/// Coalesced `M % 8 == 0` stores of the W8/W16 entries, staged through LDS.
+/// The 16*WR x 256 output tile goes out in `WR/2` passes of `P = 512/WR`
+/// tokens. Each pass: every wave writes its accumulator tiles of those tokens
+/// to `y_stage`, a barrier publishes them, and each thread reads back `64/WR`
+/// uint4 at (token `8i + tid/R`, rows `4*(tid % R) ..+3`, `R = 4*WR` uint4 per
+/// token) into the accumulators the pass just staged, then stores each to Y:
+/// per token, the workgroup's `16*WR` rows are contiguous, so a store touches
+/// 4 (W8) or 8 (W16) whole 128-byte lines instead of 16 partial ones. Same
+/// values and same (token < N, row < M) element set as the unstaged path
+/// (M % 8 == 0 makes the 4-row and 8-row run masks agree).
+///
+/// `y_stage` is 32 KiB, token-major (`16*R` bytes per token, no pad); uint4
+/// `c` of token `t` sits at uint4 `c ^ (t & 15)` of its row, so the 16 tokens
+/// of a tile land in 16 distinct bank groups on the write side and a wave's
+/// read stays one row. Every stage address is precomputed once into its own
+/// VGPR as `v_and_b32 vA, 0x7ff0, vX` (the static LDS bound's masked form; all
+/// addresses are 16-aligned and below 32768, so the mask keeps them exact) and
+/// no store source is redefined while stores are in flight: store `i` of a
+/// pass uses its own offset VGPR (`8i` tokens on, shared by every pass) and
+/// pass `p` its own soffset SGPR, all computed before the first store.
+fn staged_stores(b: &mut Builder, spec: &Spec) -> R {
+    const STAGE_BYTES: u32 = 32768;
+    const MASK: u32 = STAGE_BYTES - 16;
+    let wr = u32::from(spec.wr);
+    let r = 4 * wr; // uint4 per token row
+    let row = 16 * r; // bytes per token row
+    let tok_pass = 512 / wr;
+    debug_assert_eq!(tok_pass * row, STAGE_BYTES);
+    let tiles_pass = (tok_pass / 16) as u8;
+    let loads_pass = (64 / wr) as u8;
+    let passes = spec.wr / 2;
+    // Per-lane registers (lane constants, temps, codes and the B ring are dead
+    // after the loop; the scalar path rebuilds its offsets in the B ring).
+    let (vtok, t0, t1, t2, t4, t5) = (T3, T0, T1, T2, T4, T5);
+    let voff = |i: u8| RINGB + i;
+    let waddr = |j: u8, h: u8| CODE[0] + 2 * j + h;
+    let raddr = |i: u8| CODE[2] + i;
+    // Scalars of the dead group loop: one Y token-group offset per pass.
+    const SOFF: [u8; 8] = [G, GOFF, NGOFF, SXOFF, C8, GPR, NCHM1, GPRM1];
+    if usize::from(passes) > SOFF.len() { return Err("qwen4_mq6_x4: too many epilogue passes".into()) }
+    b.lds_relayout()?;
+    let stage = b.lds_slot("y_stage", 0, STAGE_BYTES)?;
+    let masked = |b: &mut Builder, dst: u8, src: u8| op(b, format!("v_and_b32_e32 v{dst}, {}, v{src}", lit(MASK)), &[v(dst)], &[v(src)]);
+    // Write side: lane (ml, lh) of wave w holds token ml of a tile, uint4
+    // c = 2*(tid >> 4) + h (rows 16w + 8lh + 4h); tile j of the pass at
+    // (16j + ml) * row + ((c ^ ml) << 4).
+    op(b, format!("v_and_b32_e32 v{t4}, 15, v{TID}"), &[v(t4)], &[v(TID)])?;
+    op(b, format!("v_lshrrev_b32_e32 v{t5}, 4, v{TID}"), &[v(t5)], &[v(TID)])?;
+    op(b, format!("v_lshlrev_b32_e32 v{t5}, 1, v{t5}"), &[v(t5)], &[v(t5)])?;
+    op(b, format!("v_lshlrev_b32_e32 v{t0}, {}, v{t4}", row.trailing_zeros()), &[v(t0)], &[v(t4)])?;
+    for h in 0..2u8 {
+        if h == 0 { op(b, format!("v_xor_b32_e32 v{t1}, v{t5}, v{t4}"), &[v(t1)], &[v(t5), v(t4)])?; }
+        else {
+            op(b, format!("v_or_b32_e32 v{t1}, 1, v{t5}"), &[v(t1)], &[v(t5)])?;
+            op(b, format!("v_xor_b32_e32 v{t1}, v{t1}, v{t4}"), &[v(t1)], &[v(t1), v(t4)])?;
+        }
+        op(b, format!("v_lshl_add_u32 v{t1}, v{t1}, 4, v{t0}"), &[v(t1)], &[v(t1), v(t0)])?;
+        for j in 0..tiles_pass {
+            if j == 0 { masked(b, waddr(j, h), t1)?; continue }
+            op(b, format!("v_add_nc_u32_e32 v{t2}, {}, v{t1}", lit(u32::from(j) * 16 * row)), &[v(t2)], &[v(t1)])?;
+            masked(b, waddr(j, h), t2)?;
+        }
+    }
+    // Read side: token t0 = tid / R of each 8-token group, uint4 c = tid % R;
+    // load i at (8i + t0) * row + ((c ^ t0 ^ 8*(i & 1)) << 4).
+    op(b, format!("v_lshrrev_b32_e32 v{t5}, {}, v{TID}", r.trailing_zeros()), &[v(t5)], &[v(TID)])?;
+    op(b, format!("v_and_b32_e32 v{t4}, {}, v{TID}", r - 1), &[v(t4)], &[v(TID)])?;
+    op(b, format!("v_xor_b32_e32 v{t1}, v{t4}, v{t5}"), &[v(t1)], &[v(t4), v(t5)])?;
+    op(b, format!("v_lshlrev_b32_e32 v{t0}, {}, v{t5}", row.trailing_zeros()), &[v(t0)], &[v(t5)])?;
+    op(b, format!("v_lshl_add_u32 v{t1}, v{t1}, 4, v{t0}"), &[v(t1)], &[v(t1), v(t0)])?;
+    op(b, format!("v_xor_b32_e32 v{t2}, {}, v{t1}", lit(128)), &[v(t2)], &[v(t1)])?;
+    for i in 0..loads_pass {
+        let base = if i % 2 == 0 { t1 } else { t2 };
+        if i == 0 { masked(b, raddr(i), base)?; continue }
+        op(b, format!("v_add_nc_u32_e32 v{t0}, {}, v{base}", lit(u32::from(i) * 8 * row)), &[v(t0)], &[v(base)])?;
+        masked(b, raddr(i), t0)?;
+    }
+    // Token of this lane's first store: wgy*256 + tid / R.
+    sop(b, format!("s_lshl_b32 s{ST0}, s{WGY}, 8"), &[ST0], &[WGY])?;
+    sop(b, format!("s_mul_i32 s{ST1}, s{WGX}, {}", lit(spec.rows())), &[ST1], &[WGX])?;
+    op(b, format!("v_add_nc_u32_e32 v{vtok}, s{ST0}, v{t5}"), &[v(vtok)], &[s(ST0), v(t5)])?;
+    // Row = wgx*rows + 4*(tid % R); store i's Y byte offset within its pass
+    // ((tid / R + 8i) * M + row) * 4; the pass's token offset rides in soffset.
+    op(b, format!("v_lshl_add_u32 v{}, v{t4}, 2, s{ST1}", voff(0)), &[v(voff(0))], &[v(t4), s(ST1)])?;
+    op(b, format!("v_cmp_gt_i32_e64 s{MASK1}, s{SM}, v{}", voff(0)), &[s(MASK1)], &[s(SM), v(voff(0))])?;
+    op(b, format!("v_mul_lo_u32 v{t5}, v{t5}, s{SM}"), &[v(t5)], &[v(t5), s(SM)])?;
+    op(b, format!("v_add_nc_u32_e32 v{0}, v{0}, v{t5}", voff(0)), &[v(voff(0))], &[v(voff(0)), v(t5)])?;
+    op(b, format!("v_lshlrev_b32_e32 v{0}, 2, v{0}", voff(0)), &[v(voff(0))], &[v(voff(0))])?;
+    sop(b, format!("s_lshl_b32 s{ST1}, s{SM}, 5"), &[ST1], &[SM])?; // 8 tokens of Y
+    for i in 1..loads_pass {
+        op(b, format!("v_add_nc_u32_e32 v{}, s{ST1}, v{}", voff(i), voff(i - 1)), &[v(voff(i))], &[s(ST1), v(voff(i - 1))])?;
+    }
+    // Pass p's token-group offset: (wgy*256 + P*p) * M * 4.
+    sop(b, format!("s_mul_i32 s{}, s{ST0}, s{SM}", SOFF[0]), &[SOFF[0]], &[ST0, SM])?;
+    sop(b, format!("s_lshl_b32 s{0}, s{0}, 2", SOFF[0]), &[SOFF[0]], &[SOFF[0]])?;
+    sop(b, format!("s_mul_i32 s{ST1}, s{SM}, {}", lit(4 * tok_pass)), &[ST1], &[SM])?;
+    for p in 1..usize::from(passes) {
+        sop(b, format!("s_add_co_i32 s{}, s{}, s{ST1}", SOFF[p], SOFF[p - 1]), &[SOFF[p]], &[SOFF[p - 1], ST1])?;
+    }
+    sop(b, format!("s_mov_b32 s{SNB}, s{SN}"), &[SNB], &[SN])?;
+    for p in 0..passes {
+        for j in 0..tiles_pass {
+            let acc = ACC + 8 * (p * tiles_pass + j);
+            for h in 0..2u8 {
+                let (addr, data) = (waddr(j, h), acc + 4 * h);
+                b.ds_store(stage, Instruction::new(format!("ds_store_b128 v{addr}, {}", rs(data, 4)), vec![], vec![v(addr), vr(data, 4)])
+                    .memory(MemoryClass::DsStore))?;
+            }
+        }
+        b.barrier(&[Transition::Ready(stage)])?;
+        // Read back into this pass's (now staged) accumulators.
+        let dst = |i: u8| ACC + 8 * p * tiles_pass + 4 * i;
+        for i in 0..loads_pass {
+            b.ds_load(stage, Instruction::new(format!("ds_load_b128 {}, v{}", rs(dst(i), 4), raddr(i)), vec![vr(dst(i), 4)], vec![v(raddr(i))])
+                .memory(MemoryClass::DsLoad))?;
+        }
+        for i in 0..loads_pass {
+            op(b, format!("v_cmp_gt_i32_e64 s{MASK0}, s{SNB}, v{vtok}"), &[s(MASK0)], &[s(SNB), v(vtok)])?;
+            sop(b, format!("s_add_co_i32 s{SNB}, s{SNB}, -8"), &[SNB], &[SNB])?;
+            wait_alu(b, "depctr_va_sdst(0)")?;
+            op(b, format!("s_and_b32 exec_lo, s{MASK0}, s{MASK1}"), &[], &[s(MASK0), s(MASK1)])?;
+            bstore(b, 4, dst(i), voff(i), SRD_Y, SOFF[usize::from(p)], 0)?;
+            op(b, "s_mov_b32 exec_lo, -1", &[], &[])?;
+        }
+        if p + 1 < passes { b.barrier(&[Transition::Retire(stage)])?; }
+    }
+    Ok(())
 }
 
 pub fn emit(spec: Spec) -> Result<Emitted, String> {

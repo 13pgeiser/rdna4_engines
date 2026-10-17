@@ -1242,6 +1242,36 @@ const fn mq6_x4_pm_gfx1151_shape(m: usize, n: usize) -> bool {
     m >= QWEN4_MQ6_X4_PM_MIN_M_GFX1151 && n >= QWEN4_MQ6_X4_PM_MIN_N_GFX1151
 }
 
+/// Whether the gfx1201 MQ6 PM launch of `m` rows (> 64) and `n` tokens takes the 256-row,
+/// 512-thread `_w16` entry instead of the 128-row `_w8`: iff the workgroup count
+/// `ceil(m / 256) * ceil(n / 256)` is a multiple of 32. A `_w16` workgroup is 16 waves, so
+/// it owns one WGP and the launch runs in whole rounds over the R9700's 32 WGPs, while
+/// `_w8` (two workgroups per WGP) wins elsewhere and `_w16` loses when the last round is
+/// partial. Origin: Mq6TrunkTune ABBA on R9700 (`qcal/release-0.4.3/mq6-trunk-tune/REPORT.md`):
+/// +4.8% out/o at N=4096, +1.5% qkv at N=1024, +1.6% kv at N=4096, and the -15% out at
+/// N=1024 (partial round) avoided. The entries compute the same bytes; this only picks speed.
+const fn mq6_x4_pm_gfx1201_w16_shape(m: usize, n: usize) -> bool {
+    m.div_ceil(256) * n.div_ceil(256) % 32 == 0
+}
+
+/// The gfx1201 MQ6 PM entry for an `m`-row, `n`-token launch: `(symbol, rows per
+/// workgroup, threads per workgroup, batch tile)`. `_w4` (64 rows, 128 threads) for
+/// `m <= 64`; above that `_w16` (256 rows, 512 threads) when
+/// [`mq6_x4_pm_gfx1201_w16_shape`] holds, else `_w8` (128 rows, 256 threads).
+const fn mq6_x4_pm_gfx1201_entry(
+    m: usize,
+    n: usize,
+    batch_tile: usize,
+) -> (&'static str, usize, u32, usize) {
+    if m <= 64 {
+        ("qwen4_mq6_x4_pm_gfx1201_w4", 64, 128, batch_tile)
+    } else if mq6_x4_pm_gfx1201_w16_shape(m, n) {
+        ("qwen4_mq6_x4_pm_gfx1201_w16", 256, 512, batch_tile)
+    } else {
+        ("qwen4_mq6_x4_pm_gfx1201_w8", 128, 256, batch_tile)
+    }
+}
+
 /// Largest output extent, in bytes, a gfx11 builder-module PM kernel can address. The
 /// PM entries build their Y (and HC-stream / mirror) buffer descriptors raw with
 /// `num_records = 0x7fffffff` and index them with 32-bit byte offsets, so a store at or
@@ -40693,8 +40723,7 @@ impl Gpu {
                 ("qwen4_mq6_x4_pm_gfx1151_w8_bf16out", 128, 256, batch_tile)
             }
             None if pm1151 => ("qwen4_mq6_x4_pm_gfx1151_w8", 128, 256, batch_tile),
-            None if pm1201 && m <= 64 => ("qwen4_mq6_x4_pm_gfx1201_w4", 64, 128, batch_tile),
-            None if pm1201 => ("qwen4_mq6_x4_pm_gfx1201_w8", 128, 256, batch_tile),
+            None if pm1201 => mq6_x4_pm_gfx1201_entry(m, batch_size, batch_tile),
             None => (func_name, rows_per_block, block, batch_tile),
         };
         let group_bytes: usize = match bits {
@@ -40713,7 +40742,7 @@ impl Gpu {
                 "gemm_mqv2_residual_wmma_gfx11_bt: K must be a multiple of 256",
             ));
         }
-        // PM entries (gfx1151 `_w8[_bf16out]`, gfx1201 `_w4/_w8`) address Y through a raw
+        // PM entries (gfx1151 `_w8[_bf16out]`, gfx1201 `_w4/_w8/_w16`) address Y through a raw
         // 0x7fffffff descriptor with 32-bit byte offsets: refuse >= 2^31 bytes before the
         // X conversion below writes anything. The hipcc/U3 entries are not bound by it.
         if use_pm {
@@ -50905,7 +50934,8 @@ mod tests {
     /// The builder-module MQ6 overwrite GEMM (`HIPFIRE_QWEN4_MQ6_X4_PM`) must
     /// produce the hipcc `gemm_mq6g256v2_wmma_gfx12_bt8_x4` bytes: the 64-row
     /// entry (M <= 64), the 128-row entry with a full and a ragged row tail,
-    /// and token tails inside the last 256-token tile.
+    /// the 256-row `_w16` entry (whole 32-workgroup rounds, incl. a ragged row
+    /// tail), and token tails inside the last 256-token tile.
     #[test]
     #[ignore = "requires a gfx1201 GPU and working HIP toolchain"]
     fn mq6_x4_pm_matches_hipcc_bytes() {
@@ -50920,6 +50950,10 @@ mod tests {
             (10240usize, 2560usize, 512usize),
             (64, 2560, 300),
             (1003, 512, 257),
+            // `_w16`: ceil(512/256) * ceil(4096/256) = 32 workgroups.
+            (512, 512, 4096),
+            // `_w16` with a ragged row tail: 4 * 8 = 32 workgroups.
+            (1003, 512, 1800),
         ] {
             let group = crate::dispatch::MQ6G256V2_GROUP_BYTES;
             let mut weights = vec![0u8; m * k / 256 * group];
@@ -50989,6 +51023,49 @@ mod tests {
         }
         assert!(!mq6_x4_pm_gfx1151_shape(10240, 1131));
         assert!(!mq6_x4_pm_gfx1151_shape(10240, 512));
+    }
+
+    /// The gfx1201 PM entry symbol for `m` rows and `n` tokens.
+    fn mq6_x4_pm_gfx1201_symbol(m: usize, n: usize) -> &'static str {
+        mq6_x4_pm_gfx1201_entry(m, n, 8).0
+    }
+
+    /// The 256-row `_w16` entry is taken exactly when its workgroup count fills whole
+    /// rounds of 32 (the Mq6TrunkTune report cells).
+    #[test]
+    fn mq6_x4_pm_gfx1201_w16_shape_rule() {
+        for (m, n) in [
+            (10240usize, 1024usize),
+            (12288, 1024),
+            (2560, 4096),
+            (6144, 1024),
+            (512, 4096),
+        ] {
+            assert!(mq6_x4_pm_gfx1201_w16_shape(m, n), "M={m} N={n}");
+            assert_eq!(
+                mq6_x4_pm_gfx1201_symbol(m, n),
+                "qwen4_mq6_x4_pm_gfx1201_w16",
+                "M={m} N={n}"
+            );
+        }
+        for (m, n) in [(2560usize, 1024usize), (512, 1024), (640, 4096)] {
+            assert!(!mq6_x4_pm_gfx1201_w16_shape(m, n), "M={m} N={n}");
+            assert_eq!(
+                mq6_x4_pm_gfx1201_symbol(m, n),
+                "qwen4_mq6_x4_pm_gfx1201_w8",
+                "M={m} N={n}"
+            );
+        }
+        // The ragged-M GPU cell: 4 row blocks * 8 token tiles = 32.
+        assert!(mq6_x4_pm_gfx1201_w16_shape(1003, 1800));
+        // M <= 64 stays on `_w4` whatever the token count.
+        for n in [1usize, 300, 1024, 4096, 8192] {
+            assert_eq!(
+                mq6_x4_pm_gfx1201_symbol(64, n),
+                "qwen4_mq6_x4_pm_gfx1201_w4",
+                "N={n}"
+            );
+        }
     }
 
     /// The fused shared gate/up kernel's shape limits: 16-channel rows, 64-multiple K,

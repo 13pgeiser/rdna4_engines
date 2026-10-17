@@ -113,8 +113,9 @@
       "kind": "embedded",
       "module": "qwen4_mq6_x4_pm_gfx1201",
       "path": "/home/kaden/ClaudeCode/warpfront/wt-jit/kernels/qwen4_mq6_x4_pm_gfx1201.hxaco",
-      "sha256": "9a0b2c3455bc000fa40f1ef7a57acebbd94c7b9b18303e2b47e78cf7faac96c1",
+      "sha256": "3329205e119b0fa919300cfea160f376b8fc136618cab5b5e6b93beb141a8955",
       "symbols": [
+        "qwen4_mq6_x4_pm_gfx1201_w16",
         "qwen4_mq6_x4_pm_gfx1201_w4",
         "qwen4_mq6_x4_pm_gfx1201_w8"
       ],
@@ -132,10 +133,18 @@
             "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-flash-next-gfx1201-native",
             "resolved_process_success": true
           }
+        ],
+        "qwen4_mq6_x4_pm_gfx1201_w16": [
+          {
+            "selection_authority": "source-predicted",
+            "source_anchor": "mq6_x4_pm_gfx1201_entry (rdna-compute gemm.rs): M > 64 and ceil(M/256)*ceil(N/256) % 32 == 0; not yet observed in a module-load audit"
+          }
         ]
       },
       "repo_image": "kernels/qwen4_mq6_x4_pm_gfx1201.hxaco",
       "image_exports": [
+        "qwen4_mq6_x4_pm_gfx1201_w16",
+        "qwen4_mq6_x4_pm_gfx1201_w16.kd",
         "qwen4_mq6_x4_pm_gfx1201_w4",
         "qwen4_mq6_x4_pm_gfx1201_w4.kd",
         "qwen4_mq6_x4_pm_gfx1201_w8",

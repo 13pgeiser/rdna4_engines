@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Qwen4 MQ6 trunk GEMM builder family (gfx1201 W4 + W8 entries).
+//! Qwen4 MQ6 trunk GEMM builder family (gfx1201 W4, W8 and W16 entries).
 use peacemaker_isa::Arch;
 use peacemaker_isa::kernels::qwen4_mq6_x4::{self, Spec};
 #[macro_use]
@@ -17,13 +17,16 @@ fn entries_are_deterministic_and_target_only_gfx1201() {
         let spec = Spec { arch: ARCH, wr };
         let (a, b) = (qwen4_mq6_x4::emit(spec).unwrap(), qwen4_mq6_x4::emit(spec).unwrap());
         assert_eq!(a.proof.s_text_sha256, b.proof.s_text_sha256);
-        // One staging barrier per 32-K chunk of a group (eight) and one for the prologue stage.
-        assert_eq!((a.shape.barriers, a.shape.wmma), (9, 256), "{spec:?}");
+        // One staging barrier per 32-K chunk of a group (eight) and one for the
+        // prologue stage; W8/W16 add the X-slot retire before the epilogue and
+        // a publish per output pass (WR/2) plus a retire between passes.
+        let epilogue = if wr == 4 { 0 } else { 1 + 2 * usize::from(wr / 2) - 1 };
+        assert_eq!((a.shape.barriers, a.shape.wmma), (9 + epilogue, 256), "{spec:?}");
     }
     for arch in [Arch::Gfx1100, Arch::Gfx1151] {
         assert!(qwen4_mq6_x4::emit(Spec { arch, wr: 4 }).is_err());
     }
-    for wr in [0, 2, 6, 16] {
+    for wr in [0, 2, 6, 12, 32] {
         assert!(qwen4_mq6_x4::emit(Spec { arch: ARCH, wr }).is_err(), "wr {wr}");
     }
 }
@@ -107,9 +110,10 @@ mod toolchain {
         }
     }
 
-    /// Both entries use only the static allocation: every DS access of every
-    /// lane of every wave ends inside the two 20480-byte X slots, and the
-    /// bound is tight (one byte less is refused).
+    /// Every entry uses only the static allocation: every DS access of every
+    /// lane of every wave (the two 20480-byte X slots, and the W8/W16 output
+    /// stage over the same bytes) ends inside it, and the bound is tight (one
+    /// byte less is refused).
     #[test]
     fn static_lds_accesses_stay_inside_the_static_allocation() {
         for wr in Spec::ALL {

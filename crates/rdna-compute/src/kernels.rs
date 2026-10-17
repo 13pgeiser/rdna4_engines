@@ -4377,10 +4377,15 @@ pub const SPEC_ACCEPT_ORDERED_PM_GFX1201: &[u8] =
 /// exact twin of hipcc `gemm_mq6g256v2_wmma_gfx12_bt8_x4` (F32 overwrite, BT8
 /// X-LDS) in `kernels/src/qwen4_gemm_mq6g256v2_wmma_gfx12_x4.hip`, with that
 /// kernel's arguments and output bytes. Entries `qwen4_mq6_x4_pm_gfx1201_w4`
-/// (64-row block of 128 threads) and `_w8` (128-row block of 256 threads),
-/// both over 256-token tiles (grid `[ceil(M/rows), ceil(N/256), 1]`).
+/// (64-row block of 128 threads), `_w8` (128-row block of 256 threads) and
+/// `_w16` (256-row block of 512 threads), all over 256-token tiles (grid
+/// `[ceil(M/rows), ceil(N/256), 1]`). `_w4` takes M <= 64; above that `_w16` is
+/// taken iff `ceil(M/256) * ceil(N/256)` is a multiple of 32 (whole rounds of
+/// one 16-wave workgroup per WGP over the R9700's 32 WGPs), else `_w8`; see
+/// `gemm::mq6_x4_pm_gfx1201_w16_shape`. The `_w8`/`_w16` epilogues stage the
+/// output tile through LDS for coalesced stores.
 /// Default on (`HIPFIRE_QWEN4_MQ6_X4_PM=0` keeps the hipcc kernel).
-/// SHA-256 9a0b2c3455bc000fa40f1ef7a57acebbd94c7b9b18303e2b47e78cf7faac96c1
+/// SHA-256 3329205e119b0fa919300cfea160f376b8fc136618cab5b5e6b93beb141a8955
 /// (`sha256sum kernels/qwen4_mq6_x4_pm_gfx1201.hxaco`).
 pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] =
     include_bytes!("../../../kernels/qwen4_mq6_x4_pm_gfx1201.hxaco");

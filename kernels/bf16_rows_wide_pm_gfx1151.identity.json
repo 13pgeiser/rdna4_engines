@@ -1020,9 +1020,9 @@
         "all"
       ],
       "exit_code": 0,
-      "expected_sha256": "9a0b2c3455bc000fa40f1ef7a57acebbd94c7b9b18303e2b47e78cf7faac96c1",
+      "expected_sha256": "3329205e119b0fa919300cfea160f376b8fc136618cab5b5e6b93beb141a8955",
       "stderr": "",
-      "actual_sha256": "9a0b2c3455bc000fa40f1ef7a57acebbd94c7b9b18303e2b47e78cf7faac96c1",
+      "actual_sha256": "3329205e119b0fa919300cfea160f376b8fc136618cab5b5e6b93beb141a8955",
       "byte_identical": true
     },
     {
