@@ -541,6 +541,9 @@ pub struct Fixture {
     pub prompts: Vec<FixturePrompt>,
     pub continuation_ids: Vec<u32>,
     pub failure_injections: Vec<String>,
+    /// Marker id (`boundary_token_id`) at row `cut - 1` of every requested
+    /// boundary of the boundary prompt and nowhere else.
+    pub boundary_token_id: u32,
 }
 
 fn usize_list(value: Option<&Value>, what: &str) -> Result<Vec<usize>, String> {
@@ -563,6 +566,204 @@ fn u32_list(value: Option<&Value>, what: &str) -> Result<Vec<u32>, String> {
         .into_iter()
         .map(|n| u32::try_from(n).map_err(|_| format!("{what}: id {n} exceeds u32")))
         .collect()
+}
+
+/// Row-prompt ids are drawn from `LCG_ID_MIN..LCG_ID_MAX`; the boundary
+/// marker id must lie outside it so it occurs only where the fixture put it.
+pub const LCG_ID_MIN: u32 = 1000;
+pub const LCG_ID_MAX: u32 = 100_000;
+
+/// Problems with a boundary prompt's marker ids: every requested cut is an
+/// interior row boundary whose preceding row (`cut - 1`) holds `marker`, and
+/// the marker occurs nowhere else (no unrequested snapshot boundary). The
+/// caller's ids are checked, never rewritten.
+pub fn boundary_fixture_problems(ids: &[u32], cuts: &[usize], marker: u32) -> Vec<String> {
+    let mut bad = Vec::new();
+    if cuts.is_empty() {
+        bad.push("the boundary prompt requests no boundaries".to_string());
+    }
+    if cuts.windows(2).any(|w| w[0] >= w[1]) {
+        bad.push("requested boundaries are not strictly ascending".to_string());
+    }
+    for &cut in cuts {
+        if cut == 0 || cut >= ids.len() {
+            bad.push(format!(
+                "requested boundary {cut} is outside 1..{}",
+                ids.len()
+            ));
+        } else if ids[cut - 1] != marker {
+            bad.push(format!(
+                "requested boundary {cut}: row {} holds id {}, not the marker {marker}",
+                cut - 1,
+                ids[cut - 1]
+            ));
+        }
+    }
+    for (row, _) in ids.iter().enumerate().filter(|(_, &id)| id == marker) {
+        if !cuts.contains(&(row + 1)) {
+            bad.push(format!(
+                "marker {marker} at row {row} would add the unrequested boundary {}",
+                row + 1
+            ));
+        }
+    }
+    bad
+}
+
+/// Whole-prompt boundary prefill evidence: a receipt exists and, on the
+/// layer-major route, every requested cut is an executed exit (a launch cut
+/// or a window edge), since a snapshot at `cut` needs the request to stop
+/// there. The incumbent route's exits are not receipted, so only the receipt
+/// itself is required of it.
+pub fn boundary_capture_problems(
+    cuts: &[usize],
+    receipt: Option<&Value>,
+    layer_major: bool,
+) -> Vec<String> {
+    let Some(receipt) = receipt else {
+        return vec!["no receipt for the whole-prompt boundary prefill".to_string()];
+    };
+    if !layer_major {
+        return Vec::new();
+    }
+    let mut exits: std::collections::BTreeSet<u64> = receipt["launch_cuts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_u64)
+        .collect();
+    for window in receipt["windows"].as_array().into_iter().flatten() {
+        if let (Some(start), Some(rows)) = (window["start"].as_u64(), window["rows"].as_u64()) {
+            exits.insert(start);
+            exits.insert(start.saturating_add(rows));
+        }
+    }
+    cuts.iter()
+        .filter(|&&cut| !exits.contains(&(cut as u64)))
+        .map(|cut| {
+            format!("requested boundary {cut} is not an executed exit (launch cuts / window edges)")
+        })
+        .collect()
+}
+
+/// What the cache planned for one boundary: exactly `cut` rows, from a stored
+/// snapshot rather than live state.
+pub fn boundary_plan_problems(cut: usize, planned: usize, live: bool) -> Vec<String> {
+    let mut bad = Vec::new();
+    if planned != cut {
+        bad.push(format!(
+            "session cache planned {planned} reused rows, not the requested boundary {cut}"
+        ));
+    }
+    if live {
+        bad.push("the plan continued live state, not a stored snapshot".to_string());
+    }
+    bad
+}
+
+/// One boundary's restore case: the plan ([`boundary_plan_problems`]) and the
+/// restored request, which must have computed only the rows after the cut
+/// (`entry_pos == cut`), so a cold recompute or a shallower snapshot never
+/// passes as the requested boundary.
+pub fn boundary_restore_problems(
+    cut: usize,
+    planned: usize,
+    live: bool,
+    receipt: Option<&Value>,
+    extended_rows: usize,
+) -> Vec<String> {
+    let mut bad = boundary_plan_problems(cut, planned, live);
+    match receipt {
+        None => bad.push("no receipt for the restored request".to_string()),
+        Some(r) => {
+            let want_rows = extended_rows.saturating_sub(cut) as u64;
+            if u64_at(r, "entry_pos") != Some(cut as u64) {
+                bad.push(format!(
+                    "restored request entry_pos {:?} != {cut}",
+                    u64_at(r, "entry_pos")
+                ));
+            }
+            if u64_at(r, "prompt_rows") != Some(want_rows) {
+                bad.push(format!(
+                    "restored request computed {:?} rows, expected {want_rows}",
+                    u64_at(r, "prompt_rows")
+                ));
+            }
+        }
+    }
+    bad
+}
+
+/// Every requested boundary needs an executed case that reused exactly its
+/// cut; `reused` is `(cut, reused rows)` per executed case.
+pub fn boundary_coverage_problems(requested: &[usize], reused: &[(usize, usize)]) -> Vec<String> {
+    requested
+        .iter()
+        .filter_map(|&cut| match reused.iter().find(|(c, _)| *c == cut) {
+            None => Some(format!("requested boundary {cut}: case never executed")),
+            Some(&(_, rows)) if rows != cut => Some(format!(
+                "requested boundary {cut}: reused {rows} rows, not {cut}"
+            )),
+            Some(_) => None,
+        })
+        .collect()
+}
+
+/// The 16K natural-cadence boundary case: ONE whole prefill of the 16384-row
+/// prompt plus `BOUNDARY16K_TAIL_ROWS` continuation rows, under the unchanged
+/// 8192-row snapshot cadence (no marker policy), must leave strict pool
+/// snapshots at BOTH cuts.
+pub const BOUNDARY16K_CUTS: [usize; 2] = [8192, 16384];
+pub const BOUNDARY16K_TAIL_ROWS: usize = 3;
+
+/// Required check names of the 16K boundary case.
+pub fn boundary16k_required() -> Vec<String> {
+    let mut names = vec!["state.boundary16k.capture".to_string()];
+    names.extend(
+        BOUNDARY16K_CUTS
+            .iter()
+            .map(|cut| format!("state.boundary16k.{cut}.restore")),
+    );
+    names
+}
+
+/// The 16K case's whole prompt: the 16384-row prompt ids as given plus the
+/// first `BOUNDARY16K_TAIL_ROWS` continuation ids (so 16384 is an interior
+/// boundary), refused when it does not fit `max_seq` with decode.
+pub fn boundary16k_prompt(
+    rows: &[u32],
+    continuation: &[u32],
+    max_seq: usize,
+    decode: usize,
+) -> Result<Vec<u32>, String> {
+    if rows.len() != 16384 {
+        return Err(format!("the 16K prompt has {} rows, not 16384", rows.len()));
+    }
+    if continuation.len() < BOUNDARY16K_TAIL_ROWS {
+        return Err(format!(
+            "continuation has {} ids, the 16K case needs {BOUNDARY16K_TAIL_ROWS}",
+            continuation.len()
+        ));
+    }
+    let mut ids = rows.to_vec();
+    ids.extend_from_slice(&continuation[..BOUNDARY16K_TAIL_ROWS]);
+    if ids.len() + decode + 1 > max_seq {
+        return Err(format!(
+            "{} rows + decode {decode} do not fit max_seq {max_seq}",
+            ids.len()
+        ));
+    }
+    Ok(ids)
+}
+
+/// The largest requested cut whose case executed and fully verified
+/// (`(cut, verified)` per requested case); `None` if none did.
+pub fn largest_verified_cut(cases: &[(usize, bool)]) -> Option<usize> {
+    cases
+        .iter()
+        .filter(|(_, verified)| *verified)
+        .map(|(cut, _)| *cut)
+        .max()
 }
 
 impl Fixture {
@@ -708,6 +909,30 @@ impl Fixture {
                 return Err(format!("fixture lacks a {kind} prompt"));
             }
         }
+        // The explicit message-end marker the boundary prompt carries at every
+        // requested cut - 1 (`Qwen4Bundle::set_turn_end_token` makes it a
+        // snapshot boundary). Pinned by the fixture, outside the row-prompt id
+        // range, never inferred from the artifact's own EOS/`<|im_end|>` id.
+        let boundary_token_id = value
+            .get("boundary_token_id")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or("fixture boundary_token_id missing or not a u32 (the explicit marker id the boundary prompt carries at every requested cut - 1)")?;
+        if (LCG_ID_MIN..LCG_ID_MAX).contains(&boundary_token_id) {
+            return Err(format!(
+                "fixture boundary_token_id {boundary_token_id} lies inside the row-prompt id range {LCG_ID_MIN}..{LCG_ID_MAX}"
+            ));
+        }
+        for prompt in prompts.iter().filter(|p| p.kind == "boundary") {
+            let bad = boundary_fixture_problems(
+                &prompt.prompt_ids,
+                &prompt.requested_boundaries,
+                boundary_token_id,
+            );
+            if !bad.is_empty() {
+                return Err(format!("boundary prompt {}: {}", prompt.id, bad.join("; ")));
+            }
+        }
         let continuation_ids = u32_list(value.get("continuation_ids"), "continuation_ids")?;
         if continuation_ids.is_empty() {
             return Err("fixture has no continuation_ids (divergent continuation)".into());
@@ -741,8 +966,454 @@ impl Fixture {
             prompts,
             continuation_ids,
             failure_injections,
+            boundary_token_id,
         })
     }
+}
+
+// ── process memory telemetry ───────────────────────────────────────────
+//
+// Opaque HIP driver/event memory has no prior measurement: Hold 1's first cell
+// measures it. The ledger names two ALLOWANCES (not measurements); the gate
+// fails when the observed residual over the OWNED census exceeds them, or when
+// any required telemetry is not observable. Nothing here is estimated.
+
+/// Allowed unowned driver/event VRAM residual: exactly 1.5 GiB.
+pub const UNOWNED_VRAM_ALLOWANCE_BYTES: u64 = 1_610_612_736;
+/// Allowed unowned driver/event host residual: exactly 2 GiB.
+pub const UNOWNED_HOST_ALLOWANCE_BYTES: u64 = 2_147_483_648;
+/// Period of the background `/proc` sampler.
+pub const SAMPLER_PERIOD_MS: u64 = 50;
+/// Phase samples every run must contain.
+pub const MEMORY_PHASES: [&str; 3] = ["pre_load", "post_load", "end"];
+/// Label of the background sampler's running maxima.
+pub const SAMPLER_LABEL: &str = "sampler_max";
+
+/// One reading of this process's memory counters (bytes). `None` = the
+/// counter was not observable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProcCounters {
+    /// `/proc/self/status` `VmRSS` (includes reclaimable file pages).
+    pub vm_rss: Option<u64>,
+    /// `RssAnon`.
+    pub rss_anon: Option<u64>,
+    /// `VmPin`: pages pinned by the driver or `mlock`.
+    pub vm_pin: Option<u64>,
+    /// `VmHWM`: the kernel's continuous RSS high-water mark.
+    pub vm_hwm: Option<u64>,
+    /// `RssFile`: file-backed resident pages (HFQ/PLE page cache mappings).
+    /// Reclaimable, so recorded but never judged against an allowance.
+    pub rss_file: Option<u64>,
+    /// `RssShmem`: shared-memory resident pages; recorded only.
+    pub rss_shmem: Option<u64>,
+    /// Clean RSS (`Shared_Clean + Private_Clean`, `/proc/self/smaps`) of
+    /// REGULAR-FILE mappings only: the page-cache-backed, reclaimable part.
+    /// Device (`/dev/kfd*`, `/dev/dri/*`), `/dev/zero`, anonymous, memfd and
+    /// deleted mappings are never in it, so pinned KFD buffer objects are not
+    /// subtracted.
+    pub reclaimable_file_clean: Option<u64>,
+    /// `VmRSS - reclaimable_file_clean`, both read in the same sample.
+    pub host_rss_unreclaimable: Option<u64>,
+    /// This process's amdgpu `drm-memory-vram`, summed over unique DRM clients.
+    pub drm_vram: Option<u64>,
+    /// This process's amdgpu `drm-memory-gtt` (process GTT), same dedup.
+    pub drm_gtt: Option<u64>,
+}
+
+impl ProcCounters {
+    /// Raise every counter to the larger of the two; an observed value
+    /// replaces an unobserved one.
+    pub fn merge_max(&mut self, other: &ProcCounters) {
+        fn raise(a: &mut Option<u64>, b: Option<u64>) {
+            if let Some(b) = b {
+                *a = Some(a.map_or(b, |a| a.max(b)));
+            }
+        }
+        raise(&mut self.vm_rss, other.vm_rss);
+        raise(&mut self.rss_anon, other.rss_anon);
+        raise(&mut self.vm_pin, other.vm_pin);
+        raise(&mut self.vm_hwm, other.vm_hwm);
+        raise(&mut self.rss_file, other.rss_file);
+        raise(&mut self.rss_shmem, other.rss_shmem);
+        raise(
+            &mut self.reclaimable_file_clean,
+            other.reclaimable_file_clean,
+        );
+        raise(
+            &mut self.host_rss_unreclaimable,
+            other.host_rss_unreclaimable,
+        );
+        raise(&mut self.drm_vram, other.drm_vram);
+        raise(&mut self.drm_gtt, other.drm_gtt);
+    }
+}
+
+/// Bytes of `key` (`VmRSS`, ...) in `/proc/<pid>/status` text (`kB` lines).
+pub fn status_bytes(text: &str, key: &str) -> Option<u64> {
+    let rest = text
+        .lines()
+        .find_map(|line| line.strip_prefix(key)?.strip_prefix(':'))?;
+    let mut parts = rest.split_whitespace();
+    let n: u64 = parts.next()?.parse().ok()?;
+    match parts.next() {
+        Some("kB") => n.checked_mul(1024),
+        None => Some(n),
+        Some(_) => None,
+    }
+}
+
+/// One amdgpu DRM client of a process (`/proc/<pid>/fdinfo/<fd>`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DrmClient {
+    pub id: String,
+    pub vram: Option<u64>,
+    pub gtt: Option<u64>,
+}
+
+fn fdinfo_bytes(value: &str) -> Option<u64> {
+    let mut parts = value.split_whitespace();
+    let n: u64 = parts.next()?.parse().ok()?;
+    let unit: u64 = match parts.next() {
+        None => 1,
+        Some("KiB") => 1 << 10,
+        Some("MiB") => 1 << 20,
+        Some("GiB") => 1 << 30,
+        Some(_) => return None,
+    };
+    n.checked_mul(unit)
+}
+
+/// The amdgpu client an fdinfo text describes; `None` for any other file or
+/// driver, or a client without an id.
+pub fn parse_drm_fdinfo(text: &str) -> Option<DrmClient> {
+    let (mut driver, mut id, mut vram, mut gtt) = (None, None, None, None);
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "drm-driver" => driver = Some(value.to_string()),
+            "drm-client-id" => id = Some(value.to_string()),
+            "drm-memory-vram" => vram = fdinfo_bytes(value),
+            "drm-memory-gtt" => gtt = fdinfo_bytes(value),
+            _ => {}
+        }
+    }
+    if driver.as_deref() != Some("amdgpu") {
+        return None;
+    }
+    Some(DrmClient { id: id?, vram, gtt })
+}
+
+/// `(vram, gtt)` summed over unique client ids (several fds may share one
+/// client). `None` when there is no amdgpu client or any client lacks either
+/// counter: that is "not observable", never zero.
+pub fn drm_totals(clients: &[DrmClient]) -> Option<(u64, u64)> {
+    let mut unique = std::collections::BTreeMap::new();
+    for client in clients {
+        unique.entry(client.id.as_str()).or_insert(client);
+    }
+    if unique.is_empty() {
+        return None;
+    }
+    let (mut vram, mut gtt) = (0u64, 0u64);
+    for client in unique.values() {
+        vram = vram.checked_add(client.vram?)?;
+        gtt = gtt.checked_add(client.gtt?)?;
+    }
+    Some((vram, gtt))
+}
+
+/// Class of one `/proc/<pid>/smaps` mapping; the same rules as the hold
+/// sampler `sample_mem.py` (`classify`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapClass {
+    KfdDri,
+    Zero,
+    Anon,
+    File,
+}
+
+pub fn classify_mapping(path: &str) -> MapClass {
+    if path.starts_with("/dev/kfd") || path.starts_with("/dev/dri") {
+        MapClass::KfdDri
+    } else if path.starts_with("/dev/zero") {
+        MapClass::Zero
+    } else if path.is_empty()
+        || path.starts_with('[')
+        || path.starts_with("/memfd:")
+        || path.starts_with("memfd:")
+        || path.contains("(deleted)")
+    {
+        MapClass::Anon
+    } else if path.starts_with('/') {
+        MapClass::File
+    } else {
+        MapClass::Anon
+    }
+}
+
+/// Bytes of clean (`Shared_Clean + Private_Clean`) resident pages of the
+/// regular-file mappings in `/proc/<pid>/smaps` text. `None` when the text has
+/// no mapping at all (unreadable smaps): not observable, never zero.
+pub fn smaps_regular_file_clean_bytes(text: &str) -> Option<u64> {
+    let mut class = MapClass::Anon;
+    let mut mappings = 0usize;
+    let mut clean_kb = 0u64;
+    for line in text.lines() {
+        let first = line.split_whitespace().next().unwrap_or("");
+        let is_header = !first.ends_with(':')
+            && first.contains('-')
+            && first.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+        if is_header {
+            // `addr perms offset dev inode [path]`: the path may hold spaces.
+            let mut rest = line;
+            for _ in 0..5 {
+                rest = rest.trim_start();
+                rest = rest.split_once(char::is_whitespace).map_or("", |(_, r)| r);
+            }
+            class = classify_mapping(rest.trim());
+            mappings += 1;
+        } else if class == MapClass::File {
+            if let Some(value) = line
+                .strip_prefix("Shared_Clean:")
+                .or_else(|| line.strip_prefix("Private_Clean:"))
+            {
+                let kb: u64 = value.split_whitespace().next()?.parse().ok()?;
+                clean_kb = clean_kb.checked_add(kb)?;
+            }
+        }
+    }
+    if mappings == 0 {
+        return None;
+    }
+    clean_kb.checked_mul(1024)
+}
+
+/// This process's counters right now: `/proc/self/status`, `/proc/self/fdinfo`
+/// and, with `with_smaps`, `/proc/self/smaps` (the clean regular-file RSS).
+/// A counter that cannot be read stays `None`.
+pub fn read_proc_counters(with_smaps: bool) -> ProcCounters {
+    let mut counters = ProcCounters::default();
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        counters.vm_rss = status_bytes(&status, "VmRSS");
+        counters.rss_anon = status_bytes(&status, "RssAnon");
+        counters.vm_pin = status_bytes(&status, "VmPin");
+        counters.vm_hwm = status_bytes(&status, "VmHWM");
+        counters.rss_file = status_bytes(&status, "RssFile");
+        counters.rss_shmem = status_bytes(&status, "RssShmem");
+    }
+    if with_smaps {
+        if let Ok(smaps) = std::fs::read_to_string("/proc/self/smaps") {
+            counters.reclaimable_file_clean = smaps_regular_file_clean_bytes(&smaps);
+        }
+        if let (Some(rss), Some(clean)) = (counters.vm_rss, counters.reclaimable_file_clean) {
+            counters.host_rss_unreclaimable = Some(rss.saturating_sub(clean));
+        }
+    }
+    let mut clients = Vec::new();
+    if let Ok(dir) = std::fs::read_dir("/proc/self/fdinfo") {
+        for entry in dir.flatten() {
+            if let Some(client) = std::fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|text| parse_drm_fdinfo(&text))
+            {
+                clients.push(client);
+            }
+        }
+    }
+    if let Some((vram, gtt)) = drm_totals(&clients) {
+        counters.drm_vram = Some(vram);
+        counters.drm_gtt = Some(gtt);
+    }
+    counters
+}
+
+/// A labeled sample as JSON: `device` is `hipMemGetInfo` `(free, total)`.
+pub fn counters_json(
+    label: &str,
+    method: &str,
+    counters: &ProcCounters,
+    device: Option<(u64, u64)>,
+) -> Value {
+    json!({
+        "label": label, "method": method,
+        "device_free": device.map(|d| d.0), "device_total": device.map(|d| d.1),
+        "vm_rss": counters.vm_rss, "rss_anon": counters.rss_anon, "vm_pin": counters.vm_pin,
+        "vm_hwm": counters.vm_hwm, "drm_vram": counters.drm_vram, "drm_gtt": counters.drm_gtt,
+        "rss_file": counters.rss_file, "rss_shmem": counters.rss_shmem,
+        "reclaimable_regular_file_clean_bytes": counters.reclaimable_file_clean,
+        "host_rss_unreclaimable": counters.host_rss_unreclaimable,
+    })
+}
+
+/// The owned-census basis the manifest declares for the cell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryLedger {
+    /// COMMITTED device census the process owns by ledger (weights, state,
+    /// scratch, S1 reserve, diagnostics). It is a positive integer, not a pool
+    /// semantic: the session-cache BUDGET cap (2 GiB fixture) and the pending
+    /// ceiling are NOT committed census and are not included. The SessionCache
+    /// sits outside the S1 reserve; the first primitive cell runs with an empty
+    /// cache, so the residual is valid, and cache occupancy/evictions are logged
+    /// per case through `cache_usage`, never folded into this figure.
+    pub owned_device_bytes: u64,
+    /// Host pinned/anonymous bytes the process owns by ledger.
+    pub owned_host_bytes: u64,
+    /// How the census was derived (non-empty).
+    pub census_basis: String,
+}
+
+/// The owned census from `memory_ledger.{owned_device_bytes,
+/// owned_host_bytes,census_basis}`; any missing or zero figure refuses.
+pub fn memory_ledger(manifest: &Value) -> Result<MemoryLedger, String> {
+    let bytes = |path: &str| {
+        u64_at(manifest, path).filter(|&n| n > 0).ok_or_else(|| {
+            format!("manifest key {path} missing or not a positive integer (owned census bytes)")
+        })
+    };
+    let census_basis = get(manifest, "memory_ledger.census_basis")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or(
+            "manifest key memory_ledger.census_basis missing (how the owned census was derived)",
+        )?
+        .to_string();
+    Ok(MemoryLedger {
+        owned_device_bytes: bytes("memory_ledger.owned_device_bytes")?,
+        owned_host_bytes: bytes("memory_ledger.owned_host_bytes")?,
+        census_basis,
+    })
+}
+
+/// Judge the run's memory samples against the owned census: every phase
+/// sample, the background sampler's maxima and every required counter must be
+/// present, and the unowned residual must not exceed the fixed allowances.
+///
+/// Device observed = max(process `drm-memory-vram`, `hipMemGetInfo` used
+/// minus the `pre_load` used). Host observed = max over the single counters
+/// `host_rss_unreclaimable` (`VmRSS` minus the CLEAN RSS of regular-file
+/// mappings only, from smaps), `VmPin` and process `drm-memory-gtt` (never
+/// summed: pinned pages appear in more than one; clean regular-file pages are
+/// the only subtracted class, never the whole `RssFile`, which holds pinned
+/// KFD buffer objects). Returns `(problems, memory receipt)`.
+pub fn memory_problems(samples: &[Value], ledger: &MemoryLedger) -> (Vec<String>, Value) {
+    let mut bad = Vec::new();
+    for phase in MEMORY_PHASES {
+        if !samples.iter().any(|s| s["label"] == phase) {
+            bad.push(format!("memory sample {phase} missing"));
+        }
+    }
+    match samples.iter().find(|s| s["label"] == SAMPLER_LABEL) {
+        None => bad.push("background memory sampler result missing".to_string()),
+        Some(s) if s["samples"].as_u64().unwrap_or(0) == 0 => {
+            bad.push("background memory sampler took no samples".to_string())
+        }
+        Some(_) => {}
+    }
+    for sample in samples {
+        let label = sample["label"].as_str().unwrap_or("?");
+        let mut keys = vec![
+            "vm_rss",
+            "vm_pin",
+            "drm_vram",
+            "drm_gtt",
+            "reclaimable_regular_file_clean_bytes",
+            "host_rss_unreclaimable",
+        ];
+        if label != SAMPLER_LABEL {
+            keys.extend(["device_free", "device_total"]);
+        }
+        for key in keys {
+            if sample[key].as_u64().is_none() {
+                bad.push(format!("telemetry {key} not observable at sample {label}"));
+            }
+        }
+    }
+    let used = |s: &Value| {
+        Some(
+            s["device_total"]
+                .as_u64()?
+                .saturating_sub(s["device_free"].as_u64()?),
+        )
+    };
+    let base = samples
+        .iter()
+        .find(|s| s["label"] == "pre_load")
+        .and_then(used);
+    let max_key = |key: &str| samples.iter().filter_map(|s| s[key].as_u64()).max();
+    let hip_delta_max = base.and_then(|b| {
+        samples
+            .iter()
+            .filter_map(used)
+            .map(|u| u.saturating_sub(b))
+            .max()
+    });
+    let (drm_vram, host_rss, vm_pin, drm_gtt) = (
+        max_key("drm_vram"),
+        max_key("host_rss_unreclaimable"),
+        max_key("vm_pin"),
+        max_key("drm_gtt"),
+    );
+    let device_observed = [drm_vram, hip_delta_max].into_iter().flatten().max();
+    let host_observed = [host_rss, vm_pin, drm_gtt].into_iter().flatten().max();
+    let vram_residual = device_observed.map(|o| o.saturating_sub(ledger.owned_device_bytes));
+    let host_residual = host_observed.map(|o| o.saturating_sub(ledger.owned_host_bytes));
+    match vram_residual {
+        None => bad.push("no device memory usage was observed".to_string()),
+        Some(r) if r > UNOWNED_VRAM_ALLOWANCE_BYTES => bad.push(format!(
+            "unowned VRAM residual {r} B exceeds the {UNOWNED_VRAM_ALLOWANCE_BYTES} B allowance"
+        )),
+        Some(_) => {}
+    }
+    match host_residual {
+        None => bad.push("no host memory usage was observed".to_string()),
+        Some(r) if r > UNOWNED_HOST_ALLOWANCE_BYTES => bad.push(format!(
+            "unowned host residual {r} B exceeds the {UNOWNED_HOST_ALLOWANCE_BYTES} B allowance"
+        )),
+        Some(_) => {}
+    }
+    bad.sort();
+    bad.dedup();
+    let receipt = json!({
+        "samples": samples,
+        "ledger": {
+            "owned_device_bytes": ledger.owned_device_bytes,
+            "owned_host_bytes": ledger.owned_host_bytes,
+            "census_basis": ledger.census_basis,
+        },
+        "allowances": {
+            "unowned_vram_bytes": UNOWNED_VRAM_ALLOWANCE_BYTES,
+            "unowned_host_bytes": UNOWNED_HOST_ALLOWANCE_BYTES,
+            "note": "named allowances fixed in the gate (1.5 GiB VRAM, 2 GiB host), not measurements",
+        },
+        "high_water": {
+            "drm_vram": drm_vram, "hipmemgetinfo_used_delta": hip_delta_max,
+            "host_rss_unreclaimable": host_rss, "vm_pin": vm_pin, "drm_gtt": drm_gtt,
+            "rss_anon": max_key("rss_anon"),
+            "reclaimable_regular_file_clean_bytes": max_key("reclaimable_regular_file_clean_bytes"),
+            "vm_rss": max_key("vm_rss"), "vm_hwm": max_key("vm_hwm"),
+            "rss_file": max_key("rss_file"), "rss_shmem": max_key("rss_shmem"),
+            "rss_file_note": "RssFile and the clean regular-file RSS are recorded; only the clean regular-file class is subtracted from VmRSS (pinned KFD buffer-object file maps stay counted); RssShmem and RssAnon are recorded only",
+            "sampling": format!("maximum over the labeled phase samples and a background /proc sampler ({SAMPLER_PERIOD_MS} ms period, discrete points, not a continuous high-water); vm_hwm is the kernel's continuous RSS high-water"),
+        },
+        "observed": {
+            "device": device_observed,
+            "device_basis": "max(process drm-memory-vram, hipMemGetInfo used minus pre_load used)",
+            "host": host_observed,
+            "host_basis": "max(VmRSS - clean RSS of regular-file mappings, VmPin, process drm-memory-gtt), one counter each, never summed",
+        },
+        "residual": {
+            "vram_bytes": vram_residual, "host_bytes": host_residual,
+            "host_by_counter": {
+                "host_rss_unreclaimable": host_rss.map(|o| o.saturating_sub(ledger.owned_host_bytes)),
+                "vm_pin": vm_pin.map(|o| o.saturating_sub(ledger.owned_host_bytes)),
+                "drm_gtt": drm_gtt.map(|o| o.saturating_sub(ledger.owned_host_bytes)),
+            },
+        },
+    });
+    (bad, receipt)
 }
 
 // ── manifest identity ──────────────────────────────────────────────────
