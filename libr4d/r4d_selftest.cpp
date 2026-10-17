@@ -4650,6 +4650,173 @@ static void i8a8_numeric(const Plugin& pl, const char* row, int64_t M, int64_t N
     ok(nm, rel < 5e-3, d);
 }
 
+/* The rotated int8 trunk against the f32 product it approximates. i8a8_numeric's reference uses
+ * the quantiser's own codes, so it would pass with the weight and activation rotated by different
+ * transforms; this one measures meaning. The weight is quantised on the host as libquant writes
+ * `codes=i8 group=128 scale=bf16 transform=fwht128` (each 128 of K rotated by h_fwht, the 1/128 in
+ * the stored scale) and the activation by had_quant_act_i8g on the device, so the pair holds only
+ * if h_fwht and r4d_fwht_wave are one transform and the 1/128 is divided out exactly once.
+ *
+ * Three pairings against the exact product of the sources: plain weight with quant_act_i8g
+ * (i8a8), rotated weight with had_quant_act_i8g (i8a8h), and the rotated weight with the plain
+ * quantiser, the mismatch a container served under the wrong dtype would produce, which must
+ * measure far off. Outlier columns make the rotated grid the better one. */
+static void i8a8h_rot(const Plugin& pl, const char* row, int64_t M, int64_t N, int64_t K) {
+    if (!sel(row) && !sel("had_quant_act_i8g")) return;
+    char nm[160];
+    std::snprintf(nm, sizeof nm, "%s i8a8h + had_quant_act_i8g vs the f32 it approximates, "
+                  "M=%lld N=%lld K=%lld", row, (long long)M, (long long)N, (long long)K);
+    const RadKernelInfo* r  = find(pl, row);
+    const RadKernelInfo* qp = find(pl, "quant_act_i8g");
+    const RadKernelInfo* qh = find(pl, "had_quant_act_i8g");
+    if (!r || !qp || !qh || !r->layout || !r->relayout) { ok(nm, false, "rows or hooks absent"); return; }
+    const int64_t nkb = K / 128;
+
+    /* Outliers every 37th weight column and 23rd activation column, six times the body. */
+    std::vector<float> wsrc((size_t)(N * K)), xsrc((size_t)(M * K));
+    std::vector<uint16_t> xbf((size_t)(M * K));
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t k = 0; k < K; ++k) {
+            float v = (float)(((n * 31 + k * 17) % 61) - 30) / 37.0f * 0.02f;
+            if (k % 37 == 0) v *= 6.0f;
+            wsrc[(size_t)(n * K + k)] = v;
+        }
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t k = 0; k < K; ++k) {
+            float v = (float)(((m * 29 + k * 11) % 53) - 26) / 41.0f;
+            if (k % 23 == 0) v *= 6.0f;
+            /* Rounded through bf16 here, so the reference reads the number the device does. */
+            const uint16_t h = h_to_bf16(v);
+            xbf [(size_t)(m * K + k)] = h;
+            xsrc[(size_t)(m * K + k)] = h_bf16(h);
+        }
+    std::vector<double> want((size_t)(M * N), 0.0);
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t n = 0; n < N; ++n) {
+            double acc = 0.0;
+            for (int64_t k = 0; k < K; ++k)
+                acc += (double)wsrc[(size_t)(n * K + k)] * (double)xsrc[(size_t)(m * K + k)];
+            want[(size_t)(m * N + n)] = acc;
+        }
+
+    /* The weight as libquant's rtn writes it: codes against the rounded scale, and the rotated
+     * form then stores that scale over 128, exact in bf16. */
+    auto planes = [&](bool rot) {
+        Planes p;
+        p.enc = rad_enc_affine(RAD_I8, RAD_BF16, 1, 128);
+        if (rot) rad_enc_copy_str(p.enc.transform, "fwht128");
+        p.size(N, K);
+        std::vector<float> v(128);
+        for (int64_t n = 0; n < N; ++n)
+            for (int64_t g = 0; g < nkb; ++g) {
+                for (int64_t j = 0; j < 128; ++j) v[(size_t)j] = wsrc[(size_t)(n * K + g * 128 + j)];
+                if (rot) h_fwht(v.data(), 128);
+                float amax = 0.0f;
+                for (float x : v) amax = std::max(amax, std::fabs(x));
+                rad_store_f32(p.data[1].data(), RAD_BF16, n * nkb + g, amax > 0 ? amax / 127.0f : 1.0f);
+                const float s = rad_load_f32(p.data[1].data(), RAD_BF16, n * nkb + g);
+                for (int64_t j = 0; j < 128; ++j)
+                    p.data[0][(size_t)(n * K + g * 128 + j)] =
+                        (uint8_t)(int8_t)std::max(-127.0f, std::min(127.0f, std::nearbyint(v[(size_t)j] / s)));
+                if (rot) rad_store_f32(p.data[1].data(), RAD_BF16, n * nkb + g, s / 128.0f);
+            }
+        return p;
+    };
+    const Planes plain = planes(false), rotated = planes(true);
+
+    /* The bytes, extents and arrangement of the two forms are identical, so the encoding is the
+     * only guard: each dtype takes its own and refuses the other, under tags of their own. */
+    {
+        const std::vector<RadParam> lp8  = { PI("N", N), PI("K", K), PI("group", 128), PS("dtype", "i8a8") };
+        const std::vector<RadParam> lp8h = { PI("N", N), PI("K", K), PI("group", 128), PS("dtype", "i8a8h") };
+        std::vector<uint8_t> scratch;
+        RadLayout lplain{}, lrot{};
+        const int own_plain = stored(r, lp8,  2, plain,   { "codes" }, &scratch, &lplain);
+        const int own_rot   = stored(r, lp8h, 2, rotated, { "codes" }, &scratch, &lrot);
+        const int cross_a   = stored(r, lp8,  2, rotated, { "codes" }, &scratch);
+        const int cross_b   = stored(r, lp8h, 2, plain,   { "codes" }, &scratch);
+        const bool tags = lplain.tag && lrot.tag && std::strcmp(lplain.tag, lrot.tag) != 0;
+        const std::string what = std::string(row) + ": i8a8 and i8a8h each take only their own encoding";
+        ok(what.c_str(), own_plain == RAD_OK && own_rot == RAD_OK && cross_a == RAD_E_DTYPE &&
+                         cross_b == RAD_E_DTYPE && tags,
+           "own " + std::to_string(own_plain) + "/" + std::to_string(own_rot) + ", crossed " +
+           std::to_string(cross_a) + "/" + std::to_string(cross_b) + ", tags " +
+           (lplain.tag ? lplain.tag : "(none)") + " / " + (lrot.tag ? lrot.tag : "(none)"));
+    }
+
+    auto launch = [&](const RadKernelInfo* k, std::vector<RadTensor> ts, std::vector<RadParam> ps) {
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        if (k->scratch) {
+            const int64_t need = k->scratch(&a);
+            if (need > 0) { a.scratch = dalloc((size_t)need); a.scratch_bytes = need; }
+        }
+        const int rc = k->launch(&a, (RadStream) nullptr);
+        return rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess ? RAD_OK : (rc ? rc : -1);
+    };
+
+    void* d_x  = dalloc(xbf.size() * 2);
+    void* d_q  = dalloc((size_t)(M * K));
+    void* d_qs = dalloc((size_t)(M * nkb) * 4);
+    void* d_y  = dalloc((size_t)(M * N) * 2);
+    if (!d_x || !d_q || !d_qs || !d_y) { ok(nm, false, "hipMalloc failed"); return; }
+    st_memcpy(d_x, xbf.data(), xbf.size() * 2, hipMemcpyHostToDevice);
+
+    /* rel_l2 of one pairing against the reference, or -1 when something refused to run. */
+    auto measure = [&](const Planes& p, const char* dt, const RadKernelInfo* quant) -> double {
+        const std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 128), PS("dtype", dt) };
+        std::vector<uint8_t> wq, wsc;
+        if (stored(r, lp, 2, p, { "codes" }, &wq) != RAD_OK ||
+            stored(r, lp, 3, p, { "scale" }, &wsc) != RAD_OK)
+            return -1.0;
+        void* d_w = dalloc(wq.size());
+        void* d_s = dalloc(wsc.size());
+        if (!d_w || !d_s) return -1.0;
+        st_memcpy(d_w, wq.data(), wq.size(), hipMemcpyHostToDevice);
+        st_memcpy(d_s, wsc.data(), wsc.size(), hipMemcpyHostToDevice);
+        if (launch(quant, { T(d_x, RAD_BF16, { M, K }), T(d_q, RAD_I8, { M, K }),
+                            T(d_qs, RAD_F32, { M, nkb }) },
+                   { PI("M", M), PI("n", K), PI("group", 128), PS("dtype", "bf16") }) != RAD_OK)
+            return -1.0;
+        std::vector<RadTensor> ts = {
+            T(d_q, RAD_I8, { M, K }), T(d_qs, RAD_F32, { M, nkb }), T(d_w, RAD_I8, { N, K }),
+            T(d_s, RAD_BF16, { N, nkb }), T(d_y, RAD_BF16, { M, N }), T(nullptr, RAD_F32, { 1 }),
+            T(nullptr, RAD_U8, { 1 }),
+        };
+        absent(ts[5]); absent(ts[6]);
+        if (launch(r, ts, { PI("M", M), PI("N", N), PI("K", K), PI("group", 128), PS("dtype", dt) })
+            != RAD_OK)
+            return -1.0;
+        std::vector<uint16_t> got((size_t)(M * N));
+        st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
+        double num = 0.0, den = 0.0;
+        for (int64_t i = 0; i < M * N; ++i) {
+            const double d = (double)h_bf16(got[(size_t)i]) - want[(size_t)i];
+            num += d * d;
+            den += want[(size_t)i] * want[(size_t)i];
+        }
+        return den > 0.0 ? std::sqrt(num / den) : -1.0;
+    };
+    const double e_plain = measure(plain,   "i8a8",  qp);
+    const double e_rot   = measure(rotated, "i8a8h", qh);
+    const double e_cross = measure(rotated, "i8a8h", qp);
+
+    /* Printed either way: the pass is about the plumbing, the numbers about the format. An int8
+     * pair lands at a few parts in a thousand; the failures the bounds catch are far off. An
+     * output off by a constant c measures |1 - c|, so a 1/128 never divided out measures ~127,
+     * and a 1/sqrt(128) folded on the activation side too (the per-row had_*_i8 convention)
+     * ~0.91. */
+    std::printf("        rel_l2 vs f32: i8a8 %.4f, i8a8h %.4f, rotated weight with the plain "
+                "quantiser %.4f\n", e_plain, e_rot, e_cross);
+    ok(nm, e_plain >= 0.0 && e_rot >= 0.0 && e_cross >= 0.0 && e_plain < 0.05 && e_rot < 0.05 &&
+           e_rot < e_plain && e_cross > 0.5,
+       "rel_l2 i8a8 " + std::to_string(e_plain) + ", i8a8h " + std::to_string(e_rot) +
+       ", crossed " + std::to_string(e_cross));
+}
+
 
 /* The tiled bf16 GEMM against the skinny one, byte for byte, at every tile variant. An op over
  * M 1..max_tok is served by the skinny row at M <= 64 and the tiled one above, so they must agree
@@ -19406,6 +19573,9 @@ static void device_phase(const Plugin& pl) {
         bias_gemm_numeric(pl, 520, 1040, 1104, 0, true, true);
         bias_gemm_numeric(pl, 2050, 600, 40, 2, false, true);
         bias_gemm_numeric(pl, 200, 300, 136, 2, true, false);
+        i8a8h_rot(pl, "gemm_i8a8_nt_m16", 1, 256, 1024);
+        i8a8h_rot(pl, "gemm_i8a8_nt_m16", 16, 256, 1024);
+        i8a8h_rot(pl, "gemm_i8a8_tiled", 200, 256, 1024);
         w8a16_numeric(pl, "gemm_w8a16_nt_m64", 5, 272, 384, RAD_F16);
         w8a16_numeric(pl, "gemm_w8a16_nt_m64", 64, 2560, 6144, RAD_F16);
         gemm_case(pl, "gemm_w4a8_nt_m64",    "w4a8",    M, N, K, RAD_I8,  1, 0, 0, N*K/2, N*(K/128)*4);

@@ -3746,14 +3746,16 @@ static const RadConstraint cGemmNtQBiasFp8A8M16[] = {
     C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16), C_EQ("group", R4D_FP8_BLOCK),
     C_IN("dtype", "fp8a8"),
 };
-/* The int8 twins: the same bands at dtype i8a8. */
+/* The int8 twins: the same bands at dtype i8a8. `i8a8h` is the same launch over a weight rotated
+ * by a 128-wide Hadamard, the 1/128 in its scale, as `w4a8h` is beside `w4a8`; only its layout
+ * tag and its activation (had_quant_act_i8g) differ. */
 static const RadConstraint cGemmNtI8A8M16[] = {
     C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16), C_EQ("group", R4D_FP8_BLOCK),
-    C_IN("dtype", "i8a8"),
+    C_IN("dtype", "i8a8 i8a8h"),
 };
 static const RadConstraint cGemmNtI8A8Tiled[] = {
     C_DIV("K", R4D_FP8_BLOCK), C_DIV("N", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK),
-    C_IN("dtype", "i8a8"),
+    C_IN("dtype", "i8a8 i8a8h"),
 };
 /* libr4d's `K DIV 4`, renamed to docs/OPS.md's `n` as in every quantiser row here. */
 static const RadConstraint cQuantActFp8[] = {
@@ -5967,7 +5969,8 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "for the fp8 one and the weight's scale per row",
   "the fp8 row's: M <= 64; K a multiple of 128; N a multiple of 16",
   "i8 A with an f32 scale per (row, 128 K), i8 W with a bf16 scale per ROW per 128 K, bf16 C; "
-  "int32 accumulation within a 128-K block, folded to f32 at its end",
+  "int32 accumulation within a 128-K block, folded to f32 at its end. dtype i8a8h: the weight "
+  "rotated by a 128-wide Hadamard, the 1/128 in its scale, against had_quant_act_i8g's activation",
   RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_FP8_M16,
   ROW(cGemmNtI8A8M16), NOTUNE,
   nullptr, nullptr, r4d_rad_gemm_i8a8_m16, r4d_rad_gemm_i8a8_m16_scratch,
@@ -5978,7 +5981,9 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "gemm_fp8a8_tiled at INT8 codes: the same 128x128 prefill tile, the iu8 WMMA for the fp8 one and "
   "the weight's scale per row, eight a lane a tile in the fold",
   "the fp8 row's: any M; K and N multiples of 128",
-  "i8 A with an f32 scale per (row, 128 K), i8 W with a bf16 scale per ROW per 128 K, bf16 C",
+  "i8 A with an f32 scale per (row, 128 K), i8 W with a bf16 scale per ROW per 128 K, bf16 C. "
+  "dtype i8a8h: the weight rotated by a 128-wide Hadamard, the 1/128 in its scale, against "
+  "had_quant_act_i8g's activation",
   RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_FP8_TILED,
   ROW(cGemmNtI8A8Tiled), NOTUNE,
   nullptr, nullptr, r4d_rad_gemm_i8a8_tiled, nullptr,
@@ -6337,7 +6342,8 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "a 128-wide Hadamard along K, then per-(row, 128-column) symmetric int8 quantisation",
   "had_quant_act_fp8's: n a multiple of 128 and group 128",
   "bf16 in, int8 out in PLAIN ROW-MAJOR order with an f32 scale of amax/127 per (row, 128 "
-  "columns); the sqrt(128) of the unnormalised transform is left to the weight's stored scale",
+  "columns); the factor of 128 of the unnormalised transform is left to the weight's stored "
+  "scale (dtype i8a8h)",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cHadQuantActFp8), NOTUNE,
   nullptr, nullptr, r4d_rad_had_quant_act_i8g },

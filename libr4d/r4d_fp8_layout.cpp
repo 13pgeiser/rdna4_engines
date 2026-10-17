@@ -228,8 +228,18 @@ extern "C" int r4d_rad_unrelayout_fp8_block(const RadParam* p, int n_p, int oper
  * side for one 128-K block. On the narrow path a lane's eight accumulator rows are eight
  * consecutive rows of one tile, so their scales are one 16-byte load. A row-major plane needs
  * eight scattered loads, which if-converted into every k step cost the decode kernel 70% at
- * M = 4. The prefill tile reads one row's scale per lane and works with either form. */
+ * M = 4. The prefill tile reads one row's scale per lane and works with either form.
+ *
+ * `i8a8h` is the same planes holding a weight rotated by the unnormalised 128-wide Hadamard along
+ * K, the 1/128 in its scale (libquant's `transform=fwht128`), to be met by had_quant_act_i8g's
+ * activation. The bytes cannot tell the two apart, so each dtype accepts only its own transform
+ * and the rotated codes carry a tag of their own. */
 namespace {
+bool i8_rotated(const RadParam* p, int n_p) {
+    const char* d = r4d_pgets(p, n_p, "dtype");
+    return d && std::strcmp(d, "i8a8h") == 0;
+}
+
 int i8_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc, const int* sel,
                   const RadTensor* pl, int n, RadLayout* out) {
     if (!out || !pl) return RAD_E_INVAL;
@@ -237,7 +247,10 @@ int i8_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* en
     const int rc = fgeom(p, n_p, &g);
     if (rc != RAD_OK) return rc;
     if (operand != FL_B && operand != FL_BSCALE) return RAD_E_UNSUPPORTED;
-    if (!r4d_enc::affine(enc, RAD_I8, RAD_BF16, 1, R4D_FP8_BLOCK)) return RAD_E_DTYPE;
+    const bool rot = i8_rotated(p, n_p);
+    if (!r4d_enc::affine(enc, RAD_I8, RAD_BF16, 1, R4D_FP8_BLOCK, RAD_DT_INVALID,
+                         rot ? "fwht128" : ""))
+        return RAD_E_DTYPE;
     if (operand == FL_BSCALE) {
         if (!r4d_enc::selects(enc, sel, n, "scale") || !r4d_enc::dims(pl[0], g.N, g.sk))
             return RAD_E_SHAPE;
@@ -248,7 +261,8 @@ int i8_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* en
     if (!r4d_enc::selects(enc, sel, n, "codes") || !r4d_enc::dims(pl[0], g.N, g.K))
         return RAD_E_SHAPE;
     if (g.K % R4D_FP8_SUPER_K || g.N % r4d_fp8::kFragRows) return RAD_E_SHAPE;
-    ffill(out, "r4d.i8.w.frag64", RAD_I8, g.N, g.K, r4d_fp8::frag_bytes(g.N, g.K));
+    ffill(out, rot ? "r4d.i8h.w.frag64" : "r4d.i8.w.frag64", RAD_I8, g.N, g.K,
+          r4d_fp8::frag_bytes(g.N, g.K));
     return RAD_OK;
 }
 }  /* namespace */
