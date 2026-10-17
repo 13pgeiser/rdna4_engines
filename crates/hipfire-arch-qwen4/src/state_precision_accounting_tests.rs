@@ -122,13 +122,15 @@ fn plan_entry_bytes(
         + a(h * feedback)
         + a(feedback);
     if native_mtp {
+        // Head QSA K/V, raw and pooled index, selection, selected length,
+        // wide hidden and the target boundary hidden.
         let full_width = config.num_key_value_heads * config.head_dim;
         total += 2 * a(p * full_width * 4)
             + a(p * raw_width * 4)
             + a(pooled * raw_width * 4)
             + a(4 * s)
             + a(4)
-            + a(feedback);
+            + 2 * a(feedback);
     }
     total as u64
 }
