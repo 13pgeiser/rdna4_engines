@@ -29,7 +29,7 @@ if [ -d /models ]; then
 	    )
 	fi
 	if [ ! -d /models/Qwen3.8-27B-MXFP4-mtpfp8 ]; then
-	    mtp="$CURDIR/radiance/fp8_mtp.py"
+	    mtp="$CURDIR/radiance-vllm-mxfp4-scripts/fp8_mtp.py"
 	    (
 		cd /models || exit
 		python3 -m venv venv
@@ -46,14 +46,14 @@ if [ -d /models ]; then
 		    generation_config.json chat_template.jinja preprocessor_config.json processor_config.json; do
 		    [ -e "/models/Qwen3.8-27B-MXFP4-mtpfp8/$f" ] && ln -sf "/models/Qwen3.8-27B-MXFP4-mtpfp8/$f" "/models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken/$f"
 		done
-		python3 "$CURDIR/radiance/mtpfp8-pertoken.py" "Qwen3.8-27B-MXFP4-mtpfp8/config.json" "Qwen3.8-27B-MXFP4-mtpfp8-pertoken/config.json"
+		python3 "$CURDIR/radiance-vllm-mxfp4-scripts/mtpfp8-pertoken.py" "Qwen3.8-27B-MXFP4-mtpfp8/config.json" "Qwen3.8-27B-MXFP4-mtpfp8-pertoken/config.json"
 		)
 	fi
 else
 	echo "/models does not exists..."
 fi
-if [ ! -e "$CURDIR/radiance/chat_template.jinja" ]; then
-	curl -fsSL https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates/resolve/main/chat_template.jinja -o "$CURDIR/radiance/chat_template.jinja"
+if [ ! -e "$CURDIR/radiance-vllm-mxfp4-scripts/chat_template.jinja" ]; then
+	curl -fsSL https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates/resolve/main/chat_template.jinja -o "$CURDIR/radiance-vllm-mxfp4-scripts/chat_template.jinja"
 fi
 
 # -------------------------------
@@ -97,7 +97,7 @@ trap 'git -C "$CURDIR/radiance-vllm-mxfp4" checkout -- serve-mxfp4.sh' EXIT
 # -------------------------------
 if [ "$BENCH" = 1 ]; then
 	# detached serve: the container is RUNNING when this returns, the engine is not ready yet
-	DETACH=1 CHAT_TEMPLATE="../radiance/chat_template.jinja" MODELS=/models SNAP=/models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken SERVED_NAMES="qwen3.8" NAME="r9700-qwen3.8-mxfp4" PORT=9931 TP=1 MAXLEN=220000 MAXSEQS=1 CHUNK=4096 KV_MEM=9126805504 SINGLE_GPU_PROFILE=1 FAST_DRAFT=0 ./serve-mxfp4.sh
+	DETACH=1 CHAT_TEMPLATE="../radiance-vllm-mxfp4-scripts/chat_template.jinja" MODELS=/models SNAP=/models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken SERVED_NAMES="qwen3.8" NAME="r9700-qwen3.8-mxfp4" PORT=9931 TP=1 MAXLEN=220000 MAXSEQS=1 CHUNK=4096 KV_MEM=9126805504 SINGLE_GPU_PROFILE=1 FAST_DRAFT=0 ./serve-mxfp4.sh
 	deadline=$((SECONDS + 900))
 	until curl -fsS "http://127.0.0.1:9931/health" >/dev/null 2>&1; do
 	    if [ "$SECONDS" -ge "$deadline" ]; then
@@ -120,7 +120,7 @@ if [ "$BENCH" = 1 ]; then
 	    --request-rate inf
 	docker rm -f r9700-qwen3.8-mxfp4
 else
-	CHAT_TEMPLATE="../radiance/chat_template.jinja" MODELS=/models SNAP=/models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken SERVED_NAMES="qwen3.8" NAME="r9700-qwen3.8-mxfp4" PORT=9931 TP=1 MAXLEN=220000 MAXSEQS=1 CHUNK=4096 KV_MEM=9126805504 SINGLE_GPU_PROFILE=1 FAST_DRAFT=0 ./serve-mxfp4.sh
+	CHAT_TEMPLATE="../radiance-vllm-mxfp4-scripts/chat_template.jinja" MODELS=/models SNAP=/models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken SERVED_NAMES="qwen3.8" NAME="r9700-qwen3.8-mxfp4" PORT=9931 TP=1 MAXLEN=220000 MAXSEQS=1 CHUNK=4096 KV_MEM=9126805504 SINGLE_GPU_PROFILE=1 FAST_DRAFT=0 ./serve-mxfp4.sh
 fi
 # ============ Serving Benchmark Result ============
 # Successful requests:                     100       
@@ -164,7 +164,7 @@ fi
 # -------------------------------
 
 # -------------------------------
-# CHAT_TEMPLATE="../radiance/chat_template.jinja" MODELS=/models SNAP=/models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken SERVED_NAMES="qwen3.8" NAME="r9700-qwen3.8-mxfp4" PORT=9931 TP=1 MAXLEN=180000 MAXSEQS=1 CHUNK=4096 KV_MEM=6900000000 SINGLE_GPU_PROFILE=1 SPEC_METHOD=dflash ./serve-mxfp4.sh
+# CHAT_TEMPLATE="../radiance-vllm-mxfp4-scripts/chat_template.jinja" MODELS=/models SNAP=/models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken SERVED_NAMES="qwen3.8" NAME="r9700-qwen3.8-mxfp4" PORT=9931 TP=1 MAXLEN=180000 MAXSEQS=1 CHUNK=4096 KV_MEM=6900000000 SINGLE_GPU_PROFILE=1 SPEC_METHOD=dflash ./serve-mxfp4.sh
 # ============ Serving Benchmark Result ============
 #Successful requests:                     100       
 #Failed requests:                         0         
@@ -207,22 +207,22 @@ fi
 # -------------------------------
 
 # -------------------------------
-# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CHAT_TEMPLATE="../radiance/chat_template.jinja" MODELS=/models SNAP=/models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken SERVED_NAMES="qwen3.8" NAME="r9700-qwen3.8-mxfp4" PORT=9931 TP=1 MAXLEN=220000 MAXSEQS=1 CHUNK=4096 KV_MEM=9126805504 SINGLE_GPU_PROFILE=1 SPEC_METHOD=dflash ./serve-mxfp4.sh
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CHAT_TEMPLATE="../radiance-vllm-mxfp4-scripts/chat_template.jinja" MODELS=/models SNAP=/models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken SERVED_NAMES="qwen3.8" NAME="r9700-qwen3.8-mxfp4" PORT=9931 TP=1 MAXLEN=220000 MAXSEQS=1 CHUNK=4096 KV_MEM=9126805504 SINGLE_GPU_PROFILE=1 SPEC_METHOD=dflash ./serve-mxfp4.sh
 # Fails with: (EngineCore pid=572) torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 8.50 GiB. GPU 0 has a total capacity of 31.86 GiB of which 7.10 GiB is free. Of the allocated memory 20.60 GiB is allocated by PyTorch, and 3.09 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
 # -------------------------------
 
 # -------------------------------
-# CHAT_TEMPLATE="../radiance/chat_template.jinja" MODELS=/models SNAP=/models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken SERVED_NAMES="qwen3.8" NAME="r9700-qwen3.8-mxfp4" PORT=9931 TP=1 MAXLEN=220000 MAXSEQS=1 CHUNK=4096 KV_MEM=8300000000 SINGLE_GPU_PROFILE=1 SPEC_METHOD=dflash ./serve-mxfp4.sh
+# CHAT_TEMPLATE="../radiance-vllm-mxfp4-scripts/chat_template.jinja" MODELS=/models SNAP=/models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken SERVED_NAMES="qwen3.8" NAME="r9700-qwen3.8-mxfp4" PORT=9931 TP=1 MAXLEN=220000 MAXSEQS=1 CHUNK=4096 KV_MEM=8300000000 SINGLE_GPU_PROFILE=1 SPEC_METHOD=dflash ./serve-mxfp4.sh
 # Fails with: (EngineCore pid=572) torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 7.72 GiB. GPU 0 has a total capacity of 31.86 GiB of which 7.10 GiB is free. Of the allocated memory 20.60 GiB is allocated by PyTorch, and 3.09 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
 # -------------------------------
 
 # -------------------------------
-# CHAT_TEMPLATE="../radiance/chat_template.jinja" MODELS=/models SNAP=/models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken SERVED_NAMES="qwen3.8" NAME="r9700-qwen3.8-mxfp4" PORT=9931 TP=1 MAXLEN=200000 MAXSEQS=1 CHUNK=4096 KV_MEM=7900000000 SINGLE_GPU_PROFILE=1 SPEC_METHOD=dflash ./serve-mxfp4.sh
+# CHAT_TEMPLATE="../radiance-vllm-mxfp4-scripts/chat_template.jinja" MODELS=/models SNAP=/models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken SERVED_NAMES="qwen3.8" NAME="r9700-qwen3.8-mxfp4" PORT=9931 TP=1 MAXLEN=200000 MAXSEQS=1 CHUNK=4096 KV_MEM=7900000000 SINGLE_GPU_PROFILE=1 SPEC_METHOD=dflash ./serve-mxfp4.sh
 # Fails with: (EngineCore pid=572) torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 7.35 GiB. GPU 0 has a total capacity of 31.86 GiB of which 6.84 GiB is free. Of the allocated memory 20.60 GiB is allocated by PyTorch, and 3.09 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
 # -------------------------------
 
 # -------------------------------
-# CHAT_TEMPLATE="../radiance/chat_template.jinja" MODELS=/models SNAP=/models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken SERVED_NAMES="qwen3.8" NAME="r9700-qwen3.8-mxfp4" PORT=9931 TP=1 MAXLEN=220000 MAXSEQS=1 CHUNK=4096 KV_MEM=9126805504 SINGLE_GPU_PROFILE=1 SPEC_METHOD=dflash ./serve-mxfp4.sh
+# CHAT_TEMPLATE="../radiance-vllm-mxfp4-scripts/chat_template.jinja" MODELS=/models SNAP=/models/Qwen3.8-27B-MXFP4-mtpfp8-pertoken SERVED_NAMES="qwen3.8" NAME="r9700-qwen3.8-mxfp4" PORT=9931 TP=1 MAXLEN=220000 MAXSEQS=1 CHUNK=4096 KV_MEM=9126805504 SINGLE_GPU_PROFILE=1 SPEC_METHOD=dflash ./serve-mxfp4.sh
 # Fails with:
 # (EngineCore pid=572) torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 8.50 GiB. GPU 0 has a total capacity of 31.86 GiB of which 6.87 GiB is free. Of the allocated memory 20.60 GiB is allocated by PyTorch, and 3.09 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
 # -------------------------------
