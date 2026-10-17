@@ -1414,6 +1414,10 @@ class GreedyStageTests(TempCase):
         self.assertEqual(env["HIPFIRE_GRAPH"], "1")
         self.assertEqual(env["HIPFIRE_STATE_QUANT"], "q8")
         self.assertIn("--spec mtp", (child_dir / "command.txt").read_text())
+        # thinking off through the child's isolated global config (no env knob exists)
+        self.assertEqual((child_dir / "home" / ".hipfire" / "config.toml").read_text(), '[reasoning]\nmode = "off"\n')
+        self.assertEqual(json.loads((child_dir / "identity.json").read_text())["child"]["home_files"],
+                         {"config.toml": '[reasoning]\nmode = "off"\n'})
         report = (cfg.run_dir / "report.md").read_text()
         self.assertIn("GATE (Track A F32 tripwire)", report)
         self.assertIn("DIAGNOSTIC", report)

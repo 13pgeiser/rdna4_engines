@@ -507,6 +507,8 @@ class Child:
     kldseq: Optional[str] = None
     ef_sampled: bool = False
     sample_memory: bool = False
+    #: Files written under the child's isolated HIPFIRE_HOME (``<dir>/home/.hipfire``) before launch.
+    home_files: dict = field(default_factory=dict)
 
 
 def arm_order(modes: tuple[str, ...], run: int) -> tuple[str, ...]:
@@ -800,8 +802,14 @@ def read_prompt_text(path: Path) -> str:
     return text.rstrip("\n")
 
 
+#: The greedy arms compare visible text, so thinking is off: with the Flash-Next default (on) a short
+#: budget is all reasoning and `hipfire run --json` reports empty content (j1724). `reasoning.mode` has no
+#: env knob; the child's isolated global config sets it.
+GREEDY_HOME_CONFIG = '[reasoning]\nmode = "off"\n'
+
+
 def plan_greedy(cfg: Config) -> list[Child]:
-    """P0 kill experiment: greedy ``hipfire run`` with MTP off vs on, per (run, graph, mode)."""
+    """P0 kill experiment: greedy ``hipfire run`` (thinking off) with MTP off vs on, per (run, graph, mode)."""
     assert cfg.prompt_file is not None
     prompt = read_prompt_text(cfg.prompt_file)
     children: list[Child] = []
@@ -817,6 +825,7 @@ def plan_greedy(cfg: Config) -> list[Child]:
                     bench_env(cfg, mode), BIN_HIPFIRE,
                     inputs=[("model", cfg.model), ("prompt", cfg.prompt_file)],
                     sample_memory=True,
+                    home_files={"config.toml": GREEDY_HOME_CONFIG},
                 )
             )
     return children
@@ -2011,6 +2020,8 @@ def run_child(cfg: Config, child: Child, identity: dict, environ: dict) -> dict:
     cdir = child.dir
     (cdir / "home" / ".hipfire").mkdir(parents=True, exist_ok=True)
     (cdir / "lockdir").mkdir(parents=True, exist_ok=True)
+    for rel, text in child.home_files.items():
+        write_text(cdir / "home" / ".hipfire" / rel, text)
     env = build_child_env(environ, cfg, child)
     write_text(cdir / "command.txt", shlex.join(child.argv) + "\n")
     write_json(cdir / "env.json", env)
@@ -2018,6 +2029,7 @@ def run_child(cfg: Config, child: Child, identity: dict, environ: dict) -> dict:
     cid["child"] = {
         "id": child.id, "mode": child.mode, "graph": child.graph, "binary": child.binary,
         "state_quant_env": {k: v for k, v in child.extra_env.items() if k in ("HIPFIRE_STATE_QUANT", "HIPFIRE_GDN_TEST_STATE_QUANT")},
+        "home_files": dict(child.home_files),
     }
     write_json(cdir / "identity.json", cid)
     sampler = MemorySampler(cdir / "memory_samples.jsonl") if child.sample_memory else None
