@@ -149,6 +149,104 @@ __global__ __launch_bounds__(THR) void rmsnorm_quant_i8_kernel(
         ybuf, l2, lm);
 }
 
+// The same kernel at decode heights (THR 1024, n <= 1024 * EPT), with every operand of the row
+// loaded in one go before the first reduction. The kernel above reads the row again in each pass,
+// each read behind a barrier, so a row costs three dependent memory round trips; on gfx1201 that
+// held the kernel at 11 us at any height against a 4.2 us launch floor, and this form at 8.2 us
+// (4x R9700, 1 to 16 rows of 5376, 2026-10-17). Every pass partitions the row the same way (thread
+// t takes columns t, t+THR, ...), so each thread keeps its own columns in registers and none needs
+// another's; only the fragment-order store crosses threads, through `ybuf` as before. The sums,
+// the order they are taken in and every element's arithmetic are junction_row's, so the bytes are.
+template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR, uint32_t EPT>
+__global__ __launch_bounds__(THR) void rmsnorm_quant_i8_reg_kernel(
+    const uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
+    const void* __restrict__ wp, const void* __restrict__ sc, uint32_t sc_f32,
+    signed char* __restrict__ q, float* __restrict__ S, uint16_t* __restrict__ yo,
+    uint32_t n, float eps, float wadd, uint32_t x_ld, uint32_t r_ld, uint32_t y_ld) {
+    extern __shared__ uint16_t ybuf[];
+    __shared__ float l1[THR / kWave], l2[THR / kWave], lm[THR / kWave];
+    const uint32_t row = blockIdx.x, tid = threadIdx.x;
+    const uint16_t* __restrict__ xr = x + (size_t)row * x_ld;
+    uint16_t* __restrict__ rr = RES ? res + (size_t)row * r_ld : nullptr;
+    uint16_t* __restrict__ yr = yo ? yo + (size_t)row * y_ld : nullptr;
+
+    uint16_t xv[EPT], rv[EPT];
+    float gp[EPT], gw[EPT];
+#pragma unroll
+    for (uint32_t e = 0; e < EPT; ++e) {
+        const uint32_t i = tid + e * THR;
+        xv[e] = 0; rv[e] = 0; gp[e] = 0.0f; gw[e] = 0.0f;
+        if (i < n) {
+            xv[e] = xr[i];
+            if (RES) rv[e] = rr[i];
+            if (POST) gp[e] = gain(wp, i, WF32) + wadd;
+            gw[e] = gain(w, i, WF32) + wadd;
+        }
+    }
+    const float sv = SCL ? scalar_of(sc, sc_f32) : 1.0f;
+
+    // ---- the post-norm's sum of squares, over the branch output
+    float s1 = 0.0f;
+    if (POST) {
+        float ss = 0.0f;
+#pragma unroll
+        for (uint32_t e = 0; e < EPT; ++e)
+            if (tid + e * THR < n) { const float v = bf2f(xv[e]); ss += v * v; }
+        s1 = rsqrtf(block_sum<THR / kWave>(ss, l1) / (float)n + eps);
+    }
+
+    // ---- the junction (post-norm, add, scalar), stored, and the norm's sum of squares over it
+    float ss2 = 0.0f;
+#pragma unroll
+    for (uint32_t e = 0; e < EPT; ++e) {
+        const uint32_t i = tid + e * THR;
+        if (i < n) {
+            uint16_t v = xv[e];
+            if (RES) {
+                if (POST) v = f32_to_bf16(bf2f(v) * s1 * gp[e]);
+                v = f32_to_bf16(bf2f(rv[e]) + bf2f(v));
+                if (SCL) v = f32_to_bf16(bf2f(v) * sv);
+                rr[i] = v;
+            }
+            xv[e] = v;
+            const float f = bf2f(v);
+            ss2 += f * f;
+        }
+    }
+    const float s2 = rsqrtf(block_sum<THR / kWave>(ss2, l2) / (float)n + eps);
+
+    // ---- the norm output, rounded to bf16 as the standalone norm stores it, and its absmax
+    float m = 0.0f;
+#pragma unroll
+    for (uint32_t e = 0; e < EPT; ++e) {
+        const uint32_t i = tid + e * THR;
+        if (i < n) {
+            const uint16_t y = f32_to_bf16(bf2f(xv[e]) * s2 * gw[e]);
+            ybuf[i] = y;
+            if (yr) yr[i] = y;
+            m = fmaxf(m, fabsf(bf2f(y)));
+        }
+    }
+    m = r4d_wave_max(m);
+    if ((tid & 31) == 0) lm[tid >> 5] = m;
+    __syncthreads();   // also publishes ybuf to every thread
+    m = lm[0];
+#pragma unroll
+    for (uint32_t i = 1; i < THR / kWave; i++) m = fmaxf(m, lm[i]);
+    const float scale = fmaxf(m, 1e-8f) / 127.f;
+    const float inv = 1.f / scale;
+    if (tid == 0) S[row] = scale;
+
+    // ---- the codes, in junction_row's fragment order
+    signed char* __restrict__ qr = q + (size_t)row * n;
+    for (uint32_t i = tid; i < n; i += THR) {
+        const uint32_t s = i >> 4, j = i & 15;
+        const uint32_t src = (s << 4) + 8 * ((j & 7) >> 2) + 4 * (j >> 3) + (j & 3);
+        const int t = __float2int_rn(bf2f(ybuf[src]) * inv);
+        qr[i] = (signed char)(t < -128 ? -128 : (t > 127 ? 127 : t));
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The same junction with the two-rank all-reduce that precedes it: the branch output is a rank's
 // partial sum of a column-sharded linear (o_proj, down_proj), and the post-norm is of the whole
@@ -368,13 +466,25 @@ extern "C" int r4d_rad_rmsnorm_quant_i8(const RadArgs* a, RadStream stream) {
     const float wadd = (float)r4d_getf(a, "wadd", 0.0);
     const uint32_t scf = sc ? (sc->dtype == RAD_F32) : 0u;
 
+    // The decode form keeps a thread's columns in registers: at 1024 threads, EPT of them.
+    const int ept = (thr != 1024 || !r4d_cfg_rmsq8_reg(a)) ? 0
+                  : n <= 4096 ? 4 : n <= 6144 ? 6 : n <= 8192 ? 8 : 0;
+
 #define R4D_RQI8_T(WF, RS, PO, SC, T) emit_rc = R4D_EMIT(stream,                                 \
     (rmsnorm_quant_i8_kernel<WF, RS, PO, SC, T>), dim3((uint32_t)M), dim3(T), lds,               \
     (const uint16_t*)r4d_p(x), (uint16_t*)r4d_wp(rs), r4d_p(w), r4d_p(wp), r4d_p(sc), scf,       \
     (signed char*)r4d_wp(q), (float*)r4d_wp(s), (uint16_t*)r4d_wp(y), (uint32_t)n, eps, wadd,    \
     (uint32_t)xp, (uint32_t)rp, (uint32_t)yp)
+#define R4D_RQI8_R(WF, RS, PO, SC, E) emit_rc = R4D_EMIT(stream,                                 \
+    (rmsnorm_quant_i8_reg_kernel<WF, RS, PO, SC, 1024, E>), dim3((uint32_t)M), dim3(1024), lds,  \
+    (const uint16_t*)r4d_p(x), (uint16_t*)r4d_wp(rs), r4d_p(w), r4d_p(wp), r4d_p(sc), scf,       \
+    (signed char*)r4d_wp(q), (float*)r4d_wp(s), (uint16_t*)r4d_wp(y), (uint32_t)n, eps, wadd,    \
+    (uint32_t)xp, (uint32_t)rp, (uint32_t)yp)
 #define R4D_RQI8(WF, RS, PO, SC)                                                                  \
-    do { if (thr == 1024)     R4D_RQI8_T(WF, RS, PO, SC, 1024);                                   \
+    do { if (ept == 4)        R4D_RQI8_R(WF, RS, PO, SC, 4);                                      \
+         else if (ept == 6)   R4D_RQI8_R(WF, RS, PO, SC, 6);                                      \
+         else if (ept == 8)   R4D_RQI8_R(WF, RS, PO, SC, 8);                                      \
+         else if (thr == 1024) R4D_RQI8_T(WF, RS, PO, SC, 1024);                                  \
          else if (thr == 512) R4D_RQI8_T(WF, RS, PO, SC, 512);                                    \
          else if (thr == 256) R4D_RQI8_T(WF, RS, PO, SC, 256);                                    \
          else return R4D_NO(RAD_E_INVAL); } while (0)
@@ -388,6 +498,7 @@ extern "C" int r4d_rad_rmsnorm_quant_i8(const RadArgs* a, RadStream stream) {
     else                     R4D_RQI8_W(false);
 #undef R4D_RQI8_W
 #undef R4D_RQI8
+#undef R4D_RQI8_R
 #undef R4D_RQI8_T
     return emit_rc;
 }

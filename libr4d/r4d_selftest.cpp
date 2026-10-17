@@ -10961,7 +10961,7 @@ static void qkv_norm_rope_numeric(const Plugin& pl) {
  * feed-forward) and with one (feed-forward -> next layer). The unfused chain, kernel by kernel, is
  * rmsnorm(x; w_post) -> add(residual) -> scale -> rmsnorm(residual; w) -> quant_act_i8. bf16 gains
  * (as Gemma's checkpoint stores), and two batch heights covering both r4d_act_threads widths a
- * decode step meets (1024 at M <= 32, 512 above). */
+ * decode step meets (1024 at M <= 32, 512 above), the first in both of its forms. */
 static void rmsnorm_quant_i8_numeric(const Plugin& pl) {
     const RadKernelInfo* nrm = find(pl, "rmsnorm_bf16");
     const RadKernelInfo* ad  = find(pl, "add_bf16");
@@ -10969,7 +10969,12 @@ static void rmsnorm_quant_i8_numeric(const Plugin& pl) {
     const RadKernelInfo* qz  = find(pl, "quant_act_i8");
     const RadKernelInfo* rq  = find(pl, "rmsnorm_quant_i8");
     if (!nrm || !ad || !scl || !qz || !rq) { ok("rmsnorm_quant_i8 vs its chain", false, "rows absent"); return; }
-    for (const int64_t M : { (int64_t)1, (int64_t)8, (int64_t)40 }) {
+    /* The row's reg axis at 1024 threads: 1 (the default) holds a thread's columns in registers,
+     * 0 re-reads the row each pass; both must leave the chain's bytes. */
+    struct RqCase { int64_t M; int reg; };
+    for (const RqCase rqc : { RqCase{ 1, 1 }, RqCase{ 8, 1 }, RqCase{ 8, 0 }, RqCase{ 40, 1 } }) {
+        const int64_t M = rqc.M;
+        const std::string form = rqc.reg ? "" : " (re-read form)";
         const int64_t K = 5376;   /* Gemma 4 31B's hidden width: 336 sixteen-byte k steps */
         std::vector<uint16_t> hx((size_t)M * K), hr((size_t)M * K), hw((size_t)K), hp((size_t)K);
         for (int64_t r = 0; r < M; ++r)
@@ -11005,6 +11010,8 @@ static void rmsnorm_quant_i8_numeric(const Plugin& pl) {
         const std::vector<RadParam> pn = { PI("M", M), PI("n", K), PF("eps", eps), PS("dtype", "bf16"), PF("wadd", wadd) };
         const std::vector<RadParam> pe = { PI("M", M), PI("n", K), PS("dtype", "bf16") };
         const std::vector<RadParam> pq = { PI("M", M), PI("n", K), PI("group", K), PS("dtype", "bf16") };
+        std::vector<RadParam> prq = pn;
+        prq.push_back(PI("reg", rqc.reg));
 
         auto compare = [&](const std::string& what, bool res) {
             std::vector<uint16_t> y0((size_t)M * K), y1((size_t)M * K), r0((size_t)M * K), r1((size_t)M * K);
@@ -11041,9 +11048,9 @@ static void rmsnorm_quant_i8_numeric(const Plugin& pl) {
         if (rc == RAD_OK)
             rc = launch_row(rq, { T(d_x, RAD_BF16, { M, K }), T(nullptr, RAD_BF16, {}), T(d_w, RAD_BF16, { K }),
                                   T(d_q[1], RAD_I8, { M, K }), T(d_s[1], RAD_F32, { M }), T(d_y[1], RAD_BF16, { M, K }),
-                                  T(nullptr, RAD_BF16, {}), T(nullptr, RAD_BF16, {}) }, pn);
-        if (rc != RAD_OK) ok("rmsnorm_quant_i8 vs rmsnorm + quant_act_i8", false, "rc=" + std::to_string(rc));
-        else compare("rmsnorm_quant_i8 is byte-identical to rmsnorm + quant_act_i8", false);
+                                  T(nullptr, RAD_BF16, {}), T(nullptr, RAD_BF16, {}) }, prq);
+        if (rc != RAD_OK) ok(("rmsnorm_quant_i8 vs rmsnorm + quant_act_i8" + form).c_str(), false, "rc=" + std::to_string(rc));
+        else compare("rmsnorm_quant_i8 is byte-identical to rmsnorm + quant_act_i8" + form, false);
 
         /* --- the junction, without and with the scalar --- */
         for (const bool with_sc : { false, true }) {
@@ -11059,8 +11066,8 @@ static void rmsnorm_quant_i8_numeric(const Plugin& pl) {
                 rc = launch_row(rq, { T(d_x, RAD_BF16, { M, K }), T(d_r[1], RAD_BF16, { M, K }), T(d_w, RAD_BF16, { K }),
                                       T(d_q[1], RAD_I8, { M, K }), T(d_s[1], RAD_F32, { M }), T(d_y[1], RAD_BF16, { M, K }),
                                       T(d_p, RAD_BF16, { K }),
-                                      with_sc ? T(d_sc, RAD_BF16, { 1 }) : T(nullptr, RAD_BF16, {}) }, pn);
-            const std::string what = with_sc ? "rmsnorm_quant_i8 junction with scalar" : "rmsnorm_quant_i8 junction";
+                                      with_sc ? T(d_sc, RAD_BF16, { 1 }) : T(nullptr, RAD_BF16, {}) }, prq);
+            const std::string what = (with_sc ? "rmsnorm_quant_i8 junction with scalar" : "rmsnorm_quant_i8 junction") + form;
             if (rc != RAD_OK) ok((what + " vs rmsnorm + add + scale + rmsnorm + quant_act_i8").c_str(), false, "rc=" + std::to_string(rc));
             else compare(what + " is byte-identical to its chain", true);
         }

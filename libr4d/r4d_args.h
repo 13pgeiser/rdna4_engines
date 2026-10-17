@@ -359,6 +359,9 @@ void r4d_cfg_split  (const RadArgs*, struct R4dSplitCfg*);
 void r4d_cfg_ar     (const RadArgs*, struct R4dArCfg*);
 void r4d_cfg_topk   (const RadArgs*, struct R4dTopkCfg*);
 void r4d_cfg_mv     (const RadArgs*, struct R4dMvCfg*);
+/* rmsnorm_quant_i8's decode form: 1 the row's operands in registers before the reductions, 0 the
+ * pass-per-read kernel; the row's `reg` axis. */
+int  r4d_cfg_rmsq8_reg(const RadArgs*);
 
 }  /* extern "C" */
 

@@ -4754,6 +4754,14 @@ static const RadTunable tMv[] = {
   { "rb", kMvRb, NELEM(kMvRb), 0, "rows of the weight one wave owns. 0 = libr4d's own rule" },
 };
 
+/* rmsnorm_quant_i8 at decode heights (1024 threads, n <= 8192): 1 loads every operand of the row
+ * into registers before the first reduction (rmsnorm_quant_i8_reg_kernel), 0 re-reads the row in
+ * each pass. The same bytes either way; on 4x R9700 the first is 8.2 us a launch, the second 11. */
+static const int64_t kRmsQ8Reg[] = { 1, 0 };
+static const RadTunable tRmsQ8[] = {
+  { "reg", kRmsQ8Reg, NELEM(kRmsQ8Reg), 1, "decode heights: 1 = the row's operands loaded before the reductions, 0 = re-read each pass" },
+};
+
 /* ==================================================================================== the rows */
 
 /* ------------------------------------------- the small model ops and the sampler chain -------
@@ -7546,7 +7554,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "bf16 in, int8 out in the w4a8 GEMM's fragment order with an f32 per-row scale, optional bf16 "
   "out; every stored intermediate rounded to bf16 as the unfused chain stores it",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
-  ROW(cRmsNormQuantI8), NOTUNE,
+  ROW(cRmsNormQuantI8), ROW(tRmsQ8), nullptr,
   nullptr, nullptr, r4d_rad_rmsnorm_quant_i8 },
 
 { "qkv_norm_rope_bf16", "qkv_norm_rope", "attn",
@@ -8917,4 +8925,7 @@ extern "C" void r4d_cfg_topk(const RadArgs* a, R4dTopkCfg* out) {
 }
 extern "C" void r4d_cfg_mv(const RadArgs* a, R4dMvCfg* out) {
     out->rb = TUNE(a, tMv, "rb");
+}
+extern "C" int r4d_cfg_rmsq8_reg(const RadArgs* a) {
+    return TUNE(a, tRmsQ8, "reg");
 }
