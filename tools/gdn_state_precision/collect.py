@@ -87,6 +87,21 @@ TEST_IDENTITY_FILTER = "greedy_mtp_matches_ar_on_flash_next"
 TEST_SAMPLED_AR = "sampled_mtp_matches_ar_distribution_on_flash_next"
 TEST_SAMPLED_EF = "sampled_mtp_q8ef_matches_verify_distribution_on_flash_next"
 
+#: Every ``#[ignore]`` test of ``session_cache_hw`` (its ``--list --ignored`` on the A-de86803d7 gate bins). Each
+#: test loads Flash-Next, and the test file's contract is ONE test per process (two loads in one process exhaust
+#: host memory: the Halo host OOM of 2026-10-17 10:14Z, j1735, ran all of them in one process). The restore stage
+#: runs one ``--exact`` child per name, refuses any session_cache_hw argv without ``--exact <one of these>``, and
+#: before any GPU work refuses a binary whose ignored-test list differs from this tuple.
+SESSION_CACHE_TESTS = (
+    "disk_snapshots_restore_after_restart_on_flash_next",
+    "message_end_snapshots_restore_on_flash_next",
+    "resident_restore_matches_cold_on_flash_next",
+    "restored_prefill_matches_cold_on_flash_next",
+    "retired_turn_commits_live_on_flash_next",
+    "tail_snapshot_restore_matches_split_cold_on_flash_next",
+    "terminal_stop_inside_window_repairs_live_on_flash_next",
+)
+
 #: Counters a q8_ef sampled-law receipt must carry (each > 0). The two graph
 #: counters are required only when the arm ran with HIPFIRE_REPLAY_BACKEND=auto (--graph 1). They are
 #: read from any JSON under HIPFIRE_SAMPLED_MTP_OUT with a top-level
@@ -570,10 +585,17 @@ def graph_env(kind: str, graph: str) -> dict:
     return {"HIPFIRE_GRAPH": graph}
 
 
-def _child(cfg: Config, run: int, graph: str, mode: str, label: str, kind: str, argv, extra_env, binary, **kw) -> Child:
+def _child(
+    cfg: Config, run: int, graph: str, mode: str, label: str, kind: str, argv, extra_env, binary,
+    sub: Optional[str] = None, **kw,
+) -> Child:
+    """``sub`` names one of several children sharing a label (own dir and id; ``--only`` still matches the label)."""
     path = cfg.run_dir / f"run{run}" / f"g{graph}" / (mode if mode else "-") / label
+    cid = f"run{run}/g{graph}/{mode}/{label}"
+    if sub:
+        path, cid = path / sub, f"{cid}/{sub}"
     return Child(
-        id=f"run{run}/g{graph}/{mode}/{label}",
+        id=cid,
         label=label,
         kind=kind,
         run=run,
@@ -669,14 +691,17 @@ def plan_restore(cfg: Config) -> list[Child]:
                 )
             )
             continue
-        children.append(
-            _child(
-                cfg, run, graph, mode, "session-cache", "session_test",
-                [cfg.exe(BIN_SESSION), "--ignored", "--test-threads=1"],
-                {k: v for k, v in env.items() if k != "HIPFIRE_MTP_IDENTITY_OUT"},
-                BIN_SESSION, inputs=[("model", cfg.model)],
+        # One process per test: each loads Flash-Next (see SESSION_CACHE_TESTS).
+        session_env = {k: v for k, v in env.items() if k != "HIPFIRE_MTP_IDENTITY_OUT"}
+        for name in SESSION_CACHE_TESTS:
+            children.append(
+                _child(
+                    cfg, run, graph, mode, "session-cache", "session_test",
+                    [cfg.exe(BIN_SESSION), "--ignored", "--test-threads=1", "--exact", name],
+                    session_env, BIN_SESSION, sub=name, expect_tests=(name,),
+                    inputs=[("model", cfg.model)],
+                )
             )
-        )
         children.append(
             _child(
                 cfg, run, graph, mode, "identity", "identity_test",
@@ -858,7 +883,39 @@ def plan_children(cfg: Config) -> list[Child]:
             raise CollectError(f"--only {','.join(cfg.only)} leaves no child to run in stage {cfg.stage}")
     for c in children:
         c.extra_env = {k: v.replace("@CHILD@", str(c.dir)) for k, v in c.extra_env.items()}
+        require_one_session_test(c)
     return children
+
+
+def require_one_session_test(child: Child) -> None:
+    """session_cache_hw runs exactly one ``--exact`` test per process (SESSION_CACHE_TESTS)."""
+    if child.binary != BIN_SESSION:
+        return
+    argv = child.argv
+    i = argv.index("--exact") if argv.count("--exact") == 1 else -1
+    if i < 0 or i + 1 >= len(argv) or argv[i + 1] not in SESSION_CACHE_TESTS:
+        raise CollectError(
+            f"{child.id}: session_cache_hw must run one known test per process (--exact <test>): every test loads "
+            f"Flash-Next and two loads in one process exhaust host memory; argv {shlex.join(argv)}"
+        )
+
+
+def check_session_test_list(cfg: Config, children: list[Child]) -> None:
+    """Before any GPU work: the session_cache_hw binary's ignored tests must be exactly SESSION_CACHE_TESTS
+    (``--list`` touches no GPU); a test the plan does not know would otherwise go unrun."""
+    if not any(c.binary == BIN_SESSION for c in children):
+        return
+    argv = [cfg.exe(BIN_SESSION), "--list", "--ignored", "--format", "terse"]
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=120, check=True).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CollectError(f"cannot list session_cache_hw tests ({shlex.join(argv)}): {exc}") from exc
+    listed = {line[: -len(": test")] for line in out.splitlines() if line.endswith(": test")}
+    if listed != set(SESSION_CACHE_TESTS):
+        raise CollectError(
+            "session_cache_hw ignored tests differ from SESSION_CACHE_TESTS: "
+            f"unknown {sorted(listed - set(SESSION_CACHE_TESTS))}, missing {sorted(set(SESSION_CACHE_TESTS) - listed)}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2229,6 +2286,7 @@ def print_dry_run(cfg: Config, children: list[Child]) -> None:
 
 def run_stage(cfg: Config, environ: dict) -> int:
     children = plan_children(cfg)
+    check_session_test_list(cfg, children)
     run_dir = cfg.run_dir
     run_dir.mkdir(parents=True, exist_ok=True)
     hasher = Hasher(cfg.out / "hash-cache.json")

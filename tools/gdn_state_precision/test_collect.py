@@ -96,6 +96,10 @@ print(json.dumps(rep, indent=2))
 FAKE_TEST = """#!{python}
 import os, sys
 a = sys.argv
+if "--list" in a:
+    for n in """ + repr(list(collect.SESSION_CACHE_TESTS)) + """:
+        print(n + ": test")
+    sys.exit(0)
 name = a[a.index("--exact") + 1] if "--exact" in a else "some_case"
 out = os.environ.get("HIPFIRE_MTP_IDENTITY_OUT")
 if out:
@@ -375,8 +379,15 @@ class CommandConstructionTests(TempCase):
     def test_restore_commands(self):
         cfg, kids = self.plan("restore", modes="q8,fp32,q8_ef")
         sess = [k for k in kids if k.kind == "session_test" and k.graph == "0"]
-        self.assertEqual([k.mode for k in sess], ["q8", "fp32"])
-        self.assertEqual(sess[0].argv, [self.bin("session_cache_hw"), "--ignored", "--test-threads=1"])
+        n = len(collect.SESSION_CACHE_TESTS)
+        self.assertEqual([k.mode for k in sess], ["q8"] * n + ["fp32"] * n)
+        # One process per test: each session_cache_hw test loads Flash-Next.
+        for k, name in zip(sess, collect.SESSION_CACHE_TESTS * 2):
+            self.assertEqual(k.argv, [self.bin("session_cache_hw"), "--ignored", "--test-threads=1", "--exact", name])
+            self.assertEqual(k.expect_tests, (name,))
+            self.assertEqual(k.label, "session-cache")
+            self.assertEqual(k.id, f"run0/g0/{k.mode}/session-cache/{name}")
+        self.assertEqual(len({k.dir for k in sess}), 2 * n)
         self.assertEqual(sess[0].extra_env["HIPFIRE_SESSION_CACHE_MODEL"], self.M)
         ident = [k for k in kids if k.kind == "identity_test" and k.graph == "0"]
         self.assertEqual(
@@ -388,6 +399,32 @@ class CommandConstructionTests(TempCase):
         self.assertEqual(ef[0].argv[0], self.bin("q8_ef_product_routes_hw"))
         self.assertEqual(ef[0].extra_env["HIPFIRE_GDN_TEST_STATE_QUANT"], "q8_ef")
         self.assertEqual(ef[0].argv[1:], ["--ignored", "--nocapture", "--test-threads=1"])
+
+    def test_session_cache_hw_without_exact_is_refused(self):
+        cfg = self.fx.config("restore", "--graph", "0", modes="fp32")
+        bad = collect._child(
+            cfg, 0, "0", "fp32", "session-cache", "session_test",
+            [cfg.exe("session_cache_hw"), "--ignored", "--test-threads=1"], {}, "session_cache_hw",
+        )
+        with self.assertRaisesRegex(collect.CollectError, "one known test per process"):
+            collect.require_one_session_test(bad)
+        bad.argv += ["--exact", "not_a_session_test"]
+        with self.assertRaisesRegex(collect.CollectError, "one known test per process"):
+            collect.require_one_session_test(bad)
+        ok = collect._child(
+            cfg, 0, "0", "fp32", "session-cache", "session_test",
+            [cfg.exe("session_cache_hw"), "--exact", collect.SESSION_CACHE_TESTS[0]], {}, "session_cache_hw",
+        )
+        collect.require_one_session_test(ok)
+
+    def test_session_test_list_must_match(self):
+        cfg, kids = self.plan("restore", "--graph", "0", modes="fp32")
+        exe = Path(cfg.exe("session_cache_hw"))
+        exe.write_text("#!/bin/sh\necho 'disk_snapshots_restore_after_restart_on_flash_next: test'\necho 'new_case: test'\n")
+        with self.assertRaisesRegex(collect.CollectError, r"unknown \['new_case'\]"):
+            collect.check_session_test_list(cfg, kids)
+        exe.write_text(FAKE_TEST.format(python=sys.executable))
+        collect.check_session_test_list(cfg, kids)
 
     def test_memory_commands(self):
         cfg, kids = self.plan("memory")
@@ -928,8 +965,12 @@ class MultiStageEndToEndTests(TempCase):
         kinds = [(c["mode"], c["kind"]) for c in receipt["children"]]
         self.assertEqual(
             sorted(kinds),
-            sorted([("q8", "session_test"), ("q8", "identity_test"), ("q8_ef", "ef_routes_test")]),
+            sorted([("q8", "session_test")] * len(collect.SESSION_CACHE_TESTS)
+                   + [("q8", "identity_test"), ("q8_ef", "ef_routes_test")]),
         )
+        # Each session_cache_hw test ran alone in its own process.
+        sess = [c for c in receipt["children"] if c["kind"] == "session_test"]
+        self.assertEqual([c["id"].rsplit("/", 1)[1] for c in sess], list(collect.SESSION_CACHE_TESTS))
 
     def test_memory_stage_records_daemon_lines_and_samples(self):
         fx = Fixture(self.root, fakes={"hipfire": FAKE_HIPFIRE})
