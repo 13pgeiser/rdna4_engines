@@ -30,29 +30,29 @@ docker rm -f hipfire_server
 docker run --name hipfire_server --network host --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -v /models/hipfire:/root/.hipfire/models -v hipfire-kcache:/var/cache/hipfire "$IMAGE" serve "$TAG" 0.0.0.0:9931
 # docker run --name hipfire_server --network host --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -v /models/hipfire:/root/.hipfire/models -v hipfire-kcache:/var/cache/hipfire "$IMAGE" run qwen3.8:27b-mq4-xts "Explain FFT in one line"
 
-============ Serving Benchmark Result ============
-Successful requests:                     100       
-Failed requests:                         0         
-Maximum request concurrency:             1         
-Benchmark duration (s):                  383.00    
-Total input tokens:                      107626    
-Total generated tokens:                  12792     
-Request throughput (req/s):              0.26      
-Output token throughput (tok/s):         33.40     
-Peak output token throughput (tok/s):    66.00     
-Peak concurrent requests:                2.00      
-Total token throughput (tok/s):          314.41    
----------------Time to First Token----------------
-Mean TTFT (ms):                          725.60    
-Median TTFT (ms):                        664.28    
-P99 TTFT (ms):                           769.68    
------Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          24.46     
-Median TPOT (ms):                        24.95     
-P99 TPOT (ms):                           29.40     
----------------Inter-token Latency----------------
-Mean ITL (ms):                           24.11     
-Median ITL (ms):                         0.01      
-P99 ITL (ms):                            61.16     
-==================================================
+# ============ Serving Benchmark Result ============
+# Successful requests:                     100       
+# Failed requests:                         0         
+# Maximum request concurrency:             1         
+# Benchmark duration (s):                  383.00    
+# Total input tokens:                      107626    
+# Total generated tokens:                  12792     
+# Request throughput (req/s):              0.26      
+# Output token throughput (tok/s):         33.40     
+# Peak output token throughput (tok/s):    66.00     
+# Peak concurrent requests:                2.00      
+# Total token throughput (tok/s):          314.41    
+# ---------------Time to First Token----------------
+# Mean TTFT (ms):                          725.60    
+# Median TTFT (ms):                        664.28    
+# P99 TTFT (ms):                           769.68    
+# -----Time per Output Token (excl. 1st token)------
+# Mean TPOT (ms):                          24.46     
+# Median TPOT (ms):                        24.95     
+# P99 TPOT (ms):                           29.40     
+# ---------------Inter-token Latency----------------
+# Mean ITL (ms):                           24.11     
+# Median ITL (ms):                         0.01      
+# P99 ITL (ms):                            61.16     
+# ==================================================
 
