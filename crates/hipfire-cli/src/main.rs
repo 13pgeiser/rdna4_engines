@@ -51,6 +51,7 @@ use std::{
 
 mod bench_concurrency;
 mod bench_power;
+mod config_tuning;
 mod config_view;
 #[cfg(target_os = "linux")]
 mod doctor;
@@ -195,6 +196,11 @@ enum ConfigAction {
         #[command(subcommand)]
         action: Option<ConfigProfileAction>,
     },
+    /// Preview, apply and undo tuning presets (speed vs. answer quality).
+    Tuning {
+        #[command(subcommand)]
+        action: Option<ConfigTuningAction>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -208,6 +214,45 @@ enum ConfigProfileAction {
     Create {
         /// New custom profile name (not a built-in).
         name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigTuningAction {
+    /// Show which tuning preset is applied and which settings it owns.
+    Status(OutputArgs),
+    /// Preview a preset for this GPU (or another with --arch) without writing.
+    Show {
+        /// balanced, quality-first (alias quality) or low-power.
+        preset: hipfire_config::tuning::Preset,
+        /// Preview the plan for another GPU arch (for example gfx1201).
+        #[arg(long, value_name = "GFX")]
+        arch: Option<String>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Apply a preset to config.toml after showing the change.
+    Set {
+        /// balanced, quality-first (alias quality) or low-power.
+        preset: hipfire_config::tuning::Preset,
+        /// Leave one preview line out (prompt-processing, flash-next-experts,
+        /// flash-next-ple, shorter-thinking); repeatable.
+        #[arg(long, value_name = "LINE")]
+        skip: Vec<String>,
+        /// Must equal this machine's GPU arch; use `show --arch` to preview others.
+        #[arg(long, value_name = "GFX")]
+        arch: Option<String>,
+        /// Save without asking (required when stdin is not a terminal).
+        #[arg(short, long)]
+        yes: bool,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+    /// Undo the last tuning action.
+    Undo {
+        /// Undo without asking (required when stdin is not a terminal).
+        #[arg(short, long)]
+        yes: bool,
     },
 }
 
@@ -1269,6 +1314,7 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
             Ok(())
         }
         ConfigAction::Profile { action } => config_profile_command(paths, action),
+        ConfigAction::Tuning { action } => config_tuning::config_tuning_command(paths, action),
     }
 }
 
@@ -1333,8 +1379,9 @@ fn model_config_command_to(
             | ConfigAction::Schema(_)
             | ConfigAction::Profile { .. }
             | ConfigAction::Overrides(_)
+            | ConfigAction::Tuning { .. }
     ) {
-        bail!("config migrate/schema/profile/overrides are global; omit the model argument");
+        bail!("config migrate/schema/profile/overrides/tuning are global; omit the model argument");
     }
 
     match action {
@@ -1416,7 +1463,8 @@ fn model_config_command_to(
         ConfigAction::Migrate
         | ConfigAction::Schema(_)
         | ConfigAction::Profile { .. }
-        | ConfigAction::Overrides(_) => {
+        | ConfigAction::Overrides(_)
+        | ConfigAction::Tuning { .. } => {
             unreachable!()
         }
     }
@@ -18232,6 +18280,72 @@ effort = "high"
     fn bench_prompt_md5_is_hex_of_prompt_bytes() {
         // md5("abc") is a fixed vector; guards against swapping in sha256.
         assert_eq!(bench_prompt_md5("abc"), "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    /// Gate for the Low-power "Shorter thinking" tuning line: a chat request
+    /// that names no effort picks up the global `reasoning.effort = "low"`
+    /// and forwards it for an effort-native model. If this stops holding the
+    /// line must leave `hipfire_config::tuning::plan`.
+    #[test]
+    fn global_reasoning_effort_low_reaches_an_effort_native_request() {
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        let mut layer = ConfigLayer::default();
+        layer
+            .set(
+                "reasoning.effort",
+                hipfire_config::ConfigValue::String("low".into()),
+            )
+            .unwrap();
+        let configured = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let mut request = serde_json::json!({});
+        let resolution = apply_http_reasoning_request(
+            &serde_json::json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+            &configured,
+            &mut request,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(request["reasoning_effort"], "low");
+        assert_eq!(resolution.effective_effort.as_deref(), Some("low"));
+        assert!(resolution.warnings.is_empty(), "{:?}", resolution.warnings);
+
+        // Without the global value the same request does not get "low".
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let mut baseline = serde_json::json!({});
+        let baseline_resolution = apply_http_reasoning_request(
+            &serde_json::json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+            &defaults,
+            &mut baseline,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_ne!(baseline_resolution.effective_effort.as_deref(), Some("low"));
+
+        // An explicit request effort still wins over the config value.
+        let mut explicit = serde_json::json!({});
+        let explicit_resolution = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "xhigh" }),
+            &configured,
+            &mut explicit,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit_resolution.effective_effort.as_deref(),
+            Some("xhigh")
+        );
     }
 
     #[test]

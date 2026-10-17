@@ -20,6 +20,7 @@ pub mod http_auth;
 pub mod intent;
 pub mod rocm;
 pub mod secret;
+pub mod tuning;
 
 pub use host_memory::{host_memory, HostMemory};
 
@@ -5085,6 +5086,9 @@ pub struct ConfigPaths {
     pub models_toml: PathBuf,
     pub models_json: PathBuf,
     pub legacy_per_model_json: PathBuf,
+    /// Tuning-preset ownership and undo state (`tuning.toml`), a control-plane
+    /// file beside `config.toml`; see [`tuning`].
+    pub tuning_toml: PathBuf,
 }
 
 /// The hipfire state root every crate shares (`ConfigPaths::root`,
@@ -5182,6 +5186,7 @@ impl ConfigPaths {
             models_toml: root.join("models.toml"),
             models_json: root.join("models.json"),
             legacy_per_model_json: root.join("per_model_config.json"),
+            tuning_toml: root.join("tuning.toml"),
             root,
         }
     }

@@ -145,7 +145,9 @@ pub(crate) fn validate_cli_value(value: &str) -> Result<()> {
     if value == "off" {
         return Ok(());
     }
-    emu::profile(value).map(|_| ()).map_err(|e| anyhow!("--emu: {e}"))
+    emu::profile(value)
+        .map(|_| ())
+        .map_err(|e| anyhow!("--emu: {e}"))
 }
 
 /// Apply an explicit `--emu` value to the daemon's process snapshot and return
@@ -181,7 +183,8 @@ pub(crate) fn apply_cli_override(
             candidate.values.remove(key)?;
         }
     }
-    let options = emu::from_process_config(&candidate).map_err(|e| anyhow!("--emu {value}: {e}"))?;
+    let options =
+        emu::from_process_config(&candidate).map_err(|e| anyhow!("--emu {value}: {e}"))?;
     *config = candidate;
     Ok(EffectiveEmu {
         profile: options.map(|o| o.profile_id),
@@ -278,7 +281,8 @@ pub(crate) fn estimate_report(
     profile: &EmuProfile,
     input: &DeratingInput,
 ) -> Result<serde_json::Value> {
-    let estimate = emu_model::estimate(input).map_err(|e| anyhow!("estimate input rejected: {e}"))?;
+    let estimate =
+        emu_model::estimate(input).map_err(|e| anyhow!("estimate input rejected: {e}"))?;
     Ok(serde_json::json!({
         "type": "emu_estimate",
         "schema_version": emu_model::SCHEMA_VERSION,
@@ -354,8 +358,12 @@ fn estimate_command(args: EmuEstimateArgs) -> Result<()> {
     let profile = emu::profile(&args.id).map_err(|e| anyhow!("{e}"))?;
     let raw = std::fs::read_to_string(&args.input)
         .with_context(|| format!("failed to read {}", args.input.display()))?;
-    let input: DeratingInput = serde_json::from_str(&raw)
-        .with_context(|| format!("{} is not a DeratingInput (schema v1)", args.input.display()))?;
+    let input: DeratingInput = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "{} is not a DeratingInput (schema v1)",
+            args.input.display()
+        )
+    })?;
     let report = estimate_report(profile, &input)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -404,9 +412,18 @@ fn render_receipt(id: &str, receipt: &serde_json::Value) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "hipfire emu validate {id}: status {}\n",
-        receipt.get("status").and_then(|s| s.as_str()).unwrap_or("?")
+        receipt
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("?")
     ));
-    for section in ["capacity", "host_topology", "bandwidth", "graph", "estimate"] {
+    for section in [
+        "capacity",
+        "host_topology",
+        "bandwidth",
+        "graph",
+        "estimate",
+    ] {
         let Some(node) = receipt.get(section) else {
             continue;
         };
@@ -437,8 +454,7 @@ fn validate_command(paths: &Paths, args: EmuValidateArgs) -> Result<()> {
     if let Some(line) = effective.log_line() {
         eprintln!("{line}");
     }
-    let daemon =
-        crate::find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
+    let daemon = crate::find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
     let engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, None)
         .with_context(|| format!("failed to start a daemon with emu profile `{}`", args.id))?;
     engine.ping()?;
@@ -514,10 +530,17 @@ mod tests {
     #[test]
     fn bench_parses_emu_flag() {
         assert_eq!(
-            parse_bench(&["bench", "model", "--emu", "rx9070xt"]).emu.as_deref(),
+            parse_bench(&["bench", "model", "--emu", "rx9070xt"])
+                .emu
+                .as_deref(),
             Some("rx9070xt")
         );
-        assert_eq!(parse_bench(&["bench", "model", "--emu", "off"]).emu.as_deref(), Some("off"));
+        assert_eq!(
+            parse_bench(&["bench", "model", "--emu", "off"])
+                .emu
+                .as_deref(),
+            Some("off")
+        );
         assert_eq!(parse_bench(&["bench", "model"]).emu, None);
     }
 
@@ -526,7 +549,10 @@ mod tests {
         let Commands::Emu(list) = parse(&["emu", "list", "--json"]) else {
             panic!("emu list");
         };
-        assert!(matches!(list.action, EmuAction::List(EmuListArgs { json: true })));
+        assert!(matches!(
+            list.action,
+            EmuAction::List(EmuListArgs { json: true })
+        ));
 
         let Commands::Emu(validate) = parse(&[
             "emu", "validate", "rx9070xt", "--json", "--mib", "256", "--mib", "1024",
@@ -541,7 +567,12 @@ mod tests {
         assert_eq!(v.mib, vec![256, 1024]);
 
         let Commands::Emu(estimate) = parse(&[
-            "emu", "estimate", "rx9060xt", "--input", "/tmp/in.json", "--json",
+            "emu",
+            "estimate",
+            "rx9060xt",
+            "--input",
+            "/tmp/in.json",
+            "--json",
         ]) else {
             panic!("emu estimate");
         };
@@ -561,7 +592,10 @@ mod tests {
             vec!["hipfire", "emu", "validate", "rx9070xt", "--mib", "2049"],
             vec!["hipfire", "emu", "estimate", "rx9070xt"],
         ] {
-            assert!(crate::Cli::try_parse_from(argv.clone()).is_err(), "{argv:?}");
+            assert!(
+                crate::Cli::try_parse_from(argv.clone()).is_err(),
+                "{argv:?}"
+            );
         }
     }
 
@@ -579,7 +613,10 @@ mod tests {
         // carries it: serialized ProcessConfig, read through the compat name.
         let wire = serde_json::to_string(&config).unwrap();
         let received: ProcessConfig = serde_json::from_str(&wire).unwrap();
-        assert_eq!(received.legacy_value("HIPFIRE_EMU").as_deref(), Some("rx9070xt"));
+        assert_eq!(
+            received.legacy_value("HIPFIRE_EMU").as_deref(),
+            Some("rx9070xt")
+        );
     }
 
     #[test]
@@ -628,9 +665,15 @@ mod tests {
         let before = config.clone();
         let err = apply_cli_override(&mut config, Some("rx9999")).unwrap_err();
         let text = format!("{err}");
-        assert!(text.contains("rx9999") && text.contains("rx9070xt"), "{text}");
+        assert!(
+            text.contains("rx9999") && text.contains("rx9070xt"),
+            "{text}"
+        );
         assert_eq!(config, before);
-        assert!(validate_cli_value("Rx9070XT").is_err(), "ids are exact lower-case");
+        assert!(
+            validate_cli_value("Rx9070XT").is_err(),
+            "ids are exact lower-case"
+        );
         assert!(validate_cli_value("").is_err());
     }
 
@@ -654,7 +697,10 @@ mod tests {
         let args = parse_bench(&["bench", "no-such-model", "--emu", "rx9999"]);
         let err = crate::bench_command(&Paths::discover().unwrap(), args).unwrap_err();
         let text = format!("{err:#}");
-        assert!(text.contains("rx9999") && text.contains("unknown"), "{text}");
+        assert!(
+            text.contains("rx9999") && text.contains("unknown"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -696,7 +742,10 @@ mod tests {
         assert_eq!(receipt_failures(&bad), vec!["graph failed".to_owned()]);
         let mut top = ok.clone();
         top["status"] = "fail".into();
-        assert_eq!(receipt_failures(&top), vec!["receipt status is fail".to_owned()]);
+        assert_eq!(
+            receipt_failures(&top),
+            vec!["receipt status is fail".to_owned()]
+        );
         assert!(render_receipt("rx9070xt", &ok).contains("cu_emulation is `none`"));
     }
 
@@ -790,12 +839,17 @@ mod tests {
         assert_eq!(report["target_profile"]["id"], "rx9060xt");
         assert_eq!(report["target_profile"]["kind"], "registry_metadata");
         assert_eq!(report["measured"]["measured_wall_ns"], 1_000_000);
-        assert_eq!(report["measured"]["capacity_profile_during_measurement"], "rx9070xt");
+        assert_eq!(
+            report["measured"]["capacity_profile_during_measurement"],
+            "rx9070xt"
+        );
         assert_eq!(report["estimate"]["kind"], "model_estimate_not_measured");
         assert_eq!(report["estimate"]["quality"], "topology_scenario");
         // Halving bandwidth on a bandwidth-bound kernel lengthens it: the
         // 900 us kernel becomes ~1.8 ms, so the estimate exceeds the measured wall.
-        let estimated = report["estimate"]["estimated_wall_ns"].as_f64().expect("scalar estimate");
+        let estimated = report["estimate"]["estimated_wall_ns"]
+            .as_f64()
+            .expect("scalar estimate");
         assert!(estimated > 1_000_000.0, "{estimated}");
         let human = render_estimate(&report);
         assert!(human.contains("ESTIMATE from measured inputs"), "{human}");

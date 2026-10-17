@@ -18,6 +18,8 @@ Persistent stores under `~/.hipfire/`:
 3. **Migration inputs** — `config.json`, `models.json`, and
    `per_model_config.json`. Migration writes TOML and preserves the JSON files
    for rollback.
+4. **Tuning state** — `tuning.toml`: which preset owns which `config.toml`
+   keys, and the single undo level (see [Tuning presets](#tuning-presets)).
 
 Copyable sparse profiles for users, kernel developers, and retained-PM4 work
 live in [`docs/configs/`](configs/README.md). They include direct mappings from
@@ -1547,6 +1549,97 @@ resolves them on every decide, so a change applies without a reload. They
 are not in the Jev response body; a non-identity calibration shows in the
 `x-hipfire-timing` header. A hipfire binary built before these keys existed
 refuses a `models.toml` that contains them.
+
+---
+
+## Tuning presets
+
+`hipfire config tuning` trades speed for answer quality in one step, per GPU.
+A preset is a bundle of **global** `config.toml` writes (never `models.toml`);
+nothing is written until you confirm.
+
+```bash
+hipfire config tuning status [--json]       # which preset is applied, which keys it owns
+hipfire config tuning show quality-first    # preview: lines, measured trade-offs, net change
+hipfire config tuning show quality-first --arch gfx1201 --json
+hipfire config tuning set quality-first     # preview, then [y/N]
+hipfire config tuning set quality-first --skip flash-next-ple --yes
+hipfire config tuning undo [--yes]          # single level
+```
+
+Presets: `balanced`, `quality-first` (alias `quality`), `low-power`. Line ids,
+for `--skip`: `prompt-processing`, `flash-next-experts`, `flash-next-ple`,
+`shorter-thinking`. `set` and `undo` print the preview and ask `[y/N]` on a
+terminal. Without a terminal they need `--yes`; otherwise they print `error:
+refusing to change config without confirmation; pass --yes`, exit 2 and write
+nothing. `--arch` only previews another GPU's plan; `set --arch X` is refused
+unless X is this machine's GPU (`install.json`). `--json` carries `lines[]`
+(`id`, `keys`, `from`, `to`, `ticked`, `requirement`, `evidence`) and
+`net_diff`.
+
+| Line | gfx1151 (Strix Halo) | gfx1201 (R9700 / RX 9070) | gfx1100 (RX 7900) |
+|---|---|---|---|
+| **Quality-first** · Prompt processing (dense MQ4V2) | #902 not landed: `kernel.iu4_prefill = false`; opt-in: `kernel.gfx11_a8_prefill = true`; default-on: nothing (already accurate) | `kernel.iu4_prefill = false` (native fp8) | `kernel.iu4_prefill = false` |
+| **Quality-first** · Flash-Next experts | `developer.qwen4_moe_sym_iu4 = false` | `developer.qwen4_moe_sym_iu4 = false` | nothing |
+| **Quality-first** · Flash-Next word table | `memory.ple_format = "q8"`, ticked only when every installed Flash-Next split base has its `.ple-q8` (or the shared `qwen3.8-flash-next.ple-q8`); a monolithic embeds the q8 rows | nothing (auto is already q8) | nothing |
+| **Low-power** · Shorter thinking | `reasoning.effort = "low"` | same | same |
+| **Low-power** · Prompt processing | #902 default-on: `kernel.gfx11_a8_prefill = false` (back to IU4); otherwise nothing | nothing | nothing |
+| **Balanced** | writes nothing; gives back the keys the applied preset still owns | same | same |
+
+Any other GPU gets only arch-neutral lines and the note "no measured quality
+switches for <arch> yet". The Prompt processing line is read from the same
+choices as the Settings virtual row (`hipfire_config::effective::
+quality_choices_for`); PR #902 is detected by schema
+(`hipfire_config::field("kernel.gfx11_a8_prefill")`), never by version. The
+sym IU4 key is a typed boolean and is written as a TOML boolean. "Shorter
+thinking" relies on a chat request without `reasoning_effort` forwarding the
+global `reasoning.effort` to an effort-native model (pinned by a `hipfire-cli`
+test).
+
+Every line shows its measured trade-off from `hipfire_config::evidence` (for
+example "43% closer (WT2 KLD 0.0695 -> 0.0394), prompts 1.6× slower, typing
+unchanged"); an unmeasured number is said to be unmeasured. Not changed by any
+preset: KV cache (fp8 vs exact within noise on Flash-Next), speculation
+(designed lossless), and context, devices, offload and model choices.
+
+**State.** `~/.hipfire/tuning.toml` (a control-plane file beside `config.toml`,
+never inside it) records what the applied preset wrote, so the Settings "From"
+column can say `preset` and switching is exact:
+
+```toml
+schema_version = 1
+
+[applied]                       # what is in effect now
+preset = "quality-first"
+arch = "gfx1201"
+applied_at = 1760630000
+
+[applied.set]                   # keys this preset owns, exact values
+"kernel.iu4_prefill" = false
+"developer.qwen4_moe_sym_iu4" = false
+
+[applied.base]                  # what to give back when the preset leaves
+"kernel.iu4_prefill" = { unset = true }
+
+[undo]                          # restores the state before the last action
+previous_preset = "balanced"
+[undo.prior]                    # per touched key: value before the action
+"kernel.iu4_prefill" = { unset = true }
+[undo.after]                    # per touched key: value the action left
+"kernel.iu4_prefill" = { value = false }
+```
+
+Applying a preset first gives back the keys the old preset still owns (a key
+you edited since is kept and reported), then merges the ticked lines;
+re-applying the same preset is a no-op that keeps your undo. `undo` restores
+each touched key that still has the value the action left, or removes it, and
+hands ownership back to the previous preset. `status` reads `Balanced`,
+`<Preset>`, `<Preset> (edited)` (an owned key changed or went away) or `Custom`
+(no preset owns anything but a key a preset would write was set by hand). The
+write order is `tuning.toml` to a temp file, then `config.toml`, then the
+rename, so an interrupted run never leaves ownership claiming keys that were
+not written. The preview warns when an environment variable overrides a key the
+preset writes, or a `models.toml` entry sets it for one model.
 
 ---
 
