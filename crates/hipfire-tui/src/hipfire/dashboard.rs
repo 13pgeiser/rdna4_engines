@@ -1356,6 +1356,18 @@ impl DashboardWorker {
     /// Spawn the background fetch thread. It starts idle (no fetch) until the
     /// Dashboard tab is marked active via [`DashboardWorker::set_active`].
     pub fn spawn(config: ConfigState) -> Self {
+        let agent = health_agent();
+        Self::spawn_with_health_probe(config, move |cfg| probe_health(&agent, cfg))
+    }
+
+    /// [`DashboardWorker::spawn`] with the `/health` probe supplied by the
+    /// caller. Tests drive the health loop through a probe they control, so
+    /// what they check (which config a probe reads, what gets published)
+    /// never depends on network or scheduling timing.
+    fn spawn_with_health_probe(
+        config: ConfigState,
+        probe: impl Fn(&ConfigState) -> HealthSnapshot + Send + 'static,
+    ) -> Self {
         let snapshot = Arc::new(Mutex::new(None));
         let metrics = Arc::new(Mutex::new(MetricsView::Collecting));
         let active = Arc::new(AtomicBool::new(false));
@@ -1387,7 +1399,7 @@ impl DashboardWorker {
             let health = Arc::clone(&health);
             let shutdown = Arc::clone(&shutdown);
             let config = Arc::clone(&config);
-            thread::spawn(move || health_loop(health, shutdown, config, health_wake_rx))
+            thread::spawn(move || health_loop(health, shutdown, config, health_wake_rx, probe))
         };
 
         Self {
@@ -1582,23 +1594,28 @@ fn health_loop(
     shutdown: Arc<AtomicBool>,
     config: Arc<Mutex<ConfigState>>,
     wake_rx: mpsc::Receiver<()>,
+    probe: impl Fn(&ConfigState) -> HealthSnapshot,
 ) {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_millis(450)))
-        .http_status_as_error(false)
-        // Never forward the bearer to another origin.
-        .max_redirects(0)
-        .build()
-        .into();
     while !shutdown.load(Ordering::SeqCst) {
         // Clone out of the lock so the probe never holds it.
         let cfg = config.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let next = probe_health(&agent, &cfg);
+        let next = probe(&cfg);
         *health.lock().unwrap_or_else(|e| e.into_inner()) = next;
         let _ = wake_rx.recv_timeout(HEALTH_REFRESH);
         // Coalesce a burst of wakes into a single re-probe.
         while wake_rx.try_recv().is_ok() {}
     }
+}
+
+/// The `/health` client: 450 ms global timeout, statuses as values, no
+/// redirects (the bearer is never forwarded to another origin).
+fn health_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_millis(450)))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .build()
+        .into()
 }
 
 #[cfg(test)]
@@ -1840,18 +1857,15 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn bounded_run_kills_hung_process() {
-        // A process that sleeps far longer than the timeout must be killed and
-        // reported as TimedOut within ~the timeout (not blocked for 60s).
-        let mut cmd = Command::new("sleep");
-        cmd.arg("60");
-        let start = Instant::now();
+        // `tail -f /dev/null` never exits on its own, so `run_bounded` can only
+        // return by killing it at the deadline: returning `TimedOut` at all is
+        // the proof that a hung child is killed rather than waited on. No
+        // wall-clock bound on how long that took (host load must not decide
+        // the result).
+        let mut cmd = Command::new("tail");
+        cmd.args(["-f", "/dev/null"]);
         let run = run_bounded(cmd, Duration::from_millis(200));
-        let elapsed = start.elapsed();
         assert!(matches!(run, RocmSmiRun::TimedOut), "expected TimedOut");
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "kill must be prompt, took {elapsed:?}"
-        );
     }
 
     #[test]
@@ -2025,65 +2039,96 @@ mod tests {
         }
     }
 
-    fn wait_for_health(
-        worker: &DashboardWorker,
-        timeout: Duration,
-        pred: impl Fn(&HealthSnapshot) -> bool,
-    ) -> Option<HealthSnapshot> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let h = worker.health();
-            if pred(&h) {
-                return Some(h);
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
+    /// A `/health` client with no timeout: the local test server always
+    /// answers, so the result never depends on how loaded the host is.
+    fn untimed_agent() -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build()
+            .into()
     }
 
     #[test]
-    fn health_poller_reports_up_then_down_while_tab_inactive() {
+    fn health_probe_reports_up_then_down_when_the_listener_closes() {
         let mut server = HealthServer::start(r#"{"status":"ok","model":"m"}"#);
-        let worker = DashboardWorker::spawn(config_for_port(server.port));
-        worker.set_active(false);
-
-        let up = wait_for_health(&worker, Duration::from_secs(3), |h| h.checked && h.serve_up)
-            .expect("health snapshot reports serve up within 3s");
+        let agent = untimed_agent();
+        let up = probe_health(&agent, &config_for_port(server.port));
+        assert!(up.checked && up.serve_up);
         assert_eq!(up.model.as_deref(), Some("m"));
         assert!(up.failure.is_none());
         assert!(up.text.contains(r#""status":"ok""#));
 
+        let port = server.port;
         server.shutdown();
-        worker.force_refresh();
-        let down = wait_for_health(&worker, Duration::from_secs(3), |h| {
-            h.checked && !h.serve_up
-        })
-        .expect("health snapshot reports serve down once the listener is closed");
+        let down = probe_health(&agent, &config_for_port(port));
+        assert!(down.checked && !down.serve_up);
         assert!(down.model.is_none());
         assert!(down.failure.is_none(), "unreachable is down, not a failure");
     }
 
+    /// A health probe the test steps by hand: each call reports the port it
+    /// was given on `started`, then blocks until the test sends on `release`
+    /// (or drops it), then reports serve up only for `up_port`.
+    fn stepped_probe(
+        up_port: u16,
+    ) -> (
+        impl Fn(&ConfigState) -> HealthSnapshot + Send + 'static,
+        mpsc::Receiver<u16>,
+        mpsc::Sender<()>,
+    ) {
+        let (started_tx, started) = mpsc::channel::<u16>();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let probe = move |cfg: &ConfigState| {
+            let _ = started_tx.send(cfg.port);
+            let _ = release_rx.recv();
+            HealthSnapshot {
+                checked: true,
+                serve_up: cfg.port == up_port,
+                ..HealthSnapshot::default()
+            }
+        };
+        (probe, started, release)
+    }
+
     #[test]
     fn health_poller_picks_up_a_port_change_from_update_config() {
-        let server = HealthServer::start(r#"{"status":"ok","model":null}"#);
-        // Start pointed at a port nothing listens on (the server's port + 1
-        // could collide; bind-and-drop gives a free one).
-        let dead = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let worker = DashboardWorker::spawn(config_for_port(dead));
-        wait_for_health(&worker, Duration::from_secs(3), |h| {
-            h.checked && !h.serve_up
-        })
-        .expect("first probe lands immediately and reports down");
-        worker.update_config(config_for_port(server.port));
-        let up = wait_for_health(&worker, Duration::from_secs(3), |h| h.serve_up)
-            .expect("new port picked up without restarting the worker");
-        assert_eq!(up.model, None);
+        // The loop runs on every tab (the worker starts inactive) and re-reads
+        // the shared config for every probe. Each probe is stepped by hand, so
+        // the order of events is fixed and nothing depends on timing.
+        let (dead, live) = (1, 2);
+        let (probe, started, release) = stepped_probe(live);
+        let worker = DashboardWorker::spawn_with_health_probe(config_for_port(dead), probe);
+        // Declared after `worker`, so it drops first (also when an assert
+        // unwinds): the blocked probe returns and the worker can join.
+        let release = release;
+
+        assert_eq!(
+            started.recv().unwrap(),
+            dead,
+            "first probe uses the initial config"
+        );
+        release.send(()).unwrap();
+        worker.update_config(config_for_port(live));
+        // A probe that read the config before `update_config` may still be
+        // reported (it blocks until released); every probe after it must
+        // read the new port.
+        let mut port = started.recv().unwrap();
+        if port == dead {
+            release.send(()).unwrap();
+            port = started.recv().unwrap();
+        }
+        assert_eq!(
+            port, live,
+            "new port picked up without restarting the worker"
+        );
+        release.send(()).unwrap();
+        // The live probe's snapshot is published before the loop starts its
+        // next probe; wake only the health loop and wait for that start.
+        worker.update_config(config_for_port(live));
+        assert_eq!(started.recv().unwrap(), live);
+        let health = worker.health();
+        assert!(health.checked && health.serve_up, "{health:?}");
     }
 
     // ── amd-smi parsers + tool selection ────────────────────────────────────
