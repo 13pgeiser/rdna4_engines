@@ -454,8 +454,9 @@ const QWEN4_EXPERT_STAGE_MIN_ROWS_DEFAULT: usize = 2048;
 /// Default stage threshold on a narrow discrete host link
 /// ([`crate::host_link::HostLink::is_narrow_discrete`]) off gfx1201: the
 /// mapped read of a host layer costs more per forward the narrower the link,
-/// so the copy pays from a shorter forward. Capped at the chunk like the
-/// 2048 default.
+/// so the copy pays from a shorter forward. A fixed floor, not capped at the
+/// chunk: a forward shorter than this (or a chunk admitted below it) never
+/// stages and keeps the zero-copy mapped reads.
 const QWEN4_EXPERT_STAGE_NARROW_LINK_MIN_ROWS: usize = 768;
 
 /// One Flash-Next routed expert's QT44 gate/up and QT53 down bytes.
@@ -483,8 +484,9 @@ impl StageMinRowsSource {
 /// [`QWEN4_EXPERT_STAGE_MIN_ROWS_ENV`] (integer >= 2) is authoritative. The
 /// default is `min(2048, chunk_rows)`, so a full chunk always qualifies on an
 /// arch whose chunk is below 2048 (gfx1100 on a fast link: 1536); on a
-/// `narrow_link` (measured narrow discrete host link) off gfx1201 it is
-/// `min(768, chunk_rows)`. gfx1201 keeps 2048 whatever its admitted rung
+/// `narrow_link` (measured narrow discrete host link) off gfx1201 it is a
+/// fixed 768, never lowered to the chunk, so forwards under 768 rows (and any
+/// chunk admitted below 768) keep the mapped reads. gfx1201 keeps 2048
 /// (K3: 1536-row forwards expose the DMA) and whatever its link, so its
 /// behavior is unchanged.
 fn resolve_expert_stage_min_rows(
@@ -502,7 +504,7 @@ fn resolve_expert_stage_min_rows(
     let rows = if arch == "gfx1201" {
         QWEN4_EXPERT_STAGE_MIN_ROWS_DEFAULT
     } else if narrow_link {
-        QWEN4_EXPERT_STAGE_NARROW_LINK_MIN_ROWS.min(chunk_rows.max(2))
+        QWEN4_EXPERT_STAGE_NARROW_LINK_MIN_ROWS
     } else {
         QWEN4_EXPERT_STAGE_MIN_ROWS_DEFAULT.min(chunk_rows.max(2))
     };
@@ -10921,14 +10923,18 @@ mod tests {
             resolve("gfx1100", chunk("gfx1100", Some("1100")), false, None),
             (1024, Default)
         );
-        // A measured narrow discrete link stages from 768 rows (capped at the
-        // chunk): the gfx1100 8192-row chunk, and any other arch forced on.
+        // A measured narrow discrete link stages from a fixed 768 rows, never
+        // lowered to the chunk: a chunk admitted below 768 never stages.
         let narrow = Discrete { gbps: 12.0 }.is_narrow_discrete();
         assert!(narrow);
         assert_eq!(resolve("gfx1100", 8192, narrow, None), (768, Default));
         assert_eq!(resolve("gfx1100", 1536, narrow, None), (768, Default));
         assert_eq!(resolve("gfx1030", 1536, narrow, None), (768, Default));
-        assert_eq!(resolve("gfx1100", 512, narrow, None), (512, Default));
+        assert_eq!(resolve("gfx1100", 768, narrow, None), (768, Default));
+        assert_eq!(resolve("gfx1100", 512, narrow, None), (768, Default));
+        assert_eq!(resolve("gfx1100", 256, narrow, None), (768, Default));
+        // An explicit threshold still wins over the fixed default.
+        assert_eq!(resolve("gfx1100", 512, narrow, Some("256")), (256, Env));
         // gfx1201 keeps 2048 on a narrow link too: its behavior is unchanged.
         assert_eq!(resolve("gfx1201", 4096, narrow, None), (2048, Default));
         assert_eq!(resolve("gfx1201", 8192, narrow, None), (2048, Default));
