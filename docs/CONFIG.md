@@ -1378,14 +1378,19 @@ gfx1100/gfx1151 IU4 producers; `"8"` restores the full-grid search.
 interior tiles use the unchecked specialization and only the final tile uses
 guarded loads and stores.
 
-`kernel.gfx11_a8_prefill` (default `false`; opt in with `true` or
-`HIPFIRE_GFX11_A8_PREFILL=1`, exact gfx1100/gfx1151 only) moves the MQ4V2
-prefill projections from IU4 W4A4 to W4A8: the fused producers emit int8
+### Opt-in gfx11 8-bit activation prefill
+
+`kernel.gfx11_a8_prefill` (default `false` on every architecture; opt in with
+`true` or `HIPFIRE_GFX11_A8_PREFILL=1`, exact gfx1100/gfx1151 only) moves the
+MQ4V2 prefill projections from IU4 W4A4 to W4A8: the fused producers emit int8
 per-128 activations and an iu8-WMMA GEMM consumes them. It applies to
 symmetric MQ4V2, eager prefill (no Redline recording or graph capture) with
 batch >= 64 and K % 256 == 0, and takes precedence over IU4 there; everything
-else stays on IU4. On qwen3.8-27b it gives about the `kernel.iu4_prefill=false`
-quality at a fraction of that route's prefill time.
+else stays on IU4. On Strix Halo (gfx1151, qwen3.8-27b) 8-bit activation
+prefill gives about 43% lower KLD (WT2 0.0394 against 0.0695), and prompts
+process about 1.5–1.6× slower (pp8192 604 against 974 tok/s, pp32000 521
+against 777 tok/s). Enable it with `hipfire config set kernel.gfx11_a8_prefill true`
+or `HIPFIRE_GFX11_A8_PREFILL=1`; with the key off, prefill is unchanged.
 
 ### Retained replay
 

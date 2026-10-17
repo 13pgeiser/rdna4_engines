@@ -3033,7 +3033,7 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         true,
         "HIPFIRE_GFX11_A8_PREFILL",
-        "Opt in to the W4A8 MQ4V2 prefill route on exact gfx1100/gfx1151 (symmetric MQ4V2, eager, batch >= 64, K % 256 == 0): int8 per-128 activations from the fused producers and an iu8-WMMA GEMM, about the IU4-off quality at a fraction of its time. Default off (IU4 W4A4 stays the default); other architectures ignore it."
+        "Opt in to the W4A8 MQ4V2 prefill route on exact gfx1100/gfx1151 (symmetric MQ4V2, eager, batch >= 64, K % 256 == 0): int8 per-128 activations from the fused producers and an iu8-WMMA GEMM: about 43% lower KLD than IU4 W4A4 on Strix Halo, prompts about 1.5-1.6x slower. Default off on every architecture (IU4 W4A4 stays the default); other architectures ignore it."
     ),
     process_bool_field!(
         "kernel.npu_spillover",
@@ -7190,6 +7190,81 @@ overrides = { decide = { calibration = { choice = 1.3, score = 2, noul = 0.7 } }
         .expect("process");
         assert_eq!(
             process.legacy_value("HIPFIRE_NPU_SPILLOVER").as_deref(),
+            Some("1")
+        );
+    }
+    #[test]
+    fn gfx11_a8_prefill_defaults_off_and_round_trips() {
+        let field = field("kernel.gfx11_a8_prefill").expect("gfx11_a8_prefill schema field");
+        assert_eq!(field.legacy_key, "gfx11_a8_prefill");
+        assert_eq!(field.env_compat, Some("HIPFIRE_GFX11_A8_PREFILL"));
+        // Off by default on every architecture: the schema default is the
+        // only default, there is no per-arch variant.
+        assert_eq!(field.default.to_value(), ConfigValue::Bool(false));
+        assert_eq!(field.parse_cli("1").unwrap(), ConfigValue::Bool(true));
+        assert_eq!(field.parse_cli("true").unwrap(), ConfigValue::Bool(true));
+        assert_eq!(field.parse_cli("0").unwrap(), ConfigValue::Bool(false));
+        assert!(field.parse_cli("sometimes").is_err());
+        // An empty resolve leaves the bridge value absent, which the runtime
+        // parses as off.
+        let process =
+            ProcessConfig::from_resolved(&resolve([]).expect("empty resolve")).expect("process");
+        assert_eq!(process.legacy_value("HIPFIRE_GFX11_A8_PREFILL"), None);
+
+        // The key is process-wide: a per-model override is refused.
+        let mut overrides = ConfigLayer::default();
+        overrides
+            .set("kernel.gfx11_a8_prefill", ConfigValue::Bool(true))
+            .unwrap();
+        let error = validate_model_layer(&overrides).unwrap_err().to_string();
+        assert!(error.contains("kernel.gfx11_a8_prefill"), "{error}");
+        assert!(
+            error.contains("not valid in a per-model override"),
+            "{error}"
+        );
+
+        // Global TOML round trip under [kernel].
+        let root = temp_root("gfx11-a8-prefill");
+        let paths = ConfigPaths::under(&root);
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.gfx11_a8_prefill", "true").unwrap();
+        write_global_toml(&paths, &layer).unwrap();
+        let rendered = fs::read_to_string(&paths.config_toml).unwrap();
+        assert!(rendered.contains("[kernel]"), "{rendered}");
+        assert!(rendered.contains("gfx11_a8_prefill = true"), "{rendered}");
+        let loaded = load_global(&paths).unwrap();
+        assert_eq!(loaded.layer, layer);
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: paths.config_toml.clone(),
+            },
+            layer: loaded.layer,
+        }])
+        .expect("global resolve");
+        let process = ProcessConfig::from_resolved(&resolved).expect("process");
+        assert_eq!(
+            process.legacy_value("HIPFIRE_GFX11_A8_PREFILL").as_deref(),
+            Some("1")
+        );
+        let _ = fs::remove_dir_all(root);
+
+        // Env spelling flows through the env layer into the same snapshot.
+        // HIPFIRE_GFX11_A8_PREFILL is unique to this test; no other test reads it.
+        std::env::set_var("HIPFIRE_GFX11_A8_PREFILL", "1");
+        let env_layer = load_env_layer().expect("env layer");
+        std::env::remove_var("HIPFIRE_GFX11_A8_PREFILL");
+        let process = ProcessConfig::from_resolved(
+            &resolve([NamedLayer {
+                source: ConfigSource::LegacyEnv {
+                    name: "HIPFIRE_GFX11_A8_PREFILL".into(),
+                },
+                layer: env_layer,
+            }])
+            .expect("env resolve"),
+        )
+        .expect("process");
+        assert_eq!(
+            process.legacy_value("HIPFIRE_GFX11_A8_PREFILL").as_deref(),
             Some("1")
         );
     }

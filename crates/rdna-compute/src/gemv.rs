@@ -6826,10 +6826,22 @@ impl Gpu {
         self.ensure_mq_signs()?;
         let gfx12 = self.arch == "gfx1201";
         let (source, kernel) = match (awq.is_some(), gfx12) {
-            (true, true) => (FUSED_RMSNORM_MQ_ROTATE_AWQ_I8_GFX12_SRC, "fused_rmsnorm_mq_rotate_awq_i8_gfx12"),
-            (false, true) => (FUSED_RMSNORM_MQ_ROTATE_I8_GFX12_SRC, "fused_rmsnorm_mq_rotate_i8_gfx12"),
-            (true, false) => (FUSED_RMSNORM_MQ_ROTATE_AWQ_I8_GFX11_SRC, "fused_rmsnorm_mq_rotate_awq_i8_gfx11"),
-            (false, false) => (FUSED_RMSNORM_MQ_ROTATE_I8_GFX11_SRC, "fused_rmsnorm_mq_rotate_i8_gfx11"),
+            (true, true) => (
+                FUSED_RMSNORM_MQ_ROTATE_AWQ_I8_GFX12_SRC,
+                "fused_rmsnorm_mq_rotate_awq_i8_gfx12",
+            ),
+            (false, true) => (
+                FUSED_RMSNORM_MQ_ROTATE_I8_GFX12_SRC,
+                "fused_rmsnorm_mq_rotate_i8_gfx12",
+            ),
+            (true, false) => (
+                FUSED_RMSNORM_MQ_ROTATE_AWQ_I8_GFX11_SRC,
+                "fused_rmsnorm_mq_rotate_awq_i8_gfx11",
+            ),
+            (false, false) => (
+                FUSED_RMSNORM_MQ_ROTATE_I8_GFX11_SRC,
+                "fused_rmsnorm_mq_rotate_i8_gfx11",
+            ),
         };
         self.ensure_kernel(kernel, source, kernel)?;
         let mut xp = x.buf.as_ptr();
@@ -6924,9 +6936,15 @@ impl Gpu {
         }
         self.ensure_mq_signs()?;
         let (source, kernel) = if self.arch == "gfx1201" {
-            (FUSED_SILU_MUL_MQ_ROTATE_AWQ_I8_HIN_GFX12_SRC, "fused_silu_mul_mq_rotate_awq_i8_hin_gfx12")
+            (
+                FUSED_SILU_MUL_MQ_ROTATE_AWQ_I8_HIN_GFX12_SRC,
+                "fused_silu_mul_mq_rotate_awq_i8_hin_gfx12",
+            )
         } else {
-            (FUSED_SILU_MUL_MQ_ROTATE_AWQ_I8_HIN_GFX11_SRC, "fused_silu_mul_mq_rotate_awq_i8_hin_gfx11")
+            (
+                FUSED_SILU_MUL_MQ_ROTATE_AWQ_I8_HIN_GFX11_SRC,
+                "fused_silu_mul_mq_rotate_awq_i8_hin_gfx11",
+            )
         };
         self.ensure_kernel(kernel, source, kernel)?;
         let mut hp = h.buf.as_ptr();
@@ -7020,10 +7038,22 @@ impl Gpu {
         self.ensure_mq_signs()?;
         let gfx12 = self.arch == "gfx1201";
         let (source, kernel) = match (awq.is_some(), gfx12) {
-            (true, true) => (GATED_NORM_MQ_ROTATE_AWQ_I8_GFX12_SRC, "gated_norm_mq_rotate_awq_i8_gfx12"),
-            (false, true) => (GATED_NORM_MQ_ROTATE_I8_GFX12_SRC, "gated_norm_mq_rotate_i8_gfx12"),
-            (true, false) => (GATED_NORM_MQ_ROTATE_AWQ_I8_GFX11_SRC, "gated_norm_mq_rotate_awq_i8_gfx11"),
-            (false, false) => (GATED_NORM_MQ_ROTATE_I8_GFX11_SRC, "gated_norm_mq_rotate_i8_gfx11"),
+            (true, true) => (
+                GATED_NORM_MQ_ROTATE_AWQ_I8_GFX12_SRC,
+                "gated_norm_mq_rotate_awq_i8_gfx12",
+            ),
+            (false, true) => (
+                GATED_NORM_MQ_ROTATE_I8_GFX12_SRC,
+                "gated_norm_mq_rotate_i8_gfx12",
+            ),
+            (true, false) => (
+                GATED_NORM_MQ_ROTATE_AWQ_I8_GFX11_SRC,
+                "gated_norm_mq_rotate_awq_i8_gfx11",
+            ),
+            (false, false) => (
+                GATED_NORM_MQ_ROTATE_I8_GFX11_SRC,
+                "gated_norm_mq_rotate_i8_gfx11",
+            ),
         };
         self.ensure_kernel(kernel, source, kernel)?;
         let mut xp = x.buf.as_ptr();
@@ -7067,7 +7097,11 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
             kernel,
-            folded_rows_grid("gated_norm_rotate_mq_i8_batched", (k / 256).div_ceil(2), batch_size)?,
+            folded_rows_grid(
+                "gated_norm_rotate_mq_i8_batched",
+                (k / 256).div_ceil(2),
+                batch_size,
+            )?,
             [64, 1, 1],
             0,
             &mut params,
@@ -7127,9 +7161,15 @@ impl Gpu {
         }
         self.ensure_mq_signs()?;
         let (source, kernel) = if self.arch == "gfx1201" {
-            (SIGMOID_MUL_MQ_ROTATE_X_AWQ_I8_GFX12_SRC, "sigmoid_mul_rotate_x_mq_awq_i8_gfx12")
+            (
+                SIGMOID_MUL_MQ_ROTATE_X_AWQ_I8_GFX12_SRC,
+                "sigmoid_mul_rotate_x_mq_awq_i8_gfx12",
+            )
         } else {
-            (SIGMOID_MUL_MQ_ROTATE_X_AWQ_I8_GFX11_SRC, "sigmoid_mul_rotate_x_mq_awq_i8_gfx11")
+            (
+                SIGMOID_MUL_MQ_ROTATE_X_AWQ_I8_GFX11_SRC,
+                "sigmoid_mul_rotate_x_mq_awq_i8_gfx11",
+            )
         };
         self.ensure_kernel(kernel, source, kernel)?;
         let mut ap = attn.buf.as_ptr();

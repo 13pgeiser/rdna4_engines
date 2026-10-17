@@ -37,12 +37,12 @@ use std::ffi::c_void;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-const I8_MODULE: &str = "tmp_a8_gfx11_oracle_i8";
+const I8_MODULE: &str = "a8_gfx11_oracle_i8";
 const I8_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_i8.gfx11.hip")
 );
-const SILU_MODULE: &str = "tmp_a8_gfx11_oracle_silu";
+const SILU_MODULE: &str = "a8_gfx11_oracle_silu";
 const SILU_SRC: &str = r#"
 #include <hip/hip_runtime.h>
 // Same expression as the i8 gate/up epilogue (I8_SILU_MUL).
@@ -692,7 +692,7 @@ fn defines(defs: &str) -> String {
 fn main() {
     let model = std::env::args()
         .nth(1)
-        .expect("usage: tmp_a8_gfx11_oracle <qwen3.8-27b.mq4-xts> [--compile-only]");
+        .expect("usage: a8_gfx11_oracle <qwen3.8-27b.mq4-xts> [--compile-only]");
     let base_defs = std::env::var("I8_DEFINES").unwrap_or_default();
     let src = format!("{}{I8_SRC}", defines(&base_defs));
     let mut gpu = Gpu::init().expect("initialize GPU");

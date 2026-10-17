@@ -1968,18 +1968,37 @@ mod tests {
     #[test]
     fn a8_prefill_is_opt_in_and_scoped_per_arch() {
         let defaults = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
-        for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1201", "gfx906"] {
-            assert!(!FeatureFlags::from_process_config(arch, &defaults).a8_prefill_enabled());
-            let only = |env: &'static str| {
-                FeatureFlags::from_lookup(arch, move |name| {
-                    if name == env { Ok("1".into()) } else { Err(()) }
-                })
-            };
+        for arch in [
+            "gfx906", "gfx908", "gfx90a", "gfx942", "gfx1010", "gfx1030", "gfx1100", "gfx1101",
+            "gfx1102", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            // Default is false on every arch, through both resolution paths.
+            let from_defaults = FeatureFlags::from_process_config(arch, &defaults);
+            assert!(!from_defaults.gfx11_a8_prefill, "{arch}");
+            assert!(!from_defaults.a8_prefill_enabled(), "{arch}");
+            assert!(
+                !FeatureFlags::from_lookup(arch, |_| Err(())).a8_prefill_enabled(),
+                "{arch}"
+            );
+            assert!(!FeatureFlags::for_test(arch).a8_prefill_enabled(), "{arch}");
+            let only =
+                |env: &'static str| {
+                    FeatureFlags::from_lookup(arch, move |name| {
+                        if name == env {
+                            Ok("1".into())
+                        } else {
+                            Err(())
+                        }
+                    })
+                };
             assert_eq!(
                 only("HIPFIRE_GFX11_A8_PREFILL").a8_prefill_enabled(),
                 matches!(arch, "gfx1100" | "gfx1151")
             );
-            assert_eq!(only("HIPFIRE_A8_PREFILL").a8_prefill_enabled(), arch == "gfx1201");
+            assert_eq!(
+                only("HIPFIRE_A8_PREFILL").a8_prefill_enabled(),
+                arch == "gfx1201"
+            );
         }
         let mut layer = ConfigLayer::default();
         layer.set_cli("kernel.gfx11_a8_prefill", "true").unwrap();

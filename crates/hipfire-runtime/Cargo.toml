@@ -812,7 +812,7 @@ required-features = ["deltanet"]
 
 
 [[example]]
-name = "tmp_a8_gfx11_oracle"
+name = "a8_gfx11_oracle"
 required-features = ["lab"]
 
 

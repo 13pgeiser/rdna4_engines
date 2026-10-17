@@ -9,7 +9,7 @@
 // activations (nibble-pair qs order, f32 d, exact int s), banded raster and
 // the same pinned fold, so the output is bit-identical to the gfx12 route
 // and to the CPU reference in
-// `crates/hipfire-runtime/examples/tmp_a8_gfx11_oracle.rs`:
+// `crates/hipfire-runtime/examples/a8_gfx11_oracle.rs`:
 //   C   = sum_k (q - 8) * x8       per (row, token, K128), integer-exact
 //   acc = fma(RN(sc * d), (float)C, acc)   per K128 block, in K order
 //

@@ -492,9 +492,14 @@ fn f1lite_ffn_eligible(
         && w_down.k == hidden_dim
         && matches!(epilogue, BatchEpilogue::Residual)
         && !s4_residual_fast(gpu, fusion, w_down.gpu_dtype, epilogue, n)
-        && (gpu.a8_prefill_active(n, w_gate.k) && hidden_dim % 128 == 0
-            || gpu.iu4_producer_sidecar_active(n, hidden_dim)
-            || gpu.iu4_silu_quant_fused_active(n, hidden_dim))
+        && if gpu.a8_prefill_active(n, w_gate.k) {
+            // A8 gate/up SiLU entry tiles 128 rows; a sidecar-capable gfx11
+            // must not admit f1lite for a hidden_dim the A8 entry rejects.
+            hidden_dim % 128 == 0
+        } else {
+            gpu.iu4_producer_sidecar_active(n, hidden_dim)
+                || gpu.iu4_silu_quant_fused_active(n, hidden_dim)
+        }
 }
 
 /// F1-lite: AWQ IU4 producer for w_down reading h = silu(gate)*up, already
@@ -8130,7 +8135,7 @@ fn batch_chunk_delta_net_ffn_gate_up(
             layer.w_up.k,
             n,
         )?;
-    } else if f1lite && gpu.a8_prefill_active(n, layer.w_gate.k) {
+    } else if f1lite && iu4_prep.is_none() && gpu.a8_prefill_active(n, layer.w_gate.k) {
         let xq = gpu.ensure_int8_mmq_x(&pbs.x_rot_batch, n, layer.w_gate.k)?;
         gpu.gemm_gate_up_silu_mq4g256v2_i8_prequant(
             &layer.w_gate.buf,
@@ -10898,7 +10903,7 @@ fn batch_chunk_full_attn_ffn_gate_up(
             layer.w_up.k,
             n,
         )?;
-    } else if f1lite && gpu.a8_prefill_active(n, layer.w_gate.k) {
+    } else if f1lite && iu4_prep.is_none() && gpu.a8_prefill_active(n, layer.w_gate.k) {
         let xq = gpu.ensure_int8_mmq_x(&pbs.x_rot_batch, n, layer.w_gate.k)?;
         gpu.gemm_gate_up_silu_mq4g256v2_i8_prequant(
             &layer.w_gate.buf,
