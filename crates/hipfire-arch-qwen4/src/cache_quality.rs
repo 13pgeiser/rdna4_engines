@@ -16,9 +16,11 @@
 //! `SessionState::snapshot_parts` part.
 //!
 //! Per fixture case and arm: `session_clear`, then (hit arms) replay the prior
-//! turns through plan -> prefill -> teacher-forced decode -> `session_commit`,
-//! then plan and prefill the final prompt and score `score_rows + 1` logits
-//! rows into a raw f32 sidecar. The result JSON is always written; `Err` is
+//! turns through plan -> prefill -> teacher-forced decode -> `session_commit`
+//! (`cache_mode: "live"`: `session_commit_live(stream[..consumed_end])`, the
+//! serve route that keeps the decode-lineage state for the next turn), then
+//! plan and prefill the final prompt and score `score_rows + 1` logits rows
+//! into a raw f32 sidecar. The result JSON is always written; `Err` is
 //! returned afterwards if any expectation failed.
 
 use crate::bundle::Qwen4Bundle;
@@ -208,6 +210,10 @@ struct CqArm {
     expect_start: Option<usize>,
     /// Free-form tag echoed into the result (cross-binary comparisons).
     label: Option<String>,
+    /// Hit arm commits each prior turn with `session_commit_live` (serve's
+    /// `commit_qwen4_session`), so the final request resumes the live
+    /// decode-lineage state instead of a snapshot.
+    live: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -386,30 +392,33 @@ fn cq_parse_arm(value: &Value, ctx: &str) -> Result<CqArm, String> {
     let kind = cq_string(object, "kind", &ctx)?;
     match kind.as_str() {
         "hit" => {
-            // The session cache has one policy: a hit arm either omits
-            // `cache_mode` or names it "default". The RC3 prefix-cache modes
-            // no longer exist, so a fixture written for them is refused
-            // instead of silently measuring something else.
-            if let Some(value) = object.get("cache_mode") {
-                match value.as_str() {
-                    Some("default") => {}
+            // The session cache has one snapshot policy ("default", also the
+            // omitted value) plus "live", which keeps serve's live
+            // continuation. The RC3 prefix-cache modes no longer exist, so a
+            // fixture written for them is refused instead of silently
+            // measuring something else.
+            let live = match object.get("cache_mode") {
+                None => false,
+                Some(value) => match value.as_str() {
+                    Some("default") => false,
+                    Some("live") => true,
                     Some(mode @ ("cold_exact" | "session")) => {
                         return Err(format!(
-                            "{ctx}: cache_mode {mode:?} belongs to the RC3 prefix/radix cache and is not supported by the session-cache oracle; omit cache_mode or use \"default\""
+                            "{ctx}: cache_mode {mode:?} belongs to the RC3 prefix/radix cache and is not supported by the session-cache oracle; omit cache_mode or use \"default\" or \"live\""
                         ))
                     }
                     Some(other) => {
                         return Err(format!(
-                            "{ctx}: unknown cache_mode {other:?} (expected \"default\" or omitted)"
+                            "{ctx}: unknown cache_mode {other:?} (expected \"default\", \"live\" or omitted)"
                         ))
                     }
                     None => {
                         return Err(format!(
-                            "{ctx}: unknown cache_mode {value} (expected \"default\" or omitted)"
+                            "{ctx}: unknown cache_mode {value} (expected \"default\", \"live\" or omitted)"
                         ))
                     }
-                }
-            }
+                },
+            };
             let expect = match object.get("expect") {
                 None => CqExpect::None,
                 Some(value) => match value.as_str() {
@@ -438,6 +447,7 @@ fn cq_parse_arm(value: &Value, ctx: &str) -> Result<CqArm, String> {
                 expect,
                 expect_start,
                 label,
+                live,
             })
         }
         "cold" => {
@@ -452,6 +462,7 @@ fn cq_parse_arm(value: &Value, ctx: &str) -> Result<CqArm, String> {
                 expect: CqExpect::None,
                 expect_start: None,
                 label,
+                live: false,
             })
         }
         other => Err(format!(
@@ -519,6 +530,11 @@ fn cq_parse_case(
     }
     if arms.is_empty() {
         return Err(format!("{ctx}: needs at least one arm"));
+    }
+    if turns.is_empty() && arms.iter().any(|arm| arm.live) {
+        return Err(format!(
+            "{ctx}: a cache_mode \"live\" arm needs at least one prior turn to continue"
+        ));
     }
     let colds = arms
         .iter()
@@ -1631,7 +1647,11 @@ fn cq_arm_body(
             turn.consumed_end,
             &format!("turn {index} teacher-forced decode"),
         )?;
-        rig.bundle.session_commit();
+        if arm.live {
+            rig.bundle.session_commit_live(&stream[..turn.consumed_end]);
+        } else {
+            rig.bundle.session_commit();
+        }
         turns.push(json!({
             "turn": index,
             "stream": turn.stream,
@@ -1798,9 +1818,10 @@ fn cq_compare_arms(cold: &CqArmRun, arm: &CqArmRun) -> Result<CqComparison, Stri
     })
 }
 
-/// `cache_mode` in the result: hit arms ran the session cache's one policy
-/// ("default"); the cold arm keeps the RC3 report's "cold_exact" so existing
-/// consumers group it unchanged.
+/// `cache_mode` in the result: hit arms ran the session cache's snapshot
+/// policy ("default") or serve's live continuation ("live"); the cold arm
+/// keeps the RC3 report's "cold_exact" so existing consumers group it
+/// unchanged.
 fn cq_arm_json(arm: &CqArm, run: &Result<CqArmRun, String>, expectation: Value) -> Value {
     let mut out = json!({
         "name": arm.name,
@@ -1808,9 +1829,10 @@ fn cq_arm_json(arm: &CqArm, run: &Result<CqArmRun, String>, expectation: Value) 
             CqArmKind::Hit => "hit",
             CqArmKind::Cold => "cold",
         },
-        "cache_mode": match arm.kind {
-            CqArmKind::Hit => "default",
-            CqArmKind::Cold => "cold_exact",
+        "cache_mode": match (arm.kind, arm.live) {
+            (CqArmKind::Hit, false) => "default",
+            (CqArmKind::Hit, true) => "live",
+            (CqArmKind::Cold, _) => "cold_exact",
         },
         "expectation": expectation,
     });
@@ -1954,6 +1976,16 @@ fn cq_run_case(
                 found.all_rows_bitwise_equal,
                 found.families_equal,
             ));
+        }
+        // A live arm that did not resume at the last turn's end silently
+        // measured a snapshot or cold prefill instead.
+        if let (true, Ok(run), Some(last)) = (arm.live, run, case.turns.last()) {
+            if run.selected_start != last.consumed_end {
+                reasons.push(format!(
+                    "live continuation not resumed: final selected_start {} != last turn consumed_end {}",
+                    run.selected_start, last.consumed_end
+                ));
+            }
         }
         let passed = reasons.is_empty();
         for reason in &reasons {
@@ -2273,6 +2305,23 @@ mod tests {
     }
 
     #[test]
+    fn live_cache_mode_needs_a_prior_turn() {
+        let mut value = valid();
+        value["cases"][0]["arms"][1]["cache_mode"] = json!("live");
+        let fixture = parse(&value).expect("live hit arm");
+        let arms = &fixture.cases[0].arms;
+        assert_eq!(
+            (arms[0].live, arms[1].live, arms[2].live),
+            (false, true, false)
+        );
+        value["cases"][0]["turns"] = json!([]);
+        assert!(parse_err(&value).contains("needs at least one prior turn"));
+        let mut value = valid();
+        value["cases"][0]["arms"][2]["cache_mode"] = json!("live");
+        assert!(parse_err(&value).contains("not allowed on a cold arm"));
+    }
+
+    #[test]
     fn label_is_an_optional_string_on_either_arm_kind() {
         let mut value = valid();
         value["cases"][0]["arms"][2]["label"] = json!("cold-ref");
@@ -2291,6 +2340,7 @@ mod tests {
             expect: CqExpect::None,
             expect_start: None,
             label: Some("rc4".to_string()),
+            live: false,
         };
         let cold = CqArm {
             name: "c".to_string(),
@@ -2298,12 +2348,19 @@ mod tests {
             expect: CqExpect::None,
             expect_start: None,
             label: None,
+            live: false,
         };
         let failed: Result<CqArmRun, String> = Err("boom".to_string());
         let value = cq_arm_json(&hit, &failed, json!({"passed": false}));
         assert_eq!(value["label"], json!("rc4"));
         assert_eq!(value["cache_mode"], json!("default"));
         assert_eq!(value["error"], json!("boom"));
+        let live = CqArm {
+            live: true,
+            ..hit.clone()
+        };
+        let value = cq_arm_json(&live, &failed, json!({"passed": false}));
+        assert_eq!(value["cache_mode"], json!("live"));
         let value = cq_arm_json(&cold, &failed, json!({"passed": false}));
         assert!(value.get("label").is_none());
         assert_eq!(value["cache_mode"], json!("cold_exact"));
