@@ -6,13 +6,14 @@
 //! own `config.toml`, a controlled registry card, an explicit GPU/model
 //! context and an injected environment layer. Nothing reads the real
 //! `~/.hipfire`, the process environment or the network.
+//!
+//! Tests build their [`App`] through [`hermetic_app`] /
+//! [`hermetic_app_with_config`] or [`FixtureBuilder`], never the production
+//! loader (it reads the real `~/.hipfire`, `install.json` and `HIPFIRE_*` env).
 
 use std::{
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Once,
-    },
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use hipfire_config::{
@@ -26,6 +27,72 @@ use crate::{
     app::{App, Tab},
     hipfire::{registry::ModelRow, settings_model::RowId, HipfirePaths},
 };
+
+/// A fresh temporary state root, removed (recursively) when dropped. Derefs to
+/// its path.
+pub struct TempHome(PathBuf);
+
+impl TempHome {
+    pub fn new(tag: &str) -> Self {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "hipfire-tui-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create temp home");
+        Self(root)
+    }
+}
+
+impl std::ops::Deref for TempHome {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for TempHome {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// An [`App`] over an empty fresh home: unknown GPU and model, no env layer,
+/// bundled registry. Keep the returned [`TempHome`] alive as long as the app.
+pub fn hermetic_app() -> (App, TempHome) {
+    hermetic_app_with_config("")
+}
+
+/// [`hermetic_app`] whose `config.toml` holds `config_toml` (written BEFORE
+/// the app loads); an empty string writes no file.
+pub fn hermetic_app_with_config(config_toml: &str) -> (App, TempHome) {
+    let home = TempHome::new("app");
+    if !config_toml.is_empty() {
+        std::fs::write(home.join("config.toml"), config_toml).expect("write hermetic config");
+    }
+    let arch = ArchCtx {
+        gpu_arch: None,
+        gpu_count: 1,
+        model_arch_id: None,
+        registry_tag: None,
+        a8_prefill: A8Prefill::detect(),
+    };
+    let app = App::load_from_paths(
+        HipfirePaths::under(home.to_path_buf()),
+        arch,
+        ConfigLayer::default(),
+    )
+    .expect("load hermetic app");
+    (app, home)
+}
 
 /// The model every fixture serves (a dense 27B, `model_arch` 5).
 pub const ACTIVE_MODEL: &str = "qwen3.8:27b";
@@ -106,10 +173,6 @@ impl FixtureBuilder {
 
     pub fn build(self) -> Fixture {
         static NEXT: AtomicU32 = AtomicU32::new(0);
-        static NO_FETCH: Once = Once::new();
-        // The registry loader would otherwise try the network; the bundled
-        // registry is replaced below anyway.
-        NO_FETCH.call_once(|| std::env::set_var("HIPFIRE_NO_REGISTRY_FETCH", "1"));
 
         let root = std::env::temp_dir().join(format!(
             "hipfire-tui-settings-{}-{}",
@@ -223,5 +286,101 @@ pub fn online_dashboard(
         gpu_load: LoadState::Unavailable("test".into()),
         offline_hint: None,
         system: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn real_root() -> PathBuf {
+        let _guard = crate::hipfire::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        HipfirePaths::discover().root
+    }
+
+    /// No test-constructed App may sit on the real `~/.hipfire`.
+    #[test]
+    fn test_apps_never_use_the_real_home() {
+        let real = real_root();
+        let (app, home) = hermetic_app();
+        assert_ne!(app.paths.root, real);
+        assert_eq!(app.paths.root, home.to_path_buf());
+        let (app, _home) = hermetic_app_with_config("schema_version = 1\n");
+        assert_ne!(app.paths.root, real);
+        let fixture = FixtureBuilder::new("gfx1151").build();
+        assert_ne!(fixture.app.paths.root, real);
+        assert!(fixture.app.paths.root.starts_with(std::env::temp_dir()));
+    }
+
+    /// A hermetic app drops its home with it.
+    #[test]
+    fn temp_home_is_removed_on_drop() {
+        let (app, home) = hermetic_app();
+        let root = app.paths.root.clone();
+        assert!(root.is_dir());
+        drop(app);
+        drop(home);
+        assert!(!root.exists());
+    }
+
+    /// Source guard: no test module may build an App from the real home or
+    /// mutate process env outside `ENV_LOCK`. Test code is everything after
+    /// the file's first `#[cfg(test)]` module.
+    #[test]
+    fn test_code_never_loads_the_real_app_or_mutates_env_unlocked() {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let load = ["App::", "load()"].concat();
+        let set_env = ["env::set_", "var("].concat();
+        let lock = ["ENV_", "LOCK"].concat();
+        let mut files = Vec::new();
+        walk(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let mut offenders = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let is_support = file
+                .file_name()
+                .is_some_and(|name| name == "test_support.rs");
+            let has_tests = text.contains("#[test]");
+            // The first inline `#[cfg(test)] mod name {` (not `mod name;`).
+            let in_test_module = text
+                .match_indices("#[cfg(test)]\nmod ")
+                .map(|(at, marker)| &text[at + marker.len()..])
+                .find(|rest| rest.lines().next().is_some_and(|line| line.ends_with('{')))
+                .or(is_support.then_some(text.as_str()))
+                .unwrap_or("");
+            if has_tests && in_test_module.is_empty() {
+                offenders.push(format!(
+                    "{}: has #[test] but no `#[cfg(test)] mod` marker",
+                    file.display()
+                ));
+            }
+            if in_test_module.contains(&load) {
+                offenders.push(format!(
+                    "{}: test code builds an App from the real home",
+                    file.display()
+                ));
+            }
+            if in_test_module.contains(&set_env) && !in_test_module.contains(&lock) {
+                offenders.push(format!(
+                    "{}: test code sets env without ENV_LOCK",
+                    file.display()
+                ));
+            }
+        }
+        assert!(offenders.is_empty(), "{offenders:#?}");
     }
 }

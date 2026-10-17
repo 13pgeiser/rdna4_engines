@@ -1837,11 +1837,11 @@ mod render_tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     /// Render the whole UI for the Dashboard tab with the given snapshot and
-    /// return the flattened buffer text. App::load() reads ~/.hipfire but is
-    /// tolerant of missing files (same path as `--check`); the Dashboard panel
-    /// itself draws purely from `app.dashboard`, which we inject here.
+    /// return the flattened buffer text. The app is hermetic (an empty temp
+    /// home); the Dashboard panel itself draws purely from `app.dashboard`,
+    /// which we inject here.
     fn render_dashboard(dash: Option<Dashboard>) -> String {
-        let mut app = App::load().expect("App::load");
+        let (mut app, _home) = crate::test_support::hermetic_app();
         app.tab = Tab::Dashboard;
         app.dashboard = dash;
         let backend = TestBackend::new(110, 30);
@@ -1854,7 +1854,7 @@ mod render_tests {
     }
 
     fn render_metrics(view: crate::hipfire::metrics::MetricsView, width: u16) -> String {
-        let mut app = App::load().expect("App::load");
+        let (mut app, _home) = crate::test_support::hermetic_app();
         app.tab = Tab::Dashboard;
         app.live_metrics = view;
         let mut terminal = Terminal::new(TestBackend::new(width, 30)).expect("terminal");
@@ -2000,7 +2000,7 @@ mod render_tests {
     /// passed closure first (set tab / inject dashboard / toast). CPU-only, no
     /// TTY, no GPU, no serve.
     fn render_with(setup: impl FnOnce(&mut App)) -> String {
-        let mut app = App::load().expect("App::load");
+        let (mut app, _home) = crate::test_support::hermetic_app();
         setup(&mut app);
         let backend = TestBackend::new(120, 32);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -2142,7 +2142,7 @@ mod render_tests {
 
     #[test]
     fn models_empty_state_guides_to_pull() {
-        // App::load with no registry / no local models yields empty visible
+        // A hermetic app with no registry / no local models yields empty visible
         // items; the Models tab must render pull guidance, not an empty table.
         let text = render_with(|app| {
             app.tab = Tab::Models;
@@ -2166,7 +2166,7 @@ mod render_tests {
 
     #[test]
     fn header_records_ordered_tab_hitboxes() {
-        let mut app = App::load().expect("App::load");
+        let (mut app, _home) = crate::test_support::hermetic_app();
         let backend = TestBackend::new(110, 30);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
@@ -2188,7 +2188,7 @@ mod render_tests {
         // drew the tab title in the buffer — the only check that catches a real
         // off-by-one in draw_header's cell-width / divider math (the fabricated-
         // hitbox click tests cannot).
-        let mut app = App::load().expect("App::load");
+        let (mut app, _home) = crate::test_support::hermetic_app();
         let backend = TestBackend::new(110, 30);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
@@ -2221,7 +2221,7 @@ mod render_tests {
         // At a width where not all tabs fit, the hit regions must not register a
         // tab ratatui didn't draw, every region is clamped to the area, and a
         // click well past the visible tabs resolves to nothing.
-        let mut app = App::load().expect("App::load");
+        let (mut app, _home) = crate::test_support::hermetic_app();
         let backend = TestBackend::new(20, 12);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
@@ -2245,7 +2245,7 @@ mod render_tests {
     fn help_overlay_does_not_panic_at_tiny_geometry() {
         // Locks in the saturating-sub underflow guards in draw_help_overlay.
         for (w, h) in [(4u16, 3u16), (2, 2), (1, 1)] {
-            let mut app = App::load().expect("App::load");
+            let (mut app, _home) = crate::test_support::hermetic_app();
             app.show_help = true;
             let backend = TestBackend::new(w, h);
             let mut terminal = Terminal::new(backend).expect("terminal");
@@ -2431,7 +2431,7 @@ mod render_tests {
     }
     /// Render at `w`x`h` and return each buffer row as a string.
     fn render_rows(w: u16, h: u16, setup: impl FnOnce(&mut App)) -> Vec<String> {
-        let mut app = App::load().expect("App::load");
+        let (mut app, _home) = crate::test_support::hermetic_app();
         setup(&mut app);
         let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
         terminal
@@ -2621,7 +2621,7 @@ mod render_tests {
     }
 
     fn long_reply_app() -> App {
-        let mut app = App::load().expect("App::load");
+        let (mut app, _home) = crate::test_support::hermetic_app();
         app.tab = Tab::Chat;
         let mut body: Vec<String> = (1..=40).map(|i| format!("line {i:02} xxxx")).collect();
         body.push("END-OF-REPLY".into());
@@ -2711,7 +2711,7 @@ mod render_tests {
 
     #[test]
     fn chat_long_input_tail_and_cursor_visible() {
-        let mut app = App::load().expect("App::load");
+        let (mut app, _home) = crate::test_support::hermetic_app();
         app.tab = Tab::Chat;
         app.chat.input = format!("{}END", "x".repeat(400));
         let (text, cursor) = draw_at(&mut app, 80, 24);
@@ -2734,7 +2734,7 @@ mod render_tests {
 
     #[test]
     fn chat_help_goes_to_transcript_not_input_title() {
-        let mut app = App::load().expect("App::load");
+        let (mut app, _home) = crate::test_support::hermetic_app();
         app.tab = Tab::Chat;
         app.chat.messages = vec![msg("user", "hi"), msg("assistant", "hello")];
         app.chat.input = "/help".into();
@@ -2759,7 +2759,7 @@ mod render_tests {
 
     #[test]
     fn chat_reasoning_is_labelled_and_styled_apart() {
-        let mut app = App::load().expect("App::load");
+        let (mut app, _home) = crate::test_support::hermetic_app();
         app.tab = Tab::Chat;
         app.chat.messages = vec![
             msg("user", "hi"),
@@ -2800,7 +2800,7 @@ mod render_tests {
 
     #[test]
     fn chat_abort_marks_stopped_in_transcript_only() {
-        let mut app = App::load().expect("App::load");
+        let (mut app, _home) = crate::test_support::hermetic_app();
         app.tab = Tab::Chat;
         app.chat.messages = vec![msg("user", "hi"), msg("assistant", "partial reply")];
         app.chat.sending = true;
@@ -2814,7 +2814,7 @@ mod render_tests {
 
     #[test]
     fn chat_stats_label_is_honest_about_chunks() {
-        let mut app = App::load().expect("App::load");
+        let (mut app, _home) = crate::test_support::hermetic_app();
         app.tab = Tab::Chat;
         app.chat.last_stats = Some(crate::app::GenStats {
             tokens: 7,
@@ -2838,7 +2838,7 @@ mod render_tests {
     /// a long tag that is the active (local) model.
     fn render_models(width: u16, height: u16) -> String {
         use crate::hipfire::registry::{LocalModel, ModelEntry, ModelRow};
-        let mut app = App::load().expect("App::load");
+        let (mut app, _home) = crate::test_support::hermetic_app();
         app.tab = Tab::Models;
         let row = |tag: &str, downloaded: bool, has_mtp: bool| ModelRow {
             tag: tag.into(),
@@ -2940,7 +2940,7 @@ mod render_tests {
         entry.ple.insert("q8".into(), sc(3_000_000_000));
         entry.mtp = Some(sc(400_000_000));
         entry.dflash = Some(sc(1_200_000_000));
-        let mut app = App::load().expect("App::load");
+        let (mut app, _home) = crate::test_support::hermetic_app();
         app.tab = Tab::Models;
         app.pull_choice = PullChoice::for_entry("qwen3.8:flash-next-mq4-xts", &entry);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");

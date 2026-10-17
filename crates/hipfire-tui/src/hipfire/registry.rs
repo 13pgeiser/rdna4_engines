@@ -68,6 +68,19 @@ impl RegistryState {
         Self::from_loaded(paths, registry_paths.cache, loaded)
     }
 
+    /// The bundled registry only: no `HIPFIRE_REGISTRY_URL` /
+    /// `HIPFIRE_NO_REGISTRY_FETCH` process env, no cache read, no network.
+    /// Local model files under `paths` still apply.
+    pub fn load_bundled(paths: &HipfirePaths) -> Self {
+        let loaded = hipfire_registry::LoadedRegistry {
+            registry: hipfire_registry::bundled()
+                .expect("checked-in registry/v1.json must validate"),
+            source: hipfire_registry::RegistrySource::Bundled,
+            warnings: Vec::new(),
+        };
+        Self::from_loaded(paths, paths.root.join("registry.cache.json"), loaded)
+    }
+
     fn from_loaded(
         paths: &HipfirePaths,
         cache_path: PathBuf,
@@ -362,9 +375,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let mut paths = super::HipfirePaths::discover();
-        paths.root = root.clone();
-        paths.models = root.join("models");
+        let paths = super::HipfirePaths::under(root.clone());
         std::fs::create_dir_all(&paths.models).unwrap();
         for file in [
             "x.mq4",

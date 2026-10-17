@@ -26,6 +26,16 @@ pub struct ConfigState {
 
 impl ConfigState {
     pub fn load(paths: &HipfirePaths) -> Self {
+        Self::load_inner(paths, true)
+    }
+
+    /// [`ConfigState::load`] without the `HIPFIRE_SERVE_API_KEY_FILE`
+    /// process-environment override: reads only `paths`.
+    pub fn load_hermetic(paths: &HipfirePaths) -> Self {
+        Self::load_inner(paths, false)
+    }
+
+    fn load_inner(paths: &HipfirePaths, read_env: bool) -> Self {
         let mut values = defaults();
         let mut loaded_from_disk = false;
         let mut warning = None;
@@ -47,7 +57,7 @@ impl ConfigState {
 
         // `HIPFIRE_SERVE_API_KEY_FILE` outranks the config file, matching the
         // CLI's resolution order for this key.
-        if let Some(schema) = field("serve.api_key_file") {
+        if let Some(schema) = field("serve.api_key_file").filter(|_| read_env) {
             if let Some(name) = schema.env_compat {
                 if let Ok(raw) = std::env::var(name) {
                     match schema.parse_cli(&raw) {

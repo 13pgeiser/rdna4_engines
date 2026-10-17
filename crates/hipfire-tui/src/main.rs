@@ -403,8 +403,8 @@ mod tests {
     use super::*;
     use app::Tab;
 
-    fn test_app() -> App {
-        App::load().expect("App::load")
+    fn test_app() -> (App, crate::test_support::TempHome) {
+        crate::test_support::hermetic_app()
     }
     fn k(c: KeyCode) -> KeyEvent {
         KeyEvent::new(c, KeyModifiers::NONE)
@@ -420,7 +420,7 @@ mod tests {
 
     #[test]
     fn settings_flag_opens_on_settings_for_this_launch_only() {
-        let mut app = test_app();
+        let (mut app, _home) = test_app();
         app.tab = Tab::Models; // what ui_state.json restored
         assert_eq!(apply_launch_tab(&mut app, false), None);
         assert_eq!(app.tab, Tab::Models, "no flag leaves the restored tab");
@@ -471,7 +471,7 @@ mod tests {
 
     #[test]
     fn question_mark_opens_help_then_any_key_closes_it() {
-        let mut app = test_app();
+        let (mut app, _home) = test_app();
         app.tab = Tab::Home;
         assert!(!app.show_help);
         let quit = handle_key(&mut app, k(KeyCode::Char('?')));
@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn left_click_on_tab_region_switches_tab() {
-        let mut app = test_app();
+        let (mut app, _home) = test_app();
         app.tab = Tab::Home;
         app.tab_row_y = 3;
         app.tab_hitboxes = vec![(0, 6, Tab::Home), (9, 20, Tab::Dashboard)];
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn click_off_the_tab_bar_does_not_switch() {
-        let mut app = test_app();
+        let (mut app, _home) = test_app();
         app.tab = Tab::Home;
         app.tab_row_y = 3;
         app.tab_hitboxes = vec![(0, 6, Tab::Home), (9, 20, Tab::Dashboard)];
@@ -515,7 +515,7 @@ mod tests {
 
     #[test]
     fn scroll_dismisses_help_overlay() {
-        let mut app = test_app();
+        let (mut app, _home) = test_app();
         app.show_help = true;
         handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, 0, 0));
         assert!(!app.show_help);
@@ -526,7 +526,7 @@ mod tests {
         // The wheel must actually move the active list (its real purpose), not
         // just dismiss the overlay. The Quality group always has several rows,
         // so the selection movement is deterministic.
-        let mut app = test_app();
+        let (mut app, _home) = test_app();
         app.tab = Tab::Settings;
         app.settings_group = hipfire_config::intent::Intent::Quality;
         app.settings_search = None;
@@ -570,7 +570,7 @@ mod tests {
             Tab::System,
             Tab::Logs,
         ] {
-            let mut app = test_app();
+            let (mut app, _home) = test_app();
             app.tab = tab;
             app.settings_edit = None;
             app.settings_pending = None;
@@ -584,7 +584,7 @@ mod tests {
 
     #[test]
     fn dashboard_restart_then_n_starts_no_serve_command() {
-        let mut app = test_app();
+        let (mut app, _home) = test_app();
         app.tab = Tab::Dashboard;
         assert!(!handle_key(&mut app, k(KeyCode::Char('R'))));
         assert!(app.confirm_serve.is_some(), "R arms the confirm");
@@ -601,7 +601,7 @@ mod tests {
 
     #[test]
     fn dashboard_stop_then_y_starts_the_stop_command() {
-        let mut app = test_app();
+        let (mut app, _home) = test_app();
         app.tab = Tab::Dashboard;
         handle_key(&mut app, k(KeyCode::Char('x')));
         assert!(app.confirm_serve.is_some());
@@ -614,7 +614,7 @@ mod tests {
 
     #[test]
     fn armed_serve_confirm_is_modal_and_disarms_on_tab_leave() {
-        let mut app = test_app();
+        let (mut app, _home) = test_app();
         app.tab = Tab::Dashboard;
         handle_key(&mut app, k(KeyCode::Char('R')));
         assert!(
@@ -667,7 +667,7 @@ mod tests {
 
     #[test]
     fn q_with_running_pull_asks_before_quitting() {
-        let mut app = test_app();
+        let (mut app, _home) = test_app();
         app.tab = Tab::Home;
         let (_tx, rx) = std::sync::mpsc::channel();
         let cancel = app.inject_pull("qwen3.5:4b".into(), rx);
@@ -698,7 +698,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_with_running_pull_asks_before_quitting() {
-        let mut app = test_app();
+        let (mut app, _home) = test_app();
         app.tab = Tab::Models;
         let (_tx, rx) = std::sync::mpsc::channel();
         let cancel = app.inject_pull("qwen3.5:4b".into(), rx);
@@ -719,7 +719,7 @@ mod tests {
 
     #[test]
     fn quit_is_immediate_without_a_pull() {
-        let mut app = test_app();
+        let (mut app, _home) = test_app();
         app.tab = Tab::Home;
         assert!(handle_key(&mut app, k(KeyCode::Char('q'))));
         assert!(!app.confirm_quit);
@@ -728,7 +728,7 @@ mod tests {
 
     #[test]
     fn esc_on_chat_cancels_a_queued_send_instead_of_blurring_or_quitting() {
-        let mut app = test_app();
+        let (mut app, _home) = test_app();
         app.tab = Tab::Chat;
         // Health is unknown at this point, so Enter queues (and starts nothing).
         app.chat.input = "hello".into();
@@ -749,7 +749,7 @@ mod tests {
     #[test]
     fn pull_chooser_is_modal_q_does_not_quit_and_esc_closes_it() {
         use crate::hipfire::registry::{ModelEntry, ModelRow};
-        let mut app = test_app();
+        let (mut app, _home) = test_app();
         app.tab = Tab::Models;
         let mut entry = ModelEntry::default();
         entry.ple.insert(

@@ -1916,7 +1916,12 @@ mod tests {
         // Spawn the worker, leave it idle (Dashboard tab not active), and drop
         // it — Drop must signal shutdown and join without hanging. No GPU /
         // serve needed; idle worker performs no fetch.
-        let cfg = ConfigState::load(&crate::hipfire::HipfirePaths::discover());
+        let cfg = ConfigState::load_hermetic(&crate::hipfire::HipfirePaths::under(
+            std::env::temp_dir().join(format!(
+                "hipfire-worker-spawn-absent-{}",
+                std::process::id()
+            )),
+        ));
         let worker = DashboardWorker::spawn(cfg);
         // No snapshot before any fetch.
         assert!(worker.snapshot().is_none());

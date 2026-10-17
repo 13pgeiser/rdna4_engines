@@ -232,6 +232,9 @@ pub struct App {
     pub arch: ArchCtx,
     /// The `HIPFIRE_*` environment layer, captured at load (injected in tests).
     pub env_layer: hipfire_config::ConfigLayer,
+    /// Config and registry loads read nothing but `paths` (no process env, no
+    /// registry fetch): set by [`App::load_from_paths`], never by [`App::load`].
+    hermetic: bool,
     /// Settings rows (intent groups, effective values, origins, locks).
     pub settings: SettingsModel,
     pub registry: RegistryState,
@@ -334,7 +337,7 @@ impl App {
                 Some(format!("environment: {error}")),
             ),
         };
-        let mut app = Self::assemble(paths, None, env)?;
+        let mut app = Self::assemble(paths, None, env, false)?;
         if let Some(message) = env_warning {
             app.config.warning = Some(match app.config.warning.take() {
                 Some(previous) => format!("{previous}; {message}"),
@@ -353,7 +356,15 @@ impl App {
         arch: ArchCtx,
         env: hipfire_config::ConfigLayer,
     ) -> Result<Self> {
-        Self::assemble(paths, Some(arch), env)
+        Self::assemble(paths, Some(arch), env, true)
+    }
+
+    fn load_config(&self) -> ConfigState {
+        if self.hermetic {
+            ConfigState::load_hermetic(&self.paths)
+        } else {
+            ConfigState::load(&self.paths)
+        }
     }
 
     /// `arch: None` derives the context from `install.json` and the active
@@ -362,9 +373,16 @@ impl App {
         paths: HipfirePaths,
         arch: Option<ArchCtx>,
         env_layer: hipfire_config::ConfigLayer,
+        hermetic: bool,
     ) -> Result<Self> {
-        let config = ConfigState::load(&paths);
-        let mut registry = RegistryState::load(&paths);
+        let (config, mut registry) = if hermetic {
+            (
+                ConfigState::load_hermetic(&paths),
+                RegistryState::load_bundled(&paths),
+            )
+        } else {
+            (ConfigState::load(&paths), RegistryState::load(&paths))
+        };
         let status = StatusState::load_local(&paths);
         let active_model = config.default_model.clone();
         let registry_v1 = settings_model::registry_v1(&registry);
@@ -387,6 +405,7 @@ impl App {
             config,
             arch,
             env_layer,
+            hermetic,
             settings,
             registry,
             status,
@@ -862,7 +881,7 @@ impl App {
         // local-models / serve.pid — all file I/O). The live serve health, VRAM
         // and system diagnostics come from the background DashboardWorker, so we
         // never run /health or lspci/rocm-smi on the UI thread here.
-        self.config = ConfigState::load(&self.paths);
+        self.config = self.load_config();
         // A reload re-reads config from disk, so drop any uncommitted enum preview
         // (5b) rather than leave it pointing at a now-stale value.
         self.settings_pending = None;
@@ -871,7 +890,11 @@ impl App {
         // collapse everything (and then a clean quit would persist that empty
         // set back to ui_state.json).
         let expanded = self.registry.expanded_groups.clone();
-        self.registry = RegistryState::load(&self.paths);
+        self.registry = if self.hermetic {
+            RegistryState::load_bundled(&self.paths)
+        } else {
+            RegistryState::load(&self.paths)
+        };
         self.registry.expanded_groups = expanded;
         self.rebuild_settings();
         // Preserve the live overlay (serve health / gpu_lines) already mirrored
@@ -1901,33 +1924,19 @@ impl ChatState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{hermetic_app_with_config, TempHome};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    /// Build an App whose config writes target an isolated temp file, so the
-    /// settings tests never touch the user's real ~/.hipfire/config.toml.
-    fn test_app() -> (App, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "hipfire-tui-app-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg = dir.join("config.toml");
-        std::fs::write(&cfg, "schema_version = 1\n").unwrap();
-
-        let mut app = App::load().expect("load app");
-        app.paths.root = dir.clone();
-        app.paths.config = cfg;
-        app.paths.legacy_config = dir.join("config.json");
-        app.config = ConfigState::load(&app.paths);
+    /// Build a hermetic App (isolated temp home with an empty `config.toml`),
+    /// so the settings tests never touch the user's real ~/.hipfire. The
+    /// returned [`TempHome`] derefs to the home path and removes it on drop.
+    fn test_app() -> (App, TempHome) {
+        let (mut app, home) = hermetic_app_with_config("schema_version = 1\n");
         app.tab = Tab::Settings;
-        (app, dir)
+        (app, home)
     }
 
     #[test]
@@ -2636,7 +2645,7 @@ mod tests {
 
     /// A Chat-tab app isolated from the real `~/.hipfire` (serve.pid) and from
     /// any real serve (config port points at a free, closed port).
-    fn chat_app() -> (App, std::path::PathBuf) {
+    fn chat_app() -> (App, TempHome) {
         let (mut app, dir) = test_app();
         app.tab = Tab::Chat;
         app.paths.serve_pid = dir.join("serve.pid");
@@ -2919,7 +2928,7 @@ mod tests {
 
     /// A Models-tab app over two remote rows: `rich:full` (q4+q8 PLE and an MTP
     /// sidecar) and `plain:base` (nothing). `rich:full` is selected.
-    fn pull_app() -> (App, std::path::PathBuf) {
+    fn pull_app() -> (App, TempHome) {
         use crate::hipfire::registry::{ModelEntry, ModelRow};
         use hipfire_registry::Sidecar;
         let (mut app, dir) = test_app();
@@ -3081,15 +3090,8 @@ mod tests {
             effective::{A8Prefill, Origin},
             ConfigValue,
         };
-        let _guard = crate::hipfire::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("HIPFIRE_NO_REGISTRY_FETCH", "1");
-        let root = std::env::temp_dir().join(format!(
-            "hipfire-tui-load-from-paths-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
+        let home = TempHome::new("load-from-paths");
+        let root = home.to_path_buf();
         std::fs::write(root.join("config.toml"), "[reasoning]\neffort = \"low\"\n").unwrap();
         let arch = ArchCtx {
             gpu_arch: Some("gfx1151".into()),
@@ -3105,7 +3107,6 @@ mod tests {
         let app =
             App::load_from_paths(HipfirePaths::under(root.clone()), arch.clone(), env.clone())
                 .unwrap();
-        std::env::remove_var("HIPFIRE_NO_REGISTRY_FETCH");
         assert_eq!(app.arch, arch);
         assert_eq!(app.env_layer, env);
         assert_eq!(app.paths.root, root);

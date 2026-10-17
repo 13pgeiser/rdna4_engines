@@ -17,7 +17,6 @@ use hipfire_config::{
 
 use super::{deprecated_status, not_editable_status, App, EditState, PendingEnum};
 use crate::hipfire::{
-    config::ConfigState,
     dashboard::LoadedConfig,
     knobs::PROMPT_PROCESSING_ID,
     settings_model::{live_text, value_string, RowFilter, RowId, SettingsRow, VirtualRow},
@@ -148,7 +147,7 @@ impl App {
     fn after_config_write(&mut self) {
         let id = self.selected_row().map(|row| row.id.clone());
         self.rebuild_settings();
-        self.config = ConfigState::load(&self.paths);
+        self.config = self.load_config();
         self.restore_selection(id);
         self.dashboard_worker.update_config(self.config.clone());
         self.dashboard_worker.force_refresh();
@@ -1217,7 +1216,7 @@ mod tests {
     fn corrupt_config_points_reset_at_reset_all() {
         let mut fixture = FixtureBuilder::new("gfx1201").build();
         std::fs::write(fixture.config_path(), "{ broken not toml").unwrap();
-        fixture.app.config = ConfigState::load(&fixture.app.paths);
+        fixture.app.config = fixture.app.load_config();
         assert!(fixture.app.config.warning.is_some());
         press(&mut fixture.app, KeyCode::Delete);
         assert!(
