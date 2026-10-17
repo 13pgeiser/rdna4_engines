@@ -42,6 +42,7 @@ fi
 # -------------------------------
 #sudo bash -c "echo "210000000" > $(echo /sys/class/drm/card0/device/hwmon/hwmon*/power1_cap)"
 docker rm -f radiance_server
+#IMAGE="stilldeadcode/radiance:1.7.0"
 docker run --name radiance_server --network host --init --ulimit memlock=-1 \
     --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined \
     --group-add "$(getent group render | cut -d: -f3)" \
