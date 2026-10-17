@@ -335,6 +335,7 @@
 - **Device-mesh `g5-production-sealed-moe-run` no longer caps `hipfire run` at 64 tokens (harness-only; no production change).** `qwen3.6:35b-a3b-mq4r` reasons by default and `hipfire run` prints only answer tokens, so a 64- or 512-token budget ended inside hidden reasoning, stdout was a bare newline, and `run_reload_equal` failed `min_chars` on every host. Both runs now use the fitted default budget and must still print identical non-empty text.
 - G4.8 vision/OCR lifecycle matrices now finish on gfx1151: the child watchdog kills only after 1800 s without output (not 1800 s total), the test committer waits for the whole turn instead of 60 s, and the `g4-vision-lifecycle` row budget is 6000 s (each matrix takes ~32-34 min there).
 - The GPU buffer pool reuses the smallest fitting buffer in a size bucket instead of the newest. Before, rebuilding a scratch with the same sizes could hand a small request the large pooled buffer, drop the remaining undersized one and allocate a new buffer (Qwen3.5 prefill scratch after a failed construction: 60 allocations vs 59 warm).
+- **LFM2.5 stop tokens resolve to the real `<|im_end|>` / `<|endoftext|>` ids.** `encode()` prepends BOS on LFM tokenizers, so the single-id probe never matched and `eos_tok` fell back to id 1 (BOS on 1.2B, a 9-newline content token on 8B-A1B, which ended turns early). Stop ids now come from the special-token table in the AR, continuous-batch and VL decode loops and in `SpecTarget::eos_token()`.
 
 ## v0.4.2 — 2026-10-14
 
