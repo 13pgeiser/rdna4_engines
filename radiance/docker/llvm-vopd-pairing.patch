@@ -1,0 +1,23 @@
+The VOPD pairing fix the image's HIP compiler is built with (Dockerfile, stage `llvm`).
+
+VOPDPairingMutation caches each load's transitive load dependencies (LoadPredsCache), and
+fuseInstructionPair adds edges after entries were filled, so they go stale. loadsMayOverlap stops
+at the first witness while iterating a SmallPtrSet<SUnit *, 8>, whose order past eight entries is
+the order of the pointers, so WHICH loads were cached before a fusion depends on heap addresses and
+the pair decisions with it: the same source compiles to different code from run to run. A stale
+entry can only miss dependencies and so only refuses pairs; dropping the cache after every fusion
+makes every answer come from the current DAG.
+
+diff --git a/llvm/lib/Target/AMDGPU/GCNVOPDUtils.cpp b/llvm/lib/Target/AMDGPU/GCNVOPDUtils.cpp
+index 29dec3b8b..b241a2f24 100644
+--- a/llvm/lib/Target/AMDGPU/GCNVOPDUtils.cpp
++++ b/llvm/lib/Target/AMDGPU/GCNVOPDUtils.cpp
+@@ -486,6 +486,8 @@ struct VOPDPairingMutation : ScheduleDAGMutation {
+           continue;
+ 
+         if (fuseInstructionPair(*DAG, *ISUI, *JSUI)) {
++          // Fusion adds edges, so cached transitive load dependencies are stale.
++          LoadPredsComputed.reset();
+           // Clear to prevent future checks/fusing
+           VOPDCapable[JIdx] = false;
+           break;

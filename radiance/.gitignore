@@ -1,0 +1,8 @@
+/build*/
+compile_commands.json
+*.o
+*.so
+*.rad
+/sync-jarvis.sh
+__pycache__/
+.cache/

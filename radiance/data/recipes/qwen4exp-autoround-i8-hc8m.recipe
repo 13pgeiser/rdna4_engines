@@ -1,0 +1,38 @@
+# qwen4exp-autoround-i8-hc8m.recipe -- a Qwen3.8-Flash-Next released as AutoRound int4
+# (`auto_round:auto_gptq`, symmetric, group 128), such as
+# ukisai/Swift-1.5-Qwen3.8-Flash-Next-W4A16-AutoRound, arranged as the production container is
+# around its experts.
+#
+#   rad-convert <AutoRound checkpoint> --recipe data/recipes/qwen4exp-autoround-i8-hc8m.recipe \
+#       -o swift-autoround.rad
+#
+# The routed experts are named by no rule: rad-convert imports the release's int4 codes and group
+# scales as `i4*bf16[1x128]` (the scales rounded from f16 to bf16), served on the four-bit expert
+# GEMM. The release ships its block linears in int4 as well, which the trunk's W8A8 GEMMs do not
+# read, so they are made int8 from the int4 values the release holds -- a 128 of K each, as their
+# groups are. Everything the release keeps in bf16 is quantised as qwen4exp-w4nl64-i8-hc8m.recipe
+# quantises it, the MTP layer's experts rounded to the experts' own format.
+
+# The MTP layer's experts, bf16 in the release (blk.48 is the MTP layer).
+blk.48.ffn_*_exps.*.weight           rtn  codes=i4 group=128 scale=bf16
+
+# The connections' mixing matrices and the MTP head's fc matrices, as in production.
+*_hc_down.weight                     rtn  codes=fp8_e4m3 group=128 scale=f32
+*_hc_up.weight                       rtn  codes=fp8_e4m3 group=80 scale=f32
+mtp.fc_hidden.weight                 rtn  codes=fp8_e4m3 group=128 scale=f32
+mtp.fc_embedding.weight              rtn  codes=fp8_e4m3 group=128 scale=f32
+
+# The trunk's block linears as int8, a scale per 128 columns searched for least error.
+blk.*.attn_qg.weight                 rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.attn_k.weight                  rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.attn_v.weight                  rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.attn_output.weight             rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.ssm_inz.weight                 rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.ssm_out.weight                 rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.ffn_gate_up_shexp.weight       rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+blk.*.ffn_down_shexp.weight          rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+output.weight                        rtn  codes=i8 group=128 scale=bf16 clamp=sym rule=search
+
+# The n-gram table at one fixed E4M3 scale, and the MTP head's 2-bit draft head.
+blk.*.ple_ngram.weight               rtn  codes=fp8_e4m3 block=*x* scale=bf16 rule=fixed scale_value=1.99317932128906e-4
+mtp.draft_head.weight                rtn  codes=u2 zero=u8 group=128 scale=f16

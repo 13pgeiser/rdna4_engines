@@ -1,0 +1,58 @@
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 5bc91ebd..90172e9e 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -20,6 +20,8 @@
+ #include <ctime>
+ #include <exception>
+ #include <functional>
++#include <memory>
++#include <mutex>
+ 
+ #include <optional>
+ #include <sstream>
+@@ -285,8 +287,33 @@ struct common_chat_templates {
+     bool has_explicit_template;  // Model had builtin template or template overridden was specified.
+     std::unique_ptr<common_chat_template> template_default;  // always set (defaults to chatml)
+     std::unique_ptr<common_chat_template> template_tool_use;
++    /* RADIANCE: the differential analysis of template_default ([0]) and template_tool_use ([1]),
++     * made on first use (template_analysis). */
++    mutable std::mutex analysis_lock;
++    mutable std::shared_ptr<const autoparser::autoparser> analysis[2];
+ };
+ 
++/* RADIANCE: autoparser::analyze_template renders the template over synthetic messages and reads
++ * nothing but the template, so one analysis serves every request rendered through it. One that
++ * throws is not kept, and the next request analyses again and throws again. */
++static std::shared_ptr<const autoparser::autoparser> template_analysis(
++        const common_chat_templates * tmpls, const common_chat_template & tmpl) {
++    const size_t slot = &tmpl == tmpls->template_default.get() ? 0 : 1;
++    {
++        std::lock_guard<std::mutex> lock(tmpls->analysis_lock);
++        if (tmpls->analysis[slot]) {
++            return tmpls->analysis[slot];
++        }
++    }
++    auto made = std::make_shared<autoparser::autoparser>();
++    made->analyze_template(tmpl);
++    std::lock_guard<std::mutex> lock(tmpls->analysis_lock);
++    if (!tmpls->analysis[slot]) {
++        tmpls->analysis[slot] = std::move(made);
++    }
++    return tmpls->analysis[slot];
++}
++
+ common_chat_tool_choice common_chat_tool_choice_parse_oaicompat(const std::string & tool_choice) {
+     if (tool_choice == "auto") {
+         return COMMON_CHAT_TOOL_CHOICE_AUTO;
+@@ -2465,8 +2492,8 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
+ 
+     try {
+         LOG_DBG("%s: using differential autoparser\n", __func__);
+-        struct autoparser::autoparser autoparser;
+-        autoparser.analyze_template(tmpl);
++        const std::shared_ptr<const autoparser::autoparser> analysis = template_analysis(tmpls, tmpl);
++        const autoparser::autoparser & autoparser = *analysis;
+         auto auto_params = autoparser::peg_generator::generate_parser(tmpl, params, autoparser);
+ 
+         std::vector<common_chat_msg_delimiter> delimiters;

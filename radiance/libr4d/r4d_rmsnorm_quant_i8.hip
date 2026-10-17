@@ -1,0 +1,352 @@
+// r4d_rmsnorm_quant_i8.hip - r4d_rmsnorm_quant_i8: the RMS norm and the per-row int8 quantiser
+// r4d_gemm_w4a8_nt_m64 reads, in one pass over the row -- optionally with the residual junction
+// in front of it: a post-norm on the branch output, the residual add and a scalar on the sum.
+//
+// A w4a8 linear needs its activation as int8 codes in the GEMM's fragment order with one f32 scale
+// per row (r4d_quant_act_i8), produced by a norm. Unfused that is two dispatches, and a
+// sandwich-norm model (Gemma 2/3/4) issues four or five at every residual junction:
+//
+//     rmsnorm(branch; w_post) -> add(residual) -> [scale] -> rmsnorm(residual; w) -> quant_act_i8
+//
+// each a single workgroup per row at decode, so the step pays for dispatches, not bytes. This is
+// the chain as one dispatch.
+//
+// Byte-identical to the chain, because the engine's greedy output is compared byte for byte across
+// builds:
+//
+//   * every intermediate the chain stores in bf16 is rounded to bf16 here and the next stage reads
+//     the rounded value: the post-norm output, the residual sum, the scaled residual and the norm
+//     output the quantiser reduces over;
+//   * both sums of squares use the standalone norm's partition: the width r4d_act_threads(M, n)
+//     picks, thread t folding columns t, t+THR, ... in order, then r4d_wave_sum and the waves in
+//     order through LDS (copied from r4d_model_bf16.hip's rmsnorm_kernel and block_sum, which live
+//     in another unit);
+//   * each element's arithmetic matches the standalone kernels (`x * s * (g + wadd)`,
+//     `a + b`, `x * scalar`, `fmaxf(m, 1e-8f) / 127.f`), under -ffp-contract=off.
+//
+// The residual is read and written; each thread rewrites only the columns it read, so the second
+// pass reads its own writes back.
+//
+// Returns a negative code instead of throwing, for the reason given in r4d_gemm_fp8a8.hip.
+#include "r4d.h"
+#include "r4d_args.h"
+#include "r4d_emit.h"
+#include "r4d_common.h"
+#include "r4d_ar_seq.h"
+#include <cstdint>
+
+namespace {
+
+constexpr uint32_t kWave = 32;
+
+__device__ __forceinline__ float bf2f(uint16_t h) { return __uint_as_float((uint32_t)h << 16); }
+
+// The standalone norm's reduction, verbatim (r4d_model_bf16.hip): the wave butterfly, then the
+// waves summed in order by every thread from LDS. `lds` must not be reused by a second reduction
+// without a barrier in between; the kernel below gives each its own array.
+template <uint32_t NW>
+__device__ __forceinline__ float block_sum(float v, float* lds) {
+    v = r4d_wave_sum(v);
+    const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
+    if (lane == 0) lds[wave] = v;
+    __syncthreads();
+    float s = 0.0f;
+#pragma unroll
+    for (uint32_t w = 0; w < NW; ++w) s += lds[w];
+    return s;
+}
+
+__device__ __forceinline__ float gain(const void* w, uint32_t i, bool f32) {
+    return f32 ? ((const float*)w)[i] : bf2f(((const uint16_t*)w)[i]);
+}
+
+// RES:  a residual is present; the norm is taken of `res + d` (stored back into `res`), where d is
+//       the branch `x` itself or, with POST, rmsnorm(x; w_post).  Without RES the norm is of `x`.
+// SCL:  the sum is multiplied by the [1] scalar before it is stored and normalised.
+// `ybuf` holds the row's norm output for the fragment-order store, which reads across threads.
+//
+// The row body from the junction on: `s1` is the post-norm's factor, already reduced over `xr` by
+// the caller (the plain kernel takes it off the row; the all-reduce form off the reduced sum it has
+// just stored). l2 and lm are this function's own reduction planes.
+template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR>
+__device__ __forceinline__ void junction_row(
+    const uint16_t* __restrict__ xr, uint16_t* __restrict__ rr, const void* __restrict__ w,
+    const void* __restrict__ wp, float sv, signed char* __restrict__ qr, float* __restrict__ Sr,
+    uint16_t* __restrict__ yr, uint32_t n, float eps, float wadd, float s1,
+    uint16_t* ybuf, float* l2, float* lm) {
+    // ---- the junction (post-norm, add, scalar), stored, and the norm's sum of squares over it
+    float ss2 = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += THR) {
+        uint16_t v = xr[i];
+        if (RES) {
+            if (POST) v = f32_to_bf16(bf2f(v) * s1 * (gain(wp, i, WF32) + wadd));
+            v = f32_to_bf16(bf2f(rr[i]) + bf2f(v));
+            if (SCL) v = f32_to_bf16(bf2f(v) * sv);
+            rr[i] = v;
+        }
+        const float f = bf2f(v);
+        ss2 += f * f;
+    }
+    ss2 = block_sum<THR / kWave>(ss2, l2);
+    const float s2 = rsqrtf(ss2 / (float)n + eps);
+
+    // ---- the norm output, rounded to bf16 as the standalone norm stores it, and its absmax
+    const uint16_t* __restrict__ nr = RES ? rr : xr;
+    float m = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += THR) {
+        const uint16_t y = f32_to_bf16(bf2f(nr[i]) * s2 * (gain(w, i, WF32) + wadd));
+        ybuf[i] = y;
+        if (yr) yr[i] = y;
+        m = fmaxf(m, fabsf(bf2f(y)));
+    }
+    m = r4d_wave_max(m);
+    if ((threadIdx.x & 31) == 0) lm[threadIdx.x >> 5] = m;
+    __syncthreads();   // also publishes ybuf to every thread
+    m = lm[0];
+#pragma unroll
+    for (uint32_t i = 1; i < THR / kWave; i++) m = fmaxf(m, lm[i]);
+    const float scale = fmaxf(m, 1e-8f) / 127.f;
+    const float inv = 1.f / scale;
+    if (threadIdx.x == 0) *Sr = scale;
+
+    // ---- the codes, in r4d_quant_act_i8's fragment order: byte j of a k step comes from
+    // lane-half j>>3 and element j&7, i.e. source 8*((j&7)>>2) + 4*(j>>3) + (j&3) inside the step.
+    for (uint32_t i = threadIdx.x; i < n; i += THR) {
+        const uint32_t s = i >> 4, j = i & 15;
+        const uint32_t src = (s << 4) + 8 * ((j & 7) >> 2) + 4 * (j >> 3) + (j & 3);
+        const int t = __float2int_rn(bf2f(ybuf[src]) * inv);
+        qr[i] = (signed char)(t < -128 ? -128 : (t > 127 ? 127 : t));
+    }
+}
+
+__device__ __forceinline__ float scalar_of(const void* sc, uint32_t f32) {
+    return f32 ? ((const float*)sc)[0] : bf2f(((const uint16_t*)sc)[0]);
+}
+
+template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR>
+__global__ __launch_bounds__(THR) void rmsnorm_quant_i8_kernel(
+    const uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
+    const void* __restrict__ wp, const void* __restrict__ sc, uint32_t sc_f32,
+    signed char* __restrict__ q, float* __restrict__ S, uint16_t* __restrict__ yo,
+    uint32_t n, float eps, float wadd, uint32_t x_ld, uint32_t r_ld, uint32_t y_ld) {
+    extern __shared__ uint16_t ybuf[];
+    __shared__ float l1[THR / kWave], l2[THR / kWave], lm[THR / kWave];
+    const uint32_t row = blockIdx.x;
+    const uint16_t* __restrict__ xr = x + (size_t)row * x_ld;
+
+    // ---- the post-norm's sum of squares, over the branch output
+    float s1 = 0.0f;
+    if (POST) {
+        float ss = 0.0f;
+        for (uint32_t i = threadIdx.x; i < n; i += THR) { const float v = bf2f(xr[i]); ss += v * v; }
+        ss = block_sum<THR / kWave>(ss, l1);
+        s1 = rsqrtf(ss / (float)n + eps);
+    }
+    junction_row<WF32, RES, POST, SCL, THR>(
+        xr, RES ? res + (size_t)row * r_ld : nullptr, w, wp, SCL ? scalar_of(sc, sc_f32) : 1.0f,
+        q + (size_t)row * n, S + row, yo ? yo + (size_t)row * y_ld : nullptr, n, eps, wadd, s1,
+        ybuf, l2, lm);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The same junction with the two-rank all-reduce that precedes it: the branch output is a rank's
+// partial sum of a column-sharded linear (o_proj, down_proj), and the post-norm is of the whole
+// sum. ar_rmsnorm_quant_fp8's handshake, exact wire only: each block pushes its rows into the
+// peer's scratch slot as 16B words, publishes its flag, waits for the peer's, and reduces
+// `f2bf(mine + peer)` back into `x` (the standalone exact all-reduce's bytes; the fp32 add
+// commutes, so both ranks agree) during the post-norm's sum-of-squares pass. A block owns whole
+// rows, one per block at decode.
+#define R4D_ARQ8_SPIN_MAX 4000000000ULL
+
+__device__ __forceinline__ void arq8_store_rel(unsigned int* p, unsigned int v) {
+    __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+__device__ __forceinline__ unsigned int arq8_load_acq(const unsigned int* p) {
+    return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+template <bool WF32, bool RES, bool POST, bool SCL, uint32_t THR>
+__global__ __launch_bounds__(THR) void ar_rmsnorm_quant_i8_kernel(
+    uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
+    const void* __restrict__ wp, const void* __restrict__ sc, uint32_t sc_f32,
+    signed char* __restrict__ q, float* __restrict__ S, uint16_t* __restrict__ yo,
+    int4* peer_base, const int4* my_base, unsigned int* peer_flags, unsigned int* my_flags,
+    unsigned int* seq_ctrs, int M, uint32_t n, float eps, float wadd, uint32_t r_ld, uint32_t y_ld,
+    int slot_stride16, int drain, int acq, unsigned int nbw) {
+    extern __shared__ uint16_t ybuf[];
+    __shared__ float l1[THR / kWave], l2[THR / kWave], lm[THR / kWave];
+    __shared__ unsigned int s_seq, s_slot;
+    const int b = (int)blockIdx.x, nb = (int)gridDim.x;
+    const uint32_t tid = threadIdx.x;
+    const int r0 = (int)(((long)b * M) / nb), r1 = (int)(((long)(b + 1) * M) / nb);
+
+    r4d_ar_seq_take(seq_ctrs, nbw, s_seq, s_slot);   /* device-resident, replay-safe */
+    const unsigned int sq = s_seq;
+    int4* const ps = peer_base + (size_t)s_slot * slot_stride16;
+    const int4* const ms = my_base + (size_t)s_slot * slot_stride16;
+
+    /* push my rows into the peer's slot; `x` is a tight [M][n] of bf16 */
+    const int wpr = (int)(n >> 3);
+    const int4* const in4 = (const int4*)x;
+    for (int k = r0 * wpr + (int)tid; k < r1 * wpr; k += (int)THR) ps[k] = in4[k];
+    if (drain == 1) __threadfence_system();
+    else if (drain == 3) asm volatile("s_wait_storecnt 0x0" ::: "memory");
+    __syncthreads();
+    if (tid == 0) {
+        if (drain == 2) __threadfence_system();
+        arq8_store_rel(&peer_flags[b], sq);
+        unsigned long long z = 0;
+        while (r4d_ar_seq_behind(arq8_load_acq(&my_flags[b]), sq)) {
+            if (++z > R4D_ARQ8_SPIN_MAX) __builtin_trap();
+        }
+    }
+    __syncthreads();
+    if (acq) __threadfence_system();
+
+    const uint16_t* __restrict__ P = (const uint16_t*)ms;   /* the peer's rows, in my scratch */
+    const float sv = SCL ? scalar_of(sc, sc_f32) : 1.0f;
+    for (int row = r0; row < r1; ++row) {
+        uint16_t* __restrict__ xr = x + (size_t)row * n;
+        const uint16_t* __restrict__ pr = P + (size_t)row * n;
+        float ss = 0.0f;
+        for (uint32_t i = tid; i < n; i += THR) {
+            const uint16_t a = f32_to_bf16(bf2f(xr[i]) + bf2f(pr[i]));
+            xr[i] = a;
+            if (POST) { const float v = bf2f(a); ss += v * v; }
+        }
+        float s1 = 0.0f;
+        if (POST) s1 = rsqrtf(block_sum<THR / kWave>(ss, l1) / (float)n + eps);
+        junction_row<WF32, RES, POST, SCL, THR>(
+            xr, RES ? res + (size_t)row * r_ld : nullptr, w, wp, sv, q + (size_t)row * n, S + row,
+            yo ? yo + (size_t)row * y_ld : nullptr, n, eps, wadd, s1, ybuf, l2, lm);
+        __syncthreads();   /* the planes and ybuf are re-used by the next row this block owns */
+    }
+}
+
+}  // namespace
+
+// ============================================================== the plugin ABI entry point
+//
+// Operands, in the schema's order (r4d_rows.cpp, oRmsNormQuantI8):
+//   0 x         [M][n] bf16           the norm's input, or the branch output with a residual
+//   1 residual  [M][n] bf16, optional READ AND WRITTEN
+//   2 w         [n]    bf16 or f32    the norm's gain
+//   3 q         [M][n] int8           fragment order, unpitched
+//   4 scale     [M][1] f32            one per row
+//   5 out_bf16  [M][n] bf16, optional the norm output the unfused norm would have stored
+//   6 w_post    [n]    optional       a post-norm on x before the add; needs the residual
+//   7 scalar    [1]    optional       multiplies the sum; needs the residual
+enum { RQ_X = 0, RQ_RES, RQ_W, RQ_Q, RQ_S, RQ_Y, RQ_WP, RQ_SC };
+
+extern "C" int r4d_rad_rmsnorm_quant_i8(const RadArgs* a, RadStream stream) {
+    int emit_rc = RAD_OK;
+    const RadTensor* x  = r4d_opt(a, RQ_X);
+    const RadTensor* rs = r4d_opt(a, RQ_RES);
+    const RadTensor* w  = r4d_opt(a, RQ_W);
+    const RadTensor* q  = r4d_opt(a, RQ_Q);
+    const RadTensor* s  = r4d_opt(a, RQ_S);
+    const RadTensor* y  = r4d_opt(a, RQ_Y);
+    const RadTensor* wp = r4d_opt(a, RQ_WP);
+    const RadTensor* sc = r4d_opt(a, RQ_SC);
+    if (!x || !w || !q || !s) return R4D_NO(RAD_E_INVAL);
+    if ((wp || sc) && !rs) return R4D_NO(RAD_E_INVAL);   // a junction without a stream to add into
+    if (x->dtype != RAD_BF16 || q->dtype != RAD_I8 || s->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    long long M = 0, n = 0;
+    if (r4d_rows_of(x, &M, &n) != RAD_OK) return R4D_NO(RAD_E_SHAPE);
+    if (n % 16) return R4D_NO(RAD_E_SHAPE);                  // a k step is sixteen bytes of one row
+    if (r4d_numel(w) != n) return R4D_NO(RAD_E_SHAPE);
+    if (w->dtype != RAD_F32 && w->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if (wp && (r4d_numel(wp) != n || wp->dtype != w->dtype)) return R4D_NO(RAD_E_SHAPE);
+    if (sc && (r4d_numel(sc) != 1 || (sc->dtype != RAD_F32 && sc->dtype != RAD_BF16)))
+        return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(q) != M * n || !r4d_contig(q)) return R4D_NO(RAD_E_SHAPE);
+    if (r4d_numel(s) != M || !r4d_contig(s)) return R4D_NO(RAD_E_SHAPE);
+    if (y && r4d_numel(y) != M * n) return R4D_NO(RAD_E_SHAPE);
+    if (rs && r4d_numel(rs) != M * n) return R4D_NO(RAD_E_SHAPE);
+    const long long xp = r4d_row_pitch(x), rp = rs ? r4d_row_pitch(rs) : n, yp = y ? r4d_row_pitch(y) : n;
+    if (xp < 0 || rp < 0 || yp < 0) return R4D_NO(RAD_E_STRIDE);
+    // The row's norm output is staged in LDS for the cross-thread fragment-order store.
+    const size_t lds = (size_t)n * sizeof(uint16_t);
+    if (lds > 60 * 1024) return R4D_NO(RAD_E_SHAPE);
+
+    // The same width rmsnorm_bf16 and quant_act_i8 pick, from the same function: it decides which
+    // columns a thread folds into each sum of squares, hence the byte-identity.
+    const int thr = r4d_act_threads((int)M, (int)n);
+    const float eps  = (float)r4d_getf(a, "eps", 1e-6);
+    const float wadd = (float)r4d_getf(a, "wadd", 0.0);
+    const uint32_t scf = sc ? (sc->dtype == RAD_F32) : 0u;
+
+#define R4D_RQI8_T(WF, RS, PO, SC, T) emit_rc = R4D_EMIT(stream,                                 \
+    (rmsnorm_quant_i8_kernel<WF, RS, PO, SC, T>), dim3((uint32_t)M), dim3(T), lds,               \
+    (const uint16_t*)r4d_p(x), (uint16_t*)r4d_wp(rs), r4d_p(w), r4d_p(wp), r4d_p(sc), scf,       \
+    (signed char*)r4d_wp(q), (float*)r4d_wp(s), (uint16_t*)r4d_wp(y), (uint32_t)n, eps, wadd,    \
+    (uint32_t)xp, (uint32_t)rp, (uint32_t)yp)
+#define R4D_RQI8(WF, RS, PO, SC)                                                                  \
+    do { if (thr == 1024)     R4D_RQI8_T(WF, RS, PO, SC, 1024);                                   \
+         else if (thr == 512) R4D_RQI8_T(WF, RS, PO, SC, 512);                                    \
+         else if (thr == 256) R4D_RQI8_T(WF, RS, PO, SC, 256);                                    \
+         else return R4D_NO(RAD_E_INVAL); } while (0)
+#define R4D_RQI8_W(WF)                                                                            \
+    do { if (!rs)            R4D_RQI8(WF, false, false, false);                                   \
+         else if (!wp && !sc) R4D_RQI8(WF, true, false, false);                                   \
+         else if (wp && !sc)  R4D_RQI8(WF, true, true, false);                                    \
+         else if (wp && sc)   R4D_RQI8(WF, true, true, true);                                     \
+         else                 R4D_RQI8(WF, true, false, true); } while (0)
+    if (w->dtype == RAD_F32) R4D_RQI8_W(true);
+    else                     R4D_RQI8_W(false);
+#undef R4D_RQI8_W
+#undef R4D_RQI8
+#undef R4D_RQI8_T
+    return emit_rc;
+}
+
+// The fused all-reduce form's launch. The IPC arguments are r4d_ar_oneshot_2rank_exact's -- the
+// double-buffered scratch, the per-block flags and the device-resident sequence counters -- and the
+// rest is the junction's. `x` is the message and takes no pitch; `nblocks` is clamped to M (a block
+// owns whole rows). Returns 0, or a negative code for a shape it does not serve.
+extern "C" int r4d_ar_rmsnorm_quant_i8(long peer_scratch, long my_scratch, long peer_flags,
+                                       long my_flags, long seq_ctrs, long slot_stride16,
+                                       long x, long res, long w, long wp, long sc, int sc_f32,
+                                       long y, long q, long s, int M, int n, float eps, float wadd,
+                                       int w_f32, int r_ld, int y_ld, long stream, int nblocks,
+                                       int drain, int acq) {
+    if (!x || !w || !q || !s) return -1;
+    if (!peer_scratch || !my_scratch || !peer_flags || !my_flags || !seq_ctrs) return -1;
+    if (M <= 0 || n <= 0) return -2;
+    if (n % 16) return -3;
+    if ((wp || sc) && !res) return -5;
+    if ((size_t)n * sizeof(uint16_t) > 60 * 1024) return -6;
+    if (!r_ld) r_ld = n;
+    if (!y_ld) y_ld = n;
+    int nb = nblocks < 1 ? 1 : nblocks;
+    if (nb > M) nb = M;
+    const int nbw = r4d_ar_max_blocks();
+    if (nb > nbw) nb = nbw;
+    const int thr = r4d_act_threads(M, n);
+    const size_t lds = (size_t)n * sizeof(uint16_t);
+#define R4D_ARQ8_T(WF, RS, PO, SC, T)                                                             \
+    hipLaunchKernelGGL((ar_rmsnorm_quant_i8_kernel<WF, RS, PO, SC, T>), dim3((uint32_t)nb),       \
+                       dim3(T), lds, (hipStream_t)stream, (uint16_t*)x, (uint16_t*)res,          \
+                       (const void*)w, (const void*)wp, (const void*)sc, (uint32_t)sc_f32,       \
+                       (signed char*)q, (float*)s, (uint16_t*)y, (int4*)peer_scratch,            \
+                       (const int4*)my_scratch, (unsigned int*)peer_flags,                       \
+                       (unsigned int*)my_flags, (unsigned int*)seq_ctrs, M, (uint32_t)n, eps,    \
+                       wadd, (uint32_t)r_ld, (uint32_t)y_ld, (int)slot_stride16, drain, acq,      \
+                       (unsigned)nbw)
+#define R4D_ARQ8(WF, RS, PO, SC)                                                                  \
+    do { if (thr == 1024)     R4D_ARQ8_T(WF, RS, PO, SC, 1024);                                   \
+         else if (thr == 512) R4D_ARQ8_T(WF, RS, PO, SC, 512);                                    \
+         else                 R4D_ARQ8_T(WF, RS, PO, SC, 256); } while (0)
+#define R4D_ARQ8_W(WF)                                                                            \
+    do { if (!res)            R4D_ARQ8(WF, false, false, false);                                  \
+         else if (!wp && !sc) R4D_ARQ8(WF, true, false, false);                                   \
+         else if (wp && !sc)  R4D_ARQ8(WF, true, true, false);                                    \
+         else if (wp && sc)   R4D_ARQ8(WF, true, true, true);                                     \
+         else                 R4D_ARQ8(WF, true, false, true); } while (0)
+    if (w_f32) R4D_ARQ8_W(true);
+    else       R4D_ARQ8_W(false);
+#undef R4D_ARQ8_W
+#undef R4D_ARQ8
+#undef R4D_ARQ8_T
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}

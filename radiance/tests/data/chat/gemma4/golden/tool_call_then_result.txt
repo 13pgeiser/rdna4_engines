@@ -1,0 +1,10 @@
+<bos><|turn>system
+<|think|>
+<|tool>declaration:read{description:<|"|>Read a file.<|"|>,parameters:{properties:{limit:{type:<|"|>INTEGER<|"|>},path:{description:<|"|>Absolute path<|"|>,type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:edit{description:<|"|>Apply edits — exact text, «quoted» & <tagged>, 日本語.<|"|>,parameters:{properties:{dry_run:{type:<|"|>BOOLEAN<|"|>},edits:{items:{properties:{newText:{type:<|"|>STRING<|"|>},oldText:{type:<|"|>STRING<|"|>}},required:[<|"|>oldText<|"|>,<|"|>newText<|"|>],type:<|"|>OBJECT<|"|>},type:<|"|>ARRAY<|"|>},mode:{enum:[<|"|>fast<|"|>,<|"|>safe<|"|>],type:<|"|>STRING<|"|>},path:{type:<|"|>STRING<|"|>}},required:[<|"|>path<|"|>,<|"|>edits<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:ping{description:<|"|>Takes no arguments.<|"|>,parameters:{type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+<|turn>user
+Fix /work/a.py.<turn|>
+<|turn>model
+<|channel>thought
+Read it first.
+<channel|><|tool_call>call:read{limit:40,path:<|"|>/work/a.py<|"|>}<tool_call|><|tool_response>response:read{value:<|"|>print(1)
+<|"|>}<tool_response|><|channel>thought

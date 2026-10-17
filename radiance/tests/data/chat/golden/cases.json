@@ -1,0 +1,124 @@
+{
+  "about": "Requests rendered through each shipped template by Python jinja2 (tests/mkchatgolden.py) and by ChatTemplate::apply (tests/chat_test.cpp). Messages are OpenAI-shaped, as the server receives them: tool-call arguments are JSON strings and a media part is the server's media_marker part. Each model's renders are in <model>/golden/<case>.txt, or <case>.err holding the message of a template that refused the request.",
+  "models": {
+    "qwen3.8":  { "bos": "",    "eos": "<|im_end|>", "media": "<|vision_start|><|image_pad|><|vision_end|>" },
+    "qwen3.6":  { "bos": "",    "eos": "<|im_end|>", "media": "<|vision_start|><|image_pad|><|vision_end|>" },
+    "minicpm5": { "bos": "<s>", "eos": "</s>",       "media": "" },
+    "gemma4":   { "bos": "<bos>", "eos": "<eos>",    "media": "<|image|>" }
+  },
+  "tools": [
+    { "type": "function", "function": { "name": "read", "description": "Read a file.",
+      "parameters": { "type": "object", "properties": {
+        "path": { "type": "string", "description": "Absolute path" },
+        "limit": { "type": "integer" } }, "required": ["path"] } } },
+    { "type": "function", "function": { "name": "edit",
+      "description": "Apply edits — exact text, «quoted» & <tagged>, 日本語.",
+      "parameters": { "type": "object", "properties": {
+        "path": { "type": "string" },
+        "edits": { "type": "array", "items": { "type": "object", "properties": {
+          "oldText": { "type": "string" }, "newText": { "type": "string" } },
+          "required": ["oldText", "newText"] } },
+        "dry_run": { "type": "boolean" },
+        "mode": { "type": "string", "enum": ["fast", "safe"] } },
+        "required": ["path", "edits"] } } },
+    { "type": "function", "function": { "name": "ping", "description": "Takes no arguments.",
+      "parameters": { "type": "object", "properties": {} } } }
+  ],
+  "cases": [
+    { "name": "system_and_user",
+      "messages": [
+        { "role": "system", "content": "You are terse." },
+        { "role": "user", "content": "What is 2+2?" } ] },
+    { "name": "thinking_off",
+      "enable_thinking": false,
+      "messages": [ { "role": "user", "content": "Hi." } ] },
+    { "name": "tools_and_user",
+      "tools": true,
+      "messages": [ { "role": "user", "content": "Read /work/a.py." } ] },
+    { "name": "tools_system_and_user",
+      "tools": true,
+      "messages": [
+        { "role": "system", "content": "You are a coding agent." },
+        { "role": "user", "content": "Read /work/a.py." } ] },
+    { "name": "history_with_reasoning",
+      "messages": [
+        { "role": "user", "content": "First question." },
+        { "role": "assistant", "reasoning_content": "Thinking about the first.", "content": "First answer." },
+        { "role": "user", "content": "Second question." } ] },
+    { "name": "history_with_reasoning_preserved",
+      "kwargs": { "preserve_thinking": true },
+      "messages": [
+        { "role": "user", "content": "First question." },
+        { "role": "assistant", "reasoning_content": "Thinking about the first.", "content": "First answer." },
+        { "role": "user", "content": "Second question." } ] },
+    { "name": "history_with_reasoning_dropped",
+      "kwargs": { "preserve_thinking": false },
+      "messages": [
+        { "role": "user", "content": "First question." },
+        { "role": "assistant", "reasoning_content": "Thinking about the first.", "content": "First answer." },
+        { "role": "user", "content": "Second question." } ] },
+    { "name": "tool_call_then_result",
+      "tools": true,
+      "messages": [
+        { "role": "user", "content": "Fix /work/a.py." },
+        { "role": "assistant", "reasoning_content": "Read it first.", "content": null,
+          "tool_calls": [ { "id": "call_1", "type": "function",
+            "function": { "name": "read", "arguments": "{\"path\": \"/work/a.py\", \"limit\": 40}" } } ] },
+        { "role": "tool", "tool_call_id": "call_1", "content": "print(1)\n" } ] },
+    { "name": "tool_call_answered_then_user",
+      "tools": true,
+      "messages": [
+        { "role": "user", "content": "Fix /work/a.py." },
+        { "role": "assistant", "reasoning_content": "Read it first.", "content": null,
+          "tool_calls": [ { "id": "call_1", "type": "function",
+            "function": { "name": "read", "arguments": "{\"path\": \"/work/a.py\", \"limit\": 40}" } } ] },
+        { "role": "tool", "tool_call_id": "call_1", "content": "print(1)\n" },
+        { "role": "assistant", "content": "It prints 1." },
+        { "role": "user", "content": "Now make it print 2." } ] },
+    { "name": "tool_calls_preserving_reasoning",
+      "tools": true,
+      "kwargs": { "preserve_thinking": true },
+      "messages": [
+        { "role": "user", "content": "Fix /work/a.py." },
+        { "role": "assistant", "reasoning_content": "Read it first.", "content": "",
+          "tool_calls": [ { "id": "call_1", "type": "function",
+            "function": { "name": "read", "arguments": "{\"path\": \"/work/a.py\"}" } } ] },
+        { "role": "tool", "tool_call_id": "call_1", "content": "print(1)\n" },
+        { "role": "user", "content": "Go on." } ] },
+    { "name": "parallel_calls_with_typed_arguments",
+      "tools": true,
+      "messages": [
+        { "role": "user", "content": "Edit both files, then ping." },
+        { "role": "assistant", "content": "Doing all three.",
+          "tool_calls": [
+            { "id": "call_a", "type": "function", "function": { "name": "edit",
+              "arguments": "{\"path\": \"/work/a.py\", \"edits\": [{\"oldText\": \"    return a\\n\", \"newText\": \"    return a < b & c  # it's\\n\"}, {\"oldText\": \"x\\ty\", \"newText\": \"\\\\\\\"\"}], \"dry_run\": false, \"mode\": \"safe\"}" } },
+            { "id": "call_b", "type": "function", "function": { "name": "read",
+              "arguments": "{\"path\": \"/work/über.py\", \"limit\": 3}" } },
+            { "id": "call_c", "type": "function", "function": { "name": "ping", "arguments": "{}" } } ] },
+        { "role": "tool", "tool_call_id": "call_a", "content": "{\"ok\": true}" },
+        { "role": "tool", "tool_call_id": "call_b", "content": "x = 1\n" },
+        { "role": "tool", "tool_call_id": "call_c", "content": "pong" } ] },
+    { "name": "no_generation_prompt",
+      "add_generation_prompt": false,
+      "messages": [
+        { "role": "user", "content": "Hi." },
+        { "role": "assistant", "content": "Hello." } ] },
+    { "name": "unicode_text",
+      "tools": true,
+      "messages": [ { "role": "user", "content": "Übersetze: 日本語 🙂 \"quoted\" \\ back" } ] },
+    { "name": "effort_low",
+      "kwargs": { "reasoning_effort": "low" },
+      "messages": [ { "role": "user", "content": "Hi." } ] },
+    { "name": "effort_the_template_refuses",
+      "kwargs": { "reasoning_effort": "high" },
+      "messages": [ { "role": "user", "content": "Hi." } ] },
+    { "name": "a_picture_between_text",
+      "models": ["qwen3.8", "qwen3.6", "gemma4"],
+      "messages": [
+        { "role": "user", "content": [
+          { "type": "text", "text": "Describe" },
+          { "type": "media_marker", "text": "<__media__>" },
+          { "type": "text", "text": "briefly." } ] } ] }
+  ]
+}

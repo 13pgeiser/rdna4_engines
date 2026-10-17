@@ -1,0 +1,32 @@
+<s><|im_start|>system
+# Tools
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{"type": "function", "function": {"name": "read", "description": "Read a file.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path"}, "limit": {"type": "integer"}}, "required": ["path"]}}}
+{"type": "function", "function": {"name": "edit", "description": "Apply edits — exact text, «quoted» & <tagged>, 日本語.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "edits": {"type": "array", "items": {"type": "object", "properties": {"oldText": {"type": "string"}, "newText": {"type": "string"}}, "required": ["oldText", "newText"]}}, "dry_run": {"type": "boolean"}, "mode": {"type": "string", "enum": ["fast", "safe"]}}, "required": ["path", "edits"]}}}
+{"type": "function", "function": {"name": "ping", "description": "Takes no arguments.", "parameters": {"type": "object", "properties": {}}}}
+</tools>
+
+Tool usage guidelines:
+- You may call zero or more functions. If no function calls are needed, just answer normally and do not include any <function ... </function>.
+- When calling a function, return an XML object within <function ... </function> using:
+<function name="function-name"><param name="param-name">param-value</param></function>
+- param-value may be multi-line. If it contains <, & or newline characters, wrap it in a CDATA block: <param name="param-name"><![CDATA[...multi-line value...]]></param><|im_end|>
+<|im_start|>user
+Fix /work/a.py.<|im_end|>
+<|im_start|>assistant
+<think>
+Read it first.
+</think>
+
+<function name="read"><param name="path">/work/a.py</param></function><|im_end|>
+<|im_start|>user
+<tool_response>
+print(1)
+
+</tool_response><|im_end|>
+<|im_start|>user
+Go on.<|im_end|>
+<|im_start|>assistant
+<think>

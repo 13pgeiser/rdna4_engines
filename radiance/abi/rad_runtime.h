@@ -1,0 +1,480 @@
+/* rad_runtime.h -- the run phase. Ordinary C++ with one rule: it may only issue handles obtained
+ * during declare. There is no capture discipline: the device backend records a pass's dispatch
+ * packets at the queue as they are issued and replays them (core/device/aql.cpp,
+ * core/runtime/ctx.h), so the step function needs no graph-safe form. See spec.md §3.2.
+ */
+#ifndef RAD_RUNTIME_H
+#define RAD_RUNTIME_H
+
+#include "rad_builder.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct RadCtx RadCtx;
+
+/* ================================================================== the step batch */
+/* Built once per step by the core and shared by every layer and KV group; rebuilding it per group
+ * and per layer would make a large share of a decode step host work with the device idle (spec §8).
+ *
+ * Every pointer is device memory unless the field name says _h. The host mirrors give the
+ * scheduler and the run phase the bounds without a device read. */
+enum { RAD_PHASE_PREFILL = 0, RAD_PHASE_DECODE = 1, RAD_PHASE_MIXED = 2 };
+
+typedef struct RadKVGroupBatch {
+    rad_kvgroup group;
+    int32_t*    slot_mapping;    /* [n_tok] flat slot index per token, device */
+    int32_t*    block_table;     /* [n_seq, max_blocks] device */
+    int64_t     block_table_pitch;
+    int32_t*    seqused;         /* [n_seq] context length in this group, device */
+    int32_t*    state_index;     /* [n_seq, state_index_pitch] state slots per sequence, device */
+    /* State slots per sequence: 1 unless the group's kernel asked for scratch beside the state.
+     * A linear kernel serving speculation cannot commit the state until acceptance is known, so it
+     * keeps the committed state in column 0 and replay scratch in the later columns. The engine
+     * zeroes all of them at admission and otherwise does not look inside. Zero means 1. */
+    int64_t     state_index_pitch;
+    int64_t     block_size;
+    int64_t     max_blocks;
+} RadKVGroupBatch;
+
+typedef struct RadBatch {
+    int      phase;              /* RAD_PHASE_* -- the run phase uses it to index bucket tables */
+    int      step;               /* monotonic, for the heat engine and for logs */
+
+    int64_t  n_tok;              /* total tokens across all sequences in this step */
+    int64_t  n_seq;
+
+    const int32_t* token_ids;    /* [n_tok] device */
+    const int32_t* positions;    /* [n_tok] device */
+    const int32_t* cu_seqlens;   /* [n_seq+1] device: sequence boundaries within this step */
+    const int32_t* seq_ids;      /* [n_seq] device: engine-side sequence identity */
+
+    /* The tokens the sampler wants logits for: indices into this step's tokens, [n_out].
+     *
+     * A prefill chunk computes hidden states for every token, but the sampler wants only each
+     * sequence's last. The plugin issues gather_rows over these and runs the lm_head only on the
+     * result (docs/OPS.md, "Vocabulary edges"); over all n_tok rows at max_tok 8192 and a 248K
+     * vocab the logits buffer would be 8 GiB instead of 63 MiB.
+     *
+     * n_out is 0 for a chunk that finishes no sequence (the middle of a long prefill): no logits
+     * are produced and the lm_head is not run. */
+    int64_t        n_out;
+    const int32_t* out_ids;            /* [n_out] device */
+
+    const int32_t* q_lens;       /* [n_seq] device: query length this step */
+    const int32_t* ctx_lens;     /* [n_seq] device: context length before this step */
+    int32_t        max_q_len;    /* host-side bounds -- these select kernel bands */
+    int32_t        max_ctx_len;
+
+    int              n_kv_groups;
+    const RadKVGroupBatch* kv;   /* [n_kv_groups] */
+
+    /* Speculative window (spec §10). n_spec == 0 for an ordinary decode step. */
+    int            n_spec;             /* draft tokens per sequence this step */
+    const int32_t* num_accepted;       /* [n_seq] device, from the previous verify */
+    const int32_t* spec_parent;        /* [n_tok] device, tree layout; null for a linear chain */
+
+    /* The draft pass. 0 is an ordinary step that runs the trunk; non-zero runs only the draft
+     * head, and the sign gives the kind:
+     *
+     *    r < 0   a history pass: one row per token, gathered from the trunk step's rows
+     *            (out_ids). The head attends to its own K and V, which nothing else writes (a
+     *            prefill fills only the trunk's layers); this fills them for the positions the
+     *            step just committed. When `n_draft_out` is non-zero the pass is also draft round
+     *            1 and ends in the lm_head over the rows `draft_out_ids` names.
+     *    r > 1   draft round r, one-based. One row per sequence, reading the head's output from
+     *            the round before and ending in the lm_head; it samples the r-th draft. There is
+     *            no pass with r == 1: the history pass carries that round.
+     *
+     * Zero is the ordinary step so that a zeroed RadBatch runs the model, the same reason
+     * `num_accepted` is one-based (docs/OPS.md).
+     *
+     * On any draft pass `token_ids` is already shifted (the head at index i reads the token at
+     * i + 1) by the batch builder, so no kernel or plugin applies the shift. Every other field
+     * keeps its usual meaning. */
+    int32_t        draft_pass;
+
+    /* Linear-state checkpointing (spec §7.3): tokens at which the scheduler wants a checkpoint
+     * written, already aligned to the checkpoint interval by the chunk split. */
+    int            n_checkpoints;
+    const int32_t* checkpoint_tok;     /* [n_checkpoints] device: index into this step's tokens */
+    const int32_t* checkpoint_slot;    /* [n_checkpoints] device: destination snapshot slot */
+
+    /* The decode / prefill split within a mixed step.
+     *
+     * Sequences [0, n_seq_decode) carry decode rows and the rest prefill chunks; the scheduler
+     * orders every step that way. A block that treats the two differently issues over each as a
+     * contiguous sub-range of the per-sequence arrays (`cu_seqlens + n_seq_decode`,
+     * `state_index + n_seq_decode * pitch`, ...) with the token operands left at their base. This
+     * works because cu_seqlens holds absolute row offsets, so a kernel reading cu[n] and cu[n+1]
+     * finds the right rows in either sub-array.
+     *
+     * Without the split a mixed step is prefill-shaped for every sequence, so its decode rows
+     * cannot verify a draft and produce one token instead of several; under interactive load many
+     * steps are mixed.
+     *
+     * n_seq_decode == n_seq on a pure decode step and 0 on a pure prefill, so a block that does
+     * not care can ignore these fields, and one that does needs no phase test. */
+    int64_t n_seq_decode;
+    /* The decode rows are tokens [0, n_tok_decode) and the prefill chunks the rest. A per-token
+     * op cannot derive this, since each decode row is 1 + its own draft count. */
+    int64_t n_tok_decode;
+    /* The longest query in each half. max_q_len over a mixed step is the prefill chunk's, and
+     * banding the decode half with it would give eight rows a thousand-row GEMM's band.
+     *
+     * Only the decode value is currently read (by the GDN blocks). The prefill value is for a
+     * block whose prefill path bands on a per-sequence query length; the GDN prefill ops band on
+     * the step's total tokens, taken from their operands. */
+    int32_t max_q_len_decode;
+    int32_t max_q_len_prefill;
+
+    /* Draft round 1, carried by the history pass: [n_draft_out] device, indices into this pass's
+     * rows, one per drafting sequence, in the order the later rounds' rows take.
+     *
+     * Round 1 continues from the last committed position with the token the trunk chose after it.
+     * The history pass already has a row with exactly those inputs: it covers every position the
+     * verify step could have committed and repeats the last committed one past it
+     * (core/sched/advance.h, ADV_HIST). So each drafting sequence's last history row is its
+     * round-1 row, saving a separate pass; the pass ends in the lm_head over those rows, and the
+     * head's wide state there is what round 2 continues from.
+     *
+     * 0 on a history pass that drafts nothing, and on every other pass. */
+    int64_t        n_draft_out;
+    const int32_t* draft_out_ids;
+
+    /* The prompt after this step: `n_ahead` more tokens of the last sequence, stored in
+     * `token_ids` right after its n_tok (the next prefill chunk); 0 on every other step (decode,
+     * draft pass, a prefill's last chunk).
+     *
+     * Nothing is computed on them. They let an op that fetches per-token data from a slow tier
+     * start the next step's reads during this one: the PLE gather reads its rows from the
+     * container file, tens of thousands of random reads per chunk (docs/OPS.md, ngram_ids'
+     * `ahead_ids` and embed_lookup_q's `ahead`). */
+    int64_t        n_ahead;
+
+    /* ================================================ multimodal (spec §11) */
+
+    /* The rotary position of every token, which differs from `positions`. `positions` is a
+     * token's index in its sequence (the KV slot, the QSA block and other bookkeeping count in
+     * it). Qwen-VL style M-RoPE gives each token three components (temporal, height, width): a
+     * text token has all three equal, an image token has the image's start in the first and its
+     * row and column offsets in the others, and text after an image continues from the image's
+     * largest component, so from the first image on the rotary position runs behind the index.
+     *
+     * [3, n_tok] device, component-major: plane c is rope_pos + c * n_tok. Plane 0 alone is a
+     * valid one-component position for every token whose components agree, i.e. every token when
+     * `rope_mixed` is 0, so a kernel reading one position per token can use plane 0 then.
+     *
+     * Null when the program declares no encoder; `positions` is then the rotary position. */
+    const int32_t* rope_pos;
+    /* Host-side: non-zero when some token on this pass has differing components (an image or
+     * video span is present); a block with a one-component fast path must take the
+     * multi-component path. */
+    int32_t        rope_mixed;
+
+    /* Rows that take an encoder's output in place of a token embedding: row i of `mm_embd`
+     * replaces the embedding of this pass's token `mm_rows[i]`. The placeholder ids a media span
+     * holds in `token_ids` are still real ids (a hashed n-gram embedding reads them).
+     *
+     * Rank 0 holds the rows and every other rank zeros, matching a vocabulary-sharded embedding
+     * lookup where non-owning ranks contribute zero to the following reduction. So a plugin
+     * overwrites its lookup output with these rows before that reduction, whether it is an
+     * all-reduce or folded into the first layer's norm.
+     *
+     * On a pass that shifts its tokens (a draft history pass) the rows are shifted with them. 0
+     * rows on every pass without media. */
+    int64_t        n_mm_rows;
+    const int32_t* mm_rows;            /* [n_mm_rows] device: index into this pass's tokens */
+    const void*    mm_embd;            /* [n_mm_rows, n_embd] bf16 device */
+
+    /* The encoder pass. Non-zero `enc` runs a declared encoder (rad_declare_encoder) and nothing
+     * else: no token rows, no KV, no logits. Its value is that encoder's `modalities`
+     * (RAD_MM_AUDIO, or the image/video mask), selecting between two declared encoders. Input is a
+     * list of patches already resized, normalised and cut by the processor; output is the
+     * encoder's declared `out` buffer, one row per `merge` patches, read back after the pass.
+     *
+     * An audio pass's patches are feature frames with 1-D coordinates: plane 0 the frame's index
+     * in its clip, plane 1 whether it takes part in the convolution (1) or is staging the encoder
+     * reads as zero (0), plane 2 the clip's real frames and plane 3 its staged ones. The zero
+     * frames pad a clip staged whole to whole output rows, or, for a clip staged a second at a
+     * time (Qwen3-ASR), align each second to whole rows.
+     *
+     * Patches are grouped into segments (one per image, one per temporal group of a video), and
+     * attention runs within a segment. `enc_coord` gives each patch's place in its segment, which
+     * is all a learned position table or a 2-D rotary embedding needs. */
+    int32_t        enc;
+    int64_t        enc_n_patch;
+    const void*    enc_pixels;         /* [enc_n_patch, patch_dim] bf16 device */
+    /* [4, enc_n_patch] device, component-major like rope_pos: row, column, the segment's height
+     * and its width, all in patches. Planes 0 and 1 together are a [2, enc_n_patch] position. */
+    const int32_t* enc_coord;
+    int64_t        enc_n_seg;
+    const int32_t* enc_cu;             /* [enc_n_seg + 1] device: segment boundaries in patches */
+    int32_t        enc_max_seg;        /* host: the longest segment, which bands the attention */
+
+    /* ================================================ image generation */
+
+    /* A generator pass (rad_declare_generator): RAD_GEN_PASS_*, with `gen_b` its payload. 0 on
+     * every step of a program that declared no generator. */
+    int32_t                   gen;
+    const struct RadGenBatch* gen_b;
+} RadBatch;
+
+/* What a generator pass carries beside the step batch's own fields, which keep their meanings:
+ *
+ *   COND     one sequence. `token_ids`, `positions` and `rope_pos` are its conditioning prompt, the
+ *            encoder's input (`enc_*`) is the prompt's reference pictures and `mm_rows` the prompt
+ *            rows the encoder's output rows replace, as on any media step. What is here lays out
+ *            the generator's sequence over those rows and writes it into the KV group.
+ *   DENOISE  one entry per (image, conditioning): `cu_seqlens` bounds each entry's latent rows,
+ *            and the KV group's `block_table` and `seqused` name its conditioning's sequence.
+ *   DECODE   one image.
+ *
+ * Every pointer is device memory unless the name ends in _h. */
+typedef struct RadGenBatch {
+    /* ---- COND */
+    int64_t        rows;          /* the generator's rows for this sequence */
+    /* Where each row comes from: >= 0 the prompt row of that index (the conditioning network's
+     * output there), < 0 the reference latent row -(1 + src). [rows] */
+    const int32_t* src;
+    /* Rotary positions, three components a row. On a COND pass they are laid out segment by
+     * segment: segment s's [3, length] component-major block starts at element 3 * seg_h[s], so a
+     * segment's positions are one dense operand. On a DENOISE pass, [3, n_tok] component-major,
+     * the latent rows'. */
+    const int32_t* rope;
+    /* The sequence in segments: rows [seg_h[s], seg_h[s+1]), each a picture (`seg_bidi_h` 1, its
+     * rows attend to each other both ways) or a run of text (0, causal). A segment is never split
+     * and attends to every segment before it. `seg` is the same offsets on the device; `seg_cu`
+     * is [n_seg, 2], segment s's own cu_seqlens {0, length}, and `seg_start` [n_seg] its first
+     * row -- the keys before it, which is its `seqused` when it is run on its own. */
+    int64_t        n_seg;
+    const int32_t* seg;
+    const int32_t* seg_h;
+    const int32_t* seg_bidi_h;
+    const int32_t* seg_cu;
+    const int32_t* seg_start;
+    /* [rows] the KV slot each row is stored at. */
+    const int32_t* slot_mapping;
+    /* Pixels for the decoder's encoder: `n_px` blocks of `px` [*, pixel_channels] bf16 in
+     * [-1, 1], block b at pixel px_h[3b], px_h[3b+1] high and px_h[3b+2] wide. These are the
+     * reference pictures in prompt order and, with `inpaint`, a last block holding the picture
+     * being repainted at the output size, whose latents go to the lanes below. */
+    int64_t        n_px;
+    const void*    px;
+    const int32_t* px_h;
+    /* [n_px, 2] each block's own cu_seqlens over its latent tokens: {0, (h / scale) (w / scale)}. */
+    const int32_t* px_cu;
+    int32_t        inpaint;
+    /* [image tokens] f32: 1 where the image is repainted, 0 where the picture is kept. */
+    const float*   inp_mask;
+    /* The lanes this conditioning's images run in, which take the repainted picture's latents. */
+    int64_t        n_lane;
+    const int32_t* lane_h;
+
+    /* ---- DENOISE, one value per entry ([n_seq]); on a COND pass `sigma` is one 0, the time
+     * the conditioning is modulated at */
+    const float*   sigma;         /* where the entry's latent is */
+    const float*   sigma_next;    /* where this step takes it */
+    const float*   cfg;           /* guidance: v = neg + cfg * (pos - neg); 1 without a pair */
+    /* The entry holding this image's negative conditioning, or -1 for none; -2 marks an entry
+     * that is one, whose rows serve another entry's step and which does not move its lane. */
+    const int32_t* pair;
+    const int32_t* lane;          /* the plugin's lane the image's latent lives in */
+    const int32_t* lane_dh;       /* ... the same, host */
+    /* RAD_GEN_F_*. */
+    const int32_t* flags;
+    /* [n_seq, 2] the image's noise seed, low word first. */
+    const uint32_t* seed;
+
+    /* ---- DECODE */
+    int32_t        dec_lane;
+    int32_t        dec_height, dec_width;    /* pixels */
+    int32_t        dec_preview;              /* the lane's preview latent, not its state */
+} RadGenBatch;
+
+/* An entry's flags on a DENOISE pass. */
+enum {
+    RAD_GEN_F_FIRST   = 1,   /* the image's first step: its latent is the noise its seed draws */
+    RAD_GEN_F_INPAINT = 2,   /* repaint: after the step, the kept region goes back to the picture,
+                              * noised to sigma_next with the image's own noise */
+    RAD_GEN_F_PREVIEW = 4    /* write the step's estimate of the clean latent to the lane's preview */
+};
+
+/* ================================================================== operands */
+/* RAD_OPK_KV names a KV group's pool rather than a buffer: attention and kv_store take the cache
+ * as an operand, and RadKVGroupBatch carries the slot mapping and block table but not the pool
+ * base, which belongs to the block manager. handle is the rad_kvgroup and offset is the layer,
+ * since a group's pool holds one cache per bound layer. */
+/* RAD_OPK_WTAB names a run of consecutively declared weights. A routed MoE layer has no single
+ * base to stride from: its experts are separate movement units (spec §4.2), and after placement
+ * one may be in VRAM, the next streamed over the link and a third on disk. The core resolves each
+ * handle like any weight (residency table, mover event, use note) and hands the kernel a device
+ * array of pointers, one per expert, in declaration order. See RAD_WTAB below for the RadTensor
+ * shape rule. */
+enum { RAD_OPK_BUF = 0, RAD_OPK_WEIGHT = 1, RAD_OPK_RAW = 2, RAD_OPK_NONE = 3, RAD_OPK_KV = 4,
+       RAD_OPK_WTAB = 5 };
+
+typedef struct RadOperand {
+    uint8_t  kind;
+    uint32_t dtype;      /* RAD_OPK_RAW only: what the pointer points at (buffers and weights
+                          * carry their dtype in the declaration). RAD_DT_INVALID means the
+                          * kernel knows it from the schema position, which a specialised
+                          * kernel does and libref does not. */
+    uint32_t handle;     /* rad_buf or rad_weight */
+    void*    raw;        /* RAD_OPK_RAW: a pointer the core did not allocate (a batch field) */
+    int64_t  offset;     /* element offset into the buffer or weight */
+    int64_t  rows;       /* 0 = the declared extent; >0 = only this many rows of dim 0 */
+    int64_t  cols;       /* 0 = the declared extent; >0 = a column slice of that width, with the
+                          * declared width kept as the stride. Lets q, k and v be views of one
+                          * fused qkv buffer instead of three buffers and a copy. */
+} RadOperand;
+
+#define RAD_B(h)            ((RadOperand){ RAD_OPK_BUF,    RAD_DT_INVALID, (h), 0, 0, 0, 0 })
+#define RAD_B_AT(h, o)      ((RadOperand){ RAD_OPK_BUF,    RAD_DT_INVALID, (h), 0, (o), 0, 0 })
+#define RAD_B_N(h, o, n)    ((RadOperand){ RAD_OPK_BUF,    RAD_DT_INVALID, (h), 0, (o), (n), 0 })
+/* A column slice: `w` columns starting at column `c`, keeping the buffer's declared width as the
+ * stride. RAD_B_COL(qkv, 0, n_q) is the q view of a fused projection. */
+#define RAD_B_COL(h, c, w)  ((RadOperand){ RAD_OPK_BUF,    RAD_DT_INVALID, (h), 0, (c), 0, (w) })
+#define RAD_W(h)            ((RadOperand){ RAD_OPK_WEIGHT, RAD_DT_INVALID, (h), 0, 0, 0, 0 })
+/* A weight table: the `n` weights declared at handles h, h+1, ... h+n-1, as a declaration loop
+ * over experts produces (rad_decl_weight hands out consecutive indices).
+ *
+ * The kernel receives `RadTensor::data` as a device array of `n` `void*`, entry e pointing at
+ * expert e's first byte. `shape[0]` is n and `stride[0]` is 0; the zero leading stride marks an
+ * axis that must be indexed through the table, not by arithmetic. `dtype` and `shape[1..]` /
+ * `stride[1..]` are one entry's; every weight in the run must agree on them, or the core refuses
+ * the issue by name.
+ *
+ * The table is rebuilt only when a pointer changes, so a resident model pays one comparison per
+ * expert per issue and no copy. */
+#define RAD_WTAB(h, n)      ((RadOperand){ RAD_OPK_WTAB,   RAD_DT_INVALID, (h), 0, 0, (n), 0 })
+#define RAD_KV(g, layer)    ((RadOperand){ RAD_OPK_KV,     RAD_DT_INVALID, (g), 0, (layer), 0, 0 })
+#define RAD_P(ptr)          ((RadOperand){ RAD_OPK_RAW,    RAD_DT_INVALID, 0, (void*)(ptr), 0, 0, 0 })
+#define RAD_P_T(ptr, dt)    ((RadOperand){ RAD_OPK_RAW,    (dt), 0, (void*)(ptr), 0, 0, 0 })
+/* A raw pointer to a dense 2-D array, [rows, cols], packed. On a raw operand `cols` is the second
+ * extent, not a column slice (there is no declared width to slice). This is how a two-dimensional
+ * batch field such as the block table, [n_seq, max_blocks], keeps its width. */
+#define RAD_P_T2(ptr, dt, r, c) \
+    ((RadOperand){ RAD_OPK_RAW, (dt), 0, (void*)(ptr), 0, (r), (c) })
+#define RAD_NONE            ((RadOperand){ RAD_OPK_NONE,   RAD_DT_INVALID, 0, 0, 0, 0, 0 })
+
+#define RAD_OPD(...)  ((const RadOperand[]){ __VA_ARGS__ }), \
+                      (int)(sizeof((const RadOperand[]){ __VA_ARGS__ }) / sizeof(RadOperand))
+
+/* ================================================================== issue */
+/* The core resolves each weight handle to a pointer, waits on the mover's event if the weight is
+ * in flight, indexes the op's bucket table with `n`, and dispatches to the device or host
+ * implementation for the current execution site.
+ *
+ * `n` is the value of the op's ranged parameter (at most one per op, so this is a single integer
+ * on the hot path). RAD_N_BATCH means the batch's token count, which almost every op wants. An op
+ * with no ranged parameter ignores it.
+ *
+ * Ops take handles, not pointers, so a weight's location is not fixed at declare; placement
+ * depends on this (spec §3.2). */
+#define RAD_N_BATCH ((int64_t)-1)
+
+int rad_issue(RadCtx* c, rad_op op, const RadOperand* opd, int n_opd, int64_t n);
+
+/* The second lane, for overlapping a collective (or an arm no shard divides) with compute.
+ * `rad_lane` selects the stream later issues launch on (0 or 1); `rad_lane_join(c, from, to)`
+ * orders `to` behind everything already issued on `from` without blocking the host. The runtime
+ * joins lane 1 into lane 0 at the end of every step, so a missing join costs speed, not
+ * correctness.
+ *
+ * Three rules (reasons at Ctx::lane1_ in core): every collective must use the same lane, since
+ * the all-reduce numbers its scratch slots per launch and the ranks must agree; a kernel with a
+ * device-wide arrival counter must key it on the stream (libr4d's split-K GEMM does), or it may
+ * not run here; and every buffer the second lane touches must be named to rad_buf_concurrent,
+ * because the planner packs transients from one linear order. */
+int rad_lane(RadCtx* c, int lane);
+int rad_lane_join(RadCtx* c, int from, int to);
+
+/* Same, with the ranged value taken from the batch. */
+#define RAD_ISSUE(c, op, ...) rad_issue((c), (op), RAD_OPD(__VA_ARGS__), RAD_N_BATCH)
+#define RAD_ISSUE_N(c, op, n, ...) rad_issue((c), (op), RAD_OPD(__VA_ARGS__), (n))
+
+/* Fail the step with a reason. An architecture block's step() returns void, so this is how it
+ * refuses a batch shape it does not serve; the engine stops with `what` in the message. Returns
+ * the status it set, so a helper can `return rad_step_fail(...)`. */
+int rad_step_fail(RadCtx* c, const char* what);
+
+/* ================================================================== run-phase queries */
+const RadBatch* rad_batch(RadCtx* c);
+int             rad_rank(RadCtx* c);
+int             rad_world_size(RadCtx* c);
+RadStream       rad_stream(RadCtx* c);
+
+/* The routing result for a MoE layer, resolved on device against the current residency table.
+ * Routing never blocks the compute stream: the histogram is copied back asynchronously and the
+ * heat engine consumes it on the next step (spec §5.5). These are device-side buffers the plugin
+ * issues its expert ops against, not host-visible expert ids. */
+typedef struct RadRouting {
+    const int32_t* expert_ids;    /* [n_tok, top_k] device */
+    const float*   expert_w;      /* [n_tok, top_k] device */
+    const int32_t* expert_count;  /* [n_expert] device: tokens routed to each */
+    const int32_t* sorted_tok;    /* [n_tok * top_k] device: tokens grouped by expert */
+    const int32_t* expert_offset; /* [n_expert+1] device */
+    int64_t        top_k;
+    int64_t        n_expert;
+} RadRouting;
+
+/* Record that this layer's routing lives in these buffers, so the heat engine can read the
+ * histogram back and the mover can be told what was wanted. The plugin computed them with
+ * ordinary declared ops; this is the handoff, not a computation. */
+int rad_route_report(RadCtx* c, int layer, const RadRouting* r);
+
+/* A core-owned device row of at least `n_expert` int32 where a layer's expert counts can be
+ * written in place; the core copies it to the host once at the end of the pass. A router that
+ * writes here and reports this pointer as `expert_count` hands the counts over for free; any other
+ * pointer costs one copy dispatch per routed layer on the compute stream. Null when the core keeps
+ * no histogram for `layer` or its row is narrower than `n_expert`; the router then writes its own
+ * buffer and reports that. */
+int32_t* rad_route_counts(RadCtx* c, int layer, int64_t n_expert);
+
+/* Next-layer expert prefetch, at decode. At its router input a routed layer names the next routed
+ * layer; the core applies that layer's router to this layer's input rows, picks the experts it is
+ * likeliest to route that sit in the pinned host pool, and copies them to the card while the rest
+ * of this layer runs. Just before the next layer's routed GEMMs it points their weight-table
+ * entries at the copies that have landed, where the entries still name the pool slots copied from.
+ * Results are unchanged: a copy holds its slot's bytes. Active only when placement keeps experts
+ * in a pinned pool and the device backend can spare a DMA engine; a pass of more than 16 rows
+ * makes no prediction. The three calls are no-ops otherwise.
+ *
+ * `parts` names, for each of the next layer's experts, the weights its unit is made of (at most four,
+ * e.g. the gate-up matrix and its scales and the down matrix and its scales), as the routed GEMMs
+ * read them through weight tables; 0 where an expert has fewer or none. An expert is prefetched only
+ * where each of its weights is in exactly one table and all of them sit in one pool slot. The arrays
+ * must outlive the context; the core reads the routing counts only to rank and count, never to choose
+ * an expert's bytes. `layer` is the next layer's index as rad_route_report and
+ * rad_expert_prefetch_step name it; `router` is its router, [n_expert, n_embd] bf16. */
+typedef struct RadPrefetchNext {
+    int               layer;
+    rad_weight        router;
+    int64_t           n_expert, top_k;
+    int64_t           n_parts;
+    const rad_weight* parts;      /* [n_expert * n_parts] */
+    const int32_t*    count_at;   /* [n_expert]: where the expert's count is in the layer's routing
+                                     counts (rad_route_counts), -1 for nowhere; null when at its index */
+} RadPrefetchNext;
+
+/* At this layer's router input: `h` rows [r0, r0 + rows) of n_embd bf16, read in place on another
+ * stream -- the block must not overwrite them before this layer's routed GEMMs. */
+int rad_expert_prefetch(RadCtx* c, const RadPrefetchNext* next, rad_buf h, int64_t r0, int64_t rows,
+                        int64_t n_embd);
+/* After this layer's routed down GEMM: the copies cross the link from here, overlapping the next
+ * layer's attention rather than this layer's own streamed experts. */
+int rad_expert_prefetch_mark(RadCtx* c);
+/* Ahead of `layer`'s routed GEMMs, on every routed layer of every pass. */
+int rad_expert_prefetch_step(RadCtx* c, int layer);
+
+/* A weight's pointer, for the rare plugin-private kernel invoked outside the op vocabulary. Waits
+ * on the mover. The weight may move afterwards, so the pointer is valid only within one issue. */
+void* rad_weight_ptr(RadCtx* c, rad_weight w);
+void* rad_buf_ptr(RadCtx* c, rad_buf b);
+
+#ifdef __cplusplus
+}   /* extern "C" */
+#endif
+#endif /* RAD_RUNTIME_H */

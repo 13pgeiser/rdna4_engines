@@ -1,0 +1,33 @@
+# gemma4-26b-a4b-df.recipe -- gemma-4-26B-A4B-it with z-lab's DFlash drafter, from the bf16
+# checkpoint as Google ships it, as arch/gemma4 serves it.
+#
+#   rad-convert <gemma-4-26B-A4B-it checkpoint> --draft-model <gemma-4-26B-A4B-it-DFlash checkpoint> \
+#       --recipe data/recipes/gemma4-26b-a4b-df.recipe -o gemma4-26b-a4b-df.rad
+#
+# The routed experts are ~90% of the weight bytes and a decode step reads whichever were routed.
+# Their gate_up is block fp8: 2 x 704 = 1408 rows are whole 64-row GEMM tiles and eleven 128-row
+# scale blocks, and K = 2816 is 22. A third of the expert bytes a decode step reads.
+#
+# Their down projection stays bf16: K is the expert width, 704, and the fp8 grouped GEMM reads K
+# in whole 128-column blocks. gemma4-26b-a4b-df-pad768.recipe makes it fp8 as well, from a
+# checkpoint whose experts were padded to 768 first.
+#
+# The attention, the dense arm, the router, the norms and the tied embedding stay bf16: together
+# under a tenth of the bytes, and the dense arm's 2112 is not whole 128-blocks either.
+
+blk.*.ffn_gate_up_exps.*.weight      rtn codes=fp8_e4m3 block=128x128 scale=bf16
+
+# The DFlash drafter's six linears: block fp8 (the drafter only proposes; the trunk verifies).
+dflash.fc.weight                     rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_q.weight           rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_k.weight           rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_v.weight           rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.attn_output.weight      rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.ffn_gate_up.weight      rtn codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.blk.*.ffn_down.weight         rtn codes=fp8_e4m3 block=128x128 scale=bf16
+
+# The drafter's head: the target's tied table again under a name of its own, block fp8, which the
+# draft head reads instead of the bf16 table -- half the widest read on the draft path, for half
+# the table's bytes again (176 MiB a rank at tp 4). Drafts are verified, so this changes what is
+# proposed, never what is accepted.
+dflash.draft_head.weight             rtn codes=fp8_e4m3 block=128x128 scale=bf16

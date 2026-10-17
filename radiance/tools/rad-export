@@ -1,0 +1,659 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""rad-export -- a finetune's output to a .rad, encoded by the model's own recipe.
+
+A LoRA trainer (Unsloth, PEFT/TRL, Axolotl, a plain torch loop) leaves either a merged 16-bit
+checkpoint or a LoRA adapter. rad-convert takes the first and a recipe; the tuned container should
+be encoded exactly like the stock one, so the recipe is the one the stock model is converted with.
+rad-export does the steps between:
+
+  1. a LoRA adapter is folded into its base as PEFT's merge_and_unload folds it on the CPU,
+     W' = W + scale * B @ A, written tensor by tensor into ~1 GiB shards beside the output (peak
+     RAM a few GiB, not the model twice);
+  2. the recipe is picked (by name, a file, or `auto` from the checkpoint's base model) and its
+     header's usage line supplies the --set keys and whether a drafter (--draft-model) is needed;
+  3. the drafter is found: --draft, the config file, or the Hub repository the recipe's usage line
+     names (the local Hub cache, else downloaded with huggingface_hub);
+  4. rad-convert runs -- the installed one, or the one in the Radiance image under docker with no
+     network (CPU only: a convert never opens a GPU, so it is safe beside a running serve).
+
+    rad-export SRC [-o OUT.rad] [--recipe NAME|FILE|auto] [--base DIR] [--draft DIR|ORG/NAME]
+               [--set K=V ...] [--image IMAGE | --rad-convert PATH] [--dry-run] [-- rad-convert args]
+    rad-export --list-recipes [--json] [--image IMAGE | --rad-convert PATH]
+
+SRC is a merged checkpoint (config.json + *.safetensors) or a PEFT adapter (adapter_config.json +
+adapter_model.safetensors). OUT defaults to SRC's folder name + .rad beside SRC (or in out_dir).
+Optional config ~/.config/rad-export/config.json (or --config):
+    {"image": "stilldeadcode/radiance", "out_dir": "/models/rad",
+     "recipes": {"Qwen3.8-27B": "q38-27b-fp8block-df2"},          # base-model substring -> recipe
+     "drafts":  {"q38-27b-fp8block-df2": "/models/Qwen3.8-27B-DFlash2"},   # recipe -> drafter
+     "bases":   {"Qwen/Qwen3.8-27B": "/models/Qwen3.8-27B"},             # adapter base id -> local copy
+     "hub_cache": ["~/.cache/huggingface/hub"]}
+Run from an Unsloth Studio post-export hook (UNSLOTH_POST_EXPORT set), the last line names the .rad
+as UNSLOTH_HOOK_OUTPUT=<path> so Studio lists it with the export.
+"""
+import argparse, glob, json, math, os, re, shlex, shutil, struct, subprocess, sys, tempfile, time
+
+IMAGE_RECIPES = "/opt/radiance/share/radiance/recipes"
+DEFAULT_IMAGE = "stilldeadcode/radiance"
+SHARD = 1 << 30
+# What a conversion reads from a Hub repository; anything else (.bin, .gguf, .pth copies) is not
+# downloaded.
+HUB_FILES = ["*.json", "*.safetensors", "*.jinja", "*.model", "*.tiktoken", "*.txt"]
+# Weight files that are not copied from a base into the merged checkpoint.
+WEIGHT_EXT = (".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf", ".h5", ".msgpack", ".onnx",
+              ".npz")
+# The tokenizer and chat-template files an adapter may carry; the trainer's copies replace the
+# base's in the merged checkpoint.
+TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json",
+                   "added_tokens.json", "chat_template.jinja", "chat_template.json", "tokenizer.model",
+                   "vocab.json", "merges.txt")
+HUB_ID = re.compile(r"[A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*")
+
+
+def die(msg, code=1):
+    print(f"rad-export: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def say(msg):
+    print(f"rad-export: {msg}", flush=True)
+
+
+def hub_id(s):
+    """`s` when it is an ORG/NAME Hub repository id, else None. Ids come from files this tool did
+    not write (an adapter's config, a recipe header), so they are checked before they become a
+    cache path or a download."""
+    s = str(s or "")
+    return s if HUB_ID.fullmatch(s) and ".." not in s else None
+
+
+# ---------------------------------------------------------------- recipes
+
+class Backend:
+    """Where rad-convert runs and where its recipes are: the installed tool, or the image under docker."""
+
+    def __init__(self, a, cfg):
+        self.native = a.rad_convert or (None if a.image else shutil.which("rad-convert"))
+        self.image = a.image or os.environ.get("RADIANCE_IMAGE") or cfg.get("image") or DEFAULT_IMAGE
+        self.memory = a.memory
+        self._dir = a.recipes_dir
+
+    def docker(self):
+        if not shutil.which("docker"):
+            die("no rad-convert on PATH and no docker to run the image's; pass --rad-convert PATH")
+        return "docker"
+
+    def recipes_dir(self):
+        if self._dir:
+            return self._dir
+        if self.native:
+            prefix = os.path.dirname(os.path.dirname(os.path.realpath(self.native)))
+            for d in (os.path.join(prefix, "share", "radiance", "recipes"),
+                      os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "data", "recipes")):
+                if os.path.isdir(d):
+                    self._dir = os.path.realpath(d)
+                    return self._dir
+            die(f"no recipes next to {self.native}; pass --recipes-dir")
+        # the image's own recipes, copied out once per image id
+        dk = self.docker()
+        iid = subprocess.run([dk, "image", "inspect", "-f", "{{.Id}}", self.image], capture_output=True, text=True)
+        if iid.returncode != 0:
+            die(f"docker image {self.image} not found (docker pull {self.image}, or --image / --rad-convert)")
+        cache = os.path.join(os.path.expanduser("~/.cache/rad-export"), "recipes-" + iid.stdout.strip().split(":")[-1][:16])
+        if not os.path.isdir(cache):
+            os.makedirs(os.path.dirname(cache), exist_ok=True)
+            tmp = tempfile.mkdtemp(prefix=".recipes-", dir=os.path.dirname(cache))
+            cid = subprocess.run([dk, "create", self.image], capture_output=True, text=True, check=True).stdout.strip()
+            try:
+                subprocess.run([dk, "cp", f"{cid}:{IMAGE_RECIPES}", os.path.join(tmp, "r")], check=True, capture_output=True)
+                try:
+                    os.replace(os.path.join(tmp, "r"), cache)
+                except OSError:
+                    if not os.path.isdir(cache):    # another run put it there first
+                        raise
+            finally:
+                subprocess.run([dk, "rm", cid], capture_output=True)
+                shutil.rmtree(tmp, ignore_errors=True)
+        self._dir = cache
+        return cache
+
+    def recipe_path_for_convert(self, local_path):
+        """The path rad-convert sees: the same file inside the image when it is one of the image's recipes."""
+        if not self.native and os.path.dirname(local_path) == self.recipes_dir():
+            return os.path.join(IMAGE_RECIPES, os.path.basename(local_path))
+        return local_path
+
+    def command(self, args, mounts):
+        """The rad-convert command line. Under docker the container runs as the caller, with no
+        network and no pull, and sees only `mounts` (path -> read-only), each at its own path."""
+        if self.native:
+            return [self.native] + args
+        cmd = [self.docker(), "run", "--rm", "--pull", "never", "--network", "none",
+               "-u", f"{os.getuid()}:{os.getgid()}"]
+        if self.memory:
+            cmd += ["--memory", self.memory]
+        roots = {}
+        for path, ro in mounts.items():
+            # a Hub cache snapshot is symlinks into ../../blobs: mount the whole repository folder
+            root = path.split("/snapshots/")[0] if "/snapshots/" in path else path
+            roots[root] = roots.get(root, True) and ro
+        for path, ro in sorted(roots.items()):
+            if any(c in path for c in ',"\n'):
+                die(f"cannot mount {path!r} into the container (a comma, quote or newline in the path)")
+            cmd += ["--mount", f"type=bind,src={path},dst={path}" + (",readonly" if ro else "")]
+        return cmd + ["--entrypoint", "/opt/radiance/bin/rad-convert", self.image] + args
+
+    def run(self, args, mounts, log):
+        """Run the convert with its output going to `log`; returns the exit code."""
+        with open(log, "w") as f:
+            return subprocess.run(self.command(args, mounts), stdout=f, stderr=subprocess.STDOUT).returncode
+
+
+def read_recipe(path):
+    """Header facts: the summary line, whether calibration data is needed, and the usage line's flags."""
+    text = open(path, encoding="utf-8").read()
+    header = []
+    for line in text.splitlines():
+        if not line.startswith("#"):
+            break
+        header.append(line[1:].strip())
+    summary = header[0].split("--", 1)[-1].strip() if header else ""
+    usage, on = [], False
+    for h in header:
+        if h.startswith("rad-convert"):
+            on = True
+        if on:
+            usage.append(h.rstrip("\\").strip())
+            if not h.endswith("\\"):
+                break
+    flags = {"draft": None, "set": []}
+    toks = shlex.split(" ".join(usage)) if usage else []
+    for i, t in enumerate(toks):
+        if t == "--draft-model" and i + 1 < len(toks):
+            flags["draft"] = toks[i + 1].strip("<>")
+        if t == "--set" and i + 1 < len(toks):
+            flags["set"].append(toks[i + 1])
+    calib = bool(re.search(r"\$CALIB\b|calib=\$|--imatrix", text))
+    return {"name": os.path.basename(path)[:-7], "summary": " ".join(header[:3]), "first": summary, "calib": calib, **flags}
+
+
+def list_recipes(backend):
+    d = backend.recipes_dir()
+    return [read_recipe(p) for p in sorted(glob.glob(os.path.join(d, "*.recipe")))]
+
+
+# ---------------------------------------------------------------- checkpoint facts
+
+def read_json(path, strict=False):
+    """A JSON file's object; {} when it is absent, or (unless `strict`) unreadable."""
+    if not os.path.exists(path):
+        return {}
+    try:
+        v = json.load(open(path, encoding="utf-8-sig"))
+    except Exception as e:
+        if strict:
+            die(f"{path}: {e}")
+        return {}
+    if not isinstance(v, dict):
+        if strict:
+            die(f"{path}: not a JSON object")
+        return {}
+    return v
+
+
+def st_header(path):
+    """A safetensors file's tensors, name -> (dtype, shape), from its header alone."""
+    with open(path, "rb") as f:
+        raw = f.read(8)
+        if len(raw) != 8:
+            die(f"{path}: not a safetensors file")
+        n = struct.unpack("<Q", raw)[0]
+        if n > (100 << 20):
+            die(f"{path}: a safetensors header of {n} bytes")
+        try:
+            h = json.loads(f.read(n))
+        except Exception as e:
+            die(f"{path}: unreadable safetensors header: {e}")
+    return {k: (v["dtype"], list(v["shape"])) for k, v in h.items() if k != "__metadata__"}
+
+
+def weight_files(d):
+    """The checkpoint's shards and the tensors each holds: the index's assignment when there is one
+    (a shard on disk that the index does not name is not read), else every *.safetensors."""
+    idx = read_json(os.path.join(d, "model.safetensors.index.json"), strict=True).get("weight_map")
+    if idx:
+        out = {}
+        for k, f in idx.items():
+            out.setdefault(f, []).append(k)
+        return out
+    out, seen = {}, {}
+    for p in sorted(glob.glob(os.path.join(d, "*.safetensors"))):
+        f = os.path.basename(p)
+        out[f] = list(st_header(p))
+        for k in out[f]:
+            if k in seen:
+                die(f"{d}: tensor {k} is in both {seen[k]} and {f}, and no index says which to read")
+            seen[k] = f
+    return out
+
+
+def base_model_of(src):
+    for name, key in (("export_metadata.json", "base_model"), ("adapter_config.json", "base_model_name_or_path"), ("config.json", "_name_or_path")):
+        v = read_json(os.path.join(src, name)).get(key)
+        if v:
+            return str(v)
+    return ""
+
+
+def model_names(src, base):
+    """Names to match recipes against: the base model id and its last path component, and the base's own."""
+    out = []
+    for v in (base_model_of(src), base and read_json(os.path.join(base, "config.json")).get("_name_or_path"), base):
+        if v:
+            out += [str(v), os.path.basename(str(v).rstrip("/"))]
+    return [n for n in dict.fromkeys(out) if n]
+
+
+def complete(d):
+    """A checkpoint folder with every weight file present (a Hub snapshot mid-download has config.json first)."""
+    if not os.path.exists(os.path.join(d, "config.json")):
+        return False
+    idx = read_json(os.path.join(d, "model.safetensors.index.json")).get("weight_map")
+    if idx:
+        return all(os.path.exists(os.path.join(d, f)) for f in set(idx.values()))
+    return any(os.path.exists(p) for p in glob.glob(os.path.join(d, "*.safetensors")))
+
+
+def hub_snapshot(repo, cache_dirs):
+    if not hub_id(repo):
+        return None
+    org, _, name = repo.partition("/")
+    snaps = [s for c in cache_dirs for s in glob.glob(os.path.join(glob.escape(os.path.expanduser(c)),
+                                                                   f"models--{glob.escape(org)}--{glob.escape(name)}",
+                                                                   "snapshots", "*"))
+             if complete(s)]
+    return max(snaps, key=os.path.getmtime) if snaps else None
+
+
+def hub_fetch(repo, cache_dirs, dry):
+    if not hub_id(repo):
+        return None
+    path = hub_snapshot(repo, cache_dirs)
+    if path:
+        return path
+    if dry:
+        return f"<would download {repo}>"
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        return None
+    say(f"downloading {repo} from the Hugging Face Hub ({', '.join(HUB_FILES)})")
+    try:
+        return snapshot_download(repo, allow_patterns=HUB_FILES)
+    except Exception as e:
+        say(f"{repo}: {e}")
+        return None
+
+
+def checkpoint_dir(path, what, dry):
+    """`path` when it is a complete checkpoint folder; refused with `what` otherwise."""
+    if dry and path.startswith("<would download"):
+        return path
+    if not complete(path):
+        die(f"{what} {path} is not a checkpoint (config.json and every *.safetensors shard)")
+    return os.path.realpath(path)
+
+
+def resolve_base(base_id, a, cfg):
+    hub = cfg.get("hub_cache", ["~/.cache/huggingface/hub"])
+    if a.base:
+        return checkpoint_dir(a.base, "--base", a.dry_run)
+    pinned = cfg.get("bases", {}).get(base_id)
+    if pinned:
+        return checkpoint_dir(os.path.expanduser(pinned), "the config's base", a.dry_run)
+    if base_id and os.path.isdir(base_id):
+        return checkpoint_dir(base_id, "the adapter's base", a.dry_run)
+    if hub_id(base_id):
+        p = hub_fetch(base_id, hub, a.dry_run)
+        return checkpoint_dir(p, "the adapter's base", a.dry_run) if p else None
+    return None
+
+
+def pick_recipe(a, cfg, recipes, names):
+    if a.recipe and a.recipe != "auto":
+        if os.path.isfile(a.recipe):
+            return read_recipe(os.path.realpath(a.recipe)), os.path.realpath(a.recipe)
+        byname = {r["name"]: r for r in recipes}
+        name = a.recipe[:-7] if a.recipe.endswith(".recipe") else a.recipe
+        if name not in byname:
+            die(f"no recipe '{name}' (--list-recipes shows them)")
+        return byname[name], None
+    for key, rname in cfg.get("recipes", {}).items():
+        if any(key.lower() in n.lower() for n in names):
+            return pick_recipe(argparse.Namespace(recipe=rname), {}, recipes, names)
+    # auto: recipes whose header names this model, take a bf16 checkpoint, and need no calibration data
+    cands = [r for r in recipes if not r["calib"] and any(n.lower() in r["summary"].lower() for n in names if len(n) > 3)]
+    bf16 = [r for r in cands if "bf16" in r["summary"].lower()]
+    cands = bf16 or cands
+    if len(cands) == 1:
+        return cands[0], None
+    if not cands:
+        die(f"no recipe names {names[:2]}; pick one with --recipe (rad-export --list-recipes)")
+    shown = next((n for n in names if not os.path.isdir(n)), os.path.basename(names[0]))
+    die("several recipes fit " + repr(shown) + ": " + ", ".join(r["name"] for r in cands) +
+        " -- pick one with --recipe, or pin it in the config's \"recipes\"")
+
+
+def resolve_draft(a, cfg, recipe, dry):
+    """The drafter: --draft, the config's pin for the recipe, or the Hub repository the recipe's
+    usage line names. A usage line with a placeholder (`<... checkpoint>`) names no repository,
+    and no name is guessed from it."""
+    hub = cfg.get("hub_cache", ["~/.cache/huggingface/hub"])
+    want = recipe.get("draft")
+    if a.draft:
+        if os.path.isdir(a.draft):
+            return checkpoint_dir(a.draft, "--draft", dry)
+        return hub_fetch(a.draft, hub, dry) or die(f"drafter {a.draft} is neither a folder nor a Hub "
+                                                   "repository this can fetch")
+    if not want:
+        return None
+    pinned = cfg.get("drafts", {}).get(recipe["name"])
+    if pinned:
+        pinned = os.path.expanduser(pinned)
+        if os.path.isdir(pinned):
+            return checkpoint_dir(pinned, "the config's drafter", dry)
+        return hub_fetch(pinned, hub, dry) or die(f"the config's drafter {pinned} is neither a "
+                                                  "folder nor a Hub repository this can fetch")
+    path = hub_fetch(want, hub, dry) if hub_id(want) else None
+    if not path:
+        die(f"recipe {recipe['name']} merges a drafter ({want}); pass --draft DIR or ORG/NAME, or "
+            "pin one in the config's \"drafts\"")
+    return path
+
+
+def out_stem(src):
+    """The .rad's name: SRC's folder, prefixed by its parent's for a trainer's generic folder name
+    (run-checkpoint-123, not checkpoint-123), without an export-type suffix."""
+    stem = os.path.basename(src)
+    if re.fullmatch(r"(adapter|merged|lora|model|final|checkpoint[-_].*)", stem, re.I):
+        stem = os.path.basename(os.path.dirname(src)) + "-" + stem
+    return re.sub(r"[-_](adapter|merged|lora)(-16bit)?$", "", stem, flags=re.I) or stem
+
+
+# ---------------------------------------------------------------- LoRA merge
+
+def pattern_key(patterns, module):
+    """PEFT's get_pattern_key: the first rank_pattern / alpha_pattern key that matches the end of
+    the module name on a dot boundary, or None."""
+    for k in patterns:
+        if re.match(rf"(.*\.)?({k})$", module):
+            return k
+    return None
+
+
+def adapter_config(adapter):
+    cfg = read_json(os.path.join(adapter, "adapter_config.json"), strict=True)
+    if cfg.get("peft_type", "LORA") != "LORA" or cfg.get("use_dora"):
+        die("only plain LoRA adapters merge here (DoRA and other PEFT types: merge_and_unload in PEFT, then pass the merged folder)")
+    if cfg.get("modules_to_save"):
+        die("adapter has modules_to_save; merge with PEFT's merge_and_unload and pass the merged folder")
+    if cfg.get("lora_bias"):
+        die("adapter trains a LoRA bias; merge with PEFT's merge_and_unload and pass the merged folder")
+    for k in ("r", "lora_alpha"):
+        v = cfg.get(k)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not v > 0:
+            die(f"{adapter}/adapter_config.json: {k} is {v!r}, not a positive number")
+    for k in ("rank_pattern", "alpha_pattern"):
+        if not isinstance(cfg.get(k) or {}, dict):
+            die(f"{adapter}/adapter_config.json: {k} is not an object")
+    return cfg
+
+
+def scale_of(cfg, module):
+    """(r, scale) for one module as PEFT's update_layer sets them: the pattern's r and alpha where
+    one matches, scale alpha / r, or alpha / sqrt(r) with rsLoRA."""
+    rp, ap = cfg.get("rank_pattern") or {}, cfg.get("alpha_pattern") or {}
+    rk, ak = pattern_key(rp, module), pattern_key(ap, module)
+    r = rp[rk] if rk is not None else cfg["r"]
+    alpha = ap[ak] if ak is not None else cfg["lora_alpha"]
+    return r, (alpha / math.sqrt(r) if cfg.get("use_rslora") else alpha / r)
+
+
+def plan_merge(adapter, base):
+    """Check an adapter against its base from the safetensors headers alone, before a tensor is
+    read: which base weight each A/B pair folds into, with its scale. Anything this cannot merge
+    exactly is refused."""
+    cfg = adapter_config(adapter)
+    wpath = os.path.join(adapter, "adapter_model.safetensors")
+    if not os.path.exists(wpath):
+        die(f"{adapter}: no adapter_model.safetensors")
+    ad = st_header(wpath)
+    odd = [k for k in ad if not re.search(r"\.lora_[AB]\.(weight|default\.weight)$", k)]
+    if odd:
+        die(f"adapter holds tensors other than linear LoRA A/B ({odd[0]}, ...): embedding LoRA, trained biases or "
+            "saved modules -- merge with PEFT's merge_and_unload and pass the merged folder")
+    base_shape = {}
+    for f, ks in weight_files(base).items():
+        hdr = st_header(os.path.join(base, f))
+        for k in ks:
+            if k not in hdr:
+                die(f"{base}: the index puts {k} in {f}, which does not hold it")
+            base_shape[k] = hdr[k][1]
+    fan_in_fan_out = bool(cfg.get("fan_in_fan_out"))
+    pairs = {}
+    for k in sorted(ad):
+        if ".lora_B." in k:
+            if k.replace(".lora_B.", ".lora_A.") not in ad:
+                die(f"adapter has {k} without its lora_A")
+            continue
+        bk = k.replace(".lora_A.", ".lora_B.")
+        if bk not in ad:
+            die(f"adapter has {k} without its lora_B")
+        module = k.replace("base_model.model.", "", 1).split(".lora_A.")[0]
+        (_, sa), (_, sb) = ad[k], ad[bk]
+        r, scale = scale_of(cfg, module)
+        if len(sa) != 2 or len(sb) != 2:
+            die(f"{module}: a LoRA of rank-{len(sa)} tensors (a convolution's); merge with PEFT's merge_and_unload")
+        if sa[0] != r or sb[1] != r:
+            die(f"{module}: A {sa} and B {sb} are not rank {r}, the rank the adapter config gives it")
+        key = module + ".weight"
+        if key not in base_shape:
+            # VLM checkpoints keep the text model under model.language_model.
+            alt = key.replace("model.", "model.language_model.", 1)
+            if alt not in base_shape:
+                die(f"adapter targets {key}, which the base checkpoint does not have")
+            key = alt
+        want = [sa[1], sb[0]] if fan_in_fan_out else [sb[0], sa[1]]
+        if base_shape[key] != want:
+            die(f"{key}: the adapter's delta is {want} and the weight {base_shape[key]}")
+        pairs[key] = (k, bk, scale)
+    return pairs, fan_in_fan_out
+
+
+def tokenizer_size(path):
+    """The token ids a tokenizer.json can emit: its vocabulary and added tokens, max id + 1."""
+    tj = read_json(path)
+    vocab = (tj.get("model") or {}).get("vocab")
+    n = 0
+    if isinstance(vocab, dict):
+        n = max(vocab.values(), default=-1) + 1
+    elif isinstance(vocab, list):
+        n = len(vocab)
+    for t in tj.get("added_tokens") or []:
+        if isinstance(t.get("id"), int):
+            n = max(n, t["id"] + 1)
+    return n
+
+
+def merge_lora(adapter, base, out):
+    """Fold a PEFT LoRA adapter into a copy of the base checkpoint, streaming tensor by tensor.
+
+    Each delta is (B @ A) * scale in fp32, transposed for fan_in_fan_out (Conv1D) weights. As in
+    PEFT's merge on the CPU, a bf16 or fp16 adapter's delta is rounded to the adapter's dtype
+    before it is added, and the sum is rounded once to the base weight's dtype."""
+    pairs, fan_in_fan_out = plan_merge(adapter, base)
+    import torch
+    from safetensors import safe_open
+    from safetensors.torch import load_file, save_file
+
+    ad = load_file(os.path.join(adapter, "adapter_model.safetensors"))
+    os.makedirs(out, exist_ok=True)
+    for f in os.listdir(base):
+        p = os.path.join(base, f)
+        if os.path.isfile(p) and not f.endswith(WEIGHT_EXT) and f != "model.safetensors.index.json":
+            shutil.copy2(p, os.path.join(out, f))
+    # The trainer's tokenizer and chat template are the tuned model's.
+    if os.path.exists(os.path.join(adapter, "tokenizer.json")):
+        bcfg = read_json(os.path.join(base, "config.json"))
+        rows = bcfg.get("vocab_size") or (bcfg.get("text_config") or {}).get("vocab_size")
+        n = tokenizer_size(os.path.join(adapter, "tokenizer.json"))
+        if rows and n > rows:
+            die(f"the adapter's tokenizer has {n} tokens and the base's embedding {rows} rows; a "
+                "resized embedding is not merged here -- use PEFT's merge_and_unload")
+    for f in TOKENIZER_FILES:
+        if os.path.isfile(os.path.join(adapter, f)):
+            shutil.copy2(os.path.join(adapter, f), os.path.join(out, f))
+
+    files = weight_files(base)
+    shards, cur, size, wm, total, done, maxrel = 0, {}, 0, {}, 0, 0, 0.0
+
+    def flush():
+        nonlocal shards, cur, size
+        if cur:
+            shards += 1
+            save_file(cur, os.path.join(out, f"part-{shards:05d}.safetensors"), metadata={"format": "pt"})
+        cur, size = {}, 0
+
+    for f in sorted(files):
+        with safe_open(os.path.join(base, f), "pt") as h:
+            for k in files[f]:
+                t = h.get_tensor(k)
+                if k in pairs:
+                    ka, kb, s = pairs.pop(k)
+                    A, B = ad[ka], ad[kb]
+                    d = (B.float() @ A.float()) * s
+                    if fan_in_fan_out:          # GPT-2 style Conv1D weights are stored transposed
+                        d = d.T
+                    if B.dtype in (torch.float16, torch.bfloat16):
+                        d = d.to(B.dtype)
+                    w, d = t.float(), d.float()
+                    wn = w.norm().item()
+                    if wn > 0:
+                        maxrel = max(maxrel, d.norm().item() / wn)
+                    t = (w + d).to(t.dtype)
+                    if not torch.isfinite(t).all():
+                        die(f"{k}: the merged weight is not finite")
+                    done += 1
+                cur[k] = t.contiguous()
+                wm[k] = shards + 1
+                n = t.numel() * t.element_size()
+                size += n
+                total += n
+                if size >= SHARD:
+                    flush()
+    flush()
+    for i in range(1, shards + 1):
+        os.rename(os.path.join(out, f"part-{i:05d}.safetensors"), os.path.join(out, f"model-{i:05d}-of-{shards:05d}.safetensors"))
+    json.dump({"metadata": {"total_size": total}, "weight_map": {k: f"model-{i:05d}-of-{shards:05d}.safetensors" for k, i in wm.items()}},
+              open(os.path.join(out, "model.safetensors.index.json"), "w"), indent=1)
+    say(f"merged {done} LoRA weights into {base} (largest |dW|/|W| {maxrel:.4f})")
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    argv = sys.argv[1:]
+    extra = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, extra = argv[:i], argv[i + 1:]
+    ap = argparse.ArgumentParser(prog="rad-export", description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("src", nargs="?", help="merged checkpoint or LoRA adapter folder")
+    ap.add_argument("-o", "--out", help="the .rad to write")
+    ap.add_argument("--recipe", default="auto", help="recipe name, recipe file, or auto (default)")
+    ap.add_argument("--base", help="base checkpoint for a LoRA adapter (default: the adapter's base_model_name_or_path)")
+    ap.add_argument("--draft", help="drafter folder or Hub id, when the recipe merges one")
+    ap.add_argument("--set", action="append", default=[], help="extra rad-convert --set K=V (after the recipe's own)")
+    ap.add_argument("--image", help=f"Radiance image for docker (default $RADIANCE_IMAGE, the config, {DEFAULT_IMAGE})")
+    ap.add_argument("--rad-convert", help="use this rad-convert binary instead of docker")
+    ap.add_argument("--recipes-dir", help="recipes folder (default: the installed or image's own)")
+    ap.add_argument("--memory", help="docker memory limit for the convert, e.g. 24g")
+    ap.add_argument("--config", default=os.path.expanduser("~/.config/rad-export/config.json"))
+    ap.add_argument("--list-recipes", action="store_true")
+    ap.add_argument("--json", action="store_true", help="with --list-recipes: JSON (names first entry 'auto')")
+    ap.add_argument("--keep-merged", action="store_true", help="keep the merged checkpoint of a LoRA adapter beside OUT")
+    ap.add_argument("--dry-run", action="store_true", help="resolve everything, print the rad-convert command, convert nothing")
+    a = ap.parse_args(argv)
+    cfg = read_json(a.config, strict=True)
+    be = Backend(a, cfg)
+
+    if a.list_recipes:
+        rs = list_recipes(be)
+        if a.json:
+            print(json.dumps({"recipes": ["auto"] + [r["name"] for r in rs if not r["calib"]],
+                              "needs_calibration": [r["name"] for r in rs if r["calib"]]}))
+        else:
+            for r in rs:
+                print(f"{r['name']:34s} {'[calib] ' if r['calib'] else ''}{'[drafter] ' if r['draft'] else ''}{r['first'][:90]}")
+        return
+    if not a.src:
+        ap.error("SRC is required")
+    src = os.path.realpath(a.src)
+    adapter = os.path.exists(os.path.join(src, "adapter_config.json"))
+    if not adapter and not os.path.exists(os.path.join(src, "config.json")):
+        die(f"{src} is neither a merged checkpoint (config.json) nor a LoRA adapter (adapter_config.json)")
+    base_id = base_model_of(src)
+    base = resolve_base(base_id, a, cfg) if adapter else None
+    if adapter and not base:
+        die(f"the adapter's base {base_id!r} is neither on this disk nor fetched; pass --base")
+    names = model_names(src, base)
+    recipe, recipe_file = pick_recipe(a, cfg, list_recipes(be), names)
+    recipe_file = recipe_file or os.path.join(be.recipes_dir(), recipe["name"] + ".recipe")
+    draft = resolve_draft(a, cfg, recipe, a.dry_run)
+    out = os.path.abspath(a.out) if a.out else os.path.join(
+        os.path.expanduser(cfg["out_dir"]) if cfg.get("out_dir") else os.path.dirname(src), out_stem(src) + ".rad")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    say(f"{'adapter' if adapter else 'merged checkpoint'} {src} -> {out}; recipe {recipe['name']}" + (f", drafter {draft}" if draft else ""))
+
+    work = tempfile.mkdtemp(prefix=".rad-export-", dir=os.path.dirname(out))
+    t0 = time.time()
+    try:
+        merged = os.path.join(work, "merged") if adapter else src
+        if adapter and not a.dry_run:
+            merge_lora(src, base, merged)
+        args = [merged, "-o", out, "--recipe", be.recipe_path_for_convert(recipe_file)]
+        # The merged checkpoint carries the adapter's tokenizer where it has one, else the base's.
+        if any(d and not d.startswith("<") and os.path.exists(os.path.join(d, "tokenizer.json"))
+               for d in ([src, base] if adapter else [src])):
+            args += ["--tokenizer", os.path.join(merged, "tokenizer.json")]
+        if draft:
+            args += ["--draft-model", draft]
+        for kv in recipe["set"] + a.set:
+            args += ["--set", kv]
+        args += extra
+        mounts = {os.path.dirname(out): False, os.path.realpath(merged): True}
+        if draft:
+            mounts[os.path.realpath(draft)] = True
+        if not be.recipe_path_for_convert(recipe_file).startswith(IMAGE_RECIPES):
+            mounts[os.path.dirname(recipe_file)] = True
+        say("rad-convert " + " ".join(shlex.quote(x) for x in args))
+        if a.dry_run:
+            return
+        log = out + ".log"
+        rc = be.run(args, mounts, log)
+        if rc != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
+            tail = open(log, errors="replace").read()[-1500:]
+            die(f"rad-convert failed (exit {rc}); log {log}\n" + tail)
+        say(f"wrote {out} ({os.path.getsize(out) / 2**30:.2f} GiB) in {time.time() - t0:.0f} s; log {log}")
+        if a.keep_merged and merged != src:
+            shutil.move(merged, out + ".merged")
+            say(f"merged checkpoint kept at {out}.merged")
+        if os.environ.get("UNSLOTH_POST_EXPORT"):
+            print(f"UNSLOTH_HOOK_OUTPUT={out}", flush=True)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

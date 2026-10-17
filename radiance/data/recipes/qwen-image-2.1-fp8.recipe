@@ -1,0 +1,20 @@
+# qwen-image-2.1-fp8.recipe -- Qwen-Image 2.1 or 2.1-Turbo with block-scaled fp8 linears.
+#
+#   rad-convert <Qwen-Image-2.1 pipeline directory> --recipe data/recipes/qwen-image-2.1-fp8.recipe \
+#       -o qwen-image-2.1-fp8.rad
+#
+# Every linear of the text encoder's language model and of the DiT's 32 blocks becomes E4M3 codes
+# with a bf16 scale a 128 x 128 block, read by the fp8a8 GEMMs over activations quantised the same
+# way. What stays bf16 is read once a pass or less: the embedding table, the vision tower, txt_in,
+# img_in, the timestep MLP, the shared modulation, norm_out, proj_out and the VAE (cast from the
+# base model's f32).
+
+te.blk.*.attn_qkv.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.attn_output.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.ffn_gate_up.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+te.blk.*.ffn_down.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.attn_qkv.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.attn_output.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.ffn_gate_up.weight         rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dit.blk.*.ffn_down.weight            rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+vae.*                                cast dtype=bf16

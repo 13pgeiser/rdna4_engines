@@ -1,0 +1,349 @@
+/* engine_draft.cpp -- the two drafter drivers (spec §10).
+ *
+ * A draft head runs as extra passes after the trunk step. SERIAL runs `depth` dependent passes;
+ * BLOCK runs a context pass, then one pass that fills the whole block. The architecture plugin
+ * declares which (rad_declare_drafter); nothing here depends on the model.
+ */
+#include "engine_priv.h"
+
+#include "sched/scheduler.h"
+#include "device/device.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+namespace rad {
+
+/* ------------------------------------------------------------------ the card's step state */
+/* Every rank's zeroed StepSlots and sorted end-of-generation ids, and the pinned host copy of rank
+ * 0's slots the step reads back. Allocated once at start, so the step path never allocates. */
+int Engine::step_state_init() {
+    std::vector<int32_t> eog;
+    if (vocab_) eog = vocab_->eog();
+    std::sort(eog.begin(), eog.end());
+    eog.erase(std::unique(eog.begin(), eog.end()), eog.end());
+    const int64_t n_slot = cfg_.max_seqs > 0 ? cfg_.max_seqs : 1;
+    const int64_t slot_bytes = n_slot * (int64_t)sizeof(StepSlot);
+    for (auto& rk : ranks_) {
+        RAD_TRY(rad_dev_set(rk->device));
+        rk->step_slots = static_cast<StepSlot*>(rad_dev_alloc(slot_bytes, RAD_MEM_DEVICE));
+        rk->n_eog = (int32_t)eog.size();
+        rk->eog = static_cast<int32_t*>(
+            rad_dev_alloc(std::max<int64_t>(1, (int64_t)eog.size()) * 4, RAD_MEM_DEVICE));
+        if (!rk->step_slots || !rk->eog) {
+            RAD_ERR("step state: no device memory for %lld slot(s) on card %d",
+                    (long long)n_slot, rk->device);
+            return RAD_E_NOMEM;
+        }
+        RAD_TRY(rad_memset_async(rk->step_slots, 0, slot_bytes, rk->ctx.stream()));
+        if (!eog.empty())
+            RAD_TRY(rad_memcpy_async(rk->eog, eog.data(), (int64_t)eog.size() * 4,
+                                     rk->ctx.stream()));
+        RAD_TRY(rad_stream_sync(rk->ctx.stream()));
+    }
+    if (!ranks_.empty()) RAD_TRY(rad_dev_set(ranks_[0]->device));
+    slots_host_ = static_cast<StepSlot*>(rad_dev_alloc(slot_bytes, RAD_MEM_HOST_PINNED));
+    if (!slots_host_) return RAD_E_NOMEM;
+    RAD_TRY(rad_event_create_as(&step_end_, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
+    return RAD_OK;
+}
+
+void Engine::step_state_fini() {
+    for (auto& rk : ranks_) {
+        (void)rad_dev_set(rk->device);
+        if (rk->step_slots) rad_dev_free(rk->step_slots, RAD_MEM_DEVICE);
+        if (rk->eog) rad_dev_free(rk->eog, RAD_MEM_DEVICE);
+        rk->step_slots = nullptr;
+        rk->eog = nullptr;
+    }
+    if (slots_host_) rad_dev_free(slots_host_, RAD_MEM_HOST_PINNED);
+    slots_host_ = nullptr;
+    if (step_end_) rad_event_destroy(step_end_);
+    step_end_ = nullptr;
+}
+
+/* ------------------------------------------------------------------ the serial driver
+ *
+ * RAD_DRAFT_SERIAL: one head pass per drafted token after the trunk step (MTP, EAGLE, Medusa).
+ * Round 1 consumes the sampled token and the hidden state of the position it came from, which
+ * depends on how many drafts were accepted; it runs in the history pass, whose rows include that
+ * position (RadBatch::draft_out_ids).
+ *
+ * The card, not the host, resolves those positions (sched/advance.h): behind the trunk's sampler
+ * every rank runs the acceptance into its StepSlots, and an advance before each draft pass fills
+ * in its positions and tokens. So the host issues the whole step (trunk, history, every round)
+ * without waiting and reads back once after the last round, instead of idling the card for a
+ * readback, commit and batch build per step.
+ *
+ * Each pass is an ordinary RadBatch through the same barrier and sampler chain; `draft_pass`
+ * tells the plugin to run the head. Tokens go out through set_draft(), like prompt lookup's; a
+ * sequence the head declined keeps n_draft 0, leaving it to the n-gram drafter.
+ */
+bool Engine::serial_drafting() const {
+    return drafter_.kind == RAD_DRAFT_SERIAL && drafter_.depth > 0;
+}
+
+/* One advance on every rank against the scheduler's latest build, over its first `rows` rows
+ * when given, else all. */
+int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
+    for (size_t i = 0; i < ranks_.size(); ++i) {
+        Rank& rk = *ranks_[i];
+        AdvanceArgs a = sched_.advance_args((int)i);
+        if (rows >= 0 && rows < a.n_seq) a.n_seq = rows;
+        a.mode  = mode;
+        a.round = round;
+        a.st    = rk.step_slots;
+        a.eog   = rk.eog;
+        a.n_eog = rk.n_eog;
+        if (from_proposal) {
+            a.src = static_cast<const int32_t*>(drafter_.proposal ? rk.ctx.buf_ptr(drafter_.proposal)
+                                                                  : rk.ctx.buf_ptr(rk.tok_buf));
+            a.src_pitch = (drafter_.proposal && drafter_.proposal_pitch > 0)
+                              ? drafter_.proposal_pitch : 1;
+        } else {
+            a.src = static_cast<const int32_t*>(rk.ctx.buf_ptr(rk.tok_buf));
+        }
+        if (!a.src || !a.st) {
+            RAD_ERR("drafter '%s': rank %zu has no %s to advance from", drafter_.name, i,
+                    a.st ? "proposal buffer" : "step state");
+            return RAD_E_STATE;
+        }
+        RAD_TRY(step_advance(a, rk.ctx.stream()));
+    }
+    return RAD_OK;
+}
+
+/* Issue the step's draft passes behind it, without waiting. After the trunk's ranks join: the
+ * acceptance on every rank, the sampled-id readback (before a round can overwrite them), the
+ * history pass and every round, then the final proposal into the slots and their readback.
+ * Nothing synchronises here; collect_step has the step's one wait. */
+int Engine::issue_serial_drafter(int step, StepOut& so) {
+    serial_rounds_ = 0;
+    serial_rows_   = 0;
+    serial_done_   = 0;
+    /* A step issued ahead continues from the card's acceptance, so run it even without drafts. */
+    if (!serial_drafting()) {
+        if (pipelining_) RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
+        return RAD_OK;
+    }
+
+    RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
+    RAD_TRY(collect_issue(so));
+
+    int rounds = drafter_.depth;
+    serial_row_.resize((size_t)cfg_.max_seqs);
+    /* `n` counts rows that can draft. It can be zero while the history pass still has work (a
+     * mid-prompt sequence has hidden states the head needs but no token to propose from). */
+    const int n = sched_.serial_begin(&rounds, serial_row_.data(), (int)serial_row_.size());
+    if (rounds <= 0) return RAD_OK;
+    serial_rounds_ = rounds;
+    serial_rows_   = n;
+
+    /* RADIANCE_DEBUG_STAGE: running means of a draft pass's host time: batch + advance, greedy
+     * sampler chain, barrier release and issue. They cost the step nothing until their sum exceeds
+     * the previous pass's device time. */
+    static const bool stg = std::getenv("RADIANCE_DEBUG_STAGE") != nullptr;
+    static double a_batch = 0, a_samp = 0, a_rel = 0, a_iss = 0;
+    static long   n_pass = 0;
+
+    /* Pass 0, then rounds 2..rounds: round 1 has no pass of its own. */
+    for (int rd = 0; rd <= rounds; rd += rd == 0 ? 2 : 1) {
+        if (rd > 0 && n <= 0) break;
+        const auto tA = std::chrono::steady_clock::now();
+        const RadBatch* db = sched_.serial_batch(rd, step);
+        if (!db) { if (rd == 0) continue; break; }
+        /* Pass 0 is the history pass, writing the head's own K and V (nothing else does). It is
+         * also draft round 1 for drafting rows, whose inputs are the last row of their history run
+         * (RadBatch::draft_out_ids), so it ends in the lm_head over those rows. Round r >= 2 embeds
+         * round r-1's proposal, which the advance takes from the proposal buffer on the card. */
+        const int drafted = rd == 0 ? (int)db->n_draft_out : n;
+        RAD_TRY(advance_all(rd == 0 ? ADV_HIST : ADV_ROUND, rd, rd > 0));
+        const auto tB = std::chrono::steady_clock::now();
+
+        /* Greedy, not the request's sampler: the target verifies against its own draw
+         * (core/sample/accept.h), so sampling a draft would spend the request's RNG stream and
+         * lower acceptance. A head with its own proposal buffer samples nothing (a zero-row
+         * chain). */
+        for (auto& rk : ranks_) {
+            int s = rk->sampler.build_greedy(drafter_.proposal ? 0 : drafted);
+            if (s < 0) {
+                RAD_ERR("drafter '%s': build_greedy: %s", drafter_.name, rad_strerror(s));
+                return s;
+            }
+        }
+
+        const auto tC = std::chrono::steady_clock::now();
+        issue_what_.store(kIssueAll, std::memory_order_release);
+        step_batch_.store(db, std::memory_order_release);
+        /* Timed separately: the first crossing releases the parked ranks (the wake), the second
+         * waits for them to finish issuing (the issue). */
+        barrier_->arrive_and_wait();
+        const auto tC2 = std::chrono::steady_clock::now();
+        barrier_->arrive_and_wait();
+        const auto tD = std::chrono::steady_clock::now();
+
+        int st = step_status_.load(std::memory_order_acquire);
+        if (st < 0) {
+            RAD_ERR("drafter '%s': pass %d of step %d failed: %s -- the engine cannot continue",
+                    drafter_.name, rd, step, rad_strerror(st));
+            return st;
+        }
+        if (stg) {
+            using us = std::chrono::duration<double, std::micro>;
+            a_batch += us(tB - tA).count();
+            a_samp  += us(tC - tB).count();
+            a_rel   += us(tC2 - tC).count();
+            a_iss   += us(tD - tC2).count();
+            if (++n_pass % 400 == 0)
+                RAD_INFO("draft: %ld passes; batch %.1f, sampler %.1f, release %.1f, issue %.1f us "
+                         "a pass", n_pass, a_batch / (double)n_pass, a_samp / (double)n_pass,
+                         a_rel / (double)n_pass, a_iss / (double)n_pass);
+        }
+        if (rd > 0) serial_done_ = rd;
+        else if (drafted > 0) serial_done_ = 1;
+    }
+    if (serial_done_ <= 0 || n <= 0) return RAD_OK;
+
+    /* The last round's proposal into the slots, then rank 0's slots back to the host. Only the
+     * drafting rows: at depth 1 the last pass is the history pass, whose later rows only carried
+     * history (Scheduler::serial_batch). */
+    RAD_TRY(advance_all(ADV_TAKE, serial_done_, true, n));
+    Rank& r0 = *ranks_[0];
+    RAD_TRY(rad_memcpy_async(slots_host_, r0.step_slots,
+                             (int64_t)cfg_.max_seqs * (int64_t)sizeof(StepSlot), r0.ctx.stream()));
+    return RAD_OK;
+}
+
+/* After commit: check the host's acceptance against the card's, publish the proposals through
+ * set_draft, and move the history watermark. The card's acceptance positioned every draft pass,
+ * so a disagreement is a defect and the step is refused. */
+int Engine::finish_serial_drafter(const StepOut& so) {
+    if (!serial_drafting() || serial_rounds_ <= 0) return RAD_OK;
+    const StepPlan& plan = sched_.plan();
+    if (serial_done_ > 0 && serial_rows_ > 0) {
+        for (size_t i = 0; i < plan.e.size(); ++i) {
+            const StepEntry& e = plan.e[i];
+            if (so.first_row[i] < 0) continue;
+            const StepSlot& S = slots_host_[e.card];   /* in range: the builder refuses others */
+            if (S.acc != so.accepted[i] || S.tok[0] != so.token[i]) {
+                RAD_ERR("drafter '%s': the card accepted %d draft(s) ending in token %d for "
+                        "sequence %llu and the host %d ending in %d; the draft passes ran from "
+                        "the card's", drafter_.name, S.acc, S.tok[0],
+                        (unsigned long long)e.seq, so.accepted[i], so.token[i]);
+                return RAD_E_STATE;
+            }
+        }
+    }
+    sched_.serial_end(serial_done_);
+    if (serial_done_ <= 0 || serial_rows_ <= 0) return RAD_OK;
+
+    Rank& r0 = *ranks_[0];
+    const int rounds = serial_rounds_, done = serial_done_;
+    draft_out_.assign((size_t)serial_rows_ * (size_t)rounds, 0);
+    for (int i = 0; i < serial_rows_; ++i) {
+        const StepSlot& S = slots_host_[serial_row_[(size_t)i].card];
+        for (int rd = 1; rd <= done; ++rd)
+            draft_out_[(size_t)i * (size_t)rounds + (size_t)(rd - 1)] = S.tok[rd];
+    }
+    for (int i = 0; i < serial_rows_; ++i) {
+        /* No draft for a request the sampler will not speculate on (a constraining grammar that
+         * cannot snapshot its state); the sampler would refuse the next step otherwise. */
+        if (!r0.sampler.allows_speculation(serial_row_[(size_t)i].seq)) continue;
+        sched_.set_draft(serial_row_[(size_t)i].seq,
+                         &draft_out_[(size_t)i * (size_t)rounds], done);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ the block driver
+ *
+ * RAD_DRAFT_BLOCK (block diffusion, e.g. DFlash2): one backbone pass over `block` positions (an
+ * anchor and `block - 1` masked slots) proposes `depth` tokens at once, with no rounds. `block` is
+ * the drafter's own: depth + 1 when the anchor row predicts nothing, depth when it does
+ * (rad_builder.h). Two passes:
+ *
+ *   Context pass: mirrors the trunk step just run. The drafter projects the trunk's tapped hidden
+ *   states and stores K and V for those positions in its own cache, over exactly the trunk's rows
+ *   in order.
+ *
+ *   Query pass: the drafter's layers over the block fill every masked position. Its own selector
+ *   writes the tokens to the plugin's `proposal` buffer, which is why RAD_DRAFT_BLOCK requires
+ *   one.
+ *
+ * Proposals go out through set_draft() like every other.
+ */
+int Engine::run_block_drafter(int step) {
+    if (drafter_.kind != RAD_DRAFT_BLOCK || drafter_.depth <= 0) return RAD_OK;
+
+    const int steps = drafter_.depth;
+    /* The row count is the drafter's (defaulted and checked by declare_drafter). */
+    const int block = drafter_.block > 0 ? (int)drafter_.block : drafter_.depth + 1;
+    std::vector<Scheduler::BlockRow> rows((size_t)cfg_.max_seqs);
+    const int n = sched_.block_begin(block, steps, (int)drafter_.window, drafter_.mask_token,
+                                  rows.data(), (int)rows.size());
+
+    Rank& r0 = *ranks_[0];
+    void* prop = r0.ctx.buf_ptr(drafter_.proposal);
+    if (!prop) {
+        RAD_ERR("drafter '%s': `%s` was declared as the proposal buffer but never planned",
+                drafter_.name, r0.program.buffers[drafter_.proposal].name.c_str());
+        return RAD_E_STATE;
+    }
+
+    /* Neither pass samples (no logits in the context pass; the query pass has its own selector),
+     * so the sampler chain is zero rows. */
+    auto run_pass = [&](const RadBatch* db, const char* what) -> int {
+        for (auto& rk : ranks_) {
+            int s = rk->sampler.build_greedy(0);
+            if (s < 0) {
+                RAD_ERR("drafter '%s': build_greedy: %s", drafter_.name, rad_strerror(s));
+                return s;
+            }
+        }
+        issue_what_.store(kIssueAll, std::memory_order_release);
+        step_batch_.store(db, std::memory_order_release);
+        barrier_->arrive_and_wait();
+        barrier_->arrive_and_wait();
+        const int s = step_status_.load(std::memory_order_acquire);
+        if (s < 0)
+            RAD_ERR("drafter '%s': %s pass of step %d failed: %s -- the engine cannot continue",
+                    drafter_.name, what, step, rad_strerror(s));
+        /* Probe after each pass; by the step loop's dump these buffers hold stale values. */
+        if (s >= 0) dump_buffers(r0.ctx, step, what);
+        return s;
+    };
+
+    /* The context pass runs even when nothing drafts: a mid-prompt sequence has hidden states the
+     * drafter will need, and skipping would leave a permanent hole in its cache. */
+    if (const RadBatch* cb = sched_.block_context(step)) RAD_TRY(run_pass(cb, "context"));
+
+    /* Cleared so a query batch that could not be built does not republish the previous step's
+     * proposals. */
+    draft_out_.clear();
+    if (n > 0) {
+        if (const RadBatch* qb = sched_.block_query(step)) {
+            RAD_TRY(run_pass(qb, "query"));
+            const int64_t n_raw = (int64_t)n * steps;
+            int32_t* const raw = readback_.reserve(n_raw);
+            if (!raw) return RAD_E_NOMEM;
+            RAD_TRY(rad_memcpy_async(raw, prop, n_raw * 4, r0.ctx.stream()));
+            RAD_TRY(rad_stream_sync(r0.ctx.stream()));
+            draft_out_.assign(raw, raw + n_raw);
+        }
+    }
+    sched_.block_end();
+    if (n <= 0 || draft_out_.empty()) return RAD_OK;
+
+    for (int i = 0; i < n; ++i) {
+        /* A request the sampler will not speculate on gets no draft; see finish_serial_drafter. */
+        if (!r0.sampler.allows_speculation(rows[(size_t)i].seq)) continue;
+        sched_.set_draft(rows[(size_t)i].seq, &draft_out_[(size_t)i * (size_t)steps], steps);
+    }
+    return RAD_OK;
+}
+
+}  /* namespace rad */

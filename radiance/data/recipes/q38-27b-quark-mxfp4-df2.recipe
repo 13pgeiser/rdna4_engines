@@ -1,0 +1,30 @@
+# q38-27b-quark-mxfp4-df2.recipe -- AMD's Quark AWQ-MXFP4 Qwen3.8-27B with the DFlash2 drafter.
+#
+#   rad-convert <amd/Qwen3.8-27B-Quark-AWQ-MXFP4> --draft-model <z-lab/Qwen3.8-27B-DFlash2> \
+#       --recipe q38-27b-quark-mxfp4-df2.recipe -o q38-27b-quark-mxfp4-df2.rad
+#
+# Quark's MXFP4 linears are read as `fp4_e2m1*e8m0[1x32]`, byte for byte, so no rule names them:
+# the trunk is served at the 4-bit weights Quark shipped, against E4M3 activations. The checkpoint
+# is served by the family's quantised plugin (qwen35_fp8). The delta net's a/b projection is
+# declared bf16, and every MXFP4 value is exact in bf16, so `cast` keeps Quark's values that way.
+# The target's head goes block fp8, as in q38-27b-fp8-df2.recipe.
+#
+# THE DRAFTER is made as small as its acceptance allows, since it is read whole on every decode step
+# and a draft is verified, so its precision moves acceptance and never an emitted token: its linears
+# at OCP-MXFP4 like the trunk, and a 2-bit copy of the target's head (u2 with a u8 zero, least-squares
+# clip search) whose top 32 the engine rescores against the target's fp8 head. Against fp8 linears
+# and an unsearched 2-bit head without the rescore, TP1 at depth 7: 108.9 -> 121.6 tok/s one
+# stream, 0.75 GiB less weight.
+
+blk.*.ssm_ab.weight                  cast dtype=bf16
+
+output.weight                        rtn  codes=fp8_e4m3 block=128x128 scale=bf16
+dflash.draft_head.weight             rtn  codes=u2 zero=u8 group=128 scale=f16 rule=search
+
+dflash.fc.weight                     rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_q.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_k.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_v.weight           rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.attn_output.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_gate_up.weight      rtn  codes=fp4_e2m1 group=32 scale=e8m0
+dflash.blk.*.ffn_down.weight         rtn  codes=fp4_e2m1 group=32 scale=e8m0

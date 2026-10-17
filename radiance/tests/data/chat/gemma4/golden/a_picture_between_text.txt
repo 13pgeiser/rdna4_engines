@@ -1,0 +1,6 @@
+<bos><|turn>system
+<|think|>
+<turn|>
+<|turn>user
+Describe<|image|>briefly.<turn|>
+<|turn>model

@@ -1,0 +1,23 @@
+# Qwen3.8-Flash-Next on one card: the production container of flashnext.yaml at --tp 1. The routed
+# experts that do not fit the card sit in a 42 GiB pinned host pool, so the process pins about
+# 49 GiB of host memory and wants a host with 64 GB of RAM; the n-gram table is read from the
+# model file on the drive.
+#
+# A prefill step copies every pooled expert across the link once, so one-card prefill is
+# link-bound; a 4096-token step amortises that copy over twice the tokens of a 2048-token one
+# (26K-token prompts: 2545 vs 1413 tok/s). The checkpoint interval matches the step because a
+# prefill chunk never crosses a checkpoint. At 4 sequences the cache holds 301K tokens, one and a
+# half 200K-token sessions.
+name: radiance-flashnext-tp1
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-flashnext-tp1
+    command: >
+      --model /models/qwen3.8-next-flash-fp8-iq4r-moe.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 1 --max-num-seqs 4 --max-model-len 200000
+      --placement expert_tiered --host-pool-mib 43000 --gpu-headroom-mib 96
+      --kv-cache-dtype fp8
+      --prefix-cache-mib 4096
+      --num-speculative-tokens 3 --max-num-batched-tokens 4096 --checkpoint-interval 4096
