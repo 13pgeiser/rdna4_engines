@@ -1460,6 +1460,22 @@ fn model_config_command(
     action: Option<ConfigAction>,
 ) -> Result<()> {
     let registry = load_registry(&paths.registry).registry;
+    model_config_command_to(
+        paths,
+        &registry,
+        model_name,
+        action,
+        &mut std::io::stdout(),
+    )
+}
+
+fn model_config_command_to(
+    paths: &Paths,
+    registry: &RegistryV1,
+    model_name: &str,
+    action: Option<ConfigAction>,
+    out: &mut dyn std::io::Write,
+) -> Result<()> {
     let (tag, entry) = registry
         .model(model_name)
         .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
@@ -1502,7 +1518,8 @@ fn model_config_command(
                         ))
                     })
                     .collect::<Result<serde_json::Map<_, _>>>()?;
-                println!(
+                writeln!(
+                    out,
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "scope": "model",
@@ -1513,14 +1530,15 @@ fn model_config_command(
                         "values": values,
                         "warnings": catalog.warnings,
                     }))?
-                );
+                )?;
             } else {
-                println!("Model configuration: {model_name}");
-                println!(
+                writeln!(out, "Model configuration: {model_name}")?;
+                writeln!(
+                    out,
                     "Catalog: {} ({:?})\n",
                     catalog.path.display(),
                     catalog.format
-                );
+                )?;
                 for schema in fields() {
                     let item = resolved
                         .get(schema.key)
@@ -1530,13 +1548,14 @@ fn model_config_command(
                     } else {
                         "inherited"
                     };
-                    println!(
+                    writeln!(
+                        out,
                         "  {:<43} {:<16} {:<9} {}",
                         schema.key,
                         item.value,
                         marker,
                         source_label(&item.source)
-                    );
+                    )?;
                 }
                 for warning in catalog.warnings {
                     eprintln!("warning: {warning}");
@@ -1554,7 +1573,8 @@ fn model_config_command(
                 .get(schema.key)
                 .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
             if output.json {
-                println!(
+                writeln!(
+                    out,
                     "{}",
                     serde_json::to_string(&serde_json::json!({
                         "model": model_name,
@@ -1563,9 +1583,9 @@ fn model_config_command(
                         "value": value.value,
                         "source": value.source,
                     }))?
-                );
+                )?;
             } else {
-                println!("{}", value.value);
+                writeln!(out, "{}", value.value)?;
             }
             Ok(())
         }
@@ -1579,7 +1599,7 @@ fn model_config_command(
                 .model_id(model_name)
                 .map(str::to_owned)
                 .unwrap_or_else(|| tag.clone().unwrap_or_else(|| model_name.to_owned()));
-            let local_path = find_model_path(paths, &registry, model_name);
+            let local_path = find_model_path(paths, registry, model_name);
             let (canonical, saved) = {
                 let record = loaded.catalog.models.entry(id.clone()).or_default();
                 if record.path.is_none() {
@@ -1598,12 +1618,13 @@ fn model_config_command(
                 (schema.key, saved)
             };
             write_catalog_toml(&paths.config, &loaded.catalog)?;
-            println!("{id} {canonical} = {saved}");
+            writeln!(out, "{id} {canonical} = {saved}")?;
             if loaded.format == CatalogFormat::LegacyJson {
-                println!(
+                writeln!(
+                    out,
                     "migrated model catalog to {}; preserved legacy JSON as rollback copies",
                     paths.config.models_toml.display()
-                );
+                )?;
             }
             Ok(())
         }
@@ -1613,7 +1634,7 @@ fn model_config_command(
             }
             let mut loaded = load_catalog(&paths.config)?;
             let Some(id) = loaded.catalog.model_id(model_name).map(str::to_owned) else {
-                println!("{model_name} has no per-model overrides");
+                writeln!(out, "{model_name} has no per-model overrides")?;
                 return Ok(());
             };
             let record = loaded.catalog.models.get_mut(&id).ok_or_else(|| {
@@ -1623,13 +1644,13 @@ fn model_config_command(
                 let schema = field(&key).ok_or_else(|| unknown_key(&key))?;
                 let existed = record.overrides.remove(schema.key)?.is_some();
                 if existed {
-                    println!("{id} {} override removed", schema.key);
+                    writeln!(out, "{id} {} override removed", schema.key)?;
                 } else {
-                    println!("{id} {} was already inherited", schema.key);
+                    writeln!(out, "{id} {} was already inherited", schema.key)?;
                 }
             } else {
                 record.overrides = ConfigLayer::default();
-                println!("all {id} overrides removed");
+                writeln!(out, "all {id} overrides removed")?;
             }
             write_catalog_toml(&paths.config, &loaded.catalog)?;
             Ok(())
@@ -1644,7 +1665,8 @@ fn model_config_command(
                 .get(schema.key)
                 .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
             if output.json {
-                println!(
+                writeln!(
+                    out,
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "model": model_name,
@@ -1655,22 +1677,23 @@ fn model_config_command(
                         "scope": schema.scope,
                         "help": schema.help,
                     }))?
-                );
+                )?;
             } else {
-                println!("{}", schema.key);
-                println!("  model:       {model_name}");
-                println!("  value:       {}", value.value);
-                println!("  source:      {}", source_label(&value.source));
-                println!("  scope:       {:?}", schema.scope);
-                println!("  about:       {}", schema.help);
+                writeln!(out, "{}", schema.key)?;
+                writeln!(out, "  model:       {model_name}")?;
+                writeln!(out, "  value:       {}", value.value)?;
+                writeln!(out, "  source:      {}", source_label(&value.source))?;
+                writeln!(out, "  scope:       {:?}", schema.scope)?;
+                writeln!(out, "  about:       {}", schema.help)?;
                 if !value.shadowed.is_empty() {
-                    println!("  shadowed:");
+                    writeln!(out, "  shadowed:")?;
                     for candidate in value.shadowed.iter().rev() {
-                        println!(
+                        writeln!(
+                            out,
                             "    {:<16} {}",
                             candidate.value,
                             source_label(&candidate.source)
-                        );
+                        )?;
                     }
                 }
             }
@@ -11213,6 +11236,151 @@ mod tests {
         assert!(direct.get("generation.max_tokens").is_none());
 
         fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// Drives `config <model> {list,set,reset}` against a fixture home and
+    /// records stdout plus the `models.toml` bytes after each step.
+    fn model_config_golden_transcript() -> String {
+        let paths = test_paths("model-config-golden");
+        fs::create_dir_all(&paths.root).unwrap();
+        fs::write(
+            &paths.config.config_toml,
+            "[generation]\nmax_tokens = 1234\n",
+        )
+        .unwrap();
+        let registry = RegistryV1::parse(
+            r#"{
+                "schema_version":1,
+                "generated_at":"2026-09-01T00:00:00Z",
+                "models":{
+                    "qwen3:8b":{"repo":"x","file":"qwen3-8b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"}
+                },
+                "aliases":{}
+            }"#,
+            "test",
+        )
+        .unwrap();
+        let root = paths.root.display().to_string();
+        let mut transcript = String::new();
+        let mut step = |label: &str, model: &str, action: ConfigAction| {
+            let mut out = Vec::new();
+            let result = model_config_command_to(&paths, &registry, model, Some(action), &mut out);
+            transcript.push_str(&format!("== {label}\n"));
+            transcript.push_str(&match result {
+                Ok(()) if label.starts_with("list") => {
+                    // The full list tracks the whole schema; pin the header and
+                    // the rows these steps change or inherit.
+                    const PINNED: [&str; 4] = [
+                        "generation.max_tokens",
+                        "generation.temperature",
+                        "memory.max_seq",
+                        "reasoning.effort",
+                    ];
+                    let mut kept = String::new();
+                    for line in String::from_utf8(out).unwrap().lines() {
+                        let key = line.split_whitespace().next().unwrap_or("");
+                        if !line.starts_with("  ") || PINNED.contains(&key) {
+                            kept.push_str(line);
+                            kept.push('\n');
+                        }
+                    }
+                    kept
+                }
+                Ok(()) => String::from_utf8(out).unwrap(),
+                Err(error) => format!("error: {error}\n"),
+            });
+            transcript.push_str("-- models.toml\n");
+            transcript.push_str(&fs::read_to_string(&paths.config.models_toml).unwrap_or_default());
+        };
+        let list = || ConfigAction::List(OutputArgs { json: false });
+        step("list", "qwen3:8b", list());
+        step(
+            "set reasoning.effort high",
+            "qwen3:8b",
+            ConfigAction::Set {
+                key: "reasoning.effort".into(),
+                value: "high".into(),
+            },
+        );
+        step("list after set", "qwen3:8b", list());
+        step(
+            "set alias key",
+            "qwen3:8b",
+            ConfigAction::Set {
+                key: "max_seq".into(),
+                value: "4096".into(),
+            },
+        );
+        step(
+            "set local model",
+            "local-thing.mq4",
+            ConfigAction::Set {
+                key: "generation.temperature".into(),
+                value: "0.5".into(),
+            },
+        );
+        step(
+            "set developer key",
+            "qwen3:8b",
+            ConfigAction::Set {
+                key: "developer.qwen4_moe_sym_iu4".into(),
+                value: "0".into(),
+            },
+        );
+        step(
+            "set process key",
+            "qwen3:8b",
+            ConfigAction::Set {
+                key: "kernel.iu4_prefill".into(),
+                value: "0".into(),
+            },
+        );
+        step(
+            "reset reasoning.effort",
+            "qwen3:8b",
+            ConfigAction::Reset {
+                key: Some("reasoning.effort".into()),
+            },
+        );
+        step(
+            "reset reasoning.effort again",
+            "qwen3:8b",
+            ConfigAction::Reset {
+                key: Some("reasoning.effort".into()),
+            },
+        );
+        step(
+            "reset unknown key",
+            "qwen3:8b",
+            ConfigAction::Reset {
+                key: Some("no.such.key".into()),
+            },
+        );
+        step(
+            "reset all",
+            "qwen3:8b",
+            ConfigAction::Reset { key: None },
+        );
+        step(
+            "reset model without overrides",
+            "never-seen",
+            ConfigAction::Reset { key: None },
+        );
+        step("list local after sets", "local-thing.mq4", list());
+        let transcript = transcript.replace(&root, "<ROOT>");
+        fs::remove_dir_all(&paths.root).unwrap();
+        transcript
+    }
+
+    #[test]
+    fn model_config_list_set_reset_output_is_stable() {
+        let transcript = model_config_golden_transcript();
+        // Captured from the handler before the set/reset logic moved into
+        // `hipfire_config`; the move must not change a byte.
+        assert_eq!(
+            transcript,
+            include_str!("../tests/fixtures/model_config_transcript.txt")
+        );
     }
 
     #[test]
