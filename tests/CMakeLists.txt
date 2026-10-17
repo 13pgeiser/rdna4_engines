@@ -506,13 +506,13 @@ endif()
 # Installs the build into a prefix, then configures, builds and installs every plugin directory
 # standalone against it with find_package(radiance). The result must match the tree's plugins,
 # vocabulary and registration, and serve rad-kbench's fixture through the installed tools
-# (tests/oot_plugins.sh). libr4d is included when the tree built it, with the same HIP compiler and
-# targets. Labelled `oot`: it rebuilds every plugin and takes minutes.
+# (tests/oot_plugins.sh). libr4d is included when the tree built it, with the same HIP compiler,
+# targets and RAD_HIP_VOPD_REPEATABLE. Labelled `oot`: it rebuilds every plugin and takes minutes.
 set(RAD_OOT_HIP "")
 if(RAD_HIP_FOUND AND TARGET libr4d)
   get_target_property(RAD_OOT_R4D_ARCH libr4d HIP_ARCHITECTURES)
   string(REPLACE ";" "\\;" RAD_OOT_R4D_ARCH "${RAD_OOT_R4D_ARCH}")
-  set(RAD_OOT_HIP ${CMAKE_HIP_COMPILER} "${RAD_OOT_R4D_ARCH}")
+  set(RAD_OOT_HIP ${CMAKE_HIP_COMPILER} "${RAD_OOT_R4D_ARCH}" ${RAD_HIP_VOPD_REPEATABLE})
 endif()
 add_test(NAME oot_plugins
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/oot_plugins.sh
