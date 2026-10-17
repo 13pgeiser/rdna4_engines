@@ -23,8 +23,8 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::{
-    field, memory::PleFormatRequest, mtp_k_default_for_arch, ConfigScope, ConfigSource,
-    ConfigValue, ResolvedConfig,
+    developer_env_for_key, field, memory::PleFormatRequest, mtp_k_default_for_arch, ConfigLayer,
+    ConfigScope, ConfigSource, ConfigValue, ResolvedConfig,
 };
 
 const KV_KEY: &str = "memory.kv_cache";
@@ -357,6 +357,116 @@ pub fn install_gpu_arch(root: &Path) -> Option<String> {
     let json: serde_json::Value = serde_json::from_str(&text).ok()?;
     let arch = json.get("gpu_arch")?.as_str()?.trim();
     (!arch.is_empty()).then(|| arch.to_owned())
+}
+
+/// Which layer set a key's value, as the Settings "From" column and
+/// `hipfire config list` name it (spec §3.2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "detail", rename_all = "kebab-case")]
+pub enum Origin {
+    /// Built-in default.
+    Default,
+    /// Built-in `auto` or arch-gated default resolved by an arch rule on this GPU.
+    DefaultArch(String),
+    /// The model's registry card.
+    Registry,
+    /// A named profile's bundle wrote it into config.toml.
+    Profile(String),
+    /// The applied tuning preset owns it in config.toml (attributed by
+    /// `tuning`; [`origin_of`] never returns it).
+    Preset,
+    /// You set it for all models (config.toml).
+    You,
+    /// Per-model value in models.toml.
+    ThisModel,
+    /// An environment variable of this process; the UI locks the row.
+    Env(String),
+    /// A one-shot command-line argument.
+    OneShot,
+}
+
+impl Origin {
+    /// Short "From" label: `default`, `default · gfx1201`, `registry`,
+    /// `profile dev`, `preset`, `you`, `this model`, `env HIPFIRE_KV_MODE`.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Default => "default".into(),
+            Self::DefaultArch(arch) => format!("default · {arch}"),
+            Self::Registry => "registry".into(),
+            Self::Profile(name) => format!("profile {name}"),
+            Self::Preset => "preset".into(),
+            Self::You => "you".into(),
+            Self::ThisModel => "this model".into(),
+            Self::Env(name) => format!("env {name}"),
+            Self::OneShot => "one-shot".into(),
+        }
+    }
+
+    /// Stable machine name (`list --json` "origin").
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Default | Self::DefaultArch(_) => "default",
+            Self::Registry => "registry",
+            Self::Profile(_) => "profile",
+            Self::Preset => "preset",
+            Self::You => "you",
+            Self::ThisModel => "model",
+            Self::Env(_) => "env",
+            Self::OneShot => "one-shot",
+        }
+    }
+
+    /// The value was set by something other than the defaults or the model
+    /// card (the `●` marker).
+    pub fn marked(&self) -> bool {
+        !matches!(self, Self::Default | Self::DefaultArch(_) | Self::Registry)
+    }
+}
+
+/// Attribute `key`'s value to a layer. `profile` is the detected profile
+/// (`detect_config_profile`) and its bundle (`load_config_profile`): a global
+/// value equal to that bundle's reads `profile <name>`, any other global
+/// value reads `you`. Preset ownership is layered on top by `tuning`.
+pub fn origin_of(
+    key: &str,
+    resolved: &ResolvedConfig,
+    effective: &Effective,
+    ctx: &ArchCtx,
+    profile: Option<(&str, &ConfigLayer)>,
+) -> Origin {
+    let canonical = crate::canonical_config_key(key).unwrap_or_else(|| key.to_owned());
+    let Some(slot) = resolved.get(&canonical) else {
+        return builtin_origin(effective, ctx);
+    };
+    match &slot.source {
+        ConfigSource::BuiltIn => builtin_origin(effective, ctx),
+        ConfigSource::RegistryModel { .. } | ConfigSource::RegistryTarget { .. } => {
+            Origin::Registry
+        }
+        ConfigSource::GlobalUser { .. } => match profile {
+            Some((name, bundle)) if bundle.get(&canonical) == Some(&slot.value) => {
+                Origin::Profile(name.to_owned())
+            }
+            _ => Origin::You,
+        },
+        ConfigSource::ModelUser { .. } => Origin::ThisModel,
+        ConfigSource::LegacyEnv { name } => Origin::Env(
+            field(&canonical)
+                .and_then(|schema| schema.env_compat.map(str::to_owned))
+                .or_else(|| developer_env_for_key(&canonical))
+                .unwrap_or_else(|| name.clone()),
+        ),
+        ConfigSource::OneShot { .. } => Origin::OneShot,
+    }
+}
+
+fn builtin_origin(effective: &Effective, ctx: &ArchCtx) -> Origin {
+    match ctx.gpu_arch.as_deref() {
+        Some(arch) if effective.by_arch_rule && !arch.is_empty() => {
+            Origin::DefaultArch(arch.to_owned())
+        }
+        _ => Origin::Default,
+    }
 }
 
 /// One option of a virtual row: the key writes that select it.
@@ -920,5 +1030,60 @@ mod tests {
         .unwrap();
         assert_eq!(install_gpu_arch(&root).as_deref(), Some("gfx1151"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn origin_labels_each_layer() {
+        let gfx1201 = ctx("gfx1201");
+        let resolved = defaults();
+        let kv = effective("memory.kv_cache", &resolved, &gfx1201);
+        let origin = origin_of("memory.kv_cache", &resolved, &kv, &gfx1201, None);
+        assert_eq!(origin, Origin::DefaultArch("gfx1201".into()));
+        assert_eq!(origin.label(), "default · gfx1201");
+        assert!(!origin.marked());
+        let effort = effective("reasoning.effort", &resolved, &gfx1201);
+        assert_eq!(
+            origin_of("reasoning.effort", &resolved, &effort, &gfx1201, None),
+            Origin::Default
+        );
+
+        let mut env = ConfigLayer::default();
+        env.set("memory.kv_cache", ConfigValue::String("q8".into()))
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::LegacyEnv {
+                name: "HIPFIRE_*".into(),
+            },
+            layer: env,
+        }])
+        .unwrap();
+        let kv = effective("memory.kv_cache", &resolved, &gfx1201);
+        let origin = origin_of("memory.kv_cache", &resolved, &kv, &gfx1201, None);
+        assert_eq!(origin.label(), "env HIPFIRE_KV_MODE");
+        assert!(origin.marked());
+
+        let resolved = resolve([user_layer(&[(
+            "reasoning.effort",
+            ConfigValue::String("low".into()),
+        )])])
+        .unwrap();
+        let effort = effective("reasoning.effort", &resolved, &gfx1201);
+        assert_eq!(
+            origin_of("reasoning.effort", &resolved, &effort, &gfx1201, None),
+            Origin::You
+        );
+        let mut bundle = ConfigLayer::default();
+        bundle
+            .set("reasoning.effort", ConfigValue::String("low".into()))
+            .unwrap();
+        let origin = origin_of(
+            "reasoning.effort",
+            &resolved,
+            &effort,
+            &gfx1201,
+            Some(("dev", &bundle)),
+        );
+        assert_eq!(origin.label(), "profile dev");
+        assert_eq!(origin.kind(), "profile");
     }
 }
