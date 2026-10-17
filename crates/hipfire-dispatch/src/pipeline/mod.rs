@@ -45,7 +45,7 @@ pub use layer_ops::{
     execute_indexed_attention_uncovered, execute_lm_head, execute_project, gdn_qkv_projection_bf16,
     project_weight, project_weights, qsa_projection_hook_installed, reset_qsa_projection_slot,
     set_qsa_projection_hook, validate_lm_head, BroadcastAddOp, ClearOp, CoreWindow, DenseFfnOp,
-    DenseFfnRecipe, EmbeddingOp, GatedDeltaNetOp, GdnRowCapture, GdnTrunkArenas,
+    DenseFfnRecipe, EmbeddingOp, GatedDeltaNetOp, GatedShortConvOp, GdnRowCapture, GdnTrunkArenas,
     GroupedDepthwiseOp, HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode,
     IndexedAttentionOp, IndexedAttentionState, MixerPhase, ProjectOp, QsaProjectionHook,
     QsaTrunkArenas,
