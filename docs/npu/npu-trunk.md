@@ -440,11 +440,29 @@ Runtime `CalKey` derives:
   sysfs/proc ABI. Schema 3 and later (including 4) therefore drop `perfopt_armed`, rather than inventing
   a boolean from a kernel name. Recollect if boot arming changes under the same
   release: this key cannot distinguish that case.
-* `model_index_sha256`: HFQ bytes `[0,data_offset)`, using
-  `HfqFile::index_sha256`, exactly the trunk-overlay binding convention.
-  The verified local `qwen3.8-flash-next-gptq3.mq4` has `data_offset=14442496`
-  and index SHA256 `8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013`.
-  No 125-GB full-file hash is computed at load.
+* `model_trunk_index_sha256`: `model_trunk_index_sha256(&HfqFile)`, an index-only
+  digest of what the NPU trunk depends on, equal for a monolithic MQ4 and its
+  split MQ4 XTS base. Preimage (little-endian): domain
+  `hipfire-npu-trunk-index-v1\0`; `u32` arch id; `u64` length + canonical
+  metadata JSON (effective metadata without the top-level `hipfire_ple_rows`
+  marker, compact, object keys sorted at every depth); `u64` tensor count, then
+  per tensor sorted by name: `u32` name length + name, `u8` quant type,
+  `u32` dim count + `u32` dims, `u64` data size. Only the 128 PLE shard tensors
+  `model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_N.weight`
+  (canonical decimal `N`) are excluded; offsets and tensor payloads never enter.
+  Both the verified local `qwen3.8-flash-next-gptq3.mq4` and its split XTS base
+  digest to `098bd75fd3a6a5174d06033f2b3ec7febeb7777e7eba4696b64cecca5e3418b6`.
+  CPU proof (`cargo test -p hipfire-arch-qwen4 npu_trunk::calibration`): the always-on
+  `split_and_monolithic_resolve_the_same_calibration_admission_and_pairs` builds a
+  monolithic and a split HFQ fixture and runs the shared `bind_builtin`,
+  `auto_admission`, `select_families`, `crossover`, `plan_executable` and
+  `executable_plan_for` for both; family mask, eligibility table and the executable
+  16K/64K pair ranges must equal the built-in record's. With
+  `NPU_TRUNK_TEST_MODELS=<monolithic>:<split base>` the same comparison runs on the
+  real artifacts (it requires one of each layout; unset skips).
+  The trunk-overlay and expert-hot-set bindings keep the raw
+  `HfqFile::index_sha256` over bytes `[0,data_offset)`. No full-file hash is
+  computed at load.
 * `epilogue`: serving uses `bf16`; `trunk_route`: `stock` or
   `overlay:<marker>` from the **successful overlay outcome**, not its presence.
 
@@ -625,7 +643,7 @@ the normal path: `halo-xdna2-overlay-v4.json` (`overlay:gfx1151-zab-v1`) or
 keyed stock, and measured for `hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1`.
 Invalid/unreadable files never fall back. Successful arming logs
 `cal_source=file|builtin`. A file must match every key field. The built-in
-record binds on the hard fields only (`device.arch`, `build`, `model_index_sha256`,
+record binds on the hard fields only (`device.arch`, `build`, `model_trunk_index_sha256`,
 `epilogue`, `trunk_route`; `Calibration::bind_builtin`): it takes this host's
 `device.pci_bdf` (the GPU's PCI address, not an NPU slot), `device.npu_fw_version`
 and `kernel.uname_release`, keeps `margin` 0.0, and when any of them differed the
@@ -634,7 +652,7 @@ load logs one line
 The speed it predicts for another kernel/firmware is corrected by the live rate
 scales below, not by a margin. The reference key is
 gfx1151, the reference unit's GPU PCI address (`device.pci_bdf` in the built-in record), firmware `1.1.2.65`, uname `7.3.0-rc7-perfopt+`,
-model index `8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013`,
+model index `098bd75fd3a6a5174d06033f2b3ec7febeb7777e7eba4696b64cecca5e3418b6`,
 BF16 and the matching stock/overlay route; the builtin does not admit another
 arch, build, model, epilogue or route.
 

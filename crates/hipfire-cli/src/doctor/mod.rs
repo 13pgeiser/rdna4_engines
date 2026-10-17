@@ -975,7 +975,7 @@ mod tests {
         iommu_npu: "identity",
         amdxdna: "in-tree",
         npu_fw: "1.1.2.65",
-        model_index_sha256: REFERENCE_INDEX,
+        model_trunk_index_sha256: REFERENCE_INDEX,
         kernels: &["pack:v0.4.3@fedcba987654"],
     }];
 
@@ -987,7 +987,7 @@ mod tests {
         iommu_npu: "identity",
         amdxdna: "in-tree",
         npu_fw: "1.1.2.65",
-        model_index_sha256: REFERENCE_INDEX,
+        model_trunk_index_sha256: REFERENCE_INDEX,
         kernels: &[],
     }];
 
@@ -1508,10 +1508,10 @@ mod tests {
         assert!(!text.contains(FAKE_USER), "{text}");
         assert!(!text.contains("0000:"), "{text}");
         assert!(!text.contains(probe_root_name(&probe)), "{text}");
-        // Only a tag and the index sha identify the model.
+        // Only a tag and the trunk index digest identify the model.
         let report = json(&run);
         assert_eq!(report["model"]["tag"], "qwen3.8:flash-next");
-        assert_eq!(report["model"]["index_sha256"], REFERENCE_INDEX);
+        assert_eq!(report["model"]["model_trunk_index_sha256"], REFERENCE_INDEX);
         assert_eq!(report["model"]["calibration"], "builtin");
         assert_eq!(report["npu_trunk"], "auto");
     }

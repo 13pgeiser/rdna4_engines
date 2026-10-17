@@ -28,7 +28,7 @@ pub(crate) use programs::build_rowmajor_programs_for_families;
 pub use calibration::{
     CalKey, Calibration, ContentionCalibration, DeviceKey, FamilyCalibration, GlueCalibration,
     GpuCalibration, KernelKey, NpuCalibration, OutFamily, QsaOrder, CALIBRATION_SCHEMA_VERSION,
-    calibration_build_identity, calibration_key, runtime_calibration_key, model_index_identity,
+    calibration_build_identity, calibration_key, runtime_calibration_key, model_index_identity, model_trunk_index_sha256,
 };
 pub use plan::{
     bank_segments, bank_segments_moved, contention_extra, crossover, gpu_chunk, load_log_line, npu_ms,

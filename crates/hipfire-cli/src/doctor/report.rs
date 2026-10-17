@@ -97,8 +97,9 @@ pub(crate) struct Host {
 pub(crate) struct Model {
     /// Registry tag when the file is a registry model, else `None` (never a path).
     pub tag: Option<String>,
-    /// Lowercase hex sha256 of the HFQ header/index span.
-    pub index_sha256: String,
+    /// `model_trunk_index_sha256` of the model (lowercase hex): the normalized, PLE-shard-agnostic
+    /// NPU trunk index digest, not the raw header-span hash.
+    pub model_trunk_index_sha256: String,
     /// `"builtin"` or `"file"`: which calibration record admits this model.
     pub calibration: &'static str,
 }

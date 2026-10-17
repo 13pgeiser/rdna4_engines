@@ -19,8 +19,8 @@ pub(crate) struct Profile {
     pub iommu_npu: &'static str,
     pub amdxdna: &'static str,
     pub npu_fw: &'static str,
-    /// Header index sha256 of the pinned model artifact.
-    pub model_index_sha256: &'static str,
+    /// NPU trunk index digest of the pinned model artifact.
+    pub model_trunk_index_sha256: &'static str,
     /// Kernel sets validated on this host: `pack:<tag>@<commit12>` / `jit:<commit12>` match exactly; a bare
     /// `pack:<tag>` matches that release pack at any commit ([`kernel_set_listed`]).
     pub kernels: &'static [&'static str],
@@ -34,7 +34,7 @@ pub(crate) const PROFILES: &[Profile] = &[Profile {
     iommu_npu: "identity",
     amdxdna: "in-tree",
     npu_fw: "1.1.2.65",
-    model_index_sha256: "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013",
+    model_trunk_index_sha256: "098bd75fd3a6a5174d06033f2b3ec7febeb7777e7eba4696b64cecca5e3418b6",
     // The Halo P0 `doctor --npu` run (j1356) validated this row; pinned to the v0.4.3 release pack by tag, since the
     // release commit cannot name its own hash.
     kernels: &["pack:v0.4.3"],
@@ -78,7 +78,7 @@ fn differences(profile: &Profile, host: &Host, model_sha: Option<&str>) -> Vec<P
     field("npu_fw", profile.npu_fw, &host.npu_fw);
     field(
         "model",
-        profile.model_index_sha256,
+        profile.model_trunk_index_sha256,
         model_sha.unwrap_or("unknown"),
     );
     if !kernel_set_listed(profile.kernels, &host.kernels) {
@@ -156,7 +156,7 @@ mod tests {
             iommu_npu: "DMA-FQ",
             amdxdna: "in-tree",
             npu_fw: "1.1.0.0",
-            model_index_sha256: "aa",
+            model_trunk_index_sha256: "aa",
             kernels: &[KERNEL_SET],
         },
         Profile {
@@ -166,7 +166,7 @@ mod tests {
             iommu_npu: "identity",
             amdxdna: "in-tree",
             npu_fw: "1.1.2.65",
-            model_index_sha256: "bb",
+            model_trunk_index_sha256: "bb",
             kernels: &[KERNEL_SET, "jit:ffffffffffff"],
         },
     ];
@@ -266,7 +266,7 @@ mod tests {
         assert_eq!(first.id, "hipx");
         assert_eq!(first.kernel, "7.3.0-rc7-perfopt+");
         assert_eq!(first.npu_fw, "1.1.2.65");
-        assert_eq!(first.model_index_sha256.len(), 64);
+        assert_eq!(first.model_trunk_index_sha256.len(), 64);
         assert_eq!(first.kernels, ["pack:v0.4.3"]);
         let host = |kernels: &str| Host {
             kernel: first.kernel.into(),
@@ -283,7 +283,7 @@ mod tests {
             PROFILES,
             false,
             &host("pack:v0.4.3@0123456789ab"),
-            Some(first.model_index_sha256),
+            Some(first.model_trunk_index_sha256),
         );
         assert_eq!(reference.tier, Tier::Reference);
         assert_eq!(reference.profile, Some("hipx"));
@@ -292,7 +292,7 @@ mod tests {
                 PROFILES,
                 false,
                 &host(other),
-                Some(first.model_index_sha256),
+                Some(first.model_trunk_index_sha256),
             );
             assert_eq!(assessment.tier, Tier::CompatibleUnvalidated, "{other}");
             assert_eq!(fields(&assessment), ["kernels"]);

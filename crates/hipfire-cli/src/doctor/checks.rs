@@ -92,9 +92,9 @@ pub(crate) trait HostProbe {
     fn sudo_n_available(&self) -> bool;
     /// Local Flash-Next-class model files, the registry tag's file first.
     fn local_models(&self) -> Vec<LocalModelFile>;
-    /// Header index sha256 (lowercase hex) of a model file.
-    fn index_sha256(&self, path: &Path) -> Option<String>;
-    /// `(model_index_sha256, "file" | "builtin")` of every calibration the
+    /// NPU trunk index digest (`model_trunk_index_sha256`, lowercase hex) of a model file.
+    fn model_trunk_index_sha256(&self, path: &Path) -> Option<String>;
+    /// `(model_trunk_index_sha256, "file" | "builtin")` of every calibration the
     /// engine could pick for the stock and overlay routes.
     fn calibration_records(&self) -> Result<Vec<(String, &'static str)>, String>;
 }
@@ -119,7 +119,9 @@ impl Outcome {
 
     /// Index sha of the matched model, for the profile comparison.
     pub(crate) fn model_sha(&self) -> Option<&str> {
-        self.model.as_ref().map(|model| model.index_sha256.as_str())
+        self.model
+            .as_ref()
+            .map(|model| model.model_trunk_index_sha256.as_str())
     }
 }
 
@@ -327,7 +329,7 @@ fn kernel_set(probe: &dyn HostProbe, daemon: Option<&Path>) -> String {
 
 struct Matched {
     file: LocalModelFile,
-    index_sha256: String,
+    model_trunk_index_sha256: String,
     calibration: &'static str,
 }
 
@@ -343,18 +345,18 @@ fn model(probe: &dyn HostProbe) -> (Check, Option<Matched>) {
     let candidates = probe.local_models();
     let mut seen = Vec::new();
     for file in &candidates {
-        let Some(sha) = probe.index_sha256(&file.path) else {
+        let Some(sha) = probe.model_trunk_index_sha256(&file.path) else {
             continue;
         };
         if let Some((_, calibration)) = records.iter().find(|(admitted, _)| *admitted == sha) {
             let shown = file.tag.as_deref().unwrap_or("local model");
             let detail = format!(
-                "{shown}, index sha256 {}…, {calibration} calibration",
+                "{shown}, trunk index sha256 {}…, {calibration} calibration",
                 &sha[..8]
             );
             let matched = Matched {
                 file: file.clone(),
-                index_sha256: sha,
+                model_trunk_index_sha256: sha,
                 calibration: *calibration,
             };
             return (pass("model", detail), Some(matched));
@@ -365,7 +367,7 @@ fn model(probe: &dyn HostProbe) -> (Check, Option<Matched>) {
         "no local Flash-Next (arch 16) model".to_owned()
     } else {
         format!(
-            "{} local Flash-Next model(s), none matches a calibration (index sha256 {})",
+            "{} local Flash-Next model(s), none matches a calibration (trunk index sha256 {})",
             seen.len(),
             seen.join(", ")
         )
@@ -499,7 +501,7 @@ pub(crate) fn run(probe: &dyn HostProbe) -> Outcome {
     };
     let model = matched.as_ref().map(|matched| Model {
         tag: matched.file.tag.clone(),
-        index_sha256: matched.index_sha256.clone(),
+        model_trunk_index_sha256: matched.model_trunk_index_sha256.clone(),
         calibration: matched.calibration,
     });
     let mut outcome = Outcome {
@@ -533,7 +535,7 @@ pub(crate) mod testing {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     pub(crate) const REFERENCE_INDEX: &str =
-        "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013";
+        "098bd75fd3a6a5174d06033f2b3ec7febeb7777e7eba4696b64cecca5e3418b6";
     /// Appears in every fake model/daemon path; must never reach a report.
     pub(crate) const FAKE_USER: &str = "fakeuser";
 
@@ -723,7 +725,7 @@ pub(crate) mod testing {
         fn local_models(&self) -> Vec<LocalModelFile> {
             self.models.iter().map(|(file, _)| file.clone()).collect()
         }
-        fn index_sha256(&self, path: &Path) -> Option<String> {
+        fn model_trunk_index_sha256(&self, path: &Path) -> Option<String> {
             self.models
                 .iter()
                 .find(|(file, _)| file.path == path)
@@ -808,7 +810,7 @@ mod tests {
             }
         );
         let model = outcome.model.as_ref().unwrap();
-        assert_eq!(model.index_sha256, REFERENCE_INDEX);
+        assert_eq!(model.model_trunk_index_sha256, REFERENCE_INDEX);
         assert_eq!(model.calibration, "builtin");
         assert_eq!(outcome.npu_trunk, "auto");
     }

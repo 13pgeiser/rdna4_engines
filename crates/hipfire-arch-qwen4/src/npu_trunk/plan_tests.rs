@@ -12,7 +12,7 @@ fn cal(name: &str) -> Calibration {
     // Python's legacy get('panel_cols', 1), not a production input default.
     if v["npu"].get("panel_cols").is_none() { v["npu"]["panel_cols"] = json!(1); }
     v["margin"] = json!(0);
-    v["key"] = json!({"device":{"arch":"gfx1151","pci_bdf":"0000:c0:00.0","npu_fw_version":"fixture"},"build":"fixture","kernel":{"uname_release":"fixture"},"model_index_sha256":"0000000000000000000000000000000000000000000000000000000000000000","epilogue":v["npu"]["epilogue"],"trunk_route":"stock"});
+    v["key"] = json!({"device":{"arch":"gfx1151","pci_bdf":"0000:c0:00.0","npu_fw_version":"fixture"},"build":"fixture","kernel":{"uname_release":"fixture"},"model_trunk_index_sha256":"0000000000000000000000000000000000000000000000000000000000000000","epilogue":v["npu"]["epilogue"],"trunk_route":"stock"});
     v["glue"]["consume_mode"] = json!("direct");
     v["glue"]["consume_ms_per_col_8192"] = json!({"bf16":2.85/16480.0,"f32":4.60/16480.0});
     for name in ["qkv", "zab", "q", "kvidx"] {
@@ -77,7 +77,10 @@ fn golden(names: &str) {
         ("device.arch", |k| k.device.arch += "x"), ("device.pci_bdf", |k| k.device.pci_bdf += "x"),
         ("device.npu_fw_version", |k| k.device.npu_fw_version += "x"), ("build", |k| k.build += "x"),
         ("kernel.uname_release", |k| k.kernel.uname_release += "x"),
-        ("model_index_sha256", |k| k.model_index_sha256 += "x"), ("epilogue", |k| k.epilogue += "x"),
+        ("model_trunk_index_sha256", |k| {
+            k.model_trunk_index_sha256 += "x"
+        }),
+        ("epilogue", |k| k.epilogue += "x"),
         ("trunk_route", |k| k.trunk_route += "x"),
     ];
     for (field, mutate) in mutations {
@@ -226,13 +229,20 @@ fn npu_trunk_v2_rejects_missing_invalid_fields() {
 
 #[test]
 fn npu_trunk_runtime_key_is_cheap_deterministic_metadata() {
-    let digest = "8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013";
-    let key = calibration_key("gfx1151", "0000:C0:00.0", "1.1.2.65\n", "7.3.0-rc7-perfopt+\n", digest, "overlay:gfx1151-zab-v1");
+    let digest = "098bd75fd3a6a5174d06033f2b3ec7febeb7777e7eba4696b64cecca5e3418b6";
+    let key = calibration_key(
+        "gfx1151",
+        "0000:C0:00.0",
+        "1.1.2.65\n",
+        "7.3.0-rc7-perfopt+\n",
+        digest,
+        "overlay:gfx1151-zab-v1",
+    );
     assert_eq!(key.device.pci_bdf, "0000:c0:00.0");
     assert_eq!(key.device.npu_fw_version, "1.1.2.65");
     assert_eq!(key.kernel.uname_release, "7.3.0-rc7-perfopt+");
     assert_eq!(key.build, "hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1");
-    assert_eq!(key.model_index_sha256, digest);
+    assert_eq!(key.model_trunk_index_sha256, digest);
     assert_eq!(key.trunk_route, "overlay:gfx1151-zab-v1");
     assert_eq!(key, calibration_key("gfx1151", "0000:c0:00.0", "1.1.2.65", "7.3.0-rc7-perfopt+", digest, "overlay:gfx1151-zab-v1"));
 }

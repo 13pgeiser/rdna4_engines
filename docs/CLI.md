@@ -581,7 +581,7 @@ The command is Linux only. It reads Linux sysfs, proc and device nodes, so on an
 | `memlock` | yes | `RLIMIT_MEMLOCK` (soft and hard), `CAP_IPC_LOCK` and the process's `VmPin`. Passes when the soft or the hard limit (unlimited counts) covers `VmPin` plus the bytes the armed trunk pins, or when `CAP_IPC_LOCK` is held. | A bounded limit sized from the requirement, not `infinity`: the fix line gives the systemd `LimitMEMLOCK`, the `limits.d` and the `ulimit -l` values. See [Host memlock limit](npu/npu-trunk.md#host-memlock-limit). |
 | `rocm_runtime` | yes | A ROCm root that holds the HIP runtime library (`libamdhip64`). | The ROCm install guidance, printed in the fix line. |
 | `daemon` | yes | Finds `hipfire-daemon` and runs `hipfire-daemon --version` (5 s limit). Passing needs only that the daemon is found; the detail is its version line when it answers. | `hipfire setup` |
-| `model` | yes | The local Flash-Next models (HFQ architecture 16). A model passes when the SHA-256 of its header index equals a calibration record: the built-in records for the `stock` and `overlay:gfx1151-zab-v1` routes, or the override `npu-trunk/calibration.json`. | `hipfire pull qwen3.8:flash-next` |
+| `model` | yes | The local Flash-Next models (HFQ architecture 16). A model passes when its NPU trunk index digest (`model_trunk_index_sha256`) equals a calibration record: the built-in records for the `stock` and `overlay:gfx1151-zab-v1` routes, or the override `npu-trunk/calibration.json`. | `hipfire pull qwen3.8:flash-next` |
 | `gpu_free` | yes | Whether `hipfire serve` is running (`serve.pid`) and a non-blocking probe of the GPU's lock file. Reports `INFO` and skips when there is no gfx1151 GPU. | `hipfire stop` |
 | `npu_trunk_config` | no | The effective `fusions.npu_trunk`. | None. |
 | `fclk` | no | The fabric clock state of the GPU (pinned or automatic) and whether it could be pinned without a password (writable attributes or `sudo -n`). Serving runs it on automatic. | None. |
@@ -604,7 +604,7 @@ A profile row holds these fields. The report compares each against the host:
 | `iommu.npu` | IOMMU group domain type of `accel0`. | `identity` |
 | `amdxdna` | The out-of-tree driver version, or `in-tree`. | `in-tree` |
 | `npu_fw` | The NPU firmware version (`fw_version`). | `1.1.2.65` |
-| `model` | The SHA-256 of the matched model's header index. | `8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013` |
+| `model` | The NPU trunk index digest of the matched model (`model_trunk_index_sha256`: index-only, equal for a monolithic MQ4 and its split XTS base). | `098bd75fd3a6a5174d06033f2b3ec7febeb7777e7eba4696b64cecca5e3418b6` |
 | `kernels` | The kernel set the daemon will run (below). | `pack:v0.4.3` (the v0.4.3 release pack, at its release commit). |
 
 The kernel set is `pack:<tag>@<commit12>` when the install holds a kernel pack with a recorded `<arch>.manifest.json` for gfx1151 (written by `hipfire kernel-pack install`), or `jit:<commit12>` from the third word of `hipfire-daemon --version` when it does not; `commit12` is the first 12 hex digits of the commit. It is `unknown` when neither is available. A row lists the kernel sets validated on it: an entry `pack:<tag>` matches that release's pack at any commit (a release commit cannot name its own hash), and any other entry matches only itself. A kernel set that no row lists makes the host `compatible-unvalidated` by itself, even when every other field matches; JIT kernels (`jit:<commit12>`) are never the reference on `hipx`, which is pinned to the v0.4.3 release pack. The profile id and differences are in the report as `profile` and `profile_diff`.
@@ -651,7 +651,7 @@ changes no setting and writes no file
 | `profile_diff` | List of `{field, reference, found}`; empty for `reference` and `blocked`. |
 | `host` | `gpu_arch`, `npu`, `kernel`, `iommu` (`gpu`, `npu`), `amdxdna`, `npu_fw`, `kernels`, `memlock` (`soft`, `hard`, `required`, `cap_ipc_lock`; `null` is unlimited) and `fclk` (`pinned`, `pinnable`). |
 | `checks` | List of `{id, status, detail}` with `fix` on a failure or a warning; `status` is `pass`, `fail`, `warn` or `info`. |
-| `model` | `tag`, `index_sha256` and `calibration` (`builtin` or `file`, the record that admitted it); absent when no model matched. |
+| `model` | `tag`, `model_trunk_index_sha256` and `calibration` (`builtin` or `file`, the record that admitted it); absent when no model matched. |
 | `npu_trunk` | The effective `fusions.npu_trunk`. |
 | `calibration` | Absent when none ran. `armed`, `off_reason`, `trunk_route`, `sizes` (per size: `rows`, `off` and `auto` as `samples_ms` and `median_ms`, `saved_pct`, `spread_pct`, `verdict`), `rate_scales`, `npu_wait_per_pair`, `guard_trips`, `exactness` (`verdict`, `prompt_rows`, `tokens`, `first_difference`) and `duration_s`. |
 | `calibration_skipped` | Why no calibration ran: blocked, `declined`, not confirmed (no terminal), soak mode or failed. |

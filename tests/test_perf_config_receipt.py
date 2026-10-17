@@ -57,11 +57,13 @@ OVERLAY_NOT_APPLIED_1201 = (
     "(overlay default gfx1151-zab-v1 is gfx1151 only; HIPFIRE_QWEN4_TRUNK_OVERLAY=1 applies it)"
 )
 
+# Synthetic log line: the script only parses it. `cal_sha256` is an opaque sample digest, not the hash of
+# the current built-in record, so it is deliberately not regenerated when the calibration key changes.
 NPU_AUTO_HALO = (
     'npu-trunk: mode=auto contract=bf16 families=qkv,zab,q,kvidx '
     'cal_key={"device":{"arch":"gfx1151","pci_bdf":"0000:c0:00.0","npu_fw_version":"1.1.2.65"},'
     '"build":"hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1","kernel":{"uname_release":"7.3.0-rc7-perfopt+"},'
-    '"model_index_sha256":"8703bb1626ff48b976a84d5f4f7d18b4aad8e9d1d9b780a52f963d73cb83c013",'
+    '"model_trunk_index_sha256":"098bd75fd3a6a5174d06033f2b3ec7febeb7777e7eba4696b64cecca5e3418b6",'
     '"epilogue":"bf16","trunk_route":"overlay:gfx1151-zab-v1"} '
     "cal_sha256=b3cbbcba42068ed2f9b6bd43f64876c95ccf08cbdf107903c31de4dfe7015bfd"
 )

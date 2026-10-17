@@ -274,14 +274,8 @@ impl HostProbe for SystemProbe<'_> {
         preferred
     }
 
-    fn index_sha256(&self, path: &Path) -> Option<String> {
-        use std::fmt::Write;
-        let hash = HfqFile::open(path).ok()?.index_sha256().ok()?;
-        let mut hex = String::with_capacity(64);
-        for byte in hash {
-            write!(hex, "{byte:02x}").ok()?;
-        }
-        Some(hex)
+    fn model_trunk_index_sha256(&self, path: &Path) -> Option<String> {
+        npu_trunk::model_trunk_index_sha256(&HfqFile::open(path).ok()?).ok()
     }
 
     fn calibration_records(&self) -> Result<Vec<(String, &'static str)>, String> {
@@ -290,7 +284,10 @@ impl HostProbe for SystemProbe<'_> {
         for route in ROUTES {
             let (calibration, source) = Calibration::load_with_builtin(&path, route)?;
             let record = (
-                calibration.key.model_index_sha256.to_ascii_lowercase(),
+                calibration
+                    .key
+                    .model_trunk_index_sha256
+                    .to_ascii_lowercase(),
                 source,
             );
             if !records.contains(&record) {
