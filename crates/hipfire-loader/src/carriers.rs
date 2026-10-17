@@ -218,43 +218,64 @@ fn ple_prewarm_off_reason(available: Option<u64>, explicit_zero: bool) -> String
     }
 }
 
-/// Default (`auto`) q4 PLE table prewarm: the hottest 15 GiB of rows (about
-/// as many rows as 28 GB of Q8), the knee of the warm-rows value curve.
-const PLE_PREWARM_AUTO_BYTES: u64 = 15 << 30;
-
-/// Host RAM an `auto` PLE table prewarm leaves free. Larger than the hot-row
-/// store's reserve: on Halo (MemAvailable ~24 GiB at ready) prewarming the
-/// whole 26.8 GiB q4 table pushed reclaim into the request, and Ciru 8K fell
-/// to 1,734 tok/s from 1,828 at 15 GiB.
+/// Host RAM an `auto` PLE table prewarm leaves free to protect the unified
+/// memory the GPU and the request path share. Larger than the hot-row store's
+/// reserve: on Halo (MemAvailable ~24 GiB at ready) prewarming the whole
+/// 26.8 GiB q4 table pushed reclaim into the request, and Ciru 8K fell to
+/// 1,734 tok/s from 1,828 at 15 GiB. `auto` also caps at
+/// [`PLE_PREWARM_AUTO_CAP_BYTES`] unless a discrete GPU holds its experts in
+/// host RAM.
 const PLE_PREWARM_RESERVE_BYTES: u64 = 8 << 30;
 
+/// Most an `auto` PLE table prewarm reads on unified memory and on a discrete
+/// GPU whose experts are all resident. An explicit
+/// `memory.ple_prewarm_bytes` ignores it.
+const PLE_PREWARM_AUTO_CAP_BYTES: u64 = 15 << 30;
+
 /// Bytes of the q4 PLE table to prewarm now that the model is ready: an
-/// explicit `memory.ple_prewarm_bytes`, or (`auto`) [`PLE_PREWARM_AUTO_BYTES`]
-/// capped at `MemAvailable - CMA` minus [`PLE_PREWARM_RESERVE_BYTES`]; the
-/// prewarm caps it at the table's data.  The flag is whether the budget was
-/// set to zero.
-fn ple_prewarm_budget() -> (u64, Option<u64>, bool) {
+/// explicit `memory.ple_prewarm_bytes`, or (`auto`) `MemAvailable - CMA` minus
+/// [`PLE_PREWARM_RESERVE_BYTES`] (0 when MemAvailable is unknown), capped at
+/// [`PLE_PREWARM_AUTO_CAP_BYTES`] unless the GPU is discrete and holds
+/// host-placed experts. The snapshot is taken after the weights, pinned
+/// experts and MTP are attached, so it already excludes them and nothing
+/// further is subtracted here. When uncapped the budget grows with host RAM
+/// and covers the whole table when the table fits above the reserve; the store
+/// and [`ple_resident_bytes`] cap it at the table's data.  The flag is whether
+/// the budget was set to zero.
+fn ple_prewarm_budget(is_uma: bool, has_host_experts: bool) -> (u64, Option<u64>, bool) {
     let available = hipfire_runtime::ple_hot_store::mem_available_bytes();
-    let (budget, explicit_zero) =
-        ple_prewarm_budget_for(hipfire_config::memory::ple_prewarm_bytes(), available);
+    let (budget, explicit_zero) = ple_prewarm_budget_for(
+        hipfire_config::memory::ple_prewarm_bytes(),
+        available,
+        is_uma,
+        has_host_experts,
+    );
     (budget, available, explicit_zero)
 }
 
-/// [`ple_prewarm_budget`] for a given request and `MemAvailable - CMA`.
+/// [`ple_prewarm_budget`] for a given request and `MemAvailable - CMA`. Only
+/// a discrete GPU (`!is_uma`) with host-placed experts is uncapped.
 fn ple_prewarm_budget_for(
     request: hipfire_config::memory::PleHotStoreBudget,
     available: Option<u64>,
+    is_uma: bool,
+    has_host_experts: bool,
 ) -> (u64, bool) {
     match request {
         hipfire_config::memory::PleHotStoreBudget::Bytes(bytes) => (bytes, bytes == 0),
-        hipfire_config::memory::PleHotStoreBudget::Auto => (
-            available.map_or(0, |available| {
-                available
-                    .saturating_sub(PLE_PREWARM_RESERVE_BYTES)
-                    .min(PLE_PREWARM_AUTO_BYTES)
-            }),
-            false,
-        ),
+        hipfire_config::memory::PleHotStoreBudget::Auto => {
+            let budget = available.map_or(0, |available| {
+                available.saturating_sub(PLE_PREWARM_RESERVE_BYTES)
+            });
+            (
+                if !is_uma && has_host_experts {
+                    budget
+                } else {
+                    budget.min(PLE_PREWARM_AUTO_CAP_BYTES)
+                },
+                false,
+            )
+        }
     }
 }
 
@@ -2806,6 +2827,24 @@ fn load_qwen4_rank_scoped(
         .map_or(usize::MAX, |bytes| bytes >> 20);
     let mesh = DeviceMesh::single().map_err(|error| format!("qwen4: mesh: {error}"))?;
     let expected = WeightOrigin::for_single(&mesh, ctx.gpu);
+    // What a discrete card keeps in host RAM: the host-mapped experts plus a
+    // hot set's host tier. Only the q4 PLE prewarm paths read it, so it is
+    // zero on unified memory and when neither a rank table nor a q4 sidecar
+    // exists (no per-rank vector is built for the q8 path).
+    let host_expert_bytes: u64 = if use_ranges || (rank_table.is_none() && q4_prewarm.is_none()) {
+        0
+    } else {
+        residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, ep_ranks)
+            .map(|per_rank| {
+                per_rank[ep.map_or(0, |placement| placement.rank)]
+                    + hotset_plan.as_ref().map_or(0, |(plan, _)| {
+                        plan.owner_bytes(
+                            hipfire_arch_qwen4::expert_tier_plan::Placement::HostMapped,
+                        )
+                    })
+            })
+            .unwrap_or(0)
+    };
     // A rank-order PLE table's worker starts now: it reads the table's
     // hottest prefix at a capped rate while the weights load, and
     // prewarms on from there once the model is ready. The PLE hot-row
@@ -2826,16 +2865,7 @@ fn load_qwen4_rank_scoped(
                 .filter_map(|entry| bytes_of(entry))
                 .sum()
         } else {
-            residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, ep_ranks)
-                .map(|per_rank| {
-                    per_rank[ep.map_or(0, |placement| placement.rank)]
-                        + hotset_plan.as_ref().map_or(0, |(plan, _)| {
-                            plan.owner_bytes(
-                                hipfire_arch_qwen4::expert_tier_plan::Placement::HostMapped,
-                            )
-                        })
-                })
-                .unwrap_or(0)
+            host_expert_bytes
         };
         start_ple_table_worker(store, host_weight_bytes)
     });
@@ -3045,7 +3075,14 @@ fn load_qwen4_rank_scoped(
     // The in-load fill's own target (`ple_load_fill`, fixed when it
     // started) covers the part already resident; no residency census runs
     // against the still-reading fill.
-    let mut ple_prewarm = ple_prewarm_budget();
+    // An uncapped `auto` prewarm is for a discrete GPU whose routed experts
+    // actually sit in host RAM (host-mapped bytes, a hot set's host tier, or
+    // an armed CPU splice/tier split); unified memory and a fully resident
+    // discrete card keep the cap.
+    let mut ple_prewarm = ple_prewarm_budget(
+        use_ranges,
+        host_expert_bytes > 0 || bundle.has_cpu_deferred_experts(),
+    );
     let mut ple_hot_prewarm = ple_hot_prewarm_budget();
     let ple_resident = if let Some(worker) = &ple_table_worker {
         ple_resident_bytes(ple_prewarm.0, ple_load_fill, worker.store().data_bytes())
@@ -7153,7 +7190,7 @@ mod qwen4_admission_tests {
 mod qwen4_ple_load_fill_tests {
     use super::{
         ple_load_fill_bytes, ple_prewarm_budget_for, ple_resident_bytes, PLE_LOAD_FILL_AUTO_BYTES,
-        PLE_PREWARM_RESERVE_BYTES,
+        PLE_PREWARM_AUTO_CAP_BYTES, PLE_PREWARM_RESERVE_BYTES,
     };
     use hipfire_config::memory::PleHotStoreBudget::{Auto, Bytes};
 
@@ -7203,9 +7240,9 @@ mod qwen4_ple_load_fill_tests {
     fn halo_prewarm_budget_and_resident_charge() {
         const MIB: u64 = 1 << 20;
         // Halo: 23,038 MiB MemAvailable at admission leaves 23,038 - 8,192 =
-        // 14,846 MiB, under the 15 GiB auto cap. The 14 GiB in-load fill is
-        // inside it, so the resident charge is the budget.
-        let (budget, zero) = ple_prewarm_budget_for(Auto, Some(23_038 * MIB));
+        // 14,846 MiB. The 14 GiB in-load fill is inside it, so the resident
+        // charge is the budget.
+        let (budget, zero) = ple_prewarm_budget_for(Auto, Some(23_038 * MIB), true, false);
         assert_eq!((budget, zero), (14_846 * MIB, false));
         assert_eq!(
             ple_resident_bytes(budget, PLE_LOAD_FILL_AUTO_BYTES, 27 * GIB),
@@ -7213,15 +7250,165 @@ mod qwen4_ple_load_fill_tests {
         );
         // The auto cap, an explicit value, zero and unknown MemAvailable.
         assert_eq!(
-            ple_prewarm_budget_for(Auto, Some(112 * GIB)),
+            ple_prewarm_budget_for(Auto, Some(112 * GIB), true, false),
             (15 * GIB, false)
         );
         assert_eq!(
-            ple_prewarm_budget_for(Bytes(2 * GIB), None),
+            ple_prewarm_budget_for(Bytes(2 * GIB), None, true, false),
             (2 * GIB, false)
         );
-        assert_eq!(ple_prewarm_budget_for(Bytes(0), Some(112 * GIB)), (0, true));
-        assert_eq!(ple_prewarm_budget_for(Auto, None), (0, false));
+        assert_eq!(
+            ple_prewarm_budget_for(Bytes(0), Some(112 * GIB), true, false),
+            (0, true)
+        );
+        assert_eq!(ple_prewarm_budget_for(Auto, None, true, false), (0, false));
+    }
+
+    #[test]
+    fn auto_budget_follows_ram_past_15_gib_when_offloaded_and_the_table_caps_residency() {
+        const MIB: u64 = 1 << 20;
+        // The 26.82 GiB q4 PLE table (data_bytes of the store).
+        let table = 27_463 * MIB;
+        // Discrete GPU with host-placed experts, 112 GiB available: budget is
+        // available - reserve, above the 15 GiB cap, and the resident charge
+        // caps at the whole table.
+        let (budget, zero) = ple_prewarm_budget_for(Auto, Some(112 * GIB), false, true);
+        assert_eq!(
+            (budget, zero),
+            (112 * GIB - PLE_PREWARM_RESERVE_BYTES, false)
+        );
+        assert!(budget > 15 * GIB);
+        assert_eq!(ple_resident_bytes(budget, 0, table), table);
+        assert_eq!(
+            ple_resident_bytes(budget, PLE_LOAD_FILL_AUTO_BYTES, table),
+            table
+        );
+        // Just enough RAM for the whole table plus the reserve.
+        let (budget, _) = ple_prewarm_budget_for(
+            Auto,
+            Some(table + PLE_PREWARM_RESERVE_BYTES),
+            false,
+            true,
+        );
+        assert_eq!(budget, table);
+        assert_eq!(ple_resident_bytes(budget, 0, table), table);
+        // One MiB short of that: a partial prewarm that keeps the reserve.
+        let (budget, _) = ple_prewarm_budget_for(
+            Auto,
+            Some(table + PLE_PREWARM_RESERVE_BYTES - MIB),
+            false,
+            true,
+        );
+        assert_eq!(budget, table - MIB);
+        assert_eq!(ple_resident_bytes(budget, 0, table), table - MIB);
+        // 35 GiB available leaves 27 GiB over the reserve.
+        let (budget, _) = ple_prewarm_budget_for(Auto, Some(35 * GIB), false, true);
+        assert_eq!(budget, 27 * GIB);
+    }
+
+    #[test]
+    fn auto_budget_keeps_the_15_gib_cap_unless_a_discrete_gpu_has_host_experts() {
+        // Unified memory (Halo), with or without a host-expert signal, and a
+        // fully-resident discrete card (gfx1201, low and 23 GiB available,
+        // large host RAM) share one beta budget: available minus reserve,
+        // capped at 15 GiB.
+        for (is_uma, has_host_experts) in [(true, false), (true, true), (false, false)] {
+            for available in [12 * GIB, 23 * GIB, 112 * GIB] {
+                let expected =
+                    (available - PLE_PREWARM_RESERVE_BYTES).min(PLE_PREWARM_AUTO_CAP_BYTES);
+                assert_eq!(
+                    ple_prewarm_budget_for(Auto, Some(available), is_uma, has_host_experts),
+                    (expected, false)
+                );
+            }
+            assert_eq!(
+                ple_prewarm_budget_for(Auto, Some(112 * GIB), is_uma, has_host_experts),
+                (15 * GIB, false)
+            );
+        }
+        // A discrete GPU with host-placed experts (gfx1100 offload) is
+        // uncapped: available minus reserve.
+        assert_eq!(
+            ple_prewarm_budget_for(Auto, Some(112 * GIB), false, true),
+            (112 * GIB - PLE_PREWARM_RESERVE_BYTES, false)
+        );
+        assert_eq!(
+            ple_prewarm_budget_for(Auto, Some(23 * GIB), false, true),
+            (15 * GIB, false)
+        );
+    }
+
+    #[test]
+    fn auto_budget_is_zero_without_headroom_over_the_reserve() {
+        // At, under and far under the reserve, and with no MemAvailable reading.
+        assert_eq!(
+            ple_prewarm_budget_for(Auto, Some(PLE_PREWARM_RESERVE_BYTES), false, true),
+            (0, false)
+        );
+        assert_eq!(
+            ple_prewarm_budget_for(Auto, Some(PLE_PREWARM_RESERVE_BYTES - 1), false, true),
+            (0, false)
+        );
+        assert_eq!(ple_prewarm_budget_for(Auto, Some(0), false, true), (0, false));
+        assert_eq!(ple_prewarm_budget_for(Auto, None, false, true), (0, false));
+        assert_eq!(ple_resident_bytes(0, 0, 27 * GIB), 0);
+        // One byte over the reserve is a one-byte budget.
+        assert_eq!(
+            ple_prewarm_budget_for(Auto, Some(PLE_PREWARM_RESERVE_BYTES + 1), false, true),
+            (1, false)
+        );
+        assert_eq!(
+            ple_prewarm_budget_for(Auto, Some(PLE_PREWARM_RESERVE_BYTES + 1), true, false),
+            (1, false)
+        );
+    }
+
+    #[test]
+    fn explicit_budget_ignores_available_ram_and_the_reserve() {
+        // An explicit value is used as given, whatever MemAvailable says and
+        // whatever the placement (the cap is Auto-only).
+        for (is_uma, has_host_experts) in [(true, false), (false, false), (false, true)] {
+            assert_eq!(
+                ple_prewarm_budget_for(Bytes(20 * GIB), Some(GIB), is_uma, has_host_experts),
+                (20 * GIB, false)
+            );
+            assert_eq!(
+                ple_prewarm_budget_for(Bytes(20 * GIB), Some(112 * GIB), is_uma, has_host_experts),
+                (20 * GIB, false)
+            );
+            // An explicit zero turns the prewarm off and is reported as such.
+            assert_eq!(
+                ple_prewarm_budget_for(Bytes(0), None, is_uma, has_host_experts),
+                (0, true)
+            );
+            assert_eq!(
+                ple_prewarm_budget_for(Bytes(0), Some(0), is_uma, has_host_experts),
+                (0, true)
+            );
+        }
+        // An explicit over-the-table value still charges only the table.
+        assert_eq!(ple_resident_bytes(40 * GIB, 0, 27 * GIB), 27 * GIB);
+    }
+
+    #[test]
+    fn saturated_edges_do_not_overflow() {
+        assert_eq!(
+            ple_prewarm_budget_for(Auto, Some(u64::MAX), false, true),
+            (u64::MAX - PLE_PREWARM_RESERVE_BYTES, false)
+        );
+        assert_eq!(
+            ple_prewarm_budget_for(Bytes(u64::MAX), None, false, true),
+            (u64::MAX, false)
+        );
+        let (budget, _) = ple_prewarm_budget_for(Auto, Some(u64::MAX), false, true);
+        assert_eq!(ple_resident_bytes(budget, 0, 27 * GIB), 27 * GIB);
+        assert_eq!(ple_resident_bytes(u64::MAX, u64::MAX, 27 * GIB), 27 * GIB);
+        assert_eq!(ple_resident_bytes(u64::MAX, 0, u64::MAX), u64::MAX);
+        // Not offloaded: the 15 GiB cap holds at the same saturated edge.
+        assert_eq!(
+            ple_prewarm_budget_for(Auto, Some(u64::MAX), false, false),
+            (PLE_PREWARM_AUTO_CAP_BYTES, false)
+        );
     }
 
     #[test]

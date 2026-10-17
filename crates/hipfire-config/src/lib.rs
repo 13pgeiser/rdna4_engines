@@ -1854,7 +1854,7 @@ pub static FIELDS: &[ConfigField] = &[
         },
         false,
         "HIPFIRE_PLE_PREWARM_BYTES",
-        "Prewarm budget of the q4 PLE table (bytes of `<model>.ple-q4` read into the page cache after the model is ready, while no request runs; a rank-ordered table hottest tier first, then tier 0 again). Default `auto` = 15 GiB (the hottest rows), capped at MemAvailable minus the CMA region minus 8 GiB at ready and at the table. `0` turns the prewarm off; an explicit N is that many bytes. The pages are ordinary reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission."
+        "Prewarm budget of the q4 PLE table (bytes of `<model>.ple-q4` read into the page cache after the model is ready, while no request runs; a rank-ordered table hottest tier first, then tier 0 again). Default `auto` = MemAvailable minus the CMA region minus 8 GiB, sampled once after the pinned experts and the model are loaded, capped at the table's data bytes; on a unified-memory GPU and on a discrete GPU with every expert resident in VRAM it is also capped at 15 GiB (the smaller of the two), and only a discrete GPU with host-placed experts takes the uncapped figure; an unreadable MemAvailable gives 0. `0` turns the prewarm off; an explicit N is that many bytes, is never capped at 15 GiB, and overrides the derivation (the table still caps it). The pages are ordinary reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission."
     ),
     process_field!(
         "memory.ple_load_fill_bytes",
@@ -9076,8 +9076,12 @@ pub mod memory {
 
     /// Prewarm budget of the q4 PLE sidecar page-cache prewarm
     /// (`memory.ple_prewarm_bytes`, compat env `HIPFIRE_PLE_PREWARM_BYTES`):
-    /// `Auto` (default) = 15 GiB, capped at `MemAvailable` minus the CMA region minus 8 GiB at ready
-    /// and at the sidecar's data bytes; `Bytes(0)` = off; `Bytes(n)` = that many bytes.
+    /// `Auto` (default) = `MemAvailable` minus the CMA region minus 8 GiB, sampled once after
+    /// the pinned experts and the model are loaded, capped at the sidecar's data bytes and, on a
+    /// unified-memory GPU or a discrete GPU with every expert resident in VRAM, at 15 GiB; only
+    /// a discrete GPU with host-placed experts takes the uncapped figure. 0 when `MemAvailable`
+    /// is unreadable; `Bytes(0)` = off; `Bytes(n)` = that many bytes (an explicit override of
+    /// the derivation, never capped at 15 GiB, still capped at the table).
     pub fn ple_prewarm_bytes() -> PleHotStoreBudget {
         parse_ple_prewarm_bytes(process_value("HIPFIRE_PLE_PREWARM_BYTES").as_deref())
     }
