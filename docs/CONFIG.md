@@ -1657,7 +1657,9 @@ re-applying the same preset is a no-op that keeps your undo. `undo` restores
 each touched key that still has the value the action left, or removes it, and
 hands ownership back to the previous preset. `status` reads `Balanced`,
 `<Preset>`, `<Preset> (edited)` (an owned key changed or went away) or `Custom`
-(no preset owns anything but a key a preset would write was set by hand). The
+(no preset owns anything, but a key a preset manages was set by hand to a value
+no preset writes, such as `reasoning.effort = "high"`; a hand-set value a
+preset would also write, such as `"low"`, still reads `Balanced`). The
 write order is `tuning.toml` to a temp file, then `config.toml`, then the
 rename, so an interrupted run never leaves ownership claiming keys that were
 not written. The preview warns when an environment variable overrides a key the

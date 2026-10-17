@@ -1652,7 +1652,7 @@ mod tests {
             "Applies",
             "next message",
             "Editing: all models",
-            "Tuning: Custom (p)",
+            "Tuning: Balanced (p)",
         ] {
             assert!(text.contains(want), "missing {want:?}:\n{text}");
         }

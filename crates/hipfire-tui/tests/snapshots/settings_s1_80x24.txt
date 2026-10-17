@@ -3,7 +3,7 @@
  Home  |  Dashboard  |  Chat  |  Models  |  Settings  |  System  |  Logs
 
 ────────────────────────────────────────────────────────────────────────────────
- Tuning: Custom  p    GPU: gfx1151    Editing: all models
+ Tuning: Balanced  p    GPU: gfx1151    Editing: all models
  [Quality]  Speed  Memory  Speculation  Hardware  Advanced             / search
  ┌ Quality — changes the answers; better is usually slower ───────────────────┐
  │  Setting                       Using now               From                │

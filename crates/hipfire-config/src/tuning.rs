@@ -896,8 +896,10 @@ impl TuningStatus {
 /// Where the global config stands against the tuning state (spec §2.5):
 /// `P` when every owned key still has the value it wrote, `P (edited)` when
 /// one differs or is gone, `Custom` when no preset owns anything but a key a
-/// preset would write is set to something other than its default, `Balanced`
-/// otherwise. `ctx` picks the arch whose keys count.
+/// preset writes holds a value that is neither its default nor what any
+/// preset writes for it on this arch (a hand-set `reasoning.effort = "low"`
+/// is still `Balanced`; `"high"` is `Custom`), `Balanced` otherwise. `ctx`
+/// picks the arch whose keys count.
 pub fn status(global: &ConfigLayer, state: &TuningState, ctx: &ArchCtx) -> TuningStatus {
     if let Some(applied) = &state.applied {
         if !applied.set.is_empty() {
@@ -913,15 +915,23 @@ pub fn status(global: &ConfigLayer, state: &TuningState, ctx: &ArchCtx) -> Tunin
         }
     }
     let env = PlanEnv::everything();
-    let touched = plan(Preset::QualityFirst, ctx, &env)
-        .keys()
-        .into_iter()
-        .chain(plan(Preset::LowPower, ctx, &env).keys())
-        .any(|key| match global.values.get(key) {
+    let mut written: BTreeMap<String, Vec<ConfigValue>> = BTreeMap::new();
+    for preset in [Preset::QualityFirst, Preset::LowPower] {
+        let plan = plan(preset, ctx, &env);
+        for (key, value) in plan.writes_for(&plan.default_ticked()) {
+            written.entry(key).or_default().push(value);
+        }
+    }
+    let custom = written
+        .iter()
+        .any(|(key, values)| match global.values.get(key) {
             None => false,
-            Some(value) => field(key).is_none_or(|schema| schema.default.to_value() != *value),
+            Some(value) => {
+                field(key).is_none_or(|schema| schema.default.to_value() != *value)
+                    && !values.contains(value)
+            }
         });
-    if touched {
+    if custom {
         TuningStatus::Custom
     } else {
         TuningStatus::Balanced
@@ -1528,7 +1538,18 @@ mod tests {
             status(&at_default, &state, &context),
             TuningStatus::Balanced
         );
-        let custom = layer(&[("kernel.iu4_prefill", ConfigValue::Bool(false))]);
+        // A hand-set value some preset writes is not a deviation either
+        // (spec S1 mockup: `reasoning.effort = "low"` by hand reads Balanced).
+        for preset_value in [
+            layer(&[("kernel.iu4_prefill", ConfigValue::Bool(false))]),
+            layer(&[("reasoning.effort", ConfigValue::String("low".into()))]),
+        ] {
+            assert_eq!(
+                status(&preset_value, &state, &context),
+                TuningStatus::Balanced
+            );
+        }
+        let custom = layer(&[("reasoning.effort", ConfigValue::String("high".into()))]);
         assert_eq!(status(&custom, &state, &context), TuningStatus::Custom);
         assert_eq!(TuningStatus::Custom.label(), "Custom");
         assert_eq!(
