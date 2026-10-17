@@ -2300,8 +2300,14 @@ void Scheduler::serial_end(int rounds_done) {
  * it exactly, rejected suffix included: the drafter reads hidden states positionally from its
  * own buffer, so batch row i must be buffer row i. The rejected positions lie in [n_computed,
  * n_computed + block), which the query pass overwrites before anything reads them, and the
- * ensure() below covers them since n_computed + block reaches the trunk step's own end. */
-int Scheduler::block_begin(int block, int depth, int window, int32_t mask, BlockRow* out, int max) {
+ * ensure() below covers them since n_computed + block reaches the trunk step's own end.
+ *
+ * On the card the step has not committed yet. The step began at n_computed (a row issued ahead
+ * was staged at its furthest reach; it really continued from the committed end, as commit()
+ * reads it), and the anchor lands somewhere in [that + n_tokens - n_spec, that + n_tokens]
+ * depending on acceptance: the gates take the end that binds them, the query rows the furthest. */
+int Scheduler::block_begin(int block, int depth, int window, int32_t mask, BlockRow* out, int max,
+                           bool on_card) {
     std::lock_guard<std::mutex> lk(mu_);
     block_.clear();
     block_len_ = 0;
@@ -2348,20 +2354,28 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
         }
         SchedReq& s = *sp;
         Request& r = *s.req;
-        d.base_pos = r.n_computed;
+        if (on_card && e.dev) d.ctx_len = (int32_t)r.n_computed;
+        /* The anchor's position, the sequence's committed end: lowest and highest it can be. */
+        const int64_t next_lo = on_card ? (int64_t)d.ctx_len + e.n_tokens - e.n_spec : r.n_computed;
+        const int64_t next_hi = on_card ? (int64_t)d.ctx_len + e.n_tokens : r.n_computed;
+        d.base_pos = next_hi;
+        d.dev      = on_card;
 
         /* May it propose? It needs an anchor token (the one the sampler just chose, so the entry
          * produced one) and a draft cache covering what the block's attention reads. The high end
          * is this step's context pass, about to cover everything up to the trunk's end. The low
-         * end is draft_lo, non-zero only after a prefix-cache hit that left a hole. */
-        const bool have_tok = e.produces_token && !r.output.empty() && r.n_computed >= 1;
+         * end is draft_lo, non-zero only after a prefix-cache hit that left a hole. On the card
+         * the anchor is the card's, and a request that may not speculate is left out here rather
+         * than at set_draft, since the step issued ahead verifies what this pass proposes. */
+        const bool have_tok = on_card ? e.produces_token && r.may_speculate
+                                      : e.produces_token && !r.output.empty() && r.n_computed >= 1;
         /* Where this sequence's draft cache starts once the context pass has run: its own floor,
          * or for a sequence that never had one, this step's first row (0 for an ordinary prefill,
          * the hit length after a prefix-cache hit). The binding query row is the lowest, at
          * n_computed, and it reads back to n_computed - window + 1. */
-        const int64_t lo = draft_floor(s, (int64_t)e.ctx_len);
+        const int64_t lo = draft_floor(s, (int64_t)d.ctx_len);
         const bool reach = lo <= 0 ? true
-                                   : (window > 0 && r.n_computed - window + 1 >= lo);
+                                   : (window > 0 && next_lo - window + 1 >= lo);
 
         /* RADIANCE_DEBUG_DRAFT counts which gate declined. A drafter that silently stops
          * proposing looks like collapsed acceptance downstream (accept% is conditional on
@@ -2369,9 +2383,9 @@ int Scheduler::block_begin(int block, int depth, int window, int32_t mask, Block
         const bool ok_room = n_draft_rows < max;
         /* The query block writes positions n_computed .. n_computed + block - 1, and none of them
          * may be at or past the end of the context. */
-        const bool ok_ctx  = ctx_limit_ <= 0 || r.n_computed + block <= ctx_limit_;
+        const bool ok_ctx  = ctx_limit_ <= 0 || next_hi + block <= ctx_limit_;
         const bool ok_kv   = ok_room && ok_ctx &&
-                             kv_->ensure_from(r.id, r.n_computed + block, r.n_computed) >= 0;
+                             kv_->ensure_from(r.id, next_hi + block, r.n_computed) >= 0;
         static const bool dbg = [] { const char* v = std::getenv("RADIANCE_DEBUG_DRAFT");
                                      return v && *v && *v != '0'; }();
         if (dbg) {
@@ -2483,6 +2497,13 @@ const RadBatch* Scheduler::block_query(int step) {
          * block = depth it starts on it. */
         e.hidden_row = row + block - depth;
         e.hidden_n   = depth;
+        /* On the card the anchor, its position and every mask come from the card (ADV_BLOCK),
+         * which reads the mask id here; the host staged them at the furthest position. */
+        if (d.dev) {
+            e.dev     = true;
+            e.dev_out = -1;
+            e.dev_aux = block_mask_.empty() ? 0 : block_mask_[0];
+        }
         block_plan_.e.push_back(e);
         block_plan_.n_tok += block;
         row += block;

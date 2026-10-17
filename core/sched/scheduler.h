@@ -333,6 +333,13 @@ public:
      *
      * The drafter writes its proposal to its declared proposal buffer, not through the sampler,
      * and the engine publishes it through set_draft().
+     *
+     * On the card (`on_card`), block_begin runs before commit() instead, right after the step is
+     * issued, so both passes queue behind it with no readback in between. The context pass is
+     * unchanged: it mirrors the trunk step, whose positions the host knows. The query pass's
+     * anchor depends on acceptance, so its rows are device rows (advance.h, ADV_BLOCK) staged at
+     * the furthest position acceptance could leave, and the reservation covers that far.
+     * block_end still runs after commit().
      */
     struct BlockRow {
         uint64_t seq = 0;
@@ -343,7 +350,8 @@ public:
      * last `depth` rows), `window` its attention window (0 for none) and `mask` the token id its
      * masked query slots embed. Returns how many sequences may draft and fills `out` with them,
      * in the order block_query() emits them. */
-    int block_begin(int block, int depth, int window, int32_t mask, BlockRow* out, int max);
+    int block_begin(int block, int depth, int window, int32_t mask, BlockRow* out, int max,
+                    bool on_card = false);
     const RadBatch* block_context(int step);
     const RadBatch* block_query(int step);
     void block_end();
@@ -570,6 +578,9 @@ private:
         int32_t        n_tokens = 0;
         int64_t        base_pos = 0;      /* the anchor's position: the sequence's next one */
         bool           can_draft = false;
+        /* On the card: the anchor's position is the card's, and `base_pos` the furthest it can
+         * be (Scheduler::block_begin). */
+        bool           dev = false;
         /* A placeholder: the trunk step finished this sequence, so it has no KV and drafts
          * nothing, but keeps its row so later rows stay aligned with the trunk's. The pass stores
          * nothing for it (a negative slot is padding). */

@@ -275,7 +275,37 @@ int Engine::finish_serial_drafter(const StepOut& so) {
  *   one.
  *
  * Proposals go out through set_draft() like every other.
+ *
+ * Two drivers run these passes. run_block_drafter, after the step commits, stages both from the
+ * committed sequence and reads the proposals back: two host waits a step with the card idle
+ * between them, and no step issued ahead. The card's driver (issue_block_drafter, the default)
+ * queues both behind the step before its readback, from the card's acceptance, as the serial
+ * driver does; RADIANCE_DRAFT_BLOCK_HOST=1 selects the host's.
  */
+
+/* One drafter pass through the barrier. Neither pass samples (no logits in the context pass; the
+ * query pass has its own selector), so the sampler chain is zero rows. */
+int Engine::block_pass(const RadBatch* db, const char* what, int step) {
+    for (auto& rk : ranks_) {
+        int s = rk->sampler.build_greedy(0);
+        if (s < 0) {
+            RAD_ERR("drafter '%s': build_greedy: %s", drafter_.name, rad_strerror(s));
+            return s;
+        }
+    }
+    issue_what_.store(kIssueAll, std::memory_order_release);
+    step_batch_.store(db, std::memory_order_release);
+    barrier_->arrive_and_wait();
+    barrier_->arrive_and_wait();
+    const int s = step_status_.load(std::memory_order_acquire);
+    if (s < 0)
+        RAD_ERR("drafter '%s': %s pass of step %d failed: %s -- the engine cannot continue",
+                drafter_.name, what, step, rad_strerror(s));
+    /* Probe after each pass; by the step loop's dump these buffers hold stale values. */
+    if (s >= 0) dump_buffers(ranks_[0]->ctx, step, what);
+    return s;
+}
+
 int Engine::run_block_drafter(int step) {
     if (drafter_.kind != RAD_DRAFT_BLOCK || drafter_.depth <= 0) return RAD_OK;
 
@@ -294,39 +324,16 @@ int Engine::run_block_drafter(int step) {
         return RAD_E_STATE;
     }
 
-    /* Neither pass samples (no logits in the context pass; the query pass has its own selector),
-     * so the sampler chain is zero rows. */
-    auto run_pass = [&](const RadBatch* db, const char* what) -> int {
-        for (auto& rk : ranks_) {
-            int s = rk->sampler.build_greedy(0);
-            if (s < 0) {
-                RAD_ERR("drafter '%s': build_greedy: %s", drafter_.name, rad_strerror(s));
-                return s;
-            }
-        }
-        issue_what_.store(kIssueAll, std::memory_order_release);
-        step_batch_.store(db, std::memory_order_release);
-        barrier_->arrive_and_wait();
-        barrier_->arrive_and_wait();
-        const int s = step_status_.load(std::memory_order_acquire);
-        if (s < 0)
-            RAD_ERR("drafter '%s': %s pass of step %d failed: %s -- the engine cannot continue",
-                    drafter_.name, what, step, rad_strerror(s));
-        /* Probe after each pass; by the step loop's dump these buffers hold stale values. */
-        if (s >= 0) dump_buffers(r0.ctx, step, what);
-        return s;
-    };
-
     /* The context pass runs even when nothing drafts: a mid-prompt sequence has hidden states the
      * drafter will need, and skipping would leave a permanent hole in its cache. */
-    if (const RadBatch* cb = sched_.block_context(step)) RAD_TRY(run_pass(cb, "context"));
+    if (const RadBatch* cb = sched_.block_context(step)) RAD_TRY(block_pass(cb, "context", step));
 
     /* Cleared so a query batch that could not be built does not republish the previous step's
      * proposals. */
     draft_out_.clear();
     if (n > 0) {
         if (const RadBatch* qb = sched_.block_query(step)) {
-            RAD_TRY(run_pass(qb, "query"));
+            RAD_TRY(block_pass(qb, "query", step));
             const int64_t n_raw = (int64_t)n * steps;
             int32_t* const raw = readback_.reserve(n_raw);
             if (!raw) return RAD_E_NOMEM;
@@ -342,6 +349,83 @@ int Engine::run_block_drafter(int step) {
         /* A request the sampler will not speculate on gets no draft; see finish_serial_drafter. */
         if (!r0.sampler.allows_speculation(rows[(size_t)i].seq)) continue;
         sched_.set_draft(rows[(size_t)i].seq, &draft_out_[(size_t)i * (size_t)steps], steps);
+    }
+    return RAD_OK;
+}
+
+/* The card's driver: both passes behind the step, without waiting. After the trunk's ranks join,
+ * the acceptance runs on every rank (ADV_ACCEPT), leaving each sequence's anchor and committed
+ * end in its StepSlot. The context pass mirrors the trunk step, whose positions the host knows.
+ * The query pass's rows are device rows that the card positions at the committed end (ADV_BLOCK),
+ * and its proposals go into the slots behind the anchor (ADV_BTAKE): exactly the token row the
+ * next verify reads (ADV_TRUNK), so the step issued ahead verifies them with no host round trip.
+ * collect_step's wait covers both passes and the slots' readback. */
+int Engine::issue_block_drafter(int step, StepOut& so) {
+    block_rows_ = 0;
+    if (!block_card_) return RAD_OK;
+
+    RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
+    /* The sampled ids before either pass, as the serial driver reads them. */
+    RAD_TRY(collect_issue(so));
+
+    const int steps = drafter_.depth;
+    const int block = drafter_.block > 0 ? (int)drafter_.block : drafter_.depth + 1;
+    block_row_.resize((size_t)cfg_.max_seqs);
+    const int n = sched_.block_begin(block, steps, (int)drafter_.window, drafter_.mask_token,
+                                     block_row_.data(), (int)block_row_.size(), /*on_card=*/true);
+
+    /* Even when nothing drafts; see run_block_drafter. */
+    if (const RadBatch* cb = sched_.block_context(step)) RAD_TRY(block_pass(cb, "context", step));
+    if (n <= 0) return RAD_OK;
+    const RadBatch* qb = sched_.block_query(step);
+    if (!qb) return RAD_OK;
+    RAD_TRY(advance_all(ADV_BLOCK, 0, false));
+    RAD_TRY(block_pass(qb, "query", step));
+    RAD_TRY(advance_all(ADV_BTAKE, steps, true, n));
+    Rank& r0 = *ranks_[0];
+    RAD_TRY(rad_memcpy_async(slots_host_, r0.step_slots,
+                             (int64_t)cfg_.max_seqs * (int64_t)sizeof(StepSlot), r0.ctx.stream()));
+    block_rows_ = n;
+    return RAD_OK;
+}
+
+/* After commit: check the host's acceptance against the card's, which positioned the query pass
+ * (a disagreement is a defect and the step is refused, as in finish_serial_drafter), move the
+ * drafter's filled range, and publish each row's proposal from the slots. */
+int Engine::finish_block_drafter(const StepOut& so) {
+    if (!block_card_) return RAD_OK;
+    if (block_rows_ > 0) {
+        const StepPlan& plan = sched_.plan();
+        for (size_t i = 0; i < plan.e.size(); ++i) {
+            const StepEntry& e = plan.e[i];
+            if (so.first_row[i] < 0) continue;
+            const StepSlot& S = slots_host_[e.card];   /* in range: the builder refuses others */
+            if (S.acc != so.accepted[i] || S.tok[0] != so.token[i]) {
+                RAD_ERR("drafter '%s': the card accepted %d draft(s) ending in token %d for "
+                        "sequence %llu and the host %d ending in %d; the query pass ran from the "
+                        "card's", drafter_.name, S.acc, S.tok[0], (unsigned long long)e.seq,
+                        so.accepted[i], so.token[i]);
+                sched_.block_end();
+                return RAD_E_STATE;
+            }
+        }
+    }
+    sched_.block_end();
+    if (block_rows_ <= 0) return RAD_OK;
+
+    Rank& r0 = *ranks_[0];
+    const int steps = drafter_.depth;
+    draft_out_.assign((size_t)block_rows_ * (size_t)steps, 0);
+    for (int i = 0; i < block_rows_; ++i) {
+        const StepSlot& S = slots_host_[block_row_[(size_t)i].card];
+        for (int j = 0; j < steps; ++j)
+            draft_out_[(size_t)i * (size_t)steps + (size_t)j] = S.tok[1 + j];
+    }
+    for (int i = 0; i < block_rows_; ++i) {
+        /* As in finish_serial_drafter: the step issued ahead only carries a request whose answer
+         * is fixed (Scheduler::step_next_locked), so this agrees with the count it verifies. */
+        if (!r0.sampler.allows_speculation(block_row_[(size_t)i].seq)) continue;
+        sched_.set_draft(block_row_[(size_t)i].seq, &draft_out_[(size_t)i * (size_t)steps], steps);
     }
     return RAD_OK;
 }

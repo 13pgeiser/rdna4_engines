@@ -1183,7 +1183,9 @@ core.
 **Kind is a shape, not a model.** `RAD_DRAFT_SERIAL` runs `depth` dependent passes, each embedding
 what the last proposed. `RAD_DRAFT_BLOCK` runs a context pass, then one pass that fills every
 drafted position. MTP and EAGLE-style heads are serial; block-diffusion drafters (DFlash2, DSpark)
-are block.
+are block. Both run on the card's acceptance (`core/sched/advance.h`): the verify's acceptance, the
+positions of every pass after it and the proposals stay on the card, so a step's passes and the
+next step are issued before the step is read back, and the host's commit runs beside the card.
 
 Separate draft models are not supported; a drafter is part of the model's source.
 `rad-convert --draft-model` merges a drafter that ships as its own repository into the container

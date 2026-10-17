@@ -3088,6 +3088,7 @@ reductions running on fewer blocks: Qwen3.8-27B's 41k-token prefill 9.5 s uncapp
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
 | `RADIANCE_GEMMA4_OVERLAP` | the Gemma 4 31B's prefill overlap (`arch/gemma4_bf16`, two or more ranks, fused junctions, the exact all-reduce wire): a prefill step of 1024 rows or more runs as two slices, each slice's all-reduces on a second stream beside the other's compute. On by default; `0` turns it off and runs every step whole (the startup notes say which) |
 | `RADIANCE_AR8_SHARD_WEIGHTS`, `RADIANCE_AR8_PIECES` | the eight-rank two-shot's shard weights (`auto`, the default, reads the PCIe links; `off`; or eight integers) and piece count, with `RADIANCE_AR8_SHARD_WEIGHTS_MIN_ELEMS` and `RADIANCE_AR8_PIECES_MIN_ELEMS` for the message size each starts at (§4.7) |
+| `RADIANCE_DRAFT_BLOCK_HOST` | `1` runs a block drafter's (DFlash) passes from the host after each commit, two waits a step and no step issued ahead, instead of on the card's acceptance. For comparing the two drivers; the replies and the drafts' acceptance are the same |
 
 Engine development has its own instruments: `RADIANCE_DEBUG_*` (residual probes, routing and issue
 dumps), `RADIANCE_OP_ORACLE*` (named ops checked against `libref` on the operands the model issued;

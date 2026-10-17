@@ -419,4 +419,124 @@ TEST(the_card_stages_a_cacheless_head_at_the_committed_position) {
     }
 }
 
+/* ================================================================== the block drafter */
+
+/* A block drafter's query row on the card: the anchor (the verify's chosen token) at the
+ * committed end, the row's mask id (`aux`) at every position after it, slots through the row's
+ * own table and the group's length to the block's end. The host staged the furthest the anchor
+ * could be; a host row is left as staged. A wrong base drafts from the wrong position and
+ * acceptance collapses with no error; a wrong slot writes the drafter's K/V into another block. */
+TEST(a_block_query_row_takes_its_anchor_and_position_from_the_step_slot) {
+    Slab s(ADV_BLOCK, /*n_groups=*/1, /*block=*/4);
+    /* Row 0: a block of four for card 3, staged at 60; the card has it at 50. */
+    s.row(0, true, 0, 4, 60, 3, 0, -1, /*mask=*/4);
+    for (int b = 0; b < Slab::kPitch; ++b) s.bt(0, 0)[b] = 100 + b;
+    s.st[3].ctx = 50; s.st[3].tok[0] = 777;
+    /* Row 1: host-staged, untouched. */
+    s.row(1, false, 4, 2, 30, 4, 0, -1, 9);
+    s.w[Slab::TOK + 4] = 900; s.w[Slab::TOK + 5] = 901;
+    s.w[Slab::POS + 4] = 30;  s.w[Slab::POS + 5] = 31;
+    /* Row 2: card 1 at 7 with mask 9; its block 1 (positions 4..7) was never assigned. */
+    s.row(2, true, 6, 4, 20, 1, 0, -1, 9);
+    s.bt(0, 2)[1] = -1;
+    s.st[1].ctx = 7; s.st[1].tok[0] = 555;
+    s.run();
+
+    const int32_t tok[10] = { 777, 4, 4, 4, 900, 901, 555, 9, 9, 9 };
+    const int32_t pos[10] = { 50, 51, 52, 53, 30, 31, 7, 8, 9, 10 };
+    const int32_t slot[10] = { 112 * 4 + 2, 112 * 4 + 3, 113 * 4 + 0, 113 * 4 + 1, 0, 0,
+                               -1, 8, 9, 10 };
+    for (int t = 0; t < 10; ++t) {
+        CHECK_EQ(s.w[Slab::TOK + t], tok[t]);
+        CHECK_EQ(s.w[Slab::POS + t], pos[t]);
+        CHECK_EQ(s.slot(0, t), slot[t]);
+    }
+    CHECK_EQ(s.w[Slab::CTX + 0], 50);
+    CHECK_EQ(s.w[Slab::CTX + 1], 30);
+    CHECK_EQ(s.w[Slab::CTX + 2], 7);
+    CHECK_EQ(s.used(0, 0), 54);
+    CHECK_EQ(s.used(0, 2), 11);
+    CHECK_EQ(s.st[3].tok[0], 777);   /* the anchor stays the next verify's first token */
+}
+
+/* The block's proposals go into the slot behind the anchor, row i's from i * src_pitch: exactly
+ * the tokens the next verify reads after its first. The anchor and host rows are untouched. */
+TEST(a_block_take_puts_each_rows_proposals_behind_its_anchor) {
+    Slab s(ADV_BTAKE);
+    s.a.round = 3;
+    s.a.src_pitch = 3;
+    for (int i = 0; i < 3; ++i) {
+        s.row(i, true, 4 * i, 4, 0, /*card=*/2 - i, 0, -1, 4);
+        s.st[2 - i].tok[0] = 50 + i;
+        for (int c = 0; c < 3; ++c) s.src[i * 3 + c] = 1000 * (i + 1) + c;
+    }
+    s.row(3, false, 12, 4, 0, 5, 0, -1, 4);
+    s.src[9] = 4242;
+    s.run();
+    for (int i = 0; i < 3; ++i) {
+        const StepSlot& S = s.st[2 - i];
+        CHECK_EQ(S.tok[0], 50 + i);
+        for (int c = 0; c < 3; ++c) CHECK_EQ(S.tok[1 + c], 1000 * (i + 1) + c);
+    }
+    CHECK(s.st[5].tok[1] != 4242);
+}
+
+/* The chain a pipelined block-drafter step runs, row for row: the verify's acceptance, the query
+ * block at the committed end, the take, then the step issued ahead. A verify at 101..105 (four
+ * drafts) accepts two, so the anchor is the target's third pick at 104, and the next verify
+ * starts there with the anchor and the block's proposals. */
+TEST(a_block_drafter_step_on_the_card_continues_where_the_verify_left_off) {
+    StepSlot st;
+    /* The verify: 7000 then drafts 7101..7104; the target picks 7101, 7102, 9999, ... */
+    {
+        Slab v(ADV_ACCEPT);
+        v.row(0, false, 0, 5, 101, 1, 0, 0, 4);
+        const int32_t t[5] = { 7000, 7101, 7102, 7103, 7104 };
+        const int32_t y[5] = { 7101, 7102, 9999, 1, 2 };
+        for (int j = 0; j < 5; ++j) { v.w[Slab::TOK + j] = t[j]; v.src[j] = y[j]; }
+        v.run();
+        st = v.st[1];
+    }
+    CHECK_EQ(st.acc, 2);
+    CHECK_EQ(st.ctx, 104);
+    CHECK_EQ(st.tok[0], 9999);
+    /* The query block of four, staged at the furthest anchor, 106. */
+    {
+        Slab q(ADV_BLOCK);
+        q.st[1] = st;
+        q.row(0, true, 0, 4, 106, 1, 0, -1, 4);
+        q.run();
+        const int32_t tok[4] = { 9999, 4, 4, 4 };
+        for (int j = 0; j < 4; ++j) {
+            CHECK_EQ(q.w[Slab::TOK + j], tok[j]);
+            CHECK_EQ(q.w[Slab::POS + j], 104 + j);
+        }
+        st = q.st[1];
+    }
+    /* Its three proposals, then the next verify of 1 + 3. */
+    {
+        Slab t(ADV_BTAKE);
+        t.st[1] = st;
+        t.a.round = 3;
+        t.a.src_pitch = 3;
+        t.row(0, true, 0, 4, 106, 1, 0, -1, 4);
+        t.src[0] = 8001; t.src[1] = 8002; t.src[2] = 8003;
+        t.run();
+        st = t.st[1];
+    }
+    {
+        Slab n(ADV_TRUNK);
+        n.st[1] = st;
+        n.row(0, true, 0, 4, 106, 1, 0, 0, 3);
+        n.run();
+        const int32_t tok[4] = { 9999, 8001, 8002, 8003 };
+        for (int j = 0; j < 4; ++j) {
+            CHECK_EQ(n.w[Slab::TOK + j], tok[j]);
+            CHECK_EQ(n.w[Slab::POS + j], 104 + j);
+        }
+        CHECK_EQ(n.w[Slab::CTX], 104);
+        CHECK_EQ(n.w[Slab::ACC], 3);
+    }
+}
+
 RAD_TEST_MAIN()

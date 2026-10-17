@@ -382,8 +382,8 @@ private:
     int  issue_ahead(const RadBatch** out);
     /* The arena level and the followers' pools, before any release that runs a forward pass. */
     int  prepare_release(const RadBatch* b);
-    /* Whether a step may be issued ahead: requires that the drafter, if any, runs on the card (a
-     * block drafter and the prompt-lookup drafter both read the committed sequence). */
+    /* Whether a step may be issued ahead: requires that the drafter, if any, runs on the card (the
+     * prompt-lookup drafter and the host's block driver both read the committed sequence). */
     bool pipelining_ = false;
     int  finish_serial_drafter(const StepOut& so);
     /* Handed from issue_serial_drafter to finish_serial_drafter: the drafting rows, the rounds
@@ -407,8 +407,19 @@ private:
     void   phase_mark(int p);
 
     /* Block driver (spec §10): a context pass mirroring the step just run, then one pass that
-     * fills every drafted position at once. DFlash2 has this shape. */
+     * fills every drafted position at once. DFlash2 has this shape. run_block_drafter stages both
+     * after the commit; on the card (`block_card_`, the default), issue_block_drafter queues them
+     * behind the step before its readback and finish_block_drafter publishes the proposals after
+     * the commit, so the step can be issued ahead. RADIANCE_DRAFT_BLOCK_HOST=1 keeps the host's. */
     int  run_block_drafter(int step);
+    int  block_pass(const RadBatch* db, const char* what, int step);
+    bool block_card_ = false;
+    int  issue_block_drafter(int step, StepOut& so);
+    int  finish_block_drafter(const StepOut& so);
+    /* Handed from issue_block_drafter to finish_block_drafter and issue_ahead: the drafting rows,
+     * in the query pass's order, and how many there are (0 when no query pass ran). */
+    std::vector<Scheduler::BlockRow> block_row_;
+    int  block_rows_ = 0;
     /* Encoder driver (spec §11, core/engine_mm.cpp): encodes every media item the scheduler waits
      * on, in passes of whole segments, and reads it back into the item. Runs between steps, never
      * inside one. */

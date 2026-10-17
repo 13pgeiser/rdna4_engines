@@ -3937,6 +3937,179 @@ TEST(a_step_issued_ahead_equals_the_step_built_after_the_commit) {
     }
 }
 
+/* ================================================================== a block drafter on the card */
+namespace {
+/* Every pass of a block drafter's run: each step's trunk batch, then its context and query
+ * passes, as the card holds them once its advances have run. */
+struct BlockRun {
+    std::vector<BatchRows> trunk, context, query;
+    std::vector<std::vector<int32_t>> out;
+    int ahead = 0;
+    int card_host_disagree = 0;
+};
+constexpr int kBlk = 8, kBlkDepth = 7;
+constexpr int32_t kBlkMask = 99;
+
+/* The host's driver: both passes built after the commit, from the committed sequence. */
+BlockRun block_reference(int steps) {
+    Fixture f;
+    std::vector<uint64_t> ids;
+    ahead_setup(f, kBlkDepth, ids);
+    BlockRun run;
+    const RadBatch* b = f.sch.step();
+    if (!b) return run;
+    run.trunk.push_back(read_rows(b, f.sch.plan(), f.kv));
+    Scheduler::BlockRow rows[4];
+    for (int t = 0; t < steps; ++t) {
+        CHECK_OK(ahead_commit(f, t));
+        CHECK_EQ(f.sch.block_begin(kBlk, kBlkDepth, 0, kBlkMask, rows, 4), 3);
+        const RadBatch* cb = f.sch.block_context(t + 1);
+        if (!cb) { CHECK(cb != nullptr); return run; }
+        run.context.push_back(read_rows(cb, f.sch.plan(), f.kv));
+        const RadBatch* qb = f.sch.block_query(t + 1);
+        if (!qb) { CHECK(qb != nullptr); return run; }
+        /* The query plan is the scheduler's own; its rows are the drafting sequences in order. */
+        StepPlan qp;
+        for (int i = 0; i < 3; ++i) { StepEntry e; e.seq = rows[i].seq; qp.e.push_back(e); }
+        run.query.push_back(read_rows(qb, qp, f.kv));
+        f.sch.block_end();
+        ahead_publish(f, ids, kBlkDepth, t + 1);
+        b = f.sch.step();
+        if (!b) break;
+        run.trunk.push_back(read_rows(b, f.sch.plan(), f.kv));
+    }
+    for (uint64_t id : ids) run.out.push_back(f.sch.find(id)->output);
+    return run;
+}
+
+/* The card's driver (Engine::issue_block_drafter): the step's acceptance into the StepSlots, both
+ * passes built before the commit with the query rows placed by ADV_BLOCK, the proposals into the
+ * slots (ADV_BTAKE), expect_draft and step_next with ADV_TRUNK, then the commit, block_end, the
+ * drafts published and promote_next. */
+BlockRun block_pipelined(int steps) {
+    Fixture f;
+    std::vector<uint64_t> ids;
+    ahead_setup(f, kBlkDepth, ids);
+    BlockRun run;
+    std::vector<StepSlot> slots((size_t)f.cfg.max_seqs);
+    const RadBatch* b = f.sch.step();
+    if (!b) return run;
+    run.trunk.push_back(read_rows(b, f.sch.plan(), f.kv));
+    Scheduler::BlockRow rows[4];
+    for (int t = 0; t < steps; ++t) {
+        const StepPlan& p = f.sch.plan();
+        std::vector<int32_t> y((size_t)b->n_out + 1, -1);
+        for (const StepEntry& e : p.e) {
+            if (e.dev_out < 0) continue;
+            const int32_t a = ahead_acc(e.seq, t, e.n_spec);
+            for (int j = 0; j <= e.n_spec; ++j)
+                y[(size_t)(e.dev_out + j)] = j < a ? ahead_draft(e.seq, t, j) : ahead_tok(e.seq, t);
+        }
+        AdvanceArgs acc = f.sch.advance_args(0);
+        acc.mode = ADV_ACCEPT;
+        acc.st = slots.data();
+        acc.src = y.data();
+        for (int i = 0; i < acc.n_seq; ++i) adv_row(acc, i);
+        for (const StepEntry& e : p.e) {
+            const StepSlot& S = slots[(size_t)e.card];
+            if (S.acc != ahead_acc(e.seq, t, e.n_spec) || S.tok[0] != ahead_tok(e.seq, t))
+                ++run.card_host_disagree;
+        }
+
+        CHECK_EQ(f.sch.block_begin(kBlk, kBlkDepth, 0, kBlkMask, rows, 4, /*on_card=*/true), 3);
+        const RadBatch* cb = f.sch.block_context(t + 1);
+        if (!cb) { CHECK(cb != nullptr); return run; }
+        run.context.push_back(read_rows(cb, f.sch.plan(), f.kv));
+        const RadBatch* qb = f.sch.block_query(t + 1);
+        if (!qb) { CHECK(qb != nullptr); return run; }
+        AdvanceArgs q = f.sch.advance_args(0);
+        q.mode = ADV_BLOCK;
+        q.st = slots.data();
+        for (int i = 0; i < q.n_seq; ++i) adv_row(q, i);
+        StepPlan qp;
+        for (int i = 0; i < 3; ++i) { StepEntry e; e.seq = rows[i].seq; qp.e.push_back(e); }
+        run.query.push_back(read_rows(qb, qp, f.kv));
+        /* The block's proposals for step t + 1, taken behind the anchor. */
+        std::vector<int32_t> prop((size_t)3 * kBlkDepth);
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < kBlkDepth; ++j)
+                prop[(size_t)(i * kBlkDepth + j)] = ahead_draft(rows[i].seq, t + 1, j);
+        AdvanceArgs tk = f.sch.advance_args(0);
+        tk.mode = ADV_BTAKE;
+        tk.round = kBlkDepth;
+        tk.src = prop.data();
+        tk.src_pitch = kBlkDepth;
+        tk.st = slots.data();
+        for (int i = 0; i < tk.n_seq; ++i) adv_row(tk, i);
+        for (int i = 0; i < 3; ++i) f.sch.expect_draft(rows[i].seq, kBlkDepth);
+
+        const RadBatch* nb = f.sch.step_next();
+        if (nb) {
+            AdvanceArgs tr = f.sch.advance_args(0);
+            tr.mode = ADV_TRUNK;
+            tr.st = slots.data();
+            for (int i = 0; i < tr.n_seq; ++i) adv_row(tr, i);
+        }
+        CHECK_OK(ahead_commit(f, t));
+        f.sch.block_end();
+        ahead_publish(f, ids, kBlkDepth, t + 1);
+        if (nb) {
+            f.sch.promote_next();
+            b = nb;
+            ++run.ahead;
+        } else {
+            b = f.sch.step();
+            if (!b) break;
+        }
+        run.trunk.push_back(read_rows(b, f.sch.plan(), f.kv));
+    }
+    for (uint64_t id : ids) run.out.push_back(f.sch.find(id)->output);
+    return run;
+}
+}  /* namespace */
+
+/* A block drafter on the card runs the passes the host's driver runs after the commit: the same
+ * trunk steps, and context and query passes with the same positions, lengths and slots once the
+ * card's advances have filled in what the host only bounded, and the same query tokens. Its query
+ * block is staged before the step's acceptance is known, at the furthest anchor; a wrong position
+ * drafts from the wrong place (acceptance collapses, no error) and a wrong slot writes the
+ * drafter's K/V into another block. Every step after the first runs issued ahead.
+ *
+ * The context pass's token ids are not compared: that pass reads hidden states and no ids
+ * (Scheduler::block_context), and staged before the commit, its accepted positions are not in the
+ * sequence yet. */
+TEST(a_block_drafter_on_the_card_runs_the_passes_the_hosts_driver_runs) {
+    const int T = 24;
+    const BlockRun a = block_reference(T);
+    const BlockRun b = block_pipelined(T);
+    CHECK_EQ(b.ahead, T);
+    CHECK_EQ(b.card_host_disagree, 0);
+    REQUIRE_EQ(a.trunk.size(), (size_t)T + 1);
+    REQUIRE_EQ(a.trunk.size(), b.trunk.size());
+    REQUIRE_EQ(a.context.size(), b.context.size());
+    REQUIRE_EQ(a.query.size(), b.query.size());
+    for (size_t t = 0; t < a.trunk.size(); ++t) {
+        CHECK(a.trunk[t] == b.trunk[t]);
+        CHECK_EQ(b.trunk[t].bad_slots, 0);
+    }
+    for (size_t t = 0; t < a.context.size(); ++t) {
+        BatchRows ca = a.context[t], cb = b.context[t];
+        ca.tok.clear();
+        cb.tok.clear();
+        const bool same_c = ca == cb, same_q = a.query[t] == b.query[t];
+        CHECK(same_c);
+        CHECK(same_q);
+        if (!same_c || !same_q)
+            std::fprintf(stderr, "    step %zu: context %s, query %s\n", t,
+                         same_c ? "same" : "differs", same_q ? "same" : "differs");
+        CHECK_EQ(a.context[t].bad_slots, 0);
+        CHECK_EQ(b.context[t].bad_slots, 0);
+        CHECK_EQ(a.query[t].bad_slots, 0);
+        CHECK_EQ(b.query[t].bad_slots, 0);
+    }
+    CHECK(a.out == b.out);
+}
+
 /* ================================================================== the token budget per token */
 /* A verify step emits up to 1 + n_spec tokens at once. The budget (max_tokens, and the context)
  * is applied token by token before each reaches the sink: trimming `output` afterwards would leave

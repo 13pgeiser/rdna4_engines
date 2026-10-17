@@ -353,6 +353,8 @@ int Engine::issue_ahead(const RadBatch** out) {
     if (!pipelining_) return RAD_OK;
     for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i)
         sched_.expect_draft(serial_row_[(size_t)i].seq, serial_done_);
+    for (int i = 0; i < block_rows_; ++i)
+        sched_.expect_draft(block_row_[(size_t)i].seq, drafter_.depth);
     const RadBatch* nb = sched_.step_next();
     if (!nb) return RAD_OK;
     /* Its rows' tokens, positions and slots, advanced on the card behind this step's acceptance
@@ -403,9 +405,13 @@ int Engine::step_loop() {
     int idle = 0;
     std::vector<uint64_t> cancel;
     /* Not in KL mode: its scored rows are copied out of the logits buffer after collection, and a
-     * pass issued ahead would overwrite them. */
-    pipelining_ = !cfg_.kld() && !embedding_ && drafter_.kind != RAD_DRAFT_BLOCK &&
-                  (serial_drafting() || cfg_.n_spec <= 0);
+     * pass issued ahead would overwrite them. A block drafter pipelines only on the card
+     * (engine_draft.cpp); the host's driver stages from the committed sequence. */
+    block_card_ = drafter_.kind == RAD_DRAFT_BLOCK && drafter_.depth > 0 && !cfg_.kld() &&
+                  !embedding_ && [] { const char* v = std::getenv("RADIANCE_DRAFT_BLOCK_HOST");
+                                      return !(v && *v && *v != '0'); }();
+    pipelining_ = !cfg_.kld() && !embedding_ && (drafter_.kind != RAD_DRAFT_BLOCK || block_card_) &&
+                  (serial_drafting() || block_card_ || cfg_.n_spec <= 0);
     const bool t_on = (int)log_level() >= (int)Log::Debug;
     /* The next step's forward pass when already issued behind the previous step, before its
      * readback (Scheduler::step_next). */
@@ -696,10 +702,10 @@ int Engine::step_loop() {
         }
 
         if (t_on) phase_mark(PH_SAVE);
-        /* Queue the serial drafter's passes behind the step before waiting: the card computes
-         * acceptance itself and every pass reads it there (sched/advance.h), so one wait covers
-         * the whole step. */
-        st = issue_serial_drafter(b->step, so);
+        /* Queue the drafter's passes behind the step before waiting: the card computes acceptance
+         * itself and every pass reads it there (sched/advance.h), so one wait covers the whole
+         * step. */
+        st = block_card_ ? issue_block_drafter(b->step, so) : issue_serial_drafter(b->step, so);
         if (st < 0) return fail_loop(st);
         st = mark_step_end(b, so);
         if (st < 0) return fail_loop(st);
@@ -763,12 +769,13 @@ int Engine::step_loop() {
         if (t_on) phase_mark(PH_COMMIT);
         if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
 
-        /* The drafter for the next step. A block drafter runs here, since its passes are staged
-         * from the committed sequence. A serial one already ran on the card; what remains is to
-         * check its acceptance against the host's and publish its proposals. Both drivers return
-         * immediately for a kind that is not theirs. */
-        st = drafter_.kind == RAD_DRAFT_BLOCK ? run_block_drafter(b->step)
-                                              : finish_serial_drafter(so);
+        /* The drafter for the next step. The host's block driver runs here, since it stages from
+         * the committed sequence. A serial one, or a block one on the card, already ran; what
+         * remains is to check its acceptance against the host's and publish its proposals. Each
+         * driver returns immediately for a kind that is not its own. */
+        st = drafter_.kind != RAD_DRAFT_BLOCK ? finish_serial_drafter(so)
+           : block_card_                      ? finish_block_drafter(so)
+                                              : run_block_drafter(b->step);
         if (st < 0) return fail_loop(st);
         /* The step ends here, after its draft rounds, so step timing includes them
          * (Scheduler::step_finished). */
