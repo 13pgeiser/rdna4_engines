@@ -26,7 +26,7 @@ use super::config::{layers_label, offload_exec_label, passback_share_label};
 use super::dashboard::LoadedConfig;
 use super::knobs::{self, ExplainCtx, PROMPT_PROCESSING_ID};
 use super::registry::RegistryState;
-use super::search::row_matches;
+use super::search::{match_tier, row_matches};
 use super::writer::SYM_IU4_KEY;
 use super::HipfirePaths;
 
@@ -254,10 +254,18 @@ impl SettingsModel {
             .collect()
     }
 
-    /// Rows of every group that pass `filter`, in group order: the search
-    /// results view, where the Group column tells them apart.
+    /// Rows of every group that pass `filter`: the search results view, where
+    /// the Group column tells them apart. Title and key matches come first,
+    /// then environment-variable matches, then help-text-only matches; group
+    /// order holds within each tier.
     pub fn search(&self, filter: &RowFilter) -> Vec<&SettingsRow> {
-        self.rows.iter().filter(|row| filter.matches(row)).collect()
+        let mut hits: Vec<&SettingsRow> =
+            self.rows.iter().filter(|row| filter.matches(row)).collect();
+        hits.sort_by_key(|row| {
+            let keys: Vec<&str> = row.keys.iter().map(String::as_str).collect();
+            match_tier(&row.title, &keys, &filter.search)
+        });
+        hits
     }
 
     /// Rows per group after `filter`, in [`Intent::ALL`] order.

@@ -15,7 +15,6 @@ pub use hipfire_config::intent::{field_matches, key_matches};
 /// `title`, or on any of the row's canonical `keys` through the shared schema
 /// matcher (key, legacy key, env var, help text, ...). A virtual row names
 /// every key its choices write. An empty query matches everything.
-#[allow(dead_code)] // consumed by the Settings pane rewrite
 pub fn row_matches(title: &str, keys: &[&str], query: &str) -> bool {
     let query = query.trim();
     if query.is_empty() {
@@ -31,6 +30,34 @@ pub fn row_matches(title: &str, keys: &[&str], query: &str) -> bool {
         Some(schema) => field_matches(schema, query),
         None => key_matches(key, query),
     })
+}
+
+/// Why a row matched, best first: `0` title, canonical key or legacy key;
+/// `1` environment variable; `2` only the help text (or other schema text).
+/// An empty query is tier 0. Call only for rows [`row_matches`] accepts.
+pub fn match_tier(title: &str, keys: &[&str], query: &str) -> u8 {
+    let query = query.trim().to_ascii_lowercase();
+    if query.is_empty() || title.to_ascii_lowercase().contains(&query) {
+        return 0;
+    }
+    let has = |text: &str| text.to_ascii_lowercase().contains(&query);
+    let mut tier = 2;
+    for key in keys {
+        let (names, env): (Vec<&str>, Option<String>) = match field(key) {
+            Some(schema) => (
+                vec![schema.key, schema.legacy_key],
+                schema.env_compat.map(str::to_owned),
+            ),
+            None => (vec![*key], hipfire_config::developer_env_for_key(key)),
+        };
+        if names.iter().any(|name| has(name)) {
+            return 0;
+        }
+        if env.as_deref().is_some_and(has) {
+            tier = 1;
+        }
+    }
+    tier
 }
 
 #[cfg(test)]

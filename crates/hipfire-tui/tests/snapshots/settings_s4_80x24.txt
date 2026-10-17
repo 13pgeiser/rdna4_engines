@@ -7,18 +7,18 @@
  Search: kv█                                             30 matches · Esc clear
  ┌ Search results — name, key, env var or description ────────────────────────┐
  │  Setting                   Using now         From               Group      │
- │> Context length            32,768 tokens     default            Memory     │
- │  KV cache precision        fp8 (auto)        default · gfx1201  Memory     │
+ │> KV cache precision        fp8 (auto)        default · gfx1201  Memory     │
  │  KV fit-to-memory          off               default            Memory     │
- │  Expert layers kept on GPU all on GPU        default            Memory     │
- │  Who multiplies spilled la…over PCIe         default            Memory     │
- │  memory.kv_backend         vmm               default            Memory     │
+ │  KV cache layout           vmm               default            Memory     │
+ │  KV key format             (empty)           default            Memory     │
+ │  KV value format           (empty)           default            Memory     │
+ │  memory.unsafe_wsl_vmm_kv  off               default            Memory     │
  └────────────────────────────────────────────────────────── rows 1–6 of 30 ↓ ┘
- ┌ Context length ────────────────────────────────────────────────────────────┐
- │How many tokens of conversation the model can hold.                         │
- │Longer context reserves more memory up front; shorter leaves room.          │
- │Built-in default. Applies: next model load.                                 │
- │memory.max_seq · Enter edits                                                │
+ ┌ KV cache precision ────────────────────────────────────────────────────────┐
+ │Format of the conversation memory (KV cache). Smaller fits longer chats.    │
+ │Smaller formats save memory; exact formats keep more detail.                │
+ │Auto: fp8 on exact gfx1201, one GPU, Qwen. Applies: next model load.        │
+ │memory.kv_cache · HIPFIRE_KV_MODE · ←/→ preview, Enter saves                │
  └────────────────────────────────────────────────────────────────────────────┘
 type to filter · ↑↓ move · Enter results · Esc clear search
 

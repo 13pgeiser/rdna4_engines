@@ -16,7 +16,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
 
@@ -36,7 +36,7 @@ const WIDE_COLS: u16 = 160;
 const WIDE_ROWS: u16 = 24;
 /// Rail and pane widths at the wide layout.
 const RAIL_W: u16 = 24;
-const PANE_W: u16 = 46;
+const PANE_W: u16 = 42;
 
 /// Group labels on the tab row.
 fn tab_label(group: Intent) -> &'static str {
@@ -92,17 +92,19 @@ fn title_copy(group: Intent) -> String {
     }
 }
 
-/// `text` padded to `width` columns, or cut with an ellipsis when longer.
+/// `text` in a `width`-column cell that always ends in a space, so adjacent
+/// columns never touch: padded when it fits, else cut with an ellipsis.
 fn cell(text: &str, width: usize) -> String {
-    let count = text.chars().count();
-    if count <= width {
-        return format!("{text}{}", " ".repeat(width - count));
-    }
     if width == 0 {
         return String::new();
     }
-    let mut cut: String = text.chars().take(width - 1).collect();
+    let count = text.chars().count();
+    if count < width {
+        return format!("{text}{}", " ".repeat(width - count));
+    }
+    let mut cut: String = text.chars().take(width.saturating_sub(2)).collect();
     cut.push('…');
+    cut.push(' ');
     cut
 }
 
@@ -194,7 +196,12 @@ fn from_label(row: &SettingsRow) -> String {
 
 fn cells(app: &App, row: &SettingsRow) -> Cells {
     let marked = row.origin.marked();
-    let marker = if marked { "● " } else { "" };
+    // A value on a row nobody reads is not in effect, so it carries no ● mark.
+    let marker = if marked && !row.is_unused() {
+        "● "
+    } else {
+        ""
+    };
     let (using, from, preview) = match pending_for(app, row) {
         Some(pending) => (
             format!("→ {}", pending_label(row, pending)),
@@ -238,7 +245,7 @@ impl Columns {
         let (setting, using, from) = match (wide, searching) {
             (false, false) => (30, 24, body.saturating_sub(54).max(10)),
             (false, true) => (26, 18, 19),
-            (true, false) => (29, 24, 18),
+            (true, false) => (30, 24, 20),
             (true, true) => (26, 22, 20),
         };
         let used = setting + using + from;
@@ -687,14 +694,14 @@ fn draw_rail(frame: &mut Frame, app: &App, area: Rect) {
     ))];
     for (group, count) in app.settings.group_counts(&app.settings_filter()) {
         let current = group == app.settings_group && !searching;
-        let label = cell(rail_label(group), inner.saturating_sub(6));
-        let text = format!("{}{label}{count:>4}", if current { "> " } else { "  " });
+        let label = cell(rail_label(group), inner.saturating_sub(5));
+        let text = format!("{}{label}{count:>3}", if current { "> " } else { "  " });
         let style = if current {
             Style::default().fg(ACCENT).bg(PANEL_2)
         } else {
             Style::default().fg(TEXT)
         };
-        lines.push(Line::from(Span::styled(cell(&text, inner), style)));
+        lines.push(Line::from(Span::styled(text, style)));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -976,13 +983,13 @@ fn chain_section(row: &SettingsRow, shown: &str, width: usize) -> Vec<Line<'stat
     if row.chain.len() == 1 && !row.origin.marked() {
         for text in wrap(
             "no registry, profile, preset, user, model or environment value is set",
-            width.saturating_sub(5),
+            width.saturating_sub(6),
         ) {
             lines.push(muted(format!("     {text}")));
         }
     }
     if let Some(reason) = &row.effective.reason {
-        for text in wrap(reason, width.saturating_sub(5)) {
+        for text in wrap(reason, width.saturating_sub(6)) {
             lines.push(muted(format!("     {text}")));
         }
     }
@@ -1155,6 +1162,8 @@ fn draw_why_pane(frame: &mut Frame, app: &App, area: Rect) {
     };
     frame.render_widget(
         Paragraph::new(lines)
+            // Every pane line wraps; none is cut at the border.
+            .wrap(Wrap { trim: false })
             .block(block(&title))
             .style(Style::default().fg(TEXT).bg(PANEL)),
         area,
@@ -1344,7 +1353,7 @@ mod tests {
                 for row in rows {
                     let using = cells(&fixture.app, &row).using;
                     assert!(
-                        using.chars().count() <= columns.using,
+                        using.chars().count() < columns.using,
                         "{gpu} {}: {using:?} is wider than the {}-column cell",
                         row.title,
                         columns.using
@@ -1692,5 +1701,216 @@ mod tests {
             ["7"],
             "exactly the char under the cursor is reversed"
         );
+    }
+
+    /// Words the pane draws for the selected row, and words it was asked to
+    /// draw, rendering the pane tall enough that nothing is clipped below.
+    fn pane_words(app: &App) -> (Vec<String>, Vec<String>) {
+        let area = Rect::new(0, 0, PANE_W, 200);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| draw_why_pane(frame, app, area))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut drawn = Vec::new();
+        for y in 1..buf.area.height - 1 {
+            let row: String = (1..buf.area.width - 1)
+                .map(|x| buf[(x, y)].symbol())
+                .collect();
+            drawn.extend(row.split_whitespace().map(str::to_owned));
+        }
+        let row = app.selected_row().unwrap();
+        let asked = why_lines(app, row, PANE_W as usize - 2)
+            .iter()
+            .flat_map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        (drawn, asked)
+    }
+
+    #[test]
+    fn why_pane_wraps_every_line_and_cuts_none_at_160x48() {
+        for (gpu, a8) in [
+            ("gfx1151", A8Prefill::OptIn),
+            ("gfx1201", A8Prefill::NotLanded),
+            ("gfx1100", A8Prefill::NotLanded),
+        ] {
+            let mut fixture = FixtureBuilder::new(gpu).a8(a8).build();
+            for digit in '1'..='6' {
+                press(&mut fixture.app, KeyCode::Char(digit));
+                press(&mut fixture.app, KeyCode::Home);
+                for _ in 0..8 {
+                    let (drawn, asked) = pane_words(&fixture.app);
+                    assert_eq!(
+                        drawn, asked,
+                        "{gpu} group {digit} row {}",
+                        fixture.app.settings_selected
+                    );
+                    press(&mut fixture.app, KeyCode::Down);
+                }
+            }
+        }
+        // The reviewed case: the typing-speed line wraps whole at 160x48.
+        let mut fixture = strix_halo();
+        let text = render_text(&mut fixture.app, 160, 48);
+        assert!(!text.contains("batch ≥ │"), "{text}");
+        assert!(
+            text.contains("64)"),
+            "the wrapped tail is on screen: {text}"
+        );
+    }
+
+    #[test]
+    fn adjacent_columns_never_touch() {
+        assert_eq!(cell("ab", 5), "ab   ");
+        assert_eq!(cell("abcd", 5), "abcd ");
+        assert_eq!(cell("abcde", 5), "abc… ");
+        assert_eq!(cell("abcdefgh", 3), "a… ");
+        for (width, height, search) in [
+            (80, 24, true),
+            (80, 24, false),
+            (120, 32, true),
+            (160, 48, true),
+            (160, 48, false),
+        ] {
+            let mut fixture = FixtureBuilder::new("gfx1201").build();
+            if search {
+                press(&mut fixture.app, KeyCode::Char('/'));
+                type_text(&mut fixture.app, "kv");
+            }
+            for digit in if search { "1" } else { "123456" }.chars() {
+                if !search {
+                    press(&mut fixture.app, KeyCode::Char(digit));
+                }
+                let text = render_text(&mut fixture.app, width, height);
+                let chars: Vec<char> = text.chars().collect();
+                for pair in chars.windows(2) {
+                    assert!(
+                        !(pair[0] == '…' && (pair[1].is_alphanumeric() || pair[1] == '│')),
+                        "a cut cell touches the next column at {width}x{height}:\n{text}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn group_paragraph_is_drawn_once_at_the_bottom_of_the_wide_list() {
+        for digit in '1'..='6' {
+            let mut fixture = strix_halo();
+            press(&mut fixture.app, KeyCode::Char(digit));
+            for end in [false, true] {
+                if end {
+                    press(&mut fixture.app, KeyCode::End);
+                }
+                let rows = render_rows(&mut fixture.app, 160, 48);
+                let blurb = wrap(group_blurb(fixture.app.settings_group), 80);
+                let first_word = group_blurb(fixture.app.settings_group)
+                    .split_whitespace()
+                    .next()
+                    .unwrap();
+                // The paragraph's first line appears once, and its last line
+                // sits directly above the box's bottom border.
+                let first_hits = rows
+                    .iter()
+                    .filter(|r| r.contains(&format!("││ {first_word} ")))
+                    .count();
+                assert_eq!(first_hits, 1, "group {digit}: {rows:#?}");
+                let last_word = blurb
+                    .last()
+                    .unwrap()
+                    .split_whitespace()
+                    .last()
+                    .unwrap()
+                    .to_owned();
+                let hits: Vec<usize> = rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| r.contains(&last_word) && r.contains("││"))
+                    .map(|(i, _)| i)
+                    .collect();
+                let border = rows.iter().rposition(|r| r.starts_with(" └")).unwrap();
+                assert!(hits.contains(&(border - 1)), "group {digit}: {rows:#?}");
+            }
+        }
+    }
+
+    #[test]
+    fn search_ranks_title_and_key_hits_before_env_and_help_text_hits() {
+        let mut fixture = FixtureBuilder::new("gfx1201").build();
+        press(&mut fixture.app, KeyCode::Char('/'));
+        type_text(&mut fixture.app, "kv");
+        let titles: Vec<String> = fixture
+            .app
+            .settings_visible()
+            .iter()
+            .map(|row| row.title.clone())
+            .collect();
+        let at = |title: &str| {
+            titles
+                .iter()
+                .position(|t| t == title)
+                .unwrap_or_else(|| panic!("{title} missing in {titles:?}"))
+        };
+        let context = at("Context length");
+        for title in [
+            "KV cache precision",
+            "KV fit-to-memory",
+            "KV cache layout",
+            "KV key format",
+            "KV value format",
+        ] {
+            assert!(
+                at(title) < context,
+                "{title} ranks after Context length: {titles:?}"
+            );
+        }
+        // The count is unchanged by ranking.
+        let unranked = fixture
+            .app
+            .settings
+            .rows
+            .iter()
+            .filter(|row| fixture.app.settings_filter().matches(row))
+            .count();
+        assert_eq!(titles.len(), unranked);
+
+        // Tiers hold: a key hit never follows a help-text-only hit.
+        let tiers: Vec<u8> = fixture
+            .app
+            .settings_visible()
+            .iter()
+            .map(|row| {
+                let keys: Vec<&str> = row.keys.iter().map(String::as_str).collect();
+                crate::hipfire::search::match_tier(&row.title, &keys, "kv")
+            })
+            .collect();
+        assert!(tiers.windows(2).all(|pair| pair[0] <= pair[1]), "{tiers:?}");
+        assert_eq!(tiers[0], 0);
+        assert_eq!(*tiers.last().unwrap(), 2, "help-text-only hits come last");
+    }
+
+    #[test]
+    fn kv_layout_and_axis_rows_have_plain_titles() {
+        let fixture = FixtureBuilder::new("gfx1201").build();
+        for (key, title) in [
+            ("memory.kv_backend", "KV cache layout"),
+            ("memory.kv_k", "KV key format"),
+            ("memory.kv_v", "KV value format"),
+        ] {
+            let row = fixture
+                .app
+                .settings
+                .row(&RowId::Key(key.into()))
+                .unwrap_or_else(|| panic!("no row {key}"));
+            assert_eq!(row.title, title);
+        }
     }
 }
