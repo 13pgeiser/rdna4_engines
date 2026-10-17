@@ -786,7 +786,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1654
+**Count:** 1658
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1577,6 +1577,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GRAPH_PREFILL` | crates/hipfire-runtime/examples/bench_qwen35_mq4.rs | harness |
 | `HIPFIRE_GRID_TOKFAST` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GTT_CEILING_GIB` | scripts/run-bounded.sh | harness |
+| `HIPFIRE_HALO_PERF_LEVEL` | docker/hipfire-halo-tune.sh | harness |
+| `HIPFIRE_HALO_TUNE_STATE` | docker/hipfire-halo-tune.sh | harness |
 | `HIPFIRE_HAVE_2_GPU` | crates/hipfire-arch-qwen35/tests/pp_parity.rs, crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs | harness |
 | `HIPFIRE_HC_CTRL_T1024` | crates/rdna-compute/src/attention.rs, scripts/analysis/ds4-gfx1151-roofline/hcctrl.sh | developer |
 | `HIPFIRE_HFQ` | benchmarks/vision/run_bench.sh | harness |
@@ -1864,7 +1866,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_NORMALIZE_PROMPT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/build_kld_ref_native_gemma4.rs | stable |
 | `HIPFIRE_NO_DEVICE_COMPILER` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/examples/mtp_q8_det_byte_oracle.rs | experimental |
 | `HIPFIRE_NO_Q8_ROUTER` | crates/hipfire-quantize/src/pipeline.rs | developer |
-| `HIPFIRE_NO_REGISTRY_FETCH` | crates/hipfire-cli/tests/run_stats.rs, crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_NO_REGISTRY_FETCH` | crates/hipfire-cli/tests/bench_daemon_lifetime.rs, crates/hipfire-cli/tests/run_stats.rs | stable |
 | `HIPFIRE_NO_SPILL` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_NPU_SPILLOVER` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | experimental |
 | `HIPFIRE_NPU_TRUNK_TEST_MODEL` | crates/hipfire-arch-qwen4/tests/npu_trunk_model_sanity.rs | harness |
@@ -2021,7 +2023,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_MOE_DOWN_TWIN` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_MOE_GATEUP_TWIN` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_MOE_SYM_DOWN_RR` | crates/rdna-compute/examples/qwen4_moe_sym.rs, crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_QWEN4_MOE_SYM_IU4` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-config/src/lib.rs | developer |
+| `HIPFIRE_QWEN4_MOE_SYM_IU4` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-config/src/intent.rs | developer |
 | `HIPFIRE_QWEN4_MOE_SYM_PM` | crates/rdna-compute/examples/qwen4_moe_sym.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_MOE_X_LDS` | crates/rdna-compute/examples/qwen4_moe_f16_lds_oracle.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_MQ4_ROWS_PM` | crates/rdna-compute/examples/mq4_rows_oracle.rs, crates/rdna-compute/src/gemv.rs | developer |
@@ -2237,6 +2239,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_ROWS_FA_PREP` | crates/rdna-compute/src/rows_batched.rs | developer |
 | `HIPFIRE_ROWS_GATED_NORM` | crates/rdna-compute/src/rows_batched.rs | developer |
 | `HIPFIRE_ROWS_GDN` | crates/rdna-compute/src/rows_batched.rs | developer |
+| `HIPFIRE_RUN_AS_ROOT` | docker/hipfire-entrypoint.sh | harness |
 | `HIPFIRE_S4_FLAG_PROBE_UNSET_OFF` | crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_S4_FLAG_PROBE_UNSET_ON` | crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_SAMPLED_MTP_ARM` | crates/hipfire-arch-qwen35/tests/sampled_mtp_penalty_hw.rs, crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs | harness |
@@ -2270,6 +2273,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SERVE_ALLOW_REQUEST_PATHS` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_SERVE_ALLOW_REQUEST_PULL` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_SERVE_API_KEY_FILE` | crates/hipfire-cli/src/serve/mod.rs, crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_SERVE_ARGS` | docker/hipfire-entrypoint.sh | harness |
 | `HIPFIRE_SERVE_BATCH_NONEXACT` | crates/hipfire-arch-qwen35/src/forward_slots/vmm.rs, crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SERVE_BATCH_SAMPLED` | crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SERVE_BATCH_SPEC` | crates/hipfire-config/src/lib.rs, crates/hipfire-generate/src/fn_batch.rs | experimental |

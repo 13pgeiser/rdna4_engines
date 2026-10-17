@@ -340,12 +340,8 @@ nix build github:warpfront/hipfire    # build package
 Containers ([docs/CONTAINER.md](docs/CONTAINER.md)):
 
 ```bash
-podman build -f Containerfile --target runtime -t hipfire .
-podman run --rm -it --device /dev/kfd --device /dev/dri \
-  --group-add keep-groups --security-opt seccomp=unconfined \
-  -v hipfire-models:/root/.hipfire/models \
-  -v hipfire-kcache:/var/cache/hipfire \
-  hipfire run qwen3.5:4b "2+2="
+docker compose up -d      # or: podman compose up -d
+curl http://127.0.0.1:11435/v1/models
 ```
 
 ## Deprecated features
