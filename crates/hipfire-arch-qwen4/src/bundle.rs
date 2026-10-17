@@ -400,6 +400,15 @@ impl SessionState for Qwen4Bundle {
                 .as_ref()
                 .map(|band| (band, self.pp_session_policy())),
         );
+        // A slow-link load mixes in `tile_rows` tiles but checkpoints on its
+        // own cadence (`checkpoint_stride_rows`): the pair is a distinct
+        // numeric/cache identity, never aliasing an explicit chunk-1536
+        // cadence or the incumbent chunk-8192 math.
+        scope.push_str(&session_pair::slowlink_scope_tag(
+            self.slowlink
+                .profile
+                .map(|profile| (profile.tile_rows, profile.checkpoint_stride_rows)),
+        ));
         // Approximate CPU arithmetic is a different prefix-state domain. Bind
         // the actual armed layers and immutable hot-set/placement digest while
         // preserving the GPU-only and pipeline-band scope.
@@ -414,7 +423,7 @@ impl SessionState for Qwen4Bundle {
     }
 
     fn snapshot_boundaries(&self, prompt: &[u32], after: usize, up_to: usize) -> Vec<usize> {
-        let Some(chunk) = self.spec_chunk_rows() else {
+        let Some(chunk) = self.session_cadence_rows() else {
             return Vec::new();
         };
         stride_boundaries(chunk, prompt, self.turn_end_token_active(), after, up_to)
@@ -424,7 +433,7 @@ impl SessionState for Qwen4Bundle {
         if !self.tail_snapshot {
             return None;
         }
-        let chunk = self.spec_chunk_rows()?;
+        let chunk = self.session_cadence_rows()?;
         let token = self.turn_end_token?;
         let p = prompt[..up_to].iter().rposition(|&id| id == token)?;
         if p <= after
@@ -1194,7 +1203,17 @@ impl Qwen4Bundle {
             }
             _ => usize::MAX,
         };
-        let requested = qwen4_prefill_chunk_requested(gpu, max_chunk).min(ple_rows_cap);
+        // An admitted slow-link profile fixes the forward's chunk at EXACTLY
+        // its charged tile (never the incumbent helper's wider default, which
+        // would retain scratch the profile did not charge); the caller's and
+        // the PLE store's capacity must cover it, checked before any
+        // allocation. Every other load keeps the incumbent request unchanged.
+        let s1_tile = self.slowlink.profile.map(|profile| profile.tile_rows);
+        let requested =
+            session_pair::attach_chunk_request(s1_tile, max_chunk, ple_rows_cap, || {
+                qwen4_prefill_chunk_requested(gpu, max_chunk)
+            })
+            .map_err(BundleError::Forward)?;
         if requested == 0 {
             return Err(BundleError::Forward(
                 "Qwen4 PLE row store cannot stage one chunk row".to_string(),
@@ -1281,13 +1300,18 @@ impl Qwen4Bundle {
         // memory beside the kernels' lazily sized workspaces; the smallest
         // rung is attempted regardless and fails at allocation if it must.
         let (free, _) = gpu.device_mem_info().map_err(BundleError::Hip)?;
-        let max_chunk = qwen4_prefill_chunk_rungs(requested)
-            .find(|&rows| {
-                qwen4_forward_device_bytes(&self.config, rows, mode)
-                    .and_then(|bytes| bytes.checked_add(QWEN4_FORWARD_HEADROOM_BYTES))
-                    .is_some_and(|bytes| bytes <= free as u64)
-            })
-            .unwrap_or_else(|| requested.min(1536));
+        let max_chunk = match s1_tile {
+            // The charged tile, with no rung downshift: admission sized the
+            // placement and the arena for exactly these rows.
+            Some(tile) => tile,
+            None => qwen4_prefill_chunk_rungs(requested)
+                .find(|&rows| {
+                    qwen4_forward_device_bytes(&self.config, rows, mode)
+                        .and_then(|bytes| bytes.checked_add(QWEN4_FORWARD_HEADROOM_BYTES))
+                        .is_some_and(|bytes| bytes <= free as u64)
+                })
+                .unwrap_or_else(|| requested.min(1536)),
+        };
         eprintln!("  qwen4 prefill chunk: {max_chunk} rows (requested {requested})");
         let mut forward = Qwen4GpuForward::new_inner(
             gpu,

@@ -404,6 +404,62 @@ pub(crate) fn pending_backup_applies(
     saved && saved_for == Some(position)
 }
 
+/// The chunk rows [`Qwen4Bundle::attach_forward`] requests. With an admitted
+/// slow-link profile it is exactly the profile's charged tile: it must fit
+/// the S1 bound, the caller's capacity `max_chunk` and the PLE store's
+/// `ple_rows_cap`, or the attach is refused before any allocation (never a
+/// widened or narrowed chunk, never the incumbent helper). Without a profile
+/// it is the incumbent request, unchanged.
+pub(crate) fn attach_chunk_request(
+    tile_rows: Option<usize>,
+    max_chunk: usize,
+    ple_rows_cap: usize,
+    incumbent: impl FnOnce() -> usize,
+) -> Result<usize, String> {
+    let Some(tile) = tile_rows else {
+        return Ok(incumbent().min(ple_rows_cap));
+    };
+    if tile == 0 || tile > PROMPT_TILE_ROWS_MAX {
+        return Err(format!(
+            "slow-link profile tile {tile} is outside 1..={PROMPT_TILE_ROWS_MAX}"
+        ));
+    }
+    if max_chunk < tile {
+        return Err(format!(
+            "slow-link profile tile {tile} exceeds the caller's chunk capacity {max_chunk}"
+        ));
+    }
+    if ple_rows_cap < tile {
+        return Err(format!(
+            "slow-link profile tile {tile} exceeds the PLE row store's {ple_rows_cap}-row prefetch"
+        ));
+    }
+    Ok(tile)
+}
+
+/// The session cache's checkpoint cadence (the stride of its boundary list and
+/// of the lineage split): a slow-link load's own `checkpoint_stride_rows`
+/// when it has a profile, else the forward's chunk, exactly as before.
+pub(crate) fn session_cadence(
+    profile_stride: Option<usize>,
+    forward_chunk: Option<usize>,
+) -> Option<usize> {
+    match profile_stride {
+        Some(stride) if stride > 0 => Some(stride),
+        _ => forward_chunk,
+    }
+}
+
+/// Identity suffix of a slow-link load's session scope: its mixer tile AND
+/// its checkpoint cadence. Empty for every other load, so their scopes are
+/// byte-for-byte unchanged and a slow-link scope can never alias an explicit
+/// chunk-1536 cadence or the incumbent chunk-8192 numerics.
+pub(crate) fn slowlink_scope_tag(profile: Option<(usize, usize)>) -> String {
+    profile.map_or_else(String::new, |(tile, cadence)| {
+        format!("/s1tile{tile}cut{cadence}")
+    })
+}
+
 /// PLE token history after `tokens` follow `entry`.
 pub(crate) fn ple_history_after(entry: PleHistory, tokens: &[u32]) -> PleHistory {
     let mut history = entry;
@@ -713,6 +769,17 @@ impl Qwen4Bundle {
 
     pub fn slowlink_profile(&self) -> Option<&crate::slowlink_admission::SlowlinkProfile> {
         self.slowlink.profile.as_ref()
+    }
+
+    /// The session cache's boundary/lineage cadence of this bundle: the
+    /// admitted profile's checkpoint stride, else the forward chunk.
+    pub(crate) fn session_cadence_rows(&self) -> Option<usize> {
+        session_cadence(
+            self.slowlink
+                .profile
+                .map(|profile| profile.checkpoint_stride_rows),
+            self.spec_chunk_rows(),
+        )
     }
 
     /// Receipt of the most recent prefill request (`None` before any).
@@ -2400,6 +2467,123 @@ mod slowlink_txn_tests {
             reference(&ctx, &cold, &all, all.len()).snapshot()
         );
         assert_eq!((m.head_pos, m.pending), (all.len(), Some(all.len() - 1)));
+    }
+
+    #[test]
+    fn session_pair_s1_checkpoint_cadence_shares_the_incumbent_boundaries_and_a_distinct_identity()
+    {
+        let prompt = vec![1u32; 16384];
+        // A slow-link load (mixer tile 1536, checkpoint cadence 8192) keeps
+        // the incumbent chunk-8192 boundary list: one interior cut at 16K,
+        // the end boundary published at the window's commit.
+        let cadence = session_cadence(Some(8192), Some(1536)).unwrap();
+        assert_eq!(cadence, 8192);
+        let s1 = stride_boundaries(cadence, &prompt, None, 0, prompt.len());
+        let incumbent = stride_boundaries(
+            session_cadence(None, Some(8192)).unwrap(),
+            &prompt,
+            None,
+            0,
+            prompt.len(),
+        );
+        assert_eq!(s1, [8192, 16384]);
+        assert_eq!(s1, incumbent);
+        assert_eq!(prompt_cuts_in(0, prompt.len(), &s1), [8192]);
+        assert_eq!(
+            prompt_window_end(0, prompt.len(), &s1, PROMPT_TXN_MAX_CUTS),
+            prompt.len(),
+            "one window"
+        );
+        // The incumbent loop (also a bypassed request on this load) stops at
+        // the same session boundaries.
+        let mut at = 0;
+        let mut exits = Vec::new();
+        while at < prompt.len() {
+            at = s1.iter().copied().find(|&b| b > at).unwrap_or(prompt.len());
+            exits.push(at);
+        }
+        assert_eq!(exits, s1);
+        // The explicit chunk-1536 cadence would force ten interior cuts and
+        // several windows at 16K: why the cadence is the profile's own.
+        let explicit = stride_boundaries(
+            session_cadence(None, Some(1536)).unwrap(),
+            &prompt,
+            None,
+            0,
+            prompt.len(),
+        );
+        assert_eq!(prompt_cuts_in(0, prompt.len(), &explicit).len(), 10);
+        assert!(prompt_window_end(0, prompt.len(), &explicit, PROMPT_TXN_MAX_CUTS) < prompt.len());
+        // Message-end cuts still union with the cadence (unchanged scheduling).
+        let mut with_ends = prompt.clone();
+        with_ends[2] = END;
+        assert_eq!(
+            stride_boundaries(8192, &with_ends, Some(END), 0, with_ends.len()),
+            [3, 8192, 16384]
+        );
+        // No profile: the forward chunk, as before; a zero stride is not a cadence.
+        assert_eq!(session_cadence(None, Some(1536)), Some(1536));
+        assert_eq!(session_cadence(Some(0), Some(1536)), Some(1536));
+        assert_eq!(session_cadence(None, None), None);
+        // Identity: tile 1536 + cadence 8192 is neither the explicit
+        // chunk-1536 scope nor the incumbent chunk-8192 scope, and another
+        // cadence is a third scope.
+        let base = |chunk: usize| format!("qwen4/Ar/chunk{chunk}/F");
+        let s1_scope = format!("{}{}", base(1536), slowlink_scope_tag(Some((1536, 8192))));
+        let explicit_scope = format!("{}{}", base(1536), slowlink_scope_tag(None));
+        let incumbent_scope = format!("{}{}", base(8192), slowlink_scope_tag(None));
+        let other_cadence = format!("{}{}", base(1536), slowlink_scope_tag(Some((1536, 4096))));
+        let scopes = [&s1_scope, &explicit_scope, &incumbent_scope, &other_cadence];
+        for (i, a) in scopes.iter().enumerate() {
+            for b in &scopes[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(slowlink_scope_tag(None), "");
+    }
+
+    #[test]
+    fn session_pair_attach_chunk_is_the_exact_profile_tile_or_the_unchanged_incumbent() {
+        use std::cell::Cell;
+        let widened = |calls: &Cell<u32>| {
+            calls.set(calls.get() + 1);
+            8192
+        };
+        // No profile: the incumbent request, capped by the PLE store, exactly as before.
+        let calls = Cell::new(0);
+        assert_eq!(
+            attach_chunk_request(None, 16640, usize::MAX, || widened(&calls)),
+            Ok(8192)
+        );
+        assert_eq!(
+            attach_chunk_request(None, 16640, 4096, || widened(&calls)),
+            Ok(4096)
+        );
+        assert_eq!(calls.get(), 2);
+        // A profile: the charged tile for the product carrier (1536) and for a
+        // caller passing the whole context (16640); the incumbent helper is
+        // never consulted, so 8192 / 4096 scratch cannot be retained.
+        let calls = Cell::new(0);
+        assert_eq!(
+            attach_chunk_request(Some(1536), 1536, usize::MAX, || widened(&calls)),
+            Ok(1536)
+        );
+        assert_eq!(
+            attach_chunk_request(Some(1536), 16640, usize::MAX, || widened(&calls)),
+            Ok(1536)
+        );
+        assert_eq!(
+            attach_chunk_request(Some(1024), 16640, 2048, || widened(&calls)),
+            Ok(1024)
+        );
+        assert_eq!(calls.get(), 0);
+        // Capacity shortfalls and a tile beyond the S1 bound refuse, never resize.
+        assert!(attach_chunk_request(Some(1536), 1024, usize::MAX, || 0).is_err());
+        assert!(attach_chunk_request(Some(1536), 16640, 512, || 0).is_err());
+        assert!(
+            attach_chunk_request(Some(PROMPT_TILE_ROWS_MAX + 1), 16640, usize::MAX, || 0).is_err()
+        );
+        assert!(attach_chunk_request(Some(0), 16640, usize::MAX, || 0).is_err());
     }
 
     #[test]
