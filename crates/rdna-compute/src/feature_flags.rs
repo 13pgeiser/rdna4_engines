@@ -2721,6 +2721,35 @@ mod tests {
         }
     }
 
+    /// `hipfire_config::effective("kernel.iu4_prefill")` is the Settings/CLI
+    /// prediction of the route gate; it must agree with
+    /// `FeatureFlags::iu4_prefill_enabled` under the default process policy.
+    #[test]
+    fn effective_iu4_prefill_matches_iu4_prefill_enabled() {
+        use hipfire_config::effective::{effective, A8Prefill, ArchCtx};
+        use hipfire_config::ConfigValue;
+
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx1030", "gfx1101"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            let ctx = ArchCtx {
+                gpu_arch: Some(arch.into()),
+                gpu_count: 1,
+                model_arch_id: None,
+                registry_tag: None,
+                a8_prefill: A8Prefill::NotLanded,
+            };
+            let predicted = effective("kernel.iu4_prefill", &resolved, &ctx);
+            assert_eq!(predicted.value, ConfigValue::Bool(true), "arch={arch}");
+            assert_eq!(
+                predicted.used_on_gpu,
+                flags.iu4_prefill_enabled(),
+                "arch={arch}"
+            );
+        }
+    }
+
     #[test]
     fn qkvza_split_tail_defaults_false_in_test_ctor() {
         let f = FeatureFlags::for_test("gfx1100");

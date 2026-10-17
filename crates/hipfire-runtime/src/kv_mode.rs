@@ -683,7 +683,9 @@ mod tests {
 
     #[test]
     fn deprecated_kv_names_warn_supported_names_do_not() {
-        for raw in ["", "auto", "q8", "fwht2", "fwht3", "fwht4", "fp8", "bf16", "f16", "lloyd3"] {
+        for raw in [
+            "", "auto", "q8", "fwht2", "fwht3", "fwht4", "fp8", "bf16", "f16", "lloyd3",
+        ] {
             assert!(deprecated_kv_name_warning(raw).is_none(), "{raw}");
         }
         for raw in DEPRECATED_KV_NAMES {
@@ -729,6 +731,61 @@ mod tests {
         for p in [&QWEN35_PP_POLICY, &DIR_SAFETENSORS_POLICY] {
             let (k, v) = pair("auto", None, None, p, "gfx1201", true).unwrap();
             assert_eq!((k, v), (Q8, Some(VMode::Q8)), "site={}", p.site);
+        }
+    }
+
+    /// `hipfire_config::effective("memory.kv_cache")` is the Settings/CLI
+    /// prediction of the Qwen auto default; it must name the same mode the
+    /// loader resolves.
+    #[test]
+    fn effective_kv_cache_auto_matches_resolve_kv_pair() {
+        use hipfire_config::effective::{effective, A8Prefill, ArchCtx};
+        use hipfire_config::{resolve, ConfigValue};
+
+        let resolved = resolve([]).unwrap();
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx1030"] {
+            // An eligible-gfx1201 policy (accepted set contains Fp8).
+            let loaded =
+                resolve_kv_pair("auto", None, None, &QWEN35_HFQ_POLICY, arch, true).unwrap();
+            let ctx = ArchCtx {
+                gpu_arch: Some(arch.into()),
+                gpu_count: 1,
+                model_arch_id: None,
+                registry_tag: Some("qwen3.8:27b".into()),
+                a8_prefill: A8Prefill::NotLanded,
+            };
+            let predicted = effective("memory.kv_cache", &resolved, &ctx);
+            assert_eq!(
+                predicted.value,
+                ConfigValue::String(qwen_k_display_name(loaded.k()).into()),
+                "arch={arch}"
+            );
+        }
+    }
+
+    /// Native Qwen4 (`model_arch` 16) uses `resolve_qwen4`: fp8 on exact
+    /// gfx1201, bf16 elsewhere.
+    #[test]
+    fn effective_kv_cache_auto_matches_resolve_qwen4() {
+        use hipfire_config::effective::{effective, A8Prefill, ArchCtx};
+        use hipfire_config::{resolve, ConfigValue};
+
+        let resolved = resolve([]).unwrap();
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx1030", "gfx942"] {
+            let loaded = resolve_qwen4("auto", arch).unwrap();
+            let ctx = ArchCtx {
+                gpu_arch: Some(arch.into()),
+                gpu_count: 1,
+                model_arch_id: Some(16),
+                registry_tag: None,
+                a8_prefill: A8Prefill::NotLanded,
+            };
+            let predicted = effective("memory.kv_cache", &resolved, &ctx);
+            assert_eq!(
+                predicted.value,
+                ConfigValue::String(qwen_k_display_name(loaded.mode).into()),
+                "arch={arch}"
+            );
         }
     }
 
@@ -1168,7 +1225,10 @@ mod tests {
         // become an auto selection.
         let r = resolve("fp8", p);
         assert_eq!(r.mode, KvMode::Fp8);
-        assert!(r.warning.is_none(), "fp8 must resolve cleanly on the slots site");
+        assert!(
+            r.warning.is_none(),
+            "fp8 must resolve cleanly on the slots site"
+        );
         // Arch-parameterized gate: explicit fp8 on gfx1201 is honored, and
         // every other arch hard-errors naming the arch and the fix.
         let ok = resolve_qwen35_slots("fp8", "gfx1201").unwrap();
@@ -1389,7 +1449,15 @@ mod tests {
         assert_eq!(legacy.mode, Asym3);
         assert!(legacy.warning.is_none());
         // Bare asymN/turboN/fwhtN are FWHT names; no hd512 FWHT tier → q8 + warn.
-        for raw in ["asym3", "turbo3", "turbo", "fwht3", "asym4", "legacy-asym4", "garbage"] {
+        for raw in [
+            "asym3",
+            "turbo3",
+            "turbo",
+            "fwht3",
+            "asym4",
+            "legacy-asym4",
+            "garbage",
+        ] {
             let r = resolve(raw, p);
             assert_eq!(r.mode, Q8, "{raw}");
             assert!(r.warning.is_some(), "{raw} must warn");

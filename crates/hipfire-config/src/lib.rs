@@ -10,11 +10,14 @@
 //! resolved values; they do not parse user configuration in hot paths.
 
 pub mod devices;
+pub mod effective;
 pub mod emu;
 pub mod emu_budget;
 pub mod emu_model;
+pub mod evidence;
 pub mod host_memory;
 pub mod http_auth;
+pub mod intent;
 pub mod rocm;
 pub mod secret;
 
