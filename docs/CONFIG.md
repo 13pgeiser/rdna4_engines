@@ -615,6 +615,17 @@ the session-cache scope (`Q8` vs `F32` in the state-format part of the key), and
 a snapshot of one format is never restored into the other (the fixed-part
 lengths differ, and the restore refuses a length mismatch).
 
+Measured on Strix Halo (Flash-Next GPTQ3), F32 − Q8 decode KLD against the
+BF16 reference, paired per chunk: −0.006848 (95% CI −0.009145 to −0.004703) on
+code24 (24 chunks) and −0.011792 (95% CI −0.014177 to −0.009682) on a
+WikiText-2 10-chunk subset (first 10 of 24 chunks × 2048 tokens); these and the
+decode cost (−1.46% without speculation, +1.65% with native MTP, one process
+per arm) come from gate binaries built from beta `c80b9e3e7`, before the
+K1-C1/Cn gfx1151 decode GEMV and the WY GDN fix `0d06c380b`. On the release
+16K prefill lane (6 interleaved fresh processes × 3 requests, beta `0d06c380b`
+plus this change) F32 measures 2,389.98 tok/s and Q8 2,394.77 tok/s (paired
+Q8 − F32 mean +2.5 tok/s, +0.10%). Details are in the CHANGELOG.
+
 **Memory owners (storage sizes of the format, not measured costs).** For
 Flash-Next (36 GDN layers, 48 value heads, 128×128): 811,008 B (Q8) or
 3,145,728 B (F32) per layer, 27.84375 or 108 MiB per recurrent set, so each
