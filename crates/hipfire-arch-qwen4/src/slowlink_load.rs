@@ -166,9 +166,11 @@ fn load_inner(
     });
     let recipe = receipt.manifest.identity.recipe.clone();
     let source = hipfire_runtime::hfq::HfqModelSource::from_hfq(hfq);
+    // The cached process snapshot, as the product reads developer knobs.
+    let state_quant = hipfire_config::developer_var("HIPFIRE_STATE_QUANT").unwrap_or_default();
     let state_format = crate::resolve_state_format(
         &hipfire_runtime::config::get().kv_mode,
-        &std::env::var("HIPFIRE_STATE_QUANT").unwrap_or_default(),
+        &state_quant,
         gpu,
         &receipt.config,
     )?;
@@ -260,10 +262,7 @@ fn load_inner(
             Some(p) => p.resident_layers,
             None => {
                 // The incumbent's automatic placement at its own chunk.
-                let chunk = crate::gpu_forward::qwen4_prefill_chunk_placement_requested(
-                    &load.gpu.arch,
-                    max_seq,
-                );
+                let chunk = crate::gpu_forward::qwen4_prefill_chunk_requested(load.gpu, max_seq);
                 let inputs = residency::placement_inputs(&residency::PlacementInputsArgs {
                     gpu: load.gpu,
                     config: load.config,
