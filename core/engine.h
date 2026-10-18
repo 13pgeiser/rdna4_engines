@@ -98,6 +98,9 @@ private:
     /* serve()'s startup stall watch, released when the server listens (run_server) or the KL
      * mode starts (run_kld). */
     std::unique_ptr<StallWatch> startup_watch_;
+    /* rad_mono_ns at the top of start(), so serve() can report how long bringup took. The same
+     * span the startup watch covers (main.cpp creates it here and ends it at the listen). */
+    uint64_t              startup_begin_ns_ = 0;
     std::vector<std::thread>           rank_threads_;
 
     Config cfg_;

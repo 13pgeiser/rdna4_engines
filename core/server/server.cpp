@@ -207,6 +207,16 @@ void Server::register_routes() {
  * number bounds the connections that may wait once the reserve is busy too. */
 static const int64_t kSpareWorkers = 64;
 
+void Server::note_ready(uint64_t begin_ns) {
+    if (begin_ns == 0) return;
+    const uint64_t now = rad_mono_ns();
+    /* Only a start in the past is a duration. A stamp that arrives out of order is ignored rather
+     * than written as zero: the page divides by this figure, and a zero cost would price every
+     * restart as free. */
+    if (now <= begin_ns) return;
+    startup_s_ = (int64_t)((now - begin_ns) / 1000000000ull);
+}
+
 int Server::run() {
     TransportOptions t;
     t.host = opt_.host;

@@ -191,6 +191,12 @@ public:
     /* The admission ceiling as resolved: ServerOptions::queue_depth, or 8 x max_seqs for 0. */
     int64_t  queue_cap() const { return queue_depth_; }
 
+    /* Records how long bringup took, called by Engine::serve just before it starts listening
+     * (the same moment the startup watch ends). `begin_ns` is rad_mono_ns from the top of
+     * Engine::start(); 0 leaves the figure unset. run() blocks serving forever, so the value is
+     * handed in rather than taken inside it. */
+    void note_ready(uint64_t begin_ns);
+
 private:
     struct Generation;
     struct TranscriptionJob;   /* speech.cpp */
@@ -351,6 +357,9 @@ private:
     std::atomic<int64_t> speech_sessions_{0};
     std::atomic<bool>    stopping_{false};
     int64_t              started_at_ = 0;
+    /* Seconds from the top of Engine::start() to the moment the server began listening -- the
+     * cost of a restart, measured on this machine rather than guessed. 0 until note_ready(). */
+    int64_t              startup_s_ = 0;
 
     /* Sinks whose HTTP side is gone but whose engine side may still be mid-step. Held until the
      * scheduler reports the request terminal, because Request::sink is a raw pointer and freeing

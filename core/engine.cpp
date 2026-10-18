@@ -2629,6 +2629,7 @@ int Engine::run_server() {
 
     /* Startup ends here; a quiet server from now on is an idle one. */
     startup_watch_.reset();
+    srv.note_ready(startup_begin_ns_);
     const int rc = srv.run();
     /* The watcher tests `watching` first, so clearing it ends the thread without a second stop;
      * run() has already torn the transport down. Joining costs up to one sleep interval. */

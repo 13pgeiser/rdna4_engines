@@ -125,6 +125,9 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
     o["model"]     = opt_.model_id;
     o["version"]   = opt_.version;
     o["uptime_s"]  = unix_now() - started_at_;
+    /* How long this process took to come up, measured on this machine: the price of a restart,
+     * which the page needs to say whether a restart pays back. 0 before the server listens. */
+    o["startup_s"] = startup_s_;
     o["in_flight"] = in_flight_.load(std::memory_order_relaxed);
     o["queue_cap"] = queue_depth_;
     o["now_ms"]    = (int64_t)std::time(nullptr) * 1000;

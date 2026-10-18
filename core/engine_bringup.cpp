@@ -5,6 +5,7 @@
  * Separate from engine.cpp (the hot step loop), with which it shares only the Engine's fields.
  */
 #include "engine_priv.h"
+#include "rad_internal.h"
 #include "engine_hostmem.h"
 #include "gen/driver.h"
 #include "gen/audio_driver.h"
@@ -3124,6 +3125,7 @@ int Engine::configure_kv() {
 
 /* ================================================================== start */
 int Engine::start() {
+    startup_begin_ns_ = rad_mono_ns();
     std::vector<int> devs;
     std::string inventory;
     std::string devnote;
