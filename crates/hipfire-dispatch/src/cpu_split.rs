@@ -30,8 +30,8 @@ use crate::cpwait::{
 use crate::families::moe::RoutedExpertWeights;
 use crate::types::DispatchError;
 use hip_bridge::{
-    HipError, InputReady, MappedHostBuffer, MappedPublished, PinnedTransferBuffer, SignalGen,
-    SignalWord, SIGNAL_ABORT,
+    HipError, MappedHostBuffer, MappedPublished, PinnedTransferBuffer, SignalGen, SignalWord,
+    SIGNAL_ABORT,
 };
 use hipfire_config::memory::{D2Join, D2Ready, D2Return};
 use hipfire_cpu::quant::CpuQuant;
@@ -233,6 +233,24 @@ pub fn select_join_mode(
                 },
             }
         }
+    }
+}
+
+/// How `prepare` waits for its input downloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputWait {
+    /// Blocking stream synchronizations (the original boundary).
+    StreamSync,
+    /// An event proof polled within [`READY_SPIN_BUDGET`].
+    EventSpin,
+}
+
+/// The input wait of a configured readiness. The same under the host and the
+/// CP-wait join: the CP-wait join arms no readiness word of its own.
+fn input_wait(ready: D2Ready) -> InputWait {
+    match ready {
+        D2Ready::Sync => InputWait::StreamSync,
+        D2Ready::Event => InputWait::EventSpin,
     }
 }
 
@@ -521,7 +539,7 @@ struct Transaction {
     mapped_call: bool,
     /// `mapped_retire_waits` when this call's `prepare` began.
     waits_base: u64,
-    /// Generation of this call's ready/join words (CP-wait executors).
+    /// Generation of this call's join word (CP-wait executors).
     cp_gen: u32,
 }
 
@@ -534,11 +552,10 @@ struct MappedReturn {
     buf: RefCell<MappedHostBuffer>,
 }
 
-/// The CP-wait join of one executor: a ready word the GPU writes after the
-/// input downloads, a join word the CPU writes after the slots, the gate that
-/// funnels every error into an abort, and the watchdog arm. Dropping it stops
-/// the watchdog arm first, then releases any queued wait (each word's drop
-/// stores the abort value before it drains).
+/// The CP-wait join of one executor: a join word the CPU writes after the
+/// slots, the gate that funnels every error into an abort, and the watchdog
+/// arm. Dropping it stops the watchdog arm first, then releases any queued wait
+/// (the word's drop stores the abort value before it drains).
 struct CpWait {
     gate: RefCell<JoinGate>,
     /// The watchdog arm of the queued wait, if any.
@@ -547,12 +564,11 @@ struct CpWait {
     watchdog: &'static Watchdog<SystemClock>,
     gen: Cell<SignalGen>,
     joins: Cell<u64>,
-    ready_word: SignalWord,
     join_word: SignalWord,
 }
 
-/// [`GatePort`] over a [`CpWait`]'s words, its watchdog and (when present) the
-/// device.
+/// [`GatePort`] over a [`CpWait`]'s join word, its watchdog and (when present)
+/// the device.
 struct CpPort<'a> {
     cp: &'a CpWait,
     gpu: Option<&'a Gpu>,
@@ -634,7 +650,7 @@ impl Drop for CpWait {
 /// like its other model-owned tensors. CPU work never outlives `join`.
 pub struct CpuSplitExecutor {
     /// CP-wait join; `None` selects the host join. Declared FIRST so it drops
-    /// first: its signal words release any queued wait before the transfer
+    /// first: its signal word releases any queued wait before the transfer
     /// buffers (which synchronize the device) or the mapped buffer drop.
     cpwait: Option<CpWait>,
     dim: usize,
@@ -666,10 +682,10 @@ pub struct CpuSplitExecutor {
     /// Input readiness mechanism (`HIPFIRE_QWEN4_D2_READY`); `Sync` is the
     /// original boundary.
     ready: D2Ready,
-    /// Readiness polls (event query or ready-word load), ever.
+    /// Readiness polls (event queries), ever.
     ready_polls: Cell<u64>,
-    /// Blocking stream synchronizations an event/word readiness still needed
-    /// (spin budget exhausted, or a buffer the proof does not cover), ever.
+    /// Blocking stream synchronizations event readiness still needed (spin
+    /// budget exhausted, or a buffer the proof does not cover), ever.
     ready_fallback_syncs: Cell<u64>,
     /// Why a requested CP-wait join was refused (host join kept).
     join_refusal: Option<String>,
@@ -832,15 +848,15 @@ impl CpuSplitExecutor {
     }
 
     /// `(ready_polls, ready_fallback_syncs)`, each cumulative: readiness polls
-    /// (event queries or ready-word loads) and the blocking stream
-    /// synchronizations event/word readiness still needed.
+    /// (event queries) and the blocking stream synchronizations event readiness
+    /// still needed.
     pub fn ready_counters(&self) -> (u64, u64) {
         (self.ready_polls.get(), self.ready_fallback_syncs.get())
     }
 
     /// Select event readiness (`HIPFIRE_QWEN4_D2_READY=event`). Call once, at
     /// load, before the first `prepare`. The default is the original stream
-    /// synchronization. Under the CP-wait join the ready word replaces both.
+    /// synchronization. Either join uses the configured readiness.
     pub fn enable_event_ready(&mut self) -> Result<D2Ready, DispatchError> {
         let st = self.state.get_mut();
         if st.failed || st.ready {
@@ -930,12 +946,8 @@ impl CpuSplitExecutor {
                 return Ok(D2Join::Host);
             }
         };
-        let words = gpu
-            .hip
-            .signal_word()
-            .and_then(|ready| Ok((ready, gpu.hip.signal_word()?)));
-        let (ready_word, join_word) = match words {
-            Ok(words) => words,
+        let join_word = match gpu.hip.signal_word() {
+            Ok(word) => word,
             Err(error) => {
                 self.join_refusal = Some(format!(
                     "signal word allocation failed: {error} (host join kept)"
@@ -946,7 +958,7 @@ impl CpuSplitExecutor {
         let abort_ptr = join_word.host_ptr();
         let target = Arc::new(JoinTarget::new(Box::new(move || {
             // SAFETY: the join word outlives every watchdog arm: `CpWait`
-            // disarms its arm before its words drop, and `Watchdog::disarm` is
+            // disarms its arm before its word drops, and `Watchdog::disarm` is
             // serialized with this call.
             unsafe { abort_ptr.store(SIGNAL_ABORT) }
         })));
@@ -957,7 +969,6 @@ impl CpuSplitExecutor {
             watchdog,
             gen: Cell::new(SignalGen::new()),
             joins: Cell::new(0),
-            ready_word,
             join_word,
         });
         Ok(D2Join::CpWait)
@@ -1196,48 +1207,29 @@ impl CpuSplitExecutor {
     }
 
     /// Wait for the three input downloads of `prepare`, then retire the older
-    /// mask/output transfers. `Sync` is the original boundary: three stream
-    /// synchronizations, byte for byte. `Event` and the CP-wait ready word arm a
-    /// proof after the downloads and spin on it ([`READY_SPIN_BUDGET`]); a spin
-    /// that expires, or an older buffer the proof does not cover, falls back to
-    /// the blocking synchronization and is counted.
+    /// mask/output transfers, by the configured readiness ([`input_wait`]) under
+    /// either join. `Sync` is the original boundary: three stream
+    /// synchronizations, byte for byte. `Event` arms a proof after the downloads
+    /// and spins on it ([`READY_SPIN_BUDGET`]); a spin that expires, or an older
+    /// buffer the proof does not cover, falls back to the blocking
+    /// synchronization and is counted.
     fn await_inputs(&self, gpu: &Gpu, st: &mut Transaction) -> Result<(), DispatchError> {
-        if let Some(cp) = self.cpwait.as_ref() {
-            let gen = st.cp_gen;
-            return self.await_ready(
-                gpu,
-                st,
-                |input| input.arm_ready_word(&gpu.hip, &cp.ready_word, gen),
-                |input, proof| input.try_complete_ready_word(proof, &cp.ready_word),
-            );
-        }
-        match self.ready {
-            D2Ready::Sync => {
+        match input_wait(self.ready) {
+            InputWait::StreamSync => {
                 st.input.complete(&gpu.hip).map_err(err)?;
                 // These may synchronize the stream, intentionally BEFORE its tail.
                 st.mask.complete(&gpu.hip).map_err(err)?;
                 st.output.complete(&gpu.hip).map_err(err)
             }
-            D2Ready::Event => self.await_ready(
-                gpu,
-                st,
-                |input| input.arm_ready(&gpu.hip),
-                |input, proof| input.try_complete_ready(&gpu.hip, proof),
-            ),
+            InputWait::EventSpin => self.await_event_ready(gpu, st),
         }
     }
 
-    fn await_ready(
-        &self,
-        gpu: &Gpu,
-        st: &mut Transaction,
-        arm: impl FnOnce(&mut PinnedTransferBuffer) -> Result<InputReady, HipError>,
-        mut poll: impl FnMut(&mut PinnedTransferBuffer, &mut InputReady) -> Result<bool, HipError>,
-    ) -> Result<(), DispatchError> {
-        let mut proof = arm(&mut st.input).map_err(err)?;
+    fn await_event_ready(&self, gpu: &Gpu, st: &mut Transaction) -> Result<(), DispatchError> {
+        let mut proof = st.input.arm_ready(&gpu.hip).map_err(err)?;
         let start = Instant::now();
         let outcome = spin_until_ready(
-            || poll(&mut st.input, &mut proof),
+            || st.input.try_complete_ready(&gpu.hip, &mut proof),
             || start.elapsed(),
             READY_SPIN_BUDGET,
         )
@@ -1596,7 +1588,7 @@ impl CpuSplitExecutor {
                 .map_err(err)?;
             self.await_inputs(gpu, &mut st)?;
             if retire_first {
-                // The input proof (a synchronization, or the event/word that
+                // The input proof (a synchronization, or the event that
                 // follows the previous layer's work on this stream) puts the
                 // previous generation's combine behind it, so this is a poll,
                 // not a wait. Nothing can write the buffer before it.
@@ -2045,7 +2037,7 @@ impl CpuSplitExecutor {
             cpwait,
             ..
         } = self;
-        // The CP-wait words go first: each stores the abort value, drains the
+        // The CP-wait word goes first: it stores the abort value, drains the
         // device and frees itself, and the watchdog arm is already disarmed.
         drop(cpwait);
         drop(state);
@@ -2367,6 +2359,24 @@ mod return_tests {
         let empty = select_join_mode(D2Join::CpWait, D2ReturnMode::Mapped, &[], true);
         assert!(empty.refusal.is_some());
         assert_eq!(empty.mode, D2Join::Host);
+    }
+
+    #[test]
+    fn cpwait_arms_no_readiness_word_and_uses_the_configured_readiness() {
+        // Both joins wait for the inputs through the one configured mechanism.
+        assert_eq!(input_wait(D2Ready::Sync), InputWait::StreamSync);
+        assert_eq!(input_wait(D2Ready::Event), InputWait::EventSpin);
+        // The executor arms no readiness word: no production code names one.
+        let production = include_str!("cpu_split.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for word_path in ["arm_ready_word", "try_complete_ready_word", "ready_word"] {
+            assert!(
+                !production.contains(word_path),
+                "{word_path} reappeared in the executor"
+            );
+        }
     }
 
     #[test]

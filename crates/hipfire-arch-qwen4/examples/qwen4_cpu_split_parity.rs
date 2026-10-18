@@ -36,7 +36,9 @@
 //! the tensor the combine actually read (the mapped view in mapped mode).
 //! `HIPFIRE_QWEN4_D2_READY=sync|event` (default `sync`) selects the input-readiness
 //! mechanism of `prepare` and `HIPFIRE_QWEN4_D2_JOIN=host|cpwait` (default `host`) the
-//! join. The effective per-layer modes, the cumulative `ready_polls`,
+//! join. Readiness is the configured `HIPFIRE_QWEN4_D2_READY` mode under either join:
+//! the CP-wait join reports the same `sync`/`event` readiness as the host join. The
+//! effective per-layer modes, the cumulative `ready_polls` (event queries),
 //! `ready_fallback_syncs`, `cpwait_joins`, `cpwait_aborts` and `watchdog_fires`
 //! counters are printed and written to the JSON (`d2_ready_modes`, `d2_join_modes`,
 //! `d2_readiness_counters`); an `event` run gates on its layers having polled. The

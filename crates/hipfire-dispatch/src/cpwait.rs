@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use hip_bridge::SIGNAL_ABORT;
 
-/// How long `prepare` spins on the readiness proof (event or ready word)
+/// How long `prepare` spins on the event readiness proof
 /// before it falls back to the blocking stream synchronization.
 pub const READY_SPIN_BUDGET: Duration = Duration::from_millis(2);
 
