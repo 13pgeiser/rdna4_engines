@@ -1757,12 +1757,15 @@ function update(s, dt) {
   /* THE STEP AS A PERCENTAGE OF THE FASTEST THIS PROCESS HAS DONE AT THIS CONCURRENCY: 100% is the fastest step, anything slower a percentage of it. Keyed by
  * concurrency on purpose: a c8 step read against the single-stream floor would report the batch
  * arriving as a slowdown -- the mistake that took the old drift line out. Raw ratio, no
- * threshold, no colour: the number is the statement. */
+ * threshold, no colour: the number is the statement. Capped at 100: `now` is a ~500 ms poll mean while
+ * `best` is a 32-step window mean, so a fast stretch shorter than a window can read faster than the
+ * recorded floor. That is "at your best", not a new record -- the engine only ratchets the floor on a
+ * completed 32-step window, and a sub-window blip is not one. */
   if (s.running > 0 && lastStepMs != null) {
     const k = s.running;
     if (!(k in bestAt) || lastStepMs < bestAt[k]) bestAt[k] = lastStepMs;
     const ref = k === 1 && floorMs > 0 ? floorMs : bestAt[k];
-    if (ref > 0) det += " · now " + Math.round(100 * ref / lastStepMs) + "% of best" + (k === 1 ? "" : "@c" + k);
+    if (ref > 0) det += " · now " + Math.min(100, Math.round(100 * ref / lastStepMs)) + "% of best" + (k === 1 ? "" : "@c" + k);
   }
   $("m-stepdet").textContent = det;
 
