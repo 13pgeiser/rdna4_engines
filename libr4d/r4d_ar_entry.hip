@@ -20,6 +20,7 @@
 
 #include "r4d_args.h"
 #include "r4d.h"
+#include "r4d_ar_shards.h"
 
 #include <condition_variable>
 #include <cstdio>
@@ -68,6 +69,7 @@ struct Rendezvous {
     long flags  [R4D_MAX_RANKS] = { 0 };
     long seq    [R4D_MAX_RANKS] = { 0 };
     int  dev    [R4D_MAX_RANKS] = { 0 };
+    int  shard_w[R4D_MAX_RANKS][R4D_MAX_RANKS] = { { 0 } };
     int  failed = 0;
 };
 
@@ -111,6 +113,10 @@ struct ArInst {
      * each card reaches over its own link (see build). */
     int  host       = 0;
     long gate_ctr   = 0;      /* the blocks that have seen their peer's bytes land (r4d_ar_seq.h) */
+    /* The eight-rank two-shot's per-rank shard weights (r4d_ar_shards.h), fixed at build so the
+     * scratch was sized for them and a recorded launch keeps its table. */
+    int  shard_weighted = 0;
+    int  shard_w[R4D_MAX_RANKS] = { 0 };
 };
 
 /* A parameter that may be declared as a range: init gets one band's frozen geometry, and buffers
@@ -127,6 +133,29 @@ long long pgeti_hi(const RadParam* p, int n_p, const char* k, long long dflt) {
 
 long align16(long v) { return (v + 15) & ~15L; }
 
+/* RADIANCE_AR8_SHARD_WEIGHTS, read at every eight-rank build so a process can change it between
+ * instances; each rank reads it and build() checks that they agree. */
+bool ar8_shard_weights(int* w) {
+    const char* e = std::getenv(R4D_AR8_SHARD_WEIGHTS_ENV);
+    if (!e || !*e) return false;
+    static std::once_flag said_bad, said_on;
+    int got[8];
+    if (!r4d_ar_shard_weights_parse(e, 8, got)) {
+        std::call_once(said_bad, [e] {
+            std::fprintf(stderr, "[r4d] %s=\"%s\" ignored (needs eight non-negative integers, "
+                         "comma-separated, sum > 0); eight-rank two-shot shards stay even\n",
+                         R4D_AR8_SHARD_WEIGHTS_ENV, e);
+        });
+        return false;
+    }
+    std::memcpy(w, got, sizeof(got));
+    std::call_once(said_on, [w] {
+        std::fprintf(stderr, "[r4d] eight-rank two-shot shards weighted %d,%d,%d,%d,%d,%d,%d,%d\n",
+                     w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+    });
+    return true;
+}
+
 /* Sequence counter allocation in words: 2 * nbw (r4d_ar_seq.h), then r4d_ar_link_landed's block
  * counter, padded to a cache line. */
 long kSeqWords(long nbw) { return 2L * nbw + 32; }
@@ -136,7 +165,9 @@ long kSeqWords(long nbw) { return 2L * nbw + 32; }
  * One sizing rule for the whole family: a slot holds a full message. The one-shots need exactly
  * that; the two-shot's two regions (2 * message / world_size) and the tiered-int8 wire's two
  * images (2 * ceil(shard/32) * 38 bytes) are smaller. RadInitFn is not told which row resolved,
- * so sizing for the maximum avoids reconstructing which kernel this instance serves.
+ * so sizing for the maximum avoids reconstructing which kernel this instance serves. The one
+ * exception is a weighted eight-rank two-shot whose largest weight is over half the sum: its two
+ * regions of the longest shard outgrow a message, and the slot grows to hold them.
  *
  * Cost: at a 4096-token chunk on a 5120-wide residual, 40 MiB a slot and 80 MiB for the pair. One
  * set serves every op with the same (rank, world, dtype, bound); see the cache below. */
@@ -153,6 +184,15 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
     in->max_numel = (long)max_numel;
     in->slot_bytes = align16((long)max_numel * in->esize);
     in->slot16 = in->slot_bytes / 16;
+    if (world == 8 && ar8_shard_weights(in->shard_w)) {
+        in->shard_weighted = 1;
+        const long need16 =
+            2 * r4d_ar_shard_max_bound((long)max_numel * in->esize / 16, 8, in->shard_w);
+        if (need16 > in->slot16) {
+            in->slot16 = need16;
+            in->slot_bytes = need16 * 16;
+        }
+    }
 
     int maxb = 0, nb_design = 0, max_peers = 0;
     if (world == 2) {
@@ -223,9 +263,20 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
         g_rv.flags[rank]   = fl;
         g_rv.seq[rank]     = sq;
         g_rv.dev[rank]     = dev;
+        for (int i = 0; i < R4D_MAX_RANKS; ++i)
+            g_rv.shard_w[rank][i] = in->shard_weighted ? in->shard_w[i] : -1;
     }
     int rc = rv_barrier(world);
     if (rc != RAD_OK) return rc;
+
+    /* Every rank must cut the message at the same words, or an owner reduces words its peers
+     * pushed elsewhere. All ranks compare the same table, so all refuse together. */
+    for (int r = 0; r < world; ++r)
+        if (std::memcmp(g_rv.shard_w[r], g_rv.shard_w[rank], sizeof(g_rv.shard_w[rank]))) {
+            std::fprintf(stderr, "[r4d] ranks %d and %d read different %s\n", rank, r,
+                         R4D_AR8_SHARD_WEIGHTS_ENV);
+            return RAD_E_STATE;
+        }
 
     /* Peer access is per context, so each rank enables its own, after the publish barrier where
      * peer device ordinals are known. A host can expose more HIP devices than ranks (e.g. an
@@ -494,7 +545,11 @@ static int ar_setup(const RadArgs* a, ArCall* c, int shard_nb) {
     c->pub      = cfgv.pub;
 
     const long words16 = (long)n * in->esize / 16;
-    const long basis   = shard_nb ? words16 / in->world : words16;
+    long basis = shard_nb ? words16 / in->world : words16;
+    if (shard_nb && in->shard_weighted) {
+        long off[R4D_MAX_RANKS + 1];
+        basis = r4d_ar_shard_table(words16, in->world, in->shard_w, off);
+    }
     /* The two-shots move shards, so they use the smaller basis and a tighter ceiling; the
      * full-message rule over-launches across the mid band. */
     int cap = in->nb_cap;
@@ -842,10 +897,14 @@ extern "C" int r4d_rad_ar_twoshot_8rank_exact(const RadArgs* a, RadStream s) {
     if (rc != RAD_OK) return rc;
     if (c.in->world != 8) return RAD_E_SHAPE;
     if (c.numel > R4D_AR_TWOSHOT_WIDE_MAX_ELEMS) return RAD_E_SHAPE;
-    const long words16 = c.numel * c.in->esize / 16;
-    if (words16 % c.in->world) return RAD_E_SHAPE;
-    if (2 * (c.numel * c.in->esize) / c.in->world > c.in->slot_bytes) return RAD_E_SCRATCH;
     const ArInst* in = c.in;
+    const int* weights = in->shard_weighted ? in->shard_w : nullptr;
+    /* Even shards keep the four-rank rule (whole words a rank); weighted ones are uneven anyway. */
+    const long words16 = c.numel * in->esize / 16;
+    if (!weights && words16 % in->world) return RAD_E_SHAPE;
+    long off[R4D_MAX_RANKS + 1];
+    const long sh_max = r4d_ar_shard_table(words16, in->world, weights, off);
+    if (2 * sh_max * 16 > in->slot_bytes) return RAD_E_SCRATCH;
     R4D_TRY("ar_twoshot_8rank_exact",
         r4d_ar_twoshot_8rank_exact(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
                                    in->peer_scratch[3], in->peer_scratch[4], in->peer_scratch[5],
@@ -856,7 +915,7 @@ extern "C" int r4d_rad_ar_twoshot_8rank_exact(const RadArgs* a, RadStream s) {
                                    in->my_scratch, in->my_flags, in->my_seq, in->slot16,
                                    c.inp, c.out, c.numel, in->dtype, in->rank,
                                    (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
-                                   c.pub));
+                                   c.pub, weights));
     return RAD_OK;
 }
 

@@ -35,6 +35,7 @@
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_args.h"
+#include "r4d_ar_shards.h"
 #include "r4d_hc_fp8.h"
 #include "r4d_fp8_frag.h"
 #include "r4d_fp8_lm.h"
@@ -16239,6 +16240,82 @@ static void ar_pattern_worker(ArPattern* t) {
     st_free(out);
 }
 
+/* An environment variable set (or, with a null value, cleared) for one scope and restored after
+ * it: the eight-rank two-shot reads its settings at every init. */
+struct ScopedEnv {
+    const char* name;
+    bool had;
+    std::string kept;
+    ScopedEnv(const char* n, const char* v) : name(n) {
+        const char* was = std::getenv(n);
+        had = was != nullptr;
+        if (was) kept = was;
+        if (v) setenv(n, v, 1); else unsetenv(n);
+    }
+    ~ScopedEnv() { if (had) setenv(name, kept.c_str(), 1); else unsetenv(name); }
+    ScopedEnv(const ScopedEnv&) = delete;
+    ScopedEnv& operator=(const ScopedEnv&) = delete;
+};
+
+struct ArPatternRun { const char* dtype; std::vector<int64_t> sizes; int oop; };
+
+/* One run on a fresh instance per rank, every size checked against the fold. False when init
+ * failed, so the caller stops instead of reporting every later run as failed too. */
+static bool ar_pattern_check(const RadKernelInfo* row, const std::vector<int>& devs,
+                             const std::string& name, int world, const ArPatternRun& run) {
+    std::vector<ArPattern> t((size_t)world);
+    std::vector<std::thread> th;
+    for (int r = 0; r < world; ++r) {
+        t[(size_t)r].row = row; t[(size_t)r].rank = r; t[(size_t)r].dev = devs[(size_t)r];
+        t[(size_t)r].world = world;
+        t[(size_t)r].dtype = run.dtype; t[(size_t)r].sizes = run.sizes;
+        t[(size_t)r].out_of_place = run.oop;
+        th.emplace_back(ar_pattern_worker, &t[(size_t)r]);
+    }
+    for (std::thread& x : th) x.join();
+    const std::string what = name + " " + run.dtype;
+    bool up = true, ran = true;
+    std::string rcs;
+    for (const ArPattern& a : t) {
+        up = up && a.rc_init == RAD_OK; ran = ran && a.rc_launch == RAD_OK;
+        rcs += std::to_string(a.rc_init) + "/" + std::to_string(a.rc_launch) + " ";
+    }
+    ok((what + " init (peer rendezvous)").c_str(), up, "init/launch rc " + rcs);
+    if (!up) return false;
+    ok((what + " launches").c_str(), ran, "init/launch rc " + rcs);
+    if (ran) {
+        const bool bf = !std::strcmp(run.dtype, "bf16");
+        for (size_t k = 0; k < run.sizes.size(); ++k) {
+            const int64_t n = run.sizes[k];
+            int64_t bad = 0, first = -1;
+            for (int64_t i = 0; i < n; ++i) {
+                float acc = 0.0f;
+                for (int r = 0; r < world; ++r) {
+                    const float v = ar_pattern_value(r, i);
+                    acc += bf ? h_bf16(h_to_bf16(v)) : v;
+                }
+                const float want = bf ? h_bf16(h_to_bf16(acc)) : acc;
+                for (int r = 0; r < world; ++r)
+                    if (t[(size_t)r].out.size() <= k || t[(size_t)r].out[k][(size_t)i] != want) {
+                        if (first < 0) first = i;
+                        ++bad;
+                    }
+            }
+            const int64_t words = n * (bf ? 2 : 4) / 16;
+            const std::string label =
+                what + " numel " + std::to_string(n) + " (" + std::to_string(words) +
+                " words, % " + std::to_string(world) + " = " +
+                std::to_string(words % world) +
+                ((int)k == run.oop ? ", out of place" : ", in place") +
+                ") == fp32 ascending-rank fold on every rank, bit for bit";
+            ok(label.c_str(), bad == 0,
+               std::to_string(bad) + " elements wrong, first at " + std::to_string(first));
+        }
+    }
+    if (row->fini) for (ArPattern& a : t) if (a.inst) row->fini(a.inst);
+    return true;
+}
+
 static void ar_wide_pattern(const Plugin& pl, const std::vector<int>& devs, const char* name,
                             int world) {
     const RadKernelInfo* row = find(pl, name);
@@ -16247,12 +16324,13 @@ static void ar_wide_pattern(const Plugin& pl, const std::vector<int>& devs, cons
         skip(name, (std::string("needs ") + std::to_string(world) + " gfx1201 cards").c_str());
         return;
     }
-    struct Run { const char* dtype; std::vector<int64_t> sizes; int oop; };
+    using Run = ArPatternRun;
     /* The three-rank list walks the UNEVEN split (words % 3 of 0, 1 and 2); the four- and
      * eight-rank rows cannot be given one -- cArTsExact4/cArTsExact8/cArTi8Ts4 constrain numel so
      * the words divide evenly (r4d_rows.cpp; every size below is a multiple of 64 elements, so
-     * the words divide by eight too), and the two-shot's own entry refuses any other message --
-     * so their list keeps the whole-word sizes and the band edges instead. */
+     * the words divide by eight too), and without shard weights the two-shot's own entry refuses
+     * any other message -- so their list keeps the whole-word sizes and the band edges instead
+     * (uneven eight-rank shards: ar_wide_weighted). */
     std::vector<Run> runs;
     if (world == 3) {
         runs = {
@@ -16279,64 +16357,16 @@ static void ar_wide_pattern(const Plugin& pl, const std::vector<int>& devs, cons
             { "fp32", { 8192, 8256, 1048576 }, 0 },
         };
     }
-    for (const Run& run : runs) {
-        std::vector<ArPattern> t((size_t)world);
-        std::vector<std::thread> th;
-        for (int r = 0; r < world; ++r) {
-            t[(size_t)r].row = row; t[(size_t)r].rank = r; t[(size_t)r].dev = devs[(size_t)r];
-            t[(size_t)r].world = world;
-            t[(size_t)r].dtype = run.dtype; t[(size_t)r].sizes = run.sizes;
-            t[(size_t)r].out_of_place = run.oop;
-            th.emplace_back(ar_pattern_worker, &t[(size_t)r]);
-        }
-        for (std::thread& x : th) x.join();
-        const std::string what = std::string(name) + " " + run.dtype;
-        bool up = true, ran = true;
-        std::string rcs;
-        for (const ArPattern& a : t) {
-            up = up && a.rc_init == RAD_OK; ran = ran && a.rc_launch == RAD_OK;
-            rcs += std::to_string(a.rc_init) + "/" + std::to_string(a.rc_launch) + " ";
-        }
-        ok((what + " init (peer rendezvous)").c_str(), up, "init/launch rc " + rcs);
-        if (!up) return;
-        ok((what + " launches").c_str(), ran, "init/launch rc " + rcs);
-        if (ran) {
-            const bool bf = !std::strcmp(run.dtype, "bf16");
-            for (size_t k = 0; k < run.sizes.size(); ++k) {
-                const int64_t n = run.sizes[k];
-                int64_t bad = 0, first = -1;
-                for (int64_t i = 0; i < n; ++i) {
-                    float acc = 0.0f;
-                    for (int r = 0; r < world; ++r) {
-                        const float v = ar_pattern_value(r, i);
-                        acc += bf ? h_bf16(h_to_bf16(v)) : v;
-                    }
-                    const float want = bf ? h_bf16(h_to_bf16(acc)) : acc;
-                    for (int r = 0; r < world; ++r)
-                        if (t[(size_t)r].out.size() <= k || t[(size_t)r].out[k][(size_t)i] != want) {
-                            if (first < 0) first = i;
-                            ++bad;
-                        }
-                }
-                const int64_t words = n * (bf ? 2 : 4) / 16;
-                const std::string label =
-                    what + " numel " + std::to_string(n) + " (" + std::to_string(words) +
-                    " words, % " + std::to_string(world) + " = " +
-                    std::to_string(words % world) +
-                    ((int)k == run.oop ? ", out of place" : ", in place") +
-                    ") == fp32 ascending-rank fold on every rank, bit for bit";
-                ok(label.c_str(), bad == 0,
-                   std::to_string(bad) + " elements wrong, first at " + std::to_string(first));
-            }
-        }
-        if (row->fini) for (ArPattern& a : t) if (a.inst) row->fini(a.inst);
-    }
+    for (const Run& run : runs)
+        if (!ar_pattern_check(row, devs, name, world, run)) return;
     /* The four- and eight-rank rows' even-shard rule, checked from the one place that can: a
-     * message whose 16-byte words do not divide by the world must be REFUSED
-     * (r4d_ar_twoshot_Nrank_exact.hip shards it evenly and the entry throws on any residual), not
-     * launched with a truncated tail. The three-rank row has no such rule -- it splits unevenly
-     * by design. 40 bf16 elements are 5 words (5 % 4 != 0), 72 are 9 (9 % 8 != 0). */
+     * message whose 16-byte words do not divide by the world must be REFUSED, not launched with a
+     * truncated tail. The three-rank row has no such rule -- it splits unevenly by design -- and
+     * neither has a weighted eight-rank one (ar_wide_weighted), so the rule is checked without
+     * weights whatever the environment. 40 bf16 elements are 5 words (5 % 4 != 0), 72 are 9
+     * (9 % 8 != 0). */
     if (world >= 4 && std::strstr(name, "twoshot")) {
+        ScopedEnv even(R4D_AR8_SHARD_WEIGHTS_ENV, nullptr);
         const int64_t odd = world == 4 ? 40 : 72;
         const std::string w = std::to_string(world);
         std::vector<ArPattern> t((size_t)world);
@@ -16359,6 +16389,28 @@ static void ar_wide_pattern(const Plugin& pl, const std::vector<int>& devs, cons
            refused == world,
            std::to_string(refused) + " of " + w + " ranks refused, rc " +
                std::to_string(t[0].rc_launch));
+    }
+}
+
+/* The eight-rank two-shot with per-rank shard weights (RADIANCE_AR8_SHARD_WEIGHTS): shards of
+ * unequal length, empty ones (weight 0: the rank only pushes, gathers and handshakes), a single
+ * owner (its two regions outgrow a message, so init must grow the slot), and messages shorter than
+ * one word a rank, which the even split refuses. The fold is the same whoever owns a word, so the
+ * oracle is unchanged. */
+static void ar_wide_weighted(const Plugin& pl, const std::vector<int>& devs, const char* name) {
+    constexpr int W = 8;
+    const RadKernelInfo* row = find(pl, name);
+    if (!row) { ok(name, false, "row absent"); return; }
+    if ((int)devs.size() < W) { skip(name, "needs 8 gfx1201 cards"); return; }
+    /* bf16: 72 elements are 9 words, 8 are one; 8256 is 1032 words, 4196352 is 524544. */
+    const std::vector<ArPatternRun> runs = {
+        { "bf16", { 4194304, 72, 8, 128, 8256, 4196352, 4194304 }, 1 },
+        { "fp32", { 36, 1048580 }, 0 },
+    };
+    for (const char* w : { "0,3,1,0,5,1,2,4", "1,0,0,0,0,0,0,0", "4,1,0,4,0,1,4,4" }) {
+        ScopedEnv env(R4D_AR8_SHARD_WEIGHTS_ENV, w);
+        for (const ArPatternRun& run : runs)
+            if (!ar_pattern_check(row, devs, std::string(name) + " weights " + w, W, run)) return;
     }
 }
 
@@ -16568,6 +16620,17 @@ static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dty
                 g_cold > 0 ? fmt("cold (%lld MiB read before each; last arriver / with skew, "
                                  "medians)", (long long)(g_cold >> 20)).c_str()
                            : "warm (back to back, period over the span, slowest rank)");
+    /* The plugin reads the same variable through the same parser at init, so this is the table
+     * the two-shot runs. */
+    int wts[W];
+    const char* wenv = std::getenv(R4D_AR8_SHARD_WEIGHTS_ENV);
+    const bool weighted = wenv && *wenv && r4d_ar_shard_weights_parse(wenv, W, wts);
+    std::printf("two-shot shard weights: %s\n",
+                weighted ? fmt("%d,%d,%d,%d,%d,%d,%d,%d", wts[0], wts[1], wts[2], wts[3], wts[4],
+                               wts[5], wts[6], wts[7]).c_str()
+                : wenv && *wenv ? fmt("even (%s=\"%s\" is invalid)", R4D_AR8_SHARD_WEIGHTS_ENV,
+                                      wenv).c_str()
+                                : "even");
     StBarrier bar(W);
     std::vector<Ar8Perf> t((size_t)W);
     std::vector<std::thread> th;
@@ -16591,16 +16654,22 @@ static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dty
     size_t cfg = 0;
     for (int64_t n : sizes) {
         const double bytes = (double)n * esz;
+        const int64_t n16 = n * esz / 16;
         std::printf("  numel %lld (%.0f KiB, %lld 16-byte words)\n", (long long)n, bytes / 1024.0,
-                    (long long)(n * esz / 16));
+                    (long long)n16);
+        long off[W + 1];
+        const int64_t sh_max = r4d_ar_shard_table((long)n16, W, weighted ? wts : nullptr, off);
+        std::string shards;
+        for (int r = 0; r < W; ++r) shards += fmt(" %ld", off[r + 1] - off[r]);
+        std::printf("    two-shot shard words by rank:%s\n", shards.c_str());
         for (size_t j = 0; j < rows.size(); ++j) {
             const bool two = j == 1;
             const double sent = two ? 2.0 * (W - 1) / W * bytes : (double)(W - 1) * bytes;
             for (int nb : nbs) {
                 const Ar8Perf& r0 = t[0];
                 /* The entry's nb_for, to name the rule's count: 1400 words a block, floor 4,
-                 * ceiling 16, the two-shot over its shard with ceiling 8 at eight ranks. */
-                const int64_t basis = n * esz / 16 / (two ? W : 1);
+                 * ceiling 16, the two-shot over its longest shard with ceiling 8 at eight ranks. */
+                const int64_t basis = two ? (weighted ? sh_max : n16 / W) : n16;
                 const int64_t rule =
                     std::min<int64_t>(std::max<int64_t>(basis / 1400, 4), two ? 8 : 16);
                 const std::string nbs_ =
@@ -16614,6 +16683,11 @@ static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dty
                 int64_t bad = 0;
                 for (const Ar8Perf& x : t) bad += x.bad[cfg];
                 double us = 0.0, us_hi = 0.0;
+                /* Warm: each rank's period; cold: each rank's median launch. */
+                std::string per_rank;
+                for (const Ar8Perf& x : t)
+                    per_rank += fmt(" %.1f", g_cold <= 0 ? (double)x.period[cfg] * 1000.0
+                                                         : (double)median(x.cold[cfg]) * 1000.0);
                 if (g_cold <= 0) {
                     for (const Ar8Perf& x : t) us = std::max(us, (double)x.period[cfg] * 1000.0);
                 } else {
@@ -16631,6 +16705,7 @@ static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dty
                             us > 0 ? bytes / (us * 1e3) : 0.0, us > 0 ? sent / (us * 1e3) : 0.0,
                             bad ? fmt("%lld elements differ from the fold", (long long)bad).c_str()
                                 : "= fold on every rank");
+                std::printf("      us by rank:%s\n", per_rank.c_str());
                 ++cfg;
             }
         }
@@ -19956,6 +20031,7 @@ static void device_phase(const Plugin& pl) {
                 ar_wide_ti8(pl, devs, n.c_str(), world);
             } else if (std::strstr(base, "twoshot")) {
                 ar_wide_pattern(pl, devs, n.c_str(), world);
+                if (world == 8) ar_wide_weighted(pl, devs, n.c_str());
             } else {
                 ar_wide_rank(pl, devs, n.c_str(), world);
                 /* The one-shot through the same per-element oracle: both rows of the op agree
