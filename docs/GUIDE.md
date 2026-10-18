@@ -2444,10 +2444,10 @@ finished turns kept for reuse, which gives way the moment a live request needs i
 figure with a high hit rate is the cache working, not a leak. Both segments take their warning colour
 from the total fill, since a full pool causes preemption.
 
-The decode step tile carries two figures under the big number:
+The decode step tile carries two figures and a percentage under the big number:
 
 ```
-best 14.79ms · recent 15.21ms
+best 14.79ms · recent 15.21ms · now 97% of best
 ```
 
 Both are window means of single-sequence decode steps, measured by the engine:
@@ -2456,6 +2456,18 @@ has run, `recent` its most recent one. Individual steps vary a lot — a step th
 saves a KV checkpoint, or finishes while other engine work is committing, can
 take twice as long as its neighbour — so nothing is compared until 32 have been
 averaged. A single slow step moves neither figure.
+
+The percentage, `now X% of best`, is the page's own live window read against the
+floor. `now` is the mean of the steps that completed in the last poll (~500 ms);
+the figure is that mean as a fraction of `best`, so 100% is the fastest the lane
+has done and anything slower reads a percentage of it (a step at 80% of the
+floor's speed reads "80% of best"). It is capped at 100: `now` is a ~500 ms mean
+while `best` is a 32-step window mean, so a fast stretch shorter than a window can
+read faster than the recorded floor. That is "at your best", not a new record —
+the engine only lowers `best` on a completed 32-step window, and a sub-window blip
+is not one. At higher concurrency the figure is keyed to that concurrency (`@c8`)
+and read against the fastest step seen at that concurrency, because a batched step
+is a different measurement and would report a batch arriving as a slowdown.
 
 The gap between them is normal, and it is not degradation. `best` is the most
 favorable moment the lane has hit; `recent` is what it is doing now. On a healthy
