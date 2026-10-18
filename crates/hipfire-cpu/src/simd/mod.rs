@@ -491,6 +491,143 @@ pub(crate) fn row_pair_dot_with_activation_sums(
     }
 }
 
+/// Most activation rows one [`row_dot_multi_with_activation_sums`] call is
+/// sized for (the widest tier's group; narrower tiers loop inside the call).
+#[cfg(target_arch = "x86_64")]
+pub(crate) const MULTI_TOKEN_MAX: usize = x86_512::MULTI_TOKENS_AVX512;
+
+/// Whether `q` has a decode-once multi-token prepared row dot: the two MQ4 V2
+/// formats, whose single-token prepared kernels it reproduces bit for bit.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn has_multi_token_kernel(q: CpuQuant) -> bool {
+    matches!(q, CpuQuant::Mq4G256V2 | CpuQuant::Mq4G128V2)
+}
+
+/// One weight row dotted with several activation rows (`xs[t]`, prepared sums
+/// `sums[t]` from [`prepare_activation_sums`]), decoding each weight chunk once
+/// for all of them. `out[t]` is bit-identical to
+/// [`row_dot_with_activation_sums`]`(q, row, &[], k, xs[t], sums[t])`: every
+/// token runs exactly the single-token kernel's FMA sequence, chain split, lane
+/// join and affine association on its own accumulators.
+///
+/// Same preconditions as [`row_dot_with_activation_sums`], and
+/// [`has_multi_token_kernel`]`(q)`. Any number of tokens is accepted; they are
+/// processed in tier-sized groups.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn row_dot_multi_with_activation_sums(
+    q: CpuQuant,
+    row: &[u8],
+    k: usize,
+    xs: &[&[f32]],
+    sums: &[&[f32]],
+    out: &mut [f32],
+) {
+    row_dot_multi_with_activation_sums_tier(
+        resolve_tier(q, true, avx512_available()),
+        q,
+        row,
+        k,
+        xs,
+        sums,
+        out,
+    )
+}
+
+/// [`row_dot_multi_with_activation_sums`] on an explicit `tier` (`Avx512`
+/// requires [`avx512_available`], the caller's burden as with
+/// [`row_dot_with_activation_sums_tier`]).
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn row_dot_multi_with_activation_sums_tier(
+    tier: SimdTier,
+    q: CpuQuant,
+    row: &[u8],
+    k: usize,
+    xs: &[&[f32]],
+    sums: &[&[f32]],
+    out: &mut [f32],
+) {
+    assert!(
+        has_multi_token_kernel(q),
+        "row_dot_multi_with_activation_sums_tier: {q:?} has no multi-token kernel"
+    );
+    debug_assert!(tier != SimdTier::Scalar, "no scalar prepared row dot");
+    debug_assert!(
+        tier != SimdTier::Avx512 || avx512_available(),
+        "row_dot_multi_with_activation_sums_tier({q:?}): AVX-512 absent"
+    );
+    let n = xs.len();
+    assert!(sums.len() == n && out.len() == n, "token count mismatch");
+    assert!(
+        k.is_multiple_of(q.group_elems()) && row.len() >= (k / q.group_elems()) * q.group_bytes(),
+        "row_dot_multi_with_activation_sums_tier({q:?}): row shorter than the shape"
+    );
+    assert!(
+        xs.iter().all(|x| x.len() >= k) && sums.iter().all(|s| s.len() >= k / 128),
+        "row_dot_multi_with_activation_sums_tier({q:?}): activation or sums shorter than the shape"
+    );
+    let group = match tier {
+        SimdTier::Avx512 => x86_512::MULTI_TOKENS_AVX512,
+        _ => x86::MULTI_TOKENS_AVX2,
+    };
+    let mut t0 = 0;
+    while t0 < n {
+        let g = (n - t0).min(group);
+        let (xg, sg, og) = (&xs[t0..t0 + g], &sums[t0..t0 + g], &mut out[t0..t0 + g]);
+        // SAFETY: features resolved by the caller, bounds asserted above.
+        unsafe {
+            if tier == SimdTier::Avx512 {
+                multi_group_avx512(q, row, k, xg, sg, og);
+            } else {
+                multi_group_avx2(q, row, k, xg, sg, og);
+            }
+        }
+        t0 += g;
+    }
+}
+
+/// Monomorphizes a multi-token group over its token count (`xs.len()`, one of
+/// the listed values) for one tier's kernels.
+#[cfg(target_arch = "x86_64")]
+macro_rules! multi_group {
+    ($name:ident, $kernels:ident, $($t:literal),+) => {
+        /// # Safety
+        ///
+        /// The tier's CPU features, and the bounds
+        /// [`row_dot_multi_with_activation_sums_tier`] asserts, for
+        /// `1..=max` tokens.
+        unsafe fn $name(
+            q: CpuQuant,
+            row: &[u8],
+            k: usize,
+            xs: &[&[f32]],
+            sums: &[&[f32]],
+            out: &mut [f32],
+        ) {
+            match xs.len() {
+                $($t => {
+                    let xp: [*const f32; $t] = core::array::from_fn(|i| xs[i].as_ptr());
+                    let sp: [*const f32; $t] = core::array::from_fn(|i| sums[i].as_ptr());
+                    let r = match q {
+                        CpuQuant::Mq4G256V2 => {
+                            $kernels::mq4g256v2_row_dot_cached_multi::<$t>(row.as_ptr(), k, &xp, &sp)
+                        }
+                        CpuQuant::Mq4G128V2 => {
+                            $kernels::mq4g128v2_row_dot_cached_multi::<$t>(row.as_ptr(), k, &xp, &sp)
+                        }
+                        _ => unreachable!("{q:?} has no multi-token kernel"),
+                    };
+                    out.copy_from_slice(&r);
+                })+
+                n => unreachable!("multi-token group of {n}"),
+            }
+        }
+    };
+}
+
+#[cfg(target_arch = "x86_64")]
+multi_group!(multi_group_avx512, x86_512, 1, 2, 3, 4, 5, 6, 7, 8);
+#[cfg(target_arch = "x86_64")]
+multi_group!(multi_group_avx2, x86, 1, 2, 3, 4);
 /// One weight row dotted with a pre-rotated activation on the best vector tier
 /// for `q` ([`resolve_tier`]): AVX-512 for the formats that have a kernel, AVX2
 /// otherwise.

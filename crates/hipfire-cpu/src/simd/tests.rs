@@ -1206,6 +1206,155 @@ mod exact {
         }
     }
 
+    /// The decode-once multi-token row dot must reproduce, bit for bit, the
+    /// single-token prepared kernel (and the AVX2 uncached reference) for every
+    /// token count — below, at and above each tier's group width and odd
+    /// counts — on both tiers and both V2 formats, over adversarial activations
+    /// (a different style per token) and random weights with finite `fp16`
+    /// headers.
+    #[test]
+    fn multi_token_row_dot_is_bit_identical_to_per_token_on_both_tiers() {
+        let tiers: Vec<SimdTier> = if avx512_available() {
+            vec![SimdTier::Avx2, SimdTier::Avx512]
+        } else {
+            vec![SimdTier::Avx2]
+        };
+        if !row_dot_enabled(CpuQuant::Mq4G256V2, Some(true)) {
+            eprintln!("skip: AVX2/F16C absent on this runner");
+            return;
+        }
+        let mut rng = Rng(0x3317_0008);
+        let m = 12;
+        for (q, k) in SHAPES {
+            let kind = activation_sum_kind(q).unwrap();
+            let sl = kind.len(k);
+            let rb = row_bytes(q, k);
+            for n in (1..=9usize).chain([15, 16, 17]) {
+                let packed = random_weights(q, m, k, &mut rng);
+                // Token t uses style (t + n) % MODES, so every style meets
+                // every neighbour across the n sweep.
+                let xs_own: Vec<Vec<f32>> = (0..n)
+                    .map(|t| activations(k, (t + n) % MODES, &mut rng))
+                    .collect();
+                let sums_own: Vec<Vec<f32>> = xs_own
+                    .iter()
+                    .map(|x| {
+                        let mut s = vec![0.0f32; sl];
+                        prepare_activation_sums(kind, x, &mut s);
+                        s
+                    })
+                    .collect();
+                let xs: Vec<&[f32]> = xs_own.iter().map(|v| v.as_slice()).collect();
+                let ss: Vec<&[f32]> = sums_own.iter().map(|v| v.as_slice()).collect();
+                for &tier in &tiers {
+                    for r in 0..m {
+                        let row = &packed[r * rb..];
+                        let mut got = vec![0.0f32; n];
+                        row_dot_multi_with_activation_sums_tier(
+                            tier, q, row, k, &xs, &ss, &mut got,
+                        );
+                        for t in 0..n {
+                            let what = format!("{q:?} k={k} n={n} {tier:?} row={r} token={t}");
+                            let single = row_dot_with_activation_sums_tier(
+                                tier,
+                                q,
+                                row,
+                                &[],
+                                k,
+                                xs[t],
+                                ss[t],
+                            );
+                            bits_eq(got[t], single, &format!("multi vs per-token {what}"));
+                            let reference = row_dot_tier(SimdTier::Avx2, q, row, &[], k, xs[t]);
+                            bits_eq(got[t], reference, &format!("multi vs avx2 uncached {what}"));
+                        }
+                    }
+                }
+                // The dispatching entry resolves the same tier as the
+                // single-token dispatcher.
+                let row = &packed[..];
+                let mut got = vec![0.0f32; n];
+                row_dot_multi_with_activation_sums(q, row, k, &xs, &ss, &mut got);
+                for t in 0..n {
+                    bits_eq(
+                        got[t],
+                        row_dot_with_activation_sums(q, row, &[], k, xs[t], ss[t]),
+                        &format!("dispatch {q:?} k={k} n={n} token={t}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every token of a group gets the same answer whichever neighbours share
+    /// the decode: a token's result must not depend on its slot or on the other
+    /// tokens (no cross-token state), including when the same activation row
+    /// appears several times and when the sums slices alias.
+    #[test]
+    fn multi_token_result_is_independent_of_slot_and_neighbours() {
+        if !row_dot_enabled(CpuQuant::Mq4G256V2, Some(true)) {
+            return;
+        }
+        let tiers: Vec<SimdTier> = if avx512_available() {
+            vec![SimdTier::Avx2, SimdTier::Avx512]
+        } else {
+            vec![SimdTier::Avx2]
+        };
+        let mut rng = Rng(0x5107_0009);
+        for (q, k) in [(CpuQuant::Mq4G256V2, 2560usize), (CpuQuant::Mq4G128V2, 640)] {
+            let kind = activation_sum_kind(q).unwrap();
+            let packed = random_weights(q, 4, k, &mut rng);
+            let rb = row_bytes(q, k);
+            let base: Vec<Vec<f32>> = (0..MODES)
+                .map(|mode| activations(k, mode, &mut rng))
+                .collect();
+            let base_sums: Vec<Vec<f32>> = base
+                .iter()
+                .map(|x| {
+                    let mut s = vec![0.0f32; kind.len(k)];
+                    prepare_activation_sums(kind, x, &mut s);
+                    s
+                })
+                .collect();
+            for &tier in &tiers {
+                for r in 0..4 {
+                    let row = &packed[r * rb..];
+                    let alone: Vec<f32> = (0..MODES)
+                        .map(|i| {
+                            row_dot_with_activation_sums_tier(
+                                tier,
+                                q,
+                                row,
+                                &[],
+                                k,
+                                &base[i],
+                                &base_sums[i],
+                            )
+                        })
+                        .collect();
+                    // A rotated, repeated schedule over all styles.
+                    for shift in 0..MODES {
+                        let order: Vec<usize> = (0..11).map(|t| (t * 3 + shift) % MODES).collect();
+                        let xs: Vec<&[f32]> = order.iter().map(|&i| base[i].as_slice()).collect();
+                        let ss: Vec<&[f32]> =
+                            order.iter().map(|&i| base_sums[i].as_slice()).collect();
+                        let mut got = vec![0.0f32; order.len()];
+                        row_dot_multi_with_activation_sums_tier(
+                            tier, q, row, k, &xs, &ss, &mut got,
+                        );
+                        for (t, &i) in order.iter().enumerate() {
+                            bits_eq(
+                                got[t],
+                                alone[i],
+                                &format!("{q:?} {tier:?} row={r} shift={shift} slot={t} style={i}"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// The two prepared-sum owners (Mq4G256V2's halves and Mq4G128V2's groups)
     /// share one value per 128 activations: it must equal the AVX2 two-chain
     /// reduction `codes_dot_sum` runs per half.
@@ -1324,8 +1473,9 @@ mod exact {
     }
 
     /// The whole sourced path (Σx prep + dedup, rayon blocking, tier dispatch)
-    /// reproduces, bit for bit, the AVX2 uncached row dots, for 1..=8
-    /// activation rows per job on 1/2/8/16-thread pools. Jobs alias activation
+    /// reproduces, bit for bit, the AVX2 uncached row dots, for 1..=9, 16 and 17
+    /// activation rows per job (past each tier's multi-token group width, odd
+    /// and even) on 1/2/8/16-thread pools. Jobs alias activation
     /// rows (so the Σx dedup is exercised) and mix the two V2 formats, which
     /// share one prepared sum per 128 activations.
     #[test]
@@ -1343,7 +1493,7 @@ mod exact {
         // (k, m): D2 gate_up shape and the down shape, plus a 128-granular k
         // for the G256 job's neighbours.
         for (k, m) in [(2560usize, 37usize), (640, 53)] {
-            for n in 1..=8usize {
+            for n in (1..=9usize).chain([16, 17]) {
                 let shared_a: Vec<Vec<f32>> = (0..n)
                     .map(|t| activations(k, (t + 1) % MODES, &mut rng))
                     .collect();
@@ -1482,6 +1632,98 @@ mod exact {
                 "{:<24} {a2:>12.1} {a2c:>12.1} {a5:>12.1} {a5c:>12.1}",
                 format!("{q:?} k={k}")
             );
+        }
+    }
+
+    /// hiptrx-indicative micro-benchmark of the decode-once multi-token row
+    /// dot: ns per *weight row* (all `n` activation rows of it), single thread,
+    /// per tier, `n` calls of the single-token prepared kernel vs one
+    /// multi-token call. Run:
+    /// `cargo test -p hipfire-cpu --lib --release -- --ignored v2_multi_token_microbench --nocapture`
+    #[test]
+    #[ignore]
+    fn v2_multi_token_microbench_hiptrx_indicative() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        if !row_dot_enabled(CpuQuant::Mq4G256V2, None) {
+            eprintln!("skip: AVX2/F16C absent");
+            return;
+        }
+        let tiers: Vec<SimdTier> = if avx512_available() {
+            vec![SimdTier::Avx2, SimdTier::Avx512]
+        } else {
+            vec![SimdTier::Avx2]
+        };
+        let mut rng = Rng(0xBE4C_0007);
+        println!("[hiptrx-indicative] ns per weight row (all n activation rows), single thread");
+        println!(
+            "{:<22} {:<8} {:>3} {:>12} {:>12} {:>8}",
+            "shape", "tier", "n", "per-token", "multi", "speedup"
+        );
+        for (q, k, m) in [
+            (CpuQuant::Mq4G256V2, 2560usize, 256usize),
+            (CpuQuant::Mq4G128V2, 640, 512),
+        ] {
+            let rb = row_bytes(q, k);
+            let packed = random_weights(q, m, k, &mut rng);
+            let kind = activation_sum_kind(q).unwrap();
+            let sl = kind.len(k);
+            let xs_all: Vec<Vec<f32>> = (0..8)
+                .map(|t| activations(k, t % MODES, &mut rng))
+                .collect();
+            let sums_all: Vec<Vec<f32>> = xs_all
+                .iter()
+                .map(|x| {
+                    let mut s = vec![0.0f32; sl];
+                    prepare_activation_sums(kind, x, &mut s);
+                    s
+                })
+                .collect();
+            for &tier in &tiers {
+                for n in [1usize, 2, 4, 8] {
+                    let xs: Vec<&[f32]> = xs_all[..n].iter().map(|v| v.as_slice()).collect();
+                    let ss: Vec<&[f32]> = sums_all[..n].iter().map(|v| v.as_slice()).collect();
+                    let mut out = vec![0.0f32; n];
+                    let passes = 400usize;
+                    let mut time = |f: &mut dyn FnMut(&[u8], &mut [f32])| -> f64 {
+                        for r in 0..m {
+                            f(&packed[r * rb..], &mut out);
+                        }
+                        let t0 = Instant::now();
+                        let mut acc = 0.0f32;
+                        for _ in 0..passes {
+                            for r in 0..m {
+                                f(black_box(&packed[r * rb..]), &mut out);
+                                acc += out[0];
+                            }
+                        }
+                        black_box(acc);
+                        t0.elapsed().as_nanos() as f64 / (passes * m) as f64
+                    };
+                    let per_token = time(&mut |row, out| {
+                        for t in 0..n {
+                            out[t] = row_dot_with_activation_sums_tier(
+                                tier,
+                                q,
+                                row,
+                                &[],
+                                k,
+                                black_box(xs[t]),
+                                ss[t],
+                            );
+                        }
+                    });
+                    let multi = time(&mut |row, out| {
+                        row_dot_multi_with_activation_sums_tier(tier, q, row, k, &xs, &ss, out)
+                    });
+                    println!(
+                        "{:<22} {:<8} {n:>3} {per_token:>12.1} {multi:>12.1} {:>7.2}x",
+                        format!("{q:?} k={k}"),
+                        format!("{tier:?}"),
+                        per_token / multi
+                    );
+                }
+            }
         }
     }
 }

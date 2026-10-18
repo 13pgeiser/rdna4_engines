@@ -655,6 +655,18 @@ fn run_shared_jobs<S: SharedJobSource + Sync>(
                     }
                     for chunk in rest.chunks_mut(n) {
                         let (row, srow) = row_slices(q, src.packed(j), m, k, r);
+                        if n > 1 && simd::has_multi_token_kernel(q) {
+                            multi_token_row(
+                                q,
+                                row,
+                                k,
+                                (src, j),
+                                (sums, &offsets[base..base + n], sum_len),
+                                chunk,
+                            );
+                            r += 1;
+                            continue;
+                        }
                         for (t, v) in chunk.iter_mut().enumerate() {
                             *v = simd::row_dot_with_activation_sums(
                                 q,
@@ -678,6 +690,44 @@ fn run_shared_jobs<S: SharedJobSource + Sync>(
                 }
             });
     });
+}
+
+/// One weight row against all `chunk.len()` activation rows of job `j` on the
+/// prepared V2 path: each weight chunk is decoded once per group of up to
+/// [`simd::MULTI_TOKEN_MAX`] rows instead of once per row
+/// ([`simd::row_dot_multi_with_activation_sums`]). `out[t]` equals the
+/// single-token prepared row dot bit for bit. `sum_offsets[t]` locates token
+/// `t`'s prepared Σx in `sums`.
+#[cfg(target_arch = "x86_64")]
+fn multi_token_row<S: SharedJobSource>(
+    q: CpuQuant,
+    row: &[u8],
+    k: usize,
+    (src, j): (&S, usize),
+    (sums, sum_offsets, sum_len): (&[f32], &[usize], usize),
+    out: &mut [f32],
+) {
+    let mut t0 = 0;
+    while t0 < out.len() {
+        let g = (out.len() - t0).min(simd::MULTI_TOKEN_MAX);
+        let mut xs: [&[f32]; simd::MULTI_TOKEN_MAX] = [&[]; simd::MULTI_TOKEN_MAX];
+        let mut ss: [&[f32]; simd::MULTI_TOKEN_MAX] = [&[]; simd::MULTI_TOKEN_MAX];
+        for i in 0..g {
+            let off = sum_offsets[t0 + i];
+            debug_assert_ne!(off, usize::MAX, "unprepared token in a prepared job");
+            xs[i] = &src.xs_row(j, t0 + i)[..k];
+            ss[i] = &sums[off..off + sum_len];
+        }
+        simd::row_dot_multi_with_activation_sums(
+            q,
+            row,
+            k,
+            &xs[..g],
+            &ss[..g],
+            &mut out[t0..t0 + g],
+        );
+        t0 += g;
+    }
 }
 
 /// One output element: `Σ_j W[row][j] * x[j]`, accumulating one group at a time.

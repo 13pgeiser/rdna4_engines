@@ -524,6 +524,100 @@ pub(super) unsafe fn mq4g128v2_row_dot_cached(
     acc
 }
 
+/// Widest token group the AVX2 multi-token kernels carry: two `ymm` dot
+/// accumulators per token (eight) plus the two shared code vectors and one
+/// activation temporary stay within the sixteen `ymm` registers.
+pub(super) const MULTI_TOKENS_AVX2: usize = 4;
+
+/// The sixteen 8-lane chunks (128 activations) of one V2 half / `Mq4G128V2`
+/// group at payload `p`, dotted with `T` activation rows `x[t] + off`, each
+/// chunk's nibbles decoded **once** for all `T` tokens.
+///
+/// Per token this is [`codes_dot_sum`]'s `CACHED` body over `first..last = 0..16`
+/// verbatim: chunk `2i` FMAs into `dot0`, chunk `2i + 1` into `dot1`, then
+/// `hsum256(dot0 + dot1)`. Tokens never mix, so each result is bit-identical to
+/// the single-token kernel's.
+///
+/// # Safety
+///
+/// Requires AVX2/FMA, `64` readable payload bytes at `p` and `128` readable
+/// `f32` at `x[t].add(off)` for every `t < T`.
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn block_dots_multi<const T: usize>(
+    p: *const u8,
+    x: &[*const f32; T],
+    off: usize,
+) -> [f32; T] {
+    let mut dot0 = [_mm256_setzero_ps(); T];
+    let mut dot1 = [_mm256_setzero_ps(); T];
+    let mut idx = 0;
+    while idx + 1 < 16 {
+        let c0 = _mm256_cvtepi32_ps(codes8::<4>(p.add(idx * 4)));
+        let c1 = _mm256_cvtepi32_ps(codes8::<4>(p.add((idx + 1) * 4)));
+        for t in 0..T {
+            let xb = x[t].add(off + idx * 8);
+            dot0[t] = _mm256_fmadd_ps(c0, _mm256_loadu_ps(xb), dot0[t]);
+            dot1[t] = _mm256_fmadd_ps(c1, _mm256_loadu_ps(xb.add(8)), dot1[t]);
+        }
+        idx += 2;
+    }
+    core::array::from_fn(|t| hsum256(_mm256_add_ps(dot0[t], dot1[t])))
+}
+
+/// [`mq4g256v2_row_dot_cached`] for `T` activation rows at once (`x[t]`,
+/// `sums[t]`), each weight chunk decoded once. Result `t` is bit-equal to
+/// `mq4g256v2_row_dot_cached(row, k, x[t], sums[t])`.
+///
+/// # Safety
+///
+/// As [`mq4g256v2_row_dot_cached`] for every token.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(super) unsafe fn mq4g256v2_row_dot_cached_multi<const T: usize>(
+    row: *const u8,
+    k: usize,
+    x: &[*const f32; T],
+    sums: &[*const f32; T],
+) -> [f32; T] {
+    let mut acc = [0.0f32; T];
+    for g in 0..k / 256 {
+        let gptr = row.add(g * 136);
+        let h = f16_quad(gptr);
+        let d0 = block_dots_multi::<T>(gptr.add(8), x, g * 256);
+        let d1 = block_dots_multi::<T>(gptr.add(8 + 64), x, g * 256 + 128);
+        for t in 0..T {
+            let (s0, s1) = (*sums[t].add(2 * g), *sums[t].add(2 * g + 1));
+            acc[t] += (h[0] * d0[t] + h[1] * s0) + (h[2] * d1[t] + h[3] * s1);
+        }
+    }
+    acc
+}
+
+/// [`mq4g128v2_row_dot_cached`] for `T` activation rows at once. Result `t` is
+/// bit-equal to `mq4g128v2_row_dot_cached(row, k, x[t], sums[t])`.
+///
+/// # Safety
+///
+/// As [`mq4g128v2_row_dot_cached`] for every token.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(super) unsafe fn mq4g128v2_row_dot_cached_multi<const T: usize>(
+    row: *const u8,
+    k: usize,
+    x: &[*const f32; T],
+    sums: &[*const f32; T],
+) -> [f32; T] {
+    let mut acc = [0.0f32; T];
+    for g in 0..k / 128 {
+        let gptr = row.add(g * 68);
+        let (scale, zero) = f16_pair(gptr);
+        let d = block_dots_multi::<T>(gptr.add(4), x, g * 128);
+        for t in 0..T {
+            acc[t] += scale * d[t] + zero * *sums[t].add(g);
+        }
+    }
+    acc
+}
+
 /// Per-128-element `Σx` in [`codes_dot_sum`]'s exact order over a 16-chunk
 /// range: even 8-lane chunks into `sum0`, odd into `sum1`, then one
 /// `hsum256(sum0 + sum1)`. A V2 group's two halves and `Mq4G128V2`'s group each

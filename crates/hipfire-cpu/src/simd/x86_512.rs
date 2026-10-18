@@ -236,3 +236,97 @@ pub(super) unsafe fn mq4g128v2_row_dot_cached(
     }
     acc
 }
+
+/// Widest token group the AVX-512 multi-token kernels carry: one `zmm` dot
+/// accumulator per token (both chains share it) plus the two shared code
+/// vectors and an activation temporary, far inside the 32 `zmm` registers.
+pub(super) const MULTI_TOKENS_AVX512: usize = 8;
+
+/// The sixteen 8-lane chunks (128 activations) of one V2 half / `Mq4G128V2`
+/// group at payload `p`, dotted with `T` activation rows `x[t] + off`, each
+/// four-chunk payload decoded **once** for all `T` tokens.
+///
+/// Per token this is [`codes_dot_sum512`]'s `CACHED` body over `first..last =
+/// 0..16` verbatim (two FMAs per four-chunk step into the token's own `zmm`,
+/// then [`join_chains`]), so every result is bit-identical to the single-token
+/// kernel's; tokens never mix.
+///
+/// # Safety
+///
+/// Requires AVX-512F (+ AVX2/FMA/F16C), `64` readable payload bytes at `p` and
+/// `128` readable `f32` at `x[t].add(off)` for every `t < T`.
+#[inline]
+#[target_feature(enable = "avx512f,avx2,fma,f16c")]
+unsafe fn block_dots_multi512<const T: usize>(
+    p: *const u8,
+    x: &[*const f32; T],
+    off: usize,
+) -> [f32; T] {
+    let mut dot = [_mm512_setzero_ps(); T];
+    let mut idx = 0;
+    while idx < 16 {
+        let bytes = _mm_loadu_si128(p.add(idx * 4) as *const __m128i);
+        let (lo, hi) = nibble_planes(bytes);
+        let (c0, c1) = (widen16(lo), widen16(hi));
+        for t in 0..T {
+            let xb = x[t].add(off + idx * 8);
+            dot[t] = _mm512_fmadd_ps(c0, _mm512_loadu_ps(xb), dot[t]);
+            dot[t] = _mm512_fmadd_ps(c1, _mm512_loadu_ps(xb.add(16)), dot[t]);
+        }
+        idx += 4;
+    }
+    core::array::from_fn(|t| join_chains(dot[t]))
+}
+
+/// [`mq4g256v2_row_dot_cached`] for `T` activation rows at once (`x[t]`,
+/// `sums[t]`), each weight chunk decoded once. Result `t` is bit-equal to
+/// `mq4g256v2_row_dot_cached(row, k, x[t], sums[t])`.
+///
+/// # Safety
+///
+/// As [`mq4g256v2_row_dot_cached`] for every token.
+#[target_feature(enable = "avx512f,avx2,fma,f16c")]
+pub(super) unsafe fn mq4g256v2_row_dot_cached_multi<const T: usize>(
+    row: *const u8,
+    k: usize,
+    x: &[*const f32; T],
+    sums: &[*const f32; T],
+) -> [f32; T] {
+    let mut acc = [0.0f32; T];
+    for g in 0..k / 256 {
+        let gptr = row.add(g * 136);
+        let h = f16_quad(gptr);
+        let d0 = block_dots_multi512::<T>(gptr.add(8), x, g * 256);
+        let d1 = block_dots_multi512::<T>(gptr.add(8 + 64), x, g * 256 + 128);
+        for t in 0..T {
+            let (s0, s1) = (*sums[t].add(2 * g), *sums[t].add(2 * g + 1));
+            acc[t] += (h[0] * d0[t] + h[1] * s0) + (h[2] * d1[t] + h[3] * s1);
+        }
+    }
+    acc
+}
+
+/// [`mq4g128v2_row_dot_cached`] for `T` activation rows at once. Result `t` is
+/// bit-equal to `mq4g128v2_row_dot_cached(row, k, x[t], sums[t])`.
+///
+/// # Safety
+///
+/// As [`mq4g128v2_row_dot_cached`] for every token.
+#[target_feature(enable = "avx512f,avx2,fma,f16c")]
+pub(super) unsafe fn mq4g128v2_row_dot_cached_multi<const T: usize>(
+    row: *const u8,
+    k: usize,
+    x: &[*const f32; T],
+    sums: &[*const f32; T],
+) -> [f32; T] {
+    let mut acc = [0.0f32; T];
+    for g in 0..k / 128 {
+        let gptr = row.add(g * 68);
+        let (scale, zero) = f16_pair(gptr);
+        let d = block_dots_multi512::<T>(gptr.add(4), x, g * 128);
+        for t in 0..T {
+            acc[t] += scale * d[t] + zero * *sums[t].add(g);
+        }
+    }
+    acc
+}
