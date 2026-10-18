@@ -112,17 +112,21 @@ fn emit_error_no_id(stdout: &mut impl std::io::Write, message: impl std::fmt::Di
     emit_uncorrelated_error(stdout, None, &message.to_string(), "internal", false, false);
 }
 
-/// Print the per-phase load receipt (stderr, two lines) right before a
-/// `loaded` ACK. Measurement only; the ACK JSON is unchanged.
+/// The two receipt lines for one load, in print order.
+fn load_phase_lines(line: &str, json: &serde_json::Value) -> [String; 2] {
+    [
+        format!("hipfire load phases: {line}"),
+        format!("hipfire.load_phases.v1 {json}"),
+    ]
+}
+
+/// Finish the load receipt and print it (stderr, two lines) right before a
+/// successful `loaded` ACK. Measurement only; the ACK JSON is unchanged.
 fn emit_load_phases() {
-    eprintln!(
-        "hipfire load phases: {}",
-        rdna_compute::load_phases::summary_line()
-    );
-    eprintln!(
-        "hipfire.load_phases.v1 {}",
-        rdna_compute::load_phases::summary_json()
-    );
+    let (line, json) = rdna_compute::load_phases::finish_load();
+    for text in load_phase_lines(&line, &json) {
+        eprintln!("{text}");
+    }
 }
 
 /// Retire the reader-side batch admission on every generate exit. Batch
@@ -1586,6 +1590,7 @@ fn main() {
                             ack.as_object_mut()
                                 .expect("loaded ack is a JSON object")
                                 .extend(effort_fields);
+                            emit_load_phases();
                             let _ = writeln!(stdout, "{ack}");
                             let _ = stdout.flush();
                         }
@@ -4908,6 +4913,33 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    /// The load receipt is exactly two stderr lines, human summary first,
+    /// then the compact `hipfire.load_phases.v1` JSON, from one snapshot.
+    #[test]
+    fn load_phase_receipt_is_two_lines_in_order() {
+        rdna_compute::load_phases::begin_load();
+        rdna_compute::load_phases::add("open_admission", 1_500_000, 0);
+        let (line, json) = rdna_compute::load_phases::finish_load();
+        let lines = super::load_phase_lines(&line, &json);
+        assert!(
+            lines[0].starts_with("hipfire load phases: total="),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains("open_admission=1.5ms/1"), "{}", lines[0]);
+        let payload = lines[1]
+            .strip_prefix("hipfire.load_phases.v1 ")
+            .expect("second line is the JSON receipt");
+        assert!(!payload.contains('\n'), "compact JSON");
+        let parsed: serde_json::Value = serde_json::from_str(payload).expect("valid JSON");
+        assert_eq!(parsed["schema"], "hipfire.load_phases.v1");
+        assert_eq!(parsed, json);
+        assert!(lines.iter().all(|l| !l.contains('\n')));
+        // finish_load ended the load: a later record is dropped.
+        rdna_compute::load_phases::add("late", 1, 0);
+        assert!(!rdna_compute::load_phases::summary_line().contains("late="));
+    }
+
     /// Source-level: the generate arm takes the whole-request PLE guard
     /// before any setup or route (batch enqueue, drive, singleton generate)
     /// and the bench verbs take it right after resolving the model.

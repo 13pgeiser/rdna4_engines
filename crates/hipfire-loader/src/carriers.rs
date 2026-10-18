@@ -2771,7 +2771,7 @@ fn load_qwen4_rank_scoped(
         if let (Some((read0, faults0)), Some((read1, faults1))) =
             (tiers_io0, rdna_compute::load_phases::thread_io())
         {
-            rdna_compute::load_phases::add(
+            rdna_compute::load_phases::add_amortized(
                 "expert_tiers.storage_read",
                 tiers_ns,
                 read1.saturating_sub(read0),
@@ -2840,7 +2840,7 @@ fn load_qwen4_rank_scoped(
     if let (Some((read0, faults0)), Some((read1, faults1))) =
         (weights_io0, rdna_compute::load_phases::thread_io())
     {
-        rdna_compute::load_phases::add(
+        rdna_compute::load_phases::add_amortized(
             "weights.storage_read",
             weights_ns,
             read1.saturating_sub(read0),

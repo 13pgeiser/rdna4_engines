@@ -1380,10 +1380,13 @@ impl HotRowStore {
         load_fill: Option<LoadFill>,
     ) -> JoinHandle<()> {
         let store = self.clone();
+        // The load this worker was spawned in: a fill that outlives it must
+        // not record into a later load's receipt.
+        let load_generation = rdna_compute::load_phases::generation();
         std::thread::Builder::new()
             .name("ple-table".to_string())
             .spawn(move || {
-                let filled = load_fill.map_or(0, |fill| store.load_fill(fill));
+                let filled = load_fill.map_or(0, |fill| store.load_fill(fill, load_generation));
                 if let Some(budget) = store.wait_for_budget() {
                     store.prewarm(budget, filled);
                 }
@@ -1402,7 +1405,7 @@ impl HotRowStore {
     /// Once the whole prefix is resident it keeps repairing it until ready.
     /// Returns the resident prefix (from `data_offset`) at the end, where the
     /// prewarm after ready continues.
-    fn load_fill(&self, fill: LoadFill) -> u64 {
+    fn load_fill(&self, fill: LoadFill, load_generation: u64) -> u64 {
         let target = fill.bytes.min(self.data_bytes);
         if target == 0 || fill.bytes_per_sec == 0 {
             return 0;
@@ -1525,7 +1528,12 @@ impl HotRowStore {
         } - begin;
         self.load_filled.store(filled, Ordering::Relaxed);
         let secs = started.elapsed().as_secs_f64();
-        rdna_compute::load_phases::add_overlapped("ple_load_fill", (secs * 1e9) as u64, read_bytes);
+        rdna_compute::load_phases::add_overlapped_for(
+            load_generation,
+            "ple_load_fill",
+            (secs * 1e9) as u64,
+            read_bytes,
+        );
         eprintln!(
             "{TAG}: load fill {ended}: {:.2} GiB resident from the hottest row on ({:.2} GiB read \
              of {:.2}); {:.2} GiB read in {secs:.1} s, {:.2} of it re-reading evicted pages, {:.2} GB/s \
