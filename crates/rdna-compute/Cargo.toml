@@ -459,7 +459,7 @@ required-features = ["lab"]
 
 [[example]]
 name = "rope_compact_offset_check"
-required-features = ["lab"]
+required-features = ["lab", "deltanet"]
 
 [[example]]
 name = "sample_accept_parity"
@@ -831,7 +831,7 @@ required-features = ["lab"]
 
 [[example]]
 name = "test_mrope_rope_parity"
-required-features = ["lab"]
+required-features = ["lab", "deltanet"]
 
 [[example]]
 name = "test_multislot_ops"
