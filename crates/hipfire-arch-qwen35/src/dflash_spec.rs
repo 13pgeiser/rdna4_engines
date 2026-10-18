@@ -1179,7 +1179,7 @@ mod lookup {
     /// Load-time arming inputs.
     #[derive(Clone, Copy, Debug)]
     pub(super) struct ArmInputs {
-        /// Resolved `speculation.dflash_lookup` (`auto` = off for now).
+        /// Resolved `speculation.dflash_lookup` (`auto` = off).
         pub on: bool,
         /// `HIPFIRE_SPEC_LOOKUP_TAIL` is not `0`.
         pub tail_env: bool,

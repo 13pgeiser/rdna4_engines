@@ -1601,7 +1601,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_DFLASH_LOOKUP"),
-        "Request-local verbatim-copy lookup composed into the dense Qwen3.5-class DFlash2 singleton verify window: a Copy window (lookup candidates replace the learned candidates) or a Tail window (first K learned candidates plus a lookup tail, at most 16 verify rows), taken only when measured acceptance per measured window price pays; a request with no lookup proposal runs the incumbent window unchanged. on/1 arms it on a singleton DFlash2 selector chain (no DDTree, no retained-PM4 verify, no CACTUS); off/0 disables it; auto (default) is off for now. Developer `HIPFIRE_SPEC_LOOKUP_TAIL=0` disables only the Tail windows."
+        "Request-local verbatim-copy lookup composed into the dense Qwen3.5-class DFlash2 singleton verify window: a Copy window (lookup candidates replace the learned candidates) or a Tail window (first K learned candidates plus a lookup tail, at most 16 verify rows), taken only when measured acceptance per measured window price pays; a request with no lookup proposal runs the incumbent window unchanged. on/1 arms it on a singleton DFlash2 selector chain (no DDTree, no retained-PM4 verify, no CACTUS); off/0 disables it; auto (default) is off. Developer `HIPFIRE_SPEC_LOOKUP_TAIL=0` disables only the Tail windows."
     ),
     field!(
         "speculation.dflash",
@@ -5003,10 +5003,10 @@ fn mtp_ngram_copy_enabled_for_arch_value(
 /// Dense Qwen3.5-class DFlash2 verbatim-copy lookup arming
 /// (`speculation.dflash_lookup`, env override `HIPFIRE_DFLASH_LOOKUP`).
 /// `on`/`1` arms it; `off`/`0` disables it; `auto` (the schema default; an
-/// unset key also resolves to `auto`) is off for now — a later slice flips
-/// `auto` per qualified capability. This only resolves the user policy; the
-/// consumer (`DflashSpeculator`) additionally requires a singleton DFlash2
-/// selector chain and reports the reason it declined.
+/// unset key also resolves to `auto`) is off: the R9700 promotion gate
+/// failed on non-copy classes (CHANGELOG 0.4.3). This only resolves the user
+/// policy; the consumer (`DflashSpeculator`) additionally requires a
+/// singleton DFlash2 selector chain and reports the reason it declined.
 pub fn dflash_lookup_enabled() -> bool {
     dflash_lookup_enabled_value(process_value("HIPFIRE_DFLASH_LOOKUP").as_deref())
 }
@@ -7376,7 +7376,7 @@ mod tests {
         }
         assert!(field.validate(&ConfigValue::String("yes".into())).is_err());
         assert!(field.validate(&ConfigValue::String("true".into())).is_err());
-        // auto/unset resolve OFF until a qualified capability flips auto.
+        // auto/unset resolve OFF.
         for (raw, expect) in [
             (Some("on"), true),
             (Some("1"), true),
