@@ -963,10 +963,10 @@ The synthetic `hipfire bench --matrix` probes
 
 With `serve.vmm_batch` on, a Qwen4 load under `topology.pp` or `topology.ep`
 (`2..=8`) stages the same exact **AR fn-lanes** route as a single card
-(`continuous_batch_route = "fn-lanes"`, greedy-only lanes). Nothing here is
-measured: the multi-card GPU gates and every throughput or per-stream figure are
-**pending**, and no speedup or exactness claim is made for these topologies by
-this page.
+(`continuous_batch_route = "fn-lanes"`, greedy-only lanes). The only evidence
+on this page is two byte-identity receipts (PP2 mq2, and EP2 mq4; see the
+stage-policy bullet below). No throughput, per-stream, latency or speedup
+figure is measured or claimed for these topologies by this page.
 
 - **Staging and admission.** Lanes are staged after the weights, from each
   device's remaining free memory. The check is per device: every band (PP) or
@@ -989,7 +989,8 @@ this page.
   memory with event-fenced asynchronous uploads; it must stay byte-identical
   to a synchronous upload, and no speedup from it is measured or claimed here.
 - **PP micro-batch count `G`.** `G` ranges over `1..=min(lanes, 2 * stages)`.
-  The default stage policy is unchanged (per-lane on gfx1201). Under a
+  Stage-policy admission is per-stage proof-row based (see the stage-policy
+  bullet below); nothing is assumed per-lane or shared by arch alone. Under a
   no-sharing policy (per-lane, no row-local sharing to trade against) `G` is
   the maximal overlap `min(lanes, 2 * stages)`. Under a shared policy `G` is
   adaptive: bounded exploration of each `G`, then the `G` with the cheapest
@@ -1012,11 +1013,76 @@ this page.
   whatever `speculation.mtp` requests.
 - **No promotion.** A running singleton request is never promoted into a lane
   under PP/EP (`continuous_batch_promotion = false`); on one card it is `true`.
-- **gfx1201 stays per-lane.** Row-local stages run once per lane, with the
-  singleton's typed ops, until grouped stages are certified for gfx1201
-  (`fn_lanes_stage_policy` / `fn_lanes_stage_evidence` in the load ack). A step
-  of C lanes is therefore C serial trunk passes under both topologies; this is
-  the policy, not a tuning gap.
+- **Stage-policy admission is per-stage proof rows.** Sharing is decided per
+  row-local stage, from the weights each lane store actually bound, never from
+  the production shape or from a whole-policy certificate or flag. A stage
+  becomes `OnceAllRows` only if **every** owned weight-instance route of that
+  stage matches a `RowTwinProof` row `{arch, stage, route: StageRoute,
+  domain: &[LaneTopology], receipt}` of `LANE_ROW_TWIN_PROOFS`; one unmatched
+  instance (an unproved projection, router, shared-expert or MoE route, or a
+  topology outside the row's `domain`) leaves only **that** stage per lane,
+  with the reason recorded, while the other stages keep their own proofs. The
+  stateful stages (`ple_conv`, `gdn_core`, `qsa_core`) are always per lane.
+  The routes are derived per bound instance (`LaneStageRoutes`) and resolved
+  into a policy plus evidence and per-lane reasons (`LanePolicyResolution`).
+  gfx1151 keeps all its historical topologies and expert classes: its rows are
+  wildcard-route rows over every `LaneTopology`, preserving the old behavior
+  under the exact receipt `GFX1151_LANE_RECEIPT`. The gfx1201 rows are
+  route-bound and carry one receipt per proved topology.
+
+  *PP rows.* The PP2 mq2 rows (PP domain) carry `GFX1201_PP2_MQ2_RECEIPT`
+  (hold j1574, `fn_mesh_lane_oracle` on 2x R9700): with every row-local stage
+  shared and with every stage per lane, each lane's ids and every logits row
+  were byte-identical to the serialized PP singleton at K=1..8 (8 prompts x 64
+  tokens) under adaptive, 1 and 4 decode micro-batches and with overlap off.
+  Their routes are the actual all-MQ6 projection route of the PP2 artifact
+  (GDN input, QSA and head projections MQ6, Q8 embedding), the BF16
+  HC/router/shared routes, and the resident MQ4/E8P MoE route with per-expert
+  `DecodeGemv` capability admission.
+
+  *EP rows.* The EP rows (`[Ep]` domain) are twelve: eleven non-MoE rows
+  (embedding, PLE rows, HC read, HC write, GDN in/out projections, QSA in/out
+  projections, final HC read, head and argmax) and one MoE row. All carry
+  `GFX1201_EP2_MQ4_RECEIPT` (hold j1570, `mcb-notes/runs/ep-diag-8e148906a-1`,
+  2026-10-18, gfx1201 EP2 mq4-xts): production lane ids and logits were
+  byte-identical to the serialized EP singleton at K=1, 2, 4 and 8 over 64
+  tokens. The bound routes a non-MoE row requires are those the proved
+  artifact binds: MQ6 for every GDN qkv/z/a/b/out and QSA indexer/q/k/v/out
+  projection and for the head, Q8 embedding, BF16 HC, BF16 PLE rows and F32
+  argmax.
+
+  *EP MoE class.* The MoE row requires the route class
+  `LaneExpertRoute::EpPackedStaticOrBalanced`, with BF16 router/shared routes
+  and per-expert `DecodeGemv` capability admission. The class is decided per
+  owned MoE layer, and **every** owned MoE layer must be one of exactly two
+  things: (a) the actual static gathered runtime over fully resident packed
+  QT44/QT53 experts, or (b) the actual balanced-live gathered runtime over
+  fully host-mapped packed QT44/QT53 experts. In both, the gather must be
+  installed; there must be no CPU (D1/D2), tier, slab, pruned or FP8 expert
+  route; and the layer's dtype buffers and the runtime it selected must
+  agree. Any mix of (a) and (b) layers is admitted, with no restriction on how
+  many layers are resident (27 resident + 21 host-mapped, 28 + 20, and so
+  on). A single MoE layer outside that class matches no row, so the MoE stage
+  alone runs per lane.
+
+  *Fallback and limits.* A different bound route, arch or topology (a mixed
+  or otherwise different artifact route, or any expert route outside the EP
+  MoE class above) matches no row, and the fallback is stage-specific: only
+  the affected stage runs per lane with the singleton's typed ops. The `Ep`
+  domain does not encode the rank count, and the measured EP cells are EP2
+  mq4-xts at K=1, 2, 4 and 8 only: the receipt is exactness evidence, not
+  performance, and it evidences no other EP width, topology count or latency
+  (the admitted class covers both ownership runtimes above, but no
+  throughput or per-stream figure is attached to either). Both receipts are
+  exactness evidence, not performance. A future arch or route qualifies
+  solely by adding a proof row; no resolver code changes. The evidence is the
+  deduplicated set of receipts of the proofs actually used, logged once per
+  store as `qwen4 lanes: stage policy <describe()> (proofs <receipts>;
+  per-lane: <stage>=<reason>,...)` and reported through
+  `fn_lanes_stage_policy` / `fn_lanes_stage_evidence` in the load ack. The
+  developer `HIPFIRE_FN_LANE_POLICY` override is unchanged. On a stage that
+  stays per lane, a step of C lanes runs that stage C times serially under
+  both topologies; this is the policy, not a tuning gap.
 - **Load ack.** `fn_lanes_topology` is `single`, `ep` or `pp`;
   `fn_lanes_device_receipts` has one entry per card (EP: rank order; PP: input
   band to output band). The scalar `fn_lanes_*` receipt fields are the root's:

@@ -3697,8 +3697,13 @@ impl Qwen4Bundle {
     /// Developer / oracle entry (the serve path never calls it): replace the
     /// row-local stage share policy of EVERY lane store of this load, so a
     /// measurement can compare shared and per-lane stage execution on the
-    /// topology itself (`gfx1201` keeps every stage per lane by default,
-    /// [`crate::gpu_forward_lanes::LaneStagePolicy::for_arch`]).
+    /// topology itself (the default policy is resolved per stage from the
+    /// `LANE_ROW_TWIN_PROOFS` rows by each store's actually bound weight
+    /// routes: a stage is shared only if every owned instance route matches a
+    /// proof row, so a stage with an unproved instance stays per lane: for
+    /// example a MoE layer outside the EP packed static-or-balanced class
+    /// (`LaneExpertRoute::EpPackedStaticOrBalanced`), or any route outside the
+    /// proof rows).
     ///
     /// - single: this bundle's store;
     /// - EP: every rank's store, replicated through the soft lane fan-out

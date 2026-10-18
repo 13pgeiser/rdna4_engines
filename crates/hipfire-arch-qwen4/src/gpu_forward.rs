@@ -1599,6 +1599,63 @@ pub(crate) fn lane_layer_moe<'a>(
     )
 }
 
+/// How an EP lane step binds one layer's routed experts (see
+/// [`Qwen4GpuForward::lane_ep_expert_kind`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EpLaneExpertKind {
+    /// The static EP decode runtime over a fully resident packed aggregate.
+    StaticResidentPacked,
+    /// The live balanced-ownership runtime over a host-mapped packed aggregate.
+    BalancedHostMappedPacked,
+}
+
+/// What [`classify_ep_lane_expert`] needs of one layer's [`Qwen4MoeLayerRuntime`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EpLaneRuntimeFacts {
+    /// The runtime's layer label.
+    label: usize,
+    host_mapped: bool,
+    /// Non-empty expert views, every one QT44 gate/up + QT53 down.
+    packed_mq4: bool,
+    /// No CPU-deferred/split/cold owner, tier, slab, stock FP8 or keep mask.
+    plain: bool,
+}
+
+/// Classify one EP layer's lane expert binding from plain facts: the row gather
+/// is installed, `selected` (what [`lane_layer_moe`] picked; `balanced_selected`
+/// when that is the layer's live balanced runtime) and the layer's `static_moe`
+/// runtime are both labelled for `layer` and plain packed QT44/QT53, and the
+/// residency agrees with the selection: a live balanced runtime over a
+/// host-mapped layer, else the static runtime over a resident layer. Anything
+/// else (a host-mapped layer without a live balanced runtime, a balanced
+/// selection over a resident layer, a missing runtime) is `None`.
+fn classify_ep_lane_expert(
+    layer: usize,
+    gather_installed: bool,
+    balanced_selected: bool,
+    selected: Option<EpLaneRuntimeFacts>,
+    static_moe: Option<EpLaneRuntimeFacts>,
+) -> Option<EpLaneExpertKind> {
+    if !gather_installed {
+        return None;
+    }
+    let (selected, static_moe) = (selected?, static_moe?);
+    for runtime in [selected, static_moe] {
+        if runtime.label != layer || !runtime.packed_mq4 || !runtime.plain {
+            return None;
+        }
+    }
+    match (
+        balanced_selected,
+        selected.host_mapped,
+        static_moe.host_mapped,
+    ) {
+        (true, true, true) => Some(EpLaneExpertKind::BalancedHostMappedPacked),
+        (false, false, false) => Some(EpLaneExpertKind::StaticResidentPacked),
+        _ => None,
+    }
+}
+
 /// The EP lane resources from the forward's `ep` and `scratch` fields
 /// (`fwd.ep.as_ref()`, `&fwd.scratch`): `None` outside EP, an error under EP
 /// before `attach_ep` installed the row gather.
@@ -4029,6 +4086,24 @@ impl Qwen4MoeLayerRuntime {
                 Qwen4GpuForwardError::Dispatch(format!("retained route identity: {error:?}"))
             })?;
         Ok(self)
+    }
+
+    /// The plain facts [`classify_ep_lane_expert`] reads of this runtime.
+    fn ep_lane_facts(&self) -> EpLaneRuntimeFacts {
+        EpLaneRuntimeFacts {
+            label: self.label,
+            host_mapped: self.host_mapped,
+            packed_mq4: !self.experts.is_empty() && self.qt44_qt53_formats(),
+            plain: !self.cpu_deferred_experts
+                && self.cpu_expert_owners.is_none()
+                && self.cpu_cold_owners.is_none()
+                && self.cpu_split.is_none()
+                && self.tier.is_none()
+                && self.tier_identity.is_none()
+                && self.slab.is_none()
+                && !self.fp8
+                && self.expert_keep_mask.is_none(),
+        }
     }
 
     /// Every routed expert is the QT44 gate/up + QT53 down pair (`MQ4G256V2`/`MQ4G128V2`) the
@@ -7810,6 +7885,28 @@ impl Qwen4GpuForward {
         self.ep.as_ref().map(|ep| ep.placement)
     }
 
+    /// How `layer`'s routed experts are bound by an EP lane step, `None` unless
+    /// positively one of the two proven packed MQ4 (QT44/QT53) kinds: the
+    /// layer's static resident runtime, or its live balanced runtime over a
+    /// host-mapped trunk layer. Read-only and allocation-free: it inspects the
+    /// runtime [`lane_layer_moe`] selects (the one selector the lane step
+    /// binds), the installed row gather and the runtimes' plain flags.
+    pub(crate) fn lane_ep_expert_kind(&self, layer: usize) -> Option<EpLaneExpertKind> {
+        let ep = self.ep.as_ref()?;
+        let selected = lane_layer_moe(Some(ep), &self.moe, layer)?;
+        let balanced_selected = ep.balanced.get(layer).and_then(Option::as_ref).is_some();
+        classify_ep_lane_expert(
+            layer,
+            ep.gather.is_some(),
+            balanced_selected,
+            Some(selected.ep_lane_facts()),
+            self.moe
+                .get(layer)
+                .and_then(Option::as_ref)
+                .map(Qwen4MoeLayerRuntime::ep_lane_facts),
+        )
+    }
+
     /// Device pointers of this rank's compact routed-expert tensors, one per
     /// trunk MoE layer in layer order (what every peer's full table names).
     pub(crate) fn ep_expert_sources(
@@ -11418,6 +11515,68 @@ mod ep_table_tests {
             );
             // The even-split count is no longer the exact count.
             assert!(entries(&layout, compact(0, 0x1000_0000, EXPERTS / 4)).is_err());
+        }
+    }
+
+    fn ep_runtime(label: usize, host_mapped: bool) -> super::EpLaneRuntimeFacts {
+        super::EpLaneRuntimeFacts {
+            label,
+            host_mapped,
+            packed_mq4: true,
+            plain: true,
+        }
+    }
+
+    #[test]
+    fn ep_lane_expert_kind_is_static_or_balanced_from_the_selected_runtime() {
+        use super::EpLaneExpertKind::{BalancedHostMappedPacked, StaticResidentPacked};
+        let kind = super::classify_ep_lane_expert;
+        // Resident trunk layer: the static runtime, no balanced live runtime.
+        let resident = Some(ep_runtime(3, false));
+        assert_eq!(
+            kind(3, true, false, resident, resident),
+            Some(StaticResidentPacked)
+        );
+        // Host-mapped trunk layer with its live balanced runtime selected.
+        let mapped = Some(ep_runtime(3, true));
+        assert_eq!(
+            kind(3, true, true, mapped, mapped),
+            Some(BalancedHostMappedPacked)
+        );
+    }
+
+    #[test]
+    fn ep_lane_expert_kind_refuses_every_unproven_binding() {
+        let kind = super::classify_ep_lane_expert;
+        let resident = Some(ep_runtime(3, false));
+        let mapped = Some(ep_runtime(3, true));
+        // The row gather is not installed.
+        assert_eq!(kind(3, false, false, resident, resident), None);
+        assert_eq!(kind(3, false, true, mapped, mapped), None);
+        // No selected or no static runtime.
+        assert_eq!(kind(3, true, false, None, resident), None);
+        assert_eq!(kind(3, true, false, resident, None), None);
+        // A balanced selection must be a host-mapped layer, and a host-mapped
+        // layer without a live balanced runtime is not static-resident.
+        assert_eq!(kind(3, true, true, resident, resident), None);
+        assert_eq!(kind(3, true, false, mapped, mapped), None);
+        // The balanced layer's static runtime must be the host-mapped one.
+        assert_eq!(kind(3, true, true, mapped, resident), None);
+        // A runtime labelled for another layer (a balanced table indexed by
+        // MoE ordinal selects a neighbour's live runtime).
+        let other = Some(ep_runtime(4, false));
+        assert_eq!(kind(3, true, false, other, other), None);
+        assert_eq!(kind(3, true, false, other, resident), None);
+        // Not QT44/QT53 for every expert view, or any CPU/tier/slab/FP8/keep-mask state.
+        for (packed_mq4, plain) in [(false, true), (true, false), (false, false)] {
+            let bad = Some(super::EpLaneRuntimeFacts {
+                packed_mq4,
+                plain,
+                ..ep_runtime(3, false)
+            });
+            assert_eq!(kind(3, true, false, bad, bad), None);
+            assert_eq!(kind(3, true, false, bad, resident), None);
+            assert_eq!(kind(3, true, false, resident, bad), None);
         }
     }
 

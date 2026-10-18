@@ -7789,7 +7789,7 @@ mod tests {
             row_budget: 32,
             mapped_bytes: 123_456,
             stage_policy: "embed=once,argmax=once".to_string(),
-            stage_evidence: "g0-receipt",
+            stage_evidence: "g0-receipt".to_string(),
             spec: "mtp",
             spec_k: 3,
         };
