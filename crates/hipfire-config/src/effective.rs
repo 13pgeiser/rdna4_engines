@@ -23,8 +23,9 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::{
-    developer_env_for_key, field, memory::PleFormatRequest, mtp_k_default_for_arch, ConfigLayer,
-    ConfigScope, ConfigSource, ConfigValue, ResolvedConfig,
+    developer_env_for_key, field, memory::PleFormatRequest, mtp_k_default,
+    qwen4_row_exact_verify_rows_table, ConfigLayer, ConfigScope, ConfigSource, ConfigValue,
+    ResolvedConfig,
 };
 
 const KV_KEY: &str = "memory.kv_cache";
@@ -331,14 +332,18 @@ fn state_quant_auto(out: &mut Effective, ctx: &ArchCtx) {
     out.reason = Some(reason);
 }
 
-/// `speculation.mtp_k = auto` → `mtp_k_default_for_arch`.
+/// `speculation.mtp_k = auto` → `mtp_k_default` over the GPU's table
+/// row-exact verify rows (the runtime additionally honors the developer
+/// `HIPFIRE_QWEN4_WIDE_VERIFY_ROWS` oracle override, which the config view
+/// does not model).
 fn mtp_k_auto(out: &mut Effective, ctx: &ArchCtx) {
     let arch = ctx.arch();
-    let k = mtp_k_default_for_arch(ctx.model_arch_id.unwrap_or(0), arch);
+    let rows = qwen4_row_exact_verify_rows_table(arch);
+    let k = mtp_k_default(ctx.model_arch_id.unwrap_or(0), rows);
     out.value = ConfigValue::Integer(k as i64);
     out.by_arch_rule = k != crate::MTP_K_DEFAULT;
     out.reason = Some(if out.by_arch_rule {
-        format!("auto: {k} for Flash-Next on gfx1151")
+        format!("auto: {k} for Flash-Next (row-exact verify rows {rows} - 1)")
     } else if ctx.model_arch_id.is_none() {
         format!("auto: {k} (model unknown)")
     } else {
@@ -749,18 +754,15 @@ mod tests {
     }
 
     #[test]
-    fn mtp_k_auto_is_7_for_flash_next_on_gfx1151_else_3() {
-        let mut c = ctx("gfx1151");
-        c.model_arch_id = Some(16);
-        let e = eff(MTP_K_KEY, &c);
-        assert_eq!(e.value, ConfigValue::Integer(7));
-        assert!(e.by_arch_rule);
-        for (arch, model) in [
-            ("gfx1151", Some(5)),
-            ("gfx1151", None),
-            ("gfx1201", Some(16)),
-            ("gfx1100", Some(16)),
-        ] {
+    fn mtp_k_auto_is_row_exact_rows_minus_one_for_flash_next_else_3() {
+        for arch in ["gfx1151", "gfx1201", "gfx1100", ""] {
+            let mut c = ctx(arch);
+            c.model_arch_id = Some(16);
+            let e = eff(MTP_K_KEY, &c);
+            assert_eq!(e.value, ConfigValue::Integer(7), "{arch}");
+            assert!(e.by_arch_rule, "{arch}");
+        }
+        for (arch, model) in [("gfx1151", Some(5)), ("gfx1151", None), ("gfx1201", None)] {
             let mut c = ctx(arch);
             c.model_arch_id = model;
             let e = eff(MTP_K_KEY, &c);

@@ -1598,6 +1598,62 @@ const MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS: usize = 6;
 /// ms/token mean) and a retirement is sticky.
 const MTP_FLOOR_RETIRE_DECAY: f32 = 0.96;
 
+/// Routed depth at or below which native evidence is shallow: the incumbent
+/// cap-3 chooser, the depth a deeper (capability-default) budget must be able
+/// to fall back to before a request retires stickily.
+const MTP_FLOOR_SHALLOW_CAP: usize = 3;
+
+/// Hard bound on the windows one shallow re-probe may spend (native or
+/// external, first-use unpriced ones included): twice
+/// [`MTP_FLOOR_PROBE_WINDOWS`], so every priced window of the probe budget
+/// can still be preceded by one unpriced first use.
+const MTP_FLOOR_SHALLOW_MAX_WINDOWS: usize = 2 * MTP_FLOOR_PROBE_WINDOWS;
+
+/// Phase of the fresh-shallow evidence a would-be retirement of a deeper
+/// budget asks for ([`MtpFloor::retire_or_probe`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ShallowState {
+    /// No re-probe running or decided since the last deep window.
+    #[default]
+    Idle,
+    /// Shallow windows are running; the verdict waits for
+    /// [`MTP_FLOOR_PROBE_WINDOWS`] priced ones or the window bound.
+    Probing,
+    /// Shallow priced below AR: no retirement while that holds; deeper caps
+    /// need positive evidence ([`MtpFloor::update_climb_evidence`]).
+    Holding,
+    /// Priced shallow windows did not beat AR: the verdict retires.
+    Lost,
+    /// The window bound ended with no priced shallow window (every timing
+    /// invalid): no win can be asserted, so the verdict retires (the
+    /// invalid-AR-price rule).
+    Unpriced,
+}
+
+impl ShallowState {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Probing => "probing",
+            Self::Holding => "holding",
+            Self::Lost => "lost",
+            Self::Unpriced => "unpriced",
+        }
+    }
+}
+
+/// Fresh shallow evidence of one re-probe (then, while holding, its decayed
+/// continuation).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ShallowEvidence {
+    /// Windows spent, priced or not.
+    windows: usize,
+    /// Windows with a valid timing.
+    priced: usize,
+    /// (wall us, emitted tokens) of the priced windows.
+    cost: (f32, f32),
+}
+
 /// The singleton request's retirement threshold:
 /// `HIPFIRE_MTP_FLOOR_MIN_WINDOWS` when it parses as an integer ≥ 1, else
 /// [`MTP_SINGLETON_FLOOR_MIN_WINDOWS`].
@@ -1832,6 +1888,20 @@ fn expected_emitted_by_depth(agreement: &Agreement) -> [f32; MTP_WINDOW_COST.len
 /// also needs the slow-memory (`slow`, ~25 windows) realized cost of all
 /// windows to lose to that price: the 8-window memories dip on any streak of
 /// rejected drafts and a retirement is sticky.
+///
+/// Fresh shallow evidence (singleton and lane floors, a budget above
+/// [`MTP_FLOOR_SHALLOW_CAP`]): a request that explored deeper caps and whose
+/// verdict would retire first needs fresh shallow native evidence, i.e.
+/// [`MTP_FLOOR_PROBE_WINDOWS`] priced shallow windows (batched at a routed
+/// cap ≤ 3, or interleaved) since the last deep window.  The decayed cap
+/// statistics never count: only `shallow_since_deep`, which a deep window
+/// zeroes.  Without it, after the AR re-price the floor spends at most
+/// [`MTP_FLOOR_SHALLOW_MAX_WINDOWS`] windows on its best measured shallow
+/// option (first-use unpriced windows and external windows spend the bound
+/// unpriced); priced below AR it holds (no retirement, the climb waits for
+/// [`MTP_FLOOR_PROBE_WINDOWS`] consecutive windows of a deeper candidate
+/// pricing below the shallow one), priced at or above AR or never priced
+/// it retires.  A budget of at most [`MTP_FLOOR_SHALLOW_CAP`] never probes.
 #[derive(Clone, Debug)]
 pub(crate) struct MtpFloor {
     calibrated: bool,
@@ -1880,6 +1950,17 @@ pub(crate) struct MtpFloor {
     probe_samples: Vec<f32>,
     /// `observed` when the last probe set started.
     probed_at: Option<usize>,
+    /// Draft budget `k` of the last routed or observed native window.
+    budget_k: usize,
+    /// A window routed deeper than [`MTP_FLOOR_SHALLOW_CAP`] was observed.
+    deep_seen: bool,
+    /// Priced shallow windows since the last deep window.
+    shallow_since_deep: usize,
+    shallow_state: ShallowState,
+    shallow: ShallowEvidence,
+    /// Consecutive windows a deeper candidate priced below the held
+    /// shallow one.
+    climb_streak: usize,
 }
 
 impl MtpFloor {
@@ -1912,6 +1993,12 @@ impl MtpFloor {
             probe_left: 0,
             probe_samples: Vec::new(),
             probed_at: None,
+            budget_k: 0,
+            deep_seen: false,
+            shallow_since_deep: 0,
+            shallow_state: ShallowState::Idle,
+            shallow: ShallowEvidence::default(),
+            climb_streak: 0,
         }
     }
 
@@ -2190,6 +2277,7 @@ impl MtpFloor {
         if k == 0 || self.retired || !self.calibrated {
             return;
         }
+        self.budget_k = k;
         // An unusable timing records no cost but still spends probe budget,
         // so the number of unmeasured windows stays bounded.
         if valid_us(us) {
@@ -2229,6 +2317,7 @@ impl MtpFloor {
                 }
             }
         }
+        self.observe_shallow_epoch(route, window, us, agreement);
         self.count_probe();
         self.decide(agreement);
     }
@@ -2260,6 +2349,7 @@ impl MtpFloor {
                     decay_add(&mut self.external, wall_us, emitted as f32, decay);
                 }
             }
+            self.spend_shallow_window(None);
             self.count_probe();
             self.decide(agreement);
         }
@@ -2309,6 +2399,7 @@ impl MtpFloor {
                 self.external_blocked =
                     valid_us(self.ar_us) && external.is_some_and(|cost| cost >= self.ar_us);
             } else {
+                self.spend_shallow_window(None);
                 self.count_probe();
                 self.decide(agreement);
             }
@@ -2370,19 +2461,167 @@ impl MtpFloor {
     }
 
     /// A losing verdict past the grace: sticky retirement, unless AR has not
-    /// been re-priced where the request is now, in which case the next
-    /// windows are AR probe tokens and the verdict is re-evaluated on their
-    /// mean (`observe_calibration`).  Returns the route for the next window.
-    fn retire_or_probe(&mut self) -> FloorRoute {
+    /// been re-priced where the request is now (the next windows are AR
+    /// probe tokens, re-evaluated on their mean by `observe_calibration`),
+    /// or a deeper budget has no fresh shallow evidence yet (the next
+    /// windows are the bounded shallow re-probe,
+    /// [`Self::needs_shallow_evidence`]).  Returns the route for the next
+    /// window.
+    fn retire_or_probe(&mut self, agreement: &Agreement) -> FloorRoute {
         if self.should_probe() {
             self.probe_left = self.probe_tokens;
             self.probe_samples.clear();
             self.probed_at = Some(self.observed);
             FloorRoute::ArSample
+        } else if self.needs_shallow_evidence() {
+            self.shallow_state = ShallowState::Probing;
+            self.shallow = ShallowEvidence::default();
+            self.climb_streak = 0;
+            self.shallow_route(agreement, self.budget_k)
         } else {
             self.retired = true;
             FloorRoute::Ar
         }
+    }
+
+    /// The verdict would retire a request that explored past
+    /// [`MTP_FLOOR_SHALLOW_CAP`] on a budget above it, with no priced shallow
+    /// window since its last deep one and no shallow verdict already taken.
+    fn needs_shallow_evidence(&self) -> bool {
+        self.shallow_state == ShallowState::Idle
+            && self.budget_k > MTP_FLOOR_SHALLOW_CAP
+            && self.deep_seen
+            && self.shallow_since_deep < MTP_FLOOR_PROBE_WINDOWS
+            && valid_us(self.ar_us)
+    }
+
+    /// Route of a shallow window within `k`: the cheapest measured shallow
+    /// option, else the deepest shallow cap.
+    fn shallow_route(&self, agreement: &Agreement, k: usize) -> FloorRoute {
+        let limit = k.min(MTP_FLOOR_SHALLOW_CAP);
+        match self.best_native(agreement, limit) {
+            Some((route, _)) => route,
+            None if limit == 0 => FloorRoute::Interleaved,
+            None => FloorRoute::Batched(limit),
+        }
+    }
+
+    /// Fresh shallow realized wall us per emitted token.
+    fn shallow_cost(&self) -> Option<f32> {
+        let (us, emitted) = self.shallow.cost;
+        (emitted > 0.0 && valid_us(us)).then(|| us / emitted)
+    }
+
+    /// The held shallow evidence still prices below AR.
+    fn shallow_wins(&self) -> bool {
+        self.shallow_state == ShallowState::Holding
+            && self.shallow_cost().is_some_and(|cost| cost < self.ar_us)
+    }
+
+    /// Draft budget the route may use: a held shallow request stays at or
+    /// below [`MTP_FLOOR_SHALLOW_CAP`] until a deeper candidate has the
+    /// positive evidence of [`Self::update_climb_evidence`].
+    fn hold_limit(&self, k: usize) -> usize {
+        if self.shallow_state == ShallowState::Holding
+            && self.climb_streak < MTP_FLOOR_PROBE_WINDOWS
+        {
+            k.min(MTP_FLOOR_SHALLOW_CAP)
+        } else {
+            k
+        }
+    }
+
+    /// Count one finished window of a held shallow request toward a climb:
+    /// the cheapest candidate within the budget is deeper than the shallow
+    /// cap and prices strictly below both the cheapest shallow candidate and
+    /// AR.
+    fn update_climb_evidence(&mut self, agreement: &Agreement) {
+        let k = self.budget_k;
+        let deeper = k > MTP_FLOOR_SHALLOW_CAP
+            && match (
+                self.best_candidate(agreement, MTP_FLOOR_SHALLOW_CAP),
+                self.best_candidate(agreement, k),
+            ) {
+                (Some((_, shallow)), Some((FloorRoute::Batched(cap), cost))) => {
+                    cap > MTP_FLOOR_SHALLOW_CAP && cost < shallow && cost < self.ar_us
+                }
+                _ => false,
+            };
+        self.climb_streak = if deeper {
+            self.climb_streak.saturating_add(1)
+        } else {
+            0
+        };
+    }
+
+    /// Track the shallow epoch with one finished native window: a deep
+    /// window zeroes the shallow count and ends a held or decided shallow
+    /// verdict; a shallow one counts when priced and feeds the re-probe or
+    /// the held evidence.
+    fn observe_shallow_epoch(
+        &mut self,
+        route: NativeWindow,
+        window: WindowStats,
+        us: f32,
+        agreement: &Agreement,
+    ) {
+        if route == NativeWindow::Batched && window.cap > MTP_FLOOR_SHALLOW_CAP {
+            self.deep_seen = true;
+            self.shallow_since_deep = 0;
+            self.climb_streak = 0;
+            match self.shallow_state {
+                ShallowState::Probing => self.spend_shallow_window(None),
+                ShallowState::Idle => {}
+                _ => self.shallow_state = ShallowState::Idle,
+            }
+            return;
+        }
+        let priced = valid_us(us);
+        if priced {
+            self.shallow_since_deep = self.shallow_since_deep.saturating_add(1);
+        }
+        let emitted = window.emitted as f32;
+        match self.shallow_state {
+            ShallowState::Probing => self.spend_shallow_window(priced.then_some((us, emitted))),
+            ShallowState::Holding => {
+                if priced {
+                    let decay = self.decay.max(MTP_FLOOR_RETIRE_DECAY);
+                    decay_add(&mut self.shallow.cost, us, emitted, decay);
+                }
+                self.update_climb_evidence(agreement);
+            }
+            _ => {}
+        }
+    }
+
+    /// Spend one window of the shallow re-probe (`evidence`: its wall us and
+    /// emitted tokens when priced), and take the verdict at
+    /// [`MTP_FLOOR_PROBE_WINDOWS`] priced windows or the window bound.
+    fn spend_shallow_window(&mut self, evidence: Option<(f32, f32)>) {
+        if self.shallow_state != ShallowState::Probing {
+            return;
+        }
+        self.shallow.windows += 1;
+        if let Some((us, emitted)) = evidence {
+            self.shallow.priced += 1;
+            self.shallow.cost.0 += us;
+            self.shallow.cost.1 += emitted;
+        }
+        if self.shallow.priced < MTP_FLOOR_PROBE_WINDOWS
+            && self.shallow.windows < MTP_FLOOR_SHALLOW_MAX_WINDOWS
+        {
+            return;
+        }
+        self.shallow_state = if self.shallow.priced == 0 {
+            ShallowState::Unpriced
+        } else if self.shallow_cost().is_some_and(|cost| cost < self.ar_us) {
+            self.deep_seen = false;
+            self.shallow_since_deep = self.shallow.priced;
+            self.climb_streak = 0;
+            ShallowState::Holding
+        } else {
+            ShallowState::Lost
+        };
     }
 
     /// The slow-memory realized per-token cost of every window is strictly
@@ -2397,7 +2636,12 @@ impl MtpFloor {
     /// slow-memory realized cost does not beat AR either; first re-pricing
     /// AR with fresh probes ([`Self::retire_or_probe`]).
     fn decide(&mut self, agreement: &Agreement) {
-        if self.retired || !self.calibrated || self.probing() || self.probe_left > 0 {
+        if self.retired
+            || !self.calibrated
+            || self.probing()
+            || self.probe_left > 0
+            || self.shallow_state == ShallowState::Probing
+        {
             return;
         }
         if self.ar_us <= 0.0 {
@@ -2412,9 +2656,10 @@ impl MtpFloor {
         if !native_wins
             && !(self.external_alive() && self.combined_wins())
             && !self.slow_wins()
+            && !self.shallow_wins()
             && !self.in_grace()
         {
-            self.retire_or_probe();
+            self.retire_or_probe(agreement);
         }
     }
 
@@ -2441,6 +2686,7 @@ impl MtpFloor {
         k: usize,
         provisional: usize,
     ) -> FloorRoute {
+        self.budget_k = k;
         if self.retired {
             return FloorRoute::Ar;
         }
@@ -2453,20 +2699,27 @@ impl MtpFloor {
                 depth => FloorRoute::Batched(depth),
             };
         }
-        let best = self.best_native(agreement, k);
+        if self.shallow_state == ShallowState::Probing {
+            return self.shallow_route(agreement, k);
+        }
+        let limit = self.hold_limit(k);
+        let best = self.best_native(agreement, limit);
         if let Some((route, cost)) = best {
             if cost < self.ar_us {
                 // The candidates include every measured option, so the
                 // cheapest one costs no more than `cost`.
                 return self
-                    .best_candidate(agreement, k)
+                    .best_candidate(agreement, limit)
                     .map_or(route, |(candidate, _)| candidate);
             }
         }
-        if (self.external_alive() && self.combined_wins()) || self.slow_wins() {
-            // Losing native route kept alive for the external windows or the
-            // realized mixture: the cheapest measured option within `k`,
-            // else interleaved.
+        if (self.external_alive() && self.combined_wins())
+            || self.slow_wins()
+            || self.shallow_wins()
+        {
+            // Losing native route kept alive for the external windows, the
+            // realized mixture or the held shallow evidence: the cheapest
+            // measured option within the limit, else interleaved.
             return best.map_or(FloorRoute::Interleaved, |(route, _)| route);
         }
         if self.in_grace() && valid_us(self.ar_us) {
@@ -2478,7 +2731,7 @@ impl MtpFloor {
                 |(route, _)| route,
             );
         }
-        self.retire_or_probe()
+        self.retire_or_probe(agreement)
     }
 
     /// One `QWEN4_FLOOR_TRACE` JSON line (`HIPFIRE_MTP_FLOOR_TRACE=1`): the
@@ -2542,9 +2795,23 @@ impl MtpFloor {
         } else {
             0.0
         };
+        let shallow = self.shallow_cost().unwrap_or(0.0);
+        let shallow_state = self.shallow_state.name();
         format!(
-            "QWEN4_FLOOR_TRACE {{\"event\":\"{event}\",\"us\":{us:.1},\"emitted\":{emitted},\"drafts\":{drafts},\"ar_us\":{:.1},\"observed\":{},\"probes\":{},\"retire_after\":{},\"retired\":{},\"probe_left\":{},\"combined_us_per_tok\":{combined:.1},\"slow_us_per_tok\":{slow:.1},\"row_us\":{row_us:.1},\"options\":[{options}]}}",
-            self.ar_us, self.observed, self.probes, self.retire_after, self.retired, self.probe_left
+            "QWEN4_FLOOR_TRACE {{\"event\":\"{event}\",\"us\":{us:.1},\"emitted\":{emitted},\"drafts\":{drafts},\"ar_us\":{:.1},\"observed\":{},\"probes\":{},\"retire_after\":{},\"retired\":{},\"probe_left\":{},\"combined_us_per_tok\":{combined:.1},\"slow_us_per_tok\":{slow:.1},\"row_us\":{row_us:.1},\"budget_k\":{},\"deep_seen\":{},\"shallow_state\":\"{shallow_state}\",\"shallow_windows\":{},\"shallow_priced\":{},\"shallow_budget\":{},\"shallow_since_deep\":{},\"shallow_us_per_tok\":{shallow:.1},\"climb_streak\":{},\"options\":[{options}]}}",
+            self.ar_us,
+            self.observed,
+            self.probes,
+            self.retire_after,
+            self.retired,
+            self.probe_left,
+            self.budget_k,
+            self.deep_seen,
+            self.shallow.windows,
+            self.shallow.priced,
+            MTP_FLOOR_SHALLOW_MAX_WINDOWS,
+            self.shallow_since_deep,
+            self.climb_streak
         )
     }
 }
@@ -9905,8 +10172,11 @@ mod tests {
     }
 
     #[test]
-    fn rearm_fresh_chooser_starts_at_three_without_lowering_the_halo_cap() {
-        let cap = hipfire_config::mtp_k_default_for_arch(16, "gfx1151");
+    fn rearm_fresh_chooser_starts_at_three_without_lowering_the_native_cap() {
+        let cap = hipfire_config::mtp_k_default(
+            16,
+            rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows("gfx1151"),
+        );
         assert_eq!(cap, 7);
         let mut drafter = Qwen4MtpDrafter::new(cap, 4096, None);
         drafter.floor.observe_calibration(100.0, &drafter.agreement);
@@ -11340,6 +11610,302 @@ mod tests {
         assert_eq!(floor.observed, 32);
         assert!(floor.needs_ar_sample() && !floor.retired);
         assert_eq!(floor.probed_at, Some(32));
+    }
+
+    /// A singleton floor on a budget of 7 that ran cap 5 for its whole grace,
+    /// every window losing to a 30 ms AR step, then re-priced AR: its
+    /// verdict would retire, so it starts the bounded shallow re-probe.
+    fn deep_only_losing_floor(bad: &Agreement) -> MtpFloor {
+        let mut floor = MtpFloor::with_retire_after(MTP_SINGLETON_FLOOR_MIN_WINDOWS)
+            .with_retire_evidence(2);
+        floor.observe_calibration(30_000.0, bad);
+        for _ in 0..MTP_SINGLETON_FLOOR_MIN_WINDOWS {
+            floor.observe_window(NativeWindow::Batched, capped(5, 5, 0), 200_000.0, 7, bad);
+        }
+        assert!(floor.needs_ar_sample() && !floor.retired);
+        for _ in 0..2 {
+            floor.observe_calibration(30_000.0, bad);
+        }
+        assert_eq!(floor.ar_us, 30_000.0);
+        assert!(!floor.retired && !floor.needs_ar_sample());
+        assert_eq!(floor.shallow_state, ShallowState::Probing);
+        assert!(floor.deep_seen && floor.shallow_since_deep == 0);
+        floor
+    }
+
+    /// Deep-only losing evidence re-probes shallow before retiring; a
+    /// shallow control that beats AR keeps the request alive on its shallow
+    /// route, and the trace carries the state.
+    #[test]
+    fn floor_shallow_reprobe_win_prevents_retirement() {
+        let bad = agreement(0.0, 2.0);
+        let mut floor = deep_only_losing_floor(&bad);
+        assert_eq!(floor.route(&bad, 7, 3), FloorRoute::Batched(3));
+        for done in 1..=MTP_FLOOR_PROBE_WINDOWS {
+            assert_eq!(floor.shallow_state, ShallowState::Probing, "window {done}");
+            assert!(!floor.retired);
+            floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), 60_000.0, 7, &bad);
+        }
+        assert_eq!(floor.shallow_state, ShallowState::Holding);
+        assert!(!floor.retired);
+        assert_eq!(floor.shallow.priced, MTP_FLOOR_PROBE_WINDOWS);
+        assert_eq!(floor.shallow_cost(), Some(15_000.0));
+        assert!(!floor.deep_seen);
+        assert_eq!(floor.shallow_since_deep, MTP_FLOOR_PROBE_WINDOWS);
+        // The chooser's own cap-3 price (no accepted prefix predicted) still
+        // loses; the fresh realized shallow cost keeps the request on cap 3.
+        assert_eq!(floor.route(&bad, 7, 3), FloorRoute::Batched(3));
+        assert!(!floor.retired);
+        let trace = floor.trace_line(&bad, "t", 1.0, 1, 3);
+        for field in [
+            "\"shallow_state\":\"holding\"",
+            "\"shallow_priced\":3",
+            "\"shallow_windows\":3",
+            "\"shallow_budget\":6",
+            "\"budget_k\":7",
+            "\"deep_seen\":false",
+            "\"shallow_since_deep\":3",
+            "\"shallow_us_per_tok\":15000.0",
+            "\"climb_streak\":0",
+        ] {
+            assert!(trace.contains(field), "{field} in {trace}");
+        }
+    }
+
+    /// Shallow windows that also lose to AR end the re-probe in a sticky
+    /// retirement, after exactly the probe budget of priced windows.
+    #[test]
+    fn floor_shallow_reprobe_loss_retires() {
+        let bad = agreement(0.0, 2.0);
+        let mut floor = deep_only_losing_floor(&bad);
+        for done in 1..=MTP_FLOOR_PROBE_WINDOWS {
+            assert!(!floor.retired, "window {done}");
+            floor.observe_window(NativeWindow::Batched, capped(3, 3, 0), 60_000.0, 7, &bad);
+        }
+        assert_eq!(floor.shallow_state, ShallowState::Lost);
+        assert!(floor.retired);
+        assert_eq!(floor.route(&bad, 7, 3), FloorRoute::Ar);
+        assert!(floor
+            .trace_line(&bad, "t", 1.0, 1, 3)
+            .contains("\"shallow_state\":\"lost\""));
+    }
+
+    /// The lane floor (no AR probe tokens, retiring at the probe budget)
+    /// takes the same shallow control before its sticky retirement.
+    #[test]
+    fn floor_shallow_reprobe_guards_floors_without_ar_probes() {
+        let bad = agreement(0.0, 2.0);
+        let deep = || {
+            let mut floor = MtpFloor::new();
+            floor.observe_calibration(30_000.0, &bad);
+            for _ in 0..MTP_FLOOR_PROBE_WINDOWS {
+                floor.observe_window(NativeWindow::Batched, capped(5, 5, 0), 200_000.0, 7, &bad);
+            }
+            floor
+        };
+        let mut floor = deep();
+        assert!(!floor.retired);
+        assert_eq!(floor.shallow_state, ShallowState::Probing);
+        assert_eq!(floor.route(&bad, 7, 3), FloorRoute::Batched(3));
+        for _ in 0..MTP_FLOOR_PROBE_WINDOWS {
+            floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), 60_000.0, 7, &bad);
+        }
+        assert_eq!(floor.shallow_state, ShallowState::Holding);
+        assert!(!floor.retired);
+        let mut floor = deep();
+        for _ in 0..MTP_FLOOR_PROBE_WINDOWS {
+            floor.observe_window(NativeWindow::Batched, capped(3, 3, 0), 60_000.0, 7, &bad);
+        }
+        assert!(floor.retired);
+    }
+
+    /// First-use unpriced windows spend the hard window bound but not the
+    /// priced budget: a valid control still wins, and a probe whose every
+    /// timing is invalid ends, finitely, in the fail-closed retirement.
+    #[test]
+    fn floor_shallow_reprobe_budget_is_bounded_with_unpriced_first_uses() {
+        let bad = agreement(0.0, 2.0);
+        assert_eq!(MTP_FLOOR_SHALLOW_MAX_WINDOWS, 2 * MTP_FLOOR_PROBE_WINDOWS);
+        // Two unpriced first uses (drafted depths 1 and 2), then a priced
+        // winner at depth 3: five windows, inside the bound.
+        let mut floor = deep_only_losing_floor(&bad);
+        for depth in [1, 2] {
+            floor.observe_window(
+                NativeWindow::Batched,
+                capped(3, depth, 0),
+                f32::NAN,
+                7,
+                &bad,
+            );
+        }
+        for _ in 0..MTP_FLOOR_PROBE_WINDOWS - 1 {
+            assert_eq!(floor.shallow_state, ShallowState::Probing);
+            floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), 60_000.0, 7, &bad);
+        }
+        assert_eq!(floor.shallow_state, ShallowState::Probing);
+        floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), 60_000.0, 7, &bad);
+        assert_eq!(floor.shallow_state, ShallowState::Holding);
+        assert_eq!(floor.shallow.windows, 2 + MTP_FLOOR_PROBE_WINDOWS);
+        assert_eq!(floor.shallow.priced, MTP_FLOOR_PROBE_WINDOWS);
+        assert!(!floor.retired);
+
+        // One priced winner among five unpriced windows ends at the bound
+        // with that control's verdict.
+        let mut floor = deep_only_losing_floor(&bad);
+        floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), 60_000.0, 7, &bad);
+        for spent in 2..MTP_FLOOR_SHALLOW_MAX_WINDOWS {
+            floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), f32::NAN, 7, &bad);
+            assert_eq!(floor.shallow_state, ShallowState::Probing, "window {spent}");
+        }
+        floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), f32::NAN, 7, &bad);
+        assert_eq!(floor.shallow_state, ShallowState::Holding);
+        assert_eq!(floor.shallow.windows, MTP_FLOOR_SHALLOW_MAX_WINDOWS);
+        assert_eq!(floor.shallow.priced, 1);
+        assert!(!floor.retired);
+
+        // No priced control at all: bounded, then retired (an unpriced win
+        // cannot be asserted).
+        let mut floor = deep_only_losing_floor(&bad);
+        for spent in 1..MTP_FLOOR_SHALLOW_MAX_WINDOWS {
+            floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), f32::NAN, 7, &bad);
+            assert_eq!(floor.shallow_state, ShallowState::Probing, "window {spent}");
+            assert!(!floor.retired);
+            assert_eq!(floor.shallow.windows, spent);
+            assert_eq!(floor.route(&bad, 7, 3), FloorRoute::Batched(3));
+        }
+        floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), f32::NAN, 7, &bad);
+        assert_eq!(floor.shallow_state, ShallowState::Unpriced);
+        assert!(floor.retired);
+        assert_eq!(floor.shallow.priced, 0);
+        assert_eq!(floor.route(&bad, 7, 3), FloorRoute::Ar);
+        assert!(floor
+            .trace_line(&bad, "t", 1.0, 1, 3)
+            .contains("\"shallow_state\":\"unpriced\""));
+
+        // External windows spend the same bound, so a probe cannot outlive
+        // it while takeovers run.
+        let mut floor = deep_only_losing_floor(&bad);
+        for spent in 1..MTP_FLOOR_SHALLOW_MAX_WINDOWS {
+            floor.observe_external(1, 200_000.0, 4, &bad);
+            assert_eq!(floor.shallow.windows, spent);
+            assert_eq!(floor.shallow_state, ShallowState::Probing);
+            assert!(!floor.retired);
+        }
+        floor.observe_external(1, 200_000.0, 4, &bad);
+        assert_eq!(floor.shallow_state, ShallowState::Unpriced);
+        assert!(floor.retired);
+    }
+
+    /// Only the request's current budget asks for the probe: a budget of at
+    /// most 3 (an explicit K below 3, or a route `k` override back to 3)
+    /// retires on its own evidence without shallow windows.
+    #[test]
+    fn floor_shallow_reprobe_is_skipped_for_budgets_at_or_below_three() {
+        let bad = agreement(0.0, 2.0);
+        for k in 1..=MTP_FLOOR_SHALLOW_CAP {
+            let mut floor = MtpFloor::with_retire_after(MTP_SINGLETON_FLOOR_MIN_WINDOWS)
+                .with_retire_evidence(2);
+            floor.observe_calibration(30_000.0, &bad);
+            for _ in 0..MTP_SINGLETON_FLOOR_MIN_WINDOWS {
+                floor.observe_window(NativeWindow::Batched, capped(k, k, 0), 60_000.0, k, &bad);
+            }
+            assert!(floor.needs_ar_sample() && !floor.retired, "k {k}");
+            for _ in 0..2 {
+                floor.observe_calibration(30_000.0, &bad);
+            }
+            assert!(floor.retired, "k {k}");
+            assert_eq!(floor.shallow_state, ShallowState::Idle, "k {k}");
+            assert_eq!(floor.shallow.windows, 0, "k {k}");
+        }
+        // A deep request whose current route budget is 3: the override
+        // starts no shallow windows even though deep windows were seen.
+        let mut floor = MtpFloor::with_retire_after(MTP_SINGLETON_FLOOR_MIN_WINDOWS)
+            .with_retire_evidence(2);
+        floor.observe_calibration(30_000.0, &bad);
+        for _ in 0..MTP_SINGLETON_FLOOR_MIN_WINDOWS {
+            floor.observe_window(NativeWindow::Batched, capped(5, 5, 0), 200_000.0, 7, &bad);
+        }
+        assert!(floor.deep_seen && floor.needs_ar_sample());
+        assert_eq!(floor.route(&bad, 3, 3), FloorRoute::ArSample);
+        for _ in 0..2 {
+            floor.observe_calibration(30_000.0, &bad);
+        }
+        assert!(floor.retired);
+        assert_eq!(floor.shallow_state, ShallowState::Idle);
+    }
+
+    /// Stale shallow samples are not fresh evidence: cap-3 windows decayed
+    /// into the cap statistics before the deep exploration still leave the
+    /// retirement needing its own shallow windows.
+    #[test]
+    fn floor_shallow_reprobe_ignores_stale_shallow_samples() {
+        let bad = agreement(0.0, 2.0);
+        let mut floor = MtpFloor::with_retire_after(MTP_SINGLETON_FLOOR_MIN_WINDOWS)
+            .with_retire_evidence(2);
+        floor.observe_calibration(30_000.0, &bad);
+        for _ in 0..MTP_FLOOR_PROBE_WINDOWS {
+            floor.observe_window(NativeWindow::Batched, capped(3, 3, 0), 60_000.0, 7, &bad);
+        }
+        for _ in MTP_FLOOR_PROBE_WINDOWS..MTP_SINGLETON_FLOOR_MIN_WINDOWS {
+            floor.observe_window(NativeWindow::Batched, capped(5, 5, 0), 200_000.0, 7, &bad);
+        }
+        assert!(floor.caps[3].windows > 0.0, "decayed cap-3 samples remain");
+        assert!(floor.needs_ar_sample());
+        for _ in 0..2 {
+            floor.observe_calibration(30_000.0, &bad);
+        }
+        assert_eq!(floor.shallow_state, ShallowState::Probing);
+        assert_eq!(floor.shallow_since_deep, 0);
+        assert!(!floor.retired);
+    }
+
+    /// Positive evidence gates the climb: a held shallow request stays at
+    /// cap 3 until a deeper candidate has priced below the shallow one and
+    /// AR for the probe budget of consecutive windows; a deep window then
+    /// ends the hold.
+    #[test]
+    fn floor_shallow_hold_resumes_the_climb_only_on_positive_evidence() {
+        let bad = agreement(0.0, 2.0);
+        let good = agreement(2.0, 2.0);
+        let mut floor = deep_only_losing_floor(&bad);
+        for _ in 0..MTP_FLOOR_PROBE_WINDOWS {
+            floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), 60_000.0, 7, &bad);
+        }
+        assert_eq!(floor.shallow_state, ShallowState::Holding);
+        assert_eq!(floor.climb_streak, 0);
+        // The deep exploration's window-cost fit would only slow the
+        // shallow row price's convergence; drop it to isolate the evidence
+        // rule (every later window is a depth-3 one, row = the prior).
+        floor.fit = [0.0; 5];
+        let mut climbed = None;
+        for window in 1..=40 {
+            floor.observe_window(NativeWindow::Batched, capped(3, 3, 3), 60_000.0, 7, &good);
+            assert_eq!(floor.shallow_state, ShallowState::Holding, "window {window}");
+            assert!(!floor.retired);
+            let route = floor.route(&good, 7, 3);
+            if floor.climb_streak < MTP_FLOOR_PROBE_WINDOWS {
+                assert!(
+                    matches!(route, FloorRoute::Batched(cap) if cap <= MTP_FLOOR_SHALLOW_CAP),
+                    "window {window}: {route:?}"
+                );
+            } else {
+                assert!(
+                    matches!(route, FloorRoute::Batched(cap) if cap > MTP_FLOOR_SHALLOW_CAP),
+                    "window {window}: {route:?}"
+                );
+                climbed = Some(window);
+                break;
+            }
+        }
+        assert!(
+            climbed.is_some_and(|window| window >= MTP_FLOOR_PROBE_WINDOWS),
+            "{climbed:?}"
+        );
+        floor.observe_window(NativeWindow::Batched, capped(4, 4, 4), 70_000.0, 7, &good);
+        assert_eq!(floor.shallow_state, ShallowState::Idle);
+        assert!(floor.deep_seen);
+        assert_eq!(floor.shallow_since_deep, 0);
+        assert_eq!(floor.climb_streak, 0);
     }
 
     /// The singleton path turns retire evidence on (default

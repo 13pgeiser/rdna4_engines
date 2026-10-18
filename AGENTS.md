@@ -829,8 +829,9 @@ Caveats that are part of the fixture, not trivia:
   Flash-Next batch lanes refuse non-neutral repeat/presence/frequency penalties
   (`crates/hipfire-generate/src/batch.rs:2767–2789`).** Each MTP
   window picks its verification route: a batched `(K+1)`-row verify at the
-  draft depth `K` (up to the `mtp_k` cap; `auto` = 7 for native Qwen4 MTP on
-  gfx1151, else 3) that maximizes expected emitted tokens per window cost
+  draft depth `K` (up to the `mtp_k` cap; `auto` for native Qwen4 MTP =
+  `min(GPU row-exact verify rows, CPU-owned-expert window) − 1` resolved after
+  placement: 7 today, 3 on a CPU-placed load; else 3) that maximizes expected emitted tokens per window cost
   (per-depth draft agreement, decayed), or the interleaved route (one target
   row per draft, stop at the first rejection) when no depth pays.
   A same-request AR floor guards the default route: the request's first
@@ -868,8 +869,28 @@ Caveats that are part of the fixture, not trivia:
   alive on a losing native route only while external (n-gram) windows are
   measured and unblocked (cost per token below AR) and the decayed realized
   per-token cost of all its windows, native and external, is strictly below
-  AR; it retires at the first window where that stops holding. A retired
-  request runs with no head append, copy, snapshot or replay, forced
+  AR; it retires at the first window where that stops holding.
+  Before that sticky retirement of a request (singleton or continuous-batching
+  lane floor) whose draft budget is above 3 and that has run a deep (cap > 3)
+  window (it runs after the AR re-price probes where they exist; a budget of 3
+  or less never re-probes), the floor requires fresh shallow (K ≤ 3: batched
+  cap ≤ 3 or interleaved) native evidence: 3 priced shallow windows since that
+  last deep window. Without them it routes the request at cap ≤ 3 for a
+  bounded re-probe from the existing probe budget, which ends at 3 priced
+  windows or 6 in all (a first-use unpriced window and external windows spend
+  the bound; no new environment switch). AR is re-priced first where it can
+  be; a lane with a 0 AR probe budget still gets the bounded shallow control,
+  starting at its first would-be retirement. A shallow cost
+  below AR holds the request on its best measured shallow depth, route capped
+  at 3 until a deeper candidate prices below both the shallow depth and AR for
+  3 consecutive windows (positive evidence); a shallow cost at or above AR, or
+  no priced shallow window at all (fail closed), retires it.
+  `HIPFIRE_MTP_FLOOR_TRACE` lines carry `budget_k`, `deep_seen`,
+  `shallow_state` (`idle|probing|holding|lost|unpriced`), `shallow_windows`,
+  `shallow_priced`, `shallow_budget`, `shallow_since_deep`,
+  `shallow_us_per_tok` and `climb_streak`. The `auto` cap rule above is
+  unchanged, as are explicit `mtp_k` overrides and the D1/D2 hard gates.
+  A retired request runs with no head append, copy, snapshot or replay, forced
   advances fall back to the target alone, and only `configure_request`
   (a new request) resets it, not `mtp_reset` or a prefill realign. At most one
   calibration head append and three probe windows precede the first measured

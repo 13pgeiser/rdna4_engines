@@ -6561,6 +6561,30 @@ impl Qwen4GpuForward {
             route_rows,
         )
     }
+    /// Verify rows the armed CPU numerical modes run row-exact, read from each
+    /// mode's own ownership and exported window, **independent of**
+    /// [`Self::has_cpu_deferred_experts`]: the D1 whole-layer splice
+    /// (`cpu_deferred_experts`, [`cpu_splice::NARROW_VERIFY_MAX_ROWS`]) and any
+    /// armed D2 tier split (`cpu_split_layers > 0`,
+    /// [`hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS`]), including the
+    /// measured per-load D2 default that [`host_arith_every_call`] excludes
+    /// from the load-wide predicate: that default withholds its CPU executor
+    /// from a window wider than the narrow cap ([`d2_executor_admitted`]), so a
+    /// wider verify would run GPU arithmetic against CPU-arithmetic decode
+    /// rows, and the `auto` cap must not draft past the window. `None` when
+    /// neither owns a layer; the narrowest window when both do. The native MTP
+    /// `auto` draft cap reads this.
+    pub(crate) fn native_mtp_cpu_window_rows(&self) -> Option<usize> {
+        let d1 = self
+            .cpu_deferred_experts
+            .then_some(cpu_splice::NARROW_VERIFY_MAX_ROWS);
+        let d2 = (self.cpu_split_layers > 0)
+            .then_some(hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS);
+        match (d1, d2) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
     /// Trunk layers armed for the D2 split (any owner kind), in layer order.
     pub(crate) fn split_layers(&self) -> Vec<usize> {
         self.moe

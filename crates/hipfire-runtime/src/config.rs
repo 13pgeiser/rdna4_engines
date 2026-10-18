@@ -156,7 +156,8 @@ pub struct RuntimeConfig {
     pub mtp_mode: String,
     /// Explicit numeric `HIPFIRE_MTP_K` / `speculation.mtp_k`. `None` = unset
     /// or `auto`: the consumer applies its default (`hipfire_config::
-    /// mtp_k_default_for_arch` for native Qwen4 MTP, else `MTP_K_DEFAULT`).
+    /// mtp_k_default` over the GPU's row-exact verify rows for native Qwen4
+    /// MTP, else `MTP_K_DEFAULT`).
     pub mtp_k: Option<usize>,
     /// `attention.yarn_factor` / `HIPFIRE_YARN_FACTOR`: YaRN RoPE factor
     /// override applied by [`crate::rope::rope_scaling`]. `None` = the

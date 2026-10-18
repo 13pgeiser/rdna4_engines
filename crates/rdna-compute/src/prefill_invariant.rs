@@ -122,18 +122,21 @@ pub fn qwen4_append_wmma_route(
 
 /// The historic few-row limit: routes gated on `route_rows <= 8` are the
 /// per-row twins of the decode GEMV (each output row runs the decode kernel's
-/// lane->K map, FMA chain and reduction tree).
-pub const FEW_ROW_ROUTE_ROWS: usize = 8;
+/// lane->K map, FMA chain and reduction tree). Shared with `hipfire-config`,
+/// whose `auto` MTP cap derives from the same row-exact rows.
+pub const FEW_ROW_ROUTE_ROWS: usize = hipfire_config::QWEN4_FEW_ROW_ROUTE_ROWS;
 /// Largest verify block the few-row routes are built for. Every few-row
 /// launcher capped at 8 rows serves up to this many by looping its existing
 /// <=8-row launch over row groups.
 pub const WIDE_VERIFY_MAX_ROWS: usize = 32;
-/// gfx1151 row-exact verify rows; raised only after the row-exactness oracle
-/// proves the arch at that many rows.
-pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151: usize = 8;
-/// gfx1201 row-exact verify rows; raised only after the row-exactness oracle
-/// proves the arch at that many rows.
-pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201: usize = 8;
+/// gfx1151 row-exact verify rows (owned by `hipfire-config`); raised only
+/// after the row-exactness oracle proves the arch at that many rows.
+pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151: usize =
+    hipfire_config::QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151;
+/// gfx1201 row-exact verify rows (owned by `hipfire-config`); raised only
+/// after the row-exactness oracle proves the arch at that many rows.
+pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201: usize =
+    hipfire_config::QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201;
 
 /// Parse `HIPFIRE_QWEN4_WIDE_VERIFY_ROWS`: an unsigned integer clamped to
 /// [`FEW_ROW_ROUTE_ROWS`]..=[`WIDE_VERIFY_MAX_ROWS`]; unset or unparsable is
@@ -182,15 +185,13 @@ fn resolve_verify_rows(runtime: usize, env: Option<usize>, table: usize) -> usiz
 /// `FEW_ROW_ROUTE_ROWS..=WIDE_VERIFY_MAX_ROWS`), then the table; both
 /// overrides apply on exact gfx1151/gfx1201 only (oracle runs).
 pub fn qwen4_row_exact_verify_rows(arch: &str) -> usize {
-    let table = match arch {
-        "gfx1151" => QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151,
-        "gfx1201" => QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201,
-        _ => return FEW_ROW_ROUTE_ROWS,
-    };
+    if !matches!(arch, "gfx1151" | "gfx1201") {
+        return FEW_ROW_ROUTE_ROWS;
+    }
     resolve_verify_rows(
         QWEN4_WIDE_VERIFY_ROWS_RUNTIME.load(Ordering::Relaxed),
         *QWEN4_WIDE_VERIFY_ROWS_OVERRIDE,
-        table,
+        hipfire_config::qwen4_row_exact_verify_rows_table(arch),
     )
 }
 
@@ -317,6 +318,36 @@ mod tests {
         for arch in ["gfx1151", "gfx1201", "gfx1100"] {
             assert_eq!(qwen4_row_exact_verify_rows(arch), 8, "{arch}");
         }
+    }
+
+    /// The native Qwen4 `auto` MTP cap is one below the runtime row-exact
+    /// rows, and the `hipfire-config` effective view of `speculation.mtp_k`
+    /// (which reads the shared table, not the developer override) agrees with
+    /// it under the default process policy.
+    #[test]
+    fn native_mtp_default_cap_is_row_exact_rows_minus_one_and_matches_config_view() {
+        use hipfire_config::effective::{effective, A8Prefill, ArchCtx};
+        use hipfire_config::{mtp_k_default, ConfigValue, MTP_K_DEFAULT};
+
+        let resolved = hipfire_config::resolve([]).unwrap();
+        for arch in ["gfx1151", "gfx1201", "gfx1100", "gfx1150", "gfx942"] {
+            let cap = mtp_k_default(16, qwen4_row_exact_verify_rows(arch));
+            assert_eq!(cap, qwen4_row_exact_verify_rows(arch) - 1, "{arch}");
+            assert_eq!(cap, 7, "{arch}");
+            let ctx = ArchCtx {
+                gpu_arch: Some(arch.into()),
+                gpu_count: 1,
+                model_arch_id: Some(16),
+                registry_tag: None,
+                a8_prefill: A8Prefill::NotLanded,
+            };
+            assert_eq!(
+                effective("speculation.mtp_k", &resolved, &ctx).value,
+                ConfigValue::Integer(cap as i64),
+                "{arch}"
+            );
+        }
+        assert_eq!(mtp_k_default(5, qwen4_row_exact_verify_rows("gfx1151")), MTP_K_DEFAULT);
     }
 }
 

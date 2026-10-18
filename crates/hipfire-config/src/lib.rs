@@ -4800,22 +4800,48 @@ fn mtp_ngram_enabled_for_arch_value(value: Option<&str>, model_arch: u32, gpu_ar
 fn ngram_mod_arch_admitted(model_arch: u32, gpu_arch: &str) -> bool {
     model_arch == 16 && matches!(gpu_arch, "gfx1151" | "gfx1201")
 }
-/// Fallback MTP draft cap (`speculation.mtp_k` = `auto`): every model/GPU pair
-/// except [`mtp_k_default_for_arch`]'s admitted one.
+/// Fallback MTP draft cap (`speculation.mtp_k` = `auto`): every model that
+/// does not report a row-exact verify capability (see [`mtp_k_default`]).
 pub const MTP_K_DEFAULT: usize = 3;
-/// `auto` MTP draft cap. Native Qwen4 MTP (`model_arch == 16`, Flash-Next) on
-/// gfx1151 drafts up to 7 (8 verify rows, the lane route's row limit): the
-/// adaptive depth chooser picks each window's depth from this request's
-/// measured window costs and agreement, and a 6.4 ms verify row there pays
-/// at code-class acceptance (forced K=5 +11% on code). Every other
-/// model/GPU keeps [`MTP_K_DEFAULT`] (gfx1201: a row costs ~0.5 AR steps,
-/// deeper forced K lost 10-16%, and its committed route plan was walked at
-/// K=3). An explicit `HIPFIRE_MTP_K` / `speculation.mtp_k` / `mtp_k` load
-/// param (including `3`) overrides this; callers apply it only when no
-/// explicit value is present.
-pub fn mtp_k_default_for_arch(model_arch: u32, gpu_arch: &str) -> usize {
-    if model_arch == 16 && gpu_arch == "gfx1151" {
-        7
+/// Verify rows a Qwen4 forward runs bitwise like the single-row decode on a
+/// GPU whose row-exactness oracle has not proven a wider block: the historic
+/// few-row route limit (`rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS`,
+/// which re-exports this value).
+pub const QWEN4_FEW_ROW_ROUTE_ROWS: usize = 8;
+/// gfx1151 row-exact verify rows; raised only after the row-exactness oracle
+/// proves the arch at that many rows (`rdna_compute::prefill_invariant`
+/// re-exports this value).
+pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151: usize = 8;
+/// gfx1201 row-exact verify rows; raised only after the row-exactness oracle
+/// proves the arch at that many rows (`rdna_compute::prefill_invariant`
+/// re-exports this value).
+pub const QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201: usize = 8;
+/// Per-arch proven row-exact Qwen4 verify rows without the developer/oracle
+/// overrides (other arches [`QWEN4_FEW_ROW_ROUTE_ROWS`]). The runtime value is
+/// `rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows`, which layers
+/// those overrides over this table; the config view of `speculation.mtp_k`
+/// reads the table because `rdna-compute` depends on this crate.
+pub fn qwen4_row_exact_verify_rows_table(gpu_arch: &str) -> usize {
+    match gpu_arch {
+        "gfx1151" => QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151,
+        "gfx1201" => QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201,
+        _ => QWEN4_FEW_ROW_ROUTE_ROWS,
+    }
+}
+/// `auto` MTP draft cap. Native Qwen4 MTP (`model_arch == 16`, Flash-Next)
+/// drafts up to one below the GPU's row-exact verify rows
+/// (`row_exact_verify_rows`, the rows a verify forward runs bitwise like the
+/// single-row decode): the adaptive depth chooser picks each window's depth
+/// from this request's measured window costs and agreement, so the cap is the
+/// proven capability, not a per-GPU tuning guess. Other models keep
+/// [`MTP_K_DEFAULT`]. An explicit `HIPFIRE_MTP_K` / `speculation.mtp_k` /
+/// `mtp_k` load param (including `3`) overrides this; callers apply it only
+/// when no explicit value is present. Callers pass
+/// `rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(gpu_arch)`;
+/// the config view passes [`qwen4_row_exact_verify_rows_table`].
+pub fn mtp_k_default(model_arch: u32, row_exact_verify_rows: usize) -> usize {
+    if model_arch == 16 {
+        row_exact_verify_rows.saturating_sub(1).max(1)
     } else {
         MTP_K_DEFAULT
     }
@@ -7157,11 +7183,20 @@ mod tests {
 
     #[test]
     fn mtp_k_default_per_arch_and_auto_rule() {
-        assert_eq!(mtp_k_default_for_arch(16, "gfx1151"), 7);
-        assert_eq!(mtp_k_default_for_arch(16, "gfx1201"), MTP_K_DEFAULT);
-        assert_eq!(mtp_k_default_for_arch(16, "gfx1100"), MTP_K_DEFAULT);
-        assert_eq!(mtp_k_default_for_arch(5, "gfx1151"), MTP_K_DEFAULT);
+        assert_eq!(mtp_k_default(16, 8), 7);
+        assert_eq!(mtp_k_default(16, 16), 15);
+        assert_eq!(mtp_k_default(16, 4), 3);
+        assert_eq!(mtp_k_default(16, 1), 1);
+        assert_eq!(mtp_k_default(16, 0), 1);
+        assert_eq!(mtp_k_default(5, 8), MTP_K_DEFAULT);
         assert_eq!(MTP_K_DEFAULT, 3);
+        for gpu in ["gfx1151", "gfx1201", "gfx1100", "gfx1150", ""] {
+            assert_eq!(
+                mtp_k_default(16, qwen4_row_exact_verify_rows_table(gpu)),
+                7,
+                "{gpu}"
+            );
+        }
 
         let field = field("speculation.mtp_k").expect("speculation.mtp_k field");
         assert!(field.validate(&ConfigValue::String("auto".into())).is_ok());

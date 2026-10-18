@@ -859,17 +859,27 @@ impl Carrier for Qwen4Carrier {
         }
         let (native_mtp, max_k, max_seq) = (loaded.native_mtp, loaded.max_k, loaded.max_seq);
         let cpu_splice = loaded.bundle.has_cpu_deferred_experts();
+        // Rows a verify forward of the placed load runs row-exact; the n-gram
+        // copy lane's take cap reads it. Experts hosted on the CPU on every call
+        // (D1 splice or explicit D2 tier split) verify at most the 4-row CPU window,
+        // otherwise the per-GPU row-exact rows apply.
+        let verify_rows = qwen4_placed_verify_rows(cpu_splice, &ctx.gpu.arch);
+        // An explicit K keeps its value (the CPU-window hard cap narrows it
+        // below); the `auto` cap is resolved here from the placed load's own
+        // CPU ownership: one below the smaller of the GPU's row-exact rows and
+        // the armed CPU mode's window.
+        let max_k = if qwen4_explicit_mtp_k(ctx.spec).is_some() {
+            max_k
+        } else {
+            qwen4_auto_mtp_k(
+                &ctx.gpu.arch,
+                loaded.bundle.native_mtp_cpu_window_rows(),
+            )
+        };
         let max_k = if cpu_splice {
-            max_k.min(hipfire_arch_qwen4::program::QWEN4_CPU_SPLICE_MAX_ROWS - 1)
+            max_k.min(verify_rows - 1)
         } else {
             max_k
-        };
-        // Host-placed experts on the CPU splice verify at most the 4-row CPU
-        // window; otherwise the per-GPU proven row-exact verify rows apply.
-        let verify_rows = if cpu_splice {
-            hipfire_arch_qwen4::program::QWEN4_CPU_SPLICE_MAX_ROWS
-        } else {
-            rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(&ctx.gpu.arch)
         };
         let speculator = native_mtp.then(|| {
             qwen4_native_mtp_speculator(
@@ -1020,16 +1030,47 @@ pub(crate) fn qwen4_ep_option_refusal(
     }
 }
 
-/// The native MTP draft window of a Qwen4 load: `speculation.mtp_k`, else the
-/// process config, else the architecture default, clamped to `1..=10`. The one
-/// resolution of the Single and the pipeline-parallel load.
+/// Rows one verify forward of a placed Qwen4 load runs row-exact against the
+/// single-row decode: the CPU routed-expert window
+/// (`hipfire_arch_qwen4::program::QWEN4_CPU_SPLICE_MAX_ROWS`) when
+/// host-placed experts run on the CPU, else the GPU's
+/// `qwen4_row_exact_verify_rows`. The native MTP draft cap is one below it.
+fn qwen4_placed_verify_rows(cpu_splice: bool, gpu_arch: &str) -> usize {
+    let gpu_rows = rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(gpu_arch);
+    if cpu_splice {
+        gpu_rows.min(hipfire_arch_qwen4::program::QWEN4_CPU_SPLICE_MAX_ROWS)
+    } else {
+        gpu_rows
+    }
+}
+
+/// The explicit native MTP draft window of a Qwen4 load: the load param
+/// `speculation.mtp_k`, else the process config (`HIPFIRE_MTP_K` /
+/// `speculation.mtp_k`); `None` = `auto`.
+fn qwen4_explicit_mtp_k(spec: SpecLoadCfg) -> Option<usize> {
+    spec.mtp_k.or(hipfire_runtime::config::get().mtp_k)
+}
+
+/// The `auto` native MTP draft cap: one below the smaller of the GPU's
+/// row-exact verify rows and `cpu_window_rows`, the window of the armed CPU
+/// routed-expert mode (`Qwen4Bundle::native_mtp_cpu_window_rows`, `None` while
+/// no layer is CPU-owned), clamped to `1..=10`. Before placement is known
+/// pass `None`.
+fn qwen4_auto_mtp_k(gpu_arch: &str, cpu_window_rows: Option<usize>) -> usize {
+    let gpu_rows = rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(gpu_arch);
+    let rows = cpu_window_rows.map_or(gpu_rows, |window| gpu_rows.min(window));
+    hipfire_config::mtp_k_default(hipfire_arch_qwen4::ARCH_ID, rows).clamp(1, 10)
+}
+
+/// The native MTP draft window of a Qwen4 load before placement: an explicit
+/// K, else the GPU's `auto` cap, clamped to `1..=10`. The one resolution of
+/// the Single and the pipeline-parallel load; the Single load re-resolves an
+/// `auto` cap after placement (`qwen4_auto_mtp_k`) and narrows a CPU-placed
+/// load to the CPU window.
 fn qwen4_native_mtp_k(spec: SpecLoadCfg, gpu_arch: &str) -> usize {
-    spec.mtp_k
-        .or(hipfire_runtime::config::get().mtp_k)
-        .unwrap_or_else(|| {
-            hipfire_config::mtp_k_default_for_arch(hipfire_arch_qwen4::ARCH_ID, gpu_arch)
-        })
-        .clamp(1, 10)
+    qwen4_explicit_mtp_k(spec)
+        .map(|k| k.clamp(1, 10))
+        .unwrap_or_else(|| qwen4_auto_mtp_k(gpu_arch, None))
 }
 
 /// The generic speculator around the native Qwen4 MTP head, with the load log

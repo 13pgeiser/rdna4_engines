@@ -3132,7 +3132,10 @@ fn resolve_qwen4_route_plan(
     ) {
         return Err("retained Redline route".into());
     }
-    let default_k = hipfire_config::mtp_k_default_for_arch(hipfire_arch_qwen4::ARCH_ID, &gpu.arch);
+    let default_k = hipfire_config::mtp_k_default(
+        hipfire_arch_qwen4::ARCH_ID,
+        rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows(&gpu.arch),
+    );
     if let Some(k) = req
         .spec
         .mtp_k

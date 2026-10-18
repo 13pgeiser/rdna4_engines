@@ -1022,6 +1022,18 @@ impl Qwen4Bundle {
             .is_some_and(Qwen4GpuForward::has_cpu_deferred_experts)
     }
 
+    /// Verify rows the armed CPU routed-expert modes (D1 splice, any D2 tier
+    /// split including the measured per-call default) run row-exact, from
+    /// their own ownership (not [`Self::has_cpu_deferred_experts`], which
+    /// excludes the per-call default); `None` when no layer is CPU-owned. The
+    /// native MTP `auto` cap is one below the smaller of this and the GPU's
+    /// row-exact rows.
+    pub fn native_mtp_cpu_window_rows(&self) -> Option<usize> {
+        self.execution
+            .as_ref()
+            .and_then(Qwen4GpuForward::native_mtp_cpu_window_rows)
+    }
+
     /// Trunk layers armed for the opt-in CPU-cold/GPU-hot routed slot join.
     pub fn split_layers(&self) -> Vec<usize> {
         self.execution.as_ref().map(Qwen4GpuForward::split_layers).unwrap_or_default()
