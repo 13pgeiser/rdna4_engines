@@ -3909,6 +3909,8 @@ fn redline_shadow_qwen4(
     position_step: usize,
     replay_only: bool,
 ) -> Result<serde_json::Value, String> {
+    // The replayed decode steps fetch PLE rows: hold the whole-request guard.
+    let _ple_serving = loaded.ple_serving_guard();
     let launches = gpu.replay.recorded_launches().len();
     if launches == 0 {
         return Err("Qwen4 Redline shadow requires a captured decode tape".to_string());

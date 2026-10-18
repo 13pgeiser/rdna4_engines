@@ -3102,6 +3102,14 @@ fn main() {
                     continue;
                 }
 
+                // Whole-request PLE serving guard (Qwen4 with PLE rows; `None`
+                // otherwise): held from admission to the end of this arm, so
+                // background PLE prewarm readers pause for setup, prefill and
+                // decode of the ordinary, speculative, bench and serve routes
+                // and for the whole continuous-batch drive below (lane
+                // requests that join it from the inbox included). RAII: every
+                // `continue`, error, cancel and panic unwind drops it.
+                let _ple_serving = m.ple_serving_guard();
                 // Fresh terminal-control transaction for ordinary generates.
                 // A think-barrier message instead restores the exact singleton
                 // snapshot captured before the driver's outer guard dropped.
@@ -4877,6 +4885,37 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    /// Source-level: the generate arm takes the whole-request PLE guard
+    /// before any setup or route (batch enqueue, drive, singleton generate)
+    /// and the bench verbs take it right after resolving the model.
+    #[test]
+    fn request_routes_hold_the_ple_serving_guard() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("test module")];
+        let arm = prod.find("\"generate\" => {").expect("generate arm");
+        let arm_end = arm + prod[arm..].find("\"decide\" => {").expect("decide arm");
+        let arm = &prod[arm..arm_end];
+        let guard = arm.find("let _ple_serving = m.ple_serving_guard();").expect("guard");
+        for later in [
+            "activate_terminal_control(id, gen_attempt_id)",
+            "batch_request_eligible_for_route(",
+            "drive_staged_continuous_batch(",
+            "drive_lfm_continuous_batch(",
+            "hipfire_generate::batch::drive_promoted(",
+            "                    generate(\n",
+        ] {
+            let at = arm.find(later).unwrap_or_else(|| panic!("{later} missing"));
+            assert!(guard < at, "guard must precede {later}");
+        }
+        let bench = include_str!("bench.rs");
+        assert_eq!(bench.matches("let _ple_serving = m.ple_serving_guard();").count(), 2);
+        for handler in ["fn handle_bench_prefill(", "fn handle_bench_decode("] {
+            let body = &bench[bench.find(handler).expect(handler)..];
+            let guard = body.find("let _ple_serving = m.ple_serving_guard();").expect("bench guard");
+            assert!(guard < body.find("m.bench_topology(").expect("topology"));
+        }
+    }
+
     #[test]
     fn load_pp_resolves_config_fallback_before_weight_host_refusal() {
         let mut msg = serde_json::json!({"type": "load", "params": {"tp": 1}});

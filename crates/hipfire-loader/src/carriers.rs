@@ -3060,8 +3060,10 @@ fn load_qwen4_rank_scoped(
     // The model is loaded and admitted: a rank-order PLE table's worker
     // (it serves from the start; the worker only reads ahead) ends its
     // in-load fill and prewarms on from there, or the PLE hot-row store's
-    // worker prewarms the hottest rows into the page cache, while no
-    // request is served (every PLE fetch pauses it).
+    // worker prewarms the hottest rows into the page cache, only while no
+    // request is in flight (each request holds a `ServingGuard` from
+    // admission to its terminal event, so the prewarm pauses for the whole
+    // request, not per PLE fetch, and resumes once it has been idle).
     if let Some(worker) = ple_table_worker {
         let store = worker.store().clone();
         let (budget, available, explicit_zero) = ple_prewarm;

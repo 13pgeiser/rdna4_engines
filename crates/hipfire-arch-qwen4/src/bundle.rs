@@ -931,6 +931,14 @@ impl Qwen4Bundle {
         self.ple.as_mut().map(|ple| &mut ple.rows)
     }
 
+    /// Whole-request serving guard on the PLE row store's
+    /// [`hipfire_runtime::external_rows::FetchActivity`]: the prewarm
+    /// readers of the same table pause while it is held and resume once the
+    /// store has been idle.  `None` for a profile without PLE.
+    pub fn ple_serving_guard(&self) -> Option<hipfire_runtime::external_rows::ServingGuard> {
+        self.ple.as_ref().map(|ple| ple.rows.activity().serving())
+    }
+
     pub fn attached_origin(&self) -> Option<hipfire_runtime::weight_store::WeightOrigin> {
         self.weight_store.origin()
     }

@@ -2388,6 +2388,11 @@ pub fn generate(
     // no longer replay the identical draw sequence at temp>0.
     request_seed: u32,
 ) {
+    // Whole-request PLE serving guard (Qwen4 with PLE rows; `None` otherwise):
+    // every route below (Qwen4 AR, native MTP, the spec-capacity fallthrough)
+    // prefills and decodes under it, and it drops on every return, error and
+    // unwind, so a caller outside the daemon is covered too.
+    let _ple_serving = m.ple_serving_guard();
     // ── Producer-route authority (Task 6) ──────────────────────────────
     // Resolve the selected generation route BEFORE sampler RNG reset and
     // every stateful branch. Non-empty tools are denied for unsafe routes
@@ -6869,6 +6874,21 @@ mod route_scope_tests {
 #[cfg(test)]
 mod qwen4_pp_route_tests {
     use super::*;
+
+    /// Source-level: the public `generate` holds the whole-request PLE guard
+    /// before route selection, so no Qwen4 route runs unprotected.
+    #[test]
+    fn generate_holds_the_ple_serving_guard_before_route_selection() {
+        let src = include_str!("ar.rs");
+        let generate = src.find("pub fn generate(").expect("generate");
+        let guard = src[generate..]
+            .find("let _ple_serving = m.ple_serving_guard();")
+            .expect("guard");
+        let route = src[generate..]
+            .find("let selected_route = select_generation_route")
+            .expect("route selection");
+        assert!(guard < route);
+    }
 
     fn inputs(arch_id: u32, pp: usize) -> GenerationRouteInputs {
         GenerationRouteInputs {

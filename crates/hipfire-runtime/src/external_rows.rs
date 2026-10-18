@@ -279,31 +279,56 @@ pub const READER_QUEUE_CAPACITY: usize = 64;
 /// background readers only run while no request is being served.
 pub const FETCH_QUIET: Duration = Duration::from_secs(5);
 
-/// Whether a [`RowStore`] is serving fetches.  Every fetch (a prefill chunk or
-/// a decode step) holds a [`FetchGuard`]; background readers of the same table
-/// (the hot-row prewarm, the PLE rows prewarm) wait until the store has been
-/// idle for their quiet period.
+/// Whether a [`RowStore`] is serving requests.  Two kinds of guard hold it
+/// busy, sharing one in-flight count: a [`ServingGuard`] spans a whole request
+/// (every chunk's fetch AND the compute between them, which can outlast
+/// [`FETCH_QUIET`]), and a [`FetchGuard`] covers one fetch (a prefill chunk or
+/// a decode step).  Background readers of the same table (the hot-row
+/// prewarm, the PLE rows prewarm) wait until no guard is held and the last one
+/// dropped at least their quiet period ago.
 pub struct FetchActivity {
     /// Time base of `last_ms`.
     created: Instant,
     /// Milliseconds after `created` (plus one; 0 = never) at which the last
-    /// fetch finished.
+    /// guard (fetch or serving) dropped.
     last_ms: AtomicU64,
-    /// Fetches in flight.
+    /// Guards held: fetches in flight plus requests being served.
     active: AtomicUsize,
 }
 
 /// A fetch in flight (from [`FetchActivity::busy`]); the store counts as busy
 /// until [`FETCH_QUIET`] (or the waiter's own quiet period) after the last
-/// guard drops.
+/// guard drops.  It only covers the fetch itself; hold a [`ServingGuard`] for
+/// the whole request.
 pub struct FetchGuard<'a>(&'a FetchActivity);
 
 impl Drop for FetchGuard<'_> {
     fn drop(&mut self) {
-        let activity = self.0;
-        let at = activity.created.elapsed().as_millis() as u64 + 1;
-        activity.last_ms.fetch_max(at, Ordering::AcqRel);
-        activity.active.fetch_sub(1, Ordering::AcqRel);
+        self.0.finish();
+    }
+}
+
+/// A whole request being served (from [`FetchActivity::serving`]): held from
+/// the request's start to its end, including the compute between fetches.  It
+/// releases on drop, so an error or a cancellation unwinding the request
+/// releases it too.  Owns an `Arc` of the activity, so it is not tied to a
+/// borrow of the store and nests with [`FetchGuard`]s.  The store counts as
+/// busy until [`FETCH_QUIET`] (or the waiter's own quiet period) after the
+/// last guard drops.
+#[derive(Debug)]
+pub struct ServingGuard(Arc<FetchActivity>);
+
+impl Drop for ServingGuard {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
+impl fmt::Debug for FetchActivity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FetchActivity")
+            .field("in_flight", &self.in_flight())
+            .finish()
     }
 }
 
@@ -322,13 +347,27 @@ impl FetchActivity {
         FetchGuard(self)
     }
 
-    /// Fetches in flight.
+    /// A request starts being served; the returned guard marks it finished
+    /// when dropped.  Clones only the `Arc` (no allocation).
+    pub fn serving(self: &Arc<Self>) -> ServingGuard {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        ServingGuard(Arc::clone(self))
+    }
+
+    /// A guard dropped: stamp the quiet-period start, then release its count.
+    fn finish(&self) {
+        let at = self.created.elapsed().as_millis() as u64 + 1;
+        self.last_ms.fetch_max(at, Ordering::AcqRel);
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Guards held: fetches in flight plus requests being served.
     pub fn in_flight(&self) -> usize {
         self.active.load(Ordering::Acquire)
     }
 
-    /// How long the store has been quiet: `None` while a fetch is in flight,
-    /// `Some(MAX)` when it never served one.
+    /// How long the store has been quiet: `None` while a fetch or request is
+    /// in flight, `Some(MAX)` when it never served one.
     fn quiet_for(&self) -> Option<Duration> {
         if self.in_flight() > 0 {
             return None;
@@ -342,8 +381,8 @@ impl FetchActivity {
         ))
     }
 
-    /// No fetch is in flight and the last one finished at least `quiet` ago
-    /// (or none ever ran).
+    /// No fetch or request is in flight and the last one finished at least
+    /// `quiet` ago (or none ever ran).
     pub fn idle_for(&self, quiet: Duration) -> bool {
         self.quiet_for().is_some_and(|since| since >= quiet)
     }
@@ -2057,8 +2096,10 @@ impl RowStoreInner {
         pending: &mut PendingPages,
     ) -> Result<(), RowStoreError> {
         // Every PLE fetch (a prefill chunk or a decode step) marks the row
-        // store busy, so background readers of the table (the hot store's
-        // fill, the rows prewarm) only run while no request is being served.
+        // store busy for the fetch itself; the whole-request
+        // [`ServingGuard`] (held by the caller) also covers the compute
+        // between fetches.  Background readers of the table (the hot
+        // store's fill, the rows prewarm) only run while neither is held.
         let _busy = self.activity.busy();
         if pages.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(RowStoreError::InvalidLease {
@@ -3627,6 +3668,121 @@ mod tests {
     use super::*;
     use std::io;
     use std::sync::atomic::AtomicUsize;
+
+    /// Guard counting: a serving guard and fetch guards share one in-flight
+    /// count, and the store is not idle until all of them dropped.
+    #[test]
+    fn serving_and_fetch_guards_share_the_in_flight_count() {
+        let activity = Arc::new(FetchActivity::new());
+        assert_eq!(activity.in_flight(), 0);
+        assert!(activity.idle_for(Duration::ZERO), "never served: idle");
+        let serving = activity.serving();
+        assert_eq!(activity.in_flight(), 1);
+        assert!(!activity.idle_for(Duration::ZERO));
+        let fetch = activity.busy();
+        assert_eq!(activity.in_flight(), 2);
+        // Overlapping: the fetch ending leaves the request being served.
+        drop(fetch);
+        assert_eq!(activity.in_flight(), 1);
+        assert!(!activity.idle_for(Duration::ZERO));
+        // And a fetch starting/ending after the serving guard dropped.
+        let fetch = activity.busy();
+        drop(serving);
+        assert_eq!(activity.in_flight(), 1);
+        assert!(!activity.idle_for(Duration::ZERO));
+        drop(fetch);
+        assert_eq!(activity.in_flight(), 0);
+        assert!(activity.idle_for(Duration::ZERO));
+        // The quiet period starts at the last guard's drop.
+        assert!(!activity.idle_for(Duration::from_secs(3600)));
+        // Two serving guards (two requests) also share the count.
+        let (a, b) = (activity.serving(), activity.serving());
+        assert_eq!(activity.in_flight(), 2);
+        drop(a);
+        assert_eq!(activity.in_flight(), 1);
+        drop(b);
+        assert_eq!(activity.in_flight(), 0);
+    }
+
+    /// The gap between two fetches of one request (compute) is covered by a
+    /// serving guard, but not by the per-fetch guards alone; the quiet period
+    /// then starts when the request ends.
+    #[test]
+    fn serving_guard_covers_the_gap_between_fetches() {
+        const QUIET: Duration = Duration::from_millis(20);
+        const GAP: Duration = Duration::from_millis(120);
+        let activity = Arc::new(FetchActivity::new());
+
+        // Fetch guards only: idle once the gap outlasts the quiet period.
+        drop(activity.busy());
+        std::thread::sleep(GAP);
+        assert!(activity.idle_for(QUIET), "per-fetch guard misses the gap");
+
+        // Whole request: busy across the same gap, between and after fetches.
+        let serving = activity.serving();
+        drop(activity.busy());
+        std::thread::sleep(GAP);
+        assert!(!activity.idle_for(QUIET), "serving guard covers the gap");
+        drop(activity.busy());
+        std::thread::sleep(GAP);
+        assert!(!activity.idle_for(QUIET));
+        drop(serving);
+        assert!(!activity.idle_for(QUIET), "quiet period restarts at the end");
+        std::thread::sleep(GAP);
+        assert!(activity.idle_for(QUIET));
+    }
+
+    /// An error return, a panic and a cancelled thread all release the
+    /// serving guard (and nested fetch guards) on unwind.
+    #[test]
+    fn serving_guard_releases_on_error_panic_and_cancel() {
+        fn request(activity: &Arc<FetchActivity>, fail: bool) -> Result<(), RowStoreError> {
+            let _serving = activity.serving();
+            let _fetch = activity.busy();
+            assert_eq!(activity.in_flight(), 2);
+            if fail {
+                return Err(RowStoreError::Canceled);
+            }
+            Ok(())
+        }
+        let activity = Arc::new(FetchActivity::new());
+        assert!(request(&activity, true).is_err());
+        assert_eq!(activity.in_flight(), 0, "error path released");
+        assert!(request(&activity, false).is_ok());
+        assert_eq!(activity.in_flight(), 0, "success path released");
+
+        let panicked = {
+            let activity = activity.clone();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _serving = activity.serving();
+                let _fetch = activity.busy();
+                panic!("request failed mid-flight");
+            }))
+        };
+        assert!(panicked.is_err());
+        assert_eq!(activity.in_flight(), 0, "unwind released");
+        assert!(!activity.idle_for(Duration::from_secs(3600)));
+
+        // A request cancelled between chunks: the thread stops at its flag and
+        // the guard drops with it.
+        let canceled = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker = {
+            let (activity, canceled) = (activity.clone(), canceled.clone());
+            std::thread::spawn(move || {
+                let _serving = activity.serving();
+                started_tx.send(()).unwrap();
+                while !canceled.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+        started_rx.recv().unwrap();
+        assert_eq!(activity.in_flight(), 1, "held across the request");
+        canceled.store(true, Ordering::Release);
+        worker.join().unwrap();
+        assert_eq!(activity.in_flight(), 0, "cancel released");
+    }
 
     struct MemoryRowSource {
         shards: Vec<Vec<u8>>,

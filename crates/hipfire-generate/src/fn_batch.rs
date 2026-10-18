@@ -46,6 +46,7 @@ use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
 use hipfire_loader::LoadedModel;
 use hipfire_runtime::emit_text::ThinkBudget;
+use hipfire_runtime::external_rows::ServingGuard;
 use hipfire_runtime::slot_batch::{BatchStepPlan, RequestEpoch, RequestRows, RequestStepKind, RowRange};
 use rdna_compute::Gpu;
 use std::collections::{HashSet, VecDeque};
@@ -83,6 +84,11 @@ struct LaneCtl {
     /// The lane's decode map-ahead ran (once per request, at its first
     /// planned decode step).
     mapped_ahead: bool,
+    /// Whole-request PLE serving guard: owned by the lane's control for its
+    /// full lifespan (admission or promotion until commit, cancel or error
+    /// drops the control), so the PLE prewarm readers stay paused for the
+    /// lane's prefill and decode, never just for a scheduler tick.
+    _serving: Option<ServingGuard>,
 }
 
 fn release(model: &mut LoadedModel, ctl: &mut LaneCtl) -> Result<(), String> {
@@ -163,6 +169,7 @@ fn adopt_promoted(
         epoch, slot, semantic: Some(producer), bytes, budget: ThinkBudget::new(max_think_tokens),
         forced: VecDeque::new(), started_in_think, max_tokens, start, decode_start: Some(decode_start),
         prefill_ms, cache: None, skip_first_forward: seed_emitted, mapped_ahead: false,
+        _serving: model.ple_serving_guard(),
     });
 }
 
@@ -522,6 +529,11 @@ pub fn drive_qwen4_lane_batch(
     inbox: &mut DaemonInbox,
     promoted: Option<Qwen4PromotedRequest>,
 ) -> Result<(), BatchDriveError> {
+    // Held for the whole drive (every return path, error teardown included):
+    // covers requests that are queued, being rendered or handed back to the
+    // singleton route, which own no lane control yet, plus the promoted
+    // adoption below.
+    let _serving = m.ple_serving_guard();
     let setup = m.qwen4().ok_or("lane model is not qwen4").and_then(|bundle| {
         let store = bundle.lanes().ok_or("qwen4 lanes not staged")?;
         let (max_lanes, row_budget) = (store.max_lanes(), store.row_budget().min(params.max_batch_tokens));
@@ -654,6 +666,7 @@ pub fn drive_qwen4_lane_batch(
                     bytes: Vec::new(), budget: ThinkBudget::new(req.max_think_tokens), forced: VecDeque::new(),
                     started_in_think: started, max_tokens, start: Instant::now(), decode_start: None, prefill_ms: 0.0, cache: None,
                     skip_first_forward: false, mapped_ahead: false,
+                    _serving: m.ple_serving_guard(),
                 });
                 let BatchLane::Running(lane) = &mut sched.lanes[ticket.lane] else { return Err("assigned lane is not running".into()); };
                 lane.prompt_len = prompt.len();
@@ -795,7 +808,70 @@ pub fn drive_qwen4_lane_batch(
 
 #[cfg(test)]
 mod tests {
-    use super::forwarded_tokens;
+    use super::{forwarded_tokens, LaneCtl};
+    use hipfire_runtime::emit_text::ThinkBudget;
+    use hipfire_runtime::external_rows::FetchActivity;
+    use hipfire_runtime::slot_batch::RequestEpoch;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn lane_ctl(serving: Option<hipfire_runtime::external_rows::ServingGuard>) -> LaneCtl {
+        LaneCtl {
+            epoch: RequestEpoch { request_tag: 1, owner_generation: 1 },
+            slot: 0, semantic: None, bytes: Vec::new(), budget: ThinkBudget::new(0),
+            forced: VecDeque::new(), started_in_think: false, max_tokens: 1, start: Instant::now(),
+            decode_start: None, prefill_ms: 0.0, cache: None, skip_first_forward: false,
+            mapped_ahead: false, _serving: serving,
+        }
+    }
+
+    #[test]
+    fn lane_control_owns_the_serving_guard_for_its_whole_lifespan() {
+        let activity = Arc::new(FetchActivity::new());
+        let mut controls: Vec<Option<LaneCtl>> = vec![None, None];
+        controls[0] = Some(lane_ctl(Some(activity.serving())));
+        controls[1] = Some(lane_ctl(Some(activity.serving())));
+        assert_eq!(activity.in_flight(), 2);
+        // Scheduler ticks (taking a lane's control mutably) never release it.
+        let _ = controls[0].as_mut();
+        assert_eq!(activity.in_flight(), 2);
+        // Commit / cancel / error all end a lane by dropping its control.
+        controls[0] = None;
+        assert_eq!(activity.in_flight(), 1);
+        assert!(!activity.idle_for(Duration::ZERO));
+        controls.clear();
+        assert_eq!(activity.in_flight(), 0);
+        assert!(activity.idle_for(Duration::ZERO));
+    }
+
+    #[test]
+    fn lane_control_releases_the_serving_guard_on_unwind() {
+        let activity = Arc::new(FetchActivity::new());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ctl = lane_ctl(Some(activity.serving()));
+            assert_eq!(activity.in_flight(), 1);
+            panic!("lane step failed");
+        }));
+        assert!(result.is_err());
+        assert_eq!(activity.in_flight(), 0);
+    }
+
+    /// Source-level: every lane control carries the guard, and the driver
+    /// takes its own before any setup, render, handoff or teardown path.
+    #[test]
+    fn every_lane_control_and_the_drive_take_a_serving_guard() {
+        let src = include_str!("fn_batch.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("test module")];
+        assert_eq!(prod.matches("LaneCtl {").count(), 3, "decl + admission + promotion");
+        assert_eq!(prod.matches("_serving: ").count(), 3, "decl + admission + promotion");
+        assert_eq!(prod.matches("_serving: m.ple_serving_guard()").count(), 1);
+        assert_eq!(prod.matches("_serving: model.ple_serving_guard()").count(), 1);
+        let drive = prod.find("pub fn drive_qwen4_lane_batch").expect("drive");
+        let guard = prod[drive..].find("let _serving = m.ple_serving_guard();").expect("drive guard");
+        let setup = prod[drive..].find("let setup =").expect("setup");
+        assert!(guard < setup, "the drive guard must precede setup and promoted adoption");
+    }
 
     #[test]
     fn forwarded_tokens_are_seed_then_all_committed_but_last() {

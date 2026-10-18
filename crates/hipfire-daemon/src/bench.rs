@@ -45,6 +45,9 @@ pub(crate) fn handle_bench_prefill(
             return;
         }
     };
+    // Whole-request PLE serving guard: the synthetic prefill pauses the PLE
+    // prewarm readers for its whole run (every return path drops it).
+    let _ple_serving = m.ple_serving_guard();
     // The loaded model is the authority on its topology: single card,
     // pipeline-parallel, dense tensor-parallel or expert-parallel, with
     // the degrees and device ordinals read from what is resident. Each
@@ -320,6 +323,9 @@ pub(crate) fn handle_bench_decode(
             return;
         }
     };
+    // Whole-request PLE serving guard: priming and the timed decode pause
+    // the PLE prewarm readers for the whole probe (every return path drops it).
+    let _ple_serving = m.ple_serving_guard();
     // The loaded model is the authority on its topology (degrees and card
     // ordinals read from what is resident); `serve`'s own refusals are the
     // only ones that survive.

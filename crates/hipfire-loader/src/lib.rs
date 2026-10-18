@@ -1271,6 +1271,15 @@ impl LoadedModel {
         })
     }
 
+    /// Whole-request PLE serving guard of a Qwen4 model: while it is held
+    /// the PLE row store counts as busy, so background PLE prewarm readers
+    /// stay paused. `None` for any other architecture, or a Qwen4 profile
+    /// without PLE. Hold it for the full lifespan of a request (admission to
+    /// terminal event) and drop it on every exit.
+    pub fn ple_serving_guard(&self) -> Option<hipfire_runtime::external_rows::ServingGuard> {
+        self.qwen4().and_then(|bundle| bundle.ple_serving_guard())
+    }
+
     /// The Qwen4 PP root bundle and its generic `Gpus` as disjoint borrows
     /// (`state` and `pp_gpus` are separate fields), for generation closures
     /// that need both at once. `None` unless this is a Qwen4 bundle whose

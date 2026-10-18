@@ -24,9 +24,10 @@
 //! ready, a prewarm reads the pack's data from its start (hottest tier
 //! first), then reads tier 0 a second time so its pages are promoted to the
 //! active list and outlive the colder ones when the cache is reclaimed.  It
-//! runs while no request is being served: every PLE fetch holds the row
-//! store's [`FetchActivity`] busy (bound by `RowStore::attach_hot_store`), and
-//! the prewarm resumes `FETCH_QUIET` after the last one.
+//! runs while no request is being served: every request holds the row store's
+//! [`FetchActivity`] busy for its whole duration (a `ServingGuard`, and each PLE
+//! fetch its own guard; bound by `RowStore::attach_hot_store`), and the prewarm
+//! resumes `FETCH_QUIET` after the last guard dropped.
 //!
 //! A rank-ordered table's worker can also start while the model is still
 //! loading ([`LoadFill`]): it reads the hottest prefix of the table at a
@@ -1192,8 +1193,9 @@ impl HotRowStore {
     }
 
     /// Use `activity` (the row store's [`FetchActivity`]) to pause the
-    /// prewarm: it waits while a PLE fetch (a prefill chunk or a decode step)
-    /// is in flight and for [`BUSY_QUIET`] after the last one, so it never
+    /// prewarm: it waits while a request is being served or a PLE fetch (a
+    /// prefill chunk or a decode step) is in flight, and for [`BUSY_QUIET`]
+    /// after the last guard dropped, so it never
     /// competes with a request for the SSD.  Binding the same activity again
     /// is a no-op; another one errs.  Until bound, nothing pauses the
     /// prewarm.
@@ -2225,6 +2227,42 @@ mod tests {
         assert!(store.prewarm_complete());
         assert_eq!(store.prewarmed_bytes(), budget, "phase 1 reads the budget");
         assert_eq!(store.retouched_bytes(), tier0, "phase 2 reads tier 0");
+    }
+
+    /// A whole-request serving guard pauses the prewarm across the compute
+    /// gaps between its fetches; a request that fails releases it on every
+    /// path, and the prewarm then completes after [`BUSY_QUIET`].
+    #[test]
+    fn prewarm_pauses_for_a_whole_request_then_completes() {
+        let shards = synthetic_shards(SHARDS, ROWS_PER_SHARD);
+        let fixture = PackFixture::new(&shards, ROWS_PER_SHARD, 200, 5, 8);
+        let store = &fixture.store;
+        let tier0 = store.tier_base[1] - store.data_offset;
+        let activity = std::sync::Arc::new(FetchActivity::new());
+        store.bind_activity(activity.clone()).unwrap();
+        let budget = store.data_bytes() / 2;
+        // A request that fails after its fetches; the guard unwinds with it.
+        // The budget is set while the request is being served.
+        let request = |activity: &std::sync::Arc<FetchActivity>| -> Result<(), String> {
+            let _serving = activity.serving();
+            store.set_prewarm_budget(budget);
+            drop(activity.busy());
+            // A compute gap with no fetch in flight.
+            std::thread::sleep(Duration::from_millis(250));
+            assert_eq!(store.prewarmed_bytes(), 0, "paused across the gap");
+            drop(activity.busy());
+            Err("request failed".to_string())
+        };
+        assert!(request(&activity).is_err());
+        assert_eq!(activity.in_flight(), 0, "guard released on the error path");
+        assert_eq!(store.prewarmed_bytes(), 0, "quiet period not over yet");
+        let deadline = Instant::now() + BUSY_QUIET + Duration::from_secs(10);
+        while !store.prewarm_complete() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(store.prewarm_complete());
+        assert_eq!(store.prewarmed_bytes(), budget);
+        assert_eq!(store.retouched_bytes(), tier0);
     }
 
     /// A budget inside tier 0 re-reads only that much of it; a budget of 0
