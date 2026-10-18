@@ -4072,11 +4072,27 @@ impl ReplayKernargBinding {
     }
 
     fn apply(self, kernarg_bytes: &mut [u8], position: usize) -> Result<(), String> {
+        self.apply_with_frame_reservation(
+            kernarg_bytes,
+            position,
+            crate::norm::reserve_gdn_requant_frames,
+        )
+    }
+
+    /// `apply` with the GDN frame source passed in: production uses the
+    /// process-global `norm::reserve_gdn_requant_frames`; unit tests pass a
+    /// local counter, because tests running in parallel share the global one.
+    fn apply_with_frame_reservation(
+        self,
+        kernarg_bytes: &mut [u8],
+        position: usize,
+        reserve_frames: impl FnOnce(u32) -> u32,
+    ) -> Result<(), String> {
         let position_u32 =
             u32::try_from(position).map_err(|_| "decode position exceeds u32".to_owned())?;
         match self {
             Self::GdnFrameU32 { offset, frames } => {
-                let frame = crate::norm::reserve_gdn_requant_frames(frames);
+                let frame = reserve_frames(frames);
                 write_kernarg_u32(kernarg_bytes, offset, frame, "GDN kernarg binding")
             }
             Self::PositionPlusU32 { offset, addend } => {
@@ -12017,21 +12033,24 @@ mod tests {
 
     #[test]
     fn gdn_frame_apply_advances_by_frames_and_writes_base() {
-        // Restore a known checkpoint so we can assert on delta rather than
-        // absolute non-zero value (fetch_add legitimately starts at 0 in a
-        // fresh process).
-        crate::norm::restore_gdn_requant_frame_checkpoint(1000);
-        let checkpoint = crate::norm::gdn_requant_frame_checkpoint();
+        // A local counter, not the process-global one: other tests in this
+        // process reserve global frames concurrently, so exact values read
+        // back from the global are not this test's.
+        let counter = std::sync::atomic::AtomicU32::new(1000);
+        let reserve = |n: u32| counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        let checkpoint = counter.load(std::sync::atomic::Ordering::Relaxed);
         let mut kernarg = vec![0u8; 80];
         let binding = ReplayKernargBinding::GdnFrameU32 {
             offset: 76,
             frames: 16,
         };
-        binding.apply(&mut kernarg, 0).unwrap();
+        binding
+            .apply_with_frame_reservation(&mut kernarg, 0, reserve)
+            .unwrap();
         let written = u32::from_le_bytes(kernarg[76..80].try_into().unwrap());
         // Written base must equal the pre-advance checkpoint
         assert_eq!(written, checkpoint);
-        let after = crate::norm::gdn_requant_frame_checkpoint();
+        let after = counter.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(after, checkpoint + 16);
         // Second apply with frames=1 should advance by 1 from new base
         let checkpoint2 = after;
@@ -12039,13 +12058,15 @@ mod tests {
             offset: 76,
             frames: 1,
         };
-        binding2.apply(&mut kernarg, 0).unwrap();
+        binding2
+            .apply_with_frame_reservation(&mut kernarg, 0, reserve)
+            .unwrap();
         let written2 = u32::from_le_bytes(kernarg[76..80].try_into().unwrap());
         assert_eq!(written2, checkpoint2);
-        assert_eq!(crate::norm::gdn_requant_frame_checkpoint(), checkpoint2 + 1);
-        // Clean up: restore to avoid leaking state to other tests (tests run
-        // in parallel in same process; use a deterministic restore).
-        crate::norm::restore_gdn_requant_frame_checkpoint(checkpoint);
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            checkpoint2 + 1
+        );
     }
 
     #[test]
