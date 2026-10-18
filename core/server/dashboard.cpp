@@ -1712,6 +1712,7 @@ let c1hist = [];
 const C1CAP = 7200;                       /* an hour at 2 polls/s of single-stream samples */
 let bestEver = 0;                         /* the best engine floor ever seen here, across restarts */
 try { bestEver = parseFloat(localStorage.getItem("radiance.c1best")) || 0; } catch (e) {}
+const bestAt = {};                        /* fastest step seen at each concurrency, this process */
 
 
 function update(s, dt) {
@@ -1752,6 +1753,16 @@ function update(s, dt) {
   if (floorMs > 0) {
     det = "best " + floorMs.toFixed(2) + "ms";
     if (engRecentMs > 0) det += " · recent " + engRecentMs.toFixed(2) + "ms";
+  }
+  /* THE STEP AS A PERCENTAGE OF THE FASTEST THIS PROCESS HAS DONE AT THIS CONCURRENCY. Keyed by
+ * concurrency on purpose: a c8 step read against the single-stream floor would report the batch
+ * arriving as a slowdown -- the mistake that took the old drift line out. Raw ratio, no
+ * threshold, no colour: the number is the statement. */
+  if (s.running > 0 && lastStepMs != null) {
+    const k = s.running;
+    if (!(k in bestAt) || lastStepMs < bestAt[k]) bestAt[k] = lastStepMs;
+    const ref = k === 1 && floorMs > 0 ? floorMs : bestAt[k];
+    if (ref > 0) det += " · now " + Math.round(100 * lastStepMs / ref) + "% of best" + (k === 1 ? "" : "@c" + k);
   }
   $("m-stepdet").textContent = det;
 
