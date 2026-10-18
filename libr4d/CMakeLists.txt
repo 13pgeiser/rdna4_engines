@@ -46,6 +46,9 @@ set(R4D_UNITS
   "r4d_attn_paged_h256_gqa2|"
   # Gemma 3 sliding window: head_dim 128, 2 queries per KV head, windowed decode and prefill.
   "r4d_attn_paged_h128_gqa2w|"
+  # One query head per KV head at 128 wide: plain MHA, the Unlimited-OCR decoder (10 over 10).
+  # Both legs, prefill and decode; see the file's header for why it is not a drafter-shaped unit.
+  "r4d_attn_paged_h128_gqa1|"
   # Eight queries per KV head, one body instantiated at head_dim 256 (the routed 35B-A3B) and 128
   # (MiniCPM5-2B).
   "r4d_attn_paged_gqa8|"

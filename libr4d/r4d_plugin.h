@@ -261,6 +261,13 @@ int     r4d_rad_attn_prefill_h128_gqa8_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h128_gqa8_fp8  (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h128_gqa8_bf16 (const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h128_gqa8_scratch(const RadArgs*);
+/* ONE query a KV head, head_dim 128 -- plain MHA, the Unlimited-OCR decoder (10 over 10). Both
+ * legs from the generic body instantiated at ratio 1 (r4d_attn_paged_h128_gqa1.hip). */
+int     r4d_rad_attn_prefill_h128_gqa1_fp8 (const RadArgs*, RadStream);
+int     r4d_rad_attn_prefill_h128_gqa1_bf16(const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_h128_gqa1_fp8  (const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_h128_gqa1_bf16 (const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h128_gqa1_scratch(const RadArgs*);
 /* Four queries per KV head, head_dim 256 only (Qwen3.5-0.8B); same body, another instantiation
  * (r4d_attn_paged_h256_gqa4.hip). */
 int     r4d_rad_attn_prefill_h256_gqa4_fp8 (const RadArgs*, RadStream);

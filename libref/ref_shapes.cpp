@@ -1653,8 +1653,55 @@ int ref_moe_scatter_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* o
     return o.finish("moe_scatter", operand, out);
 }
 
-/* `a_order` decides the activation's row count: one per token, or one per (token, slot) in
- * scatter order. */
+/* The two shape lists concatenated, with `expert_ids` named ONCE as an output -- it is what the
+ * selection writes and what the sort reads. The sort's three outputs are sized by THIS RANK'S
+ * SLICE (`n_local`, absent means the slice is the router), exactly as in libr4d's shape. */
+int ref_router_topk_scatter_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M  = gi(p, n_p, "M", 0);
+    const int64_t ne = gi(p, n_p, "n_expert", 0);
+    const int64_t k  = gi(p, n_p, "top_k", 0);
+    const int64_t nl = gi(p, n_p, "n_local", ne);
+    if (M <= 0 || ne <= 0 || k <= 0 || k > ne || nl <= 0 || nl > ne) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, ne });                               /* logits */
+    o.t((uint32_t)RAD_I32, { M, k });                /* expert_ids */
+    o.t(D, { M, k });                                /* expert_w */
+    o.t((uint32_t)RAD_I32, { M * k });               /* sorted_tok */
+    o.t((uint32_t)RAD_I32, { nl + 1 });              /* expert_offset */
+    o.t((uint32_t)RAD_I32, { nl });                  /* expert_count */
+    return o.finish("router_topk_scatter", operand, out);
+}
+
+/* The router GEMM's list, the pair's list, and -- with the gate present -- the gate's one-column
+ * list, with `logits` named once as the GEMM's output. `gate_b`/`gate` come together or not: the
+ * operand count carries it, as in libr4d's shape. */
+int ref_router_gemm_topk_scatter_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M  = gi(p, n_p, "M", 0);
+    const int64_t K  = gi(p, n_p, "K", 0);
+    const int64_t ne = gi(p, n_p, "n_expert", 0);
+    const int64_t k  = gi(p, n_p, "top_k", 0);
+    const int64_t nl = gi(p, n_p, "n_local", ne);
+    if (M <= 0 || K <= 0 || ne <= 0 || k <= 0 || k > ne || nl <= 0 || nl > ne)
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, K });                                /* a */
+    o.t(D, { ne, K });                               /* b: the router */
+    o.t(D, { 1, K });                                /* gate_b: the shared expert's gate */
+    o.t(D, { M, ne });                               /* logits */
+    o.t((uint32_t)RAD_I32, { M, k });                /* expert_ids */
+    o.t(D, { M, k });                                /* expert_w */
+    o.t((uint32_t)RAD_I32, { M * k });               /* sorted_tok */
+    o.t((uint32_t)RAD_I32, { nl + 1 });              /* expert_offset */
+    o.t((uint32_t)RAD_I32, { nl });                  /* expert_count */
+    o.t(D, { M, 1 });                                /* gate */
+    return o.finish("router_gemm_topk_scatter", operand, out);
+}
+
+/* `a_order` decides the activation's row count: one per token, or one per (token, slot) already
+ * in the scatter's order. A described case that got this wrong would build the operand at the
+ * extent the WRONG reading wants, and the fault it names would go unseen. */
 static inline bool sorted_a_order(const RadParam* p, int n_p) {
     const char* s = gs(p, n_p, "a_order");
     return s && std::strcmp(s, "sorted") == 0;

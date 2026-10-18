@@ -945,7 +945,8 @@ TEST(op_vocabulary) {
         /* The rest of the QSA indexer and DFlash2's convolution: not fusions, so a model that
          * issues them has no other host path. */
         "qsa_score", "qsa_select", "qsa_tail_store", "qsa_work", "dflash_conv",
-        "router_topk", "moe_scatter", "moe_gemm", "moe_gemm_q", "moe_gemm_q_mod4", "moe_gather",
+        "router_topk", "moe_scatter", "router_topk_scatter", "router_gemm_topk_scatter",
+        "moe_gemm", "moe_gemm_q", "moe_gemm_q_mod4", "moe_gather",
         "row_topk",
         "row_topk_merge", "pair_argmax", "logit_rerank",
         "gdn_conv_prep", "gdn_conv_update", "gdn_kkt_solve", "gdn_chunk_scan",
@@ -3930,6 +3931,50 @@ TEST(op_router_topk) {
     CHECK_OK(run("router_topk", b));
     CHECK_NEAR(w2.at(0), 0.73105858f, 1e-6);
     CHECK_NEAR(w2.at(1), 0.26894142f, 1e-6);
+}
+
+TEST(op_router_gemm_topk_scatter) {
+    /* THE GATE-ABSENT FORM: the plugin-owned shared arm issues the gate itself, so the fused op
+     * resolves with `gate_b` and `gate` as NULL SLOTS. Two tokens, three columns, four experts,
+     * top-two. */
+    const int64_t M = 2, K = 3, ne = 4, k = 2;
+    T x(RAD_F32, {M, K});   x.f({1, 0, 0,   0, 1, 0});
+    T w(RAD_F32, {ne, K});  w.f({1, 0, 0,   0, 2, 0,   0, 0, 3,   1, 1, 0});
+    T lg(RAD_F32, {M, ne});
+    T ids(RAD_I32, {M, k}), ew(RAD_F32, {M, k});
+    T sorted(RAD_I32, {M * k}), eoff(RAD_I32, {ne + 1}), ecnt(RAD_I32, {ne});
+    A a; a.t(x).t(w).tnull().t(lg).t(ids).t(ew).t(sorted).t(eoff).t(ecnt).tnull()
+          .i("M", M).i("K", K).i("n_expert", ne).i("n_local", ne).i("top_k", k).i("norm", 0)
+          .s("dtype", "f32").i("expert_base", 0);
+    CHECK_OK(run("router_gemm_topk_scatter", a));
+    /* Row 0: logits {1, 0, 0, 1} -- experts 0 and 3 tie at 1, the LOWER id is selected first,
+     * then 3; row 1: {0, 2, 0, 1} -- 1 at 2, then 3 at 1. */
+    CHECK_EQ(ids.iat(0), 0LL); CHECK_EQ(ids.iat(1), 3LL);
+    CHECK_EQ(ids.iat(2), 1LL); CHECK_EQ(ids.iat(3), 3LL);
+    CHECK_NEAR(lg.at(3), 1.0f, 1e-6);
+    CHECK_NEAR(lg.at(5), 2.0f, 1e-6);
+    /* The sort: expert 0 has slot 0, expert 1 slot 2, expert 3 slots 1 and 3 -- sorted by pair. */
+    CHECK_EQ(eoff.iat(0), 0LL); CHECK_EQ(eoff.iat(1), 1LL); CHECK_EQ(eoff.iat(2), 2LL);
+    CHECK_EQ(eoff.iat(3), 2LL); CHECK_EQ(eoff.iat(4), 4LL);
+    CHECK_EQ(sorted.iat(0), 0LL); CHECK_EQ(sorted.iat(1), 2LL);
+    CHECK_EQ(sorted.iat(2), 1LL); CHECK_EQ(sorted.iat(3), 3LL);
+    CHECK_NEAR(ew.at(0) + ew.at(1),
+               (std::exp(0.0f) + std::exp(0.0f)) /
+                   (2.0f * std::exp(0.0f) + 2.0f * std::exp(-1.0f)), 1e-5);
+
+    /* THE GATE PRESENT: `gate` = x @ gate_b^T at N = 1, beside the router, over the same x. */
+    T gb(RAD_F32, {1, K}); gb.f({2, 3, 0});
+    T gate(RAD_F32, {M, 1});
+    T lg2(RAD_F32, {M, ne});
+    T ids2(RAD_I32, {M, k}), ew2(RAD_F32, {M, k});
+    T sorted2(RAD_I32, {M * k}), eoff2(RAD_I32, {ne + 1}), ecnt2(RAD_I32, {ne});
+    A b; b.t(x).t(w).t(gb).t(lg2).t(ids2).t(ew2).t(sorted2).t(eoff2).t(ecnt2).t(gate)
+          .i("M", M).i("K", K).i("n_expert", ne).i("n_local", ne).i("top_k", k).i("norm", 1)
+          .s("dtype", "f32").i("expert_base", 0);
+    CHECK_OK(run("router_gemm_topk_scatter", b));
+    CHECK_NEAR(gate.at(0), 2.0f, 1e-6);
+    CHECK_NEAR(gate.at(1), 3.0f, 1e-6);
+    CHECK_NEAR(ew2.at(0) + ew2.at(1), 1.0f, 1e-6);   /* renormalised to sum to one */
 }
 
 /* The four-class grouped GEMM: expert e is entry e / 4 of class e % 4, each class at its own
@@ -7824,6 +7869,11 @@ std::vector<Geo> geometries() {
         G("scale_rows", "M", 3, a.i("M", R).i("n", 8).s("act", "sigmoid").s("dtype", "f32")),
         G("router_topk", "M", 3, a.i("M", R).i("n_expert", 6).i("top_k", 2).i("norm", 1)
                                  .s("dtype", "f32")),
+        G("router_topk_scatter", "M", 3, a.i("M", R).i("n_expert", 6).i("n_local", 4)
+                                         .i("top_k", 2).i("norm", 1).s("dtype", "f32")),
+        G("router_gemm_topk_scatter", "M", 3, a.i("M", R).i("K", 32).i("n_expert", 4)
+                                              .i("n_local", 4).i("top_k", 2).i("norm", 0)
+                                              .s("dtype", "f32")),
         G("moe_scatter", "M", 3, a.i("M", R).i("n_expert", 6).i("top_k", 2)),
         G("moe_gemm", "M", 3, a.i("M", R).i("N", 16).i("K", 32).i("n_expert", 4).i("top_k", 2)
                               .s("a_order", "token").s("dtype", "f32")),

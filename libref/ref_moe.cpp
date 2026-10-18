@@ -147,6 +147,84 @@ int ref_moe_scatter(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ router_topk_scatter */
+/* THE PAIR AS ONE OP, and the reference is the pair: the fused device kernel's whole claim is that
+ * it is byte-identical to these two launches, so the oracle that checks that claim is exactly
+ * these two, in order, over the operands the fused op carries. The selection runs over the whole
+ * router's `n_expert` logits; the sort runs over THIS RANK'S SLICE, which is the fused op's
+ * `n_local` standing where `moe_scatter`'s `n_expert` names the slice it owns. */
+int ref_router_topk_scatter(const RadArgs* a, RadStream s) {
+    if (!have(a, 6)) return RAD_E_INVAL;
+    const int64_t ne = p_int(a, "n_expert", 0);
+    const int64_t nl = p_int(a, "n_local", ne);
+    const int64_t k  = p_int(a, "top_k", 1);
+    if (ne <= 0 || k <= 0 || k > ne || nl <= 0 || nl > ne) return RAD_E_SHAPE;
+
+    const RadParam rp[] = { RAD_INT("n_expert", ne), RAD_INT("top_k", k),
+                            RAD_INT("norm", p_int(a, "norm", 0)),
+                            RAD_STR("dtype", p_str(a, "dtype", "bf16")) };
+    const RadArgs ra{ a->t, 3, rp, 4, nullptr, 0, nullptr, a->rank, a->world_size };
+    const int rc = ref_router_topk(&ra, s);
+    if (rc != RAD_OK) return rc;
+
+    /* The fused op's operands with `expert_w` removed -- the sort's input is the selection's
+     * output, named once, and `moe_scatter` takes it in operand slot 0. RadArgs reads a
+     * contiguous tensor array, so the four descriptors are laid out here, by value. */
+    const RadTensor t2[] = { a->t[1], a->t[3], a->t[4], a->t[5] };
+    const RadParam sp[]   = { RAD_INT("n_expert", nl), RAD_INT("top_k", k),
+                              RAD_INT("expert_base", p_int(a, "expert_base", 0)),
+                              RAD_STR("protect", p_str(a, "protect", nullptr)) };
+    const RadArgs sa{ t2, 4, sp, 4, nullptr, 0, nullptr, a->rank, a->world_size };
+    return ref_moe_scatter(&sa, s);
+}
+
+/* ------------------------------------------------------------------ router_gemm_topk_scatter */
+/* THE ROUTER GEMM IN FRONT OF THE PAIR, and with `gate_b`/`gate` present the shared expert's
+ * one-column gate over the same input. As with the pair, the reference IS the launches it stands
+ * in for: the router's `gemm_nt`, the gate's `gemm_nt` at N = 1, then `router_topk_scatter` over
+ * the logits -- the fused kernel's claim is byte-identity to exactly these. `gate_b` and `gate`
+ * come together or not at all, and the operand count says which. */
+int ref_router_gemm_topk_scatter(const RadArgs* a, RadStream s) {
+    /* NOT `have`: the required operands are not a prefix -- `gate_b` sits between the router's
+     * weight and the outputs, and it and `gate` are null slots in the gate-absent form. The nine
+     * required slots are checked by name; the pair is checked to come together or not at all. */
+    if (!a || !a->t || a->n_t < 9) return RAD_E_INVAL;
+    const bool gate_b = a->n_t > 2 && a->t[2].data != nullptr;
+    const bool gate   = a->n_t > 9 && a->t[9].data != nullptr;
+    if (gate_b != gate) return RAD_E_INVAL;
+    for (int i : {0, 1, 3, 4, 5, 6, 7, 8})
+        if (!a->t[i].data) return RAD_E_INVAL;
+    const int64_t ne = p_int(a, "n_expert", 0);
+    const int64_t nl = p_int(a, "n_local", ne);
+    const int64_t k  = p_int(a, "top_k", 1);
+    const int64_t K  = p_int(a, "K", 0);
+    if (ne <= 0 || k <= 0 || k > ne || nl <= 0 || nl > ne || K <= 0) return RAD_E_SHAPE;
+    const char* dt = p_str(a, "dtype", "bf16");
+
+    /* The router: a [M, K] x b [n_expert, K]^T -> logits. gemm_nt takes a, b, y contiguously. */
+    const RadTensor g3[] = { a->t[0], a->t[1], a->t[3] };
+    const RadParam  gp[] = { RAD_INT("N", ne), RAD_INT("K", K), RAD_STR("dtype", dt) };
+    const RadArgs   ga{ g3, 3, gp, 3, nullptr, 0, nullptr, a->rank, a->world_size };
+    const int gc = ref_gemm_nt(&ga, s);
+    if (gc != RAD_OK) return gc;
+
+    /* The shared expert's gate: the same arithmetic at N = 1, beside the router, over the same
+     * `a`. The pair was checked to come together. */
+    if (gate) {
+        const RadTensor p3[] = { a->t[0], a->t[2], a->t[9] };
+        const RadParam  pp[] = { RAD_INT("N", 1), RAD_INT("K", K), RAD_STR("dtype", dt) };
+        const RadArgs   pa{ p3, 3, pp, 3, nullptr, 0, nullptr, a->rank, a->world_size };
+        const int pc = ref_gemm_nt(&pa, s);
+        if (pc != RAD_OK) return pc;
+    }
+
+    /* The pair over the logits the GEMM just wrote. Every parameter the pair reads is a parameter
+     * of this op, under the same name -- the fused lists are unions, so `a`'s list passes through. */
+    const RadTensor t6[] = { a->t[3], a->t[4], a->t[5], a->t[6], a->t[7], a->t[8] };
+    const RadArgs   fa{ t6, 6, a->p, a->n_p, nullptr, 0, nullptr, a->rank, a->world_size };
+    return ref_router_topk_scatter(&fa, s);
+}
+
 /* ------------------------------------------------------------------ moe_gemm, moe_gemm_q */
 /* y[i, :] = a[row(i), :] @ w[e]^T, e the expert whose offset range contains i. `a_order` picks
  * row(i): `sorted_tok[i] / top_k` for one activation row per token, i itself for one per

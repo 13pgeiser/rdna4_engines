@@ -472,6 +472,29 @@ static const RadParamSpec pScatter[] = { P_INT("M"), P_INT("n_expert"), P_INT("t
 static const RadOperandSpec oScatter[] = { OPD("expert_ids"), OUT("sorted_tok"),
                                            OUT("expert_offset"), OUT("expert_count") };
 
+/* THE PAIR AS ONE OP: the union of the two parameter lists, and their operands with the shared
+ * `expert_ids` named once, as an output. Same schema as libr4d's fused row. */
+static const RadParamSpec pRouterTopkScatter[] = { P_INT("M"), P_INT("n_expert"),
+                                                   P_INTO("n_local"), P_INT("top_k"),
+                                                   P_INT("norm"), P_STR("dtype"),
+                                                   P_INTO("expert_base"),
+                                                   P_STRO("protect") };
+static const RadOperandSpec oRouterTopkScatter[] = { OPD("logits"), OUT("expert_ids"),
+                                                     OUT("expert_w"), OUT("sorted_tok"),
+                                                     OUT("expert_offset"),
+                                                     OUT("expert_count") };
+
+/* THE ROUTER GEMM IN FRONT OF THE PAIR, and the gate's one-column GEMM beside it: the union of
+ * the three operand lists with `logits` named once, as the GEMM's output. */
+static const RadParamSpec pRouterGemmTopkScatter[] = { P_INT("M"), P_INT("K"),
+                                                       P_INT("n_expert"), P_INTO("n_local"),
+                                                       P_INT("top_k"), P_INT("norm"),
+                                                       P_STR("dtype"), P_INTO("expert_base"),
+                                                       P_STRO("protect") };
+static const RadOperandSpec oRouterGemmTopkScatter[] = {
+    OPD("a"), WGT("b"), WGT_O("gate_b"), OUT("logits"), OUT("expert_ids"), OUT("expert_w"),
+    OUT("sorted_tok"), OUT("expert_offset"), OUT("expert_count"), OUT_O("gate") };
+
 /* `a_order` says which rows the activation has; a routed block's two grouped GEMMs differ. gate_up
  * reads the block input, one row per token, so sorted row i gathers `a[sorted_tok[i] / top_k]`.
  * down reads gate_up's output, already one row per (token, slot) in scatter order, so row i is row
@@ -1356,6 +1379,16 @@ static const RadOpSchema kSchemas[] = {
   "sorts only its own slice, and the slots that went elsewhere simply contribute nothing to this "
   "rank's partial -- which the block's end-of-block all-reduce then sums. `expert_base` absent "
   "or 0 with n_expert the model's count is the whole-model case." },
+{ "router_topk_scatter", ARR(pRouterTopkScatter), ARR(oRouterTopkScatter),
+  "`router_topk` then `moe_scatter`, in one launch: exactly those two and in that order, over "
+  "the operands they share. The reference IS the pair -- the fused device kernel claims to be "
+  "byte-identical to these two launches, and this is what it is measured against. The sort's "
+  "outputs are sized by `n_local`, this rank's slice; absent it is the router's count." },
+{ "router_gemm_topk_scatter", ARR(pRouterGemmTopkScatter), ARR(oRouterGemmTopkScatter),
+  "`gemm_nt` of `a` against the router `b`, then `router_topk_scatter` over those logits, and "
+  "with `gate_b`/`gate` present the shared expert's `gemm_nt` at N = 1 over the same `a`. As "
+  "with the pair, the reference IS the launches: the gate weight and output come together or not "
+  "at all, and the operand count says which." },
 { "moe_gemm", ARR(pMoeGemm), ARR(oMoeGemm),
   "y[i] = a[row(i)] @ w[e]^T in SORTED order, e being the expert whose offset range contains i. "
   "`a_order` picks row(i): \"token\" gathers a[sorted_tok[i] / top_k] from an activation with one "
@@ -2100,6 +2133,12 @@ SIMPLE("ref_router_topk", "router_topk", "moe", "softmax then exact top-k routin
        ref_router_topk),
 SIMPLE("ref_moe_scatter", "moe_scatter", "moe", "stable counting sort of routing slots by expert",
        "i32 indices", ref_moe_scatter),
+SIMPLE("ref_router_topk_scatter", "router_topk_scatter", "moe",
+       "the selection and the sort in one op, run as exactly the pair", DT_FLOAT,
+       ref_router_topk_scatter),
+SIMPLE("ref_router_gemm_topk_scatter", "router_gemm_topk_scatter", "moe",
+       "the router GEMM, the selection and the sort in one op, run as exactly the launches",
+       DT_FLOAT, ref_router_gemm_topk_scatter),
 SIMPLE("ref_moe_gemm", "moe_gemm", "moe", "grouped GEMM over the expert-sorted rows", DT_FLOAT,
        ref_moe_gemm),
 ROW_CB("ref_moe_gemm_q", "moe_gemm_q", "moe",

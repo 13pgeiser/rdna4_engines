@@ -1,0 +1,17 @@
+# unlimited-ocr-bf16.recipe -- baidu/Unlimited-OCR from its bf16 checkpoint, served at the
+# checkpoint's own precision.
+#
+#   rad-convert <Unlimited-OCR checkpoint> --recipe data/recipes/unlimited-ocr-bf16.recipe \
+#       -o unlimited-ocr-bf16.rad
+#
+# No rules: every decoder weight is plain bf16 as the checkpoint ships it, and the bf16 plugin
+# (arch/unlimitedocr_bf16) probes the first routed expert, reads the plain encoding and serves the
+# experts through the bf16 grouped GEMM. The checkpoint carries no quantization_config.
+#
+# The container this writes is the P0/P1 decoder only: the plugin's name map covers the 12-layer
+# Llama-MoE trunk and its tied head, and the DeepEncoder vision tensors are left out until the P2
+# tower is declared (aijuus/plans/UNLIMITED-OCR-PLUGIN.md). Reconvert with the same recipe then.
+#
+# Quantisation follow-ups (after P5) get their own recipes: the 64-expert MoE is the qwen4exp
+# w4/w4nl64 tier's shape (moe_intermediate_size 896 = 7 x 128 scale groups, n_embd 1280 = 10 x 128
+# -- whole scale blocks both ways), with the tied 331 MB head and the vision tower kept bf16.

@@ -387,6 +387,26 @@ static const RadParamSpec pScatter[]   = { P_INT("M"), P_INT("n_expert"), P_INT(
 static const RadOperandSpec oScatter[] = { OPD("expert_ids"), OUT("sorted_tok"),
                                            OUT("expert_offset"), OUT("expert_count") };
 
+/* THE PAIR AS ONE OP, and the router GEMM in front of it: libref's schemas for the same two rows,
+ * where the operand lists are unions and `expert_ids`/`logits` are named once as outputs. */
+static const RadParamSpec pRouterTopkScatter[] = { P_INT("M"), P_INT("n_expert"),
+                                                   P_INTO("n_local"), P_INT("top_k"),
+                                                   P_INT("norm"), P_STR("dtype"),
+                                                   P_INTO("expert_base"),
+                                                   P_STRO("protect") };
+static const RadOperandSpec oRouterTopkScatter[] = { OPD("logits"), OUT("expert_ids"),
+                                                     OUT("expert_w"), OUT("sorted_tok"),
+                                                     OUT("expert_offset"),
+                                                     OUT("expert_count") };
+static const RadParamSpec pRouterGemmTopkScatter[] = { P_INT("M"), P_INT("K"),
+                                                       P_INT("n_expert"), P_INTO("n_local"),
+                                                       P_INT("top_k"), P_INT("norm"),
+                                                       P_STR("dtype"), P_INTO("expert_base"),
+                                                       P_STRO("protect") };
+static const RadOperandSpec oRouterGemmTopkScatter[] = {
+    OPD("a"), WGT("b"), WGT_O("gate_b"), OUT("logits"), OUT("expert_ids"), OUT("expert_w"),
+    OUT("sorted_tok"), OUT("expert_offset"), OUT("expert_count"), OUT_O("gate") };
+
 static const RadParamSpec pMoeGemm[]   = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("n_expert"),
                                            P_INT("top_k"), P_STR("a_order"), P_STR("dtype") };
 static const RadOperandSpec oMoeGemm[] = { OPD("a"), WTAB("w"), OPD("sorted_tok"),
@@ -979,6 +999,10 @@ static const RadOpSchema kSchemas[] = {
 { "router_sigmoid_topk", ARR(pRouterSigmoid), ARR(oRouterSigmoid),
   "Single-group sigmoid routing; correction bias selects experts, original scores weight them." },
 { "router_topk", ARR(pRouter), ARR(oRouter), "softmax then exact top-k routing." },
+{ "router_topk_scatter", ARR(pRouterTopkScatter), ARR(oRouterTopkScatter),
+  "the selection and the sort in one op, run as exactly the pair." },
+{ "router_gemm_topk_scatter", ARR(pRouterGemmTopkScatter), ARR(oRouterGemmTopkScatter),
+  "the router GEMM, the shared expert's gate GEMM and the pair, run as exactly the launches." },
 { "moe_scatter", ARR(pScatter), ARR(oScatter),
   "stable counting sort of routing slots by expert." },
 { "moe_gemm", ARR(pMoeGemm), ARR(oMoeGemm), "grouped GEMM over the expert-sorted rows." },
@@ -1514,6 +1538,12 @@ SIMPLE("avx_router_topk", "router_topk", "moe", "softmax then exact top-k routin
        L(router_topk)),
 SIMPLE("avx_router_sigmoid_topk", "router_sigmoid_topk", "moe", "sigmoid correction-bias routing", DT_FLOAT,
        L(router_sigmoid_topk)),
+SIMPLE("avx_router_topk_scatter", "router_topk_scatter", "moe",
+       "the selection and the sort in one op, run as exactly the pair", DT_FLOAT,
+       L(router_topk_scatter)),
+SIMPLE("avx_router_gemm_topk_scatter", "router_gemm_topk_scatter", "moe",
+       "the router GEMM, the shared expert's gate GEMM and the pair, run as exactly the launches",
+       DT_FLOAT, L(router_gemm_topk_scatter)),
 SIMPLE("avx_moe_scatter", "moe_scatter", "moe", "stable counting sort of routing slots by expert",
        "i32 indices", L(moe_scatter)),
 SIMPLE("avx_moe_gemm", "moe_gemm", "moe", "grouped GEMM over the expert-sorted rows", DT_FLOAT,

@@ -22968,6 +22968,10 @@ static void device_phase(const Plugin& pl) {
     attn_case(pl, "attn_decode_h256_gqa6_bf16kv",  256, 6,  1, "bf16",     0);
     attn_case(pl, "attn_decode_h128_gqa4_fp8kv",   128, 4,  1, "fp8_e4m3", 0);
     attn_case(pl, "attn_decode_h128_gqa4_bf16kv",  128, 4,  1, "bf16",     0);
+    attn_case(pl, "attn_prefill_h128_gqa1_bf16kv", 128, 1, 32, "bf16",     1);
+    attn_case(pl, "attn_prefill_h128_gqa1_fp8kv",  128, 1, 32, "fp8_e4m3", 1);
+    attn_case(pl, "attn_decode_h128_gqa1_bf16kv",  128, 1,  1, "bf16",     0);
+    attn_case(pl, "attn_decode_h128_gqa1_fp8kv",   128, 1,  1, "fp8_e4m3", 0);
     attn_case(pl, "attn_prefill_h64_gqa4_bf16kv",   64, 4, 32, "bf16",     1);
     attn_case(pl, "attn_prefill_h64_gqa4_bf16kv",   64, 4,  1, "bf16",     1);
     /* Gemma 4 dense sliding window, decode, with the model's window of 1024: exercises the

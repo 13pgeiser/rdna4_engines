@@ -237,6 +237,8 @@ int ref_dflash_conv        (const RadArgs*, RadStream);
 /* ---- mixture of experts */
 int ref_router_topk        (const RadArgs*, RadStream);
 int ref_moe_scatter        (const RadArgs*, RadStream);
+int ref_router_topk_scatter(const RadArgs*, RadStream);
+int ref_router_gemm_topk_scatter(const RadArgs*, RadStream);
 int ref_moe_gemm           (const RadArgs*, RadStream);
 int ref_moe_gemm_q         (const RadArgs*, RadStream);
 int ref_moe_gemm_q_mod4    (const RadArgs*, RadStream);
@@ -469,6 +471,8 @@ REF_SHAPE_FN(ref_dflash_conv);
 
 REF_SHAPE_FN(ref_router_topk);
 REF_SHAPE_FN(ref_moe_scatter);
+REF_SHAPE_FN(ref_router_topk_scatter);
+REF_SHAPE_FN(ref_router_gemm_topk_scatter);
 REF_SHAPE_FN(ref_moe_gemm);
 REF_SHAPE_FN(ref_moe_gemm_q);
 REF_SHAPE_FN(ref_moe_gemm_q_mod4);

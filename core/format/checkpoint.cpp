@@ -247,6 +247,9 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
     m.n_ff        = gi("intermediate_size", gi("moe_intermediate_size", 0));
     m.n_vocab     = gi("vocab_size", 0);
     m.n_ctx_train = gi("max_position_embeddings", 0);
+    /* THE DEEPSEEK SPELLING. Unlimited-OCR's decoder is a DeepSeek-V2 MoE and states its expert
+     * count as `n_routed_experts`; a routed config names the count under one of the three and
+     * never under more than one, so the chain is a rename, not a guess. */
     m.n_expert        = gi("num_experts", gi("num_local_experts", gi("n_routed_experts", 0)));
     m.n_expert_used   = gi("num_experts_per_tok", 0);
     m.n_expert_shared = gi("n_shared_experts", gi("num_shared_experts",

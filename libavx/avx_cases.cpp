@@ -557,6 +557,18 @@ std::vector<Case> build_cases() {
                              HS("dtype", dt) });
         add("router_topk", { HI("M", 9), HI("n_expert", 8), HI("top_k", 2), HI("norm", 0),
                              HS("dtype", dt) });
+        /* The pair and the pair behind the router GEMM: the whole-model form and a rank's slice
+         * with a nonzero expert base, since the sort's slicing is the part the fuse adds. */
+        add("router_topk_scatter", { HI("M", 9), HI("n_expert", 8), HI("top_k", 2),
+                                     HI("norm", 1), HS("dtype", dt) });
+        add("router_topk_scatter", { HI("M", 9), HI("n_expert", 8), HI("n_local", 4),
+                                     HI("top_k", 2), HI("norm", 0), HI("expert_base", 2),
+                                     HS("dtype", dt) });
+        add("router_gemm_topk_scatter", { HI("M", 9), HI("K", 128), HI("n_expert", 8),
+                                          HI("top_k", 2), HI("norm", 0), HS("dtype", dt) });
+        add("router_gemm_topk_scatter", { HI("M", 9), HI("K", 128), HI("n_expert", 8),
+                                          HI("n_local", 4), HI("top_k", 2), HI("norm", 1),
+                                          HI("expert_base", 2), HS("dtype", dt) });
         add("moe_gather",  { HI("M", 9), HI("n", 128), HI("top_k", 2), HS("dtype", dt) });
         /* The shared-expert fold: `shared`/`shared_gate` are always described, so always
          * present; this case uses sigmoid, the one above "none". */
