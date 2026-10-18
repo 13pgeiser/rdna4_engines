@@ -9005,6 +9005,25 @@ extern "C" void r4d_cfg_mxfp4_tiled(const RadArgs* a, R4dMxTileCfg* out) {
 extern "C" void r4d_cfg_split(const RadArgs* a, R4dSplitCfg* out) {
     out->splits = TUNE(a, tAttnSplit, "splits");
 }
+/* A fresh-start divergence (4x R9700 behind an EPYC root complex, 2026-10-17): on a freshly
+ * started 31B server, a prefill all-reduce now and then reads a peer's scratch before that peer's
+ * words have landed -- the first reuse of a double-buffered slot, inputs identical on every rank
+ * (RADIANCE_DEBUG_OPHASH) -- and the first greedy reply flips a near-tie. Every thread's full
+ * system fence before the flag (drain 1) cures it, as does one after it (acq 1); the per-wave
+ * store wait (drain 3) and the publisher's one writeback (pub 1) do not, and Relaxed Ordering off
+ * on every link does not. The mechanism below the fence is not known. Decode heights never showed
+ * it, and the fence costs them ~0.7 %, so it is taken only from RADIANCE_AR_FENCE_FROM elements
+ * (default 131072, 24 rows of the 31B's 5376: above any verify height, and every prefill chunk);
+ * 0 never. Read once. Only at four ranks, where it was seen and cured: at two (Qwen3.8-27B's
+ * prefill at tp 2) it cost 4.5% of prefill, and no two-rank start ever flipped. */
+static long long ar_fence_from() {
+    static const long long v = [] {
+        const char* e = std::getenv("RADIANCE_AR_FENCE_FROM");
+        return e && *e ? std::atoll(e) : 131072LL;
+    }();
+    return v;
+}
+
 extern "C" void r4d_cfg_ar(const RadArgs* a, R4dArCfg* out) {
     out->nblocks  = TUNE(a, tAr, "nblocks");
     out->nthreads = TUNE(a, tAr, "nthreads");
@@ -9012,6 +9031,12 @@ extern "C" void r4d_cfg_ar(const RadArgs* a, R4dArCfg* out) {
     out->acq      = TUNE(a, tAr, "acq");
     /* An axis of the four-rank junction only (tArQ84); 1 for every other row, as before. */
     out->pub      = TUNE(a, tArQ84, "pub");
+    /* Operand 0 is the message on every collective that reads this (all_reduce's x, a junction's
+     * [M, n] input, all_gather's source). */
+    const long long from = ar_fence_from();
+    if (from > 0 && a && a->t && a->n_t > 0 && rad_tensor_numel(&a->t[0]) >= from &&
+        r4d_geti_or(a, "world_size", 4) == 4)        /* the four-rank rows carry no world_size */
+        out->drain = 1;
 }
 extern "C" void r4d_cfg_topk(const RadArgs* a, R4dTopkCfg* out) {
     out->rc  = 0;                      /* derived from pt1 at issue; see the note at tTopk */
