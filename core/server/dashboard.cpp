@@ -125,8 +125,10 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
     o["model"]     = opt_.model_id;
     o["version"]   = opt_.version;
     o["uptime_s"]  = unix_now() - started_at_;
-    /* How long this process took to come up, measured on this machine: the price of a restart,
-     * which the page needs to say whether a restart pays back. 0 before the server listens. */
+    /* How long this process took to come up, measured on this machine. Raw figure: a restart's
+     * real cost, for whoever is deciding whether one is worth it. 0 before the server listens.
+     * The page no longer consumes it -- see the note on the decode-step detail line for why the
+     * payback arithmetic that used to live there was removed. */
     o["startup_s"] = startup_s_;
     o["in_flight"] = in_flight_.load(std::memory_order_relaxed);
     o["queue_cap"] = queue_depth_;
@@ -1684,6 +1686,34 @@ function renderRequests(list, poolTokens) {
 let prev = null, prevAt = 0, bars = [], devs = [], layerBars = [];
 let lastStepMs = null, lastTps = null;
 
+/* THE SINGLE-STREAM FLOOR and the engine's most recent window, shown as two numbers and
+ * interpreted by nobody. The engine records the fastest single-sequence decode window it has
+ * measured (step_ns_decode_best) and its most recent one (step_ns_decode_recent); the page states
+ * both and draws no conclusion. Neither is asked of a human: a typed ruler goes stale and
+ * mis-advises silently, and a browser meter sees only the steps taken while this tab is open. On
+ * an engine too old to emit the floor, the page falls back to the fastest single-stream step this
+ * tab has seen.
+ *
+ * THERE IS DELIBERATELY NO RESTART ADVICE HERE, and it was not never-built -- it was built,
+ * deployed, measured, and removed the same day (2026-10-18). It compared the floor against the
+ * recent window, called the gap drift, and priced a payback from startup_s. The gap is not drift.
+ * On a HEALTHY shared lane the floor sat flat at 14.79 ms while the recent window moved between
+ * 15.2 and 16.5 ms -- 3% to 11% -- tracking what else the lane was doing: it froze when the lane
+ * went idle and ROSE on a fresh short request, so it was neither context length nor engine age.
+ * The payback formula assumes a restart's improvement is permanent, so acting on it pays the 49 s
+ * bringup and re-drifts within minutes; the line was telling the operator to restart every 12-19
+ * minutes forever, for a gain that was never there. What best-vs-recent actually measures is the
+ * distance between the lane's most favorable moment and its typical one.
+ *
+ * A verdict could go back here IF someone first observes the thing none of today's data shows:
+ * step time rising with ENGINE AGE and STAYING up. Every excursion seen so far was load. The
+ * full chain, including the estimator that survives this, is in patches/CHANGELOG-SOURCE.md. */
+let c1hist = [];
+const C1CAP = 7200;                       /* an hour at 2 polls/s of single-stream samples */
+let bestEver = 0;                         /* the best engine floor ever seen here, across restarts */
+try { bestEver = parseFloat(localStorage.getItem("radiance.c1best")) || 0; } catch (e) {}
+
+
 function update(s, dt) {
   $("ver").textContent = s.version + "  ·  up " + dur(s.uptime_s);
 
@@ -1702,6 +1732,29 @@ function update(s, dt) {
   const st = stepTime(lastStepMs);
   M.step.u.textContent = st.u;
   setMetric("step",    lastStepMs,    st.n);
+
+  /* THE FLOOR, single-stream on both sides of the engine's own measurement. The floor is a
+ * single-sequence window, so the engine keys it to one row deliberately: a decode step at eight
+ * sequences is a different measurement, and reading it against a single-sequence floor would
+ * report a batch arriving as a slowdown. */
+  if (s.running === 1 && stepMs != null) { c1hist.push(stepMs); if (c1hist.length > C1CAP) c1hist.shift(); }
+  const engBestMs = s.step_ns_decode_best > 0 ? s.step_ns_decode_best / 1e6 : 0;
+  const engRecentMs = s.step_ns_decode_recent > 0 ? s.step_ns_decode_recent / 1e6 : 0;
+  if (engBestMs > 0 && (bestEver === 0 || engBestMs < bestEver)) {
+    bestEver = engBestMs;
+    try { localStorage.setItem("radiance.c1best", String(bestEver)); } catch (e) {}
+  }
+  const floorMs = engBestMs > 0 ? engBestMs : (c1hist.length ? Math.min(...c1hist) : 0);
+  /* The two engine figures, stated plainly. Painted every poll: without a verdict there is
+   * nothing for a fast repaint to make unactionable, and `recent` only moves when a window of 32
+   * single-sequence steps completes anyway. */
+  let det = "";
+  if (floorMs > 0) {
+    det = "best " + floorMs.toFixed(2) + "ms";
+    if (engRecentMs > 0) det += " · recent " + engRecentMs.toFixed(2) + "ms";
+  }
+  $("m-stepdet").textContent = det;
+
   setMetric("decode",  s.decode_tps,  tps(s.decode_tps));
   setMetric("prefill", s.prefill_tps, tps(s.prefill_tps));
   setMetric("flight",  s.in_flight,   String(s.in_flight));
