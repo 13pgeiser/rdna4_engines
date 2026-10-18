@@ -70,6 +70,11 @@
  * (32 sequences verifying four tokens) and a 2048-token prefill chunk is 10 MiB. A multiple of 128
  * (see pAllReduce's `numel`). */
 #define R4D_AR_WIDE_ONESHOT_MAX_ELEMS 524288
+/* The same bound at eight ranks, where the one-shot's (ws-1)*N is seven times the message and
+ * loses early: on eight R9700 the two-shot is faster from 16384 elements on (21.6 against 26.3
+ * us), at a 48-row decode message of 4096 wide 3.4 times. A multiple of 64, the 8-rank
+ * two-shot's DIV. */
+#define R4D_AR_8RANK_ONESHOT_MAX_ELEMS 8192
 #define R4D_XSTR(v) R4D_STR(v)
 #define R4D_STR(v)  #v
 
@@ -2675,9 +2680,9 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("all_reduce", pAllReduce, oAllReduce,
            "sum over the tensor-parallel group. `exact` separates the exact sum from the "
            "quantised wire and a caller that does not declare it gets no kernel. At 4 and 8 ranks "
-           "the exact sum is one-shot up to " R4D_XSTR(R4D_AR_WIDE_ONESHOT_MAX_ELEMS) " elements and "
-           "two-shot above, chosen by the "
-           "message's band; `hops` is accepted and no row of this plugin reads it."),
+           "the exact sum is one-shot up to " R4D_XSTR(R4D_AR_WIDE_ONESHOT_MAX_ELEMS) " elements "
+           "(at 8 ranks " R4D_XSTR(R4D_AR_8RANK_ONESHOT_MAX_ELEMS) ") and two-shot above, chosen "
+           "by the message's band; `hops` is accepted and no row of this plugin reads it."),
     SCHEMA("all_gather", pAllGather, oAllGather,
            "y is [world_size * numel] with rank r's contribution at offset r * numel. The bytes are "
            "moved and never summed: the vocab-parallel sampler's payload is (u32 token id, f32 "
@@ -3483,7 +3488,7 @@ static const RadConstraint cArTsExact4Lane[] = {
 };
 static const RadConstraint cArTsExact8[] = {
     C_EQ("world_size", 8), C_EQ("exact", 1), C_IN("dtype", "bf16 fp16 fp32"),
-    C_DIV("numel", 64), C_GE("numel", R4D_AR_WIDE_ONESHOT_MAX_ELEMS + 1),
+    C_DIV("numel", 64), C_GE("numel", R4D_AR_8RANK_ONESHOT_MAX_ELEMS + 1),
     C_LE("numel", R4D_AR_TWOSHOT_WIDE_MAX_ELEMS),
     C_P2P,
 };
@@ -5603,7 +5608,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "all-reduce (sum), reduce-scatter + all-gather over P2P IPC scratch, per-block pipelined "
   "handshake",
   "exactly 8 ranks, all peer-accessible; messages above "
-  R4D_XSTR(R4D_AR_WIDE_ONESHOT_MAX_ELEMS) " elements, two hops; shares the wide family's "
+  R4D_XSTR(R4D_AR_8RANK_ONESHOT_MAX_ELEMS) " elements, two hops; shares the wide family's "
   "flag/seq/scratch set; message must shard evenly over the ranks; in place; cudagraph-safe",
   "bf16 / fp16 / fp32 payload, fp32 accumulate in ascending rank order, bit-identical across ranks",
   RAD_DOMAIN_DEVICE, R4D_PRIO_AR_TWOSHOT,

@@ -499,6 +499,10 @@ static int ar_setup(const RadArgs* a, ArCall* c, int shard_nb) {
      * full-message rule over-launches across the mid band. */
     int cap = in->nb_cap;
     if (shard_nb && cap > 24) cap = 24;
+    /* Every block handshakes with all seven peers at eight ranks; past eight blocks the extra
+     * flag rounds cost more than the added reduce bandwidth (8 against 16 blocks measured up to 3 %
+     * faster from 2097152 elements on). */
+    if (shard_nb && in->world == 8 && cap > 8) cap = 8;
     c->nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(basis, cap);
     if (c->nblocks > in->max_blocks) c->nblocks = in->max_blocks;
     return RAD_OK;

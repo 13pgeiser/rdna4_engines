@@ -1601,11 +1601,11 @@ not accept a lossy wire gets no kernel rather than the quantised one.
 
 `hops` (1 or 2) is a caller's request for one-shot or two-shot; libref accepts and ignores it, and
 no libr4d row reads it. libr4d chooses by message size where a width has both: its two-shot rows
-start above 524288 elements, a band edge of the ranged `numel`. Every all-reduce kernel serves `y`
-absent, in place. `overlap` 1 says the caller issues the collective on its second lane, beside
-compute; libr4d then picks rows with a narrow launch (8 blocks of 256 threads at two ranks, 4 of
-1024 for the four-rank two-shots, exact and tiered-int8) that compute the same bits and leave the
-CUs to the kernels running beside them. libref ignores it.
+start above 524288 elements (8192 at eight ranks), a band edge of the ranged `numel`. Every
+all-reduce kernel serves `y` absent, in place. `overlap` 1 says the caller issues the collective on
+its second lane, beside compute; libr4d then picks rows with a narrow launch (8 blocks of 256
+threads at two ranks, 4 of 1024 for the four-rank two-shots, exact and tiered-int8) that compute the
+same bits and leave the CUs to the kernels running beside them. libref ignores it.
 
 libr4d serves these at 2, 3, 4 and 8 ranks:
 

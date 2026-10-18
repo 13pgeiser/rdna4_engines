@@ -1000,9 +1000,10 @@ prefill.
 At three and four ranks `wht6` selects tiered int8 over a two-shot all-reduce, both hops quantised
 (at three ranks the shards are whole 32-element groups, one uneven where the message does not
 divide), with the same floor. Eight ranks have no lossy wire; `--tp 8 --tp-wire wht6` stops at
-startup naming the all-reduce it found no kernel for, and `--tp-wire exact`. The exact wire at three,
-four and eight ranks is one-shot up to 1 MiB a message and two-shot above it, which sends
-2·(ranks−1)/ranks of the message per rank instead of (ranks−1) times it, with the same bits.
+startup naming the all-reduce it found no kernel for, and `--tp-wire exact`. The exact wire at three
+and four ranks is one-shot up to 1 MiB a message and two-shot above it, which sends
+2·(ranks−1)/ranks of the message per rank instead of (ranks−1) times it, with the same bits. At
+eight ranks the one-shot's seven copies lose early, and it ends at 8192 elements (16 KiB of bf16).
 
 On a model with a gated residual (Qwen3.8-Flash-Next) the all-reduce runs inside the residual's
 write, with the MoE gather in front of it. At two ranks the rotated forms of `ar_hc_write` and

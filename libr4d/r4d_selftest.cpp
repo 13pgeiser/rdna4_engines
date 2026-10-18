@@ -58,6 +58,8 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -16099,10 +16101,11 @@ static void gather_two_rank(const Plugin& pl, const std::vector<int>& devs, cons
 }
 
 /* ------------------------------------------------------------------ the wide (3/4/8-rank) family */
-/* The wide kernels are templated on the world size; these cases run them at 3 and 4 ranks (4 is
- * the TP4 width). Checked: a rendezvous of `world`, a sum of 1 + 2 + .. + world on every rank bit
- * for bit, slot parity surviving a block-count sweep, and the gather placing every slice in both
- * layouts. Skipped on fewer cards than the width, with the width named in the skip. */
+/* The wide kernels are templated on the world size; these cases run them at 3, 4 and 8 ranks (4
+ * is the TP4 width, 8 the TP8 one). Checked: a rendezvous of `world`, a sum of 1 + 2 + .. + world
+ * on every rank bit for bit, slot parity surviving a block-count sweep, and the gather placing
+ * every slice in both layouts. Skipped on fewer cards than the width, with the width named in the
+ * skip. */
 static void ar_wide_rank(const Plugin& pl, const std::vector<int>& devs, const char* name,
                          int world) {
     const RadKernelInfo* row = find(pl, name);
@@ -16245,10 +16248,11 @@ static void ar_wide_pattern(const Plugin& pl, const std::vector<int>& devs, cons
         return;
     }
     struct Run { const char* dtype; std::vector<int64_t> sizes; int oop; };
-    /* The three-rank list walks the UNEVEN split (words % 3 of 0, 1 and 2); the four-rank rows
-     * cannot be given one -- cArTsExact4/cArTi8Ts4 constrain numel so the words divide evenly
-     * (r4d_rows.cpp), and the two-shot's own entry refuses any other message -- so its list keeps
-     * the whole-word sizes and the band edges instead. */
+    /* The three-rank list walks the UNEVEN split (words % 3 of 0, 1 and 2); the four- and
+     * eight-rank rows cannot be given one -- cArTsExact4/cArTsExact8/cArTi8Ts4 constrain numel so
+     * the words divide evenly (r4d_rows.cpp; every size below is a multiple of 64 elements, so
+     * the words divide by eight too), and the two-shot's own entry refuses any other message --
+     * so their list keeps the whole-word sizes and the band edges instead. */
     std::vector<Run> runs;
     if (world == 3) {
         runs = {
@@ -16267,6 +16271,12 @@ static void ar_wide_pattern(const Plugin& pl, const std::vector<int>& devs, cons
             { "bf16", { 4194304, 128, 524288, 524352, 4196352, 20971520, 46137344, 4194304 }, 2 },
             /* fp32: words = numel / 4, whole groups of four either side of the same edge. */
             { "fp32", { 1048580 - 4, 524352 }, 0 },
+        };
+        /* Eight ranks end the one-shot band at 8192 (R4D_AR_8RANK_ONESHOT_MAX_ELEMS): the edge
+         * there instead, words divisible by eight on both sides. */
+        if (world == 8) runs = {
+            { "bf16", { 4194304, 128, 8192, 8256, 4196352, 20971520, 46137344, 4194304 }, 2 },
+            { "fp32", { 8192, 8256, 1048576 }, 0 },
         };
     }
     for (const Run& run : runs) {
@@ -16321,28 +16331,309 @@ static void ar_wide_pattern(const Plugin& pl, const std::vector<int>& devs, cons
         }
         if (row->fini) for (ArPattern& a : t) if (a.inst) row->fini(a.inst);
     }
-    /* The four-rank rows' even-shard rule, checked from the one place that can: a message whose
-     * 16-byte words do not divide by four must be REFUSED (r4d_ar_twoshot_Nrank_exact.hip shards
-     * it evenly and the entry throws on any residual), not launched with a truncated tail. The
-     * three-rank row has no such rule -- it splits unevenly by design. */
-    if (world == 4 && std::strstr(name, "twoshot")) {
-        ArPattern t[4];
-        for (int r = 0; r < 4; ++r) {
-            t[r].row = row; t[r].rank = r; t[r].dev = devs[(size_t)r]; t[r].world = 4;
-            t[r].dtype = "bf16"; t[r].sizes = { 524288, 40 };   /* 40 elems = 5 words: 5 % 4 != 0 */
-            t[r].out_of_place = 1;
+    /* The four- and eight-rank rows' even-shard rule, checked from the one place that can: a
+     * message whose 16-byte words do not divide by the world must be REFUSED
+     * (r4d_ar_twoshot_Nrank_exact.hip shards it evenly and the entry throws on any residual), not
+     * launched with a truncated tail. The three-rank row has no such rule -- it splits unevenly
+     * by design. 40 bf16 elements are 5 words (5 % 4 != 0), 72 are 9 (9 % 8 != 0). */
+    if (world >= 4 && std::strstr(name, "twoshot")) {
+        const int64_t odd = world == 4 ? 40 : 72;
+        const std::string w = std::to_string(world);
+        std::vector<ArPattern> t((size_t)world);
+        std::vector<std::thread> th;
+        for (int r = 0; r < world; ++r) {
+            t[(size_t)r].row = row; t[(size_t)r].rank = r; t[(size_t)r].dev = devs[(size_t)r];
+            t[(size_t)r].world = world;
+            t[(size_t)r].dtype = "bf16"; t[(size_t)r].sizes = { 524288, odd };
+            t[(size_t)r].out_of_place = 1;
+            th.emplace_back(ar_pattern_worker, &t[(size_t)r]);
         }
-        std::thread a(ar_pattern_worker, &t[0]), b(ar_pattern_worker, &t[1]),
-                    c(ar_pattern_worker, &t[2]), d(ar_pattern_worker, &t[3]);
-        a.join(); b.join(); c.join(); d.join();
+        for (std::thread& x : th) x.join();
         int refused = 0;
         for (const ArPattern& x : t) {
             if (x.rc_init == RAD_OK && x.rc_launch == RAD_E_SHAPE) ++refused;
             if (x.inst) row->fini(x.inst);
         }
-        ok((std::string(name) + " refuses a 5-word message at 4 ranks (RAD_E_SHAPE, not a launch)").c_str(),
-           refused == 4,
-           std::to_string(refused) + " of 4 ranks refused, rc " + std::to_string(t[0].rc_launch));
+        ok((std::string(name) + " refuses a " + std::to_string(odd * 2 / 16) + "-word message at " +
+            w + " ranks (RAD_E_SHAPE, not a launch)").c_str(),
+           refused == world,
+           std::to_string(refused) + " of " + w + " ranks refused, rc " +
+               std::to_string(t[0].rc_launch));
+    }
+}
+
+/* The eight-rank exact all-reduce timed, one thread per card as the engine runs it: both rows
+ * (one-shot, two-shot) at every message size given, each at the block rule and at fixed block
+ * counts, out of place on the per-element pattern and checked bit for bit against the fp32
+ * ascending-rank fold on every rank.
+ *
+ * Warm, every rank launches `iters` times back to back after as many warm-up launches, and the
+ * period is the span over iters (the handshake keeps ranks in lockstep after the first). Cold
+ * (--cold MIB), each launch follows a read of MIB through its card's caches and is timed alone;
+ * flushes end at different times on different cards, so a launch's time on a rank includes
+ * waiting for the last to arrive. The last arriver's time (the minimum over ranks) is the
+ * collective's own, the maximum adds the skew; both are reported as medians over the launches.
+ * The one-shot sends (W-1)*N bytes a rank, the two-shot 2*(W-1)/W*N; GB/s is given on the payload
+ * and on those sent bytes. */
+class StBarrier {
+public:
+    explicit StBarrier(int n) : n_(n) {}
+    void wait() {
+        std::unique_lock<std::mutex> lk(m_);
+        const int g = gen_;
+        if (++in_ == n_) { in_ = 0; ++gen_; cv_.notify_all(); return; }
+        cv_.wait(lk, [&] { return gen_ != g; });
+    }
+private:
+    std::mutex m_;
+    std::condition_variable cv_;
+    int n_, in_ = 0, gen_ = 0;
+};
+
+struct Ar8Perf {
+    int rank = 0, dev = 0, world = 8, iters = 0;
+    const char* dtype = "bf16";
+    std::vector<int64_t> sizes;
+    std::vector<const RadKernelInfo*> rows;
+    std::vector<int> nbs;
+    StBarrier* bar = nullptr;
+    int rc_init = RAD_OK;
+    /* Per config (size, row, block count): launch rc, wrong elements, the warm period in ms and
+     * the cold per-launch times in ms. */
+    std::vector<int> rc;
+    std::vector<int64_t> bad;
+    std::vector<float> period;
+    std::vector<std::vector<float>> cold;
+};
+
+static void ar8_perf_worker(Ar8Perf* t) {
+    const size_t ncfg = t->sizes.size() * t->rows.size() * t->nbs.size();
+    t->rc.assign(ncfg, RAD_E_STATE); t->bad.assign(ncfg, 0); t->period.assign(ncfg, 0.0f);
+    t->cold.assign(ncfg, {});
+    if (st_set_device(t->dev) != hipSuccess) t->rc_init = RAD_E_DEVICE;
+    const bool bf = !std::strcmp(t->dtype, "bf16");
+    const int esz = bf ? 2 : 4;
+    int64_t most = 0;
+    for (int64_t n : t->sizes) most = std::max(most, n);
+    std::vector<void*> inst(t->rows.size(), nullptr);
+    std::vector<RadParam> ip = {
+        PI("world_size", t->world), PI("numel", most), PS("dtype", t->dtype), PI("exact", 1),
+    };
+    for (size_t j = 0; j < t->rows.size() && t->rc_init == RAD_OK; ++j)
+        t->rc_init = t->rows[j]->init(ip.data(), (int)ip.size(), t->rank, t->world, &inst[j]);
+    void *in = nullptr, *out = nullptr, *csrc = nullptr, *cdst = nullptr;
+    if (t->rc_init == RAD_OK &&
+        (hipMalloc(&in, (size_t)most * esz) != hipSuccess ||
+         hipMalloc(&out, (size_t)most * esz) != hipSuccess ||
+         (g_cold > 0 && (hipMalloc(&csrc, (size_t)g_cold) != hipSuccess ||
+                         hipMalloc(&cdst, (size_t)std::min(g_cold, kColdChunk)) != hipSuccess))))
+        t->rc_init = RAD_E_NOMEM;
+    /* Every rank takes part in every barrier whatever its own state, so one failing rank ends
+     * the run instead of hanging the others. */
+    t->bar->wait();
+    std::vector<uint8_t> h((size_t)most * esz), want((size_t)most * esz), got((size_t)most * esz);
+    std::vector<hipEvent_t> ev(2 * (size_t)std::max(t->iters, 1));
+    for (hipEvent_t& e : ev) st_ev_create(&e);
+    size_t cfg = 0;
+    for (int64_t n : t->sizes) {
+        for (int64_t i = 0; i < n; ++i) {
+            float acc = 0.0f;
+            for (int r = 0; r < t->world; ++r) {
+                const float v = ar_pattern_value(r, i);
+                acc += bf ? h_bf16(h_to_bf16(v)) : v;
+            }
+            const float v = ar_pattern_value(t->rank, i);
+            if (bf) {
+                const uint16_t b = h_to_bf16(v), w = h_to_bf16(acc);
+                std::memcpy(&h[(size_t)i * 2], &b, 2); std::memcpy(&want[(size_t)i * 2], &w, 2);
+            } else {
+                std::memcpy(&h[(size_t)i * 4], &v, 4); std::memcpy(&want[(size_t)i * 4], &acc, 4);
+            }
+        }
+        if (t->rc_init == RAD_OK) st_memcpy(in, h.data(), (size_t)n * esz, hipMemcpyHostToDevice);
+        const uint32_t dt = bf ? RAD_BF16 : RAD_F32;
+        for (size_t j = 0; j < t->rows.size(); ++j) {
+            for (int nb : t->nbs) {
+                std::vector<RadParam> ps = ip;
+                if (nb > 0) ps.push_back(PI("nblocks", nb));
+                RadTensor ts[2] = { T(in, dt, { n }), T(out, dt, { n }) };
+                RadArgs a;
+                std::memset(&a, 0, sizeof(a));
+                a.t = ts; a.n_t = 2;
+                a.p = ps.data(); a.n_p = (int)ps.size();
+                a.instance = inst[j];
+                a.rank = t->rank;
+                a.world_size = t->world;
+                t->bar->wait();
+                int rc = t->rc_init;
+                if (rc == RAD_OK) {
+                    st_memset(out, 0, (size_t)n * esz);
+                    rc = t->rows[j]->launch(&a, nullptr);
+                    if (st_stream_sync(nullptr) != hipSuccess && rc == RAD_OK) rc = RAD_E_DEVICE;
+                }
+                t->rc[cfg] = rc;
+                t->bar->wait();
+                if (rc == RAD_OK) {
+                    st_memcpy(got.data(), out, (size_t)n * esz, hipMemcpyDeviceToHost);
+                    for (int64_t i = 0; i < n; ++i)
+                        t->bad[cfg] += std::memcmp(&got[(size_t)i * esz], &want[(size_t)i * esz],
+                                                   (size_t)esz) != 0;
+                }
+                /* The entry's checks depend only on the arguments, so every rank skips or times
+                 * the same configs; the barriers run unconditionally all the same. */
+                const bool timed = rc == RAD_OK && t->iters > 0;
+                /* As many warm-up launches as timed ones: after the host-side check the cards sit
+                 * idle, and ten launches did not bring the first configuration of a size back to
+                 * clock (the block rule read slower than the same count pinned). */
+                if (timed) {
+                    for (int i = 0; i < std::max(t->iters, 50); ++i)
+                        t->rows[j]->launch(&a, nullptr);
+                    st_stream_sync(nullptr);
+                }
+                t->bar->wait();
+                if (timed) {
+                    if (g_cold <= 0) {
+                        st_ev_record(ev[0], nullptr);
+                        for (int i = 0; i < t->iters; ++i) t->rows[j]->launch(&a, nullptr);
+                        st_ev_record(ev[1], nullptr);
+                        st_ev_sync(ev[1]);
+                        float ms = 0.0f;
+                        st_ev_elapsed(&ms, ev[0], ev[1]);
+                        t->period[cfg] = ms / (float)t->iters;
+                    } else {
+                        for (int i = 0; i < t->iters; ++i) {
+                            for (int64_t off = 0; off < g_cold; off += kColdChunk)
+                                hip_ck(hipMemcpyAsync(cdst, (const char*)csrc + off,
+                                                      (size_t)std::min(kColdChunk, g_cold - off),
+                                                      hipMemcpyDeviceToDevice, nullptr),
+                                       "hipMemcpyAsync", __LINE__);
+                            st_ev_record(ev[2 * (size_t)i], nullptr);
+                            t->rows[j]->launch(&a, nullptr);
+                            st_ev_record(ev[2 * (size_t)i + 1], nullptr);
+                        }
+                        st_ev_sync(ev[2 * (size_t)t->iters - 1]);
+                        t->cold[cfg].resize((size_t)t->iters);
+                        for (int i = 0; i < t->iters; ++i)
+                            st_ev_elapsed(&t->cold[cfg][(size_t)i], ev[2 * (size_t)i],
+                                          ev[2 * (size_t)i + 1]);
+                    }
+                }
+                t->bar->wait();
+                ++cfg;
+            }
+        }
+    }
+    for (hipEvent_t e : ev) st_ev_destroy(e);
+    for (size_t j = 0; j < t->rows.size(); ++j)
+        if (inst[j] && t->rows[j]->fini) t->rows[j]->fini(inst[j]);
+    for (void* p : { in, out, csrc, cdst }) if (p) st_free(p);
+}
+
+static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dtype) {
+    constexpr int W = 8;
+    if (iters <= 0) iters = 200;
+    const bool bf = !std::strcmp(dtype, "bf16");
+    if (!bf && std::strcmp(dtype, "fp32")) {
+        std::printf("--perfar8: dtype bf16 or fp32\n");
+        return;
+    }
+    const int esz = bf ? 2 : 4;
+    /* Messages at 4096 wide: 1, 4, 32 and 48 rows (the last eight streams with a draft window
+     * of six), 128 rows (the three- and four-rank one-shot band's top), 512, a 2048-row prefill
+     * chunk and 4096. */
+    std::vector<int64_t> sizes = numel > 0 ? std::vector<int64_t>{ numel }
+        : std::vector<int64_t>{ 4096, 16384, 131072, 196608, 524288, 2097152, 8388608, 16777216 };
+    for (int64_t n : sizes)
+        if (n <= 0 || n * esz % 16) { std::printf("--perfar8: numel %lld not whole 16-byte words\n",
+                                                  (long long)n); return; }
+    int nd = 0;
+    if (hipGetDeviceCount(&nd) != hipSuccess) nd = 0;
+    std::vector<int> devs;
+    for (int d = 0; d < nd; ++d) {
+        hipDeviceProp_t p;
+        if (hipGetDeviceProperties(&p, d) == hipSuccess &&
+            !std::strncmp(p.gcnArchName, "gfx1201", 7))
+            devs.push_back(d);
+    }
+    if ((int)devs.size() < W) { std::printf("--perfar8: needs 8 gfx1201 cards, found %zu\n",
+                                             devs.size()); return; }
+    std::vector<const RadKernelInfo*> rows;
+    for (const char* name : { "ar_oneshot_8rank_exact", "ar_twoshot_8rank_exact" }) {
+        const RadKernelInfo* r = find(pl, name);
+        if (!r) { std::printf("--perfar8: row %s absent\n", name); return; }
+        rows.push_back(r);
+    }
+    const std::vector<int> nbs = { 0, 4, 8, 16, 32, 64 };
+    std::printf("eight-rank exact all-reduce, %s, %d launches a point, %s\n", dtype, iters,
+                g_cold > 0 ? fmt("cold (%lld MiB read before each; last arriver / with skew, "
+                                 "medians)", (long long)(g_cold >> 20)).c_str()
+                           : "warm (back to back, period over the span, slowest rank)");
+    StBarrier bar(W);
+    std::vector<Ar8Perf> t((size_t)W);
+    std::vector<std::thread> th;
+    for (int r = 0; r < W; ++r) {
+        Ar8Perf& x = t[(size_t)r];
+        x.rank = r; x.dev = devs[(size_t)r]; x.iters = iters; x.dtype = dtype;
+        x.sizes = sizes; x.rows = rows; x.nbs = nbs; x.bar = &bar;
+        th.emplace_back(ar8_perf_worker, &x);
+    }
+    for (std::thread& x : th) x.join();
+    for (const Ar8Perf& x : t)
+        if (x.rc_init != RAD_OK) {
+            std::printf("  rank %d: init rc=%d\n", x.rank, x.rc_init);
+            return;
+        }
+    auto median = [](std::vector<float> v) {
+        if (v.empty()) return 0.0f;
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    size_t cfg = 0;
+    for (int64_t n : sizes) {
+        const double bytes = (double)n * esz;
+        std::printf("  numel %lld (%.0f KiB, %lld 16-byte words)\n", (long long)n, bytes / 1024.0,
+                    (long long)(n * esz / 16));
+        for (size_t j = 0; j < rows.size(); ++j) {
+            const bool two = j == 1;
+            const double sent = two ? 2.0 * (W - 1) / W * bytes : (double)(W - 1) * bytes;
+            for (int nb : nbs) {
+                const Ar8Perf& r0 = t[0];
+                /* The entry's nb_for, to name the rule's count: 1400 words a block, floor 4,
+                 * ceiling 16, the two-shot over its shard with ceiling 8 at eight ranks. */
+                const int64_t basis = n * esz / 16 / (two ? W : 1);
+                const int64_t rule =
+                    std::min<int64_t>(std::max<int64_t>(basis / 1400, 4), two ? 8 : 16);
+                const std::string nbs_ =
+                    nb ? std::to_string(nb) : fmt("rule %lld", (long long)rule);
+                if (r0.rc[cfg] != RAD_OK) {
+                    std::printf("    %-9s nb %-7s  rc=%d (not served)\n",
+                                two ? "two-shot" : "one-shot", nbs_.c_str(), r0.rc[cfg]);
+                    ++cfg;
+                    continue;
+                }
+                int64_t bad = 0;
+                for (const Ar8Perf& x : t) bad += x.bad[cfg];
+                double us = 0.0, us_hi = 0.0;
+                if (g_cold <= 0) {
+                    for (const Ar8Perf& x : t) us = std::max(us, (double)x.period[cfg] * 1000.0);
+                } else {
+                    std::vector<float> lo((size_t)iters, 1e30f), hi((size_t)iters, 0.0f);
+                    for (const Ar8Perf& x : t)
+                        for (int i = 0; i < iters && i < (int)x.cold[cfg].size(); ++i) {
+                            lo[(size_t)i] = std::min(lo[(size_t)i], x.cold[cfg][(size_t)i]);
+                            hi[(size_t)i] = std::max(hi[(size_t)i], x.cold[cfg][(size_t)i]);
+                        }
+                    us = median(lo) * 1000.0; us_hi = median(hi) * 1000.0;
+                }
+                std::printf("    %-9s nb %-7s %8.1f us%s  %6.2f GB/s payload  %6.2f GB/s sent a "
+                            "rank  %s\n", two ? "two-shot" : "one-shot", nbs_.c_str(), us,
+                            g_cold > 0 ? fmt(" (skew %.1f)", us_hi).c_str() : "",
+                            us > 0 ? bytes / (us * 1e3) : 0.0, us > 0 ? sent / (us * 1e3) : 0.0,
+                            bad ? fmt("%lld elements differ from the fold", (long long)bad).c_str()
+                                : "= fold on every rank");
+                ++cfg;
+            }
+        }
     }
 }
 
@@ -19638,10 +19929,12 @@ static void device_phase(const Plugin& pl) {
     for (const char* base : { "ar_oneshot_2rank_exact", "ar_gather_2rank", "ar_oneshot_3rank_exact",
                               "ar_twoshot_3rank_exact", "ar_twoshot_3rank_ti8", "ar_gather_3rank",
                               "ar_oneshot_4rank_exact", "ar_twoshot_4rank_exact",
-                              "ar_twoshot_4rank_ti8", "ar_gather_4rank" }) {
+                              "ar_twoshot_4rank_ti8", "ar_gather_4rank", "ar_oneshot_8rank_exact",
+                              "ar_twoshot_8rank_exact", "ar_gather_8rank" }) {
         for (const std::string& n : { std::string(base), std::string(base) + "_host" }) {
             if (!sel(n.c_str())) continue;
-            const int world = std::strstr(base, "4rank") ? 4
+            const int world = std::strstr(base, "8rank") ? 8
+                            : std::strstr(base, "4rank") ? 4
                             : std::strstr(base, "3rank") ? 3 : 2;
             if (!g_case) {
                 if (world == 2) std::printf("\ncross-rank\n");
@@ -19683,16 +19976,12 @@ static void device_phase(const Plugin& pl) {
                              std::strstr(base, "gather") != nullptr);
         }
     }
-    /* The 8-rank rows cannot be exercised on a four-card box. Reported as skipped rather
-     * than quietly passing: a row that has never been launched is not a row that works. */
+    /* The wide rows at every width are dispatched above and skip themselves, naming the width
+     * they need, on a box with fewer cards. */
     auto skip_pair = [](const char* base, const char* why) {
         for (const std::string& n : { std::string(base), std::string(base) + "_host" })
             if (sel(n.c_str())) skip(n.c_str(), why);
     };
-    /* Only the 8-rank rows now: the four-rank ones are dispatched above and skip themselves with
-     * the width they need. */
-    for (const char* n : { "ar_oneshot_8rank_exact", "ar_twoshot_8rank_exact", "ar_gather_8rank" })
-        skip_pair(n, "needs 8 cards");
     skip_pair("ar_oneshot_2rank_wht6", "lossy wire: needs a tolerance harness, not a smoke test");
     skip_pair("ar_ln_had_quant_i8", "two-rank fusion: needs the same harness as the wht6 wire");
     /* Also skipped: the norm half is rmsnorm_quant_fp8's device function, checked there, and the
@@ -19836,6 +20125,10 @@ static void usage(void) {
                 "             or runs (S contiguous runs). a=bf16 (default) or a=fp8_e4m3 (scale\n"
                 "             every 128); y=bf16 (default), y=f16 or y=f32. Each row's t and y are\n"
                 "             compared with the first row's; --cold applies.\n"
+                "  --perfar8 numel [iters] [dtype]:  the eight-rank exact all-reduce, one thread\n"
+                "             a card: one-shot and two-shot at the block rule and at 4..64 blocks,\n"
+                "             each checked against the rank-order fold; numel 0 runs the decode\n"
+                "             and prefill messages at 4096 wide. dtype bf16 (default) or fp32.\n"
                 "  --perfqsa CTX [M] [iters]:  the QSA indexer at a real context length. It is\n"
                 "             the only decode op that grows with context, and at 200K it is\n"
                 "             about a third of the step. M is 1 + n_spec.\n"
@@ -19872,6 +20165,9 @@ int main(int argc, char** argv) {
     int lo_it = 200;
     bool lo_fp8 = false;
     uint32_t lo_ydt = RAD_BF16;
+    long long ar8_n = -1;
+    int ar8_it = 200;
+    const char* ar8_dt = "bf16";
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--real")) {
             if (i + 5 >= argc) { usage(); return 2; }
@@ -19959,6 +20255,12 @@ int main(int argc, char** argv) {
                     return 2;
                 }
             }
+        } else if (!std::strcmp(argv[i], "--perfar8")) {
+            /* The eight-rank exact all-reduce rows timed; numel 0 runs the default sizes. */
+            if (i + 1 >= argc) { usage(); return 2; }
+            ar8_n = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) ar8_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != 0x2d) ar8_dt = argv[++i];
         } else if (!std::strcmp(argv[i], "--perfhc")) {
             /* The gated residual's read at M rows. */
             if (i + 1 >= argc) { usage(); return 2; }
@@ -20068,6 +20370,16 @@ int main(int argc, char** argv) {
         dfree_all();
 #else
         skip("bf16 expert GEMM timing", "built without HIP");
+#endif
+        return 0;
+    }
+    if (ar8_n >= 0) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        ar8_perf(pl, ar8_n, ar8_it, ar8_dt);
+        dfree_all();
+#else
+        skip("eight-rank all-reduce timing", "built without HIP");
 #endif
         return 0;
     }

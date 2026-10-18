@@ -843,11 +843,14 @@ TEST(an_engine_with_no_card_leaves_a_gpu_librarys_device_rows_out) {
     for (const KernelRow& row : r.rows()) CHECK(row.info->domain != RAD_DOMAIN_DEVICE);
 }
 
-/* The shipped libr4d picks the all-reduce by message size. At 3, 4 and 8 ranks the exact sum is a
- * one-shot for decode-sized messages and a two-shot for prefill chunks; the two-shot rows start one
- * element above the one-shot bound, which is a band edge of the ranged `numel`. The band under it
- * must stay resolvable for every row with a DIV on `numel` (two-rank wht6 (64), three- and
- * four-rank ti8 (32, 128)), or a lossy serve loses its decode band. Only the real plugin can show
+/* The shipped libr4d picks the all-reduce by message size. At 3 and 4 ranks the exact sum is a
+ * one-shot for decode-sized messages and a two-shot for prefill chunks, at 8 ranks a one-shot only
+ * up to 8192 elements (its seven-fold send loses early); the two-shot rows start one element above
+ * the one-shot bound, which is a band edge of the ranged `numel`. Edges are the union over every
+ * candidate row, so the eight-rank edge at 8192 also splits the other widths' bands, each half
+ * resolving the same row. The band under the one-shot bound must stay resolvable for every row
+ * with a DIV on `numel` (two-rank wht6 (64), three- and four-rank ti8 (32, 128)), or a lossy
+ * serve loses its decode band. Only the real plugin can show
  * resolution above two ranks on a two-card machine. Geometry: Qwen3.8-Flash-Next, 2560 wide,
  * 2048-token chunk. */
 TEST(libr4d_resolves_the_all_reduce_by_message_size) {
@@ -868,35 +871,44 @@ TEST(libr4d_resolves_the_all_reduce_by_message_size) {
     };
 
     CHECK_EQ(band_names(bands(3, 1, chunk)),
-             "524288:ar_oneshot_3rank_exact 5242880:ar_twoshot_3rank_exact ");
+             "8192:ar_oneshot_3rank_exact 524288:ar_oneshot_3rank_exact "
+             "5242880:ar_twoshot_3rank_exact ");
     CHECK_EQ(band_names(bands(4, 1, chunk)),
-             "524288:ar_oneshot_4rank_exact 5242880:ar_twoshot_4rank_exact ");
+             "8192:ar_oneshot_4rank_exact 524288:ar_oneshot_4rank_exact "
+             "5242880:ar_twoshot_4rank_exact ");
     CHECK_EQ(band_names(bands(8, 1, chunk)),
-             "524288:ar_oneshot_8rank_exact 5242880:ar_twoshot_8rank_exact ");
+             "8192:ar_oneshot_8rank_exact 524288:ar_twoshot_8rank_exact "
+             "5242880:ar_twoshot_8rank_exact ");
     CHECK_EQ(band_names(bands(3, 0, chunk)),
-             "524288:ar_twoshot_3rank_ti8 5242880:ar_twoshot_3rank_ti8 ");
+             "8192:ar_twoshot_3rank_ti8 524288:ar_twoshot_3rank_ti8 5242880:ar_twoshot_3rank_ti8 ");
     CHECK_EQ(band_names(bands(4, 0, chunk)),
-             "524288:ar_twoshot_4rank_ti8 5242880:ar_twoshot_4rank_ti8 ");
+             "8192:ar_twoshot_4rank_ti8 524288:ar_twoshot_4rank_ti8 5242880:ar_twoshot_4rank_ti8 ");
     CHECK_EQ(band_names(bands(2, 0, chunk)),
-             "524288:ar_oneshot_2rank_wht6 5242880:ar_oneshot_2rank_wht6 ");
+             "8192:ar_oneshot_2rank_wht6 524288:ar_oneshot_2rank_wht6 "
+             "5242880:ar_oneshot_2rank_wht6 ");
     CHECK_EQ(band_names(bands(2, 1, chunk)),
-             "524288:ar_oneshot_2rank_exact 5242880:ar_oneshot_2rank_exact ");
+             "8192:ar_oneshot_2rank_exact 524288:ar_oneshot_2rank_exact "
+             "5242880:ar_oneshot_2rank_exact ");
 
     /* A 16384-token chunk is two-shot to its end: the two-shot's bound guards its word offsets,
      * it is not a prefill size, and a chunk past 20971520 elements would otherwise fall back to
      * the one-shot's twice-as-heavy send. */
     CHECK_EQ(band_names(bands(4, 1, 16384)),
-             "524288:ar_oneshot_4rank_exact 41943040:ar_twoshot_4rank_exact ");
+             "8192:ar_oneshot_4rank_exact 524288:ar_oneshot_4rank_exact "
+             "41943040:ar_twoshot_4rank_exact ");
     CHECK_EQ(band_names(bands(3, 1, 16384)),
-             "524288:ar_oneshot_3rank_exact 41943040:ar_twoshot_3rank_exact ");
+             "8192:ar_oneshot_3rank_exact 524288:ar_oneshot_3rank_exact "
+             "41943040:ar_twoshot_3rank_exact ");
 
     /* Above the two-shot's bound the one-shot takes the message back. */
     CHECK_EQ(band_names(bands(4, 1, 131072)),
-             "524288:ar_oneshot_4rank_exact 268435456:ar_twoshot_4rank_exact "
-             "335544320:ar_oneshot_4rank_exact ");
+             "8192:ar_oneshot_4rank_exact 524288:ar_oneshot_4rank_exact "
+             "268435456:ar_twoshot_4rank_exact 335544320:ar_oneshot_4rank_exact ");
 
-    /* A step that never exceeds the bound has one band, and it is the one-shot's. */
-    CHECK_EQ(band_names(bands(4, 1, 128)), "327680:ar_oneshot_4rank_exact ");
+    /* A step that never exceeds the bound stays on the one-shot, split only at the eight-rank
+     * edge. */
+    CHECK_EQ(band_names(bands(4, 1, 128)),
+             "8192:ar_oneshot_4rank_exact 327680:ar_oneshot_4rank_exact ");
 
     /* Eight ranks have no lossy wire: every band is a miss that names the request. */
     const std::vector<Band> none = bands(8, 0, chunk);
@@ -912,9 +924,10 @@ TEST(libr4d_resolves_the_all_reduce_by_message_size) {
     for (const Band& b : bands(3, 0, chunk)) CHECK_EQ(b.dom[RAD_DOMAIN_DEVICE].ranged_div, 32ll);
     for (const Band& b : bands(4, 0, chunk)) CHECK_EQ(b.dom[RAD_DOMAIN_DEVICE].ranged_div, 128ll);
     const std::vector<Band> exact4 = bands(4, 1, chunk);
-    REQUIRE_EQ(exact4.size(), 2u);
+    REQUIRE_EQ(exact4.size(), 3u);
     CHECK_EQ(exact4[0].dom[RAD_DOMAIN_DEVICE].ranged_div, 0ll);
-    CHECK_EQ(exact4[1].dom[RAD_DOMAIN_DEVICE].ranged_div, 64ll);
+    CHECK_EQ(exact4[1].dom[RAD_DOMAIN_DEVICE].ranged_div, 0ll);
+    CHECK_EQ(exact4[2].dom[RAD_DOMAIN_DEVICE].ranged_div, 64ll);
     for (const Band& b : bands(3, 1, chunk)) CHECK_EQ(b.dom[RAD_DOMAIN_DEVICE].ranged_div, 0ll);
 }
 
