@@ -26,12 +26,24 @@
 //! timing and an informative general-input delta.
 //!
 //! CLI: --mode check|graph|time|sweep|stress|rows --routing one|all|skew|FILE
-//!      [--x FILE.f16] [--tokens T] [--seed N] [--iters N] [--residency vram|host]
-//! Routing FILE = little-endian i32 top-10 expert ids [T*10]; X FILE = F16
-//! [T*2560] (captured activations). `--residency host` places the expert
+//!      [--geometry fn|a3b] [--x FILE.f16] [--tokens T] [--seed N] [--iters N]
+//!      [--residency vram|host]
+//! Geometry (default `fn`): fn = 512 experts, top-10, hidden 2560, expert
+//! intermediate 640; a3b = 256 experts, top-8, hidden 2048, intermediate 512.
+//! Every mode but `rows` runs either geometry; `rows` is fn-only (its combine
+//! is the top-10 BF16 kernel). The incumbent envelope (informative delta,
+//! `time` arm) is the shipped fn route and is skipped for a3b.
+//! Routing FILE = little-endian i32 expert ids [T*top_k]; X FILE = F16
+//! [T*hidden] (captured activations). `--residency host` places the expert
 //! weights in host-mapped memory. Output: one JSON object on stdout.
 //! Needs `HIPFIRE_QWEN4_MOE_SYM_IU4=1` only for the route predicate report;
 //! the launchers themselves run regardless.
+//!
+//! a3b on gfx1201 (`--mode check|graph`) also runs the PM BF16-row combine
+//! (`Gpu::moe_down_combine_grouped_bf16in_pm`) over the route's own grouped
+//! down rows and requires it bitwise equal to the HIP
+//! `moe_down_combine_grouped_k8` over the same rows widened BF16 -> F32
+//! (natural inverse permutation, and one with every 7th slot unrouted).
 //!
 //! `--mode rows` (prefill batch invariance, see `rows_mode`): per-token
 //! routing (a function of the token's own index), reference at T = 8192
@@ -45,13 +57,49 @@
 use hip_bridge::KernargBlob;
 use rdna_compute::{DType, Gpu, GpuTensor, Int4MmqPrepared};
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
-const E: usize = 512;
-const TOPK: usize = 10;
-const HID: usize = 2560;
-const MI: usize = 640;
-const GU_M: usize = 2 * MI;
-const DN_M: usize = HID;
+/// Expert geometry of this run (`--geometry`). QT44 gate/up and QT53 down
+/// group bytes are shared by every geometry.
+#[derive(Clone, Copy)]
+struct Geo {
+    name: &'static str,
+    e: usize,
+    topk: usize,
+    hid: usize,
+    mi: usize,
+    gu_m: usize,
+    dn_m: usize,
+    gu_stride: usize,
+    dn_stride: usize,
+}
+
+impl Geo {
+    const fn new(name: &'static str, e: usize, topk: usize, hid: usize, mi: usize) -> Geo {
+        Geo {
+            name,
+            e,
+            topk,
+            hid,
+            mi,
+            gu_m: 2 * mi,
+            dn_m: hid,
+            gu_stride: 2 * mi * (hid / 256) * GU_GB,
+            dn_stride: hid * (mi / 128) * DN_GB,
+        }
+    }
+}
+
+const GEO_FN: Geo = Geo::new("fn", 512, 10, 2560, 640);
+const GEO_A3B: Geo = Geo::new("a3b", 256, 8, 2048, 512);
+/// Set once from `--geometry` (runtime input, so not a `LazyLock`).
+static GEO: OnceLock<Geo> = OnceLock::new();
+
+/// The selected geometry (`fn` until `main` selects another).
+fn geo() -> &'static Geo {
+    GEO.get().unwrap_or(&GEO_FN)
+}
+
 const GU_GB: usize = 136;
 const DN_GB: usize = 68;
 const BLK: usize = 72;
@@ -343,13 +391,13 @@ struct Grouping {
 }
 fn cpu_group(topk: &[i32], pmax: usize) -> Grouping {
     let l = topk.len();
-    let mut raw = vec![0i32; E];
+    let mut raw = vec![0i32; geo().e];
     for &e in topk {
         raw[e as usize] += 1;
     }
     let counts: Vec<i32> = raw.iter().map(|c| (c + 15) / 16 * 16).collect();
-    let mut offsets = vec![0i32; E + 1];
-    for e in 0..E {
+    let mut offsets = vec![0i32; geo().e + 1];
+    for e in 0..geo().e {
         offsets[e + 1] = offsets[e] + counts[e];
     }
     let mut sorted = vec![-1i32; pmax];
@@ -362,7 +410,7 @@ fn cpu_group(topk: &[i32], pmax: usize) -> Grouping {
         sorted[p] = f as i32;
         inverse[f] = p as i32;
     }
-    for e in 0..E {
+    for e in 0..geo().e {
         for t in offsets[e] / 16..offsets[e + 1] / 16 {
             tiles[t as usize] = e as i32;
         }
@@ -380,16 +428,16 @@ fn routing(kind: &str, t: usize, seed: u64) -> Res<Vec<i32>> {
     let mut r = Rng(seed ^ 0xabcdef);
     Ok(match kind {
         // Every slot to expert 0: the hottest-possible single bucket.
-        "one" => vec![0; t * TOPK],
-        // Round robin over all 512 experts.
-        "all" => (0..t * TOPK).map(|i| (i % E) as i32).collect(),
+        "one" => vec![0; t * geo().topk],
+        // Round robin over all experts.
+        "all" => (0..t * geo().topk).map(|i| (i % geo().e) as i32).collect(),
         // Five hot experts on every token plus five distinct uniform others.
         "skew" => {
-            let mut v = Vec::with_capacity(t * TOPK);
+            let mut v = Vec::with_capacity(t * geo().topk);
             for _ in 0..t {
                 let mut row: Vec<i32> = (0..5).collect();
-                while row.len() < TOPK {
-                    let e = 5 + r.below((E - 5) as u64) as i32;
+                while row.len() < geo().topk {
+                    let e = 5 + r.below((geo().e - 5) as u64) as i32;
                     if !row.contains(&e) {
                         row.push(e);
                     }
@@ -404,12 +452,15 @@ fn routing(kind: &str, t: usize, seed: u64) -> Res<Vec<i32>> {
                 .chunks_exact(4)
                 .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
                 .collect();
-            if v.len() < t * TOPK {
-                return Err(
-                    format!("routing file {path} has {} slots < {}", v.len(), t * TOPK).into(),
-                );
+            if v.len() < t * geo().topk {
+                return Err(format!(
+                    "routing file {path} has {} slots < {}",
+                    v.len(),
+                    t * geo().topk
+                )
+                .into());
             }
-            v[..t * TOPK].to_vec()
+            v[..t * geo().topk].to_vec()
         }
     })
 }
@@ -446,7 +497,7 @@ fn to_i32(b: &[u8]) -> Vec<i32> {
 }
 
 fn ptr_table(base: &GpuTensor, stride: usize, distinct: usize) -> Vec<u8> {
-    (0..E)
+    (0..geo().e)
         .flat_map(|e| ((base.buf.as_ptr() as u64) + ((e % distinct) * stride) as u64).to_le_bytes())
         .collect()
 }
@@ -491,9 +542,6 @@ struct Case {
     host: bool,
 }
 
-const GU_STRIDE: usize = GU_M * (HID / 256) * GU_GB;
-const DN_STRIDE: usize = DN_M * (MI / 128) * DN_GB;
-
 #[allow(clippy::too_many_arguments)]
 fn make_case(
     gpu: &mut Gpu,
@@ -504,11 +552,11 @@ fn make_case(
     host: bool,
 ) -> Res<Case> {
     let l = topk.len();
-    let t = l / TOPK;
-    let pmax = l + E * 15;
+    let t = l / geo().topk;
+    let pmax = l + geo().e * 15;
     let pmax = pmax.div_ceil(16) * 16;
-    let gu_distinct = gu_w.len() / GU_STRIDE;
-    let dn_distinct = dn_w.len() / DN_STRIDE;
+    let gu_distinct = gu_w.len() / geo().gu_stride;
+    let dn_distinct = dn_w.len() / geo().dn_stride;
     let (gu_t, dn_t) = if host {
         (
             gpu.upload_raw_host_mapped(&gu_w, &[gu_w.len()])?,
@@ -520,8 +568,14 @@ fn make_case(
             gpu.upload_raw(&dn_w, &[dn_w.len()])?,
         )
     };
-    let gu_ptrs = gpu.upload_raw(&ptr_table(&gu_t, GU_STRIDE, gu_distinct), &[E * 8])?;
-    let dn_ptrs = gpu.upload_raw(&ptr_table(&dn_t, DN_STRIDE, dn_distinct), &[E * 8])?;
+    let gu_ptrs = gpu.upload_raw(
+        &ptr_table(&gu_t, geo().gu_stride, gu_distinct),
+        &[geo().e * 8],
+    )?;
+    let dn_ptrs = gpu.upload_raw(
+        &ptr_table(&dn_t, geo().dn_stride, dn_distinct),
+        &[geo().e * 8],
+    )?;
     Ok(Case {
         t,
         l,
@@ -536,25 +590,25 @@ fn make_case(
         dn_t,
         gu_ptrs,
         dn_ptrs,
-        x_in: gpu.upload_f32(x, &[t * HID])?,
-        counts: alloc(gpu, E * 4)?,
-        offsets: alloc(gpu, (E + 1) * 4)?,
+        x_in: gpu.upload_f32(x, &[t * geo().hid])?,
+        counts: alloc(gpu, geo().e * 4)?,
+        offsets: alloc(gpu, (geo().e + 1) * 4)?,
         sorted: alloc(gpu, pmax * 4)?,
         tiles: alloc(gpu, pmax / 16 * 4)?,
         inverse: alloc(gpu, l * 4)?,
-        ygu: alloc(gpu, pmax * MI * 2 + GUARD)?,
-        ydn: alloc(gpu, pmax * DN_M * 2 + GUARD)?,
-        i_counts: alloc(gpu, E * 4)?,
-        i_offsets: alloc(gpu, (E + 1) * 4)?,
+        ygu: alloc(gpu, pmax * geo().mi * 2 + GUARD)?,
+        ydn: alloc(gpu, pmax * geo().dn_m * 2 + GUARD)?,
+        i_counts: alloc(gpu, geo().e * 4)?,
+        i_offsets: alloc(gpu, (geo().e + 1) * 4)?,
         i_sorted: alloc(gpu, pmax * 4)?,
         i_tiles: alloc(gpu, pmax / 16 * 4)?,
         i_inverse: alloc(gpu, l * 4)?,
-        i_ygu: alloc(gpu, pmax * GU_M * 4)?,
-        i_ydn: alloc(gpu, pmax * DN_M * 4)?,
-        x_rot: alloc(gpu, t * HID * 4)?,
-        i_rot: alloc(gpu, l * MI * 4)?,
-        h_ygu: alloc(gpu, pmax * MI * 2 + GUARD)?,
-        h_ydn: alloc(gpu, pmax * DN_M * 2 + GUARD)?,
+        i_ygu: alloc(gpu, pmax * geo().gu_m * 4)?,
+        i_ydn: alloc(gpu, pmax * geo().dn_m * 4)?,
+        x_rot: alloc(gpu, t * geo().hid * 4)?,
+        i_rot: alloc(gpu, l * geo().mi * 4)?,
+        h_ygu: alloc(gpu, pmax * geo().mi * 2 + GUARD)?,
+        h_ydn: alloc(gpu, pmax * geo().dn_m * 2 + GUARD)?,
         host,
     })
 }
@@ -571,31 +625,39 @@ struct Handles {
 fn cand_stage(gpu: &mut Gpu, c: &Case, h: &mut Handles, s: usize) -> Res<()> {
     match s {
         0 => gpu.moe_scatter_stable_top10(
-            &c.topk, &c.counts, &c.offsets, &c.sorted, &c.tiles, &c.inverse, c.l, E, c.pmax,
+            &c.topk,
+            &c.counts,
+            &c.offsets,
+            &c.sorted,
+            &c.tiles,
+            &c.inverse,
+            c.l,
+            geo().e,
+            c.pmax,
         )?,
-        1 => h.gate = Some(gpu.qwen4_moe_rotate256_i4(&c.x_in, HID, c.t)?),
+        1 => h.gate = Some(gpu.qwen4_moe_rotate256_i4(&c.x_in, geo().hid, c.t)?),
         2 => gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
             &c.gu_ptrs,
             &c.tiles,
             &c.sorted,
             h.gate.as_ref().ok_or("gate A4 missing")?,
             &c.ygu,
-            GU_M,
-            HID,
-            TOPK,
+            geo().gu_m,
+            geo().hid,
+            geo().topk,
             c.pmax,
             c.t,
             c.host,
         )?,
-        3 => h.down = Some(gpu.qwen4_moe_rotate128_i4(&c.ygu, &c.sorted, MI, c.pmax, c.l)?),
+        3 => h.down = Some(gpu.qwen4_moe_rotate128_i4(&c.ygu, &c.sorted, geo().mi, c.pmax, c.l)?),
         _ => gpu.gemm_qwen4_moe_down_iu4_sym(
             &c.dn_ptrs,
             &c.tiles,
             &c.sorted,
             h.down.as_ref().ok_or("down A4 missing")?,
             &c.ydn,
-            DN_M,
-            MI,
+            geo().dn_m,
+            geo().mi,
             1,
             c.pmax,
             c.l,
@@ -795,7 +857,17 @@ fn entry_gemm(gpu: &mut Gpu, c: &Case, e: Entry, down: bool, y: &GpuTensor) -> R
             .as_ref()
             .ok_or("no down sidecar")?
             .as_ptr();
-        (e.down, &c.dn_ptrs, xq, DN_M, MI, 1, c.l, 128, e.down_rr)
+        (
+            e.down,
+            &c.dn_ptrs,
+            xq,
+            geo().dn_m,
+            geo().mi,
+            1,
+            c.l,
+            128,
+            e.down_rr,
+        )
     } else {
         let xq = gpu
             .scratch
@@ -804,7 +876,15 @@ fn entry_gemm(gpu: &mut Gpu, c: &Case, e: Entry, down: bool, y: &GpuTensor) -> R
             .ok_or("no gate sidecar")?
             .as_ptr();
         (
-            e.gate_up, &c.gu_ptrs, xq, GU_M, HID, TOPK, c.t, e.gu_block, 1,
+            e.gate_up,
+            &c.gu_ptrs,
+            xq,
+            geo().gu_m,
+            geo().hid,
+            geo().topk,
+            c.t,
+            e.gu_block,
+            1,
         )
     };
     if m % (64 * rr) != 0 {
@@ -840,8 +920,10 @@ fn anchor_mismatch(
 ) -> Res<Vec<(&'static str, [usize; 2])>> {
     let mut out = Vec::with_capacity(anchors.len());
     for &e in anchors {
-        gpu.hip.memset(&c.h_ygu.buf, v, c.pmax * MI * 2 + GUARD)?;
-        gpu.hip.memset(&c.h_ydn.buf, v, c.pmax * DN_M * 2 + GUARD)?;
+        gpu.hip
+            .memset(&c.h_ygu.buf, v, c.pmax * geo().mi * 2 + GUARD)?;
+        gpu.hip
+            .memset(&c.h_ydn.buf, v, c.pmax * geo().dn_m * 2 + GUARD)?;
         let mut h = Handles {
             entry: Some(e),
             ..Handles::default()
@@ -850,8 +932,8 @@ fn anchor_mismatch(
             anchor_stage(gpu, c, &mut h, s)?;
         }
         gpu.hip.device_synchronize()?;
-        let a = download(gpu, &c.h_ygu.buf, c.pmax * MI * 2 + GUARD)?;
-        let d = download(gpu, &c.h_ydn.buf, c.pmax * DN_M * 2 + GUARD)?;
+        let a = download(gpu, &c.h_ygu.buf, c.pmax * geo().mi * 2 + GUARD)?;
+        let d = download(gpu, &c.h_ydn.buf, c.pmax * geo().dn_m * 2 + GUARD)?;
         out.push((e.name, [diff(&a, ygu), diff(&d, ydn)]));
     }
     Ok(out)
@@ -875,7 +957,8 @@ fn anchor_stage(gpu: &mut Gpu, c: &Case, h: &mut Handles, s: usize) -> Res<()> {
     match s {
         2 => entry_gemm(gpu, c, e, false, &c.h_ygu),
         3 => {
-            h.down = Some(gpu.qwen4_moe_rotate128_i4(&c.h_ygu, &c.sorted, MI, c.pmax, c.l)?);
+            h.down =
+                Some(gpu.qwen4_moe_rotate128_i4(&c.h_ygu, &c.sorted, geo().mi, c.pmax, c.l)?);
             Ok(())
         }
         4 => entry_gemm(gpu, c, e, true, &c.h_ydn),
@@ -895,7 +978,7 @@ fn inc_stage(gpu: &mut Gpu, c: &Case, _h: &mut Handles, s: usize) -> Res<()> {
             &c.i_tiles,
             &c.i_inverse,
             c.l,
-            E,
+            geo().e,
             c.pmax,
             16,
         )?,
@@ -906,23 +989,23 @@ fn inc_stage(gpu: &mut Gpu, c: &Case, _h: &mut Handles, s: usize) -> Res<()> {
             &c.i_sorted,
             &c.x_rot,
             &c.i_ygu,
-            GU_M,
-            HID,
-            TOPK,
+            geo().gu_m,
+            geo().hid,
+            geo().topk,
             c.pmax,
             c.t,
         )?,
         2 => {
-            let xf16 = gpu.rotate_x_mq_batched_f16(&c.x_in, HID, c.t)?;
+            let xf16 = gpu.rotate_x_mq_batched_f16(&c.x_in, geo().hid, c.t)?;
             gpu.gemm_mq4g256v2_moe_grouped_top10_silu_bf16out(
                 &c.gu_ptrs,
                 &c.i_tiles,
                 &c.i_sorted,
                 &xf16,
                 &c.i_ygu,
-                GU_M,
-                HID,
-                TOPK,
+                geo().gu_m,
+                geo().hid,
+                geo().topk,
                 c.pmax,
                 c.t,
             )?;
@@ -931,7 +1014,7 @@ fn inc_stage(gpu: &mut Gpu, c: &Case, _h: &mut Handles, s: usize) -> Res<()> {
             &c.i_ygu,
             &c.i_sorted,
             &c.i_rot,
-            MI,
+            geo().mi,
             c.pmax,
             true,
             None,
@@ -942,23 +1025,24 @@ fn inc_stage(gpu: &mut Gpu, c: &Case, _h: &mut Handles, s: usize) -> Res<()> {
             &c.i_sorted,
             &c.i_rot,
             &c.i_ydn,
-            DN_M,
-            MI,
+            geo().dn_m,
+            geo().mi,
             1,
             c.pmax,
             c.l,
-            E,
+            geo().e,
         )?,
         4 => {
-            let x16 = gpu.moe_unscatter_rotate128_f16(&c.i_ygu, &c.i_sorted, MI, c.pmax, c.l)?;
+            let x16 =
+                gpu.moe_unscatter_rotate128_f16(&c.i_ygu, &c.i_sorted, geo().mi, c.pmax, c.l)?;
             gpu.gemm_mq4g128v2_moe_grouped_top10_xf16(
                 &c.dn_ptrs,
                 &c.i_tiles,
                 &c.i_sorted,
                 &x16,
                 &c.i_ydn,
-                DN_M,
-                MI,
+                geo().dn_m,
+                geo().mi,
                 c.pmax,
                 true,
             )?;
@@ -972,8 +1056,8 @@ fn inc_stage(gpu: &mut Gpu, c: &Case, _h: &mut Handles, s: usize) -> Res<()> {
 /// (upstream of the MoE in the shipped route, not charged to either arm).
 fn inc_setup(gpu: &mut Gpu, c: &Case) -> Res<()> {
     if gpu.arch == "gfx1201" {
-        let r = gpu.reserve_int4_mmq(HID, c.t)?;
-        gpu.rotate_x_mq_i4_batched(&c.x_in, None, Some(&c.x_rot), r, HID, c.t)?;
+        let r = gpu.reserve_int4_mmq(geo().hid, c.t)?;
+        gpu.rotate_x_mq_i4_batched(&c.x_in, None, Some(&c.x_rot), r, geo().hid, c.t)?;
         gpu.hip.device_synchronize()?;
     }
     Ok(())
@@ -1012,22 +1096,24 @@ fn stats(v: &[f64]) -> String {
 }
 
 fn poison(gpu: &Gpu, c: &Case, v: i32) -> Res<()> {
-    gpu.hip.memset(&c.ygu.buf, v, c.pmax * MI * 2 + GUARD)?;
-    gpu.hip.memset(&c.ydn.buf, v, c.pmax * DN_M * 2 + GUARD)?;
+    gpu.hip
+        .memset(&c.ygu.buf, v, c.pmax * geo().mi * 2 + GUARD)?;
+    gpu.hip
+        .memset(&c.ydn.buf, v, c.pmax * geo().dn_m * 2 + GUARD)?;
     Ok(())
 }
 
 fn outputs(gpu: &Gpu, c: &Case) -> Res<(Vec<u8>, Vec<u8>)> {
     Ok((
-        download(gpu, &c.ygu.buf, c.pmax * MI * 2 + GUARD)?,
-        download(gpu, &c.ydn.buf, c.pmax * DN_M * 2 + GUARD)?,
+        download(gpu, &c.ygu.buf, c.pmax * geo().mi * 2 + GUARD)?,
+        download(gpu, &c.ydn.buf, c.pmax * geo().dn_m * 2 + GUARD)?,
     ))
 }
 
 /// Live-tile bytes of both outputs (what the combine can read).
 fn live_bytes(g: &Grouping, ygu: &[u8], ydn: &[u8]) -> Vec<u8> {
-    let used = g.offsets[E] as usize;
-    [&ygu[..used * MI * 2], &ydn[..used * DN_M * 2]].concat()
+    let used = g.offsets[geo().e] as usize;
+    [&ygu[..used * geo().mi * 2], &ydn[..used * geo().dn_m * 2]].concat()
 }
 
 fn load_oracle(gpu: &mut Gpu) -> Res<()> {
@@ -1057,7 +1143,7 @@ fn ref_swiglu(gpu: &mut Gpu, g: &[f32], u: &[f32], live: &[i32]) -> Res<Vec<u16>
     a.push_ptr(p(&lt));
     a.push_ptr(p(&ot));
     a.push_i32(n as i32);
-    a.push_i32(MI as i32);
+    a.push_i32(geo().mi as i32);
     launch(
         gpu,
         "qwen4_moe_sym_ref_swiglu",
@@ -1093,55 +1179,55 @@ fn fold_check(
     for &tile in tiles {
         let e = g.tiles[tile] as usize;
         let slots: Vec<i32> = (0..16).map(|i| g.sorted[tile * 16 + i]).collect();
-        let mut xg = vec![0u8; (HID / 128) * 16 * BLK];
-        let mut xd = vec![0u8; (MI / 128) * 16 * BLK];
+        let mut xg = vec![0u8; (geo().hid / 128) * 16 * BLK];
+        let mut xd = vec![0u8; (geo().mi / 128) * 16 * BLK];
         for (j, &s) in slots.iter().enumerate() {
             if s < 0 {
                 continue;
             }
-            let tok = s as usize / TOPK;
-            for h in 0..HID / 128 {
+            let tok = s as usize / geo().topk;
+            for h in 0..geo().hid / 128 {
                 xg[(h * 16 + j) * BLK..(h * 16 + j + 1) * BLK]
                     .copy_from_slice(&xqg[(h * c.t + tok) * BLK..(h * c.t + tok + 1) * BLK]);
             }
-            for h in 0..MI / 128 {
+            for h in 0..geo().mi / 128 {
                 let o = (h * c.l + s as usize) * BLK;
                 xd[(h * 16 + j) * BLK..(h * 16 + j + 1) * BLK].copy_from_slice(&xqd[o..o + BLK]);
             }
         }
         let ge = e % c.gu_distinct;
         let f = fold_reference(
-            &c.gu_w[ge * GU_STRIDE..(ge + 1) * GU_STRIDE],
+            &c.gu_w[ge * geo().gu_stride..(ge + 1) * geo().gu_stride],
             &xg,
-            GU_M,
-            HID,
+            geo().gu_m,
+            geo().hid,
             16,
             GU_GB,
         );
         for j in 0..16 {
             live.push((slots[j] >= 0) as i32);
-            for col in 0..MI {
-                gs.push(f[j * GU_M + col]);
-                us.push(f[j * GU_M + MI + col]);
-                let o = ((tile * 16 + j) * MI + col) * 2;
+            for col in 0..geo().mi {
+                gs.push(f[j * geo().gu_m + col]);
+                us.push(f[j * geo().gu_m + geo().mi + col]);
+                let o = ((tile * 16 + j) * geo().mi + col) * 2;
                 cand.push(u16::from_le_bytes([ygu[o], ygu[o + 1]]));
             }
         }
         let de = e % c.dn_distinct;
         let fd = fold_reference(
-            &c.dn_w[de * DN_STRIDE..(de + 1) * DN_STRIDE],
+            &c.dn_w[de * geo().dn_stride..(de + 1) * geo().dn_stride],
             &xd,
-            DN_M,
-            MI,
+            geo().dn_m,
+            geo().mi,
             16,
             DN_GB,
         );
         for j in 0..16 {
-            for col in 0..DN_M {
-                let o = ((tile * 16 + j) * DN_M + col) * 2;
+            for col in 0..geo().dn_m {
+                let o = ((tile * 16 + j) * geo().dn_m + col) * 2;
                 let got = u16::from_le_bytes([ydn[o], ydn[o + 1]]);
                 let want = if slots[j] >= 0 {
-                    bf16_bits(fd[j * DN_M + col])
+                    bf16_bits(fd[j * geo().dn_m + col])
                 } else {
                     0
                 };
@@ -1153,7 +1239,7 @@ fn fold_check(
     let r = ref_swiglu(gpu, &gs, &us, &live)?;
     for (i, got) in cand.iter().enumerate() {
         gu_mis += (*got != r[i]) as usize;
-        pad_bad += (live[i / MI] == 0 && *got != 0) as usize;
+        pad_bad += (live[i / geo().mi] == 0 && *got != 0) as usize;
     }
     Ok((gu_mis, dn_mis, pad_bad))
 }
@@ -1161,10 +1247,11 @@ fn fold_check(
 /// The down sidecar the real `mq_rotate_x_128_v2` + shared quantizer make
 /// from the route's own gate/up output, vs the route's producer.
 fn down_sidecar_mismatch(gpu: &mut Gpu, c: &Case, xqd: &[u8]) -> Res<usize> {
-    let n = c.pmax * MI;
+    let n = c.pmax * geo().mi;
     let rot = alloc(gpu, n * 4)?;
-    let refq = alloc(gpu, (MI / 128) * c.l * BLK)?;
-    gpu.hip.memset(&refq.buf, 0x7B, (MI / 128) * c.l * BLK)?;
+    let refq = alloc(gpu, (geo().mi / 128) * c.l * BLK)?;
+    gpu.hip
+        .memset(&refq.buf, 0x7B, (geo().mi / 128) * c.l * BLK)?;
     let mut a = KernargBlob::new();
     a.push_ptr(p(&c.ygu));
     a.push_ptr(p(&rot));
@@ -1184,11 +1271,11 @@ fn down_sidecar_mismatch(gpu: &mut Gpu, c: &Case, xqd: &[u8]) -> Res<usize> {
     a.push_ptr(p(&rot));
     a.push_ptr(s1);
     a.push_ptr(s2);
-    a.push_i32(MI as i32);
+    a.push_i32(geo().mi as i32);
     launch(
         gpu,
         "mq_rotate_x_128_v2",
-        [(MI / 128) as u32, c.pmax as u32, 1],
+        [(geo().mi / 128) as u32, c.pmax as u32, 1],
         32,
         &mut a,
     )?;
@@ -1196,18 +1283,18 @@ fn down_sidecar_mismatch(gpu: &mut Gpu, c: &Case, xqd: &[u8]) -> Res<usize> {
     a.push_ptr(p(&rot));
     a.push_ptr(p(&c.sorted));
     a.push_ptr(p(&refq));
-    a.push_i32(MI as i32);
+    a.push_i32(geo().mi as i32);
     a.push_i32(c.pmax as i32);
     a.push_i32(c.l as i32);
     launch(
         gpu,
         "qwen4_moe_sym_ref_quant",
-        [(MI / 128) as u32, c.pmax as u32, 1],
+        [(geo().mi / 128) as u32, c.pmax as u32, 1],
         32,
         &mut a,
     )?;
     gpu.hip.device_synchronize()?;
-    let r = download(gpu, &refq.buf, (MI / 128) * c.l * BLK)?;
+    let r = download(gpu, &refq.buf, (geo().mi / 128) * c.l * BLK)?;
     gpu.free_tensor(rot)?;
     gpu.free_tensor(refq)?;
     Ok(r.iter().zip(xqd).filter(|(a, b)| a != b).count())
@@ -1225,8 +1312,8 @@ fn sidecars(gpu: &Gpu, c: &Case) -> Res<(Vec<u8>, Vec<u8>)> {
         .as_ref()
         .ok_or("no down sidecar")?;
     Ok((
-        download(gpu, g, (HID / 128) * c.t * BLK)?,
-        download(gpu, d, (MI / 128) * c.l * BLK)?,
+        download(gpu, g, (geo().hid / 128) * c.t * BLK)?,
+        download(gpu, d, (geo().mi / 128) * c.l * BLK)?,
     ))
 }
 
@@ -1242,9 +1329,87 @@ fn sample_tiles(used: usize) -> Vec<usize> {
 /// Header checker on this case's tables: (gate/up ok, down ok).
 fn header_checks(gpu: &mut Gpu, c: &Case) -> Res<(bool, bool)> {
     Ok((
-        gpu.qwen4_moe_sym_check(&c.gu_ptrs, GU_M, HID, E, GU_GB)?,
-        gpu.qwen4_moe_sym_check(&c.dn_ptrs, DN_M, MI, E, DN_GB)?,
+        gpu.qwen4_moe_sym_check(&c.gu_ptrs, geo().gu_m, geo().hid, geo().e, GU_GB)?,
+        gpu.qwen4_moe_sym_check(&c.dn_ptrs, geo().dn_m, geo().mi, geo().e, DN_GB)?,
     ))
+}
+
+/// BF16 rows widened to F32 (lossless), `n` values: the HIP combine's input.
+fn widen_bf16(gpu: &mut Gpu, src: &GpuTensor, n: usize) -> Res<GpuTensor> {
+    let out = alloc(gpu, n * 4)?;
+    let mut a = KernargBlob::new();
+    a.push_ptr(p(src));
+    a.push_ptr(p(&out));
+    a.push_i32(n as i32);
+    launch(
+        gpu,
+        "qwen4_moe_sym_ref_widen",
+        [n.div_ceil(256) as u32, 1, 1],
+        256,
+        &mut a,
+    )?;
+    Ok(out)
+}
+
+/// The PM BF16-row combine over the route's grouped down rows `c.ydn`
+/// (`x_residual += sum_k w * row`, ascending slots, unrouted slots skipped).
+/// The only call site of the launcher.
+fn pm_combine(
+    gpu: &mut Gpu,
+    c: &Case,
+    inverse: &GpuTensor,
+    weights: &GpuTensor,
+    residual: &GpuTensor,
+) -> Res<()> {
+    gpu.moe_down_combine_grouped_bf16in_pm(
+        &c.ydn,
+        inverse,
+        weights,
+        residual,
+        geo().dn_m,
+        geo().topk,
+        c.t,
+        c.pmax,
+    )?;
+    Ok(())
+}
+
+/// Byte mismatches of the PM combine vs the HIP `moe_down_combine_grouped_k8`
+/// over `c.ydn` widened to F32, for the natural inverse permutation and one
+/// with every 7th flat slot unrouted (-1). Call after the route ran; random
+/// positive weights and residual.
+fn combine_mismatch(gpu: &mut Gpu, c: &Case, seed: u64) -> Res<[usize; 2]> {
+    let (dim, k_top) = (geo().dn_m, geo().topk);
+    let mut r = Rng(seed ^ 0xc0b1);
+    let wts: Vec<f32> = (0..c.l).map(|_| 0.02 + r.unit()).collect();
+    let res0: Vec<f32> = (0..c.t * dim).map(|_| (r.unit() - 0.5) * 8.0).collect();
+    let natural = to_i32(&download(gpu, &c.inverse.buf, c.l * 4)?);
+    let unrouted: Vec<i32> = natural
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| if i % 7 == 3 { -1 } else { s })
+        .collect();
+    let wide = widen_bf16(gpu, &c.ydn, c.pmax * dim)?;
+    let wt = gpu.upload_f32(&wts, &[c.l])?;
+    let mut mis = [0usize; 2];
+    for (k, inv) in [natural, unrouted].iter().enumerate() {
+        let it = gpu.upload_raw(&i32_bytes(inv), &[c.l])?;
+        let pm = gpu.upload_f32(&res0, &[c.t * dim])?;
+        let hip = gpu.upload_f32(&res0, &[c.t * dim])?;
+        pm_combine(gpu, c, &it, &wt, &pm)?;
+        gpu.moe_down_combine_grouped_k8(&wide, &it, &wt, &hip, dim, k_top, c.t)?;
+        gpu.hip.device_synchronize()?;
+        mis[k] = diff(
+            &download(gpu, &pm.buf, c.t * dim * 4)?,
+            &download(gpu, &hip.buf, c.t * dim * 4)?,
+        );
+        for tsr in [it, pm, hip] {
+            gpu.free_tensor(tsr)?;
+        }
+    }
+    gpu.free_tensor(wide)?;
+    gpu.free_tensor(wt)?;
+    Ok(mis)
 }
 
 // ---------------------------------------------------------------- sweeps
@@ -1255,8 +1420,8 @@ fn header_checks(gpu: &mut Gpu, c: &Case) -> Res<(bool, bool)> {
 /// or epoch mix-up changes the exact fold. X comes from the real producers.
 fn weight_sweep(seed: u64) -> (Vec<u8>, Vec<u8>, Vec<i32>) {
     let mut r = Rng(seed ^ 0x0e0e);
-    let gu_experts = HID * 16 / GU_M; // 32
-    let dn_experts = MI * 16 / DN_M; // 4
+    let gu_experts = geo().hid * 16 / geo().gu_m; // 32
+    let dn_experts = geo().mi * 16 / geo().dn_m; // 4
     let mut probe = |m: usize, k: usize, gb: usize, experts: usize| {
         let mut w = Vec::new();
         for e in 0..experts {
@@ -1289,11 +1454,11 @@ fn weight_sweep(seed: u64) -> (Vec<u8>, Vec<u8>, Vec<i32>) {
         }
         w
     };
-    let gu = probe(GU_M, HID, GU_GB, gu_experts);
-    let dn = probe(DN_M, MI, DN_GB, dn_experts);
-    // 512 tokens, each to ten distinct probe experts (3j mod 32 distinct).
-    let topk = (0..512 * TOPK)
-        .map(|i| (((i / TOPK) + 3 * (i % TOPK)) % gu_experts) as i32)
+    let gu = probe(geo().gu_m, geo().hid, GU_GB, gu_experts);
+    let dn = probe(geo().dn_m, geo().mi, DN_GB, dn_experts);
+    // 512 tokens, each to top-k distinct probe experts (3j mod 32 distinct).
+    let topk = (0..512 * geo().topk)
+        .map(|i| (((i / geo().topk) + 3 * (i % geo().topk)) % gu_experts) as i32)
         .collect();
     (gu, dn, topk)
 }
@@ -1328,27 +1493,45 @@ fn x_onehot_sweep(
         }
         xq
     };
-    let xg = craft(HID / 128, &mut r);
-    let xd = craft(MI / 128, &mut r);
-    let gu_w = symmetric_weights(GU_M, HID, GU_GB, seed * 31 + 1);
-    let dn_w = symmetric_weights(DN_M, MI, DN_GB, seed * 31 + 2);
+    let xg = craft(geo().hid / 128, &mut r);
+    let xd = craft(geo().mi / 128, &mut r);
+    let gu_w = symmetric_weights(geo().gu_m, geo().hid, GU_GB, seed * 31 + 1);
+    let dn_w = symmetric_weights(geo().dn_m, geo().mi, DN_GB, seed * 31 + 2);
     let gu_t = gpu.upload_raw(&gu_w, &[gu_w.len()])?;
     let dn_t = gpu.upload_raw(&dn_w, &[dn_w.len()])?;
-    let gu_ptrs = gpu.upload_raw(&ptr_table(&gu_t, GU_STRIDE, 1), &[E * 8])?;
-    let dn_ptrs = gpu.upload_raw(&ptr_table(&dn_t, DN_STRIDE, 1), &[E * 8])?;
+    let gu_ptrs = gpu.upload_raw(&ptr_table(&gu_t, geo().gu_stride, 1), &[geo().e * 8])?;
+    let dn_ptrs = gpu.upload_raw(&ptr_table(&dn_t, geo().dn_stride, 1), &[geo().e * 8])?;
     // Grouped rows j -> expert 0, source row j (x_row_div 1 for both GEMMs).
     let tiles = gpu.upload_raw(&i32_bytes(&vec![0; n / 16]), &[n / 16])?;
     let sorted = gpu.upload_raw(&i32_bytes(&(0..n as i32).collect::<Vec<_>>()), &[n])?;
     let xgt = gpu.upload_raw(&xg, &[xg.len()])?;
     let xdt = gpu.upload_raw(&xd, &[xd.len()])?;
-    let ygu = alloc(gpu, n * MI * 2)?;
-    let ydn = alloc(gpu, n * DN_M * 2)?;
+    let ygu = alloc(gpu, n * geo().mi * 2)?;
+    let ydn = alloc(gpu, n * geo().dn_m * 2)?;
     let run = |gpu: &mut Gpu, e: Entry| -> Res<(Vec<u8>, Vec<u8>)> {
-        gpu.hip.memset(&ygu.buf, 0x7B, n * MI * 2)?;
-        gpu.hip.memset(&ydn.buf, 0x7B, n * DN_M * 2)?;
+        gpu.hip.memset(&ygu.buf, 0x7B, n * geo().mi * 2)?;
+        gpu.hip.memset(&ydn.buf, 0x7B, n * geo().dn_m * 2)?;
         for (func, ptrs, xq, y, m, k, block, rr) in [
-            (e.gate_up, &gu_ptrs, &xgt, &ygu, GU_M, HID, e.gu_block, 1),
-            (e.down, &dn_ptrs, &xdt, &ydn, DN_M, MI, 128u32, e.down_rr),
+            (
+                e.gate_up,
+                &gu_ptrs,
+                &xgt,
+                &ygu,
+                geo().gu_m,
+                geo().hid,
+                e.gu_block,
+                1,
+            ),
+            (
+                e.down,
+                &dn_ptrs,
+                &xdt,
+                &ydn,
+                geo().dn_m,
+                geo().mi,
+                128u32,
+                e.down_rr,
+            ),
         ] {
             let mut a = KernargBlob::new();
             a.push_ptr(p(ptrs));
@@ -1372,8 +1555,8 @@ fn x_onehot_sweep(
         }
         gpu.hip.device_synchronize()?;
         Ok((
-            download(gpu, &ygu.buf, n * MI * 2)?,
-            download(gpu, &ydn.buf, n * DN_M * 2)?,
+            download(gpu, &ygu.buf, n * geo().mi * 2)?,
+            download(gpu, &ydn.buf, n * geo().dn_m * 2)?,
         ))
     };
     let (got_gu, got_dn) = run(gpu, cand)?;
@@ -1382,12 +1565,15 @@ fn x_onehot_sweep(
         let (ag, ad) = run(gpu, e)?;
         anchor_mis.push((e.name, [diff(&ag, &got_gu), diff(&ad, &got_dn)]));
     }
-    let fg = fold_reference(&gu_w, &xg, GU_M, HID, n, GU_GB);
-    let fd = fold_reference(&dn_w, &xd, DN_M, MI, n, DN_GB);
-    let (mut gs, mut us) = (Vec::with_capacity(n * MI), Vec::with_capacity(n * MI));
+    let fg = fold_reference(&gu_w, &xg, geo().gu_m, geo().hid, n, GU_GB);
+    let fd = fold_reference(&dn_w, &xd, geo().dn_m, geo().mi, n, DN_GB);
+    let (mut gs, mut us) = (
+        Vec::with_capacity(n * geo().mi),
+        Vec::with_capacity(n * geo().mi),
+    );
     for j in 0..n {
-        gs.extend_from_slice(&fg[j * GU_M..j * GU_M + MI]);
-        us.extend_from_slice(&fg[j * GU_M + MI..(j + 1) * GU_M]);
+        gs.extend_from_slice(&fg[j * geo().gu_m..j * geo().gu_m + geo().mi]);
+        us.extend_from_slice(&fg[j * geo().gu_m + geo().mi..(j + 1) * geo().gu_m]);
     }
     let r_gu = ref_swiglu(gpu, &gs, &us, &vec![1; n])?;
     let gu_mis = r_gu
@@ -1485,29 +1671,29 @@ fn rows_hex(b: &[u8]) -> String {
 /// expert's run spans many tokens and tiles), then warm (8..64) and cold
 /// (64..512, often empty at small T) experts; all ten distinct, in a random
 /// (not sorted) rank order.
-fn row_route(seed: u64, idx: u64) -> ([i32; TOPK], [f32; TOPK]) {
+fn row_route(seed: u64, idx: u64) -> (Vec<i32>, Vec<f32>) {
     let mut r = Rng(seed ^ idx.wrapping_mul(0xD6E8_FEB8_6659_FD93) ^ 0x0007_0077);
     let hot = [0usize, 1, 1, 2, 2, 3, 3, 5][r.below(8) as usize];
-    let mut ids = [0i32; TOPK];
+    let mut ids = vec![0i32; geo().topk];
     let mut n = 0;
-    while n < TOPK {
+    while n < geo().topk {
         let e = if n < hot {
             r.below(8) as i32
         } else if r.below(3) == 0 {
             8 + r.below(56) as i32
         } else {
-            64 + r.below((E - 64) as u64) as i32
+            64 + r.below((geo().e - 64) as u64) as i32
         };
         if !ids[..n].contains(&e) {
             ids[n] = e;
             n += 1;
         }
     }
-    for i in (1..TOPK).rev() {
+    for i in (1..geo().topk).rev() {
         let j = r.below(i as u64 + 1) as usize;
         ids.swap(i, j);
     }
-    let mut w = [0f32; TOPK];
+    let mut w = vec![0f32; geo().topk];
     let mut s = 0f32;
     for x in w.iter_mut() {
         *x = 0.02 + r.unit();
@@ -1524,7 +1710,7 @@ fn row_route(seed: u64, idx: u64) -> ([i32; TOPK], [f32; TOPK]) {
 fn row_x(seed: u64, idx: u64) -> Vec<f32> {
     let mut r = Rng(seed ^ idx.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5858);
     let scale = [0.25f32, 0.5, 1.0, 2.0][(idx % 4) as usize];
-    (0..HID)
+    (0..geo().hid)
         .map(|i| {
             let v = (r.unit() - 0.5) * 4.0 * scale;
             if i % 97 == 13 {
@@ -1545,9 +1731,9 @@ struct RowPool {
 
 fn row_pool(seed: u64, first: u64, n: usize) -> RowPool {
     let mut p = RowPool {
-        topk: Vec::with_capacity(n * TOPK),
-        wts: Vec::with_capacity(n * TOPK),
-        x: Vec::with_capacity(n * HID),
+        topk: Vec::with_capacity(n * geo().topk),
+        wts: Vec::with_capacity(n * geo().topk),
+        x: Vec::with_capacity(n * geo().hid),
     };
     for j in 0..n as u64 {
         let (ids, w) = row_route(seed, first + j);
@@ -1645,66 +1831,111 @@ fn rows_run(
     diag: bool,
 ) -> Res<RowOut> {
     let t = o + t0;
-    let l = t * TOPK;
-    let pmax = (l + E * 15).div_ceil(16) * 16;
+    let l = t * geo().topk;
+    let pmax = (l + geo().e * 15).div_ceil(16) * 16;
     if o > 0 {
         gpu.hip
-            .memcpy_htod_offset(&b.topk.buf, 0, rows_bytes(&fill.topk[..o * TOPK]))?;
+            .memcpy_htod_offset(&b.topk.buf, 0, rows_bytes(&fill.topk[..o * geo().topk]))?;
         gpu.hip
-            .memcpy_htod_offset(&b.wts.buf, 0, rows_bytes(&fill.wts[..o * TOPK]))?;
+            .memcpy_htod_offset(&b.wts.buf, 0, rows_bytes(&fill.wts[..o * geo().topk]))?;
         gpu.hip
-            .memcpy_htod_offset(&b.x.buf, 0, rows_bytes(&fill.x[..o * HID]))?;
+            .memcpy_htod_offset(&b.x.buf, 0, rows_bytes(&fill.x[..o * geo().hid]))?;
     }
     gpu.hip.memcpy_htod_offset(
         &b.topk.buf,
-        o * TOPK * 4,
-        rows_bytes(&base.topk[..t0 * TOPK]),
+        o * geo().topk * 4,
+        rows_bytes(&base.topk[..t0 * geo().topk]),
     )?;
-    gpu.hip
-        .memcpy_htod_offset(&b.wts.buf, o * TOPK * 4, rows_bytes(&base.wts[..t0 * TOPK]))?;
-    gpu.hip
-        .memcpy_htod_offset(&b.x.buf, o * HID * 4, rows_bytes(&base.x[..t0 * HID]))?;
-    gpu.hip.memset(&b.ygu.buf, 0x7B, pmax * MI * 2)?;
-    gpu.hip.memset(&b.ydn.buf, 0x7B, pmax * DN_M * 2)?;
-    gpu.hip.memset(&b.out.buf, 0xA5, t * HID * 4)?;
+    gpu.hip.memcpy_htod_offset(
+        &b.wts.buf,
+        o * geo().topk * 4,
+        rows_bytes(&base.wts[..t0 * geo().topk]),
+    )?;
+    gpu.hip.memcpy_htod_offset(
+        &b.x.buf,
+        o * geo().hid * 4,
+        rows_bytes(&base.x[..t0 * geo().hid]),
+    )?;
+    gpu.hip.memset(&b.ygu.buf, 0x7B, pmax * geo().mi * 2)?;
+    gpu.hip.memset(&b.ydn.buf, 0x7B, pmax * geo().dn_m * 2)?;
+    gpu.hip.memset(&b.out.buf, 0xA5, t * geo().hid * 4)?;
     let mut kernels: Vec<String> = Vec::new();
     gpu.moe_scatter_stable_top10(
-        &b.topk, &b.counts, &b.offsets, &b.sorted, &b.tiles, &b.inverse, l, E, pmax,
+        &b.topk,
+        &b.counts,
+        &b.offsets,
+        &b.sorted,
+        &b.tiles,
+        &b.inverse,
+        l,
+        geo().e,
+        pmax,
     )?;
     kernels.push(gpu.last_launched_kernel().unwrap_or("?").to_string());
-    let x_view = b.x.sub_offset(0, t * HID);
-    let gate = gpu.qwen4_moe_rotate256_i4(&x_view, HID, t)?;
+    let x_view = b.x.sub_offset(0, t * geo().hid);
+    let gate = gpu.qwen4_moe_rotate256_i4(&x_view, geo().hid, t)?;
     kernels.push(gpu.last_launched_kernel().unwrap_or("?").to_string());
     gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
-        &b.gu_ptrs, &b.tiles, &b.sorted, &gate, &b.ygu, GU_M, HID, TOPK, pmax, t, host,
+        &b.gu_ptrs,
+        &b.tiles,
+        &b.sorted,
+        &gate,
+        &b.ygu,
+        geo().gu_m,
+        geo().hid,
+        geo().topk,
+        pmax,
+        t,
+        host,
     )?;
     kernels.push(gpu.last_launched_kernel().unwrap_or("?").to_string());
-    let down = gpu.qwen4_moe_rotate128_i4(&b.ygu, &b.sorted, MI, pmax, l)?;
+    let down = gpu.qwen4_moe_rotate128_i4(&b.ygu, &b.sorted, geo().mi, pmax, l)?;
     kernels.push(gpu.last_launched_kernel().unwrap_or("?").to_string());
     gpu.gemm_qwen4_moe_down_iu4_sym(
-        &b.dn_ptrs, &b.tiles, &b.sorted, &down, &b.ydn, DN_M, MI, 1, pmax, l, host,
+        &b.dn_ptrs,
+        &b.tiles,
+        &b.sorted,
+        &down,
+        &b.ydn,
+        geo().dn_m,
+        geo().mi,
+        1,
+        pmax,
+        l,
+        host,
     )?;
     kernels.push(gpu.last_launched_kernel().unwrap_or("?").to_string());
     // The prefill's combine: BF16 grouped rows, rank order by expert id,
     // written from +0.0 (`combine_initial_zero_applies` on this route).
     gpu.moe_down_combine_grouped_top10_bf16in(
-        &b.ydn, &b.inverse, &b.topk, &b.wts, &b.out, &b.order, HID, pmax, t, true, E,
+        &b.ydn,
+        &b.inverse,
+        &b.topk,
+        &b.wts,
+        &b.out,
+        &b.order,
+        geo().hid,
+        pmax,
+        t,
+        true,
+        geo().e,
     )?;
     kernels.push(gpu.last_launched_kernel().unwrap_or("?").to_string());
     gpu.hip.device_synchronize()?;
-    let mut out = vec![0u8; t0 * HID * 4];
-    gpu.hip.memcpy_dtoh_at(&mut out, &b.out.buf, o * HID * 4)?;
+    let mut out = vec![0u8; t0 * geo().hid * 4];
+    gpu.hip
+        .memcpy_dtoh_at(&mut out, &b.out.buf, o * geo().hid * 4)?;
     let slots = if diag {
         let mut inv = vec![0u8; l * 4];
         gpu.hip.memcpy_dtoh(&mut inv, &b.inverse.buf)?;
         let inv = to_i32(&inv);
-        let mut ygu = vec![0u8; pmax * MI * 2];
+        let mut ygu = vec![0u8; pmax * geo().mi * 2];
         gpu.hip.memcpy_dtoh(&mut ygu, &b.ygu.buf)?;
-        let mut ydn = vec![0u8; pmax * DN_M * 2];
+        let mut ydn = vec![0u8; pmax * geo().dn_m * 2];
         gpu.hip.memcpy_dtoh(&mut ydn, &b.ydn.buf)?;
         Some((
-            rows_slots(&ygu, &inv, o * TOPK, t0 * TOPK, MI * 2),
-            rows_slots(&ydn, &inv, o * TOPK, t0 * TOPK, DN_M * 2),
+            rows_slots(&ygu, &inv, o * geo().topk, t0 * geo().topk, geo().mi * 2),
+            rows_slots(&ydn, &inv, o * geo().topk, t0 * geo().topk, geo().dn_m * 2),
         ))
     } else {
         None
@@ -1745,9 +1976,9 @@ fn rows_mode(mut gpu: Gpu, args: &[String], host: bool, seed: u64) -> Res<()> {
     let offset_spec = arg(args, "--offsets", "1,17,256,t");
     let diag = args.iter().any(|a| a == "--diag");
     let print_all = arg(args, "--print", "all") != "fail";
-    let distinct: usize = arg(args, "--distinct", &E.to_string()).parse()?;
-    if distinct == 0 || distinct > E || ref_t == 0 {
-        return Err("--distinct must be 1..=512 and --ref-tokens > 0".into());
+    let distinct: usize = arg(args, "--distinct", &geo().e.to_string()).parse()?;
+    if distinct == 0 || distinct > geo().e || ref_t == 0 {
+        return Err(format!("--distinct must be 1..={} and --ref-tokens > 0", geo().e).into());
     }
     let rmax = *rows.last().ok_or("--rows is empty")?;
     if rmax > ref_t {
@@ -1761,11 +1992,21 @@ fn rows_mode(mut gpu: Gpu, args: &[String], host: bool, seed: u64) -> Res<()> {
         }
     }
 
-    let mut gu_w = Vec::with_capacity(distinct * GU_STRIDE);
-    let mut dn_w = Vec::with_capacity(distinct * DN_STRIDE);
+    let mut gu_w = Vec::with_capacity(distinct * geo().gu_stride);
+    let mut dn_w = Vec::with_capacity(distinct * geo().dn_stride);
     for e in 0..distinct as u64 {
-        gu_w.extend(symmetric_weights(GU_M, HID, GU_GB, seed * 1000 + e));
-        dn_w.extend(symmetric_weights(DN_M, MI, DN_GB, seed * 1000 + 600 + e));
+        gu_w.extend(symmetric_weights(
+            geo().gu_m,
+            geo().hid,
+            GU_GB,
+            seed * 1000 + e,
+        ));
+        dn_w.extend(symmetric_weights(
+            geo().dn_m,
+            geo().mi,
+            DN_GB,
+            seed * 1000 + 600 + e,
+        ));
     }
     let (gu_t, dn_t) = if host {
         (
@@ -1779,23 +2020,23 @@ fn rows_mode(mut gpu: Gpu, args: &[String], host: bool, seed: u64) -> Res<()> {
         )
     };
     drop((gu_w, dn_w));
-    let l_max = tmax * TOPK;
-    let pmax_max = (l_max + E * 15).div_ceil(16) * 16;
+    let l_max = tmax * geo().topk;
+    let pmax_max = (l_max + geo().e * 15).div_ceil(16) * 16;
     let bufs = RowBufs {
-        gu_ptrs: gpu.upload_raw(&ptr_table(&gu_t, GU_STRIDE, distinct), &[E * 8])?,
-        dn_ptrs: gpu.upload_raw(&ptr_table(&dn_t, DN_STRIDE, distinct), &[E * 8])?,
+        gu_ptrs: gpu.upload_raw(&ptr_table(&gu_t, geo().gu_stride, distinct), &[geo().e * 8])?,
+        dn_ptrs: gpu.upload_raw(&ptr_table(&dn_t, geo().dn_stride, distinct), &[geo().e * 8])?,
         topk: alloc(&mut gpu, l_max * 4)?,
         wts: alloc(&mut gpu, l_max * 4)?,
-        x: alloc(&mut gpu, tmax * HID * 4)?,
-        counts: alloc(&mut gpu, E * 4)?,
-        offsets: alloc(&mut gpu, (E + 1) * 4)?,
+        x: alloc(&mut gpu, tmax * geo().hid * 4)?,
+        counts: alloc(&mut gpu, geo().e * 4)?,
+        offsets: alloc(&mut gpu, (geo().e + 1) * 4)?,
         sorted: alloc(&mut gpu, pmax_max * 4)?,
         tiles: alloc(&mut gpu, pmax_max / 16 * 4)?,
         inverse: alloc(&mut gpu, l_max * 4)?,
-        ygu: alloc(&mut gpu, pmax_max * MI * 2 + GUARD)?,
-        ydn: alloc(&mut gpu, pmax_max * DN_M * 2 + GUARD)?,
-        order: alloc(&mut gpu, tmax * TOPK * 8)?,
-        out: alloc(&mut gpu, tmax * HID * 4)?,
+        ygu: alloc(&mut gpu, pmax_max * geo().mi * 2 + GUARD)?,
+        ydn: alloc(&mut gpu, pmax_max * geo().dn_m * 2 + GUARD)?,
+        order: alloc(&mut gpu, tmax * geo().topk * 8)?,
+        out: alloc(&mut gpu, tmax * geo().hid * 4)?,
     };
     let base = row_pool(seed, 0, ref_t);
     let fill = row_pool(seed, ROWS_FILLER_BASE, omax);
@@ -1829,7 +2070,7 @@ fn rows_mode(mut gpu: Gpu, args: &[String], host: bool, seed: u64) -> Res<()> {
             })
         );
         if let Some(p) = &prev_ref {
-            let d = rows_diff(&rf.out, p, HID * 4, 4);
+            let d = rows_diff(&rf.out, p, geo().hid * 4, 4);
             runs += 1;
             fails += usize::from(d.is_some());
             println!(
@@ -1850,23 +2091,24 @@ fn rows_mode(mut gpu: Gpu, args: &[String], host: bool, seed: u64) -> Res<()> {
                 }
                 let run = rows_run(&mut gpu, &bufs, &base, &fill, o, t0, host, diag)?;
                 runs += 1;
-                let d = rows_diff(&run.out, &rf.out[..t0 * HID * 4], HID * 4, 4);
+                let d = rows_diff(&run.out, &rf.out[..t0 * geo().hid * 4], geo().hid * 4, 4);
                 let mut stage = serde_json::Value::Null;
                 let mut stage_diff = serde_json::Value::Null;
                 if d.is_some() {
                     if let (Some((gy, dy)), Some((rg, rd))) = (&run.slots, &rf.slots) {
-                        let n = t0 * TOPK;
-                        let hit = rows_diff(gy, &rg[..n * MI * 2], MI * 2, 2)
+                        let n = t0 * geo().topk;
+                        let hit = rows_diff(gy, &rg[..n * geo().mi * 2], geo().mi * 2, 2)
                             .map(|x| ("gate_up_silu", x))
                             .or_else(|| {
-                                rows_diff(dy, &rd[..n * DN_M * 2], DN_M * 2, 2).map(|x| ("down", x))
+                                rows_diff(dy, &rd[..n * geo().dn_m * 2], geo().dn_m * 2, 2)
+                                    .map(|x| ("down", x))
                             })
                             .or(Some(("combine", (0, serde_json::Value::Null))));
                         if let Some((name, (row, mut v))) = hit {
                             stage = serde_json::json!(name);
                             if name != "combine" {
-                                v["token"] = serde_json::json!(row / TOPK);
-                                v["rank"] = serde_json::json!(row % TOPK);
+                                v["token"] = serde_json::json!(row / geo().topk);
+                                v["rank"] = serde_json::json!(row % geo().topk);
                                 stage_diff = v;
                             }
                         }
@@ -1877,8 +2119,9 @@ fn rows_mode(mut gpu: Gpu, args: &[String], host: bool, seed: u64) -> Res<()> {
                     let first = d.as_ref().map(|(tok, v)| {
                         let mut v = v.clone();
                         v["token"] = serde_json::json!(tok);
-                        v["experts"] =
-                            serde_json::json!(base.topk[tok * TOPK..(tok + 1) * TOPK].to_vec());
+                        v["experts"] = serde_json::json!(base.topk
+                            [tok * geo().topk..(tok + 1) * geo().topk]
+                            .to_vec());
                         v
                     });
                     println!(
@@ -1931,6 +2174,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "host" => true,
         other => return Err(format!("--residency {other}: expected vram or host").into()),
     };
+    let geometry = arg(&args, "--geometry", "fn");
+    let selected = match geometry.as_str() {
+        "fn" => GEO_FN,
+        "a3b" => GEO_A3B,
+        other => return Err(format!("--geometry {other}: expected fn or a3b").into()),
+    };
+    GEO.set(selected).map_err(|_| "geometry selected twice")?;
 
     let mut gpu = Gpu::init()?;
     if !matches!(gpu.arch.as_str(), "gfx1151" | "gfx1201") {
@@ -1941,6 +2191,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
     if mode == "rows" {
+        if geo().name != "fn" {
+            return Err("--mode rows is --geometry fn only (top-10 BF16 combine)".into());
+        }
         return rows_mode(gpu, &args, host, seed);
     }
     load_oracle(&mut gpu)?;
@@ -1948,6 +2201,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let q = |s: &str| format!("\"{s}\"");
     out.insert("arch".into(), q(&gpu.arch));
     out.insert("mode".into(), q(&mode));
+    if geo().name != "fn" {
+        out.insert("geometry".into(), q(geo().name));
+        out.insert(
+            "geometry_experts_topk_hidden_inter".into(),
+            format!("[{},{},{},{}]", geo().e, geo().topk, geo().hid, geo().mi),
+        );
+    }
     out.insert("seed".into(), seed.to_string());
     out.insert("hipcc_extra_flags".into(), q(&gpu.flags.hipcc_extra_flags));
     out.insert(
@@ -1969,9 +2229,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if mode == "sweep" {
         // (a) weight one-hot through the whole production envelope.
         let (gu_w, dn_w, topk) = weight_sweep(seed);
-        let t = topk.len() / TOPK;
+        let t = topk.len() / geo().topk;
         let mut r = Rng(seed ^ 0x77);
-        let x: Vec<f32> = (0..t * HID).map(|_| (r.unit() - 0.5) * 4.0).collect();
+        let x: Vec<f32> = (0..t * geo().hid).map(|_| (r.unit() - 0.5) * 4.0).collect();
         let c = make_case(&mut gpu, topk, &x, gu_w, dn_w, host)?;
         let (gok, dok) = header_checks(&mut gpu, &c)?;
         poison(&gpu, &c, 0x7B)?;
@@ -1980,14 +2240,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let g = cpu_group(&c.topk_host, c.pmax);
         let (ygu, ydn) = outputs(&gpu, &c)?;
         let (xqg, xqd) = sidecars(&gpu, &c)?;
-        let used = g.offsets[E] as usize / 16;
+        let used = g.offsets[geo().e] as usize / 16;
         let all: Vec<usize> = (0..used).collect();
         let (gm, dm, pb) = fold_check(&mut gpu, &c, &g, &all, &xqg, &xqd, &ygu, &ydn)?;
         out.insert(
             "weight_onehot_probes_gate_up".into(),
-            (HID * 16).to_string(),
+            (geo().hid * 16).to_string(),
         );
-        out.insert("weight_onehot_probes_down".into(), (MI * 16).to_string());
+        out.insert(
+            "weight_onehot_probes_down".into(),
+            (geo().mi * 16).to_string(),
+        );
         out.insert("weight_onehot_tiles_checked".into(), used.to_string());
         out.insert(
             "weight_onehot_headers_symmetric".into(),
@@ -2020,19 +2283,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let topk = routing(&rkind, tokens, seed)?;
         let x: Vec<f32> = if xfile.is_empty() {
             let mut r = Rng(seed ^ 0x77);
-            (0..tokens * HID).map(|_| (r.unit() - 0.5) * 4.0).collect()
+            (0..tokens * geo().hid)
+                .map(|_| (r.unit() - 0.5) * 4.0)
+                .collect()
         } else {
             let b = std::fs::read(&xfile)?;
             b.chunks_exact(2)
-                .take(tokens * HID)
+                .take(tokens * geo().hid)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect()
         };
-        let mut gu_w = Vec::with_capacity(E * GU_STRIDE);
-        let mut dn_w = Vec::with_capacity(E * DN_STRIDE);
-        for e in 0..E as u64 {
-            gu_w.extend(symmetric_weights(GU_M, HID, GU_GB, seed * 1000 + e));
-            dn_w.extend(symmetric_weights(DN_M, MI, DN_GB, seed * 1000 + 600 + e));
+        let mut gu_w = Vec::with_capacity(geo().e * geo().gu_stride);
+        let mut dn_w = Vec::with_capacity(geo().e * geo().dn_stride);
+        for e in 0..geo().e as u64 {
+            gu_w.extend(symmetric_weights(
+                geo().gu_m,
+                geo().hid,
+                GU_GB,
+                seed * 1000 + e,
+            ));
+            dn_w.extend(symmetric_weights(
+                geo().dn_m,
+                geo().mi,
+                DN_GB,
+                seed * 1000 + 600 + e,
+            ));
         }
         out.insert("routing".into(), q(&rkind));
         out.insert("md5_routing".into(), q(&md5_hex(&i32_bytes(&topk))));
@@ -2045,12 +2320,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         out.insert("md5_gu_w".into(), q(&md5_hex(&gu_w)));
         out.insert("md5_dn_w".into(), q(&md5_hex(&dn_w)));
         let c = make_case(&mut gpu, topk, &x, gu_w, dn_w, host)?;
-        inc_setup(&mut gpu, &c)?;
+        if geo().name == "fn" {
+            inc_setup(&mut gpu, &c)?;
+        }
         let g = cpu_group(&c.topk_host, c.pmax);
-        let used = g.offsets[E] as usize / 16;
+        let used = g.offsets[geo().e] as usize / 16;
         out.insert("tokens".into(), c.t.to_string());
         out.insert("slots_L".into(), c.l.to_string());
-        out.insert("padded_P".into(), g.offsets[E].to_string());
+        out.insert("padded_P".into(), g.offsets[geo().e].to_string());
         out.insert(
             "active_experts".into(),
             g.counts.iter().filter(|&&n| n > 0).count().to_string(),
@@ -2066,12 +2343,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // dword): a one-ulp zp flip in QT44 (second half) and QT53, and a
             // QT53 zero-scale group with a nonzero zero point.
             for (name, tsr, off) in [
-                ("qt44_zp_ulp", &c.gu_t, 7 * GU_STRIDE + 3 * GU_GB + 4),
-                ("qt53_zp_ulp", &c.dn_t, 300 * DN_STRIDE + 11 * DN_GB),
+                ("qt44_zp_ulp", &c.gu_t, 7 * geo().gu_stride + 3 * GU_GB + 4),
+                (
+                    "qt53_zp_ulp",
+                    &c.dn_t,
+                    (300 % geo().e) * geo().dn_stride + 11 * DN_GB,
+                ),
                 (
                     "qt53_zero_scale_nonzero_zp",
                     &c.dn_t,
-                    511 * DN_STRIDE + 2559 * 5 * DN_GB,
+                    (geo().e - 1) * geo().dn_stride + (geo().dn_m - 1) * (geo().mi / 128) * DN_GB,
                 ),
             ] {
                 let orig = download(&gpu, &tsr.buf, off + 4)?;
@@ -2103,8 +2384,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let grp_ok = to_i32(&download(&gpu, &c.sorted.buf, c.pmax * 4)?) == g.sorted
                 && to_i32(&download(&gpu, &c.tiles.buf, c.pmax / 16 * 4)?) == g.tiles
                 && to_i32(&download(&gpu, &c.inverse.buf, c.l * 4)?) == g.inverse
-                && to_i32(&download(&gpu, &c.counts.buf, E * 4)?) == g.counts
-                && to_i32(&download(&gpu, &c.offsets.buf, (E + 1) * 4)?) == g.offsets;
+                && to_i32(&download(&gpu, &c.counts.buf, geo().e * 4)?) == g.counts
+                && to_i32(&download(&gpu, &c.offsets.buf, (geo().e + 1) * 4)?) == g.offsets;
             out.insert("group_matches_cpu_stable".into(), grp_ok.to_string());
             if !grp_ok {
                 fails.push("grouping mismatch".into());
@@ -2114,21 +2395,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut poison_bad = 0usize;
             for tile in 0..c.pmax / 16 {
                 if g.tiles[tile] < 0 {
-                    poison_bad += ygu[tile * 16 * MI * 2..(tile + 1) * 16 * MI * 2]
+                    poison_bad += ygu[tile * 16 * geo().mi * 2..(tile + 1) * 16 * geo().mi * 2]
                         .iter()
                         .filter(|&&x| x != 0x7B)
                         .count();
-                    poison_bad += ydn[tile * 16 * DN_M * 2..(tile + 1) * 16 * DN_M * 2]
+                    poison_bad += ydn[tile * 16 * geo().dn_m * 2..(tile + 1) * 16 * geo().dn_m * 2]
                         .iter()
                         .filter(|&&x| x != 0x7B)
                         .count();
                 }
             }
-            poison_bad += ygu[c.pmax * MI * 2..]
+            poison_bad += ygu[c.pmax * geo().mi * 2..]
                 .iter()
                 .filter(|&&x| x != 0x7B)
                 .count();
-            poison_bad += ydn[c.pmax * DN_M * 2..]
+            poison_bad += ydn[c.pmax * geo().dn_m * 2..]
                 .iter()
                 .filter(|&&x| x != 0x7B)
                 .count();
@@ -2154,6 +2435,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             out.insert("anchor_byte_mismatch_gate_up_down".into(), anchor_json(&am));
             if anchor_total(&am) != 0 {
                 fails.push("candidate GEMMs differ from an anchor".into());
+            }
+            if geo().name == "a3b" {
+                let key = "pm_combine_vs_hip_byte_mismatch_natural_unrouted";
+                if gpu.arch == "gfx1201" {
+                    let mis = combine_mismatch(&mut gpu, &c, seed)?;
+                    out.insert(key.into(), format!("[{},{}]", mis[0], mis[1]));
+                    if mis[0] + mis[1] != 0 {
+                        fails.push("PM combine differs from HIP combine".into());
+                    }
+                } else {
+                    out.insert(key.into(), q("skipped_not_gfx1201"));
+                }
             }
             let h_eager = md5_hex(&live_bytes(&g, &ygu, &ydn));
             out.insert("hash_live".into(), q(&h_eager));
@@ -2198,8 +2491,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let distinct = |pool: &dyn Fn(&mut Rng) -> i32, r: &mut Rng| -> Vec<i32> {
                     let mut v = Vec::with_capacity(c.l);
                     for _ in 0..c.t {
-                        let mut row: Vec<i32> = Vec::with_capacity(TOPK);
-                        while row.len() < TOPK {
+                        let mut row: Vec<i32> = Vec::with_capacity(geo().topk);
+                        while row.len() < geo().topk {
                             let e = pool(r);
                             if !row.contains(&e) {
                                 row.push(e);
@@ -2209,22 +2502,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     v
                 };
-                let uniform = distinct(&|r: &mut Rng| r.below(E as u64) as i32, &mut r);
+                let uniform = distinct(&|r: &mut Rng| r.below(geo().e as u64) as i32, &mut r);
                 // Skewed: experts 0..15 drawn 8x as often as the rest.
                 let skewed = distinct(
                     &|r: &mut Rng| {
                         if r.below(2) == 0 {
                             r.below(16) as i32
                         } else {
-                            r.below(E as u64) as i32
+                            r.below(geo().e as u64) as i32
                         }
                     },
                     &mut r,
                 );
                 // Empty experts: 64..512 only, so experts 0..63 receive no slot.
-                let sparse = distinct(&|r: &mut Rng| 64 + r.below((E - 64) as u64) as i32, &mut r);
+                let sparse = distinct(
+                    &|r: &mut Rng| 64 + r.below((geo().e - 64) as u64) as i32,
+                    &mut r,
+                );
                 let newx = |scale: f32, r: &mut Rng| -> Vec<f32> {
-                    (0..c.t * HID).map(|_| (r.unit() - 0.5) * scale).collect()
+                    (0..c.t * geo().hid)
+                        .map(|_| (r.unit() - 0.5) * scale)
+                        .collect()
                 };
                 let (x1, x2, x3) = (newx(3.0, &mut r), newx(9.0, &mut r), newx(0.5, &mut r));
                 rounds.push(("uniform", uniform, x1));
@@ -2237,8 +2535,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         (&c.sorted, c.pmax * 4),
                         (&c.tiles, c.pmax / 16 * 4),
                         (&c.inverse, c.l * 4),
-                        (&c.counts, E * 4),
-                        (&c.offsets, (E + 1) * 4),
+                        (&c.counts, geo().e * 4),
+                        (&c.offsets, (geo().e + 1) * 4),
                     ] {
                         gpu.hip.memset(&t.buf, v, n)?;
                     }
@@ -2247,13 +2545,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .int4_mmq_x_scratch
                         .as_ref()
                         .ok_or("no gate sidecar")?;
-                    gpu.hip.memset(gs, v, (HID / 128) * c.t * BLK)?;
+                    gpu.hip.memset(gs, v, (geo().hid / 128) * c.t * BLK)?;
                     let ds = gpu
                         .scratch
                         .qwen4_moe_down_i4_scratch
                         .as_ref()
                         .ok_or("no down sidecar")?;
-                    gpu.hip.memset(ds, v, (MI / 128) * c.l * BLK)?;
+                    gpu.hip.memset(ds, v, (geo().mi / 128) * c.l * BLK)?;
                     gpu.hip.device_synchronize()?;
                     Ok(())
                 };
@@ -2266,8 +2564,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ("sorted", download(gpu, &c.sorted.buf, c.pmax * 4)?),
                         ("tiles", download(gpu, &c.tiles.buf, c.pmax / 16 * 4)?),
                         ("inverse", download(gpu, &c.inverse.buf, c.l * 4)?),
-                        ("counts", download(gpu, &c.counts.buf, E * 4)?),
-                        ("offsets", download(gpu, &c.offsets.buf, (E + 1) * 4)?),
+                        ("counts", download(gpu, &c.counts.buf, geo().e * 4)?),
+                        ("offsets", download(gpu, &c.offsets.buf, (geo().e + 1) * 4)?),
                         ("gate_sidecar", xg),
                         ("down_sidecar", xd),
                     ])
@@ -2303,7 +2601,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         && to_i32(&replay[4].1) == gr.inverse
                         && to_i32(&replay[5].1) == gr.counts
                         && to_i32(&replay[6].1) == gr.offsets;
-                    let used = gr.offsets[E] as usize / 16;
+                    let used = gr.offsets[geo().e] as usize / 16;
                     let (gm, dm, pb) = fold_check(
                         &mut gpu,
                         &c,
@@ -2328,7 +2626,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     round_reports.push(format!(
                         "{{\"round\":\"{name}\",\"empty_experts\":{empty},\"padded_P\":{},\"replay_vs_eager_mismatch\":{{{}}},\"replay_group_matches_cpu\":{grp_ok},\"replay_fold_mismatch\":[{gm},{dm},{pb}],\"eager_vs_anchor_byte_mismatch\":{},\"live_hash\":\"{hash}\",\"changed_vs_previous_round\":{changed},\"pass\":{ok}}}",
-                        gr.offsets[E],
+                        gr.offsets[geo().e],
                         mism.join(","),
                         anchor_json(&am)
                     ));
@@ -2341,31 +2639,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Stale prepared handles must be refused once the producer
                 // generation advances, never silently consumed.
-                let stale_gate = gpu.qwen4_moe_rotate256_i4(&c.x_in, HID, c.t)?;
-                let _fresh_gate = gpu.qwen4_moe_rotate256_i4(&c.x_in, HID, c.t)?;
+                let stale_gate = gpu.qwen4_moe_rotate256_i4(&c.x_in, geo().hid, c.t)?;
+                let _fresh_gate = gpu.qwen4_moe_rotate256_i4(&c.x_in, geo().hid, c.t)?;
                 let gate_err = gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
                     &c.gu_ptrs,
                     &c.tiles,
                     &c.sorted,
                     &stale_gate,
                     &c.ygu,
-                    GU_M,
-                    HID,
-                    TOPK,
+                    geo().gu_m,
+                    geo().hid,
+                    geo().topk,
                     c.pmax,
                     c.t,
                     c.host,
                 );
-                let stale_down = gpu.qwen4_moe_rotate128_i4(&c.ygu, &c.sorted, MI, c.pmax, c.l)?;
-                let fresh_down = gpu.qwen4_moe_rotate128_i4(&c.ygu, &c.sorted, MI, c.pmax, c.l)?;
+                let stale_down =
+                    gpu.qwen4_moe_rotate128_i4(&c.ygu, &c.sorted, geo().mi, c.pmax, c.l)?;
+                let fresh_down =
+                    gpu.qwen4_moe_rotate128_i4(&c.ygu, &c.sorted, geo().mi, c.pmax, c.l)?;
                 let down_err = gpu.gemm_qwen4_moe_down_iu4_sym(
                     &c.dn_ptrs,
                     &c.tiles,
                     &c.sorted,
                     &stale_down,
                     &c.ydn,
-                    DN_M,
-                    MI,
+                    geo().dn_m,
+                    geo().mi,
                     1,
                     c.pmax,
                     c.l,
@@ -2378,9 +2678,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &c.sorted,
                     &fresh_down,
                     &c.ygu,
-                    GU_M,
-                    HID,
-                    TOPK,
+                    geo().gu_m,
+                    geo().hid,
+                    geo().topk,
                     c.pmax,
                     c.t,
                     c.host,
@@ -2397,43 +2697,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     fails.push("stale or mismatched IU4 handle accepted".into());
                 }
             }
-            // General-input delta vs the incumbent (informative only).
-            let mut h = Handles::default();
-            for s in 0..5 {
-                inc_stage(&mut gpu, &c, &mut h, s)?;
-            }
-            gpu.hip.device_synchronize()?;
-            let isorted = to_i32(&download(&gpu, &c.i_sorted.buf, c.pmax * 4)?);
-            // gfx1151's WMMA down stores BF16 rows, gfx1201's SIMT down F32.
-            let f32_rows = gpu.arch == "gfx1201";
-            let ydi = download(&gpu, &c.i_ydn.buf, c.pmax * DN_M * 4)?;
-            let (mut num, mut den) = (0f64, 0f64);
-            for (pi, &s) in isorted.iter().enumerate() {
-                if s < 0 {
-                    continue;
+            // General-input delta vs the incumbent (informative only; the
+            // incumbent envelope is the shipped fn route, so a3b skips it).
+            if geo().name == "fn" {
+                let mut h = Handles::default();
+                for s in 0..5 {
+                    inc_stage(&mut gpu, &c, &mut h, s)?;
                 }
-                let pc = g.inverse[s as usize] as usize;
-                for col in (0..DN_M).step_by(7) {
-                    let i = pi * DN_M + col;
-                    let inc = if f32_rows {
-                        f32::from_le_bytes(ydi[4 * i..4 * i + 4].try_into().unwrap()) as f64
-                    } else {
-                        f32::from_bits(
-                            (u16::from_le_bytes([ydi[2 * i], ydi[2 * i + 1]]) as u32) << 16,
-                        ) as f64
-                    };
-                    let o = (pc * DN_M + col) * 2;
-                    let cand =
-                        f32::from_bits((u16::from_le_bytes([ydn[o], ydn[o + 1]]) as u32) << 16)
-                            as f64;
-                    num += (cand - inc) * (cand - inc);
-                    den += inc * inc;
+                gpu.hip.device_synchronize()?;
+                let isorted = to_i32(&download(&gpu, &c.i_sorted.buf, c.pmax * 4)?);
+                // gfx1151's WMMA down stores BF16 rows, gfx1201's SIMT down F32.
+                let f32_rows = gpu.arch == "gfx1201";
+                let ydi = download(&gpu, &c.i_ydn.buf, c.pmax * geo().dn_m * 4)?;
+                let (mut num, mut den) = (0f64, 0f64);
+                for (pi, &s) in isorted.iter().enumerate() {
+                    if s < 0 {
+                        continue;
+                    }
+                    let pc = g.inverse[s as usize] as usize;
+                    for col in (0..geo().dn_m).step_by(7) {
+                        let i = pi * geo().dn_m + col;
+                        let inc = if f32_rows {
+                            f32::from_le_bytes(ydi[4 * i..4 * i + 4].try_into().unwrap()) as f64
+                        } else {
+                            f32::from_bits(
+                                (u16::from_le_bytes([ydi[2 * i], ydi[2 * i + 1]]) as u32) << 16,
+                            ) as f64
+                        };
+                        let o = (pc * geo().dn_m + col) * 2;
+                        let cand =
+                            f32::from_bits((u16::from_le_bytes([ydn[o], ydn[o + 1]]) as u32) << 16)
+                                as f64;
+                        num += (cand - inc) * (cand - inc);
+                        den += inc * inc;
+                    }
                 }
+                out.insert(
+                    "down_vs_incumbent_rel_rms_informative".into(),
+                    format!("{:.6e}", (num / den.max(1e-30)).sqrt()),
+                );
+            } else {
+                out.insert(
+                    "down_vs_incumbent_rel_rms_informative".into(),
+                    q("n/a_fn_only"),
+                );
             }
-            out.insert(
-                "down_vs_incumbent_rel_rms_informative".into(),
-                format!("{:.6e}", (num / den.max(1e-30)).sqrt()),
-            );
         }
 
         if mode == "stress" {
@@ -2465,10 +2773,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // NT4; gfx1201: the other tile width). Two warm passes each, then
             // a palindromic order per iteration (ABC, CBA, ...) so drift
             // charges every arm alike.
-            let mut arms: Vec<(&str, Stage, Option<Entry>)> = vec![
-                ("incumbent", inc_stage, None),
-                ("candidate", cand_stage, None),
-            ];
+            let mut arms: Vec<(&str, Stage, Option<Entry>)> = Vec::new();
+            if geo().name == "fn" {
+                arms.push(("incumbent", inc_stage, None));
+            }
+            arms.push(("candidate", cand_stage, None));
             for &e in anchors.iter().filter(|e| e.gu_block == 128) {
                 arms.push((e.name, anchor_stage, Some(e)));
             }

@@ -48,6 +48,7 @@ pub mod kernels {
     pub mod iu4_v2b;
     pub mod iu4_v2b_a4;
     pub mod iu4_v2c;
+    pub mod moe_slot_ops;
     pub mod mq4_fp8_verify;
     pub mod mq4_rows_x4;
     pub mod mq4_verify;

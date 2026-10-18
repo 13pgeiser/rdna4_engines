@@ -457,4 +457,21 @@ mod tests {
         assert!(key_matches(key, "hipfire_qwen4"));
         assert!(!key_matches(key, "kv_cache"));
     }
+
+    #[test]
+    fn moe_sym_iu4_is_an_uncurated_advanced_developer_key_with_its_own_env_name() {
+        // Default-OFF opt-in route: not a curated Quality row, never aliased to the
+        // Flash-Next key.
+        let key = "developer.moe_sym_iu4";
+        assert_eq!(intent_of(key), Intent::Advanced);
+        for intent in Intent::ALL {
+            assert!(!intent.curated().contains(&key), "{intent:?}");
+        }
+        assert!(key_matches(key, "HIPFIRE_MOE_SYM_IU4"));
+        assert!(key_matches(key, "moe_sym_iu4"));
+        assert!(!key_matches(
+            "developer.qwen4_moe_sym_iu4",
+            "HIPFIRE_MOE_SYM_IU4"
+        ));
+    }
 }

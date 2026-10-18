@@ -81,6 +81,227 @@ fn row_repeat_shapes_are_validated() {
     }
 }
 
+fn geometry(
+    experts: u32,
+    top_k: u32,
+    hidden: u32,
+    intermediate: u32,
+) -> qwen4_moe_sym::ExpertGeometry {
+    qwen4_moe_sym::ExpertGeometry {
+        experts,
+        top_k,
+        hidden,
+        intermediate,
+    }
+}
+
+/// GU `M = 2I, K = H, epochs = H/128, x_row_div = top_k`; down `M = H, K = I, epochs = I/128` (slot rows).
+#[test]
+fn geometry_plan_derives_gate_up_and_down_shapes() {
+    let mq4 = qwen4_moe_sym::WeightCodec::Mq4Sym;
+    // (experts, top_k, H, I, GU epochs, down epochs)
+    for (e, t, h, i, gu_epochs, down_epochs) in
+        [(512, 10, 2560, 640, 20, 5), (256, 8, 2048, 512, 16, 4)]
+    {
+        for arch in ARCHES {
+            let plan = geometry(e, t, h, i).plan(arch, mq4).unwrap();
+            assert_eq!(
+                (plan.arch, plan.codec, plan.geometry),
+                (arch, mq4, geometry(e, t, h, i))
+            );
+            assert_eq!(plan.tile_widths, qwen4_moe_sym::tile_widths(arch));
+            assert_eq!(plan.descriptor_table_bytes, e * 8);
+            let (gu, down) = (plan.gate_up, plan.down);
+            assert_eq!(
+                (gu.kind, gu.m, gu.k, gu.epochs, gu.x_row_div, gu.grid_x),
+                (Kind::GateUp, 2 * i, h, gu_epochs, t, 2 * i / 64)
+            );
+            assert_eq!(
+                (
+                    down.kind,
+                    down.m,
+                    down.k,
+                    down.epochs,
+                    down.x_row_div,
+                    down.grid_x
+                ),
+                (Kind::Down, h, i, down_epochs, 1, h / 64)
+            );
+            assert_eq!(
+                (gu.row_bytes, down.row_bytes),
+                (gu_epochs * 68, down_epochs * 68)
+            );
+            for &nt in plan.tile_widths {
+                for kind in Kind::ALL {
+                    assert_eq!(
+                        plan.spec(kind, nt).unwrap(),
+                        Spec {
+                            arch,
+                            kind,
+                            nt,
+                            rr: 1,
+                            codec: mq4
+                        }
+                    );
+                }
+            }
+            assert!(plan.spec(Kind::Down, 2).is_err());
+        }
+    }
+    // The down tail is odd exactly when I/128 is odd.
+    assert_eq!(
+        geometry(512, 10, 2560, 640)
+            .plan(Arch::Gfx1201, mq4)
+            .unwrap()
+            .down
+            .epochs
+            % 2,
+        1
+    );
+    assert_eq!(
+        geometry(256, 8, 2048, 512)
+            .plan(Arch::Gfx1201, mq4)
+            .unwrap()
+            .down
+            .epochs
+            % 2,
+        0
+    );
+}
+
+#[test]
+fn geometry_plan_refuses_invalid_shapes() {
+    let mq4 = qwen4_moe_sym::WeightCodec::Mq4Sym;
+    let bad = |g: qwen4_moe_sym::ExpertGeometry, what: &str| {
+        for arch in ARCHES {
+            assert!(g.plan(arch, mq4).is_err(), "{what}: {g:?} {arch:?}");
+        }
+    };
+    let ok = geometry(256, 8, 2048, 512);
+    // Gate/up K = H % 256 (128 is a multiple of the down K step only).
+    bad(geometry(256, 8, 128, 512), "H % 256");
+    bad(geometry(256, 8, 2048 + 128, 512), "H % 256");
+    bad(geometry(256, 8, 0, 512), "H == 0");
+    // Down K = I % 128 and M = H % 64; gate/up M = 2I % 64.
+    bad(geometry(256, 8, 2048, 64), "I % 128");
+    bad(geometry(256, 8, 2048, 512 + 32), "I % 128");
+    bad(geometry(256, 8, 2048, 0), "I == 0");
+    bad(geometry(256, 8, 2048, u32::MAX / 2 + 1), "2I overflows u32");
+    // top_k 1..=16.
+    bad(geometry(256, 0, 2048, 512), "top_k 0");
+    bad(geometry(256, 17, 2048, 512), "top_k 17");
+    for top_k in [1, 16] {
+        for arch in ARCHES {
+            assert_eq!(
+                geometry(256, top_k, 2048, 512)
+                    .plan(arch, mq4)
+                    .unwrap()
+                    .gate_up
+                    .x_row_div,
+                top_k
+            );
+        }
+    }
+    // experts >= 1 and the descriptor table (experts * 8 bytes) fits u32.
+    bad(geometry(0, 8, 2048, 512), "experts 0");
+    bad(geometry(u32::MAX / 8 + 1, 8, 2048, 512), "descriptor table");
+    for arch in ARCHES {
+        assert!(geometry(u32::MAX / 8, 8, 2048, 512).plan(arch, mq4).is_ok());
+        assert!(geometry(1, 1, 2048, 512).plan(arch, mq4).is_ok());
+    }
+    // The 32-bit row arithmetic of the kernel: 24-bit row bytes, 32-bit expert weight row base.
+    bad(geometry(256, 8, 128 * 250_000, 512), "row bytes >= 2^24");
+    bad(
+        geometry(256, 8, 2048, 128 * 100_000),
+        "expert matrix bytes >= 2^32",
+    );
+    // Only the certified MQ4 objects on gfx1151/gfx1201.
+    for arch in [Arch::Gfx1100, Arch::Gfx942] {
+        assert!(ok.plan(arch, mq4).is_err(), "{arch:?}");
+    }
+    for codec in [
+        qwen4_moe_sym::WeightCodec::Mq3I4,
+        qwen4_moe_sym::WeightCodec::E8pI4,
+    ] {
+        for arch in ARCHES {
+            assert!(ok.plan(arch, codec).is_err(), "{codec:?} {arch:?}");
+        }
+    }
+}
+
+/// Every planned entry (NT1/NT4 gfx1151, NT1/NT4/NT8 gfx1201) reads `K` and `n_experts` from the kernarg at run time
+/// (so one object serves every planned `H`/`I`/expert count), exits on an out-of-range expert id before the
+/// pointer-table load, derives its row bytes and trips from the runtime `K`, and only the down entry has the odd
+/// K128 epoch tail.
+#[test]
+fn planned_entries_take_k_and_experts_at_run_time_and_down_has_the_odd_tail() {
+    let plan = |arch| {
+        geometry(256, 8, 2048, 512)
+            .plan(arch, qwen4_moe_sym::WeightCodec::Mq4Sym)
+            .unwrap()
+    };
+    for arch in ARCHES {
+        let plan = plan(arch);
+        let mut census = Vec::new();
+        for &nt in plan.tile_widths {
+            for kind in Kind::ALL {
+                let spec = plan.spec(kind, nt).unwrap();
+                let text = qwen4_moe_sym::emit(spec).unwrap().s_text;
+                let has = |needle: &str| text.contains(needle);
+                // Runtime kernarg K (+ M) and the expert-count guard.
+                assert!(
+                    has("s_load_b64 s[18:19], s[0:1], 0x28"),
+                    "{spec:?}: M/K kernarg"
+                );
+                assert!(
+                    has("s_load_b32 s5, s[0:1], 0x3c"),
+                    "{spec:?}: n_experts kernarg"
+                );
+                assert!(
+                    has("s_cmp_ge_u32 s23, s5"),
+                    "{spec:?}: unsigned expert id guard"
+                );
+                // Trips = (K/128 - 1) / 2 from the runtime K.
+                assert!(
+                    has("s_lshr_b32 s44, s19, 7") && has("s_lshr_b32 s44, s44, 1"),
+                    "{spec:?}: trips"
+                );
+                let odd_tail = has("s_bitcmp1_b32 s19, 7");
+                match kind {
+                    Kind::GateUp => {
+                        assert!(
+                            has("s_lshr_b32 s46, s19, 8") && has("s_mulk_i32 s46, 0x88"),
+                            "{spec:?}: QT44 row bytes"
+                        );
+                        assert!(
+                            !odd_tail && !has("tail_odd"),
+                            "{spec:?}: gate/up K % 256 == 0 has no odd tail"
+                        );
+                    }
+                    Kind::Down => {
+                        assert!(
+                            has("s_lshr_b32 s46, s19, 7") && has("s_mulk_i32 s46, 0x44"),
+                            "{spec:?}: QT53 row bytes"
+                        );
+                        assert!(odd_tail && has("tail_odd"), "{spec:?}: down odd epoch tail");
+                    }
+                }
+                census.push((nt, kind));
+            }
+        }
+        let nts: Vec<u8> = census.iter().step_by(2).map(|c| c.0).collect();
+        assert_eq!(
+            nts,
+            if arch == Arch::Gfx1201 {
+                vec![1, 4, 8]
+            } else {
+                vec![1, 4]
+            },
+            "{arch:?}"
+        );
+    }
+}
+
 /// The runtime embeds one certified module per arch: it must be exactly
 /// what the builder emits today.
 #[test]

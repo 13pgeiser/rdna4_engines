@@ -10197,6 +10197,12 @@ pub const EP_TILE_PULL_N8_PM_GFX1201: &[u8] =
 pub const EP_TILE_PULL_N8_PM_GFX1100: &[u8] =
     include_bytes!("../../../kernels/ep_gather_grouped_rows_by_tile_owner_n8_pm_gfx1100.hxaco");
 
+/// Certified PeaceMaker ordered BF16 grouped expert combine twin, gfx1201
+/// (`peacemaker-isa emit --kernel moe_slot_ops_pm --arch gfx1201`, 48-byte kernarg).
+/// Ascending top-k F32 FMA accumulation followed by an RN residual add; no LDS or atomics.
+pub const MOE_SLOT_OPS_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/moe_slot_ops_pm_gfx1201.hxaco");
+
 /// 2D strided F32 row copy with a `float4` fast path:
 /// `dst[r*dst_row_stride + dst_col_offset + c] = src[r*src_row_stride + c]`.
 /// Replaces the per-row `copy_d2d` loop in the FLUX.1 MMDiT single block's

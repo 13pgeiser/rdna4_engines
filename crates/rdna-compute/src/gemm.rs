@@ -48112,6 +48112,88 @@ impl Gpu {
 pub(crate) static QWEN4_MOE_SYM_IU4: LazyLock<Option<bool>> =
     LazyLock::new(|| hipfire_config::developer_typed_bool("HIPFIRE_QWEN4_MOE_SYM_IU4"));
 
+/// `HIPFIRE_MOE_SYM_IU4` (`developer.moe_sym_iu4`, a typed boolean:
+/// `true`/`false`/`1`/`0`) opts in to the symmetric IU4 grouped routed-expert
+/// prefill route for loader-verified symmetric qt44-gate_up / qt53-down MoE
+/// artifacts (A3B-class geometry). Default OFF: unset keeps the incumbent route,
+/// `true` requests the route, `false` is the kill switch. Independent of
+/// [`QWEN4_MOE_SYM_IU4`]. Read once.
+pub(crate) static MOE_SYM_IU4: LazyLock<Option<bool>> =
+    LazyLock::new(|| hipfire_config::developer_typed_bool("HIPFIRE_MOE_SYM_IU4"));
+
+/// Pure admission of [`Gpu::moe_sym_iu4_requested`]: the flag is explicitly
+/// true (unset and false are off), the global IU4 prefill switch is not
+/// explicitly off (`Some(false)`; unset and true pass), the PM arch selection
+/// holds (`arch_ok`), the frozen A4 producer candidate set holds
+/// (`producer_ok`), and the builder objects exist (`objects_ok`).
+pub(crate) fn moe_sym_iu4_admits(
+    flag: Option<bool>,
+    iu4_prefill: Option<bool>,
+    arch_ok: bool,
+    producer_ok: bool,
+    objects_ok: bool,
+) -> bool {
+    flag == Some(true) && iu4_prefill != Some(false) && arch_ok && producer_ok && objects_ok
+}
+
+#[cfg(test)]
+mod moe_sym_iu4_admits_tests {
+    use super::moe_sym_iu4_admits;
+
+    #[test]
+    fn flag_truth_table() {
+        // unset -> off (default OFF)
+        assert!(!moe_sym_iu4_admits(None, None, true, true, true));
+        // 1 -> on
+        assert!(moe_sym_iu4_admits(Some(true), None, true, true, true));
+        // 0 -> off (kill switch)
+        assert!(!moe_sym_iu4_admits(Some(false), None, true, true, true));
+    }
+
+    #[test]
+    fn explicit_global_iu4_prefill_disable_wins() {
+        assert!(!moe_sym_iu4_admits(
+            Some(true),
+            Some(false),
+            true,
+            true,
+            true
+        ));
+        // An explicit global enable, or none, does not block the route.
+        assert!(moe_sym_iu4_admits(Some(true), Some(true), true, true, true));
+        assert!(moe_sym_iu4_admits(Some(true), None, true, true, true));
+    }
+
+    #[test]
+    fn every_other_requirement_is_necessary() {
+        assert!(!moe_sym_iu4_admits(Some(true), None, false, true, true));
+        assert!(!moe_sym_iu4_admits(Some(true), None, true, false, true));
+        // missing builder objects -> off
+        assert!(!moe_sym_iu4_admits(Some(true), None, true, true, false));
+    }
+
+    #[test]
+    fn exhaustive_only_one_admitting_row() {
+        let tri = [None, Some(false), Some(true)];
+        let mut admitted = 0;
+        for flag in tri {
+            for prefill in tri {
+                for bits in 0u8..8 {
+                    let (a, p, o) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+                    if moe_sym_iu4_admits(flag, prefill, a, p, o) {
+                        admitted += 1;
+                        assert_eq!(flag, Some(true));
+                        assert_ne!(prefill, Some(false));
+                        assert!(a && p && o);
+                    }
+                }
+            }
+        }
+        // flag true x prefill {unset, true} x all three requirements.
+        assert_eq!(admitted, 2);
+    }
+}
+
 /// The route's GEMMs run from the certified builder modules
 /// (`kernels::QWEN4_MOE_IU4_SYM_PM_*`). `HIPFIRE_QWEN4_MOE_SYM_PM=0` restores
 /// the byte-identical gfx1151 hipcc entries (same-binary control); gfx1201 has
@@ -48552,6 +48634,44 @@ impl Gpu {
         self.route_rows(rows) >= QWEN4_MOE_SYM_IU4_MIN_ROWS
             && !self.qwen4_append_f16_moe_scope
             && self.qwen4_moe_sym_iu4_requested()
+    }
+
+    /// Opt-in symmetric IU4 grouped routed-expert prefill route for loader-verified
+    /// symmetric qt44-gate_up / qt53-down MoE artifacts (`HIPFIRE_MOE_SYM_IU4`).
+    /// Requested only when the flag is explicitly true (default OFF; false is the
+    /// kill switch), the global IU4 prefill switch is not explicitly off
+    /// (`HIPFIRE_IU4_PREFILL=0`), the device selects the PeaceMaker native
+    /// image (gfx1201; the gfx1151 hipcc control is not part of this route), the
+    /// frozen C2 A4 producer candidate set is in force
+    /// (`-DIU4_A4_CANDIDATES=2`, exactly as [`Self::qwen4_moe_sym_iu4_requested`]),
+    /// and the slot-ops builder object exists ([`Self::moe_slot_ops_available`]).
+    /// Independent of `HIPFIRE_QWEN4_MOE_SYM_IU4`. Row count, shape plan and
+    /// verified headers are checked separately.
+    pub fn moe_sym_iu4_requested(&self) -> bool {
+        let mut candidates = self
+            .flags
+            .hipcc_extra_flags
+            .split_whitespace()
+            .filter(|flag| flag.starts_with("-DIU4_A4_CANDIDATES="))
+            .peekable();
+        let producer_ok =
+            candidates.peek().is_some() && candidates.all(|flag| flag == "-DIU4_A4_CANDIDATES=2");
+        let arch_ok = self.qwen4_moe_sym_arch_index().is_some()
+            && qwen4_moe_sym_native_selected(self.arch.as_str(), false);
+        moe_sym_iu4_admits(
+            *MOE_SYM_IU4,
+            self.flags.iu4_prefill,
+            arch_ok,
+            producer_ok,
+            self.moe_slot_ops_available(),
+        )
+    }
+
+    /// Whether a `rows`-row prefill takes the opt-in symmetric IU4 expert route
+    /// ([`Self::moe_sym_iu4_requested`] and at least
+    /// [`QWEN4_MOE_SYM_IU4_MIN_ROWS`] routing rows).
+    pub fn moe_sym_iu4_applies(&self, rows: usize) -> bool {
+        self.route_rows(rows) >= QWEN4_MOE_SYM_IU4_MIN_ROWS && self.moe_sym_iu4_requested()
     }
 
     /// Index of this arch in the route's per-arch tables (gfx1151, gfx1201).

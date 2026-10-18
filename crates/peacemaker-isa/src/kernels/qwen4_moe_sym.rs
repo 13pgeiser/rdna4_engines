@@ -366,6 +366,178 @@ impl Spec {
     }
 }
 
+/// Routed-expert shape of one MoE layer. `hidden` is the activation width `H`
+/// (the gate/up K and the down M), `intermediate` the per-expert width `I`
+/// (the down K; the gate/up M is `2I`: gate rows then up rows).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExpertGeometry {
+    pub experts: u32,
+    pub top_k: u32,
+    pub hidden: u32,
+    pub intermediate: u32,
+}
+
+/// Largest `top_k` the plan admits (the flat slot index is `token * top_k + k`).
+pub const MAX_TOP_K: u32 = 16;
+
+/// One projection of a [`GeometryPlan`]: the kernarg `M`/`K`/`x_row_div` of its
+/// entry and the quantities derived from them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProjectionGeometry {
+    pub kind: Kind,
+    /// Kernarg `M` (gate/up: `2I`; down: `H`).
+    pub m: u32,
+    /// Kernarg `K` (gate/up: `H`; down: `I`).
+    pub k: u32,
+    /// K128 epochs per output, `k / 128` (an odd count only for the down tail).
+    pub epochs: u32,
+    /// Kernarg `x_row_div`: gate/up reads the token row `slot / top_k`, down
+    /// reads the flat slot row (`1`).
+    pub x_row_div: u32,
+    /// Grid x: `m / 64` CTAs (see [`Spec`]; the gfx1151 row repeats are not planned).
+    pub grid_x: u32,
+    /// Bytes of one weight row, `epochs * 68` (`(K/256)*136` for QT44,
+    /// `(K/128)*68` for QT53).
+    pub row_bytes: u32,
+}
+
+/// Validated grouped-GEMM geometry of one MoE layer for one arch and codec.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GeometryPlan {
+    pub arch: Arch,
+    pub codec: WeightCodec,
+    pub geometry: ExpertGeometry,
+    pub gate_up: ProjectionGeometry,
+    pub down: ProjectionGeometry,
+    /// [`tile_widths`] of the arch.
+    pub tile_widths: &'static [u8],
+    /// Bytes of the `expert_weight_ptrs` descriptor table (`experts * 8`).
+    pub descriptor_table_bytes: u32,
+}
+
+impl ExpertGeometry {
+    /// Plan the gate/up (`M = 2I, K = H`) and down (`M = H, K = I`) entries.
+    ///
+    /// Refused unless: `experts >= 1`; `top_k` in `1..=16`; `Mq4Sym` codec on an
+    /// arch whose every [`tile_widths`] entry [`Spec::validate`]s; gate/up
+    /// `M % 64 == 0` and `K % 256 == 0`; down `M % 64 == 0` and `K % 128 == 0`;
+    /// the `experts * 8` descriptor table fits `u32`; and the kernel's 32-bit
+    /// row arithmetic holds (`row_bytes < 2^24` for the `v_mul_u32_u24` lane
+    /// offsets, `M * row_bytes < 2^32` for the `s_mul_i32` weight row base).
+    pub fn plan(self, arch: Arch, codec: WeightCodec) -> Result<GeometryPlan, String> {
+        const WHAT: &str = "qwen4_moe_sym plan";
+        if codec != WeightCodec::Mq4Sym {
+            return Err(format!(
+                "{WHAT}: codec {codec:?} (the QT44/QT53 symmetric MQ4 objects are Mq4Sym)"
+            ));
+        }
+        let widths = tile_widths(arch);
+        for &nt in widths {
+            for kind in Kind::ALL {
+                Spec {
+                    arch,
+                    kind,
+                    nt,
+                    rr: 1,
+                    codec,
+                }
+                .validate()?;
+            }
+        }
+        if self.experts == 0 {
+            return Err(format!("{WHAT}: experts must be >= 1"));
+        }
+        if !(1..=MAX_TOP_K).contains(&self.top_k) {
+            return Err(format!("{WHAT}: top_k {} (1..={MAX_TOP_K})", self.top_k));
+        }
+        let descriptor_table_bytes = self.experts.checked_mul(8).ok_or_else(|| {
+            format!(
+                "{WHAT}: {} experts: the expert_weight_ptrs table exceeds u32 bytes",
+                self.experts
+            )
+        })?;
+        let gate_up_m = self.intermediate.checked_mul(2).ok_or_else(|| {
+            format!(
+                "{WHAT}: intermediate {} overflows gate/up M = 2I",
+                self.intermediate
+            )
+        })?;
+        let gate_up = projection(Kind::GateUp, gate_up_m, self.hidden, 256, self.top_k)?;
+        let down = projection(Kind::Down, self.hidden, self.intermediate, 128, 1)?;
+        Ok(GeometryPlan {
+            arch,
+            codec,
+            geometry: self,
+            gate_up,
+            down,
+            tile_widths: widths,
+            descriptor_table_bytes,
+        })
+    }
+}
+
+fn projection(
+    kind: Kind,
+    m: u32,
+    k: u32,
+    k_multiple: u32,
+    x_row_div: u32,
+) -> Result<ProjectionGeometry, String> {
+    let tag = kind.tag();
+    if m == 0 || m % 64 != 0 {
+        return Err(format!(
+            "qwen4_moe_sym plan: {tag} M {m} must be a nonzero multiple of 64"
+        ));
+    }
+    if k == 0 || k % k_multiple != 0 {
+        return Err(format!(
+            "qwen4_moe_sym plan: {tag} K {k} must be a nonzero multiple of {k_multiple}"
+        ));
+    }
+    let epochs = k / 128;
+    let row_bytes = epochs
+        .checked_mul(68)
+        .filter(|&b| b < 1 << 24)
+        .ok_or_else(|| {
+            format!("qwen4_moe_sym plan: {tag} K {k}: row bytes exceed the 24-bit lane offset")
+        })?;
+    if u64::from(m) * u64::from(row_bytes) > u64::from(u32::MAX) {
+        return Err(format!(
+            "qwen4_moe_sym plan: {tag} {m} rows x {row_bytes} B exceed the 32-bit weight row base"
+        ));
+    }
+    Ok(ProjectionGeometry {
+        kind,
+        m,
+        k,
+        epochs,
+        x_row_div,
+        grid_x: m / 64,
+        row_bytes,
+    })
+}
+
+impl GeometryPlan {
+    /// The validated NT entry for `kind` at tile width `nt` (one of [`Self::tile_widths`]).
+    pub fn spec(&self, kind: Kind, nt: u8) -> Result<Spec, String> {
+        if !self.tile_widths.contains(&nt) {
+            return Err(format!(
+                "qwen4_moe_sym plan: tile width {nt} is not built for {}",
+                self.arch.name()
+            ));
+        }
+        let spec = Spec {
+            arch: self.arch,
+            kind,
+            nt,
+            rr: 1,
+            codec: self.codec,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+}
+
 /// Default-off schedule experiment. Chains belong to distinct output tiles;
 /// no output's K-step or K128-fold order changes. Not part of `emit_module`.
 #[derive(Clone, Copy, Debug)]

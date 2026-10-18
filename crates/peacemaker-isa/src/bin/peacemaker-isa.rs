@@ -455,6 +455,14 @@ fn ep_tile_pull(
         serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
     ))
 }
+/// The ordered BF16 grouped expert combine twin (gfx1201 only).
+fn moe_slot_ops(arch: Arch) -> Result<(String, Vec<u8>), String> {
+    let (_, text, proof) = peacemaker_isa::kernels::moe_slot_ops::emit_module(arch)?;
+    Ok((
+        text,
+        serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+    ))
+}
 /// `all` (default) emits F32 rows16 + rows32 score and select; `bf16` emits the BF16-pooled rows16 + rows32 scores.
 fn qsa_select(epi: &str, arch: Arch) -> Result<(String, Vec<u8>), String> {
     use peacemaker_isa::kernels::qsa_select::{self, Kind, Spec};
@@ -1261,6 +1269,7 @@ fn run() -> Result<(), String> {
         "spec_accept_pm" => spec_accept(arch)?,
         "qwen4_ep_owner_assign_pm" => qwen4_ep_owner_assign(arch)?,
         "ep_tile_mask_pm" => ep_tile_mask(arch)?,
+        "moe_slot_ops_pm" => moe_slot_ops(arch)?,
         "ep_gather_grouped_rows_by_tile_owner_pm" => ep_tile_pull(
             peacemaker_isa::kernels::ep_gather_grouped_rows_by_tile_owner::Variant::Ep2,
             arch,
@@ -1330,7 +1339,8 @@ fn run() -> Result<(), String> {
         || kernel == "qwen4_ep_owner_assign_pm"
         || kernel == "ep_tile_mask_pm"
         || kernel == "ep_gather_grouped_rows_by_tile_owner_pm"
-        || kernel == "ep_gather_grouped_rows_by_tile_owner_n8_pm";
+        || kernel == "ep_gather_grouped_rows_by_tile_owner_n8_pm"
+        || kernel == "moe_slot_ops_pm";
     let mtp_q8 = kernel == "mtp_q8_det_gfx11";
     let mtp_det = kernel == "mtp_dense_det_gfx11" || mtp_q8;
     if pm_module.is_none()
@@ -1343,7 +1353,7 @@ fn run() -> Result<(), String> {
         && !mtp_det
         && (shape.is_some() || m7.is_some())
     {
-        return Err("--shape/--m7 apply only to pm_decode_<module>, mq4_verify, mq4_fp8_verify, mq_i4_rows, mq_i4_a4, qwen4_lane_rows, spec_sampling_rows_pm, spec_accept_pm, qwen4_ep_owner_assign_pm, ep_tile_mask_pm, ep_gather_grouped_rows_by_tile_owner_pm, ep_gather_grouped_rows_by_tile_owner_n8_pm, mtp_dense_det_gfx11 and mtp_q8_det_gfx11 (--m7 only)".into());
+        return Err("--shape/--m7 apply only to pm_decode_<module>, mq4_verify, mq4_fp8_verify, mq_i4_rows, mq_i4_a4, qwen4_lane_rows, spec_sampling_rows_pm, spec_accept_pm, qwen4_ep_owner_assign_pm, ep_tile_mask_pm, ep_gather_grouped_rows_by_tile_owner_pm, ep_gather_grouped_rows_by_tile_owner_n8_pm, moe_slot_ops_pm, mtp_dense_det_gfx11 and mtp_q8_det_gfx11 (--m7 only)".into());
     }
     if spec_pm && co.is_none() && (shape.is_some() || m7.is_some()) {
         return Err("spec_*_pm --shape/--m7 require --co (M7 certifies the linked object)".into());
@@ -1510,6 +1520,12 @@ fn run() -> Result<(), String> {
             (
                 peacemaker_isa::kernels::ep_tile_mask::symbol(arch),
                 peacemaker_isa::kernels::ep_tile_mask::contract(arch, &e),
+            )
+        } else if kernel == "moe_slot_ops_pm" {
+            let e = peacemaker_isa::kernels::moe_slot_ops::emit(arch)?;
+            (
+                peacemaker_isa::kernels::moe_slot_ops::symbol(arch),
+                peacemaker_isa::kernels::moe_slot_ops::contract(arch, &e),
             )
         } else if kernel == "ep_gather_grouped_rows_by_tile_owner_pm"
             || kernel == "ep_gather_grouped_rows_by_tile_owner_n8_pm"

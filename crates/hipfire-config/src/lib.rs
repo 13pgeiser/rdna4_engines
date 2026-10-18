@@ -3986,8 +3986,11 @@ pub fn is_developer_key(key: &str) -> bool {
 /// boolean, a string spelling, or the integers 0/1). Anything else is
 /// rejected when the layer is built, never silently ignored. Every other
 /// developer key keeps its free-form legacy spelling.
-const TYPED_BOOL_DEVELOPER_KEYS: &[&str] =
-    &["developer.qwen4_moe_sym_iu4", "developer.qwen4_d2_default"];
+const TYPED_BOOL_DEVELOPER_KEYS: &[&str] = &[
+    "developer.qwen4_moe_sym_iu4",
+    "developer.qwen4_d2_default",
+    "developer.moe_sym_iu4",
+];
 
 pub fn is_typed_bool_developer_key(key: &str) -> bool {
     TYPED_BOOL_DEVELOPER_KEYS.contains(&key)
@@ -6916,6 +6919,47 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    const MOE_SYM_IU4_KEY: &str = "developer.moe_sym_iu4";
+    const MOE_SYM_IU4_ENV: &str = "HIPFIRE_MOE_SYM_IU4";
+
+    #[test]
+    fn moe_sym_iu4_is_a_typed_bool_developer_key_independent_of_the_flash_next_key() {
+        assert!(is_developer_key(MOE_SYM_IU4_KEY));
+        assert!(is_typed_bool_developer_key(MOE_SYM_IU4_KEY));
+        assert_ne!(MOE_SYM_IU4_KEY, SYM_IU4_KEY);
+        assert_ne!(MOE_SYM_IU4_ENV, SYM_IU4_ENV);
+        // Unset is None (the route's default is OFF); each spelling reads as a bool.
+        assert_eq!(typed_developer_bool_value(MOE_SYM_IU4_ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(MOE_SYM_IU4_ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+            let mut layer = ConfigLayer::default();
+            layer.set_cli(MOE_SYM_IU4_KEY, raw).unwrap();
+            assert_eq!(
+                layer.get(MOE_SYM_IU4_KEY),
+                Some(&ConfigValue::Bool(want)),
+                "{raw}"
+            );
+            layer.validate().unwrap();
+        }
+        for bad in ["", "2", "on", "off", "yes", "maybe"] {
+            let mut layer = ConfigLayer::default();
+            let error = layer.set_cli(MOE_SYM_IU4_KEY, bad).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::InvalidValue { key, .. } if key == MOE_SYM_IU4_KEY),
+                "{bad:?}: {error}"
+            );
+            assert!(layer.values.is_empty(), "{bad:?} must not be stored");
+        }
+        // Setting one key never writes the other.
+        let mut layer = ConfigLayer::default();
+        layer.set_cli(MOE_SYM_IU4_KEY, "1").unwrap();
+        assert_eq!(layer.get(SYM_IU4_KEY), None);
     }
 
     #[test]
