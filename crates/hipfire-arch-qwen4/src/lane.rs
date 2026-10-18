@@ -47,6 +47,9 @@ use hipfire_runtime::slot_batch::RequestEpoch;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
+pub(crate) mod groups;
+use groups::GroupPlanner;
+
 /// Most lanes one store holds.
 const MAX_LANES: usize = 64;
 
@@ -606,6 +609,9 @@ pub struct Qwen4LaneStore {
     format: Qwen4StateFormat,
     backend: Qwen4KvBackend,
     policy: LaneStagePolicy,
+    /// Micro-batch group count policy of the PP decode wavefront (consulted
+    /// only on the output-band root; see [`groups`]).
+    groups: GroupPlanner,
     /// Decode rows the step buffers hold (`max_lanes * (k + 1)` with spec,
     /// else `max_lanes`).
     rows_cap: usize,
@@ -653,6 +659,29 @@ impl Qwen4LaneStore {
         if row_budget == 0 {
             return Err("lane store: row_budget must be at least 1".to_string());
         }
+        // Developer overrides, refused before any device allocation.
+        let group_override =
+            groups::groups_override_from_env().map_err(|e| format!("lane store: {e}"))?;
+        let policy_override =
+            groups::policy_override_from_env().map_err(|e| format!("lane store: {e}"))?;
+        if let Some(requested) = group_override {
+            eprintln!(
+                "  qwen4 lanes: {} = {requested} fixes the PP decode micro-batch count (clamped to min(lanes, 2 * stages))",
+                groups::GROUPS_ENV
+            );
+        }
+        let policy = match policy_override {
+            Some(policy) => {
+                eprintln!(
+                    "  qwen4 lanes: {} selects stage policy {}",
+                    groups::POLICY_ENV,
+                    policy.describe()
+                );
+                policy
+            }
+            // Shared stages only where G0 evidenced them (gfx1151).
+            None => LaneStagePolicy::for_arch(&gpu.arch),
+        };
         // This band's ownership: the single scope allocates the historical
         // whole-model store.
         let scope = bundle.weights.band_scope().clone();
@@ -725,8 +754,8 @@ impl Qwen4LaneStore {
             ring_rows: spec.map_or(0, |spec| spec.k + 1),
             format: bundle.state_format(),
             backend: bundle.state.qsa_backend(),
-            // Shared stages only where G0 evidenced them (gfx1151).
-            policy: LaneStagePolicy::for_arch(&gpu.arch),
+            policy,
+            groups: GroupPlanner::new(group_override),
             rows_cap,
             logits,
             top1,
@@ -1184,7 +1213,35 @@ impl Qwen4LaneStore {
     }
 
     pub fn set_stage_policy(&mut self, policy: LaneStagePolicy) {
+        if self.policy != policy {
+            // Walls measured under one policy say nothing about another.
+            self.groups.clear();
+        }
         self.policy = policy;
+    }
+
+    /// Micro-batch group count for a PP decode step over `rows` (rows per
+    /// lane, plan order); see [`groups::GroupPlanner::select`].
+    pub(crate) fn select_decode_groups<I>(&mut self, stages: usize, rows: I) -> usize
+    where
+        I: ExactSizeIterator<Item = usize> + Clone,
+    {
+        self.groups.select(&self.policy, stages, rows)
+    }
+
+    /// Record one complete successful PP decode step's wall (microseconds).
+    pub(crate) fn observe_decode_groups<I>(
+        &mut self,
+        stages: usize,
+        rows: I,
+        groups: usize,
+        wall_us: f64,
+    ) -> bool
+    where
+        I: Iterator<Item = usize> + Clone,
+    {
+        self.groups
+            .observe(&self.policy, stages, rows, groups, wall_us)
     }
 
     pub fn max_lanes(&self) -> usize {

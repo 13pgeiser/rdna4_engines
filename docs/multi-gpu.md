@@ -979,10 +979,34 @@ this page.
 - **EP.** The trunk is replicated, so every rank holds a full lane-store replica
   and runs each lane entry through the same per-rank worker fan-out as the
   singleton EP forward.
-- **PP.** Each band holds a band-scoped lane store. Bands run **sequentially**
-  for a lane step: HC streams cross each band edge through pinned host memory
-  (no peer access), exactly as the singleton PP forward. There is no
-  micro-batch overlap between bands.
+- **PP.** Each band holds a band-scoped lane store. HC streams cross each band
+  edge through pinned host memory (no peer access), exactly as the singleton
+  PP forward. A decode step is cut into `G` contiguous, balanced, whole-lane
+  micro-batches (a lane's rows are never split) that wavefront through the
+  bands with sender completion events gating each receiver upload
+  (`HIPFIRE_PP_LANE_OVERLAP=0` selects the sequential band walk). Prompt
+  tiles run as singleton PP tiles. Per-step token staging uses pinned host
+  memory with event-fenced asynchronous uploads; it must stay byte-identical
+  to a synchronous upload, and no speedup from it is measured or claimed here.
+- **PP micro-batch count `G`.** `G` ranges over `1..=min(lanes, 2 * stages)`.
+  The default stage policy is unchanged (per-lane on gfx1201). Under a
+  no-sharing policy (per-lane, no row-local sharing to trade against) `G` is
+  the maximal overlap `min(lanes, 2 * stages)`. Under a shared policy `G` is
+  adaptive: bounded exploration of each `G`, then the `G` with the cheapest
+  observed complete-step wall (the step's final output sync included, not
+  caller-side picks), ties broken deterministically; statistics are kept
+  separately per exact row shape, stage count and policy, so a policy change
+  never mixes timings. The adaptive path is production opt-in only. Two
+  developer-only variables steer it (both in
+  [env-vars.md](env-vars.md#qwen4--qwen38-flash-next-arch-16)):
+  `HIPFIRE_PP_LANE_GROUPS=<G>` forces `G` (a positive value is clamped to
+  `min(active lanes, 2 * stages)`; `0` or a non-integer refuses), overriding
+  the per-lane maximal overlap too; `HIPFIRE_FN_LANE_POLICY=<spec>` (a
+  `LaneStagePolicy::parse` spec, read at lane-store construction, applied to
+  every band/rank store and logged; a bad spec refuses the load) selects the
+  stage policy. Every `G` and every policy must keep lane outputs
+  byte-identical; the choice is a scheduling decision, not a numerical one,
+  and no measured gain is claimed on this page.
 - **AR lanes only.** Native-MTP lanes are not staged under PP/EP
   (`continuous_batch_spec = false`, `continuous_batch_spec_mode = "off"`),
   whatever `speculation.mtp` requests.

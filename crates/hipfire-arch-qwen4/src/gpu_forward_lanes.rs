@@ -1329,13 +1329,25 @@ fn forward_lanes_scoped(
     };
 
     // Token ids: one upload for every row, in lane order (the input band
-    // embeds them; every other band runs from received HC streams).
+    // embeds them; every other band runs from received HC streams). Outside a
+    // graph capture the ids go through the pinned, fenced ring: the host fill
+    // waits only on the slot's own earlier copy (never on a previous group's
+    // compute), the copy is enqueued on the active stream without a host wait,
+    // and the bytes stay untouched until that copy's fence completes. A
+    // capture keeps the blocking `host_token_bytes` copy (no null-stream work
+    // inside a capture).
+    let ids_async = band_scope.input && !gpu.graphs.capture_mode;
     if band_scope.input {
+        let ids_len = n * std::mem::size_of::<i32>();
+        let staged_ids: &mut [u8] = if ids_async {
+            fwd.lane_tokens.stage(gpu, ids_len)?
+        } else {
+            &mut fwd.host_token_bytes[..ids_len]
+        };
         let mut row = 0usize;
         for lane in lanes.iter() {
             for &token in lane.tokens {
-                fwd.host_token_bytes[row * 4..row * 4 + 4]
-                    .copy_from_slice(&(token as i32).to_ne_bytes());
+                staged_ids[row * 4..row * 4 + 4].copy_from_slice(&(token as i32).to_ne_bytes());
                 row += 1;
             }
         }
@@ -1903,10 +1915,18 @@ fn forward_lanes_scoped(
         // other band runs from the HC streams its caller placed in
         // `scratch.streams` rows `[0, n)` (lane order).
         if band_scope.input {
-            gpu.memcpy_htod_auto(
-                &scratch.token_ids.buf,
-                &fwd.host_token_bytes[..n * std::mem::size_of::<i32>()],
-            )?;
+            if ids_async {
+                fwd.lane_tokens.upload(
+                    gpu,
+                    &scratch.token_ids.buf,
+                    n * std::mem::size_of::<i32>(),
+                )?;
+            } else {
+                gpu.memcpy_htod_auto(
+                    &scratch.token_ids.buf,
+                    &fwd.host_token_bytes[..n * std::mem::size_of::<i32>()],
+                )?;
+            }
             let embedding = bundle.weights.resident(&bundle.weights.root.embedding)?;
             let embed_share = policy.share(StageName::Embed);
             for i in segs_for(embed_share) {

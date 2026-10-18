@@ -17,6 +17,10 @@
 //! streams. Sender completion events gate receiver uploads, and stream order
 //! protects scratch reuse. The output band drains once before picks are read.
 //! `HIPFIRE_PP_LANE_OVERLAP=0` selects the sequential decode walk instead.
+//! The micro-batch count `G` per step comes from the output-band root's
+//! [`crate::lane::groups`] planner: maximal overlap `min(lanes, 2 * stages)`
+//! under a per-lane stage policy, measured per-`G` complete-step walls under a
+//! row-sharing policy, or the clamped `HIPFIRE_PP_LANE_GROUPS` override.
 //! The prompt-completing and ordinary prefill tiles then run as singleton PP
 //! tiles through [`Qwen4Bundle::pp_lane_prefill_tile_detached`]. On any
 //! failure every plan participant is poisoned on every band and the phase
@@ -824,14 +828,17 @@ impl DecodeMicroBatch {
     }
 }
 
-/// Greedily approach the remaining average, reserving one whole lane for
-/// each later group. Equal-sized lanes differ by at most one lane per group.
+/// Greedily approach the remaining average into `groups` contiguous groups,
+/// reserving one whole lane for each later group. Equal-sized lanes differ by
+/// at most one lane per group. `groups` is clamped to `1..=lanes` (the
+/// callers pass [`crate::lane::groups`] selections, already within
+/// `min(lanes, 2 * stages)`); no lanes give no groups.
 fn decode_micro_batches(
     rows: impl ExactSizeIterator<Item = usize> + Clone,
-    stages: usize,
+    groups: usize,
 ) -> Vec<DecodeMicroBatch> {
     let n = rows.len();
-    let groups = n.min(stages.saturating_mul(2));
+    let groups = if n == 0 { 0 } else { groups.clamp(1, n) };
     let mut remaining: usize = rows.clone().sum();
     let mut rows = rows.peekable();
     let mut batches = Vec::with_capacity(groups);
@@ -958,7 +965,10 @@ fn decode_run_overlap(
     picks: &mut [u32],
 ) -> Result<(), StepFailure> {
     let stages = refs.len();
-    let batches = decode_micro_batches(call.decode.iter().map(|r| r.rows.len), stages);
+    let started = Instant::now();
+    let lane_rows = || call.decode.iter().map(|r| r.rows.len);
+    let groups = stores[stages - 1].select_decode_groups(stages, lane_rows());
+    let batches = decode_micro_batches(lane_rows(), groups);
     if events.len() < stages - 1
         || events
             .iter()
@@ -1097,6 +1107,9 @@ fn decode_run_overlap(
     if let Some(error) = wait_error {
         return Err(StepFailure::new(error, true));
     }
+    // The complete step: every band's work drained by the output-band sync
+    // above, the top-1 copied back, no device error.
+    let wall_us = started.elapsed().as_secs_f64() * 1e6;
     let mut first = 0;
     for r in call.decode {
         for j in 0..r.rows.len {
@@ -1104,6 +1117,7 @@ fn decode_run_overlap(
         }
         first += r.rows.len;
     }
+    stores[output].observe_decode_groups(stages, lane_rows(), batches.len(), wall_us);
     Ok(())
 }
 
@@ -1370,13 +1384,15 @@ impl Qwen4Bundle {
 #[cfg(test)]
 mod pp_lane_tests {
     use super::{decode_micro_batches, decode_overlap_enabled, decode_wavefront};
+    use crate::lane::groups::max_groups;
 
     #[test]
     fn pp_lane_partition_balance_contiguity_and_no_split() {
         for stages in 1..=5 {
             for lanes in 1..=32 {
                 let rows = vec![1; lanes];
-                let batches = decode_micro_batches(rows.iter().copied(), stages);
+                let groups = max_groups(lanes, stages);
+                let batches = decode_micro_batches(rows.iter().copied(), groups);
                 assert_eq!(batches.len(), lanes.min(2 * stages));
                 let min = batches.iter().map(|b| b.rows).min().unwrap();
                 let max = batches.iter().map(|b| b.rows).max().unwrap();
@@ -1398,10 +1414,10 @@ mod pp_lane_tests {
                 assert_eq!(first, lanes);
             }
         }
-        assert!(decode_micro_batches([].into_iter(), 2).is_empty());
+        assert!(decode_micro_batches([].into_iter(), 4).is_empty());
         // Balance by row count, not just lane count; a heavy lane stays whole.
         let rows = [3, 1, 1, 1, 2, 2, 1, 1];
-        let batches = decode_micro_batches(rows.into_iter(), 2);
+        let batches = decode_micro_batches(rows.into_iter(), 4);
         assert_eq!(
             batches.iter().map(|b| b.rows).collect::<Vec<_>>(),
             [3, 3, 4, 2]
@@ -1410,8 +1426,57 @@ mod pp_lane_tests {
             batches.iter().map(|b| b.lane_end).collect::<Vec<_>>(),
             [1, 4, 6, 8]
         );
-        let heavy = decode_micro_batches([1, 100, 1].into_iter(), 1);
+        let heavy = decode_micro_batches([1, 100, 1].into_iter(), 2);
         assert_eq!(heavy.iter().map(|b| b.lane_end).collect::<Vec<_>>(), [2, 3]);
+    }
+
+    #[test]
+    fn pp_lane_partition_is_balanced_whole_lane_for_every_valid_group_count() {
+        let shapes: [&[usize]; 2] = [&[2, 1, 4, 1, 1], &[3, 1, 1, 1, 2, 2, 1, 1, 5, 1, 1, 2]];
+        for stages in 1..=5 {
+            for lanes in 1..=32usize {
+                let unit = vec![1; lanes];
+                for groups in 1..=max_groups(lanes, stages) {
+                    let batches = decode_micro_batches(unit.iter().copied(), groups);
+                    assert_eq!(batches.len(), groups);
+                    let sizes: Vec<usize> = batches.iter().map(|b| b.rows).collect();
+                    assert!(sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 1);
+                    assert!(sizes.windows(2).all(|w| w[0] >= w[1]));
+                    assert_eq!(sizes.iter().sum::<usize>(), lanes);
+                }
+            }
+            for shape in shapes {
+                for groups in 1..=max_groups(shape.len(), stages) {
+                    let batches = decode_micro_batches(shape.iter().copied(), groups);
+                    assert_eq!(batches.len(), groups);
+                    let (mut lane, mut first) = (0, 0);
+                    for batch in &batches {
+                        assert_eq!(batch.lane_begin, lane);
+                        assert!(batch.lane_end > batch.lane_begin);
+                        assert_eq!(batch.first_row, first);
+                        assert_eq!(
+                            batch.rows,
+                            shape[batch.lane_begin..batch.lane_end]
+                                .iter()
+                                .sum::<usize>()
+                        );
+                        lane = batch.lane_end;
+                        first += batch.rows;
+                    }
+                    assert_eq!(lane, shape.len());
+                    assert_eq!(first, shape.iter().sum::<usize>());
+                }
+            }
+        }
+        // One group holds every lane; one lane per group at the maximum.
+        let one = decode_micro_batches([2, 1, 3].into_iter(), 1);
+        assert_eq!(one.len(), 1);
+        assert_eq!((one[0].lane_begin, one[0].lane_end, one[0].rows), (0, 3, 6));
+        let each = decode_micro_batches([2, 1, 3].into_iter(), 3);
+        assert_eq!(each.iter().map(|b| b.rows).collect::<Vec<_>>(), [2, 1, 3]);
+        // An out-of-range request clamps to the lanes (and to one group).
+        assert_eq!(decode_micro_batches([1, 1].into_iter(), 9).len(), 2);
+        assert_eq!(decode_micro_batches([1, 1].into_iter(), 0).len(), 1);
     }
 
     #[test]
@@ -1459,7 +1524,8 @@ mod pp_lane_tests {
             for element_bytes in [2, 4] {
                 let row_bytes = 4 * 256 * element_bytes;
                 let mut end = 0;
-                for batch in decode_micro_batches(rows.into_iter(), stages) {
+                let groups = max_groups(rows.len(), stages);
+                for batch in decode_micro_batches(rows.into_iter(), groups) {
                     let range = batch.bounce_range(row_bytes);
                     assert_eq!(range.start, end);
                     assert_eq!(range.len(), batch.rows * row_bytes);

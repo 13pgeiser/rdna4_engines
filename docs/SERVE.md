@@ -930,9 +930,15 @@ request run alone on the singleton route. **Default off, experimental.**
   lanes** (`continuous_batch_spec: false`, spec mode `"off"`) and a running
   singleton is **never promoted** into a lane
   (`continuous_batch_promotion: false`). EP replicates the lane store on every
-  rank; PP keeps a band-scoped store per band and runs the bands
-  **sequentially**, the HC streams crossing each band edge through pinned host
-  memory. On gfx1201 every row-local stage runs per lane until grouped stages
+  rank; PP keeps a band-scoped store per band, the HC streams crossing each
+  band edge through pinned host memory; a decode step is split into `G`
+  contiguous whole-lane micro-batches that wavefront through the bands
+  (`G` = the maximal overlap `min(lanes, 2 * stages)` under the default
+  per-lane policy; adaptive over `1..=min(lanes, 2 * stages)` under a shared
+  policy; the developer variables `HIPFIRE_PP_LANE_GROUPS=<G>` and
+  `HIPFIRE_FN_LANE_POLICY=<spec>` override group count and stage policy, see
+  [env-vars.md](env-vars.md)). On gfx1201 every row-local stage runs per lane
+  until grouped stages
   are certified. The multi-card GPU gates and all performance figures are
   **pending**; no throughput or speedup claim is made. Details:
   [multi-gpu.md](multi-gpu.md#flash-next-fn-lanes-continuous-batching-under-pp-and-ep).

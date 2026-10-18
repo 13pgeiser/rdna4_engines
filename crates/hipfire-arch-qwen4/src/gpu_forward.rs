@@ -6388,6 +6388,9 @@ pub struct Qwen4GpuForward {
     mesh_route_rows: Option<usize>,
     /// Fenced async upload of a mesh input band's token ids.
     mesh_tokens: PleHostStage,
+    /// Pinned, fenced ring for the lane forward's token ids (the active-stream
+    /// asynchronous upload; capture keeps the blocking `host_token_bytes` copy).
+    pub(crate) lane_tokens: crate::lane_token_ring::LaneTokenRing,
     /// Op ids of this band's trunk program (see [`mesh_trunk_op_range`]).
     mesh_trunk_ops: std::ops::Range<u32>,
     #[cfg(target_os = "linux")]
@@ -7674,6 +7677,9 @@ impl Qwen4GpuForward {
             scope,
             mesh_route_rows: None,
             mesh_tokens: PleHostStage::new(vec![0u8; max_chunk * std::mem::size_of::<i32>()], true),
+            lane_tokens: crate::lane_token_ring::LaneTokenRing::new(
+                max_chunk * std::mem::size_of::<i32>(),
+            ),
             mesh_trunk_ops,
             #[cfg(target_os = "linux")]
             npu_trunk,
@@ -8193,6 +8199,7 @@ impl Qwen4GpuForward {
             scratch,
             host_ple,
             mesh_tokens,
+            lane_tokens,
             moe,
             expert_stage,
             ep,
@@ -8215,6 +8222,9 @@ impl Qwen4GpuForward {
         // retire it before the device buffers and the host bytes go.
         let mut first = host_ple.free_gpu(gpu);
         if let Some(error) = mesh_tokens.free_gpu(gpu) {
+            first.get_or_insert(error);
+        }
+        if let Some(error) = lane_tokens.free_gpu(gpu) {
             first.get_or_insert(error);
         }
         #[cfg(target_os = "linux")]
