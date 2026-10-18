@@ -1702,7 +1702,7 @@ fn run_down_indexed(
             Fmt::Mq4 => cx
                 .gpu
                 .gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(
-                    &tab.table, &t_ids, &t_x, &t_y, DOWN_M, DOWN_K, tokens, E,
+                    &tab.table, &t_ids, &t_x, &t_y, DOWN_M, DOWN_K, tokens, E, 10,
                 ),
         };
         launched.map_err(e)?;

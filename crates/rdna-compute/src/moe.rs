@@ -2888,17 +2888,29 @@ impl Gpu {
         k: usize,
         batch_size: usize,
         n_exp: usize,
+        k_top: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if k_top == 0 || k_top > 16 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded: k_top must be in 1..=16",
+            ));
+        }
         require_span(
             expert_outputs,
-            &[batch_size, 10, m, 4],
+            &[batch_size, k_top, m, 4],
             "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded outputs",
         )?;
         require_span(
             hidden_batch,
-            &[batch_size, 10, k, 4],
+            &[batch_size, k_top, k, 4],
             "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded activations",
+        )?;
+        require_span(
+            topk_indices,
+            &[batch_size, k_top, 4],
+            "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded indices",
         )?;
         const FUNC: &str = "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded";
         self.ensure_kernel(
@@ -2914,6 +2926,7 @@ impl Gpu {
         let kv = k as i32;
         let nv = batch_size as i32;
         let nev = n_exp as i32;
+        let ktv = k_top as i32;
         let mut params = [
             &pp as *const _ as *mut c_void,
             &ip as *const _ as *mut c_void,
@@ -2923,8 +2936,9 @@ impl Gpu {
             &kv as *const _ as *mut c_void,
             &nv as *const _ as *mut c_void,
             &nev as *const _ as *mut c_void,
+            &ktv as *const _ as *mut c_void,
         ];
-        let bytes = batch_size.saturating_mul(10).saturating_mul(
+        let bytes = batch_size.saturating_mul(k_top).saturating_mul(
             m.saturating_mul(k.div_ceil(128).saturating_mul(68))
                 .saturating_add(k.saturating_mul(4))
                 .saturating_add(m.saturating_mul(4)),
@@ -2932,7 +2946,7 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "gemv", FUNC, bytes);
         let result = self.launch_maybe_blob(
             FUNC,
-            [m as u32, 10, batch_size as u32],
+            [m as u32, k_top as u32, batch_size as u32],
             [32, 1, 1],
             0,
             &mut params,
@@ -2946,6 +2960,7 @@ impl Gpu {
                 b.push_i32(kv);
                 b.push_i32(nv);
                 b.push_i32(nev);
+                b.push_i32(ktv);
                 b
             },
         );

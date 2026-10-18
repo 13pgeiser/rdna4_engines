@@ -305,6 +305,18 @@ pub fn mixed_expert_tag(gate_dtype: DType, down_dtype: DType) -> HipResult<u8> {
             &format!("graded EP: GL dtype not supported (gate={gate_dtype:?} down={down_dtype:?})"),
         ));
     }
+    // qt53 (MQ4G128V2) is admitted only as a UNIFORM routed-expert down beside
+    // qt44 gate_up (see `validate_qt53_admission`). It has no graded tag: the
+    // tag-branched decoder has no G128 row-local branch and would mis-decode.
+    if gate_dtype == DType::MQ4G128V2 || down_dtype == DType::MQ4G128V2 {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "graded/tiered EP: qt53 (MQ4G128V2) has no mixed expert tag \
+                 (gate={gate_dtype:?} down={down_dtype:?}); qt53 routed-down layers must be uniform"
+            ),
+        ));
+    }
     match (gate_dtype, down_dtype) {
         // Tags 0..6 — V1 pair identities (unchanged).
         (DType::MQ4G256, DType::MQ6G256) => Ok(0),
@@ -357,6 +369,10 @@ pub(crate) fn dtype_from_quant_type(qt: u8) -> HipResult<DType> {
         41 => Ok(DType::BQ1G128),
         44 => Ok(DType::MQ4G256V2),
         52 => Ok(DType::MQ4G256V2Lloyd),
+        // qt53: row-local MQ4G128V2, 68 B per ceil(K/128) group, FWHT128 basis.
+        // Role admission (routed expert down only) is enforced by
+        // `validate_qt53_admission`, never by this dtype map.
+        53 => Ok(DType::MQ4G128V2),
         45 => Ok(DType::MQ4CG256),
         // Neutral-size Magnum V2 family (qt47-50): preserve qtype distinction
         // through WeightTensor/GpuTensor; do not map to legacy MQ2/3/5/6.
@@ -378,6 +394,183 @@ pub(crate) fn dtype_from_quant_type(qt: u8) -> HipResult<DType> {
             &format!("graded EP: unsupported quant_type {other}"),
         )),
     }
+}
+
+/// HFQ quant_type of the row-local MQ4G128V2 format.
+pub(crate) const QT_MQ4G128V2: u8 = 53;
+/// HFQ quant_type of the routed gate_up partner qt53 requires.
+pub(crate) const QT_MQ4G256V2: u8 = 44;
+
+/// Tensor role used to admit or refuse qt53 (MQ4G128V2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Qt53Role {
+    RoutedDown,
+    RoutedGateUp,
+    Router,
+    SharedExpert,
+    DenseFfn,
+    Attention,
+    Embedding,
+    LmHead,
+    Other,
+}
+
+impl Qt53Role {
+    fn label(self) -> &'static str {
+        match self {
+            Self::RoutedDown => "routed-expert down_proj",
+            Self::RoutedGateUp => "routed-expert gate_up",
+            Self::Router => "router",
+            Self::SharedExpert => "shared-expert",
+            Self::DenseFfn => "dense FFN",
+            Self::Attention => "attention",
+            Self::Embedding => "embedding",
+            Self::LmHead => "lm_head",
+            Self::Other => "non-routed-down",
+        }
+    }
+}
+
+/// Classify a tensor name for qt53 admission. Per-expert
+/// (`...mlp.experts.{id}.down_proj.weight`) and stacked
+/// (`...mlp.experts.down_proj[.weight]`) routed names are both recognised.
+pub(crate) fn qt53_role(name: &str) -> Qt53Role {
+    const EXPERTS: &str = ".mlp.experts.";
+    if let Some(at) = name.find(EXPERTS) {
+        let tail = &name[at + EXPERTS.len()..];
+        let rest = match tail.split_once('.') {
+            Some((id, rest)) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => rest,
+            _ => tail,
+        };
+        let proj = rest.strip_suffix(".weight").unwrap_or(rest);
+        return match proj {
+            "down_proj" => Qt53Role::RoutedDown,
+            "gate_up_proj" | "gate_proj" | "up_proj" => Qt53Role::RoutedGateUp,
+            _ => Qt53Role::Other,
+        };
+    }
+    if name.contains(".mlp.shared_expert_gate.") || name.contains(".mlp.shared_expert.") {
+        Qt53Role::SharedExpert
+    } else if name.ends_with(".mlp.gate.weight") {
+        Qt53Role::Router
+    } else if name.contains(".self_attn.") || name.contains(".linear_attn.") {
+        Qt53Role::Attention
+    } else if name.contains("embed_tokens") {
+        Qt53Role::Embedding
+    } else if name.contains("lm_head") {
+        Qt53Role::LmHead
+    } else if name.contains(".mlp.") {
+        Qt53Role::DenseFfn
+    } else {
+        Qt53Role::Other
+    }
+}
+
+/// One tensor's container facts for [`validate_qt53_admission`].
+#[derive(Clone, Copy)]
+pub(crate) struct Qt53Fact<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) quant_type: u8,
+    pub(crate) shape: &'a [u32],
+}
+
+/// Pure CPU admission of qt53 (MQ4G128V2) over a whole file's tensor list,
+/// run once before any upload. A file with no qt53 tensor is accepted
+/// unchanged. Otherwise:
+///
+/// - every qt53 tensor must be a routed-expert `down_proj`; dense, shared,
+///   router, attention, embedding, lm_head, gate_up and every other role is
+///   refused;
+/// - the down shape must be `[hidden, moe_intermediate]` (per expert) or
+///   `[E, hidden, moe_intermediate]` (stacked), i.e. down K = moe_intermediate;
+/// - within any layer holding a qt53 down, every routed down is qt53 (no
+///   tags/mixed tiers), every routed gate_up is qt44, and no routed projection
+///   carries an AWQ sidecar.
+pub(crate) fn validate_qt53_admission(
+    facts: &[Qt53Fact<'_>],
+    hidden: usize,
+    moe_intermediate: usize,
+) -> HipResult<()> {
+    use std::collections::BTreeMap;
+    if !facts.iter().any(|f| f.quant_type == QT_MQ4G128V2) {
+        return Ok(());
+    }
+    let refuse = |detail: String| {
+        HipError::new(
+            0,
+            &format!(
+                "qwen35: qt53 (MQ4G128V2) is admitted only as uniform routed-expert down_proj \
+                 with qt44 gate_up and no AWQ: {detail}"
+            ),
+        )
+    };
+    for fact in facts.iter().filter(|f| f.quant_type == QT_MQ4G128V2) {
+        let role = qt53_role(fact.name);
+        if role != Qt53Role::RoutedDown {
+            return Err(refuse(format!(
+                "tensor '{}' is a {} tensor",
+                fact.name,
+                role.label()
+            )));
+        }
+        let dims: Vec<usize> = fact.shape.iter().map(|&d| d as usize).collect();
+        let per_expert = dims.len() == 2 && dims[0] == hidden && dims[1] == moe_intermediate;
+        let stacked =
+            dims.len() == 3 && dims[0] > 0 && dims[1] == hidden && dims[2] == moe_intermediate;
+        if moe_intermediate == 0 || !(per_expert || stacked) {
+            return Err(refuse(format!(
+                "down tensor '{}' shape {dims:?} is not [{hidden}, {moe_intermediate}] \
+                 (K must equal moe_intermediate_size)",
+                fact.name
+            )));
+        }
+    }
+    #[derive(Default)]
+    struct LayerState<'a> {
+        down_qt53: usize,
+        down_other: Option<(&'a str, u8)>,
+        gate_bad: Option<(&'a str, u8)>,
+        awq: Option<&'a str>,
+    }
+    let mut layers: BTreeMap<&str, LayerState<'_>> = BTreeMap::new();
+    for fact in facts {
+        let Some(at) = fact.name.find(".mlp.experts.") else {
+            continue;
+        };
+        let state = layers.entry(&fact.name[..at]).or_default();
+        if fact.name.ends_with(".awq_scale.weight") {
+            state.awq.get_or_insert(fact.name);
+            continue;
+        }
+        match qt53_role(fact.name) {
+            Qt53Role::RoutedDown if fact.quant_type == QT_MQ4G128V2 => state.down_qt53 += 1,
+            Qt53Role::RoutedDown => {
+                state.down_other.get_or_insert((fact.name, fact.quant_type));
+            }
+            Qt53Role::RoutedGateUp if fact.quant_type != QT_MQ4G256V2 => {
+                state.gate_bad.get_or_insert((fact.name, fact.quant_type));
+            }
+            _ => {}
+        }
+    }
+    for (layer, state) in layers.iter().filter(|(_, s)| s.down_qt53 > 0) {
+        if let Some((name, qt)) = state.down_other {
+            return Err(refuse(format!(
+                "layer '{layer}' mixes qt53 down with qt{qt} down '{name}' (no mixed tags)"
+            )));
+        }
+        if let Some((name, qt)) = state.gate_bad {
+            return Err(refuse(format!(
+                "layer '{layer}' qt53 down requires qt44 gate_up, found qt{qt} '{name}'"
+            )));
+        }
+        if let Some(name) = state.awq {
+            return Err(refuse(format!(
+                "layer '{layer}' carries AWQ sidecar '{name}'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Shared expert storage — unlike routed experts, gate_proj and up_proj are
@@ -4246,5 +4439,222 @@ mod dense_shared_tests {
 
         assert!(dense_fixture(false).validate_dense().is_ok());
         assert!(dense_fixture(true).validate_dense().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod qt53_admission_tests {
+    use super::*;
+
+    const H: usize = 2048;
+    const I: usize = 512;
+
+    fn fact(name: &str, quant_type: u8, shape: &[u32]) -> (String, u8, Vec<u32>) {
+        (name.to_string(), quant_type, shape.to_vec())
+    }
+
+    fn check(rows: &[(String, u8, Vec<u32>)]) -> HipResult<()> {
+        let facts: Vec<Qt53Fact<'_>> = rows
+            .iter()
+            .map(|(name, quant_type, shape)| Qt53Fact {
+                name,
+                quant_type: *quant_type,
+                shape,
+            })
+            .collect();
+        validate_qt53_admission(&facts, H, I)
+    }
+
+    fn down(layer: usize, expert: usize, qt: u8) -> (String, u8, Vec<u32>) {
+        fact(
+            &format!("model.language_model.layers.{layer}.mlp.experts.{expert}.down_proj.weight"),
+            qt,
+            &[H as u32, I as u32],
+        )
+    }
+
+    fn gate_up(layer: usize, expert: usize, qt: u8) -> (String, u8, Vec<u32>) {
+        fact(
+            &format!(
+                "model.language_model.layers.{layer}.mlp.experts.{expert}.gate_up_proj.weight"
+            ),
+            qt,
+            &[2 * I as u32, H as u32],
+        )
+    }
+
+    fn good_layer(layer: usize) -> Vec<(String, u8, Vec<u32>)> {
+        (0..2)
+            .flat_map(|e| [gate_up(layer, e, 44), down(layer, e, 53)])
+            .collect()
+    }
+
+    #[test]
+    fn dtype53_maps_to_mq4g128v2_and_rotation_is_g128() {
+        assert_eq!(dtype_from_quant_type(53).unwrap(), DType::MQ4G128V2);
+        assert_eq!(
+            hipfire_dispatch::types::dtype_rotation_plan(DType::MQ4G128V2),
+            hipfire_dispatch::types::RotationPlan::FwhtG128
+        );
+        // Unmapped tags still fail; qt53 never gets a mixed tag.
+        assert!(dtype_from_quant_type(54).is_err());
+        for (g, d) in [
+            (DType::MQ4G256V2, DType::MQ4G128V2),
+            (DType::MQ4G128V2, DType::MQ4G128V2),
+            (DType::MQ4G128V2, DType::MQ4G256V2),
+        ] {
+            let err = mixed_expert_tag(g, d).expect_err("qt53 has no mixed tag");
+            assert!(err.message.contains("qt53"), "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn role_classifier_names() {
+        let role = |n: &str| qt53_role(n);
+        assert_eq!(
+            role("model.language_model.layers.3.mlp.experts.17.down_proj.weight"),
+            Qt53Role::RoutedDown
+        );
+        assert_eq!(role("layers.3.mlp.experts.down_proj"), Qt53Role::RoutedDown);
+        assert_eq!(
+            role("layers.3.mlp.experts.0.gate_up_proj.weight"),
+            Qt53Role::RoutedGateUp
+        );
+        assert_eq!(
+            role("layers.3.mlp.experts.0.down_proj.awq_scale.weight"),
+            Qt53Role::Other
+        );
+        assert_eq!(role("layers.3.mlp.gate.weight"), Qt53Role::Router);
+        assert_eq!(
+            role("layers.3.mlp.shared_expert.down_proj.weight"),
+            Qt53Role::SharedExpert
+        );
+        assert_eq!(
+            role("layers.3.mlp.shared_expert_gate.weight"),
+            Qt53Role::SharedExpert
+        );
+        assert_eq!(role("layers.3.mlp.down_proj.weight"), Qt53Role::DenseFfn);
+        assert_eq!(
+            role("layers.3.linear_attn.out_proj.weight"),
+            Qt53Role::Attention
+        );
+        assert_eq!(
+            role("layers.3.self_attn.q_proj.weight"),
+            Qt53Role::Attention
+        );
+        assert_eq!(role("model.embed_tokens.weight"), Qt53Role::Embedding);
+        assert_eq!(role("lm_head.weight"), Qt53Role::LmHead);
+    }
+
+    #[test]
+    fn files_without_qt53_are_untouched() {
+        let rows = vec![gate_up(0, 0, 44), down(0, 0, 44), down(1, 0, 13)];
+        assert!(check(&rows).is_ok());
+        assert!(check(&[]).is_ok());
+    }
+
+    #[test]
+    fn accepts_a3b_routed_down_beside_qt44_gate_up_per_layer() {
+        let mut rows = good_layer(0);
+        rows.extend(good_layer(1));
+        // Unrelated tensors of every other role stay legal at their own qt.
+        rows.push(fact("layers.0.mlp.gate.weight", 13, &[256, H as u32]));
+        rows.push(fact(
+            "layers.0.self_attn.q_proj.weight",
+            44,
+            &[4096, H as u32],
+        ));
+        assert!(check(&rows).is_ok());
+        // Stacked routed down [E, H, I].
+        let stacked = vec![
+            fact(
+                "layers.0.mlp.experts.down_proj",
+                53,
+                &[256, H as u32, I as u32],
+            ),
+            fact(
+                "layers.0.mlp.experts.gate_up_proj",
+                44,
+                &[256, 1024, H as u32],
+            ),
+        ];
+        assert!(check(&stacked).is_ok());
+    }
+
+    #[test]
+    fn refuses_qt53_in_every_non_routed_down_role() {
+        let roles = [
+            ("layers.0.mlp.gate.weight", "router"),
+            (
+                "layers.0.mlp.shared_expert.down_proj.weight",
+                "shared-expert",
+            ),
+            ("layers.0.mlp.shared_expert_gate.weight", "shared-expert"),
+            ("layers.0.mlp.down_proj.weight", "dense FFN"),
+            ("layers.0.self_attn.q_proj.weight", "attention"),
+            ("layers.0.linear_attn.out_proj.weight", "attention"),
+            ("model.embed_tokens.weight", "embedding"),
+            ("lm_head.weight", "lm_head"),
+            ("layers.0.mlp.experts.0.gate_up_proj.weight", "gate_up"),
+            ("layers.0.mlp.experts.0.up_proj.weight", "gate_up"),
+        ];
+        for (name, label) in roles {
+            let rows = vec![fact(name, 53, &[H as u32, I as u32])];
+            let err = check(&rows).expect_err(name);
+            assert!(err.message.contains("qt53"), "{name}: {}", err.message);
+            assert!(err.message.contains(label), "{name}: {}", err.message);
+            assert!(err.message.contains(name), "{name}: {}", err.message);
+        }
+    }
+
+    #[test]
+    fn refuses_mixed_gate_up_awq_and_wrong_k() {
+        // Mixed down within a layer (qt53 + qt44 down).
+        let mut rows = good_layer(0);
+        rows.push(down(0, 2, 44));
+        let err = check(&rows).expect_err("mixed down");
+        assert!(err.message.contains("mixes qt53"), "{}", err.message);
+
+        // qt53 down with a non-qt44 gate_up.
+        for gate_qt in [13u8, 45, 53] {
+            let rows = vec![gate_up(0, 0, gate_qt), down(0, 0, 53)];
+            let err = check(&rows).expect_err("gate_up must be qt44");
+            assert!(
+                err.message.contains("qt44 gate_up") || err.message.contains("gate_up"),
+                "{}",
+                err.message
+            );
+        }
+
+        // AWQ sidecar on a qt53 layer: on the down and on the gate_up.
+        for sidecar in [
+            "model.language_model.layers.0.mlp.experts.0.down_proj.awq_scale.weight",
+            "model.language_model.layers.0.mlp.experts.0.gate_up_proj.awq_scale.weight",
+        ] {
+            let mut rows = good_layer(0);
+            rows.push(fact(sidecar, 1, &[I as u32]));
+            let err = check(&rows).expect_err("AWQ");
+            assert!(err.message.contains("AWQ"), "{}", err.message);
+        }
+        // An AWQ sidecar in a DIFFERENT, non-qt53 layer does not poison qt53.
+        let mut rows = good_layer(0);
+        rows.push(fact(
+            "model.language_model.layers.5.mlp.experts.0.down_proj.awq_scale.weight",
+            1,
+            &[I as u32],
+        ));
+        assert!(check(&rows).is_ok());
+
+        // Down K != moe_intermediate (and swapped / wrong rank).
+        for shape in [
+            vec![H as u32, 1024],
+            vec![I as u32, H as u32],
+            vec![H as u32],
+            vec![H as u32, I as u32, 1],
+        ] {
+            let rows = vec![fact("layers.0.mlp.experts.0.down_proj.weight", 53, &shape)];
+            let err = check(&rows).expect_err("K");
+            assert!(err.message.contains("moe_intermediate"), "{}", err.message);
+        }
     }
 }

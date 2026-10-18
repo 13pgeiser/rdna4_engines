@@ -828,7 +828,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "2326440b1210f8f069ab34c0246f8bf7af30969b44eb0f3c563660039fe93bdb",
+      "sha256": "a8f8c821293c5c3bb61457a1fe3c3524709003688eea3d56f1218d430510e203",
       "symbols": [
         "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded"
       ],
@@ -3308,7 +3308,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "2326440b1210f8f069ab34c0246f8bf7af30969b44eb0f3c563660039fe93bdb",
+          "sha256": "a8f8c821293c5c3bb61457a1fe3c3524709003688eea3d56f1218d430510e203",
           "symbols": [
             "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded"
           ],

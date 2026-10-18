@@ -1825,6 +1825,7 @@ fn down_stage(
             p.down_k,
             p.batch_size,
             p.n_exp,
+            10,
         ))?;
         // The combine rounds every expert output it reads to BF16 itself.
     }

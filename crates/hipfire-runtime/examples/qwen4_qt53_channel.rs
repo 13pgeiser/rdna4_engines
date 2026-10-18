@@ -704,6 +704,7 @@ fn indexed_top10(gpu: &mut Gpu) -> Result<(), String> {
         k,
         tokens,
         experts_count,
+        10,
     )
     .map_err(|error| error.to_string())?;
     let expanded_host = gpu

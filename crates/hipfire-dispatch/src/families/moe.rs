@@ -865,6 +865,46 @@ impl MoeDtypes<'_> {
                 .per_expert_down
                 .is_some_and(|values| values.iter().copied().any(is_fp8))
     }
+
+    /// The one narrow qwen35 qt53 routed-down typed fallback shape: uniform
+    /// routed gate/up `MQ4G256V2` (qt44) + uniform routed down `MQ4G128V2`
+    /// (qt53), no mixed tiers or per-expert tag shape, no Paro, and qt53 (or
+    /// any planar MQ-I4 / qt=55) nowhere else (router, shared selector,
+    /// shared gate/up/down). Pure dtype shape only; tags and AWQ sidecars are
+    /// not part of this snapshot and are refused by the pipeline stages.
+    /// Admission of this shape applies only to MoE without a route policy
+    /// (callers reach it through `route.is_none()`).
+    pub fn qt53_routed_down_fallback(&self) -> bool {
+        let uniform = |table: Option<&[DType]>, expected: DType| {
+            table.map_or(true, |values| values.iter().all(|dtype| *dtype == expected))
+        };
+        let qt53_or_mq_i4 = |dtype: DType| dtype == DType::MQ4G128V2 || dtype.is_mq_i4();
+        self.routed_gate_up == DType::MQ4G256V2
+            && self.routed_down == DType::MQ4G128V2
+            && !self.routed_has_mixed_experts
+            && !self.has_paro_shared
+            && uniform(self.per_expert_gate_up, DType::MQ4G256V2)
+            && uniform(self.per_expert_down, DType::MQ4G128V2)
+            && !qt53_or_mq_i4(self.router)
+            && !self.shared.is_some_and(|shared| {
+                [shared.selector, shared.gate, shared.up, shared.down]
+                    .into_iter()
+                    .any(qt53_or_mq_i4)
+            })
+            && !self.has_fp8_b128_projection()
+    }
+}
+
+/// Typed refusal for the qwen35 qt53 routed-down fallback: the shape is
+/// admitted but the live device/route cannot launch it, so it is refused
+/// before any launch (never a silent per-expert GEMV or CPU fallback).
+pub(crate) fn qt53_fallback_unsupported(variant: &'static str) -> DispatchError {
+    DispatchError::UnsupportedVariant {
+        family: "moe",
+        variant,
+        arch: "",
+        quant: "MQ4G128V2",
+    }
 }
 
 /// Resolved fused-vs-fallback eligibility for one MoE decode layer. This IS the
@@ -952,6 +992,14 @@ pub struct MoeResolution {
     /// set. Resolution stays infallible; [`Self::check_generic_route`] raises
     /// the typed refusal at execution.
     pub fp8_b128_refused: bool,
+    /// Uniform qt44 gate/up + qt53 down without a route policy (see
+    /// [`MoeDtypes::qt53_routed_down_fallback`]): lowers on the GPU top-K
+    /// indexed path with the F32 FWHT128 down recipe. Decode requires `k == 8`.
+    pub routed_indexable_qt53_f32: bool,
+    /// Refusal state: the qt53 fallback shape is present but `k != 8` leaves no
+    /// GPU top-K route; [`Self::check_generic_route`] raises the typed refusal
+    /// (the per-expert CPU fallback has no qt53 GEMV).
+    pub qt53_fallback_refused: bool,
 }
 
 impl MoeResolution {
@@ -1066,6 +1114,8 @@ impl MoeResolution {
             && routed_gate_up_e8
             && matches!(d.routed_down, MFP4G32E8 | MFP3G32E8 | MFP2G32E8);
 
+        let routed_indexable_qt53_f32 = d.qt53_routed_down_fallback();
+
         let routed_dtype_indexable = routed_indexable_mq4
             || routed_indexable_mq4v2
             || routed_indexable_mq5
@@ -1078,9 +1128,11 @@ impl MoeResolution {
             || routed_indexable_mq3lloyd
             || routed_indexable_mixed_lloyd
             || routed_indexable_paro
-            || routed_indexable_e8;
+            || routed_indexable_e8
+            || routed_indexable_qt53_f32;
 
         let use_gpu_topk = k == 8 && routed_dtype_indexable;
+        let qt53_fallback_refused = routed_indexable_qt53_f32 && !use_gpu_topk;
         let needs_x_rot_local = gate_side_mq4
             || gate_fusable_mq4v2
             || routed_indexable_mixed_per_expert
@@ -1140,6 +1192,8 @@ impl MoeResolution {
             needs_x_rot_local,
             mixed,
             fp8_b128_refused: false,
+            routed_indexable_qt53_f32,
+            qt53_fallback_refused,
         }
     }
 
@@ -1175,6 +1229,8 @@ impl MoeResolution {
             needs_x_rot_local: false,
             mixed: false,
             fp8_b128_refused: true,
+            routed_indexable_qt53_f32: false,
+            qt53_fallback_refused: false,
         }
     }
 
@@ -1187,6 +1243,13 @@ impl MoeResolution {
     ) -> Result<(), DispatchError> {
         if self.fp8_b128_refused && !route.is_some_and(MoeRouteCapability::is_fp8_grouped) {
             return Err(fp8_b128_generic_refusal());
+        }
+        // qwen35 qt53 routed-down typed fallback: the specialized Flash-Next route
+        // never consults this state.
+        if self.qt53_fallback_refused && !route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
+            return Err(qt53_fallback_unsupported(
+                "qt53-routed-down-fallback-needs-gpu-topk-k8",
+            ));
         }
         Ok(())
     }
@@ -1203,6 +1266,7 @@ impl MoeResolution {
             || self.routed_indexable_mq3lloyd
             || self.routed_indexable_mixed_lloyd
             || self.routed_indexable_paro
+            || self.routed_indexable_qt53_f32
     }
 }
 
@@ -2127,6 +2191,19 @@ pub fn gated_moe_prefill_admissible_for_dtypes(
         return true;
     }
 
+    // qwen35 qt53 routed-down typed fallback: uniform qt44 gate/up + uniform qt53
+    // down. The shared expert stays an MQ4/MQ6 (G256) dense projection pair.
+    if dtypes.expert_gate_up == DType::MQ4G256V2 && dtypes.expert_down == DType::MQ4G128V2 {
+        let shared_gu_dt = dtypes.shared_expert_gate;
+        let shared_ok = |dtype: DType| {
+            matches!(dtype, DType::MQ4G256 | DType::MQ4G256V2)
+                || (admit_mq6 && matches!(dtype, DType::MQ6G256 | DType::MQ6G256V2))
+        };
+        return shared_ok(shared_gu_dt)
+            && dtypes.shared_expert_up == shared_gu_dt
+            && shared_ok(dtypes.shared_expert_down);
+    }
+
     if admit_mq6 {
         let shared_gu_dt = dtypes.shared_expert_gate;
         let shared_gu_ok = matches!(
@@ -2263,6 +2340,11 @@ pub struct MoePrefillResolution {
     /// disabled. Resolution stays infallible; [`Self::check_generic_route`]
     /// raises the typed refusal at execution.
     pub fp8_b128_refused: bool,
+    /// Refusal state: the qwen35 qt53 routed-down fallback shape is present on
+    /// a Path 0 (gfx9 atomic-GEMV) device, which has no qt53 down; the
+    /// typed refusal is raised before any launch. Never set for FP8 or for a
+    /// layer on the specialized Flash-Next route (exempt in the check).
+    pub qt53_refused: bool,
 }
 
 impl MoePrefillResolution {
@@ -2309,6 +2391,7 @@ impl MoePrefillResolution {
                 paro_mode: false,
                 force_mq4_grouped_fp16: false,
                 fp8_b128_refused: true,
+                qt53_refused: false,
             };
         }
         let paro_mode = d.routed_gate_up == DType::ParoQ4G128 && d.has_paro_shared;
@@ -2400,6 +2483,7 @@ impl MoePrefillResolution {
             paro_mode,
             force_mq4_grouped_fp16,
             fp8_b128_refused: false,
+            qt53_refused: d.qt53_routed_down_fallback() && down_path0 && !use_path2,
         }
     }
 
@@ -2415,6 +2499,7 @@ impl MoePrefillResolution {
             paro_mode: false,
             force_mq4_grouped_fp16: false,
             fp8_b128_refused: false,
+            qt53_refused: false,
         }
     }
 
@@ -2427,6 +2512,11 @@ impl MoePrefillResolution {
     ) -> Result<(), DispatchError> {
         if self.fp8_b128_refused && !route.is_some_and(MoeRouteCapability::is_fp8_grouped) {
             return Err(fp8_b128_generic_refusal());
+        }
+        if self.qt53_refused && !route.is_some_and(MoeRouteCapability::is_sealed_grouped) {
+            return Err(qt53_fallback_unsupported(
+                "qt53-routed-down-fallback-path0-unsupported",
+            ));
         }
         Ok(())
     }
@@ -2761,7 +2851,7 @@ mod tests {
         d
     }
 
-    fn prefill_resolution_fields(r: &MoePrefillResolution) -> [bool; 7] {
+    fn prefill_resolution_fields(r: &MoePrefillResolution) -> [bool; 8] {
         // Exhaustive destructuring makes a new resolution field require an
         // explicit comparison here, without changing the production API.
         let MoePrefillResolution {
@@ -2772,6 +2862,7 @@ mod tests {
             paro_mode,
             force_mq4_grouped_fp16,
             fp8_b128_refused,
+            qt53_refused,
         } = r;
         [
             *use_path2,
@@ -2781,6 +2872,7 @@ mod tests {
             *paro_mode,
             *force_mq4_grouped_fp16,
             *fp8_b128_refused,
+            *qt53_refused,
         ]
     }
 
@@ -2931,7 +3023,8 @@ mod tests {
                             false,
                             dtype == DType::ParoQ4G128,
                             false,
-                            false
+                            false,
+                            false // qt53_refused: none of these dtypes is qt53
                         ],
                         "{arch_name}, {dtype:?}, batch={batch}",
                     );
@@ -3095,7 +3188,8 @@ mod tests {
                     );
                     assert_eq!(
                         prefill_resolution_fields(&r),
-                        [false, false, false, false, false, false, true],
+                        // qwen35 qt53 routed-down typed fallback: eighth field is qt53_refused.
+                        [false, false, false, false, false, false, true, false],
                         "{arch_name} batch={batch}",
                     );
                     assert!(fp8_b128_refusal(r.check_generic_route(None).unwrap_err()));
@@ -3202,5 +3296,276 @@ mod tests {
         assert_eq!(uniform(W3), Some(Some(1)));
         assert_eq!(uniform(E8P), Some(Some(3)));
         assert_eq!(uniform(W2), None);
+    }
+
+    fn qt53_fallback_dtypes() -> MoeDtypes<'static> {
+        MoeDtypes {
+            routed_gate_up: DType::MQ4G256V2,
+            routed_down: DType::MQ4G128V2,
+            experts_all_gate_up_mq4: false,
+            ..uniform_mq4()
+        }
+    }
+
+    /// Pure shape table of the qwen35 qt53 routed-down typed fallback: only
+    /// uniform qt44 gate/up + uniform qt53 down, qt53 nowhere else.
+    #[test]
+    fn qt53_fallback_dtype_shape_table() {
+        static MIXED_DOWN: [DType; 2] = [DType::MQ4G128V2, DType::MQ4G256V2];
+        static MIXED_GATE_UP: [DType; 2] = [DType::MQ4G256V2, DType::MQ4G256];
+        static UNIFORM_GATE_UP: [DType; 3] = [DType::MQ4G256V2; 3];
+        static UNIFORM_DOWN: [DType; 3] = [DType::MQ4G128V2; 3];
+        let base = qt53_fallback_dtypes();
+        assert!(base.qt53_routed_down_fallback());
+        let accepted = MoeDtypes {
+            per_expert_gate_up: Some(&UNIFORM_GATE_UP),
+            per_expert_down: Some(&UNIFORM_DOWN),
+            ..base
+        };
+        assert!(accepted.qt53_routed_down_fallback());
+        let shared = |edit: fn(&mut MoeSharedDtypes)| {
+            let mut d = qt53_fallback_dtypes();
+            let mut s = d.shared.unwrap();
+            edit(&mut s);
+            d.shared = Some(s);
+            d
+        };
+        let refused = [
+            MoeDtypes {
+                routed_down: DType::MQ4G256V2,
+                ..base
+            },
+            MoeDtypes {
+                routed_gate_up: DType::MQ4G256,
+                ..base
+            },
+            MoeDtypes {
+                routed_gate_up: DType::MQ4G128V2,
+                routed_down: DType::MQ4G256V2,
+                ..base
+            },
+            MoeDtypes {
+                routed_gate_up: DType::MQ4G128V2,
+                ..base
+            },
+            MoeDtypes {
+                routed_has_mixed_experts: true,
+                ..base
+            },
+            MoeDtypes {
+                has_paro_shared: true,
+                ..base
+            },
+            MoeDtypes {
+                router: DType::MQ4G128V2,
+                ..base
+            },
+            MoeDtypes {
+                per_expert_down: Some(&MIXED_DOWN),
+                ..base
+            },
+            MoeDtypes {
+                per_expert_gate_up: Some(&MIXED_GATE_UP),
+                ..base
+            },
+            MoeDtypes {
+                shared: None,
+                routed_down: DType::MQ6G256V2,
+                ..base
+            },
+            shared(|s| s.selector = DType::MQ4G128V2),
+            shared(|s| s.gate = DType::MQ4G128V2),
+            shared(|s| s.up = DType::MQ4G128V2),
+            shared(|s| s.down = DType::MQ4G128V2),
+            shared(|s| s.down = DType::FP8E4M3B128),
+            MoeDtypes {
+                router: DType::FP8E4M3B128,
+                ..base
+            },
+        ];
+        for (index, d) in refused.iter().enumerate() {
+            assert!(!d.qt53_routed_down_fallback(), "case {index}");
+        }
+        // No-shared recipe with the same routed pair stays in the shape.
+        assert!(MoeDtypes {
+            shared: None,
+            ..base
+        }
+        .qt53_routed_down_fallback());
+    }
+
+    /// Decode resolution: the shape lowers on the GPU top-K indexed path only at
+    /// k == 8; any other k is a typed refusal (no per-expert CPU fallback has a
+    /// qt53 GEMV). qt53 never claims a V2 256 indexed flag.
+    #[test]
+    fn qt53_fallback_decode_resolution_requires_gpu_topk_k8() {
+        let d = qt53_fallback_dtypes();
+        for has_wmma in [false, true] {
+            let r = MoeResolution::resolve_arch(&d, 8, has_wmma);
+            assert!(r.routed_indexable_qt53_f32 && r.routed_indexable());
+            assert!(r.use_gpu_topk && r.needs_x_rot_local && !r.qt53_fallback_refused);
+            assert!(!r.routed_indexable_mq4v2 && !r.mixed && !r.fp8_b128_refused);
+            r.check_generic_route(None).unwrap();
+            for k in [1usize, 4, 10] {
+                let r = MoeResolution::resolve_arch(&d, k, has_wmma);
+                assert!(!r.use_gpu_topk && r.qt53_fallback_refused, "k={k}");
+                assert!(matches!(
+                    r.check_generic_route(None),
+                    Err(DispatchError::UnsupportedVariant {
+                        family: "moe",
+                        variant: "qt53-routed-down-fallback-needs-gpu-topk-k8",
+                        quant: "MQ4G128V2",
+                        ..
+                    })
+                ));
+            }
+        }
+        // A non-qt53 shape never carries the qt53 flags.
+        let r = MoeResolution::resolve_arch(&uniform_mq4(), 8, false);
+        assert!(!r.routed_indexable_qt53_f32 && !r.qt53_fallback_refused);
+    }
+
+    /// Prefill resolution: Path 0 (gfx9 atomic GEMV, no qt53 down) refuses the
+    /// shape before any launch; Path 1 / Path 2 archs keep their legacy routing.
+    #[test]
+    fn qt53_fallback_prefill_resolution_refuses_only_path0_archs() {
+        let d = qt53_fallback_dtypes();
+        for (arch_name, path0, path2) in [
+            ("gfx942", true, false),
+            ("gfx906", true, false),
+            ("gfx1030", false, false),
+            ("gfx1100", false, true),
+            ("gfx1151", false, true),
+            ("gfx1201", false, true),
+        ] {
+            let ctx = crate::context::DispatchCtx::for_test(arch_name);
+            let r = MoePrefillResolution::resolve(&d, &ctx.arch, &ctx.flags);
+            assert_eq!((r.down_path0, r.use_path2), (path0, path2), "{arch_name}");
+            assert_eq!(r.qt53_refused, path0, "{arch_name}");
+            match r.check_generic_route(None) {
+                Ok(()) => assert!(!path0, "{arch_name}"),
+                Err(err) => assert!(
+                    path0
+                        && matches!(
+                            err,
+                            DispatchError::UnsupportedVariant {
+                                family: "moe",
+                                variant: "qt53-routed-down-fallback-path0-unsupported",
+                                quant: "MQ4G128V2",
+                                ..
+                            }
+                        ),
+                    "{arch_name}"
+                ),
+            }
+            // Every other dtype shape keeps the legacy fields exactly.
+            let legacy = MoePrefillResolution::resolve(&uniform_mq4(), &ctx.arch, &ctx.flags);
+            assert!(!legacy.qt53_refused, "{arch_name}");
+        }
+    }
+
+    /// The Flash-Next route (`route_policy = Some(Qt44Qt53Grouped*)`) never
+    /// consults the qt53 fallback refusal: its fixed top-10 / Path 0 shapes
+    /// still pass the generic guards exactly as before.
+    #[test]
+    fn qt53_fallback_refusal_is_exempt_for_sealed_grouped_routes() {
+        let d = qt53_fallback_dtypes();
+        let decode = MoeResolution::resolve_arch(&d, 10, false);
+        assert!(decode.qt53_fallback_refused && !decode.use_gpu_topk);
+        let ctx = crate::context::DispatchCtx::for_test("gfx942");
+        let prefill = MoePrefillResolution::resolve(&d, &ctx.arch, &ctx.flags);
+        assert!(prefill.qt53_refused);
+        for route in [
+            MoeRouteCapability::Qt44Qt53Grouped,
+            MoeRouteCapability::Qt44Qt53GroupedSymmetric,
+            MoeRouteCapability::SlabCodecGrouped,
+        ] {
+            decode.check_generic_route(Some(route)).unwrap();
+            prefill.check_generic_route(Some(route)).unwrap();
+        }
+        assert!(decode.check_generic_route(None).is_err());
+        assert!(prefill.check_generic_route(None).is_err());
+    }
+
+    /// Batched-prefill dtype snapshot admission: only uniform qt44 gate/up +
+    /// qt53 down over MQ4/MQ6 G256 shared projections; qt53 anywhere else or
+    /// beside another gate/up stays refused.
+    #[test]
+    fn qt53_fallback_prefill_snapshot_admission_is_narrow() {
+        let base = MoePrefillDtypes {
+            expert_gate_up: DType::MQ4G256V2,
+            expert_down: DType::MQ4G128V2,
+            ..MoePrefillDtypes::uniform(DType::MQ4G256V2)
+        };
+        let admits = |d: &MoePrefillDtypes, mq6: bool| {
+            gated_moe_prefill_admissible_for_dtypes(d, mq6, false, false, false)
+        };
+        assert!(admits(&base, false) && admits(&base, true));
+        assert!(!admits(
+            &MoePrefillDtypes {
+                expert_gate_up: DType::MQ4G256,
+                ..base
+            },
+            false
+        ));
+        assert!(!admits(
+            &MoePrefillDtypes {
+                expert_gate_up: DType::MQ6G256V2,
+                ..base
+            },
+            true
+        ));
+        assert!(!admits(
+            &MoePrefillDtypes {
+                shared_expert_down: DType::MQ4G128V2,
+                ..base
+            },
+            false
+        ));
+        assert!(!admits(
+            &MoePrefillDtypes {
+                shared_expert_gate: DType::MQ4G128V2,
+                shared_expert_up: DType::MQ4G128V2,
+                ..base
+            },
+            false
+        ));
+        assert!(!admits(
+            &MoePrefillDtypes {
+                router: DType::MQ4G128V2,
+                ..base
+            },
+            false
+        ));
+        assert!(!admits(
+            &MoePrefillDtypes {
+                expert_down_uniform: false,
+                ..base
+            },
+            false
+        ));
+        assert!(!admits(
+            &MoePrefillDtypes {
+                expert_gate_up_uniform: false,
+                ..base
+            },
+            false
+        ));
+        // MQ6 shared projections are only admitted under the MQ6 policy switch.
+        let mq6_shared = MoePrefillDtypes {
+            shared_expert_gate: DType::MQ6G256V2,
+            shared_expert_up: DType::MQ6G256V2,
+            shared_expert_down: DType::MQ6G256V2,
+            ..base
+        };
+        assert!(!admits(&mq6_shared, false) && admits(&mq6_shared, true));
+        // The pre-existing qt53-down refusal for any other gate_up is unchanged.
+        assert!(!admits(
+            &MoePrefillDtypes {
+                expert_down: DType::MQ4G128V2,
+                ..MoePrefillDtypes::uniform(DType::MQ4G256)
+            },
+            false
+        ));
     }
 }

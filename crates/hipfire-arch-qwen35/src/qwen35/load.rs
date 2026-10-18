@@ -13,6 +13,7 @@ use super::weights::build_expert_binding;
 use super::weights::dtype_from_quant_type;
 use super::weights::hfq_source_fingerprint;
 use super::weights::mixed_expert_tag;
+use super::weights::validate_qt53_admission;
 use super::weights::DeltaNetLayerWeights;
 use super::weights::ExpertWeights;
 use super::weights::FullAttnLayerWeights;
@@ -22,12 +23,15 @@ use super::weights::MoeFfnWeights;
 use super::weights::MoeParoSidecars;
 use super::weights::MoeProjectionSource;
 use super::weights::PackedExpertOwners;
+use super::weights::Qt53Fact;
 use super::weights::Qwen35EpConfigFingerprint;
 use super::weights::Qwen35EpShardInfo;
 use super::weights::Qwen35HfqSourceIdentity;
 use super::weights::Qwen35RankSeal;
 use super::weights::Qwen35Weights;
 use super::weights::SharedExpertWeights;
+use super::weights::QT_MQ4G128V2;
+use super::weights::QT_MQ4G256V2;
 use hip_bridge::DeviceBuffer;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
@@ -147,6 +151,55 @@ fn load_norm_weight(
     let (info, data) =
         qwen35_tensor_data_vec(hfq, name).unwrap_or_else(|| panic!("tensor not found: {name}"));
     dequant_norm(gpu, info.quant_type, &data, shape, QWEN35_NORM_BIAS)
+}
+
+/// Bytes of one row-local MQ4G128V2 (qt53) blob: `m * ceil(k/128) * 68`.
+/// `None` on overflow, `m == 0` or `k == 0`.
+fn mq4g128v2_blob_bytes(m: usize, k: usize) -> Option<usize> {
+    if m == 0 || k == 0 {
+        return None;
+    }
+    m.checked_mul(k.div_ceil(128))?
+        .checked_mul(rdna_compute::MQ4G128V2_GROUP_BYTES)
+}
+
+/// Pure CPU validation of one MQ4G128V2 (qt53) tensor blob, shared by the
+/// ordinary loaders and the MTP head loader.
+///
+/// The row-local layout is `ceil(k/128)` groups of 68 B per row —
+/// `[f16 scale][f16 zero][64 B nibbles]` — with a final partial group allowed,
+/// so any `k > 0` is legal (127/129 included). The blob must be EXACTLY
+/// `m * ceil(k/128) * 68` bytes (overflow-checked) and every group's fp16
+/// scale and zero must be finite (exponent field not all-ones). Role
+/// admission (routed-expert down only) is NOT decided here; see
+/// [`super::weights::validate_qt53_admission`].
+pub(crate) fn validate_mq4g128v2_blob(data: &[u8], m: usize, k: usize) -> Result<(), String> {
+    if m == 0 || k == 0 {
+        return Err(format!("MQ4G128V2 requires m>0 and k>0, got M={m} K={k}"));
+    }
+    let expected = mq4g128v2_blob_bytes(m, k)
+        .ok_or_else(|| format!("MQ4G128V2 blob length overflows usize: M={m} K={k}"))?;
+    if data.len() != expected {
+        return Err(format!(
+            "MQ4G128V2 blob length mismatch: expected {expected}, got {} (M={m} K={k})",
+            data.len()
+        ));
+    }
+    for (group, header) in data
+        .chunks_exact(rdna_compute::MQ4G128V2_GROUP_BYTES)
+        .enumerate()
+    {
+        let scale = u16::from_le_bytes([header[0], header[1]]);
+        let zero = u16::from_le_bytes([header[2], header[3]]);
+        // fp16 inf/NaN: exponent field (bits 14..10) all ones.
+        if scale & 0x7C00 == 0x7C00 || zero & 0x7C00 == 0x7C00 {
+            return Err(format!(
+                "MQ4G128V2 group {group} has a non-finite fp16 header \
+                 (scale=0x{scale:04x} zero=0x{zero:04x}) (M={m} K={k})"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Shared quant-type dispatch for a projection weight at `target`.
@@ -565,6 +618,28 @@ fn load_weight_tensor_raw_with(
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ4G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
+            })
+        }
+        53 => {
+            // MQ4G128V2 (qt=53): row-local 68 B per ceil(K/128) group. Reaches
+            // here only for routed-expert down tensors: file-level
+            // `validate_qt53_admission` (run before any upload) refuses every
+            // other role, mixed tier and AWQ. Exact length + finite headers are
+            // checked here; placement (device / host-mapped) rides `target`.
+            validate_mq4g128v2_blob(data, m, k)
+                .map_err(|e| HipError::new(0, &format!("qwen35: qt53 {e}")))?;
+            let buf = upload_codes(gpu, target, data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ4G128V2,
                 m,
                 k,
                 row_stride: 0,
@@ -2929,6 +3004,10 @@ impl WeightSource for HfqSource<'_> {
         self.hfq.mq4v2_symmetric()
     }
     fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
+        // Single early file-level qt53 (MQ4G128V2) admission: wrong role,
+        // mixed tier, AWQ, bad K or an unsupported mode fails here, before the
+        // first upload of any resident, host-mapped or per-expert path.
+        validate_hfq_qt53_admission(self.hfq, self.c)?;
         // Partial GPU offload is resolved by the loader (see
         // `hipfire_runtime::offload`), which also prints the residency line; this
         // source no longer decides or announces placement.
@@ -3766,6 +3845,63 @@ fn qwen35_hfq_sidecar_sources(
         .collect()
 }
 
+/// Container facts of every tensor in `hfq`, for [`validate_qt53_admission`].
+fn hfq_qt53_facts(hfq: &HfqFile) -> Vec<Qt53Fact<'_>> {
+    hfq.tensor_infos()
+        .iter()
+        .map(|info| Qt53Fact {
+            name: &info.name,
+            quant_type: info.quant_type,
+            shape: &info.shape,
+        })
+        .collect()
+}
+
+/// The single early file-level qt53 (MQ4G128V2) admission hook for the
+/// ordinary single-device loader. Pure metadata scan; files without a qt53
+/// tensor pass untouched.
+pub(crate) fn validate_hfq_qt53_admission(hfq: &HfqFile, config: &Qwen35Config) -> HipResult<()> {
+    if !hfq
+        .tensor_infos()
+        .iter()
+        .any(|i| i.quant_type == QT_MQ4G128V2)
+    {
+        return Ok(());
+    }
+    if config.paged_experts {
+        return Err(HipError::new(
+            0,
+            "qwen35: qt53 (MQ4G128V2) is not supported with paged experts \
+             (the weight pager owns the expert buffers)",
+        ));
+    }
+    validate_qt53_admission(
+        &hfq_qt53_facts(hfq),
+        config.dim,
+        config.moe_intermediate_size,
+    )
+}
+
+/// Loudly refuse a qt53 (MQ4G128V2) file in a loading mode that cannot serve
+/// it (sealed EP, dense TP, ...), naming qt53 and the first offending tensor.
+pub(crate) fn reject_hfq_qt53_for_mode(hfq: &HfqFile, mode: &str) -> HipResult<()> {
+    match hfq
+        .tensor_infos()
+        .iter()
+        .find(|info| info.quant_type == QT_MQ4G128V2)
+    {
+        None => Ok(()),
+        Some(info) => Err(HipError::new(
+            0,
+            &format!(
+                "qwen35: qt53 (MQ4G128V2) tensor '{}' is not supported by {mode} loading; \
+                 load it through the ordinary single-device resident or host-mapped path",
+                info.name
+            ),
+        )),
+    }
+}
+
 fn expected_mq4_bytes(m: usize, k: usize) -> Option<usize> {
     if k % 256 != 0 {
         return None;
@@ -4028,6 +4164,8 @@ pub fn preflight_weights_dense_tp(
 ) -> Result<(), String> {
     crate::qwen35::config::validate_dense_tp(config, shard)
         .map_err(|e| format!("preflight: {e}"))?;
+    reject_hfq_qt53_for_mode(hfq, "dense tensor-parallel")
+        .map_err(|e| format!("preflight: {}", e.message))?;
 
     // ── Checked blob-range validation before any GPU init ──
     // HfqFile::open only bounds the index; tensor_data_pread zero-pads short
@@ -4421,6 +4559,7 @@ pub fn load_weights_dense_tp_rank(
     {
         return Err(HipError::new(0, "invalid dense TP rank layout"));
     }
+    reject_hfq_qt53_for_mode(hfq, "dense tensor-parallel")?;
     let dim = config.dim;
     let head_dim = config.head_dim;
     let q_range = layout.q_head_range.clone();
@@ -4951,6 +5090,24 @@ fn packable_expert_dtype(qt: u8, target: MemoryTarget) -> Option<DType> {
     }
 }
 
+/// Uniform per-layer `(gate_up, down)` dtype pair the packer can serve.
+/// Equal-dtype pairs follow [`packable_expert_dtype`]. The single admitted
+/// mixed pair is qt44 gate_up + qt53 down, host-mapped only: on a device
+/// placement it keeps literal per-expert tensors like every other mixed pair.
+fn packable_expert_pair(
+    gate_up_qt: u8,
+    down_qt: u8,
+    target: MemoryTarget,
+) -> Option<(DType, DType)> {
+    if (gate_up_qt, down_qt) == (QT_MQ4G256V2, QT_MQ4G128V2) {
+        return (target == MemoryTarget::HostMapped)
+            .then_some((DType::MQ4G256V2, DType::MQ4G128V2));
+    }
+    let gate_up = packable_expert_dtype(gate_up_qt, target)?;
+    let down = packable_expert_dtype(down_qt, target)?;
+    (gate_up == down).then_some((gate_up, down))
+}
+
 struct PackedExpertSpec {
     gate_up_name: String,
     down_name: String,
@@ -4973,7 +5130,8 @@ struct ResolvedExpert {
 /// or anything else ([`ExpertLayerLayout::Mixed`]).
 #[derive(Debug, PartialEq, Eq)]
 enum ExpertLayerLayout {
-    Uniform(DType),
+    /// `(gate_up dtype, down dtype)` shared by every routed expert.
+    Uniform(DType, DType),
     Mixed,
 }
 
@@ -4990,12 +5148,10 @@ enum ExpertLayerLayout {
 /// fallback: a host-placed graded layer (`.mq4p`, whose expert 0 can be MQ6
 /// ahead of an MQ4 expert 1) reaches the graded packer only through here.
 fn classify_expert_layer(experts: &[ResolvedExpert], target: MemoryTarget) -> ExpertLayerLayout {
-    let mut shape: Option<(DType, usize, usize)> = None;
+    let mut shape: Option<((DType, DType), usize, usize)> = None;
     for expert in experts {
-        let admitted = packable_expert_dtype(expert.gate_up_qt, target)
-            .zip(packable_expert_dtype(expert.down_qt, target))
-            .filter(|(gate_dt, down_dt)| gate_dt == down_dt)
-            .map(|(gate_dt, _)| (gate_dt, expert.gate_up_bytes, expert.down_bytes));
+        let admitted = packable_expert_pair(expert.gate_up_qt, expert.down_qt, target)
+            .map(|pair| (pair, expert.gate_up_bytes, expert.down_bytes));
         let Some(admitted) = admitted else {
             return ExpertLayerLayout::Mixed;
         };
@@ -5006,7 +5162,7 @@ fn classify_expert_layer(experts: &[ResolvedExpert], target: MemoryTarget) -> Ex
         }
     }
     match shape {
-        Some((dtype, _, _)) => ExpertLayerLayout::Uniform(dtype),
+        Some(((gate_up, down), _, _)) => ExpertLayerLayout::Uniform(gate_up, down),
         None => ExpertLayerLayout::Mixed,
     }
 }
@@ -5113,7 +5269,9 @@ fn try_load_packed_experts(
             down_bytes,
         });
     }
-    let ExpertLayerLayout::Uniform(expert_dtype) = classify_expert_layer(&resolved, target) else {
+    let ExpertLayerLayout::Uniform(gate_up_dtype, down_dtype) =
+        classify_expert_layer(&resolved, target)
+    else {
         // A layer that is not uniform belongs to the graded host packer, which
         // declines a device placement (that placement keeps its literal
         // per-expert tensors). Never one host tensor per expert — each pays
@@ -5221,6 +5379,27 @@ fn try_load_packed_experts(
             HostBlob::Owned(results.next().expect("two packed expert jobs").data),
         )
     };
+    if down_dtype == DType::MQ4G128V2 {
+        // qt53 down: exact per-expert extent and finite fp16 headers before
+        // any upload (the packed slices bypass `load_weight_tensor_raw`).
+        let down_all = down_host.as_ref();
+        for (slot, spec) in specs.iter().enumerate() {
+            let blob = down_all
+                .get(slot * down_stride..(slot + 1) * down_stride)
+                .ok_or_else(|| {
+                    HipError::new(
+                        0,
+                        &format!(
+                            "qwen35: qt53 packed down blob truncated at '{}'",
+                            spec.down_name
+                        ),
+                    )
+                })?;
+            validate_mq4g128v2_blob(blob, dim, mi).map_err(|e| {
+                HipError::new(0, &format!("qwen35: qt53 down '{}': {e}", spec.down_name))
+            })?;
+        }
+    }
     let trace = hipfire_config::developer_var_os("HIPFIRE_LOAD_TRACE").is_some();
     let zero_copy =
         matches!(gate_up_host, HostBlob::Borrowed(_)) && matches!(down_host, HostBlob::Borrowed(_));
@@ -5257,7 +5436,7 @@ fn try_load_packed_experts(
     for (slot, spec) in specs.iter().enumerate() {
         let mut gate_up = WeightTensor {
             buf: gate_up_owner.sub_offset(slot * gate_up_stride, gate_up_stride),
-            gpu_dtype: expert_dtype,
+            gpu_dtype: gate_up_dtype,
             m: 2 * mi,
             k: dim,
             row_stride: 0,
@@ -5270,7 +5449,7 @@ fn try_load_packed_experts(
         gate_up.awq_scale = load_awq_scale_for(hfq, gpu, &spec.gate_up_name, dim);
         let mut down = WeightTensor {
             buf: down_owner.sub_offset(slot * down_stride, down_stride),
-            gpu_dtype: expert_dtype,
+            gpu_dtype: down_dtype,
             m: dim,
             k: mi,
             row_stride: 0,
@@ -5354,12 +5533,35 @@ fn try_load_graded_host_experts(
         else {
             return Ok(None);
         };
-        let (Ok(gate_dt), Ok(down_dt)) = (
+        let (gate_dt, down_dt) = match (
             super::weights::dtype_from_quant_type(gate_up_qt),
             super::weights::dtype_from_quant_type(down_qt),
-        ) else {
-            return Ok(None);
+        ) {
+            (Ok(gate_dt), Ok(down_dt)) => (gate_dt, down_dt),
+            (gate, down) => {
+                // An unmapped expert dtype is a load error, never a silent
+                // decline that lets a later fallback misread the bank.
+                let error = gate.err().or(down.err()).expect("one dtype lookup failed");
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "qwen35: graded host experts: expert {expert_id} gate_up qt{gate_up_qt} / \
+                         down qt{down_qt}: {}",
+                        error.message
+                    ),
+                ));
+            }
         };
+        if gate_dt == DType::MQ4G128V2 || down_dt == DType::MQ4G128V2 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "qwen35: graded host expert packing does not support qt53 (MQ4G128V2): \
+                     expert {expert_id} gate_up qt{gate_up_qt} / down qt{down_qt}; qt53 layers \
+                     must be uniform qt44 gate_up + qt53 down"
+                ),
+            ));
+        }
         if matches!(
             gate_dt,
             DType::MQ4G256V2Lloyd | DType::MQ2G256GL | DType::MQ3G256GL
@@ -7117,6 +7319,7 @@ fn load_weights_ep_rank_inner(
     fault: Option<EpFault>,
 ) -> HipResult<Qwen35Weights> {
     let assignment = validate_ep_load_topology(config, mesh, physical_devices, shard, rank, gpu)?;
+    reject_hfq_qt53_for_mode(hfq, "sealed expert-parallel (EP)")?;
     let source_identity = Qwen35HfqSourceIdentity::capture(hfq);
     let config_fingerprint = Qwen35EpConfigFingerprint::capture(config);
     let ctx = SealedEpLoadCtx {
@@ -8349,17 +8552,51 @@ mod packed_host_expert_tests {
         // A layer that is uniform in an admitted dtype keeps the uniform packer.
         assert_eq!(
             classify_expert_layer(&[mq6(), mq6()], host),
-            ExpertLayerLayout::Uniform(DType::MQ6G256)
+            ExpertLayerLayout::Uniform(DType::MQ6G256, DType::MQ6G256)
         );
         assert_eq!(
             classify_expert_layer(&[mq4(), mq4(), mq4()], device),
-            ExpertLayerLayout::Uniform(DType::MQ4G256)
+            ExpertLayerLayout::Uniform(DType::MQ4G256, DType::MQ4G256)
         );
         // qt 15 is host-only: the same uniform layer on the device is not.
         assert_eq!(
             classify_expert_layer(&[mq6(), mq6()], device),
             ExpertLayerLayout::Mixed
         );
+    }
+
+    /// qt44 gate_up + qt53 down is the one admitted mixed pair: host-packed as a
+    /// uniform layer, literal per-expert on the device, and never graded.
+    #[test]
+    fn qt44_gate_up_with_qt53_down_packs_only_host_mapped() {
+        let host = MemoryTarget::HostMapped;
+        let device = MemoryTarget::Device;
+        let a3b = || resolved(44, 53, 1024 * 8 * 136, 2048 * 4 * 68);
+        assert_eq!(
+            classify_expert_layer(&[a3b(), a3b(), a3b()], host),
+            ExpertLayerLayout::Uniform(DType::MQ4G256V2, DType::MQ4G128V2)
+        );
+        assert_eq!(
+            classify_expert_layer(&[a3b(), a3b()], device),
+            ExpertLayerLayout::Mixed
+        );
+        // Mixing the qt53 layer with any other pair or stride is Mixed, so it
+        // reaches the graded packer, which refuses qt53 loudly.
+        assert_eq!(
+            classify_expert_layer(
+                &[a3b(), resolved(44, 44, 1024 * 8 * 136, 2048 * 2 * 136)],
+                host
+            ),
+            ExpertLayerLayout::Mixed
+        );
+        // Reversed or other qt53 pairings are never packable.
+        for (g, d) in [(53u8, 44u8), (53, 53), (13, 53), (45, 53), (44, 52)] {
+            assert_eq!(
+                classify_expert_layer(&[resolved(g, d, 8 << 20, 4 << 20)], host),
+                ExpertLayerLayout::Mixed,
+                "({g},{d})"
+            );
+        }
     }
 
     /// Real loader views must preserve numerical output at nonzero offsets,
@@ -8570,5 +8807,120 @@ mod packed_host_expert_tests {
             "PACKED_HOST_EXPERT_PARITY PASS: {path} (GPU bits; CPU widths 4/2/1 when supported)"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod qt53_blob_tests {
+    use super::*;
+
+    const GROUP: usize = 68;
+
+    /// `m * ceil(k/128)` groups of 68 B with a symmetric finite header
+    /// (scale 1.0 = 0x3C00, zero -8.0 = 0xC800) and a distinct payload.
+    fn blob(m: usize, k: usize) -> Vec<u8> {
+        let groups = m * k.div_ceil(128);
+        let mut out = Vec::with_capacity(groups * GROUP);
+        for g in 0..groups {
+            out.extend_from_slice(&0x3C00u16.to_le_bytes());
+            out.extend_from_slice(&0xC800u16.to_le_bytes());
+            out.extend((0..64).map(|i| (g + i) as u8));
+        }
+        out
+    }
+
+    #[test]
+    fn accepts_a3b_down_shape() {
+        // A3B routed down: [H=2048, I=512] -> 2048 rows x 4 groups x 68 B.
+        let data = blob(2048, 512);
+        assert_eq!(data.len(), 2048 * 4 * 68);
+        assert_eq!(mq4g128v2_blob_bytes(2048, 512), Some(data.len()));
+        validate_mq4g128v2_blob(&data, 2048, 512).unwrap();
+    }
+
+    #[test]
+    fn accepts_ceil_groups_for_partial_last_group() {
+        for k in [1usize, 127, 128, 129, 255, 256, 257] {
+            let data = blob(3, k);
+            assert_eq!(data.len(), 3 * k.div_ceil(128) * 68, "k={k}");
+            validate_mq4g128v2_blob(&data, 3, k).unwrap_or_else(|e| panic!("k={k}: {e}"));
+        }
+        // 127 and 129 straddle the 128 boundary: 1 vs 2 groups per row.
+        assert_eq!(mq4g128v2_blob_bytes(1, 127), Some(68));
+        assert_eq!(mq4g128v2_blob_bytes(1, 129), Some(136));
+    }
+
+    #[test]
+    fn rejects_zero_dims() {
+        let data = blob(2, 128);
+        assert!(validate_mq4g128v2_blob(&data, 0, 128).is_err());
+        assert!(validate_mq4g128v2_blob(&data, 2, 0).is_err());
+        assert!(validate_mq4g128v2_blob(&[], 0, 0).is_err());
+        assert_eq!(mq4g128v2_blob_bytes(0, 128), None);
+        assert_eq!(mq4g128v2_blob_bytes(2, 0), None);
+    }
+
+    #[test]
+    fn rejects_short_and_long_blobs() {
+        let data = blob(4, 512);
+        assert!(validate_mq4g128v2_blob(&data[..data.len() - 1], 4, 512).is_err());
+        assert!(validate_mq4g128v2_blob(&data[..data.len() - GROUP], 4, 512).is_err());
+        assert!(validate_mq4g128v2_blob(&[], 4, 512).is_err());
+        let mut long = data.clone();
+        long.push(0);
+        assert!(validate_mq4g128v2_blob(&long, 4, 512).is_err());
+        long.truncate(data.len());
+        long.extend_from_slice(&[0u8; GROUP]);
+        assert!(validate_mq4g128v2_blob(&long, 4, 512).is_err());
+        // Right bytes, wrong shape (qt44's 256-group stride is not qt53's).
+        assert!(validate_mq4g128v2_blob(&data, 4, 256).is_err());
+        assert!(validate_mq4g128v2_blob(&data, 2, 1024).is_ok());
+    }
+
+    #[test]
+    fn rejects_overflowing_extent_without_wrapping() {
+        assert_eq!(mq4g128v2_blob_bytes(usize::MAX, 128), None);
+        assert_eq!(mq4g128v2_blob_bytes(usize::MAX / 68 + 1, 128), None);
+        assert_eq!(mq4g128v2_blob_bytes(3, usize::MAX), None);
+        for (m, k) in [
+            (usize::MAX, 128),
+            (usize::MAX / 68 + 1, 128),
+            (3, usize::MAX),
+        ] {
+            let err = validate_mq4g128v2_blob(&[0u8; 68], m, k).expect_err("overflow");
+            assert!(err.contains("overflow"), "{err}");
+        }
+    }
+
+    #[test]
+    fn rejects_nonfinite_fp16_headers_in_any_group() {
+        let finite = blob(2, 256);
+        validate_mq4g128v2_blob(&finite, 2, 256).unwrap();
+        let groups = finite.len() / GROUP;
+        // inf / NaN in scale or zero, signed, first / middle / last group.
+        for bits in [0x7C00u16, 0xFC00, 0x7E00, 0x7FFF, 0xFFFF] {
+            for group in [0, groups / 2, groups - 1] {
+                for offset in [0usize, 2] {
+                    let mut data = finite.clone();
+                    let at = group * GROUP + offset;
+                    data[at..at + 2].copy_from_slice(&bits.to_le_bytes());
+                    let err = validate_mq4g128v2_blob(&data, 2, 256)
+                        .expect_err("non-finite header must be rejected");
+                    assert!(err.contains("non-finite"), "{err}");
+                    assert!(err.contains(&format!("group {group}")), "{err}");
+                }
+            }
+        }
+        // Largest finite fp16 (0x7BFF), subnormal and signed zero are finite.
+        for bits in [0x7BFFu16, 0xFBFF, 0x0001, 0x0000, 0x8000, 0x8001] {
+            let mut data = finite.clone();
+            data[0..2].copy_from_slice(&bits.to_le_bytes());
+            data[2..4].copy_from_slice(&bits.to_le_bytes());
+            validate_mq4g128v2_blob(&data, 2, 256).unwrap();
+        }
+        // Non-header payload bytes are never interpreted as a header.
+        let mut data = finite.clone();
+        data[4..68].fill(0xFF);
+        validate_mq4g128v2_blob(&data, 2, 256).unwrap();
     }
 }

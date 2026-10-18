@@ -1983,7 +1983,7 @@ fn old_kernel_parity(
     )
     .map_err(err)?;
     gpu.gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded(
-        &dt, &tk, &xd, &yd, DOWN_M, DOWN_K, c, N_EXPERTS,
+        &dt, &tk, &xd, &yd, DOWN_M, DOWN_K, c, N_EXPERTS, 10,
     )
     .map_err(err)?;
     gpu.hip.device_synchronize().map_err(err)?;

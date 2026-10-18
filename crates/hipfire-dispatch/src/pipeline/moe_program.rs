@@ -2636,6 +2636,9 @@ pub(super) fn select_decode(
     }
     if route.is_none() {
         super::reject_mq4g128v2_moe(&params.dtypes)?;
+        // qwen35 qt53 routed-down typed fallback (no route policy only): refuse
+        // tags / AWQ / Paro / CPU-deferred operands before anything is lowered.
+        super::check_qt53_decode_fallback(params, route)?;
     } else {
         resolution.use_gpu_topk = true;
         resolution.needs_x_rot_local = true;
@@ -3444,6 +3447,9 @@ pub(super) fn select_prefill(
     }
     if route.is_none() {
         super::reject_mq4g128v2_moe(&params.dtypes)?;
+        // qwen35 qt53 routed-down typed fallback (no route policy only): refuse
+        // tags / AWQ / Paro / CPU-deferred operands before anything is lowered.
+        super::check_qt53_prefill_fallback(params)?;
     }
     let (host_gate_up, host_down) =
         crate::families::moe::routed_host_mapped_projections(params.routed_experts);

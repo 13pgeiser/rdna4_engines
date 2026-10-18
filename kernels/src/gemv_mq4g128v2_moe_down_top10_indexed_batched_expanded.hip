@@ -20,15 +20,16 @@ extern "C" __global__ void gemv_mq4g128v2_moe_down_top10_indexed_batched_expande
     int M,
     int K,
     int N,
-    int n_exp
+    int n_exp,
+    int k_top
 ) {
     const int row = blockIdx.x;
     const int rank = blockIdx.y;
     const int token = blockIdx.z;
     const int tid = threadIdx.x;
-    if (row >= M || rank >= 10 || token >= N || K <= 0) return;
+    if (row >= M || k_top <= 0 || rank >= k_top || token >= N || K <= 0) return;
 
-    const int flat = token * 10 + rank;
+    const int flat = token * k_top + rank;
     const int expert = topk_indices[flat];
     float acc = 0.0f;
     if (expert >= 0 && expert < n_exp) {

@@ -62,6 +62,7 @@
 use crate::qwen35::Qwen35Weights;
 use hip_bridge::{DeviceBuffer, HipError, HipResult};
 use hipfire_dispatch::pipeline::{run_uniform_moe_down_expanded, run_uniform_moe_gate_up};
+use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::{
@@ -965,6 +966,17 @@ pub fn load_mtp_head_at_offset(
     let meta: serde_json::Value =
         serde_json::from_str(&hfq.metadata_json).expect(".mtp metadata JSON parse failed");
     let config = Qwen35MtpHeadConfig::from_metadata(&meta, max_seq);
+    // Pure metadata prevalidation of every qt53 tensor (roles, uniformity,
+    // shapes, extents, AWQ) before the first upload below. No qt53 => no-op.
+    validate_mtp_qt53_layout(
+        hfq.tensor_infos(),
+        config.ffn_kind == Qwen35MtpFfnKind::Moe,
+        mtp_meta_declares_awq(&meta),
+        config.num_experts,
+        config.n_embd,
+        config.moe_intermediate_size,
+    )
+    .map_err(|error| HipError::new(0, &error))?;
 
     // ── Norms (F32, 1D) ─────────────────────────────────────────────────
     //
@@ -1235,14 +1247,309 @@ fn sanity_check_2d_shape(name: &str, info: &HfqTensorInfo, m: usize, k: usize) {
     );
 }
 
+/// MQ4G128V2 (qt53): admitted in `.mtp` heads ONLY as the routed-expert
+/// `moe_experts.{id}.down` tensor (see [`mtp_qt53_down_expert_id`]).
+const MTP_QT_MQ4G128V2: u8 = 53;
+/// MQ4G256V2 (qt44): the routed gate_up partner of a qt53 down.
+const MTP_QT_MQ4G256V2: u8 = 44;
+
 fn mtp_packed_dtype(quant_type: u8) -> Option<DType> {
     match quant_type {
         13 => Some(DType::MQ4G256),
         15 => Some(DType::MQ6G256),
         44 => Some(DType::MQ4G256V2),
         47 => Some(DType::MQ6G256V2),
+        MTP_QT_MQ4G128V2 => Some(DType::MQ4G128V2),
         _ => None,
     }
+}
+
+/// Routed expert id of an exact canonical `moe_experts.{id}.down` name
+/// (decimal digits, no sign / leading zeros / extra segments); `None` for
+/// every other tensor name.
+fn mtp_qt53_down_expert_id(name: &str) -> Option<usize> {
+    let id = name.strip_prefix("moe_experts.")?.strip_suffix(".down")?;
+    if id.is_empty()
+        || !id.bytes().all(|b| b.is_ascii_digit())
+        || (id.len() > 1 && id.starts_with('0'))
+    {
+        return None;
+    }
+    id.parse().ok()
+}
+
+fn mtp_qt53_role_error(name: &str) -> String {
+    format!(
+        ".mtp tensor '{name}' is MQ4G128V2 (qt=53), which an MTP head admits only for the \
+         routed-expert down projection 'moe_experts.<id>.down'; every other MTP tensor role \
+         (attention, eh_proj, router, shared expert, routed gate_up, dense FFN, lm_head_draft) \
+         must not be qt=53"
+    )
+}
+
+/// Pure per-tensor qt53 admission run BEFORE upload: exact down name, nonzero
+/// geometry, and the shared qt53 blob validator.
+fn mtp_qt53_admit_tensor(name: &str, m: usize, k: usize, data: &[u8]) -> HipResult<()> {
+    if mtp_qt53_down_expert_id(name).is_none() {
+        return Err(HipError::new(0, &mtp_qt53_role_error(name)));
+    }
+    crate::qwen35::load::validate_mq4g128v2_blob(data, m, k)
+        .map_err(|error| HipError::new(0, &format!(".mtp tensor '{name}' qt=53: {error}")))
+}
+
+/// Pure: refusal for the batched MTP head forward when ANY head weight is
+/// MQ4G128V2 (qt53). qt53 routed down has only the serial decode route.
+fn mtp_batched_qt53_refusal(dtypes: impl IntoIterator<Item = DType>) -> Result<(), DispatchError> {
+    if dtypes.into_iter().any(|dtype| dtype == DType::MQ4G128V2) {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "mtp-head",
+            variant: "qt53-batched-mtp-unsupported-use-serial",
+            arch: "",
+            quant: "MQ4G128V2",
+        });
+    }
+    Ok(())
+}
+
+/// Every weight dtype of the head (attention, eh_proj, FFN incl. every routed
+/// expert, lm_head_draft), for [`mtp_batched_qt53_refusal`].
+fn mtp_head_weight_dtypes(w: &Qwen35MtpHeadWeights) -> impl Iterator<Item = DType> + '_ {
+    let fixed = [&w.eh_proj, &w.wq, &w.wk, &w.wv, &w.wo]
+        .into_iter()
+        .chain(w.lm_head_draft.as_ref())
+        .map(|t| t.gpu_dtype);
+    let ffn: Box<dyn Iterator<Item = DType> + '_> = match &w.ffn {
+        Qwen35MtpFfnWeights::Dense(f) => {
+            Box::new([f.gate.gpu_dtype, f.up.gpu_dtype, f.down.gpu_dtype].into_iter())
+        }
+        Qwen35MtpFfnWeights::Moe(f) => Box::new(
+            [
+                f.router.gpu_dtype,
+                f.shared_expert_gate.gpu_dtype,
+                f.shared_expert.gate.gpu_dtype,
+                f.shared_expert.up.gpu_dtype,
+                f.shared_expert.down.gpu_dtype,
+            ]
+            .into_iter()
+            .chain(
+                f.experts
+                    .iter()
+                    .flat_map(|e| [e.gate_up.gpu_dtype, e.down.gpu_dtype]),
+            ),
+        ),
+    };
+    fixed.chain(ffn)
+}
+
+/// Serial-entry route-or-refusal, run before any launch for weights that did
+/// not come through the loader: qt53 anywhere except the uniform routed down
+/// (qt44 gate_up + qt53 down) is refused. Non-qt53 heads pass untouched.
+fn mtp_head_serial_route_check(
+    w: &Qwen35MtpHeadWeights,
+    cfg: &Qwen35MtpHeadConfig,
+) -> HipResult<()> {
+    let outside_routed_down = {
+        let fixed = [&w.eh_proj, &w.wq, &w.wk, &w.wv, &w.wo]
+            .into_iter()
+            .chain(w.lm_head_draft.as_ref())
+            .any(|t| t.gpu_dtype == DType::MQ4G128V2);
+        fixed
+            || match &w.ffn {
+                Qwen35MtpFfnWeights::Dense(f) => [&f.gate, &f.up, &f.down]
+                    .into_iter()
+                    .any(|t| t.gpu_dtype == DType::MQ4G128V2),
+                Qwen35MtpFfnWeights::Moe(f) => [
+                    &f.router,
+                    &f.shared_expert_gate,
+                    &f.shared_expert.gate,
+                    &f.shared_expert.up,
+                    &f.shared_expert.down,
+                ]
+                .into_iter()
+                .any(|t| t.gpu_dtype == DType::MQ4G128V2),
+            }
+    };
+    if outside_routed_down {
+        return Err(HipError::new(
+            0,
+            "MTP head carries MQ4G128V2 (qt=53) outside the routed-expert down projection; \
+             qt=53 is admitted only as moe_experts.<id>.down",
+        ));
+    }
+    if let Qwen35MtpFfnWeights::Moe(f) = &w.ffn {
+        mtp_moe_route_check(
+            f.experts
+                .iter()
+                .map(|e| (e.gate_up.gpu_dtype, e.down.gpu_dtype)),
+            cfg.moe_intermediate_size,
+            cfg.num_experts_per_tok,
+        )
+        .map_err(|error| HipError::new(0, &error))?;
+    }
+    Ok(())
+}
+
+/// True when the head metadata declares an AWQ sidecar (any top-level key
+/// containing `awq` whose value is not null/false/0/empty).
+fn mtp_meta_declares_awq(meta: &serde_json::Value) -> bool {
+    meta.as_object().is_some_and(|object| {
+        object.iter().any(|(key, value)| {
+            key.to_ascii_lowercase().contains("awq")
+                && match value {
+                    serde_json::Value::Null => false,
+                    serde_json::Value::Bool(flag) => *flag,
+                    serde_json::Value::Number(number) => number.as_f64() != Some(0.0),
+                    serde_json::Value::String(text) => !text.is_empty(),
+                    serde_json::Value::Array(items) => !items.is_empty(),
+                    serde_json::Value::Object(map) => !map.is_empty(),
+                }
+        })
+    })
+}
+
+/// Whole-index qt53 admission, metadata only (no payload, no upload).
+///
+/// No qt53 tensor => `Ok` (every existing non-qt53 head is untouched).
+/// Otherwise the head must be MoE and, for EVERY routed expert `0..n_exp`:
+/// `moe_experts.{x}.down` is qt53 (uniform; mixed rejected), shape
+/// `[dim, mi]` (K = mi), group_size 128, exact extent `dim*(mi/128)*68`;
+/// `moe_experts.{x}.gate_up` is qt44, shape `[2*mi, dim]`, exact extent
+/// `2*mi*(dim/256)*136`. No qt53 tensor may carry any other name, and no AWQ
+/// metadata/sidecar may exist.
+fn validate_mtp_qt53_layout(
+    infos: &[HfqTensorInfo],
+    ffn_is_moe: bool,
+    meta_awq: bool,
+    n_exp: usize,
+    dim: usize,
+    mi: usize,
+) -> Result<(), String> {
+    let qt53: Vec<&HfqTensorInfo> = infos
+        .iter()
+        .filter(|t| t.quant_type == MTP_QT_MQ4G128V2)
+        .collect();
+    if qt53.is_empty() {
+        return Ok(());
+    }
+    for t in &qt53 {
+        match mtp_qt53_down_expert_id(&t.name) {
+            None => return Err(mtp_qt53_role_error(&t.name)),
+            Some(id) if !ffn_is_moe || id >= n_exp => {
+                return Err(format!(
+                    ".mtp tensor '{}' is qt=53 but expert id {id} is outside this head's \
+                     {n_exp} routed experts (MoE head required)",
+                    t.name
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    if meta_awq || infos.iter().any(|t| t.name.contains(".awq_scale")) {
+        return Err(
+            ".mtp qt=53 routed down has no AWQ route: the head declares AWQ metadata or an \
+             .awq_scale sidecar"
+                .to_string(),
+        );
+    }
+    if n_exp == 0 || dim == 0 || dim % 256 != 0 || mi == 0 || mi % 128 != 0 {
+        return Err(format!(
+            ".mtp qt=53 routed down requires experts>0, hidden % 256 == 0 (qt44 gate_up K) and \
+             moe_intermediate % 128 == 0 (qt53 down K); got experts={n_exp} hidden={dim} \
+             moe_intermediate={mi}"
+        ));
+    }
+    let by_name: std::collections::HashMap<&str, &HfqTensorInfo> =
+        infos.iter().map(|t| (t.name.as_str(), t)).collect();
+    let down_bytes = dim * (mi / 128) * 68;
+    let gate_up_bytes = 2 * mi * (dim / 256) * 136;
+    for x in 0..n_exp {
+        let down_name = format!("moe_experts.{x}.down");
+        let down = by_name
+            .get(down_name.as_str())
+            .ok_or_else(|| format!(".mtp qt=53 head is missing '{down_name}'"))?;
+        if down.quant_type != MTP_QT_MQ4G128V2 {
+            return Err(format!(
+                ".mtp routed down must be uniformly qt=53 when any is: '{down_name}' has qt={}",
+                down.quant_type
+            ));
+        }
+        if down.shape != [dim as u32, mi as u32] || down.group_size != 128 {
+            return Err(format!(
+                ".mtp tensor '{down_name}' qt=53: shape {:?} group_size {} != [{dim}, {mi}] \
+                 (K = moe_intermediate) group_size 128",
+                down.shape, down.group_size
+            ));
+        }
+        if down.data_size != down_bytes {
+            return Err(format!(
+                ".mtp tensor '{down_name}' qt=53: {} bytes != exact {down_bytes}",
+                down.data_size
+            ));
+        }
+        let gate_up_name = format!("moe_experts.{x}.gate_up");
+        let gate_up = by_name
+            .get(gate_up_name.as_str())
+            .ok_or_else(|| format!(".mtp qt=53 head is missing '{gate_up_name}'"))?;
+        if gate_up.quant_type != MTP_QT_MQ4G256V2 {
+            return Err(format!(
+                ".mtp qt=53 routed down requires qt=44 (MQ4G256V2) gate_up on every expert: \
+                 '{gate_up_name}' has qt={}",
+                gate_up.quant_type
+            ));
+        }
+        if gate_up.shape != [(2 * mi) as u32, dim as u32] {
+            return Err(format!(
+                ".mtp tensor '{gate_up_name}': shape {:?} != [{}, {dim}]",
+                gate_up.shape,
+                2 * mi
+            ));
+        }
+        if gate_up.data_size != gate_up_bytes {
+            return Err(format!(
+                ".mtp tensor '{gate_up_name}': {} bytes != exact {gate_up_bytes}",
+                gate_up.data_size
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Typed route-or-refusal for the MTP MoE routed experts, checked before any
+/// launch. Non-qt53 pairs pass untouched; a qt53 down requires every expert to
+/// be exactly (qt44 gate_up, qt53 down), K = mi a multiple of 128, top_k 8.
+fn mtp_moe_route_check(
+    pairs: impl IntoIterator<Item = (DType, DType)>,
+    mi: usize,
+    k_top: usize,
+) -> Result<(), String> {
+    let mut any_down53 = false;
+    let mut any_gate53 = false;
+    let mut all_qt44_qt53 = true;
+    for (gate, down) in pairs {
+        any_down53 |= down == DType::MQ4G128V2;
+        any_gate53 |= gate == DType::MQ4G128V2;
+        all_qt44_qt53 &= gate == DType::MQ4G256V2 && down == DType::MQ4G128V2;
+    }
+    if any_gate53 {
+        return Err("MTP MoE routed gate_up cannot be MQ4G128V2 (qt=53 is down-only)".to_string());
+    }
+    if !any_down53 {
+        return Ok(());
+    }
+    if !all_qt44_qt53 {
+        return Err(
+            "MTP MoE qt=53 routed down requires uniform (MQ4G256V2 gate_up, MQ4G128V2 down) on \
+             every expert"
+                .to_string(),
+        );
+    }
+    if mi == 0 || mi % 128 != 0 || k_top != 8 {
+        return Err(format!(
+            "MTP MoE qt=53 routed down requires top_k=8 and moe_intermediate % 128 == 0; got \
+             top_k={k_top} moe_intermediate={mi}"
+        ));
+    }
+    Ok(())
 }
 
 /// Wrap raw quantized bytes into a [`WeightTensor`]. Local copy of the
@@ -1270,6 +1577,25 @@ fn weight_tensor_from_raw(
                 m,
                 k,
                 row_stride: 0,
+                paro: None,
+                awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
+            })
+        }
+        MTP_QT_MQ4G128V2 => {
+            // Own arm: row-local K=128 groups (no K % 256 rule). Role + blob
+            // validation run before the upload; only `moe_experts.{id}.down`.
+            mtp_qt53_admit_tensor(name, m, k, data)?;
+            let dtype = mtp_packed_dtype(MTP_QT_MQ4G128V2).expect("qt53 must map");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: dtype,
+                m,
+                k,
+                row_stride: dtype.row_stride(k),
                 paro: None,
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
@@ -1336,7 +1662,8 @@ fn weight_tensor_from_raw(
         }
         other => panic!(
             ".mtp tensor '{name}': unsupported quant_type={other} \
-             (supported: MQ4/MQ6 G256 V1=13/15, V2=44/47, Q8_F16=3, F16=1, F32=2)"
+             (supported: MQ4/MQ6 G256 V1=13/15, V2=44/47, routed-down-only MQ4G128V2=53, \
+              Q8_F16=3, F16=1, F32=2)"
         ),
     }
 }
@@ -1351,7 +1678,319 @@ mod packed_dtype_tests {
         assert_eq!(mtp_packed_dtype(15), Some(DType::MQ6G256));
         assert_eq!(mtp_packed_dtype(44), Some(DType::MQ4G256V2));
         assert_eq!(mtp_packed_dtype(47), Some(DType::MQ6G256V2));
+        assert_eq!(mtp_packed_dtype(53), Some(DType::MQ4G128V2));
         assert_eq!(mtp_packed_dtype(48), None);
+    }
+
+    fn info(
+        name: &str,
+        qt: u8,
+        shape: [u32; 2],
+        group_size: u32,
+        data_size: usize,
+    ) -> HfqTensorInfo {
+        HfqTensorInfo {
+            name: name.to_string(),
+            quant_type: qt,
+            shape: shape.to_vec(),
+            group_size,
+            data_offset: 0,
+            data_size,
+        }
+    }
+
+    // A3B-shaped geometry scaled down: hidden 256 (qt44 K), mi 128 (qt53 K).
+    const DIM: usize = 256;
+    const MI: usize = 128;
+    const N_EXP: usize = 3;
+
+    fn good_head() -> Vec<HfqTensorInfo> {
+        let mut infos = vec![
+            info("wq", 44, [64, DIM as u32], 256, 64 * (DIM / 256) * 136),
+            info("moe_router", 1, [N_EXP as u32, DIM as u32], 0, 1),
+        ];
+        for x in 0..N_EXP {
+            infos.push(info(
+                &format!("moe_experts.{x}.gate_up"),
+                44,
+                [2 * MI as u32, DIM as u32],
+                256,
+                2 * MI * (DIM / 256) * 136,
+            ));
+            infos.push(info(
+                &format!("moe_experts.{x}.down"),
+                53,
+                [DIM as u32, MI as u32],
+                128,
+                DIM * (MI / 128) * 68,
+            ));
+        }
+        infos
+    }
+
+    fn layout(infos: &[HfqTensorInfo]) -> Result<(), String> {
+        validate_mtp_qt53_layout(infos, true, false, N_EXP, DIM, MI)
+    }
+
+    #[test]
+    fn qt53_admits_only_exact_routed_down_names() {
+        assert_eq!(mtp_qt53_down_expert_id("moe_experts.0.down"), Some(0));
+        assert_eq!(mtp_qt53_down_expert_id("moe_experts.255.down"), Some(255));
+        for bad in [
+            "moe_experts.00.down",
+            "moe_experts.01.down",
+            "moe_experts..down",
+            "moe_experts.+1.down",
+            "moe_experts.-1.down",
+            "moe_experts.1.gate_up",
+            "moe_experts.1.down.awq_scale.weight",
+            "moe_experts.1.2.down",
+            "moe_experts.x.down",
+            "moe_experts.1.down ",
+            "moe_shared_down",
+            "ffn_down",
+            "moe_router",
+            "moe_shared_gate",
+            "moe_shared_up",
+            "moe_shared_expert_gate",
+            "eh_proj",
+            "wq",
+            "wk",
+            "wv",
+            "wo",
+            "ffn_gate",
+            "ffn_up",
+            "lm_head_draft.weight",
+            "prefix.moe_experts.1.down",
+        ] {
+            assert_eq!(mtp_qt53_down_expert_id(bad), None, "{bad}");
+            let error = mtp_qt53_admit_tensor(bad, 4, 128, &[]).unwrap_err();
+            assert!(error.to_string().contains("qt=53"), "{bad}: {error}");
+            assert!(error.to_string().contains(bad), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn qt53_admission_accepts_exact_symmetric_blob_and_rejects_bad_extent() {
+        let (m, k) = (4usize, 128usize);
+        let mut blob = Vec::new();
+        for _ in 0..m {
+            blob.extend_from_slice(&0x3C00u16.to_le_bytes()); // scale 1.0
+            blob.extend_from_slice(&0xC800u16.to_le_bytes()); // zero -8.0
+            blob.extend_from_slice(&[0x88u8; 64]);
+        }
+        mtp_qt53_admit_tensor("moe_experts.2.down", m, k, &blob).unwrap();
+        let short = &blob[..blob.len() - 1];
+        let error = mtp_qt53_admit_tensor("moe_experts.2.down", m, k, short).unwrap_err();
+        assert!(error.to_string().contains("moe_experts.2.down"), "{error}");
+        assert!(mtp_qt53_admit_tensor("moe_experts.2.gate_up", m, k, &blob).is_err());
+    }
+
+    #[test]
+    fn qt53_layout_accepts_uniform_qt44_gate_up_qt53_down_and_ignores_non_qt53_heads() {
+        layout(&good_head()).unwrap();
+        // No qt53 anywhere: the validator is a no-op regardless of arguments.
+        let mut plain = good_head();
+        for t in &mut plain {
+            if t.quant_type == 53 {
+                t.quant_type = 44;
+                t.shape = vec![DIM as u32, MI as u32];
+            }
+        }
+        assert_eq!(
+            validate_mtp_qt53_layout(&plain, false, true, 0, 0, 0),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn qt53_layout_rejects_mixed_down_wrong_gate_up_shapes_extents_awq_and_roles() {
+        let reject = |mutate: &dyn Fn(&mut Vec<HfqTensorInfo>), needle: &str| {
+            let mut infos = good_head();
+            mutate(&mut infos);
+            let error = layout(&infos).unwrap_err();
+            assert!(error.contains(needle), "{needle}: {error}");
+        };
+        let at = |infos: &mut Vec<HfqTensorInfo>, name: &str| {
+            infos.iter().position(|t| t.name == name).unwrap()
+        };
+        // Mixed down: one expert stays qt44.
+        reject(
+            &|i| {
+                let p = at(i, "moe_experts.1.down");
+                i[p].quant_type = 44;
+            },
+            "uniformly qt=53",
+        );
+        // gate_up must be qt44 on every expert.
+        reject(
+            &|i| {
+                let p = at(i, "moe_experts.0.gate_up");
+                i[p].quant_type = 47;
+            },
+            "requires qt=44",
+        );
+        // qt53 gate_up is a role violation (down-only).
+        reject(
+            &|i| {
+                let p = at(i, "moe_experts.0.gate_up");
+                i[p].quant_type = 53;
+            },
+            "routed-expert down projection",
+        );
+        // Down K != mi, wrong rows, wrong group size, wrong extent.
+        reject(
+            &|i| {
+                let p = at(i, "moe_experts.2.down");
+                i[p].shape = vec![DIM as u32, 2 * MI as u32];
+            },
+            "shape",
+        );
+        reject(
+            &|i| {
+                let p = at(i, "moe_experts.2.down");
+                i[p].shape = vec![MI as u32, DIM as u32];
+            },
+            "shape",
+        );
+        reject(
+            &|i| {
+                let p = at(i, "moe_experts.2.down");
+                i[p].group_size = 256;
+            },
+            "group_size",
+        );
+        reject(
+            &|i| {
+                let p = at(i, "moe_experts.2.down");
+                i[p].data_size += 68;
+            },
+            "bytes",
+        );
+        reject(
+            &|i| {
+                let p = at(i, "moe_experts.2.gate_up");
+                i[p].shape = vec![MI as u32, DIM as u32];
+            },
+            "shape",
+        );
+        reject(
+            &|i| {
+                let p = at(i, "moe_experts.2.gate_up");
+                i[p].data_size -= 136;
+            },
+            "bytes",
+        );
+        // Missing expert / out-of-range qt53 id.
+        reject(
+            &|i| {
+                let p = at(i, "moe_experts.2.gate_up");
+                i.remove(p);
+            },
+            "missing",
+        );
+        reject(
+            &|i| {
+                i.push(info(
+                    "moe_experts.3.down",
+                    53,
+                    [DIM as u32, MI as u32],
+                    128,
+                    1,
+                ))
+            },
+            "outside",
+        );
+        // AWQ sidecar.
+        reject(
+            &|i| {
+                i.push(info(
+                    "moe_experts.0.down.awq_scale.weight",
+                    1,
+                    [MI as u32, 0],
+                    0,
+                    2,
+                ))
+            },
+            "AWQ",
+        );
+        // Every other role refuses qt53 by name.
+        for role in [
+            "wq",
+            "moe_router",
+            "moe_shared_down",
+            "moe_shared_gate",
+            "moe_shared_up",
+            "moe_shared_expert_gate",
+            "eh_proj",
+            "ffn_down",
+            "lm_head_draft.weight",
+        ] {
+            let mut infos = good_head();
+            infos.push(info(role, 53, [DIM as u32, MI as u32], 128, 68));
+            let error = layout(&infos).unwrap_err();
+            assert!(error.contains(role), "{role}: {error}");
+        }
+        // AWQ metadata and a non-MoE head.
+        let infos = good_head();
+        assert!(validate_mtp_qt53_layout(&infos, true, true, N_EXP, DIM, MI)
+            .unwrap_err()
+            .contains("AWQ"));
+        assert!(validate_mtp_qt53_layout(&infos, false, false, N_EXP, DIM, MI).is_err());
+        // K = mi must be a whole number of 128-groups; hidden of 256-groups.
+        assert!(validate_mtp_qt53_layout(&infos, true, false, N_EXP, DIM, MI + 64).is_err());
+        assert!(validate_mtp_qt53_layout(&infos, true, false, N_EXP, DIM + 128, MI).is_err());
+    }
+
+    #[test]
+    fn mtp_metadata_awq_detection() {
+        use serde_json::json;
+        assert!(!mtp_meta_declares_awq(&json!({"n_embd": 2048})));
+        assert!(!mtp_meta_declares_awq(
+            &json!({"awq": false, "awq_scale": 0, "x_awq": null})
+        ));
+        assert!(mtp_meta_declares_awq(&json!({"awq": true})));
+        assert!(mtp_meta_declares_awq(&json!({"quant_AWQ_group": 128})));
+        assert!(mtp_meta_declares_awq(&json!({"awq_recipe": "s2"})));
+    }
+
+    #[test]
+    fn mtp_moe_route_check_is_route_or_refusal() {
+        use DType::{MQ4G128V2 as Q53, MQ4G256V2 as Q44, MQ6G256V2 as Q6};
+        // Existing non-qt53 pairs are untouched.
+        assert_eq!(mtp_moe_route_check([(Q44, Q44); 4], 512, 8), Ok(()));
+        assert_eq!(mtp_moe_route_check([(Q44, Q6), (Q6, Q44)], 100, 4), Ok(()));
+        assert_eq!(mtp_moe_route_check([(Q44, Q53); 4], 512, 8), Ok(()));
+        // Mixed down, qt53 gate_up, non-qt44 gate_up, bad K, bad top_k.
+        assert!(mtp_moe_route_check([(Q44, Q53), (Q44, Q44)], 512, 8).is_err());
+        assert!(mtp_moe_route_check([(Q53, Q53)], 512, 8).is_err());
+        assert!(mtp_moe_route_check([(Q53, Q44)], 512, 8).is_err());
+        assert!(mtp_moe_route_check([(Q6, Q53)], 512, 8).is_err());
+        assert!(mtp_moe_route_check([(Q44, Q53)], 576, 8).is_err());
+        assert!(mtp_moe_route_check([(Q44, Q53)], 0, 8).is_err());
+        assert!(mtp_moe_route_check([(Q44, Q53)], 512, 10).is_err());
+    }
+
+    #[test]
+    fn batched_mtp_head_refuses_any_qt53_with_typed_serial_only_variant() {
+        use DType::{MQ4G128V2 as Q53, MQ4G256V2 as Q44, MQ6G256V2 as Q6, Q8_0};
+        assert!(mtp_batched_qt53_refusal([Q44, Q6, Q8_0, DType::MQ4G256]).is_ok());
+        assert!(mtp_batched_qt53_refusal(std::iter::empty()).is_ok());
+        for dtypes in [vec![Q44, Q53], vec![Q53], vec![Q8_0, Q6, Q53, Q44]] {
+            match mtp_batched_qt53_refusal(dtypes).unwrap_err() {
+                DispatchError::UnsupportedVariant {
+                    family,
+                    variant,
+                    quant,
+                    ..
+                } => {
+                    assert_eq!(family, "mtp-head");
+                    assert_eq!(variant, "qt53-batched-mtp-unsupported-use-serial");
+                    assert_eq!(quant, "MQ4G128V2");
+                }
+                other => panic!("expected UnsupportedVariant, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1697,6 +2336,7 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
     let cfg = &head.config;
     let w = &head.weights;
     let n_embd = cfg.n_embd;
+    mtp_head_serial_route_check(w, cfg)?;
 
     assert_eq!(
         prev_hidden.numel(),
@@ -1940,6 +2580,15 @@ fn mtp_moe_ffn_decode(
     let topk_weights = scratch.moe_topk_weights.as_ref().expect("MoE MTP scratch");
     let down_expanded = scratch.moe_down_expanded.as_ref().expect("MoE MTP scratch");
 
+    mtp_moe_route_check(
+        ffn.experts
+            .iter()
+            .map(|e| (e.gate_up.gpu_dtype, e.down.gpu_dtype)),
+        mi,
+        k_top,
+    )
+    .map_err(|error| HipError::new(0, &error))?;
+
     weight_gemv(gpu, &ffn.router, x_norm, router_logits)?;
     gpu.softmax_f32(router_logits)?;
     gpu.moe_topk_renorm_k8(
@@ -2013,9 +2662,20 @@ fn mtp_moe_ffn_decode(
         k_top,
     )
     .map_err(|error| HipError::new(0, &error.to_string()))?;
-    fused_silu_mul_rotate_mq_batched_for(
-        gpu, &e0.down, gate_batch, up_batch, rot_batch, mi, k_top,
-    )?;
+    if down_dtype == DType::MQ4G128V2 {
+        // qt53 F32 fallback in the FWHT128 basis: F32 silu_mul on the exact
+        // live [k_top, mi] views, then in-place row-local rotate128.
+        let live = k_top * mi;
+        let gate_live = gate_batch.sub_offset(0, live);
+        let up_live = up_batch.sub_offset(0, live);
+        let rot_live = rot_batch.sub_offset(0, live);
+        gpu.silu_mul_f32(&gate_live, &up_live, &rot_live)?;
+        gpu.rotate_x_mq_128_v2(&rot_live, &rot_live, mi, k_top)?;
+    } else {
+        fused_silu_mul_rotate_mq_batched_for(
+            gpu, &e0.down, gate_batch, up_batch, rot_batch, mi, k_top,
+        )?;
+    }
     run_uniform_moe_down_expanded(
         gpu,
         down_dtype,
@@ -2716,6 +3376,10 @@ pub fn mtp_head_forward_block_batched(
     rotated_x_scratch: Option<&GpuTensor>,
     kv_only: bool,
 ) -> HipResult<()> {
+    // qt53 has only the serial decode route: typed refusal before ANY launch
+    // (attention included), never the generic batched-MoE panic below.
+    mtp_batched_qt53_refusal(mtp_head_weight_dtypes(&head.weights))
+        .map_err(|error| HipError::new(0, &error.to_string()))?;
     let cfg = &head.config;
     let w = &head.weights;
     let dim = cfg.n_embd;
