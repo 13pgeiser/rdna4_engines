@@ -287,20 +287,20 @@ impl DflashTailSource for Script {
     }
 }
 
-/// Tail source that splices `tail` after K = 2 kept learned rows only when
-/// the learned candidates are exactly `want` (a sequential stopping rule: the
-/// decision reads `drafted[..2]` only), otherwise declines.
+/// Tail source that splices `tail` after K = 1 kept learned row only when the
+/// first learned candidate is exactly `want` (a sequential stopping rule: the
+/// decision reads `drafted[..1]` only), otherwise declines.
 struct GatedTail {
-    want: [u32; 2],
+    want: u32,
     tail: Vec<u32>,
 }
 
 impl DflashTailSource for GatedTail {
     fn splice(&mut self, drafted: &[u32], tail: &mut Vec<u32>) -> Option<usize> {
-        if drafted.len() >= 2 && drafted[0] == self.want[0] && drafted[1] == self.want[1] {
+        if drafted.first() == Some(&self.want) {
             tail.clear();
             tail.extend_from_slice(&self.tail);
-            Some(2)
+            Some(1)
         } else {
             None
         }
@@ -1069,13 +1069,16 @@ fn dflash_lookup_state_oracle() {
 // host from the window's own verify logits (a forced Copy window with the same
 // rows) under the request's truncation, and compared with the emitted tokens:
 //
-// * Tail: K = 2 real learned rows (the learned draft's most frequent pair,
-//   found by pilot windows) + 3 point-mass rows (`t1` = target's 2nd-ranked
-//   token after the pair, `t2`, `t3` likewise after their prefixes). The
-//   source splices only when the learned pair equals that pair (a sequential
-//   rule); every other trial is an incumbent window. Positions 0 and 1 use all
-//   trials (rows 0..K are identical with or without the splice), positions
-//   >= 2 use spliced trials whose emitted prefix reached them.
+// * Tail: K = 1 real learned row (`d1`, the first learned candidate that
+//   maximizes the pilot's estimated reach P(d1 = mode) * P(d1 accepted), on
+//   the best of several built-in prompts) + 3 point-mass rows (the target's
+//   2nd-ranked token after the prefix, 1st-ranked if the 2nd carries < 2%).
+//   The source splices only when the learned candidate equals `d1` (a
+//   sequential rule reading `drafted[..1]` only); every other trial is an
+//   incumbent window. Position 0 uses all trials (row 0 is the incumbent
+//   procedure with or without the splice), positions >= 1 use spliced trials
+//   whose emitted prefix reached them. Trials run until the first point-mass
+//   row has >= 300 and the second >= 100 conditioned trials (cap 8000).
 // * Copy: 3 point-mass rows chosen the same way; positions 0..3 conditional
 //   on the emitted prefix.
 //
@@ -1087,7 +1090,36 @@ fn dflash_lookup_state_oracle() {
 // (`capture`) must equal the snapshot byte for byte.
 
 const TRIALS: usize = 2000;
-const PILOT_WINDOWS: usize = 100;
+/// Incumbent windows per candidate prompt for the Tail reach estimate.
+const SELECT_WINDOWS: usize = 60;
+/// Tail trials: at least `TAIL_MIN_TRIALS`, then until the conditioned counts
+/// of the first / second point-mass rows reach their targets, at most the cap.
+const TAIL_MIN_TRIALS: usize = 2000;
+const TAIL_CAP_TRIALS: usize = 8000;
+const TAIL_N_FIRST: usize = 300;
+const TAIL_N_SECOND: usize = 100;
+/// A 2nd-ranked point-mass candidate with less target mass than this is
+/// replaced by the 1st-ranked token (keeps p(candidate) testable).
+const MIN_CANDIDATE_P: f64 = 0.02;
+/// Candidate prompts of the Tail scenario (the story prompt also drives Copy).
+const TAIL_PROMPTS: [(&str, &str); 4] = [
+    (
+        "story",
+        "Write the opening paragraph of a story about a lighthouse keeper.",
+    ),
+    (
+        "list",
+        "List the planets of the solar system in order from the sun, one per line, each with one short fact.",
+    ),
+    (
+        "code",
+        "Write a Python function that reads a CSV file and returns a list of dictionaries, with a short docstring.",
+    ),
+    (
+        "explain",
+        "Explain in a few sentences how a refrigerator keeps food cold.",
+    ),
+];
 /// Significance level of every chi-square test (declared, not tuned).
 const ALPHA: f64 = 0.001;
 /// Bins with expected count below this are pooled.
@@ -1218,7 +1250,8 @@ fn pilot_laws(rig: &mut Rig, snap: &Snap, tokens: &[u32], seed: u64) -> R<Vec<Ve
         .collect())
 }
 
-/// Grow `prefix` by the target's 2nd-ranked token at row `prefix.len()`.
+/// Grow `prefix` by the target's 2nd-ranked token at row `prefix.len()`
+/// (1st-ranked when the 2nd carries less than `MIN_CANDIDATE_P`).
 fn extend_with_second(
     rig: &mut Rig,
     snap: &Snap,
@@ -1229,7 +1262,14 @@ fn extend_with_second(
     let mut forced = prefix.clone();
     forced.push(probe);
     let laws = pilot_laws(rig, snap, &forced, seed)?;
-    prefix.push(ranked(&laws[prefix.len()], 2));
+    let law = &laws[prefix.len()];
+    let second = ranked(law, 2);
+    let pick = if law[second as usize] >= MIN_CANDIDATE_P {
+        second
+    } else {
+        ranked(law, 1)
+    };
+    prefix.push(pick);
     Ok(())
 }
 
@@ -1424,24 +1464,56 @@ fn user_prompt(slot: &ModelSlot, user: &str) -> R<Vec<u32>> {
     .collect())
 }
 
+/// The trial emitted `prefix[..j]` at positions `0..j` (and reached position `j`).
+fn prefix_ok(t: &Trial, prefix: &[u32], j: usize) -> bool {
+    t.accepted >= j && t.committed[1..=j] == prefix[..j]
+}
+
+/// Run one chi-square position test; record coverage and rejections.
+#[allow(clippy::too_many_arguments)]
+fn check(
+    evaluated: &mut Vec<String>,
+    failures: &mut Vec<String>,
+    label: &str,
+    j: usize,
+    trials: &[Trial],
+    law: &[f64],
+    keep: impl Fn(&Trial) -> bool,
+) {
+    let (ok, ran) = test_position(label, j, trials, law, keep);
+    if ran {
+        evaluated.push(format!("{label}@{j}"));
+    }
+    if !ok {
+        failures.push(format!(
+            "{label}@{j}: chi-square / support check rejected the target law"
+        ));
+    }
+}
+
+/// Restore + full-state byte check against the snapshot.
+fn assert_restored(rig: &mut Rig, snap: &Snap, trials_done: usize) {
+    restore(rig, snap).expect("restore");
+    let parts = capture(rig, None, snap.pos, 0).expect("capture").parts;
+    assert!(
+        parts == snap.parts,
+        "restored state differs from the snapshot after {trials_done} trials"
+    );
+}
+
 #[test]
-#[ignore = "requires real HIP GPU + HIPFIRE_TEST_TARGET (27B dense) + HIPFIRE_TEST_DRAFT (paired DFlash2); ~2 x 2000 sampled windows"]
+#[ignore = "requires real HIP GPU + HIPFIRE_TEST_TARGET (27B dense) + HIPFIRE_TEST_DRAFT (paired DFlash2); ~2000 Copy + 2000..8000 Tail sampled windows"]
 fn dflash_lookup_sampled_law() {
     let Some(mut rig) = Rig::open().expect("open rig") else {
         return;
     };
-    // An open-ended prompt: a broad next-token law, mid-range 2nd-ranked tokens.
-    rig.prompt = user_prompt(
-        &rig.slot,
-        "Write the opening paragraph of a story about a lighthouse keeper.",
-    )
-    .expect("prompt");
-    let snap = take_snapshot(&mut rig).expect("snapshot");
     let t_all = std::time::Instant::now();
-    let mut all_ok = true;
+    let mut failures: Vec<String> = Vec::new();
     let mut evaluated: Vec<String> = Vec::new();
 
-    // ── Copy window: 3 point-mass rows (2nd-ranked chain) ───────────────
+    // ── Copy window (story prompt): 3 point-mass rows, 2nd-ranked chain ──
+    rig.prompt = user_prompt(&rig.slot, TAIL_PROMPTS[0].1).expect("prompt");
+    let snap = take_snapshot(&mut rig).expect("snapshot");
     let mut copy_tokens: Vec<u32> = Vec::new();
     for i in 0..3 {
         extend_with_second(&mut rig, &snap, &mut copy_tokens, 0, 10 + i).expect("copy pilot");
@@ -1470,13 +1542,7 @@ fn dflash_lookup_sampled_law() {
             rows: r.drafted.len(),
         });
         if (i + 1) % 100 == 0 {
-            restore(&mut rig, &snap).expect("restore");
-            let parts = capture(&rig, None, snap.pos, 0).expect("capture").parts;
-            assert!(
-                parts == snap.parts,
-                "restored state differs from the snapshot after {} trials",
-                i + 1
-            );
+            assert_restored(&mut rig, &snap, i + 1);
         }
     }
     assert!(
@@ -1484,99 +1550,154 @@ fn dflash_lookup_sampled_law() {
         "every Copy trial must verify exactly 4 rows"
     );
     for j in 0..=3 {
-        let (ok, ran) = test_position("copy", j, &trials, &copy_laws[j], |_| true);
-        all_ok &= ok;
-        if ran {
-            evaluated.push(format!("copy@{j}"));
+        check(
+            &mut evaluated,
+            &mut failures,
+            "copy",
+            j,
+            &trials,
+            &copy_laws[j],
+            |t| prefix_ok(t, &copy_tokens, j),
+        );
+    }
+    snap.dn.free_gpu(&mut rig.gpu);
+
+    // ── Tail: pick the prompt / first learned candidate by estimated reach ─
+    // reach = P(learned d1 = d1*) * P(d1* accepted), from SELECT_WINDOWS
+    // incumbent windows per prompt (d1* = the d1 with most accepted windows).
+    let mut best: Option<(usize, u32, usize, usize)> = None; // (prompt, d1, accepted, count)
+    for (ci, (name, text)) in TAIL_PROMPTS.iter().enumerate() {
+        rig.prompt = user_prompt(&rig.slot, text).expect("prompt");
+        let s = take_snapshot(&mut rig).expect("snapshot");
+        let mut freq: HashMap<u32, (usize, usize)> = HashMap::new(); // d1 -> (windows, accepted>=1)
+        for i in 0..SELECT_WINDOWS {
+            let r = window_from(
+                &mut rig,
+                &s,
+                200_000 + (ci * 1_000 + i) as u64,
+                &mut Step::none(),
+            )
+            .expect("selection window");
+            let e = freq.entry(r.drafted[1]).or_default();
+            e.0 += 1;
+            if r.accepted >= 1 {
+                e.1 += 1;
+            }
+        }
+        s.dn.free_gpu(&mut rig.gpu);
+        let (&d1, &(count, acc)) = freq
+            .iter()
+            .max_by(|a, b| {
+                a.1 .1
+                    .cmp(&b.1 .1)
+                    .then(a.1 .0.cmp(&b.1 .0))
+                    .then(b.0.cmp(a.0))
+            })
+            .expect("selection windows");
+        println!(
+            "[sampled-law] prompt {name}: d1*={d1} learned in {count}/{SELECT_WINDOWS} windows, accepted in {acc} -> est. reach {:.3}",
+            acc as f64 / SELECT_WINDOWS as f64
+        );
+        if best.map_or(true, |(_, _, a, c)| (acc, count) > (a, c)) {
+            best = Some((ci, d1, acc, count));
         }
     }
+    let (pi, d1, acc, count) = best.expect("a candidate prompt");
+    println!(
+        "[sampled-law] tail prompt chosen: {} (d1*={d1}, est. reach {:.3}, d1* in {count}/{SELECT_WINDOWS}, accepted {acc})",
+        TAIL_PROMPTS[pi].0,
+        acc as f64 / SELECT_WINDOWS as f64
+    );
+    rig.prompt = user_prompt(&rig.slot, TAIL_PROMPTS[pi].1).expect("prompt");
+    let snap = take_snapshot(&mut rig).expect("snapshot");
 
-    // ── Tail window: K = 2 learned rows + 3 point-mass rows ─────────────
-    let mut freq: HashMap<(u32, u32), usize> = HashMap::new();
-    for i in 0..PILOT_WINDOWS {
-        let r = window_from(&mut rig, &snap, 50_000 + i as u64, &mut Step::none())
-            .expect("pilot window");
-        *freq.entry((r.drafted[1], r.drafted[2])).or_default() += 1;
-    }
-    let (&(d1, d2), &cnt) = freq
-        .iter()
-        .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
-        .expect("pilot windows");
-    println!("[sampled-law] learned pair ({d1}, {d2}) in {cnt}/{PILOT_WINDOWS} pilot windows");
-    let mut prefix: Vec<u32> = vec![d1, d2];
+    let mut prefix: Vec<u32> = vec![d1];
     for i in 0..3 {
         extend_with_second(&mut rig, &snap, &mut prefix, 0, 60 + i).expect("tail pilot");
     }
-    let tail_tokens: Vec<u32> = prefix[2..].to_vec();
+    let tail_tokens: Vec<u32> = prefix[1..].to_vec();
     let tail_laws = pilot_laws(&mut rig, &snap, &prefix, 70).expect("tail laws");
     println!(
-        "[sampled-law] tail tokens {tail_tokens:?}, p(candidate) rows 2..5 {:?}",
+        "[sampled-law] tail d1={d1} p(d1)={:.4}; point-mass tokens {tail_tokens:?}, p(candidate) rows 1..4 {:?}",
+        tail_laws[0][d1 as usize],
         tail_tokens
             .iter()
             .enumerate()
-            .map(|(r, &c)| tail_laws[2 + r][c as usize])
+            .map(|(r, &c)| tail_laws[1 + r][c as usize])
             .collect::<Vec<_>>()
     );
     let mut trials: Vec<Trial> = Vec::new();
-    for i in 0..TRIALS {
+    let (mut n_first, mut n_second) = (0usize, 0usize);
+    let mut i = 0usize;
+    while i < TAIL_CAP_TRIALS
+        && !(i >= TAIL_MIN_TRIALS && n_first >= TAIL_N_FIRST && n_second >= TAIL_N_SECOND)
+    {
         let mut step = Step {
             look: Look::Gated(GatedTail {
-                want: [d1, d2],
+                want: d1,
                 tail: tail_tokens.clone(),
             }),
             max_accept: None,
         };
         let r = window_from(&mut rig, &snap, 100_000 + i as u64, &mut step).expect("tail window");
-        trials.push(Trial {
+        let t = Trial {
             accepted: r.accepted,
             committed: r.committed,
             rows: r.drafted.len(),
-        });
-        if (i + 1) % 100 == 0 {
-            restore(&mut rig, &snap).expect("restore");
-            let parts = capture(&rig, None, snap.pos, 0).expect("capture").parts;
-            assert!(
-                parts == snap.parts,
-                "restored state differs from the snapshot after {} trials",
-                i + 1
-            );
+        };
+        if t.rows == 5 {
+            n_first += prefix_ok(&t, &prefix, 1) as usize;
+            n_second += prefix_ok(&t, &prefix, 2) as usize;
+        }
+        trials.push(t);
+        i += 1;
+        if i % 100 == 0 {
+            assert_restored(&mut rig, &snap, i);
         }
     }
-    let spliced = trials.iter().filter(|t| t.rows == 6).count();
-    println!("[sampled-law] tail: {spliced}/{TRIALS} trials spliced");
-    for j in 0..=1 {
-        // Rows 0..K are the incumbent procedure with or without the splice;
-        // position 1's emitted prefix is the first learned token d1.
-        let (ok, ran) = test_position("tail", j, &trials, &tail_laws[j], |t| {
-            j == 0 || t.committed[1] == d1
-        });
-        all_ok &= ok;
-        if ran {
-            evaluated.push(format!("tail@{j}"));
-        }
+    let spliced = trials.iter().filter(|t| t.rows == 5).count();
+    println!(
+        "[sampled-law] tail: {i} trials, {spliced} spliced; conditioned trials first point-mass row {n_first} (target {TAIL_N_FIRST}), second {n_second} (target {TAIL_N_SECOND})"
+    );
+    check(
+        &mut evaluated,
+        &mut failures,
+        "tail",
+        0,
+        &trials,
+        &tail_laws[0],
+        |_| true,
+    );
+    for j in 1..=4 {
+        check(
+            &mut evaluated,
+            &mut failures,
+            "tail",
+            j,
+            &trials,
+            &tail_laws[j],
+            |t| t.rows == 5 && prefix_ok(t, &prefix, j),
+        );
     }
-    for j in 2..=5 {
-        let (ok, ran) = test_position("tail", j, &trials, &tail_laws[j], |t| t.rows == 6);
-        all_ok &= ok;
-        if ran {
-            evaluated.push(format!("tail@{j}"));
+    snap.dn.free_gpu(&mut rig.gpu);
+
+    // Coverage is decided BEFORE the verdict line is printed.
+    for must in ["copy@0", "copy@1", "tail@0", "tail@1", "tail@2"] {
+        if !evaluated.iter().any(|e| e == must) {
+            failures.push(format!(
+                "{must} was not tested (too few conditioned trials or < 2 bins); first/second point-mass conditioned counts {n_first}/{n_second} of {i} tail trials"
+            ));
         }
     }
     println!(
-        "DFLASH_LOOKUP_SAMPLED_LAW {} (alpha={ALPHA}, trials={TRIALS}, tested: {evaluated:?}, {:.0}s)",
-        if all_ok { "PASS" } else { "FAIL" },
-        t_all.elapsed().as_secs_f64()
+        "DFLASH_LOOKUP_SAMPLED_LAW {} (alpha={ALPHA}, copy trials={TRIALS}, tail trials={i}, tested: {evaluated:?}, {:.0}s){}",
+        if failures.is_empty() { "PASS" } else { "FAIL" },
+        t_all.elapsed().as_secs_f64(),
+        if failures.is_empty() {
+            String::new()
+        } else {
+            format!(" reasons: {failures:?}")
+        }
     );
-    assert!(all_ok, "a chi-square test rejected the target law");
-    // The splice boundary must actually have been tested.
-    for must in ["copy@0", "copy@1", "tail@0", "tail@1"] {
-        assert!(
-            evaluated.iter().any(|e| e == must),
-            "{must} had too few trials to test; raise TRIALS"
-        );
-    }
-    assert!(
-        evaluated.iter().any(|e| e == "tail@2"),
-        "the first point-mass row of the Tail window (pos 2) was not tested; raise TRIALS or PILOT_WINDOWS"
-    );
+    assert!(failures.is_empty(), "sampled-law failures: {failures:?}");
 }
