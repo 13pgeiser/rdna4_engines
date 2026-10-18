@@ -52,6 +52,7 @@ pub mod lane_gdn;
 pub mod lane_rows_pm;
 mod loaded_code_check;
 pub mod moe;
+pub mod expert_capabilities;
 pub mod slab_admission;
 pub use slab_admission::{
     qwen4_slab_codec_admitted, qwen4_slab_default_cold_codec, qwen4_slab_layer_cold_codec,

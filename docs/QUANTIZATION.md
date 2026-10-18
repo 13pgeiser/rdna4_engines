@@ -489,6 +489,28 @@ unsigned, uniform bounds check before any expert pointer read, prefetch,
 or barrier. Invalid IDs perform no dereference or output store; the
 gfx1151 port preserves rc5's E8P NaN containment.
 
+#### Expert capability table
+
+One table, `rdna_compute::expert_capabilities`, answers "does this arch run this expert codec on
+this route" for every gate (slab K1/K2 selection, arena and tier-plan `check_executable`,
+artifact load, dispatch pair/bucket selection, expert stage defaults). The key is the exact
+on-disk quant-tag pair read from the tensor table (`ExpertQt`: MQ4 `(44,53)`, W3 `(131,132)`,
+W2 `(133,134)`, E8P `(135,136)`), never a model or XTS label. `generation_label` (v1 qt 13,
+v2 candidates qt 45/52, v3 qt 44/53 and the planar I4 tags) is display-only and never read by
+admission; the "V2" in `MQ4G256V2`/`MQ4G128V2` names a codec-layout revision, not the MQ
+generation. The qt 44/53 kernels need the symmetric grid, which the tag cannot show; the
+existing header check (`routed_headers_symmetric`, `qwen4_moe_sym_check`) stays the prerequisite.
+
+Routes: `PrefillK2`, `DecodeGemv`, `Stage` (slab-arena staging, needs K1 and K2), `TierStage`
+(`ExpertTierPlan`; MQ4 is arch-neutral), `D2CpuSplit` (CPU decoder inventory supplied by
+dispatch). A cell is admitted only when its raw kernel inventory (read from the real K1/K2
+tables, never from admission) is present and no named hold refuses it. Beta holds, all in
+`HOLD_CELLS`: tier plans refuse E8P on gfx1100/gfx1151/gfx1201 and W3 on gfx1151; the gfx1151
+E8P cells (K2, K1, stage) hold only while `SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED` is false. The
+per-arch artifact receipts flags gate the load only. W2 and gfx1100 W3 have no kernel. Stage
+defaults (gfx1201 always on and 2048 rows; narrow-link policy elsewhere; the gfx1100 8192-row
+narrow-link chunk) are `stage_policy` metadata read together with the measured link predicate.
+
 ### PARO4G128 probe payload
 
 `quant_type=28` is **not** row-major HFQ4/MQ4. Each tensor stores ParoQuant

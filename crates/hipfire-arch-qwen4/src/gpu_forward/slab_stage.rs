@@ -594,6 +594,27 @@ impl Qwen4ExpertStage {
             let Some(slab) = runtime.slab.as_ref() else {
                 return off("a host layer is not a slab arena");
             };
+            // Stage ELIGIBILITY (the `Route::Stage` capability of every codec this layer holds on
+            // this arch), separate from the default switch that decided to build a stage at all
+            // (`stage_default_enabled` / `HIPFIRE_QWEN4_EXPERT_STAGE`). Every slab layer was
+            // already admitted at load by the same cells (`slab_serves`), so this never refuses a
+            // loadable layer; it keeps a measured link or an explicit `1` from staging a codec the
+            // arch has no K1/K2 for.
+            if !rdna_compute::expert_capabilities::stage_eligible(
+                &gpu.arch,
+                slab.codecs.iter().filter_map(|&codec| {
+                    rdna_compute::expert_capabilities::ExpertQt::of_slab_codec(codec)
+                }),
+            ) || slab
+                .codecs
+                .iter()
+                .any(|&codec| rdna_compute::expert_capabilities::ExpertQt::of_slab_codec(codec).is_none())
+            {
+                return off(&format!(
+                    "a host slab layer holds a codec without a Stage capability on {}",
+                    gpu.arch
+                ));
+            }
             let arena_ref = bundle
                 .weights
                 .layer(layer)

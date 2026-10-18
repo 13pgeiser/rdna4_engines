@@ -300,57 +300,26 @@ fn refuse_expert_slabs(
     Ok(())
 }
 
-/// Set because the real-layer G1 receipts of BOTH gfx1201 slab kernels are in
-/// `rcpt/`, both with 0 mismatches: K1 decode
-/// (`r5.k1.g1.L0-records.raw.json`, sha256 `2bb0cfa1…8239`) and K2 prefill
-/// (`g1.k2.real.json`, sha256 `bb1bde6b…c226`, with the A4 identity
-/// `g1.a4.identity.json`, sha256 `2e6f9643…a979`). The gfx1100 route (MQ4-only
-/// layers) is admitted by the same switch through
-/// [`rdna_compute::qwen4_slab_codec_admitted`]; see
-/// [`SLAB_ROUTE_GFX1151_RECEIPTS_LANDED`] for gfx1151. Every other architecture
-/// keeps refusing in [`slab_route_admitted`].
-pub const SLAB_ROUTE_RECEIPTS_LANDED: bool = true;
-
-/// gfx1151 twin of [`SLAB_ROUTE_RECEIPTS_LANDED`]. Set because the G1 receipts
-/// of the gfx1151 slab kernels are in `rcpt/` on the Halo card (exact gfx1151,
-/// BDF `0000:c0:00.0`), each passing with 0 mismatches against the CPU twin:
-/// K1 decode `mq_i4_moe_gemv_pm_gfx1151`, synthetic plus certified L0 records
-/// with the old-kernel parity (`r9.g1.k1.gfx1151.json`, sha256 `f5e4e524…b3c6`);
-/// K2 prefill, the W3 NT1 anchor and the NT4 entries with the down row repeats
-/// 1/2/4 (`qwen4_moe_iu4_sym_w3_pm_gfx1151`,
-/// `qwen4_moe_iu4_sym_w3_nt4_pm_gfx1151`), synthetic
-/// (`r9.g1.k2.synthetic.gfx1151.json`, sha256 `eb5c643a…181c`) and real layers
-/// (`r9.g1.k2.real.gfx1151.json`, sha256 `ceabf444…0f73`). The A4 activations
-/// are deterministic synthetic rows through the real weights. gfx1151 only;
-/// every other architecture keeps the `ExpertSlabKernelsUnavailable` refusal.
-pub const SLAB_ROUTE_GFX1151_RECEIPTS_LANDED: bool = true;
-
-/// The gfx1151 E8P-I4 admission switch, defined once in
-/// [`rdna_compute::slab_admission`] and re-exported here: `true`. The Halo G1 receipts named
-/// there are pre-rc5 history for `e8p_i4_moe_gemv_pm_gfx1151` and
-/// `qwen4_moe_iu4_sym_e8p_pm_gfx1151`; the current rc5 bounded images (96-byte K1, 64-byte K2)
-/// are not claimed GPU qualified by this constant.
-/// [`rdna_compute::qwen4_slab_codec_admitted`] reads it for gfx1151 E8P, so
-/// [`crate::expert_arena::ExpertArenaPlan::check_executable`] (and with it
-/// [`expert_slab_plan`]) admits MQ4 + E8P layers on gfx1151; `false` would refuse them with
-/// the arena `ArchRefused` error. It does not affect [`slab_route_admitted`] (MQ4 is served
-/// either way) or any other architecture.
+/// The artifact-load receipts flags and the gfx1151 E8P switch are owned by
+/// [`rdna_compute::expert_capabilities`] (the one capability table); they are re-exported here
+/// for the artifact gate. `SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED` is `true`: the Halo G1 receipts
+/// named in [`rdna_compute::slab_admission`] are pre-rc5 history for
+/// `e8p_i4_moe_gemv_pm_gfx1151` and `qwen4_moe_iu4_sym_e8p_pm_gfx1151`; the current rc5 bounded
+/// images (96-byte K1, 64-byte K2) are not claimed GPU qualified by it. `false` would hold the
+/// gfx1151 E8P cells (`Hold::Gfx1151E8pReceiptsPending`) and refuse MQ4 + E8P layers with the
+/// arena `ArchRefused` error; it does not affect [`slab_route_admitted`] or any other cell.
+pub use rdna_compute::expert_capabilities::{
+    SLAB_ROUTE_GFX1151_RECEIPTS_LANDED, SLAB_ROUTE_RECEIPTS_LANDED,
+};
 pub use rdna_compute::slab_admission::SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED;
 
 /// Whether the sealed expert-slab route may load on GPU architecture `arch`:
-/// the architecture serves at least the MQ4 codec
-/// ([`rdna_compute::qwen4_slab_codec_admitted`]: gfx1100, gfx1151 and gfx1201)
-/// and its own receipts flag is set ([`SLAB_ROUTE_RECEIPTS_LANDED`] for gfx1100
-/// and gfx1201, [`SLAB_ROUTE_GFX1151_RECEIPTS_LANDED`] for gfx1151). Which
-/// cold codec rides next to MQ4 is per architecture, checked per expert by
+/// [`rdna_compute::expert_capabilities::slab_artifact_route_admitted`] (the architecture serves
+/// MQ4 and its own receipts flag is set: gfx1100, gfx1151 and gfx1201). Which cold codec rides
+/// next to MQ4 is per architecture, checked per expert by
 /// [`crate::expert_arena::ExpertArenaPlan::check_executable`].
 pub fn slab_route_admitted(arch: &str) -> bool {
-    rdna_compute::qwen4_slab_codec_admitted(arch, crate::expert_arena::CODEC_MQ4)
-        && match arch {
-            "gfx1151" => SLAB_ROUTE_GFX1151_RECEIPTS_LANDED,
-            "gfx1100" | "gfx1201" => SLAB_ROUTE_RECEIPTS_LANDED,
-            _ => false,
-        }
+    rdna_compute::expert_capabilities::slab_artifact_route_admitted(arch)
 }
 
 /// The arena plan of a version-1 expert-slab artifact when the route is
@@ -2771,7 +2740,7 @@ mod tests {
         }
     }
 
-    /// `slab_route_admitted` is the MQ4 matrix gate AND the arch's own receipts flag.
+    /// `slab_route_admitted` is the central MQ4 capability AND the arch's own receipts flag.
     #[test]
     fn slab_route_admission_is_the_mq4_matrix_gate_and_the_arch_receipts_flag() {
         for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx1200", "gfx942", ""] {
@@ -2782,8 +2751,10 @@ mod tests {
             };
             assert_eq!(
                 slab_route_admitted(arch),
-                rdna_compute::qwen4_slab_codec_admitted(arch, crate::expert_arena::CODEC_MQ4)
-                    && flag,
+                rdna_compute::expert_capabilities::slab_serves(
+                    arch,
+                    rdna_compute::expert_capabilities::QT_MQ4_XTS
+                ) && flag,
                 "{arch:?}"
             );
         }

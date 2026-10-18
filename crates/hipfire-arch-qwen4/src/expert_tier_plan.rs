@@ -263,18 +263,17 @@ impl ExpertTierPlan {
         &self.host_windows
     }
 
-    /// Refuse expert formats that have no kernel on `arch`: W2 and E8P-I4
-    /// everywhere, W3 anywhere but `gfx1201`; MQ4 is always accepted. Route/arch
-    /// admission of the tier route as a whole belongs to C2 admission, not here.
+    /// Refuse expert formats the tier route does not serve on `arch`: each entry's exact quant
+    /// pair must be [`rdna_compute::expert_capabilities::Route::TierStage`]-admitted. Beta: W2
+    /// has no kernel anywhere, E8P-I4 is held everywhere (`Hold::TierPlanE8pRefused`), W3 is
+    /// admitted on gfx1201 only (gfx1151 holds it, other arches have no kernel), MQ4 is accepted
+    /// on every arch (arch-neutral aggregate route). Route/arch admission of the tier route as a
+    /// whole belongs to C2 admission, not here.
     pub fn check_executable(&self, arch: &str) -> Result<(), ExpertTierError> {
+        use rdna_compute::expert_capabilities::{admitted, ExpertQt, Route};
         for entry in &self.entries {
-            let ok = match entry.format {
-                ExpertFormat::Mq4Xts => true,
-                ExpertFormat::Mq3I4 => arch == "gfx1201",
-                ExpertFormat::Mq2I4 => false,
-                ExpertFormat::E8pI4 => false,
-            };
-            if !ok {
+            let (gate_up, down) = entry.format.pair();
+            if !admitted(arch, ExpertQt::new(gate_up, down), Route::TierStage) {
                 return Err(ExpertTierError::UnsupportedFormat {
                     format: entry.format,
                     arch: arch.to_owned(),

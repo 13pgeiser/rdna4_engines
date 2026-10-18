@@ -78,8 +78,6 @@ mod npu_forward;
 
 pub(crate) const EPSILON: f32 = 1.0e-6;
 const GFX942_PREFILL_CHUNK_ROWS: usize = 1536;
-/// gfx1100 chunk on a narrow discrete host link (`crate::host_link`).
-const GFX1100_NARROW_LINK_PREFILL_CHUNK_ROWS: usize = 8192;
 
 /// Developer override of the requested prefill chunk
 /// ([`qwen4_prefill_chunk_requested`]).
@@ -114,8 +112,8 @@ pub fn qwen4_prefill_chunk_default(
     arch: &str,
     link: impl FnOnce() -> crate::host_link::HostLink,
 ) -> usize {
-    match arch {
-        "gfx1100" if link().is_narrow_discrete() => GFX1100_NARROW_LINK_PREFILL_CHUNK_ROWS,
+    match rdna_compute::expert_capabilities::narrow_link_prefill_chunk_rows(arch) {
+        Some(rows) if link().is_narrow_discrete() => rows,
         _ => qwen4_prefill_chunk_baseline_default(arch),
     }
 }
@@ -485,23 +483,6 @@ pub const QWEN4_EXPERT_STAGE_MIN_ROWS_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE_MI
 /// way. Verify forwards capture too but stay below the row threshold.
 pub const QWEN4_EXPERT_STAGE_CAPTURE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE_CAPTURE";
 
-/// A 1,336,934,400-byte layer copy takes 23.5 ms (card B, gfx1201). A
-/// 2048-row forward already hides it: pp2048 went from 1057 to 1377 tok/s,
-/// and the restore that was not hidden cost 18 ms of that chunk. Smaller
-/// forwards keep the mapped path (K3: 1536 rows expose the DMA). This is the
-/// ceiling of the default threshold: an arch whose prefill chunk is smaller
-/// (gfx1100: 1536) stages its full chunk instead of never staging
-/// ([`resolve_expert_stage_min_rows`]).
-const QWEN4_EXPERT_STAGE_MIN_ROWS_DEFAULT: usize = 2048;
-
-/// Default stage threshold on a narrow discrete host link
-/// ([`crate::host_link::HostLink::is_narrow_discrete`]) off gfx1201: the
-/// mapped read of a host layer costs more per forward the narrower the link,
-/// so the copy pays from a shorter forward. A fixed floor, not capped at the
-/// chunk: a forward shorter than this (or a chunk admitted below it) never
-/// stages and keeps the zero-copy mapped reads.
-const QWEN4_EXPERT_STAGE_NARROW_LINK_MIN_ROWS: usize = 768;
-
 /// One Flash-Next routed expert's QT44 gate/up and QT53 down bytes.
 const QWEN4_EXPERT_STAGE_GATE_UP_BYTES: usize = 1_740_800;
 const QWEN4_EXPERT_STAGE_DOWN_BYTES: usize = 870_400;
@@ -544,13 +525,8 @@ fn resolve_expert_stage_min_rows(
     {
         return (rows, StageMinRowsSource::Env);
     }
-    let rows = if arch == "gfx1201" {
-        QWEN4_EXPERT_STAGE_MIN_ROWS_DEFAULT
-    } else if narrow_link {
-        QWEN4_EXPERT_STAGE_NARROW_LINK_MIN_ROWS
-    } else {
-        QWEN4_EXPERT_STAGE_MIN_ROWS_DEFAULT.min(chunk_rows.max(2))
-    };
+    let rows =
+        rdna_compute::expert_capabilities::stage_default_min_rows(arch, chunk_rows, narrow_link);
     (rows, StageMinRowsSource::Default)
 }
 
@@ -574,7 +550,7 @@ pub(crate) fn expert_stage_min_rows_from(
     env: Option<&str>,
     link: impl FnOnce() -> crate::host_link::HostLink,
 ) -> (usize, StageMinRowsSource) {
-    let narrow_link = arch != "gfx1201"
+    let narrow_link = rdna_compute::expert_capabilities::stage_reads_link(arch)
         && !env
             .and_then(|value| value.trim().parse::<usize>().ok())
             .is_some_and(|rows| rows >= 2)
@@ -3795,7 +3771,7 @@ impl Qwen4ExpertStage {
         chunk_rows: usize,
     ) -> Result<Option<Self>, Qwen4GpuForwardError> {
         if let Some(placement) = bundle.weights.ep_placement() {
-            if gpu.arch != "gfx1201" {
+            if !rdna_compute::expert_capabilities::stage_policy(&gpu.arch).expert_parallel_stage {
                 eprintln!(
                     "qwen4 EP rank {}/{}: expert staging not admitted (needs gfx1201)",
                     placement.rank, placement.ranks
@@ -3809,7 +3785,7 @@ impl Qwen4ExpertStage {
         // Settle the host link (probe or cache hit) before any stage buffer
         // takes VRAM: the `min_rows` default reads it, and the 64 MiB probe
         // must not compete with the buffers. gfx1201 never reads it.
-        if gpu.arch != "gfx1201" {
+        if rdna_compute::expert_capabilities::stage_reads_link(&gpu.arch) {
             let _ = crate::host_link::host_link(gpu);
         }
         let Some(first_host) = moe
@@ -3862,8 +3838,10 @@ impl Qwen4ExpertStage {
                 .flatten()
                 .any(|layer| {
                     layer.experts.iter().any(|expert| {
-                        expert.gate_up.tensor.dtype != DType::MQ4G256V2
-                            || expert.down.tensor.dtype != DType::MQ4G128V2
+                        rdna_compute::expert_capabilities::ExpertQt::of_dtypes(
+                            expert.gate_up.tensor.dtype,
+                            expert.down.tensor.dtype,
+                        ) != Some(rdna_compute::expert_capabilities::QT_MQ4_XTS)
                     })
                 })
         {

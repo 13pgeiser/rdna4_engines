@@ -48199,13 +48199,45 @@ pub(crate) fn slab_k2_metadata(arch: &str, codec: u8) -> Option<&'static SlabK2>
     }
 }
 
+/// Raw (ungated) K2 inventory of the sealed slab per (`arch`, slab codec `codec`): `(module,
+/// [gate/up, down] serving entries)`. It is [`slab_k2_metadata`] plus the trunk builder modules the
+/// slab route also launches as K2 on gfx1201 and gfx1151: the MQ4 (0) NT4 entries
+/// (`qwen4_moe_iu4_sym_pm_<arch>`) and the MQ3-I4 (1) entries (gfx1201 NT1
+/// `qwen4_moe_iu4_sym_w3_pm_gfx1201`, gfx1151 NT4 `qwen4_moe_iu4_sym_w3_nt4_pm_gfx1151`). Inventory
+/// only: it never consults [`crate::qwen4_slab_codec_admitted`] or any other admission, so the
+/// admission matrix ([`crate::expert_capabilities`]) can be derived from it without a cycle.
+pub(crate) fn slab_k2_raw(arch: &str, codec: u8) -> Option<(&'static str, [&'static str; 2])> {
+    if let Some(k2) = slab_k2_metadata(arch, codec) {
+        return Some((k2.module, k2.entries));
+    }
+    match (arch, codec) {
+        ("gfx1151", 0) => Some((
+            QWEN4_MOE_SYM_PM_MODULE[0],
+            [QWEN4_MOE_SYM_PM_GATE_UP[0][0], QWEN4_MOE_SYM_PM_DOWN[0][0]],
+        )),
+        ("gfx1201", 0) => Some((
+            QWEN4_MOE_SYM_PM_MODULE[1],
+            [QWEN4_MOE_SYM_PM_GATE_UP[1][0], QWEN4_MOE_SYM_PM_DOWN[1][0]],
+        )),
+        ("gfx1201", 1) => Some((
+            QWEN4_MOE_SYM_W3_PM_MODULE,
+            [QWEN4_MOE_SYM_W3_GATE_UP, QWEN4_MOE_SYM_W3_DOWN],
+        )),
+        ("gfx1151", 1) => Some((
+            QWEN4_MOE_SYM_W3_NT4_PM_MODULE_GFX1151,
+            [QWEN4_MOE_SYM_W3_NT4_GATE_UP_GFX1151, QWEN4_MOE_SYM_W3_NT4_DOWN_GFX1151[0]],
+        )),
+        _ => None,
+    }
+}
+
 /// The sealed-slab NT1 K2 table of slab codec `codec` on `arch` the route SERVES:
 /// [`slab_k2_metadata`] (gfx1100 MQ4 (0) and E8P (3), gfx1201 E8P (3), gfx1151 E8P (3)) restricted to
-/// what [`crate::qwen4_slab_codec_admitted`] admits. `None` for everything else and for every codec
-/// the matrix refuses (W2 / codec 2 never, gfx1100 W3 never, gfx1151 E8P while its switch is false): a table
-/// entry is not permission.
+/// what [`crate::expert_capabilities::slab_serves_codec`] admits. `None` for everything else and
+/// for every codec the central table refuses (W2 / codec 2 never, gfx1100 W3 never, gfx1151 E8P
+/// while its switch is false): a table entry is not permission.
 pub(crate) fn slab_k2_entry(arch: &str, codec: u8) -> Option<&'static SlabK2> {
-    if !crate::qwen4_slab_codec_admitted(arch, codec) {
+    if !crate::expert_capabilities::slab_serves_codec(arch, codec) {
         return None;
     }
     slab_k2_metadata(arch, codec)

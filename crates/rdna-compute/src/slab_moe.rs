@@ -441,14 +441,14 @@ pub fn slab_arch_kernels(arch: &str) -> Option<&'static SlabArchKernels> {
 }
 
 /// The cold-bucket K1 table of cold codec `cold_codec` the sealed route SERVES on `arch`:
-/// [`slab_cold_k1_metadata`] restricted to what [`crate::qwen4_slab_codec_admitted`] admits, so
-/// metadata alone never launches or preloads a codec. `None` for MQ4 (0, never cold), every
-/// codec the matrix refuses on that arch, and W2 (2) everywhere. On gfx1100 only E8P (3)
-/// resolves (its K1 [`SLAB_COLD_GFX1100_E8P`]; the matching K2 is `slab_k2_entry`); W3 (1) does not.
-/// On gfx1151 W3 (1) resolves ([`SLAB_COLD_GFX1151_W3`]); E8P (3) resolves ([`SLAB_COLD_GFX1151_E8P`])
-/// only when the admission matrix admits it.
+/// [`slab_cold_k1_metadata`] restricted to what [`crate::expert_capabilities::slab_serves_codec`]
+/// admits, so metadata alone never launches or preloads a codec. `None` for MQ4 (0, never cold),
+/// every codec the central table refuses on that arch, and W2 (2) everywhere. On gfx1100 only E8P
+/// (3) resolves (its K1 [`SLAB_COLD_GFX1100_E8P`]; the matching K2 is `slab_k2_entry`); W3 (1) does
+/// not. On gfx1151 W3 (1) resolves ([`SLAB_COLD_GFX1151_W3`]); E8P (3) resolves
+/// ([`SLAB_COLD_GFX1151_E8P`]) only when the central table admits it.
 pub fn slab_cold_kernels(arch: &str, cold_codec: u8) -> Option<&'static SlabCold> {
-    if cold_codec == 0 || !crate::qwen4_slab_codec_admitted(arch, cold_codec) {
+    if cold_codec == 0 || !crate::expert_capabilities::slab_serves_codec(arch, cold_codec) {
         return None;
     }
     slab_cold_k1_metadata(arch, cold_codec)
@@ -507,10 +507,10 @@ pub const fn slab_bucket_of_codec(codec: u8) -> usize {
 }
 
 /// Bucket of codec id `codec` on `arch` (cold = 0, MQ4 = 1), `None` when the
-/// slab does not admit that codec there ([`crate::qwen4_slab_codec_admitted`]).
+/// slab does not serve that codec there ([`crate::expert_capabilities::slab_serves_codec`]).
 pub fn slab_bucket_of_codec_on(arch: &str, codec: u8) -> Option<usize> {
     slab_arch_kernels(arch)?;
-    if !crate::qwen4_slab_codec_admitted(arch, codec) {
+    if !crate::expert_capabilities::slab_serves_codec(arch, codec) {
         return None;
     }
     Some(usize::from(codec == 0))

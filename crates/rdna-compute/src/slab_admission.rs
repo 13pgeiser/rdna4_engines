@@ -5,6 +5,10 @@
 //! Which expert-slab codecs a GPU architecture serves, and a layer's cold
 //! codec (pure CPU matrix).
 //!
+//! The arch × codec matrix below is NOT stored here: it is the codec-byte projection of the one
+//! capability table, [`crate::expert_capabilities`] (raw kernel inventory minus named holds). This
+//! module keeps the codec constants, the gfx1151 E8P switch and the per-layer cold-codec logic.
+//!
 //! Codec ids are the per-layer codec table bytes of an expert-slab layer:
 //! `0` = MQ4 symmetric, `1` = MQ3-I4 (W3), `3` = E8P-I4. `2` (MQ2-I4, W2) is
 //! refused on every architecture.
@@ -61,25 +65,26 @@ pub const SLAB_CODEC_E8P: u8 = 3;
 /// gfx1100 and gfx1201 E8P never read it.
 pub const SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED: bool = true;
 
-/// Whether the sealed expert-slab route serves `codec` on GPU architecture
-/// `arch`. Exact architecture names only: no family prefix match. gfx1151 E8P follows
+/// Whether the sealed expert-slab route serves slab codec byte `codec` on GPU architecture
+/// `arch`: the codec-byte projection of [`crate::expert_capabilities::slab_serves_codec`] (the
+/// ONE capability table, derived from the raw kernel inventory minus its named holds). Exact
+/// architecture names only: no family prefix match. gfx1151 E8P follows
 /// [`SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`].
 pub fn qwen4_slab_codec_admitted(arch: &str, codec: u8) -> bool {
-    qwen4_slab_codec_admitted_with(arch, codec, SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED)
+    crate::expert_capabilities::slab_serves_codec(arch, codec)
 }
 
 /// [`qwen4_slab_codec_admitted`] with the gfx1151 E8P receipts decision given explicitly: the
-/// pure matrix, so both states of [`SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`] are testable.
+/// pure table, so both states of [`SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`] are testable.
 pub fn qwen4_slab_codec_admitted_with(arch: &str, codec: u8, gfx1151_e8p_landed: bool) -> bool {
-    match arch {
-        "gfx1201" => matches!(codec, SLAB_CODEC_MQ4 | SLAB_CODEC_W3 | SLAB_CODEC_E8P),
-        "gfx1151" => {
-            matches!(codec, SLAB_CODEC_MQ4 | SLAB_CODEC_W3)
-                || (gfx1151_e8p_landed && codec == SLAB_CODEC_E8P)
-        }
-        "gfx1100" => matches!(codec, SLAB_CODEC_MQ4 | SLAB_CODEC_E8P),
-        _ => false,
-    }
+    crate::expert_capabilities::slab_serves_codec_with(
+        arch,
+        codec,
+        &crate::expert_capabilities::Holds {
+            gfx1151_e8p_landed,
+            ..crate::expert_capabilities::Holds::BETA
+        },
+    )
 }
 
 /// The cold codec a layer without cold experts (all MQ4) is launched with on

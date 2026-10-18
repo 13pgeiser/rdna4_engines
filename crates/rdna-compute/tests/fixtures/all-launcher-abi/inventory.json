@@ -309,7 +309,8 @@
     "crates/rdna-compute/src/slab_moe.rs::slab_arch_kernels": "per-arch slab table lookup returning &'static SlabArchKernels (module, image and symbol names, plan source); names only, the launchers mq_i4_moe_gemv_slab, qwen4_moe_rotate128_i4_slab and the planner are checked sites",
     "crates/rdna-compute/src/slab_moe.rs::slab_cold_k1_metadata": "cold K1 table lookup by (arch, cold codec) returning &'static SlabCold (module, image and symbol names); names only, mq_i4_moe_gemv_slab launches through it and is a checked site",
     "crates/rdna-compute/src/slab_moe.rs::slab_k1_wide_capable": "predicate comparing a SlabK1's symbol table with MQ_I4_MOE_GEMV_SYMBOLS; names only, never issues a launch",
-    "crates/rdna-compute/src/gemm.rs::moe_scatter_stable_top10": "selector/arch guard that hands the changed QWEN4_MOE_SCATTER_STABLE_TOP10_SRC source and its module key to moe_scatter_stable_top10_with; it issues no launch, the three grouping launches and their kernel names live in moe_scatter_stable_top10_with, a checked launcher"
+    "crates/rdna-compute/src/gemm.rs::moe_scatter_stable_top10": "selector/arch guard that hands the changed QWEN4_MOE_SCATTER_STABLE_TOP10_SRC source and its module key to moe_scatter_stable_top10_with; it issues no launch, the three grouping launches and their kernel names live in moe_scatter_stable_top10_with, a checked launcher",
+    "crates/rdna-compute/src/gemm.rs::slab_k2_raw": "ungated K2 inventory selector keyed by (arch, slab codec) returning (module name, [gate/up, down] symbol names) from slab_k2_metadata and the QWEN4_MOE_SYM_PM_*/QWEN4_MOE_SYM_W3_* name constants; names only, it has no launch, ensure or compile call and its only caller is expert_capabilities::k2_raw, which builds a RawKernel name pair for the admission matrix"
   },
   "forwarders": {
     "crates/rdna-compute/src/gemm.rs::gemm_mq4g256v2_moe_grouped_top10_bf16out": {

@@ -147,12 +147,13 @@ impl HostLink {
 }
 
 /// Default of the G2 long-prefill expert stage switch when
-/// `HIPFIRE_QWEN4_EXPERT_STAGE` is unset: on for gfx1201 (the card it was
-/// measured on, whatever its link) and on every discrete device whose
-/// measured link is narrow. Off for unified memory and for an unmeasured
-/// link. `link` is only evaluated off gfx1201, so gfx1201 never probes.
+/// `HIPFIRE_QWEN4_EXPERT_STAGE` is unset: the arch's
+/// [`rdna_compute::expert_capabilities::stage_policy`] (on for gfx1201, the card it was
+/// measured on, whatever its link) and, for every other arch, on every discrete device whose
+/// measured link is narrow. Off for unified memory and for an unmeasured link. `link` is only
+/// evaluated where the policy reads the link, so gfx1201 never probes.
 pub fn expert_stage_default(arch: &str, link: impl FnOnce() -> HostLink) -> bool {
-    arch == "gfx1201" || link().is_narrow_discrete()
+    rdna_compute::expert_capabilities::stage_default_enabled(arch, || link().is_narrow_discrete())
 }
 
 /// [`HostLink`] of `gpu`, resolved on first use (calibration record, else the
