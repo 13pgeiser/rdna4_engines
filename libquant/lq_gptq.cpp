@@ -5,6 +5,7 @@
 #include <algorithm>
 
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -21,6 +22,48 @@ namespace {
  * U[i][j] (Frantar et al.'s formulation). Double throughout: a Cholesky is K^3/6 accumulations
  * deep, and f32 loses real conditioning on a matrix near-singular in the directions a rotation
  * flattened. */
+#ifdef RAD_LQ_LAPACK
+/* LAPACK, column-major, Fortran calling convention (OpenBLAS). See the three functions below. */
+extern "C" void dpotrf_(const char* uplo, const int* n, double* a, const int* lda, int* info);
+extern "C" void dpotri_(const char* uplo, const int* n, double* a, const int* lda, int* info);
+
+/* Zero the row-major strict upper (upper = true) or strict lower triangle. */
+static void zero_triangle(std::vector<double>& a, int64_t k, bool upper) {
+#pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < k; ++i) {
+        if (upper) for (int64_t j = i + 1; j < k; ++j) a[(size_t)(i * k + j)] = 0.0;
+        else       for (int64_t j = 0; j < i; ++j)     a[(size_t)(i * k + j)] = 0.0;
+    }
+}
+
+bool chol_lower(std::vector<double>& a, int64_t k) {
+    const int n = (int)k;
+    int info = 0;
+    dpotrf_("U", &n, a.data(), &n, &info);
+    if (info != 0) return false;
+    zero_triangle(a, k, true);
+    return true;
+}
+
+void inv_from_chol(std::vector<double>& l, int64_t k) {
+    const int n = (int)k;
+    int info = 0;
+    dpotri_("U", &n, l.data(), &n, &info);
+    /* Column-major upper is row-major lower: mirror it into the row-major upper half. */
+#pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < k; ++i)
+        for (int64_t j = i + 1; j < k; ++j) l[(size_t)(i * k + j)] = l[(size_t)(j * k + i)];
+}
+
+bool chol_upper(std::vector<double>& a, int64_t k) {
+    const int n = (int)k;
+    int info = 0;
+    dpotrf_("L", &n, a.data(), &n, &info);
+    if (info != 0) return false;
+    zero_triangle(a, k, false);
+    return true;
+}
+#else
 bool chol_lower(std::vector<double>& a, int64_t k) {
     for (int64_t i = 0; i < k; ++i) {
         for (int64_t j = 0; j <= i; ++j) {
@@ -79,6 +122,7 @@ bool chol_upper(std::vector<double>& a, int64_t k) {
     }
     return true;
 }
+#endif  /* RAD_LQ_LAPACK */
 
 struct Cache {
     std::mutex mu;
@@ -126,7 +170,15 @@ Gram gptq_factor(const char* dir, const char* name, int64_t K, int64_t domain, d
         if (it != c.f.end()) return it->second;
     }
     auto keep = [&](Gram u) {
-        if (layer) c.f.emplace(key, u);
+        /* One factor at a time: a dense model reads each layer's once, and a 21504-wide factor
+         * is 3.7 GB (every one kept OOM-killed TranslateGemma 27B's conversion at layer 25).
+         * Experts of one layer arrive together, so they still share it.
+         * RAD_LQ_FACTOR_CACHE_ALL keeps the old behaviour. */
+        static const bool all = std::getenv("RAD_LQ_FACTOR_CACHE_ALL") != nullptr;
+        if (layer) {
+            if (!all) c.f.clear();
+            c.f.emplace(key, u);
+        }
         return u;
     };
 
