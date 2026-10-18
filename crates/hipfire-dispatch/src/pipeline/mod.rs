@@ -6822,7 +6822,7 @@ fn prefill_combine_stage(
 // ───────────────────── opt-in expert IU4 prefill stages ─────────────────────
 //
 // Launchers of the verdict `moe_program::decide_expert_iu4` admitted for a call
-// (`HIPFIRE_MOE_SYM_IU4`, default off): the scatter and every router/shared stage
+// (`HIPFIRE_MOE_SYM_IU4`, default ON by capability; `=0` kills it): the scatter and every router/shared stage
 // are the existing ones; the stages below replace gate/up, the SwiGLU/rotation,
 // down and combine of the qt53 F32 fallback. They run only from an
 // `ExpertIu4Decision::Admitted` plan, re-check that the operands still describe
@@ -6892,7 +6892,7 @@ fn prefill_expert_iu4_gate_up_stage(
         plan.k_top,
         plan.grouped_rows,
         plan.rows,
-        false,
+        plan.host_mapped,
     ))
 }
 
@@ -6934,7 +6934,7 @@ fn prefill_expert_iu4_down_stage(
         1,
         plan.grouped_rows,
         plan.total_slots,
-        false,
+        plan.host_mapped,
     ))
 }
 

@@ -2970,7 +2970,7 @@ fn load_weights_inner(
             host_expert_bytes as f64 / (1u64 << 30) as f64,
         );
     }
-    let mut weights = Qwen35Weights {
+    let weights = Qwen35Weights {
         token_embd,
         embd_format,
         output_norm,
@@ -2981,10 +2981,10 @@ fn load_weights_inner(
         lm_head_aliases_embd,
         ep_shard: None,
     };
-    // Model-level symmetric IU4 verdict + scratch reservation (no-op unless the
-    // flag made a MoE layer carry a capability).
-    finalize_expert_iu4(devices, layout, &mut weights);
-    Ok(weights)
+    // Model-level symmetric IU4 resolution for the qt53 artifact class (default
+    // on by capability; typed refusal or explicit-kill warning; no-op for every
+    // other model).
+    finalize_expert_iu4(devices, layout, weights)
 }
 
 // ── HfqSource ─────────────────────────────────────────────────────────────
@@ -6630,16 +6630,33 @@ pub(crate) fn load_moe_ffn(
     }
 
     let mut ffn = pending.commit(expert_execution_plan, expert_table, expert_binding, gpu)?;
-    // Opt-in symmetric IU4 expert prefill route (`HIPFIRE_MOE_SYM_IU4`, default
-    // off): flag off => no check, no capability, no reservation. The model-level
-    // verdict and scratch reservation run once in `finalize_expert_iu4`.
-    if gpu.moe_sym_iu4_requested() {
-        ffn.expert_iu4 = expert_iu4_layer_capability(gpu, config, &ffn, residency.experts_host());
+    // Default-on symmetric IU4 expert prefill route for the qt53 artifact class:
+    // layer-level capability + header verification here (no-op for every other
+    // model and under the explicit kill); the model-level verdict, scratch
+    // reservation and logging run once in `finalize_expert_iu4`. A layer that
+    // cannot carry the route fails the load, so the committed layer is released
+    // here and the staged-load transaction reclaims the rest.
+    match expert_iu4_layer_capability(gpu, config, &ffn, residency.experts_host()) {
+        Ok(capability) => {
+            ffn.expert_iu4 = capability;
+            Ok(ffn)
+        }
+        Err(error) => {
+            let _ = gpu.bind_thread();
+            let _ = gpu.hip.device_synchronize();
+            super::weights::free_moe_ffn(gpu, ffn);
+            Err(error)
+        }
     }
-    Ok(ffn)
 }
 
-// ─── Opt-in symmetric IU4 routed-expert prefill capability ─────────────────
+// ─── Default-on symmetric IU4 routed-expert prefill (qt53 artifact class) ──
+//
+// The qt53 artifact class (uniform qt44 gate_up + qt53 down routed experts) has
+// no acceptable non-IU4 prefill: the qt53 F32 fallback is ~3.7x slower. The
+// route therefore resolves by capability at load (`finalize_expert_iu4`), and a
+// model that cannot carry it fails the load with a typed refusal unless the
+// user explicitly kills it (`HIPFIRE_MOE_SYM_IU4=0` / `HIPFIRE_IU4_PREFILL=0`).
 
 type ExpertIu4Capability = (
     hipfire_dispatch::families::moe_expert_iu4::ExpertIu4Spec,
@@ -6655,6 +6672,8 @@ pub(crate) struct ExpertIu4LayerFacts {
     pub(crate) hidden: usize,
     pub(crate) intermediate: usize,
     /// Routed experts are host-mapped (`memory.moe_expert_budget` spill).
+    /// Informational admitted state: host-mapped experts carry the capability
+    /// (the pipeline passes the real `host_mapped` bool to the NT8 PM entries).
     pub(crate) experts_host: bool,
     /// Loaded resident expert tensors (`0` when paged; the pager owns them).
     pub(crate) resident_experts: usize,
@@ -6675,6 +6694,14 @@ pub(crate) struct ExpertIu4LayerFacts {
 fn uniform_dtype(mut dtypes: impl Iterator<Item = DType>) -> Option<DType> {
     let first = dtypes.next()?;
     dtypes.all(|dtype| dtype == first).then_some(first)
+}
+
+/// The qt53 artifact class: any routed expert projection is qt53
+/// (`MQ4G128V2`). Membership is deliberately broader than eligibility, so a
+/// partly-qt53 or otherwise ineligible layer of a qt53 model is refused at
+/// load instead of silently reaching the slow fallback.
+fn expert_iu4_is_qt53_class(mut projections: impl Iterator<Item = (DType, DType)>) -> bool {
+    projections.any(|(gate_up, down)| gate_up == DType::MQ4G128V2 || down == DType::MQ4G128V2)
 }
 
 fn expert_iu4_layer_facts(
@@ -6711,16 +6738,14 @@ fn expert_iu4_layer_facts(
 }
 
 /// Pure per-layer eligibility: the expert spec this layer would carry, or the
-/// first reason it cannot carry the capability. Resident, uniform qt44
-/// (MQ4G256V2) gate_up + qt53 (MQ4G128V2) down only; the spec's own geometry
-/// requirements are those of `ExpertIu4Spec::validate`.
+/// first reason it cannot carry the capability. Fully loaded (resident or
+/// host-mapped), uniform qt44 (MQ4G256V2) gate_up + qt53 (MQ4G128V2) down only;
+/// the spec's own geometry requirements are those of `ExpertIu4Spec::validate`.
+/// Paged/EP/CPU-deferred/tagged/AWQ/Paro layers stay refused.
 pub(crate) fn expert_iu4_layer_spec(
     facts: &ExpertIu4LayerFacts,
 ) -> Result<hipfire_dispatch::families::moe_expert_iu4::ExpertIu4Spec, &'static str> {
     use hipfire_dispatch::families::moe_expert_iu4::{ExpertIu4Spec, ExpertNumerics};
-    if facts.experts_host {
-        return Err("routed experts are host-mapped");
-    }
     if facts.experts == 0 || facts.resident_experts != facts.experts {
         return Err("routed experts are not fully resident (paged, EP or absent)");
     }
@@ -6773,7 +6798,7 @@ pub(crate) struct ExpertIu4Verdict {
 }
 
 /// Pure model verdict over every MoE layer's capability, in layer order.
-/// `None` when no layer carries one (flag off or nothing eligible: no work).
+/// `None` when no layer carries one (nothing eligible: no spec to bind).
 /// `verified` only when EVERY MoE layer carries the same spec with verified
 /// symmetric headers; otherwise the capability is withheld from ALL layers.
 pub(crate) fn expert_iu4_model_verdict(
@@ -6802,71 +6827,120 @@ pub(crate) fn expert_iu4_model_verdict(
     })
 }
 
-/// One log line per process for the first layer-level refusal.
-fn log_expert_iu4_refusal_once(layer_idx: u16, reason: &str) {
-    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        eprintln!(
-            "  qwen35 symmetric IU4 MoE (HIPFIRE_MOE_SYM_IU4): layer {layer_idx} refused: {reason}"
-        );
+/// Why the load of a qt53-class model is refused (the model cannot carry the
+/// IU4 route and the user did not explicitly kill it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExpertIu4Refusal {
+    /// A device hosting MoE layers has no gfx1201 PM objects / producers.
+    ArchIncapable,
+    /// A layer is ineligible, headers are not symmetric, or the header
+    /// verifier failed.
+    Unverified,
+    /// The scratch / sign-table reservation failed on an owner device.
+    ReservationFailed,
+}
+
+impl ExpertIu4Refusal {
+    /// Stable `DispatchError::UnsupportedVariant::variant` name.
+    pub(crate) fn variant(self) -> &'static str {
+        match self {
+            Self::ArchIncapable => "iu4-arch-incapable",
+            Self::Unverified => "iu4-experts-not-verified-symmetric",
+            Self::ReservationFailed => "iu4-scratch-reservation-failed",
+        }
     }
 }
 
-/// Per-layer capability. Only called when the flag is requested. Ineligible
-/// layers return `None`; eligible ones run the FN load-time header verifier
-/// (`verify_symmetric`: gate/up `(2I, H, 136)`, down `(H, I, 68)`) over the
-/// layer's expert pointer tables. The verifier is optional: a verifier kernel
-/// error means verification is unavailable, so the layer carries
-/// `(spec, false)` (logged once) and the load continues on the E0 fallback.
-fn expert_iu4_layer_capability(
-    gpu: &mut Gpu,
-    config: &Qwen35Config,
-    ffn: &MoeFfnWeights,
-    experts_host: bool,
-) -> Option<ExpertIu4Capability> {
-    let facts = expert_iu4_layer_facts(ffn, config, experts_host);
-    let spec = match expert_iu4_layer_spec(&facts) {
-        Ok(spec) => spec,
-        Err(reason) => {
-            log_expert_iu4_refusal_once(ffn.layer_idx, reason);
-            return None;
-        }
-    };
-    let (experts, hidden, intermediate) = (facts.experts, facts.hidden, facts.intermediate);
-    let checked = gpu
-        .qwen4_moe_sym_check(
-            &ffn.expert_gate_up_ptrs,
-            2 * intermediate,
-            hidden,
-            experts,
-            136,
-        )
-        .and_then(|gate_up| {
-            if gate_up {
-                gpu.qwen4_moe_sym_check(&ffn.expert_down_ptrs, hidden, intermediate, experts, 68)
-            } else {
-                Ok(false)
-            }
-        });
-    let symmetric = match checked {
-        Ok(symmetric) => {
-            if !symmetric {
-                log_expert_iu4_refusal_once(ffn.layer_idx, "routed headers are not symmetric");
-            }
-            symmetric
-        }
-        Err(error) => {
-            log_expert_iu4_refusal_once(
-                ffn.layer_idx,
-                &format!(
-                    "symmetric header verification unavailable: {}",
-                    error.message
-                ),
-            );
-            false
-        }
-    };
-    Some((spec, symmetric))
+/// Outcome of the model-level IU4 resolution for a qt53-class model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExpertIu4LoadDecision {
+    /// Bind the capability on every MoE layer (reserved and prewarmed).
+    Bind,
+    /// Explicit user kill: load with no capability and a loud WARNING.
+    LoadWithWarning,
+    /// Fail the load with a typed refusal.
+    Refuse(ExpertIu4Refusal),
+}
+
+/// Pure load decision. An explicit kill wins over every other input (the
+/// verifier and reservation are not even run); otherwise the first failing
+/// requirement in the order arch -> verified -> reservation refuses; only a
+/// capable, verified, reserved, un-killed model binds. Never silently falls
+/// back to the slow qt53 route.
+pub(crate) fn expert_iu4_load_decision(
+    arch_capable: bool,
+    verified: bool,
+    kill: bool,
+    reserve_ok: bool,
+) -> ExpertIu4LoadDecision {
+    if kill {
+        ExpertIu4LoadDecision::LoadWithWarning
+    } else if !arch_capable {
+        ExpertIu4LoadDecision::Refuse(ExpertIu4Refusal::ArchIncapable)
+    } else if !verified {
+        ExpertIu4LoadDecision::Refuse(ExpertIu4Refusal::Unverified)
+    } else if !reserve_ok {
+        ExpertIu4LoadDecision::Refuse(ExpertIu4Refusal::ReservationFailed)
+    } else {
+        ExpertIu4LoadDecision::Bind
+    }
+}
+
+const EXPERT_IU4_ARTIFACT_CLASS: &str =
+    "symmetric qt44 gate_up + qt53 down routed experts (MQ4G256V2 + MQ4G128V2)";
+const EXPERT_IU4_REMEDY: &str = "run on a gfx1201 build with the IU4 route, use the qt44 \
+    (mq4r/mq4rs) artifact, or set HIPFIRE_MOE_SYM_IU4=0 to explicitly accept the \
+    ~3.7x slower qt53 F32 prefill fallback";
+
+/// `DispatchError::UnsupportedVariant::arch` is `&'static str`; map the arches
+/// that reach this route and leave anything else empty (the message carries the
+/// real arch string).
+fn expert_iu4_static_arch(arch: &str) -> &'static str {
+    match arch {
+        "gfx1201" => "gfx1201",
+        "gfx1200" => "gfx1200",
+        "gfx1151" => "gfx1151",
+        "gfx1100" => "gfx1100",
+        "gfx1030" => "gfx1030",
+        "gfx942" => "gfx942",
+        _ => "",
+    }
+}
+
+fn expert_iu4_refusal_dispatch_error(
+    refusal: ExpertIu4Refusal,
+    arch: &str,
+) -> hipfire_dispatch::types::DispatchError {
+    hipfire_dispatch::types::DispatchError::UnsupportedVariant {
+        family: "moe",
+        variant: refusal.variant(),
+        arch: expert_iu4_static_arch(arch),
+        quant: "MQ4G128V2",
+    }
+}
+
+/// Full load-error text: the typed dispatch refusal, the concrete detail, the
+/// artifact class, and the remedies.
+fn expert_iu4_refusal_message(refusal: ExpertIu4Refusal, arch: &str, detail: &str) -> String {
+    format!(
+        "qwen35: {} (device arch '{arch}'): {detail}. Artifact class: {EXPERT_IU4_ARTIFACT_CLASS}; \
+         it has no acceptable prefill without the symmetric IU4 route. Remedy: {EXPERT_IU4_REMEDY}",
+        expert_iu4_refusal_dispatch_error(refusal, arch),
+    )
+}
+
+fn expert_iu4_kill_warning() -> String {
+    "  qwen35 symmetric IU4 MoE: WARNING: the IU4 route is explicitly disabled \
+     (HIPFIRE_MOE_SYM_IU4=0 or HIPFIRE_IU4_PREFILL=0); this qt53 model uses the qt53 F32 \
+     fallback for every prefill, ~3.7x slower than the IU4 route"
+        .to_owned()
+}
+
+fn expert_iu4_admitted_info(moe_layers: usize) -> String {
+    format!(
+        "  qwen35 symmetric IU4 MoE: INFO: {moe_layers} MoE layers admitted by capability \
+         (default on; HIPFIRE_MOE_SYM_IU4=0 kills it); headers verified symmetric, scratch reserved"
+    )
 }
 
 fn layer_moe_ffn_mut(layer: &mut LayerWeights) -> Option<&mut MoeFfnWeights> {
@@ -6877,72 +6951,265 @@ fn layer_moe_ffn_mut(layer: &mut LayerWeights) -> Option<&mut MoeFfnWeights> {
     }
 }
 
-/// Model-level IU4 finalization, once after every layer is loaded. Does
-/// nothing (no GPU work, no reservation, no log) unless some MoE layer carries
-/// a capability. If ANY MoE layer failed, the capability is withheld from ALL
-/// layers (verified=false) and the reason logged once. When verified, sizes the
-/// route's scratch for the model's prefill chunk ceiling
-/// ([`prefill_max_batch_for_model`], the ceiling the ordinary MoE prefill
-/// chunks under) on every device hosting a MoE layer, so no allocation happens
-/// inside prefill. A failed reservation withholds the capability instead of
-/// failing the load.
-fn finalize_expert_iu4(devices: &mut [Gpu], layout: &Layout, weights: &mut Qwen35Weights) {
+/// Per-layer resolution while the layer loads. `Ok(None)`: the layer is not of
+/// the qt53 artifact class (nothing to do, no log), or the user explicitly
+/// killed the route ([`Gpu::moe_sym_iu4_disabled`]; [`finalize_expert_iu4`]
+/// emits the one WARNING). Otherwise the layer must be on a capable device and
+/// eligible, and its expert headers must verify symmetric (FN load-time
+/// verifier `qwen4_moe_sym_check`: gate/up `(2I, H, 136)`, down `(H, I, 68)`
+/// over the layer's expert pointer tables; host-mapped layers verify through the
+/// same device pointer tables): `Ok(Some((spec, true)))`. Anything else is the
+/// typed refusal of [`expert_iu4_load_decision`] as a load error; the caller
+/// releases the layer.
+fn expert_iu4_layer_capability(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    ffn: &MoeFfnWeights,
+    experts_host: bool,
+) -> HipResult<Option<ExpertIu4Capability>> {
+    if !expert_iu4_is_qt53_class(
+        ffn.experts
+            .iter()
+            .map(|e| (e.gate_up.gpu_dtype, e.down.gpu_dtype)),
+    ) || gpu.moe_sym_iu4_disabled()
+    {
+        return Ok(None);
+    }
+    let layer = ffn.layer_idx;
+    // Not killed, so `requested()` false means the device lacks the gfx1201 PM
+    // objects / combine object / C2 producers.
+    let arch_capable = gpu.moe_sym_iu4_requested();
+    let mut capability = None;
+    let mut detail = format!(
+        "layer {layer}: device arch '{}' has no symmetric IU4 PM objects/producers",
+        gpu.arch
+    );
+    if arch_capable {
+        let facts = expert_iu4_layer_facts(ffn, config, experts_host);
+        detail = match expert_iu4_layer_spec(&facts) {
+            Err(reason) => format!("layer {layer}: {reason}"),
+            Ok(spec) => {
+                let (experts, hidden, intermediate) =
+                    (facts.experts, facts.hidden, facts.intermediate);
+                let checked = gpu
+                    .qwen4_moe_sym_check(
+                        &ffn.expert_gate_up_ptrs,
+                        2 * intermediate,
+                        hidden,
+                        experts,
+                        136,
+                    )
+                    .and_then(|gate_up| {
+                        if gate_up {
+                            gpu.qwen4_moe_sym_check(
+                                &ffn.expert_down_ptrs,
+                                hidden,
+                                intermediate,
+                                experts,
+                                68,
+                            )
+                        } else {
+                            Ok(false)
+                        }
+                    });
+                match checked {
+                    Ok(true) => {
+                        capability = Some((spec, true));
+                        String::new()
+                    }
+                    Ok(false) => format!("layer {layer}: routed headers are not symmetric"),
+                    Err(error) => format!(
+                        "layer {layer}: symmetric header verification failed: {}",
+                        error.message
+                    ),
+                }
+            }
+        };
+    }
+    match expert_iu4_load_decision(arch_capable, capability.is_some(), false, true) {
+        ExpertIu4LoadDecision::Bind | ExpertIu4LoadDecision::LoadWithWarning => Ok(capability),
+        ExpertIu4LoadDecision::Refuse(refusal) => Err(HipError::new(
+            0,
+            &expert_iu4_refusal_message(refusal, &gpu.arch, &detail),
+        )),
+    }
+}
+
+/// Return every GPU owner of a fully loaded model after a post-sweep refusal.
+/// Mirrors the staged-load rollback placement (`GpuStagedLoadOps`): embedding on
+/// device 0, final norm and output on the output device, each layer through the
+/// single layer teardown `LayerWeights::free_gpu` on its band device. The
+/// load path never installs a pager or EP shard.
+fn release_loaded_weights(devices: &mut [Gpu], layout: &Layout, weights: Qwen35Weights) {
+    let Qwen35Weights {
+        token_embd,
+        output_norm,
+        output,
+        layers,
+        pager,
+        lm_head_aliases_embd,
+        ..
+    } = weights;
+    debug_assert!(
+        pager.is_none(),
+        "post-sweep refusal runs before any pager install"
+    );
+    for gpu in devices.iter_mut() {
+        let _ = gpu.bind_thread();
+        let _ = gpu.hip.device_synchronize();
+    }
+    for (index, layer) in layers.into_iter().enumerate() {
+        layer.free_gpu(&mut devices[layout.device_for_layer(index)]);
+    }
+    let out_dev = layout.output_device();
+    if lm_head_aliases_embd {
+        output.free_metadata_only(&mut devices[out_dev]);
+    } else {
+        output.free_all(&mut devices[out_dev]);
+    }
+    let _ = devices[out_dev].free_tensor(output_norm);
+    let _ = devices[0].free_tensor(token_embd);
+}
+
+/// Model-level IU4 resolution, once after every layer is loaded (config-free:
+/// the per-layer capability, spec and header verdict were resolved in
+/// [`expert_iu4_layer_capability`] while loading each layer). Does nothing (no
+/// GPU work, no log) unless some MoE layer is of the qt53 artifact class. For
+/// that class the route resolves by capability (default on):
+///
+/// * explicit kill (`Gpu::moe_sym_iu4_disabled`) -> load proceeds with no
+///   capability and one WARNING; no verifier, no reservation;
+/// * otherwise every MoE layer must carry the same verified capability on a
+///   capable arch, and the route's scratch must reserve on every owner device
+///   sized for the model's prefill chunk ceiling
+///   ([`prefill_max_batch_for_model`]) plus the FWHT sign tables, so no
+///   allocation happens inside prefill -> capability bound on ALL layers and
+///   one INFO;
+/// * any failure (incapable arch, a MoE layer without the capability, disagreeing
+///   layer recipes, reservation/sign-table error) refuses the whole load with a
+///   typed error after releasing the loaded weights.
+fn finalize_expert_iu4(
+    devices: &mut [Gpu],
+    layout: &Layout,
+    mut weights: Qwen35Weights,
+) -> HipResult<Qwen35Weights> {
     use std::collections::BTreeSet;
-    let mut caps: Vec<Option<ExpertIu4Capability>> = Vec::new();
     let mut hosting: BTreeSet<usize> = BTreeSet::new();
+    let mut caps: Vec<Option<ExpertIu4Capability>> = Vec::new();
+    let mut uncapable_layer: Option<u16> = None;
+    let mut qt53_class = false;
     for (index, layer) in weights.layers.iter_mut().enumerate() {
         if let Some(ffn) = layer_moe_ffn_mut(layer) {
-            caps.push(ffn.expert_iu4);
             hosting.insert(layout.device_for_layer(index));
+            caps.push(ffn.expert_iu4);
+            if ffn.expert_iu4.is_none() {
+                uncapable_layer.get_or_insert(ffn.layer_idx);
+            }
+            qt53_class |= expert_iu4_is_qt53_class(
+                ffn.experts
+                    .iter()
+                    .map(|e| (e.gate_up.gpu_dtype, e.down.gpu_dtype)),
+            );
         }
     }
-    let Some(verdict) = expert_iu4_model_verdict(&caps) else {
-        return;
+    let Some(&first_device) = hosting.iter().next().filter(|_| qt53_class) else {
+        return Ok(weights);
     };
-    let mut verified = verdict.verified;
-    let mut reason = verdict.reason.map(str::to_owned);
-    if verified {
-        let spec = verdict.spec;
-        for device in hosting {
-            let max_rows = super::prefill::prefill_max_batch_for_model(&devices[device], weights);
-            // The rotate256_i4 / rotate128_i4 launches lazily build the FWHT sign
-            // tables; build them here too so an admitted prefill allocates nothing.
-            let gpu = &mut devices[device];
-            let reserved = gpu
-                .reserve_qwen4_moe_sym(
-                    max_rows,
-                    spec.top_k as usize,
-                    spec.experts as usize,
-                    spec.hidden as usize,
-                    spec.intermediate as usize,
-                )
-                .and_then(|()| gpu.ensure_mq_signs())
-                .and_then(|()| gpu.ensure_mq_signs_128());
-            if let Err(error) = reserved {
-                verified = false;
-                reason = Some(format!(
-                    "symmetric IU4 scratch/sign-table reservation failed on device {device}: {}",
-                    error.message
-                ));
-                break;
+
+    let kill = devices[first_device].moe_sym_iu4_disabled();
+    let mut arch_capable = false;
+    let mut verified = false;
+    let mut reserve_ok = true;
+    let mut detail = String::new();
+    let mut spec = None;
+    if !kill {
+        // Not killed, so `requested()` false means the device lacks the gfx1201
+        // PM objects / combine object / C2 producers.
+        let incapable = hosting
+            .iter()
+            .copied()
+            .find(|&device| !devices[device].moe_sym_iu4_requested());
+        arch_capable = incapable.is_none();
+        if let Some(device) = incapable {
+            detail = format!(
+                "device {device} ({}) has no symmetric IU4 PM objects/producers",
+                devices[device].arch
+            );
+        } else {
+            match (expert_iu4_model_verdict(&caps), uncapable_layer) {
+                (Some(verdict), None) if verdict.verified => {
+                    verified = true;
+                    spec = Some(verdict.spec);
+                }
+                (_, Some(layer)) => {
+                    detail = format!(
+                        "layer {layer}: routed experts are not the qt44 gate_up + qt53 down \
+                         artifact (the layer carries no symmetric IU4 capability)"
+                    );
+                }
+                (Some(verdict), None) => {
+                    detail = verdict
+                        .reason
+                        .unwrap_or("MoE layers are not verified")
+                        .to_owned();
+                }
+                (None, None) => {
+                    detail = "no MoE layer carries the symmetric IU4 capability".to_owned();
+                }
+            }
+        }
+        if let (true, Some(spec)) = (verified, spec) {
+            for &device in &hosting {
+                let max_rows =
+                    super::prefill::prefill_max_batch_for_model(&devices[device], &weights);
+                // The rotate256_i4 / rotate128_i4 launches lazily build the FWHT
+                // sign tables; build them here too so an admitted prefill
+                // allocates nothing.
+                let gpu = &mut devices[device];
+                let reserved = gpu
+                    .reserve_qwen4_moe_sym(
+                        max_rows,
+                        spec.top_k as usize,
+                        spec.experts as usize,
+                        spec.hidden as usize,
+                        spec.intermediate as usize,
+                    )
+                    .and_then(|()| gpu.ensure_mq_signs())
+                    .and_then(|()| gpu.ensure_mq_signs_128());
+                if let Err(error) = reserved {
+                    reserve_ok = false;
+                    detail = format!(
+                        "symmetric IU4 scratch/sign-table reservation failed on device {device}: {}",
+                        error.message
+                    );
+                    break;
+                }
             }
         }
     }
-    for layer in weights.layers.iter_mut() {
-        if let Some(ffn) = layer_moe_ffn_mut(layer) {
-            if let Some((_, flag)) = ffn.expert_iu4.as_mut() {
-                *flag = verified;
-            }
+
+    match expert_iu4_load_decision(arch_capable, verified, kill, reserve_ok) {
+        ExpertIu4LoadDecision::Bind => {
+            // Every MoE layer already carries the verified, agreeing capability.
+            eprintln!("{}", expert_iu4_admitted_info(caps.len()));
+            Ok(weights)
         }
-    }
-    match reason {
-        None => eprintln!(
-            "  qwen35 symmetric IU4 MoE (HIPFIRE_MOE_SYM_IU4): {} MoE layers verified symmetric; scratch reserved",
-            caps.len()
-        ),
-        Some(reason) => eprintln!(
-            "  qwen35 symmetric IU4 MoE (HIPFIRE_MOE_SYM_IU4): capability withheld for all layers: {reason}"
-        ),
+        ExpertIu4LoadDecision::LoadWithWarning => {
+            // The layers loaded with no capability (kill); make that explicit.
+            for layer in weights.layers.iter_mut() {
+                if let Some(ffn) = layer_moe_ffn_mut(layer) {
+                    ffn.expert_iu4 = None;
+                }
+            }
+            eprintln!("{}", expert_iu4_kill_warning());
+            Ok(weights)
+        }
+        ExpertIu4LoadDecision::Refuse(refusal) => {
+            let arch = devices[first_device].arch.clone();
+            let error = HipError::new(0, &expert_iu4_refusal_message(refusal, &arch, &detail));
+            release_loaded_weights(devices, layout, weights);
+            Err(error)
+        }
     }
 }
 
@@ -9301,8 +9568,7 @@ mod expert_iu4_load_tests {
 
     #[test]
     fn layer_spec_refusal_table() {
-        let cases: [(&str, fn(&mut ExpertIu4LayerFacts)); 14] = [
-            ("host-mapped", |f| f.experts_host = true),
+        let cases: [(&str, fn(&mut ExpertIu4LayerFacts)); 13] = [
             ("not fully resident", |f| f.resident_experts = 0),
             ("not fully resident", |f| f.resident_experts = 255),
             ("not fully resident", |f| f.experts = 0),
@@ -9368,5 +9634,138 @@ mod expert_iu4_load_tests {
         let verdict = expert_iu4_model_verdict(&[ok, Some((other, true))]).unwrap();
         assert!(!verdict.verified);
         assert!(verdict.reason.unwrap().contains("disagree"));
+    }
+
+    #[test]
+    fn layer_spec_admits_host_mapped_experts() {
+        // Host-mapped experts are admitted state, not a refusal: the pipeline
+        // passes the real `host_mapped` bool to both PM GEMM launchers.
+        let mut facts = a3b();
+        facts.experts_host = true;
+        assert_eq!(expert_iu4_layer_spec(&facts), Ok(a3b_spec()));
+    }
+
+    #[test]
+    fn qt53_class_is_any_qt53_expert_projection() {
+        let (g, d, other) = (DType::MQ4G256V2, DType::MQ4G128V2, DType::MQ4G256);
+        assert!(!expert_iu4_is_qt53_class([].into_iter()));
+        assert!(expert_iu4_is_qt53_class([(g, d), (g, d)].into_iter()));
+        // One qt53 expert makes the artifact the qt53 class (the layer is then
+        // refused as non-uniform rather than silently falling back).
+        assert!(expert_iu4_is_qt53_class([(g, g), (g, d)].into_iter()));
+        assert!(expert_iu4_is_qt53_class([(d, other)].into_iter()));
+        // qt44-only (mq4r/mq4rs) and other recipes are not the qt53 class.
+        assert!(!expert_iu4_is_qt53_class(
+            [(g, g), (other, other)].into_iter()
+        ));
+    }
+
+    /// Exhaustive 2^4 table: arch capable x verified x kill x reservation ok.
+    #[test]
+    fn load_decision_exhaustive_table() {
+        use ExpertIu4LoadDecision::{Bind, LoadWithWarning, Refuse};
+        use ExpertIu4Refusal::{ArchIncapable, ReservationFailed, Unverified};
+        let mut seen = 0;
+        for bits in 0u8..16 {
+            let (arch, verified, kill, reserve) =
+                (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0);
+            let expected = if kill {
+                // The explicit kill wins over every other input.
+                LoadWithWarning
+            } else if !arch {
+                Refuse(ArchIncapable)
+            } else if !verified {
+                Refuse(Unverified)
+            } else if !reserve {
+                Refuse(ReservationFailed)
+            } else {
+                Bind
+            };
+            assert_eq!(
+                expert_iu4_load_decision(arch, verified, kill, reserve),
+                expected,
+                "arch={arch} verified={verified} kill={kill} reserve={reserve}"
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, 16);
+        // Spot the three outcome classes explicitly.
+        assert_eq!(expert_iu4_load_decision(true, true, false, true), Bind);
+        assert_eq!(
+            expert_iu4_load_decision(false, false, true, false),
+            LoadWithWarning
+        );
+        assert_eq!(
+            expert_iu4_load_decision(false, true, false, true),
+            Refuse(ArchIncapable)
+        );
+        // Exactly one Bind row: capable, verified, not killed, reserved.
+        let binds = (0u8..16)
+            .filter(|bits| {
+                expert_iu4_load_decision(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0)
+                    == Bind
+            })
+            .count();
+        assert_eq!(binds, 1);
+    }
+
+    #[test]
+    fn refusal_is_a_typed_dispatch_error_with_artifact_and_remedy() {
+        use hipfire_dispatch::types::DispatchError;
+        for (refusal, variant) in [
+            (ExpertIu4Refusal::ArchIncapable, "iu4-arch-incapable"),
+            (
+                ExpertIu4Refusal::Unverified,
+                "iu4-experts-not-verified-symmetric",
+            ),
+            (
+                ExpertIu4Refusal::ReservationFailed,
+                "iu4-scratch-reservation-failed",
+            ),
+        ] {
+            match expert_iu4_refusal_dispatch_error(refusal, "gfx1100") {
+                DispatchError::UnsupportedVariant {
+                    family,
+                    variant: got,
+                    arch,
+                    quant,
+                } => {
+                    assert_eq!(family, "moe");
+                    assert_eq!(got, variant);
+                    assert_eq!(arch, "gfx1100");
+                    assert_eq!(quant, "MQ4G128V2");
+                }
+                other => panic!("expected UnsupportedVariant, got {other:?}"),
+            }
+            let message = expert_iu4_refusal_message(refusal, "gfx1100", "layer 3: detail");
+            for needle in [
+                variant,
+                "layer 3: detail",
+                "symmetric qt44 gate_up + qt53 down",
+                "gfx1201 build with the IU4 route",
+                "qt44 (mq4r/mq4rs)",
+                "HIPFIRE_MOE_SYM_IU4=0",
+            ] {
+                assert!(message.contains(needle), "{needle}: {message}");
+            }
+        }
+        // Unknown arch strings stay empty rather than inventing a static name.
+        assert_eq!(expert_iu4_static_arch("gfx9999"), "");
+        assert_eq!(expert_iu4_static_arch("gfx1201"), "gfx1201");
+    }
+
+    #[test]
+    fn kill_warning_and_admitted_info_text() {
+        let warning = expert_iu4_kill_warning();
+        assert!(warning.contains("WARNING"), "{warning}");
+        assert!(warning.contains("qt53 F32 fallback"), "{warning}");
+        assert!(warning.contains("3.7x slower"), "{warning}");
+        assert!(warning.contains("HIPFIRE_MOE_SYM_IU4=0"), "{warning}");
+        let info = expert_iu4_admitted_info(40);
+        assert!(info.contains("INFO"), "{info}");
+        assert!(info.contains("40 MoE layers"), "{info}");
+        assert!(info.contains("admitted by capability"), "{info}");
+        assert!(info.contains("default on"), "{info}");
+        assert!(info.contains("HIPFIRE_MOE_SYM_IU4=0 kills it"), "{info}");
     }
 }

@@ -3617,19 +3617,21 @@ pub(super) fn select_prefill(
 
 // ───────────────────── opt-in expert IU4 prefill route ─────────────────────
 //
-// `HIPFIRE_MOE_SYM_IU4` (default OFF). Only a prefill whose arch bound the
-// loader capability (`MoePrefillParams::expert_iu4`) ever consults any of this;
-// an unbound call returns [`ExpertIu4Decision::Unbound`] before reading a flag,
-// the device or an operand, so default-off adds no launch, query or allocation.
+// `HIPFIRE_MOE_SYM_IU4` (default ON by capability; `=0` kills it). Only a prefill
+// whose arch bound the loader capability (`MoePrefillParams::expert_iu4`) ever
+// consults any of this; an unbound call (explicit kill or a non-artifact model)
+// returns [`ExpertIu4Decision::Unbound`] before reading a flag, the device or an
+// operand, so it adds no launch, query or allocation.
 //
 // The decision is made ONCE per invocation (first routed stage, the scatter) from
 // [`ExpertIu4Facts`], cached in [`MoeStepState`] and read by every later stage, so
 // the scatter, gate/up, down and combine can never disagree and no stage falls
-// back after an expert IU4 launch. Every capacity, scratch, capture and shape
-// check is part of that one pure decision and precedes the first IU4 launch.
+// back after an expert IU4 launch. Every capacity, scratch and shape check is part
+// of that one pure decision and precedes the first IU4 launch; hipGraph capture and
+// host-mapped experts are admitted, only Redline recording is excluded.
 
 use crate::families::moe_expert_iu4::{
-    expert_iu4_admission, ExpertIu4Inputs, ExpertIu4Reject, ExpertIu4Spec,
+    expert_iu4_admission, ExpertIu4Inputs, ExpertIu4Reject, ExpertIu4Spec, EXPERT_IU4_MIN_ROWS,
 };
 
 /// Grouped-row tile of the symmetric GEMM launchers (`grouped_rows % 16 == 0`).
@@ -3678,6 +3680,9 @@ pub(super) enum ExpertIu4Exclusion {
     /// A buffer, scratch, extent or kernel domain limit (named) is below what the
     /// route needs.
     Capacity(&'static str),
+    /// Redline replay recording / retained body is active (not a hipGraph capture,
+    /// which is admitted): prefill never runs under it.
+    RedlineRecording,
 }
 
 impl ExpertIu4Exclusion {
@@ -3696,6 +3701,7 @@ impl ExpertIu4Exclusion {
             Self::SpecMismatch => "loader spec disagrees with the call geometry or dtypes",
             Self::ActivationDtype => "normalized activation is not F32",
             Self::Capacity(_) => "a buffer, scratch or kernel limit is below the route's need",
+            Self::RedlineRecording => "Redline recording or retained body is active",
         }
     }
 
@@ -3715,6 +3721,7 @@ impl ExpertIu4Exclusion {
             Self::SpecMismatch => 29,
             Self::ActivationDtype => 30,
             Self::Capacity(_) => 31,
+            Self::RedlineRecording => 32,
         }
     }
 }
@@ -3749,6 +3756,8 @@ pub(super) struct ExpertIu4Plan {
     /// Routed width I (gate/up output is `2 * I`, down `k`).
     pub(super) intermediate: usize,
     pub(super) k_top: usize,
+    /// Routed experts are host-mapped: both PM GEMM launchers take the NT8 entries.
+    pub(super) host_mapped: bool,
 }
 
 impl ExpertIu4Plan {
@@ -3762,6 +3771,7 @@ impl ExpertIu4Plan {
             && p.down_k == self.intermediate
             && p.k_top == self.k_top
             && p.routed_out.is_none()
+            && expert_iu4_host_mapped(p) == self.host_mapped
     }
 }
 
@@ -3789,6 +3799,8 @@ pub(super) struct ExpertIu4CallShape {
     pub(super) canonical_slot_order: bool,
     pub(super) staged_expert_tables: bool,
     pub(super) paro: bool,
+    /// Redline recording or a retained Redline body is active (not a hipGraph capture).
+    pub(super) redline_recording: bool,
 }
 
 /// Extents of the call.
@@ -3858,14 +3870,17 @@ pub(super) struct ExpertIu4Facts {
     pub(super) capability: Option<(ExpertIu4Spec, bool)>,
     /// `Gpu::moe_sym_iu4_requested()`.
     pub(super) requested: bool,
-    /// `Gpu::route_rows(batch_size)`: the floor measure `moe_sym_iu4_applies` uses.
+    /// `Gpu::route_rows(batch_size)`: the measure the row floor ([`EXPERT_IU4_MIN_ROWS`]) reads.
     pub(super) route_rows: usize,
     pub(super) min_rows: usize,
     pub(super) use_path2: bool,
     pub(super) has_dtype_tags: bool,
     pub(super) has_down_awq: bool,
-    /// Graph capture, replay capture or recording is active.
+    /// A hipGraph capture is active (`graphs.capture_mode`, verify or replay
+    /// capture). Informational: admitted, never a refusal.
     pub(super) capturing_graph: bool,
+    /// Layer-wide host-mapped bit. Informational to admission (host-mapped experts
+    /// are admitted); the plan carries it to both PM GEMM launchers (NT8 entries).
     pub(super) host_mapped: bool,
     pub(super) shape: ExpertIu4CallShape,
     pub(super) routed_gate_up: rdna_compute::DType,
@@ -3941,8 +3956,9 @@ pub(super) fn expert_iu4_capacity(
 }
 
 /// The pure verdict. Order: unbound; [`expert_iu4_admission`] (requested, spec,
-/// headers verified, Path 2, row floor, tags, AWQ, capture, host-mapped); the
-/// call-shape exclusions; spec/geometry agreement; activation dtype; operand
+/// headers verified, Path 2, row floor [`EXPERT_IU4_MIN_ROWS`], tags, AWQ; hipGraph
+/// capture and host-mapped experts are admitted); the call-shape exclusions (incl.
+/// Redline recording); spec/geometry agreement; activation dtype; operand
 /// capacity; reserved scratch. An exclusion is reported only after admission
 /// accepted, so a Path-2 EP call is never labelled `NotPath2`.
 pub(super) fn decide_expert_iu4(f: &ExpertIu4Facts) -> ExpertIu4Decision {
@@ -3977,6 +3993,7 @@ pub(super) fn decide_expert_iu4(f: &ExpertIu4Facts) -> ExpertIu4Decision {
         (s.canonical_slot_order, X::CanonicalSlotOrder),
         (s.staged_expert_tables, X::StagedExpertTables),
         (s.paro, X::Paro),
+        (s.redline_recording, X::RedlineRecording),
     ]
     .into_iter()
     .find(|(on, _)| *on)
@@ -4011,17 +4028,32 @@ pub(super) fn decide_expert_iu4(f: &ExpertIu4Facts) -> ExpertIu4Decision {
         hidden: d.hidden,
         intermediate: d.intermediate,
         k_top: d.k_top,
+        host_mapped: f.host_mapped,
     })
 }
 
-/// Whether graph capture, replay capture or recording is active (the IU4 route
-/// has no capture proof; scratch growth would also invalidate a capture).
-fn expert_iu4_capturing(gpu: &Gpu) -> bool {
+/// Whether a hipGraph capture is active (`graphs.capture_mode`, verify capture or
+/// replay capture). Informational: the route is capture-safe (one cached plan, a
+/// preflight that never grows scratch, fixed-pointer launches) and admitted.
+fn expert_iu4_graph_capturing(gpu: &Gpu) -> bool {
     gpu.graphs.capture_mode
         || gpu.graphs.verify.capturing.is_some()
         || gpu.graphs.replay.capturing.is_some()
-        || gpu.replay.is_recording()
-        || gpu.replay.retained_body_active()
+}
+
+/// Redline recording or a retained Redline body is active (not a hipGraph capture):
+/// prefill never runs under it, and the route has no proof there, so the call is
+/// excluded by name.
+fn expert_iu4_redline_active(gpu: &Gpu) -> bool {
+    gpu.replay.is_recording() || gpu.replay.retained_body_active()
+}
+
+/// Layer-wide host-mapped bit of the routed experts (any projection or the layer);
+/// the one bit both PM GEMM launchers receive.
+fn expert_iu4_host_mapped(p: &MoePrefillParams<'_>) -> bool {
+    let (host_gate_up, host_down) =
+        crate::families::moe::routed_host_mapped_projections(p.routed_experts);
+    host_gate_up || host_down || crate::families::moe::routed_host_mapped(p.routed_experts)
 }
 
 /// Gather the verdict's facts. Only called with a bound capability.
@@ -4030,8 +4062,6 @@ fn expert_iu4_facts(
     p: &MoePrefillParams<'_>,
     selection: &MoePrefillSelection,
 ) -> ExpertIu4Facts {
-    let (host_gate_up, host_down) =
-        crate::families::moe::routed_host_mapped_projections(p.routed_experts);
     let held = |t: &GpuTensor| t.buf.size();
     let usable = |buf: &Option<hip_bridge::DeviceBuffer>, tracked: usize| {
         buf.as_ref().map(|b| b.size().min(tracked))
@@ -4040,14 +4070,12 @@ fn expert_iu4_facts(
         capability: p.expert_iu4,
         requested: gpu.moe_sym_iu4_requested(),
         route_rows: gpu.route_rows(p.batch_size),
-        min_rows: rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
+        min_rows: EXPERT_IU4_MIN_ROWS,
         use_path2: selection.resolution.use_path2,
         has_dtype_tags: p.expert_dtype_tags.is_some() || p.dtypes.routed_has_mixed_experts,
         has_down_awq: p.expert_down_awq_ptrs.is_some() || p.down_awq_scale.is_some(),
-        capturing_graph: expert_iu4_capturing(gpu),
-        host_mapped: host_gate_up
-            || host_down
-            || crate::families::moe::routed_host_mapped(p.routed_experts),
+        capturing_graph: expert_iu4_graph_capturing(gpu),
+        host_mapped: expert_iu4_host_mapped(p),
         shape: ExpertIu4CallShape {
             specialized_route: p.route_policy.is_some() || selection.route.is_some(),
             not_softmax_gated_recipe: !matches!(p.recipe, MoeRecipe::SoftmaxGatedShared { .. }),
@@ -4062,6 +4090,7 @@ fn expert_iu4_facts(
             ),
             staged_expert_tables: p.expert_stage_ptrs.is_some(),
             paro: p.paro_gate_up.is_some() || p.paro_down.is_some(),
+            redline_recording: expert_iu4_redline_active(gpu),
         },
         routed_gate_up: p.dtypes.routed_gate_up,
         routed_down: p.dtypes.routed_down,
@@ -4098,11 +4127,20 @@ fn expert_iu4_facts(
     }
 }
 
-/// Log class of a verdict (`None` for the unbound default, which logs nothing):
-/// admitted 0, each [`ExpertIu4Reject`] `1 + index`, each exclusion 19..=31.
+/// Log classes (one rate-limit counter each): admitted 0, each
+/// [`ExpertIu4Reject`] `1 + index`, each exclusion 19..=32, admitted host-mapped 33.
+const EXPERT_IU4_LOG_CLASSES: usize = 64;
+const EXPERT_IU4_CLASS_ADMITTED_HOST_MAPPED: usize = 33;
+/// A WARNING repeats on its class's first occurrence and then every this many.
+const EXPERT_IU4_WARN_EVERY: u64 = 1000;
+
+/// Log class of a verdict (`None` for the unbound default, which logs nothing).
 fn expert_iu4_log_class(decision: &ExpertIu4Decision) -> Option<usize> {
     match decision {
         ExpertIu4Decision::Unbound => None,
+        ExpertIu4Decision::Admitted(plan) if plan.host_mapped => {
+            Some(EXPERT_IU4_CLASS_ADMITTED_HOST_MAPPED)
+        }
         ExpertIu4Decision::Admitted(_) => Some(0),
         ExpertIu4Decision::Fallback(ExpertIu4Fallback::Admission(reject)) => ExpertIu4Reject::ALL
             .iter()
@@ -4112,12 +4150,45 @@ fn expert_iu4_log_class(decision: &ExpertIu4Decision) -> Option<usize> {
     }
 }
 
+/// Severity of a verdict's log line. Every bound fallback except the intended
+/// [`ExpertIu4Reject::NotPath2`] one (the narrow host-verify Path 1 indexed GEMV, or
+/// a user-disabled grouped GEMM) means the ~3.7x slower qt53 F32 route ran, so it is
+/// a WARNING; admissions and NotPath2 are INFO.
+fn expert_iu4_log_level(decision: &ExpertIu4Decision) -> Option<ExpertIu4LogLevel> {
+    match decision {
+        ExpertIu4Decision::Unbound => None,
+        ExpertIu4Decision::Admitted(_) => Some(ExpertIu4LogLevel::Info),
+        ExpertIu4Decision::Fallback(ExpertIu4Fallback::Admission(ExpertIu4Reject::NotPath2)) => {
+            Some(ExpertIu4LogLevel::Info)
+        }
+        ExpertIu4Decision::Fallback(_) => Some(ExpertIu4LogLevel::Warning),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExpertIu4LogLevel {
+    Info,
+    Warning,
+}
+
+/// Rate limit: `occurrence` is the number of earlier verdicts of the same class.
+/// INFO logs once; WARNING logs the first and every [`EXPERT_IU4_WARN_EVERY`]th.
+fn expert_iu4_should_log(level: ExpertIu4LogLevel, occurrence: u64) -> bool {
+    match level {
+        ExpertIu4LogLevel::Info => occurrence == 0,
+        ExpertIu4LogLevel::Warning => occurrence.is_multiple_of(EXPERT_IU4_WARN_EVERY),
+    }
+}
+
 /// One stderr line describing the verdict (same `  <what> (<flag>): ...` shape as
-/// the loader's IU4 line); `None` for the unbound default.
+/// the loader's IU4 line, `WARNING:`-prefixed for [`ExpertIu4LogLevel::Warning`]);
+/// `occurrence` is the 1-based count of this class's verdicts so far. `None` for the
+/// unbound default.
 pub(super) fn expert_iu4_log_line(
     arch: &str,
     f: &ExpertIu4Facts,
     decision: &ExpertIu4Decision,
+    occurrence: u64,
 ) -> Option<String> {
     let (spec, _) = f.capability?;
     let common = format!(
@@ -4127,12 +4198,16 @@ pub(super) fn expert_iu4_log_line(
     let head = "  moe expert IU4 prefill (HIPFIRE_MOE_SYM_IU4):";
     match decision {
         ExpertIu4Decision::Unbound => None,
-        ExpertIu4Decision::Admitted(_) => Some(format!(
-            "{head} requested={} admitted {common} modules=qwen4_moe_iu4_sym_pm_gfx1201\
-             [qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4,qwen4_moe_down_iu4_sym_pm_gfx1201_nt4]\
-             +moe_slot_ops_pm_gfx1201[moe_down_combine_grouped_bf16in_pm_gfx1201]",
-            f.requested
-        )),
+        ExpertIu4Decision::Admitted(plan) => {
+            let nt = if plan.host_mapped { "nt8" } else { "nt4" };
+            Some(format!(
+                "{head} requested={} admitted host_mapped={} graph_capture={} {common} \
+                 modules=qwen4_moe_iu4_sym_pm_gfx1201\
+                 [qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_{nt},qwen4_moe_down_iu4_sym_pm_gfx1201_{nt}]\
+                 +moe_slot_ops_pm_gfx1201[moe_down_combine_grouped_bf16in_pm_gfx1201]",
+                f.requested, plan.host_mapped, f.capturing_graph
+            ))
+        }
         ExpertIu4Decision::Fallback(fallback) => {
             let detail = match fallback {
                 ExpertIu4Fallback::Exclusion(ExpertIu4Exclusion::Capacity(name)) => {
@@ -4140,23 +4215,37 @@ pub(super) fn expert_iu4_log_line(
                 }
                 _ => fallback.reason().to_string(),
             };
-            Some(format!(
-                "{head} requested={} fallback to the qt53 F32 route: {detail} {common}",
-                f.requested
-            ))
+            Some(match expert_iu4_log_level(decision) {
+                Some(ExpertIu4LogLevel::Warning) => format!(
+                    "WARNING:{head} requested={} fallback to the qt53 F32 route \
+                     (~3.7x slower than the IU4 route at prefill sizes): {detail} \
+                     occurrence={occurrence} {common}",
+                    f.requested
+                ),
+                _ => format!(
+                    "{head} requested={} fallback to the qt53 F32 route: {detail} {common}",
+                    f.requested
+                ),
+            })
         }
     }
 }
 
-/// Log the verdict once per process per decision class.
-fn log_expert_iu4_once(arch: &str, f: &ExpertIu4Facts, decision: &ExpertIu4Decision) {
-    static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let Some(class) = expert_iu4_log_class(decision) else {
+/// Log the verdict: INFO once per process per class, WARNING on each class's first
+/// occurrence and then every [`EXPERT_IU4_WARN_EVERY`]th.
+fn log_expert_iu4(arch: &str, f: &ExpertIu4Facts, decision: &ExpertIu4Decision) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEEN: [AtomicU64; EXPERT_IU4_LOG_CLASSES] =
+        [const { AtomicU64::new(0) }; EXPERT_IU4_LOG_CLASSES];
+    let (Some(class), Some(level)) = (
+        expert_iu4_log_class(decision),
+        expert_iu4_log_level(decision),
+    ) else {
         return;
     };
-    let bit = 1u64 << class;
-    if LOGGED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
-        if let Some(line) = expert_iu4_log_line(arch, f, decision) {
+    let occurrence = SEEN[class].fetch_add(1, Ordering::Relaxed);
+    if expert_iu4_should_log(level, occurrence) {
+        if let Some(line) = expert_iu4_log_line(arch, f, decision, occurrence + 1) {
             eprintln!("{line}");
         }
     }
@@ -4178,7 +4267,7 @@ impl MoeStepState<'_> {
         *self.expert_iu4.get_or_init(|| {
             let facts = expert_iu4_facts(gpu, params, selection);
             let decision = decide_expert_iu4(&facts);
-            log_expert_iu4_once(gpu.arch.as_str(), &facts, &decision);
+            log_expert_iu4(gpu.arch.as_str(), &facts, &decision);
             decision
         })
     }
@@ -4273,7 +4362,7 @@ mod tests {
 
     // ── opt-in expert IU4 prefill route: the pure verdict ────────────────────
 
-    use crate::families::moe_expert_iu4::ExpertNumerics;
+    use crate::families::moe_expert_iu4::{ExpertNumerics, EXPERT_IU4_MIN_ROWS};
     use rdna_compute::DType;
 
     const A3B_ROWS: usize = 8192;
@@ -4330,7 +4419,7 @@ mod tests {
             capability: Some((a3b_spec(), true)),
             requested: true,
             route_rows: A3B_ROWS,
-            min_rows: rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
+            min_rows: EXPERT_IU4_MIN_ROWS,
             use_path2: true,
             has_dtype_tags: false,
             has_down_awq: false,
@@ -4364,17 +4453,128 @@ mod tests {
                 hidden: 2048,
                 intermediate: 512,
                 k_top: 8,
+                host_mapped: false,
             })
         );
-        // The row floor is inclusive, on the route-row measure.
+        // The row floor is inclusive, on the route-row measure, and is a single row.
         let at_floor = ExpertIu4Facts {
-            route_rows: rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
+            route_rows: EXPERT_IU4_MIN_ROWS,
             ..admitted_facts()
         };
         assert!(matches!(
             decide_expert_iu4(&at_floor),
             ExpertIu4Decision::Admitted(_)
         ));
+    }
+
+    /// Facts of an A3B-geometry call carrying `rows` physical rows (the grouped
+    /// extent is the worst-case tile-padded one the scatter publishes).
+    fn a3b_rows_facts(rows: usize) -> ExpertIu4Facts {
+        let grouped = (rows * A3B_TOP_K + 256 * 15).next_multiple_of(EXPERT_IU4_TILE_ROWS);
+        ExpertIu4Facts {
+            route_rows: rows,
+            dims: ExpertIu4Dims {
+                rows,
+                grouped_rows: grouped,
+                ..a3b_dims()
+            },
+            held: ExpertIu4Held {
+                x_norm: rows * 2048 * 4,
+                x_batch: rows * 2048 * 4,
+                sorted_slot_index: grouped * 4,
+                inverse_perm: rows * A3B_TOP_K * 4,
+                topk_weights: rows * A3B_TOP_K * 4,
+                y_gate_up_grouped: grouped * 512 * 2,
+                y_down_grouped: grouped * 2048 * 2,
+            },
+            scratch: ExpertIu4Scratch {
+                gate_x: rdna_compute::scratch::int4_mmq_reservation_bytes(2048, rows),
+                down_i4: rdna_compute::scratch::qwen4_moe_down_i4_bytes(512, rows * A3B_TOP_K),
+            },
+            ..admitted_facts()
+        }
+    }
+
+    #[test]
+    fn expert_iu4_floor_is_one_row_for_every_prefill_size() {
+        assert_eq!(EXPERT_IU4_MIN_ROWS, 1);
+        for rows in [1usize, 2, 4, 7, 16, 17, 63, 100, 511, 512, 4096, A3B_ROWS] {
+            let facts = a3b_rows_facts(rows);
+            match decide_expert_iu4(&facts) {
+                ExpertIu4Decision::Admitted(plan) => {
+                    assert_eq!(plan.rows, rows);
+                    assert_eq!(plan.total_slots, rows * A3B_TOP_K);
+                    assert_eq!(plan.grouped_rows, facts.dims.grouped_rows);
+                    assert!(!plan.host_mapped);
+                }
+                other => panic!("{rows} rows: {other:?}"),
+            }
+        }
+        // Zero routing rows is still below the floor.
+        assert_eq!(
+            fallback(ExpertIu4Facts {
+                route_rows: 0,
+                ..admitted_facts()
+            }),
+            ExpertIu4Fallback::Admission(ExpertIu4Reject::BelowMinRows)
+        );
+    }
+
+    #[test]
+    fn expert_iu4_admits_graph_capture_and_host_mapped_experts() {
+        let device = match decide_expert_iu4(&admitted_facts()) {
+            ExpertIu4Decision::Admitted(plan) => plan,
+            other => panic!("{other:?}"),
+        };
+        assert!(!device.host_mapped);
+        // hipGraph capture (capture_mode, verify capture, replay capture) is admitted:
+        // the same cached plan, no extra requirement.
+        let capturing = ExpertIu4Facts {
+            capturing_graph: true,
+            ..admitted_facts()
+        };
+        assert_eq!(
+            decide_expert_iu4(&capturing),
+            ExpertIu4Decision::Admitted(device)
+        );
+        // Host-mapped experts are admitted and the plan carries the bit to the PM
+        // launchers (NT8 entries) with the same geometry.
+        let host = ExpertIu4Facts {
+            host_mapped: true,
+            ..admitted_facts()
+        };
+        assert_eq!(
+            decide_expert_iu4(&host),
+            ExpertIu4Decision::Admitted(ExpertIu4Plan {
+                host_mapped: true,
+                ..device
+            })
+        );
+        let both = ExpertIu4Facts {
+            capturing_graph: true,
+            host_mapped: true,
+            ..admitted_facts()
+        };
+        assert_eq!(
+            decide_expert_iu4(&both),
+            ExpertIu4Decision::Admitted(ExpertIu4Plan {
+                host_mapped: true,
+                ..device
+            })
+        );
+        // The capacity / scratch preflight is the same bytes under capture and host:
+        // a short reservation still refuses (never grows mid-capture).
+        let short = ExpertIu4Facts {
+            scratch: ExpertIu4Scratch {
+                gate_x: None,
+                ..a3b_scratch()
+            },
+            ..both
+        };
+        assert_eq!(
+            fallback(short),
+            ExpertIu4Fallback::Exclusion(ExpertIu4Exclusion::Capacity("int4_mmq_x_scratch"))
+        );
     }
 
     #[test]
@@ -4398,9 +4598,10 @@ mod tests {
         assert_eq!(decide_expert_iu4(&hostile), ExpertIu4Decision::Unbound);
         assert_eq!(expert_iu4_log_class(&ExpertIu4Decision::Unbound), None);
         assert_eq!(
-            expert_iu4_log_line("gfx1201", &hostile, &ExpertIu4Decision::Unbound),
+            expert_iu4_log_line("gfx1201", &hostile, &ExpertIu4Decision::Unbound, 1),
             None
         );
+        assert_eq!(expert_iu4_log_level(&ExpertIu4Decision::Unbound), None);
     }
 
     #[test]
@@ -4441,7 +4642,7 @@ mod tests {
             (
                 "below the row floor",
                 ExpertIu4Facts {
-                    route_rows: rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS - 1,
+                    route_rows: EXPERT_IU4_MIN_ROWS - 1,
                     ..base
                 },
                 Admission(ExpertIu4Reject::BelowMinRows),
@@ -4463,20 +4664,12 @@ mod tests {
                 Admission(ExpertIu4Reject::DownAwq),
             ),
             (
-                "graph capture / recording",
+                "Redline recording / retained body (the named pipeline exclusion)",
                 ExpertIu4Facts {
-                    capturing_graph: true,
+                    shape: shape(|s| s.redline_recording = true),
                     ..base
                 },
-                Admission(ExpertIu4Reject::GraphCapture),
-            ),
-            (
-                "host-mapped experts",
-                ExpertIu4Facts {
-                    host_mapped: true,
-                    ..base
-                },
-                Admission(ExpertIu4Reject::HostMapped),
+                Exclusion(X::RedlineRecording),
             ),
             (
                 "wrong gate/up codec in the spec",
@@ -4646,7 +4839,7 @@ mod tests {
     fn expert_iu4_admission_precedes_exclusions() {
         // A call that is both below the floor and EP reports the admission reason.
         let facts = ExpertIu4Facts {
-            route_rows: 1,
+            route_rows: EXPERT_IU4_MIN_ROWS - 1,
             shape: ExpertIu4CallShape {
                 routed_out: true,
                 ..ExpertIu4CallShape::default()
@@ -4866,16 +5059,22 @@ mod tests {
         let mut classes = std::collections::BTreeSet::new();
         let mut push = |decision: ExpertIu4Decision| {
             let class = expert_iu4_log_class(&decision).expect("loggable");
-            assert!(class < 64);
+            assert!(class < EXPERT_IU4_LOG_CLASSES);
             assert!(classes.insert(class), "{decision:?} reuses class {class}");
         };
-        push(ExpertIu4Decision::Admitted(ExpertIu4Plan {
+        let plan = ExpertIu4Plan {
             rows: 1,
             grouped_rows: 16,
             total_slots: 8,
             hidden: 2048,
             intermediate: 512,
             k_top: 8,
+            host_mapped: false,
+        };
+        push(ExpertIu4Decision::Admitted(plan));
+        push(ExpertIu4Decision::Admitted(ExpertIu4Plan {
+            host_mapped: true,
+            ..plan
         }));
         for reject in ExpertIu4Reject::ALL {
             push(ExpertIu4Decision::Fallback(ExpertIu4Fallback::Admission(
@@ -4896,16 +5095,19 @@ mod tests {
             X::SpecMismatch,
             X::ActivationDtype,
             X::Capacity("x"),
+            X::RedlineRecording,
         ] {
             push(ExpertIu4Decision::Fallback(ExpertIu4Fallback::Exclusion(x)));
         }
 
         let facts = admitted_facts();
         let admitted = decide_expert_iu4(&facts);
-        let line = expert_iu4_log_line("gfx1201", &facts, &admitted).unwrap();
+        let line = expert_iu4_log_line("gfx1201", &facts, &admitted, 1).unwrap();
         for needle in [
             "requested=true",
             "admitted",
+            "host_mapped=false",
+            "graph_capture=false",
             "arch=gfx1201",
             "MQ4G256V2",
             "MQ4G128V2",
@@ -4918,12 +5120,31 @@ mod tests {
         ] {
             assert!(line.contains(needle), "{needle}: {line}");
         }
+        assert!(!line.starts_with("WARNING"), "{line}");
+
+        // A host-mapped admission names the NT8 entries and its own log class.
+        let host = ExpertIu4Facts {
+            host_mapped: true,
+            capturing_graph: true,
+            ..facts
+        };
+        let admitted_host = decide_expert_iu4(&host);
+        let line = expert_iu4_log_line("gfx1201", &host, &admitted_host, 1).unwrap();
+        for needle in ["host_mapped=true", "graph_capture=true", "_nt8"] {
+            assert!(line.contains(needle), "{needle}: {line}");
+        }
+        assert!(!line.contains("_nt4"), "{line}");
+        assert_ne!(
+            expert_iu4_log_class(&admitted),
+            expert_iu4_log_class(&admitted_host)
+        );
 
         let refused = ExpertIu4Facts {
             requested: false,
             ..facts
         };
-        let line = expert_iu4_log_line("gfx1100", &refused, &decide_expert_iu4(&refused)).unwrap();
+        let line =
+            expert_iu4_log_line("gfx1100", &refused, &decide_expert_iu4(&refused), 1).unwrap();
         assert!(line.contains("requested=false"), "{line}");
         assert!(
             line.contains(ExpertIu4Reject::NotRequested.reason()),
@@ -4938,7 +5159,155 @@ mod tests {
             },
             ..facts
         };
-        let line = expert_iu4_log_line("gfx1201", &tight, &decide_expert_iu4(&tight)).unwrap();
+        let line = expert_iu4_log_line("gfx1201", &tight, &decide_expert_iu4(&tight), 1).unwrap();
         assert!(line.contains("int4_mmq_x_scratch"), "{line}");
+    }
+
+    #[test]
+    fn expert_iu4_log_levels_warn_on_every_slow_fallback_and_info_otherwise() {
+        use ExpertIu4Exclusion as X;
+        use ExpertIu4Fallback::{Admission, Exclusion};
+        use ExpertIu4LogLevel::{Info, Warning};
+        let level = |decision| expert_iu4_log_level(&decision);
+        assert_eq!(level(ExpertIu4Decision::Unbound), None);
+        let plan = ExpertIu4Plan {
+            rows: 1,
+            grouped_rows: 16,
+            total_slots: 8,
+            hidden: 2048,
+            intermediate: 512,
+            k_top: 8,
+            host_mapped: false,
+        };
+        assert_eq!(level(ExpertIu4Decision::Admitted(plan)), Some(Info));
+        assert_eq!(
+            level(ExpertIu4Decision::Admitted(ExpertIu4Plan {
+                host_mapped: true,
+                ..plan
+            })),
+            Some(Info)
+        );
+        // The narrow host-verify Path 1 (or a user-disabled grouped GEMM) is the one
+        // intended fallback: info, once.
+        assert_eq!(
+            level(ExpertIu4Decision::Fallback(Admission(
+                ExpertIu4Reject::NotPath2
+            ))),
+            Some(Info)
+        );
+        for reject in ExpertIu4Reject::ALL {
+            if reject != ExpertIu4Reject::NotPath2 {
+                assert_eq!(
+                    level(ExpertIu4Decision::Fallback(Admission(reject))),
+                    Some(Warning),
+                    "{reject:?}"
+                );
+            }
+        }
+        for x in [
+            X::SpecializedRoute,
+            X::Recipe,
+            X::CpuDeferred,
+            X::CpuSplit,
+            X::RoutedOut,
+            X::EpRowGather,
+            X::EpTileExchange,
+            X::CanonicalSlotOrder,
+            X::StagedExpertTables,
+            X::Paro,
+            X::SpecMismatch,
+            X::ActivationDtype,
+            X::Capacity("y_down_grouped"),
+            X::RedlineRecording,
+        ] {
+            assert_eq!(
+                level(ExpertIu4Decision::Fallback(Exclusion(x))),
+                Some(Warning),
+                "{x:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn expert_iu4_log_rate_limit_is_first_then_every_thousand() {
+        use ExpertIu4LogLevel::{Info, Warning};
+        // Info: once per class.
+        assert!(expert_iu4_should_log(Info, 0));
+        for occurrence in [1, 2, 999, 1000, 1001, 2000] {
+            assert!(!expert_iu4_should_log(Info, occurrence), "{occurrence}");
+        }
+        // Warning: the first occurrence and then every 1000th.
+        assert_eq!(EXPERT_IU4_WARN_EVERY, 1000);
+        let logged: Vec<u64> = (0..=3001)
+            .filter(|n| expert_iu4_should_log(Warning, *n))
+            .collect();
+        assert_eq!(logged, vec![0, 1000, 2000, 3000]);
+    }
+
+    #[test]
+    fn expert_iu4_warning_lines_name_the_reason_the_slowdown_and_the_count() {
+        let recording = ExpertIu4Facts {
+            shape: ExpertIu4CallShape {
+                redline_recording: true,
+                ..ExpertIu4CallShape::default()
+            },
+            ..admitted_facts()
+        };
+        let decision = decide_expert_iu4(&recording);
+        let line = expert_iu4_log_line("gfx1201", &recording, &decision, 1001).unwrap();
+        for needle in [
+            "WARNING",
+            ExpertIu4Exclusion::RedlineRecording.reason(),
+            "qt53 F32",
+            "~3.7x slower",
+            "occurrence=1001",
+            "arch=gfx1201",
+        ] {
+            assert!(line.contains(needle), "{needle}: {line}");
+        }
+
+        for (label, facts, name) in [
+            (
+                "capacity",
+                ExpertIu4Facts {
+                    scratch: ExpertIu4Scratch {
+                        down_i4: None,
+                        ..a3b_scratch()
+                    },
+                    ..admitted_facts()
+                },
+                "qwen4_moe_down_i4_scratch",
+            ),
+            (
+                "spec mismatch",
+                ExpertIu4Facts {
+                    routed_down: DType::MQ4G256V2,
+                    ..admitted_facts()
+                },
+                ExpertIu4Exclusion::SpecMismatch.reason(),
+            ),
+            (
+                "activation dtype",
+                ExpertIu4Facts {
+                    x_norm_f32: false,
+                    ..admitted_facts()
+                },
+                ExpertIu4Exclusion::ActivationDtype.reason(),
+            ),
+        ] {
+            let decision = decide_expert_iu4(&facts);
+            let line = expert_iu4_log_line("gfx1201", &facts, &decision, 1).unwrap();
+            assert!(line.starts_with("WARNING"), "{label}: {line}");
+            assert!(line.contains(name), "{label}: {line}");
+        }
+
+        // NotPath2 is the info-level fallback: no WARNING prefix.
+        let path1 = ExpertIu4Facts {
+            use_path2: false,
+            ..admitted_facts()
+        };
+        let line = expert_iu4_log_line("gfx1201", &path1, &decide_expert_iu4(&path1), 1).unwrap();
+        assert!(!line.starts_with("WARNING"), "{line}");
+        assert!(line.contains(ExpertIu4Reject::NotPath2.reason()), "{line}");
     }
 }

@@ -1659,15 +1659,18 @@ pub struct MoeFfnWeights {
     /// without allocating or rebuilding expert maps.
     pub(crate) expert_table: hipfire_dispatch::pipeline::sealed_moe::ExpertTable,
     pub(crate) expert_binding: hipfire_dispatch::pipeline::sealed_moe::ExpertBindingCache,
-    /// Opt-in symmetric IU4 grouped routed-expert prefill capability
-    /// (`HIPFIRE_MOE_SYM_IU4`). Tuple field: `.0` is the expert recipe and geometry
-    /// ([`hipfire_dispatch::families::moe_expert_iu4::ExpertIu4Spec`], built from the
-    /// config and the loaded codecs); `.1` is `true` only when the loader verified
-    /// symmetric headers on every routed gate/up and down tensor of ALL model MoE
-    /// layers (`qwen4_moe_sym_check`) and reserved the route's scratch. `None` is
-    /// the default: flag off, an ineligible layer (not uniform qt44 gate/up + qt53
-    /// down, host-mapped, paged, EP, tagged, AWQ, CPU-deferred), or any non-HFQ
-    /// loader. `None` adds no load-time work, no reservation and no runtime cost.
+    /// Symmetric IU4 grouped routed-expert prefill capability for the qt53
+    /// artifact class (default on by capability; `HIPFIRE_MOE_SYM_IU4=0` /
+    /// `HIPFIRE_IU4_PREFILL=0` kill it). Tuple field: `.0` is the expert recipe and
+    /// geometry ([`hipfire_dispatch::families::moe_expert_iu4::ExpertIu4Spec`],
+    /// built from the config and the loaded codecs); `.1` is `true` once the loader
+    /// verified symmetric headers on this layer's routed gate/up and down tensors
+    /// (`qwen4_moe_sym_check`); the model-level finalize binds it only when ALL MoE
+    /// layers agree and the route's scratch reserved, otherwise the load fails
+    /// (typed refusal). `None`: not the qt53 artifact class (nothing to do), the
+    /// explicit kill (the loader logs one WARNING and the qt53 F32 fallback runs),
+    /// or any non-HFQ loader. Host-mapped experts carry it; paged, EP, tagged, AWQ,
+    /// CPU-deferred and non-uniform layers of a qt53 model refuse the load.
     pub(crate) expert_iu4: Option<(
         hipfire_dispatch::families::moe_expert_iu4::ExpertIu4Spec,
         bool,

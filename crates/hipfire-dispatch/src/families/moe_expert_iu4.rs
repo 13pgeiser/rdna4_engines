@@ -2,8 +2,9 @@
 // Copyright (c) 2026 Björn Bösel
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Admission vocabulary of the opt-in symmetric IU4 grouped routed-expert
-//! prefill route (pure CPU, unit-tested).
+//! Admission vocabulary of the symmetric IU4 grouped routed-expert
+//! prefill route (pure CPU, unit-tested). The route is on by default by
+//! capability (`HIPFIRE_MOE_SYM_IU4=0` / `HIPFIRE_IU4_PREFILL=0` kill it).
 //!
 //! The route is a capability, never a model or card name: it is admitted from the
 //! expert recipe and geometry ([`ExpertIu4Spec`]) plus the per-call state of the
@@ -14,6 +15,14 @@
 //! explicit and loggable, never a silent success.
 
 use rdna_compute::DType;
+
+/// Row floor of this route: one row. The A3B-class route has no faster non-IU4
+/// alternative at any size (the qt53 F32 fallback is ~3.7x slower at prefill
+/// sizes) and its tile-based GEMM kernels (16-row tiles, -1 padding, runtime
+/// `K`/`n_experts`) are generic in the row count, so no floor is needed. This is
+/// deliberately not the Flash-Next F16-WMMA crossover
+/// (`rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS`), which keeps its own route.
+pub const EXPERT_IU4_MIN_ROWS: usize = 1;
 
 /// The numerical boundary of the route's expert arithmetic: exactly the plan's
 /// "Target expert numerical boundary".
@@ -88,15 +97,11 @@ pub enum ExpertIu4Reject {
     MixedTags,
     /// The down tensors carry AWQ scales.
     DownAwq,
-    /// Graph capture or recording is active (no capture proof for the route yet).
-    GraphCapture,
-    /// Routed experts are host-mapped (only resident experts are in scope).
-    HostMapped,
 }
 
 impl ExpertIu4Reject {
     /// Every reject reason, spec requirements first, in check order.
-    pub const ALL: [ExpertIu4Reject; 18] = [
+    pub const ALL: [ExpertIu4Reject; 16] = [
         Self::GateUpCodec,
         Self::DownCodec,
         Self::NoExperts,
@@ -113,8 +118,6 @@ impl ExpertIu4Reject {
         Self::BelowMinRows,
         Self::MixedTags,
         Self::DownAwq,
-        Self::GraphCapture,
-        Self::HostMapped,
     ];
 
     /// Stable one-line reason for logs.
@@ -138,8 +141,6 @@ impl ExpertIu4Reject {
             Self::BelowMinRows => "fewer rows than the route floor",
             Self::MixedTags => "routed tensors carry per-expert dtype tags",
             Self::DownAwq => "down tensors carry AWQ scales",
-            Self::GraphCapture => "graph capture or recording is active",
-            Self::HostMapped => "routed experts are host-mapped",
         }
     }
 }
@@ -217,17 +218,22 @@ pub struct ExpertIu4Inputs {
     pub has_dtype_tags: bool,
     /// The down tensors carry AWQ scales.
     pub has_down_awq: bool,
-    /// Graph capture or recording is active.
+    /// Graph capture, replay capture or recording is active. Informational: the
+    /// route is admitted under hipGraph capture (Redline recording is refused by
+    /// the pipeline, not here).
     pub capturing_graph: bool,
-    /// Routed experts are host-mapped.
+    /// Routed experts are host-mapped. Informational: the route is admitted; the
+    /// PM GEMM launchers must be called with `host_mapped = true`.
     pub host_mapped: bool,
 }
 
 /// Pure admission of the route for one prefill expert stage. Order (first failure
 /// wins): not requested; the spec's own requirements ([`ExpertIu4Spec::validate`]);
-/// headers not verified; not Path 2; `rows < min_rows`; mixed dtype tags; down AWQ;
-/// graph capture/recording (no capture proof yet); host-mapped experts (only
-/// resident experts are in scope).
+/// headers not verified; not Path 2; `rows < min_rows`; mixed dtype tags; down AWQ.
+/// Hipgraph capture and host-mapped experts are admitted ([`ExpertIu4Inputs::capturing_graph`],
+/// [`ExpertIu4Inputs::host_mapped`] are informational): the launcher sequence is
+/// capture/replay-safe and the PM GEMMs have host-mapped (NT8) entries. The
+/// caller must pass the real `host_mapped` to the launchers.
 pub fn expert_iu4_admission(
     spec: &ExpertIu4Spec,
     inputs: &ExpertIu4Inputs,
@@ -251,12 +257,6 @@ pub fn expert_iu4_admission(
     }
     if inputs.has_down_awq {
         return Err(R::DownAwq);
-    }
-    if inputs.capturing_graph {
-        return Err(R::GraphCapture);
-    }
-    if inputs.host_mapped {
-        return Err(R::HostMapped);
     }
     Ok(())
 }
@@ -294,7 +294,7 @@ mod tests {
             symmetric_headers_verified: true,
             use_path2: true,
             rows: 4096,
-            min_rows: 512,
+            min_rows: EXPERT_IU4_MIN_ROWS,
             has_dtype_tags: false,
             has_down_awq: false,
             capturing_graph: false,
@@ -376,18 +376,33 @@ mod tests {
         for s in [narrow(), wide()] {
             assert_eq!(expert_iu4_admission(&s, &admitted()), Ok(()));
         }
-        // Exactly at the floor.
+        // Exactly at the floor (one row).
         let at_floor = ExpertIu4Inputs {
-            rows: 512,
+            rows: EXPERT_IU4_MIN_ROWS,
             ..admitted()
         };
+        assert_eq!(EXPERT_IU4_MIN_ROWS, 1);
         assert_eq!(expert_iu4_admission(&narrow(), &at_floor), Ok(()));
+    }
+
+    #[test]
+    fn admission_admits_graph_capture_and_host_mapped_experts() {
+        for s in [narrow(), wide()] {
+            for (capturing_graph, host_mapped) in [(true, false), (false, true), (true, true)] {
+                let inputs = ExpertIu4Inputs {
+                    capturing_graph,
+                    host_mapped,
+                    ..admitted()
+                };
+                assert_eq!(expert_iu4_admission(&s, &inputs), Ok(()));
+            }
+        }
     }
 
     #[test]
     fn admission_rejects_each_requirement() {
         use ExpertIu4Reject as R;
-        let cases: [(ExpertIu4Inputs, R); 8] = [
+        let cases: [(ExpertIu4Inputs, R); 6] = [
             (
                 ExpertIu4Inputs {
                     requested: false,
@@ -411,7 +426,7 @@ mod tests {
             ),
             (
                 ExpertIu4Inputs {
-                    rows: 511,
+                    rows: 0,
                     ..admitted()
                 },
                 R::BelowMinRows,
@@ -429,20 +444,6 @@ mod tests {
                     ..admitted()
                 },
                 R::DownAwq,
-            ),
-            (
-                ExpertIu4Inputs {
-                    capturing_graph: true,
-                    ..admitted()
-                },
-                R::GraphCapture,
-            ),
-            (
-                ExpertIu4Inputs {
-                    host_mapped: true,
-                    ..admitted()
-                },
-                R::HostMapped,
             ),
         ];
         for (inputs, want) in cases {
@@ -465,7 +466,7 @@ mod tests {
             symmetric_headers_verified: false,
             use_path2: false,
             rows: 0,
-            min_rows: 512,
+            min_rows: EXPERT_IU4_MIN_ROWS,
             has_dtype_tags: true,
             has_down_awq: true,
             capturing_graph: true,
@@ -480,15 +481,12 @@ mod tests {
         assert_eq!(expert_iu4_admission(&s, &i), Err(R::NotPath2));
         i.use_path2 = true;
         assert_eq!(expert_iu4_admission(&s, &i), Err(R::BelowMinRows));
-        i.rows = 512;
+        i.rows = EXPERT_IU4_MIN_ROWS;
         assert_eq!(expert_iu4_admission(&s, &i), Err(R::MixedTags));
         i.has_dtype_tags = false;
         assert_eq!(expert_iu4_admission(&s, &i), Err(R::DownAwq));
         i.has_down_awq = false;
-        assert_eq!(expert_iu4_admission(&s, &i), Err(R::GraphCapture));
-        i.capturing_graph = false;
-        assert_eq!(expert_iu4_admission(&s, &i), Err(R::HostMapped));
-        i.host_mapped = false;
+        // Graph capture and host-mapped experts never refuse the route.
         assert_eq!(expert_iu4_admission(&s, &i), Ok(()));
     }
 
@@ -536,14 +534,6 @@ mod tests {
             },
             ExpertIu4Inputs {
                 has_down_awq: true,
-                ..admitted()
-            },
-            ExpertIu4Inputs {
-                capturing_graph: true,
-                ..admitted()
-            },
-            ExpertIu4Inputs {
-                host_mapped: true,
                 ..admitted()
             },
         ] {
