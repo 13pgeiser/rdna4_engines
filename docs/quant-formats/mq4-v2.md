@@ -209,6 +209,36 @@ accepted for artifact transport and host-side validation, and any generic
 upload or dispatch attempt MUST fail explicitly rather than reinterpret it as
 qt=44, qt=45, or legacy MQ4G128.
 
+### Symmetric qt53 / `--moe-expert-down mq4g128v2-symmetric`
+
+The wire format above is unchanged; only the encoder differs.  With
+`--moe-expert-down mq4g128v2-symmetric` the quantizer encodes every **routed-expert
+`down_proj`** as symmetric qt=53 and leaves every other tensor on the recipe's codec
+(the intended A3B recipe: routed `gate_up` = symmetric qt=44, routed `down` = symmetric
+qt=53).
+
+- Role selection is by tensor role and shape, not model name: stacked 3-D
+  `*experts.down_proj` (each `[H, I]` expert slice, written as
+  `…experts.{N}.down_proj.weight`) and un-stacked 2-D `*.mlp.experts.{N}.down_proj.weight`
+  (including `mtp.layers.*`).  `shared_expert`, dense `mlp.down_proj`, `gate_up` and
+  all other tensors are byte-identical to the recipe without the flag.
+- Each rotated 128-group goes through the same per-128 symmetric search as the
+  symmetric qt=44 encoder (`mq_symmetric::quantize_symmetric_half`, max code 15):
+  `zero = f16(-8 * scale)` bit-exactly, so code 8 reconstructs 0.  An all-zero group, or
+  one whose every scale candidate underflows fp16, is `scale = 0`, `zero = 0x8000`
+  (`-0.0`) and every code 8 (payload bytes `0x88`).  Unlike the asymmetric encoder, whose
+  degenerate groups write `q = 0`.  A group whose scale would overflow fp16 is an
+  encoder error, not a zero group.
+- Row-local `ceil(K / 128)` tiling with zero-padded tails, FWHT-128 signs
+  `gen_fwht_signs(43, 128)` / `gen_fwht_signs(1043, 128)`, and the 68 B group are those of
+  the asymmetric qt=53 encoder; any `K > 0` is encoded (no fallback to qt=44).
+- Output carries quant type 53, group size 128, and the metadata key
+  `moe.expert_down = "mq4g128v2-symmetric"` next to `mq4v2.symmetric`.
+- Requires `--format mq4 --uniform --mq4v2-symmetric`; refused (exit 2) with REAP
+  overlay/bake, AWQ, `--imatrix`, `--hessian-dir`, graded/tier-map/Lloyd/MQ5/MQ6 expert
+  levers (`HIPFIRE_MOE_GRADED`, `HIPFIRE_MOE_TIER_MAP`, `HIPFIRE_ROUTED_GL`,
+  `HIPFIRE_MOE_{DOWN,EXPERTS}_MQ{5,6}=1`), and every non-`safetensors` quantize route.
+
 ---
 
 ## 3 · Encoder

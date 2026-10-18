@@ -5,7 +5,15 @@
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+/// Routed-expert `down_proj` codec override (`--moe-expert-down`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum MoeExpertDown {
+    /// Symmetric MQ4G128V2 (qt53): row-local per-128 groups, 68 B each.
+    #[value(name = "mq4g128v2-symmetric")]
+    Mq4g128v2Symmetric,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -247,6 +255,15 @@ pub(crate) struct QuantizeArgs {
     #[arg(long)]
     pub mq2v2_symmetric: bool,
 
+    /// Routed-expert down_proj codec override. `mq4g128v2-symmetric` encodes
+    /// every routed-expert down_proj (stacked `experts.down_proj` slices and
+    /// un-stacked `mlp.experts.N.down_proj`) as symmetric MQ4G128V2 (qt53,
+    /// 68 B per 128 weights) while gate_up and everything else keep the
+    /// recipe's codec. Requires uniform symmetric MQ4: `--format mq4
+    /// --uniform --mq4v2-symmetric`.
+    #[arg(long, value_enum, value_name = "VALUE")]
+    pub moe_expert_down: Option<MoeExpertDown>,
+
     /// Replace selected MQ4V2-XT tensors in an existing HFQ with trained final
     /// codes. PATH is one frozen-record `.safetensors` file or a directory of
     /// them; each record carries metadata `name,M,K,qt,source_sha` and tensors
@@ -464,6 +481,7 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     ("awq_a4_source_sha", &[Main]),
     ("mq3v2_symmetric", &[Main]),
     ("mq2v2_symmetric", &[Main]),
+    ("moe_expert_down", &[Main]),
     ("mq4v2_final_codes", &[FinalCodes]),
     ("mq3v2_final_codes", &[FinalCodes]),
     ("mq2v2_final_codes", &[FinalCodes]),
@@ -623,6 +641,70 @@ mod route_tests {
             let err = reject_unreachable(&matches(argv), *route).unwrap_err();
             assert!(
                 err.starts_with(&format!("{flag} has no effect")),
+                "{route:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn moe_expert_down_parses_only_its_value_and_is_main_only() {
+        let parse = |value: &str| {
+            QuantizeArgs::command().try_get_matches_from([
+                "hipfire-quantize",
+                "--input",
+                "i",
+                "--output",
+                "o",
+                "--moe-expert-down",
+                value,
+            ])
+        };
+        let parsed = parse("mq4g128v2-symmetric").unwrap();
+        assert_eq!(
+            parsed.get_one::<MoeExpertDown>("moe_expert_down"),
+            Some(&MoeExpertDown::Mq4g128v2Symmetric)
+        );
+        for bad in [
+            "mq4g128v2",
+            "mq4g128v2-asymmetric",
+            "mq4v2-symmetric",
+            "",
+            "MQ4G128V2-SYMMETRIC",
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?} must not parse");
+        }
+        assert!(QuantizeArgs::command()
+            .try_get_matches_from([
+                "hipfire-quantize",
+                "--input",
+                "i",
+                "--output",
+                "o",
+                "--moe-expert-down"
+            ])
+            .is_err());
+        let argv = [
+            "--input",
+            "i",
+            "--output",
+            "o",
+            "--moe-expert-down",
+            "mq4g128v2-symmetric",
+        ];
+        reject_unreachable(&matches(&argv), Main).unwrap();
+        // Flux reads `--flux-pipe` instead of `--input` (and refuses `--input`
+        // first), so give each route its own minimal source argument.
+        for route in EVERY.iter().copied().filter(|route| *route != Main) {
+            let source: &[&str] = if route == Flux {
+                &["--flux-pipe", "p"]
+            } else {
+                &["--input", "i"]
+            };
+            let mut probe = source.to_vec();
+            probe.extend(["--output", "o", "--moe-expert-down", "mq4g128v2-symmetric"]);
+            let err = reject_unreachable(&matches(&probe), route).unwrap_err();
+            assert!(
+                err.starts_with("--moe-expert-down has no effect"),
                 "{route:?}: {err}"
             );
         }

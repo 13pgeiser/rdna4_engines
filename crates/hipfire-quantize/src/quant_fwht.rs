@@ -431,6 +431,37 @@ pub(crate) fn quantize_mq4g128v2(
     signs1: &[f32],
     signs2: &[f32],
 ) -> Result<Vec<u8>, String> {
+    quantize_mq4g128v2_impl(w, m, k, signs1, signs2, false)
+}
+
+/// MQ4G128V2 with a symmetric per-128 grid in the unchanged 68-byte wire
+/// group.
+///
+/// Same row-local zero-padded tiling and `cpu_fwht_128` rotation as
+/// [`quantize_mq4g128v2`]; each rotated 128-group goes through the shared
+/// `mq_symmetric::quantize_symmetric_half` (max code 15), so the stored zero
+/// is exactly `f16(-8 * scale)` and code 8 reconstructs zero. An all-zero or
+/// all-candidates-underflow group is `(scale 0, zero 0x8000)` with every code
+/// 8 (byte `0x88`), exactly as that helper returns it. A group whose scale
+/// overflows fp16 is an error, never a silent zero group.
+pub(crate) fn quantize_mq4g128v2_symmetric(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Result<Vec<u8>, String> {
+    quantize_mq4g128v2_impl(w, m, k, signs1, signs2, true)
+}
+
+fn quantize_mq4g128v2_impl(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+    symmetric: bool,
+) -> Result<Vec<u8>, String> {
     const GROUP_SIZE: usize = 128;
     if m == 0 || k == 0 {
         return Err(format!(
@@ -500,6 +531,53 @@ pub(crate) fn quantize_mq4g128v2(
                     "MQ4G128V2 FWHT produced non-finite values at row {row}, group {group_index}"
                 ));
             }
+            let out_group = row
+                .checked_mul(groups_per_row)
+                .and_then(|base| base.checked_add(group_index))
+                .and_then(|index| index.checked_mul(MQ4G128V2_GROUP_BYTES))
+                .ok_or_else(|| "MQ4G128V2 output offset overflows".to_string())?;
+            if symmetric {
+                let mut codes = [0u8; GROUP_SIZE];
+                let (scale_bits, zero_bits) =
+                    hipfire_quantize::mq_symmetric::quantize_symmetric_half(&group, 15, &mut codes);
+                let scale = f16_to_f32(scale_bits);
+                let zero = f16_to_f32(zero_bits);
+                if !scale.is_finite() || !zero.is_finite() {
+                    return Err(format!(
+                        "MQ4G128V2 symmetric header is non-finite at row {row}, group {group_index}"
+                    ));
+                }
+                if scale_bits == 0 {
+                    // Legitimate only for an all-zero group or one whose every
+                    // scale candidate underflows fp16. The largest candidate
+                    // is `amax / 7.5`; if it is representable, the helper
+                    // skipped every candidate because of overflow.
+                    let amax = group
+                        .iter()
+                        .fold(0.0f32, |acc, &value| acc.max(value.abs()));
+                    if amax != 0.0 && f32_to_f16(amax / 7.5) != 0 {
+                        return Err(format!(
+                            "MQ4G128V2 symmetric scale overflows fp16 at row {row}, group {group_index}"
+                        ));
+                    }
+                    if zero_bits != 0x8000 {
+                        return Err(format!(
+                            "MQ4G128V2 symmetric zero-scale header is not -0.0 at row {row}, group {group_index}"
+                        ));
+                    }
+                } else if zero_bits != f32_to_f16(-8.0 * scale) {
+                    return Err(format!(
+                        "MQ4G128V2 symmetric zero is not -8*scale at row {row}, group {group_index}"
+                    ));
+                }
+                output[out_group..out_group + 2].copy_from_slice(&scale_bits.to_le_bytes());
+                output[out_group + 2..out_group + 4].copy_from_slice(&zero_bits.to_le_bytes());
+                for index in 0..GROUP_SIZE / 2 {
+                    output[out_group + 4 + index] =
+                        (codes[2 * index] & 0x0f) | ((codes[2 * index + 1] & 0x0f) << 4);
+                }
+                continue;
+            }
             let lo = group.iter().copied().fold(f32::INFINITY, f32::min);
             let hi = group.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let range = hi - lo;
@@ -536,11 +614,6 @@ pub(crate) fn quantize_mq4g128v2(
                 scale_bits = 0;
                 scale = 0.0;
             }
-            let out_group = row
-                .checked_mul(groups_per_row)
-                .and_then(|base| base.checked_add(group_index))
-                .and_then(|index| index.checked_mul(MQ4G128V2_GROUP_BYTES))
-                .ok_or_else(|| "MQ4G128V2 output offset overflows".to_string())?;
             output[out_group..out_group + 2].copy_from_slice(&scale_bits.to_le_bytes());
             output[out_group + 2..out_group + 4].copy_from_slice(&zero_bits.to_le_bytes());
             if !degenerate {
@@ -1066,6 +1139,574 @@ mod tests {
         for group in blob.chunks_exact(MQ4G128V2_GROUP_BYTES) {
             assert!(f16_to_f32(u16::from_le_bytes([group[0], group[1]])).is_finite());
             assert!(f16_to_f32(u16::from_le_bytes([group[2], group[3]])).is_finite());
+        }
+    }
+
+    // ---- symmetric MQ4G128V2 (qt53) -------------------------------------
+
+    /// Verbatim copy of `quantize_mq4g128v2` before the symmetric variant
+    /// was added. It is the byte-identity oracle for the asymmetric path.
+    fn frozen_quantize_mq4g128v2(
+        w: &[f32],
+        m: usize,
+        k: usize,
+        signs1: &[f32],
+        signs2: &[f32],
+    ) -> Result<Vec<u8>, String> {
+        const GROUP_SIZE: usize = 128;
+        if m == 0 || k == 0 {
+            return Err(format!(
+                "MQ4G128V2 requires nonzero dimensions, got M={m} K={k}"
+            ));
+        }
+        let expected_values = m
+            .checked_mul(k)
+            .ok_or_else(|| format!("MQ4G128V2 dimensions overflow: M={m} K={k}"))?;
+        if w.len() != expected_values {
+            return Err(format!(
+                "MQ4G128V2 source length {} != M*K {}*{}={expected_values}",
+                w.len(),
+                m,
+                k
+            ));
+        }
+        if signs1.len() != GROUP_SIZE || signs2.len() != GROUP_SIZE {
+            return Err(format!(
+                "MQ4G128V2 requires 128 signs per table, got {} and {}",
+                signs1.len(),
+                signs2.len()
+            ));
+        }
+        if signs1.iter().any(|value| !value.is_finite())
+            || signs2.iter().any(|value| !value.is_finite())
+        {
+            return Err("MQ4G128V2 signs contain non-finite values".to_string());
+        }
+        if w.iter().any(|value| !value.is_finite()) {
+            return Err("MQ4G128V2 source contains non-finite values".to_string());
+        }
+        let groups_per_row = k
+            .checked_add(GROUP_SIZE - 1)
+            .ok_or_else(|| format!("MQ4G128V2 K overflows group rounding: K={k}"))?
+            / GROUP_SIZE;
+        let total_groups = m
+            .checked_mul(groups_per_row)
+            .ok_or_else(|| "MQ4G128V2 group count overflows usize".to_string())?;
+        let output_len = total_groups
+            .checked_mul(MQ4G128V2_GROUP_BYTES)
+            .ok_or_else(|| "MQ4G128V2 output length overflows usize".to_string())?;
+        let mut output = vec![0u8; output_len];
+
+        for row in 0..m {
+            let row_start = row
+                .checked_mul(k)
+                .ok_or_else(|| format!("MQ4G128V2 row offset overflows at row {row}"))?;
+            for group_index in 0..groups_per_row {
+                let group_start = group_index
+                    .checked_mul(GROUP_SIZE)
+                    .ok_or_else(|| "MQ4G128V2 group offset overflows".to_string())?;
+                let actual = k.saturating_sub(group_start).min(GROUP_SIZE);
+                let mut group = [0.0f32; GROUP_SIZE];
+                if actual != 0 {
+                    let source_start = row_start
+                        .checked_add(group_start)
+                        .ok_or_else(|| "MQ4G128V2 source offset overflows".to_string())?;
+                    let source_end = source_start
+                        .checked_add(actual)
+                        .ok_or_else(|| "MQ4G128V2 source end overflows".to_string())?;
+                    group[..actual].copy_from_slice(&w[source_start..source_end]);
+                }
+                cpu_fwht_128(&mut group, signs1, signs2);
+                if group.iter().any(|value| !value.is_finite()) {
+                    return Err(format!(
+                        "MQ4G128V2 FWHT produced non-finite values at row {row}, group {group_index}"
+                    ));
+                }
+                let lo = group.iter().copied().fold(f32::INFINITY, f32::min);
+                let hi = group.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let range = hi - lo;
+                if !range.is_finite() {
+                    return Err(format!(
+                        "MQ4G128V2 range is non-finite at row {row}, group {group_index}"
+                    ));
+                }
+                let step = if hi > lo { range / 15.0 } else { 0.0 };
+                if !step.is_finite() {
+                    return Err(format!(
+                        "MQ4G128V2 scale is non-finite at row {row}, group {group_index}"
+                    ));
+                }
+                let mut scale_bits = f32_to_f16(step);
+                let zero_bits = f32_to_f16(lo);
+                let mut scale = f16_to_f32(scale_bits);
+                let zero = f16_to_f32(zero_bits);
+                if !zero.is_finite() {
+                    return Err(format!(
+                        "MQ4G128V2 zero is non-finite at row {row}, group {group_index}"
+                    ));
+                }
+                let degenerate = hi == lo || step == 0.0 || scale == 0.0;
+                if !degenerate && !scale.is_finite() {
+                    return Err(format!(
+                        "MQ4G128V2 fp16 scale is non-finite at row {row}, group {group_index}"
+                    ));
+                }
+                if degenerate {
+                    scale_bits = 0;
+                    scale = 0.0;
+                }
+                let out_group = row
+                    .checked_mul(groups_per_row)
+                    .and_then(|base| base.checked_add(group_index))
+                    .and_then(|index| index.checked_mul(MQ4G128V2_GROUP_BYTES))
+                    .ok_or_else(|| "MQ4G128V2 output offset overflows".to_string())?;
+                output[out_group..out_group + 2].copy_from_slice(&scale_bits.to_le_bytes());
+                output[out_group + 2..out_group + 4].copy_from_slice(&zero_bits.to_le_bytes());
+                if !degenerate {
+                    let inv_scale = 1.0 / scale;
+                    if !inv_scale.is_finite() {
+                        return Err(format!(
+                            "MQ4G128V2 inverse scale is non-finite at row {row}, group {group_index}"
+                        ));
+                    }
+                    for index in 0..GROUP_SIZE {
+                        let normalized = (group[index] - zero) * inv_scale;
+                        if !normalized.is_finite() {
+                            return Err(format!(
+                                "MQ4G128V2 quantization value is non-finite at row {row}, group {group_index}"
+                            ));
+                        }
+                        let quantized = (normalized + 0.5).floor().clamp(0.0, 15.0) as u8;
+                        let byte = out_group + 4 + index / 2;
+                        if index & 1 == 0 {
+                            output[byte] = quantized & 0x0f;
+                        } else {
+                            output[byte] |= (quantized & 0x0f) << 4;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(output)
+    }
+
+    fn sym_signs() -> (Vec<f32>, Vec<f32>) {
+        (gen_fwht_signs(43, 128), gen_fwht_signs(1043, 128))
+    }
+
+    /// Deterministic xorshift32 values uniform in `[-amplitude, amplitude)`.
+    fn sym_values(seed: u32, n: usize, amplitude: f32) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(2_654_435_761) | 1;
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (((state >> 8) as f32) / 8_388_608.0 - 1.0) * amplitude
+            })
+            .collect()
+    }
+
+    /// Exact inverse of `cpu_fwht_128`: `D1 * c * H * D2` (the forward
+    /// transform is `D2 * c * H * D1` with `H * H = 128 I`, `c = 1/sqrt(128)`).
+    fn sym_ifwht_128(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
+        assert_eq!(x.len(), 128);
+        for i in 0..128 {
+            x[i] *= signs2[i];
+        }
+        let mut stride = 1;
+        while stride < 128 {
+            let mut i = 0;
+            while i < 128 {
+                for j in 0..stride {
+                    let a = x[i + j];
+                    let b = x[i + j + stride];
+                    x[i + j] = a + b;
+                    x[i + j + stride] = a - b;
+                }
+                i += stride * 2;
+            }
+            stride <<= 1;
+        }
+        let scale = 1.0f32 / (128.0f32).sqrt();
+        for i in 0..128 {
+            x[i] *= scale * signs1[i];
+        }
+    }
+
+    fn sym_header(group: &[u8]) -> (u16, u16) {
+        (
+            u16::from_le_bytes([group[0], group[1]]),
+            u16::from_le_bytes([group[2], group[3]]),
+        )
+    }
+
+    fn sym_codes(group: &[u8]) -> Vec<u8> {
+        let mut codes = Vec::with_capacity(128);
+        for &byte in &group[4..MQ4G128V2_GROUP_BYTES] {
+            codes.push(byte & 0x0f);
+            codes.push(byte >> 4);
+        }
+        codes
+    }
+
+    #[test]
+    fn mq4g128v2_symmetric_test_inverse_inverts_forward() {
+        let (s1, s2) = sym_signs();
+        let source = sym_values(7, 128, 1.0);
+        let mut x = source.clone();
+        cpu_fwht_128(&mut x, &s1, &s2);
+        sym_ifwht_128(&mut x, &s1, &s2);
+        for (a, b) in x.iter().zip(&source) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn mq4g128v2_symmetric_shapes_row_local_and_deterministic() {
+        let (s1, s2) = sym_signs();
+        for m in [1usize, 2] {
+            for k in [127usize, 128, 129, 512] {
+                let w = sym_values((m * 1000 + k) as u32, m * k, 0.7);
+                let blob = quantize_mq4g128v2_symmetric(&w, m, k, &s1, &s2).expect("encode");
+                let groups_per_row = k.div_ceil(128);
+                let row_bytes = groups_per_row * MQ4G128V2_GROUP_BYTES;
+                assert_eq!(
+                    blob.len(),
+                    m * groups_per_row * MQ4G128V2_GROUP_BYTES,
+                    "m={m} k={k}"
+                );
+                // Determinism.
+                assert_eq!(
+                    blob,
+                    quantize_mq4g128v2_symmetric(&w, m, k, &s1, &s2).unwrap(),
+                    "m={m} k={k}"
+                );
+                // Encoding each row alone is identical to its slice.
+                for row in 0..m {
+                    let one =
+                        quantize_mq4g128v2_symmetric(&w[row * k..(row + 1) * k], 1, k, &s1, &s2)
+                            .expect("single-row encode");
+                    assert_eq!(
+                        &blob[row * row_bytes..(row + 1) * row_bytes],
+                        one.as_slice(),
+                        "row {row} m={m} k={k}"
+                    );
+                }
+                if m == 2 {
+                    let mut mutated = w.clone();
+                    for value in &mut mutated[k..] {
+                        *value = -*value * 1.5 + 0.25;
+                    }
+                    let other = quantize_mq4g128v2_symmetric(&mutated, m, k, &s1, &s2).unwrap();
+                    assert_eq!(
+                        &other[..row_bytes],
+                        &blob[..row_bytes],
+                        "row 0 moved, k={k}"
+                    );
+                    assert_ne!(
+                        &other[row_bytes..],
+                        &blob[row_bytes..],
+                        "row 1 unchanged, k={k}"
+                    );
+                    let mut mutated = w.clone();
+                    for value in &mut mutated[..k] {
+                        *value = -*value * 1.5 + 0.25;
+                    }
+                    let other = quantize_mq4g128v2_symmetric(&mutated, m, k, &s1, &s2).unwrap();
+                    assert_eq!(
+                        &other[row_bytes..],
+                        &blob[row_bytes..],
+                        "row 1 moved, k={k}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mq4g128v2_symmetric_headers_are_symmetric_and_finite() {
+        let (s1, s2) = sym_signs();
+        let amplitudes = [1.0e3f32, 4.0, 1.0, 1.0e-2, 1.0e-4, 1.0e-6, 6.0e-7, 1.0e-9];
+        let mut live = 0usize;
+        let mut zero_scale = 0usize;
+        for (amplitude_index, &amplitude) in amplitudes.iter().enumerate() {
+            for seed in 1u32..=12 {
+                let w = sym_values(seed * 31 + amplitude_index as u32, 2 * 129, amplitude);
+                let blob = quantize_mq4g128v2_symmetric(&w, 2, 129, &s1, &s2).expect("encode");
+                for group in blob.chunks_exact(MQ4G128V2_GROUP_BYTES) {
+                    let (scale_bits, zero_bits) = sym_header(group);
+                    let scale = f16_to_f32(scale_bits);
+                    assert!(scale.is_finite() && scale >= 0.0 && scale_bits >> 15 == 0);
+                    assert!(f16_to_f32(zero_bits).is_finite());
+                    assert_eq!(
+                        zero_bits,
+                        f32_to_f16(-8.0 * f16_to_f32(scale_bits)),
+                        "amplitude={amplitude} seed={seed}"
+                    );
+                    if scale_bits == 0 {
+                        zero_scale += 1;
+                        assert_eq!(zero_bits, 0x8000);
+                        assert!(group[4..].iter().all(|&byte| byte == 0x88));
+                    } else {
+                        live += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            live > 0 && zero_scale > 0,
+            "live={live} zero_scale={zero_scale}"
+        );
+    }
+
+    #[test]
+    fn mq4g128v2_symmetric_degenerate_and_extreme_groups() {
+        let (s1, s2) = sym_signs();
+        // All-zero group (including -0.0).
+        let mut zeros = vec![0.0f32; 128];
+        zeros[9] = -0.0;
+        let blob = quantize_mq4g128v2_symmetric(&zeros, 1, 128, &s1, &s2).unwrap();
+        assert_eq!(sym_header(&blob), (0, 0x8000));
+        assert!(blob[4..].iter().all(|&byte| byte == 0x88));
+        // Subnormal / tiny group: every scale candidate underflows fp16.
+        let mut tiny = vec![1.0e-9f32; 128];
+        tiny[3] = -1.0e-9;
+        tiny[100] = 0.5e-9;
+        let blob = quantize_mq4g128v2_symmetric(&tiny, 1, 128, &s1, &s2).unwrap();
+        assert_eq!(sym_header(&blob), (0, 0x8000));
+        assert!(blob[4..].iter().all(|&byte| byte == 0x88));
+        // The asymmetric encoder keeps its own q=0 convention for the same input.
+        let asym = quantize_mq4g128v2(&tiny, 1, 128, &s1, &s2).unwrap();
+        assert_ne!(asym[4..], blob[4..]);
+        // Constant group: whatever the rotation makes of it, the header is
+        // finite and exactly symmetric.
+        let constant = vec![0.37f32; 128];
+        let blob = quantize_mq4g128v2_symmetric(&constant, 1, 128, &s1, &s2).unwrap();
+        let (scale_bits, zero_bits) = sym_header(&blob);
+        assert!(f16_to_f32(scale_bits).is_finite());
+        assert_eq!(zero_bits, f32_to_f16(-8.0 * f16_to_f32(scale_bits)));
+        // Large-but-finite values: finite headers or a clean Err, never a
+        // panic or an inf header.
+        for fill in [100.0f32, 6.0e4] {
+            let large = vec![fill; 128];
+            match quantize_mq4g128v2_symmetric(&large, 1, 128, &s1, &s2) {
+                Ok(blob) => {
+                    let (scale_bits, zero_bits) = sym_header(&blob);
+                    assert!(f16_to_f32(scale_bits).is_finite());
+                    assert!(f16_to_f32(zero_bits).is_finite());
+                    assert_eq!(zero_bits, f32_to_f16(-8.0 * f16_to_f32(scale_bits)));
+                }
+                Err(error) => assert!(error.contains("overflow"), "{error}"),
+            }
+        }
+        assert!(quantize_mq4g128v2_symmetric(&vec![100.0f32; 128], 1, 128, &s1, &s2).is_ok());
+        // One huge spike rotates to a flat ~8.8e5 magnitude: every scale
+        // candidate's zero (-8*scale) overflows fp16, so the helper returns a
+        // zero-scale header; the encoder must refuse it, not store it.
+        let mut spike = vec![0.0f32; 128];
+        spike[5] = 1.0e7;
+        let error = quantize_mq4g128v2_symmetric(&spike, 1, 128, &s1, &s2).unwrap_err();
+        assert!(error.contains("overflow"), "{error}");
+    }
+
+    #[test]
+    fn mq4g128v2_symmetric_rejects_invalid_inputs_like_asymmetric() {
+        let (s1, s2) = sym_signs();
+        let good = vec![0.25f32; 128];
+        let mut nan = good.clone();
+        nan[17] = f32::NAN;
+        let mut pos_inf = good.clone();
+        pos_inf[0] = f32::INFINITY;
+        let mut neg_inf = good.clone();
+        neg_inf[127] = f32::NEG_INFINITY;
+        let mut bad_sign = s1.clone();
+        bad_sign[4] = f32::NAN;
+        let long_signs = gen_fwht_signs(43, 129);
+        let cases: Vec<(Vec<f32>, usize, usize, Vec<f32>, Vec<f32>)> = vec![
+            (vec![], 0, 128, s1.clone(), s2.clone()),
+            (vec![], 1, 0, s1.clone(), s2.clone()),
+            (good[..127].to_vec(), 1, 128, s1.clone(), s2.clone()),
+            (good.clone(), 1, 128, s1[..127].to_vec(), s2.clone()),
+            (good.clone(), 1, 128, s1.clone(), long_signs),
+            (good.clone(), 1, 128, bad_sign, s2.clone()),
+            (nan, 1, 128, s1.clone(), s2.clone()),
+            (pos_inf, 1, 128, s1.clone(), s2.clone()),
+            (neg_inf, 1, 128, s1.clone(), s2.clone()),
+        ];
+        for (index, (w, m, k, a, b)) in cases.iter().enumerate() {
+            let symmetric = quantize_mq4g128v2_symmetric(w, *m, *k, a, b);
+            assert!(symmetric.is_err(), "case {index} accepted");
+            assert_eq!(
+                symmetric,
+                quantize_mq4g128v2(w, *m, *k, a, b),
+                "case {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn mq4g128v2_symmetric_low_even_nibble_layout() {
+        let (s1, s2) = sym_signs();
+        // Craft rotated-domain targets whose codes are scale-independent:
+        // +4.0 clamps to code 15 for every scale candidate, 0.0 is code 8.
+        for (even, odd, expected) in [(4.0f32, 0.0f32, 0x8fu8), (0.0, 4.0, 0xf8)] {
+            let mut source = [0.0f32; 128];
+            for (index, value) in source.iter_mut().enumerate() {
+                *value = if index % 2 == 0 { even } else { odd };
+            }
+            sym_ifwht_128(&mut source, &s1, &s2);
+            let blob = quantize_mq4g128v2_symmetric(&source, 1, 128, &s1, &s2).unwrap();
+            assert_eq!(blob.len(), MQ4G128V2_GROUP_BYTES);
+            assert!(
+                blob[4..].iter().all(|&byte| byte == expected),
+                "even={even} odd={odd} got {:02x?}",
+                &blob[4..12]
+            );
+        }
+        // Against the shared helper on the rotated group: byte i = q[2i] | q[2i+1] << 4.
+        let source = sym_values(99, 128, 0.5);
+        let mut rotated = [0.0f32; 128];
+        rotated.copy_from_slice(&source);
+        cpu_fwht_128(&mut rotated, &s1, &s2);
+        let mut codes = [0u8; 128];
+        let (scale_bits, zero_bits) =
+            hipfire_quantize::mq_symmetric::quantize_symmetric_half(&rotated, 15, &mut codes);
+        let blob = quantize_mq4g128v2_symmetric(&source, 1, 128, &s1, &s2).unwrap();
+        assert_eq!(sym_header(&blob), (scale_bits, zero_bits));
+        for index in 0..64 {
+            assert_eq!(
+                blob[4 + index],
+                codes[2 * index] | (codes[2 * index + 1] << 4)
+            );
+        }
+        assert_eq!(sym_codes(&blob), codes.to_vec());
+    }
+
+    #[test]
+    fn mq4g128v2_symmetric_decodes_within_half_a_step() {
+        let (s1, s2) = sym_signs();
+        let mut checked = 0usize;
+        for (m, k, amplitude) in [
+            (2usize, 129usize, 0.8f32),
+            (1, 512, 0.05),
+            (2, 128, 3.0),
+            (1, 127, 1.0e-3),
+        ] {
+            let w = sym_values((k * 7 + m) as u32, m * k, amplitude);
+            let blob = quantize_mq4g128v2_symmetric(&w, m, k, &s1, &s2).unwrap();
+            let groups_per_row = k.div_ceil(128);
+            for row in 0..m {
+                for group_index in 0..groups_per_row {
+                    let group = &blob[(row * groups_per_row + group_index) * MQ4G128V2_GROUP_BYTES
+                        ..(row * groups_per_row + group_index + 1) * MQ4G128V2_GROUP_BYTES];
+                    let (scale_bits, zero_bits) = sym_header(group);
+                    let scale = f16_to_f32(scale_bits);
+                    let zero = f16_to_f32(zero_bits);
+                    assert!(scale > 0.0);
+                    let mut source = [0.0f32; 128];
+                    let start = group_index * 128;
+                    let actual = k.saturating_sub(start).min(128);
+                    source[..actual].copy_from_slice(&w[row * k + start..row * k + start + actual]);
+                    let mut rotated = source;
+                    cpu_fwht_128(&mut rotated, &s1, &s2);
+                    let codes = sym_codes(group);
+                    let mut decoded = [0.0f32; 128];
+                    let mut clamped = false;
+                    let mut rotated_sq_err = 0.0f64;
+                    for index in 0..128 {
+                        decoded[index] = codes[index] as f32 * scale + zero;
+                        let lo = zero;
+                        let hi = 15.0 * scale + zero;
+                        let error = (decoded[index] - rotated[index]).abs();
+                        rotated_sq_err += f64::from(error) * f64::from(error);
+                        if rotated[index] >= lo && rotated[index] <= hi {
+                            assert!(
+                                error <= scale * 0.5 * 1.001 + 1e-6,
+                                "row {row} group {group_index} i={index}: err {error} scale {scale}"
+                            );
+                            checked += 1;
+                        } else {
+                            clamped = true;
+                        }
+                    }
+                    // The rotation is orthonormal, so the original-domain L2
+                    // error equals the rotated-domain one.
+                    let mut reconstructed = decoded;
+                    sym_ifwht_128(&mut reconstructed, &s1, &s2);
+                    let original_sq_err: f64 = reconstructed
+                        .iter()
+                        .zip(&source)
+                        .map(|(a, b)| f64::from(a - b) * f64::from(a - b))
+                        .sum();
+                    assert!(
+                        (original_sq_err - rotated_sq_err).abs()
+                            <= 1e-3 * rotated_sq_err.max(1e-12) + 1e-12,
+                        "{original_sq_err} vs {rotated_sq_err}"
+                    );
+                    if !clamped {
+                        let bound = (128.0f64).sqrt() * f64::from(scale) * 0.5 * 1.001 + 1e-5;
+                        for index in 0..actual {
+                            assert!(
+                                f64::from((reconstructed[index] - source[index]).abs()) <= bound
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 500, "checked {checked}");
+    }
+
+    #[test]
+    fn mq4g128v2_asymmetric_is_byte_identical_to_frozen_copy() {
+        let s1 = gen_fwht_signs(43, 128);
+        let s2 = gen_fwht_signs(1043, 128);
+        let mut inputs: Vec<(Vec<f32>, usize, usize)> = Vec::new();
+        for (index, &(m, k)) in [(1usize, 127usize), (1, 128), (2, 129), (3, 512), (2, 300)]
+            .iter()
+            .enumerate()
+        {
+            for (amplitude_index, &amplitude) in [3.0f32, 1.0e-2, 1.0e-6, 1.0e-9].iter().enumerate()
+            {
+                inputs.push((
+                    sym_values((index * 10 + amplitude_index) as u32 + 1, m * k, amplitude),
+                    m,
+                    k,
+                ));
+            }
+        }
+        inputs.push((vec![0.0; 256], 2, 128));
+        inputs.push((vec![0.37; 256], 2, 128));
+        let mut nan = vec![0.5f32; 128];
+        nan[3] = f32::NAN;
+        inputs.push((nan, 1, 128));
+        for (index, (w, m, k)) in inputs.iter().enumerate() {
+            assert_eq!(
+                quantize_mq4g128v2(w, *m, *k, &s1, &s2),
+                frozen_quantize_mq4g128v2(w, *m, *k, &s1, &s2),
+                "input {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn mq4g128v2_symmetric_expert_slice_encoding_is_thread_count_independent() {
+        use rayon::prelude::*;
+        let (s1, s2) = sym_signs();
+        let slices: Vec<Vec<f32>> = (0..8u32)
+            .map(|expert| sym_values(expert + 500, 4 * 512, 0.1 + expert as f32 * 0.01))
+            .collect();
+        let encode = |slice: &Vec<f32>| quantize_mq4g128v2_symmetric(slice, 4, 512, &s1, &s2);
+        let sequential: Vec<_> = slices.iter().map(encode).collect();
+        assert!(sequential.iter().all(Result::is_ok));
+        for threads in [1usize, 2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let parallel: Vec<_> = pool.install(|| slices.par_iter().map(encode).collect());
+            assert_eq!(parallel, sequential, "threads={threads}");
         }
     }
 

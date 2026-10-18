@@ -127,6 +127,113 @@ struct MainQuantState<'a> {
 static MQ4V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
 static MQ3V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
 static MQ2V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
+/// `--moe-expert-down mq4g128v2-symmetric`: routed-expert down_proj goes to
+/// symmetric qt53 (MQ4G128V2) instead of the recipe's qt44.
+static MOE_EXPERT_DOWN_MQ4G128V2_SYM: OnceLock<bool> = OnceLock::new();
+
+fn moe_expert_down_mq4g128v2_symmetric() -> bool {
+    MOE_EXPERT_DOWN_MQ4G128V2_SYM
+        .get()
+        .copied()
+        .unwrap_or(false)
+}
+
+/// Un-stacked routed-expert down_proj: 2-D `...mlp.experts.{N}.down_proj.weight`
+/// (also `mtp.layers.*.mlp.experts.{N}.down_proj.weight`). Selected by role and
+/// shape only. `shared_expert`, dense `mlp.down_proj`, gate_up and every other
+/// tensor are not routed-expert down_proj. Stacked 3-D `experts.down_proj` is
+/// decided in `handle_moe_expert_3d` by its `base_name`.
+fn is_routed_expert_down_2d(name: &str, shape: &[usize]) -> bool {
+    if shape.len() != 2 {
+        return false;
+    }
+    let Some(stem) = name.strip_suffix(".down_proj.weight") else {
+        return false;
+    };
+    let Some((_, expert)) = stem.rsplit_once(".mlp.experts.") else {
+        return false;
+    };
+    !expert.is_empty() && expert.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Encode one routed-expert down_proj `[m, k]` as symmetric MQ4G128V2 (qt53).
+/// FWHT128 signs are `gen_fwht_signs(43, 128)` / `gen_fwht_signs(1043, 128)`.
+/// An encoder error is fatal: there is no fallback to qt44.
+fn encode_routed_expert_down_qt53(name: &str, weights: &[f32], m: usize, k: usize) -> Vec<u8> {
+    let signs1 = gen_fwht_signs(43, 128);
+    let signs2 = gen_fwht_signs(1043, 128);
+    quantize_mq4g128v2_symmetric(weights, m, k, &signs1, &signs2).unwrap_or_else(|error| {
+        eprintln!("error: symmetric qt53 encode of {name} [{m}x{k}] failed: {error}");
+        std::process::exit(1);
+    })
+}
+
+/// Refuse every combination `--moe-expert-down mq4g128v2-symmetric` does not
+/// implement. `env` reads developer env levers (`Some(value)` when set).
+fn check_moe_expert_down(
+    args: &QuantizeArgs,
+    route: crate::cli::Route,
+    use_mq4v2: bool,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<(), String> {
+    if args.moe_expert_down.is_none() {
+        return Ok(());
+    }
+    const FLAG: &str = "--moe-expert-down mq4g128v2-symmetric";
+    if route != crate::cli::Route::Main {
+        return Err(format!(
+            "{FLAG} only applies to the safetensors quantize path"
+        ));
+    }
+    if !use_mq4v2 {
+        return Err(format!("{FLAG} requires --format mq4"));
+    }
+    if !args.uniform {
+        return Err(format!("{FLAG} requires --uniform (no K-map promotion)"));
+    }
+    if !args.mq4v2_symmetric {
+        return Err(format!("{FLAG} requires --mq4v2-symmetric"));
+    }
+    if args.reap_overlay.is_some() || args.reap_bake.is_some() {
+        return Err(format!(
+            "{FLAG} cannot be combined with --reap-overlay/--reap-bake (REAP re-quant has only asymmetric encoders)"
+        ));
+    }
+    if args.awq
+        || args.awq_alpha.is_some()
+        || args.awq_a4_aware
+        || args.awq_a4_route_c2
+        || args.awq_a4_signed_capture.is_some()
+    {
+        return Err(format!("{FLAG} cannot be combined with AWQ"));
+    }
+    if args.imatrix.is_some() {
+        return Err(format!("{FLAG} cannot be combined with --imatrix"));
+    }
+    if args.hessian_dir.is_some() {
+        return Err(format!(
+            "{FLAG} cannot be combined with --hessian-dir (GPTQ/Hessian)"
+        ));
+    }
+    if env("HIPFIRE_MOE_TIER_MAP").is_some() {
+        return Err(format!(
+            "{FLAG} cannot be combined with HIPFIRE_MOE_TIER_MAP"
+        ));
+    }
+    for var in [
+        "HIPFIRE_MOE_GRADED",
+        "HIPFIRE_ROUTED_GL",
+        "HIPFIRE_MOE_DOWN_MQ6",
+        "HIPFIRE_MOE_EXPERTS_MQ6",
+        "HIPFIRE_MOE_DOWN_MQ5",
+        "HIPFIRE_MOE_EXPERTS_MQ5",
+    ] {
+        if env(var).as_deref() == Some("1") {
+            return Err(format!("{FLAG} cannot be combined with {var}=1"));
+        }
+    }
+    Ok(())
+}
 
 fn quantize_mq4g256v2_selected(
     weights: &[f32],
@@ -1922,6 +2029,12 @@ pub(crate) fn run() {
         eprintln!("error: --mq2v2-symmetric currently requires --format mq2v2");
         std::process::exit(1);
     }
+    if let Err(message) = check_moe_expert_down(&args, route_for(&args), use_mq4v2, &|var| {
+        hipfire_config::developer_var(var).ok()
+    }) {
+        eprintln!("error: {message}");
+        std::process::exit(2);
+    }
     if args.awq_a4_route_c2 {
         AWQ_A4_ROUTE_C2.set(true).expect("AWQ c2 recipe set twice");
     }
@@ -1978,6 +2091,14 @@ pub(crate) fn run() {
         .expect("MQ2V2_SYMMETRIC set twice — should not happen");
     if args.mq2v2_symmetric {
         eprintln!("MQ2V2 symmetric headers: ENABLED (per-128 MSE scale search, zero=-2*d)");
+    }
+    MOE_EXPERT_DOWN_MQ4G128V2_SYM
+        .set(args.moe_expert_down == Some(MoeExpertDown::Mq4g128v2Symmetric))
+        .expect("MOE_EXPERT_DOWN_MQ4G128V2_SYM set twice — should not happen");
+    if args.moe_expert_down.is_some() {
+        eprintln!(
+            "Routed-expert down_proj: symmetric MQ4G128V2 (qt53, 68 B per 128 weights, FWHT128 signs 43/1043, per-128 MSE scale search, zero=-8*d); gate_up and all other tensors unchanged"
+        );
     }
     if awq_enabled {
         if IMATRIX.get().is_none() {
@@ -2284,6 +2405,13 @@ pub(crate) fn run() {
     let is_gemma4_family = arch_id == 13 || arch_id == 22;
     let is_moe_like =
         is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe || is_gemma4;
+    if args.moe_expert_down.is_some() && (is_cohere2moe || is_deepseek4 || is_lfm2moe || is_minimax)
+    {
+        eprintln!(
+            "error: --moe-expert-down mq4g128v2-symmetric is not implemented for this architecture's routed-expert tensor layout (arch_id={arch_id}); its expert handler would ignore it"
+        );
+        std::process::exit(2);
+    }
     if (use_mq6g256v2 || use_mq5g256v2 || use_mq3g256v2 || use_mq2g256v2) && is_moe_like {
         eprintln!(
             "error: --format mq{{2,3,5,6}}v2 is dense-only (gfx1201 Qwen3.8); MoE model (arch_id={arch_id}) is not supported with this format. Use legacy mq{{2,3,5,6}} or mq4/mq4v2/mq4c for MoE, or run on a dense checkpoint."
@@ -2559,6 +2687,9 @@ pub(crate) fn run() {
     }
     if args.mq4v2_symmetric {
         metadata["mq4v2.symmetric"] = serde_json::json!(1);
+    }
+    if args.moe_expert_down == Some(MoeExpertDown::Mq4g128v2Symmetric) {
+        metadata["moe.expert_down"] = serde_json::json!("mq4g128v2-symmetric");
     }
     if args.mq3v2_symmetric {
         metadata["mq3v2.symmetric"] = serde_json::json!(1);
@@ -3919,6 +4050,7 @@ pub(crate) fn run() {
                 use_hfp4,
                 use_mfp4l,
                 routed_gl,
+                moe_expert_down_mq4g128v2_symmetric(),
                 &imatrix_path,
                 bake_keep_active,
                 &reap_bake_plan,
@@ -5597,6 +5729,9 @@ fn handle_moe_expert_3d(
     _use_hfp4: bool,
     _use_mfp4l: bool,
     routed_gl: bool,
+    // `--moe-expert-down mq4g128v2-symmetric`: stacked routed-expert
+    // down_proj → symmetric qt53 (group 128). gate_up is untouched.
+    moe_expert_down_sym: bool,
     imatrix_path: &Option<PathBuf>,
     bake_keep_active: bool,
     reap_bake_plan: &Option<hipfire_reap::plan::ReapPlan>,
@@ -5980,9 +6115,15 @@ fn handle_moe_expert_3d(
                 .and_then(|t| t.get(x))
                 .filter(|v| v.len() == inner_k_e)
                 .map(|v| compute_awq_scales(v, awq_alpha_e));
-            let (quantized, qt, gs) = if let (Some(tm), Some(lay)) =
-                (moe_tier_map.as_ref(), parent_layer)
-            {
+            let (quantized, qt, gs) = if moe_expert_down_sym && base_name == "down_proj" {
+                // Validated recipe (uniform symmetric MQ4, no promotion / AWQ /
+                // Lloyd / graded / tier-map) — the override is exclusive.
+                (
+                    encode_routed_expert_down_qt53(name, &f32_slice, inner_m, inner_k_e),
+                    QuantType::MQ4G128V2,
+                    128u32,
+                )
+            } else if let (Some(tm), Some(lay)) = (moe_tier_map.as_ref(), parent_layer) {
                 // N-tier TIER_MAP dispatch: look up (layer, expert) -> QuantType.
                 // Fires for BOTH gate_up and down (unlike graded_hot which is down-only).
                 // Falls back to uniform MQ4 for unmapped (layer,expert) pairs.
@@ -6319,7 +6460,9 @@ fn handle_moe_expert_3d(
     }
     *quantized_params += inner_n as u64 * n_out_experts as u64;
     // Single eprintln to summarize the whole expert sweep.
-    let label = if moe_tier_map.is_some() && parent_layer.is_some() {
+    let label = if moe_expert_down_sym && base_name == "down_proj" {
+        "MQ4G128V2-sym"
+    } else if moe_tier_map.is_some() && parent_layer.is_some() {
         "TierMap"
     } else if graded_hot.is_some() {
         "Graded(MQ6/MQ2L)"
@@ -6551,7 +6694,14 @@ fn handle_main_quant(
             let mut awq_sidecar_scales: Option<Vec<f32>> = None;
             let mut lloyd_sidecar_levels: Option<[f32; 16]> = None;
 
-            let (quantized, qt, gs, label) = if flags.q8_conv1d_default && is_conv1d_tensor(name) {
+            let (quantized, qt, gs, label) = if moe_expert_down_mq4g128v2_symmetric()
+                && is_routed_expert_down_2d(name, &meta.shape)
+            {
+                // Un-stacked routed-expert down_proj → symmetric qt53.
+                let q =
+                    encode_routed_expert_down_qt53(name, &f32_data, meta.shape[0], meta.shape[1]);
+                (q, QuantType::MQ4G128V2, 128u32, "MQ4G128V2-sym")
+            } else if flags.q8_conv1d_default && is_conv1d_tensor(name) {
                 // DeltaNet conv1d defaults to Q8 (see --no-q8-conv1d to disable).
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
@@ -8973,6 +9123,7 @@ mod unsupported_arch_lloyd_promote6_expert_tests {
     enum Recipe {
         Mq4V2Lloyd,
         Mq4V2,
+        Mq4V2DownQt53,
     }
 
     /// `developer_var` overrides would change the emitted bytes for reasons
@@ -9006,17 +9157,33 @@ mod unsupported_arch_lloyd_promote6_expert_tests {
     /// Runs the REAL `handle_moe_expert_3d` for one stacked expert tensor with
     /// K-map Promote6, exactly the flag set `run()` builds for `recipe`.
     fn run_handler(arch_id: u32, recipe: Recipe, shape: [usize; 3], bf16: &[u8]) -> Vec<HfqTensor> {
+        run_handler_with(EXPERT_NAME, arch_id, recipe, shape, bf16, true)
+    }
+
+    /// Same, for any stacked expert tensor name; `promote6` marks it K-map
+    /// Promote6 (false = uniform, empty K-map).
+    fn run_handler_with(
+        expert_name: &str,
+        arch_id: u32,
+        recipe: Recipe,
+        shape: [usize; 3],
+        bf16: &[u8],
+        promote6: bool,
+    ) -> Vec<HfqTensor> {
         assert_no_ambient_expert_overrides();
         let dir = tempfile::tempdir().unwrap();
         let st_path = dir.path().join("experts.safetensors");
         let view = TensorView::new(Dtype::BF16, shape.to_vec(), bf16).unwrap();
-        serialize_to_file([(EXPERT_NAME, view)], None, &st_path).unwrap();
+        serialize_to_file([(expert_name, view)], None, &st_path).unwrap();
         let st_files = vec![SafetensorsFile::open(&st_path).unwrap()];
-        let (meta, raw_data) = st_files[0].tensor_data(EXPERT_NAME).unwrap();
-        let kmap: HashMap<String, QuantLevel> =
-            HashMap::from([(EXPERT_NAME.to_string(), QuantLevel::Promote6)]);
+        let (meta, raw_data) = st_files[0].tensor_data(expert_name).unwrap();
+        let kmap: HashMap<String, QuantLevel> = if promote6 {
+            HashMap::from([(expert_name.to_string(), QuantLevel::Promote6)])
+        } else {
+            HashMap::new()
+        };
         let ctx = PerTensorCtx {
-            name: EXPERT_NAME,
+            name: expert_name,
             file_idx: 0,
             n_elements: shape.iter().product(),
             arch_id,
@@ -9038,47 +9205,48 @@ mod unsupported_arch_lloyd_promote6_expert_tests {
             false,
             0.0,
             &None,
-            false,                                // use_gptq_e8
-            false,                                // use_gptq_mfp3e8
-            false,                                // use_gptq_mfp2e8
-            false,                                // use_mq6g256
-            false,                                // use_mq4g256
-            matches!(recipe, Recipe::Mq4V2),      // use_mq4v2
-            matches!(recipe, Recipe::Mq4V2Lloyd), // use_mq4v2_lloyd
-            false,                                // use_mq4c
-            false,                                // use_mq4_mq6exp
-            false,                                // use_mq4_mq2lloydexp
-            false,                                // use_mq4_mq2glexp
-            false,                                // use_mq4_mq2lloyd_native
-            false,                                // use_mq4_mq2lloyd_kmap
-            false,                                // use_mq4_mq2lloyd_imatrix
-            false,                                // use_mq4_mq3lloyd_kmap
-            false,                                // use_mq4_mqlloyd_tiered
-            false,                                // use_mq4_mqlloyd_antirez
-            false,                                // use_mq4_mqlloyd_antirez_gptq
-            false,                                // use_mq4_mq2lloyd_gptq_all
-            false,                                // use_mq5g256
-            false,                                // use_hfq6
-            false,                                // use_hfq4g256
-            false,                                // use_hfq3g256
-            false,                                // use_hfq3g128
-            false,                                // use_hfq2g256
-            false,                                // use_hfq2g128
-            false,                                // use_hfq_mixed
-            false,                                // use_mfp4
-            false,                                // use_mfp4p
-            false,                                // use_mfp4e8
-            false,                                // use_mfp4e8soa
-            false,                                // use_mfp3e8_gptq_fmt
-            false,                                // use_mfp2e8_gptq_fmt
-            false,                                // use_mq3g256
-            false,                                // use_mq2g256
-            false,                                // use_mq2g256_lloyd
-            false,                                // use_mq3g256_lloyd
-            false,                                // use_mq4g256_lloyd
-            false,                                // use_hfp4
-            false,                                // use_mfp4l
-            false,                                // routed_gl
+            false,                                                   // use_gptq_e8
+            false,                                                   // use_gptq_mfp3e8
+            false,                                                   // use_gptq_mfp2e8
+            false,                                                   // use_mq6g256
+            false,                                                   // use_mq4g256
+            matches!(recipe, Recipe::Mq4V2 | Recipe::Mq4V2DownQt53), // use_mq4v2
+            matches!(recipe, Recipe::Mq4V2Lloyd),                    // use_mq4v2_lloyd
+            false,                                                   // use_mq4c
+            false,                                                   // use_mq4_mq6exp
+            false,                                                   // use_mq4_mq2lloydexp
+            false,                                                   // use_mq4_mq2glexp
+            false,                                                   // use_mq4_mq2lloyd_native
+            false,                                                   // use_mq4_mq2lloyd_kmap
+            false,                                                   // use_mq4_mq2lloyd_imatrix
+            false,                                                   // use_mq4_mq3lloyd_kmap
+            false,                                                   // use_mq4_mqlloyd_tiered
+            false,                                                   // use_mq4_mqlloyd_antirez
+            false,                                                   // use_mq4_mqlloyd_antirez_gptq
+            false,                                                   // use_mq4_mq2lloyd_gptq_all
+            false,                                                   // use_mq5g256
+            false,                                                   // use_hfq6
+            false,                                                   // use_hfq4g256
+            false,                                                   // use_hfq3g256
+            false,                                                   // use_hfq3g128
+            false,                                                   // use_hfq2g256
+            false,                                                   // use_hfq2g128
+            false,                                                   // use_hfq_mixed
+            false,                                                   // use_mfp4
+            false,                                                   // use_mfp4p
+            false,                                                   // use_mfp4e8
+            false,                                                   // use_mfp4e8soa
+            false,                                                   // use_mfp3e8_gptq_fmt
+            false,                                                   // use_mfp2e8_gptq_fmt
+            false,                                                   // use_mq3g256
+            false,                                                   // use_mq2g256
+            false,                                                   // use_mq2g256_lloyd
+            false,                                                   // use_mq3g256_lloyd
+            false,                                                   // use_mq4g256_lloyd
+            false,                                                   // use_hfp4
+            false,                                                   // use_mfp4l
+            false,                                                   // routed_gl
+            matches!(recipe, Recipe::Mq4V2DownQt53),                 // moe_expert_down_sym
             &None,
             false,
             &None,
@@ -9242,6 +9410,286 @@ mod unsupported_arch_lloyd_promote6_expert_tests {
         assert_eq!(meta.dtype, "BF16");
         assert_eq!(meta.shape[1..], [1024, 2048]);
         bytes[..1024 * 2048 * 2].to_vec()
+    }
+
+    const DOWN_NAME: &str = "model.language_model.layers.3.mlp.experts.down_proj";
+
+    /// Independent expectation: symmetric qt53 of expert `expert`'s `[m, k]`
+    /// slice straight from the encoder with the 43/1043 sign tables.
+    fn expected_qt53(bf16: &[u8], expert: usize, m: usize, k: usize) -> Vec<u8> {
+        let bytes = m * k * 2;
+        let weights = to_f32(&bf16[expert * bytes..(expert + 1) * bytes], "BF16");
+        quantize_mq4g128v2_symmetric(
+            &weights,
+            m,
+            k,
+            &gen_fwht_signs(43, 128),
+            &gen_fwht_signs(1043, 128),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn symmetric_down_override_emits_qt53_for_stacked_down_only() {
+        let [n, m, k] = SYNTH_SHAPE;
+        let bf16 = synth_bf16(n, m, k);
+        let tensors = run_handler_with(
+            DOWN_NAME,
+            6,
+            Recipe::Mq4V2DownQt53,
+            SYNTH_SHAPE,
+            &bf16,
+            false,
+        );
+        assert_all_qt(
+            &tensors,
+            QuantType::MQ4G128V2,
+            "stacked down_proj with override",
+        );
+        assert_eq!(QuantType::MQ4G128V2 as u8, 53);
+        assert_eq!(tensors.len(), n);
+        for (slot, tensor) in tensors.iter().enumerate() {
+            assert_eq!(
+                tensor.name,
+                format!("model.language_model.layers.3.mlp.experts.{slot}.down_proj.weight")
+            );
+            assert_eq!(tensor.shape, vec![m as u32, k as u32]);
+            assert_eq!(tensor.group_size, 128);
+            assert_eq!(tensor.data.len(), m * k.div_ceil(128) * 68);
+            assert_eq!(
+                tensor.data,
+                expected_qt53(&bf16, slot, m, k),
+                "expert {slot}"
+            );
+        }
+        // Control: without the override the same stacked down is qt44.
+        let control = run_handler_with(DOWN_NAME, 6, Recipe::Mq4V2, SYNTH_SHAPE, &bf16, false);
+        assert_all_qt(
+            &control,
+            QuantType::MQ4G256V2,
+            "stacked down_proj, no override",
+        );
+        assert_ne!(control[0].data, tensors[0].data);
+        // gate_up is untouched: same qt44 bytes with and without the override.
+        let gate_up_flagged = run_handler_with(
+            EXPERT_NAME,
+            6,
+            Recipe::Mq4V2DownQt53,
+            SYNTH_SHAPE,
+            &bf16,
+            false,
+        );
+        let gate_up_plain =
+            run_handler_with(EXPERT_NAME, 6, Recipe::Mq4V2, SYNTH_SHAPE, &bf16, false);
+        assert_all_qt(
+            &gate_up_flagged,
+            QuantType::MQ4G256V2,
+            "stacked gate_up with override",
+        );
+        assert_eq!(
+            tensors_sha256(&gate_up_flagged),
+            tensors_sha256(&gate_up_plain)
+        );
+        assert_eq!(gate_up_flagged[0].group_size, 256);
+    }
+
+    #[test]
+    fn symmetric_down_override_encodes_unaligned_k_without_falling_back() {
+        // K=129 is not a multiple of 256 (the qt44 arm would drop to HFQ4G128)
+        // nor of 128; the override still emits row-local padded qt53.
+        let shape = [2usize, 3, 129];
+        let bf16 = synth_bf16(shape[0], shape[1], shape[2]);
+        let tensors = run_handler_with(DOWN_NAME, 6, Recipe::Mq4V2DownQt53, shape, &bf16, false);
+        assert_all_qt(&tensors, QuantType::MQ4G128V2, "K=129 stacked down_proj");
+        for (slot, tensor) in tensors.iter().enumerate() {
+            assert_eq!(tensor.group_size, 128);
+            assert_eq!(tensor.data.len(), 3 * 2 * 68);
+            assert_eq!(tensor.data, expected_qt53(&bf16, slot, 3, 129));
+        }
+    }
+
+    #[test]
+    fn symmetric_down_override_is_thread_count_independent() {
+        let bf16 = synth_bf16(SYNTH_SHAPE[0], SYNTH_SHAPE[1], SYNTH_SHAPE[2]);
+        let mut digests = Vec::new();
+        for threads in [1usize, 2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let tensors = pool.install(|| {
+                run_handler_with(
+                    DOWN_NAME,
+                    6,
+                    Recipe::Mq4V2DownQt53,
+                    SYNTH_SHAPE,
+                    &bf16,
+                    false,
+                )
+            });
+            digests.push(tensors_sha256(&tensors));
+        }
+        assert!(
+            digests.windows(2).all(|pair| pair[0] == pair[1]),
+            "{digests:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod moe_expert_down_override_tests {
+    use super::*;
+    use clap::{CommandFactory, FromArgMatches};
+
+    #[test]
+    fn two_d_role_predicate_selects_routed_expert_down_only() {
+        let shape = [4usize, 8];
+        for (name, expected) in [
+            (
+                "model.language_model.layers.0.mlp.experts.7.down_proj.weight",
+                true,
+            ),
+            ("mtp.layers.0.mlp.experts.3.down_proj.weight", true),
+            (
+                "model.language_model.layers.0.mlp.shared_expert.down_proj.weight",
+                false,
+            ),
+            (
+                "model.language_model.layers.0.mlp.experts.7.gate_up_proj.weight",
+                false,
+            ),
+            (
+                "model.language_model.layers.0.mlp.experts.7.gate_proj.weight",
+                false,
+            ),
+            ("model.language_model.layers.0.mlp.down_proj.weight", false),
+            (
+                "model.language_model.layers.0.mlp.experts.down_proj.weight",
+                false,
+            ),
+            (
+                "model.language_model.layers.0.mlp.experts.7.down_proj.bias",
+                false,
+            ),
+        ] {
+            assert_eq!(is_routed_expert_down_2d(name, &shape), expected, "{name}");
+        }
+        // 3-D (stacked) tensors are decided by handle_moe_expert_3d, not here.
+        assert!(!is_routed_expert_down_2d(
+            "model.language_model.layers.0.mlp.experts.7.down_proj.weight",
+            &[2, 4, 8]
+        ));
+    }
+
+    const GOOD: [&str; 7] = [
+        "--format",
+        "mq4",
+        "--uniform",
+        "--mq4v2-symmetric",
+        "--no-q8-router",
+        "--moe-expert-down",
+        "mq4g128v2-symmetric",
+    ];
+
+    fn parse(extra: &[&str]) -> QuantizeArgs {
+        let argv = ["hipfire-quantize", "--input", "i", "--output", "o"]
+            .into_iter()
+            .chain(extra.iter().copied());
+        let matches = QuantizeArgs::command().try_get_matches_from(argv).unwrap();
+        QuantizeArgs::from_arg_matches(&matches).unwrap()
+    }
+
+    fn check(extra: &[&str], env: &[(&str, &str)]) -> Result<(), String> {
+        let args = parse(extra);
+        let use_mq4v2 = matches!(args.format.as_str(), "mq4v2" | "mq4" | "mq4g256v2");
+        check_moe_expert_down(&args, route_for(&args), use_mq4v2, &|var| {
+            env.iter()
+                .find(|(name, _)| *name == var)
+                .map(|(_, value)| value.to_string())
+        })
+    }
+
+    #[test]
+    fn validation_accepts_exactly_the_uniform_symmetric_mq4_recipe() {
+        check(&GOOD, &[]).unwrap();
+        // Levers set to something other than "1" are inert.
+        check(
+            &GOOD,
+            &[
+                ("HIPFIRE_MOE_DOWN_MQ6", "0"),
+                ("HIPFIRE_MOE_EXPERTS_MQ5", "0"),
+            ],
+        )
+        .unwrap();
+        // Absent flag: nothing is checked.
+        let args = parse(&["--format", "mq6", "--awq"]);
+        check_moe_expert_down(&args, route_for(&args), false, &|_| Some("1".to_string())).unwrap();
+    }
+
+    #[test]
+    fn validation_refuses_every_unsupported_combination() {
+        let without = |drop: &str| -> Vec<&str> {
+            let mut v: Vec<&str> = GOOD.to_vec();
+            let at = v.iter().position(|a| *a == drop).unwrap();
+            v.remove(at);
+            v
+        };
+        let with = |extra: &[&'static str]| -> Vec<&'static str> {
+            let mut v: Vec<&'static str> = GOOD.to_vec();
+            v.extend_from_slice(extra);
+            v
+        };
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (without("--uniform"), "--uniform"),
+            (without("--mq4v2-symmetric"), "--mq4v2-symmetric"),
+            (
+                vec![
+                    "--format",
+                    "mq6",
+                    "--uniform",
+                    "--mq4v2-symmetric",
+                    "--moe-expert-down",
+                    "mq4g128v2-symmetric",
+                ],
+                "--format mq4",
+            ),
+            (with(&["--reap-bake", "p"]), "REAP"),
+            (with(&["--reap-overlay", "p"]), "safetensors quantize path"),
+            (with(&["--awq"]), "AWQ"),
+            (with(&["--awq-alpha", "0.5"]), "AWQ"),
+            (with(&["--imatrix", "x"]), "--imatrix"),
+            (with(&["--hessian-dir", "d"]), "--hessian-dir"),
+        ];
+        for (argv, needle) in &cases {
+            let error = check(argv, &[]).unwrap_err();
+            assert!(error.contains(needle), "{argv:?}: {error}");
+        }
+        for var in [
+            "HIPFIRE_MOE_DOWN_MQ6",
+            "HIPFIRE_MOE_EXPERTS_MQ6",
+            "HIPFIRE_MOE_DOWN_MQ5",
+            "HIPFIRE_MOE_EXPERTS_MQ5",
+            "HIPFIRE_MOE_GRADED",
+            "HIPFIRE_ROUTED_GL",
+        ] {
+            let error = check(&GOOD, &[(var, "1")]).unwrap_err();
+            assert!(error.contains(var), "{var}: {error}");
+        }
+        let error = check(&GOOD, &[("HIPFIRE_MOE_TIER_MAP", "/tmp/map")]).unwrap_err();
+        assert!(error.contains("HIPFIRE_MOE_TIER_MAP"), "{error}");
+        // Any non-Main route (qwen4-flash-next, GGUF, ...) is refused.
+        let args = parse(&GOOD);
+        for route in [
+            crate::cli::Route::Qwen4,
+            crate::cli::Route::Gguf,
+            crate::cli::Route::ReapOverlay,
+        ] {
+            let error = check_moe_expert_down(&args, route, true, &|_| None).unwrap_err();
+            assert!(
+                error.contains("safetensors quantize path"),
+                "{route:?}: {error}"
+            );
+        }
     }
 }
 
