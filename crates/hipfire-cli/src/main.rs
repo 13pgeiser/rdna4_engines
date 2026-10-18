@@ -3983,8 +3983,7 @@ pub(crate) fn same_installed_file(a: &Path, b: &Path) -> bool {
 /// Fixture retired pins, process-wide so a serve harness's request threads see
 /// them. [`RetiredOverride`] serializes the tests that set it.
 #[cfg(test)]
-static RETIRED_OVERRIDE: std::sync::Mutex<Option<Vec<RetiredModel>>> =
-    std::sync::Mutex::new(None);
+static RETIRED_OVERRIDE: std::sync::Mutex<Option<Vec<RetiredModel>>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
 static RETIRED_OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -22701,10 +22700,22 @@ effort = "high"
         let expected = [
             ("qwen3.8:flash-next", "qwen3.8-flash-next-base.mq4-xts"),
             ("qwen3.8:flash-next-mq4", "qwen3.8-flash-next-base.mq4-xts"),
-            ("qwen3.8:flash-next-gptq3", "qwen3.8-flash-next-base.mq4-xts"),
-            ("qwen3.8:flash-next-mq4-xts", "qwen3.8-flash-next-base.mq4-xts"),
-            ("qwen3.8:flash-next-mq3-xts", "qwen3.8-flash-next-base.mq3-xts"),
-            ("qwen3.8:flash-next-mq2-xts", "qwen3.8-flash-next-base.mq2-xts"),
+            (
+                "qwen3.8:flash-next-gptq3",
+                "qwen3.8-flash-next-base.mq4-xts",
+            ),
+            (
+                "qwen3.8:flash-next-mq4-xts",
+                "qwen3.8-flash-next-base.mq4-xts",
+            ),
+            (
+                "qwen3.8:flash-next-mq3-xts",
+                "qwen3.8-flash-next-base.mq3-xts",
+            ),
+            (
+                "qwen3.8:flash-next-mq2-xts",
+                "qwen3.8-flash-next-base.mq2-xts",
+            ),
             (
                 "qwen3.8:flash-next-mq2-xts-4500",
                 "qwen3.8-flash-next-base.mq2-xts-4500",
@@ -22736,7 +22747,10 @@ effort = "high"
             "qwen3.8:flash-next-mq4-xts",
         ] {
             let (_, entry) = registry.model(tag).unwrap();
-            assert!(grandfather_pin(entry).is_some(), "{tag} stays grandfathered");
+            assert!(
+                grandfather_pin(entry).is_some(),
+                "{tag} stays grandfathered"
+            );
             assert!(entry.trunk_overlay().is_some() && entry.expert_hotset().is_some());
         }
     }
@@ -22791,7 +22805,11 @@ effort = "high"
             );
             assert_eq!(model_card(&paths, &registry, &input).tag(), Some(pin.tag));
         }
-        assert_eq!(hash_count(), 1, "one hash; every spelling reuses the record");
+        assert_eq!(
+            hash_count(),
+            1,
+            "one hash; every spelling reuses the record"
+        );
         let record = VerifiedCache::in_home(&paths.root)
             .record_of(&installed)
             .expect("the verification is cached");
@@ -22881,7 +22899,11 @@ effort = "high"
                 .record_of(&installed)
                 .is_none());
         }
-        assert_eq!(download_count(), 0, "a mismatch is never repaired by a pull");
+        assert_eq!(
+            download_count(),
+            0,
+            "a mismatch is never repaired by a pull"
+        );
 
         // The right bytes then verify and serve.
         fs::write(&installed, RETIRED_Q8_BYTES).unwrap();
@@ -22924,12 +22946,18 @@ effort = "high"
 
         // Text and JSON marking.
         let line = local_model_line(rtn_row);
-        assert!(line.contains("(qwen3.8:flash-next-rtn-asym) [retired]"), "{line}");
+        assert!(
+            line.contains("(qwen3.8:flash-next-rtn-asym) [retired]"),
+            "{line}"
+        );
         assert!(!local_model_line(lookalike_row).contains("retired"));
         let json = serde_json::to_value(rtn_row).unwrap();
         assert_eq!(json["retired"], true);
         assert_eq!(json["registry_tag"], RETIRED_MODELS[0].tag);
-        assert_eq!(serde_json::to_value(lookalike_row).unwrap()["retired"], false);
+        assert_eq!(
+            serde_json::to_value(lookalike_row).unwrap()["retired"],
+            false
+        );
 
         // The available catalog (what `list --remote` and the TUI offer) has neither.
         for pin in RETIRED_MODELS {
