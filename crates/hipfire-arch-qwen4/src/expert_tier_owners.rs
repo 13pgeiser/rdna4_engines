@@ -496,6 +496,8 @@ impl ExpertTierOwners {
             return Ok(());
         }
         let bytes = usize::try_from(bytes).map_err(|_| ExpertTierOwnerError::Overflow)?;
+        let alloc_started = std::time::Instant::now();
+        let _alloc_phase = AllocPhase(alloc_started, bytes as u64);
         let cpu = self
             .hip
             .host_malloc(bytes, HIP_HOST_MALLOC_MAPPED)
@@ -531,7 +533,8 @@ impl ExpertTierOwners {
         src: &dyn Fn(u64, u64) -> Result<&'src [u8], String>,
     ) -> Result<(), ExpertTierOwnerError> {
         checked_extent(tier, dst_offset, len, self.plan.owner_bytes(tier))?;
-        copy_span(src, source_offset, len, dst_offset, |offset, chunk| {
+        let copy_started = std::time::Instant::now();
+        let copied = copy_span(src, source_offset, len, dst_offset, |offset, chunk| {
             let offset = usize::try_from(offset).map_err(|_| ExpertTierOwnerError::Overflow)?;
             match tier {
                 Placement::Device => {
@@ -561,7 +564,16 @@ impl ExpertTierOwners {
                     Ok(())
                 }
             }
-        })
+        });
+        rdna_compute::load_phases::add(
+            match tier {
+                Placement::Device => "expert_tiers.h2d",
+                Placement::HostMapped => "expert_tiers.host_copy",
+            },
+            rdna_compute::load_phases::ns_since(copy_started),
+            len,
+        );
+        copied
     }
 
     fn zero_tail(&self, tier: Placement) -> Result<(), ExpertTierOwnerError> {
@@ -599,6 +611,20 @@ impl ExpertTierOwners {
                 Ok(())
             }
         }
+    }
+}
+
+/// Records one `expert_tiers.host_alloc` call (pinned host allocation plus its
+/// device alias lookup) when the allocating scope ends, error paths included.
+struct AllocPhase(std::time::Instant, u64);
+
+impl Drop for AllocPhase {
+    fn drop(&mut self) {
+        rdna_compute::load_phases::add(
+            "expert_tiers.host_alloc",
+            rdna_compute::load_phases::ns_since(self.0),
+            self.1,
+        );
     }
 }
 

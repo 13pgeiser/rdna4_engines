@@ -1525,6 +1525,7 @@ impl HotRowStore {
         } - begin;
         self.load_filled.store(filled, Ordering::Relaxed);
         let secs = started.elapsed().as_secs_f64();
+        rdna_compute::load_phases::add_overlapped("ple_load_fill", (secs * 1e9) as u64, read_bytes);
         eprintln!(
             "{TAG}: load fill {ended}: {:.2} GiB resident from the hottest row on ({:.2} GiB read \
              of {:.2}); {:.2} GiB read in {secs:.1} s, {:.2} of it re-reading evicted pages, {:.2} GB/s \

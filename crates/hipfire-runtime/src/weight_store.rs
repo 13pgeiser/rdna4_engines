@@ -777,7 +777,14 @@ fn upload_resident_bytes(
     match residency {
         WeightResidency::HostMapped => gpu.upload_raw_host_mapped(bytes, logical_shape),
         WeightResidency::Resident | WeightResidency::ExternalRows { .. } => {
-            upload_pooled_bytes(gpu, bytes, logical_shape)
+            let started = std::time::Instant::now();
+            let uploaded = upload_pooled_bytes(gpu, bytes, logical_shape);
+            rdna_compute::load_phases::add(
+                "weights.device_upload",
+                rdna_compute::load_phases::ns_since(started),
+                bytes.len() as u64,
+            );
+            uploaded
         }
     }
 }
@@ -1058,6 +1065,7 @@ fn upload_range_pooled(
                 .map_err(|error| format!("pooled tail pad upload failed: {error}"))?;
         }
         let mut offset = 0usize;
+        let (mut read_ns, mut h2d_ns) = (0u64, 0u64);
         let mut staging = vec![0u8; next_range_chunk(0, payload_len, alignment)];
         while offset < payload_len {
             let chunk_len = next_range_chunk(offset, payload_len, alignment);
@@ -1066,17 +1074,23 @@ fn upload_range_pooled(
                 .offset
                 .checked_add(offset as u64)
                 .ok_or_else(|| "source range offset overflow".to_string())?;
+            let read_started = std::time::Instant::now();
             descriptor
                 .read_exact_at(absolute_offset, chunk)
                 .map_err(|error| format!("source range read failed: {error}"))?;
+            read_ns += rdna_compute::load_phases::ns_since(read_started);
+            let h2d_started = std::time::Instant::now();
             gpu.hip
                 .memcpy_htod_offset(&tensor.buf, offset, chunk)
                 .map_err(|error| format!("pooled chunk upload failed: {error}"))?;
+            h2d_ns += rdna_compute::load_phases::ns_since(h2d_started);
             // Read once per load: on unified memory the cached copy only
             // pushes other pages (the PLE table's) out of the page cache.
             descriptor.release_uploaded(absolute_offset, chunk_len as u64);
             offset += chunk_len;
         }
+        rdna_compute::load_phases::add("weights.range_read", read_ns, payload_len as u64);
+        rdna_compute::load_phases::add("weights.h2d", h2d_ns, payload_len as u64);
         Ok::<(), String>(())
     })();
     if let Err(error) = result {

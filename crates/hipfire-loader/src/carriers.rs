@@ -1709,6 +1709,7 @@ fn load_qwen4_rank_scoped(
     // source that reaches the carrier without admission).  A developer
     // profile's embedded rows (or a profile without PLE) have no sidecar
     // to resolve: `None`.
+    let admission_started = std::time::Instant::now();
     let choice = crate::admission::resolve_qwen4_ple_rows_hfq(&mut hfq, ctx.path, &ctx.gpu.arch)?;
     // GPU-arch admission: an artifact the device cannot run is refused here,
     // before any allocation or mapping drop.
@@ -1719,19 +1720,27 @@ fn load_qwen4_rank_scoped(
     // run would otherwise fail after the weights were fulfilled.
     hipfire_arch_qwen4::bundle::admit_executable_profile(&receipt.config)
         .map_err(|error| format!("qwen4: {error}"))?;
+    rdna_compute::load_phases::add(
+        "qwen4_artifact_admission",
+        rdna_compute::load_phases::ns_since(admission_started),
+        0,
+    );
     // A band's forward scratch plan is chosen once, from the full manifest,
     // so every band attaches the same plan (a band-scoped manifest would
     // miss the PLE entries the selector inspects).
     let full_scratch_mode = match band {
-        Some(_) => Some(
-            hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
-                ctx.gpu,
-                &hfq,
-                &receipt.config,
-                &receipt.manifest,
+        Some(_) => {
+            let _scan = rdna_compute::load_phases::span("qwen4_symmetry_scan");
+            Some(
+                hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+                    ctx.gpu,
+                    &hfq,
+                    &receipt.config,
+                    &receipt.manifest,
+                )
+                .map_err(|error| error.to_string())?,
             )
-            .map_err(|error| error.to_string())?,
-        ),
+        }
         None => None,
     };
     let receipt = match band {
@@ -1781,6 +1790,7 @@ fn load_qwen4_rank_scoped(
     }
     // A rank-order table is its own hot-row pack and is served through
     // its store; every other source reads through 128 shard descriptors.
+    let ple_descriptors_started = std::time::Instant::now();
     let rank_table = receipt.ple_rows.rank_table().cloned();
     let ple_descriptors = match rank_table {
         Some(_) => None,
@@ -1877,6 +1887,11 @@ fn load_qwen4_rank_scoped(
             )
         },
     );
+    rdna_compute::load_phases::add(
+        "ple_setup",
+        rdna_compute::load_phases::ns_since(ple_descriptors_started),
+        0,
+    );
     let recipe = receipt.recipe().clone();
     let config = receipt.config;
     let mut manifest = receipt.manifest;
@@ -1934,10 +1949,13 @@ fn load_qwen4_rank_scoped(
     let scratch_mode = match full_scratch_mode {
         Some(mode) => mode,
         None if ep.is_some() => hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode::Full,
-        None => hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
-            ctx.gpu, &hfq, &config, &manifest,
-        )
-        .map_err(|error| error.to_string())?,
+        None => {
+            let _scan = rdna_compute::load_phases::span("qwen4_symmetry_scan");
+            hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
+                ctx.gpu, &hfq, &config, &manifest,
+            )
+            .map_err(|error| error.to_string())?
+        }
     };
     if scratch_mode != hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode::Full {
         let reason = if matches!(
@@ -1999,6 +2017,7 @@ fn load_qwen4_rank_scoped(
     // `native_mtp` as the placement sees it: the later host-spill decline
     // must not move the reserve the placement was sized with.
     let placement_native_mtp = native_mtp;
+    let placement_started = std::time::Instant::now();
     // The chunk the expert placement reserve, forward census and pool
     // workspace are sized from: the requested chunk (explicit
     // `HIPFIRE_PREFILL_CHUNK_ROWS`, else the arch default). On gfx1100 that
@@ -2628,6 +2647,11 @@ fn load_qwen4_rank_scoped(
             )
         );
     }
+    rdna_compute::load_phases::add(
+        "qwen4_placement",
+        rdna_compute::load_phases::ns_since(placement_started),
+        0,
+    );
     // Context-sized QSA arenas (trunk layers in `qsa_format`, plus the MTP
     // head's, which stays F32): what legacy storage allocates at assembly
     // (named in the refusal when it does not fit), and VMM storage only
@@ -2669,6 +2693,7 @@ fn load_qwen4_rank_scoped(
     // in hand); its worker verifies the pack meanwhile and prewarms it
     // once the model is ready. Dropping either on an error path stops and
     // joins its worker.
+    let ple_workers_started = std::time::Instant::now();
     #[cfg(unix)]
     let ple_table_worker = rank_table.as_ref().map(|store| {
         // What the sweep puts in host RAM: on unified memory every
@@ -2715,6 +2740,11 @@ fn load_qwen4_rank_scoped(
         }
         _ => None,
     };
+    rdna_compute::load_phases::add(
+        "ple_setup",
+        rdna_compute::load_phases::ns_since(ple_workers_started),
+        0,
+    );
     // Every allocation of the weight sweep is immutable model data: railgun
     // check mode verifies it unchanged instead of snapshotting it (§2.4).
     let weights_role =
@@ -2722,6 +2752,8 @@ fn load_qwen4_rank_scoped(
     let expert_tiers = if let Some((plan, budget)) = hotset_plan {
         use hipfire_arch_qwen4::expert_tier_plan::Placement;
         let device_experts = plan.device_experts();
+        let tiers_io0 = rdna_compute::load_phases::thread_io();
+        let tiers_started = std::time::Instant::now();
         let lease = hipfire_arch_qwen4::expert_tier_owners::materialize(
             ctx.gpu,
             plan,
@@ -2734,6 +2766,21 @@ fn load_qwen4_rank_scoped(
         ).map_err(|error| format!(
             "HIPFIRE_QWEN4_EXPERT_HOTSET: materialize failed after tier placement was committed (owners may be partly allocated; cannot safely fall back): {error}"
         ))?;
+        let tiers_ns = rdna_compute::load_phases::ns_since(tiers_started);
+        rdna_compute::load_phases::add("expert_tiers", tiers_ns, 0);
+        if let (Some((read0, faults0)), Some((read1, faults1))) =
+            (tiers_io0, rdna_compute::load_phases::thread_io())
+        {
+            rdna_compute::load_phases::add(
+                "expert_tiers.storage_read",
+                tiers_ns,
+                read1.saturating_sub(read0),
+            );
+            rdna_compute::load_phases::note(
+                "expert_tiers.major_faults",
+                faults1.saturating_sub(faults0).to_string(),
+            );
+        }
         let digest = lease.logical_digest();
         use std::fmt::Write as _;
         let mut digest_hex = String::with_capacity(16);
@@ -2764,6 +2811,8 @@ fn load_qwen4_rank_scoped(
     };
     let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq, &ctx.gpu.arch);
     let source = HfqModelSource::from_hfq(hfq);
+    let weights_io0 = rdna_compute::load_phases::thread_io();
+    let weights_started = std::time::Instant::now();
     let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads_ep(
         &manifest.weights,
         &mesh,
@@ -2786,10 +2835,26 @@ fn load_qwen4_rank_scoped(
         },
     )
     .map_err(|error| format!("qwen4: manifest fulfillment failed: {error}"))?;
+    let weights_ns = rdna_compute::load_phases::ns_since(weights_started);
+    rdna_compute::load_phases::add("weights", weights_ns, 0);
+    if let (Some((read0, faults0)), Some((read1, faults1))) =
+        (weights_io0, rdna_compute::load_phases::thread_io())
+    {
+        rdna_compute::load_phases::add(
+            "weights.storage_read",
+            weights_ns,
+            read1.saturating_sub(read0),
+        );
+        rdna_compute::load_phases::note(
+            "weights.major_faults",
+            faults1.saturating_sub(faults0).to_string(),
+        );
+    }
     drop(weights_role);
     let scope = band
         .cloned()
         .unwrap_or_else(|| hipfire_arch_qwen4::weights::Qwen4BandScope::single(&config));
+    let assemble_started = std::time::Instant::now();
     let mut bundle = hipfire_arch_qwen4::bundle::Qwen4Bundle::assemble_band_with_ple_rows(
             config,
             &recipe,
@@ -2840,11 +2905,22 @@ fn load_qwen4_rank_scoped(
             return Err(format!("qwen4: trunk overlay setup failed: {detail}"));
         }
     }
+    rdna_compute::load_phases::add(
+        "qwen4_assemble",
+        rdna_compute::load_phases::ns_since(assemble_started),
+        0,
+    );
+    let forward_started = std::time::Instant::now();
     if let Err(error) = bundle.attach_forward(ctx.gpu, placement_chunk, scratch_mode) {
         let detail = error.to_string();
         let _ = bundle.free_gpu(ctx.gpu);
         return Err(format!("qwen4: forward setup failed: {detail}"));
     }
+    rdna_compute::load_phases::add(
+        "qwen4_forward_state",
+        rdna_compute::load_phases::ns_since(forward_started),
+        0,
+    );
     if let Some(scope) = band {
         // `attach_forward` searches smaller chunk rungs when the largest does
         // not fit; a band never shrinks the canonical chunk on its own. A band
@@ -2893,12 +2969,19 @@ fn load_qwen4_rank_scoped(
         );
     }
     if native_mtp {
+        let mtp_started = std::time::Instant::now();
         if let Err(error) = bundle.attach_mtp(ctx.gpu, ctx.max_seq) {
             let detail = error.to_string();
             let _ = bundle.free_gpu(ctx.gpu);
             return Err(format!("qwen4: MTP setup failed: {detail}"));
         }
+        rdna_compute::load_phases::add(
+            "qwen4_mtp_attach",
+            rdna_compute::load_phases::ns_since(mtp_started),
+            0,
+        );
     }
+    let post_load_started = std::time::Instant::now();
     // One snapshot of the PLE page-cache budgets, taken before admission:
     // the prewarm after ready sets these budgets (capped at what admission
     // leaves them), and the admission sizes the pages they keep resident.
@@ -3149,6 +3232,11 @@ fn load_qwen4_rank_scoped(
                 return Err(format!("qwen4: QSA context census failed: {detail}"));
             }
         }
+    rdna_compute::load_phases::add(
+        "qwen4_post_load",
+        rdna_compute::load_phases::ns_since(post_load_started),
+        0,
+    );
     if let Some(scope) = band {
         eprintln!(
             "qwen4 PP band layers {:?} (input {}, output {}): loaded on device {} (max_seq {max_seq})",

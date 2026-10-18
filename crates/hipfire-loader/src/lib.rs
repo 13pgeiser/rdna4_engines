@@ -3473,6 +3473,7 @@ pub fn load_admitted_with_gemma4_drafter(
     // Planner-closed routes start their bounded kernel compile now, overlapped
     // with the non-dispatching weight load, and preload every planned module
     // before the first dispatch. Refused routes keep lazy loading.
+    let route_begin_started = std::time::Instant::now();
     let planned_route = begin_route_kernels(
         &RouteRequest {
             path,
@@ -3495,6 +3496,19 @@ pub fn load_admitted_with_gemma4_drafter(
         },
         gpu,
     )?;
+    rdna_compute::load_phases::add(
+        "kernels.route_begin",
+        rdna_compute::load_phases::ns_since(route_begin_started),
+        0,
+    );
+    rdna_compute::load_phases::note(
+        "kernels",
+        if planned_route.is_some() {
+            "route_plan"
+        } else {
+            "lazy"
+        },
+    );
     let mut ctx = LoadCtx {
         path,
         max_seq,
@@ -3543,7 +3557,14 @@ pub fn load_admitted_with_gemma4_drafter(
         }
     };
     if let Some(planned) = planned_route {
-        if let Err(error) = finish_route_kernels(planned, &result, ctx.gpu) {
+        let route_wait_started = std::time::Instant::now();
+        let finished = finish_route_kernels(planned, &result, ctx.gpu);
+        rdna_compute::load_phases::add(
+            "kernels.route_wait",
+            rdna_compute::load_phases::ns_since(route_wait_started),
+            0,
+        );
+        if let Err(error) = finished {
             return Err(match unload_model(result, ctx.gpu) {
                 Ok(()) => error,
                 Err(e) => format!("{error}; cleanup also failed: {e}"),

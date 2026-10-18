@@ -112,6 +112,19 @@ fn emit_error_no_id(stdout: &mut impl std::io::Write, message: impl std::fmt::Di
     emit_uncorrelated_error(stdout, None, &message.to_string(), "internal", false, false);
 }
 
+/// Print the per-phase load receipt (stderr, two lines) right before a
+/// `loaded` ACK. Measurement only; the ACK JSON is unchanged.
+fn emit_load_phases() {
+    eprintln!(
+        "hipfire load phases: {}",
+        rdna_compute::load_phases::summary_line()
+    );
+    eprintln!(
+        "hipfire.load_phases.v1 {}",
+        rdna_compute::load_phases::summary_json()
+    );
+}
+
 /// Retire the reader-side batch admission on every generate exit. Batch
 /// drivers clear entries themselves; the guard is a no-op in that case, while
 /// singleton/image/error paths cannot leave a reusable key stuck announced.
@@ -1267,6 +1280,7 @@ fn main() {
                 let _ = stdout.flush();
             }
             "load" => {
+                rdna_compute::load_phases::begin_load();
                 // `params.pp` > 1 is explicit; otherwise `topology.pp` decides.
                 // Resolve once, before the weight-host envelope, slot caps and
                 // every pp gate below read the request.
@@ -2234,6 +2248,7 @@ fn main() {
                             continue;
                         }
                     };
+                let open_admission_started = std::time::Instant::now();
                 let admission = match hipfire_loader::admission::admit_source_with_options(
                     path,
                     tp,
@@ -2271,6 +2286,11 @@ fn main() {
                         continue;
                     }
                 };
+                rdna_compute::load_phases::add(
+                    "open_admission",
+                    rdna_compute::load_phases::ns_since(open_admission_started),
+                    0,
+                );
                 // Only tp>1 EP loads defer prior retirement. Every single-device
                 // or pp load (Qwen4/Flash-Next included) is unload-first: after
                 // admission the prior model is torn down and VMM must be clean
@@ -2525,6 +2545,7 @@ fn main() {
                         if let Ok(secs_str) = developer_var("HIPFIRE_DPM_WARMUP_SECS") {
                             if let Ok(secs) = secs_str.parse::<f32>() {
                                 if secs > 0.0 {
+                                    let _dpm_warmup = rdna_compute::load_phases::span("dpm_warmup");
                                     if let Err(e) = gpu.dpm_warmup(secs) {
                                         eprintln!("[daemon] dpm_warmup failed (non-fatal): {e:?}");
                                     }
@@ -2690,6 +2711,7 @@ fn main() {
                         });
                         // Load ack reports effective storage, not only the request.
                         if staged_ep_batch {
+                            emit_load_phases();
                             let _ = writeln!(
                                 stdout,
                                 r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"pp":{},"audio":{},"video":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"reasoning_effort_probe_error":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32","kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
@@ -2761,6 +2783,7 @@ fn main() {
                                 staging.row_budget,
                                 &gpu,
                             );
+                            emit_load_phases();
                             let _ = writeln!(stdout, "{ack}");
                         }
                         // ── PFlash drafter load (Phase 4.0) ──────────────

@@ -6794,7 +6794,14 @@ impl Gpu {
     /// but the bytes are copied on the CPU through the host pointer and the pad
     /// is zeroed. Qwen4 host-mapped routed experts load through this path.
     pub fn upload_raw_host_mapped(&mut self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
+        let alloc_started = std::time::Instant::now();
         let tensor = self.alloc_host_mapped_tensor(data.len(), shape, DType::Raw)?;
+        crate::load_phases::add(
+            "weights.host_alloc",
+            crate::load_phases::ns_since(alloc_started),
+            (data.len() + HOST_TAIL_PAD_BYTES) as u64,
+        );
+        let copy_started = std::time::Instant::now();
         let host_ptr = self.host_mapped[&(tensor.buf.as_ptr() as usize)] as *mut u8;
         // SAFETY: `alloc_host_mapped_tensor` registered `host_ptr` as a live
         // allocation of `data.len() + HOST_TAIL_PAD_BYTES` bytes that nothing
@@ -6803,6 +6810,11 @@ impl Gpu {
             std::ptr::copy_nonoverlapping(data.as_ptr(), host_ptr, data.len());
             std::ptr::write_bytes(host_ptr.add(data.len()), 0, HOST_TAIL_PAD_BYTES);
         }
+        crate::load_phases::add(
+            "weights.host_copy",
+            crate::load_phases::ns_since(copy_started),
+            data.len() as u64,
+        );
         Ok(tensor)
     }
 

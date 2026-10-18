@@ -462,6 +462,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         return Err("qwen35: directory source unsupported".into());
     };
 
+    let config_placement_started = std::time::Instant::now();
     let config = <Qwen35 as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
 
     // ── CPU-only parse + compatibility (zero GPU allocation) ─────────
@@ -473,6 +474,11 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     let dn_quant = parse_state_quant(ctx.state_quant_override)?;
     eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
     warn_tiny_model_state(&hfq, dn_quant);
+    rdna_compute::load_phases::add(
+        "qwen35_config_placement",
+        rdna_compute::load_phases::ns_since(config_placement_started),
+        0,
+    );
 
     // ── Weights (first GPU ownership): private upload, or import from the
     //    weight host when HIPFIRE_WEIGHT_HOST=1. No private-load fallback
@@ -595,6 +601,14 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     eprintln!(
         "QWEN35_LOAD_PHASES route={route} weights_ms={weights_ms:.3} kv_ms={kv_ms:.3} dn_ms={dn_ms:.3} scratch_ms={scratch_ms:.3}"
     );
+    for (name, ms) in [
+        ("qwen35_weights", weights_ms),
+        ("qwen35_kv", kv_ms),
+        ("qwen35_deltanet", dn_ms),
+        ("qwen35_scratch", scratch_ms),
+    ] {
+        rdna_compute::load_phases::add(name, (ms * 1e6) as u64, 0);
+    }
 
     Ok(Qwen35Bundle {
         config,

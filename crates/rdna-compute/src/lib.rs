@@ -51,6 +51,7 @@ pub mod kv_slots;
 pub mod lane_fa;
 pub mod lane_gdn;
 pub mod lane_rows_pm;
+pub mod load_phases;
 mod loaded_code_check;
 pub mod moe;
 pub mod slab_admission;
