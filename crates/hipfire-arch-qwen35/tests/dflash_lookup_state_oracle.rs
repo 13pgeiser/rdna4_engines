@@ -1768,3 +1768,128 @@ fn lookup_law_exact_binomial_helper() {
     let p1 = 100.0 * 0.01 * 0.99f64.powi(99);
     assert!((binomial_two_sided(100, 0, 0.01) - (1.0 - p1)).abs() < 1e-9);
 }
+
+// ── window-boundary carry-over diagnostic ───────────────────────────────
+
+/// Greedy windows from a fresh prefill. `at` = (window index, step) replaces
+/// that one window; every other window is the incumbent. Stops once
+/// `min_tokens` are emitted or EOS. Returns the cursor.
+fn boundary_arm(rig: &mut Rig, at: Option<(usize, Step)>, min_tokens: usize) -> R<Cursor> {
+    let first = rig.fresh_prefill()?;
+    let mut cur = Cursor {
+        pos: rig.prompt.len(),
+        seed: first,
+        rng: 0x1D2C_3B4A_5968_7786 | 1,
+        emitted: vec![first],
+    };
+    let mut at = at;
+    let mut w = 0usize;
+    while cur.emitted.len() < min_tokens && !cur.emitted.contains(&rig.eos) && w < 64 {
+        let mut step = match at.take() {
+            Some((i, s)) if i == w => s,
+            other => {
+                at = other;
+                Step::none()
+            }
+        };
+        step_once(rig, &mut cur, GREEDY, &mut step)?;
+        w += 1;
+    }
+    Ok(cur)
+}
+
+/// Diagnostic for cross-window state carry-over, no product claim by itself:
+/// A = incumbent windows; B = the same, but window `w` clamped (`max_accept`,
+/// the incumbent max_emit path) to commit `m - 2` instead of `m`; C = window
+/// `w` is a Copy window whose candidate `m - 2` is wrong, so it commits the
+/// same tokens at the same boundary as B. Greedy streams must agree. Reports
+/// whether the committed KV [0, P) of A and B agree (window-boundary
+/// dependence of the incumbent dense verifier), and ASSERTS that B and C agree
+/// on every captured state part (a lookup window leaves exactly the state an
+/// incumbent window with the same boundary leaves).
+#[test]
+#[ignore = "requires real HIP GPU + HIPFIRE_TEST_TARGET (27B dense) + HIPFIRE_TEST_DRAFT (paired DFlash2)"]
+fn dflash_window_boundary_carryover() {
+    let Some(mut rig) = Rig::open().expect("open rig") else {
+        return;
+    };
+    let rf = reference_run(&mut rig).expect("reference run");
+    let Some(w) = rf
+        .wins
+        .iter()
+        .position(|r| r.accepted >= 4 && rf.all.len() >= r.seed_idx + 1 + 15)
+    else {
+        println!("WINDOW_BOUNDARY_CARRYOVER SKIPPED: no reference window with accepted >= 4 and 15 continuation tokens");
+        panic!("no usable reference window");
+    };
+    let m = rf.wins[w].accepted;
+    let cont = rf.cont(w).to_vec();
+    let min_tokens = rf.all.len().min(100);
+
+    let a = boundary_arm(&mut rig, None, min_tokens).expect("arm A");
+    let pa = a.pos;
+
+    let mut clamp = Step::none();
+    clamp.max_accept = Some(m - 2);
+    let b = boundary_arm(&mut rig, Some((w, clamp)), min_tokens).expect("arm B");
+    let pb = b.pos;
+    let b_at_pb = capture(&rig, None, pb, 0).expect("capture B");
+
+    let mut copy_tokens = cont[..15.min(cont.len())].to_vec();
+    copy_tokens[m - 2] = wrong(copy_tokens[m - 2], rig.vocab);
+    let c = boundary_arm(
+        &mut rig,
+        Some((w, Step::copy(copy_tokens, None))),
+        min_tokens,
+    )
+    .expect("arm C");
+    let pc = c.pos;
+    let c_at_pc = capture(&rig, None, pc, 0).expect("capture C");
+
+    let n = a.emitted.len().min(b.emitted.len()).min(c.emitted.len());
+    let streams_equal = a.emitted[..n] == b.emitted[..n] && b.emitted[..n] == c.emitted[..n];
+    // KV [0, P) of A vs B at the common committed prefix: recapture A by
+    // re-running it (state is only readable at the arm's end).
+    let p = pa.min(pb);
+    let a2 = boundary_arm(&mut rig, None, min_tokens).expect("arm A again");
+    assert_eq!(a2.emitted, a.emitted, "arm A is not deterministic");
+    let a_at_p = capture(&rig, None, p, 0).expect("capture A at P");
+    let b2 = boundary_arm(
+        &mut rig,
+        Some((w, {
+            let mut s = Step::none();
+            s.max_accept = Some(m - 2);
+            s
+        })),
+        min_tokens,
+    )
+    .expect("arm B again");
+    assert_eq!(b2.emitted, b.emitted, "arm B is not deterministic");
+    let b_at_p = capture(&rig, None, p, 0).expect("capture B at P");
+    let kv = |r: &Rec| {
+        r.parts
+            .iter()
+            .find(|(k, _)| *k == "kv")
+            .map(|(_, v)| v.clone())
+    };
+    let kv_a_b_equal = kv(&a_at_p) == kv(&b_at_p);
+
+    let b_vs_c = pb == pc && b.emitted == c.emitted && b_at_pb.parts == c_at_pc.parts;
+    println!(
+        "WINDOW_BOUNDARY_CARRYOVER window={w} m={m} streams_equal={streams_equal} \
+         kv_incumbent_boundary_shift_equal={kv_a_b_equal} (P={p}) lookup_vs_clamped_incumbent_equal={b_vs_c}"
+    );
+    if !b_vs_c {
+        for ((k, x), (_, y)) in b_at_pb.parts.iter().zip(&c_at_pc.parts) {
+            println!(
+                "    {k}: B={x} C={y} {}",
+                if x == y { "same" } else { "DIFF" }
+            );
+        }
+    }
+    assert!(streams_equal, "greedy streams differ across arms");
+    assert!(
+        b_vs_c,
+        "Copy window left different state than the clamped incumbent window with the same boundary"
+    );
+}
