@@ -87,24 +87,30 @@ fi
 # never signalled, no driver timeout). Once one is verified, drop this block and the
 # PRELOAD line below it.
 #
-# MECHANICS: vmemoff.so is gitignored (only the source is tracked); if missing it
-# is rebuilt from vmemoff.c inside the radiance-build image. local/radiance-vmemoff is
-# derived from local/radiance with the shim at /opt/vmemoff.so, only while it is missing,
-# so it survives docker system prune -a.
+# MECHANICS: vmemoff.so is gitignored (only the source is tracked); if missing it is
+# rebuilt from vmemoff.c with host gcc (self-contained source), falling back to a build
+# inside the radiance-build image. local/radiance-vmemoff is derived from local/radiance
+# with the shim at /opt/vmemoff.so, only while it is missing, so it survives docker
+# system prune -a.
 VMEMOFF="${VMEMOFF:-1}"
 if [ "$VMEMOFF" = 1 ]; then
     shim="$CURDIR/radiance-vmemoff/vmemoff.so"
-    if [ ! -e "$shim" ] && docker image inspect radiance-build >/dev/null 2>&1; then
-        docker rm -f vmemoff_build >/dev/null 2>&1
-        docker create --name vmemoff_build radiance-build sleep 60 >/dev/null
-        docker cp "$CURDIR/radiance-vmemoff/vmemoff.c" vmemoff_build:/tmp/vmemoff.c
-        docker start vmemoff_build >/dev/null
-        docker exec vmemoff_build gcc -shared -fPIC -O2 -o /tmp/vmemoff.so /tmp/vmemoff.c -I/opt/rocm/include \
-            || { docker rm -f vmemoff_build >/dev/null; exit 1; }
-        docker cp vmemoff_build:/tmp/vmemoff.so "$shim" || exit 1
-        docker rm -f vmemoff_build >/dev/null
+    if [ ! -e "$shim" ]; then
+        if command -v gcc >/dev/null 2>&1; then
+            # vmemoff.c is self-contained (no ROCm headers): plain host gcc suffices.
+            gcc -shared -fPIC -O2 -o "$shim" "$CURDIR/radiance-vmemoff/vmemoff.c" -ldl
+        elif docker image inspect radiance-build >/dev/null 2>&1; then
+            docker rm -f vmemoff_build >/dev/null 2>&1
+            docker create --name vmemoff_build radiance-build sleep 60 >/dev/null
+            docker cp "$CURDIR/radiance-vmemoff/vmemoff.c" vmemoff_build:/tmp/vmemoff.c
+            docker start vmemoff_build >/dev/null
+            docker exec vmemoff_build gcc -shared -fPIC -O2 -o /tmp/vmemoff.so /tmp/vmemoff.c -I/opt/rocm/include \
+                || { docker rm -f vmemoff_build >/dev/null; exit 1; }
+            docker cp vmemoff_build:/tmp/vmemoff.so "$shim" || exit 1
+            docker rm -f vmemoff_build >/dev/null
+        fi
     fi
-    [ -e "$shim" ] || { echo "vmemoff shim missing: $shim (and no radiance-build image to rebuild it)" >&2; exit 1; }
+    [ -e "$shim" ] || { echo "vmemoff shim missing: $shim (no host gcc, no radiance-build image to rebuild it)" >&2; exit 1; }
     vmemoff_image="local/radiance-vmemoff"
     if ! docker image inspect "$vmemoff_image" >/dev/null 2>&1; then
         docker rm -f vmemoff_img >/dev/null 2>&1
@@ -130,7 +136,7 @@ docker run --name radiance_server --network host --init --ulimit memlock=-1 \
     --group-add "$(getent group render | cut -d: -f3)" \
     --group-add "$(getent group video | cut -d: -f3)" \
     -v "$MODEL_DIR":/models:ro \
-    -e RADIANCE_LOG=trace \
+    -e RADIANCE_LOG=info \
     "${PRELOAD[@]}" \
     "$IMAGE" --model /models/"$MODEL_FILE" \
     --host :: --port 9931 --tp 1 --max-num-seqs 1 --max-model-len 196608 --kv-cache-dtype fp8 -vv --debug-selection --debug-placement
