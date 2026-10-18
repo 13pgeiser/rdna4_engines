@@ -45,7 +45,8 @@ set(RAD_TESTS_WITH_LEGACY chatparse_test chatparse_gemma4_test)
 # relayout_parity_test checks each kernel library's relayout of libquant's planes against a
 # recorded hash of the stored bytes. libr4d's layout sources are host-only, so they are compiled in,
 # with -ffp-contract=off as libr4d uses, so scale conversions round identically.
-set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test)
+# r4d_ar_links_test checks libr4d's header-only link reader, so it needs only the include path.
+set(RAD_TESTS_WITH_R4D_HOST relayout_parity_test r4d_ar_links_test)
 
 # Chat templates (copied from the model repositories) and media samples, passed by absolute path so
 # test binaries can run from anywhere.

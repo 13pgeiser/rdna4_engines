@@ -21,6 +21,7 @@
 #include "r4d_args.h"
 #include "r4d.h"
 #include "r4d_ar_shards.h"
+#include "r4d_ar_links.h"
 
 #include <condition_variable>
 #include <cstdio>
@@ -71,10 +72,15 @@ struct Rendezvous {
     long flags  [R4D_MAX_RANKS] = { 0 };
     long seq    [R4D_MAX_RANKS] = { 0 };
     int  dev    [R4D_MAX_RANKS] = { 0 };
-    int  shard_w[R4D_MAX_RANKS][R4D_MAX_RANKS] = { { 0 } };
-    int  pieces [R4D_MAX_RANKS] = { 0 };
-    long long weights_min[R4D_MAX_RANKS] = { 0 };
-    long long pieces_min [R4D_MAX_RANKS] = { 0 };
+    /* What each rank read for the eight-rank two-shot: settings that must agree, and its own
+     * card's link, which the weights are derived from. */
+    struct Ar8Seen {
+        int       mode = 0;
+        int       w[R4D_MAX_RANKS] = { 0 };
+        int       pieces = 0;
+        long long weights_min = 0, pieces_min = 0;
+        R4DArLink link;
+    } ar8[R4D_MAX_RANKS];
     int  failed = 0;
 };
 
@@ -145,26 +151,35 @@ long long pgeti_hi(const RadParam* p, int n_p, const char* k, long long dflt) {
 long align16(long v) { return (v + 15) & ~15L; }
 
 /* RADIANCE_AR8_SHARD_WEIGHTS, read at every eight-rank build so a process can change it between
- * instances; each rank reads it and build() checks that they agree. */
-bool ar8_shard_weights(int* w) {
+ * instances: unset or "auto" derives the weights from the links, "off" keeps the shards even,
+ * eight integers set them. Anything else is "off", with one warning. */
+enum { AR8_EVEN = 0, AR8_SET = 1, AR8_AUTO = 2 };
+int ar8_weights_mode(int* w) {
     const char* e = std::getenv(R4D_AR8_SHARD_WEIGHTS_ENV);
-    if (!e || !*e) return false;
-    static std::once_flag said_bad, said_on;
-    int got[8];
-    if (!r4d_ar_shard_weights_parse(e, 8, got)) {
-        std::call_once(said_bad, [e] {
-            std::fprintf(stderr, "[r4d] %s=\"%s\" ignored (needs eight non-negative integers, "
-                         "comma-separated, sum > 0); eight-rank two-shot shards stay even\n",
-                         R4D_AR8_SHARD_WEIGHTS_ENV, e);
-        });
-        return false;
-    }
-    std::memcpy(w, got, sizeof(got));
-    std::call_once(said_on, [w] {
-        std::fprintf(stderr, "[r4d] eight-rank two-shot shards weighted %d,%d,%d,%d,%d,%d,%d,%d\n",
-                     w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+    if (!e || !*e || !std::strcmp(e, "auto")) return AR8_AUTO;
+    if (!std::strcmp(e, "off")) return AR8_EVEN;
+    if (r4d_ar_shard_weights_parse(e, 8, w)) return AR8_SET;
+    static std::once_flag said;
+    std::call_once(said, [e] {
+        std::fprintf(stderr, "[r4d] %s=\"%s\" ignored (needs auto, off or eight non-negative "
+                     "integers, comma-separated, sum > 0); eight-rank two-shot shards stay even\n",
+                     R4D_AR8_SHARD_WEIGHTS_ENV, e);
     });
-    return true;
+    return AR8_EVEN;
+}
+
+/* This rank's card's slowest PCIe hop, from sysfs by the runtime's bus id. */
+bool ar8_own_link(R4DArLink* l) {
+    int dev = 0;
+    char bus[64] = { 0 };
+    if (hipGetDevice(&dev) != hipSuccess ||
+        hipDeviceGetPCIBusId(bus, (int)sizeof bus, dev) != hipSuccess)
+        return false;
+    unsigned dom = 0, b = 0, d = 0, f = 0;
+    if (std::sscanf(bus, "%x:%x:%x.%x", &dom, &b, &d, &f) != 4) return false;
+    char bdf[32];
+    std::snprintf(bdf, sizeof bdf, "%04x:%02x:%02x.%x", dom, b, d, f);
+    return r4d_ar_link_bottleneck("", bdf, l);
 }
 
 /* RADIANCE_AR8_PIECES and the two size floors, read like the weights. */
@@ -210,6 +225,84 @@ long long ar8_pieces_for(const ArInst* in, long numel, long long asked) {
     return asked > 0 ? asked : r4d_ar8_auto_pieces(numel);
 }
 
+/* The eight-rank two-shot's settings, agreed before anything is sized: each rank publishes what
+ * it read and its own card's link, and after one barrier every rank derives the same weights from
+ * the same eight entries. Settings that differ between ranks would cut the message at different
+ * words or take different handshake steps; all ranks compare the same entries, so all refuse
+ * together. */
+int ar8_settle(ArInst* in, int rank, int world) {
+    static std::once_flag said_w, said_p, said_links, said_unknown, said_set;
+    Rendezvous::Ar8Seen me;
+    me.mode = ar8_weights_mode(me.w);
+    me.pieces = ar8_pieces();
+    me.weights_min = ar8_min_elems(R4D_AR8_SHARD_WEIGHTS_MIN_ENV, &said_w);
+    me.pieces_min = ar8_min_elems(R4D_AR8_PIECES_MIN_ENV, &said_p);
+    if (me.mode == AR8_AUTO && !ar8_own_link(&me.link)) me.link = R4DArLink();
+    {
+        std::lock_guard<std::mutex> lk(g_rv.m);
+        g_rv.ar8[rank] = me;
+    }
+    const int rc = rv_barrier(world);
+    if (rc != RAD_OK) return rc;
+
+    const Rendezvous::Ar8Seen* all = g_rv.ar8;
+    for (int r = 0; r < world; ++r)
+        if (all[r].mode != me.mode || std::memcmp(all[r].w, me.w, sizeof(me.w)) ||
+            all[r].pieces != me.pieces || all[r].weights_min != me.weights_min ||
+            all[r].pieces_min != me.pieces_min) {
+            std::fprintf(stderr, "[r4d] ranks %d and %d read different eight-rank two-shot "
+                         "settings (%s, %s and their _MIN_ELEMS)\n", rank, r,
+                         R4D_AR8_SHARD_WEIGHTS_ENV, R4D_AR8_PIECES_ENV);
+            return RAD_E_STATE;
+        }
+    in->pieces = me.pieces;
+    in->weights_min = me.weights_min;
+    in->pieces_min = me.pieces_min;
+
+    int w[R4D_MAX_RANKS] = { 0 };
+    if (me.mode == AR8_SET) {
+        std::memcpy(w, me.w, sizeof(w));
+        std::call_once(said_set, [&w] {
+            std::fprintf(stderr, "[r4d] eight-rank two-shot shards weighted "
+                         "%d,%d,%d,%d,%d,%d,%d,%d (%s)\n", w[0], w[1], w[2], w[3], w[4], w[5],
+                         w[6], w[7], R4D_AR8_SHARD_WEIGHTS_ENV);
+        });
+    } else if (me.mode == AR8_AUTO) {
+        double gbs[R4D_MAX_RANKS] = { 0 };
+        for (int r = 0; r < world; ++r) gbs[r] = r4d_ar_link_gbs(all[r].link);
+        if (!r4d_ar_weights_from_rates(gbs, world, w)) {
+            std::call_once(said_unknown, [all, world] {
+                std::string who;
+                for (int r = 0; r < world; ++r)
+                    if (r4d_ar_link_gbs(all[r].link) <= 0.0) who += " " + std::to_string(r);
+                std::fprintf(stderr, "[r4d] eight-rank two-shot: no PCIe link speed in sysfs for "
+                             "rank%s; shards stay even\n", who.c_str());
+            });
+            return RAD_OK;
+        }
+        std::call_once(said_links, [all, world, &w] {
+            std::string l;
+            for (int r = 0; r < world; ++r) {
+                char one[96];
+                std::snprintf(one, sizeof one, "%s r%d %.1f GT/s x%d %.1f GB/s w%d",
+                              r ? "," : "", r, all[r].link.gts, all[r].link.width,
+                              r4d_ar_link_gbs(all[r].link), w[r]);
+                l += one;
+            }
+            std::fprintf(stderr, "[r4d] eight-rank two-shot shard weights from the slowest PCIe "
+                         "hop of each card:%s\n", l.c_str());
+        });
+        bool same = true;
+        for (int r = 1; r < world; ++r) same = same && w[r] == w[0];
+        if (same) return RAD_OK;   /* equal links: the even split, on the unweighted path */
+    } else {
+        return RAD_OK;
+    }
+    in->shard_weighted = 1;
+    std::memcpy(in->shard_w, w, sizeof(in->shard_w));
+    return RAD_OK;
+}
+
 /* Sequence counter allocation in words: 2 * nbw (r4d_ar_seq.h), then r4d_ar_link_landed's block
  * counter, padded to a cache line. */
 long kSeqWords(long nbw) { return 2L * nbw + 32; }
@@ -239,13 +332,10 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
     in->slot_bytes = align16((long)max_numel * in->esize);
     in->slot16 = in->slot_bytes / 16;
     if (world == 8) {
-        static std::once_flag said_w, said_p;
-        in->pieces = ar8_pieces();
-        in->weights_min = ar8_min_elems(R4D_AR8_SHARD_WEIGHTS_MIN_ENV, &said_w);
-        in->pieces_min = ar8_min_elems(R4D_AR8_PIECES_MIN_ENV, &said_p);
+        const int rc8 = ar8_settle(in, rank, world);
+        if (rc8 != RAD_OK) return rc8;
     }
-    if (world == 8 && ar8_shard_weights(in->shard_w)) {
-        in->shard_weighted = 1;
+    if (in->shard_weighted) {
         const long need16 =
             2 * r4d_ar_shard_max_bound((long)max_numel * in->esize / 16, 8, in->shard_w);
         /* Sized only if some message this instance carries is weighted. */
@@ -324,28 +414,9 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
         g_rv.flags[rank]   = fl;
         g_rv.seq[rank]     = sq;
         g_rv.dev[rank]     = dev;
-        for (int i = 0; i < R4D_MAX_RANKS; ++i)
-            g_rv.shard_w[rank][i] = in->shard_weighted ? in->shard_w[i] : -1;
-        g_rv.pieces[rank] = in->pieces;
-        g_rv.weights_min[rank] = in->weights_min;
-        g_rv.pieces_min[rank] = in->pieces_min;
     }
     int rc = rv_barrier(world);
     if (rc != RAD_OK) return rc;
-
-    /* Every rank must cut the message at the same words, or an owner reduces words its peers
-     * pushed elsewhere, and take the same handshake steps, or the flags drift apart. All ranks
-     * compare the same values, so all refuse together. */
-    for (int r = 0; r < world; ++r)
-        if (std::memcmp(g_rv.shard_w[r], g_rv.shard_w[rank], sizeof(g_rv.shard_w[rank])) ||
-            g_rv.pieces[r] != g_rv.pieces[rank] ||
-            g_rv.weights_min[r] != g_rv.weights_min[rank] ||
-            g_rv.pieces_min[r] != g_rv.pieces_min[rank]) {
-            std::fprintf(stderr, "[r4d] ranks %d and %d read different eight-rank two-shot "
-                         "settings (%s, %s and their _MIN_ELEMS)\n", rank, r,
-                         R4D_AR8_SHARD_WEIGHTS_ENV, R4D_AR8_PIECES_ENV);
-            return RAD_E_STATE;
-        }
 
     /* Peer access is per context, so each rank enables its own, after the publish barrier where
      * peer device ordinals are known. A host can expose more HIP devices than ranks (e.g. an

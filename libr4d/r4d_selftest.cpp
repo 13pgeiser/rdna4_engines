@@ -36,6 +36,7 @@
 #include "rad_plugin.h"
 #include "r4d_args.h"
 #include "r4d_ar_shards.h"
+#include "r4d_ar_links.h"
 #include "r4d_hc_fp8.h"
 #include "r4d_fp8_frag.h"
 #include "r4d_fp8_lm.h"
@@ -16375,7 +16376,7 @@ static void ar_wide_pattern(const Plugin& pl, const std::vector<int>& devs, cons
      * weights whatever the environment. 40 bf16 elements are 5 words (5 % 4 != 0), 72 are 9
      * (9 % 8 != 0). */
     if (world >= 4 && std::strstr(name, "twoshot")) {
-        ScopedEnv even(R4D_AR8_SHARD_WEIGHTS_ENV, nullptr);
+        ScopedEnv even(R4D_AR8_SHARD_WEIGHTS_ENV, "off");
         const int64_t odd = world == 4 ? 40 : 72;
         const std::string w = std::to_string(world);
         std::vector<ArPattern> t((size_t)world);
@@ -16432,7 +16433,7 @@ static void ar_wide_weighted(const Plugin& pl, const std::vector<int>& devs, con
         for (const char* k : { "1", "2", "4" }) {
             ScopedEnv env_k(R4D_AR8_PIECES_ENV, k);
             for (const char* w : { "", "0,3,1,0,5,1,2,4", "1,0,0,0,0,0,0,0", "4,1,0,4,0,1,4,4" }) {
-                ScopedEnv env_w(R4D_AR8_SHARD_WEIGHTS_ENV, *w ? w : nullptr);
+                ScopedEnv env_w(R4D_AR8_SHARD_WEIGHTS_ENV, *w ? w : "off");
                 const std::string label =
                     std::string(name) + " pieces " + k +
                     (*w ? std::string(" weights ") + w : std::string(" even"));
@@ -16450,6 +16451,17 @@ static void ar_wide_weighted(const Plugin& pl, const std::vector<int>& devs, con
                              std::string(name) + " weights 4,1,0,4,0,1,4,4, pieces per launch", W,
                              mixed);
         }
+    }
+    /* The weights from this box's links ("auto", the default) and switched off, at the default
+     * floors and piece rule: what the engine runs without settings. Bits only, since what auto
+     * derives depends on the box (the startup line names it). */
+    for (const char* mode : { "auto", "off" }) {
+        ScopedEnv env_w(R4D_AR8_SHARD_WEIGHTS_ENV, mode);
+        ScopedEnv env_k(R4D_AR8_PIECES_ENV, nullptr);
+        ScopedEnv floor_w(R4D_AR8_SHARD_WEIGHTS_MIN_ENV, nullptr);
+        ScopedEnv floor_k(R4D_AR8_PIECES_MIN_ENV, nullptr);
+        const ArPatternRun run = { "bf16", { 4194304, 524288, 8256, 8388608, 196608 }, 1 };
+        if (!ar_pattern_check(row, devs, std::string(name) + " weights " + mode, W, run)) return;
     }
     /* The floors at their defaults (R4D_AR8_MIN_ELEMS_DEFAULT elements) with weights, first at the
      * size rule's piece counts (131072 runs one piece, 262144 two, 1048576 four, 4194304 eight),
@@ -16672,6 +16684,39 @@ static void ar8_perf_worker(Ar8Perf* t) {
     for (void* p : { in, out, csrc, cdst }) if (p) st_free(p);
 }
 
+/* The eight-rank two-shot's weights as the plugin derives them at init (r4d_ar_entry.hip,
+ * ar8_settle): RADIANCE_AR8_SHARD_WEIGHTS unset or "auto" from each rank's slowest PCIe hop, "off"
+ * or anything invalid even, eight integers as given; equal derived weights are the even split.
+ * `how` names the source and, for "auto", every rank's link. */
+static bool ar8_weights_as_plugin(const std::vector<int>& devs, int* w, std::string* how) {
+    const char* e = std::getenv(R4D_AR8_SHARD_WEIGHTS_ENV);
+    if (e && *e && std::strcmp(e, "auto")) {
+        if (!std::strcmp(e, "off")) { *how = " (off)"; return false; }
+        if (r4d_ar_shard_weights_parse(e, 8, w)) { *how = " (set)"; return true; }
+        *how = fmt(" (%s=\"%s\" is invalid)", R4D_AR8_SHARD_WEIGHTS_ENV, e);
+        return false;
+    }
+    double gbs[8] = { 0 };
+    std::string links;
+    for (int r = 0; r < 8 && r < (int)devs.size(); ++r) {
+        char bus[64] = { 0 };
+        unsigned dom = 0, b = 0, d = 0, f = 0;
+        R4DArLink l;
+        if (hipDeviceGetPCIBusId(bus, (int)sizeof bus, devs[(size_t)r]) == hipSuccess &&
+            std::sscanf(bus, "%x:%x:%x.%x", &dom, &b, &d, &f) == 4)
+            r4d_ar_link_bottleneck("", fmt("%04x:%02x:%02x.%x", dom, b, d, f), &l);
+        gbs[r] = r4d_ar_link_gbs(l);
+        links += fmt("%s r%d %.1f GT/s x%d", r ? "," : "", r, l.gts, l.width);
+    }
+    if (!r4d_ar_weights_from_rates(gbs, 8, w)) {
+        *how = " (auto: a link is unreadable;" + links + ")";
+        return false;
+    }
+    *how = " (auto:" + links + ")";
+    for (int r = 1; r < 8; ++r) if (w[r] != w[0]) return true;
+    return false;
+}
+
 static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dtype) {
     constexpr int W = 8;
     if (iters <= 0) iters = 200;
@@ -16717,17 +16762,16 @@ static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dty
                 g_cold > 0 ? fmt("cold (%lld MiB read before each; last arriver / with skew, "
                                  "medians)", (long long)(g_cold >> 20)).c_str()
                            : "warm (back to back, period over the span, slowest rank)");
-    /* The plugin reads the same variable through the same parser at init, so this is the table
-     * the two-shot runs. */
+    /* The plugin reads the same variable and the same sysfs files through the same functions at
+     * init, so this is the table the two-shot runs. */
     int wts[W];
-    const char* wenv = std::getenv(R4D_AR8_SHARD_WEIGHTS_ENV);
-    const bool weighted = wenv && *wenv && r4d_ar_shard_weights_parse(wenv, W, wts);
-    std::printf("two-shot shard weights: %s\n",
+    std::string how;
+    const bool weighted = ar8_weights_as_plugin(devs, wts, &how);
+    std::printf("two-shot shard weights: %s%s\n",
                 weighted ? fmt("%d,%d,%d,%d,%d,%d,%d,%d", wts[0], wts[1], wts[2], wts[3], wts[4],
                                wts[5], wts[6], wts[7]).c_str()
-                : wenv && *wenv ? fmt("even (%s=\"%s\" is invalid)", R4D_AR8_SHARD_WEIGHTS_ENV,
-                                      wenv).c_str()
-                                : "even");
+                         : "even",
+                how.c_str());
     /* The floors as the plugin reads them; under them a message runs even and in one piece, the
      * `pieces` parameter included. */
     auto floor_of = [](const char* name) {
