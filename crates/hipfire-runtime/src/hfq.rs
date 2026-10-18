@@ -10,13 +10,12 @@ use crate::llama::{
 use crate::model_load::{load_weights as rt_load_weights, LoadedWeights, WeightSource};
 use crate::model_source::{
     capture_file_identity, read_file_exact_at, read_file_nowait_at, verify_path_identity,
-    ModelSource, SourceError,
-    SourceFileIdentity, SourceFormat, SourceIdentity, SourceRangeDescriptor, SourceRangeIdentity,
-    SourceReader, SourceReaderImpl,
+    ModelSource, SourceError, SourceFileIdentity, SourceFormat, SourceIdentity,
+    SourceRangeDescriptor, SourceRangeIdentity, SourceReader, SourceReaderImpl,
 };
+use crate::offload::LayerResidency;
 use crate::ple_hot_store::NowaitRead;
 use crate::ple_sidecar::PleRowsFile;
-use crate::offload::LayerResidency;
 use crate::weight_backend::{
     decode_raw_codec, flat_name_candidates, load_embedding, raw_codec, resolve_lm_head,
     reupload_f16_as_f32, upload_decoded_bytes, HfqBackend, MemoryTarget, WeightBackend,
@@ -4764,7 +4763,11 @@ mod positional_read_tests {
         assert!(err.is_none(), "EOF is a short total, not an error");
         assert_eq!(n, 8);
         assert_eq!(&out[..8], &[9u8; 8]);
-        assert_eq!(&out[8..], &[0xEEu8; 8], "bytes past EOF must not be written");
+        assert_eq!(
+            &out[8..],
+            &[0xEEu8; 8],
+            "bytes past EOF must not be written"
+        );
     }
 
     #[test]
@@ -4790,7 +4793,10 @@ mod positional_read_tests {
             &mut out,
         );
         assert_eq!(n, 2);
-        assert_eq!(err.expect("error surfaced").kind(), ErrorKind::PermissionDenied);
+        assert_eq!(
+            err.expect("error surfaced").kind(),
+            ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
@@ -4829,7 +4835,11 @@ mod positional_read_tests {
         assert_eq!(&b[..], &bytes[200..208]);
         assert_eq!(&a[..], &bytes[10..18]);
         let mut past = [0u8; 4];
-        assert_eq!(file_read_at(&file, &mut past, 256).unwrap(), 0, "EOF reads 0");
+        assert_eq!(
+            file_read_at(&file, &mut past, 256).unwrap(),
+            0,
+            "EOF reads 0"
+        );
     }
 
     /// Regression for #869: UMA loads `drop_mmap()` and then read every tensor
@@ -4853,11 +4863,19 @@ mod positional_read_tests {
             ],
         );
         let mut f = HfqFile::open(&path).unwrap();
-        assert!(f.tensor_data("embed.weight").is_some(), "mmap serves before the drop");
+        assert!(
+            f.tensor_data("embed.weight").is_some(),
+            "mmap serves before the drop"
+        );
         f.drop_mmap();
-        assert!(f.tensor_data("embed.weight").is_none(), "precondition: mmap dropped");
+        assert!(
+            f.tensor_data("embed.weight").is_none(),
+            "precondition: mmap dropped"
+        );
         {
-            let (info, data) = f.tensor_data_pread("embed.weight").expect("pread after drop");
+            let (info, data) = f
+                .tensor_data_pread("embed.weight")
+                .expect("pread after drop");
             assert_eq!(info.data_size, first.len());
             assert_eq!(&data[..], &first[..]);
         }
@@ -4865,7 +4883,9 @@ mod positional_read_tests {
             let (_, data) = f.tensor_data_pread("norm.weight").expect("second tensor");
             assert_eq!(&data[..], &second[..], "offset of the second tensor");
         }
-        let (_, v) = f.tensor_data_vec("norm.weight").expect("vec after drop_mmap");
+        let (_, v) = f
+            .tensor_data_vec("norm.weight")
+            .expect("vec after drop_mmap");
         assert_eq!(v, second);
         assert!(f.tensor_data_pread("absent.weight").is_none());
     }
@@ -4970,9 +4990,7 @@ mod mq_i4_header_tests {
         let (m, k) = shape_for(profile);
         let levels = usize::from(profile.codec.levels()) + 1;
         let codes: Vec<u8> = (0..m * k).map(|i| ((i * 5 + 1) % levels) as u8).collect();
-        let scales: Vec<u16> = (0..m * (k / GROUP))
-            .map(|g| 0x3C00 + g as u16)
-            .collect();
+        let scales: Vec<u16> = (0..m * (k / GROUP)).map(|g| 0x3C00 + g as u16).collect();
         let bytes = encode_tensor(profile, m, k, &codes, &scales).unwrap();
         (codes, scales, bytes)
     }

@@ -4719,9 +4719,7 @@ pub fn mtp_effective_mode_name(raw: &str, measured_ar_floor: bool) -> &'static s
 /// The shared log line for an `auto` MTP that a producer without a measured AR
 /// floor declines, worded once for every route (sequential, slots, daemon).
 pub fn mtp_no_floor_decline_line(model: &str) -> String {
-    format!(
-        "  {model} MTP: off by default (no measured AR floor); opt in with --spec mtp"
-    )
+    format!("  {model} MTP: off by default (no measured AR floor); opt in with --spec mtp")
 }
 
 /// One MTP-over-host-spill verdict, shared by the qwen35 and qwen4 arming
@@ -7102,7 +7100,10 @@ mod tests {
         // (mode, producer declared a measured AR floor) -> admitted.
         for floor in [false, true] {
             assert!(!mtp_mode_admits(MtpMode::Off, floor), "off never admits");
-            assert!(mtp_mode_admits(MtpMode::On, floor), "explicit on always admits");
+            assert!(
+                mtp_mode_admits(MtpMode::On, floor),
+                "explicit on always admits"
+            );
         }
         assert!(
             !mtp_mode_admits(MtpMode::Auto, false),
@@ -7137,7 +7138,10 @@ mod tests {
                 let effective = mtp_effective_mode(mode, floor);
                 // The effective mode admits exactly what the gate admits.
                 assert_eq!(effective != MtpMode::Off, mtp_mode_admits(mode, floor));
-                assert_eq!(mtp_effective_mode_name(mode.name(), floor), effective.name());
+                assert_eq!(
+                    mtp_effective_mode_name(mode.name(), floor),
+                    effective.name()
+                );
             }
         }
         assert_eq!(mtp_effective_mode(MtpMode::Auto, false), MtpMode::Off);
@@ -7151,7 +7155,8 @@ mod tests {
         // admitted mode. Auto + floor + fully resident arms; auto + floor +
         // spill on a non-admitted arch declines; explicit on arms over both.
         let arms = |mode: MtpMode, floor: bool, blobs: usize, arch: &str, admitted: &[&str]| {
-            mtp_mode_admits(mode, floor) && mtp_host_spill_policy(mode, blobs, arch, admitted).attach
+            mtp_mode_admits(mode, floor)
+                && mtp_host_spill_policy(mode, blobs, arch, admitted).attach
         };
         assert!(arms(MtpMode::Auto, true, 0, "gfx1100", &[]));
         assert!(!arms(MtpMode::Auto, true, 8, "gfx1100", &[]));
