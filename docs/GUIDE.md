@@ -3085,6 +3085,7 @@ reductions running on fewer blocks: Qwen3.8-27B's 41k-token prefill 9.5 s uncapp
 | `RADIANCE_CALIB_TOKENS` | with `RADIANCE_CALIB_DIR`, the tokens the calibration tap accumulates before it writes and switches itself off (default 65536) |
 | `RADIANCE_G3_CALIB_LAYERS` | `lo:hi`: `arch/gemma3`'s calibration tap over layers lo to hi - 1 only, to take a large model's Grams in passes (docs/ARCHITECTURES.md) |
 | `RADIANCE_PROFILE_EVERY` | with `--profile-ops`, dump the per-op table every N steps (default 32) |
+| `RADIANCE_AR_FENCE_FROM` | four-rank all-reduces of at least this many elements take a full fence before their flag (default 131072: prefill chunks, never decode or verify); cures a rare fresh-start divergence on the 31B at tp 4; `0` turns it off |
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
 | `RADIANCE_GEMMA4_OVERLAP` | the Gemma 4 31B's prefill overlap (`arch/gemma4_bf16`, two or more ranks, fused junctions, the exact all-reduce wire): a prefill step of 1024 rows or more runs as two slices, each slice's all-reduces on a second stream beside the other's compute. On by default; `0` turns it off and runs every step whole (the startup notes say which) |
 | `RADIANCE_AR8_SHARD_WEIGHTS`, `RADIANCE_AR8_PIECES` | the eight-rank two-shot's shard weights (`auto`, the default, reads the PCIe links; `off`; or eight integers) and piece count, with `RADIANCE_AR8_SHARD_WEIGHTS_MIN_ELEMS` and `RADIANCE_AR8_PIECES_MIN_ELEMS` for the message size each starts at (§4.7) |
