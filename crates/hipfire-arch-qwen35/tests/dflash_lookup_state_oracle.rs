@@ -1395,6 +1395,31 @@ fn chi_square(counts: &HashMap<u32, usize>, law: &[f64]) -> Chi {
     }
 }
 
+/// Two-sided exact binomial p-value of `k` successes in `n` trials at rate
+/// `p`: the summed probability of every outcome no more likely than `k`.
+fn binomial_two_sided(n: usize, k: usize, p: f64) -> f64 {
+    if p <= 0.0 {
+        return if k == 0 { 1.0 } else { 0.0 };
+    }
+    if p >= 1.0 {
+        return if k == n { 1.0 } else { 0.0 };
+    }
+    let nf = n as f64;
+    let ln_pmf = |i: usize| {
+        let i_f = i as f64;
+        ln_gamma(nf + 1.0) - ln_gamma(i_f + 1.0) - ln_gamma(nf - i_f + 1.0)
+            + i_f * p.ln()
+            + (nf - i_f) * (1.0 - p).ln()
+    };
+    let at_k = ln_pmf(k);
+    let total: f64 = (0..=n)
+        .map(ln_pmf)
+        .filter(|&l| l <= at_k + 1e-9)
+        .map(f64::exp)
+        .sum();
+    total.min(1.0)
+}
+
 struct Trial {
     accepted: usize,
     committed: Vec<u32>,
@@ -1415,12 +1440,40 @@ fn test_position(
         *counts.entry(t.committed[j + 1]).or_default() += 1;
     }
     let chi = chi_square(&counts, law);
-    if chi.n < MIN_TRIALS || chi.bins < 2 {
-        println!(
-            "{label} pos {j}: n={} (< {MIN_TRIALS} or < 2 bins): not tested",
-            chi.n
-        );
+    if chi.n < MIN_TRIALS {
+        println!("{label} pos {j}: n={} (< {MIN_TRIALS}): not tested", chi.n);
         return (true, false);
+    }
+    if chi.bins < 2 {
+        // The truncated law leaves one chi-square bin. Test it exactly
+        // instead: a single-token support means every draw must be that
+        // token (support violations are the whole test); a wider support
+        // whose tail pools into the one bin gets a two-sided exact binomial
+        // test of the off-mode count against its law mass.
+        let support = law.iter().filter(|&&p| p > 0.0).count();
+        let (mode, p_mode) =
+            law.iter().enumerate().fold(
+                (0usize, 0.0f64),
+                |m, (i, &p)| if p > m.1 { (i, p) } else { m },
+            );
+        let off = chi.n - counts.get(&(mode as u32)).copied().unwrap_or(0);
+        let p_value = if support <= 1 {
+            if off == 0 {
+                1.0
+            } else {
+                0.0
+            }
+        } else {
+            binomial_two_sided(chi.n, off, 1.0 - p_mode)
+        };
+        let ok = chi.violations == 0 && p_value >= ALPHA;
+        println!(
+            "{label} pos {j}: n={} one-bin law (support {support}, mode {mode} p={p_mode:.6}): off-mode {off}, exact p={p_value:.4} support_violations={} (alpha={ALPHA}) {}",
+            chi.n,
+            chi.violations,
+            if ok { "PASS" } else { "FAIL" }
+        );
+        return (ok, true);
     }
     let ok = chi.violations == 0 && chi.p_value >= ALPHA;
     println!(
@@ -1700,4 +1753,18 @@ fn dflash_lookup_sampled_law() {
         }
     );
     assert!(failures.is_empty(), "sampled-law failures: {failures:?}");
+}
+
+#[test]
+fn lookup_law_exact_binomial_helper() {
+    // Symmetric: every outcome is no more likely than the mode at n/2.
+    assert!((binomial_two_sided(10, 5, 0.5) - 1.0).abs() < 1e-9);
+    // k = 0 at p = 1/2: P(0) + P(10) = 2 / 1024.
+    assert!((binomial_two_sided(10, 0, 0.5) - 2.0 / 1024.0).abs() < 1e-12);
+    // Degenerate rates.
+    assert_eq!(binomial_two_sided(50, 0, 0.0), 1.0);
+    assert_eq!(binomial_two_sided(50, 1, 0.0), 0.0);
+    // 100 draws at 1%: k = 0 excludes only the more likely k = 1.
+    let p1 = 100.0 * 0.01 * 0.99f64.powi(99);
+    assert!((binomial_two_sided(100, 0, 0.01) - (1.0 - p1)).abs() < 1e-9);
 }
