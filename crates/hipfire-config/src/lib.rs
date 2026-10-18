@@ -9,6 +9,7 @@
 //! persistence, validation, and field-level provenance. Runtime crates consume
 //! resolved values; they do not parse user configuration in hot paths.
 
+pub mod calibration;
 pub mod devices;
 pub mod effective;
 pub mod emu;
@@ -5891,7 +5892,7 @@ fn flatten_toml(
     path: &Path,
 ) -> Result<()> {
     for (key, value) in table {
-        if prefix.is_empty() && key == "schema_version" {
+        if prefix.is_empty() && (key == "schema_version" || key == calibration::SECTION) {
             continue;
         }
         let dotted = if prefix.is_empty() {
@@ -5963,11 +5964,36 @@ fn from_json_value(value: &serde_json::Value) -> Option<ConfigValue> {
     }
 }
 
+/// Write the user layer to `config.toml`. The top-level `calibration` table
+/// (`hipfire calibrate`'s measured record, see [`calibration`]) is not part of
+/// the layer, so it is carried over from the file being overwritten; an
+/// unreadable or unparsable existing file contributes nothing.
 pub fn write_global_toml(paths: &ConfigPaths, layer: &ConfigLayer) -> Result<()> {
-    write_layer_toml(&paths.config_toml, layer)
+    let existing = fs::read_to_string(&paths.config_toml)
+        .ok()
+        .and_then(|raw| toml::from_str::<toml::Table>(&raw).ok())
+        .and_then(|mut root| root.remove(calibration::SECTION));
+    write_global_with_calibration(paths, layer, existing)
+}
+
+/// Write `config.toml` as the user layer plus an optional `calibration` table.
+pub(crate) fn write_global_with_calibration(
+    paths: &ConfigPaths,
+    layer: &ConfigLayer,
+    table: Option<toml::Value>,
+) -> Result<()> {
+    let mut root = layer_toml_root(layer)?;
+    if let Some(table) = table {
+        root.insert(calibration::SECTION.to_owned(), table);
+    }
+    write_toml_root(&paths.config_toml, root)
 }
 
 fn write_layer_toml(path: &Path, layer: &ConfigLayer) -> Result<()> {
+    write_toml_root(path, layer_toml_root(layer)?)
+}
+
+fn layer_toml_root(layer: &ConfigLayer) -> Result<toml::map::Map<String, toml::Value>> {
     layer.validate()?;
     let mut root = toml::map::Map::new();
     root.insert(
@@ -5980,6 +6006,10 @@ fn write_layer_toml(path: &Path, layer: &ConfigLayer) -> Result<()> {
         };
         insert_toml_path(&mut root, key, value)?;
     }
+    Ok(root)
+}
+
+fn write_toml_root(path: &Path, root: toml::map::Map<String, toml::Value>) -> Result<()> {
     let rendered =
         toml::to_string_pretty(&toml::Value::Table(root)).map_err(|source| ConfigError::Parse {
             path: path.to_owned(),

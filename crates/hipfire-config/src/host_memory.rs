@@ -138,6 +138,13 @@ fn optional_bytes(field: MeminfoField) -> Option<u64> {
     }
 }
 
+/// `MemTotal` of a `/proc/meminfo` body in bytes. Unlike [`parse_meminfo`] it
+/// does not require `MemAvailable`: callers that only fingerprint the
+/// installed memory (see [`crate::calibration`]) need no more than the total.
+pub(crate) fn meminfo_total_bytes(meminfo: &str) -> Option<u64> {
+    optional_bytes(meminfo_field(meminfo, "MemTotal"))
+}
+
 /// Build a [`HostMemory`] from a `/proc/meminfo` body. `None` when `MemTotal`
 /// or `MemAvailable` is missing or malformed; the optional fields degrade to
 /// `None` individually.

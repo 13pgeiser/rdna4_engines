@@ -138,6 +138,14 @@ fn in_splice_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     hipfire_cpu::splice_pool::install(splice_pool_config(), f)
 }
 
+/// Streaming-read bandwidth of host RAM measured on the splice pool: the
+/// pinned pool (one worker per physical core) the routed-expert splice runs
+/// on, so the figure is what that splice can actually pull from system
+/// memory. `hipfire calibrate` records it.
+pub fn splice_read_bandwidth(bytes: usize, reps: usize) -> hipfire_cpu::membw::ReadBandwidth {
+    in_splice_pool(|| hipfire_cpu::membw::read_bandwidth(bytes, reps))
+}
+
 /// Worker count of the splice pool (builds the pool on first call, with the
 /// same config every splice uses). For arming logs only.
 pub fn splice_pool_threads() -> usize {

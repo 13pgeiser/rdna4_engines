@@ -1534,7 +1534,7 @@ pub fn expert_stage_enabled(gpu: &rdna_compute::Gpu) -> bool {
 
 /// [`expert_stage_enabled`] with the env value and the (lazily measured)
 /// link supplied; the strict `1`/`0` spelling of `developer_bool`.
-fn expert_stage_switch(
+pub(crate) fn expert_stage_switch(
     arch: &str,
     env: Option<&str>,
     link: impl FnOnce() -> crate::host_link::HostLink,

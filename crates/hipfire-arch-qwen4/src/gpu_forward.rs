@@ -81,6 +81,10 @@ const GFX942_PREFILL_CHUNK_ROWS: usize = 1536;
 /// gfx1100 chunk on a narrow discrete host link (`crate::host_link`).
 const GFX1100_NARROW_LINK_PREFILL_CHUNK_ROWS: usize = 8192;
 
+/// Developer override of the requested prefill chunk
+/// ([`qwen4_prefill_chunk_requested`]).
+pub(crate) const QWEN4_PREFILL_CHUNK_ROWS_ENV: &str = "HIPFIRE_PREFILL_CHUNK_ROWS";
+
 /// Default rows of one Qwen4 prefill chunk (the reusable forward scratch).
 ///
 /// Public serving calls may receive longer prompts; the forward owner tiles
@@ -143,7 +147,7 @@ pub fn qwen4_prefill_chunk_baseline_default(arch: &str) -> usize {
 pub fn qwen4_prefill_chunk_requested(gpu: &Gpu, max_seq: usize) -> usize {
     prefill_chunk_requested_from(
         &gpu.arch,
-        hipfire_config::developer_var("HIPFIRE_PREFILL_CHUNK_ROWS")
+        hipfire_config::developer_var(QWEN4_PREFILL_CHUNK_ROWS_ENV)
             .ok()
             .as_deref(),
         max_seq,
@@ -153,7 +157,7 @@ pub fn qwen4_prefill_chunk_requested(gpu: &Gpu, max_seq: usize) -> usize {
 
 /// The explicit `HIPFIRE_PREFILL_CHUNK_ROWS` value rounded down to whole
 /// 256-row tiles; `None` when unset, unparsable or below one tile.
-fn explicit_prefill_chunk_rows(env: Option<&str>) -> Option<usize> {
+pub(crate) fn explicit_prefill_chunk_rows(env: Option<&str>) -> Option<usize> {
     env.and_then(|value| value.trim().parse::<usize>().ok())
         .map(|rows| rows / 256 * 256)
         .filter(|&rows| rows >= 256)
@@ -504,13 +508,13 @@ const QWEN4_EXPERT_STAGE_DOWN_BYTES: usize = 870_400;
 
 /// Where the effective stage `min_rows` came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StageMinRowsSource {
+pub(crate) enum StageMinRowsSource {
     Env,
     Default,
 }
 
 impl StageMinRowsSource {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Env => "env",
             Self::Default => "default",
@@ -551,15 +555,31 @@ fn resolve_expert_stage_min_rows(
 }
 
 fn qwen4_expert_stage_min_rows(gpu: &Gpu, chunk_rows: usize) -> (usize, StageMinRowsSource) {
-    // gfx1201 and an explicit threshold never read the link, so they never probe.
-    let env = hipfire_config::developer_var(QWEN4_EXPERT_STAGE_MIN_ROWS_ENV).ok();
-    let narrow_link = gpu.arch != "gfx1201"
+    expert_stage_min_rows_from(
+        &gpu.arch,
+        chunk_rows,
+        hipfire_config::developer_var(QWEN4_EXPERT_STAGE_MIN_ROWS_ENV)
+            .ok()
+            .as_deref(),
+        || crate::host_link::host_link(gpu),
+    )
+}
+
+/// [`qwen4_expert_stage_min_rows`] with the `HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS`
+/// value and the (lazily measured) host link supplied. gfx1201 and an explicit
+/// threshold never evaluate `link`, so they never probe.
+pub(crate) fn expert_stage_min_rows_from(
+    arch: &str,
+    chunk_rows: usize,
+    env: Option<&str>,
+    link: impl FnOnce() -> crate::host_link::HostLink,
+) -> (usize, StageMinRowsSource) {
+    let narrow_link = arch != "gfx1201"
         && !env
-            .as_deref()
             .and_then(|value| value.trim().parse::<usize>().ok())
             .is_some_and(|rows| rows >= 2)
-        && crate::host_link::host_link(gpu).is_narrow_discrete();
-    resolve_expert_stage_min_rows(&gpu.arch, chunk_rows, narrow_link, env.as_deref())
+        && link().is_narrow_discrete();
+    resolve_expert_stage_min_rows(arch, chunk_rows, narrow_link, env)
 }
 
 /// Whether long-prefill expert staging would stage a window of at most

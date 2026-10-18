@@ -98,6 +98,13 @@ pub fn resolvable_formats() -> Vec<String> {
         .collect()
 }
 
+/// The CPU-decodable dense formats the default matrix measures, by `--format`
+/// name. Lets a caller measure the matrix one format at a time (deadline checks,
+/// per-format failure) without re-stating the list.
+pub fn format_names() -> impl Iterator<Item = &'static str> {
+    FORMATS.iter().map(|(name, _, _)| *name)
+}
+
 fn hip_err(msg: String) -> hip_bridge::HipError {
     hip_bridge::HipError::new(0, &msg)
 }

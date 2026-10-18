@@ -51,6 +51,7 @@ use std::{
 
 mod bench_concurrency;
 mod bench_power;
+mod calibrate;
 mod config_tuning;
 mod config_view;
 #[cfg(target_os = "linux")]
@@ -113,6 +114,8 @@ pub(crate) enum Commands {
     Emu(emu::EmuArgs),
     /// Measure this host's GPU share for a split offload step.
     OffloadBench(OffloadBenchArgs),
+    /// Measure this host's link, CPU and GPU rates and save them for the engine.
+    Calibrate(calibrate::CalibrateArgs),
     /// Report compiled kernel inventory for the detected architecture.
     Profile(ProfileArgs),
     /// Print build, source-checkout, and installed-daemon identity.
@@ -1085,6 +1088,7 @@ fn run() -> Result<()> {
         Some(Commands::Bench(args)) => bench_command(&paths, args),
         Some(Commands::Emu(args)) => emu::emu_command(&paths, args),
         Some(Commands::OffloadBench(args)) => offload_bench_command(&paths, args),
+        Some(Commands::Calibrate(args)) => calibrate::calibrate_command(&paths, args),
         Some(Commands::Profile(args)) => profile_command(&paths, args),
         Some(Commands::Version(output)) => version_command(&paths, output),
         Some(Commands::Update(args)) => update_command(&paths, args),

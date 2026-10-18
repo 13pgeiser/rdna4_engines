@@ -1552,6 +1552,7 @@ dependencies = [
  "hipfire-arch-qwen4",
  "hipfire-client",
  "hipfire-config",
+ "hipfire-dispatch",
  "hipfire-registry",
  "hipfire-runtime",
  "http-body-util",

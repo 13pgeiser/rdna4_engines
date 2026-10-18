@@ -446,6 +446,7 @@ Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq al
 | `hipfire update --tag TAG` / `--commit SHA` | Install an immutable detached revision. A later explicit selector moves away from the pin. |
 | `hipfire setup --source PATH [flags]` | Install or repair this machine's runtime from a source checkout (normally run by `scripts/install.sh`; `--source` is required and must contain `Cargo.toml`). Flags: `--rocm-root PATH`, `--hipcc PATH` (also `HIPFIRE_HIPCC`), `--strict-rocm` (also `HIPFIRE_ROCM_STRICT=1`), `--gpu-arch ARCH`, `--profile auto\|hip\|redline` (`auto` leaves `replay.backend=auto` so `.mq4r` models select Redline), `-y`/`--yes` (alias `--non-interactive`), `--compile-kernels` (compile locally with `hipcc` even when a release kernel pack exists), `--kernel-pack-url URL` (directory or URL holding the kernel-pack assets; default: the tag's GitHub release). A release tag selects that release's prebuilt kernel pack, which needs no device compiler. |
 | `hipfire kernel-pack install --tag TAG --arch ARCH --source PATH [--dest DIR] [--url URL] [--rocm-version V]` | Download, verify and install the prebuilt kernel pack for `TAG` and `ARCH`. `--source` is the checkout the installed daemon was built from; its `HEAD` must be the pack's commit. `--dest` defaults to `~/.hipfire/bin/kernels/compiled/<ARCH>`; `--rocm-version` (default: the resolved ROCm root's `.info/version`) is checked against the pack's supported range. A successful install also writes the pack's verified `manifest.json` beside the installed directory as `<ARCH>.manifest.json` (for example `~/.hipfire/bin/kernels/compiled/gfx1151.manifest.json`), through a temporary file and a rename. `hipfire doctor --npu` reads it to name the installed kernel set. |
+| `hipfire calibrate [--show\|--check\|--clear] [--json]` | Measure this host's PCIe link, CPU read bandwidth and GPU/CPU offload rates in at most 60 s and record them, with the hardware fingerprint they were measured on, in `config.toml` `[calibration]`; the engine then skips its load-time probes while the record is fresh. `--show` prints the record and the routes it selects (nothing measured), `--check` exits 0 when a fresh record covers every detected GPU, `--clear` removes the record. Refuses while a daemon runs. See [below](#hipfire-calibrate). |
 | `hipfire doctor --npu [--yes] [-j\|--json] [--apply]` | Strix Halo (gfx1151 + XDNA2) NPU trunk fitness check: GPU-free checks, a tier, then (after confirmation) a GPU-only vs `auto` prefill A/B and a greedy `on`/`emulate` exactness check, about 6–7 minutes. `-j`/`--json` prints one report with no hostname, user, path or PCI address; `--apply` sets `npu_trunk off` on a measured loss or an exactness mismatch and changes nothing else. Linux only. See [below](#hipfire-doctor---npu). |
 | `hipfire doctor --npu --soak [--hours H] [--out DIR] [--yes]` | Stability soak instead of the A/B: cold long-prompt prefills with the NPU and GPU busy together for `H` hours (default 4, at most 24), with a kernel-log watch and a heartbeat. Stops at the first fatal kernel line, hang, daemon exit or low memory. Writes only into `DIR` (default `npu-soak-<UTC timestamp>` in the current directory). |
 | `hipfire doctor --npu --soak-report DIR` | Summarize a soak directory, including the previous boot's kernel log after a freeze and reboot. Runs no checks and does not need the GPU or NPU. |
@@ -708,6 +709,32 @@ A heartbeat line (`<UTC time> load=<1-minute load> memavail_kb=<kB>`) is written
 | `summary.json` | Schema `hipfire-soak/1`: `verdict`, `reason`, `hours`, `requests`, `failed_requests`, `per_size`, `benign_count`, `fatal_count`, `heartbeat_gaps`, `fatal_line` and `host` (kernel, IOMMU, driver and firmware facts; no host name). `reason` and `fatal_line` have the host name and PCI addresses removed. |
 
 After a freeze and reboot, `hipfire doctor --npu --soak-report DIR` reads the start time from the first line of `DIR/heartbeat.log`, collects the previous boot's kernel log since then (`journalctl -k -b -1`; run it as a user that can read that journal, which a volatile journal does not keep), and writes it to `DIR/prev-boot-kmsg.log` and a summary to `DIR/report.txt`. The summary, also printed, gives the last heartbeat, the last request, the kernel-line counts, up to 20 fatal lines and the last 40 kernel lines. It exits 0 and does not run the checks; it fails when `DIR` has no `heartbeat.log`.
+
+### `hipfire calibrate`
+
+`hipfire calibrate` measures the rates the engine's load-time selectors otherwise probe for, once, and stores them in `config.toml` under `[calibration]` next to a fingerprint of this host. It never prompts and makes no network calls; everything it reads and writes is local. With no flag it measures; the flags are:
+
+| Flag | Purpose |
+|---|---|
+| `--show` | Print the stored record, whether it is fresh for each detected GPU (with the reason when not), and the engine routes it selects and why. Opens no GPU and measures nothing. |
+| `--check` | Print one line and exit 0 when a fresh record covers every detected GPU (or no GPU is detected and a record exists), exit 1 otherwise. The installers use it. |
+| `--clear` | Remove the `[calibration]` table; other config keys are untouched. |
+| `-j`, `--json` | Machine-readable output for the measuring run and for `--show`. |
+
+`--show`, `--check` and `--clear` are mutually exclusive.
+
+**What it detects.** From sysfs, proc and the KFD topology, without running a kernel: per GPU, the architecture, VRAM size, PCI address (BDF) and the PCIe link speed and width (the narrowest link on the path from the root port to the GPU); per host, the CPU model, logical and physical core counts, the ISA flags (AVX2, FMA, F16C, AVX-512 variants), total RAM, and whether each GPU is unified-memory (an APU) or discrete.
+
+**What it measures.** The measuring run covers, in order:
+
+1. CPU read bandwidth on the pinned splice pool (one worker per physical core), the pool the CPU-executed offload engine runs on.
+2. Per HIP-visible GPU: pinned host-to-device copy rate; zero-copy kernel read rate, a GPU kernel reading host-mapped memory over the link; and the `offload_split` engine-rate probe, a CPU GEMV against a GPU GEMV over host-mapped bytes.
+
+The whole run is bounded at 60 s. An optional probe that would start past the deadline is skipped and reported as skipped, and the record is written with what completed. The run ends by printing the summary, the routes the record selects and `calibrated in X.X s`.
+
+**Refuses while a daemon runs.** The probes need an idle GPU, so the command exits with an error while a hipfire daemon is live (the same check `hipfire offload-bench` makes). Stop the daemon first.
+
+**How the engine uses the record.** At model load, a fresh record replaces the load-time probe: the Qwen4 host-link class (and with it G2 expert staging, the gfx1100 8192-row prefill chunk, the stage minimum rows and the S1 link verdict) is taken from the stored copy rate and the load log says `[calibrated <time>]`. A stale record (a different GPU, PCIe link, RAM, CPU or probe version) or a missing one makes the engine probe at load exactly as before, and the log names the reason. Explicit env overrides still win. Run `hipfire calibrate --show` to see the stored values, freshness and chosen routes; the stored schema and staleness rules are in [CONFIG.md](CONFIG.md#calibration-machine-written).
 
 ## Where files live
 

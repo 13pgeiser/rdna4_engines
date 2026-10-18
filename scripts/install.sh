@@ -590,21 +590,46 @@ if [ ! -x "$HIPFIRE_BIN" ]; then
     exit 1
 fi
 
-if [ "${_TX_ARMED:-0}" -eq 1 ]; then
-    # Do not exec while rollback is armed: run setup, restore on failure, disarm only on success.
-    set +e
-    "$HIPFIRE_BIN" setup --source "$REPO_DIR" "${FORWARDED_ARGS[@]}"
-    setup_status=$?
-    set -e
-    if [ "$setup_status" -ne 0 ]; then
+# After a successful setup: offer `hipfire calibrate` when interactive and no fresh record covers
+# this host; otherwise only hint. A calibrate failure is a warning, never an install failure.
+_offer_calibrate() {
+    if "$HIPFIRE_BIN" calibrate --check >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ "$YES" -ne 0 ] || [ ! -t 0 ] || [ ! -t 1 ]; then
+        echo "Run 'hipfire calibrate' to tune hipfire to this host."
+        return 0
+    fi
+    local reply=""
+    printf 'Calibrate hipfire for this host now? Measures link, CPU and GPU rates; takes up to 60 s. [Y/n] '
+    read -r reply || reply=""
+    case "$reply" in
+        ""|[Yy]|[Yy][Ee][Ss])
+            if ! "$HIPFIRE_BIN" calibrate; then
+                echo "WARNING: hipfire calibrate failed; the install is unaffected. Re-run 'hipfire calibrate' later." >&2
+            fi
+            ;;
+        *)
+            echo "Skipped. Run 'hipfire calibrate' to tune hipfire to this host."
+            ;;
+    esac
+    return 0
+}
+
+# setup runs as a child (not exec) so the calibrate offer can follow it. While rollback is armed
+# a failed setup restores the checkpoint; the setup exit status is the script's status either way.
+set +e
+"$HIPFIRE_BIN" setup --source "$REPO_DIR" "${FORWARDED_ARGS[@]}"
+setup_status=$?
+set -e
+if [ "$setup_status" -ne 0 ]; then
+    if [ "${_TX_ARMED:-0}" -eq 1 ]; then
         _tx_fail "$setup_status"
     fi
-    _tx_disarm
-    # Clear EXIT trap noise; setup already succeeded.
-    trap - EXIT
-    exit 0
+    exit "$setup_status"
 fi
-
-# Clear EXIT trap so exec does not remove state the child never needs.
+_tx_disarm
+# Setup succeeded: nothing left for the EXIT trap to restore.
 trap - EXIT
-exec "$HIPFIRE_BIN" setup --source "$REPO_DIR" "${FORWARDED_ARGS[@]}"
+_offer_calibrate
+exit 0
