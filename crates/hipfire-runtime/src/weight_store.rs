@@ -1511,7 +1511,9 @@ pub fn compact_owned_experts(
     assign: ExpertAssign,
 ) -> Result<Vec<u8>, String> {
     if assign != ExpertAssign::Stride {
-        return Err(format!("compact expert upload supports Stride assignment, got {assign:?}"));
+        return Err(format!(
+            "compact expert upload supports Stride assignment, got {assign:?}"
+        ));
     }
     if ranks == 0 || rank >= ranks {
         return Err(format!("expert rank {rank} is outside {ranks} ranks"));
@@ -1911,24 +1913,24 @@ where
                         fulfill_entry_error(entry, reason),
                     ));
                 }
-                let tensor = match upload_resident_bytes(
-                    gpu,
-                    entry.residency,
-                    &bytes,
-                    &entry.logical_shape,
-                ) {
-                    Ok(mut tensor) => {
-                        tensor.dtype = dtype;
-                        tensor
-                    }
-                    Err(error) => {
-                        return Err(rollback_fulfill_error(
-                            store,
-                            gpu,
-                            fulfill_entry_error(entry, format!("pooled upload failed: {error}")),
-                        ));
-                    }
-                };
+                let tensor =
+                    match upload_resident_bytes(gpu, entry.residency, &bytes, &entry.logical_shape)
+                    {
+                        Ok(mut tensor) => {
+                            tensor.dtype = dtype;
+                            tensor
+                        }
+                        Err(error) => {
+                            return Err(rollback_fulfill_error(
+                                store,
+                                gpu,
+                                fulfill_entry_error(
+                                    entry,
+                                    format!("pooled upload failed: {error}"),
+                                ),
+                            ));
+                        }
+                    };
                 let projection = projection_for(entry, 0, 1, dtype);
                 if let Err(reason) = store.insert(key, WeightHandle::Resident(tensor), projection) {
                     return Err(rollback_fulfill_error(
@@ -2035,26 +2037,25 @@ where
                         ),
                     ));
                 }
-                let tensor =
-                    match upload_range_pooled(
-                        gpu,
-                        &descriptor,
-                        dtype,
-                        &entry.logical_shape,
-                        range_tail_pad(entry),
-                    ) {
-                        Ok(mut tensor) => {
-                            tensor.dtype = dtype;
-                            tensor
-                        }
-                        Err(reason) => {
-                            return Err(rollback_fulfill_error(
-                                store,
-                                gpu,
-                                fulfill_entry_error(entry, reason),
-                            ));
-                        }
-                    };
+                let tensor = match upload_range_pooled(
+                    gpu,
+                    &descriptor,
+                    dtype,
+                    &entry.logical_shape,
+                    range_tail_pad(entry),
+                ) {
+                    Ok(mut tensor) => {
+                        tensor.dtype = dtype;
+                        tensor
+                    }
+                    Err(reason) => {
+                        return Err(rollback_fulfill_error(
+                            store,
+                            gpu,
+                            fulfill_entry_error(entry, reason),
+                        ));
+                    }
+                };
                 let projection = projection_for(entry, 0, 1, dtype);
                 if let Err(reason) = store.insert(key, WeightHandle::Resident(tensor), projection) {
                     return Err(rollback_fulfill_error(
@@ -2131,7 +2132,10 @@ mod tests {
                 // Local index e / ranks holds expert e.
                 for e in (rank..n).step_by(ranks) {
                     let local = e / ranks;
-                    assert_eq!(&compact[local * b..(local + 1) * b], &stack[e * b..(e + 1) * b]);
+                    assert_eq!(
+                        &compact[local * b..(local + 1) * b],
+                        &stack[e * b..(e + 1) * b]
+                    );
                 }
                 owned_total += compact.len();
             }

@@ -875,10 +875,7 @@ impl Carrier for Qwen4Carrier {
         let max_k = if qwen4_explicit_mtp_k(ctx.spec).is_some() {
             max_k
         } else {
-            qwen4_auto_mtp_k(
-                &ctx.gpu.arch,
-                loaded.bundle.native_mtp_cpu_window_rows(),
-            )
+            qwen4_auto_mtp_k(&ctx.gpu.arch, loaded.bundle.native_mtp_cpu_window_rows())
         };
         let max_k = if cpu_splice {
             max_k.min(verify_rows - 1)
@@ -2874,7 +2871,10 @@ fn load_qwen4_rank_scoped(
         for (_, kind) in &split_kinds {
             *kinds.entry(kind).or_default() += 1;
         }
-        let by_kind: Vec<String> = kinds.iter().map(|(kind, n)| format!("{n} {kind}")).collect();
+        let by_kind: Vec<String> = kinds
+            .iter()
+            .map(|(kind, n)| format!("{n} {kind}"))
+            .collect();
         let source = if bundle.has_cpu_deferred_experts() {
             "offload_exec=cpu"
         } else {

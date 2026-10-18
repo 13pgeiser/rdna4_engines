@@ -366,7 +366,10 @@ fn placement_capacity_inputs(
         draft_bytes: draft_reservation,
         slack: 128u64 << 20,
     };
-    Ok(PlacementCapacity { layer_bytes, inputs })
+    Ok(PlacementCapacity {
+        layer_bytes,
+        inputs,
+    })
 }
 
 /// Defensive arm for a configured spill on an unspillable path. Admission
@@ -476,7 +479,11 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     //    once opted in. ─────────────────────────────────────────────────
     let weights_started = std::time::Instant::now();
     let socket = weight_host_socket()?;
-    let route = if socket.is_some() { "import" } else { "private" };
+    let route = if socket.is_some() {
+        "import"
+    } else {
+        "private"
+    };
     let (weights, mut weight_lease) = match socket {
         None => (
             <Qwen35 as Architecture>::load_weights_with_placement(
@@ -498,10 +505,13 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     // expanded tensors) already own VRAM, while KV and lazy PBS do not.
     if let Some(mut sequence) = ctx.sequence {
         let capacity = (|| -> Result<(usize, usize, usize, usize), String> {
-            let (free, _) = ctx.gpu.device_mem_info().map_err(|e| format!("Qwen post-weight VRAM query: {e}"))?;
-            let minimum = crate::qwen35::prefill::minimum_prefill_reservation_bytes(
-                &config, &ctx.gpu.arch,
-            ).ok_or("Qwen minimum PBS sizing overflow")?;
+            let (free, _) = ctx
+                .gpu
+                .device_mem_info()
+                .map_err(|e| format!("Qwen post-weight VRAM query: {e}"))?;
+            let minimum =
+                crate::qwen35::prefill::minimum_prefill_reservation_bytes(&config, &ctx.gpu.arch)
+                    .ok_or("Qwen minimum PBS sizing overflow")?;
             let stride = crate::qwen35::prefill::vmm_kv_token_bytes(
                 &config,
                 plan.pair,
@@ -1102,7 +1112,9 @@ pub fn free_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut rdna_compute::Gpu) -> 
         }
         (Some(lease), Err(e)) => {
             drop(lease);
-            Err(format!("{e}; weight-host lease closed without release (teardown not proven clean)"))
+            Err(format!(
+                "{e}; weight-host lease closed without release (teardown not proven clean)"
+            ))
         }
     }
 }
@@ -1134,7 +1146,9 @@ impl SharedWeightLease {
         {
             let mut inner = self.inner;
             inner.close_allocation_fds();
-            inner.release().map_err(|e| format!("weight-host release: {e}"))
+            inner
+                .release()
+                .map_err(|e| format!("weight-host release: {e}"))
         }
         #[cfg(not(target_os = "linux"))]
         match self._never {}
@@ -1208,15 +1222,28 @@ fn refuse_outside_weight_host_envelope(ctx: &LoadCtx) -> Result<(), String> {
 pub fn weight_host_card_identity(
     gpu: &rdna_compute::Gpu,
 ) -> Result<hipfire_runtime::weight_host::CardIdentity, String> {
-    let uuid = gpu.hip.device_uuid(gpu.device_id).map_err(|e| format!("card UUID: {e}"))?;
-    let pci_bus_id = gpu.hip.device_pci_bus_id(gpu.device_id).map_err(|e| format!("card PCI bus ID: {e}"))?;
-    Ok(hipfire_runtime::weight_host::CardIdentity { uuid, pci_bus_id, device_arch: gpu.arch.clone() })
+    let uuid = gpu
+        .hip
+        .device_uuid(gpu.device_id)
+        .map_err(|e| format!("card UUID: {e}"))?;
+    let pci_bus_id = gpu
+        .hip
+        .device_pci_bus_id(gpu.device_id)
+        .map_err(|e| format!("card PCI bus ID: {e}"))?;
+    Ok(hipfire_runtime::weight_host::CardIdentity {
+        uuid,
+        pci_bus_id,
+        device_arch: gpu.arch.clone(),
+    })
 }
 
 /// Source certificate the host publishes beside its socket (same private
 /// directory): `<socket>.source-cert`.
 pub fn weight_host_source_certificate_path(socket: &std::path::Path) -> std::path::PathBuf {
-    let mut name = socket.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let mut name = socket
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
     name.push(".source-cert");
     socket.with_file_name(name)
 }
@@ -1232,10 +1259,13 @@ mod loader_abi_generated {
 #[cfg(target_os = "linux")]
 pub fn loader_abi() -> hipfire_runtime::weight_host::LoaderAbi {
     use hipfire_runtime::weight_host::{FieldValue, LoaderAbi, Sha256Digest};
-    let mut abi = LoaderAbi::new("hipfire.qwen35.dense.loader-abi/v1")
-        .with("representation_tag", FieldValue::str(crate::shared_weights::DENSE_REPRESENTATION_TAG));
+    let mut abi = LoaderAbi::new("hipfire.qwen35.dense.loader-abi/v1").with(
+        "representation_tag",
+        FieldValue::str(crate::shared_weights::DENSE_REPRESENTATION_TAG),
+    );
     for (name, digest) in loader_abi_generated::LOADER_ABI_COMPONENTS {
-        abi.components.insert((*name).to_owned(), Sha256Digest(*digest));
+        abi.components
+            .insert((*name).to_owned(), Sha256Digest(*digest));
     }
     abi
 }
@@ -1245,13 +1275,16 @@ pub fn loader_abi() -> hipfire_runtime::weight_host::LoaderAbi {
 pub fn weight_host_source_sha256(
     cert: &hipfire_runtime::weight_host::SourceCertificate,
 ) -> Result<hipfire_runtime::weight_host::Sha256Digest, String> {
-    hipfire_runtime::weight_host::model_content_sha256(&[cert.to_source_digest()]).map_err(|e| e.to_string())
+    hipfire_runtime::weight_host::model_content_sha256(&[cert.to_source_digest()])
+        .map_err(|e| e.to_string())
 }
 
 /// Diagnostics-only provenance: never compared or hashed.
 #[cfg(target_os = "linux")]
 pub fn weight_host_provenance(role: &str) -> hipfire_runtime::weight_host::BuildProvenance {
-    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     hipfire_runtime::weight_host::BuildProvenance {
         label: format!("{role} {exe} pid {}", std::process::id()),
         ..Default::default()
@@ -1268,16 +1301,25 @@ fn import_from_weight_host(
     use hipfire_runtime::weight_host as wh;
     refuse_outside_weight_host_envelope(ctx)?;
     let connect_started = std::time::Instant::now();
-    let admission_token = std::env::var("HIPFIRE_FABRIC_ADMISSION")
-        .map_err(|_| "HIPFIRE_WEIGHT_HOST=1 needs HIPFIRE_FABRIC_ADMISSION (dev-fabric correct-class job)".to_string())?;
+    let admission_token = std::env::var("HIPFIRE_FABRIC_ADMISSION").map_err(|_| {
+        "HIPFIRE_WEIGHT_HOST=1 needs HIPFIRE_FABRIC_ADMISSION (dev-fabric correct-class job)"
+            .to_string()
+    })?;
     let card = weight_host_card_identity(ctx.gpu)?;
     let cert_path = weight_host_source_certificate_path(socket);
     // Identity check only (fstat), no content scan: the host hashed once.
-    let (_source, cert) = wh::SourceCertificate::verify_source_path(&cert_path, std::path::Path::new(ctx.path))
-        .map_err(|e| format!("weight host source certificate {}: {e}", cert_path.display()))?;
+    let (_source, cert) =
+        wh::SourceCertificate::verify_source_path(&cert_path, std::path::Path::new(ctx.path))
+            .map_err(|e| {
+                format!(
+                    "weight host source certificate {}: {e}",
+                    cert_path.display()
+                )
+            })?;
     let source_sha256 = weight_host_source_sha256(&cert)?;
     crate::shared_weights::apply_source_dispatch_flags(ctx.gpu, hfq);
-    let recipe = crate::shared_weights::resolve_dense_recipe(ctx.gpu, config).map_err(|e| e.to_string())?;
+    let recipe =
+        crate::shared_weights::resolve_dense_recipe(ctx.gpu, config).map_err(|e| e.to_string())?;
     let hello = wh::HostHello {
         card,
         source_sha256,
@@ -1285,7 +1327,10 @@ fn import_from_weight_host(
         recipe,
         admission_token,
         provenance: weight_host_provenance("tenant"),
-        options: wh::ConnectOptions { handshake_timeout: std::time::Duration::from_secs(30), expected_host_pid: None },
+        options: wh::ConnectOptions {
+            handshake_timeout: std::time::Duration::from_secs(30),
+            expected_host_pid: None,
+        },
     };
     let mut lease = wh::WeightHostClient::connect(socket, hello)
         .map_err(|e| format!("weight host {}: {e}", socket.display()))?;
@@ -1298,7 +1343,10 @@ fn import_from_weight_host(
     let imported_bytes = crate::shared_weights::dense_imported_physical_bytes(lease.manifest());
     if let Err(e) = lease.ack_import(imported_bytes) {
         weights.free_gpu(ctx.gpu);
-        return Err(append_cleanup_context(format!("weight host import ack: {e}"), note_vmm_after_free(ctx.gpu)));
+        return Err(append_cleanup_context(
+            format!("weight host import ack: {e}"),
+            note_vmm_after_free(ctx.gpu),
+        ));
     }
     let import_map_ms = import_started.elapsed().as_secs_f64() * 1e3;
     eprintln!(
@@ -1632,7 +1680,8 @@ mod tests {
     /// file + file/8 + 512 MiB, and MTP + DFlash charge independently and add.
     #[test]
     fn draft_reserve_charges_mtp_and_dflash() {
-        let dir = std::env::temp_dir().join(format!("hipfire-draft-reserve-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-draft-reserve-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let write_sized = |name: &str, len: u64| {
@@ -1657,7 +1706,9 @@ mod tests {
             expect.saturating_mul(2)
         );
         // A bundled head charges only its appended section, never the trunk.
-        let bundled = MtpHeadLocation::Bundled { section_bytes: file_len };
+        let bundled = MtpHeadLocation::Bundled {
+            section_bytes: file_len,
+        };
         assert_eq!(draft_device_reserve_bytes(Some(&bundled), None), expect);
         assert_eq!(
             draft_device_reserve_bytes(Some(&bundled), Some(&dflash)),
@@ -1674,8 +1725,14 @@ mod tests {
     #[test]
     fn placement_reserves_the_mtp_head_only_when_the_load_attaches_it() {
         assert!(!crate::MTP_MEASURED_AR_FLOOR);
-        assert!(!mtp_head_reserved(None), "auto without a floor: no head, no reservation");
-        assert!(mtp_head_reserved(Some(true)), "explicit on reserves the head");
+        assert!(
+            !mtp_head_reserved(None),
+            "auto without a floor: no head, no reservation"
+        );
+        assert!(
+            mtp_head_reserved(Some(true)),
+            "explicit on reserves the head"
+        );
         assert!(!mtp_head_reserved(Some(false)), "off never reserves");
     }
 
@@ -1686,7 +1743,8 @@ mod tests {
     /// `resolve_mtp_head_file`).
     #[test]
     fn mtp_head_probe_prefers_sidecar_spelling_then_bundle() {
-        let dir = std::env::temp_dir().join(format!("hipfire-mtp-head-file-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-mtp-head-file-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let trunk = dir.join("model.mq4v2.hfq");

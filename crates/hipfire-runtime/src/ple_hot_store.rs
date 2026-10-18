@@ -510,7 +510,10 @@ fn read_exact_at(file: &File, offset: u64, dst: &mut [u8]) -> Result<(), SourceE
 fn read_exact_at(_file: &File, offset: u64, _dst: &mut [u8]) -> Result<(), SourceError> {
     Err(SourceError::Io {
         offset,
-        source: io::Error::new(io::ErrorKind::Unsupported, unsupported("positional pack read")),
+        source: io::Error::new(
+            io::ErrorKind::Unsupported,
+            unsupported("positional pack read"),
+        ),
     })
 }
 
@@ -681,7 +684,11 @@ impl Residency {
             // (`last` <= its page count), and `pages` holds `count` bytes.
             let rc = unsafe {
                 libc::mincore(
-                    self.addr.as_ptr().cast::<u8>().add((first * page) as usize).cast(),
+                    self.addr
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add((first * page) as usize)
+                        .cast(),
                     count * page as usize,
                     self.pages.as_mut_ptr(),
                 )
@@ -1268,15 +1275,16 @@ impl HotRowStore {
                 Ok(NowaitRead::WouldBlock)
             };
         }
-        read_nowait_at(&self.pack, offset, dst)
-            .map_err(|source| SourceError::Io { offset, source })
+        read_nowait_at(&self.pack, offset, dst).map_err(|source| SourceError::Io { offset, source })
     }
 
     fn check_pack_range(&self, offset: u64, len: usize) -> Result<(), SourceError> {
-        let end = offset.checked_add(len as u64).ok_or(SourceError::Overflow {
-            offset,
-            length: len as u64,
-        })?;
+        let end = offset
+            .checked_add(len as u64)
+            .ok_or(SourceError::Overflow {
+                offset,
+                length: len as u64,
+            })?;
         if offset < self.data_offset || end > self.data_offset + self.data_bytes {
             return Err(SourceError::RangeOutOfBounds {
                 offset,
@@ -1479,7 +1487,10 @@ impl HotRowStore {
             }
             let len = ((end - at) as usize).min(chunk);
             if let Err(error) = read_exact_at(&file, at, &mut buffer[..len]) {
-                eprintln!("{TAG}: load fill: read at {:.2} GiB failed: {error}", gib(at - begin));
+                eprintln!(
+                    "{TAG}: load fill: read at {:.2} GiB failed: {error}",
+                    gib(at - begin)
+                );
                 ended = "stopped by a read error";
                 break;
             }
@@ -1490,9 +1501,9 @@ impl HotRowStore {
                 // A view that still shows the page just read as a hole cannot
                 // see the page cache (`mincore` needs the file's owner or
                 // write access): read on in order without it.
-                let blind = residency
-                    .as_mut()
-                    .is_some_and(|view| !matches!(view.first_hole(at, at + 1), Ok(hole) if hole > at));
+                let blind = residency.as_mut().is_some_and(
+                    |view| !matches!(view.first_hole(at, at + 1), Ok(hole) if hole > at),
+                );
                 if blind {
                     eprintln!("{TAG}: load fill: the residency view is blind; reading on in order");
                     residency = None;
@@ -1505,7 +1516,10 @@ impl HotRowStore {
                 }
             }
         }
-        let filled = match residency.as_mut().map(|view| view.first_hole(begin, cursor)) {
+        let filled = match residency
+            .as_mut()
+            .map(|view| view.first_hole(begin, cursor))
+        {
             Some(Ok(hole)) => hole,
             _ => cursor,
         } - begin;
@@ -2031,10 +2045,7 @@ mod tests {
             read_nowait_at(&file, u64::MAX, &mut dst).unwrap(),
             NowaitRead::WouldBlock
         );
-        assert_eq!(
-            read_nowait_at(&file, 0, &mut []).unwrap(),
-            NowaitRead::Done
-        );
+        assert_eq!(read_nowait_at(&file, 0, &mut []).unwrap(), NowaitRead::Done);
     }
 
     /// A failure that is not "no `RWF_NOWAIT` here" is returned, not turned
@@ -2317,7 +2328,13 @@ mod tests {
 
     #[test]
     fn load_fill_reads_about_a_slice_of_its_rate_per_read() {
-        let chunk = |bytes_per_sec| LoadFill { bytes: 1, bytes_per_sec }.chunk();
+        let chunk = |bytes_per_sec| {
+            LoadFill {
+                bytes: 1,
+                bytes_per_sec,
+            }
+            .chunk()
+        };
         assert_eq!(chunk(200_000_000), PREWARM_CHUNK.min(10_000_000));
         assert_eq!(chunk(100_000), 5_000);
         assert_eq!(chunk(1), LOAD_FILL_MIN_CHUNK);
@@ -2565,7 +2582,11 @@ mod tests {
             bytes_per_sec: u64::MAX,
         }));
         wait_for(|| small.load_filled_bytes() == small.data_bytes());
-        assert_eq!(small.load_filled_bytes(), small.data_bytes(), "capped at the data");
+        assert_eq!(
+            small.load_filled_bytes(),
+            small.data_bytes(),
+            "capped at the data"
+        );
         small.set_prewarm_budget(prefix);
         wait_for(|| small.prewarm_complete());
         assert_eq!(small.prewarmed_bytes(), prefix);

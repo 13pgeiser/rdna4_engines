@@ -4895,7 +4895,9 @@ mod tests {
         let arm = prod.find("\"generate\" => {").expect("generate arm");
         let arm_end = arm + prod[arm..].find("\"decide\" => {").expect("decide arm");
         let arm = &prod[arm..arm_end];
-        let guard = arm.find("let _ple_serving = m.ple_serving_guard();").expect("guard");
+        let guard = arm
+            .find("let _ple_serving = m.ple_serving_guard();")
+            .expect("guard");
         for later in [
             "activate_terminal_control(id, gen_attempt_id)",
             "batch_request_eligible_for_route(",
@@ -4908,10 +4910,17 @@ mod tests {
             assert!(guard < at, "guard must precede {later}");
         }
         let bench = include_str!("bench.rs");
-        assert_eq!(bench.matches("let _ple_serving = m.ple_serving_guard();").count(), 2);
+        assert_eq!(
+            bench
+                .matches("let _ple_serving = m.ple_serving_guard();")
+                .count(),
+            2
+        );
         for handler in ["fn handle_bench_prefill(", "fn handle_bench_decode("] {
             let body = &bench[bench.find(handler).expect(handler)..];
-            let guard = body.find("let _ple_serving = m.ple_serving_guard();").expect("bench guard");
+            let guard = body
+                .find("let _ple_serving = m.ple_serving_guard();")
+                .expect("bench guard");
             assert!(guard < body.find("m.bench_topology(").expect("topology"));
         }
     }
