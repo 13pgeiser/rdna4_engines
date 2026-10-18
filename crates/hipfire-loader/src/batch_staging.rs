@@ -559,8 +559,8 @@ fn stage_qwen4_lanes(
     requested: usize,
     req: VmmStagingRequest,
 ) -> BatchStaging {
-    use hipfire_arch_qwen4::lane::Qwen4LaneStore;
-    use hipfire_arch_qwen4::{Qwen4ContextCommit, Qwen4KvBackend};
+    use hipfire_arch_qwen4::ep::{ep_lane_row_budget, ep_lane_store_device_bytes};
+    use hipfire_arch_qwen4::Qwen4KvBackend;
     let refuse = |reason: &str| {
         eprintln!("[daemon] qwen4 lanes refused: {reason} — fallback to sequential");
         BatchStaging::default()
@@ -624,19 +624,18 @@ fn stage_qwen4_lanes(
     if bundle.state.qsa_backend() != Qwen4KvBackend::Vmm {
         return refuse("QSA context backend is not VMM");
     }
-    let row_budget = req.row_budget.max(requested);
+    // The row budget and lane bytes are the EP load reservation's own rule and
+    // helper (`Qwen4Carrier` reserves them before splitting the experts).
+    let row_budget = ep_lane_row_budget(req.row_budget, requested);
     if topology == "single" {
         let chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq);
-        let context = Qwen4ContextCommit::new(
+        let Some(need) = ep_lane_store_device_bytes(
+            &bundle.config,
+            bundle.state_format(),
             Qwen4KvBackend::Vmm,
             max_seq,
             chunk,
             gpu.vmm_recommended_granularity().unwrap_or(1),
-        );
-        let Some(need) = Qwen4LaneStore::device_bytes(
-            &bundle.config,
-            bundle.state_format(),
-            &context,
             requested,
             row_budget,
             spec_on_k,

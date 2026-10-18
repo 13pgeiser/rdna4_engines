@@ -434,6 +434,50 @@ N = 2 and N = 4 sit within 1 MiB of the next layer (the quotient is 19.998 and
 layer. At N = 2, 3 and 4 the layers that do not fit are host-mapped (the MTP
 layer always is when not every layer is resident).
 
+### Flash-Next EP: AR lane reservation
+
+A Flash-Next EP load that requests lane batching (`serve.vmm_batch` on and
+`serve.continuous_batch_size` above `1`, the same request the daemon reads
+for staging, on the VMM KV backend) charges the AR lane store to each rank
+**before** the routed experts are split into resident and host-mapped layers.
+The lane store is staged after the weights from the memory that is left, so
+without the charge the plan can fill the card with expert layers and staging is
+then refused for lack of room. The charge is the same figure staging checks
+later: one shared helper computes the lane-store bytes from the lane count, the
+load's `max_seq`, the requested prefill chunk, the VMM granularity and a row
+budget of at least the lane count, and the load placement and
+`stage_rank_lanes` read that one function (the loader's batch staging for EP
+does too), so the reserved and the staged bytes cannot drift. The reservation
+is planner capacity only: it changes which layers are resident, never a
+forward. Singleton forward bytes and numerics are unchanged.
+
+- **Off is identical.** With no batch request (no `serve.vmm_batch`, or
+  `continuous_batch_size` of `1`), or on any load that is not a Flash-Next EP
+  load, nothing is charged and the placement is the same plan as before. The
+  request is a per-load field on the loader's admission, not an environment
+  variable, and the plain `load_model` entry points leave it off.
+- **Trade line.** A charged load logs exactly one line:
+  `[daemon] qwen4 EP lane reservation: lanes=N max_seq=S -> X GiB/rank; resident expert layers A -> B`.
+  `A` is the resident expert layer count the plan would have chosen without
+  the charge, `B` the count with it. A smaller `B` is the trade: lane memory is
+  bought with host-mapped expert layers.
+- **Impossible reservation.** If the charge cannot be met even with every
+  expert layer on the host, the load keeps the baseline (uncharged) plan and
+  logs why. Staging then meets its existing per-rank `lane store bytes <= free`
+  refusal, the load keeps the singleton route
+  (`continuous_batch_capable = false`), and nothing else changes.
+- **Oracle.** `fn_mesh_lane_oracle --reserve-lanes N` loads through the admitted
+  route with that request set to `N` lanes and a row budget equal to the
+  oracle's staged `--row-budget` (default `max(--ks)`; the loader takes the
+  larger of that and `N`). `N = 1` is the same plan as off; without the flag the
+  oracle loads as before. Pick `N = max(--ks)` to reserve what the oracle
+  stages. The flag is planner capacity only: the oracle's
+  singleton-versus-lanes comparison and its `--ks`, `--row-budget` and
+  `--policies` are unchanged. The report records `reserve_lanes`.
+
+This section records behavior only; it carries no measurement and no exactness
+evidence. The changed placement is not covered by the EP2/EP4 evidence above.
+
 ### Flash-Next EP: card topology
 
 All EP exchange traffic (the row gather on decode and few-row forwards, the
@@ -928,8 +972,10 @@ this page.
   device's remaining free memory. The check is per device: every band (PP) or
   rank (EP) needs `lane store bytes <= free` on its own card. If any device does
   not fit, nothing is staged, the reason is logged and the load keeps the
-  singleton route (`continuous_batch_capable = false`). The singleton's own
-  admission and residency plan are not changed by staging.
+  singleton route (`continuous_batch_capable = false`). Without the EP lane
+  reservation below, staging does not change the singleton's own admission and
+  residency plan. Under EP a lane request can reserve its bytes in that plan
+  first: [Flash-Next EP: AR lane reservation](#flash-next-ep-ar-lane-reservation).
 - **EP.** The trunk is replicated, so every rank holds a full lane-store replica
   and runs each lane entry through the same per-rank worker fan-out as the
   singleton EP forward.

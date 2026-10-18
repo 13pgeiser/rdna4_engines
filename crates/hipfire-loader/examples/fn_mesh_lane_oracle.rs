@@ -194,6 +194,9 @@ struct Args {
     policies: Vec<PolicyEntry>,
     /// Tokens per lane for every policy after the first (`<= tokens`).
     tokens_sweep: Option<usize>,
+    /// Loader-planned AR lane capacity (`--reserve-lanes N`): the admitted
+    /// route's per-load VMM batch request. `None` = plain `load_model`.
+    reserve_lanes: Option<usize>,
 }
 
 fn parse_ks(value: &str) -> R<Vec<usize>> {
@@ -283,6 +286,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
     let mut logits = false;
     let mut policies = None;
     let mut tokens_sweep = None;
+    let mut reserve_lanes = None;
     while let Some(flag) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
         match flag.as_str() {
@@ -301,6 +305,9 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
             "--policies" => policies = Some(parse_policies(&value("--policies")?)?),
             "--tokens-sweep" => {
                 tokens_sweep = Some(value("--tokens-sweep")?.parse::<usize>().map_err(e)?)
+            }
+            "--reserve-lanes" => {
+                reserve_lanes = Some(value("--reserve-lanes")?.parse::<usize>().map_err(e)?)
             }
             other => return Err(format!("unknown argument {other}")),
         }
@@ -330,6 +337,9 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
             prompt_files.len()
         ));
     }
+    if reserve_lanes == Some(0) {
+        return Err("--reserve-lanes must be at least 1".into());
+    }
     Ok(Args {
         model: model.ok_or("--model is required")?,
         prompt_files,
@@ -348,15 +358,19 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
             }]
         }),
         tokens_sweep,
+        reserve_lanes,
     })
 }
 
 const HELP: &str = "fn_mesh_lane_oracle --model M.mq4 --prompt-file P [--prompt-file P ...] \
 --max-seq N --tokens T --ks 1,2,4,8 --out DIR [--pp 1] [--row-budget R] [--skip-model-hash] [--logits] \
-[--policies SPEC[;SPEC...]] [--tokens-sweep N]\n\
+[--policies SPEC[;SPEC...]] [--tokens-sweep N] [--reserve-lanes N]\n\
 EP comes from topology.ep / the S1 env var as in fn_ep_oracle; --pp N>1 runs the PP lanes arm. \
 --policies sweeps lane stage share policies (production | per-lane | per-lane:<stage>=once,... | g0) \
 over one reference; --tokens-sweep N sets tokens per lane for every policy after the first. \
+--reserve-lanes N loads through the admitted route with the daemon's VMM-batch request (serve.vmm_batch, \
+continuous_batch_size N) so a qwen4 EP load reserves N AR lanes before the expert split (planner capacity \
+only; default off = plain load_model, N=1 is the same plan). \
 Needs at least max(ks) prompt files. \
 Exit 0 all equal, 1 mismatch, 2 refusal/error. DIR must not exist.";
 
@@ -1564,23 +1578,110 @@ fn run(args: Args) -> R<Verdict> {
     result
 }
 
+/// `load_model`'s admitted route (`admit_source_with_options` then
+/// `load_admitted_with_gemma4_drafter`, the oracle's defaults throughout)
+/// with the per-load VMM batch request set on the admission, so the loader
+/// reserves `lanes` AR lanes in the EP expert placement. Planner capacity
+/// only: the forward numerics and the oracle's lanes are unchanged.
+fn load_with_lane_reservation(
+    args: &Args,
+    lanes: usize,
+    cask: &hipfire_runtime::loader_api::CaskConfig,
+    spec: hipfire_runtime::loader_api::SpecLoadCfg,
+    gpu: &mut Gpu,
+) -> R<hipfire_loader::LoadedModel> {
+    use hipfire_loader::admission::{
+        admit_source_with_options, legacy_warning, qwen4_kv_adaptive_requested,
+        qwen_default_q8_enabled, BatchLoadRequest, KvBackendHints, KvBackendRequest,
+        SourceAdmissionOptions,
+    };
+    let mut admission = admit_source_with_options(
+        &args.model,
+        1,
+        args.pp,
+        KvBackendRequest::Automatic,
+        None,
+        gpu.arch.as_str(),
+        None,
+        "auto",
+        None,
+        args.max_seq,
+        KvBackendHints {
+            kv_mode: None,
+            kv_k: None,
+            kv_v: None,
+            qwen_default_q8: qwen_default_q8_enabled(),
+            kv_adaptive: None,
+            cask: Some(cask),
+            deepseek4_heterogeneous: false,
+            vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
+            free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
+        },
+        SourceAdmissionOptions {
+            spec,
+            kv_adaptive: qwen4_kv_adaptive_requested(None),
+            cask: cask.sidecar.is_some(),
+            ..Default::default()
+        },
+    )?;
+    // The oracle stages `max(ks)` lanes with `--row-budget` (default max(ks))
+    // decode rows; the reserved row budget is that same figure (the loader
+    // takes `max(row_budget, lanes)`).
+    admission.batch_request = BatchLoadRequest {
+        vmm_batch: true,
+        continuous_batch_size: lanes,
+        row_budget: args
+            .row_budget
+            .unwrap_or_else(|| *args.ks.last().expect("ks is non-empty")),
+    };
+    let warning = legacy_warning(admission.kv_backend, admission.kv_backend_reason.as_deref());
+    let loaded = hipfire_loader::load_admitted_with_gemma4_drafter(
+        admission,
+        &args.model,
+        args.max_seq,
+        None,
+        hipfire_config::Deepseek4ComputePlacement::Single,
+        None,
+        None,
+        hipfire_loader::GEMMA4_EAGLE_DRAFT_LEN,
+        None,
+        None,
+        None,
+        None,
+        None,
+        cask,
+        args.pp,
+        spec,
+        gpu,
+    );
+    if loaded.is_ok() {
+        if let Some(warning) = warning {
+            eprintln!("{warning}");
+        }
+    }
+    loaded
+}
+
 fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<Verdict> {
     eprintln!("[{TOOL}] loading {}", args.model);
     let mut gpu = Gpu::init().map_err(|x| format!("Gpu::init: {x:?}"))?;
     let cask = hipfire_runtime::loader_api::CaskConfig::default();
     let spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg::default();
-    let mut model = hipfire_loader::load_model(
-        &args.model,
-        args.max_seq,
-        None,
-        None,
-        None,
-        None,
-        &cask,
-        args.pp,
-        spec_cfg,
-        &mut gpu,
-    )?;
+    let mut model = match args.reserve_lanes {
+        None => hipfire_loader::load_model(
+            &args.model,
+            args.max_seq,
+            None,
+            None,
+            None,
+            None,
+            &cask,
+            args.pp,
+            spec_cfg,
+            &mut gpu,
+        )?,
+        Some(lanes) => load_with_lane_reservation(args, lanes, &cask, spec_cfg, &mut gpu)?,
+    };
 
     let prompts = {
         let tokenizer = model
@@ -1695,6 +1796,7 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
     report["row_budget"] = json!(row_budget);
     report["logits_compared"] = json!(args.logits);
     report["tokens_sweep"] = json!(args.tokens_sweep);
+    report["reserve_lanes"] = json!(args.reserve_lanes);
     report["policies_requested"] = json!(args
         .policies
         .iter()
@@ -1892,6 +1994,33 @@ mod tests {
         assert_eq!(
             parse_args_from(argv(&line)).unwrap_err(),
             "--pp must be at least 1"
+        );
+    }
+
+    #[test]
+    fn args_reserve_lanes_default_off_and_validated() {
+        let line = format!("{BASE} --ks 1{}", files(1));
+        assert_eq!(parse_args_from(argv(&line)).unwrap().reserve_lanes, None);
+        let line = format!("{BASE} --ks 1 --reserve-lanes 8{}", files(1));
+        assert_eq!(parse_args_from(argv(&line)).unwrap().reserve_lanes, Some(8));
+        // Planner capacity only: independent of --ks / --row-budget.
+        let line = format!("{BASE} --ks 2 --row-budget 2 --reserve-lanes 4{}", files(2));
+        let args = parse_args_from(argv(&line)).unwrap();
+        assert_eq!(
+            (args.reserve_lanes, args.ks, args.row_budget),
+            (Some(4), vec![2], Some(2))
+        );
+        let line = format!("{BASE} --ks 1 --reserve-lanes 0{}", files(1));
+        assert_eq!(
+            parse_args_from(argv(&line)).unwrap_err(),
+            "--reserve-lanes must be at least 1"
+        );
+        let line = format!("{BASE} --ks 1 --reserve-lanes x{}", files(1));
+        assert!(parse_args_from(argv(&line)).is_err());
+        let line = format!("{BASE} --ks 1{} --reserve-lanes", files(1));
+        assert_eq!(
+            parse_args_from(argv(&line)).unwrap_err(),
+            "--reserve-lanes needs a value"
         );
     }
 

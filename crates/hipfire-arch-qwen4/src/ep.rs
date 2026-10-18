@@ -1961,6 +1961,37 @@ pub fn ep_lane_fit(rank: usize, need: u64, free: u64, reserve: u64) -> Result<()
     ))
 }
 
+/// Row budget an AR lane store is staged with: the requested step row budget
+/// (`serve.max_batch_tokens`), never below one row per lane. The one rule the
+/// load-time reservation and the batch staging share.
+pub fn ep_lane_row_budget(requested_row_budget: usize, lanes: usize) -> usize {
+    requested_row_budget.max(lanes)
+}
+
+/// Device bytes one rank's lane store commits, for `lanes` lanes at
+/// `row_budget` rows (`spec_k` = native-MTP lanes; EP stages AR lanes only).
+/// `max_seq`, `chunk_rows` and `granularity` are the context commit the QSA
+/// backend maps ([`crate::kv_backend::Qwen4ContextCommit::new`]). The single
+/// source of the byte count: the loader's EP load reservation and
+/// `stage_rank_lanes` (and the single-device staging check) all call it, so
+/// planned and staged bytes cannot differ. `None` on overflow.
+#[allow(clippy::too_many_arguments)]
+pub fn ep_lane_store_device_bytes(
+    config: &crate::Qwen4Config,
+    format: crate::Qwen4StateFormat,
+    backend: crate::Qwen4KvBackend,
+    max_seq: usize,
+    chunk_rows: usize,
+    granularity: usize,
+    lanes: usize,
+    row_budget: usize,
+    spec_k: Option<usize>,
+) -> Option<u64> {
+    let context =
+        crate::kv_backend::Qwen4ContextCommit::new(backend, max_seq, chunk_rows, granularity);
+    Qwen4LaneStore::device_bytes(config, format, &context, lanes, row_budget, spec_k)
+}
+
 /// A lane-entry error as the plain text every rank compares.
 fn bundle_text(error: BundleError) -> String {
     match error {
@@ -1994,16 +2025,13 @@ fn stage_rank_lanes(
         .map_or(0, |placement| placement.rank);
     let max_seq = bundle.state.max_seq_len;
     let chunk = crate::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq);
-    let context = crate::kv_backend::Qwen4ContextCommit::new(
+    let need = ep_lane_store_device_bytes(
+        &bundle.config,
+        bundle.state_format(),
         bundle.state.qsa_backend(),
         max_seq,
         chunk,
         gpu.vmm_recommended_granularity().unwrap_or(1),
-    );
-    let need = Qwen4LaneStore::device_bytes(
-        &bundle.config,
-        bundle.state_format(),
-        &context,
         max_lanes,
         row_budget,
         None,
@@ -2920,6 +2948,61 @@ mod tests {
             assert!(error.contains(part), "{part}: {error}");
         }
         assert!(ep_lane_fit(2, 1, 0, 0).is_err());
+    }
+
+    #[test]
+    fn ep_lane_reservation_bytes_are_the_stage_bytes() {
+        use crate::{Qwen4KvBackend, Qwen4StateFormat};
+        let config = crate::config::compact_test_config();
+        let format = Qwen4StateFormat::F32;
+        let (max_seq, chunk, granularity) = (32768usize, 1536usize, 2usize << 20);
+        let context = crate::kv_backend::Qwen4ContextCommit::new(
+            Qwen4KvBackend::Vmm,
+            max_seq,
+            chunk,
+            granularity,
+        );
+        let mut previous = 0u64;
+        for lanes in [2usize, 4, 8] {
+            let budget = ep_lane_row_budget(4096, lanes);
+            let planned = ep_lane_store_device_bytes(
+                &config,
+                format,
+                Qwen4KvBackend::Vmm,
+                max_seq,
+                chunk,
+                granularity,
+                lanes,
+                budget,
+                None,
+            );
+            assert_eq!(
+                planned,
+                Qwen4LaneStore::device_bytes(&config, format, &context, lanes, budget, None)
+            );
+            let planned = planned.unwrap();
+            assert!(planned > previous, "lanes={lanes}");
+            previous = planned;
+        }
+        // A request below one row per lane is raised to the lane count.
+        assert_eq!(ep_lane_row_budget(2, 8), 8);
+        assert_eq!(ep_lane_row_budget(0, 8), 8);
+        assert_eq!(ep_lane_row_budget(4096, 8), 4096);
+        // Overflow is reported, never wrapped.
+        assert_eq!(
+            ep_lane_store_device_bytes(
+                &config,
+                format,
+                Qwen4KvBackend::Vmm,
+                max_seq,
+                chunk,
+                granularity,
+                usize::MAX,
+                usize::MAX,
+                None,
+            ),
+            None
+        );
     }
 }
 

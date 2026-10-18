@@ -3460,6 +3460,7 @@ pub fn load_admitted_with_gemma4_drafter(
         pp_layer_counts,
         mesh,
         pp_bands,
+        batch_request,
         ..
     } = admission;
     let carrier =
@@ -3544,6 +3545,7 @@ pub fn load_admitted_with_gemma4_drafter(
         // Slice 4 (integration) populates this from the daemon `xdna` param
         // after flag + exact-gfx1151 admission; until then loads stay GPU-only.
         xdna: None,
+        batch_request,
     };
     let mut result = match carrier.load(source, &mut ctx) {
         Ok(result) => result,
