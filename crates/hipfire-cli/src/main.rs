@@ -6941,6 +6941,23 @@ fn bench_load_speculation(params: &serde_json::Value) -> serde_json::Value {
     })
 }
 
+/// Add the daemon's `loaded` ack `mtp_mode_effective` to a bench load's
+/// speculation selectors as `mtp_effective`: the MTP mode the loaded model
+/// serves after its producer's capability gate. `mtp_mode` stays what the
+/// params asked for (`auto` on a producer without a measured AR floor is
+/// requested `auto` but effective `off`); `null` when the ack carries no
+/// verdict (an older daemon, or a route that does not report one).
+fn bench_load_speculation_effective(
+    mut requested: serde_json::Value,
+    loaded: &serde_json::Value,
+) -> serde_json::Value {
+    requested["mtp_effective"] = loaded
+        .get("mtp_mode_effective")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    requested
+}
+
 /// Positions past the measured ones that the daemon's `bench_prefill` and
 /// `bench_decode` guards require (`tokens + 32 <= physical_cap`).
 const BENCH_SEQ_HEADROOM: u64 = 32;
@@ -7239,8 +7256,9 @@ fn open_bench_engine(
         params["experimental_multi_slot_slots"] = serde_json::json!(slots as u64);
         params["experimental_multi_slot_ctx"] = serde_json::json!(ctx as u64);
     }
-    let load_speculation = bench_load_speculation(&params);
+    let requested_speculation = bench_load_speculation(&params);
     let loaded = engine.load(&path, params)?;
+    let load_speculation = bench_load_speculation_effective(requested_speculation, &loaded);
     let post_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
     let devices_spec = process_config.legacy_value("HIPFIRE_DEVICES");
     Ok((
@@ -18262,6 +18280,68 @@ effort = "high"
         assert_eq!(bench_spec_route(&idle), None);
         let eagle = serde_json::json!({"spec": "gemma4_eagle", "tau": 1.8, "rounds": 7});
         assert_eq!(bench_spec_route(&eagle).as_deref(), Some("gemma4_eagle"));
+    }
+
+    #[test]
+    fn bench_load_speculation_reports_the_effective_mtp_mode_beside_the_requested_one() {
+        let params = serde_json::json!({
+            "mtp_mode": "auto", "dflash_mode": "auto", "dspark_mode": "auto",
+            "ngram_draft": false,
+        });
+        let requested = bench_load_speculation(&params);
+        // A producer without a measured AR floor: requested auto, effective off.
+        let off = bench_load_speculation_effective(
+            requested.clone(),
+            &serde_json::json!({ "type": "loaded", "mtp_mode_effective": "off" }),
+        );
+        assert_eq!(off["mtp_mode"], "auto");
+        assert_eq!(off["mtp_effective"], "off");
+        // The DFlash/DSpark/n-gram selectors pass through untouched.
+        assert_eq!(off["dflash_mode"], "auto");
+        assert_eq!(off["dspark_mode"], "auto");
+        assert_eq!(off["ngram_draft"], false);
+        // A producer with the floor reports `auto`.
+        let on = bench_load_speculation_effective(
+            requested.clone(),
+            &serde_json::json!({ "mtp_mode_effective": "auto" }),
+        );
+        assert_eq!(on["mtp_effective"], "auto");
+        // An ack with no verdict is null, never a guess.
+        let none = bench_load_speculation_effective(
+            requested,
+            &serde_json::json!({ "type": "loaded" }),
+        );
+        assert_eq!(none["mtp_effective"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn speculation_selector_lowering_is_unchanged_by_the_mtp_floor_gate() {
+        // The producer-capability gate lives on the consumers, not here: `auto`
+        // leaves the registry's `mtp_mode = auto` and DFlash selectors alone,
+        // while every explicit selector pins its modes exactly as before.
+        let lowered = |selector: &str| {
+            let mut params = serde_json::json!({
+                "mtp_mode": "auto", "dflash_mode": "auto", "dspark_mode": "auto",
+            });
+            apply_speculation_selector(&mut params, selector).unwrap();
+            params
+        };
+        let auto = lowered("auto");
+        assert_eq!(auto["mtp_mode"], "auto");
+        assert_eq!(auto["dflash_mode"], "auto");
+        assert_eq!(auto["dspark_mode"], "auto");
+        for (selector, dflash, mtp, dspark) in [
+            ("off", "off", "off", "off"),
+            ("dflash", "on", "off", "off"),
+            ("mtp", "off", "on", "off"),
+            ("ngram", "off", "off", "off"),
+            ("dspark", "off", "off", "on"),
+        ] {
+            let params = lowered(selector);
+            assert_eq!(params["dflash_mode"], dflash, "{selector}");
+            assert_eq!(params["mtp_mode"], mtp, "{selector}");
+            assert_eq!(params["dspark_mode"], dspark, "{selector}");
+        }
     }
 
     /// A request the AR floor retired must not read as rejected drafts. The

@@ -381,6 +381,7 @@ mod tests {
             num_hash_layers: 0,
             reap_keep: None,
             load_dspark: true,
+            load_mtp: true,
             mq2r: false,
             mq2rxt: false,
         }

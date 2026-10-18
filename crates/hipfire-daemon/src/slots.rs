@@ -146,7 +146,10 @@ impl SlotLoadParams {
     pub fn from_load_msg(msg: &serde_json::Value) -> Self {
         let param = |k: &str| msg.get("params").and_then(|p| p.get(k));
         let param_str = |k: &str| param(k).and_then(|v| v.as_str());
-        // mtp_mode "on"/"auto" enables MTP; mtp_k sets depth. An integer param
+        // `mtp_mode` on/auto only requests a depth here (`mtp_k` > 0); `off`
+        // is 0. Whether the head arms is decided later by the producer-
+        // capability gate (`SlotEngine::spawn`: `auto` arms only a producer
+        // with a measured AR floor, `on` always). mtp_k sets depth. An integer param
         // is explicit; the CLI's `"auto"` resolves to HIPFIRE_MTP_K/config, else
         // MTP_K_DEFAULT (3); an absent param (non-CLI client) means 4.
         // The tri-state survives beside mtp_k: the engine's host-spill
@@ -235,6 +238,9 @@ pub struct SlotBackend {
     engine: AnySlotEngine,
     tokenizer: Tokenizer,
     arch_str: String,
+    /// `params.mtp_mode` after the producer-capability gate (what the engine
+    /// serves: `auto` on a producer without a measured AR floor is `off`).
+    mtp_mode_effective: &'static str,
     dim: usize,
     layers: usize,
     vocab: usize,
@@ -416,6 +422,14 @@ impl SlotBackend {
         let preflight = cpu_preflight(model_path, vision_mode, vision.as_deref())?;
         let arch_id = preflight.arch_id;
         let arch_str = preflight.arch_str.clone();
+        // The engine applies the same gate to its depth (`SlotEngine::spawn`);
+        // this is the verdict the load ack reports.
+        let mtp_mode_effective = hipfire_config::mtp_effective_mode(
+            mtp_mode,
+            hipfire_loader::carrier_for(arch_id)
+                .is_some_and(|carrier| carrier.mtp_measured_ar_floor()),
+        )
+        .name();
         let dim = preflight.dim;
         let layers = preflight.layers;
         let chat_template = preflight.chat_template;
@@ -572,6 +586,7 @@ impl SlotBackend {
             chat_template_source,
             tokenizer,
             arch_str,
+            mtp_mode_effective,
             dim,
             chat_template,
             layers,
@@ -592,6 +607,10 @@ impl SlotBackend {
 
     pub fn arch_str(&self) -> &str {
         &self.arch_str
+    }
+    /// The MTP mode this slot engine serves after the producer-capability gate.
+    pub fn mtp_mode_effective(&self) -> &'static str {
+        self.mtp_mode_effective
     }
     pub fn dim(&self) -> usize {
         self.dim

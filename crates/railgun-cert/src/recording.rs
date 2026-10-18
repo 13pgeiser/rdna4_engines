@@ -910,7 +910,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "widened-prefill-batching",
         predicates: &[IsRecording, CaptureMode],
-        condition: "wide_candidate: ordinary whole-stack prefill with no PBS/cap/tree/tape/hidden ring/fusion and `!capture_mode && !is_recording()` (prefill.rs:2786-2794)",
+        condition: "wide_candidate: ordinary whole-stack prefill with no PBS/cap/tree/tape/hidden ring/fusion and `!capture_mode && !recording`; the facts come from `ordinary_call_facts` (`gpu.graphs.capture_mode`, `gpu.replay.is_recording()`) into `OrdinaryCallFacts::wide_candidate` (prefill.rs)",
         effect: LaunchShape,
         switches: "eager: widened chunk rows (up to 8192); recorded: legacy 512-row chunk cadence",
         kernels: &[],
@@ -1628,6 +1628,12 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "<item>",
+        occurrences: 1,
+        decisions: &["widened-prefill-batching"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
         function: "batch_chunk_fa_attend_ragged_fp8q",
         occurrences: 2,
         decisions: &["kv-tier-capture-forces-flash"],
@@ -1658,8 +1664,8 @@ pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
         function: "forward_prefill_batch_with_pbs_opts_inner",
-        occurrences: 4,
-        decisions: &["widened-prefill-batching", "gfx1151-fa-pair-merge"],
+        occurrences: 2,
+        decisions: &["gfx1151-fa-pair-merge"],
     },
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
@@ -1675,9 +1681,21 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "ordinary_call_facts",
+        occurrences: 3,
+        decisions: &["widened-prefill-batching"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
         function: "q8_multirow_attn_admitted",
         occurrences: 4,
         decisions: &["q8-multirow-verify-attention"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "wide_candidate",
+        occurrences: 1,
+        decisions: &["widened-prefill-batching"],
     },
     Site {
         file: "hipfire-arch-qwen35/src/qwen35/prefill_multi.rs",

@@ -1531,6 +1531,7 @@ fn main() {
                             let vl = backend.is_vl();
                             let audio = backend.is_audio();
                             let video = backend.is_video();
+                            let mtp_mode_effective = backend.mtp_mode_effective();
                             // Same probe + ack fields as the single-slot path,
                             // computed from the template this route renders.
                             backend
@@ -1566,6 +1567,7 @@ fn main() {
                                 "kv_backend_warning": slot_kv_diag.warning,
                                 "kv_mode": slot_params.kv_mode_resolved,
                                 "pp": 1,
+                                "mtp_mode_effective": mtp_mode_effective,
                             });
                             ack.as_object_mut()
                                 .expect("loaded ack is a JSON object")
@@ -2458,20 +2460,34 @@ fn main() {
                         let (dim, layers, vocab) = m.ack_dims();
 
                         // MTP config from load params; `None` (auto) keeps the carrier-resolved K (Qwen4 native MTP) else the skeleton MTP_K_DEFAULT.
-                        m.mtp_mode = mtp_mode;
+                        // `auto` is gated by the producer capability declared on the
+                        // model's carrier (`Carrier::mtp_measured_ar_floor`): a producer
+                        // without a measured AR floor resolves `auto` to `off`, so no
+                        // downstream reader rearms it from head/weights presence
+                        // (`mtp_weights_present`, the DSpark sidecar). `on` is explicit
+                        // and unchanged.
+                        m.mtp_mode = hipfire_config::mtp_effective_mode_name(
+                            &mtp_mode,
+                            m.mtp_measured_ar_floor(),
+                        )
+                        .to_string();
                         m.mtp_k = mtp_k.unwrap_or(m.mtp_k);
-                        // Detect whether MTP weights are present in the loaded
-                        // model. Used by mtp_mode=auto to decide whether to
-                        // enable spec-decode at generate time. Three sources:
-                        //   - DeepSeek V4: the trunk's bundled `mtp_layer`.
-                        //   - DeepSeek V4: a DSpark sidecar (either counts for auto
-                        //     mode; the loader picks whichever applies).
-                        //   - Qwen3.5/3.6: a native MTP (NextN) head loaded by
-                        //     the loader (`qwen35_mtp_head`, set from a bundled
-                        //     `.mq4-mtp` trailer or a `.mtp` sidecar). The loader
-                        //     already set `m.mtp_weights_present = true` in that
-                        //     case; OR it in here so the ds4 probe doesn't clobber
-                        //     it back to false for a qwen35 model.
+                        // Record whether MTP/DSpark weights are present in the loaded
+                        // model. This is metadata only: it never decides arming. The
+                        // effective `m.mtp_mode` above (after the producer-capability
+                        // gate) decides, so presence alone cannot rearm `auto`
+                        // (`deepseek4_spec_requested_from_policy` additionally needs the
+                        // declared floor). Sources:
+                        //   - DeepSeek V4: the trunk's bundled `mtp_layer` (loaded only
+                        //     for an explicit `on`, see `DeepseekV4Config::load_mtp`).
+                        //   - DeepSeek V4: a DSpark sidecar (a separate selector; the
+                        //     route is picked by the installed drafter, not this flag).
+                        //   - Qwen3.5/3.6: a native MTP (NextN) head loaded by the
+                        //     loader (`qwen35_mtp_head`, from a bundled `.mq4-mtp`
+                        //     trailer or a `.mtp` sidecar), loaded only for an explicit
+                        //     `on`. The loader already set `m.mtp_weights_present =
+                        //     true` in that case; OR it in here so the ds4 probe doesn't
+                        //     clobber it back to false for a qwen35 model.
                         let ds4_mtp = m
                             .deepseek4()
                             .map(|b| b.weights.mtp_layer.is_some() || b.weights.dspark.is_some())
@@ -2708,7 +2724,7 @@ fn main() {
                             );
                         } else {
                             let ack = format!(
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"pp":{},"audio":{},"video":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"reasoning_effort_probe_error":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"pp":{},"audio":{},"video":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"reasoning_effort_probe_error":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}","mtp_mode_effective":"{}"}}"#,
                                 arch,
                                 dim,
                                 layers,
@@ -2735,6 +2751,7 @@ fn main() {
                                 serde_json::to_string(&model_ctx).unwrap(),
                                 serde_json::to_string(&card_cap).unwrap(),
                                 seq_kv,
+                                m.mtp_mode,
                             );
                             let ack = hipfire_generate::batch::vmm_loaded_ack(
                                 ack,

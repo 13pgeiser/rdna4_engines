@@ -5909,6 +5909,51 @@ impl PendingMoeFfn {
     }
 }
 
+/// The sealed expert plan, dispatch table and binding cache of one MoE layer
+/// on a Single device, built purely from the artifact's own tensor headers
+/// (names, shapes, quant tags, encoded bytes, sidecars) — no `Gpu`, no device
+/// tensor. `load_moe_ffn` calls exactly this, so a CPU test that feeds an
+/// installed HFQ through it sees the same `ExpertTable` (including the sealed
+/// `Single` execution contract every ordinary load carries) the daemon binds.
+pub(crate) fn build_moe_layer_expert_binding(
+    hfq: &HfqFile,
+    p: &str,
+    config: &Qwen35Config,
+    layer_idx: usize,
+    physical_device: i32,
+    source_expert_ids: &[usize],
+    original_router_rows: usize,
+) -> HipResult<(
+    hipfire_runtime::sealed_moe::ExpertExecutionPlan,
+    hipfire_dispatch::pipeline::sealed_moe::ExpertTable,
+    hipfire_dispatch::pipeline::sealed_moe::ExpertBindingCache,
+)> {
+    // Capture and validate the actual per-expert source records before any
+    // owner is published. The table/cache contain only CPU metadata and can
+    // therefore fail without leaving a partially bound executable owner.
+    // REAP's compact slots retain the original source IDs so heterogeneous
+    // dtype, sidecar, and source-name metadata follows the loaded tensors.
+    let source_records = qwen35_hfq_expert_sources(hfq, p, config, source_expert_ids)?;
+    let source_fingerprint = hfq_source_fingerprint(hfq);
+    let router_source = qwen35_router_source_projection(
+        hfq,
+        &format!("{p}.mlp.gate.weight"),
+        config.num_experts,
+        original_router_rows,
+        config.dim,
+        &source_fingerprint,
+    )?;
+    let sidecar_sources = qwen35_hfq_sidecar_sources(hfq, &source_records, &router_source)?;
+    build_expert_binding(
+        source_records,
+        router_source,
+        sidecar_sources,
+        layer_idx,
+        config.n_layers,
+        super::weights::ExpertBindingTarget::Single { physical_device },
+    )
+}
+
 pub(crate) fn load_moe_ffn(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -5955,30 +6000,18 @@ pub(crate) fn load_moe_ffn(
     // therefore fail without leaving a partially bound executable owner.
     // REAP's compact slots retain the original source IDs so heterogeneous
     // dtype, sidecar, and source-name metadata follows the loaded tensors.
-    let source_records = qwen35_hfq_expert_sources(hfq, p, config, &source_expert_ids)?;
-    let source_fingerprint = hfq_source_fingerprint(hfq);
     let original_router_rows = config
         .reap_keep
         .as_ref()
         .map_or(n_exp, |plan| plan.original_experts);
-    let router_source = qwen35_router_source_projection(
+    let (expert_execution_plan, expert_table, expert_binding) = build_moe_layer_expert_binding(
         hfq,
-        &format!("{p}.mlp.gate.weight"),
-        n_exp,
-        original_router_rows,
-        config.dim,
-        &source_fingerprint,
-    )?;
-    let sidecar_sources = qwen35_hfq_sidecar_sources(hfq, &source_records, &router_source)?;
-    let (expert_execution_plan, expert_table, expert_binding) = build_expert_binding(
-        source_records,
-        router_source,
-        sidecar_sources,
+        p,
+        config,
         layer_idx as usize,
-        config.n_layers,
-        super::weights::ExpertBindingTarget::Single {
-            physical_device: gpu.device_id,
-        },
+        gpu.device_id,
+        &source_expert_ids,
+        original_router_rows,
     )?;
 
     // `load_weight_tensor` retains the historical panic for an absent source.

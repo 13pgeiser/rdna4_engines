@@ -6296,11 +6296,18 @@ pub fn generate(
 /// through to `mtp_mode` for DSpark made `speculation = "dspark"` load and build
 /// the sidecar, then silently route the request through AR because that selector
 /// correctly pins MTP off.
+///
+/// The native in-trunk MTP is gated by the producer capability
+/// (`model_mtp_measured_ar_floor`, [`LoadedModel::mtp_measured_ar_floor`]): an
+/// `auto` model mode needs weights present AND a declared measured AR floor, so
+/// head presence alone never rearms `auto` (DeepSeek V4 declares none: `auto`
+/// stays AR). An explicit `on` (process or model) still requests MTP.
 pub fn deepseek4_spec_requested_from_policy(
     drafter_name: Option<&str>,
     process_mtp_mode: &str,
     model_mtp_mode: &str,
     model_mtp_weights_present: bool,
+    model_mtp_measured_ar_floor: bool,
 ) -> bool {
     if drafter_name == Some("dspark") {
         return true;
@@ -6308,7 +6315,15 @@ pub fn deepseek4_spec_requested_from_policy(
     match process_mtp_mode {
         "on" => true,
         "off" => false,
-        _ => model_mtp_mode == "on" || (model_mtp_mode == "auto" && model_mtp_weights_present),
+        _ => {
+            model_mtp_mode == "on"
+                || (model_mtp_mode == "auto"
+                    && model_mtp_weights_present
+                    && hipfire_config::mtp_mode_admits(
+                        hipfire_config::MtpMode::Auto,
+                        model_mtp_measured_ar_floor,
+                    ))
+        }
     }
 }
 
@@ -6318,6 +6333,7 @@ pub fn deepseek4_spec_requested(m: &LoadedModel) -> bool {
         hipfire_runtime::config::get().mtp_mode.as_str(),
         &m.mtp_mode,
         m.mtp_weights_present,
+        m.mtp_measured_ar_floor(),
     )
 }
 

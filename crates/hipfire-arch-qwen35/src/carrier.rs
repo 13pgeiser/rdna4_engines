@@ -294,6 +294,18 @@ struct PlacementCapacity {
     inputs: offload::CapacityInputs,
 }
 
+/// Whether the placement reserves device room for the MTP head: exactly when
+/// the load will attach it, i.e. the producer-capability gate admits the typed
+/// mode (`on`; `auto` only with a declared measured AR floor, which this
+/// producer lacks). Mirrors the sequential loader's head gate so a reservation
+/// is never charged for a head that does not load.
+pub(crate) fn mtp_head_reserved(spec_mtp: Option<bool>) -> bool {
+    hipfire_config::mtp_mode_admits(
+        hipfire_config::MtpMode::from_tri_state(spec_mtp),
+        crate::MTP_MEASURED_AR_FLOOR,
+    )
+}
+
 fn placement_capacity_inputs(
     hfq: &HfqFile,
     config: &Qwen35Config,
@@ -322,19 +334,23 @@ fn placement_capacity_inputs(
     // the DFlash draft are both device-resident and are *not* part of the
     // trunk spill, so they must be reserved out of the capacity the placement
     // spends — otherwise `auto` would over-place the trunk and the head's own
-    // load would OOM after the weights landed.
+    // load would OOM after the weights landed. The MTP head is reserved only
+    // when the load will actually attach it (`mtp_head_reserved`): under
+    // `auto` this producer declares no measured AR floor, so no head loads
+    // and nothing is reserved.
     let mtp_head: Option<MtpHeadLocation>;
     let dflash_draft: Option<&std::path::Path> = ctx.draft_path.map(std::path::Path::new);
-    if ctx.spec.mtp != Some(false) {
+    if mtp_head_reserved(ctx.spec.mtp) {
         mtp_head = match ctx.mtp_path.clone() {
             // An explicit CLI path is always a standalone sidecar file.
             Some(path) => Some(MtpHeadLocation::Sidecar(path)),
             None => resolve_mtp_head_file(hfq.path()),
         };
     } else {
-        // Speculation explicitly off: the MTP head will not load. A DFlash
-        // draft is still charged when named — the slots route runs its
-        // DFlash2 chain independently of the MTP kill switch.
+        // MTP not admitted (explicit off, or `auto` without a measured AR
+        // floor): the head will not load. A DFlash draft is still charged when
+        // named — the slots route runs its DFlash2 chain independently of the
+        // MTP gate.
         mtp_head = None;
     }
     // (DSpark is a DeepSeek4 module and never attaches here.)
@@ -1649,6 +1665,18 @@ mod tests {
         );
         assert_eq!(draft_device_reserve_bytes(None, None), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The placement reserves the MTP head only where the load attaches it:
+    /// qwen35 declares no measured AR floor, so `auto` reserves nothing, an
+    /// explicit `on` reserves, `off` never. A DFlash draft is charged
+    /// independently of this verdict (`draft_device_reserve_bytes`).
+    #[test]
+    fn placement_reserves_the_mtp_head_only_when_the_load_attaches_it() {
+        assert!(!crate::MTP_MEASURED_AR_FLOOR);
+        assert!(!mtp_head_reserved(None), "auto without a floor: no head, no reservation");
+        assert!(mtp_head_reserved(Some(true)), "explicit on reserves the head");
+        assert!(!mtp_head_reserved(Some(false)), "off never reserves");
     }
 
     /// The MTP head probe both resolvers share: the stem sidecar spelling

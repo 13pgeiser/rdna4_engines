@@ -288,15 +288,15 @@ pub const KNOBS: &[KnobInfo] = &[
     KnobInfo {
         key: "mtp_mode",
         title: "Multi-token prediction (MTP)",
-        summary: "Uses a model's MTP head to predict several tokens per step where supported.",
-        effect: "Raises decode throughput on MTP-capable models when the head is usable at the loaded placement; a no-op on models without an MTP head.",
+        summary: "Uses a model's MTP head to predict several tokens per step where its producer has a measured autoregressive floor.",
+        effect: "Raises decode throughput on models whose MTP drafter declares a measured AR floor (native Flash-Next) when the head is usable at the loaded placement; Qwen3.5/3.6 and DeepSeek V4 keep plain AR under `auto` and load no head — use `on` (or --spec mtp) to opt in. A no-op on models without an MTP head.",
         default: "auto",
-        when: "Leave on auto; force on/off only when A/B-testing throughput. A host-mapped routed-expert spill needs `on` to override `auto`'s decline.",
+        when: "Leave on auto; force on/off only when A/B-testing throughput. `on` arms the head on a producer without a measured AR floor (Qwen3.5/3.6, DeepSeek V4) and overrides `auto`'s decline of a host-mapped routed-expert spill.",
         note: Some("`auto` declines a host-mapped routed-expert spill (memory.moe_expert_budget, either offload_exec seam): the verify re-reads or recomputes the experts, and a head that is unverified there has produced garbled windows (`qwen3.6-35b-a3b.mq6` — mtp windows at tau 0.04-0.13 while its single-row AR decodes coherently). The load prints one line and decodes AR; set on (or --spec mtp) to opt back in."),
         options: &[
             ("off", "No multi-token prediction."),
             ("on", "Force the MTP head where the model has one."),
-            ("auto", "Use MTP when supported and not host-spilled; else single-token."),
+            ("auto", "Use MTP only where the producer has a measured AR floor and the model is not host-spilled; else single-token."),
         ],
     },
     KnobInfo {

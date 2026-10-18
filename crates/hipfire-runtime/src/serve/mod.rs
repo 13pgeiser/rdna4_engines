@@ -311,7 +311,9 @@ pub struct SlotEngineConfig {
     pub mtp_k: usize,
     /// The `params.mtp_mode` tri-state (`off`/`auto`/`on`). `mtp_k > 0` alone
     /// cannot distinguish `auto` from an explicit `on`, so the slots arming
-    /// site reads this (not `mtp_k`) for the host-spill decline.
+    /// site reads this (not `mtp_k`) for the producer-capability gate
+    /// (`hipfire_config::mtp_mode_admits`: `auto` arms only a producer that
+    /// declares a measured AR floor) and the host-spill decline.
     pub mtp_mode: hipfire_config::MtpMode,
     /// Raw KV-mode string from the load request (empty = resolve from
     /// env/config in the engine).

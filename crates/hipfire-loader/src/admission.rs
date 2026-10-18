@@ -224,8 +224,9 @@ pub fn qwen4_kv_adaptive_requested(value: Option<&str>) -> bool {
 }
 
 /// Whether a Qwen4 load attaches its native MTP head. The executable HFQM
-/// manifest always carries the validated head, so `auto` (`None`) attaches it
-/// and `Some(false)` keeps AR. The retained Redline default (a `.mq4r` name)
+/// manifest always carries the validated head, and Qwen4 declares a measured
+/// AR floor ([`hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR`]), so `auto`
+/// (`None`) attaches it and `Some(false)` keeps AR. The retained Redline default (a `.mq4r` name)
 /// owns the load instead: its tape is the single-row AR forward, which no MTP
 /// window runs, so `auto` stays AR there and an explicit `Some(true)` refuses.
 /// Under expert parallelism (`ep` > 1) and pipeline parallelism (`pp` > 1) the
@@ -247,16 +248,30 @@ pub(crate) fn qwen4_native_mtp(
     let retained = hipfire_runtime::config::retained_redline_default(
         gpu_arch, "qwen4", path, pp, tp, ep, true,
     );
-    match spec.mtp {
-        Some(false) => Ok(false),
-        Some(true) if retained => Err(
+    qwen4_native_mtp_for_floor(spec.mtp, retained, hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR)
+}
+
+/// [`qwen4_native_mtp`]'s policy with the retained-Redline fact and the
+/// producer's declared measured AR floor passed in, so the table is testable
+/// without a GPU. `auto` attaches only when the producer declared the floor
+/// ([`hipfire_config::mtp_mode_admits`]) and the load is not the retained
+/// default; explicit `on` ignores the floor and refuses the retained default.
+pub(crate) fn qwen4_native_mtp_for_floor(
+    spec_mtp: Option<bool>,
+    retained: bool,
+    measured_ar_floor: bool,
+) -> Result<bool, String> {
+    use hipfire_config::MtpMode;
+    match MtpMode::from_tri_state(spec_mtp) {
+        MtpMode::Off => Ok(false),
+        MtpMode::On if retained => Err(
             "qwen4: native MTP (speculation.mtp = on) cannot be used with the MQ4R pre-recorded \
              launch path (retained Redline) this model would run on. Set speculation.mtp = off, \
              or load the non-MQ4R HFQM build of this model"
                 .into(),
         ),
-        Some(true) => Ok(true),
-        None => Ok(!retained),
+        MtpMode::On => Ok(true),
+        auto @ MtpMode::Auto => Ok(!retained && hipfire_config::mtp_mode_admits(auto, measured_ar_floor)),
     }
 }
 
@@ -334,11 +349,7 @@ pub(crate) fn qwen4_mtp_with_host_mapped_experts(
     gpu_arch: &str,
     host_mapped_experts: usize,
 ) -> bool {
-    let mode = match spec.mtp {
-        Some(true) => hipfire_config::MtpMode::On,
-        Some(false) => hipfire_config::MtpMode::Off,
-        None => hipfire_config::MtpMode::Auto,
-    };
+    let mode = hipfire_config::MtpMode::from_tri_state(spec.mtp);
     hipfire_config::mtp_host_spill_policy(mode, host_mapped_experts, gpu_arch, &["gfx1201"]).attach
 }
 
@@ -5962,6 +5973,76 @@ mod qwen4_pp_admission_tests {
             o.spec.ngram_draft = Some(false);
         });
         assert_eq!(qwen4_pp_option_refusal(8, None, &off), Ok(()));
+    }
+
+    #[test]
+    fn qwen4_spill_policy_after_the_floor_gate_is_unchanged_for_flash_next() {
+        let with = |mtp| SpecLoadCfg {
+            mtp,
+            ..SpecLoadCfg::default()
+        };
+        // Fully resident: the head stays attached unless explicitly off.
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            assert!(qwen4_mtp_with_host_mapped_experts(with(None), arch, 0), "{arch}");
+            assert!(qwen4_mtp_with_host_mapped_experts(with(Some(true)), arch, 0), "{arch}");
+            assert!(!qwen4_mtp_with_host_mapped_experts(with(Some(false)), arch, 0), "{arch}");
+        }
+        // Host-mapped experts: `auto` keeps the head only on the admitted gfx1201;
+        // explicit `on` attaches everywhere; `off` never.
+        assert!(qwen4_mtp_with_host_mapped_experts(with(None), "gfx1201", 24));
+        assert!(!qwen4_mtp_with_host_mapped_experts(with(None), "gfx1100", 24));
+        assert!(!qwen4_mtp_with_host_mapped_experts(with(None), "gfx1151", 24));
+        assert!(qwen4_mtp_with_host_mapped_experts(with(Some(true)), "gfx1100", 24));
+        assert!(!qwen4_mtp_with_host_mapped_experts(with(Some(false)), "gfx1201", 24));
+    }
+
+    #[test]
+    fn qwen4_native_mtp_auto_follows_the_declared_floor_and_explicit_on_ignores_it() {
+        // (mtp, retained, floor) -> verdict.
+        // The Qwen4 producer's own declaration admits auto on the non-retained load.
+        assert!(hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR);
+        assert_eq!(
+            qwen4_native_mtp_for_floor(None, false, hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR),
+            Ok(true)
+        );
+        // A producer without the floor keeps `auto` AR, retained or not.
+        for retained in [false, true] {
+            assert_eq!(qwen4_native_mtp_for_floor(None, retained, false), Ok(false));
+        }
+        // The retained default keeps `auto` AR even with the floor.
+        assert_eq!(qwen4_native_mtp_for_floor(None, true, true), Ok(false));
+        // Explicit `on` ignores the floor declaration; retained still refuses it.
+        for floor in [false, true] {
+            assert_eq!(qwen4_native_mtp_for_floor(Some(true), false, floor), Ok(true));
+            assert!(qwen4_native_mtp_for_floor(Some(true), true, floor).is_err());
+            assert_eq!(qwen4_native_mtp_for_floor(Some(false), false, floor), Ok(false));
+            assert_eq!(qwen4_native_mtp_for_floor(Some(false), true, floor), Ok(false));
+        }
+    }
+
+    #[test]
+    fn only_the_qwen4_carrier_declares_a_measured_ar_floor() {
+        // Capability is declared by the producer, defaulting false: Qwen3.5/3.6
+        // and DeepSeek V4 (native MTP without a floor) must auto -> AR, and every
+        // other carrier keeps the trait default.
+        for carrier in crate::registry_carriers() {
+            let expected = carrier.claims_arch_id(hipfire_arch_qwen4::ARCH_ID, false);
+            assert_eq!(
+                carrier.mtp_measured_ar_floor(),
+                expected,
+                "{} floor declaration",
+                carrier.name()
+            );
+        }
+        assert!(!hipfire_arch_qwen35::MTP_MEASURED_AR_FLOOR);
+        assert!(!hipfire_arch_deepseek4::MTP_MEASURED_AR_FLOOR);
+        for arch_id in [5u32, 6, 9] {
+            let carrier = crate::carrier_for(arch_id).expect("carrier");
+            assert!(!carrier.mtp_measured_ar_floor(), "arch {arch_id}");
+        }
+        assert!(crate::carrier_for(hipfire_arch_qwen4::ARCH_ID)
+            .expect("qwen4 carrier")
+            .mtp_measured_ar_floor());
     }
 
     #[test]

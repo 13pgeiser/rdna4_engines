@@ -32,6 +32,7 @@ use super::weights::LayerWeights;
 use super::weights::MoeFfnWeights;
 use super::weights::Qwen35Weights;
 use super::weights::StateQuant;
+use super::weights::DeltaNetStateGeometry;
 use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
@@ -1696,10 +1697,17 @@ const PREFILL_DEFAULT_BATCH_GFX1201_FP8: usize = 512;
 /// configured ceiling, never a staging write.
 #[inline]
 fn fp8_chunk512_for_gpu(gpu: &Gpu) -> bool {
-    gpu.arch == "gfx1201"
-        && gpu.flags.gfx12_mq4v2_fp8_gateup
-        && gpu.flags.gfx12_mq4v2_fp8_resid
-        && gpu.flags.gfx12_mq4v2_fp8_qkvza
+    fp8_chunk512_for_flags(gpu.arch.as_str(), &gpu.flags)
+}
+
+/// Pure core of [`fp8_chunk512_for_gpu`]: the same three FP8 projection flags
+/// on exact gfx1201, read from any [`rdna_compute::FeatureFlags`].
+#[inline]
+fn fp8_chunk512_for_flags(arch: &str, flags: &rdna_compute::FeatureFlags) -> bool {
+    arch == "gfx1201"
+        && flags.gfx12_mq4v2_fp8_gateup
+        && flags.gfx12_mq4v2_fp8_resid
+        && flags.gfx12_mq4v2_fp8_qkvza
 }
 
 /// gfx1201-measured default prefill chunk size (Qwen3.8 prefill sweet spot).
@@ -1733,6 +1741,18 @@ fn explicit_prefill_max_batch() -> Option<usize> {
         .filter(|&v| v >= MIN_BATCH)
 }
 
+/// Explicit chunk-rows request (`HIPFIRE_PREFILL_CHUNK_ROWS` or the
+/// `prefill.chunk_rows` config key), or `None` when only the registered
+/// built-in default exists: built-ins are omitted from `ProcessConfig`
+/// (hipfire-config `include_builtin_in_process_config`), so `developer_var`
+/// errs on them and an explicit user value is the only thing observed here.
+fn explicit_prefill_chunk_rows() -> Option<usize> {
+    hipfire_config::developer_var("HIPFIRE_PREFILL_CHUNK_ROWS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v >= MIN_BATCH)
+}
+
 /// Architecture default for the widened ordinary-prefill chunk ceiling
 /// (`prefill.chunk_rows`): 8192 on gfx1100/gfx1151/gfx1201, 512 elsewhere.
 #[inline]
@@ -1749,17 +1769,22 @@ fn prefill_chunk_rows_default(arch: &str) -> usize {
 /// `HIPFIRE_PREFILL_CHUNK_ROWS`), then the arch default above. Values below
 /// `WIDENED_COMMIT_ROWS` keep legacy behavior downstream.
 pub fn prefill_chunk_rows_requested(gpu: &Gpu) -> usize {
-    if let Some(explicit) = explicit_prefill_max_batch() {
-        return explicit;
-    }
-    if let Ok(s) = hipfire_config::developer_var("HIPFIRE_PREFILL_CHUNK_ROWS") {
-        if let Ok(v) = s.parse::<usize>() {
-            if v >= MIN_BATCH {
-                return v;
-            }
-        }
-    }
-    prefill_chunk_rows_default(gpu.arch.as_str())
+    chunk_rows_requested_from(
+        gpu.arch.as_str(),
+        explicit_prefill_max_batch(),
+        explicit_prefill_chunk_rows(),
+    )
+}
+
+/// Pure core of [`prefill_chunk_rows_requested`].
+fn chunk_rows_requested_from(
+    arch: &str,
+    explicit_max_batch: Option<usize>,
+    explicit_chunk_rows: Option<usize>,
+) -> usize {
+    explicit_max_batch
+        .or(explicit_chunk_rows)
+        .unwrap_or_else(|| prefill_chunk_rows_default(arch))
 }
 
 fn dense_layers_are_all_mq4v2(weights: &Qwen35Weights) -> bool {
@@ -1829,13 +1854,78 @@ fn native_mq4_widened_flags_admitted(
 }
 
 fn prefill_max_batch_for_model(gpu: &Gpu, weights: &Qwen35Weights) -> usize {
-    explicit_prefill_max_batch().unwrap_or_else(|| {
-        if gpu.arch == "gfx1151" && dense_layers_are_all_mq4v2(weights) {
+    legacy_prefill_max_batch(
+        explicit_prefill_max_batch(),
+        gpu.arch.as_str(),
+        fp8_chunk512_for_gpu(gpu),
+        gpu.arch == "gfx1151" && dense_layers_are_all_mq4v2(weights),
+    )
+}
+
+/// Rows and tape flag of the implicit `HIPFIRE_PREFILL_REUSE_PBS=1` cache that
+/// `Qwen35Scratch::new_with_kv_max` allocates (pure core of that sizing): an
+/// explicit `HIPFIRE_PREFILL_MAX_BATCH` raises the cache exactly as it raises
+/// every other ordinary ceiling, capped at 512 rows and tape-free on exact
+/// gfx1201, floored at 512 rows on gfx1151, the configured rows with a tape
+/// elsewhere.
+pub(crate) fn implicit_reuse_pbs_plan(
+    arch: &str,
+    explicit_max_batch: Option<usize>,
+    fp8_chunk512: bool,
+) -> (usize, bool) {
+    let configured = explicit_max_batch
+        .unwrap_or_else(|| prefill_max_batch_for_arch(arch, fp8_chunk512));
+    if arch == "gfx1201" {
+        (configured.min(512), false)
+    } else if arch == "gfx1151" {
+        (configured.max(512), true)
+    } else {
+        (configured, true)
+    }
+}
+
+/// [`implicit_reuse_pbs_plan`] for the live device and process configuration.
+pub(crate) fn implicit_reuse_pbs_plan_for_gpu(gpu: &Gpu) -> (usize, bool) {
+    implicit_reuse_pbs_plan(
+        gpu.arch.as_str(),
+        explicit_prefill_max_batch(),
+        fp8_chunk512_for_gpu(gpu),
+    )
+}
+
+/// Pure core of [`prefill_max_batch_for_model`]: the incumbent (non-widened)
+/// ordinary chunk ceiling. Explicit `HIPFIRE_PREFILL_MAX_BATCH` wins, then the
+/// gfx1151 dense-MQ4V2 512, then the per-arch default.
+fn legacy_prefill_max_batch(
+    explicit: Option<usize>,
+    arch: &str,
+    fp8_chunk512: bool,
+    gfx1151_dense_mq4v2: bool,
+) -> usize {
+    explicit.unwrap_or_else(|| {
+        if gfx1151_dense_mq4v2 {
             512
         } else {
-            prefill_max_batch_for_arch(gpu.arch.as_str(), fp8_chunk512_for_gpu(gpu))
+            prefill_max_batch_for_arch(arch, fp8_chunk512)
         }
     })
+}
+
+/// Widened ordinary route: an ordinary (non-captured, no tree/tape/cap/caller
+/// PBS) call whose admitted ceiling exceeds the 512-row commit seam.
+fn widened_route(wide_candidate: bool, limit: usize) -> bool {
+    wide_candidate && limit > WIDENED_COMMIT_ROWS
+}
+
+/// Rows of the owned widened PBS for an `n`-token call under `limit`.
+fn widened_owned_rows(limit: usize, n: usize) -> usize {
+    limit.min(n).max(MIN_BATCH)
+}
+
+/// Commit stride handed to `forward_prefill_chunk` for one chunk: only the
+/// widened route produces `Some(512)`, and only above one seam.
+fn widened_commit_stride(wide: bool, chunk_n: usize) -> Option<usize> {
+    (wide && chunk_n > WIDENED_COMMIT_ROWS).then_some(WIDENED_COMMIT_ROWS)
 }
 
 /// Resolve the prefill chunk upper bound for `gpu`.
@@ -1977,32 +2067,8 @@ fn ordinary_prefill_static_ceiling(
         return None;
     }
     // Actual Q8 state with a complete EF owner for every LA layer, single
-    // lane, and single-end requant. EF-off changes the global frame schedule
-    // under layer-major grouping (frame enters the arithmetic without EF),
-    // so it resolves to the legacy 512 path even under a larger ceiling.
-    let n_la = config
-        .layer_types
-        .iter()
-        .filter(|t| **t == LayerType::LinearAttention)
-        .count();
-    if dn_state.quant != StateQuant::Q8 || n_la == 0 {
-        return None;
-    }
-    if dn_state.s_ef_residual.len() != n_la || dn_state.s_ef_residual.iter().any(|t| t.numel() == 0)
-    {
-        return None;
-    }
-    let single_lane_s =
-        config.linear_num_value_heads * config.linear_value_head_dim * config.linear_value_head_dim;
-    if dn_state.s_matrices.len() != n_la
-        || dn_state
-            .s_matrices
-            .iter()
-            .any(|t| t.numel() != single_lane_s)
-    {
-        return None;
-    }
-    if dn_requant_per_token_env() {
+    // lane, and single-end requant (see `ordinary_dn_state_admitted`).
+    if !ordinary_dn_state_admitted_live(config, dn_state) {
         return None;
     }
     let requested = prefill_chunk_rows_requested(gpu);
@@ -2017,6 +2083,1230 @@ fn ordinary_prefill_static_ceiling(
         }
     }
     Some(rung)
+}
+///
+/// DeltaNet state contract every widened ordinary route shares: actual Q8
+/// state with a complete EF owner for every LA layer, single lane, and
+/// single-end requant. EF-off changes the global frame schedule under
+/// layer-major grouping (frame enters the arithmetic without EF), so it
+/// resolves to the legacy path even under a larger ceiling. Per-token requant
+/// inserts 511 extra Q8/EF boundaries per 512 rows and can never equal the
+/// 512-single-end trajectory.
+fn ordinary_dn_state_admitted_live(config: &Qwen35Config, dn_state: &DeltaNetState) -> bool {
+    ordinary_dn_state_admitted(config, dn_state, dn_requant_per_token_env())
+}
+
+/// Pure core of [`ordinary_dn_state_admitted_live`]: the allocator geometry of
+/// the state ([`DeltaNetStateGeometry`], a live state or an allocation plan)
+/// against the model config. Every S and EF owner is checked (no first-owner
+/// summary) through borrowed iterators, with no heap allocation.
+fn ordinary_dn_state_admitted(
+    config: &Qwen35Config,
+    state: &impl DeltaNetStateGeometry,
+    per_token_requant: bool,
+) -> bool {
+    let n_la = config
+        .layer_types
+        .iter()
+        .filter(|t| **t == LayerType::LinearAttention)
+        .count();
+    if state.quant() != StateQuant::Q8 || n_la == 0 {
+        return false;
+    }
+    let mut ef_numel = state.ef_numel();
+    if ef_numel.len() != n_la || ef_numel.any(|n| n == 0) {
+        return false;
+    }
+    let single_lane_s =
+        config.linear_num_value_heads * config.linear_value_head_dim * config.linear_value_head_dim;
+    let mut s_numel = state.s_numel();
+    if s_numel.len() != n_la || s_numel.any(|n| n != single_lane_s) {
+        return false;
+    }
+    !per_token_requant
+}
+///
+/// The one widened rung of the resident Qwen35 MoE ordinary route. Admission
+/// is binary: this rung when [`resident_moe_rung_fits`] holds, otherwise the
+/// incumbent `prefill_max_batch_for_model` ceiling — never an intermediate
+/// 1024/2048 rung, because 4096 is the only wider GEMM width validated for the
+/// grouped MoE producers.
+///
+/// Origin of the incumbent 512: `PREFILL_DEFAULT_BATCH_GFX1100` is the
+/// gfx1100-measured MQ4V2 gate-up sweet spot (384 on exact gfx1201, 512 under
+/// the full FP8 path, 256 elsewhere), and [`WIDENED_COMMIT_ROWS`] is the same
+/// 512-row DeltaNet commit seam. The receipt's `commit_stride=512` is the
+/// generic widened-chunk value; the MoE layer bodies (`batch_chunk_delta_net_moe`,
+/// `batch_chunk_full_attn_moe*`) do NOT take a commit stride and run the
+/// incumbent whole-chunk GDN launch and FA attend, exactly as an explicit
+/// `HIPFIRE_PREFILL_MAX_BATCH=4096` does. The seam is therefore not claimed
+/// for MoE bodies.
+pub(crate) const RESIDENT_MOE_CHUNK_ROWS: usize = 4096;
+///
+/// Outcome of resolving the user's chunk request for the resident-MoE route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResidentMoeRequest {
+    /// An explicit override or opt-out: the incumbent ceiling, unchanged.
+    Incumbent,
+    /// Ask for [`RESIDENT_MOE_CHUNK_ROWS`]; `requested` is the value logged.
+    Widen { requested: usize },
+}
+///
+/// Precedence: explicit `HIPFIRE_PREFILL_MAX_BATCH` wins and keeps the
+/// incumbent path exactly as before. Otherwise an explicit
+/// `HIPFIRE_PREFILL_CHUNK_ROWS` / `prefill.chunk_rows` below the MoE rung opts
+/// out (incumbent), and one at or above it requests the (single) MoE rung.
+/// With nothing explicit the route requests [`RESIDENT_MOE_CHUNK_ROWS`]
+/// by default.
+fn resident_moe_request(
+    explicit_max_batch: Option<usize>,
+    explicit_chunk_rows: Option<usize>,
+) -> ResidentMoeRequest {
+    if explicit_max_batch.is_some() {
+        return ResidentMoeRequest::Incumbent;
+    }
+    match explicit_chunk_rows {
+        Some(v) if v >= RESIDENT_MOE_CHUNK_ROWS => ResidentMoeRequest::Widen { requested: v },
+        Some(_) => ResidentMoeRequest::Incumbent,
+        None => ResidentMoeRequest::Widen {
+            requested: RESIDENT_MOE_CHUNK_ROWS,
+        },
+    }
+}
+
+fn resident_moe_request_now() -> ResidentMoeRequest {
+    resident_moe_request(explicit_prefill_max_batch(), explicit_prefill_chunk_rows())
+}
+///
+/// Grouped-producer dtype capability of one MoE layer: routed experts uniform
+/// MQ4G256 or uniform MQ4G256V2 (gate_up and down the same format, no graded
+/// merge), shared expert MQ4G256/MQ4G256V2 with a fused gate/up pair, router
+/// and shared scalar gate in the formats the dispatch admission accepts.
+/// Anything else (MQ6, E8, Lloyd/codebook, PARO, mixed tiers) keeps the
+/// incumbent chunk.
+fn resident_moe_producer_dtypes_supported(
+    d: &hipfire_dispatch::families::moe::MoePrefillDtypes,
+) -> bool {
+    let mq4 = |dt: DType| matches!(dt, DType::MQ4G256 | DType::MQ4G256V2);
+    let scalar = |dt: DType| {
+        matches!(
+            dt,
+            DType::MQ4G256 | DType::MQ4G256V2 | DType::Q8_0 | DType::F32
+        )
+    };
+    !d.routed_mixed_merged
+        && d.expert_gate_up_uniform
+        && d.expert_down_uniform
+        && mq4(d.expert_gate_up)
+        && d.expert_down == d.expert_gate_up
+        && mq4(d.shared_expert_gate)
+        && d.shared_expert_up == d.shared_expert_gate
+        && mq4(d.shared_expert_down)
+        && scalar(d.router)
+        && scalar(d.shared_expert_scalar_gate)
+}
+///
+/// Whether a layer's sealed expert contract is a multi-device (TP/EP)
+/// execution. A `Single` contract on one physical device is the ordinary
+/// resident load; absent contracts are single by construction.
+fn resident_moe_contract_multi_device(
+    contract: Option<&hipfire_dispatch::pipeline::sealed_moe::ExpertExecutionContract>,
+) -> bool {
+    use hipfire_dispatch::pipeline::sealed_moe::ContractParallelism;
+    contract.is_some_and(|c| {
+        c.parallelism() != ContractParallelism::Single || c.physical_devices().len() > 1
+    })
+}
+///
+/// Placement facts of one MoE layer read from the loaded weights (never from
+/// configuration intent). Resident means every flag is clear.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ResidentMoePlacement {
+    /// An attention projection lives in host-mapped memory.
+    attention_host_located: bool,
+    /// The routed gate/up owner is host-mapped (packed owners, not the
+    /// non-owning per-expert subviews, which cannot report residency).
+    routed_gate_up_host: bool,
+    /// The routed down owner is host-mapped.
+    routed_down_host: bool,
+    /// The router, shared-expert gate or a shared projection is host-mapped.
+    small_ffn_host_located: bool,
+    /// `memory.offload_exec=cpu` armed the CPU expert splice on this layer.
+    cpu_deferred_experts: bool,
+    /// Paged experts: the resident expert list is empty (a pager owns them).
+    paged_experts: bool,
+    /// The sealed expert contract spans more than the one local device
+    /// (tensor/expert parallel). Every ordinary single-device load also
+    /// carries a sealed contract (`adapt_expert_execution_plan` always attaches
+    /// one), so its mere presence is NOT multi-device.
+    multi_device_contract: bool,
+    /// AWQ/PARO sidecars, per-expert dtype tags or an EP global table: routes
+    /// outside the validated grouped-producer set.
+    sidecar_experts: bool,
+}
+
+impl ResidentMoePlacement {
+    fn resident(self) -> bool {
+        self == Self::default()
+    }
+}
+
+fn resident_moe_layer_placement(
+    gpu: &Gpu,
+    attention: &[&hipfire_runtime::llama::WeightTensor],
+    ffn: &MoeFfnWeights,
+) -> ResidentMoePlacement {
+    use hipfire_dispatch::families::moe::RoutedExpertWeights;
+    let (routed_gate_up_host, routed_down_host) = ffn.host_mapped_projections();
+    ResidentMoePlacement {
+        attention_host_located: attention.iter().any(|w| gpu.host_located(&w.buf)),
+        routed_gate_up_host,
+        routed_down_host,
+        small_ffn_host_located: [
+            &ffn.router,
+            &ffn.shared_expert_gate,
+            &ffn.shared_expert.gate,
+            &ffn.shared_expert.up,
+            &ffn.shared_expert.down,
+        ]
+        .iter()
+        .any(|w| gpu.host_located(&w.buf)),
+        cpu_deferred_experts: ffn.cpu_deferred_experts,
+        paged_experts: ffn.experts.is_empty(),
+        multi_device_contract: resident_moe_contract_multi_device(
+            ffn.expert_table.execution_contract(),
+        ),
+        sidecar_experts: ffn.paro_shared.is_some()
+            || ffn.expert_down_awq_ptrs.is_some()
+            || ffn.expert_dtype_tags.is_some()
+            || ffn.global_expert_dtypes.is_some(),
+    }
+}
+
+fn resident_moe_layer_capable(
+    gpu: &Gpu,
+    attention: &[&hipfire_runtime::llama::WeightTensor],
+    ffn: &MoeFfnWeights,
+) -> bool {
+    resident_moe_layer_facts_capable(
+        &resident_moe_layer_placement(gpu, attention, ffn),
+        moe_prefill_dtypes(ffn).as_ref(),
+    )
+}
+
+/// Pure core of [`resident_moe_layer_capable`]: every placement flag clear and
+/// the layer's dtype record inside the validated grouped-producer set.
+fn resident_moe_layer_facts_capable(
+    placement: &ResidentMoePlacement,
+    dtypes: Option<&hipfire_dispatch::families::moe::MoePrefillDtypes>,
+) -> bool {
+    placement.resident() && dtypes.is_some_and(resident_moe_producer_dtypes_supported)
+}
+///
+/// Every static (no allocation, no memory query) fact the resident Qwen35 MoE
+/// widened ordinary route reads. [`resident_moe_static_facts`] gathers them
+/// from the loaded model; CPU tests build the derivable ones from an installed
+/// artifact. [`resident_moe_static_decision`] is the one decision over them.
+#[derive(Clone, Debug)]
+struct ResidentMoeStaticFacts {
+    /// `config.num_experts != 0`.
+    moe_config: bool,
+    /// Chunk-knob resolution ([`resident_moe_request`]).
+    request: ResidentMoeRequest,
+    /// The device has the WMMA grouped producer.
+    has_wmma: bool,
+    /// Paged experts / EP shard / MQ6 anywhere in the loaded weights.
+    pager: bool,
+    ep_shard: bool,
+    moe_has_mq6: bool,
+    layers_present: bool,
+    /// [`ordinary_dn_state_admitted`] for the actual state.
+    dn_state_admitted: bool,
+    /// [`prefill_batch_pbs_eligible`] for the loaded layers.
+    batch_pbs_eligible: bool,
+    /// Every layer passes [`resident_moe_layer_facts_capable`].
+    layers_resident_capable: bool,
+}
+///
+/// Static (no allocation, no memory query) eligibility of the resident
+/// Qwen35 MoE widened ordinary route: returns [`RESIDENT_MOE_CHUNK_ROWS`] when
+/// the loaded model is a fully resident, single-device, non-paged MoE whose
+/// every layer passes the batched-prefill producer admission
+/// (`qwen35_layer_batch_admissible` through `prefill_batch_pbs_eligible`) and
+/// whose routed/shared experts are MQ4G256 or MQ4G256V2, the DeltaNet state
+/// meets [`ordinary_dn_state_admitted`], and the device has the WMMA grouped
+/// producer. Capability and actual placement only: no card or tag names.
+/// `None` keeps the incumbent ceiling (and the dense route is unaffected).
+fn resident_moe_static_decision(f: &ResidentMoeStaticFacts) -> Option<usize> {
+    if !f.moe_config {
+        return None;
+    }
+    if !matches!(f.request, ResidentMoeRequest::Widen { .. }) {
+        return None;
+    }
+    if !f.has_wmma {
+        return None;
+    }
+    if f.pager || f.ep_shard || f.moe_has_mq6 || !f.layers_present {
+        return None;
+    }
+    if !f.dn_state_admitted {
+        return None;
+    }
+    if !f.batch_pbs_eligible {
+        return None;
+    }
+    f.layers_resident_capable
+        .then_some(RESIDENT_MOE_CHUNK_ROWS)
+}
+///
+/// Gather [`ResidentMoeStaticFacts`] from the loaded model. The gates are read
+/// in the order [`resident_moe_static_decision`] applies them and gathering
+/// stops at the first closed one (the later facts stay `false` and are never
+/// consulted by the decision), so a dense or non-widening request pays no
+/// per-layer walk.
+fn resident_moe_static_facts(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    dn_state: &DeltaNetState,
+) -> ResidentMoeStaticFacts {
+    let mut f = ResidentMoeStaticFacts {
+        moe_config: config.num_experts != 0,
+        request: resident_moe_request_now(),
+        has_wmma: gpu.arch_caps.has_wmma(),
+        pager: weights.pager.is_some(),
+        ep_shard: weights.ep_shard.is_some(),
+        moe_has_mq6: weights.moe_has_mq6,
+        layers_present: !weights.layers.is_empty(),
+        dn_state_admitted: false,
+        batch_pbs_eligible: false,
+        layers_resident_capable: false,
+    };
+    if !f.moe_config
+        || !matches!(f.request, ResidentMoeRequest::Widen { .. })
+        || !f.has_wmma
+        || f.pager
+        || f.ep_shard
+        || f.moe_has_mq6
+        || !f.layers_present
+    {
+        return f;
+    }
+    f.dn_state_admitted = ordinary_dn_state_admitted_live(config, dn_state);
+    if !f.dn_state_admitted {
+        return f;
+    }
+    f.batch_pbs_eligible = prefill_batch_pbs_eligible(
+        weights,
+        config,
+        dn_state,
+        WIDENED_COMMIT_ROWS,
+        gpu.arch.as_str(),
+        true,
+    );
+    if !f.batch_pbs_eligible {
+        return f;
+    }
+    f.layers_resident_capable = weights.layers.iter().all(|layer| match layer {
+        LayerWeights::DeltaNetMoe(l) => {
+            resident_moe_layer_capable(gpu, &[&l.wqkv, &l.wz, &l.w_alpha, &l.w_beta, &l.wo], &l.ffn)
+        }
+        LayerWeights::FullAttnMoe(l) => {
+            resident_moe_layer_capable(gpu, &[&l.wq, &l.wk, &l.wv, &l.wo], &l.ffn)
+        }
+        _ => false,
+    });
+    f
+}
+///
+/// Wrapper-level gate: the DENSE widened ordinary route is statically
+/// admitted above the 512-row seam. Only that route makes the wrappers omit
+/// their implicit ≤512 cached PBS (see [`plan_wrapper_pbs`]).
+fn ordinary_dense_widen_statically_admitted(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    dn_state: &DeltaNetState,
+) -> bool {
+    ordinary_prefill_static_ceiling(gpu, weights, config, dn_state)
+        .is_some_and(|c| c > WIDENED_COMMIT_ROWS)
+}
+///
+/// Which PBS the ordinary wrappers hand the inner entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WrapperOwner {
+    /// No caller PBS: the inner entry owns the decision (reuse off, or the
+    /// dense widened route that drops the implicit cache).
+    None,
+    /// The implicit `HIPFIRE_PREFILL_REUSE_PBS=1` cache as allocated.
+    Physical,
+    /// The lazily allocated explicit-equivalent owner (`Qwen35Scratch::
+    /// reuse_virtual_pbs`) with exactly these rows and tape flag.
+    Virtual { rows: usize, tape: bool },
+}
+///
+/// The wrapper-side parameters of one ordinary call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WrapperPbsPlan {
+    owner: WrapperOwner,
+    /// Virtual explicit `HIPFIRE_PREFILL_MAX_BATCH`: the incumbent ceiling the
+    /// inner entry uses instead of the arch default.
+    max_batch_override: Option<usize>,
+    /// An existing virtual owner is released before anything else.
+    free_virtual: bool,
+    /// The virtual owner is (re)allocated with `owner`'s rows/tape.
+    alloc_virtual: bool,
+}
+
+impl WrapperPbsPlan {
+    fn pbs<'a>(
+        &self,
+        physical: Option<&'a PrefillBatchScratch>,
+        virtual_owner: Option<&'a PrefillBatchScratch>,
+    ) -> Option<&'a PrefillBatchScratch> {
+        match self.owner {
+            WrapperOwner::None => None,
+            WrapperOwner::Physical => physical,
+            WrapperOwner::Virtual { .. } => virtual_owner,
+        }
+    }
+}
+///
+/// Inputs of [`plan_wrapper_pbs`].
+#[derive(Clone, Copy, Debug)]
+struct WrapperPbsInputs<'a> {
+    arch: &'a str,
+    fp8_chunk512: bool,
+    /// The dense widened route is statically admitted.
+    dense_widened: bool,
+    /// The implicit reuse cache `(rows, tape)`, `None` with reuse off.
+    physical: Option<(usize, bool)>,
+    /// An already allocated virtual owner `(rows, tape)` (e.g. kept from an
+    /// earlier request).
+    existing_virtual: Option<(usize, bool)>,
+    /// The DEFAULT resident-MoE request (no explicit knob) is statically
+    /// eligible and its 4096 rung fits memory with no caller PBS present.
+    default_moe_fits: bool,
+    /// The call's own caller/capture facts ([`OrdinaryCallFacts`], the same
+    /// record the inner entry builds, with no caller PBS) leave the call a
+    /// widen candidate: captured/recorded, tree, tape, staged ring,
+    /// band/fusion and capped calls never get a promotion.
+    call_eligible: bool,
+}
+///
+/// Wrapper PBS plan. Beta's explicit `HIPFIRE_PREFILL_MAX_BATCH=4096` with
+/// `HIPFIRE_PREFILL_REUSE_PBS=1` runs on an implicit cache sized by
+/// [`implicit_reuse_pbs_plan`]`(arch, Some(4096), ..)` with the ceiling 4096.
+/// An eligible, memory-admitted DEFAULT request is exactly that "virtual
+/// explicit 4096": same owner rows and tape flag (the existing explicit sizing
+/// function and clamps), same ceiling, so every executed parameter is identical.
+/// A default that does not fit keeps the incumbent implicit cache and ceiling;
+/// an explicit manual knob is never rewritten (it never reports
+/// `default_moe_fits`, its static gate is closed).
+fn plan_wrapper_pbs(i: &WrapperPbsInputs) -> WrapperPbsPlan {
+    let none = WrapperPbsPlan {
+        owner: WrapperOwner::None,
+        max_batch_override: None,
+        free_virtual: i.existing_virtual.is_some(),
+        alloc_virtual: false,
+    };
+    if i.dense_widened {
+        return none;
+    }
+    let Some(physical) = i.physical else {
+        return none;
+    };
+    if !i.call_eligible {
+        // Keep whatever owners exist untouched: only the implicit cache runs.
+        return WrapperPbsPlan {
+            owner: WrapperOwner::Physical,
+            free_virtual: false,
+            ..none
+        };
+    }
+    if !i.default_moe_fits {
+        return WrapperPbsPlan {
+            owner: WrapperOwner::Physical,
+            ..none
+        };
+    }
+    let target = implicit_reuse_pbs_plan(i.arch, Some(RESIDENT_MOE_CHUNK_ROWS), i.fp8_chunk512);
+    let max_batch_override = Some(RESIDENT_MOE_CHUNK_ROWS);
+    if physical == target {
+        WrapperPbsPlan {
+            owner: WrapperOwner::Physical,
+            max_batch_override,
+            ..none
+        }
+    } else {
+        WrapperPbsPlan {
+            owner: WrapperOwner::Virtual {
+                rows: target.0,
+                tape: target.1,
+            },
+            max_batch_override,
+            free_virtual: i.existing_virtual.is_some_and(|e| e != target),
+            alloc_virtual: i.existing_virtual != Some(target),
+        }
+    }
+}
+
+fn pbs_has_tape(p: &PrefillBatchScratch) -> bool {
+    p.dn_s_tape_q8.is_some() || p.dn_s_tape_f32.is_some()
+}
+///
+/// The wrapper's call-level gate: the one decision of "may this call be
+/// promoted at all", shared by the production wrapper step and the CPU tests
+/// (which call it with the same inputs over artifact-derived facts). The call
+/// is a promotion candidate only when
+/// - it is non-empty and its caller/capture record ([`OrdinaryCallFacts`], no
+///   caller PBS) leaves it a widen candidate,
+/// - the ordinary batched (PBS) path actually runs for ITS OWN row count `n`
+///   (`batched_eligible(n)`: the verify-decouple window, the `prefill_batched`
+///   switch, the two-token minimum, DeltaNet layers and layer admission; a
+///   one-token call falls to the per-token AR loop, so a 4096 owner would be
+///   allocated for nothing), and
+/// - the widened chunks (every one at least the 512-row commit seam) are
+///   batched-eligible too (`batched_eligible(WIDENED_COMMIT_ROWS)`, the probe
+///   the resident static facts use). Wherever the actual `n` and the 512 probe
+///   disagree (n = 1, or a small verify-decouple window with
+///   `prefill_batched` off) the call keeps the incumbent resource plan: no
+///   KV mapping, no override, no allocation, no owner released.
+/// The gate is evaluated before any KV mapping, override or allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OrdinaryWrapperGate {
+    n: usize,
+    /// The implicit reuse cache `(rows, tape)`, `None` with reuse off.
+    physical: Option<(usize, bool)>,
+    call_eligible: bool,
+}
+
+impl OrdinaryWrapperGate {
+    fn new(
+        n: usize,
+        call: &OrdinaryCallFacts,
+        physical: Option<(usize, bool)>,
+        batched_eligible: impl Fn(usize) -> bool,
+    ) -> Self {
+        let call_eligible = n > 0
+            && call.wide_candidate()
+            && batched_eligible(n)
+            && batched_eligible(WIDENED_COMMIT_ROWS);
+        Self {
+            n,
+            physical,
+            call_eligible,
+        }
+    }
+    /// The wrapper maps the call's required KV before the memory query. With
+    /// the implicit cache present the wrapper decides first, so it performs
+    /// the same (idempotent) mapping the inner entry would.
+    fn maps_kv(&self) -> bool {
+        self.call_eligible && self.physical.is_some()
+    }
+    /// The memory admission of the virtual-explicit owner is queried.
+    fn needs_default_fit(&self, dense_widened: bool) -> bool {
+        self.maps_kv() && !dense_widened
+    }
+    fn plan(
+        &self,
+        arch: &str,
+        fp8_chunk512: bool,
+        dense_widened: bool,
+        existing_virtual: Option<(usize, bool)>,
+        default_moe_fits: bool,
+    ) -> WrapperPbsPlan {
+        // An empty call returns before the inner entry touches anything.
+        if self.n == 0 {
+            return WrapperPbsPlan {
+                owner: WrapperOwner::None,
+                max_batch_override: None,
+                free_virtual: false,
+                alloc_virtual: false,
+            };
+        }
+        plan_wrapper_pbs(&WrapperPbsInputs {
+            arch,
+            fp8_chunk512,
+            dense_widened,
+            physical: self.physical,
+            existing_virtual,
+            default_moe_fits: default_moe_fits && self.needs_default_fit(dense_widened),
+            call_eligible: self.call_eligible,
+        })
+    }
+}
+///
+/// Memory credit of the wrapper's existing virtual owner: its payload bytes
+/// only when it is exactly the explicit-equivalent `target` AND the implicit
+/// cache is not already that shape, i.e. when [`plan_wrapper_pbs`] keeps it
+/// (no `free_virtual`, no `alloc_virtual`). A kept owner is held by
+/// `Qwen35Scratch::reuse_virtual_pbs` across calls, so its bytes are already
+/// absent from device-free bytes and offset the full owner charge. An owner of
+/// any other shape is released and replaced; its bytes would only return to
+/// the allocator pool (not guaranteed reclaimable for a different size
+/// bucket), so it earns no credit. The implicit cache's own bytes are never
+/// credited.
+fn wrapper_virtual_credit_bytes(
+    config: &Qwen35Config,
+    physical: Option<(usize, bool)>,
+    existing_virtual: Option<(usize, bool)>,
+    target: (usize, bool),
+) -> usize {
+    existing_virtual
+        .filter(|&e| e == target && physical != Some(target))
+        .and_then(|(rows, tape)| resident_moe_owner_bytes(config, rows, tape))
+        .unwrap_or(0)
+}
+///
+/// Production wrapper step: gather the real facts, run the shared
+/// [`OrdinaryWrapperGate`] and [`plan_wrapper_pbs`] (the default-fits fact is
+/// the shared resident-MoE static decision plus the shared memory admission of
+/// the owner that would be allocated), then apply the plan to the scratch
+/// (release / allocate the virtual owner). Runs before any cache owner exists
+/// for the call, with the weights, config, state and KV in hand and no caller
+/// PBS. `call` is the caller/capture record of THIS call (built by
+/// `ordinary_call_facts`, the constructor the inner entry uses, with no caller
+/// PBS).
+#[allow(clippy::too_many_arguments)]
+fn ordinary_wrapper_pbs_prepare(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    dn_state: &DeltaNetState,
+    kv_cache: &mut llama::KvCache,
+    scratch: &Qwen35Scratch,
+    start_pos: usize,
+    n: usize,
+    call: OrdinaryCallFacts,
+) -> HipResult<WrapperPbsPlan> {
+    let physical = scratch
+        .prefill_batch
+        .as_ref()
+        .map(|p| (p.max_batch, pbs_has_tape(p)));
+    let existing_virtual = scratch
+        .reuse_virtual_pbs
+        .borrow()
+        .as_ref()
+        .map(|p| (p.max_batch, pbs_has_tape(p)));
+    // Every denying fact (caller/capture record, the call's own batched
+    // eligibility at its actual `n`, the 512-row seam) closes promotion before
+    // any override, mapping or allocation.
+    let gate = {
+        let arch = gpu.arch.as_str();
+        OrdinaryWrapperGate::new(n, &call, physical, |rows| {
+            prefill_batch_pbs_eligible(weights, config, dn_state, rows, arch, true)
+        })
+    };
+    // The inner entry charges the memory admission after the required KV is
+    // mapped.
+    if gate.maps_kv() {
+        let required_tokens = checked_kv_end(start_pos, n, "forward_prefill_batch")?;
+        release_widened_pbs_for_kv_growth(gpu, kv_cache, config, scratch, required_tokens)?;
+        kv_cache.ensure_mapped_capacity(gpu, required_tokens)?;
+    }
+    let dense_widened =
+        n > 0 && ordinary_dense_widen_statically_admitted(gpu, weights, config, dn_state);
+    let fp8_chunk512 = fp8_chunk512_for_gpu(gpu);
+    let default_moe_fits = gate.needs_default_fit(dense_widened) && {
+        let moe = resident_moe_static_facts(gpu, weights, config, dn_state);
+        let target =
+            implicit_reuse_pbs_plan(gpu.arch.as_str(), Some(RESIDENT_MOE_CHUNK_ROWS), fp8_chunk512);
+        let credit_bytes =
+            wrapper_virtual_credit_bytes(config, physical, existing_virtual, target);
+        resident_moe_default_fits(
+            &moe,
+            config,
+            KvTierFlags::from_cache(kv_cache),
+            || resident_moe_memory_facts(gpu),
+            ResidentMoeOwner {
+                rows: target.0,
+                tape: target.1,
+                credit_bytes,
+            },
+        )
+    };
+    let plan = gate.plan(
+        gpu.arch.as_str(),
+        fp8_chunk512,
+        dense_widened,
+        existing_virtual,
+        default_moe_fits,
+    );
+    if plan.free_virtual {
+        if let Some(old) = scratch.reuse_virtual_pbs.borrow_mut().take() {
+            old.free_gpu(gpu)?;
+        }
+    }
+    if plan.alloc_virtual {
+        if let WrapperOwner::Virtual { rows, tape } = plan.owner {
+            let owner = PrefillBatchScratch::new_opt(gpu, config, rows, tape)?;
+            *scratch.reuse_virtual_pbs.borrow_mut() = Some(owner);
+        }
+    }
+    Ok(plan)
+}
+///
+/// A ring-only eager forward (no per-token hidden rows, tape or tree) is a
+/// DFlash prompt seed that rides the ordinary route; verify and
+/// captured/recorded forwards keep the staged ring route. Shared by the inner
+/// entry and the wrappers.
+fn hidden_ring_seed(
+    gpu: &Gpu,
+    hidden_ring: Option<&HiddenStateRingBuffer>,
+    has_per_token_hidden_out: bool,
+    has_gdn_tape: bool,
+    has_tree_verify: bool,
+) -> bool {
+    match hidden_ring {
+        Some(rb) => {
+            !has_per_token_hidden_out
+                && !has_gdn_tape
+                && !has_tree_verify
+                && rb.rides_ordinary_prefill(gpu)
+        }
+        None => false,
+    }
+}
+///
+/// The one constructor of the caller/capture facts of an ordinary prefill
+/// call: the inner entry calls it with its real arguments, and each wrapper
+/// calls it (with no caller PBS) to gate the virtual-explicit promotion.
+#[allow(clippy::too_many_arguments)]
+fn ordinary_call_facts(
+    gpu: &Gpu,
+    caller_pbs_rows: Option<usize>,
+    max_batch_cap: Option<usize>,
+    has_tree_verify: bool,
+    has_gdn_tape: bool,
+    hidden_ring: Option<&HiddenStateRingBuffer>,
+    has_per_token_hidden_out: bool,
+    has_max_layer: bool,
+    fusion_on: bool,
+) -> OrdinaryCallFacts {
+    let ring_seed = hidden_ring_seed(
+        gpu,
+        hidden_ring,
+        has_per_token_hidden_out,
+        has_gdn_tape,
+        has_tree_verify,
+    );
+    OrdinaryCallFacts {
+        caller_pbs_rows,
+        max_batch_cap,
+        tree_verify: has_tree_verify,
+        gdn_tape: has_gdn_tape,
+        staged_hidden_ring: hidden_ring.is_some() && !ring_seed,
+        max_layer: has_max_layer,
+        fusion_on,
+        capture_mode: gpu.graphs.capture_mode,
+        recording: gpu.replay.is_recording(),
+    }
+}
+///
+/// The ordinary incumbent ceiling a call runs with: the model/arch default
+/// (or the wrapper's virtual-explicit override), capped by an explicit
+/// `max_batch_cap`.
+fn resolve_ordinary_max_batch(
+    model_default: usize,
+    max_batch_override: Option<usize>,
+    max_batch_cap: Option<usize>,
+) -> usize {
+    let configured = max_batch_override.unwrap_or(model_default);
+    match max_batch_cap {
+        Some(cap) => configured.min(cap),
+        None => configured,
+    }
+}
+///
+/// Live projection-prelude scratch already resident on the device (bytes).
+#[derive(Clone, Copy, Debug, Default)]
+struct LiveProjectionScratch {
+    int4_mmq_x: usize,
+    q8_1_mmq_x: usize,
+    fp16_x: usize,
+    fp8_x: usize,
+    fp8_half_sums: usize,
+    fp8_row_scales: usize,
+}
+
+fn live_projection_scratch(gpu: &Gpu) -> LiveProjectionScratch {
+    LiveProjectionScratch {
+        int4_mmq_x: gpu.scratch.int4_mmq_x_scratch_bytes,
+        q8_1_mmq_x: gpu.scratch.q8_1_mmq_x_scratch_bytes,
+        fp16_x: gpu.scratch.fp16_x_scratch_bytes,
+        fp8_x: gpu.scratch.mq4v2_fp8_x_scratch_bytes,
+        fp8_half_sums: gpu.scratch.mq4v2_fp8_half_sums_scratch_bytes,
+        fp8_row_scales: gpu.scratch.mq4v2_fp8_row_scales_scratch_bytes,
+    }
+}
+///
+/// Bytes of the `PrefillBatchScratch::new_opt` allocations that
+/// [`PrefillBatchScratch::projected_allocation_bytes`] does not mirror:
+/// `dn_z_fold_batch` (`rows * (v_dim + 256)` F32) and `dn_normed_batch`
+/// (`rows * v_dim` F32 for a non-lean owner), i.e. `rows * (2 * v_dim + 256) *
+/// 4`. Charged here, in the resident-MoE census only, so the global
+/// placement/offload reservation (`dense_prefill_allocation_bytes`) is
+/// unchanged. `None` on overflow.
+fn resident_moe_pbs_unmirrored_bytes(config: &Qwen35Config, rows: usize) -> Option<usize> {
+    let v_dim = config
+        .linear_num_value_heads
+        .checked_mul(config.linear_value_head_dim)?;
+    let per_row = v_dim.checked_mul(2)?.checked_add(256)?;
+    rows.checked_mul(per_row)?.checked_mul(4)
+}
+///
+/// Requested payload bytes of one non-lean [`PrefillBatchScratch`] owner of
+/// `rows` rows with or without the verify-only S-tape: the constructor mirror
+/// plus [`resident_moe_pbs_unmirrored_bytes`], each term once. Payload only
+/// (no driver rounding or allocator overhead: the 1 GiB headroom covers such
+/// transients). `None` on overflow.
+fn resident_moe_owner_bytes(config: &Qwen35Config, rows: usize, tape: bool) -> Option<usize> {
+    let mirrored = PrefillBatchScratch::projected_allocation_bytes(config, rows, tape)
+        .ok()
+        .and_then(|bytes| usize::try_from(bytes).ok())?;
+    mirrored.checked_add(resident_moe_pbs_unmirrored_bytes(config, rows)?)
+}
+///
+/// Steady-state bytes of one ordinary (tape-free) MoE [`PrefillBatchScratch`]
+/// at `rows` rows ([`resident_moe_owner_bytes`] with no tape): the checked
+/// constructor mirror, which charges the shared-expert, expanded-expert and
+/// grouped-GEMM scratch term for term (sorted maps, tile ids, grouped gate/up
+/// and down outputs) and the inactive residual backup, plus the two
+/// allocations it omits. Ordinary prefill allocates `cap_gdn_tape = false`, so
+/// the verify-only DeltaNet S-tape is NOT charged (unlike the placement
+/// reservation in [`dense_prefill_allocation_bytes`]). `None` on overflow.
+fn resident_moe_pbs_bytes(config: &Qwen35Config, rows: usize) -> Option<usize> {
+    resident_moe_owner_bytes(config, rows, false)
+}
+///
+/// Projection-prelude growth to `rows` rows. Producer-agnostic and
+/// conservative for MoE (no dense FP8-only byte assumption): at the widest
+/// projection K the grouped route can feed — hidden `dim`, the DeltaNet/attention
+/// output widths and the shared/routed intermediates — every prelude
+/// representation a producer may select (iu4 72 B/128, Q8_1 144 B/128, FP16,
+/// FP8 codes + half sums + row scales) is charged, each net of the bytes the
+/// matching live scratch already holds. `None` on overflow.
+fn resident_moe_projection_deficit(
+    config: &Qwen35Config,
+    rows: usize,
+    live: &LiveProjectionScratch,
+) -> Option<usize> {
+    let v = config
+        .linear_num_value_heads
+        .checked_mul(config.linear_value_head_dim)?;
+    let q = config.n_heads.checked_mul(config.head_dim)?;
+    let k = config
+        .dim
+        .max(v)
+        .max(q)
+        .max(config.shared_expert_intermediate_size)
+        .max(config.moe_intermediate_size);
+    let blocks128 = k.checked_add(127)? / 128;
+    let blocks256 = k.checked_add(255)? / 256;
+    let terms = [
+        (blocks128.checked_mul(72)?, live.int4_mmq_x),
+        (blocks128.checked_mul(144)?, live.q8_1_mmq_x),
+        (k.checked_mul(2)?, live.fp16_x),
+        (k, live.fp8_x),
+        (blocks256.checked_mul(8)?, live.fp8_half_sums),
+        (4, live.fp8_row_scales),
+    ];
+    let mut total = 0usize;
+    for (per_row, live_bytes) in terms {
+        let need = rows.checked_mul(per_row)?;
+        total = total.checked_add(need.saturating_sub(live_bytes))?;
+    }
+    Some(total)
+}
+///
+/// Missing FA Q16 scratch for `rows` rows. The MoE layer bodies run the whole
+/// chunk through attention (`commit_stride = None`, no 512-row segmenting), and
+/// every selectable Q16 scratch consumer (`rdna-compute` attention) sizes
+/// `batch_size * n_heads * head_dim * 2` from that actual batch, freeing the
+/// old buffer before allocating the grown one, so the growth charged here is
+/// the full-row requirement net of the bytes the live buffer already holds.
+/// `None` on overflow.
+fn resident_moe_q16_missing(config: &Qwen35Config, rows: usize, live_q16: usize) -> Option<usize> {
+    let need = rows
+        .checked_mul(config.n_heads.checked_mul(config.head_dim)?)?
+        .checked_mul(2)?;
+    Some(need.saturating_sub(live_q16))
+}
+///
+/// The retained widened PBS owner `(rows, lean)` the call will actually REUSE
+/// without replacement: the inner entry keeps its cached owner only when
+/// `rows >= reuse_rows` (the rows the call's owned PBS needs,
+/// [`widened_owned_rows`]`(RESIDENT_MOE_CHUNK_ROWS, n)`) and its leanness
+/// matches the call's. A resident MoE owner is never lean
+/// (`lean_pbs_route` requires a dense model), so a lean cached owner is a
+/// mismatch. Anything else is freed (`free_gpu` returns it to the allocator
+/// pool, bucket-local; only an out-of-memory drain releases it to the
+/// driver, and a different size bucket is not guaranteed to reclaim it) and
+/// replaced by a full owner, so it earns NO credit: the full rung is charged.
+fn resident_moe_reusable_cached(
+    cached: Option<(usize, bool)>,
+    reuse_rows: usize,
+) -> Option<(usize, bool)> {
+    cached.filter(|&(rows, lean)| !lean && rows >= reuse_rows)
+}
+///
+/// Credit for a retained widened PBS owner that is reused in place (see
+/// [`resident_moe_reusable_cached`]): exactly the bytes of that owner's shape,
+/// only when it is a full (non-lean) owner. Callers hand a cached owner only
+/// on the grow-only route where retention is observable in free VRAM.
+fn resident_moe_cache_credit(config: &Qwen35Config, cached: Option<(usize, bool)>) -> usize {
+    cached
+        .filter(|&(_, lean)| !lean)
+        .and_then(|(rows, _)| resident_moe_pbs_bytes(config, rows))
+        .unwrap_or(0)
+}
+///
+/// Inputs of the resident-MoE memory decision. `None` terms mean checked
+/// arithmetic overflowed and make the rung inadmissible.
+#[derive(Clone, Copy, Debug)]
+struct ResidentMoeFit {
+    free_bytes: usize,
+    free_deduction: usize,
+    pbs_bytes: Option<usize>,
+    cached_credit: usize,
+    projection_deficit: Option<usize>,
+    q16_missing: Option<usize>,
+}
+///
+/// The rung fits iff projected PBS (net of the cached owner credit) +
+/// projection-prelude growth + missing Q16 + the existing
+/// [`WIDENED_VRAM_HEADROOM_BYTES`] is `<=` device-free bytes minus pending
+/// allocations. Any overflow fails closed.
+fn resident_moe_rung_fits(fit: &ResidentMoeFit) -> bool {
+    let (Some(pbs), Some(projection), Some(q16)) =
+        (fit.pbs_bytes, fit.projection_deficit, fit.q16_missing)
+    else {
+        return false;
+    };
+    let Some(total) = pbs
+        .saturating_sub(fit.cached_credit)
+        .checked_add(projection)
+        .and_then(|t| t.checked_add(q16))
+        .and_then(|t| t.checked_add(WIDENED_VRAM_HEADROOM_BYTES))
+    else {
+        return false;
+    };
+    total <= fit.free_bytes.saturating_sub(fit.free_deduction)
+}
+///
+/// Final binary decision: the MoE rung when it fits, else the incumbent.
+fn resident_moe_limit(fits: bool, incumbent: usize) -> usize {
+    if fits {
+        RESIDENT_MOE_CHUNK_ROWS
+    } else {
+        incumbent
+    }
+}
+///
+/// KV tier flags the resident-MoE admission reads from a [`llama::KvCache`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+struct KvTierFlags {
+    quant_q8: bool,
+    quant_asym4: bool,
+    quant_asym3: bool,
+    quant_asym2: bool,
+    quant_fp8: bool,
+}
+
+impl KvTierFlags {
+    fn from_cache(kv: &llama::KvCache) -> Self {
+        Self {
+            quant_q8: kv.quant_q8,
+            quant_asym4: kv.quant_asym4,
+            quant_asym3: kv.quant_asym3,
+            quant_asym2: kv.quant_asym2,
+            quant_fp8: kv.quant_fp8,
+        }
+    }
+
+    /// Batched flash attention is selectable for the tier.
+    fn batched_flash(self) -> bool {
+        self.quant_q8
+            || self.quant_asym4
+            || self.quant_asym3
+            || self.quant_asym2
+            || self.quant_fp8
+    }
+}
+///
+/// Device-memory facts of the resident-MoE memory decision.
+#[derive(Clone, Copy, Debug)]
+struct ResidentMoeMemoryFacts {
+    /// Device-free bytes; `None` when the query failed (keeps the incumbent).
+    free_bytes: Option<usize>,
+    live: LiveProjectionScratch,
+    /// Bytes the live FA Q16 scratch already holds.
+    live_q16_bytes: usize,
+}
+
+fn resident_moe_memory_facts(gpu: &Gpu) -> ResidentMoeMemoryFacts {
+    ResidentMoeMemoryFacts {
+        free_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
+        live: live_projection_scratch(gpu),
+        live_q16_bytes: gpu.scratch.fa2_q16_scratch_bytes,
+    }
+}
+///
+/// The PBS owner whose bytes the memory decision charges and credits.
+/// [`Self::WIDENED`] is the tape-free widened owner the inner entry
+/// allocates; the wrapper's virtual-explicit owner may be a different shape
+/// (tape flag, rows) and may already exist (`credit_bytes`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResidentMoeOwner {
+    rows: usize,
+    tape: bool,
+    credit_bytes: usize,
+}
+
+impl ResidentMoeOwner {
+    const WIDENED: Self = Self {
+        rows: RESIDENT_MOE_CHUNK_ROWS,
+        tape: false,
+        credit_bytes: 0,
+    };
+}
+///
+/// Memory admission of [`RESIDENT_MOE_CHUNK_ROWS`]: batched flash attention
+/// must be selectable for the KV tier, the device free-byte query must
+/// succeed (a failed query keeps the incumbent), and the rung must fit. The
+/// charged PBS is the larger of the tape-free 4096-row rung and `owner`'s own
+/// projected bytes. `cached` is the retained widened owner `(rows, lean)` the
+/// grow-only route credits; `owner.credit_bytes` credits an existing owner.
+fn resident_moe_memory_admits(
+    config: &Qwen35Config,
+    kv: KvTierFlags,
+    mem: &ResidentMoeMemoryFacts,
+    cached: Option<(usize, bool)>,
+    owner: ResidentMoeOwner,
+    free_deduction: usize,
+) -> bool {
+    if !kv.batched_flash() {
+        return false;
+    }
+    let Some(free_bytes) = mem.free_bytes else {
+        return false;
+    };
+    let owner_bytes = resident_moe_owner_bytes(config, owner.rows, owner.tape);
+    let pbs_bytes = match (resident_moe_pbs_bytes(config, RESIDENT_MOE_CHUNK_ROWS), owner_bytes) {
+        (Some(rung), Some(own)) => Some(rung.max(own)),
+        _ => None,
+    };
+    resident_moe_rung_fits(&ResidentMoeFit {
+        free_bytes,
+        free_deduction,
+        pbs_bytes,
+        cached_credit: resident_moe_cache_credit(config, cached)
+            .saturating_add(owner.credit_bytes),
+        projection_deficit: resident_moe_projection_deficit(
+            config,
+            RESIDENT_MOE_CHUNK_ROWS,
+            &mem.live,
+        ),
+        q16_missing: resident_moe_q16_missing(
+            config,
+            RESIDENT_MOE_CHUNK_ROWS,
+            mem.live_q16_bytes,
+        ),
+    })
+}
+///
+/// The DEFAULT resident-MoE request is eligible and its rung fits with
+/// `owner` as the PBS: the wrapper's "virtual explicit 4096" test. `mem` is
+/// read only once the static decision admits.
+fn resident_moe_default_fits(
+    static_facts: &ResidentMoeStaticFacts,
+    config: &Qwen35Config,
+    kv: KvTierFlags,
+    mem: impl FnOnce() -> ResidentMoeMemoryFacts,
+    owner: ResidentMoeOwner,
+) -> bool {
+    resident_moe_static_decision(static_facts).is_some()
+        && resident_moe_memory_admits(config, kv, &mem(), None, owner, 0)
+}
+///
+/// Ordinary chunk ceiling of the resident MoE route: [`RESIDENT_MOE_CHUNK_ROWS`]
+/// only when [`resident_moe_static_decision`] admits, the caller's staging
+/// owner (if any) can hold it, and [`resident_moe_memory_admits`]; otherwise
+/// `incumbent`. `mem` is read only once the cheaper gates pass. `cached` is the
+/// retained widened owner `(rows, lean)` and `reuse_rows` the rows the call's
+/// owned PBS needs: it is credited only when it is actually reused
+/// ([`resident_moe_reusable_cached`]). The single decision shared by
+/// production ([`ordinary_prefill_chunk_limit_with_facts`]) and the CPU
+/// installed-artifact tests.
+#[allow(clippy::too_many_arguments)]
+fn resident_moe_chunk_limit_from_facts(
+    static_facts: &ResidentMoeStaticFacts,
+    caller_pbs_rows: Option<usize>,
+    config: &Qwen35Config,
+    kv: KvTierFlags,
+    mem: impl FnOnce() -> ResidentMoeMemoryFacts,
+    cached: Option<(usize, bool)>,
+    reuse_rows: usize,
+    free_deduction: usize,
+    incumbent: usize,
+) -> usize {
+    if resident_moe_static_decision(static_facts).is_none() {
+        return incumbent;
+    }
+    if caller_pbs_rows.is_some_and(|rows| rows < RESIDENT_MOE_CHUNK_ROWS) {
+        return incumbent;
+    }
+    resident_moe_limit(
+        resident_moe_memory_admits(
+            config,
+            kv,
+            &mem(),
+            resident_moe_reusable_cached(cached, reuse_rows),
+            ResidentMoeOwner::WIDENED,
+            free_deduction,
+        ),
+        incumbent,
+    )
+}
+///
+/// Caller/capture facts of one ordinary prefill call: every reason the inner
+/// entry keeps the legacy cadence regardless of the model.
+#[derive(Clone, Copy, Debug, Default)]
+struct OrdinaryCallFacts {
+    /// Rows of the PBS the caller (or the wrapper's retained implicit cache)
+    /// hands the inner entry.
+    caller_pbs_rows: Option<usize>,
+    max_batch_cap: Option<usize>,
+    tree_verify: bool,
+    gdn_tape: bool,
+    /// A staged hidden ring (a ring-only eager seed rides the ordinary route).
+    staged_hidden_ring: bool,
+    max_layer: bool,
+    fusion_on: bool,
+    capture_mode: bool,
+    recording: bool,
+}
+
+impl OrdinaryCallFacts {
+    /// Only the whole-stack sequential ordinary entry with no caller PBS/cap
+    /// can widen: captured, TP/EP (separate callers), tree/tape, staged
+    /// hidden-ring, band-limited, fused, or caller-capped requests resolve to
+    /// the legacy path before any wider allocation or launch.
+    fn wide_candidate(&self) -> bool {
+        self.caller_pbs_rows.is_none()
+            && self.max_batch_cap.is_none()
+            && !self.tree_verify
+            && !self.gdn_tape
+            && !self.staged_hidden_ring
+            && !self.max_layer
+            && !self.fusion_on
+            && !self.capture_mode
+            && !self.recording
+    }
+}
+///
+/// Inputs of [`plan_ordinary_prefill`] beyond the call facts.
+#[derive(Clone, Copy, Debug)]
+struct OrdinaryPlanRequest {
+    call: OrdinaryCallFacts,
+    n: usize,
+    /// Incumbent ordinary ceiling (explicit/arch default, caller-capped).
+    max_batch: usize,
+    explicit_max_batch: Option<usize>,
+    /// [`prefill_chunk_rows_requested`] (the dense widened receipt value).
+    chunk_rows_requested: usize,
+    moe_request: ResidentMoeRequest,
+    /// [`resident_moe_static_decision`] admitted the model.
+    moe_static_admitted: bool,
+}
+///
+/// The parameters one ordinary prefill call executes with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OrdinaryPrefillPlan {
+    /// Admitted chunk ceiling in rows.
+    limit: usize,
+    /// Widened route: larger chunks with 512-row commit seams.
+    wide: bool,
+    moe_route: bool,
+    /// The visible `prefill_chunk:` line.
+    receipt: PrefillChunkReceipt,
+    /// Rows of the PBS the chunks run on: the caller's owner, the widened owned
+    /// owner, or the legacy right-sized owned scratch.
+    pbs_rows: usize,
+}
+
+impl OrdinaryPrefillPlan {
+    /// Chunk rows actually executed per step (before the hidden-ring cap).
+    fn chunk_batch(&self, hidden_ring_cap: Option<usize>) -> usize {
+        prefill_effective_chunk_batch(self.limit, self.pbs_rows, hidden_ring_cap)
+    }
+}
+///
+/// The ordinary prefill parameter planner shared by the production inner entry
+/// and the CPU tests. `limit_when_candidate` runs only for a widen candidate
+/// (production: the dense/MoE admission over the loaded model and device;
+/// tests: the same shared decisions over artifact-derived facts); every other
+/// call keeps the incumbent `max_batch`.
+fn plan_ordinary_prefill<E>(
+    req: &OrdinaryPlanRequest,
+    limit_when_candidate: impl FnOnce() -> Result<usize, E>,
+) -> Result<OrdinaryPrefillPlan, E> {
+    let wide_candidate = req.call.wide_candidate();
+    let limit = if wide_candidate {
+        limit_when_candidate()?
+    } else {
+        req.max_batch
+    };
+    let wide = widened_route(wide_candidate, limit);
+    let moe_route = wide_candidate && req.moe_static_admitted;
+    let requested = if moe_route {
+        match req.moe_request {
+            ResidentMoeRequest::Widen { requested } => requested,
+            ResidentMoeRequest::Incumbent => req.max_batch,
+        }
+    } else if wide {
+        req.chunk_rows_requested
+    } else {
+        req.explicit_max_batch.unwrap_or(req.max_batch)
+    };
+    let pbs_rows = match req.call.caller_pbs_rows {
+        Some(rows) => rows,
+        None if wide => widened_owned_rows(limit, req.n),
+        None => {
+            owned_prefill_scratch_plan(req.n, req.max_batch.min(limit), req.call.tree_verify).0
+        }
+    };
+    Ok(OrdinaryPrefillPlan {
+        limit,
+        wide,
+        moe_route,
+        receipt: PrefillChunkReceipt {
+            requested,
+            admitted: limit,
+            commit_stride: wide.then_some(WIDENED_COMMIT_ROWS),
+        },
+        pbs_rows,
+    })
+}
+///
+/// Next chunk of the ordinary loop: widened grouping keeps an odd tail attached
+/// to the largest admitted chunk (packed for gfx1100 native MQ4), the legacy
+/// path keeps its cadence.
+fn next_ordinary_chunk_len(
+    wide: bool,
+    packed_mq4: bool,
+    remaining: usize,
+    chunk_batch: usize,
+) -> Option<usize> {
+    if wide && packed_mq4 {
+        next_packed_prefill_chunk_len(remaining, chunk_batch)
+    } else if wide {
+        next_exact_prefill_chunk_len(remaining, chunk_batch)
+    } else {
+        next_prefill_chunk_len(remaining, chunk_batch)
+    }
 }
 /// Only the retained widened PBS owner can use this representation: ordinary
 /// sequential prefill runs eager, with no tree/chain verify or MoE/TP/EP.
@@ -2473,6 +3763,13 @@ fn memory_admitted_rung(
 /// Public only because hipfire-generate's ordinary AR caller needs the same
 /// decision. Existing generic/TP/EP getters are unchanged; `pbs` limits the
 /// ceiling when a caller owns a smaller staging buffer.
+///
+/// Resident Qwen35 MoE models (fully resident, single device, MQ4G256/V2
+/// grouped producers; see [`resident_moe_static_decision`]) resolve to
+/// [`RESIDENT_MOE_CHUNK_ROWS`] when the projected PBS, grouped/projection
+/// scratch, full-row Q16 growth and the 1 GiB headroom fit in device-free
+/// bytes minus `free_deduction`, else to the incumbent ceiling — never an
+/// intermediate rung. Explicit `HIPFIRE_PREFILL_MAX_BATCH` keeps the incumbent.
 pub fn ordinary_prefill_chunk_limit(
     gpu: &Gpu,
     weights: &Qwen35Weights,
@@ -2481,7 +3778,17 @@ pub fn ordinary_prefill_chunk_limit(
     kv_cache: &llama::KvCache,
     pbs: Option<&PrefillBatchScratch>,
 ) -> HipResult<usize> {
-    ordinary_prefill_chunk_limit_with_cache(gpu, weights, config, dn_state, kv_cache, pbs, None, 0)
+    ordinary_prefill_chunk_limit_with_cache(
+        gpu,
+        weights,
+        config,
+        dn_state,
+        kv_cache,
+        pbs,
+        None,
+        RESIDENT_MOE_CHUNK_ROWS,
+        0,
+    )
 }
 ///
 /// [`ordinary_prefill_chunk_limit`] as it will read after `free_deduction`
@@ -2499,7 +3806,17 @@ pub fn ordinary_prefill_chunk_limit_deducting(
     kv_cache: &llama::KvCache,
     free_deduction: usize,
 ) -> HipResult<usize> {
-    ordinary_prefill_chunk_limit_with_cache(gpu, weights, config, dn_state, kv_cache, None, None, free_deduction)
+    ordinary_prefill_chunk_limit_with_cache(
+        gpu,
+        weights,
+        config,
+        dn_state,
+        kv_cache,
+        None,
+        None,
+        RESIDENT_MOE_CHUNK_ROWS,
+        free_deduction,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2511,11 +3828,45 @@ fn ordinary_prefill_chunk_limit_with_cache(
     kv_cache: &llama::KvCache,
     pbs: Option<&PrefillBatchScratch>,
     cached: Option<&PrefillBatchScratch>,
+    reuse_rows: usize,
     free_deduction: usize,
+) -> HipResult<usize> {
+    let moe = resident_moe_static_facts(gpu, weights, config, dn_state);
+    ordinary_prefill_chunk_limit_with_facts(
+        gpu, weights, config, dn_state, kv_cache, pbs, cached, reuse_rows, free_deduction, &moe,
+    )
+}
+
+/// [`ordinary_prefill_chunk_limit_with_cache`] over already gathered resident
+/// MoE static facts (the inner entry gathers them once for the whole call).
+#[allow(clippy::too_many_arguments)]
+fn ordinary_prefill_chunk_limit_with_facts(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    dn_state: &DeltaNetState,
+    kv_cache: &llama::KvCache,
+    pbs: Option<&PrefillBatchScratch>,
+    cached: Option<&PrefillBatchScratch>,
+    // Rows of the owned widened PBS the call needs (see
+    // [`resident_moe_reusable_cached`]); only the resident-MoE arm reads it.
+    reuse_rows: usize,
+    free_deduction: usize,
+    moe: &ResidentMoeStaticFacts,
 ) -> HipResult<usize> {
     let legacy = prefill_max_batch_for_model(gpu, weights);
     let Some(perf) = ordinary_prefill_static_ceiling(gpu, weights, config, dn_state) else {
-        return Ok(legacy);
+        return Ok(resident_moe_chunk_limit_from_facts(
+            moe,
+            pbs.map(|p| p.max_batch),
+            config,
+            KvTierFlags::from_cache(kv_cache),
+            || resident_moe_memory_facts(gpu),
+            cached.map(|p| (p.max_batch, p.lean)),
+            reuse_rows,
+            free_deduction,
+            legacy,
+        ));
     };
     if perf <= WIDENED_COMMIT_ROWS {
         return Ok(perf.min(legacy));
@@ -2589,15 +3940,53 @@ pub fn ordinary_serve_prefill_chunk_len(remaining: usize, ceiling: usize) -> Opt
 /// fallback is visible in the log.
 fn emit_prefill_chunk_receipt(requested: usize, admitted: usize, commit_stride: Option<usize>) {
     static LAST_ADMITTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    if LAST_ADMITTED.swap(admitted, std::sync::atomic::Ordering::Relaxed) == admitted {
-        return;
+    emit_prefill_chunk_receipt_guarded(&LAST_ADMITTED, requested, admitted, commit_stride);
+}
+
+/// [`emit_prefill_chunk_receipt`] with the changed-admission guard injected,
+/// so a CPU test (one fresh guard per modelled load) exercises the exact
+/// production print path. Returns whether a line was printed.
+fn emit_prefill_chunk_receipt_guarded(
+    last_admitted: &std::sync::atomic::AtomicUsize,
+    requested: usize,
+    admitted: usize,
+    commit_stride: Option<usize>,
+) -> bool {
+    if last_admitted.swap(admitted, std::sync::atomic::Ordering::Relaxed) == admitted {
+        return false;
     }
-    match commit_stride {
-        Some(s) => {
-            eprintln!("prefill_chunk: requested={requested} admitted={admitted} commit_stride={s}")
+    eprintln!(
+        "{}",
+        PrefillChunkReceipt {
+            requested,
+            admitted,
+            commit_stride
         }
-        None => {
-            eprintln!("prefill_chunk: requested={requested} admitted={admitted} commit_stride=none")
+    );
+    true
+}
+///
+/// The one visible admitted-chunk line (`prefill_chunk: requested=… admitted=…
+/// commit_stride=…`). Production prints it with `eprintln!("{receipt}")`
+/// through [`emit_prefill_chunk_receipt`]; CPU tests format the same value, so
+/// the log line they assert is the production line and neither allocates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PrefillChunkReceipt {
+    requested: usize,
+    admitted: usize,
+    commit_stride: Option<usize>,
+}
+
+impl std::fmt::Display for PrefillChunkReceipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "prefill_chunk: requested={} admitted={} commit_stride=",
+            self.requested, self.admitted
+        )?;
+        match self.commit_stride {
+            Some(stride) => write!(f, "{stride}"),
+            None => f.write_str("none"),
         }
     }
 }
@@ -2923,17 +4312,29 @@ pub fn forward_prefill_batch(
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
 ) -> HipResult<()> {
-    // Widened ordinary route: omit the implicit ≤512 legacy cache so a fully
-    // admitted request allocates one larger owned PBS in the inner entry.
-    // Explicit small ceilings keep the cache; capped/explicit-PBS callers
-    // never bypass (see `forward_prefill_batch_capped` and the inner entry).
-    let widen = ordinary_prefill_static_ceiling(gpu, weights, config, dn_state)
-        .is_some_and(|c| c > WIDENED_COMMIT_ROWS);
-    let pbs_for_call = match scratch.prefill_batch.as_ref() {
-        Some(_) if widen => None,
-        other => other,
-    };
-    forward_prefill_batch_with_pbs(
+    // Wrapper PBS plan (`plan_wrapper_pbs`): the dense widened route drops the
+    // implicit ≤512 cache; an eligible, memory-admitted DEFAULT resident-MoE
+    // request runs as a virtual explicit `HIPFIRE_PREFILL_MAX_BATCH=4096`
+    // (owner rows/tape from the explicit cache sizing, ceiling 4096); every
+    // other call keeps the implicit cache. Capped/explicit-PBS callers never
+    // bypass (see `forward_prefill_batch_capped` and the inner entry).
+    let call = ordinary_call_facts(
+        gpu,
+        None,
+        None,
+        tree_verify.is_some(),
+        gdn_tape.is_some(),
+        hidden_rb.as_deref(),
+        per_token_hidden_out.is_some(),
+        false,
+        false,
+    );
+    let wrapper = ordinary_wrapper_pbs_prepare(
+        gpu, weights, config, dn_state, kv_cache, scratch, start_pos, tokens.len(), call,
+    )?;
+    let virtual_owner = scratch.reuse_virtual_pbs.borrow();
+    let pbs_for_call = wrapper.pbs(scratch.prefill_batch.as_ref(), virtual_owner.as_ref());
+    let result = forward_prefill_batch_with_pbs_opts_inner(
         gpu,
         weights,
         config,
@@ -2944,12 +4345,18 @@ pub fn forward_prefill_batch(
         scratch,
         hidden_rb,
         per_token_hidden_out,
+        HiddenCapture::Verify,
         gdn_tape,
         tree_verify,
         pbs_for_call,
         None, // mask_override: MTP probe is the only consumer; default callers don't override
         None, // max_layer: pflash uses this; non-pflash default is full stack
-    )
+        true, // preserve legacy post-condition: scratch.logits is last-token logits
+        None,
+        wrapper.max_batch_override,
+        DflashFusionCtx::Off,
+    );
+    result
 }
 
 /// Ordinary prompt prefill that also writes every row's post-output-norm
@@ -2974,14 +4381,14 @@ pub fn forward_prefill_batch_capture_hidden(
     scratch: &Qwen35Scratch,
     hidden_out: &GpuTensor,
 ) -> HipResult<()> {
-    // Same implicit-cache omission as `forward_prefill_batch`.
-    let widen = ordinary_prefill_static_ceiling(gpu, weights, config, dn_state)
-        .is_some_and(|c| c > WIDENED_COMMIT_ROWS);
-    let pbs_for_call = match scratch.prefill_batch.as_ref() {
-        Some(_) if widen => None,
-        other => other,
-    };
-    forward_prefill_batch_with_pbs_opts_inner(
+    // Same wrapper PBS plan as `forward_prefill_batch`.
+    let call = ordinary_call_facts(gpu, None, None, false, false, None, true, false, false);
+    let wrapper = ordinary_wrapper_pbs_prepare(
+        gpu, weights, config, dn_state, kv_cache, scratch, start_pos, tokens.len(), call,
+    )?;
+    let virtual_owner = scratch.reuse_virtual_pbs.borrow();
+    let pbs_for_call = wrapper.pbs(scratch.prefill_batch.as_ref(), virtual_owner.as_ref());
+    let result = forward_prefill_batch_with_pbs_opts_inner(
         gpu,
         weights,
         config,
@@ -3000,8 +4407,10 @@ pub fn forward_prefill_batch_capture_hidden(
         None,
         true,
         None,
+        wrapper.max_batch_override,
         DflashFusionCtx::Off,
-    )
+    );
+    result
 }
 
 /// Like [`forward_prefill_batch`], but forces the configured chunk ceiling
@@ -3048,6 +4457,7 @@ pub fn forward_prefill_batch_capped(
         None,
         true,
         Some(max_batch_cap),
+        None,
         DflashFusionCtx::Off,
     )
 }
@@ -3150,6 +4560,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
         max_layer,
         needs_last_token_logits,
         None,
+        None,
         fusion,
     )
 }
@@ -3174,6 +4585,9 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     max_layer: Option<usize>,
     needs_last_token_logits: bool,
     max_batch_cap: Option<usize>,
+    // Virtual explicit `HIPFIRE_PREFILL_MAX_BATCH` chosen by the ordinary
+    // wrapper (`plan_wrapper_pbs`); replaces the arch/env default ceiling.
+    max_batch_override: Option<usize>,
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
     // Plain single-token AR decode? Only then is the per-token `forward_scratch`
@@ -3204,13 +4618,11 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     // still sequential per token, so the per-chunk DeltaNet cost is linear
     // in N either way; raising the batch just amortizes the NON-DeltaNet
     // kernels more.
-    let max_batch: usize = {
-        let configured = prefill_max_batch_for_model(gpu, weights);
-        match max_batch_cap {
-            Some(cap) => configured.min(cap),
-            None => configured,
-        }
-    };
+    let max_batch: usize = resolve_ordinary_max_batch(
+        prefill_max_batch_for_model(gpu, weights),
+        max_batch_override,
+        max_batch_cap,
+    );
 
     let n = tokens.len();
     if n == 0 {
@@ -3433,57 +4845,70 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     // prefills the same tokens; chunks wider than ring staging write their
     // hidden rows straight to the ring (`HiddenStateRingBuffer::writes_direct`).
     // Verify and captured/recorded forwards keep the staged ring route.
-    let ring_seed = match hidden_rb.as_deref() {
-        Some(rb) => {
-            per_token_hidden_out.is_none()
-                && gdn_tape.is_none()
-                && tree_verify.is_none()
-                && rb.rides_ordinary_prefill(gpu)
-        }
-        None => false,
-    };
+    let ring_seed = hidden_ring_seed(
+        gpu,
+        hidden_rb.as_deref(),
+        per_token_hidden_out.is_some(),
+        gdn_tape.is_some(),
+        tree_verify.is_some(),
+    );
     // Widened ordinary admission. Decided here, after required KV mapping, so
     // the per-device byte admission charges mapped KV. Only the whole-stack
     // sequential ordinary entry with no caller PBS/cap can widen: captured,
     // TP/EP (separate callers), tree/tape, staged hidden-ring, band-limited,
     // fused, or caller-capped requests resolve to the legacy path before any
-    // wider allocation or launch. The ordinary wrappers omit their *implicit*
-    // ≤512 legacy cache above when a wider ceiling is statically admitted, so
-    // `pbs_in.is_none()` here means the owner decision is ours; an explicit
-    // smaller caller PBS always wins and keeps legacy cadence.
-    let wide_candidate = pbs_in.is_none()
-        && max_batch_cap.is_none()
-        && tree_verify.is_none()
-        && gdn_tape.is_none()
-        && (hidden_rb.is_none() || ring_seed)
-        && max_layer.is_none()
-        && matches!(fusion, DflashFusionCtx::Off)
-        && !gpu.graphs.capture_mode
-        && !gpu.replay.is_recording();
-    let limit = if wide_candidate {
-        let cached = scratch.widened_prefill_batch.borrow();
-        ordinary_prefill_chunk_limit_with_cache(
-            gpu,
-            weights,
-            config,
-            dn_state,
-            kv_cache,
-            None,
-            cached.as_ref().filter(|_| widened_pbs_grow_only(gpu)),
-            0,
-        )?
-    } else {
-        max_batch
-    };
-    let wide_admitted = wide_candidate && limit > WIDENED_COMMIT_ROWS;
-    emit_prefill_chunk_receipt(
-        if wide_admitted {
-            prefill_chunk_rows_requested(gpu)
-        } else {
-            explicit_prefill_max_batch().unwrap_or(max_batch)
+    // wider allocation or launch. The dense widened wrapper omits its
+    // *implicit* ≤512 legacy cache above (`plan_wrapper_pbs`); an eligible,
+    // memory-admitted DEFAULT resident-MoE request arrives here as a virtual
+    // explicit `HIPFIRE_PREFILL_MAX_BATCH=4096` (caller owner with the explicit
+    // cache rows/tape and `max_batch_override`), and every other cache is a
+    // caller owner that keeps legacy cadence. An explicit smaller caller PBS
+    // always wins. Every parameter below comes from `plan_ordinary_prefill`,
+    // the same planner the CPU installed-artifact tests call.
+    let moe_facts = resident_moe_static_facts(gpu, weights, config, dn_state);
+    let plan = plan_ordinary_prefill(
+        &OrdinaryPlanRequest {
+            call: ordinary_call_facts(
+                gpu,
+                pbs_in.map(|p| p.max_batch),
+                max_batch_cap,
+                tree_verify.is_some(),
+                gdn_tape.is_some(),
+                hidden_rb.as_deref(),
+                per_token_hidden_out.is_some(),
+                max_layer.is_some(),
+                !matches!(fusion, DflashFusionCtx::Off),
+            ),
+            n,
+            max_batch,
+            explicit_max_batch: explicit_prefill_max_batch(),
+            chunk_rows_requested: prefill_chunk_rows_requested(gpu),
+            moe_request: moe_facts.request,
+            moe_static_admitted: resident_moe_static_decision(&moe_facts).is_some(),
         },
-        limit,
-        wide_admitted.then_some(WIDENED_COMMIT_ROWS),
+        || {
+            let cached = scratch.widened_prefill_batch.borrow();
+            ordinary_prefill_chunk_limit_with_facts(
+                gpu,
+                weights,
+                config,
+                dn_state,
+                kv_cache,
+                None,
+                cached.as_ref().filter(|_| widened_pbs_grow_only(gpu)),
+                // Credit the retained owner only if this call reuses it in
+                // place: the rows its owned widened PBS needs at the rung.
+                widened_owned_rows(RESIDENT_MOE_CHUNK_ROWS, n),
+                0,
+                &moe_facts,
+            )
+        },
+    )?;
+    let limit = plan.limit;
+    emit_prefill_chunk_receipt(
+        plan.receipt.requested,
+        plan.receipt.admitted,
+        plan.receipt.commit_stride,
     );
     // Allocate the batch scratch once per call (or reuse a caller-owned one).
     // When `pbs_in` is Some, we neither allocate nor free — the caller retains
@@ -3508,11 +4933,11 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         // tape-free owned PBS sized to the actual largest chunk — short calls
         // never pay the full ceiling. All small/excluded paths keep their
         // prior capacity and cadence.
-        let wide = wide_candidate && limit > WIDENED_COMMIT_ROWS;
+        let wide = plan.wide;
         let pbs: &PrefillBatchScratch = match pbs_in {
             Some(p) => p,
             None if wide => {
-                let owned_rows = limit.min(n).max(MIN_BATCH);
+                let owned_rows = plan.pbs_rows;
                 // Retained widened PBS: reuse across requests when it fits,
                 // else replace. Saves the ~25 ms per-request alloc on
                 // 6k-token prefills. Bit-identical: every PBS tensor is
@@ -3541,8 +4966,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 // `limit == max_batch` on every legacy path; on the admitted
                 // but memory-narrowed path it sizes the owned scratch to the
                 // executed 512 cadence instead of the unadmitted request.
-                let (owned_max_batch, cap_gdn_tape) =
-                    owned_prefill_scratch_plan(n, max_batch.min(limit), tree_verify.is_some());
+                let (owned_max_batch, cap_gdn_tape) = (plan.pbs_rows, tree_verify.is_some());
                 own_pbs = Some(PrefillBatchScratch::new_opt(
                     gpu,
                     config,
@@ -3586,22 +5010,16 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 }
                 _ => true,
             });
+        let packed_mq4 = wide
+            && gpu.arch == "gfx1100"
+            && gpu.flags.packed_mq4_prefill
+            && dense_layers_have_projection_dtype(weights, DType::MQ4G256);
         let mut chunk_start = 0usize;
         while chunk_start < n {
             let remaining = n - chunk_start;
             // Widened grouping keeps an odd tail attached to the largest
             // admitted chunk so its GEMMs use the padded multi-row route.
-            let chunk_n = if wide
-                && gpu.arch == "gfx1100"
-                && gpu.flags.packed_mq4_prefill
-                && dense_layers_have_projection_dtype(weights, DType::MQ4G256)
-            {
-                next_packed_prefill_chunk_len(remaining, chunk_batch)
-            } else if wide {
-                next_exact_prefill_chunk_len(remaining, chunk_batch)
-            } else {
-                next_prefill_chunk_len(remaining, chunk_batch)
-            }
+            let chunk_n = next_ordinary_chunk_len(wide, packed_mq4, remaining, chunk_batch)
             .ok_or_else(|| {
                 hip_bridge::HipError::new(
                     0,
@@ -3756,11 +5174,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 .map_err(|e| hip_bridge::HipError::new(0, &e))?;
             // Only the admitted wide path produces `Some(512)`; every other
             // caller (captured, TP/EP, independent, pair, Halo) passes `None`.
-            let commit_stride = if wide && chunk_n > WIDENED_COMMIT_ROWS {
-                Some(WIDENED_COMMIT_ROWS)
-            } else {
-                None
-            };
+            let commit_stride = widened_commit_stride(wide, chunk_n);
             forward_prefill_chunk(
                 gpu,
                 weights,
@@ -4416,15 +5830,17 @@ pub fn prefill_batch_pbs_eligible(
     moe_router_logits_present: bool,
 ) -> bool {
     let decouple_env = hipfire_config::developer_var("HIPFIRE_MTP_VERIFY_DECOUPLE").ok();
-    let is_rdna3_decouple = arch.starts_with("gfx11");
-    let verify_decouple = n <= 32
-        && decouple_env.as_deref() != Some("0")
-        && (is_rdna3_decouple || decouple_env.as_deref() == Some("1"));
-    let force_fallback = !verify_decouple && !hipfire_runtime::config::get().prefill_batched;
     let has_dn = weights
         .layers
         .iter()
         .any(|lw| matches!(lw, LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_)));
+    let scalar_ok = prefill_batch_scalar_eligible(
+        n,
+        arch,
+        decouple_env.as_deref(),
+        hipfire_runtime::config::get().prefill_batched,
+        has_dn,
+    );
     let all_layers_ok = weights.layers.iter().all(|lw| {
         if matches!(
             lw,
@@ -4435,7 +5851,7 @@ pub fn prefill_batch_pbs_eligible(
         }
         qwen35_layer_batch_admissible(lw, config, arch).is_ok()
     });
-    let result = !force_fallback && n >= MIN_BATCH && has_dn && all_layers_ok;
+    let result = scalar_ok && all_layers_ok;
     if hipfire_config::developer_var("HIPFIRE_DEBUG_BATCH")
         .ok()
         .as_deref()
@@ -4444,7 +5860,7 @@ pub fn prefill_batch_pbs_eligible(
         eprintln!(
             "[hipfire::batch_eligible] result={result} \
              arch={arch} n={n} n>={MIN_BATCH}={} \
-             force_fallback={force_fallback} \
+             scalar_ok={scalar_ok} \
              has_dn={has_dn} \
              moe_router_logits_present={moe_router_logits_present} \
              all_layers_ok={all_layers_ok}",
@@ -4452,6 +5868,25 @@ pub fn prefill_batch_pbs_eligible(
         );
     }
     result
+}
+
+/// Pure scalar half of [`prefill_batch_pbs_eligible`] (no weights): the
+/// verify-decouple window, the `prefill_batched` config switch, the
+/// two-token minimum and a DeltaNet layer. `decouple_env` is
+/// `HIPFIRE_MTP_VERIFY_DECOUPLE`.
+fn prefill_batch_scalar_eligible(
+    n: usize,
+    arch: &str,
+    decouple_env: Option<&str>,
+    prefill_batched: bool,
+    has_dn: bool,
+) -> bool {
+    let is_rdna3_decouple = arch.starts_with("gfx11");
+    let verify_decouple = n <= 32
+        && decouple_env != Some("0")
+        && (is_rdna3_decouple || decouple_env == Some("1"));
+    let force_fallback = !verify_decouple && !prefill_batched;
+    !force_fallback && n >= MIN_BATCH && has_dn
 }
 
 pub(crate) fn trace_finite_if_enabled(gpu: &Gpu, label: &str, tensor: &GpuTensor) -> HipResult<()> {
@@ -15280,6 +16715,7 @@ fn batched_gemm_single_weight(
 #[cfg(test)]
 mod tests {
     use super::super::forward::unsupported_mq3_experts_uniform_from_dtypes;
+    use super::super::weights::DeltaNetStatePlan;
     use super::*;
     use hipfire_dispatch::context::DispatchWorkload;
     use hipfire_dispatch::families::fused_qkv::fused_gate_up_key_for;
@@ -17360,6 +18796,2351 @@ mod tests {
         let mut narrow = widened_test_config();
         narrow.hidden_dim = 3584;
         assert!(!widened_dense_shape_admitted(&narrow));
+    }
+
+    fn resident_moe_test_config() -> Qwen35Config {
+        let mut moe = widened_test_config();
+        moe.num_experts = 256;
+        moe.num_experts_per_tok = 8;
+        moe.moe_intermediate_size = 512;
+        moe.shared_expert_intermediate_size = 512;
+        moe
+    }
+
+    fn resident_moe_dtypes(dt: DType) -> hipfire_dispatch::families::moe::MoePrefillDtypes {
+        let mut d = hipfire_dispatch::families::moe::MoePrefillDtypes::uniform(dt);
+        // The shipped recipe keeps the router and shared scalar gate in Q8.
+        d.router = DType::Q8_0;
+        d.shared_expert_scalar_gate = DType::Q8_0;
+        d
+    }
+
+    #[test]
+    fn resident_moe_request_precedence() {
+        use ResidentMoeRequest::{Incumbent, Widen};
+        let default = Widen {
+            requested: RESIDENT_MOE_CHUNK_ROWS,
+        };
+        // Nothing explicit: the MoE rung is requested by default.
+        assert_eq!(resident_moe_request(None, None), default);
+        // Explicit HIPFIRE_PREFILL_MAX_BATCH always wins, whatever chunk_rows says.
+        assert_eq!(resident_moe_request(Some(512), None), Incumbent);
+        assert_eq!(resident_moe_request(Some(8192), Some(4096)), Incumbent);
+        assert_eq!(resident_moe_request(Some(2), Some(8192)), Incumbent);
+        // Explicit chunk_rows below the rung opts out; at/above it requests the rung.
+        assert_eq!(resident_moe_request(None, Some(512)), Incumbent);
+        assert_eq!(resident_moe_request(None, Some(2048)), Incumbent);
+        assert_eq!(resident_moe_request(None, Some(4095)), Incumbent);
+        assert_eq!(resident_moe_request(None, Some(4096)), default);
+        assert_eq!(
+            resident_moe_request(None, Some(8192)),
+            Widen { requested: 8192 }
+        );
+    }
+
+    #[test]
+    fn resident_moe_rung_is_a_staged_commit_multiple() {
+        assert!(WIDENED_RUNGS.contains(&RESIDENT_MOE_CHUNK_ROWS));
+        assert_eq!(RESIDENT_MOE_CHUNK_ROWS % WIDENED_COMMIT_ROWS, 0);
+        assert_eq!(WIDENED_COMMIT_ROWS, 512);
+    }
+
+    #[test]
+    fn resident_moe_dtype_capability_covers_v1_and_v2_only() {
+        for supported in [DType::MQ4G256, DType::MQ4G256V2] {
+            assert!(
+                resident_moe_producer_dtypes_supported(&resident_moe_dtypes(supported)),
+                "{supported:?} grouped producer must be admitted"
+            );
+        }
+        // A Q8/F32/MQ4 router and scalar gate are all accepted.
+        for router in [DType::Q8_0, DType::F32, DType::MQ4G256, DType::MQ4G256V2] {
+            let mut d = resident_moe_dtypes(DType::MQ4G256V2);
+            d.router = router;
+            d.shared_expert_scalar_gate = router;
+            assert!(resident_moe_producer_dtypes_supported(&d));
+        }
+        for unsupported in [
+            DType::MQ6G256,
+            DType::MQ6G256V2,
+            DType::HFQ4G256,
+            DType::MFP4G32E8,
+            DType::MQ2G256Lloyd,
+            DType::MQ3G256Lloyd,
+            DType::Q8_0,
+        ] {
+            assert!(
+                !resident_moe_producer_dtypes_supported(&resident_moe_dtypes(unsupported)),
+                "{unsupported:?} must keep the incumbent chunk"
+            );
+        }
+        // V1 gate_up with V2 down (or the reverse) is a graded mix, not a uniform pair.
+        let mut mixed = resident_moe_dtypes(DType::MQ4G256);
+        mixed.expert_down = DType::MQ4G256V2;
+        assert!(!resident_moe_producer_dtypes_supported(&mixed));
+        // Graded merge, non-uniform experts, broken shared pair, MQ6 router.
+        let mut merged = resident_moe_dtypes(DType::MQ4G256V2);
+        merged.routed_mixed_merged = true;
+        assert!(!resident_moe_producer_dtypes_supported(&merged));
+        let mut ragged_gate_up = resident_moe_dtypes(DType::MQ4G256);
+        ragged_gate_up.expert_gate_up_uniform = false;
+        assert!(!resident_moe_producer_dtypes_supported(&ragged_gate_up));
+        let mut ragged_down = resident_moe_dtypes(DType::MQ4G256);
+        ragged_down.expert_down_uniform = false;
+        assert!(!resident_moe_producer_dtypes_supported(&ragged_down));
+        let mut shared_pair = resident_moe_dtypes(DType::MQ4G256V2);
+        shared_pair.shared_expert_up = DType::MQ4G256;
+        assert!(!resident_moe_producer_dtypes_supported(&shared_pair));
+        let mut shared_down = resident_moe_dtypes(DType::MQ4G256V2);
+        shared_down.shared_expert_down = DType::MQ6G256V2;
+        assert!(!resident_moe_producer_dtypes_supported(&shared_down));
+        let mut router = resident_moe_dtypes(DType::MQ4G256V2);
+        router.router = DType::MQ6G256;
+        assert!(!resident_moe_producer_dtypes_supported(&router));
+    }
+
+    #[test]
+    fn resident_moe_placement_excludes_every_nonresident_route() {
+        assert!(ResidentMoePlacement::default().resident());
+        let nonresident = [
+            ResidentMoePlacement {
+                attention_host_located: true,
+                ..Default::default()
+            },
+            ResidentMoePlacement {
+                routed_gate_up_host: true,
+                ..Default::default()
+            },
+            ResidentMoePlacement {
+                routed_down_host: true,
+                ..Default::default()
+            },
+            ResidentMoePlacement {
+                small_ffn_host_located: true,
+                ..Default::default()
+            },
+            ResidentMoePlacement {
+                cpu_deferred_experts: true,
+                ..Default::default()
+            },
+            ResidentMoePlacement {
+                paged_experts: true,
+                ..Default::default()
+            },
+            ResidentMoePlacement {
+                multi_device_contract: true,
+                ..Default::default()
+            },
+            ResidentMoePlacement {
+                sidecar_experts: true,
+                ..Default::default()
+            },
+        ];
+        for placement in nonresident {
+            assert!(!placement.resident(), "{placement:?} must not widen");
+        }
+    }
+
+    /// Independent closed form of the REQUESTED payload bytes of one non-lean
+    /// MoE `PrefillBatchScratch` (u128), written from the `new_opt` allocation
+    /// list rather than from `projected_allocation_bytes`. Payload only (no
+    /// driver rounding or allocator overhead; the 1 GiB headroom covers
+    /// those transients). With `n` rows, `p = ceil(n/64)*64`, `k` key dim, `v`
+    /// value dim, `H` value heads, `q`/`c` attention q/kv dims, experts `E`,
+    /// top-k `t`, shared/routed intermediates `s`/`i`.
+    fn constructor_payload_bytes(c: &Qwen35Config, n: u128, tape: bool) -> u128 {
+        let d = c.dim as u128;
+        let h = c.hidden_dim as u128;
+        let k = (c.linear_num_key_heads * c.linear_key_head_dim) as u128;
+        let v = (c.linear_num_value_heads * c.linear_value_head_dim) as u128;
+        let hh = c.linear_num_value_heads as u128;
+        let vhd = c.linear_value_head_dim as u128;
+        let q = (c.n_heads * c.head_dim) as u128;
+        let kvd = (c.n_kv_heads * c.head_dim) as u128;
+        let p = n.div_ceil(64) * 64;
+        let base = 4 * (n * (3 * d + 3 * h + 9 * v + 3 * k + 2 * hh + 6 * q + 2 * kvd + 263) + p * k)
+            + 2 * n * (d + v + h + q)
+            + 8 * n
+            + 256;
+        let e = c.num_experts as u128;
+        let t = c.num_experts_per_tok as u128;
+        let s = c.shared_expert_intermediate_size as u128;
+        let i = c.moe_intermediate_size as u128;
+        let m = (n * t + 15 * e).div_ceil(16) * 16;
+        let moe = 4 * (n * (e + 1 + 3 * s + 2 * t + 3 * t * i + t * d + d) + m * (2 * i + d))
+            + 4 * (2 * e + 1 + m + n * t + m / 16);
+        let tape_bytes = if tape && hh > 0 {
+            5 * n * hh * vhd * vhd + 4 * n * v
+        } else {
+            0
+        };
+        base + moe + tape_bytes
+    }
+
+    #[test]
+    fn resident_moe_pbs_bytes_are_tape_free_and_include_grouped_scratch() {
+        let moe = resident_moe_test_config();
+        let rows = RESIDENT_MOE_CHUNK_ROWS;
+        let bytes = resident_moe_pbs_bytes(&moe, rows).expect("chargeable");
+        assert_eq!(
+            bytes as u128,
+            constructor_payload_bytes(&moe, rows as u128, false),
+            "the census equals the independent constructor closed form (tape-free owner)"
+        );
+        let with_tape = resident_moe_owner_bytes(&moe, rows, true).expect("chargeable");
+        assert!(
+            bytes < with_tape,
+            "ordinary prefill never allocates the verify-only S-tape"
+        );
+        // The grouped gate/up and down outputs are inside the PBS term.
+        let mut dense_shape = moe.clone();
+        dense_shape.num_experts = 0;
+        let dense_bytes = resident_moe_pbs_bytes(&dense_shape, rows).expect("chargeable");
+        let m_max = moe_grouped_m_total_max(rows, 8, 256) as u64;
+        let grouped = m_max * 2 * 512 * 4 + m_max * moe.dim as u64 * 4;
+        assert!(
+            (bytes - dense_bytes) as u64 >= grouped,
+            "grouped dynamic scratch must be counted once, inside the PBS projection"
+        );
+        // Overflow fails closed.
+        assert_eq!(resident_moe_pbs_bytes(&moe, usize::MAX), None);
+    }
+
+    /// The two `new_opt` allocations `projected_allocation_bytes` does not
+    /// mirror (`dn_z_fold_batch`, `dn_normed_batch`) are charged exactly once,
+    /// and the census equals the independent constructor closed form for tape
+    /// off/on, credits and overflow.
+    #[test]
+    fn resident_moe_census_matches_constructor_closed_form() {
+        let moe = resident_moe_test_config();
+        let v = moe.linear_num_value_heads * moe.linear_value_head_dim;
+        for rows in [100usize, 512, 1024, 4096] {
+            for tape in [false, true] {
+                assert_eq!(
+                    resident_moe_owner_bytes(&moe, rows, tape).map(|b| b as u128),
+                    Some(constructor_payload_bytes(&moe, rows as u128, tape)),
+                    "rows={rows} tape={tape}"
+                );
+            }
+            let z_fold = rows * (v + 256) * 4;
+            let normed = rows * v * 4;
+            assert_eq!(
+                resident_moe_pbs_unmirrored_bytes(&moe, rows),
+                Some(z_fold + normed)
+            );
+            let mirrored = usize::try_from(
+                PrefillBatchScratch::projected_allocation_bytes(&moe, rows, false).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                resident_moe_pbs_bytes(&moe, rows),
+                Some(mirrored + z_fold + normed)
+            );
+        }
+        assert_eq!(resident_moe_owner_bytes(&moe, usize::MAX, false), None);
+        assert_eq!(resident_moe_pbs_unmirrored_bytes(&moe, usize::MAX), None);
+        // Credits are the same census: a retained widened owner credits its own bytes.
+        assert_eq!(
+            resident_moe_cache_credit(&moe, Some((2048, false))) as u128,
+            constructor_payload_bytes(&moe, 2048, false)
+        );
+        // Memory decision charged from the closed form (not from the helpers).
+        let kv = KvTierFlags {
+            quant_q8: true,
+            ..Default::default()
+        };
+        let projection = resident_moe_projection_deficit(
+            &moe,
+            RESIDENT_MOE_CHUNK_ROWS,
+            &LiveProjectionScratch::default(),
+        )
+        .unwrap();
+        let q16 = RESIDENT_MOE_CHUNK_ROWS * moe.n_heads * moe.head_dim * 2;
+        let need = usize::try_from(constructor_payload_bytes(
+            &moe,
+            RESIDENT_MOE_CHUNK_ROWS as u128,
+            false,
+        ))
+        .unwrap()
+            + projection
+            + q16
+            + WIDENED_VRAM_HEADROOM_BYTES;
+        let mem = |free: usize| ResidentMoeMemoryFacts {
+            free_bytes: Some(free),
+            live: LiveProjectionScratch::default(),
+            live_q16_bytes: 0,
+        };
+        let widened = ResidentMoeOwner::WIDENED;
+        assert!(resident_moe_memory_admits(&moe, kv, &mem(need), None, widened, 0));
+        assert!(!resident_moe_memory_admits(&moe, kv, &mem(need - 1), None, widened, 0));
+    }
+
+    #[test]
+    fn resident_moe_projection_deficit_scales_credits_live_scratch_and_checks_overflow() {
+        let moe = resident_moe_test_config();
+        let none = LiveProjectionScratch::default();
+        let base = resident_moe_projection_deficit(&moe, 4096, &none).unwrap();
+        assert!(base > 0);
+        assert_eq!(
+            resident_moe_projection_deficit(&moe, 8192, &none).unwrap(),
+            2 * base,
+            "no live scratch: linear in rows"
+        );
+        // Credit is exactly the bytes the matching live scratch holds.
+        let credited = LiveProjectionScratch {
+            int4_mmq_x: 1000,
+            ..Default::default()
+        };
+        assert_eq!(
+            resident_moe_projection_deficit(&moe, 4096, &credited).unwrap(),
+            base - 1000
+        );
+        // Fully resident scratch of every kind leaves nothing to grow.
+        let full = LiveProjectionScratch {
+            int4_mmq_x: usize::MAX,
+            q8_1_mmq_x: usize::MAX,
+            fp16_x: usize::MAX,
+            fp8_x: usize::MAX,
+            fp8_half_sums: usize::MAX,
+            fp8_row_scales: usize::MAX,
+        };
+        assert_eq!(
+            resident_moe_projection_deficit(&moe, 4096, &full),
+            Some(0)
+        );
+        assert_eq!(
+            resident_moe_projection_deficit(&moe, usize::MAX, &none),
+            None
+        );
+        // Q16: the FULL chunk (the MoE bodies attend the whole chunk; there is
+        // no 512-row commit segment), net of live bytes, saturating.
+        let q16 = RESIDENT_MOE_CHUNK_ROWS * moe.n_heads * moe.head_dim * 2;
+        let q16_512 = WIDENED_COMMIT_ROWS * moe.n_heads * moe.head_dim * 2;
+        assert!(q16 > q16_512);
+        assert_eq!(
+            resident_moe_q16_missing(&moe, RESIDENT_MOE_CHUNK_ROWS, 0),
+            Some(q16)
+        );
+        assert_eq!(
+            resident_moe_q16_missing(&moe, RESIDENT_MOE_CHUNK_ROWS, 100),
+            Some(q16 - 100)
+        );
+        assert_eq!(
+            resident_moe_q16_missing(&moe, RESIDENT_MOE_CHUNK_ROWS, q16),
+            Some(0)
+        );
+        assert_eq!(
+            resident_moe_q16_missing(&moe, RESIDENT_MOE_CHUNK_ROWS, usize::MAX),
+            Some(0)
+        );
+        // Overflow fails closed.
+        assert_eq!(resident_moe_q16_missing(&moe, usize::MAX, 0), None);
+        let mut huge = resident_moe_test_config();
+        huge.head_dim = usize::MAX;
+        assert_eq!(
+            resident_moe_q16_missing(&huge, RESIDENT_MOE_CHUNK_ROWS, 0),
+            None
+        );
+    }
+
+    /// The full-row Q16 term and the 1 GiB headroom through the production
+    /// memory decision: the 512-row budget the first draft charged would
+    /// admit a rung whose real growth leaves less than the headroom.
+    #[test]
+    fn resident_moe_full_row_q16_keeps_one_gib_headroom() {
+        let moe = resident_moe_test_config();
+        let kv = KvTierFlags {
+            quant_q8: true,
+            ..Default::default()
+        };
+        let pbs = resident_moe_pbs_bytes(&moe, RESIDENT_MOE_CHUNK_ROWS).unwrap();
+        let projection = resident_moe_projection_deficit(
+            &moe,
+            RESIDENT_MOE_CHUNK_ROWS,
+            &LiveProjectionScratch::default(),
+        )
+        .unwrap();
+        let q16_full = resident_moe_q16_missing(&moe, RESIDENT_MOE_CHUNK_ROWS, 0).unwrap();
+        let q16_512 = resident_moe_q16_missing(&moe, WIDENED_COMMIT_ROWS, 0).unwrap();
+        assert!(q16_full > q16_512);
+        let mem = |free: usize, live_q16: usize| ResidentMoeMemoryFacts {
+            free_bytes: Some(free),
+            live: LiveProjectionScratch::default(),
+            live_q16_bytes: live_q16,
+        };
+        let admits = |m: ResidentMoeMemoryFacts| {
+            resident_moe_memory_admits(&moe, kv, &m, None, ResidentMoeOwner::WIDENED, 0)
+        };
+        let need = pbs + projection + q16_full + WIDENED_VRAM_HEADROOM_BYTES;
+        assert!(admits(mem(need, 0)));
+        assert!(!admits(mem(need - 1, 0)));
+        // Remaining free bytes after the full growth are at least the headroom.
+        assert_eq!(need - (pbs + projection + q16_full), WIDENED_VRAM_HEADROOM_BYTES);
+        // The 512-row Q16 budget would have admitted this much free memory.
+        let old_need = need - (q16_full - q16_512);
+        assert!(!admits(mem(old_need, 0)));
+        // A live buffer credits exactly its own bytes.
+        assert!(admits(mem(need - q16_full, q16_full)));
+        assert!(!admits(mem(need - q16_full - 1, q16_full)));
+        assert!(admits(mem(need - q16_512, q16_512)));
+        assert!(!admits(mem(need - q16_512 - 1, q16_512)));
+        // A failed free-byte query and a KV tier without batched flash keep the incumbent.
+        assert!(!admits(ResidentMoeMemoryFacts {
+            free_bytes: None,
+            ..mem(need, 0)
+        }));
+        assert!(!resident_moe_memory_admits(
+            &moe,
+            KvTierFlags::default(),
+            &mem(usize::MAX, 0),
+            None,
+            ResidentMoeOwner::WIDENED,
+            0
+        ));
+        // Pending allocations are deducted before the headroom test.
+        let widened = ResidentMoeOwner::WIDENED;
+        assert!(resident_moe_memory_admits(&moe, kv, &mem(need + 4096, 0), None, widened, 4096));
+        assert!(!resident_moe_memory_admits(&moe, kv, &mem(need + 4096, 0), None, widened, 4097));
+        // A taped explicit-equivalent owner is charged its own (larger) bytes,
+        // and an existing owner credits exactly its bytes.
+        let taped = ResidentMoeOwner {
+            rows: RESIDENT_MOE_CHUNK_ROWS,
+            tape: true,
+            credit_bytes: 0,
+        };
+        let taped_bytes = resident_moe_owner_bytes(&moe, taped.rows, true).unwrap();
+        assert!(taped_bytes > pbs);
+        let taped_need = need - pbs + taped_bytes;
+        assert!(resident_moe_memory_admits(&moe, kv, &mem(taped_need, 0), None, taped, 0));
+        assert!(!resident_moe_memory_admits(&moe, kv, &mem(taped_need - 1, 0), None, taped, 0));
+        // An owner smaller than the rung never lowers the 4096-row charge.
+        let small = ResidentMoeOwner {
+            rows: WIDENED_COMMIT_ROWS,
+            tape: false,
+            credit_bytes: 0,
+        };
+        assert!(!resident_moe_memory_admits(&moe, kv, &mem(need - 1, 0), None, small, 0));
+        assert!(resident_moe_memory_admits(&moe, kv, &mem(need, 0), None, small, 0));
+        let credited = ResidentMoeOwner {
+            credit_bytes: taped_bytes,
+            ..taped
+        };
+        assert!(resident_moe_memory_admits(&moe, kv, &mem(need - pbs, 0), None, credited, 0));
+        assert!(!resident_moe_memory_admits(&moe, kv, &mem(need - pbs - 1, 0), None, credited, 0));
+    }
+
+    #[test]
+    fn resident_moe_cache_credit_is_exact_owner_bytes_only() {
+        let moe = resident_moe_test_config();
+        assert_eq!(resident_moe_cache_credit(&moe, None), 0);
+        // A lean owner has a different layout: never credited.
+        assert_eq!(resident_moe_cache_credit(&moe, Some((2048, true))), 0);
+        assert_eq!(
+            resident_moe_cache_credit(&moe, Some((2048, false))),
+            resident_moe_pbs_bytes(&moe, 2048).unwrap()
+        );
+        // An unprojectable owner shape is not credited (conservative).
+        assert_eq!(resident_moe_cache_credit(&moe, Some((0, false))), 0);
+    }
+
+    /// Only a retained owner the call reuses in place is credited: non-lean and
+    /// at least as many rows as the call's owned PBS needs.
+    #[test]
+    fn resident_moe_reusable_cached_requires_in_place_reuse() {
+        let r = resident_moe_reusable_cached;
+        assert_eq!(r(None, 100), None);
+        assert_eq!(r(Some((4096, false)), 4096), Some((4096, false)));
+        assert_eq!(r(Some((8192, false)), 4096), Some((8192, false)));
+        assert_eq!(r(Some((2048, false)), 2048), Some((2048, false)));
+        // Smaller owner: replaced, no credit.
+        assert_eq!(r(Some((2048, false)), 4096), None);
+        assert_eq!(r(Some((2048, false)), 2049), None);
+        // Lean owner: layout mismatch, replaced.
+        assert_eq!(r(Some((8192, true)), 100), None);
+    }
+
+    /// The retained-owner credit through the shared chunk-limit decision: a
+    /// short owner that must be replaced is charged in full (a budget the old
+    /// speculative credit admitted is rejected), the same-shape owner keeps its
+    /// exact positive credit, and shape/lean mismatches earn none.
+    #[test]
+    fn resident_moe_cached_credit_only_when_reused_boundary() {
+        let moe = resident_moe_test_config();
+        let facts = ResidentMoeStaticFacts {
+            moe_config: true,
+            request: ResidentMoeRequest::Widen {
+                requested: RESIDENT_MOE_CHUNK_ROWS,
+            },
+            has_wmma: true,
+            pager: false,
+            ep_shard: false,
+            moe_has_mq6: false,
+            layers_present: true,
+            dn_state_admitted: true,
+            batch_pbs_eligible: true,
+            layers_resident_capable: true,
+        };
+        let kv = KvTierFlags {
+            quant_q8: true,
+            ..KvTierFlags::default()
+        };
+        let need = resident_moe_need_bytes(&moe, 0);
+        let incumbent = 512usize;
+        let limit = |cached: Option<(usize, bool)>, reuse_rows: usize, free: usize| {
+            resident_moe_chunk_limit_from_facts(
+                &facts,
+                None,
+                &moe,
+                kv,
+                || ResidentMoeMemoryFacts {
+                    free_bytes: Some(free),
+                    live: LiveProjectionScratch::default(),
+                    live_q16_bytes: 0,
+                },
+                cached,
+                reuse_rows,
+                0,
+                incumbent,
+            )
+        };
+        let bytes = |rows: usize| resident_moe_pbs_bytes(&moe, rows).unwrap();
+        // No owner: the exact full-rung boundary.
+        assert_eq!(limit(None, 4096, need), RESIDENT_MOE_CHUNK_ROWS);
+        assert_eq!(limit(None, 4096, need - 1), incumbent);
+        // Same-shape owner reused in place: positive credit, exact boundary.
+        let same = Some((4096, false));
+        assert_eq!(limit(same, 4096, need - bytes(4096)), RESIDENT_MOE_CHUNK_ROWS);
+        assert_eq!(limit(same, 4096, need - bytes(4096) - 1), incumbent);
+        // Short owner at 4096 needed rows must be replaced: growth rejects the
+        // budget the speculative credit would admit, and charges the full rung.
+        let short = Some((2048, false));
+        assert_eq!(limit(short, 4096, need - bytes(2048)), incumbent);
+        assert_eq!(limit(short, 4096, need), RESIDENT_MOE_CHUNK_ROWS);
+        assert_eq!(limit(short, 4096, need - 1), incumbent);
+        // The same short owner is reused (and credited) when the call needs no
+        // more rows than it holds; one row more is a replacement.
+        assert_eq!(limit(short, 2048, need - bytes(2048)), RESIDENT_MOE_CHUNK_ROWS);
+        assert_eq!(limit(short, 2048, need - bytes(2048) - 1), incumbent);
+        assert_eq!(limit(short, 2049, need - bytes(2048)), incumbent);
+        // Lean owner: never credited.
+        assert_eq!(limit(Some((2048, true)), 100, need - bytes(2048)), incumbent);
+        // An oversized lean owner still earns no credit. Its payload can exceed
+        // the full-rung need, so use the uncredited boundary without subtraction.
+        assert_eq!(limit(Some((8192, true)), 100, need - 1), incumbent);
+    }
+
+    #[test]
+    fn resident_moe_memory_boundary_pending_deduction_credit_and_overflow() {
+        let moe = resident_moe_test_config();
+        let pbs = resident_moe_pbs_bytes(&moe, RESIDENT_MOE_CHUNK_ROWS).unwrap();
+        let projection = resident_moe_projection_deficit(
+            &moe,
+            RESIDENT_MOE_CHUNK_ROWS,
+            &LiveProjectionScratch::default(),
+        )
+        .unwrap();
+        let q16 = resident_moe_q16_missing(&moe, RESIDENT_MOE_CHUNK_ROWS, 0).unwrap();
+        let need = pbs + projection + q16 + WIDENED_VRAM_HEADROOM_BYTES;
+        let fit = |free: usize, deduction: usize, credit: usize| ResidentMoeFit {
+            free_bytes: free,
+            free_deduction: deduction,
+            pbs_bytes: Some(pbs),
+            cached_credit: credit,
+            projection_deficit: Some(projection),
+            q16_missing: Some(q16),
+        };
+        // Inclusive boundary at the existing 1 GiB headroom.
+        assert_eq!(WIDENED_VRAM_HEADROOM_BYTES, 1 << 30);
+        assert!(resident_moe_rung_fits(&fit(need, 0, 0)));
+        assert!(!resident_moe_rung_fits(&fit(need - 1, 0, 0)));
+        // Pending allocations are deducted from free bytes (saturating).
+        assert!(resident_moe_rung_fits(&fit(need + 4096, 4096, 0)));
+        assert!(!resident_moe_rung_fits(&fit(need + 4096, 4097, 0)));
+        assert!(!resident_moe_rung_fits(&fit(10, 100, 0)));
+        // A cached owner credits exactly its own bytes, never more than the need.
+        let credit = resident_moe_pbs_bytes(&moe, 2048).unwrap();
+        assert!(resident_moe_rung_fits(&fit(need - credit, 0, credit)));
+        assert!(!resident_moe_rung_fits(&fit(need - credit - 1, 0, credit)));
+        let floor = projection + q16 + WIDENED_VRAM_HEADROOM_BYTES;
+        assert!(resident_moe_rung_fits(&fit(floor, 0, pbs * 2)));
+        assert!(!resident_moe_rung_fits(&fit(floor - 1, 0, pbs * 2)));
+        // Headroom is charged on top of an otherwise exactly-fitting rung.
+        assert!(!resident_moe_rung_fits(&fit(
+            need - WIDENED_VRAM_HEADROOM_BYTES,
+            0,
+            0
+        )));
+        // Overflow and unprojectable terms fail closed.
+        let mut overflow = fit(usize::MAX, 0, 0);
+        overflow.pbs_bytes = Some(usize::MAX);
+        assert!(!resident_moe_rung_fits(&overflow));
+        for broken in [
+            ResidentMoeFit {
+                pbs_bytes: None,
+                ..fit(usize::MAX, 0, 0)
+            },
+            ResidentMoeFit {
+                projection_deficit: None,
+                ..fit(usize::MAX, 0, 0)
+            },
+            ResidentMoeFit {
+                q16_missing: None,
+                ..fit(usize::MAX, 0, 0)
+            },
+        ] {
+            assert!(!resident_moe_rung_fits(&broken));
+        }
+    }
+
+    #[test]
+    fn resident_moe_limit_is_binary_incumbent_fallback() {
+        for incumbent in [256usize, 384, 512] {
+            assert_eq!(resident_moe_limit(true, incumbent), RESIDENT_MOE_CHUNK_ROWS);
+            let fallback = resident_moe_limit(false, incumbent);
+            assert_eq!(fallback, incumbent, "memory denial returns the incumbent");
+            assert!(
+                ![1024, 2048].contains(&fallback),
+                "no intermediate rung is ever returned"
+            );
+        }
+    }
+
+    #[test]
+    fn resident_moe_sealed_contract_is_multi_device_only_for_tp_ep() {
+        use hipfire_dispatch::pipeline::sealed_moe::{
+            ContractAssignment, ContractParallelism, ExpertExecutionContract,
+        };
+        let contract = |parallelism, devices: Vec<i32>| {
+            ExpertExecutionContract::new(
+                "g",
+                Some(0),
+                "fp",
+                0,
+                devices,
+                parallelism,
+                ContractAssignment::Stride,
+                vec![0; 256],
+                (0..256).collect(),
+                "indexed-decode",
+                Vec::new(),
+            )
+            .expect("contract")
+        };
+        // The ordinary load (`adapt_expert_execution_plan`, ExpertParallelism::Single)
+        // always carries a sealed contract: it must read as resident.
+        let single = contract(ContractParallelism::Single, vec![0]);
+        assert!(!resident_moe_contract_multi_device(Some(&single)));
+        assert!(!resident_moe_contract_multi_device(None));
+        let ep = contract(ContractParallelism::ExpertParallel, vec![0, 1]);
+        assert!(resident_moe_contract_multi_device(Some(&ep)));
+        let tp = contract(ContractParallelism::TensorParallel, vec![0, 1]);
+        assert!(resident_moe_contract_multi_device(Some(&tp)));
+        let single_multi = contract(ContractParallelism::Single, vec![0, 1]);
+        assert!(resident_moe_contract_multi_device(Some(&single_multi)));
+    }
+
+    #[test]
+    fn prefill_chunk_receipt_is_the_visible_log_line() {
+        let admitted = PrefillChunkReceipt {
+            requested: 4096,
+            admitted: 4096,
+            commit_stride: Some(WIDENED_COMMIT_ROWS),
+        };
+        assert_eq!(
+            admitted.to_string(),
+            "prefill_chunk: requested=4096 admitted=4096 commit_stride=512"
+        );
+        let fallback = PrefillChunkReceipt {
+            requested: 4096,
+            admitted: 512,
+            commit_stride: None,
+        };
+        assert_eq!(
+            fallback.to_string(),
+            "prefill_chunk: requested=4096 admitted=512 commit_stride=none"
+        );
+    }
+
+    /// Facts of one INSTALLED artifact, derived by production code.
+    ///
+    /// The config comes from `config_from_hfq`, every layer's sealed expert
+    /// table from the loader's own `build_moe_layer_expert_binding` (what
+    /// `load_moe_ffn` calls), every router/shared tag from the production tag
+    /// mapper. Device-owned facts (`host_located`, `cpu_deferred_experts`, live
+    /// scratch bytes, free VRAM) cannot exist on CPU: the scenarios supply them
+    /// as resident / modelled inputs and the GPU hold covers them.
+    struct InstalledMoe {
+        name: String,
+        config: Qwen35Config,
+        moe_has_mq6: bool,
+        /// Every dtype-derivable `prefill_batch_pbs_eligible` leaf predicate
+        /// (`is_batchable_la`, `gated_moe_prefill_admissible`) holds.
+        batch_pbs_eligible: bool,
+        layers: Vec<(
+            ResidentMoePlacement,
+            hipfire_dispatch::families::moe::MoePrefillDtypes,
+        )>,
+    }
+
+    fn load_installed_moe(
+        name: &str,
+        hfq: &hipfire_runtime::hfq::HfqFile,
+        arch: &str,
+    ) -> InstalledMoe {
+        let config = super::super::config::config_from_hfq(hfq).expect("production config");
+        assert!(config.num_experts > 0, "{name}: MoE config");
+        let tag = |tensor: &str| -> DType {
+            let info = hfq
+                .tensors()
+                .iter()
+                .find(|t| t.name == tensor)
+                .unwrap_or_else(|| panic!("{name}: tensor {tensor}"));
+            crate::qwen35::weights::dtype_from_quant_type(info.quant_type)
+                .unwrap_or_else(|e| panic!("{name}: {tensor}: {e:?}"))
+        };
+        // `load_moe_ffn` arms the AWQ pointer table only when every expert has a
+        // down sidecar and `HIPFIRE_MOE_AWQ` is not "0".
+        let moe_awq_enabled = hipfire_config::developer_var("HIPFIRE_MOE_AWQ")
+            .ok()
+            .as_deref()
+            != Some("0");
+        let mut layers = Vec::with_capacity(config.n_layers);
+        let mut batch_pbs_eligible = true;
+        let mut moe_has_mq6 = false;
+        for layer in 0..config.n_layers {
+            let prefix = format!("model.language_model.layers.{layer}");
+            let p = format!("{prefix}.mlp");
+            let ids: Vec<usize> = (0..config.num_experts).collect();
+            let (_plan, table, _cache) = crate::qwen35::load::build_moe_layer_expert_binding(
+                hfq,
+                &prefix,
+                &config,
+                layer,
+                0,
+                &ids,
+                config.num_experts,
+            )
+            .unwrap_or_else(|e| panic!("{name} layer {layer}: expert binding: {e:?}"));
+            assert!(
+                table.execution_contract().is_some(),
+                "{name} layer {layer}: ordinary Single load carries a sealed contract"
+            );
+            let n = table.n_experts();
+            assert_eq!(n, config.num_experts, "{name} layer {layer}");
+            let gate_up: Vec<DType> = table
+                .experts()
+                .iter()
+                .map(|e| {
+                    let r = e.resources();
+                    r.gate_up()
+                        .or_else(|| r.gate())
+                        .expect("fused or separate gate/up resource")
+                        .dtype()
+                })
+                .collect();
+            let down: Vec<DType> = table
+                .experts()
+                .iter()
+                .map(|e| e.resources().down().dtype())
+                .collect();
+            let awq_all = moe_awq_enabled
+                && table
+                    .experts()
+                    .iter()
+                    .all(|e| !e.resources().down().sidecars().is_empty());
+            let gu_uniform = gate_up.iter().all(|d| *d == gate_up[0]);
+            let down_uniform = down.iter().all(|d| *d == down[0]);
+            let dtypes = hipfire_dispatch::families::moe::MoePrefillDtypes {
+                router: tag(&format!("{p}.gate.weight")),
+                shared_expert_scalar_gate: tag(&format!("{p}.shared_expert_gate.weight")),
+                shared_expert_gate: tag(&format!("{p}.shared_expert.gate_proj.weight")),
+                shared_expert_up: tag(&format!("{p}.shared_expert.up_proj.weight")),
+                shared_expert_down: tag(&format!("{p}.shared_expert.down_proj.weight")),
+                expert_gate_up: gate_up[0],
+                expert_down: down[0],
+                expert_gate_up_uniform: gu_uniform,
+                expert_down_uniform: down_uniform,
+                // `load_moe_ffn` publishes `expert_dtype_tags` exactly when the
+                // per-expert dtypes are mixed.
+                routed_mixed_merged: !gu_uniform || !down_uniform,
+            };
+            moe_has_mq6 |= [dtypes.expert_gate_up, dtypes.expert_down]
+                .iter()
+                .any(|d| matches!(d, DType::MQ6G256 | DType::MQ6G256V2));
+            batch_pbs_eligible &= hipfire_dispatch::families::moe::gated_moe_prefill_admissible(
+                &dtypes,
+                mq6_batched_admit_enabled_from_env(None, arch),
+                arch,
+            );
+            layers.push((
+                ResidentMoePlacement {
+                    multi_device_contract: resident_moe_contract_multi_device(
+                        table.execution_contract(),
+                    ),
+                    paged_experts: n == 0,
+                    sidecar_experts: awq_all || !gu_uniform || !down_uniform,
+                    ..ResidentMoePlacement::default()
+                },
+                dtypes,
+            ));
+        }
+        // Attention/projection tags the batched layer admission checks.
+        for t in hfq.tensors() {
+            let n = &t.name;
+            let projection = n.ends_with("in_proj_qkv.weight")
+                || n.ends_with("in_proj_z.weight")
+                || n.ends_with("in_proj_a.weight")
+                || n.ends_with("in_proj_b.weight")
+                || n.ends_with("out_proj.weight")
+                || n.ends_with("q_proj.weight")
+                || n.ends_with("k_proj.weight")
+                || n.ends_with("v_proj.weight")
+                || n.ends_with("o_proj.weight");
+            if projection && !n.contains(".experts.") && !n.contains("shared_expert") {
+                let dt = crate::qwen35::weights::dtype_from_quant_type(t.quant_type).unwrap();
+                batch_pbs_eligible &= is_batchable_la(dt, arch);
+            }
+        }
+        InstalledMoe {
+            name: name.to_string(),
+            config,
+            moe_has_mq6,
+            batch_pbs_eligible,
+            layers,
+        }
+    }
+
+    /// KV tier flags a resolved KV pair sets on its `KvCache` constructors.
+    fn kv_tier_flags_for_pair(pair: hipfire_runtime::kv_mode::KvPair) -> KvTierFlags {
+        use hipfire_runtime::kv_mode::KvMode;
+        let mut flags = KvTierFlags::default();
+        match pair.k() {
+            KvMode::Q8 => flags.quant_q8 = true,
+            KvMode::Asym2 | KvMode::Fwht2 => flags.quant_asym2 = true,
+            KvMode::Asym3 | KvMode::Fwht3 => flags.quant_asym3 = true,
+            KvMode::Asym4 | KvMode::Fwht4 => flags.quant_asym4 = true,
+            KvMode::Fp8 => flags.quant_fp8 = true,
+            _ => {}
+        }
+        flags
+    }
+
+    /// The KV tier the production default ("auto" through the qwen35 HFQ policy
+    /// and native-eligibility rule) resolves to for this model on `arch`.
+    fn installed_default_kv(config: &Qwen35Config, arch: &str) -> KvTierFlags {
+        use hipfire_runtime::kv_mode;
+        let native = kv_mode::qwen35_native_eligible(
+            arch,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            1,
+            false,
+            false,
+        );
+        let policy =
+            kv_mode::qwen35_policy_for_native(&kv_mode::QWEN35_HFQ_POLICY, "auto", native);
+        let pair = kv_mode::resolve_kv_pair("auto", None, None, &policy, arch, true)
+            .expect("default kv pair");
+        kv_tier_flags_for_pair(pair)
+    }
+
+    fn resident_moe_need_bytes(config: &Qwen35Config, live_q16: usize) -> usize {
+        resident_moe_pbs_bytes(config, RESIDENT_MOE_CHUNK_ROWS).unwrap()
+            + resident_moe_projection_deficit(
+                config,
+                RESIDENT_MOE_CHUNK_ROWS,
+                &LiveProjectionScratch::default(),
+            )
+            .unwrap()
+            + resident_moe_q16_missing(config, RESIDENT_MOE_CHUNK_ROWS, live_q16).unwrap()
+            + WIDENED_VRAM_HEADROOM_BYTES
+    }
+
+    fn owner_bytes_of(config: &Qwen35Config, owner: (usize, bool)) -> usize {
+        resident_moe_owner_bytes(config, owner.0, owner.1).unwrap()
+    }
+
+    /// `resident_moe_need_bytes` with the wrapper's explicit-equivalent owner as
+    /// the charged PBS (the larger of the tape-free rung and the owner).
+    fn resident_moe_need_owner_bytes(
+        config: &Qwen35Config,
+        live_q16: usize,
+        owner: (usize, bool),
+    ) -> usize {
+        let rung = resident_moe_pbs_bytes(config, RESIDENT_MOE_CHUNK_ROWS).unwrap();
+        resident_moe_need_bytes(config, live_q16) - rung
+            + rung.max(owner_bytes_of(config, owner))
+    }
+
+    /// Every input of one modelled ordinary prefill call. Each field is a REAL
+    /// production input (caller facts, state geometry plan, KV tier, device
+    /// flags/caps from `FeatureFlags`/`ArchCaps`, loader-derived layer facts);
+    /// tests flip single fields and read the decision, never a typed verdict.
+    #[derive(Clone)]
+    struct Sc {
+        arch: &'static str,
+        flags: rdna_compute::FeatureFlags,
+        explicit: bool,
+        reuse_pbs: bool,
+        n: usize,
+        call: OrdinaryCallFacts,
+        dn_quant: StateQuant,
+        dn_batch: usize,
+        dn_ef: bool,
+        per_token_requant: bool,
+        kv: KvTierFlags,
+        free_bytes: Option<usize>,
+        live_q16: usize,
+        pager: bool,
+        ep_shard: bool,
+        mq6_weights: bool,
+        batch_pbs_eligible: bool,
+        prefill_batched: bool,
+        layers: Vec<(
+            ResidentMoePlacement,
+            hipfire_dispatch::families::moe::MoePrefillDtypes,
+        )>,
+        cached: Option<(usize, bool)>,
+        deduction: usize,
+        existing_virtual: Option<(usize, bool)>,
+    }
+
+    type CallFlip = fn(&mut OrdinaryCallFacts);
+    type ScFlip = fn(&mut Sc);
+    type PlacementFlip = fn(&mut ResidentMoePlacement);
+    type DtypeFlip = fn(&mut hipfire_dispatch::families::moe::MoePrefillDtypes);
+
+    fn baseline(
+        moe: &InstalledMoe,
+        arch: &'static str,
+        explicit: bool,
+        reuse_pbs: bool,
+        n: usize,
+    ) -> Sc {
+        let flags = rdna_compute::FeatureFlags::from_active_config(arch);
+        let target = implicit_reuse_pbs_plan(
+            arch,
+            Some(RESIDENT_MOE_CHUNK_ROWS),
+            fp8_chunk512_for_flags(arch, &flags),
+        );
+        Sc {
+            arch,
+            flags,
+            explicit,
+            reuse_pbs,
+            n,
+            call: OrdinaryCallFacts::default(),
+            dn_quant: StateQuant::Q8,
+            dn_batch: 1,
+            dn_ef: crate::qwen35::weights::delta_net_state_ef_enabled(StateQuant::Q8),
+            per_token_requant: dn_requant_per_token_env(),
+            kv: installed_default_kv(&moe.config, arch),
+            free_bytes: Some(resident_moe_need_owner_bytes(&moe.config, 0, target) + (64 << 20)),
+            live_q16: 0,
+            pager: false,
+            ep_shard: false,
+            mq6_weights: moe.moe_has_mq6,
+            batch_pbs_eligible: moe.batch_pbs_eligible,
+            prefill_batched: hipfire_runtime::config::get().prefill_batched,
+            layers: moe.layers.clone(),
+            cached: None,
+            deduction: 0,
+            existing_virtual: None,
+        }
+    }
+
+    struct Run {
+        facts: ResidentMoeStaticFacts,
+        wrapper: WrapperPbsPlan,
+        /// The wrapper maps the call's required KV (before any memory query).
+        maps_kv: bool,
+        /// The wrapper queried device memory for the virtual owner's admission.
+        mem_queried: bool,
+        /// The inner entry returned to the per-token AR loop before the planner
+        /// (`prefill_batch_pbs_eligible` false at the actual n): `plan` is an
+        /// unexecuted placeholder and `chunks` is empty.
+        ar_fallback: bool,
+        /// The executed PBS owner `(rows, tape)`, `None` when the inner entry
+        /// allocates its own.
+        owner: Option<(usize, bool)>,
+        plan: OrdinaryPrefillPlan,
+        chunks: Vec<(usize, Option<usize>)>,
+        /// The effective incumbent ceiling the inner entry ran with.
+        max_batch: usize,
+        /// The ORIGINAL incumbent ceiling (arch/env default capped by an explicit
+        /// `max_batch_cap`, never the wrapper's virtual-explicit override).
+        incumbent: usize,
+    }
+
+    /// `prefill_batch_pbs_eligible(rows)` over artifact-derived facts: the
+    /// dtype-derivable layer predicates and the SAME scalar gate production
+    /// calls (verify-decouple window, `prefill_batched`, two-token minimum,
+    /// a DeltaNet layer).
+    fn sc_batched_eligible(moe: &InstalledMoe, sc: &Sc, rows: usize) -> bool {
+        sc.batch_pbs_eligible
+            && prefill_batch_scalar_eligible(
+                rows,
+                sc.arch,
+                hipfire_config::developer_var("HIPFIRE_MTP_VERIFY_DECOUPLE")
+                    .ok()
+                    .as_deref(),
+                sc.prefill_batched,
+                moe.config
+                    .layer_types
+                    .iter()
+                    .any(|t| *t == LayerType::LinearAttention),
+            )
+    }
+
+    fn sc_static_facts(moe: &InstalledMoe, sc: &Sc) -> ResidentMoeStaticFacts {
+        let caps = rdna_compute::arch_caps::ArchCaps::new(
+            sc.arch,
+            std::sync::Arc::new(sc.flags.clone()),
+        );
+        let explicit_max = sc.explicit.then_some(4096usize);
+        let plan = DeltaNetStatePlan::new(&moe.config, sc.dn_quant, sc.dn_batch, sc.dn_ef);
+        ResidentMoeStaticFacts {
+            moe_config: moe.config.num_experts != 0,
+            request: resident_moe_request(explicit_max, explicit_max),
+            has_wmma: caps.has_wmma(),
+            pager: sc.pager,
+            ep_shard: sc.ep_shard,
+            moe_has_mq6: sc.mq6_weights,
+            layers_present: !sc.layers.is_empty(),
+            dn_state_admitted: ordinary_dn_state_admitted(
+                &moe.config,
+                &plan,
+                sc.per_token_requant,
+            ),
+            // The static facts' probe is the 512-row seam, exactly as
+            // `resident_moe_static_facts` evaluates it.
+            batch_pbs_eligible: sc_batched_eligible(moe, sc, WIDENED_COMMIT_ROWS),
+            layers_resident_capable: sc.layers.iter().all(|(placement, dtypes)| {
+                resident_moe_layer_facts_capable(placement, Some(dtypes))
+            }),
+        }
+    }
+
+    fn sc_memory_facts(sc: &Sc) -> ResidentMoeMemoryFacts {
+        ResidentMoeMemoryFacts {
+            free_bytes: sc.free_bytes,
+            live: LiveProjectionScratch::default(),
+            live_q16_bytes: sc.live_q16,
+        }
+    }
+
+    /// The wrapper step exactly as `ordinary_wrapper_pbs_prepare` flows it,
+    /// through the SAME shared [`OrdinaryWrapperGate`] (actual `n`, the 512-row
+    /// seam, the caller/capture record), [`resident_moe_default_fits`],
+    /// [`wrapper_virtual_credit_bytes`] and [`plan_wrapper_pbs`]. Needs no
+    /// inner entry, so it also covers calls (n = 1) that fall to the
+    /// per-token loop. Returns `(plan, maps_kv, mem_queried)`.
+    fn wrapper_run(
+        moe: &InstalledMoe,
+        sc: &Sc,
+        facts: &ResidentMoeStaticFacts,
+    ) -> (WrapperPbsPlan, bool, bool) {
+        let arch = sc.arch;
+        let fp8 = fp8_chunk512_for_flags(arch, &sc.flags);
+        let explicit_max = sc.explicit.then_some(4096usize);
+        // The implicit reuse cache as `Qwen35Scratch` allocates it for this
+        // knob state, the virtual-explicit target, and the shared fit.
+        let physical = sc
+            .reuse_pbs
+            .then(|| implicit_reuse_pbs_plan(arch, explicit_max, fp8));
+        if sc.call.caller_pbs_rows.is_some() {
+            // Direct `_with_pbs` callers: their own PBS, no wrapper.
+            return (
+                WrapperPbsPlan {
+                    owner: WrapperOwner::None,
+                    max_batch_override: None,
+                    free_virtual: false,
+                    alloc_virtual: false,
+                },
+                false,
+                false,
+            );
+        }
+        if sc.call.max_batch_cap.is_some() {
+            // `forward_prefill_batch_capped`: the implicit cache, never the wrapper.
+            return (
+                WrapperPbsPlan {
+                    owner: if physical.is_some() {
+                        WrapperOwner::Physical
+                    } else {
+                        WrapperOwner::None
+                    },
+                    max_batch_override: None,
+                    free_virtual: false,
+                    alloc_virtual: false,
+                },
+                false,
+                false,
+            );
+        }
+        let target = implicit_reuse_pbs_plan(arch, Some(RESIDENT_MOE_CHUNK_ROWS), fp8);
+        let credit_bytes =
+            wrapper_virtual_credit_bytes(&moe.config, physical, sc.existing_virtual, target);
+        let gate = OrdinaryWrapperGate::new(sc.n, &sc.call, physical, |rows| {
+            sc_batched_eligible(moe, sc, rows)
+        });
+        let queried = std::cell::Cell::new(false);
+        let dense_widened = false;
+        let default_moe_fits = gate.needs_default_fit(dense_widened)
+            && resident_moe_default_fits(
+                facts,
+                &moe.config,
+                sc.kv,
+                || {
+                    queried.set(true);
+                    sc_memory_facts(sc)
+                },
+                ResidentMoeOwner {
+                    rows: target.0,
+                    tape: target.1,
+                    credit_bytes,
+                },
+            );
+        let plan = gate.plan(arch, fp8, dense_widened, sc.existing_virtual, default_moe_fits);
+        (plan, gate.maps_kv(), queried.get())
+    }
+
+    /// The ordinary prefill call exactly as production flows it: wrapper PBS
+    /// plan ([`wrapper_run`]), then `plan_ordinary_prefill` whose widen-candidate
+    /// limit is `resident_moe_chunk_limit_from_facts` (the MoE arm of
+    /// `ordinary_prefill_chunk_limit_with_facts`; a MoE shape has no dense
+    /// static ceiling, asserted below), then the production chunk iterator.
+    /// A caller-supplied PBS bypasses the wrapper (direct `_with_pbs` callers).
+    /// Requires `sc.n >= MIN_BATCH` (a one-token call never reaches the planner:
+    /// the inner entry takes the per-token loop; use [`wrapper_run`]). A call
+    /// whose batched eligibility fails at its actual n (`prefill_batched` off
+    /// above the verify-decouple window, a layer dtype that is not batchable)
+    /// also takes the AR loop in production: `Run::ar_fallback` with no chunks
+    /// and no planner execution.
+    fn run(moe: &InstalledMoe, sc: &Sc) -> Run {
+        let arch = sc.arch;
+        let fp8 = fp8_chunk512_for_flags(arch, &sc.flags);
+        let explicit_max = sc.explicit.then_some(4096usize);
+        let request = resident_moe_request(explicit_max, explicit_max);
+        let legacy_max_batch = legacy_prefill_max_batch(explicit_max, arch, fp8, false);
+        assert!(
+            !widened_dense_shape_admitted(&moe.config),
+            "{}: a MoE shape has no dense widened ceiling",
+            moe.name
+        );
+        assert!(sc.n >= MIN_BATCH, "run() needs n >= 2 (n = 1: use wrapper_run)");
+        let facts = sc_static_facts(moe, sc);
+        let mem = sc_memory_facts(sc);
+        let physical = sc
+            .reuse_pbs
+            .then(|| implicit_reuse_pbs_plan(arch, explicit_max, fp8));
+        let (wrapper, maps_kv, mem_queried) = wrapper_run(moe, sc, &facts);
+        let owner = match wrapper.owner {
+            WrapperOwner::None => None,
+            WrapperOwner::Physical => physical,
+            WrapperOwner::Virtual { rows, tape } => Some((rows, tape)),
+        };
+        let incumbent = resolve_ordinary_max_batch(legacy_max_batch, None, sc.call.max_batch_cap);
+        let max_batch = resolve_ordinary_max_batch(
+            legacy_max_batch,
+            wrapper.max_batch_override,
+            sc.call.max_batch_cap,
+        );
+        // The production inner entry computes `prefill_batch_pbs_eligible` at
+        // the ACTUAL n and, when false, runs the per-token AR loop and returns
+        // BEFORE `plan_ordinary_prefill` (no planner, no chunk plan). The
+        // wrapper step above already ran, as in production.
+        if !sc_batched_eligible(moe, sc, sc.n) {
+            return Run {
+                facts,
+                wrapper,
+                maps_kv,
+                mem_queried,
+                owner,
+                // Not executed: placeholder carrying the incumbent ceiling.
+                plan: OrdinaryPrefillPlan {
+                    limit: max_batch,
+                    wide: false,
+                    moe_route: false,
+                    receipt: PrefillChunkReceipt {
+                        requested: max_batch,
+                        admitted: max_batch,
+                        commit_stride: None,
+                    },
+                    pbs_rows: 0,
+                },
+                chunks: Vec::new(),
+                max_batch,
+                incumbent,
+                ar_fallback: true,
+            };
+        }
+        let mut call = sc.call;
+        call.caller_pbs_rows = call.caller_pbs_rows.or(owner.map(|o| o.0));
+        let req = OrdinaryPlanRequest {
+            call,
+            n: sc.n,
+            max_batch,
+            explicit_max_batch: explicit_max,
+            chunk_rows_requested: chunk_rows_requested_from(arch, explicit_max, explicit_max),
+            moe_request: request,
+            moe_static_admitted: resident_moe_static_decision(&facts).is_some(),
+        };
+        let plan = plan_ordinary_prefill::<()>(&req, || {
+            Ok(resident_moe_chunk_limit_from_facts(
+                &facts,
+                None,
+                &moe.config,
+                sc.kv,
+                || mem,
+                sc.cached,
+                widened_owned_rows(RESIDENT_MOE_CHUNK_ROWS, sc.n),
+                sc.deduction,
+                max_batch,
+            ))
+        })
+        .unwrap();
+        let batch = plan.chunk_batch(None);
+        let (mut chunks, mut left) = (Vec::new(), sc.n);
+        while left > 0 {
+            let c = next_ordinary_chunk_len(plan.wide, false, left, batch).expect("chunk plan");
+            chunks.push((c, widened_commit_stride(plan.wide, c)));
+            left -= c;
+        }
+        Run {
+            facts,
+            wrapper,
+            maps_kv,
+            mem_queried,
+            owner,
+            plan,
+            chunks,
+            max_batch,
+            incumbent,
+            ar_fallback: false,
+        }
+    }
+
+    /// The ORIGINAL incumbent plan, compared against an independent
+    /// recomputation: no override, not widened, the original (capped) ceiling,
+    /// the original owner rows, and exactly the legacy chunk cadence.
+    fn assert_incumbent(r: &Run, sc: &Sc, what: &str) {
+        assert!(!r.plan.wide, "{what}: must not widen");
+        if r.ar_fallback {
+            // The inner entry returned to the per-token AR loop before the
+            // planner: no override, the incumbent ceiling, and no chunk plan.
+            assert_eq!(
+                r.wrapper.max_batch_override, None,
+                "{what}: no virtual-explicit override"
+            );
+            assert_eq!(r.plan.limit, r.incumbent, "{what}: incumbent ceiling");
+            assert!(r.chunks.is_empty(), "{what}: AR fallback runs no chunk plan");
+            return;
+        }
+        assert_eq!(
+            r.wrapper.max_batch_override, None,
+            "{what}: no virtual-explicit override"
+        );
+        assert_eq!(r.plan.limit, r.incumbent, "{what}: incumbent ceiling");
+        let rows = r
+            .owner
+            .map(|o| o.0)
+            .or(sc.call.caller_pbs_rows)
+            .unwrap_or_else(|| {
+                owned_prefill_scratch_plan(sc.n, r.incumbent, sc.call.tree_verify).0
+            });
+        assert_eq!(r.plan.pbs_rows, rows, "{what}: original owner rows");
+        let batch = r.incumbent.min(rows);
+        let (mut expected, mut left) = (Vec::new(), sc.n);
+        while left > 0 {
+            let c = next_prefill_chunk_len(left, batch).expect("legacy chunk plan");
+            expected.push((c, None));
+            left -= c;
+        }
+        assert_eq!(r.chunks, expected, "{what}: original chunk plan");
+        assert!(
+            r.chunks.iter().all(|(c, _)| *c <= r.incumbent),
+            "{what}: no chunk above the incumbent ceiling"
+        );
+    }
+
+    /// Planner proof over the INSTALLED artifacts: both real HFQs go through the
+    /// loader's expert binding; the production default and the beta explicit
+    /// `HIPFIRE_PREFILL_MAX_BATCH=4096` arms go through the SAME
+    /// wrapper-cache / `plan_ordinary_prefill` / memory / chunk functions the
+    /// production inner entry calls, with `HIPFIRE_PREFILL_REUSE_PBS` on and
+    /// off, and every denying fact is flipped against the same decision. Absent
+    /// artifacts skip loudly unless `HIPFIRE_REQUIRE_INSTALLED_A3B_HFQ` is set,
+    /// which makes both mandatory.
+    #[test]
+    fn resident_moe_installed_artifacts_admit_4096_and_log_it() {
+        use hipfire_runtime::hfq::HfqFile;
+        let models = std::env::var_os("HIPFIRE_MODELS_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| std::path::Path::new(&home).join(".hipfire/models"))
+            })
+            .expect("HOME or HIPFIRE_MODELS_DIR");
+        let require = hipfire_config::developer_var_os("HIPFIRE_REQUIRE_INSTALLED_A3B_HFQ").is_some();
+        let mut checked = 0;
+        for name in ["qwen3.6-35b-a3b.mq4r", "ornith-1.5-35b-a3b.mq4r"] {
+            let path = models.join(name);
+            if !path.exists() {
+                assert!(
+                    !require,
+                    "resident_moe artifact test: required {} is absent",
+                    path.display()
+                );
+                eprintln!("resident_moe artifact test: {} absent, skipped", path.display());
+                continue;
+            }
+            let hfq = HfqFile::open(&path).expect("open installed hfq");
+            for arch in ["gfx1201", "gfx1100"] {
+                let moe = load_installed_moe(name, &hfq, arch);
+                assert!(!moe.moe_has_mq6, "{name}: moe_has_mq6 must be false");
+                assert!(moe.batch_pbs_eligible, "{name}: batched layer dtype admission");
+                let line = |r: &Run| r.plan.receipt.to_string();
+                // Census of the actual HFQ shape against the independent
+                // constructor closed form (not the projected mirror).
+                for rows in [100usize, 512, 1024, 4096] {
+                    for tape in [false, true] {
+                        assert_eq!(
+                            resident_moe_owner_bytes(&moe.config, rows, tape).map(|b| b as u128),
+                            Some(constructor_payload_bytes(&moe.config, rows as u128, tape)),
+                            "{name}: census rows={rows} tape={tape}"
+                        );
+                    }
+                }
+                assert_eq!(resident_moe_owner_bytes(&moe.config, usize::MAX, false), None);
+
+                // --- reuse PBS off: default vs beta explicit 4096 -------------
+                for n in [4096usize, 8192, 3855, 16384, 4097, 513, 100] {
+                    let d = run(&moe, &baseline(&moe, arch, false, false, n));
+                    let e = run(&moe, &baseline(&moe, arch, true, false, n));
+                    assert!(
+                        resident_moe_static_decision(&d.facts).is_some(),
+                        "{name} {arch}: static decision must admit the installed model"
+                    );
+                    assert_eq!(
+                        resident_moe_static_decision(&e.facts),
+                        None,
+                        "{name} {arch}: explicit 4096 keeps the incumbent static gate"
+                    );
+                    assert!(d.plan.wide && e.plan.wide, "{name} {arch} n={n}");
+                    assert_eq!(d.plan.limit, RESIDENT_MOE_CHUNK_ROWS);
+                    assert_eq!(e.plan.limit, RESIDENT_MOE_CHUNK_ROWS);
+                    assert_eq!(
+                        (d.plan.pbs_rows, &d.chunks, line(&d)),
+                        (e.plan.pbs_rows, &e.chunks, line(&e)),
+                        "{name} {arch} n={n}: default vs explicit parameters"
+                    );
+                    assert_eq!((d.owner, e.owner), (None, None));
+                }
+                let d4096 = run(&moe, &baseline(&moe, arch, false, false, 4096));
+                assert_eq!(d4096.plan.pbs_rows, 4096);
+                assert_eq!(d4096.chunks, vec![(4096, Some(WIDENED_COMMIT_ROWS))]);
+                assert_eq!(
+                    line(&d4096),
+                    "prefill_chunk: requested=4096 admitted=4096 commit_stride=512"
+                );
+                eprintln!(
+                    "resident_moe production-planner proof: {name} {arch}: default==explicit4096 limit={} pbs_rows={} chunks(n=4096)={:?} line=\"{}\"",
+                    d4096.plan.limit,
+                    d4096.plan.pbs_rows,
+                    d4096.chunks,
+                    line(&d4096)
+                );
+                let guard = std::sync::atomic::AtomicUsize::new(0);
+                assert!(emit_prefill_chunk_receipt_guarded(
+                    &guard,
+                    d4096.plan.receipt.requested,
+                    d4096.plan.receipt.admitted,
+                    d4096.plan.receipt.commit_stride,
+                ));
+
+                // --- reuse PBS on: default == beta explicit 4096, EXACTLY -------
+                let flags0 = rdna_compute::FeatureFlags::from_active_config(arch);
+                let _ = &flags0;
+                let eff = |r: &Run| {
+                    (
+                        r.plan.wide,
+                        r.plan.limit,
+                        r.plan.pbs_rows,
+                        r.owner,
+                        r.chunks.clone(),
+                        r.plan.receipt.to_string(),
+                    )
+                };
+                for fp8_off in [false, true] {
+                    if fp8_off && arch != "gfx1201" {
+                        continue;
+                    }
+                    let tweak = |sc: &mut Sc| {
+                        if fp8_off {
+                            sc.flags.gfx12_mq4v2_fp8_gateup = false;
+                        }
+                    };
+                    let flags_now = {
+                        let mut f = flags0.clone();
+                        if fp8_off {
+                            f.gfx12_mq4v2_fp8_gateup = false;
+                        }
+                        f
+                    };
+                    let fp8_now = fp8_chunk512_for_flags(arch, &flags_now);
+                    let target = implicit_reuse_pbs_plan(arch, Some(RESIDENT_MOE_CHUNK_ROWS), fp8_now);
+                    let default_physical = implicit_reuse_pbs_plan(arch, None, fp8_now);
+                    let need_owner = resident_moe_need_owner_bytes(&moe.config, 0, target);
+                    for n in [4096usize, 8192, 513, 100] {
+                        let mut sd = baseline(&moe, arch, false, true, n);
+                        tweak(&mut sd);
+                        let mut se = baseline(&moe, arch, true, true, n);
+                        tweak(&mut se);
+                        let (d, e) = (run(&moe, &sd), run(&moe, &se));
+                        // Explicit manual knob: never rewritten (static gate closed,
+                        // implicit cache sized by the explicit knob itself).
+                        assert_eq!(resident_moe_static_decision(&e.facts), None);
+                        assert_eq!(e.wrapper.owner, WrapperOwner::Physical);
+                        assert_eq!(e.wrapper.max_batch_override, None);
+                        assert_eq!(e.owner, Some(target));
+                        assert!(!d.plan.wide && !e.plan.wide, "{name} {arch} n={n}");
+                        assert!(d.chunks.iter().chain(e.chunks.iter()).all(|c| c.1.is_none()));
+                        assert_eq!(d.plan.limit, RESIDENT_MOE_CHUNK_ROWS);
+                        // Default (fresh owner): EXACT beta explicit parameters.
+                        assert_eq!(
+                            eff(&d),
+                            eff(&e),
+                            "{name} {arch} fp8_off={fp8_off} n={n}: reuse-PBS default vs explicit"
+                        );
+                        if default_physical == target {
+                            assert_eq!(d.wrapper.owner, WrapperOwner::Physical);
+                            assert!(!d.wrapper.alloc_virtual);
+                        } else {
+                            assert_eq!(
+                                d.wrapper.owner,
+                                WrapperOwner::Virtual {
+                                    rows: target.0,
+                                    tape: target.1
+                                }
+                            );
+                            assert!(d.wrapper.alloc_virtual && !d.wrapper.free_virtual);
+                        }
+                        // Existing owner kept from an earlier admitted request: the
+                        // same effective parameters, allocated only when it differs.
+                        for existing in [Some(target), Some((1024, false)), Some((target.0, !target.1))] {
+                            let mut s2 = sd.clone();
+                            s2.existing_virtual = existing;
+                            let d2 = run(&moe, &s2);
+                            assert_eq!(eff(&d2), eff(&e), "{name} {arch} existing={existing:?}");
+                            if default_physical != target && existing == Some(target) {
+                                assert!(!d2.wrapper.alloc_virtual && !d2.wrapper.free_virtual);
+                            }
+                        }
+                        // Exact memory boundary of the explicit-equivalent owner,
+                        // fresh and credited by an existing owner.
+                        let mut fit = sd.clone();
+                        fit.free_bytes = Some(need_owner);
+                        assert_eq!(eff(&run(&moe, &fit)), eff(&e));
+                        let mut low = sd.clone();
+                        low.free_bytes = Some(need_owner - 1);
+                        let l = run(&moe, &low);
+                        // Does not fit: the incumbent cache and ceiling, no override.
+                        assert_eq!(l.wrapper.owner, WrapperOwner::Physical);
+                        assert_eq!(l.wrapper.max_batch_override, None);
+                        assert_eq!(l.owner, Some(default_physical));
+                        assert!(!l.plan.wide);
+                        assert_eq!(l.plan.limit, l.max_batch);
+                        assert_ne!(l.max_batch, RESIDENT_MOE_CHUNK_ROWS);
+                        assert_eq!(l.plan.chunk_batch(None), l.max_batch.min(default_physical.0));
+                        // A virtual owner kept from an earlier admitted request is
+                        // released when a later request no longer fits even with
+                        // the owner's own bytes credited; only a SAME-TARGET owner
+                        // that the wrapper keeps without replacement is credited
+                        // (it is held across calls, so its bytes are already absent
+                        // from free VRAM). When the implicit cache already is the
+                        // target shape no virtual owner is ever kept (nothing to
+                        // credit). Any other shape is replaced, and its freed bytes
+                        // only return to the allocator pool, so it earns no credit.
+                        let owner_bytes = owner_bytes_of(&moe.config, target);
+                        if default_physical != target {
+                            let tight = need_owner - owner_bytes - 1;
+                            let mut tight_plain = sd.clone();
+                            tight_plain.free_bytes = Some(tight);
+                            let mut tight_existing = tight_plain.clone();
+                            tight_existing.existing_virtual = Some(target);
+                            let (lp, le) = (run(&moe, &tight_plain), run(&moe, &tight_existing));
+                            assert!(le.wrapper.free_virtual && !le.wrapper.alloc_virtual);
+                            assert_eq!(eff(&le), eff(&lp));
+                            assert_eq!(le.wrapper.max_batch_override, None);
+                            // Credited by a kept owner, the boundary moves by its bytes.
+                            let mut credited = sd.clone();
+                            credited.existing_virtual = Some(target);
+                            credited.free_bytes = Some(need_owner - owner_bytes);
+                            assert_eq!(eff(&run(&moe, &credited)), eff(&e), "credited fit");
+                            credited.free_bytes = Some(need_owner - owner_bytes - 1);
+                            assert_eq!(run(&moe, &credited).wrapper.max_batch_override, None);
+                            // A mismatched owner (rows or tape) is replaced: the
+                            // budget a speculative credit would admit is denied, and
+                            // the stale owner is released.
+                            for stale in [(1024, false), (target.0, !target.1)] {
+                                let stale_bytes = owner_bytes_of(&moe.config, stale);
+                                assert!(stale_bytes < need_owner);
+                                let mut sc_stale = sd.clone();
+                                sc_stale.existing_virtual = Some(stale);
+                                sc_stale.free_bytes = Some(need_owner - stale_bytes);
+                                let r = run(&moe, &sc_stale);
+                                assert_eq!(
+                                    r.wrapper.max_batch_override, None,
+                                    "{name} {arch}: mismatched owner {stale:?} earns no credit"
+                                );
+                                assert!(r.wrapper.free_virtual && !r.wrapper.alloc_virtual);
+                                assert_eq!(r.owner, Some(default_physical));
+                                // Charged in full, it admits at exactly the fresh boundary.
+                                sc_stale.free_bytes = Some(need_owner);
+                                assert_eq!(eff(&run(&moe, &sc_stale)), eff(&e));
+                            }
+                        }
+                        // Eligibility facts keep denying with the cache present.
+                        let mut no_kv = sd.clone();
+                        no_kv.kv = KvTierFlags::default();
+                        let nk = run(&moe, &no_kv);
+                        assert_eq!(nk.wrapper.max_batch_override, None);
+                        assert_eq!(nk.owner, Some(default_physical));
+                        let mut ef_off = sd.clone();
+                        ef_off.dn_ef = false;
+                        let ne = run(&moe, &ef_off);
+                        assert_eq!(ne.wrapper.max_batch_override, None);
+                        assert_eq!(ne.owner, Some(default_physical));
+                    }
+                    eprintln!(
+                        "resident_moe reuse-PBS proof: {name} {arch} fp8_chunk512={fp8_now}: default cache={default_physical:?} -> virtual-explicit owner={target:?} limit=4096 wide=false commit=none == beta explicit4096 (EXACT, fresh + existing owner); low-mem keeps incumbent"
+                    );
+                }
+                let _ = &flags0;
+
+                // --- negative flags: each must deny through the actual decision,
+                // with the reuse cache absent AND present -------------------------
+                let base = baseline(&moe, arch, false, false, 8192);
+                let admitted = run(&moe, &base);
+                assert!(admitted.plan.wide, "{name} {arch}: baseline admits");
+                let deny = |what: &str, sc: &Sc| assert_incumbent(&run(&moe, sc), sc, what);
+                for reuse in [false, true] {
+                    let rbase = baseline(&moe, arch, false, reuse, 8192);
+                    if reuse {
+                        assert_eq!(
+                            run(&moe, &rbase).wrapper.max_batch_override,
+                            Some(RESIDENT_MOE_CHUNK_ROWS),
+                            "{name} {arch}: reuse baseline promotes"
+                        );
+                    }
+                    let call_flips: [(&str, CallFlip); 10] = [
+                        ("caller PBS smaller", |c| c.caller_pbs_rows = Some(512)),
+                        ("caller PBS covering the rung", |c| c.caller_pbs_rows = Some(8192)),
+                        ("max_batch_cap", |c| c.max_batch_cap = Some(256)),
+                        ("tree verify", |c| c.tree_verify = true),
+                        ("gdn tape", |c| c.gdn_tape = true),
+                        ("staged hidden ring", |c| c.staged_hidden_ring = true),
+                        ("max_layer", |c| c.max_layer = true),
+                        ("fusion", |c| c.fusion_on = true),
+                        ("capture mode", |c| c.capture_mode = true),
+                        ("recording", |c| c.recording = true),
+                    ];
+                    for (what, flip) in call_flips {
+                        let mut sc = rbase.clone();
+                        flip(&mut sc.call);
+                        deny(what, &sc);
+                        if what == "max_batch_cap" {
+                            // The ACTUAL chunks honor the cap exactly as production does.
+                            let r = run(&moe, &sc);
+                            assert!(r.incumbent <= 256 && r.plan.limit <= 256);
+                            assert!(r.chunks.iter().all(|(c, _)| *c <= 256));
+                        }
+                    }
+                    // State: wrong quant, EF off, lane batch > 1, per-token requant.
+                    let state_flips: [(&str, ScFlip); 5] = [
+                        ("state FP32", |s| s.dn_quant = StateQuant::FP32),
+                        ("state Q4", |s| s.dn_quant = StateQuant::Q4),
+                        ("state EF off", |s| s.dn_ef = false),
+                        ("state batch 2", |s| s.dn_batch = 2),
+                        ("per-token requant", |s| s.per_token_requant = true),
+                    ];
+                    for (what, flip) in state_flips {
+                        let mut sc = rbase.clone();
+                        flip(&mut sc);
+                        deny(what, &sc);
+                    }
+                    // KV: tiers without batched flash resolve through the real pair resolver.
+                    {
+                        use hipfire_runtime::kv_mode::{KvMode, KvPair};
+                        let mut sc = rbase.clone();
+                        sc.kv = kv_tier_flags_for_pair(KvPair::Native(KvMode::Bf16));
+                        assert!(!sc.kv.batched_flash());
+                        deny("kv bf16", &sc);
+                        sc.kv = KvTierFlags::default();
+                        deny("kv f32/none", &sc);
+                        for admitted_kv in [
+                            KvMode::Q8,
+                            KvMode::Fwht2,
+                            KvMode::Fwht3,
+                            KvMode::Fwht4,
+                            KvMode::Fp8,
+                        ] {
+                            let mut ok = rbase.clone();
+                            ok.kv = kv_tier_flags_for_pair(KvPair::Native(admitted_kv));
+                            assert!(ok.kv.batched_flash(), "{admitted_kv:?}");
+                            let r = run(&moe, &ok);
+                            if reuse {
+                                assert_eq!(
+                                    r.wrapper.max_batch_override,
+                                    Some(RESIDENT_MOE_CHUNK_ROWS),
+                                    "{name} {arch}: kv {admitted_kv:?}"
+                                );
+                            } else {
+                                assert!(r.plan.wide, "{name} {arch}: kv {admitted_kv:?}");
+                            }
+                        }
+                    }
+                    // Static model facts, including the production scalar gate.
+                    let static_flips: [(&str, ScFlip); 6] = [
+                        ("pager", |s| s.pager = true),
+                        ("ep shard", |s| s.ep_shard = true),
+                        ("mq6 weights", |s| s.mq6_weights = true),
+                        ("batch pbs dtype ineligible", |s| s.batch_pbs_eligible = false),
+                        ("prefill_batched off", |s| s.prefill_batched = false),
+                        ("no layers", |s| s.layers.clear()),
+                    ];
+                    for (what, flip) in static_flips {
+                        let mut sc = rbase.clone();
+                        flip(&mut sc);
+                        deny(what, &sc);
+                    }
+                    // Every placement flag of one middle layer, and every dtype class.
+                    let mid = moe.layers.len() / 2;
+                    let placement_flips: [(&str, PlacementFlip); 8] = [
+                        ("attention host", |p| p.attention_host_located = true),
+                        ("gate_up host", |p| p.routed_gate_up_host = true),
+                        ("down host", |p| p.routed_down_host = true),
+                        ("small ffn host", |p| p.small_ffn_host_located = true),
+                        ("cpu deferred experts", |p| p.cpu_deferred_experts = true),
+                        ("paged experts", |p| p.paged_experts = true),
+                        ("multi-device contract", |p| p.multi_device_contract = true),
+                        ("sidecar experts", |p| p.sidecar_experts = true),
+                    ];
+                    for (what, flip) in placement_flips {
+                        let mut sc = rbase.clone();
+                        flip(&mut sc.layers[mid].0);
+                        deny(what, &sc);
+                    }
+                    let dtype_flips: [(&str, DtypeFlip); 5] = [
+                        ("router mq6", |d| d.router = DType::MQ6G256),
+                        ("expert gate_up mq6", |d| d.expert_gate_up = DType::MQ6G256),
+                        ("expert down mixed", |d| d.expert_down_uniform = false),
+                        ("merged mixed routed", |d| d.routed_mixed_merged = true),
+                        ("shared pair split", |d| d.shared_expert_up = DType::MQ6G256),
+                    ];
+                    for (what, flip) in dtype_flips {
+                        let mut sc = rbase.clone();
+                        flip(&mut sc.layers[0].1);
+                        deny(what, &sc);
+                    }
+                    // Device: no WMMA grouped producer.
+                    {
+                        let mut sc = rbase.clone();
+                        sc.arch = "gfx1030";
+                        sc.flags = rdna_compute::FeatureFlags::from_active_config("gfx1030");
+                        let r = run(&moe, &sc);
+                        assert!(!r.facts.has_wmma);
+                        assert_incumbent(&r, &sc, "no wmma");
+                    }
+                }
+                // Memory: exact boundary with the full-row Q16 term, deduction,
+                // live Q16 credit, retained-owner credit, failed free query.
+                let need = resident_moe_need_bytes(&moe.config, 0);
+                let mut sc = base.clone();
+                sc.free_bytes = Some(need);
+                assert!(run(&moe, &sc).plan.wide, "{name} {arch}: free == need admits");
+                sc.free_bytes = Some(need - 1);
+                deny("free < need", &sc);
+                let fallback = run(&moe, &sc);
+                assert_eq!(
+                    fallback.plan.receipt.to_string(),
+                    format!(
+                        "prefill_chunk: requested=4096 admitted={} commit_stride=none",
+                        fallback.max_batch
+                    ),
+                    "{name} {arch}: memory fallback receipt"
+                );
+                assert!(emit_prefill_chunk_receipt_guarded(
+                    &guard,
+                    fallback.plan.receipt.requested,
+                    fallback.plan.receipt.admitted,
+                    fallback.plan.receipt.commit_stride,
+                ));
+                sc.free_bytes = None;
+                deny("free query failed", &sc);
+                sc.free_bytes = Some(need + 4096);
+                sc.deduction = 4096;
+                assert!(run(&moe, &sc).plan.wide);
+                sc.deduction = 4097;
+                deny("pending deduction", &sc);
+                sc.deduction = 0;
+                let q16_full =
+                    resident_moe_q16_missing(&moe.config, RESIDENT_MOE_CHUNK_ROWS, 0).unwrap();
+                sc.live_q16 = q16_full;
+                sc.free_bytes = Some(need - q16_full);
+                assert!(run(&moe, &sc).plan.wide, "{name} {arch}: live Q16 credit");
+                sc.free_bytes = Some(need - q16_full - 1);
+                deny("live Q16 credit boundary", &sc);
+                sc.live_q16 = 0;
+                // Retained widened owner credit: ONLY an owner this call reuses in
+                // place (non-lean, rows >= the call's owned PBS rows). A smaller or
+                // lean owner is freed to the allocator pool (bucket-local, not
+                // guaranteed reclaimable by another size) and replaced, so the
+                // full 4096 PBS is charged: no speculative credit.
+                let pbs_rows_bytes =
+                    |rows: usize| resident_moe_pbs_bytes(&moe.config, rows).unwrap();
+                let with_cached = |n: usize, cached: Option<(usize, bool)>, free: usize| {
+                    let mut c = base.clone();
+                    c.n = n;
+                    c.cached = cached;
+                    c.free_bytes = Some(free);
+                    c
+                };
+                let short = pbs_rows_bytes(2048);
+                // Short owner (2048 < the 4096 rows an 8192-row call needs) is
+                // replaced: the old speculative credit would admit this budget.
+                deny(
+                    "short cached owner earns no credit",
+                    &with_cached(8192, Some((2048, false)), need - short),
+                );
+                assert!(
+                    run(&moe, &with_cached(8192, Some((2048, false)), need)).plan.wide,
+                    "{name} {arch}: short cached owner, full rung charged exactly"
+                );
+                // Same-shape owner reused in place: positive credit, exact boundary.
+                let same = pbs_rows_bytes(4096);
+                assert!(
+                    run(&moe, &with_cached(8192, Some((4096, false)), need - same)).plan.wide,
+                    "{name} {arch}: reused owner credit"
+                );
+                deny(
+                    "reused owner credit boundary",
+                    &with_cached(8192, Some((4096, false)), need - same - 1),
+                );
+                // A call needing only the owner's rows reuses a smaller owner.
+                assert!(
+                    run(&moe, &with_cached(100, Some((2048, false)), need - short)).plan.wide,
+                    "{name} {arch}: n=100 reuses a 2048-row owner"
+                );
+                deny(
+                    "n=100 reused owner credit boundary",
+                    &with_cached(100, Some((2048, false)), need - short - 1),
+                );
+                // Exact reuse boundary: rows == needed rows credits, one row more
+                // needed replaces the owner.
+                assert!(
+                    run(&moe, &with_cached(2048, Some((2048, false)), need - short)).plan.wide,
+                    "{name} {arch}: owner rows == needed rows"
+                );
+                deny(
+                    "owner one row short",
+                    &with_cached(2049, Some((2048, false)), need - short),
+                );
+                // Lean mismatch: never credited.
+                deny(
+                    "lean owner is never credited",
+                    &with_cached(100, Some((2048, true)), need - short),
+                );
+                // A 512-row Q16 budget would have admitted a rung whose real
+                // full-row growth leaves < 1 GiB: it must deny now.
+                let q16_512 =
+                    resident_moe_q16_missing(&moe.config, WIDENED_COMMIT_ROWS, 0).unwrap();
+                let mut old = base.clone();
+                old.free_bytes = Some(need - (q16_full - q16_512));
+                deny("old 512-row Q16 budget", &old);
+                check_wrapper_actual_n(&moe, arch);
+                checked += 1;
+            }
+        }
+        eprintln!("resident_moe installed-artifact cases checked: {checked}");
+        if require {
+            assert_eq!(checked, 4, "both installed HFQs on both arches");
+        }
+    }
+
+    /// Wrapper and call-fact seams without an artifact: only the dense route
+    /// drops the implicit cache, every caller/capture fact closes the widen
+    /// candidate, and the allocator geometry plan drives the state gate.
+    #[test]
+    fn ordinary_wrapper_cache_and_state_planners() {
+        let inputs = |arch: &'static str,
+                      fp8: bool,
+                      dense: bool,
+                      physical: Option<(usize, bool)>,
+                      existing: Option<(usize, bool)>,
+                      fits: bool| WrapperPbsInputs {
+            arch,
+            fp8_chunk512: fp8,
+            dense_widened: dense,
+            physical,
+            existing_virtual: existing,
+            default_moe_fits: fits,
+            call_eligible: true,
+        };
+        let none = |p: WrapperPbsPlan| {
+            p.owner == WrapperOwner::None
+                && p.max_batch_override.is_none()
+                && !p.alloc_virtual
+        };
+        // Dense widened route and reuse off never hand a cache; an old virtual
+        // owner is released.
+        assert!(none(plan_wrapper_pbs(&inputs("gfx1100", false, true, Some((512, true)), None, true))));
+        assert!(none(plan_wrapper_pbs(&inputs("gfx1100", false, false, None, None, true))));
+        assert!(plan_wrapper_pbs(&inputs("gfx1100", false, false, None, Some((4096, true)), true)).free_virtual);
+        // Not fitting: the implicit cache, no override; an existing owner is released.
+        let p = plan_wrapper_pbs(&inputs("gfx1100", false, false, Some((512, true)), Some((4096, true)), false));
+        assert_eq!((p.owner, p.max_batch_override, p.free_virtual, p.alloc_virtual), (WrapperOwner::Physical, None, true, false));
+        // Fitting default on gfx1100: the explicit-4096 owner (4096 rows, tape) from the
+        // existing explicit sizing function, ceiling 4096.
+        let target = implicit_reuse_pbs_plan("gfx1100", Some(RESIDENT_MOE_CHUNK_ROWS), false);
+        assert_eq!(target, (4096, true));
+        let p = plan_wrapper_pbs(&inputs("gfx1100", false, false, Some((512, true)), None, true));
+        assert_eq!(
+            (p.owner, p.max_batch_override, p.free_virtual, p.alloc_virtual),
+            (WrapperOwner::Virtual { rows: 4096, tape: true }, Some(4096), false, true)
+        );
+        // An existing owner of the same shape is reused; a different one is replaced.
+        let p = plan_wrapper_pbs(&inputs("gfx1100", false, false, Some((512, true)), Some(target), true));
+        assert_eq!((p.free_virtual, p.alloc_virtual), (false, false));
+        let p = plan_wrapper_pbs(&inputs("gfx1100", false, false, Some((512, true)), Some((1024, false)), true));
+        assert_eq!((p.free_virtual, p.alloc_virtual), (true, true));
+        // A denying call (capture/tree/tape/ring/cap/state) never promotes, whatever
+        // fits, and leaves existing owners untouched.
+        let mut denied = inputs("gfx1100", false, false, Some((512, true)), Some((4096, true)), true);
+        denied.call_eligible = false;
+        let p = plan_wrapper_pbs(&denied);
+        assert_eq!(
+            (p.owner, p.max_batch_override, p.free_virtual, p.alloc_virtual),
+            (WrapperOwner::Physical, None, false, false)
+        );
+        // The shared scalar gate: prefill_batched off denies (outside the verify-decouple window).
+        assert!(prefill_batch_scalar_eligible(512, "gfx1201", None, true, true));
+        assert!(!prefill_batch_scalar_eligible(512, "gfx1201", None, false, true));
+        assert!(!prefill_batch_scalar_eligible(512, "gfx1100", Some("0"), false, true));
+        assert!(prefill_batch_scalar_eligible(16, "gfx1100", None, false, true));
+        assert!(!prefill_batch_scalar_eligible(1, "gfx1201", None, true, true));
+        assert!(!prefill_batch_scalar_eligible(512, "gfx1201", None, true, false));
+        // The shared ceiling resolver: the cap applies to the override too.
+        assert_eq!(resolve_ordinary_max_batch(512, None, Some(256)), 256);
+        assert_eq!(resolve_ordinary_max_batch(512, Some(4096), Some(256)), 256);
+        assert_eq!(resolve_ordinary_max_batch(512, Some(4096), None), 4096);
+        assert_eq!(resolve_ordinary_max_batch(384, None, None), 384);
+        // gfx1201 with the FP8 path: the implicit cache already is the explicit-4096 shape.
+        let p = plan_wrapper_pbs(&inputs("gfx1201", true, false, Some((512, false)), None, true));
+        assert_eq!(
+            (p.owner, p.max_batch_override, p.alloc_virtual),
+            (WrapperOwner::Physical, Some(4096), false)
+        );
+        // gfx1201 without it: 384-row cache -> the 512-row tape-free explicit owner.
+        let p = plan_wrapper_pbs(&inputs("gfx1201", false, false, Some((384, false)), None, true));
+        assert_eq!(
+            (p.owner, p.max_batch_override, p.alloc_virtual),
+            (WrapperOwner::Virtual { rows: 512, tape: false }, Some(4096), true)
+        );
+        let open = OrdinaryCallFacts::default();
+        assert!(open.wide_candidate());
+        let flips: [CallFlip; 9] = [
+            |c| c.caller_pbs_rows = Some(8192),
+            |c| c.max_batch_cap = Some(256),
+            |c| c.tree_verify = true,
+            |c| c.gdn_tape = true,
+            |c| c.staged_hidden_ring = true,
+            |c| c.max_layer = true,
+            |c| c.fusion_on = true,
+            |c| c.capture_mode = true,
+            |c| c.recording = true,
+        ];
+        for flip in flips {
+            let mut c = open;
+            flip(&mut c);
+            assert!(!c.wide_candidate());
+        }
+        // Implicit cache sizing per arch, default and explicit.
+        assert_eq!(implicit_reuse_pbs_plan("gfx1201", None, true), (512, false));
+        assert_eq!(implicit_reuse_pbs_plan("gfx1201", None, false), (384, false));
+        assert_eq!(implicit_reuse_pbs_plan("gfx1201", Some(4096), false), (512, false));
+        assert_eq!(implicit_reuse_pbs_plan("gfx1100", None, false), (512, true));
+        assert_eq!(implicit_reuse_pbs_plan("gfx1100", Some(4096), false), (4096, true));
+        assert_eq!(implicit_reuse_pbs_plan("gfx1151", None, false), (512, true));
+        // State gate over the allocator's own scalar plan.
+        let moe = resident_moe_test_config();
+        let q8 = DeltaNetStatePlan::new(&moe, StateQuant::Q8, 1, true);
+        assert!(ordinary_dn_state_admitted(&moe, &q8, false));
+        assert!(!ordinary_dn_state_admitted(&moe, &q8, true));
+        assert!(!ordinary_dn_state_admitted(
+            &moe,
+            &DeltaNetStatePlan::new(&moe, StateQuant::Q8, 1, false),
+            false
+        ));
+        assert!(!ordinary_dn_state_admitted(
+            &moe,
+            &DeltaNetStatePlan::new(&moe, StateQuant::Q8, 2, true),
+            false
+        ));
+        for quant in [StateQuant::FP32, StateQuant::Q4] {
+            assert!(!ordinary_dn_state_admitted(
+                &moe,
+                &DeltaNetStatePlan::new(&moe, quant, 1, true),
+                false
+            ));
+        }
+    }
+
+    /// Geometry over arbitrary per-owner counts (a live state's tensors or a
+    /// malformed one): the same borrowed-iterator view the live state exposes.
+    struct SliceGeometry {
+        quant: StateQuant,
+        s: Vec<usize>,
+        ef: Vec<usize>,
+    }
+
+    impl DeltaNetStateGeometry for SliceGeometry {
+        fn quant(&self) -> StateQuant {
+            self.quant
+        }
+        fn s_numel(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
+            self.s.iter().copied()
+        }
+        fn ef_numel(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
+            self.ef.iter().copied()
+        }
+    }
+
+    /// The allocator plan is three scalars with exactly the old per-layer
+    /// allocation formulas, and its borrowed iterators reproduce the old
+    /// per-layer vectors with no heap allocation.
+    #[test]
+    fn delta_net_state_plan_is_scalar_with_unchanged_allocation_formulas() {
+        let moe = resident_moe_test_config();
+        let n_la = moe
+            .layer_types
+            .iter()
+            .filter(|t| **t == LayerType::LinearAttention)
+            .count();
+        assert_eq!(n_la, 48);
+        let s_size = |batch: usize| {
+            batch * moe.linear_num_value_heads * moe.linear_key_head_dim * moe.linear_key_head_dim
+        };
+        for batch in [1usize, 2, 4] {
+            for (quant, ef) in [
+                (StateQuant::FP32, false),
+                (StateQuant::FP32, true),
+                (StateQuant::Q8, true),
+                (StateQuant::Q8, false),
+                (StateQuant::Q4, true),
+                (StateQuant::Q4, false),
+            ] {
+                let plan = DeltaNetStatePlan::new(&moe, quant, batch, ef);
+                // Scalars: F32/Q8 one element per state element, Q4 packs two
+                // per byte, EF (when on) is the unpacked per-element count.
+                let s_per_layer = if quant == StateQuant::Q4 {
+                    s_size(batch) / 2
+                } else {
+                    s_size(batch)
+                };
+                assert_eq!(plan.quant, quant);
+                assert_eq!(plan.n_layers, n_la);
+                assert_eq!(plan.s_per_layer, s_per_layer);
+                assert_eq!(plan.ef_per_layer, ef.then_some(s_size(batch)));
+                assert_eq!(plan.quant(), quant);
+                let s: Vec<usize> = plan.s_numel().collect();
+                assert_eq!(s, vec![s_per_layer; n_la]);
+                let efs: Vec<usize> = plan.ef_numel().collect();
+                assert_eq!(
+                    efs,
+                    if ef { vec![s_size(batch); n_la] } else { Vec::new() }
+                );
+                assert_eq!(plan.s_numel().len(), n_la);
+                assert_eq!(plan.ef_numel().len(), if ef { n_la } else { 0 });
+            }
+        }
+    }
+
+    /// Admission walks EVERY S and EF owner (never a first-owner summary):
+    /// a nonuniform, missing, extra, zero or wrong-quant owner at ANY position
+    /// denies, and the live-state / plan views agree on valid state.
+    #[test]
+    fn dn_state_admission_checks_every_owner() {
+        let moe = resident_moe_test_config();
+        let n_la = 48usize;
+        let single = moe.linear_num_value_heads * moe.linear_value_head_dim * moe.linear_value_head_dim;
+        let valid = || SliceGeometry {
+            quant: StateQuant::Q8,
+            s: vec![single; n_la],
+            ef: vec![single; n_la],
+        };
+        assert!(ordinary_dn_state_admitted(&moe, &valid(), false));
+        assert!(!ordinary_dn_state_admitted(&moe, &valid(), true));
+        // The slice view and the allocator plan are the same geometry.
+        let plan = DeltaNetStatePlan::new(&moe, StateQuant::Q8, 1, true);
+        assert_eq!(plan.s_per_layer, single);
+        assert!(ordinary_dn_state_admitted(&moe, &plan, false));
+        // Quant mismatch, including with otherwise valid owners.
+        for quant in [StateQuant::FP32, StateQuant::Q4] {
+            let mut g = valid();
+            g.quant = quant;
+            assert!(!ordinary_dn_state_admitted(&moe, &g, false));
+        }
+        // Every position, every malformation, in both owner lists.
+        for i in 0..n_la {
+            for bad in [0usize, single - 1, single + 1, single * 2, single / 2] {
+                let mut g = valid();
+                g.s[i] = bad;
+                assert!(
+                    !ordinary_dn_state_admitted(&moe, &g, false),
+                    "S owner {i} = {bad}"
+                );
+            }
+            // EF owners are required non-empty per layer (any nonzero count).
+            let mut g = valid();
+            g.ef[i] = 0;
+            assert!(!ordinary_dn_state_admitted(&moe, &g, false), "EF owner {i} empty");
+            let mut g = valid();
+            g.ef[i] = single * 3;
+            assert!(ordinary_dn_state_admitted(&moe, &g, false), "EF owner {i} nonzero");
+        }
+        // Missing / extra owners (count mismatch) anywhere in the list.
+        for list in 0..2 {
+            for extra in [false, true] {
+                for pos in [0usize, n_la / 2, n_la - 1] {
+                    let mut g = valid();
+                    let v = if list == 0 { &mut g.s } else { &mut g.ef };
+                    if extra {
+                        v.insert(pos, single);
+                    } else {
+                        v.remove(pos);
+                    }
+                    assert!(
+                        !ordinary_dn_state_admitted(&moe, &g, false),
+                        "list={list} extra={extra} pos={pos}"
+                    );
+                }
+            }
+        }
+        // EF entirely missing (EF off) and S entirely missing.
+        let mut g = valid();
+        g.ef.clear();
+        assert!(!ordinary_dn_state_admitted(&moe, &g, false));
+        let mut g = valid();
+        g.s.clear();
+        assert!(!ordinary_dn_state_admitted(&moe, &g, false));
+    }
+
+    /// The wrapper gate over pure facts: actual `n`, the 512-row seam and the
+    /// caller/capture record, evaluated before any KV mapping / memory query /
+    /// override / allocation.
+    #[test]
+    fn ordinary_wrapper_gate_uses_actual_n_and_seam() {
+        let open = OrdinaryCallFacts::default();
+        let phys = Some((512usize, true));
+        let gate = |arch: &str,
+                    decouple: Option<&str>,
+                    batched: bool,
+                    n: usize,
+                    call: &OrdinaryCallFacts,
+                    physical: Option<(usize, bool)>| {
+            OrdinaryWrapperGate::new(n, call, physical, |rows| {
+                prefill_batch_scalar_eligible(rows, arch, decouple, batched, true)
+            })
+        };
+        let target = implicit_reuse_pbs_plan("gfx1100", Some(RESIDENT_MOE_CHUNK_ROWS), false);
+        // Closed gate: incumbent resource plan whatever the fit says, with the
+        // implicit cache (kept, existing virtual owner untouched) or without
+        // (reuse off: the plan's stale-owner release only).
+        let assert_closed = |g: &OrdinaryWrapperGate, what: &str| {
+            assert!(!g.call_eligible, "{what}");
+            assert!(!g.maps_kv(), "{what}: no KV mapping");
+            assert!(!g.needs_default_fit(false), "{what}: no memory query");
+            let p = g.plan("gfx1100", false, false, Some(target), true);
+            assert_eq!(p.max_batch_override, None, "{what}");
+            assert!(!p.alloc_virtual, "{what}");
+            if g.physical.is_some() {
+                assert_eq!(p.owner, WrapperOwner::Physical, "{what}");
+                assert!(!p.free_virtual, "{what}: existing owner untouched");
+            } else {
+                assert_eq!(p.owner, WrapperOwner::None, "{what}");
+            }
+        };
+        // n = 1 falls to the per-token AR loop: closed, reuse on and off.
+        for physical in [phys, None] {
+            assert_closed(&gate("gfx1100", None, true, 1, &open, physical), "n=1");
+            assert_closed(&gate("gfx1201", None, true, 1, &open, physical), "n=1 gfx1201");
+        }
+        // prefill_batched off: the verify-decouple window admits small n on
+        // gfx11 (actual n allowed) but the 512-row seam is not: closed. Above
+        // the window both are closed. gfx1201 needs the env opt-in for the
+        // window and is still closed at the seam.
+        assert!(prefill_batch_scalar_eligible(16, "gfx1100", None, false, true));
+        assert!(!prefill_batch_scalar_eligible(512, "gfx1100", None, false, true));
+        for physical in [phys, None] {
+            for n in [2usize, 16, 32, 33, 40, 600] {
+                assert_closed(
+                    &gate("gfx1100", None, false, n, &open, physical),
+                    "gfx1100 prefill_batched off",
+                );
+            }
+            assert_closed(&gate("gfx1201", None, false, 16, &open, physical), "gfx1201 off");
+            assert!(prefill_batch_scalar_eligible(16, "gfx1201", Some("1"), false, true));
+            assert_closed(
+                &gate("gfx1201", Some("1"), false, 16, &open, physical),
+                "gfx1201 decouple=1, off",
+            );
+            assert_closed(
+                &gate("gfx1100", Some("0"), false, 16, &open, physical),
+                "decouple=0, off",
+            );
+        }
+        // Valid positive n opens the gate: the implicit cache is mapped and the
+        // memory fit is queried; reuse off maps nothing.
+        for n in [2usize, 3, 16, 33, 100, 4096, 8192] {
+            let g = gate("gfx1100", None, true, n, &open, phys);
+            assert!(g.call_eligible && g.maps_kv() && g.needs_default_fit(false), "n={n}");
+            assert!(!g.needs_default_fit(true), "dense widened never queries the MoE fit");
+            let p = g.plan("gfx1100", false, false, None, true);
+            assert_eq!(
+                (p.owner, p.max_batch_override, p.alloc_virtual),
+                (
+                    WrapperOwner::Virtual {
+                        rows: target.0,
+                        tape: target.1
+                    },
+                    Some(RESIDENT_MOE_CHUNK_ROWS),
+                    true
+                ),
+                "n={n}"
+            );
+            // A fit that was not asked for (needs_default_fit false) never promotes.
+            let off = gate("gfx1100", None, true, n, &open, None);
+            assert!(off.call_eligible && !off.maps_kv() && !off.needs_default_fit(false));
+            let p = off.plan("gfx1100", false, false, Some(target), true);
+            assert_eq!((p.owner, p.max_batch_override, p.alloc_virtual), (WrapperOwner::None, None, false));
+            assert!(p.free_virtual);
+        }
+        // Every caller/capture fact closes the gate at a valid n.
+        let flips: [CallFlip; 9] = [
+            |c| c.caller_pbs_rows = Some(8192),
+            |c| c.max_batch_cap = Some(256),
+            |c| c.tree_verify = true,
+            |c| c.gdn_tape = true,
+            |c| c.staged_hidden_ring = true,
+            |c| c.max_layer = true,
+            |c| c.fusion_on = true,
+            |c| c.capture_mode = true,
+            |c| c.recording = true,
+        ];
+        for flip in flips {
+            let mut c = open;
+            flip(&mut c);
+            assert_closed(&gate("gfx1100", None, true, 100, &c, phys), "call fact");
+        }
+        // An empty call touches nothing at all.
+        let g = gate("gfx1100", None, true, 0, &open, phys);
+        assert!(!g.call_eligible && !g.maps_kv());
+        let p = g.plan("gfx1100", false, false, Some(target), true);
+        assert_eq!(
+            p,
+            WrapperPbsPlan {
+                owner: WrapperOwner::None,
+                max_batch_override: None,
+                free_virtual: false,
+                alloc_virtual: false,
+            }
+        );
+    }
+
+    /// Only the existing virtual owner the wrapper keeps without replacement is
+    /// credited; a mismatched owner (replaced, freed to the allocator pool) and
+    /// an owner equal to the implicit cache (never kept) earn nothing.
+    #[test]
+    fn wrapper_virtual_credit_is_same_target_only() {
+        let moe = resident_moe_test_config();
+        let target = (4096usize, true);
+        let bytes = resident_moe_owner_bytes(&moe, target.0, target.1).unwrap();
+        let physical = Some((512usize, true));
+        assert_eq!(wrapper_virtual_credit_bytes(&moe, physical, Some(target), target), bytes);
+        assert_eq!(wrapper_virtual_credit_bytes(&moe, physical, None, target), 0);
+        for stale in [(1024usize, true), (4096, false), (8192, true), (512, false)] {
+            assert_eq!(
+                wrapper_virtual_credit_bytes(&moe, physical, Some(stale), target),
+                0,
+                "{stale:?}"
+            );
+        }
+        // The implicit cache already is the target: no virtual owner is kept.
+        assert_eq!(wrapper_virtual_credit_bytes(&moe, Some(target), Some(target), target), 0);
+        // The plan keeps exactly the credited owner (no free, no alloc).
+        let p = plan_wrapper_pbs(&WrapperPbsInputs {
+            arch: "gfx1100",
+            fp8_chunk512: false,
+            dense_widened: false,
+            physical,
+            existing_virtual: Some(target),
+            default_moe_fits: true,
+            call_eligible: true,
+        });
+        assert!(!p.free_virtual && !p.alloc_virtual);
+        for stale in [(1024usize, true), (4096, false)] {
+            let p = plan_wrapper_pbs(&WrapperPbsInputs {
+                arch: "gfx1100",
+                fp8_chunk512: false,
+                dense_widened: false,
+                physical,
+                existing_virtual: Some(stale),
+                default_moe_fits: true,
+                call_eligible: true,
+            });
+            assert!(p.free_virtual && p.alloc_virtual, "{stale:?} is replaced");
+        }
+    }
+
+    /// Wrapper actual-N proof over `moe` through the SHARED production
+    /// wrapper decision ([`OrdinaryWrapperGate`], [`wrapper_run`] /
+    /// [`run`]): valid positive n equals the explicit 4096 parameters; n = 1
+    /// and the config-off / verify-decouple small windows (actual n and the
+    /// 512 seam disagree) keep the original incumbent resource plan with no
+    /// override, KV mapping, memory query or allocation.
+    fn check_wrapper_actual_n(moe: &InstalledMoe, arch: &'static str) {
+        let name = &moe.name;
+        let base = |explicit: bool, reuse: bool, n: usize| {
+            let mut sc = baseline(moe, arch, explicit, reuse, n);
+            if !sc.kv.batched_flash() {
+                sc.kv = KvTierFlags {
+                    quant_q8: true,
+                    ..KvTierFlags::default()
+                };
+            }
+            sc
+        };
+        let flags = rdna_compute::FeatureFlags::from_active_config(arch);
+        let fp8 = fp8_chunk512_for_flags(arch, &flags);
+        let target = implicit_reuse_pbs_plan(arch, Some(RESIDENT_MOE_CHUNK_ROWS), fp8);
+        let eff = |r: &Run| {
+            (
+                r.plan.wide,
+                r.plan.limit,
+                r.plan.pbs_rows,
+                r.owner,
+                r.chunks.clone(),
+                r.plan.receipt.to_string(),
+            )
+        };
+        // Valid positive n, reuse off and on: the default equals the explicit 4096.
+        for reuse in [false, true] {
+            for n in [2usize, 16, 33, 100] {
+                let d = run(moe, &base(false, reuse, n));
+                let e = run(moe, &base(true, reuse, n));
+                assert!(
+                    resident_moe_static_decision(&d.facts).is_some(),
+                    "{name} {arch} n={n}: default admitted"
+                );
+                assert_eq!(resident_moe_static_decision(&e.facts), None);
+                assert_eq!(d.plan.limit, RESIDENT_MOE_CHUNK_ROWS, "{name} {arch} n={n}");
+                assert_eq!(
+                    eff(&d),
+                    eff(&e),
+                    "{name} {arch} reuse={reuse} n={n}: default vs explicit 4096"
+                );
+                assert_eq!(d.maps_kv, reuse, "{name} {arch} n={n}: KV mapped iff cache present");
+                assert!(!e.mem_queried, "explicit knob never queries the default fit");
+                if reuse {
+                    assert_eq!(d.wrapper.max_batch_override, Some(RESIDENT_MOE_CHUNK_ROWS));
+                    assert!(d.mem_queried);
+                }
+            }
+        }
+        // Gate-denied calls: incumbent resource plan (see `OrdinaryWrapperGate`).
+        let assert_denied = |sc: &Sc, what: &str| {
+            let facts = sc_static_facts(moe, sc);
+            let (plan, maps_kv, queried) = wrapper_run(moe, sc, &facts);
+            assert!(!maps_kv, "{name} {arch} {what}: no KV mapping");
+            assert!(!queried, "{name} {arch} {what}: no memory query");
+            assert_eq!(plan.max_batch_override, None, "{name} {arch} {what}: no override");
+            assert!(!plan.alloc_virtual, "{name} {arch} {what}: no allocation");
+            if sc.reuse_pbs {
+                assert_eq!(plan.owner, WrapperOwner::Physical, "{what}");
+                assert!(!plan.free_virtual, "{name} {arch} {what}: owners untouched");
+            } else {
+                assert_eq!(plan.owner, WrapperOwner::None, "{what}");
+                assert_eq!(plan.free_virtual, sc.existing_virtual.is_some(), "{what}");
+            }
+        };
+        // n = 1, reuse on/off, fresh and existing virtual owner. The 512-row
+        // static facts alone would still admit the model.
+        for reuse in [false, true] {
+            for existing in [None, Some(target), Some((1024, false))] {
+                let mut sc = base(false, reuse, 1);
+                sc.existing_virtual = existing;
+                let facts = sc_static_facts(moe, &sc);
+                assert!(resident_moe_static_decision(&facts).is_some(), "{name} {arch}");
+                assert!(!sc_batched_eligible(moe, &sc, 1));
+                assert_denied(&sc, "n=1");
+                // Explicit knob: also the incumbent.
+                let mut ex = base(true, reuse, 1);
+                ex.existing_virtual = existing;
+                assert_denied(&ex, "n=1 explicit");
+            }
+        }
+        // prefill_batched off at the verify-decouple boundary and above: the
+        // actual n may be admitted (gfx11 window) while the 512 seam is not.
+        let decouple_env_unset = hipfire_config::developer_var_os("HIPFIRE_MTP_VERIFY_DECOUPLE").is_none();
+        for reuse in [false, true] {
+            for existing in [None, Some(target)] {
+                for n in [2usize, 16, 32, 33, 40, 600] {
+                    let mut sc = base(false, reuse, n);
+                    sc.prefill_batched = false;
+                    sc.existing_virtual = existing;
+                    assert!(!sc_batched_eligible(moe, &sc, WIDENED_COMMIT_ROWS));
+                    if decouple_env_unset {
+                        assert_eq!(
+                            sc_batched_eligible(moe, &sc, n),
+                            arch == "gfx1100" && n <= 32,
+                            "{name} {arch} n={n}: actual-n admission differs from the 512 probe"
+                        );
+                    }
+                    assert_denied(&sc, "prefill_batched off");
+                    // The whole planner flow keeps the original incumbent plan.
+                    let r = run(moe, &sc);
+                    assert_incumbent(&r, &sc, "prefill_batched off");
+                    // The inner entry's own scalar/PBS eligibility at the actual
+                    // n: above the verify-decouple window it returns to the
+                    // per-token AR loop BEFORE the planner (no chunk plan runs);
+                    // inside the gfx11 window the batched planner runs.
+                    let inner_batched = sc_batched_eligible(moe, &sc, n);
+                    assert_eq!(r.ar_fallback, !inner_batched, "{name} {arch} n={n}");
+                    assert_eq!(r.chunks.is_empty(), !inner_batched, "{name} {arch} n={n}");
+                }
+            }
+        }
+    }
+
+    /// [`check_wrapper_actual_n`] on a synthetic resident MoE (no installed
+    /// artifact needed).
+    #[test]
+    fn wrapper_actual_n_synthetic_resident_moe() {
+        let config = resident_moe_test_config();
+        let dtypes = resident_moe_dtypes(DType::MQ4G256);
+        let moe = InstalledMoe {
+            name: "synthetic-a3b".to_string(),
+            layers: vec![(ResidentMoePlacement::default(), dtypes); config.n_layers],
+            config,
+            moe_has_mq6: false,
+            batch_pbs_eligible: true,
+        };
+        for arch in ["gfx1201", "gfx1100"] {
+            check_wrapper_actual_n(&moe, arch);
+        }
     }
 
     #[test]

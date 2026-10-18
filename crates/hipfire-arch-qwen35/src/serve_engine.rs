@@ -99,8 +99,10 @@ pub struct EngineConfig {
     /// MTP speculative decode depth (K candidates per cycle). 0 = MTP off.
     pub mtp_k: usize,
     /// The `params.mtp_mode` tri-state (`off`/`auto`/`on`). `mtp_k > 0` alone
-    /// cannot distinguish `auto` from an explicit `on`, so the slots arming
-    /// site reads this (not `mtp_k`) for the host-spill decline.
+    /// cannot distinguish `auto` from an explicit `on`, so `SlotEngine::spawn`
+    /// reads this (not `mtp_k`) for the producer-capability gate (`auto`
+    /// arms only with a declared measured AR floor, which qwen35 lacks) and
+    /// the arming site for the host-spill decline.
     pub mtp_mode: hipfire_config::MtpMode,
     /// Raw KV-mode string from the load request (`--kv-mode`). Empty = fall
     /// back to `HIPFIRE_KV_MODE` / config, resolved through the slots site
@@ -234,7 +236,19 @@ impl SlotEngine {
 
     /// Build the rig on a new thread and start serving. Returns once the model
     /// is loaded, so a caller that gets `Ok` can submit immediately.
-    pub fn spawn(cfg: EngineConfig) -> Result<SlotEngine, String> {
+    ///
+    /// The producer-capability gate runs here, before any placement or head
+    /// resolution reads `mtp_k`: qwen35 declares no measured AR floor
+    /// ([`crate::MTP_MEASURED_AR_FLOOR`]), so an `auto` mode serves plain AR
+    /// (no head is resolved or reserved for) and only an explicit `on` keeps
+    /// its depth. The daemon's slots route and any direct caller get the same
+    /// verdict as the sequential loader.
+    pub fn spawn(mut cfg: EngineConfig) -> Result<SlotEngine, String> {
+        let admitted_k = slot_mtp_k(cfg.mtp_mode, cfg.mtp_k, crate::MTP_MEASURED_AR_FLOOR);
+        if cfg.mtp_k > 0 && admitted_k == 0 && cfg.mtp_mode == hipfire_config::MtpMode::Auto {
+            eprintln!("{}", hipfire_config::mtp_no_floor_decline_line("qwen35 slots"));
+        }
+        cfg.mtp_k = admitted_k;
         let (tx, rx) = channel::<EngineCommand>();
         let (ready_tx, ready_rx) = channel::<Result<(), String>>();
         let stats = Arc::new(Mutex::new(EngineStats::default()));
@@ -7810,37 +7824,89 @@ mod spill_agreement_tests {
     }
 }
 
+/// The slots MTP depth after the producer-capability gate
+/// (`hipfire_config::mtp_mode_admits`): `mtp_k` when the mode admits the head
+/// for a producer with/without a declared measured AR floor, else `0` (plain
+/// AR, no head resolved or reserved for). `Off` is `0` regardless of `mtp_k`.
+fn slot_mtp_k(mode: hipfire_config::MtpMode, mtp_k: usize, measured_ar_floor: bool) -> usize {
+    if hipfire_config::mtp_mode_admits(mode, measured_ar_floor) {
+        mtp_k
+    } else {
+        0
+    }
+}
+
 #[cfg(test)]
 mod mtp_spill_decline_tests {
+    use super::slot_mtp_k;
     use hipfire_config::{mtp_host_spill_policy, MtpMode};
 
     /// There is no GPU-free seam for `Rig::build` itself (it opens the HFQ,
     /// inits the GPU and loads weights before reaching the arming site), so
-    /// this pins the exact verdict the arming site computes from the built
-    /// weights: a host-mapped spill under `auto` declines (no head), while
-    /// `on` still arms. The parent's live bench covers the end-to-end load.
-    fn slots_arming_verdict(mode: MtpMode, host_mapped_expert_blobs: usize, arch: &str) -> bool {
-        // Mirrors the `Rig::build` arming site: `mtp_k > 0 && policy.attach`
-        // with qwen35's empty admitted list.
-        let mtp_k = 4;
+    /// this pins the exact verdict the arming sites compute: `spawn`'s
+    /// producer-capability gate (`slot_mtp_k`) and then, from the built
+    /// weights, `mtp_k > 0 && policy.attach`. A host-mapped spill under `auto`
+    /// declines (no head, AR), while `on` still arms. The parent's live bench
+    /// covers the end-to-end load.
+    fn slots_arming_verdict(
+        mode: MtpMode,
+        host_mapped_expert_blobs: usize,
+        arch: &str,
+        measured_ar_floor: bool,
+    ) -> bool {
+        // qwen35's admitted spill list is empty.
+        let mtp_k = slot_mtp_k(mode, 4, measured_ar_floor);
         mtp_k > 0 && mtp_host_spill_policy(mode, host_mapped_expert_blobs, arch, &[]).attach
     }
 
     #[test]
-    fn slots_arming_declines_spill_under_auto_and_arms_on_explicit_on() {
-        // Fully resident: auto arms (no decline).
-        assert!(slots_arming_verdict(MtpMode::Auto, 0, "gfx1201"));
-        // Host-mapped spill under auto: declines on every arch (no head, AR).
+    fn qwen35_declares_no_measured_ar_floor() {
+        assert!(!crate::MTP_MEASURED_AR_FLOOR);
+    }
+
+    #[test]
+    fn slots_arming_is_explicit_only_for_the_declared_qwen35_floor() {
+        let floor = crate::MTP_MEASURED_AR_FLOOR;
+        // `auto` stays AR on a producer without a measured floor, resident or not.
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            for blobs in [0, 24] {
+                assert!(
+                    !slots_arming_verdict(MtpMode::Auto, blobs, arch, floor),
+                    "qwen35 slots auto must stay AR ({arch}, blobs {blobs})"
+                );
+            }
+        }
+        // Explicit opt-in arms, resident and over a spill.
+        assert!(slots_arming_verdict(MtpMode::On, 0, "gfx1201", floor));
+        assert!(slots_arming_verdict(MtpMode::On, 24, "gfx1100", floor));
+        // Off never arms.
+        assert!(!slots_arming_verdict(MtpMode::Off, 0, "gfx1201", floor));
+        assert!(!slots_arming_verdict(MtpMode::Off, 24, "gfx1201", floor));
+    }
+
+    #[test]
+    fn slots_arming_declines_spill_under_auto_and_arms_on_explicit_on_with_a_floor() {
+        // A producer that did declare the floor keeps the spill policy:
+        // fully resident auto arms, a host-mapped spill under auto declines
+        // on every arch, explicit `on` arms over the same spill.
+        assert!(slots_arming_verdict(MtpMode::Auto, 0, "gfx1201", true));
         for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             assert!(
-                !slots_arming_verdict(MtpMode::Auto, 24, arch),
+                !slots_arming_verdict(MtpMode::Auto, 24, arch, true),
                 "slots must decline a spill under auto on {arch}"
             );
         }
-        // Explicit opt-in still arms over the same spill.
-        assert!(slots_arming_verdict(MtpMode::On, 24, "gfx1100"));
-        // Off never arms.
-        assert!(!slots_arming_verdict(MtpMode::Off, 0, "gfx1201"));
-        assert!(!slots_arming_verdict(MtpMode::Off, 24, "gfx1201"));
+        assert!(slots_arming_verdict(MtpMode::On, 24, "gfx1100", true));
+        assert!(!slots_arming_verdict(MtpMode::Off, 0, "gfx1201", true));
+    }
+
+    #[test]
+    fn slot_mtp_k_zeroes_every_non_admitted_mode() {
+        assert_eq!(slot_mtp_k(MtpMode::Off, 4, true), 0);
+        assert_eq!(slot_mtp_k(MtpMode::Off, 4, false), 0);
+        assert_eq!(slot_mtp_k(MtpMode::Auto, 4, false), 0);
+        assert_eq!(slot_mtp_k(MtpMode::Auto, 4, true), 4);
+        assert_eq!(slot_mtp_k(MtpMode::On, 4, false), 4);
+        assert_eq!(slot_mtp_k(MtpMode::On, 0, false), 0);
     }
 }

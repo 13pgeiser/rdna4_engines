@@ -23,6 +23,13 @@
 //! The `arch` module exposes the trait impl for use by the runtime's
 //! daemon and other consumers via `hipfire_arch_qwen35::Qwen35`.
 
+/// Producer capability: the Qwen3.5/3.6 native MTP drafter (`mtp_speculator`,
+/// `mtp_head`) has no measured autoregressive floor — it never prices a draft
+/// window against the AR step or retires itself when drafting loses. So
+/// `speculation.mtp = auto` keeps plain AR (the head is not loaded); only an
+/// explicit `on` / `--spec mtp` arms it.
+pub const MTP_MEASURED_AR_FLOOR: bool = false;
+
 // Qwen3.5 is a hybrid DeltaNet + FullAttention architecture; all the
 // runtime infrastructure it touches is `deltanet`-gated. When the parent
 // build doesn't enable the feature, the crate is a no-op stub. This keeps

@@ -172,7 +172,8 @@ works, what to measure, what counts as pass/fail.
   Qwen3.8-27B tiers that declare a paired draft (`qwen3.8:27b`, `-mq3*`,
   `-mq4*`, including the canonical `qwen3.8:27b-mq4-xts` fixture): the
   registry layer sets `speculation.dflash=auto`, so a present paired file
-  activates DFlash with no config, an absent file keeps MTP `auto`, and an
+  activates DFlash with no config, an absent file keeps MTP `auto` (which is
+  AR here: Qwen35 declares no measured AR floor; `--spec mtp` opts in), and an
   explicit `dflash_mode off` (canonical `speculation.dflash=off`) is the
   kill switch. `dflash_block` stays `auto` (L16 singleton, L8 on a
   `serve.vmm_batch` serve with ≥ 4 lanes, IU4 verify gates unchanged).
@@ -282,7 +283,8 @@ Files land at `~/.hipfire/models/<canonical-name>`.
 **Do not rename.** Load resolves the draft by its registry-declared
 filename; renaming breaks the pairing — an explicit `dflash_mode auto` then
 runs AR (one warning line) and `on` fails the load; a Qwen3.8-27B tier
-(registry `auto`) keeps MTP `auto` when the draft file is absent.
+(registry `auto`) keeps MTP `auto` when the draft file is absent, and Qwen35's
+`auto` is AR (no measured AR floor; `--spec mtp` opts in).
 
 ### Verify hashes after pull (paranoid mode)
 
@@ -815,8 +817,14 @@ Caveats that are part of the fixture, not trivia:
 - Loading it needs a build whose qwen4 trunk source contract admits **both**
   packed trunk tiers and whose external-PLE admission accepts both PLE tiers.
   Older builds refuse at load; that refusal is correct, not a corrupt file.
-- **MTP is on by default (`speculation.mtp = auto`) except on `.mq4r` loads,
-  which keep the retained Redline AR route; it serves greedy and sampled
+- **MTP `auto` (`speculation.mtp = auto`, the schema default) arms native MTP
+  only for a producer that declares a measured AR floor. Today that is Qwen4
+  (Flash-Next, arch 16), except on `.mq4r` loads, which keep the retained
+  Redline AR route. Qwen3.5-class (arch 5/6, dense and MoE), DeepSeek V4 and
+  Gemma 4 declare no floor (the DS4 native-MTP audit found none), so `auto`
+  resolves to AR there even when a head is present. An explicit
+  `speculation.mtp = on` / `--spec mtp` still attaches any present head on
+  every producer, and DSpark / DFlash selection is unchanged. Qwen4 MTP serves greedy and sampled
   requests: `speculation.mtp_sampled` (`HIPFIRE_MTP_SAMPLED`, default on since
   0.4.1; `0` sends sampled requests to AR) verifies sampled requests by
   speculative rejection sampling against the AR sampler's distribution
@@ -1119,7 +1127,7 @@ Caveats that are part of the fixture, not trivia:
 | "27B DFlash regressed 30-40% suddenly" | PR #32 (cleanup-dead-wmma-kernels) on master removed `gemm_hfq4g256_residual_wmma{,2,_k4}.hip` thinking dead. Dispatch fell back to slower variants. | Verify against canonical 199 tok/s @ max=120 with default flags. If kernel files missing in `kernels/src/`, `git checkout` from a known-good commit (see commit 9a2c667 for the full recovery context). |
 | `HIPFIRE_GRAPH=1` reports plausible tok/s but output is garbage | Dangling stack-pointer kernargs from raw `self.hip.launch_kernel(...)` calls in `forward_scratch_layers` (kv_cache_write_*, attention_flash_*, fused_qkv_hfq4g256, rmsnorm_batched, rope_partial_interleaved_f32, gated_delta_net_q8, etc.) — captured pointers dangle past `end_graph_capture` | Bench tok/s alone never proves graph correctness. Always eyeball under `HIPFIRE_GRAPH=1` and run the claim-scoped VALIDATION serve route — never retired coherence-gate scripts as acceptance. Fix: migrate every raw-launch helper used in forward_scratch_layers to `launch_maybe_blob` (model after `conv1d_silu_split_f32_n`). |
 | `memory.offload_exec` modes disagree on greedy output, or `passback` differs between two identical runs | Expected: the modes run different GEMV engines, and `passback`'s row split is scheduled per process (probe + online arm timings). Measured (2B): `cpu`×2 and `pcie`×2 byte-identical; `cpu` vs `pcie` differ; `passback`×2 differ; `HIPFIRE_OFFLOAD_PASSBACK_SHARE=0` byte-identical to `cpu` | NEVER assert a greedy/golden reference across a mode pair (`cpu` vs `pcie` is not bit-identical either), and NEVER assert `passback` output with the share on `auto` — pin `memory.offload_passback_share`, or use `0` to reach the exact `cpu` twin. See [`docs/perf-checkpoints/2026-10-02-offload-passback-model-spread-gfx1201-amendment-1.md`](docs/perf-checkpoints/2026-10-02-offload-passback-model-spread-gfx1201-amendment-1.md) § 5. |
-| Offloaded MoE with `speculation.mtp=auto` runs AR (bench `spec_route` null, serve `timings.tau`/`mtp` null, no `MTP head loaded` line) | Native Qwen35 MTP `auto` declines after placement resolves host-mapped routed experts on either `pcie` or `cpu`, logging the count, seam and `opt in with --spec mtp`. Unset/null layer/expert budgets keep all weights resident; only explicit `auto`/`-1` or manual `N` requests placement changes | Use `--spec mtp` / `speculation.mtp=on`, subject to metadata-based refusal of uniform MQ6G256 V1 (qt15) Qwen35 MoE on gfx1200/gfx1201 with FP16 WMMA enabled whenever a head would attach (including resident `auto`). `--spec off` / `speculation.mtp=off` and auto-declined spill remain AR; `HIPFIRE_FP16=0` permits explicit MTP. Mixed/graded MQ4+MQ6, MQ6V2, gfx1151 and dense are outside the refusal. `speculation.dflash=on` still refuses without a DFlash draft and never aliases to MTP. No root WMMA fix is claimed |
+| Qwen3.5-class (arch 5/6) model with `speculation.mtp=auto` runs AR, resident or offloaded (bench `spec_route` null, serve `timings.tau`/`mtp` null, no `MTP head loaded` line) | Native MTP `auto` arms only a producer that declares a measured AR floor, and Qwen35 declares none, so the load logs `MTP: off by default (no measured AR floor); opt in with --spec mtp` and no head is loaded. Where a floor-declaring producer (Qwen4) does attach under `auto`, a host-mapped routed-expert spill still declines it on any arch but its admitted one (the `pcie`/`cpu` decline line logs the count, seam and `opt in with --spec mtp`). Unset/null layer/expert budgets keep all weights resident; only explicit `auto`/`-1` or manual `N` requests placement changes | Use `--spec mtp` / `speculation.mtp=on`, subject to metadata-based refusal of uniform MQ6G256 V1 (qt15) Qwen35 MoE on gfx1200/gfx1201 with FP16 WMMA enabled whenever a head would attach. `--spec off` / `speculation.mtp=off`, `auto` and an auto-declined spill remain AR; `HIPFIRE_FP16=0` permits explicit MTP. Mixed/graded MQ4+MQ6, MQ6V2, gfx1151 and dense are outside the refusal. `speculation.dflash=on` still refuses without a DFlash draft and never aliases to MTP. No root WMMA fix is claimed |
 
 
 ---

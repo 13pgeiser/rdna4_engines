@@ -250,6 +250,17 @@ pub trait Carrier: Send + Sync {
         None
     }
 
+    /// Producer capability: this arch's native MTP drafter ships a measured
+    /// autoregressive floor, so `speculation.mtp = auto` may attach it
+    /// (`hipfire_config::mtp_mode_admits`). Default `false`: an `auto` MTP is
+    /// declined, the head is not loaded, and the model keeps plain AR; only an
+    /// explicit `on` arms it. A carrier overrides with its producer crate's
+    /// `MTP_MEASURED_AR_FLOOR` — the declaration lives with the drafter, never
+    /// in a central arch table.
+    fn mtp_measured_ar_floor(&self) -> bool {
+        false
+    }
+
     // ── decide (Jev-compatible logit readout) ──────────────────────────────
     /// Whether this arch implements the three decide hooks below.
     fn decide_supported(&self) -> bool {
@@ -1208,6 +1219,21 @@ impl LoadedModel {
             rec_min_p: None,
             rec_presence_penalty: None,
         }
+    }
+
+    /// Whether this model's producer declared a measured AR floor
+    /// ([`Carrier::mtp_measured_ar_floor`]); `false` for an arch with no
+    /// registered carrier. Every MTP consumer of an `auto` mode reads this
+    /// (not head presence) so a loaded head never rearms `auto` by itself.
+    pub fn mtp_measured_ar_floor(&self) -> bool {
+        carrier_for(self.arch_id).is_some_and(|carrier| carrier.mtp_measured_ar_floor())
+    }
+
+    /// `mtp_mode` after the producer-capability gate
+    /// ([`hipfire_config::mtp_effective_mode_name`]): `auto` on a producer
+    /// without a measured AR floor is `"off"`; `on`/`off` are unchanged.
+    pub fn effective_mtp_mode(&self) -> &'static str {
+        hipfire_config::mtp_effective_mode_name(&self.mtp_mode, self.mtp_measured_ar_floor())
     }
 
     /// LFM2.5-MoE bundle if this model is arch_id=11, else None.
@@ -2511,12 +2537,20 @@ fn finish_qwen35_load(
     // declines over a host-mapped spill, `on` (`Some(true)`) arms, `off`
     // (`Some(false)`) stays AR via the gate below. qwen35's admitted list is
     // empty. Worded once in `hipfire_config::mtp_host_spill_decline_line`.
-    let mtp_spill_mode = match ctx.spec.mtp {
-        Some(true) => hipfire_config::MtpMode::On,
-        Some(false) => hipfire_config::MtpMode::Off,
-        None => hipfire_config::MtpMode::Auto,
-    };
+    let mtp_spill_mode = hipfire_config::MtpMode::from_tri_state(ctx.spec.mtp);
+    // Producer capability gate first: qwen35's drafter declares no measured AR
+    // floor (`hipfire_arch_qwen35::MTP_MEASURED_AR_FLOOR`), so `auto` keeps
+    // plain AR and the head is never loaded (the retained AR spine keeps its
+    // memory); only an explicit `on` arms it. A floor decline supersedes the
+    // spill decline below (its line would misdescribe the cause).
+    let mtp_floor_declined = matches!(arch_id, 5 | 6)
+        && mtp_spill_mode == hipfire_config::MtpMode::Auto
+        && !hipfire_config::mtp_mode_admits(
+            mtp_spill_mode,
+            hipfire_arch_qwen35::MTP_MEASURED_AR_FLOOR,
+        );
     let mtp_spill_degrade = matches!(arch_id, 5 | 6)
+        && !mtp_floor_declined
         && !hipfire_config::mtp_host_spill_policy(
             mtp_spill_mode,
             host_mapped_expert_blobs,
@@ -2540,9 +2574,19 @@ fn finish_qwen35_load(
             )
         );
     }
+    if mtp_floor_declined
+        && !adaptive_blocks_generic_spec
+        && eviction.is_none()
+        && dflash.is_none()
+        && dspark_speculator.is_none()
+    {
+        eprintln!("{}", hipfire_config::mtp_no_floor_decline_line("qwen35"));
+    }
     // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then .mtp sidecar) ──
     // Precedence: DSpark > DFlash > MTP > n-gram. Gate: only arch 5/6, no adaptive/eviction,
-    // and typed mtp != off. Bundled first, then the sidecar the CLI resolved
+    // and a typed mtp the producer-capability gate admits (`on`; `auto` only with a
+    // declared measured AR floor, which qwen35 lacks, so `auto` never loads a head).
+    // Bundled first, then the sidecar the CLI resolved
     // (`ctx.mtp_path`), else `<trunk>.mtp`; physical_cap is the KV window. A head
     // whose hidden size or vocab differs from the trunk is refused before upload.
     // On missing/refused/failed: error when forced on (mtp=on), auto logs/falls back.
@@ -2552,6 +2596,7 @@ fn finish_qwen35_load(
             || !matches!(arch_id, 5 | 6)
             || ctx.spec.mtp == Some(false)
             || mtp_spill_degrade
+            || mtp_floor_declined
             || dflash.is_some()
             || dspark_speculator.is_some()
         {
@@ -2609,10 +2654,7 @@ fn finish_qwen35_load(
         }
     }
     let mtp_present = mtp.is_some();
-    let (mtp, mtp_source) = match mtp {
-        Some((head, source)) => (Some(head), Some(source)),
-        None => (None, None),
-    };
+    let mtp = mtp.map(|(head, _source)| head);
     // Auto-attached drafters (mode `auto`, not forced `on`) get one line that
     // names the artifact and the switch, so an A/B never starts with a hunt.
     let auto_draft = match (ctx.spec.dflash, &dflash, ctx.draft_path) {
@@ -2652,8 +2694,6 @@ fn finish_qwen35_load(
             eprintln!(
                 "DFlash: on (auto, draft {draft}) — disable with --spec off or speculation.dflash off"
             );
-        } else if let (Some(source), None, "mtp") = (&mtp_source, ctx.spec.mtp, name) {
-            eprintln!("MTP: on (auto, {source}) — disable with --spec off or speculation.mtp off");
         }
     }
 
@@ -3038,8 +3078,13 @@ fn resolve_route_plan(
     };
     // Native MTP head, in the loader's order: bundled trailer, then sidecar.
     // A head that later fails its trunk check falls back to AR, a subset of
-    // the MTP plan.
-    let head = if req.spec.mtp == Some(false) {
+    // the MTP plan. The plan applies the loader's producer-capability gate:
+    // `auto` without a declared measured AR floor (qwen35's case) loads no
+    // head, so the plan is the AR route.
+    let head = if !hipfire_config::mtp_mode_admits(
+        hipfire_config::MtpMode::from_tri_state(req.spec.mtp),
+        hipfire_arch_qwen35::MTP_MEASURED_AR_FLOOR,
+    ) {
         None
     } else {
         match hipfire_arch_qwen35::mtp_head::detect_bundled_mtp_offset(base) {

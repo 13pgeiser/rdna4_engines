@@ -663,6 +663,10 @@ impl Carrier for Qwen4Carrier {
         arch_id == hipfire_arch_qwen4::ARCH_ID && !is_dir
     }
 
+    fn mtp_measured_ar_floor(&self) -> bool {
+        hipfire_arch_qwen4::MTP_MEASURED_AR_FLOOR
+    }
+
     fn admit_topology(
         &self,
         _arch_id: u32,
@@ -3903,6 +3907,9 @@ impl Carrier for Qwen35Carrier {
         // 5 = dense (+VL), 6 = MoE — same ids in both namespaces.
         matches!(arch_id, 5 | 6)
     }
+    fn mtp_measured_ar_floor(&self) -> bool {
+        hipfire_arch_qwen35::MTP_MEASURED_AR_FLOOR
+    }
     fn admit_topology(
         &self,
         _arch_id: u32,
@@ -5050,6 +5057,9 @@ impl Carrier for Deepseek4Carrier {
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 9
+    }
+    fn mtp_measured_ar_floor(&self) -> bool {
+        hipfire_arch_deepseek4::MTP_MEASURED_AR_FLOOR
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {

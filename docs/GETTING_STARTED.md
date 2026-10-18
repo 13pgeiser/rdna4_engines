@@ -465,8 +465,8 @@ Defaults that matter on day one (from the native schema; full table in [CONFIG.m
 | `temperature` | `0.3` | Stored global default only for run/serve send (see above); Chat session seed |
 | `max_tokens` | `4096` | Per-request generation cap for `run` / API fallback |
 | `kv_cache` | `auto` | Resolves via a registry non-q8 `default_kv_mode`, else the architecture default: Qwen native `fp8` on eligible exact gfx1201, `q8` on gfx1100 / gfx1151 and elsewhere. `fwht3` is an optional headroom mode |
-| `dflash_mode` | **`off`** (schema) | DFlash is opt-in; pulling a draft does not enable it. Exception: Qwen3.8-27B tiers with a registry-declared draft (`qwen3.8:27b`, `-mq3*`, `-mq4*`) resolve `auto` through the registry layer, so the pulled draft is used there; if the draft file is absent the load keeps MTP `auto`. `hipfire config set dflash_mode off` is the kill switch ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)). |
-| `speculation` | `auto` | Mechanism selector; DFlash stays off when `dflash_mode=off`, but eligible **MTP / DSpark** paths may still activate under `auto`. Use `speculation=off` to force plain AR. |
+| `dflash_mode` | **`off`** (schema) | DFlash is opt-in; pulling a draft does not enable it. Exception: Qwen3.8-27B tiers with a registry-declared draft (`qwen3.8:27b`, `-mq3*`, `-mq4*`) resolve `auto` through the registry layer, so the pulled draft is used there; if the draft file is absent the load keeps MTP `auto` (AR for this Qwen35 producer: it declares no measured AR floor, so only `--spec mtp` arms its head). `hipfire config set dflash_mode off` is the kill switch ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)). |
+| `speculation` | `auto` | Mechanism selector; DFlash stays off when `dflash_mode=off`. Native **MTP** under `auto` arms only a producer that declares a measured AR floor (today only Flash-Next / Qwen4); Qwen3.5-class and DeepSeek V4 heads stay AR until `--spec mtp` opts in. An eligible **DSpark** sidecar may still activate under `auto`. Use `speculation=off` to force plain AR. |
 | `thinking` | `on` | Reasoning models may emit `<think>`; display strip is CLI/API-side |
 | `host` / `port` | `127.0.0.1` / `11435` | Serve bind (no TLS; key optional, recommended off loopback) |
 
@@ -543,7 +543,7 @@ is tagged.
 | HIP / `/dev/kfd` / arch errors | `hipfire diag`; match ROCm/HIP version to arch (above) |
 | Model not found | `hipfire list` / `hipfire list -r`; `hipfire pull <tag>` |
 | Port in use / stale serve | `hipfire ps`; `hipfire stop --force`; check `~/.hipfire/serve.pid` and (detached only) `serve.log` |
-| Draft pulled but no speedup | Expected for most models: the schema `dflash_mode` default is **off** (Qwen3.8-27B paired tiers resolve `auto` from the registry; check `hipfire config <tag>` and that the draft file is present, else only MTP runs) |
+| Draft pulled but no speedup | Expected for most models: the schema `dflash_mode` default is **off** (Qwen3.8-27B paired tiers resolve `auto` from the registry; check `hipfire config <tag>` and that the draft file is present; with the draft absent the load runs AR, because native MTP `auto` arms only Flash-Next, and `--spec mtp` is the opt-in for the 27B MTP head) |
 | Truncated answers, or empty `content` from an OpenAI client, on thinking models | `max_tokens` covers the `<think>` span too: raise `max_tokens` / `thinking_budget`, or send `"chat_template_kwargs": {"enable_thinking": false}` (see [SERVE.md](SERVE.md)); [MODELS.md](MODELS.md) thinking section |
 
 ```bash

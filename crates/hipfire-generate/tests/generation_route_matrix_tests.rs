@@ -43,18 +43,58 @@ fn base() -> GenerationRouteInputs {
 
 #[test]
 fn dspark_request_is_independent_of_mtp_mode() {
-    assert!(deepseek4_spec_requested_from_policy(
-        Some("dspark"),
-        "off",
-        "off",
-        false,
-    ));
+    // DSpark short-circuits before any MTP verdict, whatever the declared floor.
+    for floor in [false, true] {
+        assert!(deepseek4_spec_requested_from_policy(
+            Some("dspark"),
+            "off",
+            "off",
+            false,
+            floor,
+        ));
+    }
     assert!(!deepseek4_spec_requested_from_policy(
-        None, "off", "auto", true,
+        None, "off", "auto", true, true,
     ));
     assert!(deepseek4_spec_requested_from_policy(
-        None, "auto", "auto", true,
+        None, "auto", "auto", true, true,
     ));
+}
+
+#[test]
+fn deepseek4_native_mtp_auto_without_a_measured_floor_stays_ar_and_explicit_on_still_arms() {
+    // DeepSeek V4's native MTP declares no measured AR floor.
+    let floor = hipfire_arch_deepseek4::MTP_MEASURED_AR_FLOOR;
+    assert!(!floor);
+    // `auto` with the weights present (a loaded head or a DSpark sidecar's
+    // presence flag) must not rearm without the capability.
+    assert!(!deepseek4_spec_requested_from_policy(
+        None, "auto", "auto", true, floor,
+    ));
+    // No weights: `auto` is AR either way.
+    assert!(!deepseek4_spec_requested_from_policy(
+        None, "auto", "auto", false, true,
+    ));
+    // A declared floor admits `auto` (weights present) exactly as before.
+    assert!(deepseek4_spec_requested_from_policy(
+        None, "auto", "auto", true, true,
+    ));
+    // Explicit `on` (model or process) still requests MTP without the floor.
+    assert!(deepseek4_spec_requested_from_policy(
+        None, "auto", "on", false, floor,
+    ));
+    assert!(deepseek4_spec_requested_from_policy(
+        None, "on", "auto", false, floor,
+    ));
+    // Explicit `off` never does, floor or not.
+    for floor in [false, true] {
+        assert!(!deepseek4_spec_requested_from_policy(
+            None, "off", "on", true, floor,
+        ));
+        assert!(!deepseek4_spec_requested_from_policy(
+            None, "auto", "off", true, floor,
+        ));
+    }
 }
 
 /// One canonical input row that selects each ALL variant (coverage guard).

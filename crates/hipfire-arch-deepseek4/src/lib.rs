@@ -51,6 +51,14 @@
 //!   (source of truth for MTP wiring, Hyper-Connections head reduction,
 //!   and the raw SWA + compressed-KV KV-cache layout).
 
+/// Producer capability: the DeepSeek V4 in-trunk native MTP layer
+/// (`mtp_speculator::Deepseek4MtpDrafter`, `spec_decode`) has no measured
+/// autoregressive floor (audited: no floor/retire pricing anywhere in the
+/// crate), so `speculation.mtp = auto` keeps plain AR and the MTP layer is not
+/// loaded; explicit `on` / `--spec mtp` arms it. The DSpark sidecar is a
+/// separate selector (`speculation.dspark`) and is unaffected.
+pub const MTP_MEASURED_AR_FLOOR: bool = false;
+
 pub mod arch;
 pub mod arch_model;
 mod backend;

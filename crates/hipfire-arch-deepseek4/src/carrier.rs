@@ -99,11 +99,20 @@ pub fn load_bundle(
     // sidecar; any other mechanism (`Some(false)`) skips it so it never pages
     // into VRAM. `None` (auto / directly-driven daemon) keeps default-on.
     let load_dspark = ctx.spec.dspark != Some(false);
+    // Native in-trunk MTP layer load gate: the producer-capability verdict
+    // (`on` loads it; `auto` loads it only for a producer with a measured AR
+    // floor, which DeepSeek V4 lacks; `off` never). Independent of DSpark
+    // (its sidecar loads above whatever this says).
+    let load_mtp = hipfire_config::mtp_mode_admits(
+        hipfire_config::MtpMode::from_tri_state(ctx.spec.mtp),
+        crate::MTP_MEASURED_AR_FLOOR,
+    );
     let (config, weights) = match src {
         ModelSource::Hfq(mut hfq) => {
             let mut config = <DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
             apply_deepseek4_experts_per_token(&mut config, ctx.deepseek4_experts_per_token)?;
             config.load_dspark = load_dspark;
+            config.load_mtp = load_mtp;
             let weights =
                 <DeepseekV4 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
             (config, weights)
@@ -114,6 +123,7 @@ pub fn load_bundle(
             })?;
             apply_deepseek4_experts_per_token(&mut config, ctx.deepseek4_experts_per_token)?;
             config.load_dspark = load_dspark;
+            config.load_mtp = load_mtp;
             let weights =
                 DeepseekV4::load_weights_from_safetensors(&source, &config, ctx.gpu)?;
             (config, weights)

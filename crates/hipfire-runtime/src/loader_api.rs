@@ -229,9 +229,12 @@ pub struct SpecLoadCfg {
     /// still wins over this in the builder.
     pub dspark_conf_threshold: Option<f32>,
     /// Qwen MTP (NextN) enable, lowered from the `speculation` selector:
-    /// `Some(true)` = `mtp` mode (load + force), `Some(false)` = another
-    /// mechanism selected (skip load + build), `None` = `auto` (load if a
-    /// bundled trailer or `.mtp` sidecar exists).
+    /// `Some(true)` = `mtp` mode (load + force, whatever the producer
+    /// declares), `Some(false)` = another mechanism selected (skip load +
+    /// build), `None` = `auto`: the head loads only for a producer that
+    /// declares a measured AR floor (`hipfire_config::mtp_mode_admits`;
+    /// native Qwen4 only — Qwen3.5/3.6 and DeepSeek V4 keep plain AR) and
+    /// only if a bundled trailer or `.mtp` sidecar exists.
     pub mtp: Option<bool>,
     /// MTP draft window K. `Some` = explicit (load param, `HIPFIRE_MTP_K`, or
     /// `speculation.mtp_k`); `None` = `auto`: each producer applies its own

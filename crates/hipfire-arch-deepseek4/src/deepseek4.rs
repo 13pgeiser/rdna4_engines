@@ -327,6 +327,16 @@ pub struct DeepseekV4Config {
     #[serde(skip)]
     pub load_dspark: bool,
 
+    /// Whether to load the trunk's in-band native MTP layer (`mtp.0.*`) during
+    /// `load_weights`. Set by the loader from the MTP producer-capability gate
+    /// (`hipfire_config::mtp_mode_admits` with [`crate::MTP_MEASURED_AR_FLOOR`]):
+    /// `speculation.mtp = auto` on this producer (no measured AR floor) leaves
+    /// the layer unloaded so ordinary AR keeps its memory; explicit `on` loads
+    /// it. Defaults to `true` for directly-driven loaders (examples, oracles).
+    /// `HIPFIRE_DEEPSEEK4_LOAD_MTP=0` still skips it. Not (de)serialized.
+    #[serde(skip)]
+    pub load_mtp: bool,
+
     /// DeepSeek V4 routed-MQ2 product-family selector. This is derived from an
     /// exact `.mq2r`/`.mq2rxt` artifact identity and is never inferred from a
     /// tensor dtype, so MQ2-Lloyd keeps its established runtime defaults. The
@@ -479,6 +489,7 @@ impl DeepseekV4Config {
             num_hash_layers: raw.num_hash_layers,
             reap_keep: None,
             load_dspark: true,
+            load_mtp: true,
             mq2r,
             mq2rxt,
         };
@@ -659,6 +670,7 @@ pub fn config_from_safetensors(source: &dyn ModelSource) -> Option<DeepseekV4Con
         num_hash_layers: raw.num_hash_layers,
         reap_keep: None,
         load_dspark: true,
+        load_mtp: true,
         mq2r: false,
         mq2rxt: false,
     })

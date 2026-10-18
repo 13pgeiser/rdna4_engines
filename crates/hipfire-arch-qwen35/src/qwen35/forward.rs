@@ -1155,6 +1155,12 @@ pub struct Qwen35Scratch {
     // on. RefCell because the prefill entries take `&Qwen35Scratch`; all
     // mutation happens on the single owning daemon thread.
     pub widened_prefill_batch: std::cell::RefCell<Option<PrefillBatchScratch>>,
+    // Explicit-equivalent owner of an eligible DEFAULT resident-MoE request
+    // under `HIPFIRE_PREFILL_REUSE_PBS=1` (`plan_wrapper_pbs`): allocated
+    // lazily, with the rows/tape flag the explicit
+    // `HIPFIRE_PREFILL_MAX_BATCH=4096` cache sizing would give, only when the
+    // implicit cache differs from them. RefCell for the same reason as above.
+    pub reuse_virtual_pbs: std::cell::RefCell<Option<PrefillBatchScratch>>,
 }
 
 fn qwen35_x_rot_len(dim: usize, hidden_dim: usize, v_dim: usize) -> usize {
@@ -1413,6 +1419,7 @@ impl Qwen35Scratch {
             moe_down_expanded: None,
             prefill_batch: None,
             widened_prefill_batch: std::cell::RefCell::new(None),
+            reuse_virtual_pbs: std::cell::RefCell::new(None),
         })
         .and_then(|mut s| {
             // Allocate MoE scratch only for MoE configs. Done after the
@@ -1475,16 +1482,9 @@ impl Qwen35Scratch {
                 // wrappers use separate owned tape-enabled scratch, never
                 // this cache. Other arches keep their existing sizing and
                 // tape behavior.
-                let (max_batch, cap_tape) = if gpu.arch == "gfx1201" {
-                    (super::prefill::prefill_max_batch(gpu).min(512), false)
-                } else if gpu.arch == "gfx1151" {
-                    (
-                        super::prefill::prefill_max_batch(gpu).max(512),
-                        true,
-                    )
-                } else {
-                    (super::prefill::prefill_max_batch(gpu), true)
-                };
+                // Sizing is the pure `implicit_reuse_pbs_plan` the CPU
+                // admission tests read for the same default/explicit cases.
+                let (max_batch, cap_tape) = super::prefill::implicit_reuse_pbs_plan_for_gpu(gpu);
                 s.prefill_batch = match PrefillBatchScratch::new_opt(gpu, config, max_batch, cap_tape) {
                     Ok(prefill) => Some(prefill),
                     Err(error) => {
@@ -1569,6 +1569,9 @@ impl Qwen35Scratch {
             note(pbs.free_gpu(gpu));
         }
         if let Some(pbs) = self.widened_prefill_batch.into_inner() {
+            note(pbs.free_gpu(gpu));
+        }
+        if let Some(pbs) = self.reuse_virtual_pbs.into_inner() {
             note(pbs.free_gpu(gpu));
         }
         match first_err {

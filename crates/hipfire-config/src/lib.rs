@@ -2114,7 +2114,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_MTP_MODE"),
-        "MTP eligibility policy."
+        "MTP eligibility policy. `auto` (default) arms the native MTP head only for a producer that declares a measured autoregressive floor (native Qwen4 MTP, Flash-Next); every other producer (Qwen3.5/3.6, DeepSeek V4) keeps plain AR and does not load the head. `on` arms the head wherever one exists (also over a host-mapped expert spill); `off` never arms it."
     ),
     field!(
         "speculation.mtp_k",
@@ -2577,7 +2577,7 @@ pub static FIELDS: &[ConfigField] = &[
         ValueRule::Integer { min: 2, max: 1048576 },
         false,
         "HIPFIRE_PREFILL_CHUNK_ROWS",
-        "Widened ordinary-prefill chunk ceiling in rows (arch default 8192 on exact gfx1100/gfx1151/gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH overrides; per-device VRAM admission may select a smaller rung). Qwen4 (Flash-Next) rounds it down to 256 rows; its auto expert placement is sized from the same chunk: the explicit value, else 8192 on exact gfx1151, 4096 on exact gfx1201, 1536 elsewhere; exact gfx1100 on a measured narrow discrete host link (below 16 GB/s, probed before placement is sized) defaults to 8192, ceding resident expert layers for the wider chunk (an explicit value never probes and is authoritative for placement; 1536 opts out)."
+        "Widened ordinary-prefill chunk ceiling in rows (arch default 8192 on exact gfx1100/gfx1151/gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH overrides; per-device VRAM admission may select a smaller rung). Resident Qwen3.5/3.6 MoE models (fully resident, single device, grouped MQ4 producers) take one widened rung instead: unset requests 4096 rows, admitted only when the projected prefill batch scratch plus grouped/projection workspace plus the 1 GiB margin fit the free VRAM, else the incumbent 512 (arch default) ceiling with no intermediate rung; an explicit value below 4096 or HIPFIRE_PREFILL_MAX_BATCH keeps the incumbent, one at or above 4096 requests the admitted rung (the actual admitted chunk is logged as `prefill_chunk: requested=… admitted=…`). Dense Qwen3.5/3.6 keeps the 8192 ladder above. Qwen4 (Flash-Next) rounds it down to 256 rows; its auto expert placement is sized from the same chunk: the explicit value, else 8192 on exact gfx1151, 4096 on exact gfx1201, 1536 elsewhere; exact gfx1100 on a measured narrow discrete host link (below 16 GB/s, probed before placement is sized) defaults to 8192, ceding resident expert layers for the wider chunk (an explicit value never probes and is authoritative for placement; 1536 opts out)."
     ),
     process_bool_field!(
         "speculation.draft_f16",
@@ -4620,10 +4620,12 @@ pub fn parse_tri_state(mode: &str) -> Option<bool> {
     }
 }
 /// The `on`/`off`/`auto` MTP selector the CLI lowers into `params.mtp_mode`.
-/// `Off` keeps AR, `On` arms the head wherever one exists, `Auto` arms it
-/// except over a host-mapped expert spill (the shared [`mtp_host_spill_policy`]
-/// decline). `Default = Off`: the slots `mtp_mode` param defaults to `"off"`
-/// unless the operator opted in, and the daemon parse keeps that default
+/// `Off` keeps AR, `On` arms the head wherever one exists, `Auto` arms it only
+/// for a producer that declared a measured AR floor ([`mtp_mode_admits`]) and,
+/// even then, not over a host-mapped expert spill (the shared
+/// [`mtp_host_spill_policy`] decline). `Default = Off`: the slots `mtp_mode`
+/// param defaults to `"off"` unless the operator opted in, and the daemon
+/// parse keeps that default
 /// verbatim — only the `auto`-vs-`on` distinction now survives beside `mtp_k`.
 /// Exact, lower-case; anything unrecognized (including `auto` and the empty
 /// string, which the slots `mtp_k` rule already treats as off) resolves as
@@ -4633,7 +4635,8 @@ pub enum MtpMode {
     /// Never arm the head (today's behaviour, unchanged).
     #[default]
     Off,
-    /// Arm unless the host-spill policy declines (today's `auto`).
+    /// Arm only for a producer with a measured AR floor, and not over a
+    /// host-mapped expert spill the host-spill policy declines.
     Auto,
     /// Arm even over a host-mapped expert spill (explicit opt-in).
     On,
@@ -4652,6 +4655,73 @@ impl MtpMode {
             _ => Self::Auto,
         }
     }
+}
+
+impl MtpMode {
+    /// Lift the typed load tri-state (`SpecLoadCfg::mtp`: `Some(true)` = `on`,
+    /// `Some(false)` = `off`, `None` = `auto`) into the mode every MTP arming
+    /// site shares, so no consumer re-spells the three-way match.
+    pub fn from_tri_state(mtp: Option<bool>) -> Self {
+        match mtp {
+            Some(true) => Self::On,
+            Some(false) => Self::Off,
+            None => Self::Auto,
+        }
+    }
+
+    /// The exact lower-case spelling [`MtpMode::parse`] reads back.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+            Self::On => "on",
+        }
+    }
+}
+
+/// The one producer-capability gate every MTP consumer applies before it loads,
+/// attaches or routes a native MTP head: `measured_ar_floor` is the producer's
+/// declaration that its drafter ships a measured autoregressive floor (a
+/// per-request AR-vs-draft pricing that retires drafting when it loses to AR).
+/// `On` is an explicit opt-in and always admits; `Off` never does; `Auto`
+/// admits only a producer that declared the floor, so an unmeasured drafter
+/// never speculates by default and the model keeps its plain AR route. Pure
+/// and arch-blind: the capability, not the model tag or the card, decides.
+/// Host-spill and head-presence policies ([`mtp_host_spill_policy`]) apply on
+/// top of this verdict.
+pub fn mtp_mode_admits(mode: MtpMode, measured_ar_floor: bool) -> bool {
+    match mode {
+        MtpMode::Off => false,
+        MtpMode::On => true,
+        MtpMode::Auto => measured_ar_floor,
+    }
+}
+
+/// `mode` after the producer-capability gate: `Auto` on a producer without a
+/// measured AR floor resolves to `Off` (consumers that read the mode see AR,
+/// never a rearm from head or weights presence); `On`, `Off` and an `Auto`
+/// with a declared floor are unchanged.
+pub fn mtp_effective_mode(mode: MtpMode, measured_ar_floor: bool) -> MtpMode {
+    match mode {
+        MtpMode::Auto if !measured_ar_floor => MtpMode::Off,
+        other => other,
+    }
+}
+
+/// [`mtp_effective_mode`] over the raw `params.mtp_mode` spelling, as the
+/// lower-case name string consumers compare against. Spelling follows
+/// [`MtpMode::parse`] (an unrecognized value defers to `auto`, an empty one is
+/// `off`).
+pub fn mtp_effective_mode_name(raw: &str, measured_ar_floor: bool) -> &'static str {
+    mtp_effective_mode(MtpMode::parse(raw), measured_ar_floor).name()
+}
+
+/// The shared log line for an `auto` MTP that a producer without a measured AR
+/// floor declines, worded once for every route (sequential, slots, daemon).
+pub fn mtp_no_floor_decline_line(model: &str) -> String {
+    format!(
+        "  {model} MTP: off by default (no measured AR floor); opt in with --spec mtp"
+    )
 }
 
 /// One MTP-over-host-spill verdict, shared by the qwen35 and qwen4 arming
@@ -7018,6 +7088,77 @@ mod tests {
         assert_eq!(MtpMode::parse("on"), MtpMode::On);
         assert_eq!(MtpMode::parse("anything-else"), MtpMode::Auto);
         assert_eq!(MtpMode::default(), MtpMode::Off);
+    }
+
+    #[test]
+    fn mtp_mode_from_tri_state_matches_the_parse_spelling() {
+        assert_eq!(MtpMode::from_tri_state(Some(true)), MtpMode::parse("on"));
+        assert_eq!(MtpMode::from_tri_state(Some(false)), MtpMode::parse("off"));
+        assert_eq!(MtpMode::from_tri_state(None), MtpMode::parse("auto"));
+    }
+
+    #[test]
+    fn mtp_mode_admits_truth_table_on_off_auto_by_declared_floor() {
+        // (mode, producer declared a measured AR floor) -> admitted.
+        for floor in [false, true] {
+            assert!(!mtp_mode_admits(MtpMode::Off, floor), "off never admits");
+            assert!(mtp_mode_admits(MtpMode::On, floor), "explicit on always admits");
+        }
+        assert!(
+            !mtp_mode_admits(MtpMode::Auto, false),
+            "auto without a measured floor stays AR"
+        );
+        assert!(
+            mtp_mode_admits(MtpMode::Auto, true),
+            "auto with a measured floor admits"
+        );
+    }
+
+    #[test]
+    fn mtp_effective_mode_name_resolves_auto_by_declared_floor() {
+        assert_eq!(mtp_effective_mode_name("auto", false), "off");
+        assert_eq!(mtp_effective_mode_name("auto", true), "auto");
+        assert_eq!(mtp_effective_mode_name("on", false), "on");
+        assert_eq!(mtp_effective_mode_name("on", true), "on");
+        for floor in [false, true] {
+            assert_eq!(mtp_effective_mode_name("off", floor), "off");
+            assert_eq!(mtp_effective_mode_name("", floor), "off");
+        }
+        // An unrecognized spelling defers to auto, so it follows the floor.
+        assert_eq!(mtp_effective_mode_name("bogus", false), "off");
+        assert_eq!(mtp_effective_mode_name("bogus", true), "auto");
+    }
+
+    #[test]
+    fn mtp_effective_mode_and_name_round_trip() {
+        for mode in [MtpMode::Off, MtpMode::Auto, MtpMode::On] {
+            assert_eq!(MtpMode::parse(mode.name()), mode);
+            for floor in [false, true] {
+                let effective = mtp_effective_mode(mode, floor);
+                // The effective mode admits exactly what the gate admits.
+                assert_eq!(effective != MtpMode::Off, mtp_mode_admits(mode, floor));
+                assert_eq!(mtp_effective_mode_name(mode.name(), floor), effective.name());
+            }
+        }
+        assert_eq!(mtp_effective_mode(MtpMode::Auto, false), MtpMode::Off);
+        assert_eq!(mtp_effective_mode(MtpMode::Auto, true), MtpMode::Auto);
+        assert_eq!(mtp_effective_mode(MtpMode::On, false), MtpMode::On);
+    }
+
+    #[test]
+    fn mtp_floor_gate_composes_with_the_host_spill_policy() {
+        // The floor verdict gates first; the spill policy only narrows an
+        // admitted mode. Auto + floor + fully resident arms; auto + floor +
+        // spill on a non-admitted arch declines; explicit on arms over both.
+        let arms = |mode: MtpMode, floor: bool, blobs: usize, arch: &str, admitted: &[&str]| {
+            mtp_mode_admits(mode, floor) && mtp_host_spill_policy(mode, blobs, arch, admitted).attach
+        };
+        assert!(arms(MtpMode::Auto, true, 0, "gfx1100", &[]));
+        assert!(!arms(MtpMode::Auto, true, 8, "gfx1100", &[]));
+        assert!(arms(MtpMode::Auto, true, 8, "gfx1201", &["gfx1201"]));
+        assert!(!arms(MtpMode::Auto, false, 0, "gfx1201", &["gfx1201"]));
+        assert!(arms(MtpMode::On, false, 8, "gfx1100", &[]));
+        assert!(!arms(MtpMode::Off, true, 0, "gfx1201", &["gfx1201"]));
     }
 
     #[test]

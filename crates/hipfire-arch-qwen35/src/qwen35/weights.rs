@@ -3106,6 +3106,92 @@ pub enum StateQuant {
     Q4,
 }
 
+/// Whether a `quant` DeltaNet state carries the per-element f16 error-feedback
+/// residual (Q8 only; `HIPFIRE_DN_STATE_EF=0` opts out).
+pub(crate) fn delta_net_state_ef_enabled(quant: StateQuant) -> bool {
+    quant == StateQuant::Q8
+        && hipfire_config::developer_var("HIPFIRE_DN_STATE_EF")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+}
+
+/// Per-layer element counts of one [`DeltaNetState`] allocation, read from
+/// either a pure allocation plan ([`DeltaNetStatePlan`]) or a live state, with
+/// no heap allocation: both owners are walked through borrowed iterators, one
+/// item per LA layer's S tensor / EF residual (EF yields nothing when off).
+/// Admission code reads the live state's own tensors, so a nonuniform,
+/// missing or malformed owner anywhere is visible, not just the first.
+pub(crate) trait DeltaNetStateGeometry {
+    fn quant(&self) -> StateQuant;
+    /// `numel()` of each LA layer's S tensor.
+    fn s_numel(&self) -> impl ExactSizeIterator<Item = usize> + '_;
+    /// `numel()` of each LA layer's EF residual; empty when EF is off.
+    fn ef_numel(&self) -> impl ExactSizeIterator<Item = usize> + '_;
+}
+
+/// Pure scalar allocation plan of one [`DeltaNetState`]. Every LA layer has the
+/// same S count and, when EF is on, the same EF count by construction, so the
+/// plan is three scalars. The allocator
+/// ([`DeltaNetState::new_batched_with_quant`]) sizes every S and EF tensor
+/// from it, and CPU tests read the exact geometry the allocator produces
+/// without a device.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DeltaNetStatePlan {
+    pub(crate) quant: StateQuant,
+    /// Number of LA layers.
+    pub(crate) n_layers: usize,
+    /// `numel()` of each LA layer's S tensor.
+    pub(crate) s_per_layer: usize,
+    /// `numel()` of each LA layer's EF residual; `None` when EF is off.
+    pub(crate) ef_per_layer: Option<usize>,
+}
+
+impl DeltaNetStatePlan {
+    pub(crate) fn new(
+        config: &Qwen35Config,
+        quant: StateQuant,
+        batch: usize,
+        ef_enabled: bool,
+    ) -> Self {
+        let n_layers = config
+            .layer_types
+            .iter()
+            .filter(|t| **t == LayerType::LinearAttention)
+            .count();
+        let s_dim = config.linear_key_head_dim;
+        let s_size = batch * config.linear_num_value_heads * s_dim * s_dim;
+        // Q4 packs two elements per byte; FP32 and Q8 keep one tensor element
+        // per state element.
+        let per_layer = if quant == StateQuant::Q4 {
+            s_size / 2
+        } else {
+            s_size
+        };
+        Self {
+            quant,
+            n_layers,
+            s_per_layer: per_layer,
+            ef_per_layer: ef_enabled.then_some(s_size),
+        }
+    }
+}
+
+impl DeltaNetStateGeometry for DeltaNetStatePlan {
+    fn quant(&self) -> StateQuant {
+        self.quant
+    }
+    fn s_numel(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
+        std::iter::repeat_n(self.s_per_layer, self.n_layers)
+    }
+    fn ef_numel(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
+        let (ef, layers) = match self.ef_per_layer {
+            Some(ef) => (ef, self.n_layers),
+            None => (0, 0),
+        };
+        std::iter::repeat_n(ef, layers)
+    }
+}
+
 pub struct DeltaNetState {
     /// S matrix storage — FP32 or Q8 depending on quant mode
     pub s_matrices: Vec<GpuTensor>,
@@ -3121,6 +3207,18 @@ pub struct DeltaNetState {
     pub s_ef_residual: Vec<GpuTensor>,
     /// Current quantization mode
     pub quant: StateQuant,
+}
+
+impl DeltaNetStateGeometry for DeltaNetState {
+    fn quant(&self) -> StateQuant {
+        self.quant
+    }
+    fn s_numel(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
+        self.s_matrices.iter().map(|t| t.numel())
+    }
+    fn ef_numel(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
+        self.s_ef_residual.iter().map(|t| t.numel())
+    }
 }
 
 impl DeltaNetState {
@@ -3213,15 +3311,8 @@ impl DeltaNetState {
         batch: usize,
     ) -> HipResult<Self> {
         assert!(batch > 0, "DeltaNetState batch must be non-zero");
-        let n_delta_layers = config
-            .layer_types
-            .iter()
-            .filter(|t| **t == LayerType::LinearAttention)
-            .count();
         let s_dim = config.linear_key_head_dim; // 128
         let n_heads = config.linear_num_value_heads; // 16
-        let s_size_per_lane = n_heads * s_dim * s_dim; // 16 * 128 * 128 = 262144
-        let s_size = batch * s_size_per_lane;
 
         let conv_channels = config.linear_num_key_heads * config.linear_key_head_dim * 2
             + config.linear_num_value_heads * config.linear_value_head_dim;
@@ -3235,10 +3326,11 @@ impl DeltaNetState {
         // HIPFIRE_DN_STATE_EF=0. Q8-only (FP32 has no requant; Q4 EF is future
         // work). The multi-GPU band split (`new_with_quant_multi` below) uses
         // the same rule and geometry. Residual is f16 per-element.
-        let ef_enabled = quant == StateQuant::Q8
-            && hipfire_config::developer_var("HIPFIRE_DN_STATE_EF")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+        let ef_enabled = delta_net_state_ef_enabled(quant);
+        // One pure scalar plan (also read by the ordinary-prefill admission
+        // tests) fixes the per-layer element counts the loop allocates.
+        let plan = DeltaNetStatePlan::new(config, quant, batch, ef_enabled);
+        let n_delta_layers = plan.n_layers;
 
         // GpuTensor has no freeing Drop (free needs &mut Gpu). Mirror
         // alloc_k_v_vmm_filtered: on any mid-loop failure free every tensor
@@ -3251,40 +3343,42 @@ impl DeltaNetState {
             for _ in 0..n_delta_layers {
                 match quant {
                     StateQuant::FP32 => {
-                        s_matrices.push(gpu.zeros(&[s_size], DType::F32)?);
+                        s_matrices.push(gpu.zeros(&[plan.s_per_layer], DType::F32)?);
                         s_scales.push(gpu.zeros(&[batch * n_heads], DType::F32)?);
                     }
                     StateQuant::Q8 => {
-                        // int8 state: s_size bytes (1 byte each), per-row scales
-                        let buf = gpu.hip.malloc(s_size)?;
-                        if let Err(e) = gpu.hip.memset(&buf, 0, s_size) {
+                        // int8 state: one byte per element, per-row scales
+                        let bytes = plan.s_per_layer;
+                        let buf = gpu.hip.malloc(bytes)?;
+                        if let Err(e) = gpu.hip.memset(&buf, 0, bytes) {
                             let _ = gpu.hip.free(buf);
                             return Err(e);
                         }
                         s_matrices.push(GpuTensor {
                             buf,
-                            shape: vec![s_size],
+                            shape: vec![bytes],
                             dtype: DType::F32,
                         });
                         s_scales.push(gpu.zeros(&[batch * n_heads * s_dim], DType::F32)?);
                     }
                     StateQuant::Q4 => {
-                        // 4-bit nibble-packed: s_size/2 bytes, per-row scales
-                        let buf = gpu.hip.malloc(s_size / 2)?;
-                        if let Err(e) = gpu.hip.memset(&buf, 0, s_size / 2) {
+                        // 4-bit nibble-packed: half a byte per element, per-row scales
+                        let bytes = plan.s_per_layer;
+                        let buf = gpu.hip.malloc(bytes)?;
+                        if let Err(e) = gpu.hip.memset(&buf, 0, bytes) {
                             let _ = gpu.hip.free(buf);
                             return Err(e);
                         }
                         s_matrices.push(GpuTensor {
                             buf,
-                            shape: vec![s_size / 2],
+                            shape: vec![bytes],
                             dtype: DType::F32,
                         });
                         s_scales.push(gpu.zeros(&[batch * n_heads * s_dim], DType::F32)?);
                     }
                 }
-                if ef_enabled {
-                    s_ef_residual.push(gpu.zeros(&[s_size], DType::F16)?);
+                if let Some(ef_numel) = plan.ef_per_layer {
+                    s_ef_residual.push(gpu.zeros(&[ef_numel], DType::F16)?);
                 }
                 conv_states.push(gpu.zeros(&[conv_state_size], DType::F32)?);
             }

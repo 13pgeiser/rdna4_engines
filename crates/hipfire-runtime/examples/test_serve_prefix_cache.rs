@@ -135,7 +135,7 @@ fn main() {
         vl_path: None,
         mtp_k,
         mtp_mode: if mtp_k > 0 {
-            hipfire_config::MtpMode::Auto
+            hipfire_config::MtpMode::On
         } else {
             hipfire_config::MtpMode::Off
         },
@@ -337,7 +337,7 @@ fn main() {
                     vl_path: None,
                     mtp_k,
                     mtp_mode: if mtp_k > 0 {
-                        hipfire_config::MtpMode::Auto
+                        hipfire_config::MtpMode::On
                     } else {
                         hipfire_config::MtpMode::Off
                     },
@@ -493,7 +493,7 @@ fn main() {
             vl_path: None,
             mtp_k,
             mtp_mode: if mtp_k > 0 {
-                hipfire_config::MtpMode::Auto
+                hipfire_config::MtpMode::On
             } else {
                 hipfire_config::MtpMode::Off
             },

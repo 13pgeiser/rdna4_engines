@@ -10,6 +10,12 @@
 //! transactions. CPU reference equations are opt-in parity fixtures.
 #![recursion_limit = "256"]
 
+/// Producer capability: native Qwen4 MTP ships a measured autoregressive floor
+/// (`mtp_spec::MtpFloor`: per-request AR-vs-draft window pricing that retires
+/// drafting when it loses to AR, on by default). `speculation.mtp = auto` arms
+/// the head only for a producer declaring this; explicit `on` always arms.
+pub const MTP_MEASURED_AR_FLOOR: bool = true;
+
 pub mod admission;
 pub mod artifact;
 pub mod bundle;
