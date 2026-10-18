@@ -95,6 +95,8 @@ docker run --name hipfire_server --network host --device /dev/kfd --device /dev/
 # docker run --name hipfire_server --network host --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined -v /models/hipfire:/root/.hipfire/models -v hipfire-kcache:/var/cache/hipfire "$IMAGE" run qwen3.8:27b-mq4-xts "Explain FFT in one line"
 
 
+# qwen3.8:27b-mq4-xts
+#
 #phoenix@debian00d861dabdae:~/ai/my_ai_scripts$ llm-bench run --openai-base-url http://localhost:9931/v1 --models openai:qwen3.8:27b-mq4-xts --prompts "Write a rust function to parse JSON safely."
 #→ Benchmarking 1 model(s) × 1 prompt(s) × 3 run(s) = 3 total requests
 #

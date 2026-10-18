@@ -1,8 +1,63 @@
 #!/bin/bash
-# qwen3.8 27b in 4 bits: AMD Quark AWQ MXFP4 container (19 GiB) with its DFlash2 drafter.
+# qwen3.8 in 4 bits: radiance .rad containers (27b MXFP4 + DFlash2 drafter, or flash-next fp8 trunk + 4-bit codebook MoE).
 CURDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODEL_DIR="/models/rad"
-MODEL_FILE="qwen3.8-27b-mxfp4.rad"
+
+# -------------------------------
+# model selection (multiple choice)
+# -------------------------------
+# parallel arrays, one entry per model, indexed together:
+#   FILES  - .rad file under /models/rad (absent = downloaded)
+#   REPOS  - Hugging Face repo the file is served from
+#   EXTRAS - extra serve args for this model
+FILES=(
+      "qwen3.8-27b-mxfp4.rad"
+      "qwen3.8-next-flash-fp8-iq4r-moe.rad"
+)
+REPOS=(
+      "StillDeadcode/qwen3.8-27b-mxfp4"
+      "StillDeadcode/qwen3.8-next-flash-fp8-iq4r-moe"
+)
+EXTRAS=(
+      "--max-num-seqs 1 --max-model-len 262144"
+      "--max-num-seqs 1 --max-model-len 132144 --weights-disk-tier  --host-pool-mib 115000 --embedding-placement ram --kv-cache-dtype fp8"
+)
+
+resolve_model() {    # $1 -> model index on stdout; rc!=0 if no unique match
+      local sel="$1" i hits=()
+      if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#FILES[@]} )); then
+           printf '%s\n' $((sel-1)); return 0
+      fi
+      for i in "${!FILES[@]}"; do
+           [[ "${FILES[$i]}" == *"$sel"* ]] && hits+=("$i")
+      done
+      if (( ${#hits[@]} == 1 )); then
+           printf '%s\n' "${hits[0]}"; return 0
+      fi
+      return 1
+}
+
+if [ -n "$1" ]; then
+      # positional arg bypasses the menu (index or name)
+      IDX="$(resolve_model "$1")" || {
+           echo "no model matching '$1'; options:" >&2
+           for i in "${!FILES[@]}"; do echo "     $((i+1))) ${FILES[$i]}" >&2; done
+           exit 1
+      }
+elif [ ! -t 0 ]; then
+      # non-interactive, no arg: keep the current default
+      IDX=0
+else
+      echo "Available radiance models in $MODEL_DIR:"
+      for i in "${!FILES[@]}"; do echo "     $((i+1))) ${FILES[$i]}"; done
+      read -rp "Select model [1-${#FILES[@]}] (default 1): " pick
+      pick=${pick:-1}
+      IDX="$(resolve_model "$pick")" || { echo "invalid selection: $pick" >&2; exit 1; }
+fi
+MODEL_FILE="${FILES[$IDX]}"
+REPO="${REPOS[$IDX]}"
+EXTRA_FLAGS="${EXTRAS[$IDX]}"
+echo "serving $MODEL_FILE with EXTRA_FLAGS=$EXTRA_FLAGS"
 
 # -------------------------------
 # docker image (build only if missing)
@@ -33,7 +88,7 @@ if [ ! -e "$MODEL_DIR/$MODEL_FILE" ]; then
     (
 	mkdir -p "$MODEL_DIR" || exit
 	cd "$MODEL_DIR" || exit
-	curl -LC - -O "https://huggingface.co/StillDeadcode/qwen3.8-27b-mxfp4/resolve/main/$MODEL_FILE"
+	curl -LC - -O "https://huggingface.co/$REPO/resolve/main/$MODEL_FILE"
     )
 fi
 
@@ -92,7 +147,7 @@ fi
 # inside the radiance-build image. local/radiance-vmemoff is derived from local/radiance
 # with the shim at /opt/vmemoff.so, only while it is missing, so it survives docker
 # system prune -a.
-VMEMOFF="${VMEMOFF:-1}"
+VMEMOFF="${VMEMOFF:-0}"
 if [ "$VMEMOFF" = 1 ]; then
     shim="$CURDIR/radiance-vmemoff/vmemoff.so"
     if [ ! -e "$shim" ]; then
@@ -139,4 +194,30 @@ docker run --name radiance_server --network host --init --ulimit memlock=-1 \
     -e RADIANCE_LOG=info \
     "${PRELOAD[@]}" \
     "$IMAGE" --model /models/"$MODEL_FILE" \
-    --host :: --port 9931 --tp 1 --max-num-seqs 1 --max-model-len 196608 --kv-cache-dtype fp8 -vv --debug-selection --debug-placement
+    --host :: --port 9931 --tp 1 $EXTRA_FLAGS --kv-cache-dtype fp8 -vv --debug-selection --debug-placement
+
+# qwen3.8-27b-mxfp4.rad
+# 
+# phoenix@debian00d861dabdae:~/ai/my_ai_scripts$ llm-bench run --openai-base-url http://localhost:9931/v1 --models openai:qwen3.8:27b-mq4-xts --prompts "Write a rust function to parse JSON safely."
+# → Benchmarking 1 model(s) × 1 prompt(s) × 3 run(s) = 3 total requests
+# 
+# Results: 3 succeeded, 0 failed (100% success rate)
+# 
+# ╭──────────┬─────────────────────┬──────────┬──────────┬───────┬──────────┬────────────┬─────────╮
+# │ Provider │ Model               │ P50 (ms) │ P99 (ms) │ Tok/s │ Avg Cost │ Total Cost │ Success │
+# ├──────────┼─────────────────────┼──────────┼──────────┼───────┼──────────┼────────────┼─────────┤
+# │ openai   │ qwen3.8:27b-mq4-xts │    15525 │    22270 │  39.9 │      n/a │        n/a │    100% │
+# ╰──────────┴─────────────────────┴──────────┴──────────┴───────┴──────────┴────────────┴─────────╯
+
+# qwen3.8-next-flash-fp8-iq4r-moe.rad
+# 
+# phoenix@debian00d861dabdae:~/ai/my_ai_scripts$ llm-bench run --openai-base-url http://localhost:9931/v1 --models openai:qwen3.8:27b-mq4-xts --prompts "Write a rust function to parse JSON safely."
+# → Benchmarking 1 model(s) × 1 prompt(s) × 3 run(s) = 3 total requests
+# 
+# Results: 3 succeeded, 0 failed (100% success rate)
+# 
+# ╭──────────┬─────────────────────┬──────────┬──────────┬───────┬──────────┬────────────┬─────────╮
+# │ Provider │ Model               │ P50 (ms) │ P99 (ms) │ Tok/s │ Avg Cost │ Total Cost │ Success │
+# ├──────────┼─────────────────────┼──────────┼──────────┼───────┼──────────┼────────────┼─────────┤
+# │ openai   │ qwen3.8:27b-mq4-xts │    32722 │    47724 │  17.8 │      n/a │        n/a │    100% │
+# ╰──────────┴─────────────────────┴──────────┴──────────┴───────┴──────────┴────────────┴─────────╯
