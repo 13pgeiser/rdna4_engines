@@ -20,7 +20,7 @@
 #include <vector>
 
 namespace rad {
-namespace gen { struct Request; }
+namespace gen { struct Request; struct AudioRequest; class AudioTicket; struct VideoRequest; class VideoTicket; }
 namespace mm { struct Frame; struct Item; }
 namespace server {
 
@@ -595,6 +595,60 @@ public:
     /* A reference picture as the conditioning network's encoder reads it: RGB at the size it was
      * resized to, which the processor must not change. */
     virtual int picture(const mm::Frame& f, std::shared_ptr<mm::Item>* out, std::string* why) = 0;
+    virtual int64_t queued() const = 0;
+    virtual int64_t running() const = 0;
+};
+
+/* The audio generator (core/gen/audio_driver.h), for a model that makes music or other audio from
+ * text: its declared prompt template and limits, the plugin's rewrite of a request's texts into
+ * the form it was trained on, and its request queue. The server renders and tokenises the prompt
+ * and reads the audio back off the ticket, a window at a time. */
+struct AudioGenInfo {
+    /* The prompt templates (RadAudioGenDecl): with instructions, without them ("" makes them
+     * required), and the unconditional branch's own ("" derives it from the conditional prompt). */
+    std::string name, tmpl, tmpl_plain, neg_tmpl;
+    int64_t max_prompt = 0, max_frames = 0, frame_rate_num = 1, frame_rate_den = 1;
+    int64_t sample_rate = 0, channels = 0;
+    int64_t default_steps = 0, max_lanes = 1;   /* default_steps 0: no denoiser */
+    double  default_cfg = 1.0;
+};
+
+class IAudioGen {
+public:
+    virtual ~IAudioGen() = default;
+    virtual const AudioGenInfo& info() const = 0;
+    /* `in` rewritten as the model wants text for `field` (RAD_TEXT_*); the text unchanged when the
+     * plugin states no rewrite. RAD_E_INVAL with `why` for text the model cannot take. */
+    virtual int prepare(int field, const std::string& in, std::string* out,
+                        std::string* why) const = 0;
+    /* Queue a request; refused at once, with `why`, when it can never run. */
+    virtual int submit(std::unique_ptr<gen::AudioRequest> r, std::string* why) = 0;
+    virtual int64_t queued() const = 0;
+    virtual int64_t running() const = 0;
+};
+
+/* The video generator (core/gen/video_driver.h), for a model that makes a video and its
+ * soundtrack from text: its declared prompt template, sizes and lengths, and its request queue.
+ * The server renders and tokenises the prompt, queues the request as a job, and turns what the
+ * ticket hands back into an MP4 file. */
+struct VideoGenInfo {
+    std::string name, tmpl;
+    int64_t max_text = 0;
+    int64_t fps_num = 1, fps_den = 1;
+    int64_t frames_per_chunk = 1, frames_tail = 0, min_chunks = 1, max_chunks = 1;
+    int64_t size_multiple = 32, min_side = 0, max_area = 0, max_aspect = 1;
+    int64_t default_width = 0, default_height = 0, default_chunks = 1;
+    int64_t sample_rate = 0, channels = 0;
+    int64_t default_steps = 0, max_steps = 0, max_lanes = 1;
+    bool    fixed_steps = false;   /* a trained schedule: max_steps grid points and no other */
+};
+
+class IVideoGen {
+public:
+    virtual ~IVideoGen() = default;
+    virtual const VideoGenInfo& info() const = 0;
+    /* Queue a request; refused at once, with `why`, when it can never run. */
+    virtual int submit(std::unique_ptr<gen::VideoRequest> r, std::string* why) = 0;
     virtual int64_t queued() const = 0;
     virtual int64_t running() const = 0;
 };

@@ -111,6 +111,8 @@ static const RadParamSpec pGridEmbed[]   = { P_INT("M"), P_INT("n"), P_INT("side
 static const RadOperandSpec oGridEmbed[] = { INOUT("x"), WGT("table"), OPD("coord") };
 
 static const RadParamSpec pMnD[]      = { P_INT("M"), P_INT("n"), P_STR("dtype") };
+/* `add`'s `div` divides the rounded sum (libref's pAdd). */
+static const RadParamSpec pAdd[]      = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_F64O("div") };
 static const RadParamSpec pMulWeight[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_INTO("scalar") };
 /* `cap` is required (as in libref's pMnCap). */
 static const RadParamSpec pMnCap[]    = { P_INT("M"), P_INT("n"), P_F64("cap"), P_STR("dtype") };
@@ -140,7 +142,8 @@ static const RadOperandSpec oConv2dUnfold[] = { OPD("x"), OPD("cu_seqlens"), OPD
                                                 OUT("y") };
 static const RadParamSpec pConv1dDw[] = { P_INT("M"), P_INT("n"), P_INT("k"), P_INTO("cu_div"),
                                           P_STR("dtype") };
-static const RadOperandSpec oConv1dDw[] = { OPD("x"), WGT("w"), OPD("cu_seqlens"), OUT("y") };
+static const RadOperandSpec oConv1dDw[] = { OPD("x"), WGT("w"), OPD("cu_seqlens"), OUT("y"),
+                                            WGT_O("b") };
 static const RadParamSpec pRelSin[]   = { P_INT("M"), P_INT("n"), P_F64O("max_timescale"),
                                           P_STR("dtype") };
 static const RadOperandSpec oRelSin[] = { OUT("y") };
@@ -167,6 +170,8 @@ static const RadParamSpec pQuant[]      = { P_INT("M"), P_INT("n"), P_INT("group
 static const RadOperandSpec oQuant[]    = { OPD("x"), OUT("q"), OUT("scale"), OUT_O("asum") };
 static const RadOperandSpec oHadQuant[] = { OPD("x"), OUT("q"), OUT("scale") };
 static const RadOperandSpec oQuantFp8[] = { OPD("x"), OUT("q"), OUT("scale") };
+static const RadParamSpec pQuantCols[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oQuantCols[] = { OPD("x"), OUT("y"), OUT("scale") };
 /* ParoQuant's rotation, as libref declares it: the tables come from the "givens" encoding
  * (abi/rad_encoding.h) and are weight operands, placed with the weight they belong to. */
 static const RadParamSpec pGivensRotate[] = { P_INT("M"), P_INT("n"), P_INT("group"), P_STR("dtype"),
@@ -252,7 +257,8 @@ static const RadConstraint cPagedBlock[] = { RAD_CGE("block_size", 1) };
 static const RadParamSpec pAttnDense[]   = { P_INT("M"), P_INT("head_dim"), P_INT("gqa"),
                                              P_INT("causal"), P_STR("dtype"), P_F64O("scale"),
                                              P_INTO("max_seqlen"), P_INTO("window"),
-                                             P_INTO("cu_div"), P_INTO("block") };
+                                             P_INTO("cu_div"), P_INTO("block"),
+                                             P_INTO("window_right") };
 static const RadOperandSpec oAttnDense[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"),
                                              OUT("out") };
 
@@ -267,7 +273,9 @@ static const RadParamSpec pRope[]   = { P_INT("M"), P_INT("head_dim"), P_INT("n_
                                         P_STR("mode"), P_INTO("rotary_dim"), P_STRO("sections"),
                                         P_F64O("yarn_factor"), P_F64O("yarn_low"),
                                         P_F64O("yarn_high"), P_F64O("yarn_magnitude"),
-                                        P_STRO("ladder") };
+                                        P_STRO("ladder"), P_F64O("llama3_factor"),
+                                        P_F64O("llama3_low"), P_F64O("llama3_high"),
+                                        P_F64O("llama3_orig") };
 static const RadOperandSpec oRope[] = { INOUT("qkv"), OPD("positions") };
 
 static const RadParamSpec pRopeTable[]   = { P_INT("M"), P_INT("rot"), P_F64("theta"),
@@ -316,8 +324,9 @@ static const RadParamSpec pQkNormRope[]   = { P_INT("M"), P_INT("head_dim"), P_I
                                               P_INTO("rotary_dim"), P_F64O("wadd"),
                                               P_INTO("v_norm"), P_STRO("sections"),
                                               P_STRO("comps") };
-static const RadOperandSpec oQkNormRope[] = { INOUT("qkv"), OPD("positions"), WGT("q_w"),
-                                              WGT("k_w") };
+/* `positions` may be absent at `rotary_dim` 0, and an absent gain is a unit one (libref). */
+static const RadOperandSpec oQkNormRope[] = { INOUT("qkv"), OPD_O("positions"), WGT_O("q_w"),
+                                              WGT_O("k_w") };
 
 /* ---- mixture of experts ------------------------------------------------------------------- */
 static const RadParamSpec pScaleRows[]   = { P_INT("M"), P_INT("n"), P_STR("act"),
@@ -459,11 +468,23 @@ static const RadOperandSpec oAllGather[] = { OPD("x"), OUT("y") };
 /* ---- image generation --------------------------------------------------------------------- */
 static const RadParamSpec pLnMod[]   = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype") };
 static const RadOperandSpec oLnMod[] = { OPD("x"), OPD("s"), OPD("cu_seqlens"), OUT("y") };
+static const RadParamSpec pGateAdd[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_STRO("act") };
 static const RadOperandSpec oGateAdd[] = { OPD("y"), OPD("g"), OPD("cu_seqlens"), INOUT("x") };
 static const RadParamSpec pLnModQ[]  = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
                                          P_INT("gated"), P_STR("dtype") };
 static const RadOperandSpec oLnModQ[] = { OPD_O("y"), OPD_O("g"), OPD("s"), OPD("cu_seqlens"),
                                           INOUT("x"), OUT("q"), OUT("scale"), OUT_O("z") };
+static const RadParamSpec pRmsMod[]  = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INTO("gated"),
+                                         P_STR("dtype") };
+static const RadOperandSpec oRmsMod[] = { OPD_O("y"), OPD_O("g"), OPD("s"), WGT("w"),
+                                          OPD("cu_seqlens"), INOUT("x"), OUT("z") };
+static const RadParamSpec pRmsModQ[]  = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
+                                          P_INT("gated"), P_STR("dtype") };
+static const RadOperandSpec oRmsModQ[] = { OPD_O("y"), OPD_O("g"), OPD("s"), WGT("w"),
+                                           OPD("cu_seqlens"), INOUT("x"), OUT("q"), OUT("scale"),
+                                           OUT_O("z") };
+static const RadOperandSpec oFlowX0[] = { OPD("v"), OPD("t"), OPD("sigma"), OPD("sigma_next"),
+                                          INOUT("x") };
 static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale"), P_F64("max_period"),
                                           P_INTO("round"), P_STR("dtype") };
 static const RadOperandSpec oTimestep[] = { OPD("t"), OUT("y") };
@@ -478,7 +499,7 @@ static const RadOperandSpec oFlowEuler[]  = { OPD("v"), OPD("sigma"), OPD("sigma
                                               OPD("cu_seqlens"), OPD_O("inp_lat"), OPD_O("inp_mask"),
                                               INOUT("state"), INOUT_O("preview") };
 static const RadParamSpec pChanAffine[] = { P_INT("M"), P_INT("n"), P_STR("mul"), P_STR("add"),
-                                            P_STR("mode"), P_STR("dtype") };
+                                            P_STR("mode"), P_STR("dtype"), P_INTO("round") };
 static const RadParamSpec pConvNhwc[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
                                           P_INT("stride"), P_STR("pad"), P_INT("up"), P_STR("dtype") };
 static const RadOperandSpec oConvNhwc[] = { OPD("x"), WGT("w"), WGT("b"), OUT("y") };
@@ -490,11 +511,107 @@ static const RadOperandSpec oSpaceDepth[] = { OPD("x"), INOUT("y") };
 static const RadParamSpec pAttnPS[] = { P_INT("q_len"), P_INT("head_dim"), P_INT("gqa"),
                                         P_INTD("block_size"), P_INT("causal"), P_STR("q_dtype"),
                                         P_STR("kv_dtype"), P_F64O("scale"), P_INTO("max_ctx"),
-                                        P_INTO("n_head"), P_INTO("max_seqs"), P_STRO("qk") };
-static const RadOperandSpec oAttnPS[] = { OPD("q"), OPD("k"), OPD("v"), OPD("kv_cache"),
-                                          OPD("block_table"), OPD("seqused"), OPD("cu_seqlens"),
+                                        P_INTO("n_head"), P_INTO("max_seqs"), P_STRO("qk"),
+                                        P_STRO("pv") };
+static const RadOperandSpec oAttnPS[] = { OPD("q"), OPD("k"), OPD("v"), OPD_O("kv_cache"),
+                                          OPD_O("block_table"), OPD_O("seqused"), OPD("cu_seqlens"),
                                           OPD_O("k_descale"), OPD_O("v_descale"), OPD_O("k_i8"),
-                                          OPD_O("k_scale"), OUT("out") };
+                                          OPD_O("k_scale"), OUT("out"), OPD_O("v_scale") };
+
+/* ---- video generation (avx_video.cpp), as libref declares it ------------------------------ */
+static const RadParamSpec pPatchUnfold[] = { P_INT("M"), P_INT("C"), P_INT("pt"), P_INT("ph"),
+                                             P_INT("pw"), P_STR("mul"), P_STR("add"),
+                                             P_STR("dtype") };
+static const RadOperandSpec oPatchUnfold[] = { OPD("x"), OPD("geom"), OUT("y") };
+static const RadParamSpec pVtileGather[] = { P_INT("M"), P_INT("n"), P_INT("tile"),
+                                             P_INT("overlap"), P_INT("frames"), P_INT("period"),
+                                             P_INT("n_reg"), P_STR("dtype") };
+static const RadOperandSpec oVtileGather[] = { OPD("x"), WGT("reg"), OPD("geom"), OUT("y") };
+static const RadParamSpec pVtileStitch[] = { P_INT("M"), P_INT("tile"), P_INT("overlap"),
+                                             P_INT("scale"), P_INT("pt"), P_INT("skip"),
+                                             P_INT("keep"), P_INT("blend"), P_INT("period"),
+                                             P_STR("mean"), P_STR("std") };
+static const RadOperandSpec oVtileStitch[] = { OPD("x"), OPD("geom"), INOUT("prev"), OUT("y") };
+static const RadParamSpec pGridPos3[] = { P_INT("M"), P_INT("T"), P_INT("H"), P_INT("W"),
+                                          P_INT("period"), P_F64("scale") };
+static const RadOperandSpec oGridPos3[] = { OUT("y") };
+/* ---- video sparse attention (avx_vsa.cpp), as libref declares it ------------------------- */
+static const RadParamSpec pVsa[] = { P_INT("M"), P_INT("head_dim"), P_INT("tile_t"),
+                                     P_INT("tile_h"), P_INT("tile_w"), P_INT("patch"),
+                                     P_F64("sparsity"), P_F64O("scale") };
+static const RadOperandSpec oVsaSelect[] = { OPD("q"), OPD("k"), OPD_O("v"), OPD("segs"),
+                                             OPD("geom"), OUT("sel"), OUT_O("coarse") };
+/* attn_vsa adds attn_prefix_self's int8 Q.K form at the end: `qk` "i8" with `k_i8` and `k_scale`,
+ * quant_act_i8g's codes and scales of k at group head_dim. */
+static const RadParamSpec pAttnVsa[] = { P_INT("M"), P_INT("head_dim"), P_INT("tile_t"),
+                                         P_INT("tile_h"), P_INT("tile_w"), P_INT("patch"),
+                                         P_F64("sparsity"), P_F64O("scale"), P_STRO("qk"),
+                                         P_STRO("pv") };
+static const RadOperandSpec oAttnVsa[] = { OPD("q"), OPD("k"), OPD("v"), OPD("segs"),
+                                           OPD("geom"), OPD("sel"), OPD_O("coarse"),
+                                           OPD_O("gate"), OUT("out"), OPD_O("k_i8"),
+                                           OPD_O("k_scale"), OPD_O("v_scale") };
+
+/* ---- audio generation (avx_audio.cpp), as libref declares it ------------------------------ */
+static const RadParamSpec pConv1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
+                                        P_INT("dil"), P_STRO("act"), P_STR("dtype"),
+                                        P_INTO("causal") };
+static const RadOperandSpec oConv1d[] = { OPD("x"), WGT("w"), OPD("cu_seqlens"), OPD_O("res"),
+                                          OUT("y"), WGT_O("b") };
+static const RadParamSpec pConvT1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("stride"),
+                                         P_STR("dtype"), P_INTO("pad"), P_INTO("k") };
+static const RadOperandSpec oConvT1d[] = { OPD("x"), WGT("w"), WGT("b"), OPD("cu_seqlens"),
+                                           OUT("y") };
+static const RadParamSpec pSnake[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_INTO("log") };
+static const RadOperandSpec oSnake[] = { OPD("x"), WGT("alpha"), OUT("y"), WGT_O("beta") };
+static const RadParamSpec pSnakeAa[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("k"),
+                                         P_INTO("log"), P_STR("dtype") };
+static const RadOperandSpec oSnakeAa[] = { OPD("x"), WGT("alpha"), WGT("beta"), WGT("f_up"),
+                                           WGT("f_down"), OPD("cu_seqlens"), OUT("y") };
+static const RadParamSpec pCfgTopk[] = { P_INT("M"), P_INT("n_vocab"), P_INT("k"), P_INT("rep"),
+                                         P_INTO("cond_k"), P_F64("cfg"), P_F64O("temp"),
+                                         P_INT("stream"), P_STR("dtype"), P_INTO("sup_lo"),
+                                         P_INTO("sup_hi"), P_F64O("penalty") };
+static const RadOperandSpec oCfgTopk[] = { OPD("logits"), OPD("seed"), OPD("frame"), OUT("ids"),
+                                           OPD_O("cfg"), OPD_O("lane"), INOUT_O("hist") };
+static const RadParamSpec pRvqEmbed[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_codes"),
+                                          P_INT("vocab"), P_INT("off0"), P_F64("scale"),
+                                          P_STR("dtype"), P_INTO("round") };
+static const RadOperandSpec oRvqEmbed[] = { OPD("codes"), WGT("t0"), WGT("t1"), OUT("y") };
+static const RadParamSpec pFrameMix[] = { P_INT("M"), P_INT("n_embd"), P_INT("L"), P_INT("stride"),
+                                          P_INTO("rep"), P_STR("dtype") };
+static const RadOperandSpec oFrameMix[] = { OPD("hid"), WGT("logits"), WGT("scale"), OPD("lane"),
+                                            OPD("frame"), OPD("status"), INOUT("dst") };
+static const RadParamSpec pEndStatus[] = { P_INT("M"), P_INT("end"), P_INT("rep") };
+static const RadOperandSpec oEndStatus[] = { OPD("ids"), OPD("lane"), INOUT("status") };
+static const RadParamSpec pFrameStore[] = { P_INT("M"), P_INT("n_codes"), P_INT("stride"),
+                                            P_INTO("rep"), P_INTO("skip") };
+static const RadOperandSpec oFrameStore[] = { OPD("codes"), OPD("lane"), OPD("frame"),
+                                              OPD("status"), INOUT("dst") };
+static const RadParamSpec pFourier[] = { P_INT("M"), P_INT("n"), P_INTO("round"), P_STR("dtype") };
+static const RadOperandSpec oFourier[] = { OPD("t"), WGT("w"), OUT("y") };
+static const RadParamSpec pWinInput[] = { P_INT("M"), P_INT("n_lat"), P_INT("n_zero"),
+                                          P_INT("n_cond"), P_INT("stride"), P_STR("dtype") };
+static const RadOperandSpec oWinInput[] = { OPD("lat"), OPD("cond"), OPD("lat_cu"), OPD("win_lane"),
+                                            OPD("pair"), OUT("y") };
+static const RadParamSpec pWinPrep[] = { P_INT("M"), P_INT("n"), P_INT("stride"), P_INT("ov"),
+                                         P_STR("dtype") };
+static const RadOperandSpec oWinPrep[] = { OPD("flags"), OPD("t"), OPD("seed"), OPD("win_index"),
+                                           OPD("win_lane"), OPD("pair"), OPD("lat_cu"),
+                                           OPD("prev"), INOUT("noise"), INOUT("lat") };
+static const RadParamSpec pWinFinish[] = { P_INT("M"), P_INT("n"), P_INT("n_cond"), P_INT("stride"),
+                                           P_INT("ov"), P_STR("dtype") };
+static const RadOperandSpec oWinFinish[] = { OPD("flags"), OPD("pair"), OPD("win_lane"),
+                                             OPD("lat_cu"), OPD("cond"), INOUT("lat"),
+                                             INOUT("prev"), INOUT("prev_cond") };
+static const RadParamSpec pChanSplit[] = { P_INT("M"), P_INT("n"), P_INT("parts"), P_STR("dtype") };
+static const RadParamSpec pInterleave[] = { P_INT("M"), P_STR("dtype") };
+static const RadOperandSpec oInterleave2[] = { OPD("a"), OPD("b"), OUT("y") };
+static const RadParamSpec pIota[] = { P_INT("M"), P_INT("start"), P_INT("step"),
+                                      P_INTO("period") };
+static const RadOperandSpec oIota[] = { OUT("y") };
+static const RadParamSpec pCuRepeat[] = { P_INT("M"), P_INT("mult") };
+static const RadOperandSpec oCuRepeat[] = { OPD("len"), OUT("y") };
 
 /* ---- vocabulary edges --------------------------------------------------------------------- */
 static const RadParamSpec pEmbed[]    = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
@@ -579,8 +696,9 @@ static const RadOpSchema kSchemas[] = {
   "x += a side x side position table resampled bilinearly to the row's grid." },
 { "grid_embed_aa", ARR(pGridEmbed), ARR(oGridEmbed),
   "x += the table resampled as torch's antialiased half-pixel bilinear, SigLIP2's." },
-{ "add", ARR(pMnD), ARR(oBinary),
-  "y = a + b; a `b` of exactly n elements against a taller output broadcasts along rows." },
+{ "add", ARR(pAdd), ARR(oBinary),
+  "y = a + b; a `b` of exactly n elements against a taller output broadcasts along rows. With "
+  "`div`, y = rd(rd(a + b) / div), bit for bit libref's." },
 { "mul", ARR(pMnD), ARR(oBinary), "y = a * b, with the same broadcast rule as `add`." },
 { "mul_weight", ARR(pMulWeight), ARR(oMulWeight),
   "y = x * w, `w` a weight of one element or one row, broadcast; f32 product rounded once." },
@@ -593,7 +711,7 @@ static const RadOpSchema kSchemas[] = {
 { "conv2d", ARR(pConv2d), ARR(oConv2d),
   "segment-wise 2-D convolution over (time, width), channels innermost, optional row mask." },
 { "conv1d_dw", ARR(pConv1dDw), ARR(oConv1dDw),
-  "segment-wise causal depthwise convolution over time." },
+  "segment-wise causal depthwise convolution over time, an optional bias." },
 { "rel_sinusoid", ARR(pRelSin), ARR(oRelSin), "the sinusoidal relative-position table." },
 { "conv2d_unfold", ARR(pConv2dUnfold), ARR(oConv2dUnfold),
   "a convolution's receptive fields as rows, columns in the weight's order." },
@@ -634,6 +752,7 @@ static const RadOpSchema kSchemas[] = {
 { "quant_act_i8g", ARR(pQuant), ARR(oQuantFp8),
   "symmetric int8, one f32 scale per `group` contiguous elements, row-major." },
 { "quant_act_fp8", ARR(pQuant), ARR(oQuantFp8), "symmetric block-scaled E4M3 quantiser." },
+{ "quant_cols_fp8", ARR(pQuantCols), ARR(oQuantCols), "E4M3 with one scale per column." },
 { "had_quant_act_fp8", ARR(pQuant), ARR(oQuantFp8),
   "width-`group` Hadamard, then the same symmetric block-scaled E4M3 quantiser. No normalisation: "
   "the 1/group is folded into the stored weight scale at convert (docs/OPS.md)." },
@@ -682,7 +801,9 @@ static const RadOpSchema kSchemas[] = {
 { "attn_paged", ARR(pAttnPaged), ARR(oAttnPaged),
   "paged causal / sliding-window attention, any query length, online-softmax so one pass over the "
   "cache suffices." },
-{ "attn_dense", ARR(pAttnDense), ARR(oAttnDense), "dense varlen attention over cu_seqlens." },
+{ "attn_dense", ARR(pAttnDense), ARR(oAttnDense),
+  "dense varlen attention over cu_seqlens; a non-causal window may reach further right "
+  "(`window_right`)." },
 { "kv_store", ARR(pKvStore), ARR(oKvStore), "scatter k and v into the paged cache." },
 { "rope_table", ARR(pRopeTable), ARR(oRopeTable), "cos/sin at each position's own row." },
 { "qsa_block_key", ARR(pQsaBlockKey), ARR(oQsaBlockKey),
@@ -749,8 +870,9 @@ static const RadOpSchema kSchemas[] = {
 { "ln_mod", ARR(pLnMod), ARR(oLnMod),
   "y = bf16(bf16(LN(x)) * bf16(1 + s[seq])): a gainless layer norm and the row's entry's "
   "modulation row of `s` ([n_seq, >= n] at its own pitch)." },
-{ "gate_add", ARR(pMnD), ARR(oGateAdd),
-  "x = bf16(x + bf16(bf16(tanh(g[seq])) * y)), bit for bit libref's." },
+{ "gate_add", ARR(pGateAdd), ARR(oGateAdd),
+  "x = bf16(x + bf16(bf16(tanh(g[seq])) * y)), or with `act` none the gate g itself, bit for bit "
+  "libref's." },
 { "timestep_embed", ARR(pTimestep), ARR(oTimestep),
   "the sinusoidal timestep embedding [cos | sin], libref's libm calls; `round` 1 takes t through "
   "bf16 at scale and back first." },
@@ -767,7 +889,8 @@ static const RadOpSchema kSchemas[] = {
   "one flow-matching Euler step per entry that moves a lane, with guidance, the preview and the "
   "repaint's kept region; libref's roundings bit for bit." },
 { "chan_affine", ARR(pChanAffine), ARR(oUnary),
-  "a per-channel affine from two lists of n bf16 values, `fma` or `inv`." },
+  "a per-channel affine from two lists of n bf16 values, `fma` or `inv`; `round` 0 keeps the "
+  "lists and the arithmetic in f32, rounded once." },
 { "conv2d_nhwc", ARR(pConvNhwc), ARR(oConvNhwc),
   "an image convolution, channels innermost, as GEMMs over bands of patch rows; `up` 2 reads the "
   "input upsampled nearest-neighbour, `pad` same or down." },
@@ -786,6 +909,73 @@ static const RadOpSchema kSchemas[] = {
 { "attn_prefix_self", ARR(pAttnPS), ARR(oAttnPS),
   "attention over `seqused[s]` prefix positions in the paged cache and the step's own rows, "
   "flash-attention tiles; `qk` \"i8\" is the int8 score form (docs/OPS.md)." },
+{ "rms_mod", ARR(pRmsMod), ARR(oRmsMod),
+  "the gated residual (no tanh), then an RMS norm with a gain times bf16(1 + scale row) plus the "
+  "shift row, `s` holding [shift | scale]; libref's roundings." },
+{ "rms_mod_quant_fp8", ARR(pRmsModQ), ARR(oRmsModQ),
+  "rms_mod with its norm chain in bf16, then the E4M3 codes and scales of that row." },
+{ "flow_x0_step", ARR(pMnD), ARR(oFlowX0),
+  "x = r x + (1 - r)(x + (1 - t) v), r = sigma_next / sigma, each step one f32 rounding, bit for "
+  "bit libref's." },
+{ "patch_unfold", ARR(pPatchUnfold), ARR(oPatchUnfold),
+  "patch rows to denormalised voxel rows, f32(f32(x * mul) + add), bit for bit libref's." },
+{ "vtile_gather", ARR(pVtileGather), ARR(oVtileGather),
+  "a video decoder's tiles out of the latent's voxel rows, then the register rows and zeros." },
+{ "vtile_stitch", ARR(pVtileStitch), ARR(oVtileStitch),
+  "decoded tiles blended into frames, the chunk overlap blended and kept, RGB bytes out; bit for "
+  "bit libref's." },
+{ "grid_pos3", ARR(pGridPos3), ARR(oGridPos3),
+  "a video decoder's rotary positions over its tiles, [3, >= M] at the operand's row pitch, bit "
+  "for bit libref's." },
+{ "vsa_select", ARR(pVsa), ARR(oVsaSelect),
+  "video sparse attention's tile selection over libref's tiles: the k video tiles of largest "
+  "pooled score per video query tile, ascending, bit for bit libref's; with `coarse`, the softmax "
+  "over every tile's score times the tiles' means of v." },
+{ "attn_vsa", ARR(pAttnVsa), ARR(oAttnVsa),
+  "video sparse attention over libref's tiles: prefix queries dense, video queries the prefix "
+  "and their `sel` tiles, blocked online softmax; the gated coarse term on the output rounded "
+  "to its dtype." },
+{ "conv1d", ARR(pConv1d), ARR(oConv1d),
+  "a 1-D convolution over the sequences `cu_seqlens` bounds, channels innermost, PyTorch's "
+  "[cout, cin, k] weight, dilation `dil`, centred or (`causal`) all on the left, zeros outside "
+  "each sequence; `res` added after the bias, then `act` none, tanh or clamp. GEMMs over bands "
+  "of patch rows." },
+{ "conv_t1d", ARR(pConvT1d), ARR(oConvT1d),
+  "a transposed 1-D convolution of kernel `k` >= stride (2 stride by default), padding `pad` "
+  "((k - stride) / 2, or 0 the causal form), each sequence growing `stride` times; one GEMM a "
+  "phase." },
+{ "snake", ARR(pSnake), ARR(oSnake),
+  "x + sin(alpha x)^2 / (alpha + 1e-9) per channel, or SnakeBeta's x + sin(alpha x)^2 / "
+  "(beta + 1e-9) with `beta`, both read as logarithms with `log` 1; a polynomial sine." },
+{ "snake_aa", ARR(pSnakeAa), ARR(oSnakeAa),
+  "BigVGAN's alias-free SnakeBeta: replicate-padded upsampling by `f_up`, SnakeBeta, "
+  "replicate-padded filtering by `f_down` at stride `ratio`; a polynomial sine." },
+{ "cfg_topk_sample", ARR(pCfgTopk), ARR(oCfgTopk),
+  "one guided top-k pick a lane by inverse CDF over rad_philox_uniform_s, with a suppressed id "
+  "range, a repetition penalty over each lane's history and per-lane guidance; bit for bit "
+  "libref's." },
+{ "rvq_embed", ARR(pRvqEmbed), ARR(oRvqEmbed),
+  "a frame's embedding from code-major residual codes, libref's roundings (`round` 1: one)." },
+{ "frame_mix_store", ARR(pFrameMix), ARR(oFrameMix),
+  "a frame's softmax-weighted mix of hidden planes, stored into its lane, bit for bit libref's." },
+{ "end_status", ARR(pEndStatus), ARR(oEndStatus),
+  "status[lane[i]] = ids[rep i] == end ? -1 : ids[rep i]." },
+{ "frame_store", ARR(pFrameStore), ARR(oFrameStore),
+  "a frame's codes into its lane's history, code-major rows over the lane's frames." },
+{ "resample_nearest", ARR(pMnD), ARR(oUnary),
+  "rows resampled nearest-neighbour, the row counts read off the operands." },
+{ "fourier_embed", ARR(pFourier), ARR(oFourier),
+  "[cos(2 pi t w) | sin(2 pi t w)], libref's libm calls and roundings." },
+{ "win_input", ARR(pWinInput), ARR(oWinInput),
+  "a denoiser's input [lat | zeros | cond] from each window entry's lane." },
+{ "win_prep", ARR(pWinPrep), ARR(oWinPrep),
+  "a window step's noise and overlap binding, bit for bit libref's." },
+{ "win_finish", ARR(pWinFinish), ARR(oWinFinish),
+  "a window's end and the overlap it hands on." },
+{ "chan_split", ARR(pChanSplit), ARR(oUnary), "channel groups to sequences." },
+{ "interleave2", ARR(pInterleave), ARR(oInterleave2), "two streams interleaved, y [rows, 2]." },
+{ "iota", ARR(pIota), ARR(oIota), "y[i] = start + i * step." },
+{ "cu_repeat", ARR(pCuRepeat), ARR(oCuRepeat), "y[j] = j * len[0] * mult." },
 { "embed_lookup", ARR(pEmbedM), ARR(oEmbed),
   "embedding gather, vocab-parallel with an offset; `mult` multiplies every row (rounded once)." },
 { "embed_lookup_q", ARR(pEmbed), ARR(oEmbedQ),
@@ -1014,6 +1204,8 @@ SIMPLE("avx_had_quant_act_i8", "had_quant_act_i8", "quant",
        L(had_quant_act_i8)),
 SIMPLE("avx_quant_act_fp8", "quant_act_fp8", "quant", "symmetric block-scaled E4M3 quantiser",
        "float in, fp8_e4m3 out, f32 scale", L(quant_act_fp8)),
+SIMPLE("avx_quant_cols_fp8", "quant_cols_fp8", "quant", "E4M3 with one scale per column",
+       "float in, fp8_e4m3 out, f32 scale", L(quant_cols_fp8)),
 SIMPLE("avx_had_quant_act_fp8", "had_quant_act_fp8", "quant",
        "width-`group` Hadamard, then the same symmetric block-scaled E4M3 quantiser",
        "float in, fp8_e4m3 out, f32 scale per group; n a multiple of group",
@@ -1141,7 +1333,8 @@ SIMPLE("avx_all_gather", "all_gather", "ar", "gather every rank's shard; world_s
 
 SIMPLE("avx_ln_mod", "ln_mod", "norm", "gainless layer norm times (1 + an entry's scale row)",
        DT_FLOAT, L(ln_mod)),
-SIMPLE("avx_gate_add", "gate_add", "elem", "x += tanh(gate row) * y", DT_FLOAT, L(gate_add)),
+SIMPLE("avx_gate_add", "gate_add", "elem", "x += act(gate row) * y, act tanh or none", DT_FLOAT,
+       L(gate_add)),
 SIMPLE("avx_ln_mod_quant_fp8", "ln_mod_quant_fp8", "norm",
        "gated residual, adaptive norm and the E4M3 quantiser in one pass",
        "float in, fp8_e4m3 out, f32 scale, bf16 z", L(ln_mod_quant_fp8)),
@@ -1174,6 +1367,63 @@ SIMPLE("avx_scatter_add_rows", "scatter_add_rows", "elem", "x[idx[i]] += v[i]", 
 SIMPLE("avx_attn_prefix_self", "attn_prefix_self", "attn",
        "attention over a paged prefix and the step's own rows, flash-attention tiles",
        "bf16 or f32 q, k, v and cache; int8 score form", L(attn_prefix_self)),
+SIMPLE("avx_rms_mod", "rms_mod", "norm",
+       "gated residual, RMS norm with a gain times (1 + scale row) plus a shift row", DT_FLOAT,
+       L(rms_mod)),
+SIMPLE("avx_rms_mod_quant_fp8", "rms_mod_quant_fp8", "norm",
+       "gated residual, modulated RMS norm and the E4M3 quantiser in one pass", DT_FLOAT,
+       L(rms_mod_quant_fp8)),
+SIMPLE("avx_flow_x0_step", "flow_x0_step", "elem", "a sampler step toward the clean estimate",
+       DT_FLOAT, L(flow_x0_step)),
+SIMPLE("avx_patch_unfold", "patch_unfold", "elem", "patch rows to denormalised voxel rows",
+       DT_FLOAT, L(patch_unfold)),
+SIMPLE("avx_vtile_gather", "vtile_gather", "elem", "a video decoder's tiles out of the latent",
+       DT_FLOAT, L(vtile_gather)),
+SIMPLE("avx_vtile_stitch", "vtile_stitch", "elem",
+       "decoded tiles blended into frames, the chunk overlap, bytes out", DT_FLOAT,
+       L(vtile_stitch)),
+SIMPLE("avx_grid_pos3", "grid_pos3", "elem", "a video decoder's rotary positions over its tiles",
+       DT_FLOAT, L(grid_pos3)),
+SIMPLE("avx_vsa_select", "vsa_select", "attn",
+       "video sparse attention's top-k tiles by pooled score, and the coarse branch",
+       "float q, k, v and coarse; i32 segs, geom and sel", L(vsa_select)),
+SIMPLE("avx_attn_vsa", "attn_vsa", "attn",
+       "block-sparse attention over the prefix and selected video tiles, the gated coarse term",
+       "float q, k, v, coarse, gate and out; i32 segs, geom and sel", L(attn_vsa)),
+
+SIMPLE("avx_conv1d", "conv1d", "conv", "a 1-D convolution over sequences, as GEMMs over patch rows",
+       DT_FLOAT, L(conv1d)),
+SIMPLE("avx_conv_t1d", "conv_t1d", "conv", "a transposed 1-D convolution, one GEMM a phase",
+       DT_FLOAT, L(conv_t1d)),
+SIMPLE("avx_snake", "snake", "elem", "the snake activation", DT_FLOAT, L(snake)),
+SIMPLE("avx_snake_aa", "snake_aa", "elem", "the alias-free SnakeBeta: upsample, snake, downsample",
+       DT_FLOAT, L(snake_aa)),
+SIMPLE("avx_cfg_topk_sample", "cfg_topk_sample", "sample", "a guided top-k pick a lane", DT_FLOAT,
+       L(cfg_topk_sample)),
+SIMPLE("avx_rvq_embed", "rvq_embed", "elem", "a frame's embedding from its residual codes",
+       DT_FLOAT, L(rvq_embed)),
+SIMPLE("avx_frame_mix_store", "frame_mix_store", "elem",
+       "a frame's conditioning row into its lane", DT_FLOAT, L(frame_mix_store)),
+SIMPLE("avx_end_status", "end_status", "elem", "a frame's status from its first pick", DT_ANY,
+       L(end_status)),
+SIMPLE("avx_frame_store", "frame_store", "elem", "a frame's codes into its lane's history", DT_ANY,
+       L(frame_store)),
+SIMPLE("avx_resample_nearest", "resample_nearest", "elem", "rows resampled nearest-neighbour",
+       DT_ANY, L(resample_nearest)),
+SIMPLE("avx_fourier_embed", "fourier_embed", "elem", "random Fourier features of a time",
+       DT_FLOAT, L(fourier_embed)),
+SIMPLE("avx_win_input", "win_input", "elem", "a denoiser's input from the window states",
+       DT_FLOAT, L(win_input)),
+SIMPLE("avx_win_prep", "win_prep", "elem", "a window step's noise and overlap", DT_FLOAT,
+       L(win_prep)),
+SIMPLE("avx_win_finish", "win_finish", "elem", "a window's end and the overlap it hands on",
+       DT_FLOAT, L(win_finish)),
+SIMPLE("avx_chan_split", "chan_split", "elem", "channel groups to sequences", DT_ANY,
+       L(chan_split)),
+SIMPLE("avx_interleave2", "interleave2", "elem", "two streams interleaved", DT_ANY,
+       L(interleave2)),
+SIMPLE("avx_iota", "iota", "elem", "an arithmetic index sequence", DT_ANY, L(iota)),
+SIMPLE("avx_cu_repeat", "cu_repeat", "elem", "bounds of equal sequences", DT_ANY, L(cu_repeat)),
 
 SIMPLE("avx_embed_lookup", "embed_lookup", "vocab", "embedding gather", DT_FLOAT, L(embed_lookup)),
 /* Its layout hook only validates: the table is read as stored and other encodings are refused

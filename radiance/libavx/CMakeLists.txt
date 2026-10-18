@@ -50,6 +50,9 @@ set(AVX_KERNEL_SRC
   avx_misc.cpp
   avx_gen.cpp
   avx_gen_attn.cpp
+  avx_video.cpp
+  avx_vsa.cpp
+  avx_audio.cpp
 )
 
 # The flag sets, written out because each states which instructions the object may contain.

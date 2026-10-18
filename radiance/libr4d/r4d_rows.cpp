@@ -172,6 +172,9 @@ static const RadParamSpec pAttnDense[] = {
      * start that attend only within themselves (a chunked encoder's windows). */
     P_INTO("cu_div"),
     P_INTO("block"),
+    /* Non-causal only: the window's right side, key j visible when j - i < window_right; 0 is
+     * `window`'s (docs/OPS.md). */
+    P_INTO("window_right"),
 };
 static const RadOperandSpec oAttnDense[] = {
     { "q",          RAD_OPD_IN,  0 },
@@ -678,6 +681,23 @@ static const RadOperandSpec oGemmNtQ[] = {
     { "y",       RAD_OPD_OUT,    0 },
     { "a_sum",   RAD_OPD_IN,     1 },
     { "b_ref",   RAD_OPD_WEIGHT, 1 },
+};
+/* docs/OPS.md's `gemm_nt_q_bias`, ref's spelling: gemm_nt_q's first four operands, a per-column
+ * bias, then `y`. No parts and no aux operands. */
+static const RadParamSpec pGemmNtQBias[] = {
+    { "M",     RAD_P_INT, RAD_REQUIRED },
+    { "N",     RAD_P_INT, RAD_REQUIRED },
+    { "K",     RAD_P_INT, RAD_REQUIRED },
+    { "group", RAD_P_INT, RAD_REQUIRED },
+    { "dtype", RAD_P_STR, RAD_REQUIRED },
+};
+static const RadOperandSpec oGemmNtQBias[] = {
+    { "a",       RAD_OPD_IN,     0 },
+    { "a_scale", RAD_OPD_IN,     0 },
+    { "b",       RAD_OPD_WEIGHT, 0 },
+    { "b_scale", RAD_OPD_WEIGHT, 0 },
+    { "bias",    RAD_OPD_WEIGHT, 0 },
+    { "y",       RAD_OPD_OUT,    0 },
 };
 
 /* docs/OPS.md's `dequant` is activation-shaped (`M`(range) `n` `group` `dtype`). libr4d's
@@ -1537,6 +1557,10 @@ static const RadOperandSpec oBinary[] = {
     { "b", RAD_OPD_IN,  0 },
     { "y", RAD_OPD_OUT, 0 },
 };
+/* `add`'s: `div` divides the rounded sum, rounded again (absent, 1: the plain sum). */
+static const RadParamSpec pAdd[] = {
+    P_INT("M"), P_INT("n"), P_STR("dtype"), P_F64O("div"),
+};
 static const RadParamSpec pActMul[] = {
     P_INT("M"), P_INT("n"), P_STR("act"), P_STR("dtype"),
 };
@@ -1559,11 +1583,13 @@ static const RadParamSpec pQkNormRope[] = {
 static const RadParamSpec pPoolRows[] = {
     P_INT("M"), P_INT("n"), P_INT("k"), P_F64O("mult"), P_STR("dtype"),
 };
+/* `positions` may be absent at `rotary_dim` 0 (the norm alone), and an absent gain is a unit
+ * gain. */
 static const RadOperandSpec oQkNormRope[] = {
     { "qkv",       RAD_OPD_INOUT,  0 },
-    { "positions", RAD_OPD_IN,     0 },
-    { "q_w",       RAD_OPD_WEIGHT, 0 },
-    { "k_w",       RAD_OPD_WEIGHT, 0 },
+    { "positions", RAD_OPD_IN,     1 },
+    { "q_w",       RAD_OPD_WEIGHT, 1 },
+    { "k_w",       RAD_OPD_WEIGHT, 1 },
 };
 /* `scalar` 1 says `w` is one element rather than one row, for the shape description; the shim
  * reads it off the operand. */
@@ -1608,6 +1634,7 @@ static const RadOperandSpec oConv1dDw[] = {
     { "w",          RAD_OPD_WEIGHT, 0 },
     { "cu_seqlens", RAD_OPD_IN,     0 },
     { "y",          RAD_OPD_OUT,    0 },
+    { "b",          RAD_OPD_WEIGHT, 1 },
 };
 static const RadParamSpec pRelSin[] = {
     P_INT("M"), P_INT("n"), P_F64O("max_timescale"), P_STR("dtype"),
@@ -1695,6 +1722,11 @@ static const RadParamSpec pRope[] = {
     { "yarn_high", RAD_P_F64, RAD_OPTIONAL },
     { "yarn_magnitude", RAD_P_F64, RAD_OPTIONAL },
     { "ladder",     RAD_P_STR, RAD_OPTIONAL },   /* the base ladder's width: rotary|head */
+    /* Llama 3's frequency scaling (abi/rad_yarn.h, RadLlama3). */
+    { "llama3_factor", RAD_P_F64, RAD_OPTIONAL },
+    { "llama3_low",    RAD_P_F64, RAD_OPTIONAL },
+    { "llama3_high",   RAD_P_F64, RAD_OPTIONAL },
+    { "llama3_orig",   RAD_P_F64, RAD_OPTIONAL },
 };
 
 /* ---------------------------------------------------------------------- the vision tower */
@@ -2044,9 +2076,9 @@ static const RadOperandSpec oExpertScale[] = {
 
 /* ------------------------------------------------------------------------------- runtime LoRA
  * libref's schemas field for field (libref/ref_registry.cpp says what they mean): the loader
- * refuses a library whose schema differs from the first declarer's. The pools are plain inputs --
- * the engine owns them as program buffers and fills a slot between steps -- and `dtype` is the
- * tensor dtype name of `a` (shrink) or `y` (expand), which is what the rows below match on. */
+ * refuses a library whose schema differs from the first declarer's. The pools are plain inputs
+ * (program buffers the engine fills between steps), and `dtype` is the tensor dtype name of `a`
+ * (shrink) or `y` (expand), which the rows below match on. */
 static const RadParamSpec pLoraShrink[] = {
     P_INT("M"),
     P_INT("K"),
@@ -2094,6 +2126,8 @@ static const RadOperandSpec oLnModQ[] = {
     { "cu_seqlens", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 }, { "q", RAD_OPD_OUT, 0 },
     { "scale", RAD_OPD_OUT, 0 }, { "z", RAD_OPD_OUT, 1 },
 };
+/* `act` is the gate's activation, "tanh" (the default) or "none". */
+static const RadParamSpec pGateAdd[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_STRO("act") };
 static const RadOperandSpec oGateAdd[] = {
     { "y", RAD_OPD_IN, 0 }, { "g", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
     { "x", RAD_OPD_INOUT, 0 },
@@ -2123,8 +2157,9 @@ static const RadOperandSpec oFlowEuler[] = {
     { "inp_lat", RAD_OPD_IN, 1 }, { "inp_mask", RAD_OPD_IN, 1 }, { "state", RAD_OPD_INOUT, 0 },
     { "preview", RAD_OPD_INOUT, 1 },
 };
+/* `round` 0 keeps the lists and the arithmetic in f32 (default 1, bf16 lists and roundings). */
 static const RadParamSpec pChanAffine[] = { P_INT("M"), P_INT("n"), P_STR("mul"), P_STR("add"),
-                                            P_STR("mode"), P_STR("dtype") };
+                                            P_STR("mode"), P_STR("dtype"), P_INTO("round") };
 static const RadOperandSpec oGenUnary[] = { { "x", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 } };
 static const RadParamSpec pConvNhwc[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
                                           P_INT("stride"), P_STR("pad"), P_INT("up"),
@@ -2146,12 +2181,187 @@ static const RadOperandSpec oScatterAdd[] = {
 static const RadParamSpec pAttnPS[] = { P_INT("q_len"), P_INT("head_dim"), P_INT("gqa"),
                                         P_INTD("block_size"), P_INT("causal"), P_STR("q_dtype"),
                                         P_STR("kv_dtype"), P_F64O("scale"), P_INTO("max_ctx"),
-                                        P_INTO("n_head"), P_INTO("max_seqs"), P_STRO("qk") };
+                                        P_INTO("n_head"), P_INTO("max_seqs"), P_STRO("qk"),
+                                        P_STRO("pv") };
 static const RadOperandSpec oAttnPS[] = {
     { "q", RAD_OPD_IN, 0 }, { "k", RAD_OPD_IN, 0 }, { "v", RAD_OPD_IN, 0 },
-    { "kv_cache", RAD_OPD_IN, 0 }, { "block_table", RAD_OPD_IN, 0 }, { "seqused", RAD_OPD_IN, 0 },
+    { "kv_cache", RAD_OPD_IN, 1 }, { "block_table", RAD_OPD_IN, 1 }, { "seqused", RAD_OPD_IN, 1 },
     { "cu_seqlens", RAD_OPD_IN, 0 }, { "k_descale", RAD_OPD_IN, 1 }, { "v_descale", RAD_OPD_IN, 1 },
     { "k_i8", RAD_OPD_IN, 1 }, { "k_scale", RAD_OPD_IN, 1 }, { "out", RAD_OPD_OUT, 0 },
+    { "v_scale", RAD_OPD_IN, 1 },
+};
+
+/* ---- audio generation (r4d_audio.hip); the same specs as libref's (ref_registry.cpp). */
+static const RadParamSpec pConv1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
+                                        P_INT("dil"), P_STRO("act"), P_STR("dtype"),
+                                        P_INTO("causal") };
+static const RadOperandSpec oConv1d[] = {
+    { "x", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "res", RAD_OPD_IN, 1 }, { "y", RAD_OPD_OUT, 0 }, { "b", RAD_OPD_WEIGHT, 1 },
+};
+static const RadParamSpec pConvT1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("stride"),
+                                         P_STR("dtype"), P_INTO("pad"), P_INTO("k") };
+static const RadOperandSpec oConvT1d[] = {
+    { "x", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "b", RAD_OPD_WEIGHT, 0 },
+    { "cu_seqlens", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pSnake[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_INTO("log") };
+static const RadOperandSpec oSnake[] = {
+    { "x", RAD_OPD_IN, 0 }, { "alpha", RAD_OPD_WEIGHT, 0 }, { "y", RAD_OPD_OUT, 0 },
+    { "beta", RAD_OPD_WEIGHT, 1 },
+};
+static const RadParamSpec pCfgTopk[] = { P_INT("M"), P_INT("n_vocab"), P_INT("k"), P_INT("rep"),
+                                         P_INTO("cond_k"), P_F64("cfg"), P_F64O("temp"),
+                                         P_INT("stream"), P_STR("dtype"), P_INTO("sup_lo"),
+                                         P_INTO("sup_hi"), P_F64O("penalty") };
+static const RadOperandSpec oCfgTopk[] = {
+    { "logits", RAD_OPD_IN, 0 }, { "seed", RAD_OPD_IN, 0 }, { "frame", RAD_OPD_IN, 0 },
+    { "ids", RAD_OPD_OUT, 0 }, { "cfg", RAD_OPD_IN, 1 }, { "lane", RAD_OPD_IN, 1 },
+    { "hist", RAD_OPD_INOUT, 1 },
+};
+static const RadParamSpec pRvqEmbed[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_codes"),
+                                          P_INT("vocab"), P_INT("off0"), P_F64("scale"),
+                                          P_STR("dtype"), P_INTO("round") };
+static const RadOperandSpec oRvqEmbed[] = {
+    { "codes", RAD_OPD_IN, 0 }, { "t0", RAD_OPD_WEIGHT, 0 }, { "t1", RAD_OPD_WEIGHT, 0 },
+    { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pFrameMix[] = { P_INT("M"), P_INT("n_embd"), P_INT("L"), P_INT("stride"),
+                                          P_INTO("rep"), P_STR("dtype") };
+static const RadOperandSpec oFrameMix[] = {
+    { "hid", RAD_OPD_IN, 0 }, { "logits", RAD_OPD_WEIGHT, 0 }, { "scale", RAD_OPD_WEIGHT, 0 },
+    { "lane", RAD_OPD_IN, 0 }, { "frame", RAD_OPD_IN, 0 }, { "status", RAD_OPD_IN, 0 },
+    { "dst", RAD_OPD_INOUT, 0 },
+};
+static const RadParamSpec pEndStatus[] = { P_INT("M"), P_INT("end"), P_INT("rep") };
+static const RadOperandSpec oEndStatus[] = {
+    { "ids", RAD_OPD_IN, 0 }, { "lane", RAD_OPD_IN, 0 }, { "status", RAD_OPD_INOUT, 0 },
+};
+static const RadParamSpec pFrameStore[] = { P_INT("M"), P_INT("n_codes"), P_INT("stride"),
+                                            P_INTO("rep"), P_INTO("skip") };
+static const RadOperandSpec oFrameStore[] = {
+    { "codes", RAD_OPD_IN, 0 }, { "lane", RAD_OPD_IN, 0 }, { "frame", RAD_OPD_IN, 0 },
+    { "status", RAD_OPD_IN, 0 }, { "dst", RAD_OPD_INOUT, 0 },
+};
+static const RadParamSpec pFourier[] = { P_INT("M"), P_INT("n"), P_INTO("round"), P_STR("dtype") };
+static const RadOperandSpec oFourier[] = {
+    { "t", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pWinInput[] = { P_INT("M"), P_INT("n_lat"), P_INT("n_zero"),
+                                          P_INT("n_cond"), P_INT("stride"), P_STR("dtype") };
+static const RadOperandSpec oWinInput[] = {
+    { "lat", RAD_OPD_IN, 0 }, { "cond", RAD_OPD_IN, 0 }, { "lat_cu", RAD_OPD_IN, 0 },
+    { "win_lane", RAD_OPD_IN, 0 }, { "pair", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pWinPrep[] = { P_INT("M"), P_INT("n"), P_INT("stride"), P_INT("ov"),
+                                         P_STR("dtype") };
+static const RadOperandSpec oWinPrep[] = {
+    { "flags", RAD_OPD_IN, 0 }, { "t", RAD_OPD_IN, 0 }, { "seed", RAD_OPD_IN, 0 },
+    { "win_index", RAD_OPD_IN, 0 }, { "win_lane", RAD_OPD_IN, 0 }, { "pair", RAD_OPD_IN, 0 },
+    { "lat_cu", RAD_OPD_IN, 0 }, { "prev", RAD_OPD_IN, 0 }, { "noise", RAD_OPD_INOUT, 0 },
+    { "lat", RAD_OPD_INOUT, 0 },
+};
+static const RadParamSpec pWinFinish[] = { P_INT("M"), P_INT("n"), P_INT("n_cond"), P_INT("stride"),
+                                           P_INT("ov"), P_STR("dtype") };
+static const RadOperandSpec oWinFinish[] = {
+    { "flags", RAD_OPD_IN, 0 }, { "pair", RAD_OPD_IN, 0 }, { "win_lane", RAD_OPD_IN, 0 },
+    { "lat_cu", RAD_OPD_IN, 0 }, { "cond", RAD_OPD_IN, 0 }, { "lat", RAD_OPD_INOUT, 0 },
+    { "prev", RAD_OPD_INOUT, 0 }, { "prev_cond", RAD_OPD_INOUT, 0 },
+};
+static const RadParamSpec pChanSplit[] = { P_INT("M"), P_INT("n"), P_INT("parts"), P_STR("dtype") };
+static const RadParamSpec pInterleave[] = { P_INT("M"), P_STR("dtype") };
+static const RadOperandSpec oInterleave2[] = {
+    { "a", RAD_OPD_IN, 0 }, { "b", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pIota[] = { P_INT("M"), P_INT("start"), P_INT("step"),
+                                      P_INTO("period") };
+static const RadOperandSpec oIota[] = { { "y", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pCuRepeat[] = { P_INT("M"), P_INT("mult") };
+static const RadOperandSpec oCuRepeat[] = { { "len", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pSnakeAa[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_INT("k"),
+                                         P_INTO("log"), P_STR("dtype") };
+static const RadOperandSpec oSnakeAa[] = {
+    { "x", RAD_OPD_IN, 0 }, { "alpha", RAD_OPD_WEIGHT, 0 }, { "beta", RAD_OPD_WEIGHT, 0 },
+    { "f_up", RAD_OPD_WEIGHT, 0 }, { "f_down", RAD_OPD_WEIGHT, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
+    { "y", RAD_OPD_OUT, 0 },
+};
+
+/* ---- video generation (r4d_video.hip); the same specs as libref's (ref_registry.cpp). `geom` is
+ * the request's latent geometry, i32 on the device. */
+static const RadParamSpec pRmsMod[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INTO("gated"),
+                                        P_STR("dtype") };
+static const RadOperandSpec oRmsMod[] = {
+    { "y", RAD_OPD_IN, 1 }, { "g", RAD_OPD_IN, 1 }, { "s", RAD_OPD_IN, 0 },
+    { "w", RAD_OPD_WEIGHT, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 },
+    { "z", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pRmsModQ[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
+                                         P_INT("gated"), P_STR("dtype") };
+static const RadOperandSpec oRmsModQ[] = {
+    { "y", RAD_OPD_IN, 1 }, { "g", RAD_OPD_IN, 1 }, { "s", RAD_OPD_IN, 0 },
+    { "w", RAD_OPD_WEIGHT, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 },
+    { "q", RAD_OPD_OUT, 0 }, { "scale", RAD_OPD_OUT, 0 }, { "z", RAD_OPD_OUT, 1 },
+};
+static const RadOperandSpec oFlowX0[] = {
+    { "v", RAD_OPD_IN, 0 }, { "t", RAD_OPD_IN, 0 }, { "sigma", RAD_OPD_IN, 0 },
+    { "sigma_next", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 },
+};
+static const RadParamSpec pPatchUnfold[] = { P_INT("M"), P_INT("C"), P_INT("pt"), P_INT("ph"),
+                                             P_INT("pw"), P_STR("mul"), P_STR("add"),
+                                             P_STR("dtype") };
+static const RadOperandSpec oPatchUnfold[] = {
+    { "x", RAD_OPD_IN, 0 }, { "geom", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pVtileGather[] = { P_INT("M"), P_INT("n"), P_INT("tile"),
+                                             P_INT("overlap"), P_INT("frames"), P_INT("period"),
+                                             P_INT("n_reg"), P_STR("dtype") };
+static const RadOperandSpec oVtileGather[] = {
+    { "x", RAD_OPD_IN, 0 }, { "reg", RAD_OPD_WEIGHT, 0 }, { "geom", RAD_OPD_IN, 0 },
+    { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pVtileStitch[] = { P_INT("M"), P_INT("tile"), P_INT("overlap"),
+                                             P_INT("scale"), P_INT("pt"), P_INT("skip"),
+                                             P_INT("keep"), P_INT("blend"), P_INT("period"),
+                                             P_STR("mean"), P_STR("std") };
+static const RadOperandSpec oVtileStitch[] = {
+    { "x", RAD_OPD_IN, 0 }, { "geom", RAD_OPD_IN, 0 }, { "prev", RAD_OPD_INOUT, 0 },
+    { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pGridPos3[] = { P_INT("M"), P_INT("T"), P_INT("H"), P_INT("W"),
+                                          P_INT("period"), P_F64("scale") };
+static const RadOperandSpec oGridPos3[] = { { "y", RAD_OPD_OUT, 0 } };
+
+/* ---- video sparse attention (r4d_vsa.hip); the same specs as libref's. `segs` cuts the packed
+ * rows into dense segments and the video grid, `geom` is the request's latent geometry; `sel` is
+ * vsa_select's output and attn_vsa's input. `v` of vsa_select is read only for `coarse`. */
+static const RadParamSpec pVsa[] = { P_INT("M"), P_INT("head_dim"), P_INT("tile_t"),
+                                     P_INT("tile_h"), P_INT("tile_w"), P_INT("patch"),
+                                     P_F64("sparsity"), P_F64O("scale") };
+static const RadOperandSpec oVsaSelect[] = {
+    { "q", RAD_OPD_IN, 0 }, { "k", RAD_OPD_IN, 0 }, { "v", RAD_OPD_IN, 1 },
+    { "segs", RAD_OPD_IN, 0 }, { "geom", RAD_OPD_IN, 0 },
+    { "sel", RAD_OPD_OUT, 0 }, { "coarse", RAD_OPD_OUT, 1 },
+};
+/* attn_vsa adds attn_prefix_self's int8 Q.K form at the end of the shared list: `qk` "i8" with
+ * `k_i8` [M, n_head head_dim] and `k_scale` [M, n_head], quant_act_i8g's codes and scales of k at
+ * group head_dim; and the fp8 P.V form: `pv` "fp8" with `v` as quant_cols_fp8's E4M3 codes and
+ * `v_scale` [n_head head_dim] their column scales. */
+static const RadParamSpec pAttnVsa[] = { P_INT("M"), P_INT("head_dim"), P_INT("tile_t"),
+                                         P_INT("tile_h"), P_INT("tile_w"), P_INT("patch"),
+                                         P_F64("sparsity"), P_F64O("scale"), P_STRO("qk"),
+                                         P_STRO("pv") };
+static const RadOperandSpec oAttnVsa[] = {
+    { "q", RAD_OPD_IN, 0 }, { "k", RAD_OPD_IN, 0 }, { "v", RAD_OPD_IN, 0 },
+    { "segs", RAD_OPD_IN, 0 }, { "geom", RAD_OPD_IN, 0 }, { "sel", RAD_OPD_IN, 0 },
+    { "coarse", RAD_OPD_IN, 1 }, { "gate", RAD_OPD_IN, 1 }, { "out", RAD_OPD_OUT, 0 },
+    { "k_i8", RAD_OPD_IN, 1 }, { "k_scale", RAD_OPD_IN, 1 }, { "v_scale", RAD_OPD_IN, 1 },
+};
+
+/* quant_cols_fp8: E4M3 codes with one scale per column over every row (an attention's V for its
+ * fp8 P.V); the same spec as libref's. */
+static const RadParamSpec pQuantCols[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oQuantCols[] = {
+    { "x", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 }, { "scale", RAD_OPD_OUT, 0 },
 };
 
 static const RadOpSchema kSchemas[] = {
@@ -2163,9 +2373,10 @@ static const RadOpSchema kSchemas[] = {
            "attention normalises the value with a bare RMS (a weightless ggml_rms_norm) and the "
            "key with the k_norm gain in the same layer, which one op with a required gain cannot "
            "express."),
-    SCHEMA("add", pMnDtype, oBinary,
+    SCHEMA("add", pAdd, oBinary,
            "y = a + b. `b` carrying exactly n elements against an output of M rows broadcasts "
-           "along rows, and nothing else broadcasts at all."),
+           "along rows, and nothing else broadcasts at all. With `div`, y = rd(rd(a + b) / div), "
+           "rd y's dtype."),
     SCHEMA("mul", pMnDtype, oBinary, "y = a * b, with the same one broadcast rule as `add`."),
     SCHEMA("mul_weight", pMulWeight, oMulWeight,
            "y = x * w, `w` a WEIGHT of one element (a scalar for the whole output) or of one row "
@@ -2187,13 +2398,17 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("qk_norm_rope", pQkNormRope, oQkNormRope,
            "In place over a fused [q | k | v] row: each q and k head RMS-normed against its gain "
            "(plus wadd) and rounded, then rotated (neox or gptj, rotary_dim of head_dim); with "
-           "v_norm each v head is RMS-normed with a unit gain and not rotated."),
+           "v_norm each v head is RMS-normed with a unit gain and not rotated. An absent gain is "
+           "a unit gain without wadd; rotary_dim 0 is the norm alone, positions then optional; "
+           "f32 positions are read as the values they hold."),
     SCHEMA("pool_rows", pPoolRows, oUnary,
            "Row r of y is the mean of x's rows [r*k, r*k + k), summed in f32 and rounded, then "
            "times `mult` and rounded again."),
     SCHEMA("sigmoid", pMnDtype, oUnary, "y = 1 / (1 + exp(-x))."),
     SCHEMA("relu", pMnDtype, oUnary, "y = max(x, 0)."),
     SCHEMA("silu", pMnDtype, oUnary, "y = x * sigmoid(x)."),
+    SCHEMA("gelu", pMnDtype, oUnary,
+           "y = 0.5x(1 + erf(x/sqrt(2))). The exact erf form, not the tanh approximation."),
     SCHEMA("clamp", pMnDtype, oClamp,
            "y = min(max(x, lo), hi), lo and hi WEIGHTS of one element each: a clipped linear's range."),
     SCHEMA("conv2d", pConv2d, oConv2d,
@@ -2445,6 +2660,8 @@ static const RadOpSchema kSchemas[] = {
            "C[M,N] = A[M,K] @ dequant(Bq)[N,K]^T. `dtype` names the operand COMBINATION, so one "
            "op covers w4a16 through mxfp4a8 and an architecture plugin that changes quant changes "
            "one string."),
+    SCHEMA("gemm_nt_q_bias", pGemmNtQBias, oGemmNtQBias,
+           "gemm_nt_q with a per-column bias added to the f32 product before its one rounding."),
     SCHEMA("dequant_w4", pDequantW4, oDequantW4,
            "a packed 4-bit fragment-ordered weight back to row-major bf16."),
     SCHEMA("scale_rows", pScaleRows, oScaleRows,
@@ -2709,8 +2926,9 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("ln_mod_quant_fp8", pLnModQ, oLnModQ,
            "gated 1: x = bf16(x + bf16(bf16(tanh(g[seq])) * y)) first; then z = ln_mod(x) and "
            "(q, scale) = quant_act_fp8(z, group), z written when bound."),
-    SCHEMA("gate_add", pGenMn, oGateAdd,
-           "x = bf16(x + bf16(bf16(tanh(g[seq])) * y)): a residual through its sequence's gate."),
+    SCHEMA("gate_add", pGateAdd, oGateAdd,
+           "x = bf16(x + bf16(bf16(tanh(g[seq])) * y)): a residual through its sequence's gate; "
+           "with `act` none the gate is g itself, x = bf16(x + bf16(g[seq] * y))."),
     SCHEMA("timestep_embed", pTimestep, oTimestep,
            "the sinusoidal timestep embedding, [cos | sin] of t' * exp(-ln(max_period) * i / (n/2))."),
     SCHEMA("gather_rows2", pGenMn, oGather2,
@@ -2722,7 +2940,8 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("flow_euler", pLane, oFlowEuler,
            "one Euler step of a flow-matching sampler per entry that moves a lane."),
     SCHEMA("chan_affine", pChanAffine, oGenUnary,
-           "a per-channel affine from two parameter lists of n values."),
+           "a per-channel affine from two parameter lists of n values; `round` 0 keeps the lists "
+           "and the arithmetic in f32, rounded once into y."),
     SCHEMA("conv2d_nhwc", pConvNhwc, oConvNhwc,
            "an image convolution, channels innermost, the sizes read off the operands."),
     SCHEMA("l2norm_chan", pL2Norm, oL2Norm,
@@ -2736,7 +2955,86 @@ static const RadOpSchema kSchemas[] = {
            "attention over a paged prefix and the step's own rows, causal over the own rows or not. "
            "`qk` \"i8\" with `k_i8` and `k_scale` selects the INT8 Q.K form: the own keys as quant_act_i8g "
            "codes and scales at group head_dim, the query and the prefix keys quantised the same "
-           "way inside the op, the score product exact in integers and P.V as in the bf16 form."),
+           "way inside the op, the score product exact in integers and P.V as in the bf16 form. "
+           "`pv` \"fp8\" with `v_scale` selects the fp8 P.V form (prefix-free only): `v` as "
+           "quant_cols_fp8's E4M3 codes and column scales, P as e4m3(448 p) against an exact "
+           "running max, o = (sum w v_code) v_scale / (448 sum p)."),
+    SCHEMA("conv1d", pConv1d, oConv1d,
+           "a 1-D convolution over the sequences cu_seqlens bounds, channels innermost, zeros outside "
+           "each; dilation `dil`, padding dil (k - 1) / 2 a side or, with `causal`, dil (k - 1) on "
+           "the left; `res` added after the bias, then `act`."),
+    SCHEMA("conv_t1d", pConvT1d, oConvT1d,
+           "a transposed 1-D convolution of kernel `k` (2 stride by default, or stride), padding "
+           "`pad` ((k - stride) / 2 by default, 0 the causal form): each sequence grows `stride` "
+           "times."),
+    SCHEMA("snake", pSnake, oSnake,
+           "x + sin(alpha x)^2 / (alpha + 1e-9) per channel, or with `beta` x + (1 / (beta + "
+           "1e-9)) sin(alpha x)^2; `log` reads both as logarithms."),
+    SCHEMA("cfg_topk_sample", pCfgTopk, oCfgTopk,
+           "a guided top-k pick a lane from `rep` branch rows, drawn with the frame's Philox stream; "
+           "per-lane guidance, a repetition penalty over the lane's history and suppressed ids "
+           "optional."),
+    SCHEMA("rvq_embed", pRvqEmbed, oRvqEmbed,
+           "a frame's embedding from code-major residual codes, the first codebook's table and the "
+           "others' stacked one, times `scale`; `round` 1 rounds the f32 sum once."),
+    SCHEMA("frame_mix_store", pFrameMix, oFrameMix,
+           "a frame's conditioning row (softmax-weighted planes times scale) into its lane."),
+    SCHEMA("end_status", pEndStatus, oEndStatus,
+           "status[lane[i]] = ids[rep i] == end ? -1 : ids[rep i]."),
+    SCHEMA("frame_store", pFrameStore, oFrameStore,
+           "a frame's codes into its lane's history: dst[(lane n_codes + k) stride + frame - skip] "
+           "= codes[k, rep i] when frame >= skip and status[lane] >= 0."),
+    SCHEMA("resample_nearest", pGenMn, oGenUnary, "rows resampled nearest-neighbour."),
+    SCHEMA("fourier_embed", pFourier, oFourier, "[cos | sin] of 2 pi t w for a trained w."),
+    SCHEMA("win_input", pWinInput, oWinInput,
+           "a denoiser's [lat | zeros | cond] rows from the window states."),
+    SCHEMA("win_prep", pWinPrep, oWinPrep, "a window step's noise and overlap binding."),
+    SCHEMA("win_finish", pWinFinish, oWinFinish, "a window's end and the overlap it hands on."),
+    SCHEMA("chan_split", pChanSplit, oGenUnary, "channel groups to sequences."),
+    SCHEMA("interleave2", pInterleave, oInterleave2, "two streams interleaved."),
+    SCHEMA("iota", pIota, oIota, "y[i] = start + i * step."),
+    SCHEMA("cu_repeat", pCuRepeat, oCuRepeat, "bounds of equal sequences, y[j] = j * len[0] * mult."),
+    SCHEMA("snake_aa", pSnakeAa, oSnakeAa,
+           "BigVGAN's alias-free SnakeBeta over each sequence, f32: replicate-padded, upsampled "
+           "`ratio` times by `f_up`, SnakeBeta, filtered by `f_down` at stride `ratio`."),
+    SCHEMA("rms_mod", pRmsMod, oRmsMod,
+           "gated 1: x = bf16(x + bf16(g[seq] * y)) first (no tanh); then z = bf16(bf16(bf16(bf16("
+           "x rsqrt(mean(x^2) + eps)) w) bf16(1 + scale[seq])) + shift[seq]), `s` holding "
+           "[shift | scale]."),
+    SCHEMA("rms_mod_quant_fp8", pRmsModQ, oRmsModQ,
+           "rms_mod with the chain in bf16, then (q, scale) = quant_act_fp8(z, group); z written "
+           "when bound."),
+    SCHEMA("flow_x0_step", pGenMn, oFlowX0,
+           "x = r x + (1 - r) (x + (1 - t) v), r = sigma_next / sigma, each step one f32 "
+           "rounding."),
+    SCHEMA("patch_unfold", pPatchUnfold, oPatchUnfold,
+           "patch rows unfolded to voxel rows and denormalised with f32 lists."),
+    SCHEMA("vtile_gather", pVtileGather, oVtileGather,
+           "a video decoder's tiles out of voxel rows, each followed by its register tokens and "
+           "zeros to the period."),
+    SCHEMA("vtile_stitch", pVtileStitch, oVtileStitch,
+           "a decoded chunk's tiles stitched into RGB bytes, blended with the previous chunk's "
+           "tail."),
+    SCHEMA("grid_pos3", pGridPos3, oGridPos3,
+           "a video decoder's rotary positions over tiles of `period` rows, f32 [3, M]."),
+    SCHEMA("vsa_select", pVsa, oVsaSelect,
+           "video sparse attention's selection over tiles of at most 64 rows (dense segments in "
+           "chunks, the video grid in tile_t x tile_h x tile_w boxes): f32 tile means of q and k, "
+           "scores scale qp.kp, and for each video query tile the k = max(1, min(ceil((1 - "
+           "sparsity) V), V)) video tiles of largest score, ascending, ties to the lower tile; "
+           "with `coarse`, bf16(softmax over every tile of the scores, times the v means)."),
+    SCHEMA("attn_vsa", pAttnVsa, oAttnVsa,
+           "block-sparse attention over vsa_select's tiles: a prefix query tile sees every tile, a "
+           "video one the prefix tiles and its selected tiles; with `coarse` and `gate`, "
+           "bf16(bf16(o) + coarse[tile] gate). `qk` \"i8\" with `k_i8` and `k_scale` selects the "
+           "INT8 Q.K form: the keys as quant_act_i8g codes and scales at group head_dim, the query "
+           "quantised the same way inside the op, a score the exact integer product times both "
+           "scales, P.V as in the bf16 form. `pv` \"fp8\" with `v_scale` selects the fp8 P.V "
+           "form: `v` as quant_cols_fp8's E4M3 codes and column scales, P as e4m3(448 p) against "
+           "an exact running max, o = (sum w v_code) v_scale / (448 sum p)."),
+    SCHEMA("quant_cols_fp8", pQuantCols, oQuantCols,
+           "E4M3 codes with one scale per column over all M rows: scale = amax(|x[:, c]|) / 448 "
+           "(1 for an all-zero column), y = e4m3(clamp(x / scale, +-448)), round to nearest even."),
 };
 
 /* ================================================================================ constraints
@@ -3009,13 +3307,22 @@ static const RadConstraint cAttnLocalRel[] = {
 static const RadConstraint cCastWiden[] = {
     C_IN("from", "bf16"), C_IN("to", "f32"),
 };
+/* `cast` narrowing bf16 -> f16, rounded to nearest: the f16 activation of a 4-bit weight's skinny
+ * GEMM (w4a16_asym) where no rotation produces one. */
+static const RadConstraint cCastF16[] = {
+    C_IN("from", "bf16"), C_IN("to", "f16"),
+};
 /* The encoder's dense attention: bidirectional, any window, at the (head_dim, gqa) pairs
  * r4d_attn_dense_bf16.hip compiles. */
+/* Causal or not at head_dim 64: a vision tower's heads, and a codec's sliding causal layers. */
 static const RadConstraint cAttnDenseH64[] = {
-    C_EQ("head_dim", 64), C_EQ("gqa", 1), C_EQ("causal", 0), C_IN("dtype", "bf16"),
+    C_EQ("head_dim", 64), C_EQ("gqa", 1), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cAttnDenseH256G2[] = {
     C_EQ("head_dim", 256), C_EQ("gqa", 2), C_EQ("causal", 0), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cAttnDenseH256G4[] = {
+    C_EQ("head_dim", 256), C_EQ("gqa", 4), C_EQ("causal", 0), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cAttnDenseH512G4[] = {
     C_EQ("head_dim", 512), C_EQ("gqa", 4), C_EQ("causal", 0), C_IN("dtype", "bf16"),
@@ -3184,9 +3491,8 @@ static const RadConstraint cExpertScale[] = {
 };
 /* Runtime LoRA. Any M, K and N: the scalar kernels loop over whatever extents arrive, and the grid
  * is M blocks (shrink) or M strips of 256 columns (expand). R and S are bounded only by the shims'
- * 32-bit index sanity. The dtype set is every activation the decode below reads -- an fp8 or i8
- * one with its scale stream -- and the three outputs a GEMM writes; anything else does not
- * resolve here. */
+ * 32-bit index sanity. The dtype set is every activation the decode reads (an fp8 or i8 one with
+ * its scale stream) and the three outputs a GEMM writes. */
 static const RadConstraint cLoraShrink[] = {
     C_GE("R", 1), C_LE("R", 65536), C_GE("S", 1), C_LE("S", 1048576),
     C_IN("dtype", "bf16 f16 f32 fp8_e4m3 fp8_e5m2 i8"),
@@ -3195,10 +3501,10 @@ static const RadConstraint cLoraExpand[] = {
     C_GE("R", 1), C_LE("R", 65536), C_GE("S", 1), C_LE("S", 1048576),
     C_IN("dtype", "bf16 f16 f32"),
 };
-/* The tiled rows (r4d_lora_bf16.hip, V2). Shrink is two rows because a constraint on an absent
+/* The tiled rows (r4d_lora_bf16.hip). Shrink is two rows because a constraint on an absent
  * parameter does not hold: a bf16 activation has no `group`, and a coded one is the WMMA's only
- * when its group is whole 32-wide steps (the scale is applied a step at a time). Anything else --
- * f16, f32, a coded activation with another group or none declared -- is the scalar row's. */
+ * when its group is whole 32-wide steps (the scale is applied a step at a time). Anything else
+ * (f16, f32, a coded activation with another group or none declared) is the scalar row's. */
 static const RadConstraint cLoraShrinkWmma[] = {
     C_GE("R", 1), C_LE("R", 65536), C_GE("S", 1), C_LE("S", 1048576), C_IN("dtype", "bf16"),
 };
@@ -3375,6 +3681,12 @@ static const RadConstraint cGemmNtFp8A8M16[] = {
 };
 static const RadConstraint cGemmNtFp8A8Tiled[] = {
     C_DIV("K", R4D_FP8_BLOCK), C_DIV("N", R4D_FP8_BLOCK), C_EQ("group", R4D_FP8_BLOCK),
+    C_IN("dtype", "fp8a8"),
+};
+/* gemm_nt_q_bias on the narrow tile: the unbiased narrow row's band. The weight is the same
+ * fragment-order plane, so the same layout hooks serve it. */
+static const RadConstraint cGemmNtQBiasFp8A8M16[] = {
+    C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16), C_EQ("group", R4D_FP8_BLOCK),
     C_IN("dtype", "fp8a8"),
 };
 /* The int8 twins: the same bands at dtype i8a8. */
@@ -3843,6 +4155,8 @@ static const RadConstraint cRopeRow[]   = { C_GE("head_dim", 1),
 static const RadConstraint cLayernorm[] = { C_GE("n", 1), C_IN("dtype", "bf16") };
 static const RadConstraint cGridEmbed[] = { C_GE("n", 1), C_GE("side", 1), C_IN("dtype", "bf16") };
 static const RadConstraint cGemmBias[]  = { C_GE("M", 1), C_DIV("K", 8), C_IN("dtype", "bf16") };
+/* The f32 GEMM reads its rows a float at a time: any K. */
+static const RadConstraint cGemmBiasF32[] = { C_GE("M", 1), C_IN("dtype", "f32") };
 static const RadConstraint cSampleVoc[] = { C_GE("n_vocab", 1) };
 static const RadConstraint cSampleCand[] = { C_GE("n_cand", 1), C_LE("n_cand", 4096) };
 static const RadConstraint cSampleLogprobs[] = { C_GE("n_vocab", 1), C_GE("k", 1), C_LE("k", 64) };
@@ -3866,13 +4180,31 @@ static const RadConstraint cLogitsGemmFp8[] = { C_DIV("n_embd", 128), C_IN("dtyp
 /* Rows read 16 bytes at a time, so the widths are whole eights. */
 static const RadConstraint cGenRows8[] = { C_IN("dtype", "bf16"), C_DIV("n", 8) };
 static const RadConstraint cGenBf16[] = { C_IN("dtype", "bf16") };
+/* A depth decoder's attention: a frame's handful of positions, one query head a key head. */
+static const RadConstraint cAttnDenseSmallH256[] = {
+    C_EQ("head_dim", 256), C_EQ("gqa", 1), C_IN("dtype", "bf16"), C_LE("max_seqlen", 32),
+};
+static const RadConstraint cAudioAny[] = { C_IN("dtype", "bf16 f32") };
+/* ---- video generation (r4d_video.hip). The modulated norms keep a row's 8-wide chunks in
+ * registers, four a thread (n <= 8192), and read 16 bytes at a time; the lists are kernel
+ * arguments, 64 floats at most; the alias-free activation stages its filters in 32 floats of
+ * LDS. */
+static const RadConstraint cRmsMod[] = { C_IN("dtype", "bf16"), C_DIV("n", 8), C_LE("n", 8192) };
+static const RadConstraint cRmsModQ[] = { C_IN("dtype", "bf16"), C_DIV("n", 128), C_LE("n", 8192),
+                                          C_EQ("group", 128) };
+static const RadConstraint cGenF32[] = { C_IN("dtype", "f32") };
+static const RadConstraint cPatchUnfold[] = { C_IN("dtype", "f32"), C_LE("C", 64) };
+static const RadConstraint cGenAnyFloat[] = { C_IN("dtype", "bf16 f32") };
+static const RadConstraint cSnakeAa[] = { C_IN("dtype", "f32"), C_LE("k", 32) };
 static const RadConstraint cLnModQ[] = { C_IN("dtype", "bf16"), C_DIV("n", 128), C_LE("n", 8192),
                                          C_EQ("group", 128) };
 /* The lane copies move 32-bit words, so any row of whole words: bf16 latents and an f32 mask. */
 static const RadConstraint cGenLanes[] = { C_IN("dtype", "bf16 f32") };
 /* The two lists are kernel arguments, 64 floats each at most (r4d_gen.hip). */
 static const RadConstraint cGenAffine[] = { C_IN("dtype", "bf16"), C_LE("n", 64) };
+static const RadConstraint cGenAffineF32[] = { C_IN("dtype", "f32"), C_LE("n", 64) };
 static const RadConstraint cGenTimestep[] = { C_IN("dtype", "bf16"), C_DIV("n", 2) };
+static const RadConstraint cGenTimestepF32[] = { C_IN("dtype", "f32"), C_DIV("n", 2) };
 /* The paged prefix at libr4d's block of 16, both caches bf16, up to eight query heads a KV head
  * (the shim takes 1, 2, 4 and 8). */
 static const RadConstraint cAttnPrefixSelf[] = {
@@ -3888,6 +4220,14 @@ static const RadConstraint cAttnDenseH768[] = {
 static const RadConstraint cAttnDenseH1152[] = {
     C_EQ("head_dim", 1152), C_EQ("gqa", 1), C_EQ("causal", 0), C_IN("dtype", "bf16"),
 };
+/* Video sparse attention: head_dim 128 over 4 x 4 x 4 tiles. The dtypes, the tile capacity and
+ * the optional pairs (v with coarse, coarse with gate) are the entry points' checks. */
+static const RadConstraint cVsa[] = {
+    C_EQ("head_dim", 128), C_EQ("tile_t", 4), C_EQ("tile_h", 4), C_EQ("tile_w", 4),
+    C_GE("patch", 1),
+};
+/* A thread quantises eight columns: one 16-byte load and one 8-byte store a row. */
+static const RadConstraint cQuantCols[] = { C_DIV("n", 8), C_IN("dtype", "bf16") };
 
 static const RadKernelInfo kKernels[] = {
 /* ---------------------------------- the small model ops (r4d_model_bf16.hip) ----------------
@@ -4007,6 +4347,15 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_cast_widen, nullptr, nullptr, nullptr,
   r4d_shape_cast },
 
+{ "cast_bf16_f16", "cast", "elem",
+  "y = x, bf16 narrowed to f16",
+  "any M and n; both row pitches are read off the operands",
+  "bf16 in, f16 out, rounded to nearest even (a value past f16's range becomes an infinity)",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cCastF16), NOTUNE,
+  nullptr, nullptr, r4d_rad_cast_f16, nullptr, nullptr, nullptr,
+  r4d_shape_cast },
+
 { "act_mul_bf16", "act_mul", "elem",
   "gated activation over two operands: act(a) rounded, times b",
   "any n; a, b and y each at their own row pitch, so both may be column slices of one buffer",
@@ -4030,7 +4379,8 @@ static const RadKernelInfo kKernels[] = {
   "blocks at any even head_dim and section size (sections of 16 or a multiple of 32 pairs, each "
   "on a 32-channel slice, in registers; others a lane a pair); one workgroup a token and a wave "
   "a head, sin/cos computed once for all its heads",
-  "bf16 qkv and gains, i32 positions, f32 arithmetic, the norm rounded before the rotation",
+  "bf16 qkv, bf16 or f32 gains, i32 positions, f32 arithmetic, the norm rounded before the "
+  "rotation",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cQkNormRope), NOTUNE,
   nullptr, nullptr, r4d_rad_qk_norm_rope },
@@ -4051,6 +4401,24 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cBf16Row), NOTUNE,
   nullptr, nullptr, r4d_rad_silu, nullptr, nullptr, nullptr,
+  r4d_shape_unary },
+
+{ "silu_f32", "silu", "elem",
+  "x * sigmoid(x) over f32 rows, flat over the extent",
+  "any n; both row pitches read off the operands",
+  "f32 in, f32 out or bf16 rounded once",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cF32Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_silu, nullptr, nullptr, nullptr,
+  r4d_shape_unary },
+
+{ "gelu_bf16", "gelu", "elem",
+  "0.5 x (1 + erf(x / sqrt 2)), the exact form: libref's act_gelu",
+  "any n; both row pitches read off the operands",
+  "bf16 in and out, fp32 arithmetic",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_gelu, nullptr, nullptr, nullptr,
   r4d_shape_unary },
 
 { "clamp_bf16", "clamp", "elem",
@@ -4125,7 +4493,7 @@ static const RadKernelInfo kKernels[] = {
 { "rmsnorm_bf16", "rmsnorm", "norm",
   "root-mean-square norm with a gain, two passes over the row",
   "any n; the sum of squares accumulates in f32 and only the store narrows",
-  "bf16 x / gain / y, fp32 reduction",
+  "bf16 y, x bf16 or (with a gain) f32, bf16 or f32 gain, fp32 reduction",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cBf16Row), NOTUNE,
   nullptr, nullptr, r4d_rad_rmsnorm, nullptr, nullptr, nullptr,
@@ -4143,7 +4511,7 @@ static const RadKernelInfo kKernels[] = {
 { "layernorm_bf16", "layernorm", "norm",
   "layer norm with a gain and an optional bias, two passes over the row",
   "any n; mean and variance accumulate in f32 and only the store narrows",
-  "bf16 x / y, f32 or bf16 gain and bias",
+  "bf16 or f32 x, bf16 y, f32 or bf16 gain and bias",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cLayernorm), NOTUNE,
   nullptr, nullptr, r4d_rad_layernorm, nullptr, nullptr, nullptr,
@@ -4168,8 +4536,9 @@ static const RadKernelInfo kKernels[] = {
   r4d_shape_grid_embed },
 
 { "gemm_bf16_nt_bias_tiled", "gemm_nt_bias", "gemm",
-  "biased GEMM C = res + act(A @ W^T + bias): eight waves over an LDS-staged 64-deep K tile, "
-  "the K tail staged as zeros, the activation and residual in the store",
+  "biased GEMM C = res + act(A @ W^T + bias) over 64-deep K tiles, the K tail staged as zeros, "
+  "the activation and residual in the store: from 32 blocks of 128x128 the weight read straight "
+  "into registers and the activation staged through LDS, below that both staged at 64x64",
   "any M, N; K a multiple of 8; A rows 16-byte aligned; `res` may be the output itself",
   "bf16 A / W / C / res, bf16 or f32 bias, fp32 accumulate, three RNE roundings in the store",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
@@ -4177,12 +4546,33 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_gemm_nt_bias, nullptr, nullptr, nullptr,
   r4d_shape_gemm_nt_bias },
 
+{ "gemm_f32_nt_bias", "gemm_nt_bias", "gemm",
+  "biased f32 GEMM C = res + act(A @ W^T + bias): a register-blocked FMA tile of 128 rows by 128, "
+  "96, 64 or 32 columns over LDS-staged 16-deep K slabs, the activation and residual in the store",
+  "any M, N and K; A and C at their own row pitches; `res` may be the output itself",
+  "f32 A / W, f32 or bf16 bias, f32 accumulate, C f32 or bf16 with res in C's dtype (each epilogue "
+  "step rounded to C's dtype)",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGemmBiasF32), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_f32_nt_bias, nullptr, nullptr, nullptr,
+  r4d_shape_gemm_nt_bias },
+
 { "add_bf16", "add", "elem",
-  "elementwise sum, with the one row-broadcast form",
+  "elementwise sum, with the one row-broadcast form; `div` divides the rounded sum",
   "any n; `b` with exactly n elements broadcasts along rows and nothing else does",
   "bf16 in and out, fp32 arithmetic",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_add, nullptr, nullptr, nullptr,
+  r4d_shape_binary },
+
+{ "add_f32", "add", "elem",
+  "elementwise f32 sum, the same broadcast rule and `div`, flat over the extent so a narrow row "
+  "over a million rows keeps every lane busy",
+  "any M and n; `y` may be `a` (an in-place residual)",
+  "f32 in and out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cF32Row), NOTUNE,
   nullptr, nullptr, r4d_rad_add, nullptr, nullptr, nullptr,
   r4d_shape_binary },
 
@@ -4198,9 +4588,19 @@ static const RadKernelInfo kKernels[] = {
 { "mul_weight_bf16", "mul_weight", "elem",
   "activation times a learned scalar or one-row gain",
   "any n; the weight is one element or exactly n",
-  "bf16 in, weight and out, fp32 arithmetic",
+  "bf16 in and out, a bf16 or f32 weight, fp32 arithmetic",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_mul_weight, nullptr, nullptr, nullptr,
+  r4d_shape_mul_weight },
+
+{ "mul_weight_f32", "mul_weight", "elem",
+  "activation times a learned scalar or one-row gain into an f32 output (a layer scale on a "
+  "branch joining an f32 residual)",
+  "any n; the weight is one element or exactly n",
+  "bf16 or f32 in, a bf16 or f32 weight, f32 out, the product rounded once",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cF32Row), NOTUNE,
   nullptr, nullptr, r4d_rad_mul_weight, nullptr, nullptr, nullptr,
   r4d_shape_mul_weight },
 
@@ -4915,8 +5315,8 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   nullptr, nullptr, r4d_rad_attn_vit },
 
 { "attn_dense_h64_bf16", "attn_dense", "attn",
-  "dense bidirectional encoder attention, varlen over cu_seqlens, optional two-sided window or "
-  "blocks",
+  "dense varlen attention over cu_seqlens: bidirectional with an optional two-sided window or "
+  "blocks, or causal with an optional window behind",
   "head_dim 64, multi-head (no GQA), q/k/v/o at their own token pitches (column slices of a "
   "fused projection allowed)",
   "bf16 query / key / value / out, f16 operands, fp32 accumulate",
@@ -4930,6 +5330,14 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "bf16 query / key / value / out, f16 operands, fp32 accumulate",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cAttnDenseH256G2), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_dense },
+
+{ "attn_dense_h256_gqa4_bf16", "attn_dense", "attn",
+  "dense bidirectional encoder attention, varlen over cu_seqlens, optional two-sided window",
+  "head_dim 256, four query heads a KV head in one workgroup, the key range cut to the window",
+  "bf16 query / key / value / out, f16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnDenseH256G4), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_dense },
 
 { "attn_dense_h512_gqa4_bf16", "attn_dense", "attn",
@@ -5450,16 +5858,31 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   r4d_fuse_gemm_nt_q_gated },
 
 { "gemm_fp8a8_tiled", "gemm_nt_q", "gemm",
-  "the same GEMM for prefill row counts: 128x128 tile, eight waves, one K tile prefetched in "
-  "registers, and the ACTIVATION on the A operand so the epilogue is a coalesced store",
+  "the same GEMM for prefill row counts: 128x128 tile, eight waves of 2 weight x 4 activation "
+  "tiles, the weight read straight into registers and the activation staged through LDS, one K "
+  "tile ahead; a lane stores eight consecutive columns of one row",
   "any M; K and N multiples of 128 -- the fold at the end of the K loop assumes a whole scale "
   "block, and the weight's block scale is read as one scalar for the block's 128 N rows",
-  "E4M3 A with an f32 scale per (row, 128 K), E4M3 W with a bf16 scale per 128x128 tile, bf16 C",
+  "E4M3 A with an f32 scale per (row, 128 K), E4M3 W with a bf16 scale per 128x128 tile, bf16 C; "
+  "each 128-K block's product folded into the f32 accumulator with one fma",
   RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_FP8_TILED,
   ROW(cGemmNtFp8A8Tiled), NOTUNE,
   nullptr, nullptr, r4d_rad_gemm_fp8a8_tiled, nullptr,
   r4d_rad_layout_fp8_block, r4d_rad_relayout_fp8_block,
   r4d_shape_gemm_nt_q, r4d_rad_unrelayout_fp8_block },
+
+{ "gemm_fp8a8_bias_nt_m16", "gemm_nt_q_bias", "gemm",
+  "the narrow block-scaled FP8 W8A8 GEMM with a bias per output column in its store: the "
+  "unbiased narrow tile, never split, writing C at its own row pitch",
+  "M <= 64 (the narrow tile's NT of up to 4); K a multiple of 128 and N of 16, the unbiased "
+  "narrow row's band; C may be a column slice of a wider buffer",
+  "E4M3 A with an f32 scale per (row, 128 K), E4M3 W with a bf16 scale per 128x128 tile, a bf16 "
+  "bias added to the f32 accumulator before its one rounding, bf16 C",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGemmNtQBiasFp8A8M16), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_fp8a8_bias_m16, nullptr,
+  r4d_rad_layout_fp8_block, r4d_rad_relayout_fp8_block,
+  r4d_shape_gemm_nt_q_bias, r4d_rad_unrelayout_fp8_block },
 
 { "gemm_i8a8_nt_m16", "gemm_nt_q", "gemm",
   "gemm_fp8a8_nt_m16 at INT8 codes: the same narrow tile, staging and split-K, with the iu8 WMMA "
@@ -5475,7 +5898,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
 
 { "gemm_i8a8_tiled", "gemm_nt_q", "gemm",
   "gemm_fp8a8_tiled at INT8 codes: the same 128x128 prefill tile, the iu8 WMMA for the fp8 one and "
-  "the weight's scale per row, one a lane a tile in the fold",
+  "the weight's scale per row, eight a lane a tile in the fold",
   "the fp8 row's: any M; K and N multiples of 128",
   "i8 A with an f32 scale per (row, 128 K), i8 W with a bf16 scale per ROW per 128 K, bf16 C",
   RAD_DOMAIN_DEVICE, R4D_PRIO_GEMM_FP8_TILED,
@@ -6319,10 +6742,10 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cExpertScale), NOTUNE,
   nullptr, nullptr, r4d_rad_expert_scale_bf16 },
 
-/* Runtime LoRA, v1: scalar f32, correct first (r4d_lora_bf16.hip). NO opd_shape: libref describes
- * both ops, so rad-kbench draws the same operands for this row as for the oracle -- `slot` in
- * [0, S], S itself a base row. NOT CONCURRENT: see rad_kernel_concurrent below. Below the tiled
- * rows, which serve the same ops for every dtype but f16/f32 activations (R4D_PRIO_LORA_TILED). */
+/* Runtime LoRA, the scalar f32 rows (r4d_lora_bf16.hip). No opd_shape: libref describes both ops,
+ * so rad-kbench draws the same operands for this row as for the oracle (`slot` in [0, S], S a base
+ * row). Not concurrent (rad_kernel_concurrent below). Below the tiled rows, which serve every dtype
+ * but f16/f32 activations (R4D_PRIO_LORA_TILED). */
 { "lora_shrink_scalar", "lora_shrink", "gemm",
   "t = x A[slot]^T per row, base rows untouched: one block a row, one wave a column, the k of a "
   "lane in order and a fixed xor butterfly across the wave",
@@ -6341,10 +6764,10 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   RAD_DOMAIN_DEVICE, R4D_PRIO_LORA_SCALAR,
   ROW(cLoraExpand), NOTUNE,
   nullptr, nullptr, r4d_rad_lora_expand },
-/* Runtime LoRA, v2: the tiled rows. The grid is row TILES, a tile of base rows leaves on one
- * ballot, and a mixed tile runs one pass per distinct slot; shrink's summation order is fixed by K
- * and R (sh_plan), expand's bytes are v1's. The shrink split keeps its partials in the op's
- * scratch (the hook sizes it for the band) and its arrival counters in a block keyed on `t`. */
+/* Runtime LoRA, the tiled rows. The grid is row tiles, a tile of base rows leaves on one ballot,
+ * and a mixed tile runs one pass per distinct slot; shrink's summation order is fixed by K and R
+ * (sh_plan), and expand computes the scalar row's bytes. The shrink split keeps its partials in the
+ * op's scratch (the hook sizes it for the band) and its arrival counters in a block keyed on `t`. */
 { "lora_shrink_wmma", "lora_shrink", "gemm",
   "t = x A[slot]^T per row, base rows untouched: WMMA bf16 over 16-row x 16-j tiles, K in 32-wide "
   "steps over 4 waves and a K split fixed by K and R, one pass a distinct slot of a tile",
@@ -6365,7 +6788,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   nullptr, nullptr, r4d_rad_lora_shrink_wmma, r4d_rad_lora_shrink_wmma_scratch },
 { "lora_expand_tiled", "lora_expand", "gemm",
   "y += scale * (t B[slot]^T) per row, base rows neither read nor written: 32-row x 128-column "
-  "tiles, B[slot]'s slab staged in LDS once a tile, v1's j-ascending order a output",
+  "tiles, B[slot]'s slab staged in LDS once a tile, the scalar row's j-ascending order an output",
   "any M and N, 1 <= R <= 65536, 1 <= S <= 2^20; row and column strides of t and y honoured",
   "f32 t and scale; bf16 lora_b; i32 slot; bf16 / f16 / f32 y",
   RAD_DOMAIN_DEVICE, R4D_PRIO_LORA_TILED,
@@ -6374,8 +6797,10 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
 { "attn_prefix_self_h128_bf16", "attn_prefix_self", "attn",
   "attention over a paged prefix and the pass's own rows, causal over the own rows or not",
   "head_dim 128, 1/2/4/8 query heads a KV head, a flat grid over the sequences' query blocks; "
-  "the int8 Q.K form (k_i8 / k_scale) at 1 only",
-  "bf16 q/k/v/out and cache, bf16 operands, fp32 accumulate; or i8 Q.K codes, i32 accumulate",
+  "the int8 Q.K form (k_i8 / k_scale) at 1 only; the fp8 P.V form (v_scale) at 1 without a "
+  "prefix",
+  "bf16 q/k/v/out and cache, bf16 operands, fp32 accumulate; or i8 Q.K codes, i32 accumulate; "
+  "or E4M3 V codes and P, fp32 accumulate",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cAttnPrefixSelf), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_prefix_self },
@@ -6420,7 +6845,7 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   nullptr, nullptr, r4d_rad_ln_mod },
 
 { "gate_add_bf16", "gate_add", "elem",
-  "x += tanh(gate row) * y, the reference's three roundings",
+  "x += tanh(gate row) * y, the reference's three roundings; with `act` none the gate as it is",
   "any M, row pitches honoured",
   "bf16",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
@@ -6433,6 +6858,14 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "bf16",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGenTimestep), NOTUNE,
+  nullptr, nullptr, r4d_rad_timestep_embed },
+
+{ "timestep_embed_f32", "timestep_embed", "elem",
+  "sinusoidal timestep embedding into f32 rows (a timestep MLP kept in f32)",
+  "any M, row pitches honoured",
+  "f32 t and out, f32 angles",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenTimestepF32), NOTUNE,
   nullptr, nullptr, r4d_rad_timestep_embed },
 
 { "gather_rows2_bf16", "gather_rows2", "elem",
@@ -6467,6 +6900,14 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cGenBf16), NOTUNE,
   nullptr, nullptr, r4d_rad_randn_lanes },
 
+{ "randn_lanes_f32", "randn_lanes", "elem",
+  "a lane's rows from its seed's Philox normal stream, kept in f32 (a sampler's f32 latents)",
+  "any M, row pitches honoured",
+  "f32",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cF32Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_randn_lanes },
+
 { "flow_euler_bf16", "flow_euler", "elem",
   "a flow-matching Euler step with guidance, preview and repaint",
   "any M, row pitches honoured",
@@ -6476,11 +6917,19 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   nullptr, nullptr, r4d_rad_flow_euler },
 
 { "chan_affine_bf16", "chan_affine", "elem",
-  "a per-channel affine from parameter lists",
+  "a per-channel affine from parameter lists; `round` 0 keeps the lists and arithmetic f32",
   "any M, row pitches honoured",
   "bf16",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cGenAffine), NOTUNE,
+  nullptr, nullptr, r4d_rad_chan_affine },
+
+{ "chan_affine_f32", "chan_affine", "elem",
+  "a per-channel affine from parameter lists over f32 rows (an f32 latent denormalised)",
+  "any M, row pitches honoured",
+  "f32",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenAffineF32), NOTUNE,
   nullptr, nullptr, r4d_rad_chan_affine },
 
 { "l2norm_chan_bf16", "l2norm_chan", "norm",
@@ -6539,6 +6988,242 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cGenBf16), NOTUNE,
   nullptr, nullptr, r4d_rad_conv2d_nhwc, nullptr, r4d_rad_layout_conv_tap, r4d_rad_relayout_conv_tap,
   nullptr, r4d_rad_unrelayout_conv_tap },
+
+/* -------------------------------------------------------------------------- audio generation */
+{ "conv1d_bf16", "conv1d", "conv",
+  "a 1-D convolution over sequences as an implicit GEMM over (tap, cin), the weight tap-major",
+  "128 rows x 64 or 128 output channels a block, 64 K a stage; cin % 8 != 0 or cout < 16 takes a "
+  "direct kernel",
+  "bf16 rows, weight, bias and residual, fp32 accumulate, one rounding; act none, tanh or clamp",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_conv1d, nullptr, r4d_rad_layout_conv1d_tap,
+  r4d_rad_relayout_conv1d_tap, nullptr, r4d_rad_unrelayout_conv1d_tap },
+
+{ "conv1d_f32", "conv1d", "conv",
+  "a 1-D convolution over sequences in f32 (a vocoder kept in f32): an implicit GEMM over "
+  "(tap, cin) on the f32 FMA tile, the weight tap-major",
+  "128 rows x 128, 64 or 32 output channels a block, 16 K a slab; fewer than 16 output channels "
+  "take a direct kernel; `res` may be the output itself",
+  "f32 rows, weight, bias and residual, f32 accumulate; act none, tanh or clamp",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cF32Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_conv1d_f32, nullptr, r4d_rad_layout_conv1d_tap_f32,
+  r4d_rad_relayout_conv1d_tap_f32, nullptr, r4d_rad_unrelayout_conv1d_tap_f32 },
+
+{ "conv_t1d_bf16", "conv_t1d", "conv",
+  "a transposed 1-D convolution as one implicit GEMM a phase over its one or two taps, the "
+  "weight phase-major",
+  "128 input rows x 64 or 128 output channels a block, a grid slice a phase; cin % 8 == 0",
+  "bf16 rows, weight and bias, fp32 accumulate, one rounding",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_conv_t1d, nullptr, r4d_rad_layout_convt_phase,
+  r4d_rad_relayout_convt_phase, nullptr, r4d_rad_unrelayout_convt_phase },
+
+{ "conv_t1d_f32", "conv_t1d", "conv",
+  "a transposed 1-D convolution in f32 as one implicit GEMM a phase over ceil(k / stride) taps, "
+  "the weight phase-major with the taps past k zero",
+  "any k of at least a stride and any padding; 128 input rows x 128, 64 or 32 output channels a "
+  "block, a grid slice a phase",
+  "f32 rows, weight and bias, f32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cF32Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_conv_t1d_f32, nullptr, r4d_rad_layout_convt_phase_f32,
+  r4d_rad_relayout_convt_phase_f32, nullptr, r4d_rad_unrelayout_convt_phase_f32 },
+
+{ "snake_bf16", "snake", "elem",
+  "the snake activation per channel", "any M, row pitches honoured", "bf16 rows, f32 alpha",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_snake },
+
+{ "cfg_topk_sample", "cfg_topk_sample", "sample",
+  "a guided top-k pick a lane: radix selects for the conditional and the guided thresholds, ties "
+  "to the lower index, inverse CDF over the kept entries",
+  "a workgroup a lane, k <= 256, rep 1 or 2", "f32 or bf16 logits, i32 picks",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAudioAny), NOTUNE,
+  nullptr, nullptr, r4d_rad_cfg_topk_sample },
+
+{ "rvq_embed_bf16", "rvq_embed", "elem",
+  "a frame's embedding from its residual codes", "a workgroup a row", "bf16 tables and rows",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_rvq_embed },
+
+{ "frame_mix_store_bf16", "frame_mix_store", "elem",
+  "a frame's conditioning row into its lane", "a workgroup a lane, L <= 16",
+  "bf16 planes and rows, f32 logits and scale",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_frame_mix_store },
+
+{ "end_status", "end_status", "elem",
+  "a frame's status from its first pick", "a thread a lane", "i32",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  nullptr, 0, NOTUNE,
+  nullptr, nullptr, r4d_rad_end_status },
+
+{ "frame_store", "frame_store", "elem",
+  "a frame's codes into its lane's history", "a thread a (lane, code); dst contiguous", "i32",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  nullptr, 0, NOTUNE,
+  nullptr, nullptr, r4d_rad_frame_store },
+
+{ "resample_nearest_bf16", "resample_nearest", "elem",
+  "rows resampled nearest-neighbour", "a workgroup an output row", "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_resample_nearest },
+
+{ "fourier_embed_bf16", "fourier_embed", "elem",
+  "random Fourier features of a time", "a workgroup a row", "f32 time and w, bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_fourier_embed },
+
+{ "win_input_bf16", "win_input", "elem",
+  "a denoiser's input rows from the window states", "a workgroup a row", "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_win_input },
+
+{ "win_prep_bf16", "win_prep", "elem",
+  "a window step's noise and overlap binding", "a grid slice an entry", "bf16 states, f32 t",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_win_prep },
+
+{ "win_finish_bf16", "win_finish", "elem",
+  "a window's end and the overlap it hands on", "two kernels: the hand-on, then the join",
+  "bf16 states",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_win_finish },
+
+{ "chan_split_bf16", "chan_split", "elem",
+  "channel groups to sequences", "any M, row pitches honoured", "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenBf16), NOTUNE,
+  nullptr, nullptr, r4d_rad_chan_split },
+
+{ "interleave2_bf16", "interleave2", "elem",
+  "two streams interleaved into stereo samples", "contiguous", "bf16 or f32 in, f32 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAudioAny), NOTUNE,
+  nullptr, nullptr, r4d_rad_interleave2 },
+
+{ "iota", "iota", "elem",
+  "an arithmetic index sequence", "contiguous i32", "i32",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  nullptr, 0, NOTUNE,
+  nullptr, nullptr, r4d_rad_iota },
+
+{ "cu_repeat", "cu_repeat", "elem",
+  "bounds of equal sequences from a device length", "contiguous i32", "i32",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  nullptr, 0, NOTUNE,
+  nullptr, nullptr, r4d_rad_cu_repeat },
+
+{ "attn_dense_small_h256_bf16", "attn_dense", "attn",
+  "dense attention over short sequences, causal or not: a depth decoder's frame positions",
+  "head_dim 256, one query head a key head, sequences of at most 32 rows, a workgroup a (sequence, "
+  "head) with its keys and values in LDS",
+  "bf16 query / key / value / out, fp32 scores and accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnDenseSmallH256), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_dense_small_h256 },
+
+{ "quant_cols_fp8_bf16", "quant_cols_fp8", "quant",
+  "E4M3 codes with one scale per column over every row: two passes, column maxima over 32 row "
+  "chunks then the codes",
+  "n a multiple of 8, a thread eight columns; the chunks' maxima in scratch",
+  "bf16 in, E4M3 out at its own pitch, f32 scale per column",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQuantCols), NOTUNE,
+  nullptr, nullptr, r4d_rad_quant_cols_fp8, r4d_rad_quant_cols_fp8_scratch },
+
+{ "vsa_select_h128_bf16", "vsa_select", "attn",
+  "video sparse attention's tile selection: f32 tile means of q, k (and v), f32 tile scores, the "
+  "top k video tiles of each video query tile ascending, and the coarse softmax over the tiles "
+  "times the v means",
+  "head_dim 128, 4 x 4 x 4 tiles, at most 3072 tiles; the k and v means of a group of heads in "
+  "scratch, eight (four above 1536 tiles) query tiles a workgroup",
+  "bf16 q / k / v / coarse, i32 segs / geom / sel; f32 means, scores and softmax",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cVsa), NOTUNE,
+  nullptr, nullptr, r4d_rad_vsa_select, r4d_rad_vsa_select_scratch },
+
+{ "attn_vsa_h128_bf16", "attn_vsa", "attn",
+  "block-sparse attention over the selected 64-row tiles, with the gated coarse term",
+  "head_dim 128, 4 x 4 x 4 tiles, a workgroup two query tiles of one head walking the merge of "
+  "their key tiles, each tile's rows computed from the geometry; the int8 Q.K form (k_i8 / "
+  "k_scale)",
+  "bf16 q / k / v / coarse / gate / out, i32 segs / geom / sel; bf16 operands, fp32 accumulate; "
+  "or i8 Q.K codes, i32 accumulate; or E4M3 V codes and P, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cVsa), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_vsa },
+
+{ "rms_mod_bf16", "rms_mod", "norm",
+  "gated residual and modulated RMS norm in one pass: a workgroup a row",
+  "n % 8 == 0, n <= 8192; s a column slice at its own pitch",
+  "bf16 rows, gain and table, fp32 sum of squares",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cRmsMod), NOTUNE,
+  nullptr, nullptr, r4d_rad_rms_mod },
+
+{ "rms_mod_quant_fp8_bf16", "rms_mod_quant_fp8", "norm",
+  "gated residual, modulated RMS norm and quant_act_fp8 in one pass: a workgroup a row",
+  "n % 128 == 0, n <= 8192, group 128; s a column slice at its own pitch",
+  "bf16 rows, gain and table, E4M3 codes and f32 scales",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cRmsModQ), NOTUNE,
+  nullptr, nullptr, r4d_rad_rms_mod_quant_fp8 },
+
+{ "flow_x0_step_f32", "flow_x0_step", "elem",
+  "a sampler step toward the clean estimate", "any M, row pitches honoured",
+  "f32 state, f32 or bf16 velocity",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenF32), NOTUNE,
+  nullptr, nullptr, r4d_rad_flow_x0_step },
+
+{ "patch_unfold_f32", "patch_unfold", "elem",
+  "patch rows to denormalised voxel rows, the geometry read on the device",
+  "C <= 64, row pitches honoured", "f32",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cPatchUnfold), NOTUNE,
+  nullptr, nullptr, r4d_rad_patch_unfold },
+
+{ "vtile_gather", "vtile_gather", "elem",
+  "a video decoder's tiles out of the latent, the tile layout from the device geometry: a "
+  "workgroup a tile row",
+  "row pitches honoured", "bf16 or f32 rows and registers",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenAnyFloat), NOTUNE,
+  nullptr, nullptr, r4d_rad_vtile_gather },
+
+{ "vtile_stitch", "vtile_stitch", "elem",
+  "decoded tiles blended into frames and the chunk overlap: a thread a (pixel, colour) over the "
+  "chunk's frames",
+  "row pitches honoured", "bf16 or f32 tiles and overlap, u8 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  nullptr, 0, NOTUNE,
+  nullptr, nullptr, r4d_rad_vtile_stitch },
+
+{ "grid_pos3", "grid_pos3", "elem",
+  "a video decoder's rotary positions over its tiles", "a [3, M] view at its own pitch", "f32",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  nullptr, 0, NOTUNE,
+  nullptr, nullptr, r4d_rad_grid_pos3 },
+
+{ "snake_aa_f32", "snake_aa", "elem",
+  "the alias-free SnakeBeta: a thread an output, its activations recomputed per output",
+  "k <= 32, row pitches honoured", "f32 rows, filters, alpha and beta",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cSnakeAa), NOTUNE,
+  nullptr, nullptr, r4d_rad_snake_aa },
 };
 
 /* ================================================================================== the exports */
@@ -6675,10 +7360,9 @@ extern "C" const RadKernelInfo* rad_kernel_at(int i) {
  * at init, one per declared op and band). Concurrent launches never share these, so those three
  * rows are concurrent. A new row with stream-ordered state belongs in the list above.
  *
- *   lora_*              no state of their own, and ordered ON PURPOSE: the core appends them
- *                       behind the GEMM whose `y` they update and refills the pools they read
- *                       between steps with its own copies, so they are kept out of the replay's
- *                       overlap analysis rather than leaning on it. */
+ *   lora_*              ordered on purpose: the core appends them behind the GEMM whose `y` they
+ *                       update and refills the pools they read between steps with its own copies,
+ *                       so they stay out of the replay's overlap analysis. */
 extern "C" int rad_kernel_concurrent(int i) {
     const RadKernelInfo* k = rad_kernel_at(i);
     if (!k) return 0;

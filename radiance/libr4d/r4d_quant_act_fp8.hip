@@ -188,3 +188,148 @@ extern "C" int r4d_rad_quant_act_i8g(const RadArgs* a, RadStream stream) {
 extern "C" int r4d_rad_had_quant_act_i8g(const RadArgs* a, RadStream stream) {
     return rad_quant_act_fp8(a, stream, true, true);
 }
+
+// ============================================================== quant_cols_fp8
+// E4M3 codes with one scale per column over every row: an attention's V for its fp8 P.V. The
+// formula is quant_act_fp8's (scale amax / 448, 1 for an all-zero column, codes of x / scale
+// clamped to +-448) with the group running down a column. A column's scale needs every row, so
+// two passes over the rows, split into kColChunks chunks:
+//   1. column amax partials, a workgroup a block of columns and a chunk of rows, the bf16
+//      magnitudes compared as integers (their order is the values');
+//   2. a workgroup the same block and chunk: the scales from the chunks' partials, then the codes,
+//      the chunk's rows walked from its end, which the first pass read last and the last-level
+//      cache still holds.
+// A thread owns eight columns: one 16-byte load and one 8-byte store a row.
+namespace {
+
+constexpr int kColChunks  = 32;
+constexpr int kColThreads = 128;
+
+typedef unsigned short r4d_u16x2 __attribute__((ext_vector_type(2)));
+
+__device__ __forceinline__ r4d_u16x2 col_mag(uint32_t w) {
+    return __builtin_bit_cast(r4d_u16x2, w & 0x7fff7fffu);
+}
+
+__global__ __launch_bounds__(kColThreads) void quant_cols_amax_kernel(
+    const uint16_t* __restrict__ x, int M, int n, int x_ld, float* __restrict__ part) {
+    const int c8 = blockIdx.x * kColThreads + threadIdx.x;
+    if (c8 * 8 >= n) return;
+    const int r0 = (int)((long)M * blockIdx.y / kColChunks);
+    const int r1 = (int)((long)M * (blockIdx.y + 1) / kColChunks);
+    const uint16_t* p = x + (long)c8 * 8;
+    r4d_u16x2 m[4] = { { 0, 0 }, { 0, 0 }, { 0, 0 }, { 0, 0 } };
+    int r = r0;
+    for (; r + 8 <= r1; r += 8) {
+        uint4 u[8];
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) u[k] = *(const uint4*)(p + (long)(r + k) * x_ld);
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            m[0] = __builtin_elementwise_max(m[0], col_mag(u[k].x));
+            m[1] = __builtin_elementwise_max(m[1], col_mag(u[k].y));
+            m[2] = __builtin_elementwise_max(m[2], col_mag(u[k].z));
+            m[3] = __builtin_elementwise_max(m[3], col_mag(u[k].w));
+        }
+    }
+    for (; r < r1; ++r) {
+        const uint4 u = *(const uint4*)(p + (long)r * x_ld);
+        m[0] = __builtin_elementwise_max(m[0], col_mag(u.x));
+        m[1] = __builtin_elementwise_max(m[1], col_mag(u.y));
+        m[2] = __builtin_elementwise_max(m[2], col_mag(u.z));
+        m[3] = __builtin_elementwise_max(m[3], col_mag(u.w));
+    }
+    float* d = part + (long)blockIdx.y * n + c8 * 8;
+    *(float4*)d = make_float4(bf16_to_f32(m[0].x), bf16_to_f32(m[0].y), bf16_to_f32(m[1].x),
+                              bf16_to_f32(m[1].y));
+    *(float4*)(d + 4) = make_float4(bf16_to_f32(m[2].x), bf16_to_f32(m[2].y),
+                                    bf16_to_f32(m[3].x), bf16_to_f32(m[3].y));
+}
+
+template <bool HI>
+__device__ __forceinline__ int col_code2(float a, float b, float ia, float ib, int old) {
+    return __builtin_amdgcn_cvt_pk_fp8_f32(fminf(fmaxf(a * ia, -448.0f), 448.0f),
+                                           fminf(fmaxf(b * ib, -448.0f), 448.0f), old, HI);
+}
+
+__global__ __launch_bounds__(kColThreads) void quant_cols_code_kernel(
+    const uint16_t* __restrict__ x, int M, int n, int x_ld, const float* __restrict__ part,
+    uint8_t* __restrict__ y, int y_ld, float* __restrict__ scale) {
+    const int c8 = blockIdx.x * kColThreads + threadIdx.x;
+    if (c8 * 8 >= n) return;
+    float am[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    for (int ch = 0; ch < kColChunks; ++ch) {
+        const float4 a = *(const float4*)(part + (long)ch * n + c8 * 8);
+        const float4 b = *(const float4*)(part + (long)ch * n + c8 * 8 + 4);
+        am[0] = fmaxf(am[0], a.x); am[1] = fmaxf(am[1], a.y);
+        am[2] = fmaxf(am[2], a.z); am[3] = fmaxf(am[3], a.w);
+        am[4] = fmaxf(am[4], b.x); am[5] = fmaxf(am[5], b.y);
+        am[6] = fmaxf(am[6], b.z); am[7] = fmaxf(am[7], b.w);
+    }
+    float sc[8], inv[8];
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        sc[e] = am[e] > 0.0f ? am[e] * (1.0f / 448.0f) : 1.0f;
+        inv[e] = 1.0f / sc[e];
+    }
+    if (blockIdx.y == 0) {
+        *(float4*)(scale + c8 * 8) = make_float4(sc[0], sc[1], sc[2], sc[3]);
+        *(float4*)(scale + c8 * 8 + 4) = make_float4(sc[4], sc[5], sc[6], sc[7]);
+    }
+    const int r0 = (int)((long)M * blockIdx.y / kColChunks);
+    const int r1 = (int)((long)M * (blockIdx.y + 1) / kColChunks);
+    const uint16_t* p = x + (long)c8 * 8;
+    uint8_t* q = y + (long)c8 * 8;
+    auto code = [&](uint4 u) {
+        int lo = col_code2<false>(bf16w_lo(u.x), bf16w_hi(u.x), inv[0], inv[1], 0);
+        lo = col_code2<true>(bf16w_lo(u.y), bf16w_hi(u.y), inv[2], inv[3], lo);
+        int hi = col_code2<false>(bf16w_lo(u.z), bf16w_hi(u.z), inv[4], inv[5], 0);
+        hi = col_code2<true>(bf16w_lo(u.w), bf16w_hi(u.w), inv[6], inv[7], hi);
+        return make_uint2((uint32_t)lo, (uint32_t)hi);
+    };
+    int r = r1;
+    for (; r - 8 >= r0; r -= 8) {
+        uint4 u[8];
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) u[k] = *(const uint4*)(p + (long)(r - 1 - k) * x_ld);
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) *(uint2*)(q + (long)(r - 1 - k) * y_ld) = code(u[k]);
+    }
+    for (; r > r0; --r)
+        *(uint2*)(q + (long)(r - 1) * y_ld) = code(*(const uint4*)(p + (long)(r - 1) * x_ld));
+}
+
+}  // namespace
+
+/* The partial maxima of every chunk, kColChunks rows of n floats. */
+extern "C" int64_t r4d_rad_quant_cols_fp8_scratch(const RadArgs* a) {
+    const long long n = r4d_geti_or(a, "n", 0);
+    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
+    return (int64_t)kColChunks * n * (int64_t)sizeof(float);
+}
+
+extern "C" int r4d_rad_quant_cols_fp8(const RadArgs* a, RadStream stream) {
+    const RadTensor *x = r4d_opt(a, 0), *y = r4d_opt(a, 1), *sc = r4d_opt(a, 2);
+    if (!x || !y || !sc) return R4D_NO(RAD_E_INVAL);
+    if (x->dtype != RAD_BF16 || y->dtype != RAD_F8E4M3 || sc->dtype != RAD_F32)
+        return R4D_NO(RAD_E_DTYPE);
+    const long long n = r4d_geti_or(a, "n", 0);
+    if (n <= 0 || n % 8) return R4D_NO(RAD_E_SHAPE);
+    long long M = 0, my = 0;
+    const long long xl = r4d_rows_pitch(x, n, &M), yl = r4d_rows_pitch(y, n, &my);
+    if (xl < 0 || yl < 0 || (xl & 7) || (yl & 7) || ((uintptr_t)x->data & 15) ||
+        ((uintptr_t)y->data & 7) || !r4d_contig(sc) || ((uintptr_t)sc->data & 15))
+        return R4D_NO(RAD_E_STRIDE);
+    if (my < M || r4d_numel(sc) < n || M > 0x7fffffffLL || n > 0x7fffffffLL)
+        return R4D_NO(RAD_E_SHAPE);
+    if (!a->scratch || ((uintptr_t)a->scratch & 15) ||
+        a->scratch_bytes < (int64_t)kColChunks * n * (int64_t)sizeof(float))
+        return R4D_NO(RAD_E_SCRATCH);
+    const dim3 grid((unsigned)((n / 8 + kColThreads - 1) / kColThreads), (unsigned)kColChunks);
+    hipLaunchKernelGGL(quant_cols_amax_kernel, grid, dim3(kColThreads), 0, (hipStream_t)stream,
+                       (const uint16_t*)x->data, (int)M, (int)n, (int)xl, (float*)a->scratch);
+    hipLaunchKernelGGL(quant_cols_code_kernel, grid, dim3(kColThreads), 0, (hipStream_t)stream,
+                       (const uint16_t*)x->data, (int)M, (int)n, (int)xl,
+                       (const float*)a->scratch, (uint8_t*)y->data, (int)yl, (float*)sc->data);
+    return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
+}

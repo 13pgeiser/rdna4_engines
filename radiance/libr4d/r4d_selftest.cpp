@@ -38,6 +38,9 @@
 #include "r4d_hc_fp8.h"
 #include "r4d_fp8_frag.h"
 #include "r4d_fp8_lm.h"
+#include "rad_encoding.h"
+#include "rad_philox.h"
+#include "rad_yarn.h"
 
 #include <dlfcn.h>
 #include <spawn.h>
@@ -1052,10 +1055,10 @@ struct PartCut {
 /* An asymmetric grid's planes for a [N, K] weight: `bits`-bit codes (a bit stream along K), an f16
  * scale and a u8 zero point 0 .. 2^bits - 1 per 128 of K, drawn from st_mix32 of the
  * coordinates. */
-static Planes asym_planes(int bits, int64_t N, int64_t K) {
+static Planes asym_planes(int bits, int64_t N, int64_t K, uint32_t zdt = RAD_U8) {
     Planes p;
     p.enc = rad_enc_affine(bits == 4 ? RAD_U4 : RAD_U5, RAD_F16, 1, 128);
-    rad_enc_add_plane(&p.enc, "zero", RAD_U8, 1, 128);
+    rad_enc_add_plane(&p.enc, "zero", zdt, 1, 128);
     p.size(N, K);
     const int ic = p.find("codes"), is = p.find("scale"), iz = p.find("zero");
     const int64_t rb = p.row_bytes(ic), G = K / 128;
@@ -1067,10 +1070,16 @@ static Planes asym_planes(int bits, int64_t N, int64_t K) {
         for (int64_t g = 0; g < G; ++g) {
             const uint32_t h = st_mix32((uint32_t)(n * G + g) ^ 0x2545u);
             rad_store_f32(p.data[(size_t)is].data(), RAD_F16, n * G + g, 0.002f * (float)(1 + h % 40));
-            p.data[(size_t)iz][(size_t)(n * G + g)] = (uint8_t)((h >> 8) & top);
+            rad_store_code(p.data[(size_t)iz].data() + n * p.row_bytes(iz), zdt, g,
+                           (int)((h >> 8) & top));
         }
     }
     return p;
+}
+
+/* Row n's zero point in group g of asym_planes' zero plane, whatever its width. */
+static double zero_at(const Planes& p, int iz, int64_t n, int64_t g) {
+    return rad_load_f32(p.data[(size_t)iz].data() + n * p.row_bytes(iz), p.enc.plane[iz].dtype, g);
 }
 
 /* The unnormalised Sylvester Walsh-Hadamard transform of `n` values, in place: (a + b) to the lower
@@ -3945,26 +3954,27 @@ static void givens_numeric(const Plugin& pl, int64_t M, int64_t K, int parts, in
 }
 
 
-/* ParoQuant's 5-bit skinny GEMM against the planes' meaning: u5 codes (a bit stream along K), an
- * f16 scale and a zero point 0..31 per 128 of K, an f16 activation, the weight stored through the
- * row's hooks. `pb1`/`pb2` give a partitioned weight. M past 64 runs the dispatcher's 64-row
- * chunks. */
+/* The 5-bit skinny GEMM (ParoQuant's int5) and its 4-bit sibling w4a16_asym against the planes'
+ * meaning: u5 or u4 codes (a bit stream along K), an f16 scale and a zero point per 128 of K (of
+ * dtype `zdt`), an f16 activation, the weight stored through the row's hooks. `pb1`/`pb2` give a
+ * partitioned weight. M past 64 runs the dispatcher's 64-row chunks. */
 static void w5a16_numeric(const Plugin& pl, int64_t M, int64_t N, int64_t K, int64_t pb1 = 0,
-                          int64_t pb2 = 0) {
-    const char* row = "gemm_w5a16_nt_m64";
+                          int64_t pb2 = 0, int bits = 5, uint32_t zdt = RAD_U8) {
+    const char* row = bits == 5 ? "gemm_w5a16_nt_m64" : "gemm_w4a16_asym_nt_m64";
+    const char* dtype = bits == 5 ? "w5a16" : "w4a16_asym";
     if (!sel(row)) return;
     const PartCut cut(N, pb1, pb2);
     const int parts = cut.parts;
     char nm[160];
-    std::snprintf(nm, sizeof nm, "%s numeric M=%lld N=%lld K=%lld parts=%d", row, (long long)M,
-                  (long long)N, (long long)K, parts);
+    std::snprintf(nm, sizeof nm, "%s numeric M=%lld N=%lld K=%lld parts=%d zero %s", row,
+                  (long long)M, (long long)N, (long long)K, parts, rad_dtype_name(zdt));
     const RadKernelInfo* r = find(pl, row);
     if (!r || !r->layout || !r->relayout) { ok(nm, false, "row or hooks absent"); return; }
     const int64_t G = K / 128;
-    const Planes p = asym_planes(5, N, K);
+    const Planes p = asym_planes(bits, N, K, zdt);
     const int ic = p.find("codes"), is = p.find("scale"), iz = p.find("zero");
     const int64_t rb = p.row_bytes(ic);
-    std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 128) };
+    std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 128), PS("dtype", dtype) };
     std::vector<uint8_t> wq, ws;
     const int rw = stored(r, lp, 2, p, { "codes" }, &wq);
     const int rs = stored(r, lp, 3, p, { "scale", "zero" }, &ws);
@@ -3998,7 +4008,7 @@ static void w5a16_numeric(const Plugin& pl, int64_t M, int64_t N, int64_t K, int
     };
     absent(ts[1]); absent(ts[5]); absent(ts[6]);
     std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PI("group", 128),
-                                 PS("dtype", "w5a16") };
+                                 PS("dtype", dtype) };
     if (pb1) ps.push_back(PI("pb1", pb1));
     if (pb2) ps.push_back(PI("pb2", pb2));
     RadArgs a;
@@ -4016,8 +4026,9 @@ static void w5a16_numeric(const Plugin& pl, int64_t M, int64_t N, int64_t K, int
             const int pt = cut.part_of(n);
             double acc = 0;
             for (int64_t k = 0; k < K; ++k) {
-                const double q = rad_load_f32(p.data[(size_t)ic].data() + n * rb, RAD_U5, k);
-                const double z = p.data[(size_t)iz][(size_t)(n * G + k / 128)];
+                const double q = rad_load_f32(p.data[(size_t)ic].data() + n * rb,
+                                              p.enc.plane[ic].dtype, k);
+                const double z = zero_at(p, iz, n, k / 128);
                 const double sc = rad_load_f32(p.data[(size_t)is].data(), RAD_F16, n * G + k / 128);
                 acc += (double)av[(size_t)(i * PK + pt * K + k)] * (q - z) * sc;
             }
@@ -4121,18 +4132,18 @@ static void w5a16_perf(const Plugin& pl, int bits, int64_t M, int64_t N, int64_t
  * scale and a u8 zero per 128 of K, an int8 activation with an f32 scale per (row, 128), parts
  * side by side. */
 static void wpa8i8_numeric(const Plugin& pl, int bits, int64_t M, int64_t N, int64_t K, int64_t pb1 = 0,
-                            int64_t pb2 = 0) {
+                            int64_t pb2 = 0, uint32_t zdt = RAD_U8) {
     const char* row = bits == 4 ? "gemm_w4a8i8_tiled" : "gemm_w5a8i8_tiled";
     if (!sel(row)) return;
     const PartCut cut(N, pb1, pb2);
     const int parts = cut.parts;
     char nm[160];
-    std::snprintf(nm, sizeof nm, "%s numeric M=%lld N=%lld K=%lld parts=%d", row, (long long)M,
-                  (long long)N, (long long)K, parts);
+    std::snprintf(nm, sizeof nm, "%s numeric M=%lld N=%lld K=%lld parts=%d zero %s", row,
+                  (long long)M, (long long)N, (long long)K, parts, rad_dtype_name(zdt));
     const RadKernelInfo* r = find(pl, row);
     if (!r || !r->layout || !r->relayout) { ok(nm, false, "row or hooks absent"); return; }
     const int64_t G = K / 128;
-    const Planes p = asym_planes(bits, N, K);
+    const Planes p = asym_planes(bits, N, K, zdt);
     const int ic = p.find("codes"), is = p.find("scale"), iz = p.find("zero");
     const int64_t rb = p.row_bytes(ic);
     std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("group", 128), PS("dtype", bits == 4 ? "w4a8i8_asym" : "w5a8i8") };
@@ -4196,7 +4207,7 @@ static void wpa8i8_numeric(const Plugin& pl, int bits, int64_t M, int64_t N, int
             double acc = 0;
             for (int64_t g = 0; g < G; ++g) {
                 double grp = 0;
-                const double z = p.data[(size_t)iz][(size_t)(n * G + g)];
+                const double z = zero_at(p, iz, n, g);
                 const double sc = rad_load_f32(p.data[(size_t)is].data(), RAD_F16, n * G + g);
                 for (int64_t k = g * 128; k < (g + 1) * 128; ++k) {
                     const double q = rad_load_f32(p.data[(size_t)ic].data() + n * rb, p.enc.plane[ic].dtype, k);
@@ -4407,6 +4418,96 @@ static void mxd_overlap_case(const Plugin& pl) {
     (void)st_stream_sync(nullptr);
     ok("gemm_mxfp4a8_decode: a split with half its scratch is refused", rc != RAD_OK,
        "rc=" + std::to_string(rc));
+}
+
+/* gemm_nt_bias at bf16 against an f64 product over the bf16 values the kernel reads, rounded as
+ * libref rounds: the biased product, the activation, the residual, each to bf16. The shapes reach
+ * the 128 x 128 kernel (32 blocks or more) through its edges: a K tail past whole 64-element tiles
+ * (or K below one tile), N past whole 128-row tiles and not a multiple of 8 (the per-element
+ * store), the residual read from the output it overwrites, and a bf16 bias. The tolerance is two
+ * bf16 steps of the element or of the product before its residual (the f32 accumulation order is
+ * the kernel's own) and a rel_l2 of 4e-3 over the tensor. */
+static void bias_gemm_numeric(const Plugin& pl, int64_t M, int64_t N, int64_t K, int act,
+                              bool res, bool bias_f32) {
+    if (!sel("gemm_bf16_nt_bias_tiled")) return;
+    char nm[192];
+    static const char* acts[] = { "none", "gelu", "gelu_tanh" };
+    std::snprintf(nm, sizeof nm, "gemm_bf16_nt_bias_tiled numeric M=%lld N=%lld K=%lld act=%s%s%s",
+                  (long long)M, (long long)N, (long long)K, acts[act], res ? " res=out" : "",
+                  bias_f32 ? "" : " bias=bf16");
+    const RadKernelInfo* r = find(pl, "gemm_bf16_nt_bias_tiled");
+    if (!r) { ok(nm, false, "row absent"); return; }
+    std::vector<uint16_t> ha((size_t)(M * K)), hw((size_t)(N * K)), hr((size_t)(M * N));
+    for (size_t i = 0; i < ha.size(); ++i) ha[i] = st_rand_bf16((uint32_t)i);
+    for (size_t i = 0; i < hw.size(); ++i) hw[i] = h_to_bf16(0.25f * h_bf16(st_rand_bf16((uint32_t)i + 0x5bd1e995u)));
+    for (size_t i = 0; i < hr.size(); ++i) hr[i] = st_rand_bf16((uint32_t)i + 0x27d4eb2fu);
+    std::vector<float> hb((size_t)N);
+    for (int64_t n = 0; n < N; ++n) hb[(size_t)n] = h_bf16(st_rand_bf16((uint32_t)n + 77u));
+    std::vector<uint16_t> hb16((size_t)N);
+    for (int64_t n = 0; n < N; ++n) hb16[(size_t)n] = h_to_bf16(hb[(size_t)n]);
+
+    void* d_a = dalloc(ha.size() * 2);
+    void* d_w = dalloc(hw.size() * 2);
+    void* d_b = dalloc((size_t)N * 4);
+    void* d_y = dalloc((size_t)(M * N) * 2);
+    if (!d_a || !d_w || !d_b || !d_y) { ok(nm, false, "hipMalloc failed"); return; }
+    st_memcpy(d_a, ha.data(), ha.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_w, hw.data(), hw.size() * 2, hipMemcpyHostToDevice);
+    if (bias_f32) st_memcpy(d_b, hb.data(), (size_t)N * 4, hipMemcpyHostToDevice);
+    else          st_memcpy(d_b, hb16.data(), (size_t)N * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_y, hr.data(), hr.size() * 2, hipMemcpyHostToDevice);
+
+    RadTensor tr = T(d_y, RAD_BF16, { M, N });
+    if (!res) absent(tr);
+    std::vector<RadTensor> ts = { T(d_a, RAD_BF16, { M, K }), T(d_w, RAD_BF16, { N, K }),
+                                  T(d_b, bias_f32 ? RAD_F32 : RAD_BF16, { N }), tr,
+                                  T(d_y, RAD_BF16, { M, N }) };
+    std::vector<RadParam> ps = { PI("M", M), PI("N", N), PI("K", K), PS("dtype", "bf16"),
+                                 PS("act", acts[act]) };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    a.world_size = 1;
+    const int rc = r->launch(&a, nullptr);
+    if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) { ok(nm, false, "rc " + std::to_string(rc)); return; }
+    std::vector<uint16_t> got((size_t)(M * N));
+    st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
+
+    std::vector<float> af(ha.size()), wf(hw.size());
+    for (size_t i = 0; i < ha.size(); ++i) af[i] = h_bf16(ha[i]);
+    for (size_t i = 0; i < hw.size(); ++i) wf[i] = h_bf16(hw[i]);
+    double e2 = 0.0, r2 = 0.0;
+    int64_t bad = 0;
+    std::string first;
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t n = 0; n < N; ++n) {
+            double s = 0.0;
+            const float* ar = &af[(size_t)(m * K)];
+            const float* wr = &wf[(size_t)(n * K)];
+            for (int64_t k = 0; k < K; ++k) s += (double)ar[k] * (double)wr[k];
+            float t = h_bf16(h_to_bf16((float)s + hb[(size_t)n]));
+            if (act == 1) t = h_bf16(h_to_bf16((float)(0.5 * t * (1.0 + std::erf(t * 0.70710678118654752)))));
+            if (act == 2) t = h_bf16(h_to_bf16((float)(0.5 * t * (1.0 + std::tanh(0.7978845608028654 *
+                                                                            (t + 0.044715 * t * t * t))))));
+            /* A step of the product before the residual add carries through it unchanged, so the
+             * bound scales with the larger of the two. */
+            const float u = t;
+            if (res) t = h_bf16(h_to_bf16(h_bf16(hr[(size_t)(m * N + n)]) + t));
+            const float g = h_bf16(got[(size_t)(m * N + n)]);
+            const double d = (double)g - (double)t;
+            e2 += d * d;
+            r2 += (double)t * t;
+            if (!(std::fabs(d) <= std::ldexp(std::max(std::fabs(t), std::fabs(u)), -6) + 1e-3)) {
+                if (!bad++) first = "m " + std::to_string(m) + " n " + std::to_string(n) + ": " +
+                                    std::to_string(g) + " vs " + std::to_string(t);
+            }
+        }
+    const double rel = std::sqrt(e2 / (r2 > 0 ? r2 : 1.0));
+    ok(nm, bad == 0 && rel < 4e-3,
+       "rel_l2 " + std::to_string(rel) + ", " + std::to_string(bad) + " outside" +
+           (bad ? " (first " + first + ")" : std::string()));
+    dfree_all();
 }
 
 /* The int8 trunk chain: quant_act_i8g on a bf16 activation, then an i8a8 GEMM on its output,
@@ -4983,6 +5084,3032 @@ static int launch_row(const RadKernelInfo* r, std::vector<RadTensor> ts,
     if (rc != RAD_OK) return rc;
     return st_stream_sync(nullptr) == hipSuccess ? RAD_OK : RAD_E_STATE;
 }
+
+/* ---- the audio generator's ops and their optional forms, against libref's arithmetic ----------
+ *
+ * Each case builds its operands on the host, runs the row, and compares with the host port of the
+ * libref function (libref/ref_audio.cpp, ref_elementwise.cpp, ref_attn.cpp) over the same bf16
+ * inputs. Picks, ids and the history are compared exactly; a sum the kernel orders differently is
+ * held to a relative L2 against the answer rounded to bf16. */
+namespace au {
+
+uint64_t g_seed = 0xa0d10ull;
+float rnd() {
+    g_seed = g_seed * 6364136223846793005ull + 1442695040888963407ull;
+    return (float)((int64_t)(g_seed >> 40) % 2001 - 1000) / 1000.0f;
+}
+std::vector<float> randv(size_t n, float scale) {
+    std::vector<float> v(n);
+    for (auto& x : v) x = rnd() * scale;
+    return v;
+}
+float bfr(float v) { return h_bf16(h_to_bf16(v)); }
+
+/* An operand allocated (zeroed): a launch refuses a null operand before reading its shape. */
+RadTensor TA(uint32_t dt, std::vector<int64_t> shape) {
+    RadTensor t = T(nullptr, dt, std::move(shape));
+    t.data = alloc_for(t);
+    return t;
+}
+
+/* bf16 on the device; the host copy is rounded in place to what the device holds. */
+void* up_bf16(std::vector<float>& h) {
+    std::vector<uint16_t> b(h.size());
+    for (size_t i = 0; i < h.size(); ++i) { b[i] = h_to_bf16(h[i]); h[i] = h_bf16(b[i]); }
+    void* d = dalloc(b.size() * 2);
+    if (d) st_memcpy(d, b.data(), b.size() * 2, hipMemcpyHostToDevice);
+    return d;
+}
+void* up_f32(const std::vector<float>& h) {
+    void* d = dalloc(h.size() * 4);
+    if (d) st_memcpy(d, h.data(), h.size() * 4, hipMemcpyHostToDevice);
+    return d;
+}
+void* up_i32(const std::vector<int32_t>& h) {
+    void* d = dalloc(h.size() * 4);
+    if (d) st_memcpy(d, h.data(), h.size() * 4, hipMemcpyHostToDevice);
+    return d;
+}
+std::vector<float> down_bf16(void* d, size_t n) {
+    std::vector<uint16_t> b(n);
+    st_memcpy(b.data(), d, n * 2, hipMemcpyDeviceToHost);
+    std::vector<float> f(n);
+    for (size_t i = 0; i < n; ++i) f[i] = h_bf16(b[i]);
+    return f;
+}
+std::vector<float> down_f32(void* d, size_t n) {
+    std::vector<float> f(n);
+    st_memcpy(f.data(), d, n * 4, hipMemcpyDeviceToHost);
+    return f;
+}
+std::vector<int32_t> down_i32(void* d, size_t n) {
+    std::vector<int32_t> f(n);
+    st_memcpy(f.data(), d, n * 4, hipMemcpyDeviceToHost);
+    return f;
+}
+double rel(const std::vector<float>& got, const std::vector<float>& want) {
+    double e = 0, r = 0;
+    for (size_t i = 0; i < want.size(); ++i) {
+        const double w = bfr(want[i]);
+        e += (got[i] - w) * (got[i] - w);
+        r += w * w;
+    }
+    return r > 0 ? std::sqrt(e / r) : std::sqrt(e);
+}
+void check(const std::string& name, const std::vector<float>& got, const std::vector<float>& want,
+           double tol) {
+    const double r = rel(got, want);
+    ok(fmt("%s (rel_l2 %.3g, bound %.3g)", name.c_str(), r, tol).c_str(), r <= tol);
+}
+/* Elements that differ bit for bit. */
+template <class V> int64_t differ(const V& a, const V& b) {
+    int64_t n = 0;
+    for (size_t i = 0; i < a.size() && i < b.size(); ++i)
+        if (std::memcmp(&a[i], &b[i], sizeof(a[i])) != 0) ++n;
+    return n + (int64_t)(a.size() > b.size() ? a.size() - b.size() : b.size() - a.size());
+}
+int launch(const RadKernelInfo* r, std::vector<RadTensor> ts, std::vector<RadParam> ps) {
+    return launch_row(r, std::move(ts), std::move(ps));
+}
+
+/* A conv weight as the row stores it: through its relayout hook from PyTorch's layout. */
+void* stored_weight(const RadKernelInfo* r, const std::vector<RadParam>& lp,
+                    const std::vector<float>& w, int64_t rows, int64_t cols, const char* what) {
+    Planes p;
+    p.enc = rad_enc_plain(RAD_BF16);
+    p.rows = { rows };
+    p.cols = { cols };
+    p.data.assign(1, std::vector<uint8_t>(w.size() * 2));
+    for (size_t i = 0; i < w.size(); ++i) {
+        const uint16_t b = h_to_bf16(w[i]);
+        std::memcpy(p.data[0].data() + 2 * i, &b, 2);
+    }
+    std::vector<uint8_t> blob;
+    const int rc = stored(r, lp, 1, p, { "codes" }, &blob);
+    if (rc != RAD_OK && rc != RAD_E_UNSUPPORTED) {
+        ok(what, false, "relayout rc " + std::to_string(rc));
+        return nullptr;
+    }
+    void* d = dalloc(blob.size());
+    if (d) st_memcpy(d, blob.data(), blob.size(), hipMemcpyHostToDevice);
+    return d;
+}
+
+/* The sequence holding row r of `cu`. */
+int64_t seq_of(const std::vector<int32_t>& cu, int64_t r) {
+    int64_t s = 0;
+    while (s + 2 < (int64_t)cu.size() && cu[(size_t)s + 1] <= r) ++s;
+    return s;
+}
+
+/* conv1d: the causal form beside the symmetric one, on the tiled and the direct kernels. */
+void conv1d_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "conv1d_bf16");
+    if (!r) { ok("conv1d_bf16", false, "row absent"); return; }
+    struct C { int64_t cin, cout, k, dil; int causal, extras; };
+    for (const C& c : { C{ 16, 32, 3, 2, 0, 0 }, C{ 16, 32, 3, 2, 1, 1 }, C{ 16, 128, 4, 1, 1, 0 },
+                        C{ 6, 3, 7, 3, 1, 1 }, C{ 6, 3, 2, 1, 1, 0 } }) {
+        const std::vector<int32_t> cu = { 0, 13, 30 };
+        const int64_t M = 30;
+        std::vector<float> x = randv((size_t)(M * c.cin), 1.0f);
+        std::vector<float> w = randv((size_t)(c.cout * c.cin * c.k), 0.3f);
+        std::vector<float> b = randv((size_t)c.cout, 0.5f), res = randv((size_t)(M * c.cout), 0.5f);
+        void* dx = up_bf16(x);
+        void* db = up_bf16(b);
+        void* dres = up_bf16(res);
+        for (auto& v : w) v = bfr(v);
+        std::vector<RadParam> ps = { PI("M", M), PI("cin", c.cin), PI("cout", c.cout),
+                                     PI("k", c.k), PI("dil", c.dil), PS("act", c.extras ? "tanh" : "none"),
+                                     PS("dtype", "bf16"), PI("causal", c.causal) };
+        const std::string nm = fmt("conv1d_bf16 cin %lld cout %lld k %lld dil %lld causal %d%s",
+                                   (long long)c.cin, (long long)c.cout, (long long)c.k,
+                                   (long long)c.dil, c.causal, c.extras ? " +bias+res+tanh" : "");
+        void* dw = stored_weight(r, ps, w, c.cout, c.cin * c.k, nm.c_str());
+        void* dcu = up_i32(cu);
+        void* dy = dalloc((size_t)(M * c.cout) * 2);
+        if (!dw) continue;
+        RadTensor tres = T(dres, RAD_BF16, { M, c.cout }), tb = T(db, RAD_BF16, { c.cout });
+        if (!c.extras) { absent(tres); absent(tb); }
+        const int rc = launch(r, { T(dx, RAD_BF16, { M, c.cin }), T(dw, RAD_BF16, { c.cout, c.cin, c.k }),
+                                   T(dcu, RAD_I32, { 3 }), tres, T(dy, RAD_BF16, { M, c.cout }), tb },
+                              ps);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        const int64_t pad = c.causal ? c.dil * (c.k - 1) : c.dil * (c.k - 1) / 2;
+        std::vector<float> want((size_t)(M * c.cout));
+        for (int64_t row = 0; row < M; ++row) {
+            const int64_t e = seq_of(cu, row), s0 = cu[(size_t)e], s1 = cu[(size_t)e + 1];
+            for (int64_t co = 0; co < c.cout; ++co) {
+                float acc = 0.0f;
+                for (int64_t kk = 0; kk < c.k; ++kk) {
+                    const int64_t ir = row + kk * c.dil - pad;
+                    if (ir < s0 || ir >= s1) continue;
+                    for (int64_t ci = 0; ci < c.cin; ++ci)
+                        acc += w[(size_t)((co * c.cin + ci) * c.k + kk)] * x[(size_t)(ir * c.cin + ci)];
+                }
+                if (c.extras) {
+                    acc += b[(size_t)co];
+                    acc += res[(size_t)(row * c.cout + co)];
+                    acc = std::tanh(acc);
+                }
+                want[(size_t)(row * c.cout + co)] = acc;
+            }
+        }
+        check(nm + " numerics", down_bf16(dy, want.size()), want, 1e-2);
+    }
+    /* An even kernel is causal only. */
+    std::vector<RadParam> ps = { PI("M", 4), PI("cin", 8), PI("cout", 16), PI("k", 4), PI("dil", 1),
+                                 PS("dtype", "bf16") };
+    const int rc = launch(r, { TA(RAD_BF16, { 4, 8 }), TA(RAD_BF16, { 16, 8, 4 }),
+                               TI32({ 2 }, { 0, 4 }), TA(RAD_BF16, { 4, 16 }),
+                               TA(RAD_BF16, { 4, 16 }), TA(RAD_BF16, { 16 }) },
+                          ps);
+    ok("conv1d_bf16 refuses an even symmetric kernel", rc == RAD_E_SHAPE,
+       "rc " + std::to_string(rc));
+}
+
+/* conv_t1d: kernel 2 stride or stride, any padding below stride, an odd stride. */
+void conv_t1d_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "conv_t1d_bf16");
+    if (!r) { ok("conv_t1d_bf16", false, "row absent"); return; }
+    struct C { int64_t cin, cout, s, k, pad; };   /* pad -1: absent */
+    for (const C& c : { C{ 16, 32, 2, 4, -1 }, C{ 16, 32, 8, 16, -1 }, C{ 16, 32, 5, 10, 0 },
+                        C{ 16, 128, 3, 6, 0 }, C{ 16, 32, 2, 2, 0 }, C{ 16, 32, 2, 2, -1 },
+                        C{ 16, 32, 4, 8, 1 } }) {
+        const std::vector<int32_t> cu = { 0, 5, 12 };
+        const int64_t R = 12, O = R * c.s;
+        std::vector<float> x = randv((size_t)(R * c.cin), 1.0f);
+        std::vector<float> w = randv((size_t)(c.cin * c.cout * c.k), 0.3f);
+        std::vector<float> b = randv((size_t)c.cout, 0.5f);
+        void* dx = up_bf16(x);
+        void* db = up_bf16(b);
+        for (auto& v : w) v = bfr(v);
+        std::vector<RadParam> ps = { PI("M", R), PI("cin", c.cin), PI("cout", c.cout),
+                                     PI("stride", c.s), PS("dtype", "bf16"), PI("k", c.k) };
+        if (c.pad >= 0) ps.push_back(PI("pad", c.pad));
+        const std::string nm = fmt("conv_t1d_bf16 stride %lld k %lld pad %lld cout %lld",
+                                   (long long)c.s, (long long)c.k, (long long)c.pad,
+                                   (long long)c.cout);
+        void* dw = stored_weight(r, ps, w, c.cin, c.cout * c.k, nm.c_str());
+        void* dcu = up_i32(cu);
+        void* dy = dalloc((size_t)(O * c.cout) * 2);
+        if (!dw) continue;
+        const int rc = launch(r, { T(dx, RAD_BF16, { R, c.cin }), T(dw, RAD_BF16, { c.cin, c.cout, c.k }),
+                                   T(db, RAD_BF16, { c.cout }), T(dcu, RAD_I32, { 3 }),
+                                   T(dy, RAD_BF16, { O, c.cout }) },
+                              ps);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        const int64_t P = c.pad >= 0 ? c.pad : (c.k - c.s) / 2, taps = c.k / c.s;
+        std::vector<float> want((size_t)(O * c.cout));
+        for (int64_t o = 0; o < O; ++o) {
+            const int64_t e = seq_of(cu, o / c.s), i0 = cu[(size_t)e], i1 = cu[(size_t)e + 1];
+            const int64_t lo = o - i0 * c.s, q = (lo + P) / c.s, rr = (lo + P) % c.s;
+            for (int64_t co = 0; co < c.cout; ++co) {
+                float acc = b[(size_t)co];
+                for (int64_t t = 0; t < taps; ++t) {
+                    const int64_t qi = q - t, tap = rr + t * c.s;
+                    if (qi < 0 || i0 + qi >= i1) continue;
+                    for (int64_t ci = 0; ci < c.cin; ++ci)
+                        acc += w[(size_t)((ci * c.cout + co) * c.k + tap)] *
+                               x[(size_t)((i0 + qi) * c.cin + ci)];
+                }
+                want[(size_t)(o * c.cout + co)] = acc;
+            }
+        }
+        check(nm + " numerics", down_bf16(dy, want.size()), want, 1e-2);
+    }
+    /* A kernel neither stride nor 2 stride, a symmetric default the kernel cannot centre, a pad
+     * of a whole stride. */
+    struct Bad { int64_t s, k, pad; };
+    for (const Bad& c : { Bad{ 4, 12, 0 }, Bad{ 3, 6, -1 }, Bad{ 2, 4, 2 } }) {
+        std::vector<RadParam> ps = { PI("M", 4), PI("cin", 8), PI("cout", 16), PI("stride", c.s),
+                                     PS("dtype", "bf16"), PI("k", c.k) };
+        if (c.pad >= 0) ps.push_back(PI("pad", c.pad));
+        const int rc = launch(r, { TA(RAD_BF16, { 4, 8 }), TA(RAD_BF16, { 8, 16, c.k }),
+                                   TA(RAD_BF16, { 16 }), TI32({ 2 }, { 0, 4 }),
+                                   TA(RAD_BF16, { 4 * c.s, 16 }) },
+                              ps);
+        ok(fmt("conv_t1d_bf16 refuses stride %lld k %lld pad %lld", (long long)c.s,
+               (long long)c.k, (long long)c.pad).c_str(), rc == RAD_E_SHAPE, "rc " + std::to_string(rc));
+    }
+}
+
+/* snake: alpha alone, SnakeBeta, and both stored as logarithms. */
+void snake_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "snake_bf16");
+    if (!r) { ok("snake_bf16", false, "row absent"); return; }
+    const int64_t M = 9, n = 192;
+    for (int form = 0; form < 3; ++form) {
+        std::vector<float> x = randv((size_t)(M * n), 3.0f);
+        std::vector<float> al(n), be(n);
+        for (int64_t c = 0; c < n; ++c) {
+            al[(size_t)c] = form == 2 ? rnd() * 0.7f : 0.2f + 0.8f * std::fabs(rnd());
+            be[(size_t)c] = form == 2 ? rnd() * 0.7f : 0.2f + 0.8f * std::fabs(rnd());
+        }
+        void* dx = up_bf16(x);
+        void* da = up_f32(al);
+        void* dbe = up_f32(be);
+        void* dy = dalloc((size_t)(M * n) * 2);
+        RadTensor tb = T(dbe, RAD_F32, { n });
+        if (form == 0) absent(tb);
+        std::vector<RadParam> ps = { PI("M", M), PI("n", n), PS("dtype", "bf16") };
+        if (form == 2) ps.push_back(PI("log", 1));
+        const char* tag = form == 0 ? "alpha" : form == 1 ? "beta" : "log alpha, log beta";
+        const int rc = launch(r, { T(dx, RAD_BF16, { M, n }), T(da, RAD_F32, { n }),
+                                   T(dy, RAD_BF16, { M, n }), tb }, ps);
+        if (rc != RAD_OK) { ok(fmt("snake_bf16 %s", tag).c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> want((size_t)(M * n));
+        for (int64_t rr = 0; rr < M; ++rr)
+            for (int64_t c = 0; c < n; ++c) {
+                const float v = x[(size_t)(rr * n + c)];
+                const float a = form == 2 ? (float)std::exp((double)al[(size_t)c]) : al[(size_t)c];
+                const float sn = (float)std::sin((double)(v * a));
+                if (form == 0) {
+                    want[(size_t)(rr * n + c)] = v + sn * sn / (a + 1e-9f);
+                } else {
+                    const float bb = form == 2 ? (float)std::exp((double)be[(size_t)c]) : be[(size_t)c];
+                    want[(size_t)(rr * n + c)] = v + 1.0f / (bb + 1e-9f) * (sn * sn);
+                }
+            }
+        check(fmt("snake_bf16 %s numerics", tag), down_bf16(dy, want.size()), want, 3e-3);
+    }
+}
+
+/* ref_cfg_topk_sample's rule on the host, for one lane, over f32 logits. */
+int ref_pick(const std::vector<float>& lg, int64_t V, int64_t lane_row, int rep, float cfg,
+             int64_t K, int64_t cond_k, float temp, int64_t sup_lo, int64_t sup_hi, float pen,
+             std::vector<int32_t>* hist, int64_t hb, uint64_t seed, int32_t frame, uint64_t stream) {
+    std::vector<float> c((size_t)V), g((size_t)V);
+    for (int64_t j = 0; j < V; ++j) c[(size_t)j] = lg[(size_t)(rep * lane_row * V + j)];
+    if (rep == 2) {
+        for (int64_t j = 0; j < V; ++j) {
+            const float u = lg[(size_t)((rep * lane_row + 1) * V + j)];
+            g[(size_t)j] = u + cfg * (c[(size_t)j] - u);
+        }
+    } else {
+        g = c;
+    }
+    if (hist && hb >= 0) {
+        if (frame == 0)
+            for (int64_t j = 0; j < V; ++j) (*hist)[(size_t)(hb + j)] = 0;
+        for (int64_t j = 0; j < V; ++j)
+            if ((*hist)[(size_t)(hb + j)] != 0) {
+                float& v = g[(size_t)j];
+                v = v > 0.0f ? v / pen : v * pen;
+            }
+    }
+    std::vector<int64_t> idx;
+    auto open = [&](int64_t j) { return j < sup_lo || j >= sup_hi; };
+    if (cond_k > 0) {
+        std::vector<float> cc = c;
+        std::nth_element(cc.begin(), cc.begin() + (cond_k - 1), cc.end(), std::greater<float>());
+        const float thr = cc[(size_t)(cond_k - 1)];
+        for (int64_t j = 0; j < V; ++j)
+            if (c[(size_t)j] >= thr && open(j)) idx.push_back(j);
+    } else {
+        for (int64_t j = 0; j < V; ++j)
+            if (open(j)) idx.push_back(j);
+    }
+    if (idx.empty()) return -1;
+    const int64_t kk = std::min<int64_t>(K, (int64_t)idx.size());
+    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](int64_t p, int64_t q) {
+        return g[(size_t)p] > g[(size_t)q] || (g[(size_t)p] == g[(size_t)q] && p < q);
+    });
+    const float m = g[(size_t)idx[0]] / temp;
+    double tot = 0;
+    std::vector<double> e((size_t)kk);
+    for (int64_t t = 0; t < kk; ++t) {
+        e[(size_t)t] = std::exp((double)(g[(size_t)idx[(size_t)t]] / temp - m));
+        tot += e[(size_t)t];
+    }
+    const double u = (double)rad_philox_uniform_s(seed, ((uint64_t)1 << 32) + (uint64_t)frame,
+                                                  stream) * tot;
+    int64_t pick = idx[(size_t)(kk - 1)];
+    double acc = 0;
+    for (int64_t t = 0; t < kk; ++t) {
+        acc += e[(size_t)t];
+        if (u < acc) { pick = idx[(size_t)t]; break; }
+    }
+    if (hist && hb >= 0) (*hist)[(size_t)(hb + pick)] = 1;
+    return (int)pick;
+}
+
+/* cfg_topk_sample with every optional form: per-lane guidance, the repetition penalty over a
+ * lane's history across three frames (the first clearing it), suppressed ids, a temperature that
+ * libref divides by. The picks and the history must equal the host rule's exactly. */
+void cfg_topk_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "cfg_topk_sample");
+    if (!r) { ok("cfg_topk_sample", false, "row absent"); return; }
+    struct C { int64_t V; int rep; bool hist, cfgs; int64_t sup_lo, sup_hi, cond_k; float temp; };
+    for (const C& c : { C{ 2052, 2, true, true, 2048, 2051, 0, 0.9f },
+                        C{ 2051, 1, true, false, 2048, 2051, 0, 0.9f },
+                        C{ 2051, 2, false, true, 2048, 2051, 0, 0.9f },
+                        C{ 16385, 2, false, false, 0, 0, 50, 1.0f } }) {
+        const int64_t n = 3, lanes = 4, K = 50;
+        const std::string nm = fmt("cfg_topk_sample V %lld rep %d%s%s sup [%lld, %lld) cond_k %lld",
+                                   (long long)c.V, c.rep, c.hist ? " hist" : "",
+                                   c.cfgs ? " per-lane cfg" : "", (long long)c.sup_lo,
+                                   (long long)c.sup_hi, (long long)c.cond_k);
+        std::vector<int32_t> lane = { 2, 0, 3 };
+        std::vector<float> cfgv = { 1.0f, 3.0f, 4.0f };
+        std::vector<uint32_t> seed = { 7u, 0u, 0x9e3779b9u, 1u, 0xdeadbeefu, 0x12345u };
+        /* The history starts with stale marks, which frame 0 must clear. */
+        std::vector<int32_t> hist((size_t)(lanes * c.V), 0);
+        for (size_t i = 0; i < hist.size(); i += 7) hist[i] = 1;
+        void* dlane = up_i32(lane);
+        void* dcfg = up_f32(cfgv);
+        void* dseed = dalloc(seed.size() * 4);
+        if (dseed) st_memcpy(dseed, seed.data(), seed.size() * 4, hipMemcpyHostToDevice);
+        void* dhist = up_i32(hist);
+        void* dids = dalloc((size_t)(c.rep * n) * 4);
+        int64_t wrong = 0, hist_wrong = 0;
+        /* Frames 1 and 2 over the stale history (every seventh id penalised), then frame 0, which
+         * clears it, then frame 1 over the picks since. */
+        for (const int32_t f : { 1, 2, 0, 1 }) {
+            /* Logits with a spread wide enough that the penalty and the temperature move picks,
+             * and repeated values so that ties are cut by index. */
+            std::vector<float> lg((size_t)(c.rep * n * c.V));
+            for (size_t i = 0; i < lg.size(); ++i) {
+                const float v = rnd() * 6.0f;
+                lg[i] = (i % 97 == 0) ? 5.95f : v;
+            }
+            void* dlg = up_f32(lg);
+            std::vector<int32_t> frame((size_t)n, f);
+            void* dfr = up_i32(frame);
+            RadTensor tcfg = T(dcfg, RAD_F32, { n }), tlane = T(dlane, RAD_I32, { n });
+            RadTensor thist = T(dhist, RAD_I32, { lanes, c.V });
+            if (!c.cfgs) absent(tcfg);
+            if (!c.hist) { absent(tlane); absent(thist); }
+            std::vector<RadParam> ps = { PI("M", c.rep * n), PI("n_vocab", c.V), PI("k", K),
+                                         PI("rep", c.rep), PI("cond_k", c.cond_k), PF("cfg", 1.5),
+                                         PF("temp", c.temp), PI("stream", 3), PS("dtype", "f32"),
+                                         PI("sup_lo", c.sup_lo), PI("sup_hi", c.sup_hi),
+                                         PF("penalty", 1.1) };
+            const int rc = launch(r, { T(dlg, RAD_F32, { c.rep * n, c.V }), T(dseed, RAD_U32, { n, 2 }),
+                                       T(dfr, RAD_I32, { n }), T(dids, RAD_I32, { c.rep * n }), tcfg,
+                                       tlane, thist },
+                                  ps);
+            if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); return; }
+            const std::vector<int32_t> got = down_i32(dids, (size_t)(c.rep * n));
+            for (int64_t i = 0; i < n; ++i) {
+                const uint64_t sd = (uint64_t)seed[(size_t)(2 * i)] |
+                                    ((uint64_t)seed[(size_t)(2 * i + 1)] << 32);
+                const int want = ref_pick(lg, c.V, i, c.rep, c.cfgs ? cfgv[(size_t)i] : 1.5f, K,
+                                          c.cond_k, c.temp, c.sup_lo, c.sup_hi, 1.1f,
+                                          c.hist ? &hist : nullptr,
+                                          c.hist ? lane[(size_t)i] * c.V : -1, sd, f, 3);
+                for (int t = 0; t < c.rep; ++t)
+                    if (got[(size_t)(c.rep * i + t)] != want) ++wrong;
+            }
+            if (c.hist) hist_wrong += differ(down_i32(dhist, hist.size()), hist);
+        }
+        ok((nm + " picks").c_str(), wrong == 0, fmt("%lld of %lld picks differ", (long long)wrong,
+                                                     (long long)(4 * c.rep * n)));
+        if (c.hist)
+            ok((nm + " history").c_str(), hist_wrong == 0,
+               fmt("%lld history entries differ", (long long)hist_wrong));
+    }
+}
+
+/* rvq_embed: libref's two roundings, the single rounding over bf16 and f32 tables into a bf16 or
+ * f32 row, codes read as a block of a wider frame-major history (strides other than the dense
+ * plane's), and a first code outside its table leaving the row unwritten. Exact. */
+void rvq_embed_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "rvq_embed_bf16");
+    if (!r) { ok("rvq_embed_bf16", false, "row absent"); return; }
+    const int64_t D = 96, K = 5, voc = 11, off0 = 3, rows = 6, lanes = 2, stride = 9;
+    struct C { int round1; bool f32tab, f32y, block; };
+    for (const C& c : { C{ 0, false, false, false }, C{ 1, false, false, false },
+                        C{ 1, true, true, true }, C{ 1, false, true, true } }) {
+        std::vector<float> t0 = randv((size_t)((voc + off0) * D), 1.0f);
+        std::vector<float> t1 = randv((size_t)((K - 1) * voc * D), 1.0f);
+        void* d0 = c.f32tab ? up_f32(t0) : up_bf16(t0);
+        void* d1 = c.f32tab ? up_f32(t1) : up_bf16(t1);
+        /* Codes [K, rows]: dense, or the rows' block of a [lanes * K, stride] history at lane 1,
+         * frames 2.. */
+        std::vector<int32_t> plane;
+        RadTensor tc;
+        std::vector<int32_t> code((size_t)(K * rows));
+        for (int64_t k = 0; k < K; ++k)
+            for (int64_t i = 0; i < rows; ++i)
+                code[(size_t)(k * rows + i)] = (int32_t)((k * 7 + i * 3 + 1) % voc);
+        code[(size_t)(2 * rows + 4)] = 3 * voc + 1;   /* a later code past t1: adds nothing */
+        code[(size_t)5] = -off0 - 1;             /* the first code of row 5 outside t0 */
+        if (c.block) {
+            plane.assign((size_t)(lanes * K * stride), 77);
+            for (int64_t k = 0; k < K; ++k)
+                for (int64_t i = 0; i < rows; ++i)
+                    plane[(size_t)((K + k) * stride + 2 + i)] = code[(size_t)(k * rows + i)];
+            void* dp = up_i32(plane);
+            tc = T(dp, RAD_I32, { K, rows });
+            tc.data = (int32_t*)dp + K * stride + 2;
+            tc.stride[0] = stride;
+            tc.stride[1] = 1;
+        } else {
+            tc = T(up_i32(code), RAD_I32, { K, rows });
+        }
+        const uint32_t ydt = c.f32y ? RAD_F32 : RAD_BF16;
+        std::vector<float> sentinel((size_t)(rows * D), 0.25f);
+        void* dy = c.f32y ? up_f32(sentinel) : up_bf16(sentinel);
+        const float scale = 0.5f;
+        std::vector<RadParam> ps = { PI("M", rows), PI("n_embd", D), PI("n_codes", K),
+                                     PI("vocab", voc), PI("off0", off0), PF("scale", scale),
+                                     PS("dtype", c.f32y ? "f32" : "bf16"), PI("round", c.round1) };
+        const std::string nm = fmt("rvq_embed_bf16 round %d %s tables -> %s%s", c.round1,
+                                   c.f32tab ? "f32" : "bf16", c.f32y ? "f32" : "bf16",
+                                   c.block ? ", codes a history block" : "");
+        const int rc = launch(r, { tc, T(d0, c.f32tab ? RAD_F32 : RAD_BF16, { voc + off0, D }),
+                                   T(d1, c.f32tab ? RAD_F32 : RAD_BF16, { (K - 1) * voc, D }),
+                                   T(dy, ydt, { rows, D }) },
+                              ps);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> want = sentinel;
+        for (int64_t i = 0; i < rows; ++i) {
+            const int64_t c0 = code[(size_t)i] + off0;
+            if (c0 < 0 || c0 >= voc + off0) continue;
+            for (int64_t d = 0; d < D; ++d) {
+                const float e0 = t0[(size_t)(c0 * D + d)];
+                float acc = c.round1 ? e0 : 0.0f;
+                for (int64_t k = 1; k < K; ++k) {
+                    const int64_t ck = code[(size_t)(k * rows + i)] + (k - 1) * voc;
+                    if (ck >= 0 && ck < (K - 1) * voc) acc += t1[(size_t)(ck * D + d)];
+                }
+                const float s = c.round1 ? acc : bfr(e0 + bfr(acc));
+                want[(size_t)(i * D + d)] = c.f32y ? s * scale : bfr(s * scale);
+            }
+        }
+        const std::vector<float> got = c.f32y ? down_f32(dy, want.size()) : down_bf16(dy, want.size());
+        const int64_t bad = differ(got, want);
+        ok((nm + " exact").c_str(), bad == 0, fmt("%lld of %lld elements differ", (long long)bad,
+                                                  (long long)want.size()));
+    }
+}
+
+/* frame_store: each lane's codes into its block of the history, frames before `skip` and lanes
+ * whose status ended the piece left alone. Exact. */
+void frame_store_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "frame_store");
+    if (!r) { ok("frame_store", false, "row absent"); return; }
+    const int64_t K = 16, lanes = 4, stride = 12, n = 3, rep = 2;
+    for (const int64_t skip : { (int64_t)0, (int64_t)1 }) {
+        std::vector<int32_t> codes((size_t)(K * rep * n));
+        for (size_t i = 0; i < codes.size(); ++i) codes[i] = (int32_t)(i * 37 % 2048);
+        std::vector<int32_t> lane = { 3, 1, 0 }, frame = { 0, 5, 11 }, status = { 4, -1, 9, 2 };
+        std::vector<int32_t> dst((size_t)(lanes * K * stride), -7);
+        void* dc = up_i32(codes);
+        void* dl = up_i32(lane);
+        void* df = up_i32(frame);
+        void* ds = up_i32(status);
+        void* dd = up_i32(dst);
+        std::vector<RadParam> ps = { PI("M", n), PI("n_codes", K), PI("stride", stride),
+                                     PI("rep", rep), PI("skip", skip) };
+        const int rc = launch(r, { T(dc, RAD_I32, { K, rep * n }), T(dl, RAD_I32, { n }),
+                                   T(df, RAD_I32, { n }), T(ds, RAD_I32, { lanes }),
+                                   T(dd, RAD_I32, { lanes * K, stride }) },
+                              ps);
+        const std::string nm = fmt("frame_store skip %lld", (long long)skip);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t L = lane[(size_t)i], f = frame[(size_t)i] - skip;
+            if (f < 0 || status[(size_t)L] < 0 || f >= stride) continue;
+            for (int64_t k = 0; k < K; ++k)
+                dst[(size_t)((L * K + k) * stride + f)] = codes[(size_t)(k * rep * n + rep * i)];
+        }
+        const int64_t bad = differ(down_i32(dd, dst.size()), dst);
+        ok((nm + " exact").c_str(), bad == 0, fmt("%lld entries differ", (long long)bad));
+    }
+}
+
+/* conv1d_dw with its optional bias, bf16 and f32. */
+void conv1d_dw_bias_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "conv1d_dw_bf16");
+    if (!r) { ok("conv1d_dw_bf16", false, "row absent"); return; }
+    const int64_t M = 20, C = 1024, Kw = 7;
+    for (const bool f32b : { false, true }) {
+        std::vector<float> x = randv((size_t)(M * C), 1.0f), w = randv((size_t)(C * Kw), 0.5f);
+        std::vector<float> b = randv((size_t)C, 1.0f);
+        void* dx = up_bf16(x);
+        void* dw = up_bf16(w);
+        void* db = f32b ? up_f32(b) : up_bf16(b);
+        void* dy = dalloc((size_t)(M * C) * 2);
+        const std::vector<int32_t> cu = { 0, 7, 20 };
+        const int rc = launch(r, { T(dx, RAD_BF16, { M, C }), T(dw, RAD_BF16, { C, 1, Kw }),
+                                   T(up_i32(cu), RAD_I32, { 3 }), T(dy, RAD_BF16, { M, C }),
+                                   T(db, f32b ? RAD_F32 : RAD_BF16, { C }) },
+                              { PI("M", M), PI("n", C), PI("k", Kw), PS("dtype", "bf16") });
+        const std::string nm = fmt("conv1d_dw_bf16 with a %s bias", f32b ? "f32" : "bf16");
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> want((size_t)(M * C));
+        for (int64_t t = 0; t < M; ++t) {
+            const int64_t t0 = t < 7 ? 0 : 7;
+            for (int64_t c = 0; c < C; ++c) {
+                float acc = 0.0f;
+                for (int64_t j = 0; j < Kw; ++j) {
+                    const int64_t tt = t - (Kw - 1) + j;
+                    if (tt >= t0) acc += x[(size_t)(tt * C + c)] * w[(size_t)(c * Kw + j)];
+                }
+                want[(size_t)(t * C + c)] = acc + b[(size_t)c];
+            }
+        }
+        check(nm + " numerics", down_bf16(dy, want.size()), want, 1e-2);
+    }
+}
+
+/* attn_dense with an asymmetric window over a fused [q|k|v] row: the encoder rows at h256 gqa 2
+ * and 4, segments longer than the window, against libref's mask. And the refusals: a right side
+ * without a window, and the rows that read every key. */
+void attn_window_right_cases(const Plugin& pl, const char* name, int64_t nh, int64_t nkv,
+                             int64_t window, int64_t wright) {
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { ok(name, false, "row absent"); return; }
+    const int64_t hd = 256, total = 330, wq = nh * hd, wkv = nkv * hd, width = wq + 2 * wkv;
+    const std::vector<int32_t> cu = { 0, 290, 330 };
+    std::vector<float> qkv = randv((size_t)(total * width), 1.0f);
+    void* d = up_bf16(qkv);
+    auto col = [&](int64_t first, int64_t w) {
+        RadTensor t = T(d, RAD_BF16, { total, w });
+        t.data = (void*)((uint16_t*)d + first);
+        t.stride[0] = width;
+        return t;
+    };
+    void* dout = dalloc((size_t)(total * wq) * 2);
+    const float scale = 0.0625f;
+    std::vector<RadParam> ps = { PI("M", total), PI("head_dim", hd), PI("gqa", nh / nkv),
+                                 PI("causal", 0), PS("dtype", "bf16"), PF("scale", scale),
+                                 PI("max_seqlen", 290), PI("window", window),
+                                 PI("window_right", wright) };
+    const std::string nm = fmt("%s window %lld window_right %lld", name, (long long)window,
+                               (long long)wright);
+    const int rc = launch(r, { col(0, wq), col(wq, wkv), col(wq + wkv, wkv), T(up_i32(cu), RAD_I32, { 3 }),
+                               T(dout, RAD_BF16, { total, wq }) },
+                          ps);
+    if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); return; }
+    const int64_t wr = wright > 0 ? wright : window;
+    std::vector<float> want((size_t)(total * wq));
+    for (int64_t s = 0; s < 2; ++s) {
+        const int64_t b0 = cu[(size_t)s], b1 = cu[(size_t)s + 1];
+        for (int64_t h = 0; h < nh; ++h) {
+            const int64_t kh = h / (nh / nkv);
+            for (int64_t i = b0; i < b1; ++i) {
+                const int64_t jb = std::max(b0, i - window + 1), je = std::min(b1, i + wr);
+                std::vector<double> sc((size_t)(je - jb));
+                double mx = -1e300;
+                for (int64_t j = jb; j < je; ++j) {
+                    double dot = 0;
+                    for (int64_t e = 0; e < hd; ++e)
+                        dot += (double)qkv[(size_t)(i * width + h * hd + e)] *
+                               qkv[(size_t)(j * width + wq + kh * hd + e)];
+                    sc[(size_t)(j - jb)] = dot * scale;
+                    mx = std::max(mx, sc[(size_t)(j - jb)]);
+                }
+                double sum = 0;
+                for (double& v : sc) { v = std::exp(v - mx); sum += v; }
+                for (int64_t e = 0; e < hd; ++e) {
+                    double a = 0;
+                    for (int64_t j = jb; j < je; ++j)
+                        a += sc[(size_t)(j - jb)] * qkv[(size_t)(j * width + wq + wkv + kh * hd + e)];
+                    want[(size_t)(i * wq + h * hd + e)] = (float)(a / sum);
+                }
+            }
+        }
+    }
+    check(nm + " numerics", down_bf16(dout, want.size()), want, 2e-2);
+}
+
+void attn_refusal_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "attn_dense_h256_gqa2_bf16");
+    if (r) {
+        std::vector<RadParam> ps = { PI("M", 8), PI("head_dim", 256), PI("gqa", 2), PI("causal", 0),
+                                     PS("dtype", "bf16"), PI("window_right", 4) };
+        const int rc = launch(r, { TA(RAD_BF16, { 8, 1024 }), TA(RAD_BF16, { 8, 512 }),
+                                   TA(RAD_BF16, { 8, 512 }), TI32({ 2 }, { 0, 8 }),
+                                   TA(RAD_BF16, { 8, 1024 }) },
+                              ps);
+        ok("attn_dense refuses a right window without a window", rc == RAD_E_SHAPE,
+           "rc " + std::to_string(rc));
+    }
+}
+
+void attn_small_refusal_case(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "attn_dense_small_h256_bf16");
+    if (!r) { ok("attn_dense_small_h256_bf16", false, "row absent"); return; }
+    for (const char* key : { "window", "block" }) {
+        std::vector<RadParam> ps = { PI("M", 8), PI("head_dim", 256), PI("gqa", 1), PI("causal", 0),
+                                     PS("dtype", "bf16"), PI(key, 4) };
+        const int rc = launch(r, { TA(RAD_BF16, { 8, 256 }), TA(RAD_BF16, { 8, 256 }),
+                                   TA(RAD_BF16, { 8, 256 }), TI32({ 2 }, { 0, 8 }),
+                                   TA(RAD_BF16, { 8, 256 }) },
+                              ps);
+        ok(fmt("attn_dense_small_h256_bf16 refuses a %s", key).c_str(), rc == RAD_E_UNSUPPORTED,
+           "rc " + std::to_string(rc));
+    }
+}
+
+/* rope with Llama 3's frequency scaling at a depth decoder's geometry (positions 0..15, theta
+ * 5e5, factor 32 over an original length of 16), against an f32 mirror of the kernel; and its
+ * refusal beside YaRN. */
+void rope_llama3_case(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "rope_bf16");
+    if (!r) { ok("rope_bf16 llama3", false, "row absent"); return; }
+    const int64_t M = 16, hd = 128, n_head = 8, nkv = 0, half = hd / 2;
+    const int64_t row = n_head * hd;
+    const float theta = 500000.0f;
+    RadLlama3 l3;
+    l3.factor = 32.0f; l3.low = 0.001953125f; l3.high = 0.0078125f; l3.orig = 16.0f;
+    std::vector<float> x = randv((size_t)(M * row), 1.0f);
+    void* dq = up_bf16(x);
+    std::vector<int32_t> pos((size_t)M);
+    for (int64_t m = 0; m < M; ++m) pos[(size_t)m] = (int32_t)m;
+    void* dp = up_i32(pos);
+    std::vector<RadParam> ps = { PI("M", M), PI("head_dim", hd), PI("n_head", n_head),
+                                 PI("n_head_kv", nkv), PF("theta", (double)theta), PF("scale", 1.0),
+                                 PS("mode", "neox"), PF("llama3_factor", 32.0),
+                                 PF("llama3_low", 0.001953125), PF("llama3_high", 0.0078125),
+                                 PF("llama3_orig", 16.0) };
+    const int rc = launch(r, { T(dq, RAD_BF16, { M, row }), T(dp, RAD_I32, { M }) }, ps);
+    if (rc != RAD_OK) { ok("rope_bf16 llama3", false, "rc " + std::to_string(rc)); return; }
+    std::vector<float> want = x;
+    int64_t scaled = 0;
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t h = 0; h < n_head; ++h)
+            for (int64_t i = 0; i < half; ++i) {
+                const float inv0 = 1.0f / powf(theta, (float)(2 * i) / (float)hd);
+                const float inv = l3.frequency(inv0);
+                if (m == 0 && h == 0 && inv != inv0) ++scaled;
+                float s, c;
+                sincosf((float)pos[(size_t)m] * inv, &s, &c);
+                const size_t i0 = (size_t)(m * row + h * hd + i), i1 = i0 + (size_t)half;
+                want[i0] = x[i0] * c - x[i1] * s;
+                want[i1] = x[i0] * s + x[i1] * c;
+            }
+    const std::vector<float> got = down_bf16(dq, want.size());
+    const double rl = rel(got, want);
+    ok("rope_bf16 llama3 numerics", rl < 2e-3 && scaled > 0,
+       fmt("rel_l2 %.3g, %lld of %lld frequencies scaled", rl, (long long)scaled, (long long)half));
+    ps.push_back(PF("yarn_factor", 2.0));
+    ps.push_back(PF("yarn_low", 1.0));
+    ps.push_back(PF("yarn_high", 4.0));
+    const int rc2 = launch(r, { T(dq, RAD_BF16, { M, row }), T(dp, RAD_I32, { M }) }, ps);
+    ok("rope_bf16 refuses llama3 beside YaRN", rc2 == RAD_E_INVAL, "rc " + std::to_string(rc2));
+}
+
+/* attn_dense causal at head_dim 64 over a fused [rows, 3 * 16 * 64] row (a codec transformer's
+ * sliding layers), with a window behind and without, one sequence or two, against libref's mask. */
+void attn_causal_h64_case(const Plugin& pl, int64_t window, std::vector<int32_t> cu) {
+    const char* name = "attn_dense_h64_bf16";
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { ok(name, false, "row absent"); return; }
+    const int64_t hd = 64, nh = 16, total = cu.back(), wq = nh * hd, width = 3 * wq;
+    std::vector<float> qkv = randv((size_t)(total * width), 1.0f);
+    void* d = up_bf16(qkv);
+    auto col = [&](int64_t first, int64_t w) {
+        RadTensor t = T(d, RAD_BF16, { total, w });
+        t.data = (void*)((uint16_t*)d + first);
+        t.stride[0] = width;
+        return t;
+    };
+    void* dout = dalloc((size_t)(total * wq) * 2);
+    const float scale = 0.125f;
+    std::vector<RadParam> ps = { PI("M", total), PI("head_dim", hd), PI("gqa", 1), PI("causal", 1),
+                                 PS("dtype", "bf16"), PF("scale", scale), PI("max_seqlen", total) };
+    if (window) ps.push_back(PI("window", window));
+    const std::string nm = fmt("%s causal window %lld over %zu sequence(s) of %lld rows", name,
+                               (long long)window, cu.size() - 1, (long long)total);
+    const int rc = launch(r, { col(0, wq), col(wq, wq), col(2 * wq, wq),
+                               T(up_i32(cu), RAD_I32, { (int64_t)cu.size() }),
+                               T(dout, RAD_BF16, { total, wq }) },
+                          ps);
+    if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); return; }
+    std::vector<float> want((size_t)(total * wq));
+    for (size_t s = 0; s + 1 < cu.size(); ++s) {
+        const int64_t b0 = cu[s], b1 = cu[s + 1];
+        for (int64_t h = 0; h < nh; ++h)
+            for (int64_t i = b0; i < b1; ++i) {
+                const int64_t jb = window ? std::max(b0, i - window + 1) : b0, je = i + 1;
+                std::vector<double> sc((size_t)(je - jb));
+                double mx = -1e300;
+                for (int64_t j = jb; j < je; ++j) {
+                    double dot = 0;
+                    for (int64_t e = 0; e < hd; ++e)
+                        dot += (double)qkv[(size_t)(i * width + h * hd + e)] *
+                               qkv[(size_t)(j * width + wq + h * hd + e)];
+                    sc[(size_t)(j - jb)] = dot * scale;
+                    mx = std::max(mx, sc[(size_t)(j - jb)]);
+                }
+                double sum = 0;
+                for (double& v : sc) { v = std::exp(v - mx); sum += v; }
+                for (int64_t e = 0; e < hd; ++e) {
+                    double a = 0;
+                    for (int64_t j = jb; j < je; ++j)
+                        a += sc[(size_t)(j - jb)] * qkv[(size_t)(j * width + 2 * wq + h * hd + e)];
+                    want[(size_t)(i * wq + h * hd + e)] = (float)(a / sum);
+                }
+            }
+    }
+    check(nm + " numerics", down_bf16(dout, want.size()), want, 2e-2);
+}
+
+/* gelu, the exact erf form, against libref's act_gelu evaluated in double. */
+void gelu_case(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "gelu_bf16");
+    if (!r) { ok("gelu_bf16", false, "row absent"); return; }
+    const int64_t M = 64, n = 4096;
+    std::vector<float> x = randv((size_t)(M * n), 4.0f);
+    void* dx = up_bf16(x);
+    void* dy = dalloc((size_t)(M * n) * 2);
+    const int rc = launch(r, { T(dx, RAD_BF16, { M, n }), T(dy, RAD_BF16, { M, n }) },
+                          { PI("M", M), PI("n", n), PS("dtype", "bf16") });
+    if (rc != RAD_OK) { ok("gelu_bf16", false, "rc " + std::to_string(rc)); return; }
+    std::vector<float> want(x.size());
+    for (size_t i = 0; i < x.size(); ++i)
+        want[i] = 0.5f * x[i] * (1.0f + (float)std::erf((double)(x[i] * 0.70710678118654752f)));
+    const std::vector<float> got = down_bf16(dy, want.size());
+    int64_t off = 0;
+    for (size_t i = 0; i < want.size(); ++i)
+        if (h_to_bf16(got[i]) != h_to_bf16(want[i])) ++off;
+    const double rl = rel(got, want);
+    ok(fmt("gelu_bf16 numerics (rel_l2 %.3g, %lld of %zu off libref's bf16)", rl, (long long)off,
+           want.size()).c_str(), rl < 2e-3);
+}
+
+/* qk_norm_rope with f32 gains at a Gemma-style text encoder's geometry (head_dim 256, four query
+ * heads over one KV head, gain 1 + w): the same values as bf16 gains give the same bytes, and both
+ * follow libref's form (the norm rounded, then rotated). */
+void qk_norm_rope_f32_gain_case(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "qk_norm_rope_bf16");
+    if (!r) { ok("qk_norm_rope_bf16 f32 gains", false, "row absent"); return; }
+    const int64_t M = 24, hd = 256, nh = 4, nkv = 1, width = (nh + 2 * nkv) * hd, half = hd / 2;
+    const float theta = 10000.0f, eps = 1e-6f;
+    std::vector<float> x = randv((size_t)(M * width), 2.0f);
+    std::vector<float> qg = randv((size_t)hd, 0.5f), kg = randv((size_t)hd, 0.5f);
+    for (auto& v : qg) v = bfr(v);
+    for (auto& v : kg) v = bfr(v);
+    std::vector<int32_t> pos((size_t)M);
+    for (int64_t m = 0; m < M; ++m) pos[(size_t)m] = (int32_t)(m * 3);
+    void* dp = up_i32(pos);
+    std::vector<std::vector<float>> outs;
+    for (const bool f32 : { false, true }) {
+        std::vector<float> xx = x;
+        void* dq = up_bf16(xx);
+        std::vector<float> a = qg, b = kg;
+        void* dqw = f32 ? up_f32(a) : up_bf16(a);
+        void* dkw = f32 ? up_f32(b) : up_bf16(b);
+        const uint32_t gdt = f32 ? RAD_F32 : RAD_BF16;
+        const int rc = launch(r, { T(dq, RAD_BF16, { M, width }), T(dp, RAD_I32, { M }),
+                                   T(dqw, gdt, { hd }), T(dkw, gdt, { hd }) },
+                              { PI("M", M), PI("head_dim", hd), PI("n_head", nh), PI("n_head_kv", nkv),
+                                PF("theta", (double)theta), PF("eps", (double)eps), PS("mode", "neox"),
+                                PF("wadd", 1.0) });
+        if (rc != RAD_OK) {
+            ok("qk_norm_rope_bf16 f32 gains", false, fmt("%s gains rc %d", f32 ? "f32" : "bf16", rc));
+            return;
+        }
+        outs.push_back(down_bf16(dq, (size_t)(M * width)));
+        if (!f32) x = xx;
+    }
+    const int64_t bad = differ(outs[0], outs[1]);
+    ok("qk_norm_rope_bf16 f32 gains give the bf16 gains' bytes", bad == 0,
+       fmt("%lld of %zu elements differ", (long long)bad, outs[0].size()));
+    std::vector<float> want = x;
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t h = 0; h < nh + nkv; ++h) {
+            const std::vector<float>& g = h < nh ? qg : kg;
+            const size_t base = (size_t)(m * width + h * hd);
+            double ss = 0;
+            for (int64_t e = 0; e < hd; ++e) ss += (double)x[base + (size_t)e] * x[base + (size_t)e];
+            const float sc = 1.0f / std::sqrt((float)(ss / hd) + eps);
+            std::vector<float> n((size_t)hd);
+            for (int64_t e = 0; e < hd; ++e)
+                n[(size_t)e] = bfr(x[base + (size_t)e] * sc * (g[(size_t)e] + 1.0f));
+            for (int64_t i = 0; i < half; ++i) {
+                const float inv = 1.0f / powf(theta, (float)(2 * i) / (float)hd);
+                float sn, cs;
+                sincosf((float)pos[(size_t)m] * inv, &sn, &cs);
+                want[base + (size_t)i] = n[(size_t)i] * cs - n[(size_t)(i + half)] * sn;
+                want[base + (size_t)(i + half)] = n[(size_t)i] * sn + n[(size_t)(i + half)] * cs;
+            }
+        }
+    check("qk_norm_rope_bf16 f32 gains numerics", outs[1], want, 1e-2);
+}
+
+/* mul_weight over an f32 weight, a row and a scalar: one multiply, one rounding, exact. */
+void mul_weight_f32_case(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "mul_weight_bf16");
+    if (!r) { ok("mul_weight_bf16 f32", false, "row absent"); return; }
+    const int64_t M = 7, n = 512;
+    for (const int64_t wn : { n, (int64_t)1 }) {
+        std::vector<float> x = randv((size_t)(M * n), 3.0f), w = randv((size_t)wn, 0.01f);
+        void* dx = up_bf16(x);
+        void* dw = up_f32(w);
+        void* dy = dalloc((size_t)(M * n) * 2);
+        const int rc = launch(r, { T(dx, RAD_BF16, { M, n }), T(dw, RAD_F32, { wn }),
+                                   T(dy, RAD_BF16, { M, n }) },
+                              { PI("M", M), PI("n", n), PS("dtype", "bf16") });
+        const std::string nm = fmt("mul_weight_bf16 f32 weight of %lld", (long long)wn);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> want(x.size());
+        for (int64_t m = 0; m < M; ++m)
+            for (int64_t i = 0; i < n; ++i)
+                want[(size_t)(m * n + i)] = bfr(x[(size_t)(m * n + i)] * w[(size_t)(wn == 1 ? 0 : i)]);
+        const int64_t bad = differ(down_bf16(dy, want.size()), want);
+        ok((nm + " exact").c_str(), bad == 0, fmt("%lld elements differ", (long long)bad));
+    }
+}
+
+/* iota with and without a period. Exact. */
+void iota_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "iota");
+    if (!r) { ok("iota", false, "row absent"); return; }
+    for (const int64_t period : { (int64_t)0, (int64_t)16 }) {
+        const int64_t n = 70;
+        void* dy = dalloc((size_t)n * 4);
+        std::vector<RadParam> ps = { PI("M", n), PI("start", 3), PI("step", 2) };
+        if (period) ps.push_back(PI("period", period));
+        const int rc = launch(r, { T(dy, RAD_I32, { n }) }, ps);
+        const std::string nm = fmt("iota period %lld", (long long)period);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<int32_t> want((size_t)n);
+        for (int64_t i = 0; i < n; ++i) want[(size_t)i] = (int32_t)(3 + (period ? i % period : i) * 2);
+        const int64_t bad = differ(down_i32(dy, (size_t)n), want);
+        ok((nm + " exact").c_str(), bad == 0, fmt("%lld entries differ", (long long)bad));
+    }
+}
+
+}  /* namespace au */
+
+/* ---- the video generator's ops, at MiniMax-H3's geometry -----------------------------------------
+ *
+ * A request's latent geometry is a device operand the decoder's kernels read on the device.
+ * rad-kbench's index operands are constant-filled, which cannot express a (frames, H, W) whose
+ * values differ, so these cases build it by hand: a patch grid taller than it is wide, tiles that
+ * overlap unevenly, more tiles one way than the other, and every (first, last) pair of the stitch
+ * with the previous chunk's tail in `prev`. Each case compares with the host port of its libref
+ * function (libref/ref_video.cpp, ref_gen.cpp, ref_audio.cpp): bit for bit where the kernel keeps
+ * the reference's order, to a relative L2 where it sums in another order or calls the device's
+ * sin and exp. */
+namespace vid {
+
+using namespace au;
+
+/* libref's split_tiles. */
+bool split(int64_t len, int64_t tile, int64_t overlap, std::vector<int64_t>* st,
+           std::vector<int64_t>* ov) {
+    st->clear();
+    ov->clear();
+    if (tile >= len) {
+        st->push_back(0);
+        return len == tile;
+    }
+    int64_t n = (len + tile - 1) / tile;
+    while (tile * n - overlap * (n - 1) - len < 0) ++n;
+    ov->assign((size_t)(n - 1), overlap);
+    const int64_t rem = tile * n - overlap * (n - 1) - len;
+    for (int64_t i = 0; i < rem; ++i) (*ov)[(size_t)(i % (n - 1))] += 1;
+    st->push_back(0);
+    for (int64_t i = 0; i + 1 < n; ++i) st->push_back(st->back() + tile - (*ov)[(size_t)i]);
+    return true;
+}
+
+std::string list_of(const std::vector<float>& v) {
+    std::string s;
+    for (size_t i = 0; i < v.size(); ++i) s += fmt("%s%.9g", i ? " " : "", (double)v[i]);
+    return s;
+}
+
+/* patch_unfold over a 3 x 4 x 5 patch grid, one and two frames a patch. */
+void patch_unfold_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "patch_unfold_f32");
+    if (!r) { ok("patch_unfold_f32", false, "row absent"); return; }
+    const int64_t C = 24, F = 3, Hp = 4, Wp = 5, ph = 2, pw = 2;
+    std::vector<float> mul = randv((size_t)C, 1.3f), add = randv((size_t)C, 0.7f);
+    const std::string smul = list_of(mul), sadd = list_of(add);
+    for (const int64_t pt : { (int64_t)1, (int64_t)2 }) {
+        const int64_t K = C * pt * ph * pw, rows = F * pt * Hp * ph * Wp * pw, M = rows + 5;
+        std::vector<float> x = randv((size_t)(F * Hp * Wp * K), 2.0f);
+        void* dx = up_f32(x);
+        void* dy = dalloc((size_t)(M * C) * 4);
+        const std::string nm = fmt("patch_unfold_f32 pt %lld", (long long)pt);
+        const int rc = launch(r, { T(dx, RAD_F32, { F * Hp * Wp, K }),
+                                   TI32({ 3 }, { (int32_t)F, (int32_t)Hp, (int32_t)Wp }),
+                                   T(dy, RAD_F32, { M, C }) },
+                              { PI("M", M), PI("C", C), PI("pt", pt), PI("ph", ph), PI("pw", pw),
+                                PS("mul", smul.c_str()), PS("add", sadd.c_str()),
+                                PS("dtype", "f32") });
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> want((size_t)(M * C), 0.0f);
+        const int64_t Hv = Hp * ph, Wv = Wp * pw;
+        for (int64_t rr = 0; rr < rows; ++rr) {
+            const int64_t t = rr / (Hv * Wv), yy = (rr / Wv) % Hv, xx = rr % Wv;
+            const int64_t patch = ((t / pt) * Hp + yy / ph) * Wp + xx / pw;
+            const int64_t sub = ((t % pt) * ph + yy % ph) * pw + xx % pw;
+            for (int64_t c = 0; c < C; ++c) {
+                const float p = x[(size_t)(patch * K + c * pt * ph * pw + sub)] * mul[(size_t)c];
+                want[(size_t)(rr * C + c)] = p + add[(size_t)c];
+            }
+        }
+        const int64_t bad = differ(down_f32(dy, want.size()), want);
+        ok((nm + " exact, rows past the geometry untouched").c_str(), bad == 0,
+           fmt("%lld values differ", (long long)bad));
+    }
+}
+
+/* vtile_gather: a 20 x 35 latent of 2 frames in tiles of 16 at least 4 apart (overlaps 12 down,
+ * 7 and 6 across), four registers and three zero rows a tile. */
+void vtile_gather_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "vtile_gather");
+    if (!r) { ok("vtile_gather", false, "row absent"); return; }
+    const int64_t frames = 2, H = 20, W = 35, tile = 16, ov = 4, n_reg = 4, n = 64;
+    const int64_t vox = frames * tile * tile, period = vox + n_reg + 3;
+    std::vector<int64_t> sy, sx, oy, ox;
+    split(H, tile, ov, &sy, &oy);
+    split(W, tile, ov, &sx, &ox);
+    const int64_t nw = (int64_t)sx.size(), rows = (int64_t)sy.size() * nw * period;
+    for (const bool bf : { false, true }) {
+        std::vector<float> x = randv((size_t)(frames * H * W * n), 1.0f);
+        std::vector<float> reg = randv((size_t)(n_reg * n), 1.0f);
+        void* dx = bf ? up_bf16(x) : up_f32(x);
+        void* dr = up_f32(reg);
+        const uint32_t dt = bf ? RAD_BF16 : RAD_F32;
+        void* dy = dalloc((size_t)(rows * n) * (bf ? 2 : 4));
+        const std::string nm = fmt("vtile_gather %s 20 x 35 in 2 x 3 tiles", bf ? "bf16" : "f32");
+        const int rc = launch(r, { T(dx, dt, { frames * H * W, n }), T(dr, RAD_F32, { n_reg, n }),
+                                   TI32({ 3 }, { (int32_t)frames, (int32_t)H, (int32_t)W }),
+                                   T(dy, dt, { rows, n }) },
+                              { PI("M", rows), PI("n", n), PI("tile", tile), PI("overlap", ov),
+                                PI("frames", frames), PI("period", period), PI("n_reg", n_reg),
+                                PS("dtype", bf ? "bf16" : "f32") });
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> want((size_t)(rows * n), 0.0f);
+        for (int64_t row = 0; row < rows; ++row) {
+            const int64_t k = row / period, p = row % period;
+            for (int64_t c = 0; c < n; ++c) {
+                float v = 0.0f;
+                if (p < vox) {
+                    const int64_t t = p / (tile * tile), iy = (p / tile) % tile, ix = p % tile;
+                    const int64_t src = (t * H + sy[(size_t)(k / nw)] + iy) * W + sx[(size_t)(k % nw)] + ix;
+                    v = x[(size_t)(src * n + c)];
+                } else if (p < vox + n_reg) {
+                    v = bf ? bfr(reg[(size_t)((p - vox) * n + c)]) : reg[(size_t)((p - vox) * n + c)];
+                }
+                want[(size_t)(row * n + c)] = v;
+            }
+        }
+        const std::vector<float> got = bf ? down_bf16(dy, want.size()) : down_f32(dy, want.size());
+        const int64_t bad = differ(got, want);
+        ok((nm + " exact").c_str(), bad == 0, fmt("%lld values differ", (long long)bad));
+    }
+}
+
+/* libref's ref_vtile_stitch on the host, over bf16 tiles and a bf16 `prev`, which it updates. */
+std::vector<uint8_t> stitch_ref(const std::vector<float>& x, std::vector<float>* prev,
+                                int64_t frames, int64_t H, int64_t W, bool first, bool last,
+                                int64_t tile, int64_t ov, int64_t S, int64_t pt, int64_t skip,
+                                int64_t keep, int64_t blend, int64_t period, const float* mean,
+                                const float* stdv) {
+    (void)frames;
+    std::vector<int64_t> sy, sx, oy, ox;
+    split(H, tile, ov, &sy, &oy);
+    split(W, tile, ov, &sx, &ox);
+    const int64_t nh = (int64_t)sy.size(), nw = (int64_t)sx.size(), cols = 3 * pt * S * S;
+    const int64_t Hp = H * S, Wp = W * S, npx = Hp * Wp, fout = keep + (last ? blend : 0);
+    std::vector<uint8_t> y((size_t)(fout * npx * 3), 0);
+    auto wb = [&](int64_t p, int64_t e) { return bfr((float)p / (float)e); };
+    auto wa = [&](int64_t p, int64_t e) { return bfr(1.0f - bfr((float)p / (float)e)); };
+    auto Tv = [&](int64_t i, int64_t j, int64_t ly, int64_t lx, int64_t fc, int64_t c) {
+        const int64_t row = (i * nw + j) * period + ((fc / pt) * tile + ly / S) * tile + lx / S;
+        const int64_t col = ((c * pt + fc % pt) * S + ly % S) * S + lx % S;
+        return x[(size_t)(row * cols + col)];
+    };
+    for (int64_t px = 0; px < npx; ++px) {
+        const int64_t Y = px / Wp, X = px % Wp;
+        int64_t i = 0, j = 0;
+        while (i + 1 < nh && Y >= sy[(size_t)(i + 1)] * S) ++i;
+        while (j + 1 < nw && X >= sx[(size_t)(j + 1)] * S) ++j;
+        const int64_t ly = Y - sy[(size_t)i] * S, lx = X - sx[(size_t)j] * S;
+        auto stitch = [&](int64_t fc, int64_t c) {
+            float v = Tv(i, j, ly, lx, fc, c);
+            const int64_t ev = i > 0 ? oy[(size_t)(i - 1)] * S : 0;
+            if (ly < ev) {
+                const float up = Tv(i - 1, j, ly + tile * S - ev, lx, fc, c);
+                v = bfr(bfr(up * wa(ly, ev)) + bfr(v * wb(ly, ev)));
+            }
+            const int64_t eh = j > 0 ? ox[(size_t)(j - 1)] * S : 0;
+            if (lx < eh) {
+                const float left = Tv(i, j - 1, ly, lx + tile * S - eh, fc, c);
+                v = bfr(bfr(left * wa(lx, eh)) + bfr(v * wb(lx, eh)));
+            }
+            return v;
+        };
+        auto byte = [&](int64_t f, int64_t c, float v) {
+            float p = v * stdv[c];
+            p = p + mean[c];
+            p = p < 0.0f ? 0.0f : (p > 1.0f ? 1.0f : p);
+            p = p * 255.0f;
+            const float q = p != p ? 0.0f : std::nearbyintf(p);
+            y[(size_t)((f * npx + px) * 3 + c)] = (uint8_t)(q < 0.0f ? 0.0f : (q > 255.0f ? 255.0f : q));
+        };
+        for (int64_t c = 0; c < 3; ++c) {
+            for (int64_t k = 0; k < keep; ++k) {
+                float v = stitch(skip + k, c);
+                if (!first && k < blend) {
+                    const float pv = (*prev)[(size_t)((k * npx + px) * 3 + c)];
+                    v = bfr(bfr(pv * wa(k, blend)) + bfr(v * wb(k, blend)));
+                }
+                byte(k, c, v);
+            }
+            for (int64_t k = 0; k < blend; ++k) {
+                const float v = stitch(2 * skip + keep + k, c);
+                if (last) byte(keep + k, c, v);
+                (*prev)[(size_t)((k * npx + px) * 3 + c)] = bfr(v);
+            }
+        }
+    }
+    return y;
+}
+
+/* vtile_stitch: a small geometry under every (first, last) pair, then MiniMax-H3's own parameters
+ * over a 20 x 35 latent (2 x 3 tiles, uneven overlaps) as a middle and a last chunk. */
+void vtile_stitch_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "vtile_stitch");
+    if (!r) { ok("vtile_stitch", false, "row absent"); return; }
+    static const float kMean[3] = { 0.485f, 0.456f, 0.406f }, kStd[3] = { 0.229f, 0.224f, 0.225f };
+    struct G { int64_t frames, H, W, tile, ov, S, pt, skip, keep, blend; int first, last; };
+    std::vector<G> gs;
+    for (int fl = 0; fl < 4; ++fl) gs.push_back({ 4, 6, 9, 4, 1, 2, 2, 1, 3, 2, fl & 1, fl >> 1 });
+    gs.push_back({ 7, 20, 35, 16, 4, 16, 4, 3, 17, 5, 0, 0 });
+    gs.push_back({ 7, 20, 35, 16, 4, 16, 4, 3, 17, 5, 0, 1 });
+    for (const G& g : gs) {
+        std::vector<int64_t> sy, sx, oy, ox;
+        split(g.H, g.tile, g.ov, &sy, &oy);
+        split(g.W, g.tile, g.ov, &sx, &ox);
+        const int64_t period = g.frames * g.tile * g.tile + 5, cols = 3 * g.pt * g.S * g.S;
+        const int64_t tiles = (int64_t)(sy.size() * sx.size()), npx = g.H * g.S * g.W * g.S;
+        const int64_t fout = g.keep + (g.last ? g.blend : 0);
+        std::vector<float> x = randv((size_t)(tiles * period * cols), 2.5f);
+        std::vector<float> prev = randv((size_t)(g.blend * npx * 3), 2.5f);
+        void* dx = up_bf16(x);
+        void* dp = up_bf16(prev);
+        void* dy = dalloc((size_t)(fout * npx * 3));
+        const std::string nm = fmt("vtile_stitch %lld x %lld tile %lld first %d last %d",
+                                   (long long)g.H, (long long)g.W, (long long)g.tile, g.first, g.last);
+        const int rc = launch(r, { T(dx, RAD_BF16, { tiles * period, cols }),
+                                   TI32({ 5 }, { (int32_t)g.frames, (int32_t)g.H, (int32_t)g.W,
+                                                 g.first, g.last }),
+                                   T(dp, RAD_BF16, { g.blend * npx, 3 }),
+                                   T(dy, RAD_U8, { fout * npx, 3 }) },
+                              { PI("M", fout * npx), PI("tile", g.tile), PI("overlap", g.ov),
+                                PI("scale", g.S), PI("pt", g.pt), PI("skip", g.skip),
+                                PI("keep", g.keep), PI("blend", g.blend), PI("period", period),
+                                PS("mean", "0.485 0.456 0.406"), PS("std", "0.229 0.224 0.225") });
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        const std::vector<uint8_t> want =
+            stitch_ref(x, &prev, g.frames, g.H, g.W, g.first != 0, g.last != 0, g.tile, g.ov, g.S,
+                       g.pt, g.skip, g.keep, g.blend, period, kMean, kStd);
+        std::vector<uint8_t> got(want.size());
+        st_memcpy(got.data(), dy, got.size(), hipMemcpyDeviceToHost);
+        const int64_t bad = differ(got, want), badp = differ(down_bf16(dp, prev.size()), prev);
+        ok((nm + " bytes exact").c_str(), bad == 0, fmt("%lld bytes differ", (long long)bad));
+        ok((nm + " handed-on tail exact").c_str(), badp == 0,
+           fmt("%lld values differ", (long long)badp));
+    }
+}
+
+
+/* rms_mod and rms_mod_quant_fp8 at the DiT's width over three segments, the table and the gate a
+ * column slice of a wider row as the plugin reads them, gated and not. The residual is exact; the
+ * norm chain is held to a relative L2 (the sum of squares is a block sum on the device), and the
+ * codes are compared by their dequantised values. */
+void rms_mod_cases(const Plugin& pl, bool quant) {
+    const char* name = quant ? "rms_mod_quant_fp8_bf16" : "rms_mod_bf16";
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { ok(name, false, "row absent"); return; }
+    const int64_t n = 5376, M = 7, segs = 3, pitch = 3 * n;
+    const std::vector<int32_t> cu = { 0, 2, 5, 7 };
+    for (const int gated : { 0, 1 }) {
+        std::vector<float> x = randv((size_t)(M * n), 2.0f), y = randv((size_t)(M * n), 1.0f);
+        std::vector<float> tab = randv((size_t)(segs * pitch), 0.5f), w = randv((size_t)n, 1.0f);
+        void* dx = up_bf16(x);
+        void* dyd = up_bf16(y);
+        void* dt = up_bf16(tab);
+        void* dw = up_bf16(w);
+        void* dcu = up_i32(cu);
+        /* s = columns [n, 3n) of the table (shift, scale), g = columns [0, n). */
+        RadTensor ts = T((char*)dt + n * 2, RAD_BF16, { segs, 2 * n });
+        ts.stride[0] = pitch;
+        RadTensor tg = T(dt, RAD_BF16, { segs, n });
+        tg.stride[0] = pitch;
+        RadTensor ty = T(dyd, RAD_BF16, { M, n });
+        if (!gated) { absent(ty); absent(tg); }
+        void* dz = dalloc((size_t)(M * n) * 2);
+        void* dq = dalloc((size_t)(M * n));
+        void* dqs = dalloc((size_t)(M * n / 128) * 4);
+        std::vector<RadTensor> args = { ty, tg, ts, T(dw, RAD_BF16, { n }), T(dcu, RAD_I32, { 4 }),
+                                        T(dx, RAD_BF16, { M, n }) };
+        std::vector<RadParam> ps = { PI("M", M), PI("n", n), PF("eps", 1e-5), PI("gated", gated),
+                                     PS("dtype", "bf16") };
+        if (quant) {
+            args.push_back(T(dq, RAD_F8E4M3, { M, n }));
+            args.push_back(T(dqs, RAD_F32, { M, n / 128 }));
+            ps.push_back(PI("group", 128));
+        }
+        args.push_back(T(dz, RAD_BF16, { M, n }));
+        const std::string nm = fmt("%s gated %d", name, gated);
+        const int rc = launch(r, args, ps);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> xr = x, want((size_t)(M * n));
+        for (int64_t row = 0; row < M; ++row) {
+            const int64_t e = seq_of(cu, row);
+            float* xv = xr.data() + row * n;
+            if (gated)
+                for (int64_t i = 0; i < n; ++i)
+                    xv[i] = bfr(xv[i] + bfr(tab[(size_t)(e * pitch + i)] * y[(size_t)(row * n + i)]));
+            float ss = 0.0f;
+            for (int64_t i = 0; i < n; ++i) ss += xv[i] * xv[i];
+            const float rs = 1.0f / std::sqrt(ss / (float)n + 1e-5f);
+            for (int64_t i = 0; i < n; ++i) {
+                const float n2 = bfr(bfr(xv[i] * rs) * w[(size_t)i]);
+                const float sc = bfr(1.0f + tab[(size_t)(e * pitch + 2 * n + i)]);
+                want[(size_t)(row * n + i)] = bfr(bfr(n2 * sc) + tab[(size_t)(e * pitch + n + i)]);
+            }
+        }
+        const int64_t badx = differ(down_bf16(dx, xr.size()), xr);
+        ok((nm + " residual exact").c_str(), badx == 0, fmt("%lld values differ", (long long)badx));
+        check(nm + " norm", down_bf16(dz, want.size()), want, 4e-3);
+        if (quant) {
+            std::vector<uint8_t> q((size_t)(M * n));
+            st_memcpy(q.data(), dq, q.size(), hipMemcpyDeviceToHost);
+            const std::vector<float> qs = down_f32(dqs, (size_t)(M * n / 128));
+            std::vector<float> deq((size_t)(M * n));
+            for (size_t i = 0; i < deq.size(); ++i)
+                deq[i] = rad_fp8e4m3_to_f32(q[i]) * qs[i / 128];
+            check(nm + " codes", deq, want, 4e-2);
+        }
+    }
+}
+
+/* flow_x0_step: an f32 and a bf16 velocity, rows at a wider pitch; every value exact. */
+void flow_x0_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "flow_x0_step_f32");
+    if (!r) { ok("flow_x0_step_f32", false, "row absent"); return; }
+    const int64_t M = 37, n = 96, ld = 100;
+    for (const bool bf : { false, true }) {
+        std::vector<float> x = randv((size_t)(M * ld), 3.0f), v = randv((size_t)(M * n), 2.0f);
+        const std::vector<float> t = { 0.3125f }, sg = { 0.6875f }, sgn = { 0.40625f };
+        void* dx = up_f32(x);
+        void* dv = bf ? up_bf16(v) : up_f32(v);
+        RadTensor tx = T(dx, RAD_F32, { M, n });
+        tx.stride[0] = ld;
+        const std::string nm = fmt("flow_x0_step_f32 %s velocity", bf ? "bf16" : "f32");
+        const int rc = launch(r, { T(dv, bf ? RAD_BF16 : RAD_F32, { M, n }),
+                                   T(up_f32(t), RAD_F32, { 1 }), T(up_f32(sg), RAD_F32, { 1 }),
+                                   T(up_f32(sgn), RAD_F32, { 1 }), tx },
+                              { PI("M", M), PI("n", n), PS("dtype", "f32") });
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> want = x;
+        const float st = 1.0f - t[0], ra = sgn[0] / sg[0], omr = 1.0f - ra;
+        for (int64_t row = 0; row < M; ++row)
+            for (int64_t c = 0; c < n; ++c) {
+                const float xv = x[(size_t)(row * ld + c)];
+                const float p = st * v[(size_t)(row * n + c)];
+                const float d = xv + p;
+                const float a = ra * xv, b = omr * d;
+                want[(size_t)(row * ld + c)] = a + b;
+            }
+        const int64_t bad = differ(down_f32(dx, want.size()), want);
+        ok((nm + " exact, the pitch's gap untouched").c_str(), bad == 0,
+           fmt("%lld values differ", (long long)bad));
+    }
+}
+
+/* grid_pos3: MiniMax-H3's tile of 7 x 16 x 16 and its registers over two periods, written into a
+ * [3, M] view of a wider plane; exact. */
+void grid_pos3_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "grid_pos3");
+    if (!r) { ok("grid_pos3", false, "row absent"); return; }
+    const int64_t T_ = 7, H = 16, W = 16, period = 1797, M = 2 * period, ld = M + 11;
+    const float scale = (float)6.283185307179586;
+    void* dy = dalloc((size_t)(3 * ld) * 4);
+    RadTensor ty = T(dy, RAD_F32, { 3, M });
+    ty.stride[0] = ld;
+    const int rc = launch(r, { ty }, { PI("M", M), PI("T", T_), PI("H", H), PI("W", W),
+                                       PI("period", period), PF("scale", 6.283185307179586) });
+    if (rc != RAD_OK) { ok("grid_pos3", false, "rc " + std::to_string(rc)); return; }
+    std::vector<float> want((size_t)(3 * ld), 0.0f);
+    auto g = [](int64_t c, int64_t nn) {
+        const float q = ((float)c + 0.5f) / (float)nn;
+        const float d = 2.0f * q;
+        return d - 1.0f;
+    };
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t k = m % period;
+        if (k >= T_ * H * W) continue;
+        want[(size_t)m] = scale * g(k / (H * W), T_);
+        want[(size_t)(ld + m)] = scale * g((k / W) % H, H);
+        want[(size_t)(2 * ld + m)] = scale * g(k % W, W);
+    }
+    const int64_t bad = differ(down_f32(dy, want.size()), want);
+    ok("grid_pos3 7 x 16 x 16, two periods, exact", bad == 0, fmt("%lld values differ", (long long)bad));
+}
+
+/* snake_aa: BigVGAN's ratio 2 and 12-tap filters over a stereo pair of unequal sequences, alpha
+ * and beta as logarithms; and an odd filter at ratio 3. Against libref's arithmetic in f32 with
+ * the host's sin and exp. */
+void snake_aa_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "snake_aa_f32");
+    if (!r) { ok("snake_aa_f32", false, "row absent"); return; }
+    struct C { int64_t R, k, lg; std::vector<int32_t> cu; };
+    for (const C& c : { C{ 2, 12, 1, { 0, 23, 61 } }, C{ 3, 7, 0, { 0, 5, 9 } } }) {
+        const int64_t n = 40, M = c.cu.back();
+        std::vector<float> x = randv((size_t)(M * n), 2.0f), al(n), be(n);
+        for (int64_t i = 0; i < n; ++i) {
+            al[(size_t)i] = c.lg ? rnd() * 0.5f : 0.3f + std::fabs(rnd());
+            be[(size_t)i] = c.lg ? rnd() * 0.5f : 0.3f + std::fabs(rnd());
+        }
+        std::vector<float> fu = randv((size_t)c.k, 0.4f), fd = randv((size_t)c.k, 0.4f);
+        void* dy = dalloc((size_t)(M * n) * 4);
+        const std::string nm = fmt("snake_aa_f32 ratio %lld k %lld%s", (long long)c.R,
+                                   (long long)c.k, c.lg ? " log" : "");
+        const int rc = launch(r, { T(up_f32(x), RAD_F32, { M, n }), T(up_f32(al), RAD_F32, { n }),
+                                   T(up_f32(be), RAD_F32, { n }), T(up_f32(fu), RAD_F32, { 1, 1, c.k }),
+                                   T(up_f32(fd), RAD_F32, { 1, 1, c.k }),
+                                   T(up_i32(c.cu), RAD_I32, { (int64_t)c.cu.size() }),
+                                   T(dy, RAD_F32, { M, n }) },
+                              { PI("M", M), PI("n", n), PI("ratio", c.R), PI("k", c.k),
+                                PI("log", c.lg), PS("dtype", "f32") });
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> want((size_t)(M * n));
+        const int64_t R = c.R, k = c.k, P = k / R - 1, crop = P * R + (k - R) / 2;
+        const int64_t pad = k / 2 - (k % 2 == 0 ? 1 : 0);
+        for (size_t e = 0; e + 1 < c.cu.size(); ++e) {
+            const int64_t s0 = c.cu[e], L = c.cu[e + 1] - s0;
+            for (int64_t ch = 0; ch < n; ++ch) {
+                const float A = c.lg ? (float)std::exp((double)al[(size_t)ch]) : al[(size_t)ch];
+                const float B = c.lg ? (float)std::exp((double)be[(size_t)ch]) : be[(size_t)ch];
+                auto xp = [&](int64_t i) {
+                    const int64_t q = std::min(std::max<int64_t>(i - P, 0), L - 1);
+                    return x[(size_t)((s0 + q) * n + ch)];
+                };
+                std::vector<float> act((size_t)(L * R));
+                for (int64_t m = 0; m < L * R; ++m) {
+                    const int64_t o = crop + m;
+                    const int64_t lo = o < k ? 0 : (o - k) / R + 1, hi = std::min(o / R, L + 2 * P - 1);
+                    float acc = 0.0f;
+                    for (int64_t i = lo; i <= hi; ++i) acc += fu[(size_t)(o - i * R)] * xp(i);
+                    const float u = (float)R * acc;
+                    const float sn = (float)std::sin((double)(u * A));
+                    act[(size_t)m] = u + 1.0f / (B + 1e-9f) * (sn * sn);
+                }
+                for (int64_t o = 0; o < L; ++o) {
+                    float acc = 0.0f;
+                    for (int64_t j = 0; j < k; ++j) {
+                        const int64_t m = std::min(std::max<int64_t>(o * R + j - pad, 0), L * R - 1);
+                        acc += fd[(size_t)j] * act[(size_t)m];
+                    }
+                    want[(size_t)((s0 + o) * n + ch)] = acc;
+                }
+            }
+        }
+        const std::vector<float> got = down_f32(dy, want.size());
+        double e2 = 0, r2 = 0;
+        for (size_t i = 0; i < want.size(); ++i) {
+            e2 += (double)(got[i] - want[i]) * (got[i] - want[i]);
+            r2 += (double)want[i] * want[i];
+        }
+        const double rl = std::sqrt(e2 / r2);
+        ok(fmt("%s numerics (rel_l2 %.3g, bound 1e-5)", nm.c_str(), rl).c_str(), rl <= 1e-5);
+    }
+}
+
+}  /* namespace vid */
+
+/* ---- a video generator's f32 forms, its biased GEMMs and its rotary, against libref's arithmetic
+ *
+ * A diffusion transformer's patch projections and heads, its timestep MLP and a video decoder's
+ * 1x1 projections are gemm_nt_bias at f32; its modulation projections gemm_nt_q_bias at fp8a8 into
+ * a column block of a wider table; its decoder's norms, layer scales and residual adds f32 forms of
+ * rmsnorm, layernorm, mul_weight and add; its vocoder f32 convolutions; its attention the axial
+ * qk_norm_rope over f32 positions. Each case compares with a host port of the libref function:
+ * an f32 output to a relative L2 of 2e-5 (rad-kbench's f32 GEMM bound), a bf16 one against the
+ * answer rounded to bf16, a copy or a single rounding exactly. */
+namespace vg {
+
+using namespace au;
+
+double rel_f32(const std::vector<float>& got, const std::vector<float>& want) {
+    double e = 0, r = 0;
+    for (size_t i = 0; i < want.size(); ++i) {
+        e += ((double)got[i] - want[i]) * ((double)got[i] - want[i]);
+        r += (double)want[i] * want[i];
+    }
+    return r > 0 ? std::sqrt(e / r) : std::sqrt(e);
+}
+void check_f32(const std::string& name, const std::vector<float>& got,
+               const std::vector<float>& want, double tol) {
+    const double r = rel_f32(got, want);
+    ok(fmt("%s (rel_l2 %.3g, bound %.3g)", name.c_str(), r, tol).c_str(), r <= tol);
+}
+float gelu_erf(float x) { return 0.5f * x * (1.0f + (float)std::erf((double)(x * 0.70710678118654752f))); }
+float gelu_tanh(float x) {
+    const float k0 = 0.7978845608028654f, k1 = 0.044715f;
+    return 0.5f * x * (1.0f + (float)std::tanh((double)(k0 * (x + k1 * x * x * x))));
+}
+
+/* An f32 weight as an f32 row stores it, through its relayout hook from PyTorch's layout. */
+void* stored_weight_f32(const RadKernelInfo* r, const std::vector<RadParam>& lp,
+                        const std::vector<float>& w, int64_t rows, int64_t cols, const char* what) {
+    Planes p;
+    p.enc = rad_enc_plain(RAD_F32);
+    p.rows = { rows };
+    p.cols = { cols };
+    p.data.assign(1, std::vector<uint8_t>(w.size() * 4));
+    std::memcpy(p.data[0].data(), w.data(), w.size() * 4);
+    std::vector<uint8_t> blob;
+    const int rc = stored(r, lp, 1, p, { "codes" }, &blob);
+    if (rc != RAD_OK) {
+        ok(what, false, "relayout rc " + std::to_string(rc));
+        return nullptr;
+    }
+    std::string why;
+    ok(fmt("%s: the stored weight inverts to PyTorch's", what).c_str(),
+       restores(r, lp, 1, p, { "codes" }, blob, &why), why);
+    void* d = dalloc(blob.size());
+    if (d) st_memcpy(d, blob.data(), blob.size(), hipMemcpyHostToDevice);
+    return d;
+}
+
+/* gemm_nt_bias at f32 at the shapes a video generator issues, the bf16 output of its patch
+ * projections among them, and the epilogue's activation and residual (the residual once the
+ * output itself), with A and C at pitches wider than their rows. */
+void gemm_f32_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "gemm_f32_nt_bias");
+    if (!r) { ok("gemm_f32_nt_bias", false, "row absent"); return; }
+    struct G { int64_t M, N, K, apad, cpad; bool bf16; int act; int res; };   /* res 2: y itself */
+    for (const G& g : { G{ 777, 5376, 96, 0, 0, true, 0, 0 }, G{ 300, 96, 5376, 0, 0, false, 0, 0 },
+                        G{ 200, 32, 5376, 0, 0, false, 0, 0 }, G{ 40, 2688, 5376, 0, 0, false, 0, 0 },
+                        G{ 70, 5376, 256, 0, 0, false, 0, 0 }, G{ 1000, 24, 24, 0, 0, false, 0, 0 },
+                        G{ 500, 2048, 24, 0, 0, false, 0, 0 }, G{ 33, 70, 37, 5, 6, true, 1, 2 },
+                        G{ 19, 130, 19, 0, 3, false, 2, 1 }, G{ 65, 64, 300, 3, 0, true, 0, 1 } }) {
+        const int64_t lda = g.K + g.apad, ldc = g.N + g.cpad;
+        std::vector<float> a = randv((size_t)(g.M * lda), 1.0f), w = randv((size_t)(g.N * g.K), 0.1f);
+        std::vector<float> b = randv((size_t)g.N, 0.5f), res = randv((size_t)(g.M * ldc), 1.0f);
+        const uint32_t ydt = g.bf16 ? (uint32_t)RAD_BF16 : (uint32_t)RAD_F32;
+        if (g.bf16) for (auto& v : res) v = bfr(v);
+        void* da = up_f32(a);
+        void* dw = up_f32(w);
+        void* db = up_f32(b);
+        /* The output starts as the residual where the residual is the output. */
+        std::vector<float> y0(res.size(), 0.0f);
+        if (g.res == 2) y0 = res;
+        void* dy = g.bf16 ? up_bf16(y0) : up_f32(y0);
+        std::vector<float> rcopy = res;
+        void* dr = g.res == 1 ? (g.bf16 ? up_bf16(rcopy) : up_f32(rcopy)) : nullptr;
+        RadTensor ta = T(da, RAD_F32, { g.M, g.K });
+        ta.stride[0] = lda;
+        RadTensor ty = T(dy, ydt, { g.M, g.N });
+        ty.stride[0] = ldc;
+        RadTensor tr = g.res == 2 ? ty : T(dr, ydt, { g.M, g.N });
+        if (g.res == 1) tr.stride[0] = ldc;
+        if (!g.res) absent(tr);
+        std::vector<RadParam> ps = { PI("M", g.M), PI("N", g.N), PI("K", g.K), PS("dtype", "f32") };
+        if (g.act) ps.push_back(PS("act", g.act == 1 ? "gelu" : "gelu_tanh"));
+        const std::string nm = fmt("gemm_f32_nt_bias M %lld N %lld K %lld -> %s%s%s",
+                                   (long long)g.M, (long long)g.N, (long long)g.K,
+                                   g.bf16 ? "bf16" : "f32", g.act ? " +act" : "",
+                                   g.res == 2 ? " +res in place" : g.res ? " +res" : "");
+        const int rc = launch(r, { ta, T(dw, RAD_F32, { g.N, g.K }), T(db, RAD_F32, { g.N }), tr, ty },
+                              ps);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        const std::vector<float> all = g.bf16 ? down_bf16(dy, (size_t)(g.M * ldc))
+                                              : down_f32(dy, (size_t)(g.M * ldc));
+        std::vector<float> got((size_t)(g.M * g.N)), want((size_t)(g.M * g.N));
+        int64_t pad_moved = 0;
+        for (int64_t m = 0; m < g.M; ++m) {
+            for (int64_t n = 0; n < g.N; ++n) {
+                double acc = 0;
+                for (int64_t k = 0; k < g.K; ++k)
+                    acc += (double)a[(size_t)(m * lda + k)] * w[(size_t)(n * g.K + k)];
+                float t = (float)acc + b[(size_t)n];
+                if (g.bf16) t = bfr(t);
+                if (g.act) { t = g.act == 1 ? gelu_erf(t) : gelu_tanh(t); if (g.bf16) t = bfr(t); }
+                if (g.res) { t = res[(size_t)(m * ldc + n)] + t; if (g.bf16) t = bfr(t); }
+                want[(size_t)(m * g.N + n)] = t;
+                got[(size_t)(m * g.N + n)] = all[(size_t)(m * ldc + n)];
+            }
+            /* The columns past N keep what they held. */
+            for (int64_t n = g.N; n < ldc; ++n) {
+                const float before = g.res == 2 ? res[(size_t)(m * ldc + n)] : 0.0f;
+                if (all[(size_t)(m * ldc + n)] != before) ++pad_moved;
+            }
+        }
+        if (g.bf16) check(nm + " numerics", got, want, 1e-2);
+        else        check_f32(nm + " numerics", got, want, 2e-5);
+        if (g.cpad) ok((nm + " leaves the columns past N").c_str(), pad_moved == 0,
+                       fmt("%lld written", (long long)pad_moved));
+    }
+}
+
+/* gemm_nt_q_bias at fp8a8 at a modulation projection's geometry (N 16128 of K 2688, up to 64
+ * timesteps), into a column block of a table three blocks wide, and a small dense one. The host
+ * reads the same E4M3 codes and scales; only the summation order differs. */
+void gemm_q_bias_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "gemm_fp8a8_bias_nt_m16");
+    if (!r) { ok("gemm_fp8a8_bias_nt_m16", false, "row absent"); return; }
+    struct G { int64_t M, N, K; bool slice; };
+    for (const G& g : { G{ 1, 16128, 2688, true }, G{ 24, 16128, 2688, true },
+                        G{ 64, 16128, 2688, true }, G{ 5, 512, 640, false },
+                        G{ 40, 256, 384, true } }) {
+        const int64_t sn = (g.N + 127) / 128, sk = (g.K + 127) / 128;
+        std::vector<float> wf((size_t)(g.N * g.K));
+        for (int64_t i = 0; i < g.N * g.K; ++i)
+            wf[(size_t)i] = (float)((int)(st_mix32((uint32_t)i) % 2001) - 1000) * 5e-5f *
+                            (float)(1 + (i / g.K / 128) % 3);
+        const Planes p = fp8_block_planes(wf, g.N, g.K);
+        std::vector<RadParam> lp = { PI("N", g.N), PI("K", g.K), PI("group", 128) };
+        std::vector<uint8_t> wq, wsb;
+        const int rq = stored(r, lp, 2, p, { "codes" }, &wq);
+        const int rs = stored(r, lp, 3, p, { "scale" }, &wsb);
+        const std::string nm = fmt("gemm_fp8a8_bias_nt_m16 M %lld N %lld K %lld%s", (long long)g.M,
+                                   (long long)g.N, (long long)g.K, g.slice ? " into a column block" : "");
+        if (rq != RAD_OK || rs != RAD_E_UNSUPPORTED) {
+            ok(nm.c_str(), false, fmt("layout rc %d / %d", rq, rs));
+            continue;
+        }
+        std::vector<uint8_t> xq((size_t)(g.M * g.K));
+        for (size_t i = 0; i < xq.size(); ++i) xq[i] = st_rand_e4m3((uint32_t)i * 7u + 3u);
+        std::vector<float> xs((size_t)(g.M * sk));
+        for (size_t i = 0; i < xs.size(); ++i) xs[i] = 0.01f + 0.002f * (float)(st_mix32((uint32_t)i) % 50);
+        std::vector<float> bias = randv((size_t)g.N, 0.5f);
+        void* dx = dalloc(xq.size());
+        st_memcpy(dx, xq.data(), xq.size(), hipMemcpyHostToDevice);
+        void* dxs = up_f32(xs);
+        void* dw = dalloc(wq.size());
+        st_memcpy(dw, wq.data(), wq.size(), hipMemcpyHostToDevice);
+        void* dws = dalloc(wsb.size());
+        st_memcpy(dws, wsb.data(), wsb.size(), hipMemcpyHostToDevice);
+        void* db = up_bf16(bias);
+        const int64_t width = g.slice ? 3 * g.N : g.N, c0 = g.slice ? g.N : 0;
+        const uint16_t sentinel = 0x7f7f;
+        std::vector<uint16_t> y0((size_t)(g.M * width), sentinel);
+        void* dy = dalloc(y0.size() * 2);
+        st_memcpy(dy, y0.data(), y0.size() * 2, hipMemcpyHostToDevice);
+        RadTensor ty = T((uint16_t*)dy + c0, RAD_BF16, { g.M, g.N });
+        ty.stride[0] = width;
+        const int rc = launch(r, { T(dx, RAD_F8E4M3, { g.M, g.K }), T(dxs, RAD_F32, { g.M, sk }),
+                                   T(dw, RAD_F8E4M3, { g.N, g.K }), T(dws, RAD_BF16, { sn, sk }),
+                                   T(db, RAD_BF16, { g.N }), ty },
+                              { PI("M", g.M), PI("N", g.N), PI("K", g.K), PI("group", 128),
+                                PS("dtype", "fp8a8") });
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<uint16_t> yo((size_t)(g.M * width));
+        st_memcpy(yo.data(), dy, yo.size() * 2, hipMemcpyDeviceToHost);
+        /* Every row, a column in eleven past the first 64 (all of a small N), each operand
+         * decoded once. */
+        std::vector<double> xd((size_t)(g.M * g.K)), wrow((size_t)g.K);
+        for (int64_t m = 0; m < g.M; ++m)
+            for (int64_t k = 0; k < g.K; ++k)
+                xd[(size_t)(m * g.K + k)] = (double)h_e4m3(xq[(size_t)(m * g.K + k)]) *
+                                            xs[(size_t)(m * sk + k / 128)];
+        std::vector<float> got, want;
+        const uint8_t* wc = p.data[0].data();
+        for (int64_t n = 0; n < g.N; ++n) {
+            if (n >= 64 && n % 11) continue;
+            for (int64_t k = 0; k < g.K; ++k)
+                wrow[(size_t)k] = (double)h_e4m3(wc[(size_t)(n * g.K + k)]) *
+                                  rad_load_f32(p.data[1].data(), RAD_BF16, (n / 128) * sk + k / 128);
+            for (int64_t m = 0; m < g.M; ++m) {
+                double acc = 0;
+                for (int64_t k = 0; k < g.K; ++k) acc += wrow[(size_t)k] * xd[(size_t)(m * g.K + k)];
+                want.push_back((float)acc + bias[(size_t)n]);
+                got.push_back(h_bf16(yo[(size_t)(m * width + c0 + n)]));
+            }
+        }
+        check(nm + " numerics", got, want, 1e-2);
+        int64_t moved = 0;
+        for (int64_t m = 0; m < g.M; ++m)
+            for (int64_t c = 0; c < width; ++c)
+                if ((c < c0 || c >= c0 + g.N) && yo[(size_t)(m * width + c)] != sentinel) ++moved;
+        if (g.slice) ok((nm + " leaves the table's other columns").c_str(), moved == 0,
+                        fmt("%lld written", (long long)moved));
+    }
+}
+
+/* The f32 elementwise rows and the f32 forms of the bf16 rows, as a video decoder and a vocoder
+ * issue them. */
+void add_f32_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "add_f32");
+    if (!r) { ok("add_f32", false, "row absent"); return; }
+    struct C { int64_t M, n; double div; int alias; bool bcast; };
+    for (const C& c : { C{ 1000, 8, 3.0, 0, false }, C{ 70000, 8, 1.0, 1, false },
+                        C{ 37, 2048, 1.0, 1, false }, C{ 37, 33, 1.0, 0, true },
+                        C{ 64, 100, 3.0, 1, false } }) {
+        std::vector<float> a = randv((size_t)(c.M * c.n), 2.0f);
+        std::vector<float> b = randv((size_t)(c.bcast ? c.n : c.M * c.n), 2.0f);
+        void* da = up_f32(a);
+        void* db = up_f32(b);
+        void* dy = c.alias ? da : dalloc((size_t)(c.M * c.n) * 4);
+        std::vector<RadParam> ps = { PI("M", c.M), PI("n", c.n), PS("dtype", "f32") };
+        if (c.div != 1.0) ps.push_back(PF("div", c.div));
+        const std::string nm = fmt("add_f32 %lld x %lld%s%s%s", (long long)c.M, (long long)c.n,
+                                   c.div != 1.0 ? " div 3" : "", c.alias ? " in place" : "",
+                                   c.bcast ? " broadcast" : "");
+        const int rc = launch(r, { T(da, RAD_F32, { c.M, c.n }),
+                                   T(db, RAD_F32, { c.bcast ? 1 : c.M, c.n }),
+                                   T(dy, RAD_F32, { c.M, c.n }) },
+                              ps);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> want(a.size());
+        for (int64_t m = 0; m < c.M; ++m)
+            for (int64_t i = 0; i < c.n; ++i) {
+                float s = a[(size_t)(m * c.n + i)] + b[(size_t)(c.bcast ? i : m * c.n + i)];
+                if (c.div != 1.0) s = s / (float)c.div;
+                want[(size_t)(m * c.n + i)] = s;
+            }
+        const int64_t bad = differ(down_f32(dy, want.size()), want);
+        ok((nm + " exact").c_str(), bad == 0, fmt("%lld elements differ", (long long)bad));
+    }
+    /* div 0 is refused. */
+    const int rc = launch(r, { TA(RAD_F32, { 4, 8 }), TA(RAD_F32, { 4, 8 }), TA(RAD_F32, { 4, 8 }) },
+                          { PI("M", 4), PI("n", 8), PS("dtype", "f32"), PF("div", 0.0) });
+    ok("add_f32 refuses div 0", rc == RAD_E_INVAL, "rc " + std::to_string(rc));
+}
+
+void add_bf16_div_case(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "add_bf16");
+    if (!r) { ok("add_bf16 div", false, "row absent"); return; }
+    const int64_t M = 5, n = 300;
+    std::vector<float> a = randv((size_t)(M * n), 2.0f), b = randv((size_t)(M * n), 2.0f);
+    void* da = up_bf16(a);
+    void* db = up_bf16(b);
+    void* dy = dalloc((size_t)(M * n) * 2);
+    const int rc = launch(r, { T(da, RAD_BF16, { M, n }), T(db, RAD_BF16, { M, n }),
+                               T(dy, RAD_BF16, { M, n }) },
+                          { PI("M", M), PI("n", n), PS("dtype", "bf16"), PF("div", 3.0) });
+    if (rc != RAD_OK) { ok("add_bf16 div 3", false, "rc " + std::to_string(rc)); return; }
+    std::vector<float> want(a.size());
+    for (size_t i = 0; i < a.size(); ++i) want[i] = bfr(bfr(a[i] + b[i]) / 3.0f);
+    const int64_t bad = differ(down_bf16(dy, want.size()), want);
+    ok("add_bf16 div 3 exact (rd(rd(a + b) / 3))", bad == 0, fmt("%lld elements differ", (long long)bad));
+}
+
+void mul_weight_f32_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "mul_weight_f32");
+    if (!r) { ok("mul_weight_f32", false, "row absent"); return; }
+    const int64_t M = 37, n = 2048;
+    for (const int xf : { 0, 1 })
+        for (const int64_t wn : { n, (int64_t)1 }) {
+            std::vector<float> x = randv((size_t)(M * n), 3.0f), w = randv((size_t)wn, 0.1f);
+            void* dx = xf ? up_f32(x) : up_bf16(x);
+            void* dw = up_f32(w);
+            void* dy = dalloc((size_t)(M * n) * 4);
+            const int rc = launch(r, { T(dx, xf ? RAD_F32 : RAD_BF16, { M, n }), T(dw, RAD_F32, { wn }),
+                                       T(dy, RAD_F32, { M, n }) },
+                                  { PI("M", M), PI("n", n), PS("dtype", "f32") });
+            const std::string nm = fmt("mul_weight_f32 %s x, f32 weight of %lld", xf ? "f32" : "bf16",
+                                       (long long)wn);
+            if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+            std::vector<float> want(x.size());
+            for (int64_t m = 0; m < M; ++m)
+                for (int64_t i = 0; i < n; ++i)
+                    want[(size_t)(m * n + i)] = x[(size_t)(m * n + i)] * w[(size_t)(wn == 1 ? 0 : i)];
+            const int64_t bad = differ(down_f32(dy, want.size()), want);
+            ok((nm + " exact").c_str(), bad == 0, fmt("%lld elements differ", (long long)bad));
+        }
+}
+
+void silu_f32_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "silu_f32");
+    if (!r) { ok("silu_f32", false, "row absent"); return; }
+    const int64_t M = 128, n = 5376;
+    std::vector<float> x = randv((size_t)(M * n), 6.0f);
+    void* dx = up_f32(x);
+    for (const bool bf : { false, true }) {
+        void* dy = dalloc((size_t)(M * n) * (bf ? 2 : 4));
+        const int rc = launch(r, { T(dx, RAD_F32, { M, n }), T(dy, bf ? RAD_BF16 : RAD_F32, { M, n }) },
+                              { PI("M", M), PI("n", n), PS("dtype", "f32") });
+        const std::string nm = fmt("silu_f32 -> %s", bf ? "bf16" : "f32");
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> want(x.size());
+        for (size_t i = 0; i < x.size(); ++i)
+            want[i] = x[i] * (1.0f / (1.0f + (float)std::exp(-(double)x[i])));
+        if (bf) check(nm + " numerics", down_bf16(dy, want.size()), want, 1e-3);
+        else    check_f32(nm + " numerics", down_f32(dy, want.size()), want, 1e-6);
+    }
+}
+
+void norm_f32_rows_cases(const Plugin& pl, bool layer) {
+    const char* name = layer ? "layernorm_bf16" : "rmsnorm_bf16";
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { ok(name, false, "row absent"); return; }
+    const int64_t M = 9, n = 2048, ld = 2100;
+    const float eps = 1e-5f;
+    std::vector<float> x = randv((size_t)(M * ld), 30.0f), w = randv((size_t)n, 1.0f),
+                       b = randv((size_t)n, 0.5f);
+    for (size_t i = 0; i < x.size(); ++i) x[i] += 7.0f;   /* a mean the layer norm must remove */
+    void* dx = up_f32(x);
+    void* dw = up_f32(w);
+    void* db = up_f32(b);
+    void* dy = dalloc((size_t)(M * n) * 2);
+    RadTensor tx = T(dx, RAD_F32, { M, n });
+    tx.stride[0] = ld;
+    std::vector<RadTensor> ts = { tx, T(dw, RAD_F32, { n }) };
+    if (layer) ts.push_back(T(db, RAD_F32, { n }));
+    ts.push_back(T(dy, RAD_BF16, { M, n }));
+    const int rc = launch(r, ts, { PI("M", M), PI("n", n), PF("eps", (double)eps),
+                                   PS("dtype", "bf16") });
+    const std::string nm = fmt("%s over f32 rows", name);
+    if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); return; }
+    std::vector<float> want((size_t)(M * n));
+    for (int64_t m = 0; m < M; ++m) {
+        const float* xr = x.data() + m * ld;
+        double mean = 0, ss = 0;
+        if (layer) { for (int64_t i = 0; i < n; ++i) mean += xr[i]; mean /= (double)n; }
+        for (int64_t i = 0; i < n; ++i) ss += ((double)xr[i] - mean) * ((double)xr[i] - mean);
+        const double s = 1.0 / std::sqrt(ss / (double)n + eps);
+        for (int64_t i = 0; i < n; ++i)
+            want[(size_t)(m * n + i)] = layer ? (float)(((double)xr[i] - mean) * s * w[(size_t)i] + b[(size_t)i])
+                                              : (float)((double)xr[i] * s * w[(size_t)i]);
+    }
+    check(nm + " numerics", down_bf16(dy, want.size()), want, 1e-2);
+}
+
+void timestep_f32_case(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "timestep_embed_f32");
+    if (!r) { ok("timestep_embed_f32", false, "row absent"); return; }
+    const int64_t M = 64, n = 256, h = n / 2;
+    std::vector<float> t((size_t)M);
+    for (int64_t m = 0; m < M; ++m) t[(size_t)m] = (float)m / (float)M;
+    void* dt = up_f32(t);
+    void* dy = dalloc((size_t)(M * n) * 4);
+    const int rc = launch(r, { T(dt, RAD_F32, { M }), T(dy, RAD_F32, { M, n }) },
+                          { PI("M", M), PI("n", n), PF("scale", 1.0), PF("max_period", 10000.0),
+                            PS("dtype", "f32") });
+    if (rc != RAD_OK) { ok("timestep_embed_f32", false, "rc " + std::to_string(rc)); return; }
+    std::vector<float> want((size_t)(M * n));
+    const float coef = (float)(-std::log(10000.0));
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t i = 0; i < h; ++i) {
+            const float f = (float)std::exp((double)(coef * (float)i / (float)h));
+            const float arg = t[(size_t)m] * f;
+            want[(size_t)(m * n + i)] = (float)std::cos((double)arg);
+            want[(size_t)(m * n + h + i)] = (float)std::sin((double)arg);
+        }
+    check_f32("timestep_embed_f32 numerics", down_f32(dy, want.size()), want, 1e-6);
+}
+
+void randn_f32_case(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "randn_lanes_f32");
+    if (!r) { ok("randn_lanes_f32", false, "row absent"); return; }
+    /* Two lanes of 300 rows by 96; the entry draws into lane 1 (its first step), 250 rows. */
+    const int64_t n = 96, stride = 300, len = 250;
+    const uint64_t seed = 0x1234567890abcdefull;
+    void* dd = dalloc((size_t)(2 * stride * n) * 4);
+    const int rc = launch(r, { TI32({ 1 }, { 1 }),
+                               T(up_i32({ (int32_t)(uint32_t)seed, (int32_t)(uint32_t)(seed >> 32) }),
+                                 RAD_U32, { 2 }),
+                               TI32({ 1 }, { 1 }), TI32({ 2 }, { 0, (int32_t)len }),
+                               T(dd, RAD_F32, { 2 * stride, n }) },
+                          { PI("M", stride), PI("n", n), PI("stride", stride), PS("dtype", "f32") });
+    if (rc != RAD_OK) { ok("randn_lanes_f32", false, "rc " + std::to_string(rc)); return; }
+    const std::vector<float> got = down_f32(dd, (size_t)(2 * stride * n));
+    std::vector<float> g1, want;
+    int64_t stray = 0;
+    for (int64_t k = 0; k < 2 * stride; ++k)
+        for (int64_t c = 0; c < n; ++c) {
+            const float v = got[(size_t)(k * n + c)];
+            const int64_t lk = k - stride;
+            if (lk >= 0 && lk < len) {
+                g1.push_back(v);
+                want.push_back(rad_philox_normal(seed, (uint64_t)(lk * n + c)));
+            } else if (v != 0.0f) {
+                ++stray;
+            }
+        }
+    check_f32("randn_lanes_f32 against the host's Philox stream", g1, want, 1e-6);
+    ok("randn_lanes_f32 writes only its lane's rows", stray == 0, fmt("%lld stray", (long long)stray));
+}
+
+void interleave2_f32_case(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "interleave2_bf16");
+    if (!r) { ok("interleave2 f32", false, "row absent"); return; }
+    const int64_t n = 70001;
+    std::vector<float> s = randv((size_t)(2 * n), 1.0f);
+    void* ds = up_f32(s);
+    void* dy = dalloc((size_t)(2 * n) * 4);
+    const int rc = launch(r, { T(ds, RAD_F32, { n, 1 }), T((float*)ds + n, RAD_F32, { n, 1 }),
+                               T(dy, RAD_F32, { n, 2 }) },
+                          { PI("M", n), PS("dtype", "f32") });
+    if (rc != RAD_OK) { ok("interleave2 f32", false, "rc " + std::to_string(rc)); return; }
+    std::vector<float> want((size_t)(2 * n));
+    for (int64_t i = 0; i < n; ++i) {
+        want[(size_t)(2 * i)] = s[(size_t)i];
+        want[(size_t)(2 * i + 1)] = s[(size_t)(n + i)];
+    }
+    const int64_t bad = differ(down_f32(dy, want.size()), want);
+    ok("interleave2 f32 streams exact", bad == 0, fmt("%lld differ", (long long)bad));
+}
+
+void chan_affine_cases(const Plugin& pl, const char* row) {
+    const int64_t M = 1152, n = 32;
+    std::string mul, add;
+    std::vector<double> mv((size_t)n), av((size_t)n);
+    for (int64_t c = 0; c < n; ++c) {
+        mv[(size_t)c] = 0.5 + 0.0371 * (double)c;
+        av[(size_t)c] = -0.3 + 0.0123 * (double)c;
+        mul += fmt("%s%.9g", c ? " " : "", mv[(size_t)c]);
+        add += fmt("%s%.9g", c ? " " : "", av[(size_t)c]);
+    }
+    for (const int rnd : { 0, 1 })
+            for (const char* mode : { "fma", "inv" }) {
+                const RadKernelInfo* r = find(pl, row);
+                if (!r) { ok(row, false, "row absent"); return; }
+                const bool f32 = !std::strcmp(row, "chan_affine_f32");
+                std::vector<float> x = randv((size_t)(M * n), 3.0f);
+                void* dx = f32 ? up_f32(x) : up_bf16(x);
+                void* dy = dalloc((size_t)(M * n) * (f32 ? 4 : 2));
+                const uint32_t dt = f32 ? RAD_F32 : RAD_BF16;
+                const int rc = launch(r, { T(dx, dt, { M, n }), T(dy, dt, { M, n }) },
+                                      { PI("M", M), PI("n", n), PS("mul", mul.c_str()),
+                                        PS("add", add.c_str()), PS("mode", mode),
+                                        PS("dtype", f32 ? "f32" : "bf16"), PI("round", rnd) });
+                const std::string nm = fmt("%s round %d %s", row, rnd, mode);
+                if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+                auto rd = [&](float v) { return f32 ? v : bfr(v); };
+                std::vector<float> want(x.size());
+                for (int64_t m = 0; m < M; ++m)
+                    for (int64_t c = 0; c < n; ++c) {
+                        const float mu = rnd ? bfr((float)mv[(size_t)c]) : (float)mv[(size_t)c];
+                        const float ad = rnd ? bfr((float)av[(size_t)c]) : (float)av[(size_t)c];
+                        const float v = x[(size_t)(m * n + c)];
+                        const float t = std::strcmp(mode, "inv") ? v * mu : v - ad;
+                        const float tr = rnd ? rd(t) : t;
+                        want[(size_t)(m * n + c)] = rd(std::strcmp(mode, "inv") ? tr + ad : tr / mu);
+                    }
+                const std::vector<float> got = f32 ? down_f32(dy, want.size()) : down_bf16(dy, want.size());
+                const int64_t bad = differ(got, want);
+                ok((nm + " exact").c_str(), bad == 0, fmt("%lld differ", (long long)bad));
+            }
+}
+
+void gate_add_none_case(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "gate_add_bf16");
+    if (!r) { ok("gate_add_bf16 act none", false, "row absent"); return; }
+    const int64_t M = 30, n = 5376;
+    const std::vector<int32_t> cu = { 0, 7, 30 };
+    std::vector<float> y = randv((size_t)(M * n), 2.0f), g = randv((size_t)(2 * n), 1.5f),
+                       x = randv((size_t)(M * n), 3.0f);
+    void* dy = up_bf16(y);
+    void* dg = up_bf16(g);
+    for (const char* act : { "none", "tanh" }) {
+        std::vector<float> xx = x;
+        void* dxa = up_bf16(xx);
+        const int rc = launch(r, { T(dy, RAD_BF16, { M, n }), T(dg, RAD_BF16, { 2, n }),
+                                   T(up_i32(cu), RAD_I32, { 3 }), T(dxa, RAD_BF16, { M, n }) },
+                              { PI("M", M), PI("n", n), PS("dtype", "bf16"), PS("act", act) });
+        const std::string nm = fmt("gate_add_bf16 act %s", act);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> want(xx.size());
+        for (int64_t m = 0; m < M; ++m) {
+            const int64_t e = m < 7 ? 0 : 1;
+            for (int64_t i = 0; i < n; ++i) {
+                const float gv = g[(size_t)(e * n + i)];
+                const float t = std::strcmp(act, "none") ? bfr((float)std::tanh((double)gv)) : gv;
+                want[(size_t)(m * n + i)] = bfr(xx[(size_t)(m * n + i)] + bfr(t * y[(size_t)(m * n + i)]));
+            }
+        }
+        const std::vector<float> got = down_bf16(dxa, want.size());
+        if (std::strcmp(act, "none")) {
+            check(nm + " numerics", got, want, 1e-2);
+        } else {
+            const int64_t bad = differ(got, want);
+            ok((nm + " exact").c_str(), bad == 0, fmt("%lld differ", (long long)bad));
+        }
+    }
+}
+
+/* conv1d at f32 at a BigVGAN's geometries: conv_pre's 2048 -> 1024 over 7 taps, the AMP blocks'
+ * dilated 3/7/11 taps with the residual the output itself, the direct kernel's 8 channels and the
+ * final conv's one with its clamp. Two sequences, so a tap crossing a sequence's edge reads zero. */
+void conv1d_f32_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "conv1d_f32");
+    if (!r) { ok("conv1d_f32", false, "row absent"); return; }
+    struct C { int64_t cin, cout, k, dil, M0, M1; int act, bias, res; };   /* res 2: y itself */
+    for (const C& c : { C{ 2048, 1024, 7, 1, 9, 15, 0, 1, 0 }, C{ 64, 128, 7, 1, 37, 60, 0, 1, 0 },
+                        C{ 32, 32, 11, 5, 70, 41, 0, 1, 2 }, C{ 16, 16, 3, 3, 50, 77, 0, 1, 1 },
+                        C{ 48, 40, 3, 1, 33, 30, 1, 1, 0 }, C{ 8, 8, 11, 5, 90, 64, 0, 1, 2 },
+                        C{ 8, 1, 7, 1, 100, 99, 2, 0, 0 }, C{ 64, 64, 11, 1, 200, 137, 2, 1, 2 } }) {
+        const std::vector<int32_t> cu = { 0, (int32_t)c.M0, (int32_t)(c.M0 + c.M1) };
+        const int64_t M = c.M0 + c.M1;
+        std::vector<float> x = randv((size_t)(M * c.cin), 1.0f);
+        std::vector<float> w = randv((size_t)(c.cout * c.cin * c.k), 1.0f / std::sqrt((float)(c.cin * c.k)));
+        std::vector<float> b = randv((size_t)c.cout, 0.5f), res = randv((size_t)(M * c.cout), 0.5f);
+        std::vector<RadParam> ps = { PI("M", M), PI("cin", c.cin), PI("cout", c.cout), PI("k", c.k),
+                                     PI("dil", c.dil),
+                                     PS("act", c.act == 1 ? "tanh" : c.act == 2 ? "clamp" : "none"),
+                                     PS("dtype", "f32") };
+        const std::string nm = fmt("conv1d_f32 cin %lld cout %lld k %lld dil %lld%s%s%s", (long long)c.cin,
+                                   (long long)c.cout, (long long)c.k, (long long)c.dil,
+                                   c.bias ? " +bias" : "", c.res == 2 ? " +res in place" : c.res ? " +res" : "",
+                                   c.act == 1 ? " tanh" : c.act == 2 ? " clamp" : "");
+        void* dw = stored_weight_f32(r, ps, w, c.cout, c.cin * c.k, nm.c_str());
+        if (!dw) continue;
+        void* dx = up_f32(x);
+        void* db = up_f32(b);
+        void* dy = up_f32(c.res == 2 ? res : std::vector<float>((size_t)(M * c.cout), 0.0f));
+        void* dr = up_f32(res);
+        RadTensor ty = T(dy, RAD_F32, { M, c.cout });
+        RadTensor tr = c.res == 2 ? ty : T(dr, RAD_F32, { M, c.cout });
+        RadTensor tb = T(db, RAD_F32, { c.cout });
+        if (!c.res) absent(tr);
+        if (!c.bias) absent(tb);
+        const int rc = launch(r, { T(dx, RAD_F32, { M, c.cin }),
+                                   T(dw, RAD_F32, { c.cout, c.cin, c.k }),
+                                   T(up_i32(cu), RAD_I32, { 3 }), tr, ty, tb },
+                              ps);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        const int64_t pad = c.dil * (c.k - 1) / 2;
+        std::vector<float> want((size_t)(M * c.cout));
+        for (int64_t row = 0; row < M; ++row) {
+            const int64_t e = seq_of(cu, row), s0 = cu[(size_t)e], s1 = cu[(size_t)e + 1];
+            for (int64_t co = 0; co < c.cout; ++co) {
+                double acc = 0;
+                for (int64_t kk = 0; kk < c.k; ++kk) {
+                    const int64_t ir = row + kk * c.dil - pad;
+                    if (ir < s0 || ir >= s1) continue;
+                    for (int64_t ci = 0; ci < c.cin; ++ci)
+                        acc += (double)w[(size_t)((co * c.cin + ci) * c.k + kk)] * x[(size_t)(ir * c.cin + ci)];
+                }
+                float v = (float)acc;
+                if (c.bias) v += b[(size_t)co];
+                if (c.res) v += res[(size_t)(row * c.cout + co)];
+                if (c.act == 1) v = (float)std::tanh((double)v);
+                if (c.act == 2) v = v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v);
+                want[(size_t)(row * c.cout + co)] = v;
+            }
+        }
+        check_f32(nm + " numerics", down_f32(dy, want.size()), want, 2e-5);
+    }
+}
+
+/* conv_t1d at f32 at BigVGAN's upsamplers (k 9 stride 5 pad 2, k 4 stride 2 pad 1), the symmetric
+ * default pad, a pad past a stride and a kernel of one stride, against libref's rule: output row o
+ * of a sequence sums its input rows i with 0 <= o + pad - i stride < k. */
+void conv_t1d_f32_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "conv_t1d_f32");
+    if (!r) { ok("conv_t1d_f32", false, "row absent"); return; }
+    struct C { int64_t cin, cout, s, k, pad; };   /* pad -1: absent */
+    for (const C& c : { C{ 64, 32, 5, 9, 2 }, C{ 16, 8, 2, 4, 1 }, C{ 16, 32, 5, 9, -1 },
+                        C{ 16, 16, 4, 16, 5 }, C{ 24, 16, 3, 3, 0 }, C{ 128, 128, 2, 4, 1 },
+                        C{ 40, 72, 5, 9, 7 } }) {
+        const std::vector<int32_t> cu = { 0, 5, 12, 40 };
+        const int64_t R = 40, O = R * c.s;
+        std::vector<float> x = randv((size_t)(R * c.cin), 1.0f);
+        std::vector<float> w = randv((size_t)(c.cin * c.cout * c.k), 0.3f);
+        std::vector<float> b = randv((size_t)c.cout, 0.5f);
+        std::vector<RadParam> ps = { PI("M", R), PI("cin", c.cin), PI("cout", c.cout),
+                                     PI("stride", c.s), PS("dtype", "f32"), PI("k", c.k) };
+        if (c.pad >= 0) ps.push_back(PI("pad", c.pad));
+        const std::string nm = fmt("conv_t1d_f32 cin %lld cout %lld stride %lld k %lld pad %lld",
+                                   (long long)c.cin, (long long)c.cout, (long long)c.s, (long long)c.k,
+                                   (long long)c.pad);
+        void* dw = stored_weight_f32(r, ps, w, c.cin, c.cout * c.k, nm.c_str());
+        if (!dw) continue;
+        void* dx = up_f32(x);
+        void* db = up_f32(b);
+        void* dy = dalloc((size_t)(O * c.cout) * 4);
+        const int rc = launch(r, { T(dx, RAD_F32, { R, c.cin }), T(dw, RAD_F32, { c.cin, c.cout, c.k }),
+                                   T(db, RAD_F32, { c.cout }), T(up_i32(cu), RAD_I32, { 4 }),
+                                   T(dy, RAD_F32, { O, c.cout }) },
+                              ps);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        const int64_t P = c.pad >= 0 ? c.pad : (c.k - c.s) / 2;
+        std::vector<float> want((size_t)(O * c.cout));
+        for (size_t e = 0; e + 1 < cu.size(); ++e) {
+            const int64_t i0 = cu[e], L = cu[e + 1] - cu[e];
+            for (int64_t o = 0; o < L * c.s; ++o)
+                for (int64_t co = 0; co < c.cout; ++co) {
+                    double acc = b[(size_t)co];
+                    for (int64_t i = 0; i < L; ++i) {
+                        const int64_t tap = o + P - i * c.s;
+                        if (tap < 0 || tap >= c.k) continue;
+                        for (int64_t ci = 0; ci < c.cin; ++ci)
+                            acc += (double)w[(size_t)((ci * c.cout + co) * c.k + tap)] *
+                                   x[(size_t)((i0 + i) * c.cin + ci)];
+                    }
+                    want[(size_t)((i0 * c.s + o) * c.cout + co)] = (float)acc;
+                }
+        }
+        check_f32(nm + " numerics", down_f32(dy, want.size()), want, 2e-5);
+    }
+}
+
+/* conv1d at bf16 with the clamp a vocoder's output takes. */
+void conv1d_bf16_clamp_case(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "conv1d_bf16");
+    if (!r) { ok("conv1d_bf16 clamp", false, "row absent"); return; }
+    const int64_t cin = 16, cout = 32, k = 7, M = 40;
+    const std::vector<int32_t> cu = { 0, 17, 40 };
+    std::vector<float> x = randv((size_t)(M * cin), 2.0f), w = randv((size_t)(cout * cin * k), 0.4f);
+    void* dx = up_bf16(x);
+    for (auto& v : w) v = bfr(v);
+    std::vector<RadParam> ps = { PI("M", M), PI("cin", cin), PI("cout", cout), PI("k", k), PI("dil", 1),
+                                 PS("act", "clamp"), PS("dtype", "bf16") };
+    void* dw = stored_weight(r, ps, w, cout, cin * k, "conv1d_bf16 clamp");
+    if (!dw) return;
+    void* dy = dalloc((size_t)(M * cout) * 2);
+    RadTensor tr = TA(RAD_BF16, { M, cout }), tb = TA(RAD_BF16, { cout });
+    absent(tr);
+    absent(tb);
+    const int rc = launch(r, { T(dx, RAD_BF16, { M, cin }), T(dw, RAD_BF16, { cout, cin, k }),
+                               T(up_i32(cu), RAD_I32, { 3 }), tr, T(dy, RAD_BF16, { M, cout }), tb },
+                          ps);
+    if (rc != RAD_OK) { ok("conv1d_bf16 clamp", false, "rc " + std::to_string(rc)); return; }
+    std::vector<float> want((size_t)(M * cout));
+    int64_t clamped = 0;
+    for (int64_t row = 0; row < M; ++row) {
+        const int64_t e = seq_of(cu, row), s0 = cu[(size_t)e], s1 = cu[(size_t)e + 1];
+        for (int64_t co = 0; co < cout; ++co) {
+            float acc = 0.0f;
+            for (int64_t kk = 0; kk < k; ++kk) {
+                const int64_t ir = row + kk - 3;
+                if (ir < s0 || ir >= s1) continue;
+                for (int64_t ci = 0; ci < cin; ++ci)
+                    acc += w[(size_t)((co * cin + ci) * k + kk)] * x[(size_t)(ir * cin + ci)];
+            }
+            if (acc < -1.0f || acc > 1.0f) ++clamped;
+            want[(size_t)(row * cout + co)] = acc < -1.0f ? -1.0f : (acc > 1.0f ? 1.0f : acc);
+        }
+    }
+    check("conv1d_bf16 clamp numerics", down_bf16(dy, want.size()), want, 1e-2);
+    ok("conv1d_bf16 clamp case clamps", clamped > 0, fmt("%lld clamped", (long long)clamped));
+}
+
+/* qk_norm_rope's axial mode, f32 positions, absent gains and rotary_dim 0, at a video
+ * transformer's geometry (head 128, 96 rotated in sections 16 16 16, bf16 gains, f32 (t, h, w)
+ * positions of a [3, max] plane) and a video decoder's (head 64, 48 rotated in 8 8 8, no gains),
+ * and the norm alone (a refiner's). A port of libref's ref_qk_norm_rope. */
+void qk_axial_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "qk_norm_rope_bf16");
+    if (!r) { ok("qk_norm_rope_bf16 axial", false, "row absent"); return; }
+    struct C { int64_t hd, nh, rot; int sec; bool gains; int pos; double theta; };  /* pos 0 none, 1 f32 [3, max], 2 i32 [M] */
+    for (const C& c : { C{ 128, 4, 96, 16, true, 1, 10000.0 }, C{ 64, 6, 48, 8, false, 1, 100.0 },
+                        C{ 128, 2, 0, 0, true, 0, 10000.0 }, C{ 128, 3, 96, 16, true, 2, 10000.0 },
+                        C{ 64, 2, 0, 0, false, 1, 100.0 } }) {
+        const int64_t M = 37, pmax = 50, width = 3 * c.nh * c.hd, half = c.rot / 2;
+        const float eps = 1e-5f;
+        std::vector<float> x = randv((size_t)(M * width), 3.0f);
+        std::vector<float> qg = randv((size_t)c.hd, 0.5f), kg = randv((size_t)c.hd, 0.5f);
+        for (auto& v : qg) v = bfr(1.0f + v);
+        for (auto& v : kg) v = bfr(1.0f + v);
+        std::vector<float> pf((size_t)(3 * pmax));
+        for (size_t i = 0; i < pf.size(); ++i) pf[i] = (float)(st_mix32((uint32_t)i) % 4001) * 0.01f - 20.0f;
+        std::vector<int32_t> pi32((size_t)M);
+        for (int64_t m = 0; m < M; ++m) pi32[(size_t)m] = (int32_t)(m * 7 + 3);
+        std::vector<float> xx = x;
+        void* dq = up_bf16(xx);
+        x = xx;
+        RadTensor tp = c.pos == 1 ? T(up_f32(pf), RAD_F32, { 3, M }) : T(up_i32(pi32), RAD_I32, { M });
+        if (c.pos == 1) tp.stride[0] = pmax;
+        if (c.pos == 0) absent(tp);
+        RadTensor tqw = T(up_bf16(qg), RAD_BF16, { c.hd }), tkw = T(up_bf16(kg), RAD_BF16, { c.hd });
+        if (!c.gains) { absent(tqw); absent(tkw); }
+        std::vector<RadParam> ps = { PI("M", M), PI("head_dim", c.hd), PI("n_head", c.nh),
+                                     PI("n_head_kv", c.nh), PF("theta", c.theta), PF("eps", (double)eps),
+                                     PI("rotary_dim", c.rot) };
+        std::string secs;
+        if (c.rot) {
+            secs = fmt("%d %d %d", c.sec, c.sec, c.sec);
+            ps.push_back(PS("mode", "axial"));
+            ps.push_back(PS("sections", secs.c_str()));
+        }
+        const std::string nm = fmt("qk_norm_rope_bf16 head %lld rot %lld%s%s", (long long)c.hd,
+                                   (long long)c.rot, c.gains ? " gains" : " no gains",
+                                   c.pos == 1 ? " f32 [3, M] positions" : c.pos == 2 ? " i32 [M] positions"
+                                                                         : " no positions");
+        const int rc = launch(r, { T(dq, RAD_BF16, { M, width }), tp, tqw, tkw }, ps);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> want = x;
+        for (int64_t m = 0; m < M; ++m)
+            for (int64_t h = 0; h < 2 * c.nh; ++h) {
+                const size_t base = (size_t)(m * width + h * c.hd);
+                double ss = 0;
+                for (int64_t e = 0; e < c.hd; ++e) ss += (double)x[base + (size_t)e] * x[base + (size_t)e];
+                const float sc = 1.0f / std::sqrt((float)(ss / (double)c.hd) + eps);
+                std::vector<float> n((size_t)c.hd);
+                for (int64_t e = 0; e < c.hd; ++e) {
+                    const float g = c.gains ? (h < c.nh ? qg : kg)[(size_t)e] : 1.0f;
+                    n[(size_t)e] = bfr(c.gains ? x[base + (size_t)e] * sc * g : x[base + (size_t)e] * sc);
+                    want[base + (size_t)e] = n[(size_t)e];
+                }
+                for (int64_t i = 0; i < half; ++i) {
+                    const int64_t sc_i = i / c.sec, j = i % c.sec;
+                    const float p = c.pos == 1 ? pf[(size_t)(sc_i * pmax + m)] : (float)pi32[(size_t)m];
+                    const float inv = 1.0f / (float)std::pow((double)c.theta,
+                                                             (double)((float)(2 * j) / (float)(2 * c.sec)));
+                    const float ang = p * inv;
+                    const float cs = (float)std::cos((double)ang), sn = (float)std::sin((double)ang);
+                    want[base + (size_t)i] = n[(size_t)i] * cs - n[(size_t)(i + half)] * sn;
+                    want[base + (size_t)(i + half)] = n[(size_t)i] * sn + n[(size_t)(i + half)] * cs;
+                }
+            }
+        check(nm + " numerics", down_bf16(dq, want.size()), want, 1e-2);
+    }
+    /* A rotation without positions is refused. */
+    const int rc = launch(r, { TA(RAD_BF16, { 4, 3 * 2 * 128 }), RadTensor{}, TA(RAD_BF16, { 128 }),
+                               TA(RAD_BF16, { 128 }) },
+                          { PI("M", 4), PI("head_dim", 128), PI("n_head", 2), PI("n_head_kv", 2),
+                            PF("theta", 1e4), PF("eps", 1e-5), PI("rotary_dim", 96),
+                            PS("mode", "axial"), PS("sections", "16 16 16") });
+    ok("qk_norm_rope_bf16 refuses a rotation without positions", rc == RAD_E_INVAL,
+       "rc " + std::to_string(rc));
+}
+
+/* One host softmax-attention row for head `h` of query row `i`, keys [b0, b1), over a fused
+ * [rows, 3 nh hd] qkv row. */
+void attn_row_ref(const std::vector<float>& qkv, int64_t width, int64_t nh, int64_t hd, int64_t i,
+                  int64_t h, int64_t b0, int64_t b1, double scale, float* out) {
+    std::vector<double> sc((size_t)(b1 - b0));
+    double mx = -1e300;
+    for (int64_t j = b0; j < b1; ++j) {
+        double d = 0;
+        for (int64_t e = 0; e < hd; ++e)
+            d += (double)qkv[(size_t)(i * width + h * hd + e)] * qkv[(size_t)(j * width + nh * hd + h * hd + e)];
+        sc[(size_t)(j - b0)] = d * scale;
+        mx = std::max(mx, sc[(size_t)(j - b0)]);
+    }
+    double sum = 0;
+    for (double& v : sc) { v = std::exp(v - mx); sum += v; }
+    for (int64_t e = 0; e < hd; ++e) {
+        double a = 0;
+        for (int64_t j = b0; j < b1; ++j)
+            a += sc[(size_t)(j - b0)] * qkv[(size_t)(j * width + 2 * nh * hd + h * hd + e)];
+        out[e] = (float)(a / sum);
+    }
+}
+
+/* attn_dense at head_dim 128, non-causal, over one long sequence (a video transformer's packed
+ * sequence), and at head_dim 64 over consecutive 1797-row documents (a video decoder's tiles),
+ * both reading q, k and v as column slices of one fused row. Every 29th query row is checked. */
+void attn_long_case(const Plugin& pl, const char* name, int64_t hd, int64_t nh,
+                    std::vector<int32_t> cu) {
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { ok(name, false, "row absent"); return; }
+    const int64_t total = cu.back(), wq = nh * hd, width = 3 * wq;
+    std::vector<float> qkv = randv((size_t)(total * width), 1.5f);
+    void* d = up_bf16(qkv);
+    auto col = [&](int64_t first) {
+        RadTensor t = T((uint16_t*)d + first, RAD_BF16, { total, wq });
+        t.stride[0] = width;
+        return t;
+    };
+    void* dout = dalloc((size_t)(total * wq) * 2);
+    const double scale = 1.0 / std::sqrt((double)hd);
+    int64_t msl = 0;
+    for (size_t s = 0; s + 1 < cu.size(); ++s) msl = std::max<int64_t>(msl, cu[s + 1] - cu[s]);
+    const std::string nm = fmt("%s non-causal over %zu sequence(s) of %lld rows, %lld heads", name,
+                               cu.size() - 1, (long long)msl, (long long)nh);
+    const int rc = launch(r, { col(0), col(wq), col(2 * wq), T(up_i32(cu), RAD_I32, { (int64_t)cu.size() }),
+                               T(dout, RAD_BF16, { total, wq }) },
+                          { PI("M", total), PI("head_dim", hd), PI("gqa", 1), PI("causal", 0),
+                            PS("dtype", "bf16"), PF("scale", scale), PI("max_seqlen", msl) });
+    if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); return; }
+    const std::vector<float> all = down_bf16(dout, (size_t)(total * wq));
+    std::vector<float> got, want;
+    std::vector<float> row((size_t)hd);
+    for (int64_t i = 0; i < total; i += 29) {
+        int64_t s = 0;
+        while (s + 2 < (int64_t)cu.size() && cu[(size_t)s + 1] <= i) ++s;
+        for (int64_t h = 0; h < nh; ++h) {
+            attn_row_ref(qkv, width, nh, hd, i, h, cu[(size_t)s], cu[(size_t)s + 1], scale, row.data());
+            for (int64_t e = 0; e < hd; ++e) {
+                want.push_back(row[(size_t)e]);
+                got.push_back(all[(size_t)(i * wq + h * hd + e)]);
+            }
+        }
+    }
+    check(nm + " numerics", got, want, 2e-2);
+}
+
+}  /* namespace vg */
+
+/* ---- video sparse attention: vsa_select and attn_vsa against a host port of their contract
+ *
+ * The tiling, the f32 tile means (summed in each tile's raster), the f32 scores (each a sequential
+ * dot product), the top k with ties to the lower tile and the coarse softmax are plain loops here,
+ * in the order the op defines, so the selection compares exactly. The coarse output and the
+ * attention are held to a relative L2: the device's exp and its bf16 P are not these loops'. */
+namespace vsa {
+
+using namespace au;
+
+constexpr int64_t kHd = 128;
+
+/* The tiles of a packed sequence, each its rows in raster order: the dense segments in chunks of
+ * 64 rows, then the video grid in 4 x 4 x 4 boxes. */
+struct Geo {
+    int P = 0, V = 0, N = 0;
+    std::vector<std::vector<int>> rows;
+};
+
+Geo tiles(const std::vector<int32_t>& segs, int F, int Hp, int Wp) {
+    Geo g;
+    const size_t nd = segs.size() - 2;
+    for (size_t s = 0; s < nd; ++s)
+        for (int a = segs[s]; a < segs[s + 1]; a += 64) {
+            std::vector<int> r;
+            for (int x = a; x < std::min(a + 64, (int)segs[s + 1]); ++x) r.push_back(x);
+            g.rows.push_back(r);
+        }
+    g.P = (int)g.rows.size();
+    const int vb = segs[nd];
+    for (int a = 0; a < F; a += 4)
+        for (int b = 0; b < Hp; b += 4)
+            for (int c = 0; c < Wp; c += 4) {
+                std::vector<int> r;
+                for (int t = a; t < std::min(a + 4, F); ++t)
+                    for (int h = b; h < std::min(b + 4, Hp); ++h)
+                        for (int w = c; w < std::min(c + 4, Wp); ++w)
+                            r.push_back(vb + (t * Hp + h) * Wp + w);
+                g.rows.push_back(r);
+            }
+    g.N = (int)g.rows.size();
+    g.V = g.N - g.P;
+    return g;
+}
+
+int topk(double sp, int V) {
+    return std::max(1, std::min((int)std::ceil((1.0 - sp) * (double)V), V));
+}
+
+/* One operand of a fused row buffer: column `col` of rows `ld` apart. */
+struct Opd {
+    const std::vector<float>* x;
+    int64_t col, ld;
+    float at(int64_t r, int64_t h, int64_t d) const { return (*x)[(size_t)(r * ld + col + h * kHd + d)]; }
+};
+
+/* f32 tile means of every head, [nh][N][128]. */
+std::vector<float> means(const Opd& o, const Geo& g, int64_t nh) {
+    std::vector<float> m((size_t)(nh * g.N * kHd));
+    for (int64_t h = 0; h < nh; ++h)
+        for (int i = 0; i < g.N; ++i)
+            for (int64_t d = 0; d < kHd; ++d) {
+                float s = 0.0f;
+                for (int r : g.rows[(size_t)i]) s = s + o.at(r, h, d);
+                m[(size_t)((h * g.N + i) * kHd + d)] = s / (float)g.rows[(size_t)i].size();
+            }
+    return m;
+}
+
+/* vsa_select's outputs: the scores [nh][N][N], the selection [nh][N][k] (video query tiles only)
+ * and the coarse rows [nh][N][128], rounded to bf16. */
+struct Ref {
+    int k = 0;
+    std::vector<float> S;
+    std::vector<int> sel;
+    std::vector<float> coarse;
+};
+
+Ref select_ref(const Opd& q, const Opd& k, const Opd* v, const Geo& g, int64_t nh, double sp,
+               double scale) {
+    Ref f;
+    f.k = g.V > 0 ? topk(sp, g.V) : 0;
+    const std::vector<float> qm = means(q, g, nh), km = means(k, g, nh);
+    const float sc = (float)scale;
+    const size_t N = (size_t)g.N;
+    f.S.assign((size_t)nh * N * N, 0.0f);
+    for (int64_t h = 0; h < nh; ++h)
+        for (size_t i = 0; i < N; ++i)
+            for (size_t j = 0; j < N; ++j) {
+                float s = 0.0f;
+                for (int64_t d = 0; d < kHd; ++d)
+                    s = s + qm[(size_t)((h * N + i) * kHd + d)] * km[(size_t)((h * N + j) * kHd + d)];
+                f.S[(h * N + i) * N + j] = s * sc;
+            }
+    f.sel.assign((size_t)nh * N * (size_t)std::max(f.k, 1), -1);
+    for (int64_t h = 0; h < nh; ++h)
+        for (int i = g.P; i < g.N; ++i) {
+            const float* s = &f.S[((size_t)h * N + (size_t)i) * N];
+            std::vector<int> idx;
+            for (int j = g.P; j < g.N; ++j) idx.push_back(j);
+            std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return s[a] > s[b]; });
+            idx.resize((size_t)f.k);
+            std::sort(idx.begin(), idx.end());
+            std::copy(idx.begin(), idx.end(), f.sel.begin() + (long)(((size_t)h * N + (size_t)i) * f.k));
+        }
+    if (!v) return f;
+    const std::vector<float> vm = means(*v, g, nh);
+    f.coarse.assign((size_t)nh * N * kHd, 0.0f);
+    for (int64_t h = 0; h < nh; ++h)
+        for (size_t i = 0; i < N; ++i) {
+            const float* s = &f.S[((size_t)h * N + i) * N];
+            float mx = -INFINITY, sum = 0.0f;
+            for (size_t j = 0; j < N; ++j) mx = std::max(mx, s[j]);
+            std::vector<float> p(N);
+            for (size_t j = 0; j < N; ++j) { p[j] = std::exp(s[j] - mx); sum = sum + p[j]; }
+            for (size_t j = 0; j < N; ++j) p[j] = p[j] / sum;
+            for (int64_t d = 0; d < kHd; ++d) {
+                float a = 0.0f;
+                for (size_t j = 0; j < N; ++j) a = a + p[j] * vm[(size_t)((h * (int64_t)N + (int64_t)j) * kHd + d)];
+                f.coarse[(size_t)((h * (int64_t)N + (int64_t)i) * kHd + d)] = bfr(a);
+            }
+        }
+    return f;
+}
+
+/* quant_act_i8g's rule for one (row, head): the scale (amax / 127, 1 for an all-zero row) and the
+ * codes rint(clamp(x * (1 / scale), +-127)), in f32 as the device computes them. */
+float q8_row(const float* x, int64_t n, float* code) {
+    float am = 0.0f;
+    for (int64_t d = 0; d < n; ++d) am = std::max(am, std::fabs(x[d]));
+    const float sc = am > 0.0f ? am * (1.0f / 127.0f) : 1.0f;
+    const float inv = 1.0f / sc;
+    for (int64_t d = 0; d < n; ++d) code[d] = std::rint(std::min(std::max(x[d] * inv, -127.0f), 127.0f));
+    return sc;
+}
+
+/* k in the int8 Q.K form: codes [R, n_head 128] at pitch `ld` and scales [R, n_head], on the host
+ * (codes as floats) and the device. */
+struct KQ8 {
+    int64_t ld = 0, nh = 0;
+    std::vector<float> codes, scales;
+    void* dcode = nullptr;
+    void* dscale = nullptr;
+};
+
+KQ8 make_kq8(const Opd& k, int64_t R, int64_t nh) {
+    KQ8 z;
+    z.nh = nh;
+    z.ld = nh * kHd + 16;
+    z.codes.assign((size_t)(R * z.ld), 0.0f);
+    z.scales.assign((size_t)(R * nh), 0.0f);
+    std::vector<int8_t> c8((size_t)(R * z.ld), 0);
+    float x[kHd];
+    for (int64_t r = 0; r < R; ++r)
+        for (int64_t h = 0; h < nh; ++h) {
+            for (int64_t d = 0; d < kHd; ++d) x[d] = k.at(r, h, d);
+            float* code = &z.codes[(size_t)(r * z.ld + h * kHd)];
+            z.scales[(size_t)(r * nh + h)] = q8_row(x, kHd, code);
+            for (int64_t d = 0; d < kHd; ++d) c8[(size_t)(r * z.ld + h * kHd + d)] = (int8_t)code[d];
+        }
+    z.dcode = dalloc(c8.size());
+    if (z.dcode) st_memcpy(z.dcode, c8.data(), c8.size(), hipMemcpyHostToDevice);
+    z.dscale = up_f32(z.scales);
+    return z;
+}
+
+/* quant_cols_fp8's rule for an [R, n] operand: a scale per column (amax / 448 in f32, 1 for an
+ * all-zero column) and the codes e4m3(clamp(x * (1 / scale), +-448)); the codes as bytes and as
+ * the values they decode to. */
+struct ColQ8 {
+    int64_t ld = 0, n = 0;
+    std::vector<uint8_t> bytes;
+    std::vector<float> codes, scales;
+    void* dcode = nullptr;
+    void* dscale = nullptr;
+};
+
+ColQ8 quant_cols(const Opd& x, int64_t R, int64_t n, int64_t ld) {
+    ColQ8 z;
+    z.ld = ld;
+    z.n = n;
+    z.bytes.assign((size_t)(R * ld), 0);
+    z.codes.assign((size_t)(R * ld), 0.0f);
+    z.scales.assign((size_t)n, 1.0f);
+    for (int64_t c = 0; c < n; ++c) {
+        float am = 0.0f;
+        for (int64_t r = 0; r < R; ++r) am = std::max(am, std::fabs(x.at(r, 0, c)));
+        const float sc = am > 0.0f ? am * (1.0f / 448.0f) : 1.0f, inv = 1.0f / sc;
+        z.scales[(size_t)c] = sc;
+        for (int64_t r = 0; r < R; ++r) {
+            const float v = std::min(std::max(x.at(r, 0, c) * inv, -448.0f), 448.0f);
+            const uint8_t b = rad_f32_to_fp8e4m3(v);
+            z.bytes[(size_t)(r * ld + c)] = b;
+            z.codes[(size_t)(r * ld + c)] = rad_fp8e4m3_to_f32(b);
+        }
+    }
+    return z;
+}
+
+/* The same codes and scales on the device, for an attention's v. */
+ColQ8 make_vq8(const Opd& v, int64_t R, int64_t W) {
+    ColQ8 z = quant_cols(v, R, W, W + 16);
+    z.dcode = dalloc(z.bytes.size());
+    if (z.dcode) st_memcpy(z.dcode, z.bytes.data(), z.bytes.size(), hipMemcpyHostToDevice);
+    z.dscale = up_f32(z.scales);
+    return z;
+}
+
+/* The fp8 P.V form against its port. Each w = e4m3(448 p) keeps 3 mantissa bits (~2.5% RMS a
+ * value), and the kernel rounds p against its running max where the port rounds it against the
+ * row's: two independent roundings. Over the random rows here the output is an average that
+ * nearly cancels, so that noise does not shrink with the key count and shows as 1.3-2.8%
+ * rel_l2; a wrong code or scale shows at tens of percent. */
+constexpr double kPv8Tol = 4e-2;
+
+/* One query row of one head over the given key rows, in double; with `kq` the scores are the
+ * int8 form's, (q codes . k codes) q_scale k_scale scale in f32 as libref forms them. With `vq`
+ * the fp8 P.V form: p = exp(s - max) in f32, w = e4m3(448 p), o = (sum w v_code) v_scale /
+ * (448 sum p). */
+void attn_ref(const Opd& q, const Opd& k, const Opd& v, const std::vector<int>& keys, int64_t r,
+              int64_t h, double scale, float* out, const KQ8* kq = nullptr,
+              const ColQ8* vq = nullptr) {
+    std::vector<double> sc(keys.size());
+    double mx = -1e300;
+    float xq[kHd], cq[kHd], sq = 1.0f;
+    if (kq) {
+        for (int64_t e = 0; e < kHd; ++e) xq[e] = q.at(r, h, e);
+        sq = q8_row(xq, kHd, cq);
+    }
+    for (size_t j = 0; j < keys.size(); ++j) {
+        if (kq) {
+            const float* ck = &kq->codes[(size_t)(keys[j] * kq->ld + h * kHd)];
+            float acc = 0.0f;
+            for (int64_t e = 0; e < kHd; ++e) acc += cq[e] * ck[e];
+            sc[j] = (double)(acc * sq * kq->scales[(size_t)(keys[j] * kq->nh + h)] * (float)scale);
+        } else {
+            double d = 0;
+            for (int64_t e = 0; e < kHd; ++e) d += (double)q.at(r, h, e) * k.at(keys[j], h, e);
+            sc[j] = d * scale;
+        }
+        mx = std::max(mx, sc[j]);
+    }
+    if (vq) {
+        std::vector<double> w(keys.size());
+        double psum = 0;
+        for (size_t j = 0; j < keys.size(); ++j) {
+            const float pj = (float)std::exp(sc[j] - mx);
+            psum += pj;
+            w[j] = rad_fp8e4m3_to_f32(rad_f32_to_fp8e4m3(448.0f * pj));
+        }
+        for (int64_t e = 0; e < kHd; ++e) {
+            double a = 0;
+            for (size_t j = 0; j < keys.size(); ++j)
+                a += w[j] * vq->codes[(size_t)(keys[j] * vq->ld + h * kHd + e)];
+            out[e] = (float)(a * vq->scales[(size_t)(h * kHd + e)] / (448.0 * psum));
+        }
+        return;
+    }
+    double sum = 0;
+    for (double& x : sc) { x = std::exp(x - mx); sum += x; }
+    for (int64_t e = 0; e < kHd; ++e) {
+        double a = 0;
+        for (size_t j = 0; j < keys.size(); ++j) a += sc[j] * v.at(keys[j], h, e);
+        out[e] = (float)(a / sum);
+    }
+}
+
+/* A geometry: the dense segments' row counts and the video grid (latent sizes, patch 2). */
+struct Shape {
+    const char* what;
+    std::vector<int32_t> dense;
+    int F, Hp, Wp;
+};
+
+std::vector<int32_t> segs_of(const Shape& s) {
+    std::vector<int32_t> v = { 0 };
+    for (int32_t d : s.dense) v.push_back(v.back() + d);
+    v.push_back(v.back() + s.F * s.Hp * s.Wp);
+    return v;
+}
+
+std::vector<RadParam> params(int64_t R, double sp) {
+    return { PI("M", R), PI("head_dim", kHd), PI("tile_t", 4), PI("tile_h", 4), PI("tile_w", 4),
+             PI("patch", 2), PF("sparsity", sp), PF("scale", 1.0 / std::sqrt((double)kHd)) };
+}
+
+/* A launch with `scratch` bytes of scratch (the hook's answer when negative). */
+int run(const RadKernelInfo* r, std::vector<RadTensor> ts, std::vector<RadParam> ps,
+        int64_t scratch = -1) {
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    a.world_size = 1;
+    if (scratch < 0 && r->scratch) scratch = r->scratch(&a);
+    if (scratch > 0) { a.scratch = dalloc((size_t)scratch); a.scratch_bytes = scratch; }
+    const int rc = r->launch(&a, (RadStream)nullptr);
+    if (rc != RAD_OK) return rc;
+    return st_stream_sync(nullptr) == hipSuccess ? RAD_OK : RAD_E_STATE;
+}
+
+/* The operands of one pass: q, k and v as column slices of one fused row (pitch wider than the
+ * three), the geometry, and the case's host copies. */
+struct Pass {
+    Shape s;
+    int64_t nh = 0, W = 0, ld = 0, R = 0;
+    std::vector<int32_t> segs;
+    Geo g;
+    std::vector<float> qkv;
+    void* d = nullptr;
+    RadTensor col(int64_t which) const {
+        RadTensor t = T((uint16_t*)d + which * W, RAD_BF16, { R, W });
+        t.stride[0] = ld;
+        return t;
+    }
+    Opd opd(int64_t which) const { return Opd{ &qkv, which * W, ld }; }
+    RadTensor tsegs() const { return TI32({ (int64_t)segs.size() }, segs); }
+    RadTensor tgeom() const {
+        return TI32({ 16 }, { s.F, 2 * s.Hp, 2 * s.Wp, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+    }
+};
+
+/* `kconst` sets every k value to 0.5, so every key tile's mean is the same and every score ties. */
+Pass make_pass(const Shape& s, int64_t nh, float amp, bool kconst = false) {
+    Pass p;
+    p.s = s;
+    p.nh = nh;
+    p.W = nh * kHd;
+    p.ld = 3 * p.W + 64;
+    p.segs = segs_of(s);
+    p.R = p.segs.back();
+    p.g = tiles(p.segs, s.F, s.Hp, s.Wp);
+    p.qkv = randv((size_t)(p.R * p.ld), amp);
+    if (kconst)
+        for (int64_t r = 0; r < p.R; ++r)
+            for (int64_t c = 0; c < p.W; ++c) p.qkv[(size_t)(r * p.ld + p.W + c)] = 0.5f;
+    p.d = up_bf16(p.qkv);
+    return p;
+}
+
+constexpr int32_t kUnwritten = -7;
+
+/* vsa_select against the port: the selection exactly (and nothing written outside the selected
+ * slots of video query tiles), the coarse rows to a relative L2. `heads_a_group` sizes the
+ * scratch for that many heads, so the entry runs several groups. */
+void select_case(const Plugin& pl, const Pass& p, double sp, bool coarse, int64_t tiles_cap,
+                 int64_t k_cap, int64_t heads_a_group = 0, const char* note = "") {
+    const char* name = "vsa_select_h128_bf16";
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { ok(name, false, "row absent"); return; }
+    const Geo& g = p.g;
+    const std::string nm = fmt("%s %s, %lld heads, sparsity %.1f, coarse %s%s", name, p.s.what,
+                               (long long)p.nh, sp, coarse ? "yes" : "no", note);
+    const std::vector<int32_t> init((size_t)(p.nh * tiles_cap * k_cap), kUnwritten);
+    void* dsel = up_i32(init);
+    void* dco = dalloc((size_t)(p.nh * tiles_cap * kHd) * 2);
+    RadTensor tv = p.col(2), tco = T(dco, RAD_BF16, { p.nh, tiles_cap, kHd });
+    if (!coarse) { absent(tv); absent(tco); }
+    const int64_t scratch =
+        heads_a_group > 0 ? heads_a_group * tiles_cap * (coarse ? 1536 : 1024) : -1;
+    const int rc = run(r, { p.col(0), p.col(1), tv, p.tsegs(), p.tgeom(),
+                            T(dsel, RAD_I32, { p.nh, tiles_cap, k_cap }), tco },
+                       params(p.R, sp), scratch);
+    if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); return; }
+    const Opd qo = p.opd(0), ko = p.opd(1), vo = p.opd(2);
+    const Ref f = select_ref(qo, ko, coarse ? &vo : nullptr, g, p.nh, sp, 1.0 / std::sqrt((double)kHd));
+    const std::vector<int32_t> got = down_i32(dsel, init.size());
+    int64_t bad = 0, stray = 0, tiles_off = 0, near = 0;
+    for (int64_t h = 0; h < p.nh; ++h)
+        for (int64_t i = 0; i < tiles_cap; ++i) {
+            const int32_t* gs = &got[(size_t)((h * tiles_cap + i) * k_cap)];
+            const bool video = i >= g.P && i < g.N;
+            for (int64_t s = 0; s < k_cap; ++s) {
+                if (!video || s >= f.k) { stray += gs[s] != kUnwritten; continue; }
+            }
+            if (!video) continue;
+            const int* want = &f.sel[(size_t)((h * g.N + i) * f.k)];
+            bool same = true;
+            for (int s = 0; s < f.k; ++s) same = same && gs[s] == want[s];
+            if (same) continue;
+            ++tiles_off;
+            /* A selection may only differ where the k-th and (k+1)-th scores are within a few
+             * ulps: there the bisection and a sort can disagree only if a score does. */
+            std::vector<float> sc(&f.S[(size_t)((h * g.N + i) * g.N + g.P)],
+                                  &f.S[(size_t)((h * g.N + i) * g.N + g.N)]);
+            std::sort(sc.begin(), sc.end(), [](float x, float y) { return x > y; });
+            const float a = sc[(size_t)f.k - 1], b = (size_t)f.k < sc.size() ? sc[(size_t)f.k] : -INFINITY;
+            if (std::fabs(a - b) <= 4e-7f * std::max(std::fabs(a), std::fabs(b))) ++near;
+            else ++bad;
+        }
+    ok(fmt("%s: selection (k %d of %d video tiles, %lld query tiles) exact", nm.c_str(), f.k, g.V,
+           (long long)(p.nh * g.V)).c_str(),
+       bad == 0 && tiles_off == near,
+       fmt("%lld query tiles differ, %lld of them at a near-tie", (long long)tiles_off, (long long)near));
+    if (tiles_off) std::printf("        %lld query tile(s) differ, all at near-tied k-th scores\n",
+                               (long long)tiles_off);
+    ok(fmt("%s: nothing written outside the selected slots", nm.c_str()).c_str(), stray == 0,
+       fmt("%lld slots written", (long long)stray));
+    if (!coarse) return;
+    const std::vector<float> co = down_bf16(dco, (size_t)(p.nh * tiles_cap * kHd));
+    std::vector<float> cg, cw;
+    int64_t past = 0;
+    for (int64_t h = 0; h < p.nh; ++h)
+        for (int64_t i = 0; i < tiles_cap; ++i)
+            for (int64_t d = 0; d < kHd; ++d) {
+                const float x = co[(size_t)((h * tiles_cap + i) * kHd + d)];
+                if (i >= g.N) { past += x != 0.0f; continue; }
+                cg.push_back(x);
+                cw.push_back(f.coarse[(size_t)((h * g.N + i) * kHd + d)]);
+            }
+    check(nm + ": coarse", cg, cw, 2e-3);
+    ok(fmt("%s: no coarse row past the tiles", nm.c_str()).c_str(), past == 0);
+}
+
+/* Every score ties: the selection is the k lowest video tiles. */
+void select_tie_case(const Plugin& pl, const Shape& s) {
+    const Pass p = make_pass(s, 2, 1.0f, true);
+    select_case(pl, p, 0.5, false, p.g.N, topk(0.5, p.g.V), 0, ", every score tied");
+    const Ref f = select_ref(p.opd(0), p.opd(1), nullptr, p.g, p.nh, 0.5, 1.0 / std::sqrt(128.0));
+    bool lowest = true;
+    for (int64_t h = 0; h < p.nh; ++h)
+        for (int i = p.g.P; i < p.g.N; ++i)
+            for (int x = 0; x < f.k; ++x) lowest = lowest && f.sel[(size_t)((h * p.g.N + i) * f.k + x)] == p.g.P + x;
+    ok("vsa_select_h128_bf16 tie port: the lowest tiles", lowest);
+}
+
+/* The refusals: v without coarse, a tile capacity past the LDS budget, too little scratch. */
+void select_refusals(const Plugin& pl, const Pass& p) {
+    const RadKernelInfo* r = find(pl, "vsa_select_h128_bf16");
+    if (!r) return;
+    void* dsel = dalloc((size_t)(p.nh * 4000 * 8) * 4);
+    void* dco = dalloc((size_t)(p.nh * 4000 * kHd) * 2);
+    RadTensor tco = T(dco, RAD_BF16, { p.nh, 64, kHd }), none = tco;
+    absent(none);
+    int rc = run(r, { p.col(0), p.col(1), p.col(2), p.tsegs(), p.tgeom(),
+                      T(dsel, RAD_I32, { p.nh, 64, 8 }), none }, params(p.R, 0.8));
+    ok("vsa_select_h128_bf16 refuses v without coarse", rc == RAD_E_INVAL, "rc " + std::to_string(rc));
+    rc = run(r, { p.col(0), p.col(1), p.col(2), p.tsegs(), p.tgeom(),
+                  T(dsel, RAD_I32, { p.nh, 4000, 8 }), T(dco, RAD_BF16, { p.nh, 4000, kHd }) },
+             params(p.R, 0.8));
+    ok("vsa_select_h128_bf16 refuses 4000 tiles", rc == RAD_E_SHAPE, "rc " + std::to_string(rc));
+    rc = run(r, { p.col(0), p.col(1), p.col(2), p.tsegs(), p.tgeom(),
+                  T(dsel, RAD_I32, { p.nh, 64, 8 }), tco }, params(p.R, 0.8), 64 * 1024 - 16);
+    ok("vsa_select_h128_bf16 refuses scratch short of one head", rc == RAD_E_SCRATCH,
+       "rc " + std::to_string(rc));
+}
+
+/* attn_vsa against the port, with the port's selection as its input: rows `stride` apart (and
+ * every tile's first row) checked against the attention over their visible keys, then with the
+ * coarse term bf16(bf16(o) + coarse gate). At sparsity 0 every key is visible: dense attention. */
+void attn_case(const Plugin& pl, const Pass& p, double sp, bool coarse, int64_t stride,
+               bool i8 = false, bool pv8 = false) {
+    const char* name = "attn_vsa_h128_bf16";
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { ok(name, false, "row absent"); return; }
+    const Geo& g = p.g;
+    const std::string nm = fmt("%s %s, %lld heads, sparsity %.1f, coarse %s%s%s", name, p.s.what,
+                               (long long)p.nh, sp, coarse ? "yes" : "no", i8 ? ", qk i8" : "",
+                               pv8 ? ", pv fp8" : "");
+    const Ref f = select_ref(p.opd(0), p.opd(1), nullptr, g, p.nh, sp, 1.0 / std::sqrt((double)kHd));
+    const int64_t tiles_cap = g.N + 3, k_cap = f.k + 2;
+    std::vector<int32_t> sel((size_t)(p.nh * tiles_cap * k_cap), kUnwritten);
+    for (int64_t h = 0; h < p.nh; ++h)
+        for (int i = g.P; i < g.N; ++i)
+            for (int x = 0; x < f.k; ++x)
+                sel[(size_t)((h * tiles_cap + i) * k_cap + x)] = f.sel[(size_t)((h * g.N + i) * f.k + x)];
+    std::vector<float> co = randv((size_t)(p.nh * tiles_cap * kHd), 0.5f);
+    const int64_t gld = p.W + 24;
+    std::vector<float> gate = randv((size_t)(p.R * gld), 0.7f);
+    void* dco = up_bf16(co);
+    void* dg = up_bf16(gate);
+    const int64_t old = p.W + 40;
+    void* dout = dalloc((size_t)(p.R * old) * 2);
+    RadTensor tco = T(dco, RAD_BF16, { p.nh, tiles_cap, kHd }), tg = T(dg, RAD_BF16, { p.R, p.W });
+    tg.stride[0] = gld;
+    RadTensor to = T(dout, RAD_BF16, { p.R, p.W });
+    to.stride[0] = old;
+    if (!coarse) { absent(tco); absent(tg); }
+    const RadTensor tsel = T(up_i32(sel), RAD_I32, { p.nh, tiles_cap, k_cap });
+    std::vector<RadTensor> ts = { p.col(0), p.col(1), p.col(2), p.tsegs(), p.tgeom(), tsel, tco,
+                                  tg, to };
+    std::vector<RadParam> ps = params(p.R, sp);
+    KQ8 kq;
+    if (i8) {
+        kq = make_kq8(p.opd(1), p.R, p.nh);
+        RadTensor tk8 = T(kq.dcode, RAD_I8, { p.R, p.W });
+        tk8.stride[0] = kq.ld;
+        ts.push_back(tk8);
+        ts.push_back(T(kq.dscale, RAD_F32, { p.R, p.nh }));
+        ps.push_back(PS("qk", "i8"));
+    }
+    const std::vector<RadTensor> ts_bf16 = ts;
+    ColQ8 vq;
+    if (pv8) {
+        vq = make_vq8(p.opd(2), p.R, p.W);
+        RadTensor tv8 = T(vq.dcode, RAD_F8E4M3, { p.R, p.W });
+        tv8.stride[0] = vq.ld;
+        ts[2] = tv8;
+        if (!i8) {
+            RadTensor none = T(nullptr, RAD_I8, { 1 });
+            absent(none);
+            ts.push_back(none);
+            ts.push_back(none);
+        }
+        ts.push_back(T(vq.dscale, RAD_F32, { p.W }));
+        ps.push_back(PS("pv", "fp8"));
+    }
+    const int rc = run(r, ts, ps);
+    if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); return; }
+    const std::vector<float> out = down_bf16(dout, (size_t)(p.R * old));
+    std::vector<int> tile_of((size_t)p.R), first((size_t)p.R, 0);
+    for (int i = 0; i < g.N; ++i) {
+        for (int x : g.rows[(size_t)i]) tile_of[(size_t)x] = i;
+        first[(size_t)g.rows[(size_t)i][0]] = 1;
+    }
+    const Opd qo = p.opd(0), ko = p.opd(1), vo = p.opd(2);
+    std::vector<float> got, want, row((size_t)kHd);
+    std::vector<int> all;
+    for (int x = 0; x < p.R; ++x) all.push_back(x);
+    int64_t gap = 0;
+    for (int64_t x = 0; x < p.R; ++x) {
+        for (int64_t c = p.W; c < old; ++c) gap += out[(size_t)(x * old + c)] != 0.0f;
+        if (x % stride && !first[(size_t)x]) continue;
+        const int i = tile_of[(size_t)x];
+        for (int64_t h = 0; h < p.nh; ++h) {
+            std::vector<int> keys;
+            if (i < g.P) keys = all;
+            else {
+                for (int j = 0; j < g.P; ++j) keys.insert(keys.end(), g.rows[(size_t)j].begin(), g.rows[(size_t)j].end());
+                for (int s = 0; s < f.k; ++s) {
+                    const auto& rr = g.rows[(size_t)f.sel[(size_t)((h * g.N + i) * f.k + s)]];
+                    keys.insert(keys.end(), rr.begin(), rr.end());
+                }
+            }
+            attn_ref(qo, ko, vo, keys, x, h, 1.0 / std::sqrt((double)kHd), row.data(),
+                     i8 ? &kq : nullptr, pv8 ? &vq : nullptr);
+            for (int64_t e = 0; e < kHd; ++e) {
+                float w = row[(size_t)e];
+                if (coarse)
+                    w = bfr(bfr(w) + co[(size_t)((h * tiles_cap + i) * kHd + e)] *
+                                         gate[(size_t)(x * gld + h * kHd + e)]);
+                want.push_back(w);
+                got.push_back(out[(size_t)(x * old + h * kHd + e)]);
+            }
+        }
+    }
+    check(nm + fmt(": %zu values", got.size()), got, want, pv8 ? kPv8Tol : 2e-2);
+    ok(fmt("%s: the out pitch's gap untouched", nm.c_str()).c_str(), gap == 0);
+    if (!i8 && !pv8) return;
+    /* The same pass with bf16 P.V, and with bf16 scores too: how far each 8-bit form moves the
+     * output. */
+    void* dout2 = dalloc((size_t)(p.R * old) * 2);
+    RadTensor to2 = to;
+    to2.data = dout2;
+    if (pv8) {
+        std::vector<RadTensor> t2 = ts_bf16;
+        t2[8] = to2;
+        std::vector<RadParam> p2 = params(p.R, sp);
+        if (i8) p2.push_back(PS("qk", "i8"));
+        const int rc3 = run(r, t2, p2);
+        if (rc3 != RAD_OK) { ok((nm + ": the bf16 P.V form").c_str(), false, "rc " + std::to_string(rc3)); return; }
+        check(nm + ": against the bf16 P.V form", out, down_bf16(dout2, (size_t)(p.R * old)), 5e-2);
+    }
+    const int rc2 = run(r, { p.col(0), p.col(1), p.col(2), p.tsegs(), p.tgeom(), tsel, tco, tg, to2 },
+                        params(p.R, sp));
+    if (rc2 != RAD_OK) { ok((nm + ": the bf16 form").c_str(), false, "rc " + std::to_string(rc2)); return; }
+    check(nm + ": against the bf16 form", out, down_bf16(dout2, (size_t)(p.R * old)), 5e-2);
+}
+
+/* The fp8 P.V form's refusals: `pv` "fp8" without v_scale, v_scale without it, an unknown `pv`. */
+void attn_pv8_refusals(const Plugin& pl, const Pass& p) {
+    const RadKernelInfo* r = find(pl, "attn_vsa_h128_bf16");
+    if (!r) return;
+    const Ref f = select_ref(p.opd(0), p.opd(1), nullptr, p.g, p.nh, 0.8, 1.0 / std::sqrt(128.0));
+    std::vector<int32_t> sel((size_t)(p.nh * p.g.N * f.k), p.g.P);
+    const RadTensor tsel = T(up_i32(sel), RAD_I32, { p.nh, p.g.N, f.k });
+    RadTensor none = T(nullptr, RAD_BF16, { 1 });
+    absent(none);
+    const RadTensor to = T(dalloc((size_t)(p.R * p.W) * 2), RAD_BF16, { p.R, p.W });
+    const ColQ8 vq = make_vq8(p.opd(2), p.R, p.W);
+    RadTensor tv8 = T(vq.dcode, RAD_F8E4M3, { p.R, p.W });
+    tv8.stride[0] = vq.ld;
+    const RadTensor tvs = T(vq.dscale, RAD_F32, { p.W });
+    std::vector<RadParam> p8 = params(p.R, 0.8), pbad = params(p.R, 0.8);
+    p8.push_back(PS("pv", "fp8"));
+    pbad.push_back(PS("pv", "fp16"));
+    const std::vector<RadTensor> without = { p.col(0), p.col(1), tv8, p.tsegs(), p.tgeom(), tsel,
+                                             none, none, to };
+    std::vector<RadTensor> with = without;
+    with.push_back(none);
+    with.push_back(none);
+    with.push_back(tvs);
+    int rc = run(r, without, p8);
+    ok("attn_vsa_h128_bf16 refuses pv fp8 without v_scale", rc == RAD_E_INVAL, "rc " + std::to_string(rc));
+    rc = run(r, with, params(p.R, 0.8));
+    ok("attn_vsa_h128_bf16 refuses v_scale without pv fp8", rc == RAD_E_INVAL, "rc " + std::to_string(rc));
+    rc = run(r, with, pbad);
+    ok("attn_vsa_h128_bf16 refuses pv fp16", rc == RAD_E_INVAL, "rc " + std::to_string(rc));
+}
+
+/* quant_cols_fp8 against the port, scales and codes exactly: a column view of a wider row and a
+ * pitched output with a zero column and one large value; and the v columns of a 1344 x 768
+ * pass's fused projection (38010 x 3584). */
+void quant_cols_case(const Plugin& pl, int64_t R, int64_t n, int64_t xld, int64_t yld, bool edge,
+                     const char* what) {
+    const char* name = "quant_cols_fp8_bf16";
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { ok(name, false, "row absent"); return; }
+    std::vector<float> x = randv((size_t)(R * xld), 2.0f);
+    if (edge) {
+        for (int64_t row = 0; row < R; ++row) x[(size_t)(row * xld + 5)] = 0.0f;
+        x[(size_t)(7 * xld + 9)] = 3.0e4f;
+        x[(size_t)(3 * xld + 11)] = -1.0e-30f;
+    }
+    void* dx = up_bf16(x);
+    void* dy = dalloc((size_t)(R * yld));
+    void* ds = dalloc((size_t)n * 4);
+    RadTensor tx = T(dx, RAD_BF16, { R, n }), ty = T(dy, RAD_F8E4M3, { R, n });
+    tx.stride[0] = xld;
+    ty.stride[0] = yld;
+    const std::string nm = fmt("%s %s (%lld x %lld)", name, what, (long long)R, (long long)n);
+    const int rc = run(r, { tx, ty, T(ds, RAD_F32, { n }) },
+                       { PI("M", R), PI("n", n), PS("dtype", "bf16") });
+    if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); return; }
+    const ColQ8 z = quant_cols(Opd{ &x, 0, xld }, R, n, yld);
+    std::vector<uint8_t> got((size_t)(R * yld));
+    st_memcpy(got.data(), dy, got.size(), hipMemcpyDeviceToHost);
+    int64_t bad = 0, gap = 0;
+    for (int64_t row = 0; row < R; ++row)
+        for (int64_t c = 0; c < yld; ++c) {
+            const size_t at = (size_t)(row * yld + c);
+            if (c >= n) gap += got[at] != 0;
+            else bad += got[at] != z.bytes[at];
+        }
+    const int64_t sbad = differ(down_f32(ds, (size_t)n), z.scales);
+    ok((nm + ": scales exact").c_str(), sbad == 0, fmt("%lld differ", (long long)sbad));
+    ok((nm + ": codes exact, the pitch's gap untouched").c_str(), bad == 0 && gap == 0,
+       fmt("%lld codes differ, %lld gap bytes written", (long long)bad, (long long)gap));
+}
+
+void quant_cols_cases(const Plugin& pl) {
+    quant_cols_case(pl, 37, 72, 88, 80, true, "edge columns");
+    quant_cols_case(pl, 5, 8, 8, 8, false, "five rows");
+    quant_cols_case(pl, 38010, 3584, 3584 + 64, 3584, false, "1344 x 768 v");
+}
+
+/* attn_prefix_self without a prefix (self attention over cu_seqlens sequences) against the port,
+ * at bf16 and int8 scores and bf16 and fp8 P.V: two sequences of 1000 and 1333 rows, causal and
+ * not, every third row; and one 38010-row sequence (the 1344 x 768 pass) every 397th row. q, k
+ * and v are columns of one fused row. */
+void dense_case(const Plugin& pl, std::vector<int32_t> cu, int64_t nh, int causal, int64_t stride,
+                bool i8, bool pv8) {
+    const char* name = "attn_prefix_self_h128_bf16";
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { ok(name, false, "row absent"); return; }
+    const int64_t R = cu.back(), W = nh * kHd, ld = 3 * W + 64;
+    std::vector<float> qkv = randv((size_t)(R * ld), 1.5f);
+    void* d = up_bf16(qkv);
+    auto col = [&](int64_t which) {
+        RadTensor t = T((uint16_t*)d + which * W, RAD_BF16, { R, W });
+        t.stride[0] = ld;
+        return t;
+    };
+    const Opd qo{ &qkv, 0, ld }, ko{ &qkv, W, ld }, vo{ &qkv, 2 * W, ld };
+    void* dout = dalloc((size_t)(R * W) * 2);
+    RadTensor none = T(nullptr, RAD_BF16, { 1 });
+    absent(none);
+    std::vector<RadTensor> ts = { col(0), col(1), col(2), none, none, none,
+                                  T(up_i32(cu), RAD_I32, { (int64_t)cu.size() }), none, none, none,
+                                  none, T(dout, RAD_BF16, { R, W }) };
+    std::vector<RadParam> ps = { PI("q_len", R), PI("head_dim", kHd), PI("gqa", 1),
+                                 PI("block_size", 16), PI("causal", causal), PS("q_dtype", "bf16"),
+                                 PS("kv_dtype", "bf16"), PF("scale", 1.0 / std::sqrt(128.0)),
+                                 PI("max_ctx", 0), PI("n_head", nh), PI("max_seqs", 4) };
+    KQ8 kq;
+    if (i8) {
+        kq = make_kq8(ko, R, nh);
+        RadTensor tk8 = T(kq.dcode, RAD_I8, { R, W });
+        tk8.stride[0] = kq.ld;
+        ts[9] = tk8;
+        ts[10] = T(kq.dscale, RAD_F32, { R, nh });
+        ps.push_back(PS("qk", "i8"));
+    }
+    const std::vector<RadTensor> ts_bf16 = ts;
+    const std::vector<RadParam> ps_bf16 = ps;
+    ColQ8 vq;
+    if (pv8) {
+        vq = make_vq8(vo, R, W);
+        RadTensor tv8 = T(vq.dcode, RAD_F8E4M3, { R, W });
+        tv8.stride[0] = vq.ld;
+        ts[2] = tv8;
+        ts.push_back(T(vq.dscale, RAD_F32, { W }));
+        ps.push_back(PS("pv", "fp8"));
+    }
+    int64_t msl = 0;
+    for (size_t sq = 0; sq + 1 < cu.size(); ++sq) msl = std::max<int64_t>(msl, cu[sq + 1] - cu[sq]);
+    const std::string nm = fmt("%s %zu sequence(s) of up to %lld rows, %lld heads, causal %d, qk %s, "
+                               "pv %s", name, cu.size() - 1, (long long)msl, (long long)nh, causal,
+                               i8 ? "i8" : "bf16", pv8 ? "fp8" : "bf16");
+    const int rc = run(r, ts, ps);
+    if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); return; }
+    const std::vector<float> out = down_bf16(dout, (size_t)(R * W));
+    std::vector<float> got, want, row((size_t)kHd);
+    for (int64_t x = 0; x < R; x += stride) {
+        int64_t sq = 0;
+        while (sq + 2 < (int64_t)cu.size() && cu[(size_t)sq + 1] <= x) ++sq;
+        std::vector<int> keys;
+        const int64_t kend = causal ? x + 1 : cu[(size_t)sq + 1];
+        for (int64_t j = cu[(size_t)sq]; j < kend; ++j) keys.push_back((int)j);
+        for (int64_t h = 0; h < nh; ++h) {
+            attn_ref(qo, ko, vo, keys, x, h, 1.0 / std::sqrt(128.0), row.data(), i8 ? &kq : nullptr,
+                     pv8 ? &vq : nullptr);
+            for (int64_t e = 0; e < kHd; ++e) {
+                want.push_back(row[(size_t)e]);
+                got.push_back(out[(size_t)(x * W + h * kHd + e)]);
+            }
+        }
+    }
+    check(nm + fmt(": %zu values", got.size()), got, want, pv8 ? kPv8Tol : 2e-2);
+    if (!pv8) return;
+    void* dout2 = dalloc((size_t)(R * W) * 2);
+    std::vector<RadTensor> t2 = ts_bf16;
+    t2[11] = T(dout2, RAD_BF16, { R, W });
+    const int rc2 = run(r, t2, ps_bf16);
+    if (rc2 != RAD_OK) { ok((nm + ": the bf16 P.V form").c_str(), false, "rc " + std::to_string(rc2)); return; }
+    check(nm + ": against the bf16 P.V form", out, down_bf16(dout2, (size_t)(R * W)), 5e-2);
+}
+
+/* The dense fp8 P.V form's refusals: with a paged prefix, and `pv` "fp8" without v_scale. */
+void dense_pv8_refusals(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "attn_prefix_self_h128_bf16");
+    if (!r) return;
+    const int64_t R = 64, W = kHd;
+    std::vector<float> qkv = randv((size_t)(R * 3 * W), 1.0f);
+    void* d = up_bf16(qkv);
+    const Opd vo{ &qkv, 2 * W, 3 * W };
+    const ColQ8 vq = make_vq8(vo, R, W);
+    RadTensor tq = T(d, RAD_BF16, { R, W }), tk = T((uint16_t*)d + W, RAD_BF16, { R, W });
+    tq.stride[0] = tk.stride[0] = 3 * W;
+    RadTensor tv8 = T(vq.dcode, RAD_F8E4M3, { R, W });
+    tv8.stride[0] = vq.ld;
+    RadTensor none = T(nullptr, RAD_BF16, { 1 });
+    absent(none);
+    const RadTensor cu = TI32({ 2 }, { 0, (int32_t)R });
+    const RadTensor to = T(dalloc((size_t)(R * W) * 2), RAD_BF16, { R, W });
+    const RadTensor cache = T(dalloc((size_t)(4 * 16 * 2 * W) * 2), RAD_BF16, { 4, 1, 16, 2 * W });
+    std::vector<RadParam> ps = { PI("q_len", R), PI("head_dim", kHd), PI("gqa", 1),
+                                 PI("block_size", 16), PI("causal", 0), PS("q_dtype", "bf16"),
+                                 PS("kv_dtype", "bf16"), PF("scale", 1.0 / std::sqrt(128.0)),
+                                 PI("max_ctx", 64), PI("n_head", 1), PI("max_seqs", 1),
+                                 PS("pv", "fp8") };
+    int rc = run(r, { tq, tk, tv8, cache, TI32({ 1, 4 }, { 0, 1, 2, 3 }), TI32({ 1 }, { 16 }), cu,
+                      none, none, none, none, to, T(vq.dscale, RAD_F32, { W }) }, ps);
+    ok("attn_prefix_self_h128_bf16 refuses pv fp8 with a prefix", rc == RAD_E_UNSUPPORTED,
+       "rc " + std::to_string(rc));
+    rc = run(r, { tq, tk, tv8, none, none, none, cu, none, none, none, none, to }, ps);
+    ok("attn_prefix_self_h128_bf16 refuses pv fp8 without v_scale", rc == RAD_E_INVAL,
+       "rc " + std::to_string(rc));
+}
+
+void dense_cases(const Plugin& pl) {
+    for (const bool i8 : { false, true })
+        for (const bool pv8 : { false, true }) {
+            dense_case(pl, { 0, 1000, 2333 }, 2, 0, 3, i8, pv8);
+            dense_case(pl, { 0, 1000, 2333 }, 2, 1, 3, i8, pv8);
+        }
+    dense_pv8_refusals(pl);
+    dense_case(pl, { 0, 38010 }, 2, 0, 397, true, true);
+    dense_case(pl, { 0, 38010 }, 2, 0, 397, false, true);
+}
+
+/* The int8 form's refusals: `qk` "i8" without the codes, the codes without it, an unknown `qk`. */
+void attn_i8_refusals(const Plugin& pl, const Pass& p) {
+    const RadKernelInfo* r = find(pl, "attn_vsa_h128_bf16");
+    if (!r) return;
+    const Ref f = select_ref(p.opd(0), p.opd(1), nullptr, p.g, p.nh, 0.8, 1.0 / std::sqrt(128.0));
+    std::vector<int32_t> sel((size_t)(p.nh * p.g.N * f.k), p.g.P);
+    const RadTensor tsel = T(up_i32(sel), RAD_I32, { p.nh, p.g.N, f.k });
+    RadTensor none = T(nullptr, RAD_BF16, { 1 });
+    absent(none);
+    const RadTensor to = T(dalloc((size_t)(p.R * p.W) * 2), RAD_BF16, { p.R, p.W });
+    const KQ8 kq = make_kq8(p.opd(1), p.R, p.nh);
+    RadTensor tk8 = T(kq.dcode, RAD_I8, { p.R, p.W });
+    tk8.stride[0] = kq.ld;
+    const RadTensor tks = T(kq.dscale, RAD_F32, { p.R, p.nh });
+    const std::vector<RadTensor> base = { p.col(0), p.col(1), p.col(2), p.tsegs(), p.tgeom(), tsel,
+                                          none, none, to };
+    std::vector<RadParam> pi8 = params(p.R, 0.8), pbad = params(p.R, 0.8);
+    pi8.push_back(PS("qk", "i8"));
+    pbad.push_back(PS("qk", "fp8"));
+    std::vector<RadTensor> with = base;
+    with.push_back(tk8);
+    with.push_back(tks);
+    int rc = run(r, base, pi8);
+    ok("attn_vsa_h128_bf16 refuses qk i8 without k_i8 / k_scale", rc == RAD_E_INVAL,
+       "rc " + std::to_string(rc));
+    rc = run(r, with, params(p.R, 0.8));
+    ok("attn_vsa_h128_bf16 refuses k_i8 / k_scale without qk i8", rc == RAD_E_INVAL,
+       "rc " + std::to_string(rc));
+    rc = run(r, with, pbad);
+    ok("attn_vsa_h128_bf16 refuses qk fp8", rc == RAD_E_INVAL, "rc " + std::to_string(rc));
+}
+
+/* attn_vsa at sparsity 0 against attn_dense_h128_bf16 on the same rows: two kernels computing
+ * one dense attention, held to the spread between them. */
+void attn_vs_dense_case(const Plugin& pl, const Pass& p) {
+    const RadKernelInfo* r = find(pl, "attn_vsa_h128_bf16");
+    const RadKernelInfo* rd = find(pl, "attn_dense_h128_bf16");
+    if (!r || !rd) { ok("attn_vsa_h128_bf16 vs attn_dense_h128_bf16", false, "row absent"); return; }
+    const Geo& g = p.g;
+    const int k = topk(0.0, g.V);
+    std::vector<int32_t> sel((size_t)(p.nh * g.N * k));
+    for (int64_t h = 0; h < p.nh; ++h)
+        for (int i = 0; i < g.N; ++i)
+            for (int x = 0; x < k; ++x) sel[(size_t)((h * g.N + i) * k + x)] = g.P + x;
+    void* da = dalloc((size_t)(p.R * p.W) * 2);
+    void* db = dalloc((size_t)(p.R * p.W) * 2);
+    RadTensor tn = T(nullptr, RAD_BF16, { 1 });
+    absent(tn);
+    int rc = run(r, { p.col(0), p.col(1), p.col(2), p.tsegs(), p.tgeom(),
+                      T(up_i32(sel), RAD_I32, { p.nh, g.N, k }), tn, tn, T(da, RAD_BF16, { p.R, p.W }) },
+                 params(p.R, 0.0));
+    const int rc2 = launch(rd, { p.col(0), p.col(1), p.col(2), TI32({ 2 }, { 0, (int32_t)p.R }),
+                                 T(db, RAD_BF16, { p.R, p.W }) },
+                           { PI("M", p.R), PI("head_dim", kHd), PI("gqa", 1), PI("causal", 0),
+                             PS("dtype", "bf16"), PF("scale", 1.0 / std::sqrt(128.0)),
+                             PI("max_seqlen", p.R) });
+    const std::string nm = fmt("attn_vsa_h128_bf16 %s sparsity 0.0 vs attn_dense_h128_bf16", p.s.what);
+    if (rc != RAD_OK || rc2 != RAD_OK) { ok(nm.c_str(), false, fmt("rc %d / %d", rc, rc2)); return; }
+    check(nm, down_bf16(da, (size_t)(p.R * p.W)), down_bf16(db, (size_t)(p.R * p.W)), 1e-2);
+}
+
+/* The small geometry with every edge: dense segments of 13 and 14 rows, a 6 x 5 x 7 grid (edge
+ * boxes along all three axes); the same with an empty segment between; and the 1344 x 768 pass
+ * (text 300, a soundtrack of 2 x 207, 37 x 24 x 42). */
+const Shape kSmall = { "13 | 14 | 6 x 5 x 7", { 13, 14 }, 6, 5, 7 };
+const Shape kSmallEmpty = { "13 | 0 | 14 | 6 x 5 x 7", { 13, 0, 14 }, 6, 5, 7 };
+const Shape k768 = { "1344 x 768", { 300, 207, 207 }, 37, 24, 42 };
+
+void select_cases(const Plugin& pl) {
+    const Pass s = make_pass(kSmall, 3, 1.5f);
+    select_case(pl, s, 0.8, true, s.g.N + 5, topk(0.8, s.g.V) + 3);
+    select_case(pl, s, 0.8, false, s.g.N + 5, topk(0.8, s.g.V) + 3, 1, ", one head a group");
+    select_case(pl, s, 0.0, true, s.g.N, s.g.V, 2, ", two heads a group");
+    select_case(pl, s, 0.8, true, 2000, 16, 3, ", 2000-tile capacity");
+    const Pass e = make_pass(kSmallEmpty, 2, 1.5f);
+    select_case(pl, e, 0.8, true, e.g.N, topk(0.8, e.g.V));
+    select_tie_case(pl, kSmall);
+    select_refusals(pl, s);
+    const Pass b = make_pass(k768, 3, 1.5f);
+    select_case(pl, b, 0.8, true, 1500, 300);
+}
+
+void attn_cases(const Plugin& pl) {
+    const Pass s = make_pass(kSmall, 3, 1.5f);
+    attn_case(pl, s, 0.8, true, 1);
+    attn_case(pl, s, 0.8, false, 1);
+    attn_case(pl, s, 0.0, false, 1);
+    attn_case(pl, s, 0.0, true, 1);
+    const Pass e = make_pass(kSmallEmpty, 2, 1.5f);
+    attn_case(pl, e, 0.8, true, 1);
+    attn_vs_dense_case(pl, s);
+    attn_case(pl, s, 0.8, true, 1, true);
+    attn_case(pl, s, 0.0, false, 1, true);
+    attn_case(pl, e, 0.8, false, 1, true);
+    attn_i8_refusals(pl, s);
+    attn_case(pl, s, 0.8, true, 1, true, true);
+    attn_case(pl, s, 0.8, false, 1, false, true);
+    attn_case(pl, s, 0.0, true, 1, true, true);
+    attn_case(pl, e, 0.8, false, 1, true, true);
+    attn_pv8_refusals(pl, s);
+    const Pass b = make_pass(k768, 2, 1.5f);
+    attn_case(pl, b, 0.8, true, 61);
+    attn_case(pl, b, 0.8, true, 61, true);
+    attn_case(pl, b, 0.8, true, 61, true, true);
+    attn_case(pl, b, 0.8, false, 61, false, true);
+    attn_vs_dense_case(pl, b);
+}
+
+}  /* namespace vsa */
 
 static void fused_quant_fp8_numeric(const Plugin& pl) {
     const RadKernelInfo* nrm = find(pl, "rmsnorm_bf16");
@@ -7311,6 +10438,701 @@ static void w2_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iters
                  tp.label.c_str());
     }
 }
+/* ------------------------------------------------------------------ video sparse attention, timed
+ *
+ * vsa_select and attn_vsa at FastH3's 1344 x 768 pass (text 300 rows, a soundtrack of 2 x 207, a
+ * 37 x 24 x 42 grid: 38010 rows, 675 tiles) at a TP2 rank's 28 heads, and attn_dense over the
+ * same rows in the same run. q, k and v are column slices of one fused row, as the transformer
+ * writes them, every value distinct (an avalanche hash of its index), so no two tiles share a
+ * mean. attn_vsa's rate counts the work it does: 4 head_dim (query rows x visible key rows) over
+ * every (query tile, head), from the selection read back. Warm, back to back. */
+static void vsa_perf(const Plugin& pl, int iters, bool local) {
+    using namespace vsa;
+    if (iters <= 0) iters = 5;
+    const RadKernelInfo* rs = find(pl, "vsa_select_h128_bf16");
+    const RadKernelInfo* ra = find(pl, "attn_vsa_h128_bf16");
+    const RadKernelInfo* rd = find(pl, "attn_dense_h128_bf16");
+    if (!rs || !ra || !rd) { std::printf("--perfvsa: rows absent\n"); return; }
+    const Shape s = k768;
+    const std::vector<int32_t> segs = segs_of(s);
+    const int64_t R = segs.back(), nh = 28, W = nh * kHd, ld = 3 * W;
+    const Geo g = tiles(segs, s.F, s.Hp, s.Wp);
+    const int64_t tiles_cap = 1500, k_cap = 704;
+    void* dq = dalloc((size_t)(R * ld) * 2);
+    void* dg = dalloc((size_t)(R * W) * 2);
+    void* dout = dalloc((size_t)(R * W) * 2);
+    void* dsel = dalloc((size_t)(nh * tiles_cap * k_cap) * 4);
+    void* dco = dalloc((size_t)(nh * tiles_cap * kHd) * 2);
+    if (!dq || !dg || !dout || !dsel || !dco) { std::printf("--perfvsa: hipMalloc failed\n"); return; }
+    auto fill = [](void* d, int64_t n, uint32_t salt) {
+        const int64_t chunk = (int64_t)8 << 20;
+        std::vector<uint16_t> h((size_t)std::min(chunk, n));
+        for (int64_t off = 0; off < n; off += chunk) {
+            const int64_t m = std::min(chunk, n - off);
+            for (int64_t i = 0; i < m; ++i) h[(size_t)i] = st_rand_bf16((uint32_t)(off + i) ^ salt);
+            st_memcpy((uint16_t*)d + off, h.data(), (size_t)m * 2, hipMemcpyHostToDevice);
+        }
+    };
+    fill(dq, R * ld, 0u);
+    if (local) {
+        /* q and k of a video row: half random, half (cos, sin) pairs of its position along one
+         * axis at wavelengths of 6 to 48 rows, so a score falls with the distance between two
+         * tiles and a query tile selects its neighbourhood. */
+        static const double kWave[7] = { 48, 32, 24, 16, 12, 8, 6 };
+        const int64_t vb = segs[segs.size() - 2], rows = 512;
+        std::vector<uint16_t> h((size_t)(rows * ld));
+        for (int64_t r0 = vb; r0 < R; r0 += rows) {
+            const int64_t n = std::min(rows, R - r0);
+            for (int64_t r = r0; r < r0 + n; ++r) {
+                uint16_t* hr = h.data() + (r - r0) * ld;
+                const int x = (int)(r - vb), p3[3] = { x / (s.Hp * s.Wp), (x / s.Wp) % s.Hp, x % s.Wp };
+                for (int64_t c = 0; c < ld; ++c) {
+                    const float u = h_bf16(st_rand_bf16((uint32_t)(r * ld + c)));
+                    if (c >= 2 * W) { hr[c] = h_to_bf16(u); continue; }
+                    const int d = (int)(c % kHd), m = d / 2;
+                    const double ph = 2.0 * M_PI * p3[m % 3] / kWave[(m / 3) % 7];
+                    hr[c] = h_to_bf16(0.5f * u + 0.5f * (float)(d & 1 ? std::sin(ph) : std::cos(ph)));
+                }
+            }
+            st_memcpy((uint16_t*)dq + r0 * ld, h.data(), (size_t)(n * ld) * 2, hipMemcpyHostToDevice);
+        }
+    }
+    fill(dg, R * W, 0x5bd1e995u);
+    auto col = [&](int64_t which) {
+        RadTensor t = T((uint16_t*)dq + which * W, RAD_BF16, { R, W });
+        t.stride[0] = ld;
+        return t;
+    };
+    const RadTensor tsegs = TI32({ (int64_t)segs.size() }, segs);
+    const RadTensor tgeom = TI32({ 16 }, { s.F, 2 * s.Hp, 2 * s.Wp, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                           0, 0, 0 });
+    const RadTensor tsel = T(dsel, RAD_I32, { nh, tiles_cap, k_cap });
+    RadTensor tco = T(dco, RAD_BF16, { nh, tiles_cap, kHd }), tgate = T(dg, RAD_BF16, { R, W });
+    RadTensor none = tco;
+    absent(none);
+    const RadTensor tout = T(dout, RAD_BF16, { R, W });
+
+    RadArgs probe;
+    std::memset(&probe, 0, sizeof(probe));
+    std::vector<RadParam> pp = params(R, 0.8);
+    probe.p = pp.data(); probe.n_p = (int)pp.size();
+    const int64_t sb = rs->scratch(&probe);
+    void* scr = dalloc((size_t)sb);
+    auto time = [&](const RadKernelInfo* r, std::vector<RadTensor> ts, std::vector<RadParam> ps,
+                    int it) -> double {
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        a.scratch = scr; a.scratch_bytes = sb;
+        const int rc = r->launch(&a, nullptr);
+        if (rc != RAD_OK) return (double)rc;
+        if (st_stream_sync(nullptr) != hipSuccess) return -1000.0;
+        return st_time_us([&](int) { r->launch(&a, nullptr); }, it, nullptr);
+    };
+    /* The work attn_vsa does for the selection in `dsel`, in FLOPs. */
+    auto work = [&](double sp) {
+        const std::vector<int32_t> sel = down_i32(dsel, (size_t)(nh * tiles_cap * k_cap));
+        const int k = topk(sp, g.V);
+        double pre = 0, f = 0;
+        for (int j = 0; j < g.P; ++j) pre += (double)g.rows[(size_t)j].size();
+        for (int64_t h = 0; h < nh; ++h)
+            for (int i = 0; i < g.N; ++i) {
+                double keys = i < g.P ? (double)R : pre;
+                if (i >= g.P)
+                    for (int x = 0; x < k; ++x)
+                        keys += (double)g.rows[(size_t)sel[(size_t)((h * tiles_cap + i) * k_cap + x)]].size();
+                f += 4.0 * kHd * (double)g.rows[(size_t)i].size() * keys;
+            }
+        return f;
+    };
+    /* Key tiles staged a query tile when `group` consecutive query tiles walk the union of
+     * their lists. */
+    auto staged = [&](double sp, int group) {
+        const std::vector<int32_t> sel = down_i32(dsel, (size_t)(nh * tiles_cap * k_cap));
+        const int k = topk(sp, g.V);
+        double n = 0;
+        for (int64_t h = 0; h < nh; ++h)
+            for (int i0 = 0; i0 < g.N; i0 += group) {
+                std::vector<char> in((size_t)g.N, 0);
+                for (int i = i0; i < std::min(i0 + group, g.N); ++i) {
+                    if (i < g.P) { std::fill(in.begin(), in.end(), 1); break; }
+                    for (int j = 0; j < g.P; ++j) in[(size_t)j] = 1;
+                    for (int x = 0; x < k; ++x) in[(size_t)sel[(size_t)((h * tiles_cap + i) * k_cap + x)]] = 1;
+                }
+                for (char b : in) n += b;
+            }
+        return n / (double)(nh * g.N);
+    };
+    const double dense = 4.0 * (double)R * (double)R * kHd * nh;
+
+    std::printf("1344 x 768: %lld rows, %d tiles (%d prefix, %d video), %lld heads, %s q and k, "
+                "%d launches each\n", (long long)R, g.N, g.P, g.V, (long long)nh,
+                local ? "position-structured" : "random", iters);
+    std::printf("\nvsa_select (vsa_select_h128_bf16), %.1f MiB of scratch\n", (double)sb / 1048576.0);
+    for (const double sp : { 0.8, 0.0 }) {
+        for (const bool c : { true, false }) {
+            const double us = time(rs, { col(0), col(1), c ? col(2) : none, tsegs, tgeom, tsel,
+                                         c ? tco : none }, params(R, sp), iters * 2);
+            if (us < 0) std::printf("  sparsity %.1f coarse %-3s  rc %d\n", sp, c ? "yes" : "no", (int)us);
+            else std::printf("  sparsity %.1f coarse %-3s  %9.1f us\n", sp, c ? "yes" : "no", us);
+        }
+    }
+    std::printf("\nattn_vsa (attn_vsa_h128_bf16)\n");
+    for (const double sp : { 0.8, 0.0 }) {
+        /* The selection this sparsity reads, from vsa_select. */
+        time(rs, { col(0), col(1), col(2), tsegs, tgeom, tsel, tco }, params(R, sp), 0);
+        const double f = work(sp);
+        std::printf("  sparsity %.1f: key tiles staged a query tile, alone %.1f, in pairs %.1f, in "
+                    "fours %.1f\n", sp, staged(sp, 1), staged(sp, 2), staged(sp, 4));
+        for (const bool c : { true, false }) {
+            if (!c && sp == 0.0) continue;
+            const double us = time(ra, { col(0), col(1), col(2), tsegs, tgeom, tsel,
+                                         c ? tco : none, c ? tgate : none, tout },
+                                   params(R, sp), iters);
+            if (us < 0) std::printf("  sparsity %.1f coarse %-3s  rc %d\n", sp, c ? "yes" : "no", (int)us);
+            else std::printf("  sparsity %.1f coarse %-3s  %9.1f us  %6.1f TFLOP/s  (%.0f GFLOP, %.1f%% "
+                             "of dense)\n", sp, c ? "yes" : "no", us, f / (us * 1e6), f / 1e9,
+                             100.0 * f / dense);
+        }
+    }
+    /* The int8 Q.K form: k's codes and scales from the device's k (quant_act_i8g's rule), timed
+     * at sparsity 0.8 on the selection vsa_select writes, and its output against the bf16
+     * form's. */
+    {
+        std::vector<uint16_t> kh((size_t)(R * W));
+        st_memcpy2d(kh.data(), (size_t)W * 2, (uint16_t*)dq + W, (size_t)ld * 2, (size_t)W * 2,
+                    (size_t)R, hipMemcpyDeviceToHost);
+        std::vector<int8_t> c8((size_t)(R * W));
+        std::vector<float> sc((size_t)(R * nh));
+        float x[kHd], code[kHd];
+        for (int64_t r = 0; r < R; ++r)
+            for (int64_t h = 0; h < nh; ++h) {
+                for (int64_t d = 0; d < kHd; ++d) x[d] = h_bf16(kh[(size_t)(r * W + h * kHd + d)]);
+                sc[(size_t)(r * nh + h)] = q8_row(x, kHd, code);
+                for (int64_t d = 0; d < kHd; ++d) c8[(size_t)(r * W + h * kHd + d)] = (int8_t)code[d];
+            }
+        void* dk8 = dalloc(c8.size());
+        void* dks = up_f32(sc);
+        void* dref = dalloc((size_t)(R * W) * 2);
+        if (!dk8 || !dks || !dref) { std::printf("--perfvsa: hipMalloc failed\n"); return; }
+        st_memcpy(dk8, c8.data(), c8.size(), hipMemcpyHostToDevice);
+        const RadTensor tk8 = T(dk8, RAD_I8, { R, W }), tks = T(dks, RAD_F32, { R, nh });
+        time(rs, { col(0), col(1), col(2), tsegs, tgeom, tsel, tco }, params(R, 0.8), 0);
+        const double f = work(0.8);
+        std::vector<RadParam> pi8 = params(R, 0.8);
+        pi8.push_back(PS("qk", "i8"));
+        std::printf("\nattn_vsa, qk i8 (k_i8 / k_scale)\n");
+        for (const bool c : { true, false }) {
+            const double us = time(ra, { col(0), col(1), col(2), tsegs, tgeom, tsel, c ? tco : none,
+                                         c ? tgate : none, tout, tk8, tks }, pi8, iters);
+            if (us < 0) std::printf("  sparsity 0.8 coarse %-3s  rc %d\n", c ? "yes" : "no", (int)us);
+            else std::printf("  sparsity 0.8 coarse %-3s  %9.1f us  %6.1f TFLOP/s\n", c ? "yes" : "no",
+                             us, f / (us * 1e6));
+        }
+        const RadTensor tref = T(dref, RAD_BF16, { R, W });
+        time(ra, { col(0), col(1), col(2), tsegs, tgeom, tsel, none, none, tref }, params(R, 0.8), 0);
+        time(ra, { col(0), col(1), col(2), tsegs, tgeom, tsel, none, none, tout, tk8, tks }, pi8, 0);
+        const std::vector<float> a = down_bf16(dout, (size_t)(R * W)), b = down_bf16(dref, (size_t)(R * W));
+        std::printf("  output against the bf16 form: rel_l2 %.3g\n", rel(a, b));
+
+        /* The fp8 P.V form: v's codes and column scales from quant_cols_fp8 (timed, with the
+         * bytes it moves: v read twice, the codes written once), then attn_vsa at int8 and at
+         * bf16 scores, and its output against the bf16 P.V form at int8 scores and against the
+         * bf16 form. */
+        void* dv8 = dalloc((size_t)(R * W));
+        void* dvs = dalloc((size_t)W * 4);
+        void* dref8 = dalloc((size_t)(R * W) * 2);
+        if (!dv8 || !dvs || !dref8) { std::printf("--perfvsa: hipMalloc failed\n"); return; }
+        const RadTensor tv8 = T(dv8, RAD_F8E4M3, { R, W }), tvs = T(dvs, RAD_F32, { W });
+        if (const RadKernelInfo* rq = find(pl, "quant_cols_fp8_bf16")) {
+            const double uq = time(rq, { col(2), tv8, tvs }, { PI("M", R), PI("n", W),
+                                                               PS("dtype", "bf16") }, iters * 4);
+            if (uq < 0) std::printf("\nquant_cols_fp8 rc %d\n", (int)uq);
+            else std::printf("\nquant_cols_fp8 (quant_cols_fp8_bf16), v: %lld x %lld  %9.1f us  "
+                             "%6.0f GB/s\n", (long long)R, (long long)W, uq,
+                             (double)(R * W) * 5.0 / (uq * 1e3));
+        } else {
+            std::printf("\nquant_cols_fp8: row absent\n");
+            return;
+        }
+        RadTensor ni8 = T(nullptr, RAD_I8, { 1 });
+        absent(ni8);
+        std::vector<RadParam> p88 = pi8, pb8 = params(R, 0.8);
+        p88.push_back(PS("pv", "fp8"));
+        pb8.push_back(PS("pv", "fp8"));
+        std::printf("attn_vsa, pv fp8 (v as E4M3 codes, v_scale)\n");
+        for (const bool i8f : { true, false })
+            for (const bool c : { true, false }) {
+                const double us = time(ra, { col(0), col(1), tv8, tsegs, tgeom, tsel, c ? tco : none,
+                                             c ? tgate : none, tout, i8f ? tk8 : ni8, i8f ? tks : ni8,
+                                             tvs }, i8f ? p88 : pb8, iters);
+                if (us < 0) std::printf("  qk %-4s sparsity 0.8 coarse %-3s  rc %d\n", i8f ? "i8" : "bf16",
+                                        c ? "yes" : "no", (int)us);
+                else std::printf("  qk %-4s sparsity 0.8 coarse %-3s  %9.1f us  %6.1f TFLOP/s\n",
+                                 i8f ? "i8" : "bf16", c ? "yes" : "no", us, f / (us * 1e6));
+            }
+        const RadTensor tref8 = T(dref8, RAD_BF16, { R, W });
+        time(ra, { col(0), col(1), col(2), tsegs, tgeom, tsel, none, none, tref8, tk8, tks }, pi8, 0);
+        time(ra, { col(0), col(1), tv8, tsegs, tgeom, tsel, none, none, tout, tk8, tks, tvs }, p88, 0);
+        const std::vector<float> a8 = down_bf16(dout, (size_t)(R * W));
+        std::printf("  qk i8 pv fp8 output against qk i8 pv bf16: rel_l2 %.3g, against the bf16 "
+                    "form: rel_l2 %.3g\n", rel(a8, down_bf16(dref8, (size_t)(R * W))), rel(a8, b));
+    }
+
+    std::printf("\nattn_dense (attn_dense_h128_bf16), the same rows as one sequence\n");
+    const double us = time(rd, { col(0), col(1), col(2), TI32({ 2 }, { 0, (int32_t)R }), tout },
+                           { PI("M", R), PI("head_dim", kHd), PI("gqa", 1), PI("causal", 0),
+                             PS("dtype", "bf16"), PF("scale", 1.0 / std::sqrt(128.0)),
+                             PI("max_seqlen", R) }, iters);
+    if (us < 0) std::printf("  rc %d\n", (int)us);
+    else std::printf("  %9.1f us  %6.1f TFLOP/s  (%.0f GFLOP)\n", us, dense / (us * 1e6), dense / 1e9);
+}
+
+/* ------------------------------------------------------------------ a video generator, timed
+ *
+ * The ops of a video transformer's step and its decoder that dense attention does not dominate,
+ * at their shapes: the f32 GEMMs (the patch projections over the longest video, the heads over a
+ * 16384-row part, the timestep MLP, a video decoder's 1x1 projections), the fp8 modulation
+ * projection into its table, and the dense attention itself over one packed sequence of 3K to 106K
+ * rows at a TP2 rank's 28 heads, with the rate it reaches (4 M^2 head_dim heads FLOPs), and a
+ * decoder pass's per-tile attention. Warm: one set of operands, launched back to back; contents
+ * are bounded random values, so the softmax takes its rescale path as real data does. */
+/* --perfattn M HEADS [iters]: one long non-causal sequence of M rows through the head-128 dense
+ * attention at HEADS heads -- attn_dense, and attn_prefix_self without a prefix at bf16 and int8
+ * scores -- with q, k and v as columns of one fused projection, as a DiT step issues them. */
+static void attn_perf(const Plugin& pl, int64_t M, int64_t H, int iters) {
+    if (iters <= 0) iters = 5;
+    const int64_t W = H * 128;
+    void* dqkv = dalloc((size_t)(M * 3 * W) * 2);
+    void* dk8 = dalloc((size_t)(M * W));
+    void* dks = dalloc((size_t)(M * H) * 4);
+    void* dout = dalloc((size_t)(M * W) * 2);
+    if (!dqkv || !dk8 || !dks || !dout) { std::printf("--perfattn: hipMalloc failed\n"); dfree_all(); return; }
+    {
+        std::vector<uint16_t> h((size_t)(M * 3 * W));
+        for (size_t i = 0; i < h.size(); ++i) h[i] = st_rand_bf16((uint32_t)i);
+        st_memcpy(dqkv, h.data(), h.size() * 2, hipMemcpyHostToDevice);
+        std::vector<int8_t> c((size_t)(M * W));
+        for (size_t i = 0; i < c.size(); ++i) c[i] = (int8_t)((int)((i * 2654435761u) >> 24) % 255 - 127);
+        st_memcpy(dk8, c.data(), c.size(), hipMemcpyHostToDevice);
+        std::vector<float> s((size_t)(M * H));
+        for (size_t i = 0; i < s.size(); ++i) s[i] = 0.004f + 0.0005f * (float)(i % 7);
+        st_memcpy(dks, s.data(), s.size() * 4, hipMemcpyHostToDevice);
+    }
+    auto col = [&](int64_t c0) {
+        RadTensor t = T((uint16_t*)dqkv + c0, RAD_BF16, { M, W });
+        t.stride[0] = 3 * W;
+        return t;
+    };
+    RadTensor none = T(nullptr, RAD_BF16, { 1 });
+    absent(none);
+    const RadTensor cu = TI32({ 2 }, { 0, (int32_t)M });
+    const double flop = 4.0 * (double)M * (double)M * 128.0 * (double)H;
+    const int64_t sb = 32 * W * 4;
+    void* scr = dalloc((size_t)sb);
+    auto run = [&](const char* row, std::vector<RadTensor> ts, std::vector<RadParam> ps) {
+        const RadKernelInfo* r = find(pl, row);
+        if (!r) { std::printf("  %-34s absent\n", row); return; }
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        a.scratch = scr; a.scratch_bytes = sb;
+        const int rc = r->launch(&a, nullptr);
+        if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
+            std::printf("  %-34s rc %d\n", row, rc);
+            return;
+        }
+        const double us = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
+        const char *qk = "", *pv = "";
+        for (const RadParam& p : ps) {
+            if (!std::strcmp(p.key, "qk")) qk = p.sval;
+            if (!std::strcmp(p.key, "pv")) pv = p.sval;
+        }
+        if (!std::strcmp(row, "quant_cols_fp8_bf16"))
+            std::printf("  %-26s %-9s %9.2f ms  %7.0f GB/s\n", row, "v", us / 1000.0,
+                        (double)(M * W) * 5.0 / (us * 1e3));
+        else
+            std::printf("  %-26s %-4s %-4s %9.2f ms  %7.1f TFLOP/s\n", row, qk, pv, us / 1000.0,
+                        flop / (us * 1e6));
+    };
+    std::printf("dense attention, %lld rows x %lld heads x 128, %d launches each\n", (long long)M,
+                (long long)H, iters);
+    run("attn_dense_h128_bf16", { col(0), col(W), col(2 * W), cu, T(dout, RAD_BF16, { M, W }) },
+        { PI("M", M), PI("head_dim", 128), PI("gqa", 1), PI("causal", 0), PS("dtype", "bf16"),
+          PF("scale", 1.0 / std::sqrt(128.0)), PI("max_seqlen", M) });
+    for (const char* qk : { "bf16", "i8" }) {
+        const bool i8 = !std::strcmp(qk, "i8");
+        RadTensor k8 = T(dk8, RAD_I8, { M, W }), ks = T(dks, RAD_F32, { M, H });
+        if (!i8) { absent(k8); absent(ks); }
+        run("attn_prefix_self_h128_bf16",
+            { col(0), col(W), col(2 * W), none, none, none, cu, none, none, k8, ks,
+              T(dout, RAD_BF16, { M, W }) },
+            { PI("q_len", M), PI("head_dim", 128), PI("gqa", 1), PI("block_size", 16),
+              PI("causal", 0), PS("q_dtype", "bf16"), PS("kv_dtype", "bf16"),
+              PF("scale", 1.0 / std::sqrt(128.0)), PI("max_ctx", 0), PI("n_head", H),
+              PI("max_seqs", 1), PS("qk", qk) });
+    }
+    /* The fp8 P.V form, v's codes and column scales written by quant_cols_fp8 (timed too). */
+    void* dv8 = dalloc((size_t)(M * W));
+    void* dvs = dalloc((size_t)W * 4);
+    if (!dv8 || !dvs || !scr) { std::printf("--perfattn: hipMalloc failed\n"); dfree_all(); return; }
+    const RadTensor tv8 = T(dv8, RAD_F8E4M3, { M, W }), tvs = T(dvs, RAD_F32, { W });
+    run("quant_cols_fp8_bf16", { col(2 * W), tv8, tvs },
+        { PI("M", M), PI("n", W), PS("dtype", "bf16") });
+    for (const char* qk : { "bf16", "i8" }) {
+        const bool i8 = !std::strcmp(qk, "i8");
+        RadTensor k8 = T(dk8, RAD_I8, { M, W }), ks = T(dks, RAD_F32, { M, H });
+        if (!i8) { absent(k8); absent(ks); }
+        run("attn_prefix_self_h128_bf16",
+            { col(0), col(W), tv8, none, none, none, cu, none, none, k8, ks,
+              T(dout, RAD_BF16, { M, W }), tvs },
+            { PI("q_len", M), PI("head_dim", 128), PI("gqa", 1), PI("block_size", 16),
+              PI("causal", 0), PS("q_dtype", "bf16"), PS("kv_dtype", "bf16"),
+              PF("scale", 1.0 / std::sqrt(128.0)), PI("max_ctx", 0), PI("n_head", H),
+              PI("max_seqs", 1), PS("qk", qk), PS("pv", "fp8") });
+    }
+    dfree_all();
+}
+
+static void video_perf(const Plugin& pl, int iters, const char* only) {
+    if (iters <= 0) iters = 10;
+    /* One section by name, or every one. */
+    auto want = [&](const char* sec) { return !only || !std::strcmp(only, sec); };
+    /* Device memory filled with bounded random bf16, a 16 MiB pattern repeated. */
+    auto rand_fill = [](void* d, size_t bytes) {
+        const size_t chunk = std::min<size_t>(bytes, (size_t)16 << 20);
+        std::vector<uint16_t> h(chunk / 2);
+        for (size_t i = 0; i < h.size(); ++i) h[i] = st_rand_bf16((uint32_t)i);
+        for (size_t off = 0; off < bytes; off += chunk)
+            st_memcpy((uint8_t*)d + off, h.data(), std::min(chunk, bytes - off), hipMemcpyHostToDevice);
+    };
+    auto time_row = [&](const RadKernelInfo* r, std::vector<RadTensor> ts, std::vector<RadParam> ps,
+                        int it) -> double {
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        a.world_size = 1;
+        const int rc = r->launch(&a, nullptr);
+        /* A refusal or a fault comes back negative: the launch's code, or -1000. */
+        if (rc != RAD_OK) return (double)rc;
+        if (st_stream_sync(nullptr) != hipSuccess) return -1000.0;
+        return st_time_us([&](int) { r->launch(&a, nullptr); }, it, nullptr);
+    };
+
+    /* Random E4M3 codes over the whole range but the two NaN codes, as a quantiser with an amax
+     * scale writes them; at a power limit the time depends on how many bits switch. */
+    auto rand_fill_e4m3 = [](void* d, size_t bytes) {
+        const size_t chunk = std::min<size_t>(bytes, (size_t)16 << 20);
+        std::vector<uint8_t> h(chunk);
+        for (size_t i = 0; i < h.size(); ++i) {
+            const uint8_t b = (uint8_t)(st_mix32((uint32_t)i) >> 7);
+            h[i] = (b & 0x7Fu) == 0x7Fu ? (uint8_t)(b ^ 1u) : b;
+        }
+        for (size_t off = 0; off < bytes; off += chunk)
+            st_memcpy((uint8_t*)d + off, h.data(), std::min(chunk, bytes - off), hipMemcpyHostToDevice);
+    };
+
+    if (want("trunk")) {
+        std::printf("gemm_nt_q at fp8a8 (gemm_fp8a8_tiled): the DiT's linears on one of two ranks, at "
+                    "a short clip's rows, half a step's and a whole step's, %d launches each\n",
+                    iters);
+        const RadKernelInfo* gq = find(pl, "gemm_fp8a8_tiled");
+        struct L { const char* what; int64_t N, K; };
+        for (const int64_t M : { (int64_t)1412, (int64_t)18648, (int64_t)37774 }) {
+            for (const L& g : { L{ "qkv", 10752, 5376 }, L{ "qkv + gate (FastH3)", 14336, 5376 },
+                                L{ "o", 5376, 3584 }, L{ "gate_up", 14336, 5376 },
+                                L{ "down", 5376, 7168 } }) {
+                if (!gq) { std::printf("  row absent\n"); break; }
+                const int64_t sk = g.K / 128, sn = g.N / 128;
+                void* dx = dalloc((size_t)(M * g.K));
+                void* dxs = dalloc((size_t)(M * sk) * 4);
+                void* dw = dalloc((size_t)(g.N * g.K));
+                void* dws = dalloc((size_t)(sn * sk) * 2);
+                void* dy = dalloc((size_t)(M * g.N) * 2);
+                if (!dx || !dxs || !dw || !dws || !dy) { std::printf("  hipMalloc failed\n"); dfree_all(); continue; }
+                rand_fill_e4m3(dx, (size_t)(M * g.K));
+                rand_fill_e4m3(dw, (size_t)(g.N * g.K));
+                {
+                    std::vector<float> xs((size_t)(M * sk));
+                    for (size_t i = 0; i < xs.size(); ++i)
+                        xs[i] = (1.0f + (float)(st_mix32((uint32_t)i) & 1023u) / 1024.0f) * 2.0e-3f;
+                    st_memcpy(dxs, xs.data(), xs.size() * 4, hipMemcpyHostToDevice);
+                    std::vector<uint16_t> ws((size_t)(sn * sk));
+                    for (size_t i = 0; i < ws.size(); ++i)
+                        ws[i] = h_to_bf16((1.0f + (float)(st_mix32((uint32_t)i + 7u) & 1023u) / 1024.0f) * 3.0e-4f);
+                    st_memcpy(dws, ws.data(), ws.size() * 2, hipMemcpyHostToDevice);
+                }
+                RadTensor t5 = T(nullptr, RAD_F32, { 1 }), t6 = T(nullptr, RAD_U8, { 1 });
+                absent(t5);
+                absent(t6);
+                const int it = M > 20000 ? std::max(2, iters / 2) : iters;
+                const double us = time_row(gq, { T(dx, RAD_F8E4M3, { M, g.K }), T(dxs, RAD_F32, { M, sk }),
+                                                 T(dw, RAD_F8E4M3, { g.N, g.K }), T(dws, RAD_BF16, { sn, sk }),
+                                                 T(dy, RAD_BF16, { M, g.N }), t5, t6 },
+                                           { PI("M", M), PI("N", g.N), PI("K", g.K), PI("group", 128),
+                                             PS("dtype", "fp8a8") },
+                                           it);
+                if (us < 0) std::printf("  %-20s M %6lld: rc %d\n", g.what, (long long)M, (int)us);
+                else std::printf("  %-20s M %6lld N %5lld K %5lld  %9.1f us  %6.1f TFLOP/s\n", g.what,
+                                 (long long)M, (long long)g.N, (long long)g.K, us,
+                                 2.0 * (double)M * g.N * g.K / (us * 1e6));
+                dfree_all();
+            }
+        }
+    }
+
+    if (want("decoder")) {
+        std::printf("\ngemm_nt_bias at bf16 (gemm_bf16_nt_bias_tiled): the video decoder's linears "
+                    "over 14 tiles of 1797 rows, f32 bias, %d launches each\n", iters);
+        const RadKernelInfo* gb = find(pl, "gemm_bf16_nt_bias_tiled");
+        struct L { const char* what; int64_t N, K; };
+        const int64_t M = 14 * 1797;
+        for (const L& g : { L{ "qkv", 6144, 2048 }, L{ "o", 2048, 2048 }, L{ "up", 16384, 2048 },
+                            L{ "down", 2048, 8192 } }) {
+            if (!gb) { std::printf("  row absent\n"); break; }
+            void* da = dalloc((size_t)(M * g.K) * 2);
+            void* dw = dalloc((size_t)(g.N * g.K) * 2);
+            void* db = dalloc((size_t)g.N * 4);
+            void* dy = dalloc((size_t)(M * g.N) * 2);
+            if (!da || !dw || !db || !dy) { std::printf("  hipMalloc failed\n"); dfree_all(); continue; }
+            rand_fill(da, (size_t)(M * g.K) * 2);
+            rand_fill(dw, (size_t)(g.N * g.K) * 2);
+            RadTensor tr = T(nullptr, RAD_BF16, { 1 });
+            absent(tr);
+            const double us = time_row(gb, { T(da, RAD_BF16, { M, g.K }), T(dw, RAD_BF16, { g.N, g.K }),
+                                             T(db, RAD_F32, { g.N }), tr, T(dy, RAD_BF16, { M, g.N }) },
+                                       { PI("M", M), PI("N", g.N), PI("K", g.K), PS("dtype", "bf16") },
+                                       iters);
+            if (us < 0) std::printf("  %-6s rc %d\n", g.what, (int)us);
+            else std::printf("  %-6s M %6lld N %5lld K %5lld  %9.1f us  %6.1f TFLOP/s\n", g.what,
+                             (long long)M, (long long)g.N, (long long)g.K, us,
+                             2.0 * (double)M * g.N * g.K / (us * 1e6));
+            dfree_all();
+        }
+
+        /* The elementwise ops that follow those GEMMs in a decoder layer: o and down each feed a
+         * layer scale into the f32 residual, up feeds the SwiGLU. What an epilogue fusion would
+         * absorb. */
+        std::printf("  the elementwise ops after them, %d launches each\n", iters);
+        const int64_t dim = 2048, ff = 8192;
+        void* dx = dalloc((size_t)(M * 2 * ff) * 2);
+        void* dt = dalloc((size_t)(M * dim) * 4);
+        void* dr = dalloc((size_t)(M * dim) * 4);
+        void* dsc = dalloc((size_t)dim * 4);
+        void* dact = dalloc((size_t)(M * ff) * 2);
+        if (!dx || !dt || !dr || !dsc || !dact) { std::printf("  hipMalloc failed\n"); dfree_all(); }
+        else {
+            rand_fill(dx, (size_t)(M * 2 * ff) * 2);
+            rand_fill(dr, (size_t)(M * dim) * 4);
+            struct E { const char* what; const char* row; std::vector<RadTensor> ts;
+                       std::vector<RadParam> ps; double bytes; };
+            for (const E& e : {
+                     E{ "layer scale (mul_weight_f32), bf16 -> f32", "mul_weight_f32",
+                        { T(dx, RAD_BF16, { M, dim }), T(dsc, RAD_F32, { dim }), T(dt, RAD_F32, { M, dim }) },
+                        { PI("M", M), PI("n", dim), PS("dtype", "f32") }, (double)M * dim * 6 },
+                     E{ "residual (add_f32), in place", "add_f32",
+                        { T(dr, RAD_F32, { M, dim }), T(dt, RAD_F32, { M, dim }), T(dr, RAD_F32, { M, dim }) },
+                        { PI("M", M), PI("n", dim), PS("dtype", "f32") }, (double)M * dim * 12 },
+                     E{ "SwiGLU (silu_mul_bf16)", "silu_mul_bf16",
+                        { T(dx, RAD_BF16, { M, 2 * ff }), T(dact, RAD_BF16, { M, ff }) },
+                        { PI("M", M), PI("n", ff), PS("dtype", "bf16") }, (double)M * ff * 6 } }) {
+                const RadKernelInfo* r = find(pl, e.row);
+                if (!r) { std::printf("  %s: row absent\n", e.row); continue; }
+                const double us = time_row(r, e.ts, e.ps, iters);
+                if (us < 0) std::printf("  %-44s rc %d\n", e.what, (int)us);
+                else std::printf("  %-44s %9.1f us  %6.1f GB/s\n", e.what, us, e.bytes / (us * 1e3));
+            }
+            dfree_all();
+        }
+    }
+
+    if (want("f32")) {
+        std::printf("\ngemm_nt_bias at f32 (gemm_f32_nt_bias), %d launches each\n", iters);
+        const RadKernelInfo* gf = find(pl, "gemm_f32_nt_bias");
+        struct G { const char* what; int64_t M, N, K; bool bf16; };
+        for (const G& g : { G{ "video patch projection (102816 rows)", 102816, 5376, 96, true },
+                            G{ "soundtrack projection (1152 rows)", 1152, 5376, 32, true },
+                            G{ "video head, one 16384-row part", 16384, 96, 5376, false },
+                            G{ "soundtrack head (1152 rows)", 1152, 32, 5376, false },
+                            G{ "timestep MLP 1 (128 rows)", 128, 5376, 256, false },
+                            G{ "timestep MLP 2 (128 rows)", 128, 2688, 5376, false },
+                            G{ "decoder post_quant_conv", 28224, 24, 24, false },
+                            G{ "decoder proj_in", 28224, 2048, 24, false } }) {
+            if (!gf) { std::printf("  row absent\n"); break; }
+            void* da = dalloc((size_t)(g.M * g.K) * 4);
+            void* dw = dalloc((size_t)(g.N * g.K) * 4);
+            void* db = dalloc((size_t)g.N * 4);
+            void* dy = dalloc((size_t)(g.M * g.N) * (g.bf16 ? 2 : 4));
+            if (!da || !dw || !db || !dy) { std::printf("  %s: hipMalloc failed\n", g.what); dfree_all(); continue; }
+            rand_fill(da, (size_t)(g.M * g.K) * 4);
+            rand_fill(dw, (size_t)(g.N * g.K) * 4);
+            RadTensor tr = T(nullptr, g.bf16 ? RAD_BF16 : RAD_F32, { 1 });
+            absent(tr);
+            const double us = time_row(gf, { T(da, RAD_F32, { g.M, g.K }), T(dw, RAD_F32, { g.N, g.K }),
+                                             T(db, RAD_F32, { g.N }), tr,
+                                             T(dy, g.bf16 ? RAD_BF16 : RAD_F32, { g.M, g.N }) },
+                                       { PI("M", g.M), PI("N", g.N), PI("K", g.K), PS("dtype", "f32") },
+                                       iters);
+            if (us < 0) std::printf("  %-40s rc %d\n", g.what, (int)us);
+            else std::printf("  %-40s M %6lld N %5lld K %5lld -> %s  %9.1f us  %6.2f TFLOP/s\n", g.what,
+                             (long long)g.M, (long long)g.N, (long long)g.K, g.bf16 ? "bf16" : "f32 ",
+                             us, 2.0 * (double)g.M * g.N * g.K / (us * 1e6));
+            dfree_all();
+        }
+    }
+
+    if (want("conv")) {
+        std::printf("\nconv1d and conv_t1d at f32 (conv1d_f32, conv_t1d_f32): a BigVGAN's stages over "
+                    "the longest soundtrack's two channels\n");
+        {
+            const RadKernelInfo* c1 = find(pl, "conv1d_f32");
+            const RadKernelInfo* ct = find(pl, "conv_t1d_f32");
+            struct C { const char* what; bool t; int64_t rows, cin, cout, k, dil, s; };
+            for (const C& c : { C{ "conv_pre", false, 1152, 2048, 1024, 7, 1, 1 },
+                                C{ "stage 0 upsample", true, 1152, 1024, 512, 9, 1, 5 },
+                                C{ "stage 0 AMP conv k11 dil 5", false, 5760, 512, 512, 11, 5, 1 },
+                                C{ "stage 1 AMP conv k11 dil 5", false, 28800, 256, 256, 11, 5, 1 },
+                                C{ "stage 2 AMP conv k11 dil 5", false, 57600, 128, 128, 11, 5, 1 },
+                                C{ "stage 4 AMP conv k11 dil 5", false, 230400, 32, 32, 11, 5, 1 },
+                                C{ "stage 6 AMP conv k11 dil 5", false, 921600, 8, 8, 11, 5, 1 },
+                                C{ "conv_post", false, 921600, 8, 1, 7, 1, 1 } }) {
+                const RadKernelInfo* r = c.t ? ct : c1;
+                if (!r) { std::printf("  row absent\n"); break; }
+                const int64_t orows = c.rows * c.s, taps = (c.k + c.s - 1) / c.s;
+                void* dx = dalloc((size_t)(c.rows * c.cin) * 4);
+                void* dw = dalloc((size_t)(c.s * c.cout * taps * c.cin) * 4);
+                void* db = dalloc((size_t)c.cout * 4);
+                void* dy = dalloc((size_t)(orows * c.cout) * 4);
+                if (!dx || !dw || !db || !dy) { std::printf("  %s: hipMalloc failed\n", c.what); dfree_all(); continue; }
+                rand_fill(dx, (size_t)(c.rows * c.cin) * 4);
+                rand_fill(dw, (size_t)(c.s * c.cout * taps * c.cin) * 4);
+                const int32_t half = (int32_t)(c.rows / 2);
+                std::vector<RadTensor> ts;
+                std::vector<RadParam> ps = { PI("M", c.rows), PI("cin", c.cin), PI("cout", c.cout),
+                                             PI("k", c.k), PS("dtype", "f32") };
+                if (c.t) {
+                    ts = { T(dx, RAD_F32, { c.rows, c.cin }), T(dw, RAD_F32, { c.cin, c.cout, c.k }),
+                           T(db, RAD_F32, { c.cout }), TI32({ 3 }, { 0, half, (int32_t)c.rows }),
+                           T(dy, RAD_F32, { orows, c.cout }) };
+                    ps.push_back(PI("stride", c.s));
+                    ps.push_back(PI("pad", (c.k - c.s) / 2));
+                } else {
+                    RadTensor tr = T(nullptr, RAD_F32, { 1 });
+                    absent(tr);
+                    ts = { T(dx, RAD_F32, { c.rows, c.cin }), T(dw, RAD_F32, { c.cout, c.cin, c.k }),
+                           TI32({ 3 }, { 0, half, (int32_t)c.rows }), tr,
+                           T(dy, RAD_F32, { c.rows, c.cout }), T(db, RAD_F32, { c.cout }) };
+                    ps.push_back(PI("dil", c.dil));
+                }
+                const double us = time_row(r, ts, ps, iters);
+                if (us < 0) std::printf("  %-28s rc %d\n", c.what, (int)us);
+                else std::printf("  %-28s rows %7lld cin %4lld cout %4lld k %2lld  %9.1f us  %6.2f TFLOP/s\n",
+                                 c.what, (long long)orows, (long long)c.cin, (long long)c.cout,
+                                 (long long)c.k, us,
+                                 2.0 * (double)orows * c.cout * c.cin * (double)c.k / c.s / (us * 1e6));
+                dfree_all();
+            }
+        }
+    }
+
+    if (want("mod")) {
+        std::printf("\ngemm_nt_q_bias at fp8a8 (gemm_fp8a8_bias_nt_m16): a modulation projection, its "
+                    "50 timesteps into a column block of the table\n");
+        if (const RadKernelInfo* gq = find(pl, "gemm_fp8a8_bias_nt_m16")) {
+            for (const int64_t N : { (int64_t)16128, (int64_t)32256 }) {
+                const int64_t M = 50, K = 2688, sk = K / 128, sn = (N + 127) / 128, width = 3 * N;
+                void* dx = dalloc((size_t)(M * K));
+                void* dxs = dalloc((size_t)(M * sk) * 4);
+                void* dw = dalloc((size_t)(N * K));
+                void* dws = dalloc((size_t)(sn * sk) * 2);
+                void* db = dalloc((size_t)N * 2);
+                void* dy = dalloc((size_t)(M * width) * 2);
+                if (!dx || !dxs || !dw || !dws || !db || !dy) { std::printf("  hipMalloc failed\n"); break; }
+                RadTensor ty = T(dy, RAD_BF16, { M, N });
+                ty.stride[0] = width;
+                const double us = time_row(gq, { T(dx, RAD_F8E4M3, { M, K }), T(dxs, RAD_F32, { M, sk }),
+                                                 T(dw, RAD_F8E4M3, { N, K }), T(dws, RAD_BF16, { sn, sk }),
+                                                 T(db, RAD_BF16, { N }), ty },
+                                           { PI("M", M), PI("N", N), PI("K", K), PI("group", 128),
+                                             PS("dtype", "fp8a8") },
+                                           iters);
+                if (us < 0) std::printf("  N %lld: rc %d\n", (long long)N, (int)us);
+                else std::printf("  M %lld N %6lld K %lld  %9.1f us  %6.1f GB/s of weight (warm)\n",
+                                 (long long)M, (long long)N, (long long)K, us,
+                                 (double)(N * K) / (us * 1e3));
+                dfree_all();
+            }
+        }
+    }
+
+    if (want("attn")) {
+        std::printf("\nattn_dense at head_dim 128, non-causal, one sequence, 28 heads "
+                    "(attn_dense_h128_bf16)\n");
+        if (const RadKernelInfo* ra = find(pl, "attn_dense_h128_bf16")) {
+            for (const int64_t M : { (int64_t)3072, (int64_t)16384, (int64_t)38016, (int64_t)73000,
+                                     (int64_t)106000 }) {
+                const int64_t nh = 28, hd = 128, wq = nh * hd, width = 3 * wq;
+                void* dq = dalloc((size_t)(M * width) * 2);
+                void* dout = dalloc((size_t)(M * wq) * 2);
+                if (!dq || !dout) { std::printf("  M %lld: hipMalloc failed\n", (long long)M); dfree_all(); continue; }
+                rand_fill(dq, (size_t)(M * width) * 2);
+                auto col = [&](int64_t first) {
+                    RadTensor t = T((uint16_t*)dq + first, RAD_BF16, { M, wq });
+                    t.stride[0] = width;
+                    return t;
+                };
+                const int it = M > 40000 ? 2 : M > 10000 ? 3 : iters;
+                const double us = time_row(ra, { col(0), col(wq), col(2 * wq),
+                                                 TI32({ 2 }, { 0, (int32_t)M }), T(dout, RAD_BF16, { M, wq }) },
+                                           { PI("M", M), PI("head_dim", hd), PI("gqa", 1), PI("causal", 0),
+                                             PS("dtype", "bf16"), PF("scale", 1.0 / std::sqrt(128.0)),
+                                             PI("max_seqlen", M) },
+                                           it);
+                if (us < 0) std::printf("  M %6lld: rc %d\n", (long long)M, (int)us);
+                else std::printf("  M %6lld  %11.1f us  %6.1f TFLOP/s\n", (long long)M, us,
+                                 4.0 * (double)M * (double)M * hd * nh / (us * 1e6));
+                dfree_all();
+            }
+        }
+    }
+
+    if (want("attn64")) {
+        std::printf("\nattn_dense at head_dim 64 over 14 decoder tiles of 1797 rows, 32 heads "
+                    "(attn_dense_h64_bf16)\n");
+        if (const RadKernelInfo* ra = find(pl, "attn_dense_h64_bf16")) {
+            const int64_t tiles = 14, period = 1797, M = tiles * period, nh = 32, hd = 64;
+            const int64_t wq = nh * hd, width = 3 * wq;
+            void* dq = dalloc((size_t)(M * width) * 2);
+            void* dout = dalloc((size_t)(M * wq) * 2);
+            if (dq && dout) {
+                rand_fill(dq, (size_t)(M * width) * 2);
+                std::vector<int32_t> cu((size_t)tiles + 1);
+                for (int64_t t = 0; t <= tiles; ++t) cu[(size_t)t] = (int32_t)(t * period);
+                auto col = [&](int64_t first) {
+                    RadTensor t = T((uint16_t*)dq + first, RAD_BF16, { M, wq });
+                    t.stride[0] = width;
+                    return t;
+                };
+                const double us = time_row(ra, { col(0), col(wq), col(2 * wq), TI32({ tiles + 1 }, cu),
+                                                 T(dout, RAD_BF16, { M, wq }) },
+                                           { PI("M", M), PI("head_dim", hd), PI("gqa", 1), PI("causal", 0),
+                                             PS("dtype", "bf16"), PF("scale", 0.125),
+                                             PI("max_seqlen", period) },
+                                           iters);
+                if (us < 0) std::printf("  rc %d\n", (int)us);
+                else std::printf("  %lld rows  %9.1f us  %6.1f TFLOP/s\n", (long long)M, us,
+                                 4.0 * (double)period * period * hd * nh * tiles / (us * 1e6));
+            }
+            dfree_all();
+        }
+    }
+}
+
 static void fp8_perf(const Plugin& pl, int64_t N, int64_t K, int64_t M, int iters) {
     if (N % 128 || K % 128 || M < 1) {
         std::printf("--perf: N and K must be 128-aligned and M >= 1\n");
@@ -12472,23 +16294,23 @@ static void ngram_ahead_case(const Plugin& pl) {
     ok("ngram_ids_i32 ahead: the ids ahead are the ones the next step computes", ahd1 == ids2);
 }
 
-/* ---- RUNTIME LoRA: a lora_shrink row then a lora_expand row, as the engine issues them, against an
+/* ---- Runtime LoRA: a lora_shrink row then a lora_expand row, as the engine issues them, against an
  * f64 host sum and libref's bytes.
  *
- * Both halves in one case, because expand reads the `t` shrink wrote. A base row (slot -1, S,
- * -5) keeps the 0xFF fill of `t` and every byte of `y` (a -0 included), and the column slices'
+ * Both halves in one case, because expand reads the `t` shrink wrote. A base row (slot -1, S, -5)
+ * keeps the 0xFF fill of `t` and every byte of `y` (a -0 included), and the column slices'
  * neighbours are untouched. Adapter rows: shrink within (K + 2) 2^-24 sum|terms| of the f64 sum
  * (an f32 dot's worst case in any order); expand exactly the bytes of libref's f32 order (j
- * ascending, sum then scale then add, one RTNE) over the `t` the device wrote. The v1 pair runs
- * its four small shapes and two real ones; the tiled pairs run the real shapes -- M 1 / 8 / 2048,
- * K 2048 / 5120 / 6144 / 17408, N 2560 / 12288 / 17408, R 16 / 48 / 64 / 192 -- with slots in
- * runs the way a prefill chunk holds several requests and base rows, plus:
+ * ascending, sum then scale then add, one RTNE) over the `t` the device wrote. The scalar pair
+ * runs four small shapes and two real ones; the tiled pairs run the real shapes (M 1 / 8 / 2048,
+ * K 2048 / 5120 / 6144 / 17408, N 2560 / 12288 / 17408, R 16 / 48 / 64 / 192) with slots in runs
+ * the way a prefill chunk holds several requests and base rows, plus:
  *
- *   * BATCH INVARIANCE ON THE CARD: rows computed alone (M = 1) and inside batches of 8, 37 and
- *     2048 with other slots and base rows around them give the same t and y bits. This is the
- *     check the emulator cannot make -- that the WMMA unit's answer for a row does not depend on
- *     the tile position it lands in or on the rows beside it.
- *   * A LAUNCH OF BASE ROWS ONLY touches no byte of t or y. */
+ *   - Batch invariance on the card: rows computed alone (M = 1) and inside batches of 8, 37 and
+ *     2048 with other slots and base rows around them give the same t and y bits, which the
+ *     emulator cannot check (the WMMA unit's answer for a row must not depend on its tile
+ *     position or the rows beside it).
+ *   - A launch of base rows only touches no byte of t or y. */
 struct LoraProb {
     int M = 0, K = 0, N = 0, R = 0, S = 4;
     bool fp8 = false;
@@ -12727,9 +16549,9 @@ static void lora_pair_case(const Plugin& pl, const char* sname, const char* enam
            (long long)bad_y));
 }
 
-/* BATCH INVARIANCE ON THE CARD. For each of `n_tgt` target rows of a batch (several slots, at
- * tile starts, ends and middles), the same row alone -- its x, scales, slot and y, the same pools
- * -- must come back with the same t and y bits. */
+/* Batch invariance on the card. For each of `n_tgt` target rows of a batch (several slots, at tile
+ * starts, ends and middles), the same row alone (its x, scales, slot and y, the same pools) must
+ * come back with the same t and y bits. */
 static void lora_invariance_case(const Plugin& pl, const char* sname, const char* ename, int K,
                                  int N, int R, bool fp8, uint32_t ydt) {
     const RadKernelInfo* rs = find(pl, sname);
@@ -12834,8 +16656,8 @@ static void lora_case(const Plugin& pl) {
     }
 }
 
-/* ---- --perflora M K N R S PATTERN [iters]: every lora_shrink row, then every lora_expand row,
- * at one shape, warm (or cold with --cold). The pattern lays the slots out:
+/* ---- --perflora M K N R S PATTERN [iters] [a=DT] [y=DT]: every lora_shrink row, then every
+ * lora_expand row, at one shape, warm (or cold with --cold). The pattern lays the slots out:
  *
  *   base   every row a base row -- what a base request pays for the adapter ops being there
  *   one    every row adapter 0 -- one request, or a prefill chunk of one
@@ -12843,22 +16665,17 @@ static void lora_case(const Plugin& pl) {
  *   mix    row m on adapter m % S -- every adapter in every tile, the most passes a tile has
  *   runs   contiguous runs of ceil(M / S) rows a slot -- a chunk holding S requests
  *
- * `a` is bf16, or E4M3 with a scale every 128 when R4D_PERFLORA_A=fp8_e4m3; `y` bf16, or the
- * dtype R4D_PERFLORA_Y names (f16, f32). Rows that do not serve the dtype say so. Each shrink row's
- * t is compared with the first row's (max |diff| over max |t|), and each expand row's y bytes with
- * the first's over the same t -- equal bytes is the claim the tiled expand makes. The GB/s column
- * is the bytes the op cannot avoid (each active adapter's pool once, x or y once) over the time. */
+ * `a` is bf16, or E4M3 with a scale every 128 (`a=fp8_e4m3`); `y` is bf16, f16 or f32 (`y=`).
+ * Rows that do not serve the dtype say so. Each shrink row's t is compared with the first row's
+ * (max |diff| over max |t|), and each expand row's y bytes with the first's over the same t, since
+ * the tiled expand claims equal bytes. The GB/s column is the bytes the op cannot avoid (each
+ * active adapter's pool once, x or y once) over the time. */
 static void lora_perf(const Plugin& pl, int64_t M, int64_t K, int64_t N, int64_t R, int64_t S,
-                      const char* pat, int iters) {
+                      const char* pat, int iters, bool fp8, uint32_t ydt) {
     if (M < 1 || K < 1 || N < 1 || R < 1 || S < 1 || iters < 1) {
         std::printf("--perflora: M K N R S must be >= 1\n");
         return;
     }
-    const char* ae = std::getenv("R4D_PERFLORA_A");
-    const char* ye = std::getenv("R4D_PERFLORA_Y");
-    const bool fp8 = ae && !std::strcmp(ae, "fp8_e4m3");
-    const uint32_t ydt = ye && !std::strcmp(ye, "f32") ? RAD_F32
-                       : (ye && !std::strcmp(ye, "f16") ? RAD_F16 : RAD_BF16);
     std::vector<int32_t> slot((size_t)M);
     const int64_t run = (M + S - 1) / S;
     for (int64_t m = 0; m < M; ++m) {
@@ -13148,6 +16965,7 @@ static void device_phase(const Plugin& pl) {
         struct G { const char* name; int64_t hd, nh, nkv; };
         for (const G& g : { G{ "attn_dense_h64_bf16", 64, 4, 4 },
                             G{ "attn_dense_h256_gqa2_bf16", 256, 4, 2 },
+                            G{ "attn_dense_h256_gqa4_bf16", 256, 4, 1 },
                             G{ "attn_dense_h512_gqa4_bf16", 512, 4, 1 } }) {
             if (!sel(g.name)) continue;
             const RadKernelInfo* r = find(pl, g.name);
@@ -13742,6 +17560,59 @@ static void device_phase(const Plugin& pl) {
             check("attn_local_rel_bf16 numerics", down(dout, want.size()), want, 1e-2);
         }
     }
+    if (sel("cast_bf16_f16")) {
+        /* Every value against rad_f32_to_f16 of the bf16 value, bit for bit: f16's normal range
+         * (kept exactly), its subnormals (rounded to nearest even) and past 65504 (an infinity),
+         * over rows of a column slice so both pitches are read. */
+        const RadKernelInfo* r = find(pl, "cast_bf16_f16");
+        if (!r) ok("cast_bf16_f16", false, "row absent");
+        else {
+            const int64_t M = 5, n = 1000, ldx = 1024;
+            std::vector<uint16_t> hx((size_t)(M * ldx), 0x7fc0);
+            for (int64_t m = 0; m < M; ++m)
+                for (int64_t i = 0; i < n; ++i) {
+                    const uint32_t h = st_mix32((uint32_t)(m * 4096 + i) ^ 0xc457u);
+                    /* exponents from 2^-30 to 2^20 and both signs */
+                    const float v = std::ldexp(1.0f + (float)(h & 0x7f) / 128.0f,
+                                               (int)((h >> 8) % 51) - 30) * ((h >> 16) & 1 ? -1.0f : 1.0f);
+                    hx[(size_t)(m * ldx + i)] = rad_f32_to_bf16(v);
+                }
+            void* d_x = dalloc(hx.size() * 2);
+            void* d_y = dalloc((size_t)(M * n * 2));
+            if (!d_x || !d_y) ok("cast_bf16_f16", false, "hipMalloc failed");
+            else {
+                st_memcpy(d_x, hx.data(), hx.size() * 2, hipMemcpyHostToDevice);
+                RadTensor tx = T(d_x, RAD_BF16, { M, n });
+                tx.stride[0] = ldx;
+                std::vector<RadTensor> ts = { tx, T(d_y, RAD_F16, { M, n }) };
+                std::vector<RadParam> ps = { PI("M", M), PI("n", n), PS("from", "bf16"),
+                                             PS("to", "f16") };
+                RadArgs a;
+                std::memset(&a, 0, sizeof(a));
+                a.t = ts.data(); a.n_t = (int)ts.size();
+                a.p = ps.data(); a.n_p = (int)ps.size();
+                a.world_size = 1;
+                const int rc = r->launch(&a, (RadStream) nullptr);
+                std::vector<uint16_t> hy((size_t)(M * n), 0);
+                if (rc == RAD_OK && st_stream_sync(nullptr) == hipSuccess)
+                    st_memcpy(hy.data(), d_y, hy.size() * 2, hipMemcpyDeviceToHost);
+                int64_t bad = 0, inf = 0, sub = 0;
+                for (int64_t m = 0; m < M; ++m)
+                    for (int64_t i = 0; i < n; ++i) {
+                        const uint16_t want =
+                            rad_f32_to_f16(rad_bf16_to_f32(hx[(size_t)(m * ldx + i)]));
+                        bad += hy[(size_t)(m * n + i)] != want;
+                        inf += (want & 0x7fff) == 0x7c00;
+                        sub += (want & 0x7c00) == 0 && (want & 0x3ff) != 0;
+                    }
+                char d[96];
+                std::snprintf(d, sizeof d, "rc=%d, %lld of %lld differ (%lld inf, %lld subnormal)",
+                              rc, (long long)bad, (long long)(M * n), (long long)inf, (long long)sub);
+                ok("cast_bf16_f16 rounds as rad_f32_to_f16", rc == RAD_OK && bad == 0 && inf > 0 &&
+                                                              sub > 0, d);
+            }
+        }
+    }
     if (sel("cast_bf16_f32")) {
         const RadKernelInfo* r = find(pl, "cast_bf16_f32");
         if (!r) ok("cast_bf16_f32", false, "row absent");
@@ -14230,6 +18101,12 @@ static void device_phase(const Plugin& pl) {
         i8a8_numeric(pl, "gemm_i8a8_nt_m16", 64, 512, 640);
         i8a8_numeric(pl, "gemm_i8a8_tiled", 200, 256, 640);
         i8a8_numeric(pl, "gemm_i8a8_tiled", 2048, 512, 2560);
+        /* The bias GEMM: three shapes on the 128 x 128 kernel (ragged N with an unaligned pitch;
+         * an aligned ragged N with a K tail; K below one tile) and one on the 64 x 64 kernel. */
+        bias_gemm_numeric(pl, 1100, 1001, 200, 1, true, false);
+        bias_gemm_numeric(pl, 520, 1040, 1104, 0, true, true);
+        bias_gemm_numeric(pl, 2050, 600, 40, 2, false, true);
+        bias_gemm_numeric(pl, 200, 300, 136, 2, true, false);
         w8a16_numeric(pl, "gemm_w8a16_nt_m64", 5, 272, 384, RAD_F16);
         w8a16_numeric(pl, "gemm_w8a16_nt_m64", 64, 2560, 6144, RAD_F16);
         gemm_case(pl, "gemm_w4a8_nt_m64",    "w4a8",    M, N, K, RAD_I8,  1, 0, 0, N*K/2, N*(K/128)*4);
@@ -14588,6 +18465,77 @@ static void device_phase(const Plugin& pl) {
         rope_ladder_case(pl);
     }
 
+    /* The audio generator's ops and the optional forms a speech model adds, each against libref's
+     * arithmetic. */
+    if (sel("conv1d_bf16")) au::conv1d_cases(pl);
+    if (sel("conv_t1d_bf16")) au::conv_t1d_cases(pl);
+    if (sel("snake_bf16")) au::snake_cases(pl);
+    if (sel("cfg_topk_sample")) au::cfg_topk_cases(pl);
+    if (sel("rvq_embed_bf16")) au::rvq_embed_cases(pl);
+    if (sel("frame_store")) au::frame_store_cases(pl);
+    if (sel("iota")) au::iota_cases(pl);
+    if (sel("gelu_bf16")) au::gelu_case(pl);
+    if (sel("mul_weight_bf16")) au::mul_weight_f32_case(pl);
+    if (sel("qk_norm_rope_bf16")) au::qk_norm_rope_f32_gain_case(pl);
+    if (sel("attn_dense_h64_bf16")) {
+        au::attn_causal_h64_case(pl, 72, { 0, 89 });
+        au::attn_causal_h64_case(pl, 0, { 0, 89 });
+        au::attn_causal_h64_case(pl, 72, { 0, 13, 89 });
+        au::attn_causal_h64_case(pl, 9, { 0, 40, 200 });
+    }
+    if (sel("conv1d_dw_bf16")) au::conv1d_dw_bias_cases(pl);
+    if (sel("attn_dense_h256_gqa4_bf16")) {
+        au::attn_window_right_cases(pl, "attn_dense_h256_gqa4_bf16", 4, 1, 256, 257);
+        au::attn_window_right_cases(pl, "attn_dense_h256_gqa4_bf16", 4, 1, 9, 0);
+    }
+    if (sel("attn_dense_h256_gqa2_bf16")) {
+        au::attn_window_right_cases(pl, "attn_dense_h256_gqa2_bf16", 4, 2, 9, 5);
+        au::attn_window_right_cases(pl, "attn_dense_h256_gqa2_bf16", 4, 2, 9, 0);
+        au::attn_refusal_cases(pl);
+    }
+    if (sel("attn_dense_small_h256_bf16")) au::attn_small_refusal_case(pl);
+    /* The video generator's ops, the decoder's at a geometry rad-kbench cannot fill. */
+    if (sel("patch_unfold_f32")) vid::patch_unfold_cases(pl);
+    if (sel("vtile_gather")) vid::vtile_gather_cases(pl);
+    if (sel("vtile_stitch")) vid::vtile_stitch_cases(pl);
+    if (sel("rms_mod_bf16")) vid::rms_mod_cases(pl, false);
+    if (sel("rms_mod_quant_fp8_bf16")) vid::rms_mod_cases(pl, true);
+    if (sel("flow_x0_step_f32")) vid::flow_x0_cases(pl);
+    if (sel("grid_pos3")) vid::grid_pos3_cases(pl);
+    if (sel("snake_aa_f32")) vid::snake_aa_cases(pl);
+    if (sel("vsa_select_h128_bf16")) vsa::select_cases(pl);
+    if (sel("attn_vsa_h128_bf16")) vsa::attn_cases(pl);
+    if (sel("quant_cols_fp8_bf16")) vsa::quant_cols_cases(pl);
+    if (sel("attn_prefix_self_h128_bf16")) vsa::dense_cases(pl);
+    if (sel("rope_bf16")) au::rope_llama3_case(pl);
+
+    /* A video generator's f32 forms, its biased GEMMs, its axial rotary and its two dense
+     * attentions, each against libref's arithmetic. */
+    if (sel("gemm_f32_nt_bias")) vg::gemm_f32_cases(pl);
+    if (sel("gemm_fp8a8_bias_nt_m16")) vg::gemm_q_bias_cases(pl);
+    if (sel("add_f32")) vg::add_f32_cases(pl);
+    if (sel("add_bf16")) vg::add_bf16_div_case(pl);
+    if (sel("mul_weight_f32")) vg::mul_weight_f32_cases(pl);
+    if (sel("silu_f32")) vg::silu_f32_cases(pl);
+    if (sel("rmsnorm_bf16")) vg::norm_f32_rows_cases(pl, false);
+    if (sel("layernorm_bf16")) vg::norm_f32_rows_cases(pl, true);
+    if (sel("timestep_embed_f32")) vg::timestep_f32_case(pl);
+    if (sel("randn_lanes_f32")) vg::randn_f32_case(pl);
+    if (sel("interleave2_bf16")) vg::interleave2_f32_case(pl);
+    if (sel("chan_affine_f32")) vg::chan_affine_cases(pl, "chan_affine_f32");
+    if (sel("chan_affine_bf16")) vg::chan_affine_cases(pl, "chan_affine_bf16");
+    if (sel("gate_add_bf16")) vg::gate_add_none_case(pl);
+    if (sel("conv1d_f32")) vg::conv1d_f32_cases(pl);
+    if (sel("conv_t1d_f32")) vg::conv_t1d_f32_cases(pl);
+    if (sel("conv1d_bf16")) vg::conv1d_bf16_clamp_case(pl);
+    if (sel("qk_norm_rope_bf16")) vg::qk_axial_cases(pl);
+    if (sel("attn_dense_h128_bf16")) {
+        vg::attn_long_case(pl, "attn_dense_h128_bf16", 128, 2, { 0, 3001 });
+        vg::attn_long_case(pl, "attn_dense_h128_bf16", 128, 3, { 0, 1000, 2333 });
+    }
+    if (sel("attn_dense_h64_bf16"))
+        vg::attn_long_case(pl, "attn_dense_h64_bf16", 64, 4, { 0, 1797, 3594, 5391, 7188 });
+
     /* Each row needs a case under its own name: a child runs per row and `sel` matches only that
      * name, so a case nested in another row's block would never run. */
     if (sel("moe_gemm_w4a8")) {
@@ -14723,6 +18671,33 @@ static void device_phase(const Plugin& pl) {
         wpa8i8_numeric(pl, bits, 2100, 34816, 5120, 17408);
         wpa8i8_numeric(pl, bits, 2048, 17408, 5120);
         wpa8i8_numeric(pl, bits, 2048, 5120, 17408);
+        if (bits == 4) {
+            /* An int4 W4A16 release imported with a u4 zero plane and no rotation: five groups
+             * a row, so each zero row ends in a pad nibble; then the delta net's qkv|z, the MLP's
+             * gate|up and down at a prefill chunk. */
+            wpa8i8_numeric(pl, 4, 300, 400, 640, 0, 0, RAD_U4);
+            wpa8i8_numeric(pl, 4, 2048, 16384, 5120, 0, 0, RAD_U4);
+            wpa8i8_numeric(pl, 4, 2048, 34816, 5120, 0, 0, RAD_U4);
+            wpa8i8_numeric(pl, 4, 2048, 5120, 17408, 0, 0, RAD_U4);
+        }
+    }
+
+    if (sel("gemm_w4a16_asym_nt_m64")) {
+        if (!g_case) std::printf("\nthe 4-bit asymmetric f16 GEMM, against the planes' meaning\n");
+        /* z-lab's ParoQuant int4 (u8 zero, parts) and an int4 W4A16 release imported with a u4
+         * zero plane: five groups a row (a pad nibble ends each zero row), then decode and verify
+         * rows at the 27B's shapes. */
+        w5a16_numeric(pl, 8, 272, 640, 0, 0, 4);
+        w5a16_numeric(pl, 5, 400, 640, 144, 0, 4);
+        w5a16_numeric(pl, 40, 512, 2560, 128, 384, 4);
+        w5a16_numeric(pl, 8, 272, 640, 0, 0, 4, RAD_U4);
+        for (const int64_t M : { 1, 4, 16, 64 }) {
+            w5a16_numeric(pl, M, 16384, 5120, 0, 0, 4, RAD_U4);
+            w5a16_numeric(pl, M, 34816, 5120, 0, 0, 4, RAD_U4);
+            w5a16_numeric(pl, M, 5120, 17408, 0, 0, 4, RAD_U4);
+            w5a16_numeric(pl, M, 1024, 5120, 0, 0, 4, RAD_U4);
+        }
+        w5a16_numeric(pl, 150, 5120, 17408, 0, 0, 4, RAD_U4);
     }
 
     if (sel("gemm_w5a16_nt_m64")) {
@@ -15068,11 +19043,25 @@ static void usage(void) {
                 "             default), every form compared with the first; `distinct` weight\n"
                 "             planes back the table, and fewer than the experts is a cache-resident\n"
                 "             floor rather than the real traffic.\n"
-                "  --perflora M K N R S PATTERN [iters]:  every lora_shrink row, then every\n"
-                "             lora_expand row, at one shape; PATTERN lays the slots out: base, one,\n"
-                "             half (even rows adapter 0, odd base), mix (row m on m %% S) or runs\n"
-                "             (S contiguous runs). R4D_PERFLORA_A=fp8_e4m3 for a coded `a` (scale\n"
-                "             every 128), R4D_PERFLORA_Y=f16|f32 for `y`. Each row's t and y are\n"
+                "  --perfattn M HEADS [iters]:  the head-128 dense attention over one M-row\n"
+                "                       sequence: attn_dense and attn_prefix_self without a prefix at\n"
+                "                       bf16 and int8 scores, bf16 and fp8 P.V, and quant_cols_fp8\n"
+                "                       on its v.\n"
+                "  --perfvideo [iters] [section]:  a video generator's GEMMs and attention\n"
+                "             (TFLOP/s): trunk (the DiT's fp8 linears at a rank's width), decoder\n"
+                "             (the video decoder's bf16 linears), f32 (the f32 GEMMs), conv (the\n"
+                "             audio decoder's convolutions), mod (the fp8 modulation projection),\n"
+                "             attn and attn64 (dense attention at 3K to 106K rows, and over the\n"
+                "             decoder's tiles); every section without one.\n"
+                "  --perfvsa [iters] [local]:  vsa_select and attn_vsa at 1344 x 768 (38010\n"
+                "             rows, 28 heads), sparsity 0.8 and 0, beside attn_dense over the same\n"
+                "             rows. `local` gives q and k features of the row's grid position, so a\n"
+                "             query tile selects its neighbourhood rather than random tiles.\n"
+                "  --perflora M K N R S PATTERN [iters] [a=DT] [y=DT]:  every lora_shrink row,\n"
+                "             then every lora_expand row, at one shape; PATTERN lays the slots out:\n"
+                "             base, one, half (even rows adapter 0, odd base), mix (row m on m %% S)\n"
+                "             or runs (S contiguous runs). a=bf16 (default) or a=fp8_e4m3 (scale\n"
+                "             every 128); y=bf16 (default), y=f16 or y=f32. Each row's t and y are\n"
                 "             compared with the first row's; --cold applies.\n"
                 "  --perfqsa CTX [M] [iters]:  the QSA indexer at a real context length. It is\n"
                 "             the only decode op that grows with context, and at 200K it is\n"
@@ -15099,9 +19088,17 @@ int main(int argc, char** argv) {
     int moe_it = 20;
     long long m16_m = 0, m16_e = 256, m16_k = 10, m16_d = 0;
     int m16_it = 20;
+    int video_it = 0;
+    long long attn_m = 0, attn_h = 0;
+    int attn_it = 5;
+    int vsa_it = 0;
+    bool vsa_local = false;
+    const char* video_sec = nullptr;
     long long lo_m = 0, lo_k = 0, lo_n = 0, lo_r = 0, lo_s = 0;
     const char* lo_pat = nullptr;
     int lo_it = 200;
+    bool lo_fp8 = false;
+    uint32_t lo_ydt = RAD_BF16;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--real")) {
             if (i + 5 >= argc) { usage(); return 2; }
@@ -15173,12 +19170,41 @@ int main(int argc, char** argv) {
             lo_r = std::strtoll(argv[++i], nullptr, 0);
             lo_s = std::strtoll(argv[++i], nullptr, 0);
             lo_pat = argv[++i];
-            if (i + 1 < argc && argv[i + 1][0] != 0x2d) lo_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9')
+                lo_it = (int)std::strtol(argv[++i], nullptr, 0);
+            while (i + 1 < argc && (!std::strncmp(argv[i + 1], "a=", 2) ||
+                                    !std::strncmp(argv[i + 1], "y=", 2))) {
+                const char* v = argv[++i] + 2;
+                if (argv[i][0] == 'a' && !std::strcmp(v, "bf16")) lo_fp8 = false;
+                else if (argv[i][0] == 'a' && !std::strcmp(v, "fp8_e4m3")) lo_fp8 = true;
+                else if (argv[i][0] == 'y' && !std::strcmp(v, "bf16")) lo_ydt = RAD_BF16;
+                else if (argv[i][0] == 'y' && !std::strcmp(v, "f16")) lo_ydt = RAD_F16;
+                else if (argv[i][0] == 'y' && !std::strcmp(v, "f32")) lo_ydt = RAD_F32;
+                else {
+                    std::fprintf(stderr, "--perflora: %s is not a=bf16|fp8_e4m3 or y=bf16|f16|f32\n",
+                                 argv[i]);
+                    return 2;
+                }
+            }
         } else if (!std::strcmp(argv[i], "--perfhc")) {
             /* The gated residual's read at M rows. */
             if (i + 1 >= argc) { usage(); return 2; }
             hc_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) hc_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfattn")) {
+            if (i + 2 >= argc) { usage(); return 2; }
+            attn_m = std::strtoll(argv[++i], nullptr, 0);
+            attn_h = std::strtoll(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != '-') attn_it = (int)std::strtol(argv[++i], nullptr, 0);
+        } else if (!std::strcmp(argv[i], "--perfvideo")) {
+            video_it = 10;
+            if (i + 1 < argc && argv[i + 1][0] != '-') video_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && argv[i + 1][0] != '-') video_sec = argv[++i];
+        } else if (!std::strcmp(argv[i], "--perfvsa")) {
+            vsa_it = 5;
+            if (i + 1 < argc && argv[i + 1][0] != '-' && std::strcmp(argv[i + 1], "local"))
+                vsa_it = (int)std::strtol(argv[++i], nullptr, 0);
+            if (i + 1 < argc && !std::strcmp(argv[i + 1], "local")) { vsa_local = true; ++i; }
         } else if (!std::strcmp(argv[i], "--perfops")) {
             /* The elementwise ops at a decode shape: launch cost, not GEMM bandwidth. */
             if (i + 2 >= argc) { usage(); return 2; }
@@ -15203,6 +19229,35 @@ int main(int argc, char** argv) {
     Plugin pl;
 
     /* Timing modes run alone, without the catalogue. */
+    if (attn_m > 0 && attn_h > 0) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        attn_perf(pl, attn_m, attn_h, attn_it);
+#else
+        skip("attention timing", "built without HIP");
+#endif
+        return 0;
+    }
+    if (video_it) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        video_perf(pl, video_it, video_sec);
+        dfree_all();
+#else
+        skip("video generator timing", "built without HIP");
+#endif
+        return 0;
+    }
+    if (vsa_it) {
+        if (!load(&pl, path)) return 1;
+#ifdef RAD_HAVE_HIP
+        vsa_perf(pl, vsa_it, vsa_local);
+        dfree_all();
+#else
+        skip("video sparse attention timing", "built without HIP");
+#endif
+        return 0;
+    }
     if (hc_m) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
@@ -15216,7 +19271,7 @@ int main(int argc, char** argv) {
     if (lo_pat) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
-        lora_perf(pl, lo_m, lo_k, lo_n, lo_r, lo_s, lo_pat, lo_it);
+        lora_perf(pl, lo_m, lo_k, lo_n, lo_r, lo_s, lo_pat, lo_it, lo_fp8, lo_ydt);
         dfree_all();
 #else
         skip("runtime LoRA timing", "built without HIP");

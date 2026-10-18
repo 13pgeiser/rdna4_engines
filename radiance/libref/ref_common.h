@@ -426,6 +426,10 @@ static inline int p_enum(const RadArgs* a, const char* k, const char* const* nam
  * without doing the work. */
 #define RAD_REF_TRY(expr) do { int _s = (expr); if (_s < 0) return _s; } while (0)
 
+/* quant_act_i8g's rule for one row of `n` (ref_gen.cpp): returns the scale (amax/127, 1 for an
+ * all-zero row) and writes the codes rint(clamp(x * (1/scale), +-127)) to `code`, which may be `x`. */
+float ref_q8_row(const float* x, int64_t n, float* code);
+
 static inline const RadTensor* t_in(const RadArgs* a, int i) { return rad_arg_in(a, i); }
 static inline bool have(const RadArgs* a, int n) { return rad_args_have(a, n) != 0; }
 

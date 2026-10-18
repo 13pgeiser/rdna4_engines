@@ -130,7 +130,7 @@ struct MapIndex {
     }
 };
 
-/* THE predicate, over the maps already found. */
+/* weight_targeted(), over the maps already found. */
 bool targeted_core(const Program& prog, const WeightInfo& w,
                    const std::vector<const RadNameMap*>& maps, const TargetSet& targets) {
     if (targets.empty() || maps.empty()) return false;
@@ -188,11 +188,6 @@ rad_weight b_weight(const OpInfo& op) {
         return 0;
     }
     return op.weights.empty() ? 0 : op.weights[0];
-}
-
-void fnv(uint64_t* h, const void* p, size_t n) {
-    const uint8_t* b = static_cast<const uint8_t*>(p);
-    for (size_t i = 0; i < n; ++i) { *h ^= b[i]; *h *= 1099511628211ull; }
 }
 
 bool read_file(const std::string& path, std::string* out) {
@@ -339,11 +334,9 @@ int make_site(const Program& prog, const MapIndex& mi, const TargetSet& targets,
     Site s;
     s.gemm = op_index;
     s.op = op.op;
-    s.w = wh;
     s.weight = W.name;
     s.shard = W.decl.shard;
     s.max_rank = max_rank;
-    s.res_unchecked = op.op == "gemm_nt_bias";
 
     if (W.decl.rank != 2)
         return fail(err, RAD_E_SHAPE, fmt("weight '%s' is rank %u; a LoRA site needs a matrix",
@@ -425,8 +418,8 @@ int make_site(const Program& prog, const MapIndex& mi, const TargetSet& targets,
     int64_t N_full = 0;
     for (int64_t t : s.part_total) N_full = (t > 0 && N_full >= 0) ? N_full + t : -1;
 
-    /* ---- THE LOADER'S OWN FUNCTION AGREES, or this is not a site. weight_share is what puts the
-     * base weight's bytes on this rank; asked for a plain [N_full, K_full] entry it must name the
+    /* ---- the loader's own cut must agree, or this is not a site: weight_share, which puts the
+     * base weight's bytes on this rank, must name for a plain [N_full, K_full] entry the
      * rectangles this geometry names. */
     if (N_full > 0 && s.K_full > 0) {
         WeightInfo v = W;
@@ -483,7 +476,7 @@ int make_site(const Program& prog, const MapIndex& mi, const TargetSet& targets,
             srcs.push_back(m->src[k] ? m->src[k] : "");
         }
     if (alternatives) {
-        /* COPY with alternatives: the first one the container holds IS the weight, and which one
+        /* COPY with alternatives: the first one the container holds is the weight, and which one
          * that is is not recorded. Usable only when exactly one alternative is targeted. */
         std::vector<std::string> hit;
         for (const std::string& x : srcs) {
@@ -580,6 +573,15 @@ bool op_is_site(const Program& prog, const OpInfo& op, rad_weight* b_out, std::s
             return no(fmt("gemm_nt_q over rotated parts (pb1=%lld pb2=%lld): its input is the "
                           "rotated activation", p1, p2));
     }
+    if (gq || gqb) {
+        /* At w4a8, w8a8 and w2a8 `a` is quant_act_i8's codes in the int8 WMMA's step order (the
+         * middle dwords of every 16-byte step exchanged, docs/OPS.md), which lora_shrink would
+         * read as the activation's columns. */
+        const char* dt = op.base.get_s("dtype");
+        if (dt && (!std::strcmp(dt, "w4a8") || !std::strcmp(dt, "w8a8") || !std::strcmp(dt, "w2a8")))
+            return no(fmt("%s at %s reads quant_act_i8's codes in the int8 WMMA's step order, not "
+                          "in the activation's column order", op.op.c_str(), dt));
+    }
     const WeightInfo& w = prog.weights[b];
     if (gq || gqb) {
         long long k = 0;
@@ -607,7 +609,7 @@ int find_unsupported_uses(const Program& prog, const TargetSet& targets,
         const bool site = op_is_site(prog, op, &b, &why);
         for (rad_weight h : op.weights) {
             if (!targeted_idx(prog, mi, h, targets)) continue;
-            /* Every view of a targeted weight read by a site over the SAME logical weight is the
+            /* Every view of a targeted weight read by a site over the same logical weight is the
              * site's own (codes, scale, ref). Anything else reading it is not a site. */
             if (site && b && prog.weights[b].source == prog.weights[h].source) continue;
             UnsupportedUse u;
@@ -667,32 +669,6 @@ int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
         out->push_back(std::move(s));
     }
     return RAD_OK;
-}
-
-TargetSet all_capable_targets(const Program& prog) {
-    std::set<std::string> leaves;
-    for (size_t h = 1; h < prog.weights.size(); ++h) {
-        const WeightInfo& w = prog.weights[h];
-        if (excluded_weight(prog, w)) continue;
-        std::vector<const RadNameMap*> maps;
-        scan_maps(prog, w.source, &maps);
-        for (const RadNameMap* m : maps)
-            for (int k = 0; k < m->n_src && k < 8; ++k) {
-                std::string leaf;
-                const std::string src = m->src[k] ? m->src[k] : "";
-                if (!module_of(src, &leaf).empty() && !excluded_source(src)) leaves.insert(leaf);
-            }
-    }
-    TargetSet ok;
-    for (const std::string& l : leaves) {
-        const TargetSet one{ l };
-        std::vector<Site> s;
-        std::string e;
-        if (find_unsupported_uses(prog, one, nullptr) == 0 && build_sites(prog, one, 1, &s, &e) == RAD_OK &&
-            !s.empty())
-            ok.insert(l);
-    }
-    return ok;
 }
 
 std::string explain_module(const Program& prog, const TargetSet& targets, const std::string& module) {
@@ -817,6 +793,17 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
     if (truthy("trainable_token_indices"))
         return fail(err, RAD_E_UNSUPPORTED, cfg_path + ": trainable_token_indices -- embedding "
                                                        "updates are not served");
+    /* PEFT options that change the forward pass itself, not only the weights. */
+    if (truthy("layer_replication"))
+        return fail(err, RAD_E_UNSUPPORTED, cfg_path + ": layer_replication -- an adapter over "
+                                                       "repeated base layers is not served");
+    if (truthy("use_qalora"))
+        return fail(err, RAD_E_UNSUPPORTED, cfg_path + ": use_qalora -- QA-LoRA's pooled input is "
+                                                       "not served");
+    if (truthy("alora_invocation_tokens"))
+        return fail(err, RAD_E_UNSUPPORTED, cfg_path + ": alora_invocation_tokens -- an activated "
+                                                       "LoRA, which applies only after its "
+                                                       "invocation, is not served");
     if (!cfg.contains("r") || !cfg["r"].is_number_integer() || cfg["r"].get<int64_t>() <= 0)
         return fail(err, RAD_E_FORMAT, cfg_path + ": no positive integer `r`");
     if (!cfg.contains("lora_alpha") || !cfg["lora_alpha"].is_number())
@@ -833,6 +820,9 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
         else if (t.is_array())
             for (const ojson& x : t) if (x.is_string()) info->target_modules.push_back(x.get<std::string>());
     }
+    /* PEFT's get_pattern_key: a key matches a module whose name ends in it on a dot boundary,
+     * `(.*\.)?(key)$` from the start of the name, and the first matching key in the file's order
+     * wins. */
     struct Pat { std::string key; std::regex re; double v; };
     std::vector<Pat> rpat, apat;
     for (const char* which : { "rank_pattern", "alpha_pattern" }) {
@@ -846,14 +836,17 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
             Pat p;
             p.key = it.key();
             try {
-                p.re = std::regex(p.key, std::regex::ECMAScript);
+                p.re = std::regex("(.*\\.)?(" + p.key + ")$", std::regex::ECMAScript);
             } catch (const std::regex_error& e) {
                 return fail(err, RAD_E_FORMAT, cfg_path + ": " + which + " key '" + p.key +
                                                    "' is not a regex this engine reads (" + e.what() + ")");
             }
             p.v = it.value().get<double>();
+            if (!std::isfinite(p.v))
+                return fail(err, RAD_E_FORMAT, cfg_path + ": " + which + "[" + p.key +
+                                                   "] is not a finite number");
             if (!std::strcmp(which, "rank_pattern")) {
-                if (!it.value().is_number_integer() || p.v <= 0)
+                if (!it.value().is_number_integer() || p.v <= 0 || p.v > (double)INT32_MAX)
                     return fail(err, RAD_E_FORMAT, cfg_path + ": rank_pattern[" + p.key +
                                                        "] is not a positive integer");
                 info->rank_pattern.push_back({ p.key, (int64_t)p.v });
@@ -873,19 +866,10 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
                                                   "adapter as safetensors");
     if (st.open(st_path) != RAD_OK) return fail(err, RAD_E_IO, st_path + ": cannot open as safetensors");
 
-    uint64_t hash = 1469598103934665603ull;
-    fnv(&hash, text.data(), text.size());
     std::vector<const StTensor*> order;
     for (const StTensor& t : st.tensors()) order.push_back(&t);
     std::sort(order.begin(), order.end(),
               [](const StTensor* a, const StTensor* b) { return a->name < b->name; });
-    for (const StTensor* t : order) {
-        fnv(&hash, t->name.data(), t->name.size() + 1);
-        fnv(&hash, t->dtype_str.data(), t->dtype_str.size() + 1);
-        for (int64_t d : t->shape) fnv(&hash, &d, sizeof d);
-        if (t->data) fnv(&hash, t->data, (size_t)t->bytes);
-    }
-    info->content_hash = hash;
 
     static const std::regex key_re(R"(^(.*)\.lora_([AB])\.(weight|default\.weight)$)");
     std::map<std::string, AdModule> mods;
@@ -902,7 +886,7 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
                                                     "; only linear LoRA A/B pairs are served");
         }
         std::string mod = m[1].str();
-        const size_t at = mod.find("base_model.model.");   /* rad-export: first occurrence */
+        const size_t at = mod.find("base_model.model.");   /* the first one, as rad-export strips it */
         if (at != std::string::npos) mod.erase(at, 17);
         AdModule& am = mods[mod];
         am.name = mod;
@@ -932,8 +916,8 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
         }
         int64_t rr = info->r;
         double  aa = info->alpha;
-        for (const Pat& p : rpat) if (std::regex_search(am.name, p.re)) { rr = (int64_t)p.v; break; }
-        for (const Pat& p : apat) if (std::regex_search(am.name, p.re)) { aa = p.v; break; }
+        for (const Pat& p : rpat) if (std::regex_match(am.name, p.re)) { rr = (int64_t)p.v; break; }
+        for (const Pat& p : apat) if (std::regex_match(am.name, p.re)) { aa = p.v; break; }
         if (am.A->shape[0] != rr || am.B->shape[1] != rr)
             return fail(err, RAD_E_SHAPE,
                         fmt("module %s: expected rank %lld (r / rank_pattern), found lora_A %s and "
@@ -945,6 +929,9 @@ int load_adapter(const std::string& dir, const std::vector<Site>& sites, int max
         am.rank = rr;
         am.alpha = aa;
         am.scale = (float)(info->rslora ? aa / std::sqrt((double)rr) : aa / (double)rr);
+        if (!std::isfinite(am.scale))
+            return fail(err, RAD_E_FORMAT, fmt("module %s: alpha %g over rank %lld is no finite "
+                                               "f32 scale", am.name.c_str(), aa, (long long)rr));
         info->max_module_rank = std::max(info->max_module_rank, rr);
         const size_t d = am.name.rfind('.');
         info->leaves.insert(d == std::string::npos ? am.name : am.name.substr(d + 1));

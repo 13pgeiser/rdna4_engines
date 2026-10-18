@@ -26,6 +26,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -531,6 +532,81 @@ inline bool write_llama(const std::string& dir, const Llama& s) {
     return write_checkpoint(dir, c, ts);
 }
 
+/* The tiny LLaMA as an int4 W4A16 release in compressed-tensors' pack-quantized form, as
+ * llm-compressor writes it: every attention and MLP projection as X.weight_packed (the signed code
+ * q plus 8, eight a word along K from the low bits), X.weight_scale (bf16, one per 128 of K) and,
+ * with `asym`, X.weight_zero_point (the signed zero point plus 8, eight a word along N), the value
+ * being (q - zero_point) * scale. Each scale is a power of two, so every value is exact in bf16 and
+ * the release is the same numbers as a bf16 checkpoint of them. The head, the norms and the
+ * embedding stay bf16, as such a release leaves them. */
+inline bool write_llama_ct_int4(const std::string& dir, const Llama& s, bool asym) {
+    if (!write_llama(dir, s)) return false;
+    std::vector<Tensor> in = read_safetensors(dir + "/model.safetensors"), out;
+    const int64_t G = 128;
+    for (Tensor& t : in) {
+        const std::string sfx = "_proj.weight";
+        if (t.name.size() < sfx.size() ||
+            t.name.compare(t.name.size() - sfx.size(), sfx.size(), sfx) != 0) {
+            out.push_back(std::move(t));
+            continue;
+        }
+        const std::string base = t.name.substr(0, t.name.size() - 7);
+        const int64_t N = t.shape[0], K = t.shape[1], ng = K / G;
+        Tensor p{ base + ".weight_packed", "I32", { N, K / 8 }, {} };
+        Tensor sc{ base + ".weight_scale", "BF16", { N, ng }, {} };
+        Tensor zp{ base + ".weight_zero_point", "I32", { (N + 7) / 8, ng }, {} };
+        p.bytes.assign((size_t)(N * K / 2), 0);
+        sc.bytes.resize((size_t)(N * ng * 2));
+        zp.bytes.assign((size_t)((N + 7) / 8 * ng * 4), 0);
+        auto put = [](std::vector<uint8_t>& b, int64_t word, int nib, int v) {
+            uint32_t w;
+            std::memcpy(&w, b.data() + word * 4, 4);
+            w |= (uint32_t)(v & 15) << (4 * nib);
+            std::memcpy(b.data() + word * 4, &w, 4);
+        };
+        for (int64_t n = 0; n < N; ++n)
+            for (int64_t g = 0; g < ng; ++g) {
+                float lo = 0, hi = 0;
+                for (int64_t k = g * G; k < (g + 1) * G; ++k) {
+                    const float v = rad_load_f32(t.bytes.data(), RAD_BF16, n * K + k);
+                    lo = std::min(lo, v);
+                    hi = std::max(hi, v);
+                }
+                const float span = asym ? (hi - lo) / 15.0f : std::max(-lo, hi) / 7.0f;
+                const float scale = std::exp2(std::ceil(std::log2(std::max(span, 1e-20f))));
+                const int z = asym ? std::clamp((int)std::lround(-lo / scale) - 8, -8, 7) : 0;
+                rad_store_f32(sc.bytes.data(), RAD_BF16, n * ng + g, scale);
+                if (asym) put(zp.bytes, (n / 8) * ng + g, (int)(n % 8), z + 8);
+                for (int64_t k = g * G; k < (g + 1) * G; ++k) {
+                    const float v = rad_load_f32(t.bytes.data(), RAD_BF16, n * K + k);
+                    const int q = std::clamp((int)std::lround(v / scale) + z, -8, 7);
+                    put(p.bytes, n * (K / 8) + k / 8, (int)(k % 8), q + 8);
+                }
+            }
+        out.push_back(std::move(p));
+        out.push_back(std::move(sc));
+        if (asym) out.push_back(std::move(zp));
+    }
+    nlohmann::ordered_json c = nlohmann::ordered_json::parse(read_text(dir + "/config.json"));
+    c["quantization_config"] = {
+        { "quant_method", "compressed-tensors" }, { "format", "pack-quantized" },
+        { "config_groups",
+          { { "group_0",
+              { { "format", "pack-quantized" }, { "targets", { "Linear" } },
+                { "input_activations", nullptr },
+                { "weights",
+                  { { "num_bits", 4 }, { "type", "int" }, { "symmetric", !asym },
+                    { "strategy", "group" }, { "group_size", G }, { "dynamic", false },
+                    { "actorder", asym ? nullptr : nlohmann::ordered_json("static") } } } } } } },
+        { "ignore", { "lm_head" } } };
+    return write_text(dir + "/config.json", c.dump(2)) &&
+           write_safetensors(dir + "/model.safetensors", out);
+}
+
+/* The recipe that serves an int4 release on the 4-bit GEMMs: every imported grid unsigned with a
+ * u4 zero plane and its scales in f16. */
+inline const char* kInt4ImportRecipe = "blk.*.weight  import  codes=u4 zero=u4 scale=f16\n";
+
 /* ------------------------------------------------------------------ qwen3asr: speech to text */
 
 /* Qwen3-ASR (`qwen3_asr`, served by qwen3asr_bf16 from the checkpoint as it ships): a Whisper-style
@@ -635,6 +711,74 @@ inline bool write_qwen3asr(const std::string& dir, const Qwen3Asr& s) {
            write_text(dir + "/processor_config.json", fe.dump(2));
 }
 
+/* ------------------------------------------------------------------ PEFT LoRA adapters */
+
+/* A PEFT LoRA adapter for the checkpoint a writer above put in `base`: every 2-D
+ * `<module>.weight` whose leaf is in `targets` gets bf16 noise lora_A [r, in] and lora_B [out, r],
+ * with adapter_config.json's `r` and `lora_alpha`. The delta (alpha / r) * B.A is about `gain`
+ * times the weight's own spread. With `merged` set, the checkpoint with every delta folded in
+ * (f32 sum, rounded to bf16) is written there too: what the adapter served at runtime must match
+ * within rounding. */
+inline bool write_lora(const std::string& dir, const std::string& base,
+                       const std::vector<std::string>& targets, int64_t r, double alpha,
+                       uint64_t seed, float gain, const std::string& merged = "") {
+    Rng rng(seed);
+    std::vector<Tensor> ws = read_safetensors(base + "/model.safetensors");
+    if (ws.empty()) return false;
+    const float scale = (float)(alpha / (double)r);
+    std::vector<Tensor> ad;
+    nlohmann::ordered_json leaves = nlohmann::ordered_json::array();
+    for (Tensor& w : ws) {
+        const std::string sfx = ".weight";
+        if (w.shape.size() != 2 || w.dtype != "BF16" || w.name.size() <= sfx.size() ||
+            w.name.compare(w.name.size() - sfx.size(), sfx.size(), sfx) != 0)
+            continue;
+        const std::string module = w.name.substr(0, w.name.size() - sfx.size());
+        const std::string leaf = module.substr(module.rfind('.') + 1);
+        bool hit = false;
+        for (const std::string& t : targets) hit = hit || t == leaf;
+        if (!hit) continue;
+        const int64_t n_out = w.shape[0], n_in = w.shape[1];
+        Tensor A = noise("base_model.model." + module + ".lora_A.weight", { r, n_in }, rng,
+                         std::sqrt(3.0f / (float)n_in));
+        Tensor B = noise("base_model.model." + module + ".lora_B.weight", { n_out, r }, rng,
+                         gain * std::sqrt(3.0f / (float)r) / scale);
+        if (!merged.empty()) {
+            for (int64_t o = 0; o < n_out; ++o)
+                for (int64_t i = 0; i < n_in; ++i) {
+                    float d = 0.0f;
+                    for (int64_t j = 0; j < r; ++j)
+                        d += rad_load_f32(B.bytes.data(), RAD_BF16, o * r + j) *
+                             rad_load_f32(A.bytes.data(), RAD_BF16, j * n_in + i);
+                    const float v = rad_load_f32(w.bytes.data(), RAD_BF16, o * n_in + i);
+                    rad_store_f32(w.bytes.data(), RAD_BF16, o * n_in + i, v + scale * d);
+                }
+        }
+        ad.push_back(std::move(A));
+        ad.push_back(std::move(B));
+    }
+    for (const std::string& t : targets) leaves.push_back(t);
+    nlohmann::ordered_json c;
+    c["peft_type"] = "LORA";
+    c["base_model_name_or_path"] = base;
+    c["r"] = r;
+    c["lora_alpha"] = alpha;
+    c["target_modules"] = leaves;
+    c["bias"] = "none";
+    c["use_dora"] = false;
+    c["use_rslora"] = false;
+    c["modules_to_save"] = nullptr;
+    if (ad.empty() || ::mkdir(dir.c_str(), 0755) != 0 ||
+        !write_text(dir + "/adapter_config.json", c.dump(2)) ||
+        !write_safetensors(dir + "/adapter_model.safetensors", ad))
+        return false;
+    if (merged.empty()) return true;
+    return ::mkdir(merged.c_str(), 0755) == 0 &&
+           write_text(merged + "/config.json", read_text(base + "/config.json")) &&
+           write_text(merged + "/tokenizer.json", read_text(base + "/tokenizer.json")) &&
+           write_safetensors(merged + "/model.safetensors", ws);
+}
+
 /* The rad-convert recipe that makes llama_dense_fp8's linears block fp8, as
  * data/recipes/minicpm5-2b-dspark.recipe does for the trunk. */
 inline const char* kLlamaFp8Recipe =
@@ -642,6 +786,14 @@ inline const char* kLlamaFp8Recipe =
     "blk.*.attn_output.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
     "blk.*.ffn_gate_up.weight  rtn codes=fp8_e4m3 block=128x128 scale=bf16\n"
     "blk.*.ffn_down.weight     rtn codes=fp8_e4m3 block=128x128 scale=bf16\n";
+
+/* The same trunk as OCP-MXFP4: e2m1 codes with an E8M0 exponent per 32 of K, read by gemm_nt_q at
+ * mxfp4a8 against the E4M3 activation pair scaled per 128. */
+inline const char* kLlamaMxfp4Recipe =
+    "blk.*.attn_qkv.weight     rtn codes=fp4_e2m1 group=32 scale=e8m0\n"
+    "blk.*.attn_output.weight  rtn codes=fp4_e2m1 group=32 scale=e8m0\n"
+    "blk.*.ffn_gate_up.weight  rtn codes=fp4_e2m1 group=32 scale=e8m0\n"
+    "blk.*.ffn_down.weight     rtn codes=fp4_e2m1 group=32 scale=e8m0\n";
 
 /* ------------------------------------------------------------------ Qwen-Image 2.1 */
 

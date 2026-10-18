@@ -1,0 +1,18 @@
+# minimax-music3-bf16.recipe -- MiniMax-Music3 served at bf16, the precision diffusers runs it at.
+#
+#   rad-convert <MiniMax-Music3 pipeline directory> \
+#       --recipe data/recipes/minimax-music3-bf16.recipe -o minimax-music3-bf16.rad
+#
+# The language model and the depth decoder ship bf16 and are kept. The DiT, the condition encoder
+# and the vocoder ship f32: their linears and convolutions are cast to bf16 here, once (the
+# vocoder's weight norm folded in f32 first, rad_builder.h's RAD_MAP_WNORM), while their norms, the
+# snake alphas, the Fourier projection and the layer mix stay f32 -- read once a pass or less.
+
+dit.*.ln1.*                          cast dtype=f32
+dit.*.ln2.*                          cast dtype=f32
+dit.t.fourier                        cast dtype=f32
+dit.*                                cast dtype=bf16
+cond.mix.*                           cast dtype=f32
+cond.*                               cast dtype=bf16
+voc.*.alpha                          cast dtype=f32
+voc.*                                cast dtype=bf16

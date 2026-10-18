@@ -46,4 +46,30 @@ RAD_PHILOX_HD float rad_philox_normal(uint64_t seed, uint64_t e) {
     return (j & 1) ? r * sinf(t) : r * cosf(t);
 }
 
+/* Element `e` of the standard-normal stream (seed, stream): the counter's upper half is `stream`,
+ * so stream 0 is rad_philox_normal and each other value an independent stream of the same seed
+ * (an audio window's noise is stream 1 + its index). */
+RAD_PHILOX_HD float rad_philox_normal_s(uint64_t seed, uint64_t stream, uint64_t e) {
+    const uint64_t g = e >> 2;
+    uint32_t c[4] = { (uint32_t)g, (uint32_t)(g >> 32), (uint32_t)stream, (uint32_t)(stream >> 32) };
+    rad_philox4x32_10(c, (uint32_t)seed, (uint32_t)(seed >> 32));
+    const int j = (int)(e & 3u);
+    const uint32_t wa = c[(j >> 1) * 2], wb = c[(j >> 1) * 2 + 1];
+    const float ua = ((float)(wa >> 8) + 0.5f) * (1.0f / 16777216.0f);
+    const float ub = ((float)(wb >> 8) + 0.5f) * (1.0f / 16777216.0f);
+    const float r = sqrtf(-2.0f * logf(ua));
+    const float t = 6.28318530717958647692f * ub;
+    return (j & 1) ? r * sinf(t) : r * cosf(t);
+}
+
+/* Element `e` of the uniform stream (seed, stream), in (0, 1): word e % 4 of the counter
+ * (e / 4, stream) made uniform as the normal stream's words are. A sampler draws its pick from
+ * it. */
+RAD_PHILOX_HD float rad_philox_uniform_s(uint64_t seed, uint64_t stream, uint64_t e) {
+    const uint64_t g = e >> 2;
+    uint32_t c[4] = { (uint32_t)g, (uint32_t)(g >> 32), (uint32_t)stream, (uint32_t)(stream >> 32) };
+    rad_philox4x32_10(c, (uint32_t)seed, (uint32_t)(seed >> 32));
+    return ((float)(c[e & 3u] >> 8) + 0.5f) * (1.0f / 16777216.0f);
+}
+
 #endif /* RAD_PHILOX_H */

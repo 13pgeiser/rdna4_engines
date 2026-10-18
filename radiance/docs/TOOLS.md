@@ -180,8 +180,9 @@ also matches a norm leaves the norm as it is.
 | `paroquant` | a channel scaling and `stages` rounds of Givens pair rotations, learned against the Hessian, then AutoRound on the rotated weight; the encoding's `givens` transform |
 | `ggml` | `type=` one of llama.cpp's formats (q4_0, q4_1, q5_0, q5_1, q8_0, q2_K..q6_K, iq4_nl, iq4_xs, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq1_s, iq1_m), chosen by llama.cpp's own search, imatrix-weighted; the codes are byte for byte llama.cpp's, stored as each type's affine planes. iq2_xxs, iq2_xs and iq1_s need `--imatrix` |
 | `cast` | a float weight in another float dtype (`dtype=` f32, bf16, f16, fp8_e4m3, fp8_e5m2), no scale |
+| `import` | rad-convert's own, not a plugin: the numbers a quantised release ships, in the spelling the kernels read, instead of quantising again. `codes=uN` makes a symmetric grid's signed codes unsigned under a zero point of 2^(N-1); `zero=` is the zero plane's dtype (u4, u8); `scale=` the scale's (f16, bf16, f32), each shipped scale rounded to nearest; `block=RxC` repeats an FP8 scale shipped per row or per tensor over that block grid. It reads an imported integer grid (GPTQ, CT-INT4) or an FP8 weight with a scale per row or per tensor, refuses any other quantised form by name, and keeps a plain float weight as it is. The run reports per rule how many weights it re-expressed and how many scales the new dtype rounded |
 
-Every quantiser except `ggml` and `cast` takes the grid options:
+Every quantiser except `ggml`, `cast` and `import` takes the grid options:
 
 | option | |
 |---|---|
@@ -780,6 +781,13 @@ reference with the exact wire and a bf16 KV cache.
 `--kld-out FILE` writes the report as JSON, and every position's KL, both NLLs and the argmax
 agreement to `FILE.rows` (`[positions, 4]` f32, reference row order), so two candidates can be
 compared position by position.
+
+A runtime LoRA adapter (GUIDE.md §4.9.1) is scored the same way: `--lora NAME=DIR --kld-lora NAME`
+runs every document through the adapter, against a reference recorded from the merged checkpoint
+(or from PEFT itself). `--kld-lora-sources PREFIX` runs only the documents whose `source` starts
+with `PREFIX` through it and the rest as the base, in the same steps. The steps are those of the
+all-adapter and all-base runs with the same flags, so each document's rows should be byte for byte
+theirs: that is how a mixed batch is checked.
 
 ---
 

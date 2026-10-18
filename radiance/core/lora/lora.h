@@ -1,22 +1,19 @@
 /* lora.h -- runtime LoRA: which declared GEMMs an adapter lands in, and the bytes of one adapter for
- * one rank (research/radiance/lora/DESIGN.md §2, §5).
+ * one rank. Two host-only steps that read nothing but the declared Program:
  *
- * TWO PURE STEPS, both host-only and both read nothing but the declared Program:
+ *   build_sites()   after declare, every LoRA-capable trunk GEMM whose weight a target names becomes
+ *                   a Site: the weight's per-rank geometry (K slice, output width, where each PEFT
+ *                   module's rows land in y), read from what the plugin recorded on the weight
+ *                   (shard mode, row parts, shard and part spans, name-map sources), never from a
+ *                   plugin's own split rule. One Site per GEMM op; the Sites of one declared weight
+ *                   share one pool.
+ *   load_adapter()  a PEFT directory -> one PackedSite per pool, the bytes of one slot.
  *
- *   build_sites()   after declare: every LoRA-capable trunk GEMM whose weight a target names becomes
- *                   a Site -- the weight's per-rank geometry (K slice, output width, which rows of
- *                   which PEFT module land where in the GEMM's y) read off the facts the plugin
- *                   recorded on the weight: its shard mode, row parts, shard / part spans and its
- *                   name-map sources. Never a plugin's own split rule. One Site per GEMM op; the
- *                   Sites of one declared weight share one POOL (one slot layout per weight).
- *   load_adapter()  a PEFT directory -> one PackedSite per pool: exactly the bytes of one slot.
+ * Nothing here touches a device; the caller declares the pools and copies.
  *
- * Nothing here allocates device memory or touches a device; the caller declares the pools and copies.
- *
- * TARGETS ARE HF MODULE LEAF NAMES ("q_proj", "gate_proj", "in_proj_qkv", ...). A declared weight is
- * targeted when one of its name-map sources is `<prefix>.<leaf>.weight`, `leaf` in the set, and the
- * weight is not in a non-trunk scope (weight_targeted() states the rule; build_sites and
- * find_unsupported_uses use exactly that predicate, and the builder may call it mid-declare).
+ * Targets are HF module leaf names ("q_proj", "gate_proj", "in_proj_qkv", ...). A declared weight is
+ * targeted when one of its name-map sources is `<prefix>.<leaf>.weight` with `leaf` in the set and
+ * the weight is in the trunk; weight_targeted() is the one predicate everything here uses.
  */
 #pragma once
 #include "../rad_core.h"
@@ -30,25 +27,23 @@
 namespace rad {
 namespace lora {
 
-/* HF module LEAF names. A std::set so two callers that build it in different orders get the same
- * answer. Empty targets nothing. */
+/* HF module leaf names, ordered so every caller builds the same set. Empty targets nothing. */
 using TargetSet = std::set<std::string>;
 
-/* ONE CONTIGUOUS RUN OF ONE PEFT MODULE'S ROWS INSIDE THIS SITE'S y, ON THIS RANK.
- * A module may need SEVERAL parts: in_proj_qkv covers three row parts of the delta net's fused
- * ssm_inz, and a rank holds a slice of EACH, so its B rows on that rank are three disjoint runs
- * landing at three y columns. Every part of one module carries the same t_off. */
+/* One contiguous run of one PEFT module's rows inside this site's y, on this rank. A module may
+ * need several: in_proj_qkv covers three row parts of the delta net's fused ssm_inz and a rank
+ * holds a slice of each, so its B rows there are three runs at three y columns. Every part of one
+ * module has the same t_off. */
 struct SitePart {
     std::string module;            /* HF module path without ".weight", as the name map spells it */
     int64_t src_lo = 0, src_hi = 0;/* rows [lo,hi) of the module's full output (= rows of lora_B) */
     int64_t y_col = 0;             /* column of this site's per-rank y where row src_lo lands */
     int64_t t_off = 0;             /* first t column of the module's block = module slot * max_rank */
-    /* ADDED: the weight's row part this run lies in (0 for a weight of one part). */
-    int32_t row_part = 0;
+    int32_t row_part = 0;          /* the weight's row part this run lies in (0: a single part) */
 };
 
-/* ADDED: one name-map source of the site's weight, in concatenation order -- targeted or not,
- * because an untargeted source still occupies rows of the fused weight. */
+/* One name-map source of the site's weight, in concatenation order, targeted or not: an untargeted
+ * source still occupies rows of the fused weight. */
 struct SiteSource {
     std::string module;            /* source without ".weight" */
     bool        targeted = false;
@@ -59,28 +54,20 @@ struct SiteSource {
 };
 
 struct Site {
-    uint32_t gemm = 0;                          /* the gemm op handle (anchor) */
-    uint32_t lora_shrink = 0, lora_expand = 0;  /* appended op handles (stream G) */
+    uint32_t gemm = 0;                          /* the gemm op handle */
     std::string weight;                         /* declared weight name */
     int     shard = 0;                          /* RAD_SHARD_ROW / COL / NONE of the base weight */
     int64_t K_r = 0, k_lo = 0, K_full = 0;      /* x columns on this rank; COL: A columns
                                                  * [k_lo, k_lo + K_r). K_full 0 = not recorded on
                                                  * the weight (a COL span): taken from lora_A. */
     int64_t N_r = 0;                            /* per-rank y width the gemm writes */
-    int64_t R = 0;                              /* capacity: n_modules * max_rank (see report:
-                                                 * DESIGN said parts.size() * max_rank) */
+    int64_t R = 0;                              /* capacity: n_modules * max_rank */
     std::vector<SitePart> parts;                /* empty while !parts_resolved */
-    uint32_t pool_a = 0, pool_b = 0, pool_scale = 0;   /* PERSIST buffers; 0 here, the caller's */
-
-    /* ---- ADDED */
     int32_t     pool = -1;           /* index of the weight in build_sites' per-weight pool list */
-    uint32_t    w = 0;               /* the declared weight's handle */
     std::string op;                  /* the gemm's op name */
     int32_t     n_modules = 0;       /* targeted sources */
     int32_t     max_rank = 0;
     bool        parts_resolved = true;   /* false: the fused layout is decided by B rows at load */
-    bool        res_unchecked = false;   /* gemm_nt_bias: its optional `res` operand is bound at
-                                          * issue, not at declare -- stream G checks it there */
     std::vector<SiteSource> sources;
     /* Per row part g of the weight (P = max(1, n_row_parts) entries): the part's rows in the
      * container (0 = not recorded: an equal-part single span), this rank's rows [lo, hi) of it in
@@ -93,7 +80,6 @@ struct PackedSite {
     std::vector<uint16_t> a;       /* [R, K_r] bf16, zero rows past the module's rank in each block */
     std::vector<uint16_t> b;       /* [N_r, R] bf16, zero outside the module's rows / rank block */
     std::vector<float>    scale;   /* [N_r]: the module's alpha/r (alpha/sqrt(r) rsLoRA) on its rows */
-    /* ADDED */
     int32_t pool = -1;
     bool    empty = true;          /* no module of this adapter lands in this pool */
 };
@@ -121,7 +107,6 @@ struct AdapterInfo {
     std::set<std::string>    leaves;      /* leaf names present in the tensors (targets present) */
     std::vector<std::string> absent;      /* modules no site on THIS rank took (see check_placed) */
     int64_t                  max_module_rank = 0;
-    uint64_t                 content_hash = 0;   /* FNV-1a 64 over the config bytes and the tensors */
 };
 
 /* A targeted weight read by an op that is not a LoRA site. The caller refuses at startup. */
@@ -164,10 +149,6 @@ int find_unsupported_uses(const Program& prog, const TargetSet& targets,
 int build_sites(const Program& prog, const TargetSet& targets, int max_rank,
                 std::vector<Site>* out, std::string* err,
                 std::vector<std::string>* pool_weights = nullptr);
-
-/* Every leaf whose every targeted weight in `prog` would be a site: what "all LoRA-capable trunk
- * linears" means when no adapter names the targets. */
-TargetSet all_capable_targets(const Program& prog);
 
 /* One adapter for one rank: `packed` gets one PackedSite per pool (index = Site::pool), in the
  * slot layout of the pool's sites. Refusals return a negative code and name module, expected and

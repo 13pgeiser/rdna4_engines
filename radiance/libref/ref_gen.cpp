@@ -26,14 +26,15 @@ enum { kFirst = 1, kInpaint = 2, kPreview = 4 };
 
 inline float rbf(float v) { return round_dt(RAD_BF16, v); }
 
-/* A space-separated list of floats, each rounded to bf16 as the upstream bf16 tensor holds it. */
-int parse_list(const char* s, std::vector<float>* out) {
+/* A space-separated list of floats, each rounded to bf16 as the upstream bf16 tensor holds it, or
+ * kept in f32 with `bf16` false. */
+int parse_list(const char* s, std::vector<float>* out, bool bf16 = true) {
     out->clear();
     while (s && *s) {
         char* end = nullptr;
         const double v = std::strtod(s, &end);
         if (end == s) break;
-        out->push_back(rbf((float)v));
+        out->push_back(bf16 ? rbf((float)v) : (float)v);
         s = end;
     }
     return (int)out->size();
@@ -78,11 +79,15 @@ int ref_ln_mod(const RadArgs* a, RadStream) {
 }
 
 /* ------------------------------------------------------------------ gate_add */
-/* x = bf16( x + bf16( bf16(tanh(g[seq])) * y ) ): a residual added through its sequence's gate. */
+/* x = bf16( x + bf16( bf16(tanh(g[seq])) * y ) ): a residual added through its sequence's gate.
+ * With `act` none the gate is g itself, unrounded: x = bf16(x + bf16(g[seq] * y)). */
 int ref_gate_add(const RadArgs* a, RadStream) {
     if (!have(a, 4)) return RAD_E_INVAL;
     const RadTensor *y = &a->t[0], *g = &a->t[1], *cu = &a->t[2], *x = &a->t[3];
     const int64_t n = p_int(a, "n", 0);
+    static const char* kActs[] = { "tanh", "none" };
+    const int act = p_enum(a, "act", kActs, 2, 0);
+    if (act < 0 || act > 1) return RAD_E_INVAL;
     if (n <= 0) return RAD_E_SHAPE;
     const int64_t rows = rows_of(y, n), n_seq = numel(cu) - 1;
     if (rows <= 0 || n_seq <= 0 || rows_of(x, n) < rows) return RAD_E_SHAPE;
@@ -93,7 +98,8 @@ int ref_gate_add(const RadArgs* a, RadStream) {
         const int64_t yb = rowoff(y, r, n), ys = laststride(y);
         const int64_t xb = rowoff(x, r, n), xs = laststride(x);
         for (int64_t i = 0; i < n; ++i) {
-            const float t = round_dt(x->dtype, ref_tanh(ldt(g, e * g_rs + i * g_cs)));
+            const float gv = ldt(g, e * g_rs + i * g_cs);
+            const float t = act ? gv : round_dt(x->dtype, ref_tanh(gv));
             const float p = round_dt(x->dtype, t * ldt(y, yb + i * ys));
             stt(x, xb + i * xs, ldt(x, xb + i * xs) + p);
         }
@@ -145,6 +151,108 @@ int ref_ln_mod_quant_fp8(const RadArgs* a, RadStream) {
             o[(size_t)i] = round_dt(RAD_BF16, ln * sm);
             if (z) stt(z, rowoff(z, r, n) + i * laststride(z), o[(size_t)i]);
         }
+        const int64_t qb = rowoff(q, r, n), qs = laststride(q);
+        for (int64_t gi = 0; gi < ngrp; ++gi) {
+            const float* og = o.data() + gi * grp;
+            const float scl = q8_group([&](int64_t i) { return og[i]; }, grp, 448.0f, q,
+                                        qb + gi * grp * qs, qs);
+            stt(sc, rowoff(sc, r, ngrp) + gi * laststride(sc), scl);
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ rms_mod / rms_mod_quant_fp8 */
+/* The checks both forms share: `s` holds [shift | scale] in each of its n_seq rows, `g` a gate
+ * row per sequence when `gated`, and every row operand at least `rows` rows. */
+static int rms_mod_check(const RadTensor* y, const RadTensor* g, const RadTensor* s,
+                         const RadTensor* w, const RadTensor* x, int64_t n, int64_t n_seq,
+                         int64_t rows, bool gated) {
+    if (rows <= 0 || n_seq <= 0 || rows_of(x, n) < rows || numel(w) < n ||
+        numel(s) < n_seq * 2 * n)
+        return RAD_E_SHAPE;
+    if (gated && (rows_of(y, n) < rows || numel(g) < n_seq * n)) return RAD_E_SHAPE;
+    return RAD_OK;
+}
+
+/* Row r of sequence e into o[0, n). With `gated` the branch is added first through the gate row,
+ * x = bf16(x + bf16(g[e] * y[r])) (no tanh), and stored; then an RMS norm with a gain and the
+ * sequence's shift and scale, each step a tensor the upstream bf16 model stores:
+ *
+ *   n1 = bf16(x * rsqrt(mean(x^2) + eps))   n2 = bf16(n1 * w)
+ *   m  = bf16(n2 * bf16(1 + scale[e]))      z  = bf16(m + shift[e])
+ *
+ * The sum of squares is f32 in ascending order, read from the stored residual. `s` is
+ * [n_seq, >= 2n] at its own row pitch, shift = s[e, 0:n] and scale = s[e, n:2n] (a column slice
+ * of the modulation table). The residual rounds to x's dtype and the norm chain to `dt`. */
+static void rms_mod_row(const RadTensor* y, const RadTensor* g, const RadTensor* s,
+                        const RadTensor* w, const RadTensor* x, int64_t r, int64_t e, int64_t n,
+                        float eps, bool gated, uint32_t dt, float* o) {
+    const int64_t xb = rowoff(x, r, n), xs = laststride(x);
+    if (gated) {
+        const int64_t g_rs = row_stride(g, n), g_cs = laststride(g);
+        const int64_t yb = rowoff(y, r, n), ys = laststride(y);
+        for (int64_t i = 0; i < n; ++i) {
+            const float p = round_dt(x->dtype, ldt(g, e * g_rs + i * g_cs) * ldt(y, yb + i * ys));
+            stt(x, xb + i * xs, ldt(x, xb + i * xs) + p);
+        }
+    }
+    float ss = 0.0f;
+    for (int64_t i = 0; i < n; ++i) { const float v = ldt(x, xb + i * xs); ss += v * v; }
+    const float rs = 1.0f / std::sqrt(ss / (float)n + eps);
+    const int64_t s_rs = row_stride(s, 2 * n), s_cs = laststride(s), ws = laststride(w);
+    for (int64_t i = 0; i < n; ++i) {
+        const float n1 = round_dt(dt, ldt(x, xb + i * xs) * rs);
+        const float n2 = round_dt(dt, n1 * ldt(w, i * ws));
+        const float sc = round_dt(dt, 1.0f + ldt(s, e * s_rs + (n + i) * s_cs));
+        const float m  = round_dt(dt, n2 * sc);
+        o[i] = round_dt(dt, m + ldt(s, e * s_rs + i * s_cs));
+    }
+}
+
+/* A diffusion transformer's adaptive RMS norm with a shift (MiniMax-H3's
+ * `norm(h) * (1 + scale) + shift`), the gated residual of the branch before it optionally first;
+ * the norm chain rounds to z's dtype. */
+int ref_rms_mod(const RadArgs* a, RadStream) {
+    if (a->n_t < 7) return RAD_E_INVAL;
+    const RadTensor *y = t_in(a, 0), *g = t_in(a, 1), *s = &a->t[2], *w = &a->t[3];
+    const RadTensor *cu = &a->t[4], *x = &a->t[5], *z = &a->t[6];
+    const int64_t n = p_int(a, "n", 0);
+    const bool gated = p_int(a, "gated", 0) != 0;
+    const float eps = p_f32(a, "eps", 1e-6f);
+    if (n <= 0 || (gated && (!y || !g))) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(z, n), n_seq = numel(cu) - 1;
+    RAD_REF_TRY(rms_mod_check(y, g, s, w, x, n, n_seq, rows, gated));
+    REF_PAR_FOR(rows * n)
+    for (int64_t r = 0; r < rows; ++r) {
+        std::vector<float> o((size_t)n);
+        rms_mod_row(y, g, s, w, x, r, seq_of(cu, n_seq, r), n, eps, gated, z->dtype, o.data());
+        const int64_t zb = rowoff(z, r, n), zs = laststride(z);
+        for (int64_t i = 0; i < n; ++i) stt(z, zb + i * zs, o[(size_t)i]);
+    }
+    return RAD_OK;
+}
+
+/* rms_mod in front of a quantised linear: the norm chain in bf16, then the codes and scales as
+ * ref_quant_act_fp8 writes them over that bf16 row (ln_mod_quant_fp8's rule), z written when
+ * bound. */
+int ref_rms_mod_quant_fp8(const RadArgs* a, RadStream) {
+    if (a->n_t < 9) return RAD_E_INVAL;
+    const RadTensor *y = t_in(a, 0), *g = t_in(a, 1), *s = &a->t[2], *w = &a->t[3];
+    const RadTensor *cu = &a->t[4], *x = &a->t[5], *q = &a->t[6], *sc = &a->t[7], *z = t_in(a, 8);
+    const int64_t n = p_int(a, "n", 0), grp = p_int(a, "group", 0);
+    const bool gated = p_int(a, "gated", 0) != 0;
+    const float eps = p_f32(a, "eps", 1e-6f);
+    if (n <= 0 || grp <= 0 || n % grp || (gated && (!y || !g))) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(q, n), n_seq = numel(cu) - 1, ngrp = n / grp;
+    RAD_REF_TRY(rms_mod_check(y, g, s, w, x, n, n_seq, rows, gated));
+    if (numel(sc) < rows * ngrp || (z && rows_of(z, n) < rows)) return RAD_E_SHAPE;
+    REF_PAR_FOR(rows * n)
+    for (int64_t r = 0; r < rows; ++r) {
+        std::vector<float> o((size_t)n);
+        rms_mod_row(y, g, s, w, x, r, seq_of(cu, n_seq, r), n, eps, gated, RAD_BF16, o.data());
+        const int64_t zb = z ? rowoff(z, r, n) : 0, zs = z ? laststride(z) : 0;
+        for (int64_t i = 0; z && i < n; ++i) stt(z, zb + i * zs, o[(size_t)i]);
         const int64_t qb = rowoff(q, r, n), qs = laststride(q);
         for (int64_t gi = 0; gi < ngrp; ++gi) {
             const float* og = o.data() + gi * grp;
@@ -298,12 +406,13 @@ int ref_randn_lanes(const RadArgs* a, RadStream) {
  * noise the image's own stream (randn_lanes). At the last step sigma_next is 0 and the kept
  * region is the picture's latent exactly. */
 int ref_flow_euler(const RadArgs* a, RadStream) {
-    if (!have(a, 13)) return RAD_E_INVAL;
+    /* inp, mask and preview are optional: a sampler without repaint or previews passes none. */
+    if (!have(a, 9) || !t_in(a, 11)) return RAD_E_INVAL;
     const RadTensor *v = &a->t[0], *sg = &a->t[1], *sgn = &a->t[2], *cfg = &a->t[3];
     const RadTensor *pair = &a->t[4], *lane = &a->t[5], *fl = &a->t[6], *seed = &a->t[7];
     const RadTensor *cu = &a->t[8];
     const RadTensor *inp = t_in(a, 9), *mask = t_in(a, 10);
-    const RadTensor *st = &a->t[11];
+    const RadTensor *st = t_in(a, 11);
     const RadTensor *pv = t_in(a, 12);
     const int64_t n = p_int(a, "n", 0), stride = p_int(a, "stride", 0);
     if (n <= 0 || stride <= 0) return RAD_E_SHAPE;
@@ -357,31 +466,71 @@ int ref_flow_euler(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ flow_x0_step */
+/* One sampler step over a lane's rows in f32, as diffusers' MiniMaxH3Scheduler.step takes it: the
+ * velocity points toward the data, so the clean estimate is d = x + (1 - t) v, and the step blends
+ * the sample toward it by the schedule's ratio. Each product and sum is one f32 rounding:
+ *
+ *   st = f32(1 - t)   d = f32(x + f32(st * v))   r = f32(sigma_next / sigma)
+ *   x' = f32(f32(r * x) + f32(f32(1 - r) * d))
+ *
+ * t, sigma and sigma_next are one value each: t the timestep the transformer was conditioned on,
+ * sigma and sigma_next the schedule's entries, kept apart because 1 - (1 - sigma) is not exact in
+ * f32. x' is stored at x's dtype. */
+int ref_flow_x0_step(const RadArgs* a, RadStream) {
+    if (!have(a, 5)) return RAD_E_INVAL;
+    const RadTensor *v = &a->t[0], *t = &a->t[1], *sg = &a->t[2], *sgn = &a->t[3], *x = &a->t[4];
+    const int64_t n = p_int(a, "n", 0);
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(x, n);
+    if (rows <= 0 || rows_of(v, n) < rows || numel(t) < 1 || numel(sg) < 1 || numel(sgn) < 1)
+        return RAD_E_SHAPE;
+    const float st = 1.0f - ldt(t, offlin(t, 0));
+    const float r = ldt(sgn, offlin(sgn, 0)) / ldt(sg, offlin(sg, 0));
+    const float omr = 1.0f - r;
+    REF_PAR_FOR(rows * n)
+    for (int64_t k = 0; k < rows; ++k) {
+        const int64_t vb = rowoff(v, k, n), vs = laststride(v);
+        const int64_t xb = rowoff(x, k, n), xs = laststride(x);
+        for (int64_t c = 0; c < n; ++c) {
+            const float xv = ldt(x, xb + c * xs);
+            const float d = xv + st * ldt(v, vb + c * vs);
+            stt(x, xb + c * xs, r * xv + omr * d);
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ chan_affine */
 /* A per-channel affine from two parameter lists (a latent's mean and deviation are configuration,
  * not weights), each value rounded to bf16 as upstream holds it: mode `fma` is
- * bf16(bf16(x * mul) + add), `inv` is bf16(bf16(x - add) / mul). */
+ * bf16(bf16(x * mul) + add), `inv` is bf16(bf16(x - add) / mul). With `round` 0 the lists stay
+ * f32 and so does the arithmetic, rounded once into y: rd(f32(x * mul) + add) and
+ * rd(f32(x - add) / mul), as an f32 model denormalises an f32 latent. */
 int ref_chan_affine(const RadArgs* a, RadStream) {
     if (!have(a, 2)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *y = &a->t[1];
-    const int64_t n = p_int(a, "n", 0);
+    const int64_t n = p_int(a, "n", 0), rnd = p_int(a, "round", 1);
+    if (rnd < 0 || rnd > 1) return RAD_E_INVAL;
     std::vector<float> mul, add;
-    if (n <= 0 || parse_list(p_str(a, "mul", ""), &mul) != n ||
-        parse_list(p_str(a, "add", ""), &add) != n)
+    if (n <= 0 || parse_list(p_str(a, "mul", ""), &mul, rnd) != n ||
+        parse_list(p_str(a, "add", ""), &add, rnd) != n)
         return RAD_E_SHAPE;
     const char* mode = p_str(a, "mode", "fma");
     const bool inv = mode && !std::strcmp(mode, "inv");
     if (!inv && mode && std::strcmp(mode, "fma")) return RAD_E_INVAL;
     const int64_t rows = rows_of(y, n);
     if (rows <= 0 || rows_of(x, n) < rows) return RAD_E_SHAPE;
+    /* The inner product's or difference's rounding: y's dtype, or none. */
+    const uint32_t mid = rnd ? y->dtype : (uint32_t)RAD_F32;
     REF_PAR_FOR(rows * n)
     for (int64_t r = 0; r < rows; ++r) {
         const int64_t xb = rowoff(x, r, n), xs = laststride(x);
         const int64_t yb = rowoff(y, r, n), ys = laststride(y);
         for (int64_t c = 0; c < n; ++c) {
             const float v = ldt(x, xb + c * xs);
-            stt(y, yb + c * ys, inv ? round_dt(y->dtype, v - add[c]) / mul[c]
-                                    : round_dt(y->dtype, v * mul[c]) + add[c]);
+            stt(y, yb + c * ys, inv ? round_dt(mid, v - add[c]) / mul[c]
+                                    : round_dt(mid, v * mul[c]) + add[c]);
         }
     }
     return RAD_OK;
@@ -607,7 +756,7 @@ int ref_scatter_add_rows(const RadArgs* a, RadStream) {
 /* quant_act_i8g's rule for one row of `n`: the scale (amax/127, 1 for an all-zero row) and the
  * codes rint(clamp(x * (1/scale), +-127)), in f32 as the device computes them. `code` may be `x`:
  * each code is written after its value is read. */
-static float ref_q8_row(const float* x, int64_t n, float* code) {
+float ref::ref_q8_row(const float* x, int64_t n, float* code) {
     float am = 0.0f;
     for (int64_t d = 0; d < n; ++d) am = std::max(am, std::fabs(x[d]));
     const float sc = am > 0.0f ? am * (1.0f / 127.0f) : 1.0f;
@@ -619,8 +768,11 @@ static float ref_q8_row(const float* x, int64_t n, float* code) {
 
 int ref_attn_prefix_self(const RadArgs* a, RadStream) {
     if (a->n_t < 12) return RAD_E_INVAL;
-    const RadTensor *q = &a->t[0], *k = &a->t[1], *v = &a->t[2], *kv = &a->t[3];
-    const RadTensor *bt = &a->t[4], *su = &a->t[5], *cu = &a->t[6], *o = &a->t[11];
+    const RadTensor *q = &a->t[0], *k = &a->t[1], *v = &a->t[2], *cu = &a->t[6], *o = &a->t[11];
+    /* The paged prefix (cache, block table, per-sequence prefix lengths), all three or none: with
+     * none every sequence's prefix is empty. */
+    const RadTensor *kv = t_in(a, 3), *bt = t_in(a, 4), *su = t_in(a, 5);
+    if ((kv == nullptr) != (bt == nullptr) || (kv == nullptr) != (su == nullptr)) return RAD_E_INVAL;
     const RadTensor *kdes = t_in(a, 7), *vdes = t_in(a, 8);
     /* The int8 Q.K form: own keys' codes and scales are given; everything else is quantised here. */
     const RadTensor *k8 = t_in(a, 9), *ks = t_in(a, 10);
@@ -628,38 +780,50 @@ int ref_attn_prefix_self(const RadArgs* a, RadStream) {
     const bool i8 = std::strcmp(qk, "i8") == 0;
     if (i8 != (k8 != nullptr) || i8 != (ks != nullptr)) return RAD_E_INVAL;
     if (i8 && (kdes || vdes)) return RAD_E_UNSUPPORTED;
+    /* The fp8 P.V form: `v` E4M3 codes with a scale per column in `v_scale` (quant_cols_fp8), each
+     * weight exp(s - max) taken to E4M3 at 448 times its value, o = sum(w v) v_scale /
+     * (448 sum exp(s - max)); prefix-free only. */
+    const RadTensor* vsc = a->n_t > 12 ? t_in(a, 12) : nullptr;
+    const char* pv = p_str(a, "pv", "bf16");
+    const bool pv8 = std::strcmp(pv, "fp8") == 0;
+    if ((!pv8 && std::strcmp(pv, "bf16") != 0) || pv8 != (vsc != nullptr)) return RAD_E_INVAL;
+    if (pv8 && (kv || kdes || vdes)) return RAD_E_UNSUPPORTED;
     const int64_t head_dim = p_int(a, "head_dim", 0), gqa = p_int(a, "gqa", 1);
     const int causal = (int)p_int(a, "causal", 0);
-    const int64_t block_size = kv->rank == 4 ? kv->shape[2] : p_int(a, "block_size", 0);
+    const int64_t block_size = !kv ? 1 : kv->rank == 4 ? kv->shape[2] : p_int(a, "block_size", 0);
     /* The widest head held in the stack rows below. */
     constexpr int64_t kHdMax = 1024;
     if (head_dim <= 0 || gqa <= 0 || block_size <= 0) return RAD_E_SHAPE;
     if (head_dim > kHdMax) return RAD_E_UNSUPPORTED;
-    const int64_t kv_heads = kv->rank == 4 ? kv->shape[1] : 0;
+    /* Without a cache the key heads are the own keys' width over head_dim. */
+    const int64_t kv_heads = kv ? (kv->rank == 4 ? kv->shape[1] : 0)
+                           : k->rank >= 3 ? k->shape[k->rank - 2]
+                           : k->rank == 2 ? k->shape[1] / head_dim : 0;
     if (kv_heads <= 0) return RAD_E_SHAPE;
     const int64_t q_heads = kv_heads * gqa, n_seq = numel(cu) - 1;
-    if (n_seq <= 0 || numel(su) < n_seq) return RAD_E_SHAPE;
+    if (n_seq <= 0 || (su && numel(su) < n_seq)) return RAD_E_SHAPE;
     /* The rows are cu's span, which need not start at 0: a segment of a longer sequence is passed
      * as its two bounding offsets. */
     const int64_t r_first = cu_at(cu, 0), rows = cu_at(cu, n_seq) - r_first;
     if (rows <= 0) return RAD_E_SHAPE;
-    const int64_t max_blocks = bt->rank >= 2 ? bt->shape[1] : numel(bt) / n_seq;
-    const int64_t bt_rs = bt->rank >= 2 ? bt->stride[0] : max_blocks;
-    const int64_t bt_cs = bt->rank >= 2 ? bt->stride[1] : 1;
+    const int64_t max_blocks = !bt ? 0 : bt->rank >= 2 ? bt->shape[1] : numel(bt) / n_seq;
+    const int64_t bt_rs = bt && bt->rank >= 2 ? bt->stride[0] : max_blocks;
+    const int64_t bt_cs = bt && bt->rank >= 2 ? bt->stride[1] : 1;
     /* Every prefix key must have a block-table entry. */
-    for (int64_t s = 0; s < n_seq; ++s)
+    for (int64_t s = 0; su && s < n_seq; ++s)
         if (ld_int(su->dtype, su->data, offlin(su, s)) > max_blocks * block_size) return RAD_E_SHAPE;
     const int64_t q_rs = row_stride(q, q_heads * head_dim), k_rs = row_stride(k, kv_heads * head_dim);
     const int64_t v_rs = row_stride(v, kv_heads * head_dim), o_rs = row_stride(o, q_heads * head_dim);
     const int64_t k8_rs = i8 ? row_stride(k8, kv_heads * head_dim) : 0;
     const int64_t ks_rs = i8 ? row_stride(ks, kv_heads) : 0;
-    const int64_t sb = kv->stride[0], sh = kv->stride[1], so = kv->stride[2];
+    const int64_t sb = kv ? kv->stride[0] : 0, sh = kv ? kv->stride[1] : 0;
+    const int64_t so = kv ? kv->stride[2] : 0;
     const float scale = p_f32(a, "scale", 1.0f / std::sqrt((float)head_dim));
     REF_PAR_FOR_DYN(rows * q_heads * head_dim * 64)
     for (int64_t idx = 0; idx < rows * q_heads; ++idx) {
         const int64_t h = idx % q_heads, r = r_first + idx / q_heads, kh = h / gqa;
         const int64_t s = seq_of(cu, n_seq, r), b0 = cu_at(cu, s), b1 = cu_at(cu, s + 1);
-        const int64_t i = r - b0, P = ld_int(su->dtype, su->data, offlin(su, s));
+        const int64_t i = r - b0, P = su ? ld_int(su->dtype, su->data, offlin(su, s)) : 0;
         const float kds = kdes ? ldt(kdes, s * kv_heads + kh) : 1.0f;
         const float vds = vdes ? ldt(vdes, s * kv_heads + kh) : 1.0f;
         const int64_t qb = r * q_rs + h * head_dim;
@@ -709,8 +873,9 @@ int ref_attn_prefix_self(const RadArgs* a, RadStream) {
         for (int64_t d = 0; d < head_dim; ++d) acc[d] = 0.0f;
         float sum = 0.0f;
         for (int64_t j = 0; j < nk; ++j) {
-            const float wgt = ref_exp(dot(j) - mx);
-            sum += wgt;
+            const float p = ref_exp(dot(j) - mx);
+            sum += p;
+            const float wgt = pv8 ? round_dt(RAD_F8E4M3, 448.0f * p) : p;
             if (j < P) {
                 for (int64_t d = 0; d < head_dim; ++d) acc[d] += wgt * pkey(j, d, true);
             } else {
@@ -720,7 +885,13 @@ int ref_attn_prefix_self(const RadArgs* a, RadStream) {
         }
         const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
         const int64_t ob = r * o_rs + h * head_dim;
-        for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d, acc[d] * inv);
+        if (pv8) {
+            const float inv8 = sum > 0.0f ? 1.0f / (448.0f * sum) : 0.0f;
+            for (int64_t d = 0; d < head_dim; ++d)
+                stt(o, ob + d, acc[d] * ldt(vsc, offlin(vsc, kh * head_dim + d)) * inv8);
+        } else {
+            for (int64_t d = 0; d < head_dim; ++d) stt(o, ob + d, acc[d] * inv);
+        }
     }
     return RAD_OK;
 }

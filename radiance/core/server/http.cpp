@@ -417,6 +417,9 @@ public:
         return true;
     }
     bool send(const std::string& text) override { return ws_.send(text); }
+    bool send_binary(const std::string& bytes) override {
+        return ws_.send(bytes.data(), bytes.size());
+    }
     void close(int code, const std::string& reason) override {
         ws_.close((httplib::ws::CloseStatus)code, reason);
     }

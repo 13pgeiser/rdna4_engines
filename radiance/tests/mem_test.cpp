@@ -1866,10 +1866,10 @@ static std::vector<RewriteTurn> rewrite_conversation(Fixture& f, int turns, int6
         RewriteTurn rt;
         rt.prompt = (int64_t)prompt.size();
         rt.diverge = (int64_t)hist.size();
-        f.pc.begin_step();
-        rt.resumed = f.pc.lookup(prompt, {}).n_linear_tokens;
-
         const uint64_t id = (uint64_t)t + 1;
+        f.pc.begin_step();
+        rt.resumed = f.pc.lookup(prompt, {}, nullptr, nullptr, id).n_linear_tokens;
+
         std::vector<int32_t> published = prompt;
         for (int64_t i = 0; i < grow / 2; ++i) published.push_back(fresh++);   /* the reply */
         const std::vector<BlockHash> hs = chain_of(published);
@@ -1925,6 +1925,397 @@ TEST(a_rewritten_last_message_keeps_its_anchor_over_the_tips_it_leaves) {
     f.pc.set_policy(std::make_unique<KeepAll>());
     const auto turns = rewrite_conversation(f, 40, 900, 80, 16);
     check_rewrites_resume(turns, 256);
+}
+
+/* ================================================================== agent sessions sharing the store
+ *
+ * Several agent conversations at once, as a coding client with subagents drives the server. Every
+ * conversation starts from one system prompt. A parent grows turn by turn: a turn sends the whole
+ * history plus a new message and publishes it with the reply. Every few turns a parent hands a
+ * task to a subagent and waits for it: a short conversation from the same system prompt that runs
+ * a few turns of its own. The conversations that are not waiting take their turns together: every
+ * lookup first, then the checkpoints chunk by chunk across them, one step each, then the
+ * publishes. Checkpoints go where Scheduler::plan_chunk puts them: every interval past the resume
+ * point and the prompt's tail. Lookups name the request, as PCBinding does.
+ *
+ * Scaled from the shipped geometry: the 64-token interval stands for 2048, so a parent that stops
+ * at 6272 tokens stands for a 200K-token conversation. */
+struct AgentLoad {
+    int     parents = 4;
+    int64_t system = 384;               /* the system prompt every conversation starts with */
+    int64_t parent_len = 6272;          /* a parent stops growing here */
+    int64_t grow_lo = 32, grow_hi = 192;   /* tokens a turn adds: the reply and the next message */
+    int     sub_every = 4;              /* parent turns between subagents */
+    int     sub_turns = 5;              /* turns a subagent runs */
+    int64_t task = 64;                  /* the subagent's first message */
+    bool    rewrite = false;            /* a parent's next turn drops the message this turn
+                                           answered, as a client that rewrites it does */
+};
+
+enum AgentTurn { kParent, kParentAfterSub, kSubFirst, kSubLater };
+
+struct AgentTally {
+    int64_t turns = 0;
+    int64_t prompt = 0;                 /* prompt tokens sent */
+    int64_t computed = 0;               /* prompt tokens computed, past the resume point */
+    std::vector<int64_t> resumed;       /* per turn, in issue order */
+    std::vector<AgentTurn> kind;
+};
+
+static AgentTally run_agents(Fixture& f, const AgentLoad& L, uint32_t seed = 7) {
+    const int64_t I = f.pc.checkpoint_interval(), bs = f.pc.block_size();
+    uint64_t rng = 0x9e3779b97f4a7c15ull ^ seed;
+    auto rnd = [&](int64_t lo, int64_t hi) {
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        return lo + (int64_t)(rng % (uint64_t)(hi - lo + 1));
+    };
+    int32_t fresh = 1000000;
+    auto add = [&](std::vector<int32_t>* v, int64_t n) {
+        for (int64_t i = 0; i < n; ++i) v->push_back(fresh++);
+    };
+    const std::vector<int32_t> sys = tok_run(1, (int)L.system);
+
+    struct Conv {
+        std::vector<int32_t> hist;
+        int  turns = 0;            /* turns the parent has taken */
+        int  left = 0;             /* the running subagent's turns to go; 0 when none runs */
+        bool after_sub = false;    /* the parent's next turn follows its subagent */
+        bool done = false;
+        std::vector<int32_t> sub;  /* the running subagent's history */
+    };
+    std::vector<Conv> cs((size_t)L.parents);
+    for (Conv& c : cs) { c.hist = sys; add(&c.hist, L.task); }
+
+    struct Turn {
+        std::vector<int32_t> prompt;
+        std::vector<int32_t>* hist = nullptr;
+        uint64_t id = 0;
+        int64_t grow = 0, resumed = 0, keep = -1;
+        AgentTurn kind = kParent;
+        std::vector<int64_t> at;            /* checkpoint positions, in chunk order */
+        std::vector<BlockHash> hs;          /* the published chain */
+    };
+    AgentTally t;
+    uint64_t next_id = 1;
+    for (;;) {
+        std::vector<Turn> turns;
+        for (Conv& c : cs) {
+            if (c.done) continue;
+            Turn tn;
+            tn.id = next_id++;
+            tn.grow = rnd(L.grow_lo, L.grow_hi);
+            if (c.left > 0) {
+                tn.hist = &c.sub;
+                tn.kind = c.left == L.sub_turns ? kSubFirst : kSubLater;
+            } else {
+                if ((int64_t)c.hist.size() >= L.parent_len) { c.done = true; continue; }
+                tn.hist = &c.hist;
+                tn.kind = c.after_sub ? kParentAfterSub : kParent;
+                tn.keep = L.rewrite ? (int64_t)c.hist.size() : -1;
+                c.after_sub = false;
+            }
+            tn.prompt = *tn.hist;
+            add(&tn.prompt, tn.grow / 2);
+            turns.push_back(std::move(tn));
+        }
+        if (turns.empty()) break;
+
+        f.pc.begin_step();
+        for (Turn& tn : turns) {
+            tn.resumed = f.pc.lookup(tn.prompt, {}, nullptr, nullptr, tn.id).n_linear_tokens;
+            const int64_t n = (int64_t)tn.prompt.size();
+            for (int64_t p = (tn.resumed / I + 1) * I; p < n; p += I) tn.at.push_back(p);
+            const int64_t tail = n / bs * bs;
+            if (tail > I && tail % I >= std::max(bs, I / 4)) tn.at.push_back(tail);
+            t.turns++;
+            t.prompt += n;
+            t.computed += n - tn.resumed;
+            t.resumed.push_back(tn.resumed);
+            t.kind.push_back(tn.kind);
+        }
+        /* The reply comes after the prompt: no checkpoint lands in it. */
+        for (Turn& tn : turns) {
+            std::vector<int32_t> pub = tn.prompt;
+            add(&pub, tn.grow - tn.grow / 2);
+            tn.hs = chain_of(pub);
+            *tn.hist = std::move(pub);
+        }
+        /* The first chunk is planned in the admitting step, so its reservation cannot take a
+         * snapshot a lookup just handed out. */
+        for (size_t k = 0;; ++k) {
+            bool any = false;
+            if (k > 0) f.pc.begin_step();
+            for (Turn& tn : turns) {
+                if (k >= tn.at.size()) continue;
+                any = true;
+                int32_t slot = -1;
+                const BlockHash& key = tn.hs[(size_t)(tn.at[k] / bs - 1)];
+                if (f.pc.reserve_checkpoint(tn.id, tn.at[k], key, &slot) == RAD_OK)
+                    f.pc.commit_checkpoint(key);
+            }
+            if (!any) break;
+        }
+        for (Turn& tn : turns) {
+            publish(f, tn.id, *tn.hist, (int64_t)tn.hist->size() / bs * bs);
+            f.kv.free_sequence(tn.id);
+            /* A rewriting client sends the reply back without the message it answered. */
+            if (tn.keep >= 0)
+                tn.hist->erase(tn.hist->begin() + tn.keep,
+                               tn.hist->begin() + (int64_t)tn.prompt.size());
+        }
+        /* Subagents start and finish between rounds; a finished one's answer joins its parent. */
+        for (Conv& c : cs) {
+            if (c.done) continue;
+            if (c.left > 0) {
+                if (--c.left == 0) {
+                    add(&c.hist, rnd(L.grow_lo, L.grow_hi));
+                    c.after_sub = true;
+                }
+                continue;
+            }
+            if (++c.turns % L.sub_every == 0) {
+                c.sub = sys;
+                add(&c.sub, L.task);
+                c.left = L.sub_turns;
+            }
+        }
+    }
+    return t;
+}
+
+/* The same load against an unbounded keep-all store: every turn resumes as deep as checkpoints
+ * were written. */
+static AgentTally agents_unbounded(const AgentLoad& L) {
+    Fixture f;
+    f.cfg.vram_kv_mib = 128;
+    if (f.build(/*with_linear=*/true, /*ckpt_slots=*/8192) != RAD_OK) return {};
+    f.pc.set_policy(std::make_unique<KeepAll>());
+    return run_agents(f, L);
+}
+
+/* The load against a store of `slots` under the default retention. */
+static AgentTally agents_in(const AgentLoad& L, int64_t slots) {
+    Fixture f;
+    f.cfg.vram_kv_mib = 128;
+    if (f.build(/*with_linear=*/true, slots) != RAD_OK) return {};
+    return run_agents(f, L);
+}
+
+/* Turns of `kind` that resumed less than half as deep as the unbounded store let them: their
+ * session's snapshots were gone. */
+static int64_t agents_lost(const AgentTally& a, const AgentTally& best, AgentTurn kind) {
+    int64_t n = 0;
+    for (size_t i = 0; i < a.resumed.size() && i < best.resumed.size(); ++i)
+        if (a.kind[i] == kind && a.resumed[i] * 2 < best.resumed[i]) ++n;
+    return n;
+}
+
+/* Prompt tokens computed beyond the unbounded store's, as a fraction of all prompt tokens. */
+static double agents_excess(const AgentTally& a, const AgentTally& best) {
+    return best.prompt > 0 ? (double)(a.computed - best.computed) / (double)best.prompt : 1.0;
+}
+
+/* The store a configuration gives the load: its count, or under auto what the engine resolves for
+ * one sequence a parent, with memory to spare. */
+static int64_t agents_store(const Config& c, const AgentLoad& L, int64_t interval) {
+    if (c.checkpoint_slots >= 0) return c.checkpoint_slots;
+    const auto pol = make_checkpoint_policy(c.checkpoint_policy, interval);
+    return checkpoint_slots_auto(*pol, L.parents, L.parent_len, interval, 1, INT64_MAX, INT64_MAX)
+        .slots;
+}
+
+/* An admission takes over every snapshot on the chain it hit, so a conversation is one session
+ * from the start of its turn, as it is after the publish. A snapshot past the hit stays where it
+ * was; a lookup naming no request moves nothing. */
+TEST(an_admission_takes_over_the_snapshots_on_the_chain_it_hit) {
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/8));
+    const auto p1 = tok_run(7000, 336);
+    publish(f, 1, p1, 320);
+    const std::vector<BlockHash> hs = chain_of(p1);
+    ckpt_at(f, 1, hs, 128);
+    ckpt_at(f, 1, hs, 256);
+
+    auto p2 = p1;
+    for (size_t k = 200; k < p2.size(); ++k) p2[k] += 50000;
+    f.pc.begin_step();
+    CHECK_EQ(f.pc.lookup(p2, {}).n_linear_tokens, 128);
+    CHECK(f.pc.checkpoints(1) == (std::vector<int64_t>{ 128, 256 }));
+    f.pc.begin_step();
+    CHECK_EQ(f.pc.lookup(p2, {}, nullptr, nullptr, 2).n_linear_tokens, 128);
+    CHECK(f.pc.checkpoints(2) == (std::vector<int64_t>{ 128 }));
+    CHECK(f.pc.checkpoints(1) == (std::vector<int64_t>{ 256 }));
+    CHECK_EQ(f.pc.sessions_tracked(), 2ll);
+}
+
+/* A running turn's checkpoints and its conversation's earlier ones are retained as one ladder, so
+ * a full store does not take another conversation's snapshot for them. Conversation P holds one
+ * snapshot, the oldest in the store; A holds seven and its next turn writes five more. As two
+ * sessions (the turn before and the turn running) A keeps two ladders and the store evicts P's
+ * snapshot; as one it keeps one ladder and P's survives. */
+TEST(a_running_turn_does_not_evict_a_waiting_conversations_snapshot) {
+    for (const bool named : { false, true }) {
+        Fixture f;
+        CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/8));
+        const auto p = tok_run(500000, 96);
+        const std::vector<BlockHash> ph = chain_of(p);
+        ckpt_at(f, 100, ph, 64);
+
+        const auto a = tok_run(1, 16 * 60);
+        const std::vector<BlockHash> ah = chain_of(a);
+        std::vector<int32_t> turn1(a.begin(), a.begin() + 464);
+        publish(f, 1, turn1, 464);
+        f.kv.free_sequence(1);
+        for (int64_t pos = 64; pos <= 448; pos += 64) ckpt_at(f, 1, ah, pos);
+        CHECK_EQ(f.kv.free_checkpoint_slots(), 0ll);
+
+        std::vector<int32_t> turn2(a.begin(), a.begin() + 800);
+        f.pc.begin_step();
+        REQUIRE_EQ(f.pc.lookup(turn2, {}, nullptr, nullptr, named ? 2 : 0).n_linear_tokens, 448);
+        for (int64_t pos = 512; pos <= 768; pos += 64) {
+            int32_t slot = -1;
+            CHECK_OK(f.pc.reserve_checkpoint(2, pos, ah[(size_t)(pos / 16 - 1)], &slot));
+            f.pc.commit_checkpoint(ah[(size_t)(pos / 16 - 1)]);
+            f.pc.begin_step();
+        }
+        if (named) {
+            CHECK(f.pc.checkpoints(100) == (std::vector<int64_t>{ 64 }));
+            CHECK(f.pc.checkpoints(1).empty());
+            CHECK(f.pc.checkpoints(2) ==
+                  (std::vector<int64_t>{ 64, 256, 512, 576, 640, 704, 768 }));
+            CHECK_EQ(f.pc.stats().ckpt_lru, 0ll);
+        } else {
+            CHECK(f.pc.checkpoints(100).empty());
+            CHECK_EQ(f.pc.stats().ckpt_lru, 1ll);
+        }
+    }
+}
+
+/* What a session needs from the store, and that retention holds it to that: a 200K-token session
+ * at a 2048-token interval keeps at most 9 snapshots under geometric backoff. The scaled session
+ * (98 intervals of 64 tokens), checkpointed one interval at a time with a tail checkpoint half an
+ * interval on after each and retention after every one, never holds more than its policy's figure
+ * and reaches it. */
+TEST(a_sessions_standing_share_is_what_retention_keeps) {
+    CHECK_EQ(GeometricBackoff(2048).held(200000, 2048), 9ll);
+    CHECK_EQ(GeometricBackoff(2048).held(32768, 2048), 6ll);
+    CHECK_EQ(GeometricBackoff(2048).held(1000, 2048), 1ll);
+    CHECK_EQ(KeepTipOnly().held(200000, 2048), 1ll);
+    CHECK_EQ(KeepAll().held(200000, 2048), 97ll);
+    CHECK(std::string(make_checkpoint_policy("tip-only", 64)->name()) == "tip-only");
+    CHECK(std::string(make_checkpoint_policy("keep-all", 64)->name()) == "keep-all");
+    CHECK(std::string(make_checkpoint_policy("geometric-backoff", 64)->name()) ==
+          "geometric-backoff");
+
+    Fixture f;
+    CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/128));
+    const auto s = tok_run(1, 6272 + 16);
+    const std::vector<BlockHash> hs = chain_of(s);
+    size_t most = 0;
+    for (int64_t pos = 64; pos <= 6272; pos += 64) {
+        for (const int64_t at : { pos, pos + 32 }) {
+            if (at > 6272) continue;
+            ckpt_at(f, 1, hs, at);
+            f.pc.retain(1);
+            most = std::max(most, f.pc.checkpoints(1).size());
+        }
+    }
+    CHECK_EQ((int64_t)most, GeometricBackoff(64).held(6272, 64));
+    CHECK_EQ((int64_t)most, 9ll);
+}
+
+/* --checkpoint-slots auto: the policy's share plus one for each sequence, held to the share of
+ * memory but not below the floor, and to the room the host has. */
+TEST(the_auto_store_gives_every_sequence_its_sessions_share) {
+    const GeometricBackoff g(2048);
+    const int64_t slot = 113 << 20, lots = INT64_MAX;
+    CheckpointSlots c = checkpoint_slots_auto(g, 8, 200000, 2048, slot, lots, lots);
+    CHECK_EQ(c.per_seq, 10ll);
+    CHECK_EQ(c.want, 80ll);
+    CHECK_EQ(c.slots, 80ll);
+    CHECK(c.bound == CheckpointSlots::Bound::Want);
+
+    c = checkpoint_slots_auto(g, 8, 200000, 2048, slot, 40 * slot + slot / 2, lots);
+    CHECK_EQ(c.slots, 40ll);
+    CHECK(c.bound == CheckpointSlots::Bound::Share);
+    c = checkpoint_slots_auto(g, 8, 200000, 2048, slot, 2 * slot, lots);
+    CHECK_EQ(c.slots, kCheckpointSlotsFloor);
+    CHECK(c.bound == CheckpointSlots::Bound::Share);
+    c = checkpoint_slots_auto(g, 8, 200000, 2048, slot, lots, 5 * slot);
+    CHECK_EQ(c.slots, 5ll);
+    CHECK(c.bound == CheckpointSlots::Bound::Room);
+    c = checkpoint_slots_auto(g, 8, 200000, 2048, slot, 2 * slot, 3 * slot);
+    CHECK_EQ(c.slots, 3ll);
+    CHECK(c.bound == CheckpointSlots::Bound::Room);
+    c = checkpoint_slots_auto(g, 8, 200000, 2048, slot, lots, slot - 1);
+    CHECK_EQ(c.slots, 0ll);
+
+    /* The floor never exceeds what the policy wants. */
+    c = checkpoint_slots_auto(KeepTipOnly(), 1, 200000, 2048, slot, 0, lots);
+    CHECK_EQ(c.want, 2ll);
+    CHECK_EQ(c.slots, 2ll);
+    c = checkpoint_slots_auto(KeepTipOnly(), 4, 200000, 2048, slot, lots, lots);
+    CHECK_EQ(c.slots, 8ll);
+    c = checkpoint_slots_auto(KeepAll(), 2, 200000, 2048, slot, lots, lots);
+    CHECK_EQ(c.slots, 196ll);
+
+    /* --max-num-seqs's own default, 256, and no state to snapshot. */
+    c = checkpoint_slots_auto(g, 256, 200000, 2048, slot, (int64_t)8 << 30, lots);
+    CHECK_EQ(c.want, 2560ll);
+    CHECK_EQ(c.slots, ((int64_t)8 << 30) / slot);
+    c = checkpoint_slots_auto(g, INT64_MAX, 200000, 2048, slot, lots, lots);
+    CHECK_EQ(c.want, INT64_MAX);
+    CHECK_EQ(c.slots, INT64_MAX / slot);
+    c = checkpoint_slots_auto(g, 8, 200000, 2048, 0, lots, lots);
+    CHECK_EQ(c.slots, 0ll);
+}
+
+/* Four agent conversations with subagents, scaled to 200K tokens each, in the store the default
+ * configuration gives them. While a parent waits on its subagent, the subagent's snapshots fill
+ * the store; in the fixed 8-slot store they evict all of the waiting parent's, and its next turn
+ * prefills its whole history again. In the default store every continuing turn resumes where an
+ * unbounded store would. What is left is the subagents' first turns: the system prompt they share
+ * is past every snapshot the policy keeps. */
+TEST(agent_sessions_with_subagents_keep_their_snapshots_in_the_default_store) {
+    const AgentLoad L;
+    const AgentTally best = agents_unbounded(L);
+    REQUIRE(best.turns > 300);
+
+    Config d;
+    d.checkpoint_interval = 64;
+    const int64_t slots = agents_store(d, L, 64);
+    CHECK_EQ(slots, 40ll);
+    const AgentTally a = agents_in(L, slots);
+    const AgentTally fixed = agents_in(L, 8);
+    fprintf(stderr, "    %lld turns; prompt tokens computed past an unbounded store's: %.1f%% in %lld "
+            "slots, %.1f%% in 8\n", (long long)a.turns, 100 * agents_excess(a, best),
+            (long long)slots, 100 * agents_excess(fixed, best));
+    CHECK_EQ(agents_lost(a, best, kParent), 0ll);
+    CHECK_EQ(agents_lost(a, best, kParentAfterSub), 0ll);
+    CHECK_EQ(agents_lost(a, best, kSubLater), 0ll);
+    CHECK(agents_excess(a, best) < 0.03);
+
+    CHECK(agents_lost(fixed, best, kParentAfterSub) >= 30);
+    CHECK(agents_excess(fixed, best) > 0.30);
+}
+
+/* The same with a client that rewrites its last message every turn, so a turn diverges below the
+ * previous turn's tip and needs a snapshot behind it: the ladder must survive beside the
+ * subagents. */
+TEST(a_rewriting_client_with_subagents_resumes_in_the_default_store) {
+    AgentLoad L;
+    L.rewrite = true;
+    const AgentTally best = agents_unbounded(L);
+    REQUIRE(best.turns > 300);
+    Config d;
+    d.checkpoint_interval = 64;
+    const AgentTally a = agents_in(L, agents_store(d, L, 64));
+    fprintf(stderr, "    %lld turns; %.1f%% computed past an unbounded store's\n",
+            (long long)a.turns, 100 * agents_excess(a, best));
+    const int64_t lost = agents_lost(a, best, kParent) + agents_lost(a, best, kParentAfterSub) +
+                         agents_lost(a, best, kSubLater);
+    CHECK(lost <= 2);
+    CHECK(agents_excess(a, best) < 0.03);
 }
 
 /* ================================================================== the KV loan
@@ -4883,6 +5274,38 @@ TEST(the_bindings_snapshot_key_carries_the_requests_pictures) {
     const CacheHit text = b.lookup(turn(10, again, {}), nullptr, nullptr);
     CHECK_EQ(text.n_attn_tokens, 32);
     CHECK_EQ(text.checkpoint_slot, -1);
+}
+
+/* Runtime LoRA: KV written under an adapter is keyed by its load's uid from the first block on, so
+ * a base request and a request through another load (the same adapter reloaded included) share
+ * nothing with it, and the base's own keys are those of an engine without adapters. */
+TEST(the_bindings_keys_carry_the_requests_adapter_load) {
+    Fixture f;
+    REQUIRE_EQ(f.build(/*with_linear=*/true, /*ckpt_slots=*/4), RAD_OK);
+    PCBinding<PrefixCache> b(&f.pc);
+    auto via = [](Request r, uint64_t uid) {
+        r.lora_slot = uid ? 0 : -1;
+        r.lora_uid = uid;
+        return r;
+    };
+    const Request r = via(turn(7, tok_run(100, 300), tok_run(9000, 40)), 5);
+    const int32_t slot = serve_turn(f, b, r, 320);
+    REQUIRE(slot >= 0);
+    const auto again = cat(cat(r.prompt, r.output), tok_run(20000, 50));
+    const CacheHit same = b.lookup(via(turn(8, again, {}), 5), nullptr, nullptr);
+    CHECK_EQ(same.n_attn_tokens, 336);
+    CHECK_EQ(same.checkpoint_slot, slot);
+    for (uint64_t other : { 0ull, 6ull }) {
+        const CacheHit h = b.lookup(via(turn(9, again, {}), other), nullptr, nullptr);
+        CHECK_EQ(h.n_attn_tokens, 0);
+        CHECK_EQ(h.checkpoint_slot, -1);
+    }
+    /* The base's blocks are keyed as without adapters: a bare-prompt lookup finds them. */
+    const Request base = turn(10, tok_run(40000, 300), tok_run(41000, 40));
+    serve_turn(f, b, base, 320);
+    const auto next = cat(cat(base.prompt, base.output), tok_run(42000, 50));
+    CHECK_EQ(f.pc.lookup(next, {}).n_attn_tokens, 336);
+    CHECK_EQ(b.lookup(via(turn(11, next, {}), 5), nullptr, nullptr).n_attn_tokens, 0);
 }
 
 /* ================================================================== retention policies */

@@ -1,10 +1,10 @@
 # radiance
 
-An LLM and image-generation inference server for AMD GPUs, in C++ and HIP. Its HTTP API speaks
-OpenAI's chat, completions, Responses and images APIs, Anthropic's Messages API and llama-server's
-native one, so their clients and SDKs work unchanged. Model architectures, kernel libraries and
-quantisers are `.so` plugins; the ones in this tree are built and loaded the same way a third
-party's are ([`docs/PLUGIN.md`](docs/PLUGIN.md)).
+An inference server for AMD GPUs, in C++ and HIP: language models, and image, video, speech and
+music generation. Its HTTP API speaks OpenAI's chat, completions, Responses, images, audio and video
+APIs, Anthropic's Messages API and llama-server's native one, so their clients and SDKs work
+unchanged. Model architectures, kernel libraries and quantisers are `.so` plugins; the ones in this
+tree are built and loaded the same way a third party's are ([`docs/PLUGIN.md`](docs/PLUGIN.md)).
 
 The bundled device kernels (`libr4d`) target AMD RDNA4 (`gfx1200`, `gfx1201`). The serve flags
 below are for two 32 GB cards (Radeon AI PRO R9700). The engine starts on any AMD GPU family;
@@ -28,6 +28,10 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Gemma 4 31B: GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-w4a8) | `gemma4-31b-w4a8.yaml` |
 | Qwen-Image 2.1 FP8: text to image and image edits | `qwen-image-2.1-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-fp8) | `qwen-image-2.1.yaml` |
 | Qwen-Image 2.1 Turbo FP8: the same in 8 steps | `qwen-image-2.1-turbo-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-turbo-fp8) | `qwen-image-2.1-turbo.yaml` |
+| MiniMax-H3 FP8: video with its stereo soundtrack from text | `minimax-h3-fp8.rad` (60 GiB) | [download](https://huggingface.co/StillDeadcode/minimax-h3-fp8) | `minimax-h3.yaml` |
+| FastH3 8-Step V2 FP8: the same in eight steps | `fasth3-8-step-v2-fp8.rad` (62 GiB) | [download](https://huggingface.co/StillDeadcode/fasth3-8-step-v2-fp8) | `fasth3.yaml` |
+| MiniMax-Music3 bf16: songs from lyrics and a description | `minimax-music3-bf16.rad` (20 GiB) | [download](https://huggingface.co/StillDeadcode/minimax-music3-bf16) | `minimax-music3.yaml` |
+| Breeze-TTS-2 bf16: speech, whole, streamed or live, one card | `breeze-tts2-bf16.rad` (5.5 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-breeze-tts2-bf16) | `breeze-tts2.yaml` |
 | Qwen3.8-27B ParoQuant int4, int5 or MXFP4 (learned rotations), DFlash2 drafter, vision | `qwen3.8-27b-paro-int4.rad` (19 GiB; int5 22 GiB) | [convert](#convert-a-checkpoint) | `qwen3.8-27b-paro.yaml` |
 | Qwen3.8-27B bf16 | `qwen3.8-27b-bf16.rad` (50 GiB) | [convert](#convert-a-checkpoint) | `qwen3.8-27b-bf16.yaml` |
 | Qwen3.8-Flash-Next bf16, a disk-streamed reference | `qwen3.8-flash-next-bf16.rad` (335 GiB) | [convert](#convert-a-checkpoint) | `flashnext-bf16.yaml` |
@@ -62,6 +66,19 @@ pictures from a prompt, and edits of up to ten pictures with an optional mask, 2
 On two R9700s a 2048x2048 picture takes 61 s at the base model's 40 steps and 13 s with Turbo (56 and
 12 s with `--tp-wire wht6`); 1024x1024 takes 6 s and 2.6 s. Qwen-Image 2.1 is under Qwen's research
 license, which is non-commercial.
+
+The MiniMax-H3 containers serve OpenAI's video jobs (`/v1/videos`): a video with its stereo
+soundtrack from a prompt, 5 to 14 s, up to 1344x768. On two R9700s a 5.17 s clip at 1344x768 takes
+about 68 s with FastH3 and 8.8 minutes at MiniMax-H3's 50 steps; both read about 39 GiB of pinned
+host memory. MiniMax-H3's license, which FastH3 carries, does not cover the EU, the UK, the Republic
+of Korea or the USA.
+
+MiniMax-Music3 and Breeze-TTS-2 answer `/v1/audio/speech`, whole or streamed as they are made: a song
+from lyrics and a description, 44.1 kHz stereo, made at about the speed it plays on two cards; and
+speech in a voice the request describes, made in 0.6 of its playing time on one card, its first
+streamed audio 0.21 s after the request. Breeze-TTS-2 also speaks text while it is being written,
+over the `/v1/audio/speech/stream` WebSocket; it is licensed for research and non-commercial use
+only.
 
 ## Run with Docker
 
@@ -141,6 +158,9 @@ four-rank rows have no compose file. The other models' flags are in their compos
 | MiniCPM5-2B FP8 and bf16 | `--tp 2 --max-num-seqs 32 --max-model-len 131072 --kv-cache-dtype fp8 --gpu-headroom-mib 160 --max-num-batched-tokens 512` |
 | Qwen3.8-Flash-Next bf16 | `--tp 2 --max-model-len 32768 --placement expert_tiered --weights-disk-tier --host-pool-mib 12288 --gpu-headroom-mib 768 --deterministic --max-num-seqs 32 --max-num-batched-tokens 32768 --num-speculative-tokens 0` |
 | Qwen-Image 2.1 and 2.1 Turbo | `--tp 2 --tp-wire wht6` |
+| MiniMax-H3 and FastH3 | `--tp 2 --vision-tower-placement ram` |
+| MiniMax-Music3 | `--tp 2` |
+| Breeze-TTS-2 | `--tp 1` |
 
 Every model here runs at up to 32 sequences a step. The Flash-Next rows (except the bf16 reference)
 and the 27B in bf16 keep 8: on a hybrid model each sequence holds its own recurrent state, and 32 of
@@ -204,15 +224,20 @@ build/bin/rad-convert /srv/models/hf/google/gemma-4-31B-it -o gemma4-31b-w4a8.ra
 build/bin/rad-convert /srv/models/hf/z-lab/Qwen3.8-27B-PARO -o qwen3.8-27b-paro-int4.rad \
     --recipe data/recipes/q38-27b-paro-mxfp4-df2.recipe \
     --draft-model /srv/models/hf/z-lab/Qwen3.8-27B-DFlash2
+build/bin/rad-convert /srv/models/hf/ukisai/Swift-1.5-Qwen3.8-27b-W4A16-AWQ -o swift15-27b-w4a16.rad \
+    --recipe data/recipes/q38-27b-w4a16.recipe
 ```
 
 With Docker, use `docker run --rm -v /srv/models:/models --entrypoint rad-convert stilldeadcode/radiance ...`.
 In the image the recipes are in `/opt/radiance/share/radiance/recipes/`. A checkpoint served at its
 own precision needs no container: `radiance --model /srv/models/hf/Qwen/Qwen3.8-27B-FP8`. A release
 someone else quantised is read as it ships when the engine serves its form (block-scaled FP8,
-Quark's MXFP4) and converted from its exact dequantisation when it does not: compressed-tensors'
-NVFP4 to the MXFP4 kernels, AutoRound and GPTQ int4 to int8. [docs/GUIDE.md](docs/GUIDE.md) names
-the recipes of record with their `rad-convert` commands.
+Quark's MXFP4), written at its own numbers when the kernels read them in another spelling (an int4
+W4A16 release, compressed-tensors' AWQ and GPTQ or AutoRound's, on the 4-bit GEMMs with
+`data/recipes/q38-27b-w4a16.recipe`), and converted from its exact dequantisation when no kernel
+reads it: NVFP4 (compressed-tensors' and NVIDIA ModelOpt's) to the MXFP4 kernels, an AutoRound
+Flash-Next's int4 block projections to int8. [docs/GUIDE.md](docs/GUIDE.md) names the recipes of record
+with their `rad-convert` commands.
 
 ## Test
 

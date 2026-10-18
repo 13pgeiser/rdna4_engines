@@ -55,10 +55,11 @@ typedef struct RadBatch {
      * row of a sequence carries its request's slot, fixed when the request was admitted, so a step
      * that mixes adapters and the base needs nothing else.
      *
-     * Null when the engine serves no adapters (no --lora and no --max-loras). The core issues the
-     * adapter ops itself and reads it there; a block with an adapter epilogue of its own reads it
-     * too. Like every array above it sits at one address per rank for the engine's life and is
-     * rewritten every step, so a recorded pass replays it. */
+     * Null on a step with no adapter row, so always when the engine serves no adapters (no --lora
+     * and no --max-loras). The core issues the adapter ops itself, only when this is set; a block
+     * with an adapter epilogue of its own reads it too. Like every array above it sits at one
+     * address per rank for the engine's life and is rewritten every step, so a recorded pass
+     * replays it. */
     const int32_t* lora_slot;
 
     /* The tokens the sampler wants logits for: indices into this step's tokens, [n_out].
@@ -230,6 +231,18 @@ typedef struct RadBatch {
      * every step of a program that declared no generator. */
     int32_t                   gen;
     const struct RadGenBatch* gen_b;
+
+    /* ================================================ audio generation */
+
+    /* An audio generator's pass (rad_declare_audio_generator; `gen` is one of its
+     * RAD_GEN_PASS_*): its payload. Null on every other step. */
+    const struct RadAudioGenBatch* agen_b;
+
+    /* ================================================ video generation */
+
+    /* A video generator's pass (rad_declare_video_generator; `gen` is one of its
+     * RAD_GEN_PASS_*): its payload. Null on every other step. */
+    const struct RadVideoGenBatch* vgen_b;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:
@@ -310,6 +323,155 @@ enum {
     RAD_GEN_F_INPAINT = 2,   /* repaint: after the step, the kept region goes back to the picture,
                               * noised to sigma_next with the image's own noise */
     RAD_GEN_F_PREVIEW = 4    /* write the step's estimate of the clean latent to the lane's preview */
+};
+
+/* What an audio generator's pass carries beside the step batch's own fields (rad_builder.h,
+ * RadAudioGenDecl, describes the passes):
+ *
+ *   PROMPT   an ordinary causal prefill: `token_ids`, `positions`, `cu_seqlens` and the KV group's
+ *            slot mapping, block table and seqused, two sequences a lane (2i conditional, 2i + 1
+ *            unconditional). A chunk of a longer prompt is the same with positions that start
+ *            past zero.
+ *   FRAME    one row a sequence, two sequences a lane, ordered as PROMPT's: the frame's embedding
+ *            is the plugin's (it samples the frame first), so `token_ids` are zero; `positions`,
+ *            the slot mapping and seqused place the row after its sequence's earlier ones.
+ *   WINDOW   one entry per (window, branch): `cu_seqlens` bounds each entry's rows, `win_lead`
+ *            rows of the plugin's own (RadAudioGenDecl::win_lead) and then the window's latent
+ *            rows; positions count from 0 in each entry.
+ *   VOCODE   one window, no rows.
+ *
+ * Every pointer is device memory unless the name ends in _h. */
+typedef struct RadAudioGenBatch {
+    /* ---- PROMPT and FRAME: the lanes of the pass's requests, in entry order */
+    int64_t         n_lane;
+    const int32_t*  lane;          /* [n_lane] */
+    const int32_t*  lane_h;
+    /* PROMPT: 1 where this pass holds the end of the lane's prompt, so the last rows' hidden
+     * states are the ones the first frame is sampled from. [n_lane] */
+    const int32_t*  last;
+    const int32_t*  last_h;
+    /* FRAME: the frame each lane makes, from 0; frames before RadAudioGenDecl::first_frame only
+     * move the model past the prompt. [n_lane] */
+    const int32_t*  frame;
+    const int32_t*  frame_h;
+    /* PROMPT, FRAME and WINDOW: each lane's (WINDOW: each entry's) request seed, [n, 2] low word
+     * first. */
+    const uint32_t* seed;
+    /* PROMPT and FRAME, one value per entry ([n_seq]): the entry's row in a state of two rows a
+     * lane, 2 lane + branch, and the entry's last row in the pass (a prompt chunk's, or a frame's
+     * one row). */
+    const int32_t*  slot;
+    const int32_t*  last_row;
+    /* PROMPT: each entry's rows already in the KV before this pass ([n_seq]), the prefix a chunk's
+     * rows attend to beside their own. */
+    const int32_t*  prefix;
+
+    /* ---- WINDOW, one value per entry ([n_seq]) */
+    const float*    t;             /* where the entry's latent is, in [0, 1) */
+    const float*    t_next;        /* where this step takes it */
+    const float*    cfg;           /* v = u + cfg (c - u); 1 without a pair. FRAME: each lane's
+                                    * guidance, [n_lane] */
+    /* The entry holding this window's unconditional branch, or -1 for none; -2 marks an entry
+     * that is one, whose rows serve another entry's step and which does not move its lane. */
+    const int32_t*  pair;
+    const int32_t*  win_lane;      /* the lane the window's request runs in */
+    const int32_t*  win_lane_h;
+    /* RAD_AGEN_F_*, device and host. */
+    const int32_t*  flags;
+    const int32_t*  flags_h;
+    /* The window: its index in the request, its first frame and its frames, host and device. */
+    const int32_t*  win_index;
+    const int32_t*  win_index_h;
+    const int32_t*  win_frame0;
+    const int32_t*  win_frame0_h;
+    const int32_t*  win_frames;
+    const int32_t*  win_frames_h;
+    /* The latent rows apart from the lead rows: [n_seq + 1] offsets over them, and for each the
+     * row of the pass it is (`lat_rows` of them). */
+    int64_t         lat_rows;
+    const int32_t*  lat_cu;
+    const int32_t*  lat_cu_h;
+    const int32_t*  lat_src;
+
+    /* ---- VOCODE */
+    int32_t         voc_lane;
+    int32_t         voc_window;
+    int32_t         voc_latents;   /* the window's latents */
+    int32_t         voc_left;      /* latents at its start not played */
+    int32_t         voc_right;     /* latents at its end not played */
+
+    /* VOCODE with RadAudioGenDecl::voc_chunk: the lane's first frame the pass reads, counted
+     * from the first kept frame. 64 bits so that it starts past the struct's ABI 18 end. */
+    int64_t         voc_frame0;
+} RadAudioGenBatch;
+
+/* A window entry's flags on a WINDOW pass. FIRST is RAD_GEN_F_FIRST's bit and the others are clear
+ * of RAD_GEN_F_*'s, so one flags array serves the image generator's sampler ops as well. */
+enum {
+    RAD_AGEN_F_FIRST = 1,    /* the window's first step: its latent is the noise its seed draws and
+                              * its conditioning is built from the request's frames */
+    RAD_AGEN_F_LAST  = 8,    /* the window's last step: after it the latent is final */
+    RAD_AGEN_F_JOIN  = 16    /* the window has a predecessor whose end it overlaps */
+};
+
+/* What a video generator's pass carries beside the step batch's own fields (rad_builder.h,
+ * RadVideoGenDecl, describes the passes). Every pass is one request's, in lane `lane`:
+ *
+ *   VCOND    `token_ids`, `positions` and `cu_seqlens` are the prompt, one sequence of `n_tok`
+ *            rows, attended causally, nothing paged.
+ *   VSTEP    `n_tok` rows: the packed sequence, n_text + audio_channels n_audio + the video's
+ *            patches. No token ids.
+ *   ADECODE  no rows of the pass's own.
+ *   VDECODE  `dec_rows` rows of the decoder's own (rad_arch_video_positions, RAD_VPOS_DECODE).
+ *
+ * Every pointer is device memory unless the name ends in _h. */
+typedef struct RadVideoGenBatch {
+    int32_t         lane;
+    RadVideoGeom    geom;          /* the request's geometry */
+    /* The geometry again for ops that read it from an operand, i32 [RAD_VGEOM_N] (below). */
+    const int32_t*  geom_d;
+    /* The same lane, i32 [1], and 1 on a request's first step (0 otherwise), i32 [1]. */
+    const int32_t*  lane_d;
+    const int32_t*  first_d;
+    /* i32 [4]: the packed sequence's segments, {0, n_text, n_text + audio rows, n_tok} -- text,
+     * soundtrack, video -- and i32 [4] {0, video rows, 0, audio rows}, the bounds of the lane's two
+     * latents counted from each one's first row. */
+    const int32_t*  seg_cu;
+    const int32_t*  lat_cu;
+
+    /* ---- VCOND: every step the request takes, the video's timestep and the soundtrack's */
+    int32_t         n_steps;
+    const float*    t_video;       /* [n_steps] */
+    const float*    t_audio;       /* [n_steps] */
+
+    /* ---- VSTEP */
+    int32_t         step;          /* from 0; the first draws the lane's noise */
+    /* f32 [6]: the video's timestep, sigma and next sigma, then the soundtrack's. */
+    const float*    sched;
+    const float*    pos;           /* f32 [3, n_tok]: RAD_VPOS_STEP */
+    /* u32 [2, 2]: the video's noise seed and the soundtrack's, low word first. */
+    const uint32_t* seed;
+
+    /* ---- VDECODE */
+    int32_t         chunk;         /* from 0, of n_chunks */
+    int32_t         n_chunks;
+    int64_t         dec_rows;      /* RAD_VPOS_DECODE */
+    int32_t         n_frames_out;  /* frames the pass writes to frames_out */
+
+    /* ---- ADECODE */
+    int64_t         n_samples;     /* samples a channel the pass writes to audio_out */
+} RadVideoGenBatch;
+
+/* RadVideoGenBatch::geom_d. The request's latent geometry, then a VDECODE pass's chunk: the latent
+ * frames it reads (from latent frame `chunk_lat0`), its latent grid again so that (frames, h, w,
+ * first, last) is one run, and the same chunk in patches. */
+enum {
+    RAD_VGEOM_LAT_FRAMES = 0, RAD_VGEOM_LAT_H = 1, RAD_VGEOM_LAT_W = 2, RAD_VGEOM_N_TEXT = 3,
+    RAD_VGEOM_N_AUDIO = 4, RAD_VGEOM_CHUNK_LAT0 = 5,
+    RAD_VGEOM_CHUNK_FRAMES = 6, RAD_VGEOM_CHUNK_H = 7, RAD_VGEOM_CHUNK_W = 8,
+    RAD_VGEOM_CHUNK_FIRST = 9, RAD_VGEOM_CHUNK_LAST = 10,
+    RAD_VGEOM_PATCH_FRAMES = 11, RAD_VGEOM_PATCH_H = 12, RAD_VGEOM_PATCH_W = 13,
+    RAD_VGEOM_N = 16
 };
 
 /* ================================================================== operands */

@@ -557,7 +557,7 @@ def merge_lora(adapter, base, out):
         os.rename(os.path.join(out, f"part-{i:05d}.safetensors"), os.path.join(out, f"model-{i:05d}-of-{shards:05d}.safetensors"))
     json.dump({"metadata": {"total_size": total}, "weight_map": {k: f"model-{i:05d}-of-{shards:05d}.safetensors" for k, i in wm.items()}},
               open(os.path.join(out, "model.safetensors.index.json"), "w"), indent=1)
-    say(f"merged {done} LoRA weights into {base} (largest |dW|/|W| {maxrel:.4f})")
+    say(f"merged {done} LoRA weights onto a copy of {base} in {out}; the base is unchanged (largest |dW|/|W| {maxrel:.4f})")
 
 
 # ---------------------------------------------------------------- main

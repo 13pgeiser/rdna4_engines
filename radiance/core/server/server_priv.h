@@ -86,5 +86,11 @@ size_t speech_transcript_start(const SpeechFormat& f, const std::string& text, b
  * between words when there is a pause to cut in. */
 int64_t speech_quiet_point(const std::vector<float>& x, int64_t lo, int64_t hi, int32_t rate);
 
+/* ---- audio_gen.cpp: what the audio generator's routes write */
+/* Samples in [-1, 1] as 16-bit little-endian PCM, appended. */
+void append_pcm16(const std::vector<float>& x, std::string* out);
+/* A RIFF/WAVE header for `bytes` of 16-bit PCM; -1 states no length, as a stream's must. */
+std::string wav_header(int64_t bytes, int64_t rate, int64_t channels);
+
 }  /* namespace server */
 }  /* namespace rad */

@@ -87,10 +87,11 @@ TEST(the_shipped_architectures_load_with_distinct_selection_keys) {
         CHECK(keys.emplace(std::make_pair(p.arch_id, p.arch_quant), p.name).second);
     }
     const std::set<std::pair<std::string, std::string>> want = {
-        { "embeddinggemma2", "" }, { "gemma4", "" }, { "gemma4", "compressed-tensors" },
-        { "lfm2", "" }, { "llama", "" }, { "llama", "fp8_e4m3" }, { "qwen35", "" },
+        { "breeze", "" }, { "embeddinggemma2", "" }, { "gemma4", "" },
+        { "gemma4", "compressed-tensors" }, { "lfm2", "" }, { "llama", "" }, { "llama", "fp8_e4m3" },
+        { "qwen35", "" },
         { "qwen35", "fp8_e4m3" }, { "qwen35moe", "fp8_e4m3" }, { "qwen3asr", "" },
-        { "qwen4exp", "" }, { "qwenimage21", "" } };
+        { "minimaxh3", "" }, { "minimaxmusic3", "" }, { "qwen4exp", "" }, { "qwenimage21", "" } };
     std::set<std::pair<std::string, std::string>> got;
     for (const auto& [k, name] : keys) got.insert(k);
     if (got != want)

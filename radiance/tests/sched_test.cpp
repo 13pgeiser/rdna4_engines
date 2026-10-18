@@ -1122,12 +1122,20 @@ TEST(derived_metadata_is_computed_once_per_step_into_the_arena) {
 }
 
 /* RadBatch::lora_slot: every row of a sequence carries its request's runtime LoRA slot, -1 for a
- * base request, in the step's row order (decode rows first). */
+ * base request, in the step's row order (decode rows first). A step with no adapter row carries
+ * none, so the core issues no adapter op on it. */
 TEST(the_step_batch_carries_each_rows_adapter_slot) {
     Fixture f;
     f.build();
     f.cfg.lora.max_loras = 2;
     CHECK_OK(f.start());
+
+    f.submit(16, 1);
+    const RadBatch* base = f.sch.step();
+    CHECK(base != nullptr);
+    CHECK_EQ(base->n_tok, (int64_t)16);
+    CHECK(base->lora_slot == nullptr);
+    f.commit_plain();
 
     auto r = f.request(100, 64);
     r->lora_slot = 1;

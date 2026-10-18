@@ -6,9 +6,10 @@
 // activation and after the residual, as the unfused chain would.
 //
 // Not gemm_bf16_nt_tiled: that kernel needs K in whole 64-element tiles (a tower MLP's 4304 is 16
-// past one) and has no bias. This uses the same block shape (eight waves over an LDS-staged 64-deep
-// K tile, next tile prefetched into registers) with a zero-staged K tail, no split-K, and the
-// epilogue in the store. Meant for tall activations (thousands of patches).
+// past one) and has no bias. Two kernels, both with a zero-staged K tail, no split-K, and the
+// epilogue in the store: a 64 x 64 tile with both operands staged through LDS for small grids, and
+// for large ones (tall activations, thousands of patches) a 128 x 128 tile that reads the weight
+// straight into registers and stages only the activation.
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_emit.h"
@@ -50,26 +51,30 @@ __device__ __forceinline__ float ldw(const void* p, uint32_t i) {
 // ---------------------------------------------------------------------------- layernorm
 // ref_layernorm: y = (x - mean) * rsqrt(var + eps) * w + b, biased variance, two passes (mean, then
 // squared deviations); one-pass E[x^2] - E[x]^2 cancels badly when the mean is large relative to
-// the spread. One block per row.
-template <bool WF32>
+// the spread. One block per row. `TX` is the row's element: bf16, or f32 for a residual stream kept
+// in f32 (a video decoder's), read as it is; the output is bf16 either way.
+__device__ __forceinline__ float ldx(const unsigned short* p, uint32_t i) { return bf2f(p[i]); }
+__device__ __forceinline__ float ldx(const float* p, uint32_t i) { return p[i]; }
+
+template <bool WF32, typename TX>
 __global__ __launch_bounds__(kThr) void layernorm_kernel(
-    const unsigned short* __restrict__ x, const void* __restrict__ w, const void* __restrict__ b,
+    const TX* __restrict__ x, const void* __restrict__ w, const void* __restrict__ b,
     unsigned short* __restrict__ y, uint32_t n, float eps, uint32_t x_ld, uint32_t y_ld) {
     __shared__ float lds[kThr / 32];
     const uint32_t m = blockIdx.x;
-    const unsigned short* __restrict__ xr = x + (size_t)m * x_ld;
+    const TX* __restrict__ xr = x + (size_t)m * x_ld;
     unsigned short* __restrict__ yr = y + (size_t)m * y_ld;
     float s = 0.0f;
-    for (uint32_t i = threadIdx.x; i < n; i += kThr) s += bf2f(xr[i]);
+    for (uint32_t i = threadIdx.x; i < n; i += kThr) s += ldx(xr, i);
     const float mean = block_sum<kThr / 32>(s, lds) / (float)n;
     float ss = 0.0f;
     for (uint32_t i = threadIdx.x; i < n; i += kThr) {
-        const float d = bf2f(xr[i]) - mean;
+        const float d = ldx(xr, i) - mean;
         ss += d * d;
     }
     const float r = rsqrtf(block_sum<kThr / 32>(ss, lds) / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += kThr) {
-        float v = (bf2f(xr[i]) - mean) * r * ldw<WF32>(w, i);
+        float v = (ldx(xr, i) - mean) * r * ldw<WF32>(w, i);
         if (b) v += ldw<WF32>(b, i);
         yr[i] = f32_to_bf16(v);
     }
@@ -170,7 +175,8 @@ __global__ __launch_bounds__(kThr) void grid_embed_aa_kernel(
 #define VB_PITCH (VB_BK + 8)      // 144-byte LDS rows, as in gemm_bf16_nt_tiled (bank spread)
 
 // TM x TN WMMA tiles per wave, eight waves as 2 x 4: BM = 2*TM*16, BN = 4*TN*16. ACT: 0 none,
-// 1 exact GELU, 2 tanh GELU.
+// 1 exact GELU, 2 tanh GELU. Serves grids under 32 blocks of 128 x 128 at TM 2, TN 1 (64 x 64);
+// larger grids take vit_gemm_wa_kernel below.
 template <int TM, int TN, int ACT, bool RES, bool BF32>
 __global__ __launch_bounds__(256) void vit_gemm_kernel(
     const unsigned short* __restrict__ A, unsigned lda, const unsigned short* __restrict__ W,
@@ -282,6 +288,236 @@ __global__ __launch_bounds__(256) void vit_gemm_kernel(
         }
 }
 
+
+// ---------------------------------------------------------------------------- gemm_nt_bias, large grids
+//
+// 128 weight rows x 128 activation rows a block, eight waves as kVWW (weight) x kVWA
+// (activation), a wave kVTW weight tiles x kVTA activation tiles. The weight is the WMMA A operand,
+// read from global straight into registers; the activation is the B operand, staged through LDS
+// and read by the four waves that share its rows. A lane's accumulator is then eight consecutive
+// weight rows of one activation row, so the bias is eight consecutive values and the store (with
+// its residual read) is one 16-byte access.
+//
+// Staging both operands through LDS with a 4 x 2 tile a wave (the kernel above at 128 x 128, which
+// this replaces) costs 384 bytes of fragment reads and 128 of stores per bf16 WMMA: all of gfx1201's
+// LDS bandwidth, 64 bytes a clock per CU against one bf16 WMMA every 16 clocks per SIMD
+// (libr4d/isa/wmmamix.hip). Here it is 256 and 64, and the weight's 128 bytes come through the
+// vector cache.
+//
+// K is relabelled inside a staged tile so that a lane's operand bytes are contiguous: lane half h,
+// k step s and element e hold k = 32h + 8s + e of the tile, for both operands alike. That is a
+// permutation of K applied to A and B together, so the product is the same sum; its rounding inside
+// the WMMA differs from the canonical order in the last bit (rel_l2 ~4e-5 against it, well inside a
+// bf16 output). It makes a lane's weight fragments for the tile one 64-byte run of its row, four
+// 16-byte loads, and its activation fragment one 16-byte LDS read.
+//
+// A weight row stride that is a multiple of 8 KiB (K = 4096 or 8192) puts all sixteen rows a
+// fragment load touches in one vector-cache set, and every load refetches them. The block's first K
+// tile is therefore rotated by its grid position, which spreads the blocks resident at once over
+// the K columns: +5% at K 8192, -1% at K 2048 (noise-level), the summation order changing with it.
+// The real fix is a weight layout without the stride (a padded row reached 139 TFLOP/s at K 8192
+// against 115 here), which needs a layout hook.
+//
+// Measured at the video decoder's shapes (M 25158, 300 W; the kernel above 93-98 TFLOP/s): this
+// tile 133-137 at K 2048, 115 at K 8192. Rejected: 2 x 4 waves of 4 weight x 2 activation tiles
+// (spills, -20%); 2 x 2 waves of 4 x 4 tiles at a 32-wide K tile (-22%: half-line weight loads,
+// twice the barriers); 4 x 1 waves of 2 x 8 at a 32-wide K tile (-8%); eight waves a SIMD at a
+// 32-wide K tile (-4%). kVGroup 1, 2, 4 and 16 are within 2% of 8 except at N 16384 (-9, -5, -3
+// and -3%); 32 is 5-15% slower. The kernel above with the grouped raster: +3% at N 16384, -2% at
+// K 8192. A uniform block base and 32-bit lane offsets for the loads: neutral. The weight through
+// raw buffer loads: +1% at K 2048 and +4% at K 8192, but the same loads cost the fp8 prefill tile
+// 20%, so neither tile uses them. The weight's loads nontemporal: -25..-50%.
+constexpr uint32_t kVTW = 2, kVTA = 4, kVWW = 4, kVWA = 2;
+constexpr uint32_t kVBN = kVWW * kVTW * 16, kVBM = kVWA * kVTA * 16;   // weight x activation rows
+constexpr uint32_t kVThreads = kVWW * kVWA * 32;
+constexpr uint32_t kVFK = 64;                                          // K elements a staged tile
+constexpr uint32_t kVPB = kVFK * 2 + 16;                               // LDS row pitch, bytes
+constexpr uint32_t kVCPR = kVFK * 2 / 16;                              // 16-byte chunks a row
+constexpr uint32_t kVSPT = kVBM * kVCPR / kVThreads;                   // chunks a thread stages
+constexpr uint32_t kVWC = kVFK / 16;                                   // a lane's weight chunks a tile
+// Activation bands per raster group; see gemm_8a8_prefill_kernel (r4d_gemm_fp8a8.hip).
+constexpr uint32_t kVGroup = 8;
+static_assert(kVBM * kVCPR % kVThreads == 0, "whole chunks a thread");
+
+// The store's three roundings, libref's order: the biased product, the activation, the residual.
+template <int ACT, bool RES>
+__device__ __forceinline__ unsigned short vit_finish(float acc, float bv, unsigned short r) {
+    unsigned short t = f32_to_bf16(acc + bv);
+    if constexpr (ACT == 1) t = f32_to_bf16(gelu_erf(bf2f(t)));
+    if constexpr (ACT == 2) t = f32_to_bf16(gelu_tanh(bf2f(t)));
+    if constexpr (RES) t = f32_to_bf16(bf2f(r) + bf2f(t));
+    return t;
+}
+
+/* `vec` (host-checked): C, R and the bias take 16-byte accesses at every eight-column boundary. */
+template <int ACT, bool RES, bool BF32>
+__global__ __launch_bounds__(kVThreads) R4D_WAVES(6) void vit_gemm_wa_kernel(
+    const unsigned short* __restrict__ A, unsigned lda, const unsigned short* __restrict__ W,
+    unsigned ldw_, const void* __restrict__ bias, const unsigned short* R, unsigned ldr,
+    unsigned short* C, unsigned ldc, int M, int K, int N, unsigned vec) {
+    typedef r4d_u32x4 U4;
+    // Double-buffered: one barrier a staged tile, which publishes it.
+    __shared__ __attribute__((aligned(16))) unsigned char s_a[2][kVBM * kVPB];
+
+    const uint32_t tid = threadIdx.x, lane = tid & 31u;
+    // Uniform per wave, and through readfirstlane known so, so what derives from it stays scalar.
+    const uint32_t wave = __builtin_amdgcn_readfirstlane(tid >> 5);
+    const uint32_t ww = wave % kVWW, wa = wave / kVWW;
+
+    // Grouped raster, as in gemm_8a8_prefill_kernel: kVGroup activation bands sweep N together.
+    uint32_t bm = blockIdx.x, bn = blockIdx.y;
+    if (gridDim.x > kVGroup) {
+        const uint32_t per = kVGroup * gridDim.y;
+        const uint32_t lin = blockIdx.y * gridDim.x + blockIdx.x;
+        const uint32_t first = (lin / per) * kVGroup, r = lin % per;
+        const uint32_t gm = min(gridDim.x - first, kVGroup);
+        bm = first + r % gm;
+        bn = r / gm;
+    }
+    const uint32_t m0 = bm * kVBM, n0 = bn * kVBN;
+
+    // Staging: eight consecutive threads cover a row's 128 bytes, so a load is whole cachelines.
+    // Rows past M re-read row M-1; nothing past M is stored.
+    const unsigned char* asrc[kVSPT];
+    uint32_t adst[kVSPT], aoff[kVSPT];
+#pragma unroll
+    for (uint32_t i = 0; i < kVSPT; ++i) {
+        const uint32_t c = tid + kVThreads * i, r = c / kVCPR, ch = c % kVCPR;
+        asrc[i] = (const unsigned char*)(A + (size_t)min(m0 + r, (uint32_t)M - 1u) * lda);
+        aoff[i] = ch * 8u;                                        // elements into the tile
+        adst[i] = r * kVPB + ch * 16u;
+    }
+    // Weight: lane row (l & 15) of each tile, elements [32h, 32h + 32) of the staged tile. Rows past
+    // N re-read row N-1; nothing past N is stored.
+    const unsigned short* wsrc[kVTW];
+#pragma unroll
+    for (uint32_t i = 0; i < kVTW; ++i)
+        wsrc[i] = W + (size_t)min(n0 + (ww * kVTW + i) * 16u + (lane & 15u), (uint32_t)N - 1u) * ldw_ +
+                  (lane >> 4) * (kVFK / 2u);
+    // This lane's activation fragment row and half in the staged tile.
+    const uint32_t frow = (wa * kVTA * 16u + (lane & 15u)) * kVPB + (lane >> 4) * kVFK;
+
+    v8f acc[kVTW][kVTA];
+#pragma unroll
+    for (uint32_t i = 0; i < kVTW; ++i)
+#pragma unroll
+        for (uint32_t j = 0; j < kVTA; ++j) acc[i][j] = (v8f)(0.f);
+
+    /* Four k steps of one staged tile: the weight from `cur`, the activation from LDS. */
+    auto mma_tile = [&](const unsigned char* sa, const U4 (&cur)[kVTW][kVWC]) {
+#pragma unroll
+        for (uint32_t s = 0; s < kVWC; ++s) {
+            v8bf bfr[kVTA];
+#pragma unroll
+            for (uint32_t j = 0; j < kVTA; ++j)
+                bfr[j] = __builtin_bit_cast(v8bf, *(const U4*)(sa + frow + j * 16u * kVPB + s * 16u));
+#pragma unroll
+            for (uint32_t i = 0; i < kVTW; ++i) {
+                const v8bf af = __builtin_bit_cast(v8bf, cur[i][s]);
+#pragma unroll
+                for (uint32_t j = 0; j < kVTA; ++j) acc[i][j] = mma(af, bfr[j], acc[i][j]);
+            }
+        }
+    };
+
+    // Whole tiles in a rotated order, then the K tail (K is a multiple of 8, so a 16-byte chunk
+    // is wholly inside or wholly past K) staged with zeros.
+    const uint32_t nfull = (uint32_t)K / kVFK;
+    if (nfull > 0u) {
+        const uint32_t t0 = (bm + bn) % nfull;
+        auto kt = [&](uint32_t t) { const uint32_t u = t0 + t; return (u >= nfull ? u - nfull : u) * kVFK; };
+        U4 pa[kVSPT], w0[kVTW][kVWC], w1[kVTW][kVWC];
+        /* Every load is issued unconditionally (the last tile's prefetch re-reads the last tile),
+         * so the loop has no branch and its waits count exactly. */
+        auto load = [&](uint32_t k0, U4 (&w)[kVTW][kVWC]) {
+#pragma unroll
+            for (uint32_t i = 0; i < kVSPT; ++i) pa[i] = *(const U4*)(asrc[i] + (size_t)(k0 + aoff[i]) * 2u);
+#pragma unroll
+            for (uint32_t i = 0; i < kVTW; ++i)
+#pragma unroll
+                for (uint32_t c = 0; c < kVWC; ++c) w[i][c] = *(const U4*)(wsrc[i] + k0 + c * 8u);
+        };
+        auto tile = [&](uint32_t t, uint32_t buf, U4 (&cur)[kVTW][kVWC], U4 (&nxt)[kVTW][kVWC]) {
+#pragma unroll
+            for (uint32_t i = 0; i < kVSPT; ++i) *(U4*)(s_a[buf] + adst[i]) = pa[i];
+            lds_barrier();
+            load(kt(min(t + 1u, nfull - 1u)), nxt);
+            mma_tile(s_a[buf], cur);
+        };
+        load(kt(0), w0);
+        uint32_t t = 0;
+        for (; t + 1u < nfull; t += 2u) {
+            tile(t, 0, w0, w1);
+            tile(t + 1u, 1, w1, w0);
+        }
+        if (t < nfull) tile(t, 0, w0, w1);
+    }
+    if ((uint32_t)K % kVFK) {
+        // The buffer the last whole tile did not use, last read two tiles back.
+        unsigned char* const sa = s_a[nfull % 2u];
+        const uint32_t k0 = nfull * kVFK;
+        const U4 zero = (U4)(0u);
+#pragma unroll
+        for (uint32_t i = 0; i < kVSPT; ++i)
+            *(U4*)(sa + adst[i]) = k0 + aoff[i] < (uint32_t)K
+                                       ? *(const U4*)(asrc[i] + (size_t)(k0 + aoff[i]) * 2u) : zero;
+        U4 w[kVTW][kVWC];
+#pragma unroll
+        for (uint32_t i = 0; i < kVTW; ++i)
+#pragma unroll
+            for (uint32_t c = 0; c < kVWC; ++c)
+                w[i][c] = k0 + (lane >> 4) * (kVFK / 2u) + c * 8u < (uint32_t)K
+                              ? *(const U4*)(wsrc[i] + k0 + c * 8u) : zero;
+        lds_barrier();
+        mma_tile(sa, w);
+    }
+
+    // D is [weight row][activation row]: eight consecutive columns of one C row a lane a tile.
+    // The residual is read by the thread that stores the same element, so R may alias C.
+#pragma unroll
+    for (uint32_t i = 0; i < kVTW; ++i)
+#pragma unroll
+        for (uint32_t j = 0; j < kVTA; ++j) {
+            const uint32_t m = m0 + (wa * kVTA + j) * 16u + (lane & 15u);
+            const uint32_t n = n0 + (ww * kVTW + i) * 16u + (lane >> 4) * 8u;
+            if (m >= (uint32_t)M) continue;
+            const v8f v = acc[i][j];
+            if (vec && n + 8u <= (uint32_t)N) {
+                float bv[8];
+                if constexpr (BF32) {
+                    const float4 b0 = *(const float4*)((const float*)bias + n);
+                    const float4 b1 = *(const float4*)((const float*)bias + n + 4);
+                    bv[0] = b0.x; bv[1] = b0.y; bv[2] = b0.z; bv[3] = b0.w;
+                    bv[4] = b1.x; bv[5] = b1.y; bv[6] = b1.z; bv[7] = b1.w;
+                } else {
+                    const uint4 b = *(const uint4*)((const unsigned short*)bias + n);
+                    const uint32_t d[4] = { b.x, b.y, b.z, b.w };
+#pragma unroll
+                    for (uint32_t e = 0; e < 8; ++e) bv[e] = bf2f((unsigned short)(d[e / 2] >> (16 * (e % 2))));
+                }
+                uint32_t rr[4] = { 0u, 0u, 0u, 0u };
+                if constexpr (RES) {
+                    const uint4 r4 = *(const uint4*)(R + (size_t)m * ldr + n);
+                    rr[0] = r4.x; rr[1] = r4.y; rr[2] = r4.z; rr[3] = r4.w;
+                }
+                uint32_t o[4];
+#pragma unroll
+                for (uint32_t e = 0; e < 8; e += 2)
+                    o[e / 2] = (uint32_t)vit_finish<ACT, RES>(v[e], bv[e], (unsigned short)rr[e / 2]) |
+                               ((uint32_t)vit_finish<ACT, RES>(v[e + 1], bv[e + 1],
+                                                               (unsigned short)(rr[e / 2] >> 16)) << 16);
+                *(uint4*)(C + (size_t)m * ldc + n) = make_uint4(o[0], o[1], o[2], o[3]);
+            } else {
+#pragma unroll
+                for (uint32_t e = 0; e < 8; ++e) {
+                    if (n + e >= (uint32_t)N) continue;
+                    const unsigned short r = RES ? R[(size_t)m * ldr + n + e] : (unsigned short)0;
+                    C[(size_t)m * ldc + n + e] = vit_finish<ACT, RES>(v[e], ldw<BF32>(bias, n + e), r);
+                }
+            }
+        }
+}
+
 }  // namespace
 
 // ============================================================== the plugin ABI entry points
@@ -295,7 +531,9 @@ extern "C" int r4d_rad_layernorm(const RadArgs* a, RadStream stream) {
     const RadTensor* b = r4d_opt(a, LN_B);
     const RadTensor* y = r4d_opt(a, LN_Y);
     if (!x || !w || !y) return R4D_NO(RAD_E_INVAL);
-    if (x->dtype != RAD_BF16 || y->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    /* The row bf16 or f32, the output bf16. */
+    if ((x->dtype != RAD_BF16 && x->dtype != RAD_F32) || y->dtype != RAD_BF16)
+        return R4D_NO(RAD_E_DTYPE);
     /* Gain and bias share one dtype, f32 or bf16. */
     if (w->dtype != RAD_F32 && w->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
     if (b && b->dtype != w->dtype) return R4D_NO(RAD_E_DTYPE);
@@ -309,14 +547,17 @@ extern "C" int r4d_rad_layernorm(const RadArgs* a, RadStream stream) {
     if (x_ld < 0 || y_ld < 0) return R4D_NO(RAD_E_STRIDE);
     if (M <= 0 || My < M) return R4D_NO(RAD_E_SHAPE);
     const float eps = (float)r4d_getf(a, "eps", 1e-5);
-    if (w->dtype == RAD_F32)
-        return R4D_EMIT(stream, layernorm_kernel<true>, dim3((uint32_t)M), dim3(kThr), 0,
-                        (const unsigned short*)r4d_p(x), r4d_p(w), r4d_p(b),
-                        (unsigned short*)r4d_wp(y), (uint32_t)n, eps, (uint32_t)x_ld,
-                        (uint32_t)y_ld);
-    return R4D_EMIT(stream, layernorm_kernel<false>, dim3((uint32_t)M), dim3(kThr), 0,
-                    (const unsigned short*)r4d_p(x), r4d_p(w), r4d_p(b),
-                    (unsigned short*)r4d_wp(y), (uint32_t)n, eps, (uint32_t)x_ld, (uint32_t)y_ld);
+#define R4D_LN(WF, TX)                                                                              \
+    return R4D_EMIT(stream, (layernorm_kernel<WF, TX>), dim3((uint32_t)M), dim3(kThr), 0,          \
+                    (const TX*)r4d_p(x), r4d_p(w), r4d_p(b), (unsigned short*)r4d_wp(y),           \
+                    (uint32_t)n, eps, (uint32_t)x_ld, (uint32_t)y_ld)
+    if (x->dtype == RAD_F32) {
+        if (w->dtype == RAD_F32) R4D_LN(true, float);
+        R4D_LN(false, float);
+    }
+    if (w->dtype == RAD_F32) R4D_LN(true, unsigned short);
+    R4D_LN(false, unsigned short);
+#undef R4D_LN
 }
 
 /* ------------------------------------------------------------------ grid_embed */
@@ -421,32 +662,53 @@ extern "C" int r4d_rad_gemm_nt_bias(const RadArgs* a, RadStream stream) {
     }
     const bool res = R != nullptr, bf32 = B->dtype == RAD_F32;
 
-    /* The large tile once its grid reaches 32 workgroups, as gemm_bf16_nt_tiled chooses. */
+    /* The 128 x 128 kernel once its grid reaches 32 workgroups, as gemm_bf16_nt_tiled chooses;
+     * below that the 64 x 64 tile, whose four times the blocks fill more of the card. */
     const long long g128 = ((N + 127) / 128) * ((M + 127) / 128);
     const bool big = g128 >= 32;
-    const int bt = big ? 128 : 64;
-    const dim3 grid((unsigned)((N + bt - 1) / bt), (unsigned)((M + bt - 1) / bt)), block(256);
     auto Ap = (const unsigned short*)r4d_p(A);
     auto Wp = (const unsigned short*)r4d_p(W);
     auto Rp = (const unsigned short*)r4d_p(R);
     auto Cp = (unsigned short*)r4d_wp(Y);
     const void* Bp = r4d_p(B);
-#define VB_L(TM, TN, AC, RS, BF)                                                                  \
-    return R4D_EMIT(stream, (vit_gemm_kernel<TM, TN, AC, RS, BF>), grid, block, 0, Ap,          \
+    if (big) {
+        /* Sixteen-byte stores, residual reads and bias reads at every eight-column boundary. */
+        const unsigned vec = (ldc % 8) == 0 && r4d_aligned(Cp, 16) && r4d_aligned(Bp, 16) &&
+                             (!res || ((ldr % 8) == 0 && r4d_aligned(Rp, 16)));
+        const dim3 grid((unsigned)((M + kVBM - 1) / kVBM), (unsigned)((N + kVBN - 1) / kVBN));
+#define VB_L(AC, RS, BF)                                                                          \
+        return R4D_EMIT(stream, (vit_gemm_wa_kernel<AC, RS, BF>), grid, dim3(kVThreads), 0, Ap,  \
+                        (unsigned)lda, Wp, (unsigned)K, Bp, Rp, (unsigned)ldr, Cp, (unsigned)ldc,  \
+                        (int)M, (int)K, (int)N, vec)
+#define VB_ACT(RS, BF)                                                                            \
+        do {                                                                                      \
+            if (act == 1) VB_L(1, RS, BF);                                                        \
+            if (act == 2) VB_L(2, RS, BF);                                                        \
+            VB_L(0, RS, BF);                                                                      \
+        } while (0)
+#define VB_RES(BF)                                                                                \
+        do { if (res) VB_ACT(true, BF); VB_ACT(false, BF); } while (0)
+        if (bf32) VB_RES(true);
+        VB_RES(false);
+#undef VB_RES
+#undef VB_ACT
+#undef VB_L
+    }
+    const dim3 grid((unsigned)((N + 63) / 64), (unsigned)((M + 63) / 64)), block(256);
+#define VB_L(AC, RS, BF)                                                                          \
+    return R4D_EMIT(stream, (vit_gemm_kernel<2, 1, AC, RS, BF>), grid, block, 0, Ap,             \
                     (unsigned)lda, Wp, (unsigned)K, Bp, Rp, (unsigned)ldr, Cp, (unsigned)ldc,      \
-                    (int)M, (int)K,                                                                \
-                    (int)N)
-#define VB_ACT(TM, TN, RS, BF)                                                                    \
+                    (int)M, (int)K, (int)N)
+#define VB_ACT(RS, BF)                                                                            \
     do {                                                                                          \
-        if (act == 1) VB_L(TM, TN, 1, RS, BF);                                                    \
-        if (act == 2) VB_L(TM, TN, 2, RS, BF);                                                    \
-        VB_L(TM, TN, 0, RS, BF);                                                                  \
+        if (act == 1) VB_L(1, RS, BF);                                                            \
+        if (act == 2) VB_L(2, RS, BF);                                                            \
+        VB_L(0, RS, BF);                                                                          \
     } while (0)
-#define VB_RES(TM, TN, BF)                                                                        \
-    do { if (res) VB_ACT(TM, TN, true, BF); VB_ACT(TM, TN, false, BF); } while (0)
-    if (big) { if (bf32) VB_RES(4, 2, true); VB_RES(4, 2, false); }
-    if (bf32) VB_RES(2, 1, true);
-    VB_RES(2, 1, false);
+#define VB_RES(BF)                                                                                \
+    do { if (res) VB_ACT(true, BF); VB_ACT(false, BF); } while (0)
+    if (bf32) VB_RES(true);
+    VB_RES(false);
 #undef VB_RES
 #undef VB_ACT
 #undef VB_L

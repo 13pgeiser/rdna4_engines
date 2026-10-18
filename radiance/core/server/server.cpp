@@ -96,6 +96,14 @@ void Server::register_routes() {
     router_.post("/v1/images/edits",     [this](const HttpRequest& q) { return handle_images(q, true); });
     router_.post("/v1/systemone",        [this](const HttpRequest& q) { return handle_systemone(q); });
     /* Speech to text, for a model whose plugin says how it transcribes (RadAudioFormat). */
+    router_.post("/v1/audio/speech", [this](const HttpRequest& q) { return handle_speech(q); });
+    router_.post("/v1/videos",       [this](const HttpRequest& q) { return handle_video_create(q); });
+    router_.get ("/v1/videos",       [this](const HttpRequest& q) { return handle_video_list(q); });
+    router_.get ("/v1/videos/:id",   [this](const HttpRequest& q) { return handle_video_get(q); });
+    router_.add ("DELETE", "/v1/videos/:id",
+                 [this](const HttpRequest& q) { return handle_video_delete(q); });
+    router_.get ("/v1/videos/:id/content",
+                 [this](const HttpRequest& q) { return handle_video_content(q); });
     router_.post("/v1/audio/transcriptions",
                  [this](const HttpRequest& q) { return handle_transcription(q); });
     /* The same, live over a WebSocket (OpenAI's realtime transcription session). A plain GET
@@ -106,6 +114,19 @@ void Server::register_routes() {
         e.status = 426;
         e.type = "invalid_request_error";
         e.message = "/v1/realtime is a WebSocket: connect with an Upgrade: websocket request";
+        HttpResponse r = error_response(e, q.peer);
+        r.set_header("Upgrade", "websocket");
+        return r;
+    });
+    /* Speech made while its text is still being written (vLLM-Omni's realtime speech session). */
+    router_.socket("/v1/audio/speech/stream",
+                   [this](const HttpRequest& q, WsConn& c) { handle_speech_stream(q, c); });
+    router_.get ("/v1/audio/speech/stream", [this](const HttpRequest& q) {
+        ApiError e;
+        e.status = 426;
+        e.type = "invalid_request_error";
+        e.message = "/v1/audio/speech/stream is a WebSocket: connect with an Upgrade: websocket "
+                    "request";
         HttpResponse r = error_response(e, q.peer);
         r.set_header("Upgrade", "websocket");
         return r;
@@ -126,6 +147,7 @@ void Server::register_routes() {
     router_.post("/images/generations",  [this](const HttpRequest& q) { return handle_images(q, false); });
     router_.post("/images/edits",        [this](const HttpRequest& q) { return handle_images(q, true); });
     router_.post("/audio/transcriptions", [this](const HttpRequest& q) { return handle_transcription(q); });
+    router_.post("/audio/speech",        [this](const HttpRequest& q) { return handle_speech(q); });
     router_.get ("/models",              [this](const HttpRequest& q) { return handle_models(q); });
     /* llama-server's: the prompt a chat request renders to, and how many tokens it is. */
     router_.post("/apply-template",      [this](const HttpRequest& q) { return handle_apply_template(q); });
@@ -281,6 +303,7 @@ std::string Server::check_thinking_budget() const {
 void Server::stop() {
     stopping_.store(true);
     transport_.stop();
+    stop_videos();
     drain_graveyard(2000);
 }
 
@@ -390,9 +413,9 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
         }
     }
 
-    /* RUNTIME LoRA: `model` picks the adapter. The served model's own name, or no name, is the
-     * base; with adapters enabled anything else must be a loaded adapter -- a typo served by the
-     * base would answer as the wrong model and say nothing. */
+    /* Runtime LoRA: `model` picks the adapter. The served model's own name, or no name, is the
+     * base; with adapters enabled anything else must be a loaded adapter, since a typo served by
+     * the base would answer as the wrong model without a word. */
     int32_t  lora_slot = -1;
     uint64_t lora_uid = 0;
     std::shared_ptr<void> lora_hold;
@@ -1269,6 +1292,10 @@ std::optional<HttpResponse> Server::refuse_text(const std::string& peer, ApiShap
                                      "generates no text"
         : opt_.image_model         ? "this is an image model: it serves /v1/images/generations "
                                      "and /v1/images/edits and generates no text"
+        : opt_.audio_model         ? "this is an audio model: it serves /v1/audio/speech and "
+                                     "generates no text"
+        : opt_.video_model         ? "this is a video model: it serves /v1/videos and generates "
+                                     "no text"
                                    : nullptr;
     if (!why) return std::nullopt;
     return error_response(err_not_implemented(why), peer, shape);
@@ -1536,8 +1563,10 @@ HttpResponse Server::handle_embeddings(const HttpRequest& req) {
     if (!deps_.embed)
         return error_response(err_not_implemented(
             opt_.image_model ? "/v1/embeddings requires an embedding model; this one makes images"
-                             : "/v1/embeddings requires an embedding model; this one generates "
-                               "text"), req.peer);
+            : opt_.audio_model ? "/v1/embeddings requires an embedding model; this one makes audio"
+            : opt_.video_model ? "/v1/embeddings requires an embedding model; this one makes video"
+                               : "/v1/embeddings requires an embedding model; this one generates "
+                                 "text"), req.peer);
 
     OaiRequest r;
     ApiError err;
@@ -1775,7 +1804,7 @@ HttpResponse Server::handle_systemone(const HttpRequest& req) {
 
 HttpResponse Server::handle_models(const HttpRequest& req) {
     const std::string id = req.param("id");
-    /* RUNTIME LoRA: each loaded adapter is a model of its own, whose parent is the served one. */
+    /* Runtime LoRA: each loaded adapter is a model of its own, whose parent is the served one. */
     std::vector<std::string> adapters;
     if (opt_.lora_names) adapters = opt_.lora_names();
     const bool is_adapter = !id.empty() && std::find(adapters.begin(), adapters.end(), id) != adapters.end();
@@ -1805,9 +1834,9 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
     return HttpResponse::json_body(200, id.empty() ? models_body(cards) : model_body(c));
 }
 
-/* RUNTIME LoRA ADMIN, vLLM's routes and bodies: {"lora_name", "lora_path"} to load, {"lora_name"}
- * to unload. The path is read on THIS machine, so without --api-key only a loopback client may ask
- * -- the rule /diagnostics follows. */
+/* Runtime LoRA admin, vLLM's routes and bodies: {"lora_name", "lora_path"} to load, {"lora_name"}
+ * to unload. The path is read on this machine, so without --api-key only a loopback client may
+ * ask, the rule /diagnostics follows. */
 HttpResponse Server::handle_lora_admin(const HttpRequest& req, bool load) {
     using json = nlohmann::json;
     auto fail = [&](int status, const char* type, const std::string& msg) {
@@ -1845,10 +1874,10 @@ HttpResponse Server::handle_lora_admin(const HttpRequest& req, bool load) {
     if (s == RAD_E_STATE) return fail(409, "conflict_error", err);
     if (s == RAD_E_FULL) return fail(503, "service_unavailable", err);
     if (s < 0) return fail(400, "invalid_request_error", err.empty() ? std::string(rad_strerror(s)) : err);
-    /* AN UNLOAD OF AN ADAPTER IN USE DRAINS IT (lora/slots.h): accepted, not done. New requests
-     * naming it are already refused as an unknown model and it is off /v1/models; the requests
-     * counted here finish normally, and the last of them frees the slot. Asking again answers
-     * the same with the count as it is then, and a 404 once it is gone. */
+    /* An unload of an adapter in use drains it (lora/slots.h): accepted, not done. New requests
+     * naming it are refused as an unknown model and it is off /v1/models; the requests counted
+     * here finish, and the last of them frees the slot. Asking again answers with the count as it
+     * is then, and 404 once it is gone. */
     if (!load && in_flight > 0) {
         metrics_.observe_http(202);
         return HttpResponse::json_body(202, json{ { "action", "draining" }, { "lora_name", name },

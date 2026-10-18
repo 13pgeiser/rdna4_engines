@@ -89,6 +89,11 @@ struct Plugin {
     const RadChatFormat* (*arch_chat_format)(const RadModelMeta*) = nullptr;
     /* Optional (rad_builder.h); null means the model serves no speech route. */
     const RadAudioFormat* (*arch_audio_format)(const RadModelMeta*) = nullptr;
+    /* Optional (rad_builder.h); null means a request's texts go into the audio generator's
+     * prompt as given. */
+    int64_t (*arch_text_prepare)(int, const char*, char*, int64_t) = nullptr;
+    /* Required of a video generator (rad_builder.h); null for every other plugin. */
+    int64_t (*arch_video_positions)(int, const RadVideoGeom*, float*, int64_t) = nullptr;
 
     RadPluginCloseFn close = nullptr;
 };

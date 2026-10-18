@@ -1,28 +1,28 @@
 /* lora_cases.h -- the runtime-LoRA case matrix and what every implementation is held to, shared by
  * tests/lora_ops_test.cpp (libref and libavx, at every ISA level the machine runs) and
  * tests/r4d_emu/test_lora.cpp (libr4d's source on the SIMT emulator, beside libref and the host
- * restatement in ref_host.cpp). One matrix and one checker, so "the same cases" is a fact and not
- * an intention.
+ * restatement in ref_host.cpp). One matrix and one checker, so every implementation runs the same
+ * cases.
  *
- * THE MATRIX. M in {1, 3, 17, 64, 130}, R in {16, 32, 48}, S = 4, K (and N) in {64, 256, 1000};
+ * The matrix: M in {1, 3, 17, 64, 130}, R in {16, 32, 48}, S = 4, K (and N) in {64, 256, 1000};
  * `a` bf16, or E4M3 with an f32 scale every 128 columns (1000 leaves a partial group, 64 a row
  * narrower than one group); `y` bf16 and f32. Then the other dtypes once over a smaller grid: `a`
  * f16, f32, E5M2 and i8 (the last two with scales), `y` f16. `a`, its scale stream and `y` are
- * COLUMN SLICES of wider buffers. Slots cycle through -1, -5, 0..3 and 4 (= S): three spellings
- * of a base row beside the adapter rows, M = 1 once as an adapter row and twice as a base one.
+ * column slices of wider buffers. Slots cycle through -1, -5, 0..3 and 4 (= S): three spellings of
+ * a base row beside the adapter rows, M = 1 once as an adapter row and twice as a base one.
  *
- * WHAT IS CHECKED, per implementation, per case:
- *   * BASE ROWS ARE UNTOUCHED, BY BYTES. Shrink leaves the sentinel NaN pattern `t` was filled
- *     with; expand leaves `y` -- every third element a -0, which `y + 0` would turn into +0 -- and
+ * Checked per implementation, per case:
+ *   - Base rows are untouched, by bytes. Shrink leaves the sentinel NaN pattern `t` was filled
+ *     with; expand leaves `y` (every third element a -0, which `y + 0` would turn into +0) and
  *     every column outside the slice as they were.
- *   * ADAPTER ROWS AGAINST A DOUBLE-PRECISION SUM of the same f32 terms (x(m, k) is the code times
+ *   - Adapter rows against a double-precision sum of the same f32 terms (x(m, k) is the code times
  *     its scale rounded to f32, as the contract defines it). Shrink: |t - sum| <= (K + 2) 2^-24
  *     sum|terms|, the worst case of an f32 dot in any summation order, so no implementation can
  *     fail it by choosing an order and every one fails it by reading a wrong element. Expand:
  *     |y - want| <= h (|want| + e) + 2 e with e = 4 (R + 2) 2^-24 (|y| + |scale| sum|terms|) and h
  *     half an ulp of y's dtype relative (2^-8 bf16, 2^-11 f16, 0 f32).
- *   * An implementation marked `ref_bytes` must also produce, for expand, exactly the bytes of the
- *     first implementation in the list -- the claim libr4d's expand makes about libref's order.
+ *   - An implementation marked `ref_bytes` must also produce, for expand, exactly the bytes of the
+ *     first implementation in the list, the claim libr4d's expand makes about libref's order.
  *
  * A shrink row with a scratch hook (libr4d's WMMA row keeps its K split's partials there) is handed
  * the scratch the hook asks for, filled with a non-zero pattern, as the core would hand it a slice of

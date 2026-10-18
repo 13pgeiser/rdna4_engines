@@ -554,12 +554,13 @@ int  r4d_gemm_mxfp4a8_decode_max_m(void);
 // R4D_GEMM_W4A8_GROUP). The `_block()` queries report it, and every entry point rejects a K that
 // would leave a partial block.
 //
-// Three kernels, one per band, because the operand carrying the coarse (per-128-row) scale must be
-// the one whose tile is wide; see the AW comment in r4d_gemm_fp8a8.hip.
+// Three kernels, one per band. The two W8A8 ones put the weight on the WMMA A operand, so a lane's
+// accumulator slots share one activation scale; see r4d_gemm_fp8a8.hip.
 //
 //   M == 1    r4d_gemm_fp8a16_nt_m1   bf16 activation read directly, no quantise launch
-//   M <= 16   r4d_gemm_fp8a8_nt_m16   E4M3 activation, one 16-wide token tile, split-K
-//   any M     r4d_gemm_fp8a8_tiled    E4M3 activation, 128x128 tile, eight waves
+//   M <= 64   r4d_gemm_fp8a8_nt_m16   E4M3 activation, up to four 16-wide token tiles, split-K
+//   any M     r4d_gemm_fp8a8_tiled    E4M3 activation, 128x128 tile, eight waves; the weight read
+//                                     into registers, the activation staged through LDS
 //
 // `w_ld` is bytes per weight row and `sw_ld` elements per scale row, 0 meaning tight. All return 0
 // or a negative code instead of throwing, since they are reachable from C consumers.
@@ -652,6 +653,12 @@ int  r4d_gemm_fp8a8_gated_nt_m16(long a, long ascale, long wq, long ws,
                                  int a_ld, int sa_ld, int w_ld, int sw_ld,
                                  int q_ld, int s_ld, int y_ld, long stream);
 int  r4d_gemm_fp8a8_gated_nt_m16_max_m(void);
+// The narrow GEMM with a bias: `bias` bf16 [N], added to each output column's f32 accumulator before
+// its one rounding, and C written at row pitch `c_ld` (0 = N), so C may be a column slice of a wider
+// buffer. Never split. M up to r4d_gemm_fp8a8_nt_m16_max_m(); K a multiple of 128, N of 16.
+int  r4d_gemm_fp8a8_bias_nt_m16(long a, long ascale, long wq, long ws, long bias, long c,
+                                int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
+                                int c_ld, long stream);
 int  r4d_gemm_fp8a8_tiled(long a, long ascale, long wq, long ws, long c,
                           int M, int K, int N, int a_ld, int sa_ld, int w_ld, int sw_ld,
                           long stream);

@@ -86,7 +86,7 @@ struct OpPlan {
     /* The conventional all_reduce, whose `n` is the message's element count, so its link bytes
      * can be counted (ar_bytes) apart from the expert mover's. */
     bool          billed = false;
-    /* RUNTIME LoRA: this gemm's row in Program::lora_sites, -1 for every op that is not one. */
+    /* Runtime LoRA: this gemm's row in Program::lora_sites, -1 for every op that is not one. */
     int32_t       lora_site = -1;
 };
 

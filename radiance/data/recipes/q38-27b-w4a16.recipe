@@ -1,0 +1,27 @@
+# q38-27b-w4a16.recipe -- an int4 W4A16 release of Qwen3.8-27B (or a finetune of it, such as
+# ukisai's Swift 1.5 W4A16-AWQ, INT4 and W4A16-AutoRound), served at the 4-bit weights it ships.
+#
+#   rad-convert <int4 release> --recipe data/recipes/q38-27b-w4a16.recipe -o model.rad
+#
+# The releases read are compressed-tensors' pack-quantized int4 in groups of 128, symmetric or
+# asymmetric with a zero point per group (llm-compressor's AWQ, W4A16_ASYM), act-order none or
+# `static`, and AutoRound's `auto_round:auto_gptq` export (symmetric, group 128). rad-convert
+# imports each linear as it ships and the import rule writes it in the form the 4-bit GEMMs read:
+# u4 codes, an f16 scale and a u4 zero point per 128 of K, a symmetric grid's codes made unsigned
+# under a zero of 8. The numbers are the release's: every code and zero point as shipped, every
+# f16 scale as shipped, and a bf16 scale converted to f16, which holds it exactly unless it lies
+# below f16's normal range (2^-14); rad-convert reports how many it rounded.
+#
+# Served by the family's quantised plugin (qwen35_fp8): w4a16_asym over the input cast to f16 at
+# up to 64 rows a step, w4a8i8_asym over an int8 activation with a scale per (row, 128) above.
+#
+# What the release keeps in bf16 stays bf16: the delta net's a/b projections, the norms, the
+# embedding, the vision tower and the MTP head. Its head is made block fp8 as in the other 27B
+# recipes (the widest GEMM, read every step, at half the bytes), and the MTP head drafts through a
+# 2-bit copy of it (u2 with a u8 zero, least-squares clip search) whose top candidates the engine
+# rescores against the fp8 head.
+
+blk.*.weight                         import  codes=u4 zero=u4 scale=f16
+
+output.weight                        rtn     codes=fp8_e4m3 block=128x128 scale=bf16
+mtp.draft_head.weight                rtn     codes=u2 zero=u8 group=128 scale=f16 rule=search

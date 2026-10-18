@@ -90,6 +90,12 @@ public:
     virtual bool read(std::string* msg, bool* binary) = 0;
     /* A text message. Safe from any thread; false once the connection is gone. */
     virtual bool send(const std::string& text) = 0;
+    /* A binary message (raw audio). Safe from any thread; false once the connection is gone, or
+     * for a connection that carries text only. */
+    virtual bool send_binary(const std::string& bytes) {
+        (void)bytes;
+        return false;
+    }
     /* Ends the connection with a close code and reason (RFC 6455 §7.4); a read() blocked on it
      * returns false once the peer has answered or gone. Safe from any thread. */
     virtual void close(int code, const std::string& reason) = 0;

@@ -72,9 +72,22 @@ set(R4D_UNITS
   # implicit-GEMM convolution and pixel ops.
   "r4d_attn_gen|"
   "r4d_gen|"
+  # The audio generator: a vocoder's 1-D convolutions and snake activation, the guided top-k
+  # sampler for a frame's codes, the frame and window ops, and a depth decoder's short attention.
+  "r4d_audio|"
+  # The video generator: a diffusion transformer's modulated RMS norm and sampler step, the video
+  # decoder's patch unfold, tiles, stitch and rotary positions, and the soundtrack decoder's
+  # alias-free SnakeBeta.
+  "r4d_video|"
+  # Video sparse attention: the tile selection a distilled video transformer was trained with and
+  # the block-sparse attention over it.
+  "r4d_vsa|"
   # Vision tower ops: layer norm, the learned-grid position embedding, and the biased GEMM with
   # activation and residual fused into its store.
   "r4d_vit_bf16|"
+  # The same biased GEMM over f32 operands (a diffusion transformer's patch projections and heads,
+  # a video decoder's 1x1 projections), on the f32 FMA tile r4d_audio's f32 convolutions share.
+  "r4d_gemm_f32_nt_bias|"
   "r4d_gdn_chunk_scan_k128_v128_c64_bf16|-mcumode"
   "r4d_gdn_conv_w4_h128_bf16|"
   "r4d_gdn_kkt_solve_k128_c64_bf16|"
@@ -149,7 +162,7 @@ set(R4D_UNITS
   # expert_scale, each one kernel for a chain of small ones.
   "r4d_norm_join_bf16|"
   "r4d_expert_scale_bf16|"
-  # Runtime LoRA's two halves (lora_shrink, lora_expand), per-row adapter slot; scalar f32 v1.
+  # Runtime LoRA's two halves (lora_shrink, lora_expand), per-row adapter slot: scalar and tiled rows.
   "r4d_lora_bf16|"
   "r4d_dflash_conv_t2_g16_bf16|"
   "r4d_dflash_select_bf16|"

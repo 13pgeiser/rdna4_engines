@@ -219,6 +219,12 @@ int Registry::commit_(Staged& s, int order) {
         /* Optional: absent means the model serves no speech route. */
         p.arch_audio_format = dl_fn<const RadAudioFormat* (*)(const RadModelMeta*)>(
             s.handle, "rad_arch_audio_format");
+        /* Optional: absent means an audio generator's prompt takes a request's texts as given. */
+        p.arch_text_prepare = dl_fn<int64_t (*)(int, const char*, char*, int64_t)>(
+            s.handle, "rad_arch_text_prepare");
+        /* A video generator's rotary positions; the driver refuses to start without it. */
+        p.arch_video_positions = dl_fn<int64_t (*)(int, const RadVideoGeom*, float*, int64_t)>(
+            s.handle, "rad_arch_video_positions");
 
         /* The (architecture id, quantisation) pair selects the plugin, so no two plugins may claim
          * the same pair (§2.4). Sharing an id at different quantisations is normal (qwen35_bf16

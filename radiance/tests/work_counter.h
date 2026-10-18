@@ -6,12 +6,20 @@
  * on it does not flake when other tests run beside it. Tests compare ratios of two counts, or a
  * count per item against a bound far from the failure it catches.
  *
- * Where the counter is refused (no PMU in a VM, perf_event_paranoid above 2), the fallback is the
- * thread's CPU time in nanoseconds, which still excludes time spent descheduled. exact() says
- * which is in use. A multiplexed counter is scaled by its enabled/running times.
+ * Where the counter is refused (no PMU in a VM, perf_event_paranoid above 2, or a seccomp profile
+ * that denies the call, as a container build's sandbox does), the fallback is the thread's CPU time
+ * in nanoseconds, which still excludes time spent descheduled. exact() says which is in use. A
+ * multiplexed counter is scaled by its enabled/running times.
+ *
+ * CPU time includes the kernel's, which the counter leaves out, and the largest kernel cost of a
+ * run is faulting in fresh pages: by default the allocator hands a large freed block back to the
+ * system, so every run of a big input pays for its pages again, several milliseconds on a
+ * half-megabyte input. With the fallback in use the allocator keeps freed memory mapped, so a
+ * repeated run reuses pages it already faulted in and its time is the work again.
  */
 #pragma once
 #include <linux/perf_event.h>
+#include <malloc.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -36,6 +44,12 @@ public:
         a.exclude_hv = 1;
         a.read_format = PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
         fd_ = (int)syscall(SYS_perf_event_open, &a, 0, -1, -1, 0);
+        if (fd_ < 0) {
+            /* Freed memory stays mapped: no trim of the heap's top, and blocks up to the largest
+             * threshold glibc accepts (32 MiB) come from the heap rather than a fresh mapping. */
+            mallopt(M_TRIM_THRESHOLD, 1 << 30);
+            mallopt(M_MMAP_THRESHOLD, 32 << 20);
+        }
     }
     ~Work() {
         if (fd_ >= 0) close(fd_);

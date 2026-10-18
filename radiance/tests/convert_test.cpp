@@ -433,6 +433,98 @@ TEST(a_recipe_or_flag_that_cannot_be_honoured_is_refused_before_writing) {
     }
 }
 
+/* ================================================================== an int4 release */
+
+namespace {
+
+/* compressed-tensors' value of one packed linear of a tiny int4 release (tiny_model.h,
+ * write_llama_ct_int4): (q - zero_point) * scale, f32 [N, K]. */
+std::vector<float> ct_values(const std::map<std::string, tiny::Tensor>& src, const std::string& b) {
+    const tiny::Tensor& p = src.at(b + ".weight_packed");
+    const tiny::Tensor& s = src.at(b + ".weight_scale");
+    const auto z = src.find(b + ".weight_zero_point");
+    const int64_t N = p.shape[0], K = p.shape[1] * 8, G = s.shape[1];
+    std::vector<float> v((size_t)(N * K));
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t k = 0; k < K; ++k) {
+            uint32_t w;
+            std::memcpy(&w, p.bytes.data() + (n * (K / 8) + k / 8) * 4, 4);
+            const int q = (int)((w >> (4 * (k % 8))) & 15) - 8;
+            int zp = 0;
+            if (z != src.end()) {
+                std::memcpy(&w, z->second.bytes.data() + ((n / 8) * G + k / 128) * 4, 4);
+                zp = (int)((w >> (4 * (n % 8))) & 15) - 8;
+            }
+            v[(size_t)(n * K + k)] =
+                (float)(q - zp) * rad_load_f32(s.bytes.data(), RAD_BF16, n * G + k / 128);
+        }
+    return v;
+}
+
+}  /* namespace */
+
+/* An int4 W4A16 release (compressed-tensors, asymmetric with zero points, and symmetric with
+ * act-order static) converts with the import rule into the 4-bit GEMMs' form,
+ * `u4*f16[1x128]-u4[1x128]`, each joined weight decoding to compressed-tensors' (q - zp) * scale
+ * bit for bit, its rule recorded, and the run saying every shipped value is exact. Declaring it
+ * resolves the cast, the f16 4-bit GEMM, the int8 quantiser and the int8 4-bit GEMM on the host
+ * libraries. Without the rule the plugin refuses the shipped form by name. */
+TEST(an_int4_release_imports_exactly_through_the_import_rule) {
+    for (const bool asym : { true, false }) {
+        tiny::TempDir d(asym ? "convert_i4a" : "convert_i4s");
+        REQUIRE(d.ok());
+        const std::string ck = d / "llama-int4", recipe = d / "int4.recipe", out = d / "i4.rad";
+        REQUIRE_EQ(mkdir(ck.c_str(), 0755), 0);
+        REQUIRE(tiny::write_llama_ct_int4(ck, {}, asym));
+        REQUIRE(tiny::write_text(recipe, tiny::kInt4ImportRecipe));
+        std::map<std::string, tiny::Tensor> src;
+        for (tiny::Tensor& t : tiny::read_safetensors(ck + "/model.safetensors"))
+            src[t.name] = std::move(t);
+        std::string log;
+        const int st = convert(ck, { "-o", out, "--recipe", recipe }, &log);
+        if (st != 0) fprintf(stderr, "%s\n", log.c_str());
+        REQUIRE_EQ(st, 0);
+        CHECK(has(log, "every shipped value exact"));
+        RadFile f;
+        REQUIRE_EQ(f.open(out.c_str()), RAD_OK);
+        const struct { const char* weight; std::vector<std::string> parts; } kJoins[] = {
+            { "blk.0.attn_qkv.weight", { "model.layers.0.self_attn.q_proj",
+                                         "model.layers.0.self_attn.k_proj",
+                                         "model.layers.0.self_attn.v_proj" } },
+            { "blk.1.ffn_gate_up.weight", { "model.layers.1.mlp.gate_proj",
+                                            "model.layers.1.mlp.up_proj" } },
+            { "blk.1.ffn_down.weight", { "model.layers.1.mlp.down_proj" } },
+            { "blk.0.attn_output.weight", { "model.layers.0.self_attn.o_proj" } },
+        };
+        for (const auto& j : kJoins) {
+            const RadFileEntry* e = f.find(j.weight);
+            REQUIRE(e != nullptr);
+            CHECK_EQ(enc_name(f.encoding(*e)), std::string("u4*f16[1x128]-u4[1x128]"));
+            CHECK_EQ(std::string(f.str(e->quantizer)), std::string("import"));
+            CHECK_EQ(std::string(f.str(e->options)), std::string("codes=u4,scale=f16,zero=u4"));
+            std::vector<float> want;
+            for (const std::string& part : j.parts) {
+                const std::vector<float> v = ct_values(src, part);
+                want.insert(want.end(), v.begin(), v.end());
+            }
+            const std::vector<float> got = decode(f, *e);
+            REQUIRE_EQ(got.size(), want.size());
+            int64_t bad = 0;
+            for (size_t i = 0; i < got.size(); ++i) bad += got[i] != want[i];
+            CHECK_EQ(bad, (int64_t)0);
+        }
+        /* The head the release leaves bf16 stays so. */
+        const RadFileEntry* head = f.find("output.weight");
+        REQUIRE(head != nullptr);
+        CHECK_EQ(enc_name(f.encoding(*head)), std::string("bf16"));
+
+        std::string log2;
+        CHECK(convert(ck, { "-o", d / "none.rad" }, &log2) != 0);
+        CHECK(has(log2, asym ? "u4*bf16[1x128]-u4[1x128]" : "i4*bf16[1x128]"));
+        CHECK(has(log2, "import rule"));
+    }
+}
+
 /* A rule that matches nothing is almost always a typo, so it is named; the run goes on. */
 TEST(a_rule_that_matches_no_weight_is_warned_about) {
     World& w = world();

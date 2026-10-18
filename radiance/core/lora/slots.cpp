@@ -29,9 +29,8 @@ int SlotTable::reserve(const std::string& name, int* slot, bool* cooling, std::s
                 *err = "an adapter named '" + name + "' is already loaded";
                 return RAD_E_INVAL;
             }
-            /* The old adapter's requests are still running on its slot, and a request naming
-             * the new one would be told apart from them only by the uid: load it once the old one
-             * is gone (POST /v1/unload_lora_adapter says how many remain). */
+            /* The old adapter's requests still run on its slot; the name loads again once they
+             * are gone (POST /v1/unload_lora_adapter says how many remain). */
             const auto it = refs_.find(x.uid);
             const int n = it == refs_.end() ? 0 : it->second;
             *err = fmt("an adapter named '%s' is being unloaded: %d request%s still use%s it", name.c_str(),

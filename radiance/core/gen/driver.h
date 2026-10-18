@@ -23,6 +23,7 @@
  */
 #pragma once
 #include "gen.h"
+#include "pass.h"
 #include "device/device.h"
 
 #include <mutex>
@@ -31,7 +32,7 @@
 namespace rad {
 namespace gen {
 
-class Driver {
+class Driver final : public IPassDriver {
 public:
     struct RankIO {
         int       device = 0;
@@ -54,25 +55,18 @@ public:
      * request. */
     const RadGeneratorDecl&    decl() const { return decl_; }
     int64_t max_cond_tokens() const { return max_tok_; }
-    /* Fail every request queued or in flight, and refuse new ones. */
-    void shutdown(const char* why, int status);
+    void shutdown(const char* why, int status) override;
 
     /* ---------------------------------------------------------- the engine thread */
-    /* The next pass, staged on every rank's stream, or null when there is nothing to run.
-     * `step` is the engine's pass counter, carried into RadBatch::step. */
-    const RadBatch* next(int step);
-    const RadBatch* batch_for(int rank) const;
-    /* Bytes of image output the staged pass produces, 0 if none; the engine copies them to
-     * host_image() behind the pass. */
-    int64_t decode_bytes() const { return dec_bytes_; }
-    void*   host_image() const { return img_host_; }
-    /* The pass has run on every rank and its streams are drained. */
-    int  done();
+    const RadBatch* next(int step) override;
+    const RadBatch* batch_for(int rank) const override;
+    /* A decode pass's pixels: `image_out` into the pinned image buffer. */
+    const std::vector<Readback>& readbacks() const override { return rb_; }
+    int  done() override;
     bool busy() const;
 
-    /* For /health, /stats and the dashboard. */
-    int64_t queued() const;
-    int64_t running() const;
+    int64_t queued() const override;
+    int64_t running() const override;
 
 private:
     struct Cond {
@@ -160,6 +154,7 @@ private:
     void*                 img_host_ = nullptr;
     int64_t               img_bytes_ = 0;
     int64_t               dec_bytes_ = 0;
+    std::vector<Readback> rb_;
 
     std::vector<RadBatch>        out_;     /* one per rank */
     std::vector<RadGenBatch>     gout_;

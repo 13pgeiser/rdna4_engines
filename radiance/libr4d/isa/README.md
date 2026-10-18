@@ -1,19 +1,20 @@
 # libr4d/isa: reading the machine code the kernels became
 
-Nine scripts and four microbenchmarks. A wall-clock timer cannot tell "this kernel is slow" from
+Nine scripts and six microbenchmarks. A wall-clock timer cannot tell "this kernel is slow" from
 "this kernel is at the memory wall"; the disassembly plus one calibration number can, without a GPU
 run. The trace tools are the exception: they need the GPU, and they are the only instruments here
 that report the geometry a kernel was launched with rather than every geometry it could have had.
 
     BUILD=/path/to/build ./res.sh | head -40        # every kernel: vgpr/lds/scratch
-    BUILD=... ./dis.sh r4d_gemm_fp8a8 ILb1ELb0ELj8ELj1ELj8ELj64ELb0E
+    BUILD=... ./dis.sh r4d_gemm_fp8a8 gemm_8a8_prefill_kernelILb0E
     BUILD=... ./waterfall.sh                        # divergent VGPR indices, per kernel
     ./loop.sh                                       # its K loop, classified
     ./trace.sh traces/dec -- ./bin/radiance ...     # then: ./tsum.sh traces/dec/k_kernel_trace.csv
 
 `res.sh` prints mangled names; the substring `dis.sh` takes picks one template instantiation, and
 the parameter order is in the kernel's declaration (`gemm_fp8a8_kernel` is
-`<Full, AW, NT, MT, MW, FK, GATED, I8>`, so `ILb1ELb0ELj8ELj1ELj8ELj64ELb0E` is the prefill tile).
+`<Full, NT, MW, FK, GATED, I8, BIAS>`, so `ILb1ELj4ELj8ELj256ELb0E` is the narrow tile at four token
+tiles and eight waves; `gemm_8a8_prefill_kernelILb0E` is the fp8 prefill tile).
 `loop.sh` anchors on `v_wmma` by default and takes the smallest backward branch containing every
 anchor, because a largest-loop search finds the epilogue, a long unrolled store chain.
 
@@ -34,10 +35,13 @@ anchor, because a largest-loop search finds the epilogue, a long unrolled store 
 | `graphrate.hip` | what a dispatch costs the host to submit, and what capturing a fixed sequence saves |
 | `launchreg.hip` + `launchreg_lib.hip` | whether a launch costs more when the module registers more kernels, and what crossing into a `.so` costs |
 | `blockcopy.hip` | contiguous versus scattered device-to-host copy, at KV-block granularity |
+| `wmmapeak.hip` | sustained fp8, iu8 and bf16 WMMA TFLOP/s at the card's clock and power limit, with the sclk, power and temperature it ran at |
+| `wmmamix.hip` | what a VALU instruction, an LDS read and an LDS write cost next to fp8 WMMA, and LDS bandwidth per CU |
 
 Each script's header states its traps and how to read its output. The microbenchmarks are built by
 hand: `clang++ -x hip -O3 -std=c++17 --offload-arch=gfx1201 <name>.hip -o <name>` for `isarate`,
-`graphrate` and `blockcopy`, and `build_launchreg.sh` for the two-object launchreg pair.
+`graphrate`, `blockcopy`, `wmmapeak` and `wmmamix`, and `build_launchreg.sh` for the two-object
+launchreg pair.
 
 ## Instruction slot cost on gfx1201
 
@@ -61,6 +65,39 @@ about a percent under the same cut. Use the model to rule a lever out, not to pr
 gfx1201 has no dense 16x16x32 fp8 WMMA (`llvm-mc -mcpu=gfx1201` rejects it). The only 32-deep fp8
 form is `v_swmmac_f32_16x16x32_fp8_fp8`, the 2:4 sparse one, so the GEMMs here already use the
 widest dense op there is.
+
+## Sustained WMMA rate, and what the rest of a K loop costs
+
+`wmmapeak.hip` measures the ceiling a GEMM is held against: random operands rotating through eight
+fragments, every block resident, eight seconds after eight of warm-up. At the 300 W limit, with
+three blocks a WGP (the occupancy of the prefill tiles):
+
+| op | TFLOP/s | sclk | per CU per clock |
+|---|---|---|---|
+| `v_wmma_f32_16x16x16_fp8_fp8` | 330 | 2536 MHz | 2037 FLOP (8 clocks a WMMA a SIMD) |
+| `v_wmma_i32_16x16x16_iu8` | 334 | 2561 MHz | 2038 |
+| `v_wmma_f32_16x16x16_bf16` | 170 | 2703 MHz | 984 (16 clocks) |
+
+The power limit, not issue, sets these: with zero operands the same fp8 loop runs 418 TFLOP/s at
+3.25 GHz, so how hard the multipliers switch is most of the power, and a GEMM timed on constant
+operands reads fast (the fp8 prefill tile: 262 TFLOP/s on `--perfw8`'s 0x38 fill, 205 on random
+codes; `--perfvideo` fills random ones). At full occupancy the fp8 run sometimes
+settles at 260-270 TFLOP/s with hwmon reporting 2.8 GHz, a state in which the reported clock
+overstates the delivered one; quote the three-blocks figure.
+
+`wmmamix.hip` adds one kind of instruction at a time to eight independent WMMA chains a wave. With
+zero operands (the clock is then real), against 8.36 SIMD clocks a WMMA at six waves a SIMD:
+
+- a VALU instruction costs 1.05-1.4 SIMD clocks, serial with the WMMA (8 adds per 8 WMMA: 9.63
+  clocks a WMMA; 64: 16.7). A fold's arithmetic does not hide under the matrix work; VOPD pairs
+  are the only way to halve it.
+- LDS serves 64 bytes a clock per CU, loads and stores alike (32 `ds_load_b64` or 16
+  `ds_load_b128` per 8 WMMA: 31.5 clocks a WMMA). At the WMMA rate that is 256 bytes of LDS per
+  fp8 WMMA and 512 per bf16 one. Below the limit a load costs about a clock of issue.
+- nine fragment reads and two staging stores per 8 WMMA (a 1 x 8 tile staging both operands)
+  run at 73% with nothing else in the loop; four and one at 90%.
+- one dependent chain a wave runs as fast as eight at six waves a SIMD (96%); occupancy moves the
+  rate from 94% (four waves) to 98% (twelve).
 
 ## The profiler
 

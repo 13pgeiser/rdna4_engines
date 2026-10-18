@@ -914,6 +914,98 @@ TEST(raw_operand_carries_the_pointer_and_refuses_an_offset) {
     CHECK(std::strstr(f.ctx.step_error(), "no dtype") != nullptr);
 }
 
+/* Runtime LoRA's issue chain (Ctx::issue_lora): a gemm that is a LoRA site is followed by
+ * lora_shrink and lora_expand over its own activation, output and rows, but only on a step that
+ * has an adapter row (RadBatch::lora_slot non-null). A step without one, or a draft pass, issues
+ * the gemm alone, the pass an engine without adapters runs; an encoder pass reaching a site is
+ * refused by name. */
+static int k_gemm  (const RadArgs* a, RadStream s) { return record("gemm",   a, s); }
+static int k_shrink(const RadArgs* a, RadStream s) { return record("shrink", a, s); }
+static int k_expand(const RadArgs* a, RadStream s) { return record("expand", a, s); }
+
+TEST(adapter_ops_follow_a_lora_site_only_on_a_step_with_an_adapter_row) {
+    Fixture f;
+    const rad_weight w = f.add_weight("blk.0.w", RAD_BF16, 8, 4, g_weight_bytes);
+    const rad_buf x  = f.add_buffer("x", RAD_BF16, 16, 4, 0);
+    const rad_buf y  = f.add_buffer("y", RAD_BF16, 16, 8, 256);
+    const rad_buf pa = f.add_buffer("lora.a", RAD_BF16, 2, 16, 1024);    /* [S, R * K] */
+    const rad_buf pb = f.add_buffer("lora.b", RAD_BF16, 2, 32, 1280);    /* [S, N * R] */
+    const rad_buf ps = f.add_buffer("lora.scale", RAD_F32, 2, 8, 1536);
+    const rad_buf t0 = f.add_buffer("lora.t0", RAD_F32, 16, 4, 2048);
+    const rad_buf t1 = f.add_buffer("lora.t1", RAD_F32, 16, 4, 2304);
+    const rad_op g  = f.add_op("gemm_nt", "M", { 64 }, { k_gemm }, { "gemm" }, &g_gemm_schema, { w });
+    const rad_op sh = f.add_op("lora_shrink", "M", { 64 }, { k_shrink }, { "shrink" }, nullptr, {});
+    const rad_op ex = f.add_op("lora_expand", "M", { 64 }, { k_expand }, { "expand" }, nullptr, {});
+    f.P.ops[g].lora_site = 0;
+    f.P.ops[sh].anchor = (int32_t)g;
+    f.P.ops[ex].anchor = (int32_t)g;
+    rad::LoraIssueSite site;
+    site.gemm = g; site.shrink = sh; site.expand = ex;
+    site.opd_a = 0; site.opd_y = 2;
+    site.a_dtype = RAD_BF16; site.y_dtype = RAD_BF16;
+    site.pool = 0; site.t = 0;
+    site.R = 4; site.K = 4; site.N = 8;
+    f.P.lora_sites.push_back(site);
+    rad::LoraPool pool;
+    pool.weight = "blk.0.w";
+    pool.a = pa; pool.b = pb; pool.scale = ps;
+    pool.R = 4; pool.K = 4; pool.N = 8; pool.S = 2;
+    f.P.lora_pools.push_back(pool);
+    rad::LoraScratch scr;
+    scr.R = 4;
+    scr.lane[0] = t0; scr.lane[1] = t1;
+    f.P.lora_t.push_back(scr);
+    CHECK_OK(f.start());
+
+    auto body = [&](Ctx& c) {
+        RadOperand opd[3] = { RAD_B(x), RAD_W(w), RAD_B(y) };
+        CHECK_OK(c.issue(g, opd, 3, RAD_N_BATCH));
+    };
+    auto names = [] {
+        std::string s;
+        for (const Rec& r : g_rec) s += std::string(s.empty() ? "" : " ") + r.kernel;
+        return s;
+    };
+
+    /* No adapter row: the gemm alone. */
+    f.batch.lora_slot = nullptr;
+    g_rec.clear();
+    CHECK_OK(f.step(4, 0, body));
+    CHECK_EQ(names(), std::string("gemm"));
+
+    /* An adapter row: the pair behind the gemm, over its activation and its output, each row's
+     * slot read from the step batch. */
+    int32_t slots[4] = { 1, -1, 0, -1 };
+    f.batch.lora_slot = slots;
+    g_rec.clear();
+    CHECK_OK(f.step(4, 1, body));
+    REQUIRE_EQ(names(), std::string("gemm shrink expand"));
+    CHECK(g_rec[1].t[0].data == g_rec[0].t[0].data);     /* shrink reads the gemm's x */
+    CHECK(g_rec[1].t[2].data == (void*)slots);
+    CHECK_EQ(g_rec[1].t[2].shape[0], (int64_t)4);
+    CHECK(g_rec[2].t[4].data == g_rec[0].t[2].data);     /* expand adds into the gemm's y */
+    CHECK(g_rec[2].t[0].data == g_rec[1].t[4].data);     /* over shrink's t */
+    CHECK_EQ(g_rec[1].t[4].shape[0], (int64_t)4);        /* t holds the step's rows */
+
+    /* A draft pass runs the base weights: the gemm alone. */
+    f.batch.draft_pass = 1;
+    g_rec.clear();
+    CHECK_OK(f.step(4, 2, body));
+    CHECK_EQ(names(), std::string("gemm"));
+    f.batch.draft_pass = 0;
+
+    /* An encoder pass never reaches a site; one that does is refused, not run without its delta. */
+    f.batch.enc = 1;
+    g_rec.clear();
+    const int s = f.step(4, 3, [&](Ctx& c) {
+        RadOperand opd[3] = { RAD_B(x), RAD_W(w), RAD_B(y) };
+        c.issue(g, opd, 3, RAD_N_BATCH);
+    });
+    CHECK_EQ(s, RAD_E_UNSUPPORTED);
+    CHECK(std::strstr(f.ctx.step_error(), "encoder or generator pass") != nullptr);
+    CHECK_EQ(names(), std::string("gemm"));
+}
+
 /* Site is a property of the weights (spec §5.1). A domain with no kernel in some band is refused,
  * naming the op and band: the planner was told at declare which sites are unavailable, so asking
  * anyway is a planner bug. */

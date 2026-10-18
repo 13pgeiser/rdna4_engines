@@ -7,6 +7,8 @@
 #include "engine_priv.h"
 #include "engine_hostmem.h"
 #include "gen/driver.h"
+#include "gen/audio_driver.h"
+#include "gen/video_driver.h"
 
 #include "build/startup.h"
 #include "build/rad_build.h"
@@ -205,12 +207,27 @@ static int64_t meminfo_bytes(const char* key) {
     return -1;
 }
 
+/* The amdgpu driver's cap on the memory every process together pins: RAM less 1/64 and 1.5 GiB
+ * (half of RAM less 1/64 below 3 GiB), unless amdgpu.no_system_mem_limit lifts it;
+ * ttm.pages_limit does not apply. -1 when lifted (`*lifted` set) or MemTotal is unreadable. */
+static int64_t amdgpu_pin_cap(bool* lifted) {
+    {
+        std::ifstream f("/sys/module/amdgpu/parameters/no_system_mem_limit");
+        std::string v;
+        *lifted = (f >> v) && (v == "Y" || v == "1");
+    }
+    const int64_t total = meminfo_bytes("MemTotal");
+    if (*lifted || total <= 0) return -1;
+    const int64_t reserve = (int64_t)3 << 29;
+    const int64_t cap = total - (total >> 6);
+    return cap < 2 * reserve ? cap >> 1 : cap - reserve;
+}
+
 /* Explain a refused pool allocation from the machine's current state.
  *
  * A card pool refused after the budget was measured (once, before any rank allocates) usually
- * lost the memory to another process. A host pool is pinned, once per rank. Pinned memory counts
- * against amdgpu's system-wide cap: RAM less 1/64 and 1.5 GiB (half of RAM less 1/64 below
- * 3 GiB), unless amdgpu.no_system_mem_limit lifts it; ttm.pages_limit does not apply. */
+ * lost the memory to another process. A host pool is pinned, once per rank, and counts against
+ * amdgpu_pin_cap. */
 static void report_pool_refusal(int rank, int device, const Pools& pools, const Config& cfg) {
     bool card = false, host = false;
     for (const Shortfall& f : pools.shortfalls()) (f.pool == "host_pool" ? host : card) = true;
@@ -226,19 +243,9 @@ static void report_pool_refusal(int rank, int device, const Pools& pools, const 
         int64_t pinned = 0, mapped = 0;
         rad_dev_alloc_totals(RAD_MEM_HOST_PINNED, &pinned, nullptr);
         rad_dev_alloc_totals(RAD_MEM_HOST_MAPPED, &mapped, nullptr);
-        const int64_t total = meminfo_bytes("MemTotal"), avail = meminfo_bytes("MemAvailable");
+        const int64_t avail = meminfo_bytes("MemAvailable");
         bool lifted = false;
-        {
-            std::ifstream f("/sys/module/amdgpu/parameters/no_system_mem_limit");
-            std::string v;
-            lifted = (f >> v) && (v == "Y" || v == "1");
-        }
-        const int64_t reserve = (int64_t)3 << 29;
-        int64_t cap = -1;
-        if (total > 0 && !lifted) {
-            cap = total - (total >> 6);
-            cap = cap < 2 * reserve ? cap >> 1 : cap - reserve;
-        }
+        const int64_t cap = amdgpu_pin_cap(&lifted);
         /* With room under both limits the refusal is not about size; do not advise shrinking. */
         const int64_t pool = cfg.host_pool_total_mib() * 1024 * 1024;
         std::string tables, advice = "Lower --host-pool-mib";
@@ -272,6 +279,34 @@ static void report_pool_refusal(int rank, int device, const Pools& pools, const 
  * load's staging windows, and the page cache holding the container's hot pages. Without it the
  * kernel reclaims the files the engine reads, then the OOM killer runs. */
 static const int64_t kLockMargin = (int64_t)4 << 30;
+
+/* Every level of every memory cgroup the process is in, leaf first: `visit(dir, room)` until it
+ * returns false (cgroup_levels). /proc/self/cgroup reads "0::/path" on v2 and "N:memory:/path"
+ * (or a comma list naming memory) on v1; each level up to the visible root is a limit of its
+ * own. */
+static void memory_cgroups(const std::function<bool(const std::string&, int64_t)>& visit) {
+    std::ifstream f("/proc/self/cgroup");
+    std::string line;
+    bool go = true;
+    while (go && std::getline(f, line)) {
+        const size_t a = line.find(':'), b = a == std::string::npos ? a : line.find(':', a + 1);
+        if (b == std::string::npos) continue;
+        const std::string ctrl = line.substr(a + 1, b - a - 1);
+        std::string path = line.substr(b + 1);
+        const bool v2 = ctrl.empty();
+        bool memory = v2;
+        for (size_t i = 0; !memory && i < ctrl.size();) {
+            const size_t j = std::min(ctrl.find(',', i), ctrl.size());
+            memory = ctrl.compare(i, j - i, "memory") == 0;
+            i = j + 1;
+        }
+        if (!memory) continue;
+        const std::string root = v2 ? "/sys/fs/cgroup" : "/sys/fs/cgroup/memory";
+        cgroup_levels(root, path, v2, [&](const std::string& dir, int64_t room) {
+            return go = visit(dir, room);
+        });
+    }
+}
 
 /* Whether `need` more bytes fit in host memory after `still` more this process will allocate
  * first, or why not. Checks MemAvailable; every memory cgroup from the process's own up to the
@@ -307,37 +342,39 @@ static bool lockable_room(int64_t need, int64_t still, bool mlocks, std::string*
                    humanb(kLockMargin).c_str());
         return false;
     }
-    /* /proc/self/cgroup: "0::/path" on v2, "N:memory:/path" (or a comma list naming memory) on v1.
-     * Each level up to the visible root is a separate limit. */
-    std::ifstream f("/proc/self/cgroup");
-    std::string line;
-    while (std::getline(f, line)) {
-        const size_t a = line.find(':'), b = a == std::string::npos ? a : line.find(':', a + 1);
-        if (b == std::string::npos) continue;
-        const std::string ctrl = line.substr(a + 1, b - a - 1);
-        std::string path = line.substr(b + 1);
-        const bool v2 = ctrl.empty();
-        bool memory = v2;
-        for (size_t i = 0; !memory && i < ctrl.size();) {
-            const size_t j = std::min(ctrl.find(',', i), ctrl.size());
-            memory = ctrl.compare(i, j - i, "memory") == 0;
-            i = j + 1;
-        }
-        if (!memory) continue;
-        const std::string root = v2 ? "/sys/fs/cgroup" : "/sys/fs/cgroup/memory";
-        bool fits = true;
-        cgroup_levels(root, path, v2, [&](const std::string& dir, int64_t room) {
-            if (room - still - kLockMargin >= need) return true;
-            *why = fmt("the memory cgroup at %s leaves %s, %s more is still to be allocated, "
-                       "and this wants %s with %s to spare", dir.c_str(),
-                       humanb(room).c_str(), humanb(still).c_str(), humanb(need).c_str(),
-                       humanb(kLockMargin).c_str());
-            fits = false;
-            return false;
-        });
-        if (!fits) return false;
+    bool fits = true;
+    memory_cgroups([&](const std::string& dir, int64_t room) {
+        if (room - still - kLockMargin >= need) return true;
+        *why = fmt("the memory cgroup at %s leaves %s, %s more is still to be allocated, "
+                   "and this wants %s with %s to spare", dir.c_str(),
+                   humanb(room).c_str(), humanb(still).c_str(), humanb(need).c_str(),
+                   humanb(kLockMargin).c_str());
+        fits = false;
+        return false;
+    });
+    return fits;
+}
+
+/* The most lockable_room(need, still, false) admits, and in `limit` the bound that decides it.
+ * INT64_MAX when no limit can be read. */
+static int64_t lockable_bytes(int64_t still, std::string* limit) {
+    int64_t most = INT64_MAX;
+    *limit = "no readable memory limit";
+    if (const int64_t avail = meminfo_bytes("MemAvailable"); avail >= 0) {
+        most = avail - still - kLockMargin;
+        *limit = fmt("%s of memory available, less %s still to be allocated and %s to spare",
+                     humanb(avail).c_str(), humanb(still).c_str(), humanb(kLockMargin).c_str());
     }
-    return true;
+    memory_cgroups([&](const std::string& dir, int64_t room) {
+        if (room - still - kLockMargin < most) {
+            most = room - still - kLockMargin;
+            *limit = fmt("the memory cgroup at %s, which leaves %s, less %s still to be allocated "
+                         "and %s to spare", dir.c_str(), humanb(room).c_str(),
+                         humanb(still).c_str(), humanb(kLockMargin).c_str());
+        }
+        return true;
+    });
+    return std::max<int64_t>(most, 0);
 }
 
 /* The copy is table_copy_make's (core/format/table_copy.h), or for a card, table_copy_fill into
@@ -878,7 +915,47 @@ int Engine::declare() {
     {
         RadArchProbe pb{};
         (void)rad_tools_probe(plugins_, meta_, &pb);
-        if (pb.gen_rows > 0) {
+        if (pb.gen_rows > 0 && pb.gen_audio) {
+            if (!cfg_.given.count("--max-num-batched-tokens")) {
+                cfg_.max_tok = pb.gen_rows;
+                decide("--max-num-batched-tokens", std::to_string(cfg_.max_tok),
+                       "an audio generator: a window's denoising step, both branches, and a "
+                       "prompt chunk of half as many rows a branch");
+            }
+            if (!cfg_.given.count("--max-num-seqs")) {
+                cfg_.max_seqs = 8;
+                decide("--max-num-seqs", "8", "an audio generator: four requests at once, two "
+                       "branches each");
+            }
+            if (!cfg_.given.count("--max-model-len") && cfg_.max_ctx == 0) {
+                cfg_.max_ctx = pb.gen_ctx > 0 ? pb.gen_ctx : pb.gen_rows;
+                decide("--max-model-len", std::to_string(cfg_.max_ctx),
+                       "an audio generator: the longest prompt and every frame of the longest "
+                       "piece");
+            }
+            if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
+            if (cfg_.n_spec < 0) cfg_.n_spec = 0;
+            cfg_.prefix_cache = false;
+        } else if (pb.gen_rows > 0 && pb.gen_video) {
+            if (!cfg_.given.count("--max-num-batched-tokens")) {
+                cfg_.max_tok = pb.gen_rows;
+                decide("--max-num-batched-tokens", std::to_string(cfg_.max_tok),
+                       "a video generator: a denoising step carries the prompt, the soundtrack "
+                       "and every patch of the largest, longest video");
+            }
+            if (!cfg_.given.count("--max-num-seqs")) {
+                cfg_.max_seqs = 1;
+                decide("--max-num-seqs", "1", "a video generator: a pass is one request's");
+            }
+            if (!cfg_.given.count("--max-model-len") && cfg_.max_ctx == 0) {
+                cfg_.max_ctx = pb.gen_rows;
+                decide("--max-model-len", std::to_string(cfg_.max_ctx),
+                       "a video generator: a step's rows");
+            }
+            if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
+            if (cfg_.n_spec < 0) cfg_.n_spec = 0;
+            cfg_.prefix_cache = false;
+        } else if (pb.gen_rows > 0) {
             if (!cfg_.given.count("--max-num-batched-tokens")) {
                 cfg_.max_tok = pb.gen_rows;
                 decide("--max-num-batched-tokens", std::to_string(cfg_.max_tok),
@@ -1308,8 +1385,10 @@ int Engine::plan() {
                 const int64_t w = probe.state_index_width((int32_t)i);
                 if (w > 0) kg.g[i].sidx_width = w;
             }
-            f.staging = r->program.is_generator() ? gen::Driver::device_bytes(r->program)
-                                                  : BatchBuilder::device_bytes(r->program, cfg_, kg);
+            f.staging = r->program.is_generator()       ? gen::Driver::device_bytes(r->program)
+                      : r->program.is_audio_generator() ? gen::AudioDriver::device_bytes(r->program)
+                      : r->program.is_video_generator() ? gen::VideoDriver::device_bytes(r->program)
+                                                        : BatchBuilder::device_bytes(r->program, cfg_, kg);
             if (f.staging < 0) return RAD_E_INVAL;
             late_step_bytes_ = std::max(late_step_bytes_, f.staging);
             int64_t lazy = r->program.scratch_regions > 1 ? f.queue_bytes : 0;
@@ -1343,8 +1422,12 @@ int Engine::plan() {
             facts[i].expert_floor = expert_vram_floor(wfs[i], std::max<int64_t>(room, 0));
         }
         /* Capped well below overflow, so the sums it joins stay defined: a store that large is
-         * refused by name in configure_kv. */
-        const int64_t ck_n = std::max<int64_t>(cfg_.checkpoint_slots, 0), ck_cap = INT64_MAX / 8;
+         * refused by name in configure_kv. Under --checkpoint-slots auto the store is sized in
+         * configure_kv from the memory the tables leave, and the tables leave room for the fewest
+         * slots auto resolves to. */
+        const int64_t ck_n =
+            cfg_.checkpoint_slots < 0 ? kCheckpointSlotsFloor : cfg_.checkpoint_slots;
+        const int64_t ck_cap = INT64_MAX / 8;
         const int64_t ck_store = !cfg_.prefix_cache || ck_slot <= 0 ? 0
                                  : ck_n > ck_cap / ck_slot ? ck_cap : ck_slot * ck_n;
         RAD_TRY(resolve_table_placement(facts, emb_bytes, wfs, kv_floor, ngram_bytes,
@@ -2658,6 +2741,79 @@ int Engine::load_weights() {
  *
  * Runs after load, since it takes what the weight pool left, and before Ctx::init, which would
  * otherwise resolve every RAD_OPK_KV operand to null. */
+/* --checkpoint-slots auto, resolved into cfg_.checkpoint_slots once a slot's size is known
+ * (checkpoint_slots_auto in core/mem/prefix.h). The store is pinned for the life of the process,
+ * so it takes at most an eighth of host memory, leaving the rest to the page cache a model's
+ * mapped tables read through and to the host's other work. It is pinned before the host
+ * activation arenas and the prefix cache's host tier, so their bytes count as still to come;
+ * on a card the amdgpu pin cap bounds it too. */
+int Engine::size_checkpoint_store(int64_t slot, const char* what) {
+    if (slot <= 0 || !cfg_.prefix_cache) {
+        cfg_.checkpoint_slots = 0;
+        decide("--checkpoint-slots", "0",
+               slot <= 0 ? "the model keeps no linear or sliding-window state to snapshot"
+                         : "prefix caching is off (--no-prefix-cache)");
+        return RAD_OK;
+    }
+    const int64_t ctx = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
+    const int64_t interval = geo_.checkpoint_interval;
+    const std::unique_ptr<CheckpointPolicy> pol =
+        make_checkpoint_policy(cfg_.checkpoint_policy, interval);
+
+    int64_t still = cfg_.prefix_cache_mib * ((int64_t)1 << 20);
+    for (const auto& r : ranks_) still += arena_host_bytes(r->program);
+    std::string limit;
+    int64_t room = lockable_bytes(still, &limit);
+    if (!device_is_host()) {
+        bool lifted = false;
+        if (const int64_t cap = amdgpu_pin_cap(&lifted); cap > 0) {
+            int64_t pinned = 0, mapped = 0;
+            rad_dev_alloc_totals(RAD_MEM_HOST_PINNED, &pinned, nullptr);
+            rad_dev_alloc_totals(RAD_MEM_HOST_MAPPED, &mapped, nullptr);
+            const int64_t left = std::max<int64_t>(cap - pinned - mapped - still, 0);
+            if (left < room) {
+                room = left;
+                limit = fmt("the amdgpu driver's pin cap of %s, of which this process holds %s "
+                            "and still pins %s", humanb(cap).c_str(),
+                            humanb(pinned + mapped).c_str(), humanb(still).c_str());
+            }
+        }
+    }
+    const int64_t total = meminfo_bytes("MemTotal");
+    const int64_t share = total > 0 ? total / 8 : room;
+    const CheckpointSlots c = checkpoint_slots_auto(*pol, cfg_.max_seqs, ctx, interval, slot,
+                                                    share, room);
+    cfg_.checkpoint_slots = c.slots;
+
+    const std::string need =
+        fmt("%lld a sequence for --max-num-seqs %lld: %s keeps %lld for a %lld-token session at "
+            "a %lld-token interval, and one more for a running turn", (long long)c.per_seq,
+            (long long)cfg_.max_seqs, pol->name(), (long long)(c.per_seq - 1), (long long)ctx,
+            (long long)interval);
+    std::string bound;
+    if (c.bound == CheckpointSlots::Bound::Share)
+        bound = fmt("; %lld wanted, held to an eighth of host memory (%s); --checkpoint-slots N "
+                    "sets more", (long long)c.want, humanb(share).c_str());
+    else if (c.bound == CheckpointSlots::Bound::Room)
+        bound = fmt("; %lld wanted, held to what the host can pin: %s", (long long)c.want,
+                    limit.c_str());
+    decide("--checkpoint-slots", std::to_string(c.slots), need + bound);
+    if (c.slots == 0) {
+        RAD_WARN("checkpoint slots: auto finds no room for one %s snapshot of %s (%s), so every "
+                 "prefix hit on this model prefills from the start. Free host memory, or lower "
+                 "--host-pool-mib or --prefix-cache-mib", what, humanb(slot).c_str(),
+                 limit.c_str());
+        return RAD_OK;
+    }
+    const std::string line =
+        fmt("checkpoint slots: auto: %lld %s snapshot(s) of %s in pinned host memory (%s), none of "
+            "it on the card; %s%s", (long long)c.slots, what, humanb(slot).c_str(),
+            humanb(slot * c.slots).c_str(), need.c_str(), bound.c_str());
+    if (c.bound == CheckpointSlots::Bound::Room) RAD_WARN("%s", line.c_str());
+    else RAD_INFO("%s", line.c_str());
+    return RAD_OK;
+}
+
 int Engine::configure_kv() {
     /* Resolved once, for the cache below and Scheduler::init later (see Engine::geo_). */
     RAD_TRY(chunk_geometry_resolve(ranks_[0]->program, cfg_, &geo_));
@@ -2726,9 +2882,11 @@ int Engine::configure_kv() {
             shard_off[i] = slot;
             slot += ranks_[i]->kv.checkpoint_bytes();
         }
-        const int64_t n = cfg_.checkpoint_slots > 0 ? cfg_.checkpoint_slots : 0;
         /* A slot holds linear state or a trunk's window, never both (KVGroupPlan::win_snap). */
         const char* what = ranks_[0]->kv.has_window_snapshot() ? "sliding-window" : "linear-state";
+        const bool sized_auto = cfg_.checkpoint_slots < 0;
+        if (sized_auto) RAD_TRY(size_checkpoint_store(slot, what));
+        const int64_t n = cfg_.checkpoint_slots > 0 ? cfg_.checkpoint_slots : 0;
         if (slot > 0 && n > 0 && cfg_.prefix_cache) {
             /* Pinned all at once and outside every pool. A store larger than the memory left would
              * push the process into reclaim, which stalls it without a word; one that cannot be had
@@ -2736,13 +2894,14 @@ int Engine::configure_kv() {
              * makes visible. Either stops startup. */
             const bool sized = n <= INT64_MAX / slot;
             auto refuse = [&](const std::string& reason) {
-                RAD_ERR("checkpoint slots: %lld %s snapshot(s) of %s are %s of pinned host memory, "
-                        "which %s. Lower --checkpoint-slots (a larger --checkpoint-interval needs "
-                        "fewer for the same context), or pass --checkpoint-slots 0 to serve with "
-                        "no %s snapshot, every prefix hit on this model then prefilling from the "
-                        "start", (long long)n, what, humanb(slot).c_str(),
-                        sized ? humanb(slot * n).c_str() : "more than 8 EiB", reason.c_str(),
-                        what);
+                RAD_ERR("checkpoint slots: %lld %s snapshot(s)%s of %s are %s of pinned host "
+                        "memory, which %s. Lower --checkpoint-slots (a larger "
+                        "--checkpoint-interval needs fewer for the same context), or pass "
+                        "--checkpoint-slots 0 to serve with no %s snapshot, every prefix hit on "
+                        "this model then prefilling from the start", (long long)n, what,
+                        sized_auto ? " (auto)" : "",
+                        humanb(slot).c_str(), sized ? humanb(slot * n).c_str() : "more than 8 EiB",
+                        reason.c_str(), what);
                 return RAD_E_NOMEM;
             };
             if (!sized) return refuse("no host has");
@@ -2750,10 +2909,11 @@ int Engine::configure_kv() {
             if (!lockable_room(slot * n, 0, false, &why)) return refuse("does not fit: " + why);
             if (ck_store_.open(slot, slot * n) != RAD_OK)
                 return refuse(std::string("the host did not pin: ") + rad_dev_last_error());
-            RAD_INFO("checkpoint slots: %lld %s snapshot(s) of %s in pinned host memory (%s), "
-                     "none of it on the card", (long long)n, what, humanb(slot).c_str(),
-                     humanb(ck_store_.cap_bytes()).c_str());
-        } else if (slot > 0 && cfg_.prefix_cache) {
+            if (!sized_auto)
+                RAD_INFO("checkpoint slots: %lld %s snapshot(s) of %s in pinned host memory (%s), "
+                         "none of it on the card", (long long)n, what, humanb(slot).c_str(),
+                         humanb(ck_store_.cap_bytes()).c_str());
+        } else if (slot > 0 && cfg_.prefix_cache && !sized_auto) {
             RAD_INFO("checkpoint slots: --checkpoint-slots 0 keeps no %s snapshot, so every "
                      "prefix hit on this model prefills from the start", what);
         }
@@ -2911,6 +3071,14 @@ int Engine::configure_kv() {
              *
              * For an image generator the sequence is a conditioning, which its driver refuses at
              * admission; warn in those terms. */
+            if (ranks_[0]->program.is_audio_generator()) {
+                RAD_WARN("kv group '%s' holds %lld rows: a request needs its prompt and every "
+                         "frame it may make, both branches, up to %lld rows a branch, so a long "
+                         "piece is refused at once rather than cut short. Ask for shorter "
+                         "pieces, use --kv-cache-dtype fp8, or add ranks.",
+                         p->name.c_str(), (long long)cap, (long long)want);
+                continue;
+            }
             if (ranks_[0]->program.is_generator()) {
                 RAD_WARN("kv group '%s' holds %lld rows: a conditioning longer than that -- a "
                          "prompt with its pictures, up to %lld rows -- is refused. A picture "
@@ -3139,8 +3307,8 @@ int Engine::start() {
         }
 
     }
-    /* RUNTIME LoRA: the startup adapters, copied into their slots now that every rank's pools have
-     * an address and before any step can read them. */
+    /* Runtime LoRA: the startup adapters, copied into their slots now that every rank's pools
+     * have an address and before any step can read them. */
     RAD_TRY(lora_start());
 
     /* ---- the loan: the cache's idle blocks, lent to the expert slab in place -----------------

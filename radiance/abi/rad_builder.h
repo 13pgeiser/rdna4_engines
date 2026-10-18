@@ -395,7 +395,8 @@ int rad_op_declared(RadBuilder* b, const char* op);
 /* The plugin owns the map from checkpoint tensor names to declared weight names, including
  * convert-time fusions (q/k/v into one qkv, gate and up into gate_up). It is the only component
  * that knows both sides, and rad-convert reads the map from it (spec §2.4). */
-enum { RAD_MAP_COPY = 0, RAD_MAP_CONCAT = 1 };
+enum { RAD_MAP_COPY = 0, RAD_MAP_CONCAT = 1, RAD_MAP_WNORM = 2, RAD_MAP_ROWS = 3,
+       RAD_MAP_TRANSPOSE = 4, RAD_MAP_EMA = 5 };
 
 typedef struct RadNameMap {
     const char* declared;        /* the name given to rad_decl_weight */
@@ -409,12 +410,37 @@ typedef struct RadNameMap {
      * declared weight per expert; this carries the expert index so rad-convert need not parse it
      * out of the declared name. */
     int         src_index[8];
+
+    /* RAD_MAP_ROWS only: piece i is rows [src_index[i], src_index[i] + src_rows[i]) of the 2-D (or
+     * higher, rows along dim 0) tensor src[i]; the pieces join along dim 0. */
+    int64_t     src_rows[8];
 } RadNameMap;
 
 /* RAD_MAP_COPY with n_src > 1: the first source present in the container wins. This expresses a
  * tied lm_head (output.weight if present, else token_embd.weight), so one plugin covers family
  * members that differ only in tying. RAD_MAP_CONCAT with n_src > 1 concatenates all sources along
- * concat_dim and requires every one. */
+ * concat_dim and requires every one.
+ *
+ * RAD_MAP_WNORM folds a weight-normalised tensor (torch.nn.utils.weight_norm) into the plain
+ * weight it stands for: src[0] is the magnitude `weight_g` ([d0, 1, ...]), src[1] the direction
+ * `weight_v` ([d0, ...]), and the result is g * v / ||v||, the norm taken over every dimension but
+ * the first. Folded in f32 and stored as the recipe says. A model that applies the
+ * parametrisation at every forward computes the same weight each time; doing it once at convert
+ * leaves the plugin an ordinary weight.
+ *
+ * RAD_MAP_ROWS keeps only row ranges of its sources (see src_rows), joined: a head read over a
+ * fraction of a vocabulary (an audio model's codes, a few rows of a text model's 200K) stores that
+ * fraction rather than the whole table.
+ *
+ * RAD_MAP_TRANSPOSE swaps the last two dimensions of src[0] in each leading slice, [.., a, b] to
+ * [.., b, a]: a linear a checkpoint keeps as (in, out), where the GEMMs read (out, in).
+ *
+ * RAD_MAP_EMA is an exponential-moving-average codebook as EnCodec-style quantisers keep it: src[0]
+ * the embedding sums [bins, ...], src[1] the cluster usage [bins], and the codebook is each row
+ * divided by max(usage, 1e-5), in f32. Successive EMA maps for one name stack their codebooks
+ * along dim 0, as CONCAT maps extend (a residual quantiser's codebooks as one table).
+ *
+ * TRANSPOSE and EMA are computed at convert in f32, like WNORM, and stored as the recipe says. */
 
 int rad_decl_name_map(RadBuilder* b, const RadNameMap* m);
 
@@ -580,7 +606,7 @@ int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d);
  *                         against its conditioning's KV.
  *   RAD_GEN_PASS_DECODE   one image's latent to pixels, in `image_out`, which the core reads back.
  *
- * A program declares exactly one of this, logits or pooled vectors.
+ * A program declares exactly one of this, the other generators, logits or pooled vectors.
  *
  * The fields are the model's contract with a client: the prompt it was trained on, the sizes it
  * makes, its sampler's schedule. The core turns a request into passes from them without naming
@@ -662,6 +688,202 @@ typedef struct RadGeneratorDecl {
 
 int rad_declare_generator(RadBuilder* b, const RadGeneratorDecl* d);
 
+/* ================================================================== the audio generator */
+/* A program that makes audio from text: an autoregressive language model writes the piece frame by
+ * frame, with classifier-free guidance (each request runs a conditional and an unconditional
+ * branch in step), and either a denoiser turns the frames' hidden states into audio latents window
+ * by window, which a vocoder turns into samples, or (`voc_chunk` > 0) a vocoder plays the frames
+ * themselves a few at a time as they are made. The core drives the passes (RadBatch::gen,
+ * RadAudioGenBatch):
+ *
+ *   RAD_GEN_PASS_PROMPT  the prompt of one or more requests, both branches, as an ordinary causal
+ *                        prefill into the KV group: two sequences a request, the conditional one
+ *                        first. A long prompt takes several passes, each a chunk of both branches,
+ *                        unless the declaration asks for whole prompts (`prompt_whole`). The pass
+ *                        that ends a prompt leaves the branches' last hidden states in the
+ *                        request's lane.
+ *   RAD_GEN_PASS_FRAME   one frame of every request in its autoregressive stage: the plugin samples
+ *                        the frame from the lane's last hidden states, keeps what the denoiser
+ *                        conditions on, and runs the language model over the frame's embedding
+ *                        (one row a branch, appended to that branch's KV). It writes `status` for
+ *                        each lane: >= 0 a frame was made, -1 the model ended the piece instead.
+ *   RAD_GEN_PASS_WINDOW  one denoising step of one or more windows, each a run of a request's frames
+ *                        (two entries a window with guidance, conditional and unconditional).
+ *   RAD_GEN_PASS_VOCODE  one finished window's latents to samples, in `audio_out`, which the core
+ *                        reads back; with `voc_chunk`, the frames [voc_frame0, voc_frame0 +
+ *                        voc_latents) of one lane, of which the first `voc_left` are context and
+ *                        only the rest are played.
+ *
+ * Windows overlap: window k covers frames [k win_hop, k win_hop + win_frames) and is stepped once
+ * the language model has made all of them, or ended. A window joins its predecessor through the
+ * latents they share, so a request's windows run in order, and window k + 1 does not start before
+ * window k is vocoded. The last window ends at the last frame; there is a window k >= 1 only while
+ * frames remain past k win_hop + (win_frames - win_hop), so no window is all overlap.
+ *
+ * A program declares exactly one of this, the other generators, logits or pooled vectors. */
+enum { RAD_GEN_PASS_PROMPT = 4, RAD_GEN_PASS_FRAME = 5, RAD_GEN_PASS_WINDOW = 6,
+       RAD_GEN_PASS_VOCODE = 7 };
+
+typedef struct RadAudioGenDecl {
+    const char* name;             /* "minimax-music3" -- the served model id and messages */
+
+    /* The prompt, as text the core tokenises: `{instructions}` is replaced by the request's
+     * instructions (a piece's description, a voice's) and `{input}` by its input text (lyrics, the
+     * words to speak), each first rewritten by the plugin's rad_arch_text_prepare when it exports
+     * one. Special tokens are spelled as text. */
+    const char* tmpl;
+    /* The unconditional branch is the conditional prompt with every token but the first
+     * `neg_keep_head` and the last `neg_keep_tail` replaced by `neg_token`, so the two branches
+     * are the same length and step together. */
+    int32_t     neg_token;
+    int32_t     neg_keep_head, neg_keep_tail;
+    /* The longest prompt in tokens, and the most frames a request makes. */
+    int64_t     max_prompt;
+    int64_t     max_frames;
+    /* frame_rate_num / frame_rate_den frames a second. */
+    int64_t     frame_rate_num, frame_rate_den;
+
+    /* Windows: `win_frames` frames, a new one every `win_hop`. A window of n frames has
+     * floor(n * lat_num / lat_den) latents of `latent_channels`, and each latent is
+     * `samples_per_latent` samples of `channels` channels at `sample_rate`. Where two windows meet,
+     * the earlier one's last `win_crop_right` latents and the later one's first `win_crop_left` are
+     * not played; the first window keeps its start and the last its end. */
+    int64_t     win_frames, win_hop;
+    /* Rows the denoiser puts ahead of a window's latents in each entry of a WINDOW pass (a
+     * timestep token); the core counts them into the pass's rows. */
+    int64_t     win_lead;
+    int64_t     lat_num, lat_den;
+    int64_t     latent_channels;
+    int64_t     win_crop_left, win_crop_right;
+    int64_t     samples_per_latent;
+    int64_t     sample_rate;
+    int64_t     channels;
+
+    /* The denoiser's sampler: `default_steps` Euler steps of flow matching from t = 0 (noise) to
+     * t = 1 (data), t_i = i / steps; guidance `default_cfg` (1 is off), v = u + cfg (c - u). */
+    int64_t     default_steps;
+    double      default_cfg;
+
+    /* `max_lanes` requests may be in flight at once, each in a lane of the plugin's state.
+     * `status` is [>= max_lanes] i32 on the device, indexed by lane (see FRAME above); `audio_out`
+     * is [>= the samples of the longest window, channels] f32 on the device, interleaved, in
+     * [-1, 1]: what a VOCODE pass plays, its crops already applied. */
+    int64_t     max_lanes;
+    rad_buf     status;
+    rad_buf     audio_out;
+
+    /* The prompt of a request without instructions, `{input}` its only slot; NULL makes the
+     * instructions required. */
+    const char* tmpl_plain;
+    /* The unconditional branch's own template, rendered from the request's texts as `tmpl` is;
+     * NULL derives it from the conditional prompt by `neg_token` as above. With it the branches
+     * may differ in length, and a request whose guidance is 1 runs the conditional prompt in both
+     * (the guided logits are then the conditional ones). */
+    const char* neg_tmpl;
+    /* Nonzero: a prompt is never split across PROMPT passes (an encoder that reads it at once);
+     * the pass rows must hold both branches of the longest. Required with `neg_tmpl`. */
+    int32_t     prompt_whole;
+    /* The first frame a request keeps: frames before it only move the model past the prompt. */
+    int32_t     first_frame;
+    /* Nonzero: no denoiser and no windows. The vocoder plays the kept frames as they are made, at
+     * most `voc_chunk` a VOCODE pass, reading `voc_context` frames before them again (and not
+     * playing them) so that a causal vocoder needs no state between passes. A frame is then one
+     * latent: `lat_num` = `lat_den` = 1, `samples_per_latent` samples a frame. */
+    int64_t     voc_chunk;
+    int64_t     voc_context;
+} RadAudioGenDecl;
+
+int rad_declare_audio_generator(RadBuilder* b, const RadAudioGenDecl* d);
+
+/* ================================================================== the video generator */
+/* A program that makes a video and its soundtrack from text: a text encoder reads the prompt, one
+ * denoiser steps a packed sequence holding the prompt's rows, the soundtrack's latents and the
+ * video's latents together (flow matching, one forward a step, no guidance), and two decoders turn
+ * the latents into frames and samples. The core drives the passes (RadBatch::gen,
+ * RadVideoGenBatch), one request a pass:
+ *
+ *   RAD_GEN_PASS_VCOND    the request's prompt, an ordinary non-paged pass over its tokens: the
+ *                         text encoder, and what the denoiser reads of the prompt at every step,
+ *                         into the request's lane. It carries the request's whole schedule, so
+ *                         what depends only on a step's timesteps can be computed once here.
+ *   RAD_GEN_PASS_VSTEP    one denoising step of one lane over the packed sequence
+ *                         [text | audio | video]: the prompt's rows, then the soundtrack's
+ *                         `audio_channels` blocks of latents (channel-major, one row a latent),
+ *                         then the video's patches (frame-major, then row-major). The first step
+ *                         draws the lane's noise.
+ *   RAD_GEN_PASS_ADECODE  the lane's soundtrack to samples in `audio_out`, which the core reads
+ *                         back. Runs once, after the last step.
+ *   RAD_GEN_PASS_VDECODE  one chunk of the lane's video latents to frames in `frames_out`, which
+ *                         the core reads back. Chunks run in order after the soundtrack; each joins
+ *                         its predecessor through state the plugin keeps in the lane.
+ *
+ * Geometry. A video of n chunks has `frames_per_chunk n + frames_tail` frames at
+ * `fps_num / fps_den` a second and `latents_per_chunk n + latents_tail` latent frames, each of
+ * (height / latent_scale) x (width / latent_scale) latents of `latent_channels`; the denoiser
+ * reads them in `patch` x `patch` patches. Chunk c of n is `frames_per_chunk` frames, the last
+ * `frames_per_chunk + frames_tail`. A side is a multiple of `size_multiple` pixels, at least
+ * `min_side`, the area at most `max_area`, and the long side over the short at most `max_aspect`.
+ * The soundtrack has round(frames / fps * audio_rate) latents a channel, each
+ * `sample_rate / audio_rate` samples.
+ *
+ * The rotary positions of a pass's rows are the plugin's (rad_arch_video_positions), which a video
+ * generator must export.
+ *
+ * The sampler: a request's `steps` are sigma grid points, the terminal 0 included, as diffusers'
+ * MiniMax-H3 counts them: sigma_i = shift s / (1 + (shift - 1) s) over s = linspace(1, 0, steps)
+ * in f32 (consecutive duplicates dropped), and a model evaluation at each timestep
+ * t_i = 1 - sigma_i but the last; one schedule for the video (`shift_video`) and one for the
+ * soundtrack (`shift_audio`), stepped together. A few-step (distilled) checkpoint instead declares
+ * the base times it was trained on (`rungs`, below): s = rungs then 0, each taken to f32, the same
+ * shifts applied, and the step count fixed at n_rungs + 1.
+ *
+ * A program declares exactly one of this, the other generators, logits or pooled vectors. */
+enum { RAD_GEN_PASS_VCOND = 8, RAD_GEN_PASS_VSTEP = 9, RAD_GEN_PASS_ADECODE = 10,
+       RAD_GEN_PASS_VDECODE = 11 };
+
+typedef struct RadVideoGenDecl {
+    const char* name;             /* "minimax-h3" -- the served model id and messages */
+
+    /* The prompt as text the core tokenises, `{prompt}` replaced by the request's; special tokens
+     * are spelled as text. No beginning-of-sequence token is added. */
+    const char* tmpl;
+    int64_t     max_text;         /* the longest prompt, in tokens */
+
+    /* Geometry (above). */
+    int64_t     fps_num, fps_den;
+    int64_t     frames_per_chunk, frames_tail;
+    int64_t     latents_per_chunk, latents_tail, dec_latents;
+    int64_t     min_chunks, max_chunks;
+    int64_t     latent_scale, latent_channels, patch;
+    int64_t     size_multiple, min_side, max_area, max_aspect;
+    /* The size and length a request that names none is made at. */
+    int64_t     default_width, default_height, default_chunks;
+
+    /* The soundtrack. */
+    int64_t     sample_rate, audio_rate, audio_channels, audio_latent_channels;
+
+    /* The sampler (above). */
+    int64_t     default_steps, max_steps;
+    double      shift_video, shift_audio;
+
+    /* `max_lanes` requests may hold state at once. `frames_out` is [>= the frames of the largest
+     * chunk, height, width, 3] u8 on the device, the frames a VDECODE pass made, row-major RGB;
+     * `audio_out` is [>= the samples of the longest soundtrack, audio_channels] f32, interleaved,
+     * what an ADECODE pass made. */
+    int64_t     max_lanes;
+    rad_buf     frames_out;
+    rad_buf     audio_out;
+
+    /* A trained schedule when `n_rungs` > 0: base times strictly decreasing in (0, 1] (a
+     * trainer's timesteps over its 1000-step clock), each modality's sigmas their shifts as above.
+     * `default_steps` and `max_steps` are then both n_rungs + 1 and a request may not name another
+     * count. 0 is the linspace schedule. */
+    int32_t       n_rungs;
+    const double* rungs;
+} RadVideoGenDecl;
+
+int rad_declare_video_generator(RadBuilder* b, const RadVideoGenDecl* d);
+
 /* ================================================================== diagnostics */
 /* A plugin may annotate the graph dump. Free-form, printed under --debug-graph. */
 void rad_note(RadBuilder* b, const char* fmt, ...);
@@ -721,15 +943,26 @@ typedef struct RadArchProbe {
      * the engine sizes the audio pass with it (RadBuildCtx::max_audio_frames). 0 is no audio. */
     int64_t audio_frames;
 
-    /* Nonzero for an image generator (rad_declare_generator): the rows its largest pass carries.
-     * The engine sizes the step for it before declare (a denoise pass carries all of an image's
-     * latent rows at once, twice with guidance) and turns off what a generator does not use. 0 is
-     * a program that generates text or embeds. */
+    /* Nonzero for a generator (rad_declare_generator, rad_declare_audio_generator): the rows its
+     * largest pass carries. The engine sizes the step for it before declare (an image's denoise
+     * pass carries all of its latent rows at once, twice with guidance; an audio window's step all
+     * of the window's) and turns off what a generator does not use. 0 is a program that
+     * generates text or embeds. */
     int64_t gen_rows;
     /* The most patches the generator's conditioning pass encodes: every reference picture a
      * request may carry, at the model's resize target. This is the encoder's pass size
      * (max_enc_patches). */
     int64_t gen_patches;
+    /* Nonzero for an audio generator, which the engine sizes before declare as it does an image
+     * generator, with these differences: two sequences a request (its branches), and `gen_ctx`
+     * the longest a sequence grows (the whole prompt and every frame), which is the context the
+     * KV group is sized for. */
+    int32_t gen_audio;
+    int64_t gen_ctx;
+    /* Nonzero for a video generator, which the engine sizes as it does an image generator from
+     * `gen_rows` (its largest pass: a step's packed sequence at the largest size and length). It
+     * keeps no KV. */
+    int32_t gen_video;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);
@@ -899,6 +1132,35 @@ typedef struct RadAudioFormat {
 
 /* Return the format, or NULL when this model serves no speech route. Called once at startup. */
 const RadAudioFormat* rad_arch_audio_format(const RadModelMeta* meta);
+
+/* A request's free text rewritten into the form the model was trained on, before it goes into the
+ * audio generator's prompt template (RadAudioGenDecl::tmpl). Optional: absent, the text goes in
+ * as given. Training data has conventions a client does not know -- section tags on lines of
+ * their own and lower case, no markdown in a description -- and only the plugin knows them.
+ *
+ * `field` is RAD_TEXT_*, `in` NUL-terminated UTF-8. Writes at most `cap` bytes, the NUL included,
+ * and returns the length the whole result needs without its NUL (call again with more room when
+ * it is >= cap), or a negative status for text the model cannot take. Called on HTTP threads, so
+ * it keeps no state. */
+enum { RAD_TEXT_INSTRUCTIONS = 1, RAD_TEXT_INPUT = 2 };
+int64_t rad_arch_text_prepare(int field, const char* in, char* out, int64_t cap);
+
+/* The layout of a video generator's passes (rad_declare_video_generator), which only the model
+ * knows. `which` names the pass: RAD_VPOS_STEP, the packed sequence of every VSTEP pass of a
+ * request of geometry `g` -- its rows, and their rotary positions written to `pos` (f32 [3, rows]
+ * component-major) when it is non-null and `cap` rows hold them; RAD_VPOS_DECODE, the rows of one
+ * of its VDECODE passes, whose positions the plugin makes itself (`pos` is not written). Returns
+ * the rows, or a negative status for a geometry the model cannot take. Called on any thread, so it
+ * keeps no state. Required of a video generator. */
+typedef struct RadVideoGeom {
+    int32_t n_text;               /* the prompt's tokens */
+    int32_t frames;               /* the video's frames */
+    int32_t lat_frames;           /* its latent frames */
+    int32_t lat_h, lat_w;         /* latents a frame, down and across */
+    int32_t n_audio;              /* the soundtrack's latents a channel */
+} RadVideoGeom;
+enum { RAD_VPOS_STEP = 1, RAD_VPOS_DECODE = 2 };
+int64_t rad_arch_video_positions(int which, const RadVideoGeom* g, float* pos, int64_t cap);
 
 int         rad_arch_declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx);
 /* Forward declaration; the signature is in rad_runtime.h. */

@@ -16,6 +16,7 @@
 #include "../libref/ref_common.h"
 #include "rad_sample.h"
 #include "rad_philox.h"
+#include "rad_runtime.h"   /* RAD_VGEOM_* */
 
 #include <algorithm>
 #include <deque>
@@ -262,7 +263,7 @@ TEST(op_vocabulary) {
         "embed_lookup_q", "cast",
         "scale_rows",
         "softmax",
-        "quant_act_i8", "quant_act_i8g", "quant_act_fp8", "had_quant_act_fp8", "givens_dense_quant", "givens_rotate", "had_quant_act_i8",
+        "quant_act_i8", "quant_act_i8g", "quant_act_fp8", "quant_cols_fp8", "had_quant_act_fp8", "givens_dense_quant", "givens_rotate", "had_quant_act_i8",
         "gram_accum",
         /* The fused fp8 forms. A host run needs every op covered, so these keep a host-backend run
          * from failing with "site 'host' is unavailable for this band". */
@@ -294,6 +295,20 @@ TEST(op_vocabulary) {
         "randn_lanes", "flow_euler", "chan_affine", "conv2d_nhwc", "l2norm_chan", "d2s_add",
         "s2d_avg_add", "to_rgba8", "gelu_tanh", "scatter_add_rows", "attn_prefix_self",
         "ln_mod_quant_fp8",
+        /* The music generator's (arch/minimaxmusic3): the codec's convolutions and activation, the
+         * guided frame sampler and the frame embeddings, the window states of the latent
+         * denoiser, and the index helpers that feed them. */
+        "conv1d", "conv_t1d", "snake", "cfg_topk_sample", "rvq_embed", "frame_mix_store",
+        "end_status", "resample_nearest", "fourier_embed", "win_input", "win_prep", "win_finish",
+        "chan_split", "interleave2", "iota", "cu_repeat", "frame_store",
+        /* The video generator's (MiniMax-H3): its DiT's modulated norm and sampler step, its
+         * decoder's patch unfold, tiles, stitch and positions, and the vocoder's alias-free
+         * activation. */
+        "rms_mod", "rms_mod_quant_fp8", "flow_x0_step", "patch_unfold", "vtile_gather",
+        "vtile_stitch", "grid_pos3", "snake_aa",
+        /* Its step-distilled form's video sparse attention: the tile selection and the
+         * block-sparse attention over it. */
+        "vsa_select", "attn_vsa",
     };
     for (const char* op : kOps) {
         if (!kern(op)) fprintf(stderr, "    missing op '%s'\n", op);
@@ -534,6 +549,28 @@ TEST(op_add_mul) {
     CHECK_OK(run("add", c));
     CHECK_EQ(y.at(0), 101.0f);
     CHECK_EQ(y.at(3), 204.0f);
+}
+
+/* add's `div` divides the sum after its rounding to y's dtype: 1 + 0.01953125 rounds to bf16
+ * 1.015625 (a tie, to even), and 1.015625 / 3 to 0.337890625; the unrounded sum's third would be
+ * 0.33984375. In f32 the quotient is f32(4 / 3). */
+TEST(add_div_divides_the_rounded_sum) {
+    T a1(RAD_BF16, {1, 1}); a1.f({1});
+    T b1(RAD_BF16, {1, 1}); b1.f({0.01953125f});
+    T y1(RAD_BF16, {1, 1});
+    A a; a.t(a1).t(b1).t(y1).i("M", 1).i("n", 1).s("dtype", "bf16").d("div", 3.0);
+    CHECK_OK(run("add", a));
+    CHECK_EQ(y1.at(0), 0.337890625f);
+
+    T a2(RAD_F32, {1, 3}); a2.f({1, 2, 4});
+    T b2(RAD_F32, {1, 3}); b2.f({2, 2, 2});
+    T y2(RAD_F32, {1, 3});
+    A b; b.t(a2).t(b2).t(y2).i("M", 1).i("n", 3).s("dtype", "f32").d("div", 3.0);
+    CHECK_OK(run("add", b));
+    CHECK_EQ(y2.at(0), 1.0f); CHECK_EQ(y2.at(1), 4.0f / 3.0f); CHECK_EQ(y2.at(2), 2.0f);
+
+    A c; c.t(a2).t(b2).t(y2).i("M", 1).i("n", 3).s("dtype", "f32").d("div", 0.0);
+    CHECK_EQ(run("add", c), RAD_E_INVAL);
 }
 
 TEST(op_silu_mul_and_unary) {
@@ -1684,12 +1721,12 @@ TEST(op_gemm_nt) {
     CHECK_EQ(yb.at(7), 15.0f);
 }
 
-/* RUNTIME LoRA, by hand. Every value is exact in its dtype, so the answers are equalities. The
- * contract under test is as much WHICH ROWS are touched as what lands in them: a row whose slot is
- * -1 or S is a base row, its `t` row keeps the sentinel shrink found there and its `y` row keeps
- * its bits -- a -0 included, which `y + 0` would have turned into +0. */
+/* Runtime LoRA, by hand. Every value is exact in its dtype, so the answers are equalities. Which
+ * rows are touched is under test as much as what lands in them: a row whose slot is -1 or S is a
+ * base row, its `t` row keeps the sentinel shrink found there and its `y` row keeps its bits, a -0
+ * included (which `y + 0` would turn into +0). */
 TEST(op_lora_shrink) {
-    /* `a` is a COLUMN SLICE: columns 1..4 of a [3, 6] buffer, row stride 6. */
+    /* `a` is a column slice: columns 1..4 of a [3, 6] buffer, row stride 6. */
     T aw(RAD_BF16, {3, 6});
     aw.f({9, 1, 2, 3, 4, 9,   9, 5, 6, 7, 8, 9,   9, 1, 1, 1, 1, 9});
     T a_ = aw;                                   /* the slice shares aw's bytes */
@@ -1738,7 +1775,7 @@ TEST(op_lora_expand) {
     lb.f({1, 0,   0, 1,   1, 1,                   /* slot 0: n0, n1, n2 */
           2, 0,   0, 0.5f, 1, -1});               /* slot 1 */
     T sc(RAD_F32, {2, 3}); sc.f({1, 1, 1,   0.5f, 2, 1});
-    /* `y` is a COLUMN SLICE too: columns 0..2 of a [4, 5] buffer. */
+    /* `y` is a column slice too: columns 0..2 of a [4, 5] buffer. */
     T yw(RAD_BF16, {4, 5});
     yw.f({1, 1, 1, 9, 9,   -0.0f, 3, 7, 9, 9,   0, 0, 0, 9, 9,   -0.0f, -0.0f, 5, 9, 9});
     T y = yw;
@@ -3113,6 +3150,79 @@ TEST(op_qk_norm_rope) {
     CHECK_NEAR(qkv.at(2), 2.0f * 3.0f / rms, 1e-6);
     CHECK_NEAR(qkv.at(3), 2.0f * 4.0f / rms, 1e-6);
     CHECK_EQ(qkv.at(4), 7.0f);
+}
+
+/* qk_norm_rope `axial`: NeoX pairs (i, i + rot/2), section c's frequencies turned by position
+ * component c on its own ladder (one pair a section here, so theta^0 = 1). Positions are f32
+ * [C, M] and read as they are. q's gain 2 plus wadd 1 scales its normed row by 3; k has no gain,
+ * which is a unit gain without wadd. Every head is [1, -1, 1, -1] (rms 1); v is left alone. */
+TEST(qk_norm_rope_axial_turns_each_section_by_its_component) {
+    T qkv(RAD_F32, {1, 12}); qkv.f({1, -1, 1, -1,  1, -1, 1, -1,  7, 7, 7, 7});
+    T pos(RAD_F32, {2, 1}); pos.f({0.5f, -1.25f});
+    T qw(RAD_F32, {4}); qw.f({2, 2, 2, 2});
+    A a; a.t(qkv).t(pos).t(qw).tnull().i("M", 1).i("head_dim", 4).i("n_head", 1)
+          .i("n_head_kv", 1).d("theta", 100).d("eps", 0).d("wadd", 1).s("mode", "axial")
+          .i("rotary_dim", 4).s("sections", "1 1");
+    CHECK_OK(run("qk_norm_rope", a));
+    const double ca = std::cos(0.5), sa = std::sin(0.5), cb = std::cos(-1.25), sb = std::sin(-1.25);
+    /* q pairs (0, 2) at 0.5 over (3, 3) and (1, 3) at -1.25 over (-3, -3). */
+    CHECK_NEAR(qkv.at(0), 3 * ca - 3 * sa, 1e-5);
+    CHECK_NEAR(qkv.at(2), 3 * sa + 3 * ca, 1e-5);
+    CHECK_NEAR(qkv.at(1), -3 * cb + 3 * sb, 1e-5);
+    CHECK_NEAR(qkv.at(3), -3 * sb - 3 * cb, 1e-5);
+    CHECK_NEAR(qkv.at(4), ca - sa, 1e-6);
+    CHECK_NEAR(qkv.at(6), sa + ca, 1e-6);
+    CHECK_NEAR(qkv.at(5), -cb + sb, 1e-6);
+    CHECK_NEAR(qkv.at(7), -sb - cb, 1e-6);
+    for (int i = 8; i < 12; ++i) CHECK_EQ(qkv.at(i), 7.0f);
+}
+
+/* Rank-1 positions in `axial` are every component at once, still on the section ladders: with
+ * sections "1 1" both pairs turn by the position itself (2), where neox at theta 100 would turn
+ * the second by 2 * 100^(-1/2) = 0.2. `rotary_dim` 0 is the norm alone and takes no positions:
+ * [3, 4, 0, 0] / 2.5 and [2, 2, 2, 2] / 2. */
+TEST(qk_norm_rope_axial_rank1_and_the_norm_alone) {
+    T qkv(RAD_F32, {1, 4}); qkv.f({1, -1, 1, -1});
+    T pos(RAD_I32, {1}); pos.n({2});
+    A a; a.t(qkv).t(pos).tnull().tnull().i("M", 1).i("head_dim", 4).i("n_head", 1)
+          .i("n_head_kv", 0).d("theta", 100).d("eps", 0).s("mode", "axial").i("rotary_dim", 4)
+          .s("sections", "1 1");
+    CHECK_OK(run("qk_norm_rope", a));
+    const double c = std::cos(2.0), s = std::sin(2.0);
+    CHECK_NEAR(qkv.at(0), c - s, 1e-6);  CHECK_NEAR(qkv.at(2), s + c, 1e-6);
+    CHECK_NEAR(qkv.at(1), -c + s, 1e-6); CHECK_NEAR(qkv.at(3), -s - c, 1e-6);
+
+    T q2(RAD_F32, {2, 4}); q2.f({3, 4, 0, 0,  2, 2, 2, 2});
+    A b; b.t(q2).tnull().tnull().tnull().i("M", 2).i("head_dim", 4).i("n_head", 1)
+          .i("n_head_kv", 0).d("theta", 100).d("eps", 0).i("rotary_dim", 0);
+    CHECK_OK(run("qk_norm_rope", b));
+    CHECK_NEAR(q2.at(0), 1.2f, 1e-6); CHECK_NEAR(q2.at(1), 1.6f, 1e-6);
+    CHECK_EQ(q2.at(2), 0.0f); CHECK_EQ(q2.at(3), 0.0f);
+    for (int i = 4; i < 8; ++i) CHECK_NEAR(q2.at(i), 1.0f, 1e-6);
+
+    /* A rotation without positions is refused. */
+    A c2; c2.t(q2).tnull().tnull().tnull().i("M", 2).i("head_dim", 4).i("n_head", 1)
+           .i("n_head_kv", 0).d("theta", 100).d("eps", 0);
+    CHECK_EQ(run("qk_norm_rope", c2), RAD_E_INVAL);
+}
+
+/* rope reads an f32 `positions` as it is, divided by `scale`: 0.75 / 0.5 = 1.5 and -0.3 / 0.5;
+ * an integer one stays integer, 3 / 2 = 1.5. */
+TEST(rope_reads_f32_positions_as_fractions) {
+    T qkv(RAD_F32, {2, 2}); qkv.f({1, 0, 1, 0});
+    T pos(RAD_F32, {2}); pos.f({0.75f, -0.3f});
+    A a; a.t(qkv).t(pos).i("M", 2).i("head_dim", 2).i("n_head", 1).i("n_head_kv", 0)
+          .d("theta", 10000).d("scale", 0.5).s("mode", "neox");
+    CHECK_OK(run("rope", a));
+    CHECK_NEAR(qkv.at(0), std::cos(1.5), 1e-6); CHECK_NEAR(qkv.at(1), std::sin(1.5), 1e-6);
+    CHECK_NEAR(qkv.at(2), std::cos(-0.6), 1e-6); CHECK_NEAR(qkv.at(3), std::sin(-0.6), 1e-6);
+
+    T q2(RAD_F32, {1, 2}); q2.f({1, 0});
+    T p2(RAD_I32, {1}); p2.n({3});
+    A b; b.t(q2).t(p2).i("M", 1).i("head_dim", 2).i("n_head", 1).i("n_head_kv", 0)
+          .d("theta", 10000).d("scale", 2.0).s("mode", "neox");
+    CHECK_OK(run("rope", b));
+    CHECK_NEAR(q2.at(0), std::cos(1.5), 1e-6); CHECK_NEAR(q2.at(1), std::sin(1.5), 1e-6);
 }
 
 /* ================================================================== mixture of experts */
@@ -4583,6 +4693,31 @@ TEST(gate_add_adds_y_through_its_sequences_tanh_gate) {
     CHECK_EQ(x.at(2), 10.0f); CHECK_EQ(x.at(3), -4.0f);
 }
 
+/* gate_add with `act` none: x = bf16(x + bf16(g[seq] * y)), the gate as it is. An f32 gate of
+ * 1.00390625 is not rounded first: 3 g = 3.01171875 rounds to 3.015625, where bf16(g) = 1 (a tie,
+ * to even) would give 3. */
+TEST(gate_add_act_none_adds_through_the_gate_itself) {
+    T y(RAD_BF16, {2, 2}); y.f({5, 6, 7, 8});
+    T g(RAD_BF16, {2, 2}); g.f({0.5f, -2, 0.25f, 3});
+    T cu(RAD_I32, {3}); cu.n({0, 1, 2});
+    T x(RAD_BF16, {2, 2}); x.f({1, 2, 3, 4});
+    A a; a.t(y).t(g).t(cu).t(x).i("M", 2).i("n", 2).s("dtype", "bf16").s("act", "none");
+    CHECK_OK(run("gate_add", a));
+    CHECK_EQ(x.at(0), 3.5f); CHECK_EQ(x.at(1), -10.0f);
+    CHECK_EQ(x.at(2), 4.75f); CHECK_EQ(x.at(3), 28.0f);
+
+    T y1(RAD_BF16, {1, 1}); y1.f({3});
+    T g1(RAD_F32, {1, 1}); g1.f({1.00390625f});
+    T cu1(RAD_I32, {2}); cu1.n({0, 1});
+    T x1(RAD_BF16, {1, 1}); x1.f({0});
+    A b; b.t(y1).t(g1).t(cu1).t(x1).i("M", 1).i("n", 1).s("dtype", "bf16").s("act", "none");
+    CHECK_OK(run("gate_add", b));
+    CHECK_EQ(x1.at(0), 3.015625f);
+
+    A c; c.t(y1).t(g1).t(cu1).t(x1).i("M", 1).i("n", 1).s("dtype", "bf16").s("act", "silu");
+    CHECK_EQ(run("gate_add", c), RAD_E_INVAL);
+}
+
 /* ln_mod_quant_fp8 with `gated` is gate_add, ln_mod and quant_act_fp8 in one pass: the same bytes
  * in x, z, the codes and the scales as the three ops. */
 TEST(ln_mod_quant_fp8_is_the_three_ops_byte_for_byte) {
@@ -4757,6 +4892,33 @@ TEST(chan_affine_reads_bf16_lists_and_inverts) {
     CHECK_EQ(w.at(0), round_dt(RAD_BF16, 0.1f));
 }
 
+/* chan_affine with `round` 0: f32 lists and f32 arithmetic, rounded once into y. fma of 10 with
+ * mul 0.3 and add 0.1 is f32(f32(10 * 0.3f) + 0.1f) = 3.1f (the bf16 lists would give
+ * 3.10009765625); inv is f32(f32(10 - 0.1f) / 0.3f) = 32.999996f (bf16: 32.75); a bf16 y rounds
+ * only the result, 3.09375 and 33. */
+TEST(chan_affine_round_0_keeps_f32_lists_and_rounds_once) {
+    T x(RAD_F32, {1, 2}); x.f({10, 10});
+    T y(RAD_F32, {1, 2});
+    A a; a.t(x).t(y).i("M", 1).i("n", 2).s("mul", "0.3 2").s("add", "0.1 -1").s("mode", "fma")
+          .s("dtype", "f32").i("round", 0);
+    CHECK_OK(run("chan_affine", a));
+    CHECK_EQ(y.at(0), 3.1f); CHECK_EQ(y.at(1), 19.0f);
+    A b; b.t(x).t(y).i("M", 1).i("n", 2).s("mul", "0.3 2").s("add", "0.1 -1").s("mode", "inv")
+          .s("dtype", "f32").i("round", 0);
+    CHECK_OK(run("chan_affine", b));
+    CHECK_EQ(y.at(0), 32.999996f); CHECK_EQ(y.at(1), 5.5f);
+
+    T yb(RAD_BF16, {1, 2});
+    A c; c.t(x).t(yb).i("M", 1).i("n", 2).s("mul", "0.3 2").s("add", "0.1 -1").s("mode", "fma")
+          .s("dtype", "bf16").i("round", 0);
+    CHECK_OK(run("chan_affine", c));
+    CHECK_EQ(yb.at(0), 3.09375f);
+    A d; d.t(x).t(yb).i("M", 1).i("n", 2).s("mul", "0.3 2").s("add", "0.1 -1").s("mode", "inv")
+          .s("dtype", "bf16").i("round", 0);
+    CHECK_OK(run("chan_affine", d));
+    CHECK_EQ(yb.at(0), 33.0f);
+}
+
 /* conv2d_nhwc: `same` padding sums a zero-padded window; `up` 2 reads the input upsampled
  * nearest-neighbour. */
 TEST(conv2d_nhwc_pads_and_upsamples) {
@@ -4898,6 +5060,61 @@ TEST(attn_prefix_self_sees_the_whole_prefix_and_its_own_causal_rows) {
     CHECK_NEAR(out2.at(0), 70.0 / 3.0, 1e-5);
 }
 
+/* quant_cols_fp8: one scale per column over all rows, amax / 448, 1 for an all-zero column.
+ * Column 0 [1, -2, 0.5]: scale 2/448, codes 224, -448, 112 (all E4M3 values). Column 1 zero. */
+TEST(quant_cols_fp8_scales_each_column_by_its_own_max) {
+    T x(RAD_F32, {3, 2}); x.f({1, 0, -2, 0, 0.5f, 0});
+    T y(RAD_F8E4M3, {3, 2});
+    T s(RAD_F32, {2});
+    A a; a.t(x).t(y).t(s).i("M", 3).i("n", 2).s("dtype", "f32");
+    CHECK_OK(run("quant_cols_fp8", a));
+    CHECK_EQ(s.at(0), 2.0f * (1.0f / 448.0f));
+    CHECK_EQ(s.at(1), 1.0f);
+    CHECK_EQ(y.at(0), 224.0f); CHECK_EQ(y.at(2), -448.0f); CHECK_EQ(y.at(4), 112.0f);
+    CHECK_EQ(y.at(1), 0.0f); CHECK_EQ(y.at(3), 0.0f); CHECK_EQ(y.at(5), 0.0f);
+}
+
+/* The fp8 P.V form, prefix-free: w = e4m3(448 p), o = sum(w v) v_scale / (448 sum p). One query
+ * against two keys whose scores differ by ln 2: p = 1 and 1/2, w = 448 and 224 exactly, so with
+ * value codes 3 and 5 and a column scale of 2, o = 2 (448 3 + 224 5) / (448 1.5) = 2 5.5 / 1.5. */
+TEST(attn_prefix_self_fp8_pv_rounds_each_weight_to_e4m3) {
+    const float l2 = std::log(2.0f);
+    T q(RAD_F32, {3, 1}); q.f({1, 0, 0});
+    T k(RAD_F32, {3, 1}); k.f({l2, 0, -9.0f * l2});
+    T v(RAD_F8E4M3, {3, 1}); v.f({3, 5, 7});
+    T vs(RAD_F32, {1}); vs.f({2});
+    T cu(RAD_I32, {2}); cu.n({0, 3});
+    T o(RAD_F32, {3, 1});
+    A a; a.t(q).t(k).t(v).tnull().tnull().tnull().t(cu).tnull().tnull().tnull().tnull().t(o).t(vs)
+          .i("q_len", 3).i("head_dim", 1).i("gqa", 1).i("block_size", 16).i("causal", 1)
+          .i("max_ctx", 0).s("q_dtype", "f32").s("kv_dtype", "f32").d("scale", 1).s("pv", "fp8");
+    CHECK_OK(run("attn_prefix_self", a));
+    /* Row 0 sees key 0 only: o = 3 2 = 6. Row 1 (q 0) sees keys 0 and 1 at score 0: w 448 each,
+     * o = 2 (3 + 5) / 2 = 8. */
+    CHECK_NEAR(o.at(0), 6.0f, 1e-5);
+    CHECK_NEAR(o.at(1), 8.0f, 1e-5);
+    /* Row 2 (q 0) sees all three at score 0. */
+    CHECK_NEAR(o.at(2), 2.0f * (3 + 5 + 7) / 3.0f, 1e-5);
+    /* Row 0 against keys 0 and 1 directly: scores ln 2 and 0. */
+    T q2(RAD_F32, {1, 1}); q2.f({1});
+    T k2(RAD_F32, {2, 1}); k2.f({l2, 0});
+    T v2(RAD_F8E4M3, {2, 1}); v2.f({3, 5});
+    T cu2(RAD_I32, {2}); cu2.n({0, 2});
+    T o2(RAD_F32, {2, 1});
+    T q3(RAD_F32, {2, 1}); q3.f({1, 1});
+    A b; b.t(q3).t(k2).t(v2).tnull().tnull().tnull().t(cu2).tnull().tnull().tnull().tnull().t(o2)
+          .t(vs).i("q_len", 2).i("head_dim", 1).i("gqa", 1).i("block_size", 16).i("causal", 0)
+          .i("max_ctx", 0).s("q_dtype", "f32").s("kv_dtype", "f32").d("scale", 1).s("pv", "fp8");
+    CHECK_OK(run("attn_prefix_self", b));
+    CHECK_NEAR(o2.at(0), 2.0f * 5.5f / 1.5f, 1e-5);
+    /* pv fp8 without v_scale, or with a prefix, is refused. */
+    A c; c.t(q3).t(k2).t(v2).tnull().tnull().tnull().t(cu2).tnull().tnull().tnull().tnull().t(o2)
+          .tnull().i("q_len", 2).i("head_dim", 1).i("gqa", 1).i("block_size", 16)
+          .i("causal", 0).i("max_ctx", 0).s("q_dtype", "f32").s("kv_dtype", "f32")
+          .s("pv", "fp8");
+    CHECK_EQ(run("attn_prefix_self", c), (int)RAD_E_INVAL);
+}
+
 /* With no prefix the op is dense attention over the pass's own rows. */
 TEST(attn_prefix_self_with_an_empty_prefix_is_dense_attention) {
     const int64_t M = 3, hd = 4, heads = 2;
@@ -4921,6 +5138,765 @@ TEST(attn_prefix_self_with_an_empty_prefix_is_dense_attention) {
           .s("dtype", "f32");
     CHECK_OK(run("attn_dense", b));
     for (int64_t i = 0; i < M * heads * hd; ++i) CHECK_NEAR(o1.at(i), o2.at(i), 1e-5);
+
+    /* The prefix-free form (no cache, block table or prefix lengths) is the same attention, causal
+     * or not; one or two of the three prefix operands alone are refused. */
+    for (int causal = 0; causal < 2; ++causal) {
+        T o3(RAD_F32, {M, heads * hd}), o4(RAD_F32, {M, heads * hd});
+        A c; c.t(q).t(k).t(v).tnull().tnull().tnull().t(cu).tnull().tnull().tnull().tnull().t(o3)
+              .i("q_len", M).i("head_dim", hd).i("gqa", 1).i("block_size", 2)
+              .i("causal", causal).i("max_ctx", 0).s("q_dtype", "f32").s("kv_dtype", "f32");
+        CHECK_OK(run("attn_prefix_self", c));
+        A d; d.t(q).t(k).t(v).t(cu).t(o4).i("M", M).i("head_dim", hd).i("gqa", 1)
+              .i("causal", causal).s("dtype", "f32");
+        CHECK_OK(run("attn_dense", d));
+        for (int64_t i = 0; i < M * heads * hd; ++i) CHECK_NEAR(o3.at(i), o4.at(i), 1e-5);
+    }
+    T o5(RAD_F32, {M, heads * hd});
+    A e; e.t(q).t(k).t(v).t(kv).tnull().tnull().t(cu).tnull().tnull().tnull().tnull().t(o5)
+          .i("q_len", M).i("head_dim", hd).i("gqa", 1).i("block_size", 2).i("causal", 0)
+          .s("q_dtype", "f32").s("kv_dtype", "f32");
+    CHECK_EQ(run("attn_prefix_self", e), (int)RAD_E_INVAL);
+}
+
+/* ================================================================== video generation
+ * docs/OPS.md "Video generation": MiniMax-H3's DiT norm and sampler step, and its decoder's patch
+ * unfold, tiles, stitch and positions. */
+
+/* rms_mod: with `gated` the branch first, x = bf16(x + bf16(g * y)) (no tanh); then
+ * n1 = bf16(x rsqrt(mean(x^2) + eps)), n2 = bf16(n1 w), m = bf16(n2 bf16(1 + scale)),
+ * z = bf16(m + shift), each row of `s` [shift | scale].
+ *   Row 0, sequence 0: x [1, -1] gains [0.5 * 2, 0.25 * -4], so it is [2, -2], rms 2; n1 [1, -1],
+ *   n2 [1.5, -0.75], times 1 + [0.5, 0.25], plus [0.125, 1]: [2.375, 0.0625]. The halves read the
+ *   other way round would give [2.1875, -1.25].
+ *   Row 1, sequence 1, gate 0: x [1, 2], rms sqrt(2.5); n1 = bf16(0.63245553) = 0.6328125 and
+ *   bf16(1.2649111) = 1.265625; n2 0.94921875 twice; 1 + 2^-8 rounds to 1 (a tie, to even); plus
+ *   [0, 0.5]: [0.94921875, 1.453125]. One f32 chain rounded at the end gives
+ *   [0.953125, 1.4453125]. */
+TEST(rms_mod_rounds_each_step_and_reads_shift_then_scale) {
+    T y(RAD_BF16, {2, 2}); y.f({2, -4, 7, 7});
+    T g(RAD_BF16, {2, 2}); g.f({0.5f, 0.25f, 0, 0});
+    T s(RAD_BF16, {2, 4}); s.f({0.125f, 1, 0.5f, 0.25f,  0, 0.5f, 0.00390625f, 0});
+    T w(RAD_BF16, {2}); w.f({1.5f, 0.75f});
+    T cu(RAD_I32, {3}); cu.n({0, 1, 2});
+    T x(RAD_BF16, {2, 2}); x.f({1, -1, 1, 2});
+    T z(RAD_BF16, {2, 2});
+    A a; a.t(y).t(g).t(s).t(w).t(cu).t(x).t(z).i("M", 2).i("n", 2).d("eps", 0).i("gated", 1)
+          .s("dtype", "bf16");
+    CHECK_OK(run("rms_mod", a));
+    CHECK_EQ(x.at(0), 2.0f); CHECK_EQ(x.at(1), -2.0f);
+    CHECK_EQ(x.at(2), 1.0f); CHECK_EQ(x.at(3), 2.0f);
+    CHECK_EQ(z.at(0), 2.375f); CHECK_EQ(z.at(1), 0.0625f);
+    CHECK_EQ(z.at(2), 0.94921875f); CHECK_EQ(z.at(3), 1.453125f);
+
+    /* Ungated, without the branch's operands: the residual is normed as it is, and kept. */
+    T x2(RAD_BF16, {2, 2}); x2.f({1, -1, 1, 2});
+    T z2(RAD_BF16, {2, 2});
+    A b; b.tnull().tnull().t(s).t(w).t(cu).t(x2).t(z2).i("M", 2).i("n", 2).d("eps", 0)
+          .s("dtype", "bf16");
+    CHECK_OK(run("rms_mod", b));
+    CHECK_EQ(x2.at(0), 1.0f); CHECK_EQ(x2.at(1), -1.0f);
+    CHECK_EQ(z2.at(0), 2.375f); CHECK_EQ(z2.at(1), 0.0625f);
+    CHECK_EQ(z2.at(2), 0.94921875f); CHECK_EQ(z2.at(3), 1.453125f);
+
+    /* Gated without a branch is refused. */
+    A c; c.tnull().tnull().t(s).t(w).t(cu).t(x2).t(z2).i("M", 2).i("n", 2).d("eps", 0)
+          .i("gated", 1).s("dtype", "bf16");
+    CHECK_EQ(run("rms_mod", c), RAD_E_SHAPE);
+}
+
+/* rms_mod_quant_fp8 is rms_mod with its chain in bf16 and quant_act_fp8 over that row: the same
+ * bytes in x, z, the codes and the scales as the pair. */
+TEST(rms_mod_quant_fp8_is_rms_mod_then_quant_act_fp8) {
+    const std::vector<float> yv = { 5, 6, 7, 8, 0.3f, -0.7f, 0.1f, 1.9f };
+    const std::vector<float> gv = { 0, 0.5f, 2, -1, 0.5f, 1, -1, 2 };
+    const std::vector<float> xv = { 1, 2, 3, 4, -0.25f, 0.5f, 3, -2 };
+    const std::vector<float> sv = { 0.5f, -0.5f, 1, 0, 0.25f, 0.125f, -0.75f, 2,
+                                    0, 1, -1, 0.5f, 0.125f, 0.25f, 0.5f, 1 };
+    const int64_t n = 4;
+    T cu(RAD_I32, {3}); cu.n({0, 1, 2});
+    T y(RAD_BF16, {2, n}); y.f(yv);
+    T g(RAD_BF16, {2, n}); g.f(gv);
+    T s(RAD_BF16, {2, 2 * n}); s.f(sv);
+    T w(RAD_BF16, {n}); w.f({1, 0.5f, 2, 0.75f});
+    T x1(RAD_BF16, {2, n}); x1.f(xv);
+    T q1(RAD_F8E4M3, {2, n}), sc1(RAD_F32, {2, 2}), z1(RAD_BF16, {2, n});
+    A a; a.t(y).t(g).t(s).t(w).t(cu).t(x1).t(q1).t(sc1).t(z1)
+          .i("M", 2).i("n", n).d("eps", 1e-5).i("group", 2).i("gated", 1).s("dtype", "bf16");
+    CHECK_OK(run("rms_mod_quant_fp8", a));
+
+    T x2(RAD_BF16, {2, n}); x2.f(xv);
+    T z2(RAD_BF16, {2, n});
+    A b; b.t(y).t(g).t(s).t(w).t(cu).t(x2).t(z2).i("M", 2).i("n", n).d("eps", 1e-5)
+          .i("gated", 1).s("dtype", "bf16");
+    CHECK_OK(run("rms_mod", b));
+    T q2(RAD_F8E4M3, {2, n}), sc2(RAD_F32, {2, 2});
+    A d; d.t(z2).t(q2).t(sc2).i("M", 2).i("n", n).i("group", 2).s("dtype", "bf16");
+    CHECK_OK(run("quant_act_fp8", d));
+    CHECK(x1.mem == x2.mem);
+    CHECK(z1.mem == z2.mem);
+    CHECK(q1.mem == q2.mem);
+    CHECK(sc1.mem == sc2.mem);
+}
+
+/* flow_x0_step in f32 steps: st = 1 - 0.3f, r = 0.4f / 0.7f, d = x + st v, x' = r x + (1 - r) d.
+ * From x 1, v 3 that is 1.8999999f (0x3ff33333), where the algebraically equal x + (1 - r) st v
+ * gives 1.9f; from x -2.5, v 0.75 it is -2.275f. */
+TEST(flow_x0_step_blends_toward_the_clean_estimate_in_f32_steps) {
+    T v(RAD_F32, {1, 2}); v.f({3, 0.75f});
+    T t(RAD_F32, {1}); t.f({0.3f});
+    T sg(RAD_F32, {1}); sg.f({0.7f});
+    T sn(RAD_F32, {1}); sn.f({0.4f});
+    T x(RAD_F32, {1, 2}); x.f({1, -2.5f});
+    A a; a.t(v).t(t).t(sg).t(sn).t(x).i("M", 1).i("n", 2).s("dtype", "f32");
+    CHECK_OK(run("flow_x0_step", a));
+    CHECK_EQ(x.at(0), 1.8999999f);
+    CHECK(x.at(0) != 1.9f);
+    CHECK_EQ(x.at(1), -2.275f);
+}
+
+/* patch_unfold: patch rows (f, i, j) of columns (c, a, b, d) dealt to voxel rows (t, yy, xx) and
+ * denormalised, f32(f32(x mul[c]) + add[c]) with the lists in f32. Two 1 x 2 x 2 patches side by
+ * side (geom (1, 1, 2)), x[p][col] = 100 p + col: voxel row (yy, xx) reads patch xx / 2 at column
+ * c 4 + yy 2 + xx % 2. mul 0.3 is f32(0.3), not bf16's 0.30078125 (which would put the first
+ * value at -1.796875). Row 8 is past the voxels and keeps its value. */
+TEST(patch_unfold_deals_patches_to_voxels_and_denormalises) {
+    T x(RAD_F32, {2, 8});
+    std::vector<float> xv(16);
+    for (int p = 0; p < 2; ++p)
+        for (int c = 0; c < 8; ++c) xv[(size_t)(p * 8 + c)] = (float)(100 * p + c);
+    x.f(xv);
+    T geom(RAD_I32, {3}); geom.n({1, 1, 2});
+    T y(RAD_F32, {9, 2}); y.f(std::vector<float>(18, -9.0f));
+    A a; a.t(x).t(geom).t(y).i("M", 9).i("C", 2).i("pt", 1).i("ph", 2).i("pw", 2)
+          .s("mul", "2 0.3").s("add", "1 -3").s("dtype", "f32");
+    CHECK_OK(run("patch_unfold", a));
+    const float c0[8] = { 1, 3, 201, 203, 5, 7, 205, 207 };
+    const float c1[8] = { -1.8f, -1.5f, 28.2f, 28.5f, -1.2f, -0.9f, 28.8f, 29.1f };
+    for (int r = 0; r < 8; ++r) {
+        CHECK_EQ(y.at(2 * r), c0[r]);
+        CHECK_NEAR(y.at(2 * r + 1), c1[r], 1e-5);
+    }
+    CHECK_EQ(y.at(16), -9.0f); CHECK_EQ(y.at(17), -9.0f);
+}
+
+/* vtile_gather's tiles are diffusers' _split_tiles in latent units. MiniMax-H3's 768 x 1344 frame
+ * is 48 x 84 latents; tiles of 16 at least 4 apart: 48 takes 4 tiles (16 4 - 4 3 - 48 = 4 to
+ * spare, overlaps [6, 5, 5], starts 0, 10, 21, 32) and 84 takes 7 (overlaps [5, 5, 5, 5, 4, 4],
+ * starts 0, 11, 22, 33, 44, 56, 68). x[yy, xx] = 1000 yy + xx; each tile is 256 voxels, a register
+ * row and a zero row. */
+TEST(vtile_gather_splits_as_diffusers_tiles) {
+    const int64_t H = 48, W = 84, period = 258;
+    T x(RAD_F32, {H * W, 1});
+    std::vector<float> xv((size_t)(H * W));
+    for (int64_t i = 0; i < H * W; ++i) xv[(size_t)i] = (float)(1000 * (i / W) + i % W);
+    x.f(xv);
+    T reg(RAD_F32, {1, 1}); reg.f({0.5f});
+    T geom(RAD_I32, {3}); geom.n({1, H, W});
+    T y(RAD_F32, {28 * period, 1});
+    A a; a.t(x).t(reg).t(geom).t(y).i("M", 28 * period).i("n", 1).i("tile", 16).i("overlap", 4)
+          .i("frames", 1).i("period", period).i("n_reg", 1).s("dtype", "f32");
+    CHECK_OK(run("vtile_gather", a));
+    const int64_t sy[4] = { 0, 10, 21, 32 }, sx[7] = { 0, 11, 22, 33, 44, 56, 68 };
+    for (int64_t i = 0; i < 4; ++i)
+        for (int64_t j = 0; j < 7; ++j) {
+            const int64_t k = i * 7 + j;
+            CHECK_EQ(y.at(k * period), (float)(1000 * sy[i] + sx[j]));
+            CHECK_EQ(y.at(k * period + 255), (float)(1000 * (sy[i] + 15) + sx[j] + 15));
+            CHECK_EQ(y.at(k * period + 256), 0.5f);
+            CHECK_EQ(y.at(k * period + 257), 0.0f);
+        }
+}
+
+/* A tile's voxels are (t, ty, tx) row-major across its frames. Two frames of 3 x 2 in tiles of
+ * 2 over 1: rows split at 0 and 1, the columns are one tile; x holds its row index. */
+TEST(vtile_gather_lays_each_tile_frame_major_and_refuses_a_short_axis) {
+    T x(RAD_F32, {12, 1}); x.f({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
+    T reg(RAD_F32, {1, 1}); reg.f({-1});
+    T geom(RAD_I32, {3}); geom.n({2, 3, 2});
+    T y(RAD_F32, {18, 1});
+    A a; a.t(x).t(reg).t(geom).t(y).i("M", 18).i("n", 1).i("tile", 2).i("overlap", 1)
+          .i("frames", 2).i("period", 9).i("n_reg", 1).s("dtype", "f32");
+    CHECK_OK(run("vtile_gather", a));
+    const float want[18] = { 0, 1, 2, 3, 6, 7, 8, 9, -1,   2, 3, 4, 5, 8, 9, 10, 11, -1 };
+    for (int i = 0; i < 18; ++i) CHECK_EQ(y.at(i), want[i]);
+
+    /* An axis shorter than a tile, frames other than the parameter's, and y short of the tiles. */
+    T g1(RAD_I32, {3}); g1.n({2, 1, 2});
+    A b; b.t(x).t(reg).t(g1).t(y).i("M", 18).i("n", 1).i("tile", 2).i("overlap", 1)
+          .i("frames", 2).i("period", 9).i("n_reg", 1).s("dtype", "f32");
+    CHECK_EQ(run("vtile_gather", b), RAD_E_SHAPE);
+    T g2(RAD_I32, {3}); g2.n({3, 3, 2});
+    A c; c.t(x).t(reg).t(g2).t(y).i("M", 18).i("n", 1).i("tile", 2).i("overlap", 1)
+          .i("frames", 2).i("period", 9).i("n_reg", 1).s("dtype", "f32");
+    CHECK_EQ(run("vtile_gather", c), RAD_E_SHAPE);
+    T y2(RAD_F32, {17, 1});
+    A d; d.t(x).t(reg).t(geom).t(y2).i("M", 17).i("n", 1).i("tile", 2).i("overlap", 1)
+          .i("frames", 2).i("period", 9).i("n_reg", 1).s("dtype", "f32");
+    CHECK_EQ(run("vtile_gather", d), RAD_E_SHAPE);
+}
+
+namespace {
+
+/* A 3 x 3 latent of four frames, tiles of 2 over 1 at scale 2 (6 x 6 pixels, 4 x 4 a tile, kept
+ * ranges [0, 2) and [2, 6) on each axis, 2-pixel blends), each tile constant: colour c of clip
+ * frame fc in tile (i, j) is base[i][j] + 2 fc + c, base [[4, 8], [16, 32]]. */
+struct Stitch {
+    T x{RAD_BF16, {4 * 16, 12}};
+    T geom{RAD_I32, {5}};
+    T prev{RAD_BF16, {2 * 36, 3}};
+    Stitch(int first, int last) {
+        static const float kBase[4] = { 4, 8, 16, 32 };
+        std::vector<float> xv((size_t)(4 * 16 * 12));
+        for (int64_t k = 0; k < 4; ++k)
+            for (int64_t r = 0; r < 16; ++r)
+                for (int64_t col = 0; col < 12; ++col)
+                    xv[(size_t)((k * 16 + r) * 12 + col)] = kBase[k] + 2.0f * (float)(r / 4) +
+                                                            (float)(col / 4);
+        x.f(xv);
+        geom.n({4, 3, 3, first, last});
+        std::vector<float> pv((size_t)(2 * 36 * 3));
+        for (size_t i = 0; i < pv.size(); ++i) pv[i] = i < 36 * 3 ? 1.0f : 2.0f;
+        prev.f(pv);
+    }
+    int run_on(T& y, int64_t frames_out) {
+        A a; a.t(x).t(geom).t(prev).t(y).i("M", frames_out * 36).i("tile", 2).i("overlap", 1)
+              .i("scale", 2).i("pt", 1).i("skip", 0).i("keep", 2).i("blend", 2).i("period", 16)
+              .s("mean", "0 0 0").s("std", "0.015625 0.015625 0.015625");
+        return run("vtile_stitch", a);
+    }
+};
+
+}  /* namespace */
+
+/* vtile_stitch: each pixel belongs to the tile whose kept range holds it; its top `ev` rows are
+ * blended with the tile above (as decoded), then its left `eh` columns with the tile to its left
+ * (as decoded, not blended), wa = bf16(1 - p/e), wb = bf16(p/e). At clip frame 2 the tiles are
+ * [[8, 12], [20, 36]], and pixel (3, 3) is row 1 and column 1 of tile (1, 1): V = 0.5 12 + 0.5 36
+ * = 24, then S = 0.5 20 + 0.5 V = 22. Blending across first would give 20, a vertically blended
+ * left tile 19, a horizontally blended tile above 21.5.
+ *
+ * In time (skip 0, keep 2, blend 2): output frame k < blend of a chunk that is not first is
+ * bf16(bf16(prev[k] wa(k, 2)) + bf16(S wb(k, 2))): frame 0 is prev[0] = 1, frame 1 at (3, 3) is
+ * 0.5 2 + 0.5 S(1) = 1 + 10 = 11 (colour 2: 12). prev becomes S(2), S(3), which a last chunk also
+ * writes as frames 2 and 3. A byte is round(255 clamp(v / 64, 0, 1)): 1 -> 4, 11 -> 44, 12 -> 48,
+ * 18 -> 72, 20 -> 80, 22 -> 88, 24 -> 96. */
+TEST(vtile_stitch_blends_down_then_across_and_carries_the_overlap) {
+    Stitch st(0, 1);
+    T y(RAD_U8, {4 * 36, 3});
+    CHECK_OK(st.run_on(y, 4));
+    auto px = [](int64_t f, int64_t Y, int64_t X, int64_t c) {
+        return (f * 36 + Y * 6 + X) * 3 + c;
+    };
+    /* prev now holds clip frames 2 and 3, stitched. */
+    const float row2[6] = { 8, 8, 20, 16, 12, 12 }, row3[6] = { 14, 14, 20, 22, 24, 24 };
+    for (int64_t X = 0; X < 6; ++X) {
+        CHECK_EQ(st.prev.at(px(0, 2, X, 0)), row2[X]);
+        CHECK_EQ(st.prev.at(px(0, 3, X, 0)), row3[X]);
+    }
+    CHECK_EQ(st.prev.at(px(1, 3, 3, 0)), 24.0f);
+    CHECK_EQ(y.at(px(0, 3, 3, 0)), 4.0f);
+    CHECK_EQ(y.at(px(0, 0, 0, 2)), 4.0f);
+    CHECK_EQ(y.at(px(1, 3, 3, 0)), 44.0f);
+    CHECK_EQ(y.at(px(1, 3, 3, 2)), 48.0f);
+    CHECK_EQ(y.at(px(1, 5, 5, 0)), 72.0f);
+    CHECK_EQ(y.at(px(2, 3, 3, 0)), 88.0f);
+    CHECK_EQ(y.at(px(3, 3, 3, 0)), 96.0f);
+
+    /* A first chunk does not blend in time, and one that is not last writes only its kept
+     * frames: frames 0 and 1 at (3, 3) are S(0) = 18 and S(1) = 20. */
+    Stitch s1(1, 0);
+    T y1(RAD_U8, {2 * 36, 3});
+    CHECK_OK(s1.run_on(y1, 2));
+    CHECK_EQ(y1.at(px(0, 3, 3, 0)), 72.0f);
+    CHECK_EQ(y1.at(px(1, 3, 3, 0)), 80.0f);
+    CHECK_EQ(s1.prev.at(px(0, 3, 3, 0)), 22.0f);
+
+    /* Refused, nothing written: bytes short of the last chunk's four frames. */
+    Stitch s2(0, 1);
+    T y2(RAD_U8, {2 * 36, 3});
+    const std::vector<uint8_t> before = s2.prev.mem;
+    CHECK_EQ(s2.run_on(y2, 2), RAD_E_SHAPE);
+    CHECK(s2.prev.mem == before);
+}
+
+/* grid_pos3: token (t, i, j) of each `period`-row tile at scale (2 (c + 0.5) / n - 1) per axis, in
+ * f32 steps, the period's last rows (registers) at 0. Tiles of 2 x 3 x 4 every 26 rows, scale 2,
+ * into a [3, 30] view of a [3, 32] plane: rows 30 and 31 of each component are not written.
+ * 2 g(0, 3) = 2 f32(f32(2 f32(0.5 / 3)) - 1) = -1.3333333f. */
+TEST(grid_pos3_places_each_tile_token_and_zeroes_the_rest) {
+    T y(RAD_F32, {3, 32}); y.f(std::vector<float>(96, -9.0f));
+    y.t.shape[1] = 30;
+    A a; a.t(y).i("M", 30).i("T", 2).i("H", 3).i("W", 4).i("period", 26).d("scale", 2.0);
+    CHECK_OK(run("grid_pos3", a));
+    auto at3 = [&](int c, int m) { return y.at(c * 32 + m); };
+    CHECK_EQ(at3(0, 0), -1.0f);  CHECK_EQ(at3(1, 0), -1.3333333f);  CHECK_EQ(at3(2, 0), -1.5f);
+    CHECK_EQ(at3(0, 5), -1.0f);  CHECK_EQ(at3(1, 5), 0.0f);          CHECK_EQ(at3(2, 5), -0.5f);
+    CHECK_EQ(at3(0, 23), 1.0f);  CHECK_EQ(at3(1, 23), 1.3333333f);   CHECK_EQ(at3(2, 23), 1.5f);
+    for (int c = 0; c < 3; ++c) {
+        CHECK_EQ(at3(c, 24), 0.0f); CHECK_EQ(at3(c, 25), 0.0f);
+        CHECK_EQ(at3(c, 26), at3(c, 0));
+        CHECK_EQ(at3(c, 30), -9.0f); CHECK_EQ(at3(c, 31), -9.0f);
+    }
+    CHECK_EQ(at3(2, 29), 1.5f);
+}
+
+/* ================================================================== video sparse attention
+ * docs/OPS.md "Video sparse attention": the tiles over a packed sequence of dense segments and a
+ * video grid, vsa_select's top-k of pooled scores and its coarse branch, attn_vsa's block-sparse
+ * attention and its gated epilogue. */
+namespace {
+
+/* `geom` as the run phase writes it: (frames, latent height, latent width) at RAD_VGEOM_*, and
+ * values in the other entries that no tile reads. */
+void vsa_geom(T& g, int64_t frames, int64_t lat_h, int64_t lat_w) {
+    std::vector<int64_t> v(RAD_VGEOM_N);
+    for (int64_t i = 0; i < RAD_VGEOM_N; ++i) v[(size_t)i] = 1000 + i;
+    v[RAD_VGEOM_LAT_FRAMES] = frames;
+    v[RAD_VGEOM_LAT_H] = lat_h;
+    v[RAD_VGEOM_LAT_W] = lat_w;
+    g.n(v);
+}
+
+A& vsa_params(A& a, int64_t M, int64_t hd, int64_t tt, int64_t th, int64_t tw, int64_t patch,
+              double sparsity) {
+    return a.i("M", M).i("head_dim", hd).i("tile_t", tt).i("tile_h", th).i("tile_w", tw)
+            .i("patch", patch).d("sparsity", sparsity);
+}
+
+/* A small geometry with every edge case: dense segments of 13 and 14 rows (a text and a stereo
+ * soundtrack of 7 rows a channel), then a 6 x 5 x 7 grid of patches (a 10 x 14 latent at patch
+ * 2), 237 rows. In boxes of 4 x 4 x 4 the segments are a tile each and the grid's edge boxes are
+ * short on every axis: tiles 2 .. 9 are boxes (0,0,0), (0,0,1), (0,1,0), (0,1,1), (1,0,0),
+ * (1,0,1), (1,1,0), (1,1,1) of 64, 48, 16, 12, 32, 24, 8 and 6 rows. */
+constexpr int64_t kVsaRows = 237;
+
+int64_t vsa_row(int64_t t, int64_t h, int64_t w) { return 27 + (t * 5 + h) * 7 + w; }
+
+}  /* namespace */
+
+/* vsa_select over the small geometry, one column a head (head_dim 1), sparsity 0.8: k =
+ * ceil(0.2 8) = 2. Head 0's keys are 1 over box (0,1,1) and 2 over box (1,0,0), 0 over the rest
+ * of the grid and 9 over the prefix (no candidate): every video query tile takes tiles 5 and 6,
+ * ascending, but box (1,1,1)'s queries are -1, so its scores are -kp and it takes the ties at -0,
+ * the two lowest, 2 and 3. A box numbering other than (t, h, w) raster with w fastest names other
+ * tiles (w-major makes 5 and 6 into 8 and 3). Head 1's keys are -1 over the whole grid: [2, 3]
+ * everywhere. Prefix query tiles' rows, the slot past k and the spare tile row are not written. */
+TEST(vsa_select_numbers_the_boxes_t_h_w_and_breaks_ties_low) {
+    const int64_t R = kVsaRows;
+    std::vector<float> qv((size_t)(R * 2), 1.0f), kv((size_t)(R * 2), 0.0f);
+    for (int64_t r = 0; r < 27; ++r) { kv[(size_t)(r * 2)] = 9.0f; kv[(size_t)(r * 2 + 1)] = 5.0f; }
+    for (int64_t r = 27; r < R; ++r) kv[(size_t)(r * 2 + 1)] = -1.0f;
+    for (int64_t t = 0; t < 4; ++t)
+        for (int64_t w = 4; w < 7; ++w) kv[(size_t)(vsa_row(t, 4, w) * 2)] = 1.0f;
+    for (int64_t t = 4; t < 6; ++t)
+        for (int64_t h = 0; h < 4; ++h)
+            for (int64_t w = 0; w < 4; ++w) kv[(size_t)(vsa_row(t, h, w) * 2)] = 2.0f;
+    for (int64_t t = 4; t < 6; ++t)
+        for (int64_t w = 4; w < 7; ++w) qv[(size_t)(vsa_row(t, 4, w) * 2)] = -1.0f;
+    T q(RAD_F32, {R, 2}); q.f(qv);
+    T k(RAD_F32, {R, 2}); k.f(kv);
+    T segs(RAD_I32, {4}); segs.n({0, 13, 27, R});
+    T geom(RAD_I32, {RAD_VGEOM_N}); vsa_geom(geom, 6, 10, 14);
+    T sel(RAD_I32, {2, 11, 3}); sel.n(std::vector<int64_t>(66, -7));
+    A a; a.t(q).t(k).tnull().t(segs).t(geom).t(sel).tnull();
+    vsa_params(a, R, 1, 4, 4, 4, 2, 0.8);
+    CHECK_OK(run("vsa_select", a));
+    auto at = [&](int64_t h, int64_t i, int64_t s) { return sel.iat((h * 11 + i) * 3 + s); };
+    for (int64_t i = 2; i < 10; ++i) {
+        CHECK_EQ(at(0, i, 0), (int64_t)(i == 9 ? 2 : 5));
+        CHECK_EQ(at(0, i, 1), (int64_t)(i == 9 ? 3 : 6));
+        CHECK_EQ(at(1, i, 0), (int64_t)2);
+        CHECK_EQ(at(1, i, 1), (int64_t)3);
+    }
+    for (int64_t h = 0; h < 2; ++h)
+        for (int64_t s = 0; s < 3; ++s) {
+            CHECK_EQ(at(h, 0, s), (int64_t)-7);
+            CHECK_EQ(at(h, 1, s), (int64_t)-7);
+            CHECK_EQ(at(h, 10, s), (int64_t)-7);
+            for (int64_t i = 2; i < 10; ++i) if (s == 2) CHECK_EQ(at(h, i, s), (int64_t)-7);
+        }
+}
+
+/* Each dense segment is cut on its own: segments of 13, 0 and 14 rows in boxes of 2 x 2 x 2
+ * (8 rows) are tiles [0, 8), [8, 13), [13, 21), [21, 27), four of them, the empty one none; a
+ * 2 x 2 x 3 grid follows as tiles 4 (8 rows) and 5 (4 rows). With q 0 every score is 0 and the
+ * coarse branch is the plain mean of the six tile means of v = row index: (3.5 + 10 + 16.5 +
+ * 23.5 + 32 + 33.5) / 6 = 19.8333, for every tile, prefix ones too. Chunks running across the
+ * segments ([8, 16), [16, 24), [24, 27)) would give 20.8333. At sparsity 0 every video tile is
+ * selected: [4, 5]. */
+TEST(vsa_select_chunks_each_dense_segment_and_averages_every_tile) {
+    const int64_t R = 39;
+    std::vector<float> rows((size_t)R);
+    for (int64_t r = 0; r < R; ++r) rows[(size_t)r] = (float)r;
+    T q(RAD_F32, {R, 1}); q.f(std::vector<float>((size_t)R, 0.0f));
+    T k(RAD_F32, {R, 1}); k.f(std::vector<float>((size_t)R, 0.0f));
+    T v(RAD_F32, {R, 1}); v.f(rows);
+    T segs(RAD_I32, {5}); segs.n({0, 13, 13, 27, R});
+    T geom(RAD_I32, {RAD_VGEOM_N}); vsa_geom(geom, 2, 2, 3);
+    T sel(RAD_I32, {1, 6, 2}); sel.n(std::vector<int64_t>(12, -7));
+    T co(RAD_F32, {1, 6, 1});
+    A a; a.t(q).t(k).t(v).t(segs).t(geom).t(sel).t(co);
+    vsa_params(a, R, 1, 2, 2, 2, 1, 0.0);
+    CHECK_OK(run("vsa_select", a));
+    CHECK_EQ(sel.iat(8), (int64_t)4);  CHECK_EQ(sel.iat(9), (int64_t)5);
+    CHECK_EQ(sel.iat(10), (int64_t)4); CHECK_EQ(sel.iat(11), (int64_t)5);
+    for (int64_t i = 0; i < 8; ++i) CHECK_EQ(sel.iat(i), (int64_t)-7);
+    for (int64_t i = 0; i < 6; ++i) CHECK_NEAR(co.at(i), 119.0f / 6.0f, 1e-5);
+}
+
+/* k = max(1, min(ceil((1 - sparsity) V), V)) in f64, as the trained schedule computes it. One-row
+ * tiles (boxes of 1) over a grid with no prefix, q 1 and k = row index, so the selection is the k
+ * last tiles. (1 - 0.8) 660 is 131.99999999999997: 132 at MiniMax-H3's 1344 x 768 (37 x 24 x 42
+ * in boxes of 4: 10 x 6 x 11). (1 - 0.7) 10 is 3.0000000000000004: 4, where exact arithmetic
+ * gives 3. (1 - 0.8) 5 is 0.9999999999999998: 1, and at least one tile is kept. */
+TEST(vsa_select_computes_k_in_f64) {
+    struct Case { int64_t F, H, W; double sparsity; int64_t k; };
+    static const Case kCases[] = { { 10, 6, 11, 0.8, 132 }, { 1, 1, 10, 0.7, 4 },
+                                   { 1, 1, 5, 0.8, 1 },     { 1, 1, 7, 0.5, 4 },
+                                   { 1, 1, 7, 0.0, 7 },     { 1, 1, 8, 0.8, 2 },
+                                   { 2, 2, 2, 0.99, 1 } };
+    for (const Case& c : kCases) {
+        const int64_t V = c.F * c.H * c.W;
+        std::vector<float> kv((size_t)V);
+        for (int64_t r = 0; r < V; ++r) kv[(size_t)r] = (float)r;
+        T q(RAD_F32, {V, 1}); q.f(std::vector<float>((size_t)V, 1.0f));
+        T k(RAD_F32, {V, 1}); k.f(kv);
+        T segs(RAD_I32, {2}); segs.n({0, V});
+        T geom(RAD_I32, {RAD_VGEOM_N}); vsa_geom(geom, c.F, c.H, c.W);
+        T sel(RAD_I32, {1, V, V + 1}); sel.n(std::vector<int64_t>((size_t)(V * (V + 1)), -1));
+        A a; a.t(q).t(k).tnull().t(segs).t(geom).t(sel).tnull();
+        vsa_params(a, V, 1, 1, 1, 1, 1, c.sparsity);
+        CHECK_OK(run("vsa_select", a));
+        for (int64_t i : { (int64_t)0, V - 1 }) {
+            int64_t n = 0;
+            while (n <= V && sel.iat(i * (V + 1) + n) != -1) ++n;
+            CHECK_EQ(n, c.k);
+            CHECK_EQ(sel.iat(i * (V + 1)), V - c.k);
+            CHECK_EQ(sel.iat(i * (V + 1) + c.k - 1), V - 1);
+        }
+    }
+}
+
+/* Equal scores go to the lower tile, and the selection is written in ascending tile order
+ * whatever the scores' order. Five one-row video tiles, q 1, so tile j scores k[j]: of
+ * [1, 3, 2, 3, 3], k = 2 (sparsity 0.6) takes 1 and 3, k = 3 (0.4) takes 1, 3 and 4; of
+ * [2, 1, 1, 1, 5], k = 2 takes 4 and 0, written [0, 4]. A NaN ranks above every number. */
+TEST(vsa_select_breaks_score_ties_towards_the_lower_tile) {
+    struct Case { float k[5]; double sparsity; int64_t n; int64_t want[3]; };
+    static const Case kCases[] = { { { 1, 3, 2, 3, 3 }, 0.6, 2, { 1, 3, -1 } },
+                                   { { 1, 3, 2, 3, 3 }, 0.4, 3, { 1, 3, 4 } },
+                                   { { 2, 1, 1, 1, 5 }, 0.6, 2, { 0, 4, -1 } },
+                                   { { 2, NAN, 1, 7, 5 }, 0.6, 2, { 1, 3, -1 } } };
+    for (const Case& c : kCases) {
+        T q(RAD_F32, {5, 1}); q.f({1, 1, 1, 1, 1});
+        T k(RAD_F32, {5, 1}); k.f({c.k[0], c.k[1], c.k[2], c.k[3], c.k[4]});
+        T segs(RAD_I32, {2}); segs.n({0, 5});
+        T geom(RAD_I32, {RAD_VGEOM_N}); vsa_geom(geom, 1, 1, 5);
+        T sel(RAD_I32, {1, 5, 3}); sel.n(std::vector<int64_t>(15, -1));
+        A a; a.t(q).t(k).tnull().t(segs).t(geom).t(sel).tnull();
+        vsa_params(a, 5, 1, 1, 1, 1, 1, c.sparsity);
+        CHECK_OK(run("vsa_select", a));
+        for (int64_t i = 0; i < 5; ++i)
+            for (int64_t s = 0; s < 3; ++s) CHECK_EQ(sel.iat(i * 3 + s), c.want[s]);
+    }
+}
+
+/* attn_vsa over the small geometry with q 0, so every visible key weighs the same and a row's
+ * output is the mean of v = row index over what it sees. Sparsity 0.9: k = 1, and video tile i
+ * selects tile 11 - i. Prefix query rows see all 237 rows: 118. Row 27 (box (0,0,0), tile 2)
+ * sees the prefix's 27 rows (sum 351) and tile 9's 6 rows (sum 1305): 1656 / 33. Row 236 (tile 9)
+ * sees tile 2's 64 rows (sum 5856): 6207 / 91. Row 171, patch (4, 0, 4) of box (1,0,1), tile 7,
+ * sees tile 4's 16 rows (sum 1744): 2095 / 43. The prefix query tiles' rows of `sel` are neither
+ * read nor checked. */
+TEST(attn_vsa_sees_the_prefix_and_the_selected_boxes) {
+    const int64_t R = kVsaRows;
+    std::vector<float> rows((size_t)R);
+    for (int64_t r = 0; r < R; ++r) rows[(size_t)r] = (float)r;
+    T q(RAD_F32, {R, 1}); q.f(std::vector<float>((size_t)R, 0.0f));
+    T k(RAD_F32, {R, 1}); k.f(std::vector<float>((size_t)R, 0.0f));
+    T v(RAD_F32, {R, 1}); v.f(rows);
+    T segs(RAD_I32, {4}); segs.n({0, 13, 27, R});
+    T geom(RAD_I32, {RAD_VGEOM_N}); vsa_geom(geom, 6, 10, 14);
+    T sel(RAD_I32, {1, 10, 1}); sel.n({-5, -5, 9, 8, 7, 6, 5, 4, 3, 2});
+    T o(RAD_F32, {R, 1});
+    A a; a.t(q).t(k).t(v).t(segs).t(geom).t(sel).tnull().tnull().t(o);
+    vsa_params(a, R, 1, 4, 4, 4, 2, 0.9);
+    CHECK_OK(run("attn_vsa", a));
+    CHECK_NEAR(o.at(0), 118.0f, 1e-4);
+    CHECK_NEAR(o.at(26), 118.0f, 1e-4);
+    CHECK_NEAR(o.at(27), 1656.0f / 33.0f, 1e-4);
+    CHECK_NEAR(o.at(236), 6207.0f / 91.0f, 1e-4);
+    CHECK_EQ(vsa_row(4, 0, 4), (int64_t)171);
+    CHECK_NEAR(o.at(171), 2095.0f / 43.0f, 1e-4);
+}
+
+/* At sparsity 0, k is V and vsa_select selects every video tile in order, and attn_vsa over that
+ * selection is attn_dense over the whole sequence: the same keys, taken tile by tile. */
+TEST(attn_vsa_at_sparsity_zero_is_dense_attention) {
+    const int64_t R = kVsaRows, nh = 2, hd = 8;
+    uint32_t s = 7;
+    auto draw = [&s](int64_t n) {
+        std::vector<float> x((size_t)n);
+        for (auto& e : x) {
+            s = s * 1664525u + 1013904223u;
+            e = (float)((int)((s >> 8) % 2001) - 1000) / 1000.0f;
+        }
+        return x;
+    };
+    T q(RAD_F32, {R, nh, hd}); q.f(draw(R * nh * hd));
+    T k(RAD_F32, {R, nh, hd}); k.f(draw(R * nh * hd));
+    T v(RAD_F32, {R, nh, hd}); v.f(draw(R * nh * hd));
+    T segs(RAD_I32, {4}); segs.n({0, 13, 27, R});
+    T geom(RAD_I32, {RAD_VGEOM_N}); vsa_geom(geom, 6, 10, 14);
+    T sel(RAD_I32, {nh, 10, 8});
+    A a; a.t(q).t(k).tnull().t(segs).t(geom).t(sel).tnull();
+    vsa_params(a, R, hd, 4, 4, 4, 2, 0.0);
+    CHECK_OK(run("vsa_select", a));
+    for (int64_t h = 0; h < nh; ++h)
+        for (int64_t i = 2; i < 10; ++i)
+            for (int64_t j = 0; j < 8; ++j) CHECK_EQ(sel.iat((h * 10 + i) * 8 + j), j + 2);
+    T o1(RAD_F32, {R, nh, hd}), o2(RAD_F32, {R, nh, hd});
+    A b; b.t(q).t(k).t(v).t(segs).t(geom).t(sel).tnull().tnull().t(o1);
+    vsa_params(b, R, hd, 4, 4, 4, 2, 0.0);
+    CHECK_OK(run("attn_vsa", b));
+    T cu(RAD_I32, {2}); cu.n({0, R});
+    A c; c.t(q).t(k).t(v).t(cu).t(o2).i("M", R).i("head_dim", hd).i("gqa", 1).i("causal", 0)
+          .s("dtype", "f32");
+    CHECK_OK(run("attn_dense", c));
+    for (int64_t i = 0; i < R * nh * hd; ++i) CHECK_NEAR(o1.at(i), o2.at(i), 1e-5);
+
+    /* The int8 score form is attn_prefix_self's, prefix-free, over the same selection: k's codes
+     * and scales per (row, head) as quant_act_i8g writes them, the query quantised inside. */
+    T k8(RAD_I8, {R, nh * hd}), ks(RAD_F32, {R, nh});
+    A d; d.t(k).t(k8).t(ks).i("M", R).i("n", nh * hd).i("group", hd).s("dtype", "f32");
+    CHECK_OK(run("quant_act_i8g", d));
+    T o3(RAD_F32, {R, nh, hd}), o4(RAD_F32, {R, nh * hd});
+    A e; e.t(q).t(k).t(v).t(segs).t(geom).t(sel).tnull().tnull().t(o3).t(k8).t(ks).s("qk", "i8");
+    vsa_params(e, R, hd, 4, 4, 4, 2, 0.0);
+    CHECK_OK(run("attn_vsa", e));
+    A f; f.t(q).t(k).t(v).tnull().tnull().tnull().t(cu).tnull().tnull().t(k8).t(ks).t(o4)
+          .i("q_len", R).i("head_dim", hd).i("gqa", 1).i("block_size", 16).i("causal", 0)
+          .i("max_ctx", 0).s("q_dtype", "f32").s("kv_dtype", "f32").s("qk", "i8");
+    CHECK_OK(run("attn_prefix_self", f));
+    for (int64_t i = 0; i < R * nh * hd; ++i) CHECK_NEAR(o3.at(i), o4.at(i), 1e-5);
+
+    /* The fp8 P.V form, likewise: the values as quant_cols_fp8's codes and column scales. */
+    T v8(RAD_F8E4M3, {R, nh * hd}), vs(RAD_F32, {nh * hd});
+    A g; g.t(v).t(v8).t(vs).i("M", R).i("n", nh * hd).s("dtype", "f32");
+    CHECK_OK(run("quant_cols_fp8", g));
+    T o5(RAD_F32, {R, nh, hd}), o6(RAD_F32, {R, nh * hd});
+    A h; h.t(q).t(k).t(v8).t(segs).t(geom).t(sel).tnull().tnull().t(o5).t(k8).t(ks).t(vs)
+          .s("qk", "i8").s("pv", "fp8");
+    vsa_params(h, R, hd, 4, 4, 4, 2, 0.0);
+    CHECK_OK(run("attn_vsa", h));
+    A u; u.t(q).t(k).t(v8).tnull().tnull().tnull().t(cu).tnull().tnull().t(k8).t(ks).t(o6).t(vs)
+          .i("q_len", R).i("head_dim", hd).i("gqa", 1).i("block_size", 16).i("causal", 0)
+          .i("max_ctx", 0).s("q_dtype", "f32").s("kv_dtype", "f32").s("qk", "i8").s("pv", "fp8");
+    CHECK_OK(run("attn_prefix_self", u));
+    for (int64_t i = 0; i < R * nh * hd; ++i) CHECK_NEAR(o5.at(i), o6.at(i), 1e-5);
+}
+
+/* The coarse branch rounds once. Two video tiles of two rows (a 1 x 1 x 4 grid in boxes of
+ * 1 x 1 x 2), q 0, so p is 1/2 each. v rows 1, 1 + 2^-7, 1 + 2^-7, 1 + 2^-7 make the tile means
+ * 1 + 2^-8 and 1 + 2^-7 and their mix 1 + 3 2^-9, which bf16 rounds to 1 + 2^-7 = 1.0078125.
+ * Rounding the means to bf16 first, or each product, gives 1. */
+TEST(vsa_select_rounds_the_coarse_mix_once) {
+    const float a7 = 1.0078125f;
+    T q(RAD_BF16, {4, 1}); q.f({0, 0, 0, 0});
+    T k(RAD_BF16, {4, 1}); k.f({0, 0, 0, 0});
+    T v(RAD_BF16, {4, 1}); v.f({1, a7, a7, a7});
+    T segs(RAD_I32, {2}); segs.n({0, 4});
+    T geom(RAD_I32, {RAD_VGEOM_N}); vsa_geom(geom, 1, 1, 4);
+    T sel(RAD_I32, {1, 2, 2});
+    T co(RAD_BF16, {1, 2, 1});
+    A a; a.t(q).t(k).t(v).t(segs).t(geom).t(sel).t(co);
+    vsa_params(a, 4, 1, 1, 1, 2, 1, 0.0);
+    CHECK_OK(run("vsa_select", a));
+    CHECK_EQ(co.at(0), a7);
+    CHECK_EQ(co.at(1), a7);
+}
+
+/* The gated epilogue rounds the attention to the output's dtype before the add:
+ * out = bf16(bf16(o) + coarse gate). The same two tiles, both visible (sparsity 0), q 0, v rows
+ * 1, 1 + 2^-7, 1, 1 + 2^-7 in both columns: o = 1 + 2^-8 everywhere, which bf16 rounds to 1 (a
+ * tie, to even). coarse gate = 2^-8 then gives 1 + 2^-8, a tie, 1; -2^-8 gives 1 - 2^-8 =
+ * 0.99609375 exactly. Added to the unrounded o they would give 1.0078125 and 1. Tile 1's coarse
+ * 3 2^-4 in column 0 gives 1 + 3 2^-8, a tie, 1.015625: the row reads its own tile's coarse.
+ * Without coarse and gate the output is bf16(o) = 1. */
+TEST(attn_vsa_rounds_the_attention_before_the_gated_coarse_term) {
+    const float a7 = 1.0078125f, e4 = 0.0625f;
+    T q(RAD_BF16, {4, 2}); q.f({0, 0, 0, 0, 0, 0, 0, 0});
+    T k(RAD_BF16, {4, 2}); k.f({0, 0, 0, 0, 0, 0, 0, 0});
+    T v(RAD_BF16, {4, 2}); v.f({1, 1, a7, a7, 1, 1, a7, a7});
+    T segs(RAD_I32, {2}); segs.n({0, 4});
+    T geom(RAD_I32, {RAD_VGEOM_N}); vsa_geom(geom, 1, 1, 4);
+    T sel(RAD_I32, {1, 2, 2}); sel.n({0, 1, 0, 1});
+    T co(RAD_BF16, {1, 2, 2}); co.f({e4, e4, 3 * e4, e4});
+    T gate(RAD_BF16, {4, 2}); gate.f({e4, -e4, e4, -e4, e4, -e4, e4, -e4});
+    T o(RAD_BF16, {4, 2});
+    A a; a.t(q).t(k).t(v).t(segs).t(geom).t(sel).t(co).t(gate).t(o);
+    vsa_params(a, 4, 2, 1, 1, 2, 1, 0.0);
+    CHECK_OK(run("attn_vsa", a));
+    const float want[8] = { 1.0f, 0.99609375f, 1.0f, 0.99609375f,
+                            1.015625f, 0.99609375f, 1.015625f, 0.99609375f };
+    for (int i = 0; i < 8; ++i) CHECK_EQ(o.at(i), want[i]);
+
+    T o2(RAD_BF16, {4, 2});
+    A b; b.t(q).t(k).t(v).t(segs).t(geom).t(sel).tnull().tnull().t(o2);
+    vsa_params(b, 4, 2, 1, 1, 2, 1, 0.0);
+    CHECK_OK(run("attn_vsa", b));
+    for (int i = 0; i < 8; ++i) CHECK_EQ(o2.at(i), 1.0f);
+}
+
+/* What both ops refuse, writing nothing: a last segment that is not the grid's F Hp Wp rows,
+ * segments past the operands' rows, a sparsity of 1, and the optional pairs half given (coarse
+ * without v, coarse without gate); attn_vsa also a `sel` row that is not k ascending video tiles
+ * (RAD_E_INVAL) and either op a `sel` other than i32. */
+TEST(vsa_ops_refuse_a_wrong_grid_a_bad_selection_and_half_a_pair) {
+    T q(RAD_BF16, {4, 2}); q.f({1, 2, 3, 4, 5, 6, 7, 8});
+    T k(RAD_BF16, {4, 2}); k.f({8, 7, 6, 5, 4, 3, 2, 1});
+    T v(RAD_BF16, {4, 2}); v.f({1, 1, 2, 2, 3, 3, 4, 4});
+    T geom(RAD_I32, {RAD_VGEOM_N}); vsa_geom(geom, 1, 1, 4);
+    T co(RAD_BF16, {1, 2, 2}); co.f({1, 1, 1, 1});
+    T gate(RAD_BF16, {4, 2}); gate.f({1, 1, 1, 1, 1, 1, 1, 1});
+    auto attn = [&](const T& segs, const T& g, const T& sel, bool with_co, bool with_gate,
+                    double sparsity) {
+        T o(RAD_BF16, {4, 2}); o.f({-3, -3, -3, -3, -3, -3, -3, -3});
+        const std::vector<uint8_t> before = o.mem;
+        A a; a.t(q).t(k).t(v).t(segs).t(g).t(sel);
+        if (with_co) a.t(co); else a.tnull();
+        if (with_gate) a.t(gate); else a.tnull();
+        a.t(o);
+        vsa_params(a, 4, 2, 1, 1, 2, 1, sparsity);
+        const int rc = run("attn_vsa", a);
+        if (rc < 0) CHECK(o.mem == before);
+        return rc;
+    };
+    T segs(RAD_I32, {2}); segs.n({0, 4});
+    T good(RAD_I32, {1, 2, 2}); good.n({0, 1, 0, 1});
+    CHECK_OK(attn(segs, geom, good, true, true, 0.0));
+
+    T g3(RAD_I32, {RAD_VGEOM_N}); vsa_geom(g3, 1, 1, 3);
+    CHECK_EQ(attn(segs, g3, good, true, true, 0.0), RAD_E_SHAPE);
+    T s5(RAD_I32, {2}); s5.n({0, 5});
+    CHECK_EQ(attn(s5, geom, good, true, true, 0.0), RAD_E_SHAPE);
+    CHECK_EQ(attn(segs, geom, good, true, true, 1.0), RAD_E_SHAPE);
+    CHECK_EQ(attn(segs, geom, good, true, false, 0.0), RAD_E_SHAPE);
+    for (const std::vector<int64_t>& bad : { std::vector<int64_t>{ 1, 0, 0, 1 },
+                                             std::vector<int64_t>{ 0, 1, 0, 2 },
+                                             std::vector<int64_t>{ 0, 1, 1, 1 } }) {
+        T sel(RAD_I32, {1, 2, 2}); sel.n(bad);
+        CHECK_EQ(attn(segs, geom, sel, true, true, 0.0), RAD_E_INVAL);
+    }
+    T s64(RAD_I64, {1, 2, 2}); s64.n({0, 1, 0, 1});
+    CHECK_EQ(attn(segs, geom, s64, true, true, 0.0), RAD_E_DTYPE);
+
+    T sel(RAD_I32, {1, 2, 2}); sel.n({-7, -7, -7, -7});
+    const std::vector<uint8_t> before = sel.mem;
+    A a; a.t(q).t(k).tnull().t(segs).t(g3).t(sel).tnull();
+    vsa_params(a, 4, 2, 1, 1, 2, 1, 0.5);
+    CHECK_EQ(run("vsa_select", a), RAD_E_SHAPE);
+    A b; b.t(q).t(k).tnull().t(segs).t(geom).t(sel).t(co);
+    vsa_params(b, 4, 2, 1, 1, 2, 1, 0.5);
+    CHECK_EQ(run("vsa_select", b), RAD_E_SHAPE);
+    CHECK(sel.mem == before);
+}
+
+/* ================================================================== the audio vocoder
+ * BigVGAN's forms (MiniMax-H3's audio decoder). */
+
+/* conv_t1d at kernel 9, stride 5, pad 2: output row o sums x[i] w[o + 2 - 5 i] over the rows with
+ * 0 <= o + 2 - 5 i < 9, the bias first. PyTorch's ConvTranspose1d(1, 1, 9, 5, padding 2) over
+ * [1, 10] is the full [1, 2, 3, 4, 5, 16, 27, 38, 49, 50, 60, 70, 80, 90] cropped by 2 a side.
+ * The second sequence ([100]) reads only itself. Kernel 12 at stride 2 pads 5, past a stride:
+ * [1, 10] gives the full product's rows 5..8, [6 + 40, 7 + 50, 8 + 60, 9 + 70]. */
+TEST(conv_t1d_takes_any_kernel_of_at_least_a_stride) {
+    T x(RAD_F32, {3, 1}); x.f({1, 10, 100});
+    T w(RAD_F32, {1, 1, 9}); w.f({1, 2, 3, 4, 5, 6, 7, 8, 9});
+    T b(RAD_F32, {1}); b.f({0.5f});
+    T cu(RAD_I32, {3}); cu.n({0, 2, 3});
+    T y(RAD_F32, {15, 1});
+    A a; a.t(x).t(w).t(b).t(cu).t(y).i("M", 3).i("cin", 1).i("cout", 1).i("stride", 5)
+          .i("k", 9).s("dtype", "f32");
+    CHECK_OK(run("conv_t1d", a));
+    const float want[15] = { 3.5f, 4.5f, 5.5f, 16.5f, 27.5f, 38.5f, 49.5f, 50.5f, 60.5f, 70.5f,
+                             300.5f, 400.5f, 500.5f, 600.5f, 700.5f };
+    for (int i = 0; i < 15; ++i) CHECK_EQ(y.at(i), want[i]);
+
+    T x2(RAD_F32, {2, 1}); x2.f({1, 10});
+    T w2(RAD_F32, {1, 1, 12}); w2.f({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+    T b2(RAD_F32, {1}); b2.f({0});
+    T cu2(RAD_I32, {2}); cu2.n({0, 2});
+    T y2(RAD_F32, {4, 1});
+    A c; c.t(x2).t(w2).t(b2).t(cu2).t(y2).i("M", 2).i("cin", 1).i("cout", 1).i("stride", 2)
+          .i("k", 12).s("dtype", "f32");
+    CHECK_OK(run("conv_t1d", c));
+    CHECK_EQ(y2.at(0), 46.0f); CHECK_EQ(y2.at(1), 57.0f);
+    CHECK_EQ(y2.at(2), 68.0f); CHECK_EQ(y2.at(3), 79.0f);
+
+    /* A kernel short of a stride, and k - stride odd with no pad to break the tie, are refused. */
+    A d; d.t(x2).t(w2).t(b2).t(cu2).t(y2).i("M", 2).i("cin", 1).i("cout", 1).i("stride", 4)
+          .i("k", 3).s("dtype", "f32");
+    CHECK_EQ(run("conv_t1d", d), RAD_E_SHAPE);
+    A e; e.t(x2).t(w2).t(b2).t(cu2).t(y2).i("M", 2).i("cin", 1).i("cout", 1).i("stride", 2)
+          .i("k", 5).s("dtype", "f32");
+    CHECK_EQ(run("conv_t1d", e), RAD_E_SHAPE);
+}
+
+/* conv1d `act` clamp: min(max(y, -1), 1) after the bias. */
+TEST(conv1d_act_clamp_bounds_the_output) {
+    T x(RAD_F32, {4, 1}); x.f({0.5f, 2, -3, -1});
+    T w(RAD_F32, {1, 1, 1}); w.f({1});
+    T cu(RAD_I32, {2}); cu.n({0, 4});
+    T y(RAD_F32, {4, 1});
+    T b(RAD_F32, {1}); b.f({0.25f});
+    A a; a.t(x).t(w).t(cu).tnull().t(y).t(b).i("M", 4).i("cin", 1).i("cout", 1).i("k", 1)
+          .i("dil", 1).s("act", "clamp").s("dtype", "f32");
+    CHECK_OK(run("conv1d", a));
+    CHECK_EQ(y.at(0), 0.75f); CHECK_EQ(y.at(1), 1.0f);
+    CHECK_EQ(y.at(2), -1.0f); CHECK_EQ(y.at(3), -0.75f);
+}
+
+/* snake_aa's paddings, with the activation the identity (alpha 0: sin(0 u) = 0). Ratio 2, filters
+ * of 4: P = 1. Sequence [10, 20, 40] pads to [10, 10, 20, 40, 40]; the transposed f_up [1, 2, 3, 4]
+ * gives [10, 20, 40, 60, 50, 80, 100, 160, 160, 240, 120, 160], doubled and cropped by 3 a side:
+ * u [120, 100, 160, 200, 320, 320]. u pads 1 left and 2 right, [120, 120, 100, 160, 200, 320,
+ * 320, 320, 320], and f_down [1, 2, 3, 4] at stride 2 gives 1300, 2300, 3080. The one-row
+ * sequence [5] pads to [5, 5, 5], u [60, 40], [60, 60, 40, 40, 40]: 460. */
+TEST(snake_aa_pads_each_sequence_by_replication) {
+    T x(RAD_F32, {4, 1}); x.f({10, 20, 40, 5});
+    T al(RAD_F32, {1}); al.f({0});
+    T be(RAD_F32, {1}); be.f({1});
+    T fu(RAD_F32, {1, 1, 4}); fu.f({1, 2, 3, 4});
+    T fd(RAD_F32, {1, 1, 4}); fd.f({1, 2, 3, 4});
+    T cu(RAD_I32, {3}); cu.n({0, 3, 4});
+    T y(RAD_F32, {4, 1});
+    A a; a.t(x).t(al).t(be).t(fu).t(fd).t(cu).t(y).i("M", 4).i("n", 1).i("ratio", 2).i("k", 4)
+          .s("dtype", "f32");
+    CHECK_OK(run("snake_aa", a));
+    CHECK_EQ(y.at(0), 1300.0f); CHECK_EQ(y.at(1), 2300.0f);
+    CHECK_EQ(y.at(2), 3080.0f); CHECK_EQ(y.at(3), 460.0f);
+}
+
+/* snake_aa's SnakeBeta with `log` 1: alpha = beta = 0 read as e^0 = 1, so a = u + sin(u)^2. A
+ * constant 0.125 upsamples by f_up [1, 2, 3, 4] to u alternating 2 (2 + 4) 0.125 = 1.5 and
+ * 2 (1 + 3) 0.125 = 1.0; f_down 0.25 each is the mean of four. In f32 steps: 2.2982655,
+ * 2.1015348, 1.9048042. */
+TEST(snake_aa_applies_snakebeta_between_the_filters) {
+    T x(RAD_F32, {3, 1}); x.f({0.125f, 0.125f, 0.125f});
+    T al(RAD_F32, {1}); al.f({0});
+    T be(RAD_F32, {1}); be.f({0});
+    T fu(RAD_F32, {1, 1, 4}); fu.f({1, 2, 3, 4});
+    T fd(RAD_F32, {1, 1, 4}); fd.f({0.25f, 0.25f, 0.25f, 0.25f});
+    T cu(RAD_I32, {2}); cu.n({0, 3});
+    T y(RAD_F32, {3, 1});
+    A a; a.t(x).t(al).t(be).t(fu).t(fd).t(cu).t(y).i("M", 3).i("n", 1).i("ratio", 2).i("k", 4)
+          .i("log", 1).s("dtype", "f32");
+    CHECK_OK(run("snake_aa", a));
+    CHECK_NEAR(y.at(0), 2.2982655f, 1e-6);
+    CHECK_NEAR(y.at(1), 2.1015348f, 1e-6);
+    CHECK_NEAR(y.at(2), 1.9048042f, 1e-6);
 }
 
 /* ================================================================== the QSA indexer and dflash_conv
@@ -5645,6 +6621,7 @@ std::vector<Geo> geometries() {
         G("quant_act_i8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("quant_act_i8g", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("quant_act_fp8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
+        G("quant_cols_fp8", "M", 3, a.i("M", R).i("n", 32).s("dtype", "f32")),
         G("had_quant_act_fp8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("had_quant_act_i8", "M", 3, a.i("M", R).i("n", 32).i("group", 16).s("dtype", "f32")),
         G("rmsnorm_had_quant_i8", "M", 3, a.i("M", R).i("n", 32).d("eps", 1e-6).i("group", 16)
@@ -5773,6 +6750,54 @@ std::vector<Geo> geometries() {
         G("attn_prefix_self", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2)
                                           .i("block_size", 4).i("causal", 1).s("q_dtype", "bf16")
                                           .s("kv_dtype", "bf16").i("n_head", 4).i("ctx", 5)),
+        G("conv1d", "M", 8, a.i("M", R).i("cin", 2).i("cout", 3).i("k", 3).i("dil", 1)
+                            .s("dtype", "f32")),
+        G("conv_t1d", "M", 8, a.i("M", R).i("cin", 2).i("cout", 3).i("stride", 2).s("dtype", "f32")),
+        G("snake", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
+        G("cfg_topk_sample", "M", 4, a.i("M", R).i("n_vocab", 64).i("k", 8).i("rep", 2)
+                                     .d("cfg", 1.5).i("stream", 0).s("dtype", "f32")),
+        G("rvq_embed", "M", 3, a.i("M", R).i("n_embd", 8).i("n_codes", 3).i("vocab", 16)
+                               .i("off0", 4).d("scale", 1.0).s("dtype", "bf16")),
+        G("frame_mix_store", "M", 2, a.i("M", R).i("n_embd", 8).i("L", 3).i("stride", 4)
+                                     .i("rep", 2).s("dtype", "bf16")),
+        G("end_status", "M", 2, a.i("M", R).i("end", 5).i("rep", 2)),
+        G("resample_nearest", "M", 6, a.i("M", R).i("n", 8).s("dtype", "f32")),
+        G("fourier_embed", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
+        G("win_input", "M", 8, a.i("M", R).i("n_lat", 4).i("n_zero", 2).i("n_cond", 3)
+                               .i("stride", 4).s("dtype", "bf16")),
+        G("win_prep", "M", 8, a.i("M", R).i("n", 4).i("stride", 4).i("ov", 2).s("dtype", "bf16")),
+        G("win_finish", "M", 8, a.i("M", R).i("n", 4).i("n_cond", 3).i("stride", 4).i("ov", 2)
+                                .s("dtype", "bf16")),
+        G("chan_split", "M", 3, a.i("M", R).i("n", 4).i("parts", 2).s("dtype", "f32")),
+        G("interleave2", "M", 4, a.i("M", R).s("dtype", "f32")),
+        G("iota", "M", 4, a.i("M", R).i("start", 0).i("step", 1)),
+        G("cu_repeat", "M", 3, a.i("M", R).i("mult", 2)),
+        G("frame_store", "M", 2, a.i("M", R).i("n_codes", 4).i("stride", 6).i("rep", 2)
+                                 .i("skip", 0)),
+        G("rms_mod", "M", 4, a.i("M", R).i("n", 8).d("eps", 1e-6).i("gated", 1).s("dtype", "bf16")),
+        G("rms_mod_quant_fp8", "M", 4, a.i("M", R).i("n", 32).d("eps", 1e-6).i("group", 16)
+                                       .i("gated", 1).s("dtype", "bf16")),
+        G("flow_x0_step", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
+        G("patch_unfold", "M", 32, a.i("M", R).i("C", 3).i("pt", 1).i("ph", 2).i("pw", 2)
+                                   .s("mul", "1 2 3").s("add", "0 1 2").s("dtype", "f32")),
+        G("vtile_gather", "M", 60, a.i("M", R).i("n", 8).i("tile", 2).i("overlap", 1)
+                                   .i("frames", 3).i("period", 15).i("n_reg", 2)
+                                   .s("dtype", "f32")),
+        G("vtile_stitch", "M", 108, a.i("M", R).i("tile", 2).i("overlap", 1).i("scale", 2)
+                                    .i("pt", 2).i("skip", 1).i("keep", 2).i("blend", 1)
+                                    .i("period", 13).s("mean", "0.485 0.456 0.406")
+                                    .s("std", "0.229 0.224 0.225")),
+        G("grid_pos3", "M", 40, a.i("M", R).i("T", 2).i("H", 3).i("W", 4).i("period", 27)
+                                .d("scale", 1.0)),
+        G("snake_aa", "M", 8, a.i("M", R).i("n", 8).i("ratio", 2).i("k", 12).s("dtype", "f32")),
+        /* A 3 x 3 x 3 grid in boxes of 2 and two dense segments of its 27 rows; attn_vsa at
+         * k = 1, the one selection its description draws. */
+        G("vsa_select", "M", 81, a.i("M", R).i("head_dim", 8).i("tile_t", 2).i("tile_h", 2)
+                                 .i("tile_w", 2).i("patch", 1).d("sparsity", 0.8)
+                                 .s("dtype", "f32")),
+        G("attn_vsa", "M", 81, a.i("M", R).i("head_dim", 8).i("tile_t", 2).i("tile_h", 2)
+                               .i("tile_w", 2).i("patch", 1).d("sparsity", 0.9)
+                               .s("dtype", "f32")),
     };
 }
 #undef G

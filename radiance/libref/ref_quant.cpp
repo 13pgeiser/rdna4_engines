@@ -316,6 +316,39 @@ int ref_quant_act_fp8(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------- quant_cols_fp8 */
+/* E4M3 codes with ONE scale per column over all M rows: scale[c] = amax_r |x[r, c]| times 1/448
+ * in f32 (1 for an all-zero column), y = clamp(x * (1/scale), +-448) rounded to nearest even. The
+ * value side of an attention's fp8 P.V: a column is one dimension of one head, so the scale
+ * multiplies out of the sum over keys. */
+int ref_quant_cols_fp8(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *y = &a->t[1], *s = &a->t[2];
+    const int64_t n = p_int(a, "n", 0);
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = numel(x) / n;
+    if (rows <= 0 || numel(y) < rows * n || numel(s) < n) return RAD_E_SHAPE;
+    const int64_t xs = laststride(x), ys = laststride(y), ss = laststride(s);
+    REF_PAR_FOR(rows * n)
+    for (int64_t c = 0; c < n; ++c) {
+        float amax = 0.0f;
+        for (int64_t r = 0; r < rows; ++r) {
+            const float m = std::fabs(ldt(x, rowoff(x, r, n) + c * xs));
+            if (m > amax) amax = m;
+        }
+        const float sc = amax > 0.0f ? amax * (1.0f / 448.0f) : 1.0f;
+        const float inv = 1.0f / sc;
+        for (int64_t r = 0; r < rows; ++r) {
+            float v = ldt(x, rowoff(x, r, n) + c * xs) * inv;
+            if (v > 448.0f) v = 448.0f;
+            if (v < -448.0f) v = -448.0f;
+            stt(y, rowoff(y, r, n) + c * ys, v);
+        }
+        stt(s, c * ss, sc);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------- had_quant_act_fp8 */
 /* The same quantiser with a `group`-wide Hadamard before the absmax, which lowers the maximum the
  * grid is scaled by.

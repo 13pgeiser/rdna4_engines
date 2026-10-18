@@ -258,6 +258,32 @@ const RadChatFormat* rad_tools_chat_format(const LoadedPlugins& lp, const RadMod
     return ap->arch_chat_format(&meta);
 }
 
+int rad_tools_text_prepare(const LoadedPlugins& lp, int field, const std::string& in,
+                           std::string* out) {
+    const Plugin* ap = rad_tools_registry().plugin(lp.arch_plugin);
+    if (!ap || !ap->arch_text_prepare) {
+        *out = in;
+        return RAD_OK;
+    }
+    std::string buf(in.size() * 2 + 64, '\0');
+    for (int tries = 0; tries < 2; ++tries) {
+        const int64_t n = ap->arch_text_prepare(field, in.c_str(), &buf[0], (int64_t)buf.size());
+        if (n < 0) return (int)n;
+        if (n < (int64_t)buf.size()) {
+            buf.resize((size_t)n);
+            *out = std::move(buf);
+            return RAD_OK;
+        }
+        buf.assign((size_t)n + 1, '\0');
+    }
+    return RAD_E_STATE;
+}
+
+VideoPositionsFn rad_tools_video_positions(const LoadedPlugins& lp) {
+    const Plugin* ap = rad_tools_registry().plugin(lp.arch_plugin);
+    return ap ? ap->arch_video_positions : nullptr;
+}
+
 const RadAudioFormat* rad_tools_audio_format(const LoadedPlugins& lp, const RadModelMeta& meta) {
     const Plugin* ap = rad_tools_registry().plugin(lp.arch_plugin);
     if (!ap || !ap->arch_audio_format) return nullptr;
@@ -368,8 +394,8 @@ int rad_tools_declare(const LoadedPlugins& lp, const RadModelMeta& meta, const R
         return s;
     }
 
-    /* RUNTIME LoRA, after the plugin and before the sampler: the sites read the plugin's finished
-     * graph, and the appended ops go through the same resolution as everything else. */
+    /* Runtime LoRA, after the plugin and before the sampler: the sites read the plugin's finished
+     * graph, and the appended ops go through the same resolution as every other op. */
     if (with_lora) {
         b.set_lora_targets(nullptr);
         s = lora_declare(b, *lora);
@@ -381,9 +407,9 @@ int rad_tools_declare(const LoadedPlugins& lp, const RadModelMeta& meta, const R
 
     /* The sampler declares into the same builder before finish(). An unresolved sampler op is not
      * a declare failure (a deployment that never sends `typical_p` needs no typical kernel), so a
-     * negative return here is structural. Skipped for embedding programs and image generators,
-     * which sample no token. */
-    if (also && b.program().pooled_buf == RAD_NULL_HANDLE && !b.program().is_generator()) {
+     * negative return here is structural. Skipped for embedding programs and generators, which
+     * sample through no token sampler (an audio generator samples its frames itself). */
+    if (also && b.program().pooled_buf == RAD_NULL_HANDLE && !b.program().is_pass_driven()) {
         /* This rank's vocabulary width, taken from the declared logits buffer rather than
          * re-derived from n_vocab and world_size, which would break when a plugin does not split
          * the vocabulary (arch/common/rad_arch.h does not). A wrong width does not crash; it

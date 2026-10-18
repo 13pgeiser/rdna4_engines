@@ -3,28 +3,23 @@
  *     lora_shrink   t[m, j]  = sum_k x(m, k) * A[s, j, k]                     s = slot[m]
  *     lora_expand   y[m, n]  = y[m, n] + scale[s, n] * sum_j t[m, j] * B[s, n, j]
  *
- * A step mixes rows of several adapters and rows of none, so the adapter is a PER-ROW operand: a
- * row whose slot is outside [0, S) is a BASE row and neither op touches it. That is stronger than
- * "adds zero": `y + 0` turns a -0 into +0, and the promise the engine makes is that a base row is
- * bit-for-bit what the gemm wrote. So shrink writes nothing into a base row of `t` and expand does
- * no read-modify-write of a base row of `y` at all -- not a store of the value it read, no store.
+ * The adapter is a per-row operand, since a step mixes rows of several adapters and rows of none.
+ * A row whose slot is outside [0, S) is a base row and neither op touches it: shrink writes nothing
+ * into its `t` row and expand neither reads nor stores its `y` row, so a base row stays bit for bit
+ * what the gemm wrote (`y + 0` would turn -0 into +0).
  *
- * x(m, k) IS THE VALUE gemm_nt_q USES FOR THAT ACTIVATION ELEMENT, read the same way: the row and
- * column strides of `a` (a column slice of a fused projection arrives with the whole projection's
- * row stride), and the scale stream through ref_gemm.h's make_scales, which is gemm_nt_q's own
- * reading of `a_scale`. A code times its group's scale is one f32 product; a bf16, f16 or f32
- * activation is its value as it stands. One more rounding than gemm_nt_q's group sub-sum makes on
- * a quantised activation, and it is the contract (docs/OPS.md): the LoRA term is a low-rank
- * correction, and folding the scale per element keeps the kernels free of a group loop.
+ * x(m, k) is the value gemm_nt_q uses for that activation element, read the same way: through the
+ * row and column strides of `a` (a column slice of a fused projection keeps the whole projection's
+ * row stride) and through ref_gemm.h's make_scales for `a_scale`. A code times its group's scale is
+ * one f32 product and a float activation is its value. That is one more rounding than gemm_nt_q's
+ * group sub-sum, and it is the contract (docs/OPS.md): it keeps the kernels free of a group loop.
  *
- * THE SUM IS PER ROW AND ITS ORDER IS FIXED: k ascending for shrink, j ascending for expand, one
- * f32 accumulator, no FMA (libref/CMakeLists.txt). Nothing here depends on M or on another row --
- * the batch a row arrives in cannot change its bytes, which is what lets the engine claim "mixed
- * batch == the same request alone" for the LoRA term.
+ * The sum is per row in a fixed order (k ascending for shrink, j ascending for expand, one f32
+ * accumulator, no FMA: libref/CMakeLists.txt), so a row's bytes do not depend on M or on the rows
+ * batched with it.
  *
- * EVERY EXTENT IS THE OPERAND'S, and the parameters are cross-checks (ref_ops.h): `M` is the band,
- * so the rows are `t`'s for shrink and `y`'s for expand, and `K`, `N`, `R`, `S` say how to read the
- * tensors and are refused where the tensors are too small for them.
+ * Every extent is the operand's and the parameters are cross-checks (ref_ops.h): `M` is the band,
+ * and `K`, `N`, `R`, `S` say how to read the tensors and are refused where a tensor is too small.
  */
 #include "ref_common.h"
 #include "ref_gemm.h"
@@ -40,9 +35,8 @@ static inline int64_t row_slot(const RadTensor* slot, int64_t m, int64_t S) {
     return (s >= 0 && s < S) ? s : -1;
 }
 
-/* A pool operand [S, rows, cols]: its three strides. The pools are whole declared buffers and so
- * dense in the engine; a rank-3 tensor is read through its own strides anyway, because "the
- * engine's buffers are dense" is a fact about one caller and not about the op. */
+/* A pool operand [S, rows, cols]: its three strides. The engine's pools are dense, but a rank-3
+ * tensor is read through its own strides: density is a fact about one caller, not about the op. */
 struct Pool3 { int64_t s0, s1, s2; };
 static inline Pool3 pool3(const RadTensor* t, int64_t rows, int64_t cols) {
     if (t->rank == 3) return Pool3{ t->stride[0], t->stride[1], t->stride[2] };
@@ -77,12 +71,10 @@ int ref_lora_shrink(const RadArgs* a, RadStream) {
     if (coded_act(X->dtype) && !XS) return RAD_E_INVAL;     /* a code without its scale */
     if (T->dtype != RAD_F32) return RAD_E_DTYPE;
 
-    /* gemm_nt_q's reading of the scale stream, and a `group` cross-check: the stream states the
-     * group, and a parameter whose GRID disagrees with it is a caller describing other bytes. The
-     * grid -- groups along K -- and not the number, because a K no wider than one group has one
-     * group whatever `group` says (a 64-wide row under 128), and from two groups up one power of
-     * two gives each count. Absent the stream the parameter says nothing: a bf16 activation has no
-     * scale whatever `group` holds. */
+    /* gemm_nt_q's reading of the scale stream, and a `group` cross-check: a parameter whose grid
+     * (groups along K) disagrees with the stream's describes other bytes. The grid and not the
+     * number, because a K no wider than one group has one group whatever `group` says. Without a
+     * stream the parameter says nothing: a float activation has no scale. */
     const Scales SA = make_scales(XS, M, K, false);
     const int64_t gp = p_int(a, "group", 0);
     if (gp > 0 && SA.p && (K + gp - 1) / gp != (K + SA.group - 1) / SA.group) return RAD_E_SHAPE;

@@ -22,8 +22,8 @@ Written by Deadcode, with contributions from:
   request log, an uneven world's per-rank KV and weights split, --rope-scaling, the model entry's
   context length, root and capabilities, /props, the three-rank two-shot all-reduce and tiered-int8
   wire, the diagnosis of the three-rank lossy-wire crash, cardclock.py, --busy-prefill-chunk, curl,
-  jq and a CA bundle in the image with hfget.sh under its busybox, rad-export, and
-  --prefill-interleave
+  jq and a CA bundle in the image with hfget.sh under its busybox, rad-export, --prefill-interleave,
+  and runtime LoRA adapters served beside the base model and picked per request
 - hazyumps: static YaRN for the Qwen rotary paths
 - malic: ParoQuant, with its MXFP4, int5 and int4 checkpoints imported and served, the Givens
   rotation as stages and as dense per-group matrices on the matrix cores, and the 5- and 4-bit

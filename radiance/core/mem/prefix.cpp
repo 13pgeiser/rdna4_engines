@@ -82,6 +82,58 @@ void KeepAll::select(const std::vector<int64_t>& pos, std::vector<int64_t>* keep
     *keep = pos;
 }
 
+/* A session's tip is usually a prompt's tail between two interval checkpoints, so each step also
+ * counts the ladder with a tail half an interval on as its tip. */
+int64_t CheckpointPolicy::held(int64_t ctx, int64_t interval) const {
+    if (interval <= 0 || ctx < interval) return 1;
+    std::vector<int64_t> kept, keep;
+    size_t most = 0;
+    for (int64_t p = interval; p <= ctx; p += interval) {
+        kept.push_back(p);
+        select(kept, &keep);
+        std::sort(keep.begin(), keep.end());
+        kept.swap(keep);
+        most = std::max(most, kept.size());
+        if (p + interval / 2 <= ctx) {
+            std::vector<int64_t> tipped = kept;
+            tipped.push_back(p + interval / 2);
+            select(tipped, &keep);
+            most = std::max(most, keep.size());
+        }
+    }
+    return (int64_t)most;
+}
+
+int64_t KeepAll::held(int64_t ctx, int64_t interval) const {
+    return interval > 0 && ctx >= interval ? ctx / interval : 1;
+}
+
+std::unique_ptr<CheckpointPolicy> make_checkpoint_policy(const std::string& name,
+                                                         int64_t interval) {
+    if (name == "tip-only") return std::make_unique<KeepTipOnly>();
+    if (name == "keep-all") return std::make_unique<KeepAll>();
+    return std::make_unique<GeometricBackoff>(interval);
+}
+
+CheckpointSlots checkpoint_slots_auto(const CheckpointPolicy& policy, int64_t max_seqs,
+                                      int64_t ctx, int64_t interval, int64_t slot_bytes,
+                                      int64_t share_bytes, int64_t room_bytes) {
+    CheckpointSlots c;
+    c.per_seq = policy.held(ctx, interval) + 1;
+    const int64_t seqs = std::max<int64_t>(max_seqs, 1);
+    c.want = seqs > INT64_MAX / c.per_seq ? INT64_MAX : seqs * c.per_seq;
+    if (slot_bytes <= 0) return c;
+    const int64_t share = std::max<int64_t>(share_bytes, 0) / slot_bytes;
+    const int64_t room = std::max<int64_t>(room_bytes, 0) / slot_bytes;
+    c.slots = std::min(c.want, std::max(share, std::min(c.want, kCheckpointSlotsFloor)));
+    if (c.slots < c.want) c.bound = CheckpointSlots::Bound::Share;
+    if (room < c.slots) {
+        c.slots = room;
+        c.bound = CheckpointSlots::Bound::Room;
+    }
+    return c;
+}
+
 /* ------------------------------------------------------------------ configure */
 
 int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_interval) {
@@ -93,11 +145,8 @@ int PrefixCache::configure(const Config& cfg, KVManager* kv, int64_t checkpoint_
     groups_.clear();
     map_.clear(); lru_.clear();
     ck_by_prefix_.clear(); ck_by_session_.clear();
-    /* config_parse rejects unknown names, so the else branch is "geometric-backoff".
-     * set_policy() may override this afterwards. */
-    if (cfg.checkpoint_policy == "tip-only")      policy_ = std::make_unique<KeepTipOnly>();
-    else if (cfg.checkpoint_policy == "keep-all") policy_ = std::make_unique<KeepAll>();
-    else policy_ = std::make_unique<GeometricBackoff>(checkpoint_interval);
+    /* set_policy() may override this afterwards. */
+    policy_ = make_checkpoint_policy(cfg.checkpoint_policy, checkpoint_interval);
     report_.clear();
 
     if (!kv) return RAD_E_INVAL;
@@ -202,7 +251,7 @@ void PrefixCache::touch(const BlockHash& h, uint64_t now_ns) const {
 CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
                              const std::vector<MMContentKey>& mm,
                              std::vector<std::vector<int32_t>>* blocks_out,
-                             const HitCap* cap) const {
+                             const HitCap* cap, uint64_t session) const {
     CacheHit hit;
     if (blocks_out) { blocks_out->assign(groups_.size(), {}); }
     if (!enabled_ || tokens.empty()) return hit;
@@ -296,6 +345,7 @@ CacheHit PrefixCache::lookup(const std::vector<int32_t>& tokens,
     best->second.used_ns = now;
     handed_.push_back(best->first);
     ++stats_.ckpt_hits;
+    if (session != 0) take_over(session, hs, hit.n_attn_tokens);
     return hit;
 }
 
@@ -384,13 +434,16 @@ int PrefixCache::insert(uint64_t session,
         tiers_->note_session(session, hs, n_tokens, now, label);
     }
 
-    /* A conversation's snapshots belong to its latest turn. Sessions are keyed by request id, so
-     * without this each earlier turn's deepest snapshot would stay a protected tip. Every snapshot
-     * on the chain just published moves under this id, so the policy sees one session, one tip. */
+    take_over(session, hs, n_full * block_size_);
+    return RAD_OK;
+}
+
+void PrefixCache::take_over(uint64_t session, const std::vector<BlockHash>& hs,
+                            int64_t upto) const {
     for (auto& kvp : ck_by_prefix_) {
         Ckpt& c = kvp.second;
-        if (c.session == session || c.pos <= 0 || c.pos > n_full * block_size_ ||
-            c.pos % block_size_ != 0 || hs[(size_t)(c.pos / block_size_ - 1)] != kvp.first)
+        if (c.session == session || c.pos <= 0 || c.pos > upto || c.pos % block_size_ != 0 ||
+            hs[(size_t)(c.pos / block_size_ - 1)] != kvp.first)
             continue;
         auto old = ck_by_session_.find(c.session);
         if (old != ck_by_session_.end()) {
@@ -401,7 +454,6 @@ int PrefixCache::insert(uint64_t session,
         c.session = session;
         ck_by_session_[session].push_back(kvp.first);
     }
-    return RAD_OK;
 }
 
 

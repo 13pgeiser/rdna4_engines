@@ -8,8 +8,9 @@
  *
  * Deliberately absent, answering 404: vLLM's /pooling, /classify, /score and /rerank (no
  * classifier or cross-encoder head), /sleep, /wake_up and /is_sleeping (no sleep mode; weights
- * are placed once, spec §5), the LoRA endpoints (no LoRA), /invocations (a SageMaker envelope),
- * stored Responses-API responses (would need a conversation store), and llama-server's /slots.
+ * are placed once, spec §5), /invocations (a SageMaker envelope), stored Responses-API responses
+ * (would need a conversation store), and llama-server's /slots and /lora-adapters (a runtime LoRA
+ * adapter is chosen per request by `model`; vLLM's load and unload routes are in server.cpp).
  */
 #include "server.h"
 
@@ -311,6 +312,8 @@ HttpResponse Server::handle_props(const HttpRequest&) {
     params["backend_sampling"]    = false;
     params["timings_per_token"]   = false;
     params["post_sampling_probs"] = false;
+    /* The adapters a request runs with when it names none: never any, since an adapter is chosen
+     * by `model` (they are listed on /v1/models). */
     params["lora"]                = json::array();
 
     json gen;
@@ -385,7 +388,7 @@ json Server::capabilities() const {
     caps["reasoning"] = deps_.chat && deps_.chat->supports_reasoning();
     /* An image model reads pictures only for edits and writes no text a grammar could constrain,
      * whatever its conditioning network's processor would take. */
-    const bool img = opt_.image_model;
+    const bool img = opt_.image_model || opt_.video_model;
     caps["grammar"]   = !img && deps_.grammar != nullptr;
     caps["embedding"] = deps_.embed != nullptr;
     caps["image"]     = deps_.mm && deps_.mm->accepts(MediaKind::Image);
@@ -394,6 +397,8 @@ json Server::capabilities() const {
     caps["logprobs"]  = opt_.supports_logprobs;
     caps["image_generation"] = deps_.images != nullptr;
     caps["image_edit"]       = deps_.images != nullptr && deps_.images->info().max_refs > 0;
+    caps["audio_generation"] = deps_.audio != nullptr;
+    caps["video_generation"] = deps_.videos != nullptr;
     /* The efforts a chat request may send, probed from the template at startup; null when it
      * takes any word. "none" and "minimal" are this server's and turn thinking off. */
     if (lim_.reasoning_efforts.empty()) {

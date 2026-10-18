@@ -63,6 +63,8 @@ int32_t layer_from_name(const std::string& n) {
 struct Logical {
     CkptWeight      src;
     const CompiledRule* rule = nullptr;
+    /* The `import` rule that re-expressed it (ckpt_import_form); `rule` is then null. */
+    const RecipeRule*   import_rule = nullptr;
     RadEncoding     enc{};
     int             status = RAD_OK;
     std::string     why;
@@ -125,7 +127,8 @@ void usage() {
         "      --set K=V        a metadata key, seen by declare AND written into the container,\n"
         "                       so a convert-time choice that must also hold at serve time is\n"
         "                       stated once. Repeatable\n"
-        "      --max-tok N      the max_tok declare is run at (default 8192)\n"
+        "      --max-tok N      the max_tok declare is run at (default 8192, or a generator's\n"
+        "                       largest pass)\n"
         "      --max-ctx N      the context bound declare is run at, as --max-model-len is on\n"
         "                       the engine. Default: the checkpoint's training context\n"
         "      --draft-model DIR  a drafter that ships as its own repository (DFlash2), merged\n"
@@ -180,6 +183,7 @@ int main(int argc, char** argv) {
     std::vector<std::string> hierarchy = rad_hierarchy_from_env();
     std::vector<std::string> recipe_files, quant_flags;
     int64_t  max_tok = 8192;
+    bool     max_tok_given = false;
     int64_t  max_ctx = 0;            /* 0: the checkpoint's training context */
     static const int kMaxSpecDefault = 4;
     int      max_spec = kMaxSpecDefault;
@@ -220,7 +224,7 @@ int main(int argc, char** argv) {
             }
             set_kv.emplace_back(kv.substr(0, eq), kv.substr(eq + 1));
         }
-        else if (a == "--max-tok")   max_tok = num("--max-tok", 1, INT64_MAX);
+        else if (a == "--max-tok")   { max_tok = num("--max-tok", 1, INT64_MAX); max_tok_given = true; }
         else if (a == "--max-ctx")   max_ctx = num("--max-ctx", 0, INT64_MAX);
         else if (a == "--max-spec")  { max_spec = (int)num("--max-spec", 0, INT32_MAX);
                                        max_spec_given = true; }
@@ -269,6 +273,15 @@ int main(int argc, char** argv) {
                             o.deflt ? (std::string(o.deflt) + "]").c_str() : "");
             }
         }
+        std::printf("%s  (rad-convert)\n    the numbers the checkpoint ships, in another spelling: "
+                    "an imported integer grid or an FP8 weight with a scale per row or per tensor\n"
+                    "    codes        str  uN: a symmetric grid's codes unsigned, under a zero "
+                    "point of 2^(N-1)\n"
+                    "    zero         str  the zero plane's dtype (u4, u8)\n"
+                    "    scale        str  the scale plane's dtype (f16, bf16, f32), rounded to "
+                    "nearest\n"
+                    "    block        str  RxC: an FP8 scale per row or per tensor repeated over "
+                    "this block grid\n", kImportRule);
         return 0;
     }
 
@@ -417,9 +430,21 @@ int main(int argc, char** argv) {
     Registry& reg = rad_tools_registry();
     std::deque<CompiledRule> compiled;
     std::map<const RecipeRule*, const CompiledRule*> by_rule;
+    std::map<const RecipeRule*, ImportForm> import_forms;
     for (const RecipeRule& r : recipe.rules()) {
-        compiled.emplace_back();
         std::string why;
+        /* rad-convert's own rule: the numbers a checkpoint ships in another spelling
+         * (ckpt_import_form) instead of a quantiser's. */
+        if (r.quantizer == kImportRule) {
+            ImportForm f;
+            if (ckpt_import_form_parse(r.options, &f, &why) < 0) {
+                RAD_ERR("%s: %s", r.origin.c_str(), why.c_str());
+                return 2;
+            }
+            import_forms[&r] = f;
+            continue;
+        }
+        compiled.emplace_back();
         if (compiled.back().build(r, reg, &why) < 0) { RAD_ERR("%s", why.c_str()); return 2; }
         by_rule[&r] = &compiled.back();
     }
@@ -448,6 +473,9 @@ int main(int argc, char** argv) {
         RAD_INFO("declaring at max_spec %d, the only depth this drafter serves", max_spec);
     }
     ctx.max_spec = max_spec;
+    /* A generator sizes its passes itself (RadArchProbe::gen_rows) and may refuse a smaller one;
+     * declare at that size unless the command line names one. */
+    if (!max_tok_given && probe.gen_rows > ctx.max_tok) ctx.max_tok = probe.gen_rows;
     /* Likewise declare the encoders, the vision tower at the engine's default patch bound. */
     if (rad_meta_geti(&meta.m, "vision_config.patch_size", 0) > 0) {
         ctx.max_enc_patches = 16384;
@@ -469,10 +497,23 @@ int main(int argc, char** argv) {
         if (rc == RAD_E_NOTFOUND) return rc;
         Logical L;
         L.src = std::move(cw);
+        const RecipeRule* r = rc < 0 ? nullptr : recipe.match(name);
         if (rc < 0) {
             L.status = rc;
             L.why = why;
-        } else if (const RecipeRule* r = recipe.match(name)) {
+        } else if (r && r->quantizer == kImportRule) {
+            std::string w2;
+            const int st = ckpt_import_form(&L.src, import_forms[r], &w2);
+            if (st == RAD_OK) {
+                L.import_rule = r;
+                L.enc = L.src.enc;
+            } else if (st == RAD_E_UNSUPPORTED && (L.src.trivial || L.src.imported)) {
+                L.enc = L.src.enc;        /* declined: a plain weight, kept as it is */
+            } else {
+                L.status = st;
+                L.why = r->origin + " (import): " + w2;
+            }
+        } else if (r) {
             L.rule = by_rule[r];
             const RadQuantWeight qw = quant_weight(L, nullptr);
             const int st = L.rule->q->encoding(L.rule->params.data(), (int)L.rule->params.size(),
@@ -624,6 +665,29 @@ int main(int argc, char** argv) {
                 RAD_WARN("%s: rule '%s %s' matches no weight", c.rule->origin.c_str(),
                          c.rule->pattern.c_str(), c.rule->quantizer.c_str());
         }
+        /* The import rules: what each re-expressed, and every scale its dtype rounded. */
+        for (const auto& [r, f] : import_forms) {
+            int64_t n = 0, n_round = 0, rounded = 0;
+            double max_rel = 0;
+            for (const Logical* L : plan) {
+                if (L->import_rule != r) continue;
+                ++n;
+                if (L->src.rounded) ++n_round;
+                rounded += L->src.rounded;
+                max_rel = std::max(max_rel, L->src.max_rel);
+            }
+            if (n == 0)
+                RAD_WARN("%s: rule '%s %s' re-expresses no weight", r->origin.c_str(),
+                         r->pattern.c_str(), r->quantizer.c_str());
+            else if (rounded == 0)
+                RAD_INFO("import   %s: %lld weight(s) re-expressed, every shipped value exact",
+                         r->origin.c_str(), (long long)n);
+            else
+                RAD_INFO("import   %s: %lld weight(s) re-expressed; %lld scale(s) of %lld of them "
+                         "rounded to %s, largest relative change %.3e", r->origin.c_str(),
+                         (long long)n, (long long)rounded, (long long)n_round,
+                         rad_dtype_name(f.scale), max_rel);
+        }
     }
 
     if (plan_only) {
@@ -636,8 +700,11 @@ int main(int argc, char** argv) {
             if (verbose)
                 RAD_DEBUG("  %-52s %-34s %10s  %s%s%s", L->src.name.c_str(),
                           enc_name(L->enc).c_str(), humanb(b).c_str(),
-                          L->rule ? L->rule->rule->quantizer.c_str() : "as is",
-                          L->rule ? " " : "", L->rule ? L->rule->rule->options_text().c_str() : "");
+                          L->rule ? L->rule->rule->quantizer.c_str()
+                                  : L->import_rule ? kImportRule : "as is",
+                          L->rule || L->import_rule ? " " : "",
+                          L->rule ? L->rule->rule->options_text().c_str()
+                                  : L->import_rule ? L->import_rule->options_text().c_str() : "");
         }
         RAD_INFO("--plan-only: about %s would be written; nothing was written to %s.",
                  humanb(bytes).c_str(), out.c_str());
@@ -721,8 +788,9 @@ int main(int argc, char** argv) {
         Logical& L = *Lp;
         RadWriter::Weight ww;
         ww.name = L.src.name;
-        ww.quantizer = L.rule ? L.rule->rule->quantizer : "";
-        ww.options = L.rule ? L.rule->rule->options_text() : "";
+        const RecipeRule* rr = L.rule ? L.rule->rule : L.import_rule;
+        ww.quantizer = rr ? rr->quantizer : "";
+        ww.options = rr ? rr->options_text() : "";
         ww.enc = L.enc;
         ww.rank = L.src.rank;
         for (uint32_t i = 0; i < RAD_MAX_RANK; ++i) ww.shape[i] = L.src.shape[i];

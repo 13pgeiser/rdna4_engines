@@ -55,7 +55,42 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
                               "RAD_SHARD_NONE", w.decl.shard == RAD_SHARD_ROW ? "ROW" : "COL",
                               rank));
         const bool cols = w.decl.shard == RAD_SHARD_COL || rank == 1;
-        if (cols) {
+        const int np1 = rank == 1 && w.decl.n_row_parts > 1 ? w.decl.n_row_parts : 1;
+        if (cols && np1 > 1) {
+            /* A rank-1 weight of stacked parts (a fused projection's bias, [value | gate]) is cut
+             * as the matrix it goes with: this rank's slice of each part, never a contiguous
+             * slice of the stack. Per-part spans and declared parts read as the row cut's do. */
+            if (w.n_part_spans > 0) {
+                if (w.n_part_spans != np1)
+                    return refuse(fmt("%d per-part spans for %d stacked parts", w.n_part_spans, np1));
+                int64_t sum = 0, soff = 0;
+                for (int g = 0; g < np1; ++g) sum += w.part_total[g];
+                if (sum != VC)
+                    return refuse(fmt("the %d stacked parts' stated elements sum to %lld and the "
+                                      "entry has %lld", np1, (long long)sum, (long long)VC));
+                for (int g = 0; g < np1; ++g) {
+                    view.push_back({ 0, VR, soff + w.part_lo[g], soff + w.part_hi[g] });
+                    soff += w.part_total[g];
+                }
+            } else {
+                if (span)
+                    return refuse("a single span over a rank-1 weight of stacked parts is not "
+                                  "defined; state one span a part");
+                if (VC % world) return refuse(fmt("%lld elements do not divide by %d ranks",
+                                                  (long long)VC, world));
+                int64_t sum = 0, soff = 0;
+                for (int g = 0; g < np1; ++g) sum += w.decl.row_parts[g];
+                if (sum != VC / world)
+                    return refuse(fmt("%d declared parts sum to %lld, and the rank's share of %lld "
+                                      "elements at %d ranks is %lld", np1, (long long)sum,
+                                      (long long)VC, world, (long long)(VC / world)));
+                for (int g = 0; g < np1; ++g) {
+                    const int64_t take = w.decl.row_parts[g];
+                    view.push_back({ 0, VR, soff + index * take, soff + (index + 1) * take });
+                    soff += take * world;
+                }
+            }
+        } else if (cols) {
             int64_t c0 = w.shard_lo, c1 = w.shard_hi;
             if (!span) {
                 if (VC % world) return refuse(fmt("%lld columns do not divide by %d ranks",
@@ -162,7 +197,11 @@ int weight_share(const WeightInfo& w, const RadEncoding& enc, uint32_t rank, con
             s.rows += pq.rows;
             s.cols = pq.cols;
         }
-        if (s.rows != w.sel_rows[k] || s.cols != w.sel_cols[k])
+        /* A vector's stacked parts come out as one piece a part, each a row of the share; laid
+         * end to end they are the declared vector, so only the element count has to agree. */
+        const bool fits = rank == 1 ? s.rows * s.cols == w.sel_rows[k] * w.sel_cols[k]
+                                    : s.rows == w.sel_rows[k] && s.cols == w.sel_cols[k];
+        if (!fits)
             return refuse(fmt("this rank's share of the '%s' plane is [%lld, %lld] and the "
                               "declaration says [%lld, %lld]", p.role, (long long)s.rows,
                               (long long)s.cols, (long long)w.sel_rows[k],

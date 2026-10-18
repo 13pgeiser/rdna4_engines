@@ -138,6 +138,10 @@ the cards the engine runs on.
 | `qwen-image-2.1.yaml` | `qwen-image-2.1-fp8.rad` | Qwen-Image 2.1 as block fp8 on two cards: OpenAI's images API, generation and edits |
 | `qwen-image-2.1-turbo.yaml` | `qwen-image-2.1-turbo-fp8.rad` | Qwen-Image 2.1 Turbo, the same in 8 steps |
 | `qwen3-asr-1.7b.yaml` | `Qwen3-ASR-1.7B-hf/` (the checkpoint) | Qwen3-ASR 1.7B: `/v1/audio/transcriptions` and live `/v1/realtime`, on one card (`RADIANCE_GPU`) |
+| `minimax-h3.yaml` | `minimax-h3-fp8.rad` | MiniMax-H3 as block fp8: video with its stereo soundtrack on `/v1/videos`, two cards and about 39 GiB of pinned host memory |
+| `fasth3.yaml` | `fasth3-8-step-v2-fp8.rad` | FastVideo's FastH3 8-Step V2, the same in eight steps |
+| `minimax-music3.yaml` | `minimax-music3-bf16.rad` | MiniMax-Music3 in bf16: songs from lyrics and a description on `/v1/audio/speech` |
+| `breeze-tts2.yaml` | `breeze-tts2-bf16.rad` | Breeze-TTS-2 in bf16: speech on `/v1/audio/speech` and live over `/v1/audio/speech/stream`, on one card (`RADIANCE_GPU`) |
 
 The container names are the files the README's model table downloads or converts.
 

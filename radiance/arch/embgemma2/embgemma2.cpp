@@ -443,11 +443,12 @@ struct Audio {
                         bcol(out, 0, n_out, Rn));
         };
 
-        RAD_ISSUE_N(c, op_c0, Pn, frames, RAD_W(w_c0), cu, valid, brows(b_s0, Pn / 2));
+        RAD_ISSUE_N(c, op_c0, Pn, frames, RAD_W(w_c0), cu, valid, brows(b_s0, Pn / 2), RAD_NONE);
         RAD_ISSUE_N(c, op_n0, Pn / 2 * (nmel / 2), brows(b_s0, Pn / 2), RAD_W(w_n0), RAD_NONE,
                     brows(b_s0, Pn / 2));
         RAD_ISSUE_N(c, op_r0, Pn / 2 * (nmel / 2), brows(b_s0, Pn / 2), brows(b_s0, Pn / 2));
-        RAD_ISSUE_N(c, op_c1, Pn / 2, brows(b_s0, Pn / 2), RAD_W(w_c1), cu, valid, brows(b_s1, Rn));
+        RAD_ISSUE_N(c, op_c1, Pn / 2, brows(b_s0, Pn / 2), RAD_W(w_c1), cu, valid, brows(b_s1, Rn),
+                    RAD_NONE);
         RAD_ISSUE_N(c, op_n1, Rn * (nmel / 4), brows(b_s1, Rn), RAD_W(w_n1), RAD_NONE,
                     brows(b_s1, Rn));
         RAD_ISSUE_N(c, op_r1, Rn * (nmel / 4), brows(b_s1, Rn), brows(b_s1, Rn));
@@ -477,7 +478,8 @@ struct Audio {
             RAD_ISSUE_N(c, l.op_lc_pre, Rn, brows(b_x, Rn), RAD_W(l.lc_pre), brows(b_h, Rn));
             clipped(l.lc_start, b_h, H, b_hc, b_g, 2 * H);
             RAD_ISSUE_N(c, l.op_glu, Rn, bcol(b_g, H, H, Rn), bcol(b_g, 0, H, Rn), brows(b_u, Rn));
-            RAD_ISSUE_N(c, l.op_dw, Rn, brows(b_u, Rn), RAD_W(l.lc_dw), cu, brows(b_o, Rn));
+            RAD_ISSUE_N(c, l.op_dw, Rn, brows(b_u, Rn), RAD_W(l.lc_dw), cu, brows(b_o, Rn),
+                        RAD_NONE);
             RAD_ISSUE_N(c, l.op_lc_norm, Rn, brows(b_o, Rn), RAD_W(l.lc_norm), brows(b_o, Rn));
             RAD_ISSUE_N(c, l.op_lc_act, Rn, brows(b_o, Rn), brows(b_o, Rn));
             clipped(l.lc_end, b_o, H, b_hc, b_u, H);

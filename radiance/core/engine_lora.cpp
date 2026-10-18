@@ -1,10 +1,10 @@
 /* engine_lora.cpp -- runtime LoRA on the engine side: which modules adapters may target (fixed
  * before declare), and loading an adapter into a slot of every rank's pools.
  *
- * A LOAD IS: pack the adapter for each rank (lora::load_adapter, host only), refuse a module no
- * rank placed, copy each rank's bytes into the slot on a stream of its own, wait, and only then
- * publish the name. A request can name the adapter only after the publish, so no step ever reads
- * a slot while it is being written; a slot no published adapter holds is never referenced. */
+ * A load packs the adapter for each rank (lora::load_adapter, host only), refuses a module no rank
+ * placed, copies each rank's bytes into the slot on a stream of its own, waits, and only then
+ * publishes the name. A request can name the adapter only after the publish, so no step reads a
+ * slot while it is written. */
 #include "engine_priv.h"
 #include "lora/lora.h"
 
@@ -54,13 +54,8 @@ int read_targets(const std::string& dir, std::set<std::string>* out, std::string
 
 int Engine::lora_targets() {
     if (!cfg_.lora.enabled()) return RAD_OK;
-    lora_targets_ = cfg_.lora.targets;
+    lora_targets_ = std::set<std::string>(cfg_.lora.targets.begin(), cfg_.lora.targets.end());
     if (lora_targets_.empty()) {
-        if (cfg_.lora.adapters.empty()) {
-            RAD_ERR("lora: --max-loras with no --lora names no module an adapter may target; give "
-                    "them with --lora-target-modules (q_proj,k_proj,v_proj,o_proj,...)");
-            return RAD_E_INVAL;
-        }
         for (const auto& [name, dir] : cfg_.lora.adapters) {
             std::string err;
             const int s = read_targets(dir, &lora_targets_, &err);
@@ -68,13 +63,6 @@ int Engine::lora_targets() {
                 RAD_ERR("lora: adapter '%s': %s", name.c_str(), err.c_str());
                 return s;
             }
-        }
-    }
-    std::set<std::string> seen;
-    for (const auto& [name, dir] : cfg_.lora.adapters) {
-        if (!seen.insert(name).second) {
-            RAD_ERR("lora: two adapters are named '%s'", name.c_str());
-            return RAD_E_INVAL;
         }
     }
     lora_table_.reset(cfg_.lora.slots(), &lora_epoch_);
@@ -92,6 +80,35 @@ int Engine::lora_start() {
                 t.c_str());
         return RAD_E_UNSUPPORTED;
     }
+    /* Every target is a module some rank carries adapters on. A leaf the model lacks, or holds
+     * only outside the trunk (embedding, lm_head, a tower, the drafter), would target nothing. */
+    {
+        std::set<std::string> carried;
+        for (const auto& r : ranks_)
+            for (const lora::Site& site : r->lora_sites)
+                for (const lora::SiteSource& src : site.sources)
+                    if (src.targeted) carried.insert(src.module.substr(src.module.rfind('.') + 1));
+        for (const std::string& x : lora_targets_)
+            if (!carried.count(x)) {
+                RAD_ERR("lora: the target module '%s' is no trunk linear of this model, so no "
+                        "adapter could land on it; leave it out of --lora-target-modules (or of "
+                        "the adapters' target_modules)", x.c_str());
+                return RAD_E_UNSUPPORTED;
+            }
+    }
+    /* The adapter ops run in their GEMM's domain and read the pools on the card, so a targeted
+     * GEMM placed on the host could serve no adapter request. On the host backend every op and
+     * the pools are in host memory. */
+    if (!device_is_host())
+        for (const auto& r : ranks_)
+            for (const LoraIssueSite& site : r->program.lora_sites)
+                if (r->ctx.op_domain((rad_op)site.gemm) != RAD_DOMAIN_DEVICE) {
+                    RAD_ERR("lora: rank %d: the GEMM over '%s' is placed on the host, and its "
+                            "adapter ops read pools on the card; keep the targeted weights in "
+                            "VRAM or leave the module out of --lora-target-modules", r->index,
+                            r->program.lora_pools[(size_t)site.pool].weight.c_str());
+                    return RAD_E_UNSUPPORTED;
+                }
     {
         const Program& P = ranks_[0]->program;
         int64_t slot_bytes = 0;
@@ -118,12 +135,10 @@ int Engine::lora_load(const std::string& name, const std::string& dir, std::stri
     std::lock_guard<std::mutex> lk(lora_mu_);
     if (!cfg_.lora.enabled()) { *err = "the engine was started without adapters"; return RAD_E_STATE; }
     if (name.empty()) { *err = "an adapter needs a name"; return RAD_E_INVAL; }
-    /* A SLOT FREED A MOMENT AGO IS WAITED FOR HERE, not handed back as a retry. It is reusable once
-     * the step loop has gone round three times (a pass issued ahead may still read it), and the
-     * loop goes round idle or busy, so that is milliseconds -- an unload followed at once by a load
-     * (a hot swap) would otherwise fail almost every time under traffic. Only other loads wait on
-     * lora_mu_ meanwhile; requests and unloads go to the table, and the step loop's counter is an
-     * atomic. */
+    /* A slot that is still cooling (lora/slots.h) is waited for here rather than answered with a
+     * retry: the step loop goes round idle or busy, so the wait is milliseconds, and a hot swap
+     * (unload, then load at once) would otherwise fail under traffic. Only other loads wait on
+     * lora_mu_ meanwhile; requests and unloads use the table alone. */
     const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     int slot = -1;
     for (;;) {
@@ -174,8 +189,8 @@ int Engine::lora_load(const std::string& name, const std::string& dir, std::stri
             char* ds = (char*)P.buffers[lp.scale].ptr;
             if (!da || !db || !ds) { rc = RAD_E_STATE; *err = "a pool has no address"; break; }
             da += (int64_t)slot * ab; db += (int64_t)slot * bb; ds += (int64_t)slot * sb;
-            /* A pool this adapter does not touch is ZEROED, not left: the bytes are whatever the
-             * last adapter in the slot or the arena held, and a scale of 0 times a NaN is a NaN. */
+            /* A pool this adapter does not touch is zeroed, not left as it was: the bytes are what
+             * the slot's last adapter or the arena held, and a scale of 0 times a NaN is a NaN. */
             if (ps.empty) {
                 if (rad_memset_async(da, 0, ab, st) < 0 || rad_memset_async(db, 0, bb, st) < 0 ||
                     rad_memset_async(ds, 0, sb, st) < 0)

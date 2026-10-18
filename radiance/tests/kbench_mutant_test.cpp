@@ -619,7 +619,9 @@ TEST(device_rows_are_timed_after_the_checks_and_host_rows_where_checked) {
 /* An in-place operand is restored from its pristine copy before every timed launch. The host
  * scatter refuses to write a row that already holds its value, so a second launch on an
  * unrestored operand would fail its timing; the device scatter's restores are timed and
- * subtracted, and their share named. */
+ * subtracted, and their share named. On the host backend that kernel is a few row writes, no
+ * longer than its restores, and on a loaded machine the restores' own batch can come out longer
+ * than the timed one: the row is then reported restore-dominated, without a time or a share. */
 TEST(an_in_place_operand_is_restored_before_every_timed_launch) {
     REQUIRE(env().ok);
     Registry reg;
@@ -646,8 +648,10 @@ TEST(an_in_place_operand_is_restored_before_every_timed_launch) {
     CHECK(!has(host[13], "failed"));
     const std::vector<std::string> dev = speed_row(md, "kbm_scatter_rows_device");
     REQUIRE(dev.size() >= 14);
-    CHECK(num(dev[9]) >= 1);
-    CHECK(has(dev[13], "restore "));
+    if (!has(dev[13], "restore-dominated")) {
+        CHECK(num(dev[9]) >= 1);
+        CHECK(has(dev[13], "restore "));
+    }
 }
 
 /* --bench-flush 0 times warm: no rotation, and no read probe, which exists to check cold

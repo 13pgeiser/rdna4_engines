@@ -22,6 +22,13 @@
 // prefix tiles (a few hundred conditioning rows) as they are staged. A score is (q . k) * qs * ks
 // with an exact integer dot product. At a DiT's 16384 rows this is ~38 -> ~32 ms, with image
 // error below the spread between exact attention implementations.
+//
+// FP8 P.V form (`PV8`, op parameter `pv` "fp8", prefix-free and one query head a KV head): V as
+// E4M3 codes with a scale per column (quant_cols_fp8's), P.V on v_wmma_f32_16x16x16_fp8_fp8 (half
+// the cycles of bf16) with P as E4M3 codes of 448 p. E4M3 ends at 448, so the softmax keeps an
+// exact running max, taken over a whole 64-key tile so that its test runs once a tile; the row
+// sum takes the unrounded 448 p and the epilogue multiplies by the column scale. The V tile is
+// staged as the transposing load over pairs of codes, split by byte permutes into V^T rows.
 #include "r4d.h"
 #include "r4d_args.h"
 #include "r4d_common.h"
@@ -48,12 +55,16 @@ __device__ __forceinline__ float ps_amax8(uint4 u) {
                  fmaxf(fmaxf(fabsf(ps_lo(u.z)), fabsf(ps_hi(u.z))),
                        fmaxf(fabsf(ps_lo(u.w)), fabsf(ps_hi(u.w)))));
 }
+// log2(448) less 2^-16: exp2 of it is 448 (1 - 1.1e-5), under 448 with room for the hardware
+// exp2's error, and still the E4M3 code of 448.
+constexpr float kPsLog448 = 8.8073397f;
+
 __device__ __forceinline__ uint2 ps_q8x8(uint4 u, float inv) {
     return make_uint2(ps_q8x4(ps_lo(u.x), ps_hi(u.x), ps_lo(u.y), ps_hi(u.y), inv),
                       ps_q8x4(ps_lo(u.z), ps_hi(u.z), ps_lo(u.w), ps_hi(u.w), inv));
 }
 
-template<int HD, int GQA, int NQB, int TILE, bool I8>
+template<int HD, int GQA, int NQB, int TILE, bool I8, bool PV8>
 __global__ __launch_bounds__(NQB * GQA * 32)
 void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restrict__ gk,
                         const int8_t* __restrict__ gk8, const float* __restrict__ gks,
@@ -62,7 +73,7 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
                         const int* __restrict__ bt, int bt_pitch,
                         const uint16_t* __restrict__ kvc, int kv_heads,
                         float scale, int causal, int q_ld, int k_ld, int k8_ld, int ks_ld,
-                        int v_ld, int o_ld)
+                        int v_ld, int o_ld, const float* __restrict__ gvs)
 {
     typedef DT16<0> D;
     typedef D::frag frag16;
@@ -92,11 +103,18 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
     constexpr int K8G    = HD / 16;            // 16-byte pieces of an own key's row
     constexpr int K8P    = (TILE * K8G + NTHR - 1) / NTHR;
     static_assert(!I8 || (DG == 16 && NTHR % 32 == 0), "an int8 prefix key is one half-wave");
+    // E4M3 V^T tile: HD rows of TILE key bytes padded by 8, so a fragment read's sixteen rows
+    // (8 bytes a lane) fall on distinct bank pairs. One 16-byte unit (16 dims of 8 keys) a thread:
+    // unit u is key group u / DG8 and dims 16 (u % DG8), so a wave reads whole half-rows.
+    constexpr int VSTR8  = TILE + 8;
+    constexpr int DG8    = HD / 16;
+    static_assert(!PV8 || (GQA == 1 && KGRP * DG8 == LGRP), "one E4M3 V unit a thread");
 
     __shared__ __align__(16) uint16_t sK[I8 ? 8 : TILE * KSTR];
     __shared__ __align__(16) int8_t   sK8[I8 ? TILE * KSTR8 : 16];
     __shared__ __align__(16) float    sKs[I8 ? TILE : 4];
-    __shared__ __align__(16) uint16_t sV[HD * VSTR];
+    __shared__ __align__(16) uint16_t sV[PV8 ? 8 : HD * VSTR];
+    __shared__ __align__(16) uint8_t  sV8[PV8 ? HD * VSTR8 : 16];
 
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int c = lane & 15, h = lane >> 4;
@@ -222,14 +240,21 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
                 }
             }
         }
-        #pragma unroll
-        for (int r = 0; r < VP; ++r) {
-            const int u = lgi + r * LGRP;
-            if (NTR % LGRP == 0 || u < NTR) {
-                const int kg = u % KGRP, dg = u / KGRP;
-                const int kk0 = k0 + kg * 8 + vj;
-                const int kk = (kk0 < klim) ? kk0 : klim - 1;
-                vr[r] = __builtin_bit_cast(uint4, load_tr_b128(vrow(pre, kk) + dg * 8));
+        if constexpr (PV8) {
+            const int kk0 = k0 + (lgi / DG8) * 8 + vj;
+            const int kk = (kk0 < klim) ? kk0 : klim - 1;
+            const uint8_t* v8 = (const uint8_t*)gv + (long)(s0 + kk) * v_ld + (long)kvh * HD;
+            vr[0] = __builtin_bit_cast(uint4, load_tr_b128(v8 + (lgi % DG8) * 16));
+        } else {
+            #pragma unroll
+            for (int r = 0; r < VP; ++r) {
+                const int u = lgi + r * LGRP;
+                if (NTR % LGRP == 0 || u < NTR) {
+                    const int kg = u % KGRP, dg = u / KGRP;
+                    const int kk0 = k0 + kg * 8 + vj;
+                    const int kk = (kk0 < klim) ? kk0 : klim - 1;
+                    vr[r] = __builtin_bit_cast(uint4, load_tr_b128(vrow(pre, kk) + dg * 8));
+                }
             }
         }
         // Int8 prefix key: row absmax over its DG lanes (one half-wave, DPP butterfly), then eight
@@ -250,12 +275,25 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
         }
 
         lds_barrier();
-        #pragma unroll
-        for (int r = 0; r < VP; ++r) {
-            const int u = lgi + r * LGRP;
-            if (NTR % LGRP == 0 || u < NTR) {
-                const int kg = u % KGRP, dg = u / KGRP;
-                *(uint4*)&sV[(dg * 8 + vj) * VSTR + kg * 8] = vr[r];
+        if constexpr (PV8) {
+            // Lane j holds dims 2 j and 2 j + 1 of the group's eight keys interleaved, a key a
+            // 16-bit pair: even bytes are one V^T row, odd bytes the next.
+            const int row = (lgi % DG8) * 16 + 2 * vj, col = (lgi / DG8) * 8;
+            const uint4 w = vr[0];
+            *(uint2*)&sV8[row * VSTR8 + col] =
+                make_uint2(__builtin_amdgcn_perm(w.y, w.x, 0x06040200u),
+                           __builtin_amdgcn_perm(w.w, w.z, 0x06040200u));
+            *(uint2*)&sV8[(row + 1) * VSTR8 + col] =
+                make_uint2(__builtin_amdgcn_perm(w.y, w.x, 0x07050301u),
+                           __builtin_amdgcn_perm(w.w, w.z, 0x07050301u));
+        } else {
+            #pragma unroll
+            for (int r = 0; r < VP; ++r) {
+                const int u = lgi + r * LGRP;
+                if (NTR % LGRP == 0 || u < NTR) {
+                    const int kg = u % KGRP, dg = u / KGRP;
+                    *(uint4*)&sV[(dg * 8 + vj) * VSTR + kg * 8] = vr[r];
+                }
             }
         }
         if constexpr (I8) {
@@ -289,6 +327,133 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
             }
         }
         lds_barrier();
+
+        if constexpr (PV8) {
+            // The whole tile's scores, one exact running max over them, P as E4M3 codes of 448 p,
+            // then the tile's fp8 WMMAs. The max is kept in the scores' own units (the int8
+            // form's are unscaled, `qs` being one positive factor a row), so s - max is at most 0
+            // exactly and x = exp2((s - max) qs + kPsLog448) cannot pass exp2(kPsLog448) < 448,
+            // where v_cvt_pk_fp8_f32 would give NaN. x is 448 p up to a factor common to every
+            // key, which the row sum shares.
+            float sc[MT][8];
+            #pragma unroll
+            for (int mt = 0; mt < MT; mt += (I8 ? 2 : 1)) {
+                if constexpr (I8) {
+                    // Two blocks' int8 chains interleaved: each WMMA waits on the one two back.
+                    v8i_ps s0 = (v8i_ps){0, 0, 0, 0, 0, 0, 0, 0}, s1 = s0;
+                    const int8_t* r0 = &sK8[(mt * 16 + c) * KSTR8] + 8 * h;
+                    const int8_t* r1 = r0 + 16 * KSTR8;
+                    #pragma unroll
+                    for (int t0 = 0; t0 < NKS; t0 += 4) {
+                        v2i_ps k0[4], k1[4];
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            const uint2 u0 = *(const uint2*)(r0 + 16 * (t0 + j));
+                            const uint2 u1 = *(const uint2*)(r1 + 16 * (t0 + j));
+                            k0[j] = (v2i_ps){ (int)u0.x, (int)u0.y };
+                            k1[j] = (v2i_ps){ (int)u1.x, (int)u1.y };
+                        }
+                        sched_barrier();
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            s0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                                true, k0[j], true, qf[t0 + j], s0, false);
+                            s1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                                true, k1[j], true, qf[t0 + j], s1, false);
+                        }
+                    }
+                    #pragma unroll
+                    for (int b = 0; b < 2; ++b) {
+                        const float4 ka = *(const float4*)&sKs[(mt + b) * 16 + 8 * h];
+                        const float4 kb = *(const float4*)&sKs[(mt + b) * 16 + 8 * h + 4];
+                        const float ks[8] = { ka.x, ka.y, ka.z, ka.w, kb.x, kb.y, kb.z, kb.w };
+                        #pragma unroll
+                        for (int e = 0; e < 8; ++e)
+                            sc[mt + b][e] = (float)(b ? s1[e] : s0[e]) * ks[e];
+                    }
+                } else {
+                    v8f s = (v8f){0, 0, 0, 0, 0, 0, 0, 0};
+                    const uint16_t* kr2 = &sK[(mt * 16 + c) * KSTR] + 8 * h;
+                    #pragma unroll
+                    for (int t0 = 0; t0 < NKS; t0 += 4) {
+                        frag16 kf[4];
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            const uint4 u = *(const uint4*)(kr2 + 16 * (t0 + j));
+                            kf[j] = D::mk(make_uint2(u.x, u.y), make_uint2(u.z, u.w));
+                        }
+                        sched_barrier();
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) s = D::wmma(kf[j], qf[t0 + j], s);
+                    }
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) sc[mt][e] = s[e];
+                }
+            }
+            if (mask) {
+                #pragma unroll
+                for (int mt = 0; mt < MT; ++mt) {
+                    const int kq0 = k0 + mt * 16 + 8 * h;
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const int key = kq0 + e;
+                        const bool ok = key < klim && (!causal || key <= qpos);
+                        sc[mt][e] = ok ? sc[mt][e] : -INFINITY;
+                    }
+                }
+            }
+            float smax = sc[0][0];
+            #pragma unroll
+            for (int mt = 0; mt < MT; ++mt)
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) smax = fmaxf(smax, sc[mt][e]);
+            if (wave_any(smax > m_ref)) {
+                const float rmax  = fmaxf(smax, swap16(smax));
+                const float mnew  = fmaxf(fmaxf(m_ref, rmax), -3.0e38f);
+                const float alpha = ex2(I8 ? (m_ref - mnew) * qs : m_ref - mnew);
+                #pragma unroll
+                for (int t = 0; t < NKS; ++t)
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) acc[t][e] *= alpha;
+                l_i *= alpha;
+                m_ref = mnew;
+            }
+            #pragma unroll
+            for (int mt = 0; mt < MT; ++mt) {
+                float x[8];
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const float d = sc[mt][e] - m_ref;
+                    x[e] = ex2(I8 ? __builtin_fmaf(d, qs, kPsLog448) : d + kPsLog448);
+                }
+                l_i += ((x[0] + x[1]) + (x[2] + x[3])) + ((x[4] + x[5]) + (x[6] + x[7]));
+                // The first conversion's high half is dead (the second writes it), so any live
+                // register serves as its old value: no zeroing moves.
+                int w0 = __builtin_amdgcn_cvt_pk_fp8_f32(x[0], x[1], __builtin_bit_cast(int, x[0]),
+                                                         false);
+                w0 = __builtin_amdgcn_cvt_pk_fp8_f32(x[2], x[3], w0, true);
+                int w1 = __builtin_amdgcn_cvt_pk_fp8_f32(x[4], x[5], __builtin_bit_cast(int, x[4]),
+                                                         false);
+                w1 = __builtin_amdgcn_cvt_pk_fp8_f32(x[6], x[7], w1, true);
+                const v2i_ps p8 = (v2i_ps){ w0, w1 };
+                const uint8_t* vr2 = &sV8[c * VSTR8 + mt * 16 + 8 * h];
+                #pragma unroll
+                for (int t0 = 0; t0 < NKS; t0 += 4) {
+                    v2i_ps vf[4];
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const uint2 u = *(const uint2*)(vr2 + (t0 + j) * 16 * VSTR8);
+                        vf[j] = (v2i_ps){ (int)u.x, (int)u.y };
+                    }
+                    sched_barrier();
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j)
+                        acc[t0 + j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                            vf[j], p8, acc[t0 + j]);
+                }
+            }
+            continue;
+        }
 
         #pragma unroll 1
         for (int mt = 0; mt < MT; ++mt) {
@@ -414,6 +579,14 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
     #pragma unroll
     for (int t = 0; t < NKS; ++t) {
         uint32_t tw[4];
+        if constexpr (PV8) {
+            // The column scales of the lane's eight dims.
+            const float4 sa = *(const float4*)(gvs + (long)hq * HD + t * 16 + 8 * h);
+            const float4 sb = *(const float4*)(gvs + (long)hq * HD + t * 16 + 8 * h + 4);
+            const float vsc[8] = { sa.x, sa.y, sa.z, sa.w, sb.x, sb.y, sb.z, sb.w };
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) acc[t][e] *= vsc[e];
+        }
         #pragma unroll
         for (int e = 0; e < 8; e += 2)
             tw[e >> 1] = (uint32_t)f32_to_bf16(acc[t][e] * inv)
@@ -422,22 +595,23 @@ void r4d_attn_ps_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restr
     }
 }
 
-template<int HD, int GQA, int NQB, int TILE, bool I8>
+template<int HD, int GQA, int NQB, int TILE, bool I8, bool PV8>
 static int r4d_attn_ps_launch(const void* q, const void* k, const void* k8, const float* ks,
                               const void* v, void* o, const int* cu,
                               const int* used, const int* bt, int bt_pitch, const void* kvc,
                               int num_seqs, int max_q, int n_head_kv, float scale, int causal,
                               int q_ld, int k_ld, int k8_ld, int ks_ld, int v_ld, int o_ld,
-                              hipStream_t s)
+                              const float* vs, hipStream_t s)
 {
     constexpr int BQ = NQB * 16;
     // At most total / BQ full blocks plus one partial block per sequence.
     dim3 grid((max_q + BQ - 1) / BQ + num_seqs, n_head_kv, 1);
-    hipLaunchKernelGGL((r4d_attn_ps_kernel<HD, GQA, NQB, TILE, I8>), grid, dim3(NQB * GQA * 32), 0, s,
+    hipLaunchKernelGGL((r4d_attn_ps_kernel<HD, GQA, NQB, TILE, I8, PV8>), grid,
+                       dim3(NQB * GQA * 32), 0, s,
                        (const uint16_t*)q, (const uint16_t*)k, (const int8_t*)k8, ks,
                        (const uint16_t*)v, (uint16_t*)o, cu, num_seqs, used, bt, bt_pitch,
                        (const uint16_t*)kvc, n_head_kv, scale, causal, q_ld, k_ld, k8_ld, ks_ld,
-                       v_ld, o_ld);
+                       v_ld, o_ld, vs);
     const hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -100 - (int)e;
 }
@@ -445,13 +619,14 @@ static int r4d_attn_ps_launch(const void* q, const void* k, const void* k8, cons
 /* head_dim 128 at gqa 1, 2, 4 and 8. Null `used`/`bt`/`kvc` means no prefix (the dense form).
  * `max_q` is the total query rows over all sequences and bounds the flat grid. Non-null `k8`
  * selects the int8 Q.K form (own-key codes, `k8_ld` bytes per row; a scale per (row, head) in
- * `ks`, `ks_ld` floats per row), gqa 1 only. */
+ * `ks`, `ks_ld` floats per row), gqa 1 only. Non-null `vs` selects the fp8 P.V form (`v` as E4M3
+ * codes, `v_ld` bytes per row; `vs` their column scales), gqa 1 and no prefix only. */
 static int r4d_attn_ps(const void* q, const void* k, const void* k8, const float* ks,
                        const void* v, void* o, const int* cu,
                        const int* used, const int* bt, int bt_pitch, const void* kvc,
                        int num_seqs, int max_q, int n_head, int n_head_kv, int head_dim,
                        float scale, int causal, int q_ld, int k_ld, int k8_ld, int ks_ld,
-                       int v_ld, int o_ld, hipStream_t s)
+                       int v_ld, int o_ld, hipStream_t s, const float* vs = nullptr)
 {
     if (n_head <= 0 || n_head_kv <= 0 || n_head % n_head_kv) return -2;
     if ((q_ld | k_ld | v_ld | o_ld) & 7) return -3;
@@ -460,12 +635,23 @@ static int r4d_attn_ps(const void* q, const void* k, const void* k8, const float
     const int gqa = n_head / n_head_kv;
     if (head_dim != 128) return -1;
 #define R4D_PS(G, NQB, T, I8)                                                                     \
-    return r4d_attn_ps_launch<128, G, NQB, T, I8>(q, k, k8, ks, v, o, cu, used, bt, bt_pitch, kvc, \
-                                                  num_seqs, max_q, n_head_kv, scale, causal,      \
-                                                  q_ld, k_ld, k8_ld, ks_ld, v_ld, o_ld, s)
+    return r4d_attn_ps_launch<128, G, NQB, T, I8, false>(q, k, k8, ks, v, o, cu, used, bt,        \
+                                                         bt_pitch, kvc, num_seqs, max_q,          \
+                                                         n_head_kv, scale, causal, q_ld, k_ld,    \
+                                                         k8_ld, ks_ld, v_ld, o_ld, nullptr, s)
     /* Sixteen query tiles per workgroup at gqa 1: a workgroup streams its head's whole K and V
      * once, so more rows per workgroup divide that traffic. At 16384 rows a head's K/V (8 MB) do
      * not fit L2; 128 rows per workgroup gave 66 TFLOP/s, 256 gave 111, 512 gave 102. */
+    if (vs) {
+        if (gqa != 1 || used || bt || kvc || (v_ld & 15) || ((uintptr_t)v & 15)) return -1;
+        if (k8)
+            return r4d_attn_ps_launch<128, 1, 16, 64, true, true>(
+                q, k, k8, ks, v, o, cu, used, bt, bt_pitch, kvc, num_seqs, max_q, n_head_kv,
+                scale, causal, q_ld, k_ld, k8_ld, ks_ld, v_ld, o_ld, vs, s);
+        return r4d_attn_ps_launch<128, 1, 16, 64, false, true>(
+            q, k, k8, ks, v, o, cu, used, bt, bt_pitch, kvc, num_seqs, max_q, n_head_kv, scale,
+            causal, q_ld, k_ld, k8_ld, ks_ld, v_ld, o_ld, vs, s);
+    }
     if (k8) {
         if (gqa != 1) return -1;
         R4D_PS(1, 16, 64, true);
@@ -482,7 +668,7 @@ static int r4d_attn_ps(const void* q, const void* k, const void* k8, const float
 
 // ============================================================== the plugin ABI entry points
 enum { PS_Q = 0, PS_K, PS_V, PS_KV, PS_BT, PS_USED, PS_CU, PS_KDES, PS_VDES, PS_K8, PS_KS,
-       PS_OUT };
+       PS_OUT, PS_VS };
 
 extern "C" int r4d_rad_attn_prefix_self(const RadArgs* a, RadStream s) {
     const RadTensor* q  = r4d_opt(a, PS_Q);
@@ -493,16 +679,32 @@ extern "C" int r4d_rad_attn_prefix_self(const RadArgs* a, RadStream s) {
     const RadTensor* su = r4d_opt(a, PS_USED);
     const RadTensor* cu = r4d_opt(a, PS_CU);
     const RadTensor* o  = r4d_opt(a, PS_OUT);
-    if (!q || !k || !v || !kv || !bt || !su || !cu || !o) return R4D_NO(RAD_E_INVAL);
+    if (!q || !k || !v || !cu || !o) return R4D_NO(RAD_E_INVAL);
+    /* The paged prefix is the cache, its block table and the per-sequence prefix lengths, all
+     * three or none: without them the op is self attention over each sequence's rows. */
+    const bool pre = kv != nullptr;
+    if (pre != (bt != nullptr) || pre != (su != nullptr)) return R4D_NO(RAD_E_INVAL);
     if (r4d_opt(a, PS_KDES) || r4d_opt(a, PS_VDES)) return R4D_NO(RAD_E_UNSUPPORTED);
-    if (kv->dtype != RAD_BF16 || q->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    if ((pre && kv->dtype != RAD_BF16) || q->dtype != RAD_BF16) return R4D_NO(RAD_E_DTYPE);
+    /* The fp8 P.V form (`pv` "fp8"): `v` as E4M3 codes [tokens, kv_heads * head_dim] and their
+     * column scales `v_scale` [kv_heads * head_dim], as quant_cols_fp8 writes them; prefix-free,
+     * one query head a KV head. */
+    const RadTensor* vs = r4d_opt(a, PS_VS);
+    const char* pvs = r4d_gets(a, "pv");
+    const bool pv8 = pvs && !std::strcmp(pvs, "fp8");
+    if (pvs && !pv8 && std::strcmp(pvs, "bf16")) return R4D_NO(RAD_E_INVAL);
+    if (pv8 != (vs != nullptr)) return R4D_NO(RAD_E_INVAL);
+    if (pv8 && pre) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (pv8 && (v->dtype != RAD_F8E4M3 || vs->dtype != RAD_F32)) return R4D_NO(RAD_E_DTYPE);
+    if (pv8 && r4d_geti_or(a, "gqa", 1) != 1) return R4D_NO(RAD_E_UNSUPPORTED);
     const long long hd = r4d_geti_or(a, "head_dim", 0), gqa = r4d_geti_or(a, "gqa", 1);
     if (hd != 128 || gqa <= 0) return R4D_NO(RAD_E_SHAPE);
-    if (kv->rank != 4 || kv->shape[2] != 16 || kv->shape[3] != 2 * hd) return R4D_NO(RAD_E_SHAPE);
-    if (!r4d_contig(cu) || !r4d_contig(su) || cu->rank != 1 || cu->shape[0] < 2)
+    if (pre && (kv->rank != 4 || kv->shape[2] != 16 || kv->shape[3] != 2 * hd))
+        return R4D_NO(RAD_E_SHAPE);
+    if (!r4d_contig(cu) || (pre && !r4d_contig(su)) || cu->rank != 1 || cu->shape[0] < 2)
         return R4D_NO(RAD_E_SHAPE);
     const int num_seqs = (int)(cu->shape[0] - 1);
-    if (r4d_numel(su) < num_seqs) return R4D_NO(RAD_E_SHAPE);
+    if (pre && r4d_numel(su) < num_seqs) return R4D_NO(RAD_E_SHAPE);
     long long total = 0, nh = 0, q_ld = 0, tk = 0, hk = 0, k_ld = 0, tv = 0, hv = 0, v_ld = 0;
     long long to = 0, ho = 0, o_ld = 0;
     if (!r4d_head_rows(q, hd, &total, &nh, &q_ld) ||
@@ -510,10 +712,11 @@ extern "C" int r4d_rad_attn_prefix_self(const RadArgs* a, RadStream s) {
         !r4d_head_rows(v, hd, &tv, &hv, &v_ld) ||
         !r4d_head_rows(o, hd, &to, &ho, &o_ld))
         return R4D_NO(RAD_E_STRIDE);
-    if (hk != hv || ho != nh || hk * gqa != nh || hk != kv->shape[1]) return R4D_NO(RAD_E_SHAPE);
+    if (hk != hv || ho != nh || hk * gqa != nh || (pre && hk != kv->shape[1]))
+        return R4D_NO(RAD_E_SHAPE);
     if (tk < total || tv < total || to < total) return R4D_NO(RAD_E_SHAPE);
-    const long long bt_pitch = bt->rank >= 2 ? bt->shape[1] : r4d_numel(bt) / num_seqs;
-    if (bt->rank >= 2 && bt->stride[1] != 1) return R4D_NO(RAD_E_STRIDE);
+    const long long bt_pitch = !pre ? 0 : bt->rank >= 2 ? bt->shape[1] : r4d_numel(bt) / num_seqs;
+    if (pre && bt->rank >= 2 && bt->stride[1] != 1) return R4D_NO(RAD_E_STRIDE);
     const long long mq = total;
     /* Int8 Q.K form (`qk` "i8"): own-key codes [tokens, kv_heads * head_dim] and scales
      * [tokens, kv_heads], as quant_act_i8g writes them at group head_dim. */
@@ -532,13 +735,21 @@ extern "C" int r4d_rad_attn_prefix_self(const RadArgs* a, RadStream s) {
         if (ks_ld < 0) return R4D_NO(RAD_E_STRIDE);
         if (h8 != hk || t8 < total || ts < total) return R4D_NO(RAD_E_SHAPE);
     }
+    if (pv8) {
+        if (!r4d_contig(vs) || ((uintptr_t)vs->data & 15) || (v_ld & 15) ||
+            ((uintptr_t)v->data & 15))
+            return R4D_NO(RAD_E_STRIDE);
+        if (r4d_numel(vs) < hk * hd) return R4D_NO(RAD_E_SHAPE);
+    }
     const float scale = (float)r4d_getf(a, "scale", 1.0 / std::sqrt((double)hd));
     const int e = r4d_attn_ps(q->data, k->data, k8 ? k8->data : nullptr,
                               ks ? (const float*)ks->data : nullptr, v->data, o->data,
-                              (const int*)cu->data, (const int*)su->data, (const int*)bt->data,
-                              (int)bt_pitch, kv->data, num_seqs, (int)mq, (int)nh, (int)hk, (int)hd,
+                              (const int*)cu->data, pre ? (const int*)su->data : nullptr,
+                              pre ? (const int*)bt->data : nullptr, (int)bt_pitch,
+                              pre ? kv->data : nullptr, num_seqs, (int)mq, (int)nh, (int)hk, (int)hd,
                               scale, (int)r4d_geti_or(a, "causal", 0), (int)q_ld, (int)k_ld,
-                              (int)k8_ld, (int)ks_ld, (int)v_ld, (int)o_ld, (hipStream_t)s);
+                              (int)k8_ld, (int)ks_ld, (int)v_ld, (int)o_ld, (hipStream_t)s,
+                              pv8 ? (const float*)vs->data : nullptr);
     if (e == -1 || e == -2) return R4D_NO(RAD_E_SHAPE);
     if (e == 0) return RAD_OK;
     return R4D_NO(e == -3 ? RAD_E_STRIDE : e <= -100 ? RAD_E_DEVICE : RAD_E_SHAPE);

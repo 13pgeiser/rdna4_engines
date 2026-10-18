@@ -631,6 +631,14 @@ struct LinearFP8 {
     /* The 5-bit sibling: the same rotation to f16 (`rot_q` is the f16 plane, no `rot_s`), then
      * gemm_nt_q at w5a16 over u5 codes with an f16 scale and a zero point. */
     bool       paro5 = false;
+    /* A 4-bit weight with a zero point and no rotation (linear_is_w4): the int4 W4A16 releases.
+     * At or below `w4_split` rows `op_a16` casts the input's bf16 plane to f16 (`a16`) for the
+     * w4a16_asym GEMM `op`; above it `op_q` quantises it to int8 with a scale per (row, 128)
+     * (`a8q`, `a8s`) for the w4a8i8_asym GEMM `op2`. */
+    bool       w4 = false;
+    int64_t    w4_split = 0;
+    rad_buf    a16 = 0, a8q = 0, a8s = 0;
+    rad_op     op_a16 = 0;
     /* Prefill band for z-lab's int4 and the int5: above `rot_split` rows the f16 skinny kernel is
      * bound by the slow f16 matrix instruction, so a second chain runs: the same rotation to int8
      * with a scale per (row, 128) into `rot_q2`/`rot_s2`, then the int8 tiled GEMM (`w4a8i8_asym` /
@@ -650,6 +658,10 @@ struct LinearFP8 {
      * this is set; otherwise the linear reads unwritten arena bytes. */
     bool       reads_x = false;
     bool       mapped  = false;   /* probe() made the name map; declare() does not make it again */
+    /* The weight's access class (rad_builder.h): read every pass by default; a linear run once a
+     * request (an encoder's) says so, which lets placement keep it off the card. Set before
+     * declare(). */
+    int        access  = RAD_ACCESS_PER_TOKEN;
 
     /* Declares the name map and reads the weight's format (reads_x, probed_i8). `base` and `src`
      * are the same as for declare(). */
@@ -778,6 +790,19 @@ inline bool linear_is_paro_mxfp4(const RadEncoding& e) {
            sc->dtype == RAD_E8M0 && sc->block[0] == 1 && sc->block[1] == RAD_MX_GROUP;
 }
 
+/* A 4-bit weight with a zero point and no transform: u4 codes, an f16 scale and a u4 or u8 zero
+ * point per 128 of K (libquant `codes=u4 zero=u4 group=128 scale=f16`, or rad-convert's import rule
+ * over an int4 release). Read by gemm_nt_q at w4a16_asym over an f16 activation, or w4a8i8_asym
+ * over an int8 one, the rotated int4's GEMMs with no rotation. */
+inline bool linear_is_w4(const RadEncoding& e) {
+    if (!rad_enc_is(&e, "affine") || e.n_planes != 3 || e.transform[0]) return false;
+    const RadEncPlane *sc = rad_enc_plane(&e, "scale"), *zp = rad_enc_plane(&e, "zero");
+    return e.plane[0].dtype == RAD_U4 && e.plane[0].block[1] == 1 && sc && zp &&
+           sc->dtype == RAD_F16 && sc->block[0] == 1 && sc->block[1] == RAD_FP8_BLOCK &&
+           (zp->dtype == RAD_U4 || zp->dtype == RAD_U8) && zp->block[0] == 1 &&
+           zp->block[1] == RAD_FP8_BLOCK;
+}
+
 /* A rotated weight with ParoQuant int5 (u5) or z-lab int4 (u4) asymmetric codes: an f16 scale and
  * u8 zero point per 128 of K. Read by gemm_nt_q at w5a16 / w4a16_asym over an f16 activation, or
  * w5a8i8 / w4a8i8_asym over an int8 one. */
@@ -799,9 +824,10 @@ inline int LinearFP8::probe(RadBuilder* b, Names& nm, const Geom& g, const char*
     const bool plain = known && rad_enc_is(&enc, "plain") && enc.n_planes == 1 &&
                        enc.plane[0].dtype == RAD_BF16;
     probed_i8 = known && linear_is_w8(enc);
-    /* A rotated weight rotates and quantises the bf16 plane itself. */
+    /* A rotated weight rotates and quantises the bf16 plane itself; a 4-bit one casts or
+     * quantises it. */
     const bool rotated = known && (linear_is_paro_mxfp4(enc) || linear_is_paro_w5(enc));
-    reads_x = g.w_bf16 || plain || probed_i8 || rotated;
+    reads_x = g.w_bf16 || plain || probed_i8 || rotated || (known && linear_is_w4(enc));
     return RAD_OK;
 }
 
@@ -941,7 +967,7 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         }
         RowParts rp;
         RAD_ARCH_TRY(rp.set(row_parts, 1, 1, base, "rows"));
-        w = decl_w_n(b, wn, RAD_BF16, { N, K }, RAD_ACCESS_PER_TOKEN, shard, grp, 0, rp.w, rp.n);
+        w = decl_w_n(b, wn, RAD_BF16, { N, K }, access, shard, grp, 0, rp.w, rp.n);
         if (!w) return RAD_E_INVAL;
         if (span_hi > 0) RAD_ARCH_TRY(rad_weight_shard_span(b, w, span_lo, span_hi));
         op = rw(b, RAD_OP(b, "gemm_nt",
@@ -973,9 +999,9 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         RowParts rp;
         RAD_ARCH_TRY(rp.set(row_parts, 1, 1, base, "rows"));
         const char* sn = nm.f("%s.scale", base);
-        w  = decl_view(b, wn, nullptr, "codes", RAD_I8, { N, K }, RAD_ACCESS_PER_TOKEN, shard, grp,
+        w  = decl_view(b, wn, nullptr, "codes", RAD_I8, { N, K }, access, shard, grp,
                        rp.w, rp.n);
-        ws = decl_view(b, sn, wn, "scale", RAD_BF16, { N, K / RAD_FP8_BLOCK }, RAD_ACCESS_PER_TOKEN,
+        ws = decl_view(b, sn, wn, "scale", RAD_BF16, { N, K / RAD_FP8_BLOCK }, access,
                        shard, grp, rp.w, rp.n);
         if (!w || !ws) return RAD_E_INVAL;
         if (span_hi > 0) {
@@ -1042,10 +1068,10 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         if (!rot_q) return RAD_E_INVAL;
         op_rot = decl_rot_op(b, g, a, 1, f16_hi, { rot_q });
         if (!op_rot) return RAD_E_INVAL;
-        w  = decl_view(b, wn, nullptr, "codes", enc.plane[0].dtype, { N, K }, RAD_ACCESS_PER_TOKEN,
+        w  = decl_view(b, wn, nullptr, "codes", enc.plane[0].dtype, { N, K }, access,
                        shard, grp);
         ws = decl_view(b, nm.f("%s.scale", base), wn, "scale,zero", RAD_F16, { N, K },
-                       RAD_ACCESS_PER_TOKEN, shard, grp);
+                       access, shard, grp);
         if (!w || !ws) return RAD_E_INVAL;
         op = decl_gemm_q(b, 1, f16_hi, RAD_FP8_BLOCK, bits5 ? "w5a16" : "w4a16_asym",
                          pb1, pb2, { w, ws }, { rot_q }, y);
@@ -1063,6 +1089,71 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
             op2 = decl_gemm_q(b, kSplit + 1, hi, RAD_FP8_BLOCK, bits5 ? "w5a8i8" : "w4a8i8_asym",
                               pb1, pb2, { w, ws }, { rot_q2, rot_s2 }, y);
             if (!op_rot2 || !op2) return RAD_E_INVAL;
+        }
+        return RAD_OK;
+    }
+
+    /* ---- 4-bit weight with a zero point and no rotation: the rotated int4's two GEMMs over this
+     * linear's own copies of the input's bf16 plane. At or below kSplit rows (the skinny f16
+     * kernel's ceiling) the plane is cast to f16 for w4a16_asym; above it, where that kernel is
+     * bound by the f16 matrix instruction, it is quantised to int8 with an f32 scale per
+     * (row, 128) for w4a8i8_asym. Two views: codes, and (scale, zero) as `b_scale`, both at the
+     * logical extents, so row parts and spans apply to both as they are; a column slice must be
+     * whole 128s, the scale group. */
+    w4 = known && linear_is_w4(enc);
+    if (w4) {
+        if (!a.x) {
+            fprintf(stderr, "radiance: '%s' is a 4-bit weight, read from its input's bf16 plane, "
+                            "and its input has none\n", wn);
+            return RAD_E_DTYPE;
+        }
+        if (N % 16 || K % RAD_FP8_BLOCK) {
+            fprintf(stderr, "radiance: '%s' is %lldx%lld per rank; a 4-bit weight takes rows in "
+                            "16s and K in whole %d-column groups\n",
+                    base, (long long)N, (long long)K, RAD_FP8_BLOCK);
+            return RAD_E_INVAL;
+        }
+        RowParts rp;
+        RAD_ARCH_TRY(rp.set(row_parts, 1, 1, base, "rows"));
+        w  = decl_view(b, wn, nullptr, "codes", RAD_U4, { N, K }, access, shard, grp, rp.w, rp.n);
+        ws = decl_view(b, nm.f("%s.scale", base), wn, "scale,zero", RAD_F16, { N, K }, access,
+                       shard, grp, rp.w, rp.n);
+        if (!w || !ws) return RAD_E_INVAL;
+        if (span_hi > 0) {
+            if (shard == RAD_SHARD_COL && (span_lo % RAD_FP8_BLOCK || span_hi % RAD_FP8_BLOCK)) {
+                fprintf(stderr, "radiance: '%s' is sliced [%lld, %lld) on this rank, which cuts a "
+                                "%d-column scale group\n", base, (long long)span_lo,
+                        (long long)span_hi, RAD_FP8_BLOCK);
+                return RAD_E_INVAL;
+            }
+            RAD_ARCH_TRY(rad_weight_shard_span(b, w, span_lo, span_hi));
+            RAD_ARCH_TRY(rad_weight_shard_span(b, ws, span_lo, span_hi));
+        }
+        const int64_t hi = max_rows > 0 ? max_rows : g.max_tok;
+        const int64_t kSplit = 64;
+        const int64_t f16_hi = hi > kSplit ? kSplit : hi;
+        a16 = decl_b(b, nm.f("%s.a16", base), RAD_F16, { f16_hi, K });
+        if (!a16) return RAD_E_INVAL;
+        op_a16 = rw(b, RAD_OP(b, "cast",
+                       RAD_PARAMS(RAD_RANGE("M", 1, f16_hi), RAD_INT("n", K),
+                                  RAD_STR("from", g.dtype), RAD_STR("to", "f16")),
+                       RAD_NOWEIGHTS),
+                    { a.x }, { a16 });
+        op = decl_gemm_q(b, 1, f16_hi, RAD_FP8_BLOCK, "w4a16_asym", 0, 0, { w, ws }, { a16 }, y);
+        if (!op_a16 || !op) return RAD_E_INVAL;
+        if (hi > kSplit) {
+            w4_split = kSplit;
+            a8q = decl_b(b, nm.f("%s.a8q", base), RAD_I8, { hi, K });
+            a8s = decl_b(b, nm.f("%s.a8s", base), RAD_F32, { hi, K / RAD_FP8_BLOCK });
+            if (!a8q || !a8s) return RAD_E_INVAL;
+            op_q = rw(b, RAD_OP(b, "quant_act_i8g",
+                         RAD_PARAMS(RAD_RANGE("M", kSplit + 1, hi), RAD_INT("n", K),
+                                    RAD_INT("group", RAD_FP8_BLOCK), RAD_STR("dtype", g.dtype)),
+                         RAD_NOWEIGHTS),
+                      { a.x }, { a8q, a8s });
+            op2 = decl_gemm_q(b, kSplit + 1, hi, RAD_FP8_BLOCK, "w4a8i8_asym", 0, 0, { w, ws },
+                              { a8q, a8s }, y);
+            if (!op_q || !op2) return RAD_E_INVAL;
         }
         return RAD_OK;
     }
@@ -1125,12 +1216,12 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         }
         const char* sn = nm.f("%s.scale", base);
         const char* rn = nm.f("%s.ref", base);
-        w    = decl_view(b, wn, nullptr, "codes", RAD_FP4E2M1, { N, K }, RAD_ACCESS_PER_TOKEN,
+        w    = decl_view(b, wn, nullptr, "codes", RAD_FP4E2M1, { N, K }, access,
                          shard, grp, rp.w, rp.n);
         ws   = decl_view(b, sn, wn, "scale", RAD_E8M0, { N, K / RAD_MX_GROUP },
-                         RAD_ACCESS_PER_TOKEN, shard, grp, rp.w, rp.n);
+                         access, shard, grp, rp.w, rp.n);
         wref = decl_view(b, rn, wn, "scale", RAD_E8M0, { N, K / RAD_MX_GROUP },
-                         RAD_ACCESS_PER_TOKEN, shard, grp, rp.w, rp.n);
+                         access, shard, grp, rp.w, rp.n);
         if (!w || !ws || !wref) return RAD_E_INVAL;
         if (span_hi > 0) {
             const bool col = shard == RAD_SHARD_COL;
@@ -1150,6 +1241,23 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
         op = decl_gemm_q(b, 1, max_rows > 0 ? max_rows : g.max_tok, RAD_MX_GROUP, "mxfp4a8", pb1, pb2,
                          { w, ws, wref }, { paro ? rot_q : a.q, paro ? rot_s : a.s }, y);
         return op ? RAD_OK : RAD_E_INVAL;
+    }
+
+    /* Block fp8 is the last form; any other encoding is refused by name with the ones read. */
+    if (known) {
+        const RadEncPlane* sc = rad_enc_plane(&enc, "scale");
+        if (!rad_enc_is(&enc, "affine") || enc.n_planes != 2 || enc.transform[0] ||
+            enc.plane[0].dtype != RAD_F8E4M3 || !sc || sc->dtype != RAD_BF16 ||
+            sc->block[0] != RAD_FP8_BLOCK || sc->block[1] != RAD_FP8_BLOCK) {
+            char en[256];
+            rad_enc_format(&enc, en, sizeof en);
+            fprintf(stderr, "radiance: '%s' is %s, which this model's linears do not read; they "
+                            "read bf16, fp8_e4m3*bf16[128x128], i8*bf16[1x128], "
+                            "fp4_e2m1*e8m0[1x32], u4*f16[1x128]-u4[1x128] (or a u8 zero) and the "
+                            "ParoQuant forms. A recipe rule stores the weight in one of them "
+                            "(docs/TOOLS.md, the import rule for a shipped int4 grid)\n", wn, en);
+            return RAD_E_DTYPE;
+        }
     }
 
     /* Block fp8: per-rank extents must be whole scale blocks, checked here to name the weight (this
@@ -1173,10 +1281,10 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
     /* One stored weight, two operands: the codes and scale plane of `<base>.weight`, block fp8 in
      * the checkpoint or made so by rad-convert's recipe. */
     w  = decl_view(b, wn, nullptr, "codes", RAD_F8E4M3, { N, K },
-                   RAD_ACCESS_PER_TOKEN, shard, grp, rp.w, rp.n);
+                   access, shard, grp, rp.w, rp.n);
     ws_row_div = RAD_FP8_BLOCK;
     ws = decl_view(b, sn, wn, "scale", RAD_BF16, { fp8_blocks(N), fp8_blocks(K) },
-                   RAD_ACCESS_PER_TOKEN, shard, grp, rp.s, rp.n);
+                   access, shard, grp, rp.s, rp.n);
     if (!w || !ws) return RAD_E_INVAL;
     /* An uneven slice; the scale plane takes the same slice in blocks. */
     if (span_hi > 0) {
@@ -1220,6 +1328,22 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
         RAD_ISSUE_N(c, op, rows, brow_slice(a.q8, r0, rows, K),
                     brow_slice(a.s8, r0, rows, K / RAD_FP8_BLOCK),
                     RAD_W(w), RAD_W(ws), brow_slice(y, r0, rows, N), RAD_NONE, RAD_NONE);
+        return;
+    }
+    /* The 4-bit weight's copies of the input start at their buffers' first row: they live only
+     * between the two ops issued here. */
+    if (w4 && w4_split && rows > w4_split) {
+        RAD_ISSUE_N(c, op_q, rows, brow_slice(a.x, r0, rows, K), brow_slice(a8q, 0, rows, K),
+                    brow_slice(a8s, 0, rows, K / RAD_FP8_BLOCK));
+        RAD_ISSUE_N(c, op2, rows, brow_slice(a8q, 0, rows, K),
+                    brow_slice(a8s, 0, rows, K / RAD_FP8_BLOCK), RAD_W(w), RAD_W(ws),
+                    brow_slice(y, r0, rows, N), RAD_NONE, RAD_NONE);
+        return;
+    }
+    if (w4) {
+        RAD_ISSUE_N(c, op_a16, rows, brow_slice(a.x, r0, rows, K), brow_slice(a16, 0, rows, K));
+        RAD_ISSUE_N(c, op, rows, brow_slice(a16, 0, rows, K), RAD_NONE, RAD_W(w), RAD_W(ws),
+                    brow_slice(y, r0, rows, N), RAD_NONE, RAD_NONE);
         return;
     }
     if (paro5 && rot_split && rows > rot_split) {
@@ -1275,6 +1399,8 @@ struct DenseFP8 {
      * works against the same E4M3 activation pair. */
     rad_weight ref = 0;
     bool       mx = false;
+    /* The caller made the name map (a row range of a checkpoint tensor); declare() does not. */
+    bool       mapped = false;
 
     int declare(RadBuilder* b, Names& nm, const char* base, int64_t N, int64_t K,
                 int access, int shard, RadWeightGroup grp,
@@ -1309,7 +1435,7 @@ inline int DenseFP8::declare(RadBuilder* b, Names& nm, const char* base, int64_t
      * only whole 16-row tiles; K takes whole 128s for the activation's per-(row, 128) scale. */
     {
         const char* wn = nm.f("%s.weight", base);
-        RAD_ARCH_TRY(map_linear(b, wn, src));
+        if (!mapped) RAD_ARCH_TRY(map_linear(b, wn, src));
         RadEncoding enc{};
         mx = weight_enc(b, wn, &enc) && linear_is_mxfp4(enc);
         if (mx) {

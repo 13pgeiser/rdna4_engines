@@ -276,6 +276,8 @@ and runs.
 | `embgemma2` | EmbeddingGemma 2, an embedding model (§5.6) |
 | `qwenimage21` | Qwen-Image 2.1 and 2.1-Turbo, an image model (§5.6) |
 | `qwen3asr_bf16` | Qwen3-ASR, speech to text from the checkpoint as it ships (§5.14) |
+| `minimaxmusic3` | MiniMax-Music3, songs from a description and lyrics (§5.15) |
+| `breeze` | Breeze-TTS-2, speech from text and an optional description of the voice (§5.15) |
 
 **4. Falling back to the reference library is fatal.** If any op resolves to `libref`, the engine
 refuses to start and names the ops, because serving from it is orders of magnitude slower with nothing
@@ -389,6 +391,16 @@ rad-convert /srv/models/Qwen/Qwen-Image-2.1 -o qwen-image-2.1-fp8.rad \
     --recipe data/recipes/qwen-image-2.1-fp8.recipe
 rad-convert /srv/models/Qwen/Qwen-Image-2.1-Turbo -o qwen-image-2.1-turbo-fp8.rad \
     --recipe data/recipes/qwen-image-2.1-fp8.recipe
+
+# MiniMax-Music3, songs (§5.15): the diffusers pipeline directory is the checkpoint (language model,
+# depth decoder, condition encoder, DiT, vocoder, tokenizer); bf16 throughout (21 GB, one card or two)
+rad-convert /srv/models/MiniMaxAI/MiniMax-Music3 -o minimax-music3-bf16.rad \
+    --recipe data/recipes/minimax-music3-bf16.recipe
+
+# Breeze-TTS-2, speech (§5.15): the release directory, its codec in audio_tokenizer/ read with it;
+# bf16 (6 GB, one card)
+rad-convert /srv/models/BreezeBlue/Breeze-TTS-2 -o breeze-tts2-bf16.rad \
+    --recipe data/recipes/breeze-tts2-bf16.recipe
 ```
 
 A checkpoint directory's `model.safetensors.index.json` decides which shard each tensor is read
@@ -409,18 +421,21 @@ dequantisation where the architecture's kernels read another form, and NVFP4 alw
 | `quark`, MXFP4 weights (fp4, per_group 32, e8m0) | `fp4_e2m1*e8m0[1x32]` | byte for byte: the same codes and exponents. A checkpoint of this form is also served as it stands (§3.4) |
 | `paroquant_mxfp4` (z-lab's ParoQuant on the MXFP4 grid: `format mxfp4`, `mxfp4_block 32`, `group_size 128`) | `fp4_e2m1*e8m0[1x32]/givens` | the codes and exponents byte for byte, plus the learned rotation as the encoding's `givens` tables: per checkpoint tensor the Givens pairs (made whole-row columns), angles and `1 / channel_scales`, a fused gate\|up or qkv\|z carrying one set a part. Convert-time only (the tables are built, not mapped); served by the rotating activation quantiser `givens_dense_quant` and the MXFP4 GEMM (docs/OPS.md). Its fp8 heads and embedding (one f32 scale a row) are read exactly, for a recipe's `cast`/`rtn` rule |
 | `paroquant`, `format int5-bitplane` (bits 5, group 128) and z-lab's plain `paroquant` (bits 4, group 128) | `u5*f16[1x128]-u8[1x128]/givens` and `u4*f16[1x128]-u8[1x128]/givens` | the AWQ-packed low nibbles (plus the fifth-bit plane) re-laid as a code bit stream along K, the f16 scales and integer zero points transposed to `[N, K/128]`, and the rotation as the `givens` tables above. Convert-time only; served by `givens_rotate` and `gemm_nt_q` at `w5a16` / `w4a16_asym` over an f16 activation (docs/OPS.md) |
-| `compressed-tensors`, `format: pack-quantized` with every config group 4-bit `int` weights, `symmetric`, `strategy: group`, not `dynamic`, no `actorder` and no `input_activations` (e.g. Google's Gemma 4 QAT w4a16-ct) | `i4*<scale>[1xG]`, G the groups' one group size | `X.weight_packed` (int32 `[N, K/8]`, eight codes a word from the low bits, offset 8) made signed, beside `X.weight_scale` (`[N, K/G]`, f16, bf16 or f32) as shipped. A zero point is refused by name, and an `X.weight_shape` must state the codes' `[N, K]`. Convert-time only; `data/recipes/gemma4-31b-dense-w4a8.recipe` re-quantises the group-32 release to the group-128 grid the w4a8 kernels read |
-| `auto-round` with `packing_format: auto_round:auto_gptq`, and `gptq` (v1) | `i4*bf16[1x128]` or `i8*bf16[1x128]` | the GPTQ-packed codes transposed and made signed, the f16 scales rounded to bf16. Symmetric, group 128 or a multiple of it (per channel included), no act-order. Convert-time only, because the scales are not served as shipped |
+| `compressed-tensors`, `format: pack-quantized` with every config group 4-bit `int` weights, `strategy: group`, not `dynamic`, no `input_activations`, `actorder` none, `static` or `weight` (e.g. Google's Gemma 4 QAT w4a16-ct, ukisai's Swift 1.5 27B INT4) | `i4*<scale>[1xG]`, G the groups' one group size | `X.weight_packed` (int32 `[N, K/8]`, eight codes a word from the low bits, offset 8) made signed, beside `X.weight_scale` (`[N, K/G]`, f16, bf16 or f32) as shipped. Act-order `static`/`weight` keeps each group's columns together and reads as none; `group`/`dynamic` reorders the groups and is refused by name, as is an `X.weight_g_idx` that moves a column. An `X.weight_shape` must state the codes' `[N, K]`. Convert-time only; `data/recipes/gemma4-31b-dense-w4a8.recipe` re-quantises the group-32 release to the group-128 grid the w4a8 kernels read, `data/recipes/q38-27b-w4a16.recipe` serves a group-128 one at its own numbers |
+| the same with `symmetric: false` (W4A16_ASYM, as llm-compressor's AWQ writes it; e.g. ukisai's Swift 1.5 27B W4A16-AWQ) | `u4*<scale>[1xG]-u4[1xG]` | the stored nibbles as the codes and `X.weight_zero_point` (int32 `[N/8, G]`, eight zero points a word along N, offset 8) as the zero plane, so `(u - z) * s` is compressed-tensors' `(q - zero_point) * scale` bit for bit |
+| `auto-round` with `packing_format: auto_round:auto_gptq`, and `gptq` (v1) | `i4*bf16[1x128]` or `i8*bf16[1x128]` | the GPTQ-packed codes transposed and made signed, the f16 scales rounded to bf16 (the routed-expert GEMMs' scale). Symmetric, group 128 or a multiple of it (per channel included), no act-order. Convert-time only, because the scales are not served as shipped; an `import` rule keeps them in their shipped f16 (`data/recipes/q38-27b-w4a16.recipe`) |
 | `compressed-tensors` with an `nvfp4-pack-quantized` config group (`weights`: 4-bit float, group 16) | `fp4_e2m1*f32[1x16]` | the packed e2m1 codes beside an f32 scale per 16 of K, `weight_scale / weight_global_scale`: the global scale is a divisor, as compressed-tensors' dequantise and vLLM read it. Each piece keeps its own global, so a fused gate\|up reads both exactly. No kernel serves NVFP4, so every NVFP4 weight takes a recipe rule (`data/recipes/q38-27b-nvfp4-df2.recipe` makes it MXFP4) |
-| `compressed-tensors` whose config groups are all `float-quantized` with 8-bit `float` weights | `fp8_e4m3*<scale>[1x*]` or `[RxC]` | nothing is imported: each `X.weight` reads stock as FP8 with `X.weight_scale` beside it, one scale a row (`[N, 1]` or `[N]`, the channel strategy) or a block plane; a per-tensor scale is refused at the weight. The quantisation is still the tool's, so the family's quantised plugin serves it |
+| `compressed-tensors` whose config groups are all `float-quantized` with 8-bit `float` weights | `fp8_e4m3*<scale>[1x*]` or `[RxC]` | nothing is imported: each `X.weight` reads stock as FP8 with `X.weight_scale` beside it, one scale a row (`[N, 1]` or `[N]`, the channel strategy) or a block plane; a per-tensor scale (`[1]`) is written once a row, so it is imported rather than byte for byte. The quantisation is still the tool's, so the family's quantised plugin serves it |
+| `modelopt` (NVIDIA ModelOpt) with `quant_algo` `NVFP4`, `FP8`, or `MIXED_PRECISION` whose `quantized_layers` are each NVFP4 (group 16) or FP8 (e.g. ukisai's Swift 1.5 27B NVFP4) | NVFP4: `fp4_e2m1*f32[1x16]`; FP8: `fp8_e4m3*f32[1x*]` | NVFP4: `X.weight` (U8 `[N, K/2]`, the even k in the low nibble) beside an f32 scale per 16 of K, `float(X.weight_scale) * X.weight_scale_2`: ModelOpt's second level multiplies, where compressed-tensors' global scale divides. FP8: `X.weight` E4M3 with its one f32 `X.weight_scale`, written once a row. `X.input_scale` (a static activation scale) is not read: activations are quantised from their own values. Any other algorithm is refused by name. No kernel serves NVFP4, and none an FP8 scale per tensor, so both take recipe rules (`data/recipes/q38-27b-modelopt-nvfp4.recipe`) |
 
 The width is read per tensor, so a release mixing int4 experts with int8 projections imports both.
 A mixed-precision release (NVFP4 MLPs beside FP8 or bf16 linears, the usual NVFP4 layout) reads
 every weight by its own form: a weight without `X.weight_packed` is not NVFP4 and reads stock, its
 `float-quantized` FP8 with the per-row (`[N, 1]`) or block scale beside it. A compressed-tensors
 release whose groups are all `float-quantized` FP8 reads the same way, with nothing to import.
-What an import cannot read (an asymmetric zero point, an act-order index, a group under 128, a
-missing or zero global scale, a compressed-tensors format not listed here) is refused by name. The release's `quantization_config` names the tool, not a served
+What an import cannot read (a GPTQ zero point other than the symmetric one, an act-order index
+that reorders groups, a GPTQ group under 128, a missing or zero global scale, a format or
+algorithm not listed here) is refused by name. The release's `quantization_config` names the tool, not a served
 form, so it is kept as `imported_quantization_config.*`, and the model is served by its family's
 quantised plugin (`qwen35_fp8` for Qwen3.8-27B, `qwen4exp_fp8` for Flash-Next).
 
@@ -430,8 +445,17 @@ the source, so one recipe covers a mixed release in one pass. NVFP4 to MXFP4 rou
 scales per 16 to a power of two per 32), so it loses more than MXFP4 made from the bf16 original:
 against the block-fp8 Qwen3.8-27B on the same four documents, unsloth's NVFP4 release made MXFP4
 scores mean KL 0.287 and top-1 agreement 87.5%, AMD's calibrated Quark MXFP4 container 0.206 and
-89.3%. Prefer the Quark container unless you need that particular checkpoint. The recipes of
-record:
+89.3%. Prefer the Quark container unless you need that particular checkpoint.
+
+Where the kernels read the release's own numbers in another spelling, a recipe's `import` rule
+(rad-convert's own, docs/TOOLS.md) writes them so instead of quantising again. An int4 W4A16
+release reaches the 4-bit GEMMs that way, `blk.*.weight import codes=u4 zero=u4 scale=f16`: u4
+codes, an f16 scale and a u4 zero point per 128 of K, a symmetric grid's codes made unsigned under a
+zero of 8. Every code and zero point is the release's and every scale is exact in f16 except a bf16
+scale below f16's normal range (2^-14), which rounds; rad-convert reports how many did. Qwen3.8-27B
+serves them on `gemm_nt_q` at `w4a16_asym` over the input cast to f16 up to 64 rows a step and at
+`w4a8i8_asym` over an int8 activation with a scale per (row, 128) above (docs/OPS.md). The recipes
+of record:
 
 ```sh
 # AMD's Quark AWQ-MXFP4 Qwen3.8-27B with the DFlash2 drafter
@@ -450,6 +474,17 @@ rad-convert /srv/models/Launch80/Qwen3.8-27B-PARO-int5 --draft-model /srv/models
 # them made MXFP4 by one recipe, the head block fp8
 rad-convert /srv/models/unsloth/Qwen3.8-27B-NVFP4 --draft-model /srv/models/z-lab/Qwen3.8-27B-DFlash2 \
     --recipe data/recipes/q38-27b-nvfp4-df2.recipe -o q38-27b-nvfp4-df2.rad
+
+# An int4 W4A16 Qwen3.8-27B (compressed-tensors AWQ or GPTQ, AutoRound's auto_gptq; here ukisai's
+# Swift 1.5 W4A16-AWQ, and its INT4 and W4A16-AutoRound the same way): the shipped grids on the
+# 4-bit GEMMs, the head block fp8
+rad-convert /srv/models/ukisai/Swift-1.5-Qwen3.8-27b-W4A16-AWQ \
+    --recipe data/recipes/q38-27b-w4a16.recipe -o swift15-27b-w4a16-awq.rad
+
+# An NVIDIA ModelOpt NVFP4 Qwen3.8-27B (ukisai's Swift 1.5 NVFP4): the FP8 projections' codes kept
+# as block fp8, the NVFP4 MLPs made MXFP4, the NVFP4 head block fp8
+rad-convert /srv/models/ukisai/Swift-1.5-Qwen3.8-27b-NVFP4 \
+    --recipe data/recipes/q38-27b-modelopt-nvfp4.recipe -o swift15-27b-nvfp4.rad
 
 # An AutoRound int4 Qwen3.8-Flash-Next: its experts imported, its int4 projections made int8
 rad-convert /srv/models/ukisai/Swift-1.5-Qwen3.8-Flash-Next-W4A16-AutoRound \
@@ -1030,6 +1065,32 @@ hit. Snapshots never take VRAM: each is copied to host memory after the step tha
 back before the step that resumes from it. `/sessions` shows what is stored, where, and whether the
 linear half is served.
 
+**How many snapshots.** The snapshot store (`--checkpoint-slots`) is shared by every conversation,
+running or not, and a conversation without a snapshot under its next prompt reuses nothing. With
+`auto`, the default, each of `--max-num-seqs` gets what `--checkpoint-policy` keeps for one
+`--max-model-len` conversation plus one for the checkpoint its running turn writes: geometric
+backoff keeps 9 for a 200K-token conversation at the default 2048-token interval, so 10 a sequence,
+80 at `--max-num-seqs 8`. The store is pinned for the life of the server, so `auto` takes at most an
+eighth of host memory (and never less than 8 slots where the host can pin them), and never more than
+the host can pin after the host pools, the host tier and the activation arenas. The startup log says
+what it chose; Flash-Next at `--tp 2 --max-num-seqs 8` on a host with 128 GB of RAM:
+
+```
+checkpoint slots: auto: 80 linear-state snapshot(s) of 113.50 MiB in pinned host memory (8.87 GiB),
+none of it on the card; 10 a sequence for --max-num-seqs 8: geometric-backoff keeps 9 for a
+200000-token session at a 2048-token interval, and one more for a running turn
+```
+
+A line that says `held to an eighth of host memory`, or (a warning) `held to what the host can
+pin`, means the store is smaller than the policy wants; `--checkpoint-slots N` sets the count
+outright. An agent client with subagents keeps more
+conversations alive than it runs at once: a parent waits while its subagent runs, and in a store
+much smaller than `auto`'s the subagent's snapshots displace the parent's, whose next turn then
+prefills its whole history again. `radiance:prefix_hit_cut_tokens_total` counts the prompt tokens
+the attention cache held and admission computed again for want of a snapshot, and
+`radiance:prefix_cache_ckpt_evictions_by_reason_total{reason="store_full"}` the snapshots a full
+store gave up; `scripts/agentreplay.py` drives that workload against a server.
+
 ### 4.9 Request defaults
 
 Each default applies only to a request that does not name the field.
@@ -1136,10 +1197,13 @@ radiance --model base.rad --lora mytune=/adapters/mytune --lora other=/adapters/
 ```
 
 Each request picks one by `model`: `"model": "mytune"` runs with that adapter, the served model's
-own name (or no name) runs the base. Requests for different adapters and for the base share one
-batch. The base weights are never touched, whatever their encoding; each targeted GEMM is followed
-by `y += scale * B(A x)` in bf16 adapter weights and f32 accumulation, on every rank before the
-all-reduce, so it works at any `--tp`.
+own name (or no name) runs the base, and any other name is a 404 that lists what is served.
+Requests for different adapters and for the base share one batch. The base weights are never
+touched, whatever their encoding; each targeted GEMM is followed by `y += scale * B(A x)` in bf16
+adapter weights and f32 accumulation, on every rank before the all-reduce, so it works at any
+`--tp`, and on the CPU (libavx) as on a card. A step that carries no adapter request runs no adapter
+op, so base requests cost what they cost without `--lora`; the one exception is the fused GEMM
+below.
 
 - `--max-loras N` reserves N slots (default: the number of `--lora`). Each slot holds one adapter's
   A and B for every targeted weight; startup prints the size. With free slots, adapters load and
@@ -1156,18 +1220,21 @@ all-reduce, so it works at any `--tp`.
   already on the card may still read it), which a load waits for by itself.
 - `--max-lora-rank R` (default 16) is the rank every slot is sized for. A smaller rank is padded,
   a larger one refused.
-- `--lora-target-modules q_proj,k_proj,...` names what adapters may target. Default: what the
-  `--lora` adapters target. Needed with `--max-loras` and no `--lora`.
+- `--lora-target-modules q_proj,k_proj,...` names what adapters may target, as module leaf names.
+  Default: what the `--lora` adapters target. Needed with `--max-loras` and no `--lora`. A name
+  that is no trunk linear of the model is refused at startup.
 - `/v1/models` lists each adapter as its own model, `parent` naming the base.
 - The prefix cache keys every block on the adapter, so KV is never shared across adapters, and a
   reload under the same name starts cold.
 
 Refused at startup or load, by name: DoRA, embedding or `lm_head` LoRA, `modules_to_save`, trained
-biases, a module the base does not have, and a module some op cannot carry -- a routed MoE expert,
-a rotated (ParoQuant) or otherwise transformed weight. A fused GEMM over a targeted weight (the fp8
-gated gate_up fold) is not used while LoRA is on; the unfused pair runs instead. A drafter keeps the
-base's weights: proposals are still verified by the adapter, so output is exact and only the
-acceptance rate can drop.
+biases, PEFT's `layer_replication`, QA-LoRA and activated LoRA, a module the base does not have, and
+a module some op cannot carry -- a routed MoE expert, a rotated (ParoQuant) or otherwise transformed
+weight, a GEMM fed int8 codes in the WMMA's step order (`w4a8`, `w8a8`, `w2a8`). Adapters serve models that generate text: an
+image, audio or video generator and an embedding model refuse `--lora` and `--max-loras`. A fused
+GEMM over a targeted weight (the fp8 gated gate_up fold) is not used while LoRA is on, for base
+requests too; the unfused pair runs instead. A drafter keeps the base's weights: proposals are
+still verified by the adapter, so output is exact and only the acceptance rate can drop.
 
 ### 4.10 Every flag
 
@@ -1229,7 +1296,7 @@ acceptance rate can drop.
 | `--deterministic` | off | pin placement to the loader's plan, so the resident set cannot change under the heat engine |
 | `--checkpoint-interval N` | 2048 | linear-attention state checkpoint interval, in tokens |
 | `--prefill-span N` | 1 | checkpoint intervals one step may carry of a prefill alone in its step, from the prompt's second interval on; needs `--max-num-batched-tokens` of N intervals. Every other step is planned at the budget less the extra intervals, and the checkpoints inside a span are not written (§4.5) |
-| `--checkpoint-slots N` | 8 | linear-state (hybrid) or sliding-window snapshots the server may hold at once, in total, not per sequence. They live in pinned host memory, allocated at startup: one slot is a snapshot of every rank's shard (113 MB on Flash-Next at `--tp 2`; on Gemma 4 31B the 1024-token window of every sliding layer, 406 MiB at `--tp 2`). A full store retires its least recently used snapshot. A store the host memory cannot hold or pin stops the start, and a table placed in host memory leaves room for it; `0` serves with none, every prefix hit then prefilling from the start |
+| `--checkpoint-slots N` | auto | linear-state (hybrid) or sliding-window snapshots the server may hold at once, in total, not per sequence. They live in pinned host memory, allocated at startup: one slot is a snapshot of every rank's shard (113 MB on Flash-Next at `--tp 2`, 144 MiB on Qwen3.8-27B; on Gemma 4 31B the 1024-token window of every sliding layer, 406 MiB at `--tp 2`). `auto` gives each of `--max-num-seqs` what `--checkpoint-policy` keeps for a `--max-model-len` session plus one (10 at 200K tokens under geometric backoff), within an eighth of host memory and what the host can pin; the startup line and the report say what it chose and why (§4.8). A full store retires its least recently used snapshot. A count is taken as given: a store the host memory cannot hold or pin stops the start, and a table placed in host memory leaves room for it; `0` serves with none, every prefix hit then prefilling from the start |
 | `--checkpoint-policy NAME` | geometric-backoff | also `tip-only`, `keep-all` |
 | `--no-prefix-cache` | prefix cache on | disable prefix caching |
 
@@ -1313,6 +1380,8 @@ a model that takes no images or video. A Qwen-VL container that states none uses
 | `--kld-ref DIR` | score this model against the reference in `DIR`: mean, median, 99/99.9/99.99th percentile KL divergence and top-1 agreement |
 | `--kld-corpus FILE` | JSONL, one `{"prompt", "score_from"?, "source"?}` a line; `--kld-record` only |
 | `--kld-out FILE` | the `--kld-ref` report as JSON, and every position's numbers in `FILE.rows` |
+| `--kld-lora NAME` | run the documents through the `--lora` adapter `NAME` (§4.9.1), e.g. against a reference recorded from the merged checkpoint |
+| `--kld-lora-sources PREFIX` | with `--kld-lora`, only the documents whose `source` starts with `PREFIX` run through the adapter; the rest run as the base, in the same steps |
 
 **Diagnostics**
 
@@ -1341,6 +1410,9 @@ a model that takes no images or video. A Qwen-VL container that states none uses
 | `POST /v1/systemone` | LiquidAI d1's decisions over a state: named yes/no, choice and score questions answered as probabilities, nothing generated; needs a container converted as d1, else 501 (§5.13) |
 | `POST /v1/audio/transcriptions` | OpenAI's speech to text, for a model whose plugin transcribes (Qwen3-ASR), else 501 (§5.14) |
 | `GET /v1/realtime` (WebSocket) | OpenAI's realtime transcription session: audio streamed in, the words back as they are spoken (§5.14) |
+| `POST /v1/audio/speech` | OpenAI's speech API, whole or streamed: speech from a speech model (Breeze-TTS-2), `instructions` describing the voice; songs from a music model (MiniMax-Music3), `input` the lyrics and `instructions` the song; else 501 (§5.15) |
+| `GET /v1/audio/speech/stream` (WebSocket) | vLLM-Omni's realtime speech session: text streamed in, each sentence's audio streamed out as soon as the sentence is complete; needs an audio generation model (§5.15) |
+| `POST /v1/videos`, `GET /v1/videos[/:id[/content]]`, `DELETE /v1/videos/:id` | OpenAI's video jobs: a video with its soundtrack from a prompt, made in the background and downloaded as MP4; needs a video model (MiniMax-H3), else 501 (§5.16) |
 | `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic's Messages API, for Claude Code and the Anthropic SDKs (§5.9, §5.11) |
 | `POST /v1/responses`, `POST /v1/responses/input_tokens` | OpenAI's Responses API, for Codex and the OpenAI SDKs' `responses` client (§5.9) |
 | `POST /completion`, `/completions`, `POST /infill` | llama-server's native completion and fill-in-the-middle, for llama.vim, llama.vscode and clients of llama-server's own API (§5.9) |
@@ -1363,9 +1435,10 @@ a model that takes no images or video. A Qwen-VL container that states none uses
 Methods follow vLLM's: `/tokenize` is POST because its input is a body, and `/ping` answers GET and
 POST because load balancers differ. As in llama-server, `/chat/completions`,
 `/chat/completions/input_tokens`, `/embeddings`, `/images/generations`, `/images/edits`,
-`/audio/transcriptions`, `/models`, `/responses` and `/responses/input_tokens` also answer without
-`/v1`, for a client configured with the bare host as its base URL; `/completions` without `/v1` is
-llama-server's native completion, as it is there. A path nothing serves is a JSON 404.
+`/audio/transcriptions`, `/audio/speech`, `/models`, `/responses` and `/responses/input_tokens` also
+answer without `/v1`, for a client configured with the bare host as its base URL; `/completions`
+without `/v1` is llama-server's native completion, as it is there. A path nothing serves is a JSON
+404.
 
 A text prompt to `/v1/completions`, `/v1/embeddings` or `/tokenize` reads the model's control tokens
 as tokens, as vLLM and llama.cpp do: a client that renders its own chat template can send
@@ -1702,7 +1775,7 @@ fall into four kinds:
 | `post_sampling_probs` | false | logprobs are the raw distribution's; the sampler's are not returned |
 | `best_of` | ≤ 1 | not implemented |
 | `suffix` | empty | infilling through `/v1/completions` is not implemented |
-| `lora` | empty | out of scope |
+| `lora` | empty | an adapter is chosen by `model` (§4.9.1), not by a per-request list |
 | `modalities`, `audio` | `["text"]`, null | output other than text is not implemented |
 | `n_indent`, `t_max_predict_ms`, `return_tokens` | 0, ≤ 0, false | not implemented (`return_tokens` is served on `/completion`, §5.9) |
 | `grammar_lazy`, `grammar_triggers`, `preserved_tokens` | off, empty, empty | the chat format decides them |
@@ -2083,6 +2156,181 @@ socket.
 
 ---
 
+### 5.15 Speech and music: `/v1/audio/speech`
+
+An audio generation model answers OpenAI's `POST /v1/audio/speech`: a speech model (Breeze-TTS-2)
+speaks `input`, in a voice `instructions` may describe; a music model (MiniMax-Music3) sings `input`
+as lyrics, as `instructions` describe the song (SGLang-Omni's reading of the route). Both are
+converted from their release directories (§3.2).
+
+#### Speech: Breeze-TTS-2
+
+```sh
+radiance --model breeze-tts2-bf16.rad                                # one card
+
+curl -s http://localhost:8000/v1/audio/speech -H 'Content-Type: application/json' -d '{
+  "input": "The quick brown fox jumps over the lazy dog."}' -o fox.wav   # 24 kHz mono, 16-bit
+curl -s http://localhost:8000/v1/audio/speech -H 'Content-Type: application/json' -d '{
+  "input": "It was a bright cold day in April.",
+  "instructions": "A calm, warm female narrator, speaking slowly.", "guidance_scale": 4}' -o april.wav
+```
+
+- **`input`** is the text to speak, as written. **`instructions`**, optional, describe the voice
+  (who speaks, how); BreezeBlue suggests `guidance_scale` 4 with them, against a voice without the
+  description (1, the default, is none).
+- **The length** is `duration` in seconds or `max_new_tokens` in frames (12.5 a second), up to two
+  minutes; the model ends the speech at the end of the text. The prompt holds at most 512 tokens.
+- **`seed`**, **`response_format`**, **`speed`** and **`voice`** are read as for music below
+  (`voice` is ignored here too: the instructions say who speaks); `num_inference_steps` is refused
+  (the model has no denoiser). Cloning a voice from a recording is not served.
+
+Speech is played four frames (0.32 s) at a time as it is made, so the streamed forms below carry it
+as it is spoken. On one R9700 a sentence is made at 0.6 of the time it plays (5.1 s of speech in
+3.1 s), and a stream's first audio comes 0.21 s after the request; four speak at once at about the
+speed they play (43 s of speech in 12.1 s). Breeze-TTS-2 is licensed for research and
+non-commercial use only, and BreezeBlue counts hosting it as an API as commercial.
+
+#### Music: MiniMax-Music3
+
+```sh
+radiance --model minimax-music3-bf16.rad --tp 2
+
+curl -s http://localhost:8000/v1/audio/speech -H 'Content-Type: application/json' -d '{
+  "input": "[verse]\nMorning light filtering through the pine\n[chorus]\nSoftly the world begins to breathe",
+  "instructions": "Genre: acoustic pop. BPM: 96. Warm and intimate. Vocals: soft female lead.",
+  "duration": 30, "seed": 7}' -o song.wav                      # 44.1 kHz stereo, 16-bit
+curl -sN http://localhost:8000/v1/audio/speech -H 'Content-Type: application/json' -d '{
+  "input": "...", "instructions": "...", "stream_format": "audio",
+  "response_format": "pcm"}' | ffplay -nodisp -f s16le -ar 44100 -ch_layout stereo -   # as made
+```
+
+- **`input`** (the lyrics, with the model's section tags such as `[verse]` and `[chorus]`) and
+  **`instructions`** (genre, tempo, key, mood, vocals, instruments) are both required. Each is
+  rewritten into the form the model was trained on and read as plain text, so neither can carry
+  the model's control tokens.
+- **The length** is `duration` in seconds or `max_new_tokens` in frames (25 a second), up to six
+  minutes; without either the song runs until the model ends it, which it usually does at the end
+  of the lyrics. Give one, not both.
+- **`seed`** makes a song repeatable: the same seed, text and length give the same samples again
+  on the same deployment. Another card count rounds differently, and a song can then take another
+  turn. Absent or -1 picks one; the `X-Seed` response header says which.
+- **`num_inference_steps`** (30) and **`guidance_scale`** (1.7) are the denoiser's.
+- **`response_format`** is `wav` (the default) or `pcm`, 16-bit little-endian at the model's rate
+  and channels, which the `X-Audio-Sample-Rate` and `X-Audio-Channels` headers state. `voice` is
+  accepted and ignored (the description says who sings); `speed` must be 1.
+
+A song's first window comes once its 200 frames are written and denoised; each later one follows
+a hundred frames on. On two R9700s a song is made at about the speed it plays: 10 s of audio in
+10.8 s with the first audio at 8.5 s, 12 s in 12.7 s; on one card, 4 s in 7.3 s. Up to four songs
+are made at once.
+
+#### Streaming
+
+Without a stream field the response is the whole audio once it is finished. A song is played eight
+seconds at a time (a 200-frame window, a new one every 100 frames), speech four frames at a time,
+and two streamed forms send each piece as it is played, as vLLM-Omni's speech route does:
+
+- `"stream_format": "audio"` sends the bytes themselves; a `wav` stream's header states no length.
+- `"stream": true` or `"stream_format": "sse"` sends Server-Sent Events: `speech.audio.delta` with
+  base64 PCM in `audio` (`response_format` must be `pcm`), then `speech.audio.done` with the usage
+  (prompt tokens in, frames out), or `speech.audio.error`.
+
+#### Live: `/v1/audio/speech/stream`
+
+The same model speaks text while it is still being written, over a WebSocket at
+`/v1/audio/speech/stream` speaking vLLM-Omni's realtime speech protocol: the client streams the
+text in (a language model's reply token by token, say), and each sentence is spoken as soon as it
+is complete, so the first audio waits for the first sentence rather than the whole text.
+
+| client sends | server answers |
+|---|---|
+| `session.config` — first, and again only between utterances | nothing, or `error` naming the field it refused |
+| `input.text` `{"text": "..."}` — any piece of the text | for each sentence it completes: `audio.start`, the audio as binary messages, `audio.done` |
+| `input.done` — the utterance's text has ended | the rest of the text as its last sentence, then `session.done` |
+| `session.close` | the socket closes (1000); a sentence being spoken is cancelled |
+
+- **`session.config`** takes the fields of `POST /v1/audio/speech` but `input` (`instructions`,
+  `voice`, `seed`, `guidance_scale`, `max_new_tokens` or `duration` for each sentence, `speed`,
+  `num_inference_steps` where the model has a denoiser), checked as that route checks them, and
+  four of its own: `response_format` `pcm` (the default) or `wav`; `stream_audio`, false (the
+  default) for one binary message a sentence or true for the audio as the model makes it;
+  `split_granularity`, `sentence` (the default), `clause` (also at commas and semicolons) or `none`
+  (the whole utterance at `input.done`); and `text_input_mode`, whose only value here is
+  `buffered` (vLLM-Omni's `commitment` mode is refused by name). Every sentence is one request made
+  with these fields; with a `seed`, every sentence uses it.
+- **`audio.start`** carries `utterance_index`, `sentence_index` (from 0 in each utterance),
+  `sentence_text`, `format`, `sample_rate` and `channels`. The audio is 16-bit little-endian PCM at
+  that rate and channel count; a `wav` sentence is one file, whose header states its length, or
+  while it streams a header that states none before the samples. **`audio.done`** carries
+  `utterance_index`, `sentence_index`, `total_bytes` (of the binary messages) and `error`, true when
+  the sentence failed, after an `error` event saying why. **`session.done`** carries
+  `utterance_index` and `total_sentences`; the session then takes the next utterance.
+- **Sentences** end after `.`, `!` and `?` followed by whitespace, and after their CJK (`。！？…`),
+  Indic (`।॥`) and Arabic (`؟`) forms followed by anything, since those scripts put no space there;
+  `clause` also ends one after `,` `;` and `，；،؛`. A decimal point, a common abbreviation (Dr.,
+  Mr., e.g., etc.) and an initial (J., J.R.) end none, and a run of punctuation or a closing quote
+  or bracket stays with its sentence. A stop at the end of what has arrived waits for the next
+  piece, or for `input.done`.
+
+**Limits.** A server holds as many sessions as the model has lanes (four for both models), each
+holding one admission place (`--max-queued-requests`) for its whole life; a session refused either
+way gets an `error` event and a 1013 close. A session speaks its sentences one at a time, in order.
+An utterance holds at most 128 KiB of text that no sentence has ended yet; a piece past that is
+refused with an `error` and dropped. A message that is not JSON, or a binary one, is an `error`,
+and the session goes on.
+
+### 5.16 Video: `/v1/videos`
+
+A video generation model (MiniMax-H3) answers OpenAI's video jobs: `POST /v1/videos` queues a video
+with its stereo soundtrack and answers at once with the video object; `GET /v1/videos/{id}` reports
+its `status` (`queued`, `in_progress`, `completed`, `failed`) and `progress` (0 to 100);
+`GET /v1/videos/{id}/content` downloads the MP4 once it is completed (`?variant=thumbnail` gives the
+first frame as WebP). `GET /v1/videos` lists the jobs, newest first (`limit`, `after`, `order`), and
+`DELETE /v1/videos/{id}` removes one, cancelling it if it is still running.
+
+```sh
+radiance --model minimax-h3-fp8.rad --tp 2 --vision-tower-placement ram
+
+curl -s http://localhost:8000/v1/videos -H 'Content-Type: application/json' -d '{
+  "prompt": "A red fox trotting through a snowy pine forest, snow crunching underfoot",
+  "seconds": "5", "size": "1344x768", "seed": 7}'          # -> {"id": "video_...", "status": "queued", ...}
+curl -s http://localhost:8000/v1/videos/video_...            # poll until "status": "completed"
+curl -s http://localhost:8000/v1/videos/video_.../content -o fox.mp4
+```
+
+- **`prompt`** is read as written, with no template; MiniMax-H3 was trained on long structured
+  descriptions (a shot, its soundscape, its music), which follow it best. At most 2048 tokens.
+- **`seconds`** is rounded up to the model's length steps (17 frames, 0.71 s, at 24 frames a
+  second): 5.17 to 14.4 seconds, 5.17 by default. The video object's `seconds` is what is made.
+- **`size`** is the frame's `WIDTHxHEIGHT`: both sides multiples of 32 from 256, at most
+  1344 x 768 pixels of area, at most 4:1. By default 1344x768. SGLang's `target`
+  `{"aspect_ratio": "9:16", "short_edge": 768, "duration_seconds": 8}` lays the model's own canvas
+  over a ratio instead (768 on the short side, the area capped, rounded to 32).
+- **`seed`** makes a video repeatable on the same deployment (absent or -1 picks one);
+  **`num_inference_steps`** counts sigma grid points as diffusers and SGLang do (50, so 49 model
+  evaluations, by default; at most 65). The model is guidance-distilled, so there is no guidance
+  scale and no negative prompt. A step-distilled release (FastH3, below) runs only the schedule it
+  was trained on: 9 grid points, and any other count is refused with a 400.
+- Only text is read: `input_reference` and non-empty `conditions` are refused, as is a `task`
+  other than `t2va`. Fields are JSON or a multipart form (OpenAI's clients send the form).
+
+**FastH3.** FastVideo's FastH3 8-Step V2 (`FastVideo/FastVideo-FastH3-8-Step-V2`) is the same model
+distilled to eight steps with video sparse attention; it is converted with the same recipe, its text
+encoder and decoders taken from a MiniMax-H3 container (`data/recipes/minimax-h3-fp8.recipe` says
+how), served the same way and named `fastvideo-fasth3-8-step-v2`. Its card notes that difficult
+motion, fine detail and some audio may fall below the base model's; it serves text to video only.
+
+On two R9700s (`--tp 2`, 300 W) a 5.17 s clip at 1344x768 takes about 68 s with FastH3 and about
+8.8 minutes with MiniMax-H3's default 50 steps. Both attentions run their scores in int8 and
+P.V in fp8 (docs/ARCHITECTURES.md); a step's cost grows with the square of the rows, so a longer
+clip or a larger frame costs more than in proportion. The text encoder and the modulation
+projections (17.9 GiB a rank) and the token embedding (1.5 GiB a rank) are read from pinned host
+memory, about 39 GiB of it in all, which `--vision-tower-placement ram` requires at two ranks.
+
+The MP4 holds H.264 video (yuv420p, BT.709) and AAC audio at 32 kHz stereo. A finished file is kept
+for an hour (`expires_at`), at most 32 of them. MiniMax-H3's license excludes use in the EU, the UK,
+the Republic of Korea and the USA without a separate license from MiniMax.
+
 ## 6. Operation
 
 ### 6.1 The dashboard
@@ -2265,7 +2513,7 @@ is the part of a log to paste into an issue. Its sections:
   warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 1.7.0
+I STARTUP REPORT -- radiance 1.8.0
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [command line]
 I   --tp                               2                                           [command line]
@@ -2310,7 +2558,7 @@ curl -s -H "Authorization: Bearer $KEY" localhost:8000/diagnostics | jq '.findin
 | `out of memory` / `the carve reserved N of address space and the card would not back it` | Something else is holding VRAM | Check with `rocm-smi` and stop the other process. The budget is stated before allocation, so the log says what it asked for |
 | `pool allocation refused` with `backing allocation of … refused` on the second card, after the first card's pools succeeded | The VRAM budget is measured before any rank allocates, so a card that refuses its weights pool lost that memory to another process in between (the next line says how much is free now). A refused `host_pool` is pinned memory: every rank pins its own `--host-pool-mib` (twice at `--tp 2`), and the amdgpu driver caps what all processes together pin at RAM less 1/64 and 1.5 GiB. It is locked user memory, which `ttm.pages_limit` does not count | Stop the other process (`rocm-smi --showpids`). For the host pool, keep `--tp` × `--host-pool-mib` under both the cap and the available RAM the refusal names. `amdgpu.no_system_mem_limit=1` lifts the driver's cap, but not the RAM |
 | `host_pool: backing allocation of … refused: rad_dev_alloc(…): locking piece K of N`, and `failed to pin userptr` in `journalctl -k` | The IOMMU would not DMA-map one piece of the pinned host pool. Pinned host memory is locked in pieces of at most 1 GiB because an Intel VT-d host in scalable mode can refuse a single pin above about 2.5 GiB; a failing piece means this machine refuses smaller pins still, or a total its IOMMU will not map | Keep IOMMU translation on: `iommu=pt` lets every pin through, but on such a host it can also remove peer access between the cards, moving every all-reduce onto the slower host-memory path. Report the kernel version, the IOMMU mode and the refusal line |
-| `device: a synchronisation has waited 5 s; the queues:` with the packet each queue is on, then `device: no queue has advanced`, then `HW Exception … GPU Hang` and a reset in `journalctl -k` (`MES failed to respond to msg=REMOVE_QUEUE`, `MODE1 reset`) | The card stopped running the queue; the kernel named is where it stopped, not necessarily why. The driver resets the whole card, VRAM included, and the engine is aborted. The usual cause is compute wave save/restore being off: the driver evicts a process's queues whenever host memory the card maps moves under memory pressure, and with `cwsr_enable=0` it cannot preempt a running queue, so the eviction waits on a queue that never drains. Clock instability (a voltage offset) is the other cause seen on R9700s. If the follow-up line says the queues advanced, the wait was long, not stuck | `cat /sys/module/amdgpu/parameters/cwsr_enable` must print `1` (the startup report warns when it is `0`); set `amdgpu.cwsr_enable=1`, rebuild the initramfs and reboot. Remove any `OD_VDDGFX_OFFSET` (`pp_od_clk_voltage`). A reset restores the power cap, fan curve and voltage offset to firmware defaults; re-apply them before every start. Keep the devcoredump under `/sys/class/drm/card*/device/devcoredump/data`, which a reboot loses. `docker inspect` shows exit code 0 for a container Docker already restarted, whatever ended the old process |
+| `device: a synchronisation has seen no queue advance for 5 s; the queues:` with the packet each queue is on, then `device: no queue has advanced`, then `HW Exception … GPU Hang` and a reset in `journalctl -k` (`MES failed to respond to msg=REMOVE_QUEUE`, `MODE1 reset`) | The card stopped running the queue; the kernel named is where it stopped, not necessarily why. The driver resets the whole card, VRAM included, and the engine is aborted. The usual cause is compute wave save/restore being off: the driver evicts a process's queues whenever host memory the card maps moves under memory pressure, and with `cwsr_enable=0` it cannot preempt a running queue, so the eviction waits on a queue that never drains. Clock instability (a voltage offset) is the other cause seen on R9700s. A wait that is only long (a deep prefill, a video's denoising pass) reports nothing while any queue advances | `cat /sys/module/amdgpu/parameters/cwsr_enable` must print `1` (the startup report warns when it is `0`); set `amdgpu.cwsr_enable=1`, rebuild the initramfs and reboot. Remove any `OD_VDDGFX_OFFSET` (`pp_od_clk_voltage`). A reset restores the power cap, fan curve and voltage offset to firmware defaults; re-apply them before every start. Keep the devcoredump under `/sys/class/drm/card*/device/devcoredump/data`, which a reboot loses. `docker inspect` shows exit code 0 for a container Docker already restarted, whatever ended the old process |
 | `--draft-model is not implemented` | The engine loads its drafter from the container | `rad-convert --draft-model DIR` at conversion time |
 | `context_length_exceeded` on a request | The prompt alone does not fit the context. `max_tokens` is clamped rather than refused, so this fires only when there is no room left to generate | Shorten the prompt by the number of tokens the message names, or raise `--max-model-len` if the model allows it |
 | `unknown option '--foo'` and the engine exits | An unknown flag is an error, so a typo in a budget flag cannot silently change the plan | Check `radiance --help` |

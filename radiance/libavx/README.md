@@ -3,7 +3,7 @@
 The conventional op vocabulary in hand-written x86 SIMD, dispatched at run time by CPU feature.
 
 libavx is a kernel plugin beside `libref` and `libr4d`. libref is the only other host
-implementation, and it is a slow reference. libavx implements all 123 of libref's ops with the
+implementation, and it is a slow reference. libavx implements all 150 of libref's ops with the
 same schemas and the same answers to a tolerance, the image generator's included (below).
 
     cmake -S libavx -B build-avx -DCMAKE_PREFIX_PATH=<radiance prefix> && cmake --build build-avx -j4
@@ -64,7 +64,7 @@ four levels and the engine never reaches it.
 
 Every op `libref` implements, `libavx` implements, so the selector resolves no op of a CPU-only
 deployment to libref: Flash-Next's QSA indexer, the DFlash2 drafters' convolution and the image
-generator included. `rad-avx-check` fails on any missing op, and reports a row that returns
+and audio generators included. `rad-avx-check` fails on any missing op, and reports a row that returns
 `RAD_E_UNSUPPORTED` separately from one that is absent: a declining row is worse than none, because
 the selector resolves to it and the step fails at issue rather than at declare.
 
@@ -76,6 +76,7 @@ Every `RAD_E_UNSUPPORTED` a libavx kernel returns, beside libref's answer to the
 | `attn_local_rel` | a right context; head_dim or left context + 1 over 2048 | the same |
 | `rope`, `qk_norm_rope`, `qsa_block_key` | an unknown `mode`; for `rope`, an unknown `ladder` | the same |
 | `rope` | YaRN with `axial` or a position scale | the same |
+| `rope` | Llama 3 scaling beside YaRN, with `axial`, or over multi-component positions | the same |
 | `rope` | a rotary half-width over 1024 | the same |
 | `had_quant_act_i8`, `had_quant_act_fp8`, `rmsnorm_had_quant_i8`, `gated_had_quant_i8`, `hc_read` | a Hadamard group over 4096 | the same (`REF_HAD_MAX`) |
 | `gdn_conv_prep`, `gdn_conv_update` | a convolution history over 16 | the same |
@@ -91,8 +92,10 @@ Every `RAD_E_UNSUPPORTED` a libavx kernel returns, beside libref's answer to the
 
 Everything but the last two rows refuses exactly where libref does, so the selector never
 resolves a geometry to libavx that libref would have served. The per-entry image ops
-(`lane_gather`, `lane_store`, `randn_lanes`, `flow_euler`) check every entry before writing any,
-where libref writes the entries before a bad one; they return libref's code, and refuse (with
+(`lane_gather`, `lane_store`, `randn_lanes`, `flow_euler`) and the audio generator's
+(`frame_mix_store`, `end_status`, `frame_store`, `win_input`, `win_prep`, `win_finish`, and
+`cfg_topk_sample` with a lane history or a suppressed id range) check every entry before writing
+any, where libref writes the entries before a bad one; they return libref's code, and refuse (with
 `RAD_E_SHAPE`) the entries libref would read or write past an operand for.
 
 `moe_gemm_q` and `moe_gemm_q_mod4` carry layout hooks for Qwen3.8-Flash-Next's codebook experts
@@ -566,6 +569,76 @@ activation. With a bf16-pair path for block fp8 the fp8 container would cost abo
 one does. The decoder takes about 1.3 s at 512 x 512 and 5 s at 1024 x 1024, the condition (the
 8B text encoder and the DiT over about 100 prompt tokens) about 0.6 s in bf16 and 8 s in fp8.
 
+## Audio generation
+
+MiniMax-Music3 (`arch/minimaxmusic3`) adds 16 ops (`avx_audio.cpp`), and a speech model's frame
+loop and causal codec one more (`frame_store`) and these forms: a causal `conv1d`, the causal
+`conv_t1d` (`pad` 0, odd strides, a kernel of one stride), SnakeBeta (`snake` with `beta`, both as
+logarithms with `log`), and a sampler that suppresses reserved ids, takes each lane's guidance and
+penalises a lane's earlier picks (`hist`, cleared at frame 0). The sampler (`cfg_topk_sample`),
+the window noise and its overlap binding (`win_prep`), the frame embeddings (`rvq_embed` in both
+roundings, `frame_mix_store`, `fourier_embed`), the code history (`frame_store`), the window copies
+and the index helpers are libref's bit for bit, held to zero error by the hand-built cases: a seed
+gives the same codes, the same noise and the same piece on both host libraries. With a history the
+sampler takes its lanes in order, as libref does, since two entries may share a lane's row.
+`cfg_topk_sample` and `frame_mix_store` keep libref's two roundings where they multiply and add
+(`keep`). The vocoder's three ops reduce in other orders and are held to the tolerance table:
+
+- **`conv1d`** is GEMMs over bands of patch rows, as `conv2d_nhwc`: the weight re-laid once a launch
+  as `[cout][k][cin]`, an output row's patch its k input rows' channel runs (zeros outside its own
+  sequence), each band one `gemm_nt_into` into f32 rows, then the residual and the tanh or the
+  clamp, rounded once. A 1-wide kernel over a dense input reads x in place.
+- **`conv_t1d`** is one GEMM per phase: output row q s + r - pad reads input rows q, q - 1, ..
+  against taps r, r + s, .. below k (phases of one kernel may differ by a tap: kernel 9 at stride 5
+  takes two taps in phases 0 to 3 and one in phase 4), so a phase's rows are a GEMM over
+  `[x[q] | x[q - 1] | ..]` patch rows and the weight re-laid per phase as `[cout][taps][cin]`.
+- **`snake`** squares a sine reduced to [-pi/2, pi/2] (the sign does not matter once squared) and
+  evaluated as an odd Taylor polynomial through r^13; a row with an argument past 8192, where the
+  three-part pi stops being exact, is computed again with the libm sine. SnakeBeta's multiplier
+  1 / (beta + 1e-9) is taken once a channel, as libref takes it.
+- **`snake_aa`** (BigVGAN's alias-free SnakeBeta, MiniMax-H3's vocoder) works on bands of 64 output
+  rows, channels innermost: a band computes the upsampled rows its filter reads into scratch (a
+  row a function of its index, so neighbouring bands agree where they overlap), with `snake`'s
+  sine, and filters them down; both sums run in libref's order.
+
+At the vocoder's third stage (384 channels), bf16, this machine (`rad-avx-bench --op <op>`):
+
+| op | geometry | libref, 1 thread | avx512, 1 thread | avx512, 16 threads |
+|---|---|---|---|---|
+| conv1d | 7 taps, dilation 3, 384 -> 384, 8192 rows | 10.9 s | 56.8 ms, 298 GFLOP/s | 6.5 ms, 2.6 TFLOP/s |
+| conv1d | 1 x 1, 384 -> 384, 8192 rows | 1.57 s | 9.7 ms, 250 GFLOP/s | 1.4 ms, 1.7 TFLOP/s |
+| conv_t1d | stride 4, 768 -> 384, 2048 -> 8192 rows | 6.33 s | 34.7 ms, 279 GFLOP/s | 3.8 ms, 2.5 TFLOP/s |
+| snake | 8192 x 384 | 20.3 ms | 1.2 ms, 10.5 GB/s | 0.32 ms, 39 GB/s |
+
+A window's vocode (two streams, 689 latents to 705536 samples each, four upsampling stages of
+three residual units) is about 2.2 TFLOP, of the order of a second on 16 cores at these rates; the
+96-channel last stage was not timed. On one thread the convolutions reach 36-43% of the bf16
+dot-product ceiling, against the image decoder's 70-88%; they have not been tuned.
+
+## Video generation
+
+MiniMax-H3 adds eight ops (`avx_gen.cpp`, `avx_video.cpp`, and `snake_aa` in `avx_audio.cpp`)
+and these forms: `qk_norm_rope`
+`axial` over f32 positions (its positions a view of a wider plane), with absent gains and as the
+norm alone; `rope` over f32 positions; `gate_add` without tanh; `add` with `div`; `chan_affine` in
+f32; `conv_t1d` at any kernel of a stride or more; `conv1d` with its clamp; and `snake_aa` above.
+The sampler step (`flow_x0_step`), the patch unfold, the decoder's tiles (`vtile_gather`), their
+stitch into bytes (`vtile_stitch`) and their positions (`grid_pos3`) are libref's bit for bit, held
+to zero error by the hand-built cases: a seed gives the same video bytes on both host libraries.
+The stitch blends a line of a tile at a time, each product and sum a pass of the line through x's
+dtype; the frames that refill the overlap run after the frames that read it, so no row is read
+after another task rewrote it. `rms_mod` and its quantised form reduce in another order and are
+held to the tolerance table.
+
+Its step-distilled form's video sparse attention adds two (`avx_vsa.cpp`). `vsa_select`'s
+selection is libref's bit for bit, since one tile more or less changes what a whole query tile
+sees: the tile means sum rows in libref's order with the vector lanes across the head, and each
+score's dot runs over the head in libref's order with the vector lanes across tiles and every
+product rounded before its add. Its coarse branch is held to the tolerance. `attn_vsa` is one task
+per (head, query tile), 64 keys of a visible tile packed at a time for broadcast products and an
+online softmax, as `attn_prefix_self`'s f32 form; a prefix query tile sees every tile, so the tasks
+are scheduled dynamically.
+
 ## Design choices
 
 Each choice below was measured on the platform above. The variants that did not pay are recorded
@@ -628,6 +701,9 @@ and spills a 16-register file, costing more than the FMA saves, so the AVX and A
     avx_{elementwise,norm,hc,quant,gemm,attn,qsa,moe,gdn,sample,misc}.cpp   the kernels; compiled 4x
     avx_gen.cpp        the image generator's norms, sampler, lanes and decoder ops; compiled 4x
     avx_gen_attn.cpp   attn_prefix_self, the generator's attention; compiled 4x
+    avx_video.cpp      the video decoder's patch unfold, tiles, stitch and positions; compiled 4x
+    avx_vsa.cpp        video sparse attention: the tile selection and the attention; compiled 4x
+    avx_audio.cpp      the audio generator's vocoder, sampler, embeddings and window ops; compiled 4x
     avx_harness.h      plugin loading, row selection, the operand draw, guarded buffers, the
                        geometry table -- shared by both tools
     avx_cases.cpp      the geometries; one table so the check and the bench cannot disagree

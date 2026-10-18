@@ -39,6 +39,8 @@ struct Deps {
     IEmbedder*        embed   = nullptr;   /* absent -> /v1/embeddings is 501 */
     IMultimodal*      mm      = nullptr;   /* absent -> image and audio parts are 501 */
     IImageGen*        images  = nullptr;   /* absent -> the images endpoints are 501 */
+    IAudioGen*        audio   = nullptr;   /* absent -> /v1/audio/speech is 501 */
+    IVideoGen*        videos  = nullptr;   /* absent -> /v1/videos is 501 */
     const SpeechFormat* speech = nullptr;  /* absent -> /v1/audio/transcriptions is 501 */
 
     /* Engine-side state the server cannot see (per-card VRAM, the expert plane), as a snapshot
@@ -56,6 +58,16 @@ struct ServerOptions {
     /* An image generator (rad_declare_generator) generates no text: the text endpoints answer
      * 501 naming /v1/images/generations and /v1/images/edits. */
     bool        image_model = false;
+    /* An audio generator (rad_declare_audio_generator) generates no text either: the text
+     * endpoints answer 501 naming /v1/audio/speech. */
+    bool        audio_model = false;
+    /* A video generator (rad_declare_video_generator) generates no text either: the text
+     * endpoints answer 501 naming /v1/videos. */
+    bool        video_model = false;
+    /* How long a finished video's file is kept for /v1/videos/{id}/content, in seconds, and how
+     * many finished videos are kept at most (the oldest go first). */
+    int64_t     video_ttl_s = 3600;
+    int64_t     max_videos = 32;
     /* The decision protocol from the container's `decision.type`: "d1" serves /v1/systemone
      * (systemone.h); empty answers it 501. Never inferred from a name. */
     std::string decision_type;
@@ -119,7 +131,7 @@ struct ServerOptions {
      * clock only mean something under load: queried during a long prefill, it tells a link parked
      * below its maximum from one at rest. */
     std::function<std::string()> diagnostics_json;
-    /* RUNTIME LoRA (Engine::lora_acquire): a request's `model` naming a loaded adapter gets that
+    /* Runtime LoRA (Engine::lora_acquire): a request's `model` naming a loaded adapter gets that
      * adapter's slot, load uid and a hold on it. Unset with LoRA off, and then any `model` is
      * served by the base. `lora_names` lists the adapters a request may name (not the draining
      * ones). */
@@ -183,6 +195,8 @@ private:
     struct Generation;
     struct TranscriptionJob;   /* speech.cpp */
     struct RealtimeSession;    /* realtime.cpp */
+    struct SpeechSession;      /* speech_stream.cpp */
+    struct VideoJob;           /* videos.cpp */
     struct StreamState;
 
     static UsageOut usage_of(const OaiRequest& r, const std::vector<Generation>& gens);
@@ -225,6 +239,37 @@ private:
 
     /* ------------------------------------------------------------------ images.cpp */
     HttpResponse handle_images(const HttpRequest& req, bool edit);
+
+    /* ------------------------------------------------------------------ audio_gen.cpp */
+    HttpResponse handle_speech(const HttpRequest& req);
+    /* The audio a speech request describes, `text` its input, as the generator's request; -1 with
+     * `err` naming the field. Shared by the route and the realtime session. */
+    int speech_request(const json& body, const std::string& text,
+                       std::unique_ptr<gen::AudioRequest>* out, ApiError* err);
+    HttpResponse stream_speech(std::shared_ptr<gen::AudioTicket> ticket, const AudioGenInfo& info,
+                               int64_t n_tok, uint64_t seed, bool sse, bool wav);
+
+    /* ------------------------------------------------------------------ videos.cpp
+     * OpenAI's video jobs: created by POST, made in the background, polled and downloaded. */
+    HttpResponse handle_video_create(const HttpRequest& req);
+    HttpResponse handle_video_list(const HttpRequest& req);
+    HttpResponse handle_video_get(const HttpRequest& req);
+    HttpResponse handle_video_delete(const HttpRequest& req);
+    HttpResponse handle_video_content(const HttpRequest& req);
+    /* A job's thread: the ticket's events into progress and an MP4 file. */
+    void video_work(std::shared_ptr<VideoJob> j);
+    /* Drops expired and surplus finished jobs; under videos_m_. */
+    void sweep_videos_locked(int64_t now);
+    /* Cancels every job and joins its thread; at stop(). */
+    void stop_videos();
+    static json video_json(const VideoJob& j);
+
+    /* ------------------------------------------------------------------ speech_stream.cpp */
+    /* vLLM-Omni's realtime speech session over a WebSocket at /v1/audio/speech/stream: text
+     * streamed in, each sentence's audio streamed out as soon as the sentence is complete. */
+    void handle_speech_stream(const HttpRequest& req, WsConn& ws);
+    void speech_stream_run(SpeechSession& s, WsConn& ws);
+    bool speech_stream_loop(SpeechSession& s, WsConn& ws);
 
     /* ------------------------------------------------------------------ admin.cpp
      * vLLM's non-generation surface, answered on the HTTP thread without the step path, the
@@ -303,6 +348,7 @@ private:
     std::atomic<int64_t> in_flight_{0};
     int64_t              queue_depth_ = 0;
     std::atomic<int64_t> realtime_sessions_{0};
+    std::atomic<int64_t> speech_sessions_{0};
     std::atomic<bool>    stopping_{false};
     int64_t              started_at_ = 0;
 
@@ -311,6 +357,12 @@ private:
      * it under a running step is a use-after-free. */
     std::mutex                          grave_m_;
     std::vector<std::shared_ptr<Sink>>  grave_;
+
+    /* The video jobs, oldest first, and the threads that make them (videos.cpp); deleted jobs
+     * wait in `videos_gone_` until their threads are done. */
+    std::mutex                              videos_m_;
+    std::vector<std::shared_ptr<VideoJob>>  videos_;
+    std::vector<std::shared_ptr<VideoJob>>  videos_gone_;
 };
 
 }  /* namespace server */

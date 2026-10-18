@@ -1399,12 +1399,13 @@ static void step_blocks(RadCtx* c, const Model& m, int64_t R, int64_t S, const R
                         brows(m.b_ks, R));
             RAD_ISSUE(c, L.op_attn_q, bcol(m.b_qkv, 0, qd, R), bcol(m.b_qkv, qd, qd, R),
                       bcol(m.b_qkv, 2 * qd, qd, R), kv_cache(m.kv, (int)l), bt, used, cu, RAD_NONE,
-                      RAD_NONE, brows(m.b_k8, R), brows(m.b_ks, R), brows(m.a_attn.x, R));
+                      RAD_NONE, brows(m.b_k8, R), brows(m.b_ks, R), brows(m.a_attn.x, R),
+                      RAD_NONE);
         } else {
             RAD_ISSUE(c, causal ? L.op_attn_c : L.op_attn_b, bcol(m.b_qkv, 0, qd, R),
                       bcol(m.b_qkv, qd, qd, R), bcol(m.b_qkv, 2 * qd, qd, R),
                       kv_cache(m.kv, (int)l), bt, used, cu, RAD_NONE, RAD_NONE, RAD_NONE, RAD_NONE,
-                      brows(m.a_attn.x, R));
+                      brows(m.a_attn.x, R), RAD_NONE);
         }
         /* Each wait below is for the all-reduce lane 1 holds last, which is the one lane 0 reads
          * next: the second half's projection runs under the first half's reduction, the first

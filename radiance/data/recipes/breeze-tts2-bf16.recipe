@@ -1,0 +1,23 @@
+# breeze-tts2-bf16.recipe -- Breeze-TTS-2 served at bf16, the precision its reference runs the
+# text encoder, the backbone and the depth decoder at.
+#
+#   rad-convert <Breeze-TTS-2 directory> \
+#       --recipe data/recipes/breeze-tts2-bf16.recipe -o breeze-tts2-bf16.rad
+#
+# The directory holds the model and, in audio_tokenizer/, the codec it plays frames through; both
+# are read as one checkpoint. The model ships bf16 and is kept. The depth decoder's heads are
+# stored (in, out) and are transposed here. The codec ships f32: its linears and convolutions are
+# cast to bf16 here, its codebooks divided by their usage first (an EMA codebook), while its norms,
+# layer scales and snake parameters stay f32 -- read once a pass or less.
+
+dep.heads.weight                     cast dtype=bf16
+codec.*.n1.weight                    cast dtype=f32
+codec.*.n2.weight                    cast dtype=f32
+codec.*.ls1.weight                   cast dtype=f32
+codec.*.ls2.weight                   cast dtype=f32
+codec.norm.weight                    cast dtype=f32
+codec.up*.ln.*                       cast dtype=f32
+codec.up*.gamma                      cast dtype=f32
+codec.*.alpha                        cast dtype=f32
+codec.*.beta                         cast dtype=f32
+codec.*                              cast dtype=bf16
