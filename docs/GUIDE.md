@@ -2651,6 +2651,20 @@ rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct?
 | `ROCM_PATH` | where ROCm lives, if not `/opt/rocm` (build time) |
 | `HF_TOKEN` | for `scripts/hfget.sh` and `--model <owner/name>` on a gated or private repo |
 | `XDG_CACHE_HOME` | where `--model <owner/name>` fetches to without `--download-dir` (`$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf`) |
+| `R4D_AR_MAX_BLOCKS` | a ceiling on libr4d's collective block counts, for two tensor-parallel engines on one set of cards; set it in both (below). Unset, nothing changes |
+
+**Two engines on one set of cards.** Every block of a libr4d collective spins until its twin on the
+peer card has pushed, and a prefill-sized fused all-reduce launches more blocks than a card holds at
+once. One engine is safe: both cards dispatch its blocks in the same order. Two tensor-parallel
+engines on the same cards can deadlock: one engine's spinners fill a card while their twins wait
+behind the other engine's kernel on the peer, which waits for a slot on the full card. On two R9700s
+(Qwen3.8-27B and a Gemma 3 27B, both `--tp 2`) that hung within a minute of concurrent prefill, and
+the driver's attempt to evict the queues froze the host. With `R4D_AR_MAX_BLOCKS` in both engines
+low enough that their spinners together leave part of a card free, the cycle cannot close: 64 for
+Qwen3.8-27B (its decode at 16 sequences x 4 rows stays uncapped) and 16 for the Gemma ran 15
+minutes of concurrent long prompts on both without a stall. The ceiling costs prefill time, the
+reductions running on fewer blocks: Qwen3.8-27B's 41k-token prefill 9.5 s uncapped, 9.8 s at 64,
+10.3 s at 32. Give the engine started first its `--gpu-headroom-mib` for the second.
 
 **Tooling**
 

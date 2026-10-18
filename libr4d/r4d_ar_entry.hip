@@ -354,11 +354,26 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
     }
     if (maxb <= 0) return RAD_E_DEVICE;
     in->max_blocks = maxb;
+    /* R4D_AR_MAX_BLOCKS: a ceiling on every collective's block count, for two engines sharing one
+     * set of cards. Each block of a collective spins until its twin on the peer card has pushed, and
+     * a prefill-sized ar_rmsnorm_quant_fp8 launches up to 256 blocks of 16 waves, twice what an
+     * R9700 holds. One engine survives that (both cards dispatch blocks in the same order, so the
+     * lowest unfinished block is resident on both); two engines do not: one engine's spinning blocks
+     * fill a card while their twins wait behind the other engine's kernel on the peer card, which
+     * waits for a slot on the full card. Two TP2 engines on two R9700s (Qwen3.8-27B and Gemma 3 27B)
+     * hung within a minute of concurrent prefill; MES then failed to evict the queues and the
+     * failed reset froze the host. Capped in both engines so that their spinners together cannot
+     * fill a card, the cycle cannot close. The flag and counter arrays keep their full size (maxb);
+     * only the launch counts shrink, and each element's sum is the same. Unset, nothing changes. */
+    if (const char* e = std::getenv("R4D_AR_MAX_BLOCKS")) {
+        const int cap = std::atoi(e);
+        if (cap > 0 && cap < in->max_blocks) in->max_blocks = cap;
+    }
     /* Launch ceilings: 24 at two ranks, the library's design count at width. The compressed
      * 2-rank wire uses up to 48, set at its own call site: it moves three eighths of the bytes, so
      * it needs more blocks to saturate the link. */
     in->nb_cap = (world == 2) ? 24 : (nb_design > 0 ? nb_design : maxb);
-    if (in->nb_cap > maxb) in->nb_cap = maxb;
+    if (in->nb_cap > in->max_blocks) in->nb_cap = in->max_blocks;
 
     /* Slots: one per (parity, source rank) at width; two at world 2, where there is one remote
      * writer. Flags: one word per (block, source rank) at width, one per block at world 2.
