@@ -1075,6 +1075,34 @@ impl Qwen4Bundle {
             .unwrap_or_default()
     }
 
+    /// D2 input readiness mode (`"event"` or `"sync"`) of every armed D2 split
+    /// layer, as `(layer label, mode)` in layer order.
+    pub fn split_ready_modes(&self) -> Vec<(usize, &'static str)> {
+        self.execution
+            .as_ref()
+            .map(Qwen4GpuForward::split_ready_modes)
+            .unwrap_or_default()
+    }
+
+    /// D2 join mode (`"cpwait"` or `"host"`) of every armed D2 split layer, as
+    /// `(layer label, mode)` in layer order.
+    pub fn split_join_modes(&self) -> Vec<(usize, &'static str)> {
+        self.execution
+            .as_ref()
+            .map(Qwen4GpuForward::split_join_modes)
+            .unwrap_or_default()
+    }
+
+    /// Cumulative D2 readiness/join counters of every armed D2 split layer, as
+    /// `(layer label, [ready_polls, ready_fallback_syncs, cpwait_joins,
+    /// cpwait_aborts, watchdog_fires])` in layer order.
+    pub fn split_readiness_counters(&self) -> Vec<(usize, [u64; 5])> {
+        self.execution
+            .as_ref()
+            .map(Qwen4GpuForward::split_readiness_counters)
+            .unwrap_or_default()
+    }
+
     /// Numerical identity of every armed CPU arithmetic mode (D1 and the D2
     /// owner kinds); empty when none is armed.
     pub fn host_exec_identity(&self) -> String {

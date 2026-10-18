@@ -3039,8 +3039,41 @@ fn load_qwen4_rank_scoped(
         } else {
             String::new()
         };
+        // Likewise the readiness and join mechanisms: only a load that asked
+        // for `event` / `cpwait` (or has such a layer) reports them.
+        let ready_modes = bundle.split_ready_modes();
+        let event = ready_modes
+            .iter()
+            .filter(|(_, mode)| *mode == "event")
+            .count();
+        let ready = if event > 0
+            || hipfire_config::memory::qwen4_d2_ready()
+                == Ok(hipfire_config::memory::D2Ready::Event)
+        {
+            format!(
+                "; input ready: {event} event, {} sync",
+                ready_modes.len() - event
+            )
+        } else {
+            String::new()
+        };
+        let join_modes = bundle.split_join_modes();
+        let cpwait = join_modes
+            .iter()
+            .filter(|(_, mode)| *mode == "cpwait")
+            .count();
+        let join = if cpwait > 0
+            || hipfire_config::memory::qwen4_d2_join() == Ok(hipfire_config::memory::D2Join::CpWait)
+        {
+            format!(
+                "; join: {cpwait} cpwait, {} host",
+                join_modes.len() - cpwait
+            )
+        } else {
+            String::new()
+        };
         eprintln!(
-            "  qwen4 routed experts: CPU split (D2) armed on {} layers ({}; {source}{cold_return}): decode and <=4-row verify run their host-placed cold experts on the CPU; prefill and wider verify stay on PCIe",
+            "  qwen4 routed experts: CPU split (D2) armed on {} layers ({}; {source}{cold_return}{ready}{join}): decode and <=4-row verify run their host-placed cold experts on the CPU; prefill and wider verify stay on PCIe",
             split_kinds.len(),
             by_kind.join(", ")
         );

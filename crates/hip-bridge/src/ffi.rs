@@ -10,7 +10,7 @@ use crate::{DeviceBuffer, MemcpyKind};
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_uint, c_void, CString, OsStr, OsString};
 use std::ptr;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Per-thread accumulators for time spent inside HIP FFI calls. Used by
@@ -337,6 +337,25 @@ pub const HIP_HOST_MALLOC_COHERENT: u32 = 0x4000_0000;
 /// Request an explicit system-scope release when recording an event.
 pub const HIP_EVENT_RELEASE_TO_SYSTEM: u32 = 0x8000_0000;
 
+/// `hipDeviceAttributeCanUseStreamWaitValue` in the `hipDeviceAttribute_t` enum
+/// of the ROCm header this bridge targets (`hip_runtime_api.h`:
+/// `hipDeviceAttributeAmdSpecificBegin = 10000`, thirteen enumerators later).
+pub const HIP_DEVICE_ATTRIBUTE_CAN_USE_STREAM_WAIT_VALUE: i32 = 10013;
+
+/// `hipStreamWaitValueGte`: wait until `(*ptr & mask) >= (value & mask)`.
+pub const HIP_STREAM_WAIT_VALUE_GTE: u32 = 0x0;
+
+/// `hipStreamWriteValueDefault`.
+pub const HIP_STREAM_WRITE_VALUE_DEFAULT: u32 = 0x0;
+
+/// `hipMallocSignalMemory` payload of a [`SignalWord`] allocation.
+const SIGNAL_WORD_BYTES: usize = 8;
+
+const STREAM_WAIT_CAP_SLOTS: usize = 16;
+const STREAM_WAIT_CAP_UNKNOWN: u8 = 0;
+const STREAM_WAIT_CAP_NO: u8 = 1;
+const STREAM_WAIT_CAP_YES: u8 = 2;
+
 /// `hipPointerAttribute_t` per ROCm 6.4.3 layout. ROCm 5.x not supported.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -602,6 +621,8 @@ pub struct HipRuntime {
     /// `set_launch_grid_limit_for_arch`. A standalone `HipRuntime` that nobody
     /// configures is unguarded.
     launch_grid_yz_limit: AtomicU32,
+    /// Per-device cache of `hipDeviceAttributeCanUseStreamWaitValue`.
+    stream_wait_caps: [AtomicU8; STREAM_WAIT_CAP_SLOTS],
 }
 
 // HipRuntime is Send+Sync — the underlying HIP runtime is thread-safe for API calls.
@@ -1469,6 +1490,7 @@ impl HipRuntime {
             },
             _lib: Arc::new(lib),
             launch_grid_yz_limit: AtomicU32::new(u32::MAX),
+            stream_wait_caps: std::array::from_fn(|_| AtomicU8::new(STREAM_WAIT_CAP_UNKNOWN)),
         };
 
         // Empirically required on ROCm 7.2 — hipcc-linked binaries get an
@@ -1899,10 +1921,12 @@ impl HipRuntime {
             storage: Some(self.host_buffer(size)?),
             device: self.current_device()?,
             stream: ptr::null_mut(),
-            pending: false,
+            ledger: TransferLedger::new(),
+            ready_event: None,
             get_device: self.fn_get_device,
             set_device: self.fn_set_device,
             synchronize: self.fn_device_synchronize,
+            event_destroy: self.fn_event_destroy,
         })
     }
 
@@ -3316,8 +3340,43 @@ impl HipRuntime {
         self.check(code, "hipStreamWriteValue32")
     }
 
+    /// Whether `device` reports `hipDeviceAttributeCanUseStreamWaitValue`.
+    ///
+    /// Symbol presence alone is not capability: a runtime may export
+    /// `hipStreamWaitValue32` on a device whose queues cannot execute it. The
+    /// answer is cached per device (a query error is not cached).
+    pub fn can_use_stream_wait_value(&self, device: i32) -> HipResult<bool> {
+        let slot = usize::try_from(device)
+            .ok()
+            .and_then(|d| self.stream_wait_caps.get(d));
+        if let Some(slot) = slot {
+            match slot.load(Ordering::Relaxed) {
+                STREAM_WAIT_CAP_NO => return Ok(false),
+                STREAM_WAIT_CAP_YES => return Ok(true),
+                _ => {}
+            }
+        }
+        let capable = if self.fn_stream_wait_value32.is_none() {
+            false
+        } else {
+            self.get_device_attribute(HIP_DEVICE_ATTRIBUTE_CAN_USE_STREAM_WAIT_VALUE, device)? != 0
+        };
+        if let Some(slot) = slot {
+            let cached = if capable {
+                STREAM_WAIT_CAP_YES
+            } else {
+                STREAM_WAIT_CAP_NO
+            };
+            slot.store(cached, Ordering::Relaxed);
+        }
+        Ok(capable)
+    }
+
     /// Wait until a 32-bit signal-memory value satisfies the requested condition.
     /// Operations submitted later to `stream` remain blocked until it does.
+    ///
+    /// Refused unless the current device reports
+    /// `hipDeviceAttributeCanUseStreamWaitValue` ([`Self::can_use_stream_wait_value`]).
     pub fn stream_wait_value32(
         &self,
         stream: &Stream,
@@ -3332,10 +3391,97 @@ impl HipRuntime {
                 "hipStreamWaitValue32 unavailable; stream signal waits are unsupported",
             ));
         };
+        let device = self.current_device()?;
+        if !self.can_use_stream_wait_value(device)? {
+            return Err(HipError::new(
+                0,
+                "hipDeviceAttributeCanUseStreamWaitValue is 0; stream signal waits are unsupported",
+            ));
+        }
         // SAFETY: ptr is a live device signal/buffer address from DeviceBuffer; stream
         // is a live handle. Value wait/write races are ordered by the stream.
         let code = unsafe { wait_value32(stream.0, ptr.as_ptr(), value, flags, mask) };
         self.check(code, "hipStreamWaitValue32")
+    }
+
+    /// Allocate one [`SignalWord`] (8 bytes of `hipMallocSignalMemory`),
+    /// initialized to 0. Refused unless the current device can use stream
+    /// value operations.
+    pub fn signal_word(&self) -> HipResult<SignalWord> {
+        let device = self.current_device()?;
+        if !self.can_use_stream_wait_value(device)? {
+            return Err(HipError::new(
+                0,
+                "hipDeviceAttributeCanUseStreamWaitValue is 0; signal words are unsupported",
+            ));
+        }
+        let owner = self.malloc_signal(SIGNAL_WORD_BYTES)?;
+        let host = owner.as_ptr().cast::<u32>();
+        if host.is_null() || !(host as usize).is_multiple_of(std::mem::align_of::<u32>()) {
+            let _ = self.free(owner);
+            return Err(mapped_err(
+                "signal memory returned a null or misaligned host pointer",
+            ));
+        }
+        // SAFETY: the Borrowed view never outlives `owner`, which the word owns.
+        let view = unsafe { owner.alias() };
+        let word = SignalWord {
+            owner: Some(owner),
+            view,
+            host,
+            device,
+            free: self.fn_free,
+            get_device: self.fn_get_device,
+            set_device: self.fn_set_device,
+            synchronize: self.fn_device_synchronize,
+            _lib: Arc::clone(&self._lib),
+        };
+        word.store(0);
+        Ok(word)
+    }
+
+    /// Enqueue `hipStreamWriteValue32(word, generation)` on `stream`: a
+    /// GPU-ordered release of everything queued before it (`None` = the default
+    /// stream). `value` must be a generation, never [`SIGNAL_ABORT`].
+    pub fn stream_write_signal(
+        &self,
+        stream: Option<&Stream>,
+        word: &SignalWord,
+        value: u32,
+    ) -> HipResult<()> {
+        if !SignalGen::is_generation(value) {
+            return Err(mapped_err("signal write value is not a generation"));
+        }
+        let raw = Stream(stream.map_or(ptr::null_mut(), |s| s.0));
+        self.stream_write_value32(
+            &raw,
+            word.device_buffer(),
+            value,
+            HIP_STREAM_WRITE_VALUE_DEFAULT,
+        )
+    }
+
+    /// Enqueue `hipStreamWaitValue32(word >= generation)` on `stream`. Later
+    /// work on the stream stays blocked until the word reaches `generation` or
+    /// holds [`SIGNAL_ABORT`]. Every error path of a caller that queued this
+    /// wait must store the abort value before any synchronize.
+    pub fn stream_wait_signal_gte(
+        &self,
+        stream: Option<&Stream>,
+        word: &SignalWord,
+        generation: u32,
+    ) -> HipResult<()> {
+        if !SignalGen::is_generation(generation) {
+            return Err(mapped_err("signal wait value is not a generation"));
+        }
+        let raw = Stream(stream.map_or(ptr::null_mut(), |s| s.0));
+        self.stream_wait_value32(
+            &raw,
+            word.device_buffer(),
+            generation,
+            HIP_STREAM_WAIT_VALUE_GTE,
+            u32::MAX,
+        )
     }
 
     pub fn device_synchronize(&self) -> HipResult<()> {
@@ -3464,20 +3610,222 @@ impl Drop for PinnedHostBuffer {
     }
 }
 
+// ── Pinned transfer storage and input readiness ─────────────────
+
+static NEXT_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Process-wide enqueue order across every transfer buffer. Each enqueue (and
+/// each readiness arm) draws the next value; the cross-buffer retirement proof
+/// compares them.
+static NEXT_TRANSFER_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// What proves an [`InputReady`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadyKind {
+    /// An event recorded on the buffer's stream after its queued downloads.
+    Event,
+    /// A `hipStreamWriteValue32` of this generation to a [`SignalWord`].
+    Word(u32),
+}
+
+/// Proof obligation of one armed readiness point of a [`PinnedTransferBuffer`].
+///
+/// Minted by [`PinnedTransferBuffer::arm_ready`] /
+/// [`PinnedTransferBuffer::arm_ready_word`] after the downloads are queued;
+/// only the buffer that minted it, while the arm is still current, can complete
+/// it. A completed token proves host readiness of that buffer and, through
+/// [`PinnedTransferBuffer::retire_behind`], of earlier same-stream buffers.
+/// Not `Clone`/`Copy`. It is a different type from [`MappedPublished`]: the
+/// two cannot be exchanged.
+///
+/// ```compile_fail
+/// fn takes_published(_: hip_bridge::MappedPublished) {}
+/// fn forge(ready: hip_bridge::InputReady) {
+///     takes_published(ready)
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn takes_ready(_: hip_bridge::InputReady) {}
+/// fn forge(published: hip_bridge::MappedPublished) {
+///     takes_ready(published)
+/// }
+/// ```
+#[must_use = "an armed readiness point must be completed before host access"]
+#[derive(Debug, PartialEq, Eq)]
+pub struct InputReady {
+    buffer: u64,
+    arm: u64,
+    kind: ReadyKind,
+    stream: usize,
+    seq: u64,
+    complete: bool,
+}
+
+impl InputReady {
+    /// Whether the proof has been completed (by a query, a word or a blocking
+    /// fallback) on the buffer that minted it.
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// The process-wide sequence number drawn when this readiness was armed.
+    pub fn sequence(&self) -> u64 {
+        self.seq
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Retire {
+    Retired,
+    /// The proof does not cover this buffer: complete it separately.
+    NotCovered,
+}
+
+/// Pure, HIP-free ledger of one [`PinnedTransferBuffer`]: pending accesses,
+/// the stream and sequence of the last enqueue, and the armed readiness.
+#[derive(Debug)]
+struct TransferLedger {
+    id: u64,
+    pending: bool,
+    stream: usize,
+    last_seq: u64,
+    armed: Option<(u64, ReadyKind)>,
+    next_arm: u64,
+}
+
+impl TransferLedger {
+    fn new() -> Self {
+        Self {
+            id: NEXT_TRANSFER_ID.fetch_add(1, Ordering::Relaxed),
+            pending: false,
+            stream: 0,
+            last_seq: 0,
+            armed: None,
+            next_arm: 1,
+        }
+    }
+
+    /// A stream change while accesses are pending needs a device drain first.
+    fn needs_drain(&self, raw: usize) -> bool {
+        self.pending && self.stream != raw
+    }
+
+    /// Every pending access is retired.
+    fn drained(&mut self) {
+        self.pending = false;
+        self.armed = None;
+    }
+
+    /// Mark before submission: even a failed API call must not expose storage
+    /// while an earlier copy might still be using it. A new enqueue
+    /// invalidates the armed readiness, which no longer covers it.
+    fn enqueued(&mut self, raw: usize) {
+        self.enqueued_at(raw, NEXT_TRANSFER_SEQ.fetch_add(1, Ordering::Relaxed));
+    }
+
+    fn enqueued_at(&mut self, raw: usize, seq: u64) {
+        self.stream = raw;
+        self.pending = true;
+        self.last_seq = seq;
+        self.armed = None;
+    }
+
+    fn arm(&mut self, kind: ReadyKind) -> Result<InputReady, &'static str> {
+        self.arm_at(kind, NEXT_TRANSFER_SEQ.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn arm_at(&mut self, kind: ReadyKind, seq: u64) -> Result<InputReady, &'static str> {
+        if !self.pending {
+            return Err("no pending transfer to arm readiness for");
+        }
+        let arm = self.next_arm;
+        self.next_arm += 1;
+        self.armed = Some((arm, kind));
+        Ok(InputReady {
+            buffer: self.id,
+            arm,
+            kind,
+            stream: self.stream,
+            seq,
+            complete: false,
+        })
+    }
+
+    fn check(&self, token: &InputReady) -> Result<(), &'static str> {
+        if token.buffer != self.id {
+            return Err("readiness token belongs to a different transfer buffer");
+        }
+        if token.complete {
+            return Err("readiness token was already completed");
+        }
+        match self.armed {
+            Some((arm, kind)) if arm == token.arm && kind == token.kind => Ok(()),
+            Some(_) => Err("readiness token is stale: the buffer was re-armed"),
+            None => {
+                Err("readiness token no longer covers the buffer (later enqueue or completion)")
+            }
+        }
+    }
+
+    /// Whether a word observation proves a `Word` token.
+    fn observe_word(&self, token: &InputReady, observed: u32) -> Result<bool, &'static str> {
+        self.check(token)?;
+        match token.kind {
+            ReadyKind::Word(want) => Ok(observed >= want),
+            ReadyKind::Event => Err("an event readiness token is not proved by a signal word"),
+        }
+    }
+
+    fn complete(&mut self, token: &mut InputReady) -> Result<(), &'static str> {
+        self.check(token)?;
+        self.drained();
+        token.complete = true;
+        Ok(())
+    }
+
+    /// A completed proof retires this buffer only when its last enqueue was on
+    /// the proof's stream with a smaller sequence: same-stream FIFO then puts
+    /// that access before the proof's marker.
+    fn retire_behind(&mut self, proof: &InputReady) -> Result<Retire, &'static str> {
+        if !proof.complete {
+            return Err("readiness proof is not complete");
+        }
+        if !self.pending {
+            return Ok(Retire::Retired);
+        }
+        if self.stream == proof.stream && self.last_seq < proof.seq {
+            self.drained();
+            Ok(Retire::Retired)
+        } else {
+            Ok(Retire::NotCovered)
+        }
+    }
+}
+
 /// Pinned transfer storage whose outstanding GPU accesses survive a CPU call.
 ///
-/// Host access is available only after `complete` drains the queued downloads.
-/// Uploads and following downloads on the same stream reuse the allocation
-/// without an intervening host wait. Stream changes and teardown must retire
-/// the old accesses first; a failed teardown retains the allocation.
+/// Host access is available only after `complete` (or a completed readiness
+/// token) drains the queued downloads. Uploads and following downloads on the
+/// same stream reuse the allocation without an intervening host wait. Stream
+/// changes and teardown must retire the old accesses first; a failed teardown
+/// retains the allocation.
+///
+/// Event readiness: after the queued downloads, [`Self::arm_ready`] records an
+/// event on the buffer's stream and returns an [`InputReady`];
+/// [`Self::try_complete_ready`] polls it without a stream synchronization. A
+/// completed token also retires other buffers whose last enqueue was on the
+/// same stream earlier ([`Self::retire_behind`]).
 pub struct PinnedTransferBuffer {
     storage: Option<PinnedHostBuffer>,
     device: i32,
     stream: HipStream,
-    pending: bool,
+    ledger: TransferLedger,
+    ready_event: Option<Event>,
     get_device: unsafe extern "C" fn(*mut c_int) -> u32,
     set_device: unsafe extern "C" fn(c_int) -> u32,
     synchronize: unsafe extern "C" fn() -> u32,
+    event_destroy: unsafe extern "C" fn(HipEvent) -> u32,
 }
 
 // SAFETY: this is the unique owner of its pinned allocation. Moving it does
@@ -3485,7 +3833,7 @@ pub struct PinnedTransferBuffer {
 // Submission, completion and host access all require exclusive `&mut self`;
 // the caller must bind the recorded device before HIP operations. Drop binds
 // that device itself, drains pending accesses and restores the prior binding,
-// retaining storage if retirement fails. HIP stream handles are not
+// retaining storage if retirement fails. HIP stream and event handles are not
 // thread-affine. Deliberately NOT Sync: concurrent access is not supported.
 unsafe impl Send for PinnedTransferBuffer {}
 
@@ -3501,6 +3849,11 @@ impl PinnedTransferBuffer {
 
     pub fn device(&self) -> i32 {
         self.device
+    }
+
+    /// Whether queued accesses are not yet proved complete.
+    pub fn is_pending(&self) -> bool {
+        self.ledger.pending
     }
 
     /// The runtime must be bound to this buffer's device, and the stream and
@@ -3571,20 +3924,130 @@ impl PinnedTransferBuffer {
 
     /// Complete the caller's existing D2H readiness boundary.
     pub fn complete(&mut self, hip: &HipRuntime) -> HipResult<()> {
-        if self.pending {
-            if self.stream.is_null() {
-                hip.stream_synchronize_default()?;
-            } else {
-                hip.stream_synchronize(&Stream(self.stream))?;
-            }
-            self.pending = false;
+        if self.ledger.pending {
+            self.sync_stream(hip)?;
+            self.ledger.drained();
         }
         Ok(())
     }
 
+    fn sync_stream(&self, hip: &HipRuntime) -> HipResult<()> {
+        if self.stream.is_null() {
+            hip.stream_synchronize_default()
+        } else {
+            hip.stream_synchronize(&Stream(self.stream))
+        }
+    }
+
+    /// Record an event on this buffer's stream after its queued transfers and
+    /// return the token that [`Self::try_complete_ready`] polls. The event is
+    /// created on first use and reused. A failed record returns no token and
+    /// leaves the accesses pending.
+    pub fn arm_ready(&mut self, hip: &HipRuntime) -> HipResult<InputReady> {
+        if !self.ledger.pending {
+            return Err(mapped_err("no pending transfer to arm readiness for"));
+        }
+        if self.ready_event.is_none() {
+            self.ready_event = Some(hip.event_create_with_flags(HIP_EVENT_DISABLE_TIMING)?);
+        }
+        let event = self
+            .ready_event
+            .as_ref()
+            .expect("ready event was just created");
+        hip.event_record(event, Some(&Stream(self.stream)))?;
+        self.ledger.arm(ReadyKind::Event).map_err(mapped_err)
+    }
+
+    /// Enqueue `hipStreamWriteValue32(word, value)` on this buffer's stream
+    /// after its queued transfers and return the token that
+    /// [`Self::try_complete_ready_word`] checks. `value` must be a generation.
+    pub fn arm_ready_word(
+        &mut self,
+        hip: &HipRuntime,
+        word: &SignalWord,
+        value: u32,
+    ) -> HipResult<InputReady> {
+        if !self.ledger.pending {
+            return Err(mapped_err("no pending transfer to arm readiness for"));
+        }
+        hip.stream_write_signal(Some(&Stream(self.stream)), word, value)?;
+        self.ledger.arm(ReadyKind::Word(value)).map_err(mapped_err)
+    }
+
+    /// Non-blocking completion of an event token: `Ok(true)` once the event
+    /// completed (the accesses are then retired and `ready` is a completed
+    /// proof), `Ok(false)` while outstanding. A foreign, stale or wrong-kind
+    /// token and any query error leave the accesses pending.
+    pub fn try_complete_ready(
+        &mut self,
+        hip: &HipRuntime,
+        ready: &mut InputReady,
+    ) -> HipResult<bool> {
+        self.ledger.check(ready).map_err(mapped_err)?;
+        if ready.kind != ReadyKind::Event {
+            return Err(mapped_err(
+                "a signal-word readiness token is not an event token",
+            ));
+        }
+        let event = self
+            .ready_event
+            .as_ref()
+            .ok_or_else(|| mapped_err("event readiness without a recorded event"))?;
+        if hip.event_query(event)? {
+            self.ledger.complete(ready).map_err(mapped_err)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Non-blocking completion of a signal-word token: an acquire load of
+    /// `word` at or above the armed generation completes it. An observed
+    /// [`SIGNAL_ABORT`] also compares `>=` but is refused: the ready word is
+    /// never aborted, so seeing the reserved value means the word is dead.
+    pub fn try_complete_ready_word(
+        &mut self,
+        ready: &mut InputReady,
+        word: &SignalWord,
+    ) -> HipResult<bool> {
+        let observed = word.load_acquire();
+        if observed == SIGNAL_ABORT {
+            return Err(mapped_err(
+                "input ready word holds the reserved abort value",
+            ));
+        }
+        if self
+            .ledger
+            .observe_word(ready, observed)
+            .map_err(mapped_err)?
+        {
+            self.ledger.complete(ready).map_err(mapped_err)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Blocking fallback for an armed token: synchronize the stream, then mark
+    /// the token complete. A foreign or stale token is refused before any wait.
+    pub fn complete_ready(&mut self, hip: &HipRuntime, ready: &mut InputReady) -> HipResult<()> {
+        self.ledger.check(ready).map_err(mapped_err)?;
+        self.sync_stream(hip)?;
+        self.ledger.complete(ready).map_err(mapped_err)
+    }
+
+    /// Retire this buffer's pending accesses using another buffer's completed
+    /// proof: `Ok(true)` when they are retired (including when none were
+    /// pending), `Ok(false)` when the proof does not cover this buffer (a
+    /// different stream, or an enqueue not earlier than the proof) and the
+    /// caller must [`Self::complete`] it. An incomplete proof is an error.
+    pub fn retire_behind(&mut self, proof: &InputReady) -> HipResult<bool> {
+        Ok(self.ledger.retire_behind(proof).map_err(mapped_err)? == Retire::Retired)
+    }
+
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
         assert!(
-            !self.pending,
+            !self.ledger.pending,
             "host access before pinned transfer completion"
         );
         self.storage
@@ -3602,49 +4065,44 @@ impl PinnedTransferBuffer {
 
     fn begin(&mut self, hip: &HipRuntime, stream: Option<&Stream>) -> HipResult<()> {
         let raw = stream.map_or(ptr::null_mut(), |s| s.0);
-        if self.pending && self.stream != raw {
+        if self.ledger.needs_drain(raw as usize) {
             // The old stream may have been destroyed already. Drain the owning
             // device, not a potentially stale handle, on this rare transition.
             hip.device_synchronize()?;
-            self.pending = false;
+            self.ledger.drained();
         }
         self.stream = raw;
-        // Mark before submission: even a failed API call must not release or
-        // expose storage while an earlier copy might still be using it.
-        self.pending = true;
+        self.ledger.enqueued(raw as usize);
         Ok(())
     }
 }
 
 impl Drop for PinnedTransferBuffer {
     fn drop(&mut self) {
-        if !self.pending {
+        let event = self.ready_event.take();
+        let pending = self.ledger.pending;
+        if !pending && event.is_none() {
             return;
         }
-        let mut previous = 0;
-        // SAFETY: the pinned owner keeps the function-pointer library live.
-        // Bind its device before draining; restore the caller's device so
-        // cached thread binding remains valid outside this destructor.
-        let drained = unsafe {
-            let got = (self.get_device)(&mut previous);
-            crate::error::observe_raw_code(got);
-            if got != HIP_SUCCESS {
-                false
-            } else {
-                let bound = (self.set_device)(self.device);
-                crate::error::observe_raw_code(bound);
-                if bound != HIP_SUCCESS {
-                    false
-                } else {
-                    let code = (self.synchronize)();
-                    crate::error::observe_raw_code(code);
-                    let restored = (self.set_device)(previous);
-                    crate::error::observe_raw_code(restored);
-                    code == HIP_SUCCESS && restored == HIP_SUCCESS
+        // Bind the owning device before draining; restore the caller's device
+        // so cached thread binding remains valid outside this destructor.
+        let drained = call_on_device(self.get_device, self.set_device, self.device, || {
+            let mut code = HIP_SUCCESS;
+            if pending {
+                // SAFETY: the pinned owner keeps the function-pointer library live.
+                code = unsafe { (self.synchronize)() };
+            }
+            if code == HIP_SUCCESS {
+                if let Some(event) = event.as_ref() {
+                    // SAFETY: the live event handle is owned by this buffer; the
+                    // stream was drained above, so the record is complete.
+                    let destroyed = unsafe { (self.event_destroy)(event.0) };
+                    crate::error::observe_raw_code(destroyed);
                 }
             }
-        };
-        if !drained {
+            code
+        });
+        if !drained && pending {
             // Retain both allocation and library rather than freeing memory
             // that the device may still access after a failed drain.
             std::mem::forget(self.storage.take());
@@ -4100,6 +4558,267 @@ impl Drop for MappedHostBuffer {
     }
 }
 
+// ── Signal words (CP-side waits) ────────────────────────────────
+
+/// Largest generation a [`SignalWord`] may carry: 31 bits. Generations count
+/// up from 1; the word starts at 0.
+pub const SIGNAL_GEN_MAX: u32 = 0x7FFF_FFFF;
+
+/// Reserved release value. It compares `>=` every generation, so a
+/// `Gte` wait on any generation is released by a store of `SIGNAL_ABORT`. It
+/// is never a generation and is never reused: a word that holds it is dead.
+pub const SIGNAL_ABORT: u32 = u32::MAX;
+
+/// Pure monotonic generation source of one signal word pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignalGen {
+    last: u32,
+}
+
+impl SignalGen {
+    pub const fn new() -> Self {
+        Self { last: 0 }
+    }
+
+    #[cfg(test)]
+    fn at(last: u32) -> Self {
+        Self { last }
+    }
+
+    /// The most recently issued generation (0 before the first).
+    pub const fn last(&self) -> u32 {
+        self.last
+    }
+
+    /// Whether `value` may be written to / waited on as a generation.
+    pub const fn is_generation(value: u32) -> bool {
+        value >= 1 && value <= SIGNAL_GEN_MAX
+    }
+
+    /// The next generation. A counter that would pass [`SIGNAL_GEN_MAX`] is
+    /// refused instead of wrapping: a wrapped (smaller) generation would be
+    /// already satisfied by the stale word value.
+    pub fn next(&mut self) -> HipResult<u32> {
+        if self.last >= SIGNAL_GEN_MAX {
+            return Err(mapped_err(
+                "signal generation counter exhausted; wrap refused",
+            ));
+        }
+        self.last += 1;
+        Ok(self.last)
+    }
+}
+
+impl Default for SignalGen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Steps of destroying a signal word, in the only safe order.
+trait SignalTeardown {
+    /// Release any wait that may still be pending on the word.
+    fn store_abort(&mut self);
+    /// Drain the device; `false` when quiescence is not proved.
+    fn quiesce(&mut self) -> bool;
+    /// Release the allocation; `false` when it failed.
+    fn free(&mut self) -> bool;
+}
+
+/// Abort FIRST (a drain with a pending wait never finishes), drain second,
+/// free only after a proved drain. `false` means the allocation must be
+/// retained.
+fn teardown_signal(t: &mut impl SignalTeardown) -> bool {
+    t.store_abort();
+    if !t.quiesce() {
+        return false;
+    }
+    t.free()
+}
+
+/// Run `call` with `device` bound, restoring the caller's binding. `true` only
+/// if every HIP step succeeded.
+fn call_on_device(
+    get_device: unsafe extern "C" fn(*mut c_int) -> u32,
+    set_device: unsafe extern "C" fn(c_int) -> u32,
+    device: i32,
+    call: impl FnOnce() -> u32,
+) -> bool {
+    let mut previous = 0;
+    // SAFETY: the caller's owner keeps the function-pointer library live; the
+    // out-param is a stack local.
+    let got = unsafe { get_device(&mut previous) };
+    crate::error::observe_raw_code(got);
+    if got != HIP_SUCCESS {
+        return false;
+    }
+    // SAFETY: as above; binds the device recorded at construction.
+    let bound = unsafe { set_device(device) };
+    crate::error::observe_raw_code(bound);
+    if bound != HIP_SUCCESS {
+        return false;
+    }
+    let code = call();
+    crate::error::observe_raw_code(code);
+    // SAFETY: as above; restores the caller's device binding.
+    let restored = unsafe { set_device(previous) };
+    crate::error::observe_raw_code(restored);
+    code == HIP_SUCCESS && restored == HIP_SUCCESS
+}
+
+/// Host pointer of a [`SignalWord`] for a thread that must store
+/// [`SIGNAL_ABORT`] (the join watchdog).
+#[derive(Clone, Copy, Debug)]
+pub struct SignalHostPtr(*mut u32);
+
+// SAFETY: the pointee is signal memory accessed only through volatile
+// loads/stores of one aligned 32-bit word; the holder's contract (see
+// `SignalHostPtr::store`) keeps the owning word alive.
+unsafe impl Send for SignalHostPtr {}
+// SAFETY: as above; concurrent volatile stores of a u32 are the protocol.
+unsafe impl Sync for SignalHostPtr {}
+
+impl SignalHostPtr {
+    /// Volatile store of `value` after a release fence.
+    ///
+    /// # Safety
+    /// The [`SignalWord`] this pointer came from must still be alive. A holder
+    /// must stop using the pointer (disarm) before the word is dropped.
+    pub unsafe fn store(self, value: u32) {
+        std::sync::atomic::fence(Ordering::Release);
+        // SAFETY: the caller guarantees the word is live; it is an aligned u32.
+        unsafe { ptr::write_volatile(self.0, value) }
+    }
+}
+
+/// One 32-bit word of `hipMallocSignalMemory` storage: GPU-writable by
+/// `hipStreamWriteValue32`, GPU-waitable by `hipStreamWaitValue32`, and
+/// host-accessible only through volatile loads/stores plus explicit fences.
+///
+/// The allocation is owned here exactly once (`hipFree` after quiescence); the
+/// device view is a non-owning `Borrowed` alias. Drop stores
+/// [`SIGNAL_ABORT`] first, drains the device, and retains the allocation if
+/// the drain is not proved: freeing signal memory that a queued wait may still
+/// poll is never allowed.
+pub struct SignalWord {
+    owner: Option<DeviceBuffer>,
+    view: DeviceBuffer,
+    host: *mut u32,
+    device: i32,
+    free: unsafe extern "C" fn(*mut c_void) -> u32,
+    get_device: unsafe extern "C" fn(*mut c_int) -> u32,
+    set_device: unsafe extern "C" fn(c_int) -> u32,
+    synchronize: unsafe extern "C" fn() -> u32,
+    _lib: Arc<Library>,
+}
+
+// SAFETY: unique owner of its signal allocation; the host pointer is used only
+// through volatile accesses of one aligned word. Moving it does not move the
+// allocation. Deliberately NOT Sync: other threads get `SignalHostPtr`.
+unsafe impl Send for SignalWord {}
+
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<SignalWord>();
+};
+
+impl SignalWord {
+    pub fn device(&self) -> i32 {
+        self.device
+    }
+
+    /// Non-owning device view: pass it to the stream value operations. Never
+    /// free it and do not let it outlive the word.
+    pub fn device_buffer(&self) -> &DeviceBuffer {
+        &self.view
+    }
+
+    /// Volatile load of the word.
+    pub fn load(&self) -> u32 {
+        // SAFETY: `host` is the live, aligned 4-byte signal allocation.
+        unsafe { ptr::read_volatile(self.host) }
+    }
+
+    /// Volatile load followed by an acquire fence: bytes the GPU wrote before
+    /// the value it just read are visible after this returns.
+    pub fn load_acquire(&self) -> u32 {
+        let value = self.load();
+        std::sync::atomic::fence(Ordering::Acquire);
+        value
+    }
+
+    /// Volatile store with no ordering of earlier stores.
+    pub fn store(&self, value: u32) {
+        // SAFETY: as `load`.
+        unsafe { ptr::write_volatile(self.host, value) }
+    }
+
+    /// Release fence, then a volatile store: every earlier host store is
+    /// ordered before `value` for any observer that acquires it. This is a
+    /// host-side order only; GPU visibility is established by a hardware oracle.
+    pub fn store_release(&self, value: u32) {
+        std::sync::atomic::fence(Ordering::Release);
+        self.store(value);
+    }
+
+    /// Pointer for the watchdog thread; see [`SignalHostPtr::store`].
+    pub fn host_ptr(&self) -> SignalHostPtr {
+        SignalHostPtr(self.host)
+    }
+}
+
+struct SignalWordTeardown<'a>(&'a mut SignalWord);
+
+impl SignalTeardown for SignalWordTeardown<'_> {
+    fn store_abort(&mut self) {
+        self.0.store_release(SIGNAL_ABORT);
+    }
+
+    fn quiesce(&mut self) -> bool {
+        let word = &*self.0;
+        call_on_device(word.get_device, word.set_device, word.device, || {
+            // SAFETY: device synchronize takes no arguments; the device is bound.
+            unsafe { (word.synchronize)() }
+        })
+    }
+
+    fn free(&mut self) -> bool {
+        let word = &mut *self.0;
+        let Some(mut owner) = word.owner.take() else {
+            return true;
+        };
+        let raw = owner.as_ptr();
+        let token = owner.take_charge();
+        let free = word.free;
+        let freed = crate::emu_budget::charged_free::<crate::emu_budget::Process>(token, || {
+            // SAFETY: unique hipExtMallocWithFlags owner; the drain was proved
+            // and the abort value releases any wait, so nothing polls it.
+            let code = unsafe { free(raw) };
+            crate::error::observe_raw_code(code);
+            if code == HIP_SUCCESS {
+                crate::registry::forget(raw as usize);
+                Ok(())
+            } else {
+                Err(HipError::new(code, "hipFree"))
+            }
+        });
+        freed.is_ok()
+    }
+}
+
+impl Drop for SignalWord {
+    fn drop(&mut self) {
+        if self.owner.is_none() {
+            return;
+        }
+        if !teardown_signal(&mut SignalWordTeardown(self)) {
+            // Retain the allocation and the library: a queued wait may still
+            // poll the word. The unreleased emu charge stays.
+            std::mem::forget(Arc::clone(&self._lib));
+        }
+    }
+}
+
 /// GPU stream handle.
 pub struct Stream(HipStream);
 impl Stream {
@@ -4453,5 +5172,289 @@ mod mapped_ledger_tests {
             const IS_CLONE: bool = true;
         }
         assert!(!<Probe<MappedPublished>>::IS_CLONE);
+    }
+}
+
+#[cfg(test)]
+mod transfer_ready_tests {
+    use super::{InputReady, ReadyKind, Retire, TransferLedger};
+
+    const S1: usize = 0x10;
+    const S2: usize = 0x20;
+
+    /// A ledger with one enqueue on `stream` at `seq`.
+    fn enqueued(stream: usize, seq: u64) -> TransferLedger {
+        let mut l = TransferLedger::new();
+        l.enqueued_at(stream, seq);
+        l
+    }
+
+    #[test]
+    fn arm_requires_pending_work() {
+        let mut l = TransferLedger::new();
+        assert!(l.arm_at(ReadyKind::Event, 5).is_err(), "nothing queued");
+        l.enqueued_at(S1, 1);
+        assert!(l.arm_at(ReadyKind::Event, 2).is_ok());
+    }
+
+    #[test]
+    fn only_the_matching_token_completes_the_buffer() {
+        let mut a = enqueued(S1, 1);
+        let mut b = enqueued(S1, 2);
+        let mut ta = a.arm_at(ReadyKind::Event, 3).unwrap();
+        let mut tb = b.arm_at(ReadyKind::Event, 4).unwrap();
+        // A token of another buffer is refused and changes nothing.
+        assert!(a.complete(&mut tb).is_err());
+        assert!(b.pending && a.pending);
+        a.complete(&mut ta).unwrap();
+        assert!(!a.pending && ta.is_complete());
+        assert!(b.pending, "the other buffer is untouched");
+        b.complete(&mut tb).unwrap();
+        assert!(!b.pending);
+    }
+
+    #[test]
+    fn a_stale_or_replaced_token_cannot_complete() {
+        let mut l = enqueued(S1, 1);
+        let mut old = l.arm_at(ReadyKind::Event, 2).unwrap();
+        let mut new = l.arm_at(ReadyKind::Event, 3).unwrap();
+        assert!(
+            l.complete(&mut old).is_err(),
+            "re-armed: the old token is stale"
+        );
+        assert!(l.pending);
+        // A later enqueue also invalidates the armed token: the event no
+        // longer covers the buffer.
+        l.enqueued_at(S1, 4);
+        assert!(l.complete(&mut new).is_err(), "later enqueue");
+        assert!(l.pending);
+        let mut fresh = l.arm_at(ReadyKind::Event, 5).unwrap();
+        l.complete(&mut fresh).unwrap();
+        assert!(
+            l.complete(&mut fresh).is_err(),
+            "a completed token completes once"
+        );
+    }
+
+    #[test]
+    fn a_token_kind_must_match_the_armed_kind() {
+        let mut l = enqueued(S1, 1);
+        let mut ev = l.arm_at(ReadyKind::Event, 2).unwrap();
+        let mut forged = InputReady {
+            kind: ReadyKind::Word(7),
+            ..l.arm_at(ReadyKind::Event, 3).unwrap()
+        };
+        assert!(l.complete(&mut forged).is_err(), "armed Event, token Word");
+        assert!(
+            l.complete(&mut ev).is_err(),
+            "the first token was replaced by the second arm"
+        );
+    }
+
+    #[test]
+    fn a_word_token_completes_only_after_its_value_is_observed() {
+        let mut l = enqueued(S1, 1);
+        let mut t = l.arm_at(ReadyKind::Word(9), 2).unwrap();
+        assert_eq!(l.observe_word(&t, 8), Ok(false));
+        assert!(l.pending);
+        assert_eq!(l.observe_word(&t, 9), Ok(true));
+        l.complete(&mut t).unwrap();
+        assert!(!l.pending);
+        let mut e = enqueued(S1, 3);
+        let ev = e.arm_at(ReadyKind::Event, 4).unwrap();
+        assert!(
+            e.observe_word(&ev, u32::MAX).is_err(),
+            "an event token never reads a word"
+        );
+    }
+
+    #[test]
+    fn a_completed_proof_retires_an_earlier_buffer_on_the_same_stream() {
+        let mut input = enqueued(S1, 10);
+        let mut mask = enqueued(S1, 4);
+        let mut proof = input.arm_at(ReadyKind::Event, 11).unwrap();
+        assert!(
+            mask.retire_behind(&proof).is_err(),
+            "an uncompleted proof retires nothing"
+        );
+        input.complete(&mut proof).unwrap();
+        assert_eq!(mask.retire_behind(&proof), Ok(Retire::Retired));
+        assert!(!mask.pending);
+        assert_eq!(
+            mask.retire_behind(&proof),
+            Ok(Retire::Retired),
+            "idempotent"
+        );
+    }
+
+    #[test]
+    fn a_stream_mismatch_or_a_later_sequence_is_not_covered() {
+        let mut input = enqueued(S1, 10);
+        let mut proof = input.arm_at(ReadyKind::Event, 11).unwrap();
+        input.complete(&mut proof).unwrap();
+        let mut other_stream = enqueued(S2, 4);
+        assert_eq!(other_stream.retire_behind(&proof), Ok(Retire::NotCovered));
+        assert!(other_stream.pending);
+        let mut later = enqueued(S1, 12);
+        assert_eq!(
+            later.retire_behind(&proof),
+            Ok(Retire::NotCovered),
+            "enqueued after the arm"
+        );
+        assert!(later.pending);
+        let mut equal = enqueued(S1, 11);
+        assert_eq!(
+            equal.retire_behind(&proof),
+            Ok(Retire::NotCovered),
+            "same sequence is not smaller"
+        );
+    }
+
+    #[test]
+    fn real_sequences_are_process_wide_and_monotonic() {
+        let mut a = TransferLedger::new();
+        let mut b = TransferLedger::new();
+        a.enqueued(S1);
+        b.enqueued(S1);
+        a.enqueued(S1);
+        assert!(a.last_seq > b.last_seq && b.last_seq > 0);
+        let mut proof = a.arm(ReadyKind::Event).unwrap();
+        a.complete(&mut proof).unwrap();
+        assert!(proof.sequence() > a.last_seq);
+        assert_eq!(b.retire_behind(&proof), Ok(Retire::Retired));
+    }
+
+    #[test]
+    fn a_stream_change_requires_a_drain_only_while_pending() {
+        let mut l = TransferLedger::new();
+        assert!(!l.needs_drain(S2));
+        l.enqueued_at(S1, 1);
+        assert!(!l.needs_drain(S1));
+        assert!(l.needs_drain(S2));
+        l.drained();
+        assert!(!l.needs_drain(S2));
+    }
+
+    #[test]
+    fn readiness_tokens_are_not_clone_or_copy() {
+        trait NotClone {
+            const IS_CLONE: bool = false;
+        }
+        impl<T> NotClone for T {}
+        struct Probe<T>(std::marker::PhantomData<T>);
+        #[allow(dead_code)]
+        impl<T: Clone> Probe<T> {
+            const IS_CLONE: bool = true;
+        }
+        // Compile-time: the trait default is chosen only when `InputReady` is
+        // not `Clone` (the inherent constant needs `T: Clone`).
+        const _: () = assert!(!<Probe<InputReady>>::IS_CLONE);
+    }
+}
+
+#[cfg(test)]
+mod signal_word_tests {
+    use super::{teardown_signal, SignalGen, SignalTeardown, SIGNAL_ABORT, SIGNAL_GEN_MAX};
+
+    #[test]
+    fn generations_are_31_bit_monotonic_and_start_at_one() {
+        let mut g = SignalGen::new();
+        assert_eq!(g.last(), 0);
+        for want in 1..=1000u32 {
+            assert_eq!(g.next().unwrap(), want);
+        }
+        assert_eq!(SIGNAL_GEN_MAX, (1u32 << 31) - 1);
+    }
+
+    /// The abort sentinel sits strictly above every generation: a store of it
+    /// releases a `Gte` wait on any generation and can never be mistaken for
+    /// one. Checked at compile time.
+    const _: () = assert!(SIGNAL_GEN_MAX < SIGNAL_ABORT);
+
+    #[test]
+    fn the_counter_never_issues_the_abort_value_up_to_exhaustion() {
+        // Drive the real counter across its last generations to the refusal
+        // boundary: every issued value is a valid generation strictly below
+        // the abort sentinel (so an abort store releases a wait on it), and
+        // the counter refuses instead of ever reaching or wrapping past it.
+        let mut g = SignalGen::at(SIGNAL_GEN_MAX - 3);
+        let mut issued = Vec::new();
+        while let Ok(gen) = g.next() {
+            issued.push(gen);
+        }
+        assert_eq!(
+            issued,
+            [SIGNAL_GEN_MAX - 2, SIGNAL_GEN_MAX - 1, SIGNAL_GEN_MAX]
+        );
+        for &gen in &issued {
+            assert!(SignalGen::is_generation(gen));
+            assert!(
+                gen < SIGNAL_ABORT,
+                "an abort store releases a Gte wait on {gen}"
+            );
+        }
+        assert_eq!(g.last(), SIGNAL_GEN_MAX);
+        assert!(!SignalGen::is_generation(SIGNAL_ABORT));
+        assert!(
+            !SignalGen::is_generation(0),
+            "the initial word value is never a generation"
+        );
+        assert!(!SignalGen::is_generation(SIGNAL_GEN_MAX + 1));
+    }
+
+    #[test]
+    fn wrap_is_refused_and_leaves_the_counter_unchanged() {
+        let mut g = SignalGen::at(SIGNAL_GEN_MAX - 1);
+        assert_eq!(g.next().unwrap(), SIGNAL_GEN_MAX);
+        assert!(g.next().is_err());
+        assert_eq!(g.last(), SIGNAL_GEN_MAX);
+        assert!(g.next().is_err(), "stays refused");
+    }
+
+    #[derive(Default)]
+    struct Rec {
+        log: Vec<&'static str>,
+        sync_ok: bool,
+        free_ok: bool,
+    }
+
+    impl SignalTeardown for Rec {
+        fn store_abort(&mut self) {
+            self.log.push("abort");
+        }
+        fn quiesce(&mut self) -> bool {
+            self.log.push("sync");
+            self.sync_ok
+        }
+        fn free(&mut self) -> bool {
+            self.log.push("free");
+            self.free_ok
+        }
+    }
+
+    #[test]
+    fn teardown_stores_abort_before_the_drain_and_frees_last() {
+        let mut r = Rec {
+            sync_ok: true,
+            free_ok: true,
+            ..Rec::default()
+        };
+        assert!(teardown_signal(&mut r));
+        assert_eq!(r.log, ["abort", "sync", "free"]);
+    }
+
+    #[test]
+    fn teardown_never_frees_after_a_failed_drain() {
+        let mut r = Rec {
+            sync_ok: false,
+            free_ok: true,
+            ..Rec::default()
+        };
+        assert!(!teardown_signal(&mut r));
+        assert_eq!(
+            r.log,
+            ["abort", "sync"],
+            "a pending wait may still poll the word"
+        );
     }
 }

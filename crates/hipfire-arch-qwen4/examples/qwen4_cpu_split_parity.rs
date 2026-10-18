@@ -34,6 +34,15 @@
 //! `mapped_publications` and `mapped_retire_waits`; a gate checks that a mapped call
 //! publishes once with zero cold-slot copies. The same-input gates run unchanged on
 //! the tensor the combine actually read (the mapped view in mapped mode).
+//! `HIPFIRE_QWEN4_D2_READY=sync|event` (default `sync`) selects the input-readiness
+//! mechanism of `prepare` and `HIPFIRE_QWEN4_D2_JOIN=host|cpwait` (default `host`) the
+//! join. The effective per-layer modes, the cumulative `ready_polls`,
+//! `ready_fallback_syncs`, `cpwait_joins`, `cpwait_aborts` and `watchdog_fires`
+//! counters are printed and written to the JSON (`d2_ready_modes`, `d2_join_modes`,
+//! `d2_readiness_counters`); an `event` run gates on its layers having polled. The
+//! lab parity runs drain the stream before the join, so a run in which any layer took
+//! the CP-wait join is REFUSED (run it with `host`); the refusal of `cpwait` itself
+//! (copy return, mixed layer, no stream-wait-value capability) is logged at load.
 //! The all-CPU oracle reads the artifact's aggregate tensors at the D1 spans (tensor data
 //! offset + expert * stride), re-derived here independently of the slab adapter and compared
 //! with it, never through a bundle owner. The AllCold endpoint must reproduce that oracle
@@ -1675,6 +1684,32 @@ fn real_main() -> R<bool> {
         hipfire_config::memory::qwen4_d2_return()
             .map_or_else(|refusal| format!("INVALID ({refusal})"), |mode| mode.as_str().to_string()),
     );
+    // The lab parity modes drain the stream before the CPU arithmetic and
+    // serialize the combine, which a CP-wait join cannot do: refuse instead of
+    // silently measuring something else.
+    let ready_modes = m.bundle.split_ready_modes();
+    let join_modes = m.bundle.split_join_modes();
+    let event_layers = ready_modes
+        .iter()
+        .filter(|(_, mode)| *mode == "event")
+        .count();
+    let cpwait_layers = join_modes
+        .iter()
+        .filter(|(_, mode)| *mode == "cpwait")
+        .count();
+    println!(
+        "qwen4_cpu_split_parity: HIPFIRE_QWEN4_D2_READY requested {} ({event_layers} of {} armed layers run event readiness); HIPFIRE_QWEN4_D2_JOIN requested {} ({cpwait_layers} run the CP-wait join; refused layers keep host)",
+        hipfire_config::memory::qwen4_d2_ready()
+            .map_or_else(|refusal| format!("INVALID ({refusal})"), |mode| mode.as_str().to_string()),
+        ready_modes.len(),
+        hipfire_config::memory::qwen4_d2_join()
+            .map_or_else(|refusal| format!("INVALID ({refusal})"), |mode| mode.as_str().to_string()),
+    );
+    if cpwait_layers > 0 {
+        return Err(format!(
+            "HIPFIRE_QWEN4_D2_JOIN=cpwait is active on {cpwait_layers} layers; the lab parity runs drain the stream before the join and cannot run under it (run with HIPFIRE_QWEN4_D2_JOIN=host)"
+        ));
+    }
 
     let mut gates: Vec<Gate> = Vec::new();
     let mut runs_json: Vec<Value> = Vec::new();
@@ -2011,6 +2046,30 @@ fn real_main() -> R<bool> {
         }));
     }
 
+    // Cumulative readiness/join counters of this process (every run above).
+    let counters = m.bundle.split_readiness_counters();
+    let counter_sum = |i: usize| counters.iter().map(|(_, c)| c[i]).sum::<u64>();
+    println!(
+        "qwen4_cpu_split_parity: readiness counters over {} layers: ready_polls {}, ready_fallback_syncs {}, cpwait_joins {}, cpwait_aborts {}, watchdog_fires {}",
+        counters.len(),
+        counter_sum(0),
+        counter_sum(1),
+        counter_sum(2),
+        counter_sum(3),
+        counter_sum(4),
+    );
+    if event_layers > 0 {
+        gate(
+            &mut gates,
+            "readiness: event layers polled their input proof",
+            counter_sum(0) > 0,
+            format!(
+                "{event_layers} event layers, {} polls, {} fallback syncs",
+                counter_sum(0),
+                counter_sum(1)
+            ),
+        );
+    }
     let all_ok = gates.iter().all(|g| g.ok);
     println!(
         "SUMMARY {} ({} gates, {} failed)",
@@ -2032,6 +2091,14 @@ fn real_main() -> R<bool> {
             "placement_source": m.placement_source,
             "d2_force": hipfire_config::memory::qwen4_d2_default(),
             "d2_return_requested": hipfire_config::memory::qwen4_d2_return().ok().map(|mode| mode.as_str()),
+            "d2_ready_requested": hipfire_config::memory::qwen4_d2_ready().ok().map(|mode| mode.as_str()),
+            "d2_join_requested": hipfire_config::memory::qwen4_d2_join().ok().map(|mode| mode.as_str()),
+            "d2_ready_modes": ready_modes.iter().map(|(l, k)| json!([l, k])).collect::<Vec<_>>(),
+            "d2_join_modes": join_modes.iter().map(|(l, k)| json!([l, k])).collect::<Vec<_>>(),
+            "d2_readiness_counters": counters.iter().map(|(l, c)| json!({
+                "layer": l, "ready_polls": c[0], "ready_fallback_syncs": c[1],
+                "cpwait_joins": c[2], "cpwait_aborts": c[3], "watchdog_fires": c[4],
+            })).collect::<Vec<_>>(),
             "offload_exec_explicit": hipfire_config::memory::offload_exec_explicit().map(|v| v.to_string()),
             "span_digest": m.span_digest,
             "host_exec_identity": identity,

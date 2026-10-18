@@ -9687,6 +9687,98 @@ pub mod memory {
         parse_d2_return(process_value("HIPFIRE_QWEN4_D2_RETURN").as_deref())
     }
 
+    /// Input-readiness mechanism of the D2 CPU split (`developer.qwen4_d2_ready`,
+    /// env `HIPFIRE_QWEN4_D2_READY`).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum D2Ready {
+        /// `prepare` blocks on a stream synchronization after the input
+        /// downloads (today's boundary, the default and the kill value).
+        #[default]
+        Sync,
+        /// `prepare` records an event after the input downloads and polls it,
+        /// falling back to the blocking synchronization after a bounded spin.
+        Event,
+    }
+
+    impl D2Ready {
+        /// The spelling [`parse_d2_ready`] accepts for this mode.
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Sync => "sync",
+                Self::Event => "event",
+            }
+        }
+    }
+
+    /// Pure body of [`qwen4_d2_ready`]: unset is `Sync`; `sync` and `event`
+    /// (exact, lower-case) select a mode; every other spelling, including the
+    /// empty string, is an error that names the accepted values.
+    pub fn parse_d2_ready(raw: Option<&str>) -> std::result::Result<D2Ready, String> {
+        match raw {
+            None => Ok(D2Ready::Sync),
+            Some("sync") => Ok(D2Ready::Sync),
+            Some("event") => Ok(D2Ready::Event),
+            Some(other) => Err(format!(
+                "HIPFIRE_QWEN4_D2_READY={other:?} is not a D2 readiness mode: expected `event` or `sync`"
+            )),
+        }
+    }
+
+    /// `developer.qwen4_d2_ready` (env `HIPFIRE_QWEN4_D2_READY`): how the D2 CPU
+    /// split learns its inputs reached the host, read from the process snapshot.
+    /// Resolve it once per load; an invalid value is an `Err` the loader must
+    /// propagate.
+    pub fn qwen4_d2_ready() -> std::result::Result<D2Ready, String> {
+        parse_d2_ready(process_value("HIPFIRE_QWEN4_D2_READY").as_deref())
+    }
+
+    /// Join mechanism of the D2 CPU split (`developer.qwen4_d2_join`, env
+    /// `HIPFIRE_QWEN4_D2_JOIN`).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum D2Join {
+        /// The canonical combine is enqueued after the CPU arithmetic finished
+        /// (today's order, the default and the kill value).
+        #[default]
+        Host,
+        /// The canonical combine is enqueued BEFORE the CPU arithmetic behind a
+        /// command-processor `hipStreamWaitValue32` that the CPU releases with a
+        /// generation store. Needs the mapped return on an all-cold layer and
+        /// the device's stream-wait-value capability; otherwise a logged
+        /// refusal keeps `Host`.
+        CpWait,
+    }
+
+    impl D2Join {
+        /// The spelling [`parse_d2_join`] accepts for this mode.
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Host => "host",
+                Self::CpWait => "cpwait",
+            }
+        }
+    }
+
+    /// Pure body of [`qwen4_d2_join`]: unset is `Host`; `host` and `cpwait`
+    /// (exact, lower-case) select a mode; every other spelling, including the
+    /// empty string, is an error that names the accepted values.
+    pub fn parse_d2_join(raw: Option<&str>) -> std::result::Result<D2Join, String> {
+        match raw {
+            None => Ok(D2Join::Host),
+            Some("host") => Ok(D2Join::Host),
+            Some("cpwait") => Ok(D2Join::CpWait),
+            Some(other) => Err(format!(
+                "HIPFIRE_QWEN4_D2_JOIN={other:?} is not a D2 join mode: expected `cpwait` or `host`"
+            )),
+        }
+    }
+
+    /// `developer.qwen4_d2_join` (env `HIPFIRE_QWEN4_D2_JOIN`): the D2 join
+    /// mechanism, read from the process snapshot. Resolve it once per load; an
+    /// invalid value is an `Err` the loader must propagate.
+    pub fn qwen4_d2_join() -> std::result::Result<D2Join, String> {
+        parse_d2_join(process_value("HIPFIRE_QWEN4_D2_JOIN").as_deref())
+    }
+
     /// How much of a split step the GPU takes (`memory.offload_passback_share`).
     ///
     /// Read only when [`offload_exec`] is [`OffloadExec::Passback`]; in any other
@@ -9767,6 +9859,42 @@ pub mod memory {
             }
             for mode in [D2Return::Copy, D2Return::Mapped] {
                 assert_eq!(parse_d2_return(Some(mode.as_str())), Ok(mode));
+            }
+        }
+
+        #[test]
+        fn d2_ready_parses_sync_event_and_refuses_everything_else() {
+            assert_eq!(parse_d2_ready(None), Ok(D2Ready::Sync));
+            assert_eq!(D2Ready::default(), D2Ready::Sync);
+            assert_eq!(parse_d2_ready(Some("sync")), Ok(D2Ready::Sync));
+            assert_eq!(parse_d2_ready(Some("event")), Ok(D2Ready::Event));
+            for bad in [
+                "", "Event", "SYNC", " event", "1", "0", "true", "cpwait", "event ",
+            ] {
+                let error = parse_d2_ready(Some(bad)).unwrap_err();
+                assert!(error.contains("HIPFIRE_QWEN4_D2_READY"), "{bad:?}: {error}");
+                assert!(error.contains("`event` or `sync`"), "{bad:?}: {error}");
+            }
+            for mode in [D2Ready::Sync, D2Ready::Event] {
+                assert_eq!(parse_d2_ready(Some(mode.as_str())), Ok(mode));
+            }
+        }
+
+        #[test]
+        fn d2_join_parses_host_cpwait_and_refuses_everything_else() {
+            assert_eq!(parse_d2_join(None), Ok(D2Join::Host));
+            assert_eq!(D2Join::default(), D2Join::Host);
+            assert_eq!(parse_d2_join(Some("host")), Ok(D2Join::Host));
+            assert_eq!(parse_d2_join(Some("cpwait")), Ok(D2Join::CpWait));
+            for bad in [
+                "", "CpWait", "HOST", " cpwait", "1", "0", "true", "event", "cpwait ",
+            ] {
+                let error = parse_d2_join(Some(bad)).unwrap_err();
+                assert!(error.contains("HIPFIRE_QWEN4_D2_JOIN"), "{bad:?}: {error}");
+                assert!(error.contains("`cpwait` or `host`"), "{bad:?}: {error}");
+            }
+            for mode in [D2Join::Host, D2Join::CpWait] {
+                assert_eq!(parse_d2_join(Some(mode.as_str())), Ok(mode));
             }
         }
 

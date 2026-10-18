@@ -35,13 +35,34 @@
 //! per-generation housekeeping (residual reset, oracle reference, previous
 //! generation's verification), which is longer than `--cpu-work-us`.
 //!
+//! CP-wait arms (need `hipDeviceAttributeCanUseStreamWaitValue`; they REFUSE,
+//! reported in the cell and the JSON header, when it is 0 or signal memory
+//! cannot be allocated):
+//!   * cpwait:     enqueue `WaitValue32(join_word >= gen)` then the combine on
+//!                 the mapped view; the host busy-works `--cpu-work-us`, writes
+//!                 the slots, publishes, stores `gen`. `wall` is the
+//!                 flag-store -> combine-complete time (compare with the
+//!                 `mapped` arm's CPU-done -> combine-complete). Byte oracle
+//!                 every generation.
+//!   * ready-word: the readiness cell with a `WriteValue32` ready word after the
+//!                 three D2H copies and the host volatile poll
+//!                 (`arm_ready_word` / `try_complete_ready_word`); compare with
+//!                 `ready-sync` / `ready-event`.
+//!   * abort:      a wait that is never satisfied, `SIGNAL_ABORT` stored after
+//!                 50 ms; the queue must drain within 1 s (`released=true`),
+//!                 the result is discarded. 5 generations per row count.
+//! The JSON header carries `hipDeviceAttributeCanUseStreamWaitValue`.
+//!
 //! Usage:
 //!   d2_mapped_return_pilot [--rows 1,4,8] [--gens 200] [--arms copy,mapped]
 //!       [--json out.json] [--cpu-load 0] [--cpu-work-us 400] [--seed 1]
-//! Arms: copy, mapped, ready-sync, ready-event.
+//! Arms: copy, mapped, ready-sync, ready-event, cpwait, ready-word, abort.
 //! Exit: 0 success; 1 failure (details printed); 2 usage; 3 no GPU/HIP.
 
-use hip_bridge::{Event, MappedHostBuffer, PinnedTransferBuffer, HIP_EVENT_DISABLE_TIMING};
+use hip_bridge::{
+    Event, MappedHostBuffer, PinnedTransferBuffer, SignalGen, SignalWord,
+    HIP_DEVICE_ATTRIBUTE_CAN_USE_STREAM_WAIT_VALUE, HIP_EVENT_DISABLE_TIMING, SIGNAL_ABORT,
+};
 use hipfire_dispatch::cpu_exec::moe_canonical_combine_reference;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::fmt::Write as _;
@@ -355,6 +376,10 @@ struct Cell {
     cross_ok: u64,
     cross_fail: u64,
     failures: Vec<String>,
+    /// Why the cell did not run (capability refusal).
+    refused: Option<String>,
+    /// `abort` cell: every generation's queue drained after the abort store.
+    released: Option<bool>,
 }
 
 impl Cell {
@@ -364,6 +389,13 @@ impl Cell {
             rows,
             gens,
             ..Self::default()
+        }
+    }
+    /// A cell the device cannot run: reported, never a silent success or failure.
+    fn refused(arm: &'static str, rows: usize, gens: u64, why: String) -> Self {
+        Self {
+            refused: Some(why),
+            ..Self::new(arm, rows, gens)
         }
     }
     fn fail(&mut self, msg: String) {
@@ -788,6 +820,474 @@ fn run_ready_cell(
     Ok(cell)
 }
 
+// ───────────────────────── CP-wait cells ─────────────────────────
+
+/// `hipDeviceAttributeCanUseStreamWaitValue` of the device, and whether the
+/// bridge accepts stream value operations on it.
+struct WaitCap {
+    /// Raw attribute value; `None` when the query failed.
+    attribute: Option<i32>,
+    /// `HipRuntime::can_use_stream_wait_value`; `None` when the query failed.
+    usable: Option<bool>,
+    query_error: Option<String>,
+}
+
+impl WaitCap {
+    /// Why the cpwait, ready-word and abort cells must refuse, or `None`.
+    fn refusal(&self) -> Option<String> {
+        match (self.usable, &self.query_error) {
+            (Some(true), _) => None,
+            (Some(false), _) => Some(format!(
+                "hipDeviceAttributeCanUseStreamWaitValue is {}: stream value waits are unsupported on this device",
+                self.attribute.map_or("0".to_string(), |v| v.to_string())
+            )),
+            (None, Some(e)) => Some(format!("capability query failed: {e}")),
+            (None, None) => Some("capability unknown".to_string()),
+        }
+    }
+}
+
+fn probe_wait_cap(gpu: &Gpu) -> WaitCap {
+    let device = gpu.device_id;
+    let attribute = gpu
+        .hip
+        .get_device_attribute(HIP_DEVICE_ATTRIBUTE_CAN_USE_STREAM_WAIT_VALUE, device);
+    let usable = gpu.hip.can_use_stream_wait_value(device);
+    WaitCap {
+        attribute: attribute.as_ref().ok().copied(),
+        usable: usable.as_ref().ok().copied(),
+        query_error: usable.err().or(attribute.err()).map(|e| e.to_string()),
+    }
+}
+
+/// Generations of the abort cell (each waits 50 ms before its abort store).
+const ABORT_GENS: u64 = 5;
+/// How long the never-satisfied wait must hold before the abort store.
+const ABORT_HOLD: std::time::Duration = std::time::Duration::from_millis(50);
+/// How long the queue gets to drain after the abort store.
+const ABORT_DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Bound of a ready-word spin before the cell gives up.
+const READY_WORD_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One mapped result allocation with a guard region and its device view.
+struct MappedRig {
+    tensor: GpuTensor,
+    buf: MappedHostBuffer,
+    payload_f32: usize,
+}
+
+impl MappedRig {
+    fn new(gpu: &Gpu, payload_f32: usize) -> Res<Self> {
+        let payload_bytes = payload_f32 * 4;
+        let mut buf = gpu
+            .hip
+            .mapped_host_buffer(payload_bytes + GUARD_BYTES)
+            .map_err(he("mapped_host_buffer"))?;
+        {
+            let mut w = buf.begin_write().map_err(he("begin_write"))?;
+            w.bytes_mut()[payload_bytes..].fill(SENTINEL);
+        }
+        let tensor = GpuTensor {
+            // SAFETY: non-owning view of the mapped allocation owned by `buf`
+            // in the same struct (dropped together, tensor first); the tensor
+            // is never passed to a free path.
+            buf: unsafe { buf.device_buffer().alias() },
+            shape: vec![payload_f32],
+            dtype: DType::F32,
+        };
+        Ok(Self {
+            tensor,
+            buf,
+            payload_f32,
+        })
+    }
+
+    /// Write generation `g`'s slots (guard bytes checked first) and publish.
+    fn write_generation(
+        &mut self,
+        seed: u64,
+        g: u64,
+        cell: &mut Cell,
+    ) -> Res<hip_bridge::MappedPublished> {
+        let payload_bytes = self.payload_f32 * 4;
+        let mut w = self.buf.begin_write().map_err(he("begin_write"))?;
+        if w.bytes_mut()[payload_bytes..]
+            .iter()
+            .any(|&b| b != SENTINEL)
+        {
+            cell.guard_fail += 1;
+            cell.fail(format!(
+                "{} R={} gen {g}: guard bytes were modified",
+                cell.arm, cell.rows
+            ));
+            w.bytes_mut()[payload_bytes..].fill(SENTINEL);
+        }
+        let f = w.f32_mut().map_err(he("f32_mut"))?;
+        fill_f32(seed, g, &mut f[..self.payload_f32]);
+        Ok(w.publish())
+    }
+}
+
+/// One cpwait generation, from the wait enqueue to the combine's completion.
+/// EVERY error between the wait enqueue and the flag store stores
+/// `SIGNAL_ABORT` before returning: a device synchronize with a pending wait
+/// never returns.
+#[allow(clippy::too_many_arguments)]
+fn cpwait_generation(
+    gpu: &mut Gpu,
+    fx: &Fixture,
+    rig: &mut MappedRig,
+    word: &SignalWord,
+    ev_start: &Event,
+    ev_stop: &Event,
+    gen: u32,
+    g: u64,
+    work_us: u64,
+    seed: u64,
+    cell: &mut Cell,
+) -> Res<Sample> {
+    let rows = fx.rows;
+    let stored = std::cell::Cell::new(false);
+    let abort_unless_stored = |why: String| {
+        if !stored.get() {
+            word.store_release(SIGNAL_ABORT);
+        }
+        why
+    };
+    gpu.hip
+        .stream_wait_signal_gte(gpu.active_stream.as_ref(), word, gen)
+        .map_err(|e| abort_unless_stored(format!("wait enqueue: {e}")))?;
+    let mut body = || -> Res<Sample> {
+        gpu.hip
+            .event_record(ev_start, gpu.active_stream.as_ref())
+            .map_err(he("record start"))?;
+        gpu.moe_down_combine_top10_batched(
+            &rig.tensor,
+            &fx.d_ids,
+            &fx.d_weights,
+            &fx.d_resid,
+            DIM,
+            rows,
+            N_EXPERTS,
+        )
+        .map_err(he("combine (cpwait)"))?;
+        gpu.hip
+            .event_record(ev_stop, gpu.active_stream.as_ref())
+            .map_err(he("record stop"))?;
+        // The combine is queued behind the wait. The CPU arm runs now.
+        busy_work(work_us);
+        let token = rig.write_generation(seed, g, cell)?;
+        rig.buf
+            .mark_gpu_reading(&gpu.hip, token, gpu.active_stream.as_ref())
+            .map_err(he("mark_gpu_reading"))?;
+        let c0 = thread_cpu_ns();
+        let t_store = Instant::now();
+        stored.set(true);
+        word.store_release(gen);
+        gpu.hip
+            .event_synchronize(ev_stop)
+            .map_err(he("sync stop"))?;
+        let wall = us(t_store.elapsed());
+        let cpu = (thread_cpu_ns().saturating_sub(c0)) as f64 / 1e3;
+        let kernel = gpu
+            .hip
+            .event_elapsed_ms(ev_start, ev_stop)
+            .map_err(he("elapsed"))? as f64
+            * 1e3;
+        Ok(Sample {
+            wall,
+            cpu,
+            h2d_api: None,
+            kernel,
+            retire: None,
+        })
+    };
+    body().map_err(abort_unless_stored)
+}
+
+/// `cpwait`: enqueue `WaitValue32(gen)` then the combine on the mapped view;
+/// the host busy-works `work_us`, writes the slots, stores `gen`, and the cell
+/// measures the flag-store -> combine-complete wall. Byte oracle every
+/// generation.
+fn run_cpwait_cell(gpu: &mut Gpu, fx: &Fixture, gens: u64, work_us: u64, seed: u64) -> Res<Cell> {
+    let rows = fx.rows;
+    let mut cell = Cell::new("cpwait", rows, gens);
+    let word = match gpu.hip.signal_word() {
+        Ok(w) => w,
+        Err(e) => {
+            return Ok(Cell::refused(
+                "cpwait",
+                rows,
+                gens,
+                format!("signal word allocation failed: {e}"),
+            ))
+        }
+    };
+    let mut rig = MappedRig::new(gpu, rows * TOP_K * DIM)?;
+    let ev_start = gpu.hip.event_create().map_err(he("event_create"))?;
+    let ev_stop = gpu.hip.event_create().map_err(he("event_create"))?;
+    let mut siggen = SignalGen::new();
+    let outcome = (|| -> Res<()> {
+        for g in 0..gens {
+            let want = fx.reference(seed, g);
+            let gen = siggen.next().map_err(he("signal generation"))?;
+            fx.reset_residual(gpu)?;
+            rig.buf.retire(&gpu.hip).map_err(he("retire"))?;
+            let sample = cpwait_generation(
+                gpu, fx, &mut rig, &word, &ev_start, &ev_stop, gen, g, work_us, seed, &mut cell,
+            )?;
+            record(&mut cell, g, &sample);
+            check_oracle(&mut cell, fx, gpu, g, &want)?;
+        }
+        Ok(())
+    })();
+    if outcome.is_ok() {
+        // The last generation's guard check needs a final (abandoned) window.
+        rig.buf.retire(&gpu.hip).map_err(he("final retire"))?;
+        let payload_bytes = rig.payload_f32 * 4;
+        let mut w = rig.buf.begin_write().map_err(he("final begin_write"))?;
+        if w.bytes_mut()[payload_bytes..]
+            .iter()
+            .any(|&b| b != SENTINEL)
+        {
+            cell.guard_fail += 1;
+            cell.fail(format!("cpwait R={rows}: guard bytes were modified"));
+        }
+    }
+    let _ = gpu.hip.event_destroy(ev_start);
+    let _ = gpu.hip.event_destroy(ev_stop);
+    outcome?;
+    Ok(cell)
+}
+
+/// `ready-word`: the readiness cell with a `WriteValue32` ready word after the
+/// three D2H copies and the production `arm_ready_word` /
+/// `try_complete_ready_word` host poll instead of a stream sync or an event.
+fn run_ready_word_cell(
+    gpu: &mut Gpu,
+    fx: &Fixture,
+    gens: u64,
+    work_us: u64,
+    seed: u64,
+) -> Res<Cell> {
+    let rows = fx.rows;
+    let nx = rows * DIM;
+    let slots = rows * TOP_K;
+    let mut cell = Cell::new("ready-word", rows, gens);
+    let word = match gpu.hip.signal_word() {
+        Ok(w) => w,
+        Err(e) => {
+            return Ok(Cell::refused(
+                "ready-word",
+                rows,
+                gens,
+                format!("signal word allocation failed: {e}"),
+            ))
+        }
+    };
+    let mut pinned = gpu
+        .hip
+        .transfer_buffer((nx + 2 * slots) * 4)
+        .map_err(he("transfer_buffer"))?;
+    let mut siggen = SignalGen::new();
+    for g in 0..gens {
+        pinned.complete(&gpu.hip).map_err(he("pinned complete"))?;
+        let gen = siggen.next().map_err(he("signal generation"))?;
+        let mut addend = vec![0f32; nx];
+        fill_f32(seed ^ 0x5EED_ADD, g, &mut addend);
+        gpu.hip
+            .memcpy_htod(&fx.d_work.buf, f32_bytes(&fx.pristine))
+            .map_err(he("reset work"))?;
+        gpu.hip
+            .memcpy_htod(&fx.d_addend.buf, f32_bytes(&addend))
+            .map_err(he("upload addend"))?;
+        busy_work(work_us);
+        let t0 = Instant::now();
+        let c0 = thread_cpu_ns();
+        gpu.add_inplace_f32(&fx.d_work, &fx.d_addend)
+            .map_err(he("add_inplace_f32"))?;
+        let stream = gpu.active_stream.as_ref();
+        pinned
+            .download_async(&gpu.hip, &fx.d_work.buf, 0, nx * 4, stream)
+            .map_err(he("download x"))?;
+        pinned
+            .download_async(&gpu.hip, &fx.d_ids.buf, nx * 4, slots * 4, stream)
+            .map_err(he("download ids"))?;
+        pinned
+            .download_async(
+                &gpu.hip,
+                &fx.d_weights.buf,
+                (nx + slots) * 4,
+                slots * 4,
+                stream,
+            )
+            .map_err(he("download weights"))?;
+        let mut proof = pinned
+            .arm_ready_word(&gpu.hip, &word, gen)
+            .map_err(he("arm_ready_word"))?;
+        let mut not_ready = 0u64;
+        while !pinned
+            .try_complete_ready_word(&mut proof, &word)
+            .map_err(he("try_complete_ready_word"))?
+        {
+            not_ready += 1;
+            if t0.elapsed() > READY_WORD_LIMIT {
+                return Err(format!(
+                    "ready-word R={rows} gen {g}: the ready word never reached {gen} (stuck at {})",
+                    word.load()
+                ));
+            }
+            std::hint::spin_loop();
+        }
+        let wall = us(t0.elapsed());
+        let cpu = (thread_cpu_ns().saturating_sub(c0)) as f64 / 1e3;
+        if g == 0 {
+            cell.first = Some(vec![
+                ("wall_us", wall),
+                ("cpu_us", cpu),
+                ("polls", not_ready as f64),
+            ]);
+        } else {
+            cell.metrics.wall.push(wall);
+            cell.metrics.cpu.push(cpu);
+            cell.metrics.polls.push(not_ready as f64);
+        }
+        let bytes = pinned.as_bytes_mut();
+        let mut bad: Option<String> = None;
+        for (i, c) in bytes[..nx * 4].chunks_exact(4).enumerate() {
+            let want = (fx.pristine[i] + addend[i]).to_bits();
+            let got = u32::from_ne_bytes(c.try_into().unwrap());
+            if got != want {
+                bad = Some(format!("x[{i}] {got:#010x} != producer {want:#010x}"));
+                break;
+            }
+        }
+        if bad.is_none() && bytes[nx * 4..(nx + slots) * 4] != *i32_bytes(&fx.ids) {
+            bad = Some("downloaded ids differ from device ids".to_string());
+        }
+        if bad.is_none() && bytes[(nx + slots) * 4..] != *f32_bytes(&fx.weights) {
+            bad = Some("downloaded weights differ from device weights".to_string());
+        }
+        if let Some(why) = bad {
+            cell.oracle_fail += 1;
+            cell.fail(format!("ready-word R={rows} gen {g}: {why}"));
+        } else {
+            cell.oracle_ok += 1;
+        }
+    }
+    Ok(cell)
+}
+
+/// `abort`: enqueue a wait that is never satisfied, store `SIGNAL_ABORT` after
+/// 50 ms, and verify the queue drains within 1 s (`released=true`). The
+/// consumer ran on garbage, so its output is never compared. Each generation
+/// uses a fresh word: a word that held the abort value releases every later wait.
+fn run_abort_cell(gpu: &mut Gpu, fx: &Fixture) -> Res<Cell> {
+    let rows = fx.rows;
+    let mut cell = Cell::new("abort", rows, ABORT_GENS);
+    let rig = MappedRig::new(gpu, rows * TOP_K * DIM)?;
+    let ev_start = gpu.hip.event_create().map_err(he("event_create"))?;
+    let ev_stop = gpu.hip.event_create().map_err(he("event_create"))?;
+    for g in 0..ABORT_GENS {
+        let word = match gpu.hip.signal_word() {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = gpu.hip.event_destroy(ev_start);
+                let _ = gpu.hip.event_destroy(ev_stop);
+                return Ok(Cell::refused(
+                    "abort",
+                    rows,
+                    ABORT_GENS,
+                    format!("signal word allocation failed: {e}"),
+                ));
+            }
+        };
+        fx.reset_residual(gpu)?;
+        // Generation 1 is never written: the word stays 0.
+        gpu.hip
+            .stream_wait_signal_gte(gpu.active_stream.as_ref(), &word, 1)
+            .map_err(|e| {
+                word.store_release(SIGNAL_ABORT);
+                format!("abort cell: wait enqueue: {e}")
+            })?;
+        gpu.hip
+            .event_record(&ev_start, gpu.active_stream.as_ref())
+            .map_err(|e| {
+                word.store_release(SIGNAL_ABORT);
+                format!("record start: {e}")
+            })?;
+        gpu.moe_down_combine_top10_batched(
+            &rig.tensor,
+            &fx.d_ids,
+            &fx.d_weights,
+            &fx.d_resid,
+            DIM,
+            rows,
+            N_EXPERTS,
+        )
+        .map_err(|e| {
+            word.store_release(SIGNAL_ABORT);
+            format!("combine (abort): {e}")
+        })?;
+        gpu.hip
+            .event_record(&ev_stop, gpu.active_stream.as_ref())
+            .map_err(|e| {
+                word.store_release(SIGNAL_ABORT);
+                format!("record stop: {e}")
+            })?;
+        std::thread::sleep(ABORT_HOLD);
+        let held = !gpu.hip.event_query(&ev_stop).map_err(|e| {
+            word.store_release(SIGNAL_ABORT);
+            format!("event_query: {e}")
+        })?;
+        let t_abort = Instant::now();
+        word.store_release(SIGNAL_ABORT);
+        let mut released = false;
+        while t_abort.elapsed() < ABORT_DRAIN_LIMIT {
+            if gpu.hip.event_query(&ev_stop).map_err(he("event_query"))? {
+                released = true;
+                break;
+            }
+            std::hint::spin_loop();
+        }
+        let drain = us(t_abort.elapsed());
+        if !released {
+            cell.oracle_fail += 1;
+            cell.released = Some(false);
+            cell.fail(format!(
+                "abort R={rows} gen {g}: the queue did not drain within {} ms after the abort store",
+                ABORT_DRAIN_LIMIT.as_millis()
+            ));
+            // A stuck queue would hang every drain: retain the owners and stop.
+            std::mem::forget(word);
+            std::mem::forget(rig);
+            return Err(format!(
+                "abort R={rows} gen {g}: released=false; the queue stayed blocked after the abort store"
+            ));
+        }
+        if held {
+            cell.oracle_ok += 1;
+        } else {
+            cell.oracle_fail += 1;
+            cell.fail(format!(
+                "abort R={rows} gen {g}: the unsatisfied wait did not hold the queue for {} ms (the combine ran before the abort store)",
+                ABORT_HOLD.as_millis()
+            ));
+        }
+        cell.metrics.wall.push(drain);
+        // Released: the drain below cannot hang. The garbage result is dropped.
+        gpu.hip
+            .device_synchronize()
+            .map_err(he("drain after abort"))?;
+    }
+    // Every generation drained after its abort store (a stuck queue returns
+    // `released=false` as a hard error above).
+    cell.released = Some(true);
+    let _ = gpu.hip.event_destroy(ev_start);
+    let _ = gpu.hip.event_destroy(ev_stop);
+    Ok(cell)
+}
+
 // ───────────────────────── driver ─────────────────────────
 
 struct Args {
@@ -847,7 +1347,17 @@ fn parse_args() -> Res<Args> {
         return Err("--gens must be >= 2 (generation 0 is reported separately)".into());
     }
     for arm in &a.arms {
-        if !["copy", "mapped", "ready-sync", "ready-event"].contains(&arm.as_str()) {
+        if ![
+            "copy",
+            "mapped",
+            "ready-sync",
+            "ready-event",
+            "cpwait",
+            "ready-word",
+            "abort",
+        ]
+        .contains(&arm.as_str())
+        {
             return Err(format!("unknown arm {arm:?}"));
         }
     }
@@ -912,8 +1422,11 @@ fn cell_json(c: &Cell) -> String {
                 metric_json(&m.kernel)
             );
         }
-        "ready-event" => {
+        "ready-event" | "ready-word" => {
             let _ = write!(o, ",\"polls_per_gen\":{}", metric_json(&m.polls));
+        }
+        "cpwait" => {
+            let _ = write!(o, ",\"combine_kernel\":{}", metric_json(&m.kernel));
         }
         _ => {}
     }
@@ -929,11 +1442,24 @@ fn cell_json(c: &Cell) -> String {
         }
         o.push_str(&json_str(f));
     }
-    o.push_str("]}}");
+    o.push_str("]}");
+    match &c.refused {
+        Some(why) => {
+            let _ = write!(o, ",\"refused\":{}", json_str(why));
+        }
+        None => o.push_str(",\"refused\":null"),
+    }
+    match c.released {
+        Some(r) => {
+            let _ = write!(o, ",\"released\":{r}");
+        }
+        None => o.push_str(",\"released\":null"),
+    }
+    o.push('}');
     o
 }
 
-fn run(args: &Args, gpu: &mut Gpu) -> Res<Vec<Cell>> {
+fn run(args: &Args, cap: &WaitCap, gpu: &mut Gpu) -> Res<Vec<Cell>> {
     let want = |a: &str| args.arms.iter().any(|x| x == a);
     let (use_copy, use_mapped) = (want("copy"), want("mapped"));
     let fixtures: Vec<Fixture> = args
@@ -1000,6 +1526,24 @@ fn run(args: &Args, gpu: &mut Gpu) -> Res<Vec<Cell>> {
                     args.seed,
                 )?);
             }
+            if want("cpwait") {
+                cells.push(match cap.refusal() {
+                    Some(why) => Cell::refused("cpwait", fx.rows, args.gens, why),
+                    None => run_cpwait_cell(gpu, fx, args.gens, args.cpu_work_us, args.seed)?,
+                });
+            }
+            if want("ready-word") {
+                cells.push(match cap.refusal() {
+                    Some(why) => Cell::refused("ready-word", fx.rows, args.gens, why),
+                    None => run_ready_word_cell(gpu, fx, args.gens, args.cpu_work_us, args.seed)?,
+                });
+            }
+            if want("abort") {
+                cells.push(match cap.refusal() {
+                    Some(why) => Cell::refused("abort", fx.rows, ABORT_GENS, why),
+                    None => run_abort_cell(gpu, fx)?,
+                });
+            }
         }
         Ok(())
     })();
@@ -1040,7 +1584,17 @@ fn main() {
         args.rows, args.gens, args.arms, args.cpu_work_us, args.cpu_load
     );
 
-    let result = run(&args, &mut gpu);
+    let cap = probe_wait_cap(&gpu);
+    eprintln!(
+        "hipDeviceAttributeCanUseStreamWaitValue={} usable={}{}",
+        cap.attribute
+            .map_or("unknown".to_string(), |v| v.to_string()),
+        cap.usable.map_or("unknown".to_string(), |v| v.to_string()),
+        cap.refusal().map_or(String::new(), |r| format!(
+            " ({r}; cpwait, ready-word and abort cells refuse)"
+        ))
+    );
+    let result = run(&args, &cap, &mut gpu);
     let (cells, hard_error) = match result {
         Ok(c) => (c, None),
         Err(e) => (Vec::new(), Some(e)),
@@ -1054,13 +1608,22 @@ fn main() {
         && mapped_cells
             .iter()
             .all(|c| c.oracle_ok == c.gens && c.guard_fail == 0);
+    let cpwait_cells: Vec<&Cell> = cells.iter().filter(|c| c.arm == "cpwait").collect();
+    let cpwait_proved = hard_error.is_none()
+        && !any_failed
+        && !cpwait_cells.is_empty()
+        && cpwait_cells
+            .iter()
+            .all(|c| c.refused.is_none() && c.oracle_ok == c.gens);
 
     let mut json = String::new();
     let _ = write!(
         json,
-        "{{\"hostname\":{},\"arch\":{},\"rows\":[{}],\"gens\":{},\"seed\":{},\"cpu_work_us\":{},\"cpu_load_threads\":{},\"arms\":[{}],\"dim\":{DIM},\"top_k\":{TOP_K},\"n_experts\":{N_EXPERTS},\"guard_bytes\":{GUARD_BYTES}",
+        "{{\"hostname\":{},\"arch\":{},\"hipDeviceAttributeCanUseStreamWaitValue\":{},\"can_use_stream_wait_value\":{},\"rows\":[{}],\"gens\":{},\"seed\":{},\"cpu_work_us\":{},\"cpu_load_threads\":{},\"arms\":[{}],\"dim\":{DIM},\"top_k\":{TOP_K},\"n_experts\":{N_EXPERTS},\"guard_bytes\":{GUARD_BYTES}",
         json_str(&hostname),
         json_str(&arch),
+        cap.attribute.map_or("null".to_string(), |v| v.to_string()),
+        cap.usable.map_or("null".to_string(), |v| v.to_string()),
         args.rows.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(","),
         args.gens,
         args.seed,
@@ -1075,7 +1638,10 @@ fn main() {
         }
         json.push_str(&cell_json(c));
     }
-    let _ = write!(json, "],\"visibility_proved\":{visibility_proved}");
+    let _ = write!(
+        json,
+        "],\"visibility_proved\":{visibility_proved},\"cpwait_proved\":{cpwait_proved}"
+    );
     match &hard_error {
         Some(e) => {
             let _ = write!(json, ",\"error\":{}", json_str(e));
@@ -1092,11 +1658,23 @@ fn main() {
     }
 
     for c in &cells {
+        if let Some(why) = &c.refused {
+            eprintln!("{:<11} R={} REFUSED: {why}", c.arm, c.rows);
+            continue;
+        }
         let (n, p50, p90, mean) = c.metrics.wall.stats();
         let (_, c50, _, _) = c.metrics.cpu.stats();
         eprintln!(
-            "{:<11} R={} n={n} wall p50 {:.1} p90 {:.1} mean {:.1} us; host cpu p50 {:.1} us; oracle ok {}/{}",
-            c.arm, c.rows, p50, p90, mean, c50, c.oracle_ok, c.gens
+            "{:<11} R={} n={n} wall p50 {:.1} p90 {:.1} mean {:.1} us; host cpu p50 {:.1} us; oracle ok {}/{}{}",
+            c.arm,
+            c.rows,
+            p50,
+            p90,
+            mean,
+            c50,
+            c.oracle_ok,
+            c.gens,
+            c.released.map_or(String::new(), |r| format!("; released={r}"))
         );
     }
     if let Some(e) = hard_error {

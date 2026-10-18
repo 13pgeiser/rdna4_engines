@@ -30,13 +30,15 @@ pub use ffi::{arm_hip_fault, keep_host_memory_out_of_reclaim};
 pub use ffi::{launch_counters, memory_effects};
 pub use ffi::{
     Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp,
-    HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime,
+    HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, InputReady,
     MappedHostBuffer, MappedPhase, MappedPublished, MappedWrite, Module, PinnedHostBuffer,
-    PinnedTransferBuffer, Stream, HIP_ERROR_NOT_READY, HIP_EVENT_DISABLE_TIMING,
+    PinnedTransferBuffer, SignalGen, SignalHostPtr, SignalWord, Stream,
+    HIP_DEVICE_ATTRIBUTE_CAN_USE_STREAM_WAIT_VALUE, HIP_ERROR_NOT_READY, HIP_EVENT_DISABLE_TIMING,
     HIP_EVENT_RELEASE_TO_SYSTEM, HIP_HOST_MALLOC_COHERENT, HIP_HOST_MALLOC_MAPPED,
     HIP_MEM_ACCESS_FLAGS_PROT_READ, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM,
     HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED, HIP_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
-    HIP_MEM_LOCATION_TYPE_DEVICE, HIP_MEM_LOCATION_TYPE_HOST, QWEN4_EXPERT_VRAM_LAYERS_ENV,
+    HIP_MEM_LOCATION_TYPE_DEVICE, HIP_MEM_LOCATION_TYPE_HOST, HIP_STREAM_WAIT_VALUE_GTE,
+    HIP_STREAM_WRITE_VALUE_DEFAULT, QWEN4_EXPERT_VRAM_LAYERS_ENV, SIGNAL_ABORT, SIGNAL_GEN_MAX,
 };
 pub use kernarg::KernargBlob;
 pub use launch_grid::{check_launch_grid, grid_yz_limit_for_arch, GFX1201_MAX_GRID_YZ};

@@ -12,12 +12,28 @@
 //! byte order, stream order and overlap. Timing/Full modes add the endpoint
 //! override, an optional serial join and host-clock/buffer capture; they never
 //! run in production.
+//!
+//! Two opt-in scheduling variants (both byte-exact, defaults unchanged, state
+//! machines in [`crate::cpwait`]): `HIPFIRE_QWEN4_D2_READY=event` replaces the
+//! blocking input synchronization of `prepare` with an event-proven readiness
+//! spin; `HIPFIRE_QWEN4_D2_JOIN=cpwait` (mapped return, all-cold layers) queues a
+//! command-processor `hipStreamWaitValue32` and the canonical combine BEFORE the
+//! CPU arithmetic (`cpwait_arm`), then `join` runs the arithmetic and releases the
+//! wait with a generation store. Nothing may synchronize the stream between those
+//! two calls; every error between them stores the abort value first.
 
 use crate::cpu_exec::{self, CpuMoeExpert};
+use crate::cpwait::{
+    spin_until_ready, ArmId, Disarm, GatePort, JoinGate, JoinTarget, SpinOutcome, SystemClock,
+    Watchdog, READY_SPIN_BUDGET,
+};
 use crate::families::moe::RoutedExpertWeights;
 use crate::types::DispatchError;
-use hip_bridge::{HipError, MappedHostBuffer, MappedPublished, PinnedTransferBuffer};
-use hipfire_config::memory::D2Return;
+use hip_bridge::{
+    HipError, InputReady, MappedHostBuffer, MappedPublished, PinnedTransferBuffer, SignalGen,
+    SignalWord, SIGNAL_ABORT,
+};
+use hipfire_config::memory::{D2Join, D2Ready, D2Return};
 use hipfire_cpu::quant::CpuQuant;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::cell::{Cell, RefCell};
@@ -172,6 +188,54 @@ pub fn select_return_mode(request: D2Return, placement: &[u8]) -> ReturnDecision
     }
 }
 
+/// A join decision and the capability reason when the request was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JoinDecision {
+    pub mode: D2Join,
+    pub refusal: Option<&'static str>,
+}
+
+/// Capability routing of the requested join for one layer: `CpWait` is
+/// honoured only on an all-cold layer that returns through the mapped view and
+/// whose device can execute stream value waits. Every other request keeps
+/// `Host`, and a refused `CpWait` says why. Never silent.
+pub fn select_join_mode(
+    request: D2Join,
+    return_mode: D2ReturnMode,
+    placement: &[u8],
+    capable: bool,
+) -> JoinDecision {
+    match request {
+        D2Join::Host => JoinDecision {
+            mode: D2Join::Host,
+            refusal: None,
+        },
+        D2Join::CpWait => {
+            let refusal = if placement.is_empty() {
+                Some("empty ownership plan")
+            } else if !placement.iter().all(|&p| p == 1) {
+                Some("mixed hot/cold placement: the CP-wait join needs the mapped return, which only an all-cold layer can use (host join kept)")
+            } else if return_mode != D2ReturnMode::Mapped {
+                Some("the CP-wait join needs the mapped return (HIPFIRE_QWEN4_D2_RETURN=mapped); the copy transport is installed behind the GPU tail (host join kept)")
+            } else if !capable {
+                Some("the device does not report hipDeviceAttributeCanUseStreamWaitValue (host join kept)")
+            } else {
+                None
+            };
+            match refusal {
+                None => JoinDecision {
+                    mode: D2Join::CpWait,
+                    refusal: None,
+                },
+                Some(reason) => JoinDecision {
+                    mode: D2Join::Host,
+                    refusal: Some(reason),
+                },
+            }
+        }
+    }
+}
+
 /// Zero every slot row of `out` that is not a host slot: exactly the bytes the
 /// copy transport's `down_expanded` holds there (the masked GPU tail stores
 /// zero for slots owned by neither arm). `host_slots` is strictly ascending.
@@ -204,6 +268,8 @@ pub struct SplitTransport {
 /// `Idle -> Published (join) -> Lent (combine_outputs) -> InFlight
 /// (combine_enqueued) -> Idle (next prepare retires)`. A lab all-hot call
 /// bypasses the mapped view (`Bypassed`); any failure is `Poisoned`.
+/// The CP-wait join reverses join and combine: `Idle -> Gated (combine queued
+/// behind the wait) -> InFlight (join published and marked it in flight)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReturnStage {
     Idle,
@@ -212,6 +278,7 @@ enum ReturnStage {
     InFlight,
     Bypassed,
     Poisoned,
+    Gated,
 }
 
 /// Which tensor the canonical combine must read.
@@ -247,6 +314,9 @@ impl ReturnProtocol {
             ReturnStage::Published | ReturnStage::Lent => {
                 Err("the previous generation was published but its combine was never enqueued")
             }
+            ReturnStage::Gated => {
+                Err("the previous generation queued its combine behind a CP wait but never joined")
+            }
             ReturnStage::Poisoned => Err("the mapped return is poisoned"),
         }
     }
@@ -275,6 +345,35 @@ impl ReturnProtocol {
         self.stage = ReturnStage::Poisoned;
     }
 
+    /// CP-wait `cpwait_arm`: the consumer of the generation about to be
+    /// written is queued behind the wait; the retired buffer is lent to it
+    /// before any host store.
+    fn arm_gated(&mut self) -> Result<CombineSource, &'static str> {
+        match self.stage {
+            ReturnStage::Idle => {
+                self.stage = ReturnStage::Gated;
+                Ok(CombineSource::Mapped)
+            }
+            ReturnStage::Gated => Err("cpwait_arm twice for one generation"),
+            ReturnStage::Poisoned => Err("cpwait_arm after a failed transaction"),
+            _ => Err("cpwait_arm over a mapped generation that was not retired"),
+        }
+    }
+
+    /// CP-wait `join` may write only into the generation armed for it.
+    fn begin_join_gated(&self) -> Result<(), &'static str> {
+        match self.stage {
+            ReturnStage::Gated => Ok(()),
+            _ => Err("cpwait join without an armed generation"),
+        }
+    }
+
+    /// CP-wait `join` published the generation and marked its (already queued)
+    /// consumer in flight.
+    fn joined_gated(&mut self) {
+        self.stage = ReturnStage::InFlight;
+    }
+
     /// `combine_outputs`: the published view is handed out once per generation.
     fn lend(&mut self) -> Result<CombineSource, &'static str> {
         match self.stage {
@@ -286,6 +385,7 @@ impl ReturnProtocol {
             ReturnStage::Idle => Err("combine_outputs before a successful join of this generation"),
             ReturnStage::Lent => Err("combine_outputs twice for one generation"),
             ReturnStage::InFlight => Err("combine_outputs after the generation was consumed"),
+            ReturnStage::Gated => Err("combine_outputs on a CP-wait generation (use cpwait_arm)"),
             ReturnStage::Poisoned => Err("combine_outputs after a failed join"),
         }
     }
@@ -305,6 +405,7 @@ impl ReturnProtocol {
             ReturnStage::Published => Err("combine_enqueued without combine_outputs"),
             ReturnStage::Idle => Err("combine_enqueued without a published generation"),
             ReturnStage::InFlight => Err("combine_enqueued twice for one generation"),
+            ReturnStage::Gated => Err("combine_enqueued on a CP-wait generation"),
             ReturnStage::Poisoned => Err("combine_enqueued after a failed join"),
         }
     }
@@ -420,6 +521,8 @@ struct Transaction {
     mapped_call: bool,
     /// `mapped_retire_waits` when this call's `prepare` began.
     waits_base: u64,
+    /// Generation of this call's ready/join words (CP-wait executors).
+    cp_gen: u32,
 }
 
 /// The mapped cold-result return: one owning mapped host allocation and its
@@ -431,10 +534,109 @@ struct MappedReturn {
     buf: RefCell<MappedHostBuffer>,
 }
 
+/// The CP-wait join of one executor: a ready word the GPU writes after the
+/// input downloads, a join word the CPU writes after the slots, the gate that
+/// funnels every error into an abort, and the watchdog arm. Dropping it stops
+/// the watchdog arm first, then releases any queued wait (each word's drop
+/// stores the abort value before it drains).
+struct CpWait {
+    gate: RefCell<JoinGate>,
+    /// The watchdog arm of the queued wait, if any.
+    arm: Cell<Option<ArmId>>,
+    target: Arc<JoinTarget>,
+    watchdog: &'static Watchdog<SystemClock>,
+    gen: Cell<SignalGen>,
+    joins: Cell<u64>,
+    ready_word: SignalWord,
+    join_word: SignalWord,
+}
+
+/// [`GatePort`] over a [`CpWait`]'s words, its watchdog and (when present) the
+/// device.
+struct CpPort<'a> {
+    cp: &'a CpWait,
+    gpu: Option<&'a Gpu>,
+}
+
+impl GatePort for CpPort<'_> {
+    fn store_join(&self, value: u32) {
+        self.cp.join_word.store_release(value);
+    }
+
+    fn disarm_watchdog(&self) -> Disarm {
+        match self.cp.arm.take() {
+            Some(id) => self.cp.watchdog.disarm(id),
+            None => Disarm::Unknown,
+        }
+    }
+
+    fn device_sync(&self) -> Result<(), String> {
+        match self.gpu {
+            Some(gpu) => gpu.hip.device_synchronize().map_err(|e| e.to_string()),
+            None => Err("no device handle for a drain".into()),
+        }
+    }
+}
+
+impl CpWait {
+    fn next_gen(&self) -> Result<u32, DispatchError> {
+        let mut gen = self.gen.get();
+        let value = gen.next().map_err(err)?;
+        self.gen.set(gen);
+        Ok(value)
+    }
+
+    /// The error funnel with a device: abort FIRST (if a wait is queued), poison,
+    /// then drain.
+    fn fail(&self, gpu: &Gpu) -> Result<(), String> {
+        self.target.poison();
+        self.gate.borrow_mut().fail(&CpPort {
+            cp: self,
+            gpu: Some(gpu),
+        })
+    }
+
+    /// Release a queued wait without any device call. `true` when this stored
+    /// the abort value.
+    fn abort_only(&self) -> bool {
+        match self.gate.try_borrow_mut() {
+            Ok(mut gate) => {
+                let stored = gate.abort(&CpPort {
+                    cp: self,
+                    gpu: None,
+                });
+                if stored {
+                    self.target.poison();
+                }
+                stored
+            }
+            Err(_) => {
+                // The gate is mid-transition on this thread: the abort value is
+                // always safe to store, and a stuck wait never is.
+                self.join_word.store_release(SIGNAL_ABORT);
+                self.target.poison();
+                true
+            }
+        }
+    }
+}
+
+impl Drop for CpWait {
+    fn drop(&mut self) {
+        if let Some(id) = self.arm.take() {
+            self.watchdog.disarm(id);
+        }
+    }
+}
+
 /// Preallocated per-layer transaction and immutable expert ownership plan.
 /// A runtime must release this with `free_gpu` while its device is bound, just
 /// like its other model-owned tensors. CPU work never outlives `join`.
 pub struct CpuSplitExecutor {
+    /// CP-wait join; `None` selects the host join. Declared FIRST so it drops
+    /// first: its signal words release any queued wait before the transfer
+    /// buffers (which synchronize the device) or the mapped buffer drop.
+    cpwait: Option<CpWait>,
     dim: usize,
     mi: usize,
     top_k: usize,
@@ -461,6 +663,16 @@ pub struct CpuSplitExecutor {
     mapped_publications: Cell<u64>,
     /// Mapped retirements that actually blocked, ever.
     mapped_retire_waits: Cell<u64>,
+    /// Input readiness mechanism (`HIPFIRE_QWEN4_D2_READY`); `Sync` is the
+    /// original boundary.
+    ready: D2Ready,
+    /// Readiness polls (event query or ready-word load), ever.
+    ready_polls: Cell<u64>,
+    /// Blocking stream synchronizations an event/word readiness still needed
+    /// (spin budget exhausted, or a buffer the proof does not cover), ever.
+    ready_fallback_syncs: Cell<u64>,
+    /// Why a requested CP-wait join was refused (host join kept).
+    join_refusal: Option<String>,
 }
 
 impl CpuSplitExecutor {
@@ -537,6 +749,7 @@ impl CpuSplitExecutor {
                 token: None,
                 mapped_call: false,
                 waits_base: 0,
+                cp_gen: 0,
             }),
             diag_on: Cell::new(false),
             recording: Cell::new(false),
@@ -556,6 +769,11 @@ impl CpuSplitExecutor {
             output_copy_calls: Cell::new(0),
             mapped_publications: Cell::new(0),
             mapped_retire_waits: Cell::new(0),
+            cpwait: None,
+            ready: D2Ready::Sync,
+            ready_polls: Cell::new(0),
+            ready_fallback_syncs: Cell::new(0),
+            join_refusal: None,
         })
     }
 
@@ -606,6 +824,143 @@ impl CpuSplitExecutor {
             self.mapped_publications.get(),
             self.mapped_retire_waits.get(),
         )
+    }
+
+    /// The input readiness mechanism of this executor's `prepare`.
+    pub fn ready_mode(&self) -> D2Ready {
+        self.ready
+    }
+
+    /// `(ready_polls, ready_fallback_syncs)`, each cumulative: readiness polls
+    /// (event queries or ready-word loads) and the blocking stream
+    /// synchronizations event/word readiness still needed.
+    pub fn ready_counters(&self) -> (u64, u64) {
+        (self.ready_polls.get(), self.ready_fallback_syncs.get())
+    }
+
+    /// Select event readiness (`HIPFIRE_QWEN4_D2_READY=event`). Call once, at
+    /// load, before the first `prepare`. The default is the original stream
+    /// synchronization. Under the CP-wait join the ready word replaces both.
+    pub fn enable_event_ready(&mut self) -> Result<D2Ready, DispatchError> {
+        let st = self.state.get_mut();
+        if st.failed || st.ready {
+            return Err(err("readiness selection with an active transaction"));
+        }
+        self.ready = D2Ready::Event;
+        Ok(D2Ready::Event)
+    }
+
+    /// The join this executor uses.
+    pub fn join_mode(&self) -> D2Join {
+        if self.cpwait.is_some() {
+            D2Join::CpWait
+        } else {
+            D2Join::Host
+        }
+    }
+
+    /// Why a requested CP-wait join was refused (the host join is kept).
+    pub fn join_refusal(&self) -> Option<&str> {
+        self.join_refusal.as_deref()
+    }
+
+    /// `(cpwait_joins, cpwait_aborts, watchdog_fires)`, each cumulative: calls
+    /// released with their generation, waits released with the abort value by
+    /// an error path, and abort stores by the watchdog.
+    pub fn cpwait_counters(&self) -> (u64, u64, u64) {
+        match self.cpwait.as_ref() {
+            Some(cp) => (
+                cp.joins.get(),
+                cp.gate.try_borrow().map_or(0, |g| g.aborts()),
+                cp.target.fires(),
+            ),
+            None => (0, 0, 0),
+        }
+    }
+
+    /// Switch this executor to the CP-wait join, or keep the host join and
+    /// record why. Call once, at load, after the return mode is selected and
+    /// before the first `prepare`, and only when the operator asked for
+    /// `cpwait`. Capability routing, never silent: a copy transport, a mixed
+    /// hot/cold plan, a device whose `hipDeviceAttributeCanUseStreamWaitValue`
+    /// is 0, a failed signal allocation or watchdog start is a refusal that
+    /// leaves [`Self::join_refusal`] set and the host join running.
+    pub fn enable_cpwait_join(&mut self, gpu: &Gpu) -> Result<D2Join, DispatchError> {
+        if self.cpwait.is_some() || self.join_refusal.is_some() {
+            return Err(err("the join was already selected"));
+        }
+        {
+            let st = self.state.get_mut();
+            if st.failed || st.ready {
+                return Err(err("join selection with an active transaction"));
+            }
+        }
+        if gpu.device_id != self.device {
+            return Err(err("join selection on another device"));
+        }
+        let precheck = select_join_mode(D2Join::CpWait, self.return_mode(), &self.placement, true);
+        if let Some(reason) = precheck.refusal {
+            self.join_refusal = Some(reason.to_string());
+            return Ok(D2Join::Host);
+        }
+        if self.diag_on.get() {
+            self.join_refusal =
+                Some("a lab parity configuration is active (host join kept)".into());
+            return Ok(D2Join::Host);
+        }
+        gpu.bind_thread().map_err(err)?;
+        let capable = match gpu.hip.can_use_stream_wait_value(gpu.device_id) {
+            Ok(capable) => capable,
+            Err(error) => {
+                self.join_refusal =
+                    Some(format!("capability query failed: {error} (host join kept)"));
+                return Ok(D2Join::Host);
+            }
+        };
+        let decision =
+            select_join_mode(D2Join::CpWait, self.return_mode(), &self.placement, capable);
+        if let Some(reason) = decision.refusal {
+            self.join_refusal = Some(reason.to_string());
+            return Ok(D2Join::Host);
+        }
+        let watchdog = match crate::cpwait::global_watchdog() {
+            Ok(watchdog) => watchdog,
+            Err(error) => {
+                self.join_refusal = Some(format!("{error} (host join kept)"));
+                return Ok(D2Join::Host);
+            }
+        };
+        let words = gpu
+            .hip
+            .signal_word()
+            .and_then(|ready| Ok((ready, gpu.hip.signal_word()?)));
+        let (ready_word, join_word) = match words {
+            Ok(words) => words,
+            Err(error) => {
+                self.join_refusal = Some(format!(
+                    "signal word allocation failed: {error} (host join kept)"
+                ));
+                return Ok(D2Join::Host);
+            }
+        };
+        let abort_ptr = join_word.host_ptr();
+        let target = Arc::new(JoinTarget::new(Box::new(move || {
+            // SAFETY: the join word outlives every watchdog arm: `CpWait`
+            // disarms its arm before its words drop, and `Watchdog::disarm` is
+            // serialized with this call.
+            unsafe { abort_ptr.store(SIGNAL_ABORT) }
+        })));
+        self.cpwait = Some(CpWait {
+            gate: RefCell::new(JoinGate::new()),
+            arm: Cell::new(None),
+            target,
+            watchdog,
+            gen: Cell::new(SignalGen::new()),
+            joins: Cell::new(0),
+            ready_word,
+            join_word,
+        });
+        Ok(D2Join::CpWait)
     }
 
     /// Switch this executor's cold return to the mapped transport, or keep
@@ -687,6 +1042,11 @@ impl CpuSplitExecutor {
         let Some(mapped) = self.mapped.as_ref() else {
             return Ok(expanded);
         };
+        if self.cpwait.is_some() {
+            return Err(err(
+                "combine_outputs on a CP-wait executor (use cpwait_arm)",
+            ));
+        }
         let mut st = self
             .state
             .try_borrow_mut()
@@ -712,6 +1072,11 @@ impl CpuSplitExecutor {
         let Some(mapped) = self.mapped.as_ref() else {
             return Ok(());
         };
+        if self.cpwait.is_some() {
+            return Err(err(
+                "combine_enqueued on a CP-wait executor (the join marks the consumer)",
+            ));
+        }
         let mut st = self
             .state
             .try_borrow_mut()
@@ -738,12 +1103,161 @@ impl CpuSplitExecutor {
         if result.is_err() {
             st.failed = true;
             st.ret.poison();
-            let _ = gpu.hip.device_synchronize();
+            self.drain_failed(gpu);
             if self.diag_on.get() {
                 self.close_open();
             }
         }
         result
+    }
+
+    /// Drain after a failed transaction. A CP-wait executor aborts any queued
+    /// wait BEFORE the device synchronize (a synchronize with a pending wait
+    /// never returns) and poisons itself.
+    fn drain_failed(&self, gpu: &Gpu) {
+        match self.cpwait.as_ref() {
+            Some(cp) => {
+                let _ = cp.fail(gpu);
+            }
+            None => {
+                let _ = gpu.hip.device_synchronize();
+            }
+        }
+    }
+
+    /// Whether this executor joins through the CP wait. The sealed program is
+    /// lowered in the CP-wait order (combine before join) iff this is true.
+    pub fn cpwait_active(&self) -> bool {
+        self.cpwait.is_some()
+    }
+
+    /// CP-wait join, step 1: after the routed GPU tail is enqueued and BEFORE
+    /// the CPU arithmetic, queue `hipStreamWaitValue32(join_word >= gen)` on the
+    /// active stream and hand out the mapped view for the canonical combine,
+    /// which the caller enqueues next on that stream. Nothing the stream queues
+    /// afterwards runs until [`Self::join`] releases the wait (or an abort
+    /// does), so no code may synchronize the stream or device between this call
+    /// and `join`. A failure aborts (ABORT stored before any drain) and
+    /// poisons; the request must be discarded.
+    pub fn cpwait_arm<'a>(&'a self, gpu: &Gpu) -> Result<&'a GpuTensor, DispatchError> {
+        let (Some(cp), Some(mapped)) = (self.cpwait.as_ref(), self.mapped.as_ref()) else {
+            return Err(err("cpwait_arm on an executor without the CP-wait join"));
+        };
+        let mut st = self
+            .state
+            .try_borrow_mut()
+            .map_err(|_| err("cpwait_arm during an active transaction"))?;
+        if st.failed {
+            return Err(err("cpwait_arm after a failed transaction"));
+        }
+        if !st.ready || !st.mapped_call {
+            return Err(err("cpwait_arm outside a prepared mapped call"));
+        }
+        let result = (|| {
+            if cp.target.is_poisoned() {
+                return Err(err("the join watchdog fired; the CP-wait join is poisoned"));
+            }
+            self.gate(gpu, st.rows)?;
+            st.ret.arm_gated().map_err(err)?;
+            let gen = st.cp_gen;
+            // Armed BEFORE the enqueue: a failed call may still have queued the
+            // packet, so from here every error must abort.
+            cp.gate.borrow_mut().arm(gen).map_err(err)?;
+            cp.arm.set(Some(cp.watchdog.arm(cp.target.clone())));
+            gpu.hip
+                .stream_wait_signal_gte(gpu.active_stream.as_ref(), &cp.join_word, gen)
+                .map_err(err)
+        })();
+        if let Err(e) = result {
+            st.failed = true;
+            st.ret.poison();
+            let _ = cp.fail(gpu);
+            return Err(e);
+        }
+        Ok(&mapped.view)
+    }
+
+    /// Release a queued CP wait with the abort value and poison, without any
+    /// device call. For an owner that is abandoning a call between
+    /// [`Self::cpwait_arm`] and [`Self::join`] (a failed later stage, a dropped
+    /// program): the combine then consumes garbage and the request must be
+    /// discarded. A no-op when no wait is queued.
+    pub fn abort_armed(&self) {
+        let Some(cp) = self.cpwait.as_ref() else {
+            return;
+        };
+        if !cp.abort_only() {
+            return;
+        }
+        if let Ok(mut st) = self.state.try_borrow_mut() {
+            st.failed = true;
+            st.ret.poison();
+        }
+    }
+
+    /// Wait for the three input downloads of `prepare`, then retire the older
+    /// mask/output transfers. `Sync` is the original boundary: three stream
+    /// synchronizations, byte for byte. `Event` and the CP-wait ready word arm a
+    /// proof after the downloads and spin on it ([`READY_SPIN_BUDGET`]); a spin
+    /// that expires, or an older buffer the proof does not cover, falls back to
+    /// the blocking synchronization and is counted.
+    fn await_inputs(&self, gpu: &Gpu, st: &mut Transaction) -> Result<(), DispatchError> {
+        if let Some(cp) = self.cpwait.as_ref() {
+            let gen = st.cp_gen;
+            return self.await_ready(
+                gpu,
+                st,
+                |input| input.arm_ready_word(&gpu.hip, &cp.ready_word, gen),
+                |input, proof| input.try_complete_ready_word(proof, &cp.ready_word),
+            );
+        }
+        match self.ready {
+            D2Ready::Sync => {
+                st.input.complete(&gpu.hip).map_err(err)?;
+                // These may synchronize the stream, intentionally BEFORE its tail.
+                st.mask.complete(&gpu.hip).map_err(err)?;
+                st.output.complete(&gpu.hip).map_err(err)
+            }
+            D2Ready::Event => self.await_ready(
+                gpu,
+                st,
+                |input| input.arm_ready(&gpu.hip),
+                |input, proof| input.try_complete_ready(&gpu.hip, proof),
+            ),
+        }
+    }
+
+    fn await_ready(
+        &self,
+        gpu: &Gpu,
+        st: &mut Transaction,
+        arm: impl FnOnce(&mut PinnedTransferBuffer) -> Result<InputReady, HipError>,
+        mut poll: impl FnMut(&mut PinnedTransferBuffer, &mut InputReady) -> Result<bool, HipError>,
+    ) -> Result<(), DispatchError> {
+        let mut proof = arm(&mut st.input).map_err(err)?;
+        let start = Instant::now();
+        let outcome = spin_until_ready(
+            || poll(&mut st.input, &mut proof),
+            || start.elapsed(),
+            READY_SPIN_BUDGET,
+        )
+        .map_err(err)?;
+        self.ready_polls
+            .set(self.ready_polls.get() + outcome.polls());
+        if let SpinOutcome::TimedOut { .. } = outcome {
+            st.input.complete_ready(&gpu.hip, &mut proof).map_err(err)?;
+            self.ready_fallback_syncs
+                .set(self.ready_fallback_syncs.get() + 1);
+        }
+        // The completed proof retires every older same-stream transfer.
+        for older in [&mut st.mask, &mut st.output] {
+            if !older.retire_behind(&proof).map_err(err)? {
+                older.complete(&gpu.hip).map_err(err)?;
+                self.ready_fallback_syncs
+                    .set(self.ready_fallback_syncs.get() + 1);
+            }
+        }
+        Ok(())
     }
 
     /// Freeze one diagnostic run for this layer. Replaces any previous
@@ -762,6 +1276,11 @@ impl CpuSplitExecutor {
         }
         drop(st);
         let active = cfg.mode != SplitParityMode::Off;
+        if active && self.cpwait.is_some() {
+            return Err(err(
+                "parity lab modes drain the stream and are refused under the CP-wait join",
+            ));
+        }
         if !active {
             if cfg.endpoint != SplitEndpoint::Natural || cfg.serial {
                 return Err(err(
@@ -1041,6 +1560,13 @@ impl CpuSplitExecutor {
             return Err(err("failed or unfinished transaction"));
         }
         let result = (|| {
+            if let Some(cp) = self.cpwait.as_ref() {
+                if cp.target.is_poisoned() {
+                    return Err(err("the join watchdog fired; the CP-wait join is poisoned"));
+                }
+                cp.gate.borrow_mut().begin_call().map_err(err)?;
+                st.cp_gen = cp.next_gen()?;
+            }
             let retire_first = if self.mapped.is_some() {
                 st.waits_base = self.mapped_retire_waits.get();
                 st.ret.admit_prepare().map_err(err)?
@@ -1068,14 +1594,12 @@ impl CpuSplitExecutor {
                     gpu.active_stream.as_ref(),
                 )
                 .map_err(err)?;
-            st.input.complete(&gpu.hip).map_err(err)?;
-            // These may synchronize the stream, intentionally BEFORE its tail.
-            st.mask.complete(&gpu.hip).map_err(err)?;
-            st.output.complete(&gpu.hip).map_err(err)?;
+            self.await_inputs(gpu, &mut st)?;
             if retire_first {
-                // The input completion above synchronized the stream, so the
-                // previous generation's combine is normally finished: this is
-                // a poll, not a wait. Nothing can write the buffer before it.
+                // The input proof (a synchronization, or the event/word that
+                // follows the previous layer's work on this stream) puts the
+                // previous generation's combine behind it, so this is a poll,
+                // not a wait. Nothing can write the buffer before it.
                 let mapped = self
                     .mapped
                     .as_ref()
@@ -1138,7 +1662,7 @@ impl CpuSplitExecutor {
             st.failed = true;
             // Keep this transaction poisoned even after a successful drain:
             // a partially advanced model request must never silently retry.
-            let _ = gpu.hip.device_synchronize();
+            self.drain_failed(gpu);
             if diag {
                 self.close_open();
             }
@@ -1327,7 +1851,14 @@ impl CpuSplitExecutor {
                     .mapped
                     .as_ref()
                     .ok_or_else(|| err("mapped call without a mapped return"))?;
-                ret.begin_join().map_err(err)?;
+                if let Some(cp) = self.cpwait.as_ref() {
+                    if cp.target.is_poisoned() {
+                        return Err(err("the join watchdog fired; the CP-wait join is poisoned"));
+                    }
+                    ret.begin_join_gated().map_err(err)?;
+                } else {
+                    ret.begin_join().map_err(err)?;
+                }
                 let mut buf = mapped
                     .buf
                     .try_borrow_mut()
@@ -1357,7 +1888,24 @@ impl CpuSplitExecutor {
                 // expanded rows (masked zero stores); match those bytes.
                 zero_unwritten_slots(rows_out, self.dim, &host_slots[..*host_count]);
                 let cpu_ns = t_cpu.map_or(0, |t| ns(t, Instant::now()));
-                *token = Some(write.publish());
+                let published = write.publish();
+                if let Some(cp) = self.cpwait.as_ref() {
+                    // The combine is already queued behind the wait: record its
+                    // retirement event at the stream tail, publish the ledger
+                    // transition, then release the wait with this generation.
+                    buf.mark_gpu_reading(&gpu.hip, published, gpu.active_stream.as_ref())
+                        .map_err(err)?;
+                    ret.joined_gated();
+                    self.mapped_publications
+                        .set(self.mapped_publications.get() + 1);
+                    cp.gate
+                        .borrow_mut()
+                        .release(&CpPort { cp, gpu: Some(gpu) })
+                        .map_err(err)?;
+                    cp.joins.set(cp.joins.get() + 1);
+                    return Ok(cpu_ns);
+                }
+                *token = Some(published);
                 ret.published();
                 self.mapped_publications
                     .set(self.mapped_publications.get() + 1);
@@ -1442,7 +1990,7 @@ impl CpuSplitExecutor {
             Err(e) => {
                 st.failed = true;
                 st.ret.poison();
-                let _ = gpu.hip.device_synchronize();
+                self.drain_failed(gpu);
                 if diag {
                     self.close_open();
                 }
@@ -1480,6 +2028,9 @@ impl CpuSplitExecutor {
 
     pub fn free_gpu(self, gpu: &Gpu) -> Result<(), HipError> {
         gpu.bind_thread()?;
+        // A queued CP wait is released with the abort value BEFORE any drain: a
+        // device synchronize with a pending wait never returns.
+        self.abort_armed();
         if let Err(e) = gpu.hip.device_synchronize() {
             // Both pinned copy sources, the mapped cold-result allocation and
             // the mask allocation may still be referenced. Retain the whole
@@ -1491,8 +2042,12 @@ impl CpuSplitExecutor {
             masked_indices,
             state,
             mapped,
+            cpwait,
             ..
         } = self;
+        // The CP-wait words go first: each stores the abort value, drains the
+        // device and frees itself, and the watchdog arm is already disarmed.
+        drop(cpwait);
         drop(state);
         // Drop the owning allocation (it quiesces its consumer itself and
         // retains the memory if that fails), then the Borrowed view with it.
@@ -1722,5 +2277,140 @@ mod return_tests {
         let mut all = vec![7.0f32; 2 * dim];
         zero_unwritten_slots(&mut all, dim, &[0, 1]);
         assert!(all.iter().all(|&v| v == 7.0));
+    }
+
+    // ── CP-wait join ──
+
+    /// One whole CP-wait generation: prepare, arm (combine queued), join.
+    fn run_gated_generation(p: &mut ReturnProtocol) {
+        assert_eq!(p.admit_prepare(), Ok(p.stage == ReturnStage::InFlight));
+        p.retired();
+        assert_eq!(p.arm_gated(), Ok(CombineSource::Mapped));
+        p.begin_join_gated().unwrap();
+        p.joined_gated();
+    }
+
+    #[test]
+    fn a_gated_generation_arms_before_it_joins_and_retires_at_the_next_prepare() {
+        let mut p = ReturnProtocol::new();
+        for generation in 0..6 {
+            assert_eq!(
+                p.stage == ReturnStage::InFlight,
+                generation > 0,
+                "generation {generation}"
+            );
+            run_gated_generation(&mut p);
+            assert_eq!(p.stage, ReturnStage::InFlight);
+        }
+    }
+
+    #[test]
+    fn a_gated_join_needs_an_armed_generation_and_the_host_join_refuses_one() {
+        let mut p = ReturnProtocol::new();
+        assert!(p.begin_join_gated().is_err(), "join before arm");
+        p.admit_prepare().unwrap();
+        assert!(p.begin_join_gated().is_err(), "prepared only");
+        p.arm_gated().unwrap();
+        assert!(p.arm_gated().is_err(), "armed twice");
+        assert!(
+            p.begin_join().is_err(),
+            "the host join never writes an armed generation"
+        );
+        assert!(
+            p.lend().is_err() && p.enqueued().is_err(),
+            "the host combine path is closed"
+        );
+        assert!(
+            p.admit_prepare().is_err(),
+            "an armed generation that never joined blocks the next call"
+        );
+    }
+
+    #[test]
+    fn an_armed_generation_cannot_start_over_an_unretired_consumer_or_a_poisoned_return() {
+        let mut p = ReturnProtocol::new();
+        run_gated_generation(&mut p);
+        assert!(
+            p.arm_gated().is_err(),
+            "the previous consumer is still in flight"
+        );
+        p.poison();
+        assert!(p.arm_gated().is_err());
+        assert!(p.begin_join_gated().is_err());
+    }
+
+    #[test]
+    fn cpwait_is_refused_on_the_copy_transport_and_on_mixed_placements() {
+        let all_cold = [1u8; 8];
+        let mixed = [1u8, 0, 1, 1];
+        let host = select_join_mode(D2Join::Host, D2ReturnMode::Mapped, &all_cold, true);
+        assert_eq!(
+            host,
+            JoinDecision {
+                mode: D2Join::Host,
+                refusal: None
+            }
+        );
+        let copy = select_join_mode(D2Join::CpWait, D2ReturnMode::Copy, &all_cold, true);
+        assert_eq!(copy.mode, D2Join::Host);
+        assert!(copy
+            .refusal
+            .is_some_and(|r| r.contains("needs the mapped return")));
+        let mix = select_join_mode(D2Join::CpWait, D2ReturnMode::Mapped, &mixed, true);
+        assert_eq!(mix.mode, D2Join::Host);
+        assert!(mix.refusal.is_some_and(|r| r.contains("mixed hot/cold")));
+        let mix_copy = select_join_mode(D2Join::CpWait, D2ReturnMode::Copy, &mixed, true);
+        assert_eq!(mix_copy.mode, D2Join::Host);
+        assert!(mix_copy
+            .refusal
+            .is_some_and(|r| r.contains("mixed hot/cold")));
+        let empty = select_join_mode(D2Join::CpWait, D2ReturnMode::Mapped, &[], true);
+        assert!(empty.refusal.is_some());
+        assert_eq!(empty.mode, D2Join::Host);
+    }
+
+    #[test]
+    fn cpwait_is_refused_without_the_stream_wait_value_capability() {
+        let refused = select_join_mode(D2Join::CpWait, D2ReturnMode::Mapped, &[1; 4], false);
+        assert_eq!(refused.mode, D2Join::Host);
+        assert!(refused
+            .refusal
+            .is_some_and(|r| r.contains("hipDeviceAttributeCanUseStreamWaitValue")));
+    }
+
+    #[test]
+    fn cpwait_is_selected_on_a_capable_all_cold_mapped_layer() {
+        let ok = select_join_mode(D2Join::CpWait, D2ReturnMode::Mapped, &[1; 512], true);
+        assert_eq!(
+            ok,
+            JoinDecision {
+                mode: D2Join::CpWait,
+                refusal: None
+            }
+        );
+    }
+
+    #[test]
+    fn join_flag_spellings_drive_the_selection() {
+        use hipfire_config::memory::parse_d2_join;
+        let request = |raw: Option<&str>| {
+            parse_d2_join(raw)
+                .map(|r| select_join_mode(r, D2ReturnMode::Mapped, &[1; 8], true).mode)
+        };
+        assert_eq!(request(None), Ok(D2Join::Host));
+        assert_eq!(request(Some("host")), Ok(D2Join::Host));
+        assert_eq!(request(Some("cpwait")), Ok(D2Join::CpWait));
+        assert!(request(Some("wait")).is_err());
+        assert!(request(Some("")).is_err());
+    }
+
+    #[test]
+    fn ready_flag_spellings_parse() {
+        use hipfire_config::memory::parse_d2_ready;
+        assert_eq!(parse_d2_ready(None), Ok(D2Ready::Sync));
+        assert_eq!(parse_d2_ready(Some("sync")), Ok(D2Ready::Sync));
+        assert_eq!(parse_d2_ready(Some("event")), Ok(D2Ready::Event));
+        assert!(parse_d2_ready(Some("spin")).is_err());
+        assert!(parse_d2_ready(Some("")).is_err());
     }
 }

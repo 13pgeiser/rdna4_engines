@@ -3317,12 +3317,17 @@ impl Qwen4MoeLayerRuntime {
         else {
             return Ok(self);
         };
-        // `HIPFIRE_QWEN4_D2_RETURN` is read from the immutable process snapshot
+        // `HIPFIRE_QWEN4_D2_RETURN`, `HIPFIRE_QWEN4_D2_READY` and
+        // `HIPFIRE_QWEN4_D2_JOIN` are read from the immutable process snapshot
         // for this load: an invalid spelling refuses the load before any
-        // executor storage exists. `copy` (the default and the kill value)
-        // leaves the executor exactly as `new` built it.
+        // executor storage exists. `copy`, `sync` and `host` (the defaults and
+        // the kill values) leave the executor exactly as `new` built it. A
+        // refused `mapped` or `cpwait` is capability routing, logged here and
+        // summarized once per load by the loader, never silent.
         let built: Result<hipfire_dispatch::cpu_split::CpuSplitExecutor, String> = (|| {
             let request = hipfire_config::memory::qwen4_d2_return()?;
+            let ready = hipfire_config::memory::qwen4_d2_ready()?;
+            let join = hipfire_config::memory::qwen4_d2_join()?;
             let mut executor = hipfire_dispatch::cpu_split::CpuSplitExecutor::new(
                 gpu,
                 config.hidden_size,
@@ -3332,24 +3337,38 @@ impl Qwen4MoeLayerRuntime {
                 &placement,
             )
             .map_err(|error| format!("{error:?}"))?;
+            let release = |executor: hipfire_dispatch::cpu_split::CpuSplitExecutor,
+                           error: String| {
+                let release = executor
+                    .free_gpu(gpu)
+                    .err()
+                    .map(|free| format!("; executor release also failed: {free:?}"))
+                    .unwrap_or_default();
+                format!("{error}{release}")
+            };
             if request == hipfire_config::memory::D2Return::Mapped {
-                match executor.enable_mapped_return(gpu) {
-                    Ok(_) => {}
-                    Err(error) => {
-                        let release = executor
-                            .free_gpu(gpu)
-                            .err()
-                            .map(|free| format!("; executor release also failed: {free:?}"))
-                            .unwrap_or_default();
-                        return Err(format!("{error:?}{release}"));
-                    }
+                if let Err(error) = executor.enable_mapped_return(gpu) {
+                    return Err(release(executor, format!("{error:?}")));
                 }
-                // A refusal is capability routing and is never silent; the
-                // selected modes are summarized once per load by the loader
-                // from `split_return_modes`.
                 if let Some(reason) = executor.return_refusal() {
                     eprintln!(
                         "  qwen4 D2 return: layer {}: mapped refused, copy kept: {reason}",
+                        self.label
+                    );
+                }
+            }
+            if ready == hipfire_config::memory::D2Ready::Event {
+                if let Err(error) = executor.enable_event_ready() {
+                    return Err(release(executor, format!("{error:?}")));
+                }
+            }
+            if join == hipfire_config::memory::D2Join::CpWait {
+                if let Err(error) = executor.enable_cpwait_join(gpu) {
+                    return Err(release(executor, format!("{error:?}")));
+                }
+                if let Some(reason) = executor.join_refusal() {
+                    eprintln!(
+                        "  qwen4 D2 join: layer {}: cpwait refused, host kept: {reason}",
                         self.label
                     );
                 }
@@ -6726,6 +6745,50 @@ impl Qwen4GpuForward {
                     .cpu_split
                     .as_ref()
                     .map(|executor| (layer.label, executor.return_mode().as_str()))
+            })
+            .collect()
+    }
+    /// The D2 input readiness mode (`"event"` or `"sync"`) of every armed
+    /// split layer, in layer order.
+    pub(crate) fn split_ready_modes(&self) -> Vec<(usize, &'static str)> {
+        self.moe
+            .iter()
+            .flatten()
+            .filter_map(|layer| {
+                layer
+                    .cpu_split
+                    .as_ref()
+                    .map(|executor| (layer.label, executor.ready_mode().as_str()))
+            })
+            .collect()
+    }
+    /// The D2 join mode (`"cpwait"` or `"host"`) of every armed split layer, in
+    /// layer order.
+    pub(crate) fn split_join_modes(&self) -> Vec<(usize, &'static str)> {
+        self.moe
+            .iter()
+            .flatten()
+            .filter_map(|layer| {
+                layer
+                    .cpu_split
+                    .as_ref()
+                    .map(|executor| (layer.label, executor.join_mode().as_str()))
+            })
+            .collect()
+    }
+    /// Cumulative D2 readiness/join counters of every armed split layer, as
+    /// `(layer label, [ready_polls, ready_fallback_syncs, cpwait_joins,
+    /// cpwait_aborts, watchdog_fires])` in layer order.
+    pub(crate) fn split_readiness_counters(&self) -> Vec<(usize, [u64; 5])> {
+        self.moe
+            .iter()
+            .flatten()
+            .filter_map(|layer| {
+                layer.cpu_split.as_ref().map(|executor| {
+                    let (polls, fallbacks) = executor.ready_counters();
+                    let (joins, aborts, fires) = executor.cpwait_counters();
+                    (layer.label, [polls, fallbacks, joins, aborts, fires])
+                })
             })
             .collect()
     }

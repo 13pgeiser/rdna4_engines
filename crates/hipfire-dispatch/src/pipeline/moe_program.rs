@@ -153,6 +153,10 @@ pub(super) struct MoeDecodeSelection {
     /// lowered over the executor's masked ids and the canonical combine reads
     /// the original route.
     pub(super) cpu_split: bool,
+    /// The split runs the CP-wait order: the canonical combine is queued behind
+    /// a command-processor wait before the CPU arithmetic, and `JoinSplit`
+    /// (last) releases it. Implies `cpu_split`.
+    pub(super) cpwait: bool,
 }
 
 /// Static grouped-prefill choices resolved while sealing. It deliberately
@@ -172,6 +176,10 @@ pub(super) struct MoePrefillSelection {
     /// [`NARROW_VERIFY_MAX_ROWS`] rows (see [`MoeDecodeSelection::cpu_split`]).
     /// Mutually exclusive with `cpu_deferred_experts`.
     pub(super) cpu_split: bool,
+    /// The split runs the CP-wait order: the canonical combine is queued behind
+    /// a command-processor wait before the CPU arithmetic, and `JoinSplit`
+    /// (last) releases it. Implies `cpu_split`.
+    pub(super) cpwait: bool,
 }
 
 impl MoePrefillSelection {
@@ -233,6 +241,22 @@ pub(super) struct MoeStepState<'a> {
     /// The post-combine parity reference re-runs the routed GPU tail over the
     /// ORIGINAL ids; while set, the masked view is not applied.
     split_reference: Cell<bool>,
+}
+
+/// A call abandoned between `Combine` (which queued the CP wait) and `JoinSplit`
+/// (which releases it) leaves the stream gated: any later synchronize hangs.
+/// Every exit of the program, including an error return or a panic, therefore
+/// releases the wait with the abort value before anything can drain the device.
+/// The combine consumed garbage, so the executor is poisoned and the request
+/// must be discarded by whoever handles the error.
+impl Drop for MoeStepState<'_> {
+    fn drop(&mut self) {
+        if self.split_phase.get() == SplitPhase::Armed {
+            if let Some(executor) = self.split_executor() {
+                executor.abort_armed();
+            }
+        }
+    }
 }
 
 impl<'a> MoeStepState<'a> {
@@ -458,6 +482,35 @@ impl<'a> MoeStepState<'a> {
             )));
         }
         Ok(())
+    }
+
+    /// Whether this call runs the CP-wait order (combine queued before the CPU
+    /// arithmetic, join last). Never true outside the split mode.
+    fn split_cpwait(&self) -> bool {
+        if let Ok((_, selection)) = self.decode_parts() {
+            return selection.cpu_split && selection.cpwait;
+        }
+        if let Ok((_, selection)) = self.prefill_parts() {
+            return selection.cpu_split && selection.cpwait;
+        }
+        false
+    }
+
+    /// The split executor this call reaches, if any.
+    fn split_executor(&self) -> Option<&CpuSplitExecutor> {
+        if let Ok((params, selection)) = self.decode_parts() {
+            return selection
+                .cpu_split
+                .then(|| decode_split_executor(params).ok())
+                .flatten();
+        }
+        if let Ok((params, selection)) = self.prefill_parts() {
+            return selection
+                .cpu_split
+                .then(|| prefill_split_executor(params).ok())
+                .flatten();
+        }
+        None
     }
 
     /// The decode params the routed GPU tail reads. `None` outside the split
@@ -1458,8 +1511,12 @@ impl<'a> SealedMoeOp<'a> {
     /// rows are then queued on the same stream behind the GPU down (whose
     /// masked slots store zero). Never completes or synchronizes the stream.
     pub(super) fn join_split(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
-        self.state
-            .require_split_phase(SplitPhase::Prepared, "JoinSplit")?;
+        let want = if self.state.split_cpwait() {
+            SplitPhase::Armed
+        } else {
+            SplitPhase::Prepared
+        };
+        self.state.require_split_phase(want, "JoinSplit")?;
         match self.state.call.protocol() {
             MoeProtocol::IndexedDecode => {
                 let (params, selection) = self.state.decode_parts()?;
@@ -1490,6 +1547,36 @@ impl<'a> SealedMoeOp<'a> {
         Ok(())
     }
 
+    /// Whether this sealed call runs the CP-wait order, checked against the
+    /// executor the call actually reaches: a selection sealed for one join mode
+    /// must never meet an executor of the other.
+    fn split_join_mode(
+        &self,
+        executor: &CpuSplitExecutor,
+        sealed: bool,
+    ) -> Result<bool, DispatchError> {
+        if sealed != executor.cpwait_active() {
+            return Err(split_error(
+                "the sealed join mode differs from the executor's join mode",
+            ));
+        }
+        Ok(sealed)
+    }
+
+    /// CP-wait `Combine`: queue the wait behind the routed tail and hand the
+    /// canonical combine the mapped view. From here until `JoinSplit` the
+    /// stream is gated: no stage may synchronize it, and a call abandoned in
+    /// the `Armed` phase aborts the wait (`MoeStepState`'s `Drop`).
+    fn arm_cpwait_combine<'e>(
+        &self,
+        gpu: &Gpu,
+        executor: &'e CpuSplitExecutor,
+    ) -> Result<&'e GpuTensor, DispatchError> {
+        let view = executor.cpwait_arm(gpu)?;
+        self.state.split_phase.set(SplitPhase::Armed);
+        Ok(view)
+    }
+
     /// The canonical combine of a split call: the unchanged BF16 combine over
     /// the original ids/weights and the joined slot rows, then (only while the
     /// lab parity record asks for it) the unmasked GPU tail is re-run into the
@@ -1505,19 +1592,32 @@ impl<'a> SealedMoeOp<'a> {
         params: &MoeParams<'_>,
         selection: &MoeDecodeSelection,
     ) -> Result<(), DispatchError> {
-        self.state
-            .require_split_phase(SplitPhase::Joined, "the canonical combine")?;
         let executor = decode_split_executor(params)?;
+        let cpwait = self.split_join_mode(executor, selection.cpwait)?;
+        self.state.require_split_phase(
+            if cpwait {
+                SplitPhase::Prepared
+            } else {
+                SplitPhase::Joined
+            },
+            "the canonical combine",
+        )?;
         let target = params.routed_out.unwrap_or(params.x_residual);
         let rows = params.batch_size;
-        let combine_input = executor.combine_outputs(params.down_expanded)?;
+        let combine_input = if cpwait {
+            self.arm_cpwait_combine(gpu, executor)?
+        } else {
+            executor.combine_outputs(params.down_expanded)?
+        };
         let combine_params = MoeParams {
             down_expanded: combine_input,
             ..*params
         };
         executor.parity_before_combine(&*gpu, rows, combine_input, target)?;
         super::decode_combine_stage(gpu, &combine_params, target, selection.route)?;
-        executor.combine_enqueued(&*gpu)?;
+        if !cpwait {
+            executor.combine_enqueued(&*gpu)?;
+        }
         executor.parity_after_combine(&*gpu, rows, target)?;
         if executor.wants_reference() {
             self.split_reference_tail(gpu)?;
@@ -1533,8 +1633,16 @@ impl<'a> SealedMoeOp<'a> {
         params: &MoePrefillParams<'_>,
         selection: &MoePrefillSelection,
     ) -> Result<(), DispatchError> {
-        self.state
-            .require_split_phase(SplitPhase::Joined, "the canonical combine")?;
+        let executor = prefill_split_executor(params)?;
+        let cpwait = self.split_join_mode(executor, selection.cpwait)?;
+        self.state.require_split_phase(
+            if cpwait {
+                SplitPhase::Prepared
+            } else {
+                SplitPhase::Joined
+            },
+            "the canonical combine",
+        )?;
         // The absorbed zero fill belongs to the BF16-row grouped combine; the
         // split folds F32 slot rows and always accumulates into a filled target.
         if self.state.initial_zero.take() {
@@ -1542,10 +1650,13 @@ impl<'a> SealedMoeOp<'a> {
                 "the canonical expanded combine cannot consume an absorbed target fill",
             ));
         }
-        let executor = prefill_split_executor(params)?;
         let target = params.routed_out.unwrap_or(params.x_batch);
         let rows = params.batch_size;
-        let combine_input = executor.combine_outputs(params.down_expanded)?;
+        let combine_input = if cpwait {
+            self.arm_cpwait_combine(gpu, executor)?
+        } else {
+            executor.combine_outputs(params.down_expanded)?
+        };
         let combine_params = MoePrefillParams {
             down_expanded: combine_input,
             ..*params
@@ -1558,7 +1669,9 @@ impl<'a> SealedMoeOp<'a> {
             selection.path2_m_total,
             false,
         )?;
-        executor.combine_enqueued(&*gpu)?;
+        if !cpwait {
+            executor.combine_enqueued(&*gpu)?;
+        }
         executor.parity_after_combine(&*gpu, rows, target)?;
         if executor.wants_reference() {
             self.split_reference_tail(gpu)?;
@@ -1869,7 +1982,7 @@ fn lower_decode<'a>(
             &mut steps,
             Step::MoeStage(op(state), MoeStage::MutationFence),
         )?;
-        if selection.cpu_split {
+        if selection.cpu_split && !selection.cpwait {
             // The cold slot rows are queued behind the GPU down (same stream)
             // and before the canonical combine of the original route.
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::JoinSplit))?;
@@ -1929,6 +2042,12 @@ fn lower_decode<'a>(
         }
         if selection.cpu_deferred_experts && !splice_first {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::CpuSplice))?;
+        }
+        if selection.cpu_split && selection.cpwait {
+            // CP-wait order: the combine (and the shared down) are queued
+            // behind the wait first; the CPU arithmetic runs last and releases
+            // the wait. See `CpuSplitExecutor::cpwait_arm`.
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::JoinSplit))?;
         }
     } else {
         if params.ep_row_gather.is_some() {
@@ -2049,10 +2168,17 @@ fn lower_prefill<'a>(
                 &mut steps,
                 Step::MoeStage(op(state), MoeStage::MutationFence),
             )?;
-            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::JoinSplit))?;
+            if !selection.cpwait {
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::JoinSplit))?;
+            }
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Combine))?;
             if params.recipe.shared_after_combine() {
                 append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
+            }
+            if selection.cpwait {
+                // CP-wait order: the CPU arithmetic runs last and releases the
+                // wait the combine is queued behind.
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::JoinSplit))?;
             }
             return Ok(steps);
         }
@@ -2766,6 +2892,9 @@ pub(super) fn select_decode(
         ninepath_mq6v2: ninepath_mq6v2 && !cpu_split,
         cpu_deferred_experts: params.cpu_deferred_experts,
         cpu_split,
+        cpwait: cpu_split
+            && crate::families::moe::cpu_split_executor(params.routed_experts, params.batch_size)
+                .is_some_and(CpuSplitExecutor::cpwait_active),
     })
 }
 
@@ -2839,6 +2968,11 @@ enum SplitPhase {
     Idle,
     /// `PrepareSplit` completed: the masked ids are queued on the stream.
     Prepared,
+    /// CP-wait join only: `Combine` queued the wait and then the canonical
+    /// combine (reading the mapped view) behind it. `JoinSplit` must still run
+    /// and release the wait; an owner that abandons the call in this phase
+    /// aborts the wait (see [`MoeStepState`]'s `Drop`).
+    Armed,
     /// `JoinSplit` completed: the cold slot rows are queued behind the GPU
     /// down, so the canonical combine may run.
     Joined,
@@ -3263,6 +3397,7 @@ pub(super) fn select_prefill(
             route: Some(route),
             cpu_deferred_experts: false,
             cpu_split: false,
+            cpwait: false,
         });
     }
     let route = (matches!(params.recipe, MoeRecipe::SoftmaxGatedShared { .. })
@@ -3430,6 +3565,9 @@ pub(super) fn select_prefill(
         route,
         cpu_deferred_experts: params.cpu_deferred_experts,
         cpu_split,
+        cpwait: cpu_split
+            && crate::families::moe::cpu_split_executor(params.routed_experts, params.batch_size)
+                .is_some_and(CpuSplitExecutor::cpwait_active),
     })
 }
 

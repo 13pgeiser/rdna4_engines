@@ -7841,6 +7841,7 @@ mod tests {
             ninepath_mq6v2: false,
             cpu_deferred_experts: false,
             cpu_split: false,
+            cpwait: false,
         })
     }
 
@@ -7861,6 +7862,7 @@ mod tests {
             route,
             cpu_deferred_experts: false,
             cpu_split: false,
+            cpwait: false,
         })
     }
 
@@ -8214,6 +8216,53 @@ mod tests {
                 ] {
                     assert!(at(absent).is_none(), "{absent:?} in {label}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn cpwait_split_queues_the_combine_before_the_join_in_both_protocols() {
+        for route in SPLIT_ROUTES {
+            let mut programs = vec![(
+                "decode".to_string(),
+                split_decode_stages(Some(route), true, |_| {}, |s| s.cpwait = true).unwrap(),
+                split_decode_stages(Some(route), true, |_| {}, |_| {}).unwrap(),
+            )];
+            for rows in 1..=crate::cpu_split::CPU_SPLIT_MAX_ROWS {
+                programs.push((
+                    format!("prefill rows={rows}"),
+                    split_prefill_stages(rows, Some(route), true, |_| {}, |s| s.cpwait = true)
+                        .unwrap(),
+                    split_prefill_stages(rows, Some(route), true, |_| {}, |_| {}).unwrap(),
+                ));
+            }
+            for (label, cpwait, host) in programs {
+                let label = format!("{route:?} {label}: {cpwait:?}");
+                let at = |stage: MoeStage| cpwait.iter().position(|s| *s == stage);
+                // Only the position of JoinSplit moves: the CPU arithmetic is
+                // the last stage, after the combine and the shared down.
+                let join = at(MoeStage::JoinSplit).unwrap();
+                assert_eq!(join, cpwait.len() - 1, "{label}");
+                assert!(
+                    at(MoeStage::Down).unwrap() < at(MoeStage::Combine).unwrap(),
+                    "{label}"
+                );
+                assert!(
+                    at(MoeStage::Combine).unwrap() < at(MoeStage::SharedDown).unwrap(),
+                    "{label}"
+                );
+                assert!(
+                    at(MoeStage::PrepareSplit).unwrap() < at(MoeStage::GateUp).unwrap(),
+                    "{label}"
+                );
+                let mut reordered = host.clone();
+                let host_join = reordered
+                    .iter()
+                    .position(|s| *s == MoeStage::JoinSplit)
+                    .unwrap();
+                reordered.remove(host_join);
+                reordered.push(MoeStage::JoinSplit);
+                assert_eq!(reordered, cpwait, "{label}: host order {host:?}");
             }
         }
     }
@@ -8621,6 +8670,7 @@ mod tests {
                 route: Some(MoeRouteCapability::Fp8B128Grouped),
                 cpu_deferred_experts: false,
                 cpu_split: false,
+                cpwait: false,
             });
             let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
             assert_eq!(
