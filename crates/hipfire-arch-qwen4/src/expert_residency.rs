@@ -1475,6 +1475,167 @@ pub fn auto_placement_layers(
     ))
 }
 
+/// Whether every routed expert fits resident beside the non-expert weights and
+/// the reserve with the placement charges of a fully resident load
+/// ([`PlacementCharges::new`] with no dedicated stage): the decision the
+/// unset-`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` load makes before it falls back to
+/// `auto` ([`resolve_expert_vram_layers`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResidentFit {
+    pub charges: PlacementCharges,
+    /// `base_reserve` plus [`Self::charges`].
+    pub reserve: u64,
+    pub fits: bool,
+}
+
+/// [`ResidentFit`] from the measured free VRAM, the non-expert and total
+/// routed-expert bytes, one layer's expert bytes and the base reserve
+/// ([`AutoReserve::bytes`]). The one place the fully-resident decision is
+/// computed, for the product loader and [`incumbent_placement_layers`].
+pub fn resident_fit(
+    free_vram: u64,
+    non_expert_bytes: u64,
+    routed_expert_bytes: u64,
+    layer_expert_bytes: u64,
+    base_reserve: u64,
+) -> Result<ResidentFit, String> {
+    let charges = PlacementCharges::new(layer_expert_bytes, false)?;
+    let reserve = charges.reserve(base_reserve)?;
+    let fits = fits_fully_resident(free_vram, non_expert_bytes, routed_expert_bytes, reserve);
+    Ok(ResidentFit {
+        charges,
+        reserve,
+        fits,
+    })
+}
+
+/// The placement the product loader resolves for an UNSET
+/// `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` on a single discrete device, from its
+/// measured inputs: `None` when everything fits resident, else
+/// `Some(layers)` kept on the device by the `auto` placement with the
+/// dedicated-stage charge (`dedicated_stage`, [`dedicated_slab_stage`]). Pure:
+/// the arithmetic every single-device load, lab example and gate shares.
+pub fn incumbent_placement_layers(
+    free_vram: u64,
+    non_expert_bytes: u64,
+    routed_expert_bytes: u64,
+    layer_expert_bytes: u64,
+    num_layers: usize,
+    base_reserve: u64,
+    dedicated_stage: bool,
+) -> Result<Option<usize>, String> {
+    let fit = resident_fit(
+        free_vram,
+        non_expert_bytes,
+        routed_expert_bytes,
+        layer_expert_bytes,
+        base_reserve,
+    )?;
+    if fit.fits {
+        return Ok(None);
+    }
+    let charges = PlacementCharges::new(layer_expert_bytes, dedicated_stage)?;
+    auto_placement_layers(
+        free_vram,
+        non_expert_bytes,
+        layer_expert_bytes,
+        num_layers,
+        base_reserve,
+        &charges,
+    )
+    .map(Some)
+}
+
+/// [`incumbent_placement_layers`] for a loaded single-device, no-MTP artifact
+/// on `gpu`: sizes the inputs exactly as the product loader does
+/// ([`placement_inputs`] at the requested prefill chunk, free VRAM from the
+/// device, one rank, no native MTP head) and returns the layers the product
+/// keeps resident (`None`: fully resident, also on unified memory). The shared
+/// lab loader's answer when no explicit layer count is set.
+#[allow(clippy::too_many_arguments)]
+pub fn incumbent_auto_resident_layers(
+    gpu: &rdna_compute::Gpu,
+    config: &Qwen4Config,
+    weights: &[WeightEntry],
+    bytes_of: &dyn Fn(&WeightEntry) -> Option<u64>,
+    backend: crate::Qwen4KvBackend,
+    max_seq: usize,
+    vmm_granularity: usize,
+    state_format: crate::Qwen4StateFormat,
+    scratch_mode: Qwen4ForwardScratchMode,
+    dedicated_stage: bool,
+) -> Result<Option<usize>, String> {
+    if gpu.is_uma() {
+        return Ok(None);
+    }
+    let routed_experts = !config.ffn.is_dense();
+    let inputs = placement_inputs(&PlacementInputsArgs {
+        gpu,
+        config,
+        weights,
+        bytes_of,
+        backend,
+        use_ranges: false,
+        max_seq,
+        vmm_granularity,
+        mtp_kept: false,
+        max_k: 0,
+        routed_experts,
+        state_format,
+        scratch_mode,
+        ranks: 1,
+        chunk_rows: crate::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq),
+    })?;
+    let (free, _) = gpu
+        .device_mem_info()
+        .map_err(|error| format!("qwen4: device memory query: {error}"))?;
+    let routed = routed_expert_bytes_ranks(weights, bytes_of, 1)
+        .map_err(|error| format!("qwen4: {error}"))?;
+    incumbent_placement_layers(
+        free as u64,
+        inputs.non_expert,
+        routed,
+        inputs.layer_experts,
+        config.num_hidden_layers,
+        inputs.reserve.bytes(),
+        dedicated_stage,
+    )
+    .map_err(|error| format!("qwen4: {error}"))
+}
+
+/// Trunk layers (ascending, the MTP head excluded) with at least one
+/// host-mapped routed-expert tensor in `weights`: the placement a load actually
+/// resolved, read back from the placed manifest rather than from whatever
+/// policy produced it.
+pub fn host_placed_trunk_layers(weights: &[WeightEntry]) -> Vec<usize> {
+    weights
+        .iter()
+        .filter(|entry| {
+            entry.residency == WeightResidency::HostMapped
+                && is_routed_expert(&entry.name)
+                && !entry.name.starts_with("mtp.")
+        })
+        .filter_map(|entry| entry.layer)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// sha256 (lowercase hex) of a resolved placement: the trunk layer count and
+/// the host-placed layers ([`host_placed_trunk_layers`]). Equal digests mean
+/// equal placement; every lab loader and receipt uses this one definition.
+pub fn placement_digest(trunk_layers: usize, host_layers: &[usize]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"qwen4-untiered-placement-v1");
+    digest.update((trunk_layers as u64).to_le_bytes());
+    digest.update((host_layers.len() as u64).to_le_bytes());
+    for &layer in host_layers {
+        digest.update((layer as u64).to_le_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
 /// Device bytes an expert-tier lease's frozen tables take beyond the payload:
 /// the gate/up and down pointer tables (8 bytes per expert each) and the
 /// 1-byte-per-expert codec table, over every trunk expert
@@ -2319,6 +2480,239 @@ pub fn check_gtt_cap(host_bytes: u64, budget: Option<GttBudget>) -> Result<(), S
         ));
     }
     Ok(())
+}
+
+/// Everything [`placement_inputs`] reads: the load's manifest and payload
+/// sizes, the state and scratch plan it admitted, and the context geometry.
+pub struct PlacementInputsArgs<'a> {
+    pub gpu: &'a rdna_compute::Gpu,
+    pub config: &'a Qwen4Config,
+    pub weights: &'a [WeightEntry],
+    pub bytes_of: &'a dyn Fn(&WeightEntry) -> Option<u64>,
+    pub backend: crate::Qwen4KvBackend,
+    /// Unified memory (the context is charged as committed, not legacy).
+    pub use_ranges: bool,
+    pub max_seq: usize,
+    pub vmm_granularity: usize,
+    /// The native MTP head stays attached after the placement
+    /// (`native_mtp` and the host-mapped MTP policy kept it).
+    pub mtp_kept: bool,
+    pub max_k: usize,
+    /// The profile has routed experts (not a dense FFN).
+    pub routed_experts: bool,
+    pub state_format: crate::Qwen4StateFormat,
+    pub scratch_mode: Qwen4ForwardScratchMode,
+    pub ranks: usize,
+    /// The chunk the reserve is sized from; never probes the host link here.
+    pub chunk_rows: usize,
+}
+
+/// What the expert placement is sized from, for one rank of a `ranks`-way load.
+#[derive(Clone, Copy, Debug)]
+pub struct PlacementInputs {
+    /// Replicated non-expert bytes.
+    pub non_expert: u64,
+    /// One MoE layer's routed-expert bytes on this rank (the largest layer).
+    pub layer_experts: u64,
+    pub reserve: AutoReserve,
+    pub mtp_bytes: Option<u64>,
+    pub gather_bytes: Option<u64>,
+}
+
+/// The `auto` reserve ([`AutoReserve`]: the larger of the historical measured
+/// formula and a bottom-up census of the first full-context request,
+/// itemised; the census alone where it carries the measured HIP runtime
+/// overhead, [`runtime_overhead_bytes`]) with its native MTP and QSA gather
+/// parts. The one place this is computed: the product loader, the
+/// expert-parallel split and every example/gate that asks the S1 admission for
+/// a profile read it, so there is one convention.
+pub fn placement_inputs(args: &PlacementInputsArgs<'_>) -> Result<PlacementInputs, String> {
+    let PlacementInputsArgs {
+        gpu,
+        config,
+        weights,
+        bytes_of,
+        backend,
+        use_ranges,
+        max_seq,
+        vmm_granularity,
+        mtp_kept,
+        max_k,
+        routed_experts,
+        state_format,
+        scratch_mode,
+        ranks,
+        chunk_rows,
+    } = *args;
+    let qsa_format = state_format.qsa;
+    let (non_expert, layer_experts) = resident_split_ranks(weights, bytes_of, ranks)
+        .map_err(|error| format!("qwen4: {error}"))?;
+    // `chunk_rows` is the caller's: it never probes the host link here.
+    let context = crate::Qwen4ContextCommit::for_expert_reserve(
+        backend,
+        use_ranges,
+        max_seq,
+        chunk_rows,
+        vmm_granularity,
+    );
+    // The context the census charges: the ACTUAL backend with the whole
+    // admitted context mapped (a VMM arena maps ahead to `max_seq`, rounded
+    // to the driver granularity), not the legacy-forced layout the historical
+    // formula charges on a discrete card.
+    let census_context = crate::Qwen4ContextCommit::new(backend, max_seq, max_seq, vmm_granularity);
+    let mtp_for = |context: &crate::Qwen4ContextCommit| -> Result<Option<u64>, String> {
+        if !mtp_kept {
+            return Ok(None);
+        }
+        let head = language_head_dtype(weights).ok_or("qwen4: manifest has no language head")?;
+        let drafts = crate::mtp_spec::native_mtp_proposal_drafts(max_k, &gpu.arch);
+        let row_capture =
+            crate::mtp_spec::native_mtp_capture(gpu, config, state_format.gdn, drafts);
+        Ok(Some(
+            crate::mtp_spec::native_mtp_device_bytes(
+                config,
+                context,
+                chunk_rows,
+                drafts,
+                head,
+                row_capture,
+                crate::mtp_spec::native_mtp_fill_scratch(gpu),
+            )
+            .ok_or("qwen4: native MTP device bytes overflow")?,
+        ))
+    };
+    // The gathered QSA prefill attention's workspace, committed as the
+    // context is (none when the route is off: the reserve is then unchanged).
+    // Bytes already committed by an earlier load in this process are out of
+    // `free` and only growth past them is charged.
+    let gather_for = |context: &crate::Qwen4ContextCommit| -> Result<Option<u64>, String> {
+        rdna_compute::tensor_ops::qsa_gather_workspace_needed(
+            gpu,
+            qsa_format,
+            state_format.qsa_f16_arena,
+        )
+        .then(|| {
+            rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+                config.num_key_value_heads,
+                context.tokens,
+            )
+            .map(|bytes| (bytes as u64).saturating_sub(gpu.qsa_gather_scratch_bytes() as u64))
+            .ok_or("qwen4: QSA gather scratch size overflows".to_string())
+        })
+        .transpose()
+    };
+    let mtp_bytes = mtp_for(&context)?;
+    let gather_bytes = gather_for(&context)?;
+    // The measured HIP runtime overhead (exact gfx1201, discrete,
+    // single-device): the census then carries it and the historical floor,
+    // whose stale F32 context used to cover it, is retired.
+    let runtime = runtime_overhead_bytes(&gpu.arch, use_ranges, ranks);
+    let historical = if runtime.is_some() {
+        None
+    } else {
+        Some(
+            auto_vram_reserve(
+                config,
+                &context,
+                chunk_rows,
+                scratch_mode,
+                state_format.layout(),
+                mtp_bytes,
+                gather_bytes,
+            )
+            .map_err(|error| format!("qwen4: {error}"))?,
+        )
+    };
+    // The bottom-up census at the full admitted context.
+    let state = state_census(
+        config,
+        state_format,
+        &census_context,
+        chunk_rows,
+        scratch_mode,
+    )
+    .map_err(|error| format!("qwen4: {error}"))?;
+    // Lazy F16 weight shadows of the BF16 owners the long-prefill F16 WMMA
+    // arms read (exact gfx1201): the cold bound from the manifest, not the
+    // warm cache.
+    // The F16 WMMA arms run only at `route_rows >= 512`
+    // (`gemm.rs` `qwen4_f16_wmma_applies`); no forward has more rows than the
+    // chunk and gfx1201 has no canonical-row routing scope, so a smaller chunk
+    // never creates a shadow.
+    let f16_shadows = if gpu.qwen4_f16_wmma_gfx1201()
+        && chunk_rows >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+    {
+        f16_shadow_bytes(weights, config.num_hidden_layers)
+            .map_err(|error| format!("qwen4: {error}"))?
+    } else {
+        0
+    };
+    // The kernels' pool workspaces at the largest requested chunk, exactly
+    // (every short-tail remainder included). The dense GDN scan's scratch is
+    // charged wherever `fn_gdn_dense::applies` can hold at load: exact gfx1201,
+    // Q8 or Q8Ef GDN state (`qwen4_dense_gdn_admits`) and the pinned
+    // 16-key/48-value-head, 128-dim, 10240-wide geometry (its opt-out flag
+    // only lowers the charge, so it is ignored). The census charges A for both
+    // formats and the thread-local EF scratch only for plain Q8; a Q8Ef live
+    // residual is charged once by the state owner, not here.
+    let dense_gdn = rdna_compute::scratch::qwen4_dense_gdn_admits(&gpu.arch, state_format.gdn)
+        && config.linear_num_key_heads == 16
+        && config.linear_num_value_heads == 48
+        && config.linear_key_head_dim == 128
+        && config.linear_value_head_dim == 128
+        && 2 * config.linear_num_key_heads * config.linear_key_head_dim
+            + config.linear_num_value_heads * config.linear_value_head_dim
+            == 10240;
+    // The routed-expert I4 MoE terms exist only for a profile whose routed
+    // experts run the grouped I4 route; a dense or synthetic profile
+    // (no experts, or dimensions that route cannot take) charges none of
+    // them and is never refused for them.
+    let routed_i4 = routed_experts
+        && config.num_experts > 0
+        && config.num_experts_per_tok > 0
+        && config.moe_intermediate_size > 0
+        && config.hidden_size % 256 == 0
+        && config.moe_intermediate_size % 128 == 0;
+    let dims = rdna_compute::scratch::Qwen4PrefillWorkspaceDims {
+        hidden_size: config.hidden_size,
+        moe_intermediate_size: config.moe_intermediate_size,
+        num_experts: config.num_experts,
+        top_k: config.num_experts_per_tok,
+        hc_count: config.hc_count,
+        hc_lowrank: config.hc_lowrank,
+        gdn_format: dense_gdn.then_some(state_format.gdn),
+        routed_i4,
+        include_short_tails: true,
+    };
+    // Overflow (or a dimension an owning allocator rejects) refuses the load
+    // with a clear error; there is no historical-only fallback.
+    let workspace = rdna_compute::scratch::qwen4_prefill_workspace_terms(chunk_rows, &dims)
+        .ok_or("qwen4: prefill workspace bytes cannot be computed (arithmetic overflow, or a hidden/MoE dimension the kernel allocators reject)")?;
+    let census = ReserveCensus {
+        qsa_context: state.qsa_context,
+        state: state.state,
+        forward: state.forward,
+        f16_shadows,
+        workspace,
+        // The split QSA selector's score/filter scratch (0 unless its route
+        // can run).
+        qsa_selector: rdna_compute::tensor_ops::qsa_bf16_split_scratch_bytes(
+            gpu,
+            state_format.layout().index_dtype(),
+        ) as u64,
+        mtp: mtp_for(&census_context)?.unwrap_or(0),
+        gather: gather_for(&census_context)?.unwrap_or(0),
+        runtime: runtime.unwrap_or(0),
+    };
+    let reserve =
+        AutoReserve::new(historical, census).map_err(|error| format!("qwen4: {error}"))?;
+    Ok(PlacementInputs {
+        non_expert,
+        layer_experts,
+        reserve,
+        mtp_bytes,
+        gather_bytes,
+    })
 }
 
 #[cfg(test)]
@@ -5319,16 +5713,8 @@ mod tests {
     fn xtx_reserve(chunk: usize) -> AutoReserve {
         let config = crate::config::compact_test_config();
         let context = crate::Qwen4ContextCommit::legacy(XTX_MAX_SEQ);
-        let historical = auto_vram_reserve(
-            &config,
-            &context,
-            chunk,
-            Full,
-            QsaKvFormat::Q8,
-            None,
-            None,
-        )
-        .unwrap();
+        let historical =
+            auto_vram_reserve(&config, &context, chunk, Full, QsaKvFormat::Q8, None, None).unwrap();
         // The census terms the receipts print (QSA context 132 MiB, state
         // 65 MiB, forward at this chunk); it stays below the floor at every
         // rung, as in both receipts, so the historical floor sets the reserve.
@@ -5392,14 +5778,13 @@ mod tests {
     ) -> XtxDryrun {
         let mut weights = xtx_manifest();
         let (non_expert, layer) = resident_split(&weights, xtx_bytes).unwrap();
-        assert_eq!((non_expert, layer), (XTX_NON_EXPERT, XTX_GATE_UP + XTX_DOWN));
-        // Placement: the requested chunk, the placement stage switch.
-        let placement_rows = crate::gpu_forward::prefill_chunk_requested_from(
-            arch,
-            chunk_env,
-            XTX_MAX_SEQ,
-            || link,
+        assert_eq!(
+            (non_expert, layer),
+            (XTX_NON_EXPERT, XTX_GATE_UP + XTX_DOWN)
         );
+        // Placement: the requested chunk, the placement stage switch.
+        let placement_rows =
+            crate::gpu_forward::prefill_chunk_requested_from(arch, chunk_env, XTX_MAX_SEQ, || link);
         let charges = PlacementCharges::new(
             layer,
             dedicated_slab_stage(expert_stage_placement_switch(arch, stage_env), slab, false),
@@ -5812,5 +6197,229 @@ mod tests {
             overflowing.len(),
             worst >> 20,
         );
+    }
+
+    /// The product loader's inline composition of the placement primitives for an
+    /// unset layer count (what `carriers.rs` computed before
+    /// [`resident_fit`]/[`incumbent_placement_layers`] named it): the
+    /// reference the shared resolver must equal exactly.
+    fn inline_unset_placement(
+        free: u64,
+        non_expert: u64,
+        experts: u64,
+        layer: u64,
+        layers: usize,
+        base: u64,
+        stage: bool,
+    ) -> Result<Option<usize>, String> {
+        let charges = PlacementCharges::new(layer, false)?;
+        let reserve = charges.reserve(base)?;
+        if fits_fully_resident(free, non_expert, experts, reserve) {
+            return Ok(None);
+        }
+        let charges = PlacementCharges::new(layer, stage)?;
+        auto_placement_layers(free, non_expert, layer, layers, base, &charges).map(Some)
+    }
+
+    #[test]
+    fn incumbent_placement_equals_the_inline_composition_on_the_shipped_layout() {
+        use crate::host_link::HostLink::Unmeasured;
+        let weights = xtx_manifest();
+        let (non_expert, layer) = resident_split(&weights, xtx_bytes).unwrap();
+        let experts = routed_expert_bytes_ranks(&weights, xtx_bytes, 1).unwrap();
+        // The 48-layer aggregate layout of the shipped split base plus the MTP
+        // head's two expert tensors.
+        assert_eq!(experts, 49 * (XTX_GATE_UP + XTX_DOWN));
+        let frees = [
+            0,
+            non_expert,
+            XTX_FREE_BASE,
+            XTX_FREE_CAND,
+            experts + non_expert + (64 << 30),
+            u64::MAX / 4,
+        ];
+        for free in frees {
+            for chunk in [512, 1536, 2048, 4096, 8192] {
+                for stage in [false, true] {
+                    let base = xtx_reserve(chunk).bytes();
+                    let shared = incumbent_placement_layers(
+                        free, non_expert, experts, layer, 48, base, stage,
+                    );
+                    let inline =
+                        inline_unset_placement(free, non_expert, experts, layer, 48, base, stage);
+                    assert_eq!(shared, inline, "free {free} chunk {chunk} stage {stage}");
+                }
+            }
+        }
+        // The receipts' placements: base 1536 rows and candidate 8192 rows.
+        let base = xtx_dryrun("gfx1100", XTX_FREE_BASE, None, None, Unmeasured, false);
+        let resolved = incumbent_placement_layers(
+            XTX_FREE_BASE,
+            non_expert,
+            experts,
+            layer,
+            48,
+            xtx_reserve(base.placement_rows).bytes(),
+            false,
+        );
+        assert_eq!(resolved, Ok(Some(base.resident_layers)));
+        // Everything fits: no placement at all (the product keeps it resident).
+        assert_eq!(
+            incumbent_placement_layers(
+                experts + non_expert + (64 << 30),
+                non_expert,
+                experts,
+                layer,
+                48,
+                xtx_reserve(1536).bytes(),
+                false
+            ),
+            Ok(None)
+        );
+    }
+
+    /// The `auto` reserve of the shipped layout under `gdn`, from the CURRENT
+    /// state census (`state_census` -> `Qwen4State::device_bytes`, which adds
+    /// the Q8Ef live residual plane once). `floor` keeps the historical
+    /// formula (gfx1100: it still applies); without it the census alone is the
+    /// reserve (the exact-gfx1201 route that carries the runtime overhead).
+    fn gdn_reserve(chunk: usize, gdn: crate::GdnStateFormat, floor: bool) -> AutoReserve {
+        let config = crate::config::compact_test_config();
+        let format = precision_format(QsaKvFormat::Q8, gdn);
+        let context = crate::Qwen4ContextCommit::legacy(XTX_MAX_SEQ);
+        let census = state_census(&config, format, &context, chunk, Full).unwrap();
+        let historical = floor.then(|| {
+            auto_vram_reserve(&config, &context, chunk, Full, format.layout(), None, None).unwrap()
+        });
+        AutoReserve::new(
+            historical,
+            census_with(census.qsa_context, census.state, census.forward, 0, 0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn q8ef_live_residual_is_charged_once_by_the_state_census_and_flows_into_the_placement() {
+        let config = crate::config::compact_test_config();
+        // One F16 residual plane per GDN layer, not mirrored, not per ring row.
+        let plane = 2
+            * (config.linear_num_value_heads
+                * config.linear_key_head_dim
+                * config.linear_value_head_dim) as u64;
+        let live = plane * config.n_linear_layers() as u64;
+        assert_eq!(live, 54 << 20);
+        let weights = xtx_manifest();
+        let (non_expert, layer) = resident_split(&weights, xtx_bytes).unwrap();
+        let experts = routed_expert_bytes_ranks(&weights, xtx_bytes, 1).unwrap();
+        for chunk in [512, 1536, 8192] {
+            let q8 = gdn_reserve(chunk, crate::GdnStateFormat::Q8, false);
+            let ef = gdn_reserve(chunk, crate::GdnStateFormat::Q8Ef, false);
+            assert_eq!(ef.census.state - q8.census.state, live, "chunk {chunk}");
+            assert_eq!(ef.census.qsa_context, q8.census.qsa_context);
+            assert_eq!(ef.census.forward, q8.census.forward);
+            assert_eq!(ef.census_total - q8.census_total, live, "chunk {chunk}");
+            // The floor never sees the GDN format: a floor-led reserve is equal.
+            let q8_floor = gdn_reserve(chunk, crate::GdnStateFormat::Q8, true);
+            let ef_floor = gdn_reserve(chunk, crate::GdnStateFormat::Q8Ef, true);
+            assert_eq!(q8_floor.historical, ef_floor.historical);
+            // Where the dense GDN scan's scratch is charged (exact gfx1201) the formats
+            // also differ in exactly one workspace term: plain Q8 charges the scan's
+            // thread-local zero-EF plane, Q8Ef (whose residual is the live state above)
+            // charges none. The total census delta is the live plane minus that scratch.
+            let workspace = |gdn| {
+                let dims = rdna_compute::scratch::Qwen4PrefillWorkspaceDims {
+                    hidden_size: config.hidden_size,
+                    moe_intermediate_size: config.moe_intermediate_size,
+                    num_experts: config.num_experts,
+                    top_k: config.num_experts_per_tok,
+                    hc_count: config.hc_count,
+                    hc_lowrank: config.hc_lowrank,
+                    gdn_format: Some(gdn),
+                    routed_i4: true,
+                    include_short_tails: true,
+                };
+                rdna_compute::scratch::qwen4_prefill_workspace_terms(chunk, &dims).unwrap()
+            };
+            let (w8, wef) = (
+                workspace(crate::GdnStateFormat::Q8),
+                workspace(crate::GdnStateFormat::Q8Ef),
+            );
+            let scratch = rdna_compute::fn_gdn_dense::workspace_ef_bytes_for(
+                crate::GdnStateFormat::Q8,
+                chunk,
+            ) as u64;
+            for ((name, q8_bytes), (_, ef_bytes)) in w8.iter().zip(wef.iter()) {
+                if *name == "gdn_dense_ef" {
+                    assert_eq!((*q8_bytes, *ef_bytes), (scratch, 0), "chunk {chunk}");
+                } else {
+                    assert_eq!(q8_bytes, ef_bytes, "{name} chunk {chunk}");
+                }
+            }
+            let total = |terms: &[(&'static str, u64); WORKSPACE_TERM_COUNT]| {
+                terms.iter().map(|(_, bytes)| bytes).sum::<u64>()
+            };
+            assert_eq!(total(&w8) - total(&wef), scratch, "chunk {chunk}");
+        }
+        // A free-VRAM window that fits exactly three resident layers beside the Q8
+        // census loses one under Q8Ef: the 54 MiB live plane is a real reserve.
+        let q8 = gdn_reserve(1536, crate::GdnStateFormat::Q8, false).bytes();
+        let ef = gdn_reserve(1536, crate::GdnStateFormat::Q8Ef, false).bytes();
+        let charges = PlacementCharges::new(layer, false).unwrap();
+        let free = non_expert + charges.reserve(q8).unwrap() + 3 * layer + (10 << 20);
+        assert_eq!(
+            incumbent_placement_layers(free, non_expert, experts, layer, 48, q8, false),
+            Ok(Some(3))
+        );
+        assert_eq!(
+            incumbent_placement_layers(free, non_expert, experts, layer, 48, ef, false),
+            Ok(Some(2))
+        );
+    }
+
+    #[test]
+    fn incumbent_placement_equals_the_inline_composition_for_q8_and_q8_ef_reserves() {
+        let weights = xtx_manifest();
+        let (non_expert, layer) = resident_split(&weights, xtx_bytes).unwrap();
+        let experts = routed_expert_bytes_ranks(&weights, xtx_bytes, 1).unwrap();
+        for gdn in [crate::GdnStateFormat::Q8, crate::GdnStateFormat::Q8Ef] {
+            for floor in [true, false] {
+                for (free, chunk) in [
+                    (XTX_FREE_BASE, 1536),
+                    (XTX_FREE_CAND, 8192),
+                    (experts + non_expert + (64 << 30), 8192),
+                ] {
+                    for stage in [false, true] {
+                        let base = gdn_reserve(chunk, gdn, floor).bytes();
+                        let shared = incumbent_placement_layers(
+                            free, non_expert, experts, layer, 48, base, stage,
+                        );
+                        let inline = inline_unset_placement(
+                            free, non_expert, experts, layer, 48, base, stage,
+                        );
+                        assert_eq!(
+                            shared, inline,
+                            "{gdn:?} floor {floor} free {free} chunk {chunk} stage {stage}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn host_placed_layers_and_digest_read_back_the_placed_manifest() {
+        let mut weights = xtx_manifest();
+        assert!(host_placed_trunk_layers(&weights).is_empty());
+        place_routed_experts(&mut weights, 40);
+        let host = host_placed_trunk_layers(&weights);
+        assert_eq!(host, (40..48).collect::<Vec<_>>());
+        let digest = placement_digest(48, &host);
+        assert_eq!(digest, placement_digest(48, &host));
+        assert_ne!(digest, placement_digest(48, &host[1..]));
+        assert_ne!(digest, placement_digest(47, &host));
+        // The MTP head never counts, even though placement host-maps it.
+        let mut all_host = xtx_manifest();
+        place_routed_experts(&mut all_host, 48);
+        assert!(host_placed_trunk_layers(&all_host).is_empty());
     }
 }

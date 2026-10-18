@@ -1342,10 +1342,13 @@ pub fn attach_qwen4_ep_peers(
 /// of the historical measured formula and a bottom-up census of the first
 /// full-context request, itemised; the census alone where it carries the
 /// measured HIP runtime overhead, [`residency::runtime_overhead_bytes`]) and
-/// its native MTP and QSA gather parts,
-/// returned too. The one place this is computed, for the load and for
-/// [`qwen4_ep_vram_layers`]. `chunk_rows` is the chunk the reserve is sized
-/// from: the load passes the requested prefill chunk
+/// its native MTP and QSA gather parts, returned too. The assembly is
+/// [`hipfire_arch_qwen4::expert_residency::placement_inputs`], shared with
+/// every example/gate that sizes the same placement (one convention); this
+/// keeps only the loader-private MTP host-spill policy. The one place this
+/// is computed for the load, and for [`qwen4_ep_vram_layers`]. `chunk_rows`
+/// is the chunk the reserve is sized from: the load passes the requested
+/// prefill chunk
 /// ([`hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested`])
 /// for the placement.
 #[allow(clippy::too_many_arguments)]
@@ -1376,24 +1379,6 @@ fn qwen4_placement_inputs(
     ),
     String,
 > {
-    use hipfire_arch_qwen4::expert_residency as residency;
-    let qsa_format = state_format.qsa;
-    let (non_expert, layer_experts) = residency::resident_split_ranks(weights, bytes_of, ranks)
-        .map_err(|error| format!("qwen4: {error}"))?;
-    // `chunk_rows` is the caller's: it never probes the host link here.
-    let context = hipfire_arch_qwen4::Qwen4ContextCommit::for_expert_reserve(
-        backend,
-        use_ranges,
-        max_seq,
-        chunk_rows,
-        vmm_granularity,
-    );
-    // The context the census charges: the ACTUAL backend with the whole
-    // admitted context mapped (a VMM arena maps ahead to `max_seq`, rounded
-    // to the driver granularity), not the legacy-forced layout the historical
-    // formula charges on a discrete card.
-    let census_context =
-        hipfire_arch_qwen4::Qwen4ContextCommit::new(backend, max_seq, max_seq, vmm_granularity);
     // Every placement host-maps at least the MTP layer's routed experts, so
     // the head is still attached after it only where the host-mapped policy
     // keeps it (exact gfx1201, or an explicit `--spec mtp`); only then does
@@ -1404,160 +1389,32 @@ fn qwen4_placement_inputs(
             &gpu.arch,
             usize::from(routed_experts),
         );
-    let mtp_for =
-        |context: &hipfire_arch_qwen4::Qwen4ContextCommit| -> Result<Option<u64>, String> {
-            if !mtp_kept {
-                return Ok(None);
-            }
-            let head = residency::language_head_dtype(weights)
-                .ok_or("qwen4: manifest has no language head")?;
-            let drafts = hipfire_arch_qwen4::mtp_spec::native_mtp_proposal_drafts(max_k, &gpu.arch);
-            let row_capture = hipfire_arch_qwen4::mtp_spec::native_mtp_capture(
-                gpu,
-                config,
-                state_format.gdn,
-                drafts,
-            );
-            Ok(Some(
-                hipfire_arch_qwen4::mtp_spec::native_mtp_device_bytes(
-                    config,
-                    context,
-                    chunk_rows,
-                    drafts,
-                    head,
-                    row_capture,
-                    hipfire_arch_qwen4::mtp_spec::native_mtp_fill_scratch(gpu),
-                )
-                .ok_or("qwen4: native MTP device bytes overflow")?,
-            ))
-        };
-    // The gathered QSA prefill attention's workspace, committed as the
-    // context is (none when the route is off: the reserve is then unchanged).
-    // Bytes already committed by an earlier load in this process are out of
-    // `free` and only growth past them is charged.
-    let gather_for =
-        |context: &hipfire_arch_qwen4::Qwen4ContextCommit| -> Result<Option<u64>, String> {
-            rdna_compute::tensor_ops::qsa_gather_workspace_needed(
-                gpu,
-                qsa_format,
-                state_format.qsa_f16_arena,
-            )
-            .then(|| {
-                rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
-                    config.num_key_value_heads,
-                    context.tokens,
-                )
-                .map(|bytes| (bytes as u64).saturating_sub(gpu.qsa_gather_scratch_bytes() as u64))
-                .ok_or("qwen4: QSA gather scratch size overflows".to_string())
-            })
-            .transpose()
-        };
-    let mtp_bytes = mtp_for(&context)?;
-    let gather_bytes = gather_for(&context)?;
-    // The measured HIP runtime overhead (exact gfx1201, discrete,
-    // single-device): the census then carries it and the historical floor,
-    // whose stale F32 context used to cover it, is retired.
-    let runtime = residency::runtime_overhead_bytes(&gpu.arch, use_ranges, ranks);
-    let historical = if runtime.is_some() {
-        None
-    } else {
-        Some(
-            residency::auto_vram_reserve(
-                config,
-                &context,
-                chunk_rows,
-                scratch_mode,
-                state_format.layout(),
-                mtp_bytes,
-                gather_bytes,
-            )
-            .map_err(|error| format!("qwen4: {error}"))?,
-        )
-    };
-    // The bottom-up census at the full admitted context.
-    let state = residency::state_census(
-        config,
-        state_format,
-        &census_context,
-        chunk_rows,
-        scratch_mode,
-    )
-    .map_err(|error| format!("qwen4: {error}"))?;
-    // Lazy F16 weight shadows of the BF16 owners the long-prefill F16 WMMA
-    // arms read (exact gfx1201): the cold bound from the manifest, not the
-    // warm cache.
-    // The F16 WMMA arms run only at `route_rows >= 512`
-    // (`gemm.rs` `qwen4_f16_wmma_applies`); no forward has more rows than the
-    // chunk and gfx1201 has no canonical-row routing scope, so a smaller chunk
-    // never creates a shadow.
-    let f16_shadows = if gpu.qwen4_f16_wmma_gfx1201()
-        && chunk_rows >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS
-    {
-        residency::f16_shadow_bytes(weights, config.num_hidden_layers)
-            .map_err(|error| format!("qwen4: {error}"))?
-    } else {
-        0
-    };
-    // The kernels' pool workspaces at the largest requested chunk, exactly
-    // (every short-tail remainder included). The dense GDN scan's scratch is
-    // charged wherever `fn_gdn_dense::applies` can hold at load: exact gfx1201,
-    // Q8 or Q8Ef GDN state (`qwen4_dense_gdn_admits`) and the pinned
-    // 16-key/48-value-head, 128-dim, 10240-wide geometry (its opt-out flag
-    // only lowers the charge, so it is ignored). The census charges A for both
-    // formats and the thread-local EF scratch only for plain Q8; a Q8Ef live
-    // residual is charged once by the state owner, not here.
-    let dense_gdn = rdna_compute::scratch::qwen4_dense_gdn_admits(&gpu.arch, state_format.gdn)
-        && config.linear_num_key_heads == 16
-        && config.linear_num_value_heads == 48
-        && config.linear_key_head_dim == 128
-        && config.linear_value_head_dim == 128
-        && 2 * config.linear_num_key_heads * config.linear_key_head_dim
-            + config.linear_num_value_heads * config.linear_value_head_dim
-            == 10240;
-    // The routed-expert I4 MoE terms exist only for a profile whose routed
-    // experts run the grouped I4 route; a dense or synthetic profile
-    // (no experts, or dimensions that route cannot take) charges none of
-    // them and is never refused for them.
-    let routed_i4 = routed_experts
-        && config.num_experts > 0
-        && config.num_experts_per_tok > 0
-        && config.moe_intermediate_size > 0
-        && config.hidden_size % 256 == 0
-        && config.moe_intermediate_size % 128 == 0;
-    let dims = rdna_compute::scratch::Qwen4PrefillWorkspaceDims {
-        hidden_size: config.hidden_size,
-        moe_intermediate_size: config.moe_intermediate_size,
-        num_experts: config.num_experts,
-        top_k: config.num_experts_per_tok,
-        hc_count: config.hc_count,
-        hc_lowrank: config.hc_lowrank,
-        gdn_format: dense_gdn.then_some(state_format.gdn),
-        routed_i4,
-        include_short_tails: true,
-    };
-    // Overflow (or a dimension an owning allocator rejects) refuses the load
-    // with a clear error; there is no historical-only fallback.
-    let workspace = rdna_compute::scratch::qwen4_prefill_workspace_terms(chunk_rows, &dims)
-        .ok_or("qwen4: prefill workspace bytes cannot be computed (arithmetic overflow, or a hidden/MoE dimension the kernel allocators reject)")?;
-    let census = residency::ReserveCensus {
-        qsa_context: state.qsa_context,
-        state: state.state,
-        forward: state.forward,
-        f16_shadows,
-        workspace,
-        // The split QSA selector's score/filter scratch (0 unless its route
-        // can run).
-        qsa_selector: rdna_compute::tensor_ops::qsa_bf16_split_scratch_bytes(
+    let inputs = hipfire_arch_qwen4::expert_residency::placement_inputs(
+        &hipfire_arch_qwen4::expert_residency::PlacementInputsArgs {
             gpu,
-            state_format.layout().index_dtype(),
-        ) as u64,
-        mtp: mtp_for(&census_context)?.unwrap_or(0),
-        gather: gather_for(&census_context)?.unwrap_or(0),
-        runtime: runtime.unwrap_or(0),
-    };
-    let reserve = residency::AutoReserve::new(historical, census)
-        .map_err(|error| format!("qwen4: {error}"))?;
-    Ok((non_expert, layer_experts, reserve, mtp_bytes, gather_bytes))
+            config,
+            weights,
+            bytes_of,
+            backend,
+            use_ranges,
+            max_seq,
+            vmm_granularity,
+            mtp_kept,
+            max_k,
+            routed_experts,
+            state_format,
+            scratch_mode,
+            ranks,
+            chunk_rows,
+        },
+    )?;
+    Ok((
+        inputs.non_expert,
+        inputs.layer_experts,
+        inputs.reserve,
+        inputs.mtp_bytes,
+        inputs.gather_bytes,
+    ))
 }
 
 /// Free VRAM of every device in `devices` (HIP logical ids), in order, as
@@ -2107,10 +1964,8 @@ fn load_qwen4_rank_scoped(
     // device is classified without a copy) and is 8192 only on a narrow
     // discrete link, so the placement cedes resident layers for the wider
     // chunk there. Every other arch and any explicit value never probes.
-    let placement_chunk = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(
-        &*ctx.gpu,
-        ctx.max_seq,
-    );
+    let placement_chunk =
+        hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&*ctx.gpu, ctx.max_seq);
     // What `auto` sizes its placement from: free VRAM, the non-expert and
     // per-layer expert bytes, and the reserve (with its native MTP and
     // QSA gather parts) at `placement_chunk`. Unified memory charges context
@@ -2441,12 +2296,13 @@ fn load_qwen4_rank_scoped(
             let (free, non_expert, layer_experts) = (inputs.0, inputs.1, inputs.2);
             let base_reserve = inputs.3.bytes();
             // Fully resident has no host layer, so no stage buffers; the
-            // safety margin is charged exactly as `auto` charges it.
-            let charges = placement_charges(layer_experts, false)?;
-            let reserve = charges
-                .reserve(base_reserve)
-                .map_err(|error| format!("qwen4: {error}"))?;
-            let fits = residency::fits_fully_resident(free, non_expert, experts, reserve);
+            // safety margin is charged exactly as `auto` charges it. The
+            // decision is `residency::resident_fit`, the one the shared lab
+            // loader and gates resolve with (`incumbent_placement_layers`).
+            let fit =
+                residency::resident_fit(free, non_expert, experts, layer_experts, base_reserve)
+                    .map_err(|error| format!("qwen4: {error}"))?;
+            let (charges, reserve, fits) = (fit.charges, fit.reserve, fit.fits);
             unset_note = format!(
                     " ({} MiB routed experts + {} MiB non-expert weights + {} MiB reserve (base {}; plus {}) {} {} MiB free VRAM)",
                     experts / MIB,
@@ -2843,7 +2699,8 @@ fn load_qwen4_rank_scoped(
             write!(&mut digest_hex, "{byte:02x}").expect("writing to a String");
         }
         let sidecar = hotset.as_ref().expect("a hotset plan has a sidecar");
-        lease.bind_hotset_sidecar_sha256(sidecar.sha256())
+        lease
+            .bind_hotset_sidecar_sha256(sidecar.sha256())
             .map_err(|error| format!("hotset numerical identity: {error}"))?;
         eprintln!(
             "  qwen4 expert hot set: {} sha256 {}, budget {} MiB, {} experts in VRAM ({} MiB), {} host-mapped ({} MiB), generation {}, digest {}, bound to base {} B, index sha256 {}",
@@ -7201,12 +7058,8 @@ mod qwen4_ple_load_fill_tests {
             table
         );
         // Just enough RAM for the whole table plus the reserve.
-        let (budget, _) = ple_prewarm_budget_for(
-            Auto,
-            Some(table + PLE_PREWARM_RESERVE_BYTES),
-            false,
-            true,
-        );
+        let (budget, _) =
+            ple_prewarm_budget_for(Auto, Some(table + PLE_PREWARM_RESERVE_BYTES), false, true);
         assert_eq!(budget, table);
         assert_eq!(ple_resident_bytes(budget, 0, table), table);
         // One MiB short of that: a partial prewarm that keeps the reserve.
@@ -7266,7 +7119,10 @@ mod qwen4_ple_load_fill_tests {
             ple_prewarm_budget_for(Auto, Some(PLE_PREWARM_RESERVE_BYTES - 1), false, true),
             (0, false)
         );
-        assert_eq!(ple_prewarm_budget_for(Auto, Some(0), false, true), (0, false));
+        assert_eq!(
+            ple_prewarm_budget_for(Auto, Some(0), false, true),
+            (0, false)
+        );
         assert_eq!(ple_prewarm_budget_for(Auto, None, false, true), (0, false));
         assert_eq!(ple_resident_bytes(0, 0, 27 * GIB), 0);
         // One byte over the reserve is a one-byte budget.

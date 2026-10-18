@@ -92,6 +92,10 @@ required-features = ["lab"]
 name = "qwen4_cpu_split_parity"
 required-features = ["lab"]
 
+[[example]]
+name = "qwen4_placement_receipt"
+required-features = ["lab"]
+
 [[test]]
 name = "mtp_takeover_fill_hw"
 required-features = ["reference-parity"]
