@@ -35,10 +35,11 @@
 //!   record is consulted ([`hipfire_config::calibration::lookup`], keyed by
 //!   the device's live PCI address, arch, VRAM size and PCIe link plus the
 //!   host CPU and RAM).  A *fresh* record carrying a usable
-//!   `pinned_h2d_gbps` ([`link_from_calibration`]) supplies the link and
-//!   nothing is copied.  A missing record, a stale one (different GPU, link,
-//!   RAM, CPU or probe version) or one without a pinned rate falls through to
-//!   the probe below, and the load log names which source was used.
+//!   `pinned_h2d_gbps` ([`link_from_calibration`]) supplies the link, and
+//!   the copy path is initialized instead of measured (below).  A missing
+//!   record, a stale one (different GPU, link, RAM, CPU or probe version) or
+//!   one without a pinned rate falls through to the probe below, and the load
+//!   log names which source was used.
 //! * **Discrete probe** ([`probe_pinned_h2d_gbps`]): one 64 MiB
 //!   `hipHostMalloc` portable pinned buffer (zero initialised, so every page
 //!   is resident) is copied to a 64 MiB device buffer with `hipMemcpyAsync`
@@ -47,9 +48,21 @@
 //!   `PROBE_BYTES / min(elapsed)` in GB/s (1 GB = 10^9 bytes), the *best*
 //!   sample, so contention from other processes lowers it only if every
 //!   sample was slowed.  The buffers, events and stream are released before
-//!   [`host_link`] returns, so the probe leaves free device memory unchanged
-//!   for the admission that follows.  `hipfire calibrate` runs this same
-//!   probe, so a stored figure and a load-time figure are the same quantity.
+//!   [`host_link`] returns.  `hipfire calibrate` runs this same probe, so a
+//!   stored figure and a load-time figure are the same quantity.
+//! * **Copy-path residue**: releasing the probe's buffers does not return
+//!   every byte.  The HIP runtime keeps the state its first pinned async copy
+//!   on a new non-blocking stream sets up (146 MiB of VRAM on gfx1100: in
+//!   hold j1760 the qwen4 placement, which reads free VRAM right after this
+//!   module, saw 24376 MiB free after the probe and 24522 MiB on a
+//!   calibrated load that skipped it, and kept 8 instead of 7 expert layers
+//!   resident).  The probe's 64 MiB device buffer is a plain `hipMalloc`
+//!   freed by `hipFree` (no allocator cache), so the residue is that runtime
+//!   setup, not the probe's size, and every load allocates it later anyway.
+//!   A calibrated resolution therefore runs the probe's own sequence with
+//!   one [`INIT_COPY_BYTES`] copy and no timing ([`init_copy_path`]), so
+//!   free VRAM after [`host_link`], and with it the placement, is the same
+//!   whichever source supplied the link.
 //! * **Fail closed**: any allocation, copy or timing failure, or a
 //!   non-finite or non-positive figure, is [`HostLink::Unmeasured`].  An
 //!   unmeasured link is never narrow, so no default that depends on a narrow
@@ -81,6 +94,9 @@ const PROBE_BYTES: usize = 64 << 20;
 const PROBE_WARMUP_COPIES: usize = 1;
 /// Timed copies; the fastest sets the figure.
 const PROBE_TIMED_COPIES: usize = 5;
+/// Bytes of the one untimed copy that initializes the copy path on a
+/// calibrated resolution ([`init_copy_path`]).
+const INIT_COPY_BYTES: usize = 4 << 10;
 
 /// What the host-to-device path of one device looks like.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -171,6 +187,14 @@ fn measure(gpu: &Gpu) -> HostLink {
     let (link, source) = resolve_link(
         gpu.is_uma(),
         || calibration_lookup(gpu),
+        || {
+            if let Err(error) = init_copy_path(gpu) {
+                eprintln!(
+                    "  qwen4 host link: copy-path init failed on device {} ({error})",
+                    gpu.device_id
+                );
+            }
+        },
         || match probe_pinned_h2d_gbps(gpu) {
             Ok(gbps) => Some(gbps),
             Err(error) => {
@@ -217,12 +241,16 @@ impl LinkSource {
 }
 
 /// The link decision without any device: unified memory is `Unified` and
-/// neither `lookup` nor `probe` runs; otherwise a fresh calibration carrying a
-/// pinned rate ([`link_from_calibration`]) wins and `probe` does not run;
-/// otherwise `probe` supplies the figure ([`HostLink::classify`]).
+/// neither `lookup`, `init` nor `probe` runs; otherwise a fresh calibration
+/// carrying a pinned rate ([`link_from_calibration`]) wins, `init` runs in
+/// place of the probe (the same copy-path setup, see the module docs) and
+/// `probe` does not run; otherwise `probe` supplies the figure
+/// ([`HostLink::classify`]) and `init` does not run. Exactly one of `init`
+/// and `probe` runs on every discrete resolution.
 fn resolve_link(
     unified: bool,
     lookup: impl FnOnce() -> Lookup,
+    init: impl FnOnce(),
     probe: impl FnOnce() -> Option<f64>,
 ) -> (HostLink, LinkSource) {
     if unified {
@@ -232,6 +260,7 @@ fn resolve_link(
     let why = match &lookup {
         Lookup::Fresh { measured_at, .. } => match link_from_calibration(&lookup) {
             Some(link @ HostLink::Discrete { .. }) => {
+                init();
                 return (
                     link,
                     LinkSource::Calibrated {
@@ -287,13 +316,30 @@ fn calibration_lookup(gpu: &Gpu) -> Lookup {
 /// released before returning. The quantity `hipfire calibrate` stores as
 /// `pinned_h2d_gbps` and [`host_link`] classifies.
 pub fn probe_pinned_h2d_gbps(gpu: &Gpu) -> Result<f64, String> {
+    pinned_h2d_copies(gpu, PROBE_BYTES, PROBE_TIMED_COPIES)
+        .map(|best_ms| gbps_from_ms(PROBE_BYTES, best_ms))
+}
+
+/// The probe's copy sequence with one [`INIT_COPY_BYTES`] copy and nothing
+/// timed: sets up the same HIP runtime copy-path state the probe leaves
+/// behind (the module docs' copy-path residue) without measuring anything.
+fn init_copy_path(gpu: &Gpu) -> Result<(), String> {
+    pinned_h2d_copies(gpu, INIT_COPY_BYTES, 0).map(|_| ())
+}
+
+/// One pinned-copy session on a private non-blocking stream: a `bytes`
+/// pinned host buffer and device buffer, [`PROBE_WARMUP_COPIES`] untimed
+/// copies, then `timed` event-bracketed copies; returns the fastest timed
+/// copy in milliseconds (infinite when `timed` is 0). Every resource is
+/// released before returning, on every path.
+fn pinned_h2d_copies(gpu: &Gpu, bytes: usize, timed: usize) -> Result<f32, String> {
     let hip = &gpu.hip;
     gpu.bind_thread().map_err(|error| error.to_string())?;
     let mut host = hip
-        .host_buffer(PROBE_BYTES)
+        .host_buffer(bytes)
         .map_err(|error| format!("pinned host buffer: {error}"))?;
     let device = hip
-        .malloc(PROBE_BYTES)
+        .malloc(bytes)
         .map_err(|error| format!("device buffer: {error}"))?;
     let stream = match hip.stream_create_non_blocking() {
         Ok(stream) => stream,
@@ -302,7 +348,7 @@ pub fn probe_pinned_h2d_gbps(gpu: &Gpu) -> Result<f64, String> {
             return Err(format!("stream: {error}"));
         }
     };
-    let timed = (|| -> Result<f64, String> {
+    let session = (|| -> Result<f32, String> {
         let src = host.as_bytes_mut();
         let start = hip.event_create().map_err(|error| error.to_string())?;
         let stop = match hip.event_create() {
@@ -312,13 +358,13 @@ pub fn probe_pinned_h2d_gbps(gpu: &Gpu) -> Result<f64, String> {
                 return Err(error.to_string());
             }
         };
-        let samples = (|| -> Result<f64, String> {
+        let samples = (|| -> Result<f32, String> {
             for _ in 0..PROBE_WARMUP_COPIES {
                 hip.memcpy_htod_async(&device, src, &stream)
                     .map_err(|error| format!("warm-up copy: {error}"))?;
             }
             let mut best_ms = f32::INFINITY;
-            for _ in 0..PROBE_TIMED_COPIES {
+            for _ in 0..timed {
                 hip.event_record(&start, Some(&stream))
                     .map_err(|error| error.to_string())?;
                 hip.memcpy_htod_async(&device, src, &stream)
@@ -332,7 +378,7 @@ pub fn probe_pinned_h2d_gbps(gpu: &Gpu) -> Result<f64, String> {
                     .map_err(|error| error.to_string())?;
                 best_ms = best_ms.min(ms);
             }
-            Ok(gbps_from_ms(PROBE_BYTES, best_ms))
+            Ok(best_ms)
         })();
         // Copies may still be queued after an error: drain before the events
         // and the buffers go away.
@@ -341,16 +387,16 @@ pub fn probe_pinned_h2d_gbps(gpu: &Gpu) -> Result<f64, String> {
             .map_err(|error| format!("stream drain: {error}"));
         let _ = hip.event_destroy(start);
         let _ = hip.event_destroy(stop);
-        let gbps = samples?;
+        let best_ms = samples?;
         drained?;
-        Ok(gbps)
+        Ok(best_ms)
     })();
     let drained = hip.stream_synchronize(&stream);
     let _ = hip.stream_destroy(stream);
     let _ = hip.free(device);
     // `host` drops last: the stream is drained, so no copy still reads it.
     drained.map_err(|error| format!("stream drain: {error}"))?;
-    timed
+    session
 }
 
 /// Best-of-N rate at which a GPU kernel reads host-mapped memory over the
@@ -678,13 +724,20 @@ mod tests {
     }
 
     #[test]
-    fn fresh_calibration_supplies_the_link_without_probing() {
+    fn fresh_calibration_supplies_the_link_and_initializes_instead_of_probing() {
+        let inits = std::cell::Cell::new(0);
         let (link, source) = resolve_link(
             false,
             || fresh(false, Some(7.1)),
+            || inits.set(inits.get() + 1),
             || unreachable!("probed despite a fresh calibration"),
         );
         assert_eq!(link, HostLink::Discrete { gbps: 7.1 });
+        assert_eq!(
+            inits.get(),
+            1,
+            "the copy path is set up in place of the probe"
+        );
         assert_eq!(
             source.suffix().as_deref(),
             Some("[calibrated 2026-10-18T14:03:22Z]")
@@ -712,6 +765,7 @@ mod tests {
             let (link, source) = resolve_link(
                 false,
                 || lookup,
+                || unreachable!("initialized on the probe path ({suffix})"),
                 || {
                     probes.set(probes.get() + 1);
                     Some(12.5)
@@ -722,7 +776,7 @@ mod tests {
             assert_eq!(probes.get(), 1, "{suffix}");
         }
         // A failed probe is still fail-closed after a fallback.
-        let (link, _) = resolve_link(false, || Lookup::Missing(String::new()), || None);
+        let (link, _) = resolve_link(false, || Lookup::Missing(String::new()), || {}, || None);
         assert_eq!(link, HostLink::Unmeasured);
     }
 
@@ -731,10 +785,41 @@ mod tests {
         let (link, source) = resolve_link(
             true,
             || unreachable!("calibration read on unified memory"),
+            || unreachable!("copy path set up on unified memory"),
             || unreachable!("probed unified memory"),
         );
         assert_eq!(link, HostLink::Unified);
         assert_eq!(source.suffix(), None);
+    }
+
+    /// Hold j1760 (hipx 7900 XTX, Flash-Next mq2-xts): 5115 MiB non-expert
+    /// weights, 12622 MiB charged reserve, 840 MiB per expert layer, 48 trunk
+    /// layers. The calibrated link (the stored 7.12 GB/s) and the probed one
+    /// (7.1 GB/s) resolve the same placement chunk, and with the same free
+    /// VRAM the same resident layer count. Free VRAM is the same because both
+    /// resolutions leave the copy-path state behind (the init in place of the
+    /// probe); before the init, j1760's calibrated arm saw 24522 MiB free and
+    /// kept 8 layers where the probed arm (24376 MiB) kept 7.
+    #[test]
+    fn calibrated_and_probed_links_place_identically_given_the_same_free_vram() {
+        use crate::expert_residency::auto_vram_layers;
+        use crate::gpu_forward::qwen4_prefill_chunk_default;
+        const MIB: u64 = 1 << 20;
+        let calibrated = link_from_calibration(&fresh(false, Some(7.115_572_651_289_664)))
+            .expect("a fresh discrete record states its link");
+        let probed = HostLink::classify(false, Some(7.1));
+        let chunk = |link: HostLink| qwen4_prefill_chunk_default("gfx1100", || link);
+        assert_eq!(chunk(calibrated), 8192);
+        assert_eq!(chunk(calibrated), chunk(probed));
+        let layers = |free_mib: u64| {
+            auto_vram_layers(free_mib * MIB, 5115 * MIB, 840 * MIB, 48, 12622 * MIB)
+        };
+        assert_eq!(
+            layers(24376),
+            7,
+            "both arms after the copy-path state exists"
+        );
+        assert_eq!(layers(24522), 8, "j1760's calibrated arm without the init");
     }
 
     fn route<'a>(choices: &'a [RouteChoice], name: &str) -> &'a RouteChoice {

@@ -1952,89 +1952,114 @@ Redline eligibility helpers `mq4r_redline_default` and `retained_redline_default
 
 `config.toml` can carry one more top-level table, `[calibration]`, that `hipfire calibrate` writes and nothing else does. It records what this host measured (PCIe link, CPU memory read rate, per-GPU offload engine rates) together with the hardware it was measured on, so the engine can skip the equivalent load-time probe. It is **not** a settable key namespace: it has no schema keys, `hipfire config set calibration.*` is rejected as an unknown key, and `hipfire config list|explain` do not show it. The loader skips it like `schema_version`, and every writer of `config.toml` (`hipfire config set` / `reset`, the Settings TUI, profile selection, tuning presets) preserves it untouched. Per-model overlays and profiles never carry it. See [`hipfire calibrate`](CLI.md#hipfire-calibrate) for the command.
 
+This is the record `hipfire calibrate` wrote on hipx (7900 XTX on a PCIe 4.0 x4 link, Strix Halo host; hold j1760). Seven of the nine engine entries are left out here:
+
 ```toml
 [calibration]
+duration_s = 6.4798244480000005
+hipfire_version = "0.4.3 (8cef2bdd47d5; feat/calibrate-043)"
+measured_at = "2026-10-18T00:37:16Z"
 probe_version = 1
-measured_at = "2026-10-18T14:03:22Z"
-hipfire_version = "0.4.3"
-duration_s = 21.4
-[calibration.host]
-cpu_model = "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
-logical_cpus = 32
-physical_cores = 16
-isa = ["avx2", "fma", "f16c", "avx512f", "avx512bw", "avx512vnni"]
-ram_total_bytes = 131072000000
+
 [calibration.cpu_read]
-gbps = 113.5
-threads = 16
 bytes = 4294967296
+gbps = 120.02258219024576
 reps = 3
+threads = 16
+
 [[calibration.devices]]
-pci_bdf = "0000:67:00.0"
 arch = "gfx1100"
-vram_bytes = 25753026560
+pci_bdf = "0000:67:00.0"
+pinned_h2d_gbps = 7.115572651289664
 unified = false
-pinned_h2d_gbps = 7.09
-zero_copy_gbps = 7.1
-[calibration.devices.link]
-gts = 16.0
-width = 4
-current_gts = 16.0
-bottleneck_bdf = "0000:65:00.0"
+vram_bytes = 25753026560
+zero_copy_gbps = 7.167447390604741
+
 [[calibration.devices.engine]]
+cpu_gbps = 102.85508765691702
 format = "mq4g256v2"
-k = 2560
-m = 123
+gpu_gbps = 4.248585554299781
+k = 5120
+m = 74018
 pool = "global"
 reps = 5
-cpu_gbps = 40.1
-gpu_gbps = 6.1
+
+[[calibration.devices.engine]]
+cpu_gbps = 121.58500365366845
+format = "q8_0"
+gpu_gbps = 6.571798732768647
+k = 5120
+m = 37009
+pool = "global"
+reps = 5
+
+[calibration.devices.link]
+bottleneck_bdf = "0000:65:00.0"
+current_gts = 16.0
+gts = 16.0
+width = 4
+
+[calibration.host]
+cpu_model = "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S"
+isa = ["sse4.2", "avx", "avx2", "fma", "f16c", "avx512f", "avx512bw", "avx512vl", "avx512vnni", "avx512bf16", "avxvnni"]
+logical_cpus = 32
+physical_cores = 16
+ram_total_bytes = 131217301504
+
+[[calibration.unmeasured]]
+arch = "gfx1151"
+pci_bdf = "0000:c0:00.0"
+reason = "not visible to HIP in this run, or it failed to open"
 ```
 
-Fields marked **fingerprint** decide whether the record is still valid for this host; the rest are information.
+Fields marked **fingerprint** decide whether the record still describes this host. The other fields are information only.
 
 | Field | Meaning |
 |---|---|
-| `probe_version` | **Fingerprint.** Version of the probe semantics (currently `1`). A different version makes every stored record stale. |
+| `probe_version` | **Fingerprint.** Version of the probe semantics (currently `1`). Any other version makes the whole record stale. |
 | `measured_at` | RFC 3339 UTC time of the run. |
 | `hipfire_version` | Version of the `hipfire` binary that wrote the record. |
 | `duration_s` | Wall time of the whole `hipfire calibrate` run, in seconds. |
-| `host.cpu_model` | **Fingerprint.** CPU model string from `/proc/cpuinfo`. |
-| `host.logical_cpus` | **Fingerprint.** Logical CPU count. |
-| `host.physical_cores` | Physical core count, when detected. |
-| `host.isa` | x86 ISA features detected at run time (for example `avx2`, `fma`, `f16c`, `avx512f`, `avx512bw`, `avx512vnni`). Empty on other architectures. |
-| `host.ram_total_bytes` | **Fingerprint.** Total RAM in bytes; a difference of at most 1 GiB still counts as the same host. |
-| `cpu_read.gbps` | CPU read bandwidth in GB/s, measured on the pinned one-worker-per-physical-core splice pool. |
-| `cpu_read.threads`, `bytes`, `reps` | Workers, buffer bytes and timed passes behind `cpu_read.gbps` (the median pass is reported). |
-| `devices[].pci_bdf` | PCI address of the GPU (lowercase `0000:67:00.0`); identifies which device an entry belongs to. |
+| `host.cpu_model` | **Fingerprint.** CPU model: the `model name` line of `/proc/cpuinfo`, else the CPUID brand string. |
+| `host.logical_cpus` | **Fingerprint.** Logical CPU count (`processor` lines of `/proc/cpuinfo`). |
+| `host.physical_cores` | Physical core count, when cpuinfo reports core ids. |
+| `host.isa` | x86 ISA features detected at run time. Empty on other architectures. |
+| `host.ram_total_bytes` | **Fingerprint.** `MemTotal` in bytes. A drift of up to 1 GiB counts as the same host. |
+| `cpu_read.gbps` | CPU read bandwidth in GB/s (10^9 bytes/s): a parallel streaming sum over `bytes` on the splice pool, one pinned worker per physical core, median of `reps` timed passes. |
+| `cpu_read.threads`, `bytes`, `reps` | Workers, buffer bytes (a quarter of `MemAvailable`, at most 4 GiB, at least 256 MiB) and timed passes. |
+| `devices[].pci_bdf` | PCI address of the GPU (lowercase `0000:67:00.0`). It is the key that matches an entry to a device. |
 | `devices[].arch` | **Fingerprint.** GPU architecture (`gfx…`). |
 | `devices[].vram_bytes` | **Fingerprint.** Total VRAM in bytes: sysfs `mem_info_vram_total` when readable, else the HIP total. Compared exactly. |
-| `devices[].unified` | `true` for a unified-memory GPU (APU) that shares host RAM. |
-| `devices[].link.gts` | **Fingerprint.** Lowest `max_link_speed` (GT/s) over every PCI device on the sysfs path from the root port to the GPU. |
-| `devices[].link.width` | **Fingerprint.** Lowest `current_link_width` over that path. |
-| `devices[].link.current_gts` | Lowest `current_link_speed` over the path (power management can lower it); information only. |
-| `devices[].link.bottleneck_bdf` | The path device with the narrowest current width (first such, root side first). |
-| `devices[].pinned_h2d_gbps` | Host-to-device copy rate from pinned memory, GB/s. This is the rate the host-link selectors read. |
-| `devices[].zero_copy_gbps` | Rate of a GPU kernel reading host-mapped memory over the link, GB/s. |
-| `devices[].engine[]` | One offload-split two-engine probe: `format` (lowercase dtype), `k`, `m`, `pool` (`global` rayon pool or `splice` pinned physical-core pool), `reps`, and the measured `cpu_gbps` and `gpu_gbps`. |
+| `devices[].unified` | `true` for a unified-memory GPU (APU). No link probe runs on one. |
+| `devices[].link.gts` | **Fingerprint.** Lowest `max_link_speed` (GT/s) over every PCI device on the sysfs path from the root port to the GPU. It is the capability, so power management cannot flap it. |
+| `devices[].link.width` | **Fingerprint.** Lowest `current_link_width` over that path. A card behind an internal switch reports x16 at its own function, while the slot link above it may be x4. |
+| `devices[].link.current_gts` | Lowest `current_link_speed` over the path. Power management lowers it at idle (an R9700 reads 2.5 GT/s idle on a 32 GT/s link), so it is information only. |
+| `devices[].link.bottleneck_bdf` | The downstream device of the narrowest link. |
+| `devices[].pinned_h2d_gbps` | Pinned host-to-device copy rate in GB/s: the qwen4 host-link probe itself. It is the figure the host-link selectors read. |
+| `devices[].zero_copy_gbps` | Rate at which a GPU kernel reads host-mapped memory over the link, in GB/s. Information only. |
+| `devices[].engine[]` | One `offload_split` two-engine probe per CPU-decodable dense format of the `hipfire offload-bench` matrix: `format`, `k`, `m` (rows of a 192 MiB weight), `pool` (`global` rayon pool), `reps`, and the median `cpu_gbps` / `gpu_gbps` (CPU GEMV against GPU GEMV over the same host-mapped bytes). |
+| `unmeasured[]` | GPUs the kernel listed that this run could not measure: not visible to HIP (for example under `HIPFIRE_DEVICES`), or they failed to open. `pci_bdf`, `arch` and `reason` are recorded. |
 
-**Staleness.** The engine reads a record only while it still describes the host. It is stale (and the engine measures at load exactly as it does without a record) when any of these differ from the live host:
+**Staleness.** The engine uses a record only while it still describes the host. Otherwise it measures at load exactly as it does without a record. A record is stale when any of these differ from the live host, checked in this order:
 
-- `probe_version` (checked first), then the CPU model or logical CPU count, then total RAM by more than 1 GiB;
-- for the device being loaded: GPU `arch`, total VRAM, or the PCIe bottleneck, meaning `link.gts` (to 0.01 GT/s) or `link.width`.
+- `probe_version`;
+- the CPU model or the logical CPU count;
+- total RAM, by more than 1 GiB;
+- for the device being loaded: `arch`, total VRAM, `link.gts` (to 0.01 GT/s) or `link.width`.
 
-A device with no entry in the record (a GPU added later) is also measured as before. `hipfire calibrate --show` prints the reason for each stale or missing entry, and `hipfire calibrate --check` exits non-zero until a fresh record covers every detected GPU. A load never rewrites the record; only `hipfire calibrate` does.
+A device with no entry is also measured at load. That covers a GPU added later and one listed under `unmeasured`. `hipfire calibrate --show` prints the reason for each stale or missing entry. `hipfire calibrate --check` exits 1 until the record is fresh for every detected GPU; a GPU listed as unmeasured with the same address and architecture counts as covered, because a re-run could not measure it either. A model load never rewrites the record; only `hipfire calibrate` does.
 
-**Selectors that read it.** At model load, the Qwen4 (Flash-Next) host-link measurement uses a fresh `devices[].pinned_h2d_gbps` in place of its load-time copy probe, and the load log names the source (`[calibrated <measured_at>]`, `[measured; calibration stale: <reason>]` or `[measured; <reason>]`). The link class then drives the same decisions as a measured one:
+**Selectors that read it.** At a qwen4 (Flash-Next) model load on a discrete GPU, the host-link class takes a fresh `devices[].pinned_h2d_gbps` in place of its load-time copy probe. The load log names the source: `[calibrated <measured_at>]`, `[measured; calibration stale: <reason>]` or `[measured; <reason>]`. The link class drives the same decisions as a measured one:
 
-- the G2 expert-staging default (DMA staging through borrowed VRAM on a narrow discrete link, below 16 GB/s);
-- the gfx1100 8192-row prefill chunk default on a narrow discrete link;
-- the stage minimum rows (768);
-- the S1 link verdict.
+- the G2 long-prefill expert-staging default on a narrow discrete link (below 16 GB/s);
+- the 8192-row prefill chunk default that gfx1100 takes on a narrow discrete link, which also sizes the expert placement reserve;
+- the 768-row stage minimum on a narrow link.
 
-Explicit overrides still win over a calibrated value: `HIPFIRE_QWEN4_EXPERT_STAGE`, `HIPFIRE_PREFILL_CHUNK_ROWS` and `HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS`, and the settings behind them, are applied exactly as without a record. A unified-memory GPU is classified from the live device and never reads the record's link rate. `hipfire calibrate --show` lists these routes and why each was chosen for the current record.
+A calibrated load still runs the probe's copy sequence once, with a 4 KiB copy and no timing. The HIP runtime keeps about 146 MiB of VRAM for its first pinned copy on a new stream, and the expert placement reads free VRAM right after the link is resolved. So a calibrated load and a probed load see the same free VRAM and place the same expert layers.
 
-**Removing it.** `hipfire calibrate --clear` deletes the `[calibration]` table and leaves every other key alone; the engine then measures at load again.
+The developer overrides `HIPFIRE_QWEN4_EXPERT_STAGE`, `HIPFIRE_PREFILL_CHUNK_ROWS` and `HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS` still win over a calibrated link, exactly as over a measured one. A unified-memory GPU is classified from the live device and never reads the record. `hipfire calibrate --show` lists these routes and the reason for each.
+
+**Removing it.** `hipfire calibrate --clear` deletes the `[calibration]` table and leaves every other key alone. The engine then measures at load again.
 
 ---
 
