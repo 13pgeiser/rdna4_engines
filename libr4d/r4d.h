@@ -382,11 +382,13 @@ void r4d_ar_wide_dims(int* max_blocks, int* nb_design, int* max_peers);
 // count allows (the first n16 % ws take one more word), so the message need not divide by the
 // rank count. At 8 ranks `shard_weights` (8 ints, or null for the even split) sizes the shards per
 // rank instead (r4d_ar_shards.h); every rank must pass the same weights. Regions A and B sit at 0
-// and the longest shard, so the slot stride must hold twice that. Above the bound below the
-// caller falls back to the one-shot; it only guards the kernel's int word offsets (2^28 elements
-// is 2^26 words at fp32). A lower bound would send large prefill chunks (e.g. 8192 tokens at
-// Gemma 4's 2816 width, 23M-46M elements) to the one-shot.
-enum { R4D_AR_TWOSHOT_WIDE_MAX_ELEMS = 268435456 };
+// and the longest shard, so the slot stride must hold twice that. `pieces` (8 ranks, 1 to
+// R4D_AR_TS_MAX_PIECES, the same on every rank) pipelines each block's words in that many runs so
+// phase 1 of one run and phase 2 of the previous share the link; 1 is the unpipelined kernel.
+// Above the bound below the caller falls back to the one-shot; it only guards the kernel's int
+// word offsets (2^28 elements is 2^26 words at fp32). A lower bound would send large prefill
+// chunks (e.g. 8192 tokens at Gemma 4's 2816 width, 23M-46M elements) to the one-shot.
+enum { R4D_AR_TWOSHOT_WIDE_MAX_ELEMS = 268435456, R4D_AR_TS_MAX_PIECES = 16 };
 void r4d_ar_twoshot_3rank_exact(long peer_scratch0, long peer_scratch1, long peer_flags0,
                                 long peer_flags1, long my_scratch, long my_flags, long seq_ctrs,
                                 long slot_stride16, long inp, long out, long n_elem, long dtype,
@@ -406,7 +408,7 @@ void r4d_ar_twoshot_8rank_exact(long peer_scratch0, long peer_scratch1, long pee
                                 long my_flags, long seq_ctrs, long slot_stride16, long inp,
                                 long out, long n_elem, long dtype, long rank, long stream,
                                 long nblocks, long nthreads, long drain, long acq, long pub,
-                                const int* shard_weights);
+                                const int* shard_weights, long pieces);
 // The tiered int8 wire on both two-shot hops (r4d_ar_twoshot_Nrank_ti8.hip; codec in
 // r4d_ar_ti8.h), 3 or 4 ranks. Int8 groups of 32 with an fp16 scale and a per-group record
 // (T1 plain, T2 top-1-exact, T3 wht32), 38 bytes/group; tiering is deterministic and

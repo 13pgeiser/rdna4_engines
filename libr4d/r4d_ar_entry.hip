@@ -34,6 +34,8 @@
 static_assert(R4D_AR_TWOSHOT_WIDE_MAX_ELEMS == 268435456,
               "r4d_rows.cpp restates this bound; libr4d changed it");
 static_assert(R4D_MAX_RANKS == 8, "the 8-rank entry point names exactly seven peers");
+static_assert((long long)R4D_AR8_MIN_ELEMS_MAX == (long long)R4D_AR_TWOSHOT_WIDE_MAX_ELEMS,
+              "r4d_ar_shards.h restates the two-shot band's top");
 
 /* ------------------------------------------------------------------ throw conversion
  *
@@ -70,6 +72,9 @@ struct Rendezvous {
     long seq    [R4D_MAX_RANKS] = { 0 };
     int  dev    [R4D_MAX_RANKS] = { 0 };
     int  shard_w[R4D_MAX_RANKS][R4D_MAX_RANKS] = { { 0 } };
+    int  pieces [R4D_MAX_RANKS] = { 0 };
+    long long weights_min[R4D_MAX_RANKS] = { 0 };
+    long long pieces_min [R4D_MAX_RANKS] = { 0 };
     int  failed = 0;
 };
 
@@ -117,6 +122,12 @@ struct ArInst {
      * scratch was sized for them and a recorded launch keeps its table. */
     int  shard_weighted = 0;
     int  shard_w[R4D_MAX_RANKS] = { 0 };
+    /* Its piece count (RADIANCE_AR8_PIECES), 0 for the size rule (r4d_ar8_auto_pieces); a launch's
+     * `pieces` parameter overrides it. */
+    int  pieces = 0;
+    /* Messages under these sizes (elements) run even and in one piece, whatever is configured. */
+    long long weights_min = R4D_AR8_MIN_ELEMS_DEFAULT;
+    long long pieces_min  = R4D_AR8_MIN_ELEMS_DEFAULT;
 };
 
 /* A parameter that may be declared as a range: init gets one band's frozen geometry, and buffers
@@ -156,6 +167,49 @@ bool ar8_shard_weights(int* w) {
     return true;
 }
 
+/* RADIANCE_AR8_PIECES and the two size floors, read like the weights. */
+int ar8_pieces() {
+    const char* e = std::getenv(R4D_AR8_PIECES_ENV);
+    if (!e || !*e) return 0;
+    long long v = 0;
+    if (!r4d_ar_parse_count(e, R4D_AR_TS_MAX_PIECES, &v) || v < 1) {
+        static std::once_flag said;
+        std::call_once(said, [e] {
+            std::fprintf(stderr, "[r4d] %s=\"%s\" ignored (needs 1..%d); the eight-rank "
+                         "two-shot takes its piece count from the message size\n",
+                         R4D_AR8_PIECES_ENV, e, (int)R4D_AR_TS_MAX_PIECES);
+        });
+        return 0;
+    }
+    return (int)v;
+}
+
+long long ar8_min_elems(const char* name, std::once_flag* said) {
+    const char* e = std::getenv(name);
+    if (!e || !*e) return R4D_AR8_MIN_ELEMS_DEFAULT;
+    long long v = 0;
+    if (!r4d_ar_parse_count(e, R4D_AR8_MIN_ELEMS_MAX, &v)) {
+        std::call_once(*said, [name, e] {
+            std::fprintf(stderr, "[r4d] %s=\"%s\" ignored (needs 0..%d elements); using %d\n",
+                         name, e, (int)R4D_AR8_MIN_ELEMS_MAX,
+                         (int)R4D_AR8_MIN_ELEMS_DEFAULT);
+        });
+        return R4D_AR8_MIN_ELEMS_DEFAULT;
+    }
+    return v;
+}
+
+/* The eight-rank two-shot's choice for one message, a function of its size and the instance
+ * alone: a recorded launch keeps the table and piece count it was recorded with, and replays of
+ * the same size agree with it. */
+const int* ar8_weights_for(const ArInst* in, long numel) {
+    return in->shard_weighted && numel >= in->weights_min ? in->shard_w : nullptr;
+}
+long long ar8_pieces_for(const ArInst* in, long numel, long long asked) {
+    if (numel < in->pieces_min) return 1;
+    return asked > 0 ? asked : r4d_ar8_auto_pieces(numel);
+}
+
 /* Sequence counter allocation in words: 2 * nbw (r4d_ar_seq.h), then r4d_ar_link_landed's block
  * counter, padded to a cache line. */
 long kSeqWords(long nbw) { return 2L * nbw + 32; }
@@ -184,11 +238,18 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
     in->max_numel = (long)max_numel;
     in->slot_bytes = align16((long)max_numel * in->esize);
     in->slot16 = in->slot_bytes / 16;
+    if (world == 8) {
+        static std::once_flag said_w, said_p;
+        in->pieces = ar8_pieces();
+        in->weights_min = ar8_min_elems(R4D_AR8_SHARD_WEIGHTS_MIN_ENV, &said_w);
+        in->pieces_min = ar8_min_elems(R4D_AR8_PIECES_MIN_ENV, &said_p);
+    }
     if (world == 8 && ar8_shard_weights(in->shard_w)) {
         in->shard_weighted = 1;
         const long need16 =
             2 * r4d_ar_shard_max_bound((long)max_numel * in->esize / 16, 8, in->shard_w);
-        if (need16 > in->slot16) {
+        /* Sized only if some message this instance carries is weighted. */
+        if (max_numel >= in->weights_min && need16 > in->slot16) {
             in->slot16 = need16;
             in->slot_bytes = need16 * 16;
         }
@@ -265,16 +326,24 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
         g_rv.dev[rank]     = dev;
         for (int i = 0; i < R4D_MAX_RANKS; ++i)
             g_rv.shard_w[rank][i] = in->shard_weighted ? in->shard_w[i] : -1;
+        g_rv.pieces[rank] = in->pieces;
+        g_rv.weights_min[rank] = in->weights_min;
+        g_rv.pieces_min[rank] = in->pieces_min;
     }
     int rc = rv_barrier(world);
     if (rc != RAD_OK) return rc;
 
     /* Every rank must cut the message at the same words, or an owner reduces words its peers
-     * pushed elsewhere. All ranks compare the same table, so all refuse together. */
+     * pushed elsewhere, and take the same handshake steps, or the flags drift apart. All ranks
+     * compare the same values, so all refuse together. */
     for (int r = 0; r < world; ++r)
-        if (std::memcmp(g_rv.shard_w[r], g_rv.shard_w[rank], sizeof(g_rv.shard_w[rank]))) {
-            std::fprintf(stderr, "[r4d] ranks %d and %d read different %s\n", rank, r,
-                         R4D_AR8_SHARD_WEIGHTS_ENV);
+        if (std::memcmp(g_rv.shard_w[r], g_rv.shard_w[rank], sizeof(g_rv.shard_w[rank])) ||
+            g_rv.pieces[r] != g_rv.pieces[rank] ||
+            g_rv.weights_min[r] != g_rv.weights_min[rank] ||
+            g_rv.pieces_min[r] != g_rv.pieces_min[rank]) {
+            std::fprintf(stderr, "[r4d] ranks %d and %d read different eight-rank two-shot "
+                         "settings (%s, %s and their _MIN_ELEMS)\n", rank, r,
+                         R4D_AR8_SHARD_WEIGHTS_ENV, R4D_AR8_PIECES_ENV);
             return RAD_E_STATE;
         }
 
@@ -546,7 +615,7 @@ static int ar_setup(const RadArgs* a, ArCall* c, int shard_nb) {
 
     const long words16 = (long)n * in->esize / 16;
     long basis = shard_nb ? words16 / in->world : words16;
-    if (shard_nb && in->shard_weighted) {
+    if (shard_nb && ar8_weights_for(in, n)) {
         long off[R4D_MAX_RANKS + 1];
         basis = r4d_ar_shard_table(words16, in->world, in->shard_w, off);
     }
@@ -898,13 +967,17 @@ extern "C" int r4d_rad_ar_twoshot_8rank_exact(const RadArgs* a, RadStream s) {
     if (c.in->world != 8) return RAD_E_SHAPE;
     if (c.numel > R4D_AR_TWOSHOT_WIDE_MAX_ELEMS) return RAD_E_SHAPE;
     const ArInst* in = c.in;
-    const int* weights = in->shard_weighted ? in->shard_w : nullptr;
+    const int* weights = ar8_weights_for(in, c.numel);
     /* Even shards keep the four-rank rule (whole words a rank); weighted ones are uneven anyway. */
     const long words16 = c.numel * in->esize / 16;
     if (!weights && words16 % in->world) return RAD_E_SHAPE;
     long off[R4D_MAX_RANKS + 1];
     const long sh_max = r4d_ar_shard_table(words16, in->world, weights, off);
     if (2 * sh_max * 16 > in->slot_bytes) return RAD_E_SCRATCH;
+    /* Pieces only move the handshakes; the regions stay at 0 and sh_max, so scratch is as above. */
+    const long long asked = r4d_pgeti_or(a->p, a->n_p, "pieces", in->pieces);
+    if (asked < 0 || asked > R4D_AR_TS_MAX_PIECES) return RAD_E_INVAL;
+    const long long pieces = ar8_pieces_for(in, c.numel, asked);
     R4D_TRY("ar_twoshot_8rank_exact",
         r4d_ar_twoshot_8rank_exact(in->peer_scratch[0], in->peer_scratch[1], in->peer_scratch[2],
                                    in->peer_scratch[3], in->peer_scratch[4], in->peer_scratch[5],
@@ -915,7 +988,7 @@ extern "C" int r4d_rad_ar_twoshot_8rank_exact(const RadArgs* a, RadStream s) {
                                    in->my_scratch, in->my_flags, in->my_seq, in->slot16,
                                    c.inp, c.out, c.numel, in->dtype, in->rank,
                                    (long)(uintptr_t)s, c.nblocks, c.nthreads, c.drain, c.acq,
-                                   c.pub, weights));
+                                   c.pub, weights, (long)pieces));
     return RAD_OK;
 }
 

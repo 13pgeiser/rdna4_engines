@@ -1,7 +1,8 @@
 #pragma once
 // r4d_ar_wide.h: shared transport of the wide (ws>2) all-reduce family. Every wide kernel
 // (one-shot exact, two-shot exact, two-shot ti8) publishes in the 2*seq flag space (the two-shots
-// add the 2s-1 half-step), advances seq_ctrs[b] once per AR, and lays scratch out as 2*ws slots of
+// add the 2s-1 half-step), advances seq_ctrs[b] once per AR (a two-shot in pieces by its piece
+// count, reserving the extra flag values it publishes), and lays scratch out as 2*ws slots of
 // one stride (parity x source rank). The parity is the launch's, from the parity counters in
 // r4d_ar_seq.h, so seq_ctrs is 2 * R4D_AR_WIDE_MAX_BLOCKS words. The constants sizing the shared
 // flag/seq/scratch set are defined only here so they cannot drift apart.

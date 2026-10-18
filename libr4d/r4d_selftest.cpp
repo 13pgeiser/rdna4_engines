@@ -16179,6 +16179,7 @@ struct ArPattern {
     const char* dtype = nullptr;       /* "bf16" or "fp32" */
     std::vector<int64_t> sizes;
     int out_of_place = -1;             /* index into sizes, or -1 */
+    std::vector<int> pieces;           /* per size: a launch `pieces` parameter, 0 or absent none */
     void* inst = nullptr;
     int rc_init = RAD_E_STATE, rc_launch = RAD_OK;
     std::vector<std::vector<float>> out;
@@ -16221,7 +16222,9 @@ static void ar_pattern_worker(ArPattern* t) {
         RadArgs a;
         std::memset(&a, 0, sizeof(a));
         a.t = ts; a.n_t = oop ? 2 : 1;
-        a.p = ps.data(); a.n_p = (int)ps.size();
+        std::vector<RadParam> lp = ps;
+        if (k < t->pieces.size() && t->pieces[k] > 0) lp.push_back(PI("pieces", t->pieces[k]));
+        a.p = lp.data(); a.n_p = (int)lp.size();
         a.instance = t->inst;
         a.rank = t->rank;
         a.world_size = t->world;
@@ -16257,7 +16260,10 @@ struct ScopedEnv {
     ScopedEnv& operator=(const ScopedEnv&) = delete;
 };
 
-struct ArPatternRun { const char* dtype; std::vector<int64_t> sizes; int oop; };
+struct ArPatternRun {
+    const char* dtype; std::vector<int64_t> sizes; int oop;
+    std::vector<int> pieces = {};      /* per size, as ArPattern::pieces */
+};
 
 /* One run on a fresh instance per rank, every size checked against the fold. False when init
  * failed, so the caller stops instead of reporting every later run as failed too. */
@@ -16270,6 +16276,7 @@ static bool ar_pattern_check(const RadKernelInfo* row, const std::vector<int>& d
         t[(size_t)r].world = world;
         t[(size_t)r].dtype = run.dtype; t[(size_t)r].sizes = run.sizes;
         t[(size_t)r].out_of_place = run.oop;
+        t[(size_t)r].pieces = run.pieces;
         th.emplace_back(ar_pattern_worker, &t[(size_t)r]);
     }
     for (std::thread& x : th) x.join();
@@ -16307,6 +16314,8 @@ static bool ar_pattern_check(const RadKernelInfo* row, const std::vector<int>& d
                 " words, % " + std::to_string(world) + " = " +
                 std::to_string(words % world) +
                 ((int)k == run.oop ? ", out of place" : ", in place") +
+                (k < run.pieces.size() && run.pieces[k] > 0
+                     ? ", pieces " + std::to_string(run.pieces[k]) : std::string()) +
                 ") == fp32 ascending-rank fold on every rank, bit for bit";
             ok(label.c_str(), bad == 0,
                std::to_string(bad) + " elements wrong, first at " + std::to_string(first));
@@ -16392,32 +16401,112 @@ static void ar_wide_pattern(const Plugin& pl, const std::vector<int>& devs, cons
     }
 }
 
-/* The eight-rank two-shot with per-rank shard weights (RADIANCE_AR8_SHARD_WEIGHTS): shards of
- * unequal length, empty ones (weight 0: the rank only pushes, gathers and handshakes), a single
- * owner (its two regions outgrow a message, so init must grow the slot), and messages shorter than
- * one word a rank, which the even split refuses. The fold is the same whoever owns a word, so the
- * oracle is unchanged. */
+/* The eight-rank two-shot with per-rank shard weights (RADIANCE_AR8_SHARD_WEIGHTS) and in
+ * pieces (RADIANCE_AR8_PIECES): shards of unequal length, empty ones (weight 0: the rank only
+ * pushes, gathers and handshakes), a single owner (its two regions outgrow a message, so init
+ * must grow the slot), and messages shorter than one word a rank, which the even split refuses --
+ * each at one, two and four pieces. Messages of a few words have fewer words a block than pieces,
+ * so the launcher's clamp is crossed too. A last run changes the piece count from launch to
+ * launch on one instance: a launch reserves one handshake step a piece, so a wrong reservation
+ * leaves a peer waiting on a flag value it already passed or running ahead into a slot still
+ * being read. These runs drop both size floors to 0 so small messages are weighted and pieced
+ * too; the last runs check the floors themselves. The fold is the same whoever owns a word, so
+ * the oracle is unchanged. */
 static void ar_wide_weighted(const Plugin& pl, const std::vector<int>& devs, const char* name) {
     constexpr int W = 8;
     const RadKernelInfo* row = find(pl, name);
     if (!row) { ok(name, false, "row absent"); return; }
     if ((int)devs.size() < W) { skip(name, "needs 8 gfx1201 cards"); return; }
-    /* bf16: 72 elements are 9 words, 8 are one; 8256 is 1032 words, 4196352 is 524544. */
-    const std::vector<ArPatternRun> runs = {
+    /* bf16: 72 elements are 9 words, 8 are one; 8256 is 1032 words, 4196352 is 524544. Without
+     * weights the words must divide by eight. */
+    const std::vector<ArPatternRun> uneven = {
         { "bf16", { 4194304, 72, 8, 128, 8256, 4196352, 4194304 }, 1 },
         { "fp32", { 36, 1048580 }, 0 },
     };
-    for (const char* w : { "0,3,1,0,5,1,2,4", "1,0,0,0,0,0,0,0", "4,1,0,4,0,1,4,4" }) {
-        ScopedEnv env(R4D_AR8_SHARD_WEIGHTS_ENV, w);
-        for (const ArPatternRun& run : runs)
-            if (!ar_pattern_check(row, devs, std::string(name) + " weights " + w, W, run)) return;
+    const std::vector<ArPatternRun> even = {
+        { "bf16", { 4194304, 128, 8256, 4196352, 4194304 }, 1 },
+        { "fp32", { 8256, 1048576 }, 0 },
+    };
+    {
+        ScopedEnv floor_w(R4D_AR8_SHARD_WEIGHTS_MIN_ENV, "0"), floor_k(R4D_AR8_PIECES_MIN_ENV, "0");
+        for (const char* k : { "1", "2", "4" }) {
+            ScopedEnv env_k(R4D_AR8_PIECES_ENV, k);
+            for (const char* w : { "", "0,3,1,0,5,1,2,4", "1,0,0,0,0,0,0,0", "4,1,0,4,0,1,4,4" }) {
+                ScopedEnv env_w(R4D_AR8_SHARD_WEIGHTS_ENV, *w ? w : nullptr);
+                const std::string label =
+                    std::string(name) + " pieces " + k +
+                    (*w ? std::string(" weights ") + w : std::string(" even"));
+                for (const ArPatternRun& run : *w ? uneven : even)
+                    if (!ar_pattern_check(row, devs, label, W, run)) return;
+            }
+        }
+        {
+            ScopedEnv env_k(R4D_AR8_PIECES_ENV, nullptr);
+            ScopedEnv env_w(R4D_AR8_SHARD_WEIGHTS_ENV, "4,1,0,4,0,1,4,4");
+            const ArPatternRun mixed = {
+                "bf16", { 4194304, 4194304, 8256, 4196352, 72, 4194304, 4194304 }, 3,
+                { 1, 4, 2, 8, 16, 3, 1 } };
+            ar_pattern_check(row, devs,
+                             std::string(name) + " weights 4,1,0,4,0,1,4,4, pieces per launch", W,
+                             mixed);
+        }
+    }
+    /* The floors at their defaults (R4D_AR8_MIN_ELEMS_DEFAULT elements) with weights, first at the
+     * size rule's piece counts (131072 runs one piece, 262144 two, 1048576 four, 4194304 eight),
+     * then at four pieces set. Which side of the weight floor a message fell on shows in what the
+     * entry accepts: 1048584 elements are 131073 words, over the floor and not divisible by eight,
+     * so only a weighted split serves it; 72 (9 words) is under it, so the even rule refuses it,
+     * unless the floor is lowered under it. The piece floor and rule change no bits and no rc;
+     * the sizes on both sides are checked for bits. */
+    ScopedEnv env_w(R4D_AR8_SHARD_WEIGHTS_ENV, "4,1,0,4,0,1,4,4");
+    ScopedEnv floor_k(R4D_AR8_PIECES_MIN_ENV, nullptr);
+    {
+        ScopedEnv env_k(R4D_AR8_PIECES_ENV, nullptr);
+        ScopedEnv floor_w(R4D_AR8_SHARD_WEIGHTS_MIN_ENV, nullptr);
+        const ArPatternRun rule = {
+            "bf16", { 131072, 262144, 1048576, 4194304, 8256, 4196352 }, 1 };
+        if (!ar_pattern_check(row, devs, std::string(name) + " weights 4,1,0,4,0,1,4,4, size rule",
+                              W, rule))
+            return;
+    }
+    ScopedEnv env_k(R4D_AR8_PIECES_ENV, "4");
+    for (const char* fw : { (const char*)nullptr, "64" }) {
+        ScopedEnv floor_w(R4D_AR8_SHARD_WEIGHTS_MIN_ENV, fw);
+        const std::string at = std::string(name) + " weights 4,1,0,4,0,1,4,4, pieces 4, floor " +
+                               (fw ? fw : "default");
+        if (!fw) {
+            const ArPatternRun sides = { "bf16", { 1048584, 131072, 524288, 4194304, 8256 }, 0 };
+            if (!ar_pattern_check(row, devs, at, W, sides)) return;
+        }
+        std::vector<ArPattern> t((size_t)W);
+        std::vector<std::thread> th;
+        for (int r = 0; r < W; ++r) {
+            t[(size_t)r].row = row; t[(size_t)r].rank = r; t[(size_t)r].dev = devs[(size_t)r];
+            t[(size_t)r].world = W; t[(size_t)r].dtype = "bf16";
+            t[(size_t)r].sizes = { 524288, 72 }; t[(size_t)r].out_of_place = 1;
+            th.emplace_back(ar_pattern_worker, &t[(size_t)r]);
+        }
+        for (std::thread& x : th) x.join();
+        const int want = fw ? RAD_OK : RAD_E_SHAPE;
+        int as_wanted = 0;
+        for (const ArPattern& x : t) {
+            if (x.rc_init == RAD_OK && x.rc_launch == want) ++as_wanted;
+            if (x.inst) row->fini(x.inst);
+        }
+        ok((at + (fw ? ": a 9-word message (over the floor) is served"
+                     : ": a 9-word message (under the floor) is refused, RAD_E_SHAPE")).c_str(),
+           as_wanted == W,
+           std::to_string(as_wanted) + " of 8 ranks as expected, rc " +
+               std::to_string(t[0].rc_launch));
     }
 }
 
 /* The eight-rank exact all-reduce timed, one thread per card as the engine runs it: both rows
- * (one-shot, two-shot) at every message size given, each at the block rule and at fixed block
- * counts, out of place on the per-element pattern and checked bit for bit against the fp32
- * ascending-rank fold on every rank.
+ * (one-shot; two-shot without a `pieces` parameter -- RADIANCE_AR8_PIECES or the size rule --
+ * and at 1, 2, 4 and 8 pieces, K1 the unpipelined kernel; under the piece floor every row runs
+ * K1, and the launcher clamps K to the words a block holds) at every message size given, each at
+ * the block rule and at fixed block counts, out of place on the per-element pattern and checked
+ * bit for bit against the fp32 ascending-rank fold on every rank.
  *
  * Warm, every rank launches `iters` times back to back after as many warm-up launches, and the
  * period is the span over iters (the handshake keeps ranks in lockstep after the first). Cold
@@ -16447,6 +16536,7 @@ struct Ar8Perf {
     const char* dtype = "bf16";
     std::vector<int64_t> sizes;
     std::vector<const RadKernelInfo*> rows;
+    std::vector<int> ks;               /* per row: the `pieces` parameter, 0 or -1 none */
     std::vector<int> nbs;
     StBarrier* bar = nullptr;
     int rc_init = RAD_OK;
@@ -16508,6 +16598,7 @@ static void ar8_perf_worker(Ar8Perf* t) {
             for (int nb : t->nbs) {
                 std::vector<RadParam> ps = ip;
                 if (nb > 0) ps.push_back(PI("nblocks", nb));
+                if (t->ks[j] > 0) ps.push_back(PI("pieces", t->ks[j]));
                 RadTensor ts[2] = { T(in, dt, { n }), T(out, dt, { n }) };
                 RadArgs a;
                 std::memset(&a, 0, sizeof(a));
@@ -16610,10 +16701,16 @@ static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dty
     if ((int)devs.size() < W) { std::printf("--perfar8: needs 8 gfx1201 cards, found %zu\n",
                                              devs.size()); return; }
     std::vector<const RadKernelInfo*> rows;
+    std::vector<int> ks;
+    /* The two-shot once a piece count; its instances share one key, so they are one buffer set. */
     for (const char* name : { "ar_oneshot_8rank_exact", "ar_twoshot_8rank_exact" }) {
         const RadKernelInfo* r = find(pl, name);
         if (!r) { std::printf("--perfar8: row %s absent\n", name); return; }
-        rows.push_back(r);
+        const bool two = !std::strcmp(name, "ar_twoshot_8rank_exact");
+        for (int k : two ? std::vector<int>{ -1, 1, 2, 4, 8 } : std::vector<int>{ 0 }) {
+            rows.push_back(r);
+            ks.push_back(k);
+        }
     }
     const std::vector<int> nbs = { 0, 4, 8, 16, 32, 64 };
     std::printf("eight-rank exact all-reduce, %s, %d launches a point, %s\n", dtype, iters,
@@ -16631,13 +16728,33 @@ static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dty
                 : wenv && *wenv ? fmt("even (%s=\"%s\" is invalid)", R4D_AR8_SHARD_WEIGHTS_ENV,
                                       wenv).c_str()
                                 : "even");
+    /* The floors as the plugin reads them; under them a message runs even and in one piece, the
+     * `pieces` parameter included. */
+    auto floor_of = [](const char* name) {
+        long long v = R4D_AR8_MIN_ELEMS_DEFAULT;
+        const char* e = std::getenv(name);
+        if (e && *e && !r4d_ar_parse_count(e, R4D_AR8_MIN_ELEMS_MAX, &v))
+            v = R4D_AR8_MIN_ELEMS_DEFAULT;
+        return (int64_t)v;
+    };
+    const int64_t wmin = floor_of(R4D_AR8_SHARD_WEIGHTS_MIN_ENV);
+    const int64_t kmin = floor_of(R4D_AR8_PIECES_MIN_ENV);
+    std::printf("two-shot floors: weights from %lld elements (%s), pieces from %lld (%s)\n",
+                (long long)wmin, R4D_AR8_SHARD_WEIGHTS_MIN_ENV, (long long)kmin,
+                R4D_AR8_PIECES_MIN_ENV);
+    long long kenv = 0;
+    const char* kenv_s = std::getenv(R4D_AR8_PIECES_ENV);
+    if (!kenv_s || !*kenv_s || !r4d_ar_parse_count(kenv_s, 16, &kenv) || kenv < 1) kenv = 0;
+    std::printf("two-shot pieces without a parameter (row \"two-shot set\"): %s\n",
+                kenv ? fmt("%lld (%s)", kenv, R4D_AR8_PIECES_ENV).c_str()
+                     : "from the message size (1 / 2 / 4 / 8 from 0 / 262144 / 1048576 / 4194304)");
     StBarrier bar(W);
     std::vector<Ar8Perf> t((size_t)W);
     std::vector<std::thread> th;
     for (int r = 0; r < W; ++r) {
         Ar8Perf& x = t[(size_t)r];
         x.rank = r; x.dev = devs[(size_t)r]; x.iters = iters; x.dtype = dtype;
-        x.sizes = sizes; x.rows = rows; x.nbs = nbs; x.bar = &bar;
+        x.sizes = sizes; x.rows = rows; x.ks = ks; x.nbs = nbs; x.bar = &bar;
         th.emplace_back(ar8_perf_worker, &x);
     }
     for (std::thread& x : th) x.join();
@@ -16658,25 +16775,33 @@ static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dty
         std::printf("  numel %lld (%.0f KiB, %lld 16-byte words)\n", (long long)n, bytes / 1024.0,
                     (long long)n16);
         long off[W + 1];
-        const int64_t sh_max = r4d_ar_shard_table((long)n16, W, weighted ? wts : nullptr, off);
+        const bool wtd = weighted && n >= wmin;
+        const int64_t sh_max = r4d_ar_shard_table((long)n16, W, wtd ? wts : nullptr, off);
         std::string shards;
         for (int r = 0; r < W; ++r) shards += fmt(" %ld", off[r + 1] - off[r]);
         std::printf("    two-shot shard words by rank:%s\n", shards.c_str());
         for (size_t j = 0; j < rows.size(); ++j) {
-            const bool two = j == 1;
+            const bool two = ks[j] != 0;
+            /* The piece count the shim runs (before the launcher's words-a-block clamp). */
+            const int keff = n < kmin ? 1 : ks[j] > 0 ? ks[j]
+                                          : kenv ? (int)kenv : r4d_ar8_auto_pieces(n);
+            const std::string rname = !two ? std::string("one-shot")
+                                    : ks[j] < 0 ? fmt("two-shot set K%d", keff)
+                                    : keff != ks[j] ? fmt("two-shot K%d>%d", ks[j], keff)
+                                                    : fmt("two-shot K%d", ks[j]);
             const double sent = two ? 2.0 * (W - 1) / W * bytes : (double)(W - 1) * bytes;
             for (int nb : nbs) {
                 const Ar8Perf& r0 = t[0];
                 /* The entry's nb_for, to name the rule's count: 1400 words a block, floor 4,
                  * ceiling 16, the two-shot over its longest shard with ceiling 8 at eight ranks. */
-                const int64_t basis = two ? (weighted ? sh_max : n16 / W) : n16;
+                const int64_t basis = two ? (wtd ? sh_max : n16 / W) : n16;
                 const int64_t rule =
                     std::min<int64_t>(std::max<int64_t>(basis / 1400, 4), two ? 8 : 16);
                 const std::string nbs_ =
                     nb ? std::to_string(nb) : fmt("rule %lld", (long long)rule);
                 if (r0.rc[cfg] != RAD_OK) {
-                    std::printf("    %-9s nb %-7s  rc=%d (not served)\n",
-                                two ? "two-shot" : "one-shot", nbs_.c_str(), r0.rc[cfg]);
+                    std::printf("    %-16s nb %-7s  rc=%d (not served)\n", rname.c_str(),
+                                nbs_.c_str(), r0.rc[cfg]);
                     ++cfg;
                     continue;
                 }
@@ -16699,8 +16824,8 @@ static void ar8_perf(const Plugin& pl, int64_t numel, int iters, const char* dty
                         }
                     us = median(lo) * 1000.0; us_hi = median(hi) * 1000.0;
                 }
-                std::printf("    %-9s nb %-7s %8.1f us%s  %6.2f GB/s payload  %6.2f GB/s sent a "
-                            "rank  %s\n", two ? "two-shot" : "one-shot", nbs_.c_str(), us,
+                std::printf("    %-16s nb %-7s %8.1f us%s  %6.2f GB/s payload  %6.2f GB/s sent a "
+                            "rank  %s\n", rname.c_str(), nbs_.c_str(), us,
                             g_cold > 0 ? fmt(" (skew %.1f)", us_hi).c_str() : "",
                             us > 0 ? bytes / (us * 1e3) : 0.0, us > 0 ? sent / (us * 1e3) : 0.0,
                             bad ? fmt("%lld elements differ from the fold", (long long)bad).c_str()

@@ -12,7 +12,42 @@
 #include <cstdlib>
 
 #define R4D_AR8_SHARD_WEIGHTS_ENV "RADIANCE_AR8_SHARD_WEIGHTS"
-enum { R4D_AR_SHARD_WEIGHT_MAX = 65535 };
+#define R4D_AR8_PIECES_ENV "RADIANCE_AR8_PIECES"
+// Below these message sizes (elements) the weights and the pieces do not apply: a decode-sized
+// message pays more for the extra handshakes and the uneven split than its link time saves
+// (measured on the eight R9700: 196608 elements run fastest even and in one piece, 524288 already
+// gain from weights and two pieces).
+#define R4D_AR8_SHARD_WEIGHTS_MIN_ENV "RADIANCE_AR8_SHARD_WEIGHTS_MIN_ELEMS"
+#define R4D_AR8_PIECES_MIN_ENV "RADIANCE_AR8_PIECES_MIN_ELEMS"
+enum {
+  R4D_AR_SHARD_WEIGHT_MAX = 65535,
+  R4D_AR8_MIN_ELEMS_DEFAULT = 262144,
+  R4D_AR8_MIN_ELEMS_MAX = 268435456,  // the two-shot band's top (r4d.h)
+};
+
+// The piece count when RADIANCE_AR8_PIECES is unset, by message size in elements: more pieces
+// shorten the one-way first and last steps ((K+1)/K of the link time) but add a handshake each,
+// which only a large message amortises (measured at 4,1,0,4,0,1,4,4: K2 best at 524288, K4 at
+// 2097152, K8 at 8388608).
+inline int r4d_ar8_auto_pieces(long long numel) {
+  if (numel < 262144) return 1;
+  if (numel < 1048576) return 2;
+  if (numel < 4194304) return 4;
+  return 8;
+}
+
+// A non-negative decimal integer of at most `max`, nothing else.
+inline bool r4d_ar_parse_count(const char* s, long long max, long long* out) {
+  if (!s || *s < '0' || *s > '9') return false;
+  long long v = 0;
+  while (*s >= '0' && *s <= '9') {
+    v = v * 10 + (*s++ - '0');
+    if (v > max) return false;
+  }
+  if (*s) return false;
+  *out = v;
+  return true;
+}
 
 // `ws` non-negative integers separated by commas, each at most R4D_AR_SHARD_WEIGHT_MAX, summing
 // to more than zero; nothing else (no blanks, signs or trailing text).
