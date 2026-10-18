@@ -1,15 +1,18 @@
 /* ref_video.cpp -- the video generator's ops around its decoder (docs/OPS.md, "Video
  * generation"): the denoised latent's patch rows unfolded to voxels, the tiles a video decoder
  * runs over, gathered from the latent and stitched back into frames, and the rotary positions of
- * a tile's tokens.
+ * a tile's tokens; and the latent upscaler's (docs/OPS.md, "The latent upscaler"): voxel rows
+ * folded back into patch rows, the 3-D and temporal depthwise convolutions, the group norm, the
+ * per-frame bilinear resize and the re-noising of the upscaled latent.
  *
  * Per-request geometry (a video's frames, height and width) comes from a `geom` operand the run
  * phase writes on the device, never from the parameters, which are fixed at declare. The tiles
  * are diffusers' AutoencoderKLMiniMaxH3 tiling in latent units, and the stitch rounds where its
- * bf16 blends round.
+ * bf16 blends round. The upscaler's ops round once into their output, where a fused kernel would.
  */
 #include "ref_common.h"
 #include "ref_ops.h"
+#include "rad_philox.h"
 
 #include <algorithm>
 #include <vector>
@@ -97,6 +100,44 @@ int ref_patch_unfold(const RadArgs* a, RadStream) {
         for (int64_t c = 0; c < C; ++c)
             stt(y, yb + c * ys,
                 ldt(x, xb + (c * pt * ph * pw + sub) * xs) * mul[(size_t)c] + add[(size_t)c]);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ patch_fold */
+/* patch_unfold's inverse, normalising instead of denormalising: voxel rows
+ * x [(F pt) (Hp ph) (Wp pw), C] folded into patch rows y [F Hp Wp, C pt ph pw], column
+ * (c, a, b, d) of patch (f, i, j) at c pt ph pw + a ph pw + b pw + d:
+ *
+ *   y[(f, i, j), (c, a, b, d)] = f32(f32(x[(f pt + a, i ph + b, j pw + d), c] * mul[c]) + add[c])
+ *
+ * `geom` is (F, Hp, Wp); `mul` and `add` are C values each, kept in f32. y holds at least the
+ * patches' rows; rows past them are not written. */
+int ref_patch_fold(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *geom = &a->t[1], *y = &a->t[2];
+    const int64_t C = p_int(a, "C", 0), pt = p_int(a, "pt", 0);
+    const int64_t ph = p_int(a, "ph", 0), pw = p_int(a, "pw", 0);
+    std::vector<float> mul, add;
+    if (C <= 0 || pt <= 0 || ph <= 0 || pw <= 0 || parse_f32_list(p_str(a, "mul", ""), &mul) != C ||
+        parse_f32_list(p_str(a, "add", ""), &add) != C || numel(geom) < 3)
+        return RAD_E_SHAPE;
+    const int64_t F = ldi(geom, 0), Hp = ldi(geom, 1), Wp = ldi(geom, 2);
+    if (F <= 0 || Hp <= 0 || Wp <= 0) return RAD_E_SHAPE;
+    const int64_t vol = pt * ph * pw, Hv = Hp * ph, Wv = Wp * pw, K = C * vol, rows = F * Hp * Wp;
+    if (rows_of(y, K) < rows || rows_of(x, C) < F * pt * Hv * Wv) return RAD_E_SHAPE;
+    REF_PAR_FOR(rows * K)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t f = r / (Hp * Wp), i = (r / Wp) % Hp, j = r % Wp;
+        const int64_t yb = rowoff(y, r, K), ys = laststride(y), xs = laststride(x);
+        for (int64_t sub = 0; sub < vol; ++sub) {
+            const int64_t ta = sub / (ph * pw), tb = (sub / pw) % ph, td = sub % pw;
+            const int64_t vox = ((f * pt + ta) * Hv + i * ph + tb) * Wv + j * pw + td;
+            const int64_t xb = rowoff(x, vox, C);
+            for (int64_t c = 0; c < C; ++c)
+                stt(y, yb + (c * vol + sub) * ys,
+                    ldt(x, xb + c * xs) * mul[(size_t)c] + add[(size_t)c]);
+        }
     }
     return RAD_OK;
 }
@@ -294,6 +335,267 @@ int ref_vtile_stitch(const RadArgs* a, RadStream) {
                 if (last) byte(keep + k, px, c, v);
                 stt(prev, rowoff(prev, k * npx + px, 3) + c * laststride(prev), v);
             }
+        }
+    }
+    return RAD_OK;
+}
+
+/* ================================================================== the latent upscaler
+ * A 3-D convolutional network over a video latent's voxel rows: row (t, i, j) of a T x H x W
+ * volume is (t H + i) W + j, channels innermost (NDHWC), every operand at its own row pitch.
+ * `geom` carries the request's volume; an output holds at least the rows the volume writes. */
+
+/* ------------------------------------------------------------------ conv3d_ndhwc */
+/* A 3-D convolution, stride 1 with `same` zero padding: kt / 2 frames and k / 2 rows and columns
+ * on each side (kt and k odd). x [>= T H W, cin], y and `res` [>= T H W, cout], geom = (T, H, W);
+ * w is PyTorch's Conv3d weight [cout, cin, kt, k, k] and b [cout]:
+ *
+ *   acc = sum over (dt, kh, kw, ci) of w[o, ci, dt, kh, kw] x[(t + dt - kt/2, i + kh - k/2,
+ *                                                              j + kw - k/2), ci]
+ *   y[(t, i, j), o] = rd(acc + b[o])                    rd(rd(acc + b[o]) + res) with `res`
+ *
+ * terms outside the volume zero. acc is f32, the taps in (dt, kh, kw) order and each tap's
+ * channels ascending; rd is y's dtype. With `res` the convolution's output is rounded before the
+ * residual is added, as a residual block's skip(x) + h adds two bf16 tensors. `res` may be y
+ * itself: each output element reads its own residual before its write, and no other. */
+int ref_conv3d_ndhwc(const RadArgs* a, RadStream) {
+    if (a->n_t < 6 || !have(a, 4) || !t_in(a, 5)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *w = &a->t[1], *b = &a->t[2], *geom = &a->t[3];
+    const RadTensor *res = t_in(a, 4), *y = &a->t[5];
+    const int64_t cin = p_int(a, "cin", 0), cout = p_int(a, "cout", 0);
+    const int64_t k = p_int(a, "k", 0), kt = p_int(a, "kt", 0);
+    if (cin <= 0 || cout <= 0 || k <= 0 || kt <= 0 || !(k & 1) || !(kt & 1) || numel(geom) < 3)
+        return RAD_E_SHAPE;
+    const int64_t T = ldi(geom, 0), H = ldi(geom, 1), W = ldi(geom, 2);
+    if (T <= 0 || H <= 0 || W <= 0) return RAD_E_SHAPE;
+    const int64_t rows = T * H * W, taps = kt * k * k;
+    if (rows_of(y, cout) < rows || rows_of(x, cin) < rows || (res && rows_of(res, cout) < rows) ||
+        numel(w) < cout * cin * taps || numel(b) < cout)
+        return RAD_E_SHAPE;
+    const int64_t pz = kt / 2, ps = k / 2, xs = laststride(x), ys = laststride(y);
+    const int64_t rs = res ? laststride(res) : 0;
+    const uint32_t dt = y->dtype;
+    REF_PAR_FOR(rows * cout * cin * taps)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t t = r / (H * W), i = (r / W) % H, j = r % W;
+        const int64_t yb = rowoff(y, r, cout), rb = res ? rowoff(res, r, cout) : 0;
+        for (int64_t o = 0; o < cout; ++o) {
+            float acc = 0.0f;
+            for (int64_t dz = 0; dz < kt; ++dz) {
+                const int64_t tz = t + dz - pz;
+                if (tz < 0 || tz >= T) continue;
+                for (int64_t kh = 0; kh < k; ++kh) {
+                    const int64_t iy = i + kh - ps;
+                    if (iy < 0 || iy >= H) continue;
+                    for (int64_t kw = 0; kw < k; ++kw) {
+                        const int64_t ix = j + kw - ps;
+                        if (ix < 0 || ix >= W) continue;
+                        const int64_t xb = rowoff(x, (tz * H + iy) * W + ix, cin);
+                        const int64_t wb = o * cin * taps + (dz * k + kh) * k + kw;
+                        for (int64_t ci = 0; ci < cin; ++ci)
+                            acc += ldt(w, wb + ci * taps) * ldt(x, xb + ci * xs);
+                    }
+                }
+            }
+            const float v = acc + ldt(b, o);
+            stt(y, yb + o * ys, res ? round_dt(dt, v) + ldt(res, rb + o * rs) : v);
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ group_norm */
+/* PyTorch's nn.GroupNorm(groups, n) over [1, n, rows]: group g is channels
+ * [g n / groups, (g + 1) n / groups) of every row, rows being y's. Its mean and biased variance
+ * are over the group's rows n / groups values, summed in f64 in row-major order (two passes, the
+ * variance about the f64 mean); then, in f32,
+ *
+ *   mean_g = f32(mean)   rstd_g = 1 / sqrt(f32(var) + eps)
+ *   v = (x - mean_g) rstd_g w[c] + b[c]            each product and sum one f32 rounding
+ *   v = v (1 + scale[c]) + shift[c]                with `mod`, one row [scale | shift] of 2n
+ *   v = v / (1 + exp(-v))                          with `act` silu
+ *
+ * and v is rounded once into y. stats[2g] and stats[2g + 1] receive mean_g and rstd_g; `stats`
+ * must hold groups (2 + 3 1024) values, the rest being a device kernel's scratch (partial sums of
+ * up to 1024 parts a group), which this implementation does not touch. y may be x: the statistics
+ * are complete before any row is written, and each element is read before its own write. */
+int ref_group_norm(const RadArgs* a, RadStream) {
+    if (a->n_t < 6 || !have(a, 3) || !t_in(a, 4) || !t_in(a, 5)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *w = &a->t[1], *b = &a->t[2], *mod = t_in(a, 3);
+    const RadTensor *st = &a->t[4], *y = &a->t[5];
+    const int64_t n = p_int(a, "n", 0), G = p_int(a, "groups", 0);
+    const float eps = p_f32(a, "eps", 1e-5f);
+    static const char* const kActs[] = { "none", "silu" };
+    const int act = p_enum(a, "act", kActs, 2, 0);
+    if (act < 0 || act > 1) return RAD_E_INVAL;
+    if (n <= 0 || G <= 0 || n % G || numel(w) < n || numel(b) < n ||
+        (mod && numel(mod) < 2 * n) || numel(st) < G * (2 + 3 * 1024))
+        return RAD_E_SHAPE;
+    const int64_t rows = rows_of(y, n), cg = n / G;
+    if (rows <= 0 || rows_of(x, n) < rows) return RAD_E_SHAPE;
+    const int64_t xs = laststride(x), ys = laststride(y);
+    const double cnt = (double)rows * (double)cg;
+    std::vector<float> mean((size_t)G), rstd((size_t)G);
+    REF_PAR_FOR(rows * n * 2)
+    for (int64_t g = 0; g < G; ++g) {
+        double s = 0.0;
+        for (int64_t r = 0; r < rows; ++r) {
+            const int64_t xb = rowoff(x, r, n) + g * cg * xs;
+            for (int64_t c = 0; c < cg; ++c) s += (double)ldt(x, xb + c * xs);
+        }
+        const double mu = s / cnt;
+        double q = 0.0;
+        for (int64_t r = 0; r < rows; ++r) {
+            const int64_t xb = rowoff(x, r, n) + g * cg * xs;
+            for (int64_t c = 0; c < cg; ++c) {
+                const double d = (double)ldt(x, xb + c * xs) - mu;
+                q += d * d;
+            }
+        }
+        mean[(size_t)g] = (float)mu;
+        rstd[(size_t)g] = 1.0f / std::sqrt((float)(q / cnt) + eps);
+    }
+    for (int64_t g = 0; g < G; ++g) {
+        stt(st, offlin(st, 2 * g), mean[(size_t)g]);
+        stt(st, offlin(st, 2 * g + 1), rstd[(size_t)g]);
+    }
+    REF_PAR_FOR(rows * n * 4)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t xb = rowoff(x, r, n), yb = rowoff(y, r, n);
+        for (int64_t c = 0; c < n; ++c) {
+            const size_t g = (size_t)(c / cg);
+            float v = (ldt(x, xb + c * xs) - mean[g]) * rstd[g];
+            v = v * ldt(w, c) + ldt(b, c);
+            if (mod) {
+                const float sc = 1.0f + ldt(mod, offlin(mod, c));
+                v = v * sc + ldt(mod, offlin(mod, n + c));
+            }
+            if (act) v = v / (1.0f + ref_exp(-v));
+            stt(y, yb + c * ys, v);
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ tconv_dw */
+/* A depthwise convolution along a volume's frames (a Conv3d of kernel (k, 1, 1), padding k / 2
+ * frames, one group a channel): geom = (T, H, W), P = H W rows a frame, x and y [>= T P, n], w
+ * PyTorch's [n, 1, k, 1, 1] (tap j of channel c at c k + j) and b [n], k odd:
+ *
+ *   y[(t, p), c] = rd(f32(sum_j w[c, j] x[(t + j - k/2, p), c]) + b[c])
+ *
+ * frames outside [0, T) zero, the sum f32 in ascending j. */
+int ref_tconv_dw(const RadArgs* a, RadStream) {
+    if (!have(a, 5)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *w = &a->t[1], *b = &a->t[2], *geom = &a->t[3], *y = &a->t[4];
+    const int64_t n = p_int(a, "n", 0), k = p_int(a, "k", 0);
+    if (n <= 0 || k <= 0 || !(k & 1) || numel(geom) < 3 || numel(w) < n * k || numel(b) < n)
+        return RAD_E_SHAPE;
+    const int64_t T = ldi(geom, 0), H = ldi(geom, 1), W = ldi(geom, 2);
+    if (T <= 0 || H <= 0 || W <= 0) return RAD_E_SHAPE;
+    const int64_t P = H * W, rows = T * P;
+    if (rows_of(y, n) < rows || rows_of(x, n) < rows) return RAD_E_SHAPE;
+    const int64_t xs = laststride(x), ys = laststride(y);
+    REF_PAR_FOR(rows * n * k)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t t = r / P, p = r % P, yb = rowoff(y, r, n);
+        for (int64_t c = 0; c < n; ++c) {
+            float acc = 0.0f;
+            for (int64_t j = 0; j < k; ++j) {
+                const int64_t tz = t + j - k / 2;
+                if (tz < 0 || tz >= T) continue;
+                acc += ldt(w, c * k + j) * ldt(x, rowoff(x, tz * P + p, n) + c * xs);
+            }
+            stt(y, yb + c * ys, acc + ldt(b, c));
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ resize_bilinear */
+/* Each frame of a volume resized on its own (the frame axis kept), as torch's
+ * upsample_bilinear2d computes align_corners=False for an output size (not a scale factor):
+ * geom = (T, h, w, H, W), x [>= T h w, n] and y [>= T H W, n]. For output row i of H, in f32,
+ *
+ *   sh = h / H   src = max(sh (i + 0.5) - 0.5, 0)   i0 = floor(src)   i1 = i0 + (i0 < h - 1)
+ *   l1 = src - i0   l0 = 1 - l1
+ *
+ * and likewise for column j of W against w; then, every product and sum one f32 rounding and the
+ * result rounded once into y,
+ *
+ *   v = l0y (l0x x[i0, j0] + l1x x[i0, j1]) + l1y (l0x x[i1, j0] + l1x x[i1, j1])
+ *
+ * MiniMax-H3's upscaler resizes trilinearly at an unchanged frame count, whose temporal weights
+ * are exactly 1 and 0, so this is that resize. Any sizes, shrinking included. */
+int ref_resize_bilinear(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *geom = &a->t[1], *y = &a->t[2];
+    const int64_t n = p_int(a, "n", 0);
+    if (n <= 0 || numel(geom) < 5) return RAD_E_SHAPE;
+    const int64_t T = ldi(geom, 0), h = ldi(geom, 1), w = ldi(geom, 2);
+    const int64_t H = ldi(geom, 3), W = ldi(geom, 4);
+    if (T <= 0 || h <= 0 || w <= 0 || H <= 0 || W <= 0) return RAD_E_SHAPE;
+    const int64_t rows = T * H * W;
+    if (rows_of(y, n) < rows || rows_of(x, n) < T * h * w) return RAD_E_SHAPE;
+    /* Output index `o` of an axis resized from `in` to `out`: its two source indices and
+     * weights. */
+    auto axis = [](int64_t o, int64_t in, int64_t out, int64_t* i0, int64_t* i1, float* l0,
+                   float* l1) {
+        const float s = (float)in / (float)out;
+        float src = s * ((float)o + 0.5f) - 0.5f;
+        if (src < 0.0f) src = 0.0f;
+        *i0 = (int64_t)src;
+        *i1 = *i0 + (*i0 < in - 1 ? 1 : 0);
+        *l1 = src - (float)*i0;
+        *l0 = 1.0f - *l1;
+    };
+    const int64_t xs = laststride(x), ys = laststride(y);
+    REF_PAR_FOR(rows * n * 8)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t t = r / (H * W), i = (r / W) % H, j = r % W;
+        int64_t i0, i1, j0, j1;
+        float l0y, l1y, l0x, l1x;
+        axis(i, h, H, &i0, &i1, &l0y, &l1y);
+        axis(j, w, W, &j0, &j1, &l0x, &l1x);
+        const int64_t b00 = rowoff(x, (t * h + i0) * w + j0, n);
+        const int64_t b01 = rowoff(x, (t * h + i0) * w + j1, n);
+        const int64_t b10 = rowoff(x, (t * h + i1) * w + j0, n);
+        const int64_t b11 = rowoff(x, (t * h + i1) * w + j1, n);
+        const int64_t yb = rowoff(y, r, n);
+        for (int64_t c = 0; c < n; ++c) {
+            const float top = l0x * ldt(x, b00 + c * xs) + l1x * ldt(x, b01 + c * xs);
+            const float bot = l0x * ldt(x, b10 + c * xs) + l1x * ldt(x, b11 + c * xs);
+            stt(y, yb + c * ys, l0y * top + l1y * bot);
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ flow_renoise */
+/* A clean latent taken back to noise level s with a fresh stream, as a sampler restarts from an
+ * upscaled latent: over x's rows, in f32,
+ *
+ *   x[k, c] = f32(f32(f32(1 - s) x[k, c]) + f32(s z(k n + c)))
+ *
+ * z(e) = rad_philox_normal_s(seed, stream, e) (abi/rad_philox.h), `seed` two u32 words low first,
+ * `stream` the parameter, s = sigma (one f32 value). x is stored at its own dtype (f32 in
+ * MiniMax-H3) and row pitch. */
+int ref_flow_renoise(const RadArgs* a, RadStream) {
+    if (!have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *sg = &a->t[0], *seed = &a->t[1], *x = &a->t[2];
+    const int64_t n = p_int(a, "n", 0), stream = p_int(a, "stream", 0);
+    if (n <= 0 || stream < 0 || numel(sg) < 1 || numel(seed) < 2) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(x, n);
+    if (rows <= 0) return RAD_E_SHAPE;
+    const float s = ldt(sg, offlin(sg, 0)), oms = 1.0f - s;
+    const uint64_t sd = (uint64_t)(uint32_t)ldi(seed, 0) | ((uint64_t)(uint32_t)ldi(seed, 1) << 32);
+    const int64_t xs = laststride(x);
+    REF_PAR_FOR(rows * n * 8)
+    for (int64_t k = 0; k < rows; ++k) {
+        const int64_t xb = rowoff(x, k, n);
+        for (int64_t c = 0; c < n; ++c) {
+            const float z = rad_philox_normal_s(sd, (uint64_t)stream, (uint64_t)(k * n + c));
+            stt(x, xb + c * xs, oms * ldt(x, xb + c * xs) + s * z);
         }
     }
     return RAD_OK;

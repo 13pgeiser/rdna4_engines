@@ -837,9 +837,25 @@ int rad_declare_audio_generator(RadBuilder* b, const RadAudioGenDecl* d);
  * the base times it was trained on (`rungs`, below): s = rungs then 0, each taken to f32, the same
  * shifts applied, and the step count fixed at n_rungs + 1.
  *
+ * Latent upscaling, for a plugin with a network that enlarges a video latent (`upscale_max` > 1):
+ * a request with a factor f > 1 is denoised at a smaller size first. Its video is W x H; each side
+ * divided by f and rounded to the nearest multiple of `size_multiple` (at least one multiple, at
+ * most the side) gives the small size W' x H'. The request's evaluations but its last `refine` run
+ * at W' x H', the last of them stepping to sigma 0 (its clean estimate) instead of the next grid
+ * point. Then one pass:
+ *
+ *   RAD_GEN_PASS_VUPSCALE  the lane's video latent from W' x H' to W x H through the plugin's
+ *                          network, told the factor (W / W' + H / H') / 2; then both latents
+ *                          re-noised to the sigmas of the first evaluation at W x H, each with a
+ *                          stream of its own seed other than the one its first step drew.
+ *
+ * The last `refine` evaluations run at W x H, and the decodes follow as for any request. Every
+ * pass carries the geometry its latent has at that point: a step before the VUPSCALE pass is at
+ * W' x H'. The schedule is the request's own, whatever size each evaluation runs at.
+ *
  * A program declares exactly one of this, the other generators, logits or pooled vectors. */
 enum { RAD_GEN_PASS_VCOND = 8, RAD_GEN_PASS_VSTEP = 9, RAD_GEN_PASS_ADECODE = 10,
-       RAD_GEN_PASS_VDECODE = 11 };
+       RAD_GEN_PASS_VDECODE = 11, RAD_GEN_PASS_VUPSCALE = 12 };
 
 typedef struct RadVideoGenDecl {
     const char* name;             /* "minimax-h3" -- the served model id and messages */
@@ -880,6 +896,12 @@ typedef struct RadVideoGenDecl {
      * count. 0 is the linspace schedule. */
     int32_t       n_rungs;
     const double* rungs;
+
+    /* Latent upscaling (above): the largest factor a request may ask for, 0 when the plugin has no
+     * upscaler; and the evaluations at the full size a request that names none runs, at least 1
+     * and fewer than the default schedule's. */
+    double        upscale_max;
+    int32_t       upscale_refine;
 } RadVideoGenDecl;
 
 int rad_declare_video_generator(RadBuilder* b, const RadVideoGenDecl* d);

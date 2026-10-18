@@ -6421,6 +6421,643 @@ void snake_aa_cases(const Plugin& pl) {
 
 }  /* namespace vid */
 
+/* ---- a video latent upscaler's ops, at MiniMax-H3's shapes ---------------------------------------
+ *
+ * The upscaler runs a 37-frame clip at its 42 x 24 latent (the source) and at 84 x 48 (the
+ * target), 512 channels, 24 at its two ends; a 15 s clip is 102 frames. Each case compares with
+ * the host port of its libref function (libref/ref_video.cpp): the temporal convolution, the
+ * resize and the fold bit for bit, since the kernels keep the reference's order; the 3D
+ * convolution to a relative L2 over sampled output rows (its f32 sum runs in its own order), every
+ * face voxel of the first and last frames among them; the group norm to a relative L2 against f64
+ * statistics, its own bytes identical over two runs; the noise through the device's log, sin and
+ * cos. Rows and columns an op must not write are filled with a marker and checked after. */
+namespace ups {
+
+using namespace au;
+
+/* f(i) for i in [0, n), strided over the host's cores. */
+template <class F> void par_for(int64_t n, F&& f) {
+    const unsigned hc = std::thread::hardware_concurrency();
+    const int nt = (int)std::max(1u, std::min(32u, hc ? hc : 1u));
+    std::vector<std::thread> th;
+    for (int k = 0; k < nt; ++k)
+        th.emplace_back([&, k]() { for (int64_t i = k; i < n; i += nt) f(i); });
+    for (std::thread& t : th) t.join();
+}
+
+constexpr uint16_t kMark = 0x7f7fu;   /* a bf16 marker no kernel here writes: 3.39e38 */
+
+/* A bf16 operand of `rows` rows at pitch `ld`: its first `fill` rows' first n columns from `v`
+ * (rounded in place), every other element the marker. */
+void* up_rows(std::vector<float>& v, int64_t rows, int64_t n, int64_t ld, int64_t fill) {
+    std::vector<uint16_t> b((size_t)(rows * ld), kMark);
+    for (int64_t r = 0; r < fill; ++r)
+        for (int64_t c = 0; c < n; ++c) {
+            const uint16_t h = h_to_bf16(v[(size_t)(r * n + c)]);
+            b[(size_t)(r * ld + c)] = h;
+            v[(size_t)(r * n + c)] = h_bf16(h);
+        }
+    void* d = dalloc(b.size() * 2);
+    if (d) st_memcpy(d, b.data(), b.size() * 2, hipMemcpyHostToDevice);
+    return d;
+}
+std::vector<uint16_t> down_u16(void* d, size_t n) {
+    std::vector<uint16_t> b(n);
+    st_memcpy(b.data(), d, n * 2, hipMemcpyDeviceToHost);
+    return b;
+}
+/* Markers an op overwrote: columns [n, ld) of the first `used` rows, and every row from `used`. */
+int64_t marks_moved(const std::vector<uint16_t>& b, int64_t rows, int64_t n, int64_t ld,
+                    int64_t used) {
+    int64_t bad = 0;
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t c = r < used ? n : 0; c < ld; ++c) bad += b[(size_t)(r * ld + c)] != kMark;
+    return bad;
+}
+RadTensor pitched(void* d, uint32_t dt, int64_t rows, int64_t n, int64_t ld) {
+    RadTensor t = T(d, dt, { rows, n });
+    t.stride[0] = ld;
+    return t;
+}
+
+/* ------------------------------------------------------------------ conv3d_ndhwc */
+struct Vol { int64_t T, H, W; };
+
+/* Every voxel on a face of the first and last frames, and a hashed sample of the rest of about
+ * `want` rows. */
+std::vector<int64_t> conv_rows(const Vol& v, int64_t M, int64_t want) {
+    std::vector<int64_t> rows;
+    const int64_t HW = v.H * v.W;
+    const uint32_t every = (uint32_t)std::max<int64_t>(1, M / want);
+    for (int64_t r = 0; r < M; ++r) {
+        const int64_t t = r / HW, y = (r / v.W) % v.H, x = r % v.W;
+        const bool face = (t == 0 || t == v.T - 1) &&
+                          (y == 0 || y == v.H - 1 || x == 0 || x == v.W - 1);
+        if (face || st_mix32((uint32_t)r * 2654435761u) % every == 0) rows.push_back(r);
+    }
+    return rows;
+}
+
+/* libref's conv3d_ndhwc at output row r: the products (exact in f32) summed in f64, rounded to f32,
+ * the bias added in f32 and rounded; with a residual, that plus the residual, rounded. `wt` is the
+ * weight tap-major, as the row stores it. */
+void conv3d_row(const std::vector<float>& x, int64_t cin, const std::vector<float>& wt,
+                const std::vector<float>& b, const float* res, const Vol& v, int64_t cout,
+                int64_t r, float* out) {
+    const int64_t HW = v.H * v.W, t = r / HW, y = (r / v.W) % v.H, xx = r % v.W;
+    std::vector<double> acc((size_t)cout, 0.0);
+    for (int64_t tap = 0; tap < 27; ++tap) {
+        const int64_t nt = t + tap / 9 - 1, ny = y + (tap / 3) % 3 - 1, nx = xx + tap % 3 - 1;
+        if (nt < 0 || nt >= v.T || ny < 0 || ny >= v.H || nx < 0 || nx >= v.W) continue;
+        const float* xr = &x[(size_t)((nt * HW + ny * v.W + nx) * cin)];
+        for (int64_t o = 0; o < cout; ++o) {
+            const float* wr = &wt[(size_t)((o * 27 + tap) * cin)];
+            double s = 0.0;
+            for (int64_t c = 0; c < cin; ++c) s += (double)(wr[c] * xr[c]);
+            acc[(size_t)o] += s;
+        }
+    }
+    for (int64_t o = 0; o < cout; ++o) {
+        float f = bfr((float)acc[(size_t)o] + b[(size_t)o]);
+        if (res) f = bfr(f + res[o]);
+        out[o] = f;
+    }
+}
+
+struct ConvCase {
+    const char* what;
+    Vol v;
+    int64_t cin, cout;
+    int res;          /* 0 none, 1 its own operand, 2 the output itself */
+    bool bf32;        /* an f32 bias */
+    int64_t xpad, ypad, yextra;   /* pitch padding, output rows past the volume */
+    int64_t mshort;   /* the M parameter this short of T H W: the volume's rows are written */
+    int64_t sample;   /* rows checked besides the faces; 0 every row */
+};
+
+void conv3d_case(const RadKernelInfo* r, const ConvCase& c) {
+    const Vol& v = c.v;
+    const int64_t vol = v.T * v.H * v.W, M = vol, K = 27 * c.cin;
+    const int64_t ldx = c.cin + c.xpad, ldy = c.cout + c.ypad, yrows = M + c.yextra;
+    const std::string nm = fmt("conv3d_ndhwc_bf16 %s: %lld -> %lld at %lld x %lld, %lld frames%s%s%s",
+                               c.what, (long long)c.cin, (long long)c.cout, (long long)v.H,
+                               (long long)v.W, (long long)v.T,
+                               c.res == 2 ? ", res in place" : c.res ? ", res" : "",
+                               c.bf32 ? ", f32 bias" : "",
+                               c.xpad || c.ypad || c.yextra || c.mshort ? ", pitched" : "");
+    g_seed = 0xc03dull + (uint64_t)(c.cin * 131 + c.cout * 7 + v.T);
+    std::vector<float> x = randv((size_t)(vol * c.cin), 1.0f);
+    std::vector<float> w = randv((size_t)(c.cout * K), 1.5f / std::sqrt((float)K));
+    std::vector<float> b = randv((size_t)c.cout, 0.5f);
+    std::vector<float> res = c.res ? randv((size_t)(M * c.cout), 1.0f) : std::vector<float>();
+    for (auto& e : w) e = bfr(e);
+    if (!c.bf32) for (auto& e : b) e = bfr(e);
+    std::vector<float> wt((size_t)(c.cout * K));
+    for (int64_t o = 0; o < c.cout; ++o)
+        for (int64_t ci = 0; ci < c.cin; ++ci)
+            for (int64_t t = 0; t < 27; ++t)
+                wt[(size_t)((o * 27 + t) * c.cin + ci)] = w[(size_t)((o * c.cin + ci) * 27 + t)];
+    std::vector<RadParam> ps = { PI("M", M - c.mshort), PI("cin", c.cin), PI("cout", c.cout),
+                                 PI("k", 3), PI("kt", 3), PS("dtype", "bf16") };
+    void* dw = stored_weight(r, ps, w, c.cout, K, nm.c_str());
+    void* dx = up_rows(x, vol, c.cin, ldx, vol);
+    std::vector<float> bb = b;
+    void* db = c.bf32 ? up_f32(b) : up_bf16(bb);
+    void* dres = c.res == 1 ? up_rows(res, M, c.cout, c.cout, M) : nullptr;
+    /* In place, y starts as the residual. */
+    void* dy = up_rows(res, yrows, c.cout, ldy, c.res == 2 ? M : 0);
+    if (!dw || !dx || !db || !dy || (c.res == 1 && !dres)) {
+        ok(nm.c_str(), false, "hipMalloc failed");
+        return;
+    }
+    RadTensor tres = c.res == 1 ? T(dres, RAD_BF16, { M, c.cout })
+                   : c.res == 2 ? pitched(dy, RAD_BF16, M, c.cout, ldy)
+                                : T(nullptr, RAD_BF16, { 1 });
+    if (!c.res) absent(tres);
+    const int rc = launch(r, { pitched(dx, RAD_BF16, vol, c.cin, ldx), T(dw, RAD_BF16, { c.cout, K }),
+                               T(db, c.bf32 ? RAD_F32 : RAD_BF16, { c.cout }),
+                               TI32({ 3 }, { (int32_t)v.T, (int32_t)v.H, (int32_t)v.W }), tres,
+                               pitched(dy, RAD_BF16, yrows, c.cout, ldy) },
+                          ps);
+    if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); return; }
+    const std::vector<uint16_t> yb = down_u16(dy, (size_t)(yrows * ldy));
+    std::vector<int64_t> rows;
+    if (c.sample) {
+        rows = conv_rows(v, M, c.sample);
+    } else {
+        for (int64_t i = 0; i < M; ++i) rows.push_back(i);
+    }
+    std::vector<float> want(rows.size() * (size_t)c.cout), got(want.size());
+    par_for((int64_t)rows.size(), [&](int64_t i) {
+        const int64_t rr = rows[(size_t)i];
+        conv3d_row(x, c.cin, wt, b, c.res ? &res[(size_t)(rr * c.cout)] : nullptr, v, c.cout, rr,
+                   &want[(size_t)i * c.cout]);
+        for (int64_t o = 0; o < c.cout; ++o)
+            got[(size_t)i * c.cout + o] = h_bf16(yb[(size_t)(rr * ldy + o)]);
+    });
+    check(fmt("%s, %zu rows", nm.c_str(), rows.size()), got, want, 5e-4);
+    const int64_t moved = marks_moved(yb, yrows, c.cout, ldy, M);
+    ok((nm + ": columns past cout and rows past the volume untouched").c_str(), moved == 0,
+       fmt("%lld marker values written", (long long)moved));
+}
+
+void conv3d_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "conv3d_ndhwc_bf16");
+    if (!r) { ok("conv3d_ndhwc_bf16", false, "row absent"); return; }
+    const Vol src{ 37, 42, 24 }, dst{ 37, 84, 48 };
+    for (const ConvCase& c : {
+             /* The model's four convolutions at its two sizes. */
+             ConvCase{ "conv_in", src, 24, 512, 0, false, 0, 0, 0, 0, 3000 },
+             ConvCase{ "source block", src, 512, 512, 2, false, 0, 0, 0, 0, 3000 },
+             ConvCase{ "target block", dst, 512, 512, 0, true, 0, 0, 0, 0, 3000 },
+             ConvCase{ "conv_out", dst, 512, 24, 0, false, 0, 0, 0, 0, 3000 },
+             /* Edges, every row checked: an odd volume (no block or tile fills) with pitched
+              * operands, rows past the volume and a declared M short of it, into 40 channels (a
+              * partial tile); one frame (no temporal neighbour); one row of voxels; two channel
+              * tiles a tap into 136 channels. */
+             ConvCase{ "odd volume", Vol{ 3, 5, 7 }, 64, 40, 1, false, 8, 16, 5, 3, 0 },
+             ConvCase{ "one frame", Vol{ 1, 9, 13 }, 16, 24, 2, true, 0, 8, 2, 0, 0 },
+             ConvCase{ "one row", Vol{ 4, 1, 21 }, 8, 8, 0, false, 8, 0, 0, 0, 0 },
+             ConvCase{ "two tiles a tap", Vol{ 2, 11, 6 }, 128, 136, 2, false, 0, 0, 7, 0, 0 },
+         })
+        conv3d_case(r, c);
+    /* A 15 s clip at the target size: 411264 rows, the largest volume the model runs. */
+    conv3d_case(r, ConvCase{ "102 frames", Vol{ 102, 84, 48 }, 512, 512, 2, false, 0, 0, 0, 0, 2000 });
+
+    /* Refusals: a 5-wide kernel, a channel count off the 16-byte chunk. */
+    ok("conv3d_ndhwc_bf16 refuses k 5",
+       launch(r, { TA(RAD_BF16, { 8, 8 }), TA(RAD_BF16, { 8, 1000 }), TA(RAD_BF16, { 8 }),
+                   TI32({ 3 }, { 2, 2, 2 }), TA(RAD_BF16, { 8, 8 }), TA(RAD_BF16, { 8, 8 }) },
+              { PI("M", 8), PI("cin", 8), PI("cout", 8), PI("k", 5), PI("kt", 3),
+                PS("dtype", "bf16") }) == RAD_E_SHAPE);
+    ok("conv3d_ndhwc_bf16 refuses cin 12",
+       launch(r, { TA(RAD_BF16, { 8, 12 }), TA(RAD_BF16, { 8, 324 }), TA(RAD_BF16, { 8 }),
+                   TI32({ 3 }, { 2, 2, 2 }), TA(RAD_BF16, { 8, 8 }), TA(RAD_BF16, { 8, 8 }) },
+              { PI("M", 8), PI("cin", 12), PI("cout", 8), PI("k", 3), PI("kt", 3),
+                PS("dtype", "bf16") }) == RAD_E_SHAPE);
+}
+
+/* ------------------------------------------------------------------ group_norm */
+/* libref's group_norm: the statistics in f64, rstd = 1 / sqrt(var + eps) in f32, the rest in f32
+ * and one rounding, to bf16 when `bf`. */
+void gn_ref(const std::vector<float>& x, int64_t M, int64_t n, int64_t groups,
+            const std::vector<float>& w, const std::vector<float>& b,
+            const std::vector<float>* mod, bool silu, float eps, bool bf, std::vector<float>* y,
+            std::vector<float>* mean, std::vector<float>* rstd) {
+    const int64_t gs = n / groups;
+    mean->assign((size_t)groups, 0.0f);
+    rstd->assign((size_t)groups, 0.0f);
+    par_for(groups, [&](int64_t g) {
+        double s = 0.0;
+        for (int64_t r = 0; r < M; ++r)
+            for (int64_t c = g * gs; c < (g + 1) * gs; ++c) s += x[(size_t)(r * n + c)];
+        const double mu = s / (double)(M * gs);
+        double q = 0.0;
+        for (int64_t r = 0; r < M; ++r)
+            for (int64_t c = g * gs; c < (g + 1) * gs; ++c) {
+                const double d = x[(size_t)(r * n + c)] - mu;
+                q += d * d;
+            }
+        (*mean)[(size_t)g] = (float)mu;
+        (*rstd)[(size_t)g] = 1.0f / std::sqrt((float)(q / (double)(M * gs)) + eps);
+    });
+    y->assign((size_t)(M * n), 0.0f);
+    par_for(M, [&](int64_t r) {
+        for (int64_t c = 0; c < n; ++c) {
+            const int64_t g = c / gs;
+            float v = (x[(size_t)(r * n + c)] - (*mean)[(size_t)g]) * (*rstd)[(size_t)g] *
+                          w[(size_t)c] + b[(size_t)c];
+            if (mod) v = v * (1.0f + (*mod)[(size_t)c]) + (*mod)[(size_t)(n + c)];
+            if (silu) v = v / (1.0f + std::exp(-v));
+            (*y)[(size_t)(r * n + c)] = bf ? bfr(v) : v;
+        }
+    });
+}
+
+void group_norm_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "group_norm");
+    if (!r) { ok("group_norm", false, "row absent"); return; }
+    struct G {
+        const char* what;
+        int64_t M, n, groups;
+        bool xf, yf, wf;   /* f32 rows in, out; an f32 gain and bias */
+        int mod;           /* 0 none, 1 bf16, 2 f32 */
+        bool silu, inplace;
+        float offset;      /* added to every value: a mean far from zero */
+        int64_t pad;
+    };
+    for (const G& g : {
+             /* The target size modulated with SiLU (a block's second norm), then plain with SiLU
+              * in place (its first); the source size over a large mean. */
+             G{ "target, modulated", 37 * 84 * 48, 512, 32, false, false, false, 1, true, false, 0.0f, 0 },
+             G{ "target, in place", 37 * 84 * 48, 512, 32, false, false, true, 0, true, true, 0.0f, 0 },
+             G{ "source, mean 40", 37 * 42 * 24, 512, 32, false, false, false, 2, false, false, 40.0f, 0 },
+             /* Edges: f32 rows both ways, pitched; one row; 64 channels in 8 groups. */
+             G{ "f32 rows", 37, 512, 32, true, true, true, 2, true, false, 1.0f, 8 },
+             G{ "f32 in, bf16 out", 101, 512, 32, true, false, false, 0, false, false, -3.0f, 16 },
+             G{ "one row", 1, 512, 32, false, false, false, 1, true, false, 0.0f, 0 },
+             G{ "64 channels", 1000, 64, 8, false, true, false, 0, true, false, 0.0f, 8 },
+         }) {
+        const int64_t M = g.M, n = g.n, ld = n + g.pad, rows = M + 2;
+        const std::string nm = fmt("group_norm %s: %lld x %lld in %lld groups", g.what,
+                                   (long long)M, (long long)n, (long long)g.groups);
+        g_seed = 0x6a0ull + (uint64_t)M;
+        std::vector<float> x = randv((size_t)(M * n), 2.0f);
+        for (auto& e : x) e += g.offset;
+        std::vector<float> w = randv((size_t)n, 1.0f), b = randv((size_t)n, 0.5f);
+        std::vector<float> mod = randv((size_t)(2 * n), 0.5f);
+        if (!g.wf) { for (auto& e : w) e = bfr(e); for (auto& e : b) e = bfr(e); }
+        if (g.mod == 1) for (auto& e : mod) e = bfr(e);
+        /* x at its pitch and two rows longer than y, rows the statistics must not read (huge
+         * values); in place, y is the same buffer and both views M rows. */
+        void* dx = nullptr;
+        if (g.xf) {
+            std::vector<float> h((size_t)(rows * ld), 1e30f);
+            for (int64_t i = 0; i < M; ++i)
+                for (int64_t c = 0; c < n; ++c) h[(size_t)(i * ld + c)] = x[(size_t)(i * n + c)];
+            dx = up_f32(h);
+        } else {
+            dx = up_rows(x, rows, n, ld, M);
+        }
+        std::vector<float> none;
+        void* dy = g.inplace ? dx : g.yf ? dalloc((size_t)(rows * ld) * 4) : up_rows(none, rows, n, ld, 0);
+        void* dw = g.wf ? up_f32(w) : up_bf16(w);
+        void* db = g.wf ? up_f32(b) : up_bf16(b);
+        void* dm = g.mod == 2 ? up_f32(mod) : g.mod == 1 ? up_bf16(mod) : nullptr;
+        void* ds = dalloc((size_t)(g.groups * (2 + 3 * 1024)) * 4);
+        if (!dx || !dy || !dw || !db || !ds) { ok(nm.c_str(), false, "hipMalloc failed"); continue; }
+        RadTensor tm = T(dm, g.mod == 2 ? RAD_F32 : RAD_BF16, { 2 * n });
+        if (!g.mod) absent(tm);
+        const uint32_t xdt = g.xf ? RAD_F32 : RAD_BF16, ydt = g.yf ? RAD_F32 : RAD_BF16;
+        const std::vector<RadTensor> ts = {
+            pitched(dx, xdt, g.inplace ? M : rows, n, ld), T(dw, g.wf ? RAD_F32 : RAD_BF16, { n }),
+            T(db, g.wf ? RAD_F32 : RAD_BF16, { n }), tm,
+            T(ds, RAD_F32, { g.groups * (2 + 3 * 1024) }), pitched(dy, ydt, M, n, ld) };
+        const std::vector<RadParam> ps = { PI("M", M), PI("n", n), PI("groups", g.groups),
+                                           PF("eps", 1e-5), PS("act", g.silu ? "silu" : "none"),
+                                           PS("dtype", g.xf ? "f32" : "bf16") };
+        const int rc = launch(r, ts, ps);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> want, mean, rstd;
+        gn_ref(x, M, n, g.groups, w, b, g.mod ? &mod : nullptr, g.silu, 1e-5f, !g.yf, &want,
+               &mean, &rstd);
+        const size_t yel = (size_t)(rows * ld);
+        const std::vector<float> yall = g.yf ? down_f32(dy, yel) : down_bf16(dy, yel);
+        std::vector<float> got((size_t)(M * n));
+        for (int64_t i = 0; i < M; ++i)
+            for (int64_t c = 0; c < n; ++c) got[(size_t)(i * n + c)] = yall[(size_t)(i * ld + c)];
+        if (g.yf) {
+            double e = 0, q = 0;
+            for (size_t i = 0; i < want.size(); ++i) {
+                e += (double)(got[i] - want[i]) * (got[i] - want[i]);
+                q += (double)want[i] * want[i];
+            }
+            const double rl = std::sqrt(e / q);
+            ok(fmt("%s numerics (rel_l2 %.3g, bound 1e-5)", nm.c_str(), rl).c_str(), rl <= 1e-5);
+        } else {
+            check(nm + " numerics", got, want, 1e-3);
+        }
+        const std::vector<float> st = down_f32(ds, (size_t)(2 * g.groups));
+        double dmean = 0, drstd = 0;
+        for (int64_t k = 0; k < g.groups; ++k) {
+            dmean = std::max(dmean, std::fabs((double)st[(size_t)(2 * k)] - mean[(size_t)k]) *
+                                        (double)rstd[(size_t)k]);
+            drstd = std::max(drstd, std::fabs((double)st[(size_t)(2 * k + 1)] / rstd[(size_t)k] - 1.0));
+        }
+        ok(fmt("%s statistics (mean off by %.2g std, rstd by %.2g; bound 1e-5)", nm.c_str(), dmean,
+               drstd).c_str(),
+           dmean <= 1e-5 && drstd <= 1e-5);
+        if (!g.yf && !g.inplace) {
+            const int64_t moved = marks_moved(down_u16(dy, yel), rows, n, ld, M);
+            ok((nm + ": pitch columns and the buffer past y's rows untouched").c_str(), moved == 0,
+               fmt("%lld marker values written", (long long)moved));
+        }
+        if (!g.inplace) {
+            /* A second run: the same bytes, output and statistics. */
+            std::vector<uint8_t> y1(yel * (g.yf ? 4 : 2)), y2(y1.size());
+            st_memcpy(y1.data(), dy, y1.size(), hipMemcpyDeviceToHost);
+            const std::vector<float> s1 = down_f32(ds, (size_t)(2 * g.groups));
+            const int rc2 = launch(r, ts, ps);
+            st_memcpy(y2.data(), dy, y2.size(), hipMemcpyDeviceToHost);
+            const std::vector<float> s2 = down_f32(ds, (size_t)(2 * g.groups));
+            ok((nm + ": a second run gives the same bytes").c_str(),
+               rc2 == RAD_OK && y1 == y2 && differ(s1, s2) == 0);
+        }
+    }
+    RadTensor nomod = T(nullptr, RAD_BF16, { 1 });
+    absent(nomod);
+    ok("group_norm refuses 12 channels a group",
+       launch(r, { TA(RAD_BF16, { 4, 96 }), TA(RAD_BF16, { 96 }), TA(RAD_BF16, { 96 }), nomod,
+                   TA(RAD_F32, { 8 * 3074 }), TA(RAD_BF16, { 4, 96 }) },
+              { PI("M", 4), PI("n", 96), PI("groups", 8), PF("eps", 1e-5), PS("act", "none"),
+                PS("dtype", "bf16") }) == RAD_E_SHAPE);
+}
+
+/* ------------------------------------------------------------------ tconv_dw */
+void tconv_dw_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "tconv_dw_bf16");
+    if (!r) { ok("tconv_dw_bf16", false, "row absent"); return; }
+    /* `mshort`: the M parameter this short of the volume, whose rows are written regardless. */
+    struct C { const char* what; Vol v; int64_t n, xpad, ypad, mshort; };
+    for (const C& c : { C{ "target", Vol{ 37, 84, 48 }, 512, 0, 0, 0 },
+                        C{ "source", Vol{ 37, 42, 24 }, 512, 0, 0, 0 },
+                        C{ "102 frames", Vol{ 102, 42, 24 }, 512, 0, 0, 0 },
+                        C{ "two frames, pitched", Vol{ 2, 3, 7 }, 64, 8, 16, 0 },
+                        C{ "one frame, M declared short", Vol{ 1, 5, 5 }, 32, 0, 8, 4 },
+                        C{ "six frames, M declared short", Vol{ 6, 1, 3 }, 8, 8, 0, 1 } }) {
+        const int64_t P = c.v.H * c.v.W, vol = c.v.T * P, M = vol, n = c.n, k = 5;
+        const int64_t ldx = n + c.xpad, ldy = n + c.ypad, yrows = M + 3;
+        const std::string nm = fmt("tconv_dw_bf16 %s: %lld frames of %lld x %lld x %lld", c.what,
+                                   (long long)c.v.T, (long long)c.v.H, (long long)c.v.W,
+                                   (long long)n);
+        g_seed = 0x7d0ull + (uint64_t)vol;
+        std::vector<float> x = randv((size_t)(vol * n), 2.0f), w = randv((size_t)(n * k), 0.6f);
+        std::vector<float> b = randv((size_t)n, 0.4f), none;
+        void* dx = up_rows(x, vol, n, ldx, vol);
+        void* dw = up_bf16(w);
+        void* db = up_bf16(b);
+        void* dy = up_rows(none, yrows, n, ldy, 0);
+        if (!dx || !dw || !db || !dy) { ok(nm.c_str(), false, "hipMalloc failed"); continue; }
+        const int rc = launch(r, { pitched(dx, RAD_BF16, vol, n, ldx),
+                                   T(dw, RAD_BF16, { n, 1, k, 1, 1 }), T(db, RAD_BF16, { n }),
+                                   TI32({ 3 }, { (int32_t)c.v.T, (int32_t)c.v.H, (int32_t)c.v.W }),
+                                   pitched(dy, RAD_BF16, yrows, n, ldy) },
+                              { PI("M", M - c.mshort), PI("n", n), PI("k", k), PS("dtype", "bf16") });
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        const std::vector<uint16_t> yb = down_u16(dy, (size_t)(yrows * ldy));
+        std::vector<float> got((size_t)(M * n)), want((size_t)(M * n));
+        par_for(M, [&](int64_t row) {
+            const int64_t t = row / P, p = row % P;
+            for (int64_t ch = 0; ch < n; ++ch) {
+                float acc = 0.0f;
+                for (int64_t j = 0; j < k; ++j) {
+                    const int64_t f = t + j - k / 2;
+                    if (f < 0 || f >= c.v.T) continue;
+                    acc = acc + w[(size_t)(ch * k + j)] * x[(size_t)((f * P + p) * n + ch)];
+                }
+                acc = acc + b[(size_t)ch];
+                want[(size_t)(row * n + ch)] = bfr(acc);
+                got[(size_t)(row * n + ch)] = h_bf16(yb[(size_t)(row * ldy + ch)]);
+            }
+        });
+        const int64_t bad = differ(got, want), moved = marks_moved(yb, yrows, n, ldy, M);
+        ok((nm + " exact, pitch columns and rows past the volume untouched").c_str(), bad == 0 && moved == 0,
+           fmt("%lld values differ, %lld markers written", (long long)bad, (long long)moved));
+    }
+}
+
+/* ------------------------------------------------------------------ resize_bilinear */
+/* upsample_bilinear2d's source index and lambdas at a size, align_corners=False, in f32. */
+void bil_axis_h(int64_t o, int64_t in, int64_t out, int64_t* i0, int64_t* i1, float* l0,
+                float* l1) {
+    const float s = (float)in / (float)out;
+    float src = s * ((float)o + 0.5f) - 0.5f;
+    src = src < 0.0f ? 0.0f : src;
+    *i0 = (int64_t)src;
+    *i1 = *i0 + (*i0 < in - 1 ? 1 : 0);
+    *l1 = src - (float)*i0;
+    *l0 = 1.0f - *l1;
+}
+
+void resize_bilinear_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "resize_bilinear");
+    if (!r) { ok("resize_bilinear", false, "row absent"); return; }
+    struct C { const char* what; int64_t T, h, w, H, W, n; bool f32; int64_t pad; };
+    for (const C& c : { C{ "x2 to the target", 37, 42, 24, 84, 48, 512, false, 0 },
+                        C{ "x4 to the target", 37, 20, 12, 84, 48, 512, false, 0 },
+                        C{ "shrink", 3, 84, 48, 42, 24, 512, false, 0 },
+                        C{ "odd sizes, pitched", 2, 7, 5, 13, 11, 64, true, 8 },
+                        C{ "one voxel to 3 x 2", 2, 1, 1, 3, 2, 16, false, 8 },
+                        C{ "uneven, pitched", 5, 9, 4, 5, 10, 32, false, 16 } }) {
+        const int64_t xr = c.T * c.h * c.w, M = c.T * c.H * c.W, n = c.n, ld = n + c.pad;
+        const int64_t yrows = M + 2;
+        const std::string nm = fmt("resize_bilinear %s: %lld x %lld -> %lld x %lld, %lld frames, %s",
+                                   c.what, (long long)c.h, (long long)c.w, (long long)c.H,
+                                   (long long)c.W, (long long)c.T, c.f32 ? "f32" : "bf16");
+        g_seed = 0x2e5ull + (uint64_t)(xr + M);
+        std::vector<float> x = randv((size_t)(xr * n), 3.0f), none;
+        void* dx = nullptr;
+        void* dy = nullptr;
+        if (c.f32) {
+            std::vector<float> h((size_t)(xr * ld), 0.0f);
+            for (int64_t i = 0; i < xr; ++i)
+                for (int64_t ch = 0; ch < n; ++ch) h[(size_t)(i * ld + ch)] = x[(size_t)(i * n + ch)];
+            dx = up_f32(h);
+            dy = up_f32(std::vector<float>((size_t)(yrows * ld), -7.0f));
+        } else {
+            dx = up_rows(x, xr, n, ld, xr);
+            dy = up_rows(none, yrows, n, ld, 0);
+        }
+        if (!dx || !dy) { ok(nm.c_str(), false, "hipMalloc failed"); continue; }
+        const uint32_t dt = c.f32 ? RAD_F32 : RAD_BF16;
+        const int rc = launch(r, { pitched(dx, dt, xr, n, ld),
+                                   TI32({ 5 }, { (int32_t)c.T, (int32_t)c.h, (int32_t)c.w,
+                                                 (int32_t)c.H, (int32_t)c.W }),
+                                   pitched(dy, dt, yrows, n, ld) },
+                              { PI("M", M), PI("n", n), PS("dtype", c.f32 ? "f32" : "bf16") });
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        const size_t yel = (size_t)(yrows * ld);
+        const std::vector<float> yall = c.f32 ? down_f32(dy, yel) : down_bf16(dy, yel);
+        std::vector<float> got((size_t)(M * n)), want((size_t)(M * n));
+        par_for(M, [&](int64_t row) {
+            const int64_t t = row / (c.H * c.W), i = (row / c.W) % c.H, j = row % c.W;
+            int64_t i0, i1, j0, j1;
+            float ly0, ly1, lx0, lx1;
+            bil_axis_h(i, c.h, c.H, &i0, &i1, &ly0, &ly1);
+            bil_axis_h(j, c.w, c.W, &j0, &j1, &lx0, &lx1);
+            auto X = [&](int64_t a, int64_t bb, int64_t ch) {
+                return x[(size_t)(((t * c.h + a) * c.w + bb) * n + ch)];
+            };
+            for (int64_t ch = 0; ch < n; ++ch) {
+                const float v = ly0 * (lx0 * X(i0, j0, ch) + lx1 * X(i0, j1, ch)) +
+                                ly1 * (lx0 * X(i1, j0, ch) + lx1 * X(i1, j1, ch));
+                want[(size_t)(row * n + ch)] = c.f32 ? v : bfr(v);
+                got[(size_t)(row * n + ch)] = yall[(size_t)(row * ld + ch)];
+            }
+        });
+        int64_t moved = 0;
+        if (c.f32) {
+            for (int64_t row = 0; row < yrows; ++row)
+                for (int64_t ch = row < M ? n : 0; ch < ld; ++ch)
+                    moved += yall[(size_t)(row * ld + ch)] != -7.0f;
+        } else {
+            moved = marks_moved(down_u16(dy, yel), yrows, n, ld, M);
+        }
+        const int64_t bad = differ(got, want);
+        ok((nm + " exact, pitch columns and rows past the volume untouched").c_str(), bad == 0 && moved == 0,
+           fmt("%lld values differ, %lld markers written", (long long)bad, (long long)moved));
+    }
+}
+
+/* ------------------------------------------------------------------ patch_fold */
+void patch_fold_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "patch_fold_f32");
+    if (!r) { ok("patch_fold_f32", false, "row absent"); return; }
+    struct C { const char* what; int64_t F, Hp, Wp, C, pt, ph, pw; bool bf; int64_t pad; };
+    for (const C& c : { C{ "the target latent, bf16", 37, 42, 24, 24, 1, 2, 2, true, 0 },
+                        C{ "the target latent, f32", 37, 42, 24, 24, 1, 2, 2, false, 0 },
+                        C{ "two frames a patch, pitched", 3, 4, 5, 24, 2, 2, 2, false, 8 },
+                        C{ "3 x 1 patches, bf16, pitched", 2, 3, 7, 16, 1, 3, 1, true, 8 } }) {
+        const int64_t K = c.C * c.pt * c.ph * c.pw, rows = c.F * c.Hp * c.Wp;
+        const int64_t Hv = c.Hp * c.ph, Wv = c.Wp * c.pw, vox = c.F * c.pt * Hv * Wv;
+        const int64_t ldx = c.C + c.pad, ldy = K + c.pad, yrows = rows + 2;
+        const std::string nm = fmt("patch_fold_f32 %s: %lld x %lld x %lld patches of %lld x %lld x %lld",
+                                   c.what, (long long)c.F, (long long)c.Hp, (long long)c.Wp,
+                                   (long long)c.pt, (long long)c.ph, (long long)c.pw);
+        g_seed = 0xf01dull + (uint64_t)vox;
+        std::vector<float> x = randv((size_t)(vox * c.C), 2.0f);
+        std::vector<float> mul = randv((size_t)c.C, 1.3f), add = randv((size_t)c.C, 0.7f);
+        const std::string smul = vid::list_of(mul), sadd = vid::list_of(add);
+        void* dx = nullptr;
+        if (c.bf) {
+            dx = up_rows(x, vox, c.C, ldx, vox);
+        } else {
+            std::vector<float> h((size_t)(vox * ldx), 0.0f);
+            for (int64_t i = 0; i < vox; ++i)
+                for (int64_t ch = 0; ch < c.C; ++ch) h[(size_t)(i * ldx + ch)] = x[(size_t)(i * c.C + ch)];
+            dx = up_f32(h);
+        }
+        void* dy = up_f32(std::vector<float>((size_t)(yrows * ldy), -7.0f));
+        if (!dx || !dy) { ok(nm.c_str(), false, "hipMalloc failed"); continue; }
+        const int rc = launch(r, { pitched(dx, c.bf ? RAD_BF16 : RAD_F32, vox, c.C, ldx),
+                                   TI32({ 3 }, { (int32_t)c.F, (int32_t)c.Hp, (int32_t)c.Wp }),
+                                   pitched(dy, RAD_F32, yrows, K, ldy) },
+                              { PI("M", rows), PI("C", c.C), PI("pt", c.pt), PI("ph", c.ph),
+                                PI("pw", c.pw), PS("mul", smul.c_str()), PS("add", sadd.c_str()),
+                                PS("dtype", c.bf ? "bf16" : "f32") });
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        const std::vector<float> yall = down_f32(dy, (size_t)(yrows * ldy));
+        std::vector<float> got((size_t)(rows * K)), want((size_t)(rows * K));
+        int64_t moved = 0;
+        for (int64_t pr = 0; pr < yrows; ++pr)
+            for (int64_t col = 0; col < ldy; ++col) {
+                const float g = yall[(size_t)(pr * ldy + col)];
+                if (pr >= rows || col >= K) { moved += g != -7.0f; continue; }
+                const int64_t f = pr / (c.Hp * c.Wp), i = (pr / c.Wp) % c.Hp, j = pr % c.Wp;
+                const int64_t ch = col / (c.pt * c.ph * c.pw), sub = col % (c.pt * c.ph * c.pw);
+                const int64_t a = sub / (c.ph * c.pw), bb = (sub / c.pw) % c.ph, d = sub % c.pw;
+                const int64_t v = ((f * c.pt + a) * Hv + i * c.ph + bb) * Wv + j * c.pw + d;
+                const float p = x[(size_t)(v * c.C + ch)] * mul[(size_t)ch];
+                want[(size_t)(pr * K + col)] = p + add[(size_t)ch];
+                got[(size_t)(pr * K + col)] = g;
+            }
+        const int64_t bad = differ(got, want);
+        ok((nm + " exact, pitch columns and rows past the patches untouched").c_str(), bad == 0 && moved == 0,
+           fmt("%lld values differ, %lld markers written", (long long)bad, (long long)moved));
+    }
+    /* The round trip: patch rows unfolded to voxels and folded back, both lists the identity. */
+    const RadKernelInfo* ru = find(pl, "patch_unfold_f32");
+    if (!ru) { ok("patch_fold_f32 round trip", false, "patch_unfold_f32 absent"); return; }
+    for (const int64_t pt : { (int64_t)1, (int64_t)2 }) {
+        const int64_t C = 24, F = 3, Hp = 4, Wp = 5, ph = 2, pw = 2, K = C * pt * ph * pw;
+        const int64_t rows = F * Hp * Wp, vox = rows * pt * ph * pw;
+        std::vector<float> p = randv((size_t)(rows * K), 2.0f);
+        const std::vector<float> ones((size_t)C, 1.0f), zeros((size_t)C, 0.0f);
+        const std::string s1 = vid::list_of(ones), s0 = vid::list_of(zeros);
+        void* dp = up_f32(p);
+        void* dv = dalloc((size_t)(vox * C) * 4);
+        void* dq = dalloc((size_t)(rows * K) * 4);
+        std::vector<RadParam> ps = { PI("M", vox), PI("C", C), PI("pt", pt), PI("ph", ph),
+                                     PI("pw", pw), PS("mul", s1.c_str()), PS("add", s0.c_str()),
+                                     PS("dtype", "f32") };
+        const RadTensor geom = TI32({ 3 }, { (int32_t)F, (int32_t)Hp, (int32_t)Wp });
+        const int rc1 = launch(ru, { T(dp, RAD_F32, { rows, K }), geom, T(dv, RAD_F32, { vox, C }) }, ps);
+        ps[0] = PI("M", rows);
+        const int rc2 = launch(r, { T(dv, RAD_F32, { vox, C }), geom, T(dq, RAD_F32, { rows, K }) }, ps);
+        const int64_t bad = rc1 == RAD_OK && rc2 == RAD_OK ? differ(down_f32(dq, p.size()), p) : -1;
+        ok(fmt("patch_fold_f32 undoes patch_unfold_f32 at pt %lld", (long long)pt).c_str(), bad == 0,
+           fmt("rc %d / %d, %lld values differ", rc1, rc2, (long long)bad));
+    }
+}
+
+/* ------------------------------------------------------------------ flow_renoise */
+void flow_renoise_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "flow_renoise_f32");
+    if (!r) { ok("flow_renoise_f32", false, "row absent"); return; }
+    struct C { const char* what; int64_t M, n, ld, extra; float sigma; uint64_t seed; };
+    for (const C& c : { C{ "the video's patch rows", 37 * 42 * 24, 96, 96, 0, 0.37f, 0x123456789abcdefull },
+                        C{ "the soundtrack's rows, pitched", 1152, 32, 40, 3, 0.8f, 42ull } }) {
+        const std::string nm = fmt("flow_renoise_f32 %s: %lld x %lld, sigma %.2f", c.what,
+                                   (long long)c.M, (long long)c.n, (double)c.sigma);
+        const int64_t rows = c.M + c.extra;
+        g_seed = 0x5eedull + (uint64_t)c.M;
+        const std::vector<float> x = randv((size_t)(rows * c.ld), 1.5f);
+        void* dx = up_f32(x);
+        void* ds = up_f32(std::vector<float>{ c.sigma });
+        void* dk = dalloc(8);
+        const uint32_t words[2] = { (uint32_t)c.seed, (uint32_t)(c.seed >> 32) };
+        if (!dx || !ds || !dk) { ok(nm.c_str(), false, "hipMalloc failed"); continue; }
+        st_memcpy(dk, words, 8, hipMemcpyHostToDevice);
+        /* x is a view of the buffer's first M rows; the rows after it are not x's. */
+        const int rc = launch(r, { T(ds, RAD_F32, { 1 }), T(dk, RAD_U32, { 2 }),
+                                   pitched(dx, RAD_F32, c.M, c.n, c.ld) },
+                              { PI("M", c.M), PI("n", c.n), PI("stream", 1), PS("dtype", "f32") });
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        const std::vector<float> got = down_f32(dx, x.size());
+        double e = 0, q = 0, worst = 0;
+        int64_t moved = 0;
+        for (int64_t k = 0; k < rows; ++k)
+            for (int64_t ch = 0; ch < c.ld; ++ch) {
+                const size_t i = (size_t)(k * c.ld + ch);
+                if (k >= c.M || ch >= c.n) { moved += got[i] != x[i]; continue; }
+                const float z = rad_philox_normal_s(c.seed, 1, (uint64_t)(k * c.n + ch));
+                const float a = (1.0f - c.sigma) * x[i];
+                const float bz = c.sigma * z;
+                const float want = a + bz;
+                e += (double)(got[i] - want) * (got[i] - want);
+                q += (double)want * want;
+                worst = std::max(worst, (double)std::fabs(got[i] - want));
+            }
+        const double rl = std::sqrt(e / q);
+        ok(fmt("%s (rel_l2 %.3g, worst %.3g; bounds 1e-6, 1e-5), the rest untouched", nm.c_str(),
+               rl, worst).c_str(),
+           rl <= 1e-6 && worst <= 1e-5 && moved == 0,
+           fmt("%lld values outside written", (long long)moved));
+    }
+}
+
+}  /* namespace ups */
+
 /* ---- a video generator's f32 forms, its biased GEMMs and its rotary, against libref's arithmetic
  *
  * A diffusion transformer's patch projections and heads, its timestep MLP and a video decoder's
@@ -11038,6 +11675,133 @@ static void video_perf(const Plugin& pl, int iters, const char* only) {
                 dfree_all();
             }
         }
+    }
+
+    if (want("upscaler")) {
+        std::printf("\nconv3d_ndhwc (conv3d_ndhwc_bf16) beside gemm_nt_bias at bf16 "
+                    "(gemm_bf16_nt_bias_tiled) at the same M, N and K = 27 cin: a video latent "
+                    "upscaler's 3 x 3 x 3 convolutions, %d launches each\n", iters);
+        const RadKernelInfo* cv = find(pl, "conv3d_ndhwc_bf16");
+        const RadKernelInfo* gb = find(pl, "gemm_bf16_nt_bias_tiled");
+        struct V { const char* what; int64_t T, H, W, cin, cout; bool gemm; };
+        for (const V& v : { V{ "target block", 37, 84, 48, 512, 512, true },
+                            V{ "source block", 37, 42, 24, 512, 512, true },
+                            V{ "conv_in", 37, 42, 24, 24, 512, false },
+                            V{ "conv_out", 37, 84, 48, 512, 24, false },
+                            V{ "target block, 102 frames", 102, 84, 48, 512, 512, false } }) {
+            const int64_t M = v.T * v.H * v.W, K = 27 * v.cin, N = v.cout;
+            const double flop = 2.0 * (double)M * N * K;
+            if (v.gemm && gb) {
+                void* da = dalloc((size_t)(M * K) * 2);
+                void* dw = dalloc((size_t)(N * K) * 2);
+                void* db = dalloc((size_t)N * 4);
+                void* dy = dalloc((size_t)(M * N) * 2);
+                if (!da || !dw || !db || !dy) { std::printf("  %s: hipMalloc failed\n", v.what); dfree_all(); continue; }
+                rand_fill(da, (size_t)(M * K) * 2);
+                rand_fill(dw, (size_t)(N * K) * 2);
+                RadTensor tr = T(nullptr, RAD_BF16, { 1 });
+                absent(tr);
+                const double us = time_row(gb, { T(da, RAD_BF16, { M, K }), T(dw, RAD_BF16, { N, K }),
+                                                 T(db, RAD_F32, { N }), tr, T(dy, RAD_BF16, { M, N }) },
+                                           { PI("M", M), PI("N", N), PI("K", K), PS("dtype", "bf16") },
+                                           iters);
+                if (us < 0) std::printf("  %-26s gemm_nt_bias rc %d\n", v.what, (int)us);
+                else std::printf("  %-26s gemm_nt_bias  M %6lld N %4lld K %5lld  %9.1f us  %6.1f TFLOP/s\n",
+                                 v.what, (long long)M, (long long)N, (long long)K, us, flop / (us * 1e6));
+                dfree_all();
+            }
+            if (!cv) { std::printf("  conv3d_ndhwc_bf16 absent\n"); break; }
+            void* dx = dalloc((size_t)(M * v.cin) * 2);
+            void* dw = dalloc((size_t)(N * K) * 2);
+            void* db = dalloc((size_t)N * 2);
+            void* dy = dalloc((size_t)(M * N) * 2);
+            if (!dx || !dw || !db || !dy) { std::printf("  %s: hipMalloc failed\n", v.what); dfree_all(); continue; }
+            rand_fill(dx, (size_t)(M * v.cin) * 2);
+            rand_fill(dw, (size_t)(N * K) * 2);
+            RadTensor tr = T(nullptr, RAD_BF16, { 1 });
+            absent(tr);
+            const double us = time_row(cv, { T(dx, RAD_BF16, { M, v.cin }), T(dw, RAD_BF16, { N, K }),
+                                             T(db, RAD_BF16, { N }),
+                                             TI32({ 3 }, { (int32_t)v.T, (int32_t)v.H, (int32_t)v.W }), tr,
+                                             T(dy, RAD_BF16, { M, N }) },
+                                       { PI("M", M), PI("cin", v.cin), PI("cout", N), PI("k", 3),
+                                         PI("kt", 3), PS("dtype", "bf16") },
+                                       iters);
+            if (us < 0) std::printf("  %-26s conv3d rc %d\n", v.what, (int)us);
+            else std::printf("  %-26s conv3d        M %6lld N %4lld K %5lld  %9.1f us  %6.1f TFLOP/s\n",
+                             v.what, (long long)M, (long long)N, (long long)K, us, flop / (us * 1e6));
+            dfree_all();
+        }
+
+        /* The rest of a block at the target size, 512 channels: what each moves through memory. */
+        [&] {
+            std::printf("  the norm and elementwise ops at 84 x 48 x 37 x 512, %d launches each\n", iters);
+            const int64_t T_ = 37, H = 84, W = 48, n = 512, M = T_ * H * W, Ms = T_ * 42 * 24;
+            void* dx = dalloc((size_t)(M * n) * 2);
+            void* dy = dalloc((size_t)(M * n) * 2);
+            void* dw = dalloc((size_t)n * 5 * 2);
+            void* db = dalloc((size_t)n * 2);
+            void* dm = dalloc((size_t)(2 * n) * 2);
+            void* ds = dalloc((size_t)(32 * (2 + 3 * 1024)) * 4);
+            void* dp = dalloc((size_t)(Ms * 96) * 4);
+            void* dsig = dalloc(4);
+            void* dseed = dalloc(8);
+            if (!dx || !dy || !dw || !db || !dm || !ds || !dp || !dsig || !dseed) {
+                std::printf("  hipMalloc failed\n");
+                dfree_all();
+                return;
+            }
+            rand_fill(dx, (size_t)(M * n) * 2);
+            rand_fill(dw, (size_t)n * 5 * 2);
+            rand_fill(db, (size_t)n * 2);
+            rand_fill(dm, (size_t)(2 * n) * 2);
+            {
+                const float sg = 0.4f;
+                st_memcpy(dsig, &sg, 4, hipMemcpyHostToDevice);
+            }
+            const std::string ones = [&] {
+                std::string s;
+                for (int i = 0; i < 24; ++i) s += i ? " 1" : "1";
+                return s;
+        }();
+        const RadTensor geom = TI32({ 3 }, { (int32_t)T_, (int32_t)H, (int32_t)W });
+        struct E { const char* what; const char* row; std::vector<RadTensor> ts;
+                   std::vector<RadParam> ps; double bytes; };
+        for (const E& e : {
+                 E{ "group_norm, modulated, SiLU (x read twice)", "group_norm",
+                    { T(dx, RAD_BF16, { M, n }), T(db, RAD_BF16, { n }), T(db, RAD_BF16, { n }),
+                      T(dm, RAD_BF16, { 2 * n }), T(ds, RAD_F32, { 32 * (2 + 3 * 1024) }),
+                      T(dy, RAD_BF16, { M, n }) },
+                    { PI("M", M), PI("n", n), PI("groups", 32), PF("eps", 1e-5), PS("act", "silu"),
+                      PS("dtype", "bf16") },
+                    (double)M * n * 6 },
+                 E{ "tconv_dw, 5 frames", "tconv_dw_bf16",
+                    { T(dx, RAD_BF16, { M, n }), T(dw, RAD_BF16, { n, 1, 5, 1, 1 }), T(db, RAD_BF16, { n }),
+                      geom, T(dy, RAD_BF16, { M, n }) },
+                    { PI("M", M), PI("n", n), PI("k", 5), PS("dtype", "bf16") }, (double)M * n * 4 },
+                 E{ "resize_bilinear, 42 x 24 -> 84 x 48", "resize_bilinear",
+                    { T(dx, RAD_BF16, { Ms, n }),
+                      TI32({ 5 }, { (int32_t)T_, 42, 24, (int32_t)H, (int32_t)W }),
+                      T(dy, RAD_BF16, { M, n }) },
+                    { PI("M", M), PI("n", n), PS("dtype", "bf16") }, (double)(M + Ms) * n * 2 },
+                 E{ "patch_fold, 24 channels to 96-wide f32", "patch_fold_f32",
+                    { T(dx, RAD_BF16, { M, 24 }), TI32({ 3 }, { (int32_t)T_, 42, 24 }),
+                      T(dp, RAD_F32, { Ms, 96 }) },
+                    { PI("M", Ms), PI("C", 24), PI("pt", 1), PI("ph", 2), PI("pw", 2),
+                      PS("mul", ones.c_str()), PS("add", ones.c_str()), PS("dtype", "bf16") },
+                    (double)M * 24 * 2 + (double)Ms * 96 * 4 },
+                 E{ "flow_renoise, 96-wide f32 rows", "flow_renoise_f32",
+                    { T(dsig, RAD_F32, { 1 }), T(dseed, RAD_U32, { 2 }), T(dp, RAD_F32, { Ms, 96 }) },
+                    { PI("M", Ms), PI("n", 96), PI("stream", 1), PS("dtype", "f32") },
+                    (double)Ms * 96 * 8 } }) {
+            const RadKernelInfo* r = find(pl, e.row);
+            if (!r) { std::printf("  %s: row absent\n", e.row); continue; }
+            const double us = time_row(r, e.ts, e.ps, iters);
+            if (us < 0) std::printf("  %-44s rc %d\n", e.what, (int)us);
+            else std::printf("  %-44s %9.1f us  %6.1f GB/s\n", e.what, us, e.bytes / (us * 1e3));
+        }
+        dfree_all();
+        }();
     }
 
     if (want("mod")) {
@@ -18503,6 +19267,13 @@ static void device_phase(const Plugin& pl) {
     if (sel("flow_x0_step_f32")) vid::flow_x0_cases(pl);
     if (sel("grid_pos3")) vid::grid_pos3_cases(pl);
     if (sel("snake_aa_f32")) vid::snake_aa_cases(pl);
+    /* A video latent upscaler's ops, at its source and target sizes. */
+    if (sel("conv3d_ndhwc_bf16")) ups::conv3d_cases(pl);
+    if (sel("group_norm")) ups::group_norm_cases(pl);
+    if (sel("tconv_dw_bf16")) ups::tconv_dw_cases(pl);
+    if (sel("resize_bilinear")) ups::resize_bilinear_cases(pl);
+    if (sel("patch_fold_f32")) ups::patch_fold_cases(pl);
+    if (sel("flow_renoise_f32")) ups::flow_renoise_cases(pl);
     if (sel("vsa_select_h128_bf16")) vsa::select_cases(pl);
     if (sel("attn_vsa_h128_bf16")) vsa::attn_cases(pl);
     if (sel("quant_cols_fp8_bf16")) vsa::quant_cols_cases(pl);
@@ -19052,7 +19823,9 @@ static void usage(void) {
                 "             (the video decoder's bf16 linears), f32 (the f32 GEMMs), conv (the\n"
                 "             audio decoder's convolutions), mod (the fp8 modulation projection),\n"
                 "             attn and attn64 (dense attention at 3K to 106K rows, and over the\n"
-                "             decoder's tiles); every section without one.\n"
+                "             decoder's tiles), upscaler (a latent upscaler's 3D convolutions\n"
+                "             beside the bf16 GEMM at the same M, N and K, then its norm and\n"
+                "             elementwise ops); every section without one.\n"
                 "  --perfvsa [iters] [local]:  vsa_select and attn_vsa at 1344 x 768 (38010\n"
                 "             rows, 28 heads), sparsity 0.8 and 0, beside attn_dense over the same\n"
                 "             rows. `local` gives q and k features of the row's grid position, so a\n"

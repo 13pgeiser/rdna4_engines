@@ -14,6 +14,7 @@
 
 #include <sys/stat.h>
 
+#include <cstddef>
 #include <map>
 
 using namespace rad;
@@ -358,6 +359,41 @@ TEST(in_place_keeps_every_weight_where_it_was_and_can_be_undone) {
     file.replace(0, sizeof(RadFileHeader), bak.data(), sizeof(RadFileHeader));
     file.resize((size_t)len);
     CHECK(file == tiny::read_text(w.base));
+}
+
+/* A weight the container holds in another movement group than the plugin now declares (a plugin
+ * that regrouped it after the conversion) is kept in place, its entry taking the declared group:
+ * the group places no bytes of a dense weight. */
+TEST(in_place_keeps_a_weight_the_plugin_has_regrouped) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("convert_ipg");
+    const std::string ip = d / "ip.rad";
+    REQUIRE(copy_file(w.base, ip));
+    RadFile a;
+    REQUIRE_EQ(a.open(w.base.c_str()), RAD_OK);
+    REQUIRE(a.entry_count() > 0);
+    const RadFileEntry& e0 = a.entry(0);
+    REQUIRE(e0.expert < 0);
+    const std::string name = a.str(e0.name);
+    const int32_t layer = e0.layer;
+    const uint64_t off = e0.offset;
+    {
+        std::string file = tiny::read_text(ip);
+        const size_t at = (size_t)a.header().dir_off + offsetof(RadFileEntry, layer);
+        const int32_t other = layer + 7;
+        std::memcpy(&file[at], &other, sizeof other);
+        REQUIRE(tiny::write_text(ip, file));
+    }
+    a.close();
+    std::string log;
+    REQUIRE_EQ(convert(w.ckpt, { "--recipe", w.recipe, "--reuse", ip, "--in-place" }, &log), 0);
+    RadFile b;
+    REQUIRE_EQ(b.open(ip.c_str()), RAD_OK);
+    const RadFileEntry* e = b.find(name.c_str());
+    REQUIRE(e != nullptr);
+    CHECK_EQ(e->layer, layer);
+    CHECK_EQ(e->offset, off);
 }
 
 /* In place, a weight cannot be replaced: a rule that would write one differently is refused and

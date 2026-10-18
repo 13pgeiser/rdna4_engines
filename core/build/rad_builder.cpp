@@ -1484,6 +1484,17 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
                              "below the one before it", nm, i, d->rungs[i]);
             return RAD_E_INVAL;
         }
+    /* An upscaler needs a schedule it can split: one evaluation at the small size at least, and
+     * `upscale_refine` of them after it by default. */
+    const int64_t def_evals = d->n_rungs > 0 ? d->n_rungs : d->default_steps - 1;
+    if (d->upscale_max != 0.0 &&
+        (!(d->upscale_max > 1.0) || d->upscale_refine < 1 || d->upscale_refine >= def_evals)) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': a latent upscaler of factor %g at most, "
+                         "refining %d evaluations of %lld by default; the factor must be above 1 "
+                         "and the refinement 1 to %lld", nm, d->upscale_max, (int)d->upscale_refine,
+            (long long)def_evals, (long long)(def_evals - 1));
+        return RAD_E_INVAL;
+    }
     auto buf_ok = [&](rad_buf h, uint32_t dtype, int64_t numel, const char* what) {
         if (h == RAD_NULL_HANDLE || (size_t)h >= prog_.buffers.size()) {
             err(RAD_E_INVAL, "declare_video_generator '%s': %s %u is not a declared buffer", nm,

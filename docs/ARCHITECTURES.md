@@ -898,3 +898,33 @@ model supplies them (`--reuse`, the transformer's tensors listed as `--changed`;
 header). The distilled model's first evaluation moves 21-23% under any perturbation (the reference
 itself between bf16 and emulated fp8, or with the fp8 text encoder's conditioning), so its per-step
 numbers against the reference say little; radiance's frames and the reference's agree by eye.
+
+## The latent upscaler
+
+LBH-123-AI's `Minimax_h3_latent_Upscaler` (v1, `LatentResizer3D`, 345M parameters, Apache-2.0) is
+read as a companion folder of either pipeline, `latent_upscaler/` (its config.json and bf16
+weights), and declared when the container carries it (RadVideoGenDecl::upscale_max is then its
+largest factor). The architecture is the ComfyUI node's; the config states the same numbers:
+
+```
+input     the clean small latent's voxels (patch rows unfolded), normalised a second time with the
+          upscaler's own per-channel mean and deviation (the node's (x - mean) / std on ComfyUI's
+          already-normalised latent), bf16
+factor    (W / W' + H / H') / 2; Linear(1, 64) of (factor - 1), SiLU, Linear(64, 64), in f32;
+          each residual block's SiLU and Linear(64, 1024) gives its (scale, shift)
+network   conv_in 3x3x3 24 -> 512; 18 blocks at the small size; F.interpolate(trilinear,
+          align_corners=False) to the full size with the frame count kept, which is bilinear on
+          each frame (resize_bilinear); 18 blocks at the full size; GroupNorm(32), SiLU,
+          conv_out 3x3x3 512 -> 24. A block list is 12 residual blocks, a temporal block after
+          the 1st, 3rd, .. 11th
+residual  GroupNorm(32) SiLU conv3d; GroupNorm(32) * (1 + scale) + shift, SiLU, conv3d; + x
+          (group_norm, conv3d_ndhwc with the residual added in its store)
+temporal  GroupNorm(32) SiLU, a depthwise (5, 1, 1) convolution over frames (tconv_dw), a 1x1x1
+          one (gemm_nt_bias with the residual)
+output    denormalised, folded back into patch rows (patch_fold), then the video latent and the
+          soundtrack's re-noised to the first full-size step's sigmas with stream 1 of their seeds
+          (flow_renoise)
+```
+
+The node runs the network on whole clips here (its temporal chunking is off in the example
+workflows); every rank runs it whole, its weights in VRAM on each.

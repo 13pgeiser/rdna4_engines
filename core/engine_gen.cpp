@@ -28,6 +28,7 @@ static const char* pass_name(int gen) {
     case RAD_GEN_PASS_VSTEP:   return "vstep";
     case RAD_GEN_PASS_ADECODE: return "adecode";
     case RAD_GEN_PASS_VDECODE: return "vdecode";
+    case RAD_GEN_PASS_VUPSCALE: return "vupscale";
     default:                   return "";
     }
 }

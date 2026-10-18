@@ -551,6 +551,22 @@ static const RadOperandSpec oAttnVsa[] = { OPD("q"), OPD("k"), OPD("v"), OPD("se
                                            OPD("geom"), OPD("sel"), OPD_O("coarse"),
                                            OPD_O("gate"), OUT("out"), OPD_O("k_i8"),
                                            OPD_O("k_scale"), OPD_O("v_scale") };
+/* ---- the latent upscaler (avx_video.cpp), as libref declares it; patch_fold takes
+ * patch_unfold's parameters and operands ------------------------------------------------------ */
+static const RadParamSpec pConv3d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
+                                        P_INT("kt"), P_STR("dtype") };
+static const RadOperandSpec oConv3d[] = { OPD("x"), WGT("w"), WGT("b"), OPD("geom"),
+                                          OPD_O("res"), OUT("y") };
+static const RadParamSpec pGroupNorm[] = { P_INT("M"), P_INT("n"), P_INT("groups"), P_F64("eps"),
+                                           P_STR("act"), P_STR("dtype") };
+static const RadOperandSpec oGroupNorm[] = { OPD("x"), WGT("w"), WGT("b"), OPD_O("mod"),
+                                             INOUT("stats"), OUT("y") };
+static const RadParamSpec pTconvDw[] = { P_INT("M"), P_INT("n"), P_INT("k"), P_STR("dtype") };
+static const RadOperandSpec oTconvDw[] = { OPD("x"), WGT("w"), WGT("b"), OPD("geom"), OUT("y") };
+static const RadOperandSpec oResize[] = { OPD("x"), OPD("geom"), OUT("y") };
+static const RadParamSpec pFlowRenoise[] = { P_INT("M"), P_INT("n"), P_INT("stream"),
+                                             P_STR("dtype") };
+static const RadOperandSpec oFlowRenoise[] = { OPD("sigma"), OPD("seed"), INOUT("x") };
 
 /* ---- audio generation (avx_audio.cpp), as libref declares it ------------------------------ */
 static const RadParamSpec pConv1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
@@ -935,6 +951,24 @@ static const RadOpSchema kSchemas[] = {
   "video sparse attention over libref's tiles: prefix queries dense, video queries the prefix "
   "and their `sel` tiles, blocked online softmax; the gated coarse term on the output rounded "
   "to its dtype." },
+{ "conv3d_ndhwc", ARR(pConv3d), ARR(oConv3d),
+  "a 3-D convolution over voxel rows, `same` zero padding, PyTorch's [cout, cin, kt, k, k] "
+  "weight, as GEMMs over bands of patch rows; with `res` (possibly y) rd(rd(acc + b) + res)." },
+{ "group_norm", ARR(pGroupNorm), ARR(oGroupNorm),
+  "a group norm over all rows, its statistics in f64 over fixed row blocks combined in order, "
+  "then the optional [scale | shift] row and silu, one rounding; stats[0, 2 groups) the mean "
+  "and rstd." },
+{ "tconv_dw", ARR(pTconvDw), ARR(oTconvDw),
+  "a depthwise convolution along a volume's frames, PyTorch's [n, 1, k, 1, 1] weight, zero "
+  "frames outside the volume." },
+{ "resize_bilinear", ARR(pMnD), ARR(oResize),
+  "each frame of a volume resized as torch's align_corners=False bilinear at a size, bit for bit "
+  "libref's." },
+{ "patch_fold", ARR(pPatchUnfold), ARR(oPatchUnfold),
+  "voxel rows to normalised patch rows, f32(f32(x * mul) + add), bit for bit libref's." },
+{ "flow_renoise", ARR(pFlowRenoise), ARR(oFlowRenoise),
+  "x = f32(f32(1 - s) x) + f32(s z), z the (seed, stream) normal stream at k n + c, bit for bit "
+  "libref's." },
 { "conv1d", ARR(pConv1d), ARR(oConv1d),
   "a 1-D convolution over the sequences `cu_seqlens` bounds, channels innermost, PyTorch's "
   "[cout, cin, k] weight, dilation `dil`, centred or (`causal`) all on the left, zeros outside "
@@ -1390,6 +1424,19 @@ SIMPLE("avx_vsa_select", "vsa_select", "attn",
 SIMPLE("avx_attn_vsa", "attn_vsa", "attn",
        "block-sparse attention over the prefix and selected video tiles, the gated coarse term",
        "float q, k, v, coarse, gate and out; i32 segs, geom and sel", L(attn_vsa)),
+SIMPLE("avx_conv3d_ndhwc", "conv3d_ndhwc", "conv",
+       "a 3-D convolution over voxel rows, as GEMMs over patch rows", DT_FLOAT, L(conv3d_ndhwc)),
+SIMPLE("avx_group_norm", "group_norm", "norm",
+       "a group norm over all rows, optionally modulated, then an activation", DT_FLOAT,
+       L(group_norm)),
+SIMPLE("avx_tconv_dw", "tconv_dw", "conv", "a depthwise convolution along a volume's frames",
+       DT_FLOAT, L(tconv_dw)),
+SIMPLE("avx_resize_bilinear", "resize_bilinear", "elem",
+       "each frame of a volume resized bilinearly", DT_FLOAT, L(resize_bilinear)),
+SIMPLE("avx_patch_fold", "patch_fold", "elem", "voxel rows to normalised patch rows", DT_FLOAT,
+       L(patch_fold)),
+SIMPLE("avx_flow_renoise", "flow_renoise", "elem", "a clean latent re-noised to a sigma",
+       DT_FLOAT, L(flow_renoise)),
 
 SIMPLE("avx_conv1d", "conv1d", "conv", "a 1-D convolution over sequences, as GEMMs over patch rows",
        DT_FLOAT, L(conv1d)),

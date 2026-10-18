@@ -18,6 +18,12 @@
  * Nothing that conditions on media is served: `input_reference` and non-empty `conditions` are
  * refused.
  *
+ * A model with a latent upscaler also takes `latent_upscale`, a factor from 1 to its largest: the
+ * first steps run at `size` divided by it and the latent is enlarged to `size` for the last
+ * `upscale_refine_steps` (the model's default when absent; abi/rad_builder.h, RadVideoGenDecl).
+ * The video object of an upscaled video says how it was made: the factor, the refine steps and the
+ * small size (`upscale_from`).
+ *
  * The prompt is the model's template with `{prompt}` filled; the template is tokenised with its
  * special tokens and the prompt without, so a caller cannot write control tokens into it.
  */
@@ -55,6 +61,11 @@ struct Server::VideoJob {
     std::string err_code, err_message;
     std::string mp4;
     std::vector<uint8_t> first;   /* the first frame, RGB, for the thumbnail */
+    /* Latent upscaling, as the generator resolved it: the factor, the evaluations after it and the
+     * small size; refine 0 when the video is not upscaled. */
+    double      upscale = 0.0;
+    int32_t     refine = 0;
+    std::string upscale_from;
     int32_t     w = 0, h = 0;
     bool        worker_done = false;   /* its thread has nothing left to do but return */
 };
@@ -142,7 +153,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     }
     static const char* kKnown[] = {
         "model", "prompt", "seconds", "size", "input_reference", "seed", "num_inference_steps",
-        "task", "target", "conditions", "user",
+        "task", "target", "conditions", "user", "latent_upscale", "upscale_refine_steps",
     };
     for (auto it = body.begin(); it != body.end(); ++it) {
         bool known = false;
@@ -272,6 +283,25 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                                                   " (sigma grid points, the last one 0)");
         r->steps = (int32_t)v;
     }
+    if (has(body, "latent_upscale")) {
+        double v = 0;
+        if (!(info.upscale_max > 0.0))
+            return error_response(err_unsupported("latent_upscale", "this model has no latent "
+                                                  "upscaler"), req.peer);
+        if (!number(body["latent_upscale"], &v) || !(v >= 1.0) || v > info.upscale_max)
+            return bad("latent_upscale", "expected a factor from 1 to " +
+                                             rad::fmt("%g", info.upscale_max));
+        r->upscale = v > 1.0 ? v : 0.0;
+    }
+    if (has(body, "upscale_refine_steps")) {
+        double v = 0;
+        if (r->upscale <= 1.0)
+            return bad("upscale_refine_steps", "counts the steps after a latent upscale; give "
+                                               "latent_upscale above 1 with it");
+        if (!number(body["upscale_refine_steps"], &v) || v != std::floor(v) || v < 1 || v > 1e6)
+            return bad("upscale_refine_steps", "expected a positive integer");
+        r->refine = (int32_t)v;
+    }
     bool seed_given = false;
     if (has(body, "seed")) {
         double v = 0;
@@ -318,6 +348,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     r->ticket = j->ticket;
     const int64_t n_tok = (int64_t)r->tokens.size();
     const int32_t steps = r->steps;
+    const double upscale = r->upscale;
     {
         std::string w;
         const int s = deps_.videos->submit(std::move(r), &w);
@@ -328,9 +359,19 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             return error_response(e, req.peer);
         }
     }
-    RAD_INFO("video %s: %s, %lld frames (%s s), %lld prompt tokens, %d steps, seed=%llu",
+    const gen::VideoTicket& tk = *j->ticket;
+    if (tk.refine > 0) {
+        j->upscale = upscale;
+        j->refine = tk.refine;
+        j->upscale_from = std::to_string(tk.small_width) + "x" + std::to_string(tk.small_height);
+    }
+    RAD_INFO("video %s: %s, %lld frames (%s s), %lld prompt tokens, %d steps%s, seed=%llu",
              j->id.c_str(), j->size.c_str(), (long long)frames, j->seconds.c_str(),
-             (long long)n_tok, steps > 0 ? steps : (int)j->ticket->steps,
+             (long long)n_tok, steps > 0 ? steps : (int)tk.steps,
+             tk.refine > 0 ? rad::fmt(" (the first %d at %dx%d, upscaled for the last %d)",
+                                      (int)(tk.steps - tk.refine), (int)tk.small_width,
+                                      (int)tk.small_height, (int)tk.refine).c_str()
+                           : "",
              (unsigned long long)j->seed);
     std::lock_guard<std::mutex> lk(videos_m_);
     sweep_videos_locked(unix_now());
@@ -395,9 +436,16 @@ void Server::video_work(std::shared_ptr<VideoJob> j) {
         j->completed_at = now;
         j->expires_at = now + opt_.video_ttl_s;
         j->mp4 = std::move(file);
-        RAD_INFO("video %s: completed, %.1f MB (%s), %.1f s", j->id.c_str(),
-                 (double)j->mp4.size() / 1e6, mp4.video_encoder().c_str(),
-                 (double)(t.t_done_ns - t.t_submit_ns) / 1e9);
+        auto sec = [](int64_t a, int64_t b) { return (double)(b - a) / 1e9; };
+        const std::string steps = t.t_upscaled_ns > 0
+            ? rad::fmt("small steps %.1f s, upscale %.2f s, full steps %.1f s",
+                       sec(t.t_cond_ns, t.t_small_ns), sec(t.t_small_ns, t.t_upscaled_ns),
+                       sec(t.t_upscaled_ns, t.t_denoised_ns))
+            : rad::fmt("steps %.1f s", sec(t.t_cond_ns, t.t_denoised_ns));
+        RAD_INFO("video %s: completed, %.1f MB (%s), %.1f s: queue and prompt %.1f s, %s, "
+                 "decode %.1f s", j->id.c_str(), (double)j->mp4.size() / 1e6,
+                 mp4.video_encoder().c_str(), sec(t.t_submit_ns, t.t_done_ns),
+                 sec(t.t_submit_ns, t.t_cond_ns), steps.c_str(), sec(t.t_denoised_ns, t.t_done_ns));
     } else {
         j->status = "failed";
         j->failed = true;
@@ -477,6 +525,11 @@ json Server::video_json(const VideoJob& j) {
     o["seconds"] = j.seconds;
     o["size"] = j.size;
     o["seed"] = j.seed;
+    if (j.refine > 0) {
+        o["latent_upscale"] = j.upscale;
+        o["upscale_refine_steps"] = j.refine;
+        o["upscale_from"] = j.upscale_from;
+    }
     o["remixed_from_video_id"] = nullptr;
     if (j.failed) {
         json e;

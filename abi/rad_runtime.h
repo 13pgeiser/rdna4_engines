@@ -423,6 +423,7 @@ enum {
  *            patches. No token ids.
  *   ADECODE  no rows of the pass's own.
  *   VDECODE  `dec_rows` rows of the decoder's own (rad_arch_video_positions, RAD_VPOS_DECODE).
+ *   VUPSCALE no rows of the pass's own: the lane's video latent from `geom_from` to `geom`.
  *
  * Every pointer is device memory unless the name ends in _h. */
 typedef struct RadVideoGenBatch {
@@ -460,6 +461,13 @@ typedef struct RadVideoGenBatch {
 
     /* ---- ADECODE */
     int64_t         n_samples;     /* samples a channel the pass writes to audio_out */
+
+    /* ---- VUPSCALE (rad_builder.h, "Latent upscaling"). `geom` is the geometry the video latent
+     * is enlarged to and `geom_from` the one it has; `geom_d` carries both (RAD_VGEOM_UP_*).
+     * `sched` is the first full-size step's, whose sigmas (sched[1] the video's, sched[4] the
+     * soundtrack's) the latents are re-noised to; `seed` is a step's. */
+    RadVideoGeom    geom_from;
+    const float*    upscale;       /* f32 [1]: the factor the network is told */
 } RadVideoGenBatch;
 
 /* RadVideoGenBatch::geom_d. The request's latent geometry, then a VDECODE pass's chunk: the latent
@@ -471,7 +479,11 @@ enum {
     RAD_VGEOM_CHUNK_FRAMES = 6, RAD_VGEOM_CHUNK_H = 7, RAD_VGEOM_CHUNK_W = 8,
     RAD_VGEOM_CHUNK_FIRST = 9, RAD_VGEOM_CHUNK_LAST = 10,
     RAD_VGEOM_PATCH_FRAMES = 11, RAD_VGEOM_PATCH_H = 12, RAD_VGEOM_PATCH_W = 13,
-    RAD_VGEOM_N = 16
+    /* A VUPSCALE pass's: (frames, h, w, H, W), the latent's grid before and after, of which the
+     * first three are also the source volume; (frames, H, W) the target volume; then both in
+     * patches, (frames, h / patch, w / patch) and (frames, H / patch, W / patch). */
+    RAD_VGEOM_UP_SRC = 16, RAD_VGEOM_UP_DST = 21, RAD_VGEOM_UP_PSRC = 24, RAD_VGEOM_UP_PDST = 27,
+    RAD_VGEOM_N = 32
 };
 
 /* ================================================================== operands */

@@ -309,6 +309,10 @@ TEST(op_vocabulary) {
         /* Its step-distilled form's video sparse attention: the tile selection and the
          * block-sparse attention over it. */
         "vsa_select", "attn_vsa",
+        /* Its latent upscaler: the 3-D and temporal convolutions, the group norm, the resize,
+         * the fold back into patch rows and the re-noising. */
+        "conv3d_ndhwc", "group_norm", "tconv_dw", "resize_bilinear", "patch_fold",
+        "flow_renoise",
     };
     for (const char* op : kOps) {
         if (!kern(op)) fprintf(stderr, "    missing op '%s'\n", op);
@@ -5441,6 +5445,277 @@ TEST(grid_pos3_places_each_tile_token_and_zeroes_the_rest) {
     CHECK_EQ(at3(2, 29), 1.5f);
 }
 
+/* ================================================================== the latent upscaler
+ * docs/OPS.md "The latent upscaler": voxel rows (t, i, j) of a T x H x W volume, channels
+ * innermost, the volume in `geom`. */
+
+/* conv3d_ndhwc's `same` padding: an all-ones 3 x 3 x 3 kernel over a 3 x 3 x 3 volume of ones
+ * counts each voxel's in-volume neighbours, 2 on an axis at an edge and 3 inside, plus the bias:
+ * a corner 8.5, the centre 27.5, a face's middle 18.5, an edge's middle 12.5. Refused: an even
+ * kernel, and y short of the volume's rows. */
+TEST(conv3d_ndhwc_pads_each_axis_with_zeros) {
+    T x(RAD_F32, {27, 1}); x.f(std::vector<float>(27, 1.0f));
+    T w(RAD_F32, {1, 1, 3, 3, 3}); w.f(std::vector<float>(27, 1.0f));
+    T b(RAD_F32, {1}); b.f({0.5f});
+    T geom(RAD_I32, {3}); geom.n({3, 3, 3});
+    T y(RAD_F32, {27, 1});
+    A a; a.t(x).t(w).t(b).t(geom).tnull().t(y).i("M", 27).i("cin", 1).i("cout", 1).i("k", 3)
+          .i("kt", 3).s("dtype", "f32");
+    CHECK_OK(run("conv3d_ndhwc", a));
+    CHECK_EQ(y.at(0), 8.5f);      /* (0, 0, 0) */
+    CHECK_EQ(y.at(13), 27.5f);    /* (1, 1, 1) */
+    CHECK_EQ(y.at(4), 18.5f);     /* (0, 1, 1): the first frame's centre */
+    CHECK_EQ(y.at(10), 18.5f);    /* (1, 0, 1): the middle frame's top edge */
+    CHECK_EQ(y.at(1), 12.5f);     /* (0, 0, 1) */
+    CHECK_EQ(y.at(26), 8.5f);     /* (2, 2, 2) */
+
+    A e; e.t(x).t(w).t(b).t(geom).tnull().t(y).i("M", 27).i("cin", 1).i("cout", 1).i("k", 2)
+          .i("kt", 3).s("dtype", "f32");
+    CHECK_EQ(run("conv3d_ndhwc", e), RAD_E_SHAPE);
+    T y2(RAD_F32, {26, 1});
+    A s; s.t(x).t(w).t(b).t(geom).tnull().t(y2).i("M", 26).i("cin", 1).i("cout", 1).i("k", 3)
+          .i("kt", 3).s("dtype", "f32");
+    CHECK_EQ(run("conv3d_ndhwc", s), RAD_E_SHAPE);
+}
+
+/* The weight is PyTorch's [cout, cin, kt, k, k] and tap (dt, kh, kw) reads voxel
+ * (t + dt - 1, i + kh - 1, j + kw - 1). Two frames of 1 x 3, two channels holding r + 1 at row r;
+ * only w[1, 0, 2, 1, 0] = 1 (frame t + 1, column j - 1) and w[1, 1, 0, 1, 2] = 10 (frame t - 1,
+ * column j + 1) are set, so output channel 1 at (t, 0, j) is x[(t + 1, j - 1), 0] +
+ * 10 x[(t - 1, j + 1), 1] + b[1] and channel 0 is its bias. */
+TEST(conv3d_ndhwc_reads_the_weight_as_pytorch_lays_it_out) {
+    T x(RAD_F32, {6, 2}); x.f({1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6});
+    std::vector<float> wv(2 * 2 * 27, 0.0f);
+    wv[75] = 1.0f;     /* ((1 * 2 + 0) * 3 + 2) * 9 + 1 * 3 + 0 */
+    wv[86] = 10.0f;    /* ((1 * 2 + 1) * 3 + 0) * 9 + 1 * 3 + 2 */
+    T w(RAD_F32, {2, 2, 3, 3, 3}); w.f(wv);
+    T b(RAD_F32, {2}); b.f({0.5f, -1.0f});
+    T geom(RAD_I32, {3}); geom.n({2, 1, 3});
+    T y(RAD_F32, {6, 2});
+    A a; a.t(x).t(w).t(b).t(geom).tnull().t(y).i("M", 6).i("cin", 2).i("cout", 2).i("k", 3)
+          .i("kt", 3).s("dtype", "f32");
+    CHECK_OK(run("conv3d_ndhwc", a));
+    const float want[6] = { -1, 3, 4, 19, 29, -1 };
+    for (int r = 0; r < 6; ++r) {
+        CHECK_EQ(y.at(2 * r), 0.5f);
+        CHECK_EQ(y.at(2 * r + 1), want[r]);
+    }
+}
+
+/* With `res`, y = bf16(bf16(acc + b) + res): 1 + 0.0087890625 rounds to 1.0078125 first, and
+ * 1.0078125 + 2 = 3.0078125 is a tie that goes to 3, where the unrounded sum 3.0087890625 would
+ * give 3.015625. -1 + 0.0087890625 rounds to -0.9921875, plus 0.5 is -0.4921875. The residual may
+ * be y itself, and adds in place. */
+TEST(conv3d_ndhwc_rounds_the_conv_before_the_residual_in_place) {
+    T x(RAD_BF16, {2, 1}); x.f({1.0f, -1.0f});
+    T w(RAD_BF16, {1, 1, 1, 1, 1}); w.f({1.0f});
+    T b(RAD_F32, {1}); b.f({0.0087890625f});
+    T geom(RAD_I32, {3}); geom.n({1, 1, 2});
+    T y(RAD_BF16, {2, 1}); y.f({2.0f, 0.5f});
+    A a; a.t(x).t(w).t(b).t(geom).t(y).t(y).i("M", 2).i("cin", 1).i("cout", 1).i("k", 1)
+          .i("kt", 1).s("dtype", "bf16");
+    CHECK_OK(run("conv3d_ndhwc", a));
+    CHECK_EQ(y.at(0), 3.0f);
+    CHECK_EQ(y.at(1), -0.4921875f);
+
+    T res(RAD_BF16, {2, 1}); res.f({2.0f, 0.5f});
+    T y2(RAD_BF16, {2, 1});
+    A c; c.t(x).t(w).t(b).t(geom).t(res).t(y2).i("M", 2).i("cin", 1).i("cout", 1).i("k", 1)
+          .i("kt", 1).s("dtype", "bf16");
+    CHECK_OK(run("conv3d_ndhwc", c));
+    CHECK(y2.mem == y.mem);
+    /* Without a residual, the one rounding: 1.0078125. */
+    A d; d.t(x).t(w).t(b).t(geom).tnull().t(y2).i("M", 2).i("cin", 1).i("cout", 1).i("k", 1)
+          .i("kt", 1).s("dtype", "bf16");
+    CHECK_OK(run("conv3d_ndhwc", d));
+    CHECK_EQ(y2.at(0), 1.0078125f);
+}
+
+/* group_norm's statistics are over every row of a group's channels. Two rows of four channels in
+ * two groups: group 0 (channels 0 and 1) holds 1, 1, 3, 3, so mean 2 and var 1 (a per-row mean
+ * would make row 0 constant); group 1 holds 8, 12, 12, 8, mean 10 and var 4, rstd 0.5 (eps 0).
+ * Normalised, row 0 is (-1, -1, -1, 1) and row 1 (1, 1, 1, -1); times w (1, 2, 3, 4) plus
+ * b (0, 0.5, -1, 0). stats gets (2, 1, 10, 0.5) and the rest of it is not written. */
+TEST(group_norm_takes_each_group_over_all_rows) {
+    T x(RAD_F32, {2, 4}); x.f({1, 1, 8, 12, 3, 3, 12, 8});
+    T w(RAD_F32, {4}); w.f({1, 2, 3, 4});
+    T b(RAD_F32, {4}); b.f({0, 0.5f, -1, 0});
+    T st(RAD_F32, {2 * (2 + 3 * 1024)}); st.f(std::vector<float>(2 * (2 + 3 * 1024), -7.0f));
+    T y(RAD_F32, {2, 4});
+    A a; a.t(x).t(w).t(b).tnull().t(st).t(y).i("M", 2).i("n", 4).i("groups", 2).d("eps", 0.0)
+          .s("act", "none").s("dtype", "f32");
+    CHECK_OK(run("group_norm", a));
+    const float want[8] = { -1, -1.5f, -4, 4, 1, 2.5f, 2, -4 };
+    for (int i = 0; i < 8; ++i) CHECK_EQ(y.at(i), want[i]);
+    CHECK_EQ(st.at(0), 2.0f); CHECK_EQ(st.at(1), 1.0f);
+    CHECK_EQ(st.at(2), 10.0f); CHECK_EQ(st.at(3), 0.5f);
+    CHECK_EQ(st.at(4), -7.0f); CHECK_EQ(st.at(2 * (2 + 3 * 1024) - 1), -7.0f);
+
+    /* Modulated by one row [scale | shift], then silu, in place: v (1 + scale) + shift is
+     * (-2, -0.5, -2, 4.25) and (2, 3.5, 1, -3.75), and silu(v) = v / (1 + e^-v). */
+    T mod(RAD_F32, {8}); mod.f({1, 0, -0.5f, 0, 0, 1, 0, 0.25f});
+    A m; m.t(x).t(w).t(b).t(mod).t(st).t(x).i("M", 2).i("n", 4).i("groups", 2).d("eps", 0.0)
+          .s("act", "silu").s("dtype", "f32");
+    CHECK_OK(run("group_norm", m));
+    const double v[8] = { -2, -0.5, -2, 4.25, 2, 3.5, 1, -3.75 };
+    for (int i = 0; i < 8; ++i) CHECK_NEAR(x.at(i), v[i] / (1.0 + std::exp(-v[i])), 1e-5);
+
+    /* Refused: a stats short of groups (2 + 3 1024), groups not dividing n, an unknown act. */
+    T sm(RAD_F32, {2 * (2 + 3 * 1024) - 1});
+    A r1; r1.t(x).t(w).t(b).tnull().t(sm).t(y).i("M", 2).i("n", 4).i("groups", 2).d("eps", 0.0)
+          .s("act", "none").s("dtype", "f32");
+    CHECK_EQ(run("group_norm", r1), RAD_E_SHAPE);
+    A r2; r2.t(x).t(w).t(b).tnull().t(st).t(y).i("M", 2).i("n", 4).i("groups", 3).d("eps", 0.0)
+          .s("act", "none").s("dtype", "f32");
+    CHECK_EQ(run("group_norm", r2), RAD_E_SHAPE);
+    A r3; r3.t(x).t(w).t(b).tnull().t(st).t(y).i("M", 2).i("n", 4).i("groups", 2).d("eps", 0.0)
+          .s("act", "gelu").s("dtype", "f32");
+    CHECK_EQ(run("group_norm", r3), RAD_E_INVAL);
+}
+
+/* The variance is taken about the mean, not as E[x^2] - mean^2: 4095 and 4097 have mean 4096 and
+ * var 1, where an f32 sum of squares (4 4096^2 + 4 = 67108868, 8 apart from its neighbours in
+ * f32) cancels to 0. */
+TEST(group_norm_keeps_a_small_variance_under_a_large_mean) {
+    T x(RAD_F32, {2, 2}); x.f({4095, 4097, 4097, 4095});
+    T w(RAD_F32, {2}); w.f({1, 1});
+    T b(RAD_F32, {2}); b.f({0, 0});
+    T st(RAD_F32, {2 + 3 * 1024});
+    T y(RAD_F32, {2, 2});
+    A a; a.t(x).t(w).t(b).tnull().t(st).t(y).i("M", 2).i("n", 2).i("groups", 1).d("eps", 0.0)
+          .s("act", "none").s("dtype", "f32");
+    CHECK_OK(run("group_norm", a));
+    const float want[4] = { -1, 1, 1, -1 };
+    for (int i = 0; i < 4; ++i) CHECK_EQ(y.at(i), want[i]);
+    CHECK_EQ(st.at(0), 4096.0f); CHECK_EQ(st.at(1), 1.0f);
+}
+
+/* tconv_dw along the frames: three frames of two rows, channel 0's taps (1, 10, 100) on frames
+ * t - 1, t, t + 1 (w[c k + j]) over x = 1..6, channel 1's (0, 1, 0) over -(1..6); frames outside
+ * the volume are zero, and each row reads its own position in the other frames. */
+TEST(tconv_dw_convolves_each_position_across_frames) {
+    T x(RAD_F32, {6, 2}); x.f({1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6});
+    T w(RAD_F32, {2, 1, 3, 1, 1}); w.f({1, 10, 100, 0, 1, 0});
+    T b(RAD_F32, {2}); b.f({0.5f, 2});
+    T geom(RAD_I32, {3}); geom.n({3, 1, 2});
+    T y(RAD_F32, {6, 2});
+    A a; a.t(x).t(w).t(b).t(geom).t(y).i("M", 6).i("n", 2).i("k", 3).s("dtype", "f32");
+    CHECK_OK(run("tconv_dw", a));
+    const float c0[6] = { 310.5f, 420.5f, 531.5f, 642.5f, 53.5f, 64.5f };
+    for (int r = 0; r < 6; ++r) {
+        CHECK_EQ(y.at(2 * r), c0[r]);
+        CHECK_EQ(y.at(2 * r + 1), (float)(1 - r));
+    }
+}
+
+/* resize_bilinear as torch's align_corners=False at a size: 2 x 2 to 4 x 4 gives the familiar
+ * [[1, 1.25, 1.75, 2], [1.5, 1.75, 2.25, 2.5], [2.5, 2.75, 3.25, 3.5], [3, 3.25, 3.75, 4]]. The
+ * first row's source clamps to 0; the last's is 1.25, whose neighbour is clamped to row 1, so it
+ * is row 1. Channel 1 holds the negatives. */
+TEST(resize_bilinear_matches_torch_and_clamps_at_the_border) {
+    T x(RAD_F32, {4, 2}); x.f({1, -1, 2, -2, 3, -3, 4, -4});
+    T geom(RAD_I32, {5}); geom.n({1, 2, 2, 4, 4});
+    T y(RAD_F32, {16, 2});
+    A a; a.t(x).t(geom).t(y).i("M", 16).i("n", 2).s("dtype", "f32");
+    CHECK_OK(run("resize_bilinear", a));
+    const float want[16] = { 1, 1.25f, 1.75f, 2, 1.5f, 1.75f, 2.25f, 2.5f,
+                             2.5f, 2.75f, 3.25f, 3.5f, 3, 3.25f, 3.75f, 4 };
+    for (int r = 0; r < 16; ++r) {
+        CHECK_EQ(y.at(2 * r), want[r]);
+        CHECK_EQ(y.at(2 * r + 1), -want[r]);
+    }
+}
+
+/* Frames resize on their own, and shrinking averages: two frames of 4 x 1 to 2 x 1 read source
+ * rows 0.5 and 2.5. 3 to 5 at a ratio f32 cannot hold exactly: row 0's source clamps to 0, row
+ * 4's (2.2) has its neighbour clamped onto row 2, and rows 1 and 3 read 0.4 and 1.6. */
+TEST(resize_bilinear_resizes_each_frame_and_shrinks) {
+    T x(RAD_F32, {8, 1}); x.f({1, 2, 4, 8, 10, 20, 40, 80});
+    T geom(RAD_I32, {5}); geom.n({2, 4, 1, 2, 1});
+    T y(RAD_F32, {4, 1});
+    A a; a.t(x).t(geom).t(y).i("M", 4).i("n", 1).s("dtype", "f32");
+    CHECK_OK(run("resize_bilinear", a));
+    CHECK_EQ(y.at(0), 1.5f); CHECK_EQ(y.at(1), 6.0f);
+    CHECK_EQ(y.at(2), 15.0f); CHECK_EQ(y.at(3), 60.0f);
+
+    T x3(RAD_F32, {3, 1}); x3.f({0, 10, 20});
+    T g3(RAD_I32, {5}); g3.n({1, 3, 1, 5, 1});
+    T y5(RAD_F32, {5, 1});
+    A c; c.t(x3).t(g3).t(y5).i("M", 5).i("n", 1).s("dtype", "f32");
+    CHECK_OK(run("resize_bilinear", c));
+    CHECK_EQ(y5.at(0), 0.0f);
+    CHECK_NEAR(y5.at(1), 4.0, 1e-5);
+    CHECK_NEAR(y5.at(3), 16.0, 1e-5);
+    CHECK_NEAR(y5.at(4), 20.0, 1e-5);
+}
+
+/* patch_fold deals voxel rows (yy, xx) of x [8, 2] (x[r, c] = 10 r + c) into the 1 x 2 x 2 patches
+ * side by side (geom (1, 1, 2)): patch j's column c 4 + b 2 + d is voxel (b, 2 j + d), times mul
+ * plus add, f32. Row 2 is past the patches and keeps its value. */
+TEST(patch_fold_gathers_voxels_into_patches_and_normalises) {
+    std::vector<float> xv(16);
+    for (int r = 0; r < 8; ++r)
+        for (int c = 0; c < 2; ++c) xv[(size_t)(r * 2 + c)] = (float)(10 * r + c);
+    T x(RAD_F32, {8, 2}); x.f(xv);
+    T geom(RAD_I32, {3}); geom.n({1, 1, 2});
+    T y(RAD_F32, {3, 8}); y.f(std::vector<float>(24, -9.0f));
+    A a; a.t(x).t(geom).t(y).i("M", 3).i("C", 2).i("pt", 1).i("ph", 2).i("pw", 2)
+          .s("mul", "1 2").s("add", "0 0.5").s("dtype", "f32");
+    CHECK_OK(run("patch_fold", a));
+    const float want[16] = { 0, 10, 40, 50, 2.5f, 22.5f, 82.5f, 102.5f,
+                             20, 30, 60, 70, 42.5f, 62.5f, 122.5f, 142.5f };
+    for (int i = 0; i < 16; ++i) CHECK_EQ(y.at(i), want[i]);
+    for (int i = 16; i < 24; ++i) CHECK_EQ(y.at(i), -9.0f);
+}
+
+/* patch_fold undoes patch_unfold: two frames of 1 x 2 patches of 2 x 1 x 2 with three channels,
+ * unfolded through (x 2 + 1, x 4 - 2, x 0.5 + 3) and folded back through their inverses, exact
+ * in f32 at these integers. */
+TEST(patch_fold_inverts_patch_unfold) {
+    std::vector<float> pv(4 * 12);
+    for (size_t i = 0; i < pv.size(); ++i) pv[i] = (float)((int)i * 7 % 23 - 11);
+    T p(RAD_F32, {4, 12}); p.f(pv);
+    T geom(RAD_I32, {3}); geom.n({2, 1, 2});
+    T vox(RAD_F32, {16, 3});
+    A u; u.t(p).t(geom).t(vox).i("M", 16).i("C", 3).i("pt", 2).i("ph", 1).i("pw", 2)
+          .s("mul", "2 4 0.5").s("add", "1 -2 3").s("dtype", "f32");
+    CHECK_OK(run("patch_unfold", u));
+    T back(RAD_F32, {4, 12});
+    A f; f.t(vox).t(geom).t(back).i("M", 4).i("C", 3).i("pt", 2).i("ph", 1).i("pw", 2)
+          .s("mul", "0.5 0.25 2").s("add", "-0.5 0.5 -6").s("dtype", "f32");
+    CHECK_OK(run("patch_fold", f));
+    for (int i = 0; i < 48; ++i) CHECK_EQ(back.at(i), pv[(size_t)i]);
+}
+
+/* flow_renoise: x = f32(f32(0.75 x) + f32(0.25 z(k n + c))) with z the (seed, 1) normal stream,
+ * indexed by the row's position k n + c, not its pitch: x is [2, 3] at a pitch of 5, whose last
+ * two columns are not written. Both products are exact here, so the expectation has one
+ * rounding. Stream 0 (rad_philox_normal) is a different draw. */
+TEST(flow_renoise_draws_its_own_stream_by_element) {
+    const uint64_t seed = 0x0123456789abcdefull;
+    T sg(RAD_F32, {1}); sg.f({0.25f});
+    T sd(RAD_U32, {2}); sd.n({(int64_t)(seed & 0xffffffffu), (int64_t)(seed >> 32)});
+    const float xv[6] = { 2, 4, -8, 6, 0, 10 };
+    T x(RAD_F32, {2, 5});
+    x.f({ xv[0], xv[1], xv[2], -9, -9, xv[3], xv[4], xv[5], -9, -9 });
+    x.t.shape[1] = 3;
+    A a; a.t(sg).t(sd).t(x).i("M", 2).i("n", 3).i("stream", 1).s("dtype", "f32");
+    CHECK_OK(run("flow_renoise", a));
+    bool differs = false;
+    for (int k = 0; k < 2; ++k) {
+        for (int c = 0; c < 3; ++c) {
+            const uint64_t e = (uint64_t)(k * 3 + c);
+            const float z = rad_philox_normal_s(seed, 1, e);
+            const float want = 0.75f * xv[k * 3 + c] + 0.25f * z;
+            CHECK_EQ(x.at(k * 5 + c), want);
+            differs = differs || want != 0.75f * xv[k * 3 + c] + 0.25f * rad_philox_normal(seed, e);
+        }
+        CHECK_EQ(x.at(k * 5 + 3), -9.0f);
+        CHECK_EQ(x.at(k * 5 + 4), -9.0f);
+    }
+    CHECK(differs);
+}
+
 /* ================================================================== video sparse attention
  * docs/OPS.md "Video sparse attention": the tiles over a packed sequence of dense segments and a
  * video grid, vsa_select's top-k of pooled scores and its coarse branch, attn_vsa's block-sparse
@@ -6798,6 +7073,15 @@ std::vector<Geo> geometries() {
         G("attn_vsa", "M", 81, a.i("M", R).i("head_dim", 8).i("tile_t", 2).i("tile_h", 2)
                                .i("tile_w", 2).i("patch", 1).d("sparsity", 0.9)
                                .s("dtype", "f32")),
+        G("conv3d_ndhwc", "M", 27, a.i("M", R).i("cin", 3).i("cout", 5).i("k", 3).i("kt", 3)
+                                   .s("dtype", "f32")),
+        G("group_norm", "M", 4, a.i("M", R).i("n", 8).i("groups", 2).d("eps", 1e-5)
+                                .s("act", "silu").s("dtype", "f32")),
+        G("tconv_dw", "M", 8, a.i("M", R).i("n", 8).i("k", 5).s("dtype", "f32")),
+        G("resize_bilinear", "M", 8, a.i("M", R).i("n", 8).s("dtype", "f32")),
+        G("patch_fold", "M", 8, a.i("M", R).i("C", 3).i("pt", 1).i("ph", 2).i("pw", 2)
+                                .s("mul", "1 2 3").s("add", "0 1 2").s("dtype", "f32")),
+        G("flow_renoise", "M", 3, a.i("M", R).i("n", 8).i("stream", 1).s("dtype", "f32")),
     };
 }
 #undef G

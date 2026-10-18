@@ -748,6 +748,42 @@ std::vector<Case> build_cases() {
     add("grid_pos3", { HI("M", 40), HI("T", 2), HI("H", 3), HI("W", 4), HI("period", 27),
                        HF("scale", 6.283185307179586) });
 
+    /* The latent upscaler over libref's cube volumes (c x c x c, the largest M holds; every geom
+     * entry c, so the resize is the identity here): the 3-D convolution at odd channel counts,
+     * kernels 3 x 3 x 3 and 3 x 1 x 1, with the residual (a separate buffer), and at MiniMax-H3's
+     * widths 24 -> 512, 512 -> 512 and 512 -> 24 in bf16; the modulated group norm over a few rows
+     * and over three of avx's 64-row blocks; the temporal convolution with taps past both ends.
+     * Real resizes, an in-place residual, an unmodulated norm over y = x, uneven volumes and views
+     * of wider planes are avx_check_hand.cpp's. */
+    for (const char* dt : { "f32", "bf16" }) {
+        struct Conv3 { int M, cin, cout, k, kt; };
+        static const Conv3 kConv3[] = { { 27, 5, 13, 3, 3 }, { 64, 20, 52, 3, 3 },
+                                        { 27, 24, 16, 1, 3 } };
+        for (const Conv3& v : kConv3)
+            add("conv3d_ndhwc", { HI("M", v.M), HI("cin", v.cin), HI("cout", v.cout),
+                                  HI("k", v.k), HI("kt", v.kt), HS("dtype", dt) },
+                0, 2.0 * v.M * v.cout * v.cin * v.k * v.k * v.kt);
+        for (const char* act : { "silu", "none" })
+            add("group_norm", { HI("M", 7), HI("n", 640), HI("groups", 32), HF("eps", 1e-5),
+                                HS("act", act), HS("dtype", dt) });
+        add("group_norm", { HI("M", 150), HI("n", 96), HI("groups", 4), HF("eps", 1e-5),
+                            HS("act", "silu"), HS("dtype", dt) });
+        add("tconv_dw", { HI("M", 27), HI("n", 645), HI("k", 5), HS("dtype", dt) });
+        add("tconv_dw", { HI("M", 64), HI("n", 37), HI("k", 3), HS("dtype", dt) });
+        add("resize_bilinear", { HI("M", 27), HI("n", 645), HS("dtype", dt) });
+        for (int pt : { 1, 4 })
+            add("patch_fold", { HI("M", 8), HI("C", 24), HI("pt", pt), HI("ph", 2), HI("pw", 2),
+                                HS("mul", kStd24.c_str()), HS("add", kMean24.c_str()),
+                                HS("dtype", dt) });
+    }
+    struct Wide { int cin, cout; };
+    for (const Wide v : { Wide{ 24, 512 }, Wide{ 512, 512 }, Wide{ 512, 24 } })
+        add("conv3d_ndhwc", { HI("M", 27), HI("cin", v.cin), HI("cout", v.cout), HI("k", 3),
+                              HI("kt", 3), HS("dtype", "bf16") },
+            0, 2.0 * 27 * v.cin * v.cout * 27);
+    add("flow_renoise", { HI("M", 9), HI("n", 96), HI("stream", 1), HS("dtype", "f32") });
+    add("flow_renoise", { HI("M", 5), HI("n", 645), HI("stream", 7), HS("dtype", "f32") });
+
     /* Video sparse attention over the cubes libref describes: a 3 x 3 x 3 grid in boxes of 2
      * after two dense segments of as many rows (P 8, V 8; sparsity 0.8 keeps 2), with and without
      * the coarse operands; and MiniMax-H3's boxes of 4 at patch 2 over a 10 x 5 x 5 grid after

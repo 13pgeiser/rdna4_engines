@@ -2495,6 +2495,8 @@ int Engine::run_server() {
         in.default_steps = vd.default_steps;
         in.max_steps = vd.max_steps;
         in.fixed_steps = vd.n_rungs > 0;
+        in.upscale_max = vd.upscale_max;
+        in.upscale_refine = vd.upscale_refine;
         in.max_lanes = vd.max_lanes;
         video_bridge.drv = vid_gen_;
         d.videos = &video_bridge;
@@ -2510,6 +2512,9 @@ int Engine::run_server() {
                  (double)(in.frames_per_chunk * in.min_chunks + in.frames_tail) / fps,
                  (double)(in.frames_per_chunk * in.max_chunks + in.frames_tail) / fps, fps,
                  (long long)in.sample_rate, (long long)in.channels, (long long)in.default_steps);
+        if (in.upscale_max > 0.0)
+            RAD_INFO("video: latent upscaling up to %gx, the last %lld evaluations at the full size "
+                     "by default", in.upscale_max, (long long)in.upscale_refine);
     }
 
     if (encd.modalities == 0 && aend.modalities == 0 && cfg_.media_flags_set())

@@ -40,6 +40,18 @@
  * and v (`to_gate_compress`) gates in an attention over the tiles' means. Everything else is the
  * base model's.
  *
+ * ============================== LATENT UPSCALING ==============================
+ *
+ * A container may also carry LBH-123-AI's latent upscaler (LatentResizer3D, the pipeline
+ * directory's latent_upscaler/ folder): a 3D-convolution network that enlarges a video latent's
+ * frames by a factor from 1 to 4, told the factor through a small embedding. With it a request can
+ * be denoised at a smaller size for its first steps (abi/rad_builder.h, "Latent upscaling"): the
+ * upscale pass unfolds the clean small latent into voxels, normalises it with the upscaler's own
+ * statistics, runs `conv_in`, 18 blocks at the small size (12 residual blocks conditioned on the
+ * factor, a temporal block after every second), a bilinear resize of each frame, 18 blocks at the
+ * full size, GroupNorm, SiLU and `conv_out`; then denormalises, folds the voxels back into patch
+ * rows and re-noises both latents for the remaining steps. Every rank runs it whole.
+ *
  * ============================== ONCE A REQUEST ==============================
  *
  * The conditioning pass runs the text encoder and the refiner, and also every step's modulation:
@@ -332,6 +344,17 @@ struct AStage {
     int64_t  ch = 0, rate = 0, k = 0;
 };
 
+/* A latent upscaler block: a residual block (GroupNorm, SiLU, conv; GroupNorm modulated by the
+ * factor's embedding, SiLU, conv; the residual added) or a temporal block (GroupNorm, SiLU, a
+ * depthwise convolution over frames, a pointwise one with the residual). */
+struct UpsBlock {
+    bool       temporal = false;
+    int64_t    emb = -1;           /* a residual block's row of the factor's embeddings */
+    rad_weight n1w = 0, n1b = 0, c1w = 0, c1b = 0, n2w = 0, n2b = 0, c2w = 0, c2b = 0;
+    rad_weight ew = 0, eb = 0;     /* the embedding's projection to (scale, shift) */
+    rad_op     op_e = 0, op_n1 = 0, op_c1 = 0, op_n2 = 0, op_c2 = 0;
+};
+
 /* Weight groups (movement units) by network: the text encoder's layers 0.., the refiner, the
  * timestep MLP with norm_out's projection, the DiT's model-level weights and its blocks after
  * them, each block's modulation projections, the decoders. A unit takes the strongest access class
@@ -344,7 +367,12 @@ enum : int {
     kGrpAda     = 2200,
     kGrpVae     = 3000,
     kGrpAudio   = 3100,
+    kGrpUps     = 3200,
 };
+
+/* The evaluations a request runs at the full size after a latent upscale, by default: of a
+ * distilled release's eight, and of the base model's 49. */
+enum { kUpsRefineDistilled = 3, kUpsRefineBase = 12 };
 
 struct Model {
     Names nm{""};
@@ -424,6 +452,23 @@ struct Model {
     rad_buf b_vqkv = 0, b_vattn = 0, b_vo = 0, b_vt = 0, b_vup = 0, b_vact = 0;
     rad_buf b_vpix = 0, b_vpix_all = 0, b_frames = 0;
     std::vector<VitBlock> vit;
+
+    /* ---- the latent upscaler, when the container carries one */
+    bool    ups = false;
+    double  ups_max = 0.0;       /* the largest factor it was trained on */
+    int64_t uC = 0, uE = 0;      /* its width and its embedding's */
+    std::string u_inv_mul, u_inv_add, u_std, u_mean;   /* its normalisation, both ways */
+    rad_weight u_e0w = 0, u_e0b = 0, u_e2w = 0, u_e2b = 0;
+    rad_weight u_cinw = 0, u_cinb = 0, u_now = 0, u_nob = 0, u_coutw = 0, u_coutb = 0;
+    rad_op  op_uunf = 0, op_ucast = 0, op_ufac = 0, op_ue0 = 0, op_ues0 = 0, op_ue2 = 0;
+    rad_op  op_ues2 = 0, op_ucin = 0, op_ursz = 0, op_unout = 0, op_ucout = 0, op_ufold = 0;
+    rad_op  op_urnv = 0, op_urna = 0;
+    /* The voxels in and out, three activations of the network's width (each the residual stream
+     * or a temporary in turn), GroupNorm's statistics, and the factor's embedding: the factor less
+     * one, the MLP's two layers, then every residual block's (scale, shift) row. */
+    rad_buf b_uin32 = 0, b_uin = 0, b_ua = 0, b_ub = 0, b_uc = 0, b_uout = 0, b_ust = 0;
+    rad_buf b_ufac = 0, b_ue0 = 0, b_ue0s = 0, b_ue1 = 0, b_ue1s = 0, b_uemb = 0;
+    std::vector<UpsBlock> u_in, u_out;
 };
 
 static Model g_model[MAX_RANKS];
@@ -1514,6 +1559,259 @@ static int declare_video(RadBuilder* b, const RadModelMeta* meta, Model& m) {
     return m.op_stitch ? RAD_OK : RAD_E_INVAL;
 }
 
+/* ================================================================== the latent upscaler */
+/* LatentResizer3D (the companion folder latent_upscaler/, its config.json and weights), declared
+ * when the container carries it. Its architecture is the ComfyUI node's, which infers it from the
+ * weights; the config states the same numbers and they are checked here. Weights are bf16 but the
+ * factor's embedding MLP, f32 (the recipe casts it) so that its first layer, one input wide, is an
+ * f32 GEMM. Activations are bf16 voxel rows of the network's width, statistics and accumulation
+ * f32. */
+static int declare_ups(RadBuilder* b, const RadModelMeta* meta, Model& m) {
+    const char* cls = rad_meta_gets(meta, "latent_upscaler._class_name", nullptr);
+    if (!cls) return RAD_OK;
+    Names& nm = m.nm;
+    auto geti = [&](const char* k, long long def) {
+        return (int64_t)rad_meta_geti(meta, nm.ckpt("latent_upscaler.%s", k), def);
+    };
+    const int64_t C = geti("channels", 512), E = geti("embed_dim", 64), G = geti("norm_num_groups", 32);
+    const int64_t nin = geti("in_blocks", 12), nout = geti("out_blocks", 12);
+    const int64_t every = geti("temporal_every", 2), tk = geti("temporal_kernel", 5);
+    const int64_t K = geti("conv_kernel_size", 3);
+    const std::vector<double> mean = meta_list(meta, "latent_upscaler.latent_normalization.mean");
+    const std::vector<double> sd = meta_list(meta, "latent_upscaler.latent_normalization.std");
+    const std::vector<double> range = meta_list(meta, "latent_upscaler.scale_range");
+    const char* mode = rad_meta_gets(meta, "latent_upscaler.upsample_mode", "trilinear");
+    if (std::strcmp(cls, "LatentResizer3D") || geti("in_channels", kC) != kC ||
+        geti("out_channels", kC) != kC || K != 3 || geti("attn", 0) != 0 || C % G || C % 8 ||
+        every < 0 || tk < 1 || tk % 2 == 0 || std::strcmp(mode, "trilinear") ||
+        geti("upsample_align_corners", 0) != 0 || (int64_t)mean.size() != kC ||
+        (int64_t)sd.size() != kC || range.size() != 2 || !(range[1] > 1.0)) {
+        fprintf(stderr, "radiance: minimaxh3: latent_upscaler/ is a '%s' this plugin does not run: "
+                        "it runs LatentResizer3D over %d channels, 3x3x3 convolutions, odd "
+                        "temporal kernels, no attention, a trilinear resize without aligned "
+                        "corners and a scale range\n", cls, (int)kC);
+        return RAD_E_UNSUPPORTED;
+    }
+    m.ups = true;
+    m.ups_max = range[1];
+    m.uC = C;
+    m.uE = E;
+    /* patch_unfold normalises as x * mul + add: (x - mean) / std is x / std - mean / std. */
+    std::vector<double> im(kC), ia(kC);
+    for (int64_t c = 0; c < kC; ++c) {
+        im[(size_t)c] = 1.0 / sd[(size_t)c];
+        ia[(size_t)c] = -mean[(size_t)c] / sd[(size_t)c];
+    }
+    m.u_inv_mul = join_list(im);
+    m.u_inv_add = join_list(ia);
+    m.u_std = join_list(sd);
+    m.u_mean = join_list(mean);
+
+    /* The most voxels a frame of latents and a video hold, before or after: the small size is
+     * never larger than the full one. */
+    const int64_t V = max_lat_frames() * ((int64_t)kMaxArea / (kScale * kScale));
+    const int64_t P = m.maxV;
+    const int acc = RAD_ACCESS_PER_TOKEN;
+    auto wt = [&](const char* name, uint32_t dt, std::initializer_list<int64_t> shape) {
+        return wcopy(b, nm.f("ups.%s", name), nm.ckpt("latent_upscaler.%s", name), dt, shape, acc,
+                     kGrpUps);
+    };
+    auto conv = [&](rad_weight w, rad_weight bias, int64_t cin, int64_t cout, rad_buf x, rad_buf res,
+                    rad_buf y) -> rad_op {
+        if (!w || !bias) return 0;
+        const rad_op op = RAD_OP(b, "conv3d_ndhwc",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, V), RAD_INT("cin", cin),
+                                            RAD_INT("cout", cout), RAD_INT("k", K), RAD_INT("kt", K),
+                                            RAD_STR("dtype", "bf16")),
+                                 RAD_WEIGHTS(w, bias));
+        return res ? rw(b, op, { x, res }, { y }) : rw(b, op, { x }, { y });
+    };
+    auto gnorm = [&](rad_weight w, rad_weight bias, bool mod, rad_buf x, rad_buf y) -> rad_op {
+        if (!w || !bias) return 0;
+        const rad_op op = RAD_OP(b, "group_norm",
+                                 RAD_PARAMS(RAD_RANGE("M", 1, V), RAD_INT("n", C),
+                                            RAD_INT("groups", G), RAD_F64("eps", 1e-5),
+                                            RAD_STR("act", "silu"), RAD_STR("dtype", "bf16")),
+                                 RAD_WEIGHTS(w, bias));
+        return mod ? rw(b, op, { x, m.b_uemb, m.b_ust }, { y, m.b_ust })
+                   : rw(b, op, { x, m.b_ust }, { y, m.b_ust });
+    };
+    auto gemm32 = [&](rad_weight w, rad_weight bias, int64_t N, int64_t Kd, rad_buf x,
+                      rad_buf y) -> rad_op {
+        if (!w || !bias) return 0;
+        return rw(b, RAD_OP(b, "gemm_nt_bias",
+                            RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("N", N), RAD_INT("K", Kd),
+                                       RAD_STR("dtype", "f32")),
+                            RAD_WEIGHTS(w, bias)),
+                  { x }, { y });
+    };
+
+    /* ---- the latent in: unfolded and normalised in f32, then bf16 */
+    m.b_uin32 = decl_b(b, nm.f("ups.in32"), RAD_F32, { V, kC });
+    m.op_uunf = rw(b, RAD_OP(b, "patch_unfold",
+                             RAD_PARAMS(RAD_RANGE("M", 1, V), RAD_INT("C", kC), RAD_INT("pt", 1),
+                                        RAD_INT("ph", kPatch), RAD_INT("pw", kPatch),
+                                        RAD_STR("mul", m.u_inv_mul.c_str()),
+                                        RAD_STR("add", m.u_inv_add.c_str()),
+                                        RAD_STR("dtype", "f32")),
+                             RAD_NOWEIGHTS),
+                   { m.b_vstate }, { m.b_uin32 });
+    m.b_uin = decl_b(b, nm.f("ups.in"), RAD_BF16, { V, kC });
+    m.op_ucast = rw(b, RAD_OP(b, "cast",
+                              RAD_PARAMS(RAD_RANGE("M", 1, V), RAD_INT("n", kC),
+                                         RAD_STR("from", "f32"), RAD_STR("to", "bf16")),
+                              RAD_NOWEIGHTS),
+                    { m.b_uin32 }, { m.b_uin });
+
+    /* ---- the factor's embedding: Linear(1, E), SiLU, Linear(E, E), then every residual block's
+     * SiLU and Linear(E, 2C), each into its own row */
+    m.b_ufac = decl_b(b, nm.f("ups.fac"), RAD_F32, { 1, 1 });
+    m.op_ufac = rw(b, RAD_OP(b, "chan_affine",
+                             RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", 1), RAD_STR("mul", "1"),
+                                        RAD_STR("add", "-1"), RAD_STR("mode", "fma"),
+                                        RAD_INT("round", 0), RAD_STR("dtype", "f32")),
+                             RAD_NOWEIGHTS),
+                   {}, { m.b_ufac });
+    m.b_ue0 = decl_b(b, nm.f("ups.e0"), RAD_F32, { 1, E });
+    m.b_ue0s = decl_b(b, nm.f("ups.e0s"), RAD_F32, { 1, E });
+    m.b_ue1 = decl_b(b, nm.f("ups.e1"), RAD_F32, { 1, E });
+    m.b_ue1s = decl_b(b, nm.f("ups.e1s"), RAD_F32, { 1, E });
+    m.u_e0w = wt("embed.0.weight", RAD_F32, { E, 1 });
+    m.u_e0b = wt("embed.0.bias", RAD_F32, { E });
+    m.u_e2w = wt("embed.2.weight", RAD_F32, { E, E });
+    m.u_e2b = wt("embed.2.bias", RAD_F32, { E });
+    m.op_ue0 = gemm32(m.u_e0w, m.u_e0b, E, 1, m.b_ufac, m.b_ue0);
+    m.op_ues0 = unary(b, "silu", 1, E, "f32", m.b_ue0, m.b_ue0s);
+    m.op_ue2 = gemm32(m.u_e2w, m.u_e2b, E, E, m.b_ue0s, m.b_ue1);
+    m.op_ues2 = unary(b, "silu", 1, E, "f32", m.b_ue1, m.b_ue1s);
+    if (!m.op_uunf || !m.op_ucast || !m.op_ufac || !m.op_ue0 || !m.op_ues0 || !m.op_ue2 ||
+        !m.op_ues2)
+        return RAD_E_INVAL;
+
+    /* The checkpoint's block lists: a residual block per index, a temporal block after the b-th
+     * when b % every == 0, numbered in one sequence. */
+    auto layout = [&](int64_t n, std::vector<UpsBlock>* out) {
+        for (int64_t i = 0; i < n; ++i) {
+            out->emplace_back();
+            if (every > 0 && i % every == 0) {
+                out->emplace_back();
+                out->back().temporal = true;
+            }
+        }
+    };
+    layout(nin, &m.u_in);
+    layout(nout, &m.u_out);
+    int64_t n_res = 0;
+    for (auto* list : { &m.u_in, &m.u_out })
+        for (UpsBlock& B : *list) if (!B.temporal) B.emb = n_res++;
+    m.b_uemb = decl_b(b, nm.f("ups.emb"), RAD_F32, { n_res, 2 * C });
+    for (const char* side : { "in_blocks", "out_blocks" }) {
+        std::vector<UpsBlock>& list = !std::strcmp(side, "in_blocks") ? m.u_in : m.u_out;
+        for (size_t i = 0; i < list.size(); ++i) {
+            UpsBlock& B = list[i];
+            if (B.temporal) continue;
+            B.ew = wt(nm.ckpt("%s.%zu.emb_layers.1.weight", side, i), RAD_F32, { 2 * C, E });
+            B.eb = wt(nm.ckpt("%s.%zu.emb_layers.1.bias", side, i), RAD_F32, { 2 * C });
+            if (!B.ew || !B.eb) return RAD_E_INVAL;
+            B.op_e = rw(b, RAD_OP(b, "gemm_nt_bias",
+                                  RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("N", 2 * C),
+                                             RAD_INT("K", E), RAD_STR("dtype", "f32")),
+                                  RAD_WEIGHTS(B.ew, B.eb)),
+                        { m.b_ue1s }, { m.b_uemb });
+            if (!B.op_e) return RAD_E_INVAL;
+        }
+    }
+
+    /* ---- conv_in, the blocks before the resize, the resize, the blocks after it: the residual
+     * stream is A before the resize and B after it, the other two the blocks' temporaries */
+    m.b_ua = decl_b(b, nm.f("ups.a"), RAD_BF16, { V, C });
+    m.b_ub = decl_b(b, nm.f("ups.b"), RAD_BF16, { V, C });
+    m.b_uc = decl_b(b, nm.f("ups.c"), RAD_BF16, { V, C });
+    m.b_ust = decl_b(b, nm.f("ups.gn_stats"), RAD_F32, { G * (2 + 3 * 1024) });
+    m.u_cinw = wt("conv_in.weight", RAD_BF16, { C, kC, K, K, K });
+    m.u_cinb = wt("conv_in.bias", RAD_BF16, { C });
+    m.op_ucin = conv(m.u_cinw, m.u_cinb, kC, C, m.b_uin, 0, m.b_ua);
+    if (!m.op_ucin) return RAD_E_INVAL;
+    auto blocks = [&](const char* side, std::vector<UpsBlock>& list, rad_buf X, rad_buf T,
+                      rad_buf H) -> int {
+        for (size_t i = 0; i < list.size(); ++i) {
+            UpsBlock& B = list[i];
+            if (B.temporal) {
+                B.n1w = wt(nm.ckpt("%s.%zu.norm.weight", side, i), RAD_BF16, { C });
+                B.n1b = wt(nm.ckpt("%s.%zu.norm.bias", side, i), RAD_BF16, { C });
+                B.c1w = wt(nm.ckpt("%s.%zu.dwconv.weight", side, i), RAD_BF16, { C, 1, tk, 1, 1 });
+                B.c1b = wt(nm.ckpt("%s.%zu.dwconv.bias", side, i), RAD_BF16, { C });
+                B.c2w = wt(nm.ckpt("%s.%zu.pwconv.weight", side, i), RAD_BF16, { C, C, 1, 1, 1 });
+                B.c2b = wt(nm.ckpt("%s.%zu.pwconv.bias", side, i), RAD_BF16, { C });
+                if (!B.c1w || !B.c1b || !B.c2w || !B.c2b) return RAD_E_INVAL;
+                B.op_n1 = gnorm(B.n1w, B.n1b, false, X, T);
+                B.op_c1 = rw(b, RAD_OP(b, "tconv_dw",
+                                       RAD_PARAMS(RAD_RANGE("M", 1, V), RAD_INT("n", C),
+                                                  RAD_INT("k", tk), RAD_STR("dtype", "bf16")),
+                                       RAD_WEIGHTS(B.c1w, B.c1b)),
+                             { T }, { H });
+                B.op_c2 = rw(b, RAD_OP(b, "gemm_nt_bias",
+                                       RAD_PARAMS(RAD_RANGE("M", 1, V), RAD_INT("N", C),
+                                                  RAD_INT("K", C), RAD_STR("dtype", "bf16")),
+                                       RAD_WEIGHTS(B.c2w, B.c2b)),
+                             { H, X }, { X });
+                if (!B.op_n1 || !B.op_c1 || !B.op_c2) return RAD_E_INVAL;
+            } else {
+                B.n1w = wt(nm.ckpt("%s.%zu.in_layers.0.weight", side, i), RAD_BF16, { C });
+                B.n1b = wt(nm.ckpt("%s.%zu.in_layers.0.bias", side, i), RAD_BF16, { C });
+                B.c1w = wt(nm.ckpt("%s.%zu.in_layers.2.weight", side, i), RAD_BF16, { C, C, K, K, K });
+                B.c1b = wt(nm.ckpt("%s.%zu.in_layers.2.bias", side, i), RAD_BF16, { C });
+                B.n2w = wt(nm.ckpt("%s.%zu.out_norm.weight", side, i), RAD_BF16, { C });
+                B.n2b = wt(nm.ckpt("%s.%zu.out_norm.bias", side, i), RAD_BF16, { C });
+                B.c2w = wt(nm.ckpt("%s.%zu.out_layers.2.weight", side, i), RAD_BF16, { C, C, K, K, K });
+                B.c2b = wt(nm.ckpt("%s.%zu.out_layers.2.bias", side, i), RAD_BF16, { C });
+                B.op_n1 = gnorm(B.n1w, B.n1b, false, X, T);
+                B.op_c1 = conv(B.c1w, B.c1b, C, C, T, 0, H);
+                B.op_n2 = gnorm(B.n2w, B.n2b, true, H, T);
+                B.op_c2 = conv(B.c2w, B.c2b, C, C, T, X, X);
+                if (!B.op_n1 || !B.op_c1 || !B.op_n2 || !B.op_c2) return RAD_E_INVAL;
+            }
+        }
+        return RAD_OK;
+    };
+    RAD_ARCH_TRY(blocks("in_blocks", m.u_in, m.b_ua, m.b_ub, m.b_uc));
+    m.op_ursz = rw(b, RAD_OP(b, "resize_bilinear",
+                             RAD_PARAMS(RAD_RANGE("M", 1, V), RAD_INT("n", C),
+                                        RAD_STR("dtype", "bf16")),
+                             RAD_NOWEIGHTS),
+                   { m.b_ua }, { m.b_ub });
+    if (!m.op_ursz) return RAD_E_INVAL;
+    RAD_ARCH_TRY(blocks("out_blocks", m.u_out, m.b_ub, m.b_ua, m.b_uc));
+
+    /* ---- GroupNorm, SiLU, conv_out, then back to the lane: denormalised, folded into patch rows
+     * and re-noised, the soundtrack with it */
+    m.u_now = wt("norm_out.weight", RAD_BF16, { C });
+    m.u_nob = wt("norm_out.bias", RAD_BF16, { C });
+    m.op_unout = gnorm(m.u_now, m.u_nob, false, m.b_ub, m.b_ua);
+    m.b_uout = decl_b(b, nm.f("ups.out"), RAD_BF16, { V, kC });
+    m.u_coutw = wt("conv_out.weight", RAD_BF16, { kC, C, K, K, K });
+    m.u_coutb = wt("conv_out.bias", RAD_BF16, { kC });
+    m.op_ucout = conv(m.u_coutw, m.u_coutb, C, kC, m.b_ua, 0, m.b_uout);
+    m.op_ufold = rw(b, RAD_OP(b, "patch_fold",
+                              RAD_PARAMS(RAD_RANGE("M", 1, P), RAD_INT("C", kC), RAD_INT("pt", 1),
+                                         RAD_INT("ph", kPatch), RAD_INT("pw", kPatch),
+                                         RAD_STR("mul", m.u_std.c_str()),
+                                         RAD_STR("add", m.u_mean.c_str()), RAD_STR("dtype", "f32")),
+                              RAD_NOWEIGHTS),
+                    { m.b_uout }, { m.b_vstate });
+    auto renoise = [&](int64_t rows, int64_t n, rad_buf x) {
+        return rw(b, RAD_OP(b, "flow_renoise",
+                            RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", n),
+                                       RAD_INT("stream", 1), RAD_STR("dtype", "f32")),
+                            RAD_NOWEIGHTS),
+                  { x }, { x });
+    };
+    m.op_urnv = renoise(P, kPatchVals, m.b_vstate);
+    m.op_urna = renoise(m.maxA, kAudioC, m.b_astate);
+    if (!m.op_unout || !m.op_ucout || !m.op_ufold || !m.op_urnv || !m.op_urna) return RAD_E_INVAL;
+    return RAD_OK;
+}
+
 /* ================================================================== declare */
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx) return RAD_E_INVAL;
@@ -1635,6 +1933,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                         "block-fp8 container (data/recipes/minimax-h3-fp8.recipe)\n");
         return RAD_E_UNSUPPORTED;
     }
+    RAD_ARCH_TRY(declare_ups(b, meta, m));
     RAD_ARCH_TRY(declare_audio(b, meta, m));
     RAD_ARCH_TRY(declare_video(b, meta, m));
 
@@ -1685,6 +1984,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         d.max_lanes = kMaxLanes;
         d.frames_out = m.b_frames;
         d.audio_out = m.b_audio;
+        if (m.ups) {
+            d.upscale_max = m.ups_max;
+            d.upscale_refine = m.rungs.empty() ? kUpsRefineBase : kUpsRefineDistilled;
+        }
         RAD_ARCH_TRY(rad_declare_video_generator(b, &d));
     }
 
@@ -1694,6 +1997,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              m.gt.rank, m.gt.world, (long long)m.gt.n_layer, (long long)m.gt.n_head,
              (long long)gd.n_layer, (long long)gd.n_head, (long long)gd.n_ff, (long long)m.Ws,
              (long long)m.D, (long long)m.tiles, (long long)m.tpr);
+    if (m.ups)
+        rad_note(b, "rank %d/%d: latent upscaler LatentResizer3D -- %zu + %zu blocks of %lld "
+                    "channels, factors up to %g, whole on every rank", m.gt.rank, m.gt.world,
+                 m.u_in.size(), m.u_out.size(), (long long)m.uC, m.ups_max);
     return RAD_OK;
 }
 
@@ -1764,7 +2071,10 @@ static void step_cond(RadCtx* c, const RadBatch* batch, const Model& m) {
     RAD_ISSUE_N(c, m.op_t2, S2, brows(m.b_te1s, S2), RAD_W(m.w_t2), RAD_W(m.b_t2), RAD_NONE,
                 brows(m.b_temb, S2));
     RAD_ISSUE_N(c, m.op_ts2, S2, brows(m.b_temb, S2), brows(m.a_temb.x, S2));
-    m.q_temb.step(c, S2);
+    /* At its own rows: QuantFP8::step bands by the batch's tokens, which here are the prompt's,
+     * and the quantiser is declared for the 2 S rows of the steps' embeddings. */
+    RAD_ISSUE_N(c, m.q_temb.op, S2, brows(m.a_temb.x, S2), brows(m.a_temb.cq(), S2),
+                brows(m.a_temb.cs(), S2));
 
     /* ---- the modulation table: block l, segment e from its modality's projection of its
      * timestep's rows, at the table's column block (l, e) */
@@ -2052,6 +2362,74 @@ static void step_video(RadCtx* c, const RadBatch* batch, const Model& m) {
                 brows(m.b_frames, n));
 }
 
+/* The latent upscale: the lane's clean small latent through the upscaler to the full size, then
+ * both latents re-noised to the next step's sigmas with streams of their own (stream 1 of each
+ * seed; the first step drew stream 0). */
+static void step_upscale(RadCtx* c, const RadBatch* batch, const Model& m) {
+    const RadVideoGenBatch* V = batch->vgen_b;
+    const RadVideoGeom& s = V->geom_from;
+    const RadVideoGeom& d = V->geom;
+    const int64_t lane = V->lane, F = d.lat_frames, C = m.uC;
+    const int64_t vs = F * s.lat_h * s.lat_w, vd = F * d.lat_h * d.lat_w;
+    const int64_t pd = vd / (kPatch * kPatch), ps = vs / (kPatch * kPatch);
+    const int64_t arows = (int64_t)kAudioCh * d.n_audio;
+    const int32_t* gd = V->geom_d;
+    const RadOperand gsrc = praw(gd + RAD_VGEOM_UP_SRC, RAD_I32, 3);
+    const RadOperand gdst = praw(gd + RAD_VGEOM_UP_DST, RAD_I32, 3);
+    const RadOperand st = RAD_B(m.b_ust);
+
+    RAD_ISSUE_N(c, m.op_uunf, vs, brow_slice(m.b_vstate, lane * m.maxV, ps, kPatchVals),
+                praw(gd + RAD_VGEOM_UP_PSRC, RAD_I32, 3), brows(m.b_uin32, vs));
+    RAD_ISSUE_N(c, m.op_ucast, vs, brows(m.b_uin32, vs), brows(m.b_uin, vs));
+    RAD_ISSUE_N(c, m.op_ufac, 1, praw(V->upscale, RAD_F32, 1), brows(m.b_ufac, 1));
+    RAD_ISSUE_N(c, m.op_ue0, 1, brows(m.b_ufac, 1), RAD_W(m.u_e0w), RAD_W(m.u_e0b), RAD_NONE,
+                brows(m.b_ue0, 1));
+    RAD_ISSUE_N(c, m.op_ues0, 1, brows(m.b_ue0, 1), brows(m.b_ue0s, 1));
+    RAD_ISSUE_N(c, m.op_ue2, 1, brows(m.b_ue0s, 1), RAD_W(m.u_e2w), RAD_W(m.u_e2b), RAD_NONE,
+                brows(m.b_ue1, 1));
+    RAD_ISSUE_N(c, m.op_ues2, 1, brows(m.b_ue1, 1), brows(m.b_ue1s, 1));
+    for (const auto* list : { &m.u_in, &m.u_out })
+        for (const UpsBlock& B : *list)
+            if (!B.temporal)
+                RAD_ISSUE_N(c, B.op_e, 1, brows(m.b_ue1s, 1), RAD_W(B.ew), RAD_W(B.eb), RAD_NONE,
+                            brow_slice(m.b_uemb, B.emb, 1, 2 * C));
+    RAD_ISSUE_N(c, m.op_ucin, vs, brows(m.b_uin, vs), RAD_W(m.u_cinw), RAD_W(m.u_cinb), gsrc,
+                RAD_NONE, brows(m.b_ua, vs));
+    auto blocks = [&](const std::vector<UpsBlock>& list, rad_buf X, rad_buf T, rad_buf H,
+                      int64_t v, const RadOperand& g) {
+        for (const UpsBlock& B : list) {
+            RAD_ISSUE_N(c, B.op_n1, v, brows(X, v), RAD_W(B.n1w), RAD_W(B.n1b), RAD_NONE, st,
+                        brows(T, v));
+            if (B.temporal) {
+                RAD_ISSUE_N(c, B.op_c1, v, brows(T, v), RAD_W(B.c1w), RAD_W(B.c1b), g, brows(H, v));
+                RAD_ISSUE_N(c, B.op_c2, v, brows(H, v), RAD_W(B.c2w), RAD_W(B.c2b), brows(X, v),
+                            brows(X, v));
+                continue;
+            }
+            RAD_ISSUE_N(c, B.op_c1, v, brows(T, v), RAD_W(B.c1w), RAD_W(B.c1b), g, RAD_NONE,
+                        brows(H, v));
+            RAD_ISSUE_N(c, B.op_n2, v, brows(H, v), RAD_W(B.n2w), RAD_W(B.n2b),
+                        brow_slice(m.b_uemb, B.emb, 1, 2 * C), st, brows(T, v));
+            RAD_ISSUE_N(c, B.op_c2, v, brows(T, v), RAD_W(B.c2w), RAD_W(B.c2b), g, brows(X, v),
+                        brows(X, v));
+        }
+    };
+    blocks(m.u_in, m.b_ua, m.b_ub, m.b_uc, vs, gsrc);
+    RAD_ISSUE_N(c, m.op_ursz, vd, brows(m.b_ua, vs), praw(gd + RAD_VGEOM_UP_SRC, RAD_I32, 5),
+                brows(m.b_ub, vd));
+    blocks(m.u_out, m.b_ub, m.b_ua, m.b_uc, vd, gdst);
+    RAD_ISSUE_N(c, m.op_unout, vd, brows(m.b_ub, vd), RAD_W(m.u_now), RAD_W(m.u_nob), RAD_NONE, st,
+                brows(m.b_ua, vd));
+    RAD_ISSUE_N(c, m.op_ucout, vd, brows(m.b_ua, vd), RAD_W(m.u_coutw), RAD_W(m.u_coutb), gdst,
+                RAD_NONE, brows(m.b_uout, vd));
+    RAD_ISSUE_N(c, m.op_ufold, pd, brows(m.b_uout, vd), praw(gd + RAD_VGEOM_UP_PDST, RAD_I32, 3),
+                brow_slice(m.b_vstate, lane * m.maxV, pd, kPatchVals));
+    RAD_ISSUE_N(c, m.op_urnv, pd, praw(V->sched + 1, RAD_F32, 1), praw(V->seed, RAD_U32, 2),
+                brow_slice(m.b_vstate, lane * m.maxV, pd, kPatchVals));
+    RAD_ISSUE_N(c, m.op_urna, arows, praw(V->sched + 4, RAD_F32, 1), praw(V->seed + 2, RAD_U32, 2),
+                brow_slice(m.b_astate, lane * m.maxA, arows, kAudioC));
+}
+
 static void step(RadCtx* c, const RadBatch* batch) {
     const Model& m = g_model[rad_rank(c)];
     if (!batch->gen || !batch->vgen_b) {
@@ -2063,6 +2441,14 @@ static void step(RadCtx* c, const RadBatch* batch) {
     case RAD_GEN_PASS_VSTEP:   step_dit(c, batch, m); return;
     case RAD_GEN_PASS_ADECODE: step_audio(c, batch, m); return;
     case RAD_GEN_PASS_VDECODE: step_video(c, batch, m); return;
+    case RAD_GEN_PASS_VUPSCALE:
+        if (!m.ups) {
+            rad_step_fail(c, "minimaxh3: an upscale pass, and this container has no latent "
+                             "upscaler");
+            return;
+        }
+        step_upscale(c, batch, m);
+        return;
     default:
         rad_step_fail(c, "minimaxh3: a generator pass of a kind this plugin does not know");
     }

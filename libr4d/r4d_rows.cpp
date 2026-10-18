@@ -2331,6 +2331,34 @@ static const RadParamSpec pGridPos3[] = { P_INT("M"), P_INT("T"), P_INT("H"), P_
                                           P_INT("period"), P_F64("scale") };
 static const RadOperandSpec oGridPos3[] = { { "y", RAD_OPD_OUT, 0 } };
 
+/* ---- a video latent upscaler (r4d_upscaler.hip); the same specs as libref's. `geom` is the
+ * request's volume, i32 on the device; patch_fold takes patch_unfold's specs. */
+static const RadParamSpec pConv3d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
+                                        P_INT("kt"), P_STR("dtype") };
+static const RadOperandSpec oConv3d[] = {
+    { "x", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "b", RAD_OPD_WEIGHT, 0 },
+    { "geom", RAD_OPD_IN, 0 }, { "res", RAD_OPD_IN, 1 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pGroupNorm[] = { P_INT("M"), P_INT("n"), P_INT("groups"), P_F64("eps"),
+                                           P_STR("act"), P_STR("dtype") };
+static const RadOperandSpec oGroupNorm[] = {
+    { "x", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "b", RAD_OPD_WEIGHT, 0 },
+    { "mod", RAD_OPD_IN, 1 }, { "stats", RAD_OPD_INOUT, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pTconvDw[] = { P_INT("M"), P_INT("n"), P_INT("k"), P_STR("dtype") };
+static const RadOperandSpec oTconvDw[] = {
+    { "x", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "b", RAD_OPD_WEIGHT, 0 },
+    { "geom", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadOperandSpec oResizeBil[] = {
+    { "x", RAD_OPD_IN, 0 }, { "geom", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pFlowRenoise[] = { P_INT("M"), P_INT("n"), P_INT("stream"),
+                                             P_STR("dtype") };
+static const RadOperandSpec oFlowRenoise[] = {
+    { "sigma", RAD_OPD_IN, 0 }, { "seed", RAD_OPD_IN, 0 }, { "x", RAD_OPD_INOUT, 0 },
+};
+
 /* ---- video sparse attention (r4d_vsa.hip); the same specs as libref's. `segs` cuts the packed
  * rows into dense segments and the video grid, `geom` is the request's latent geometry; `sel` is
  * vsa_select's output and attn_vsa's input. `v` of vsa_select is read only for `coarse`. */
@@ -3017,6 +3045,25 @@ static const RadOpSchema kSchemas[] = {
            "tail."),
     SCHEMA("grid_pos3", pGridPos3, oGridPos3,
            "a video decoder's rotary positions over tiles of `period` rows, f32 [3, M]."),
+    SCHEMA("conv3d_ndhwc", pConv3d, oConv3d,
+           "a stride-1 `same` 3D convolution over NDHWC voxel rows of the device volume geom = "
+           "(T, H, W), PyTorch's [cout, cin, kt, k, k] weight, f32 accumulation; with `res`, "
+           "y = rd(rd(acc + b) + res), res may alias y."),
+    SCHEMA("group_norm", pGroupNorm, oGroupNorm,
+           "nn.GroupNorm over all of y's rows (biased variance, rstd in f32), then the optional "
+           "modulation v (1 + mod[0:n]) + mod[n:2n] and `act` (none or silu), one rounding; "
+           "stats[2g], stats[2g + 1] hold group g's mean and rstd, the rest is scratch."),
+    SCHEMA("tconv_dw", pTconvDw, oTconvDw,
+           "a depthwise convolution along the frames of the device volume geom = (T, H, W), "
+           "frames outside zero, taps in ascending order in f32, one rounding after the bias."),
+    SCHEMA("resize_bilinear", pGenMn, oResizeBil,
+           "each frame resized as torch's bilinear interpolation at a size, align_corners=False, "
+           "geom = (T, h, w, H, W), f32 and one rounding."),
+    SCHEMA("patch_fold", pPatchUnfold, oPatchUnfold,
+           "patch_unfold's inverse: voxel rows to f32 patch rows, x mul + add per channel."),
+    SCHEMA("flow_renoise", pFlowRenoise, oFlowRenoise,
+           "x = (1 - sigma) x + sigma z, z the (seed, stream) normal stream at element k n + c, "
+           "each step one f32 rounding."),
     SCHEMA("vsa_select", pVsa, oVsaSelect,
            "video sparse attention's selection over tiles of at most 64 rows (dense segments in "
            "chunks, the video grid in tile_t x tile_h x tile_w boxes): f32 tile means of q and k, "
@@ -3311,6 +3358,11 @@ static const RadConstraint cCastWiden[] = {
  * GEMM (w4a16_asym) where no rotation produces one. */
 static const RadConstraint cCastF16[] = {
     C_IN("from", "bf16"), C_IN("to", "f16"),
+};
+/* `cast` narrowing f32 -> bf16, rounded to nearest even: an f32 latent into a bf16 network (the
+ * MiniMax-H3 latent upscaler's input voxels). */
+static const RadConstraint cCastNarrow[] = {
+    C_IN("from", "f32"), C_IN("to", "bf16"),
 };
 /* The encoder's dense attention: bidirectional, any window, at the (head_dim, gqa) pairs
  * r4d_attn_dense_bf16.hip compiles. */
@@ -4196,6 +4248,18 @@ static const RadConstraint cGenF32[] = { C_IN("dtype", "f32") };
 static const RadConstraint cPatchUnfold[] = { C_IN("dtype", "f32"), C_LE("C", 64) };
 static const RadConstraint cGenAnyFloat[] = { C_IN("dtype", "bf16 f32") };
 static const RadConstraint cSnakeAa[] = { C_IN("dtype", "f32"), C_LE("k", 32) };
+/* ---- a video latent upscaler (r4d_upscaler.hip). The convolution decodes 3 x 3 x 3 taps as
+ * constants and reads 16-byte chunks of a voxel row; the group norm puts a thread on an 8-channel
+ * chunk inside one group, a row's chunks a power of two dividing the 256-thread block (the shim
+ * checks that and n / groups % 8), and merges at most 256 groups; the temporal convolution keeps
+ * its 5-frame window in registers; the fold's lists are kernel arguments, 64 floats at most. */
+static const RadConstraint cConv3d[] = { C_IN("dtype", "bf16"), C_EQ("k", 3), C_EQ("kt", 3),
+                                         C_DIV("cin", 8) };
+static const RadConstraint cGroupNorm[] = { C_IN("dtype", "bf16 f32"), C_DIV("n", 8),
+                                            C_LE("n", 2048), C_LE("groups", 256) };
+static const RadConstraint cTconvDw[] = { C_IN("dtype", "bf16"), C_EQ("k", 5), C_DIV("n", 8) };
+static const RadConstraint cResizeBil[] = { C_IN("dtype", "bf16 f32"), C_DIV("n", 8) };
+static const RadConstraint cPatchFold[] = { C_IN("dtype", "bf16 f32"), C_LE("C", 64) };
 static const RadConstraint cLnModQ[] = { C_IN("dtype", "bf16"), C_DIV("n", 128), C_LE("n", 8192),
                                          C_EQ("group", 128) };
 /* The lane copies move 32-bit words, so any row of whole words: bf16 latents and an f32 mask. */
@@ -4354,6 +4418,15 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cCastF16), NOTUNE,
   nullptr, nullptr, r4d_rad_cast_f16, nullptr, nullptr, nullptr,
+  r4d_shape_cast },
+
+{ "cast_f32_bf16", "cast", "elem",
+  "y = x, f32 narrowed to bf16",
+  "any M and n; both row pitches are read off the operands",
+  "f32 in, bf16 out, rounded to nearest even",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cCastNarrow), NOTUNE,
+  nullptr, nullptr, r4d_rad_cast_bf16, nullptr, nullptr, nullptr,
   r4d_shape_cast },
 
 { "act_mul_bf16", "act_mul", "elem",
@@ -7224,6 +7297,57 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cSnakeAa), NOTUNE,
   nullptr, nullptr, r4d_rad_snake_aa },
+
+/* ------------------------------------------------------------------- a video latent upscaler */
+{ "conv3d_ndhwc_bf16", "conv3d_ndhwc", "conv",
+  "a 3 x 3 x 3 video convolution as an implicit GEMM over (tap, cin): the weight stored tap-major "
+  "and read into registers, the voxels' tap neighbours staged through LDS",
+  "128 voxels x 128 output channels a block, 64 K a stage; k = kt = 3, cin % 8 == 0 (a multiple "
+  "of 64 decodes the tap once per cin / 64 stages); row pitches honoured, res may alias y",
+  "bf16 voxels, weight and residual, bf16 or f32 bias, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cConv3d), NOTUNE,
+  nullptr, nullptr, r4d_rad_conv3d_ndhwc, nullptr, r4d_rad_layout_conv3d_tap,
+  r4d_rad_relayout_conv3d_tap, nullptr, r4d_rad_unrelayout_conv3d_tap },
+
+{ "group_norm", "group_norm", "norm",
+  "GroupNorm over all rows in three launches: per-part (count, mean, M2), their merge to mean and "
+  "rstd, then the affine, modulation and SiLU a thread an 8-channel chunk",
+  "n % 8 == 0 with n / 8 a power of two up to 256, n / groups % 8 == 0, groups <= 256, M n / "
+  "groups < 2^24; row pitches honoured, y may alias x",
+  "bf16 or f32 rows, bf16 or f32 gain, bias and modulation, f32 statistics",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGroupNorm), NOTUNE,
+  nullptr, nullptr, r4d_rad_group_norm },
+
+{ "tconv_dw_bf16", "tconv_dw", "conv",
+  "a depthwise convolution along the frames: a thread an 8-channel chunk of a frame position, the "
+  "5-frame window in registers over every frame",
+  "k = 5, n % 8 == 0, row pitches honoured", "bf16 voxels, weight and bias, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cTconvDw), NOTUNE,
+  nullptr, nullptr, r4d_rad_tconv_dw },
+
+{ "resize_bilinear", "resize_bilinear", "elem",
+  "torch's per-frame bilinear resize at a size: a thread an 8-channel chunk of an output voxel",
+  "n % 8 == 0, any sizes, row pitches honoured", "bf16 or f32 voxels, f32 arithmetic",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cResizeBil), NOTUNE,
+  nullptr, nullptr, r4d_rad_resize_bilinear },
+
+{ "patch_fold_f32", "patch_fold", "elem",
+  "voxel rows folded to normalised patch rows, the geometry read on the device",
+  "C <= 64, row pitches honoured", "bf16 or f32 voxels, f32 patch rows",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cPatchFold), NOTUNE,
+  nullptr, nullptr, r4d_rad_patch_fold },
+
+{ "flow_renoise_f32", "flow_renoise", "elem",
+  "a clean latent re-noised to sigma from a fresh normal stream: a thread a value",
+  "any M and n, row pitches honoured", "f32 latent and sigma, u32 seed words",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cGenF32), NOTUNE,
+  nullptr, nullptr, r4d_rad_flow_renoise },
 };
 
 /* ================================================================================== the exports */

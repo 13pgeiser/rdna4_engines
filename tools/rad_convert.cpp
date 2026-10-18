@@ -812,10 +812,15 @@ int main(int argc, char** argv) {
             ++n_changed;
         }
         if (re) {
+            /* The movement group is the declaration's either way (add_weight and add_existing
+             * record ww's), so a plugin that regroups a weight still reuses its planes; only an
+             * expert's layer, index and slot say where its planes sit in a stride table. */
+            const bool expert = ww.expert >= 0 || re->expert >= 0;
             bool same = rad_enc_equal(&reuse.encoding(*re), &ww.enc) &&
                         ww.quantizer == reuse.str(re->quantizer) &&
                         ww.options == reuse.str(re->options) && re->rank == ww.rank &&
-                        re->layer == ww.layer && re->expert == ww.expert && re->slot == ww.slot;
+                        (!expert || (re->layer == ww.layer && re->expert == ww.expert &&
+                                     re->slot == ww.slot));
             for (uint32_t i = 0; same && i < RAD_MAX_RANK; ++i)
                 if (re->shape[i] != ww.shape[i]) same = false;
             if (in_place) {
