@@ -8502,6 +8502,17 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_F16_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_FA2_KMODE 8\n",
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
 );
+/// Native-fp8-KV split-KV verifier ([`ATTENTION_FP8_E4M3_FA2_GQA_F16_GFX1201_SRC`]
+/// + `HIPFIRE_FA2_SPLIT_LSE_FP8=1`): the KMODE=8 f16 body with the Q8
+/// verifier's LSE + normalized-Oacc partial/merge records. Entry symbols
+/// `attention_fp8_e4m3_fa2_gqa_{partial,merge}_lse_gfx1201` and
+/// `attention_fp8_e4m3_fa2_q_preconvert_lse_gfx1201`, distinct from the Q0
+/// module's. JIT-only via `Gpu::attention_fp8_e4m3_fa2_gqa_split_gfx1201`.
+pub const ATTENTION_FP8_E4M3_FA2_GQA_SPLIT_LSE_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KMODE 8\n",
+    "#define HIPFIRE_FA2_SPLIT_LSE_FP8 1\n",
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
+);
 /// Route-N stage-b source ([`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`] +
 /// `HIPFIRE_FA2_FP8=1` + `HIPFIRE_FA2_KMODE=8`): fp8 (E4M3) QK + PV
 /// arithmetic on native-fp8 KV rows (codes copied verbatim, scales from
