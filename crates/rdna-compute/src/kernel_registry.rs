@@ -244,7 +244,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     add!(
         "conv1d_silu_split",
         kernels::CONV1D_SILU_SPLIT_SRC,
-        ["conv1d_silu_split_f32"]
+        ["conv1d_silu_split_f32", "conv1d_silu_split_f32_masked",]
     );
     add!(
         "conv1d_silu_split_tree",
@@ -275,7 +275,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         kernels::REPEAT_INTERLEAVE_QK_SRC,
         ["repeat_interleave_qk_f32"]
     );
-    add!("embedding_q8", kernels::EMBEDDING_Q8_SRC, ["embedding_q8"]);
+    add!(
+        "embedding_q8",
+        kernels::EMBEDDING_Q8_SRC,
+        ["embedding_q8", "embedding_q8_buf_broadcast"]
+    );
     add!(
         "embedding_q8_batched",
         kernels::EMBEDDING_Q8_BATCHED_SRC,
@@ -304,7 +308,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     add!(
         "gated_delta_net_q8",
         kernels::GATED_DELTA_NET_Q8_SRC,
-        ["gated_delta_net_q8"]
+        [
+            "gated_delta_net_q8",
+            "gated_delta_net_q8_independent_masked",
+        ]
     );
     // DFlash verify tape capture (`Gpu::tape_copy_batched`, tape_copy.rs): the
     // kernel source has no arch guard and the launcher no arch gate
@@ -510,7 +517,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     add!(
         "kv_cache_write_q8_0",
         kernels::KV_CACHE_WRITE_Q8_0_SRC,
-        ["kv_cache_write_q8_0"]
+        ["kv_cache_write_q8_0", "kv_cache_write_q8_0_ring",]
     );
     add!(
         "attention_q8_0_kv",
@@ -706,7 +713,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "convert_f32_to_f16",
             kernels::GEMM_HFQ4G256_RESIDUAL_FP16_SRC,
-            ["convert_f32_to_f16"]
+            ["convert_f32_to_f16", "gemm_hfq4g256_residual_fp16",]
         );
         add!(
             "fused_gate_up_hfq4g256_mq4v2",
@@ -741,7 +748,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "gated_delta_net_q8_fast",
             kernels::GATED_DELTA_NET_Q8_FAST_SRC,
-            ["gated_delta_net_q8_fast"]
+            [
+                "gated_delta_net_q8_fast",
+                "gated_delta_net_q8_fast_independent_masked",
+            ]
         );
         add!(
             "gdn_pre_batched_gfx1201",
@@ -751,7 +761,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2",
             kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_SRC,
-            ["gemm_gate_up_mq4g256v2_wmma_gfx12"]
+            [
+                "gemm_gate_up_mq4g256v2_wmma_gfx12",
+                "gemm_gate_up_mq4g256v2_wmma_gfx12_ldsstage",
+            ]
         );
         add!(
             "gemm_gate_up_mq4g256v2_wmma_gfx12_vt",
@@ -793,7 +806,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "gemm_hfq4g256_residual_wmma_gfx12_mq4v2",
             kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC,
-            ["gemm_mq4g256v2_residual_wmma_gfx12"]
+            [
+                "gemm_mq4g256v2_residual_wmma_gfx12",
+                "gemm_mq4g256v2_residual_wmma_gfx12_ldsstage",
+            ]
         );
         add!(
             "gemm_mq4g256v2_residual_wmma_gfx12_vt",
@@ -922,12 +938,18 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "gemm_gate_up_hfq4g256_wmma_gfx12",
             kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_SRC,
-            ["gemm_gate_up_hfq4g256_wmma_gfx12"]
+            [
+                "gemm_gate_up_hfq4g256_wmma_gfx12",
+                "gemm_gate_up_hfq4g256_wmma_gfx12_ldsstage",
+            ]
         );
         add!(
             "gemm_hfq4g256_residual_wmma_gfx12",
             kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC,
-            ["gemm_hfq4g256_residual_wmma_gfx12"]
+            [
+                "gemm_hfq4g256_residual_wmma_gfx12",
+                "gemm_hfq4g256_residual_wmma_gfx12_ldsstage",
+            ]
         );
         add!(
             "gemm_qkv_hfq4g256_wmma_gfx12",
@@ -2539,6 +2561,9 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemm_qkvza_mq6g256v2_wmma_gfx11_bt4",
             ]
         );
+        // One module, a different symbol per launcher: the installed object's
+        // index must list every kernel the source defines for the arch (the Q8
+        // QSA exports included); `tensor_ops_declares_exactly_the_kernels_its_source_defines`.
         add!(
             "tensor_ops",
             crate::tensor_ops::TENSOR_OPS_SRC,
@@ -2617,6 +2642,15 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_select_scores_rows32_f32",
                 "indexed_attention_select_scores_rows8_f32",
                 "scale_f32",
+                "gated_delta_step_halves_state128_persistent256_canon_q8",
+                "gated_delta_step_halves_state128_persistent256_canon_q8ef",
+                "indexed_attention_attention_q8",
+                "indexed_attention_attention_q8_batched",
+                "indexed_attention_attention_q8_batched_hg4",
+                "indexed_attention_attention_q8_batched_serial",
+                "indexed_attention_attention_q8_serial",
+                "indexed_attention_cache_append_q8_batched",
+                "indexed_attention_decode_prologue_q8",
             ]
         );
     }
@@ -2689,6 +2723,9 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemm_mq6g256v2_wmma_gfx12_bt8_x4_regions",
             ]
         );
+        // One module, a different symbol per launcher: the installed object's
+        // index must list every kernel the source defines for the arch (the Q8
+        // QSA exports included); `tensor_ops_declares_exactly_the_kernels_its_source_defines`.
         add!(
             "tensor_ops",
             crate::tensor_ops::TENSOR_OPS_SRC,
@@ -2777,6 +2814,15 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_select_scores_rows32_f32",
                 "indexed_attention_select_scores_rows8_f32",
                 "scale_f32",
+                "gated_delta_step_halves_state128_persistent256_canon_q8",
+                "gated_delta_step_halves_state128_persistent256_canon_q8ef",
+                "indexed_attention_attention_q8",
+                "indexed_attention_attention_q8_batched",
+                "indexed_attention_attention_q8_batched_hg4",
+                "indexed_attention_attention_q8_batched_serial",
+                "indexed_attention_attention_q8_serial",
+                "indexed_attention_cache_append_q8_batched",
+                "indexed_attention_decode_prologue_q8",
             ]
         );
         // Default >= 512-row prefill: BF16 -> F16 WMMA projections (HC
@@ -3984,7 +4030,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "attention_flash_q8_0_rows4_d8",
             kernels::ATTENTION_FLASH_Q8_0_TILE_ROWS_SRC,
-            ["attention_flash_q8_0_rows4_d8"]
+            [
+                "attention_flash_q8_0_rows4_d8",
+                "attention_flash_q8_0_rows4_d4",
+                "attention_flash_q8_0_rows8_d4",
+            ]
         );
         add!(
             "attention_flash_q8_0_rows8_d8",
@@ -4265,7 +4315,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "attention_flash_q8_0_rows4_d8",
             kernels::ATTENTION_FLASH_Q8_0_TILE_ROWS_SRC,
-            ["attention_flash_q8_0_rows4_d8"]
+            [
+                "attention_flash_q8_0_rows4_d8",
+                "attention_flash_q8_0_rows4_d4",
+                "attention_flash_q8_0_rows8_d4",
+            ]
         );
         add!(
             "attention_flash_q8_0_rows8_d8",
@@ -4318,7 +4372,12 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt",
             kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_BT_SRC,
-            ["gemm_hfq4g256_residual_wmma_gfx1100_muse_rm2_bv6"]
+            [
+                "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm2_bv6",
+                "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm3_bv4",
+                "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm4_bv3",
+                "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm6_bv2",
+            ]
         );
     }
     if arch == "gfx1151" {
@@ -4339,7 +4398,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             [
                 "npu_trunk_consume_bf16_fast",
                 "npu_trunk_epi_bf16",
-                "npu_trunk_pack_a_bf16"
+                "npu_trunk_pack_a_bf16",
+                "npu_trunk_pack_a_bf16_old",
             ]
         );
     }
@@ -4588,7 +4648,12 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "gemm_qkv_mqv2_wmma_gfx1201_bt",
             kernels::GEMM_QKV_MQV2_WMMA_GFX1201_BT_SRC,
-            ["gemm_qkv_mq6g256v2_wmma_gfx1201_bt8"]
+            [
+                "gemm_qkv_mq6g256v2_wmma_gfx1201_bt8",
+                "gemm_qkv_mq2g256v2_wmma_gfx1201_bt8",
+                "gemm_qkv_mq3g256v2_wmma_gfx1201_bt8",
+                "gemm_qkv_mq5g256v2_wmma_gfx1201_bt8",
+            ]
         );
         add!(
             "gemm_mq4g256v2_residual_mmq_iu4_gfx12_v3",
@@ -4596,7 +4661,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             [
                 "gemm_mq4g256v2_residual_mmq_iu4_full_add_v3",
                 "gemm_mq4g256v2_residual_mmq_iu4_full_set_v3",
-                "quantize_int4_mmq_ds128"
+                "quantize_int4_mmq_ds128",
+                "gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3",
             ]
         );
         add!(
@@ -4634,7 +4700,10 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "gemm_gate_up_hfq4g256_wmma",
             kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC,
-            ["gemm_gate_up_hfq4g256_wmma"]
+            [
+                "gemm_gate_up_hfq4g256_wmma",
+                "gemm_gate_up_hfq4g256_wmma_ldsstage",
+            ]
         );
         add!(
             "gemm_hfq4g256_moe_grouped_mmq_gfx11_dgpu",
@@ -4689,7 +4758,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             [
                 "gemm_hfq4g256_residual_mmq",
                 "gemm_hfq4g256_residual_mmq_full_add",
-                "quantize_q8_1_mmq_ds4"
+                "quantize_q8_1_mmq_ds4",
+                "gemm_hfq4g256_residual_mmq_full_set",
             ]
         );
         add!(
@@ -4772,11 +4842,25 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC,
             ["gemv_hfq4g256_moe_down_k8_indexed_batched_expanded"]
         );
-        add!(
-            "gemv_mq2g256_lloyd_moe_down_indexed",
-            kernels::GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_SRC,
-            ["gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed"]
-        );
+        // `k8all` is requested only by the exact-gfx1151 DeepSeek4 K=2048 route
+        // (gemv.rs:21118-21125, `deepseek4_gfx1151_route && is_gfx1151() && k == 2048`).
+        if matches!(arch, "gfx1100" | "gfx1201") {
+            add!(
+                "gemv_mq2g256_lloyd_moe_down_indexed",
+                kernels::GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_SRC,
+                ["gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed"]
+            );
+        }
+        if arch == "gfx1151" {
+            add!(
+                "gemv_mq2g256_lloyd_moe_down_indexed",
+                kernels::GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_SRC,
+                [
+                    "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed",
+                    "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8all_indexed"
+                ]
+            );
+        }
         add!(
             "gemv_mq2g256_lloyd_moe_gate_up_indexed",
             kernels::GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_SRC,
@@ -4802,7 +4886,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "gemv_hfq4g256_multirow_default_mq3v2",
             kernels::GEMV_MQ3G256V2_MULTIROW_SRC,
-            ["gemv_mq3g256v2_multirow_r2"]
+            [
+                "gemv_mq3g256v2_multirow_r2",
+                "gemv_mq3g256v2_multirow_r4",
+                "gemv_mq3g256v2_multirow_r8",
+            ]
         );
     }
     if arch == "gfx1100" {
@@ -4810,10 +4898,28 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gemm_mq4g256v2_residual_mmq_iu4_gfx11_symfold",
             kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX11_SYMFOLD_SRC,
             [
-                "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_symfold",
-                "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100",
                 "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100_symfold",
-                "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100_symfold"
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold",
+                "quantize_int4_mmq_ds128",
             ]
         );
     }
@@ -4822,10 +4928,24 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "gemm_mq4g256v2_residual_mmq_iu4_gfx11_symfold",
             kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX11_SYMFOLD_SRC,
             [
+                "gemm_mq4g256v2_residual_mmq_iu4",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151",
                 "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151_symfold",
-                "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151",
                 "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151_symfold",
-                "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151_symfold"
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold",
+                "quantize_int4_mmq_ds128",
             ]
         );
     }
@@ -9117,6 +9237,707 @@ mod tests {
         assert_trace_packaged(include_str!(
             "../tests/fixtures/kernel-trace-first-request.tsv"
         ));
+    }
+
+    // ── Declared-symbol completeness ────────────────────────────────────────
+    // The packaged object's index records the symbols its recipe declares, and
+    // `KernelCompiler::check_indexed_object` rejects the object when a requested
+    // symbol is not among them. So every `extern "C" __global__` kernel a source
+    // defines for an arch must be declared by its entry; this scanner is a
+    // minimal C preprocessor (comments, `#if`/`#ifdef`/`#elif`/`#else`,
+    // object- and function-like `#define`) plus a kernel-name extractor
+    // (`__global__ ... void NAME(`, macro-resolved names, `##`-pasted names of
+    // function-like generator macros expanded at their active invocations).
+
+    fn strip_c_comments(src: &str) -> String {
+        let b = src.as_bytes();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'"' | b'\'' => {
+                    let q = b[i];
+                    out.push(q as char);
+                    i += 1;
+                    while i < b.len() && b[i] != q {
+                        if b[i] == b'\\' && i + 1 < b.len() {
+                            out.push(b[i] as char);
+                            i += 1;
+                        }
+                        out.push(b[i] as char);
+                        i += 1;
+                    }
+                    if i < b.len() {
+                        out.push(q as char);
+                        i += 1;
+                    }
+                }
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                        if b[i] == b'\n' {
+                            out.push('\n');
+                        }
+                        i += 1;
+                    }
+                    i += 2;
+                    out.push(' ');
+                }
+                c => {
+                    out.push(c as char);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    fn c_idents(s: &str) -> Vec<(usize, usize)> {
+        let b = s.as_bytes();
+        let mut v = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i].is_ascii_alphabetic() || b[i] == b'_' {
+                let st = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                v.push((st, i));
+            } else if b[i].is_ascii_digit() {
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        v
+    }
+
+    fn eval_pp_cond(expr: &str, defs: &HashMap<String, String>) -> bool {
+        // Tokens.
+        #[derive(Clone, Debug, PartialEq)]
+        enum T {
+            Num(i64),
+            Id(String),
+            Op(&'static str),
+        }
+        let b = expr.as_bytes();
+        let mut toks = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            if c.is_ascii_whitespace() {
+                i += 1;
+            } else if c.is_ascii_digit() {
+                let st = i;
+                while i < b.len() && b[i].is_ascii_alphanumeric() {
+                    i += 1;
+                }
+                let t = expr[st..i]
+                    .trim_end_matches(|c: char| c == 'u' || c == 'U' || c == 'l' || c == 'L');
+                toks.push(T::Num(t.parse::<i64>().unwrap_or(0)));
+            } else if c.is_ascii_alphabetic() || c == b'_' {
+                let st = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                toks.push(T::Id(expr[st..i].to_owned()));
+            } else {
+                let two = expr.get(i..i + 2).unwrap_or("");
+                let op = ["&&", "||", "==", "!=", "<=", ">="]
+                    .into_iter()
+                    .find(|o| *o == two);
+                if let Some(o) = op {
+                    toks.push(T::Op(o));
+                    i += 2;
+                } else {
+                    let o = ["(", ")", "!", "<", ">", "+", "-", "*", "/", "%"]
+                        .into_iter()
+                        .find(|o| o.as_bytes()[0] == c)
+                        .unwrap_or_else(|| panic!("unsupported #if token {c:?} in {expr:?}"));
+                    toks.push(T::Op(o));
+                    i += 1;
+                }
+            }
+        }
+        struct P<'a> {
+            t: Vec<T>,
+            i: usize,
+            defs: &'a HashMap<String, String>,
+        }
+        impl P<'_> {
+            fn peek(&self) -> Option<&T> {
+                self.t.get(self.i)
+            }
+            fn eat(&mut self, op: &str) -> bool {
+                if matches!(self.peek(), Some(T::Op(o)) if *o == op) {
+                    self.i += 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            fn ident_value(&self, name: &str, depth: u32) -> i64 {
+                match self.defs.get(name) {
+                    Some(v) if depth < 8 => {
+                        let v = v.trim();
+                        if let Ok(n) = v.parse::<i64>() {
+                            n
+                        } else if v.is_empty() {
+                            0
+                        } else if v.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+                            self.ident_value(v, depth + 1)
+                        } else {
+                            // A parenthesized/compound macro body (`(A && B)`).
+                            i64::from(eval_pp_cond(v, self.defs))
+                        }
+                    }
+                    _ => 0,
+                }
+            }
+            fn primary(&mut self) -> i64 {
+                match self.t.get(self.i).cloned() {
+                    Some(T::Num(n)) => {
+                        self.i += 1;
+                        n
+                    }
+                    Some(T::Id(id)) if id == "defined" => {
+                        self.i += 1;
+                        let paren = self.eat("(");
+                        let name = match self.t.get(self.i).cloned() {
+                            Some(T::Id(n)) => n,
+                            other => panic!("defined without identifier: {other:?}"),
+                        };
+                        self.i += 1;
+                        if paren {
+                            assert!(self.eat(")"), "unbalanced defined(");
+                        }
+                        i64::from(self.defs.contains_key(&name))
+                    }
+                    Some(T::Id(id)) => {
+                        self.i += 1;
+                        // Function-like macro call in a condition: no kernel
+                        // source here uses one; treat as 0.
+                        let v = self.ident_value(&id, 0);
+                        if self.peek() == Some(&T::Op("(")) {
+                            let mut depth = 0;
+                            while let Some(t) = self.t.get(self.i) {
+                                match t {
+                                    T::Op("(") => depth += 1,
+                                    T::Op(")") => {
+                                        depth -= 1;
+                                        if depth == 0 {
+                                            self.i += 1;
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                self.i += 1;
+                            }
+                            return 0;
+                        }
+                        v
+                    }
+                    Some(T::Op("(")) => {
+                        self.i += 1;
+                        let v = self.or();
+                        assert!(self.eat(")"), "unbalanced (");
+                        v
+                    }
+                    Some(T::Op("!")) => {
+                        self.i += 1;
+                        i64::from(self.primary() == 0)
+                    }
+                    Some(T::Op("-")) => {
+                        self.i += 1;
+                        -self.primary()
+                    }
+                    other => panic!("bad #if expression token {other:?}"),
+                }
+            }
+            fn mul(&mut self) -> i64 {
+                let mut v = self.primary();
+                loop {
+                    if self.eat("*") {
+                        v *= self.primary();
+                    } else if self.eat("/") {
+                        let d = self.primary();
+                        v = if d == 0 { 0 } else { v / d };
+                    } else if self.eat("%") {
+                        let d = self.primary();
+                        v = if d == 0 { 0 } else { v % d };
+                    } else {
+                        return v;
+                    }
+                }
+            }
+            fn add(&mut self) -> i64 {
+                let mut v = self.mul();
+                loop {
+                    if self.eat("+") {
+                        v += self.mul();
+                    } else if self.eat("-") {
+                        v -= self.mul();
+                    } else {
+                        return v;
+                    }
+                }
+            }
+            fn rel(&mut self) -> i64 {
+                let mut v = self.add();
+                loop {
+                    if self.eat("<=") {
+                        v = i64::from(v <= self.add());
+                    } else if self.eat(">=") {
+                        v = i64::from(v >= self.add());
+                    } else if self.eat("<") {
+                        v = i64::from(v < self.add());
+                    } else if self.eat(">") {
+                        v = i64::from(v > self.add());
+                    } else {
+                        return v;
+                    }
+                }
+            }
+            fn eq(&mut self) -> i64 {
+                let mut v = self.rel();
+                loop {
+                    if self.eat("==") {
+                        v = i64::from(v == self.rel());
+                    } else if self.eat("!=") {
+                        v = i64::from(v != self.rel());
+                    } else {
+                        return v;
+                    }
+                }
+            }
+            fn and(&mut self) -> i64 {
+                let mut v = self.eq();
+                while self.eat("&&") {
+                    let r = self.eq();
+                    v = i64::from(v != 0 && r != 0);
+                }
+                v
+            }
+            fn or(&mut self) -> i64 {
+                let mut v = self.and();
+                while self.eat("||") {
+                    let r = self.and();
+                    v = i64::from(v != 0 || r != 0);
+                }
+                v
+            }
+        }
+        let mut p = P {
+            t: toks,
+            i: 0,
+            defs,
+        };
+        let v = p.or();
+        assert_eq!(p.i, p.t.len(), "trailing tokens in #if {expr:?}");
+        v != 0
+    }
+
+    /// Names of the `__global__` kernels `src` defines after preprocessing with
+    /// `predefs` (`-D` style `(name, value)` pairs).
+    fn active_kernel_names(
+        src: &str,
+        predefs: &[(String, String)],
+    ) -> std::collections::BTreeSet<String> {
+        let stripped = strip_c_comments(src);
+        // Logical lines (backslash continuation).
+        let mut lines: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        for raw in stripped.lines() {
+            if let Some(head) = raw.strip_suffix('\\') {
+                cur.push_str(head);
+                cur.push(' ');
+            } else {
+                cur.push_str(raw);
+                lines.push(std::mem::take(&mut cur));
+            }
+        }
+        if !cur.is_empty() {
+            lines.push(cur);
+        }
+        let mut defs: HashMap<String, String> = predefs.iter().cloned().collect();
+        let mut fdefs: HashMap<String, (Vec<String>, String)> = HashMap::new();
+        let mut stack: Vec<(bool, bool, bool)> = Vec::new(); // parent, taken, active
+        let mut text = String::new();
+        let mut out = std::collections::BTreeSet::new();
+        let active = |st: &Vec<(bool, bool, bool)>| st.last().map_or(true, |s| s.2);
+        for line in &lines {
+            let t = line.trim_start();
+            let Some(d) = t.strip_prefix('#') else {
+                if active(&stack) {
+                    text.push_str(line);
+                    text.push('\n');
+                }
+                continue;
+            };
+            let d = d.trim_start();
+            let name_end = d
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(d.len());
+            let (kw, rest) = (&d[..name_end], d[name_end..].trim());
+            let parent = active(&stack);
+            if parent && matches!(kw, "define" | "undef") && !text.is_empty() {
+                // Expand/resolve pending text under the macros as they stand
+                // before this directive changes them.
+                scan_kernels(&text, &defs, &fdefs, &mut out, 0);
+                text.clear();
+            }
+            match kw {
+                "if" => {
+                    let a = parent && eval_pp_cond(rest, &defs);
+                    stack.push((parent, a, a));
+                }
+                "ifdef" => {
+                    let a =
+                        parent && defs.contains_key(rest.split_whitespace().next().unwrap_or(""));
+                    stack.push((parent, a, a));
+                }
+                "ifndef" => {
+                    let a =
+                        parent && !defs.contains_key(rest.split_whitespace().next().unwrap_or(""));
+                    stack.push((parent, a, a));
+                }
+                "elif" => {
+                    let top = stack.last_mut().expect("#elif without #if");
+                    if top.0 && !top.1 && eval_pp_cond(rest, &defs) {
+                        top.2 = true;
+                        top.1 = true;
+                    } else {
+                        top.2 = false;
+                    }
+                }
+                "else" => {
+                    let top = stack.last_mut().expect("#else without #if");
+                    top.2 = top.0 && !top.1;
+                    top.1 = true;
+                }
+                "endif" => {
+                    stack.pop().expect("#endif without #if");
+                }
+                "define" if parent => {
+                    let nend = rest
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .unwrap_or(rest.len());
+                    let name = rest[..nend].to_owned();
+                    let after = &rest[nend..];
+                    if let Some(args) = after.strip_prefix('(') {
+                        let close = args.find(')').expect("unterminated macro parameter list");
+                        let params = args[..close]
+                            .split(',')
+                            .map(|p| p.trim().to_owned())
+                            .filter(|p| !p.is_empty())
+                            .collect();
+                        fdefs.insert(name, (params, args[close + 1..].trim().to_owned()));
+                    } else {
+                        defs.insert(name, after.trim().to_owned());
+                    }
+                }
+                "undef" if parent => {
+                    defs.remove(rest.split_whitespace().next().unwrap_or(""));
+                    fdefs.remove(rest.split_whitespace().next().unwrap_or(""));
+                }
+                _ => {}
+            }
+        }
+        assert!(stack.is_empty(), "unbalanced preprocessor conditionals");
+        scan_kernels(&text, &defs, &fdefs, &mut out, 0);
+        out
+    }
+
+    fn scan_kernels(
+        text: &str,
+        defs: &HashMap<String, String>,
+        fdefs: &HashMap<String, (Vec<String>, String)>,
+        out: &mut std::collections::BTreeSet<String>,
+        depth: u32,
+    ) {
+        let ids = c_idents(text);
+        for (n, &(s, e)) in ids.iter().enumerate() {
+            let word = &text[s..e];
+            if word == "__global__" {
+                // `void NAME (`
+                let mut j = n + 1;
+                while j < ids.len() && &text[ids[j].0..ids[j].1] != "void" {
+                    j += 1;
+                    if j > n + 12 {
+                        break;
+                    }
+                }
+                let Some(&(ns, ne)) = ids.get(j + 1) else {
+                    continue;
+                };
+                if ids.get(j).map_or(true, |&(a, b)| &text[a..b] != "void") {
+                    continue;
+                }
+                if !text[ne..].trim_start().starts_with('(') {
+                    continue;
+                }
+                let mut name = text[ns..ne].to_owned();
+                for _ in 0..6 {
+                    match defs.get(&name) {
+                        Some(v) if !v.trim().is_empty() => name = v.trim().to_owned(),
+                        _ => break,
+                    }
+                }
+                out.insert(name);
+            } else if let Some((params, body)) = fdefs.get(word) {
+                // Only generator macros matter: a body that defines a kernel or
+                // invokes another function-like macro (which may).
+                let nests = c_idents(body)
+                    .iter()
+                    .any(|&(a, b)| fdefs.contains_key(&body[a..b]));
+                if depth > 4 || !(body.contains("__global__") || nests) {
+                    continue;
+                }
+                let rest = &text[e..];
+                if !rest.trim_start().starts_with('(') {
+                    continue;
+                }
+                let open = e + rest.find('(').unwrap();
+                let mut d = 0;
+                let mut args: Vec<String> = Vec::new();
+                let mut cur = String::new();
+                let mut close = None;
+                for (k, ch) in text[open..].char_indices() {
+                    match ch {
+                        '(' => {
+                            d += 1;
+                            if d > 1 {
+                                cur.push(ch);
+                            }
+                        }
+                        ')' => {
+                            d -= 1;
+                            if d == 0 {
+                                close = Some(open + k);
+                                break;
+                            }
+                            cur.push(ch);
+                        }
+                        ',' if d == 1 => args.push(std::mem::take(&mut cur)),
+                        _ => cur.push(ch),
+                    }
+                }
+                if close.is_none() {
+                    continue;
+                }
+                args.push(cur);
+                let args: Vec<String> = args.iter().map(|a| a.trim().to_owned()).collect();
+                if args.len() != params.len() {
+                    continue;
+                }
+                // Substitute parameters token-wise, then paste `##`.
+                let mut exp = String::new();
+                let mut last = 0;
+                for (a, b) in c_idents(body) {
+                    exp.push_str(&body[last..a]);
+                    match params.iter().position(|p| p == &body[a..b]) {
+                        Some(pi) => exp.push_str(&args[pi]),
+                        None => exp.push_str(&body[a..b]),
+                    }
+                    last = b;
+                }
+                exp.push_str(&body[last..]);
+                let exp = exp.split("##").map(str::trim).collect::<Vec<_>>().join("");
+                scan_kernels(&exp, defs, fdefs, out, depth + 1);
+            }
+        }
+    }
+
+    fn entry_predefs(arch: &str, flags: &[String]) -> Vec<(String, String)> {
+        let mut v: Vec<(String, String)> = vec![("__HIP_DEVICE_COMPILE__".into(), "1".into())];
+        let (iso, fam) = match arch {
+            "gfx1100" | "gfx1151" | "gfx1201" => (
+                arch,
+                if arch == "gfx1201" {
+                    "__GFX12__"
+                } else {
+                    "__GFX11__"
+                },
+            ),
+            _ => (arch, "__GFX9__"),
+        };
+        v.push((format!("__{iso}__"), "1".into()));
+        v.push((fam.into(), "1".into()));
+        for f in flags {
+            if let Some(d) = f.strip_prefix("-D") {
+                let (n, val) = d.split_once('=').unwrap_or((d, "1"));
+                v.push((n.to_owned(), val.to_owned()));
+            }
+        }
+        v
+    }
+
+    /// Kernels a shared source defines on an arch that no entry of its source
+    /// group declares (`arch\tmodule\tsymbol\treason`, `#` comments): variants
+    /// the launchers reach only through developer opt-ins or through a module
+    /// name another entry carries. Shrink-only: a row must still be a real gap.
+    const UNDECLARED_KERNEL_CENSUS: &str =
+        include_str!("../tests/fixtures/undeclared-kernel-census.tsv");
+
+    /// Gaps keyed `(arch, first module of the source group, symbol)`. Entries
+    /// that share one source text on an arch (the repo convention of one module
+    /// per symbol over a shared translation unit) form a group: a kernel is
+    /// covered when any entry of its group declares it, because each module's
+    /// index only has to contain the symbols requested through that module.
+    fn undeclared_kernels() -> std::collections::BTreeMap<(String, String, String), ()> {
+        let mut gaps = std::collections::BTreeMap::new();
+        for arch in SUPPORTED_ARCHES {
+            let mut groups: std::collections::BTreeMap<String, Vec<KernelEntry>> =
+                Default::default();
+            for entry in entries(arch, "").unwrap() {
+                groups
+                    .entry(entry.source().to_owned())
+                    .or_default()
+                    .push(entry);
+            }
+            for group in groups.values() {
+                let first = group.iter().map(|e| e.module).min().unwrap();
+                let defined =
+                    active_kernel_names(group[0].source(), &entry_predefs(arch, &group[0].flags));
+                for name in defined {
+                    if !group.iter().any(|e| e.symbols.contains(&name.as_str())) {
+                        gaps.insert((arch.to_string(), first.to_string(), name), ());
+                    }
+                }
+            }
+        }
+        gaps
+    }
+
+    /// The converse: a declared symbol the source does not define for the arch
+    /// would put a phantom export in the packaged index.
+    #[test]
+    fn every_declared_kernel_is_defined_by_its_source() {
+        let mut bad = Vec::new();
+        for arch in SUPPORTED_ARCHES {
+            for e in entries(arch, "").unwrap() {
+                let defined = active_kernel_names(e.source(), &entry_predefs(arch, &e.flags));
+                for sym in e.symbols {
+                    if !defined.contains(*sym) {
+                        bad.push((arch.to_string(), e.module, sym.to_string()));
+                    }
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "declared but not defined (arch, module, symbol): {bad:#?}"
+        );
+    }
+
+    #[test]
+    fn every_defined_kernel_is_declared_by_its_entry() {
+        let gaps = undeclared_kernels();
+        let mut allowed = std::collections::BTreeSet::new();
+        for line in UNDECLARED_KERNEL_CENSUS
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+        {
+            let [arch, module, symbol, reason] = line.split('\t').collect::<Vec<_>>()[..] else {
+                panic!("malformed census row {line:?}");
+            };
+            assert!(
+                !reason.trim().is_empty(),
+                "census row without reason: {line:?}"
+            );
+            assert!(
+                allowed.insert((arch.to_owned(), module.to_owned(), symbol.to_owned())),
+                "duplicate census row {line:?}"
+            );
+        }
+        let missing: Vec<_> = gaps.keys().filter(|g| !allowed.contains(*g)).collect();
+        assert!(
+            missing.is_empty(),
+            "kernels defined by an entry's source but declared by no entry of its source group \
+             (arch, module, symbol): {missing:#?}"
+        );
+        let stale: Vec<_> = allowed.iter().filter(|g| !gaps.contains_key(*g)).collect();
+        assert!(
+            stale.is_empty(),
+            "stale undeclared-kernel census rows (the gap no longer exists): {stale:#?}"
+        );
+    }
+
+    /// `tensor_ops` is one module requested with a different symbol per
+    /// launcher (`ensure_kernel_public("tensor_ops", TENSOR_OPS_SRC, kernel)`),
+    /// and the installed object is only accepted when every requested symbol is
+    /// in its index, so its declaration is exactly the set of kernels the
+    /// source defines for the arch (arch/flag-guarded exports are compiled out).
+    #[test]
+    fn tensor_ops_declares_exactly_the_kernels_its_source_defines() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            let entry = lookup(arch, "tensor_ops", "").unwrap();
+            let defined = active_kernel_names(entry.source(), &entry_predefs(arch, &entry.flags));
+            let declared: std::collections::BTreeSet<String> =
+                entry.symbols.iter().map(|s| (*s).to_owned()).collect();
+            assert_eq!(
+                defined.difference(&declared).collect::<Vec<_>>(),
+                Vec::<&String>::new(),
+                "{arch}: tensor_ops source defines kernels the entry does not declare"
+            );
+            assert_eq!(
+                declared.difference(&defined).collect::<Vec<_>>(),
+                Vec::<&String>::new(),
+                "{arch}: tensor_ops declares kernels its source does not define"
+            );
+            for symbol in [
+                "indexed_attention_attention_q8_batched",
+                "indexed_attention_attention_q8_batched_hg4",
+                "indexed_attention_cache_append_q8_batched",
+                "indexed_attention_decode_prologue_q8",
+            ] {
+                assert!(declared.contains(symbol), "{arch}: {symbol}");
+            }
+        }
+    }
+
+    /// The scanner itself: guards, macro-resolved names and `##` generators.
+    #[test]
+    fn kernel_scanner_handles_guards_macros_and_generators() {
+        let src = r#"
+#define GEN(BV) \
+extern "C" __global__ void tile_bt##BV(int* p) {}
+#define NAMED my_kernel
+#if defined(__GFX12__) && !defined(NO_X)
+extern "C" __global__ void only12(int* p) {}
+GEN(4)
+GEN(8)
+#elif defined(__GFX11__)
+extern "C" __global__ void only11(int* p) {}
+#else
+extern "C" __global__ void other(int* p) {}
+#endif
+extern "C" __global__ void NAMED(int* p) {}
+// extern "C" __global__ void commented(int* p) {}
+"#;
+        let g12 = active_kernel_names(src, &entry_predefs("gfx1201", &[]));
+        assert_eq!(
+            g12.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["my_kernel", "only12", "tile_bt4", "tile_bt8"]
+        );
+        let g11 = active_kernel_names(src, &entry_predefs("gfx1151", &[]));
+        assert_eq!(
+            g11.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["my_kernel", "only11"]
+        );
+        let flagged = active_kernel_names(src, &entry_predefs("gfx1201", &["-DNO_X".to_string()]));
+        assert_eq!(
+            flagged.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["my_kernel", "other"]
+        );
     }
 
     const FN_TRACE: &str = include_str!("../tests/fixtures/kernel-trace-qwen4-flash-next.tsv");
