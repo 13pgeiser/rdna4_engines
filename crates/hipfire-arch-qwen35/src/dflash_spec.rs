@@ -858,13 +858,226 @@ pub(crate) fn dflash_first_token(
 
 // ─── DflashSpeculator ───────────────────────────────────────────────────
 
+/// Developer-only per-cycle DFlash trace (`HIPFIRE_DFLASH_CYCLE_TRACE=<path>`):
+/// one JSON object per line appended to `<path>`. Off by default; when unset the
+/// only cost on the hot path is one `LazyLock` read. Diagnostic only — it never
+/// changes decode behaviour and an open/write failure is swallowed (one
+/// `eprintln` at open, tracing disabled).
+mod cycle_trace {
+    use std::fmt::Write as _;
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{LazyLock, Mutex};
+
+    type Sink = Mutex<std::io::BufWriter<std::fs::File>>;
+
+    static SINK: LazyLock<Option<Sink>> = LazyLock::new(|| {
+        let path = hipfire_config::developer_var("HIPFIRE_DFLASH_CYCLE_TRACE")
+            .ok()
+            .filter(|p| !p.is_empty())?;
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(f) => Some(Mutex::new(std::io::BufWriter::new(f))),
+            Err(e) => {
+                eprintln!(
+                    "[dflash] HIPFIRE_DFLASH_CYCLE_TRACE: cannot open {path}: {e}; tracing disabled"
+                );
+                None
+            }
+        }
+    });
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn sink() -> Option<&'static Sink> {
+        SINK.as_ref()
+    }
+
+    pub(super) fn enabled() -> bool {
+        sink().is_some()
+    }
+
+    /// Next 1-based per-process request ordinal (called from `prefill`).
+    pub(super) fn next_seq() -> u64 {
+        SEQ.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Append one line and flush. Write errors are ignored (diagnostic only).
+    pub(super) fn emit(line: &str) {
+        if let Some(sink) = sink() {
+            if let Ok(mut w) = sink.lock() {
+                let _ = w.write_all(line.as_bytes());
+                let _ = w.write_all(b"\n");
+                let _ = w.flush();
+            }
+        }
+    }
+
+    fn push_u32s(out: &mut String, v: &[u32]) {
+        out.push('[');
+        for (i, t) in v.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let _ = write!(out, "{t}");
+        }
+        out.push(']');
+    }
+
+    pub(super) fn prefill_line(
+        pid: u32,
+        seq: u64,
+        prompt_ids: &[u32],
+        prefill_start: usize,
+        cache_hit: bool,
+    ) -> String {
+        let mut s = String::with_capacity(96 + prompt_ids.len() * 7);
+        let _ = write!(
+            s,
+            r#"{{"ev":"prefill","pid":{pid},"seq":{seq},"prompt_len":{},"prefill_start":{prefill_start},"cache_hit":{cache_hit},"prompt_ids":"#,
+            prompt_ids.len()
+        );
+        push_u32s(&mut s, prompt_ids);
+        s.push('}');
+        s
+    }
+
+    pub(super) fn forced_line(pid: u32, seq: u64, pos: usize, tokens: &[u32]) -> String {
+        let mut s = String::with_capacity(64 + tokens.len() * 7);
+        let _ = write!(
+            s,
+            r#"{{"ev":"forced","pid":{pid},"seq":{seq},"pos":{pos},"tokens":"#
+        );
+        push_u32s(&mut s, tokens);
+        s.push('}');
+        s
+    }
+
+    pub(super) fn reset_line(pid: u32, seq: u64) -> String {
+        format!(r#"{{"ev":"reset","pid":{pid},"seq":{seq}}}"#)
+    }
+
+    /// Fields of one `cycle` line. `accepted` is the raw `SpecStepResult`
+    /// value; `committed` is the post-`cap_emit` emit (drafted[..accepted] ++
+    /// [bonus] unless capped).
+    pub(super) struct Cycle<'a> {
+        pub pid: u32,
+        pub seq: u64,
+        pub cyc: u64,
+        pub pos: usize,
+        pub seed: u32,
+        pub b: usize,
+        pub max_emit: usize,
+        pub temp: f32,
+        pub drafted: &'a [u32],
+        pub accepted: usize,
+        pub committed: &'a [u32],
+        pub step_us: u64,
+        /// Tree-mode result: appended as a trailing `"ddtree":true`.
+        pub ddtree: bool,
+    }
+
+    impl Cycle<'_> {
+        pub(super) fn line(&self) -> String {
+            let mut s =
+                String::with_capacity(192 + (self.drafted.len() + self.committed.len()) * 7);
+            let _ = write!(
+                s,
+                r#"{{"ev":"cycle","pid":{},"seq":{},"cyc":{},"pos":{},"seed":{},"b":{},"max_emit":{},"temp":"#,
+                self.pid, self.seq, self.cyc, self.pos, self.seed, self.b, self.max_emit
+            );
+            if self.temp.is_finite() {
+                let _ = write!(s, "{}", self.temp);
+            } else {
+                s.push_str("null");
+            }
+            s.push_str(r#","drafted":"#);
+            push_u32s(&mut s, self.drafted);
+            let _ = write!(s, r#","accepted":{},"committed":"#, self.accepted);
+            push_u32s(&mut s, self.committed);
+            let _ = write!(s, r#","step_us":{}"#, self.step_us);
+            if self.ddtree {
+                s.push_str(r#","ddtree":true"#);
+            }
+            s.push('}');
+            s
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn cycle_trace_cycle_line_exact_bytes() {
+            let c = Cycle {
+                pid: 7,
+                seq: 2,
+                cyc: 3,
+                pos: 100,
+                seed: 5,
+                b: 4,
+                max_emit: 16,
+                temp: 0.5,
+                drafted: &[9, 8, 7],
+                accepted: 2,
+                committed: &[9, 8, 6],
+                step_us: 1234,
+                ddtree: false,
+            };
+            assert_eq!(
+                c.line(),
+                r#"{"ev":"cycle","pid":7,"seq":2,"cyc":3,"pos":100,"seed":5,"b":4,"max_emit":16,"temp":0.5,"drafted":[9,8,7],"accepted":2,"committed":[9,8,6],"step_us":1234}"#
+            );
+        }
+
+        #[test]
+        fn cycle_trace_cycle_line_empty_drafted_and_ddtree() {
+            let c = Cycle {
+                pid: 1,
+                seq: 1,
+                cyc: 0,
+                pos: 0,
+                seed: 3,
+                b: 1,
+                max_emit: 1,
+                temp: 0.0,
+                drafted: &[],
+                accepted: 0,
+                committed: &[4],
+                step_us: 0,
+                ddtree: true,
+            };
+            assert_eq!(
+                c.line(),
+                r#"{"ev":"cycle","pid":1,"seq":1,"cyc":0,"pos":0,"seed":3,"b":1,"max_emit":1,"temp":0,"drafted":[],"accepted":0,"committed":[4],"step_us":0,"ddtree":true}"#
+            );
+        }
+
+        #[test]
+        fn cycle_trace_other_lines_exact_bytes() {
+            assert_eq!(
+                prefill_line(9, 1, &[10, 11], 0, false),
+                r#"{"ev":"prefill","pid":9,"seq":1,"prompt_len":2,"prefill_start":0,"cache_hit":false,"prompt_ids":[10,11]}"#
+            );
+            assert_eq!(
+                forced_line(9, 1, 42, &[1, 2]),
+                r#"{"ev":"forced","pid":9,"seq":1,"pos":42,"tokens":[1,2]}"#
+            );
+            assert_eq!(reset_line(9, 1), r#"{"ev":"reset","pid":9,"seq":1}"#);
+        }
+    }
+}
+
 /// Lower a qwen35 `SpecStepResult` onto the arch-generic `SpecStep`.
 ///
 /// The daemon-called `spec_step_*` build `committed = [seed, drafts.., bonus]`,
 /// so `committed[1..]` is exactly the daemon's `committed_tail` (the tokens
 /// emitted this window) and its length is `accepted + 1` — which is why the
 /// unified loop advances `position` by `emit.len()`.
-fn lower_qwen35(r: SpecStepResult) -> SpecStep {
+fn lower_qwen35(r: &SpecStepResult) -> SpecStep {
     SpecStep::new(
         r.committed[1..].iter().copied(),
         r.bonus_token,
@@ -926,6 +1139,10 @@ pub struct DflashSpeculator {
     /// Resolved adaptive knob passed to `new` (the controller's `enabled` is
     /// private); VMM lanes require it to be false (fixed block).
     adaptive_enabled: bool,
+    /// `HIPFIRE_DFLASH_CYCLE_TRACE` request ordinal (process-wide counter value
+    /// taken at the last `prefill`) and per-request cycle index. Diagnostic only.
+    trace_seq: u64,
+    trace_cyc: u64,
 }
 
 /// Pre-window mark of the last completed window (terminal-prefix repair).
@@ -972,6 +1189,8 @@ impl DflashSpeculator {
             last_window: None,
             adaptive,
             adaptive_enabled: adaptive_b,
+            trace_seq: 0,
+            trace_cyc: 0,
         }
     }
 
@@ -1117,6 +1336,17 @@ impl Speculator for DflashSpeculator {
             &mut self.rng_state,
             &mut Vec::new(),
         );
+        if cycle_trace::enabled() {
+            self.trace_seq = cycle_trace::next_seq();
+            self.trace_cyc = 0;
+            cycle_trace::emit(&cycle_trace::prefill_line(
+                std::process::id(),
+                self.trace_seq,
+                prompt_tokens,
+                prefill_start,
+                cache_hit,
+            ));
+        }
         Ok(PrefillOutcome::Ready { first_token })
     }
 
@@ -1179,6 +1409,14 @@ impl Speculator for DflashSpeculator {
         df.draft_scratch
             .thlog
             .append_committed(start_pos, tokens.len(), co);
+        if cycle_trace::enabled() {
+            cycle_trace::emit(&cycle_trace::forced_line(
+                std::process::id(),
+                self.trace_seq,
+                start_pos,
+                tokens,
+            ));
+        }
         Ok(true)
     }
 
@@ -1216,6 +1454,7 @@ impl Speculator for DflashSpeculator {
         temp: f32,
         max_emit: usize,
     ) -> Result<SpecStep, String> {
+        let t0 = cycle_trace::enabled().then(std::time::Instant::now);
         let slot = target
             .as_any_mut()
             .downcast_mut::<ModelSlot>()
@@ -1356,6 +1595,7 @@ impl Speculator for DflashSpeculator {
         }
 
         let lowered = result
+            .as_ref()
             .map(lower_qwen35)
             // Defense only — accept stage already committed ≤ max_emit.
             .map(|s| s.cap_emit(max_emit))
@@ -1391,6 +1631,38 @@ impl Speculator for DflashSpeculator {
                 );
             }
         }
+        if let Some(t0) = t0 {
+            let step_us = t0.elapsed().as_micros() as u64;
+            if let (Ok(r), Ok(s)) = (&result, &lowered) {
+                let cyc = self.trace_cyc;
+                self.trace_cyc += 1;
+                cycle_trace::emit(
+                    &cycle_trace::Cycle {
+                        pid: std::process::id(),
+                        seq: self.trace_seq,
+                        cyc,
+                        pos: position,
+                        seed,
+                        // `SpecStepResult.drafted` is `[seed, d1..d(b-1)]`:
+                        // its length is the verify rows, the candidates
+                        // follow the seed.
+                        b: r.drafted.len(),
+                        max_emit,
+                        temp: if df.ddtree.is_some() {
+                            temp
+                        } else {
+                            self.sample_temp
+                        },
+                        drafted: r.drafted.get(1..).unwrap_or(&[]),
+                        accepted: r.accepted,
+                        committed: &s.emit,
+                        step_us,
+                        ddtree: df.ddtree.is_some(),
+                    }
+                    .line(),
+                );
+            }
+        }
         self.last_window = lowered.as_ref().ok().map(|_| window_mark);
         lowered
     }
@@ -1417,6 +1689,9 @@ impl Speculator for DflashSpeculator {
     }
 
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        if cycle_trace::enabled() {
+            cycle_trace::emit(&cycle_trace::reset_line(std::process::id(), self.trace_seq));
+        }
         // Drafter-local reset: invalidate cached suffix projections and free the
         // divergent-render checkpoint ring (the target KV/recurrent reset is the
         // daemon's job — it owns the bundle). The adaptive window reseeds to
