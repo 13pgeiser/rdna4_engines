@@ -1438,9 +1438,9 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "a3b-expert-iu4-redline-exclusion",
         predicates: &[IsRecording],
-        condition: "symmetric IU4 expert prefill route (HIPFIRE_MOE_SYM_IU4, on by capability unless killed; bound only to qt44/qt53 `.mq4rs` artifacts whose symmetric headers verified at load), excluded per call under Redline: hipfire-dispatch moe_program.rs expert_iu4_facts sets ExpertIu4CallShape::redline_recording (field :3648) from expert_iu4_redline_active (`replay.is_recording() || replay.retained_body_active()`, :3892-3894), and decide_expert_iu4 (:3841) returns the RedlineRecording exclusion",
+        condition: "symmetric IU4 expert prefill route (HIPFIRE_MOE_SYM_IU4, on by capability unless killed; bound only to qt44/qt53 `.mq4rs` artifacts whose symmetric headers verified at load), excluded per call under a live Redline recording: hipfire-dispatch moe_program.rs expert_iu4_facts sets ExpertIu4CallShape::redline_recording (field :3649) from expert_iu4_redline_active (`replay.is_recording()` alone, not `retained_body_active()`, :3900-3902), and decide_expert_iu4 (:3842) returns the RedlineRecording exclusion",
         effect: KernelSelection,
-        switches: "eager and hipGraph capture: grouped IU4 PM gate_up/SiLU and down GEMMs plus the BF16 ordered combine (qwen4_moe_iu4_sym_pm_gfx1201, moe_slot_ops_pm_gfx1201); Redline recording or a retained body: the incumbent Path-2 expert route for the same artifact (qt53 down on its typed F32 fallback), with a WARNING (first, then every 1000)",
+        switches: "eager and hipGraph capture: grouped IU4 PM gate_up/SiLU and down GEMMs plus the BF16 ordered combine (qwen4_moe_iu4_sym_pm_gfx1201, moe_slot_ops_pm_gfx1201); a live Redline recording: the incumbent Path-2 expert route for the same artifact (qt53 down on its typed F32 fallback), with a WARNING (first, then every 1000)",
         kernels: &[],
         verdict: NotEquivalent,
         evidence: "the IU4 route quantizes the expert activations to int4 and combines in BF16, so its output differs from the incumbent route's; it binds only to verified symmetric `.mq4rs` artifacts, while the Redline default programs are plain-AR decode tapes on `.mq4r` and dense artifacts where the capability is unbound and the MoE prefill program does not run, so no default program reaches it; the excluded branch is the unchanged incumbent route",
@@ -1449,7 +1449,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "a3b-expert-iu4-capture-admitted",
         predicates: &[CaptureMode, GraphSlotCapturing],
-        condition: "hipfire-dispatch moe_program.rs expert_iu4_graph_capturing (`graphs.capture_mode || graphs.verify.capturing || graphs.replay.capturing`, :3883-3887) fills ExpertIu4Facts::capturing_graph; expert_iu4_admission (families/moe_expert_iu4.rs) treats it as informational, never a rejection, and expert_iu4_log_line prints it as `graph_capture=`",
+        condition: "hipfire-dispatch moe_program.rs expert_iu4_graph_capturing (`graphs.capture_mode || graphs.verify.capturing || graphs.replay.capturing`, :3884-3888) fills ExpertIu4Facts::capturing_graph; expert_iu4_admission (families/moe_expert_iu4.rs) treats it as informational, never a rejection, and expert_iu4_log_line prints it as `graph_capture=`",
         effect: Oracle,
         switches: "only the `graph_capture=` field of the IU4 admission stderr line; a captured call takes the same IU4 launches as an eager one",
         kernels: &[],

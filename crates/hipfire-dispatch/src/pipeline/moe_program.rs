@@ -3680,8 +3680,9 @@ pub(super) enum ExpertIu4Exclusion {
     /// A buffer, scratch, extent or kernel domain limit (named) is below what the
     /// route needs.
     Capacity(&'static str),
-    /// Redline replay recording / retained body is active (not a hipGraph capture,
-    /// which is admitted): prefill never runs under it.
+    /// A Redline replay recording is capturing this call (not a hipGraph capture,
+    /// which is admitted). Plain-AR decode is the only recorded forward, so a
+    /// prefill-sized call never meets it in the shipped lifecycle.
     RedlineRecording,
 }
 
@@ -3701,7 +3702,7 @@ impl ExpertIu4Exclusion {
             Self::SpecMismatch => "loader spec disagrees with the call geometry or dtypes",
             Self::ActivationDtype => "normalized activation is not F32",
             Self::Capacity(_) => "a buffer, scratch or kernel limit is below the route's need",
-            Self::RedlineRecording => "Redline recording or retained body is active",
+            Self::RedlineRecording => "a Redline recording is active",
         }
     }
 
@@ -3799,7 +3800,7 @@ pub(super) struct ExpertIu4CallShape {
     pub(super) canonical_slot_order: bool,
     pub(super) staged_expert_tables: bool,
     pub(super) paro: bool,
-    /// Redline recording or a retained Redline body is active (not a hipGraph capture).
+    /// A Redline recording is capturing this call (not a hipGraph capture).
     pub(super) redline_recording: bool,
 }
 
@@ -4041,11 +4042,18 @@ fn expert_iu4_graph_capturing(gpu: &Gpu) -> bool {
         || gpu.graphs.replay.capturing.is_some()
 }
 
-/// Redline recording or a retained Redline body is active (not a hipGraph capture):
-/// prefill never runs under it, and the route has no proof there, so the call is
-/// excluded by name.
+/// A Redline recording would capture this call (not a hipGraph capture): the
+/// route has no retained-tape proof, so the call is excluded by name.
+///
+/// Deliberately `is_recording()` alone, not `retained_body_active()`: a prepared
+/// PM4/AQL route replaces the whole plain-AR forward before any layer program
+/// runs (qwen35 `forward_scratch` returns from its replay branch), so inside a MoE
+/// program `should_route_pm4()` / `should_route_aql()` can only be the plain-AR
+/// eligibility left over from the previous decode forward. Batched prefill does
+/// not reset it, and testing it here sent every prefill after the first Redline
+/// decode of a `.mq4r` load onto the slow qt53 F32 fallback.
 fn expert_iu4_redline_active(gpu: &Gpu) -> bool {
-    gpu.replay.is_recording() || gpu.replay.retained_body_active()
+    gpu.replay.is_recording()
 }
 
 /// Layer-wide host-mapped bit of the routed experts (any projection or the layer);
@@ -4664,7 +4672,7 @@ mod tests {
                 Admission(ExpertIu4Reject::DownAwq),
             ),
             (
-                "Redline recording / retained body (the named pipeline exclusion)",
+                "Redline recording (the named pipeline exclusion)",
                 ExpertIu4Facts {
                     shape: shape(|s| s.redline_recording = true),
                     ..base
