@@ -197,6 +197,10 @@ int32_t host_argmax(const float* logits, int64_t n_vocab);
 
 /* The candidate width every stage after top-k works in, SamplerConfig::max_candidates' default. */
 constexpr int64_t kSampleCandidates = 1024;
+/* Under a split vocabulary the merge (sample_merge_topk) holds world_size * n_cand gathered pairs
+ * in one workgroup's LDS; libr4d's row serves 4096 at most, so the per-rank width shrinks with
+ * the world (512 at eight ranks). */
+constexpr int64_t kSampleMergeCandidates = 4096;
 
 enum class ChainOrder {
     Radiance = 0,   /* penalties, DRY, temperature, mask, top-k, top-p/min-p/typical, XTC, pick */

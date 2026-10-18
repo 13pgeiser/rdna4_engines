@@ -2100,6 +2100,46 @@ TEST(a_greedy_row_over_a_split_vocabulary_is_staged_as_a_chain_row) {
     CHECK_EQ(p[1].top_k, 1);
 }
 
+/* Over a split vocabulary the merge holds every rank's candidates in one workgroup, 4096 pairs at
+ * most (kSampleMergeCandidates, libr4d's sample_merge_topk). At two and four ranks the default
+ * width of 1024 a rank fits; at eight it would ask 8192 and the step's merge would find no kernel,
+ * so declare narrows it to 512 and admission refuses a wider top_k instead. */
+TEST(the_candidate_width_over_a_split_vocabulary_is_what_the_merge_holds) {
+    Registry reg;
+    (void)reg.load_plugin(home() + "/kernels/libref.so", 0);
+    for (int world : { 2, 4, 8 }) {
+        RadModelMeta meta{};
+        meta.arch_id = "sampler_split";
+        meta.name = "sampler_split";
+        RadBuildCtx bc{};
+        bc.world_size = world;
+        bc.max_seqs = 2;
+        bc.max_tok = 2;
+        bc.max_ctx = 64;
+        bc.scope = "";
+        Builder b(reg, meta, bc);
+        Sampler s;
+        SamplerConfig cfg;
+        cfg.n_vocab = 2048 * (int64_t)world;
+        cfg.n_vocab_local = 2048;
+        cfg.max_seqs = 2;
+        cfg.world_size = world;
+        cfg.rank = world - 1;
+        cfg.vocab_off = 2048 * (int64_t)(world - 1);
+        cfg.max_hist = 16;
+        CHECK_OK(s.declare(&b, cfg));
+
+        const int64_t width = world == 8 ? 512 : kSampleCandidates;
+        SamplingParams sp = greedy_params();
+        std::string why;
+        sp.top_k = (int)width;
+        CHECK_OK(s.check_request(sp, &why));
+        sp.top_k = (int)width + 1;
+        CHECK_EQ(s.check_request(sp, &why), RAD_E_INVAL);
+        CHECK(why.find("candidate width of " + std::to_string(width)) != std::string::npos);
+    }
+}
+
 /* Triggers are resolved at admission, with special tokens recognised: a one-token word becomes an
  * id, a longer word is scanned for as bytes, a token trigger that is not one token is a bad
  * request, and a regular expression is refused by name (it would be matched over the reply once

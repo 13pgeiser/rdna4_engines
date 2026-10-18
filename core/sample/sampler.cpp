@@ -145,6 +145,14 @@ int Sampler::declare(RadBuilder* b, const SamplerConfig& cfg) {
 
     const int64_t rows = rows_for(cfg_);
     const int64_t nv   = cfg_.n_vocab_local;
+    if (vocab_parallel() && cfg_.max_candidates * cfg_.world_size > kSampleMergeCandidates) {
+        const int64_t cap = kSampleMergeCandidates / cfg_.world_size;
+        RAD_INFO("sampler: candidate width %lld a rank -> %lld: the merge of %d ranks' candidate "
+                 "sets holds %lld pairs at most (top_k above %lld is refused per request)",
+                 (long long)cfg_.max_candidates, (long long)cap, cfg_.world_size,
+                 (long long)kSampleMergeCandidates, (long long)cap);
+        cfg_.max_candidates = cap;
+    }
     const int64_t ncand = cfg_.max_candidates;
 
     /* ---------------------------------------------------------- buffers */
