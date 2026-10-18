@@ -1456,6 +1456,42 @@ impl Qwen4MoeLayerRuntime {
     }
 }
 
+/// The runtime one layer's call binds: a balanced live runtime (gathered EP
+/// few-row forward), else for an EP forward's full chunk (`full_chunk`) the
+/// static runtime under a tile route or the EP full table (`ep_full`: `None`
+/// outside EP, `Some(layer's full runtime)` under EP), else the static runtime.
+fn select_layer_moe<'a, R>(
+    balanced_live: Option<&'a R>,
+    ep_full: Option<Option<&'a R>>,
+    full_chunk: bool,
+    tile_route: bool,
+    static_moe: Option<&'a R>,
+) -> Option<&'a R> {
+    match (balanced_live, ep_full) {
+        (Some(live), _) => Some(live),
+        (None, Some(full)) if full_chunk => {
+            if tile_route {
+                static_moe
+            } else {
+                full
+            }
+        }
+        _ => static_moe,
+    }
+}
+
+/// The routed-expert binding a MoE seal receives: `view` of the runtime the
+/// layer selected, never of another runtime (the layer's table and cache are
+/// bound to the selected one). Without a selected runtime the description's
+/// own binding stands.
+fn bind_routed_view<'a, R>(
+    selected: Option<&'a R>,
+    bound: &'a dyn RoutedExpertWeights,
+    view: impl FnOnce(&'a R) -> &'a dyn RoutedExpertWeights,
+) -> &'a dyn RoutedExpertWeights {
+    selected.map_or(bound, view)
+}
+
 /// Whether a layer's D2 executor is bound for one MoE call: always when no
 /// executor is attached (nothing to withhold), otherwise only in a non-prefill
 /// phase (decode, verify; `d2_phase`) **and** for a window of at most the
@@ -9506,17 +9542,13 @@ impl Qwen4GpuForward {
                 .and_then(|ep| ep.balanced.get(layer_index))
                 .and_then(Option::as_ref)
                 .map(|balanced| &balanced.live);
-            let layer_moe = match (balanced_live, ep) {
-                (Some(live), _) => Some(live),
-                (None, Some(ep)) if route_n > 1 && !ep_few_rows => {
-                    if tile_route.is_some() {
-                        self.moe.get(layer_index).and_then(Option::as_ref)
-                    } else {
-                        ep.moe_full.get(layer_index)
-                    }
-                }
-                _ => self.moe.get(layer_index).and_then(Option::as_ref),
-            };
+            let layer_moe = select_layer_moe(
+                balanced_live,
+                ep.map(|ep| ep.moe_full.get(layer_index)),
+                route_n > 1 && !ep_few_rows,
+                tile_route.is_some(),
+                self.moe.get(layer_index).and_then(Option::as_ref),
+            );
             if let Some(stage) = expert_stage {
                 stage.prepare_runtime(gpu, layer_index, layer_moe)?;
             }
@@ -9762,11 +9794,15 @@ impl Qwen4GpuForward {
                     // row count, so a call whose real rows are not its whole
                     // routing window (a 1..=4-row tail of a long prefill) or
                     // that is wider than the narrow cap is bound to a view of
-                    // this layer's runtime with no executor.
+                    // the runtime this layer actually selected (`layer_moe`:
+                    // balanced live, EP full chunk, or static) with no executor.
+                    // The view must be of that same runtime: its table and
+                    // cache were bound to it, and the seal compares them.
                     let mut moe = *moe;
-                    if let Some(runtime) = self.moe.get(layer_index).and_then(Option::as_ref) {
-                        moe.routed_experts = runtime.routed_view(!self.prefill_scope, n, route_n);
-                    }
+                    moe.routed_experts =
+                        bind_routed_view(layer_moe, moe.routed_experts, |runtime| {
+                            runtime.routed_view(!self.prefill_scope, n, route_n)
+                        });
                     let sealed = crate::program::seal_moe_for_layer(
                         &ctx,
                         dims,
@@ -13108,5 +13144,242 @@ mod band_scratch_tests {
                 }
             }
         }
+    }
+}
+
+/// A layer's table and cache are bound to the runtime `layer_desc` bound, and
+/// the seal then compares that source identity with the routed experts the
+/// call carries. These cases run the forward's own `select_layer_moe` and
+/// `bind_routed_view` over CPU fixtures standing in for the static, EP-full and
+/// balanced-live runtimes, with the view closure applying the unchanged
+/// `d2_executor_admitted` (production passes `Qwen4MoeLayerRuntime::routed_view`).
+/// The fixtures have distinct source identities, so equal identity here means
+/// "the view of the runtime the layer was bound to"; the real seal may also
+/// accept a distinct source whose per-expert pointers are identical.
+#[cfg(test)]
+mod seal_view_identity_tests {
+    use super::*;
+
+    /// An executor-less view: the runtime's identity, a distinct address.
+    struct FakeSet {
+        id: u64,
+    }
+
+    impl RoutedExpertWeights for FakeSet {
+        fn len(&self) -> usize {
+            4
+        }
+
+        fn get(&self, _expert_idx: usize) -> Option<(WeightRef<'_>, WeightRef<'_>)> {
+            None
+        }
+
+        fn immutable_identity(&self) -> Option<u64> {
+            Some(self.id)
+        }
+    }
+
+    /// A layer runtime: `id` is its immutable source identity.
+    struct FakeRuntime {
+        id: u64,
+        split: bool,
+        withheld: FakeSet,
+    }
+
+    impl FakeRuntime {
+        fn new(id: u64, split: bool) -> Self {
+            Self {
+                id,
+                split,
+                withheld: FakeSet { id },
+            }
+        }
+
+        /// The fixture's `routed_view`: the same decision, the fixture's
+        /// executor-less view.
+        fn view(&self, d2_phase: bool, rows: usize, route_rows: usize) -> &dyn RoutedExpertWeights {
+            if d2_executor_admitted(self.split, d2_phase, rows, route_rows) {
+                return self;
+            }
+            &self.withheld
+        }
+    }
+
+    impl RoutedExpertWeights for FakeRuntime {
+        fn len(&self) -> usize {
+            4
+        }
+
+        fn get(&self, _expert_idx: usize) -> Option<(WeightRef<'_>, WeightRef<'_>)> {
+            None
+        }
+
+        fn immutable_identity(&self) -> Option<u64> {
+            Some(self.id)
+        }
+    }
+
+    const STATIC_ID: u64 = 0x51;
+    const FULL_ID: u64 = 0xF1;
+    const LIVE_ID: u64 = 0xB1;
+
+    fn address(view: &dyn RoutedExpertWeights) -> *const () {
+        view as *const dyn RoutedExpertWeights as *const ()
+    }
+
+    struct Runtimes {
+        static_moe: FakeRuntime,
+        full: FakeRuntime,
+        live: FakeRuntime,
+    }
+
+    impl Runtimes {
+        fn new(split: bool) -> Self {
+            Self {
+                static_moe: FakeRuntime::new(STATIC_ID, split),
+                full: FakeRuntime::new(FULL_ID, split),
+                live: FakeRuntime::new(LIVE_ID, split),
+            }
+        }
+
+        /// What the forward does for one layer: select, then bind the seal
+        /// view. Returns the selected runtime and the bound routed view.
+        #[allow(clippy::too_many_arguments)]
+        fn bind(
+            &self,
+            ep: bool,
+            balanced: bool,
+            full_chunk: bool,
+            tile_route: bool,
+            d2_phase: bool,
+            rows: usize,
+            route_rows: usize,
+        ) -> (&FakeRuntime, &dyn RoutedExpertWeights) {
+            let selected = select_layer_moe(
+                balanced.then_some(&self.live),
+                ep.then_some(Some(&self.full)),
+                full_chunk,
+                tile_route,
+                Some(&self.static_moe),
+            );
+            let described: &dyn RoutedExpertWeights = selected.expect("a runtime is selected");
+            let view = bind_routed_view(selected, described, |runtime| {
+                runtime.view(d2_phase, rows, route_rows)
+            });
+            (selected.unwrap(), view)
+        }
+    }
+
+    /// EP few-row gathered forward (decode, verify): the balanced live runtime
+    /// is selected and its own view is bound, D2 armed or not.
+    #[test]
+    fn ep_balanced_decode_binds_the_live_runtime_view() {
+        for split in [false, true] {
+            let rt = Runtimes::new(split);
+            for rows in 1..=8usize {
+                let (selected, view) = rt.bind(true, true, false, false, true, rows, rows);
+                assert_eq!(selected.id, LIVE_ID);
+                assert_eq!(view.immutable_identity(), Some(selected.id));
+                assert_ne!(view.immutable_identity(), Some(STATIC_ID));
+                assert_ne!(view.immutable_identity(), Some(FULL_ID));
+            }
+        }
+    }
+
+    /// EP full chunk (a first AR warmup between the few-row cap and a
+    /// prefill tile, or a prefill chunk): the EP full runtime is selected, and
+    /// the D2 withholding (wide window, prefill phase) is a view of it too.
+    #[test]
+    fn ep_full_chunk_binds_the_full_runtime_view_through_d2_withholding() {
+        for split in [false, true] {
+            let rt = Runtimes::new(split);
+            for (d2_phase, rows, route_rows) in [
+                (true, 16, 16),
+                (true, 511, 511),
+                (false, 16, 16),
+                (false, 2048, 2048),
+                (true, 3, 8192),
+                (false, 2, 2),
+            ] {
+                let (selected, view) =
+                    rt.bind(true, false, true, false, d2_phase, rows, route_rows);
+                assert_eq!(selected.id, FULL_ID);
+                assert_eq!(view.immutable_identity(), Some(selected.id));
+                assert_ne!(view.immutable_identity(), Some(STATIC_ID));
+                // Withheld exactly when the unchanged D2 gate refuses it.
+                assert_eq!(
+                    address(view) != address(selected),
+                    !d2_executor_admitted(split, d2_phase, rows, route_rows)
+                );
+            }
+        }
+    }
+
+    /// An EP forward of a few non-gathered rows, or a tile-route forward, binds
+    /// the static runtime and its view, never the EP tables.
+    #[test]
+    fn ep_non_gathered_few_rows_and_tile_route_bind_the_static_view() {
+        for split in [false, true] {
+            let rt = Runtimes::new(split);
+            let (selected, view) = rt.bind(true, false, false, false, true, 4, 4);
+            assert_eq!(selected.id, STATIC_ID);
+            assert_eq!(view.immutable_identity(), Some(selected.id));
+            let (selected, view) = rt.bind(true, false, true, true, false, 64, 64);
+            assert_eq!(selected.id, STATIC_ID);
+            assert_eq!(view.immutable_identity(), Some(selected.id));
+        }
+    }
+
+    /// The pre-fix override viewed the static runtime whatever the layer
+    /// selected; its source identity differs from an EP-selected runtime's.
+    #[test]
+    fn a_static_runtime_view_carries_a_different_source_than_an_ep_selected_runtime() {
+        let rt = Runtimes::new(true);
+        for (balanced, full_chunk, id) in [(true, false, LIVE_ID), (false, true, FULL_ID)] {
+            let (selected, _) = rt.bind(true, balanced, full_chunk, false, true, 4, 4);
+            assert_eq!(selected.id, id);
+            let stale = rt.static_moe.view(true, 4, 4);
+            assert_ne!(stale.immutable_identity(), Some(selected.id));
+        }
+    }
+
+    /// Single-card and pipeline-parallel forwards have no EP: the static
+    /// runtime is bound and the D2 gate behaves as before: armed admits the
+    /// runtime itself only for a whole narrow non-prefill window, off always.
+    #[test]
+    fn single_card_and_pp_keep_the_static_runtime_and_the_d2_gate() {
+        for split in [false, true] {
+            let rt = Runtimes::new(split);
+            for (d2_phase, rows, route_rows) in [
+                (true, 1, 1),
+                (true, 4, 4),
+                (true, 5, 5),
+                (true, 16, 16),
+                (false, 1, 1),
+                (false, 4, 4),
+                (true, 2, 8192),
+                (false, 2048, 2048),
+            ] {
+                let (selected, view) =
+                    rt.bind(false, false, rows > 1, false, d2_phase, rows, route_rows);
+                assert_eq!(selected.id, STATIC_ID);
+                assert_eq!(view.immutable_identity(), Some(selected.id));
+                let admitted = d2_executor_admitted(split, d2_phase, rows, route_rows);
+                assert_eq!(address(view) == address(selected), admitted);
+                if !split {
+                    // Nothing armed: never withheld.
+                    assert_eq!(address(view), address(selected));
+                }
+            }
+        }
+    }
+
+    /// Without a selected runtime the description's own binding stands.
+    #[test]
+    fn no_selected_runtime_keeps_the_described_binding() {
+        let described = FakeSet { id: 0x77 };
+        let view =
+            bind_routed_view::<FakeRuntime>(None, &described, |runtime| runtime.view(true, 1, 1));
+        assert_eq!(address(view), address(&described));
     }
 }
