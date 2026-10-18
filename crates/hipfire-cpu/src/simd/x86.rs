@@ -36,7 +36,7 @@ use core::arch::x86_64::*;
 /// Horizontal sum of eight `f32` lanes.
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn hsum256(v: __m256) -> f32 {
+pub(super) unsafe fn hsum256(v: __m256) -> f32 {
     let s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
     let s = _mm_hadd_ps(s, s);
     let s = _mm_hadd_ps(s, s);
@@ -135,7 +135,7 @@ unsafe fn codes8<const BITS: usize>(p: *const u8) -> __m256i {
 /// rather than one per chunk.
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn codes_dot_sum<const BITS: usize, const PAYLOAD: usize, const CACHED: bool>(
+pub(super) unsafe fn codes_dot_sum<const BITS: usize, const PAYLOAD: usize, const CACHED: bool>(
     gptr: *const u8,
     xg: *const f32,
     first: usize,
@@ -225,6 +225,23 @@ unsafe fn v2_group_dot<const BITS: usize>(gptr: *const u8, xg: *const f32) -> f3
     let h = f16_quad(gptr);
     let (d0, s0) = codes_dot_sum::<BITS, 8, false>(gptr, xg, 0, 16, 0.0);
     let (d1, s1) = codes_dot_sum::<BITS, 8, false>(gptr, xg, 16, 32, 0.0);
+    (h[0] * d0 + h[1] * s0) + (h[2] * d1 + h[3] * s1)
+}
+
+/// [`v2_group_dot`] for a V2 group whose two per-128 `Σx` are already reduced
+/// (`s0`, `s1`): the dot chains and the affine association are unchanged, so
+/// the result equals the uncached group bit for bit.
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn v2_group_dot_cached<const BITS: usize>(
+    gptr: *const u8,
+    xg: *const f32,
+    s0: f32,
+    s1: f32,
+) -> f32 {
+    let h = f16_quad(gptr);
+    let (d0, _) = codes_dot_sum::<BITS, 8, true>(gptr, xg, 0, 16, s0);
+    let (d1, _) = codes_dot_sum::<BITS, 8, true>(gptr, xg, 16, 32, s1);
     (h[0] * d0 + h[1] * s0) + (h[2] * d1 + h[3] * s1)
 }
 
@@ -327,7 +344,7 @@ unsafe fn f32_pair(p: *const u8) -> (f32, f32) {
 /// the TQ2/BQ1 pair (whose zero the caller derives).
 #[inline]
 #[target_feature(enable = "avx2,fma,f16c")]
-unsafe fn f16_pair(p: *const u8) -> (f32, f32) {
+pub(super) unsafe fn f16_pair(p: *const u8) -> (f32, f32) {
     let v = f16_quad(p);
     (v[0], v[1])
 }
@@ -336,7 +353,7 @@ unsafe fn f16_pair(p: *const u8) -> (f32, f32) {
 /// `vcvtph2ps`.
 #[inline]
 #[target_feature(enable = "avx2,fma,f16c")]
-unsafe fn f16_quad(p: *const u8) -> [f32; 4] {
+pub(super) unsafe fn f16_quad(p: *const u8) -> [f32; 4] {
     let mut out = [0.0f32; 4];
     _mm_storeu_ps(
         out.as_mut_ptr(),
@@ -457,6 +474,76 @@ affine_row_dot!(
     68,
     "avx2,fma,f16c"
 );
+
+/// qt 44 — `Mq4G256V2` row dot reusing the per-128 `Σx` prepared by
+/// [`activation_sums_v2`] (`sums[2g]`, `sums[2g + 1]` for group `g`). Bit-equal
+/// to [`mq4g256v2_row_dot`].
+///
+/// # Safety
+///
+/// As [`mq4g256v2_row_dot`], plus `k / 128` readable `f32` at `sums`.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(super) unsafe fn mq4g256v2_row_dot_cached(
+    row: *const u8,
+    k: usize,
+    x: *const f32,
+    sums: *const f32,
+) -> f32 {
+    let mut acc = 0.0f32;
+    for g in 0..k / 256 {
+        acc += v2_group_dot_cached::<4>(
+            row.add(g * 136),
+            x.add(g * 256),
+            *sums.add(2 * g),
+            *sums.add(2 * g + 1),
+        );
+    }
+    acc
+}
+
+/// qt 53 — `Mq4G128V2` row dot reusing the per-128 `Σx` prepared by
+/// [`activation_sums_v2`] (`sums[g]` for group `g`). Bit-equal to
+/// [`mq4g128v2_row_dot`].
+///
+/// # Safety
+///
+/// As [`mq4g128v2_row_dot`], plus `k / 128` readable `f32` at `sums`.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(super) unsafe fn mq4g128v2_row_dot_cached(
+    row: *const u8,
+    k: usize,
+    x: *const f32,
+    sums: *const f32,
+) -> f32 {
+    let mut acc = 0.0f32;
+    for g in 0..k / 128 {
+        let gptr = row.add(g * 68);
+        let (scale, zero) = f16_pair(gptr);
+        acc += uniform_group_dot::<4, 4, 16, true>(gptr, x.add(g * 128), scale, zero, *sums.add(g));
+    }
+    acc
+}
+
+/// Per-128-element `Σx` in [`codes_dot_sum`]'s exact order over a 16-chunk
+/// range: even 8-lane chunks into `sum0`, odd into `sum1`, then one
+/// `hsum256(sum0 + sum1)`. A V2 group's two halves and `Mq4G128V2`'s group each
+/// reduce exactly this way, so one prepared value serves both formats.
+/// `out[b]` is block `b`'s sum, `b < blocks`.
+#[target_feature(enable = "avx2,fma")]
+pub(super) unsafe fn activation_sums_v2(x: *const f32, out: *mut f32, blocks: usize) {
+    for b in 0..blocks {
+        let xb = x.add(b * 128);
+        let mut sum0 = _mm256_setzero_ps();
+        let mut sum1 = _mm256_setzero_ps();
+        let mut idx = 0;
+        while idx + 1 < 16 {
+            sum0 = _mm256_add_ps(sum0, _mm256_loadu_ps(xb.add(idx * 8)));
+            sum1 = _mm256_add_ps(sum1, _mm256_loadu_ps(xb.add((idx + 1) * 8)));
+            idx += 2;
+        }
+        *out.add(b) = hsum256(_mm256_add_ps(sum0, sum1));
+    }
+}
 
 /// One 256-element `Mq4G256` (qt 13) group: `[f32 scale][f32 zero]` then 128 B
 /// of paired nibbles, element `i` taking the low nibble of byte `i/2` for even

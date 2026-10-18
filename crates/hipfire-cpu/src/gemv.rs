@@ -478,8 +478,8 @@ fn gemv_shared_sourced_split<S: SharedJobSource + Sync>(
 #[derive(Default)]
 struct ActivationSumCache {
     /// `Σx` for every *unique* eligible activation row seen this call,
-    /// `kind.len(k)` f32 each (`k / 256` for the MQ kinds, `k / 8` word sums for
-    /// E8P), concatenated in first-seen order.
+    /// `kind.len(k)` f32 each (`k / 256` for the MQ kinds, `k / 128` for the MQ4
+    /// V2 kinds, `k / 8` word sums for E8P), concatenated in first-seen order.
     sums: Vec<f32>,
     /// Start index into `sums` per (job, token), flattened in job order;
     /// `usize::MAX` marks a token whose job is not prepared (scalar path or a

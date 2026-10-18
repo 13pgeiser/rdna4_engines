@@ -911,3 +911,577 @@ fn planar_shared_sourced_is_bit_identical_to_per_row_gemv() {
         }
     }
 }
+
+// ── AVX-512 tier / V2 cached Σx: exactness against the AVX2 kernels ──────────
+//
+// These tests hold the tier to *bit* equality with the AVX2 kernels (not the
+// scalar tolerance above): the AVX-512 tier is a wider execution of the same
+// arithmetic, and the V2 prepared sums are the same reductions run ahead of
+// time. Anything that reassociates a sum fails them on the adversarial inputs.
+
+#[cfg(target_arch = "x86_64")]
+mod exact {
+    use super::*;
+    use crate::gemv::{gemv_shared_sourced, SharedJobSource};
+
+    /// xorshift64* — deterministic, no dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545F4914F6CDD1D)
+        }
+        fn unit(&mut self) -> f32 {
+            (self.next() >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+        }
+    }
+
+    /// A finite `fp16` bit pattern: any sign/exponent/mantissa (zeros and
+    /// subnormals included) except the Inf/NaN exponent.
+    fn finite_f16(rng: &mut Rng) -> u16 {
+        let bits = rng.next() as u16;
+        if (bits >> 10) & 0x1f == 0x1f {
+            bits & !(1 << 10)
+        } else {
+            bits
+        }
+    }
+
+    /// `m` rows of random payload under random finite `fp16` headers, for
+    /// `Mq4G256V2` (four halves-headers per 136 B group) or `Mq4G128V2` (one
+    /// pair per 68 B group).
+    fn random_weights(q: CpuQuant, m: usize, k: usize, rng: &mut Rng) -> Vec<u8> {
+        let rb = row_bytes(q, k);
+        let gb = q.group_bytes();
+        let mut packed: Vec<u8> = (0..m * rb).map(|_| rng.next() as u8).collect();
+        let header_halves = match q {
+            CpuQuant::Mq4G256V2 => 4,
+            CpuQuant::Mq4G128V2 => 2,
+            _ => unreachable!(),
+        };
+        for g in 0..m * (k / q.group_elems()) {
+            for h in 0..header_halves {
+                let bits = finite_f16(rng);
+                packed[g * gb + 2 * h..g * gb + 2 * h + 2].copy_from_slice(&bits.to_le_bytes());
+            }
+        }
+        packed
+    }
+
+    /// Number of activation styles [`activations`] produces.
+    const MODES: usize = 7;
+
+    /// Adversarial activations: magnitude mixes, cancellation across both
+    /// chains and within a chunk, subnormals, signed zeros, absorption.
+    fn activations(k: usize, mode: usize, rng: &mut Rng) -> Vec<f32> {
+        let mut x: Vec<f32> = (0..k).map(|_| rng.unit() * 2.0).collect();
+        match mode {
+            0 => {}
+            1 => {
+                const SCALES: [f32; 6] = [1e-30, 1e-12, 1e-4, 1.0, 1e6, 1e15];
+                for v in &mut x {
+                    *v = rng.unit() * SCALES[(rng.next() % 6) as usize];
+                }
+            }
+            2 => {
+                // Exact cancellation across chains (i, i ^ 8), within a chunk
+                // (i, i ^ 1) and across chunk pairs (i, i ^ 16).
+                for i in 0..k {
+                    let j = match i % 3 {
+                        0 => i ^ 8,
+                        1 => i ^ 1,
+                        _ => i ^ 16,
+                    };
+                    if j < i && j < k {
+                        x[i] = -x[j];
+                    }
+                }
+            }
+            3 => {
+                for v in &mut x {
+                    let sign = ((rng.next() & 1) as u32) << 31;
+                    *v = f32::from_bits(sign | (rng.next() as u32 & 0x007f_ffff));
+                }
+            }
+            4 => {
+                for v in &mut x {
+                    *v = match rng.next() % 4 {
+                        0 => 0.0,
+                        1 => -0.0,
+                        _ => *v,
+                    };
+                }
+            }
+            5 => {
+                // Absorption: a huge value followed by unit values that only
+                // survive in the right accumulation order.
+                for (i, v) in x.iter_mut().enumerate() {
+                    *v = match i % 16 {
+                        0 => 1.0e18,
+                        1 => -1.0e18,
+                        _ => *v,
+                    };
+                }
+            }
+            6 => {
+                // Subnormal/zero/normal soup around cancellation.
+                for (i, v) in x.iter_mut().enumerate() {
+                    *v = match i % 5 {
+                        0 => f32::from_bits(1 + (rng.next() as u32 & 0xff)),
+                        1 => -0.0,
+                        2 => 3.0e-39,
+                        3 => -3.0e-39,
+                        _ => *v * 1e-20,
+                    };
+                }
+            }
+            _ => unreachable!(),
+        }
+        x
+    }
+
+    fn bits_eq(a: f32, b: f32, what: &str) {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "{what}: {a:e} ({:#010x}) vs {b:e} ({:#010x})",
+            a.to_bits(),
+            b.to_bits()
+        );
+    }
+
+    /// `(format, k)` shapes: the D2 gate/up (QT44, k=2560) and down (QT53,
+    /// k=640) shapes plus smaller/larger multiples that move the group count.
+    const SHAPES: [(CpuQuant, usize); 8] = [
+        (CpuQuant::Mq4G256V2, 256),
+        (CpuQuant::Mq4G256V2, 512),
+        (CpuQuant::Mq4G256V2, 2560),
+        (CpuQuant::Mq4G256V2, 5120),
+        (CpuQuant::Mq4G128V2, 128),
+        (CpuQuant::Mq4G128V2, 640),
+        (CpuQuant::Mq4G128V2, 2560),
+        (CpuQuant::Mq4G128V2, 1408),
+    ];
+
+    #[test]
+    fn tier_resolves_to_avx2_when_avx512_is_unavailable() {
+        for (q, _) in kernel_formats() {
+            assert_eq!(
+                resolve_tier(q, true, false),
+                SimdTier::Avx2,
+                "{q:?}: no AVX-512"
+            );
+            assert_eq!(
+                resolve_tier(q, false, false),
+                SimdTier::Scalar,
+                "{q:?}: no AVX2"
+            );
+            assert_eq!(
+                resolve_tier(q, false, true),
+                SimdTier::Scalar,
+                "{q:?}: forced off"
+            );
+            let want = if matches!(q, CpuQuant::Mq4G256V2 | CpuQuant::Mq4G128V2) {
+                SimdTier::Avx512
+            } else {
+                SimdTier::Avx2
+            };
+            assert_eq!(resolve_tier(q, true, true), want, "{q:?}: AVX-512 present");
+            assert_eq!(
+                tier_for(q, Some(false)),
+                SimdTier::Scalar,
+                "{q:?}: forced scalar"
+            );
+        }
+        // The detected tier is consistent with the detected features.
+        for q in [CpuQuant::Mq4G256V2, CpuQuant::Mq4G128V2] {
+            let want = match (row_dot_enabled(q, None), avx512_available()) {
+                (false, _) => SimdTier::Scalar,
+                (true, true) => SimdTier::Avx512,
+                (true, false) => SimdTier::Avx2,
+            };
+            assert_eq!(tier_for(q, None), want, "{q:?}");
+        }
+    }
+
+    /// With AVX-512 reported absent the AVX2 kernel is what `row_dot_tier`
+    /// runs for the V2 formats — i.e. the explicit AVX2 tier is the old kernel.
+    #[test]
+    fn avx2_tier_runs_the_avx2_kernels_when_avx512_is_absent() {
+        let mut rng = Rng(0x1234_5678);
+        for (q, k) in SHAPES {
+            if !row_dot_enabled(q, Some(true)) {
+                continue;
+            }
+            let packed = random_weights(q, 3, k, &mut rng);
+            let x = activations(k, 0, &mut rng);
+            let tier = resolve_tier(q, true, false);
+            assert_eq!(tier, SimdTier::Avx2);
+            let rb = row_bytes(q, k);
+            for r in 0..3 {
+                let via_tier = row_dot_tier(tier, q, &packed[r * rb..], &[], k, &x);
+                let direct = unsafe {
+                    match q {
+                        CpuQuant::Mq4G256V2 => {
+                            x86::mq4g256v2_row_dot(packed[r * rb..].as_ptr(), k, x.as_ptr())
+                        }
+                        _ => x86::mq4g128v2_row_dot(packed[r * rb..].as_ptr(), k, x.as_ptr()),
+                    }
+                };
+                bits_eq(via_tier, direct, &format!("{q:?} k={k} row {r}"));
+            }
+        }
+    }
+
+    #[test]
+    fn avx512_row_dot_is_bit_identical_to_avx2() {
+        if !avx512_available() {
+            eprintln!("skip: AVX-512F absent on this runner");
+            return;
+        }
+        let mut rng = Rng(0xA5A5_0001);
+        let m = 40;
+        for (q, k) in SHAPES {
+            let rb = row_bytes(q, k);
+            for seed in 0..2 {
+                let packed = random_weights(q, m, k, &mut rng);
+                for mode in 0..MODES {
+                    let x = activations(k, mode, &mut rng);
+                    for r in 0..m {
+                        let row = &packed[r * rb..];
+                        let a2 = row_dot_tier(SimdTier::Avx2, q, row, &[], k, &x);
+                        let a5 = row_dot_tier(SimdTier::Avx512, q, row, &[], k, &x);
+                        let disp = row_dot_avx2(q, row, &[], k, &x);
+                        let what = format!("{q:?} k={k} seed={seed} mode={mode} row={r}");
+                        bits_eq(a5, a2, &what);
+                        bits_eq(disp, a2, &format!("dispatch {what}"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v2_cached_sums_are_bit_identical_to_uncached_on_both_tiers() {
+        let tiers: Vec<SimdTier> = if avx512_available() {
+            vec![SimdTier::Avx2, SimdTier::Avx512]
+        } else {
+            vec![SimdTier::Avx2]
+        };
+        let mut rng = Rng(0xC0DE_0002);
+        let m = 40;
+        for (q, k) in SHAPES {
+            if !row_dot_enabled(q, Some(true)) {
+                continue;
+            }
+            let kind = activation_sum_kind(q).expect("V2 MQ4 formats cache Σx");
+            assert!(kind == ActivationSumKind::V2Halves);
+            assert_eq!(kind.len(k), k / 128);
+            let rb = row_bytes(q, k);
+            let packed = random_weights(q, m, k, &mut rng);
+            for mode in 0..MODES {
+                let x = activations(k, mode, &mut rng);
+                let mut sums = vec![0.0f32; kind.len(k)];
+                prepare_activation_sums(kind, &x, &mut sums);
+                for r in 0..m {
+                    let row = &packed[r * rb..];
+                    let reference = row_dot_tier(SimdTier::Avx2, q, row, &[], k, &x);
+                    for &tier in &tiers {
+                        let uncached = row_dot_tier(tier, q, row, &[], k, &x);
+                        let cached =
+                            row_dot_with_activation_sums_tier(tier, q, row, &[], k, &x, &sums);
+                        let what = format!("{q:?} k={k} mode={mode} row={r} {tier:?}");
+                        bits_eq(uncached, reference, &format!("uncached {what}"));
+                        bits_eq(cached, reference, &format!("cached {what}"));
+                    }
+                    bits_eq(
+                        row_dot_with_activation_sums(q, row, &[], k, &x, &sums),
+                        reference,
+                        &format!("dispatch {q:?} k={k} mode={mode} row={r}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The two prepared-sum owners (Mq4G256V2's halves and Mq4G128V2's groups)
+    /// share one value per 128 activations: it must equal the AVX2 two-chain
+    /// reduction `codes_dot_sum` runs per half.
+    #[test]
+    fn prepared_v2_sum_equals_the_uncached_half_reduction() {
+        if !avx2_f16c_available() {
+            return;
+        }
+        let mut rng = Rng(0x5EED_0003);
+        for mode in 0..MODES {
+            let k = 1024;
+            let x = activations(k, mode, &mut rng);
+            let mut sums = vec![0.0f32; k / 128];
+            prepare_activation_sums(ActivationSumKind::V2Halves, &x, &mut sums);
+            let gbuf = vec![0u8; 8 + 128];
+            for (b, got) in sums.iter().enumerate() {
+                let (_, want) = unsafe {
+                    x86::codes_dot_sum::<4, 8, false>(
+                        gbuf.as_ptr(),
+                        x[b * 128..].as_ptr(),
+                        0,
+                        16,
+                        0.0,
+                    )
+                };
+                bits_eq(*got, want, &format!("mode={mode} block={b}"));
+            }
+        }
+    }
+
+    /// `codes_dot_sum512` against AVX2 `codes_dot_sum` for *every* `first..last`
+    /// chunk range of a 256-element group — including the odd lengths whose
+    /// tail must land in chain 0 only — cached and uncached.
+    #[test]
+    fn avx512_chunk_ranges_incl_odd_tails_match_avx2() {
+        if !avx512_available() {
+            eprintln!("skip: AVX-512F absent on this runner");
+            return;
+        }
+        let mut rng = Rng(0x7A11_0004);
+        for mode in 0..MODES {
+            let gbuf: Vec<u8> = (0..8 + 128).map(|_| rng.next() as u8).collect();
+            let x = activations(256, mode, &mut rng);
+            for first in 0..=32usize {
+                for last in first..=32usize {
+                    let cached_sum = rng.unit();
+                    let (a2, s2) = unsafe {
+                        x86::codes_dot_sum::<4, 8, false>(
+                            gbuf.as_ptr(),
+                            x.as_ptr(),
+                            first,
+                            last,
+                            0.0,
+                        )
+                    };
+                    let (a5, s5) = unsafe {
+                        x86_512::codes_dot_sum512::<8, false>(
+                            gbuf.as_ptr(),
+                            x.as_ptr(),
+                            first,
+                            last,
+                            0.0,
+                        )
+                    };
+                    let what = format!("mode={mode} {first}..{last}");
+                    bits_eq(a5, a2, &format!("dot {what}"));
+                    bits_eq(s5, s2, &format!("sum {what}"));
+                    let (c2, cs2) = unsafe {
+                        x86::codes_dot_sum::<4, 8, true>(
+                            gbuf.as_ptr(),
+                            x.as_ptr(),
+                            first,
+                            last,
+                            cached_sum,
+                        )
+                    };
+                    let (c5, cs5) = unsafe {
+                        x86_512::codes_dot_sum512::<8, true>(
+                            gbuf.as_ptr(),
+                            x.as_ptr(),
+                            first,
+                            last,
+                            cached_sum,
+                        )
+                    };
+                    bits_eq(c5, c2, &format!("cached dot {what}"));
+                    bits_eq(cs5, cs2, &format!("cached sum {what}"));
+                    bits_eq(c5, a2, &format!("cached == uncached dot {what}"));
+                }
+            }
+        }
+    }
+
+    struct Job {
+        q: CpuQuant,
+        packed: Vec<u8>,
+        xs: Vec<Vec<f32>>,
+    }
+    struct Src(Vec<Job>);
+    impl SharedJobSource for Src {
+        fn jobs(&self) -> usize {
+            self.0.len()
+        }
+        fn n(&self, j: usize) -> usize {
+            self.0[j].xs.len()
+        }
+        fn quant(&self, j: usize) -> CpuQuant {
+            self.0[j].q
+        }
+        fn packed(&self, j: usize) -> &[u8] {
+            &self.0[j].packed
+        }
+        fn xs_row(&self, j: usize, t: usize) -> &[f32] {
+            &self.0[j].xs[t]
+        }
+    }
+
+    /// The whole sourced path (Σx prep + dedup, rayon blocking, tier dispatch)
+    /// reproduces, bit for bit, the AVX2 uncached row dots, for 1..=8
+    /// activation rows per job on 1/2/8/16-thread pools. Jobs alias activation
+    /// rows (so the Σx dedup is exercised) and mix the two V2 formats, which
+    /// share one prepared sum per 128 activations.
+    #[test]
+    fn sourced_gemv_is_bit_identical_to_avx2_uncached_across_pools() {
+        if !row_dot_enabled(CpuQuant::Mq4G256V2, None) {
+            eprintln!("skip: AVX2/F16C absent on this runner");
+            return;
+        }
+        eprintln!(
+            "tier QT44={:?} QT53={:?}",
+            tier_for(CpuQuant::Mq4G256V2, None),
+            tier_for(CpuQuant::Mq4G128V2, None)
+        );
+        let mut rng = Rng(0xFEED_0005);
+        // (k, m): D2 gate_up shape and the down shape, plus a 128-granular k
+        // for the G256 job's neighbours.
+        for (k, m) in [(2560usize, 37usize), (640, 53)] {
+            for n in 1..=8usize {
+                let shared_a: Vec<Vec<f32>> = (0..n)
+                    .map(|t| activations(k, (t + 1) % MODES, &mut rng))
+                    .collect();
+                let own: Vec<Vec<f32>> = (0..n)
+                    .map(|t| activations(k, (t * 3) % MODES, &mut rng))
+                    .collect();
+                let mut jobs = Vec::new();
+                if k % 256 == 0 {
+                    for _ in 0..2 {
+                        jobs.push(Job {
+                            q: CpuQuant::Mq4G256V2,
+                            packed: random_weights(CpuQuant::Mq4G256V2, m, k, &mut rng),
+                            xs: shared_a.clone(),
+                        });
+                    }
+                }
+                jobs.push(Job {
+                    q: CpuQuant::Mq4G128V2,
+                    packed: random_weights(CpuQuant::Mq4G128V2, m, k, &mut rng),
+                    xs: shared_a.clone(),
+                });
+                jobs.push(Job {
+                    q: CpuQuant::Mq4G128V2,
+                    packed: random_weights(CpuQuant::Mq4G128V2, m, k, &mut rng),
+                    xs: own,
+                });
+                // Reference: per element, the AVX2 uncached kernel.
+                let mut want = Vec::new();
+                for job in &jobs {
+                    let rb = row_bytes(job.q, k);
+                    for r in 0..m {
+                        for x in &job.xs {
+                            want.push(row_dot_tier(
+                                SimdTier::Avx2,
+                                job.q,
+                                &job.packed[r * rb..],
+                                &[],
+                                k,
+                                x,
+                            ));
+                        }
+                    }
+                }
+                let src = Src(jobs);
+                for threads in [1usize, 2, 8, 16] {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap();
+                    let mut got = vec![0.0f32; want.len()];
+                    pool.install(|| gemv_shared_sourced(m, k, &mut got, &src, None));
+                    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                        bits_eq(*g, *w, &format!("k={k} n={n} threads={threads} out[{i}]"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// hiptrx-indicative micro-benchmark: ns per row dot, single thread,
+    /// AVX2 vs AVX-512, with Σx recomputed per row (uncached) or prepared
+    /// (cached). Run:
+    /// `cargo test -p hipfire-cpu --lib --release -- --ignored v2_row_dot_microbench --nocapture`
+    #[test]
+    #[ignore]
+    fn v2_row_dot_microbench_hiptrx_indicative() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        if !row_dot_enabled(CpuQuant::Mq4G256V2, None) {
+            eprintln!("skip: AVX2/F16C absent");
+            return;
+        }
+        let have512 = avx512_available();
+        let mut rng = Rng(0xBE4C_0006);
+        println!("[hiptrx-indicative] ns per row dot, single thread (AVX-512F present: {have512})");
+        println!(
+            "{:<24} {:>12} {:>12} {:>12} {:>12}",
+            "shape", "avx2", "avx2+cachedΣ", "avx512", "avx512+cachedΣ"
+        );
+        for (q, k, m) in [
+            (CpuQuant::Mq4G256V2, 2560usize, 256usize),
+            (CpuQuant::Mq4G128V2, 640, 512),
+        ] {
+            let rb = row_bytes(q, k);
+            let packed = random_weights(q, m, k, &mut rng);
+            let x = activations(k, 0, &mut rng);
+            let kind = activation_sum_kind(q).unwrap();
+            let mut sums = vec![0.0f32; kind.len(k)];
+            prepare_activation_sums(kind, &x, &mut sums);
+            let passes = 600usize;
+            let time = |f: &dyn Fn(&[u8]) -> f32| -> f64 {
+                for r in 0..m {
+                    black_box(f(&packed[r * rb..]));
+                }
+                let t0 = Instant::now();
+                let mut acc = 0.0f32;
+                for _ in 0..passes {
+                    for r in 0..m {
+                        acc += f(black_box(&packed[r * rb..]));
+                    }
+                }
+                black_box(acc);
+                t0.elapsed().as_nanos() as f64 / (passes * m) as f64
+            };
+            let a2 = time(&|row| row_dot_tier(SimdTier::Avx2, q, row, &[], k, black_box(&x)));
+            let a2c = time(&|row| {
+                row_dot_with_activation_sums_tier(
+                    SimdTier::Avx2,
+                    q,
+                    row,
+                    &[],
+                    k,
+                    black_box(&x),
+                    &sums,
+                )
+            });
+            let (a5, a5c) = if have512 {
+                (
+                    time(&|row| row_dot_tier(SimdTier::Avx512, q, row, &[], k, black_box(&x))),
+                    time(&|row| {
+                        row_dot_with_activation_sums_tier(
+                            SimdTier::Avx512,
+                            q,
+                            row,
+                            &[],
+                            k,
+                            black_box(&x),
+                            &sums,
+                        )
+                    }),
+                )
+            } else {
+                (f64::NAN, f64::NAN)
+            };
+            println!(
+                "{:<24} {a2:>12.1} {a2c:>12.1} {a5:>12.1} {a5c:>12.1}",
+                format!("{q:?} k={k}")
+            );
+        }
+    }
+}

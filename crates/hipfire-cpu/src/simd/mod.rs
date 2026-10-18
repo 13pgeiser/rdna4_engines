@@ -20,9 +20,19 @@
 //! Every format the crate decodes has a kernel ([`x86`]), so [`row_dot_enabled`]
 //! is a pure CPU-feature question — see `docs/quant-formats/cpu-simd-coverage.md`
 //! for the per-format map.
+//!
+//! **Exactness tiers.** `Mq4G256V2` and `Mq4G128V2` (the D2 host-slot expert
+//! path's gate/up and down formats) additionally have an AVX-512F tier
+//! ([`x86_512`]) that is *bit-identical* to their AVX2 kernels — each lane runs
+//! the same FMA sequence its AVX2 chain does — so which tier ran never changes
+//! an output bit. [`resolve_tier`] picks the tier once, beside [`features_for`];
+//! without AVX-512F the AVX2 tier runs (never the scalar path), and there are
+//! no environment switches: A/B is by comparing binaries.
 
 #[cfg(target_arch = "x86_64")]
 mod x86;
+#[cfg(target_arch = "x86_64")]
+mod x86_512;
 
 use crate::quant::CpuQuant;
 
@@ -135,6 +145,61 @@ pub fn row_dot_enabled(q: CpuQuant, requested: Option<bool>) -> bool {
     use_avx2(features_for(q), requested)
 }
 
+/// Which row-dot implementation runs a format on this CPU.
+///
+/// `Avx512` and `Avx2` are bit-identical for every format that has both (see
+/// [`x86_512`]); `Scalar` is the reference decode, a different summation order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) enum SimdTier {
+    Avx512,
+    Avx2,
+    Scalar,
+}
+
+/// Whether the CPU reports AVX-512F on top of everything the V2 AVX2 kernels
+/// need (AVX2, FMA, F16C) — the requirement of the [`x86_512`] kernels.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn avx512_available() -> bool {
+    avx2_f16c_available() && std::arch::is_x86_feature_detected!("avx512f")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn avx512_available() -> bool {
+    false
+}
+
+/// Whether `q` has an AVX-512 kernel ([`x86_512`]).
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn has_avx512_kernel(q: CpuQuant) -> bool {
+    matches!(q, CpuQuant::Mq4G256V2 | CpuQuant::Mq4G128V2)
+}
+
+/// The tier for `q` given what the CPU offers — the single place tier
+/// precedence lives, pure so that "AVX-512 absent" is testable on any runner.
+///
+/// `avx2_ok` is the (possibly forced, see [`use_avx2`]) answer to "may `q`'s
+/// AVX2 kernel run" and `avx512f_ok` is [`avx512_available`]. AVX-512 is used
+/// only for formats with an AVX-512 kernel; absent it, a vector-capable format
+/// falls back to AVX2, never to scalar.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) fn resolve_tier(q: CpuQuant, avx2_ok: bool, avx512f_ok: bool) -> SimdTier {
+    if !avx2_ok {
+        SimdTier::Scalar
+    } else if avx512f_ok && has_avx512_kernel(q) {
+        SimdTier::Avx512
+    } else {
+        SimdTier::Avx2
+    }
+}
+
+/// [`resolve_tier`] against the running CPU, honouring a forced `requested`
+/// exactly as [`row_dot_enabled`] does.
+#[allow(dead_code)]
+pub(crate) fn tier_for(q: CpuQuant, requested: Option<bool>) -> SimdTier {
+    resolve_tier(q, use_avx2(features_for(q), requested), avx512_available())
+}
+
 /// Pure dispatch predicate. `requested` forces the decision (`Some(true)` /
 /// `Some(false)`, for tests and for the SIMD-vs-scalar comparison), `None`
 /// follows `available`.
@@ -170,16 +235,21 @@ pub(crate) enum ActivationSumKind {
     /// in `chunk_sums8` order — the fixed `hadd`/permute reduction of eight
     /// words at a time, shared with the unprepared E8P row dot.
     E8pWords,
+    /// qt 44 `Mq4G256V2` (one sum per 128-element half) and qt 53 `Mq4G128V2`
+    /// (one per 128-element group): the same two-chain 16-chunk reduction, so
+    /// the two formats share one prepared value per 128 activations.
+    V2Halves,
 }
 
 #[cfg(target_arch = "x86_64")]
 impl ActivationSumKind {
     /// How many `f32` sums one activation row of length `k` prepares: one per
-    /// 256-element group for the MQ kinds, one per 8-element word for
-    /// [`Self::E8pWords`].
+    /// 256-element group for the MQ kinds, one per 128 elements for
+    /// [`Self::V2Halves`], one per 8-element word for [`Self::E8pWords`].
     pub(crate) fn len(self, k: usize) -> usize {
         match self {
             ActivationSumKind::Mq4Quartets | ActivationSumKind::Mq6Pairs => k / 256,
+            ActivationSumKind::V2Halves => k / 128,
             ActivationSumKind::E8pWords => k / 8,
         }
     }
@@ -187,13 +257,14 @@ impl ActivationSumKind {
 
 /// The cached-`Σx` style `q` uses, or `None` when `q` has no prepared row dot.
 ///
-/// MQ4, MQ6 and both E8P formats reuse prepared sums. The other codebook formats
-/// have no affine zero term and do not need `Σx`.
+/// MQ4, MQ6, the MQ4 V2 formats and both E8P formats reuse prepared sums. The
+/// other codebook formats have no affine zero term and do not need `Σx`.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn activation_sum_kind(q: CpuQuant) -> Option<ActivationSumKind> {
     match q {
         CpuQuant::Mq4G256 => Some(ActivationSumKind::Mq4Quartets),
         CpuQuant::Mq6G256 => Some(ActivationSumKind::Mq6Pairs),
+        CpuQuant::Mq4G256V2 | CpuQuant::Mq4G128V2 => Some(ActivationSumKind::V2Halves),
         CpuQuant::E8pI4G128R256 | CpuQuant::E8pI4G128R128 => Some(ActivationSumKind::E8pWords),
         _ => None,
     }
@@ -201,7 +272,8 @@ pub(crate) fn activation_sum_kind(q: CpuQuant) -> Option<ActivationSumKind> {
 
 /// Precompute the `Σx` sums for `kind` into `out` — `out.len() ==
 /// kind.len(k)` ([`ActivationSumKind::len`]): one `f32` per 256 activation
-/// elements for the MQ kinds, one per 8-element word for E8P.
+/// elements for the MQ kinds, one per 128 for the MQ4 V2 kinds, one per
+/// 8-element word for E8P.
 ///
 /// Each style reproduces its row dot's original reduction order exactly, so a
 /// [`row_dot_with_activation_sums`] row is bit-identical to the unprepared
@@ -214,6 +286,7 @@ pub(crate) fn prepare_activation_sums(kind: ActivationSumKind, x: &[f32], out: &
             >= out.len()
                 * match kind {
                     ActivationSumKind::Mq4Quartets | ActivationSumKind::Mq6Pairs => 256,
+                    ActivationSumKind::V2Halves => 128,
                     ActivationSumKind::E8pWords => 8,
                 },
         "prepare_activation_sums: activation shorter than the sums it covers"
@@ -225,6 +298,9 @@ pub(crate) fn prepare_activation_sums(kind: ActivationSumKind, x: &[f32], out: &
             }
             ActivationSumKind::Mq6Pairs => {
                 x86::activation_sums_mq6(x.as_ptr(), out.as_mut_ptr(), out.len())
+            }
+            ActivationSumKind::V2Halves => {
+                x86::activation_sums_v2(x.as_ptr(), out.as_mut_ptr(), out.len())
             }
             ActivationSumKind::E8pWords => {
                 x86::activation_sums_e8p(x.as_ptr(), out.as_mut_ptr(), out.len())
@@ -239,7 +315,8 @@ pub(crate) fn prepare_activation_sums(kind: ActivationSumKind, x: &[f32], out: &
 /// Only the formats [`activation_sum_kind`] names have cached sums, and the
 /// caller has already resolved the feature decision ([`row_dot_enabled`]), so
 /// `q` is AVX2-enabled and `sums.len() >= kind.len(k)`. The dot FMAs, group
-/// accumulation and final scaling are the same as [`row_dot_avx2`].
+/// accumulation and final scaling are the same as [`row_dot_avx2`], on the
+/// same tier.
 ///
 /// `scales_row` is the row's f16 scale bytes for the planar formats (as in
 /// [`row_dot_avx2`]) and empty for the row formats.
@@ -252,32 +329,66 @@ pub(crate) fn row_dot_with_activation_sums(
     x: &[f32],
     sums: &[f32],
 ) -> f32 {
+    row_dot_with_activation_sums_tier(
+        resolve_tier(q, true, avx512_available()),
+        q,
+        row,
+        scales_row,
+        k,
+        x,
+        sums,
+    )
+}
+
+/// [`row_dot_with_activation_sums`] on an explicit `tier`. `Avx512` requires
+/// [`avx512_available`] (the caller's burden, as with [`row_dot_tier`]).
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn row_dot_with_activation_sums_tier(
+    tier: SimdTier,
+    q: CpuQuant,
+    row: &[u8],
+    scales_row: &[u8],
+    k: usize,
+    x: &[f32],
+    sums: &[f32],
+) -> f32 {
+    debug_assert!(tier != SimdTier::Scalar, "no scalar prepared row dot");
+    debug_assert!(
+        tier != SimdTier::Avx512 || avx512_available(),
+        "row_dot_with_activation_sums_tier({q:?}): AVX-512 absent"
+    );
     debug_assert!(
         activation_sum_kind(q).is_some_and(|kind| sums.len() >= kind.len(k)),
-        "row_dot_with_activation_sums({q:?}): sums shorter than the shape"
+        "row_dot_with_activation_sums_tier({q:?}): sums shorter than the shape"
     );
     debug_assert!(
         !q.is_planar()
             || (row.len() >= crate::gemv::row_bytes(q, k)
                 && scales_row.len() >= 2 * (k / crate::quant::PLANAR_GROUP)),
-        "row_dot_with_activation_sums({q:?}): planar row or scales shorter than the shape"
+        "row_dot_with_activation_sums_tier({q:?}): planar row or scales shorter than the shape"
     );
-    debug_assert!(x.len() >= k, "row_dot_with_activation_sums({q:?}): short x");
+    debug_assert!(
+        x.len() >= k,
+        "row_dot_with_activation_sums_tier({q:?}): short x"
+    );
+    let (p, xp, sp) = (row.as_ptr(), x.as_ptr(), sums.as_ptr());
+    // SAFETY: as `row_dot_tier` — features resolved by the caller, bounds
+    // checked above and by the callers' slices.
     unsafe {
-        match q {
-            CpuQuant::Mq4G256 => {
-                x86::mq4g256_row_dot_cached(row.as_ptr(), k, x.as_ptr(), sums.as_ptr())
+        match (tier, q) {
+            (SimdTier::Avx512, CpuQuant::Mq4G256V2) => {
+                x86_512::mq4g256v2_row_dot_cached(p, k, xp, sp)
             }
-            CpuQuant::Mq6G256 => {
-                x86::mq6g256_row_dot_cached(row.as_ptr(), k, x.as_ptr(), sums.as_ptr())
+            (SimdTier::Avx512, CpuQuant::Mq4G128V2) => {
+                x86_512::mq4g128v2_row_dot_cached(p, k, xp, sp)
             }
-            CpuQuant::E8pI4G128R256 | CpuQuant::E8pI4G128R128 => x86::e8p_row_dot_cached(
-                row.as_ptr(),
-                scales_row.as_ptr(),
-                k,
-                x.as_ptr(),
-                sums.as_ptr(),
-            ),
+            (_, CpuQuant::Mq4G256) => x86::mq4g256_row_dot_cached(p, k, xp, sp),
+            (_, CpuQuant::Mq6G256) => x86::mq6g256_row_dot_cached(p, k, xp, sp),
+            (_, CpuQuant::Mq4G256V2) => x86::mq4g256v2_row_dot_cached(p, k, xp, sp),
+            (_, CpuQuant::Mq4G128V2) => x86::mq4g128v2_row_dot_cached(p, k, xp, sp),
+            (_, CpuQuant::E8pI4G128R256 | CpuQuant::E8pI4G128R128) => {
+                x86::e8p_row_dot_cached(p, scales_row.as_ptr(), k, xp, sp)
+            }
             _ => unreachable!("row_dot_with_activation_sums: {q:?} has no cached Σx"),
         }
     }
@@ -380,15 +491,14 @@ pub(crate) fn row_pair_dot_with_activation_sums(
     }
 }
 
-/// One weight row dotted with a pre-rotated activation on the AVX2 path.
+/// One weight row dotted with a pre-rotated activation on the best vector tier
+/// for `q` ([`resolve_tier`]): AVX-512 for the formats that have a kernel, AVX2
+/// otherwise.
 ///
-/// This is the single format→kernel map, and like [`features_for`] it is
-/// exhaustive: a new [`CpuQuant`] variant does not compile until its kernel and
-/// its feature requirement are both stated. The caller has already resolved the
-/// feature decision ([`row_dot_enabled`]) — which is why this takes no flags —
-/// so `row` must be at least `(k / q.group_elems()) * q.group_bytes()` bytes and
-/// `x.len() >= k`. Rotation is the caller's business, exactly as in
-/// [`crate::quant::decode_group_codes`].
+/// The caller has already resolved the feature decision ([`row_dot_enabled`])
+/// — which is why this takes no flags — so `row` must be at least
+/// `(k / q.group_elems()) * q.group_bytes()` bytes and `x.len() >= k`. Rotation
+/// is the caller's business, exactly as in [`crate::quant::decode_group_codes`].
 ///
 /// `scales_row` is the row's f16 scale bytes for the planar formats
 /// ([`CpuQuant::is_planar`]; `2 * (k / 128)` of them, `row` is then exactly the
@@ -396,6 +506,30 @@ pub(crate) fn row_pair_dot_with_activation_sums(
 /// within the two slices.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn row_dot_avx2(q: CpuQuant, row: &[u8], scales_row: &[u8], k: usize, x: &[f32]) -> f32 {
+    row_dot_tier(
+        resolve_tier(q, true, avx512_available()),
+        q,
+        row,
+        scales_row,
+        k,
+        x,
+    )
+}
+
+/// [`row_dot_avx2`] on an explicit `tier` (`Avx2` keeps the AVX2 kernel
+/// reachable for the bit-equality comparison). `Avx512` on a format without an
+/// AVX-512 kernel runs its AVX2 kernel; it otherwise requires
+/// [`avx512_available`], which the caller establishes.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn row_dot_tier(
+    tier: SimdTier,
+    q: CpuQuant,
+    row: &[u8],
+    scales_row: &[u8],
+    k: usize,
+    x: &[f32],
+) -> f32 {
+    debug_assert!(tier != SimdTier::Scalar, "row_dot_tier({q:?}): scalar tier");
     debug_assert!(features_for(q), "row_dot_avx2({q:?}): features absent");
     debug_assert!(
         row.len() >= crate::gemv::row_bytes(q, k) && x.len() >= k,
@@ -405,6 +539,29 @@ pub(crate) fn row_dot_avx2(q: CpuQuant, row: &[u8], scales_row: &[u8], k: usize,
         !q.is_planar() || scales_row.len() >= 2 * (k / crate::quant::PLANAR_GROUP),
         "row_dot_avx2({q:?}): scales row shorter than the shape"
     );
+    if tier == SimdTier::Avx512 && has_avx512_kernel(q) {
+        debug_assert!(avx512_available(), "row_dot_tier({q:?}): AVX-512 absent");
+        let (p, xp) = (row.as_ptr(), x.as_ptr());
+        // SAFETY: AVX-512F (+ AVX2/FMA/F16C) is the caller's tier decision and
+        // the bounds are the checks above — the kernels' own contract.
+        return unsafe {
+            match q {
+                CpuQuant::Mq4G256V2 => x86_512::mq4g256v2_row_dot(p, k, xp),
+                CpuQuant::Mq4G128V2 => x86_512::mq4g128v2_row_dot(p, k, xp),
+                _ => unreachable!("has_avx512_kernel admitted {q:?}"),
+            }
+        };
+    }
+    row_dot_avx2_kernel(q, row, scales_row, k, x)
+}
+
+/// The AVX2 format→kernel map.
+///
+/// This is the single AVX2 format→kernel map, and like [`features_for`] it is
+/// exhaustive: a new [`CpuQuant`] variant does not compile until its kernel and
+/// its feature requirement are both stated.
+#[cfg(target_arch = "x86_64")]
+fn row_dot_avx2_kernel(q: CpuQuant, row: &[u8], scales_row: &[u8], k: usize, x: &[f32]) -> f32 {
     let (p, xp) = (row.as_ptr(), x.as_ptr());
     // SAFETY: the caller established this format's CPU features through
     // `row_dot_enabled`, and the bounds are the row/activation lengths checked
