@@ -471,6 +471,14 @@ rad-convert /srv/models/MisterSnrub/Qwen3.8-27B-PARO-MXFP4-v2 --draft-model /srv
 rad-convert /srv/models/Launch80/Qwen3.8-27B-PARO-int5 --draft-model /srv/models/z-lab/Qwen3.8-27B-DFlash2 \
     --recipe data/recipes/q38-27b-paro-mxfp4-df2.recipe -o q38-27b-paro-int5-df2.rad
 
+# TranslateGemma 27B from Google's bf16 checkpoint: an int8 container to calibrate in, its Grams
+# (serve it with RADIANCE_CALIB_DIR set and push translation prompts through prefill, see
+# docs/ARCHITECTURES.md), then MXFP4 + GPTQ; with a DFlash2 drafter, the -df2 recipe and --draft-model
+rad-convert /srv/models/google/translategemma-27b-it \
+    --recipe data/recipes/translategemma-27b-i8a8.recipe -o translategemma-27b-i8a8.rad
+CALIB=/srv/calib/translategemma rad-convert /srv/models/google/translategemma-27b-it \
+    --recipe data/recipes/translategemma-27b-mxfp4-gptq.recipe -o translategemma-27b-mxfp4-gptq.rad
+
 # unsloth's NVFP4 Qwen3.8-27B with the DFlash2 drafter: the NVFP4 MLPs and the FP8 linears beside
 # them made MXFP4 by one recipe, the head block fp8
 rad-convert /srv/models/unsloth/Qwen3.8-27B-NVFP4 --draft-model /srv/models/z-lab/Qwen3.8-27B-DFlash2 \
@@ -2674,6 +2682,7 @@ reductions running on fewer blocks: Qwen3.8-27B's 41k-token prefill 9.5 s uncapp
 | `RADIANCE_TUNE` | pin a kernel's tunable axes instead of reading the tune cache: `op:key=value[,key=value][;op:...]`. For comparing tunings, not for deployment |
 | `RADIANCE_CALIB_DIR` | where an engine run writes calibration data for a recipe's `gptq calib=DIR` |
 | `RADIANCE_CALIB_TOKENS` | with `RADIANCE_CALIB_DIR`, the tokens the calibration tap accumulates before it writes and switches itself off (default 65536) |
+| `RADIANCE_G3_CALIB_LAYERS` | `lo:hi`: `arch/gemma3`'s calibration tap over layers lo to hi - 1 only, to take a large model's Grams in passes (docs/ARCHITECTURES.md) |
 | `RADIANCE_PROFILE_EVERY` | with `--profile-ops`, dump the per-op table every N steps (default 32) |
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
 | `RADIANCE_AR8_SHARD_WEIGHTS`, `RADIANCE_AR8_PIECES` | the eight-rank two-shot's shard weights (`auto`, the default, reads the PCIe links; `off`; or eight integers) and piece count, with `RADIANCE_AR8_SHARD_WEIGHTS_MIN_ELEMS` and `RADIANCE_AR8_PIECES_MIN_ELEMS` for the message size each starts at (§4.7) |

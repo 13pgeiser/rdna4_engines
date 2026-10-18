@@ -17,6 +17,7 @@ plugin claims.
 | `arch/lfm2_bf16` | `lfm2` | *(empty)* | LiquidAI's LFM2 and LFM2-VL, bf16, one rank |
 | `arch/embgemma2` | `embeddinggemma2` | *(empty)* | EmbeddingGemma 2: a bidirectional encoder with Gemma 4's vision tower and audio conformer, pooled to one vector |
 | `arch/gemma4_bf16` | `gemma4` | `compressed-tensors` | Gemma 4 31B dense with its vision tower: sliding-window and proportional-RoPE global (`attention_k_eq_v`) attention, GELU ffn, softcapped logits; int4 codes with an f16 scale per 128 from Google's CT-INT4 (QAT) release, served w4a8. Optional draft head: Google's assistant (`rad-convert --draft-model`), with no cache of its own (`rad_drafter_shared_kv`) |
+| `arch/gemma3` | `gemma3` | *(empty)* | Gemma 3 dense text (TranslateGemma 27B) from the bf16 checkpoint: sliding-window and global attention at one head geometry, GemmaRMSNorm, GELU ffn; linears bf16, or int8, MXFP4 or asymmetric int4 over an activation scaled per (row, 128), as the recipe stores them. Optional DFlash2 drafter (`rad-convert --draft-model`) |
 | `arch/gemma4` | `gemma4` | *(empty)* | Gemma 4 text from Google's bf16 checkpoint (the 26B-A4B MoE and the dense sizes without per-layer embeddings) with z-lab's DFlash drafter; routed experts bf16 or block fp8 |
 | `arch/qwenimage21` | `qwenimage21` | *(empty)* | Qwen-Image 2.1 and 2.1-Turbo, an image generator, from the diffusers pipeline directory; DiT and text encoder bf16 or block fp8 |
 | `arch/qwen3asr_bf16` | `qwen3asr` | *(empty)* | Qwen3-ASR: a Whisper-style audio encoder over a dense Qwen3 decoder, speech to text |
@@ -556,6 +557,101 @@ would collapse silently. arch_test holds the two live ranges to overlap.
 **Not declared.** The vision tower (`arch/gemma4_bf16` and `arch/embgemma2` declare Gemma 4's): a
 container that carries one is served with `--mm-max-patches 0`. An fp8 attention or dense arm:
 under a tenth of the weight bytes, and the dense arm's 2112 is not whole 128-blocks either.
+
+---
+
+# `gemma3`: Gemma 3 text (TranslateGemma)
+
+`arch/gemma3` serves the language model of a `Gemma3ForConditionalGeneration` checkpoint (the
+vision tower and projector are not mapped, so never converted): TranslateGemma 27B, and the Gemma 3
+text sizes with its config keys. It is `gemma4_bf16`'s block structure with Gemma 3's differences;
+the reference is transformers' `modeling_gemma3` (4.57).
+
+```
+TranslateGemma 27B (google/translategemma-27b-it)
+  62 layers, hidden 5376, vocab 262208 tied to the embedding, rms_norm_eps 1e-6
+  layer_types: five sliding_attention then one full_attention (without it, every
+    _sliding_window_pattern-th layer is global: (l + 1) % 6 == 0)
+    sliding  32 heads / 16 kv x 128, rope theta 1e4 (rope_local_base_freq), unscaled, window 1024
+    global   32 heads / 16 kv x 128, rope theta 1e6, linear scaling factor 8
+  scores scaled by query_pre_attn_scalar^-0.5 = 1/sqrt(168); q and k RMS-normed per head, v not
+  every norm GemmaRMSNorm, x_hat * (1 + w); sandwich norms around attention and feed-forward
+  feed-forward gate|up 2 x 21504 (gelu-tanh) -> down
+  embedding * sqrt(5376) held in bf16 (73.5); final norm; tied head; no soft-capping
+```
+
+Traps:
+
+- **The rotary scaling is the global class's only.** HF applies `rope_scaling` (linear, 8) to the
+  full-attention layers; the sliding ones rotate at `rope_local_base_freq` unscaled. transformers
+  5.x reads TranslateGemma's flat `rope_parameters` as unscaled global layers, and llama.cpp's
+  current converter misses the factor too; a reference made either way is wrong by KL 0.024.
+- **The scale is query_pre_attn_scalar's**, not 1/sqrt(head_dim): 1/sqrt(128) costs KL 0.013.
+- **The embedding scale is sqrt(hidden) held in bf16**: 73.5, not 73.32, as HF's buffer is.
+- **One int8 scale a row does not fit Gemma 3's activations**: a few channels run hundreds of times
+  the rest. `gemma4_bf16`'s w8a8 linears cost KL 0.097 against bf16 on TranslateGemma, w4a8 0.225,
+  where int8 weights alone cost 0.003. The quantised linears here scale the activation per (row,
+  128).
+- **Soft-capping and YaRN are refused**, not ignored: Gemma 2's caps are absent from Gemma 3, and
+  these kernels cannot apply them.
+
+Checked against transformers' float32 forward on a tiny random Gemma 3 with TranslateGemma's head
+geometry, a 16-token window and the real tokenizer: KL 0.00016 on the host backend and on the cards,
+at prefill and at 16-token chunks. The wrong attention scale, the missing linear scaling, a window of
+15 or 17 and no window score 80 to 1600 times worse.
+
+**KV groups.** `kv_sliding` (`RAD_KV_WINDOW`, the 1024-token window) and `kv_global`
+(`RAD_KV_FULL`), 16 heads of 128 each, 8 a rank at two. The sliding layers' group holds the window,
+not the context: at a 16k context a sequence's sliding layers keep a sixteenth of what a full group
+would. The cost is the prefix cache: a window group is not reused across requests (see `gemma4`
+above), which matters little for translation prompts, whose shared prefix is a line.
+
+**Linears.** Each weight is served as its encoding stores it:
+
+| recipe rule | served | activation |
+|---|---|---|
+| none (bf16) | `gemm_nt` | bf16 |
+| `codes=i4\|i8 group=128 scale=f16` | `gemm_nt_q` w4a8 / w8a8, as `gemma4_bf16` | int8, one scale a row |
+| `codes=i8 group=128 scale=bf16` | `gemm_nt_q` i8a8 | int8, an f32 scale per (row, 128) (`quant_act_i8g`) |
+| `codes=fp4_e2m1 group=32 scale=e8m0` (MXFP4) | `gemm_nt_q` mxfp4a8 | E4M3, a scale per (row, 128) (`quant_act_fp8`) |
+| `codes=u4 zero=u8 group=128 scale=f16` | `gemm_nt_q` w4a8i8_asym | int8, a scale per (row, 128) |
+
+A linear reading the same activation as the one before it (k and v after q, up after gate) reuses
+its codes. On an MXFP4 or int8 trunk the q and k norms and both rotaries are one `qkv_norm_rope` at
+`v_norm` 0, and each junction (the branch's post-norm, the residual add, the next norm and the next
+linear's quantiser) is one `ar_rmsnorm_post_quant_fp8` at two ranks on the exact wire, the branch's
+all-reduce in the same launch, or a post-norm and `rmsnorm_quant_fp8` otherwise. Where a row is
+missing the plugin declares the chain, and the startup notes say which form each took.
+
+**Calibration.** Serve a calibration container (int8, `translategemma-27b-i8a8.recipe`: KL 0.003
+against bf16, and it fits two 32 GB cards) with `RADIANCE_CALIB_DIR` set, push a corpus of the
+prompts you will serve through prefill, and each linear's input Gram is written once
+`RADIANCE_CALIB_TOKENS` have passed. `RADIANCE_G3_CALIB_LAYERS=lo:hi` limits the tap to a layer
+slice, so the 21504-wide down projections of 62 layers can be taken in passes. At two ranks the
+column-split linears (o, down) see their rank's columns only and write `<stem>.part`; libquant
+assembles the parts block diagonally (docs/TOOLS.md). Give every prompt a distinct first line, or
+prefix-cache hits keep tokens from the tap.
+
+**Measured** on two R9700s, against the bf16 model on 32 held-out translation texts (chunked at
+2048 tokens), decode on an 800-token translation:
+
+| container | mean KL | top-1 | decode, 1 / 2 / 4 streams |
+|---|---|---|---|
+| int8 (calibration) | 0.003 | 98.0% | |
+| **MXFP4 + GPTQ** | **0.042** | **93.2%** | **56 / 108 / 205 tok/s** |
+| asymmetric int4 + GPTQ | 0.043 | 93.4% | 22 tok/s (the tiled kernel) |
+| MXFP4, round to nearest | 0.142 | 87.5% | |
+| w4a8, round to nearest | 0.225 | 84.1% | |
+
+**DFlash2.** No public drafter exists for Gemma 3. One trained with NeMo AutoModel's
+`TrainDFlash2Recipe` on the target's own translations (a Qwen3-shaped draft config: plain RoPE 1e6
+and SiLU; target layers 1, 16, 30, 44, 59; mask token `<unused0>`, 6; block 8; window 2048;
+`dflash_config.input_embedding_scale` 73.5) is merged with `--draft-model` and served as
+`qwen35_fp8` serves Qwen's: the trunk copies the residual stream after each tapped layer's junction
+into `dflash_src`, the probe fixes the depth at block - 1, and `rad_block_dflash2.h` applies the
+embedding scale through `embed_lookup`'s `mult` (only when it is not 1, so other drafters' graphs are
+unchanged). On held-out translation prompts it accepts 3.3 tokens a verify step: 152 tok/s a stream
+and 364 at four, against 56 and 175 without it.
 
 ---
 

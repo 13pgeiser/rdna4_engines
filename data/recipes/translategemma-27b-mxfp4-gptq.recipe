@@ -1,0 +1,16 @@
+# translategemma-27b-mxfp4-gptq.recipe -- TranslateGemma 27B (arch/gemma3): every linear MXFP4 by
+# GPTQ against the Grams a calibration run wrote (CALIB, see docs/ARCHITECTURES.md), served at
+# mxfp4a8 over an E4M3 activation scaled per (row, 128). The tied lm_head is int8 a 128 columns:
+# block fp8 cannot be split at --tp 2, where a rank holds 131104 vocabulary rows. Norms and the
+# embedding stay bf16. KL 0.042 against the bf16 model.
+#
+#   CALIB=<dir> rad-convert <translategemma-27b-it> \
+#       --recipe data/recipes/translategemma-27b-mxfp4-gptq.recipe -o translategemma-27b-mxfp4-gptq.rad
+
+blk.*.attn_q.weight       gptq  codes=fp4_e2m1 group=32 scale=e8m0 calib=$CALIB
+blk.*.attn_k.weight       gptq  codes=fp4_e2m1 group=32 scale=e8m0 calib=$CALIB
+blk.*.attn_v.weight       gptq  codes=fp4_e2m1 group=32 scale=e8m0 calib=$CALIB
+blk.*.attn_o.weight       gptq  codes=fp4_e2m1 group=32 scale=e8m0 calib=$CALIB
+blk.*.ffn_down.weight     gptq  codes=fp4_e2m1 group=32 scale=e8m0 calib=$CALIB
+blk.*.ffn_gate_up.weight  gptq  codes=fp4_e2m1 group=32 scale=e8m0 calib=$CALIB
+output.weight             rtn   codes=i8 group=128 scale=bf16 clamp=sym

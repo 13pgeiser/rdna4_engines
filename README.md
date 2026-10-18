@@ -33,6 +33,7 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | MiniMax-Music3 bf16: songs from lyrics and a description | `minimax-music3-bf16.rad` (20 GiB) | [download](https://huggingface.co/StillDeadcode/minimax-music3-bf16) | `minimax-music3.yaml` |
 | Breeze-TTS-2 bf16: speech, whole, streamed or live, one card | `breeze-tts2-bf16.rad` (5.5 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-breeze-tts2-bf16) | `breeze-tts2.yaml` |
 | Qwen3.8-27B ParoQuant int4, int5 or MXFP4 (learned rotations), DFlash2 drafter, vision | `qwen3.8-27b-paro-int4.rad` (19 GiB; int5 22 GiB) | [convert](#convert-a-checkpoint) | `qwen3.8-27b-paro.yaml` |
+| TranslateGemma 27B MXFP4 (GPTQ), translation; optional DFlash2 drafter | `translategemma-27b-mxfp4-gptq.rad` (17 GiB) | [convert](#convert-a-checkpoint) | `translategemma-27b.yaml` |
 | Qwen3.8-27B bf16 | `qwen3.8-27b-bf16.rad` (50 GiB) | [convert](#convert-a-checkpoint) | `qwen3.8-27b-bf16.yaml` |
 | Qwen3.8-Flash-Next bf16, a disk-streamed reference | `qwen3.8-flash-next-bf16.rad` (335 GiB) | [convert](#convert-a-checkpoint) | `flashnext-bf16.yaml` |
 | EmbeddingGemma 2 bf16: text, image, video and audio embeddings, one card | `embeddinggemma2-bf16.rad` (1.4 GiB) | [convert](#convert-a-checkpoint) | `embeddinggemma2.yaml` |
@@ -53,6 +54,15 @@ repository has the recipe and the calibration step. To convert Google's bf16 che
 with a scale search, bf16 lm_head); see [Convert a checkpoint](#convert-a-checkpoint). On two R9700s
 that container decodes at 103 tok/s on prose and 141 on code, against 112 and 150 for keptn42's,
 and accepts 0.46 of its drafts on prose against 0.50.
+
+TranslateGemma 27B is converted from Google's bf16 checkpoint in three steps: an int8 container to
+calibrate in, its Gram matrices over translation prompts, then MXFP4 with GPTQ
+(`data/recipes/translategemma-27b-*.recipe`, the steps in docs/ARCHITECTURES.md). On two R9700s it
+decodes 56 tok/s a stream (205 at four) and scores mean KL 0.042 against the bf16 model on held-out
+translations; with a DFlash2 drafter, 152 a stream. Its chat template takes structured turns
+naming the two languages and refuses the plain turn the server renders at startup, so
+`translategemma-27b.yaml` serves a plain Gemma 3 template (`deploy/compose/gemma3.jinja`) and a
+client sends on `/v1/completions` the prompt the checkpoint's template renders.
 
 The ParoQuant containers keep the trunk exactly as the ParoQuant releases ship it, with the learned
 Givens rotations it was trained in. Convert int4 from `z-lab/Qwen3.8-27B-PARO`, int5 from
