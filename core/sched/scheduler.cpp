@@ -2008,7 +2008,21 @@ void Scheduler::step_finished() {
     const int64_t ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(step_end - step_start_).count();
     m_.step_ns += ns;
-    if (plan_.phase == RAD_PHASE_DECODE) m_.step_ns_decode += ns;
+    if (plan_.phase == RAD_PHASE_DECODE) {
+        m_.step_ns_decode += ns;
+        /* The single-sequence floor, keyed to the concurrency of THIS step (plan_.n_seq_decode is
+         * the row count that was just timed, not a later snapshot). A mixed step is excluded by the
+         * phase gate even when it carries one decode row: its lone row shares the step with a
+         * prefill chunk and is not the mechanical floor. The estimator is a min over WINDOW MEANS,
+         * not raw brackets: a decode step issued ahead behind a long host commit has no GPU work
+         * in its bracket, and a raw min latches that degenerate forever; averaging a window of
+         * single-row steps first dilutes it. See rad::DecodeFloor. */
+        if (plan_.n_seq_decode == 1) {
+            decode_floor_.update(ns);
+            m_.step_ns_decode_best  = decode_floor_.best();
+            m_.step_ns_decode_recent = decode_floor_.recent();
+        }
+    }
 
     const auto   from = step_start_ - last_step_at_ < std::chrono::milliseconds(500)
                             ? last_step_at_ : step_start_;

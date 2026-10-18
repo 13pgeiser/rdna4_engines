@@ -51,6 +51,21 @@ struct SchedMetrics {
     int64_t step_ns = 0;
     int64_t step_ns_decode = 0;
 
+    /* The single-sequence decode floor, nanoseconds; 0 until a window of eligible steps fills.
+     * A min over WINDOW MEANS of single-sequence decode steps (see DecodeFloor), not over raw
+     * brackets -- a raw min latches a degenerate bracket forever. Single-sequence on purpose: a
+     * decode step at eight sequences is a different measurement, so keying the floor to one row
+     * keeps a batch arriving from being misread as drift. Scheduler::step_finished feeds DecodeFloor. */
+    int64_t step_ns_decode_best = 0;
+
+    /* The most recent completed window mean of single-sequence decode steps, nanoseconds; 0 until
+     * the first gated window completes. The advisory's OTHER side: best() is how fast the engine
+     * has ever been, recent() is how fast it is now, and both are window means of the same stream
+     * at the same size -- so they cannot disagree by order statistics the way the engine's floor
+     * disagreed with the browser's per-poll min (7.7% phantom drift on a flat lane, 2026-10-18).
+     * Scheduler::step_finished records it. */
+    int64_t step_ns_decode_recent = 0;
+
     /* Per KV group. `name` points into the Program, which outlives any scrape. */
     int n_kv_groups = 0;
     struct Group {
@@ -129,6 +144,87 @@ struct SchedMetrics {
     bool    draft_adaptive = false;
     float   draft_depth_adaptive = 0.0f;
     int64_t draft_verify_depth[RAD_METRICS_MAX_SPEC + 1] = {};
+};
+
+
+/* Estimator for the single-sequence decode floor (SchedMetrics::step_ns_decode_best).
+ *
+ * A min over RAW step brackets is unbounded below: a decode step issued ahead behind a step with
+ * long host work (a prefill chunk, or a decode step that saves a KV checkpoint) has its forward
+ * pass finished before its own bracket opens, so the bracket holds only readback and commit --
+ * about a millisecond, no GPU work. A min latches that degenerate on the first occurrence and
+ * never recovers. Measured live 2026-10-18: floor 1.34 ms against a 15.70 ms mean, after which
+ * the dashboard's restart advice read "heavily drifted, pays back fast" on a healthy engine --
+ * a systematically wrong advisory, worse than none, because it recommends a restart that cannot
+ * help.
+ *
+ * The fix mirrors the construction the dashboard already proves clean on this lane: a min over
+ * WINDOW MEANS, not over raw samples. Each full window of single-sequence decode steps
+ * contributes one mean; a degenerate is diluted by the honest steps sharing its window, so the
+ * floor tracks the real floor. Two biases on that floor partially cancel: a window MEAN sits
+ * above the true floor (it averages, so it cannot reach a lone fast step), while min-over-windows
+ * picks the window with the most degenerates and pulls back down. A simulation of the live lane
+ * (real ~15.9 ms, true floor ~14.4 ms, degenerate ~1.34 ms) puts the estimate at 14.3 ms median
+ * at the observed ~1.4% degenerate rate, worst case ~13.6 ms -- within a few percent of the true
+ * floor, and never the 12x latch of the raw min. The residual can sit slightly BELOW the true
+ * floor (a degenerate-heavy window), which mildly OVER-reports drift; it is bounded and small,
+ * not the unbounded latch. kWindow is a structural count of samples to average, not a magic
+ * threshold a real step could fall below. Scheduler::step_finished feeds it one update per
+ * single-sequence decode step. */
+struct DecodeFloor {
+    /* Single-sequence decode steps averaged into one floor candidate. 32 approximates the number
+     * of decode steps the dashboard's 500 ms poll spans at this lane's step time, so the engine
+     * floor and the page's own c1 floor are computed over comparable windows. */
+    static constexpr int kWindow = 32;
+
+    void update(int64_t ns) {
+        /* Reject degenerate brackets BEFORE they enter a window. A decode step issued ahead behind
+         * a long host commit (a prefill chunk, or a KV checkpoint every 256 tokens) brackets at
+         * ~9% of a real step; real single-sequence steps bracket at ~96%. The populations are ~10x
+         * apart, so any threshold between them separates them -- 0.5 is the midpoint of that gap,
+         * not a value tuned to one distribution. Filtering at the STEP level is essential: at the
+         * observed ~1.4% rate a degenerate dilutes inside a 32-step window to a mean of ~0.91x,
+         * which no window-level threshold would catch, and a min over hundreds of windows then
+         * reliably lands on a degenerate-heavy window ~10% below the true floor.
+         * No rejection until a window's worth of samples has been accepted, so the running mean is
+         * never bootstrapped from a degenerate. */
+        if (accepted_ >= kWindow && ns * 2 < mean_) return;
+        ++accepted_;
+        mean_ += (ns - mean_) / (double)accepted_;
+        sum_ += ns;
+        if (++count_ < kWindow) return;
+        const int64_t mean = sum_ / count_;
+        /* The FIRST window is recorded by neither side. The rejection gate needs a window's worth
+         * of accepted samples before it can judge one, so the first window is by construction
+         * un-gated and can carry degenerates; recording it would let the floor latch a value the
+         * engine can no longer reach -- the same artifact the gate exists to remove, smuggled in
+         * through bootstrap. Measured: at a 5% degenerate rate the un-gated first window put the
+         * floor ~2% below the true floor and it stuck there forever. */
+        if (warmed_) {
+            if (best_ == 0 || mean < best_) best_ = mean;
+            recent_ = mean;             /* most recent completed window, same size as best_ */
+        }
+        warmed_ = true;
+        sum_ = 0;
+        count_ = 0;
+    }
+    /* The floor: the fastest window mean ever seen. A restart is priced against this. */
+    int64_t best() const { return best_; }
+    /* The CURRENT speed: the most recent completed window mean, from the SAME stream and window
+     * size as best(). The advisory compares best() against recent() -- both window means of one
+     * population -- so the two sides cannot disagree by order statistics the way the engine's
+     * floor disagreed with the browser's per-poll min (a 7.7% phantom gap on a flat lane,
+     * 2026-10-18). 0 until the first window completes; the page must not divide by it. */
+    int64_t recent() const { return recent_; }
+
+private:
+    int64_t sum_    = 0;
+    int     count_  = 0;      /* samples in the window being accumulated */
+    int64_t best_   = 0;
+    int64_t recent_ = 0;
+    bool     warmed_  = 0;    /* false until one window has completed (the un-gated bootstrap) */
+    int64_t accepted_ = 0;    /* samples accepted across all windows (rejection gate's support) */
+    double  mean_   = 0.0;    /* running mean of ACCEPTED steps -- the rejection reference */
 };
 
 }  /* namespace rad */

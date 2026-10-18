@@ -127,6 +127,12 @@ struct SchedMetrics {
      * a decode step regardless of load. */
     int64_t step_ns = 0;
     int64_t step_ns_decode = 0;
+    /* The fastest single-sequence decode step this process has measured, nanoseconds; 0 until one
+     * runs. The dashboard reads this instead of asking a human to type a ruler (see the same field
+     * on rad::SchedMetrics, where it is recorded). */
+    int64_t step_ns_decode_best = 0;
+    /* The most recent completed single-sequence decode window mean; see SchedMetrics. */
+    int64_t step_ns_decode_recent = 0;
 };
 
 

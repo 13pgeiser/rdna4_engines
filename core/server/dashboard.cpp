@@ -182,6 +182,8 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
          * covers idle time (see SchedMetrics::step_ns). */
         o["step_ns"]         = m.step_ns;
         o["step_ns_decode"]  = m.step_ns_decode;
+        o["step_ns_decode_best"] = m.step_ns_decode_best;
+        o["step_ns_decode_recent"] = m.step_ns_decode_recent;
         o["rows_unspec"]     = m.decode_rows_unspeculated;
 
         /* Conditional rate per position with its reach count: a rate of 0.0 over a reach of 3 is
