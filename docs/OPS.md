@@ -812,6 +812,25 @@ declares bound it lower.
 `RadKVGroupBatch` carries the slot mapping, the block table and the sequence lengths, but the pool
 base belongs to the block manager, not the batch.
 
+**`kv_dtype` `fp8_v4` and `k6_v4`** (device-only) are the quantised layouts of
+`--kv-cache-dtype` (`RadBuildCtx::kv_quant`). A head's dims are grouped by 32, each group with an
+f16 scale (its absmax over the largest code), codes two's complement. A token's row in a head, at
+head_dim HD:
+
+| bytes | `fp8_v4` (25 HD / 16) | `k6_v4` (22 HD / 16) |
+|---|---|---|
+| K | [0, HD): E4M3, as `fp8_e4m3` | [0, HD/2): the codes' low four bits; [HD/2, 3HD/4): their high two bits, a word per 16 dims whose byte j holds dims 2j, 2j+1 in bits 0-3 and 8+2j, 9+2j in bits 4-7 |
+| V | [HD, 3HD/2): int4 codes, dim d in the nibble at bit 4 (d mod 2) of byte d/2 | [3HD/4, 5HD/4): the same |
+| scales | [3HD/2, 25HD/16): V's (absmax / 7) | [5HD/4, 21HD/16): K's (absmax / 31); [21HD/16, 22HD/16): V's |
+
+The group is declared at `RAD_F8E4M3` with head_dim the row's bytes / 2, so the core sizes pages
+as it does for fp8, and the cache operand's last extent is the row. The ops take the model's
+head_dim. libr4d's rows are `kv_store_fp8v4` / `kv_store_k6v4`,
+`qk_norm_rope_gate_kv_store_fp8v4` / `_k6v4` (byte-identical to the prologue and the store, as at
+the other widths), and `attn_prefill_h256_gqa6_{fp8v4,k6v4}` and `attn_decode_h256_gqa6_{fp8v4,k6v4}`,
+which widen the codes to f16 in a tile's staging. `r4d_selftest` holds the stores to an exactly
+representable set and the attention rows to its inline oracle.
+
 ### `qk_norm_rope_gate` (device-only)
 
 | op | params | operands |

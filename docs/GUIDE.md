@@ -783,6 +783,23 @@ widths, and the flag sets every attention cache of the deployment, a drafter's (
 included. The delta-net state and the QSA indexer's key tail are recurrent state and keep their own
 widths.
 
+`fp8_v4` and `k6_v4` narrow the trunk's attention cache further, in groups of 32 dimensions with an
+f16 scale each: `fp8_v4` keeps K in E4M3 and stores V as int4, `k6_v4` stores K as int6 too. A token
+then costs 25/32 or 22/32 of what fp8 costs, and a drafter's cache stays fp8. libr4d has their
+kernels for Qwen3.8-27B's attention (head_dim 256, gqa 6), so the plugin offers them there and the
+server refuses them, naming the plugin, anywhere else. On two R9700s at the serve flags of
+`qwen3.8-27b-mxfp4.yaml` with `--max-num-batched-tokens 2048` and 12 GiB a card left to another
+engine, against the bf16 model on 17 long log-analysis documents (60 368 scored positions):
+
+| `--kv-cache-dtype` | KV pool | mean KL | top-1 | 41k-token prefill | decode, 1 / 16 streams |
+|---|---|---|---|---|---|
+| `fp8` | 518 800 tokens | 0.039963 | 94.03% | 9.76 s | 134-140 / 550-555 tok/s |
+| `fp8_v4` | 664 400 (+28%) | 0.040076 | 94.03% | 9.76 s | 130-139 / 553-557 |
+| `k6_v4` | 755 184 (+46%) | 0.039965 | 94.06% | 9.84 s | 136-138 / 553-561 |
+
+The decode spread is run to run; the three are the same speed there. Each layout's row and the
+kernels that read it are in [OPS.md](OPS.md#the-kv-cache-operand).
+
 **Many sequences.** Every model here serves `--max-num-seqs` up to 32. A sequence holds only the
 blocks its tokens occupy, but two costs exist per sequence regardless:
 
@@ -1322,7 +1339,7 @@ still verified by the adapter, so output is exact and only the acceptance rate c
 | flag | default | |
 |---|---|---|
 | `--gpu-headroom-mib N` | 96 | VRAM left unclaimed on every card |
-| `--kv-cache-dtype T` | bf16 | `bf16` or `fp8` |
+| `--kv-cache-dtype T` | bf16 | `bf16`, `fp8`, or on Qwen3.8-27B `fp8_v4` or `k6_v4` (§4.4) |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |
 | `--host-headroom-mib N` | 4096 | host RAM left free for the system when startup pins host memory — kept for the unpooled allocations, staging and page cache (§4.3) |
 | `--embedding-placement WHERE` | ram | `ram` or `vram`: the token embedding pinned in host memory beside `--host-pool-mib` and read in place, or on the card (§4.3) |

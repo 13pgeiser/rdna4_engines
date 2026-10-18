@@ -1,4 +1,4 @@
-/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 21 and
+/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 23 and
  * RAD_FORMAT_VER 2, as { type, field, offset, size } rows ("" is the struct itself). A snapshot
  * of the headers on x86-64 Linux, which abi_layout_test.cpp holds the layout to; regenerate it
  * from the test's printout only together with a version bump. */
@@ -13,6 +13,7 @@
 { "RadArchProbe", "gen_audio", 48, 4 },
 { "RadArchProbe", "gen_ctx", 56, 8 },
 { "RadArchProbe", "gen_video", 64, 4 },
+{ "RadArchProbe", "kv_quant_ok", 68, 4 },
 { "RadArgs", "", 0, 64 },
 { "RadArgs", "t", 0, 8 },
 { "RadArgs", "n_t", 8, 4 },
@@ -79,7 +80,7 @@
 { "RadBufDecl", "domain", 60, 4 },
 { "RadBufDecl", "derive", 64, 8 },
 { "RadBufDecl", "kv", 72, 4 },
-{ "RadBuildCtx", "", 0, 104 },
+{ "RadBuildCtx", "", 0, 112 },
 { "RadBuildCtx", "rank", 0, 4 },
 { "RadBuildCtx", "world_size", 4, 4 },
 { "RadBuildCtx", "max_tok", 8, 8 },
@@ -96,6 +97,7 @@
 { "RadBuildCtx", "max_out_rows", 80, 8 },
 { "RadBuildCtx", "max_audio_frames", 88, 8 },
 { "RadBuildCtx", "max_mixed_tok", 96, 8 },
+{ "RadBuildCtx", "kv_quant", 104, 4 },
 { "RadAudioGenBatch", "", 0, 264 },
 { "RadAudioGenBatch", "n_lane", 0, 8 },
 { "RadAudioGenBatch", "lane", 8, 8 },

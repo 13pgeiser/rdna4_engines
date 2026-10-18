@@ -56,6 +56,29 @@ double      rad_meta_getf(const RadModelMeta* m, const char* key, double dflt);
 const char* rad_meta_gets(const RadModelMeta* m, const char* key, const char* dflt);
 
 /* ================================================================== build context */
+/* RadBuildCtx::kv_quant. A layout groups each head's dims by 32 with an f16 scale per group, the
+ * group's absmax over the largest code. A token's row in a head, at head_dim HD (a multiple of 32):
+ *
+ *   RAD_KVQ_V4 (fp8_v4), 25 * HD / 16 bytes:
+ *     [0, HD)            K, E4M3 as the fp8 cache stores it
+ *     [HD, 3HD/2)        V's int4 codes, dim d in the nibble at bit 4 * (d % 2) of byte d / 2
+ *     [3HD/2, 25HD/16)   V's scales (absmax / 7)
+ *   RAD_KVQ_K6V4 (k6_v4), 22 * HD / 16 bytes:
+ *     [0, HD/2)          K's low four bits, as V's codes above
+ *     [HD/2, 3HD/4)      K's high two bits, a 4-byte word per 16 dims whose byte j holds dims 2j
+ *                        and 2j+1 in bits 0-3 and dims 8+2j and 9+2j in bits 4-7
+ *     [3HD/4, 5HD/4)     V's int4 codes
+ *     [5HD/4, 21HD/16)   K's scales (absmax / 31)
+ *     [21HD/16, 22HD/16) V's scales (absmax / 7)
+ *
+ * Codes are two's complement (int4 -7..7, int6 -31..31). The group is declared at RAD_F8E4M3 with
+ * head_dim the row's bytes / 2 so the core sizes pages from it; only the layout's kernels read it. */
+enum {
+    RAD_KVQ_NONE = 0,
+    RAD_KVQ_V4   = 1,
+    RAD_KVQ_K6V4 = 2
+};
+
 typedef struct RadBuildCtx {
     int      rank;            /* declare runs once per rank; the plugin declares dimensions */
     int      world_size;      /* already divided -- the core inserts no collectives (spec §9) */
@@ -86,7 +109,7 @@ typedef struct RadBuildCtx {
      * RAD_DT_INVALID (the zero-initialised default) means the plugin's default, bf16 for every
      * architecture in this tree. RAD_F8E4M3 is the only other implemented value: the fp8kv
      * attention family is band-gated on it, and the store side writes E4M3 with per-(sequence,
-     * head) descales.
+     * head) descales. `kv_quant` below narrows the trunk's attention cache further.
      *
      * An ABI field rather than an environment variable because it changes what the model
      * computes, so it must have one visible answer: --kv-cache-dtype. */
@@ -140,6 +163,15 @@ typedef struct RadBuildCtx {
      *
      * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
     int64_t  max_mixed_tok;
+
+    /* A narrower layout of the trunk's attention cache under kv_dtype RAD_F8E4M3, from
+     * --kv-cache-dtype fp8_v4 or k6_v4: a RAD_KVQ_* (below). The engine sets it only for a plugin
+     * whose probe has the layout's bit in RadArchProbe::kv_quant_ok and refuses the flag
+     * otherwise, so no plugin sees it that would store plain E4M3 instead. A drafter's cache stays
+     * E4M3.
+     *
+     * Trailing and zero-defaulted, so a plugin built against the older struct is unchanged. */
+    int      kv_quant;
 } RadBuildCtx;
 
 /* ================================================================== weights */
@@ -993,6 +1025,10 @@ typedef struct RadArchProbe {
      * `gen_rows` (its largest pass: a step's packed sequence at the largest size and length). It
      * keeps no KV. */
     int32_t gen_video;
+    /* The RadBuildCtx::kv_quant layouts the plugin serves for this model, bit 1 << RAD_KVQ_*:
+     * libr4d has their rows for its attention geometry. A layout whose bit is clear is refused at
+     * startup with the plugin named. */
+    int32_t kv_quant_ok;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);

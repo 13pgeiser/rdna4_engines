@@ -881,7 +881,9 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
     bc.tp_wire_lossy = cfg_.tp_wire_exact ? 0 : 1;
     /* The engine always states the KV dtype. RAD_DT_INVALID (zero) remains valid in the ABI for
      * other callers and means the plugin's default. */
-    bc.kv_dtype = cfg_.kv_cache_dtype == "fp8" ? RAD_F8E4M3 : RAD_BF16;
+    bc.kv_dtype = cfg_.kv_cache_dtype == "bf16" ? RAD_BF16 : RAD_F8E4M3;
+    bc.kv_quant = cfg_.kv_cache_dtype == "fp8_v4" ? RAD_KVQ_V4
+                : cfg_.kv_cache_dtype == "k6_v4"  ? RAD_KVQ_K6V4 : RAD_KVQ_NONE;
     bc.tp_wire_min_bytes = cfg_.tp_wire_min_kb * 1024;
     bc.scope      = "";
     bc.max_enc_patches = cfg_.mm_max_patches > 0 ? cfg_.mm_max_patches : 0;
@@ -985,6 +987,19 @@ int Engine::declare() {
             }
             if (cfg_.n_spec < 0) cfg_.n_spec = 0;
             cfg_.prefix_cache = false;
+        }
+    }
+    /* fp8_v4 and k6_v4 are layouts only the plugin and libr4d's rows for them know. A plugin that
+     * does not say it serves one (RadArchProbe::kv_quant_ok) would store plain E4M3 under a name
+     * that promised a smaller cache, so the flag is refused rather than ignored. */
+    if (cfg_.kv_cache_dtype == "fp8_v4" || cfg_.kv_cache_dtype == "k6_v4") {
+        const int q = cfg_.kv_cache_dtype == "fp8_v4" ? RAD_KVQ_V4 : RAD_KVQ_K6V4;
+        RadArchProbe pb{};
+        (void)rad_tools_probe(plugins_, meta_, &pb);
+        if (!(pb.kv_quant_ok & (1 << q))) {
+            RAD_ERR("--kv-cache-dtype %s: the '%s' plugin does not serve it for this model "
+                    "(fp8 does)", cfg_.kv_cache_dtype.c_str(), plugins_.arch_plugin.c_str());
+            return RAD_E_UNSUPPORTED;
         }
     }
     /* Resolved here, not at argument parsing: the plugin states its drafter's depth, and it is

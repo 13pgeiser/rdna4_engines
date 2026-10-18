@@ -737,10 +737,11 @@ struct Config {
     int64_t vram_weights_mib = 0;
     int64_t vram_kv_mib = 0;
     int64_t gpu_headroom_mib = 96;     /* --gpu-headroom-mib, left unclaimed on every card */
-    /* --kv-cache-dtype bf16|fp8. fp8 is an E4M3 cache with per-(sequence, head) descales; it
-     * halves the per-token cost, most of the KV pool at production context. It changes the
-     * model's output slightly, so it is explicit and bf16 is the default. No "auto": it would
-     * always resolve to bf16 and only add a third name. */
+    /* --kv-cache-dtype bf16|fp8|fp8_v4|k6_v4. fp8 is an E4M3 cache with per-(sequence, head)
+     * descales; it halves the per-token cost, most of the KV pool at production context. fp8_v4
+     * keeps K as E4M3 and V as int4 in groups of 32, k6_v4 also K as int6 (RadBuildCtx::kv_quant),
+     * served only where the plugin says so. Each changes the model's output slightly, so it is explicit and bf16 is the
+     * default. No "auto": it would always resolve to bf16 and only add another name. */
     std::string kv_cache_dtype = "bf16";
     int64_t host_pool_mib = 0;
     int64_t host_headroom_mib = 4096; /* --host-headroom-mib: RAM left free for the system at startup */

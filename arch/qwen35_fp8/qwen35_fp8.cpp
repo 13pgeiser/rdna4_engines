@@ -554,9 +554,32 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     fd.dtype     = rad_kv_cache_dtype(ctx, RAD_BF16);
     fd.n_head_kv = g.n_head_kv;
     fd.head_dim  = g.head_dim;
+    /* --kv-cache-dtype fp8_v4 / k6_v4 (RadBuildCtx::kv_quant): V as int4 in groups of 32 with f16
+     * scales, K E4M3 as above or int6 the same way (libr4d's fp8_v4 / k6_v4 rows). A token's row
+     * is 25 or 22 * head_dim / 16 bytes instead of 2 * head_dim, so the group is declared at half
+     * that and the core sizes pages from it; only those kernels read the layout. The drafter's
+     * group stays E4M3 (declare_dflash2). The engine asks only for a layout probe() offered. */
+    const int kvq = fd.dtype == RAD_F8E4M3 ? ctx->kv_quant : RAD_KVQ_NONE;
+    const char* kvq_name = kvq == RAD_KVQ_V4 ? "fp8_v4" : kvq == RAD_KVQ_K6V4 ? "k6_v4" : nullptr;
+    if (kvq != RAD_KVQ_NONE && !kvq_name) {
+        fprintf(stderr, "radiance: KV cache layout %d is not one this plugin knows\n", kvq);
+        return RAD_E_UNSUPPORTED;
+    }
+    if (kvq_name && !(g.head_dim == 256 && g.n_head == 6 * g.n_head_kv)) {
+        fprintf(stderr, "radiance: --kv-cache-dtype %s has libr4d rows at head_dim 256, gqa 6 "
+                        "only; this model is head_dim %lld, gqa %lld\n", kvq_name,
+                (long long)g.head_dim, (long long)(g.n_head_kv ? g.n_head / g.n_head_kv : 0));
+        return RAD_E_UNSUPPORTED;
+    }
+    const int64_t row16 = kvq == RAD_KVQ_V4 ? 25 : kvq == RAD_KVQ_K6V4 ? 22 : 32;
+    fd.head_dim = g.head_dim * row16 / 32;
     m.kv_full = rad_decl_kv_group(b, nm.f("kv_attn"), &fd);
     /* The op parameter must use the spelling the rows band on, which is rad_dtype_name's. */
-    g.kv_dtype = rad_dtype_name(fd.dtype);
+    g.kv_dtype = kvq_name ? kvq_name : rad_dtype_name(fd.dtype);
+    if (kvq_name)
+        rad_note(b, "kv cache %s: %s K, int4 V, in groups of 32 with f16 scales, %lld bytes a token "
+                    "and head instead of %lld", kvq_name, kvq == RAD_KVQ_V4 ? "E4M3" : "int6",
+                 (long long)(g.head_dim * row16 / 16), (long long)(2 * g.head_dim));
 
     /* The SSM state cache is f32.
      *
@@ -1175,6 +1198,15 @@ static void step(RadCtx* c, const RadBatch* batch) {
  * 0 when the container carries no drafter. */
 static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
+    /* --kv-cache-dtype fp8_v4 / k6_v4: libr4d's rows for them are the h256/gqa6 attention
+     * family's (Qwen3.8-27B), so other geometries are refused at startup rather than in declare. */
+    {
+        const long long hd  = meta->head_dim ? meta->head_dim
+                                             : (meta->n_head ? meta->n_embd / meta->n_head : 0);
+        const long long nkv = meta->n_head_kv ? meta->n_head_kv : meta->n_head;
+        if (hd == 256 && nkv > 0 && meta->n_head == 6 * nkv)
+            out->kv_quant_ok = (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4);
+    }
     const char* da = rad_meta_gets(meta, "draft.architectures", "");
     if (da && std::strstr(da, "DFlash2")) {
         const long long bs = rad_meta_geti(meta, "draft.dflash_config.block_size", 8);

@@ -6081,6 +6081,92 @@ TEST(gemma3_dflash2_drafter_taps_and_block) {
     CHECK_EQ(q.draft_depth, 0);
 }
 
+/* --kv-cache-dtype fp8_v4: the trunk's attention cache is E4M3 K (256 bytes), int4 V (128) and
+ * eight f16 scales, 400 bytes a token and head, declared as 25 * 256 / 32 = 200 E4M3 columns so the
+ * core sizes its pages; every trunk op on it bands on kv_dtype fp8_v4. The DFlash2 drafter's own
+ * group stays E4M3 at its head_dim. Without kv_quant the same build is plain fp8. */
+TEST(qwen35_fp8_fp8_v4_cache_is_400_bytes_a_token_and_head) {
+    MetaKV mk = with_dflash2(q35fp8_meta());
+    auto count = [](const RadBuilder& b, const char* kd) {
+        int n = 0;
+        for (const auto& o : b.ops) if (pstr(&o, "kv_dtype") == kd) ++n;
+        return n;
+    };
+    RadBuilder f8;
+    RadBuildCtx c8 = spec_ctx(0, 1, 7);
+    c8.kv_dtype = RAD_F8E4M3;
+    REQUIRE_EQ(qwen35_fp8::declare(&f8, mk.meta(), &c8), RAD_OK);
+    CHECK_EQ(f8.kv_groups[0].d.head_dim, 256);
+    CHECK_EQ(count(f8, "fp8_v4"), 0);
+    const int n8 = count(f8, "fp8_e4m3");
+
+    RadBuilder b;
+    RadBuildCtx ctx = c8;
+    ctx.kv_quant = RAD_KVQ_V4;
+    REQUIRE_EQ(qwen35_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+    CHECK_EQ(b.kv_groups[0].name, std::string("kv_attn"));
+    const RadKVGroupDecl& f = b.kv_groups[0].d;
+    CHECK_EQ(f.kind, RAD_KV_FULL);
+    CHECK_EQ(f.dtype, (uint32_t)RAD_F8E4M3);
+    CHECK_EQ(f.n_head_kv, 4);
+    CHECK_EQ(f.head_dim, 200);
+    const RadKVGroupDecl& d = b.kv_groups.back().d;
+    CHECK_EQ(d.dtype, (uint32_t)RAD_F8E4M3);
+    CHECK_EQ(d.head_dim, 128);
+    const int v4 = count(b, "fp8_v4"), e4 = count(b, "fp8_e4m3");
+    CHECK(v4 > 0);
+    CHECK(e4 > 0);                       /* the drafter's attention */
+    CHECK_EQ(v4 + e4, n8);
+    CHECK(noted(b, "kv cache fp8_v4"));
+
+    RadArchProbe p{};
+    CHECK_OK(qwen35_fp8::probe(mk.meta(), &p));
+    CHECK_EQ(p.kv_quant_ok, (1 << RAD_KVQ_V4) | (1 << RAD_KVQ_K6V4));
+}
+
+/* --kv-cache-dtype k6_v4: int6 K and int4 V, each in groups of 32 with an f16 scale, 352 bytes a
+ * token and head, declared as 176 E4M3 columns; the trunk's ops band on kv_dtype k6_v4 and the
+ * drafter's group stays E4M3. */
+TEST(qwen35_fp8_k6_v4_cache_is_352_bytes_a_token_and_head) {
+    MetaKV mk = with_dflash2(q35fp8_meta());
+    RadBuilder b;
+    RadBuildCtx ctx = spec_ctx(0, 1, 7);
+    ctx.kv_dtype = RAD_F8E4M3;
+    ctx.kv_quant = RAD_KVQ_K6V4;
+    REQUIRE_EQ(qwen35_fp8::declare(&b, mk.meta(), &ctx), RAD_OK);
+    const RadKVGroupDecl& f = b.kv_groups[0].d;
+    CHECK_EQ(f.dtype, (uint32_t)RAD_F8E4M3);
+    CHECK_EQ(f.head_dim, 176);
+    CHECK_EQ(b.kv_groups.back().d.head_dim, 128);
+    int k6 = 0, v4 = 0, e4 = 0;
+    for (const auto& o : b.ops) {
+        const std::string kd = pstr(&o, "kv_dtype");
+        k6 += kd == "k6_v4"; v4 += kd == "fp8_v4"; e4 += kd == "fp8_e4m3";
+    }
+    CHECK(k6 > 0);
+    CHECK(e4 > 0);
+    CHECK_EQ(v4, 0);
+    CHECK(noted(b, "kv cache k6_v4"));
+}
+
+/* libr4d's fp8_v4 and k6_v4 rows are h256/gqa6 only: the probe answers no for another geometry, so the
+ * engine refuses the flag at startup, and declare refuses it too if asked anyway. */
+TEST(qwen35_fp8_quantised_kv_is_refused_outside_h256_gqa6) {
+    MetaKV mk = q35fp8_meta();
+    mk.m.n_head_kv = 2;                  /* gqa 12 */
+    RadArchProbe p{};
+    CHECK_OK(qwen35_fp8::probe(mk.meta(), &p));
+    CHECK_EQ(p.kv_quant_ok, 0);
+    for (int q : { (int)RAD_KVQ_V4, (int)RAD_KVQ_K6V4 }) {
+        RadBuilder b;
+        RadBuildCtx ctx = build_ctx();
+        ctx.kv_dtype = RAD_F8E4M3;
+        ctx.kv_quant = q;
+        CHECK_EQ(stderr_of_rc([&] { return qwen35_fp8::declare(&b, mk.meta(), &ctx); }),
+                 RAD_E_UNSUPPORTED);
+    }
+}
+
 /* The 35B-A3B: a replicated router over every expert, a normalised top-k (norm_topk_prob
  * defaults on in this family; without it the weights sum to about 0.4), fp8a8 grouped GEMMs over
  * the expert planes, and the shared expert folded into the gather behind a sigmoid gate. */
