@@ -650,6 +650,9 @@ A compiler-free `daemon --precompile --module rmsnorm_f32` probes the real
 `Gpu::rmsnorm_f32` kernel load and verifies numerical output. The installed
 objects must be beside the actual daemon executable, not merely in the CWD;
 the cache override controls only writable hot JIT entries.
+The runtime never writes under the installed pack: a rejected or stale packaged
+object is rebuilt into the hot cache only, so repair an install by re-running the
+installer (or `hipfire kernel-pack install`), not by relying on a runtime refresh.
 Kernel-selector and arch-specific `HIPFIRE_GFX*` / `HIPFIRE_RDNA*` /
 `HIPFIRE_MOE_*` levers are **research/power-user**. Centralized
 `FeatureFlags` controls now have typed TOML keys under `kernel` or

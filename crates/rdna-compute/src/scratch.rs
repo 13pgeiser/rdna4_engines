@@ -1162,7 +1162,7 @@ pub(crate) fn module_load_or_recompile(
                 "  {module_name}: cached kernel image invalid (HIP {}); recompiling from source",
                 e.code
             );
-            path = compiler.recompile(module_name, source, symbol)?;
+            path = compiler.recompile(module_name, source)?;
             image = read(&path)?;
             hip.module_load_data(&image)?
         }
