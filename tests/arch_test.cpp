@@ -451,6 +451,7 @@ extern "C" int rad_memset_async(void* dst, int value, int64_t bytes, RadStream s
 /* Gemma 4 dense: two attention classes (sliding-window + proportional-RoPE global) on one stream. */
 #include "../arch/gemma4_bf16/gemma4_bf16.cpp"
 /* The bf16 / fp8-expert Gemma 4 plugin: the 26B-A4B's dense and routed arms side by side. */
+#include "../arch/gemma3/gemma3.cpp"
 #include "../arch/gemma4/gemma4.cpp"
 /* Qwen3-ASR: a Whisper-style audio tower over a dense Qwen3 decoder. */
 #include "../arch/qwen3asr_bf16/qwen3asr_bf16.cpp"
@@ -5863,6 +5864,220 @@ TEST(qwen35_fp8_dflash2_drafter_takes_a_power_of_two_block) {
 TEST(qwen35_fp8_steps_lint_clean_with_a_dflash2_drafter) {
     MetaKV mk = with_dflash2(q35fp8_meta());
     lint_qwen35_fp8_family(qwen35_fp8::declare, qwen35_fp8::step, mk.meta(), 7, true, 8);
+}
+
+/* =============================== gemma3: TranslateGemma 27B's trunk =========================== */
+
+namespace {
+
+/* TranslateGemma 27B's text geometry cut to twelve layers, two global (5 and 11) over ten sliding
+ * ones by the legacy (l + 1) % 6 rule. One head geometry for both classes (head_dim 128, 32 / 16),
+ * scores scaled by query_pre_attn_scalar^-0.5, linear rotary scaling on the global class only. */
+MetaKV gemma3_meta() {
+    RadModelMeta m{};
+    m.arch_id     = "gemma3";
+    m.name        = "test-translategemma-27b";
+    m.quant       = "";
+    m.n_layers    = 12;
+    m.n_embd      = 5376;
+    m.n_head      = 32;
+    m.n_head_kv   = 16;
+    m.head_dim    = 128;
+    m.n_ff        = 21504;
+    m.n_vocab     = 262208;
+    m.n_ctx_train = 131072;
+    m.rms_eps     = 1e-6f;
+    m.rope_theta  = 1e6f;
+    m.rope_scale  = 1.0f;
+    MetaKV k(m);
+    k.set("sliding_window", "1024")
+     .set("_sliding_window_pattern", "6")
+     .set("rope_local_base_freq", "10000")
+     .set("rope_theta", "1000000")
+     .set("query_pre_attn_scalar", "168")
+     .set("rope_scaling.rope_type", "linear")
+     .set("rope_scaling.factor", "8");
+    return k;
+}
+
+MetaKV gemma3_dflash2_meta() {
+    MetaKV k = gemma3_meta();
+    k.set("draft.architectures", "DFlash2DraftModel")
+     .set("draft.num_hidden_layers", "2")
+     .set("draft.head_dim", "128")
+     .set("draft.num_attention_heads", "32")
+     .set("draft.num_key_value_heads", "8")
+     .set("draft.hidden_size", "5376")
+     .set("draft.intermediate_size", "8192")
+     .set("draft.rms_norm_eps", "1e-06")
+     .set("draft.rope_theta", "1000000")
+     .set("draft.vocab_size", "262208")
+     .set("draft.use_sliding_window", "1")
+     .set("draft.sliding_window", "2048")
+     .set("draft.dflash_config.input_embedding_scale", "73.5")
+     .set("draft.dflash_config.target_layer_ids", "1 5 10")
+     .set("draft.dflash_config.block_size", "8")
+     .set("draft.dflash_config.mask_token_id", "6")
+     .set("draft.dflash_config.selector_rank", "64")
+     .set("draft.dflash_config.selector_top_k", "8")
+     .set("draft.dflash_config.conv_kernel_size", "2")
+     .set("draft.dflash_config.conv_group_size", "16");
+    return k;
+}
+
+}  /* namespace */
+
+/* Sliding layers in a window group declared first, the global ones in a full group, both at the
+ * one head geometry; layers bound by the (l + 1) % 6 rule. */
+TEST(gemma3_declares_two_kv_groups_and_binds_the_schedule) {
+    MetaKV mk = gemma3_meta();
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(gemma3::declare(&b, mk.meta(), &ctx), RAD_OK);
+    REQUIRE_EQ((int)b.kv_groups.size(), 2);
+    CHECK_EQ(b.kv_groups[0].name, std::string("kv_sliding"));
+    CHECK_EQ((int)b.kv_groups[0].d.kind, RAD_KV_WINDOW);
+    CHECK_EQ(b.kv_groups[0].d.window, 1024);
+    CHECK_EQ(b.kv_groups[0].d.n_head_kv, 16);
+    CHECK_EQ(b.kv_groups[0].d.head_dim, 128);
+    CHECK_EQ(b.kv_groups[1].name, std::string("kv_global"));
+    CHECK_EQ((int)b.kv_groups[1].d.kind, RAD_KV_FULL);
+    CHECK_EQ(b.kv_groups[1].d.window, 0);
+    CHECK_EQ(b.kv_groups[1].d.head_dim, 128);
+    CHECK_EQ((int)b.binds.size(), 12);
+    for (int l = 0; l < 12; ++l) {
+        CHECK_EQ((int)b.binds[(size_t)l].first, l);
+        CHECK_EQ((int)b.binds[(size_t)l].second, (l + 1) % 6 == 0 ? 2 : 1);
+    }
+}
+
+/* layer_types, where the config has it, names the schedule instead of the legacy pattern, and a
+ * count that is not the model's is refused. */
+TEST(gemma3_layer_types_name_the_global_layers) {
+    MetaKV mk = gemma3_meta();
+    mk.set("layer_types", "[\"full_attention\", \"sliding_attention\", \"sliding_attention\", "
+                          "\"sliding_attention\", \"sliding_attention\", \"sliding_attention\", "
+                          "\"sliding_attention\", \"sliding_attention\", \"sliding_attention\", "
+                          "\"sliding_attention\", \"sliding_attention\", \"full_attention\"]");
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(gemma3::declare(&b, mk.meta(), &ctx), RAD_OK);
+    for (int l = 0; l < 12; ++l)
+        CHECK_EQ((int)b.binds[(size_t)l].second, (l == 0 || l == 11) ? 2 : 1);
+
+    mk.set("layer_types", "[\"full_attention\", \"sliding_attention\"]");
+    RadBuilder c;
+    CHECK(stderr_of_rc([&] { return gemma3::declare(&c, mk.meta(), &ctx); }) != RAD_OK);
+}
+
+/* Both classes attend at 1/sqrt(query_pre_attn_scalar), not 1/sqrt(head_dim); the sliding class
+ * is windowed and rotates at rope_local_base_freq unscaled, the global class at rope_theta with
+ * the linear factor; every norm is GemmaRMSNorm (wadd 1). */
+TEST(gemma3_attention_scale_rope_and_norms_per_class) {
+    MetaKV mk = gemma3_meta();
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(gemma3::declare(&b, mk.meta(), &ctx), RAD_OK);
+    std::vector<const RecOp*> at;
+    for (const auto& o : b.ops) if (o.op == "attn_paged") at.push_back(&o);
+    REQUIRE(!at.empty());
+    bool windowed = false, full = false;
+    for (const RecOp* o : at) {
+        CHECK_EQ(pint(o, "head_dim"), 128);
+        CHECK_EQ(pint(o, "gqa"), 2);
+        CHECK(std::fabs(pflt(o, "scale") - 1.0 / std::sqrt(168.0)) < 1e-9);
+        if (pint(o, "window") == 1024) windowed = true;
+        if (pint(o, "window") == 0) full = true;
+    }
+    CHECK(windowed && full);
+    std::set<std::pair<double, double>> rot;   /* (theta, scale) of every rotary op */
+    for (const auto& o : b.ops)
+        if (param(&o, "theta")) rot.insert({ pflt(&o, "theta"), pflt(&o, "scale") });
+    CHECK(rot.count({ 10000.0, 1.0 }) == 1);
+    CHECK(rot.count({ 1000000.0, 0.125 }) == 1 || rot.count({ 1000000.0, 8.0 }) == 1);
+    for (const auto& o : b.ops)
+        if (param(&o, "wadd")) CHECK_EQ(pflt(&o, "wadd"), 1.0);
+}
+
+/* Gemma 2's soft-capping and a YaRN scaling are refused rather than served without them. */
+TEST(gemma3_refuses_softcapping_and_yarn) {
+    RadBuildCtx ctx = build_ctx();
+    {
+        MetaKV mk = gemma3_meta();
+        mk.set("final_logit_softcapping", "30");
+        RadBuilder b;
+        CHECK_EQ(stderr_of_rc([&] { return gemma3::declare(&b, mk.meta(), &ctx); }), RAD_E_UNSUPPORTED);
+    }
+    {
+        MetaKV mk = gemma3_meta();
+        mk.set("rope_scaling.rope_type", "yarn").set("rope_scaling.original_max_position_embeddings", "8192");
+        RadBuilder b;
+        CHECK(stderr_of_rc([&] { return gemma3::declare(&b, mk.meta(), &ctx); }) != RAD_OK);
+    }
+}
+
+TEST(gemma3_every_op_declares_its_buffers_and_every_weight_has_a_name_map) {
+    MetaKV mk = gemma3_meta();
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(gemma3::declare(&b, mk.meta(), &ctx), RAD_OK);
+    for (const auto& o : b.ops)
+        if (o.resolved) CHECK(o.uses_declared);
+    for (const auto& w : b.weights)
+        if (!w.d.source) CHECK(find_map(b, w.name) != nullptr);
+}
+
+/* A decode step and a prefill step lint clean at one and two ranks. */
+TEST(gemma3_steps_lint_clean_at_one_and_two_ranks) {
+    MetaKV mk = gemma3_meta();
+    for (int world : { 1, 2 })
+        for (int rank = 0; rank < world; ++rank) {
+            RadBuilder b;
+            RadBuildCtx ctx = build_ctx(rank, world);
+            REQUIRE_EQ(gemma3::declare(&b, mk.meta(), &ctx), RAD_OK);
+            RadBatch batch = decode_batch();
+            RadCtx c{ .b = &b, .batch = &batch };
+            gemma3::step(&c, &batch);
+            CHECK_LINT(b, &c);
+            CHECK(c.step_fail.empty());
+            CHECK_EQ(count_op(b, "all_reduce") + count_op(b, "ar_rmsnorm_quant_fp8") > 0, world == 2);
+        }
+}
+
+/* The DFlash2 drafter: a block of 8 (depth 7, fixed), taps copied out after the named layers into
+ * one column-sliced buffer, the mask token from the config, and the drafter's own KV group after
+ * the trunk's two. Its input_embedding_scale must be the trunk's sqrt(hidden) held in bf16
+ * (73.5 on the 27B), which the embedding lookup applies. */
+TEST(gemma3_dflash2_drafter_taps_and_block) {
+    MetaKV mk = gemma3_dflash2_meta();
+    RadBuilder b;
+    RadBuildCtx ctx = spec_ctx(0, 1, 7);
+    REQUIRE_EQ(gemma3::declare(&b, mk.meta(), &ctx), RAD_OK);
+    CHECK_EQ((int)b.drafter.kind, (int)RAD_DRAFT_BLOCK);
+    CHECK_EQ(b.drafter.depth, 7);
+    CHECK_EQ(b.drafter.block, 8);
+    CHECK_EQ(b.drafter.mask_token, 6);
+    const RecBuf* src = find_b(b, "dflash_src");
+    REQUIRE(src != nullptr);
+    CHECK_EQ(src->d.shape[1], 3 * 5376);
+    CHECK_EQ((int)b.kv_groups.size(), 3);
+    CHECK(!noted(b, "input_embedding_scale"));
+    {   /* A drafter trained at another embedding scale still serves, with a note. */
+        MetaKV other = gemma3_dflash2_meta();
+        other.set("draft.dflash_config.input_embedding_scale", "64");
+        RadBuilder o;
+        REQUIRE_EQ(gemma3::declare(&o, other.meta(), &ctx), RAD_OK);
+        CHECK(noted(o, "input_embedding_scale"));
+    }
+
+    RadArchProbe p{};
+    CHECK_OK(gemma3::probe(mk.meta(), &p));
+    CHECK_EQ(p.draft_depth, 7);
+    CHECK_EQ(p.draft_depth_fixed, 1);
+    MetaKV plain = gemma3_meta();
+    RadArchProbe q{};
+    CHECK_OK(gemma3::probe(plain.meta(), &q));
+    CHECK_EQ(q.draft_depth, 0);
 }
 
 /* The 35B-A3B: a replicated router over every expert, a normalised top-k (norm_topk_prob

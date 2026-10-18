@@ -88,7 +88,7 @@ TEST(the_shipped_architectures_load_with_distinct_selection_keys) {
         CHECK(keys.emplace(std::make_pair(p.arch_id, p.arch_quant), p.name).second);
     }
     const std::set<std::pair<std::string, std::string>> want = {
-        { "breeze", "" }, { "embeddinggemma2", "" }, { "gemma4", "" },
+        { "breeze", "" }, { "embeddinggemma2", "" }, { "gemma3", "" }, { "gemma4", "" },
         { "gemma4", "compressed-tensors" }, { "lfm2", "" }, { "llama", "" }, { "llama", "fp8_e4m3" },
         { "qwen35", "" },
         { "qwen35", "fp8_e4m3" }, { "qwen35", "w8a8_fwht128" }, { "qwen35moe", "fp8_e4m3" },

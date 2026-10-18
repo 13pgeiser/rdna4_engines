@@ -113,6 +113,9 @@ struct Dflash2 {
         int64_t sel_topk = 16;    /* candidates kept per position */
         int64_t window   = 0;     /* sliding attention width, 0 for none */
         int     causal   = 0;
+        /* The target's embedding scale, applied to the query block as the drafter was trained
+         * (dflash_config.input_embedding_scale): 1 for Qwen, sqrt(hidden) in bf16 for Gemma. */
+        double  escale   = 1.0;
         int64_t steps() const { return block - 1; }
         int64_t ng(int64_t n_embd) const { return group ? n_embd / group : 0; }
         /* The kernel projection emits [2, taps, NG] per token (prepare's set, then finish's);
@@ -468,12 +471,22 @@ inline int Dflash2::declare(RadBuilder* b, Names& nm, const Geom& geom, const Co
                   {w.ck, w.cv}, {});
 
     /* ---------------------------------------------------------------- the query pass */
-    op_embed = rw(b, RAD_OP(b, "embed_lookup",
-                     RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n_embd", g.n_embd),
-                                RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
-                                RAD_INT("vocab_offset", g.vocab_off)),
-                     RAD_WEIGHTS(w_tok)),
-                 {}, {w.x});
+    /* An unscaled lookup is declared exactly as before the scale existed, so a Qwen container
+     * resolves the same op. */
+    if (cfg.escale != 1.0)
+        op_embed = rw(b, RAD_OP(b, "embed_lookup",
+                         RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n_embd", g.n_embd),
+                                    RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
+                                    RAD_INT("vocab_offset", g.vocab_off), RAD_F64("mult", cfg.escale)),
+                         RAD_WEIGHTS(w_tok)),
+                     {}, {w.x});
+    else
+        op_embed = rw(b, RAD_OP(b, "embed_lookup",
+                         RAD_PARAMS(RAD_RANGE("M", 1, qrows), RAD_INT("n_embd", g.n_embd),
+                                    RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
+                                    RAD_INT("vocab_offset", g.vocab_off)),
+                         RAD_WEIGHTS(w_tok)),
+                     {}, {w.x});
     /* The trunk's embedding is vocab-sharded, so the lookup is partial and needs an exact
      * all-reduce. */
     if (g.world > 1)
