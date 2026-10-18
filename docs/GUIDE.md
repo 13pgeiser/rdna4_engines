@@ -1029,6 +1029,51 @@ link pay more.
 access, for a board where peer traffic is broken or slow. `on` requires peer access and stops at
 startup, naming the pairs, if the driver refuses any. `auto`, the default, trusts the driver.
 
+**Eight cards on unequal links.** In the two-shot rank r reduces shard r of the message, and every
+rank's link carries at least the whole message each way whatever its shard, so the slowest link
+sets the time of every prefill all-reduce. On a board whose slots differ (here eight R9700s: four
+at Gen5 x16, two at Gen5 x8, two links that trained at Gen4 x8) the eight-rank two-shot does two
+things from 262144 elements (512 KiB of bf16) up:
+
+- it weights the shards by link: a rank on a slow link reduces a short shard, or none;
+- it runs the message in pieces, so one piece's second hop shares the link with the next piece's
+  first, both directions at once: 2 pieces under 1048576 elements, 4 under 4194304, 8 above.
+
+Every word is still folded in fp32 in ascending rank order whoever reduces it, so the bits are
+those of the even split. Below that size a decode step's message runs even and in one piece: there
+the extra handshakes cost more than the link time they save.
+
+The weights come from the links. At startup each rank reads its card's PCIe path in sysfs from the
+root port down and takes the slowest hop (the R9700's on-card switch reports full speed in any
+slot, so a degraded slot shows only at the root port); its weight is round(4·(rate/fastest)²), so
+x16 is 4, half the rate 1 and a quarter 0. Equal links give equal weights and the unweighted
+kernel. One line names what was read:
+
+```
+[r4d] eight-rank two-shot shard weights from the slowest PCIe hop of each card: r0 32.0 GT/s x16
+63.0 GB/s w4, r1 32.0 GT/s x8 31.5 GB/s w1, r2 16.0 GT/s x8 15.8 GB/s w0, ...
+```
+
+`r4d_selftest --perfar8 0` prints the same weights and times both rows at every piece count, each
+checked against the fold (warm, the slowest rank):
+
+| message (bf16) | even, one piece | weights 4,1,0,4,0,1,4,4 |
+|---|---|---|
+| 196608 elements (384 KiB) | 73 µs | below 262144: even, one piece |
+| 524288 (1 MiB) | 214 µs | 166 µs in 2 pieces |
+| 2097152 (4 MiB) | 699 µs | 531 µs in 4 pieces |
+| 8388608 (16 MiB, a 2048-token chunk at 4096 wide) | 2841 µs | 1636 µs in 8 pieces |
+
+With the two Gen4 links retrained to Gen5 x8 the weights read 4,1,1,4,1,1,4,4 and the 16 MiB
+message takes 1360 µs.
+
+The links are read once, at startup: a link that drops to a lower speed while the server runs
+keeps its weight until the next start. `RADIANCE_AR8_SHARD_WEIGHTS` overrides them: `off` keeps
+the shards even, eight comma-separated integers set them, unset or `auto` reads the links.
+`RADIANCE_AR8_PIECES` (1 to 16) fixes the piece count, and `RADIANCE_AR8_SHARD_WEIGHTS_MIN_ELEMS`
+and `RADIANCE_AR8_PIECES_MIN_ELEMS` move the two sizes they start at. Every rank must read the
+same values; where they differ, every rank stops at startup.
+
 ### 4.8 Host tier for finished conversations
 
 By default a finished conversation's KV blocks stay in VRAM, held by the prefix cache, until evicted
@@ -2616,6 +2661,7 @@ rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct?
 | `RADIANCE_CALIB_TOKENS` | with `RADIANCE_CALIB_DIR`, the tokens the calibration tap accumulates before it writes and switches itself off (default 65536) |
 | `RADIANCE_PROFILE_EVERY` | with `--profile-ops`, dump the per-op table every N steps (default 32) |
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
+| `RADIANCE_AR8_SHARD_WEIGHTS`, `RADIANCE_AR8_PIECES` | the eight-rank two-shot's shard weights (`auto`, the default, reads the PCIe links; `off`; or eight integers) and piece count, with `RADIANCE_AR8_SHARD_WEIGHTS_MIN_ELEMS` and `RADIANCE_AR8_PIECES_MIN_ELEMS` for the message size each starts at (§4.7) |
 
 Engine development has its own instruments: `RADIANCE_DEBUG_*` (residual probes, routing and issue
 dumps), `RADIANCE_OP_ORACLE*` (named ops checked against `libref` on the operands the model issued;
