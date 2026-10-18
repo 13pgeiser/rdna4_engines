@@ -860,17 +860,39 @@ static void attn_oracle_one(const uint16_t* qh, const uint8_t* kv, int kv_is_fp8
                             int64_t head_dim, int64_t kv_heads, int64_t block_size, int64_t kh,
                             const int* block_table, int64_t max_blocks, int ctx,
                             float kds, float vds, int causal, int window, float scale,
-                            int64_t qlen, int64_t i, float* out) {
+                            int64_t qlen, int64_t i, float* out, int kvq = 0) {
     const int ew = kv_is_fp8 ? 1 : 2;
     const int64_t pos = ctx - qlen + i;
-    const int64_t sb = kv_heads * block_size * 2 * head_dim;
-    const int64_t sh = block_size * 2 * head_dim;
-    const int64_t so = 2 * head_dim;
+    /* kvq 1, fp8_v4: a token's row is head_dim E4M3 K bytes, then V's codes (dim d in the nibble
+     * at bit 4 * (d % 2) of byte d / 2), then an f16 scale per 32 dims; V is (code ^ 8) - 8 times
+     * it. kvq 2, k6_v4: K's low nibbles, its high-bit words, V's codes, K's scales, V's scales
+     * (RAD_KVQ_K6V4 in abi/rad_builder.h); K is (code ^ 32) - 32 times its scale. */
+    const int v4 = kvq != 0;
+    const int64_t so = kvq == 2 ? 22 * head_dim / 16 : v4 ? 25 * head_dim / 16 : 2 * head_dim;
+    const int64_t voff = kvq == 2 ? head_dim * 3 / 4 : head_dim;
+    const int64_t vsoff = kvq == 2 ? head_dim * 21 / 16 : head_dim * 3 / 2;
+    const auto f16at = [](const uint8_t* p) {
+        uint16_t b; std::memcpy(&b, p, 2); return (float)__builtin_bit_cast(_Float16, b);
+    };
+    const int64_t sb = kv_heads * block_size * so;
+    const int64_t sh = block_size * so;
     const auto kslot = [&](int64_t blk, int64_t slot, int64_t d) {
+        if (kvq == 2) {
+            const uint8_t* row = kv + blk * sb + kh * sh + slot * so;
+            const int lo = (row[d / 2] >> (4 * (d & 1))) & 0xF;
+            const int x = (int)(d % 16);
+            const int hi = (row[head_dim / 2 + (d / 16) * 4 + (x & 7) / 2] >> ((x & 1) * 2 + (x >> 3) * 4)) & 3;
+            return (float)(((lo | (hi << 4)) ^ 32) - 32) * f16at(row + head_dim * 5 / 4 + (d / 32) * 2);
+        }
         const uint8_t* p = kv + (blk * sb + kh * sh + slot * so + d) * ew;
         return kv_is_fp8 ? h_e4m3(p[0]) : h_bf16(*(const uint16_t*)p);
     };
     const auto vslot = [&](int64_t blk, int64_t slot, int64_t d) {
+        if (v4) {
+            const uint8_t* row = kv + blk * sb + kh * sh + slot * so;
+            const int nib = (row[voff + d / 2] >> (4 * (d & 1))) & 0xF;
+            return (float)((nib ^ 8) - 8) * f16at(row + vsoff + (d / 32) * 2);
+        }
         const uint8_t* p = kv + (blk * sb + kh * sh + slot * so + head_dim + d) * ew;
         return kv_is_fp8 ? h_e4m3(p[0]) : h_bf16(*(const uint16_t*)p);
     };
@@ -922,19 +944,42 @@ static void attn_numeric_case(const Plugin& pl, const char* name, int64_t head_d
     const int64_t max_blocks = ctx / bs;
     const int64_t total_q = seqs * q_len;
     const int kv_is_fp8 = std::strcmp(kv_dtype, "bf16") != 0;
+    const int kvq = !std::strcmp(kv_dtype, "fp8_v4") ? 1 : !std::strcmp(kv_dtype, "k6_v4") ? 2 : 0;
+    const int v4 = kvq != 0;
     const uint32_t kvdt = kv_is_fp8 ? RAD_F8E4M3 : RAD_BF16;
     const int ew = kv_is_fp8 ? 1 : 2;
+    const int64_t rowe = kvq == 2 ? 22 * head_dim / 16 : v4 ? 25 * head_dim / 16 : 2 * head_dim;
+    const int64_t voff = kvq == 2 ? head_dim * 3 / 4 : head_dim;
+    const int64_t vsoff = kvq == 2 ? head_dim * 21 / 16 : head_dim * 3 / 2;
     const float scale = 1.0f / std::sqrt((float)head_dim);
 
     std::vector<uint16_t> qh((size_t)total_q * q_heads * head_dim);
     for (size_t i = 0; i < qh.size(); ++i) qh[i] = st_rand_bf16(i);
-    const int64_t nelem = max_blocks * kv_heads * bs * 2 * head_dim;
+    const int64_t nelem = max_blocks * kv_heads * bs * rowe;
     std::vector<uint8_t> kv((size_t)nelem * ew);
     for (int64_t e = 0; e < nelem; ++e) {
         const size_t bo = (size_t)e * ew;
         if (kv_is_fp8) kv[bo] = st_rand_e4m3(e);
         else { const uint16_t h = st_rand_bf16(e); kv[bo] = (uint8_t)h; kv[bo + 1] = (uint8_t)(h >> 8); }
     }
+    if (v4)   /* V: random codes, and scales from 1/64 to 1/4 so V spans about +-2 */
+        for (int64_t r0 = 0; r0 < nelem; r0 += rowe) {
+            uint8_t* row = &kv[(size_t)r0];
+            for (int64_t b = 0; b < head_dim / 2; ++b)
+                row[voff + b] = (uint8_t)(st_rand_e4m3(r0 * 7 + b) * 37u + (uint32_t)b);
+            for (int64_t g = 0; g < head_dim / 32; ++g) {
+                const _Float16 s = (_Float16)(0.015625f * (float)(1 + (st_rand_e4m3(r0 + g) & 15)));
+                std::memcpy(row + vsoff + g * 2, &s, 2);
+            }
+            if (kvq == 2) {   /* K: random codes, scales from 1/256 to 1/16 so K spans about +-2 */
+                for (int64_t b = 0; b < head_dim * 3 / 4; ++b)
+                    row[b] = (uint8_t)(st_rand_e4m3(r0 * 5 + b + 11) * 29u + (uint32_t)(3 * b));
+                for (int64_t g = 0; g < head_dim / 32; ++g) {
+                    const _Float16 s = (_Float16)(0.00390625f * (float)(1 + (st_rand_e4m3(r0 + g + 7) & 15)));
+                    std::memcpy(row + head_dim * 5 / 4 + g * 2, &s, 2);
+                }
+            }
+        }
     const std::vector<int32_t> bt = iota_i32(max_blocks);
 
     void* d_q  = dalloc((size_t)total_q * q_heads * head_dim * 2);
@@ -945,7 +990,7 @@ static void attn_numeric_case(const Plugin& pl, const char* name, int64_t head_d
 
     std::vector<RadTensor> ts = {
         T(d_q,   RAD_BF16, { total_q, q_heads, head_dim }),
-        T(d_kv,  kvdt,     { max_blocks, kv_heads, bs, 2 * head_dim }),
+        T(d_kv,  kvdt,     { max_blocks, kv_heads, bs, rowe }),
         TI32({ seqs, max_blocks }, bt),
         TI32({ seqs }, rep_i32(seqs, (int32_t)ctx)),
         TF32({ seqs, kv_heads }, 1.0f),
@@ -973,7 +1018,7 @@ static void attn_numeric_case(const Plugin& pl, const char* name, int64_t head_d
         float o[512];
         attn_oracle_one(&qh[(tok * q_heads + h) * head_dim], kv.data(), kv_is_fp8,
                         head_dim, kv_heads, bs, kh, bt.data(), max_blocks, ctx,
-                        1.0f, 1.0f, 1, window, scale, q_len, tok, o);
+                        1.0f, 1.0f, 1, window, scale, q_len, tok, o, kvq);
         for (int64_t d = 0; d < head_dim; ++d) {
             const size_t idx = (size_t)(tok * q_heads + h) * head_dim + d;
             oref[idx] = o[d];
@@ -1621,17 +1666,19 @@ static void qk_prologue_case(const Plugin& pl, uint32_t gain_dt, bool yarn = fal
  * The inputs span the clamp (v up to +-2000, k normed and rotated), reaching E4M3's +-448
  * saturation and its subnormals. A pad row (slot -1) and a slot past the cache's end must store
  * nothing. The engine's geometry: 12 query heads and 2 kv heads of 256, rot 64. */
-static void qk_kv_fold_case(const Plugin& pl, bool bf16) {
-    const char* row = bf16 ? "qk_norm_rope_gate_kv_store_bf16" : "qk_norm_rope_gate_kv_store_fp8";
+static void qk_kv_fold_case(const Plugin& pl, bool bf16, int kvq = 0) {
+    const char* row = bf16     ? "qk_norm_rope_gate_kv_store_bf16"
+                    : kvq == 1 ? "qk_norm_rope_gate_kv_store_fp8v4"
+                    : kvq == 2 ? "qk_norm_rope_gate_kv_store_k6v4" : "qk_norm_rope_gate_kv_store_fp8";
     if (!sel(row)) return;
-    const char* name = bf16
-        ? "qk_norm_rope_gate_kv_store_bf16 is byte-identical to the prologue + kv_store"
-        : "qk_norm_rope_gate_kv_store_fp8 is byte-identical to the prologue + kv_store";
+    const std::string nm_s = std::string(row) + " is byte-identical to the prologue + kv_store";
+    const char* name = nm_s.c_str();
     const uint32_t cdt = bf16 ? RAD_BF16 : RAD_F8E4M3;
-    const char* cname = bf16 ? "bf16" : "fp8_e4m3";
+    const char* cname = bf16 ? "bf16" : kvq == 1 ? "fp8_v4" : kvq == 2 ? "k6_v4" : "fp8_e4m3";
     const RadKernelInfo* rk = find(pl, row);
     const RadKernelInfo* rf = find(pl, "qk_norm_rope_gate");
-    const RadKernelInfo* rs = find(pl, bf16 ? "kv_store_bf16" : "kv_store_fp8");
+    const RadKernelInfo* rs = find(pl, bf16 ? "kv_store_bf16" : kvq == 1 ? "kv_store_fp8v4"
+                                       : kvq == 2 ? "kv_store_k6v4" : "kv_store_fp8");
     const RadKernelInfo* rt = find(pl, "rope_table_f32");
     if (!rk || !rf || !rs || !rt) { ok(name, false, "row absent"); return; }
 
@@ -1657,7 +1704,8 @@ static void qk_kv_fold_case(const Plugin& pl, bool bf16) {
     for (auto& x : hv)  x = h_to_bf16(rnd(2000.0f));
     std::vector<float> fwq((size_t)hd), fwk((size_t)hd);
     for (int64_t d = 0; d < hd; ++d) { fwq[(size_t)d] = rnd(0.5f); fwk[(size_t)d] = rnd(0.5f); }
-    const size_t cbytes = (size_t)(nb * nkv * bs * 2 * hd) * (bf16 ? 2 : 1);
+    const int64_t crow = kvq == 2 ? 22 * hd / 16 : kvq ? 25 * hd / 16 : 2 * hd;   /* a token's row */
+    const size_t cbytes = (size_t)(nb * nkv * bs * crow) * (bf16 ? 2 : 1);
     std::vector<uint8_t> hc(cbytes);
     for (auto& x : hc) x = (uint8_t)(rnd(128.0f) + 128.0f);
 
@@ -1699,7 +1747,7 @@ static void qk_kv_fold_case(const Plugin& pl, bool bf16) {
             T(q, RAD_BF16, { M, nq * hd }),        T(k, RAD_BF16, { M, nkv * hd }),
             RadTensor{} };
     };
-    auto cache = [&](void* c) { return T(c, cdt, { nb, nkv, bs, 2 * hd }); };
+    auto cache = [&](void* c) { return T(c, cdt, { nb, nkv, bs, crow }); };
 
     /* ---- the pair ---- */
     {
@@ -2735,6 +2783,121 @@ static void attn_gq_fold_case(const Plugin& pl, int64_t S, bool bf16, bool i8 = 
  * A negative or out-of-range slot (a pad row) must store nothing: the cache is prefilled with a
  * sentinel and those slots must still hold it. Slot 0 is a real slot (as in libref and
  * r4d_gdn_conv_w4_h128_bf16.hip) and is used deliberately. */
+/* kv_store into the fp8_v4 cache (E4M3 K, int4 V in groups of 32 with an f16 scale, absmax / 7),
+ * against values the format holds exactly: K as in kv_store_case, V an integer from -7 to 7 times
+ * a per-head step, with a 7 or -7 in every group, so the scale is the step and every code decodes
+ * back to the input. A pad slot and one past the cache must leave the sentinel row untouched. */
+static void kv_store_v4_case(const Plugin& pl, bool k6 = false) {
+    const char* name = k6 ? "kv_store_k6v4" : "kv_store_fp8v4";
+    if (!sel(name)) return;
+    const RadKernelInfo* r = find(pl, name);
+    if (!r) { ok(name, false, "row absent"); return; }
+    const int64_t head_dim = 256, kv_heads = 2, block_size = 16, n_blocks = 4;
+    const int64_t lane = kv_heads * head_dim, rowb = (k6 ? 22 : 25) * head_dim / 16;
+    const int64_t voff = k6 ? head_dim * 3 / 4 : head_dim;
+    const int64_t vsoff = k6 ? head_dim * 21 / 16 : head_dim * 3 / 2;
+    /* k6_v4's K: an integer from -31 to 31 times a per-(token, head) step, with a 31 and a -31 in
+     * every group, so the scale is the step and every code decodes back to the input. */
+    auto k6int = [&](int64_t t, int64_t h, int64_t d) -> int {
+        if (d % 32 == 3) return -31;
+        if (d % 32 == 26) return 31;
+        return (int)((t * 7 + h * 11 + d) % 63) - 31;
+    };
+    auto kstep = [&](int64_t t, int64_t h) { return 0.0625f * (float)(1 + (t + 2 * h) % 4); };
+    const std::vector<int32_t> slots = { 0, 17, 63, -1, (int32_t)(n_blocks * block_size), 33 };
+    const int64_t T_tok = (int64_t)slots.size();
+    auto kval = [&](int64_t t, int64_t h, int64_t d) {
+        static const float mag[8] = { 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 8.0f };
+        return k6 ? (float)k6int(t, h, d) * kstep(t, h) : mag[(size_t)((t * 3 + h * 5 + d) % 8)];
+    };
+    auto vint = [&](int64_t t, int64_t h, int64_t d) -> int {
+        if (d % 32 == 0) return -7;
+        if (d % 32 == 17) return 7;
+        return (int)((t * 5 + h * 3 + d) % 15) - 7;
+    };
+    auto step = [&](int64_t t, int64_t h) { return 0.125f * (float)(1 + (t + h) % 4); };
+    std::vector<uint16_t> hk((size_t)T_tok * lane), hv((size_t)T_tok * lane);
+    for (int64_t t = 0; t < T_tok; ++t)
+        for (int64_t h = 0; h < kv_heads; ++h)
+            for (int64_t d = 0; d < head_dim; ++d) {
+                hk[(size_t)(t * lane + h * head_dim + d)] = h_to_bf16(kval(t, h, d));
+                hv[(size_t)(t * lane + h * head_dim + d)] = h_to_bf16((float)vint(t, h, d) * step(t, h));
+            }
+    const size_t cbytes = (size_t)(n_blocks * kv_heads * block_size * rowb);
+    void* d_k = dalloc((size_t)T_tok * lane * 2);
+    void* d_v = dalloc((size_t)T_tok * lane * 2);
+    void* d_sm = dalloc((size_t)T_tok * 4);
+    void* d_c = dalloc(cbytes);
+    if (!d_k || !d_v || !d_sm || !d_c) { ok(name, false, "hipMalloc failed"); return; }
+    st_memcpy(d_k, hk.data(), (size_t)T_tok * lane * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_v, hv.data(), (size_t)T_tok * lane * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_sm, slots.data(), (size_t)T_tok * 4, hipMemcpyHostToDevice);
+    st_memset(d_c, 0x7f, cbytes);
+    std::vector<RadTensor> ts = {
+        T(d_k,  RAD_BF16,   { T_tok, lane }),
+        T(d_v,  RAD_BF16,   { T_tok, lane }),
+        T(d_sm, RAD_I32,    { T_tok }),
+        T(d_c,  RAD_F8E4M3, { n_blocks, kv_heads, block_size, rowb }),
+    };
+    std::vector<RadParam> ps = {
+        PI("M", T_tok), PI("head_dim", head_dim), PI("n_head_kv", kv_heads),
+        PI("block_size", block_size), PS("kv_dtype", k6 ? "k6_v4" : "fp8_v4"),
+    };
+    run_case(r, ts, ps);
+    std::vector<uint8_t> got(cbytes);
+    st_memcpy(got.data(), d_c, cbytes, hipMemcpyDeviceToHost);
+
+    int bad = 0;
+    std::string first;
+    std::vector<bool> live_row((size_t)(n_blocks * block_size), false);
+    for (int64_t t = 0; t < T_tok; ++t) {
+        const int32_t s = slots[(size_t)t];
+        if (s < 0 || s / block_size >= n_blocks) continue;
+        live_row[(size_t)s] = true;
+        for (int64_t h = 0; h < kv_heads; ++h) {
+            const uint8_t* row = &got[(size_t)(((s / block_size) * kv_heads + h) * block_size
+                                               + s % block_size) * rowb];
+            for (int64_t d = 0; d < head_dim && bad < 4; ++d) {
+                float k;
+                if (k6) {
+                    const int lo = (row[d / 2] >> (4 * (d & 1))) & 0xF;
+                    const int x = (int)(d % 16);
+                    const int hi = (row[head_dim / 2 + (d / 16) * 4 + (x & 7) / 2]
+                                    >> ((x & 1) * 2 + (x >> 3) * 4)) & 3;
+                    uint16_t kb;
+                    std::memcpy(&kb, row + head_dim * 5 / 4 + (d / 32) * 2, 2);
+                    k = (float)(((lo | (hi << 4)) ^ 32) - 32) * (float)__builtin_bit_cast(_Float16, kb);
+                } else {
+                    k = h_e4m3(row[d]);
+                }
+                const int nib = (row[voff + d / 2] >> (4 * (d & 1))) & 0xF;
+                uint16_t sb;
+                std::memcpy(&sb, row + vsoff + (d / 32) * 2, 2);
+                const float sc = (float)__builtin_bit_cast(_Float16, sb);
+                const float v = (float)((nib ^ 8) - 8) * sc;
+                const float wv = (float)vint(t, h, d) * step(t, h);
+                if (k != kval(t, h, d) || v != wv || sc != step(t, h)) {
+                    if (!bad) first = fmt("t%lld h%lld d%lld: k %g (want %g) v %g (want %g) scale %g",
+                                          (long long)t, (long long)h, (long long)d, k,
+                                          kval(t, h, d), v, wv, sc);
+                    ++bad;
+                }
+            }
+        }
+    }
+    int touched = 0;
+    for (int64_t s = 0; s < n_blocks * block_size; ++s) {
+        if (live_row[(size_t)s]) continue;
+        for (int64_t h = 0; h < kv_heads; ++h) {
+            const uint8_t* row = &got[(size_t)(((s / block_size) * kv_heads + h) * block_size
+                                               + s % block_size) * rowb];
+            for (int64_t b = 0; b < rowb; ++b) touched += row[b] != 0x7f;
+        }
+    }
+    ok(name, bad == 0 && touched == 0,
+       bad ? first : fmt("every live row decodes exactly; %d bytes of other rows touched", touched));
+}
+
 static void kv_store_case(const Plugin& pl, const char* name, const char* kv_dtype) {
     if (!sel(name)) return;
     const RadKernelInfo* r = find(pl, name);
@@ -18351,6 +18514,8 @@ static void device_phase(const Plugin& pl) {
     /* --- the paged cache's write side --- */
     kv_store_case(pl, "kv_store_bf16", "bf16");
     kv_store_case(pl, "kv_store_fp8",  "fp8_e4m3");
+    kv_store_v4_case(pl);
+    kv_store_v4_case(pl, true);
 
     /* --- attention --- */
     attn_case(pl, "attn_prefill_h256_gqa6_fp8kv",  256, 6, 32, "fp8_e4m3", 1);
@@ -18388,6 +18553,16 @@ static void device_phase(const Plugin& pl) {
      * tstart = 961/48 = 20. This exercises the window mask and the below-window tile skip (tiles
      * 0..19 are never walked). */
     attn_numeric_case(pl, "attn_prefill_h256_gqa2_fp8kv",    256, 2, 64, "fp8_e4m3", 1024, 2048);
+    /* fp8_v4 (Qwen3.8-27B's h256 gqa6): a prefill of several tiles over a longer history, a
+     * ragged last tile, and decode and verify rows. */
+    attn_numeric_case(pl, "attn_prefill_h256_gqa6_fp8v4", 256, 6, 64,  "fp8_v4", 0, 256);
+    attn_numeric_case(pl, "attn_prefill_h256_gqa6_fp8v4", 256, 6, 100, "fp8_v4", 0, 1024);
+    attn_numeric_case(pl, "attn_decode_h256_gqa6_fp8v4",  256, 6, 1,   "fp8_v4", 0, 1024);
+    attn_numeric_case(pl, "attn_decode_h256_gqa6_fp8v4",  256, 6, 4,   "fp8_v4", 0, 2048);
+    attn_numeric_case(pl, "attn_prefill_h256_gqa6_k6v4",  256, 6, 64,  "k6_v4",  0, 256);
+    attn_numeric_case(pl, "attn_prefill_h256_gqa6_k6v4",  256, 6, 100, "k6_v4",  0, 1024);
+    attn_numeric_case(pl, "attn_decode_h256_gqa6_k6v4",   256, 6, 1,   "k6_v4",  0, 1024);
+    attn_numeric_case(pl, "attn_decode_h256_gqa6_k6v4",   256, 6, 4,   "k6_v4",  0, 2048);
     attn_numeric_case(pl, "attn_prefill_h256_gqa2_bf16kv",   256, 2, 64, "bf16",     1024, 2048);
     attn_numeric_case(pl, "attn_decode_h256_gqa2_fp8kv",    256, 2,  1, "fp8_e4m3", 1024);
     attn_numeric_case(pl, "attn_decode_h256_gqa2_bf16kv",   256, 2,  1, "bf16",     1024);
@@ -19841,6 +20016,8 @@ static void device_phase(const Plugin& pl) {
         qk_prologue_case(pl, RAD_F32, true, 128);
         qk_kv_fold_case(pl, false);
         qk_kv_fold_case(pl, true);
+        qk_kv_fold_case(pl, false, 1);
+        qk_kv_fold_case(pl, false, 2);
         qsa_qprep_case(pl);
         topk_scatter_case(pl);
         router_gemm_fused_case(pl);

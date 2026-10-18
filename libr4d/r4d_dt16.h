@@ -67,6 +67,31 @@ template<> struct DT16<1> {                       // f16: 3 more mantissa bits, 
 };
 
 // Widen 8 fp8 (2 dwords) to 8 16-bit values (4 dwords) in element order.
+// Eight K dims of the k6_v4 cache as four f16 dwords, dims (2i, 2i+1) in dword i. `lo` holds
+// their low nibbles (dim 2i in bits 8i..8i+3, 2i+1 in 8i+4..8i+7) and `hb` their 16-dim chunk's
+// high-bit word (byte j: bits 0-1 dim 2j, 2-3 dim 2j+1, 4-5 dim 8+2j, 6-7 dim 9+2j); `half` says
+// which eight of the sixteen these are. One mask and shift put the high bits beside the low
+// nibbles, a byte a dim. Codes are 6-bit two's complement: ^ 32 makes them offset binary u,
+// 0x6400 | u is the f16 1024 + u, and (x - 1056) * s is the value times the group scale `s2` (the
+// f16 in both halves), rounded once.
+__device__ __forceinline__ void k6x8_to_f16x4w(uint32_t lo, uint32_t hb, int half, uint32_t s2,
+                                               uint32_t* w4) {
+    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+    const uint32_t ev = ((lo & 0x0F0F0F0Fu) | ((half ? hb : hb << 4) & 0x30303030u)) ^ 0x20202020u;
+    const uint32_t od = (((lo >> 4) & 0x0F0F0F0Fu) | ((half ? hb >> 2 : hb << 2) & 0x30303030u))
+                      ^ 0x20202020u;
+    const h2 s = __builtin_bit_cast(h2, s2);
+    const h2 bias = { (_Float16)1056.0f, (_Float16)1056.0f };
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        // Byte b of the even dims low, of the odd dims high; perm takes bytes 0-3 from its second
+        // operand, 4-7 from its first, and 0x0c is a zero byte.
+        const uint32_t sel = (uint32_t)b | 0x0c00u | ((uint32_t)(4 + b) << 16) | 0x0c000000u;
+        const uint32_t x = __builtin_amdgcn_perm(od, ev, sel) | 0x64006400u;
+        w4[b] = __builtin_bit_cast(uint32_t, (__builtin_bit_cast(h2, x) - bias) * s);
+    }
+}
+
 template<class D>
 __device__ __forceinline__ void fp8x8_to_16x4w(uint2 raw, uint32_t* w4) {
     #pragma unroll

@@ -91,6 +91,12 @@ extern "C" {
 int     r4d_rad_attn_prefill_h256_fp8 (const RadArgs*, RadStream);
 int     r4d_rad_attn_prefill_h256_bf16(const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h256_fp8  (const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_h256_fp8v4(const RadArgs*, RadStream);
+int     r4d_rad_attn_prefill_h256_fp8v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_v4_scratch(const RadArgs*);
+int     r4d_rad_attn_decode_h256_k6v4(const RadArgs*, RadStream);
+int     r4d_rad_attn_prefill_h256_k6v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_k6_scratch(const RadArgs*);
 int     r4d_rad_attn_decode_h256_bf16 (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h128_fp8  (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h128_bf16 (const RadArgs*, RadStream);
@@ -410,6 +416,8 @@ int r4d_rad_gated_had_quant_i8    (const RadArgs*, RadStream);
 int r4d_rad_gdn_gated_norm_hq_i8  (const RadArgs*, RadStream);
 int r4d_rad_qk_norm_rope_gate     (const RadArgs*, RadStream);
 int r4d_rad_qk_norm_rope_gate_kv_store(const RadArgs*, RadStream);
+int r4d_rad_qk_norm_rope_gate_kv_store_fp8v4(const RadArgs*, RadStream);
+int r4d_rad_qk_norm_rope_gate_kv_store_k6v4(const RadArgs*, RadStream);
 int r4d_rad_rope_table            (const RadArgs*, RadStream);
 
 /* -- block-scaled fp8, and the device sampler (r4d_gemm_fp8*.hip / r4d_fp8_layout.cpp) --
@@ -607,6 +615,8 @@ int r4d_rad_gemm_nt_bias    (const RadArgs*, RadStream);
 int r4d_rad_gemm_f32_nt_bias(const RadArgs*, RadStream);
 int r4d_rad_kv_store        (const RadArgs*, RadStream);
 int r4d_rad_kv_store_fp8    (const RadArgs*, RadStream);
+int r4d_rad_kv_store_fp8v4  (const RadArgs*, RadStream);
+int r4d_rad_kv_store_k6v4   (const RadArgs*, RadStream);
 int r4d_rad_logits_gemm     (const RadArgs*, RadStream);
 
 /* -- the decomposed sampler chain (r4d_sample_stages_f32.hip) --

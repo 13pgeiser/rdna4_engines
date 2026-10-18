@@ -3130,6 +3130,24 @@ static const RadConstraint cAttnDecodeFp8[] = {
     C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 16),
     C_EQ("causal", 1), C_LE("q_len", 10), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_e4m3"),
 };
+/* The fp8_v4 cache (E4M3 K, int4 V in groups of 32 with f16 scales) and the k6_v4 cache (int6 K,
+ * int4 V); the row layouts are RAD_KVQ_*'s (abi/rad_builder.h). */
+static const RadConstraint cAttnPrefillK6v4[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 16),
+    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "k6_v4"),
+};
+static const RadConstraint cAttnDecodeK6v4[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 16),
+    C_EQ("causal", 1), C_LE("q_len", 10), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "k6_v4"),
+};
+static const RadConstraint cAttnPrefillFp8v4[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 16),
+    C_EQ("causal", 1), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_v4"),
+};
+static const RadConstraint cAttnDecodeFp8v4[] = {
+    C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 16),
+    C_EQ("causal", 1), C_LE("q_len", 10), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "fp8_v4"),
+};
 static const RadConstraint cAttnDecodeBf16[] = {
     C_EQ("window", 0), C_EQ("head_dim", 256), C_EQ("gqa", 6), C_EQ("block_size", 16),
     C_EQ("causal", 1), C_LE("q_len", 10), C_IN("q_dtype", "bf16"), C_IN("kv_dtype", "bf16"),
@@ -3965,6 +3983,14 @@ static const RadConstraint cQkNormRopeGateKv[] = {
     C_IN("q_dtype", "bf16"), C_LE("head_dim", 256), C_DIV("head_dim", 32),
     C_GE("block_size", 1), C_IN("kv_dtype", "fp8_e4m3"),
 };
+static const RadConstraint cQkNormRopeGateKvFp8v4[] = {
+    C_IN("q_dtype", "bf16"), C_LE("head_dim", 256), C_DIV("head_dim", 32),
+    C_GE("block_size", 1), C_IN("kv_dtype", "fp8_v4"),
+};
+static const RadConstraint cQkNormRopeGateKvK6v4[] = {
+    C_IN("q_dtype", "bf16"), C_LE("head_dim", 256), C_DIV("head_dim", 32),
+    C_GE("block_size", 1), C_IN("kv_dtype", "k6_v4"),
+};
 static const RadConstraint cQkNormRopeGateKvBf16[] = {
     C_IN("q_dtype", "bf16"), C_LE("head_dim", 256), C_DIV("head_dim", 32),
     C_GE("block_size", 1), C_IN("kv_dtype", "bf16"),
@@ -4248,6 +4274,10 @@ static const RadConstraint cCausalConv[] = { C_IN("dtype", "bf16"), C_GE("width"
                                              C_LE("width", 8) };
 static const RadConstraint cKvStore[]   = { C_GE("block_size", 1), C_IN("kv_dtype", "bf16") };
 static const RadConstraint cKvStoreFp8[] = { C_GE("block_size", 1), C_IN("kv_dtype", "fp8_e4m3") };
+static const RadConstraint cKvStoreFp8v4[] = { C_GE("block_size", 1), C_DIV("head_dim", 32),
+                                               C_IN("kv_dtype", "fp8_v4") };
+static const RadConstraint cKvStoreK6v4[] = { C_GE("block_size", 1), C_DIV("head_dim", 32),
+                                              C_IN("kv_dtype", "k6_v4") };
 static const RadConstraint cRopeRow[]   = { C_GE("head_dim", 1),
                                             C_IN("mode", "neox mrope gptj imrope axial") };
 /* The vision tower's rows. The GEMM stages 16-byte chunks, so K is a multiple of 8; the norm and
@@ -4821,6 +4851,26 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_kv_store_fp8, nullptr, nullptr, nullptr,
   r4d_shape_kv_store },
 
+{ "kv_store_fp8v4", "kv_store", "attn",
+  "scatter k and v into a paged fp8_v4 cache, one workgroup a token",
+  "cache exactly [n_blocks, kv_heads, block_size, 25*head_dim/16]; head_dim a multiple of 32; a "
+  "negative or out-of-range slot stores nothing",
+  "bf16 k / v, E4M3 K and int4 V in groups of 32 with f16 scales, i32 slot mapping",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cKvStoreFp8v4), NOTUNE,
+  nullptr, nullptr, r4d_rad_kv_store_fp8v4, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "kv_store_k6v4", "kv_store", "attn",
+  "scatter k and v into a paged k6_v4 cache, one workgroup a token",
+  "cache exactly [n_blocks, kv_heads, block_size, 22*head_dim/16]; head_dim a multiple of 32; a "
+  "negative or out-of-range slot stores nothing",
+  "bf16 k / v, int6 K and int4 V in groups of 32 with f16 scales, i32 slot mapping",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cKvStoreK6v4), NOTUNE,
+  nullptr, nullptr, r4d_rad_kv_store_k6v4, nullptr, nullptr, nullptr,
+  nullptr },
+
 { "logits_gemm_bf16", "logits_gemm", "vocab",
   "the lm_head projection: C[M, n_vocab] f32 = x[M, n_embd] @ lm_head[n_vocab, n_embd]^T",
   "any M and any vocabulary; n_embd a multiple of 8. One workgroup a vocabulary column",
@@ -5005,6 +5055,24 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_attn_prefill_h256_fp8, nullptr, nullptr, nullptr,
   r4d_shape_attn_paged },
 
+{ "attn_prefill_h256_gqa6_fp8v4", "attn_paged", "attn",
+  "paged causal attention, query-tiled (prefill / chunked prefill)",
+  "head_dim 256, 6 queries per kv head, paged block 16, varlen",
+  "bf16 query, fp8_v4 kv cache (E4M3 K, int4 V in groups of 32 with f16 scales), bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
+  ROW(cAttnPrefillFp8v4), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefill_h256_fp8v4, nullptr, nullptr, nullptr,
+  nullptr },
+
+{ "attn_prefill_h256_gqa6_k6v4", "attn_paged", "attn",
+  "paged causal attention, query-tiled (prefill / chunked prefill)",
+  "head_dim 256, 6 queries per kv head, paged block 16, varlen",
+  "bf16 query, k6_v4 kv cache (int6 K, int4 V, each in groups of 32 with f16 scales), bf16 out",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_PREFILL,
+  ROW(cAttnPrefillK6v4), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_prefill_h256_k6v4, nullptr, nullptr, nullptr,
+  nullptr },
+
 { "attn_prefill_h256_gqa6_bf16kv", "attn_paged", "attn",
   "paged causal attention, query-tiled (prefill / chunked prefill)",
   "head_dim 256, 6 queries per kv head, paged block 16, varlen",
@@ -5023,6 +5091,26 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_attn_decode_h256_fp8, r4d_rad_attn_decode_h256_scratch,
   nullptr, nullptr,
   r4d_shape_attn_paged },
+
+{ "attn_decode_h256_gqa6_fp8v4", "attn_paged", "attn",
+  "paged causal attention, split-KV (decode / speculative verify)",
+  "head_dim 256, 6 queries per kv head, paged block 16, q_len*gqa <= 64",
+  "bf16 query, fp8_v4 kv cache (E4M3 K, int4 V in groups of 32 with f16 scales), bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeFp8v4), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h256_fp8v4, r4d_rad_attn_decode_h256_v4_scratch,
+  nullptr, nullptr,
+  nullptr },
+
+{ "attn_decode_h256_gqa6_k6v4", "attn_paged", "attn",
+  "paged causal attention, split-KV (decode / speculative verify)",
+  "head_dim 256, 6 queries per kv head, paged block 16, q_len*gqa <= 64",
+  "bf16 query, k6_v4 kv cache (int6 K, int4 V, each in groups of 32 with f16 scales), bf16 out, f16 partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ATTN_DECODE,
+  ROW(cAttnDecodeK6v4), ROW(tAttnSplit), nullptr,
+  nullptr, nullptr, r4d_rad_attn_decode_h256_k6v4, r4d_rad_attn_decode_h256_k6_scratch,
+  nullptr, nullptr,
+  nullptr },
 
 { "attn_decode_h256_gqa6_bf16kv", "attn_paged", "attn",
   "paged causal attention, split-KV (decode / speculative verify)",
@@ -6819,6 +6907,28 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cQkNormRopeGateKv), NOTUNE,
   nullptr, nullptr, r4d_rad_qk_norm_rope_gate_kv_store, nullptr, nullptr, nullptr,
   r4d_shape_qk_norm_rope_gate_kv_store, nullptr, r4d_fuse_qk_norm_rope_gate_kv_store },
+
+/* The fold into an fp8_v4 cache: E4M3 K, int4 V in groups of 32 (a wave) with f16 scales. */
+{ "qk_norm_rope_gate_kv_store_fp8v4", "qk_norm_rope_gate_kv_store", "attn",
+  "qk_norm_rope_gate, and kv_store into an fp8_v4 paged cache from the same launch",
+  "qk_norm_rope_gate's shapes; cache exactly [n_blocks, kv_heads, block_size, 25*head_dim/16], "
+  "head_dim a multiple of 32, one slot a row; a negative or out-of-range slot stores nothing",
+  "bf16 in and out, E4M3 K and int4 V with f16 scales, i32 slot mapping",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQkNormRopeGateKvFp8v4), NOTUNE,
+  nullptr, nullptr, r4d_rad_qk_norm_rope_gate_kv_store_fp8v4, nullptr, nullptr, nullptr,
+  nullptr },
+
+/* The fold into a k6_v4 cache: int6 K and int4 V in groups of 32 (a wave) with f16 scales. */
+{ "qk_norm_rope_gate_kv_store_k6v4", "qk_norm_rope_gate_kv_store", "attn",
+  "qk_norm_rope_gate, and kv_store into a k6_v4 paged cache from the same launch",
+  "qk_norm_rope_gate's shapes; cache exactly [n_blocks, kv_heads, block_size, 22*head_dim/16], "
+  "head_dim a multiple of 32, one slot a row; a negative or out-of-range slot stores nothing",
+  "bf16 in and out, int6 K and int4 V with f16 scales, i32 slot mapping",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cQkNormRopeGateKvK6v4), NOTUNE,
+  nullptr, nullptr, r4d_rad_qk_norm_rope_gate_kv_store_k6v4, nullptr, nullptr, nullptr,
+  nullptr },
 
 /* The same fold into a bf16 cache: the store is the two values the pair's kv_store_bf16 copies. */
 { "qk_norm_rope_gate_kv_store_bf16", "qk_norm_rope_gate_kv_store", "attn",
