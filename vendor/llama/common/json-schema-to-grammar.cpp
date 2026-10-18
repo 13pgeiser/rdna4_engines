@@ -291,6 +291,45 @@ static inline bool is_gbnf_escape(char c) {
             return false;
     }
 }
+
+// RADIANCE: a JSON Schema `pattern` is unanchored (ECMA-262 search semantics, JSON Schema
+// validation 6.3.3): "[0-9]+" admits any string holding a digit. _visit_pattern() reads only
+// ^...$, so a missing anchor is written out as "any string text" on that side. That filler is
+// not ".*": '.' here matches '"', and the string would run on past its closing quote. A
+// one-sided anchor beside a top-level '|' binds to one branch only, so that pattern is
+// returned as it came and refused.
+static std::string anchor_pattern(const std::string & p) {
+    static const std::string any = "(?:[^\"\\\\]|\\\\.)*";
+    const bool starts = !p.empty() && p.front() == '^';
+    size_t slashes = 0; // backslashes before a final '$': an odd count makes it a literal
+    if (!p.empty() && p.back() == '$') {
+        for (size_t k = p.size() - 1; k > 0 && p[k - 1] == '\\'; --k) slashes++;
+    }
+    const bool ends = p.size() > (starts ? 1u : 0u) && p.back() == '$' && slashes % 2 == 0;
+    if (starts && ends) {
+        return p;
+    }
+    const size_t from = starts ? 1 : 0;
+    const std::string core = p.substr(from, p.size() - from - (ends ? 1 : 0));
+    if (core.empty()) {
+        return "^" + any + "$";
+    }
+    if (starts != ends) {
+        int depth = 0;
+        bool in_class = false;
+        for (size_t k = 0; k < core.size(); ++k) {
+            const char c = core[k];
+            if (c == '\\') { ++k; continue; }
+            if (in_class) { if (c == ']') in_class = false; continue; }
+            if (c == '[') in_class = true;
+            else if (c == '(') depth++;
+            else if (c == ')') depth--;
+            else if (c == '|' && depth == 0) return p;
+        }
+    }
+    return "^" + (starts ? "" : any) + "(?:" + core + ")" + (ends ? "" : any) + "$";
+}
+
 static std::unordered_set<char> ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS = {'^', '$', '.', '[', ']', '(', ')', '|', '{', '}', '*', '+', '?'};
 
 static std::string replacePattern(const std::string & input, const std::regex & regex, const std::function<std::string(const std::smatch  &)> & replacement) {
@@ -357,7 +396,8 @@ private:
         return string_join(rules, " | ");
     }
 
-    std::string _visit_pattern(const std::string & pattern, const std::string & name) {
+    std::string _visit_pattern(const std::string & client_pattern, const std::string & name) {
+        const std::string pattern = anchor_pattern(client_pattern);
         // RADIANCE: front()/back() on an empty string is UB, and `pattern` is client data straight
         // off the wire. The size test has to come first.
         if (pattern.size() < 2 || !(pattern.front() == '^' && pattern.back() == '$')) {

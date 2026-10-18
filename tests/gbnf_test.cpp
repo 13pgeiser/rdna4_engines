@@ -1694,6 +1694,17 @@ TEST(json_schema_grammars_admit_exactly_their_instances) {
         { R"({"type":"string","pattern":"^[a-z]{2,5}-[0-9]+$"})",
           { R"("ab-1")", R"("abcde-123")" },
           { R"("a-1")", R"("ab-")", R"("abcdef-1")", R"("AB-1")", R"("ab1")" } },
+        /* A pattern without ^ or $ searches, as JSON Schema says: the missing side is any text.
+         * Tool schemas send them bare; on array items a tool call's JSON arguments reach this
+         * converter, so one bare pattern there failed the whole request. */
+        { R"({"type":"string","pattern":"[0-9]+"})",
+          { R"("7")", R"("ab12c")" }, { R"("abc")", R"("")" } },
+        { R"({"type":"string","pattern":"^ab"})", { R"("ab")", R"("abz")" }, { R"("zab")" } },
+        { R"({"type":"string","pattern":"ab$"})", { R"("ab")", R"("zab")" }, { R"("abz")" } },
+        { R"({"type":"string","pattern":"a\\$"})", { R"("a$")", R"("za$z")" }, { R"("a")" } },
+        { R"({"type":"string","pattern":"x|yz"})", { R"("x")", R"("ayzb")" }, { R"("y")" } },
+        { R"({"type":"array","items":{"type":"string","pattern":"[0-9]+"}})",
+          { R"(["1","x2"])", R"(["x\"1"])", "[]" }, { R"(["x"])", R"(["1","x"])" } },
         { R"({"type":"array","items":{"type":"integer"},"minItems":1,"maxItems":3})",
           { "[1]", "[1,2,3]", "[-4,0]" }, { "[]", "[1,2,3,4]", R"(["a"])" } },
         { R"({"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"string"}},)"
@@ -1713,6 +1724,11 @@ TEST(json_schema_grammars_admit_exactly_their_instances) {
     if (schema_admits(bv->v, R"({"type":"number","minimum":0.5})", "-1"))
         fprintf(stderr, "    SKIP number bounds: the converter does not enforce minimum/maximum "
                         "on \"number\"\n");
+    for (const char* schema : { R"({"type":"string","pattern":"^a|b"})",
+                                R"({"type":"string","pattern":"a|b$"})" }) {
+        std::string gbnf, err;
+        CHECK(grammar_from_json_schema(schema, "root", &gbnf, &err) < 0);
+    }
     for (const Case& c : cases) {
         for (const char* y : c.yes) {
             const bool ok = schema_admits(bv->v, c.schema, y);

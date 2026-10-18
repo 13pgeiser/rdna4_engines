@@ -101,6 +101,7 @@ vendor/llama/common/regex-partial.{h,cpp}    <- llama.cpp common/*
                    patches/0013-json-schema-a-count-past-int-is-no-bound.patch
                    patches/0014-json-schema-a-not-of-every-type-is-never.patch
                    patches/0016-chat-analyse-a-template-once.patch
+                   patches/0017-json-schema-a-pattern-without-anchors-searches.patch
 
     On 0003: a `pattern` in a `response_format` reaches _visit_pattern() as client data, and three
     of its paths do not survive that. `front()`/`back()` run on an empty string; `seq.back()` runs
@@ -487,3 +488,21 @@ PATCH SERIES
       from it per request is unchanged: the prompt, grammar, triggers, preserved tokens, stops and
       PEG parser of 32 requests through each shipped template hash the same with and without the
       cache, and a render took 1.4-1.6 ms with it against 10-13 ms without (one loaded machine).
+
+  patches/0017-json-schema-a-pattern-without-anchors-searches.patch
+
+      _visit_pattern() read only ^...$ and refused every other `pattern` with "Pattern must
+      start with '^' and end with '$'". JSON Schema patterns are unanchored (ECMA-262 search,
+      validation 6.3.3), and tool schemas send them bare: an opencode agent's tool list drew
+      twelve of these refusals, so every request it made failed. A bare pattern on array items
+      is refused, since a tool call's JSON arguments reach this converter. (A top-level string
+      argument is written raw under the XML call formats and never reaches it, which is why a
+      bare pattern there passed.) A missing anchor is now written out as any string text on that
+      side, (?:[^"\\]|\\.)*, before the old check, which then refuses only what that cannot
+      spell: a one-sided anchor beside a top-level '|', where the anchor binds to one branch. The
+      filler is not ".*": '.' matches '"' here, and on array items ["1","x"] then read as one
+      string "1\",\"x" holding a digit. An empty pattern now matches every string rather than
+      being refused (tests/sample_test.cpp updated). A final '$' after an odd run of
+      backslashes is a literal and does not count as an anchor. tests/gbnf_test.cpp
+      (json_schema_grammars_admit_exactly_their_instances) holds the converter to the search
+      reading, on plain strings and on array items, and pins the refusal.

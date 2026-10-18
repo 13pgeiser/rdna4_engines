@@ -1123,10 +1123,11 @@ TEST(json_schema_refuses_what_it_cannot_actually_enforce) {
               "{\"type\":\"string\",\"pattern\":\"^a]$\"}", "root", &gbnf, &err) < 0);
     CHECK(!err.empty());
 
-    /* An empty pattern would run front()/back() on an empty string. */
+    /* An empty pattern would run front()/back() on an empty string. Unanchored, as JSON Schema
+     * reads it, it now matches every string and never reaches them (vendor patch 0017). */
     err.clear();
-    CHECK(grammar_from_json_schema(
-              "{\"type\":\"string\",\"pattern\":\"\"}", "root", &gbnf, &err) < 0);
+    CHECK_OK(grammar_from_json_schema(
+                 "{\"type\":\"string\",\"pattern\":\"\"}", "root", &gbnf, &err));
 
     /* A leading quantifier would run back() on an empty vector. */
     err.clear();
