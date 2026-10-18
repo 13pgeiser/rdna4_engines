@@ -95,8 +95,8 @@ unsafe fn codes8<const BITS: usize>(p: *const u8) -> __m256i {
         // its prefix. Both extra bytes are within the group header or payload.
         let packed = _mm256_set1_epi64x((p.sub(2) as *const i64).read_unaligned());
         let bytes = _mm256_setr_epi8(
-            1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4,
-            4, 5, 6, 7, 4, 5, 6, 7, 4, 5, 6, 7, 4, 5, 6, 7,
+            1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 4, 5, 6, 7, 4, 5, 6, 7, 4, 5, 6, 7, 4,
+            5, 6, 7,
         );
         let v = _mm256_shuffle_epi8(packed, bytes);
         let shifts = _mm256_setr_epi32(8, 14, 20, 26, 8, 14, 20, 26);
@@ -552,13 +552,7 @@ pub(super) unsafe fn mq6g256_row_dot_cached(
     for g in 0..k / 256 {
         let gptr = row.add(g * 200);
         let (scale, zero) = f32_pair(gptr);
-        acc += uniform_group_dot::<6, 8, 32, true>(
-            gptr,
-            x.add(g * 256),
-            scale,
-            zero,
-            *sums.add(g),
-        );
+        acc += uniform_group_dot::<6, 8, 32, true>(gptr, x.add(g * 256), scale, zero, *sums.add(g));
     }
     acc
 }
@@ -974,11 +968,13 @@ mod tests {
         let prefix_bytes = if BITS == 6 { 2 } else { 1 };
         let mut packed = vec![0u8; BITS + prefix_bytes];
         for phase in 0..=mask {
-            let expected: [u32; 8] =
-                core::array::from_fn(|lane| (phase + lane as u32 * 13) & mask);
-            let word = expected.iter().enumerate().fold(0u64, |word, (lane, &code)| {
-                word | ((code as u64) << (lane * BITS))
-            });
+            let expected: [u32; 8] = core::array::from_fn(|lane| (phase + lane as u32 * 13) & mask);
+            let word = expected
+                .iter()
+                .enumerate()
+                .fold(0u64, |word, (lane, &code)| {
+                    word | ((code as u64) << (lane * BITS))
+                });
             packed[prefix_bytes..].copy_from_slice(&word.to_le_bytes()[..BITS]);
             for prefix in 0..=u8::MAX {
                 packed[..prefix_bytes].fill(prefix);
@@ -1037,8 +1033,7 @@ pub(super) unsafe fn mfp4g32_e8_row_dot(row: *const u8, k: usize, x: *const f32)
                     _mm256_srlv_epi32(_mm256_set1_epi32(index as i32), shifts),
                     mask,
                 );
-                let nibbles =
-                    _mm256_blend_epi32(nibbles, _mm256_set1_epi32(last as i32), 0x80);
+                let nibbles = _mm256_blend_epi32(nibbles, _mm256_set1_epi32(last as i32), 0x80);
                 let coordinates = _mm256_add_ps(
                     _mm256_cvtepi32_ps(_mm256_sub_epi32(nibbles, center)),
                     _mm256_set1_ps((index >> 31) as f32 * 0.5),

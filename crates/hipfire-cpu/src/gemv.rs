@@ -878,7 +878,11 @@ mod test {
             off += n * m;
         }
         for (i, (got, want)) in out[..total].iter().zip(&reference).enumerate() {
-            assert_eq!(got.to_bits(), want.to_bits(), "m={m} jobs={jobs} output {i}");
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "m={m} jobs={jobs} output {i}"
+            );
         }
         assert_eq!(&out[total..], &[-999.0; 3], "output tail overwritten");
     }
@@ -1182,7 +1186,11 @@ mod test {
         let base = x_of(k);
         let copies: Vec<Vec<f32>> = (0..4).map(|_| base.clone()).collect();
         let distinct: Vec<Vec<f32>> = (0..4)
-            .map(|t| base.iter().map(|v| v * (1.0 + 0.37 * t as f32) - 0.01 * t as f32).collect())
+            .map(|t| {
+                base.iter()
+                    .map(|v| v * (1.0 + 0.37 * t as f32) - 0.01 * t as f32)
+                    .collect()
+            })
             .collect();
         for requested in [Some(false), None] {
             for q in [
@@ -1200,7 +1208,11 @@ mod test {
                 let packed = weights(q, m, k);
                 let one_row = |x: &[f32]| {
                     let mut y = vec![0.0f32; m];
-                    let src = Window { q, packed: &packed, rows: &[x] };
+                    let src = Window {
+                        q,
+                        packed: &packed,
+                        rows: &[x],
+                    };
                     gemv_shared_sourced(m, k, &mut y, &src, requested);
                     let mut g = vec![0.0f32; m];
                     gemv_with_simd(q, &packed, m, k, x, &mut g, requested);
@@ -1216,8 +1228,14 @@ mod test {
                     let aliased: Vec<&[f32]> = vec![&copies[0][..]; width];
                     let copied: Vec<&[f32]> = copies[..width].iter().map(|v| &v[..]).collect();
                     let varied: Vec<&[f32]> = distinct[..width].iter().map(|v| &v[..]).collect();
-                    for (name, rows) in [("aliased", aliased), ("copied", copied), ("varied", varied)] {
-                        let src = Window { q, packed: &packed, rows: &rows };
+                    for (name, rows) in
+                        [("aliased", aliased), ("copied", copied), ("varied", varied)]
+                    {
+                        let src = Window {
+                            q,
+                            packed: &packed,
+                            rows: &rows,
+                        };
                         let mut out = vec![0.0f32; m * width];
                         gemv_shared_sourced(m, k, &mut out, &src, requested);
                         let mut reference = vec![0.0f32; m * width];

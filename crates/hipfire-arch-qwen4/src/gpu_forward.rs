@@ -6653,8 +6653,8 @@ impl Qwen4GpuForward {
         let d1 = self
             .cpu_deferred_experts
             .then_some(cpu_splice::NARROW_VERIFY_MAX_ROWS);
-        let d2 = (self.cpu_split_layers > 0)
-            .then_some(hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS);
+        let d2 =
+            (self.cpu_split_layers > 0).then_some(hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS);
         match (d1, d2) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -7373,10 +7373,7 @@ impl Qwen4GpuForward {
                 "HIPFIRE_QWEN4_TOKEN_READBACK_EARLY",
                 true,
             ),
-            cpu_deferred_experts: moe
-                .iter()
-                .flatten()
-                .any(|layer| layer.cpu_deferred_experts),
+            cpu_deferred_experts: moe.iter().flatten().any(|layer| layer.cpu_deferred_experts),
             cpu_split_layers: moe
                 .iter()
                 .flatten()
@@ -11389,7 +11386,11 @@ mod tests {
             Unmeasured,
             Unified,
         ] {
-            assert_eq!(chunk("gfx1100", None, usize::MAX, || link), 1536, "{link:?}");
+            assert_eq!(
+                chunk("gfx1100", None, usize::MAX, || link),
+                1536,
+                "{link:?}"
+            );
         }
         // Every other arch keeps its baseline and never evaluates the link
         // (gfx1201, gfx1151 and the rest never probe).
@@ -11423,7 +11424,9 @@ mod tests {
             1536
         );
         assert_eq!(
-            chunk("gfx1100", Some("junk"), usize::MAX, || Discrete { gbps: 7.1 }),
+            chunk("gfx1100", Some("junk"), usize::MAX, || Discrete {
+                gbps: 7.1
+            }),
             8192
         );
         assert_eq!(

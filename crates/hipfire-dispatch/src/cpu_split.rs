@@ -13,15 +13,15 @@
 //! override, an optional serial join and host-clock/buffer capture; they never
 //! run in production.
 
-use std::cell::{Cell, RefCell};
-use std::sync::Arc;
-use std::time::Instant;
-use hip_bridge::{HipError, PinnedTransferBuffer};
-use rdna_compute::{DType, Gpu, GpuTensor};
-use hipfire_cpu::quant::CpuQuant;
 use crate::cpu_exec::{self, CpuMoeExpert};
 use crate::families::moe::RoutedExpertWeights;
 use crate::types::DispatchError;
+use hip_bridge::{HipError, PinnedTransferBuffer};
+use hipfire_cpu::quant::CpuQuant;
+use rdna_compute::{DType, Gpu, GpuTensor};
+use std::cell::{Cell, RefCell};
+use std::sync::Arc;
+use std::time::Instant;
 
 pub const CPU_SPLIT_MAX_ROWS: usize = 4;
 
@@ -56,10 +56,18 @@ pub trait CpuShadow: Send + Sync {
 /// `AllCold`: every VALID slot is a host slot (masked ids all -1); EVERY valid
 /// slot's CPU bytes come from `shadow`. Invalid ids stay in neither arm.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SplitEndpoint { Natural, AllHot, AllCold }
+pub enum SplitEndpoint {
+    Natural,
+    AllHot,
+    AllCold,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SplitParityMode { Off, Timing, Full }
+pub enum SplitParityMode {
+    Off,
+    Timing,
+    Full,
+}
 
 #[derive(Clone)]
 pub struct SplitParityConfig {
@@ -130,7 +138,12 @@ pub struct SplitParityRecord {
 pub const SPLIT_PARITY_MAX_RECORDS: usize = 1 << 20;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Stage { Prepared, Joined, Before, After }
+enum Stage {
+    Prepared,
+    Joined,
+    Before,
+    After,
+}
 
 struct Open {
     t0: Instant,
@@ -161,7 +174,9 @@ fn sync_stream(gpu: &Gpu) -> Result<(), DispatchError> {
 }
 
 fn read_f32(gpu: &Gpu, t: &GpuTensor, n: usize) -> Result<Vec<f32>, DispatchError> {
-    if t.buf.size() < n * 4 { return Err(err("parity capture tensor too small")); }
+    if t.buf.size() < n * 4 {
+        return Err(err("parity capture tensor too small"));
+    }
     let mut v = vec![0.0f32; n];
     // SAFETY: `v` owns exactly n f32s; every byte pattern is a valid f32.
     let bytes = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), n * 4) };
@@ -171,7 +186,9 @@ fn read_f32(gpu: &Gpu, t: &GpuTensor, n: usize) -> Result<Vec<f32>, DispatchErro
 }
 
 fn ns(from: Instant, to: Instant) -> u64 {
-    to.saturating_duration_since(from).as_nanos().min(u64::MAX as u128) as u64
+    to.saturating_duration_since(from)
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
 }
 
 struct Transaction {
@@ -220,22 +237,38 @@ impl CpuSplitExecutor {
         max_rows: usize,
         placement: &[u8],
     ) -> Result<Self, DispatchError> {
-        if dim == 0 || dim % 256 != 0 || mi == 0 || mi % 128 != 0
-            || top_k != 10 || max_rows != CPU_SPLIT_MAX_ROWS
-            || placement.is_empty() || placement.len() > i32::MAX as usize
+        if dim == 0
+            || dim % 256 != 0
+            || mi == 0
+            || mi % 128 != 0
+            || top_k != 10
+            || max_rows != CPU_SPLIT_MAX_ROWS
+            || placement.is_empty()
+            || placement.len() > i32::MAX as usize
             || placement.iter().any(|&v| v > 1)
         {
             return Err(err("unsupported shape, row cap or ownership plan"));
         }
         gpu.bind_thread().map_err(err)?;
-        let slots = max_rows.checked_mul(top_k).ok_or_else(|| err("slot overflow"))?;
-        let input_values = max_rows.checked_mul(dim)
+        let slots = max_rows
+            .checked_mul(top_k)
+            .ok_or_else(|| err("slot overflow"))?;
+        let input_values = max_rows
+            .checked_mul(dim)
             .and_then(|v| slots.checked_mul(2).and_then(|t| v.checked_add(t)))
             .ok_or_else(|| err("input overflow"))?;
-        let output_values = slots.checked_mul(dim).ok_or_else(|| err("output overflow"))?;
-        let input_bytes = input_values.checked_mul(4).ok_or_else(|| err("input byte overflow"))?;
-        let mask_bytes = slots.checked_mul(4).ok_or_else(|| err("mask byte overflow"))?;
-        let output_bytes = output_values.checked_mul(4).ok_or_else(|| err("output byte overflow"))?;
+        let output_values = slots
+            .checked_mul(dim)
+            .ok_or_else(|| err("output overflow"))?;
+        let input_bytes = input_values
+            .checked_mul(4)
+            .ok_or_else(|| err("input byte overflow"))?;
+        let mask_bytes = slots
+            .checked_mul(4)
+            .ok_or_else(|| err("mask byte overflow"))?;
+        let output_bytes = output_values
+            .checked_mul(4)
+            .ok_or_else(|| err("output byte overflow"))?;
         let input = gpu.hip.transfer_buffer(input_bytes).map_err(err)?;
         let mask = gpu.hip.transfer_buffer(mask_bytes).map_err(err)?;
         let output = gpu.hip.transfer_buffer(output_bytes).map_err(err)?;
@@ -246,13 +279,25 @@ impl CpuSplitExecutor {
             dtype: DType::F32,
         };
         Ok(Self {
-            dim, mi, top_k, max_rows, device: gpu.device_id,
-            placement: placement.into(), masked_indices,
+            dim,
+            mi,
+            top_k,
+            max_rows,
+            device: gpu.device_id,
+            placement: placement.into(),
+            masked_indices,
             state: RefCell::new(Transaction {
-                input, mask, output,
-                ids: [-1; MAX_SLOTS], gpu_ids: [-1; MAX_SLOTS],
-                host_slots: [0; MAX_SLOTS], host_count: 0, rows: 0,
-                ready: false, failed: false, cold_shadow: None,
+                input,
+                mask,
+                output,
+                ids: [-1; MAX_SLOTS],
+                gpu_ids: [-1; MAX_SLOTS],
+                host_slots: [0; MAX_SLOTS],
+                host_count: 0,
+                rows: 0,
+                ready: false,
+                failed: false,
+                cold_shadow: None,
             }),
             diag_on: Cell::new(false),
             recording: Cell::new(false),
@@ -270,12 +315,24 @@ impl CpuSplitExecutor {
         })
     }
 
-    pub fn masked_indices(&self) -> &GpuTensor { &self.masked_indices }
-    pub fn placement(&self) -> &[u8] { &self.placement }
-    pub fn max_rows(&self) -> usize { self.max_rows }
-    pub fn dim(&self) -> usize { self.dim }
-    pub fn mi(&self) -> usize { self.mi }
-    pub fn top_k(&self) -> usize { self.top_k }
+    pub fn masked_indices(&self) -> &GpuTensor {
+        &self.masked_indices
+    }
+    pub fn placement(&self) -> &[u8] {
+        &self.placement
+    }
+    pub fn max_rows(&self) -> usize {
+        self.max_rows
+    }
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+    pub fn mi(&self) -> usize {
+        self.mi
+    }
+    pub fn top_k(&self) -> usize {
+        self.top_k
+    }
 
     /// Freeze one diagnostic run for this layer. Replaces any previous
     /// configuration and drops its records. Takes no GPU: the next `prepare`
@@ -284,22 +341,34 @@ impl CpuSplitExecutor {
     /// refused. `Off` restores production exactly and requires a natural,
     /// non-serial config. A layer outside `layers` runs production unchanged.
     pub fn configure(&self, layer: usize, cfg: SplitParityConfig) -> Result<(), DispatchError> {
-        let st = self.state.try_borrow().map_err(|_| err("configure during an active transaction"))?;
-        if st.failed || st.ready { return Err(err("configure with a failed or unfinished transaction")); }
+        let st = self
+            .state
+            .try_borrow()
+            .map_err(|_| err("configure during an active transaction"))?;
+        if st.failed || st.ready {
+            return Err(err("configure with a failed or unfinished transaction"));
+        }
         drop(st);
         let active = cfg.mode != SplitParityMode::Off;
         if !active {
             if cfg.endpoint != SplitEndpoint::Natural || cfg.serial {
-                return Err(err("parity mode Off requires the natural endpoint and serial=false"));
+                return Err(err(
+                    "parity mode Off requires the natural endpoint and serial=false",
+                ));
             }
         } else if cfg.max_records == 0 || cfg.max_records > SPLIT_PARITY_MAX_RECORDS {
-            return Err(err(format!("max_records must be 1..={SPLIT_PARITY_MAX_RECORDS}")));
+            return Err(err(format!(
+                "max_records must be 1..={SPLIT_PARITY_MAX_RECORDS}"
+            )));
         }
         if cfg.endpoint == SplitEndpoint::AllCold && cfg.shadow.is_none() {
             return Err(err("AllCold endpoint requires a CPU shadow"));
         }
         let wanted = active && cfg.layers.as_ref().map_or(true, |l| l.contains(&layer));
-        let mut p = self.parity.try_borrow_mut().map_err(|_| err("configure re-entered"))?;
+        let mut p = self
+            .parity
+            .try_borrow_mut()
+            .map_err(|_| err("configure re-entered"))?;
         self.recording.set(false);
         self.ref_pending.set(false);
         self.layer.set(layer);
@@ -330,30 +399,45 @@ impl CpuSplitExecutor {
     /// True from a successful `prepare` that opened a record until that record
     /// completes (after `parity_after_combine` in Timing, `parity_reference` in
     /// Full) or errors. False in production and for unrecorded calls.
-    pub fn wants_parity(&self) -> bool { self.recording.get() }
+    pub fn wants_parity(&self) -> bool {
+        self.recording.get()
+    }
 
     /// True while the open record is Full and still awaits the unmasked GPU
     /// reference tail + `parity_reference`.
-    pub fn wants_reference(&self) -> bool { self.ref_pending.get() }
+    pub fn wants_reference(&self) -> bool {
+        self.ref_pending.get()
+    }
 
     fn close_open(&self) {
         self.recording.set(false);
         self.ref_pending.set(false);
-        if let Ok(mut p) = self.parity.try_borrow_mut() { p.open = None; }
+        if let Ok(mut p) = self.parity.try_borrow_mut() {
+            p.open = None;
+        }
     }
 
     /// Shared hook frame: no-op unless a record is open; validates rows and
     /// eager state; any error discards the open record. `f` returns true when
     /// the record is complete and must be pushed.
     fn hook(
-        &self, gpu: &Gpu, rows: usize,
+        &self,
+        gpu: &Gpu,
+        rows: usize,
         f: impl FnOnce(&Gpu, &mut Open) -> Result<bool, DispatchError>,
     ) -> Result<(), DispatchError> {
-        if !self.recording.get() { return Ok(()); }
+        if !self.recording.get() {
+            return Ok(());
+        }
         let mut p = self.parity.borrow_mut();
         let result = (|| {
-            let open = p.open.as_mut().ok_or_else(|| err("parity record not open"))?;
-            if open.rec.rows != rows { return Err(err("parity rows differ from prepare")); }
+            let open = p
+                .open
+                .as_mut()
+                .ok_or_else(|| err("parity record not open"))?;
+            if open.rec.rows != rows {
+                return Err(err("parity rows differ from prepare"));
+            }
             self.gate(gpu, rows)?;
             f(gpu, open)
         })();
@@ -379,10 +463,16 @@ impl CpuSplitExecutor {
     /// captures `target` (combine input) and `expanded` as the combine will read
     /// them (lab only, serializes). Timing: no-op. Production/unrecorded: no-op.
     pub fn parity_before_combine(
-        &self, gpu: &Gpu, rows: usize, expanded: &GpuTensor, target: &GpuTensor,
+        &self,
+        gpu: &Gpu,
+        rows: usize,
+        expanded: &GpuTensor,
+        target: &GpuTensor,
     ) -> Result<(), DispatchError> {
         self.hook(gpu, rows, |gpu, open| {
-            if open.stage != Stage::Joined { return Err(err("parity_before_combine out of order")); }
+            if open.stage != Stage::Joined {
+                return Err(err("parity_before_combine out of order"));
+            }
             if open.full {
                 let (nt, ne) = (rows * self.dim, rows * self.top_k * self.dim);
                 sync_stream(gpu)?;
@@ -399,11 +489,20 @@ impl CpuSplitExecutor {
     /// Timing completes the record; Full captures the combined `target` and
     /// waits for `parity_reference`.
     pub fn parity_after_combine(
-        &self, gpu: &Gpu, rows: usize, target: &GpuTensor,
+        &self,
+        gpu: &Gpu,
+        rows: usize,
+        target: &GpuTensor,
     ) -> Result<(), DispatchError> {
         self.hook(gpu, rows, |gpu, open| {
-            let expect = if open.full { Stage::Before } else { Stage::Joined };
-            if open.stage != expect { return Err(err("parity_after_combine out of order")); }
+            let expect = if open.full {
+                Stage::Before
+            } else {
+                Stage::Joined
+            };
+            if open.stage != expect {
+                return Err(err("parity_after_combine out of order"));
+            }
             sync_stream(gpu)?;
             let now = Instant::now();
             open.rec.timing.wall_ns = ns(open.t0, now);
@@ -422,11 +521,18 @@ impl CpuSplitExecutor {
     /// same `expanded` (after the combine consumed it). Captures `gpu_expanded`
     /// and completes the record. No-op for Timing/unrecorded.
     pub fn parity_reference(
-        &self, gpu: &Gpu, rows: usize, expanded: &GpuTensor,
+        &self,
+        gpu: &Gpu,
+        rows: usize,
+        expanded: &GpuTensor,
     ) -> Result<(), DispatchError> {
         self.hook(gpu, rows, |gpu, open| {
-            if !open.full { return Ok(false); }
-            if open.stage != Stage::After { return Err(err("parity_reference out of order")); }
+            if !open.full {
+                return Ok(false);
+            }
+            if open.stage != Stage::After {
+                return Err(err("parity_reference out of order"));
+            }
             sync_stream(gpu)?;
             open.rec.gpu_expanded = read_f32(gpu, expanded, rows * self.top_k * self.dim)?;
             Ok(true)
@@ -434,8 +540,11 @@ impl CpuSplitExecutor {
     }
 
     fn resolve<'a>(
-        &self, gpu: &Gpu, experts: &'a dyn RoutedExpertWeights,
-        shadow: Option<&'a dyn CpuShadow>, id: usize,
+        &self,
+        gpu: &Gpu,
+        experts: &'a dyn RoutedExpertWeights,
+        shadow: Option<&'a dyn CpuShadow>,
+        id: usize,
     ) -> Option<CpuMoeExpert<'a>> {
         match shadow {
             Some(s) => s.expert(self.layer.get(), id),
@@ -447,17 +556,27 @@ impl CpuSplitExecutor {
         if rows == 0 || rows > self.max_rows || gpu.device_id != self.device {
             return Err(err("invalid width or device"));
         }
-        let capture = gpu.active_stream.as_ref()
-            .map(|s| gpu.hip.stream_is_capturing(s)).transpose().map_err(err)?
+        let capture = gpu
+            .active_stream
+            .as_ref()
+            .map(|s| gpu.hip.stream_is_capturing(s))
+            .transpose()
+            .map_err(err)?
             .unwrap_or(false);
-        if gpu.graphs.capture_mode || gpu.graphs.verify.capturing.is_some()
-            || gpu.graphs.replay.capturing.is_some() || capture
-            || gpu.replay.is_recording() || gpu.replay.retained_body_active()
-            || gpu.replay.should_route_aql() || gpu.replay.should_route_pm4()
+        if gpu.graphs.capture_mode
+            || gpu.graphs.verify.capturing.is_some()
+            || gpu.graphs.replay.capturing.is_some()
+            || capture
+            || gpu.replay.is_recording()
+            || gpu.replay.retained_body_active()
+            || gpu.replay.should_route_aql()
+            || gpu.replay.should_route_pm4()
             || gpu.replay.shadow_body_route().is_some()
             || gpu.replay.state() == rdna_compute::replay::ReplayState::ShadowValidated
         {
-            return Err(err("requires eager HIP; capture, retained replay, AQL/PM4 and shadow are refused"));
+            return Err(err(
+                "requires eager HIP; capture, retained replay, AQL/PM4 and shadow are refused",
+            ));
         }
         gpu.bind_thread().map_err(err)
     }
@@ -465,30 +584,39 @@ impl CpuSplitExecutor {
     /// Download ORIGINAL route/rotated activation and retire all old pinned
     /// reads before launching any routed GPU kernels for this generation.
     pub fn prepare(
-        &self, gpu: &Gpu, rows: usize, x_rot: &GpuTensor,
-        ids: &GpuTensor, weights: &GpuTensor, experts: &dyn RoutedExpertWeights,
+        &self,
+        gpu: &Gpu,
+        rows: usize,
+        x_rot: &GpuTensor,
+        ids: &GpuTensor,
+        weights: &GpuTensor,
+        experts: &dyn RoutedExpertWeights,
     ) -> Result<(), DispatchError> {
         let diag = self.diag_on.get();
         let t0 = diag.then(Instant::now);
         self.gate(gpu, rows)?;
         let slots = rows * self.top_k;
         let nx = rows * self.dim;
-        if x_rot.buf.size() < nx * 4 || ids.buf.size() < slots * 4
-            || weights.buf.size() < slots * 4 || experts.len() != self.placement.len()
+        if x_rot.buf.size() < nx * 4
+            || ids.buf.size() < slots * 4
+            || weights.buf.size() < slots * 4
+            || experts.len() != self.placement.len()
         {
             return Err(err("input extent or expert plan mismatch"));
         }
         // Admission may run on a different thread than orchestration. Reserve
         // its reusable CPU scratch here, before the parallel GPU/CPU phase.
-        cpu_exec::reserve_moe_cpu_host_slot_scratch(
-            self.dim, self.mi, self.max_rows * self.top_k,
-        )?;
+        cpu_exec::reserve_moe_cpu_host_slot_scratch(self.dim, self.mi, self.max_rows * self.top_k)?;
         let (endpoint, shadow) = if diag {
             // A record left open by an aborted caller never leaks into this call.
             self.close_open();
             let p = self.parity.borrow();
             let shadow = if p.endpoint == SplitEndpoint::AllCold {
-                Some(p.shadow.clone().ok_or_else(|| err("AllCold endpoint lost its CPU shadow"))?)
+                Some(
+                    p.shadow
+                        .clone()
+                        .ok_or_else(|| err("AllCold endpoint lost its CPU shadow"))?,
+                )
             } else {
                 None
             };
@@ -497,18 +625,39 @@ impl CpuSplitExecutor {
             (SplitEndpoint::Natural, None)
         };
         let mut st = self.state.borrow_mut();
-        if st.failed || st.ready { return Err(err("failed or unfinished transaction")); }
+        if st.failed || st.ready {
+            return Err(err("failed or unfinished transaction"));
+        }
         let result = (|| {
-            st.input.download_async(&gpu.hip, &x_rot.buf, 0, nx * 4, gpu.active_stream.as_ref()).map_err(err)?;
-            st.input.download_async(&gpu.hip, &ids.buf, nx * 4, slots * 4, gpu.active_stream.as_ref()).map_err(err)?;
-            st.input.download_async(&gpu.hip, &weights.buf, (nx + slots) * 4, slots * 4, gpu.active_stream.as_ref()).map_err(err)?;
+            st.input
+                .download_async(&gpu.hip, &x_rot.buf, 0, nx * 4, gpu.active_stream.as_ref())
+                .map_err(err)?;
+            st.input
+                .download_async(
+                    &gpu.hip,
+                    &ids.buf,
+                    nx * 4,
+                    slots * 4,
+                    gpu.active_stream.as_ref(),
+                )
+                .map_err(err)?;
+            st.input
+                .download_async(
+                    &gpu.hip,
+                    &weights.buf,
+                    (nx + slots) * 4,
+                    slots * 4,
+                    gpu.active_stream.as_ref(),
+                )
+                .map_err(err)?;
             st.input.complete(&gpu.hip).map_err(err)?;
             // These may synchronize the stream, intentionally BEFORE its tail.
             st.mask.complete(&gpu.hip).map_err(err)?;
             st.output.complete(&gpu.hip).map_err(err)?;
             for s in 0..slots {
                 let at = (nx + s) * 4;
-                let id = i32::from_ne_bytes(st.input.as_bytes_mut()[at..at + 4].try_into().unwrap());
+                let id =
+                    i32::from_ne_bytes(st.input.as_bytes_mut()[at..at + 4].try_into().unwrap());
                 st.ids[s] = id;
                 st.gpu_ids[s] = -1;
             }
@@ -517,7 +666,9 @@ impl CpuSplitExecutor {
                 let id = st.ids[s];
                 // Invalid original slots belong to neither arm; preserve them
                 // for the existing router-fault reporting/canonical reducer.
-                if id < 0 || id as usize >= self.placement.len() { continue; }
+                if id < 0 || id as usize >= self.placement.len() {
+                    continue;
+                }
                 let cold = match endpoint {
                     SplitEndpoint::Natural => self.placement[id as usize] == 1,
                     SplitEndpoint::AllHot => false,
@@ -536,7 +687,15 @@ impl CpuSplitExecutor {
                 let bytes = st.gpu_ids[s].to_ne_bytes();
                 st.mask.as_bytes_mut()[s * 4..s * 4 + 4].copy_from_slice(&bytes);
             }
-            st.mask.upload_async(&gpu.hip, &self.masked_indices.buf, 0, slots * 4, gpu.active_stream.as_ref()).map_err(err)?;
+            st.mask
+                .upload_async(
+                    &gpu.hip,
+                    &self.masked_indices.buf,
+                    0,
+                    slots * 4,
+                    gpu.active_stream.as_ref(),
+                )
+                .map_err(err)?;
             st.rows = rows;
             st.ready = true;
             Ok(())
@@ -546,7 +705,9 @@ impl CpuSplitExecutor {
             // Keep this transaction poisoned even after a successful drain:
             // a partially advanced model request must never silently retry.
             let _ = gpu.hip.device_synchronize();
-            if diag { self.close_open(); }
+            if diag {
+                self.close_open();
+            }
         } else {
             st.cold_shadow = shadow;
             if let Some(t0) = t0 {
@@ -562,15 +723,26 @@ impl CpuSplitExecutor {
         let slots = rows * self.top_k;
         let nx = rows * self.dim;
         let mut p = self.parity.borrow_mut();
-        if p.records.len() >= p.max_records { return; }
+        if p.records.len() >= p.max_records {
+            return;
+        }
         let full = p.mode == SplitParityMode::Full;
         let cold = st.host_count;
         let hot = st.gpu_ids[..slots].iter().filter(|&&v| v >= 0).count();
         let mut rec = SplitParityRecord {
-            layer: self.layer.get(), rows, dim: self.dim, mi: self.mi, top_k: self.top_k,
+            layer: self.layer.get(),
+            rows,
+            dim: self.dim,
+            mi: self.mi,
+            top_k: self.top_k,
             endpoint,
-            placement: Vec::new(), x_rot: Vec::new(), ids: Vec::new(), weights: Vec::new(),
-            target_in: Vec::new(), d2_expanded: Vec::new(), d2_target: Vec::new(),
+            placement: Vec::new(),
+            x_rot: Vec::new(),
+            ids: Vec::new(),
+            weights: Vec::new(),
+            target_in: Vec::new(),
+            d2_expanded: Vec::new(),
+            d2_target: Vec::new(),
             gpu_expanded: Vec::new(),
             timing: SplitTiming {
                 prepare_ns,
@@ -595,30 +767,52 @@ impl CpuSplitExecutor {
             rec.weights = f32s(nx + slots..nx + 2 * slots);
         }
         let now = Instant::now();
-        p.open = Some(Open { t0, t_prep_end: now, t_join_end: now, stage: Stage::Prepared, full, rec });
+        p.open = Some(Open {
+            t0,
+            t_prep_end: now,
+            t_join_end: now,
+            stage: Stage::Prepared,
+            full,
+            rec,
+        });
         self.recording.set(true);
         self.ref_pending.set(full);
     }
 
     fn validate_payloads(
-        &self, gpu: &Gpu, st: &Transaction, rows: usize, experts: &dyn RoutedExpertWeights,
+        &self,
+        gpu: &Gpu,
+        st: &Transaction,
+        rows: usize,
+        experts: &dyn RoutedExpertWeights,
         shadow: Option<&dyn CpuShadow>,
     ) -> Result<(), DispatchError> {
         let dummy = CpuMoeExpert {
-            gate_up_quant: CpuQuant::F32, gate_up: &[],
-            down_quant: CpuQuant::F32, down: &[],
+            gate_up_quant: CpuQuant::F32,
+            gate_up: &[],
+            down_quant: CpuQuant::F32,
+            down: &[],
         };
         let mut resolved = [dummy; MAX_SLOTS];
         for (j, &slot) in st.host_slots[..st.host_count].iter().enumerate() {
             let id = st.ids[slot as usize] as usize;
-            resolved[j] = self.resolve(gpu, experts, shadow, id)
+            resolved[j] = self
+                .resolve(gpu, experts, shadow, id)
                 .ok_or_else(|| err(format!("cold expert {id} has no retained host spans")))?;
         }
         cpu_exec::validate_moe_cpu_host_slot_outputs(
-            self.dim, self.mi, rows, self.top_k, self.placement.len(),
-            &st.ids[..rows * self.top_k], Some(&st.gpu_ids[..rows * self.top_k]),
-            &st.host_slots[..st.host_count], &resolved[..st.host_count],
-            rows * self.dim, false, rows * self.top_k * self.dim,
+            self.dim,
+            self.mi,
+            rows,
+            self.top_k,
+            self.placement.len(),
+            &st.ids[..rows * self.top_k],
+            Some(&st.gpu_ids[..rows * self.top_k]),
+            &st.host_slots[..st.host_count],
+            &resolved[..st.host_count],
+            rows * self.dim,
+            false,
+            rows * self.top_k * self.dim,
         )
     }
 
@@ -628,40 +822,84 @@ impl CpuSplitExecutor {
     /// before the CPU arithmetic.) Cold slots are installed as one H2D per run
     /// of adjacent slots: identical bytes and stream order, fewer HIP calls.
     pub fn join(
-        &self, gpu: &Gpu, rows: usize, expanded: &GpuTensor,
+        &self,
+        gpu: &Gpu,
+        rows: usize,
+        expanded: &GpuTensor,
         experts: &dyn RoutedExpertWeights,
     ) -> Result<(), DispatchError> {
         self.gate(gpu, rows)?;
         let slots = rows * self.top_k;
-        if expanded.buf.size() < slots * self.dim * 4 { return Err(err("short expanded output")); }
+        if expanded.buf.size() < slots * self.dim * 4 {
+            return Err(err("short expanded output"));
+        }
         let mut st = self.state.borrow_mut();
-        if st.failed || !st.ready || st.rows != rows { return Err(err("join without matching prepare")); }
+        if st.failed || !st.ready || st.rows != rows {
+            return Err(err("join without matching prepare"));
+        }
         let diag = self.diag_on.get();
         let tj0 = diag.then(Instant::now);
         let serial = diag && self.parity.borrow().serial;
         let shadow = st.cold_shadow.clone();
         let result = (|| {
-            if serial { sync_stream(gpu)?; }
+            if serial {
+                sync_stream(gpu)?;
+            }
             let dummy = CpuMoeExpert {
-                gate_up_quant: CpuQuant::F32, gate_up: &[],
-                down_quant: CpuQuant::F32, down: &[],
+                gate_up_quant: CpuQuant::F32,
+                gate_up: &[],
+                down_quant: CpuQuant::F32,
+                down: &[],
             };
             let mut resolved = [dummy; MAX_SLOTS];
             for (j, &slot) in st.host_slots[..st.host_count].iter().enumerate() {
-                resolved[j] = self.resolve(gpu, experts, shadow.as_deref(), st.ids[slot as usize] as usize)
+                resolved[j] = self
+                    .resolve(
+                        gpu,
+                        experts,
+                        shadow.as_deref(),
+                        st.ids[slot as usize] as usize,
+                    )
                     .ok_or_else(|| err("immutable cold payload disappeared"))?;
             }
-            let Transaction { input, output, ids, gpu_ids, host_slots, host_count, .. } = &mut *st;
+            let Transaction {
+                input,
+                output,
+                ids,
+                gpu_ids,
+                host_slots,
+                host_count,
+                ..
+            } = &mut *st;
             // SAFETY: hipHostMalloc storage is aligned, initialized and idle.
             // Input completion and previous output retirement happened BEFORE
             // the GPU tail; neither buffer has been submitted since then.
-            let x = unsafe { std::slice::from_raw_parts(input.as_bytes_mut().as_ptr().cast::<f32>(), rows * self.dim) };
-            let out = unsafe { std::slice::from_raw_parts_mut(output.as_bytes_mut().as_mut_ptr().cast::<f32>(), slots * self.dim) };
+            let x = unsafe {
+                std::slice::from_raw_parts(
+                    input.as_bytes_mut().as_ptr().cast::<f32>(),
+                    rows * self.dim,
+                )
+            };
+            let out = unsafe {
+                std::slice::from_raw_parts_mut(
+                    output.as_bytes_mut().as_mut_ptr().cast::<f32>(),
+                    slots * self.dim,
+                )
+            };
             let t_cpu = diag.then(Instant::now);
             cpu_exec::moe_cpu_host_slot_outputs(
-                self.dim, self.mi, rows, self.top_k, self.placement.len(),
-                &ids[..slots], Some(&gpu_ids[..slots]), &host_slots[..*host_count],
-                &resolved[..*host_count], x, false, out,
+                self.dim,
+                self.mi,
+                rows,
+                self.top_k,
+                self.placement.len(),
+                &ids[..slots],
+                Some(&gpu_ids[..slots]),
+                &host_slots[..*host_count],
+                &resolved[..*host_count],
+                x,
+                false,
+                out,
             )?;
             let cpu_ns = t_cpu.map_or(0, |t| ns(t, Instant::now()));
             let hs = &host_slots[..*host_count];
@@ -670,14 +908,18 @@ impl CpuSplitExecutor {
                 // Row-major ascending slots: adjacent slots are adjacent in both
                 // the pinned output and `expanded`, so a run is one contiguous copy.
                 let mut j = i + 1;
-                while j < hs.len() && hs[j] == hs[j - 1] + 1 { j += 1; }
+                while j < hs.len() && hs[j] == hs[j - 1] + 1 {
+                    j += 1;
+                }
                 let offset = hs[i] as usize * self.dim * 4;
                 let len = (j - i) * self.dim * 4;
                 // Non-owning DeviceBuffer view: no shape Vec allocation and no
                 // GPU arithmetic. Same-stream FIFO orders the down zero stores
                 // before these writes and the canonical combine after them.
                 let dst = expanded.buf.byte_view(offset, len);
-                output.upload_async(&gpu.hip, &dst, offset, len, gpu.active_stream.as_ref()).map_err(err)?;
+                output
+                    .upload_async(&gpu.hip, &dst, offset, len, gpu.active_stream.as_ref())
+                    .map_err(err)?;
                 i = j;
             }
             Ok(cpu_ns)
@@ -703,7 +945,9 @@ impl CpuSplitExecutor {
             Err(e) => {
                 st.failed = true;
                 let _ = gpu.hip.device_synchronize();
-                if diag { self.close_open(); }
+                if diag {
+                    self.close_open();
+                }
                 Err(e)
             }
         }
@@ -712,8 +956,10 @@ impl CpuSplitExecutor {
     /// Per-layer live transfer volume: original x/ids/weights download, masked
     /// ids upload, and just the cold F32 expanded slot returns. No residual.
     pub fn transfer_bytes(&self, rows: usize, cold_slots: usize) -> (usize, usize) {
-        (4 * rows * (self.dim + 2 * self.top_k),
-         4 * rows * self.top_k + 4 * cold_slots * self.dim)
+        (
+            4 * rows * (self.dim + 2 * self.top_k),
+            4 * rows * self.top_k + 4 * cold_slots * self.dim,
+        )
     }
 
     pub fn free_gpu(self, gpu: &Gpu) -> Result<(), HipError> {
@@ -724,7 +970,11 @@ impl CpuSplitExecutor {
             std::mem::forget(self);
             return Err(e);
         }
-        let Self { masked_indices, state, .. } = self;
+        let Self {
+            masked_indices,
+            state,
+            ..
+        } = self;
         drop(state);
         gpu.hip.free(masked_indices.buf)
     }

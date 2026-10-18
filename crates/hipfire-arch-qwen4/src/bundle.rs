@@ -1044,12 +1044,17 @@ impl Qwen4Bundle {
 
     /// Trunk layers armed for the opt-in CPU-cold/GPU-hot routed slot join.
     pub fn split_layers(&self) -> Vec<usize> {
-        self.execution.as_ref().map(Qwen4GpuForward::split_layers).unwrap_or_default()
+        self.execution
+            .as_ref()
+            .map(Qwen4GpuForward::split_layers)
+            .unwrap_or_default()
     }
 
     /// Stable numerical identity of the frozen CPU split and expert hot set.
     pub fn split_digest(&self) -> Option<String> {
-        self.execution.as_ref().and_then(Qwen4GpuForward::split_digest)
+        self.execution
+            .as_ref()
+            .and_then(Qwen4GpuForward::split_digest)
     }
 
     /// Owner kind (`"tier"` or `"whole-layer"`) of every armed D2 split layer,
@@ -1076,7 +1081,8 @@ impl Qwen4Bundle {
         &mut self,
         config: hipfire_dispatch::cpu_split::SplitParityConfig,
     ) -> Result<(), BundleError> {
-        self.execution.as_ref()
+        self.execution
+            .as_ref()
             .ok_or_else(|| BundleError::Forward("Qwen4 forward resources are not attached".into()))?
             .split_parity_configure(config)
             .map_err(|e| BundleError::Forward(e.to_string()))
@@ -1086,7 +1092,10 @@ impl Qwen4Bundle {
     pub fn split_take_parity_records(
         &mut self,
     ) -> Vec<hipfire_dispatch::cpu_split::SplitParityRecord> {
-        self.execution.as_ref().map(Qwen4GpuForward::split_take_parity_records).unwrap_or_default()
+        self.execution
+            .as_ref()
+            .map(Qwen4GpuForward::split_take_parity_records)
+            .unwrap_or_default()
     }
 
     /// Attach reusable ordinary-HIP execution resources after the manifest

@@ -168,8 +168,7 @@ fn awkward_headers(q: CpuQuant, packed: &mut [u8], m: usize, k: usize) {
     if q == CpuQuant::Mfp4G32E8 {
         let rb = row_bytes(q, k);
         for row in 0..m {
-            packed[row * rb..row * rb + 2]
-                .copy_from_slice(&F16X4[row % F16X4.len()].to_le_bytes());
+            packed[row * rb..row * rb + 2].copy_from_slice(&F16X4[row % F16X4.len()].to_le_bytes());
         }
         return;
     }
