@@ -2444,6 +2444,40 @@ finished turns kept for reuse, which gives way the moment a live request needs i
 figure with a high hit rate is the cache working, not a leak. Both segments take their warning colour
 from the total fill, since a full pool causes preemption.
 
+The decode step tile carries two figures under the big number:
+
+```
+best 14.79ms · recent 15.21ms
+```
+
+Both are window means of single-sequence decode steps, measured by the engine:
+`best` is the fastest window of 32 consecutive single-stream steps this process
+has run, `recent` its most recent one. Individual steps vary a lot — a step that
+saves a KV checkpoint, or finishes while other engine work is committing, can
+take twice as long as its neighbour — so nothing is compared until 32 have been
+averaged. A single slow step moves neither figure.
+
+The gap between them is normal, and it is not degradation. `best` is the most
+favorable moment the lane has hit; `recent` is what it is doing now. On a healthy
+lane sharing the card with other work the gap moves between 3% and 11% while the
+engine is in good shape: it tracks what else the machine is doing, and it freezes
+when the lane goes idle, because no new window is completing. "Recent is 8% above
+best" is not "8% degraded", and it is not a reason to restart.
+
+What is worth acting on is `best` itself getting worse across days — the engine
+no longer reaching the speeds it used to. That is a hardware, driver, or
+configuration question rather than a restart question, and the honest check is
+comparing `best` across restarts against a known-good value for the machine.
+
+Both figures are per-process and reset when the engine restarts, so a freshly
+restarted lane has not yet seen its own best moment and will report a `best` that
+later improves. `/stats` carries the raw values as `step_ns_decode_best` and
+`step_ns_decode_recent` (nanoseconds; 0 until the first window completes), plus
+`startup_s` — how long bringup took on this machine, which is the real cost of a
+restart if one is decided on. The estimator is `rad::DecodeFloor` in
+`core/sched/metrics.h`; `docs/DEVLOG-decode-floor.md` is the log of how these
+figures came to be shown without a verdict attached.
+
 **Sessions**: one row per stored conversation: how many tokens, which tier it is in, and whether its
 linear half is still reachable. Sizes overlap and cannot be added: two sessions sharing a system
 prompt share its blocks.
