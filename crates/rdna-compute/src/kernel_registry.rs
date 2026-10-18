@@ -81,7 +81,7 @@ mod kernels {
 
 pub const SUPPORTED_ARCHES: &[&str] = &["gfx1201", "gfx1100", "gfx1151", "gfx906", "gfx942"];
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct KernelEntry {
     pub arch: &'static str,
     pub module: &'static str,
@@ -4216,6 +4216,18 @@ impl PlannedKernel {
     }
 }
 
+/// Whether the loader may seal a resolved route plan. A walked plan is
+/// [`RouteSeal::Open`] (off-plan loads stay lazy and warn) unless its file
+/// names the spec route in `#! sealed`, which `scripts/route_plan_build.py`
+/// writes only from a sealed replay of the checked-in plan; the hand-closed
+/// Qwen3.6-27B gfx1201 route is [`RouteSeal::Sealed`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteSeal {
+    Sealed,
+    /// The walked family of the open plan, for the loader's log label.
+    Open(&'static str),
+}
+
 #[derive(Debug)]
 pub struct RouteKernelPlan {
     pub entries: Vec<PlannedKernel>,
@@ -4669,6 +4681,14 @@ const QWEN36_27B_GFX1201_B1_SILU_SYMBOLS: &[&str] = &[
 /// returns a partial plan) when the model, arch, policy axes, spec route or
 /// feature flags are outside a closed route.
 pub fn route_entries(input: &RouteKernelInput<'_>) -> Result<RouteKernelPlan, RegistryError> {
+    route_entries_sealed(input).map(|(plan, _)| plan)
+}
+
+/// [`route_entries`] plus the plan's [`RouteSeal`]: the loader seals only
+/// [`RouteSeal::Sealed`] plans.
+pub fn route_entries_sealed(
+    input: &RouteKernelInput<'_>,
+) -> Result<(RouteKernelPlan, RouteSeal), RegistryError> {
     let refuse = |why: String| Err(RegistryError::UnsupportedRoute(why));
     match input.spec {
         KernelSpecRoute::Ar | KernelSpecRoute::NativeMtp => {}
@@ -4765,9 +4785,9 @@ pub fn route_entries(input: &RouteKernelInput<'_>) -> Result<RouteKernelPlan, Re
             (hip, embedded)
         }
         None => {
-            if let Some(plan) = walked_route_entries(input)? {
+            if let Some((plan, seal)) = walked_route_entries(input)? {
                 validate_route_plan(&plan)?;
-                return Ok(plan);
+                return Ok((plan, seal));
             }
             return refuse(format!(
                 "model arch {} on {} has no closed route",
@@ -4819,7 +4839,7 @@ pub fn route_entries(input: &RouteKernelInput<'_>) -> Result<RouteKernelPlan, Re
     }
     let plan = RouteKernelPlan { entries };
     validate_route_plan(&plan)?;
-    Ok(plan)
+    Ok((plan, RouteSeal::Sealed))
 }
 
 /// One selected image per public entry and one recipe per module name. Any
@@ -4859,6 +4879,324 @@ pub fn validate_route_plan(plan: &RouteKernelPlan) -> Result<(), RegistryError> 
         }
     }
     Ok(())
+}
+
+// ── Predicted family kernels ────────────────────────────────────────────
+//
+// A route without a closed plan (a refused option, a layout no walk covers,
+// an open walked plan whose walks missed a rung) still has a predictable
+// kernel set: the modules a kernel-load trace of its family compiled, plus
+// every module a compatible walked plan bound. [`predicted_kernels`] resolves
+// those module names to the exact registry recipes (the installer inventory,
+// never another arch's source) so a loader can compile them before ready
+// instead of at the first request. Compiling is always safe; binding a symbol
+// into the loader's function cache is not: that cache is keyed by symbol name
+// alone, so a symbol two registry modules export (or one an embedded image
+// exports) could return the wrong image to a launcher that asked for the
+// other. Only symbols with exactly one registry owner are bound.
+
+/// One kernel-load trace fixture and the model archs it describes.
+struct FamilyTrace {
+    family: &'static str,
+    model_archs: &'static [u32],
+    /// `arch\tmodule\tsymbols` rows (`tests/fixtures/kernel-trace-*.tsv`).
+    fixture: &'static str,
+}
+
+const FAMILY_TRACES: &[FamilyTrace] = &[
+    FamilyTrace {
+        family: "qwen3.8-flash-next",
+        model_archs: &[16],
+        fixture: include_str!("../tests/fixtures/kernel-trace-qwen4-flash-next.tsv"),
+    },
+    FamilyTrace {
+        family: "qwen3.5",
+        model_archs: &[5, 6],
+        fixture: include_str!("../tests/fixtures/kernel-trace-qwen35.tsv"),
+    },
+];
+
+/// How a predicted module set was chosen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PredictionBasis {
+    /// The family's trace rows on this exact arch plus compatible walked HIP
+    /// rows: modules the runtime was observed to compile, symbols it bound.
+    FamilyTrace,
+    /// No trustworthy trace for this load: the loader did not recognise an
+    /// exact closed or walked plan (`exact_plan` false), the family is
+    /// unknown, or its fixture has no rows for this arch (names are never
+    /// borrowed across arches). This arch's whole installer inventory,
+    /// compile only (nothing is bound).
+    ConservativeArchInventory,
+}
+
+impl PredictionBasis {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FamilyTrace => "family-trace",
+            Self::ConservativeArchInventory => "conservative-arch-inventory",
+        }
+    }
+}
+
+/// What [`predicted_kernels`] needs from a load.
+pub struct PredictKernelInput<'a> {
+    pub arch: &'a str,
+    /// Header `arch_id` when the source is an HFQ file.
+    pub model_arch: Option<u32>,
+    pub hipcc_extra_flags: &'a str,
+    /// `FeatureFlags::pm_decode`: accepted twins replace their HIP modules,
+    /// so those modules are neither compiled nor bound.
+    pub pm_decode: bool,
+    /// True only when the loader recognised this exact header layout, arch
+    /// and policy axes as a closed or walked route plan (`planned` is that
+    /// plan). A family trace proves coverage for the layouts it was walked
+    /// on, not for the family: every other load (a refused or unrecognised
+    /// route, a DFlash/vision/other-codec/feature variant) is predicted as
+    /// the arch's whole installer inventory, compile-only.
+    pub exact_plan: bool,
+}
+
+/// One predicted HIP module: its exact registry recipe (compiled with every
+/// symbol the registry lists) and the proven conflict-free subset to bind.
+#[derive(Debug, Clone)]
+pub struct PredictedModule {
+    pub entry: KernelEntry,
+    pub bind: Vec<&'static str>,
+}
+
+#[derive(Debug)]
+pub struct PredictedKernels {
+    pub family: &'static str,
+    pub basis: PredictionBasis,
+    pub modules: Vec<PredictedModule>,
+    /// Names the family selected but the set leaves out, with the reason
+    /// (already in the route plan, accepted pm_decode twin, ambiguous or
+    /// stale recipe).
+    pub omitted: Vec<(&'static str, &'static str)>,
+}
+
+impl PredictedKernels {
+    /// Symbols the route preload binds.
+    pub fn bound_symbols(&self) -> usize {
+        self.modules.iter().map(|m| m.bind.len()).sum()
+    }
+
+    /// Modules with at least one bound symbol; the rest are compile-only.
+    pub fn bound_modules(&self) -> usize {
+        self.modules.iter().filter(|m| !m.bind.is_empty()).count()
+    }
+}
+
+/// Modules the fixture's rows record for `arch`, with the symbols each run
+/// resolved from them.
+fn traced_symbols(
+    fixture: &'static str,
+    arch: &str,
+) -> std::collections::BTreeMap<&'static str, std::collections::BTreeSet<&'static str>> {
+    let mut modules: std::collections::BTreeMap<
+        &'static str,
+        std::collections::BTreeSet<&'static str>,
+    > = std::collections::BTreeMap::new();
+    for line in fixture
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+    {
+        let mut columns = line.split('\t');
+        let (Some(row_arch), Some(module), Some(symbols)) =
+            (columns.next(), columns.next(), columns.next())
+        else {
+            continue;
+        };
+        if row_arch == arch {
+            modules
+                .entry(module)
+                .or_default()
+                .extend(symbols.split(','));
+        }
+    }
+    modules
+}
+
+/// The kernel set a load of this model on this arch will predictably need,
+/// resolved to exact registry recipes and minus everything `planned` already
+/// covers. Pure CPU: no weight payload, compiler or HIP call.
+///
+/// Selection: only a load whose exact header layout, arch and policy axes
+/// the loader recognised as a route plan (`exact_plan`) may use its family's
+/// trace: that family's trace rows for `arch` plus every HIP row of the
+/// walked plans for that model arch and arch (any layout, any spec route; a
+/// row whose recorded source hash no longer matches the registry is omitted
+/// as stale). A trace covers the layouts it was walked on, not the family,
+/// so every other load (refused or unrecognised route, another codec,
+/// DFlash, vision, non-default features), a family with no rows for `arch`,
+/// and an unknown family are the arch's whole installer inventory,
+/// compile-only: no module names are ever borrowed from another arch.
+///
+/// Binding: only symbols the trace or a walk observed from the module, and
+/// only when every registry corpus entry that exports them belongs to that
+/// module and no embedded image or `planned` entry of another module
+/// exports them. Modules whose recipe differs between corpus entries are
+/// omitted outright.
+pub fn predicted_kernels(
+    input: &PredictKernelInput<'_>,
+    planned: &RouteKernelPlan,
+) -> Result<PredictedKernels, RegistryError> {
+    use sha2::{Digest, Sha256};
+    use std::collections::{BTreeSet, HashMap, HashSet};
+    let inventory = entries(input.arch, input.hipcc_extra_flags)?;
+    let by_name: HashMap<&'static str, &KernelEntry> =
+        inventory.iter().rev().map(|e| (e.module, e)).collect();
+    let mut omitted: Vec<(&'static str, &'static str)> = Vec::new();
+    let trace = input
+        .model_arch
+        .and_then(|id| FAMILY_TRACES.iter().find(|t| t.model_archs.contains(&id)));
+    let mut names: BTreeSet<&'static str> = BTreeSet::new();
+    // Symbols a trace row or a walked row proved for each module.
+    let mut proven: HashMap<&'static str, BTreeSet<&'static str>> = HashMap::new();
+    let (family, basis) = match trace {
+        None => {
+            names.extend(inventory.iter().map(|e| e.module));
+            ("unknown-family", PredictionBasis::ConservativeArchInventory)
+        }
+        Some(trace) => {
+            let own = traced_symbols(trace.fixture, input.arch);
+            if own.is_empty() || !input.exact_plan {
+                names.extend(inventory.iter().map(|e| e.module));
+                (trace.family, PredictionBasis::ConservativeArchInventory)
+            } else {
+                for (module, symbols) in own {
+                    names.insert(module);
+                    proven.entry(module).or_default().extend(symbols);
+                }
+                if let Some(model_arch) = input.model_arch {
+                    for plan in walked_route_plans()?
+                        .iter()
+                        .filter(|p| p.model_arch == model_arch && p.arch == input.arch)
+                    {
+                        for row in plan.rows.iter().filter(|row| !row.embedded) {
+                            let Some(found) = by_name.get(row.module) else {
+                                omitted
+                                    .push((row.module, "walked module missing from the registry"));
+                                continue;
+                            };
+                            if format!("{:x}", Sha256::digest(found.source.as_bytes()))
+                                != row.sha256
+                            {
+                                omitted.push((
+                                    found.module,
+                                    "walked source hash differs from the registry",
+                                ));
+                                continue;
+                            }
+                            names.insert(found.module);
+                            proven
+                                .entry(found.module)
+                                .or_default()
+                                .extend(row.symbols.iter().copied());
+                        }
+                    }
+                }
+                (trace.family, PredictionBasis::FamilyTrace)
+            }
+        }
+    };
+
+    // Symbol ownership across every launcher source the registry knows, and
+    // the recipe uniqueness of each module name.
+    let mut corpus = route_corpus(input.arch, input.hipcc_extra_flags)?;
+    corpus.extend(railgun_entries(input.arch, input.hipcc_extra_flags)?);
+    let mut owners: HashMap<&'static str, HashSet<&'static str>> = HashMap::new();
+    let mut first: HashMap<&'static str, &KernelEntry> = HashMap::new();
+    let mut ambiguous: HashSet<&'static str> = HashSet::new();
+    for entry in &corpus {
+        for &symbol in entry.symbols {
+            owners.entry(symbol).or_default().insert(entry.module);
+        }
+        match first.get(entry.module) {
+            Some(prev)
+                if prev.source != entry.source
+                    || prev.flags != entry.flags
+                    || prev.scheduler_profile != entry.scheduler_profile =>
+            {
+                ambiguous.insert(entry.module);
+            }
+            Some(_) => {}
+            None => {
+                first.insert(entry.module, entry);
+            }
+        }
+    }
+    // Names embedded images bind into the same function cache.
+    let mut foreign: HashSet<&'static str> = HashSet::new();
+    if basis != PredictionBasis::ConservativeArchInventory {
+        foreign.extend(
+            crate::pm_decode_twins::GFX1201_TWINS
+                .iter()
+                .flat_map(|twin| twin.symbols.iter().copied()),
+        );
+        foreign.extend(crate::pm_mtp_gemm::route_object().2.iter().copied());
+        for (_, _, symbols) in crate::pm_xbatch::route_objects() {
+            foreign.extend(symbols.iter().copied());
+        }
+        if let Ok(slab) = slab_embedded_entries(input.arch, 3) {
+            foreign.extend(slab.iter().flat_map(|e| e.symbols().iter().copied()));
+        }
+        for plan in walked_route_plans()?
+            .iter()
+            .filter(|p| p.arch == input.arch)
+        {
+            for row in plan.rows.iter().filter(|row| row.embedded) {
+                foreign.extend(row.symbols.iter().copied());
+            }
+        }
+    }
+    let planned_modules: HashSet<&str> =
+        planned.entries.iter().map(PlannedKernel::module).collect();
+
+    let mut modules = Vec::with_capacity(names.len());
+    for module in names {
+        if planned_modules.contains(module) {
+            omitted.push((module, "already in the route plan"));
+            continue;
+        }
+        if crate::pm_decode_twins::pm_decode_module(input.arch, input.pm_decode, module).is_some() {
+            omitted.push((module, "accepted pm_decode twin"));
+            continue;
+        }
+        if ambiguous.contains(module) {
+            omitted.push((module, "two registry recipes"));
+            continue;
+        }
+        let Some(entry) = by_name.get(module) else {
+            omitted.push((module, "missing from the registry"));
+            continue;
+        };
+        let mut bind: Vec<&'static str> = Vec::new();
+        for &symbol in proven.get(module).into_iter().flatten() {
+            let exported = inventory
+                .iter()
+                .any(|e| e.module == module && e.symbols.contains(&symbol));
+            let sole_owner = owners.get(symbol).is_some_and(|set| set.len() == 1);
+            let planned_elsewhere = planned
+                .entries
+                .iter()
+                .any(|p| p.module() != module && p.symbols().contains(&symbol));
+            if exported && sole_owner && !planned_elsewhere && !foreign.contains(symbol) {
+                bind.push(symbol);
+            }
+        }
+        modules.push(PredictedModule {
+            entry: (*entry).clone(),
+            bind,
+        });
+    }
+    Ok(PredictedKernels {
+        family,
+        basis,
+        modules,
+        omitted,
+    })
 }
 
 /// Builtin-default feature flags for `arch`, independent of the process
@@ -5175,12 +5513,27 @@ pub struct WalkedRoutePlan {
     pub family: &'static str,
     pub model_arch: u32,
     pub arch: &'static str,
-    /// [`route_layout_sha256`] of the walked model header.
+    /// [`route_layout_sha256`] of the walked model header. For a family whose
+    /// native-MTP head is a separate file (Qwen3.5) this is the trunk header
+    /// alone, the AR route's layout.
     pub layout: &'static str,
+    /// `#! mtp_layout`: [`route_layout_sha256`] of the trunk plus the sidecar
+    /// head tensors a native-MTP load passes. `None` when the walked header
+    /// carries its own head (Flash-Next); the native-MTP route then matches
+    /// [`Self::layout`].
+    pub mtp_layout: Option<&'static str>,
+    /// `#! heads H,KV,D`: the `(n_heads, n_kv_heads, head_dim)` the walks
+    /// resolved, when the walk log recorded them. `None` admits any
+    /// (Flash-Next plans, which predate the line).
+    pub heads: Option<(usize, usize, usize)>,
     /// Largest admitted `max_seq`: the walks' context ceiling.
     pub max_seq: usize,
     /// Policy axis name and every value the walks covered.
     pub axes: Vec<(&'static str, Vec<&'static str>)>,
+    /// `#! sealed`: spec routes (`ar`, `native_mtp`) whose whole walked
+    /// closure was replayed against this plan and found closed. Empty: the
+    /// loader keeps the plan open.
+    pub sealed: Vec<&'static str>,
     pub rows: Vec<WalkedRouteRow>,
 }
 
@@ -5198,12 +5551,21 @@ pub struct WalkedRouteRow {
 fn parse_walked_route_plan(text: &'static str) -> Result<WalkedRoutePlan, String> {
     let mut directive = std::collections::HashMap::new();
     let mut axes = Vec::new();
+    let mut sealed = Vec::new();
     let mut rows = Vec::new();
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("#! ") {
             let mut words = rest.split(' ');
             match (words.next(), words.next()) {
                 (Some("axis"), Some(name)) => axes.push((name, words.collect::<Vec<_>>())),
+                (Some("sealed"), Some(first)) => {
+                    for route in std::iter::once(first).chain(words) {
+                        if !matches!(route, "ar" | "native_mtp") {
+                            return Err(format!("unknown sealed route in {line:?}"));
+                        }
+                        sealed.push(route);
+                    }
+                }
                 (Some(key), Some(value)) => {
                     directive.insert(key, value);
                 }
@@ -5240,6 +5602,20 @@ fn parse_walked_route_plan(text: &'static str) -> Result<WalkedRoutePlan, String
             .copied()
             .ok_or_else(|| format!("missing #! {key}"))
     };
+    let heads = directive
+        .get("heads")
+        .map(|value| {
+            let numbers = value
+                .split(',')
+                .map(str::parse::<usize>)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("heads: {e}"))?;
+            let [heads, kv_heads, head_dim] = numbers[..] else {
+                return Err(format!("heads {value:?}: expected H,KV,D"));
+            };
+            Ok((heads, kv_heads, head_dim))
+        })
+        .transpose()?;
     Ok(WalkedRoutePlan {
         family: get("family")?,
         model_arch: get("model_arch")?
@@ -5247,10 +5623,13 @@ fn parse_walked_route_plan(text: &'static str) -> Result<WalkedRoutePlan, String
             .map_err(|e| format!("model_arch: {e}"))?,
         arch: get("arch")?,
         layout: get("layout")?,
+        mtp_layout: directive.get("mtp_layout").copied(),
+        heads,
         max_seq: get("max_seq")?
             .parse()
             .map_err(|e| format!("max_seq: {e}"))?,
         axes,
+        sealed,
         rows,
     })
 }
@@ -5286,14 +5665,113 @@ pub fn route_layout_sha256(tensors: &[KernelTensorMeta<'_>]) -> String {
     format!("{:x}", Sha256::digest(lines.concat().as_bytes()))
 }
 
+/// Embedded certified-builder images by exact GPU arch: every `.hxaco` image
+/// the dispatch can bind through `ensure_embedded_kernel` on that arch. A
+/// walked embedded row is resolved here by the SHA-256 it recorded, so the
+/// image that ran in the walk (not another image under the same module name)
+/// is the one planned, and an image of another arch never resolves. The
+/// module name and symbols stay those the audit recorded.
+fn walked_arch_images(arch: &str) -> &'static [&'static [u8]] {
+    match arch {
+        "gfx1100" => &[
+            kernels::QWEN4_MOE_IU4_SYM_PM_GFX1100,
+            kernels::QWEN4_MOE_IU4_SYM_E8P_PM_GFX1100,
+            kernels::MQ_I4_MOE_GEMV_MQ4ONLY_PM_GFX1100,
+            kernels::E8P_I4_MOE_GEMV_PM_GFX1100,
+            kernels::MQ_I4_A4_PM_GFX1100,
+            kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_GFX1100,
+            kernels::EP_TILE_MASK_PM_GFX1100,
+            kernels::EP_TILE_PULL_PM_GFX1100,
+            kernels::EP_TILE_PULL_N8_PM_GFX1100,
+        ],
+        "gfx1151" => &[
+            kernels::NPU_TRUNK_PM_GFX1151,
+            kernels::NPU_TRUNK_ARENA_PM_GFX1151,
+            kernels::QWEN4_MOE_IU4_SYM_PM_GFX1151,
+            kernels::QWEN4_MOE_IU4_SYM_E8P_PM_GFX1151,
+            kernels::QWEN4_MOE_IU4_SYM_W3_PM_GFX1151,
+            kernels::QWEN4_MOE_IU4_SYM_W3_NT4_PM_GFX1151,
+            kernels::QSA_GATHER_PM_GFX1151,
+            kernels::QSA_SELECT_PM_GFX1151,
+            kernels::QSA_SELECT_BF16_PM_GFX1151,
+            kernels::SPEC_SAMPLING_ROWS_PARALLEL_PM_GFX1151,
+            kernels::SPEC_ACCEPT_ORDERED_PM_GFX1151,
+            kernels::QWEN4_MQ6_X4_PM_GFX1151,
+            kernels::QWEN4_MQ4_X4_PM_GFX1151,
+            kernels::QWEN4_LANE_ROWS_PM_GFX1151,
+            kernels::MQ4_ROWS_X4_PM_GFX1151,
+            kernels::BF16_ROWS_WIDE_PM_GFX1151,
+            kernels::QWEN4_SHARED_GU_PM_GFX1151,
+            kernels::MTP_DENSE_DET_PM_GFX1151,
+            kernels::MTP_Q8_DET_PM_GFX1151,
+            kernels::MQ_I4_MOE_GEMV_PM_GFX1151,
+            kernels::MQ_I4_MOE_GEMV_C1_PM_GFX1151,
+            kernels::MQ_I4_MOE_GEMV_CN_PM_GFX1151,
+            kernels::E8P_I4_MOE_GEMV_PM_GFX1151,
+            kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151,
+            kernels::GEMM_MQ4G256V2_GATE_UP_SILU_A4_IU4_PM_V2B_GFX1151,
+        ],
+        "gfx1201" => &[
+            kernels::QWEN4_MOE_IU4_SYM_PM_GFX1201,
+            kernels::QWEN4_MOE_IU4_SYM_W3_PM_GFX1201,
+            kernels::QWEN4_MOE_IU4_SYM_E8P_PM_GFX1201,
+            kernels::QSA_GATHER_PM_GFX1201,
+            kernels::DFLASH_SAMPLED_ACCEPT_PM_GFX1201,
+            kernels::SPEC_SAMPLING_ROWS_PARALLEL_PM_GFX1201,
+            kernels::SPEC_ACCEPT_ORDERED_PM_GFX1201,
+            kernels::QWEN4_MQ6_X4_PM_GFX1201,
+            kernels::MQ4_ROWS_X4_PM_GFX1201,
+            kernels::MQ_I4_MOE_GEMV_PM_GFX1201,
+            kernels::E8P_I4_MOE_GEMV_PM_GFX1201,
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1,
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1_CONTROL,
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S,
+            kernels::GEMM_MQ4G256V2_WMMA_FP8_GFX12_B1,
+            kernels::MQ4_VERIFY_PM_GFX1201,
+            kernels::MQ4_FP8_VERIFY_PM_GFX1201,
+            kernels::MQ4V2_FP8_FRAGMENT_REPACK_GFX1201,
+            kernels::QWEN4_EP_OWNER_ASSIGN_PM_GFX1201,
+            kernels::EP_TILE_MASK_PM_GFX1201,
+            kernels::EP_TILE_PULL_PM_GFX1201,
+            kernels::EP_TILE_PULL_N8_PM_GFX1201,
+        ],
+        _ => &[],
+    }
+}
+
+/// `(arch, SHA-256 hex, image)` of every [`walked_arch_images`] entry,
+/// hashed once on the first embedded row that needs it.
+static WALKED_ARCH_IMAGE_SHA: std::sync::LazyLock<Vec<(&'static str, String, &'static [u8])>> =
+    std::sync::LazyLock::new(|| {
+        use sha2::{Digest, Sha256};
+        ["gfx1100", "gfx1151", "gfx1201"]
+            .into_iter()
+            .flat_map(|arch| {
+                walked_arch_images(arch)
+                    .iter()
+                    .map(move |image| (arch, format!("{:x}", Sha256::digest(image)), *image))
+            })
+            .collect()
+    });
+
+/// The embedded image of exact `arch` whose SHA-256 is `sha256`.
+fn walked_arch_image(arch: &str, sha256: &str) -> Option<&'static [u8]> {
+    WALKED_ARCH_IMAGE_SHA
+        .iter()
+        .find(|(a, digest, _)| *a == arch && digest == sha256)
+        .map(|(_, _, image)| *image)
+}
+
 /// Runtime image of a walked embedded module, with its Radiowave manifest
 /// when the module has one: accepted `pm_decode` twins and the native
 /// objects the dispatch admits as in-memory code objects under these module
-/// names (`ensure_embedded_kernel` callsites). A walked module missing here
-/// refuses the plan.
+/// names (`ensure_embedded_kernel` callsites), then the exact-arch image
+/// catalog ([`walked_arch_images`]) by the walked image's SHA-256. A walked
+/// module with no runtime image refuses the plan.
 fn walked_embedded_image(
     arch: &str,
-    module: &str,
+    module: &'static str,
+    sha256: &str,
 ) -> Option<(&'static str, &'static [u8], Option<&'static str>)> {
     if arch == "gfx1201" {
         if let Some(twin) = crate::pm_decode_twins::GFX1201_TWINS
@@ -5331,7 +5809,7 @@ fn walked_embedded_image(
             return Some((name, image, None));
         }
     }
-    None
+    walked_arch_image(arch, sha256).map(|image| (module, image, None))
 }
 
 /// The walked plan for this load, when one exists for its model arch and
@@ -5341,9 +5819,16 @@ fn walked_embedded_image(
 /// matches the registry (a stale plan never loads).
 fn walked_route_entries(
     input: &RouteKernelInput<'_>,
-) -> Result<Option<RouteKernelPlan>, RegistryError> {
+) -> Result<Option<(RouteKernelPlan, RouteSeal)>, RegistryError> {
+    walked_route_entries_in(walked_route_plans()?, input)
+}
+
+fn walked_route_entries_in(
+    plans: &'static [WalkedRoutePlan],
+    input: &RouteKernelInput<'_>,
+) -> Result<Option<(RouteKernelPlan, RouteSeal)>, RegistryError> {
     use sha2::{Digest, Sha256};
-    let candidates: Vec<&WalkedRoutePlan> = walked_route_plans()?
+    let candidates: Vec<&'static WalkedRoutePlan> = plans
         .iter()
         .filter(|plan| plan.model_arch == input.model_arch && plan.arch == input.arch)
         .collect();
@@ -5352,10 +5837,20 @@ fn walked_route_entries(
     };
     let refuse = |why: String| Err(RegistryError::UnsupportedRoute(format!("{family}: {why}")));
     let layout = route_layout_sha256(input.tensors);
-    let Some(plan) = candidates.into_iter().find(|plan| plan.layout == layout) else {
+    // A sidecar-head family (Qwen3.5) walks its native-MTP route over the
+    // trunk plus head tensors, whose layout `mtp_layout` records; every
+    // other load matches the walked trunk layout.
+    let walked_layout = |plan: &WalkedRoutePlan| match (input.spec, plan.mtp_layout) {
+        (KernelSpecRoute::NativeMtp, Some(mtp_layout)) => mtp_layout,
+        _ => plan.layout,
+    };
+    let Some(plan) = candidates
+        .into_iter()
+        .find(|plan| walked_layout(plan) == layout)
+    else {
         return refuse(format!(
-            "header layout {layout} has no walked route on {}",
-            input.arch
+            "header layout {layout} has no walked route on {} ({:?})",
+            input.arch, input.spec
         ));
     };
     if input.max_seq > plan.max_seq {
@@ -5363,6 +5858,14 @@ fn walked_route_entries(
             "max_seq {} above the walked {}",
             input.max_seq, plan.max_seq
         ));
+    }
+    if let Some(heads) = plan.heads {
+        let resolved = (input.n_heads, input.n_kv_heads, input.head_dim);
+        if resolved != heads {
+            return refuse(format!(
+                "heads/kv heads/head dim {resolved:?} differ from the walked {heads:?}"
+            ));
+        }
     }
     if input.flags.pm_decode != default_feature_flags(input.arch)?.pm_decode {
         return refuse("non-default kernel.pm_decode".into());
@@ -5395,11 +5898,11 @@ fn walked_route_entries(
     let mut planned = Vec::new();
     for row in plan.rows.iter().filter(|row| row.native_mtp == native_mtp) {
         if row.embedded {
-            let (module, image, radiowave_json) = walked_embedded_image(input.arch, row.module)
-                .ok_or_else(|| {
+            let (module, image, radiowave_json) =
+                walked_embedded_image(input.arch, row.module, row.sha256).ok_or_else(|| {
                     RegistryError::ConflictingPlan(format!(
-                        "{family} route plan: no runtime image for embedded {}",
-                        row.module
+                        "{family} route plan: no runtime image for embedded {} on {}",
+                        row.module, input.arch
                     ))
                 })?;
             if format!("{:x}", Sha256::digest(image)) != row.sha256 {
@@ -5451,7 +5954,15 @@ fn walked_route_entries(
         }));
     }
     add_wide_twin_entries(input.arch, &inventory, &mut planned)?;
-    Ok(Some(RouteKernelPlan { entries: planned }))
+    let seal = if plan
+        .sealed
+        .contains(&if native_mtp { "native_mtp" } else { "ar" })
+    {
+        RouteSeal::Sealed
+    } else {
+        RouteSeal::Open(family)
+    };
+    Ok(Some((RouteKernelPlan { entries: planned }, seal)))
 }
 
 // ── S2 exact-wide verify twins ──────────────────────────────────────────
@@ -7152,6 +7663,344 @@ mod tests {
         assert_trace_packaged(include_str!("../tests/fixtures/kernel-trace-qwen35.tsv"));
     }
 
+    const FN_TRACE: &str = include_str!("../tests/fixtures/kernel-trace-qwen4-flash-next.tsv");
+    const Q35_TRACE: &str = include_str!("../tests/fixtures/kernel-trace-qwen35.tsv");
+
+    fn predict(
+        arch: &str,
+        model_arch: Option<u32>,
+        pm_decode: bool,
+        planned: &RouteKernelPlan,
+    ) -> PredictedKernels {
+        predicted_kernels(
+            &PredictKernelInput {
+                arch,
+                model_arch,
+                hipcc_extra_flags: "",
+                pm_decode,
+                exact_plan: true,
+            },
+            planned,
+        )
+        .unwrap()
+    }
+
+    fn no_plan() -> RouteKernelPlan {
+        RouteKernelPlan {
+            entries: Vec::new(),
+        }
+    }
+
+    /// A traced family on an arch with trace rows predicts exactly those
+    /// modules (a strict subset of the arch inventory), each with the
+    /// registry's own recipe for that arch.
+    #[test]
+    fn predicted_family_is_the_traced_union_with_exact_recipes() {
+        for (arch, model_arch, fixture) in [
+            ("gfx1151", 16, FN_TRACE),
+            ("gfx1201", 16, FN_TRACE),
+            ("gfx1100", 5, Q35_TRACE),
+            ("gfx1151", 5, Q35_TRACE),
+            ("gfx1201", 5, Q35_TRACE),
+        ] {
+            let predicted = predict(arch, Some(model_arch), false, &no_plan());
+            assert_eq!(
+                predicted.basis,
+                PredictionBasis::FamilyTrace,
+                "{arch} {model_arch}"
+            );
+            let inventory = entries(arch, "").unwrap();
+            assert!(
+                predicted.modules.len() < inventory.len(),
+                "{arch}: not the whole inventory"
+            );
+            for module in traced_symbols(fixture, arch).into_keys() {
+                match predicted.modules.iter().find(|m| m.entry.module == module) {
+                    Some(found) => {
+                        let registry = inventory.iter().find(|e| e.module == module).unwrap();
+                        assert_eq!(found.entry.arch, arch);
+                        assert_eq!(found.entry.source, registry.source, "{arch} {module}");
+                        assert_eq!(found.entry.flags, registry.flags, "{arch} {module}");
+                        assert_eq!(found.entry.symbols, registry.symbols, "{arch} {module}");
+                        assert_eq!(found.entry.scheduler_profile, registry.scheduler_profile);
+                    }
+                    None => assert!(
+                        predicted.omitted.iter().any(|(m, _)| *m == module),
+                        "{arch} {model_arch}: traced module {module} neither predicted nor omitted"
+                    ),
+                }
+            }
+            let mut names: Vec<_> = predicted.modules.iter().map(|m| m.entry.module).collect();
+            let len = names.len();
+            names.sort_unstable();
+            names.dedup();
+            assert_eq!(names.len(), len, "{arch}: duplicate predicted module");
+        }
+    }
+
+    /// Every HIP row of the walked plans for the family and arch joins the
+    /// prediction (or is omitted with a reason) even when the trace lacks it.
+    #[test]
+    fn predicted_family_includes_walked_hip_rows() {
+        let predicted = predict("gfx1201", Some(16), false, &no_plan());
+        let mut checked = 0;
+        for plan in walked_route_plans()
+            .unwrap()
+            .iter()
+            .filter(|p| p.model_arch == 16 && p.arch == "gfx1201")
+        {
+            for row in plan.rows.iter().filter(|row| !row.embedded) {
+                assert!(
+                    predicted
+                        .modules
+                        .iter()
+                        .any(|m| m.entry.module == row.module)
+                        || predicted.omitted.iter().any(|(m, _)| *m == row.module),
+                    "walked module {} missing from the prediction",
+                    row.module
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no walked HIP rows checked");
+    }
+
+    /// A traced family on an arch its fixture has no rows for is never
+    /// completed from another arch's names: the whole inventory, compile-only.
+    #[test]
+    fn traced_family_without_arch_rows_is_conservative_not_borrowed() {
+        assert!(
+            traced_symbols(FN_TRACE, "gfx1100").is_empty(),
+            "fixture grew gfx1100 rows"
+        );
+        let predicted = predict("gfx1100", Some(16), false, &no_plan());
+        assert_eq!(predicted.basis, PredictionBasis::ConservativeArchInventory);
+        assert_eq!(predicted.family, "qwen3.8-flash-next");
+        assert_eq!(predicted.bound_symbols(), 0);
+        let inventory = entries("gfx1100", "").unwrap();
+        for module in &predicted.modules {
+            let registry = inventory
+                .iter()
+                .find(|e| e.module == module.entry.module)
+                .unwrap_or_else(|| panic!("{} is not a gfx1100 module", module.entry.module));
+            assert_eq!(module.entry.arch, "gfx1100");
+            assert_eq!(module.entry.source, registry.source);
+        }
+    }
+
+    /// A family trace proves only the layouts it was walked on: without an
+    /// exact recognised plan (`exact_plan` false) every family, arch and spec
+    /// is the arch's whole inventory, every recipe, compile-only. No
+    /// family-based assumption is universal.
+    #[test]
+    fn no_exact_plan_is_whole_inventory_for_every_family() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            let mut distinct: Vec<_> = entries(arch, "")
+                .unwrap()
+                .iter()
+                .map(|e| e.module)
+                .collect();
+            distinct.sort_unstable();
+            distinct.dedup();
+            for model_arch in [Some(5), Some(6), Some(16), Some(99), None] {
+                let predicted = predicted_kernels(
+                    &PredictKernelInput {
+                        arch,
+                        model_arch,
+                        hipcc_extra_flags: "",
+                        pm_decode: false,
+                        exact_plan: false,
+                    },
+                    &no_plan(),
+                )
+                .unwrap();
+                assert_eq!(
+                    predicted.basis,
+                    PredictionBasis::ConservativeArchInventory,
+                    "{arch} {model_arch:?}"
+                );
+                assert_eq!(predicted.bound_symbols(), 0, "{arch} {model_arch:?}");
+                assert_eq!(
+                    predicted.modules.len() + predicted.omitted.len(),
+                    distinct.len(),
+                    "{arch} {model_arch:?}: not every inventory recipe"
+                );
+                // A module the family trace never saw (another codec's) is in.
+                let traced = traced_symbols(FN_TRACE, arch);
+                assert!(
+                    predicted.modules.len() > traced.len(),
+                    "{arch} {model_arch:?}: conservative set must exceed the traced union"
+                );
+            }
+        }
+    }
+
+    /// No trustworthy trace: the arch's whole inventory, compile-only.
+    #[test]
+    fn unknown_family_is_conservative_compile_only() {
+        for model_arch in [None, Some(99)] {
+            let predicted = predict("gfx1100", model_arch, false, &no_plan());
+            assert_eq!(predicted.basis, PredictionBasis::ConservativeArchInventory);
+            assert_eq!(predicted.basis.label(), "conservative-arch-inventory");
+            let mut distinct: Vec<_> = entries("gfx1100", "")
+                .unwrap()
+                .iter()
+                .map(|e| e.module)
+                .collect();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert_eq!(
+                predicted.modules.len() + predicted.omitted.len(),
+                distinct.len()
+            );
+            assert_eq!(predicted.bound_symbols(), 0);
+            assert!(predicted.modules.iter().all(|m| m.bind.is_empty()));
+        }
+        assert!(matches!(
+            predicted_kernels(
+                &PredictKernelInput {
+                    arch: "gfx000",
+                    model_arch: None,
+                    hipcc_extra_flags: "",
+                    pm_decode: false,
+                    exact_plan: true
+                },
+                &no_plan()
+            ),
+            Err(RegistryError::UnsupportedArch(_))
+        ));
+    }
+
+    /// Bound symbols have exactly one owning module in the whole registry
+    /// corpus, and no accepted embedded twin exports them.
+    #[test]
+    fn predicted_binds_are_conflict_free() {
+        for (arch, model_arch) in [
+            ("gfx1201", 16),
+            ("gfx1201", 5),
+            ("gfx1151", 16),
+            ("gfx1100", 5),
+        ] {
+            let predicted = predict(arch, Some(model_arch), false, &no_plan());
+            let mut corpus = route_corpus(arch, "").unwrap();
+            corpus.extend(railgun_entries(arch, "").unwrap());
+            let mut bound = 0;
+            for module in &predicted.modules {
+                for &symbol in &module.bind {
+                    let owners: std::collections::BTreeSet<_> = corpus
+                        .iter()
+                        .filter(|e| e.symbols.contains(&symbol))
+                        .map(|e| e.module)
+                        .collect();
+                    assert_eq!(
+                        owners.iter().copied().collect::<Vec<_>>(),
+                        vec![module.entry.module],
+                        "{arch} {model_arch}: {symbol} has several owners"
+                    );
+                    assert!(module.entry.symbols.contains(&symbol));
+                    // Only symbols a trace row or a walked row observed.
+                    let fixture = if model_arch == 16 {
+                        FN_TRACE
+                    } else {
+                        Q35_TRACE
+                    };
+                    let traced = traced_symbols(fixture, arch)
+                        .get(module.entry.module)
+                        .is_some_and(|set| set.contains(symbol));
+                    let walked = walked_route_plans()
+                        .unwrap()
+                        .iter()
+                        .filter(|p| p.model_arch == model_arch && p.arch == arch)
+                        .flat_map(|p| p.rows.iter())
+                        .any(|row| {
+                            row.module == module.entry.module && row.symbols.contains(&symbol)
+                        });
+                    assert!(
+                        traced || walked,
+                        "{arch} {model_arch}: {symbol} was never observed"
+                    );
+                    assert!(
+                        !crate::pm_decode_twins::GFX1201_TWINS
+                            .iter()
+                            .any(|t| t.symbols.contains(&symbol)),
+                        "{arch}: {symbol} is also an embedded twin export"
+                    );
+                    bound += 1;
+                }
+            }
+            assert_eq!(bound, predicted.bound_symbols());
+            assert!(bound > 0, "{arch} {model_arch}: nothing bound");
+        }
+    }
+
+    /// A module the route plan already carries is not predicted again, and a
+    /// symbol the plan binds from another module is never bound from the
+    /// predicted one.
+    #[test]
+    fn predicted_binds_never_collide_with_the_route_plan() {
+        let baseline = predict("gfx1151", Some(5), false, &no_plan());
+        let victim = baseline
+            .modules
+            .iter()
+            .find(|m| !m.bind.is_empty())
+            .expect("a bindable module");
+        let victim_module = victim.entry.module;
+        let victim_symbols = victim.entry.symbols;
+
+        let planned = RouteKernelPlan {
+            entries: vec![PlannedKernel::Hip(victim.entry.clone())],
+        };
+        let with_module = predict("gfx1151", Some(5), false, &planned);
+        assert!(with_module
+            .modules
+            .iter()
+            .all(|m| m.entry.module != victim_module));
+        assert!(with_module
+            .omitted
+            .contains(&(victim_module, "already in the route plan")));
+        assert_eq!(with_module.modules.len() + 1, baseline.modules.len());
+
+        let mut foreign = victim.entry.clone();
+        foreign.module = "route_plan_foreign_owner";
+        let planned = RouteKernelPlan {
+            entries: vec![PlannedKernel::Hip(foreign)],
+        };
+        let with_symbol = predict("gfx1151", Some(5), false, &planned);
+        let kept = with_symbol
+            .modules
+            .iter()
+            .find(|m| m.entry.module == victim_module)
+            .expect("the module still compiles");
+        assert!(
+            kept.bind.iter().all(|s| !victim_symbols.contains(s)),
+            "a symbol the plan binds elsewhere stayed bound"
+        );
+    }
+
+    /// An accepted pm_decode twin replaces its HIP module: it is neither
+    /// compiled nor bound as a predicted module.
+    #[test]
+    fn predicted_set_skips_accepted_pm_decode_twins() {
+        let with_twins = predict("gfx1201", Some(16), true, &no_plan());
+        for twin in crate::pm_decode_twins::GFX1201_TWINS.iter() {
+            assert!(
+                with_twins
+                    .modules
+                    .iter()
+                    .all(|m| m.entry.module != twin.module),
+                "twin {} predicted as a HIP module",
+                twin.module
+            );
+        }
+        let without = predict("gfx1201", Some(16), false, &no_plan());
+        let skipped = with_twins
+            .omitted
+            .iter()
+            .filter(|(_, why)| *why == "accepted pm_decode twin")
+            .count();
+        assert_eq!(with_twins.modules.len() + skipped, without.modules.len());
+    }
+
     #[test]
     fn native_mtp_plans_pm_fill_before_ready() {
         use crate::DType;
@@ -7243,6 +8092,11 @@ mod tests {
             };
             let (module, image, symbols) = crate::pm_mtp_gemm::route_object();
             let plan = route_entries(&input).expect("native MTP closed route");
+            assert_eq!(
+                route_entries_sealed(&input).unwrap().1,
+                RouteSeal::Sealed,
+                "the hand-closed 27B route seals"
+            );
             assert!(plan
                 .entries
                 .iter()
@@ -7256,5 +8110,432 @@ mod tests {
                 .iter()
                 .any(|e| e.module() == module));
         }
+    }
+
+    // ── Generic (Qwen3.5 A3B/27B) walked-plan matching ──────────────────
+    //
+    // Synthetic fixtures only: nothing below is a recorded walk. They drive
+    // `parse_walked_route_plan` / `walked_route_entries_in` over generated
+    // plan text to pin the matcher: layout (trunk vs trunk+head), heads,
+    // axes, max_seq, seal, and arch-exact embedded identity.
+
+    type SyntheticHeader = Vec<(String, crate::DType, Vec<usize>)>;
+
+    fn synthetic_trunk() -> SyntheticHeader {
+        let mut out = vec![(
+            "model.language_model.embed_tokens.weight".to_owned(),
+            crate::DType::Q8_0,
+            vec![1024, 256],
+        )];
+        for layer in 0..4 {
+            out.push((
+                format!("model.language_model.layers.{layer}.mlp.gate_proj.weight"),
+                crate::DType::MQ4G256V2,
+                vec![512, 256],
+            ));
+        }
+        out
+    }
+
+    fn synthetic_with_head() -> SyntheticHeader {
+        let mut header = synthetic_trunk();
+        header.push(("eh_proj".to_owned(), crate::DType::MQ4G256, vec![256, 512]));
+        header
+    }
+
+    fn synthetic_metas(header: &SyntheticHeader) -> Vec<KernelTensorMeta<'_>> {
+        header
+            .iter()
+            .map(|(name, dtype, shape)| KernelTensorMeta {
+                name,
+                dtype: *dtype,
+                shape,
+            })
+            .collect()
+    }
+
+    fn synthetic_layout(header: &SyntheticHeader) -> String {
+        route_layout_sha256(&synthetic_metas(header))
+    }
+
+    fn synthetic_plan_text(
+        arch: &str,
+        layout: &str,
+        mtp_layout: &str,
+        sealed: &str,
+        rows: &[String],
+    ) -> String {
+        let mut text = format!(
+            "#! family synthetic-qwen35\n#! model_arch 5\n#! arch {arch}\n#! layout {layout}\n\
+             #! mtp_layout {mtp_layout}\n#! heads 16,2,256\n#! max_seq 8192\n\
+             #! axis kv_backend vmm\n#! axis kv_k q8\n#! axis kv_v q8\n\
+             #! axis prefill_chunk_rows 512\n#! axis state_quant q8\n"
+        );
+        if !sealed.is_empty() {
+            text.push_str(&format!("#! sealed {sealed}\n"));
+        }
+        for row in rows {
+            text.push_str(row);
+            text.push('\n');
+        }
+        text
+    }
+
+    /// Plan text of the gfx1100 fixture: AR hip + embedded rows, the same
+    /// plus one extra hip row on native MTP, sealed for `ar` only.
+    fn main_plan_text() -> String {
+        let inventory = entries("gfx1100", "").unwrap();
+        let hip = &inventory[0];
+        let extra = inventory
+            .iter()
+            .find(|entry| entry.module != hip.module)
+            .unwrap();
+        let hip_row = |route: &str, entry: &KernelEntry| {
+            format!(
+                "{route}\thip\t{}\t{}\t{:x}",
+                entry.module,
+                entry.symbols.join(","),
+                Sha256::digest(entry.source().as_bytes())
+            )
+        };
+        let image_row = |route: &str| {
+            format!(
+                "{route}\tembedded\tgemm_mq4g256v2_residual_iu4_pm_gfx1100\t\
+                 gemm_mq4g256v2_residual_iu4_pm_gfx1100\t{:x}",
+                Sha256::digest(kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_GFX1100)
+            )
+        };
+        let rows = [
+            hip_row("ar", hip),
+            image_row("ar"),
+            hip_row("native_mtp", hip),
+            image_row("native_mtp"),
+            hip_row("native_mtp", extra),
+        ];
+        synthetic_plan_text(
+            "gfx1100",
+            &synthetic_layout(&synthetic_trunk()),
+            &synthetic_layout(&synthetic_with_head()),
+            "ar",
+            &rows,
+        )
+    }
+
+    /// A trunk-layout plan on `arch` whose only row is one embedded image.
+    fn embedded_plan_text(arch: &str, module: &str, image: &[u8]) -> String {
+        let layout = synthetic_layout(&synthetic_trunk());
+        synthetic_plan_text(
+            arch,
+            &layout,
+            &layout,
+            "",
+            &[format!(
+                "ar\tembedded\t{module}\t{module}\t{:x}",
+                Sha256::digest(image)
+            )],
+        )
+    }
+
+    /// Parse generated plan text once into a `'static` plan slice (the
+    /// planner hands out borrows of it as `'static` symbol lists).
+    macro_rules! walked_fixture {
+        ($text:expr) => {{
+            static TEXT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| $text);
+            static PLANS: std::sync::LazyLock<Vec<WalkedRoutePlan>> =
+                std::sync::LazyLock::new(|| vec![parse_walked_route_plan(TEXT.as_str()).unwrap()]);
+            PLANS.as_slice()
+        }};
+    }
+
+    fn synthetic_axes() -> Vec<(&'static str, String)> {
+        vec![
+            ("kv_backend", "vmm".to_owned()),
+            ("kv_k", "q8".to_owned()),
+            ("kv_v", "q8".to_owned()),
+            ("prefill_chunk_rows", "512".to_owned()),
+            ("state_quant", "q8".to_owned()),
+        ]
+    }
+
+    fn synthetic_input<'a>(
+        arch: &'a str,
+        tensors: &'a [KernelTensorMeta<'a>],
+        spec: KernelSpecRoute,
+        flags: &'a crate::feature_flags::FeatureFlags,
+        axes: &'a [(&'a str, String)],
+    ) -> RouteKernelInput<'a> {
+        RouteKernelInput {
+            arch,
+            model_arch: 5,
+            tensors,
+            n_heads: 16,
+            n_kv_heads: 2,
+            head_dim: 256,
+            max_seq: 8192,
+            prefill_chunk_rows: 512,
+            kv_k: "q8",
+            kv_v: "q8",
+            state_quant: "q8",
+            spec,
+            host_mapped_experts: false,
+            retained_decode: true,
+            hipcc_extra_flags: "",
+            flags,
+            route_axes: axes,
+        }
+    }
+
+    fn is_unsupported(result: Result<Option<(RouteKernelPlan, RouteSeal)>, RegistryError>) -> bool {
+        matches!(result, Err(RegistryError::UnsupportedRoute(_)))
+    }
+
+    #[test]
+    fn generic_walked_plan_matches_layout_heads_axes_max_seq_and_seal() {
+        let plans = walked_fixture!(main_plan_text());
+        let trunk = synthetic_trunk();
+        let with_head = synthetic_with_head();
+        assert_ne!(synthetic_layout(&trunk), synthetic_layout(&with_head));
+        let image = kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_GFX1100;
+        assert_eq!(plans[0].sealed, ["ar"]);
+        assert_eq!(plans[0].heads, Some((16, 2, 256)));
+        assert_eq!(plans[0].mtp_layout, Some(&*synthetic_layout(&with_head)));
+
+        let flags = default_feature_flags("gfx1100").unwrap();
+        let axes = synthetic_axes();
+        let trunk_metas = synthetic_metas(&trunk);
+        let head_metas = synthetic_metas(&with_head);
+
+        // AR over the trunk: the sealed AR route, exactly the AR rows.
+        let ar = synthetic_input("gfx1100", &trunk_metas, KernelSpecRoute::Ar, &flags, &axes);
+        let (plan, seal) = walked_route_entries_in(plans, &ar).unwrap().unwrap();
+        assert_eq!(seal, RouteSeal::Sealed);
+        assert_eq!(plan.entries.len(), 2);
+        assert!(matches!(
+            &plan.entries[1],
+            PlannedKernel::Embedded { image: planned, .. } if *planned == image
+        ));
+
+        // Native MTP over trunk + head: its own layout, every native_mtp row,
+        // and open because only `ar` was replayed sealed.
+        let mtp = synthetic_input(
+            "gfx1100",
+            &head_metas,
+            KernelSpecRoute::NativeMtp,
+            &flags,
+            &axes,
+        );
+        let (plan, seal) = walked_route_entries_in(plans, &mtp).unwrap().unwrap();
+        assert_eq!(seal, RouteSeal::Open("synthetic-qwen35"));
+        assert_eq!(plan.entries.len(), 3);
+
+        // The layouts do not cross routes.
+        let wrong = synthetic_input(
+            "gfx1100",
+            &trunk_metas,
+            KernelSpecRoute::NativeMtp,
+            &flags,
+            &axes,
+        );
+        assert!(is_unsupported(walked_route_entries_in(plans, &wrong)));
+        let wrong = synthetic_input("gfx1100", &head_metas, KernelSpecRoute::Ar, &flags, &axes);
+        assert!(is_unsupported(walked_route_entries_in(plans, &wrong)));
+
+        // max_seq ceiling, resolved heads, every axis value, a missing and an
+        // extra axis, and a non-default pm_decode flag.
+        let mut over = synthetic_input("gfx1100", &trunk_metas, KernelSpecRoute::Ar, &flags, &axes);
+        over.max_seq = 8193;
+        assert!(is_unsupported(walked_route_entries_in(plans, &over)));
+        for heads in [(24, 2, 256), (16, 4, 256), (16, 2, 128)] {
+            let mut other =
+                synthetic_input("gfx1100", &trunk_metas, KernelSpecRoute::Ar, &flags, &axes);
+            (other.n_heads, other.n_kv_heads, other.head_dim) = heads;
+            assert!(
+                is_unsupported(walked_route_entries_in(plans, &other)),
+                "{heads:?}"
+            );
+        }
+        for index in 0..axes.len() {
+            let mut changed = axes.clone();
+            changed[index].1 = "unwalked".to_owned();
+            let other = synthetic_input(
+                "gfx1100",
+                &trunk_metas,
+                KernelSpecRoute::Ar,
+                &flags,
+                &changed,
+            );
+            assert!(
+                is_unsupported(walked_route_entries_in(plans, &other)),
+                "{}",
+                axes[index].0
+            );
+            let mut missing = axes.clone();
+            missing.remove(index);
+            let other = synthetic_input(
+                "gfx1100",
+                &trunk_metas,
+                KernelSpecRoute::Ar,
+                &flags,
+                &missing,
+            );
+            assert!(
+                is_unsupported(walked_route_entries_in(plans, &other)),
+                "missing {}",
+                axes[index].0
+            );
+        }
+        let mut extra_axis = axes.clone();
+        extra_axis.push(("unwalked_axis", "on".to_owned()));
+        let other = synthetic_input(
+            "gfx1100",
+            &trunk_metas,
+            KernelSpecRoute::Ar,
+            &flags,
+            &extra_axis,
+        );
+        assert!(is_unsupported(walked_route_entries_in(plans, &other)));
+        let mut pm = flags.clone();
+        pm.pm_decode = !pm.pm_decode;
+        let other = synthetic_input("gfx1100", &trunk_metas, KernelSpecRoute::Ar, &pm, &axes);
+        assert!(is_unsupported(walked_route_entries_in(plans, &other)));
+
+        // A header that is not the walked layout, and an arch the plan does not name.
+        let mut other_header = trunk.clone();
+        other_header.pop();
+        let other_metas = synthetic_metas(&other_header);
+        let other = synthetic_input("gfx1100", &other_metas, KernelSpecRoute::Ar, &flags, &axes);
+        assert!(is_unsupported(walked_route_entries_in(plans, &other)));
+        let flags_1151 = default_feature_flags("gfx1151").unwrap();
+        let other = synthetic_input(
+            "gfx1151",
+            &trunk_metas,
+            KernelSpecRoute::Ar,
+            &flags_1151,
+            &axes,
+        );
+        assert!(walked_route_entries_in(plans, &other).unwrap().is_none());
+    }
+
+    #[test]
+    fn walked_embedded_rows_resolve_only_on_their_own_arch() {
+        let trunk = synthetic_trunk();
+        let trunk_metas = synthetic_metas(&trunk);
+        let flags_1100 = default_feature_flags("gfx1100").unwrap();
+        let flags_1151 = default_feature_flags("gfx1151").unwrap();
+        let axes = synthetic_axes();
+
+        // gfx1151's own image resolves; the recorded module name is kept.
+        let v2b = kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151;
+        let plans = walked_fixture!(embedded_plan_text(
+            "gfx1151",
+            "gemm_mq4g256v2_residual_iu4_pm_v2b_gfx1151",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151
+        ));
+        let input = synthetic_input(
+            "gfx1151",
+            &trunk_metas,
+            KernelSpecRoute::Ar,
+            &flags_1151,
+            &axes,
+        );
+        let (plan, seal) = walked_route_entries_in(plans, &input).unwrap().unwrap();
+        assert_eq!(seal, RouteSeal::Open("synthetic-qwen35"));
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(
+            plan.entries[0].module(),
+            "gemm_mq4g256v2_residual_iu4_pm_v2b_gfx1151"
+        );
+        assert!(matches!(
+            &plan.entries[0],
+            PlannedKernel::Embedded { image, .. } if *image == v2b
+        ));
+
+        // The gfx1100 image recorded under a gfx1151 plan has no runtime image.
+        let plans = walked_fixture!(embedded_plan_text(
+            "gfx1151",
+            "gemm_mq4g256v2_residual_iu4_pm_gfx1100",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_GFX1100
+        ));
+        let input = synthetic_input(
+            "gfx1151",
+            &trunk_metas,
+            KernelSpecRoute::Ar,
+            &flags_1151,
+            &axes,
+        );
+        match walked_route_entries_in(plans, &input) {
+            Err(RegistryError::ConflictingPlan(why)) => {
+                assert!(why.contains("no runtime image"), "{why}")
+            }
+            other => panic!(
+                "expected a missing runtime image, got {:?}",
+                other.map(|p| p.map(|p| p.1))
+            ),
+        }
+
+        // A recorded SHA no image of the arch matches is refused, not guessed.
+        let plans = walked_fixture!(embedded_plan_text(
+            "gfx1100",
+            "gemm_mq4g256v2_residual_iu4_pm_gfx1100",
+            b"not an embedded image"
+        ));
+        let input = synthetic_input(
+            "gfx1100",
+            &trunk_metas,
+            KernelSpecRoute::Ar,
+            &flags_1100,
+            &axes,
+        );
+        assert!(matches!(
+            walked_route_entries_in(plans, &input),
+            Err(RegistryError::ConflictingPlan(_))
+        ));
+    }
+
+    #[test]
+    fn walked_arch_images_are_exact_arch_and_sha_unique() {
+        let archs = ["gfx1100", "gfx1151", "gfx1201"];
+        for arch in archs {
+            let images = walked_arch_images(arch);
+            assert!(!images.is_empty(), "{arch}");
+            let shas: Vec<String> = images
+                .iter()
+                .map(|image| format!("{:x}", Sha256::digest(image)))
+                .collect();
+            let unique: HashSet<&String> = shas.iter().collect();
+            assert_eq!(unique.len(), shas.len(), "{arch}: an image is listed twice");
+            for (image, sha) in images.iter().zip(&shas) {
+                assert_eq!(walked_arch_image(arch, sha), Some(*image), "{arch}");
+                for other in archs.into_iter().filter(|other| *other != arch) {
+                    assert!(
+                        walked_arch_image(other, sha).is_none(),
+                        "a {arch} image resolves under {other}"
+                    );
+                }
+            }
+        }
+        assert!(walked_arch_image("gfx906", "00").is_none());
+    }
+
+    #[test]
+    fn walked_plan_directives_reject_unknown_seal_routes_and_bad_heads() {
+        macro_rules! base {
+            () => {
+                "#! family f\n#! model_arch 5\n#! arch gfx1100\n#! layout a\n#! max_seq 1\n"
+            };
+        }
+        let plan = parse_walked_route_plan(concat!(
+            base!(),
+            "#! sealed ar native_mtp\n#! heads 24,4,256\n#! mtp_layout b\n"
+        ))
+        .unwrap();
+        assert_eq!(plan.sealed, ["ar", "native_mtp"]);
+        assert_eq!(plan.heads, Some((24, 4, 256)));
+        assert_eq!(plan.mtp_layout, Some("b"));
+        let plain = parse_walked_route_plan(base!()).unwrap();
+        assert!(plain.sealed.is_empty() && plain.heads.is_none() && plain.mtp_layout.is_none());
+        assert!(parse_walked_route_plan(concat!(base!(), "#! sealed turbo\n")).is_err());
+        assert!(parse_walked_route_plan(concat!(base!(), "#! heads 24,4\n")).is_err());
+        assert!(parse_walked_route_plan(concat!(base!(), "#! heads 24,x,256\n")).is_err());
     }
 }
