@@ -17,6 +17,8 @@ pub mod bundle;
 pub mod cache_quality;
 pub mod chunk_dump;
 pub mod config;
+/// Per-load default of the D2 CPU tier split (measured engine-rate selector).
+pub mod d2_default;
 pub mod ep;
 pub mod expert_keep;
 pub use expert_keep::{ExpertKeep, EXPERT_KEEP_METADATA_KEY, EXPERT_KEEP_SCHEMA};

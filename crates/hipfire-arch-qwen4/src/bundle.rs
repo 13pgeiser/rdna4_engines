@@ -1011,7 +1011,11 @@ impl Qwen4Bundle {
         Ok(None)
     }
 
-    /// Whether trunk routed experts use the D1 CPU splice or D2 tier split.
+    /// Whether every call of this load runs host arithmetic: the D1 CPU
+    /// splice, or a D2 split requested by the explicit `memory.offload_exec=cpu`
+    /// (the speculative-width caps key on this). A D2 split armed only by the
+    /// measured per-load default is per call and does not count; see
+    /// [`Self::split_layers`].
     pub fn has_cpu_deferred_experts(&self) -> bool {
         self.execution
             .as_ref()
@@ -1026,6 +1030,24 @@ impl Qwen4Bundle {
     /// Stable numerical identity of the frozen CPU split and expert hot set.
     pub fn split_digest(&self) -> Option<String> {
         self.execution.as_ref().and_then(Qwen4GpuForward::split_digest)
+    }
+
+    /// Owner kind (`"tier"` or `"whole-layer"`) of every armed D2 split layer,
+    /// as `(layer label, kind)` in layer order.
+    pub fn split_owner_kinds(&self) -> Vec<(usize, &'static str)> {
+        self.execution
+            .as_ref()
+            .map(Qwen4GpuForward::split_owner_kinds)
+            .unwrap_or_default()
+    }
+
+    /// Numerical identity of every armed CPU arithmetic mode (D1 and the D2
+    /// owner kinds); empty when none is armed.
+    pub fn host_exec_identity(&self) -> String {
+        self.execution
+            .as_ref()
+            .map(Qwen4GpuForward::host_exec_identity)
+            .unwrap_or_default()
     }
 
     /// Lab-only slot capture / serial-overlap controls. Off leaves production

@@ -2819,16 +2819,29 @@ fn load_qwen4_rank_scoped(
             ));
         }
     }
-    // The CPU splice (D1) and the hot-set tier split (D2) arm inside
-    // `attach_forward` (`memory.offload_exec=cpu`, any arch the hot set applies
-    // on), so the loaded placement is only known here; the native-MTP
-    // admission above is unchanged by it.
-    let split_layers = bundle.split_layers().len();
-    if split_layers > 0 {
+    // The CPU splice (D1) and the D2 split arm inside `attach_forward` (D1 and
+    // the tier split by `memory.offload_exec=cpu`, the split also by the
+    // per-load measured D2 default), so the loaded placement is only known
+    // here; the native-MTP admission above is unchanged by it.
+    let split_kinds = bundle.split_owner_kinds();
+    if !split_kinds.is_empty() {
+        let mut kinds = std::collections::BTreeMap::<&str, usize>::new();
+        for (_, kind) in &split_kinds {
+            *kinds.entry(kind).or_default() += 1;
+        }
+        let by_kind: Vec<String> = kinds.iter().map(|(kind, n)| format!("{n} {kind}")).collect();
+        let source = if bundle.has_cpu_deferred_experts() {
+            "offload_exec=cpu"
+        } else {
+            "measured D2 default"
+        };
         eprintln!(
-            "  qwen4 routed experts: CPU tier split armed on {split_layers} hot-set layers (offload_exec=cpu): decode and <=4-row verify run hot-set-cold experts on the CPU; wider prefill stays on PCIe"
+            "  qwen4 routed experts: CPU split (D2) armed on {} layers ({}; {source}): decode and <=4-row verify run their host-placed cold experts on the CPU; prefill and wider verify stay on PCIe",
+            split_kinds.len(),
+            by_kind.join(", ")
         );
     }
+    let split_layers = split_kinds.len();
     if bundle.has_cpu_deferred_experts() && split_layers == 0 {
         eprintln!(
             "  qwen4 routed experts: CPU splice armed (offload_exec=cpu): decode and <=4-row verify run host-placed experts on the CPU; wider prefill stays on PCIe"

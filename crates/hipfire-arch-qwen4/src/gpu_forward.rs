@@ -1260,10 +1260,12 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     /// Opt-in routed CPU splice, only for whole host-mapped trunk aggregates.
     pub(crate) cpu_deferred_experts: bool,
     cpu_expert_owners: Option<cpu_splice::CpuExpertOwners>,
-    /// D2 tier split (`memory.offload_exec=cpu` over an expert hot set, any
-    /// arch the loader admitted one on): the COLD experts' retained CPU spans.
-    /// Never set together with `cpu_deferred_experts` (distinct numerical mode).
-    cpu_tier_owners: Option<cpu_splice::CpuTierOwners>,
+    /// D2 split (the explicit `memory.offload_exec=cpu` over an expert hot
+    /// set, or the per-load default over a hot-set tier or an un-tiered
+    /// host-mapped aggregate): the COLD experts' retained CPU spans, one
+    /// [`cpu_splice::HostSpanOwner`] per layer. Never set together with
+    /// `cpu_deferred_experts` (distinct numerical mode).
+    cpu_cold_owners: Option<cpu_splice::HostSpanOwner>,
     /// The layer's preallocated split executor (masked route + slot storage),
     /// released through `free_gpu` only.
     cpu_split: Option<hipfire_dispatch::cpu_split::CpuSplitExecutor>,
@@ -1361,7 +1363,7 @@ impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
         let expert = self.experts.get(expert_idx)?;
         // Tier split: only cold (host-placed) experts resolve, from the
         // retained host owner's CPU address, never the device alias.
-        if let Some(owners) = self.cpu_tier_owners.as_ref() {
+        if let Some(owners) = self.cpu_cold_owners.as_ref() {
             return owners.payload(expert_idx, expert.gate_up.dtype, expert.down.dtype);
         }
         self.cpu_expert_owners.as_ref()?.payload(
@@ -1378,6 +1380,114 @@ impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
     fn tier_identity(&self) -> Option<&hipfire_dispatch::families::moe::ExpertTierIdentity> {
         self.tier_identity.as_ref()
     }
+}
+
+/// A layer's runtime seen through a window the D2 split must not serve: the
+/// same experts, tables and identity, but no split executor. The D2 executor
+/// gate keys on the row count alone, so the prefill-side caller binds this view
+/// instead of the runtime for any call that
+/// [`hipfire_dispatch::cpu_split::cpu_splice_window`] rejects.
+#[repr(transparent)]
+struct SplitlessExperts(Qwen4MoeLayerRuntime);
+
+impl RoutedExpertWeights for SplitlessExperts {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn get(&self, expert_idx: usize) -> Option<(WeightRef<'_>, WeightRef<'_>)> {
+        self.0.get(expert_idx)
+    }
+
+    fn immutable_identity(&self) -> Option<u64> {
+        self.0.immutable_identity()
+    }
+
+    fn host_mapped(&self) -> bool {
+        self.0.host_mapped()
+    }
+
+    fn cpu_splice_expert(
+        &self,
+        gpu: &Gpu,
+        expert_idx: usize,
+    ) -> Option<hipfire_dispatch::cpu_exec::CpuMoeExpert<'_>> {
+        self.0.cpu_splice_expert(gpu, expert_idx)
+    }
+
+    fn tier_identity(&self) -> Option<&hipfire_dispatch::families::moe::ExpertTierIdentity> {
+        self.0.tier_identity()
+    }
+
+    // Every other trait method is forwarded so the prefill binding is identical
+    // to the runtime's in every capability except the split executor.
+    fn host_mapped_projections(&self) -> (bool, bool) {
+        self.0.host_mapped_projections()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Qwen4MoeLayerRuntime {
+    /// The weights binding for a call: this runtime when the D2 split may serve
+    /// it (or none is attached), otherwise the executor-less view. `d2_phase`
+    /// is false inside a prefill tile (see [`d2_executor_admitted`]).
+    pub(crate) fn routed_view(
+        &self,
+        d2_phase: bool,
+        rows: usize,
+        route_rows: usize,
+    ) -> &dyn RoutedExpertWeights {
+        if d2_executor_admitted(self.cpu_split.is_some(), d2_phase, rows, route_rows) {
+            return self;
+        }
+        // The view must outlive the sealed step list that borrows it, so it
+        // cannot be a local wrapper (a per-forward arena of wrappers would be
+        // an avoidable allocation on the prefill path); a `#[repr(transparent)]`
+        // newtype makes the cast a no-op.
+        // SAFETY: `SplitlessExperts` is `#[repr(transparent)]` over
+        // `Qwen4MoeLayerRuntime`, so the two references have identical layout,
+        // alignment and validity, and the view borrows `self` for its lifetime.
+        unsafe { &*(self as *const Self as *const SplitlessExperts) }
+    }
+}
+
+/// Whether a layer's D2 executor is bound for one MoE call: always when no
+/// executor is attached (nothing to withhold), otherwise only in a non-prefill
+/// phase (decode, verify; `d2_phase`) **and** for a window of at most the
+/// narrow cap whose real rows are the whole routing window
+/// ([`hipfire_dispatch::cpu_split::cpu_splice_window`]). A prompt of 1..=4
+/// rows inside a prefill tile, a 1..=4-row tail of a long prefill and every
+/// wider window take the GPU route.
+fn d2_executor_admitted(has_split: bool, d2_phase: bool, rows: usize, route_rows: usize) -> bool {
+    !has_split
+        || (d2_phase && hipfire_dispatch::cpu_split::cpu_splice_window(true, rows, route_rows))
+}
+
+/// Whether a load runs host arithmetic on **every** call: a D1 whole-layer
+/// splice layer, or a D2 split requested by the explicit
+/// `memory.offload_exec=cpu`. Only such a load caps speculative width (verify,
+/// replay, MTP `k`, n-gram take, lane verify) and needs eager HIP for the whole
+/// forward. The per-load measured D2 default is not load-wide: it executes per
+/// call ([`host_arith_call`]), so an automatic-only load keeps every width and
+/// eager rule of an unarmed load.
+const fn host_arith_every_call(d1: bool, has_split: bool, split_explicit: bool) -> bool {
+    d1 || (has_split && split_explicit)
+}
+
+/// Whether one call runs host arithmetic: `every_call` (a load
+/// [`host_arith_every_call`] holds for), or an armed D2 split (`has_split`) on
+/// a whole narrow non-prefill window ([`d2_executor_admitted`]).
+fn host_arith_call(
+    every_call: bool,
+    has_split: bool,
+    prefill: bool,
+    rows: usize,
+    route_rows: usize,
+) -> bool {
+    every_call || (has_split && d2_executor_admitted(true, !prefill, rows, route_rows))
 }
 
 /// Gather buffers one EP rank owns: parity `L % 2` over the trunk layers and
@@ -2410,6 +2520,7 @@ impl Qwen4MoeLayerRuntime {
         moe: &MoeWeights,
         layer_label: usize,
         config: &Qwen4Config,
+        d2_default: bool,
     ) -> Result<Self, Qwen4GpuForwardError> {
         Self::build(
             gpu,
@@ -2420,6 +2531,7 @@ impl Qwen4MoeLayerRuntime {
             Qwen4ExpertTableLayout::Single,
             None,
             true,
+            d2_default,
         )
     }
 
@@ -2439,6 +2551,7 @@ impl Qwen4MoeLayerRuntime {
             config,
             Qwen4ExpertTableLayout::Single,
             None,
+            false,
             false,
         )
     }
@@ -2471,6 +2584,7 @@ impl Qwen4MoeLayerRuntime {
             },
             Some(dummy),
             true,
+            false,
         )
     }
 
@@ -2498,6 +2612,7 @@ impl Qwen4MoeLayerRuntime {
             },
             None,
             true,
+            false,
         )
     }
 
@@ -2514,6 +2629,7 @@ impl Qwen4MoeLayerRuntime {
         layout: Qwen4ExpertTableLayout<'_>,
         dummy: Option<&Qwen4EpDummyExpert>,
         allow_tiers: bool,
+        d2_default: bool,
     ) -> Result<Self, Qwen4GpuForwardError> {
         let router_source = weights.resident(&moe.gate)?;
         let scalar_source = weights.resident(&moe.shared_gate_scalar)?;
@@ -3032,37 +3148,54 @@ impl Qwen4MoeLayerRuntime {
             })
             .flatten();
         let cpu_deferred_experts = cpu_expert_owners.is_some();
-        // D2 tier split: its own admission, distinct from the whole-layer D1
-        // splice above (which never arms on a tier layer). Only
-        // `memory.offload_exec=cpu` requests it (passback keeps D1 behaviour).
-        // It has no arch gate: it arms on any tier plan the loader admitted
-        // (`expert_hotset::hotset_arch_admits`: default sidecar on gfx1201
-        // only, an explicit sidecar path on any arch), and every route it has
-        // no masked ids or cold-slot installation for is refused below with
-        // one line.
+        // D2 split: its own admission, distinct from the whole-layer D1
+        // splice above, whose layers it never shares (one layer never carries
+        // both numerical modes). A hot-set tier layer is requested by
+        // `memory.offload_exec=cpu` (passback keeps D1 behaviour) or by this
+        // load's per-load default ([`crate::d2_default`]); an un-tiered
+        // host-mapped aggregate layer only by that default (the explicit `cpu`
+        // mode keeps D1 there, unchanged). The default never reaches D1 or the
+        // process-wide mode. It has no arch gate: a tier arms on any plan the
+        // loader admitted (`expert_hotset::hotset_arch_admits`: default sidecar
+        // on gfx1201 only, an explicit sidecar path on any arch), and every
+        // route it has no masked ids or cold-slot installation for is refused
+        // below with one line.
+        let explicit_cpu_split = hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
+            && !hipfire_dispatch::cpu_exec::passback_enabled();
+        let whole_layer = tier_layer.is_none()
+            && !cpu_deferred_experts
+            && local_host_mapped
+            && down_source.buf.is_host_mapped();
+        let split_kind = match tier_layer.as_ref() {
+            Some(_) => Some(cpu_splice::SplitOwnerKind::Tier),
+            None => whole_layer.then_some(cpu_splice::SplitOwnerKind::WholeLayer),
+        };
         let split_admission = cpu_splice::CpuSplitAdmission {
-            enabled: hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
-                && !hipfire_dispatch::cpu_exec::passback_enabled()
-                && allow_tiers
+            enabled: (if tier_layer.is_some() {
+                explicit_cpu_split || d2_default
+            } else {
+                d2_default
+            }) && allow_tiers
                 && layer_label < config.num_hidden_layers
                 && kept_ids.is_none(),
-            tier: tier_layer.is_some(),
+            kind: split_kind,
             bound_hotset: tier_layer
                 .as_ref()
                 .is_some_and(|view| view.lease().hotset_sidecar_sha256().is_some()),
-            host_experts: tier_layer.as_ref().map_or(0, |view| {
-                (0..config.num_experts)
+            host_experts: match tier_layer.as_ref() {
+                Some(view) => (0..config.num_experts)
                     .filter(|&eid| {
                         view.placement(eid) == Some(crate::expert_tier_plan::Placement::HostMapped)
                     })
-                    .count()
-            }),
+                    .count(),
+                None if whole_layer => config.num_experts,
+                None => 0,
+            },
             flash_next: config.profile.is_flash_next(),
-            uniform_qt44_qt53: experts.iter().all(|expert| {
+            cpu_executed: experts.iter().all(|expert| {
                 expert.gate_up.dtype == DType::MQ4G256V2 && expert.down.dtype == DType::MQ4G128V2
             }),
             ep: cpu_admission.ep,
-            slab: false,
             awq: cpu_admission.awq,
             fp8: fp8_tables.is_some(),
             narrow_stage: expert_stage_takes_narrow_windows(
@@ -3076,46 +3209,47 @@ impl Qwen4MoeLayerRuntime {
         if let Some(refusal) = split_admission.refusal() {
             cpu_splice::log_split_refusal_once(refusal, &gpu.arch);
         }
-        let cpu_tier_owners = split_admission
-            .armed()
-            .then_some(tier_layer.as_ref())
-            .flatten()
-            .and_then(|view| {
-                match cpu_splice::CpuTierOwners::new(
+        // The owner is a set of borrowed views over memory the loader already
+        // owns (the tier's pinned host owner, or the aggregate allocations'
+        // pinned bytes): no expert is copied or allocated a second time.
+        let cpu_cold_owners = if split_admission.armed() {
+            let owners = match tier_layer.as_ref() {
+                Some(view) => cpu_splice::CpuTierOwners::new(
                     &view.lease(),
                     view.layer(),
                     config.num_experts,
                     gate_up_expert_bytes,
                     down_expert_bytes,
-                ) {
-                    Ok(owners) => Some(owners),
-                    Err(why) => {
-                        eprintln!(
-                            "  [moe-cpu-split] qwen4 layer {layer_label}: {why}; this layer \
-                             falls back to the PCIe mapped-expert read"
-                        );
-                        None
-                    }
+                )
+                .map(cpu_splice::HostSpanOwner::Tier),
+                None => cpu_splice::CpuExpertOwners::new(
+                    gpu,
+                    gate_up_source,
+                    down_source,
+                    config.num_experts,
+                    gate_up_expert_bytes,
+                    down_expert_bytes,
+                )
+                .map(cpu_splice::HostSpanOwner::WholeLayer)
+                .ok_or_else(|| {
+                    "the aggregate expert allocations have no resolvable pinned host bytes"
+                        .to_owned()
+                }),
+            };
+            match owners {
+                Ok(owners) => Some(owners),
+                Err(why) => {
+                    eprintln!(
+                        "  [moe-cpu-split] qwen4 layer {layer_label}: {why}; this layer \
+                         falls back to the PCIe mapped-expert read"
+                    );
+                    None
                 }
-            });
-        let split_placement: Vec<u8> = if cpu_tier_owners.is_some() {
-            tier_layer
-                .as_ref()
-                .map(|view| {
-                    (0..config.num_experts)
-                        .map(|eid| {
-                            u8::from(
-                                view.placement(eid)
-                                    == Some(crate::expert_tier_plan::Placement::HostMapped),
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
+            }
         } else {
-            Vec::new()
+            None
         };
-        let mut runtime = Self {
+        let runtime = Self {
             table,
             cache,
             router,
@@ -3135,7 +3269,7 @@ impl Qwen4MoeLayerRuntime {
             host_mapped: local_host_mapped,
             cpu_deferred_experts,
             cpu_expert_owners,
-            cpu_tier_owners,
+            cpu_cold_owners,
             cpu_split: None,
             tier: tier_layer.as_ref().map(|view| view.lease()),
             tier_identity,
@@ -3155,28 +3289,48 @@ impl Qwen4MoeLayerRuntime {
         .seal_retained_identities()?;
         // The executor owns device storage, so it is created last: nothing
         // after it can fail and strand it.
-        if runtime.cpu_tier_owners.is_some() {
-            match hipfire_dispatch::cpu_split::CpuSplitExecutor::new(
-                gpu,
-                config.hidden_size,
-                config.moe_intermediate_size,
-                config.num_experts_per_tok,
-                hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS,
-                &split_placement,
-            ) {
-                Ok(executor) => runtime.cpu_split = Some(executor),
-                Err(error) => {
-                    let cleanup = runtime
-                        .free_gpu(gpu)
-                        .map(|free| format!("; release also failed: {free:?}"))
-                        .unwrap_or_default();
-                    return Err(Qwen4GpuForwardError::Dispatch(format!(
-                        "layer {layer_label} CPU split executor: {error:?}{cleanup}"
-                    )));
-                }
+        runtime.attach_cpu_split(gpu, config)
+    }
+
+    /// Create the layer's D2 split executor from its cold-expert owner's
+    /// ownership mask (`None` owner: nothing to attach). The executor owns
+    /// device storage, so this is the last fallible step of a layer build and a
+    /// failure releases the whole layer.
+    fn attach_cpu_split(
+        mut self,
+        gpu: &mut Gpu,
+        config: &Qwen4Config,
+    ) -> Result<Self, Qwen4GpuForwardError> {
+        let Some(placement) = self
+            .cpu_cold_owners
+            .as_ref()
+            .map(|owners| owners.placement())
+        else {
+            return Ok(self);
+        };
+        match hipfire_dispatch::cpu_split::CpuSplitExecutor::new(
+            gpu,
+            config.hidden_size,
+            config.moe_intermediate_size,
+            config.num_experts_per_tok,
+            hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS,
+            &placement,
+        ) {
+            Ok(executor) => {
+                self.cpu_split = Some(executor);
+                Ok(self)
+            }
+            Err(error) => {
+                let label = self.label;
+                let cleanup = self
+                    .free_gpu(gpu)
+                    .map(|free| format!("; release also failed: {free:?}"))
+                    .unwrap_or_default();
+                Err(Qwen4GpuForwardError::Dispatch(format!(
+                    "layer {label} CPU split executor: {error:?}{cleanup}"
+                )))
             }
         }
-        Ok(runtime)
     }
 
     /// Single-device runtime of a trunk layer of an expert-slab artifact: every
@@ -3481,7 +3635,7 @@ impl Qwen4MoeLayerRuntime {
             host_mapped,
             cpu_deferred_experts: false,
             cpu_expert_owners: None,
-            cpu_tier_owners: None,
+            cpu_cold_owners: None,
             cpu_split: None,
             tier: None,
             tier_identity: None,
@@ -5882,6 +6036,10 @@ pub struct Qwen4GpuForward {
     /// Trunk layers armed for the D2 tier split (a distinct numerical mode:
     /// never counted in `cpu_deferred_experts`).
     cpu_split_layers: usize,
+    /// The D2 split was requested by an explicit `memory.offload_exec=cpu`
+    /// (width caps and eager rules for the whole forward), not by the
+    /// per-load measured default (which affects only the calls that execute it).
+    cpu_split_explicit: bool,
     expert_stage: Option<Qwen4ExpertStage>,
     /// Expert-parallel state (`Some` iff the bundle's weights carry an EP
     /// placement): the zero dummy expert, the full per-layer tables for chunk
@@ -6373,19 +6531,71 @@ fn populate_moe_runtimes<T, E>(
 }
 
 impl Qwen4GpuForward {
-    /// Whether any CPU numerical mode is armed: the D1 whole-layer splice or
-    /// the D2 tier split. Admission (row cap, eager, replay/capture refusal,
-    /// speculative width) keys on this; the D1-only per-layer flag stays
+    /// Whether host arithmetic runs on every call of this load (the D1
+    /// whole-layer splice, or an explicit-mode D2 split;
+    /// [`host_arith_every_call`]). Load-wide admission (row cap, eager,
+    /// replay/capture refusal, speculative width) keys on this; the
+    /// automatic D2 default does not, it is per call
+    /// ([`Self::call_executes_host_arith`]). The D1-only per-layer flag stays
     /// `Qwen4MoeLayerRuntime::cpu_deferred_experts`.
     pub(crate) fn has_cpu_deferred_experts(&self) -> bool {
-        self.cpu_deferred_experts || self.cpu_split_layers > 0
+        host_arith_every_call(
+            self.cpu_deferred_experts,
+            self.cpu_split_layers > 0,
+            self.cpu_split_explicit,
+        )
     }
-    /// Trunk layers armed for the D2 tier split, in layer order.
+    /// Whether a call of `rows` rows over `route_rows` routing rows in the
+    /// given phase executes host arithmetic ([`host_arith_call`]).
+    pub(crate) fn call_executes_host_arith(
+        &self,
+        prefill: bool,
+        rows: usize,
+        route_rows: usize,
+    ) -> bool {
+        host_arith_call(
+            self.has_cpu_deferred_experts(),
+            self.cpu_split_layers > 0,
+            prefill,
+            rows,
+            route_rows,
+        )
+    }
+    /// Trunk layers armed for the D2 split (any owner kind), in layer order.
     pub(crate) fn split_layers(&self) -> Vec<usize> {
         self.moe
             .iter()
             .flatten()
             .filter(|layer| layer.cpu_split.is_some())
+            .map(|layer| layer.label)
+            .collect()
+    }
+    /// The D2 owner kind of every armed split layer, in layer order.
+    pub(crate) fn split_owner_kinds(&self) -> Vec<(usize, &'static str)> {
+        self.moe
+            .iter()
+            .flatten()
+            .filter(|layer| layer.cpu_split.is_some())
+            .filter_map(|layer| {
+                layer
+                    .cpu_cold_owners
+                    .as_ref()
+                    .map(|owners| (layer.label, owners.kind().label()))
+            })
+            .collect()
+    }
+    /// Layers armed for the D2 split through one owner kind.
+    fn split_layers_of(&self, kind: cpu_splice::SplitOwnerKind) -> Vec<usize> {
+        self.moe
+            .iter()
+            .flatten()
+            .filter(|layer| {
+                layer.cpu_split.is_some()
+                    && layer
+                        .cpu_cold_owners
+                        .as_ref()
+                        .is_some_and(|owners| owners.kind() == kind)
+            })
             .map(|layer| layer.label)
             .collect()
     }
@@ -6401,10 +6611,13 @@ impl Qwen4GpuForward {
     ///
     /// `cpu-all-v1/<bitmap>` names the D1 layers; `cpu-tier-split-v1/<tier
     /// logical digest>/<bitmap>/hotset-sha256=<sidecar sha | unbound>` the D2
-    /// layers; both join with `+`. Bitmaps are hex with bit `i` = layer label
-    /// `i` over the layers that actually armed. Thread count and scheduling
-    /// are not part of it: they change timing, never arithmetic order.
+    /// tier layers and `cpu-whole-split-v1/<bitmap>` the D2 un-tiered
+    /// whole-layer host aggregates; the parts join with `+`. Bitmaps are hex
+    /// with bit `i` = layer label `i` over the layers that actually armed.
+    /// Thread count and scheduling are not part of it: they change timing,
+    /// never arithmetic order.
     pub(crate) fn host_exec_identity(&self) -> String {
+        use cpu_splice::SplitOwnerKind::{Tier, WholeLayer};
         let cpu_all: Vec<usize> = self
             .moe
             .iter()
@@ -6412,12 +6625,13 @@ impl Qwen4GpuForward {
             .filter(|layer| layer.cpu_deferred_experts)
             .map(|layer| layer.label)
             .collect();
-        let split: Vec<usize> = self.split_layers();
+        let tier_split = self.split_layers_of(Tier);
+        let whole_split = self.split_layers_of(WholeLayer);
         let tier = self
             .moe
             .iter()
             .flatten()
-            .find(|layer| layer.cpu_split.is_some())
+            .find(|layer| layer.cpu_split.is_some() && layer.tier.is_some())
             .and_then(|layer| layer.tier.as_ref())
             .map(|lease| {
                 (
@@ -6427,8 +6641,9 @@ impl Qwen4GpuForward {
             });
         cpu_splice::host_exec_identity(
             &cpu_all,
-            &split,
-            tier.as_ref().map(|(digest, sidecar)| (digest, sidecar.as_deref())),
+            &[(Tier, &tier_split), (WholeLayer, &whole_split)],
+            tier.as_ref()
+                .map(|(digest, sidecar)| (digest, sidecar.as_deref())),
         )
     }
     /// Configure the D2 parity/timing hooks of every armed layer (lab only).
@@ -6463,8 +6678,15 @@ impl Qwen4GpuForward {
         all.sort_by_key(|(call, label, _)| (*call, *label));
         all.into_iter().map(|(_, _, record)| record).collect()
     }
-    pub(crate) fn ensure_cpu_splice_eager(&self, gpu: &Gpu) -> Result<(), Qwen4GpuForwardError> {
-        if !self.has_cpu_deferred_experts() {
+    pub(crate) fn ensure_cpu_splice_eager(
+        &self,
+        gpu: &Gpu,
+        d2_call: bool,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        // An automatic (default) D2 split asks for eager HIP only for the calls
+        // that execute it (`d2_call`); explicit-mode and D1 loads keep the
+        // whole-forward requirement.
+        if !self.has_cpu_deferred_experts() && !(self.cpu_split_layers > 0 && d2_call) {
             return Ok(());
         }
         let stream_capture = match gpu.active_stream.as_ref() {
@@ -6571,6 +6793,11 @@ impl Qwen4GpuForward {
         #[cfg(target_os = "linux")]
         let mut npu_trunk = None;
         let result = (|| {
+            // The D2 default is decided per load, before any layer admission
+            // reads it and before stage buffers take VRAM or host memory; it
+            // never touches the process-wide host-exec mode.
+            let d2_default =
+                crate::d2_default::resolve(gpu, &bundle.weights, &bundle.config, single_scope);
             if let Some(placement) = bundle.weights.ep_placement() {
                 let state = ep.insert(Qwen4ForwardEp::new(gpu, &bundle.config, placement)?);
                 populate_moe_runtimes(&mut moe, &bundle.weights.layer_refs, |layer, weights| {
@@ -6592,6 +6819,7 @@ impl Qwen4GpuForward {
                         weights,
                         layer,
                         &bundle.config,
+                        d2_default,
                     )
                 })?;
             }
@@ -6608,34 +6836,41 @@ impl Qwen4GpuForward {
                 .flatten()
                 .filter(|layer| layer.cpu_deferred_experts)
                 .count();
-            // D2 tier split: a distinct numerical mode on hot-set layers.
+            // D2 split: a distinct numerical mode, per owner kind.
             let split_layers = moe
                 .iter()
                 .flatten()
                 .filter(|layer| layer.cpu_split.is_some())
+                .count();
+            let tier_split_layers = moe
+                .iter()
+                .flatten()
+                .filter(|layer| layer.cpu_split.is_some() && layer.tier.is_some())
                 .count();
             let tier_layers = moe
                 .iter()
                 .flatten()
                 .filter(|layer| layer.tier.is_some())
                 .count();
-            if hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
+            if (hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
                 && !hipfire_dispatch::cpu_exec::passback_enabled()
+                || d2_default)
                 && tier_layers > 0
             {
                 let cold: usize = moe
                     .iter()
                     .flatten()
-                    .filter_map(|layer| layer.cpu_tier_owners.as_ref())
-                    .map(cpu_splice::CpuTierOwners::cold_experts)
+                    .filter_map(|layer| layer.cpu_cold_owners.as_ref())
+                    .filter(|owners| owners.kind() == cpu_splice::SplitOwnerKind::Tier)
+                    .map(cpu_splice::HostSpanOwner::cold_experts)
                     .sum();
-                let slots = split_layers * bundle.config.num_experts;
+                let slots = tier_split_layers * bundle.config.num_experts;
                 // The same frozen plan hash scopes host_exec_identity/split_digest.
                 // Report the assignment, not merely its hot/cold slot counts.
                 let partition_digest = moe
                     .iter()
                     .flatten()
-                    .find(|layer| layer.cpu_split.is_some())
+                    .find(|layer| layer.cpu_split.is_some() && layer.tier.is_some())
                     .and_then(|layer| layer.tier.as_ref())
                     .map(|lease| {
                         let mut hex = String::with_capacity(64);
@@ -6647,8 +6882,29 @@ impl Qwen4GpuForward {
                     })
                     .unwrap_or_else(|| "unarmed".to_owned());
                 eprintln!(
-                    "  [moe-cpu-split] qwen4: {split_layers}/{tier_layers} hot-set layers armed for the CPU tier split (static slot placement across armed layers: {} hot / {cold} cold expert slots of {slots}; dynamic per-token route hot/cold counts are reported by the executor); {} CPU worker threads; eager HIP for decode and <=4-row verify and replay, wide prefill keeps PCIe; layers whose host spans could not be resolved stay on PCIe; partition_digest={partition_digest}",
+                    "  [moe-cpu-split] qwen4: {tier_split_layers}/{tier_layers} hot-set layers armed for the CPU tier split (static slot placement across armed layers: {} hot / {cold} cold expert slots of {slots}; dynamic per-token route hot/cold counts are reported by the executor); {} CPU worker threads; eager HIP for decode and <=4-row verify and replay, wide prefill keeps PCIe; layers whose host spans could not be resolved stay on PCIe; partition_digest={partition_digest}",
                     slots - cold,
+                    hipfire_dispatch::cpu_exec::splice_pool_threads()
+                );
+            }
+            let whole_labels: Vec<usize> = moe
+                .iter()
+                .flatten()
+                .filter(|layer| layer.cpu_split.is_some() && layer.tier.is_none())
+                .map(|layer| layer.label)
+                .collect();
+            if !whole_labels.is_empty() {
+                let cold: usize = moe
+                    .iter()
+                    .flatten()
+                    .filter_map(|layer| layer.cpu_cold_owners.as_ref())
+                    .filter(|owners| owners.kind() == cpu_splice::SplitOwnerKind::WholeLayer)
+                    .map(cpu_splice::HostSpanOwner::cold_experts)
+                    .sum();
+                eprintln!(
+                    "  [moe-cpu-split] qwen4: {} whole-layer host aggregate layers armed for the CPU split (cpu-whole-split-v1/{}; every host-placed expert is cold: {cold} expert slots; decode and <=4-row verify of those experts run on the CPU); {} CPU worker threads; eager HIP for decode and <=4-row verify and replay, wide prefill keeps PCIe, placement and host allocations are unchanged; layers whose host spans could not be resolved stay on PCIe",
+                    whole_labels.len(),
+                    cpu_splice::layer_bitmap_hex(&whole_labels),
                     hipfire_dispatch::cpu_exec::splice_pool_threads()
                 );
             }
@@ -6684,7 +6940,7 @@ impl Qwen4GpuForward {
                 // A CPU splice is a host synchronization boundary, absent from
                 // a retained tape. Auto replay is disabled before publication.
                 gpu.replay.poison(
-                    "qwen4 CPU routed experts require eager HIP (memory.offload_exec=cpu|passback)",
+                    "qwen4 CPU routed experts require eager HIP (memory.offload_exec=cpu|passback or the measured D2 default)",
                 );
                 hipfire_dispatch::cpu_exec::log_capture_disabled_once();
             }
@@ -6977,6 +7233,8 @@ impl Qwen4GpuForward {
                 .flatten()
                 .filter(|layer| layer.cpu_split.is_some())
                 .count(),
+            cpu_split_explicit: hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
+                && !hipfire_dispatch::cpu_exec::passback_enabled(),
             moe,
             decode_q8,
             route_trace,
@@ -8526,10 +8784,18 @@ impl Qwen4GpuForward {
         wide_hidden_capture: Option<&GpuTensor>,
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
-        self.ensure_cpu_splice_eager(gpu)?;
-        // Either CPU numerical mode (D1 whole-layer or D2 tier split) is host
-        // synchronous: never a retained body.
-        let cpu_deferred_experts = self.has_cpu_deferred_experts();
+        // Host arithmetic is host synchronous: never a retained body, and an
+        // eager forward. D1 and an explicit-mode D2 hold for the whole forward;
+        // the automatic default's D2 only for the calls that execute it (a real
+        // narrow non-prefill window), so wide verify and prefill keep their
+        // old graph/replay behaviour.
+        let host_arith_call = self.call_executes_host_arith(
+            self.prefill_scope,
+            tokens.len(),
+            gpu.route_rows(tokens.len()),
+        );
+        self.ensure_cpu_splice_eager(gpu, host_arith_call)?;
+        let cpu_deferred_experts = host_arith_call;
         let ple_lookahead = std::mem::take(&mut self.ple_lookahead);
         if argmax_of.is_some() && tokens.len() != 1 {
             return Err(invalid("an argmax-token Qwen4 forward carries one token"));
@@ -9237,10 +9503,19 @@ impl Qwen4GpuForward {
 
             match &description.ffn {
                 Qwen4FfnBinding::Moe(moe) => {
+                    // The D2 executor gate (`cpu_split_executor`) sees only the
+                    // row count, so a call whose real rows are not its whole
+                    // routing window (a 1..=4-row tail of a long prefill) or
+                    // that is wider than the narrow cap is bound to a view of
+                    // this layer's runtime with no executor.
+                    let mut moe = *moe;
+                    if let Some(runtime) = self.moe.get(layer_index).and_then(Option::as_ref) {
+                        moe.routed_experts = runtime.routed_view(!self.prefill_scope, n, route_n);
+                    }
                     let sealed = crate::program::seal_moe_for_layer(
                         &ctx,
                         dims,
-                        *moe,
+                        moe,
                         ep_scratches.as_ref().map_or(&scratch_desc, |parity| {
                             &parity[qwen4_ep_buffer_index(layer_index, config.num_hidden_layers)]
                         }),
@@ -11084,6 +11359,239 @@ mod tests {
             for rows in ["2", "3", "4"] {
                 assert!(narrow(arch, true, Some(rows)), "{arch} {rows}");
                 assert!(!narrow(arch, false, Some(rows)), "{arch} {rows} stage off");
+            }
+        }
+    }
+
+    /// The decision `routed_view` applies, over every phase and window: the D2
+    /// executor is bound only outside a prefill tile and only for a window of
+    /// at most the narrow cap whose real rows are the whole routing window.
+    #[test]
+    fn d2_executor_is_admitted_only_outside_prefill_and_for_whole_narrow_windows() {
+        use super::d2_executor_admitted as admitted;
+        let chunk = 8192;
+        for has_split in [false, true] {
+            // Decode (1 row) and a <=4-row verify, outside a prefill tile.
+            for rows in 1..=4 {
+                assert!(admitted(has_split, true, rows, rows), "verify rows={rows}");
+                // The same <=4-row window INSIDE a prefill tile (a short prompt
+                // whose routing window equals its rows) never takes D2.
+                assert_eq!(
+                    admitted(has_split, false, rows, rows),
+                    !has_split,
+                    "prefill-phase rows={rows}"
+                );
+                // A 1..=4-row tail of a long prefill: routing window is the chunk.
+                assert_eq!(
+                    admitted(has_split, true, rows, chunk),
+                    !has_split,
+                    "tail rows={rows}"
+                );
+            }
+            // Wide windows never take D2, in either phase.
+            for rows in [5, 8, 768, chunk] {
+                assert_eq!(
+                    admitted(has_split, true, rows, rows),
+                    !has_split,
+                    "wide rows={rows}"
+                );
+                assert_eq!(
+                    admitted(has_split, false, rows, rows),
+                    !has_split,
+                    "wide prefill rows={rows}"
+                );
+            }
+        }
+    }
+
+    /// Which calls of a load run host arithmetic (and so need eager HIP): D1
+    /// and an explicit-mode D2 on every call, the automatic default's D2 only
+    /// on a whole narrow non-prefill window — so wide verify and every prefill
+    /// call (tails, short prompts) keep their old graph and replay behaviour.
+    /// The load-wide part is composed exactly as the forward composes it.
+    #[test]
+    fn automatic_d2_asks_for_eager_only_on_the_calls_that_execute_it() {
+        use super::{host_arith_call, host_arith_every_call};
+        // (d1, has_split, split_explicit) as `Qwen4GpuForward` holds them.
+        let call = |d1, has_split, explicit, prefill, rows, route| {
+            host_arith_call(
+                host_arith_every_call(d1, has_split, explicit),
+                has_split,
+                prefill,
+                rows,
+                route,
+            )
+        };
+        let chunk = 8192;
+        for prefill in [false, true] {
+            for explicit in [false, true] {
+                assert!(
+                    !call(false, false, explicit, prefill, 1, 1),
+                    "nothing armed"
+                );
+            }
+        }
+        // D1 and explicit-mode D2: every call, as before.
+        for (prefill, rows, route) in [
+            (false, 1, 1),
+            (false, 8, 8),
+            (true, 512, chunk),
+            (true, 3, chunk),
+        ] {
+            assert!(
+                call(false, true, true, prefill, rows, route),
+                "explicit {prefill} {rows}"
+            );
+            assert!(
+                call(true, false, false, prefill, rows, route),
+                "D1 {prefill} {rows}"
+            );
+            assert!(
+                call(true, false, true, prefill, rows, route),
+                "D1 {prefill} {rows}"
+            );
+        }
+        // Automatic D2: decode and <=4-row verify only.
+        for rows in 1..=4 {
+            assert!(
+                call(false, true, false, false, rows, rows),
+                "verify rows={rows}"
+            );
+            assert!(
+                !call(false, true, false, true, rows, rows),
+                "short prompt rows={rows}"
+            );
+            assert!(
+                !call(false, true, false, true, rows, chunk),
+                "prefill tail rows={rows}"
+            );
+        }
+        for rows in [5, 8, 768, chunk] {
+            assert!(
+                !call(false, true, false, false, rows, rows),
+                "wide verify rows={rows}"
+            );
+            assert!(
+                !call(false, true, false, true, rows, rows),
+                "wide prefill rows={rows}"
+            );
+        }
+    }
+
+    /// Speculative width with the automatic D2 default armed is the unarmed
+    /// load's: only a load-wide arm (D1, explicit-mode D2) reaches the 4-row
+    /// caps — `spec_verify_rows_cap` (MTP verify/replay), the bundle's and the
+    /// lanes' 4-row verify refusals, `guarded_wide_verify_rows`'s narrow return
+    /// and the loader's MTP `k` clamp all key on `has_cpu_deferred_experts`,
+    /// which is `host_arith_every_call` of the load. So a wide MTP / n-gram
+    /// verify of an automatic-D2 load runs the unarmed GPU route at the
+    /// unarmed width ([`host_arith_call`] is false for it, so the executor-less
+    /// view is bound and no eager rule is added).
+    #[test]
+    fn automatic_d2_keeps_the_unarmed_speculative_width() {
+        use super::{host_arith_call, host_arith_every_call};
+        use crate::mtp_spec::spec_verify_rows_cap;
+        use crate::program::QWEN4_CPU_SPLICE_MAX_ROWS;
+        let unarmed = host_arith_every_call(false, false, false);
+        let automatic = host_arith_every_call(false, true, false);
+        assert!(!unarmed && !automatic);
+        assert_eq!(
+            spec_verify_rows_cap(automatic),
+            spec_verify_rows_cap(unarmed)
+        );
+        assert_eq!(spec_verify_rows_cap(automatic), usize::MAX);
+        for load_wide in [
+            host_arith_every_call(false, true, true),
+            host_arith_every_call(true, false, false),
+            host_arith_every_call(true, true, true),
+        ] {
+            assert!(load_wide);
+            assert_eq!(spec_verify_rows_cap(load_wide), QWEN4_CPU_SPLICE_MAX_ROWS);
+        }
+        assert_eq!(
+            super::cpu_splice::NARROW_VERIFY_MAX_ROWS,
+            QWEN4_CPU_SPLICE_MAX_ROWS
+        );
+        // Every verify wider than the cap, up to the widest lane/row-exact
+        // verify, runs no host arithmetic on the automatic load.
+        let widest = crate::gpu_forward_lanes::LANE_MAX_ROWS.max(16);
+        for rows in QWEN4_CPU_SPLICE_MAX_ROWS + 1..=widest {
+            assert!(
+                !host_arith_call(automatic, true, false, rows, rows),
+                "rows={rows}"
+            );
+        }
+    }
+
+    /// The narrow-link gfx1100 (XTX-class) fixture: arming the D2 split, by the
+    /// explicit mode or by the per-load default, changes no prefill decision.
+    /// Every input here is the real production function: the chunk default, the
+    /// stage threshold, the stage-vs-split narrow-window conflict, the D2 layer
+    /// admission and the shared splice-window predicate.
+    #[test]
+    fn xtx_prefill_phase_is_identical_with_d2_armed_or_not() {
+        use super::cpu_splice::{CpuSplitAdmission, SplitOwnerKind, SplitRefusal};
+        use crate::host_link::HostLink::Discrete;
+        use hipfire_dispatch::cpu_split::{cpu_splice_window, CPU_SPLIT_MAX_ROWS};
+
+        let link = Discrete { gbps: 12.0 };
+        let narrow = link.is_narrow_discrete();
+        assert!(narrow);
+        let chunk = super::qwen4_prefill_chunk_default("gfx1100", || link);
+        assert_eq!(chunk, 8192, "the narrow-link 8192-row prefill chunk");
+        let (min_rows, _) = super::resolve_expert_stage_min_rows("gfx1100", chunk, narrow, None);
+        assert_eq!(min_rows, 768);
+        // Stage keeps taking full-chunk windows while D2 only takes <= 4 rows:
+        // the two never meet (D2's narrow-window refusal stays off).
+        assert!(min_rows > CPU_SPLIT_MAX_ROWS && min_rows <= chunk);
+        let narrow_stage = super::expert_stage_takes_narrow_windows("gfx1100", true, None);
+        assert!(!narrow_stage);
+
+        for kind in [SplitOwnerKind::Tier, SplitOwnerKind::WholeLayer] {
+            for d2 in [false, true] {
+                let admission = CpuSplitAdmission {
+                    enabled: d2,
+                    kind: Some(kind),
+                    bound_hotset: kind == SplitOwnerKind::Tier,
+                    host_experts: 100,
+                    flash_next: true,
+                    cpu_executed: true,
+                    narrow_stage,
+                    ..CpuSplitAdmission::default()
+                };
+                assert_eq!(admission.armed(), d2, "{kind:?}");
+                if !d2 {
+                    assert_eq!(admission.refusal(), Some(SplitRefusal::NotRequested));
+                }
+                let armed = admission.armed();
+                // Every window wider than the 4-row cap (a full chunk, a short
+                // whole prompt) and every 1..=4-row tail of a long prefill (its
+                // routing window is still the canonical chunk) is rejected by
+                // `cpu_splice_window`, the predicate `Qwen4MoeLayerRuntime::
+                // routed_view` applies when it binds the executor-less view for
+                // the D2 prefill seal: armed or not they take the GPU route. The
+                // binding itself needs a loaded runtime (GPU), so this pins the
+                // predicate it is built on.
+                for rows in [chunk, 1536, 768, 5, 8] {
+                    assert!(
+                        !cpu_splice_window(armed, rows, rows),
+                        "{kind:?} d2={d2} rows={rows}"
+                    );
+                }
+                for tail in 1..=CPU_SPLIT_MAX_ROWS {
+                    assert!(
+                        !cpu_splice_window(armed, tail, chunk),
+                        "{kind:?} d2={d2} tail={tail}"
+                    );
+                }
+                // Decode and a <=4-row verify window are the only windows D2 takes.
+                for rows in 1..=CPU_SPLIT_MAX_ROWS {
+                    assert_eq!(
+                        cpu_splice_window(armed, rows, rows),
+                        d2,
+                        "{kind:?} d2={d2} rows={rows}"
+                    );
+                }
             }
         }
     }

@@ -878,7 +878,8 @@ fn forward_lanes_scoped(
             bundle.config.profile.id()
         )));
     }
-    fwd.ensure_cpu_splice_eager(gpu)?;
+    // An automatic-default D2 split executes only on a non-prefill lane step.
+    fwd.ensure_cpu_splice_eager(gpu, !matches!(out, StepOutputs::Wave(_)))?;
     let cpu_splice = fwd.has_cpu_deferred_experts();
     policy.validate().map_err(invalid)?;
     if lanes.is_empty() {
@@ -1580,6 +1581,13 @@ fn forward_lanes_scoped(
                             let Qwen4FfnBinding::Moe(moe) = descs[layer].ffn else {
                                 return Err(invalid("lane steps run only the Flash-Next MoE FFN"));
                             };
+                            // The D2 executor is bound only on a non-prefill
+                            // step over a whole narrow window (see
+                            // `Qwen4MoeLayerRuntime::routed_view`).
+                            let mut moe = moe;
+                            if let Some(runtime) = fwd.moe.get(layer).and_then(Option::as_ref) {
+                                moe.routed_experts = runtime.routed_view(!prefill, r, rr);
+                            }
                             let sealed =
                                 seal_moe_for_layer(&ctx, dims, moe, &seg_scratch[i], r, rr)
                                     .map_err(|error| {

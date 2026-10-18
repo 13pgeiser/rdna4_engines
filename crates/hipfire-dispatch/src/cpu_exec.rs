@@ -134,7 +134,7 @@ fn splice_pool_config() -> hipfire_cpu::splice_pool::SplicePoolConfig {
 }
 
 /// The pinned physical-core pool the routed-expert splice runs on.
-fn in_splice_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+pub(crate) fn in_splice_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     hipfire_cpu::splice_pool::install(splice_pool_config(), f)
 }
 

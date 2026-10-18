@@ -835,18 +835,25 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_MOE_EXPERT_BUDGET"),
         "Resident routed-expert budget for a Mixture-of-Experts model whose experts exceed VRAM: N keeps the last N layers' routed experts on the GPU and spills the rest to system RAM; unset/null keeps every routed expert on the GPU. The number counts layers whose expert weights stay ON the GPU — llama.cpp's `--n-cpu-moe K` is this value written as `n_layers - K`. Only routed experts move: attention, router, shared expert and KV stay on the card. Explicit 'auto' (-1) opts into placement by fit, spilling routed experts before whole layers. No effect on a dense model, and none on an architecture that cannot spill experts (a configured spill fails that arch's load rather than being ignored)."
     ),
-    field!(
-        "memory.offload_exec",
-        "offload_exec",
-        Memory,
-        ModelLoad,
-        DefaultValue::String("pcie"),
-        ValueRule::Enum(OFFLOAD_EXECS),
-        true,
-        false,
-        Some("HIPFIRE_OFFLOAD_EXEC"),
-        "Which engine executes the ops that read a spilled layer's weights: 'pcie' (default) runs the GPU kernels against host-mapped weights over the link; 'cpu' executes those GEMVs on the CPU instead; 'passback' is scheduled co-inference — both engines run the same spilled step concurrently (the GPU arm is the 'pcie' path, the CPU arm is the 'cpu' path), divided by output rows per 'memory.offload_passback_share'. Not a third engine and not a fallback: it decides who multiplies, never what is spilled — placement stays memory.gpu_layer_budget, and the KV cache stays in VRAM either way. Unset, empty and unknown values all fall back to 'pcie'."
-    ),
+    // Sparse in the process config (like `replay.backend`): when the user,
+    // registry or a compatibility env never set it, the key is absent, so the
+    // loader can tell "unset" (a Flash-Next load then picks the engine from a
+    // measured rate comparison, see `memory::offload_exec_explicit`) from an
+    // explicit `pcie`. The built-in `pcie` stays the raw value
+    // ([`memory::offload_exec`]) every other consumer reads.
+    ConfigField {
+        key: "memory.offload_exec",
+        legacy_key: "offload_exec",
+        category: ConfigCategory::Memory,
+        scope: ConfigScope::ModelLoad,
+        default: DefaultValue::String("pcie"),
+        rule: ValueRule::Enum(OFFLOAD_EXECS),
+        registry_allowed: true,
+        experimental: false,
+        env_compat: Some("HIPFIRE_OFFLOAD_EXEC"),
+        include_builtin_in_process_config: false,
+        help: "Which engine executes the ops that read a spilled layer's weights: 'pcie' runs the GPU kernels against host-mapped weights over the link; 'cpu' executes those GEMVs on the CPU instead; 'passback' is scheduled co-inference — both engines run the same spilled step concurrently (the GPU arm is the 'pcie' path, the CPU arm is the 'cpu' path), divided by output rows per 'memory.offload_passback_share'. Not a third engine and not a fallback: it decides who multiplies, never what is spilled — placement stays memory.gpu_layer_budget, and the KV cache stays in VRAM either way. Unset behaves as 'pcie' everywhere except one measured default: a Flash-Next (qwen4) load whose host-placed routed experts the D2 CPU split can serve (hot-set tier layers, or un-tiered aggregate layers whose allocations are host-mapped QT44/QT53) runs only that D2 split (decode and <=4-row verify of the host-mapped experts) when this device's measured CPU engine rate beats its measured zero-copy host-link rate (the passback calibration); unified-memory, unmeasured and slower-CPU devices stay on the link, and prefill, placement and host allocations never change. The typed developer key developer.qwen4_d2_default forces or vetoes that comparison. An explicit value, 'pcie' included, always wins. Empty and unknown values fall back to 'pcie'.",
+    },
     field!(
         "memory.offload_passback_share",
         "offload_passback_share",
@@ -3979,7 +3986,8 @@ pub fn is_developer_key(key: &str) -> bool {
 /// boolean, a string spelling, or the integers 0/1). Anything else is
 /// rejected when the layer is built, never silently ignored. Every other
 /// developer key keeps its free-form legacy spelling.
-const TYPED_BOOL_DEVELOPER_KEYS: &[&str] = &["developer.qwen4_moe_sym_iu4"];
+const TYPED_BOOL_DEVELOPER_KEYS: &[&str] =
+    &["developer.qwen4_moe_sym_iu4", "developer.qwen4_d2_default"];
 
 pub fn is_typed_bool_developer_key(key: &str) -> bool {
     TYPED_BOOL_DEVELOPER_KEYS.contains(&key)
@@ -7249,6 +7257,19 @@ mod tests {
     }
 
     #[test]
+    fn offload_exec_is_absent_from_the_process_config_until_set() {
+        // The measured Flash-Next default needs "unset" distinguishable from an
+        // explicit `pcie`: the built-in value must not be carried.
+        let field = field("memory.offload_exec").expect("offload_exec schema field");
+        assert!(!field.include_builtin_in_process_config);
+        assert_eq!(field.env_compat, Some("HIPFIRE_OFFLOAD_EXEC"));
+        assert!(matches!(
+            field.default.to_value(),
+            ConfigValue::String(v) if v == "pcie"
+        ));
+    }
+
+    #[test]
     fn schema_has_unique_keys_and_legacy_keys() {
         let mut canonical = std::collections::BTreeSet::new();
         let mut legacy = std::collections::BTreeSet::new();
@@ -7268,16 +7289,21 @@ mod tests {
             }
             if !field.include_builtin_in_process_config {
                 assert!(field.env_compat.is_some(), "bridge without env alias");
-                assert!(
-                    matches!(field.scope, ConfigScope::Process | ConfigScope::Diagnostic),
-                    "non-process bridge {}",
-                    field.key
-                );
-                assert!(
-                    !field.registry_allowed,
-                    "registry-backed bridge {}",
-                    field.key
-                );
+                // `memory.offload_exec` is the one registry-backed, model-load
+                // field whose built-in is represented by absence: its unset
+                // default is a measured per-device choice, not the value `pcie`.
+                if field.key != "memory.offload_exec" {
+                    assert!(
+                        matches!(field.scope, ConfigScope::Process | ConfigScope::Diagnostic),
+                        "non-process bridge {}",
+                        field.key
+                    );
+                    assert!(
+                        !field.registry_allowed,
+                        "registry-backed bridge {}",
+                        field.key
+                    );
+                }
             }
             field
                 .validate(&field.default.to_value())
@@ -9378,6 +9404,35 @@ pub mod memory {
         parse_offload_exec(process_value("HIPFIRE_OFFLOAD_EXEC").as_deref())
     }
 
+    /// Pure truth table behind [`offload_exec_explicit`]: `None` when the user
+    /// (config, registry or `HIPFIRE_OFFLOAD_EXEC`) never chose a mode — unset
+    /// or blank — and the parsed mode otherwise, so an explicit `pcie` is
+    /// distinguishable from the unset default and an unknown spelling is an
+    /// explicit (fail-closed) `pcie`.
+    pub fn parse_offload_exec_explicit(raw: Option<&str>) -> Option<OffloadExec> {
+        raw.filter(|v| !v.trim().is_empty())
+            .map(|v| parse_offload_exec(Some(v)))
+    }
+
+    /// The explicitly configured [`OffloadExec`], `None` when nothing set it
+    /// (`memory.offload_exec` is absent from the process snapshot until the
+    /// user, registry or env sets it). [`offload_exec`] stays the raw value
+    /// with the built-in `pcie` for every consumer that has no measured
+    /// default.
+    pub fn offload_exec_explicit() -> Option<OffloadExec> {
+        parse_offload_exec_explicit(process_value("HIPFIRE_OFFLOAD_EXEC").as_deref())
+    }
+
+    /// `developer.qwen4_d2_default` (env `HIPFIRE_QWEN4_D2_DEFAULT`), a typed
+    /// boolean: `Some(true)` forces the Flash-Next un-tiered whole-layer D2
+    /// split on for a load that has host-placed experts (skipping only the
+    /// measured CPU-vs-link comparison), `Some(false)` never arms the default,
+    /// `None` (unset) takes the measured selector. An explicit
+    /// `memory.offload_exec` still wins over every value.
+    pub fn qwen4_d2_default() -> Option<bool> {
+        super::developer_typed_bool("HIPFIRE_QWEN4_D2_DEFAULT")
+    }
+
     /// How much of a split step the GPU takes (`memory.offload_passback_share`).
     ///
     /// Read only when [`offload_exec`] is [`OffloadExec::Passback`]; in any other
@@ -9466,6 +9521,36 @@ pub mod memory {
             assert_eq!(OffloadExec::Pcie.to_string(), "pcie");
             assert_eq!(OffloadExec::Cpu.to_string(), "cpu");
             assert_eq!(OffloadExec::Passback.to_string(), "passback");
+        }
+
+        #[test]
+        fn offload_exec_explicit_truth_table() {
+            // Unset and blank are "not chosen": the loader may pick by
+            // measurement. Any spelling the user did type is chosen, and an
+            // unknown one still fails closed to `pcie` (never to the CPU).
+            assert_eq!(parse_offload_exec_explicit(None), None);
+            assert_eq!(parse_offload_exec_explicit(Some("")), None);
+            assert_eq!(parse_offload_exec_explicit(Some("  ")), None);
+            assert_eq!(
+                parse_offload_exec_explicit(Some("pcie")),
+                Some(OffloadExec::Pcie)
+            );
+            assert_eq!(
+                parse_offload_exec_explicit(Some(" PCIE ")),
+                Some(OffloadExec::Pcie)
+            );
+            assert_eq!(
+                parse_offload_exec_explicit(Some("cpu")),
+                Some(OffloadExec::Cpu)
+            );
+            assert_eq!(
+                parse_offload_exec_explicit(Some("passback")),
+                Some(OffloadExec::Passback)
+            );
+            assert_eq!(
+                parse_offload_exec_explicit(Some("banana")),
+                Some(OffloadExec::Pcie)
+            );
         }
 
         #[test]

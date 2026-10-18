@@ -11,9 +11,11 @@
 //!
 //! Model load follows `qwen4_kld`: admission on the GPU architecture
 //! (`admit_hfqm_artifact_on`), slab layer arenas served by
-//! `expert_arena::recipe_arena_payload`, and `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N`
-//! (a fixed count; `auto` is refused) keeping layers 0..N resident with the
-//! rest host-mapped and borrowed from the resident source bytes.
+//! `expert_arena::recipe_arena_payload`, and the routed-expert placement: unset (or
+//! `auto`) `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` resolves the product loader's automatic
+//! placement through the shared `expert_residency::incumbent_auto_resident_layers`; a
+//! fixed `N` is an optional diagnostic override keeping layers 0..N resident. The
+//! rest is host-mapped and borrowed from the resident source bytes.
 //!
 //! Usage:
 //!   qwen4_greedy_ids --model MODEL.hfq --input PROMPTS.jsonl --output IDS.jsonl \
@@ -341,26 +343,95 @@ impl Model {
         let expected = WeightOrigin::for_single(&mesh, &gpu);
         let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq, &gpu.arch);
         let source = HfqModelSource::from_hfq(hfq);
+        // Resolved once, before placement: the product's automatic placement is sized
+        // from them and the bundle is assembled with the same values.
+        let state_format = hipfire_arch_qwen4::resolve_state_format(
+            &hipfire_runtime::config::get().kv_mode,
+            // Qwen3.5's DeltaNet `state_quant` knob: auto (q8) or fp32.
+            &std::env::var("HIPFIRE_STATE_QUANT").unwrap_or_default(),
+            &gpu,
+            &receipt.config,
+        )?;
+        let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
         // `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N` keeps trunk layers 0..N resident
-        // and host-maps the rest (a slab artifact larger than one card).
+        // and host-maps the rest (an optional diagnostic override). Unset (or `auto`)
+        // resolves the product loader's automatic placement through the one shared
+        // `expert_residency::incumbent_auto_resident_layers`.
         let weights = {
+            use hipfire_arch_qwen4::expert_residency as residency;
             let mut weights = receipt.manifest.weights.clone();
-            match hipfire_arch_qwen4::expert_residency::expert_vram_layers_from_env()? {
-                None => {}
-                Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Layers(layers)) => {
+            match residency::expert_vram_layers_from_env()? {
+                Some(residency::ExpertVramLayers::Layers(layers)) => {
                     if gpu.is_uma() {
                         return Err("host-mapped experts are only for discrete GPUs".into());
                     }
-                    let moved = hipfire_arch_qwen4::expert_residency::place_routed_experts(
-                        &mut weights,
-                        layers,
-                    );
+                    let moved = residency::place_routed_experts(&mut weights, layers);
                     eprintln!(
                         "qwen4_greedy_ids: routed experts: layers 0..{layers} in VRAM, {moved} tensors host-mapped"
                     );
                 }
-                Some(hipfire_arch_qwen4::expert_residency::ExpertVramLayers::Auto) => {
-                    return Err("qwen4_greedy_ids takes a fixed expert layer count, not auto".into());
+                None | Some(residency::ExpertVramLayers::Auto) => {
+                    let recipe = &receipt.manifest.identity.recipe;
+                    let slab_recipe = matches!(
+                        recipe,
+                        hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab { .. }
+                    );
+                    // Entry sizes as the product loader sizes them: a slab layer arena from
+                    // the recipe's plan, anything else from the mapped tensor.
+                    let bytes_of =
+                        |entry: &hipfire_runtime::weight_manifest::WeightEntry| -> Option<u64> {
+                            if let hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab {
+                                arenas,
+                                ..
+                            } = recipe
+                            {
+                                if entry
+                                    .name
+                                    .ends_with(hipfire_arch_qwen4::expert_arena::ARENA_SUFFIX)
+                                {
+                                    return entry
+                                        .layer
+                                        .and_then(|layer| arenas.layer(layer))
+                                        .map(|layer| layer.bytes as u64);
+                                }
+                            }
+                            source
+                                .tensor_data(&entry.name)
+                                .map(|(_, bytes)| bytes.len() as u64)
+                        };
+                    let vmm_granularity = match backend {
+                        hipfire_arch_qwen4::Qwen4KvBackend::Vmm => gpu
+                            .vmm_recommended_granularity()
+                            .map_err(|e| format!("qwen4: VMM granularity: {e}"))?,
+                        hipfire_arch_qwen4::Qwen4KvBackend::Legacy => 1,
+                    };
+                    let resolved = residency::incumbent_auto_resident_layers(
+                        &gpu,
+                        &receipt.config,
+                        &weights,
+                        &bytes_of,
+                        backend,
+                        max_seq,
+                        vmm_granularity,
+                        state_format,
+                        scratch_mode,
+                        residency::dedicated_slab_stage(
+                            residency::expert_stage_placement_enabled(&gpu.arch),
+                            slab_recipe,
+                            false,
+                        ),
+                    )?;
+                    match resolved {
+                        Some(layers) => {
+                            let moved = residency::place_routed_experts(&mut weights, layers);
+                            eprintln!(
+                                "qwen4_greedy_ids: routed experts: product automatic placement (expert_residency::incumbent_auto_resident_layers): layers 0..{layers} in VRAM, {moved} tensors host-mapped"
+                            );
+                        }
+                        None => eprintln!(
+                            "qwen4_greedy_ids: routed experts: product automatic placement keeps every expert resident"
+                        ),
+                    }
                 }
             }
             weights
@@ -397,14 +468,6 @@ impl Model {
         .map_err(|e| format!("qwen4 manifest fulfillment: {e}"))?;
         let vocab = receipt.config.vocab_size;
         let eos_token = receipt.config.eos_token_id;
-        let state_format = hipfire_arch_qwen4::resolve_state_format(
-            &hipfire_runtime::config::get().kv_mode,
-            // Qwen3.5's DeltaNet `state_quant` knob: auto (q8) or fp32.
-            &std::env::var("HIPFIRE_STATE_QUANT").unwrap_or_default(),
-            &gpu,
-            &receipt.config,
-        )?;
-        let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
         let mut bundle = Qwen4Bundle::assemble_with_ple_rows(
             receipt.config,
             &receipt.manifest.identity.recipe,

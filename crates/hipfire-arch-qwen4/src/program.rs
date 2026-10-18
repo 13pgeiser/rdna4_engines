@@ -892,10 +892,11 @@ pub fn seal_moe_for_layer<'a>(
     // (the invariant prefill profile pins `route_rows` to the canonical chunk, so
     // a short prefill there keeps the PCIe grouped read) and which is at most
     // the narrow verify width; every wider window is unchanged.
-    let cpu_deferred = moe.cpu_deferred_experts
-        && rows != 0
-        && rows == route_rows
-        && rows <= QWEN4_CPU_SPLICE_MAX_ROWS;
+    let cpu_deferred = hipfire_dispatch::cpu_split::cpu_splice_window(
+        moe.cpu_deferred_experts,
+        rows,
+        route_rows,
+    );
     if cpu_deferred
         && (moe.route_policy.capability.is_fp8_grouped()
             || moe.row_gather.is_some()

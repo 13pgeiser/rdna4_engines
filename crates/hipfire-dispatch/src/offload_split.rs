@@ -676,6 +676,16 @@ fn median(mut samples: Vec<f64>) -> f64 {
     samples[samples.len() / 2]
 }
 
+/// Which CPU worker pool a two-engine probe's CPU arm runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CpuProbePool {
+    /// The global rayon pool (what a pass-back step's CPU arm and
+    /// `hipfire offload-bench` use).
+    Global,
+    /// The pinned physical-core pool of the routed-expert splice.
+    Splice,
+}
+
 /// Time both engines on `probe`'s weight buffer, `reps` times each, and return
 /// the median rates. `Ok(None)` when the format has no launchable GPU arm (the
 /// scheduler then keeps [`DEFAULT_GPU_SHARE`] and the online controller converges
@@ -692,16 +702,28 @@ fn measure_both(
     row_bytes: usize,
     x_host: &[f32],
     reps: usize,
+    pool: CpuProbePool,
 ) -> Result<Option<SplitCalibration>, DispatchError> {
     let reps = reps.max(1);
     let Some(bytes) = gpu.host_bytes(w.buf) else {
         return Ok(None);
     };
-    let mut y = vec![0.0f32; w.m];
+    if pool == CpuProbePool::Splice {
+        // Build (and pin) the pool before the first timed pass, so the first
+        // sample is not the thread spawn.
+        let _ = cpu_exec::splice_pool_threads();
+    }
+    let (m, k) = (w.m, w.k);
+    let mut y = vec![0.0f32; m];
     let mut cpu_ns = Vec::with_capacity(reps);
     for _ in 0..reps {
         let t = Instant::now();
-        hipfire_cpu::gemv::gemv(q, bytes, w.m, w.k, x_host, &mut y);
+        match pool {
+            CpuProbePool::Global => hipfire_cpu::gemv::gemv(q, bytes, m, k, x_host, &mut y),
+            CpuProbePool::Splice => {
+                cpu_exec::in_splice_pool(|| hipfire_cpu::gemv::gemv(q, bytes, m, k, x_host, &mut y))
+            }
+        }
         cpu_ns.push(t.elapsed().as_nanos() as f64);
     }
     let mut gpu_ns = Vec::with_capacity(reps);
@@ -788,7 +810,17 @@ pub fn probe_weight(
             out: &scratch,
         },
     };
-    let result = measure_both(gpu, ctx, &probe, w, q, row_bytes, &x_host, reps);
+    let result = measure_both(
+        gpu,
+        ctx,
+        &probe,
+        w,
+        q,
+        row_bytes,
+        &x_host,
+        reps,
+        CpuProbePool::Global,
+    );
     let _ = gpu.free_tensor(scratch);
     if let Some(acc) = acc_scratch {
         let _ = gpu.free_tensor(acc);
@@ -797,7 +829,8 @@ pub fn probe_weight(
 }
 
 /// The same two-engine measurement over a **synthetic** host-mapped weight, for
-/// `hipfire offload-bench`: no model and no step list needed.
+/// `hipfire offload-bench`: no model and no step list needed. The CPU arm runs
+/// on the global rayon pool, like a pass-back step's CPU arm.
 ///
 /// Allocates, uses and frees its own buffers (a host-mapped weight of `m` rows —
 /// system RAM the GPU reads over the link — an f32 activation of `k`, an f32
@@ -810,6 +843,22 @@ pub fn probe_synthetic(
     m: usize,
     k: usize,
     reps: usize,
+) -> Result<SplitCalibration, DispatchError> {
+    probe_synthetic_on(gpu, ctx, dtype, m, k, reps, CpuProbePool::Global)
+}
+
+/// [`probe_synthetic`] with the CPU arm's worker pool chosen. The routed-expert
+/// splice (D1/D2) runs its CPU side on [`CpuProbePool::Splice`] (one pinned
+/// worker per physical core), so a default that asks "does the splice's CPU
+/// engine beat the link?" must time that pool, not the global one.
+pub fn probe_synthetic_on(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    dtype: DType,
+    m: usize,
+    k: usize,
+    reps: usize,
+    pool: CpuProbePool,
 ) -> Result<SplitCalibration, DispatchError> {
     let q = cpu_exec::cpu_quant_for(dtype).ok_or_else(|| {
         DispatchError::Hip(format!(
@@ -863,7 +912,7 @@ pub fn probe_synthetic(
         };
         let rotate = cpu_exec::raw_input_is_rotated(dtype);
         let (x_host, _) = cpu_exec::prepare_activation(gpu, &w_ref, &x_act, rotate)?;
-        measure_both(gpu, ctx, &probe, &w_ref, q, row_bytes, &x_host, reps)?
+        measure_both(gpu, ctx, &probe, &w_ref, q, row_bytes, &x_host, reps, pool)?
     };
     let _ = gpu.free_tensor(scratch);
     let _ = gpu.free_tensor(x_act);

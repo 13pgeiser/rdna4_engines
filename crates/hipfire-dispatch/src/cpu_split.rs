@@ -24,6 +24,21 @@ use crate::families::moe::RoutedExpertWeights;
 use crate::types::DispatchError;
 
 pub const CPU_SPLIT_MAX_ROWS: usize = 4;
+
+/// Whether a call of `rows` real rows over `route_rows` routing rows takes the
+/// CPU routed-expert window on a layer that is `armed`: decode and a verify
+/// window of at most [`CPU_SPLIT_MAX_ROWS`] rows, and only when the real rows
+/// are the whole routing window. A call over a wider routing window (a
+/// 1..=4-row tail of a long prefill whose `route_rows` is the canonical chunk)
+/// takes the GPU route. The D1 seal (`seal_moe_for_layer`) applies this
+/// predicate directly; the D2 executor gate
+/// ([`crate::families::moe::cpu_split_executor`]) sees only the row count, so
+/// the qwen4 prefill seal binds an executor-less view of the layer's weights
+/// (`Qwen4MoeLayerRuntime::routed_view`) for every call this rejects.
+pub const fn cpu_splice_window(armed: bool, rows: usize, route_rows: usize) -> bool {
+    armed && rows != 0 && rows == route_rows && rows <= CPU_SPLIT_MAX_ROWS
+}
+
 const MAX_SLOTS: usize = CPU_SPLIT_MAX_ROWS * 10;
 
 fn err(message: impl std::fmt::Display) -> DispatchError {

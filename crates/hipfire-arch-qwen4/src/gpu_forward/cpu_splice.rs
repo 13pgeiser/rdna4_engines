@@ -201,32 +201,36 @@ impl CpuExpertOwners {
     }
 }
 
-/// Whether the D2 tier split (`memory.offload_exec=cpu` over an expert hot
-/// set) may arm for one layer. Distinct from [`CpuSpliceAdmission`]: the
-/// whole-layer D1 splice never arms on a tier layer, and this mode never sets
-/// the layer's `cpu_deferred_experts` flag. Every field is an input;
+/// Whether the D2 split may arm for one layer. Distinct from
+/// [`CpuSpliceAdmission`]: the whole-layer D1 splice never arms on a tier
+/// layer, and this mode never sets the layer's `cpu_deferred_experts` flag.
+/// One decision, several span-owner kinds ([`SplitOwnerKind`]): a hot-set tier
+/// layer or an un-tiered host-mapped aggregate layer. Every field is an input;
 /// [`Self::refusal`] is the single decision and [`Self::armed`] its yes/no.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct CpuSplitAdmission {
-    /// `memory.offload_exec=cpu` selected the CPU expert route.
+    /// The D2 split was requested for this layer: `memory.offload_exec=cpu`
+    /// (tier layers only), or the per-load measured default
+    /// ([`crate::d2_default`]) with the setting unset.
     pub enabled: bool,
-    /// The layer is governed by a per-expert tier plan (the hot set).
-    pub tier: bool,
+    /// Which owner kind the layer would read its cold experts from; `None`
+    /// when it has neither a tier plan nor a host-mapped aggregate the D1
+    /// splice has not already taken.
+    pub kind: Option<SplitOwnerKind>,
     /// The tier plan came from a hot-set sidecar: the loader bound that
     /// sidecar's SHA-256 to the lease before attach. A custom tier plan
-    /// without a bound sidecar never arms.
+    /// without a bound sidecar never arms. Consulted for tier layers only.
     pub bound_hotset: bool,
     /// How many of the layer's experts are host-mapped (cold). Zero leaves
     /// nothing for the CPU to do.
     pub host_experts: usize,
     /// Flash-Next profile.
     pub flash_next: bool,
-    /// Every expert is the QT44 gate/up + QT53 down pair.
-    pub uniform_qt44_qt53: bool,
+    /// Every expert is a format the CPU executes: the QT44 gate/up + QT53 down
+    /// pair.
+    pub cpu_executed: bool,
     /// The layer is routed through expert parallelism.
     pub ep: bool,
-    /// The layer is a sealed expert-slab arena.
-    pub slab: bool,
     /// The layer carries AWQ scales (a bare CPU gemv would ignore them).
     pub awq: bool,
     /// Stock FP8 blocks.
@@ -246,12 +250,12 @@ pub(super) struct CpuSplitAdmission {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SplitRefusal {
     NotRequested,
-    NotTier,
+    NoSpanOwner,
     NoColdExperts,
     UnboundHotset,
-    NotFlashNextMq4,
+    NotFlashNext,
+    NotCpuExecuted,
     ExpertParallel,
-    Slab,
     Awq,
     Fp8,
     NarrowStage,
@@ -260,20 +264,20 @@ pub(super) enum SplitRefusal {
 impl SplitRefusal {
     /// A layer outside the mode, not a refused route.
     pub(super) fn is_silent(self) -> bool {
-        matches!(self, Self::NotRequested | Self::NotTier | Self::NoColdExperts)
+        matches!(self, Self::NotRequested | Self::NoSpanOwner | Self::NoColdExperts)
     }
 
     fn reason(self) -> &'static str {
         match self {
-            Self::NotRequested => "the CPU tier split is not requested",
-            Self::NotTier => "the layer is not governed by a hot-set tier plan",
+            Self::NotRequested => "the CPU split is not requested",
+            Self::NoSpanOwner => {
+                "the layer has neither a hot-set tier plan nor a host-mapped aggregate"
+            }
             Self::NoColdExperts => "the layer has no host-mapped expert",
             Self::UnboundHotset => "the tier plan is not backed by a bound hot-set sidecar",
-            Self::NotFlashNextMq4 => {
-                "the layer is not uniform Flash-Next QT44 gate/up + QT53 down"
-            }
+            Self::NotFlashNext => "the layer is not a Flash-Next profile layer",
+            Self::NotCpuExecuted => "the layer is not uniform Flash-Next QT44 gate/up + QT53 down",
             Self::ExpertParallel => "expert-parallel layers have no masked route",
-            Self::Slab => "expert-slab layers have no masked route or cold-slot installation",
             Self::Awq => "AWQ layers carry scales the CPU arithmetic would ignore",
             Self::Fp8 => "stock-FP8 layers have no masked route or cold-slot installation",
             Self::NarrowStage => {
@@ -289,15 +293,15 @@ impl CpuSplitAdmission {
     pub(super) fn refusal(&self) -> Option<SplitRefusal> {
         let checks = [
             (!self.enabled, SplitRefusal::NotRequested),
-            (!self.tier, SplitRefusal::NotTier),
+            (self.kind.is_none(), SplitRefusal::NoSpanOwner),
             (self.host_experts == 0, SplitRefusal::NoColdExperts),
-            (!self.bound_hotset, SplitRefusal::UnboundHotset),
             (
-                !self.flash_next || !self.uniform_qt44_qt53,
-                SplitRefusal::NotFlashNextMq4,
+                self.kind == Some(SplitOwnerKind::Tier) && !self.bound_hotset,
+                SplitRefusal::UnboundHotset,
             ),
+            (!self.flash_next, SplitRefusal::NotFlashNext),
+            (!self.cpu_executed, SplitRefusal::NotCpuExecuted),
             (self.ep, SplitRefusal::ExpertParallel),
-            (self.slab, SplitRefusal::Slab),
             (self.awq, SplitRefusal::Awq),
             (self.fp8, SplitRefusal::Fp8),
             (self.narrow_stage, SplitRefusal::NarrowStage),
@@ -475,6 +479,81 @@ impl CpuTierOwners {
     pub(super) fn cold_experts(&self) -> usize {
         self.ranges.iter().flatten().count()
     }
+
+    /// The split's per-expert ownership mask: `1` for every host-mapped
+    /// (cold) expert, `0` for a device-resident one.
+    fn placement(&self) -> Vec<u8> {
+        self.ranges
+            .iter()
+            .map(|range| u8::from(range.is_some()))
+            .collect()
+    }
+}
+
+/// The kind of host-span owner a D2 split layer reads its cold experts from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SplitOwnerKind {
+    /// A hot-set tier layer: the cold experts are the plan's host-mapped
+    /// entries inside the pinned tier owner.
+    Tier,
+    /// An un-tiered aggregate layer whose two expert allocations are
+    /// host-mapped: every expert is cold.
+    WholeLayer,
+}
+
+impl SplitOwnerKind {
+    /// Stable spelling for logs and lab receipts.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Tier => "tier",
+            Self::WholeLayer => "whole-layer",
+        }
+    }
+}
+
+/// The cold-expert byte source of one D2 split layer: borrowed views over
+/// memory the loader already owns, never a copy.
+pub(super) enum HostSpanOwner {
+    Tier(CpuTierOwners),
+    WholeLayer(CpuExpertOwners),
+}
+
+impl HostSpanOwner {
+    pub(super) fn kind(&self) -> SplitOwnerKind {
+        match self {
+            Self::Tier(_) => SplitOwnerKind::Tier,
+            Self::WholeLayer(_) => SplitOwnerKind::WholeLayer,
+        }
+    }
+
+    /// Borrowed CPU payload of one cold expert (see the owner's `payload`).
+    pub(super) fn payload(
+        &self,
+        expert_idx: usize,
+        gate_up_dtype: DType,
+        down_dtype: DType,
+    ) -> Option<hipfire_dispatch::cpu_exec::CpuMoeExpert<'_>> {
+        match self {
+            Self::Tier(owners) => owners.payload(expert_idx, gate_up_dtype, down_dtype),
+            Self::WholeLayer(owners) => owners.payload(expert_idx, gate_up_dtype, down_dtype),
+        }
+    }
+
+    /// The split's per-expert ownership mask: `1` = host (CPU arm), `0` = GPU.
+    pub(super) fn placement(&self) -> Vec<u8> {
+        match self {
+            Self::Tier(owners) => owners.placement(),
+            Self::WholeLayer(owners) => vec![1; owners.experts],
+        }
+    }
+
+    /// Experts the CPU arm serves on this layer.
+    pub(super) fn cold_experts(&self) -> usize {
+        match self {
+            Self::Tier(owners) => owners.cold_experts(),
+            Self::WholeLayer(owners) => owners.experts,
+        }
+    }
 }
 
 /// Hex of a layer bitmap: bit `i` is layer label `i`, rendered as one big
@@ -497,33 +576,47 @@ pub(super) fn layer_bitmap_hex(labels: &[usize]) -> String {
 
 /// The frozen numerical identity of the armed host arithmetic (see
 /// `Qwen4GpuForward::host_exec_identity`): empty when nothing is armed,
-/// `cpu-all-v1/<bitmap>` for D1 layers, `cpu-tier-split-v1/<64-hex tier
-/// logical digest>/<bitmap>/hotset-sha256=<hex | unbound>` for D2 layers,
-/// joined with `+`. `tier` is the split layers' tier digest and bound sidecar
-/// SHA; a split layer set without it is not an identity and yields `unbound`
-/// digest zeros rather than silently collapsing into another mode.
+/// `cpu-all-v1/<bitmap>` for D1 layers, then one part per D2 owner kind in the
+/// caller's order: `cpu-tier-split-v1/<64-hex tier logical digest>/<bitmap>/
+/// hotset-sha256=<hex | unbound>` for hot-set tier layers and
+/// `cpu-whole-split-v1/<bitmap>` for un-tiered whole-layer host aggregates (no
+/// tier digest or sidecar: every host expert is cold, so there is no plan to
+/// freeze). Parts are joined with `+`. `tier` is the tier-split layers' digest
+/// and bound sidecar SHA; a tier layer set without it is not an identity and
+/// yields `unbound` digest zeros rather than silently collapsing into another
+/// mode.
 pub(super) fn host_exec_identity(
     cpu_all: &[usize],
-    split: &[usize],
+    splits: &[(SplitOwnerKind, &[usize])],
     tier: Option<(&[u8; 32], Option<&str>)>,
 ) -> String {
     let mut parts = Vec::new();
     if !cpu_all.is_empty() {
         parts.push(format!("cpu-all-v1/{}", layer_bitmap_hex(cpu_all)));
     }
-    if !split.is_empty() {
-        let zero = [0u8; 32];
-        let (digest, sidecar) = tier.unwrap_or((&zero, None));
-        let mut digest_hex = String::with_capacity(64);
-        for byte in digest {
-            use std::fmt::Write as _;
-            let _ = write!(digest_hex, "{byte:02x}");
+    for &(kind, layers) in splits {
+        if layers.is_empty() {
+            continue;
         }
-        parts.push(format!(
-            "cpu-tier-split-v1/{digest_hex}/{}/hotset-sha256={}",
-            layer_bitmap_hex(split),
-            sidecar.unwrap_or("unbound"),
-        ));
+        match kind {
+            SplitOwnerKind::Tier => {
+                let zero = [0u8; 32];
+                let (digest, sidecar) = tier.unwrap_or((&zero, None));
+                let mut digest_hex = String::with_capacity(64);
+                for byte in digest {
+                    use std::fmt::Write as _;
+                    let _ = write!(digest_hex, "{byte:02x}");
+                }
+                parts.push(format!(
+                    "cpu-tier-split-v1/{digest_hex}/{}/hotset-sha256={}",
+                    layer_bitmap_hex(layers),
+                    sidecar.unwrap_or("unbound"),
+                ));
+            }
+            SplitOwnerKind::WholeLayer => {
+                parts.push(format!("cpu-whole-split-v1/{}", layer_bitmap_hex(layers)));
+            }
+        }
     }
     parts.join("+")
 }
@@ -840,16 +933,26 @@ mod tests {
     fn split_admission() -> CpuSplitAdmission {
         CpuSplitAdmission {
             enabled: true,
-            tier: true,
+            kind: Some(SplitOwnerKind::Tier),
             bound_hotset: true,
             host_experts: 100,
             flash_next: true,
-            uniform_qt44_qt53: true,
+            cpu_executed: true,
             ep: false,
-            slab: false,
             awq: false,
             fp8: false,
             narrow_stage: false,
+        }
+    }
+
+    /// An un-tiered host-mapped aggregate layer: every one of its experts is
+    /// host-placed, and there is no hot-set sidecar to bind.
+    fn whole_layer_admission() -> CpuSplitAdmission {
+        CpuSplitAdmission {
+            kind: Some(SplitOwnerKind::WholeLayer),
+            bound_hotset: false,
+            host_experts: 512,
+            ..split_admission()
         }
     }
 
@@ -861,7 +964,7 @@ mod tests {
     fn split_on(arch: &str, explicit_path: bool) -> CpuSplitAdmission {
         let loaded = crate::expert_hotset::hotset_arch_admits(arch, explicit_path);
         CpuSplitAdmission {
-            tier: loaded,
+            kind: loaded.then_some(SplitOwnerKind::Tier),
             bound_hotset: loaded,
             ..split_admission()
         }
@@ -890,9 +993,21 @@ mod tests {
                 "{arch} explicit={explicit_path}"
             );
         }
-        // The not-armed rows are "no tier plan", never an arch refusal.
-        assert_eq!(split_on("gfx1100", false).refusal(), Some(SplitRefusal::NotTier));
-        // Without `memory.offload_exec=cpu` nothing arms on any arch.
+        // The not-armed rows are "no span owner", never an arch refusal: an
+        // un-tiered host-mapped aggregate layer arms on every arch whatever
+        // the hot-set rule says.
+        assert_eq!(
+            split_on("gfx1100", false).refusal(),
+            Some(SplitRefusal::NoSpanOwner)
+        );
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx942"] {
+            let untiered = CpuSplitAdmission {
+                kind: Some(SplitOwnerKind::WholeLayer),
+                ..split_on(arch, false)
+            };
+            assert!(untiered.armed(), "{arch}");
+        }
+        // Without the request nothing arms on any arch.
         for arch in ["gfx1100", "gfx1201", "gfx1151"] {
             let mut a = split_on(arch, true);
             a.enabled = false;
@@ -904,21 +1019,24 @@ mod tests {
     fn split_admission_arms_only_the_bound_uniform_tier_shape() {
         assert!(split_admission().armed());
         assert_eq!(split_admission().refusal(), None);
-        let refusals: [(&str, SplitRefusal, fn(&mut CpuSplitAdmission)); 11] = [
-            ("disabled", SplitRefusal::NotRequested, |a| a.enabled = false),
-            ("no tier", SplitRefusal::NotTier, |a| a.tier = false),
+        let refusals: [(&str, SplitRefusal, fn(&mut CpuSplitAdmission)); 10] = [
+            ("disabled", SplitRefusal::NotRequested, |a| {
+                a.enabled = false
+            }),
+            ("no span owner", SplitRefusal::NoSpanOwner, |a| {
+                a.kind = None
+            }),
             (
                 "custom tier, no bound sidecar",
                 SplitRefusal::UnboundHotset,
                 |a| a.bound_hotset = false,
             ),
             ("no cold experts", SplitRefusal::NoColdExperts, |a| a.host_experts = 0),
-            ("not flash-next", SplitRefusal::NotFlashNextMq4, |a| a.flash_next = false),
-            ("mixed codec", SplitRefusal::NotFlashNextMq4, |a| {
-                a.uniform_qt44_qt53 = false
+            ("not flash-next", SplitRefusal::NotFlashNext, |a| a.flash_next = false),
+            ("mixed codec", SplitRefusal::NotCpuExecuted, |a| {
+                a.cpu_executed = false
             }),
             ("ep", SplitRefusal::ExpertParallel, |a| a.ep = true),
-            ("slab", SplitRefusal::Slab, |a| a.slab = true),
             ("awq", SplitRefusal::Awq, |a| a.awq = true),
             ("fp8", SplitRefusal::Fp8, |a| a.fp8 = true),
             ("staged narrow window", SplitRefusal::NarrowStage, |a| {
@@ -935,21 +1053,60 @@ mod tests {
     }
 
     #[test]
+    fn whole_layer_split_arms_without_a_sidecar_and_refuses_every_unsupported_route() {
+        let whole = whole_layer_admission();
+        assert!(whole.armed());
+        assert_eq!(whole.kind, Some(SplitOwnerKind::WholeLayer));
+        // Only a tier layer consults the sidecar binding.
+        assert!(!whole.bound_hotset);
+        let refusals: [(&str, SplitRefusal, fn(&mut CpuSplitAdmission)); 8] = [
+            ("disabled", SplitRefusal::NotRequested, |a| {
+                a.enabled = false
+            }),
+            (
+                "device-resident aggregate",
+                SplitRefusal::NoSpanOwner,
+                |a| a.kind = None,
+            ),
+            ("no host experts", SplitRefusal::NoColdExperts, |a| {
+                a.host_experts = 0
+            }),
+            ("not flash-next", SplitRefusal::NotFlashNext, |a| {
+                a.flash_next = false
+            }),
+            ("non QT44/QT53 experts", SplitRefusal::NotCpuExecuted, |a| {
+                a.cpu_executed = false
+            }),
+            ("ep", SplitRefusal::ExpertParallel, |a| a.ep = true),
+            ("awq", SplitRefusal::Awq, |a| a.awq = true),
+            ("staged narrow window", SplitRefusal::NarrowStage, |a| {
+                a.narrow_stage = true
+            }),
+        ];
+        for (name, reason, mutate) in refusals {
+            let mut a = whole_layer_admission();
+            mutate(&mut a);
+            assert!(!a.armed(), "{name}");
+            assert_eq!(a.refusal(), Some(reason), "{name}");
+        }
+    }
+
+    #[test]
     fn split_refusals_log_one_line_only_for_unsupported_routes() {
         // A layer outside the mode, or with nothing cold, is not a refused
         // route: no line.
         for reason in [
             SplitRefusal::NotRequested,
-            SplitRefusal::NotTier,
+            SplitRefusal::NoSpanOwner,
             SplitRefusal::NoColdExperts,
         ] {
             assert!(reason.is_silent(), "{reason:?}");
         }
         for reason in [
             SplitRefusal::UnboundHotset,
-            SplitRefusal::NotFlashNextMq4,
+            SplitRefusal::NotFlashNext,
+            SplitRefusal::NotCpuExecuted,
             SplitRefusal::ExpertParallel,
-            SplitRefusal::Slab,
             SplitRefusal::Awq,
             SplitRefusal::Fp8,
             SplitRefusal::NarrowStage,
@@ -967,12 +1124,12 @@ mod tests {
         let mut bits = 0u32;
         for reason in [
             SplitRefusal::NotRequested,
-            SplitRefusal::NotTier,
+            SplitRefusal::NoSpanOwner,
             SplitRefusal::NoColdExperts,
             SplitRefusal::UnboundHotset,
-            SplitRefusal::NotFlashNextMq4,
+            SplitRefusal::NotFlashNext,
+            SplitRefusal::NotCpuExecuted,
             SplitRefusal::ExpertParallel,
-            SplitRefusal::Slab,
             SplitRefusal::Awq,
             SplitRefusal::Fp8,
             SplitRefusal::NarrowStage,
@@ -1038,6 +1195,7 @@ mod tests {
 
     #[test]
     fn host_exec_identity_is_empty_unless_cpu_arithmetic_armed() {
+        use SplitOwnerKind::{Tier, WholeLayer};
         assert_eq!(host_exec_identity(&[], &[], None), "");
         let all: Vec<usize> = (0..48).collect();
         assert_eq!(
@@ -1045,7 +1203,7 @@ mod tests {
             "cpu-all-v1/ffffffffffff"
         );
         let digest = [0xabu8; 32];
-        let split = host_exec_identity(&[], &all, Some((&digest, Some(&"c".repeat(64)))));
+        let split = host_exec_identity(&[], &[(Tier, &all)], Some((&digest, Some(&"c".repeat(64)))));
         assert_eq!(
             split,
             format!(
@@ -1054,18 +1212,88 @@ mod tests {
                 "c".repeat(64)
             )
         );
-        let unbound = host_exec_identity(&[], &all, Some((&digest, None)));
+        let unbound = host_exec_identity(&[], &[(Tier, &all)], Some((&digest, None)));
         assert!(unbound.ends_with("/hotset-sha256=unbound"), "{unbound}");
         // Distinct modes, plans and armed layer sets never collide.
         let fewer: Vec<usize> = (0..47).collect();
-        let other = host_exec_identity(&[], &fewer, Some((&digest, Some(&"c".repeat(64)))));
+        let other = host_exec_identity(
+            &[],
+            &[(Tier, &fewer)],
+            Some((&digest, Some(&"c".repeat(64)))),
+        );
         assert_ne!(split, other);
         let other_digest = [0xacu8; 32];
         assert_ne!(
             split,
-            host_exec_identity(&[], &all, Some((&other_digest, Some(&"c".repeat(64)))))
+            host_exec_identity(
+                &[],
+                &[(Tier, &all)],
+                Some((&other_digest, Some(&"c".repeat(64))))
+            )
         );
         assert_ne!(split, host_exec_identity(&all, &[], None));
-        assert!(host_exec_identity(&all, &all, Some((&digest, None))).contains('+'));
+        assert!(host_exec_identity(&all, &[(Tier, &all)], Some((&digest, None))).contains('+'));
+        // The un-tiered whole-layer split has its own identity: no tier digest
+        // or sidecar (there is no plan to freeze: every host expert is cold),
+        // never aliasing the tier or D1 strings.
+        let whole = host_exec_identity(&[], &[(WholeLayer, &all)], None);
+        assert_eq!(whole, "cpu-whole-split-v1/ffffffffffff");
+        assert_ne!(whole, split);
+        assert_ne!(whole, host_exec_identity(&all, &[], None));
+        assert_ne!(
+            whole,
+            host_exec_identity(&[], &[(WholeLayer, &fewer)], None)
+        );
+        // Both split kinds on one load join in the fixed caller order.
+        let tier_labels = [3usize];
+        let both = host_exec_identity(
+            &[],
+            &[(Tier, &tier_labels), (WholeLayer, &fewer)],
+            Some((&digest, Some(&"c".repeat(64)))),
+        );
+        assert!(both.starts_with("cpu-tier-split-v1/"), "{both}");
+        assert!(both.contains("+cpu-whole-split-v1/"), "{both}");
+    }
+
+    /// The whole-layer owner resolves the same bytes D1's owners do, and
+    /// places every expert on the host.
+    #[test]
+    fn whole_layer_owner_serves_d1_spans_and_places_every_expert_cold() {
+        let (gate_up, down) = fake_layout();
+        let d1 = CpuExpertOwners::from_slices(&gate_up, &down, EXPERTS, FAKE_GU, FAKE_DN).unwrap();
+        let owner = HostSpanOwner::WholeLayer(
+            CpuExpertOwners::from_slices(&gate_up, &down, EXPERTS, FAKE_GU, FAKE_DN).unwrap(),
+        );
+        assert_eq!(owner.kind(), SplitOwnerKind::WholeLayer);
+        assert_eq!(owner.cold_experts(), EXPERTS);
+        assert_eq!(owner.placement(), vec![1u8; EXPERTS]);
+        for idx in [0usize, 1, 255, 511] {
+            let spans = owner.payload(idx, DType::MQ4G256, DType::MQ4G256).unwrap();
+            let reference = d1.payload(idx, DType::MQ4G256, DType::MQ4G256).unwrap();
+            assert_eq!(
+                spans.gate_up.as_ptr(),
+                reference.gate_up.as_ptr(),
+                "idx {idx}"
+            );
+            assert_eq!(spans.down.as_ptr(), reference.down.as_ptr(), "idx {idx}");
+            assert_eq!(spans.gate_up.len(), FAKE_GU);
+            assert_eq!(spans.down.len(), FAKE_DN);
+        }
+        assert!(owner
+            .payload(EXPERTS, DType::MQ4G256, DType::MQ4G256)
+            .is_none());
+        // `F32` is a dtype the CPU executor supports (`cpu_quant_for`), so the
+        // generic owner serves it as the same borrowed spans, tagged F32.
+        // Format/span-size safety is the executor's per-expert length check;
+        // the owner only guarantees in-range, in-bounds spans.
+        let f32_payload = owner.payload(0, DType::F32, DType::MQ4G256).unwrap();
+        assert_eq!(
+            Some(f32_payload.gate_up_quant),
+            hipfire_dispatch::cpu_exec::cpu_quant_for(DType::F32)
+        );
+        assert_eq!(f32_payload.gate_up.len(), FAKE_GU);
+        // A dtype without a CPU executor has no payload, never a guess.
+        assert!(owner.payload(0, DType::Raw, DType::MQ4G256).is_none());
+        assert!(owner.payload(0, DType::MQ4G256, DType::Raw).is_none());
     }
 }

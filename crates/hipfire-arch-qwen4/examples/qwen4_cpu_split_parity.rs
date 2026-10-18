@@ -15,6 +15,30 @@
 //! `HIPFIRE_QWEN4_EXPERT_HOTSET`) on any arch (gfx1100 included), and gfx1201 also
 //! takes the default sibling sidecar.
 //!
+//! `--untiered` is the shipped default shape instead: NO hot set, NO tier plan, the load's
+//! placement unchanged (unset `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS` or `auto` resolves the
+//! product loader's automatic placement through the one shared
+//! `expert_residency::incumbent_auto_resident_layers`; a fixed `N` is only an optional
+//! diagnostic override that host-maps trunk layers `N..`. The host-placed layers are READ
+//! BACK from the placed weights and recorded with a placement digest and a
+//! `placement_source`). The split is requested
+//! by the lab force
+//! `HIPFIRE_QWEN4_D2_DEFAULT=1` with `HIPFIRE_OFFLOAD_EXEC` UNSET (an explicit
+//! `memory.offload_exec` always wins over the force, so any explicit value is refused here),
+//! and every armed layer must be a whole-layer host owner: split owner kind `whole-layer`,
+//! identity `cpu-whole-split-v1/<bitmap of the host-placed layers>`, placement all-cold.
+//! The all-CPU oracle reads the artifact's aggregate tensors at the D1 spans (tensor data
+//! offset + expert * stride), re-derived here independently of the slab adapter and compared
+//! with it, never through a bundle owner. The AllCold endpoint must reproduce that oracle
+//! bitwise; there is no hot expert, so the natural run IS the all-cold placement and the
+//! mixed-join gates are replaced by all-cold gates.
+//! Real limits, not gates on a model or card: no arch, device or file name is consulted;
+//! arming, owner kind and identity come from the bundle's own capability accessors. The
+//! oracle reads the packed aggregate MQ4-XTS (QT44 gate/up + QT53 down) expert layout that
+//! `artifact::hotset_aggregate_slabs` adapts and the CPU arithmetic kernels support; any
+//! other expert format/layout is refused there (slab-arena, FP8, planar I4 have no host
+//! aggregate to span), so the lab can only qualify what the shared slab adapter can span.
+//!
 //! Every comparison is SAME-INPUT: the split executor captures, inside the real forward
 //! call of one layer, the exact rotated activation, the original route, the combine
 //! target before the join, the expanded slot buffer the canonical combine consumed, the
@@ -57,6 +81,10 @@
 //!     [--hotset SIDECAR] [--layers 4|0,1,2|all] [--offset 0] [--prompt-rows 32] \
 //!     [--steps 16] [--rows 1] [--greedy] [--timing-rounds 2] [--warmup-steps 2] \
 //!     [--no-endpoints] [--no-timing] [--json OUT.json]
+//!   HIPFIRE_QWEN4_D2_DEFAULT=1 [HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N optional diagnostic override]  (HIPFIRE_OFFLOAD_EXEC unset) \
+//!   cargo run --release -p hipfire-arch-qwen4 --features lab \
+//!     --example qwen4_cpu_split_parity -- MODEL.mq4 TEXT.txt --untiered \
+//!     [--layers ...] [--steps 16] [--rows 1] [--json OUT.json]   (no --hot-budget-mib/--hotset)
 //!
 //! `--layers` selects the first N armed layers (a bare number), an explicit list, or all.
 //! `--rows R` (1..=4) feeds R teacher-forced tokens per step through one narrow forward;
@@ -68,8 +96,10 @@
 use hipfire_arch_qwen4::admit_hfqm_artifact_on;
 use hipfire_arch_qwen4::bundle::Qwen4Bundle;
 use hipfire_arch_qwen4::expert_hotset as hotsets;
+use hipfire_arch_qwen4::expert_residency::{host_placed_trunk_layers, placement_digest};
+use hipfire_arch_qwen4::expert_slab_table::ExpertSlab;
 use hipfire_arch_qwen4::expert_slabs::ExpertFormat;
-use hipfire_arch_qwen4::expert_tier_plan::{plan_expert_tiers_from_slabs, ExpertTierPlan};
+use hipfire_arch_qwen4::expert_tier_plan::plan_expert_tiers_from_slabs;
 use hipfire_dispatch::cpu_exec::{cpu_quant_for, moe_cpu_host_slot_outputs, CpuMoeExpert};
 use hipfire_dispatch::cpu_split::{
     CpuShadow, SplitEndpoint, SplitParityConfig, SplitParityMode, SplitParityRecord, SplitTiming,
@@ -96,7 +126,9 @@ fn e<E: std::fmt::Display>(x: E) -> String {
 const USAGE: &str = "usage: HIPFIRE_OFFLOAD_EXEC=cpu qwen4_cpu_split_parity MODEL.mq4 TEXT.txt \
     --hot-budget-mib N [--hotset SIDECAR] [--layers 4|0,1,2|all] [--offset 0] \
     [--prompt-rows 32] [--steps 16] [--rows 1] [--greedy] [--timing-rounds 2] \
-    [--warmup-steps 2] [--no-endpoints] [--no-timing] [--json OUT.json]";
+    [--warmup-steps 2] [--no-endpoints] [--no-timing] [--json OUT.json]\n   or: \
+    HIPFIRE_QWEN4_D2_DEFAULT=1 [HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N optional diagnostic override; unset/auto = product placement] (HIPFIRE_OFFLOAD_EXEC unset) \
+    qwen4_cpu_split_parity MODEL.mq4 TEXT.txt --untiered [same options, no --hot-budget-mib/--hotset]";
 
 /// Rows the split serves at most (`CPU_SPLIT_MAX_ROWS`).
 const MAX_SPLIT_ROWS: usize = 4;
@@ -112,7 +144,8 @@ enum LayerSel {
 struct Args {
     model: PathBuf,
     text: PathBuf,
-    hot_budget_mib: u64,
+    /// `Some` selects the tiered hot-set run; `None` is `--untiered`.
+    hot_budget_mib: Option<u64>,
     hotset: Option<PathBuf>,
     layers: LayerSel,
     offset: usize,
@@ -125,6 +158,7 @@ struct Args {
     endpoints: bool,
     timing: bool,
     json: Option<PathBuf>,
+    untiered: bool,
 }
 
 fn parse_args() -> R<Args> {
@@ -142,6 +176,7 @@ fn parse_args() -> R<Args> {
     let mut endpoints = true;
     let mut timing = true;
     let mut json = None;
+    let mut untiered = false;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = |name: &str| {
@@ -158,6 +193,7 @@ fn parse_args() -> R<Args> {
                 )
             }
             "--hotset" => hotset = Some(PathBuf::from(value("--hotset")?)),
+            "--untiered" => untiered = true,
             "--layers" => {
                 let list = value("--layers")?;
                 let list = list.trim();
@@ -196,10 +232,18 @@ fn parse_args() -> R<Args> {
     }
     let [model, text] =
         <[String; 2]>::try_from(positional).map_err(|_| format!("need MODEL and TEXT\n{USAGE}"))?;
-    let hot_budget_mib =
-        hot_budget_mib.ok_or_else(|| format!("--hot-budget-mib is required\n{USAGE}"))?;
-    if hot_budget_mib == 0 {
-        return Err("--hot-budget-mib must be > 0".into());
+    if untiered {
+        if hot_budget_mib.is_some() || hotset.is_some() {
+            return Err(
+                "--untiered is the no-hot-set shape: drop --hot-budget-mib/--hotset".into(),
+            );
+        }
+    } else {
+        let mib = hot_budget_mib
+            .ok_or_else(|| format!("--hot-budget-mib is required (or pass --untiered)\n{USAGE}"))?;
+        if mib == 0 {
+            return Err("--hot-budget-mib must be > 0".into());
+        }
     }
     if rows == 0 || rows > MAX_SPLIT_ROWS {
         return Err(format!(
@@ -239,20 +283,24 @@ fn parse_args() -> R<Args> {
         endpoints,
         timing,
         json,
+        untiered,
     })
 }
 
 // ── model ────────────────────────────────────────────────────────────
 
 /// CPU-readable bytes of every expert of every trunk layer, served from the ORIGINAL
-/// artifact mapping through the tier plan's source spans (the bytes `materialize` copied
-/// into both tier owners). Independent of the tier owners and of host-tier residency, so
-/// it resolves hot AND cold experts for the all-CPU reference and the AllCold endpoint.
+/// artifact mapping through the aggregate source spans (the bytes `materialize` copied
+/// into the tier owners, and the bytes the D1/whole-layer host owners pin). Independent of
+/// every owner and of host residency, so it resolves hot AND cold experts for the all-CPU
+/// reference and the AllCold endpoint.
 struct HfqShadow {
     /// Address and length of the artifact mapping covering every source span.
     base: usize,
     len: usize,
-    plan: Arc<ExpertTierPlan>,
+    /// `layer * experts + expert`.
+    slabs: Vec<ExpertSlab>,
+    experts: usize,
 }
 
 impl HfqShadow {
@@ -270,16 +318,18 @@ impl HfqShadow {
 
 impl CpuShadow for HfqShadow {
     fn expert(&self, layer: usize, expert: usize) -> Option<CpuMoeExpert<'_>> {
-        let entry = self.plan.entry(layer, expert)?;
-        if !matches!(entry.format, ExpertFormat::Mq4Xts) {
+        if expert >= self.experts {
             return None;
         }
-        let (gate_up, down) = self.plan.source(layer, expert)?;
+        let slab = self.slabs.get(layer * self.experts + expert)?;
+        if !matches!(slab.format, ExpertFormat::Mq4Xts) {
+            return None;
+        }
         Some(CpuMoeExpert {
             gate_up_quant: cpu_quant_for(DType::MQ4G256V2)?,
-            gate_up: self.bytes(gate_up.offset, gate_up.len)?,
+            gate_up: self.bytes(slab.gate_up.offset, slab.gate_up.len)?,
             down_quant: cpu_quant_for(DType::MQ4G128V2)?,
-            down: self.bytes(down.offset, down.len)?,
+            down: self.bytes(slab.down.offset, slab.down.len)?,
         })
     }
 }
@@ -291,7 +341,22 @@ struct Model {
     vocab: usize,
     shadow: Arc<HfqShadow>,
     hot_experts: usize,
+    /// Tier plan digest (tiered) or `untiered` (no plan exists).
     plan_digest: String,
+    /// Diagnostic only: `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N` when the run set a fixed count
+    /// (trunk layers `0..N` resident); `None` when the product's automatic placement was
+    /// resolved. The authoritative placement is `host_layers`.
+    untiered_vram_layers: Option<usize>,
+    /// Who produced the un-tiered placement: `env-fixed`, `product-resolver` or
+    /// `product-resolver-resident`; `None` for a tiered run.
+    placement_source: Option<&'static str>,
+    /// Trunk layers with host-mapped routed experts in the placed weights (empty for a
+    /// tiered run: the tier owners hold those experts).
+    host_layers: Vec<usize>,
+    /// Digest of `(trunk layer count, host_layers)`: equal across runs means equal placement.
+    placement_digest: String,
+    /// sha256 over every source span the oracle reads (receipt identity of the oracle).
+    span_digest: String,
     /// Keeps the artifact mapping the shadow reads alive; dropped last.
     _source: HfqModelSource,
 }
@@ -300,9 +365,110 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The `qwen4_kld` load plus the product loader's hot-set path (sidecar bound to the
-/// base, aggregate slabs, tier plan under `--hot-budget-mib`, trunk experts removed from
-/// the manifest, tier owners materialized, lease handed to the bundle).
+/// The un-tiered lab shape: the split is requested only by the lab force, never by an
+/// explicit `memory.offload_exec` (which always wins over the force and would change the
+/// route being measured) and never against the `HIPFIRE_MOE_CPU_EXPERTS=0` kill-switch.
+fn admit_untiered(
+    explicit: Option<hipfire_config::memory::OffloadExec>,
+    force: Option<bool>,
+    kill_switch: bool,
+) -> R<()> {
+    if let Some(mode) = explicit {
+        return Err(format!(
+            "--untiered needs memory.offload_exec UNSET (HIPFIRE_OFFLOAD_EXEC unset): '{mode}' is explicit and wins over the D2 force"
+        ));
+    }
+    if force != Some(true) {
+        return Err(format!(
+            "--untiered needs HIPFIRE_QWEN4_D2_DEFAULT=1 (developer.qwen4_d2_default is {force:?})"
+        ));
+    }
+    if kill_switch {
+        return Err("--untiered conflicts with HIPFIRE_MOE_CPU_EXPERTS=0".into());
+    }
+    Ok(())
+}
+
+/// Optional diagnostic fixed placement: `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N` keeps trunk
+/// layers `0..N` resident and host-maps the rest. Unset (or `auto`) returns `None`: the
+/// product loader's automatic placement is then resolved through the shared
+/// `expert_residency::incumbent_auto_resident_layers`. The placement the run actually has is
+/// always read back from the placed weights, never from this value.
+fn untiered_vram_layers(
+    policy: Option<hipfire_arch_qwen4::expert_residency::ExpertVramLayers>,
+    layers: usize,
+) -> R<Option<usize>> {
+    use hipfire_arch_qwen4::expert_residency::ExpertVramLayers;
+    match policy {
+        Some(ExpertVramLayers::Layers(n)) if n < layers => Ok(Some(n)),
+        Some(ExpertVramLayers::Layers(n)) => Err(format!(
+            "HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS={n} keeps all {layers} trunk layers resident: no host-mapped layer to arm"
+        )),
+        Some(ExpertVramLayers::Auto) | None => Ok(None),
+    }
+}
+
+/// Re-derive every expert span from the artifact's aggregate tensors exactly as the D1 host
+/// owner addresses them (tensor data offset + `expert * stride`, exact per-expert extent)
+/// and require the slab table the oracle reads to equal it.
+fn check_d1_spans(hfq: &HfqFile, layers: usize, experts: usize, slabs: &[ExpertSlab]) -> R<()> {
+    let (gu_stride, dn_stride) = (
+        ExpertFormat::Mq4Xts.gate_up_bytes(),
+        ExpertFormat::Mq4Xts.down_bytes(),
+    );
+    if slabs.len() != layers * experts {
+        return Err(format!(
+            "slab table has {} entries, expected {layers} x {experts}",
+            slabs.len()
+        ));
+    }
+    for layer in 0..layers {
+        let base = |suffix: &str| -> R<usize> {
+            let name = format!("model.language_model.layers.{layer}.mlp{suffix}");
+            Ok(hfq
+                .find_tensor_info(&name)
+                .ok_or_else(|| format!("aggregate tensor {name} is missing"))?
+                .data_offset)
+        };
+        let (gu_base, dn_base) = (base(".experts.gate_up_proj")?, base(".experts.down_proj")?);
+        for expert in 0..experts {
+            let slab = &slabs[layer * experts + expert];
+            let ok = matches!(slab.format, ExpertFormat::Mq4Xts)
+                && slab.gate_up.offset == gu_base + expert * gu_stride
+                && slab.gate_up.len == gu_stride
+                && slab.down.offset == dn_base + expert * dn_stride
+                && slab.down.len == dn_stride;
+            if !ok {
+                return Err(format!(
+                    "layer {layer} expert {expert}: slab spans {slab:?} differ from the D1 aggregate spans (gate_up {}+{gu_stride}, down {}+{dn_stride})",
+                    gu_base + expert * gu_stride,
+                    dn_base + expert * dn_stride,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn span_digest(slabs: &[ExpertSlab]) -> String {
+    let mut digest = Sha256::new();
+    for slab in slabs {
+        for v in [
+            slab.gate_up.offset,
+            slab.gate_up.len,
+            slab.down.offset,
+            slab.down.len,
+        ] {
+            digest.update((v as u64).to_le_bytes());
+        }
+    }
+    format!("{:x}", digest.finalize())
+}
+
+/// The `qwen4_kld` load plus (tiered) the product loader's hot-set path (sidecar bound to
+/// the base, aggregate slabs, tier plan under `--hot-budget-mib`, trunk experts removed from
+/// the manifest, tier owners materialized, lease handed to the bundle), or (`--untiered`)
+/// the unchanged placement with no tier lease at all.
 fn load(args: &Args, max_seq: usize) -> R<Model> {
     let path = args.model.as_path();
     let mut hfq = HfqFile::open(path).map_err(|x| format!("open HFQM {}: {x}", path.display()))?;
@@ -311,11 +477,20 @@ fn load(args: &Args, max_seq: usize) -> R<Model> {
     let mut gpu = Gpu::init().map_err(e)?;
     if gpu.is_uma() {
         return Err(format!(
-            "device {} is unified memory: the hot set needs a discrete GPU",
+            "device {} is unified memory: the split needs a discrete GPU",
             gpu.arch
         ));
     }
-    if !hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
+    if args.untiered {
+        admit_untiered(
+            hipfire_config::memory::offload_exec_explicit(),
+            hipfire_config::memory::qwen4_d2_default(),
+            hipfire_config::developer_var("HIPFIRE_MOE_CPU_EXPERTS")
+                .ok()
+                .as_deref()
+                == Some("0"),
+        )?;
+    } else if !hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
         || hipfire_dispatch::cpu_exec::passback_enabled()
     {
         return Err(format!(
@@ -350,129 +525,249 @@ fn load(args: &Args, max_seq: usize) -> R<Model> {
     let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq, &gpu.arch);
     let mesh = DeviceMesh::single().map_err(|x| format!("qwen4 mesh: {x}"))?;
     let expected = WeightOrigin::for_single(&mesh, &gpu);
+    let (layers, experts) = (receipt.config.num_hidden_layers, receipt.config.num_experts);
 
-    // ── hot set: policy, sidecar, plan ───────────────────────────────
-    let policy = match &args.hotset {
-        Some(p) => hotsets::HotsetPolicy::Explicit(p.clone()),
-        None => hotsets::HotsetPolicy::from_env()?,
-    };
-    let env = hotsets::HotsetEnv {
-        gpu_arch: &gpu.arch,
-        unified_memory: false,
-        expert_parallel: false,
-        explicit_vram_layers: false,
-        source: match &receipt.manifest.identity.recipe {
-            hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextPacked { .. } => {
-                hotsets::HotsetSource::Aggregate
-            }
-            hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab { .. } => {
-                hotsets::HotsetSource::SlabArena
-            }
-            hipfire_arch_qwen4::weights::Qwen4TierRecipe::StockFp8 => {
-                hotsets::HotsetSource::StockFp8
-            }
-            _ => hotsets::HotsetSource::Nonaggregate("not an aggregate MQ4 artifact".into()),
-        },
-    };
-    let sidecar_path = hotsets::preflight(&policy, path, &env).map_err(|skip| {
-        skip.log_line(&policy.sidecar_path(path))
-            .unwrap_or_else(|| skip.to_string())
-    })?;
-    let base = hotsets::HotsetBase::from_hfq(&hfq)?;
-    let sidecar = hotsets::HotsetSidecar::load_bound(
-        &sidecar_path,
-        receipt.config.num_hidden_layers,
-        receipt.config.num_experts,
-        receipt.config.num_experts_per_tok,
-        &base,
-    )
-    .map_err(|skip| skip.to_string())?;
-    receipt.manifest.check_expert_tiers().map_err(e)?;
+    // ── oracle spans: the artifact's aggregate tensors at the D1 spans ──
     let slabs = hipfire_arch_qwen4::artifact::hotset_aggregate_slabs(
         &hfq,
         &receipt.config,
         &receipt.manifest,
     )?;
-    let budget = args.hot_budget_mib << 20;
-    let plan = plan_expert_tiers_from_slabs(&slabs, sidecar.rank(), budget).map_err(e)?;
-    hotsets::require_experts(plan.device_experts()).map_err(|skip| skip.to_string())?;
-    plan.check_executable(&gpu.arch).map_err(e)?;
-    let hot_experts = plan.device_experts();
-    let plan = Arc::new(plan);
-    let plan_digest = hex(&plan.logical_digest());
-
+    check_d1_spans(&hfq, layers, experts, &slabs)?;
+    let spans_digest = span_digest(&slabs);
     // The one mapping every source span lies in (also the shadow's backing store).
-    let (layers, experts) = (receipt.config.num_hidden_layers, receipt.config.num_experts);
     let mut need = 0usize;
-    for layer in 0..layers {
-        for expert in 0..experts {
-            let (gate_up, down) = plan.source(layer, expert).ok_or_else(|| {
-                format!("tier plan has no source spans for layer {layer} expert {expert}")
-            })?;
-            for span in [gate_up, down] {
-                need = need.max(span.end().ok_or("source span end overflows")?);
-            }
+    for slab in &slabs {
+        for span in [slab.gate_up, slab.down] {
+            need = need.max(span.end().ok_or("source span end overflows")?);
         }
     }
     let (map_base, map_len) = {
         let all = hfq
             .data_range(0, need)
-            .ok_or("the artifact mapping does not cover the plan's source spans")?;
+            .ok_or("the artifact mapping does not cover the source spans")?;
         (all.as_ptr() as usize, all.len())
     };
     let shadow = Arc::new(HfqShadow {
         base: map_base,
         len: map_len,
-        plan: plan.clone(),
+        slabs: slabs.clone(),
+        experts,
     });
-    // Self-check: the shadow serves exactly the bytes the tier owners were filled from.
+    // Self-check: the shadow serves exactly the artifact mapping's bytes.
     for (layer, expert) in [(0usize, 0usize), (layers - 1, experts - 1)] {
         let got = shadow
             .expert(layer, expert)
             .ok_or("shadow cannot serve a probe expert")?;
-        let (gate_up, _) = plan.source(layer, expert).ok_or("probe span")?;
+        let slab = &slabs[layer * experts + expert];
         let direct = hfq
-            .data_range(gate_up.offset, gate_up.len)
+            .data_range(slab.gate_up.offset, slab.gate_up.len)
             .ok_or("probe range")?;
         if got.gate_up != direct {
             return Err("shadow resolver disagrees with the artifact mapping".into());
         }
     }
 
-    // ── manifest: trunk experts are tier-owned, the MTP layer's stay host-mapped ──
+    // Resolved once, before placement: the product's automatic placement is sized from them
+    // and the bundle is assembled with the same values.
+    let state_format = hipfire_arch_qwen4::resolve_state_format(
+        &hipfire_runtime::config::get().kv_mode,
+        &std::env::var("HIPFIRE_STATE_QUANT").unwrap_or_default(),
+        &gpu,
+        &receipt.config,
+    )?;
+    let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
     let mut manifest = receipt.manifest;
     let mut placements = receipt.placements;
-    let mtp_moved =
-        hipfire_arch_qwen4::expert_residency::place_routed_experts(&mut manifest.weights, layers);
-    manifest = manifest.with_expert_tiers().map_err(e)?;
+    let (tier_lease, hot_experts, plan_digest, untiered_layers, placement_source) = if let Some(
+        mib,
+    ) =
+        args.hot_budget_mib
     {
-        let keep: BTreeSet<_> = manifest.resident_keys().collect();
-        placements.retain(|placement| keep.contains(&(placement.name.as_str(), placement.layer)));
+        // ── hot set: policy, sidecar, plan ───────────────────────────
+        let policy = match &args.hotset {
+            Some(p) => hotsets::HotsetPolicy::Explicit(p.clone()),
+            None => hotsets::HotsetPolicy::from_env()?,
+        };
+        let env = hotsets::HotsetEnv {
+            gpu_arch: &gpu.arch,
+            unified_memory: false,
+            expert_parallel: false,
+            explicit_vram_layers: false,
+            source: match &manifest.identity.recipe {
+                hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextPacked { .. } => {
+                    hotsets::HotsetSource::Aggregate
+                }
+                hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab { .. } => {
+                    hotsets::HotsetSource::SlabArena
+                }
+                hipfire_arch_qwen4::weights::Qwen4TierRecipe::StockFp8 => {
+                    hotsets::HotsetSource::StockFp8
+                }
+                _ => hotsets::HotsetSource::Nonaggregate("not an aggregate MQ4 artifact".into()),
+            },
+        };
+        let sidecar_path = hotsets::preflight(&policy, path, &env).map_err(|skip| {
+            skip.log_line(&policy.sidecar_path(path))
+                .unwrap_or_else(|| skip.to_string())
+        })?;
+        let base = hotsets::HotsetBase::from_hfq(&hfq)?;
+        let sidecar = hotsets::HotsetSidecar::load_bound(
+            &sidecar_path,
+            receipt.config.num_hidden_layers,
+            receipt.config.num_experts,
+            receipt.config.num_experts_per_tok,
+            &base,
+        )
+        .map_err(|skip| skip.to_string())?;
+        manifest.check_expert_tiers().map_err(e)?;
+        let budget = mib << 20;
+        let plan = plan_expert_tiers_from_slabs(&slabs, sidecar.rank(), budget).map_err(e)?;
+        hotsets::require_experts(plan.device_experts()).map_err(|skip| skip.to_string())?;
+        plan.check_executable(&gpu.arch).map_err(e)?;
+        let hot_experts = plan.device_experts();
+        let plan = Arc::new(plan);
+        let plan_digest = hex(&plan.logical_digest());
+
+        // ── manifest: trunk experts are tier-owned, the MTP layer's stay host-mapped ──
+        let mtp_moved = hipfire_arch_qwen4::expert_residency::place_routed_experts(
+            &mut manifest.weights,
+            layers,
+        );
+        manifest = manifest.with_expert_tiers().map_err(e)?;
+        {
+            let keep: BTreeSet<_> = manifest.resident_keys().collect();
+            placements
+                .retain(|placement| keep.contains(&(placement.name.as_str(), placement.layer)));
+        }
+        eprintln!(
+            "qwen4_cpu_split_parity: hot set {} sha256 {}, budget {mib} MiB, {hot_experts} experts in VRAM, plan digest {}, {mtp_moved} MTP expert tensors host-mapped",
+            sidecar_path.display(),
+            sidecar.sha256(),
+            &plan_digest[..16],
+        );
+        let lease = hipfire_arch_qwen4::expert_tier_owners::materialize(
+            &mut gpu,
+            plan.clone(),
+            &|offset, len| {
+                let offset = usize::try_from(offset)
+                    .map_err(|_| "hotset source offset overflow".to_string())?;
+                let len = usize::try_from(len)
+                    .map_err(|_| "hotset source length overflow".to_string())?;
+                hfq.data_range(offset, len).ok_or_else(|| {
+                    format!("source span {offset}+{len} is outside the artifact mapping")
+                })
+            },
+        )
+        .map_err(|x| format!("expert tier materialize: {x}"))?;
+        lease
+            .bind_hotset_sidecar_sha256(sidecar.sha256())
+            .map_err(|x| format!("hotset numerical identity: {x}"))?;
+        (Some(lease), hot_experts, plan_digest, None, None)
+    } else {
+        // ── un-tiered: no hot set, no tier lease. Unset (or `auto`) resolves the product
+        // loader's automatic placement through the one shared resolver; a fixed N is an
+        // optional diagnostic override ──
+        use hipfire_arch_qwen4::expert_residency as residency;
+        let vram_layers = untiered_vram_layers(residency::expert_vram_layers_from_env()?, layers)?;
+        let placement_source = match vram_layers {
+            Some(n) => {
+                let moved = residency::place_routed_experts(&mut manifest.weights, n);
+                eprintln!(
+                    "qwen4_cpu_split_parity: un-tiered placement (diagnostic N={n}): routed experts of trunk layers 0..{n} in VRAM, {moved} expert tensors host-mapped"
+                );
+                "env-fixed"
+            }
+            None => {
+                let recipe = &manifest.identity.recipe;
+                let slab_recipe = matches!(
+                    recipe,
+                    hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab { .. }
+                );
+                // Entry sizes as the product loader sizes them: a slab layer arena from the
+                // recipe's plan, anything else from the mapped tensor.
+                let bytes_of =
+                    |entry: &hipfire_runtime::weight_manifest::WeightEntry| -> Option<u64> {
+                        if let hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab {
+                            arenas,
+                            ..
+                        } = recipe
+                        {
+                            if entry
+                                .name
+                                .ends_with(hipfire_arch_qwen4::expert_arena::ARENA_SUFFIX)
+                            {
+                                return entry
+                                    .layer
+                                    .and_then(|layer| arenas.layer(layer))
+                                    .map(|layer| layer.bytes as u64);
+                            }
+                        }
+                        hfq.tensor_data(&entry.name)
+                            .map(|(_, bytes)| bytes.len() as u64)
+                    };
+                let vmm_granularity = match backend {
+                    hipfire_arch_qwen4::Qwen4KvBackend::Vmm => gpu
+                        .vmm_recommended_granularity()
+                        .map_err(|x| format!("qwen4: VMM granularity: {x}"))?,
+                    hipfire_arch_qwen4::Qwen4KvBackend::Legacy => 1,
+                };
+                let resolved = residency::incumbent_auto_resident_layers(
+                    &gpu,
+                    &receipt.config,
+                    &manifest.weights,
+                    &bytes_of,
+                    backend,
+                    max_seq,
+                    vmm_granularity,
+                    state_format,
+                    scratch_mode,
+                    residency::dedicated_slab_stage(
+                        residency::expert_stage_placement_enabled(&gpu.arch),
+                        slab_recipe,
+                        false,
+                    ),
+                )?;
+                match resolved {
+                    Some(n) => {
+                        let moved = residency::place_routed_experts(&mut manifest.weights, n);
+                        eprintln!(
+                            "qwen4_cpu_split_parity: routed experts: product automatic placement (expert_residency::incumbent_auto_resident_layers): layers 0..{n} in VRAM, {moved} tensors host-mapped"
+                        );
+                        "product-resolver"
+                    }
+                    None => {
+                        eprintln!(
+                            "qwen4_cpu_split_parity: routed experts: product automatic placement keeps every expert resident"
+                        );
+                        "product-resolver-resident"
+                    }
+                }
+            }
+        };
+        (
+            None,
+            0,
+            "untiered".to_string(),
+            vram_layers,
+            Some(placement_source),
+        )
+    };
+    let host_layers = host_placed_trunk_layers(&manifest.weights);
+    let placement_digest = placement_digest(layers, &host_layers);
+    if args.untiered {
+        if host_layers.is_empty() {
+            return Err(
+                "the resolved placement has no host-mapped trunk layer (the product's automatic placement keeps every expert resident on this card): nothing for the whole-layer split to own; set a diagnostic HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N so the card hosts experts"
+                    .into(),
+            );
+        }
+        eprintln!(
+            "qwen4_cpu_split_parity: resolved placement: {} of {layers} trunk layers host-placed {host_layers:?}, placement digest {placement_digest}, no hot set, no tier lease; D1 span digest {}",
+            host_layers.len(),
+            &spans_digest[..16]
+        );
     }
-    eprintln!(
-        "qwen4_cpu_split_parity: hot set {} sha256 {}, budget {} MiB, {hot_experts} experts in VRAM, plan digest {}, {mtp_moved} MTP expert tensors host-mapped",
-        sidecar_path.display(),
-        sidecar.sha256(),
-        args.hot_budget_mib,
-        &plan_digest[..16],
-    );
-    let lease = hipfire_arch_qwen4::expert_tier_owners::materialize(
-        &mut gpu,
-        plan.clone(),
-        &|offset, len| {
-            let offset =
-                usize::try_from(offset).map_err(|_| "hotset source offset overflow".to_string())?;
-            let len =
-                usize::try_from(len).map_err(|_| "hotset source length overflow".to_string())?;
-            hfq.data_range(offset, len).ok_or_else(|| {
-                format!("source span {offset}+{len} is outside the artifact mapping")
-            })
-        },
-    )
-    .map_err(|x| format!("expert tier materialize: {x}"))?;
-    lease
-        .bind_hotset_sidecar_sha256(sidecar.sha256())
-        .map_err(|x| format!("hotset numerical identity: {x}"))?;
 
     let source = HfqModelSource::from_hfq(hfq);
     let transaction = fulfill_manifest_from_payloads(
@@ -504,13 +799,6 @@ fn load(args: &Args, max_seq: usize) -> R<Model> {
     )
     .map_err(|x| format!("qwen4 manifest fulfillment: {x}"))?;
     let vocab = receipt.config.vocab_size;
-    let state_format = hipfire_arch_qwen4::resolve_state_format(
-        &hipfire_runtime::config::get().kv_mode,
-        &std::env::var("HIPFIRE_STATE_QUANT").unwrap_or_default(),
-        &gpu,
-        &receipt.config,
-    )?;
-    let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
     let mut bundle = Qwen4Bundle::assemble_with_ple_rows(
         receipt.config,
         &manifest.identity.recipe,
@@ -522,7 +810,7 @@ fn load(args: &Args, max_seq: usize) -> R<Model> {
         receipt.ple_rows,
         state_format,
         backend,
-        Some(lease),
+        tier_lease,
     )
     .map_err(|x| format!("qwen4 bundle assembly: {x}"))?;
     bundle.attach_npu_trunk_identity(npu_identity);
@@ -554,6 +842,11 @@ fn load(args: &Args, max_seq: usize) -> R<Model> {
         shadow,
         hot_experts,
         plan_digest,
+        untiered_vram_layers: untiered_layers,
+        host_layers,
+        placement_digest,
+        placement_source,
+        span_digest: spans_digest,
         _source: source,
     })
 }
@@ -671,6 +964,8 @@ struct LayerAgg {
     hot_row_mismatch: u64,
     cold_row_mismatch: u64,
     nonfinite: u64,
+    /// Experts the record's placement mask puts on the device (0 for a whole-layer owner).
+    placement_hot: u64,
     d2_vs_cpu: Diff,
     d2_vs_gpu: Diff,
     cpu_vs_gpu: Diff,
@@ -756,6 +1051,7 @@ fn analyze(rec: &SplitParityRecord, shadow: &HfqShadow, agg: &mut LayerAgg) -> R
     let t_gpu = target(&rec.gpu_expanded);
 
     agg.calls += 1;
+    agg.placement_hot += rec.placement.iter().filter(|&&p| p == 0).count() as u64;
     agg.rows += rows as u64;
     agg.twin_mismatch += bit_mismatch(&twin, &rec.d2_target);
     agg.d2_vs_cpu.add(&rec.d2_target, &t_cpu);
@@ -1133,6 +1429,7 @@ fn layer_json(layer: usize, a: &LayerAgg) -> Value {
             "all_cold_rows_vs_all_cpu": a.cold_row_mismatch,
         },
         "nonfinite": a.nonfinite,
+        "placement_hot_experts": a.placement_hot,
     })
 }
 
@@ -1223,6 +1520,24 @@ fn bitwise_gates(gates: &mut Vec<Gate>, run: &str, aggs: &BTreeMap<usize, LayerA
     );
 }
 
+/// Hex of a layer bitmap exactly as the core identity renders it: bit `i` is layer `i`, one
+/// big number, most significant byte first, `"0"` when empty.
+fn layer_bitmap_hex(labels: &[usize]) -> String {
+    let Some(&max) = labels.iter().max() else {
+        return "0".to_string();
+    };
+    let mut bytes = vec![0u8; max / 8 + 1];
+    for &label in labels {
+        bytes[label / 8] |= 1 << (label % 8);
+    }
+    bytes.iter().rev().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The identity a pure whole-layer split over exactly `armed` must carry.
+fn whole_identity(armed: &[usize]) -> String {
+    format!("cpu-whole-split-v1/{}", layer_bitmap_hex(armed))
+}
+
 fn real_main() -> R<bool> {
     let args = parse_args()?;
     let text = std::fs::read_to_string(&args.text)
@@ -1245,10 +1560,13 @@ fn real_main() -> R<bool> {
 
     let armed = m.bundle.split_layers();
     if armed.is_empty() {
-        return Err(
+        return Err(if args.untiered {
+            "the whole-layer D2 split armed on no layer: needs HIPFIRE_QWEN4_D2_DEFAULT=1 with HIPFIRE_OFFLOAD_EXEC unset, aggregate QT44/QT53 experts host-mapped (the product's automatic placement, or a diagnostic HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=N), and HIPFIRE_MOE_CPU_EXPERTS != 0"
+                .into()
+        } else {
             "the D2 split armed on no layer: needs HIPFIRE_OFFLOAD_EXEC=cpu, the hot set applied (explicit sidecar on gfx1100) and host-tier experts with CPU spans"
-                .into(),
-        );
+                .into()
+        });
     }
     let layers: Vec<usize> = match &args.layers {
         LayerSel::All => armed.clone(),
@@ -1266,13 +1584,28 @@ fn real_main() -> R<bool> {
         return Err("--layers selected no layer".into());
     }
     let digest = m.bundle.split_digest();
+    let identity = m.bundle.host_exec_identity();
+    let owner_kinds = m.bundle.split_owner_kinds();
+    let shape = if args.untiered {
+        format!(
+            "UN-TIERED whole-layer ({} host-placed layers {:?}, placement {}, no hot set, D1 span digest {})",
+            m.host_layers.len(),
+            m.host_layers,
+            &m.placement_digest[..16],
+            &m.span_digest[..16]
+        )
+    } else {
+        format!(
+            "hot set {} experts (plan {})",
+            m.hot_experts,
+            &m.plan_digest[..16]
+        )
+    };
     println!(
-        "qwen4_cpu_split_parity: {} armed layers, {} selected {:?}, hot set {} experts (plan {}), split digest {}, {} threads, prompt {} rows, {} steps x {} rows, {}",
+        "qwen4_cpu_split_parity: {} armed layers, {} selected {:?}, {shape}, split digest {}, identity {identity}, {} threads, prompt {} rows, {} steps x {} rows, {}",
         armed.len(),
         layers.len(),
         layers,
-        m.hot_experts,
-        &m.plan_digest[..16],
         digest.as_deref().unwrap_or("-"),
         std::env::var("HIPFIRE_CPU_EXPERT_THREADS").unwrap_or_else(|_| "default".into()),
         args.prompt_rows,
@@ -1284,6 +1617,59 @@ fn real_main() -> R<bool> {
     let mut gates: Vec<Gate> = Vec::new();
     let mut runs_json: Vec<Value> = Vec::new();
 
+    // ── identity: owner kind, identity string, placement, lab force ──
+    let want_kind = if args.untiered { "whole-layer" } else { "tier" };
+    gate(
+        &mut gates,
+        format!("identity: every armed layer is a {want_kind} owner"),
+        owner_kinds.iter().map(|(l, _)| *l).collect::<Vec<_>>() == armed
+            && owner_kinds.iter().all(|(_, k)| *k == want_kind),
+        format!(
+            "{} armed layers, owner kinds {:?}",
+            armed.len(),
+            owner_kinds.iter().map(|(_, k)| *k).collect::<BTreeSet<_>>()
+        ),
+    );
+    if args.untiered {
+        let want = whole_identity(&armed);
+        gate(
+            &mut gates,
+            "identity: host_exec_identity == cpu-whole-split-v1/<armed bitmap> (no D1/tier part)",
+            identity == want && digest.as_deref() == Some(want.as_str()),
+            format!("identity {identity}, split_digest {digest:?}, expected {want}"),
+        );
+        let host_layers = m.host_layers.clone();
+        gate(
+            &mut gates,
+            "identity: armed layers == every resolved host-placed trunk layer",
+            armed == host_layers,
+            format!(
+                "armed {} layers {armed:?}, resolved host-placed layers {host_layers:?}, placement digest {}",
+                armed.len(),
+                m.placement_digest
+            ),
+        );
+        let (force, explicit) = (
+            hipfire_config::memory::qwen4_d2_default(),
+            hipfire_config::memory::offload_exec_explicit(),
+        );
+        gate(
+            &mut gates,
+            "lab force: developer.qwen4_d2_default=true with memory.offload_exec unset",
+            force == Some(true) && explicit.is_none(),
+            format!("qwen4_d2_default {force:?}, offload_exec explicit {explicit:?}"),
+        );
+    } else {
+        gate(
+            &mut gates,
+            "identity: tier identity unchanged (cpu-tier-split-v1/..)",
+            identity.starts_with("cpu-tier-split-v1/")
+                && !identity.contains("cpu-whole-split-v1")
+                && digest.as_deref() == Some(identity.as_str()),
+            format!("identity {identity}"),
+        );
+    }
+
     // ── natural placement: same-input comparisons ────────────────────
     let natural = PassSpec {
         name: "natural".into(),
@@ -1291,18 +1677,35 @@ fn real_main() -> R<bool> {
         endpoint: SplitEndpoint::Natural,
         schedule: Schedule::Overlapped,
     };
-    println!("RUN natural (real mixed placement, overlapped schedule, full capture)");
+    println!(
+        "RUN natural ({}, overlapped schedule, full capture)",
+        if args.untiered {
+            "un-tiered: every valid slot cold"
+        } else {
+            "real mixed placement"
+        }
+    );
     let (aggs, natural_out) = full_pass(&mut m, &args, &natural, &tokens, &layers)?;
     print_layers(&aggs);
     bitwise_gates(&mut gates, "natural", &aggs, args.steps);
     let hot_total: u64 = aggs.values().map(|a| a.hot_slots).sum();
     let cold_total: u64 = aggs.values().map(|a| a.cold_slots).sum();
-    gate(
-        &mut gates,
-        "natural: join exercised",
-        hot_total > 0 && cold_total > 0,
-        format!("{hot_total} hot and {cold_total} cold slots in the selected layers"),
-    );
+    if args.untiered {
+        let placement_hot: u64 = aggs.values().map(|a| a.placement_hot).sum();
+        gate(
+            &mut gates,
+            "natural: all-cold placement (no hot slot, no device expert in the mask)",
+            hot_total == 0 && placement_hot == 0 && cold_total > 0,
+            format!("{hot_total} hot and {cold_total} cold slots, {placement_hot} device experts in the placement masks"),
+        );
+    } else {
+        gate(
+            &mut gates,
+            "natural: join exercised",
+            hot_total > 0 && cold_total > 0,
+            format!("{hot_total} hot and {cold_total} cold slots in the selected layers"),
+        );
+    }
     let worst = |f: fn(&LayerAgg) -> &Diff| {
         let mut d = Diff::default();
         aggs.values().for_each(|a| d.merge(f(a)));
@@ -1353,6 +1756,18 @@ fn real_main() -> R<bool> {
                 side_rows + empty == valid_rows,
                 format!("{side_rows} of {valid_rows} rows ({empty} unrouted) compared bitwise; mismatching rows would fail the row gates above"),
             );
+            if args.untiered && endpoint == SplitEndpoint::AllCold {
+                // The natural run is the all-cold placement computed from the owners' pinned
+                // bytes; this run computes every slot from the artifact's D1 spans. Same
+                // arithmetic on equal bytes: the logits must agree bit for bit.
+                let first = first_digest_mismatch(&out.digests, &natural_out.digests);
+                gate(
+                    &mut gates,
+                    "all-cold: logits bit-identical to the natural run (owner bytes == D1 span bytes)",
+                    first.is_none(),
+                    format!("{} steps, first mismatching step {first:?}", args.steps),
+                );
+            }
             runs_json.push(json!({
                 "run": name, "layers": aggs.iter().map(|(l, a)| layer_json(*l, a)).collect::<Vec<_>>(),
                 "logits_sha256": out.digests,
@@ -1548,6 +1963,16 @@ fn real_main() -> R<bool> {
             "text": args.text.display().to_string(),
             "arch": m.gpu.arch.to_string(),
             "hot_budget_mib": args.hot_budget_mib,
+            "untiered": args.untiered,
+            "untiered_vram_layers_diagnostic": m.untiered_vram_layers,
+            "host_placed_trunk_layers": m.host_layers,
+            "placement_digest": m.placement_digest,
+            "placement_source": m.placement_source,
+            "d2_force": hipfire_config::memory::qwen4_d2_default(),
+            "offload_exec_explicit": hipfire_config::memory::offload_exec_explicit().map(|v| v.to_string()),
+            "span_digest": m.span_digest,
+            "host_exec_identity": identity,
+            "split_owner_kinds": owner_kinds.iter().map(|(l, k)| json!([l, k])).collect::<Vec<_>>(),
             "hot_experts": m.hot_experts,
             "plan_digest": m.plan_digest,
             "split_digest": digest,
@@ -1636,5 +2061,52 @@ mod tests {
         let (pairs, matching) = timing_comparisons(&runs[..2], true);
         assert!(pairs.is_empty());
         assert!(matching); // No evidence: caller must report not_checked, not pass.
+    }
+
+    #[test]
+    fn whole_identity_renders_the_core_bitmap() {
+        assert_eq!(layer_bitmap_hex(&[]), "0");
+        assert_eq!(
+            whole_identity(&(0..48).collect::<Vec<_>>()),
+            "cpu-whole-split-v1/ffffffffffff"
+        );
+        assert_eq!(whole_identity(&[0]), "cpu-whole-split-v1/01");
+        assert_eq!(whole_identity(&[9]), "cpu-whole-split-v1/0200");
+        assert_eq!(whole_identity(&[1, 9]), "cpu-whole-split-v1/0202");
+    }
+
+    #[test]
+    fn untiered_admission_requires_force_and_no_explicit_exec() {
+        use hipfire_config::memory::OffloadExec;
+        assert!(admit_untiered(None, Some(true), false).is_ok());
+        assert!(admit_untiered(None, None, false).is_err());
+        assert!(admit_untiered(None, Some(false), false).is_err());
+        assert!(admit_untiered(None, Some(true), true).is_err());
+        for mode in [OffloadExec::Pcie, OffloadExec::Cpu, OffloadExec::Passback] {
+            assert!(
+                admit_untiered(Some(mode), Some(true), false).is_err(),
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn untiered_fixed_layers_are_an_optional_override() {
+        use hipfire_arch_qwen4::expert_residency::ExpertVramLayers;
+        assert_eq!(
+            untiered_vram_layers(Some(ExpertVramLayers::Layers(0)), 48),
+            Ok(Some(0))
+        );
+        assert_eq!(
+            untiered_vram_layers(Some(ExpertVramLayers::Layers(47)), 48),
+            Ok(Some(47))
+        );
+        assert!(untiered_vram_layers(Some(ExpertVramLayers::Layers(48)), 48).is_err());
+        // Unset and `auto` both resolve the product's automatic placement.
+        assert_eq!(
+            untiered_vram_layers(Some(ExpertVramLayers::Auto), 48),
+            Ok(None)
+        );
+        assert_eq!(untiered_vram_layers(None, 48), Ok(None));
     }
 }
