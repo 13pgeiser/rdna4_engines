@@ -1096,7 +1096,8 @@ every KV group, rather than per group and per layer.
 It carries: token ids and positions; per-group slot mappings and block tables; sequence boundaries
 (`cu_seqlens`); query and context lengths with their host-side upper bounds; the speculative window
 layout (§10); encoder rows and M-RoPE positions (§11); checkpoint destinations (§7.3); the phase,
-which the run phase uses to index bucket tables (§2.2); and the decode/prefill split.
+which the run phase uses to index bucket tables (§2.2); the decode/prefill split; and each row's
+runtime LoRA adapter slot (`lora_slot`, null when the engine serves no adapters).
 
 The split is `n_seq_decode` and `n_tok_decode`: the core orders every step so its decode rows come
 first, and those two say where they end. A block that treats the two kinds of row differently (a

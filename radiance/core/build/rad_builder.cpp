@@ -9,6 +9,7 @@
  * which makes fusion a selection rather than a compiler pass (spec §2.3).
  */
 #include "rad_build.h"
+#include "lora/lora.h"
 #include "../device/device.h"
 
 #include <algorithm>
@@ -700,6 +701,40 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
                 oi.weight_opd[(size_t)wi++] = k;
             }
         }
+    }
+
+    /* RUNTIME LoRA: A FUSED GEMM OVER A TARGETED WEIGHT IS DECLINED. Every `gemm_*` op other than
+     * the four an adapter delta can follow (lora::op_is_site) fuses something into its epilogue --
+     * the gated fold quantises the SiLU product in place -- so the delta has no y to land in. The
+     * op is recorded resolved to nothing, exactly as a library without the kernel would leave it,
+     * and the plugin falls back to the unfused chain it emits for that library. The decision reads
+     * only the weight's own declaration and name map, so the sizing declare makes the same one. */
+    bool lora_declined = false;
+    if (lora_targets_ && n_w > 0 && oi.op.rfind("gemm_", 0) == 0 && oi.op != "gemm_nt" &&
+        oi.op != "gemm_nt_bias" && oi.op != "gemm_nt_q" && oi.op != "gemm_nt_q_bias") {
+        for (int i = 0; i < n_w && !lora_declined; ++i)
+            if (w[i] > 0 && w[i] < prog_.weights.size() &&
+                lora::weight_targeted(prog_, w[i], *lora_targets_))
+                lora_declined = true;
+    }
+
+    if (lora_declined) {
+        Band none;
+        none.hi = oi.ranged_key.empty() ? INT64_MAX : oi.range_hi;
+        for (int d = 0; d < RAD_N_DOMAINS; ++d)
+            none.miss[d] = "declined: its weight is a runtime-LoRA target, and a fused GEMM has no "
+                           "output for the adapter's delta (the plugin runs the unfused chain)";
+        oi.bands.assign(1, none);
+        oi.lora_declined = true;
+        /* AND IT OWNS NO WEIGHT. The planner, the layout pass and the weight-use bookkeeping all
+         * read an op's weights, and an op with no kernel anywhere would tell the planner the weight
+         * cannot be read on the card -- moving the gate_up the unfused chain multiplies on the card
+         * off it. The op stays in the list, by name, so the sizing declare lines up. */
+        oi.weights.clear();
+        oi.weight_opd.clear();
+        prog_.ops.push_back(std::move(oi));
+        op_bufs_.emplace_back();
+        return RAD_NULL_HANDLE;
     }
 
     if (ref_) {

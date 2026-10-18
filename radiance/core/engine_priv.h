@@ -17,6 +17,7 @@
 #include "mem/kvtier.h"
 #include "runtime/tierexec.h"
 #include "build/rad_build.h"
+#include "lora/declare.h"
 #include "place/heat.h"
 #include "place/planner.h"
 #include "place/mover.h"
@@ -33,6 +34,9 @@ struct Engine::Rank {
     int       index = 0;
     int       device = 0;
     Program   program;          /* declare runs once per rank: dimensions are already divided */
+    /* RUNTIME LoRA: this rank's sites (core/lora/lora.h), the loader's map from an adapter's
+     * modules to this rank's slot bytes. Empty with LoRA off. */
+    std::vector<lora::Site> lora_sites;
     Plan      plan;
     Pools     pools;
     Mover     mover;

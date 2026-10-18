@@ -316,6 +316,7 @@ int Ctx::bind_ops() {
         /* Matched by name once here, not on the issue path; see OpPlan::billed. */
         p.billed     = (oi.op == "all_reduce");
         p.collective = p.billed;
+        p.lora_site  = oi.lora_site;
 
         for (const Band& b : oi.bands) band_table_.push_back(b.hi);
 
@@ -899,7 +900,7 @@ int Ctx::lane_join(int from, int to) {
 /* The key below reads every RadBatch field a pass's shape or arguments can depend on, by hand. A
  * field added to RadBatch changes its size: decide whether the key must read it, then update the
  * size here. */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 312,
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 320,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
 static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 72,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
@@ -926,6 +927,10 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
     ptr(b->token_ids);  ptr(b->positions);  ptr(b->cu_seqlens);    ptr(b->seq_ids);
     ptr(b->out_ids);    ptr(b->q_lens);     ptr(b->ctx_lens);      ptr(b->num_accepted);
     ptr(b->spec_parent); ptr(b->checkpoint_tok); ptr(b->checkpoint_slot); ptr(b->draft_out_ids);
+    /* The adapter ops' slot pointer. One address per rank for the engine's life, null without
+     * adapters; the slots themselves are read on the card, and the ops are issued whether or not a
+     * row has an adapter, so what a recorded pass launches never depends on their values. */
+    ptr(b->lora_slot);
     for (int g = 0; g < b->n_kv_groups; ++g) {
         const RadKVGroupBatch& k = b->kv[g];
         mix((uint64_t)k.group);  ptr(k.slot_mapping); ptr(k.block_table);

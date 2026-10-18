@@ -88,6 +88,7 @@ int         avx_par_force(int threads);
     /* ---- gemm and the vocabulary edges */                                                      \
     X(gemm_nt)              X(gemm_nt_bias)         X(gemm_nt_q)            X(gemm_nt_q_bias)     \
     X(gemm_nt_q_gated)      X(embed_lookup)         X(embed_lookup_q)       X(logits_gemm)        \
+    X(lora_shrink)          X(lora_expand)                                                        \
     /* ---- attention */                                                                          \
     X(attn_paged)           X(attn_dense)           X(kv_store)             X(rope)               \
     X(rope_table)           X(qk_norm_rope)         X(qsa_block_key)        X(attn_local_rel)     \

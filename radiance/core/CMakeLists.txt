@@ -3,7 +3,8 @@
 #
 # Sources are globbed per subdirectory with CONFIGURE_DEPENDS. Re-run cmake if a new file does not
 # appear.
-set(RAD_CORE_DIRS util device plugin build runtime mem sched place sample text server format mm diag gen)
+set(RAD_CORE_DIRS util device plugin build runtime mem sched place sample text server format mm diag gen
+                  lora)
 
 set(RAD_CORE_SRC "")
 foreach(d ${RAD_CORE_DIRS})

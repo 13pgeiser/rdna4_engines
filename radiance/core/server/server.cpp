@@ -112,6 +112,8 @@ void Server::register_routes() {
     });
     router_.get ("/v1/models",           [this](const HttpRequest& q) { return handle_models(q); });
     router_.get ("/v1/models/*id",       [this](const HttpRequest& q) { return handle_models(q); });
+    router_.post("/v1/load_lora_adapter",   [this](const HttpRequest& q) { return handle_lora_admin(q, true); });
+    router_.post("/v1/unload_lora_adapter", [this](const HttpRequest& q) { return handle_lora_admin(q, false); });
     /* The same routes without /v1, as llama-server answers them, for clients whose base URL is
      * the bare host. */
     router_.post("/chat/completions",    [this](const HttpRequest& q) { return handle_chat(q); });
@@ -388,6 +390,27 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
         }
     }
 
+    /* RUNTIME LoRA: `model` picks the adapter. The served model's own name, or no name, is the
+     * base; with adapters enabled anything else must be a loaded adapter -- a typo served by the
+     * base would answer as the wrong model and say nothing. */
+    int32_t  lora_slot = -1;
+    uint64_t lora_uid = 0;
+    std::shared_ptr<void> lora_hold;
+    if (opt_.lora_acquire && !r.model.empty() && r.model != opt_.model_id) {
+        if (opt_.lora_acquire(r.model, &lora_slot, &lora_uid, &lora_hold) != RAD_OK) {
+            std::string names = opt_.model_id;
+            if (opt_.lora_names)
+                for (const std::string& n : opt_.lora_names()) names += ", " + n;
+            ApiError e;
+            e.status = 404;
+            e.type = "not_found_error";
+            e.param = "model";
+            e.message = "no such model or adapter: " + r.model + " (served: " + names + ")";
+            *err = e;
+            return RAD_E_NOTFOUND;
+        }
+    }
+
     int idx = 0;
     std::vector<Request> rqs;
     rqs.reserve(r.prompts.size() * (size_t)r.n);
@@ -422,6 +445,9 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
             rq.stream = r.stream;
             rq.media = r.prompts[p].media;
             rq.session_label = r.session_label;
+            rq.lora_slot = lora_slot;
+            rq.lora_uid = lora_uid;
+            g.lora_hold = lora_hold;
             rq.sink = g.sink.get();
             rqs.push_back(std::move(rq));
             gens->push_back(std::move(g));
@@ -1749,7 +1775,11 @@ HttpResponse Server::handle_systemone(const HttpRequest& req) {
 
 HttpResponse Server::handle_models(const HttpRequest& req) {
     const std::string id = req.param("id");
-    if (!id.empty() && id != opt_.model_id) {
+    /* RUNTIME LoRA: each loaded adapter is a model of its own, whose parent is the served one. */
+    std::vector<std::string> adapters;
+    if (opt_.lora_names) adapters = opt_.lora_names();
+    const bool is_adapter = !id.empty() && std::find(adapters.begin(), adapters.end(), id) != adapters.end();
+    if (!id.empty() && id != opt_.model_id && !is_adapter) {
         ApiError e;
         e.status = 404;
         e.type = "not_found_error";
@@ -1764,7 +1794,69 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
     c.root = opt_.model_path;
     c.capabilities = capabilities().dump();
     metrics_.observe_http(200);
-    return HttpResponse::json_body(200, id.empty() ? models_body(c) : model_body(c));
+    std::vector<ModelCard> cards{ c };
+    for (const std::string& a : adapters) {
+        ModelCard ac = c;
+        ac.id = a;
+        ac.parent = opt_.model_id;
+        cards.push_back(ac);
+        if (is_adapter && a == id) return HttpResponse::json_body(200, model_body(ac));
+    }
+    return HttpResponse::json_body(200, id.empty() ? models_body(cards) : model_body(c));
+}
+
+/* RUNTIME LoRA ADMIN, vLLM's routes and bodies: {"lora_name", "lora_path"} to load, {"lora_name"}
+ * to unload. The path is read on THIS machine, so without --api-key only a loopback client may ask
+ * -- the rule /diagnostics follows. */
+HttpResponse Server::handle_lora_admin(const HttpRequest& req, bool load) {
+    using json = nlohmann::json;
+    auto fail = [&](int status, const char* type, const std::string& msg) {
+        ApiError e;
+        e.status = status;
+        e.type = type;
+        e.message = msg;
+        return error_response(e, req.peer);
+    };
+    if (!opt_.lora_load || !opt_.lora_unload)
+        return fail(404, "not_found_error", "this server was started without runtime LoRA (--lora or "
+                                            "--max-loras)");
+    if (opt_.api_key.empty() && !req.peer_is_loopback())
+        return fail(403, "permission_error", "loading an adapter reads a path on this machine, and a "
+                                             "server started without --api-key takes it only from a "
+                                             "loopback client");
+    const json j = json::parse(req.body, nullptr, false);
+    if (j.is_discarded() || !j.is_object() || !j.contains("lora_name") || !j["lora_name"].is_string())
+        return fail(400, "invalid_request_error", "the body must be a JSON object with lora_name");
+    const std::string name = j["lora_name"].get<std::string>();
+    if (name.empty() || name == opt_.model_id)
+        return fail(400, "invalid_request_error", "lora_name must be non-empty and not the served model's name");
+    std::string err;
+    int s;
+    int in_flight = 0;
+    if (load) {
+        if (!j.contains("lora_path") || !j["lora_path"].is_string())
+            return fail(400, "invalid_request_error", "load_lora_adapter needs lora_path");
+        s = opt_.lora_load(name, j["lora_path"].get<std::string>(), &err);
+    } else {
+        s = opt_.lora_unload(name, &err, &in_flight);
+    }
+    /* 409 for a load of a name that is still draining: the old adapter's requests are running. */
+    if (s == RAD_E_NOTFOUND) return fail(404, "not_found_error", err);
+    if (s == RAD_E_STATE) return fail(409, "conflict_error", err);
+    if (s == RAD_E_FULL) return fail(503, "service_unavailable", err);
+    if (s < 0) return fail(400, "invalid_request_error", err.empty() ? std::string(rad_strerror(s)) : err);
+    /* AN UNLOAD OF AN ADAPTER IN USE DRAINS IT (lora/slots.h): accepted, not done. New requests
+     * naming it are already refused as an unknown model and it is off /v1/models; the requests
+     * counted here finish normally, and the last of them frees the slot. Asking again answers
+     * the same with the count as it is then, and a 404 once it is gone. */
+    if (!load && in_flight > 0) {
+        metrics_.observe_http(202);
+        return HttpResponse::json_body(202, json{ { "action", "draining" }, { "lora_name", name },
+                                                  { "in_flight", in_flight } }.dump());
+    }
+    metrics_.observe_http(200);
+    return HttpResponse::json_body(200, json{ { "status", "ok" }, { "lora_name", name },
+                                              { "action", load ? "loaded" : "unloaded" } }.dump());
 }
 
 HttpResponse Server::handle_metrics(const HttpRequest&) {

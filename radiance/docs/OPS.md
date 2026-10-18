@@ -621,6 +621,45 @@ what a separate tensor would hold, so the fused form equals the unfused chain bi
 may be `y` itself, the residual stream updated in place (the encoder towers' layers do this), so an
 implementation reads `res` before it stores the product over it.
 
+### Runtime LoRA: `lora_shrink` and `lora_expand`
+
+| op | params | operands |
+|---|---|---|
+| `lora_shrink` | `M`(range) `K` `R` `S` `group`/opt `dtype` | `a`, `a_scale`?, `slot`, `lora_a` → `t` |
+| `lora_expand` | `M`(range) `N` `R` `S` `dtype` | `t`, `slot`, `lora_b`, `scale`, `y`:inout |
+
+The two halves of `y += scale ⊙ (B · (A · x))` at a trunk GEMM, issued by the core right after the
+GEMM in the GEMM's own row slice, with several adapters and no adapter mixed in one step. `slot` is
+an i32 per row naming its adapter's pool slot -- the step batch's `RadBatch::lora_slot` from the
+GEMM's first row on; **a row with `slot < 0 || slot >= S` is a base row and neither op touches
+it**: `lora_shrink` writes nothing into its `t` row, and `lora_expand` does not read or write its
+`y` row at all — so a base row stays bit for bit what the GEMM wrote, where `y + 0` would already
+have turned a -0 into +0.
+
+- `lora_shrink`: `t[m, j] = Σ_k x(m, k) · lora_a[s, j, k]`, `s = slot[m]`, f32 accumulate.
+  `a`/`a_scale` are the GEMM's own first two operands, and `x(m, k)` is the value `gemm_nt_q` uses
+  for that element: the code times its group's scale, read through the same scale-stream rule
+  (`[rows, groups]` or `[rows]`, the group derived from the stream), or a `bf16`/`f16`/`f32`
+  element as it stands. An `fp8_e4m3`/`fp8_e5m2`/`i8` `a` without `a_scale` (null data) is refused.
+  `group` is a cross-check on the stream's grid -- `ceil(K / group)` groups along K -- and 0 means
+  none; `dtype` is `a`'s tensor dtype name
+  (`rad_dtype_name`: `bf16`, `f16`, `f32`, `fp8_e4m3`, `i8`, ...), not a combined quant string.
+  `lora_a` is `[S, R, K]` bf16, `t` is `[M, R]` f32.
+- `lora_expand`: `y[m, n] = y[m, n] + scale[s, n] · Σ_j t[m, j] · lora_b[s, n, j]`, f32
+  accumulate, one rounding to `y`'s dtype (`bf16`/`f16`/`f32`, named by `dtype`). `lora_b` is
+  `[S, N, R]` bf16 and `scale` `[S, N]` f32 — per output column, so a fused projection whose parts
+  carry different `alpha / r` is one launch.
+
+`a`, `a_scale` and `y` may be row and column slices of wider buffers; every row stride is the
+tensor's. The pools are ordinary inputs and not weights: the engine owns them as program buffers
+and copies an adapter into a slot between steps, so a recorded pass replays the same pointers and
+reads whatever adapters the slots hold. A row's result does not depend on `M` or on any other row
+(no split of a reduction that moves with the batch), which is what lets a request's bytes be the
+same alone and in a mixed batch. Implementations: libref, libavx, libr4d (scalar f32 rows, and
+tiled rows over row tiles that outrank them: a WMMA shrink whose summation order is fixed by `K`
+and `R`, and an expand that stages `lora_b[s]` in LDS for a tile of rows and computes libref's
+bytes).
+
 ## Attention
 
 | op | params | operands |

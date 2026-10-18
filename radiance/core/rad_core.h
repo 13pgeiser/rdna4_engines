@@ -6,6 +6,7 @@
  */
 #pragma once
 #include "rad_internal.h"
+#include "lora/config.h"
 
 #include <map>
 #include <memory>
@@ -264,6 +265,16 @@ struct OpInfo {
     const RadOpSchema*    schema = nullptr;
     int32_t               index = 0;    /* position in the declared order */
     bool                  issued = false;   /* did the run phase ever issue it */
+    /* RUNTIME LoRA (core/lora/). `anchor`: an op the CORE appended after the plugin's declare and
+     * issues inside another op's issue -- its buffers are that op's, so buffer liveness is judged
+     * at the anchor's position, not at this op's own (which is past every plugin op). -1 for every
+     * plugin op. `lora_site`: on a targeted gemm, its row in Program::lora_sites; -1 otherwise. */
+    int32_t               anchor = -1;
+    int32_t               lora_site = -1;
+    /* Declined at declare because runtime LoRA targets its weight (a fused GEMM no delta can follow):
+     * recorded unresolved on purpose, its handle never handed to the plugin, so it is never issued
+     * and the reference-kernel gate does not count it. */
+    bool                  lora_declined = false;
 };
 
 struct KVGroupInfo {
@@ -289,6 +300,30 @@ inline int64_t conv_window_entries(const RadKVGroupDecl& d, int64_t n_spec) {
     return (d.conv_width > 0 ? d.conv_width - 1 : 0) + (n_spec > 0 ? n_spec : 0);
 }
 
+/* ONE TARGETED GEMM OF A RUNTIME-LoRA PROGRAM (core/lora/), as the issue path needs it: the two ops
+ * the core appended for it, where in the gemm's own operand list its activation and output are,
+ * and the buffers the appended ops read. Built once at declare; issue reads it and nothing else. */
+struct LoraIssueSite {
+    uint32_t gemm = 0, shrink = 0, expand = 0;     /* op handles */
+    int8_t   opd_a = -1, opd_a_scale = -1, opd_y = -1;   /* positions in the GEMM's schema */
+    uint32_t a_dtype = 0, y_dtype = 0;             /* what the appended ops were declared for */
+    int32_t  pool = -1;                            /* index into Program::lora_pools */
+    int32_t  t = -1;                               /* index into Program::lora_t */
+    int64_t  R = 0, K = 0, N = 0;
+};
+/* One targeted weight's adapter slots: A [S, R, K], B [S, N, R] bf16 and the per-column scale
+ * [S, N] f32 -- PERSIST buffers, so the arena plan (and with it the KV budget) holds them. */
+struct LoraPool {
+    std::string weight;
+    rad_buf     a = 0, b = 0, scale = 0;
+    int64_t     R = 0, K = 0, N = 0, S = 0;
+};
+/* The f32 intermediate t = A.x of one rank capacity R, one per lane (lane 1 runs beside lane 0). */
+struct LoraScratch {
+    int64_t R = 0;
+    rad_buf lane[2] = { 0, 0 };
+};
+
 /* Everything declare produced. The core owns it; the plugin only ever sees handles into it. */
 class Program {
 public:
@@ -309,6 +344,11 @@ public:
     /* The step's pooled vectors (rad_declare_pooled): set only by an embedding program, which has
      * no logits buffer. */
     rad_buf pooled_buf = 0;
+
+    /* RUNTIME LoRA (core/lora/), empty unless the engine was started with adapters enabled. */
+    std::vector<LoraIssueSite> lora_sites;
+    std::vector<LoraPool>      lora_pools;
+    std::vector<LoraScratch>   lora_t;
 
     /* The declared draft head (rad_declare_drafter). `kind == RAD_DRAFT_NONE` when none, the
      * normal case: the engine then speculates with the scheduler's prompt-lookup drafter or not at
@@ -538,6 +578,11 @@ struct TokenScores {
 
 struct Request {
     uint64_t             id = 0;
+    /* THE RUNTIME LoRA ADAPTER this request is served with (core/lora/): its slot in the adapter
+     * pools, -1 for the base model, and the uid of the load that slot held when the request was
+     * admitted -- the prefix cache keys on the uid, so a reload under the same name starts cold. */
+    int32_t              lora_slot = -1;
+    uint64_t             lora_uid = 0;
     std::vector<int32_t> prompt;
     std::vector<int32_t> output;
     SamplingParams       sp;
@@ -624,6 +669,7 @@ enum { RAD_P2P_AUTO = 0, RAD_P2P_ON = 1, RAD_P2P_OFF = 2 };
 
 struct Config {
     std::string model;                 /* path to the .rad, or a Hugging Face repo id (hf_model.h) */
+    LoraConfig  lora;                  /* --lora, --max-loras, --max-lora-rank, --lora-target-modules */
     std::string download_dir;          /* where a repo id is fetched to; empty = the XDG cache */
     std::string radiance_home;
     std::vector<std::string> kernel_hierarchy;   /* ordered; first wins */
@@ -773,6 +819,8 @@ struct Config {
      * of the two. */
     std::string kld_record;             /* --kld-record DIR */
     std::string kld_ref;                /* --kld-ref DIR */
+    std::string kld_lora;               /* --kld-lora NAME: score through this --lora adapter */
+    std::string kld_lora_sources;       /* --kld-lora-sources PREFIX: only documents whose source starts so */
     std::string kld_corpus;             /* --kld-corpus FILE, read by --kld-record only */
     std::string kld_out;                /* --kld-out FILE: the report as JSON, rows beside it */
     bool kld() const { return !kld_record.empty() || !kld_ref.empty(); }

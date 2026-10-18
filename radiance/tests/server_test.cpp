@@ -6,6 +6,7 @@
  */
 #include "server_fakes.h"
 
+#include "lora/slots.h"
 #include "server/liveview.h"
 #include "server/metrics.h"
 #include "text/chat.h"
@@ -2449,6 +2450,109 @@ TEST(models_and_health_answer) {
     HttpResponse h = f.get("/health");
     CHECK_EQ(h.status, 200);
     CHECK(json::parse(h.body)["status"].get<std::string>() == "ok");
+}
+
+/* RUNTIME LoRA admin, over a real slot table (lora/slots.h) the way Engine wires it: a request in
+ * flight holds its adapter, an unload then drains it (202, new requests 404 as an unknown model,
+ * off /v1/models, a load of the name 409), the request's end frees it, and an idle unload is 200.
+ * One slot, so the reload also waits out the cooling. */
+TEST(an_adapter_in_use_drains_on_unload_and_frees_itself_when_its_last_request_ends) {
+    std::atomic<uint64_t> epoch{100};
+    lora::SlotTable table;
+    table.reset(1, &epoch);
+    Fixture f(Fixture::Tweak{ [&](ServerOptions& o, Deps&) {
+        o.lora_acquire = [&](const std::string& m, int32_t* s, uint64_t* u, std::shared_ptr<void>* h) {
+            return table.acquire(m, s, u, h);
+        };
+        o.lora_names = [&] { return table.names(); };
+        o.lora_load = [&](const std::string& n, const std::string& d, std::string* e) {
+            int slot = -1;
+            bool cooling = false;
+            const int st = table.reserve(n, &slot, &cooling, e);
+            if (st < 0) return st;
+            table.publish(slot, n, d);
+            return (int)RAD_OK;
+        };
+        o.lora_unload = [&](const std::string& n, std::string* e, int* in_flight) {
+            return table.unload(n, in_flight, e);
+        };
+    } });
+    auto listed = [&](const char* id) {
+        const json all = json::parse(f.get("/v1/models").body);
+        for (const json& m : all["data"])
+            if (m.value("id", std::string()) == id) return true;
+        return false;
+    };
+    const std::string load = R"({"lora_name":"ad","lora_path":"/adapters/ad"})";
+    const std::string unload = R"({"lora_name":"ad"})";
+    const std::string chat_ad = R"({"model":"ad","messages":[{"role":"user","content":"hi"}]})";
+
+    CHECK_EQ(f.post("/v1/load_lora_adapter", load).status, 200);
+    CHECK(listed("ad"));
+
+    /* A request through the adapter, held open: the stream never finishes on its own. */
+    f.sched.reply = "abcdefgh";
+    f.sched.hang = true;
+    std::atomic<bool> gone{false};
+    {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/chat/completions";
+        q.body = R"({"model":"ad","messages":[{"role":"user","content":"hi"}],"stream":true})";
+        q.closed = [&gone] { return gone.load(); };
+        HttpResponse r = f.srv->router().dispatch(q);
+        CHECK_EQ(r.status, 200);
+        for (int i = 0; i < 2; ++i) { std::string c; r.next(c); }
+        {
+            std::lock_guard<std::mutex> lk(f.sched.mu);
+            CHECK_EQ(f.sched.seen.back().lora_slot, 0);
+            CHECK(f.sched.seen.back().lora_uid != 0);
+        }
+
+        /* Unloaded while in use: 202, draining, the one request counted. */
+        HttpResponse u = f.post("/v1/unload_lora_adapter", unload);
+        CHECK_EQ(u.status, 202);
+        const json uj = json::parse(u.body);
+        CHECK_EQ(uj.value("action", std::string()), std::string("draining"));
+        CHECK_EQ(uj.value("lora_name", std::string()), std::string("ad"));
+        CHECK_EQ(uj.value("in_flight", 0), 1);
+        /* Asked again: the same, with the count as it is now. */
+        HttpResponse u2 = f.post("/v1/unload_lora_adapter", unload);
+        CHECK_EQ(u2.status, 202);
+        CHECK_EQ(json::parse(u2.body).value("in_flight", 0), 1);
+
+        /* A new request naming it is told what an unknown model is told, and it is not listed. */
+        HttpResponse n = f.post("/v1/chat/completions", chat_ad);
+        CHECK_EQ(n.status, 404);
+        CHECK_EQ(json::parse(n.body)["error"].value("message", std::string()),
+                 std::string("no such model or adapter: ad (served: test-model)"));
+        CHECK(!listed("ad"));
+        CHECK_EQ(f.get("/v1/models/ad").status, 404);
+        /* A load of the same name waits for the drain. */
+        HttpResponse l = f.post("/v1/load_lora_adapter", load);
+        CHECK_EQ(l.status, 409);
+        CHECK(has(l.body, "being unloaded"));
+
+        /* The request ends (its client goes away), and with it the last hold. */
+        gone.store(true);
+        std::string c;
+        while (r.next(c)) {}
+        r.on_close(false);
+    }
+    f.sched.join_all();
+    CHECK_EQ(table.in_flight("ad"), 0);
+    CHECK_EQ(f.post("/v1/unload_lora_adapter", unload).status, 404);   /* freed by itself */
+
+    /* The slot cools before it is written again, then the name loads afresh; idle, it unloads at
+     * once. */
+    CHECK_EQ(f.post("/v1/load_lora_adapter", load).status, 503);
+    epoch += lora::kSlotCoolRounds;
+    CHECK_EQ(f.post("/v1/load_lora_adapter", load).status, 200);
+    CHECK(listed("ad"));
+    HttpResponse idle = f.post("/v1/unload_lora_adapter", unload);
+    CHECK_EQ(idle.status, 200);
+    CHECK_EQ(json::parse(idle.body).value("action", std::string()), std::string("unloaded"));
+    CHECK(!listed("ad"));
 }
 
 TEST(the_model_entry_carries_the_context_length_the_server_was_started_with) {

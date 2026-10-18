@@ -159,6 +159,16 @@ public:
      * an io_uring ring, which must not stop a sandboxed conversion. */
     void set_instances(bool on) { instances_ = on; }
 
+    /* RUNTIME LoRA (core/lora/): the HF module leaves an adapter may target. Set before the
+     * plugin declares, so a FUSED GEMM over a targeted weight -- a GEMM no adapter delta can ride
+     * on, the gated gate_up fold -- is declined as it is declared and the plugin emits the unfused
+     * chain it already has for a library without the fused kernel. Null: nothing is declined. */
+    void set_lora_targets(const std::set<std::string>* t) { lora_targets_ = t; }
+    /* The read and write sets an op declared (rad_op_reads / rad_op_writes), for the LoRA declare,
+     * which needs the dtypes of the activation and the output a targeted GEMM was declared over. */
+    const std::vector<rad_buf>& op_read_set (rad_op h) const { return op_bufs_[h].reads; }
+    const std::vector<rad_buf>& op_write_set(rad_op h) const { return op_bufs_[h].writes; }
+
     Program&       program()       { return prog_; }
     const Program& program() const { return prog_; }
 
@@ -199,6 +209,7 @@ private:
     /* Parallel to prog_.ops: the buffers each op declared it reads and writes. */
     struct OpBufUse { std::vector<rad_buf> reads, writes; };
     std::vector<OpBufUse> op_bufs_;
+    const std::set<std::string>* lora_targets_ = nullptr;
 
     /* Buffers touched from the second lane (rad_buf_concurrent). Their declared op range does not
      * bound when their bytes are in use, so they are live for the whole program. */

@@ -221,6 +221,15 @@ static const RadOperandSpec oGemmQ[]      = { OPD("a"), OPD_O("a_scale"), WGT("b
                                               OUT("y"), OPD_O("a_sum"), WGT_O("b_ref") };
 static const RadOperandSpec oGemmQBias[]  = { OPD("a"), OPD("a_scale"), WGT("b"), WGT("b_scale"),
                                               WGT("bias"), OUT("y") };
+/* Runtime LoRA, libref's schemas slot for slot (libref/ref_registry.cpp says what they mean). */
+static const RadParamSpec pLoraShrink[]   = { P_INT("M"), P_INT("K"), P_INT("R"), P_INT("S"),
+                                              P_INTO("group"), P_STR("dtype") };
+static const RadOperandSpec oLoraShrink[] = { OPD("a"), OPD_O("a_scale"), OPD("slot"),
+                                              OPD("lora_a"), OUT("t") };
+static const RadParamSpec pLoraExpand[]   = { P_INT("M"), P_INT("N"), P_INT("R"), P_INT("S"),
+                                              P_STR("dtype") };
+static const RadOperandSpec oLoraExpand[] = { OPD("t"), OPD("slot"), OPD("lora_b"), OPD("scale"),
+                                              INOUT("y") };
 /* `act` is required here (optional in the quantiser); `N` is the weight's rows, twice the output
  * width. */
 static const RadParamSpec pGemmQGated[]    = { P_INT("M"), P_INT("N"), P_INT("K"), P_INT("group"),
@@ -661,6 +670,12 @@ static const RadOpSchema kSchemas[] = {
   "C = A B^T with group-scaled quantised operands. `a_sum` and `b_ref` are libr4d's asymmetric and "
   "mxfp4 forms and are ignored here, as they are in libref." },
 { "gemm_nt_q_bias", ARR(pGemmQBias), ARR(oGemmQBias), "quantised C = A B^T + bias." },
+{ "lora_shrink", ARR(pLoraShrink), ARR(oLoraShrink),
+  "t[m, j] = sum_k x(m, k) * lora_a[slot[m], j, k]; a base row (slot outside [0, S)) is not "
+  "written." },
+{ "lora_expand", ARR(pLoraExpand), ARR(oLoraExpand),
+  "y[m, n] += scale[slot[m], n] * sum_j t[m, j] * lora_b[slot[m], n, j]; a base row is neither "
+  "read nor written." },
 { "gemm_nt_q_gated", ARR(pGemmQGated), ARR(oGemmQGated),
   "gemm_nt_q over a [N, K] gate_up plane with gated_quant_fp8's pass in the epilogue, byte for "
   "byte the pair. `N` is the weight's rows, twice the fused width; the output is [M, N/2]." },
@@ -1037,6 +1052,12 @@ ROWL("avx_gemm_nt_q", "gemm_nt_q", "gemm", "C = A B^T with group-scaled quantise
      "and integer zero per group, joined; f32 accumulate", L(gemm_nt_q), avx_layout_gemm_q),
 SIMPLE("avx_gemm_nt_q_bias", "gemm_nt_q_bias", "gemm", "quantised C = A B^T + bias",
        "i8 / fp8 / float A; w4, w2, mxfp4, i8 or float B; f32 accumulate", L(gemm_nt_q_bias)),
+SIMPLE("avx_lora_shrink", "lora_shrink", "gemm", "t = x A[slot]^T per row, base rows untouched",
+       "bf16 / f16 / f32 a, or fp8_e4m3 / fp8_e5m2 / i8 a with its f32 scale stream; bf16 lora_a; "
+       "i32 slot; f32 t", L(lora_shrink)),
+SIMPLE("avx_lora_expand", "lora_expand", "gemm",
+       "y += scale * (t B[slot]^T) per row, base rows untouched",
+       "f32 t and scale; bf16 lora_b; i32 slot; bf16 / f16 / f32 y", L(lora_expand)),
 SIMPLE("avx_gemm_nt_q_gated", "gemm_nt_q_gated", "gemm",
        "gemm_nt_q over a gate_up plane with the gated E4M3 quantiser in the epilogue",
        "i8 / fp8 / float A; w4, w2, mxfp4, i8 or float B; fp8_e4m3 out, f32 scale",

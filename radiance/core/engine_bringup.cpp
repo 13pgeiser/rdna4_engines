@@ -853,6 +853,7 @@ RadBuildCtx Engine::build_ctx(int rank, int64_t max_tok) const {
 }
 
 int Engine::declare() {
+    RAD_TRY(lora_targets());
     /* KL mode measures the trunk (core/kld.h): a drafter writes no scored rows and a prefix hit
      * would skip positions the reference holds, so both are off, and an explicit depth is refused
      * rather than ignored. The tower stays off the card; the corpus is text. */
@@ -977,11 +978,16 @@ int Engine::declare() {
                 return;
             }
             const RadBuildCtx bc = build_ctx(ri, cfg_.max_tok);
+            LoraDeclare ld;
+            ld.cfg = &cfg_.lora;
+            ld.targets = lora_targets_;
+            ld.sites_out = &r->lora_sites;
             st[(size_t)ri] = rad_tools_declare(plugins_, meta_, bc, &r->program,
                                                [this, ri](RadBuilder* bb, int64_t lw) {
                                                    return declare_sampler(ri, bb, lw);
                                                },
-                                               nullptr, sources());
+                                               nullptr, sources(), true,
+                                               cfg_.lora.enabled() ? &ld : nullptr);
         });
     }
     /* A message is a step's bf16 residual rows, so the floor is a row count: a decode step has
@@ -1149,12 +1155,16 @@ void Engine::probe_arena_levels() {
                     RadBuildCtx bc = build_ctx(r.index, want[l]);
                     bc.shape_probe = 1;
                     Program probe;
+                    LoraDeclare ld;
+                    ld.cfg = &cfg_.lora;
+                    ld.targets = lora_targets_;
                     const int st = rad_tools_declare(plugins_, meta_, bc, &probe,
                                                      [this, &r](RadBuilder* bb, int64_t lw) {
                                                          return declare_sampler(r.index, bb, lw,
                                                                                 true);
                                                      },
-                                                     &r.program, sources());
+                                                     &r.program, sources(), true,
+                                                     cfg_.lora.enabled() ? &ld : nullptr);
                     if (st < 0) why[k] = fmt("the sizing declare failed: %s", rad_strerror(st));
                     else if (plan_level(r.program, probe, want[l], &got[k], &why[k]) >= 0)
                         ok[k] = 1;
@@ -3129,6 +3139,10 @@ int Engine::start() {
         }
 
     }
+    /* RUNTIME LoRA: the startup adapters, copied into their slots now that every rank's pools have
+     * an address and before any step can read them. */
+    RAD_TRY(lora_start());
+
     /* ---- the loan: the cache's idle blocks, lent to the expert slab in place -----------------
      *
      * Here because it needs the cache's carve (the addresses) and the mover's compute stream

@@ -19,6 +19,8 @@
  */
 #pragma once
 #include "rad_core.h"
+#include <map>
+#include <set>
 #include "build/startup.h"
 #include "diag/diag.h"
 #include "mem/hostarena.h"
@@ -29,6 +31,7 @@
 #include "text/tokenizer.h"
 #include "format/radfile.h"
 #include "format/table_copy.h"
+#include "lora/slots.h"
 
 #include <atomic>
 #include <chrono>
@@ -133,6 +136,31 @@ private:
     int apply_rope_scaling();
     int declare();
     int plan();
+    /* RUNTIME LoRA (core/engine_lora.cpp). Targets are fixed before declare; adapters are loaded
+     * into slots after every rank's Ctx is bound, and a request's `model` names one. */
+    int lora_targets();
+    int lora_start();
+public:
+    int lora_load(const std::string& name, const std::string& dir, std::string* err);
+    /* Unpublish an adapter (lora::SlotTable::unload). Idle, its slot is freed at once; in use, it
+     * DRAINS: *in_flight says how many requests still hold it, no new request may name it, and
+     * the last of them frees the slot. A freed slot is reused only once the step loop has gone
+     * round three times since, so no step still on the card can read bytes a later load is
+     * writing (the next step is issued before the last is read back). */
+    int lora_unload(const std::string& name, std::string* err, int* in_flight);
+    /* RAD_OK with the slot, the uid of its load and a HOLD -- the adapter is not freed while the
+     * hold lives (the server keeps it in the request's Generation, which outlives the request in
+     * the scheduler). RAD_E_NOTFOUND for a name no slot holds, or one that is draining. */
+    int lora_acquire(const std::string& name, int32_t* slot, uint64_t* uid,
+                     std::shared_ptr<void>* hold);
+    std::vector<std::string> lora_names() const;
+private:
+    std::atomic<uint64_t>      lora_epoch_{0};   /* step-loop iterations, for slot reuse */
+    lora::SlotTable            lora_table_;      /* reads lora_epoch_, so declared after it */
+    /* Serialises loads: a slot is reserved, filled on every rank and published by one load at a
+     * time. Requests and unloads go to the table alone and never wait for a load's copy. */
+    std::mutex                 lora_mu_;
+    std::set<std::string>      lora_targets_;
     /* Resolves --embedding-placement, --vision-tower-placement and --ngram-placement into Config
      * before the card is split (engine_bringup.cpp describes how auto chooses). `wfs` is every
      * rank's footprint, read for its towers. `host_late` is the pinned host memory startup

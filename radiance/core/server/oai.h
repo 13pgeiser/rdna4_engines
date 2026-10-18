@@ -392,9 +392,14 @@ struct ModelCard {
      * OpenAI's model object has no such field. A JSON object as text, spliced in verbatim; empty
      * leaves it out. */
     std::string capabilities;
+    /* A runtime LoRA adapter's card names the model it runs on, vLLM's `parent`. Empty for the
+     * served model itself, which then carries no such field. */
+    std::string parent;
 };
 /* The list, for GET /v1/models. */
 std::string models_body(const ModelCard& m);
+/* ...with the runtime LoRA adapters after the served model. */
+std::string models_body(const std::vector<ModelCard>& cards);
 /* The entry itself, for GET /v1/models/:id: OpenAI's retrieve answers the model object, not a
  * list of one, and its SDK reads `id` off the top level. */
 std::string model_body(const ModelCard& m);

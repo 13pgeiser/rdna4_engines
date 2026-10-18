@@ -1,5 +1,5 @@
 /* ref_host.cpp -- ref_host.h's functions: the rules and roundings of r4d_pair_argmax_f32.hip,
- * r4d_norm_join_bf16.hip and r4d_expert_scale_bf16.hip, one element at a time. */
+ * r4d_norm_join_bf16.hip, r4d_expert_scale_bf16.hip and r4d_lora_bf16.hip, one element at a time. */
 #include "ref_host.h"
 #include "rad_plugin.h"
 
@@ -198,5 +198,90 @@ int host_expert_scale(const RadArgs* a) {
             uint16_t* w = (uint16_t*)W->data + r * lw + c;
             *w = f2b(b2f(*w) * s);
         }
+    return RAD_OK;
+}
+
+/* lora_shrink / lora_expand: libref's arithmetic (libref/ref_lora.cpp) over the dense-last-axis
+ * operands the test hands over -- k ascending and j ascending, one f32 accumulator, every product
+ * and sum rounded. Expand's kernel sums in the same order, so its bytes are these; shrink's sums
+ * k in 32 lane strides and a butterfly, so its are these to a tolerance. A row whose slot is
+ * outside [0, S) is not touched. */
+static float host_act(uint32_t dt, const void* p, int64_t i) {
+    switch (dt) {
+        case RAD_BF16:   return rad_bf16_to_f32(((const uint16_t*)p)[i]);
+        case RAD_F16:    return rad_f16_to_f32(((const uint16_t*)p)[i]);
+        case RAD_F32:    return ((const float*)p)[i];
+        case RAD_F8E4M3: return rad_fp8e4m3_to_f32(((const uint8_t*)p)[i]);
+        case RAD_F8E5M2: return rad_fp8e5m2_to_f32(((const uint8_t*)p)[i]);
+        case RAD_I8:     return (float)((const int8_t*)p)[i];
+        default:         return 0.0f;
+    }
+}
+
+int host_lora_shrink(const RadArgs* a) {
+    if (!a || a->n_t < 5) return RAD_E_INVAL;
+    const RadTensor *X = rad_arg_in(a, 0), *XS = rad_arg_in(a, 1), *SL = rad_arg_in(a, 2);
+    const RadTensor *LA = rad_arg_in(a, 3), *T = rad_arg_in(a, 4);
+    if (!X || !SL || !LA || !T || X->rank != 2 || T->rank != 2) return RAD_E_INVAL;
+    if (XS && XS->dtype == RAD_DT_INVALID) XS = nullptr;
+    const int64_t K = rad_args_geti_or(a, "K", 0), R = rad_args_geti_or(a, "R", 0);
+    const int64_t S = rad_args_geti_or(a, "S", 0);
+    const int64_t M = T->shape[0];
+    /* libref's grid_block: the power of two whose ceiling division gives the stream's groups. */
+    const int64_t groups = XS ? XS->shape[1] : 1;
+    int64_t group = K;
+    if (groups > 1) {
+        const int64_t lo = (K + groups - 1) / groups;
+        int64_t b = 1;
+        while (b < lo) b <<= 1;
+        group = (K + b - 1) / b == groups ? b : lo;
+    }
+    for (int64_t m = 0; m < M; ++m) {
+        const int32_t s = ((const int32_t*)SL->data)[m * SL->stride[0]];
+        if (s < 0 || s >= S) continue;
+        for (int64_t j = 0; j < R; ++j) {
+            const uint16_t* ar = (const uint16_t*)LA->data + (s * R + j) * K;
+            float acc = 0.0f;
+            for (int64_t k = 0; k < K; ++k) {
+                float x = host_act(X->dtype, X->data, m * X->stride[0] + k);
+                if (XS) x = x * ((const float*)XS->data)[m * XS->stride[0] + k / group];
+                acc += x * rad_bf16_to_f32(ar[k]);
+            }
+            ((float*)T->data)[m * T->stride[0] + j] = acc;
+        }
+    }
+    return RAD_OK;
+}
+
+int host_lora_expand(const RadArgs* a) {
+    if (!a || a->n_t < 5 || !rad_args_have(a, 5)) return RAD_E_INVAL;
+    const RadTensor *T = rad_arg_in(a, 0), *SL = rad_arg_in(a, 1), *LB = rad_arg_in(a, 2);
+    const RadTensor *SC = rad_arg_in(a, 3), *Y = rad_arg_in(a, 4);
+    if (T->rank != 2 || Y->rank != 2) return RAD_E_INVAL;
+    const int64_t N = rad_args_geti_or(a, "N", 0), R = rad_args_geti_or(a, "R", 0);
+    const int64_t S = rad_args_geti_or(a, "S", 0);
+    const int64_t M = Y->shape[0];
+    for (int64_t m = 0; m < M; ++m) {
+        const int32_t s = ((const int32_t*)SL->data)[m * SL->stride[0]];
+        if (s < 0 || s >= S) continue;
+        const float* tr = (const float*)T->data + m * T->stride[0];
+        for (int64_t n = 0; n < N; ++n) {
+            const uint16_t* br = (const uint16_t*)LB->data + (s * N + n) * R;
+            float acc = 0.0f;
+            for (int64_t j = 0; j < R; ++j) acc += tr[j] * rad_bf16_to_f32(br[j]);
+            const float d = ((const float*)SC->data)[s * N + n] * acc;
+            const int64_t o = m * Y->stride[0] + n;
+            if (Y->dtype == RAD_BF16) {
+                uint16_t* y = (uint16_t*)Y->data + o;
+                *y = rad_f32_to_bf16(rad_bf16_to_f32(*y) + d);
+            } else if (Y->dtype == RAD_F16) {
+                uint16_t* y = (uint16_t*)Y->data + o;
+                *y = rad_f32_to_f16(rad_f16_to_f32(*y) + d);
+            } else {
+                float* y = (float*)Y->data + o;
+                *y = *y + d;
+            }
+        }
+    }
     return RAD_OK;
 }

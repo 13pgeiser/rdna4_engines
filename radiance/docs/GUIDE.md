@@ -1126,6 +1126,49 @@ that ends in a single token, as Qwen's and MiniCPM's do; otherwise startup stops
 `/server_info` lists every effective default under `request_defaults` (§6.2), and startup logs one
 line naming each default the command line changed.
 
+### 4.9.1 LoRA adapters beside the base model
+
+A PEFT LoRA adapter (`adapter_config.json` + `adapter_model.safetensors`, what Unsloth, TRL and
+PEFT write) can be served beside the `.rad` it was trained on, without merging it in:
+
+```sh
+radiance --model base.rad --lora mytune=/adapters/mytune --lora other=/adapters/other
+```
+
+Each request picks one by `model`: `"model": "mytune"` runs with that adapter, the served model's
+own name (or no name) runs the base. Requests for different adapters and for the base share one
+batch. The base weights are never touched, whatever their encoding; each targeted GEMM is followed
+by `y += scale * B(A x)` in bf16 adapter weights and f32 accumulation, on every rank before the
+all-reduce, so it works at any `--tp`.
+
+- `--max-loras N` reserves N slots (default: the number of `--lora`). Each slot holds one adapter's
+  A and B for every targeted weight; startup prints the size. With free slots, adapters load and
+  unload while serving: `POST /v1/load_lora_adapter {"lora_name": "x", "lora_path": "/dir"}` and
+  `POST /v1/unload_lora_adapter {"lora_name": "x"}` (vLLM's routes; loopback-only without
+  `--api-key`).
+- An unload of an idle adapter answers 200 and frees its slot. An unload of an adapter requests
+  are still using **drains** it and answers 202
+  `{"action": "draining", "lora_name": "x", "in_flight": N}`: from then on a request naming `x`
+  gets the 404 an unknown model gets and `/v1/models` no longer lists it, the N requests finish
+  normally, and the last of them frees the slot. Asking again while it drains answers 202 with the
+  count as it is then, and 404 once it is gone. Loading the same name while it drains answers 409;
+  load it again once the unload answers 404. A freed slot is reused a few steps later (a step
+  already on the card may still read it), which a load waits for by itself.
+- `--max-lora-rank R` (default 16) is the rank every slot is sized for. A smaller rank is padded,
+  a larger one refused.
+- `--lora-target-modules q_proj,k_proj,...` names what adapters may target. Default: what the
+  `--lora` adapters target. Needed with `--max-loras` and no `--lora`.
+- `/v1/models` lists each adapter as its own model, `parent` naming the base.
+- The prefix cache keys every block on the adapter, so KV is never shared across adapters, and a
+  reload under the same name starts cold.
+
+Refused at startup or load, by name: DoRA, embedding or `lm_head` LoRA, `modules_to_save`, trained
+biases, a module the base does not have, and a module some op cannot carry -- a routed MoE expert,
+a rotated (ParoQuant) or otherwise transformed weight. A fused GEMM over a targeted weight (the fp8
+gated gate_up fold) is not used while LoRA is on; the unfused pair runs instead. A drafter keeps the
+base's weights: proposals are still verified by the adapter, so output is exact and only the
+acceptance rate can drop.
+
 ### 4.10 Every flag
 
 `radiance --help` prints these. Grouped by purpose:
@@ -1161,6 +1204,15 @@ line naming each default the command line changed.
 | `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3) |
 | `--vision-tower-placement WHERE` | vram | `vram` or `ram`: the encoder towers (vision, and audio where a model has one) on the card, or pinned in host memory beside `--host-pool-mib` and read in place once an image (§4.3) |
 | `--weights-disk-tier` | off | read weights that fit neither VRAM nor the host pool from the container (O_DIRECT); routed experts a layer at a time |
+
+**LoRA adapters** (§4.9.1)
+
+| flag | default | |
+|---|---|---|
+| `--lora NAME=PATH` | none | serve a PEFT LoRA adapter as model NAME; repeatable |
+| `--max-loras N` | the number of `--lora` | adapter slots resident at once; 0 with no `--lora` is off |
+| `--max-lora-rank R` | 16 | the rank each slot is sized for |
+| `--lora-target-modules LIST` | the adapters' own | HF module names adapters may target |
 
 **Host tier for finished conversations**
 

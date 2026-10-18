@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <tuple>
 #include <vector>
@@ -98,6 +99,17 @@ emu_v8s emu_load_tr_b128(const void* p);
 int emu_cvt_pk_fp8(float a, float b, int old, bool hi);
 #define __builtin_amdgcn_cvt_pk_fp8_f32(a, b, old, hi) emu_cvt_pk_fp8((a), (b), (old), (hi))
 extern int emu_last_block;     /* threads a block of the last grid had: which kernel ran */
+
+/* Blocks run one after another on one OS thread, so a fence orders nothing that is not already in
+ * order and an atomic is a plain read-modify-write. Enough for the split-K arrival pattern
+ * (r4d_lora_bf16.hip): the last block of a group in launch order is the one that reduces. */
+inline void __threadfence() {}
+#define __HIP_MEMORY_SCOPE_AGENT 3
+#define __hip_atomic_fetch_add(p, v, order, scope) emu_atomic_fetch_add((p), (v))
+template <typename T> inline T emu_atomic_fetch_add(T* p, T v) { const T o = *p; *p = o + v; return o; }
+/* The device allocations a unit makes for itself (counter blocks): host memory here. */
+inline hipError_t hipMalloc(void** p, size_t n) { *p = std::calloc(n ? n : 1, 1); return *p ? 0 : 2; }
+inline hipError_t hipMemsetAsync(void* p, int v, size_t n, hipStream_t) { std::memset(p, v, n); return 0; }
 
 struct alignas(8)  uint2  { unsigned x, y; };
 struct alignas(16) uint4  { unsigned x, y, z, w; };

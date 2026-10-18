@@ -2042,6 +2042,41 @@ static const RadOperandSpec oExpertScale[] = {
     { "ew",  RAD_OPD_INOUT,  0 },
 };
 
+/* ------------------------------------------------------------------------------- runtime LoRA
+ * libref's schemas field for field (libref/ref_registry.cpp says what they mean): the loader
+ * refuses a library whose schema differs from the first declarer's. The pools are plain inputs --
+ * the engine owns them as program buffers and fills a slot between steps -- and `dtype` is the
+ * tensor dtype name of `a` (shrink) or `y` (expand), which is what the rows below match on. */
+static const RadParamSpec pLoraShrink[] = {
+    P_INT("M"),
+    P_INT("K"),
+    P_INT("R"),
+    P_INT("S"),
+    P_INTO("group"),
+    P_STR("dtype"),
+};
+static const RadOperandSpec oLoraShrink[] = {
+    { "a",       RAD_OPD_IN,  0 },
+    { "a_scale", RAD_OPD_IN,  1 },
+    { "slot",    RAD_OPD_IN,  0 },
+    { "lora_a",  RAD_OPD_IN,  0 },
+    { "t",       RAD_OPD_OUT, 0 },
+};
+static const RadParamSpec pLoraExpand[] = {
+    P_INT("M"),
+    P_INT("N"),
+    P_INT("R"),
+    P_INT("S"),
+    P_STR("dtype"),
+};
+static const RadOperandSpec oLoraExpand[] = {
+    { "t",      RAD_OPD_IN,    0 },
+    { "slot",   RAD_OPD_IN,    0 },
+    { "lora_b", RAD_OPD_IN,    0 },
+    { "scale",  RAD_OPD_IN,    0 },
+    { "y",      RAD_OPD_INOUT, 0 },
+};
+
 #define SCHEMA(op, p, o, doc) { (op), ROW(p), ROW(o), (doc) }
 
 /* ---- image generation (r4d_gen.hip, r4d_attn_gen.hip) -------------------------------------
@@ -2660,6 +2695,14 @@ static const RadOpSchema kSchemas[] = {
            "ew[t, k] = ew[t, k] * w_e[ids[t, k]] over [M, top_k], w_e an [n_expert] table, an id "
            "outside it reading 0; one product rounded once, so the embed_lookup + mul pair's value "
            "bit for bit. Gemma 4's per_expert_scale on the renormalised routing weights."),
+    SCHEMA("lora_shrink", pLoraShrink, oLoraShrink,
+           "t[m, j] = sum_k x(m, k) * lora_a[s, j, k] for each row m whose s = slot[m] is in "
+           "[0, S), f32 accumulate; x(m, k) is the value gemm_nt_q uses for that element of `a`. "
+           "A base row's `t` is not written; a row's bytes do not depend on M."),
+    SCHEMA("lora_expand", pLoraExpand, oLoraExpand,
+           "y[m, n] = y[m, n] + scale[s, n] * sum_j t[m, j] * lora_b[s, n, j] for each row m "
+           "whose s = slot[m] is in [0, S), f32 accumulate, one rounding to y's dtype. A base "
+           "row's `y` is neither read nor written."),
     SCHEMA("ln_mod", pLnMod, oLnMod,
            "y = bf16(bf16(LN(x)) * bf16(1 + s[seq])): a layer norm with no gain or bias, then the "
            "row's sequence's modulation row of `s`."),
@@ -3138,6 +3181,30 @@ static const RadConstraint cPairArgmax[] = {
 };
 static const RadConstraint cExpertScale[] = {
     C_GE("top_k", 1), C_LE("top_k", 64), C_GE("n_expert", 1), C_IN("dtype", "bf16"),
+};
+/* Runtime LoRA. Any M, K and N: the scalar kernels loop over whatever extents arrive, and the grid
+ * is M blocks (shrink) or M strips of 256 columns (expand). R and S are bounded only by the shims'
+ * 32-bit index sanity. The dtype set is every activation the decode below reads -- an fp8 or i8
+ * one with its scale stream -- and the three outputs a GEMM writes; anything else does not
+ * resolve here. */
+static const RadConstraint cLoraShrink[] = {
+    C_GE("R", 1), C_LE("R", 65536), C_GE("S", 1), C_LE("S", 1048576),
+    C_IN("dtype", "bf16 f16 f32 fp8_e4m3 fp8_e5m2 i8"),
+};
+static const RadConstraint cLoraExpand[] = {
+    C_GE("R", 1), C_LE("R", 65536), C_GE("S", 1), C_LE("S", 1048576),
+    C_IN("dtype", "bf16 f16 f32"),
+};
+/* The tiled rows (r4d_lora_bf16.hip, V2). Shrink is two rows because a constraint on an absent
+ * parameter does not hold: a bf16 activation has no `group`, and a coded one is the WMMA's only
+ * when its group is whole 32-wide steps (the scale is applied a step at a time). Anything else --
+ * f16, f32, a coded activation with another group or none declared -- is the scalar row's. */
+static const RadConstraint cLoraShrinkWmma[] = {
+    C_GE("R", 1), C_LE("R", 65536), C_GE("S", 1), C_LE("S", 1048576), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cLoraShrinkWmmaQ[] = {
+    C_GE("R", 1), C_LE("R", 65536), C_GE("S", 1), C_LE("S", 1048576),
+    C_IN("dtype", "fp8_e4m3 fp8_e5m2 i8"), C_GE("group", 32), C_DIV("group", 32),
 };
 
 /* ---- the routed mixture of experts ----------------------------------------------------------
@@ -6251,6 +6318,59 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cExpertScale), NOTUNE,
   nullptr, nullptr, r4d_rad_expert_scale_bf16 },
+
+/* Runtime LoRA, v1: scalar f32, correct first (r4d_lora_bf16.hip). NO opd_shape: libref describes
+ * both ops, so rad-kbench draws the same operands for this row as for the oracle -- `slot` in
+ * [0, S], S itself a base row. NOT CONCURRENT: see rad_kernel_concurrent below. Below the tiled
+ * rows, which serve the same ops for every dtype but f16/f32 activations (R4D_PRIO_LORA_TILED). */
+{ "lora_shrink_scalar", "lora_shrink", "gemm",
+  "t = x A[slot]^T per row, base rows untouched: one block a row, one wave a column, the k of a "
+  "lane in order and a fixed xor butterfly across the wave",
+  "any M and K, 1 <= R <= 65536, 1 <= S <= 2^20; row and column strides of a, a_scale and t "
+  "honoured",
+  "bf16 / f16 / f32 a, or fp8_e4m3 / fp8_e5m2 / i8 a with its f32 scale stream; bf16 lora_a; "
+  "i32 slot; f32 t",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LORA_SCALAR,
+  ROW(cLoraShrink), NOTUNE,
+  nullptr, nullptr, r4d_rad_lora_shrink },
+{ "lora_expand_scalar", "lora_expand", "gemm",
+  "y += scale * (t B[slot]^T) per row, base rows neither read nor written: one thread an "
+  "output, j in order",
+  "any M and N, 1 <= R <= 65536, 1 <= S <= 2^20; row and column strides of t and y honoured",
+  "f32 t and scale; bf16 lora_b; i32 slot; bf16 / f16 / f32 y",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LORA_SCALAR,
+  ROW(cLoraExpand), NOTUNE,
+  nullptr, nullptr, r4d_rad_lora_expand },
+/* Runtime LoRA, v2: the tiled rows. The grid is row TILES, a tile of base rows leaves on one
+ * ballot, and a mixed tile runs one pass per distinct slot; shrink's summation order is fixed by K
+ * and R (sh_plan), expand's bytes are v1's. The shrink split keeps its partials in the op's
+ * scratch (the hook sizes it for the band) and its arrival counters in a block keyed on `t`. */
+{ "lora_shrink_wmma", "lora_shrink", "gemm",
+  "t = x A[slot]^T per row, base rows untouched: WMMA bf16 over 16-row x 16-j tiles, K in 32-wide "
+  "steps over 4 waves and a K split fixed by K and R, one pass a distinct slot of a tile",
+  "any M and K, 1 <= R <= 65536, 1 <= S <= 2^20; row and column strides of a and t honoured, "
+  "16-byte loads where the rows are aligned",
+  "bf16 a; bf16 lora_a; i32 slot; f32 t",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LORA_TILED,
+  ROW(cLoraShrinkWmma), NOTUNE,
+  nullptr, nullptr, r4d_rad_lora_shrink_wmma, r4d_rad_lora_shrink_wmma_scratch },
+{ "lora_shrink_wmma_q", "lora_shrink", "gemm",
+  "lora_shrink_wmma over fp8 / i8 codes: each code is exact in bf16, and each 32-wide step's "
+  "partial is scaled by its group's f32 scale",
+  "any M and K, a scale group that is a multiple of 32 (or one group across K), 1 <= R <= 65536, "
+  "1 <= S <= 2^20; strides of a, a_scale and t honoured",
+  "fp8_e4m3 / fp8_e5m2 / i8 a with its f32 scale stream; bf16 lora_a; i32 slot; f32 t",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LORA_TILED,
+  ROW(cLoraShrinkWmmaQ), NOTUNE,
+  nullptr, nullptr, r4d_rad_lora_shrink_wmma, r4d_rad_lora_shrink_wmma_scratch },
+{ "lora_expand_tiled", "lora_expand", "gemm",
+  "y += scale * (t B[slot]^T) per row, base rows neither read nor written: 32-row x 128-column "
+  "tiles, B[slot]'s slab staged in LDS once a tile, v1's j-ascending order a output",
+  "any M and N, 1 <= R <= 65536, 1 <= S <= 2^20; row and column strides of t and y honoured",
+  "f32 t and scale; bf16 lora_b; i32 slot; bf16 / f16 / f32 y",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_LORA_TILED,
+  ROW(cLoraExpand), NOTUNE,
+  nullptr, nullptr, r4d_rad_lora_expand_tiled },
 { "attn_prefix_self_h128_bf16", "attn_prefix_self", "attn",
   "attention over a paged prefix and the pass's own rows, causal over the own rows or not",
   "head_dim 128, 1/2/4/8 query heads a KV head, a flat grid over the sequences' query blocks; "
@@ -6553,13 +6673,18 @@ extern "C" const RadKernelInfo* rad_kernel_at(int i) {
  * gemm_mxfp4a8_decode's split partial is the op's scratch and its arrival counters are keyed on the
  * output alone; router_gemm_topk_scatter_bf16's arrival counter belongs to its op instance (taken
  * at init, one per declared op and band). Concurrent launches never share these, so those three
- * rows are concurrent. A new row with stream-ordered state belongs in the list above. */
+ * rows are concurrent. A new row with stream-ordered state belongs in the list above.
+ *
+ *   lora_*              no state of their own, and ordered ON PURPOSE: the core appends them
+ *                       behind the GEMM whose `y` they update and refills the pools they read
+ *                       between steps with its own copies, so they are kept out of the replay's
+ *                       overlap analysis rather than leaning on it. */
 extern "C" int rad_kernel_concurrent(int i) {
     const RadKernelInfo* k = rad_kernel_at(i);
     if (!k) return 0;
     if (k->family && std::strcmp(k->family, "ar") == 0) return 0;
     static const char* const kStateful[] = {
-        "hc_", "mtp_enter", "ar_", "gemm_w4a8_tiled", "gemm_w8a8_tiled",
+        "hc_", "mtp_enter", "ar_", "gemm_w4a8_tiled", "gemm_w8a8_tiled", "lora_",
     };
     for (const char* p : kStateful)
         if (std::strncmp(k->name, p, std::strlen(p)) == 0) return 0;

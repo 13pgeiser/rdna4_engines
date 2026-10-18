@@ -49,6 +49,17 @@ typedef struct RadBatch {
     const int32_t* positions;    /* [n_tok] device */
     const int32_t* cu_seqlens;   /* [n_seq+1] device: sequence boundaries within this step */
     const int32_t* seq_ids;      /* [n_seq] device: engine-side sequence identity */
+    /* [n_tok] device: the runtime LoRA adapter each token's row runs with, as a slot of the
+     * adapter pools the core declared (docs/OPS.md, lora_shrink / lora_expand). A row whose slot is
+     * < 0 or >= the pools' slot count S is a base row, which an adapter op leaves untouched. Every
+     * row of a sequence carries its request's slot, fixed when the request was admitted, so a step
+     * that mixes adapters and the base needs nothing else.
+     *
+     * Null when the engine serves no adapters (no --lora and no --max-loras). The core issues the
+     * adapter ops itself and reads it there; a block with an adapter epilogue of its own reads it
+     * too. Like every array above it sits at one address per rank for the engine's life and is
+     * rewritten every step, so a recorded pass replays it. */
+    const int32_t* lora_slot;
 
     /* The tokens the sampler wants logits for: indices into this step's tokens, [n_out].
      *

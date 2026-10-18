@@ -4,6 +4,7 @@
  */
 #include "build/startup.h"
 #include "build/rad_build.h"
+#include "lora/declare.h"
 #include "format/tunecache.h"
 #include "plugin/registry.h"
 
@@ -37,6 +38,7 @@ int rad_reference_ops(const Program& p, std::vector<std::string>* out) {
     int n = 0;
     for (size_t i = 1; i < p.ops.size(); ++i) {
         const OpInfo& oi = p.ops[i];
+        if (oi.lora_declined) continue;   /* never handed out, so never issued (rad_builder.cpp) */
         bool real = false;
         for (const Band& b : oi.bands)
             for (int d = 0; d < RAD_N_DOMAINS && !real; ++d)
@@ -340,7 +342,8 @@ std::vector<std::string> CheckpointSources::refused() const {
 
 int rad_tools_declare(const LoadedPlugins& lp, const RadModelMeta& meta, const RadBuildCtx& ctx,
                       Program* out, const std::function<int(RadBuilder*, int64_t)>& also,
-                      const Program* ref, const WeightSourceFn& sources, bool instances) {
+                      const Program* ref, const WeightSourceFn& sources, bool instances,
+                      const LoraDeclare* lora) {
     if (!out) return RAD_E_INVAL;
 
     Registry& r = rad_tools_registry();
@@ -355,12 +358,25 @@ int rad_tools_declare(const LoadedPlugins& lp, const RadModelMeta& meta, const R
     if (ref) b.set_reference(ref);
     if (sources) b.set_sources(sources);
     b.set_instances(instances);
+    const bool with_lora = lora && lora->cfg && lora->cfg->enabled();
+    if (with_lora) b.set_lora_targets(&lora->targets);
 
     int s = ap->arch_declare(&b, &meta, &ctx);
     if (s < 0) {
         RAD_ERR("%s: rad_arch_declare returned %s", lp.arch_plugin.c_str(), rad_strerror(s));
         for (const auto& e : b.errors()) RAD_ERR("    %s", e.c_str());
         return s;
+    }
+
+    /* RUNTIME LoRA, after the plugin and before the sampler: the sites read the plugin's finished
+     * graph, and the appended ops go through the same resolution as everything else. */
+    if (with_lora) {
+        b.set_lora_targets(nullptr);
+        s = lora_declare(b, *lora);
+        if (s < 0) {
+            for (const auto& e : b.errors()) RAD_ERR("    %s", e.c_str());
+            return s;
+        }
     }
 
     /* The sampler declares into the same builder before finish(). An unresolved sampler op is not

@@ -118,6 +118,9 @@ int ref_gemm_nt            (const RadArgs*, RadStream);
 int ref_gemm_nt_bias       (const RadArgs*, RadStream);
 int ref_gemm_nt_q          (const RadArgs*, RadStream);
 int ref_gemm_nt_q_bias     (const RadArgs*, RadStream);
+/* Runtime LoRA's two halves, per-row adapter slot (ref_lora.cpp). */
+int ref_lora_shrink        (const RadArgs*, RadStream);
+int ref_lora_expand        (const RadArgs*, RadStream);
 int ref_embed_lookup       (const RadArgs*, RadStream);
 int ref_embed_lookup_q     (const RadArgs*, RadStream);
 int ref_logits_gemm        (const RadArgs*, RadStream);
@@ -283,6 +286,8 @@ REF_SHAPE_FN(ref_gemm_nt);
 REF_SHAPE_FN(ref_gemm_nt_bias);
 REF_SHAPE_FN(ref_gemm_nt_q);
 REF_SHAPE_FN(ref_gemm_nt_q_bias);
+REF_SHAPE_FN(ref_lora_shrink);
+REF_SHAPE_FN(ref_lora_expand);
 REF_SHAPE_FN(ref_embed_lookup);
 REF_SHAPE_FN(ref_embed_lookup_q);
 REF_SHAPE_FN(ref_logits_gemm);
