@@ -33,7 +33,9 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 
+#include <cerrno>
 #include <condition_variable>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
@@ -188,6 +190,10 @@ struct World {
     std::string qwen35, lfm2, gemma4, llama, llama_rad;
     /* llama.rad with its lm head block fp8, and int8 per (row, 128 of K). */
     std::string llama_fp8head, llama_i8head;
+    /* The llama as an int4 W4A16 release with zero points (tiny_model.h, write_llama_ct_int4),
+     * and its container through the import rule. */
+    std::string llama_int4, llama_int4_rad;
+    std::string llama_mxfp4;   /* llama's trunk as OCP-MXFP4 */
     /* qwen35 and gemma4 with 4 KiB of KV a token (wider KV heads), for the preemption cases: a MiB
      * of device is then about 256 tokens of pool, fine enough for small_device() to land between
      * one request and four. */
@@ -217,12 +223,15 @@ struct World {
         llama_rad = dir / "llama.rad";
         llama_fp8head = dir / "llama_fp8head.rad";
         llama_i8head = dir / "llama_i8head.rad";
+        llama_int4 = dir / "llama_int4";
+        llama_int4_rad = dir / "llama_int4.rad";
+        llama_mxfp4 = dir / "llama_mxfp4.rad";
         qwen35_kv = dir / "qwen35_kv";
         gemma4_kv = dir / "gemma4_kv";
         qwen35_spec = dir / "qwen35_spec";
         qwen3asr = dir / "qwen3asr";
         for (const std::string* d : { &qwen35, &lfm2, &gemma4, &llama, &qwen35_kv, &gemma4_kv,
-                                      &qwen35_spec, &qwen3asr })
+                                      &qwen35_spec, &qwen3asr, &llama_int4 })
             if (mkdir(d->c_str(), 0755) != 0) return;
         tiny::Qwen35 qkv;
         qkv.head_dim = 128;
@@ -241,7 +250,10 @@ struct World {
             !tiny::write_text(dir / "llama_fp8head.recipe",
                               std::string(tiny::kLlamaFp8Recipe) + tiny::kLlamaFp8HeadRule) ||
             !tiny::write_text(dir / "llama_i8head.recipe",
-                              std::string(tiny::kLlamaFp8Recipe) + tiny::kLlamaI8HeadRule))
+                              std::string(tiny::kLlamaFp8Recipe) + tiny::kLlamaI8HeadRule) ||
+            !tiny::write_llama_ct_int4(llama_int4, {}, true) ||
+            !tiny::write_text(dir / "llama_int4.recipe", tiny::kInt4ImportRecipe) ||
+            !tiny::write_text(dir / "llama_mxfp4.recipe", tiny::kLlamaMxfp4Recipe))
             return;
 
         tiny::Rng r(11);
@@ -259,11 +271,14 @@ struct World {
             !write_corpus(corpus_probe, { words(r, 40) }))
             return;
 
-        const std::pair<std::string, const char*> kConverts[] = {
-            { llama_rad, "llama.recipe" }, { llama_fp8head, "llama_fp8head.recipe" },
-            { llama_i8head, "llama_i8head.recipe" } };
-        for (const auto& [out, recipe] : kConverts) {
-            const int st = tiny::run({ RAD_E2E_CONVERT, llama, "-o", out, "--recipe",
+        const struct { std::string out; const char* recipe; const std::string* ckpt; }
+            kConverts[] = { { llama_rad, "llama.recipe", &llama },
+                            { llama_fp8head, "llama_fp8head.recipe", &llama },
+                            { llama_i8head, "llama_i8head.recipe", &llama },
+                            { llama_int4_rad, "llama_int4.recipe", &llama_int4 },
+                            { llama_mxfp4, "llama_mxfp4.recipe", &llama } };
+        for (const auto& [out, recipe, ckpt] : kConverts) {
+            const int st = tiny::run({ RAD_E2E_CONVERT, *ckpt, "-o", out, "--recipe",
                                        dir / recipe },
                                      engine_env(), &convert_log);
             if (st != 0) {
@@ -460,23 +475,28 @@ struct Server {
 };
 
 /* One request on its own loopback connection, sent and not yet read, so several can be in flight
- * at once. */
+ * at once. A request that gets no response says why in `why`. */
 struct Call {
     int fd = -1;
+    std::string why;
+    bool fail(const char* what) {
+        why = std::string(what) + ": " + std::strerror(errno);
+        return false;
+    }
     bool send(int port, const char* method, const std::string& path, const std::string& body) {
         fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        if (fd < 0) return false;
+        if (fd < 0) return fail("socket");
         sockaddr_in a{};
         a.sin_family = AF_INET;
         a.sin_port = htons((uint16_t)port);
         a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        if (connect(fd, (sockaddr*)&a, sizeof a) != 0) return false;
+        if (connect(fd, (sockaddr*)&a, sizeof a) != 0) return fail("connect");
         std::string req = std::string(method) + " " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\n" +
                           "Connection: close\r\nContent-Type: application/json\r\n" +
                           "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
         for (size_t off = 0; off < req.size();) {
             const ssize_t n = ::send(fd, req.data() + off, req.size() - off, MSG_NOSIGNAL);
-            if (n <= 0) return false;
+            if (n <= 0) return fail("send");
             off += (size_t)n;
         }
         return true;
@@ -485,16 +505,23 @@ struct Call {
     int read(std::string* body) {
         std::string raw;
         char buf[16384];
+        int err = 0;
         for (;;) {
             const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
             if (n < 0 && errno == EINTR) continue;
+            if (n < 0) err = errno;
             if (n <= 0) break;
             raw.append(buf, (size_t)n);
         }
         close(fd);
         fd = -1;
         const size_t h = raw.find("\r\n\r\n");
-        if (raw.compare(0, 9, "HTTP/1.1 ") != 0 || h == std::string::npos) return -1;
+        if (raw.compare(0, 9, "HTTP/1.1 ") != 0 || h == std::string::npos) {
+            why = "no response: " + std::to_string(raw.size()) + " byte(s) before the server " +
+                  (err ? std::string("reset the connection (") + std::strerror(err) + ")"
+                       : std::string("closed it"));
+            return -1;
+        }
         std::string head = raw.substr(0, h), rest = raw.substr(h + 4);
         for (char& c : head) c = (char)std::tolower((unsigned char)c);
         if (head.find("transfer-encoding: chunked") != std::string::npos) {
@@ -515,11 +542,13 @@ struct Call {
     ~Call() { if (fd >= 0) close(fd); }
 };
 
-json post(int port, const std::string& path, const json& body, int* status = nullptr) {
+json post(int port, const std::string& path, const json& body, int* status = nullptr,
+          std::string* why = nullptr) {
     Call c;
     std::string out;
     const int st = c.send(port, "POST", path, body.dump()) ? c.read(&out) : -1;
     if (status) *status = st;
+    if (why) *why = c.why;
     return json::parse(out, nullptr, false);
 }
 
@@ -707,6 +736,265 @@ TEST(qwen35_two_ranks_agree_with_one_within_rounding) {
         world().qwen35, world().corpus,
         { "--tp", "2", "--max-num-batched-tokens", "512", "--max-num-seqs", "1" },
         { "RADIANCE_HOST_DEVICES=2" }));
+}
+
+/* ================================================================== runtime LoRA */
+
+/* A PEFT adapter over the qwen35 checkpoint on every linear runtime LoRA follows (the gated
+ * attention, the delta net's in_proj_qkv, in_proj_z and out_proj, the MLP), and the checkpoint with
+ * it merged in. Written once, by the first case that needs them. */
+const std::vector<std::string> kLoraTargets = { "q_proj",      "k_proj",    "v_proj",
+                                                "o_proj",      "in_proj_qkv", "in_proj_z",
+                                                "out_proj",    "gate_proj", "up_proj",
+                                                "down_proj" };
+struct LoraWorld {
+    tiny::TempDir dir{ "e2e_lora" };
+    std::string adapter, merged;
+    bool ok = false;
+    LoraWorld() {
+        if (!dir.ok() || !world().ok) return;
+        adapter = dir / "adapter";
+        merged = dir / "merged";
+        ok = tiny::write_lora(adapter, world().qwen35, kLoraTargets, 8, 16.0, 21, 0.25f, merged);
+    }
+};
+LoraWorld& lora_world() {
+    static LoraWorld l;
+    return l;
+}
+
+/* `mixed` against two recordings of the same corpus, document by document: those whose source
+ * starts with `prefix` must be `a`'s rows byte for byte, the others `b`'s. */
+bool spliced_recording_matches(const std::string& mixed, const std::string& a,
+                               const std::string& b, const std::string& prefix, std::string* why) {
+    const json m = json::parse(tiny::read_text(mixed + "/kld.json"), nullptr, false);
+    if (!m.is_object() || !m.contains("docs")) { *why = "no manifest"; return false; }
+    if (tiny::read_text(mixed + "/tokens.i32") != tiny::read_text(a + "/tokens.i32")) {
+        *why = "tokens.i32 differs";
+        return false;
+    }
+    const int64_t n_vocab = m["n_vocab"].get<int64_t>(), top = m["top"].get<int64_t>();
+    const std::pair<const char*, int64_t> files[] = {
+        { "logp.f16", n_vocab * 2 }, { "top.bin", top * 8 }, { "rows.f32", 8 } };
+    for (const auto& [f, row_bytes] : files) {
+        const std::string x = tiny::read_text(mixed + "/" + f);
+        const std::string ya = tiny::read_text(a + "/" + f), yb = tiny::read_text(b + "/" + f);
+        if (x.empty() || x.size() != ya.size() || x.size() != yb.size()) {
+            *why = std::string(f) + " is missing or of another size";
+            return false;
+        }
+        for (const json& d : m["docs"]) {
+            const std::string src = d["source"].get<std::string>();
+            const int64_t row0 = d["row0"].get<int64_t>();
+            const int64_t rows = d["tokens"].get<int64_t>() - 1 - d["score_from"].get<int64_t>();
+            const std::string& want = src.rfind(prefix, 0) == 0 ? ya : yb;
+            const size_t at = (size_t)(row0 * row_bytes), len = (size_t)(rows * row_bytes);
+            if (x.compare(at, len, want, at, len) != 0) {
+                *why = std::string(f) + ": document " + src + " is not " +
+                       (&want == &ya ? "the adapter" : "the base") + " recording's";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/* The adapter served at runtime scores as the merged checkpoint does, within rounding, at one rank
+ * and at two (where row-parallel GEMMs carry the delta through their all-reduce); the base model
+ * against the same reference is well outside it, so a delta that went missing fails here. */
+TEST(runtime_lora_scores_as_the_merged_checkpoint_does) {
+    World& w = world();
+    LoraWorld& L = lora_world();
+    REQUIRE(L.ok);
+    tiny::TempDir d("e2e_lora_ref");
+    const std::string ref = d / "merged";
+    const std::vector<std::string> one = { "--max-num-batched-tokens", "512", "--max-num-seqs", "1" };
+    std::vector<std::string> rec = { "--kld-record", ref, "--kld-corpus", w.corpus_short };
+    rec.insert(rec.end(), one.begin(), one.end());
+    const Ran merged = radiance(L.merged, rec);
+    REQUIRE_RAN(merged);
+    auto score = [&](const std::vector<std::string>& args, const std::vector<std::string>& env) {
+        tiny::TempDir o("e2e_lora_kld");
+        std::vector<std::string> a = { "--kld-ref", ref, "--kld-out", o / "kld.json" };
+        a.insert(a.end(), one.begin(), one.end());
+        a.insert(a.end(), args.begin(), args.end());
+        const Ran r = radiance(w.qwen35, a, env);
+        if (r.status != 0) {
+            fprintf(stderr, "    child exited %d:\n%s\n", r.status, tail(r.log).c_str());
+            return json();
+        }
+        return json::parse(tiny::read_text(o / "kld.json"), nullptr, false);
+    };
+    const std::vector<std::string> ad = { "--lora", "ad=" + L.adapter, "--kld-lora", "ad" };
+    check_within_rounding("runtime LoRA against the merged checkpoint", score(ad, {}));
+    std::vector<std::string> tp2 = { "--tp", "2" };
+    tp2.insert(tp2.end(), ad.begin(), ad.end());
+    check_within_rounding("runtime LoRA at two ranks against the merged checkpoint",
+                          score(tp2, { "RADIANCE_HOST_DEVICES=2" }));
+#if defined(__x86_64__)
+    /* libavx alone serves the adapter ops too, as it serves every other op. */
+    if (::access(RAD_E2E_HOME "/kernels/libavx.so", R_OK) == 0) {
+        std::vector<std::string> avx = { "--kernels", "libavx" };
+        avx.insert(avx.end(), ad.begin(), ad.end());
+        check_within_rounding("runtime LoRA on libavx against the merged checkpoint",
+                              score(avx, {}));
+    }
+#endif
+    const json base = score({}, {});
+    REQUIRE(base.is_object() && base.contains("all"));
+    const double kl = base["all"]["kld"]["mean"].get<double>();
+    fprintf(stderr, "    the base against the merged checkpoint: mean KL %.2g\n", kl);
+    CHECK(kl > 0.05);
+}
+
+/* An MXFP4 trunk: its GEMM's `group` is the weight's 32-wide exponent block, while the
+ * activation it reads is scaled per 128, and the adapter's shrink reads that activation at the
+ * activation's grid. Against the merged checkpoint, the adapter takes the container from the
+ * adapter's whole effect down to the MXFP4 rounding, on libref and on libavx. (The tiny llama's
+ * MXFP4 container declares at one rank only.) */
+TEST(runtime_lora_reads_an_mxfp4_trunks_activation_at_its_own_grid) {
+    World& w = world();
+    REQUIRE(w.ok);
+    tiny::TempDir d("e2e_lora_mx");
+    const std::string adapter = d / "adapter", merged = d / "merged", ref = d / "ref";
+    const std::vector<std::string> targets = { "q_proj", "k_proj", "v_proj", "o_proj",
+                                               "gate_proj", "up_proj", "down_proj" };
+    REQUIRE(tiny::write_lora(adapter, w.llama, targets, 8, 16.0, 23, 0.25f, merged));
+    const std::vector<std::string> one = { "--max-num-batched-tokens", "512", "--max-num-seqs", "1" };
+    std::vector<std::string> rec = { "--kld-record", ref, "--kld-corpus", w.corpus_short };
+    rec.insert(rec.end(), one.begin(), one.end());
+    const Ran recorded = radiance(merged, rec);
+    REQUIRE_RAN(recorded);
+    auto score = [&](const std::vector<std::string>& args, const std::vector<std::string>& env) {
+        tiny::TempDir o("e2e_lora_mx_kld");
+        std::vector<std::string> a = { "--kld-ref", ref, "--kld-out", o / "kld.json" };
+        a.insert(a.end(), one.begin(), one.end());
+        a.insert(a.end(), args.begin(), args.end());
+        const Ran r = radiance(w.llama_mxfp4, a, env);
+        if (r.status != 0) {
+            fprintf(stderr, "    child exited %d:\n%s\n", r.status, tail(r.log).c_str());
+            return -1.0;
+        }
+        const json j = json::parse(tiny::read_text(o / "kld.json"), nullptr, false);
+        return j.is_object() && j.contains("all") ? j["all"]["kld"]["mean"].get<double>() : -1.0;
+    };
+    const double base = score({}, {});
+    fprintf(stderr, "    the MXFP4 base against the merged checkpoint: mean KL %.3g\n", base);
+    REQUIRE(base > 0.05);
+    const std::vector<std::string> ad = { "--lora", "ad=" + adapter, "--kld-lora", "ad" };
+    struct Arm { const char* what; std::vector<std::string> args, env; };
+    std::vector<Arm> arms = { { "libref", ad, {} } };
+#if defined(__x86_64__)
+    if (::access(RAD_E2E_HOME "/kernels/libavx.so", R_OK) == 0) {
+        std::vector<std::string> avx = { "--kernels", "libavx" };
+        avx.insert(avx.end(), ad.begin(), ad.end());
+        arms.push_back({ "libavx", avx, {} });
+    }
+#endif
+    for (const Arm& a : arms) {
+        const double kl = score(a.args, a.env);
+        fprintf(stderr, "    the MXFP4 container with the adapter, %s: mean KL %.3g\n", a.what, kl);
+        CHECK(kl >= 0);
+        CHECK(kl < base / 4);
+    }
+}
+
+/* Off is off: without --lora or --max-loras the declared graph names no adapter op, buffer or
+ * declined GEMM, and with an adapter it is the same graph plus the adapter ops and their buffers
+ * over the same weights. */
+TEST(runtime_lora_off_declares_no_adapter_op) {
+    World& w = world();
+    LoraWorld& L = lora_world();
+    REQUIRE(L.ok);
+    const Ran off = radiance(w.qwen35, { "--debug-graph" });
+    const Ran on = radiance(w.qwen35, { "--debug-graph", "--lora", "ad=" + L.adapter });
+    REQUIRE_RAN(off);
+    REQUIRE_RAN(on);
+    /* The adapter ops, their buffers (`lora.<weight>.a`, `lora.t.r16.lane0`) and a declined fused
+     * GEMM's reason; a path may well contain "lora". */
+    for (const char* needle : { "lora_shrink", "lora_expand", "lora.", "runtime-LoRA" }) {
+        if (has(off.log, needle)) fprintf(stderr, "    the default graph names '%s'\n", needle);
+        CHECK(!has(off.log, needle));
+    }
+    auto counts = [](const std::string& log, long long* ops, long long* weights,
+                     long long* buffers) {
+        const size_t at = log.find("declare: ");
+        return at != std::string::npos &&
+               std::sscanf(log.c_str() + at, "declare: %lld ops, %lld weights, %lld buffers", ops,
+                           weights, buffers) == 3;
+    };
+    long long o0 = 0, w0 = 0, b0 = 0, o1 = 0, w1 = 0, b1 = 0;
+    REQUIRE(counts(off.log, &o0, &w0, &b0));
+    REQUIRE(counts(on.log, &o1, &w1, &b1));
+    CHECK_EQ(w1, w0);
+    CHECK(o1 > o0 && (o1 - o0) % 2 == 0);
+    CHECK(b1 > b0);
+    CHECK(has(on.log, "lora_shrink"));
+}
+
+/* Base rows are exact: documents run as the base with the adapter loaded are byte for byte what an
+ * engine without adapters writes. Mixed steps are exact: with one document through the adapter
+ * and the rest as the base, batched four at a time, every document's rows equal those of the run
+ * that served all documents its way. */
+TEST(runtime_lora_base_rows_and_mixed_steps_are_exact) {
+    World& w = world();
+    LoraWorld& L = lora_world();
+    REQUIRE(L.ok);
+    tiny::TempDir d("e2e_lora_mix");
+    auto record = [&](const char* name, const std::vector<std::string>& args) {
+        std::vector<std::string> a = { "--kld-record", d / name, "--kld-corpus", w.corpus_short,
+                                       "--max-num-batched-tokens", "512", "--max-num-seqs", "4" };
+        a.insert(a.end(), args.begin(), args.end());
+        const Ran r = radiance(w.qwen35, a);
+        if (r.status != 0) fprintf(stderr, "    %s exited %d:\n%s\n", name, r.status,
+                                   tail(r.log).c_str());
+        return r.status == 0;
+    };
+    const std::string lora = "ad=" + L.adapter;
+    REQUIRE(record("off", {}));
+    REQUIRE(record("base", { "--lora", lora }));
+    REQUIRE(record("adapter", { "--lora", lora, "--kld-lora", "ad" }));
+    REQUIRE(record("mixed", { "--lora", lora, "--kld-lora", "ad", "--kld-lora-sources", "d1" }));
+    std::string why;
+    const bool base_exact = same_recording(d / "off", d / "base", &why);
+    if (!base_exact) fprintf(stderr, "    base with the adapter loaded: %s\n", why.c_str());
+    CHECK(base_exact);
+    CHECK(!same_recording(d / "off", d / "adapter", &why));
+    const bool mixed_exact = spliced_recording_matches(d / "mixed", d / "adapter", d / "off",
+                                                       "d1", &why);
+    if (!mixed_exact) fprintf(stderr, "    mixed steps: %s\n", why.c_str());
+    CHECK(mixed_exact);
+}
+
+/* What would serve an adapter that cannot land, or one no request could reach, is refused at
+ * startup by name: a target module the trunk does not have (or has only as the vocabulary head),
+ * and an adapter that has the served model's own name. */
+TEST(runtime_lora_refuses_targets_it_cannot_serve_at_startup) {
+    World& w = world();
+    LoraWorld& L = lora_world();
+    REQUIRE(L.ok);
+    tiny::TempDir d("e2e_lora_no");
+    const std::string lora = "ad=" + L.adapter;
+    const struct { const char* targets; const char* why; } kCases[] = {
+        { "q_proj,qq_proj", "the target module 'qq_proj' is no trunk linear" },
+        { "q_proj,lm_head", "the target module 'lm_head' is no trunk linear" },
+    };
+    int k = 0;
+    for (const auto& c : kCases) {
+        const Ran r = radiance(w.qwen35, { "--lora", lora, "--lora-target-modules", c.targets,
+                                           "--kld-record", d / ("r" + std::to_string(k++)),
+                                           "--kld-corpus", w.corpus_probe }, {}, 120);
+        if (r.status == 0 || !has(r.log, c.why))
+            fprintf(stderr, "    %s: exited %d:\n%s\n", c.targets, r.status, tail(r.log).c_str());
+        CHECK(r.status != 0);
+        CHECK(has(r.log, c.why));
+    }
+    const Ran s = radiance(w.qwen35, { "--served-model-name", "ad", "--lora", lora,
+                                       "--host", "127.0.0.1", "--port", "0" }, {}, 120);
+    if (s.status == 0 || !has(s.log, "the served model's own name"))
+        fprintf(stderr, "    served as 'ad': exited %d:\n%s\n", s.status, tail(s.log).c_str());
+    CHECK(s.status != 0);
+    CHECK(has(s.log, "has the served model's own name"));
 }
 
 /* ================================================================== against transformers */
@@ -1115,6 +1403,39 @@ TEST(libavx_alone_serves_a_quantised_head_within_rounding_of_libref) {
             { "--kernels", "libavx", "--max-num-batched-tokens", "512", "--max-num-seqs", "1" }));
 }
 
+/* An int4 W4A16 release with zero points, imported, runs its linears on the 4-bit GEMMs: at or
+ * below 64 rows a step the f16 one over its cast input, above that the int8 one over
+ * quant_act_i8g's codes. libavx alone agrees with libref within rounding on each: the prefill in
+ * 512-row steps, and in 64-row steps against libref's own run in 64-row steps. */
+TEST(libavx_alone_serves_an_int4_release_within_rounding_of_libref) {
+#if defined(__x86_64__)
+    NEED_ARTIFACT(RAD_E2E_HOME "/kernels/libavx.so");
+#else
+    SKIP("libavx is x86-64 only");
+#endif
+    REQUIRE(world().ok);
+    World& w = world();
+    check_within_rounding("int4 llama on libavx alone, steps of 512",
+                          score_against_reference(w.llama_int4_rad, w.corpus_tiny,
+                                                  { "--kernels", "libavx",
+                                                    "--max-num-batched-tokens", "512",
+                                                    "--max-num-seqs", "1" }));
+    tiny::TempDir d("e2e_int4");
+    const std::vector<std::string> step64 = { "--max-num-batched-tokens", "64",
+                                              "--max-num-seqs", "1" };
+    std::vector<std::string> rec = { "--kld-record", d / "ref64", "--kld-corpus", w.corpus_tiny };
+    rec.insert(rec.end(), step64.begin(), step64.end());
+    const Ran r_ref = radiance(w.llama_int4_rad, rec);
+    REQUIRE_RAN(r_ref);
+    std::vector<std::string> sc = { "--kernels", "libavx", "--kld-ref", d / "ref64",
+                                    "--kld-out", d / "kld.json" };
+    sc.insert(sc.end(), step64.begin(), step64.end());
+    const Ran r_avx = radiance(w.llama_int4_rad, sc);
+    REQUIRE_RAN(r_avx);
+    check_within_rounding("int4 llama on libavx alone, steps of 64",
+                          json::parse(tiny::read_text(d / "kld.json"), nullptr, false));
+}
+
 /* ================================================================== HTTP */
 
 namespace {
@@ -1294,6 +1615,72 @@ TEST(a_prompt_resumed_from_the_prefix_cache_returns_what_a_cold_run_does) {
     CHECK_EQ(s.stop(), 0);
 }
 
+/* The row a running server's /diagnostics reports for `option`, or null. */
+json config_row(int port, const std::string& option) {
+    Call c;
+    std::string out;
+    if (!c.send(port, "GET", "/diagnostics", "") || c.read(&out) != 200) return json();
+    const json d = json::parse(out, nullptr, false);
+    if (!d.is_object() || !d.contains("configuration")) return json();
+    for (const json& r : d["configuration"])
+        if (r.value("option", "") == option) return r;
+    return json();
+}
+
+/* --checkpoint-slots auto, the default, sizes the snapshot store from --max-num-seqs and what the
+ * retention policy keeps for a --max-model-len session (the tiny hybrid's 4096 tokens are two
+ * 2048-token intervals: 2 snapshots, 3 a sequence), says so on its startup line and reports the
+ * count it chose with the reason. A count given on the command line is taken as it stands; a model
+ * with nothing to snapshot, or a server without a prefix cache, resolves to none. */
+TEST(the_snapshot_store_is_sized_by_auto_unless_a_count_is_given) {
+    REQUIRE(world().ok);
+    const struct Case {
+        std::string World::*model;
+        std::vector<std::string> args;
+        const char* value;
+        const char* source;
+        const char* why;
+        const char* line;
+    } kCases[] = {
+        { &World::qwen35, {}, "768", "auto", "3 a sequence for --max-num-seqs 256",
+          "checkpoint slots: auto: 768 linear-state snapshot(s) of " },
+        { &World::qwen35, { "--max-num-seqs", "4" }, "12", "auto",
+          "geometric-backoff keeps 2 for a 4096-token session at a 2048-token interval",
+          "checkpoint slots: auto: 12 linear-state snapshot(s) of " },
+        { &World::qwen35, { "--max-num-seqs", "4", "--checkpoint-slots", "auto" }, "12",
+          "command line", "3 a sequence", "checkpoint slots: auto: 12 " },
+        { &World::qwen35,
+          { "--max-num-seqs", "4", "--checkpoint-policy", "keep-all", "--checkpoint-interval", "256" },
+          "68", "auto", "keep-all keeps 16 for a 4096-token session at a 256-token interval",
+          "checkpoint slots: auto: 68 " },
+        { &World::qwen35, { "--max-num-seqs", "4", "--checkpoint-slots", "5" }, "5", "command line",
+          "", "checkpoint slots: 5 linear-state snapshot(s) of " },
+        { &World::qwen35, { "--max-num-seqs", "4", "--no-prefix-cache" }, "0", "auto",
+          "prefix caching is off", "" },
+        { &World::llama, { "--max-num-seqs", "4" }, "0", "auto",
+          "the model keeps no linear or sliding-window state", "" },
+        { &World::lfm2, { "--max-num-seqs", "4" }, "12", "auto", "3 a sequence for --max-num-seqs 4",
+          "checkpoint slots: auto: 12 linear-state snapshot(s) of 512 B " },
+    };
+    for (const Case& k : kCases) {
+        Server s;
+        REQUIRE(s.start(world().*k.model, k.args));
+        const json row = config_row(s.port, "--checkpoint-slots");
+        const std::string log = s.output();
+        std::string args;
+        for (const std::string& a : k.args) args += " " + a;
+        const bool ok = row.is_object() && row.value("value", "") == k.value &&
+                        row.value("source", "") == k.source &&
+                        row.value("why", "").find(k.why) != std::string::npos &&
+                        has(log, k.line);
+        if (!ok)
+            fprintf(stderr, "    %s:%s\n    row %s\n%s\n", (world().*k.model).c_str(), args.c_str(),
+                    row.dump().c_str(), tail(log, 12).c_str());
+        CHECK(ok);
+        CHECK_EQ(s.stop(), 0);
+    }
+}
+
 /* A snapshot store that cannot be had stops the start, naming --checkpoint-slots, the size and
  * what to change; served without it, every prefix hit on a hybrid model would prefill from the
  * start. The largest count the flag takes is more bytes than a 64-bit size says, whatever a slot's
@@ -1468,6 +1855,7 @@ const QwenImageContainers& qwen_image() {
 /* One picture through the images API, and its pixels. */
 struct Picture {
     int status = -1;
+    std::string why;
     std::string png;
     std::vector<uint8_t> rgba;
     std::string log;
@@ -1495,7 +1883,7 @@ Picture generate(const std::string& model, const std::vector<std::string>& kerne
         req["negative_prompt"] = "a dark river";
         req["true_cfg_scale"] = cfg;
     }
-    const json r = post(s.port, "/v1/images/generations", req, &p.status);
+    const json r = post(s.port, "/v1/images/generations", req, &p.status, &p.why);
     if (p.status == 200 && r.is_object() && r.contains("data") && r["data"].size() == 1) {
         std::vector<uint8_t> bytes;
         if (rad::server::base64_decode(r["data"][0].value("b64_json", std::string()), &bytes)) {
@@ -1510,8 +1898,8 @@ Picture generate(const std::string& model, const std::vector<std::string>& kerne
     s.stop();
     p.log = s.output();
     if (p.status != 200 || p.rgba.empty())
-        fprintf(stderr, "    %s: status %d, %zu pixel bytes:\n%s\n", ks.c_str(), p.status,
-                p.rgba.size(), tail(p.log, 20).c_str());
+        fprintf(stderr, "    %s: status %d%s%s, %zu pixel bytes:\n%s\n", ks.c_str(), p.status,
+                p.why.empty() ? "" : " -- ", p.why.c_str(), p.rgba.size(), tail(p.log, 20).c_str());
     return p;
 }
 

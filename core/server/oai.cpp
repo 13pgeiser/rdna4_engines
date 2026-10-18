@@ -313,7 +313,9 @@ const Guarded kGuarded[] = {
                                    "implemented" },
     { "suffix", empty_value, "an empty string", "infilling through /v1/completions is not "
                                                 "implemented" },
-    { "lora", empty_value, "an empty list", "LoRA is explicitly out of scope (spec, Scope)" },
+    { "lora", empty_value, "an empty list",
+      "a per-request adapter list is not served; a runtime LoRA adapter is chosen by `model` "
+      "(--lora)" },
     { "modalities", text_only, "[\"text\"]", "output modalities other than text are not "
                                              "implemented" },
     { "audio", empty_value, "null", "audio output is not implemented" },

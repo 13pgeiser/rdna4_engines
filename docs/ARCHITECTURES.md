@@ -19,6 +19,9 @@ plugin claims.
 | `arch/gemma4` | `gemma4` | *(empty)* | Gemma 4 text from Google's bf16 checkpoint (the 26B-A4B MoE and the dense sizes without per-layer embeddings) with z-lab's DFlash drafter; routed experts bf16 or block fp8 |
 | `arch/qwenimage21` | `qwenimage21` | *(empty)* | Qwen-Image 2.1 and 2.1-Turbo, an image generator, from the diffusers pipeline directory; DiT and text encoder bf16 or block fp8 |
 | `arch/qwen3asr_bf16` | `qwen3asr` | *(empty)* | Qwen3-ASR: a Whisper-style audio encoder over a dense Qwen3 decoder, speech to text |
+| `arch/minimaxmusic3` | `minimaxmusic3` | *(empty)* | MiniMax-Music3, songs from a description and lyrics: a Qwen3-8B frame model, a depth decoder, a flow-matching DiT and a DAC vocoder, from the diffusers pipeline directory, bf16 |
+| `arch/breeze` | `breeze` | *(empty)* | Breeze-TTS-2, speech from text and a description of the voice: a T5Gemma 2 text encoder, a Qwen3 backbone with a 16-codebook depth decoder and the Qwen3-TTS 12 Hz codec, from the release directory, bf16, one card |
+| `arch/minimaxh3` | `minimaxh3` | *(empty)* | MiniMax-H3, a video with its stereo soundtrack from text: Qwen3-VL-32B's language model as the text encoder, a 33B single-stream diffusion transformer, a tiled ViT video decoder and a BigVGAN audio decoder, from the diffusers pipeline directory; linears block fp8 (`data/recipes/minimax-h3-fp8.recipe`) |
 
 The traps below are readings that are wrong without any error: the model produces fluent output.
 
@@ -640,3 +643,258 @@ clips at their pauses (docs/GUIDE.md §5.14). Against transformers on LibriSpeec
 test-other clips, the encoder's rows are within 1.1-1.3% relative L2 of the bf16 reference's; on
 the one clip where they differed by 5%, the reference itself was 5.3% from a float32 run of the
 same model and this engine 0.8%. The transcripts match word for word.
+
+---
+
+# `minimaxmusic3`: MiniMax-Music3, songs
+
+`arch/minimaxmusic3` declares an audio generator (`rad_declare_audio_generator`), which makes the
+program a four-pass one the engine drives through `core/gen/audio_driver.h`: PROMPT runs the
+language model over prompt chunks, FRAME samples one frame of every song in flight and runs the
+language model over its embedding, WINDOW steps the denoiser over a window of frames, VOCODE plays
+a finished window. A song is a lane; up to four are made at once. It is served on
+`/v1/audio/speech` ([GUIDE §5.15](GUIDE.md)), bf16 on one card or two. The checkpoint is the
+diffusers pipeline directory, read as one.
+
+```
+LM        Qwen3-8B with its embedding and head adapted to music codes: 36 layers of 4096 (32 x 128,
+          8 kv heads), theta 1e6. Two branches a song, conditional and unconditional. Each frame's
+          first code: one of 16384 semantic codes (ids 151675..) or the end of the song (151670),
+          from u + 1.5 (c - u); the candidates are the top 50 of c, of which the top 50 of the
+          guided logits are drawn
+depth     4 layers of 4096, 16 heads of 256, SwiGLU 6144, learned positions: the frame's other
+          seven codes (1024 each) one at a time, each with the same guidance, the sequence
+          recomputed whole at every step. The next LM input is the eight codes' embeddings summed,
+          times 8^-0.5
+cond      the frame's hidden planes mixed by softmax(learned logits), scaled; a window's rows
+          through a 3-tap conv to 2048 channels, resampled nearest to 441/128 latents a frame
+DiT       36 layers of 2048 (32 x 64), LayerNorm with affine, SwiGLU 16384 with biases, RoPE over
+          the first 32 of 64 dims; input [latent 128 | zeros 128 | cond 2048] plus a 1x1-conv
+          residual, the timestep token prepended, non-causal. 30 Euler steps at t = i / 30,
+          guidance 1.7 against an all-zero conditioning
+windows   200 frames, a new one every 100; each binds its first 172 latents to its predecessor's
+vocoder   DAC's decoder: the latent's two 64-channel halves as two streams (left, right), four
+          transposed convolutions (8, 8, 4, 2), dilated residual units with snake; 512 samples a
+          latent, 44.1 kHz stereo
+```
+
+Traps:
+
+- **The randomness is radiance's.** Each pick draws `rad_philox_uniform_s(seed, 2^32 + frame,
+  sub-step)` by inverse CDF in descending guided logit (ties to the lower index), and window k's
+  noise is `rad_philox_normal_s(seed, 1 + k, row * 128 + c)` (`abi/rad_philox.h`). Parity against
+  diffusers means handing diffusers the same picks and noise, which a NumPy port of the streams
+  does.
+- **The unconditional prompt is the conditional one with its middle blanked**: its first token and
+  last two kept, every token between them the filler 151654, so both branches have one length.
+  An empty or shortened prompt is a different guidance and still sings.
+- **The first frame after the prompt is consumed, not played**: it only moves the language model
+  past the prompt, and no conditioning row is stored for it.
+- **The DiT's positions start at the timestep token**: position 0 is that token and the latents
+  follow from 1. Starting the latents at 0 shifts every rotation by one and the song still plays.
+- **A window's join runs in one order**: its head is set from the previous window's kept tail
+  first, and only then is the next window's tail taken from the joined latent. The other order
+  binds a window to its own tail, and the song drops in level for a moment at every join.
+- **The model card says 32 kHz; the vocoder plays 44.1 kHz** (512 samples a latent), as diffusers'
+  port and its config do.
+- **Under tensor parallelism, a fused projection's stacked bias is cut per part**: a rank-1
+  `[value | gate]` vector holds its share of each half, as the matrix it goes with does. A
+  contiguous slice of the stack runs and is 5-6% off in every DiT velocity.
+
+Against diffusers' own pipeline in bf16, from the same picks and noise: with radiance's codes
+teacher-forced into the reference, the language model's last hidden row is 1.55% from the
+reference's (relative L2; the reference is 1.27% from itself across bf16 and f32), the window
+conditioning 1.33% (1.10%), a DiT step's velocity 1.3% (1.8%). At one card a 4 s song is 29.0 dB
+SNR from the reference's audio, against 28.7 dB between the reference's own attention kernels; at
+two cards a 12 s song of two windows is 26.3 dB (32.0), and the 4 s song 20.8 dB, one passage of it
+having taken another turn, which a rounding-level change makes in the reference too. A pick is chaotic: with the same history,
+the reference and radiance choose differently at 318 of 808 sub-steps, and the reference chooses
+differently from itself across precisions at 314.
+
+---
+
+# `breeze`: Breeze-TTS-2, speech
+
+`arch/breeze` declares an audio generator in its chunked form (`rad_declare_audio_generator` with
+`voc_chunk`): PROMPT runs the text encoder and the backbone over both branches' whole prompts,
+FRAME samples one frame of every speech in flight and runs the backbone over its embedding, VOCODE
+plays a lane's newest frames, four at most, as soon as they are made. It is served on
+`/v1/audio/speech` and `/v1/audio/speech/stream` ([GUIDE §5.15](GUIDE.md)), bf16 on one card. The
+checkpoint is the release directory; its codec, in `audio_tokenizer/`, is read with it.
+
+```
+text      T5Gemma 2's text encoder in Gemma 3 1B's shape: 26 layers of 1152, 4 query heads over one
+          KV head of 256 (q/k RMS-normed, scale 1/16), sandwich RMS norms with a (1 + w) gain,
+          gelu-tanh GLU 6912, the embedding times 34.0 (bf16 of sqrt 1152). BIDIRECTIONAL over the
+          whole prompt: sliding layers see 255 keys behind and 256 ahead (theta 1e4); layers 5,
+          11, 17 and 23 see everything (theta 1e6, positions divided by 8). Final norm, then
+          1152 -> 2048
+backbone  Qwen3: 28 layers of 2048, 16 heads over 8 KV heads of 128, q/k norms, theta 1e6, eps
+          1e-6. Its prompt rows ARE the encoder's projection; a frame's input is the bf16 of the
+          f32 sum of its 16 codes' rows of one table [16 x 2051, 2048]. Head 2052: 2048 codes,
+          three never drawn, the end of the speech
+depth     12 layers of 1024, 8 heads over 2 KV heads of 128, Llama 3's rotary (theta 5e5, factor
+          32, original length 16, low 1/512, high 1/128), no q/k norms: position 0 is the
+          backbone's hidden state, position p code p - 1's row of the table, both through one
+          2048 -> 1024 projection; 15 heads, one a codebook
+sampling  u + g (c - u) against an unconditional prompt without the voice description (g 1, the
+          default: none); top 50 at temperature 0.9; the first code also takes a repetition penalty
+          of 1.1 over the speech's earlier first codes
+codec     the Qwen3-TTS 12 Hz tokenizer's decoder: EMA codebooks (the first code's, the other
+          fifteen's) projected 256 -> 512 and summed; a causal conv k3 to 1024; 8 layers of 512
+          (16 heads of 64, rotary at the frame's index, causal over 72 frames, layer scales);
+          twice a transposed conv k2 s2 and a ConvNeXt block (causal depthwise k7, LayerNorm,
+          exact GELU over 4096); a causal conv k7 to 1536; four blocks of SnakeBeta, a causal
+          transposed conv (8, 5, 4, 3) and three residual units (dilations 1, 3, 9); SnakeBeta and
+          a conv k7 to one channel: 1920 samples a frame, 24 kHz mono
+```
+
+Traps (each still speaks, wrongly):
+
+- **The backbone's configuration is `backbone_config`.** The top level's Llama 3 rotary at theta
+  5e5 and eps 1e-5 belong to a native backbone the release does not build; the Qwen3 backbone runs
+  at theta 1e6 and eps 1e-6.
+- **The backbone never embeds text.** Every prompt row is the encoder's output projected; the
+  checkpoint's `embed_text_tokens` (0.5B parameters) is unused, and so is the Mimi codec in the
+  main file.
+- **The encoder reads the whole prompt at once**, so a prompt is never split across passes
+  (`prompt_whole`), and its sliding window is lopsided: transformers' mask at 512 sees 255 keys
+  behind and 256 ahead. A symmetric window differs on prompts over 256 tokens.
+- **The depth heads are stored (in, out)**, `[15, 1024, 2051]`, and are transposed at convert
+  (`RAD_MAP_TRANSPOSE`); the codec's codebooks are EMA sums, divided by their usage at convert
+  (`RAD_MAP_EMA`).
+- **A frame's sixteen embeddings are summed in f32 and rounded once**, as torch sums a bf16 tensor;
+  rounding after each would move every backbone input.
+- **The codec's first two transposed convolutions have a kernel of one stride**, the four after
+  them of two, all causal: the full output's last rows dropped, no padding in front.
+- **The reference's streaming codec is not a reference.** Its 72-slot KV ring shifts with an
+  overlapping in-place copy that races on the GPU: three identical decodes agree at 20-26 dB.
+  Compare against the offline decode, which radiance's chunks reproduce: every codec layer is
+  causal, so a chunk decoded again over the 85 frames its outputs reach back to is exact. The
+  reference's own codec decoded on radiance's schedule is 117 dB from its whole decode (f32
+  rounding); with 60 frames of context it is 30 dB.
+
+Against BreezeBlue's eager reference in bf16, teacher-forced with radiance's codes (a CPU run):
+the backbone's hidden rows are 1.04% from the reference's (relative L2, median over the prompt and
+72 frames; the reference is 0.94% from itself across bf16 and f32). The reference would have drawn
+another code at 323 of 1168 picks, all near-ties: the code radiance drew had a median 0.998 of
+the reference's own pick's probability, and the first code differed once in 73 frames. Through
+the codec alone, radiance's bf16 audio is 38.4 dB SNR from the reference's f32 decode of the same
+codes. Whisper large-v3 transcribes radiance's speech word for word.
+
+---
+
+# `minimaxh3`: MiniMax-H3, video with sound
+
+`arch/minimaxh3` declares a video generator (`rad_declare_video_generator`), which makes the
+program a four-pass one the engine drives through `core/gen/video_driver.h`: VCOND runs the text
+encoder and the refiner over the prompt and computes every step's modulation, VSTEP is one
+denoising step of one request's packed sequence, ADECODE plays the soundtrack, VDECODE decodes
+one temporal chunk of frames. A request is a lane; two hold state at once (one denoising, one
+conditioned and waiting). It is served on `/v1/videos` ([GUIDE §5.16](GUIDE.md)), block fp8 on two
+cards with `--vision-tower-placement ram`. The checkpoint is the diffusers pipeline directory,
+read as one; only workflow t2va is served.
+
+```
+text      Qwen3-VL-32B's language model: 64 layers of 5120 (64 q / 8 kv heads of 128, ff 25600,
+          eps 1e-6, theta 5e6, interleaved M-RoPE, which is NeoX for text). The conditioning is
+          the hidden state AFTER LAYER 50, before any norm; layers 50..63 are never read and the
+          container leaves them out. The prompt is tokenised as written, no template, no special
+          tokens
+refiner   context_embedder 5120 -> 5376 (bias), two plain pre-norm blocks over the prompt (full
+          attention, no rotary, q/k RMS norms), a final RMSNorm
+DiT       50 blocks of 5376 (56 heads of 128), SwiGLU 14336, RMSNorm eps 1e-5, no biases, one
+          packed sequence [text | soundtrack ch0 | soundtrack ch1 | video] under full attention.
+          Each row is modulated by its modality (0 video, 1 text, 2 audio) at its timestep (text
+          rows take the video's): six vectors a block from Linear(silu(temb), 3 x 6 x 5376).
+          norm_out's shift and scale are per timestep. Video latents 24 channels in 1x2x2 patches
+          (96 values a row, proj_in f32), the soundtrack's 32 channels a row (f32). Guidance-
+          distilled: one forward a step
+rotary    3 axes (time, row, column), 16 frequencies each (theta 1e4) over the first 96 of 128
+          dims, rotate-half pairs (i, i + 48); f32 positions
+schedule  per modality: sigma = s x / (1 + (s - 1) x) over linspace(1, 0, N) (N grid points, N - 1
+          evaluations), shift 12 for the video and 3 for the soundtrack; t = 1 - sigma; x0 =
+          x + (1 - t) v, then x' = r x + (1 - r) x0 with r = sigma_next / sigma
+video     ViT decoder, 36 layers of 2048 (32 heads of 64), f32 residual, RMSNorm, q/k RMS norms
+VAE       without weights, rotary 8/8/8 over 48 of 64 dims (theta 100, angles 2 pi (2 (i + .5) /
+          n - 1)), layer scales, SwiGLU 8192 with biases, 4 registers and a zero token a tile.
+          A token is a latent: 4 frames x 16 x 16 pixels. Tiles of 16 x 16 latents, overlap 4 at
+          least; chunks of 7 latent frames every 5. Pixels come out ImageNet-normalised
+audio     dec_in_proj 32 -> 2048, BigVGAN: conv_pre k7 to 1024, 7 transposed convolutions (5 5 2 2
+VAE       2 2 2), each followed by the mean of three AMP blocks (k 3/7/11, dilations 1/3/5) with
+          anti-aliased SnakeBeta (x2 up, x2 down, 12-tap Kaiser filters); conv_post k7 to one
+          channel, clamped. 800 samples a latent, 32 kHz, each stereo channel its own sequence
+length    24 fps; a video of n chunks is 17 n + 5 frames over 5 n + 2 latent frames, n 7..20
+          (5.17 to 14.4 s); the soundtrack is round-half-even(frames x 40 / 24) latents a channel
+```
+
+Traps:
+
+- **The feed-forward's value half comes first** in the checkpoint (`[value | gate]`, out =
+  `value * silu(gate)`), in the DiT, the refiner and the video decoder alike. The halves are
+  swapped at convert into the `[gate | value]` that `silu_mul` reads.
+- **The modulation gate has no tanh**, and the residual is `h += gate * branch`. The timestep
+  embedding reads t in [0, 1] as it is, not scaled to 1000.
+- **The grid's second half is linspace's from the end**: torch computes `linspace(1, 0, N)` half
+  from each end in f32, which `gen::video_schedule` reproduces.
+- **The packed rows' positions are f64 rounded to f32**: a latent frame spans 5/3 x (1, 4, 4, 4,
+  4)[i mod 5] time units from `n_text`, the spatial axes are each side's latents over the square
+  root of the frame's area, centred on the unit interval, times 32, and the soundtrack's two
+  channels sit at the two ends of the width axis.
+- **A tile is blended with its neighbours as they were decoded**: the vertical blend reads the
+  original tile above, and the horizontal blend the original tile to the left, not the blended
+  ones. Chunks keep frames [3, 20) of their 28 and blend their last 5 linearly into the next
+  chunk's first 5.
+
+Tensor parallel: the text encoder, refiner and DiT blocks split by heads and feed-forward width.
+A block's three modulation projections split by rows, three of the six vectors a rank, and
+VCOND writes every step's modulation into the lane once a request, so the 13B modulation
+parameters and the text encoder (RAD_ACCESS_PER_REQUEST) live in pinned host memory under
+`--vision-tower-placement ram`. Each step gathers its row of the table across the ranks. The video
+decoder is replicated and splits its tiles between the ranks, gathering the decoded pixels; the
+audio decoder runs whole on each.
+
+Against diffusers' pipeline in bf16 from the same noise, a 256 x 256 clip of 4 grid points: the
+fp8 text encoder's conditioning is 4.15% from the reference's (relative L2). With radiance's
+conditioning given to both, the first evaluation's velocity is 5.4% (video) and 4.3% (soundtrack)
+from the reference's, at slope 0.99 and cosine 0.9985; the reference itself, with radiance's
+block-fp8 rounding emulated on the same linears, is 6.8% and 4.6% from its own bf16 and shows the
+same per-channel bias. Fed the same latents, the video decoder is 36.9 dB PSNR from the
+reference's frames (H.264 included) and the audio decoder 51.0 dB SNR from its samples. The same
+seed gives the same latents, run to run.
+
+Attention precision: the DiT's attention takes its scores in int8 (the keys quantised per row and
+head by `quant_act_i8g`, the query inside the op) and its P.V in fp8 (the values quantised per
+column by `quant_cols_fp8`, the weights `e4m3(448 p)` against an exactly tracked row max), so both
+halves run on the 8-bit matrix instruction. Along an exact trajectory in diffusers (256 x 256), the
+int8 scores move the velocity 1.9-5.9% and the fp8 P.V another 1-3 points, where exact f32
+softmax and SDPA's bf16 flash kernel already differ by 1.7-4.4%; finished clips keep their shot,
+motion and detail.
+
+## FastH3: eight trained steps with video sparse attention
+
+FastVideo's FastH3 releases (FastVideo/FastVideo-FastH3-8-Step-V2) are the same denoiser distilled
+(DMD2) to eight evaluations with video sparse attention, and name both in their
+`fastvideo_inference.json`, which the converter reads under `fastvideo_inference.` keys. The
+plugin takes from it:
+
+```
+schedule  the trained timesteps 999 874 749 624 500 375 250 125 over a 1000-step clock, each
+          shifted per modality (10 for the video, checked against scheduler_config.json, 3 for the
+          soundtrack), then 0: nine grid points, eight evaluations, no other count
+          (RadVideoGenDecl::rungs)
+attention VIDEO_SPARSE_ATTN_H3 at sparsity 0.8 and 64-row tiles: the prompt's and the
+          soundtrack's rows in 64-row chunks of their own (dense: their queries see every key, and
+          every query sees them), the video's patches in 4 x 4 x 4 boxes of (time, row, column);
+          a video query tile keeps the ceil(0.2 V) video tiles of best mean-q . mean-k score, per
+          head. A fourth projection beside q, k and v (attn.to_gate_compress, appended to the
+          fused qkv) gates in an attention over the tiles' means: vsa_select, then attn_vsa
+          (docs/OPS.md)
+name      served as `fastvideo-fasth3-8-step-v2`
+```
+
+Its text encoder and both decoders are MiniMax-H3's files byte for byte, so a container of the base
+model supplies them (`--reuse`, the transformer's tensors listed as `--changed`; see the recipe's
+header). The distilled model's first evaluation moves 21-23% under any perturbation (the reference
+itself between bf16 and emulated fp8, or with the fp8 text encoder's conditioning), so its per-step
+numbers against the reference say little; radiance's frames and the reference's agree by eye.

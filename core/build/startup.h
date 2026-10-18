@@ -88,6 +88,17 @@ const RadChatFormat* rad_tools_chat_format(const LoadedPlugins& plugins, const R
  * small to hold a field reads that field as null. */
 const RadAudioFormat* rad_tools_audio_format(const LoadedPlugins& plugins, const RadModelMeta& meta);
 
+/* A request's text rewritten by the architecture plugin for the audio generator's prompt
+ * (rad_arch_text_prepare): RAD_OK with the result in `*out` (the text unchanged when the plugin
+ * states no rewrite), or the plugin's negative status. */
+int rad_tools_text_prepare(const LoadedPlugins& plugins, int field, const std::string& in,
+                           std::string* out);
+
+/* The architecture plugin's video positions (rad_arch_video_positions), or null when it exports
+ * none. */
+using VideoPositionsFn = int64_t (*)(int, const RadVideoGeom*, float*, int64_t);
+VideoPositionsFn rad_tools_video_positions(const LoadedPlugins& plugins);
+
 /* Run declare.
  *
  * `also` declares into the same builder after the architecture plugin, which is how the sampler

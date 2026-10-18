@@ -7,6 +7,7 @@
 #include "device/device.h"
 #include "rad_plugin.h"
 
+#include <cstdio>
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
@@ -21,7 +22,10 @@ namespace rad {
  *
  * RADIANCE_DUMP_BUF names declared buffers (comma separated); every step prints the first row of
  * each: mean, largest magnitude and first four elements. RADIANCE_DUMP_HEAD=<n> adds the first n
- * elements verbatim (integers included); RADIANCE_DUMP_TOPK=<k> adds the k largest.
+ * elements verbatim (integers included); RADIANCE_DUMP_TOPK=<k> adds the k largest. A name may
+ * carry a row count, `frame.mix:100`, to read that many rows as one (a code-major plane holds one
+ * code a row). RADIANCE_DUMP_DIR=<dir> also writes each read's raw bytes to
+ * <dir>/<step>-<phase>-<name>.bin, for a comparison against another implementation's tensors.
  *
  * It shows tensors inside a step, which neither rad-kbench (one op at a time) nor --debug-graph
  * (what was declared) can. An environment variable at -vv only, because it adds a device-to-host
@@ -70,6 +74,13 @@ static void dump_row(int step, const char* phase, const char* name, uint32_t dty
     uint64_t h = 1469598103934665603ull;
     for (size_t i = 0; i < raw.size(); ++i) { h ^= raw[i]; h *= 1099511628211ull; }
     const int64_t good = cnt - bad;
+    if (const char* dir = std::getenv("RADIANCE_DUMP_DIR"); dir && *dir) {
+        const std::string path = fmt("%s/%d-%s-%s.bin", dir, step, phase, name);
+        if (FILE* f = std::fopen(path.c_str(), "wb")) {
+            std::fwrite(raw.data(), 1, raw.size(), f);
+            std::fclose(f);
+        }
+    }
     RAD_TRACE("step %d%-8s %-28s %-5s n=%lld  hash %016llx  mean %.6f  amax %.5f  "
               "nonfinite %lld%s  [%.6f %.6f %.6f %.6f]",
               step, phase, name, rad_dtype_name(dtype), (long long)cnt, (unsigned long long)h,
@@ -159,8 +170,13 @@ void dump_buffers(Ctx& ctx, int step, const char* phase) {
     for (const char* s = names; *s; ) {
         const char* e = s;
         while (*e && *e != ',') ++e;
-        const std::string want(s, (size_t)(e - s));
+        std::string want(s, (size_t)(e - s));
         s = *e ? e + 1 : e;
+        int64_t rows = 1;
+        if (const size_t colon = want.find(':'); colon != std::string::npos) {
+            rows = std::max<long long>(1, std::strtoll(want.c_str() + colon + 1, nullptr, 10));
+            want.resize(colon);
+        }
         if (want.empty()) continue;
 
         /* Weights match the same names, to check that the loader put the right checkpoint tensor
@@ -188,7 +204,7 @@ void dump_buffers(Ctx& ctx, int step, const char* phase) {
             const int64_t row = b.decl.rank >= 1 ? b.bytes / (b.decl.shape[0] ? b.decl.shape[0] : 1)
                                                  : b.bytes;
             done = dump_at(ctx, step, phase, b.name, b.decl.dtype, ptr,
-                           std::min<int64_t>(row, dump_cap()));
+                           row <= dump_cap() ? std::min<int64_t>(row * rows, b.bytes) : dump_cap());
         }
     }
 }

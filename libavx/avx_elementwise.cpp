@@ -32,12 +32,15 @@ static inline void roundtrip(uint32_t dt, float* v, int64_t n, void* tmp) {
 
 /* ------------------------------------------------------------------ add / mul */
 /* y = a op b over the output's extent. A one-row `b` is broadcast down the rows; nothing else
- * broadcasts, so a shape bug fails instead of producing plausible numbers. */
+ * broadcasts, so a shape bug fails instead of producing plausible numbers. `add`'s `div` divides
+ * the sum rounded through y's dtype, as libref rounds it. */
 template <bool MUL>
 static int elementwise2(const RadArgs* a) {
     if (!rad_args_have(a, 3)) return RAD_E_INVAL;
     const RadTensor *A = &a->t[0], *B = &a->t[1], *Y = &a->t[2];
     const int64_t n = p_int(a, "n", numel(Y));
+    const float div = MUL ? 1.0f : p_f32(a, "div", 1.0f);
+    if (!(div != 0.0f) || !std::isfinite(div)) return RAD_E_INVAL;
     if (n <= 0) return RAD_E_SHAPE;
     const int64_t rows = rows_of(Y, n);
     if (rows <= 0 || numel(A) < rows * n) return RAD_E_SHAPE;
@@ -57,6 +60,13 @@ static int elementwise2(const RadArgs* a) {
             vf_storeu(sy + i, MUL ? vf_mul(u, v) : vf_add(u, v));
         }
         for (; i < n; ++i) sy[i] = MUL ? x[i] * y[i] : x[i] + y[i];
+        if (div != 1.0f) {
+            /* sa is free once x is read: the sum's narrowing goes through it. */
+            roundtrip(Y->dtype, sy, n, sa);
+            const vf vd = vf_set1(div);
+            for (i = 0; i + VF_N <= n; i += VF_N) vf_storeu(sy + i, vf_div(vf_loadu(sy + i), vd));
+            for (; i < n; ++i) sy[i] /= div;
+        }
         out_row(Y, rowoff(Y, r, n), n, sy);
     }
     return RAD_OK;
@@ -371,22 +381,27 @@ AVX_KERNEL(conv2d_unfold) {
 }
 
 /* ------------------------------------------------------------------ conv1d_dw */
-/* libref's causal depthwise convolution over time. The weight is transposed to [k][C] once per
- * launch so each tap is a vector FMA over the row. */
+/* libref's causal depthwise convolution over time, plus the optional bias. The weight is
+ * transposed to [k][C] once per launch so each tap is a vector FMA over the row. */
 AVX_KERNEL(conv1d_dw) {
     if (!rad_args_have(a, 4)) return RAD_E_INVAL;
     const RadTensor *X = &a->t[0], *Wt = &a->t[1], *cu = &a->t[2], *Y = &a->t[3];
+    const RadTensor* B = rad_arg_in(a, 4);
     const int64_t C = p_int(a, "n", 0), K = p_int(a, "k", 0), cdiv = p_int(a, "cu_div", 1);
-    if (C <= 0 || K <= 0 || cdiv <= 0 || numel(Wt) < C * K) return RAD_E_SHAPE;
+    if (C <= 0 || K <= 0 || cdiv <= 0 || numel(Wt) < C * K || (B && numel(B) < C))
+        return RAD_E_SHAPE;
     const int64_t S = numel(cu) - 1;
     if (S <= 0) return RAD_E_SHAPE;
     const int64_t Mx = rows_of(X, C), My = rows_of(Y, C);
     if (Mx <= 0 || My <= 0 || ldi(cu, offlin(cu, S)) <= ldi(cu, offlin(cu, 0)))
         return RAD_E_SHAPE;                         /* zero rows is not a call (docs/OPS.md) */
 
-    float* wt = (float*)scratch_raw((size_t)(K * C) * sizeof(float) + 64);
+    /* The taps tap-major, then the bias (zeros when unbound), once a launch. */
+    float* wt = (float*)scratch_raw((size_t)((K + 1) * C) * sizeof(float) + 64);
+    float* bias = wt + K * C;
     for (int64_t c = 0; c < C; ++c)
         for (int64_t j = 0; j < K; ++j) wt[j * C + c] = ldt(Wt, (c * K + j) * laststride(Wt));
+    for (int64_t c = 0; c < C; ++c) bias[c] = B ? ldt(B, c) : 0.0f;
 
     for (int64_t s = 0; s < S; ++s) {
         const int64_t c0 = ldi(cu, offlin(cu, s)), c1 = ldi(cu, offlin(cu, s + 1));
@@ -409,6 +424,8 @@ AVX_KERNEL(conv1d_dw) {
                     vf_storeu(acc + c, vf_fma(vf_loadu(xr + c), vf_loadu(wr + c), vf_loadu(acc + c)));
                 for (; c < C; ++c) acc[c] += xr[c] * wr[c];
             }
+            if (B)
+                for (int64_t c = 0; c < C; ++c) acc[c] += bias[c];
             out_row(Y, rowoff(Y, t, C), C, acc);
         }
     }

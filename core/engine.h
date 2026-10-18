@@ -44,7 +44,7 @@ namespace rad {
 
 class Kld;
 class StallWatch;
-namespace gen { class Driver; }
+namespace gen { class Driver; class AudioDriver; class VideoDriver; struct IPassDriver; }
 struct TierPump;
 struct TierJob;
 struct StepSlot;
@@ -136,21 +136,19 @@ private:
     int apply_rope_scaling();
     int declare();
     int plan();
-    /* RUNTIME LoRA (core/engine_lora.cpp). Targets are fixed before declare; adapters are loaded
+    /* Runtime LoRA (core/engine_lora.cpp). Targets are fixed before declare; adapters are loaded
      * into slots after every rank's Ctx is bound, and a request's `model` names one. */
     int lora_targets();
     int lora_start();
 public:
     int lora_load(const std::string& name, const std::string& dir, std::string* err);
     /* Unpublish an adapter (lora::SlotTable::unload). Idle, its slot is freed at once; in use, it
-     * DRAINS: *in_flight says how many requests still hold it, no new request may name it, and
-     * the last of them frees the slot. A freed slot is reused only once the step loop has gone
-     * round three times since, so no step still on the card can read bytes a later load is
-     * writing (the next step is issued before the last is read back). */
+     * drains: *in_flight says how many requests still hold it, no new request may name it, and the
+     * last of them frees the slot, which cools before reuse (lora/slots.h). */
     int lora_unload(const std::string& name, std::string* err, int* in_flight);
-    /* RAD_OK with the slot, the uid of its load and a HOLD -- the adapter is not freed while the
-     * hold lives (the server keeps it in the request's Generation, which outlives the request in
-     * the scheduler). RAD_E_NOTFOUND for a name no slot holds, or one that is draining. */
+    /* RAD_OK with the slot, the uid of its load and a hold: the adapter is not freed while the
+     * hold lives (the server keeps it in the request's Generation). RAD_E_NOTFOUND for a name no
+     * slot holds, or one that is draining. */
     int lora_acquire(const std::string& name, int32_t* slot, uint64_t* uid,
                      std::shared_ptr<void>* hold);
     std::vector<std::string> lora_names() const;
@@ -186,6 +184,8 @@ private:
     std::vector<std::pair<const void*, void*>> table_copy_of_;
     int load_weights();
     int configure_kv();
+    /* Resolves --checkpoint-slots auto for snapshots of `slot` bytes (`what` names their kind). */
+    int size_checkpoint_store(int64_t slot, const char* what);
     /* Maps the step's logits rows back to the sequences that wanted them. Not the identity: a
      * mid-prompt prefill chunk produces no row, and a speculative verify produces 1 + n_spec. */
     struct StepOut {
@@ -310,10 +310,15 @@ private:
     float*               pooled_host_ = nullptr;
     int  collect_pooled_issue(const RadBatch* b, StepOut& so);
     int  collect_pooled(const RadBatch* b, StepOut& so);
-    /* Image generator (rad_declare_generator): the driver that turns requests into passes and the
-     * loop that runs them, replacing the scheduler and step loop (engine_gen.cpp). Null for every
-     * other program. */
-    std::unique_ptr<gen::Driver> gen_;
+    /* A generator (rad_declare_generator, rad_declare_audio_generator,
+     * rad_declare_video_generator): the driver that turns requests into passes and the loop that
+     * runs them, replacing the scheduler and step loop (engine_gen.cpp). Null for every other
+     * program. `img_gen_`, `aud_gen_` and `vid_gen_` are the same driver by its kind, for the
+     * endpoints; one of them is set when `gen_` is. */
+    std::unique_ptr<gen::IPassDriver> gen_;
+    gen::Driver*                      img_gen_ = nullptr;
+    gen::AudioDriver*                 aud_gen_ = nullptr;
+    gen::VideoDriver*                 vid_gen_ = nullptr;
     int  gen_loop();
     bool serial_drafting() const;
     int  advance_all(int mode, int round, bool from_proposal, int rows = -1);

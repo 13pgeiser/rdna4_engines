@@ -83,7 +83,7 @@ int         avx_par_force(int threads);
     /* ---- quantisation and rotation */                                                          \
     X(quant_act_i8)         X(quant_act_i8g)        X(had_quant_act_i8)     X(quant_act_fp8)      \
     X(had_quant_act_fp8)    X(gram_accum)           X(rmsnorm_had_quant_i8) X(gated_had_quant_i8) \
-    X(dequant)                                                                                    \
+    X(dequant)              X(quant_cols_fp8)                                                     \
     X(rmsnorm_quant_fp8)    X(gated_quant_fp8)      X(givens_rotate)        X(givens_dense_quant) \
     /* ---- gemm and the vocabulary edges */                                                      \
     X(gemm_nt)              X(gemm_nt_bias)         X(gemm_nt_q)            X(gemm_nt_q_bias)     \
@@ -108,6 +108,16 @@ int         avx_par_force(int threads);
     X(flow_euler)           X(chan_affine)          X(conv2d_nhwc)          X(l2norm_chan)        \
     X(d2s_add)              X(s2d_avg_add)          X(to_rgba8)             X(gelu_tanh)          \
     X(scatter_add_rows)     X(attn_prefix_self)                                                   \
+    /* ---- video generation */                                                                   \
+    X(rms_mod)              X(rms_mod_quant_fp8)    X(flow_x0_step)         X(patch_unfold)       \
+    X(vtile_gather)         X(vtile_stitch)         X(grid_pos3)            X(vsa_select)         \
+    X(attn_vsa)                                                                                   \
+    /* ---- audio generation */                                                                   \
+    X(conv1d)               X(conv_t1d)             X(snake)                X(cfg_topk_sample)    \
+    X(rvq_embed)            X(frame_mix_store)      X(end_status)           X(frame_store)        \
+    X(resample_nearest)     X(fourier_embed)        X(win_input)            X(win_prep)           \
+    X(win_finish)           X(chan_split)           X(interleave2)          X(iota)               \
+    X(cu_repeat)            X(snake_aa)                                                           \
     /* ---- sampling, and the drafter's token walk */                                             \
     X(sample_penalties)     X(sample_dry)           X(sample_temp)          X(sample_topk)        \
     X(sample_topp)          X(sample_minp)          X(sample_typical)       X(sample_xtc)         \

@@ -193,7 +193,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `layernorm` | `M`(range) `n` `eps`:f64 `dtype` | `x`, `w`w, `b`w? → `y` |
 | `grid_embed` | `M`(range) `n` `side` `dtype` | `x`:inout, `table`w, `coord` |
 | `grid_embed_aa` | `M`(range) `n` `side` `dtype` | `x`:inout, `table`w, `coord` |
-| `add` | `M`(range) `n` `dtype` | `a`, `b` → `y` |
+| `add` | `M`(range) `n` `dtype` `div`:f64/opt | `a`, `b` → `y` |
 | `mul` | `M`(range) `n` `dtype` | `a`, `b` → `y` |
 | `silu_mul` | `M`(range) `n` `dtype` | `gate_up` → `y` (splits `[M,2n]` into gate·up) |
 | `mul_weight` | `M`(range) `n` `dtype` `scalar`/opt | `x`, `w`w → `y` (w one element or one row) |
@@ -204,7 +204,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `clamp` | `M`(range) `n` `dtype` | `x`, `lo`w, `hi`w → `y` |
 | `conv2d` | `M`(range) `width` `cin` `cout` `kh` `kw` `stride` `pad` `cu_div`/opt `valid_stride`/opt `dtype` `t_last`/opt `act`/opt | `x`, `w`w, `cu_seqlens`, `valid`? → `y`; `b`w? |
 | `conv2d_unfold` | `M`(range) `width` `cin` `kh` `kw` `stride` `pad` `cu_div`/opt `valid_stride`/opt `t_last`/opt `dtype` | `x`, `cu_seqlens`, `valid`? → `y` |
-| `conv1d_dw` | `M`(range) `n` `k` `cu_div`/opt `dtype` | `x`, `w`w, `cu_seqlens` → `y` |
+| `conv1d_dw` | `M`(range) `n` `k` `cu_div`/opt `dtype` | `x`, `w`w, `cu_seqlens` → `y`; `b`w? |
 | `rel_sinusoid` | `M`(range) `n` `max_timescale`:f64/opt `dtype` | → `y` |
 | `gelu_mul` | `M`(range) `n` `dtype` | `gate_up` → `y` (splits `[M,2n]` into gelu·up, tanh approx) |
 | `seg_sinusoid` | `M`(range) `n` `period` `max_timescale`:f64/opt `cu_div`/opt `dtype` | `cu_seqlens` → `y` |
@@ -237,7 +237,10 @@ does it. A plugin asks for it first and falls back to `add` + `rmsnorm` (`spec.m
 with the gate in the first half.
 
 **`add` and `mul`** broadcast a `b` of exactly `n` elements along the rows of a taller output (a
-bias add). Nothing else broadcasts, in these or any other elementwise op.
+bias add). Nothing else broadcasts, in these or any other elementwise op. `add`'s `div` divides
+the sum after its rounding, `y = rd(rd(a + b) / div)` with `rd` `y`'s dtype (absent, 1: the plain
+sum): the last step of a mean summed pairwise, as a vocoder averages its residual blocks,
+`add(add(b0, b1), b2, div 3)` for `(b0 + b1 + b2) / 3`. A `div` of 0 is refused.
 
 **`sigmoid`**, with `mul`, gates a shared expert (`ffn_gate_inp_shexp`). Without it the shared
 expert runs ungated, which is a different model.
@@ -326,8 +329,8 @@ is easy to miss.
   With `valid`, input row `t` reads as zeros unless `valid[t * valid_stride] != 0`: the frame mask
   the subsampler applies before each convolution. f32 sum, one rounding.
 - **`conv1d_dw`** is a causal depthwise convolution over time,
-  `y[t, c] = sum_j w[c, 0, j] * x[t - (k - 1) + j, c]`, with rows before the segment's start
-  reading as zeros.
+  `y[t, c] = sum_j w[c, 0, j] * x[t - (k - 1) + j, c] + b[c]`, with rows before the segment's start
+  reading as zeros and `b` zero when unbound.
 - **`rel_sinusoid`** writes the sinusoidal relative-position table, row `d` for distance `d`:
   `sin(d * inv[i])` over the first half and `cos(d * inv[i])` over the second,
   `inv[i] = exp(i * -log(max_timescale) / max(n/2 - 1, 1))`, each step in f32 as the reference's
@@ -485,12 +488,18 @@ and is optional.
 | op | params | operands |
 |---|---|---|
 | `quant_act_fp8` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
+| `quant_cols_fp8` | `M` `n` `dtype` | `x` → `y`, `scale` |
 | `had_quant_act_fp8` | `M` `n` `group` `dtype` | `x` → `q`, `scale` |
 | `givens_dense_quant` | `M` `n` `group` `dtype` `parts` `out`:str | `x`, `tdense`w, `rscale`w → `q`, `scale` |
 | `givens_rotate` | `M` `n` `group` `dtype` `stages` `parts` | `x`, `pairs`w, `angle`w, `rscale`w → `y` |
 | `rmsnorm_quant_fp8` | `M` `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gated_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `gemm_nt_q_gated` | `M` `N` `K` `group` `dtype` `act` | `a`, `a_scale`, `b`w, `b_scale`w → `q`, `scale`, `out_bf16`? |
+
+`quant_cols_fp8` is the same E4M3 quantiser with one scale per column over all `M` rows,
+`scale[c] = amax_r |x[r, c]| * (1/448)` (1 for an all-zero column), `scale` `[n]` f32: an
+attention's values for its fp8 P.V form, where a column is one dimension of one head and its scale
+multiplies out of the sum over keys.
 
 `gemm_nt_q_gated` is `gemm_nt_q` over a `[N, K]` gate_up plane (`N` is the weight's rows, twice the
 fused width, gate half first) with `gated_quant_fp8`'s pass in the epilogue, so the `[M, N]` bf16
@@ -629,7 +638,8 @@ implementation reads `res` before it stores the product over it.
 | `lora_expand` | `M`(range) `N` `R` `S` `dtype` | `t`, `slot`, `lora_b`, `scale`, `y`:inout |
 
 The two halves of `y += scale ⊙ (B · (A · x))` at a trunk GEMM, issued by the core right after the
-GEMM in the GEMM's own row slice, with several adapters and no adapter mixed in one step. `slot` is
+GEMM in the GEMM's own row slice, with several adapters and no adapter mixed in one step; a step
+with no adapter row issues neither. `slot` is
 an i32 per row naming its adapter's pool slot -- the step batch's `RadBatch::lora_slot` from the
 GEMM's first row on; **a row with `slot < 0 || slot >= S` is a base row and neither op touches
 it**: `lora_shrink` writes nothing into its `t` row, and `lora_expand` does not read or write its
@@ -665,12 +675,12 @@ bytes).
 | op | params | operands |
 |---|---|---|
 | `attn_paged` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out` |
-| `attn_dense` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt `max_seqlen`/opt `window`/opt `cu_div`/opt `block`/opt | `q`, `k`, `v`, `cu_seqlens` → `out` |
+| `attn_dense` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt `max_seqlen`/opt `window`/opt `cu_div`/opt `block`/opt `window_right`/opt | `q`, `k`, `v`, `cu_seqlens` → `out` |
 | `attn_local_rel` | `M`(range) `head_dim` `n_head` `left` `right` `softcap`:f64 `cu_div`/opt `dtype` | `q`, `k`, `v`, `relk`, `pds`w, `cu_seqlens` → `out` |
 | `kv_store` | `M`(range) `head_dim` `n_head_kv` `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `k`, `v`, `slot_mapping`, `kv_cache`:inout |
-| `rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `ladder`/opt | `qkv`:inout, `positions` |
+| `rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `ladder`/opt `llama3_factor`:f64/opt `llama3_low`:f64/opt `llama3_high`:f64/opt `llama3_orig`:f64/opt | `qkv`:inout, `positions` |
 | `rope_table` | `M`(range) `rot` `theta`:f64 `scale`:f64 `dtype` `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `head_dim`/opt `ladder`/opt | `positions` → `cos_sin` |
-| `qk_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `wadd`:f64/opt `v_norm`/opt `sections`/opt `comps`/opt | `qkv`:inout, `positions`, `q_w`w, `k_w`w |
+| `qk_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `wadd`:f64/opt `v_norm`/opt `sections`/opt `comps`/opt | `qkv`:inout, `positions`?, `q_w`w?, `k_w`w? |
 | `qkv_norm_rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `eps`:f64 `scale`:f64/opt `mode`/opt `rotary_dim`/opt `ladder`/opt `wadd`:f64/opt `v_from_k`/opt `dtype` | `q`:inout, `k`:inout, `v`:inout, `positions`, `q_w`w, `k_w`w |
 
 **`attn_paged`**'s band is `q_len`, not `M`: one query row at decode, `1 + n_spec` at a speculative
@@ -689,7 +699,9 @@ maximum, which selects the band; the per-sequence lengths come from `cu_seqlens`
 or one input per entry so a whole batch is one launch. `window` is `attn_paged`'s rule over a
 segment's own positions (causal: key `j` is visible to query `i` when `i - j < window`; non-causal:
 when `|i - j| < window`), and 0 is no window. A bidirectional encoder's sliding layer of radius `r`
-(`|i - j| <= r`) is `window = r + 1`. `q`, `k` and `v` may each be `[tokens, heads, head_dim]` or
+(`|i - j| <= r`) is `window = r + 1`; one that sees `l` keys behind and `r` ahead is `window = l + 1`
+with `window_right = r + 1` (non-causal only: key `j` visible when `i - j < window` and
+`j - i < window_right`). `q`, `k` and `v` may each be `[tokens, heads, head_dim]` or
 `[tokens, heads * head_dim]`, and the second form may be a column slice of a fused projection read
 at its row pitch, so a tower's `[q|k|v]` row needs no copy.
 
@@ -717,6 +729,19 @@ owns:
 With `[M]` positions every component is that one position, so `mrope` and `imrope` over a text batch
 are exactly `neox`.
 
+**Positions** are integers or floats, and the operand's dtype says which. An integer `positions`
+(i32) is read as an integer; an f32 one (bf16 and f16 too) as the value it holds, a fractional
+coordinate such as a video decoder's normalised grid already multiplied by `2 pi`. Either way the
+angle is `f32(pos / scale) * inv` in f32. `[C, M]` positions are read at the operand's own strides,
+so a `[C, M]` view of a wider `[C, max]` plane is read in place.
+
+**`llama3_*`** applies Llama 3's frequency scaling (transformers' `rope_type` `llama3`) to `rope`'s
+ladder: with wavelength `2 pi / inv`, a frequency shorter than `llama3_orig / llama3_high` is kept,
+one longer than `llama3_orig / llama3_low` is divided by `llama3_factor`, and those between blend,
+`s = (llama3_orig / wavelength - llama3_low) / (llama3_high - llama3_low)`,
+`(1 - s) inv / llama3_factor + s inv`, in f32 (`abi/rad_yarn.h`, `RadLlama3`). It does not combine
+with YaRN or a multi-component mode.
+
 **`ladder`** names the width the base frequency ladder is measured in. Absent or `rotary`, the
 exponent divides by `rotary_dim`: a partial rotary is a complete rotation of its own width. `head`
 divides by `head_dim` instead (the proportional variant), so the `rotary_dim / 2` frequencies are a
@@ -726,8 +751,12 @@ ladders), and the head past `rotary_dim` is untouched either way. `rope_table` t
 the same reason: its angles must stay `rope`'s exactly.
 
 **`qk_norm_rope`** RMS-norms each q and k head of a fused `[q | k | v]` row against its gain (plus
-`wadd`), rounds, and rotates in place.
+`wadd`), rounds, and rotates in place. `positions` is read as `rope` reads it, integer or f32.
 
+- An absent `q_w` or `k_w` is a unit gain, without `wadd`: the head is `x rsqrt(mean(x^2) + eps)`,
+  rounded (a video decoder's weightless q and k norms).
+- `rotary_dim` 0 is the norm alone: nothing rotates, and `positions` may be absent (`M` is then
+  `qkv`'s rows). A rotation with no positions is refused.
 - `v_norm` 1 also RMS-norms every v head with a unit gain and does not rotate it: Gemma 4's value
   norm, which has no weight.
 - `mode` `blocks` rotates each section as its own block of channels: section `c` is `sections[c]`
@@ -740,6 +769,14 @@ the same reason: its angles must stay `rope`'s exactly.
   a 3-axis image rotary's complex form.
 - `mode` `imrope` is `rope`'s `imrope` over NeoX pairs, reading three position planes (Qwen3-VL's
   text attention).
+- `mode` `axial` is `rope`'s `axial` over NeoX pairs `(i, i + rotary_dim / 2)`: the
+  `rotary_dim / 2` frequencies split into contiguous `sections` (summing to `rotary_dim / 2`),
+  section `c`'s `j`-th frequency `theta^(-2j / (2 sections[c]))` turned by position component `c`.
+  `positions` is `[C, M]` with `C` at least the section count, or `[M]`, every component then that
+  one position on the same per-section ladders (unlike `rope`, whose `[M]` positions fall back to
+  the plain ladder). MiniMax-H3's DiT rotates 96 of its 128 channels with sections `16 16 16`
+  (theta 1e4) over f32 `(t, h, w)` positions; its video decoder 48 of 64 with `8 8 8` (theta 100)
+  over positions `grid_pos3` writes.
 
 **`qkv_norm_rope`** (device-only) is the same prologue over separate `q`, `k` and `v` projections
 (Gemma 4's text attention, three GEMMs): the q and k norms, the unit-gain value norm and the rotary
@@ -819,7 +856,7 @@ says which (`libref/ref_gen.cpp`).
 | op | params | operands |
 |---|---|---|
 | `ln_mod` | `M`(range) `n` `eps`:f64 `dtype` | `x`, `s`, `cu_seqlens` → `y` |
-| `gate_add` | `M`(range) `n` `dtype` | `y`, `g`, `cu_seqlens`, `x`:inout |
+| `gate_add` | `M`(range) `n` `dtype` `act`/opt | `y`, `g`, `cu_seqlens`, `x`:inout |
 | `ln_mod_quant_fp8` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` | `y`?, `g`?, `s`, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`? |
 | `timestep_embed` | `M`(range) `n` `scale`:f64 `max_period`:f64 `round`/opt `dtype` | `t` → `y` |
 | `gather_rows2` | `M`(range) `n` `dtype` | `a`, `b`, `idx` → `y` |
@@ -827,7 +864,7 @@ says which (`libref/ref_gen.cpp`).
 | `lane_store` | `M`(range) `n` `stride` `dtype` | `src`, `lane`, `dst`:inout |
 | `randn_lanes` | `M`(range) `n` `stride` `dtype` | `flags`, `seed`, `lane`, `cu_seqlens`, `dst`:inout |
 | `flow_euler` | `M`(range) `n` `stride` `dtype` | `v`, `sigma`, `sigma_next`, `cfg`, `pair`, `lane`, `flags`, `seed`, `cu_seqlens`, `inp_lat`?, `inp_mask`?, `state`:inout, `preview`:inout? |
-| `chan_affine` | `M`(range) `n` `mul` `add` `mode` `dtype` | `x` → `y` |
+| `chan_affine` | `M`(range) `n` `mul` `add` `mode` `dtype` `round`/opt | `x` → `y` |
 | `conv2d_nhwc` | `M`(range) `cin` `cout` `k` `stride` `pad` `up` `dtype` | `x`, `w`w, `b`w → `y` |
 | `l2norm_chan` | `M`(range) `n` `act` `dtype` | `x`, `gamma`w → `y` |
 | `d2s_add` | `M`(range) `cin` `cout` `ft` `dtype` | `x`, `y`:inout |
@@ -835,7 +872,7 @@ says which (`libref/ref_gen.cpp`).
 | `to_rgba8` | `M`(range) `n` `dtype` | `x` → `y` |
 | `gelu_tanh` | `M`(range) `n` `dtype` | `x` → `y` |
 | `scatter_add_rows` | `M`(range) `n` `dtype` | `v`, `idx`, `x`:inout |
-| `attn_prefix_self` | `q_len` `head_dim` `gqa` `block_size`/der `causal` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `qk`/opt | `q`, `k`, `v`, `kv_cache`, `block_table`, `seqused`, `cu_seqlens`, `k_descale`?, `v_descale`?, `k_i8`?, `k_scale`? → `out` |
+| `attn_prefix_self` | `q_len` `head_dim` `gqa` `block_size`/der `causal` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt `qk`/opt `pv`/opt | `q`, `k`, `v`, `kv_cache`?, `block_table`?, `seqused`?, `cu_seqlens`, `k_descale`?, `v_descale`?, `k_i8`?, `k_scale`? → `out`, `v_scale`? |
 
 **Sequences and lanes.** `cu_seqlens` partitions the rows into entries (`[n_seq+1]` i32, entry `e`
 owning `[cu[e], cu[e+1])`; it need not start at 0). `ln_mod` and `gate_add` take each row's
@@ -845,7 +882,10 @@ apart: `lane_gather` copies entry `e`'s rows out of lane `lane[e]`, and `lane_st
 source into every listed lane (a repainted picture's latent into each of its images).
 
 - `ln_mod`: `y = bf16(bf16(LN(x)) * bf16(1 + s[seq]))`, a layer norm with no gain and no bias.
-- `gate_add`: `x = bf16(x + bf16(bf16(tanh(g[seq])) * y))`.
+- `gate_add`: `x = bf16(x + bf16(bf16(tanh(g[seq])) * y))`. `act` names the gate's activation,
+  `tanh` (the default) or `none`, the gate as it is and not rounded first:
+  `x = bf16(x + bf16(g[seq] * y))` (MiniMax-H3's last block, whose gates have no tanh). The
+  roundings are to `x`'s dtype.
 - `ln_mod_quant_fp8`: with `gated` 1, `gate_add` first; then `z = ln_mod(x)` and
   `(q, scale) = quant_act_fp8(z, group)`, `z` written when bound. Each value is rounded as its own
   store would round it, so the bytes are the three ops'.
@@ -873,7 +913,10 @@ shapes: an image's size belongs to a request, and a parameter is fixed at declar
 - `l2norm_chan`: each pixel's channels to unit L2 (eps 1e-12), times `sqrt(n)`, times `gamma`
   (three roundings), then `act` `none` or `silu`.
 - `chan_affine`: `mul` and `add` are space-separated lists of `n` values, each rounded to bf16;
-  `fma` is `bf16(bf16(x * mul) + add)`, `inv` is `bf16(bf16(x - add) / mul)`.
+  `fma` is `bf16(bf16(x * mul) + add)`, `inv` is `bf16(bf16(x - add) / mul)`, the roundings to
+  `y`'s dtype. With `round` 0 (default 1) the lists stay f32 and so does the arithmetic, rounded
+  once into `y`: `fma` is `rd(f32(x * mul) + add)`, `inv` `rd(f32(x - add) / mul)` (MiniMax-H3
+  denormalises its f32 audio latents with an f32 deviation and mean).
 - `d2s_add` (Wan's DupUp3D on one frame): `y[2r+i, 2c+j, o] += x[r, c, (o F + off + 2i + j) / rep]`,
   `F = 4 ft`, `off = 4` when `ft` is 2, `rep = cout F / cin`.
 - `s2d_avg_add` (AvgDown3D on one frame): `y` gains the mean of each output channel's group of
@@ -889,7 +932,318 @@ segments before it. `qk` `"i8"` is the int8 score form and takes `k_i8` `[tokens
 head_dim]` and `k_scale` `[tokens, kv_heads]` f32, the own keys as `quant_act_i8g` writes them at
 group `head_dim`. The query and every prefix key are quantised inside the op by the same rule
 (scale `amax/127`, 1 for an all-zero row; code `rint(clamp(x * (1/scale), ±127))`), a score is the
-exact integer dot product times both scales, and `k` is not read for the own rows.
+exact integer dot product times both scales, and `k` is not read for the own rows. The prefix's
+three operands come together or not at all: without them every entry's prefix is empty and the op
+is self attention over each entry's rows (`max_ctx` 0 declares that form), which is how a single
+long sequence takes the int8 score form.
+
+`pv` `"fp8"` is the fp8 P.V form, prefix-free only: `v` holds E4M3 codes and `v_scale`
+`[kv_heads * head_dim]` their column scales (`quant_cols_fp8`). Over a row's visible keys, with
+`p = exp(s - max)` against the row's max, each weight is taken to E4M3 as `w = e4m3(448 p)` and
+
+    o = (sum w v) v_scale / (448 sum p)                        f32 sums in key order
+
+A kernel may take `p` against its running max in its own key order as long as every `p <= 1`
+(E4M3's top is 448), which differs from this only by where each weight was rounded.
+
+## Audio generation
+
+The ops an audio generator declares (`rad_declare_audio_generator`, `abi/rad_builder.h`) beyond a
+language model's and an image generator's: a frame sampler with guidance between branches over
+residual codebooks, the frame embeddings, the window states of a latent denoiser, and a
+vocoder's 1-D convolutions. Each rounds where the reference model materialises a bf16 tensor; the
+libref function says which (`libref/ref_audio.cpp`).
+
+| op | params | operands |
+|---|---|---|
+| `conv1d` | `M`(range) `cin` `cout` `k` `dil` `act`/opt `dtype` `causal`/opt | `x`, `w`w, `cu_seqlens`, `res`? → `y`; `b`w? |
+| `conv_t1d` | `M`(range) `cin` `cout` `stride` `dtype` `pad`/opt `k`/opt | `x`, `w`w, `b`w, `cu_seqlens` → `y` |
+| `snake` | `M`(range) `n` `dtype` `log`/opt | `x`, `alpha`w → `y`; `beta`w? |
+| `snake_aa` | `M`(range) `n` `ratio` `k` `log`/opt `dtype` | `x`, `alpha`w, `beta`w, `f_up`w, `f_down`w, `cu_seqlens` → `y` |
+| `cfg_topk_sample` | `M`(range) `n_vocab` `k` `rep` `cond_k`/opt `cfg`:f64 `temp`:f64/opt `stream` `dtype` `sup_lo`/opt `sup_hi`/opt `penalty`:f64/opt | `logits`, `seed`, `frame` → `ids`; `cfg`?, `lane`?, `hist`:inout? |
+| `rvq_embed` | `M`(range) `n_embd` `n_codes` `vocab` `off0` `scale`:f64 `dtype` `round`/opt | `codes`, `t0`w, `t1`w → `y` |
+| `frame_mix_store` | `M`(range) `n_embd` `L` `stride` `rep`/opt `dtype` | `hid`, `logits`w, `scale`w, `lane`, `frame`, `status`, `dst`:inout |
+| `end_status` | `M`(range) `end` `rep` | `ids`, `lane`, `status`:inout |
+| `frame_store` | `M`(range) `n_codes` `stride` `rep`/opt `skip`/opt | `codes`, `lane`, `frame`, `status`, `dst`:inout |
+| `resample_nearest` | `M`(range) `n` `dtype` | `x` → `y` |
+| `fourier_embed` | `M`(range) `n` `round`/opt `dtype` | `t`, `w`w → `y` |
+| `win_input` | `M`(range) `n_lat` `n_zero` `n_cond` `stride` `dtype` | `lat`, `cond`, `lat_cu`, `win_lane`, `pair` → `y` |
+| `win_prep` | `M`(range) `n` `stride` `ov` `dtype` | `flags`, `t`, `seed`, `win_index`, `win_lane`, `pair`, `lat_cu`, `prev`, `noise`:inout, `lat`:inout |
+| `win_finish` | `M`(range) `n` `n_cond` `stride` `ov` `dtype` | `flags`, `pair`, `win_lane`, `lat_cu`, `cond`, `lat`:inout, `prev`:inout, `prev_cond`:inout |
+| `chan_split` | `M`(range) `n` `parts` `dtype` | `x` → `y` |
+| `interleave2` | `M`(range) `dtype` | `a`, `b` → `y` |
+| `iota` | `M`(range) `start` `step` `period`/opt | → `y` |
+| `cu_repeat` | `M`(range) `mult` | `len` → `y` |
+
+**Frames.** A lane is one piece; a frame is one step of its language model, whose branches (the
+conditional first, then the unconditional) are consecutive rows, `rep` of them a lane.
+
+- `cfg_topk_sample`: per lane, `g = u + cfg (c - u)` between its first two branch rows (`c` alone
+  at `rep` 1), `cfg` the operand's value for the lane when it is bound. With `hist`
+  `[lanes, n_vocab]` i32 and `lane` `[n]`, the lane's history row is cleared at frame 0 and every id
+  it holds is penalised, `g > 0 ? g / penalty : g * penalty` (a repetition penalty over the lane's
+  earlier picks); the pick is recorded in it. Ids in `[sup_lo, sup_hi)` are never candidates; with
+  `cond_k` > 0 only the entries where `c` reaches its `cond_k`-th largest value are. The `k`
+  largest `g` (ties to the lower index) are kept, divided by `temp`, softmaxed in f32 and drawn by
+  inverse CDF in descending `g`, `u = rad_philox_uniform_s(seed, 2^32 + frame, stream)`
+  (`abi/rad_philox.h`); the pick goes to every one of the lane's `rep` slots. `logits`
+  `[rep n, n_vocab]` f32 or bf16, `seed` `[n, 2]` u32 low word first, `frame` `[n]`.
+- `end_status`: `status[lane[i]] = ids[rep i] == end ? -1 : ids[rep i]`.
+- `rvq_embed`: `codes` is code-major `[n_codes, rows]`, read at the operand's own strides (a block
+  of a wider plane is a view);
+  `y = bf16(bf16(t0[c_0 + off0] + bf16(sum_k t1[c_k + (k - 1) vocab])) * scale)`, or with `round` 1
+  one f32 sum of every codebook's row in codebook order, times `scale`, rounded once to `y`'s dtype.
+  A first code outside `t0` leaves its row unwritten; a later code outside `t1` adds nothing.
+- `frame_store`: `dst[(lane n_codes + k) stride + frame - skip] = codes[k, rep i]` for every `k`,
+  when `frame >= skip` and `status[lane] >= 0`: a frame's codes into its lane's history, each
+  codebook a row over the lane's frames, so a run of a lane's frames is a block of `n_codes`
+  rows.
+- `frame_mix_store`: `m = bf16(bf16(sum_l w_l h_l) * bf16(scale))`, `w = bf16(softmax(bf16(logits)))`
+  over the `L` planes of `hid` `[L, rows, n_embd]`, row `rep i` of each plane being lane `i`'s
+  conditional row; stored at `dst[lane * stride + frame - 1]` for `frame >= 1` and
+  `status[lane] >= 0` (frame 0 only moves past the prompt; a negative status ended the piece).
+- `iota`: `y[i] = start + i * step`, or `start + (i % period) * step` with `period` (the
+  positions of equal sequences laid end to end). `cu_repeat`: `y[j] = j * len[0] * mult`, the bounds of equal
+  sequences whose length lives on the device.
+
+**Windows.** The denoiser runs over windows of frames, each entry of a window step a lane's latent
+in a state buffer `stride` rows a lane (`lat_cu` bounds each entry's rows, `win_lane` names its
+lane, `pair` is -2 for an unconditional branch, which moves no lane). `flags` carries 1 (the
+window's first step), 8 (its last) and 16 (it overlaps the previous window by `ov` rows).
+
+- `win_input`: `y = [lat | zeros(n_zero) | cond]` from the entry's lane; an entry with `pair` -2
+  takes zeros for `cond`.
+- `win_prep`: flag 1 fills the lane with `rad_philox_normal_s(seed, 1 + win_index, k n + c)` as
+  bf16, keeping its first `ov` rows in `noise` with flag 16; flag 16 then binds the first
+  `min(ov, rows)` rows to the previous window's end,
+  `bf16(bf16(1 - bf16((1 - 1e-6) t)) noise + bf16(t prev))`, `t = bf16(t[e])`.
+- `win_finish` (flag 8): with flag 16 the first `min(ov, rows)` rows become `prev` exactly; then
+  rows `[max(0, rows - 2 ov), max(.., rows - ov))` of the latent and of `cond` are kept as the next
+  window's `prev` and `prev_cond`.
+- `fourier_embed`: `[cos(2 pi t w) | sin(2 pi t w)]`, `t` f32 `[M]`, `w` `[n / 2]`; with `round` 1
+  `t`, `2 pi t`, the product and each cosine and sine are rounded to bf16.
+- `resample_nearest`: output row `j` reads input row `min(floor(j * in / out), in - 1)`, the row
+  counts read off the operands (torch's `interpolate(mode="nearest")`).
+
+**The vocoder.** Rows are samples, channels innermost; `cu_seqlens` bounds each sequence and the
+input reads zero outside it.
+
+- `conv1d`: PyTorch's `[cout, cin, k]` weight, `k` odd, dilation `dil` and padding
+  `dil (k - 1) / 2` a side, or with `causal` 1 (any `k`) `dil (k - 1)` on the left; `res` is added
+  after the bias, then `act` `none`, `tanh` or `clamp`, `min(max(y, -1), 1)` (BigVGAN's output
+  clamp; a NaN stays NaN). f32 accumulation, one rounding.
+- `conv_t1d`: PyTorch's `[cin, cout, k]` transposed weight, any `k` of at least a stride (two
+  strides by default), padding `pad` (`(k - stride) / 2` by default, which needs `k - stride` even;
+  0 is the causal form, whose full output's last `k - stride` rows are dropped; it may exceed a
+  stride): output row `o` of a sequence is `b + sum_i x[i] w[(o + pad) - i stride]` over the
+  sequence's input rows `i` with `0 <= (o + pad) - i stride < k`, summed in f32 as
+  `q = (o + pad) / stride`, `r = (o + pad) % stride` and taps `t = 0, 1, ..` while
+  `r + t stride < k` reading `x[q - t] w[r + t stride]`; one rounding. Sequence `e`'s rows
+  `[cu[e], cu[e+1])` become `[stride cu[e], stride cu[e+1])`, `stride L` rows from `L`. BigVGAN
+  upsamples with `(k 9, stride 5, pad 2)` and `(k 4, stride 2)`.
+- `snake`: `x + sin(alpha x)^2 / (alpha + 1e-9)`, `alpha` per channel; with `beta` the SnakeBeta
+  form `x + (1 / (beta + 1e-9)) sin(alpha x)^2`. `log` 1 reads both as logarithms, exponentiated
+  first.
+- `snake_aa`: BigVGAN's alias-free SnakeBeta (diffusers' `MiniMaxH3AudioActivation1d`: an
+  upsampler, the activation, a low-pass downsampler) over each sequence, in f32. For channel `c`
+  of a sequence of `L` rows, `P = k / ratio - 1`:
+  - `xp` is the sequence replicate-padded by `P` rows on each side;
+  - `u_full[o] = sum_i f_up[o - i ratio] xp[i]` over the rows `i` with `0 <= o - i ratio < k`, in
+    ascending `i` (a depthwise `conv_transpose1d` at stride `ratio`), and
+    `u = ratio u_full[P ratio + (k - ratio) / 2 + m]` for `m < L ratio` (the full output cropped by
+    `P ratio + (k - ratio) / 2` rows at the start and `P ratio + (k - ratio + 1) / 2` at the end);
+  - `a = u + (1 / (B + 1e-9)) sin(A u)^2` as `snake`'s `beta` form evaluates it, `A = exp(alpha[c])`
+    and `B = exp(beta[c])` with `log` 1, the values themselves otherwise;
+  - `ap` is `a` replicate-padded by `k / 2` rows on the right and `k / 2` on the left less one for
+    an even `k`, and `y[o] = sum_j f_down[j] ap[o ratio + j]` over `j < k` in ascending `j`, for
+    `o < L`.
+
+  `f_up` and `f_down` are the checkpoint's `[1, 1, k]` Kaiser filters, one for every channel
+  (MiniMax-H3: `k` 12, `ratio` 2). A sequence keeps its length.
+- `chan_split`: `y[p rows + r] = x[r, p n .. p n + n)`, a stereo latent's halves as two streams.
+- `interleave2`: `y [rows, 2] = (a[r], b[r])`, f32.
+
+## Video generation
+
+The ops a video generator (MiniMax-H3) needs beyond a language model's, an image generator's and
+an audio generator's: its diffusion transformer's modulated RMS norm and its sampler step, and the
+video decoder's patch unfold, the tiles it runs over, their stitch back into frames and their
+rotary positions. The transformer's attention is `qk_norm_rope` `axial` (its step-distilled form's
+is [video sparse attention](#video-sparse-attention)) and its gated residual
+`gate_add` `act` none; the soundtrack's vocoder is `conv_t1d`, `snake_aa` and `conv1d` `clamp`
+([Audio generation](#audio-generation)). Each op rounds where the reference model materialises a
+bf16 tensor and keeps f32 where it computes in f32; the libref function says which
+(`libref/ref_gen.cpp`, `libref/ref_video.cpp`).
+
+| op | params | operands |
+|---|---|---|
+| `rms_mod` | `M`(range) `n` `eps`:f64 `gated`/opt `dtype` | `y`?, `g`?, `s`, `w`w, `cu_seqlens`, `x`:inout → `z` |
+| `rms_mod_quant_fp8` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` | `y`?, `g`?, `s`, `w`w, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`? |
+| `flow_x0_step` | `M`(range) `n` `dtype` | `v`, `t`, `sigma`, `sigma_next`, `x`:inout |
+| `patch_unfold` | `M`(range) `C` `pt` `ph` `pw` `mul` `add` `dtype` | `x`, `geom` → `y` |
+| `vtile_gather` | `M`(range) `n` `tile` `overlap` `frames` `period` `n_reg` `dtype` | `x`, `reg`w, `geom` → `y` |
+| `vtile_stitch` | `M`(range) `tile` `overlap` `scale` `pt` `skip` `keep` `blend` `period` `mean` `std` | `x`, `geom`, `prev`:inout → `y` |
+| `grid_pos3` | `M`(range) `T` `H` `W` `period` `scale`:f64 | → `y` |
+
+**The transformer.** `cu_seqlens` partitions the rows into entries as for `ln_mod`, and each row
+reads its entry's rows of `s` and `g`.
+
+- `rms_mod` is `norm(h) (1 + scale) + shift` after the branch before it is added: with `gated` 1
+  first `x = bf16(x + bf16(g[e] y))`, no tanh, stored back to `x`; then
+  `n1 = bf16(x rsqrt(mean(x^2) + eps))` (the sum of squares f32 in ascending order, over the
+  stored `x`), `n2 = bf16(n1 w)`, `m = bf16(n2 bf16(1 + scale[e]))`, `z = bf16(m + shift[e])`.
+  `s` is `[n_seq, >= 2n]` at its own row pitch, `shift = s[e, 0:n]` and `scale = s[e, n:2n]` (a
+  column slice of the modulation table); `g` is `[n_seq, >= n]` at its own pitch; `w` is `[n]`.
+  The residual rounds to `x`'s dtype and the norm chain to `z`'s.
+- `rms_mod_quant_fp8` is `rms_mod` with the norm chain in bf16, then `quant_act_fp8` of that bf16
+  row per `group` as `ln_mod_quant_fp8` takes it; `z` written when bound.
+- `flow_x0_step` is MiniMax-H3's sampler step over a lane's rows, all f32, each product and sum
+  one rounding: the velocity points at the data, so the clean estimate is `d = x + (1 - t) v` and
+  the step blends toward it, `st = f32(1 - t)`, `d = f32(x + f32(st v))`,
+  `r = f32(sigma_next / sigma)`, `x = f32(f32(r x) + f32(f32(1 - r) d))`. `t` (the timestep the
+  transformer was conditioned on), `sigma` and `sigma_next` (the schedule's entries) are one f32
+  value each; `v` is f32 or bf16, `x` f32.
+
+**The decoder** runs over a request's latent geometry, which `geom`, i32 on the device, carries
+(the parameters are fixed at declare). `mul`, `add`, `mean` and `std` are space-separated lists
+kept in f32. An output holds at least the rows the geometry writes; rows past them are not
+written.
+
+- `patch_unfold`: patch rows `x [F Hp Wp, C pt ph pw]` (row `(f, i, j)` frame-major then
+  row-major, column `(c, a, b, d)` at `c pt ph pw + a ph pw + b pw + d`, `geom` = `(F, Hp, Wp)`)
+  to voxel rows `y [(F pt) (Hp ph) (Wp pw), C]`, row `(t, yy, xx)` row-major:
+  `y[(t, yy, xx), c] = f32(f32(x[(t/pt, yy/ph, xx/pw), (c, t%pt, yy%ph, xx%pw)] mul[c]) + add[c])`,
+  the latent denormalised with f32 statistics. `M` is the output's rows.
+- The tiles of an axis of `L` latent units are diffusers' `_split_tiles` in latent units: a `tile`
+  at least as long as the axis is one tile `[0, L)`, refused unless `L == tile`; otherwise
+  `n = ceil(L / tile)`, raised while `tile n - overlap (n - 1) < L`; `ov = [overlap] * (n - 1)`,
+  the slack `tile n - sum(ov) - L` added one unit at a time to `ov[i % (n - 1)]` for
+  `i = 0, 1, ..`; `start[0] = 0`, `start[i + 1] = start[i] + tile - ov[i]`. `overlap` must be
+  below `tile`. A frame's tiles are row-major over (row band, column band).
+- `vtile_gather`: the tiles out of voxel rows `x [frames H W, n]` (`(t, yy, xx)` row-major,
+  `geom` = `(frames, H, W)`, its frames the parameter's). Tile `k` is rows
+  `[k period, (k + 1) period)` of `y`: its `frames tile tile` voxels `(t, ty, tx)` row-major from
+  `x`'s row `(t, start_y + ty, start_x + tx)`, then `reg`'s first `n_reg` rows in `y`'s dtype (a
+  decoder's register tokens), then zero rows to the period, which holds at least
+  `frames tile tile + n_reg` rows. `M` is `y`'s rows, `n_tiles period`.
+- `vtile_stitch`: a decoded chunk's tiles into RGB bytes. `x [>= n_tiles period, 3 pt scale^2]`:
+  tile `k`'s row `k period + (lt tile + ty) tile + tx`, column
+  `c pt scale^2 + a scale^2 + b scale + d`, is colour `c` of pixel `(ty scale + b, tx scale + d)`
+  of clip frame `lt pt + a`. `geom` = `(frames, H, W, first, last)`: the chunk's latent geometry,
+  and whether it is its video's first and its last chunk (nonzero). Pixel `(Y, X)` belongs to the
+  tile `(i, j)` whose kept range holds it, `[start_i scale, start_{i+1} scale)` on each axis (the
+  last tile to its end), at `(ly, lx)` within it, `T(i, j, ly, lx)` that tile's decoded value. With
+  every product and sum rounded to `x`'s dtype (`rd`), `wb(p, e) = rd(p / e)` and
+  `wa(p, e) = rd(1 - wb(p, e))`, the spatial stitch blends with the tile above, then with the tile
+  to the left, both as decoded:
+
+      V = rd(rd(T(i-1, j, ly + tile scale - ev, lx) wa(ly, ev)) + rd(T(i, j, ly, lx) wb(ly, ev)))
+          when i > 0 and ly < ev = ov_y[i-1] scale, else T(i, j, ly, lx)
+      S = rd(rd(T(i, j-1, ly, lx + tile scale - eh) wa(lx, eh)) + rd(V wb(lx, eh)))
+          when j > 0 and lx < eh = ov_x[j-1] scale, else V
+
+  Output frame `k < keep` is clip frame `skip + k`, its first `blend` frames blended with the
+  previous chunk's tail unless the chunk is first,
+  `v = rd(rd(prev[k] wa(k, blend)) + rd(S wb(k, blend)))`; then `prev[k'] = S(2 skip + keep + k')`
+  for `k' < blend` (`prev` `[blend, H scale, W scale, 3]`), which a last chunk also writes as
+  frames `keep + k'`. A byte is `round_half_even(255 clamp(f32(f32(v std[c]) + mean[c]), 0, 1))`
+  (a NaN is 0). `y` is u8 `[frames_out, H scale, W scale, 3]`, `frames_out` `keep` or
+  `keep + blend`; `M` is its pixels. Refused: `blend` past `keep`, clip frames (`frames pt`) short
+  of `2 skip + keep + blend`, a `period` short of `frames tile tile`. MiniMax-H3: `tile` 16,
+  `overlap` 4, `scale` 16, `pt` 4, `skip` 3, `keep` 17, `blend` 5, `period` 1797, ImageNet's
+  `mean` and `std`.
+- `grid_pos3`: a ViT decoder's rotary positions over consecutive tiles of `period` rows, the
+  tile's `T x H x W` tokens first, then the period's other rows (register tokens). Row `m` is
+  token `k = m % period`; for `k < T H W`, `(t, i, j) = (k / (H W), (k / W) % H, k % W)` and
+  `y[0][m] = f32(f32(scale) g(t, T))`, `y[1][m] = f32(f32(scale) g(i, H))`,
+  `y[2][m] = f32(f32(scale) g(j, W))`, `g(c, n) = f32(f32(2 f32((c + 0.5) / n)) - 1)` (torch's
+  `2 * (arange(0.5, n) / n) - 1`); otherwise all three are 0. `y` is f32 `[3, >= M]`,
+  component-major, at its own row pitch: a `[3, M]` view of a wider plane, which `qk_norm_rope`
+  `axial` then reads as f32 positions. MiniMax-H3: `T` 7, `H` 16, `W` 16, `period` 1797,
+  `scale` `2 pi`.
+
+### Video sparse attention
+
+MiniMax-H3's step-distilled form (FastH3) was trained with FastVideo's video sparse attention: a
+video query sees the dense rows and only the video tiles it scores highest, scored per head from
+tile means, and a coarse branch adds attention over every tile's mean, gated per element.
+`vsa_select` makes the selection and the coarse term, `attn_vsa` the attention over them. They
+share their parameters; `attn_vsa` recomputes `k` from `sparsity`.
+
+| op | params | operands |
+|---|---|---|
+| `vsa_select` | `M`(range) `head_dim` `tile_t` `tile_h` `tile_w` `patch` `sparsity`:f64 `scale`:f64/opt | `q`, `k`, `v`?, `segs`, `geom` → `sel`, `coarse`? |
+| `attn_vsa` | `M`(range) `head_dim` `tile_t` `tile_h` `tile_w` `patch` `sparsity`:f64 `scale`:f64/opt `qk`/opt `pv`/opt | `q`, `k`, `v`, `segs`, `geom`, `sel`, `coarse`?, `gate`? → `out`, `k_i8`?, `k_scale`?, `v_scale`? |
+
+**The tiles.** A pass's `R` rows (`M` is their band) are one packed sequence. `segs`, i32
+`[n_seg + 1]`, cuts it into segments: `segs[0] = 0`, non-decreasing, `segs[n_seg] = R`; every
+segment but the last is dense (the text, the soundtrack), the last is the video grid of
+`F x Hp x Wp` rows in `(t, h, w)` order, `w` fastest. `geom` is the request's geometry on the
+device, i32 `[RAD_VGEOM_N]` (`abi/rad_runtime.h`): `F = geom[RAD_VGEOM_LAT_FRAMES]`,
+`Hp = geom[RAD_VGEOM_LAT_H] / patch`, `Wp = geom[RAD_VGEOM_LAT_W] / patch`. With
+`TT = tile_t tile_h tile_w`:
+
+- each dense segment, on its own, is cut into chunks of `TT` rows from its start, the last chunk
+  shorter, an empty segment none: the prefix tiles `0 .. P-1`, in segment order;
+- the grid is cut into `ceil(F / tile_t) x ceil(Hp / tile_h) x ceil(Wp / tile_w)` boxes. Box
+  `(a, b, c)` holds `t` in `[a tile_t, min(F, (a + 1) tile_t))` and likewise `h` and `w`, edge boxes
+  smaller, and is tile `P + (a nb + b) nc + c` (`nb = ceil(Hp / tile_h)`, `nc = ceil(Wp / tile_w)`):
+  `V` video tiles, `N = P + V` in all;
+- a tile's rows are taken in its `(t, h, w)` raster order (a prefix tile's in row order), which
+  fixes the order of every f32 sum over a tile. `size(i)` is tile `i`'s row count.
+
+`k = max(1, min(ceil((1 - sparsity) V), V))`, computed in f64 from the f64 `sparsity`, as the
+trained schedule computes it: `(1 - 0.8) 660` is `131.99999999999997`, so MiniMax-H3's 660 video
+tiles at 1344 x 768 keep 132, and `(1 - 0.7) 10` keeps 4.
+
+Both ops refuse with `RAD_E_SHAPE` a `segs` that does not start at 0, decreases, or covers no row
+or more rows than the operands hold; a last segment of other than `F Hp Wp` rows; a box extent or
+`patch` below 1; a `sparsity` outside `[0, 1)`; and an optional operand without its partner. `sel`
+must be i32 (`RAD_E_DTYPE`). Rows past `segs[n_seg]` are neither read nor written. `q`, `k`, `v`,
+`gate` and `out` are `[R, n_head head_dim]`, a column slice of a wider projection read at its own
+row pitch, or `[R, n_head, head_dim]`; the head count is read off `q`.
+
+**`vsa_select`.** Per head `h` and tile `i`, the tile means and the scores, in f32:
+
+    qp[h][i] = (sum over the rows r of tile i, in raster order, of q[r, h, :]) / size(i)
+    kp[h][i], and vp[h][i] (read for `coarse` alone), likewise from k and v
+    S[h][i][j] = (qp[h][i] . kp[h][j]) scale        the dot a sum over d ascending, then the product
+
+For a video query tile `i >= P`, `sel[h][i][0 .. k)` is the `k` video tiles `j` (`P <= j < N`) of
+largest `S[h][i][j]`, written in ascending tile order; equal scores go to the lower tile, and a NaN
+ranks above every number (`torch.topk`'s ranking). The prefix query tiles' rows of `sel` and its
+slots past `k` are not written. `sel` is `[n_head, tiles_cap >= N, k_cap >= k]`. With `coarse`
+(and `v`: both or neither), for every tile `i`, prefix tiles too:
+
+    e_j = exp(S[h][i][j] - max over all N tiles of S[h][i][:])
+    p[h][i][j] = e_j / (sum over all N tiles, j ascending, of e_j)
+    coarse[h][i][:] = (sum over j ascending of p[h][i][j] vp[h][j][:]), rounded once to its dtype
+
+`coarse` is `[n_head, tiles_cap >= N, head_dim]`. At `sparsity` 0, `k = V` and every video tile is
+selected.
+
+**`attn_vsa`.** A query row of tile `i` sees the rows of every tile when `i < P` (dense prefix
+queries), else of the prefix tiles and of the tiles `sel[h][i][0 .. k)`. Each such row of `sel` must
+hold `k` ascending video tiles, `RAD_E_INVAL` otherwise, checked before anything is written; `sel`'s
+other entries are not read. Per head (`q`, `k` and `v` have the same heads), `o` is the softmax over
+the visible keys of `(q . k) scale` times `v`, accumulated in f32, and
+
+    out[r, h, :] = o                                           without coarse and gate
+    out[r, h, :] = rd(rd(o) + coarse[h][i][:] gate[r, h, :])   with them, in f32
+
+`rd` rounding to `out`'s dtype: FastVideo's inference epilogue, the sparse output in bf16, then
+`out.addcmul_(coarse, gate)` in bf16 with f32 arithmetic. Two bf16 values multiply exactly in f32,
+so that is one f32 add between the two roundings. `gate` comes with `coarse`, both or neither. At
+`sparsity` 0 (with `vsa_select`'s selection) `attn_vsa` is `attn_dense` over the whole sequence.
+libref takes the keys by ascending tile, each tile in raster order, in `attn_dense`'s two passes.
+`qk` `"i8"` is `attn_prefix_self`'s int8 score form: `k_i8` `[M, n_head * head_dim]` and `k_scale`
+`[M, n_head]` f32 are k as `quant_act_i8g` writes it at group `head_dim`, each query row is
+quantised inside the op by the same rule, a score is `((dot * q_scale) * k_scale) * scale` in f32
+with `dot` the codes' exact integer sum, and `k` is not read. `pv` `"fp8"` is `attn_prefix_self`'s
+fp8 P.V form (`v` E4M3 codes, `v_scale` `[n_head * head_dim]`), before the epilogue.
+
+MiniMax-H3: `tile_t`, `tile_h` and `tile_w` 4, `patch` 2, `sparsity` 0.8, `head_dim` 128, the
+default `scale` `1 / sqrt(head_dim)`.
 
 ## Mixture of experts
 

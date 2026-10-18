@@ -315,10 +315,11 @@ extern "C" int r4d_shape_cast(const RadParam* p, int n_p, int operand,
 
     const int64_t M = pi(p, n_p, "M");
     const int64_t n = pi(p, n_p, "n");
-    /* Two rows serve the op, bf16 -> bf16 (a strided row copy) and bf16 -> f32, and the shims
-     * refuse any other pair, so another pair is declined here. */
+    /* Three rows serve the op, bf16 -> bf16 (a strided row copy), bf16 -> f32 and bf16 -> f16,
+     * and the shims refuse any other pair, so another pair is declined here. */
     const uint32_t f = dt_par(p, n_p, "from"), t = dt_par(p, n_p, "to");
-    if (f != (uint32_t)RAD_BF16 || (t != (uint32_t)RAD_BF16 && t != (uint32_t)RAD_F32))
+    if (f != (uint32_t)RAD_BF16 ||
+        (t != (uint32_t)RAD_BF16 && t != (uint32_t)RAD_F32 && t != (uint32_t)RAD_F16))
         return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = { opd(f, M, n), opd(t, M, n) };
     R4D_PICK(l);
@@ -1057,6 +1058,29 @@ extern "C" int r4d_shape_gemm_nt_q(const RadParam* p, int n_p, int operand,
         /* `a_sum` belongs to the asymmetric integer grids and `b_ref` to mxfp4; fp8 has neither. */
         opd_none(),
         opd_none(),
+    };
+    R4D_PICK(l);
+}
+
+/* gemm_nt_q_bias at fp8a8: gemm_nt_q's fp8 operands, a bf16 bias per output column, then y. The
+ * libref description matches it (ref_gemm_nt_q_bias_shape). */
+extern "C" int r4d_shape_gemm_nt_q_bias(const RadParam* p, int n_p, int operand,
+                                        RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t N = pi(p, n_p, "N");
+    const int64_t K = pi(p, n_p, "K");
+    const int64_t g = pi(p, n_p, "group", R4D_FP8_BLOCK);
+    const char* q = r4d_pgets(p, n_p, "dtype");
+    if (!q || std::strcmp(q, "fp8a8") || g != R4D_FP8_BLOCK || K <= 0 || N <= 0)
+        return RAD_E_UNSUPPORTED;
+    const int64_t kb = (K + g - 1) / g, nb = (N + g - 1) / g;
+    const RadOpdDesc l[] = {
+        opd((uint32_t)RAD_F8E4M3, M, K),
+        opd((uint32_t)RAD_F32, M, kb),
+        opd((uint32_t)RAD_F8E4M3, N, K),
+        opd((uint32_t)RAD_BF16, nb, kb),
+        opd((uint32_t)RAD_BF16, N),
+        opd((uint32_t)RAD_BF16, M, N),
     };
     R4D_PICK(l);
 }

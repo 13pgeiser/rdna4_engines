@@ -19,6 +19,7 @@
  * be unchanged, and the parallel rerun applies as for the table (avx_check.cpp). */
 #include "avx_check.h"
 #include "rad_planes.h"
+#include "rad_runtime.h"   /* RAD_VGEOM_* */
 #include "rad_sample.h"
 #ifdef AVX_CHECK_CORE_DECODER
 #include "format/encoding.h"
@@ -1944,6 +1945,45 @@ void gen_cases(std::vector<Hand>& hs) {
                      .pf("scale", 1.0 / std::sqrt((double)hd)).ps("qk", i8 ? "i8" : "bf16");
                     hs.push_back(std::move(h));
                 }
+        /* ---- the prefix-free form: no cache, block table or prefix lengths; two entries of
+         * 37 and 8 rows, bf16 and int8 scores, columns of a fused projection. */
+        for (const bool pv8 : { false, true })
+        for (const bool i8 : { false, true })
+            for (const int causal : { 0, 1 }) {
+                const int64_t T = 45, kvh = 2, gqa = 1, qh = 2, hd = 64;
+                const int64_t W = (qh + 2 * kvh) * hd;
+                char nm[128];
+                std::snprintf(nm, sizeof nm, "no prefix, 2 entries%s%s%s%s", i8 ? ", i8" : "",
+                              pv8 ? ", fp8 P.V" : "", causal ? ", causal" : "", sfx.c_str());
+                Hand h(nm, "attn_prefix_self", dt == RAD_F32 ? 1e-4 : 2e-2);
+                h.view(dt, { T, qh * hd }, { W, 1 }, T * W, hfill(280))
+                 .view(dt, { T, kvh * hd }, { W, 1 }, T * W, hfill(281));
+                if (pv8) h.dense(RAD_F8E4M3, { T, kvh * hd }, hfill(282, 64.0f));
+                else     h.view(dt, { T, kvh * hd }, { W, 1 }, T * W, hfill(282));
+                h.none().none().none()
+                 .idx({ 0, 37, T })
+                 .none().none();
+                if (i8) {
+                    h.dense(RAD_I8, { T, kvh * hd }, [](int64_t i) {
+                         return (float)((int)((i * 41) % 255) - 127);
+                     })
+                     .dense(RAD_F32, { T, kvh }, [](int64_t i) {
+                         return 0.004f + 0.0005f * (float)(i % 5);
+                     });
+                } else {
+                    h.none().none();
+                }
+                h.view(dt, { T, qh * hd }, { W, 1 }, T * W, zero, true);
+                if (pv8) h.dense(RAD_F32, { kvh * hd }, [](int64_t i) {
+                    return 0.01f + 0.001f * (float)(i % 11);
+                });
+                else     h.none();
+                h.pi("q_len", T).pi("head_dim", hd).pi("gqa", gqa).pi("block_size", 16)
+                 .pi("causal", causal).ps("q_dtype", dn).ps("kv_dtype", dn).pi("max_ctx", 0)
+                 .pf("scale", 1.0 / std::sqrt((double)hd)).ps("qk", i8 ? "i8" : "bf16")
+                 .ps("pv", pv8 ? "fp8" : "bf16");
+                hs.push_back(std::move(h));
+            }
         {
             /* One segment of a longer sequence: cu is its two bounding offsets, rows [5, 30), and
              * the rows outside it stay as they were. */
@@ -2001,6 +2041,360 @@ void gen_cases(std::vector<Hand>& hs) {
          .pi("M", 2).pi("n", 67).ps("dtype", "f32")
          .refuses(RAD_E_INVAL);
         hs.push_back(std::move(r));
+    }
+}
+
+/* ================================================================== the video generator */
+/* Forms libref's descriptions do not draw: f32 positions as a [3, M] view of a wider plane, absent
+ * gains and a partial rotary; the DiT's norm over three entries (one empty) with [shift | scale] a
+ * column slice of a wider modulation table; a latent grid of different extents on every axis, so
+ * the tiles overlap unevenly; a chunk between two others (the temporal blend and the overlap it
+ * hands on), a last one and a first one; positions into a view of a wider plane. Everything but
+ * the norms and the rotaries is held to zero error: libref's arithmetic bit for bit. */
+void video_cases(std::vector<Hand>& hs) {
+    const auto zero = [](int64_t) { return 0.0f; };
+    for (const uint32_t dt : { (uint32_t)RAD_F32, (uint32_t)RAD_BF16 }) {
+        const char* dn = dt == RAD_F32 ? "f32" : "bf16";
+        const std::string sfx = std::string(", ") + dn;
+        const double norm_tol = dt == RAD_F32 ? 1e-5 : 6e-3;
+
+        /* ---- the rotaries: positions f32, component-major, rows 32 apart ------------------- */
+        {
+            const int64_t M = 9, hd = 128, nh = 2, nkv = 2, W = (nh + 2 * nkv) * hd;
+            const auto pos = [](int64_t i) { return 0.37f * (float)(i % 32) - 2.5f; };
+            Hand h(("the DiT's axial 16 16 16 over 96 of 128, f32 positions" + sfx).c_str(),
+                   "qk_norm_rope", norm_tol);
+            h.dense(dt, { M, W }, hfill(400), true)
+             .view(RAD_F32, { 3, M }, { 32, 1 }, 96, pos)
+             .dense(dt, { hd }, hfill(401, 0.1f))
+             .dense(dt, { hd }, hfill(402, 0.1f))
+             .pi("M", M).pi("head_dim", hd).pi("n_head", nh).pi("n_head_kv", nkv)
+             .pf("theta", 10000.0).pf("eps", 1e-5).ps("mode", "axial").pi("rotary_dim", 96)
+             .ps("sections", "16 16 16");
+            hs.push_back(std::move(h));
+
+            /* The decoder's: no gains, positions 2 pi (2 (c + 0.5) / n - 1), theta 100. */
+            const int64_t hv = 64, Wv = 3 * 4 * hv;
+            const auto vpos = [](int64_t i) {
+                const int64_t c = i / 32, m = i % 32;
+                const int64_t n = c == 0 ? 3 : 4, k = c == 0 ? m % 3 : c == 1 ? (m / 4) % 4 : m % 4;
+                return 6.2831855f * (2.0f * (((float)k + 0.5f) / (float)n) - 1.0f);
+            };
+            Hand g(("the decoder's axial 8 8 8 over 48 of 64, no gains" + sfx).c_str(),
+                   "qk_norm_rope", norm_tol);
+            g.dense(dt, { M, Wv }, hfill(403), true)
+             .view(RAD_F32, { 3, M }, { 32, 1 }, 96, vpos)
+             .none().none()
+             .pi("M", M).pi("head_dim", hv).pi("n_head", 4).pi("n_head_kv", 4)
+             .pf("theta", 100.0).pf("eps", 1e-5).ps("mode", "axial").pi("rotary_dim", 48)
+             .ps("sections", "8 8 8");
+            hs.push_back(std::move(g));
+
+            Hand r(("rope over fractional f32 positions, scale 2" + sfx).c_str(), "rope",
+                   norm_tol);
+            r.dense(dt, { M, 4 * 64 }, hfill(404), true)
+             .dense(RAD_F32, { M }, [](int64_t i) { return 0.73f * (float)i - 1.1f; })
+             .pi("M", M).pi("head_dim", 64).pi("n_head", 2).pi("n_head_kv", 1)
+             .pf("theta", 10000.0).pf("scale", 2.0).ps("mode", "neox");
+            hs.push_back(std::move(r));
+        }
+
+        /* ---- the DiT's norm: three entries (one empty), [shift | scale] at a 6n pitch ------- */
+        {
+            const int64_t R = 11, D = 160, W6 = 6 * D;
+            for (const bool gated : { true, false }) {
+                Hand h((std::string(gated ? "gated" : "ungated") + ", three entries, s at a 6n "
+                        "pitch" + sfx).c_str(), "rms_mod", norm_tol);
+                if (gated) {
+                    h.dense(dt, { R, D }, hfill(410))
+                     .view(dt, { 3, D }, { W6, 1 }, 3 * W6, hfill(411, 0.5f));
+                } else {
+                    h.none().none();
+                }
+                h.view(dt, { 3, 2 * D }, { W6, 1 }, 3 * W6, hfill(412, 0.5f))
+                 .dense(dt, { D }, [](int64_t i) { return 0.8f + 0.003f * (float)i; })
+                 .idx({ 0, 4, 4, R })
+                 .dense(dt, { R, D }, hfill(413, 2.0f), true)
+                 .dense(dt, { R, D }, zero, true)
+                 .pi("M", R).pi("n", D).pf("eps", 1e-5).pi("gated", gated ? 1 : 0)
+                 .ps("dtype", dn);
+                hs.push_back(std::move(h));
+
+                Hand q((std::string(gated ? "gated" : "ungated") + ", quantised, three entries" +
+                        sfx).c_str(), "rms_mod_quant_fp8", 1e-2);
+                if (gated) {
+                    q.dense(dt, { R, D }, hfill(414))
+                     .view(dt, { 3, D }, { W6, 1 }, 3 * W6, hfill(415, 0.5f));
+                } else {
+                    q.none().none();
+                }
+                q.view(dt, { 3, 2 * D }, { W6, 1 }, 3 * W6, hfill(416, 0.5f))
+                 .dense(dt, { D }, [](int64_t i) { return 0.8f + 0.003f * (float)i; })
+                 .idx({ 0, 4, 4, R })
+                 .dense(dt, { R, D }, hfill(417, 2.0f), true)
+                 .dense(RAD_F8E4M3, { R, D }, zero, true)
+                 .dense(RAD_F32, { R, D / 32 }, zero, true)
+                 .dense(RAD_BF16, { R, D }, zero, true)
+                 .pi("M", R).pi("n", D).pf("eps", 1e-5).pi("group", 32)
+                 .pi("gated", gated ? 1 : 0).ps("dtype", dn);
+                hs.push_back(std::move(q));
+            }
+        }
+
+        /* ---- the sampler: a bf16 velocity into an f32 state ------------------------------- */
+        {
+            Hand h(("bf16 velocity, f32 state, rows at a wider pitch" + sfx).c_str(),
+                   "flow_x0_step", 0.0);
+            h.dense(dt, { 7, 96 }, hfill(420, 2.0f))
+             .dense(RAD_F32, { 1 }, [](int64_t) { return 0.3046875f; })
+             .dense(RAD_F32, { 1 }, [](int64_t) { return 0.6953125f; })
+             .dense(RAD_F32, { 1 }, [](int64_t) { return 0.4413f; })
+             .view(RAD_F32, { 7, 96 }, { 101, 1 }, 7 * 101, hfill(421), true)
+             .pi("M", 7).pi("n", 96).ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+
+        /* ---- the decoder's geometry: 3 frames of 6 x 9 latents, tiles of 4 over 1 ------------ *
+         * Rows split 6 -> starts 0, 2 (overlap 2); columns 9 -> 0, 2, 5 (overlaps 2, 1). */
+        {
+            Hand h(("2 x 3 x 2 patches of 2 x 2 x 2, rows past the voxels" + sfx).c_str(),
+                   "patch_unfold", 0.0);
+            h.dense(RAD_F32, { 12, 5 * 8 }, hfill(430, 3.0f))
+             .idx({ 2, 3, 2 })
+             .dense(dt, { 100, 5 }, hfill(431), true)
+             .pi("M", 100).pi("C", 5).pi("pt", 2).pi("ph", 2).pi("pw", 2)
+             .ps("mul", "0.5 1.25 -2 0.3 1.7").ps("add", "0.1 -0.2 0.3 0 2.5").ps("dtype", dn);
+            hs.push_back(std::move(h));
+
+            /* Two register rows and two zero rows a tile. */
+            const int64_t n = 37, period = 52, tiles = 6;
+            Hand g(("6 x 9 in tiles of 4 over 1, registers and zero rows" + sfx).c_str(),
+                   "vtile_gather", 0.0);
+            g.dense(dt, { 3 * 6 * 9, n }, hfill(432))
+             .dense(dt, { 2, n }, hfill(433))
+             .idx({ 3, 6, 9 })
+             .dense(dt, { tiles * period, n }, hfill(434), true)
+             .pi("M", tiles * period).pi("n", n).pi("tile", 4).pi("overlap", 1).pi("frames", 3)
+             .pi("period", period).pi("n_reg", 2).ps("dtype", dn);
+            hs.push_back(std::move(g));
+
+            /* The decoded tiles at scale 2, two clip frames a latent one: skip 1, keep 3, blend 1;
+             * each tile's 48 token rows, then 4 rows the stitch does not read. */
+            struct Chunk { int first, last; const char* what; };
+            static const Chunk kChunks[] = { { 0, 0, "a chunk between two others" },
+                                             { 0, 1, "a video's last chunk" },
+                                             { 1, 0, "a video's first chunk" } };
+            const int64_t npx = 12 * 18;
+            for (const Chunk& ch : kChunks) {
+                const int64_t fout = 3 + (ch.last ? 1 : 0);
+                Hand s((std::string(ch.what) + ", 6 x 9 in tiles of 4 over 1" + sfx).c_str(),
+                       "vtile_stitch", 0.0);
+                s.dense(dt, { tiles * period, 3 * 2 * 2 * 2 }, hfill(435, 2.0f))
+                 .idx({ 3, 6, 9, ch.first, ch.last })
+                 .dense(RAD_BF16, { npx, 3 }, hfill(436, 2.0f), true)
+                 .dense(RAD_U8, { fout * npx, 3 }, zero, true)
+                 .pi("M", fout * npx).pi("tile", 4).pi("overlap", 1).pi("scale", 2).pi("pt", 2)
+                 .pi("skip", 1).pi("keep", 3).pi("blend", 1).pi("period", period)
+                 .ps("mean", "0.485 0.456 0.406").ps("std", "0.229 0.224 0.225");
+                hs.push_back(std::move(s));
+            }
+        }
+    }
+
+    /* ---- positions into a [3, 40] view of a [3, 64] plane ---------------------------------- */
+    {
+        Hand h("two periods of 2 x 3 x 4 and its registers, rows 64 apart", "grid_pos3", 0.0);
+        h.view(RAD_F32, { 3, 40 }, { 64, 1 }, 192, [](int64_t) { return -7.0f; }, true)
+         .pi("M", 40).pi("T", 2).pi("H", 3).pi("W", 4).pi("period", 27)
+         .pf("scale", 6.283185307179586);
+        hs.push_back(std::move(h));
+    }
+}
+
+/* ================================================================== video sparse attention
+ * What libref's descriptions cannot draw: uneven dense segments (13 and 14 rows: a tile each in
+ * boxes of 4, two each in boxes of 2) before a 6 x 5 x 7 grid (a 10 x 14 latent at patch 2) with
+ * edge boxes on every axis, and `geom`'s other entries holding values no tile reads; q, k, v and
+ * the gate at a fused projection's row pitch and the output at a pitch of its own; `sel` and
+ * `coarse` wider than the tiles and the selection; attn_vsa over selections of every size from 1
+ * to V that are not a top-k of anything; and what both refuse. Outputs start as a sentinel, so an
+ * element one side writes and the other leaves shows as a difference, and attn_vsa's `sel` holds
+ * one wherever the op must not read. */
+
+/* attn_vsa's `sel`, [nh, cap, kc]: per head and video query tile, k distinct video tiles of
+ * [P, N) in ascending order, drawn from `seed`; `fill` everywhere else. */
+std::vector<float> vsa_selection(int64_t nh, int64_t cap, int64_t kc, int64_t P, int64_t N,
+                                 int64_t k, uint64_t seed, float fill) {
+    std::vector<float> s((size_t)(nh * cap * kc), fill);
+    std::vector<int64_t> pool;
+    uint64_t x = seed;
+    for (int64_t h = 0; h < nh; ++h)
+        for (int64_t i = P; i < N; ++i) {
+            pool.clear();
+            for (int64_t j = P; j < N; ++j) pool.push_back(j);
+            for (int64_t a = 0; a < k; ++a) {
+                const int64_t b = a + (int64_t)(hsplitmix(x) % (uint64_t)(N - P - a));
+                std::swap(pool[(size_t)a], pool[(size_t)b]);
+            }
+            std::sort(pool.begin(), pool.begin() + k);
+            for (int64_t a = 0; a < k; ++a)
+                s[(size_t)((h * cap + i) * kc + a)] = (float)pool[(size_t)a];
+        }
+    return s;
+}
+
+void vsa_cases(std::vector<Hand>& hs) {
+    const int64_t R = 237, NH = 2, HD = 64, W = 4 * NH * HD, WO = NH * HD + 24;
+    const auto sentinel = [](int64_t) { return -7.0f; };
+    const auto geom = [](int64_t i) {
+        return i == RAD_VGEOM_LAT_FRAMES ? 6.0f : i == RAD_VGEOM_LAT_H ? 10.0f
+             : i == RAD_VGEOM_LAT_W ? 14.0f : (float)(1000 + i);
+    };
+    struct Geo { int64_t tt, P, V; const char* what; };
+    static const Geo kGeo[] = { { 4, 2, 8, "boxes of 4" }, { 2, 4, 36, "boxes of 2" } };
+    for (const uint32_t dt : { (uint32_t)RAD_F32, (uint32_t)RAD_BF16 }) {
+        const char* dn = dt == RAD_F32 ? "f32" : "bf16";
+        const double sel_tol = dt == RAD_F32 ? 1e-5 : 6e-3, att_tol = dt == RAD_F32 ? 1e-4 : 2e-2;
+        for (const Geo& g : kGeo)
+            for (const double sp : { 0.8, 0.0, 0.95 }) {
+                const int64_t N = g.P + g.V;
+                const int64_t k = std::max<int64_t>(
+                    1, std::min<int64_t>((int64_t)std::ceil((1.0 - sp) * (double)g.V), g.V));
+                char sfx[96];
+                std::snprintf(sfx, sizeof sfx, ", 13 | 14 then 6 x 5 x 7, %s, sparsity %g, %s",
+                              g.what, sp, dn);
+                for (const bool coarse : { true, false }) {
+                    Hand h((std::string(coarse ? "q, k, v at a pitch, coarse" : "q, k at a pitch, "
+                                        "no coarse") + sfx).c_str(), "vsa_select", sel_tol);
+                    h.view(dt, { R, NH * HD }, { W, 1 }, R * W, hfill(500))
+                     .view(dt, { R, NH * HD }, { W, 1 }, R * W, hfill(501));
+                    if (coarse) h.view(dt, { R, NH * HD }, { W, 1 }, R * W, hfill(502, 2.0f));
+                    else        h.none();
+                    h.idx({ 0, 13, 27, R })
+                     .dense(RAD_I32, { RAD_VGEOM_N }, geom)
+                     .dense(RAD_I32, { NH, N + 2, k + 2 }, sentinel, true);
+                    if (coarse) h.dense(dt, { NH, N + 1, HD }, sentinel, true);
+                    else        h.none();
+                    h.pi("M", R).pi("head_dim", HD).pi("tile_t", g.tt).pi("tile_h", g.tt)
+                     .pi("tile_w", g.tt).pi("patch", 2).pf("sparsity", sp);
+                    hs.push_back(std::move(h));
+
+                    const std::vector<float> sv =
+                        vsa_selection(NH, N + 1, k + 1, g.P, N, k, 503 + (uint64_t)k, -9.0f);
+                    Hand a((std::string(coarse ? "q, k, v, gate at a pitch, coarse, out at its "
+                                        "own" : "q, k, v at a pitch, out at its own") + sfx +
+                            ", a drawn selection").c_str(), "attn_vsa", att_tol);
+                    a.view(dt, { R, NH * HD }, { W, 1 }, R * W, hfill(504))
+                     .view(dt, { R, NH * HD }, { W, 1 }, R * W, hfill(505))
+                     .view(dt, { R, NH * HD }, { W, 1 }, R * W, hfill(506, 2.0f))
+                     .idx({ 0, 13, 27, R })
+                     .dense(RAD_I32, { RAD_VGEOM_N }, geom)
+                     .dense(RAD_I32, { NH, N + 1, k + 1 },
+                            [sv](int64_t i) { return sv[(size_t)i]; });
+                    if (coarse) {
+                        a.dense(dt, { NH, N + 1, HD }, hfill(507, 0.5f))
+                         .view(dt, { R, NH * HD }, { W, 1 }, R * W, hfill(508));
+                    } else {
+                        a.none().none();
+                    }
+                    a.view(dt, { R, NH * HD }, { WO, 1 }, R * WO, sentinel, true)
+                     .pi("M", R).pi("head_dim", HD).pi("tile_t", g.tt).pi("tile_h", g.tt)
+                     .pi("tile_w", g.tt).pi("patch", 2).pf("sparsity", sp);
+                    hs.push_back(std::move(a));
+                    if (!coarse) continue;
+                    /* The int8 score form: k's codes and per-(row, head) scales beside it. */
+                    Hand q8((std::string("int8 scores, coarse") + sfx + ", a drawn selection").c_str(),
+                            "attn_vsa", att_tol);
+                    q8.view(dt, { R, NH * HD }, { W, 1 }, R * W, hfill(504))
+                      .view(dt, { R, NH * HD }, { W, 1 }, R * W, hfill(505))
+                      .view(dt, { R, NH * HD }, { W, 1 }, R * W, hfill(506, 2.0f))
+                      .idx({ 0, 13, 27, R })
+                      .dense(RAD_I32, { RAD_VGEOM_N }, geom)
+                      .dense(RAD_I32, { NH, N + 1, k + 1 },
+                             [sv](int64_t i) { return sv[(size_t)i]; })
+                      .dense(dt, { NH, N + 1, HD }, hfill(507, 0.5f))
+                      .view(dt, { R, NH * HD }, { W, 1 }, R * W, hfill(508))
+                      .view(dt, { R, NH * HD }, { WO, 1 }, R * WO, sentinel, true)
+                      .dense(RAD_I8, { R, NH * HD }, [](int64_t i) {
+                          return (float)((int)((i * 53) % 255) - 127);
+                      })
+                      .dense(RAD_F32, { R, NH }, [](int64_t i) { return 0.004f + 0.0005f * (float)(i % 9); })
+                      .pi("M", R).pi("head_dim", HD).pi("tile_t", g.tt).pi("tile_h", g.tt)
+                      .pi("tile_w", g.tt).pi("patch", 2).pf("sparsity", sp).ps("qk", "i8");
+                    hs.push_back(std::move(q8));
+                    /* The same with the fp8 P.V form: E4M3 values and a scale per column. */
+                    Hand p8((std::string("int8 scores, fp8 P.V, coarse") + sfx +
+                             ", a drawn selection").c_str(), "attn_vsa", att_tol);
+                    p8.view(dt, { R, NH * HD }, { W, 1 }, R * W, hfill(504))
+                      .view(dt, { R, NH * HD }, { W, 1 }, R * W, hfill(505))
+                      .dense(RAD_F8E4M3, { R, NH * HD }, hfill(506, 64.0f))
+                      .idx({ 0, 13, 27, R })
+                      .dense(RAD_I32, { RAD_VGEOM_N }, geom)
+                      .dense(RAD_I32, { NH, N + 1, k + 1 },
+                             [sv](int64_t i) { return sv[(size_t)i]; })
+                      .dense(dt, { NH, N + 1, HD }, hfill(507, 0.5f))
+                      .view(dt, { R, NH * HD }, { W, 1 }, R * W, hfill(508))
+                      .view(dt, { R, NH * HD }, { WO, 1 }, R * WO, sentinel, true)
+                      .dense(RAD_I8, { R, NH * HD }, [](int64_t i) {
+                          return (float)((int)((i * 53) % 255) - 127);
+                      })
+                      .dense(RAD_F32, { R, NH }, [](int64_t i) {
+                          return 0.004f + 0.0005f * (float)(i % 9);
+                      })
+                      .dense(RAD_F32, { NH * HD }, [](int64_t i) {
+                          return 0.01f + 0.001f * (float)(i % 13);
+                      })
+                      .pi("M", R).pi("head_dim", HD).pi("tile_t", g.tt).pi("tile_h", g.tt)
+                      .pi("tile_w", g.tt).pi("patch", 2).pf("sparsity", sp).ps("qk", "i8")
+                      .ps("pv", "fp8");
+                    hs.push_back(std::move(p8));
+                }
+            }
+    }
+
+    /* ---- refusals: nothing written --------------------------------------------------------- */
+    const int64_t N = 10, k = 2;
+    std::vector<float> sv = vsa_selection(NH, N, k, 2, N, k, 509, -9.0f);
+    std::swap(sv[(size_t)(5 * k)], sv[(size_t)(5 * k + 1)]);     /* head 0, tile 5: descending */
+    struct Bad { const char* what; int rc; bool gate; float frames; };
+    static const Bad kBad[] = {
+        { "a selection row out of order", RAD_E_INVAL, true, 6.0f },
+        { "coarse without its gate", RAD_E_SHAPE, false, 6.0f },
+        { "a grid of 5 frames short of the last segment", RAD_E_SHAPE, true, 5.0f },
+    };
+    for (const Bad& b : kBad) {
+        const float fr = b.frames;
+        const std::vector<float> sel = b.rc == RAD_E_INVAL
+                                     ? sv : vsa_selection(NH, N, k, 2, N, k, 509, -9.0f);
+        Hand a((std::string("refused: ") + b.what).c_str(), "attn_vsa", 2e-2);
+        a.dense(RAD_BF16, { R, NH * HD }, hfill(510))
+         .dense(RAD_BF16, { R, NH * HD }, hfill(511))
+         .dense(RAD_BF16, { R, NH * HD }, hfill(512))
+         .idx({ 0, 13, 27, R })
+         .dense(RAD_I32, { RAD_VGEOM_N },
+                [fr, geom](int64_t i) { return i == RAD_VGEOM_LAT_FRAMES ? fr : geom(i); })
+         .dense(RAD_I32, { NH, N, k }, [sel](int64_t i) { return sel[(size_t)i]; })
+         .dense(RAD_BF16, { NH, N, HD }, hfill(513));
+        if (b.gate) a.dense(RAD_BF16, { R, NH * HD }, hfill(514));
+        else        a.none();
+        a.dense(RAD_BF16, { R, NH * HD }, sentinel, true)
+         .pi("M", R).pi("head_dim", HD).pi("tile_t", 4).pi("tile_h", 4).pi("tile_w", 4)
+         .pi("patch", 2).pf("sparsity", 0.8).refuses(b.rc);
+        hs.push_back(std::move(a));
+    }
+    {
+        Hand s("refused: a grid of 5 frames short of the last segment", "vsa_select", 6e-3);
+        s.dense(RAD_BF16, { R, NH * HD }, hfill(515))
+         .dense(RAD_BF16, { R, NH * HD }, hfill(516))
+         .none()
+         .idx({ 0, 13, 27, R })
+         .dense(RAD_I32, { RAD_VGEOM_N },
+                [geom](int64_t i) { return i == RAD_VGEOM_LAT_FRAMES ? 5.0f : geom(i); })
+         .dense(RAD_I32, { NH, N, k }, sentinel, true)
+         .none()
+         .pi("M", R).pi("head_dim", HD).pi("tile_t", 4).pi("tile_h", 4).pi("tile_w", 4)
+         .pi("patch", 2).pf("sparsity", 0.8).refuses(RAD_E_SHAPE);
+        hs.push_back(std::move(s));
     }
 }
 
@@ -3013,6 +3407,481 @@ void encoder_cases(std::vector<Hand>& hs) {
     }
 }
 
+/* ================================================================== the audio generator */
+/* Forms libref's descriptions do not draw: weights at a trained snake's scale (the drawn 0.02
+ * leaves the sine almost linear) and arguments past the polynomial's range, SnakeBeta, several
+ * sequences of uneven length starting past row 0 with an empty one, a convolution without its bias
+ * and residual, a causal one with an even kernel, a depthwise one with a bias, transposed ones at
+ * odd strides and at a kernel of one stride, sampler rows full of ties, a sampler with per-lane
+ * guidance and a history (one lane twice), the window entries the run phase issues: unconditional
+ * branches (pair -2), every flag combination, a window shorter than its overlap, a frame 0, an
+ * ended lane; codes as a block of a wider plane; and refusals that must write nothing. Everything
+ * but the convolutions and snake is held to zero error. */
+void audio_cases(std::vector<Hand>& hs) {
+    const auto zero = [](int64_t) { return 0.0f; };
+    for (const uint32_t dt : { (uint32_t)RAD_F32, (uint32_t)RAD_BF16 }) {
+        const char* dn = dt == RAD_F32 ? "f32" : "bf16";
+        const std::string sfx = std::string(", ") + dn;
+        const double norm_tol = dt == RAD_F32 ? 1e-5 : 6e-3;
+        {
+            /* alpha 0.25 .. 4.2 and x in [-8, 8]: arguments to about 34. Row 3 holds 30000 (past
+             * the polynomial's range, so the row takes the libm sine), row 2 a NaN, row 4 an
+             * infinity. */
+            const int64_t n = 67;
+            Hand h(("trained alphas, a large argument, NaN and infinity" + sfx).c_str(), "snake",
+                   norm_tol);
+            h.dense(dt, { 5, n }, [n](int64_t i) {
+                 if (i == 3 * n + 4) return 30000.0f;
+                 if (i == 2 * n + 10) return NAN;
+                 if (i == 4 * n + 66) return INFINITY;
+                 return hfill(260, 8.0f)(i);
+             })
+             .dense(RAD_F32, { n }, [](int64_t c) { return 0.25f + 0.06f * (float)c; })
+             .dense(dt, { 5, n }, zero, true)
+             .pi("M", 5).pi("n", n).ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        {
+            /* Three sequences from row 2, the second empty, no bias and no residual; rows 0, 1,
+             * 16 and 17 of y are outside every sequence and keep their bytes. */
+            const int64_t cin = 20, cout = 13;
+            Hand h(("rows 2..16 in three sequences, no bias or residual, tanh" + sfx).c_str(),
+                   "conv1d", norm_tol);
+            h.dense(dt, { 18, cin }, hfill(261))
+             .dense(dt, { cout, cin, 5 }, hfill(262, 0.3f))
+             .idx({ 2, 7, 7, 16 })
+             .none()
+             .dense(dt, { 18, cout }, hfill(263), true)
+             .none()
+             .pi("M", 18).pi("cin", cin).pi("cout", cout).pi("k", 5).pi("dil", 2)
+             .ps("act", "tanh").ps("dtype", dn);
+            hs.push_back(std::move(h));
+
+            /* x rows at a wider pitch than its channels, with the residual and the bias. */
+            Hand g(("input rows at a wider pitch, residual and bias" + sfx).c_str(), "conv1d",
+                   norm_tol);
+            g.view(dt, { 16, cin }, { cin + 3, 1 }, 16 * (cin + 3), hfill(264))
+             .dense(dt, { cout, cin, 3 }, hfill(265, 0.3f))
+             .idx({ 0, 9, 16 })
+             .dense(dt, { 16, cout }, hfill(266))
+             .dense(dt, { 16, cout }, zero, true)
+             .dense(dt, { cout }, hfill(267, 0.5f))
+             .pi("M", 16).pi("cin", cin).pi("cout", cout).pi("k", 3).pi("dil", 1)
+             .ps("dtype", dn);
+            hs.push_back(std::move(g));
+        }
+        for (const int64_t s : { 4, 2 }) {
+            /* Sequences of 3, 1 and 5 rows from row 1: output rows [s, 10 s); the first s rows of
+             * y keep their bytes. */
+            const int64_t cin = 12, cout = 7;
+            Hand h(("three uneven sequences from row 1, stride " + std::to_string(s) + sfx).c_str(),
+                   "conv_t1d", norm_tol);
+            h.dense(dt, { 10, cin }, hfill(268))
+             .dense(dt, { cin, cout, 2 * s }, hfill(269, 0.3f))
+             .dense(dt, { cout }, hfill(270, 0.5f))
+             .idx({ 1, 4, 5, 10 })
+             .dense(dt, { 10 * s, cout }, hfill(271), true)
+             .pi("M", 10).pi("cin", cin).pi("cout", cout).pi("stride", s).ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        {
+            /* Lanes 2, 0, 1, 3 of four ten-row lanes, overlap 4, seven channels (a Philox block of
+             * four straddles rows): FIRST | JOIN over a whole window; the same flags on an
+             * unconditional branch, which moves nothing; JOIN alone over a window of 3 rows,
+             * shorter than the overlap; FIRST alone over 6 rows. */
+            static const uint32_t kSeeds[8] = { 0x9e3779b9u, 1u, 7u, 0u, 3u, 0xfffffffeu, 11u,
+                                                0x80000001u };
+            Hand h(("every flag combination, an unconditional entry, a short window" + sfx).c_str(),
+                   "win_prep", 0.0);
+            h.idx({ 17, 17, 16, 1 })
+             .dense(RAD_F32, { 4 }, [](int64_t i) { return 0.7f - 0.13f * (float)i; })
+             .raw(RAD_U32, { 8 }, kSeeds)
+             .idx({ 0, 5, 2, 9 })
+             .idx({ 2, 0, 1, 3 })
+             .idx({ 1, -2, -1, -1 })
+             .idx({ 0, 10, 20, 23, 29 })
+             .dense(RAD_BF16, { 16, 7 }, hfill(272))
+             .dense(RAD_BF16, { 16, 7 }, hfill(273), true)
+             .dense(RAD_BF16, { 40, 7 }, hfill(274), true)
+             .pi("M", 29).pi("n", 7).pi("stride", 10).pi("ov", 4).ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        {
+            /* LAST | JOIN over a whole window; LAST over 7 rows (rows - 2 ov < 0, so the kept
+             * overlap starts at row 0); LAST on an unconditional branch; JOIN without LAST. */
+            Hand h(("LAST with and without JOIN, a short window, two skipped" + sfx).c_str(),
+                   "win_finish", 0.0);
+            h.idx({ 24, 8, 8, 16 })
+             .idx({ -1, -1, -2, 0 })
+             .idx({ 1, 3, 2, 0 })
+             .idx({ 0, 10, 17, 20, 25 })
+             .dense(dt, { 40, 5 }, hfill(275))
+             .dense(RAD_BF16, { 40, 7 }, hfill(276), true)
+             .dense(RAD_BF16, { 16, 7 }, hfill(277), true)
+             .dense(dt, { 16, 5 }, hfill(278), true)
+             .pi("M", 25).pi("n", 7).pi("n_cond", 5).pi("stride", 10).pi("ov", 4)
+             .ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        {
+            /* Lane 1 twice, the second an unconditional branch (zeros for its conditioning). */
+            Hand h(("an unconditional entry beside its conditional one" + sfx).c_str(),
+                   "win_input", 0.0);
+            h.dense(dt, { 24, 9 }, hfill(279))
+             .dense(dt, { 24, 5 }, hfill(280))
+             .idx({ 0, 6, 12, 15 })
+             .idx({ 1, 1, 0 })
+             .idx({ 1, -2, -1 })
+             .dense(dt, { 15, 16 }, hfill(281), true)
+             .pi("M", 15).pi("n_lat", 9).pi("n_zero", 2).pi("n_cond", 5).pi("stride", 8)
+             .ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        {
+            /* Four lanes, two branch rows each: entry 0 at frame 0 (moves past the prompt only),
+             * entry 1 on an ended lane, entries 2 and 3 stored. */
+            Hand h(("frame 0, an ended lane, two stored" + sfx).c_str(), "frame_mix_store", 0.0);
+            h.dense(dt, { 3 * 8, 37 }, hfill(282, 4.0f))
+             .dense(RAD_F32, { 3 }, [](int64_t l) { return l == 0 ? 0.3f : l == 1 ? -1.2f : 2.0f; })
+             .dense(RAD_F32, { 1 }, [](int64_t) { return 1.7f; })
+             .idx({ 2, 0, 3, 1 })
+             .idx({ 0, 3, 2, 5 })
+             .idx({ -1, 2, 5, 7 })
+             .dense(dt, { 20, 37 }, hfill(283), true)
+             .pi("M", 4).pi("n_embd", 37).pi("L", 3).pi("stride", 5).pi("rep", 2)
+             .ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        {
+            /* Codes past either table: row 1's first code (its row is not written), row 2's
+             * second (skipped in the sum). Code-major [3, 4]. */
+            static const int32_t kCodes[12] = { 3, 10, 0, -2,   4, 1, -15, 7,   9, 2, 5, 0 };
+            Hand h(("codes past either table" + sfx).c_str(), "rvq_embed", 0.0);
+            h.raw(RAD_I32, { 3, 4 }, kCodes)
+             .dense(RAD_BF16, { 12, 9 }, hfill(284))
+             .dense(RAD_BF16, { 20, 9 }, hfill(285))
+             .dense(dt, { 4, 9 }, hfill(286), true)
+             .pi("M", 4).pi("n_embd", 9).pi("n_codes", 3).pi("vocab", 10).pi("off0", 2)
+             .pf("scale", 0.75).ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        for (int round : { 1, 0 }) {
+            /* A trained projection's scale: angles to about 25 radians. */
+            Hand h(("trained frequencies, round " + std::to_string(round) + sfx).c_str(),
+                   "fourier_embed", 0.0);
+            h.dense(RAD_F32, { 5 }, [](int64_t i) { return i == 4 ? 1.0f : 0.23f * (float)i; })
+             .dense(RAD_F32, { 32 }, hfill(287, 4.0f))
+             .dense(dt, { 5, 64 }, zero, true)
+             .pi("M", 5).pi("n", 64).pi("round", round).ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        {
+            Hand h(("ten rows down to four" + sfx).c_str(), "resample_nearest", 0.0);
+            h.dense(dt, { 10, 7 }, hfill(288))
+             .dense(dt, { 4, 7 }, zero, true)
+             .pi("M", 4).pi("n", 7).ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        {
+            Hand h(("three groups of input rows at a wider pitch" + sfx).c_str(), "chan_split",
+                   0.0);
+            h.view(dt, { 5, 21 }, { 25, 1 }, 125, hfill(289))
+             .dense(dt, { 15, 7 }, zero, true)
+             .pi("M", 5).pi("n", 7).pi("parts", 3).ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        for (int lg : { 0, 1 }) {
+            /* SnakeBeta over x in [-8, 8]: alpha and beta as a codec stores them (logarithms in
+             * [-1, 1], `log` 1) or as positive values. */
+            const int64_t n = 37;
+            const std::function<float(int64_t)> al =
+                lg ? hfill(291) : std::function<float(int64_t)>([](int64_t c) {
+                    return 0.3f + 0.05f * (float)c;
+                });
+            const std::function<float(int64_t)> be =
+                lg ? hfill(292) : std::function<float(int64_t)>([](int64_t c) {
+                    return 0.2f + 0.03f * (float)c;
+                });
+            Hand h(("SnakeBeta, alpha and beta as " + std::string(lg ? "logarithms" : "values") +
+                    sfx).c_str(), "snake", norm_tol);
+            h.dense(dt, { 4, n }, hfill(293, 8.0f))
+             .dense(RAD_F32, { n }, al)
+             .dense(dt, { 4, n }, zero, true)
+             .dense(RAD_F32, { n }, be)
+             .pi("M", 4).pi("n", n).pi("log", lg).ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        {
+            /* Two segments from row 1, with a bias; row 0 keeps its bytes. */
+            const int64_t C = 21;
+            Hand h(("two segments from row 1, with a bias" + sfx).c_str(), "conv1d_dw", norm_tol);
+            h.dense(dt, { 12, C }, hfill(294))
+             .dense(dt, { C, 1, 5 }, hfill(295, 0.4f))
+             .idx({ 1, 6, 12 })
+             .dense(dt, { 12, C }, zero, true)
+             .dense(dt, { C }, hfill(296, 0.5f))
+             .pi("M", 12).pi("n", C).pi("k", 5).ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        for (int dil : { 1, 3 }) {
+            /* Causal with an even kernel (a codec's), two sequences, a bias. */
+            const int64_t cin = 20, cout = 13;
+            Hand h(("causal, k 4, dilation " + std::to_string(dil) + sfx).c_str(), "conv1d",
+                   norm_tol);
+            h.dense(dt, { 16, cin }, hfill(296 + dil))
+             .dense(dt, { cout, cin, 4 }, hfill(300, 0.3f))
+             .idx({ 0, 7, 16 })
+             .none()
+             .dense(dt, { 16, cout }, zero, true)
+             .dense(dt, { cout }, hfill(301, 0.5f))
+             .pi("M", 16).pi("cin", cin).pi("cout", cout).pi("k", 4).pi("dil", dil)
+             .pi("causal", 1).ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        for (const int64_t s : { 5, 3 }) {
+            /* A codec's odd strides at kernel 2 stride, causal, over sequences of 3, 1 and 5 rows
+             * from row 1. */
+            const int64_t cin = 12, cout = 7;
+            Hand h(("odd stride " + std::to_string(s) + ", causal" + sfx).c_str(), "conv_t1d",
+                   norm_tol);
+            h.dense(dt, { 10, cin }, hfill(314 + s))
+             .dense(dt, { cin, cout, 2 * s }, hfill(320, 0.3f))
+             .dense(dt, { cout }, hfill(321, 0.5f))
+             .idx({ 1, 4, 5, 10 })
+             .dense(dt, { 10 * s, cout }, hfill(322), true)
+             .pi("M", 10).pi("cin", cin).pi("cout", cout).pi("stride", s).pi("pad", 0)
+             .ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        for (const int64_t s : { 5, 2 }) {
+            /* BigVGAN's upsamplers (kernel 9 at stride 5, pad 2; kernel 12 at stride 2, its
+             * default pad 5 past a stride) over sequences of 3, 1 and 5 rows from row 1. */
+            const int64_t cin = 12, cout = 7, K = s == 5 ? 9 : 12;
+            Hand h(("kernel " + std::to_string(K) + " at stride " + std::to_string(s) +
+                    ", three uneven sequences" + sfx).c_str(), "conv_t1d", norm_tol);
+            h.dense(dt, { 10, cin }, hfill(330 + s))
+             .dense(dt, { cin, cout, K }, hfill(336, 0.3f))
+             .dense(dt, { cout }, hfill(337, 0.5f))
+             .idx({ 1, 4, 5, 10 })
+             .dense(dt, { 10 * s, cout }, hfill(338), true)
+             .pi("M", 10).pi("cin", cin).pi("cout", cout).pi("stride", s).pi("k", K)
+             .ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        for (const int64_t k : { 12, 7 }) {
+            /* The alias-free SnakeBeta over sequences of 5, 1 and 9 rows from row 1 (row 0 and
+             * rows past 16 keep their bytes), at a trained scale: alpha and beta logarithms,
+             * x in [-4, 4], a smooth low-pass pair of filters. */
+            const int64_t n = 21;
+            const auto lowpass = [k](int64_t j) {
+                const float t = ((float)j + 0.5f) / (float)k - 0.5f;
+                return (1.0f - 4.0f * t * t) / (float)k * 1.5f;
+            };
+            Hand h(("three uneven sequences, filters of " + std::to_string(k) + sfx).c_str(),
+                   "snake_aa", norm_tol);
+            h.dense(dt, { 18, n }, hfill(340, 4.0f))
+             .dense(RAD_F32, { n }, hfill(341, 0.8f))
+             .dense(RAD_F32, { n }, hfill(342, 0.8f))
+             .dense(RAD_F32, { 1, 1, k }, lowpass)
+             .dense(RAD_F32, { 1, 1, k }, lowpass)
+             .idx({ 1, 6, 7, 16 })
+             .dense(dt, { 18, n }, hfill(343), true)
+             .pi("M", 18).pi("n", n).pi("ratio", 2).pi("k", k).pi("log", 1).ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        {
+            /* A kernel of one stride at an odd stride: each output row reads one input row. */
+            const int64_t cin = 12, cout = 7, s = 3;
+            Hand h(("kernel 3 at stride 3" + sfx).c_str(), "conv_t1d", norm_tol);
+            h.dense(dt, { 10, cin }, hfill(323))
+             .dense(dt, { cin, cout, s }, hfill(324, 0.3f))
+             .dense(dt, { cout }, hfill(325, 0.5f))
+             .idx({ 1, 4, 5, 10 })
+             .dense(dt, { 10 * s, cout }, hfill(326), true)
+             .pi("M", 10).pi("cin", cin).pi("cout", cout).pi("stride", s).pi("k", s)
+             .ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        {
+            /* The causal transposed form over sequences of 3, 1 and 5 rows from row 1. */
+            const int64_t cin = 12, cout = 7, s = 4;
+            Hand h(("the causal form over three uneven sequences" + sfx).c_str(), "conv_t1d",
+                   norm_tol);
+            h.dense(dt, { 10, cin }, hfill(302))
+             .dense(dt, { cin, cout, 2 * s }, hfill(303, 0.3f))
+             .dense(dt, { cout }, hfill(304, 0.5f))
+             .idx({ 1, 4, 5, 10 })
+             .dense(dt, { 10 * s, cout }, hfill(305), true)
+             .pi("M", 10).pi("cin", cin).pi("cout", cout).pi("stride", s).pi("pad", 0)
+             .ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+        {
+            /* One rounding of the whole sum, with codes past either table (row 1's first code
+             * leaves its row unwritten, row 2's second adds nothing). Code-major [3, 4]. */
+            static const int32_t kCodes1[12] = { 3, 10, 0, -2,   4, 1, -15, 7,   9, 2, 5, 0 };
+            Hand h(("one rounding, codes past either table" + sfx).c_str(), "rvq_embed", 0.0);
+            h.raw(RAD_I32, { 3, 4 }, kCodes1)
+             .dense(RAD_BF16, { 12, 9 }, hfill(306))
+             .dense(RAD_BF16, { 20, 9 }, hfill(307))
+             .dense(dt, { 4, 9 }, hfill(308), true)
+             .pi("M", 4).pi("n_embd", 9).pi("n_codes", 3).pi("vocab", 10).pi("off0", 2)
+             .pf("scale", 0.75).pi("round", 1).ps("dtype", dn);
+            hs.push_back(std::move(h));
+
+            /* The codes as a block of a wider plane (a lane's history over a run of frames): rows
+             * at pitch 11, read at the operand's strides. */
+            Hand g(("one rounding, codes a block of a wider plane" + sfx).c_str(), "rvq_embed",
+                   0.0);
+            g.view(RAD_I32, { 3, 5 }, { 11, 1 }, 33, [](int64_t i) { return (float)(i % 9); })
+             .dense(RAD_BF16, { 12, 9 }, hfill(309))
+             .dense(RAD_BF16, { 20, 9 }, hfill(310))
+             .dense(dt, { 5, 9 }, zero, true)
+             .pi("M", 5).pi("n_embd", 9).pi("n_codes", 3).pi("vocab", 10).pi("off0", 2)
+             .pf("scale", 1.0).pi("round", 1).ps("dtype", dn);
+            hs.push_back(std::move(g));
+        }
+    }
+    {
+        /* Logits on a grid of 0.05 over [-1, 1]: ties throughout, at the k-th place and at the
+         * conditional's cond_k-th. Three lanes, two branches each. */
+        static const uint32_t kSeeds[6] = { 5u, 0u, 0xdeadbeefu, 7u, 1u, 1u };
+        const auto grid = [](int64_t i) { return std::round(hfill(290)(i) * 20.0f) / 20.0f; };
+        Hand h("ties at the cut and in the guided order", "cfg_topk_sample", 0.0);
+        h.dense(RAD_F32, { 6, 40 }, grid)
+         .raw(RAD_U32, { 6 }, kSeeds)
+         .idx({ 0, 17, 123456 })
+         .dense(RAD_I32, { 6 }, zero, true)
+         .pi("M", 6).pi("n_vocab", 40).pi("k", 12).pi("rep", 2).pi("cond_k", 9).pf("cfg", 1.5)
+         .pi("stream", 2).ps("dtype", "f32");
+        hs.push_back(std::move(h));
+
+        Hand g("one branch, every entry a candidate, a temperature", "cfg_topk_sample", 0.0);
+        g.dense(RAD_F32, { 3, 40 }, grid)
+         .raw(RAD_U32, { 6 }, kSeeds)
+         .idx({ 4, 4, 9 })
+         .dense(RAD_I32, { 3 }, zero, true)
+         .pi("M", 3).pi("n_vocab", 40).pi("k", 40).pi("rep", 1).pf("cfg", 1.0).pf("temp", 0.6)
+         .pi("stream", 0).ps("dtype", "f32");
+        hs.push_back(std::move(g));
+    }
+    {
+        /* A speech model's frame: three lanes with their own guidance, each lane's history of
+         * earlier picks penalised (lane 2 at frame 0, its row cleared first), reserved ids
+         * suppressed; the picks recorded in the history. */
+        static const uint32_t kSeeds[6] = { 5u, 0u, 0xdeadbeefu, 7u, 1u, 1u };
+        Hand h("guidance a lane, a history, reserved ids", "cfg_topk_sample", 0.0);
+        h.dense(RAD_F32, { 6, 40 }, hfill(311, 3.0f))
+         .raw(RAD_U32, { 6 }, kSeeds)
+         .idx({ 4, 0, 9 })
+         .dense(RAD_I32, { 6 }, zero, true)
+         .dense(RAD_F32, { 3 }, [](int64_t i) { return 1.0f + 1.5f * (float)i; })
+         .idx({ 1, 2, 3 })
+         .dense(RAD_I32, { 4, 40 }, [](int64_t i) { return (float)((i * 7) % 3 == 0); }, true)
+         .pi("M", 6).pi("n_vocab", 40).pi("k", 12).pi("rep", 2).pf("cfg", 1.0).pf("temp", 0.9)
+         .pi("stream", 0).pi("sup_lo", 36).pi("sup_hi", 39).pf("penalty", 1.1)
+         .ps("dtype", "f32");
+        hs.push_back(std::move(h));
+
+        /* One lane twice, in order: logits 4 - 0.5 j at temperature 0.01, so each entry takes its
+         * best candidate; the first takes id 0, which the second sees penalised (4 / 1.5 falls
+         * below id 1's 3.5). */
+        static const uint32_t kSeeds2[4] = { 9u, 0u, 9u, 0u };
+        Hand g("one lane twice: the second entry sees the first's pick", "cfg_topk_sample", 0.0);
+        g.dense(RAD_F32, { 2, 40 }, [](int64_t i) { return 4.0f - 0.5f * (float)(i % 40); })
+         .raw(RAD_U32, { 4 }, kSeeds2)
+         .idx({ 3, 4 })
+         .dense(RAD_I32, { 2 }, zero, true)
+         .none()
+         .idx({ 1, 1 })
+         .dense(RAD_I32, { 2, 40 }, zero, true)
+         .pi("M", 2).pi("n_vocab", 40).pi("k", 3).pi("rep", 1).pf("cfg", 1.0).pf("temp", 0.01)
+         .pi("stream", 0).pf("penalty", 1.5).ps("dtype", "f32")
+         .expect(3, { 0, 1 });
+        hs.push_back(std::move(g));
+
+        /* Refusals before anything is written: a lane past the history, every id suppressed, and
+         * the conditional's best ids all suppressed. */
+        Hand r1("a lane past the history", "cfg_topk_sample", 0.0);
+        r1.dense(RAD_F32, { 2, 40 }, hfill(312))
+          .raw(RAD_U32, { 2 }, kSeeds)
+          .idx({ 0 })
+          .dense(RAD_I32, { 2 }, zero, true)
+          .none()
+          .idx({ 5 })
+          .dense(RAD_I32, { 4, 40 }, zero, true)
+          .pi("M", 2).pi("n_vocab", 40).pi("k", 5).pi("rep", 2).pf("cfg", 2.0)
+          .pi("stream", 0).pf("penalty", 1.1).ps("dtype", "f32")
+          .refuses(RAD_E_SHAPE);
+        hs.push_back(std::move(r1));
+        Hand r2("every id suppressed", "cfg_topk_sample", 0.0);
+        r2.dense(RAD_F32, { 1, 40 }, hfill(313))
+          .raw(RAD_U32, { 2 }, kSeeds)
+          .idx({ 2 })
+          .dense(RAD_I32, { 1 }, zero, true)
+          .pi("M", 1).pi("n_vocab", 40).pi("k", 5).pi("rep", 1).pf("cfg", 1.0)
+          .pi("stream", 0).pi("sup_lo", 0).pi("sup_hi", 40).ps("dtype", "f32")
+          .refuses(RAD_E_SHAPE);
+        hs.push_back(std::move(r2));
+        Hand r3("the conditional's best ids all suppressed", "cfg_topk_sample", 0.0);
+        r3.dense(RAD_F32, { 2, 40 }, [](int64_t i) {
+              const int64_t j = i % 40;
+              return j >= 10 && j < 15 ? 5.0f : -0.01f * (float)j;
+          })
+          .raw(RAD_U32, { 2 }, kSeeds)
+          .idx({ 2 })
+          .dense(RAD_I32, { 2 }, zero, true)
+          .pi("M", 2).pi("n_vocab", 40).pi("k", 5).pi("rep", 2).pi("cond_k", 5).pf("cfg", 1.5)
+          .pi("stream", 0).pi("sup_lo", 10).pi("sup_hi", 20).ps("dtype", "f32")
+          .refuses(RAD_E_SHAPE);
+        hs.push_back(std::move(r3));
+    }
+    {
+        /* Four entries, codes a block of a wider plane (pitch 11, each lane's two branch columns):
+         * entry 0 at frame 0 under skip 1 (moves past the prompt), entry 3 on an ended lane,
+         * entries 1 and 2 stored. */
+        Hand h("frame 0 under skip, an ended lane, codes a block", "frame_store", 0.0);
+        h.view(RAD_I32, { 3, 8 }, { 11, 1 }, 33, [](int64_t i) { return (float)(100 + i); })
+         .idx({ 2, 0, 3, 1 })
+         .idx({ 0, 3, 2, 5 })
+         .idx({ 1, -1, 4, 2 })
+         .dense(RAD_I32, { 12, 6 }, [](int64_t) { return -7.0f; }, true)
+         .pi("M", 4).pi("n_codes", 3).pi("stride", 6).pi("rep", 2).pi("skip", 1);
+        hs.push_back(std::move(h));
+
+        /* Refusals before anything is written: a frame past its lane's row, a lane past the
+         * status. */
+        Hand r1("a frame past its lane's row", "frame_store", 0.0);
+        r1.idx({ 1, 2, 3, 4, 5, 6 })
+          .idx({ 0, 1 })
+          .idx({ 7, 2 })
+          .idx({ 0, 0 })
+          .dense(RAD_I32, { 6, 6 }, [](int64_t) { return -7.0f; }, true)
+          .pi("M", 2).pi("n_codes", 3).pi("stride", 6).pi("rep", 1).pi("skip", 1)
+          .refuses(RAD_E_SHAPE);
+        hs.push_back(std::move(r1));
+        Hand r2("a lane past the status", "frame_store", 0.0);
+        r2.idx({ 1, 2, 3 })
+          .idx({ 4 })
+          .idx({ 2 })
+          .idx({ 0, 0, 0, 0 })
+          .dense(RAD_I32, { 12, 6 }, [](int64_t) { return -7.0f; }, true)
+          .pi("M", 1).pi("n_codes", 3).pi("stride", 6).pi("rep", 1).pi("skip", 0)
+          .refuses(RAD_E_SHAPE);
+        hs.push_back(std::move(r2));
+    }
+    {
+        /* Lane 2 ends (its pick is `end`), lanes 0 and 1 continue, lane 3 is not in the frame. */
+        Hand h("an ending lane among continuing ones", "end_status", 0.0);
+        h.idx({ 5, 5, 3, 3, 5, 5 })
+         .idx({ 2, 0, 1 })
+         .idx({ 7, 7, 7, 7 }, true)
+         .pi("M", 3).pi("end", 5).pi("rep", 2)
+         .expect(2, { 3, -1, -1, 7 });
+        hs.push_back(std::move(h));
+    }
+}
+
 }  // namespace
 
 bool hand_cases(const Check& ck) {
@@ -3022,8 +3891,11 @@ bool hand_cases(const Check& ck) {
     anchor_cases(hs);
     packed_cases(hs);
     gen_cases(hs);
+    video_cases(hs);
+    vsa_cases(hs);
     qsa_cases(hs);
     encoder_cases(hs);
+    audio_cases(hs);
     Broken broken;
     planes_cases(ck, hs, broken);
 

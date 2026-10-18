@@ -65,9 +65,11 @@
 
 /* rad_param_find / rad_param_getdim / rad_param_gets / rad_dtype_parse. */
 #include "rad_plugin.h"
+#include "rad_runtime.h"   /* RAD_VGEOM_N */
 #include "rad_sample.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <cstdlib>
 #include <initializer_list>
@@ -531,6 +533,7 @@ int ref_conv1d_dw_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out
     o.t(D, { C, 1, K });                                      /* w */
     o.t_idx({ 2 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu_seqlens */
     o.t(D, { M / cdiv, C });                                  /* y */
+    o.skip();                                                 /* b */
     return o.finish("conv1d_dw", operand, out);
 }
 
@@ -809,6 +812,16 @@ int ref_quant_act_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     return o.finish("quant_act_fp8", operand, out);
 }
 
+int ref_quant_cols_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    Opd o;
+    o.t(D, { M, n });                       /* x */
+    o.t((uint32_t)RAD_F8E4M3, { M, n });    /* y */
+    o.t((uint32_t)RAD_F32, { n });          /* scale, one a column (amax / 448) */
+    return o.finish("quant_cols_fp8", operand, out);
+}
+
 /* `n` is K on both axes of the accumulator: h is [n, n], not [M, n]. */
 int ref_gram_accum_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
@@ -1009,14 +1022,13 @@ int ref_gemm_nt_q_bias_shape(const RadParam* p, int n_p, int operand, RadOpdDesc
     return gemm_q_shape(p, n_p, operand, true, out);
 }
 
-/* RUNTIME LoRA. `slot` is drawn in [0, S] -- S ITSELF IS A BASE ROW, one past the pool -- so a cold
- * draw exercises the rows neither op may touch as well as the adapter rows; a draw never yields
- * -1, which is the other spelling of a base row, so that one is a hand case (tests/lora_test.cpp,
- * ref_test). A single row is drawn in [0, S): a one-row call whose row drew S would write nothing,
- * and a comparison of nothing proves nothing (rad-avx-check refuses it as vacuous). The scale stream exists only beside a coded activation: a bf16, f16 or f32 `a` is
- * read as it stands, the way gemm_nt_q's fp8a16 form reads it, and an fp8 or i8 one without its
- * scale is refused by the launch. `group` defaults to the 128 every block-scaled checkpoint and
- * quantiser in this project uses when the geometry does not state one. */
+/* Runtime LoRA. `slot` is drawn in [0, S], S itself being a base row one past the pool, so a cold
+ * draw covers the rows neither op may touch as well as the adapter rows. A draw never yields -1,
+ * the other spelling of a base row, which is a hand case (tests/lora_ops_test.cpp, ref_test). A
+ * single row is drawn in [0, S): a one-row call whose row drew S would write nothing, which
+ * rad-avx-check refuses as vacuous. The scale stream exists only beside a coded activation; a float
+ * `a` is read as it stands, as gemm_nt_q's fp8a16 form reads it. `group` defaults to 128, the
+ * block every block-scaled checkpoint and quantiser here uses, when the geometry states none. */
 int ref_lora_shrink_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), K = gi(p, n_p, "K", 0);
@@ -1187,9 +1199,14 @@ int ref_qk_norm_rope_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* 
      * interleaved q/gate view that parameters cannot describe; opshapes.h declines it.) */
     o.t(D, { M, (nh + 2 * nkv) * hd });              /* qkv, INOUT */
     /* `blocks` takes positions [C, M], component-major, C one past the largest `comps` entry (the
-     * section count without `comps`). */
+     * section count without `comps`); `axial` one component a section. Without a rotation
+     * (`rotary_dim` 0) the positions are not passed. */
     const char* mode = gs(p, n_p, "mode");
-    if (mode && !std::strcmp(mode, "blocks")) {
+    const bool blocks = mode && !std::strcmp(mode, "blocks");
+    const bool axial = mode && !std::strcmp(mode, "axial");
+    if (gi(p, n_p, "rotary_dim", hd) == 0) {
+        o.skip();                                    /* positions */
+    } else if (blocks || axial) {
         int64_t nc = 0;
         for (const char* q = gs(p, n_p, "sections"); q && *q; ) {
             char* e = nullptr;
@@ -1198,7 +1215,7 @@ int ref_qk_norm_rope_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* 
             ++nc;
             q = e;
         }
-        if (const char* cs = gs(p, n_p, "comps")) {
+        if (const char* cs = blocks ? gs(p, n_p, "comps") : nullptr) {
             int64_t mx = -1;
             for (const char* q = cs; *q; ) {
                 char* e = nullptr;
@@ -2172,6 +2189,58 @@ int ref_ln_mod_quant_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdDe
     o.t(D, { M, n });                                         /* z */
     return o.finish("ln_mod_quant_fp8", operand, out);
 }
+/* rms_mod's branch and gate are passed when `gated`, and absent otherwise. */
+int ref_rms_mod_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    if (gi(p, n_p, "gated", 0)) {
+        o.t(D, { M, n });                                     /* y */
+        o.t(D, { 1, n });                                     /* g: one sequence */
+    } else {
+        o.skip();
+        o.skip();
+    }
+    o.t(D, { 1, 2 * n });                                     /* s: [shift | scale] */
+    o.t(D, { n });                                            /* w */
+    o.t_idx({ 2 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu_seqlens */
+    o.t(D, { M, n });                                         /* x, INOUT */
+    o.t(D, { M, n });                                         /* z */
+    return o.finish("rms_mod", operand, out);
+}
+int ref_rms_mod_quant_fp8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t ng = scale_groups(n, gi(p, n_p, "group", 0));
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    if (gi(p, n_p, "gated", 0)) {
+        o.t(D, { M, n });                                     /* y */
+        o.t(D, { 1, n });                                     /* g */
+    } else {
+        o.skip();
+        o.skip();
+    }
+    o.t(D, { 1, 2 * n });                                     /* s */
+    o.t(D, { n });                                            /* w */
+    o.t_idx({ 2 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);        /* cu_seqlens */
+    o.t(D, { M, n });                                         /* x, INOUT */
+    o.t((uint32_t)RAD_F8E4M3, { M, n });                      /* q */
+    o.t((uint32_t)RAD_F32, { M, ng });                        /* scale */
+    o.t(D, { M, n });                                         /* z */
+    return o.finish("rms_mod_quant_fp8", operand, out);
+}
+/* The sampler's three scalars in (0, 1), the state f32. */
+int ref_flow_x0_step_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const uint32_t F = (uint32_t)RAD_F32;
+    Opd o;
+    o.t(act_dt(p, n_p), { M, n });                            /* v */
+    o.t_fill(F, { 1 }, (uint32_t)RAD_FILL_SIGMOID, 0);        /* t */
+    o.t_fill(F, { 1 }, (uint32_t)RAD_FILL_SIGMOID, 0);        /* sigma */
+    o.t_fill(F, { 1 }, (uint32_t)RAD_FILL_SIGMOID, 0);        /* sigma_next */
+    o.t(F, { M, n });                                         /* x, INOUT */
+    return o.finish("flow_x0_step", operand, out);
+}
 int ref_gate_add_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
     const uint32_t D = act_dt(p, n_p);
@@ -2345,13 +2414,24 @@ int ref_attn_prefix_self_shape(const RadParam* p, int n_p, int operand, RadOpdDe
     const uint32_t Q  = act_dt(p, n_p);
     const uint32_t kv = dt_parse(gs(p, n_p, "kv_dtype"));
     const uint32_t KV = kv == (uint32_t)RAD_DT_INVALID ? Q : kv;
+    /* `max_ctx` 0 declares the prefix-free form: no cache, block table or prefix lengths. */
+    const bool pre = gi(p, n_p, "max_ctx", -1) != 0;
+    const char* pv = gs(p, n_p, "pv");
+    const bool pv8 = pv && !std::strcmp(pv, "fp8");
+    if (pv8 && pre) return RAD_E_UNSUPPORTED;
     Opd o;
     o.t(Q,  { M, nh, hd });                                   /* q */
     o.t(Q,  { M, kvh, hd });                                  /* k */
-    o.t(Q,  { M, kvh, hd });                                  /* v */
-    o.t(KV, { S * max_blocks, kvh, bs, 2 * hd });             /* kv_cache */
-    o.t_idx({ S, max_blocks }, S * max_blocks, -1, 0);        /* block_table: may repeat */
-    o.t_idx({ S }, 0, P, 0);                                  /* seqused: the prefix depth */
+    o.t(pv8 ? (uint32_t)RAD_F8E4M3 : Q, { M, kvh, hd });      /* v */
+    if (pre) {
+        o.t(KV, { S * max_blocks, kvh, bs, 2 * hd });         /* kv_cache */
+        o.t_idx({ S, max_blocks }, S * max_blocks, -1, 0);    /* block_table: may repeat */
+        o.t_idx({ S }, 0, P, 0);                              /* seqused: the prefix depth */
+    } else {
+        o.skip();
+        o.skip();
+        o.skip();
+    }
     o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);    /* cu_seqlens */
     o.skip();                                                 /* k_descale */
     o.skip();                                                 /* v_descale */
@@ -2364,6 +2444,8 @@ int ref_attn_prefix_self_shape(const RadParam* p, int n_p, int operand, RadOpdDe
         o.skip();
     }
     o.t(Q,  { M, nh, hd });                                   /* out */
+    if (pv8) o.t((uint32_t)RAD_F32, { kvh * hd });            /* v_scale: one a column */
+    else     o.skip();
     return o.finish("attn_prefix_self", operand, out);
 }
 
@@ -2407,4 +2489,433 @@ int ref_scatter_add_rows_shape(const RadParam* p, int n_p, int operand, RadOpdDe
     o.t_idx({ M }, 4 * M, -1, RAD_OPD_F_IDX_UNIQUE);       /* idx, distinct destinations */
     o.t(D, { 4 * M, n });                                  /* x, inout */
     return o.finish("scatter_add_rows", operand, out);
+}
+
+/* ================================================================== video generation
+ *
+ * The request's geometry is a device operand, and a description can only draw an index operand
+ * as one value throughout, so every axis of `geom` is one extent c: a c x c x c grid (and, for
+ * vtile_stitch, a chunk that is its video's first and last). The ranged M is the output's rows;
+ * an M below what the grid writes declines, and rows past it are left as drawn. */
+
+/* The tiles split_tiles (ref_video.cpp) lays over `len` latent units, 0 where none fit. */
+static int64_t tile_count(int64_t len, int64_t tile, int64_t overlap) {
+    if (len <= 0 || tile <= 0 || overlap < 0 || overlap >= tile) return 0;
+    if (tile >= len) return len == tile ? 1 : 0;
+    int64_t nt = (len + tile - 1) / tile;
+    while (tile * nt - overlap * (nt - 1) - len < 0) ++nt;
+    return nt;
+}
+
+/* A 2 x 2 x 2 grid of patches. */
+int ref_patch_unfold_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), C = gi(p, n_p, "C", 0);
+    const int64_t pt = gi(p, n_p, "pt", 0), ph = gi(p, n_p, "ph", 0), pw = gi(p, n_p, "pw", 0);
+    const int64_t c = 2, vol = pt * ph * pw;
+    if (C <= 0 || pt <= 0 || ph <= 0 || pw <= 0 || M < c * c * c * vol) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { c * c * c, C * vol });                           /* x: patch rows */
+    o.t_idx({ 3 }, 0, c, 0);                                  /* geom: (F, Hp, Wp) */
+    o.t(D, { M, C });                                         /* y: voxel rows */
+    return o.finish("patch_unfold", operand, out);
+}
+
+/* A latent of `frames` frames, as tall and as wide as it is long. */
+int ref_vtile_gather_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), tile = gi(p, n_p, "tile", 0);
+    const int64_t ov = gi(p, n_p, "overlap", 0), c = gi(p, n_p, "frames", 0);
+    const int64_t period = gi(p, n_p, "period", 0), n_reg = gi(p, n_p, "n_reg", 0);
+    const int64_t nt = tile_count(c, tile, ov);
+    if (n <= 0 || nt <= 0 || n_reg < 0 || period < c * tile * tile + n_reg ||
+        M < nt * nt * period)
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { c * c * c, n });                                 /* x: voxel rows */
+    o.t(D, { n_reg > 0 ? n_reg : 1, n });                     /* reg */
+    o.t_idx({ 3 }, 0, c, 0);                                  /* geom: (frames, H, W) */
+    o.t(D, { M, n });                                         /* y */
+    return o.finish("vtile_gather", operand, out);
+}
+
+/* The smallest grid the chunk's frames and the tile fit. */
+int ref_vtile_stitch_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), tile = gi(p, n_p, "tile", 0);
+    const int64_t ov = gi(p, n_p, "overlap", 0), S = gi(p, n_p, "scale", 0);
+    const int64_t pt = gi(p, n_p, "pt", 0), skip = gi(p, n_p, "skip", 0);
+    const int64_t keep = gi(p, n_p, "keep", 0), blend = gi(p, n_p, "blend", 0);
+    const int64_t period = gi(p, n_p, "period", 0);
+    if (tile <= 0 || S <= 0 || pt <= 0 || skip < 0 || keep <= 0 || blend < 0 || blend > keep)
+        return RAD_E_UNSUPPORTED;
+    const int64_t c = std::max(tile, (2 * skip + keep + blend + pt - 1) / pt);
+    const int64_t nt = tile_count(c, tile, ov), npx = c * S * c * S;
+    if (nt <= 0 || period < c * tile * tile || M < (keep + blend) * npx) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { nt * nt * period, 3 * pt * S * S });            /* x: the decoded tiles */
+    o.t_idx({ 5 }, 0, c, 0);                                  /* geom: first and last set */
+    o.t(D, { blend > 0 ? blend * npx : 1, 3 });               /* prev, INOUT */
+    o.t((uint32_t)RAD_U8, { M, 3 });                          /* y */
+    return o.finish("vtile_stitch", operand, out);
+}
+
+int ref_grid_pos3_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0);
+    if (M <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t((uint32_t)RAD_F32, { 3, M });                         /* y: one row a component */
+    return o.finish("grid_pos3", operand, out);
+}
+
+/* ================================================================== video sparse attention
+ *
+ * The tiles come from the values of `segs` and `geom`, which a description draws only as
+ * cumulative lengths and as one value c in every entry. So the grid is a cube of c frames and
+ * c / patch rows and columns, c the smallest that gives every axis an edge box (more than one box,
+ * the last short), and `segs` cuts M into M / (F Hp Wp) segments of the grid's rows each, the last
+ * the video; an M not a multiple of the grid declines. `n_head` (default 2) and `dtype` (default
+ * bf16) are the description's, as is `coarse`: 0 leaves the optional operands out.
+ *
+ * attn_vsa's `sel` is drawn as one value, the first video tile, which is a selection only at
+ * k = 1; any other sparsity declines (the hand-built cases build selections,
+ * libavx/avx_check_hand.cpp). */
+namespace {
+
+struct VsaGeo {
+    int64_t M, hd, nh, c, n_seg, P, V, N, k;
+    uint32_t D;
+    bool coarse;
+};
+
+/* An axis of `len` units over boxes of `t` has more than one box, the last short; a box of one
+ * unit needs only a second unit. */
+bool vsa_edge(int64_t len, int64_t t) { return t > 1 ? len > t && len % t != 0 : len > 1; }
+
+int vsa_geo(const RadParam* p, int n_p, VsaGeo* g) {
+    g->M = gi(p, n_p, "M", 0);
+    g->hd = gi(p, n_p, "head_dim", 0);
+    g->nh = gi(p, n_p, "n_head", 2);
+    const int64_t tt = gi(p, n_p, "tile_t", 0), th = gi(p, n_p, "tile_h", 0);
+    const int64_t tw = gi(p, n_p, "tile_w", 0), patch = gi(p, n_p, "patch", 0);
+    const double sparsity = rad_param_getf(p, n_p, "sparsity", -1.0);
+    if (g->M <= 0 || g->hd <= 0 || g->nh <= 0 || tt <= 0 || th <= 0 || tw <= 0 || patch <= 0 ||
+        !(sparsity >= 0.0 && sparsity < 1.0))
+        return RAD_E_UNSUPPORTED;
+    int64_t c = 1;
+    while (c <= 4096 && !(vsa_edge(c, tt) && vsa_edge(c / patch, th) && vsa_edge(c / patch, tw)))
+        ++c;
+    const int64_t hp = c / patch, rows = c * hp * hp, TT = tt * th * tw;
+    if (c > 4096 || g->M % rows != 0) return RAD_E_UNSUPPORTED;
+    g->c = c;
+    g->n_seg = g->M / rows;
+    g->P = (g->n_seg - 1) * ((rows + TT - 1) / TT);
+    g->V = ((c + tt - 1) / tt) * ((hp + th - 1) / th) * ((hp + tw - 1) / tw);
+    g->N = g->P + g->V;
+    const double keep = (1.0 - sparsity) * (double)g->V;
+    g->k = std::max<int64_t>(1, std::min<int64_t>((int64_t)std::ceil(keep), g->V));
+    g->D = act_dt(p, n_p);
+    g->coarse = gi(p, n_p, "coarse", 1) != 0;
+    return RAD_OK;
+}
+
+}  /* namespace */
+
+int ref_vsa_select_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    VsaGeo g{};
+    if (vsa_geo(p, n_p, &g) != RAD_OK) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(g.D, { g.M, g.nh, g.hd });                                 /* q */
+    o.t(g.D, { g.M, g.nh, g.hd });                                 /* k */
+    if (g.coarse) o.t(g.D, { g.M, g.nh, g.hd }); else o.skip();    /* v */
+    o.t_idx({ g.n_seg + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);   /* segs */
+    o.t_idx({ RAD_VGEOM_N }, 0, g.c, 0);                           /* geom: c everywhere */
+    /* A tile row and a slot past the selection's, which nothing writes. */
+    o.t((uint32_t)RAD_I32, { g.nh, g.N + 1, g.k + 1 });            /* sel */
+    if (g.coarse) o.t(g.D, { g.nh, g.N + 1, g.hd }); else o.skip();   /* coarse */
+    return o.finish("vsa_select", operand, out);
+}
+
+int ref_attn_vsa_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    VsaGeo g{};
+    if (vsa_geo(p, n_p, &g) != RAD_OK || g.k != 1) return RAD_E_UNSUPPORTED;
+    const char* pv = gs(p, n_p, "pv");
+    const bool pv8 = pv && !std::strcmp(pv, "fp8");
+    Opd o;
+    o.t(g.D, { g.M, g.nh, g.hd });                                 /* q */
+    o.t(g.D, { g.M, g.nh, g.hd });                                 /* k */
+    o.t(pv8 ? (uint32_t)RAD_F8E4M3 : g.D, { g.M, g.nh, g.hd });    /* v */
+    o.t_idx({ g.n_seg + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);   /* segs */
+    o.t_idx({ RAD_VGEOM_N }, 0, g.c, 0);                           /* geom: c everywhere */
+    o.t_idx({ g.nh, g.N, 1 }, g.N, g.P, 0);                        /* sel: the first video tile */
+    if (g.coarse) {
+        o.t(g.D, { g.nh, g.N, g.hd });                             /* coarse */
+        o.t(g.D, { g.M, g.nh, g.hd });                             /* gate */
+    } else {
+        o.skip();
+        o.skip();
+    }
+    o.t(g.D, { g.M, g.nh, g.hd });                                 /* out */
+    const char* qk = gs(p, n_p, "qk");
+    if (qk && !std::strcmp(qk, "i8")) {
+        o.t((uint32_t)RAD_I8, { g.M, g.nh, g.hd });                 /* k_i8 */
+        o.t((uint32_t)RAD_F32, { g.M, g.nh });                      /* k_scale */
+    } else {
+        o.skip();
+        o.skip();
+    }
+    if (pv8) o.t((uint32_t)RAD_F32, { g.nh * g.hd });              /* v_scale: one a column */
+    else     o.skip();
+    return o.finish("attn_vsa", operand, out);
+}
+
+/* ================================================================== audio generation
+ * Sequenced ops (the convolutions) are described over two sequences where M allows; lane ops over
+ * REF_LANES lanes, as the image generator's are. */
+static int64_t two_seqs(int64_t M) { return M >= 4 ? 2 : 1; }
+
+int ref_conv1d_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), cin = gi(p, n_p, "cin", 0), cout = gi(p, n_p, "cout", 0);
+    const int64_t k = gi(p, n_p, "k", 0), causal = gi(p, n_p, "causal", 0);
+    if (M <= 0 || cin <= 0 || cout <= 0 || k <= 0 || (!causal && (k & 1) == 0))
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t S = two_seqs(M);
+    Opd o;
+    o.t(D, { M, cin });                                       /* x */
+    o.t(D, { cout, cin, k });                                 /* w */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);    /* cu_seqlens */
+    o.t(D, { M, cout });                                      /* res */
+    o.t(D, { M, cout });                                      /* y */
+    o.t(D, { cout });                                         /* b */
+    return o.finish("conv1d", operand, out);
+}
+
+int ref_conv_t1d_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), cin = gi(p, n_p, "cin", 0), cout = gi(p, n_p, "cout", 0);
+    const int64_t s = gi(p, n_p, "stride", 0), k = gi(p, n_p, "k", 2 * s);
+    const int64_t pad = gi(p, n_p, "pad", -1);
+    if (M <= 0 || cin <= 0 || cout <= 0 || s <= 0 || k < s || (pad < 0 && ((k - s) & 1)))
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, cin });                                       /* x */
+    o.t(D, { cin, cout, k });                                 /* w */
+    o.t(D, { cout });                                         /* b */
+    o.t_idx({ two_seqs(M) + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);   /* cu_seqlens */
+    o.t(D, { M * s, cout });                                  /* y */
+    return o.finish("conv_t1d", operand, out);
+}
+
+int ref_snake_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, n });                                                     /* x */
+    /* alpha in (0, 1): a trained alpha is positive, and 1 / alpha near zero is no test. */
+    o.t_fill((uint32_t)RAD_F32, { n }, (uint32_t)RAD_FILL_SIGMOID, 0);    /* alpha */
+    o.t(D, { M, n });                                                     /* y */
+    o.skip();                                                             /* beta */
+    return o.finish("snake", operand, out);
+}
+
+int ref_snake_aa_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t R = gi(p, n_p, "ratio", 0), k = gi(p, n_p, "k", 0);
+    if (M <= 0 || n <= 0 || R <= 0 || k < R) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p), F = (uint32_t)RAD_F32;
+    Opd o;
+    o.t(D, { M, n });                                                     /* x */
+    o.t_fill(F, { n }, (uint32_t)RAD_FILL_SIGMOID, 0);                    /* alpha */
+    o.t_fill(F, { n }, (uint32_t)RAD_FILL_SIGMOID, 0);                    /* beta */
+    o.t(F, { 1, 1, k });                                                  /* f_up */
+    o.t(F, { 1, 1, k });                                                  /* f_down */
+    o.t_idx({ two_seqs(M) + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);      /* cu_seqlens */
+    o.t(D, { M, n });                                                     /* y */
+    return o.finish("snake_aa", operand, out);
+}
+
+int ref_cfg_topk_sample_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), V = gi(p, n_p, "n_vocab", 0), rep = gi(p, n_p, "rep", 1);
+    if (M <= 0 || V <= 0 || rep < 1 || M % rep) return RAD_E_UNSUPPORTED;
+    const int64_t n = M / rep;
+    Opd o;
+    o.t((uint32_t)RAD_F32, { M, V });                         /* logits */
+    o.t_idx({ 2 * n }, (int64_t)1 << 30, -1, 0);              /* seed */
+    o.t_idx({ n }, 9000, -1, 0);                              /* frame */
+    o.t_idx({ M }, V, -1, 0);                                 /* ids */
+    o.skip();                                                 /* cfg */
+    o.skip();                                                 /* lane */
+    o.skip();                                                 /* hist */
+    return o.finish("cfg_topk_sample", operand, out);
+}
+
+int ref_rvq_embed_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), D = gi(p, n_p, "n_embd", 0);
+    const int64_t K = gi(p, n_p, "n_codes", 0), voc = gi(p, n_p, "vocab", 0);
+    const int64_t off0 = gi(p, n_p, "off0", 0);
+    if (M <= 0 || D <= 0 || K < 1 || voc <= 0 || off0 < 0) return RAD_E_UNSUPPORTED;
+    const uint32_t B = (uint32_t)RAD_BF16;
+    Opd o;
+    o.t_idx({ K, M }, voc, -1, 0);                            /* codes */
+    o.t(B, { off0 + voc, D });                                /* t0 */
+    o.t(B, { (K > 1 ? K - 1 : 1) * voc, D });                 /* t1 */
+    o.t(act_dt(p, n_p), { M, D });                            /* y */
+    return o.finish("rvq_embed", operand, out);
+}
+
+int ref_frame_mix_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), D = gi(p, n_p, "n_embd", 0), L = gi(p, n_p, "L", 0);
+    const int64_t st = gi(p, n_p, "stride", 0);
+    if (M <= 0 || D <= 0 || L <= 0 || st <= 0 || M > REF_LANES) return RAD_E_UNSUPPORTED;
+    const uint32_t A = act_dt(p, n_p);
+    Opd o;
+    o.t(A, { L * 2 * M, D });                                 /* hid: two branch rows a lane */
+    o.t((uint32_t)RAD_F32, { L });                            /* logits */
+    o.t_fill((uint32_t)RAD_F32, { 1 }, (uint32_t)RAD_FILL_SIGMOID, 0);   /* scale */
+    o.t_idx({ M }, REF_LANES, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);       /* lane */
+    o.t_idx({ M }, st + 1, -1, 0);                            /* frame, 0 included */
+    o.t_idx({ REF_LANES }, 8, -1, 0);                         /* status */
+    o.t(A, { REF_LANES * st, D });                            /* dst, INOUT */
+    return o.finish("frame_mix_store", operand, out);
+}
+
+int ref_end_status_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), rep = gi(p, n_p, "rep", 1), end = gi(p, n_p, "end", 0);
+    if (M <= 0 || rep < 1 || M > REF_LANES) return RAD_E_UNSUPPORTED;
+    Opd o;
+    /* Ids over [0, 2 end): about half the lanes end. */
+    o.t_idx({ rep * M }, end > 0 ? 2 * end : 2, -1, 0);       /* ids */
+    o.t_idx({ M }, REF_LANES, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* lane */
+    o.t_idx({ REF_LANES }, 8, -1, 0);                         /* status, INOUT */
+    return o.finish("end_status", operand, out);
+}
+
+int ref_frame_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), K = gi(p, n_p, "n_codes", 0);
+    const int64_t st = gi(p, n_p, "stride", 0), rep = gi(p, n_p, "rep", 1);
+    if (M <= 0 || K <= 0 || st <= 0 || rep < 1 || M > REF_LANES) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t_idx({ K, rep * M }, 2048, -1, 0);                             /* codes */
+    o.t_idx({ M }, REF_LANES, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);    /* lane */
+    o.t_idx({ M }, st, -1, 0);                                        /* frame */
+    o.t_idx({ REF_LANES }, 8, -1, 0);                                 /* status */
+    o.t_idx({ REF_LANES * K, st }, 2048, -1, 0);                      /* dst, INOUT */
+    return o.finish("frame_store", operand, out);
+}
+
+int ref_resample_nearest_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    if (M <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M / 3 + 1, n });                                 /* x: fewer rows than y */
+    o.t(D, { M, n });                                         /* y */
+    return o.finish("resample_nearest", operand, out);
+}
+
+int ref_fourier_embed_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    if (M <= 0 || n <= 0 || (n & 1)) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t_fill((uint32_t)RAD_F32, { M }, (uint32_t)RAD_FILL_SIGMOID, 0);   /* t in (0, 1) */
+    o.t((uint32_t)RAD_F32, { n / 2 });                        /* w */
+    o.t(act_dt(p, n_p), { M, n });                            /* y */
+    return o.finish("fourier_embed", operand, out);
+}
+
+int ref_win_input_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), C = gi(p, n_p, "n_lat", 0), Z = gi(p, n_p, "n_zero", 0);
+    const int64_t Dc = gi(p, n_p, "n_cond", 0), st = gi(p, n_p, "stride", 0);
+    if (M <= 0 || C <= 0 || Z < 0 || Dc <= 0 || st <= 0) return RAD_E_UNSUPPORTED;
+    const int64_t S = lane_entries(p, n_p, M, st);
+    if (M > S * st) return RAD_E_UNSUPPORTED;
+    const uint32_t A = act_dt(p, n_p);
+    Opd o;
+    o.t(A, { REF_LANES * st, C });                            /* lat */
+    o.t(A, { REF_LANES * st, Dc });                           /* cond */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);    /* lat_cu */
+    o.t_idx({ S }, REF_LANES, -1, 0);                         /* win_lane */
+    o.t_idx({ S }, S, -1, 0);                                 /* pair */
+    o.t(A, { M, C + Z + Dc });                                /* y */
+    return o.finish("win_input", operand, out);
+}
+
+int ref_win_prep_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), st = gi(p, n_p, "stride", 0);
+    const int64_t ov = gi(p, n_p, "ov", 0);
+    if (M <= 0 || n <= 0 || st <= 0 || ov <= 0 || ov > st) return RAD_E_UNSUPPORTED;
+    const int64_t S = lane_entries(p, n_p, M, st);
+    if (M > S * st) return RAD_E_UNSUPPORTED;
+    const uint32_t B = (uint32_t)RAD_BF16;
+    Opd o;
+    o.t_idx({ S }, 32, -1, 0);                                /* flags: every bit drawn */
+    o.t_fill((uint32_t)RAD_F32, { S }, (uint32_t)RAD_FILL_SIGMOID, 0);   /* t */
+    o.t_idx({ 2 * S }, (int64_t)1 << 30, -1, 0);              /* seed */
+    o.t_idx({ S }, 64, -1, 0);                                /* win_index */
+    /* Distinct: two entries moving one lane would race. */
+    o.t_idx({ S }, REF_LANES, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* win_lane */
+    o.t_idx({ S }, S, -1, 0);                                 /* pair */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);    /* lat_cu */
+    o.t(B, { REF_LANES * ov, n });                            /* prev */
+    o.t(B, { REF_LANES * ov, n });                            /* noise, INOUT */
+    o.t(B, { REF_LANES * st, n });                            /* lat, INOUT */
+    return o.finish("win_prep", operand, out);
+}
+
+int ref_win_finish_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), Dc = gi(p, n_p, "n_cond", 0);
+    const int64_t st = gi(p, n_p, "stride", 0), ov = gi(p, n_p, "ov", 0);
+    if (M <= 0 || n <= 0 || Dc <= 0 || st <= 0 || ov <= 0 || ov > st) return RAD_E_UNSUPPORTED;
+    const int64_t S = lane_entries(p, n_p, M, st);
+    if (M > S * st) return RAD_E_UNSUPPORTED;
+    const uint32_t B = (uint32_t)RAD_BF16;
+    Opd o;
+    o.t_idx({ S }, 32, -1, 0);                                /* flags */
+    o.t_idx({ S }, S, -1, 0);                                 /* pair */
+    o.t_idx({ S }, REF_LANES, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* win_lane */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);    /* lat_cu */
+    o.t(B, { REF_LANES * st, Dc });                           /* cond */
+    o.t(B, { REF_LANES * st, n });                            /* lat, INOUT */
+    o.t(B, { REF_LANES * ov, n });                            /* prev, INOUT */
+    o.t(B, { REF_LANES * ov, Dc });                           /* prev_cond, INOUT */
+    return o.finish("win_finish", operand, out);
+}
+
+int ref_chan_split_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), P = gi(p, n_p, "parts", 0);
+    if (M <= 0 || n <= 0 || P <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, P * n });                                     /* x */
+    o.t(D, { P * M, n });                                     /* y */
+    return o.finish("chan_split", operand, out);
+}
+
+int ref_interleave2_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0);
+    if (M <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M });                                            /* a */
+    o.t(D, { M });                                            /* b */
+    o.t((uint32_t)RAD_F32, { M, 2 });                         /* y */
+    return o.finish("interleave2", operand, out);
+}
+
+int ref_iota_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0);
+    if (M <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t_idx({ M }, 1, -1, 0);                                 /* y */
+    return o.finish("iota", operand, out);
+}
+
+int ref_cu_repeat_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0);
+    if (M <= 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t_idx({ 1 }, 1000, -1, 0);                              /* len */
+    o.t_idx({ M }, 1, -1, 0);                                 /* y */
+    return o.finish("cu_repeat", operand, out);
 }

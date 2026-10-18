@@ -757,8 +757,9 @@ TEST(a_ct_int4_weight_is_imported_as_its_signed_codes_and_scales) {
     CHECK(!w.imported);
 }
 
-/* What is not read is refused, not misread: an asymmetric config, a zero point beside a weight
- * the config calls symmetric, and a scale plane that is not one per group. */
+/* What is not read is refused, not misread: a weight with no zero point under an asymmetric
+ * config, a zero point beside a weight the config calls symmetric, and a scale plane that is not
+ * one per group. */
 TEST(a_ct_int4_checkpoint_this_does_not_read_is_refused) {
     const Ct c = make_ct(4, 64, 32, 3);
     {
@@ -767,8 +768,13 @@ TEST(a_ct_int4_checkpoint_this_does_not_read_is_refused) {
         const std::string dir = write_checkpoint(ts, ct_config("false", 32).c_str());
         Checkpoint ck;
         REQUIRE_EQ(ck.open(dir), RAD_OK);
-        CHECK(ck.imports() == Checkpoint::Import::None);
-        CHECK(ck.import_refusal().find("symmetric") != std::string::npos);
+        CHECK(ck.imports() == Checkpoint::Import::CtInt4);
+        Program prog;
+        prog.name_map.push_back(map("p", RAD_MAP_COPY, { "p.weight" }));
+        CkptWeight w;
+        std::string why;
+        CHECK(ckpt_resolve(ck, prog, "p", false, &w, &why) != RAD_OK);
+        CHECK(why.find("p.weight_zero_point") != std::string::npos);
     }
     {
         std::vector<T> ts;
@@ -837,6 +843,305 @@ T pack_awq(const std::string& name, const std::vector<int>& v, int64_t rows, int
 }
 
 }  /* namespace */
+
+namespace {
+
+/* An asymmetric CT-INT4 weight as compressed-tensors' pack-quantized writes it (W4A16_ASYM, e.g.
+ * llm-compressor's AWQ): the signed code q[n][k] stored as q + 8 in X.weight_packed as above, the
+ * signed zero point zp[n][g] stored as zp + 8 in nibble n % 8 of int32 word [n / 8, g] of
+ * X.weight_zero_point (packed along N, the last word's spare nibbles zero), and a bf16 scale per
+ * group. compressed-tensors dequantises (q - zp) * scale. */
+struct CtAsym {
+    Ct c;                                  /* codes and scales */
+    std::vector<std::vector<int>> zp;      /* [N][G] signed, -8..7 */
+};
+
+CtAsym make_ct_asym(int64_t N, int64_t K, int64_t group, int seed) {
+    CtAsym a;
+    a.c = make_ct(N, K, group, seed);
+    a.zp.assign((size_t)N, std::vector<int>((size_t)(K / group)));
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t g = 0; g < K / group; ++g)
+            a.zp[(size_t)n][(size_t)g] = (int)((n * 5 + g * 3 + seed) % 16) - 8;
+    return a;
+}
+
+void add_ct_asym(std::vector<T>* ts, const std::string& base, const CtAsym& a) {
+    add_ct(ts, base, a.c);
+    const int64_t N = a.c.N, G = a.c.K / a.c.group;
+    T z{ base + ".weight_zero_point", "I32", { (N + 7) / 8, G }, {} };
+    z.bytes.assign((size_t)((N + 7) / 8 * G * 4), 0);
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t g = 0; g < G; ++g) {
+            uint32_t w;
+            std::memcpy(&w, z.bytes.data() + ((n / 8) * G + g) * 4, 4);
+            w |= (uint32_t)(a.zp[(size_t)n][(size_t)g] + 8) << (4 * (n % 8));
+            std::memcpy(z.bytes.data() + ((n / 8) * G + g) * 4, &w, 4);
+        }
+    ts->push_back(z);
+}
+
+std::string ct_config_ao(const char* symmetric, const char* actorder) {
+    std::string s = ct_config(symmetric, 32);
+    const std::string from = "\"actorder\":null";
+    s.replace(s.find(from), from.size(), std::string("\"actorder\":") + actorder);
+    return s;
+}
+
+/* `w` decoded from the planes ckpt_plane_rows writes, through the core's decoder. */
+std::vector<float> decode_planes(const CkptWeight& w) {
+    std::vector<std::vector<uint8_t>> pl((size_t)w.enc.n_planes);
+    std::vector<const void*> data;
+    std::string why;
+    for (int k = 0; k < w.enc.n_planes; ++k) {
+        int64_t pr = 0, pc = 0;
+        rad_enc_plane_dims(&w.enc.plane[k], w.rows, w.cols, &pr, &pc);
+        pl[(size_t)k].assign((size_t)(pr * rad_enc_row_bytes(w.enc.plane[k].dtype, pc)) + 8, 0);
+        if (ckpt_plane_rows(w, k, 0, pr, pl[(size_t)k].data(), &why) != RAD_OK) return {};
+        data.push_back(pl[(size_t)k].data());
+    }
+    EncodedView v;
+    enc_view(w.enc, w.rows, w.cols, data.data(), &v);
+    std::vector<float> out((size_t)(w.rows * w.cols));
+    if (enc_decode_rows(v, 0, w.rows, out.data(), &why) != RAD_OK) return {};
+    return out;
+}
+
+}  /* namespace */
+
+/* An asymmetric CT-INT4 weight imports as `u4*bf16[1x32]-u4[1x32]`: the stored nibbles are the
+ * codes and the stored zero points the zero plane, so (u - z) * s is compressed-tensors'
+ * (q - zp) * scale bit for bit. Gate (twelve rows: the zero points' last word half full) and up
+ * join along rows. */
+TEST(an_asymmetric_ct_int4_weight_is_its_codes_zero_points_and_scales) {
+    const CtAsym gate = make_ct_asym(12, 64, 32, 1), up = make_ct_asym(8, 64, 32, 2);
+    std::vector<T> ts;
+    add_ct_asym(&ts, "g", gate);
+    add_ct_asym(&ts, "u", up);
+    const std::string dir = write_checkpoint(ts, ct_config("false", 32).c_str());
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK(ck.imports() == Checkpoint::Import::CtInt4);
+    Program prog;
+    prog.name_map.push_back(map("gu", RAD_MAP_CONCAT, { "g.weight", "u.weight" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "gu", false, &w, &why), RAD_OK);
+    REQUIRE(w.imported);
+    REQUIRE_EQ(w.enc.n_planes, 3);
+    CHECK_EQ(w.enc.plane[0].dtype, (uint32_t)RAD_U4);
+    CHECK_EQ(w.enc.plane[1].dtype, (uint32_t)RAD_BF16);
+    CHECK_EQ(std::string(w.enc.plane[2].role), std::string("zero"));
+    CHECK_EQ(w.enc.plane[2].dtype, (uint32_t)RAD_U4);
+    CHECK_EQ(w.enc.plane[2].block[1], (int64_t)32);
+    CHECK(rad_enc_valid(&w.enc));
+    const auto pl = read_planes(w);
+    REQUIRE_EQ(pl.size(), (size_t)3);
+    std::vector<float> f((size_t)(20 * 64));
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 20, f.data(), &why), RAD_OK);
+    const std::vector<float> dec = decode_planes(w);
+    REQUIRE_EQ(dec.size(), f.size());
+    int bad_code = 0, bad_zero = 0, bad_f = 0, bad_dec = 0, negative = 0;
+    for (int64_t r = 0; r < 20; ++r) {
+        const CtAsym& a = r < 12 ? gate : up;
+        const int64_t n = r < 12 ? r : r - 12;
+        for (int64_t k = 0; k < 64; ++k) {
+            const int q = a.c.q[(size_t)n][(size_t)k], z = a.zp[(size_t)n][(size_t)(k / 32)];
+            const float want = (float)(q - z) * a.c.scale[(size_t)(n * 2 + k / 32)];
+            negative += want < 0;
+            if ((int)rad_load_f32(pl[0].data() + r * 32, RAD_U4, k) != q + 8) ++bad_code;
+            if (f[(size_t)(r * 64 + k)] != want) ++bad_f;
+            if (dec[(size_t)(r * 64 + k)] != want) ++bad_dec;
+        }
+        for (int64_t g = 0; g < 2; ++g)
+            if ((int)rad_load_f32(pl[2].data() + r, RAD_U4, g) != a.zp[(size_t)n][(size_t)g] + 8)
+                ++bad_zero;
+    }
+    CHECK(negative > 0);
+    CHECK_EQ(bad_code, 0);
+    CHECK_EQ(bad_zero, 0);
+    CHECK_EQ(bad_f, 0);
+    CHECK_EQ(bad_dec, 0);
+}
+
+/* Act-order `static` (alias `weight`) quantises in activation order but keeps each group's
+ * columns together, so it reads as no act-order, and an in-order weight_g_idx is accepted;
+ * `group` (alias `dynamic`) reorders the groups and is refused by name, as is a g_idx that moves
+ * a column out of its group. */
+TEST(ct_int4_act_order_static_reads_in_order_and_group_is_refused) {
+    const Ct c = make_ct(4, 64, 32, 4);
+    for (const char* ao : { "\"static\"", "\"weight\"" }) {
+        std::vector<T> ts;
+        add_ct(&ts, "p", c);
+        const std::string dir = write_checkpoint(ts, ct_config_ao("true", ao));
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        CHECK(ck.imports() == Checkpoint::Import::CtInt4);
+    }
+    for (const char* ao : { "\"group\"", "\"dynamic\"" }) {
+        std::vector<T> ts;
+        add_ct(&ts, "p", c);
+        const std::string dir = write_checkpoint(ts, ct_config_ao("true", ao));
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        CHECK(ck.imports() == Checkpoint::Import::None);
+        CHECK(ck.import_refusal().find("act-order") != std::string::npos);
+        CHECK(ck.import_refusal().find(std::string(ao).substr(1, std::strlen(ao) - 2)) !=
+              std::string::npos);
+    }
+    for (int moved : { 0, 1 }) {
+        std::vector<T> ts;
+        add_ct(&ts, "p", c);
+        T gi{ "p.weight_g_idx", "I32", { 64 }, std::vector<uint8_t>(256, 0) };
+        for (int k = 0; k < 64; ++k) ((int32_t*)gi.bytes.data())[k] = k / 32;
+        if (moved) ((int32_t*)gi.bytes.data())[3] = 1;
+        ts.push_back(gi);
+        const std::string dir = write_checkpoint(ts, ct_config_ao("true", "\"static\""));
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        Program prog;
+        prog.name_map.push_back(map("p", RAD_MAP_COPY, { "p.weight" }));
+        CkptWeight w;
+        std::string why;
+        const int rc = ckpt_resolve(ck, prog, "p", false, &w, &why);
+        if (moved) {
+            CHECK(rc != RAD_OK);
+            CHECK(why.find("act-order") != std::string::npos);
+        } else {
+            CHECK_EQ(rc, RAD_OK);
+        }
+    }
+}
+
+/* An import rule writes a symmetric grid unsigned under a zero of 8 and its bf16 scales as f16:
+ * every plane decodes, through the core's decoder, to the shipped value bit for bit, and with
+ * every scale in f16's range nothing is counted as rounded. An asymmetric grid keeps its zero
+ * points and changes only the scale's dtype. */
+TEST(an_import_rule_re_expresses_an_int4_grid_exactly) {
+    const Ct sym = make_ct(6, 64, 32, 5);
+    const CtAsym asym = make_ct_asym(9, 64, 32, 6);
+    ImportForm f;
+    f.codes = RAD_U4;
+    f.zero = RAD_U4;
+    f.scale = RAD_F16;
+    for (int is_asym : { 0, 1 }) {
+        std::vector<T> ts;
+        if (is_asym) add_ct_asym(&ts, "p", asym);
+        else add_ct(&ts, "p", sym);
+        const std::string dir = write_checkpoint(ts, ct_config(is_asym ? "false" : "true", 32));
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        Program prog;
+        prog.name_map.push_back(map("p", RAD_MAP_COPY, { "p.weight" }));
+        CkptWeight w;
+        std::string why;
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "p", false, &w, &why), RAD_OK);
+        std::vector<float> want((size_t)(w.rows * w.cols));
+        REQUIRE_EQ(ckpt_rows_f32(w, 0, w.rows, want.data(), &why), RAD_OK);
+        REQUIRE_EQ(ckpt_import_form(&w, f, &why), RAD_OK);
+        char en[96];
+        rad_enc_format(&w.enc, en, sizeof en);
+        CHECK_EQ(std::string(en), std::string("u4*f16[1x32]-u4[1x32]"));
+        CHECK(w.imported && !w.trivial);
+        CHECK_EQ(w.rounded, (int64_t)0);
+        const std::vector<float> dec = decode_planes(w);
+        REQUIRE_EQ(dec.size(), want.size());
+        int bad = 0;
+        for (size_t i = 0; i < dec.size(); ++i) bad += dec[i] != want[i];
+        CHECK_EQ(bad, 0);
+        /* a symmetric grid's zero plane is 8 throughout */
+        if (!is_asym) {
+            const auto pl = read_planes(w);
+            REQUIRE_EQ(pl.size(), (size_t)3);
+            for (int64_t r = 0; r < w.rows; ++r)
+                for (int64_t g = 0; g < 2; ++g)
+                    CHECK_EQ((int)rad_load_f32(pl[2].data() + r, RAD_U4, g), 8);
+        }
+    }
+}
+
+/* AutoRound's GPTQ export with an import rule: the codes unsigned under a zero of 8 and the
+ * scales kept in their shipped f16, where the import alone rounds them to bf16 for the expert
+ * GEMM. The decode is then the shipped value, code times f16 scale, bit for bit. */
+TEST(an_import_rule_keeps_gptq_scales_in_their_shipped_f16) {
+    const Gptq g = make_gptq(8, 256, 128, 4, 7);
+    std::vector<T> ts;
+    add_gptq(&ts, "x", g);
+    const std::string dir = write_checkpoint(ts, kAutoRound);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("x", RAD_MAP_COPY, { "x.weight" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "x", false, &w, &why), RAD_OK);
+    std::vector<float> want((size_t)(8 * 256));
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 8, want.data(), &why), RAD_OK);
+    const std::vector<float> as_bf16 = decode_planes(w);
+    int differ = 0;
+    for (size_t i = 0; i < want.size(); ++i) differ += as_bf16[i] != want[i];
+    CHECK(differ > 0);                       /* the default import rounds the scales */
+    ImportForm f;
+    f.codes = RAD_U4;
+    f.zero = RAD_U4;
+    f.scale = RAD_F16;
+    REQUIRE_EQ(ckpt_import_form(&w, f, &why), RAD_OK);
+    char en[96];
+    rad_enc_format(&w.enc, en, sizeof en);
+    CHECK_EQ(std::string(en), std::string("u4*f16[1x128]-u4[1x128]"));
+    CHECK_EQ(w.rounded, (int64_t)0);
+    const std::vector<float> dec = decode_planes(w);
+    REQUIRE_EQ(dec.size(), want.size());
+    int bad = 0;
+    for (size_t i = 0; i < dec.size(); ++i) bad += dec[i] != want[i];
+    CHECK_EQ(bad, 0);
+}
+
+/* A shipped scale the new dtype cannot hold (a bf16 scale below f16's normal range) is rounded,
+ * counted, and its largest relative change reported; what the rule cannot express is refused by
+ * name, and a plain weight is declined. */
+TEST(an_import_rule_counts_a_rounded_scale_and_refuses_what_it_cannot_express) {
+    Ct c = make_ct(2, 64, 32, 8);
+    c.scale[1] = rad_load_f32(std::vector<uint16_t>{ rad_f32_to_bf16(1.7e-6f) }.data(), RAD_BF16, 0);
+    std::vector<T> ts;
+    add_ct(&ts, "p", c);
+    ts.push_back(bf16("n.weight", { 64 }, 1.0f));
+    const std::string dir = write_checkpoint(ts, ct_config("true", 32));
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("p", RAD_MAP_COPY, { "p.weight" }));
+    prog.name_map.push_back(map("n", RAD_MAP_COPY, { "n.weight" }));
+    CkptWeight w;
+    std::string why;
+    ImportForm f;
+    f.codes = RAD_U4;
+    f.zero = RAD_U4;
+    f.scale = RAD_F16;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "p", false, &w, &why), RAD_OK);
+    REQUIRE_EQ(ckpt_import_form(&w, f, &why), RAD_OK);
+    CHECK_EQ(w.rounded, (int64_t)1);
+    CHECK(w.max_rel > 0.0 && w.max_rel < 0.05);
+
+    ImportForm bad = f;
+    bad.codes = RAD_U8;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "p", false, &w, &why), RAD_OK);
+    CHECK_EQ(ckpt_import_form(&w, bad, &why), (int)RAD_E_INVAL);
+    CHECK(why.find("codes=u8") != std::string::npos);
+    ImportForm no_zero;
+    no_zero.codes = RAD_U4;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "p", false, &w, &why), RAD_OK);
+    CHECK_EQ(ckpt_import_form(&w, no_zero, &why), (int)RAD_E_INVAL);
+    CHECK(why.find("zero=") != std::string::npos);
+    ImportForm blk;
+    blk.block[0] = blk.block[1] = 128;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "p", false, &w, &why), RAD_OK);
+    CHECK_EQ(ckpt_import_form(&w, blk, &why), (int)RAD_E_INVAL);
+    CHECK(why.find("block=") != std::string::npos);
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "n", false, &w, &why), RAD_OK);
+    CHECK_EQ(ckpt_import_form(&w, f, &why), (int)RAD_E_UNSUPPORTED);
+}
+
 
 /* ParoQuant MXFP4 is Quark's codes and exponents in a rotated basis plus the rotations: each
  * projection's pairs (group-local int16), theta and channel scales. Gate and up are two parts of
@@ -1877,6 +2182,180 @@ TEST(an_nvfp4_weight_missing_its_global_is_refused) {
     CHECK(why.find("divisor") != std::string::npos);
 }
 
+namespace {
+
+/* NVIDIA ModelOpt's MIXED_PRECISION layout (as in the NVFP4 releases of Qwen3.8-27B): NVFP4 for
+ * `g`, FP8 per tensor for `a` and `b`, every scale and every static input scale a rank-0 f32. */
+const char* kModelOptConfig =
+    "{\"model_type\":\"qwen3_5\",\"quantization_config\":{\"quant_method\":\"modelopt\","
+    "\"quant_algo\":\"MIXED_PRECISION\",\"quantized_layers\":{"
+    "\"g\":{\"quant_algo\":\"NVFP4\",\"group_size\":16},"
+    "\"a\":{\"quant_algo\":\"FP8\"},\"b\":{\"quant_algo\":\"FP8\"}}}}";
+
+T f32_scalar(const std::string& name, float v) {
+    T t{ name, "F32", {}, std::vector<uint8_t>(4) };
+    std::memcpy(t.bytes.data(), &v, 4);
+    return t;
+}
+
+}  /* namespace */
+
+/* ModelOpt's NVFP4 against values fixed independently of the importer: codes packed with element
+ * 2j in the low nibble, e4m3 block scales 2 and 0.5, and a weight_scale_2 of 0.25 that multiplies
+ * (ModelOpt's e2m1 * (float(weight_scale) * weight_scale_2)); read as compressed-tensors' divisor
+ * the value would be 16 times too large. The static input scale is not read. */
+TEST(a_modelopt_nvfp4_weight_decodes_with_its_second_scale_multiplying) {
+    static const float kMag[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    const int64_t N = 2, K = 32;
+    const float blk[2][2] = { { 2.0f, 0.5f }, { 0.5f, 2.0f } };
+    const float s2 = 0.25f;
+    std::vector<uint8_t> nib((size_t)(N * K));
+    std::vector<float> want((size_t)(N * K));
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t k = 0; k < K; ++k) {
+            const uint8_t c = (uint8_t)((n * 7 + k * 5) % 16);
+            nib[(size_t)(n * K + k)] = c;
+            want[(size_t)(n * K + k)] = (c & 8 ? -1.0f : 1.0f) * kMag[c & 7] * (blk[n][k / 16] * s2);
+        }
+    std::vector<T> ts;
+    T p{ "g.weight", "U8", { N, K / 2 }, {} };
+    for (int64_t i = 0; i < N * K; i += 2)
+        p.bytes.push_back((uint8_t)(nib[(size_t)i] | (nib[(size_t)i + 1] << 4)));
+    ts.push_back(p);
+    T s{ "g.weight_scale", "F8_E4M3", { N, K / 16 }, {} };
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t b = 0; b < 2; ++b) s.bytes.push_back(blk[n][b] == 2.0f ? 0x40 : 0x30);
+    ts.push_back(s);
+    ts.push_back(f32_scalar("g.weight_scale_2", s2));
+    ts.push_back(f32_scalar("g.input_scale", 3.0f));
+    const std::string dir = write_checkpoint(ts, kModelOptConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK(ck.imports() == Checkpoint::Import::ModelOpt);
+    CHECK(ck.import_refusal().empty());
+    CHECK(ck.meta().get("imported_quantization_config.quant_method") != nullptr);
+    Program prog;
+    prog.name_map.push_back(map("g", RAD_MAP_COPY, { "g.weight" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "g", false, &w, &why), RAD_OK);
+    CHECK(w.imported && !w.trivial);
+    char en[96];
+    rad_enc_format(&w.enc, en, sizeof en);
+    CHECK_EQ(std::string(en), std::string("fp4_e2m1*f32[1x16]"));
+    std::vector<float> f((size_t)(N * K));
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, N, f.data(), &why), RAD_OK);
+    int bad = 0;
+    for (size_t i = 0; i < f.size(); ++i) bad += f[i] != want[i];
+    CHECK_EQ(bad, 0);
+    CHECK_EQ(f[1], 3.0f * (2.0f * 0.25f));       /* k 1: code 5 (3.0), byte 0's high nibble */
+}
+
+/* ModelOpt's FP8 is E4M3 codes with one f32 scale per tensor. Each piece's scale is written once
+ * a row, so two projections with their own scales join (`fp8_e4m3*f32[1x*]`, imported: the plane
+ * is not the file's bytes), and the value is code * scale. An import rule makes it the served
+ * block fp8, each block's scale its piece's rounded to bf16 (counted when that changes it); a
+ * piece that ends inside a block is refused. */
+TEST(a_modelopt_fp8_weight_reads_its_per_tensor_scale_once_a_row) {
+    std::vector<T> ts;
+    ts.push_back(fp8("a.weight", { 128, 128 }));
+    ts.push_back(f32_scalar("a.weight_scale", 0.5f));
+    ts.push_back(f32_scalar("a.input_scale", 2.0f));
+    ts.push_back(fp8("b.weight", { 128, 128 }));
+    ts.push_back(f32_scalar("b.weight_scale", 0.3f));
+    ts.push_back(fp8("c.weight", { 64, 128 }));
+    ts.push_back(f32_scalar("c.weight_scale", 0.25f));
+    const std::string dir = write_checkpoint(ts, kModelOptConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("ab", RAD_MAP_CONCAT, { "a.weight", "b.weight" }));
+    prog.name_map.push_back(map("ca", RAD_MAP_CONCAT, { "c.weight", "a.weight" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "ab", false, &w, &why), RAD_OK);
+    CHECK(w.imported && !w.trivial);
+    char en[96];
+    rad_enc_format(&w.enc, en, sizeof en);
+    CHECK_EQ(std::string(en), std::string("fp8_e4m3*f32[1x*]"));
+    const auto pl = read_planes(w);
+    REQUIRE_EQ(pl.size(), (size_t)2);
+    CHECK_EQ(rad_load_f32(pl[1].data(), RAD_F32, 0), 0.5f);
+    CHECK_EQ(rad_load_f32(pl[1].data(), RAD_F32, 127), 0.5f);
+    CHECK_EQ(rad_load_f32(pl[1].data(), RAD_F32, 128), 0.3f);
+    CHECK_EQ(rad_load_f32(pl[1].data(), RAD_F32, 255), 0.3f);
+    std::vector<float> f((size_t)(256 * 128));
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 256, f.data(), &why), RAD_OK);
+    int bad = 0;
+    for (int64_t r = 0; r < 256; ++r)
+        for (int64_t k = 0; k < 128; ++k)
+            bad += f[(size_t)(r * 128 + k)] !=
+                   (float)(((r % 128) * 128 + k) % 7 - 3) * (r < 128 ? 0.5f : 0.3f);
+    CHECK_EQ(bad, 0);
+
+    ImportForm fb;
+    fb.block[0] = fb.block[1] = 128;
+    fb.scale = RAD_BF16;
+    REQUIRE_EQ(ckpt_import_form(&w, fb, &why), RAD_OK);
+    rad_enc_format(&w.enc, en, sizeof en);
+    CHECK_EQ(std::string(en), std::string("fp8_e4m3*bf16[128x128]"));
+    CHECK_EQ(w.rounded, (int64_t)1);              /* 0.3 is not a bf16; 0.5 is */
+    const std::vector<float> dec = decode_planes(w);
+    REQUIRE_EQ(dec.size(), f.size());
+    const float b3 = rad_load_f32(std::vector<uint16_t>{ rad_f32_to_bf16(0.3f) }.data(), RAD_BF16, 0);
+    int bad_dec = 0;
+    for (int64_t r = 0; r < 256; ++r)
+        for (int64_t k = 0; k < 128; ++k)
+            bad_dec += dec[(size_t)(r * 128 + k)] !=
+                       (float)(((r % 128) * 128 + k) % 7 - 3) * (r < 128 ? 0.5f : b3);
+    CHECK_EQ(bad_dec, 0);
+
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "ca", false, &w, &why), RAD_OK);
+    CHECK_EQ(ckpt_import_form(&w, fb, &why), (int)RAD_E_SHAPE);
+    CHECK(why.find("'c.weight'") != std::string::npos);
+}
+
+/* A ModelOpt algorithm this does not read (AWQ-scaled, or NVFP4 in other groups) is refused by
+ * name, as is an NVFP4 weight without its second scale. */
+TEST(a_modelopt_release_in_an_unread_form_is_refused_by_name) {
+    {
+        const std::string dir = write_checkpoint(
+            { bf16("x", { 2, 2 }, 0) },
+            "{\"model_type\":\"qwen3_5\",\"quantization_config\":{\"quant_method\":\"modelopt\","
+            "\"quant_algo\":\"W4A8_AWQ\"}}");
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        CHECK(ck.imports() == Checkpoint::Import::None);
+        CHECK(ck.import_refusal().find("W4A8_AWQ") != std::string::npos);
+    }
+    {
+        const std::string dir = write_checkpoint(
+            { bf16("x", { 2, 2 }, 0) },
+            "{\"model_type\":\"qwen3_5\",\"quantization_config\":{\"quant_method\":\"modelopt\","
+            "\"quant_algo\":\"MIXED_PRECISION\",\"quantized_layers\":{\"m.down\":{\"quant_algo\":"
+            "\"NVFP4\",\"group_size\":32}}}}");
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        CHECK(ck.imports() == Checkpoint::Import::None);
+        CHECK(ck.import_refusal().find("m.down") != std::string::npos);
+        CHECK(ck.import_refusal().find("32") != std::string::npos);
+    }
+    {
+        std::vector<T> ts;
+        ts.push_back(T{ "g.weight", "U8", { 2, 16 }, std::vector<uint8_t>(32, 0x21) });
+        ts.push_back(T{ "g.weight_scale", "F8_E4M3", { 2, 2 }, std::vector<uint8_t>(4, 0x38) });
+        const std::string dir = write_checkpoint(ts, kModelOptConfig);
+        Checkpoint ck;
+        REQUIRE_EQ(ck.open(dir), RAD_OK);
+        Program prog;
+        prog.name_map.push_back(map("g", RAD_MAP_COPY, { "g.weight" }));
+        CkptWeight w;
+        std::string why;
+        CHECK(ckpt_resolve(ck, prog, "g", false, &w, &why) < 0);
+        CHECK(why.find("weight_scale_2") != std::string::npos);
+    }
+}
+
 /* An NVFP4 group whose weights are not 4-bit floats in groups of 16, and a compressed-tensors
  * format this does not read, are refused with the group or format named. */
 TEST(a_compressed_tensors_release_in_an_unread_form_is_refused_by_name) {
@@ -2084,6 +2563,93 @@ TEST(a_fp8_weight_mixed_block_and_per_row_refuses_the_read) {
     CHECK_EQ(w.enc.n_planes, (int)0);
     std::vector<float> f(128);
     CHECK(ckpt_rows_f32(w, 0, 1, f.data(), &why) < 0);
+}
+
+/* ================================================================== derived weights */
+/* f32 values `v`, as an EMA codebook ships. */
+T f32(const std::string& name, std::vector<int64_t> shape, const std::vector<float>& v) {
+    T t{ name, "F32", shape, {} };
+    t.bytes.resize(v.size() * 4);
+    std::memcpy(t.bytes.data(), v.data(), t.bytes.size());
+    return t;
+}
+
+/* A linear kept (in, out) is read (out, in): each leading slice transposed, the weight not
+ * trivial (a recipe rule stores it). */
+TEST(a_transposed_weight_swaps_its_last_two_dimensions_in_each_slice) {
+    const std::string dir = write_checkpoint({ bf16("head.weight", { 2, 3, 4 }, 0.0f) }, kConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("ht", RAD_MAP_TRANSPOSE, { "head.weight" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "ht", false, &w, &why), RAD_OK);
+    CHECK(!w.trivial);
+    REQUIRE_EQ(w.rank, (uint32_t)3);
+    CHECK_EQ(w.shape[0], (int64_t)2);
+    CHECK_EQ(w.shape[1], (int64_t)4);
+    CHECK_EQ(w.shape[2], (int64_t)3);
+    std::vector<float> f(2 * 4 * 3);
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 8, f.data(), &why), RAD_OK);
+    /* Element (s, j, i) is the source's (s, i, j), which bf16() made s * 12 + i * 4 + j. */
+    for (int s = 0; s < 2; ++s)
+        for (int j = 0; j < 4; ++j)
+            for (int i = 0; i < 3; ++i)
+                CHECK_EQ(f[(size_t)(s * 12 + j * 3 + i)], (float)(s * 12 + i * 4 + j));
+}
+
+/* An EMA codebook is its sums over max(usage, 1e-5), row by row; codebooks declared in pieces
+ * stack along dim 0. */
+TEST(an_ema_codebook_divides_its_sums_by_their_usage_and_stacks) {
+    const std::string dir = write_checkpoint(
+        { f32("a.embedding_sum", { 2, 2 }, { 2.0f, 4.0f, 3.0f, 6.0f }),
+          f32("a.cluster_usage", { 2 }, { 2.0f, 0.0f }),
+          f32("b.embedding_sum", { 2, 2 }, { 8.0f, 1.0f, 5.0f, 5.0f }),
+          f32("b.cluster_usage", { 2 }, { 4.0f, 5.0f }) },
+        kConfig);
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    Program prog;
+    prog.name_map.push_back(map("cb", RAD_MAP_EMA, { "a.embedding_sum", "a.cluster_usage" }));
+    prog.name_map.push_back(map("cb", RAD_MAP_EMA, { "b.embedding_sum", "b.cluster_usage" }));
+    prog.name_map.push_back(map("short", RAD_MAP_EMA, { "a.embedding_sum", "b.embedding_sum" }));
+    CkptWeight w;
+    std::string why;
+    REQUIRE_EQ(ckpt_resolve(ck, prog, "cb", false, &w, &why), RAD_OK);
+    CHECK(!w.trivial);
+    CHECK_EQ(w.shape[0], (int64_t)4);
+    CHECK_EQ(w.shape[1], (int64_t)2);
+    std::vector<float> f(8);
+    REQUIRE_EQ(ckpt_rows_f32(w, 0, 4, f.data(), &why), RAD_OK);
+    const float want[8] = { 1.0f, 2.0f, 3.0f / 1e-5f, 6.0f / 1e-5f, 2.0f, 0.25f, 1.0f, 1.0f };
+    for (int i = 0; i < 8; ++i) CHECK_EQ(f[(size_t)i], want[i]);
+    /* Usage that is not one count a row is refused. */
+    CHECK_EQ(ckpt_resolve(ck, prog, "short", false, &w, &why), (int)RAD_E_SHAPE);
+}
+
+/* A folder holding a model of its own beside the checkpoint's weights (a codec) is read as part
+ * of it: its tensors and its config under the folder's name. */
+TEST(a_companion_folder_is_read_under_its_name) {
+    const std::string dir = write_checkpoint({ bf16("w", { 2, 2 }, 1.0f) }, kConfig);
+    const std::string sub = dir + "/codec";
+    REQUIRE_EQ(mkdir(sub.c_str(), 0755), 0);
+    write_shard(sub + "/model.safetensors", { bf16("decoder.x", { 2, 2 }, 5.0f) });
+    write_file(sub + "/config.json", "{\"model_type\": \"tok\", \"decoder_config\": {\"dim\": 7}}");
+    /* A folder without weights of its own is not a model. */
+    REQUIRE_EQ(mkdir((dir + "/notes").c_str(), 0755), 0);
+    write_file(dir + "/notes/config.json", "{}");
+    Checkpoint ck;
+    REQUIRE_EQ(ck.open(dir), RAD_OK);
+    CHECK(ck.find("w") != nullptr);
+    CHECK(ck.find("codec.decoder.x") != nullptr);
+    CHECK(ck.find("decoder.x") == nullptr);
+    auto mget = [&](const char* k) {
+        const char* v = ck.meta().get(k);
+        return std::string(v ? v : "");
+    };
+    CHECK_EQ(mget("codec.model_type"), std::string("tok"));
+    CHECK_EQ(mget("codec.decoder_config.dim"), std::string("7"));
 }
 
 RAD_TEST_MAIN()

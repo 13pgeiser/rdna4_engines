@@ -34,7 +34,7 @@ struct Engine::Rank {
     int       index = 0;
     int       device = 0;
     Program   program;          /* declare runs once per rank: dimensions are already divided */
-    /* RUNTIME LoRA: this rank's sites (core/lora/lora.h), the loader's map from an adapter's
+    /* Runtime LoRA: this rank's sites (core/lora/lora.h), the loader's map from an adapter's
      * modules to this rank's slot bytes. Empty with LoRA off. */
     std::vector<lora::Site> lora_sites;
     Plan      plan;

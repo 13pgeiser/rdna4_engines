@@ -1,23 +1,23 @@
-/* lora_test.cpp -- core/lora: sites from the declared Program, a PEFT adapter packed per rank, and
- * the adapter slots' bookkeeping (slots.h).
+/* lora_test.cpp -- core/lora: sites from the declared Program, a PEFT adapter packed per rank,
+ * declare's refusals, and the adapter slots' bookkeeping (slots.h).
  *
- * HOST ONLY, AND IT NEVER REACHES THE DEVICE LAYER. No kernel plugin is loaded: a Registry that
- * loads one brackets the dlopen with the device backend's code mark, which in a HIP build starts the
- * AQL backend. The Programs here are made by the REAL core Builder, over an empty Registry, driven
- * by the REAL arch/common code that declares the weights -- LinearFP8::declare (rad_fp8.h) with the
+ * Host only, and it never reaches the device layer: no kernel plugin is loaded, because a Registry
+ * that loads one brackets the dlopen with the device backend's code mark, which in a HIP build
+ * starts the AQL backend. The Programs are made by the core Builder over an empty Registry, driven
+ * by the arch/common code that declares the weights: LinearFP8::declare (rad_fp8.h) with the
  * arguments the blocks pass (rad_block_attn_fp8.h, rad_block_mlp_fp8.h, rad_block_attn_gated_fp8.h,
- * rad_block_gdn_fp8.h), over a Geom from the real geom_from(), and the delta net's uneven head split
- * as qwen4exp_fp8.cpp computes it (remainder_place). With no schema in the Registry the GEMM ops
- * themselves do not resolve, so each is appended to the Program as decl_op would record it (op name,
- * parameters, weights, schema operand positions). Everything a LoRA site is read from -- the
- * WeightInfo, its row parts and spans, the name map -- is exactly what the builder records.
+ * rad_block_gdn_fp8.h), over a Geom from geom_from(), and the delta net's uneven head split as
+ * qwen4exp_fp8.cpp computes it (remainder_place). With no schema in the Registry the GEMM ops do
+ * not resolve, so each is appended to the Program as decl_op would record it (op name, parameters,
+ * weights, schema operand positions); everything a site is read from is what the builder records.
  *
  * The dense reference is the test's own: the full delta scale * B @ A of every module, placed by
- * MODEL SEMANTICS (which heads / which ff columns a rank owns), not by anything lora.cpp computes.
+ * model semantics (which heads and ff columns a rank owns), not by anything lora.cpp computes.
  */
 #include "rad_test.h"
 
 #include "build/rad_build.h"
+#include "lora/declare.h"
 #include "lora/lora.h"
 #include "lora/slots.h"
 #include "plugin/registry.h"
@@ -33,12 +33,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
-#include <filesystem>
+#include <chrono>
 #include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -55,19 +56,9 @@ Registry& empty_registry() {
 }
 
 /* ------------------------------------------------------------------ temp dirs */
-std::string g_tmp;
-std::string tmp_root() {
-    if (g_tmp.empty()) {
-        const char* t = std::getenv("TMPDIR");
-        std::string tpl = std::string(t && *t ? t : "/tmp") + "/lora_test.XXXXXX";
-        std::vector<char> buf(tpl.begin(), tpl.end());
-        buf.push_back(0);
-        if (mkdtemp(buf.data())) g_tmp = buf.data();
-    }
-    return g_tmp;
-}
+/* Under the harness's directory (radtest::tmpdir), which it removes when the binary passes. */
 std::string new_dir(const std::string& name) {
-    const std::string d = tmp_root() + "/" + name;
+    const std::string d = radtest::tmp_path(name);
     mkdir(d.c_str(), 0755);
     return d;
 }
@@ -267,28 +258,28 @@ int build_llama(int rank, int world, RankProg* out) {
     const RadModelMeta meta = llama_meta();
     const RadBuildCtx ctx = ctx_for(rank, world);
     AR::Geom g{};
-    RAD_ARCH_TRY(AR::geom_from(g, &meta, &ctx, "bf16", RAD_BF16));   /* llama_fp8.cpp:414 */
+    RAD_ARCH_TRY(AR::geom_from(g, &meta, &ctx, "bf16", RAD_BF16));   /* llama_fp8.cpp */
     Builder b(empty_registry(), meta, ctx);
     AR::Names nm("");
-    const char* pre = "model.layers";                                  /* llama_fp8.cpp:567 */
+    const char* pre = "model.layers";                                  /* llama_fp8.cpp */
     const int64_t q_dim = g.q_dim(), kv_dim = g.kv_dim();
     const int64_t q_all = g.n_head_all * g.head_dim, kv_all = g.n_head_kv_all * g.head_dim;
     for (int l = 0; l < (int)meta.n_layers; ++l) {
         auto ck = [&](const char* leaf) { return nm.ckpt("%s.%d.%s.weight", pre, l, leaf); };
-        /* rad_block_attn_fp8.h:120-122 */
+        /* rad_block_attn_fp8.h */
         RAD_ARCH_TRY(linear(b, nm, g, nm.f("blk.%d.attn_qkv", l), q_dim + 2 * kv_dim, g.n_embd,
                             RAD_SHARD_ROW, l, { ck("self_attn.q_proj"), ck("self_attn.k_proj"),
                                                 ck("self_attn.v_proj") },
                             { q_dim, kv_dim, kv_dim }));
-        /* rad_block_attn_fp8.h:175-176 */
+        /* rad_block_attn_fp8.h */
         RAD_ARCH_TRY(linear(b, nm, g, nm.f("blk.%d.attn_output", l), g.n_embd, q_dim,
                             RAD_SHARD_COL, l, { ck("self_attn.o_proj") }));
-        /* rad_block_mlp_fp8.h:115-117 */
+        /* rad_block_mlp_fp8.h */
         AR::LinearFP8 gu{};
         RAD_ARCH_TRY(linear(b, nm, g, nm.f("blk.%d.ffn_gate_up", l), 2 * g.n_ff, g.n_embd,
                             RAD_SHARD_ROW, l, { ck("mlp.gate_proj"), ck("mlp.up_proj") },
                             { g.n_ff, g.n_ff }, 0, 0, {}, &gu));
-        /* rad_block_mlp_fp8.h:144-146 */
+        /* rad_block_mlp_fp8.h */
         RAD_ARCH_TRY(linear(b, nm, g, nm.f("blk.%d.ffn_down", l), g.n_embd, g.n_ff, RAD_SHARD_COL,
                             l, { ck("mlp.down_proj") }));
 
@@ -344,7 +335,7 @@ RadModelMeta hybrid_meta() {
 }
 
 struct GdnSplit { int64_t nk, kf, nv, vf; bool uneven; };
-/* qwen4exp_fp8.cpp:419-444, verbatim in substance. */
+/* qwen4exp_fp8.cpp, verbatim in substance. */
 GdnSplit gdn_split(const AR::Geom& g) {
     GdnSplit s{ kNK, 0, kNV, 0, false };
     if (g.world > 1 && (kNK % g.world != 0 || kNV % g.world != 0)) {
@@ -366,7 +357,7 @@ int build_hybrid(int rank, int world, RankProg* out, bool m1_on_inz = true) {
     const RadModelMeta meta = hybrid_meta();
     const RadBuildCtx ctx = ctx_for(rank, world);
     AR::Geom g{};
-    /* qwen4exp_fp8.cpp:326 */
+    /* qwen4exp_fp8.cpp */
     RAD_ARCH_TRY(AR::geom_from(g, &meta, &ctx, "bf16", RAD_BF16, true, true));
     Builder b(empty_registry(), meta, ctx);
     AR::Names nm("");
@@ -375,7 +366,7 @@ int build_hybrid(int rank, int world, RankProg* out, bool m1_on_inz = true) {
     const GdnSplit sp = gdn_split(g);
     const int64_t k_dim = sp.nk * kHK, v_dim = sp.nv * kHV, k_all = kNK * kHK, v_all = kNV * kHV;
 
-    /* ---- layer 0: the gated delta net (rad_block_gdn_fp8.h:231-242, 276-299, 318-321, 405-408) */
+    /* ---- layer 0: the gated delta net (rad_block_gdn_fp8.h) */
     {
         const int l = 0;
         auto ck = [&](const char* leaf) { return nm.ckpt("%s.%d.%s.weight", pre, l, leaf); };
@@ -437,7 +428,7 @@ int build_hybrid(int rank, int world, RankProg* out, bool m1_on_inz = true) {
         out->truth["blk.0.ssm_out.weight"] = so;
     }
 
-    /* ---- layer 1: gated attention (rad_block_attn_gated_fp8.h:189-213, 270-278, 453-455) */
+    /* ---- layer 1: gated attention (rad_block_attn_gated_fp8.h) */
     {
         const int l = 1;
         auto ck = [&](const char* leaf) { return nm.ckpt("%s.%d.%s.weight", pre, l, leaf); };
@@ -461,7 +452,7 @@ int build_hybrid(int rank, int world, RankProg* out, bool m1_on_inz = true) {
             RAD_ARCH_TRY(linear(b, nm, g, nm.f("blk.%d.attn_output", l), g.n_embd, q_dim,
                                 RAD_SHARD_COL, l, { ck("self_attn.o_proj") }, {}, o_lo, o_hi));
         }
-        /* MODEL SEMANTICS: this rank's query heads, and the KV head(s) those heads read. */
+        /* Model semantics: this rank's query heads, and the KV head(s) those heads read. */
         const int ar = g.attn_rank;
         const int64_t qh0 = ar * g.n_head, group = g.n_head_all / g.n_head_kv_all;
         const int64_t kvh0 = qh0 / group;
@@ -487,7 +478,7 @@ int build_hybrid(int rank, int world, RankProg* out, bool m1_on_inz = true) {
         out->truth["blk.1.attn_output.weight"] = o;
     }
 
-    /* ---- the dense MLP of both layers (rad_block_mlp_fp8.h:115-146) */
+    /* ---- the dense MLP of both layers (rad_block_mlp_fp8.h) */
     for (int l = 0; l < 2; ++l) {
         auto ck = [&](const char* leaf) { return nm.ckpt("%s.%d.%s.weight", pre, l, leaf); };
         RAD_ARCH_TRY(linear(b, nm, g, nm.f("blk.%d.ffn_gate_up", l), 2 * g.n_ff, g.n_embd,
@@ -690,7 +681,7 @@ void check_world(const char* label, int world,
 Adapter llama_adapter() {
     Adapter ad;
     uint32_t seed = 10;
-    /* k_proj is NOT targeted: the fused qkv's middle source stays base-only. */
+    /* k_proj is not targeted: the fused qkv's middle source stays base-only. */
     for (int l = 0; l < 2; ++l) {
         const std::string P = "model.layers." + std::to_string(l) + ".";
         ModSpec q{ P + "self_attn.q_proj", 16, 1536, 256, "F32", "BF16", seed++, false, 1.0f };
@@ -945,7 +936,7 @@ TEST(non_capable_consumers_are_reported_never_skipped) {
     REQUIRE_EQ(linear(b, nm, g, "blk.0.ffn_gate_up", 2 * g.n_ff, g.n_embd, RAD_SHARD_ROW, 0,
                       { "model.layers.0.mlp.gate_proj.weight", "model.layers.0.mlp.up_proj.weight" },
                       { g.n_ff, g.n_ff }, 0, 0, {}, &gu), RAD_OK);
-    /* the fused gated fold over the same views (rad_block_mlp_fp8.h:132-140): live -> reported */
+    /* the fused gated fold over the same views (rad_block_mlp_fp8.h): live -> reported */
     OpInfo gated;
     gated.op = "gemm_nt_q_gated";
     gated.base.set_i("N", gu.N); gated.base.set_i("K", gu.K); gated.base.set_s("act", "silu");
@@ -959,7 +950,7 @@ TEST(non_capable_consumers_are_reported_never_skipped) {
     CHECK_EQ(un[0].weight, std::string("blk.0.ffn_gate_up.weight"));
     CHECK(has(un[0].module, "model.layers.0.mlp.gate_proj"));
     CHECK_EQ(lora::find_unsupported_uses(b.program(), { "down_proj" }, nullptr), 0);
-    /* ...and the same op left UNRESOLVED (the builder's fallback: it is recorded, never issued) */
+    /* ...and the same op left unresolved (the builder's fallback: recorded, never issued) */
     Band dead;
     b.program().ops[gi].bands.push_back(dead);
     CHECK_EQ(lora::find_unsupported_uses(b.program(), t, nullptr), 0);
@@ -967,7 +958,6 @@ TEST(non_capable_consumers_are_reported_never_skipped) {
     std::string err;
     REQUIRE_EQ(lora::build_sites(b.program(), t, 16, &s, &err), RAD_OK);
     CHECK_EQ(s.size(), (size_t)1);
-    CHECK(lora::all_capable_targets(b.program()).count("gate_proj") == 1);
 
     /* a routed expert (moe_gemm_q over a stacked slice): targeted, so reported */
     RadNameMap ex = AR::map_base("blk.0.ffn_gate_up_exps.3.weight", RAD_MAP_CONCAT);
@@ -987,7 +977,6 @@ TEST(non_capable_consumers_are_reported_never_skipped) {
     un.clear();
     REQUIRE_EQ(lora::find_unsupported_uses(b.program(), t, &un), 1);
     CHECK_EQ(un[0].op, std::string("moe_gemm_q"));
-    CHECK(lora::all_capable_targets(b.program()).count("gate_proj") == 0);
 }
 
 TEST(a_transformed_or_rotated_weight_is_not_a_site) {
@@ -1014,7 +1003,8 @@ TEST(a_transformed_or_rotated_weight_is_not_a_site) {
     const rad_weight wk = decl("blk.0.attn_k.weight", "model.layers.0.self_attn.k_proj.weight");
     const rad_weight wv = decl("blk.0.attn_v.weight", "model.layers.0.self_attn.v_proj.weight");
     const rad_weight wo = decl("blk.0.attn_o.weight", "model.layers.0.self_attn.o_proj.weight");
-    REQUIRE(wq && wk && wv && wo);
+    const rad_weight wu = decl("blk.0.ffn_up.weight", "model.layers.0.mlp.up_proj.weight");
+    REQUIRE(wq && wk && wv && wo && wu);
     REQUIRE(b.program().weights[wq].enc_known);
     push_op(b, gemm_op("gemm_nt", 128, 256, "bf16", 1, 64, { wq }, { 1 }, false));
     OpInfo parts = gemm_op("gemm_nt_q", 128, 256, "mxfp4a8", 1, 64, { wk, wk }, { 2, 3 }, true);
@@ -1024,20 +1014,52 @@ TEST(a_transformed_or_rotated_weight_is_not_a_site) {
     OpInfo act = gemm_op("gemm_nt_bias", 128, 256, "bf16", 1, 64, { wo, wo }, { 1, 2 }, false);
     act.base.set_s("act", "gelu");
     push_op(b, act);
-    const lora::TargetSet t{ "q_proj", "k_proj", "v_proj", "o_proj" };
+    push_op(b, gemm_op("gemm_nt_q", 128, 256, "w4a8", 1, 64, { wu, wu }, { 2, 3 }, true));
+    const lora::TargetSet t{ "q_proj", "k_proj", "v_proj", "o_proj", "up_proj" };
     std::vector<lora::UnsupportedUse> un;
-    REQUIRE_EQ(lora::find_unsupported_uses(b.program(), t, &un), 4);
+    REQUIRE_EQ(lora::find_unsupported_uses(b.program(), t, &un), 5);
     CHECK(has(un[0].why, "perm"));
     CHECK_EQ(un[0].weight, std::string("blk.0.attn_q.weight"));
     CHECK(has(un[0].module, "q_proj"));
     CHECK(has(un[1].why, "pb1"));
     CHECK(has(un[2].why, "K=512"));
     CHECK(has(un[3].why, "act=gelu"));
+    CHECK(has(un[4].why, "step order"));
     std::vector<lora::Site> s;
     std::string err;
     REQUIRE_EQ(lora::build_sites(b.program(), t, 16, &s, &err), RAD_OK);
     CHECK_EQ(s.size(), (size_t)0);
     CHECK(has(lora::explain_module(b.program(), t, "model.layers.0.self_attn.q_proj"), "perm"));
+}
+
+/* Adapters serve the token steps of a model that writes logits: declare refuses a generator, an
+ * embedding model and a program with no logits by name, and lets a text model through. */
+TEST(declare_refuses_a_model_that_does_not_generate_text) {
+    const RadModelMeta meta = llama_meta();
+    const RadBuildCtx ctx = ctx_for(0, 1);
+    LoraConfig cfg;
+    cfg.max_loras = 1;
+    cfg.targets = { "q_proj" };
+    LoraDeclare d;
+    d.cfg = &cfg;
+    d.targets = { "q_proj" };
+    const struct { const char* what; void (*set)(Program&); } kinds[] = {
+        { "is an image, audio or video generator",
+          [](Program& p) { p.logits_buf = 1; p.generator.layout = 1; } },
+        { "makes embeddings", [](Program& p) { p.pooled_buf = 1; } },
+        { "declares no logits", [](Program&) {} },
+    };
+    for (const auto& k : kinds) {
+        Builder b(empty_registry(), meta, ctx);
+        k.set(b.program());
+        int st = RAD_OK;
+        const std::string log = stderr_of([&] { st = lora_declare(b, d); });
+        CHECK_EQ(st, (int)RAD_E_UNSUPPORTED);
+        CHECK(has(log, k.what));
+    }
+    Builder text(empty_registry(), meta, ctx);
+    text.program().logits_buf = 1;
+    CHECK_OK(lora_declare(text, d));
 }
 
 /* ================================================================== load refusals */
@@ -1067,6 +1089,26 @@ TEST(load_refusals_name_module_expected_and_found) {
       expect_refusal(one("fifo", c, { good }), sites, 16, "fan_in_fan_out"); }
     { ojson c = ok; c["alpha_pattern"] = { { "(?P<x>q_proj)", 4 } };
       expect_refusal(one("regex", c, { good }), sites, 16, "(?P<x>q_proj)"); }
+    { ojson c = ok; c["lora_alpha"] = 1e300;
+      expect_refusal(one("alpha", c, { good }), sites, 16, "no finite f32 scale"); }
+    { ojson c = ok; c["rank_pattern"] = { { "q_proj", (int64_t)1 << 40 } };
+      expect_refusal(one("bigrank", c, { good }), sites, 16, "rank_pattern[q_proj]"); }
+    { ojson c = ok; c["lora_bias"] = true;
+      expect_refusal(one("lbias", c, { good }), sites, 16, "lora_bias"); }
+    { ojson c = ok; c["target_parameters"] = { "experts.gate_up_proj" };
+      expect_refusal(one("tparams", c, { good }), sites, 16, "target_parameters"); }
+    { ojson c = ok; c["trainable_token_indices"] = { 1, 2 };
+      expect_refusal(one("ttok", c, { good }), sites, 16, "trainable_token_indices"); }
+    { ojson c = ok; c["layer_replication"] = { { 0, 2 }, { 1, 2 } };
+      expect_refusal(one("lrep", c, { good }), sites, 16, "layer_replication"); }
+    { ojson c = ok; c["use_qalora"] = true;
+      expect_refusal(one("qalora", c, { good }), sites, 16, "use_qalora"); }
+    { ojson c = ok; c["alora_invocation_tokens"] = { 7, 8 };
+      expect_refusal(one("alora", c, { good }), sites, 16, "alora_invocation_tokens"); }
+    { ojson c = ok; c["use_qalora"] = false; c["layer_replication"] = nullptr;
+      Adapter ad; ad.mods = { good }; write_adapter(&ad, "plainopts", c);
+      lora::AdapterInfo info; std::vector<lora::PackedSite> packed; std::string e;
+      CHECK_OK(lora::load_adapter(ad.dir, sites, 16, &info, &packed, &e)); }
     /* tensors that are not linear LoRA pairs */
     {
         Adapter ad;
@@ -1195,16 +1237,6 @@ TEST(adapter_info_and_scales) {
                 CHECK_EQ(m.scale, s.scale);
                 CHECK(m.pool >= 0);
             }
-    /* the hash is the content's: same bytes in another directory, same hash */
-    lora::AdapterInfo again;
-    const std::string copy = new_dir("llama_copy");
-    for (const char* f : { "/adapter_config.json", "/adapter_model.safetensors" }) {
-        std::ifstream i(ad.dir + f, std::ios::binary);
-        std::ofstream o(copy + f, std::ios::binary);
-        o << i.rdbuf();
-    }
-    REQUIRE_EQ(lora::load_adapter(copy, sites, 16, &again, &packed, &err), RAD_OK);
-    CHECK_EQ(again.content_hash, info.content_hash);
     /* rsLoRA: alpha / sqrt(r) */
     Adapter rs;
     rs.mods = { { "model.layers.0.self_attn.q_proj", 16, 1536, 256, "BF16", "BF16", 4, false, 4.f } };
@@ -1215,7 +1247,44 @@ TEST(adapter_info_and_scales) {
     REQUIRE_EQ(lora::load_adapter(rs.dir, sites, 16, &ri, &packed, &err), RAD_OK);
     REQUIRE_EQ(ri.modules.size(), (size_t)1);
     CHECK_EQ(ri.modules[0].scale, 4.0f);
-    CHECK(ri.content_hash != info.content_hash);
+}
+
+/* rank_pattern and alpha_pattern keys match as PEFT's get_pattern_key does: the end of the
+ * module's name on a dot boundary, the first matching key in the file winning. A key found only
+ * inside the name, or not on a dot boundary, leaves the module at r and lora_alpha. */
+TEST(pattern_keys_match_the_end_of_the_module_name_as_peft_does) {
+    RankProg rp;
+    const std::vector<lora::Site> sites = llama_sites(0, 1, kLlamaTargets, &rp);
+    const std::string q = "model.layers.0.self_attn.q_proj";
+    const struct { const char* key; double alpha; float scale; } kCases[] = {
+        { "self_attn", 64.0, 2.0f },
+        { "_proj", 64.0, 2.0f },
+        { "q_proj", 64.0, 8.0f },
+        { "layers.0.self_attn.q_proj", 64.0, 8.0f },
+        { "layers.1.self_attn.q_proj", 64.0, 2.0f },
+        { "model.layers.0.self_attn.q_proj", 64.0, 8.0f },
+        { "k_proj|q_proj", 32.0, 4.0f },
+    };
+    int i = 0;
+    for (const auto& c : kCases) {
+        Adapter ad;
+        ad.mods = { { q, 8, 1536, 256, "BF16", "BF16", 1, false, c.scale } };
+        ojson cfg = base_cfg(8, 16.0, { "q_proj" });
+        cfg["alpha_pattern"] = ojson::object();
+        cfg["alpha_pattern"][c.key] = c.alpha;
+        cfg["alpha_pattern"]["0.self_attn.q_proj"] = 128.0;   /* matches too, but comes second */
+        write_adapter(&ad, "pattern" + std::to_string(i++), cfg);
+        lora::AdapterInfo info;
+        std::vector<lora::PackedSite> packed;
+        std::string err;
+        REQUIRE_EQ(lora::load_adapter(ad.dir, sites, 16, &info, &packed, &err), RAD_OK);
+        REQUIRE_EQ(info.modules.size(), (size_t)1);
+        const float want = c.scale == 2.0f ? 16.0f : c.scale;   /* no match: the second key's */
+        if (info.modules[0].scale != want)
+            fprintf(stderr, "    alpha_pattern key '%s': scale %g, PEFT's %g\n", c.key,
+                    info.modules[0].scale, want);
+        CHECK_EQ(info.modules[0].scale, want);
+    }
 }
 
 /* ================================================================== the slot table
@@ -1303,12 +1372,57 @@ TEST(an_adapter_in_use_drains_and_its_last_request_frees_it) {
     CHECK(t.publish(slot, "a", "/a2") != u);
 }
 
-TEST(zz_remove_the_temporary_adapters) {
-    if (!g_tmp.empty()) {
-        std::error_code ec;
-        std::filesystem::remove_all(g_tmp, ec);
-        CHECK(!ec);
+/* Requests take and drop holds on several threads while the adapter is unloaded and loaded again
+ * in a loop: a load is never handed a slot a live hold still names, and a request only ever gets
+ * the slot of a published adapter. The loop starts once the users hold the adapter and runs until
+ * they have taken thousands of holds during it, at most 30 s: on a loaded machine its 3000 rounds
+ * alone can end before a user thread is first scheduled. */
+TEST(a_slot_is_never_reloaded_under_a_live_hold) {
+    std::atomic<uint64_t> epoch{0};
+    lora::SlotTable t;
+    t.reset(2, &epoch);
+    int slot = -1;
+    bool cooling = false;
+    std::string err;
+    REQUIRE_EQ(t.reserve("a", &slot, &cooling, &err), RAD_OK);
+    t.publish(slot, "a", "/a");
+    std::atomic<int> live[2] = { 0, 0 };
+    std::atomic<bool> stop{ false };
+    std::atomic<long> holds{ 0 };
+    std::vector<std::thread> users;
+    for (int i = 0; i < 4; ++i)
+        users.emplace_back([&] {
+            while (!stop.load()) {
+                int32_t s = -1;
+                uint64_t u = 0;
+                std::shared_ptr<void> h;
+                if (t.acquire("a", &s, &u, &h) != RAD_OK) { std::this_thread::yield(); continue; }
+                ++live[s];
+                ++holds;
+                std::this_thread::yield();
+                --live[s];
+                h.reset();
+            }
+        });
+    while (holds.load() == 0) std::this_thread::yield();
+    const long before = holds.load();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    int bad = 0, loads = 0;
+    for (int round = 0; round < 3000 || (holds.load() - before < 3000 &&
+                                         std::chrono::steady_clock::now() < deadline); ++round) {
+        int n = 0;
+        (void)t.unload("a", &n, &err);
+        epoch += lora::kSlotCoolRounds;
+        if (t.reserve("a", &slot, &cooling, &err) != RAD_OK) continue;   /* still draining */
+        if (live[slot].load() != 0) ++bad;
+        t.publish(slot, "a", "/a");
+        ++loads;
     }
+    stop.store(true);
+    for (std::thread& u : users) u.join();
+    CHECK_EQ(bad, 0);
+    CHECK(loads > 0);
+    CHECK(holds.load() > before);
 }
 
 TEST(nothing_here_touches_a_device) {

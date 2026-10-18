@@ -15,6 +15,7 @@
 
 #include "rad_test.h"
 
+#include "gen/audio.h"
 #include "gen/gen.h"
 #include "mm/processor.h"
 #include "server/adapters.h"
@@ -585,6 +586,90 @@ struct FakeImageGen : IImageGen {
         auto it = std::make_shared<mm::Item>();
         it->expand = picture_expand;
         *out = std::move(it);
+        return RAD_OK;
+    }
+    int64_t queued() const override { return 0; }
+    int64_t running() const override { return 0; }
+};
+
+/* An audio generator that finishes every request on submit: `windows` windows of `per_window`
+ * stereo samples, pushed in `order` (the driver may finish windows out of order), sample j of
+ * window k at sample(k, j). Text containing "REFUSE" is refused by prepare(). With `hold` a
+ * request is taken and left running, its ticket neither fed nor ended. A realtime session submits
+ * from its own thread: read what was submitted through n_got() and request(). */
+struct FakeAudioGen : IAudioGen {
+    AudioGenInfo inf;
+    int         submit_status = RAD_OK;
+    std::string submit_why;
+    int         finish_status = RAD_OK;
+    std::string finish_why;
+    std::vector<int32_t> order = { 1, 0, 2 };
+    int32_t     per_window = 6;
+    bool        hold = false;
+    std::vector<std::unique_ptr<gen::AudioRequest>> got;
+    mutable std::mutex got_m;
+
+    FakeAudioGen() {
+        inf.name = "fake-audio";
+        inf.tmpl = "<s>{instructions}|{input}";
+        inf.max_prompt = 64;
+        inf.max_frames = 100;
+        inf.frame_rate_num = 25;
+        inf.frame_rate_den = 1;
+        inf.sample_rate = 8000;
+        inf.channels = 2;
+        inf.default_steps = 30;
+        inf.default_cfg = 1.7;
+        inf.max_lanes = 4;
+    }
+    /* One sample past full scale (window 2's first), to show the clip. */
+    static float sample(int32_t k, int32_t j) {
+        return j == 0 && k == 2 ? 1.5f : (float)(k * 8 + j) / 37.0f - 0.4f;
+    }
+    const AudioGenInfo& info() const override { return inf; }
+    int prepare(int, const std::string& in, std::string* out, std::string* why) const override {
+        if (in.find("REFUSE") != std::string::npos) {
+            *why = "the text was refused";
+            return RAD_E_INVAL;
+        }
+        *out = in;
+        return RAD_OK;
+    }
+    size_t n_got() const {
+        std::lock_guard<std::mutex> lk(got_m);
+        return got.size();
+    }
+    /* Request i's prompt as text (the fake tokenizer's ids are bytes) and its ticket. */
+    std::string prompt_of(size_t i) const {
+        std::lock_guard<std::mutex> lk(got_m);
+        std::string t;
+        for (int32_t c : got[i]->tokens) t += (char)c;
+        return t;
+    }
+    std::shared_ptr<gen::AudioTicket> ticket_of(size_t i) const {
+        std::lock_guard<std::mutex> lk(got_m);
+        return got[i]->ticket;
+    }
+    int submit(std::unique_ptr<gen::AudioRequest> r, std::string* why) override {
+        std::lock_guard<std::mutex> lk(got_m);
+        if (submit_status < 0) { *why = submit_why; return submit_status; }
+        if (hold) {
+            got.push_back(std::move(r));
+            return RAD_OK;
+        }
+        gen::AudioTicket& t = *r->ticket;
+        t.in_tokens = (int64_t)r->tokens.size();
+        t.frames = r->max_frames;
+        t.windows = (int64_t)order.size();
+        if (finish_status == RAD_OK)
+            for (int32_t k : order) {
+                gen::AudioChunk c;
+                c.window = k;
+                for (int32_t j = 0; j < per_window; ++j) c.samples.push_back(sample(k, j));
+                t.push(std::move(c));
+            }
+        t.finish(finish_status, finish_why);
+        got.push_back(std::move(r));
         return RAD_OK;
     }
     int64_t queued() const override { return 0; }

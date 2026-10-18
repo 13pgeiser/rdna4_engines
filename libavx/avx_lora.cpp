@@ -1,19 +1,17 @@
 /* avx_lora.cpp -- runtime LoRA's two halves on the host: lora_shrink and lora_expand.
  *
- * libref/ref_lora.cpp is the DEFINITION and says what the ops are; this is the same arithmetic over
- * the same bytes with the dot products vectorised, which is the only difference and a tolerance
- * question (avx_check). What is EXACT, and has to be, is which rows are touched: a row whose slot
- * is outside [0, S) is a base row, its `t` row is never written and its `y` row is neither read nor
- * written -- not a store of what was read, no store -- because the engine promises that a base row
- * is bit for bit what the GEMM wrote.
+ * libref/ref_lora.cpp defines the ops; this is the same arithmetic over the same bytes with the dot
+ * products vectorised, a tolerance question (avx_check). Which rows are touched is exact: a row
+ * whose slot is outside [0, S) is a base row, its `t` row is never written and its `y` row is
+ * neither read nor stored, so it stays bit for bit what the GEMM wrote.
  *
  * x(m, k) is gemm_nt_q's activation value: the code times its group's scale, read through the same
  * scale-stream rule as avx_gemm.cpp (copied below for the reason avx_moe.cpp gives for its copy).
  *
- * THREADING. A row's dots never split, so its bytes do not depend on the team or on M. A prefill
- * has rows to spare and goes wide over them; a decode step has one row and R columns, so there the
- * row's activation is decoded once on the calling thread and the team goes wide over the columns.
- * Either way each output element is one dotf() over the same two f32 rows.
+ * Threading: a row's dots never split, so its bytes do not depend on the team or on M. A prefill
+ * goes wide over rows; a decode step has one row and R columns, so the row is decoded once on the
+ * calling thread and the team goes wide over the columns. Either way each output element is one
+ * dotf() over the same two f32 rows.
  */
 #include "avx_common.h"
 #include "avx_vec.h"

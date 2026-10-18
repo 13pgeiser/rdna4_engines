@@ -415,27 +415,37 @@ int Ctx::issue(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
     return rc;
 }
 
-/* RUNTIME LoRA: the two ops the core appended for a targeted gemm, issued right behind it on the
+/* Runtime LoRA: the two ops the core appended for a targeted gemm, issued right behind it on the
  * same stream, over the same rows, through the ordinary issue path (bands, tape, hazards).
  *
  *   t  = A[slot] . x          lora_shrink, x = the gemm's own activation operand(s)
  *   y += scale . B[slot] . t  lora_expand, y = the gemm's own output operand
  *
- * Here and only here: a row-parallel gemm's y is this rank's PARTIAL sum and the plugin reduces it
- * after this returns, so the delta rides the same reduction (B.A.x is linear in x's shards). Only
- * the trunk pass: a draft pass runs the drafter's weights, an encoder pass the tower's. A base row
- * (slot -1) is not touched by either kernel, so a step with no adapter rows computes exactly what
- * the same step without LoRA does. */
+ * A row-parallel gemm's y is this rank's partial sum and the plugin reduces it after this returns,
+ * so the delta rides the same reduction (B.A.x is linear in x's shards). Nothing is issued on a
+ * step with no adapter row (RadBatch::lora_slot null), which is then the pass an engine without
+ * adapters runs, nor on a draft pass, whose proposals the trunk verifies. An encoder or generator
+ * pass never reaches a site: such a weight is outside the targets' scope rule (core/lora/lora.h),
+ * so reaching one here is refused rather than run without its delta. */
 int Ctx::issue_lora(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
-    if (!batch_ || batch_->draft_pass != 0 || batch_->enc != 0 || batch_->gen != 0) return RAD_OK;
+    if (!batch_) return RAD_OK;
+    if (batch_->enc != 0 || batch_->gen != 0)
+        return abort_step_msg(h, RAD_E_UNSUPPORTED,
+                              "a LoRA-targeted gemm was issued by an encoder or generator pass, "
+                              "which runtime LoRA does not reach; leave its module out of "
+                              "--lora-target-modules");
+    if (!batch_->lora_slot || batch_->draft_pass != 0) return RAD_OK;
     const OpPlan& p = plans_[h];
     const LoraIssueSite& s = program_->lora_sites[(size_t)p.lora_site];
     if (n == RAD_N_BATCH) n = batch_->n_tok;
     if (n <= 0) return RAD_OK;
-    if (op_domain_[h].load(std::memory_order_relaxed) != RAD_DOMAIN_DEVICE)
+    /* The adapter ops run in the gemm's domain and read the pools, which are device buffers: on a
+     * card that is the device domain, and on the host backend every domain is host memory. */
+    const int dom = (int)op_domain_[h].load(std::memory_order_relaxed);
+    if (dom != RAD_DOMAIN_DEVICE && !device_is_host())
         return abort_step_msg(h, RAD_E_UNSUPPORTED,
-                              "a LoRA-targeted gemm was placed on the host; its adapter delta has "
-                              "no host path, so the step would compute the base model's output");
+                              "a LoRA-targeted gemm was placed on the host, and the adapter pools "
+                              "are on the card");
     if (s.opd_a < 0 || s.opd_a >= n_opd || s.opd_y < 0 || s.opd_y >= n_opd)
         return abort_step_msg(h, RAD_E_STATE, "LoRA site: the gemm was issued with fewer operands "
                                               "than its schema names");
@@ -445,9 +455,9 @@ int Ctx::issue_lora(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         (size_t)ya.handle >= program_->buffers.size() || (size_t)xa.handle >= program_->buffers.size())
         return abort_step_msg(h, RAD_E_UNSUPPORTED, "LoRA site: the gemm's activation or output is "
                                                     "not a declared buffer");
-    /* THE ROWS THE GEMM WROTE ARE ROWS OF THE STEP'S TOKENS starting at r0, so the slot array is
-     * read from r0 too. A row slice offsets by whole rows of the buffer's declared width; a column
-     * slice offsets by less than one row. Anything else is a view this code cannot place. */
+    /* The rows the gemm wrote are the step's token rows from r0 on, so the slot array is read from
+     * r0 too. A row slice offsets by whole rows of the buffer's declared width and a column slice
+     * by less than one row; any other view cannot be placed. */
     const RadBufDecl& yd = program_->buffers[ya.handle].decl;
     const RadBufDecl& xd = program_->buffers[xa.handle].decl;
     if (yd.dtype != s.y_dtype || xd.dtype != s.a_dtype)
@@ -461,30 +471,25 @@ int Ctx::issue_lora(rad_op h, const RadOperand* opd, int n_opd, int64_t n) {
         return abort_step_msg(h, RAD_E_STATE, "LoRA site: the gemm's output view starts inside a "
                                               "row, so its token rows cannot be told");
     const int64_t r0 = ya.offset / yw;
-    /* ...and the activation must be the SAME rows: shrink reads x's row m and expand writes y's
-     * row m with one slot, so a GEMM whose two views start at different tokens cannot be followed. */
+    /* The activation must start at the same row: shrink reads x's row m and expand writes y's row
+     * m with one slot. */
     {
         const int64_t xw = xd.rank >= 2 ? xd.shape[xd.rank - 1] : 0;
         if (xw <= 0 || (xa.cols == 0 && xa.offset % xw != 0) || xa.offset / xw != r0)
             return abort_step_msg(h, RAD_E_STATE, "LoRA site: the gemm's activation and output "
                                                   "views do not start at the same token row");
     }
-    if (op_domain_[s.shrink].load(std::memory_order_relaxed) != RAD_DOMAIN_DEVICE ||
-        op_domain_[s.expand].load(std::memory_order_relaxed) != RAD_DOMAIN_DEVICE)
-        return abort_step_msg(h, RAD_E_UNSUPPORTED, "LoRA site: the adapter ops were placed off "
-                                                    "the device the gemm runs on");
+    if ((int)op_domain_[s.shrink].load(std::memory_order_relaxed) != dom ||
+        (int)op_domain_[s.expand].load(std::memory_order_relaxed) != dom)
+        return abort_step_msg(h, RAD_E_UNSUPPORTED, "LoRA site: the adapter ops were placed in "
+                                                    "another domain than the gemm they follow");
     if (r0 < 0 || r0 + n > batch_->n_tok)
         return abort_step_msg(h, RAD_E_STATE,
                               fmt("LoRA site: the gemm wrote rows [%lld, %lld) of a %lld-token step",
                                   (long long)r0, (long long)(r0 + n), (long long)batch_->n_tok));
-    /* Each row's adapter is the step batch's (RadBatch::lora_slot), which the builder fills from
-     * every request's slot. It sits at one address per rank for the engine's life and is
-     * rewritten in stream order before each step's kernels, so the pointer this launch records is
-     * the one a replay of it reads. */
-    if (!batch_->lora_slot)
-        return abort_step_msg(h, RAD_E_STATE, "LoRA site: the step batch carries no per-row adapter "
-                                              "slot (RadBatch::lora_slot), so the engine was started "
-                                              "without adapters and should have declared no site");
+    /* Each row's adapter is the step batch's (RadBatch::lora_slot), rewritten in stream order
+     * before each step's kernels, so the pointer this launch records is the one a replay of it
+     * reads. */
     const LoraPool&    pool = program_->lora_pools[(size_t)s.pool];
     const rad_buf      t    = program_->lora_t[(size_t)s.t].lane[lane_ ? 1 : 0];
     RadOperand         slot = RAD_P_T(batch_->lora_slot + r0, RAD_I32);

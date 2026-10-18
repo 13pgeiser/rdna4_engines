@@ -2,11 +2,9 @@
  * --lora-target-modules). Read by declare (which sites and pools exist), by the adapter manager
  * (what may be loaded into them) and by nothing else.
  *
- * OFF UNLESS ASKED FOR: with no adapter named and no --max-loras, `enabled()` is false, declare
- * appends nothing, the program has no pool and no extra op, and the engine computes exactly what it
- * computed before this file existed. */
+ * Off unless asked for: with no adapter named and no --max-loras, `enabled()` is false, declare
+ * appends nothing, the program has no pool and no extra op, and no step carries an adapter slot. */
 #pragma once
-#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -20,11 +18,9 @@ struct LoraConfig {
     int max_loras = 0;
     /* The rank every slot is sized for; an adapter of lower rank is zero-padded into it. */
     int max_rank = 16;
-    /* HF module leaf names (q_proj, gate_proj, in_proj_qkv, ...) the sites are built for. Empty:
-     * the union of the startup adapters' target_modules, or -- with no startup adapter -- every
-     * LoRA-capable trunk linear (`all_linear`). */
-    std::set<std::string> targets;
-    bool all_linear = false;
+    /* HF module leaf names (q_proj, gate_proj, in_proj_qkv, ...) the sites are built for, sorted
+     * and unique. Empty: the union of the startup adapters' target_modules. */
+    std::vector<std::string> targets;
 
     bool enabled() const { return max_loras > 0 || !adapters.empty(); }
     int  slots() const {

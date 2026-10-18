@@ -251,11 +251,14 @@ int ref_grid_embed_aa(const RadArgs* a, RadStream) {
 /* ------------------------------------------------------------------ add / mul */
 /* Elementwise over the output's extent. `b` may be a single row of exactly `n` elements, which
  * broadcasts along rows (a bias add); nothing else broadcasts, so a shape bug cannot pass as a
- * plausible number. */
+ * plausible number. `add` with `div` stores rd(rd(a + b) / div), rd y's dtype: the last step of a
+ * mean summed pairwise, (b0 + b1 + b2) / 3 as a vocoder averages its residual blocks. */
 static int elementwise2(const RadArgs* a, bool mul) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *A = &a->t[0], *B = &a->t[1], *Y = &a->t[2];
     const int64_t n = p_int(a, "n", numel(Y));
+    const float div = mul ? 1.0f : p_f32(a, "div", 1.0f);
+    if (!(div != 0.0f) || !std::isfinite(div)) return RAD_E_INVAL;
     if (n <= 0) return RAD_E_SHAPE;
     const int64_t rows = rows_of(Y, n);
     if (rows <= 0 || numel(A) < rows * n) return RAD_E_SHAPE;
@@ -269,7 +272,9 @@ static int elementwise2(const RadArgs* a, bool mul) {
         const int64_t as = laststride(A), bs = laststride(B), ys = laststride(Y);
         for (int64_t i = 0; i < n; ++i) {
             float u = ldt(A, ab + i * as), v = ldt(B, bb + i * bs);
-            stt(Y, yb + i * ys, mul ? u * v : u + v);
+            float s = mul ? u * v : u + v;
+            if (div != 1.0f) s = round_dt(Y->dtype, s) / div;
+            stt(Y, yb + i * ys, s);
         }
     }
     return RAD_OK;
@@ -652,13 +657,15 @@ int ref_conv2d_unfold(const RadArgs* a, RadStream) {
 
 /* ------------------------------------------------------------------ conv1d_dw */
 /* A causal depthwise convolution over time: y[t, c] = sum_j w[c, j] * x[t - (k-1) + j, c], the
- * rows before the segment's start (cu[s] / cu_div) read as zeros. `w` is PyTorch's depthwise
- * [C, 1, k]. f32 accumulation, one rounding. */
+ * rows before the segment's start (cu[s] / cu_div) read as zeros, plus `b` [C] when bound. `w` is
+ * PyTorch's depthwise [C, 1, k]. f32 accumulation, one rounding. */
 int ref_conv1d_dw(const RadArgs* a, RadStream) {
     if (!have(a, 4)) return RAD_E_INVAL;
     const RadTensor *X = &a->t[0], *Wt = &a->t[1], *cu = &a->t[2], *Y = &a->t[3];
+    const RadTensor *B = t_in(a, 4);
     const int64_t C = p_int(a, "n", 0), K = p_int(a, "k", 0), cdiv = p_int(a, "cu_div", 1);
-    if (C <= 0 || K <= 0 || cdiv <= 0 || numel(Wt) < C * K) return RAD_E_SHAPE;
+    if (C <= 0 || K <= 0 || cdiv <= 0 || numel(Wt) < C * K || (B && numel(B) < C))
+        return RAD_E_SHAPE;
     const int64_t S = numel(cu) - 1;
     if (S <= 0) return RAD_E_SHAPE;
     const int64_t Mx = rows_of(X, C), My = rows_of(Y, C);
@@ -681,6 +688,7 @@ int ref_conv1d_dw(const RadArgs* a, RadStream) {
                     if (tt < t0) continue;
                     acc += ldt(X, rowoff(X, tt, C) + c * xs) * ldt(Wt, c * K + j);
                 }
+                if (B) acc += ldt(B, c);
                 stt(Y, yb + c * ys, acc);
             }
         }

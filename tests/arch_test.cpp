@@ -5696,6 +5696,88 @@ TEST(qwen35_fp8_steps_lint_clean_with_its_mtp_head) {
     lint_qwen35_fp8_family(qwen35_fp8::declare, qwen35_fp8::step, mk.meta(), 3, false, 0);
 }
 
+namespace {
+
+/* Every trunk and MTP linear of a qwen35 container in the 4-bit form an int4 W4A16 release
+ * imports to: u4 codes, an f16 scale and a u4 zero point per 128 of K. */
+std::vector<std::pair<std::string, RadEncoding>> int4_linears() {
+    RadEncoding w4 = rad_enc_affine(RAD_U4, RAD_F16, 1, 128);
+    rad_enc_add_plane(&w4, "zero", RAD_U4, 1, 128);
+    std::vector<std::pair<std::string, RadEncoding>> e;
+    for (const char* k : { "attn_qg.weight", "attn_k.weight", "attn_v.weight",
+                           "attn_output.weight", "ssm_inz.weight", "ssm_out.weight",
+                           "ffn_gate_up.weight", "ffn_down.weight" })
+        e.emplace_back(k, w4);
+    return e;
+}
+
+int qwen35_fp8_int4_declare(RadBuilder* b, const RadModelMeta* m, const RadBuildCtx* c) {
+    b->encs = int4_linears();
+    return qwen35_fp8::declare(b, m, c);
+}
+
+}  /* namespace */
+
+/* An int4 container's linears are read by the 4-bit GEMMs over their input's bf16 plane: at or
+ * below 64 rows a `cast` to f16 and w4a16_asym, above that quant_act_i8g's int8 codes and
+ * w4a8i8_asym, both over the codes and the joined (scale, zero) view. No linear keeps an fp8a8
+ * GEMM, and the gated fold (an fp8a8 tile) is not declared over a 4-bit gate_up. */
+TEST(qwen35_fp8_reads_an_int4_container_with_the_4bit_gemms) {
+    MetaKV mk = q35fp8_meta();
+    RadBuilder b;
+    RadBuildCtx ctx = build_ctx();
+    REQUIRE_EQ(qwen35_fp8_int4_declare(&b, mk.meta(), &ctx), RAD_OK);
+    int f16 = 0, i8 = 0, other = 0;
+    for (const auto& o : b.ops) {
+        if (o.op != "gemm_nt_q") continue;
+        const std::string dt = pstr(&o, "dtype");
+        const RecParam* m = param(&o, "M");
+        REQUIRE(m != nullptr);
+        if (dt == "w4a16_asym") {
+            ++f16;
+            CHECK_EQ(m->ival, 1LL);
+            CHECK_EQ(m->ihi, 64LL);
+        } else if (dt == "w4a8i8_asym") {
+            ++i8;
+            CHECK_EQ(m->ival, 65LL);
+            CHECK_EQ(m->ihi, 256LL);
+        } else {
+            ++other;
+        }
+        CHECK_EQ(pint(&o, "group"), 128);
+    }
+    /* q|gate, k, v, o for 2 attention layers; qkv|z and out for 6 delta-net layers; gate_up and
+     * down for 8 feed-forwards: 36 linears, each with both GEMMs, a cast and a quantiser. */
+    CHECK_EQ(f16, 36);
+    CHECK_EQ(i8, 36);
+    CHECK_EQ(other, 0);
+    int casts = 0;
+    for (const auto& o : b.ops)
+        if (o.op == "cast" && pstr(&o, "to") == "f16") {
+            ++casts;
+            CHECK_EQ(pstr(&o, "from"), std::string("bf16"));
+            CHECK_EQ(param(&o, "M")->ihi, 64LL);
+        }
+    CHECK_EQ(casts, 36);
+    CHECK_EQ(count_op(b, "quant_act_i8g"), 36);
+    CHECK_EQ(count_op(b, "gemm_nt_q_gated"), 0);
+    int joined = 0;
+    for (const RecWeight& w : b.weights)
+        if (w.d.planes && std::string(w.d.planes) == "scale,zero") {
+            ++joined;
+            CHECK_EQ(w.d.dtype, (uint32_t)RAD_F16);
+        }
+    CHECK_EQ(joined, 36);
+}
+
+/* Every engine step an int4 container runs lints clean at one and two ranks, the MTP head's
+ * history pass and rounds included: the 4-bit linears' row parts and shards are cut like the
+ * block-fp8 ones. */
+TEST(qwen35_fp8_int4_steps_lint_clean_with_its_mtp_head) {
+    MetaKV mk = q35fp8_meta();
+    lint_qwen35_fp8_family(qwen35_fp8_int4_declare, qwen35_fp8::step, mk.meta(), 3, false, 0);
+}
+
 /* The head is a serial drafter at the deployment's depth, declared after the trunk's lm_head:
  * the planner reads declaration order as liveness, and the head's passes run after the trunk. */
 TEST(qwen35_fp8_declares_its_mtp_head_after_the_trunk) {

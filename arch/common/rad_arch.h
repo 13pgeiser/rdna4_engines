@@ -417,6 +417,48 @@ inline RadNameMap map_base(const char* declared, int mode) {
     return m;
 }
 
+/* Row ranges of checkpoint tensors joined along dim 0 (RAD_MAP_ROWS): each piece is (source,
+ * first row, rows). */
+struct RowPiece { const char* src; int first; int64_t rows; };
+inline int map_rows(RadBuilder* b, const char* declared, std::initializer_list<RowPiece> pieces) {
+    RadNameMap m = map_base(declared, RAD_MAP_ROWS);
+    for (const RowPiece& p : pieces) {
+        if (m.n_src >= 8) return RAD_E_INVAL;
+        m.src[m.n_src] = p.src;
+        m.src_index[m.n_src] = p.first;
+        m.src_rows[m.n_src] = p.rows;
+        ++m.n_src;
+    }
+    return rad_decl_name_map(b, &m);
+}
+
+/* A weight-normalised checkpoint tensor folded into its plain weight (RAD_MAP_WNORM). */
+inline int map_wnorm(RadBuilder* b, const char* declared, const char* g, const char* v) {
+    RadNameMap m = map_base(declared, RAD_MAP_WNORM);
+    m.n_src  = 2;
+    m.src[0] = g;
+    m.src[1] = v;
+    return rad_decl_name_map(b, &m);
+}
+
+/* A linear the checkpoint keeps as (in, out), read as (out, in): src's last two dimensions
+ * swapped (RAD_MAP_TRANSPOSE). */
+inline int map_transpose(RadBuilder* b, const char* declared, const char* src) {
+    RadNameMap m = map_base(declared, RAD_MAP_TRANSPOSE);
+    m.n_src  = 1;
+    m.src[0] = src;
+    return rad_decl_name_map(b, &m);
+}
+
+/* An EMA codebook: the embedding sums over max(cluster usage, 1e-5), row by row (RAD_MAP_EMA). */
+inline int map_ema(RadBuilder* b, const char* declared, const char* sums, const char* usage) {
+    RadNameMap m = map_base(declared, RAD_MAP_EMA);
+    m.n_src  = 2;
+    m.src[0] = sums;
+    m.src[1] = usage;
+    return rad_decl_name_map(b, &m);
+}
+
 /* A checkpoint tensor copied through unchanged. */
 inline int map_copy(RadBuilder* b, const char* declared, const char* src) {
     RadNameMap m = map_base(declared, RAD_MAP_COPY);

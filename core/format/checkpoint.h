@@ -17,8 +17,8 @@
  * convert time.
  *
  * An imported quantisation's descriptor (`auto-round`, `gptq`, `quark`, `compressed-tensors`,
- * `paroquant`) names the tool, not a served form, so no plugin claims it; Checkpoint::imports()
- * describes how the plugin is chosen.
+ * `paroquant`, `modelopt`) names the tool, not a served form, so no plugin claims it;
+ * Checkpoint::imports() describes how the plugin is chosen.
  */
 #pragma once
 #include "../rad_internal.h"
@@ -31,6 +31,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace rad {
@@ -54,12 +55,16 @@ struct SrcTensor {
      * scale row covers. 0 for other tensors. */
     int32_t              gptq_bits = 0;
     int64_t              gptq_group = 0;
-    /* CT-INT4 (compressed-tensors' symmetric pack-quantized int4): `data` is X.weight_packed's
-     * int32 words [N, K / 8], eight codes per word along K from the low bits up, unsigned with zero
-     * point 8. The tensor described is the logical [N, K] code matrix, `rad_dtype` RAD_I4;
-     * `ct_group` is the K columns one scale of X.weight_scale [N, K / group] covers. 0 for other
-     * tensors. */
+    /* CT-INT4 (compressed-tensors' pack-quantized int4): `data` is X.weight_packed's int32 words
+     * [N, K / 8], eight codes per word along K from the low bits up, each the signed code plus 8.
+     * The tensor described is the logical [N, K] code matrix, `rad_dtype` RAD_I4 (symmetric) or
+     * RAD_U4 (asymmetric, the stored nibbles); `ct_group` is the K columns one scale of
+     * X.weight_scale [N, K / group] covers. 0 for other tensors. */
     int64_t              ct_group = 0;
+    /* An asymmetric CT-INT4 weight's X.weight_zero_point: int32 [ceil(N / 8), G], eight zero
+     * points per word along N from the low bits up, each the signed zero point plus 8
+     * (compressed-tensors packs it along dim 0). Null for a symmetric weight. */
+    const SrcTensor*     ct_zero = nullptr;
     /* ParoQuant's int5-bitplane (Import::ParoI5): `data` is the AWQ-packed low nibbles qweight
      * [K, N/8] and the tensor described is the logical [N, K] u5 code matrix; `aux` are the fifth-bit
      * plane qweight_hi [K, N/32], and the zero points qzeros [G, N/8] and qzeros_hi [G, N/32].
@@ -131,6 +136,9 @@ public:
     /* Sub-tensor `index` along dim 0 of a stacked (rank >= 2) tensor, as a view owned here and
      * valid for the checkpoint's life. Null, with the reason logged, if there is no such slice. */
     const SrcTensor* slice(const SrcTensor& st, int index, const char* declared);
+    /* Rows [r0, r0 + n) along dim 0 of a plainly stored tensor, as a view owned here (a
+     * RAD_MAP_ROWS piece). Null, with the reason logged, when the rows are not there. */
+    const SrcTensor* rows(const SrcTensor& st, int64_t r0, int64_t n, const char* declared);
 
     /* FP8's block, from quantization_config.weight_block_size; 128x128 when it says nothing. */
     int64_t fp8_block_rows() const { return fp8_br_; }
@@ -141,21 +149,24 @@ public:
      * (zero point stored less one). QuarkMx: Quark's MXFP4 (fp4 weights, per_group 32, e8m0
      * scales, no per-layer overrides). ParoMx: ParoQuant's `paroquant_mxfp4` (Quark's codes and
      * exponents in a rotated basis, rotations beside them). CtInt4, Nvfp4, CtFp8:
-     * compressed-tensors' pack-quantized int4, a release with an nvfp4-pack-quantized group, and
-     * one whose groups are all float-quantized FP8 (detect_import). In an Nvfp4 or CtFp8 release
-     * every weight without the NVFP4 tensors reads stock, so FP8 and bf16 linears beside the
-     * NVFP4 ones read by their own form. An unreadable form of these stays None, with the reason
-     * in import_refusal(). The quantization_config keys are then renamed
-     * `imported_quantization_config.*`, since they describe the tool, not a served format. */
-    enum class Import { None, Gptq, QuarkMx, CtInt4, ParoMx, ParoI5, ParoI4, Nvfp4, CtFp8 };
+     * compressed-tensors' pack-quantized int4 (symmetric, or asymmetric with a zero point), a
+     * release with an nvfp4-pack-quantized group, and one whose groups are all float-quantized FP8
+     * (detect_import). ModelOpt: NVIDIA ModelOpt's NVFP4, FP8, or both per layer
+     * (MIXED_PRECISION). In an Nvfp4, CtFp8 or ModelOpt release every weight without the NVFP4
+     * tensors reads stock, so FP8 and bf16 linears beside the NVFP4 ones read by their own form.
+     * An unreadable form of these stays None, with the reason in import_refusal(). The
+     * quantization_config keys are then renamed `imported_quantization_config.*`, since they
+     * describe the tool, not a served format. */
+    enum class Import { None, Gptq, QuarkMx, CtInt4, ParoMx, ParoI5, ParoI4, Nvfp4, CtFp8,
+                        ModelOpt };
     Import imports() const { return import_; }
     const std::string& import_refusal() const { return import_why_; }
 
     /* The pieces an imported `name` (a `.weight`) is read from, as views owned here: GPTQ-packed
      * codes and their scales, Quark's codes and exponents as RAD dtypes, or NVFP4's codes as fp4
-     * beside an f32 scale plane derived from the e4m3 scales and the global scale. RAD_E_NOTFOUND
-     * when `name` is an ordinary tensor or absent; another error, with `why`, for an unreadable
-     * imported form. */
+     * beside an f32 scale plane derived from the e4m3 scales and the second level (a divisor in
+     * compressed-tensors, a multiplier in ModelOpt). RAD_E_NOTFOUND when `name` is an ordinary
+     * tensor or absent; another error, with `why`, for an unreadable imported form. */
     int import_piece(const std::string& name, const SrcTensor** codes, const SrcTensor** scale,
                      std::string* why);
 
@@ -166,6 +177,7 @@ private:
                   const std::unordered_map<std::string, std::string>* owner = nullptr);
     int open_safetensors(const std::string& path);
     int open_diffusers();
+    int add_companions();
     int open_gguf(const std::string& path);
     void detect_import();
 
@@ -185,11 +197,27 @@ private:
     Import      import_ = Import::None;
     std::string import_why_;
     int64_t     ct_group_ = 0;   /* CtInt4: the group every weight's config states */
+    bool        ct_asym_  = false;   /* CtInt4: the config states asymmetric weights */
     /* import_piece's answers by name, so a weight resolved twice reuses its views. */
     std::unordered_map<std::string, std::pair<const SrcTensor*, const SrcTensor*>> imported_;
 };
 
 /* ================================================================== logical weights */
+/* Another spelling of the numbers a weight ships, asked for by a recipe's `import` rule
+ * (ckpt_import_form). Each field left at its default keeps that part as the import writes it.
+ *
+ *   codes   an unsigned dtype of the shipped codes' width: a symmetric grid's signed codes c are
+ *           written c + 2^(bits-1) under a zero point of 2^(bits-1), so (u - z) * s == c * s;
+ *   zero    the zero plane's dtype (a shipped or re-expressed zero point), which must hold it;
+ *   scale   the scale plane's dtype, each shipped scale rounded to nearest (counted when that
+ *           changes it);
+ *   block   a scale shipped once per row or per tensor (FP8) repeated over this block grid,
+ *           which every block's rows must share. */
+struct ImportForm {
+    uint32_t codes = RAD_DT_INVALID, zero = RAD_DT_INVALID, scale = RAD_DT_INVALID;
+    int64_t  block[2] = { 0, 0 };
+};
+
 /* A declared weight's source, as the name map resolves it: pieces joined along `concat_dim`, and
  * for block-scaled FP8 each piece's scale plane beside it. */
 struct CkptWeight {
@@ -216,6 +244,22 @@ struct CkptWeight {
      * piece (a row part: gate and up, or q, k and v, each rotated separately). */
     bool        paro = false;
     std::vector<const SrcTensor*> pq_pairs, pq_theta, pq_scale;
+    /* A weight-normalised tensor (RAD_MAP_WNORM): `pieces` is its direction v alone, and every
+     * element of v with first index i reads times wnorm_scale[i] = g_i / ||v_i||. Not trivial
+     * (the values change), so a recipe rule stores it. */
+    bool        wnorm = false;
+    std::vector<float> wnorm_scale;
+    /* A weight computed from its sources at resolve (RAD_MAP_TRANSPOSE, RAD_MAP_EMA): its f32
+     * values in the logical shape, which ckpt_rows_f32 serves. Not trivial, so a recipe rule
+     * stores it. */
+    std::vector<float> derived;
+    /* An `import` rule's form, applied by ckpt_plane_rows (also `imported`). `rounded` counts the
+     * shipped scales `form.scale` does not hold exactly and `max_rel` is their largest relative
+     * change, both found by ckpt_import_form. */
+    bool        reform = false;
+    ImportForm  form{};
+    int64_t     rounded = 0;
+    double      max_rel = 0;
     RadEncoding enc{};
     std::string why;
 };
@@ -225,6 +269,24 @@ struct CkptWeight {
  * there; anything else with the reason in `why`. */
 int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, bool optional,
                  CkptWeight* out, std::string* why);
+
+/* The quantiser name of a recipe rule rad-convert handles itself through ckpt_import_form. */
+constexpr const char* kImportRule = "import";
+
+/* An import rule's options (codes=DTYPE, zero=DTYPE, scale=DTYPE, block=RxC) as an ImportForm.
+ * RAD_E_INVAL, with the option named in `why`, for an option it does not take or a value it
+ * cannot read. */
+int ckpt_import_form_parse(const std::vector<std::pair<std::string, std::string>>& options,
+                           ImportForm* f, std::string* why);
+
+/* Re-express a resolved `w` as `f` asks (a recipe's `import` rule): RAD_OK with `w->enc` the new
+ * encoding and the form recorded for ckpt_plane_rows. RAD_E_UNSUPPORTED, with `why`, when `w` is
+ * a plain float weight with nothing shipped to re-express (the rule declines it); any other error,
+ * with `why`, when its shipped form cannot take `f`: a form other than an integer grid (GPTQ,
+ * CT-INT4) or an FP8 weight with one scale per row or per tensor, a code or zero dtype that does
+ * not hold the shipped values, or a block whose rows carry different scales. Rounding a scale to
+ * `f.scale` is allowed and counted in `w->rounded`. */
+int ckpt_import_form(CkptWeight* w, const ImportForm& f, std::string* why);
 
 /* The checkpoint tensor a piece or scale reads: its name without the "[index]" a slice of a
  * stacked tensor carries, so an expert reads the stack it was cut from. */

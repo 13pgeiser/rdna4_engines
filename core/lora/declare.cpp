@@ -28,6 +28,38 @@ bool is_coded(uint32_t dt) {
     return dt == RAD_F8E4M3 || dt == RAD_F8E5M2 || dt == RAD_I8;
 }
 
+/* The block of a scale stream of `blocks` groups over `ext` elements, as the kernel libraries
+ * read one (libref/ref_gemm.h's grid_block): the power of two whose ceiling division gives
+ * `blocks`, else the plain ceiling; one group is the whole extent. */
+int64_t grid_block(int64_t ext, int64_t blocks) {
+    if (ext <= 0) return 1;
+    if (blocks <= 1) return ext;
+    const int64_t lo = (ext + blocks - 1) / blocks;
+    int64_t b = 1;
+    while (b < lo) b <<= 1;
+    return (ext + b - 1) / b == blocks ? b : lo;
+}
+
+/* The scale grid of a coded activation the GEMM `reads`: the read set's one f32 buffer beside
+ * the codes (reads[0]), [rows, groups] or one scale a row, over the codes' full width. The
+ * GEMM's own `group` is the weight's (an MXFP4 weight's 32-wide exponent block reads an
+ * activation scaled per 128), and a GEMM may read a column span of the activation, so neither
+ * its `group` nor its K gives the activation's grid. 0 when the stream is not one f32 buffer. */
+int64_t activation_grid(const Program& P, const std::vector<rad_buf>& reads) {
+    const RadBufDecl& a = P.buffers[reads[0]].decl;
+    const RadBufDecl* s = nullptr;
+    for (size_t i = 1; i < reads.size(); ++i) {
+        const RadBufDecl& d = P.buffers[reads[i]].decl;
+        if (d.dtype != RAD_F32) continue;
+        if (s) return 0;
+        s = &d;
+    }
+    if (!s || a.rank < 1 || s->rank < 1) return 0;
+    const int64_t width = a.shape[a.rank - 1];
+    const int64_t groups = s->rank >= 2 ? s->shape[s->rank - 1] : 1;
+    return groups > 0 ? grid_block(width, groups) : 0;
+}
+
 rad_buf decl_persist(Builder& b, const std::string& name, uint32_t dtype, uint32_t rank,
                      const int64_t* shape) {
     RadBufDecl d{};
@@ -44,6 +76,16 @@ rad_buf decl_persist(Builder& b, const std::string& name, uint32_t dtype, uint32
 int lora_declare(Builder& b, const LoraDeclare& d) {
     if (!d.cfg || !d.cfg->enabled()) return RAD_OK;
     Program& P = b.program();
+    /* Adapters are chosen per request and applied on the token steps of a model that writes
+     * logits; a generator's passes and an embedding model's requests carry no adapter. */
+    if (P.is_pass_driven() || P.pooled_buf != RAD_NULL_HANDLE ||
+        P.logits_buf == RAD_NULL_HANDLE) {
+        RAD_ERR("lora: runtime LoRA adapters serve a model that generates text, and this one %s",
+                P.is_pass_driven()                  ? "is an image, audio or video generator"
+                : P.pooled_buf != RAD_NULL_HANDLE ? "makes embeddings"
+                                                    : "declares no logits");
+        return RAD_E_UNSUPPORTED;
+    }
     const int     S = d.cfg->slots();
     const int     max_rank = d.cfg->max_rank;
     const int64_t max_tok = P.ctx.max_tok;
@@ -53,10 +95,8 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
         return RAD_E_INVAL;
     }
 
-    /* EVERY READER OF A TARGETED WEIGHT CARRIES THE DELTA, OR STARTUP REFUSES. A targeted weight
-     * that some op multiplies without the adapter is a model that is the base in one place and the
-     * adapter in another, and the text it writes is wrong in a way no test of the targeted GEMM
-     * would show. */
+    /* Every reader of a targeted weight carries the delta, or startup refuses: a weight some op
+     * multiplies without the adapter would be the base in one place and the adapter in another. */
     std::vector<lora::UnsupportedUse> bad;
     int s = lora::find_unsupported_uses(P, d.targets, &bad);
     if (s < 0) return s;
@@ -110,10 +150,10 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
         }
     }
 
-    /* ---- t = A.x, one f32 plane per capacity R and lane. PERSIST and not TRANSIENT: the ops that
-     * use it are issued inside the GEMM's issue, at the GEMM's position, while the buffer plan would
-     * place a transient by the appended ops' own position at the end of the program -- and share
-     * its bytes with whatever is live there. */
+    /* ---- t = A.x, one f32 plane per capacity R and lane. Persistent, not transient: the ops that
+     * use it run at the GEMM's position, but the buffer plan would place a transient at the
+     * appended ops' own position, the end of the program, and share its bytes with buffers live
+     * mid-program. */
     std::map<int64_t, int32_t> t_by_r;
     P.lora_t.clear();
     for (const lora::Site& x : sites) {
@@ -136,14 +176,13 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
         const uint32_t gh = x.gemm;
         if (gh == 0 || gh >= P.ops.size()) return RAD_E_STATE;
         if (!b.op_resolved(gh)) continue;   /* never handed to the plugin, so never issued */
-        /* Copied out first: decl_op below appends to P.ops and moves every OpInfo. */
+        /* Copied out first: decl_op below appends to P.ops, which may move every OpInfo. */
         const OpInfo&  g = P.ops[gh];
         const std::string gop = g.op;
         const std::string rkey = g.ranged_key;
         const int64_t  lo = g.range_lo, hi = g.range_hi;
-        long long gk = 0, gn = 0, gg = 0;
+        long long gk = 0, gn = 0;
         const bool     has_k = g.base.get_i("K", &gk), has_n = g.base.get_i("N", &gn);
-        const bool     has_group = g.base.get_i("group", &gg) && gg > 0;
         const int      oa = opd_index(g, "a"), oas = opd_index(g, "a_scale"), oy = opd_index(g, "y");
         const std::vector<rad_buf> reads = b.op_read_set(gh), writes = b.op_write_set(gh);
 
@@ -167,6 +206,12 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
         const uint32_t y_dt = P.buffers[writes[0]].decl.dtype;
         const bool coded = is_coded(a_dt);
         if (coded && oas < 0) { refuse("a coded activation and no `a_scale` operand"); continue; }
+        const int64_t a_grid = coded ? activation_grid(P, reads) : 0;
+        if (coded && a_grid <= 0) {
+            refuse("a coded activation whose read set holds no single f32 scale stream beside the "
+                   "codes, so the grid lora_shrink reads it at is not known at declare");
+            continue;
+        }
 
         RadParam sp[6];
         int n_sp = 0;
@@ -174,7 +219,7 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
         sp[n_sp++] = RAD_INT("K", x.K_r);
         sp[n_sp++] = RAD_INT("R", x.R);
         sp[n_sp++] = RAD_INT("S", S);
-        if (coded && has_group) sp[n_sp++] = RAD_INT("group", gg);
+        if (coded) sp[n_sp++] = RAD_INT("group", a_grid);
         sp[n_sp++] = RAD_STR("dtype", rad_dtype_name(a_dt));
         const rad_op hs = b.decl_op("lora_shrink", sp, n_sp, nullptr, 0);
 
@@ -200,10 +245,6 @@ int lora_declare(Builder& b, const LoraDeclare& d) {
         P.ops[he].anchor = (int32_t)gh;
         P.ops[gh].lora_site = (int32_t)P.lora_sites.size();
         P.lora_sites.push_back(is);
-
-        x.lora_shrink = hs; x.lora_expand = he;
-        const LoraPool& lp = P.lora_pools[(size_t)x.pool];
-        x.pool_a = lp.a; x.pool_b = lp.b; x.pool_scale = lp.scale;
     }
     if (n_refused) return RAD_E_UNSUPPORTED;
 

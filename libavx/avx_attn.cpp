@@ -532,7 +532,8 @@ AVX_BF16_TARGET static bool attn_dense_bf16(const RadTensor* q, const RadTensor*
                                             const RadTensor* v, const RadTensor* cu,
                                             const RadTensor* o, int64_t D, int64_t gqa,
                                             int64_t kv_heads, int causal, int64_t window,
-                                            int64_t block, int64_t cdiv, float scale, int64_t q_rs, int64_t q_hs, int64_t q_ds,
+                                            int64_t wright, int64_t block, int64_t cdiv,
+                                            float scale, int64_t q_rs, int64_t q_hs, int64_t q_ds,
                                             int64_t k_rs, int64_t k_hs, int64_t k_ds, int64_t v_rs,
                                             int64_t v_hs, int64_t v_ds, int64_t o_rs, int64_t o_hs,
                                             int64_t o_ds) {
@@ -589,7 +590,7 @@ AVX_BF16_TARGET static bool attn_dense_bf16(const RadTensor* q, const RadTensor*
         int64_t jbeg = 0, jend = causal ? q1 : len;
         if (window > 0) {
             jbeg = std::max<int64_t>(0, q0 - window + 1);
-            if (!causal) jend = std::min<int64_t>(len, q1 - 1 + window);
+            if (!causal) jend = std::min<int64_t>(len, q1 - 1 + wright);
         }
         if (block > 0) {
             jbeg = std::max<int64_t>(jbeg, q0 / block * block);
@@ -617,7 +618,8 @@ AVX_BF16_TARGET static bool attn_dense_bf16(const RadTensor* q, const RadTensor*
                     for (int64_t j = 0; j < kt; ++j) {
                         const int64_t d = i - (j0 + j);
                         bool ok = !causal || d >= 0;
-                        if (window > 0) ok = ok && (causal ? d < window : (d < window && -d < window));
+                        if (window > 0)
+                            ok = ok && (causal ? d < window : (d < window && -d < wright));
                         if (block > 0) ok = ok && i / block == (j0 + j) / block;
                         if (!ok) S[r * KT + j] = -INFINITY;
                     }
@@ -729,12 +731,16 @@ AVX_KERNEL(attn_dense) {
     const int64_t head_dim = p_int(a, "head_dim", q->rank >= 3 ? q->shape[q->rank - 1] : 0);
     const int64_t gqa = p_int(a, "gqa", 1);
     const int causal = (int)p_int(a, "causal", 0);
-    /* As libref: causal, i - j < window; non-causal, |i - j| < window; 0 means none. A `block`
-     * cuts a segment into blocks attending within themselves; `cu_div` reads cu_seqlens in units
-     * that many rows apart. */
-    const int64_t window = p_int(a, "window", 0);
+    /* As libref: causal, i - j < window; non-causal, |i - j| < window, or i - j < window and
+     * j - i < window_right when that is given; 0 means none. A `block` cuts a segment into blocks
+     * attending within themselves; `cu_div` reads cu_seqlens in units that many rows apart. */
+    const int64_t window = p_int(a, "window", 0), wright_p = p_int(a, "window_right", 0);
     const int64_t block = p_int(a, "block", 0), cdiv = p_int(a, "cu_div", 1);
-    if (head_dim <= 0 || gqa <= 0 || window < 0 || block < 0 || cdiv <= 0) return RAD_E_SHAPE;
+    if (head_dim <= 0 || gqa <= 0 || window < 0 || block < 0 || cdiv <= 0 || wright_p < 0 ||
+        (wright_p > 0 && (causal || window == 0)))
+        return RAD_E_SHAPE;
+    /* The right side of a non-causal window. */
+    const int64_t wright = wright_p > 0 ? wright_p : window;
     if (head_dim > AVX_HD_MAX) return RAD_E_UNSUPPORTED;
 
     /* A rank-2 operand is [tokens, heads * head_dim]: its head count is width / head_dim. */
@@ -768,8 +774,8 @@ AVX_KERNEL(attn_dense) {
 
     const float scale = p_f32(a, "scale", 1.0f / std::sqrt((float)head_dim));
 #if AVX_LEVEL == 3
-    if (attn_dense_bf16(q, k, v, cu, o, head_dim, gqa, kv_heads, causal, window, block, cdiv,
-                        scale, q_rs,
+    if (attn_dense_bf16(q, k, v, cu, o, head_dim, gqa, kv_heads, causal, window, wright, block,
+                        cdiv, scale, q_rs,
                         q_hs, q_ds, k_rs, k_hs, k_ds, v_rs, v_hs, v_ds, o_rs, o_hs, o_ds))
         return RAD_OK;
 #endif
@@ -792,7 +798,7 @@ AVX_KERNEL(attn_dense) {
             int64_t jbeg = b0, jend = causal ? (i + 1) : b1;
             if (window > 0) {
                 jbeg = std::max<int64_t>(b0, i - window + 1);
-                if (!causal) jend = std::min<int64_t>(b1, i + window);
+                if (!causal) jend = std::min<int64_t>(b1, i + wright);
             }
             if (block > 0) {
                 const int64_t blk = b0 + (i - b0) / block * block;
@@ -1067,6 +1073,14 @@ AVX_KERNEL(kv_store) {
  * frequencies, and for `axial` a frequency ladder per section. Same rule as libref's rope_freqs. */
 enum { ROPE_NEOX = 0, ROPE_GPTJ = 1, ROPE_MROPE = 2, ROPE_IMROPE = 3, ROPE_AXIAL = 4 };
 
+/* A position as libref's rope_pos reads it, divided by the position scale: a float operand's own
+ * value (a fractional coordinate), an integer operand's integer. */
+static inline float rope_pos(const RadTensor* pos, int64_t off, float div) {
+    const uint32_t dt = pos->dtype;
+    const bool flt = dt == RAD_F32 || dt == RAD_BF16 || dt == RAD_F16;
+    return (flt ? ldt(pos, off) : (float)ldi(pos, off)) / div;
+}
+
 /* cos in [0, half), sin in [half, rot): the layout `rope_table` writes.
  *
  * Not sincosf: it gives the same bits but glibc's joint wrapper is slower than two separate
@@ -1218,6 +1232,14 @@ AVX_KERNEL(rope) {
         if (mode == ROPE_AXIAL || rscale != 1.0f) return RAD_E_UNSUPPORTED;
         for (int64_t i = 0; i < half; ++i) invf[i] = yarn.frequency(invf[i], (int)i);
     }
+    /* Llama 3's frequency scaling, refused beside YaRN or a multi-component mode as libref
+     * refuses it. */
+    const RadLlama3 l3 = rad_llama3_args(a);
+    if (!rad_llama3_valid(l3) || (l3.factor != 0.0f && yarn.factor != 0.0f)) return RAD_E_INVAL;
+    if (l3.factor != 0.0f) {
+        if (mode == ROPE_AXIAL || multi) return RAD_E_UNSUPPORTED;
+        for (int64_t i = 0; i < half; ++i) invf[i] = l3.frequency(invf[i]);
+    }
     for (int64_t i = nfreq; i < half; ++i) invf[i] = 0.0f;
     const int64_t pcs = multi ? pos->stride[0] : 0, pms = multi ? pos->stride[1] : 0;
 
@@ -1229,10 +1251,10 @@ AVX_KERNEL(rope) {
         float* buf = scratch_f32_b((size_t)rot);
         if (multi) {
             float pc[8];
-            for (int64_t c = 0; c < n_comp; ++c) pc[c] = (float)ldi(pos, c * pcs + m * pms) / div;
+            for (int64_t c = 0; c < n_comp; ++c) pc[c] = rope_pos(pos, c * pcs + m * pms, div);
             angles_multi(cs, invf, comp, half, pc);
         } else {
-            angles(cs, invf, half, (float)ldi(pos, offlin(pos, m)) / div);
+            angles(cs, invf, half, rope_pos(pos, offlin(pos, m), div));
         }
         if (yarn.factor != 0.0f)
             for (int64_t i = 0; i < rot; ++i) cs[i] *= yarn.magnitude;
@@ -1244,14 +1266,16 @@ AVX_KERNEL(rope) {
 }
 
 /* ------------------------------------------------------------------ qk_norm_rope */
-/* Per-head RMS norm with its own gain, then RoPE.
+/* Per-head RMS norm with its own gain, then RoPE. An absent gain is a unit gain without `wadd`,
+ * and `rotary_dim` 0 is the norm alone, `positions` then optional (libref).
  *
  * The norm output is rounded to the tensor's dtype before the rotation, as the unfused pair does
  * (and libr4d's r4d_qk_norm_rope_gate matches): it is stored with out_row and re-read by the
  * rotation rather than kept in f32. */
 AVX_KERNEL(qk_norm_rope) {
-    if (!rad_args_have(a, 4)) return RAD_E_INVAL;
-    const RadTensor *qkv = &a->t[0], *pos = &a->t[1], *qw = &a->t[2], *kw = &a->t[3];
+    if (!a || a->n_t < 4 || !rad_arg_in(a, 0)) return RAD_E_INVAL;
+    const RadTensor *qkv = &a->t[0], *pos = rad_arg_in(a, 1);
+    const RadTensor *qw = rad_arg_in(a, 2), *kw = rad_arg_in(a, 3);
 
     const int64_t head_dim = p_int(a, "head_dim", 0);
     const int64_t n_head = p_int(a, "n_head", 0);
@@ -1263,22 +1287,26 @@ AVX_KERNEL(qk_norm_rope) {
     const int v_norm = (int)p_int(a, "v_norm", 0);
     /* libref's modes: `gptj_blocks` is `blocks` with each section's pairs adjacent, (start + 2j,
      * start + 2j + 1), Qwen-Image's 3-axis rotary; `imrope` is `rope`'s interleaved M-RoPE over
-     * NeoX pairs (Qwen3-VL's text attention). */
-    static const char* kModes[] = { "neox", "gptj", "blocks", "gptj_blocks", "imrope" };
-    const int mode = p_enum(a, "mode", kModes, 5, ROPE_NEOX);
+     * NeoX pairs (Qwen3-VL's text attention); `axial` is `rope`'s axial form, its section ladders
+     * over rank-1 positions too. */
+    static const char* kModes[] = { "neox", "gptj", "blocks", "gptj_blocks", "imrope", "axial" };
+    const int mode = p_enum(a, "mode", kModes, 6, ROPE_NEOX);
     if (mode < 0) return RAD_E_UNSUPPORTED;
     const bool blocks = mode == 2 || mode == 3;
     const bool adjacent = mode == 3;
     const bool im = mode == 4;
+    const bool axial = mode == 5;
     const int64_t rot = p_int(a, "rotary_dim", head_dim);
-    if (head_dim <= 0 || n_head <= 0 || rot <= 0 || rot > head_dim || (rot & 1)) return RAD_E_SHAPE;
-    if (numel(qw) < head_dim || numel(kw) < head_dim) return RAD_E_SHAPE;
+    if (head_dim <= 0 || n_head <= 0 || rot < 0 || rot > head_dim || (rot & 1)) return RAD_E_SHAPE;
+    if ((qw && numel(qw) < head_dim) || (kw && numel(kw) < head_dim)) return RAD_E_SHAPE;
+    const bool turn = rot > 0;
+    if (turn && !pos) return RAD_E_INVAL;
 
     /* `blocks` mode (libref): section c is sec[c] pairs over its own 2 * sec[c] channels, paired
      * (start + j, start + sec[c] + j), rotated by position component comps[c]. */
     int64_t sec[8] = {}, comp[8] = {};
     int n_sec = 0;
-    if (im) {
+    if (turn && (im || axial)) {
         for (const char* v = p_str(a, "sections", nullptr); v && *v && n_sec < 8; ) {
             char* end = nullptr;
             const long long x = std::strtoll(v, &end, 10);
@@ -1287,9 +1315,9 @@ AVX_KERNEL(qk_norm_rope) {
             sec[n_sec++] = x;
             v = end;
         }
-        if (n_sec < 3) return RAD_E_SHAPE;
+        if (n_sec < (im ? 3 : 1)) return RAD_E_SHAPE;
     }
-    if (blocks) {
+    if (turn && blocks) {
         for (const char* v = p_str(a, "sections", nullptr); v && *v && n_sec < 8; ) {
             char* end = nullptr;
             const long long x = std::strtoll(v, &end, 10);
@@ -1314,16 +1342,20 @@ AVX_KERNEL(qk_norm_rope) {
             if (k != n_sec) return RAD_E_SHAPE;
         }
     }
-    const bool multi = pos->rank >= 2;
+    const bool multi = pos && pos->rank >= 2;
     const int64_t n_comp = multi ? pos->shape[0] : 1;
-    if (multi && !blocks && !im) return RAD_E_SHAPE;
-    if (multi && im && n_comp < 3) return RAD_E_SHAPE;
-    for (int c = 0; blocks && c < n_sec; ++c)
-        if (comp[c] < 0 || comp[c] >= n_comp || n_comp > 8) return RAD_E_SHAPE;
+    const int64_t stride_row = (n_head + 2 * n_head_kv) * head_dim;
+    if (turn) {
+        if (multi && !blocks && !im && !axial) return RAD_E_SHAPE;
+        if (multi && im && n_comp < 3) return RAD_E_SHAPE;
+        if (multi && axial && n_comp < n_sec) return RAD_E_SHAPE;
+        for (int c = 0; blocks && c < n_sec; ++c)
+            if (comp[c] < 0 || comp[c] >= n_comp || n_comp > 8) return RAD_E_SHAPE;
+    }
+    /* The component axis at the operand's own pitch: a [C, M] view of a wider plane. */
     const int64_t pcs = multi ? pos->stride[0] : 0, pms = multi ? pos->stride[1] : 0;
 
-    const int64_t stride_row = (n_head + 2 * n_head_kv) * head_dim;
-    const int64_t M = multi ? pos->shape[1] : numel(pos);
+    const int64_t M = !pos ? rows_of(qkv, stride_row) : multi ? pos->shape[1] : numel(pos);
     if (M <= 0 || numel(qkv) < M * stride_row) return RAD_E_SHAPE;
     const int64_t rs = qkv->rank >= 2 ? qkv->stride[qkv->rank - 2] : stride_row;
     const int64_t ds = laststride(qkv);
@@ -1337,9 +1369,19 @@ AVX_KERNEL(qk_norm_rope) {
     float* gq = tab + 2 * half;
     float* gk = tab + 2 * half + head_dim;
     /* imrope's component per frequency, as libref's rope_freqs: 1 where i % 3 == 1 and
-     * i < 3 * sec[1], 2 where i % 3 == 2 and i < 3 * sec[2], 0 elsewhere. */
-    const bool by_comp = blocks || (im && multi);
-    if (!blocks) {
+     * i < 3 * sec[1], 2 where i % 3 == 2 and i < 3 * sec[2], 0 elsewhere. axial's sections are
+     * contiguous, each its own ladder theta^(-2j / (2 sec[c])) and filling rot / 2 exactly. */
+    const bool by_comp = blocks || (im && multi) || axial;
+    if (axial) {
+        int64_t i = 0;
+        for (int c = 0; c < n_sec; ++c)
+            for (int64_t j = 0; j < sec[c]; ++j, ++i) {
+                if (i >= half) return RAD_E_SHAPE;
+                invf[i] = 1.0f / sc_pow(theta, (float)(2 * j) / (float)(2 * sec[c]));
+                pcomp[i] = (float)c;
+            }
+        if (i != half) return RAD_E_SHAPE;
+    } else if (!blocks) {
         for (int64_t i = 0; i < half; ++i) {
             invf[i] = 1.0f / sc_pow(theta, (float)(2 * i) / (float)rot);
             pcomp[i] = !im ? 0.0f
@@ -1355,19 +1397,19 @@ AVX_KERNEL(qk_norm_rope) {
             }
     }
     for (int64_t d = 0; d < head_dim; ++d) {
-        gq[d] = ldt(qw, d * laststride(qw)) + wadd;
-        gk[d] = ldt(kw, d * laststride(kw)) + wadd;
+        gq[d] = qw ? ldt(qw, d * laststride(qw)) + wadd : 1.0f;
+        gk[d] = kw ? ldt(kw, d * laststride(kw)) + wadd : 1.0f;
     }
 
     AVX_PARALLEL_FOR_IF(M * (n_head + n_head_kv) * head_dim >= AVX_PAR_MIN)
     for (int64_t m = 0; m < M; ++m) {
         const float div = rscale != 0.0f ? rscale : 1.0f;
-        float pc[8];
-        if (multi)
+        float pc[8] = {};
+        if (turn && multi)
             for (int64_t c = 0; c < n_comp && c < 8; ++c)
-                pc[c] = (float)ldi(pos, c * pcs + m * pms) / div;
-        else
-            pc[0] = (float)ldi(pos, offlin(pos, m)) / div;
+                pc[c] = rope_pos(pos, c * pcs + m * pms, div);
+        else if (turn)
+            for (float& v : pc) v = rope_pos(pos, offlin(pos, m), div);
         const int64_t row = m * rs;
         /* cos and sin, then for adjacent pairs the same per rotated channel: cc[2i] = cc[2i+1]
          * = cos_i, ss[2i] = -sin_i, ss[2i+1] = sin_i, so channel d becomes
@@ -1404,8 +1446,9 @@ AVX_KERNEL(qk_norm_rope) {
             /* Store through the operand's dtype; the rotation re-reads it (see above). */
             if (ds == 1) out_row(qkv, base, head_dim, rbuf);
             else for (int64_t i = 0; i < head_dim; ++i) stt(qkv, base + i * ds, rbuf[i]);
+            if (!turn) continue;
             if (!blocks) {
-                rope_head(qkv, base, ds, rot, im ? (int)ROPE_NEOX : mode, cs, half, rbuf);
+                rope_head(qkv, base, ds, rot, im || axial ? (int)ROPE_NEOX : mode, cs, half, rbuf);
                 continue;
             }
             if (pairs_vec) {

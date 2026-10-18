@@ -1,0 +1,15 @@
+# Breeze-TTS-2 (BreezeBlue/Breeze-TTS-2) in bf16: speech on /v1/audio/speech, whole or streamed,
+# and text spoken as it is written over the /v1/audio/speech/stream WebSocket. It runs on one card,
+# RADIANCE_GPU in .env (default 0). Breeze-TTS-2 is licensed for research and non-commercial use
+# only, and BreezeBlue counts hosting it as an API as commercial.
+name: radiance-breeze-tts2
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-breeze-tts2
+    environment:
+      ROCR_VISIBLE_DEVICES: "${RADIANCE_GPU:-0}"
+    command: >
+      --model /models/breeze-tts2-bf16.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 1

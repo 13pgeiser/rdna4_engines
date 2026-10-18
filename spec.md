@@ -37,7 +37,8 @@ option was to patch the source. Here each has a designed extension point.
 **In:** continuous batching, paged KV, prefix caching, tensor parallelism, speculative decoding,
 hybrid KV (full, sliding-window and linear-attention state in one model), weight placement across
 VRAM, RAM and SSD with runtime re-placement, a server for OpenAI, Anthropic and llama-server
-clients, embeddings, image generation, and a quantiser.
+clients, embeddings, image generation, a quantiser, and PEFT LoRA adapters served beside the base
+model and picked per request (`docs/GUIDE.md` §4.9.1).
 
 **Multimodal (§11).** Pictures and video on the Qwen and Gemma 4 plugins, pictures on LFM2-VL,
 and pictures, video and audio as EmbeddingGemma 2 input. The encoder is declared by the language
@@ -47,8 +48,8 @@ prefix-cache hit by content.
 **Large MoE models.** Heat-driven expert placement (§5.4) and the 4-bit expert formats
 (`docs/MOE-W4.md`) serve Qwen3.8-Flash-Next. DeepSeek-V4-Flash is not ported.
 
-**Out:** training, LoRA, pipeline parallelism, CUDA, disaggregated prefill. None is designed out
-and none is designed for.
+**Out:** training, pipeline parallelism, CUDA, disaggregated prefill. None is designed out and
+none is designed for.
 
 **Hardware.** Everything above the device layer learns the machine at run time (architecture,
 compute units, wave width, LDS, VRAM). Everything that must be written per card is a kernel
@@ -1032,11 +1033,24 @@ rule again each time the store fills keeps the same ladder instead of thinning i
 `tip-only` and `keep-all` are the two ends of that trade, for comparison. Retention is a policy
 class (`core/mem/prefix.h`), so a new policy is a new class (§19.1).
 
-`--checkpoint-slots` (default 8) bounds the snapshots for the whole server, not per sequence: they
-come from one free list in pinned host memory. When retention leaves the store full, the least
-recently used snapshot goes, where a use is its reservation or a lookup resuming from it. A tip has
-no further protection: sessions are request ids, and a rewritten last message leaves one tip per
-turn that no later turn reaches, while the snapshot every turn resumes from is used every turn.
+`--checkpoint-slots` bounds the snapshots for the whole server, not per sequence: they come from
+one free list in pinned host memory. The default, `auto`, gives every sequence `--max-num-seqs`
+admits what the policy keeps for one session at `--max-model-len`, plus one for the checkpoint a
+running turn writes (geometric backoff keeps 9 for a 200K-token session at a 2048-token interval,
+so 10 a sequence), within an eighth of host memory and what the host can pin after the rest of
+startup; a count is taken as given. The store is shared by more conversations than run at once:
+a parent waits while its subagent runs, and in a smaller store the subagent's snapshots displace the
+ones the parent resumes from.
+
+A session is a request id, and a conversation's snapshots belong to its latest turn: the
+admission's lookup takes over every snapshot on the chain it hit, and the publish every snapshot on
+the chain it published. A running turn and the snapshots its conversation already held are then one
+session, retained as one ladder, rather than two ladders beside each other while the turn runs.
+
+When retention leaves the store full, the least recently used snapshot goes, where a use is its
+reservation or a lookup resuming from it. A tip has no further protection: a rewritten last message
+leaves one tip per turn that no later turn reaches, while the snapshot every turn resumes from is
+used every turn.
 
 ### Idle session tiers
 
@@ -1097,7 +1111,7 @@ It carries: token ids and positions; per-group slot mappings and block tables; s
 (`cu_seqlens`); query and context lengths with their host-side upper bounds; the speculative window
 layout (§10); encoder rows and M-RoPE positions (§11); checkpoint destinations (§7.3); the phase,
 which the run phase uses to index bucket tables (§2.2); the decode/prefill split; and each row's
-runtime LoRA adapter slot (`lora_slot`, null when the engine serves no adapters).
+runtime LoRA adapter slot (`lora_slot`, null on a step with no adapter row).
 
 The split is `n_seq_decode` and `n_tok_decode`: the core orders every step so its decode rows come
 first, and those two say where they end. A block that treats the two kinds of row differently (a

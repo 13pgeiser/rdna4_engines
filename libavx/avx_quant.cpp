@@ -34,6 +34,8 @@
 using namespace avx;
 
 #include "avx_had.h"
+#include <algorithm>
+#include <vector>
 
 /* Codes are stored with out_row; for RAD_I8 that is the vectorised clamp + cvtps/packs path
  * (avx_vec.h), bit-exact with libref's nearbyintf-and-clamp. */
@@ -389,6 +391,43 @@ AVX_KERNEL(quant_act_fp8) {
             stt(s, rowoff(s, r, ngrp) + gi * laststride(s), sc);
         }
         out_row(q, rowoff(q, r, n), n, out);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------- quant_cols_fp8 */
+/* libref's ref_quant_cols_fp8: one scale per column over all rows (amax * (1/448), 1 for an
+ * all-zero column), codes clamp(x * (1/scale), +-448) to nearest even. Two passes over the rows,
+ * each row's columns at once: the column maxima, then the codes. */
+AVX_KERNEL(quant_cols_fp8) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *x = &a->t[0], *y = &a->t[1], *s = &a->t[2];
+    const int64_t n = p_int(a, "n", 0);
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = numel(x) / n;
+    if (rows <= 0 || numel(y) < rows * n || numel(s) < n) return RAD_E_SHAPE;
+    std::vector<float> amax((size_t)n, 0.0f), inv((size_t)n);
+    {
+        float* buf = scratch_f32((size_t)n);
+        for (int64_t r = 0; r < rows; ++r) {
+            const float* v = in_row(x, rowoff(x, r, n), n, buf);
+            for (int64_t c = 0; c < n; ++c)
+                amax[(size_t)c] = std::max(amax[(size_t)c], std::fabs(v[c]));
+        }
+    }
+    for (int64_t c = 0; c < n; ++c) {
+        const float sc = amax[(size_t)c] > 0.0f ? amax[(size_t)c] * (1.0f / 448.0f) : 1.0f;
+        inv[(size_t)c] = 1.0f / sc;
+        stt(s, c * laststride(s), sc);
+    }
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        float* buf = scratch_f32((size_t)n);
+        float* out = scratch_f32_b((size_t)n);
+        const float* v = in_row(x, rowoff(x, r, n), n, buf);
+        for (int64_t c = 0; c < n; ++c)
+            out[c] = std::min(std::max(v[c] * inv[(size_t)c], -448.0f), 448.0f);
+        out_row(y, rowoff(y, r, n), n, out);
     }
     return RAD_OK;
 }

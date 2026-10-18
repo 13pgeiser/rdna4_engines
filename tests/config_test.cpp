@@ -127,6 +127,48 @@ TEST(the_kl_mode_records_or_scores_and_says_which_input_it_lacks) {
     CHECK_EQ(parse({ "--kld-ref" }, &f), RAD_E_INVAL);
 }
 
+/* Runtime LoRA: the adapters reach their fields in order, the targets as sorted leaf names, and a
+ * combination that would size slots no adapter uses, or name an adapter that is not served, is
+ * refused by name. */
+TEST(the_lora_flags_reach_their_fields_and_refuse_what_serves_no_adapter) {
+    Config c;
+    CHECK_OK(parse({ "--lora", "b=/ad/b", "--lora", "a=/ad/a", "--max-loras", "3",
+                     "--max-lora-rank", "32", "--lora-target-modules", "v_proj, q_proj,v_proj" },
+                   &c));
+    REQUIRE_EQ(c.lora.adapters.size(), (size_t)2);
+    CHECK_EQ(c.lora.adapters[0].first, std::string("b"));
+    CHECK_EQ(c.lora.adapters[1].second, std::string("/ad/a"));
+    CHECK_EQ(c.lora.slots(), 3);
+    CHECK_EQ(c.lora.max_rank, 32);
+    CHECK(c.lora.targets == std::vector<std::string>({ "q_proj", "v_proj" }));
+    Config d;
+    CHECK_OK(parse({}, &d));
+    CHECK(!d.lora.enabled());
+
+    auto refused = [](std::initializer_list<const char*> v, const char* why) {
+        int st = RAD_OK;
+        const std::string log = stderr_of([&] { st = parse_fresh(v); });
+        if (st != RAD_E_INVAL || log.find(why) == std::string::npos)
+            std::fprintf(stderr, "    expected a refusal naming '%s', got %d: %s", why, st,
+                         log.c_str());
+        CHECK_EQ(st, (int)RAD_E_INVAL);
+        CHECK(log.find(why) != std::string::npos);
+    };
+    refused({ "--lora", "/ad/a" }, "NAME=PATH");
+    refused({ "--lora", "a=" }, "NAME=PATH");
+    refused({ "--lora", "a=/x", "--lora", "a=/y" }, "names the adapter 'a' twice");
+    refused({ "--lora", "a=/x", "--lora", "b=/y", "--max-loras", "1" }, "fewer adapters");
+    refused({ "--max-lora-rank", "32" }, "--max-lora-rank sizes runtime LoRA slots");
+    refused({ "--lora-target-modules", "q_proj" }, "--lora-target-modules sizes");
+    refused({ "--max-loras", "2" }, "names no module an adapter may target");
+    refused({ "--lora", "a=/x", "--lora-target-modules", "self_attn.q_proj" }, "leaf names");
+    refused({ "--lora", "a=/x", "--lora-target-modules", ".*proj" }, "leaf names");
+    refused({ "--lora", "a=/x", "--lora-target-modules", " , " }, "names no module");
+    refused({ "--lora", "a=/x", "--kld-lora", "a" }, "in KL mode");
+    refused({ "--lora", "a=/x", "--kld-lora", "b", "--kld-ref", "/r" }, "'b' is not one of");
+    refused({ "--lora", "a=/x", "--kld-ref", "/r", "--kld-lora-sources", "d" }, "give --kld-lora");
+}
+
 TEST(the_model_is_required_and_nothing_else_is) {
     Config c;
     Argv none({});
@@ -410,8 +452,10 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--kld-record", { "/r", "--kld-corpus", "/c.jsonl" } }, { "--kld-ref", { "/r" } },
         { "--kld-corpus", { "/c.jsonl", "--kld-record", "/r" } },
         { "--kld-out", { "/o.json", "--kld-ref", "/r" } },
-        { "--lora", { "a=/adapters/a" } }, { "--max-loras", { "2" } },
-        { "--max-lora-rank", { "32" } }, { "--lora-target-modules", { "q_proj,v_proj" } },
+        { "--lora", { "a=/adapters/a" } },
+        { "--max-loras", { "2", "--lora-target-modules", "q_proj" } },
+        { "--max-lora-rank", { "32", "--lora", "a=/adapters/a" } },
+        { "--lora-target-modules", { "q_proj,v_proj", "--max-loras", "1" } },
         { "--kld-lora", { "a", "--lora", "a=/adapters/a", "--kld-ref", "/r" } },
         { "--kld-lora-sources", { "doc/", "--kld-lora", "a", "--lora", "a=/adapters/a",
                                   "--kld-ref", "/r" } },
@@ -660,6 +704,43 @@ TEST(the_checkpoint_policy_is_one_of_the_three_that_exist) {
     Config d;
     CHECK_EQ(parse({}, &d), RAD_OK);
     CHECK_EQ(d.checkpoint_policy, std::string("geometric-backoff"));
+}
+
+/* --checkpoint-slots is auto by default, resolved by the engine once a snapshot's size is known;
+ * a count is taken as given, 0 included, and the report shows which. */
+TEST(the_checkpoint_slots_are_auto_or_a_count) {
+    Config d;
+    CHECK_EQ(parse({}, &d), RAD_OK);
+    CHECK_EQ(d.checkpoint_slots, -1ll);
+    auto row = [](const Config& c) {
+        for (const diag::ConfigRow& r : diag::config_rows(c))
+            if (r.flag == "--checkpoint-slots") return r;
+        return diag::ConfigRow{};
+    };
+    CHECK_EQ(row(d).value, std::string("auto"));
+    CHECK_EQ(row(d).source, std::string("default"));
+
+    Config a;
+    CHECK_EQ(parse({ "--checkpoint-slots", "auto" }, &a), RAD_OK);
+    CHECK_EQ(a.checkpoint_slots, -1ll);
+    CHECK_EQ(row(a).value, std::string("auto"));
+    CHECK_EQ(row(a).source, std::string("command line"));
+    for (const auto& [arg, want] : std::vector<std::pair<const char*, long long>>{
+             { "0", 0 }, { "8", 8 }, { "96", 96 }, { "9223372036854775807", INT64_MAX } }) {
+        Config c;
+        CHECK_EQ(parse({ "--checkpoint-slots", arg }, &c), RAD_OK);
+        CHECK_EQ(c.checkpoint_slots, want);
+        CHECK_EQ(row(c).value, std::string(arg));
+    }
+    for (const char* bad : { "-1", "Auto", "auto8", "8 ", "", "0x10", "1e3",
+                             "9223372036854775808" }) {
+        Config c;
+        int st = RAD_OK;
+        const std::string log = stderr_of([&] { st = parse({ "--checkpoint-slots", bad }, &c); });
+        if (st != RAD_E_INVAL) std::fprintf(stderr, "    '%s' was not refused\n", bad);
+        CHECK_EQ(st, (int)RAD_E_INVAL);
+        CHECK(has(log, "--checkpoint-slots"));
+    }
 }
 
 /* The request parser's ranges, enforced at startup: a default outside them would 400 every

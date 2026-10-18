@@ -1,0 +1,14 @@
+# MiniMax-H3 (MiniMaxAI/MiniMax-H3) as block fp8: video with its stereo soundtrack from text, on
+# OpenAI's /v1/videos, 1344x768 and 5.17 s by default, about 9 minutes a clip at its 50 steps.
+# The text encoder and the modulation projections are read from pinned host memory
+# (--vision-tower-placement ram), about 39 GiB of it. MiniMax-H3's license excludes use in the EU,
+# the UK, the Republic of Korea and the USA.
+name: radiance-minimax-h3
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-minimax-h3
+    command: >
+      --model /models/minimax-h3-fp8.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 2 --vision-tower-placement ram

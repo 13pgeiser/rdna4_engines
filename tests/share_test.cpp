@@ -228,6 +228,40 @@ TEST(a_sharded_vector_is_a_slice_of_it) {
     CHECK_EQ(s[0].rects[0].bytes, (int64_t)(16 * 4));
 }
 
+/* A rank-1 weight of stacked parts (a fused [value | gate] projection's bias) is cut like its
+ * matrix: this rank's slice of each part. A contiguous slice would hand rank 0 every value bias
+ * and rank 1 every gate bias. */
+TEST(a_stacked_vector_is_cut_in_every_part) {
+    const RadEncoding e = rad_enc_plain(RAD_BF16);
+    WeightInfo w;
+    w.enc = e;
+    w.enc_known = true;
+    w.decl.shard = RAD_SHARD_ROW;
+    w.decl.rank = 1;
+    w.decl.shape[0] = 32;
+    w.decl.n_row_parts = 2;
+    w.decl.row_parts[0] = 16;
+    w.decl.row_parts[1] = 16;
+    w.n_sel = 1;
+    w.sel[0] = 0;
+    w.sel_rows[0] = 1;
+    w.sel_cols[0] = 32;
+    /* entry [64]: values 0..31, gates 32..63; rank 1 owns values 16..31 and gates 48..63 */
+    const int64_t shape[1] = { 64 };
+    PlaneShare s[RAD_ENC_MAX_PLANES];
+    REQUIRE_EQ(weight_share(w, e, 1, shape, 2, 1, s, nullptr), RAD_OK);
+    REQUIRE_EQ(s[0].rects.size(), (size_t)2);
+    CHECK_EQ(s[0].rects[0].byte0, (int64_t)(16 * 2));
+    CHECK_EQ(s[0].rects[0].bytes, (int64_t)(16 * 2));
+    CHECK_EQ(s[0].rects[1].byte0, (int64_t)(48 * 2));
+    CHECK_EQ(s[0].rects[1].bytes, (int64_t)(16 * 2));
+    /* parts that do not sum to the rank's share are refused */
+    w.decl.row_parts[1] = 8;
+    std::string why;
+    CHECK_EQ(weight_share(w, e, 1, shape, 2, 0, s, &why), RAD_E_SHAPE);
+    CHECK(why.find("declared parts") != std::string::npos);
+}
+
 /* A reshape: a conv kernel [O, C, T, H, W] declared as the [O, C*T*H*W] matrix it is. The bytes
  * do not move, so the share is the whole plane in the declared view; a shard of a reshape would
  * be a different cut, so it is refused. */

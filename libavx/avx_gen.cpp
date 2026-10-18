@@ -1,18 +1,19 @@
 /* avx_gen.cpp -- the image generator's ops (docs/OPS.md, "Image generation") except
  * attn_prefix_self (avx_gen_attn.cpp): the diffusion transformer's adaptive norms and gated
  * residual, the timestep embedding, the per-image latent lanes and the flow-matching sampler, and
- * the image decoder's convolution, channel norm, resampling shortcuts and pixel output.
+ * the image decoder's convolution, channel norm, resampling shortcuts and pixel output; and a video
+ * generator's modulated RMS norms and sampler step ("Video generation").
  *
  * Each op rounds where libref/ref_gen.cpp rounds, which is where the upstream bf16 model stores a
  * tensor. Rows are computed in f32 scratch and every such rounding is a pass through the stored
  * dtype (`narrow_row`), so a fused kernel produces the bytes of the unfused chain.
  *
- * Bit-exact with libref, not only within tolerance: randn_lanes and flow_euler (a seed gives the
- * same picture on every plugin, and the sampler's state feeds every later step), gate_add,
- * chan_affine, to_rgba8, s2d_avg_add, d2s_add, the lane copies and timestep_embed. Where libref
- * multiplies and then adds in two roundings, `keep` stops the compiler from fusing the pair (this
- * plugin is built with -ffp-contract=fast, libref without contraction). The norms reduce in a
- * different order from libref's and are held to the tolerance table.
+ * Bit-exact with libref, not only within tolerance: randn_lanes, flow_euler and flow_x0_step (a
+ * seed gives the same picture on every plugin, and the sampler's state feeds every later step),
+ * gate_add, chan_affine, to_rgba8, s2d_avg_add, d2s_add, the lane copies and timestep_embed.
+ * Where libref multiplies and then adds in two roundings, `keep` stops the compiler from fusing
+ * the pair (this plugin is built with -ffp-contract=fast, libref without contraction). The norms
+ * reduce in a different order from libref's and are held to the tolerance table.
  *
  * Per-entry tables (a sequence's modulation row, its tanh gate) are built once per launch before
  * the parallel region, in scratch_raw; the row loops use only scratch_f32 / _b / _c, so the
@@ -107,6 +108,12 @@ inline void mul_rows(float* v, const float* w, int64_t n) {
     for (; i < n; ++i) v[i] *= w[i];
 }
 
+inline void mul_into(float* out, const float* a, const float* b, int64_t n) {
+    int64_t i = 0;
+    for (; i + VF_N <= n; i += VF_N) vf_storeu(out + i, vf_mul(vf_loadu(a + i), vf_loadu(b + i)));
+    for (; i < n; ++i) out[i] = a[i] * b[i];
+}
+
 inline void add_rows(float* v, const float* w, int64_t n) {
     int64_t i = 0;
     for (; i + VF_N <= n; i += VF_N) vf_storeu(v + i, vf_add(vf_loadu(v + i), vf_loadu(w + i)));
@@ -116,7 +123,8 @@ inline void add_rows(float* v, const float* w, int64_t n) {
 /* An entry's modulation row through `f`, rounded to `dt`, for every entry: [n_seq][n] floats in
  * scratch_raw. `s` is [n_seq, >= n] at its own row pitch (a column slice of the shared
  * modulation projection), read as libref reads it. `f` 0 is 1 + s, 1 is tanh(s), the exact libm
- * tanh: a gate is per entry and column, so n_seq * n tanh calls per launch, not one per element. */
+ * tanh: a gate is per entry and column, so n_seq * n tanh calls per launch, not one per element.
+ * `f` 2 is s itself, unrounded. */
 float* entry_rows(const RadTensor* s, int64_t n_seq, int64_t n, uint32_t dt, int f) {
     float* t = (float*)scratch_raw((size_t)(n_seq * n + 16) * sizeof(float));
     const int64_t rs = row_stride(s, n), cs = laststride(s);
@@ -124,7 +132,7 @@ float* entry_rows(const RadTensor* s, int64_t n_seq, int64_t n, uint32_t dt, int
         float* row = t + e * n;
         for (int64_t i = 0; i < n; ++i) {
             const float v = ldt(s, e * rs + i * cs);
-            row[i] = narrow1(dt, f ? sc_tanh(v) : 1.0f + v);
+            row[i] = f == 2 ? v : narrow1(dt, f ? sc_tanh(v) : 1.0f + v);
         }
     }
     return t;
@@ -173,14 +181,15 @@ inline uint64_t seed_of(const RadTensor* seed, int64_t e) {
            ((uint64_t)(uint32_t)ldi(seed, offlin(seed, 2 * e + 1)) << 32);
 }
 
-/* The bf16 values of a space-separated list (libref's parse_list): up to `cap` into out. */
-int64_t parse_list(const char* s, float* out, int64_t cap) {
+/* The bf16 values of a space-separated list (libref's parse_list), or with `bf16` false its f32
+ * values: up to `cap` into out. */
+int64_t parse_list(const char* s, float* out, int64_t cap, bool bf16 = true) {
     int64_t k = 0;
     while (s && *s) {
         char* end = nullptr;
         const double v = std::strtod(s, &end);
         if (end == s) break;
-        if (k < cap) out[k] = narrow1(RAD_BF16, (float)v);
+        if (k < cap) out[k] = bf16 ? narrow1(RAD_BF16, (float)v) : (float)v;
         ++k;
         s = end;
     }
@@ -217,15 +226,19 @@ AVX_KERNEL(ln_mod) {
 }
 
 /* ------------------------------------------------------------------ gate_add */
-/* x = bf16( x + bf16( bf16(tanh(g[seq])) * y ) ), the roundings in x's dtype. */
+/* x = bf16( x + bf16( bf16(tanh(g[seq])) * y ) ), the roundings in x's dtype; with `act` none the
+ * gate is g itself, unrounded. */
 AVX_KERNEL(gate_add) {
     if (!rad_args_have(a, 4)) return RAD_E_INVAL;
     const RadTensor *Yv = &a->t[0], *G = &a->t[1], *cu = &a->t[2], *X = &a->t[3];
     const int64_t n = p_int(a, "n", 0);
+    static const char* kActs[] = { "tanh", "none" };
+    const int act = p_enum(a, "act", kActs, 2, 0);
+    if (act < 0 || act > 1) return RAD_E_INVAL;
     if (n <= 0) return RAD_E_SHAPE;
     const int64_t rows = rows_of(Yv, n), n_seq = numel(cu) - 1;
     if (rows <= 0 || n_seq <= 0 || rows_of(X, n) < rows) return RAD_E_SHAPE;
-    const float* gate = entry_rows(G, n_seq, n, X->dtype, 1);
+    const float* gate = entry_rows(G, n_seq, n, X->dtype, act ? 2 : 1);
 
     AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
     for (int64_t r = 0; r < rows; ++r) {
@@ -307,6 +320,89 @@ AVX_KERNEL(ln_mod_quant_fp8) {
     }
     return RAD_OK;
 }
+
+/* ------------------------------------------------------------------ rms_mod / rms_mod_quant_fp8 */
+/* Both forms: with `gated` the branch added through the gate row (no tanh) and the residual stored
+ * in x's dtype; then n1 = rd(x rsqrt(mean(x^2) + eps)), n2 = rd(n1 w), m = rd(n2 rd(1 + scale)),
+ * z = rd(m + shift), rd the norm chain's dtype (z's for rms_mod, bf16 for the quantised form,
+ * libref's rule). The sum of squares is the vector reduction, held to the tolerance table; every
+ * rounding is a pass through the stored dtype, so the rest is libref's arithmetic. The per-entry
+ * rows (1 + scale rounded, the shift and the gate) and the gain are built once a launch. */
+static int rms_mod_run(const RadArgs* a, bool quant) {
+    if (a->n_t < (quant ? 9 : 7)) return RAD_E_INVAL;
+    const RadTensor *Yv = rad_arg_in(a, 0), *G = rad_arg_in(a, 1), *S = &a->t[2], *W = &a->t[3];
+    const RadTensor *cu = &a->t[4], *X = &a->t[5];
+    const RadTensor *Q = quant ? &a->t[6] : nullptr, *SC = quant ? &a->t[7] : nullptr;
+    const RadTensor* Z = quant ? rad_arg_in(a, 8) : &a->t[6];
+    const int64_t n = p_int(a, "n", 0), grp = quant ? p_int(a, "group", 0) : 1;
+    const bool gated = p_int(a, "gated", 0) != 0;
+    const float eps = p_f32(a, "eps", 1e-6f);
+    if (n <= 0 || grp <= 0 || n % grp || (gated && (!Yv || !G))) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(quant ? Q : Z, n), n_seq = numel(cu) - 1, ngrp = n / grp;
+    if (rows <= 0 || n_seq <= 0 || rows_of(X, n) < rows || numel(W) < n ||
+        numel(S) < n_seq * 2 * n)
+        return RAD_E_SHAPE;
+    if (gated && (rows_of(Yv, n) < rows || numel(G) < n_seq * n)) return RAD_E_SHAPE;
+    if (quant && (numel(SC) < rows * ngrp || (Z && rows_of(Z, n) < rows))) return RAD_E_SHAPE;
+    const uint32_t dt = quant ? (uint32_t)RAD_BF16 : Z->dtype;
+    /* The tables from one scratch_raw call, [gain | shift | gate] a sequence and the weight row:
+     * a second call may reallocate the first. */
+    const int64_t tw = gated ? 3 * n : 2 * n;
+    float* tabs = (float*)scratch_raw((size_t)(n_seq * tw + n + 32) * sizeof(float));
+    {
+        const int64_t s_rs = row_stride(S, 2 * n), s_cs = laststride(S);
+        const int64_t g_rs = gated ? row_stride(G, n) : 0, g_cs = gated ? laststride(G) : 0;
+        for (int64_t e = 0; e < n_seq; ++e)
+            for (int64_t i = 0; i < n; ++i) {
+                float* row = tabs + e * tw;
+                row[i] = narrow1(dt, 1.0f + ldt(S, e * s_rs + (n + i) * s_cs));
+                row[n + i] = ldt(S, e * s_rs + i * s_cs);
+                if (gated) row[2 * n + i] = ldt(G, e * g_rs + i * g_cs);
+            }
+        for (int64_t i = 0; i < n; ++i) tabs[n_seq * tw + i] = ldt(W, i * laststride(W));
+    }
+    const float* wrow = tabs + n_seq * tw;
+
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        float* buf = scratch_f32((size_t)(5 * n + 80));
+        float *xs = buf, *v = buf + n + 16, *o = v + n + 16, *codes = o + n + 16;
+        float* tmp = codes + n + 16;
+        const float* ent = tabs + seq_of(cu, n_seq, r) * tw;
+        const float* xv = in_row(X, rowoff(X, r, n), n, xs);
+        if (gated) {
+            const float* yv = in_row(Yv, rowoff(Yv, r, n), n, codes);
+            mul_into(v, ent + 2 * n, yv, n);
+            narrow_row(X->dtype, v, n, tmp);
+            add_rows(v, xv, n);
+            narrow_row(X->dtype, v, n, tmp);
+            out_row(X, rowoff(X, r, n), n, v);
+        } else {
+            std::memcpy(v, xv, (size_t)n * sizeof(float));
+        }
+        const float rs = 1.0f / std::sqrt(row_sumsq(v, n) / (float)n + eps);
+        const vf vr = vf_set1(rs);
+        int64_t i = 0;
+        for (; i + VF_N <= n; i += VF_N) vf_storeu(o + i, vf_mul(vf_loadu(v + i), vr));
+        for (; i < n; ++i) o[i] = v[i] * rs;
+        narrow_row(dt, o, n, tmp);
+        mul_rows(o, wrow, n);
+        narrow_row(dt, o, n, tmp);
+        mul_rows(o, ent, n);
+        narrow_row(dt, o, n, tmp);
+        add_rows(o, ent + n, n);
+        if (!quant) {
+            out_row(Z, rowoff(Z, r, n), n, o);
+            continue;
+        }
+        narrow_row(dt, o, n, tmp);
+        fp8_emit(o, codes, n, grp, Q, SC, Z, r);
+    }
+    return RAD_OK;
+}
+
+AVX_KERNEL(rms_mod) { return rms_mod_run(a, false); }
+AVX_KERNEL(rms_mod_quant_fp8) { return rms_mod_run(a, true); }
 
 /* ------------------------------------------------------------------ timestep_embed */
 /* y[m] = [cos(t' f_0) .. cos(t' f_{h-1}) | sin(t' f_0) .. sin(t' f_{h-1})] with libref's libm
@@ -559,20 +655,60 @@ AVX_KERNEL(flow_euler) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ flow_x0_step */
+/* x' = f32(f32(r x) + f32(f32(1 - r) d)) with d = f32(x + f32((1 - t) v)) and
+ * r = sigma_next / sigma: libref's f32 steps bit for bit, `keep` holding each product to its own
+ * rounding. */
+AVX_KERNEL(flow_x0_step) {
+    if (!rad_args_have(a, 5)) return RAD_E_INVAL;
+    const RadTensor *V = &a->t[0], *T = &a->t[1], *sg = &a->t[2], *sgn = &a->t[3], *X = &a->t[4];
+    const int64_t n = p_int(a, "n", 0);
+    if (n <= 0) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(X, n);
+    if (rows <= 0 || rows_of(V, n) < rows || numel(T) < 1 || numel(sg) < 1 || numel(sgn) < 1)
+        return RAD_E_SHAPE;
+    const float st = 1.0f - ldt(T, offlin(T, 0));
+    const float r = ldt(sgn, offlin(sgn, 0)) / ldt(sg, offlin(sg, 0));
+    const float omr = 1.0f - r;
+
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t k = 0; k < rows; ++k) {
+        float* buf = scratch_f32((size_t)(3 * n + 48));
+        float *vs = buf, *xs = buf + n + 16, *o = xs + n + 16;
+        const float* v = in_row(V, rowoff(V, k, n), n, vs);
+        const float* x = in_row(X, rowoff(X, k, n), n, xs);
+        const vf vst = vf_set1(st), vr = vf_set1(r), vo = vf_set1(omr);
+        int64_t c = 0;
+        for (; c + VF_N <= n; c += VF_N) {
+            const vf xv = vf_loadu(x + c);
+            const vf d = vf_add(xv, keep(vf_mul(vst, vf_loadu(v + c))));
+            vf_storeu(o + c, vf_add(keep(vf_mul(vr, xv)), keep(vf_mul(vo, d))));
+        }
+        for (; c < n; ++c) {
+            const float d = x[c] + keep(st * v[c]);
+            o[c] = keep(r * x[c]) + keep(omr * d);
+        }
+        out_row(X, rowoff(X, k, n), n, o);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ chan_affine */
 /* A per-channel affine from two lists of n bf16 values: `fma` is bf16(bf16(x * mul) + add), `inv`
  * is bf16(bf16(x - add) / mul), the inner rounding in y's dtype. */
 AVX_KERNEL(chan_affine) {
     if (!rad_args_have(a, 2)) return RAD_E_INVAL;
     const RadTensor *X = &a->t[0], *Y = &a->t[1];
-    const int64_t n = p_int(a, "n", 0);
+    const int64_t n = p_int(a, "n", 0), rnd = p_int(a, "round", 1);
+    if (rnd < 0 || rnd > 1) return RAD_E_INVAL;
     if (n <= 0) return RAD_E_SHAPE;
     const char* ms = p_str(a, "mul", ""), *as = p_str(a, "add", "");
     /* Each number takes at least two characters but the last, so this bounds the count. */
     const int64_t cap = (int64_t)((std::strlen(ms) + std::strlen(as)) / 2 + 2);
     float* lists = (float*)scratch_raw((size_t)(2 * cap + 16) * sizeof(float));
     float *mul = lists, *add = lists + cap;
-    if (parse_list(ms, mul, cap) != n || parse_list(as, add, cap) != n) return RAD_E_SHAPE;
+    if (parse_list(ms, mul, cap, rnd) != n || parse_list(as, add, cap, rnd) != n)
+        return RAD_E_SHAPE;
     const char* mode = p_str(a, "mode", "fma");
     const bool inv = mode && !std::strcmp(mode, "inv");
     if (!inv && mode && std::strcmp(mode, "fma")) return RAD_E_INVAL;
@@ -589,16 +725,21 @@ AVX_KERNEL(chan_affine) {
             for (; c + VF_N <= n; c += VF_N)
                 vf_storeu(t + c, vf_sub(vf_loadu(x + c), vf_loadu(add + c)));
             for (; c < n; ++c) t[c] = x[c] - add[c];
-            narrow_row(Y->dtype, t, n, tmp);
+            if (rnd) narrow_row(Y->dtype, t, n, tmp);
             for (c = 0; c + VF_N <= n; c += VF_N)
                 vf_storeu(t + c, vf_div(vf_loadu(t + c), vf_loadu(mul + c)));
             for (; c < n; ++c) t[c] /= mul[c];
-        } else {
+        } else if (rnd) {
             for (; c + VF_N <= n; c += VF_N)
                 vf_storeu(t + c, vf_mul(vf_loadu(x + c), vf_loadu(mul + c)));
             for (; c < n; ++c) t[c] = x[c] * mul[c];
             narrow_row(Y->dtype, t, n, tmp);
             add_rows(t, add, n);
+        } else {
+            for (; c + VF_N <= n; c += VF_N)
+                vf_storeu(t + c, vf_add(keep(vf_mul(vf_loadu(x + c), vf_loadu(mul + c))),
+                                        vf_loadu(add + c)));
+            for (; c < n; ++c) t[c] = keep(x[c] * mul[c]) + add[c];
         }
         out_row(Y, rowoff(Y, r, n), n, t);
     }

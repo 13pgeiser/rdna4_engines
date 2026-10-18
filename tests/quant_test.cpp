@@ -8,6 +8,7 @@
  * zero or a missing rotation all exceed.
  */
 #include "quant_fixture.h"
+#include "format/checkpoint.h"
 #include "format/recipe.h"
 
 #include <deque>
@@ -330,6 +331,14 @@ TEST(every_shipped_recipe_compiles_and_its_grids_are_accepted) {
         std::deque<CompiledRule> compiled;
         for (const RecipeRule& rule : r.rules()) {
             ++rules;
+            /* rad-convert's own import rule: its options must parse. */
+            if (rule.quantizer == kImportRule) {
+                ImportForm f;
+                const int ps = ckpt_import_form_parse(rule.options, &f, &why);
+                if (ps != RAD_OK) std::fprintf(stderr, "    %s: %s\n", rule.origin.c_str(), why.c_str());
+                CHECK_EQ(ps, RAD_OK);
+                continue;
+            }
             compiled.emplace_back();
             CompiledRule& c = compiled.back();
             if (c.build(rule, reg(), &why) != RAD_OK) {

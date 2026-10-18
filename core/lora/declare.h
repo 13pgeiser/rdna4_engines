@@ -2,9 +2,9 @@
  * its program, build the sites (lora.h), declare the adapter pools and the two ops each targeted
  * GEMM is followed by, and record what the issue path needs (Program::lora_sites).
  *
- * Runs inside rad_tools_declare, after rad_arch_declare and before the sampler, on the real
- * declare AND on every sizing declare -- identically, because a sizing declare must produce the
- * same op list (rad_builder.cpp checks it op by op). */
+ * Runs inside rad_tools_declare, after rad_arch_declare and before the sampler, identically on the
+ * real declare and on every sizing declare, which must produce the same op list (rad_builder.cpp
+ * checks it op by op). */
 #pragma once
 #include "lora/config.h"
 #include "lora/lora.h"

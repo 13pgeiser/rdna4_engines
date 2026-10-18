@@ -14,12 +14,14 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <set>
 #include <sstream>
 
 namespace rad {
@@ -104,9 +106,9 @@ static const Flag g_flags[] = {
     "                                    --lora). Each slot holds one adapter's A/B on the card"},
     { "--max-lora-rank",      "R",      "the rank each slot is sized for (default 16); a smaller\n"
     "                                    adapter is zero-padded, a larger one refused"},
-    { "--lora-target-modules", "LIST",  "comma-separated HF module names adapters may target\n"
-    "                                    (q_proj,k_proj,...). Default: what the --lora adapters\n"
-    "                                    target. Needed with --max-loras and no --lora"},
+    { "--lora-target-modules", "LIST",  "comma-separated HF module leaf names adapters may\n"
+    "                                    target (q_proj,k_proj,...). Default: what the --lora\n"
+    "                                    adapters target. Needed with --max-loras and no --lora"},
 
     { "--placement",          "MODE",   "all_vram | layer_offload | expert_tiered | auto" },
     { "--deterministic",      nullptr,  "pin placement to the plan the loader made, so the resident\n"
@@ -122,12 +124,12 @@ static const Flag g_flags[] = {
     "                                    intervals, and the checkpoints inside a span are not\n"
     "                                    written" },
     /* A total, not per sequence: the snapshot store is one pool of N slots
-     * (KVManager::set_checkpoint_store). The default 8 gives one per sequence at 8 sequences,
-     * enough for append-only chat, where the next turn hits at the end of the last. */
-    { "--checkpoint-slots",   "N",      "linear-state or sliding-window snapshots "
-                                          "retained IN TOTAL (not "
-                                          "per sequence), in pinned host memory; compare "
-                                          "against --max-num-seqs" },
+     * (KVManager::set_checkpoint_store). */
+    { "--checkpoint-slots",   "N",      "linear-state or sliding-window snapshots the server holds in\n"
+    "                                    total, in pinned host memory. Default `auto`: what\n"
+    "                                    --checkpoint-policy keeps for a --max-model-len session, plus\n"
+    "                                    one, for each of --max-num-seqs, within an eighth of host\n"
+    "                                    memory. N fixes the total; 0 keeps none" },
     { "--no-prefix-cache",    nullptr,  "disable prefix caching" },
     { "--checkpoint-policy",  "NAME",   "which snapshots a session retains: geometric-backoff "
                                         "(default), tip-only, keep-all" },
@@ -515,20 +517,29 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--max-loras"))             { if (!num(0, 64, &c->lora.max_loras)) return RAD_E_INVAL; }
         else if (S("--max-lora-rank"))         { if (!num(1, 512, &c->lora.max_rank)) return RAD_E_INVAL; }
         else if (S("--lora-target-modules")) {
+            /* Module leaf names, as PEFT's target_modules lists them: a dotted path or a pattern
+             * would match no leaf and target nothing without a word. */
             if (!(v = need(i))) return RAD_E_INVAL;
-            c->lora.targets.clear();
+            std::set<std::string> leaves;
             std::string cur;
             for (const char* q = v;; ++q) {
                 if (*q == ',' || !*q) {
-                    if (!cur.empty()) c->lora.targets.insert(cur);
+                    if (!cur.empty()) leaves.insert(cur);
                     cur.clear();
                     if (!*q) break;
-                } else if (*q != ' ') cur += *q;
+                } else if (std::isalnum((unsigned char)*q) || *q == '_') {
+                    cur += *q;
+                } else if (*q != ' ') {
+                    RAD_ERR("--lora-target-modules takes module leaf names (q_proj,k_proj,...); "
+                            "'%s' holds '%c'", v, *q);
+                    return RAD_E_INVAL;
+                }
             }
-            if (c->lora.targets.empty()) {
+            if (leaves.empty()) {
                 RAD_ERR("--lora-target-modules names no module");
                 return RAD_E_INVAL;
             }
+            c->lora.targets.assign(leaves.begin(), leaves.end());
         }
         /* The prefix cache has no disk tier; the removed flags name their replacements. */
         else if (S("--prefix-cache-host-mib")) {
@@ -555,7 +566,17 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--deterministic"))         c->deterministic = true;
         else if (S("--checkpoint-interval"))   { if (!num(0, INT64_MAX, &c->checkpoint_interval)) return RAD_E_INVAL; }
         else if (S("--prefill-span"))          { if (!num(1, INT32_MAX, &c->prefill_span)) return RAD_E_INVAL; }
-        else if (S("--checkpoint-slots"))      { if (!num(0, INT64_MAX, &c->checkpoint_slots)) return RAD_E_INVAL; }
+        else if (S("--checkpoint-slots")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!std::strcmp(v, "auto")) {
+                c->checkpoint_slots = -1;
+            } else if (!*v || std::strspn(v, "0123456789") != std::strlen(v)) {
+                RAD_ERR("--checkpoint-slots takes auto or a whole number, not '%s'", v);
+                return RAD_E_INVAL;
+            } else if (!parse_int(a.c_str(), v, 0, INT64_MAX, &c->checkpoint_slots)) {
+                return RAD_E_INVAL;
+            }
+        }
         else if (S("--no-prefix-cache"))       c->prefix_cache = false;
         else if (S("--checkpoint-policy")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -844,6 +865,48 @@ int config_parse(int argc, char** argv, Config* c) {
         return RAD_E_INVAL;
     }
 
+    /* Runtime LoRA: the slot flags need slots, the named adapters must fit them, and KL mode's
+     * adapter is one of them. */
+    {
+        const LoraConfig& L = c->lora;
+        std::set<std::string> names;
+        for (const auto& [name, path] : L.adapters)
+            if (!names.insert(name).second) {
+                RAD_ERR("--lora names the adapter '%s' twice", name.c_str());
+                return RAD_E_INVAL;
+            }
+        if (L.max_loras > 0 && L.max_loras < (int)L.adapters.size()) {
+            RAD_ERR("--max-loras %d holds fewer adapters than the %zu that --lora names",
+                    L.max_loras, L.adapters.size());
+            return RAD_E_INVAL;
+        }
+        const bool rank_given = c->given.count("--max-lora-rank") != 0;
+        if (!L.enabled() && (rank_given || !L.targets.empty())) {
+            RAD_ERR("%s sizes runtime LoRA slots, and there are none: give --lora or --max-loras",
+                    rank_given ? "--max-lora-rank" : "--lora-target-modules");
+            return RAD_E_INVAL;
+        }
+        if (L.adapters.empty() && L.max_loras > 0 && L.targets.empty()) {
+            RAD_ERR("--max-loras with no --lora names no module an adapter may target; give "
+                    "--lora-target-modules (q_proj,k_proj,v_proj,o_proj,...)");
+            return RAD_E_INVAL;
+        }
+        if (!c->kld_lora.empty() && !c->kld()) {
+            RAD_ERR("--kld-lora scores through an adapter in KL mode; give --kld-record or "
+                    "--kld-ref");
+            return RAD_E_INVAL;
+        }
+        if (!c->kld_lora.empty() && !names.count(c->kld_lora)) {
+            RAD_ERR("--kld-lora '%s' is not one of the adapters --lora names", c->kld_lora.c_str());
+            return RAD_E_INVAL;
+        }
+        if (!c->kld_lora_sources.empty() && c->kld_lora.empty()) {
+            RAD_ERR("--kld-lora-sources picks the documents that run through --kld-lora's adapter; "
+                    "give --kld-lora");
+            return RAD_E_INVAL;
+        }
+    }
+
     /* --reasoning-effort is a template variable ("none" also sets enable_thinking false), so
      * either key in --chat-template-kwargs as well would give two defaults for one setting. */
     if (!c->reasoning_effort.empty() &&
@@ -960,7 +1023,8 @@ const ShowRow kShow[] = {
     { "--deterministic",      [](const Config& c) { return onoff(c.deterministic); } },
     { "--checkpoint-interval", [](const Config& c) { return num(c.checkpoint_interval); } },
     { "--prefill-span",       [](const Config& c) { return num(c.prefill_span); } },
-    { "--checkpoint-slots",   [](const Config& c) { return num(c.checkpoint_slots); } },
+    { "--checkpoint-slots",   [](const Config& c) {
+          return c.checkpoint_slots < 0 ? std::string("auto") : num(c.checkpoint_slots); } },
     { "--no-prefix-cache",    [](const Config& c) {
           return std::string(c.prefix_cache ? "not given: prefix caching on" : "prefix caching off"); } },
     { "--checkpoint-policy",  [](const Config& c) { return c.checkpoint_policy; } },

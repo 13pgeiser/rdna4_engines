@@ -5,62 +5,45 @@
  *
  * The core issues the pair right after a targeted trunk GEMM, in the GEMM's own row slice, with
  * `a`/`a_scale` the GEMM's activation operands and `y` its output (docs/OPS.md). A row whose slot
- * is outside [0, S) is a BASE row and both kernels leave it before touching anything: shrink
- * writes no `t`, expand neither reads nor writes `y` -- `y + 0` would already turn a -0 into +0,
- * and the engine's promise is that a base row is bit for bit what the GEMM wrote.
+ * is outside [0, S) is a base row and both kernels leave it before touching anything: shrink
+ * writes no `t`, expand neither reads nor writes `y` (`y + 0` would turn -0 into +0), so a base
+ * row stays bit for bit what the GEMM wrote.
  *
- * V1, SCALAR f32 AND CORRECT FIRST. The adapter term is a rank-R correction (R <= 64 a module)
- * next to an N x K GEMM, so it is small whatever it costs per FLOP; the WMMA form -- a 16-row tile
- * per distinct slot, other slots' rows masked out of the fragment -- is a later speed pass. What
- * this form already guarantees, and the later one must keep:
+ * Invariants every row here keeps:
+ *   - No split that moves with M: a row's arithmetic does not depend on the batch it arrives in,
+ *     so a request alone and the same request in a mixed batch get the same bytes.
+ *   - The grid is M and the declared parameters. Which adapters are active is read on the device
+ *     from `slot` and the pools, so a recorded pass replays the same packets whatever they hold.
+ *   - x(m, k) is gemm_nt_q's activation value: a code times its group's scale (one f32 product),
+ *     or a bf16/f16/f32 element as it stands, the scale stream's grid read as libref's make_scales
+ *     reads it. The decodes below are the ABI's conversions (rad_plugin.h) restated for the device
+ *     bit for bit; gfx1201 has no bf16 convert, so the narrowing is the ABI's RTNE with its
+ *     quiet-NaN rule. Every multiply-add rounds twice (-ffp-contract=off, RadAddPlugin.cmake).
  *
- *   * NO SPLIT THAT MOVES WITH M. A row's shrink is one wave per column j, lane l summing the k
- *     that are l mod 32 in ascending order, then a fixed xor butterfly; expand is one thread per
- *     (m, n) summing j ascending. Neither depends on the batch a row arrives in, which is what
- *     lets the engine claim "a request alone == the same request in a mixed batch" for the LoRA
- *     term.
- *   * THE GRID IS M AND THE DECLARED PARAMETERS. Which adapters are active is read on the device,
- *     from `slot` and the pools, so a recorded pass replays the same packets whatever the slots
- *     hold.
- *   * NO HOST READS, NO SCRATCH, NO LDS: the reduction is cross-lane only, so a block never waits
- *     on another wave and a base row leaves before any cross-lane op.
+ * The scalar rows (lora_shrink_scalar, lora_expand_scalar): shrink is one block a row, one wave a
+ * column j, lane l summing the k that are l mod 32 in ascending order, then a fixed xor butterfly;
+ * expand is one thread an (m, n), j ascending, so its bytes are libref's. No scratch and no LDS. They
+ * serve every dtype, and are the only rows for f16 and f32 activations.
  *
- * x(m, k) IS gemm_nt_q's ACTIVATION VALUE: a code times its group's scale (one f32 product), or a
- * bf16/f16/f32 element as it stands, with the scale stream's grid read the way libref's
- * make_scales reads it. The decodes below are the ABI's conversions (rad_plugin.h) restated for
- * the device, bit for bit, so a code decodes here exactly as it does in the oracle. gfx1201 has no
- * bf16 convert; the narrowing is the ABI's RTNE with its quiet-NaN rule. Every multiply-add rounds
- * twice (-ffp-contract=off, RadAddPlugin.cmake), so expand computes libref's bytes and shrink
- * differs from them only by its summation order.
- *
- * V2, THE TILED ROWS (lora_shrink_wmma, lora_shrink_wmma_q, lora_expand_tiled), below the v1
- * kernels. v1's grid is a ROW: shrink is one block a row walking K serially, expand one block a
- * (row, 256 columns) re-reading all of B[s] for every row, and a chunk of base rows still launches
- * M * ceil(N/256) blocks that read a slot and leave. On the card that is a prefill at a third of
- * the base speed and base requests 7-8 % slower. The tiled rows keep every promise above and
- * change only who computes what:
- *
- *   * THE GRID'S UNIT IS A ROW TILE (16 rows shrink, 32 expand). Every wave reads the tile's slots
- *     and a ballot decides; a tile of base rows leaves before any barrier or operand load, so a
- *     base step costs one small block a tile. A tile holding rows of several adapters runs ONE
- *     PASS PER DISTINCT SLOT, ascending, each pass with its own slot's pools; a row's value comes
- *     out of its own slot's pass alone and other rows' results are never stored. The passes of a
- *     tile may be spread over blockIdx.z when the grid is small (decode with several adapters);
- *     that decides which block runs a pass, never the pass's arithmetic.
- *   * SHRINK IS WMMA bf16 (16 x 16 x 16), with the pool fragment as the A operand and the x
- *     fragment as B, so a lane's accumulator is one row. Its order is fixed by K and R alone: K
- *     in 32-wide steps, a block's run of steps split over its 4 waves (wave w takes every 4th),
- *     the waves summed 0..3 in LDS, and -- for a K long enough that one tile would leave the card
- *     idle at decode -- the run split over KS blocks whose f32 partials the LAST to arrive sums
- *     0..KS-1 (sh_plan). bf16 activations feed the WMMA as they are; fp8 and i8 codes are exact
- *     in bf16 and feed it as codes, and each step's partial is scaled by its group's f32 scale,
- *     which needs the group to be whole steps (a multiple of 32, or one group across K) and is
- *     otherwise the v1 kernel. Every one of those roundings is a sum or product of the terms the
- *     contract names, so the result is inside v1's (K + 2) 2^-24 sum|terms| bound; no code times
- *     scale is ever rounded on its own. f16 and f32 activations have no exact WMMA and stay v1.
- *   * EXPAND IS v1's ARITHMETIC IN A TILE. B[s]'s [128 columns, 32 j] slab is staged in LDS as f32
- *     (exact) and reused by the tile's 32 rows; each output keeps v1's sequence (acc = 0, j
- *     ascending acc = acc + t*B, d = scale*acc, one rounding into y), so its bytes are libref's.
+ * The tiled rows (lora_shrink_wmma, lora_shrink_wmma_q, lora_expand_tiled), preferred:
+ *   - The grid's unit is a row tile (16 rows shrink, 32 expand). Every wave reads the tile's slots
+ *     and a ballot decides; a tile of base rows leaves before any barrier or operand load. A tile
+ *     holding rows of several adapters runs one pass per distinct slot, ascending, each with its
+ *     own slot's pools; a row's value comes from its own slot's pass alone. The passes may be
+ *     spread over blockIdx.z when the grid is small, which decides which block runs a pass, never
+ *     its arithmetic.
+ *   - Shrink is WMMA bf16 (16 x 16 x 16) with the pool fragment as the A operand and x as B, so a
+ *     lane's accumulator is one row. Its order is fixed by K and R alone: K in 32-wide steps, a
+ *     block's steps split over its 4 waves (wave w takes every 4th), the waves summed 0..3 in LDS,
+ *     and for a long K the steps split over KS blocks whose f32 partials the last to arrive sums
+ *     0..KS-1 (sh_plan). fp8 and i8 codes are exact in bf16 and feed the WMMA as codes; each step's
+ *     partial is scaled by its group's f32 scale, which needs the group to be whole steps (a
+ *     multiple of 32, or one group across K). Every rounding is a sum or product of the contract's
+ *     terms, so the result is inside the scalar row's (K + 2) 2^-24 sum|terms| bound.
+ *   - Expand is the scalar arithmetic in a tile: B[s]'s [128 columns, 32 j] slab is staged in LDS
+ *     as f32 (exact) and reused by the tile's 32 rows; each output keeps the scalar sequence (acc =
+ *     0, j ascending acc = acc + t*B, d = scale*acc, one rounding into y), so its bytes are
+ *     libref's.
  *
  * Kernels are written against r4d_launch.h so tests/r4d_emu runs this source on the host.
  */
@@ -248,7 +231,7 @@ __global__ __launch_bounds__(256) void lora_expand_kernel(ExpandArgs A) {
     }
 }
 
-/* ================================================================ v2: the tiled rows */
+/* ================================================================ the tiled rows */
 
 typedef short    lr_v8s __attribute__((ext_vector_type(8)));    /* 8 bf16, as the WMMA takes them */
 typedef float    lr_v8f __attribute__((ext_vector_type(8)));
@@ -368,7 +351,7 @@ __device__ __forceinline__ lr_v8f wmma_bf16(lr_v8s a, lr_v8s b, lr_v8f c) {
     return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
 }
 
-/* SHRINK, one block a (j tile x K split, row tile, z), 4 waves. The pool fragment is the WMMA's A
+/* Shrink, one block a (j tile x K split, row tile, z), 4 waves. The pool fragment is the WMMA's A
  * operand (16 j x 16 k) and the x fragment its B (16 k x 16 rows), so lane l's eight outputs are
  * row l % 16 at j = 8 (l / 16) .. +7: one row, one group scale a lane. A lane holds 16 contiguous
  * k of its row in both operands, the first 8 in the step's first WMMA and the next 8 in its
@@ -464,9 +447,9 @@ __global__ __launch_bounds__(kShThreads) void lora_shrink_wmma_kernel(ShrinkTArg
     }
     if (T.ks == 1) return;
 
-    /* THE K SPLIT'S SUM, in the last block to arrive. Every thread's partial stores are fenced
-     * before the arrival, and the counter is left zero for the next launch (they are ordered: the
-     * lora rows are not concurrent, and each lane's `t` keys its own counter block). */
+    /* The K split's sum, in the last block to arrive. Every thread's partial stores are fenced
+     * before the arrival, and the counter is left zero for the next launch (launches are ordered:
+     * the lora rows are not concurrent, and each lane's `t` keys its own counter block). */
     __threadfence();
     __syncthreads();
     const int cidx = ((int)blockIdx.y * T.jt + jt) * kZMax + z;
@@ -491,10 +474,10 @@ __global__ __launch_bounds__(kShThreads) void lora_shrink_wmma_kernel(ShrinkTArg
     }
 }
 
-/* EXPAND, one block a (128 columns, 32 rows, z), 8 waves: wave w owns rows 4w..4w+3 and lane l
+/* Expand, one block a (128 columns, 32 rows, z), 8 waves: wave w owns rows 4w..4w+3 and lane l
  * columns 4l..4l+3, sixteen outputs a thread. B[s]'s slab [128 columns][32 j] is staged as f32
- * (a bf16 widens exactly) and t's [32 rows][32 j] beside it; then every output runs v1's sequence
- * over the slab and the next, so the bytes are v1's and libref's. A pass's accumulators start at
+ * (a bf16 widens exactly) and t's [32 rows][32 j] beside it; every output runs the scalar row's
+ * sequence over the slab and the next, so the bytes are libref's. A pass's accumulators start at
  * zero and only its own rows are written back: a row of another slot accumulates against zeros it
  * never stores. V: B is dense, 16-byte aligned and R a multiple of 8, so 16-byte loads. */
 template <int YDT, bool V>
@@ -667,8 +650,8 @@ static bool dtype_agrees(const RadArgs* a, uint32_t dt) {
     return !d || rad_dtype_parse(d) == dt;
 }
 
-/* The launches, one per dtype instantiation: the v1 grid is M blocks for shrink and M strips of
- * 256 columns for expand, 256 threads each, whatever the slots hold. */
+/* The scalar rows' launches, one per dtype instantiation: M blocks for shrink and M strips of 256
+ * columns for expand, 256 threads each, whatever the slots hold. */
 template <int ADT>
 static void launch_shrink(const ShrinkArgs& P, int64_t blocks, RadStream stream) {
     (void)stream;                                 /* the host emulator's launch takes none */
@@ -819,12 +802,11 @@ static int shrink_scalar(const ShrinkArgs& P, int adt, int64_t M, RadStream stre
 
 /* ---------------------------------------------------------------- the tiled rows' plans (host) */
 
-/* THE SHRINK SPLIT, from K and R alone -- never M, because it is the summation order. A row tile
+/* The shrink split, from K and R alone and never M, because it is the summation order. A row tile
  * covers ceil(R / 16) j tiles; at decode that tile is the whole grid, so K is split until j tiles
  * times splits reach kShFill blocks, but never below 16 steps (512 k) a block, past which the
- * split's partial traffic and its arrival outweigh what the extra blocks read. The split is then
- * rounded so no block is left without a step. MiniCPM5-2B's four sites at TP1, for scale: K 2048
- * R 48 -> 3 x 4 blocks; K 2048 R 32 -> 2 x 4; K 2048 R 16 -> 1 x 4; K 6144 R 16 -> 1 x 12. */
+ * partials' traffic and the arrival outweigh what the extra blocks read. The split is rounded so
+ * no block is left without a step. E.g. K 2048 R 48 -> 3 x 4 blocks; K 6144 R 16 -> 1 x 12. */
 struct ShPlan { int jt, ks, spb, nsteps; };
 static ShPlan sh_plan(int64_t K, int64_t R) {
     ShPlan p;
@@ -842,11 +824,11 @@ static int64_t sh_part_bytes(int64_t M, int64_t R, const ShPlan& p) {
     return p.ks > 1 ? (int64_t)p.ks * M * R * (int64_t)sizeof(float) : 0;
 }
 
-/* HOW MANY BLOCKS ONE TILE'S PASSES SPREAD OVER. Decode with several adapters is a handful of
- * blocks a pass, run one after another inside a block they would add up; spread over blockIdx.z
- * they run at once. Only while the grid is small -- every z block of a tile that has fewer passes
- * leaves after reading the slots, and on a prefill grid those would be thousands -- and never more
- * than the passes a tile can have. Which block runs a pass is all this decides. */
+/* How many blocks one tile's passes spread over. Decode with several adapters is a handful of
+ * blocks a pass; run one after another inside a block they would add up, spread over blockIdx.z
+ * they run at once. Only while the grid is small (every z block of a tile with fewer passes leaves
+ * after reading the slots, and a prefill grid would have thousands), and never more than the
+ * passes a tile can have. Which block runs a pass is all this decides. */
 static int z_fan(int64_t base, int64_t S, int64_t M, int64_t tile) {
     int64_t z = base >= kZGrid ? 1 : kZGrid / base;
     if (z > S) z = S;
@@ -856,12 +838,12 @@ static int z_fan(int64_t base, int64_t S, int64_t M, int64_t tile) {
     return z < 1 ? 1 : (int)z;
 }
 
-/* THE SPLIT'S ARRIVAL COUNTERS, one block a (device, `t`). They cannot live in the scratch: other
+/* The split's arrival counters, one block a (device, `t`). They cannot live in the scratch: other
  * ops write the arena between two of ours and the counters must be zero at entry. Each lane's `t`
  * is its own buffer and the lora rows are ordered on their lane (not concurrent), so two launches
- * that could overlap never share a block; the reducer leaves every counter zero. A block too
- * small for a launch is replaced by a larger one and the old one is kept -- a recorded pass may
- * still name it, and its own launches still fit it. */
+ * that could overlap never share a block; the reducer leaves every counter zero. A block too small
+ * for a launch is replaced by a larger one and the old one is kept, since a recorded pass may
+ * still name it. */
 static unsigned* shrink_ctr(const void* t, int64_t n, RadStream stream) {
     static std::mutex mu;
     static std::map<std::pair<int, const void*>, std::pair<unsigned*, int64_t>> blocks;
@@ -936,8 +918,8 @@ int r4d_rad_lora_expand(const RadArgs* a, RadStream stream) {
 }
 
 /* The tiled shrink: lora_shrink_wmma (bf16 a) and lora_shrink_wmma_q (fp8 / i8 codes whose group
- * is whole 32-wide steps) share this entry point. What the WMMA cannot hold exactly -- f16 and f32
- * activations, a scale group that ends inside a step -- goes to the v1 kernel, decided by the
+ * is whole 32-wide steps) share this entry point. What the WMMA cannot hold exactly (f16 and f32
+ * activations, a scale group that ends inside a step) goes to the scalar kernel, decided by the
  * dtype and the stream's grid and never by M; the rows' bands do not send either here, and a
  * direct caller still gets the exact answer. */
 int r4d_rad_lora_shrink_wmma(const RadArgs* a, RadStream stream) {
@@ -982,7 +964,7 @@ int r4d_rad_lora_shrink_wmma(const RadArgs* a, RadStream stream) {
 }
 
 /* The K split's partials, sized at declare for the band's widest M (the core calls this with it).
- * f16 / f32 activations run the v1 kernel and need none. */
+ * f16 / f32 activations run the scalar kernel and need none. */
 int64_t r4d_rad_lora_shrink_wmma_scratch(const RadArgs* a) {
     using namespace r4d_lora;
     const int64_t M = rad_args_geti_or(a, "M", 0), K = rad_args_geti_or(a, "K", 0);

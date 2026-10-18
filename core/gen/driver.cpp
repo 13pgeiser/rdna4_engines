@@ -439,6 +439,7 @@ const RadBatch* Driver::next(int step) {
     std::lock_guard<std::mutex> lk(mu_);
     pass_ = Pass{};
     dec_bytes_ = 0;
+    rb_.clear();
     if (closed_) return nullptr;
     /* Retire finished, failed and cancelled jobs, returning their KV and lanes before admitting.
      * Safe because next() runs between passes, with nothing in flight. */
@@ -820,6 +821,7 @@ const RadBatch* Driver::build_decode(int32_t l, bool preview, int step) {
         G.dec_preview = preview ? 1 : 0;
     }
     dec_bytes_ = (int64_t)j->req->width * j->req->height * decl_.pixel_channels;
+    rb_.assign(1, Readback{ decl_.image_out, dec_bytes_, img_host_ });
     pass_.kind = RAD_GEN_PASS_DECODE;
     pass_.job = j->id;
     pass_.lane = l;
@@ -889,6 +891,7 @@ int Driver::done() {
     }
     pass_ = Pass{};
     dec_bytes_ = 0;
+    rb_.clear();
     return RAD_OK;
 }
 

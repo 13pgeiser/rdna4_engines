@@ -703,12 +703,12 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
         }
     }
 
-    /* RUNTIME LoRA: A FUSED GEMM OVER A TARGETED WEIGHT IS DECLINED. Every `gemm_*` op other than
-     * the four an adapter delta can follow (lora::op_is_site) fuses something into its epilogue --
-     * the gated fold quantises the SiLU product in place -- so the delta has no y to land in. The
-     * op is recorded resolved to nothing, exactly as a library without the kernel would leave it,
-     * and the plugin falls back to the unfused chain it emits for that library. The decision reads
-     * only the weight's own declaration and name map, so the sizing declare makes the same one. */
+    /* Runtime LoRA: a fused GEMM over a targeted weight is declined. Every `gemm_*` op other than
+     * the four an adapter delta can follow (lora::op_is_site) fuses something into its epilogue
+     * (the gated fold quantises the SiLU product in place), so the delta has no y to land in. The
+     * op is recorded unresolved, as a library without the kernel would leave it, and the plugin
+     * runs its unfused chain. The decision reads only the weight's own declaration and name map,
+     * so the sizing declare makes the same one. */
     bool lora_declined = false;
     if (lora_targets_ && n_w > 0 && oi.op.rfind("gemm_", 0) == 0 && oi.op != "gemm_nt" &&
         oi.op != "gemm_nt_bias" && oi.op != "gemm_nt_q" && oi.op != "gemm_nt_q_bias") {
@@ -726,10 +726,10 @@ rad_op Builder::decl_op(const char* opname, const RadParam* p, int n_p,
                            "output for the adapter's delta (the plugin runs the unfused chain)";
         oi.bands.assign(1, none);
         oi.lora_declined = true;
-        /* AND IT OWNS NO WEIGHT. The planner, the layout pass and the weight-use bookkeeping all
-         * read an op's weights, and an op with no kernel anywhere would tell the planner the weight
-         * cannot be read on the card -- moving the gate_up the unfused chain multiplies on the card
-         * off it. The op stays in the list, by name, so the sizing declare lines up. */
+        /* It owns no weight: the planner reads an op's weights, and an op with no kernel anywhere
+         * would tell it the weight cannot be read on the card, moving the gate_up the unfused
+         * chain multiplies off the card. The op stays in the list by name so the sizing declare
+         * lines up. */
         oi.weights.clear();
         oi.weight_opd.clear();
         prog_.ops.push_back(std::move(oi));
@@ -939,8 +939,21 @@ int Builder::decl_name_map(const RadNameMap* m) {
         err(RAD_E_INVAL, "name map for '%s': %d source tensors, 1..8 allowed", m->declared, m->n_src);
         return RAD_E_INVAL;
     }
-    if (m->mode != RAD_MAP_COPY && m->mode != RAD_MAP_CONCAT) {
+    if (m->mode != RAD_MAP_COPY && m->mode != RAD_MAP_CONCAT && m->mode != RAD_MAP_WNORM &&
+        m->mode != RAD_MAP_ROWS && m->mode != RAD_MAP_TRANSPOSE && m->mode != RAD_MAP_EMA) {
         err(RAD_E_INVAL, "name map for '%s': unknown mode %d", m->declared, m->mode);
+        return RAD_E_INVAL;
+    }
+    if ((m->mode == RAD_MAP_WNORM || m->mode == RAD_MAP_EMA) && m->n_src != 2) {
+        err(RAD_E_INVAL, "name map for '%s': a %s map names two sources (%s), not %d",
+            m->declared, m->mode == RAD_MAP_EMA ? "codebook" : "weight-norm",
+            m->mode == RAD_MAP_EMA ? "the embedding sums and the cluster usage"
+                                   : "the magnitude and the direction", m->n_src);
+        return RAD_E_INVAL;
+    }
+    if (m->mode == RAD_MAP_TRANSPOSE && m->n_src != 1) {
+        err(RAD_E_INVAL, "name map for '%s': a transpose map names one source, not %d",
+            m->declared, m->n_src);
         return RAD_E_INVAL;
     }
 
@@ -961,6 +974,14 @@ int Builder::decl_name_map(const RadNameMap* m) {
      * also map_base() in arch/common/rad_arch.h), so every map would ask for slice 0. */
     for (int i = 0; i < m->n_src; ++i) c.src_index[i] = m->src_index[i];
     for (int i = m->n_src; i < 8; ++i) c.src_index[i] = -1;
+    for (int i = 0; i < 8; ++i) c.src_rows[i] = i < m->n_src ? m->src_rows[i] : 0;
+    if (m->mode == RAD_MAP_ROWS)
+        for (int i = 0; i < m->n_src; ++i)
+            if (m->src_index[i] < 0 || m->src_rows[i] <= 0) {
+                err(RAD_E_INVAL, "name map for '%s': row piece %d starts at %d and holds %lld rows",
+                    m->declared, i, m->src_index[i], (long long)m->src_rows[i]);
+                return RAD_E_INVAL;
+            }
 
     /* A CONCAT map may be declared in pieces; any other repeat is an error.
      *
@@ -975,10 +996,12 @@ int Builder::decl_name_map(const RadNameMap* m) {
     auto seen = name_map_first_.find(c.declared);
     if (seen != name_map_first_.end()) {
         const RadNameMap& first = prog_.name_map[seen->second];
-        if (c.mode != RAD_MAP_CONCAT || first.mode != RAD_MAP_CONCAT) {
-            err(RAD_E_INVAL, "name map for '%s': declared twice, and only a CONCAT map may be "
-                             "extended -- a repeated COPY map means two sources for one weight, and "
-                             "which one wins is not something a declaration can express",
+        const bool joins = (c.mode == RAD_MAP_CONCAT && first.mode == RAD_MAP_CONCAT) ||
+                           (c.mode == RAD_MAP_EMA && first.mode == RAD_MAP_EMA);
+        if (!joins) {
+            err(RAD_E_INVAL, "name map for '%s': declared twice, and only a CONCAT or EMA map may "
+                             "be extended -- a repeated COPY map means two sources for one weight, "
+                             "and which one wins is not something a declaration can express",
                 c.declared);
             return RAD_E_INVAL;
         }
@@ -1022,6 +1045,16 @@ int Builder::declare_logits(rad_buf b) {
             prog_.gen_str.name.c_str());
         return RAD_E_STATE;
     }
+    if (prog_.is_audio_generator()) {
+        err(RAD_E_STATE, "declare_logits: this program already declared the audio generator '%s'",
+            prog_.agen_str.name.c_str());
+        return RAD_E_STATE;
+    }
+    if (prog_.is_video_generator()) {
+        err(RAD_E_STATE, "declare_logits: this program already declared the video generator '%s'",
+            prog_.vgen_str.name.c_str());
+        return RAD_E_STATE;
+    }
     prog_.logits_buf = b;
     return RAD_OK;
 }
@@ -1050,6 +1083,16 @@ int Builder::declare_pooled(rad_buf b) {
     if (prog_.generator.layout != 0) {
         err(RAD_E_STATE, "declare_pooled: this program already declared the image generator '%s'",
             prog_.gen_str.name.c_str());
+        return RAD_E_STATE;
+    }
+    if (prog_.is_audio_generator()) {
+        err(RAD_E_STATE, "declare_pooled: this program already declared the audio generator '%s'",
+            prog_.agen_str.name.c_str());
+        return RAD_E_STATE;
+    }
+    if (prog_.is_video_generator()) {
+        err(RAD_E_STATE, "declare_pooled: this program already declared the video generator '%s'",
+            prog_.vgen_str.name.c_str());
         return RAD_E_STATE;
     }
     const RadBufDecl& d = prog_.buffers[b].decl;
@@ -1140,10 +1183,13 @@ int Builder::declare_generator(const RadGeneratorDecl* d) {
             prog_.gen_str.name.c_str(), nm);
         return RAD_E_STATE;
     }
-    if (prog_.logits_buf != RAD_NULL_HANDLE || prog_.pooled_buf != RAD_NULL_HANDLE) {
+    if (prog_.logits_buf != RAD_NULL_HANDLE || prog_.pooled_buf != RAD_NULL_HANDLE ||
+        prog_.is_audio_generator() || prog_.is_video_generator()) {
         err(RAD_E_STATE, "declare_generator '%s': this program already declared %s; a program "
-                         "generates text, embeds or makes images -- one of the three", nm,
-            prog_.logits_buf != RAD_NULL_HANDLE ? "logits" : "a pooled output");
+                         "generates text, embeds, makes images, audio or video -- one of the five",
+            nm, prog_.logits_buf != RAD_NULL_HANDLE ? "logits"
+                : prog_.pooled_buf != RAD_NULL_HANDLE ? "a pooled output"
+                : prog_.is_audio_generator() ? "an audio generator" : "a video generator");
         return RAD_E_STATE;
     }
     if (d->layout != RAD_GEN_LAYOUT_JOINT_GRID) {
@@ -1221,6 +1267,258 @@ int Builder::declare_generator(const RadGeneratorDecl* d) {
     c.name = c.tmpl_text = c.tmpl_edit = c.tmpl_image = c.tmpl_image_sep = nullptr;
     c.drop_prefix = c.tmpl_transparent = nullptr;
     c.sigmas = nullptr;
+    return RAD_OK;
+}
+
+/* Validated at declare for the reason the image generator is: a buffer too small for the longest
+ * window, or a window that never ends, would otherwise show at the first request. */
+int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
+    if (finished_) {
+        err(RAD_E_STATE, "declare_audio_generator after declare finished");
+        return RAD_E_STATE;
+    }
+    if (!d) { err(RAD_E_INVAL, "declare_audio_generator: null declaration"); return RAD_E_INVAL; }
+    const char* nm = d->name && *d->name ? d->name : "(unnamed)";
+    if (prog_.is_audio_generator()) {
+        err(RAD_E_STATE, "declare_audio_generator: '%s' was already declared; '%s' is a second one",
+            prog_.agen_str.name.c_str(), nm);
+        return RAD_E_STATE;
+    }
+    if (prog_.logits_buf != RAD_NULL_HANDLE || prog_.pooled_buf != RAD_NULL_HANDLE ||
+        prog_.generator.layout != 0 || prog_.is_video_generator()) {
+        err(RAD_E_STATE, "declare_audio_generator '%s': this program already declared %s; a "
+                         "program generates text, embeds, makes images, audio or video -- one of "
+                         "the five", nm,
+            prog_.logits_buf != RAD_NULL_HANDLE ? "logits"
+                : prog_.pooled_buf != RAD_NULL_HANDLE ? "a pooled output"
+                : prog_.generator.layout != 0 ? "an image generator" : "a video generator");
+        return RAD_E_STATE;
+    }
+    if (!d->tmpl || !std::strstr(d->tmpl, "{input}") || !std::strstr(d->tmpl, "{instructions}")) {
+        err(RAD_E_INVAL, "declare_audio_generator '%s': tmpl needs {instructions} and {input}", nm);
+        return RAD_E_INVAL;
+    }
+    if (d->tmpl_plain &&
+        (!std::strstr(d->tmpl_plain, "{input}") || std::strstr(d->tmpl_plain, "{instructions}"))) {
+        err(RAD_E_INVAL, "declare_audio_generator '%s': tmpl_plain is the prompt without "
+                         "instructions and needs {input} alone", nm);
+        return RAD_E_INVAL;
+    }
+    if (d->neg_tmpl && !d->prompt_whole) {
+        err(RAD_E_INVAL, "declare_audio_generator '%s': an unconditional template makes branches "
+                         "of different lengths, which step together only as whole prompts; set "
+                         "prompt_whole", nm);
+        return RAD_E_INVAL;
+    }
+    if (d->max_prompt <= 0 || d->first_frame < 0 ||
+        (!d->neg_tmpl && (d->neg_keep_head < 0 || d->neg_keep_tail < 0 || d->neg_token < 0 ||
+                          d->neg_keep_head + d->neg_keep_tail >= d->max_prompt))) {
+        err(RAD_E_INVAL, "declare_audio_generator '%s': the prompt is out of range (at most %lld "
+                         "tokens, unconditional branch token %d keeping %d + %d)", nm,
+            (long long)d->max_prompt, (int)d->neg_token, (int)d->neg_keep_head,
+            (int)d->neg_keep_tail);
+        return RAD_E_INVAL;
+    }
+    const bool chunked = d->voc_chunk > 0;
+    if (chunked && (d->voc_context < 0 || d->lat_num != 1 || d->lat_den != 1)) {
+        err(RAD_E_INVAL, "declare_audio_generator '%s': a vocoder that plays frames as they are "
+                         "made reads a frame as one latent (lat_num = lat_den = 1) and a context "
+                         "of >= 0 frames; got %lld/%lld and %lld", nm, (long long)d->lat_num,
+            (long long)d->lat_den, (long long)d->voc_context);
+        return RAD_E_INVAL;
+    }
+    if (d->max_frames <= 0 || d->frame_rate_num <= 0 || d->frame_rate_den <= 0 ||
+        (!chunked && (d->win_frames <= 0 || d->win_hop <= 0 || d->win_hop > d->win_frames ||
+                      d->win_lead < 0 || d->latent_channels <= 0 || d->win_crop_left < 0 ||
+                      d->win_crop_right < 0)) ||
+        d->lat_num <= 0 || d->lat_den <= 0 || d->samples_per_latent <= 0 || d->sample_rate <= 0 ||
+        d->channels <= 0 || d->max_lanes <= 0) {
+        err(RAD_E_INVAL, "declare_audio_generator '%s': a geometry field is out of range (%lld "
+                         "frames at %lld/%lld a second, windows of %lld every %lld, %lld lead "
+                         "rows, %lld/%lld latents a frame of %lld channels, crops %lld + %lld, "
+                         "%lld samples a latent at %lld Hz x %lld, %lld lanes)", nm,
+            (long long)d->max_frames, (long long)d->frame_rate_num, (long long)d->frame_rate_den,
+            (long long)d->win_frames, (long long)d->win_hop, (long long)d->win_lead,
+            (long long)d->lat_num, (long long)d->lat_den, (long long)d->latent_channels,
+            (long long)d->win_crop_left, (long long)d->win_crop_right,
+            (long long)d->samples_per_latent, (long long)d->sample_rate, (long long)d->channels,
+            (long long)d->max_lanes);
+        return RAD_E_INVAL;
+    }
+    /* A middle window plays what is left after both crops, so they must leave some of it. */
+    if (!chunked &&
+        d->win_crop_left + d->win_crop_right >= d->win_frames * d->lat_num / d->lat_den) {
+        err(RAD_E_INVAL, "declare_audio_generator '%s': the crops (%lld + %lld latents) leave a "
+                         "window of %lld latents nothing to play", nm, (long long)d->win_crop_left,
+            (long long)d->win_crop_right, (long long)(d->win_frames * d->lat_num / d->lat_den));
+        return RAD_E_INVAL;
+    }
+    if ((!chunked && d->default_steps <= 0) || !(d->default_cfg >= 1.0)) {
+        err(RAD_E_INVAL, "declare_audio_generator '%s': the sampler is incomplete (%lld default "
+                         "steps, guidance %g)", nm, (long long)d->default_steps, d->default_cfg);
+        return RAD_E_INVAL;
+    }
+    auto buf_ok = [&](rad_buf h, uint32_t dtype, int64_t numel, const char* what) {
+        if (h == RAD_NULL_HANDLE || (size_t)h >= prog_.buffers.size()) {
+            err(RAD_E_INVAL, "declare_audio_generator '%s': %s %u is not a declared buffer", nm,
+                what, (unsigned)h);
+            return false;
+        }
+        const RadBufDecl& ob = prog_.buffers[h].decl;
+        if (ob.dtype != dtype || ob.domain != RAD_DOMAIN_DEVICE ||
+            decl_numel(ob.rank, ob.shape) < numel) {
+            err(RAD_E_INVAL, "declare_audio_generator '%s': %s '%s' must be a device %s buffer of "
+                             "at least %lld elements", nm, what, prog_.buffers[h].name.c_str(),
+                dtype == RAD_I32 ? "i32" : "f32", (long long)numel);
+            return false;
+        }
+        return true;
+    };
+    /* audio_out holds what one VOCODE pass plays: a window, or a chunk of frames. */
+    const int64_t win_samples = (chunked ? d->voc_chunk : d->win_frames * d->lat_num / d->lat_den) *
+                                d->samples_per_latent;
+    if (!buf_ok(d->status, RAD_I32, d->max_lanes, "status") ||
+        !buf_ok(d->audio_out, RAD_F32, win_samples * d->channels, "audio_out"))
+        return RAD_E_INVAL;
+    prog_.agen_str.name = nm;
+    prog_.agen_str.tmpl = d->tmpl;
+    prog_.agen_str.tmpl_plain = d->tmpl_plain ? d->tmpl_plain : "";
+    prog_.agen_str.neg_tmpl = d->neg_tmpl ? d->neg_tmpl : "";
+    prog_.audio_gen = *d;
+    /* As for the image generator: the Program is moved after declare; strings live in agen_str. */
+    prog_.audio_gen.name = nullptr;
+    prog_.audio_gen.tmpl = nullptr;
+    prog_.audio_gen.tmpl_plain = nullptr;
+    prog_.audio_gen.neg_tmpl = nullptr;
+    return RAD_OK;
+}
+
+/* Validated at declare for the reasons the other generators are: an output buffer too small for
+ * the largest chunk or the longest soundtrack, or a geometry whose frame count does not follow
+ * from its chunks, would otherwise show at the first request. */
+int Builder::declare_video_generator(const RadVideoGenDecl* d) {
+    if (finished_) {
+        err(RAD_E_STATE, "declare_video_generator after declare finished");
+        return RAD_E_STATE;
+    }
+    if (!d) { err(RAD_E_INVAL, "declare_video_generator: null declaration"); return RAD_E_INVAL; }
+    const char* nm = d->name && *d->name ? d->name : "(unnamed)";
+    if (prog_.is_video_generator()) {
+        err(RAD_E_STATE, "declare_video_generator: '%s' was already declared; '%s' is a second one",
+            prog_.vgen_str.name.c_str(), nm);
+        return RAD_E_STATE;
+    }
+    if (prog_.logits_buf != RAD_NULL_HANDLE || prog_.pooled_buf != RAD_NULL_HANDLE ||
+        prog_.generator.layout != 0 || prog_.is_audio_generator()) {
+        err(RAD_E_STATE, "declare_video_generator '%s': this program already declared %s; a "
+                         "program generates text, embeds, makes images, audio or video -- one of "
+                         "the five", nm,
+            prog_.logits_buf != RAD_NULL_HANDLE ? "logits"
+                : prog_.pooled_buf != RAD_NULL_HANDLE ? "a pooled output"
+                : prog_.generator.layout != 0 ? "an image generator" : "an audio generator");
+        return RAD_E_STATE;
+    }
+    if (!d->tmpl || !std::strstr(d->tmpl, "{prompt}") || d->max_text <= 0) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': tmpl needs {prompt} and max_text a "
+                         "length (%lld)", nm, (long long)d->max_text);
+        return RAD_E_INVAL;
+    }
+    if (d->fps_num <= 0 || d->fps_den <= 0 || d->frames_per_chunk <= 0 || d->frames_tail < 0 ||
+        d->latents_per_chunk <= 0 || d->latents_tail < 0 || d->dec_latents < d->latents_per_chunk ||
+        d->min_chunks <= 0 || d->max_chunks < d->min_chunks || d->default_chunks < d->min_chunks ||
+        d->default_chunks > d->max_chunks ||
+        d->latents_per_chunk * (d->max_chunks - 1) + d->dec_latents >
+            d->latents_per_chunk * d->max_chunks + d->latents_tail) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': the temporal geometry is out of range "
+                         "(%lld/%lld fps, %lld n + %lld frames over %lld n + %lld latents, chunks of "
+                         "%lld latents, %lld..%lld chunks, %lld by default)", nm,
+            (long long)d->fps_num, (long long)d->fps_den, (long long)d->frames_per_chunk,
+            (long long)d->frames_tail, (long long)d->latents_per_chunk, (long long)d->latents_tail,
+            (long long)d->dec_latents, (long long)d->min_chunks, (long long)d->max_chunks,
+            (long long)d->default_chunks);
+        return RAD_E_INVAL;
+    }
+    const int64_t unit = d->latent_scale * d->patch;
+    if (d->latent_scale <= 0 || d->latent_channels <= 0 || d->patch <= 0 ||
+        d->size_multiple <= 0 || d->size_multiple % unit != 0 || d->min_side < d->size_multiple ||
+        d->max_area < d->min_side * d->min_side || d->max_aspect < 1 ||
+        d->default_width % d->size_multiple != 0 || d->default_height % d->size_multiple != 0 ||
+        d->default_width < d->min_side || d->default_height < d->min_side ||
+        d->default_width * d->default_height > d->max_area) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': the spatial geometry is out of range "
+                         "(latents of %lld px in %lld x %lld patches, sides multiples of %lld from "
+                         "%lld, area to %lld, aspect to %lld, %lld x %lld by default)", nm,
+            (long long)d->latent_scale, (long long)d->patch, (long long)d->patch,
+            (long long)d->size_multiple, (long long)d->min_side, (long long)d->max_area,
+            (long long)d->max_aspect, (long long)d->default_width, (long long)d->default_height);
+        return RAD_E_INVAL;
+    }
+    if (d->sample_rate <= 0 || d->audio_rate <= 0 || d->sample_rate % d->audio_rate != 0 ||
+        d->audio_channels <= 0 || d->audio_latent_channels <= 0) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': the soundtrack is out of range (%lld Hz "
+                         "at %lld latents a second, %lld channels of %lld)", nm,
+            (long long)d->sample_rate, (long long)d->audio_rate, (long long)d->audio_channels,
+            (long long)d->audio_latent_channels);
+        return RAD_E_INVAL;
+    }
+    if (d->default_steps <= 0 || d->max_steps < d->default_steps || !(d->shift_video > 0.0) ||
+        !(d->shift_audio > 0.0) || d->max_lanes <= 0) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': the sampler is incomplete (%lld steps by "
+                         "default, %lld at most, shifts %g and %g, %lld lanes)", nm,
+            (long long)d->default_steps, (long long)d->max_steps, d->shift_video, d->shift_audio,
+            (long long)d->max_lanes);
+        return RAD_E_INVAL;
+    }
+    if (d->n_rungs < 0 || (d->n_rungs > 0 && !d->rungs) ||
+        (d->n_rungs > 0 && (d->default_steps != d->n_rungs + 1 || d->max_steps != d->n_rungs + 1))) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': a trained schedule of %d rungs runs %d grid "
+                         "points, which default_steps and max_steps must both be (%lld, %lld)", nm,
+            (int)d->n_rungs, (int)d->n_rungs + 1, (long long)d->default_steps,
+            (long long)d->max_steps);
+        return RAD_E_INVAL;
+    }
+    for (int i = 0; i < d->n_rungs; ++i)
+        if (!(d->rungs[i] > 0.0 && d->rungs[i] <= 1.0) ||
+            (i > 0 && !(d->rungs[i] < d->rungs[i - 1]))) {
+            err(RAD_E_INVAL, "declare_video_generator '%s': rung %d (%g) is outside (0, 1] or not "
+                             "below the one before it", nm, i, d->rungs[i]);
+            return RAD_E_INVAL;
+        }
+    auto buf_ok = [&](rad_buf h, uint32_t dtype, int64_t numel, const char* what) {
+        if (h == RAD_NULL_HANDLE || (size_t)h >= prog_.buffers.size()) {
+            err(RAD_E_INVAL, "declare_video_generator '%s': %s %u is not a declared buffer", nm,
+                what, (unsigned)h);
+            return false;
+        }
+        const RadBufDecl& ob = prog_.buffers[h].decl;
+        if (ob.dtype != dtype || ob.domain != RAD_DOMAIN_DEVICE ||
+            decl_numel(ob.rank, ob.shape) < numel) {
+            err(RAD_E_INVAL, "declare_video_generator '%s': %s '%s' must be a device %s buffer of "
+                             "at least %lld elements", nm, what, prog_.buffers[h].name.c_str(),
+                dtype == RAD_U8 ? "u8" : "f32", (long long)numel);
+            return false;
+        }
+        return true;
+    };
+    /* frames_out holds the last chunk, the largest, at the largest area; audio_out the longest
+     * soundtrack. */
+    const int64_t chunk_px = (d->frames_per_chunk + d->frames_tail) * d->max_area * 3;
+    const int64_t max_frames = d->frames_per_chunk * d->max_chunks + d->frames_tail;
+    const int64_t max_lat = (max_frames * d->fps_den * d->audio_rate * 2 + d->fps_num) /
+                            (2 * d->fps_num) + 1;
+    const int64_t max_samples = max_lat * (d->sample_rate / d->audio_rate);
+    if (!buf_ok(d->frames_out, RAD_U8, chunk_px, "frames_out") ||
+        !buf_ok(d->audio_out, RAD_F32, max_samples * d->audio_channels, "audio_out"))
+        return RAD_E_INVAL;
+    prog_.vgen_str.name = nm;
+    prog_.vgen_str.tmpl = d->tmpl;
+    prog_.vgen_str.rungs.assign(d->rungs, d->rungs + d->n_rungs);
+    prog_.video_gen = *d;
+    /* As for the other generators: the Program is moved after declare; strings and the rungs live
+     * in vgen_str. */
+    prog_.video_gen.name = nullptr;
+    prog_.video_gen.tmpl = nullptr;
+    prog_.video_gen.rungs = nullptr;
     return RAD_OK;
 }
 
@@ -1524,10 +1822,12 @@ void Builder::finish_layouts() {
     for (size_t h = 1; h < prog_.weights.size(); ++h) {
         const WeightInfo& w = prog_.weights[h];
         if (w.n_sel <= 1 || !w.identity || !claimant[h].empty()) continue;
+        char en[256];
+        rad_enc_format(&w.enc, en, sizeof en);
         if (unjoined[h].empty())
-            err(RAD_E_SHAPE, "'%s' takes %d planes of '%s' as one weight and no op reads it, so "
-                             "nothing says how they are stored", w.name.c_str(), w.n_sel,
-                w.source.c_str());
+            err(RAD_E_SHAPE, "'%s' takes %d planes of '%s' (%s) as one weight and no op reads it, "
+                             "so nothing says how they are stored", w.name.c_str(), w.n_sel,
+                w.source.c_str(), en);
         else
             err(RAD_E_SHAPE, "'%s' takes %d planes of '%s' as one weight, and the host kernels "
                              "reading it (%s) have no layout that joins them (abi/rad_planes.h)",
@@ -1812,6 +2112,16 @@ int rad_declare_encoder(RadBuilder* b, const RadEncoderDecl* d) {
 int rad_declare_generator(RadBuilder* b, const RadGeneratorDecl* d) {
     if (!b) return RAD_E_INVAL;
     return B(b)->declare_generator(d);
+}
+
+int rad_declare_audio_generator(RadBuilder* b, const RadAudioGenDecl* d) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->declare_audio_generator(d);
+}
+
+int rad_declare_video_generator(RadBuilder* b, const RadVideoGenDecl* d) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->declare_video_generator(d);
 }
 
 void rad_note(RadBuilder* b, const char* f, ...) {

@@ -51,15 +51,17 @@ ARG JOBS=
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       build-essential nasm pkg-config ca-certificates curl xz-utils zlib1g-dev libdav1d-dev \
-      libwebp-dev \
+      libwebp-dev libopenh264-dev \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /tmp
 # Demuxers: media.cpp's kFormats whitelist. Decoders: what those containers carry -- still
 # images, H.264 and HEVC (MP4, MOV, HEIF), VP8 and VP9 (WebM, WebP), AV1 through dav1d (WebM, MP4,
 # AVIF), MPEG-1/2/4, Theora and the FLV/H.263 family. JPEG XL is recognised and refused by name
 # (its only decoder is libjxl's). Encoders: the image output formats of media.cpp encode_image
-# (png, jpeg as mjpeg, webp through libwebp). No protocols: media.cpp reads from memory through its
-# own I/O context.
+# (png, jpeg as mjpeg, webp through libwebp), and a generated video's MP4 (core/mm/mp4.cpp): H.264
+# through libopenh264 (BSD-licensed, so the build stays LGPL) and FFmpeg's own AAC, in the mp4
+# muxer. No protocols: media.cpp and mp4.cpp read and write memory through their own I/O
+# contexts.
 RUN echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
     curl -fsSL "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" -o ffmpeg.tar.xz \
  && echo "${FFMPEG_SHA256}  ffmpeg.tar.xz" | sha256sum -c - \
@@ -70,7 +72,7 @@ RUN echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
       --enable-zlib --enable-libdav1d --enable-libwebp \
       --enable-demuxer=mov,matroska,avi,mpegts,flv,ogg,gif,apng,image2pipe,image_png_pipe,image_jpeg_pipe,image_jpegls_pipe,image_jpegxl_pipe,image_webp_pipe,image_bmp_pipe,image_tiff_pipe,image_qoi_pipe,image_pgm_pipe,image_ppm_pipe,image_pbm_pipe,image_pam_pipe,image_gif_pipe,wav,w64,mp3,flac,aac,aiff \
       --enable-decoder=h264,hevc,vp8,vp9,libdav1d,mpeg4,mpeg1video,mpeg2video,mjpeg,jpegls,png,apng,gif,webp,bmp,tiff,qoi,pgm,ppm,pbm,pam,pgmyuv,theora,vp3,flv,h263,pcm_u8,pcm_s16le,pcm_s16be,pcm_s24le,pcm_s24be,pcm_s32le,pcm_s32be,pcm_f32le,pcm_f32be,pcm_f64le,pcm_alaw,pcm_mulaw,mp3float,mp2float,flac,vorbis,opus,aac \
-      --enable-encoder=png,mjpeg,libwebp \
+      --enable-encoder=png,mjpeg,libwebp,libopenh264,aac --enable-muxer=mp4 --enable-libopenh264 \
       --enable-parser=h264,hevc,vp8,vp9,av1,mpeg4video,mpegvideo,mjpeg,png,gif,bmp,webp,vp3,qoi,pnm,h263,jpegxl,mpegaudio,flac,aac,vorbis,opus \
  && make -j"${JOBS:-$(nproc)}" \
  && make install \
@@ -136,11 +138,11 @@ ARG JOBS=
 
 # g++-14 rather than the default 13: hipcc compiles device-side translation units against its
 # libstdc++, which is also the runtime image's. gawk: tools/ops_doc_check.sh uses gensub, which
-# mawk lacks. libdav1d7 and libwebp7 are the runtime libraries of the ffmpeg stage's AV1 decoder
-# and WebP encoder; busybox-static goes into the runtime image.
+# mawk lacks. libdav1d7, libwebp7 and libopenh264-7 are the runtime libraries of the ffmpeg stage's
+# AV1 decoder, WebP encoder and H.264 encoder; busybox-static goes into the runtime image.
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      cmake ninja-build pkg-config g++-14 gawk libdav1d7 libwebp7 busybox-static \
+      cmake ninja-build pkg-config g++-14 gawk libdav1d7 libwebp7 libopenh264-7 busybox-static \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ffmpeg /opt/ffmpeg /opt/ffmpeg
@@ -207,10 +209,11 @@ ARG JOBS=
 #       ctest --test-dir /build -L gpu --output-on-failure
 # Tests run JOBS at a time (default one per two hardware threads, about one per core on an SMT
 # machine: the per-binary CPU budgets in tests/CMakeLists.txt hold for tests that do not share a
-# core); the `perf` entries, which assert wall-clock costs, run alone (RUN_SERIAL). The build sandbox forbids io_uring, so avx_check skips its
-# file-backed gather case. The `oot` suite (every shipped plugin rebuilt against the installed
-# package) repeats this stage's whole compile, so it runs from the development tree instead
-# (tests/oot_plugins.sh).
+# core); the `perf` entries, which assert wall-clock costs, run alone (RUN_SERIAL). The build
+# sandbox forbids io_uring, so avx_check skips its file-backed gather case, and perf_event_open, so
+# the tests that bound work count CPU time rather than instructions (tests/work_counter.h). The
+# `oot` suite (every shipped plugin rebuilt against the installed package) repeats this stage's
+# whole compile, so it runs from the development tree instead (tests/oot_plugins.sh).
 RUN echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
     bash /src/docker/llvm-check.sh /build \
  && ctest --test-dir /build -LE 'gpu|oot' -j"${JOBS:-$(( ($(nproc) + 1) / 2 ))}" --output-on-failure \

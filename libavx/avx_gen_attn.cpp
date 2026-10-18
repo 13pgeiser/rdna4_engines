@@ -52,8 +52,17 @@ struct Geo {
     int causal;
     int64_t hd, gqa, kvh, qh, n_seq, bs, max_blocks, bt_rs, bt_cs;
     int64_t q_rs, k_rs, v_rs, o_rs, k8_rs, ks_rs, sb, sh, so;
+    int64_t rows_total;    /* the fp8 P.V form's rows */
     float scale;
 };
+
+/* f32 to the nearest E4M3 and back. */
+inline float e4m3_round(float x) {
+    const uint8_t c = rad_f32_to_fp8e4m3(x);
+    float y;
+    cvt_fp8e4m3_to_f32(&c, &y, 1);
+    return y;
+}
 
 inline int64_t cu_at(const RadTensor* cu, int64_t i) { return ldi(cu, offlin(cu, i)); }
 
@@ -532,12 +541,77 @@ PS_BF16 void task_bf16(const Geo& g, const Seq& q, const uint8_t* pack, int64_t 
 
 }  /* namespace */
 
+/* ------------------------------------------------------------------ attn_prefix_self, fp8 P.V */
+/* libref's fp8 P.V form, prefix-free, row by row: every score (bf16 or int8 form, libref's
+ * order), the max, then p = exp(s - max) in f64 rounded to f32, w = e4m3(448 p), and
+ * o = (sum w v) v_scale / (448 sum p), sums in key order. Two passes, as libref's, because the
+ * weights are rounded against the row's final max. */
+static int ps_pv8(const Geo& g, const RadTensor* vsc) {
+    const int64_t hd = g.hd, qh = g.qh;
+    AVX_PARALLEL_FOR_IF(g.rows_total * qh * hd >= AVX_PAR_MIN)
+    for (int64_t idx = 0; idx < g.rows_total * qh; ++idx) {
+        const int64_t h = idx % qh, r = cu_at(g.cu, 0) + idx / qh, kh = h / g.gqa;
+        int64_t s = 0;
+        while (s + 1 < g.n_seq && r >= cu_at(g.cu, s + 1)) ++s;
+        const int64_t b0 = cu_at(g.cu, s), b1 = cu_at(g.cu, s + 1), i = r - b0;
+        const int64_t nk = g.causal ? i + 1 : b1 - b0;
+        float* qf = scratch_f32((size_t)(3 * hd + nk));
+        float* kf = qf + hd;
+        float* acc = kf + hd;
+        float* sc = acc + hd;
+        for (int64_t d = 0; d < hd; ++d) qf[d] = ldt(g.q, r * g.q_rs + h * hd + d);
+        float sq = 1.0f;
+        if (g.i8) {
+            float am = 0.0f;
+            for (int64_t d = 0; d < hd; ++d) am = std::max(am, std::fabs(qf[d]));
+            sq = am > 0.0f ? am * (1.0f / 127.0f) : 1.0f;
+            const float inv = 1.0f / sq;
+            for (int64_t d = 0; d < hd; ++d)
+                qf[d] = std::rint(std::min(std::max(qf[d] * inv, -127.0f), 127.0f));
+        }
+        float mx = -INFINITY;
+        for (int64_t j = 0; j < nk; ++j) {
+            const int64_t row = b0 + j;
+            float dot = 0.0f;
+            if (g.i8) {
+                for (int64_t d = 0; d < hd; ++d) kf[d] = ldt(g.k8, row * g.k8_rs + kh * hd + d);
+                for (int64_t d = 0; d < hd; ++d) dot += qf[d] * kf[d];
+                dot = dot * sq * ldt(g.ks, row * g.ks_rs + kh) * g.scale;
+            } else {
+                const int64_t kb = row * g.k_rs + kh * hd;
+                for (int64_t d = 0; d < hd; ++d) dot += qf[d] * ldt(g.k, kb + d);
+                dot *= g.scale;
+            }
+            sc[j] = dot;
+            mx = std::max(mx, dot);
+        }
+        for (int64_t d = 0; d < hd; ++d) acc[d] = 0.0f;
+        float sum = 0.0f;
+        for (int64_t j = 0; j < nk; ++j) {
+            const float p = (float)std::exp((double)(sc[j] - mx));
+            sum += p;
+            const float w = e4m3_round(448.0f * p);
+            const int64_t vb = (b0 + j) * g.v_rs + kh * hd;
+            for (int64_t d = 0; d < hd; ++d) acc[d] += w * ldt(g.v, vb + d);
+        }
+        const float inv8 = sum > 0.0f ? 1.0f / (448.0f * sum) : 0.0f;
+        for (int64_t d = 0; d < hd; ++d)
+            stt(g.o, r * g.o_rs + h * hd + d, acc[d] * ldt(vsc, offlin(vsc, kh * hd + d)) * inv8);
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ attn_prefix_self */
 AVX_KERNEL(attn_prefix_self) {
     if (a->n_t < 12) return RAD_E_INVAL;
     Geo g{};
-    g.q = &a->t[0]; g.k = &a->t[1]; g.v = &a->t[2]; g.kv = &a->t[3];
-    g.bt = &a->t[4]; g.su = &a->t[5]; g.cu = &a->t[6]; g.o = &a->t[11];
+    g.q = &a->t[0]; g.k = &a->t[1]; g.v = &a->t[2]; g.cu = &a->t[6]; g.o = &a->t[11];
+    /* The paged prefix, all three operands or none (every prefix empty). */
+    g.kv = rad_arg_in(a, 3);
+    g.bt = rad_arg_in(a, 4);
+    g.su = rad_arg_in(a, 5);
+    if ((g.kv == nullptr) != (g.bt == nullptr) || (g.kv == nullptr) != (g.su == nullptr))
+        return RAD_E_INVAL;
     g.kdes = rad_arg_in(a, 7);
     g.vdes = rad_arg_in(a, 8);
     g.k8 = rad_arg_in(a, 9);
@@ -548,19 +622,22 @@ AVX_KERNEL(attn_prefix_self) {
     g.hd = p_int(a, "head_dim", 0);
     g.gqa = p_int(a, "gqa", 1);
     g.causal = (int)p_int(a, "causal", 0);
-    g.bs = g.kv->rank == 4 ? g.kv->shape[2] : p_int(a, "block_size", 0);
+    g.bs = !g.kv ? 1 : g.kv->rank == 4 ? g.kv->shape[2] : p_int(a, "block_size", 0);
     if (g.hd <= 0 || g.gqa <= 0 || g.bs <= 0) return RAD_E_SHAPE;
     if (g.hd > PS_HD_MAX) return RAD_E_UNSUPPORTED;
-    g.kvh = g.kv->rank == 4 ? g.kv->shape[1] : 0;
+    /* Without a cache the key heads are the own keys' width over head_dim. */
+    g.kvh = g.kv ? (g.kv->rank == 4 ? g.kv->shape[1] : 0)
+          : g.k->rank >= 3 ? g.k->shape[g.k->rank - 2]
+          : g.k->rank == 2 ? g.k->shape[1] / g.hd : 0;
     if (g.kvh <= 0) return RAD_E_SHAPE;
     g.qh = g.kvh * g.gqa;
     g.n_seq = numel(g.cu) - 1;
-    if (g.n_seq <= 0 || numel(g.su) < g.n_seq) return RAD_E_SHAPE;
+    if (g.n_seq <= 0 || (g.su && numel(g.su) < g.n_seq)) return RAD_E_SHAPE;
     if (cu_at(g.cu, g.n_seq) - cu_at(g.cu, 0) <= 0) return RAD_E_SHAPE;
-    g.max_blocks = g.bt->rank >= 2 ? g.bt->shape[1] : numel(g.bt) / g.n_seq;
-    g.bt_rs = g.bt->rank >= 2 ? g.bt->stride[0] : g.max_blocks;
-    g.bt_cs = g.bt->rank >= 2 ? g.bt->stride[1] : 1;
-    for (int64_t s = 0; s < g.n_seq; ++s)
+    g.max_blocks = !g.bt ? 0 : g.bt->rank >= 2 ? g.bt->shape[1] : numel(g.bt) / g.n_seq;
+    g.bt_rs = g.bt && g.bt->rank >= 2 ? g.bt->stride[0] : g.max_blocks;
+    g.bt_cs = g.bt && g.bt->rank >= 2 ? g.bt->stride[1] : 1;
+    for (int64_t s = 0; g.su && s < g.n_seq; ++s)
         if (ldi(g.su, offlin(g.su, s)) > g.max_blocks * g.bs) return RAD_E_SHAPE;
     g.q_rs = row_stride(g.q, g.qh * g.hd);
     g.k_rs = row_stride(g.k, g.kvh * g.hd);
@@ -568,15 +645,28 @@ AVX_KERNEL(attn_prefix_self) {
     g.o_rs = row_stride(g.o, g.qh * g.hd);
     g.k8_rs = g.i8 ? row_stride(g.k8, g.kvh * g.hd) : 0;
     g.ks_rs = g.i8 ? row_stride(g.ks, g.kvh) : 0;
-    g.sb = g.kv->stride[0]; g.sh = g.kv->stride[1]; g.so = g.kv->stride[2];
+    if (g.kv) { g.sb = g.kv->stride[0]; g.sh = g.kv->stride[1]; g.so = g.kv->stride[2]; }
     g.scale = p_f32(a, "scale", 1.0f / std::sqrt((float)g.hd));
+    /* The fp8 P.V form (libref's ref_attn_prefix_self): prefix-free, its own two-pass loop. */
+    {
+        const RadTensor* vsc = a->n_t > 12 ? rad_arg_in(a, 12) : nullptr;
+        const char* pv = p_str(a, "pv", "bf16");
+        const bool pv8 = std::strcmp(pv, "fp8") == 0;
+        if ((!pv8 && std::strcmp(pv, "bf16") != 0) || pv8 != (vsc != nullptr)) return RAD_E_INVAL;
+        if (pv8) {
+            if (g.kv || g.kdes || g.vdes) return RAD_E_UNSUPPORTED;
+            g.rows_total = cu_at(g.cu, g.n_seq) - cu_at(g.cu, 0);
+            return ps_pv8(g, vsc);
+        }
+    }
 
     /* ---- which form, and each (entry, kv head)'s key sequence */
     [[maybe_unused]] bool bf16 = false;
 #if AVX_LEVEL == 3
     static const bool have_bf16 = __builtin_cpu_supports("avx512bf16");
     bf16 = have_bf16 && g.hd % 64 == 0 && g.gqa <= 16 && !g.kdes && !g.vdes &&
-           g.q->dtype == RAD_BF16 && g.kv->dtype == RAD_BF16 && g.v->dtype == RAD_BF16 &&
+           g.q->dtype == RAD_BF16 && (!g.kv || g.kv->dtype == RAD_BF16) &&
+           g.v->dtype == RAD_BF16 &&
            (g.i8 || g.k->dtype == RAD_BF16);
 #endif
     const size_t tile_bytes =
@@ -594,7 +684,7 @@ AVX_KERNEL(attn_prefix_self) {
         for (int64_t s = 0; s < g.n_seq; ++s) {
             Seq q{};
             q.s = s; q.kh = kh;
-            q.P = ldi(g.su, offlin(g.su, s));
+            q.P = g.su ? ldi(g.su, offlin(g.su, s)) : 0;
             q.b0 = cu_at(g.cu, s);
             q.len = std::max<int64_t>(0, cu_at(g.cu, s + 1) - q.b0);
             /* A negative prefix count makes key j own row b0 + j - P, as libref indexes it. */

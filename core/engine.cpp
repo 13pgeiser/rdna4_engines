@@ -4,6 +4,8 @@
  */
 #include "engine_priv.h"
 #include "gen/driver.h"
+#include "gen/audio_driver.h"
+#include "gen/video_driver.h"
 #include "kld.h"
 #include "mm/processor.h"
 
@@ -1343,28 +1345,39 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         return RAD_E_STATE;
     }
     embedding_ = ranks_[0]->program.pooled_buf != RAD_NULL_HANDLE;
-    const bool generator = ranks_[0]->program.is_generator();
+    const bool audio_gen = ranks_[0]->program.is_audio_generator();
+    const bool video_gen = ranks_[0]->program.is_video_generator();
+    const bool generator = ranks_[0]->program.is_pass_driven();
     if (ranks_[0]->program.logits_buf == RAD_NULL_HANDLE && !embedding_ && !generator) {
         RAD_ERR("the '%s' plugin declared no logits buffer (rad_declare_logits), no pooled output "
-                "(rad_declare_pooled) and no image generator (rad_declare_generator), so a step "
-                "produces nothing anyone can read. An encoder-only plugin cannot serve.",
+                "(rad_declare_pooled) and no generator (rad_declare_generator, "
+                "rad_declare_audio_generator, rad_declare_video_generator), so a step produces "
+                "nothing anyone can read. An encoder-only plugin cannot serve.",
                 plugins_.arch_plugin.c_str());
         return RAD_E_UNSUPPORTED;
     }
     if (generator) {
+        const char* const what = audio_gen ? "audio" : video_gen ? "video" : "images";
         if (cfg_.kld() || cfg_.n_spec > 0) {
-            RAD_ERR("the '%s' plugin makes images: --kld and speculative decoding have no tokens to "
-                    "work on", plugins_.arch_plugin.c_str());
+            RAD_ERR("the '%s' plugin makes %s: --kld and speculative decoding have no tokens to "
+                    "work on", plugins_.arch_plugin.c_str(), what);
             return RAD_E_UNSUPPORTED;
         }
         for (size_t i = 1; i < ranks_.size(); ++i)
-            if (!ranks_[i]->program.is_generator()) {
-                RAD_ERR("rank %zu declared no image generator and rank 0 did", i);
+            if (ranks_[i]->program.is_audio_generator() != audio_gen ||
+                ranks_[i]->program.is_video_generator() != video_gen ||
+                !ranks_[i]->program.is_pass_driven()) {
+                RAD_ERR("rank %zu declared a different generator from rank 0's", i);
                 return RAD_E_STATE;
             }
         cfg_.prefix_cache = false;
-        prefix_off_why_ = "an image generator: a conditioning is read by its own request's images "
-                          "and by nothing after them";
+        prefix_off_why_ = audio_gen
+            ? "an audio generator: a prompt is read by its own request's frames and by nothing "
+              "after them"
+            : video_gen
+            ? "a video generator: a prompt is read by its own request's steps and keeps no KV"
+            : "an image generator: a conditioning is read by its own request's images and by "
+              "nothing after them";
         decide("--no-prefix-cache", "prefix caching off", prefix_off_why_);
     }
     if (embedding_) {
@@ -1498,13 +1511,33 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     rio.reserve(ranks_.size());
     for (auto& rk : ranks_)
         rio.push_back({ rk->device, rk->ctx.stream(), &rk->program });
-    if (generator) {
+    if (video_gen) {
+        /* As for the image generator below; the plugin lays out each request's rows. */
+        std::vector<gen::VideoDriver::RankIO> gio;
+        for (auto& rk : ranks_) gio.push_back({ rk->device, rk->ctx.stream() });
+        auto d = std::make_unique<gen::VideoDriver>();
+        RAD_TRY(d->init(ranks_[0]->program, rad_tools_video_positions(plugins_), gio));
+        vid_gen_ = d.get();
+        gen_ = std::move(d);
+        RAD_TRY(rad_dev_set(ranks_[0]->device));
+    } else if (audio_gen) {
+        /* As for the image generator below. */
+        std::vector<gen::AudioDriver::RankIO> gio;
+        for (auto& rk : ranks_) gio.push_back({ rk->device, rk->ctx.stream() });
+        auto d = std::make_unique<gen::AudioDriver>();
+        RAD_TRY(d->init(ranks_[0]->program, kv_iface_.get(), gio));
+        aud_gen_ = d.get();
+        gen_ = std::move(d);
+        RAD_TRY(rad_dev_set(ranks_[0]->device));
+    } else if (generator) {
         /* The generator's driver replaces the scheduler, which is never initialised, so its
          * token-step staging is never allocated. */
         std::vector<gen::Driver::RankIO> gio;
         for (auto& rk : ranks_) gio.push_back({ rk->device, rk->ctx.stream() });
-        gen_ = std::make_unique<gen::Driver>();
-        RAD_TRY(gen_->init(ranks_[0]->program, kv_iface_.get(), gio));
+        auto d = std::make_unique<gen::Driver>();
+        RAD_TRY(d->init(ranks_[0]->program, kv_iface_.get(), gio));
+        img_gen_ = d.get();
+        gen_ = std::move(d);
         RAD_TRY(rad_dev_set(ranks_[0]->device));
     } else
     RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
@@ -2006,7 +2039,9 @@ int Engine::run_server() {
 
     server::ServerOptions o{};
     o.embedding_model = embedding_;
-    o.image_model = gen_ != nullptr;
+    o.image_model = img_gen_ != nullptr;
+    o.audio_model = aud_gen_ != nullptr;
+    o.video_model = vid_gen_ != nullptr;
     o.decision_type = rad_meta_gets(&meta_, "decision.type", "");
     o.model_id = !cfg_.served_model_name.empty() ? cfg_.served_model_name
                : meta_.name && *meta_.name       ? meta_.name : "radiance";
@@ -2024,9 +2059,9 @@ int Engine::run_server() {
     o.default_reasoning_effort = cfg_.reasoning_effort;
     o.reasoning_effort_map = cfg_.reasoning_effort_map;
     o.default_thinking_budget = cfg_.thinking_token_budget;
-    {
+    if (!gen_) {
         /* The four sampler defaults a file can state: the served value and, per field, its
-         * source. */
+         * source. A generator samples by its own rules and serves no text requests. */
         GenSampling stated;
         std::string src;
         o.default_sampling =
@@ -2078,6 +2113,14 @@ int Engine::run_server() {
     /* Per request, from a reading at most a second old (Engine::diagnostics_json). */
     o.diagnostics_json = [this] { return diagnostics_json(); };
     if (cfg_.lora.enabled()) {
+        /* `model` picks the adapter, and the served model's own name picks the base. */
+        for (const auto& [name, dir] : cfg_.lora.adapters)
+            if (name == o.model_id) {
+                RAD_ERR("lora: the adapter '%s' has the served model's own name, so a request "
+                        "naming it would run the base; rename it or give --served-model-name",
+                        name.c_str());
+                return RAD_E_INVAL;
+            }
         o.lora_acquire = [this](const std::string& m, int32_t* slot, uint64_t* uid,
                                 std::shared_ptr<void>* hold) {
             return lora_acquire(m, slot, uid, hold);
@@ -2317,7 +2360,7 @@ int Engine::run_server() {
         int64_t queued() const override { return drv->queued(); }
         int64_t running() const override { return drv->running(); }
     } image_bridge;
-    if (gen_) {
+    if (img_gen_) {
         const Program& pg = ranks_[0]->program;
         const RadGeneratorDecl& gd = pg.generator;
         server::ImageGenInfo& in = image_bridge.inf;
@@ -2339,11 +2382,11 @@ int Engine::run_server() {
         in.default_height = gd.default_height;
         in.default_steps = gd.default_steps;
         in.max_lanes = gd.max_lanes;
-        in.max_cond_tokens = gen_->max_cond_tokens();
+        in.max_cond_tokens = img_gen_->max_cond_tokens();
         in.fixed_schedule = !pg.gen_str.sigmas.empty();
         in.fixed_steps = (int64_t)pg.gen_str.sigmas.size();
         in.default_cfg = gd.default_cfg;
-        image_bridge.drv = gen_.get();
+        image_bridge.drv = img_gen_;
         image_bridge.proc = mm_proc.get();
         d.images = &image_bridge;
         /* The served model id is the generator's own name (qwen-image-2.1), not the container's
@@ -2357,6 +2400,116 @@ int Engine::run_server() {
                  (long long)in.default_height, (long long)in.max_tokens, (long long)in.max_refs,
                  in.fixed_schedule ? (std::to_string(in.fixed_steps) + " fixed steps").c_str()
                                    : (std::to_string(in.default_steps) + " steps by default").c_str());
+    }
+
+    /* An audio generator's endpoint: the driver's queue, the declared prompt and limits, and the
+     * plugin's rewrite of a request's texts. */
+    struct AudioBridge final : server::IAudioGen {
+        gen::AudioDriver*      drv = nullptr;
+        const LoadedPlugins*   plugins = nullptr;
+        server::AudioGenInfo   inf;
+        const server::AudioGenInfo& info() const override { return inf; }
+        int prepare(int field, const std::string& in, std::string* out,
+                    std::string* why) const override {
+            const int s = rad_tools_text_prepare(*plugins, field, in, out);
+            if (s < 0 && why)
+                *why = s == RAD_E_INVAL ? "the model cannot take this text"
+                                        : std::string(rad_strerror(s));
+            return s;
+        }
+        int submit(std::unique_ptr<gen::AudioRequest> r, std::string* why) override {
+            return drv->submit(std::move(r), why);
+        }
+        int64_t queued() const override { return drv->queued(); }
+        int64_t running() const override { return drv->running(); }
+    } audio_bridge;
+    if (aud_gen_) {
+        const Program& pg = ranks_[0]->program;
+        const RadAudioGenDecl& ad = pg.audio_gen;
+        server::AudioGenInfo& in = audio_bridge.inf;
+        in.name = pg.agen_str.name;
+        in.tmpl = pg.agen_str.tmpl;
+        in.tmpl_plain = pg.agen_str.tmpl_plain;
+        in.neg_tmpl = pg.agen_str.neg_tmpl;
+        in.max_prompt = ad.max_prompt;
+        in.max_frames = ad.max_frames;
+        in.frame_rate_num = ad.frame_rate_num;
+        in.frame_rate_den = ad.frame_rate_den;
+        in.sample_rate = ad.sample_rate;
+        in.channels = ad.channels;
+        in.default_steps = ad.voc_chunk > 0 ? 0 : ad.default_steps;
+        in.default_cfg = ad.default_cfg;
+        in.max_lanes = ad.max_lanes;
+        audio_bridge.drv = aud_gen_;
+        audio_bridge.plugins = &plugins_;
+        d.audio = &audio_bridge;
+        if (cfg_.served_model_name.empty() && !in.name.empty()) {
+            o.model_id = in.name;
+            decide("--served-model-name", o.model_id, "an audio generator: its own name");
+        }
+        RAD_INFO("audio: '%s', %lld Hz x %lld, up to %lld frames (%lld s), %lld at once, %s",
+                 in.name.c_str(), (long long)in.sample_rate, (long long)in.channels,
+                 (long long)in.max_frames,
+                 (long long)(in.max_frames * in.frame_rate_den / in.frame_rate_num),
+                 (long long)in.max_lanes,
+                 ad.voc_chunk > 0
+                     ? fmt("played %lld frames at a time as they are made",
+                           (long long)ad.voc_chunk).c_str()
+                     : fmt("%lld steps a window by default", (long long)in.default_steps).c_str());
+    }
+
+    /* A video generator's endpoints: the driver's queue and the declared prompt, sizes and
+     * lengths. */
+    struct VideoBridge final : server::IVideoGen {
+        gen::VideoDriver*    drv = nullptr;
+        server::VideoGenInfo inf;
+        const server::VideoGenInfo& info() const override { return inf; }
+        int submit(std::unique_ptr<gen::VideoRequest> r, std::string* why) override {
+            return drv->submit(std::move(r), why);
+        }
+        int64_t queued() const override { return drv->queued(); }
+        int64_t running() const override { return drv->running(); }
+    } video_bridge;
+    if (vid_gen_) {
+        const Program& pg = ranks_[0]->program;
+        const RadVideoGenDecl& vd = pg.video_gen;
+        server::VideoGenInfo& in = video_bridge.inf;
+        in.name = pg.vgen_str.name;
+        in.tmpl = pg.vgen_str.tmpl;
+        in.max_text = vd.max_text;
+        in.fps_num = vd.fps_num;
+        in.fps_den = vd.fps_den;
+        in.frames_per_chunk = vd.frames_per_chunk;
+        in.frames_tail = vd.frames_tail;
+        in.min_chunks = vd.min_chunks;
+        in.max_chunks = vd.max_chunks;
+        in.size_multiple = vd.size_multiple;
+        in.min_side = vd.min_side;
+        in.max_area = vd.max_area;
+        in.max_aspect = vd.max_aspect;
+        in.default_width = vd.default_width;
+        in.default_height = vd.default_height;
+        in.default_chunks = vd.default_chunks;
+        in.sample_rate = vd.sample_rate;
+        in.channels = vd.audio_channels;
+        in.default_steps = vd.default_steps;
+        in.max_steps = vd.max_steps;
+        in.fixed_steps = vd.n_rungs > 0;
+        in.max_lanes = vd.max_lanes;
+        video_bridge.drv = vid_gen_;
+        d.videos = &video_bridge;
+        if (cfg_.served_model_name.empty() && !in.name.empty()) {
+            o.model_id = in.name;
+            decide("--served-model-name", o.model_id, "a video generator: its own name");
+        }
+        const double fps = (double)in.fps_num / (double)in.fps_den;
+        RAD_INFO("video: '%s', %lldx%lld by default (up to %lld pixels), %.2f to %.2f s at %g fps "
+                 "with %lld Hz x %lld sound, %lld steps by default",
+                 in.name.c_str(), (long long)in.default_width, (long long)in.default_height,
+                 (long long)in.max_area,
+                 (double)(in.frames_per_chunk * in.min_chunks + in.frames_tail) / fps,
+                 (double)(in.frames_per_chunk * in.max_chunks + in.frames_tail) / fps, fps,
+                 (long long)in.sample_rate, (long long)in.channels, (long long)in.default_steps);
     }
 
     if (encd.modalities == 0 && aend.modalities == 0 && cfg_.media_flags_set())
@@ -2416,6 +2569,12 @@ int Engine::run_server() {
     const char* const keyed = o.api_key.empty() ? "" : "; a bearer key is required";
     if (embedding_)
         RAD_INFO("serving on http://%s:%d  (/v1/embeddings; completions and chat are 501%s)",
+                 o.host.c_str(), o.port, keyed);
+    else if (aud_gen_)
+        RAD_INFO("serving on http://%s:%d  (/v1/audio/speech; completions and chat are 501%s)",
+                 o.host.c_str(), o.port, keyed);
+    else if (vid_gen_)
+        RAD_INFO("serving on http://%s:%d  (/v1/videos; completions and chat are 501%s)",
                  o.host.c_str(), o.port, keyed);
     else if (gen_)
         RAD_INFO("serving on http://%s:%d  (/v1/images/generations%s; completions and chat are "

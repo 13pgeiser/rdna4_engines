@@ -127,6 +127,8 @@ public:
     int         drafter_shared_kv(int pos_offset);
     int         declare_encoder(const RadEncoderDecl* d);
     int         declare_generator(const RadGeneratorDecl* d);
+    int         declare_audio_generator(const RadAudioGenDecl* d);
+    int         declare_video_generator(const RadVideoGenDecl* d);
     void        note_v       (const char* f, va_list ap);
 
     /* An op's buffer operands (rad_op_reads/rad_op_writes in rad_builder.h), which give the
@@ -159,13 +161,13 @@ public:
      * an io_uring ring, which must not stop a sandboxed conversion. */
     void set_instances(bool on) { instances_ = on; }
 
-    /* RUNTIME LoRA (core/lora/): the HF module leaves an adapter may target. Set before the
-     * plugin declares, so a FUSED GEMM over a targeted weight -- a GEMM no adapter delta can ride
-     * on, the gated gate_up fold -- is declined as it is declared and the plugin emits the unfused
-     * chain it already has for a library without the fused kernel. Null: nothing is declined. */
+    /* Runtime LoRA (core/lora/): the HF module leaves an adapter may target. Set before the plugin
+     * declares, so a fused GEMM over a targeted weight (the gated gate_up fold), which leaves no
+     * output for the delta, is declined as it is declared and the plugin emits the unfused chain it
+     * has for a library without the fused kernel. Null: nothing is declined. */
     void set_lora_targets(const std::set<std::string>* t) { lora_targets_ = t; }
-    /* The read and write sets an op declared (rad_op_reads / rad_op_writes), for the LoRA declare,
-     * which needs the dtypes of the activation and the output a targeted GEMM was declared over. */
+    /* The read and write sets an op declared (rad_op_reads / rad_op_writes): the LoRA declare reads
+     * the dtypes of a targeted GEMM's activation and output from them. */
     const std::vector<rad_buf>& op_read_set (rad_op h) const { return op_bufs_[h].reads; }
     const std::vector<rad_buf>& op_write_set(rad_op h) const { return op_bufs_[h].writes; }
 

@@ -2,22 +2,22 @@
  * be written again. Host bookkeeping only: the engine copies the adapter's bytes (engine_lora.cpp)
  * and this table decides which slot, publishes the name, hands out holds and frees slots.
  *
- * A SLOT'S LIFE:
+ * A slot's life:
  *
  *   free --load--> loaded --unload, no request uses it--> free (cooling)
  *                    |                                         ^
  *                    +--unload, requests use it--> draining ---+ the last of them finishes
  *
- * A request holds the adapter it names from admission until its reply is done (the server keeps
- * the hold in the request's Generation), so an adapter is never unloaded under a request. An
- * unload of an adapter in use DRAINS it: from that moment no new request can name it (it is gone
- * from the names, and acquire answers as for a name never loaded), the requests already holding
- * it finish normally, and the last hold to go frees the slot. A load of the same name waits for
- * that rather than racing it.
+ * A request holds the adapter it names from admission until its reply is done or it is cancelled
+ * (the server keeps the hold in the request's Generation), so an adapter is never unloaded under a
+ * request. An unload of an adapter in use drains it: no new request can name it (acquire answers
+ * as for a name never loaded), the requests already holding it finish, and the last hold to go
+ * frees the slot. A load of the same name is refused until then.
  *
- * COOLING: a freed slot is written again only once the step loop has gone round three times
- * since (`epoch` below counts its rounds): the step after a request's last one may already be on
- * the card, issued ahead, and reads the slot through the step batch until it runs.
+ * Cooling: a freed slot is written again only after the step loop has gone round
+ * kSlotCoolRounds times (`epoch` counts its rounds). A step that read the slot may still be on
+ * the card when the last hold goes, issued ahead of the readback; an idle round has no step in
+ * flight and a busy round collects one, so with one step issued ahead two rounds suffice.
  *
  * Thread-safe: every call takes the table's lock. Loads are serialised by the caller (one at a
  * time between reserve and publish), which is what keeps a reserved slot from being handed out
@@ -85,7 +85,7 @@ private:
     const std::atomic<uint64_t>*  epoch_ = nullptr;
 };
 
-/* Step-loop rounds a freed slot waits before it is written again (see COOLING above). */
+/* Step-loop rounds a freed slot waits before it is written again (see Cooling above). */
 inline constexpr uint64_t kSlotCoolRounds = 3;
 
 }  /* namespace lora */

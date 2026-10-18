@@ -265,15 +265,15 @@ struct OpInfo {
     const RadOpSchema*    schema = nullptr;
     int32_t               index = 0;    /* position in the declared order */
     bool                  issued = false;   /* did the run phase ever issue it */
-    /* RUNTIME LoRA (core/lora/). `anchor`: an op the CORE appended after the plugin's declare and
-     * issues inside another op's issue -- its buffers are that op's, so buffer liveness is judged
-     * at the anchor's position, not at this op's own (which is past every plugin op). -1 for every
-     * plugin op. `lora_site`: on a targeted gemm, its row in Program::lora_sites; -1 otherwise. */
+    /* Runtime LoRA (core/lora/). `anchor`: the op a core-appended op is issued inside of; its
+     * buffers are that op's, so their liveness is judged at the anchor's position rather than this
+     * op's own (past every plugin op). -1 for a plugin op. `lora_site`: a targeted gemm's row in
+     * Program::lora_sites, -1 otherwise. */
     int32_t               anchor = -1;
     int32_t               lora_site = -1;
-    /* Declined at declare because runtime LoRA targets its weight (a fused GEMM no delta can follow):
-     * recorded unresolved on purpose, its handle never handed to the plugin, so it is never issued
-     * and the reference-kernel gate does not count it. */
+    /* Declined at declare because runtime LoRA targets its weight (a fused GEMM no delta can
+     * follow): recorded unresolved and never handed to the plugin, so it is never issued and the
+     * reference-kernel gate does not count it. */
     bool                  lora_declined = false;
 };
 
@@ -300,9 +300,9 @@ inline int64_t conv_window_entries(const RadKVGroupDecl& d, int64_t n_spec) {
     return (d.conv_width > 0 ? d.conv_width - 1 : 0) + (n_spec > 0 ? n_spec : 0);
 }
 
-/* ONE TARGETED GEMM OF A RUNTIME-LoRA PROGRAM (core/lora/), as the issue path needs it: the two ops
- * the core appended for it, where in the gemm's own operand list its activation and output are,
- * and the buffers the appended ops read. Built once at declare; issue reads it and nothing else. */
+/* One targeted GEMM of a runtime-LoRA program (core/lora/), as the issue path needs it: the two ops
+ * the core appended for it, where the gemm's activation and output are in its operand list, and
+ * the buffers the appended ops read. Built once at declare. */
 struct LoraIssueSite {
     uint32_t gemm = 0, shrink = 0, expand = 0;     /* op handles */
     int8_t   opd_a = -1, opd_a_scale = -1, opd_y = -1;   /* positions in the GEMM's schema */
@@ -312,7 +312,7 @@ struct LoraIssueSite {
     int64_t  R = 0, K = 0, N = 0;
 };
 /* One targeted weight's adapter slots: A [S, R, K], B [S, N, R] bf16 and the per-column scale
- * [S, N] f32 -- PERSIST buffers, so the arena plan (and with it the KV budget) holds them. */
+ * [S, N] f32, persistent buffers, so the arena plan (and with it the KV budget) holds them. */
 struct LoraPool {
     std::string weight;
     rad_buf     a = 0, b = 0, scale = 0;
@@ -345,7 +345,7 @@ public:
      * no logits buffer. */
     rad_buf pooled_buf = 0;
 
-    /* RUNTIME LoRA (core/lora/), empty unless the engine was started with adapters enabled. */
+    /* Runtime LoRA (core/lora/), empty unless the engine was started with adapters enabled. */
     std::vector<LoraIssueSite> lora_sites;
     std::vector<LoraPool>      lora_pools;
     std::vector<LoraScratch>   lora_t;
@@ -380,6 +380,24 @@ public:
         std::vector<double> sigmas;
     } gen_str;
     bool is_generator() const { return generator.layout != 0; }
+    /* The declared audio generator (rad_declare_audio_generator); `max_lanes` 0 when none. Its
+     * strings point at `agen_str`, as the image generator's do at `gen_str`. */
+    RadAudioGenDecl audio_gen{};
+    struct AudioGenStrings {
+        std::string name, tmpl, tmpl_plain, neg_tmpl;   /* "" for an absent template */
+    } agen_str;
+    bool is_audio_generator() const { return audio_gen.max_lanes != 0; }
+    /* The declared video generator (rad_declare_video_generator); `max_lanes` 0 when none. */
+    RadVideoGenDecl video_gen{};
+    struct VideoGenStrings {
+        std::string name, tmpl;
+        std::vector<double> rungs;   /* RadVideoGenDecl::rungs; the declaration's pointer is null */
+    } vgen_str;
+    bool is_video_generator() const { return video_gen.max_lanes != 0; }
+    /* Driven by passes, not token steps: any generator. */
+    bool is_pass_driven() const {
+        return is_generator() || is_audio_generator() || is_video_generator();
+    }
 
     /* Two arenas, because a host-site activation cannot index device memory. The buffer plan
      * colours each domain separately (transients share storage only within a domain), so each is
@@ -578,9 +596,9 @@ struct TokenScores {
 
 struct Request {
     uint64_t             id = 0;
-    /* THE RUNTIME LoRA ADAPTER this request is served with (core/lora/): its slot in the adapter
-     * pools, -1 for the base model, and the uid of the load that slot held when the request was
-     * admitted -- the prefix cache keys on the uid, so a reload under the same name starts cold. */
+    /* The runtime LoRA adapter this request runs with (core/lora/): its slot in the adapter pools,
+     * -1 for the base model, and the uid of the load that slot held at admission. The prefix cache
+     * keys on the uid, so a reload under the same name starts cold. */
     int32_t              lora_slot = -1;
     uint64_t             lora_uid = 0;
     std::vector<int32_t> prompt;
@@ -769,8 +787,9 @@ struct Config {
     /* Cap on linear-state (or sliding-window) snapshots held at once, for the whole server. The
      * slots are pinned host memory, all allocated at startup and never on the card (spec §7.3).
      * A slot is a sizeable fraction of a gigabyte on a linear-attention model, so raising the cap
-     * trades host RAM for retained checkpoints. */
-    int64_t checkpoint_slots = 8;
+     * trades host RAM for retained checkpoints. -1 is `auto`, resolved by the engine when the
+     * store is opened (checkpoint_slots_auto in core/mem/prefix.h). */
+    int64_t checkpoint_slots = -1;
     bool    prefix_cache = true;
     /* geometric-backoff | tip-only | keep-all. §19.1 records the default as unmeasured;
      * core/mem/prefix.h ships the two extremes so they can be compared. */

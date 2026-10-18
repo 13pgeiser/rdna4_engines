@@ -264,9 +264,15 @@ int ref_attn_dense(const RadArgs* a, RadStream) {
      * itself (a chunked encoder's windows). `cu_div` reads cu_seqlens in units of that many rows:
      * a segment is rows [cu[s] / cu_div, cu[s+1] / cu_div). */
     const int64_t window   = p_int(a, "window", 0);
+    /* Non-causal only: the window's right side, key j visible when j - i < window_right; 0 is
+     * `window`'s. A sliding encoder layer that sees `l` keys behind and `r` ahead is window l + 1,
+     * window_right r + 1. */
+    const int64_t wright   = p_int(a, "window_right", 0);
     const int64_t block    = p_int(a, "block", 0);
     const int64_t cdiv     = p_int(a, "cu_div", 1);
-    if (head_dim <= 0 || gqa <= 0 || window < 0 || block < 0 || cdiv <= 0) return RAD_E_SHAPE;
+    if (head_dim <= 0 || gqa <= 0 || window < 0 || block < 0 || cdiv <= 0 || wright < 0 ||
+        (wright > 0 && (causal || window == 0)))
+        return RAD_E_SHAPE;
     if (head_dim > REF_HD_MAX) return RAD_E_UNSUPPORTED;
 
     /* [tokens, heads, head_dim], or [tokens, heads * head_dim] as a column slice of a fused
@@ -308,7 +314,7 @@ int ref_attn_dense(const RadArgs* a, RadStream) {
             int64_t jbeg = b0, jend = causal ? (i + 1) : b1;
             if (window > 0) {
                 jbeg = std::max<int64_t>(b0, i - window + 1);
-                if (!causal) jend = std::min<int64_t>(b1, i + window);
+                if (!causal) jend = std::min<int64_t>(b1, i + (wright > 0 ? wright : window));
             }
             if (block > 0) {
                 const int64_t blk = b0 + (i - b0) / block * block;
@@ -477,6 +483,15 @@ static void rope_head(const RadTensor* t, int64_t base, int64_t ds, int64_t rot,
     }
 }
 
+/* A position as the rotation reads it, divided by the position scale in f32: an integer operand's
+ * value, or a float operand's own value (a fractional coordinate, such as a video decoder's
+ * normalised grid already multiplied by 2 pi). */
+static inline float rope_pos(const RadTensor* pos, int64_t off, float div) {
+    const uint32_t dt = pos->dtype;
+    const bool flt = dt == RAD_F32 || dt == RAD_BF16 || dt == RAD_F16;
+    return (flt ? ld_dt(dt, pos->data, off) : (float)ld_int(dt, pos->data, off)) / div;
+}
+
 /* "11 11 10" -> {11, 11, 10}. Absent is no sections. */
 static int rope_sections(const RadArgs* a, int64_t* sec) {
     const char* v = p_str(a, "sections", nullptr);
@@ -551,6 +566,12 @@ int ref_rope(const RadArgs* a, RadStream) {
         if (mode == ROPE_AXIAL || rscale != 1.0f) return RAD_E_UNSUPPORTED;
         for (int64_t i = 0; i < rot / 2; ++i) f.inv[i] = yarn.frequency(f.inv[i], (int)i);
     }
+    const RadLlama3 l3 = rad_llama3_args(a);
+    if (!rad_llama3_valid(l3) || (l3.factor != 0.0f && yarn.factor != 0.0f)) return RAD_E_INVAL;
+    if (l3.factor != 0.0f) {
+        if (mode == ROPE_AXIAL || multi) return RAD_E_UNSUPPORTED;
+        for (int64_t i = 0; i < rot / 2; ++i) f.inv[i] = l3.frequency(f.inv[i]);
+    }
     for (int64_t i = nfreq; i < rot / 2; ++i) f.inv[i] = 0.0f;
 
     const int64_t stride_row = (n_head + 2 * n_head_kv) * head_dim;
@@ -564,10 +585,9 @@ int ref_rope(const RadArgs* a, RadStream) {
         float p[8];
         const float div = rscale != 0.0f ? rscale : 1.0f;
         if (multi) {
-            for (int64_t c = 0; c < n_comp; ++c)
-                p[c] = (float)ld_int(pos->dtype, pos->data, c * pcs + m * pms) / div;
+            for (int64_t c = 0; c < n_comp; ++c) p[c] = rope_pos(pos, c * pcs + m * pms, div);
         } else {
-            const float one = (float)ld_int(pos->dtype, pos->data, offlin(pos, m)) / div;
+            const float one = rope_pos(pos, offlin(pos, m), div);
             for (int c = 0; c < 8; ++c) p[c] = one;
         }
         const int64_t row = m * rs;
@@ -581,14 +601,16 @@ int ref_rope(const RadArgs* a, RadStream) {
 /* ------------------------------------------------------------------ qk_norm_rope */
 /* QK-norm and rotation in one op: an RMS norm over each head_dim-wide q and k head against its own
  * gain vector, then RoPE. `v_norm` 1 also RMS-norms each v head with unit gain and no rotation
- * (Gemma 4's weightless value norm); otherwise v heads are untouched.
+ * (Gemma 4's weightless value norm); otherwise v heads are untouched. An absent gain is a unit
+ * gain, without `wadd` (a video decoder's weightless q and k norms); `rotary_dim` 0 is the norm
+ * alone, and then `positions` may be absent.
  *
  * The norm output is rounded to the tensor's dtype before the rotation, as the unfused pair does;
  * libr4d's r4d_qk_norm_rope_gate matches this. A fused kernel keeping f32 across the seam would be
  * half a ULP better and fail the comparison. */
 int ref_qk_norm_rope(const RadArgs* a, RadStream) {
-    if (!have(a, 4)) return RAD_E_INVAL;
-    const RadTensor *qkv = &a->t[0], *pos = &a->t[1], *qw = &a->t[2], *kw = &a->t[3];
+    if (a->n_t < 4 || !t_in(a, 0)) return RAD_E_INVAL;
+    const RadTensor *qkv = &a->t[0], *pos = t_in(a, 1), *qw = t_in(a, 2), *kw = t_in(a, 3);
 
     const int64_t head_dim  = p_int(a, "head_dim", 0);
     const int64_t n_head    = p_int(a, "n_head", 0);
@@ -600,16 +622,21 @@ int ref_qk_norm_rope(const RadArgs* a, RadStream) {
     const int     v_norm    = (int)p_int(a, "v_norm", 0);
     /* `gptj_blocks` is `blocks` with each section's pairs adjacent, (start + 2j, start + 2j + 1):
      * the complex-number form of Qwen-Image's 3-axis rotary. `imrope` is `rope`'s interleaved
-     * M-RoPE over NeoX pairs, after the norm (Qwen3-VL text attention). */
-    static const char* kModes[] = { "neox", "gptj", "blocks", "gptj_blocks", "imrope" };
-    const int mode = p_enum(a, "mode", kModes, 5, 0);
+     * M-RoPE over NeoX pairs, after the norm (Qwen3-VL text attention). `axial` is `rope`'s axial
+     * form (a 3-axis video rotary over NeoX pairs), its section ladders applied with rank-1
+     * positions too, every component then being that one position. */
+    static const char* kModes[] = { "neox", "gptj", "blocks", "gptj_blocks", "imrope", "axial" };
+    const int mode = p_enum(a, "mode", kModes, 6, 0);
     if (mode < 0) return RAD_E_UNSUPPORTED;
     const bool blocks = mode == 2 || mode == 3;
     const bool adjacent = mode == 3;
     const bool im = mode == 4;
+    const bool axial = mode == 5;
     int64_t rot = p_int(a, "rotary_dim", head_dim);
-    if (head_dim <= 0 || n_head <= 0 || rot <= 0 || rot > head_dim || (rot & 1)) return RAD_E_SHAPE;
-    if (numel(qw) < head_dim || numel(kw) < head_dim) return RAD_E_SHAPE;
+    if (head_dim <= 0 || n_head <= 0 || rot < 0 || rot > head_dim || (rot & 1)) return RAD_E_SHAPE;
+    if ((qw && numel(qw) < head_dim) || (kw && numel(kw) < head_dim)) return RAD_E_SHAPE;
+    const bool turn = rot > 0;
+    if (turn && !pos) return RAD_E_INVAL;
 
     /* Blocks: section c is `sec[c]` rotary pairs over its own run of 2 * sec[c] channels, paired
      * (start + j, start + sec[c] + j) and turned by position component comps[c] at
@@ -617,11 +644,11 @@ int ref_qk_norm_rope(const RadArgs* a, RadStream) {
      * rotated prefix exactly. Positions are [C, M], component-major. */
     int64_t sec[8] = {}, comp[8] = {};
     int n_sec = 0;
-    if (im) {
+    if (turn && (im || axial)) {
         n_sec = rope_sections(a, sec);
-        if (n_sec < 3) return RAD_E_SHAPE;
+        if (n_sec < (im ? 3 : 1)) return RAD_E_SHAPE;
     }
-    if (blocks) {
+    if (turn && blocks) {
         n_sec = rope_sections(a, sec);
         if (n_sec <= 0) return RAD_E_SHAPE;
         int64_t total = 0;
@@ -639,23 +666,31 @@ int ref_qk_norm_rope(const RadArgs* a, RadStream) {
             if (k != n_sec) return RAD_E_SHAPE;
         }
     }
-    const bool multi = pos->rank >= 2;
+    const int64_t stride_row = (n_head + 2 * n_head_kv) * head_dim;
+    const bool multi = pos && pos->rank >= 2;
     const int64_t n_comp = multi ? pos->shape[0] : 1;
-    const int64_t M = multi ? pos->shape[1] : numel(pos);
-    if (multi && !blocks && !im) return RAD_E_SHAPE;
-    if (multi && im && n_comp < 3) return RAD_E_SHAPE;
-    for (int c = 0; blocks && c < n_sec; ++c)
-        if (comp[c] < 0 || comp[c] >= n_comp) return RAD_E_SHAPE;
+    const int64_t M = !pos ? rows_of(qkv, stride_row) : multi ? pos->shape[1] : numel(pos);
+    if (turn) {
+        if (multi && !blocks && !im && !axial) return RAD_E_SHAPE;
+        if (multi && im && n_comp < 3) return RAD_E_SHAPE;
+        if (multi && axial && n_comp < n_sec) return RAD_E_SHAPE;
+        for (int c = 0; blocks && c < n_sec; ++c)
+            if (comp[c] < 0 || comp[c] >= n_comp) return RAD_E_SHAPE;
+    }
     const int64_t pcs = multi ? pos->stride[0] : 0, pms = multi ? pos->stride[1] : 0;
 
-    const int64_t stride_row = (n_head + 2 * n_head_kv) * head_dim;
     if (M <= 0 || numel(qkv) < M * stride_row) return RAD_E_SHAPE;
     const int64_t rs = row_stride(qkv, stride_row);
     const int64_t ds = laststride(qkv);
     RopeFreq f;
     /* No `ladder` parameter here: the fused norm+rope measures by `rot`. */
-    if (im) RAD_REF_TRY(rope_freqs(ROPE_IMROPE, rot, rot, theta, sec, multi ? n_sec : 0, &f));
-    else    RAD_REF_TRY(rope_freqs(blocks ? 0 : mode, rot, rot, theta, nullptr, 0, &f));
+    if (turn && im)
+        RAD_REF_TRY(rope_freqs(ROPE_IMROPE, rot, rot, theta, sec, multi ? n_sec : 0, &f));
+    else if (turn && axial)
+        RAD_REF_TRY(rope_freqs(ROPE_AXIAL, rot, rot, theta, sec, n_sec, &f));
+    else if (turn)
+        RAD_REF_TRY(rope_freqs(blocks ? 0 : mode, rot, rot, theta, nullptr, 0, &f));
+    const int pair_mode = im ? (int)ROPE_IMROPE : axial ? (int)ROPE_AXIAL : mode;
 
     /* RMS-norms one head in place, against gain `w` (+ wadd), or unit gain without one. */
     auto norm_head = [&](int64_t base, const RadTensor* w) {
@@ -675,19 +710,20 @@ int ref_qk_norm_rope(const RadArgs* a, RadStream) {
     for (int64_t m = 0; m < M; ++m) {
         float p[8];
         const float div = rscale != 0.0f ? rscale : 1.0f;
-        if (multi) {
+        if (turn && multi) {
             for (int64_t c = 0; c < n_comp && c < 8; ++c)
-                p[c] = (float)ld_int(pos->dtype, pos->data, c * pcs + m * pms) / div;
-        } else {
-            const float one = (float)ld_int(pos->dtype, pos->data, offlin(pos, m)) / div;
+                p[c] = rope_pos(pos, c * pcs + m * pms, div);
+        } else if (turn) {
+            const float one = rope_pos(pos, offlin(pos, m), div);
             for (int c = 0; c < 8; ++c) p[c] = one;
         }
         const int64_t row = m * rs;
         for (int64_t h = 0; h < n_head + n_head_kv; ++h) {
             const int64_t base = row + h * head_dim * ds;
             norm_head(base, h < n_head ? qw : kw);
+            if (!turn) continue;
             if (!blocks) {
-                rope_head(qkv, base, ds, rot, im ? ROPE_IMROPE : mode, f, p);
+                rope_head(qkv, base, ds, rot, pair_mode, f, p);
                 continue;
             }
             int64_t start = 0;

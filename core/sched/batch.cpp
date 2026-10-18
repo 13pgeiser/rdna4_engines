@@ -124,8 +124,8 @@ void BatchBuilder::carve(Set& s, char* h) {
      * moves a rotary position off the token index. */
     pair(&s.h_rope,  &s.d_rope,  mm_on_ ? 3 * T : 0);
     pair(&s.h_mmrow, &s.d_mmrow, mm_on_ ? T : 0);
-    /* Each row's adapter slot, only when the engine serves adapters: with none the slab and every
-     * offset in it are what they were before adapters existed. */
+    /* Each row's adapter slot, carved only when the engine serves adapters, so an engine without
+     * them lays the slab out as if the array did not exist. */
     pair(&s.h_lora,  &s.d_lora,  lora_on_ ? T : 0);
     /* Host-only (derived metadata is copied into the planned arena), but carved on both sides to
      * keep device offsets equal to host offsets. */
@@ -871,6 +871,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
     int64_t n_out = 0, n_dout = 0;
     int32_t rope_mixed = 0;
     int64_t n_mm = 0;
+    bool lora_rows = false;
     s.h_cu[0] = 0;
     for (int64_t i = 0; i < n_seq; ++i) {
         const StepEntry& e = plan.e[(size_t)i];
@@ -902,6 +903,7 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         if (lora_on_) {
             const int32_t ls = e.req ? e.req->lora_slot : -1;
             for (int32_t j = 0; j < e.n_tokens; ++j) s.h_lora[k + j] = ls;
+            if (ls >= 0 && e.n_tokens > 0) lora_rows = true;
         }
         /* Rotary position of each row at its own position (draft-head rows rotate at the index
          * they write, not the token they embed). Three planes of n_tok. */
@@ -1108,7 +1110,9 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.n_mm_rows = n_mm;
         B.mm_rows = n_mm ? on_rank(base, b0, s.d_mmrow) : nullptr;
         B.mm_embd = n_mm ? mm_dev_[r] : nullptr;
-        B.lora_slot = lora_on_ ? on_rank(base, b0, s.d_lora) : nullptr;
+        /* Null on a step with no adapter row: the core then issues no adapter op, and the step
+         * runs the same pass as an engine serving no adapters. */
+        B.lora_slot = lora_rows ? on_rank(base, b0, s.d_lora) : nullptr;
         B.enc = 0;
         B.enc_n_patch = 0;
         B.enc_pixels = nullptr;

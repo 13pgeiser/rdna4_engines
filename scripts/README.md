@@ -11,7 +11,7 @@ checkout the script is in, and default to containers under `$HOME/models/rad/` a
 running (`oracle.sh` only the one on its own port) and logs to `$HOME/<script>.log`. Most defaults
 are environment overrides (`M=` for the container, `P=` for the port, and so on); each script's
 header lists its own. Scripts that only attach to a live server need `curl` and `jq`; `cardclock.py`
-needs `python3`. Scripts find each other through `$(dirname "$0")`.
+and `agentreplay.py` need `python3`. Scripts find each other through `$(dirname "$0")`.
 
 ## Bringing a model up
 
@@ -31,6 +31,7 @@ needs `python3`. Scripts find each other through `$(dirname "$0")`.
 | `cstep2.sh` | Steady-state decode ms/step at each concurrency, against a live server. Waits until exactly C sequences are running before sampling and re-checks at the end, since a window with fewer than C at either edge measures no single concurrency. Model-agnostic (`P=` picks the port). |
 | `dprofd.sh` | Per-op device timing (`--profile-ops`) at depth and concurrency on the 27B dense model with its DFlash2 drafter (`qwen3.8-27b-fp8.rad`); starts its own server on :8129 and needs a ~16K-token prompt (`PROMPT=<file>`). The counters are cumulative and a run starts with prefill, so one dump mixes prefill and decode; difference two dumps taken after prefill has ended. |
 | `fnpf.sh` | Prefill throughput of the server on `$P`, over the repository's own markdown, with a fresh nonce per rep so the prefix cache cannot serve it. Prints card temperature and clock beside every rep. |
+| `agentreplay.py` | Several agent conversations at once against a live server, each growing turn by turn to `--context` tokens and handing tasks to subagents that share its system prompt while it waits (`--rewrite`: a client that replaces its last message every turn). Prints per kind of turn how much of the prompt the cache served and how many continuing turns prefilled their history again, and the prefix-cache counters across the run. The conversations follow `--seed` and carry a fresh nonce, so two servers (one flag apart, restarted between) are sent the same work and share nothing with an earlier run. Takes the key from `--api-key-file`, never the command line. |
 | `fnconc.sh` | What a long prefill costs the decoders running beside it, and the prefill's own time, measured together: alone, then contended, with a warm pass discarded. |
 | `fntrace.sh` | A Flash-Next prefill under `rocprofv3`, on its own server, with the `/stats` link counters across the same request, giving the MoE GEMM's streamed-read rate. |
 | `mctrace.sh` | A MiniCPM5-2B decode trace under `rocprofv3`, on its own server, formatted for `libr4d/isa/tsum.sh`, mainly for its `blocks` column. |

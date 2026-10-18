@@ -110,6 +110,11 @@ public:
      * retain. The tip, positions.back(), must always be kept: an appending transcript resumes
      * from it. */
     virtual void select(const std::vector<int64_t>& positions, std::vector<int64_t>* keep) const = 0;
+    /* The most snapshots the policy keeps for one session that grows to `ctx` tokens with a
+     * checkpoint on every `interval`, retention applied after each: the session's standing share
+     * of the store. The base applies select() to its own output one checkpoint at a time, which
+     * is cheap only for a policy that keeps few. */
+    virtual int64_t held(int64_t ctx, int64_t interval) const;
 };
 
 /* Keep the tip and, at every scale S = interval x 2^k, the shallowest checkpoint in the tip's
@@ -134,12 +139,39 @@ class KeepTipOnly final : public CheckpointPolicy {
 public:
     const char* name() const override { return "tip-only"; }
     void select(const std::vector<int64_t>& positions, std::vector<int64_t>* keep) const override;
+    int64_t held(int64_t, int64_t) const override { return 1; }
 };
 class KeepAll final : public CheckpointPolicy {
 public:
     const char* name() const override { return "keep-all"; }
     void select(const std::vector<int64_t>& positions, std::vector<int64_t>* keep) const override;
+    int64_t held(int64_t ctx, int64_t interval) const override;
 };
+
+/* The policy --checkpoint-policy names, at the resolved checkpoint interval. config_parse admits
+ * only the three names, so any other is geometric backoff. */
+std::unique_ptr<CheckpointPolicy> make_checkpoint_policy(const std::string& name, int64_t interval);
+
+/* ------------------------------------------------------------------ the store's size */
+/* --checkpoint-slots auto. Every sequence --max-num-seqs admits gets its session's standing share
+ * at --max-model-len (CheckpointPolicy::held) plus one slot for the checkpoint its running turn
+ * writes while the previous turn's snapshots are still held. The store is pinned for the life of
+ * the process, so the count is bounded by two byte budgets the engine measures: `share`, the part
+ * of host memory the store may take, and `room`, what the host can pin after everything still to
+ * be allocated. Under the share it never drops below kCheckpointSlotsFloor (or `want`, if fewer);
+ * the room is a hard bound. */
+constexpr int64_t kCheckpointSlotsFloor = 8;
+
+struct CheckpointSlots {
+    int64_t per_seq = 0;      /* snapshots a sequence is given */
+    int64_t want = 0;         /* --max-num-seqs x per_seq */
+    int64_t slots = 0;        /* the store's size */
+    enum class Bound { Want, Share, Room } bound = Bound::Want;
+};
+
+CheckpointSlots checkpoint_slots_auto(const CheckpointPolicy& policy, int64_t max_seqs,
+                                      int64_t ctx, int64_t interval, int64_t slot_bytes,
+                                      int64_t share_bytes, int64_t room_bytes);
 
 /* ------------------------------------------------------------------ the cache */
 class PrefixCache {
@@ -168,11 +200,13 @@ public:
      * cached_groups() order, ready for KVManager::adopt().
      *
      * Never returns the whole prompt: one token must remain to compute a logit from, so a full
-     * hit is backed off by one block. `cap`, when given, ends the hit early (HitCap). */
+     * hit is backed off by one block. `cap`, when given, ends the hit early (HitCap). `session`,
+     * when not 0, is the request being admitted: it takes over the snapshots on the chain it hit
+     * (take_over). */
     CacheHit lookup(const std::vector<int32_t>& tokens,
                     const std::vector<MMContentKey>& mm,
                     std::vector<std::vector<int32_t>>* blocks_out = nullptr,
-                    const HitCap* cap = nullptr) const;
+                    const HitCap* cap = nullptr, uint64_t session = 0) const;
 
     /* Publish the whole blocks a sequence just filled. `blocks[i]` is the block table of
      * cached_groups()[i]. Takes a KV reference on every newly indexed block. */
@@ -347,6 +381,12 @@ private:
     /* Retire one snapshot: free its slot and tell the tiers. The session index is left to the
      * caller. */
     void retire_ckpt(std::unordered_map<BlockHash, Ckpt, BlockHashHash>::iterator it);
+    /* Move every snapshot on the chain `hs` at or below `upto` tokens under `session`. A
+     * conversation's snapshots belong to its latest turn: sessions are request ids, so otherwise
+     * each earlier turn's deepest snapshot would stay a protected tip, and a running turn would be
+     * a second session beside its conversation, two ladders where retention should keep one.
+     * The admission's lookup and the publish both call it. */
+    void take_over(uint64_t session, const std::vector<BlockHash>& hs, int64_t upto) const;
     /* Take one key out of a session's index entry, and the entry when it empties. */
     void unindex_ckpt(uint64_t session, const BlockHash& key);
     /* For the debug lines: whether `c` is its session's deepest snapshot, and seconds since a
@@ -375,7 +415,7 @@ private:
     std::unordered_map<BlockHash, int32_t, BlockHashHash> held_;
     bool        released_ = false;
     mutable std::unordered_map<BlockHash, Ckpt, BlockHashHash> ck_by_prefix_;
-    std::unordered_map<uint64_t, std::vector<BlockHash>> ck_by_session_;
+    mutable std::unordered_map<uint64_t, std::vector<BlockHash>> ck_by_session_;
     /* Snapshots lookup handed out since begin_step; kept in their slots until the next one. */
     mutable std::vector<BlockHash> handed_;
     bool handed(const BlockHash& h) const {

@@ -1,0 +1,39 @@
+# q38-27b-modelopt-nvfp4.recipe -- an NVIDIA ModelOpt NVFP4 release of Qwen3.8-27B (or a finetune of
+# it, such as ukisai's Swift 1.5 NVFP4): FP8 attention and delta-net projections, NVFP4 MLPs and head.
+#
+#   rad-convert <ModelOpt NVFP4 release> --recipe data/recipes/q38-27b-modelopt-nvfp4.recipe -o model.rad
+#
+# The release is ModelOpt's MIXED_PRECISION: the attention q, k, v and output and the delta net's
+# qkv, z and output projections are FP8 with one f32 scale per tensor; the MLPs and the lm_head are
+# NVFP4 (e2m1 codes, an e4m3 scale per 16 of K, times an f32 weight_scale_2 per tensor); the delta
+# net's a/b projections, the norms, the embedding, the vision tower and the MTP head are bf16. Its
+# static input scales are not read: activations are quantised from their own values.
+#
+#   - The FP8 projections keep their codes. The import rule writes each tensor's scale as the
+#     block plane the block-fp8 GEMM reads, rounded to bf16: one factor for the whole tensor, off
+#     by at most 2^-8 (3.3e-3 on Swift 1.5's 208 tensors); qkv and z keep their own scales, each
+#     a whole number of 128-row blocks.
+#   - No kernel reads NVFP4, so the MLPs are made OCP-MXFP4 (`fp4_e2m1`, an e8m0 scale per 32 of
+#     K, the encoding and kernel of q38-27b-quark-mxfp4-df2.recipe) from their exact values. That
+#     rounds twice (e4m3 scales per 16 to a power of two per 32): 0.116 relative error against
+#     the release's NVFP4 values on Swift 1.5, and unsloth's NVFP4 release made MXFP4 this way
+#     scores mean KL 0.287 against the block-fp8 base, AMD's Quark MXFP4 0.206.
+#     `codes=fp8_e4m3 block=128x128 scale=bf16` on the two MLP rules instead keeps them within
+#     0.027 of the release at 28.2 GiB of weights against 20.8.
+#   - The head is block fp8 from its exact NVFP4 values, as in the other 27B recipes.
+#   - The MTP head stays bf16 as shipped (blk.64 is its layer); it drafts through a 2-bit copy of
+#     the head (u2 with a u8 zero, least-squares clip search) rescored against the fp8 head.
+
+blk.*.attn_qg.weight                 import  block=128x128 scale=bf16
+blk.*.attn_k.weight                  import  block=128x128 scale=bf16
+blk.*.attn_v.weight                  import  block=128x128 scale=bf16
+blk.*.attn_output.weight             import  block=128x128 scale=bf16
+blk.*.ssm_inz.weight                 import  block=128x128 scale=bf16
+blk.*.ssm_out.weight                 import  block=128x128 scale=bf16
+
+blk.64.ffn_*.weight                  cast    dtype=bf16
+blk.*.ffn_gate_up.weight             rtn     codes=fp4_e2m1 group=32 scale=e8m0
+blk.*.ffn_down.weight                rtn     codes=fp4_e2m1 group=32 scale=e8m0
+
+output.weight                        rtn     codes=fp8_e4m3 block=128x128 scale=bf16
+mtp.draft_head.weight                rtn     codes=u2 zero=u8 group=128 scale=f16 rule=search

@@ -2,17 +2,17 @@
  *
  * The case matrix and every check are lora_cases.h's, shared with tests/lora_ops_test.cpp (libref and
  * libavx): base rows untouched by bytes, adapter rows against a double-precision sum within the
- * bounds stated there. Here the implementations are the emulated kernels -- the v1 scalar rows and
- * the tiled rows (WMMA shrink, LDS-staged expand) -- ref_host.cpp's restatement of libref's
- * arithmetic, and libref itself when $RADIANCE_HOME holds one (ctest sets it); every emulated
- * EXPAND is held to the first of those bit for bit, because its j-ascending sum and its roundings
- * are libref's. Shrink is held to the bound rather than to libref's bytes: v1 sums k in 32 lane
+ * bounds stated there. Here the implementations are the emulated kernels (the scalar rows and the
+ * tiled rows: WMMA shrink, LDS-staged expand), ref_host.cpp's restatement of libref's arithmetic,
+ * and libref itself when $RADIANCE_HOME holds one (ctest sets it). Every emulated expand is held
+ * to libref's restatement bit for bit, because its j-ascending sum and its roundings are libref's.
+ * Shrink is held to the bound rather than to libref's bytes: the scalar row sums k in 32 lane
  * strides and a butterfly, the WMMA row in 32-wide steps over waves and a K split.
  *
  * Then what the tiled rows promise beyond the matrix, each proven here on the emulator:
  *
- *   shapes     the real ones -- K 2048 / 5120 / 6144 / 17408, R 16 / 48 / 64 / 192, N 256 ..
- *              12288, odd M, S 1..4, bf16 and E4M3 with a scale every 128 -- shrink to the f64
+ *   shapes     the real ones (K 2048 / 5120 / 6144 / 17408, R 16 / 48 / 64 / 192, N 256 ..
+ *              12288, odd M, S 1..4, bf16 and E4M3 with a scale every 128): shrink to the f64
  *              bound (and its worst error printed against f64), expand to libref's bytes.
  *   batch      a row computed alone (M = 1) and as row p of M in {7, 16, 17, 37, 300}, the others
  *              random slots and base rows: its t and y bits are the same. Every K split, z fan-out
@@ -303,7 +303,7 @@ static std::vector<int32_t> rand_slots(std::mt19937& rng, int M, int S, int base
     return v;
 }
 
-/* REAL SHAPES. Each pair is shrink -> expand, as the engine issues it: expand reads the t the
+/* Real shapes. Each pair is shrink -> expand, as the engine issues it: expand reads the t the
  * tiled shrink wrote, and is held to libref's bytes over that same t. */
 static void test_shapes(const Rows& R) {
     std::mt19937 rng(23);
@@ -344,7 +344,7 @@ static void test_shapes(const Rows& R) {
                 sizeof(shapes) / sizeof(shapes[0]), wb, wr, std::ldexp(1.0, -24));
 }
 
-/* BATCH INVARIANCE: a row alone and inside batches of other slots and base rows. */
+/* Batch invariance: a row alone and inside batches of other slots and base rows. */
 static void test_invariance() {
     std::mt19937 rng(41);
     struct Sh { int K, R, N, S; uint32_t adt, ydt; };
@@ -435,7 +435,7 @@ static void test_invariance() {
                 "positions, aligned and unaligned)\n", compared);
 }
 
-/* BASE ROWS ONLY: a prefill-sized launch of nothing but base rows touches no byte of t or y. */
+/* Base rows only: a prefill-sized launch of nothing but base rows touches no byte of t or y. */
 static void test_all_base() {
     std::mt19937 rng(5);
     std::vector<int32_t> slot((size_t)2048);
@@ -453,9 +453,9 @@ static void test_all_base() {
     std::printf("lora base rows only: M 2048, t and y untouched\n");
 }
 
-/* EVERY CODE through a one-hot pool: A[s, j, k] = (k == j), so t[m, j] = x(m, j) = code * scale
- * exactly -- one exact product, the rest +-0 -- and the WMMA row's code widening is checked code
- * by code. Codes whose value is NaN or Inf would turn every j's zero products into NaN, so they
+/* Every code through a one-hot pool: A[s, j, k] = (k == j), so t[m, j] = x(m, j) = code * scale
+ * exactly (one exact product, the rest +-0), and the WMMA row's code widening is checked code by
+ * code. Codes whose value is NaN or Inf would turn every j's zero products into NaN, so they
  * get rows of their own, where every t must be NaN as in the f64 sum. */
 static void test_codes() {
     int checked = 0;

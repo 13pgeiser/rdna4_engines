@@ -7,6 +7,7 @@
 #include "r4d_args.h"
 #include "r4d_common.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -98,14 +99,26 @@ struct QkBlocks {
     int comp[8] = {};
 };
 
+// A norm gain element, the gains bf16 or (w_f32) f32; an absent gain is one, without `wadd`.
+__device__ __forceinline__ float qk_gain(const void* w, uint32_t e, int w_f32, float wadd) {
+    if (!w) return 1.0f;
+    return (w_f32 ? ((const float*)w)[e] : bf2f(((const uint16_t*)w)[e])) + wadd;
+}
+
+// Element `i` of the positions: an i32 value, or with `pos_f32` an f32 one read as the value it
+// holds (a fractional coordinate, such as a video decoder's normalised grid times 2 pi).
+__device__ __forceinline__ float qk_pos(const void* pos, int pos_f32, size_t i) {
+    return pos_f32 ? ((const float*)pos)[i] : (float)((const int*)pos)[i];
+}
+
 // MODE: 0 neox, 1 gptj, 2 blocks. Positions are [M] for the first two and [C, M] (plane stride
 // `pplane`) for blocks.
 template <int MODE>
 __global__ __launch_bounds__(kQkThreads) void qk_norm_rope_kernel(
-    uint16_t* __restrict__ qkv, const int* __restrict__ pos, const uint16_t* __restrict__ qw,
-    const uint16_t* __restrict__ kw, uint32_t head_dim, uint32_t n_head, uint32_t n_head_kv,
+    uint16_t* __restrict__ qkv, const void* __restrict__ pos, const void* __restrict__ qw,
+    const void* __restrict__ kw, uint32_t head_dim, uint32_t n_head, uint32_t n_head_kv,
     uint32_t rot, int v_norm, float theta, float eps, float rscale, float wadd, uint32_t ld,
-    QkBlocks blk, uint32_t pplane) {
+    QkBlocks blk, uint32_t pplane, int w_f32, int pos_f32) {
     __shared__ float cs_s[kQkMaxHalf], sn_s[kQkMaxHalf];
     const uint32_t m = blockIdx.x;
     const uint32_t n_rope = n_head + n_head_kv;
@@ -119,12 +132,12 @@ __global__ __launch_bounds__(kQkThreads) void qk_norm_rope_kernel(
         for (uint32_t i = threadIdx.x; i < half; i += kQkThreads) {
             int c = 0, s0 = 0;
             while (c + 1 < blk.n && (int)i >= s0 + blk.sec[c]) { s0 += blk.sec[c]; ++c; }
-            const float p = (float)pos[(size_t)blk.comp[c] * pplane + m] / div;
+            const float p = qk_pos(pos, pos_f32, (size_t)blk.comp[c] * pplane + m) / div;
             const float inv = 1.0f / powf(theta, (float)((int)i - s0) / (float)blk.sec[c]);
             sincosf(p * inv, &sn_s[i], &cs_s[i]);
         }
     } else {
-        const float p = (float)pos[m] / div;
+        const float p = qk_pos(pos, pos_f32, m) / div;
         for (uint32_t i = threadIdx.x; i < half; i += kQkThreads) {
             const float inv = 1.0f / powf(theta, (float)(2 * i) / (float)rot);
             sincosf(p * inv, &sn_s[i], &cs_s[i]);
@@ -148,11 +161,11 @@ __global__ __launch_bounds__(kQkThreads) void qk_norm_rope_kernel(
         ss = r4d_wave_sum(ss);
         const float sc = 1.0f / sqrtf(ss / (float)head_dim + eps);
         const bool is_v = hh >= n_rope;
-        const uint16_t* w = hh < n_head ? qw : kw;
+        const void* w = hh < n_head ? qw : kw;
         #pragma unroll
         for (int j = 0; j < kQkMaxE; ++j)
             if (j < E) {
-                const float g = is_v ? 1.0f : bf2f(w[at(j)]) + wadd;
+                const float g = is_v ? 1.0f : qk_gain(w, at(j), w_f32, wadd);
                 x[j] = bf2f(f32_to_bf16(x[j] * sc * g));
             }
         if (!is_v) {
@@ -226,11 +239,17 @@ __global__ __launch_bounds__(kQkThreads) void qk_norm_rope_kernel(
 //   2  imrope       NeoX pairs (i, i + rot/2) on one ladder theta^(-2i/rot), the position
 //                   component interleaved: 1 where i % 3 == 1 and i < 3 * sec[1], 2 where
 //                   i % 3 == 2 and i < 3 * sec[2], 0 elsewhere (Qwen3-VL's text attention)
+//   3  axial        NeoX pairs (i, i + rot/2), the rot/2 frequencies in contiguous sections,
+//                   section c on its own ladder theta^(-2j/(2 sec[c])) and turned by component c
+//                   (a video transformer's or decoder's (t, h, w) rotary). With rank-1 positions
+//                   (`pplane` 0) every component is the one position.
+//
+// `rot` 0 is the norm alone and reads no positions.
 __global__ __launch_bounds__(kQkThreads) void qk_norm_rope_any_kernel(
-    uint16_t* __restrict__ qkv, const int* __restrict__ pos, const uint16_t* __restrict__ qw,
-    const uint16_t* __restrict__ kw, uint32_t head_dim, uint32_t n_head, uint32_t n_head_kv,
+    uint16_t* __restrict__ qkv, const void* __restrict__ pos, const void* __restrict__ qw,
+    const void* __restrict__ kw, uint32_t head_dim, uint32_t n_head, uint32_t n_head_kv,
     uint32_t rot, int v_norm, float theta, float eps, float rscale, float wadd, uint32_t ld,
-    QkBlocks blk, uint32_t pplane, int pm) {
+    QkBlocks blk, uint32_t pplane, int pm, int w_f32, int pos_f32) {
     __shared__ float cs_s[kQkMaxHalf], sn_s[kQkMaxHalf];
     __shared__ int   pa_s[kQkMaxHalf], pb_s[kQkMaxHalf];
     const uint32_t m = blockIdx.x;
@@ -244,7 +263,7 @@ __global__ __launch_bounds__(kQkThreads) void qk_norm_rope_any_kernel(
             int c = 0;
             if (i % 3 == 1 && (int)i < 3 * blk.sec[1]) c = 1;
             else if (i % 3 == 2 && (int)i < 3 * blk.sec[2]) c = 2;
-            const float p = (float)pos[(size_t)c * pplane + m] / div;
+            const float p = qk_pos(pos, pos_f32, (size_t)c * pplane + m) / div;
             const float inv = 1.0f / powf(theta, (float)(2 * i) / (float)rot);
             sincosf(p * inv, &sn_s[i], &cs_s[i]);
             pa_s[i] = (int)i;
@@ -253,7 +272,16 @@ __global__ __launch_bounds__(kQkThreads) void qk_norm_rope_any_kernel(
         }
         int c = 0, s0 = 0;
         while (c + 1 < blk.n && (int)i >= s0 + blk.sec[c]) { s0 += blk.sec[c]; ++c; }
-        const float p = (float)pos[(size_t)blk.comp[c] * pplane + m] / div;
+        if (pm == 3) {
+            const float p = qk_pos(pos, pos_f32, (size_t)c * pplane + m) / div;
+            const float inv =
+                1.0f / powf(theta, (float)(2 * ((int)i - s0)) / (float)(2 * blk.sec[c]));
+            sincosf(p * inv, &sn_s[i], &cs_s[i]);
+            pa_s[i] = (int)i;
+            pb_s[i] = (int)(i + half);
+            continue;
+        }
+        const float p = qk_pos(pos, pos_f32, (size_t)blk.comp[c] * pplane + m) / div;
         const float inv = 1.0f / powf(theta, (float)((int)i - s0) / (float)blk.sec[c]);
         sincosf(p * inv, &sn_s[i], &cs_s[i]);
         if (pm == 1) {
@@ -273,9 +301,9 @@ __global__ __launch_bounds__(kQkThreads) void qk_norm_rope_any_kernel(
         ss = r4d_wave_sum(ss);
         const float sc = 1.0f / sqrtf(ss / (float)head_dim + eps);
         const bool is_v = hh >= n_rope;
-        const uint16_t* w = hh < n_head ? qw : kw;
+        const void* w = hh < n_head ? qw : kw;
         auto nrm = [&](uint32_t e) {
-            const float g = is_v ? 1.0f : bf2f(w[e]) + wadd;
+            const float g = is_v ? 1.0f : qk_gain(w, e, w_f32, wadd);
             return bf2f(f32_to_bf16(bf2f(h[e]) * sc * g));
         };
         if (is_v) {
@@ -318,6 +346,19 @@ __global__ __launch_bounds__(kThreads) void widen_kernel(
         y[(size_t)m * y_ld + i] = bf2f(x[(size_t)m * x_ld + i]);
 }
 
+// ---------------------------------------------------------------------------- cast bf16 -> f16
+// ref_cast: the value rounded to nearest even once, so a bf16 value in f16's normal range is kept
+// exactly and one past it becomes an infinity (rad_f32_to_f16).
+__global__ __launch_bounds__(kThreads) void narrow_f16_kernel(
+    const uint16_t* __restrict__ x, uint16_t* __restrict__ y, uint32_t n, uint32_t x_ld,
+    uint32_t y_ld, uint32_t M) {
+    const uint32_t i = blockIdx.x * kThreads + threadIdx.x;
+    if (i >= n) return;
+    for (uint32_t m = blockIdx.y; m < M; m += gridDim.y)
+        y[(size_t)m * y_ld + i] =
+            __builtin_bit_cast(uint16_t, (_Float16)bf2f(x[(size_t)m * x_ld + i]));
+}
+
 // ---------------------------------------------------------------------------- the audio tower
 // Gemma 4's USM conformer: elementwise rectifier and clamp, the subsampler's segment-wise
 // convolution, the light-conv block's causal depthwise convolution, the relative-position table,
@@ -347,6 +388,37 @@ __global__ __launch_bounds__(kThreads) void silu_kernel(
     for (uint32_t m = blockIdx.y; m < M; m += gridDim.y) {
         const float v = bf2f(x[(size_t)m * x_ld + i]);
         y[(size_t)m * y_ld + i] = f32_to_bf16(v * (1.0f / (1.0f + expf(-v))));
+    }
+}
+
+// The f32 form: f32 in, f32 out or bf16 rounded once (a timestep MLP's activation, rounded where
+// the bf16 projection after it reads it). Flat over the extent.
+__device__ __forceinline__ void st_act(float* p, float v) { *p = v; }
+__device__ __forceinline__ void st_act(uint16_t* p, float v) { *p = f32_to_bf16(v); }
+
+template <typename TY>
+__global__ __launch_bounds__(kThreads) void silu_f32_kernel(
+    const float* __restrict__ x, TY* __restrict__ y, uint32_t n, uint32_t x_ld, uint32_t y_ld,
+    uint64_t total) {
+    for (uint64_t t = (uint64_t)blockIdx.x * kThreads + threadIdx.x; t < total;
+         t += (uint64_t)gridDim.x * kThreads) {
+        const uint64_t m = t / n;
+        const uint32_t i = (uint32_t)(t - m * n);
+        const float v = x[m * x_ld + i];
+        st_act(y + m * y_ld + i, v * (1.0f / (1.0f + expf(-v))));
+    }
+}
+
+// ref_gelu: the exact erf form, 0.5 x (1 + erf(x / sqrt 2)) in libref's order, one rounding (a
+// ConvNeXt block's feed-forward activation; gated feed-forwards use the tanh form).
+__global__ __launch_bounds__(kThreads) void gelu_kernel(
+    const uint16_t* __restrict__ x, uint16_t* __restrict__ y, uint32_t n, uint32_t x_ld,
+    uint32_t y_ld, uint32_t M) {
+    const uint32_t i = blockIdx.x * kThreads + threadIdx.x;
+    if (i >= n) return;
+    for (uint32_t m = blockIdx.y; m < M; m += gridDim.y) {
+        const float v = bf2f(x[(size_t)m * x_ld + i]);
+        y[(size_t)m * y_ld + i] = f32_to_bf16(0.5f * v * (1.0f + erff(v * 0.70710678118654752f)));
     }
 }
 
@@ -533,10 +605,11 @@ __global__ __launch_bounds__(kThreads) void conv2d_lds_kernel(
 }
 
 // ref_conv1d_dw. One thread per (row, channel); the segment is found by a scan over cu_seqlens.
+// `b`, when bound, is a bias per channel (bf16, or f32 with b_f32), added before the rounding.
 __global__ __launch_bounds__(kThreads) void conv1d_dw_kernel(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ w, const int* __restrict__ cu,
     uint16_t* __restrict__ y, int C, int K, int cdiv, int S, uint32_t x_ld, uint32_t y_ld,
-    int rows) {
+    int rows, const void* __restrict__ b, int b_f32) {
     const int c = (int)(blockIdx.x * kThreads + threadIdx.x);
     if (c >= C) return;
     for (int t = (int)blockIdx.y; t < rows; t += (int)gridDim.y) {
@@ -553,6 +626,7 @@ __global__ __launch_bounds__(kThreads) void conv1d_dw_kernel(
             if (tt < t0) continue;
             acc += bf2f(x[(size_t)tt * x_ld + c]) * bf2f(w[(size_t)c * K + j]);
         }
+        if (b) acc += b_f32 ? ((const float*)b)[c] : bf2f(((const uint16_t*)b)[c]);
         y[(size_t)t * y_ld + c] = f32_to_bf16(acc);
     }
 }
@@ -682,32 +756,43 @@ extern "C" int r4d_seg_mean_bf16(long x, long cu, long y, int S, int n, int x_ld
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
-// mode: 0 neox, 1 gptj, 2 blocks, 3 gptj_blocks, 4 imrope (`blk` and the position plane stride
-// `pplane` used only by the last three).
+// mode: 0 neox, 1 gptj, 2 blocks, 3 gptj_blocks, 4 imrope, 5 axial (`blk` and the position plane
+// stride `pplane` used only by the last four). A null gain is a unit gain; `rot` 0 is the norm
+// alone, and then `pos` may be null. `pos_f32` reads f32 positions as the values they hold.
 extern "C" int r4d_qk_norm_rope_bf16(long qkv, long pos, long qw, long kw, int M, int head_dim,
                                      int n_head, int n_head_kv, int rot, int mode, int v_norm,
                                      float theta, float eps, float rscale, float wadd, int ld,
-                                     const QkBlocks* blk, int pplane, long stream) {
-    if (!qkv || !pos || !qw || !kw) return -1;
-    if (M <= 0 || head_dim <= 0 || n_head <= 0 || n_head_kv <= 0 || rot <= 0 || rot > head_dim ||
-        (rot & 1) || rot / 2 > (int)kQkMaxHalf || head_dim > 32 * kQkMaxE || mode < 0 || mode > 4)
+                                     const QkBlocks* blk, int pplane, long stream, int w_f32,
+                                     int pos_f32) {
+    if (!qkv || (rot > 0 && !pos)) return -1;
+    if (M <= 0 || head_dim <= 0 || n_head <= 0 || n_head_kv <= 0 || rot < 0 || rot > head_dim ||
+        (rot & 1) || rot / 2 > (int)kQkMaxHalf || head_dim > 32 * kQkMaxE || mode < 0 || mode > 5)
         return -2;
+    if (rot == 0) {
+        /* The norm alone: no pair is rotated, so no position is read. */
+        hipLaunchKernelGGL(qk_norm_rope_any_kernel, dim3((uint32_t)M), dim3(kQkThreads), 0,
+                           (hipStream_t)stream, (uint16_t*)qkv, (const void*)nullptr,
+                           (const void*)qw, (const void*)kw, (uint32_t)head_dim,
+                           (uint32_t)n_head, (uint32_t)n_head_kv, 0u, v_norm, theta, eps, rscale,
+                           wadd, (uint32_t)ld, QkBlocks{}, 0u, 0, w_f32, 0);
+        return hipGetLastError() == hipSuccess ? 0 : -4;
+    }
     if (mode >= 3) {
-        /* gptj_blocks and imrope: general kernel only (its pair table is built per mode). */
+        /* gptj_blocks, imrope and axial: general kernel only (its pair table is built per mode). */
         if (!blk || blk->n <= 0 || blk->n > 8) return -2;
         int total = 0;
         for (int c = 0; c < blk->n; ++c) {
             if (blk->sec[c] <= 0) return -2;
             total += blk->sec[c];
         }
-        if (mode == 3 && 2 * total != rot) return -2;
+        if ((mode == 3 || mode == 5) && 2 * total != rot) return -2;
         if (mode == 4 && (blk->n < 3 || 2 * total != rot)) return -2;
         hipLaunchKernelGGL(qk_norm_rope_any_kernel, dim3((uint32_t)M), dim3(kQkThreads), 0,
-                           (hipStream_t)stream, (uint16_t*)qkv, (const int*)pos,
-                           (const uint16_t*)qw, (const uint16_t*)kw, (uint32_t)head_dim,
+                           (hipStream_t)stream, (uint16_t*)qkv, (const void*)pos,
+                           (const void*)qw, (const void*)kw, (uint32_t)head_dim,
                            (uint32_t)n_head, (uint32_t)n_head_kv, (uint32_t)rot, v_norm, theta,
                            eps, rscale, wadd, (uint32_t)ld, *blk, (uint32_t)pplane,
-                           mode == 3 ? 1 : 2);
+                           mode == 3 ? 1 : mode == 4 ? 2 : 3, w_f32, pos_f32);
         return hipGetLastError() == hipSuccess ? 0 : -4;
     }
     if (mode != 2 && head_dim % 32) return -2;
@@ -729,18 +814,19 @@ extern "C" int r4d_qk_norm_rope_bf16(long qkv, long pos, long qw, long kw, int M
     }
     if (any) {
         hipLaunchKernelGGL(qk_norm_rope_any_kernel, dim3((uint32_t)M), dim3(kQkThreads), 0,
-                           (hipStream_t)stream, (uint16_t*)qkv, (const int*)pos,
-                           (const uint16_t*)qw, (const uint16_t*)kw, (uint32_t)head_dim,
+                           (hipStream_t)stream, (uint16_t*)qkv, (const void*)pos,
+                           (const void*)qw, (const void*)kw, (uint32_t)head_dim,
                            (uint32_t)n_head, (uint32_t)n_head_kv, (uint32_t)rot, v_norm, theta,
-                           eps, rscale, wadd, (uint32_t)ld, b, (uint32_t)pplane, 0);
+                           eps, rscale, wadd, (uint32_t)ld, b, (uint32_t)pplane, 0, w_f32,
+                           pos_f32);
         return hipGetLastError() == hipSuccess ? 0 : -4;
     }
 #define R4D_QN(MD)                                                                              \
     hipLaunchKernelGGL(qk_norm_rope_kernel<MD>, dim3((uint32_t)M), dim3(kQkThreads), 0,         \
-                       (hipStream_t)stream, (uint16_t*)qkv, (const int*)pos, (const uint16_t*)qw, \
-                       (const uint16_t*)kw, (uint32_t)head_dim, (uint32_t)n_head,               \
+                       (hipStream_t)stream, (uint16_t*)qkv, (const void*)pos, (const void*)qw,  \
+                       (const void*)kw, (uint32_t)head_dim, (uint32_t)n_head,                   \
                        (uint32_t)n_head_kv, (uint32_t)rot, v_norm, theta, eps, rscale, wadd,    \
-                       (uint32_t)ld, b, (uint32_t)pplane)
+                       (uint32_t)ld, b, (uint32_t)pplane, w_f32, pos_f32)
     if (mode == 1)      R4D_QN(1);
     else if (mode == 2) R4D_QN(2);
     else                R4D_QN(0);
@@ -769,10 +855,30 @@ extern "C" int r4d_widen_bf16_f32(long x, long y, int M, int n, int x_ld, int y_
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
+extern "C" int r4d_narrow_bf16_f16(long x, long y, int M, int n, int x_ld, int y_ld,
+                                   long stream) {
+    if (!x || !y) return -1;
+    if (M <= 0 || n <= 0) return -2;
+    hipLaunchKernelGGL(narrow_f16_kernel,
+                       dim3((uint32_t)((n + kThreads - 1) / kThreads), grid_rows(M)),
+                       dim3(kThreads), 0, (hipStream_t)stream, (const uint16_t*)x, (uint16_t*)y,
+                       (uint32_t)n, (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)M);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
 extern "C" int r4d_relu_bf16(long x, long y, int M, int n, int x_ld, int y_ld, long stream) {
     if (!x || !y) return -1;
     if (M <= 0 || n <= 0) return -2;
     hipLaunchKernelGGL(relu_kernel, dim3((uint32_t)((n + kThreads - 1) / kThreads), grid_rows(M)),
+                       dim3(kThreads), 0, (hipStream_t)stream, (const uint16_t*)x, (uint16_t*)y,
+                       (uint32_t)n, (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)M);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+extern "C" int r4d_gelu_bf16(long x, long y, int M, int n, int x_ld, int y_ld, long stream) {
+    if (!x || !y) return -1;
+    if (M <= 0 || n <= 0) return -2;
+    hipLaunchKernelGGL(gelu_kernel, dim3((uint32_t)((n + kThreads - 1) / kThreads), grid_rows(M)),
                        dim3(kThreads), 0, (hipStream_t)stream, (const uint16_t*)x, (uint16_t*)y,
                        (uint32_t)n, (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)M);
     return hipGetLastError() == hipSuccess ? 0 : -4;
@@ -830,14 +936,15 @@ extern "C" int r4d_conv2d_unfold_bf16(long x, long cu, long valid, long y, int r
 }
 
 extern "C" int r4d_conv1d_dw_bf16(long x, long w, long cu, long y, int rows, int C, int K,
-                                  int cdiv, int S, int x_ld, int y_ld, long stream) {
+                                  int cdiv, int S, int x_ld, int y_ld, long stream, long b = 0,
+                                  int b_f32 = 0) {
     if (!x || !w || !cu || !y) return -1;
     if (rows <= 0 || C <= 0 || K <= 0 || cdiv <= 0 || S <= 0) return -2;
     hipLaunchKernelGGL(conv1d_dw_kernel,
                        dim3((uint32_t)((C + kThreads - 1) / kThreads), grid_rows(rows)),
                        dim3(kThreads), 0, (hipStream_t)stream, (const uint16_t*)x,
                        (const uint16_t*)w, (const int*)cu, (uint16_t*)y, C, K, cdiv, S,
-                       (uint32_t)x_ld, (uint32_t)y_ld, rows);
+                       (uint32_t)x_ld, (uint32_t)y_ld, rows, (const void*)b, b_f32);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -958,32 +1065,60 @@ extern "C" int r4d_rad_qk_norm_rope(const RadArgs* a, RadStream s) {
     const RadTensor* pos = r4d_opt(a, QN_POS);
     const RadTensor* qw  = r4d_opt(a, QN_QW);
     const RadTensor* kw  = r4d_opt(a, QN_KW);
-    if (!qkv || !pos || !qw || !kw) return R4D_NO(RAD_E_INVAL);
+    if (!qkv) return R4D_NO(RAD_E_INVAL);
     R4D_NEED(dt_bf16(qkv));
-    R4D_NEED(dt_bf16(qw));
-    R4D_NEED(dt_bf16(kw));
-    if (pos->dtype != RAD_I32 || !r4d_contig(pos)) return R4D_NO(RAD_E_DTYPE);
-    if (!r4d_contig(qw) || !r4d_contig(kw)) return R4D_NO(RAD_E_STRIDE);
+    /* The gains bf16 or f32, both alike (a model may keep its norms f32, libref reads either); an
+     * absent gain is a unit gain. */
+    const RadTensor* w0 = qw ? qw : kw;
+    if (w0 && ((w0->dtype != RAD_BF16 && w0->dtype != RAD_F32) ||
+               (qw && kw && kw->dtype != qw->dtype)))
+        return R4D_NO(RAD_E_DTYPE);
+    if ((qw && !r4d_contig(qw)) || (kw && !r4d_contig(kw))) return R4D_NO(RAD_E_STRIDE);
     const long long hd  = r4d_geti_or(a, "head_dim", 0);
     const long long nh  = r4d_geti_or(a, "n_head", 0);
     const long long nkv = r4d_geti_or(a, "n_head_kv", 0);
     const long long rot = r4d_geti_or(a, "rotary_dim", hd);
-    if (hd <= 0 || nh <= 0 || nkv <= 0 || r4d_numel(qw) < hd || r4d_numel(kw) < hd)
+    if (hd <= 0 || nh <= 0 || nkv <= 0 || (qw && r4d_numel(qw) < hd) ||
+        (kw && r4d_numel(kw) < hd))
         return R4D_NO(RAD_E_SHAPE);
     /* The register layout holds head_dim up to 1024 (32 lanes x kQkMaxE). */
-    if (hd > 1024 || rot > hd || (rot & 1)) return R4D_NO(RAD_E_SHAPE);
+    if (hd > 1024 || rot < 0 || rot > hd || (rot & 1)) return R4D_NO(RAD_E_SHAPE);
+    /* A rotation needs positions; the norm alone (rotary_dim 0) may go without. Positions are
+     * i32, or f32 read as the values they hold, M-contiguous ([M], or [C, M] at any plane
+     * pitch). */
+    if (rot > 0 && !pos) return R4D_NO(RAD_E_INVAL);
+    if (pos && pos->dtype != RAD_I32 && pos->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
+    if (pos && (pos->rank == 2 ? pos->stride[1] != 1 : !r4d_contig(pos)))
+        return R4D_NO(RAD_E_STRIDE);
+    const int pos_f32 = pos && pos->dtype == RAD_F32;
     const char* mode = r4d_gets(a, "mode");
     int md = 0;
     if (mode && !std::strcmp(mode, "gptj")) md = 1;
     else if (mode && !std::strcmp(mode, "blocks")) md = 2;
     else if (mode && !std::strcmp(mode, "gptj_blocks")) md = 3;
     else if (mode && !std::strcmp(mode, "imrope")) md = 4;
+    else if (mode && !std::strcmp(mode, "axial")) md = 5;
     else if (mode && std::strcmp(mode, "neox")) return R4D_NO(RAD_E_UNSUPPORTED);
     /* Any head_dim in the section modes (qk_norm_rope_any_kernel); the others need multiples of 32. */
-    if (md < 2 && hd % 32) return R4D_NO(RAD_E_SHAPE);
+    if (rot > 0 && md < 2 && hd % 32) return R4D_NO(RAD_E_SHAPE);
     QkBlocks blk{};
     long long M = 0, pplane = 0;
-    if (md == 4) {
+    if (rot == 0) {
+        /* Nothing turns: the rows are the positions' when bound, qkv's otherwise. */
+        M = !pos ? 0 : pos->rank == 2 ? pos->shape[1] : r4d_numel(pos);
+    } else if (md == 5) {
+        /* Contiguous sections on their own ladders, one position component each; rank-1
+         * positions turn every section by the one position. */
+        blk.n = parse_ints(r4d_gets(a, "sections"), blk.sec, 8);
+        if (blk.n <= 0) return R4D_NO(RAD_E_SHAPE);
+        if (pos->rank == 2) {
+            if (pos->shape[0] < blk.n) return R4D_NO(RAD_E_SHAPE);
+            M = pos->shape[1];
+            pplane = pos->stride[0];
+        } else {
+            M = r4d_numel(pos);
+        }
+    } else if (md == 4) {
         /* Interleaved M-RoPE reads three position planes; its sections only bound the
          * interleave. */
         blk.n = parse_ints(r4d_gets(a, "sections"), blk.sec, 8);
@@ -1002,12 +1137,16 @@ extern "C" int r4d_rad_qk_norm_rope(const RadArgs* a, RadStream s) {
         M = pos->shape[1];
         pplane = pos->stride[0];
     } else {
+        /* neox and gptj turn by one position a row. */
+        if (pos->rank >= 2 && pos->shape[0] != 1 && pos->shape[pos->rank - 1] != 1)
+            return R4D_NO(RAD_E_SHAPE);
         M = r4d_numel(pos);
     }
     const long long width = (nh + 2 * nkv) * hd;
     long long Mq = 0;
     const long long ld = r4d_rows_pitch(qkv, width, &Mq);
     if (ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (rot == 0 && !pos) M = Mq;
     if (M <= 0 || Mq < M) return R4D_NO(RAD_E_SHAPE);
     const int e = r4d_qk_norm_rope_bf16(r4d_addr(qkv), r4d_addr(pos), r4d_addr(qw), r4d_addr(kw),
                                         (int)M, (int)hd, (int)nh, (int)nkv, (int)rot, md,
@@ -1016,7 +1155,8 @@ extern "C" int r4d_rad_qk_norm_rope(const RadArgs* a, RadStream s) {
                                         (float)r4d_getf(a, "eps", 1e-6),
                                         (float)r4d_getf(a, "scale", 1.0),
                                         (float)r4d_getf(a, "wadd", 0.0), (int)ld, &blk,
-                                        (int)pplane, (long)(uintptr_t)s);
+                                        (int)pplane, (long)(uintptr_t)s,
+                                        w0 && w0->dtype == RAD_F32 ? 1 : 0, pos_f32);
     if (e == -2) return R4D_NO(RAD_E_SHAPE);
     return enc_status(e);
 }
@@ -1058,6 +1198,24 @@ extern "C" int r4d_rad_cast_widen(const RadArgs* a, RadStream s) {
                                          (int)y_ld, (long)(uintptr_t)s));
 }
 
+/* ------------------------------------------------------------------ cast bf16 -> f16 */
+extern "C" int r4d_rad_cast_f16(const RadArgs* a, RadStream s) {
+    const RadTensor* x = r4d_opt(a, 0);
+    const RadTensor* y = r4d_opt(a, 1);
+    if (!x || !y) return R4D_NO(RAD_E_INVAL);
+    R4D_NEED(dt_bf16(x));
+    if (y->dtype != RAD_F16) return R4D_NO(RAD_E_DTYPE);
+    const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
+    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
+    long long M = 0, Mx = 0;
+    const long long y_ld = r4d_rows_pitch(y, n, &M);
+    const long long x_ld = r4d_rows_pitch(x, n, &Mx);
+    if (y_ld < 0 || x_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0 || Mx < M) return R4D_NO(RAD_E_SHAPE);
+    return enc_status(r4d_narrow_bf16_f16(r4d_addr(x), r4d_addr(y), (int)M, (int)n, (int)x_ld,
+                                          (int)y_ld, (long)(uintptr_t)s));
+}
+
 /* ------------------------------------------------------------------ the audio tower */
 
 extern "C" int r4d_rad_relu(const RadArgs* a, RadStream s) {
@@ -1077,7 +1235,40 @@ extern "C" int r4d_rad_relu(const RadArgs* a, RadStream s) {
                                     (long)(uintptr_t)s));
 }
 
+/* Both rows: silu_bf16 (bf16 in and out) and silu_f32 (f32 in, f32 or bf16 out). */
 extern "C" int r4d_rad_silu(const RadArgs* a, RadStream s) {
+    const RadTensor* X = r4d_opt(a, 0);
+    const RadTensor* Y = r4d_opt(a, 1);
+    if (!X || !Y) return R4D_NO(RAD_E_INVAL);
+    const bool x_f32 = X->dtype == RAD_F32;
+    if (x_f32 ? (Y->dtype != RAD_F32 && Y->dtype != RAD_BF16)
+              : (X->dtype != RAD_BF16 || Y->dtype != RAD_BF16))
+        return R4D_NO(RAD_E_DTYPE);
+    const long long n = r4d_geti_or(a, "n", r4d_dim(Y, (int)Y->rank - 1));
+    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
+    long long M = 0, Mx = 0;
+    const long long y_ld = r4d_rows_pitch(Y, n, &M);
+    const long long x_ld = r4d_rows_pitch(X, n, &Mx);
+    if (y_ld < 0 || x_ld < 0) return R4D_NO(RAD_E_STRIDE);
+    if (M <= 0 || Mx < M) return R4D_NO(RAD_E_SHAPE);
+    if (x_f32) {
+        const uint64_t total = (uint64_t)M * (uint64_t)n;
+        const dim3 grid((uint32_t)std::min<uint64_t>((total + kThreads - 1) / kThreads, 65536u));
+        if (Y->dtype == RAD_F32)
+            hipLaunchKernelGGL(silu_f32_kernel<float>, grid, dim3(kThreads), 0, (hipStream_t)s,
+                               (const float*)X->data, (float*)Y->data, (uint32_t)n,
+                               (uint32_t)x_ld, (uint32_t)y_ld, total);
+        else
+            hipLaunchKernelGGL(silu_f32_kernel<uint16_t>, grid, dim3(kThreads), 0, (hipStream_t)s,
+                               (const float*)X->data, (uint16_t*)Y->data, (uint32_t)n,
+                               (uint32_t)x_ld, (uint32_t)y_ld, total);
+        return enc_status(hipGetLastError() == hipSuccess ? 0 : -4);
+    }
+    return enc_status(r4d_silu_bf16(r4d_addr(X), r4d_addr(Y), (int)M, (int)n, (int)x_ld, (int)y_ld,
+                                    (long)(uintptr_t)s));
+}
+
+extern "C" int r4d_rad_gelu(const RadArgs* a, RadStream s) {
     const RadTensor* X = r4d_opt(a, 0);
     const RadTensor* Y = r4d_opt(a, 1);
     if (!X || !Y) return R4D_NO(RAD_E_INVAL);
@@ -1090,7 +1281,7 @@ extern "C" int r4d_rad_silu(const RadArgs* a, RadStream s) {
     const long long x_ld = r4d_rows_pitch(X, n, &Mx);
     if (y_ld < 0 || x_ld < 0) return R4D_NO(RAD_E_STRIDE);
     if (M <= 0 || Mx < M) return R4D_NO(RAD_E_SHAPE);
-    return enc_status(r4d_silu_bf16(r4d_addr(X), r4d_addr(Y), (int)M, (int)n, (int)x_ld, (int)y_ld,
+    return enc_status(r4d_gelu_bf16(r4d_addr(X), r4d_addr(Y), (int)M, (int)n, (int)x_ld, (int)y_ld,
                                     (long)(uintptr_t)s));
 }
 
@@ -1207,15 +1398,18 @@ extern "C" int r4d_rad_conv1d_dw(const RadArgs* a, RadStream s) {
     const RadTensor* Wt = r4d_opt(a, 1);
     const RadTensor* cu = r4d_opt(a, 2);
     const RadTensor* Y  = r4d_opt(a, 3);
+    const RadTensor* B  = r4d_opt(a, 4);
     if (!X || !Wt || !cu || !Y) return R4D_NO(RAD_E_INVAL);
     R4D_NEED(dt_bf16(X));
     R4D_NEED(dt_bf16(Wt));
     R4D_NEED(dt_bf16(Y));
+    if (B && B->dtype != RAD_BF16 && B->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
     if (cu->dtype != RAD_I32 || !r4d_contig(cu) || r4d_numel(cu) < 2) return R4D_NO(RAD_E_SHAPE);
-    if (!r4d_contig(Wt)) return R4D_NO(RAD_E_STRIDE);
+    if (!r4d_contig(Wt) || (B && !r4d_contig(B))) return R4D_NO(RAD_E_STRIDE);
     const long long C = r4d_geti_or(a, "n", 0), K = r4d_geti_or(a, "k", 0);
     const long long cdiv = r4d_geti_or(a, "cu_div", 1);
-    if (C <= 0 || K <= 0 || cdiv <= 0 || r4d_numel(Wt) < C * K) return R4D_NO(RAD_E_SHAPE);
+    if (C <= 0 || K <= 0 || cdiv <= 0 || r4d_numel(Wt) < C * K || (B && r4d_numel(B) < C))
+        return R4D_NO(RAD_E_SHAPE);
     long long Mx = 0, My = 0;
     const long long x_ld = r4d_rows_pitch(X, C, &Mx);
     const long long y_ld = r4d_rows_pitch(Y, C, &My);
@@ -1224,7 +1418,8 @@ extern "C" int r4d_rad_conv1d_dw(const RadArgs* a, RadStream s) {
     return enc_status(r4d_conv1d_dw_bf16(r4d_addr(X), r4d_addr(Wt), r4d_addr(cu), r4d_addr(Y),
                                          (int)My, (int)C, (int)K, (int)cdiv,
                                          (int)(r4d_numel(cu) - 1), (int)x_ld, (int)y_ld,
-                                         (long)(uintptr_t)s));
+                                         (long)(uintptr_t)s, B ? r4d_addr(B) : 0,
+                                         B && B->dtype == RAD_F32 ? 1 : 0));
 }
 
 extern "C" int r4d_rad_rel_sinusoid(const RadArgs* a, RadStream s) {

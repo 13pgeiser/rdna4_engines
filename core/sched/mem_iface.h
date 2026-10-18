@@ -284,11 +284,10 @@ struct KVBinding final : IKVManager {
  * and segment: the same picture at the same place hits, two pictures never alias. */
 inline void media_keys(const Request& r, std::vector<MMContentKey>* out) {
     out->clear();
-    /* THE RUNTIME LoRA ADAPTER IS PART OF EVERY BLOCK'S KEY. KV written under an adapter is not
-     * the base's, so it rides into the chain as one span over the whole sequence, keyed by the
-     * adapter's load uid -- every block overlaps it, and with uid 0 (the base) there is no span and
-     * every hash is what it was before adapters existed. The uid, never the name: a reload under
-     * the same name is new weights and must start cold. */
+    /* The runtime LoRA adapter is part of every block's key: KV written under an adapter is not
+     * the base's. It enters the chain as one span over the whole sequence, keyed by the adapter's
+     * load uid, so every block overlaps it; the base (uid 0) adds no span and its hashes are
+     * unchanged. The uid and not the name, because a reload under the same name is new weights. */
     if (r.lora_uid != 0) {
         MMContentKey k;
         k.tok_begin = 0;
@@ -319,7 +318,8 @@ struct PCBinding final : IPrefixCache {
     CacheHit lookup(const Request& r, std::vector<std::vector<int32_t>>* out,
                     const HitCap* cap) const override {
         media_keys(r, &mm_);
-        return m->lookup(r.prompt, mm_, out, cap);
+        /* r.id: the admission takes its conversation's snapshots over. */
+        return m->lookup(r.prompt, mm_, out, cap, r.id);
     }
 
     /* Installed by the engine when the idle tiers are on; empty otherwise. */

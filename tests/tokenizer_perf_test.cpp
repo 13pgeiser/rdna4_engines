@@ -101,10 +101,14 @@ double encode_seconds(const Tokenizer& t, const std::string& text, int runs = 5)
 }
 
 /* The work of one encode, in radtest::Work's unit. Without an instruction counter the unit is CPU
- * time, which a busy machine inflates run to run, so the least of three runs is taken. */
+ * time: a first, untimed run faults in the pages the encode uses (the counter does not count page
+ * faults, see work_counter.h), and since a busy machine inflates CPU time run to run, the least of
+ * three runs after it is taken. */
 uint64_t encode_work(const Tokenizer& t, const std::string& text) {
     std::vector<int32_t> ids;
-    const int runs = radtest::work().exact() ? 1 : 3;
+    const bool exact = radtest::work().exact();
+    if (!exact) t.encode(text, ids, false, true);
+    const int runs = exact ? 1 : 3;
     uint64_t best = UINT64_MAX;
     for (int r = 0; r < runs; ++r) {
         ids.clear();
@@ -117,8 +121,9 @@ uint64_t encode_work(const Tokenizer& t, const std::string& text) {
 
 /* Four times the text is about four times the work. The texts differ, so a cache of one cannot
  * help the other; the encoder's per-call word cache makes the larger one slightly cheaper per byte
- * (about x3.3). Counted in work, so the ratio does not depend on the machine's load or on where the
- * working set leaves the core's cache. */
+ * (about x3.3). Counted in instructions, the ratio does not depend on the machine's load or on where
+ * the working set leaves the core's cache. Counted in CPU time it does (about x4 with a 1 MiB L2,
+ * more with less cache), so that bound is wider; both stay far below quadratic (x16). */
 TEST(encoding_work_is_linear_in_the_text) {
     auto v = vocab();
     REQUIRE(v != nullptr);
@@ -130,14 +135,14 @@ TEST(encoding_work_is_linear_in_the_text) {
     std::fprintf(stderr, "    256 KB %llu, 1 MB %llu %s, ratio %.2f\n", (unsigned long long)a,
                  (unsigned long long)b, radtest::work().unit(), (double)b / (double)a);
     CHECK((double)b / (double)a > 2.6);
-    CHECK((double)b / (double)a < 4.6);
+    CHECK((double)b / (double)a < (radtest::work().exact() ? 4.6 : 6.0));
 }
 
 /* Inputs a splitter goes quadratic on. A backtracking `\s+(?!\S)` rescans a whitespace run from
  * every position in it, and a merge quadratic in word length shows on one huge word; both must
  * stay linear. 125 and 500 KB: linear is 4 (a whitespace run is x4.3), quadratic 16. Counted in CPU
- * time the larger text also pays for leaving the core's cache (x7.4 on a whitespace run with every
- * core busy), so that bound is wider; both stay far below quadratic. */
+ * time the larger text also pays for leaving the core's cache (a whitespace run x4.6 to x5.5), so
+ * that bound is wider; both stay far below quadratic. */
 TEST(pathological_inputs_stay_linear) {
     auto v = vocab();
     REQUIRE(v != nullptr);
