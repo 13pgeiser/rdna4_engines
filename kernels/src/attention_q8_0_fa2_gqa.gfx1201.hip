@@ -1802,7 +1802,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_part
 {
     if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
         return;
-    if (n_splits < 1 || n_splits > 8)
+    if (n_splits < 1 || n_splits > 64)
         return;
     const int kv_h = blockIdx.y;
     if (kv_h >= 4)
@@ -1895,7 +1895,7 @@ extern "C" __global__ __launch_bounds__(256) void attention_q8_0_fa2_gqa_merge_g
 {
     if (n_heads != 24 || head_dim != 256)
         return;
-    if (n_splits < 1 || n_splits > 8)
+    if (n_splits < 1 || n_splits > 64)
         return;
     const int tid = (int)threadIdx.x;
     const int wave = tid >> 5;

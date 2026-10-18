@@ -1486,8 +1486,9 @@ fn fa_pertoken_min_ctx_for(arch: &str, explicit: Option<usize>) -> Option<usize>
 
 /// Opt-in gfx1201 split-KV packed-Q8 verifier: `HIPFIRE_GFX12_FA2_SPLIT_VERIFY`
 /// (`1`/`on`/`true`) enables it, `HIPFIRE_GFX12_FA2_SPLIT_COUNT` picks the
-/// split count (`2`, `4` or `8`; default `8`; anything else fails closed to
-/// the existing rows route). Default off. Read once per process.
+/// split count (`2`, `4`, `8`, `16`, `32` or `64`; default `8`; anything else
+/// fails closed to the existing rows route). Default off. Read once per
+/// process.
 fn gfx12_fa2_split_verify_splits() -> Option<usize> {
     static SPLITS: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
         let on = matches!(
@@ -1503,7 +1504,7 @@ fn gfx12_fa2_split_verify_splits() -> Option<usize> {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(8);
-        matches!(splits, 2 | 4 | 8).then_some(splits)
+        matches!(splits, 2 | 4 | 8 | 16 | 32 | 64).then_some(splits)
     });
     *SPLITS
 }

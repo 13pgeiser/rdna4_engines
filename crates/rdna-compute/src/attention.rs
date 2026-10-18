@@ -9653,11 +9653,11 @@ impl Gpu {
                 ),
             ));
         }
-        if n_splits < 1 || n_splits > 8 {
+        if n_splits < 1 || n_splits > 64 {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_split_gfx1201 requires 1 <= n_splits <= 8, got {n_splits}"
+                    "attention_q8_0_fa2_gqa_split_gfx1201 requires 1 <= n_splits <= 64, got {n_splits}"
                 ),
             ));
         }
