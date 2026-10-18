@@ -1470,9 +1470,10 @@ std::string Tokenizer::piece_at(int32_t id, bool render_special, At at) const {
     if (b >= 0) return std::string(1, (char)b);
 
     std::string s = v_->text(id);
-    /* User-defined and control tokens are stored as literal text; only normal tokens are in the
-     * vocab's own encoding and need the decoder chain. */
-    if (t == RAD_TT_CONTROL || t == RAD_TT_UNKNOWN || t == RAD_TT_USER_DEFINED) return s;
+    /* Control tokens are stored as literal text. A user-defined (added, non-special) token goes
+     * through the decoder chain like a normal one, as HuggingFace decodes every token it keeps:
+     * Gemma's whitespace runs are added tokens spelled in U+2581 ("\u2581\u2581" is two spaces). */
+    if (t == RAD_TT_CONTROL || t == RAD_TT_UNKNOWN) return s;
 
     /* No declared decoder means the tokens are already text (true for unigram and wordpiece, not
      * byte-level BPE). rad-convert emits the chain it read, so the absence is declared. */
