@@ -747,7 +747,7 @@ fn read_step_logits(
 ) -> R<Vec<(RequestEpoch, Vec<u8>)>> {
     gpu.hip.device_synchronize().map_err(e)?;
     let store = bundle.lanes().ok_or("lane store vanished")?;
-    let t = store.logits();
+    let t = store.logits().ok_or("lane store has no step logits")?;
     let mut out = Vec::new();
     let (mut ar, mut pre) = (0usize, 0usize);
     for rr in &plan.requests {

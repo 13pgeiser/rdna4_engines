@@ -40,7 +40,8 @@ use crate::mtp_spec::{
     mtp_fill_scratch_requested, mtp_fill_scratch_wanted, native_mtp_row_capture,
     Qwen4PromotionParts,
 };
-use crate::state::{Qwen4State, Qwen4StateFormat};
+use crate::state::{scope_layer_counts, Qwen4State, Qwen4StateFormat};
+use crate::weights::Qwen4BandScope;
 use hipfire_dispatch::pipeline::DraftHeadRequestState;
 use hipfire_runtime::slot_batch::RequestEpoch;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -610,11 +611,16 @@ pub struct Qwen4LaneStore {
     rows_cap: usize,
     /// Rows `[0, rows_cap)`: the decode rows of a step (the planned decode
     /// requests' rows concatenated in plan order); `[rows_cap, rows_cap +
-    /// max_lanes)`: the prompt-completing prefill rows.
-    logits: GpuTensor,
-    top1: GpuTensor,
+    /// max_lanes)`: the prompt-completing prefill rows. `None` on a band
+    /// that does not run the LM head (only the single scope and the output
+    /// band hold step outputs).
+    logits: Option<GpuTensor>,
+    top1: Option<GpuTensor>,
+    /// Host mirror of `top1` (empty without step outputs).
     top1_host: Vec<u8>,
     spec: Option<SpecStore>,
+    /// The band this store's lane states are scoped to.
+    scope: Qwen4BandScope,
     pub(crate) phase: LanePhase,
     pub(crate) next_step_id: u64,
     /// Start of the step's wall clock: set by `draft_step` (or provision when
@@ -647,6 +653,12 @@ impl Qwen4LaneStore {
         if row_budget == 0 {
             return Err("lane store: row_budget must be at least 1".to_string());
         }
+        // This band's ownership: the single scope allocates the historical
+        // whole-model store.
+        let scope = bundle.weights.band_scope().clone();
+        if spec.is_some() && !scope.output {
+            return Err("lane store: MTP lanes need the output band".to_string());
+        }
         if let Some(spec) = spec {
             let verify_rows = if bundle.has_cpu_deferred_experts() {
                 crate::program::QWEN4_CPU_SPLICE_MAX_ROWS
@@ -675,25 +687,33 @@ impl Qwen4LaneStore {
         };
         let rows = rows_cap + max_lanes;
         let vocab = bundle.lane_vocab();
-        let logit_elements = rows
-            .checked_mul(vocab)
-            .ok_or_else(|| "lane store: logits extent overflow".to_string())?;
-        let logits = gpu
-            .zeros(&[logit_elements], DType::F32)
-            .map_err(|e| format!("lane store: logits: {e}"))?;
-        let top1 = match gpu.zeros(&[rows * std::mem::size_of::<i32>()], DType::Raw) {
-            Ok(tensor) => tensor,
-            Err(error) => {
-                let _ = gpu.free_tensor(logits);
-                return Err(format!("lane store: top1: {error}"));
-            }
+        // Step logits and top-1 exist only where the LM head runs: the
+        // single scope or the output band.
+        let (logits, top1) = if scope.output {
+            let logit_elements = rows
+                .checked_mul(vocab)
+                .ok_or_else(|| "lane store: logits extent overflow".to_string())?;
+            let logits = gpu
+                .zeros(&[logit_elements], DType::F32)
+                .map_err(|e| format!("lane store: logits: {e}"))?;
+            let top1 = match gpu.zeros(&[rows * std::mem::size_of::<i32>()], DType::Raw) {
+                Ok(tensor) => tensor,
+                Err(error) => {
+                    let _ = gpu.free_tensor(logits);
+                    return Err(format!("lane store: top1: {error}"));
+                }
+            };
+            (Some(logits), Some(top1))
+        } else {
+            (None, None)
         };
         let spec_store = match spec {
             Some(config) => match SpecStore::new(gpu, bundle, config, max_lanes, rows_cap) {
                 Ok(store) => Some(store),
                 Err(error) => {
-                    let _ = gpu.free_tensor(logits);
-                    let _ = gpu.free_tensor(top1);
+                    for tensor in [logits, top1].into_iter().flatten() {
+                        let _ = gpu.free_tensor(tensor);
+                    }
                     return Err(error);
                 }
             },
@@ -710,8 +730,13 @@ impl Qwen4LaneStore {
             rows_cap,
             logits,
             top1,
-            top1_host: vec![0; rows * std::mem::size_of::<i32>()],
+            top1_host: if scope.output {
+                vec![0; rows * std::mem::size_of::<i32>()]
+            } else {
+                Vec::new()
+            },
             spec: spec_store,
+            scope,
             phase: LanePhase::Idle,
             next_step_id: 0,
             step_started: None,
@@ -727,28 +752,69 @@ impl Qwen4LaneStore {
     /// `min(MTP_FILL_ROWS, forward max_chunk)` rows). `_row_budget` is
     /// accepted for the frozen signature: decode rows share the
     /// `max_lanes * (k + 1)` output rows, so the budget adds nothing.
+    /// The whole model: [`Self::device_bytes_scoped`] over
+    /// [`Qwen4BandScope::single`].
     pub fn device_bytes(
+        config: &Qwen4Config,
+        format: Qwen4StateFormat,
+        context: &Qwen4ContextCommit,
+        max_lanes: usize,
+        row_budget: usize,
+        spec_k: Option<usize>,
+    ) -> Option<u64> {
+        Self::device_bytes_scoped(
+            config,
+            format,
+            context,
+            max_lanes,
+            row_budget,
+            spec_k,
+            &Qwen4BandScope::single(config),
+        )
+    }
+
+    /// [`Self::device_bytes`] of the store one pipeline band holds: the
+    /// lane states cover only the band's layers
+    /// ([`Qwen4State::device_bytes_scoped`]; the verify ring only its GDN
+    /// layers), and the step logits/top-1 buffers and every MTP charge only
+    /// exist on the output band (`scope.output`, the band that holds the
+    /// head). `None` on overflow, or for MTP lanes off the output band,
+    /// which [`Self::new`] refuses.
+    pub fn device_bytes_scoped(
         config: &Qwen4Config,
         format: Qwen4StateFormat,
         context: &Qwen4ContextCommit,
         max_lanes: usize,
         _row_budget: usize,
         spec_k: Option<usize>,
+        scope: &Qwen4BandScope,
     ) -> Option<u64> {
         let f32_bytes = std::mem::size_of::<f32>();
-        let mut per_lane = Qwen4State::device_bytes(config, format, context)?;
+        let mut per_lane = Qwen4State::device_bytes_scoped(config, format, context, scope)?;
         let rows_cap = match spec_k {
             Some(k) => max_lanes.checked_mul(k.checked_add(1)?)?,
             None => max_lanes,
         };
         let rows = rows_cap.checked_add(max_lanes)?;
-        let mut shared = rows
-            .checked_mul(config.vocab_size)?
-            .checked_mul(f32_bytes)?
-            .checked_add(rows.checked_mul(std::mem::size_of::<i32>())?)?;
+        let mut shared = if scope.output {
+            rows.checked_mul(config.vocab_size)?
+                .checked_mul(f32_bytes)?
+                .checked_add(rows.checked_mul(std::mem::size_of::<i32>())?)?
+        } else {
+            0
+        };
         if let Some(k) = spec_k {
+            if !scope.output {
+                return None;
+            }
             let wide = config.hc_count.checked_mul(config.hidden_size)?;
-            let ring = Qwen4State::row_capture_bytes(config, format.gdn, k.checked_add(1)?)?;
+            let (gdn_layers, _) = scope_layer_counts(config, scope);
+            let ring = Qwen4State::row_capture_bytes_scoped(
+                config,
+                format.gdn,
+                k.checked_add(1)?,
+                gdn_layers,
+            )?;
             per_lane = per_lane
                 .checked_add(MtpGpuState::device_bytes(config, context)?)?
                 .checked_add(ring)?
@@ -929,9 +995,10 @@ impl Qwen4LaneStore {
     /// an AR lane; an MTP lane's prompt-completing pick is read by the
     /// singleton chunk path and leaves no logits row). `rows_cap` is
     /// `max_lanes` without spec, so an AR-only plan is the S3 layout.
-    /// Valid until the next forward; read it before `commit_step`.
-    pub fn logits(&self) -> &GpuTensor {
-        &self.logits
+    /// Valid until the next forward; read it before `commit_step`. `None`
+    /// on a store without step outputs ([`Self::has_step_outputs`]).
+    pub fn logits(&self) -> Option<&GpuTensor> {
+        self.logits.as_ref()
     }
 
     /// First prompt-completing logits row: `rows_cap` (`max_lanes * (k + 1)`
@@ -1020,7 +1087,10 @@ impl Qwen4LaneStore {
     }
 
     /// Disjoint borrows of the `epochs` lanes (plan order) and the step
-    /// output buffers.
+    /// output buffers. Only a store with output buffers
+    /// ([`Self::has_step_outputs`]: the single scope or the output band)
+    /// has a step; a non-output band reaches its lanes through
+    /// [`Self::band_lanes_mut`].
     pub(crate) fn step_parts(&mut self, epochs: &[RequestEpoch]) -> Result<StepParts<'_>, String> {
         let Self {
             table,
@@ -1030,8 +1100,15 @@ impl Qwen4LaneStore {
             top1_host,
             rows_cap,
             spec,
+            scope,
             ..
         } = self;
+        let (Some(logits), Some(top1)) = (logits.as_ref(), top1.as_ref()) else {
+            return Err(format!(
+                "lane store: band {:?} is not the output band and has no step logits",
+                scope.band
+            ));
+        };
         Ok(StepParts {
             lanes: table.pick_mut(epochs)?,
             logits,
@@ -1041,6 +1118,26 @@ impl Qwen4LaneStore {
             rows_cap: *rows_cap,
             spec: spec.as_mut(),
         })
+    }
+
+    /// Disjoint borrows of the `epochs` lanes (plan order) of any band, with
+    /// no step buffers: what a non-output band's lane step runs on.
+    pub(crate) fn band_lanes_mut(
+        &mut self,
+        epochs: &[RequestEpoch],
+    ) -> Result<Vec<&mut Qwen4LaneState>, String> {
+        self.table.pick_mut(epochs)
+    }
+
+    /// The band this store's lane states are scoped to.
+    pub fn band_scope(&self) -> &Qwen4BandScope {
+        &self.scope
+    }
+
+    /// The store holds the step logits and top-1 buffers: the single scope
+    /// or the output band.
+    pub fn has_step_outputs(&self) -> bool {
+        self.logits.is_some()
     }
 
     /// Disjoint borrows of the `epochs` lanes (request order) and the MTP
@@ -1152,6 +1249,7 @@ impl Qwen4LaneStore {
             }
         }
         for (name, tensor) in [("logits", logits), ("top1", top1)] {
+            let Some(tensor) = tensor else { continue };
             if let Err(error) = gpu.free_tensor(tensor) {
                 first.get_or_insert(format!("lane {name}: {error}"));
             }
@@ -1469,5 +1567,129 @@ mod tests {
         );
         assert!(table.pick_mut(&[epoch(1, 1), epoch(1, 1)]).is_err());
         assert!(table.pick_mut(&[epoch(1, 9)]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod band_accounting_tests {
+    use super::*;
+    use crate::config::compact_test_config;
+
+    fn partition(config: &Qwen4Config, counts: &[usize]) -> Vec<Qwen4BandScope> {
+        assert_eq!(counts.iter().sum::<usize>(), config.num_hidden_layers);
+        let mut start = 0;
+        counts
+            .iter()
+            .map(|&count| {
+                let band = start..start + count;
+                start += count;
+                let scope = Qwen4BandScope {
+                    input: band.start == 0,
+                    output: band.end == config.num_hidden_layers,
+                    band,
+                };
+                scope.validate(config).expect("valid band");
+                scope
+            })
+            .collect()
+    }
+
+    #[test]
+    fn band_store_bytes_sum_to_the_single_scope_store() {
+        let config = compact_test_config();
+        let context = Qwen4ContextCommit::legacy(1024);
+        let format = Qwen4StateFormat::F32;
+        let single = Qwen4BandScope::single(&config);
+        for lanes in [1usize, 4, 8] {
+            let whole = Qwen4LaneStore::device_bytes_scoped(
+                &config, format, &context, lanes, lanes, None, &single,
+            )
+            .unwrap();
+            assert_eq!(
+                Qwen4LaneStore::device_bytes(&config, format, &context, lanes, lanes, None),
+                Some(whole)
+            );
+            for counts in [
+                &[24usize, 24][..],
+                &[20, 28][..],
+                &[16, 16, 16][..],
+                &[9, 17, 22][..],
+            ] {
+                let scopes = partition(&config, counts);
+                let bands: Vec<u64> = scopes
+                    .iter()
+                    .map(|scope| {
+                        Qwen4LaneStore::device_bytes_scoped(
+                            &config, format, &context, lanes, lanes, None, scope,
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                // The step logits and top-1 are charged once, on the output
+                // band; every lane's state is split with no duplication.
+                assert_eq!(bands.iter().sum::<u64>(), whole, "{counts:?} lanes={lanes}");
+                let head = (2 * lanes * (config.vocab_size * 4 + 4)) as u64;
+                let output = scopes.iter().position(|scope| scope.output).unwrap();
+                let states: u64 = scopes
+                    .iter()
+                    .map(|scope| {
+                        lanes as u64
+                            * Qwen4State::device_bytes_scoped(&config, format, &context, scope)
+                                .unwrap() as u64
+                    })
+                    .sum();
+                assert_eq!(states + head, whole);
+                for (index, (&bytes, scope)) in bands.iter().zip(&scopes).enumerate() {
+                    let own = lanes as u64
+                        * Qwen4State::device_bytes_scoped(&config, format, &context, scope).unwrap()
+                            as u64;
+                    assert_eq!(bytes, own + if index == output { head } else { 0 });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn non_output_band_refuses_mtp_lane_bytes() {
+        let config = compact_test_config();
+        let context = Qwen4ContextCommit::legacy(1024);
+        let format = Qwen4StateFormat::F32;
+        let single = Qwen4BandScope::single(&config);
+        assert!(Qwen4LaneStore::device_bytes_scoped(
+            &config,
+            format,
+            &context,
+            2,
+            2,
+            Some(3),
+            &single
+        )
+        .is_some());
+        let scopes = partition(&config, &[24, 24]);
+        assert!(Qwen4LaneStore::device_bytes_scoped(
+            &config,
+            format,
+            &context,
+            2,
+            2,
+            Some(3),
+            &scopes[0]
+        )
+        .is_none());
+        let output = Qwen4LaneStore::device_bytes_scoped(
+            &config,
+            format,
+            &context,
+            2,
+            2,
+            Some(3),
+            &scopes[1],
+        )
+        .unwrap();
+        let ar_output =
+            Qwen4LaneStore::device_bytes_scoped(&config, format, &context, 2, 2, None, &scopes[1])
+                .unwrap();
+        // The MTP head, ring and wide buffers add bytes on the output band only.
+        assert!(output > ar_output);
     }
 }

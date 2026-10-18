@@ -1118,7 +1118,7 @@ fn main() {
     let mut pflash_drafter_gpu: Option<rdna_compute::Gpu> = None;
     // Continuous-batch host scheduler + GPU batch state (if available).
     // Initialized on successful load when `continuous_batch_size` > 1 and
-    // the loaded arch is batch-capable (qwen 5/6, single-GPU, Q8 KV/state).
+    // the loaded route staged lane state (including Qwen4 single/EP/PP fn-lanes).
     // None => sequential fallback.
     let mut continuous_batch_size: usize = 1;
     let mut batch_scheduler: Option<ContinuousBatchScheduler> = None;
@@ -2788,7 +2788,7 @@ fn main() {
                                 vmm_batch,
                                 staging.slots,
                                 staging.row_budget,
-                                &gpu,
+                                &mut gpu,
                             );
                             emit_load_phases();
                             let _ = writeln!(stdout, "{ack}");

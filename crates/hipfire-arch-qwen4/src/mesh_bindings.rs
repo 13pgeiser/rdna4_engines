@@ -257,14 +257,12 @@ impl<'a> Qwen4MeshBindings<'a> {
             {
                 return Err("Qwen4 mesh weight and state ownership disagree".into());
             }
-            // Only the output band may hold the MTP head; no band takes EP or lanes.
-            if rank.bundle.ep.is_some()
-                || rank.bundle.lanes.is_some()
-                || (rank.bundle.mtp.is_some() && !scope.output)
-            {
+            // Only the output band may hold the MTP head; no band takes EP. A
+            // band may hold a band-scoped lane store: the mesh forward still
+            // refuses a lane scope, the lane executor drives those stores.
+            if rank.bundle.ep.is_some() || (rank.bundle.mtp.is_some() && !scope.output) {
                 return Err(
-                    "Qwen4 topology.pp does not admit EP, lanes or an MTP head off the output band"
-                        .into(),
+                    "Qwen4 topology.pp does not admit EP or an MTP head off the output band".into(),
                 );
             }
         }

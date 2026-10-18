@@ -1492,6 +1492,134 @@ fn bind_routed_view<'a, R>(
     selected.map_or(bound, view)
 }
 
+/// The runtime one gathered EP lane MoE invocation binds: exactly the
+/// singleton's selection for a 1..=[`QWEN4_EP_GATHER_MAX_ROWS`]-row gathered
+/// forward (`full_chunk = false`, no tile route): the layer's balanced live
+/// runtime, else the static runtime; never the EP full table. Outside EP
+/// (`balanced_live` and `ep_full` absent) it is the static runtime.
+pub(crate) fn select_ep_lane_moe<'a, R>(
+    balanced_live: Option<&'a R>,
+    ep_full: Option<Option<&'a R>>,
+    static_moe: Option<&'a R>,
+) -> Option<&'a R> {
+    select_layer_moe(balanced_live, ep_full, false, false, static_moe)
+}
+
+/// Whether a gathered EP MoE call of `rows` rows binds a separate
+/// shared-down output: the singleton's few-row forward (`rows >= 2`) does, its
+/// one-row decode does not.
+pub(crate) const fn ep_lane_shared_down(rows: usize) -> bool {
+    rows >= 2
+}
+
+/// A lane MoE invocation under EP runs the singleton's gathered forward: its
+/// real rows are its routing rows, at most [`QWEN4_EP_GATHER_MAX_ROWS`]. Wider
+/// or re-routed calls would be the full-table chunk route, which a lane step
+/// does not run.
+pub(crate) fn ep_lane_moe_rows(rows: usize, route_rows: usize) -> Result<(), Qwen4GpuForwardError> {
+    if rows == 0 {
+        return Err(invalid(
+            "an EP lane MoE invocation carries at least one row",
+        ));
+    }
+    if rows > QWEN4_EP_GATHER_MAX_ROWS {
+        return Err(invalid(format!(
+            "an EP lane MoE invocation of {rows} rows exceeds the {QWEN4_EP_GATHER_MAX_ROWS}-row gather cap"
+        )));
+    }
+    if route_rows != rows {
+        return Err(invalid(format!(
+            "an EP lane MoE invocation of {rows} rows routes {route_rows} rows; the gathered forward needs them equal"
+        )));
+    }
+    Ok(())
+}
+
+/// The gather buffer (`0` or `1`, the trunk buffers) of the `ordinal`-th MoE
+/// invocation of a lane step, counted over the whole step in emission order.
+/// Consecutive invocations never share a buffer (`ep_row_gather` hazard rule),
+/// whatever the lane/layer interleaving.
+pub(crate) const fn ep_lane_buffer(ordinal: usize) -> usize {
+    ordinal % 2
+}
+
+/// A step's MoE invocation count must be even so the next step's first
+/// invocation (ordinal 0, buffer 0) never repeats this step's last buffer.
+pub(crate) fn ep_lane_check_invocations(invocations: usize) -> Result<(), Qwen4GpuForwardError> {
+    if invocations % 2 != 0 {
+        return Err(invalid(format!(
+            "an EP lane step emitted {invocations} MoE invocations; an odd count would reuse a gather buffer across consecutive steps"
+        )));
+    }
+    Ok(())
+}
+
+/// Install the singleton's gathered-forward EP binding on one lane MoE
+/// binding: the row gather, and for `rows >= 2` the singleton scratch's
+/// `moe_down_expanded` as the unfused shared-down output.
+pub(crate) fn bind_ep_lane_gather<'a>(
+    binding: &mut Qwen4MoeBinding<'a>,
+    rows: usize,
+    gather: &'a dyn MoeRowGather,
+    shared_down: &'a GpuTensor,
+) {
+    binding.row_gather = Some(gather);
+    if ep_lane_shared_down(rows) {
+        binding.shared_down_out = Some(shared_down);
+    }
+}
+
+/// What a lane step borrows from an EP forward: the installed row gather, the
+/// two trunk gather buffers the step alternates over, and the singleton
+/// scratch's `moe_down_expanded` (the shared-down output of few-row calls).
+pub(crate) struct Qwen4EpLane<'a> {
+    pub(crate) gather: &'a dyn MoeRowGather,
+    pub(crate) buffers: [&'a GpuTensor; 2],
+    pub(crate) shared_down: &'a GpuTensor,
+}
+
+/// The runtime a lane MoE invocation of `layer` binds (see
+/// [`select_ep_lane_moe`]); the static runtime outside EP. Takes the forward's
+/// `ep` and `moe` fields (`fwd.ep.as_ref()`, `&fwd.moe`) rather than the whole
+/// forward, so the lane step can keep the result alive while it mutably uses
+/// other fields.
+pub(crate) fn lane_layer_moe<'a>(
+    ep: Option<&'a Qwen4ForwardEp>,
+    moe: &'a [Option<Qwen4MoeLayerRuntime>],
+    layer: usize,
+) -> Option<&'a Qwen4MoeLayerRuntime> {
+    let balanced_live = ep
+        .and_then(|ep| ep.balanced.get(layer))
+        .and_then(Option::as_ref)
+        .map(|balanced| &balanced.live);
+    select_ep_lane_moe(
+        balanced_live,
+        ep.map(|ep| ep.moe_full.get(layer)),
+        moe.get(layer).and_then(Option::as_ref),
+    )
+}
+
+/// The EP lane resources from the forward's `ep` and `scratch` fields
+/// (`fwd.ep.as_ref()`, `&fwd.scratch`): `None` outside EP, an error under EP
+/// before `attach_ep` installed the row gather.
+pub(crate) fn ep_lane<'a>(
+    ep: Option<&'a Qwen4ForwardEp>,
+    scratch: &'a Qwen4GpuForwardScratch,
+) -> Result<Option<Qwen4EpLane<'a>>, Qwen4GpuForwardError> {
+    let Some(ep) = ep else {
+        return Ok(None);
+    };
+    let gather = ep
+        .gather
+        .as_deref()
+        .ok_or_else(|| invalid("EP lane step before attach_ep: the row gather is not installed"))?;
+    Ok(Some(Qwen4EpLane {
+        gather: gather as &dyn MoeRowGather,
+        buffers: [&ep.buffers[0], &ep.buffers[1]],
+        shared_down: &scratch.moe_down_expanded,
+    }))
+}
+
 /// Whether a layer's D2 executor is bound for one MoE call: always when no
 /// executor is attached (nothing to withhold), otherwise only in a non-prefill
 /// phase (decode, verify; `d2_phase`) **and** for a window of at most the
@@ -2288,7 +2416,7 @@ pub(crate) struct Qwen4BalancedPlan {
 
 /// Expert-parallel state of one rank's forward (present iff the bundle's
 /// weights carry an EP placement).
-struct Qwen4ForwardEp {
+pub(crate) struct Qwen4ForwardEp {
     placement: Qwen4EpPlacement,
     dummy: Qwen4EpDummyExpert,
     /// Per-layer full (P2P) tables for chunk forwards; empty until
@@ -6208,7 +6336,7 @@ pub struct Qwen4GpuForward {
     /// forwards, the row-gather buffers and the installed gather. Under EP
     /// `moe` holds the per-layer decode tables, there is no G2 expert stage,
     /// and no forward records or replays a retained body.
-    ep: Option<Qwen4ForwardEp>,
+    pub(crate) ep: Option<Qwen4ForwardEp>,
     /// `DECODE_Q8_PER_LAYER` per layer [HC attn down, attn up, mlp down, mlp
     /// up, shared gate, up, down]: BF16 matrices requantized to Q8_0 for
     /// single-token forwards (gfx1151). Batch-1 decode streams every weight
@@ -13381,5 +13509,125 @@ mod seal_view_identity_tests {
         let view =
             bind_routed_view::<FakeRuntime>(None, &described, |runtime| runtime.view(true, 1, 1));
         assert_eq!(address(view), address(&described));
+    }
+
+    /// A lane MoE invocation binds exactly what the singleton's gathered
+    /// forward (1 row decode, 2..=8 row few-row) selects and views, balanced
+    /// or not, D2 armed or not; never the EP full runtime.
+    #[test]
+    fn ep_lane_moe_selects_and_views_the_singleton_gathered_runtime() {
+        for split in [false, true] {
+            let rt = Runtimes::new(split);
+            for balanced in [false, true] {
+                for rows in 1..=QWEN4_EP_GATHER_MAX_ROWS {
+                    let (singleton, singleton_view) =
+                        rt.bind(true, balanced, false, false, true, rows, rows);
+                    let lane = select_ep_lane_moe(
+                        balanced.then_some(&rt.live),
+                        Some(Some(&rt.full)),
+                        Some(&rt.static_moe),
+                    )
+                    .expect("a runtime is selected");
+                    assert!(std::ptr::eq(lane, singleton));
+                    assert_ne!(lane.id, FULL_ID);
+                    assert_eq!(lane.id, if balanced { LIVE_ID } else { STATIC_ID });
+                    let described: &dyn RoutedExpertWeights = lane;
+                    let view = bind_routed_view(Some(lane), described, |runtime| {
+                        runtime.view(true, rows, rows)
+                    });
+                    assert_eq!(address(view), address(singleton_view));
+                    assert_eq!(view.immutable_identity(), Some(lane.id));
+                }
+            }
+        }
+    }
+
+    /// Outside EP the lane selection is the static runtime (unchanged).
+    #[test]
+    fn lane_moe_outside_ep_is_the_static_runtime() {
+        let rt = Runtimes::new(false);
+        let lane = select_ep_lane_moe(None, None, Some(&rt.static_moe)).unwrap();
+        assert!(std::ptr::eq(lane, &rt.static_moe));
+        assert!(select_ep_lane_moe::<FakeRuntime>(None, None, None).is_none());
+    }
+
+    /// Rows 1..=8 with equal routing rows pass; over the cap, zero or a
+    /// re-routed count refuse.
+    #[test]
+    fn ep_lane_rows_refuse_over_cap_and_rerouted() {
+        for rows in 1..=QWEN4_EP_GATHER_MAX_ROWS {
+            assert!(ep_lane_moe_rows(rows, rows).is_ok());
+            assert_eq!(ep_lane_shared_down(rows), rows >= 2);
+        }
+        assert!(ep_lane_moe_rows(0, 0).is_err());
+        assert!(
+            ep_lane_moe_rows(QWEN4_EP_GATHER_MAX_ROWS + 1, QWEN4_EP_GATHER_MAX_ROWS + 1).is_err()
+        );
+        assert!(ep_lane_moe_rows(1, 2).is_err());
+        assert!(ep_lane_moe_rows(4, 1).is_err());
+    }
+
+    /// The buffer sequence of the emitted MoE invocations: lane-major (every
+    /// layer of lane 0, then lane 1, ...; the whole program one per-lane run)
+    /// and layer-major (every segment of layer 0, then layer 1, ...; grouped
+    /// or mixed shares), over 1..=8 lanes and 48 layers, only ever 0/1,
+    /// alternating (never the same index twice in a row), also across two
+    /// consecutive steps.
+    #[test]
+    fn ep_lane_buffers_alternate_over_every_emission_order() {
+        const LAYERS: usize = 48;
+        for lanes in 1..=8usize {
+            for lane_major in [true, false] {
+                let invocations = LAYERS * lanes;
+                assert!(ep_lane_check_invocations(invocations).is_ok());
+                let mut last: Option<usize> = None;
+                for _step in 0..2 {
+                    let mut ordinal = 0usize;
+                    for layer_or_lane in 0..invocations {
+                        // Emission order only decides which (lane, layer) owns
+                        // an ordinal; the buffer depends on the ordinal alone.
+                        let _owner = if lane_major {
+                            (layer_or_lane / LAYERS, layer_or_lane % LAYERS)
+                        } else {
+                            (layer_or_lane % lanes, layer_or_lane / lanes)
+                        };
+                        let buffer = ep_lane_buffer(ordinal);
+                        ordinal += 1;
+                        assert!(buffer < 2);
+                        assert_ne!(last, Some(buffer), "lanes={lanes} lane_major={lane_major}");
+                        last = Some(buffer);
+                    }
+                    assert_eq!(ordinal, invocations);
+                    assert_eq!(last, Some(1));
+                }
+            }
+        }
+        // Grouped stages emit fewer, wider invocations per layer.
+        for groups in 1..=8usize {
+            assert!(ep_lane_check_invocations(LAYERS * groups).is_ok());
+        }
+        assert!(ep_lane_check_invocations(LAYERS * 3 + 1).is_err());
+    }
+
+    /// The lane buffer is not the singleton's layer parity once a layer
+    /// repeats (lane-major second lane starts at layer 0 again).
+    #[test]
+    fn ep_lane_buffer_differs_from_layer_parity_across_lanes() {
+        // Lane 0 ends at layer 47 (buffer 1 by ordinal 47); lane 1 layer 0 is
+        // ordinal 48 -> buffer 0 = qwen4_ep_buffer_index(0, 48) here, but
+        // lane 1 layer 47 (ordinal 95) -> 1, and lane 2 layer 0 (ordinal 96)
+        // -> 0; with an odd layer count layer parity would repeat a buffer.
+        for layers in [47usize, 48] {
+            let mut repeats = 0;
+            let mut last = None;
+            for ordinal in 0..layers * 2 {
+                let layer_parity = qwen4_ep_buffer_index(ordinal % layers, 48);
+                if last == Some(layer_parity) {
+                    repeats += 1;
+                }
+                last = Some(layer_parity);
+            }
+            assert_eq!(repeats > 0, layers % 2 == 1);
+        }
     }
 }

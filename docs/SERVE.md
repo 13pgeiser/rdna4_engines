@@ -922,6 +922,20 @@ request run alone on the singleton route. **Default off, experimental.**
   On gfx1151 G0 admitted every row-local stage (embedding, HC read/write, the
   GDN/QSA projections, the MoE, final HC read, head, argmax); other cards run
   every stage per lane until their own G0 run.
+- **Under `topology.pp` / `topology.ep` (2..=8 cards):** the same exact
+  **AR** fn-lanes route is staged across the cards, with these differences from
+  the single-card route above. The lane store is budgeted per device: every
+  band (PP) or rank (EP) must satisfy `need <= free` on its own card, else
+  nothing is staged and the singleton route is kept. There are **no native-MTP
+  lanes** (`continuous_batch_spec: false`, spec mode `"off"`) and a running
+  singleton is **never promoted** into a lane
+  (`continuous_batch_promotion: false`). EP replicates the lane store on every
+  rank; PP keeps a band-scoped store per band and runs the bands
+  **sequentially**, the HC streams crossing each band edge through pinned host
+  memory. On gfx1201 every row-local stage runs per lane until grouped stages
+  are certified. The multi-card GPU gates and all performance figures are
+  **pending**; no throughput or speedup claim is made. Details:
+  [multi-gpu.md](multi-gpu.md#flash-next-fn-lanes-continuous-batching-under-pp-and-ep).
 
 The loaded ack reports `continuous_batch_route: "fn-lanes"`,
 `continuous_batch_history_capable: true` (the typed capability the serve
@@ -938,7 +952,11 @@ and the lane-store receipt:
 policy) and `fn_lanes_stage_evidence` (the G0 receipt id for the production
 policy). Each lane's `done` event carries the singleton's MTP counters
 (`mtp`, `mtp_windows`, `ar_windows`, `mtp_retired`) plus `mtp_drafts` and
-`mtp_accepted`.
+`mtp_accepted`. Under PP/EP the ack also reports `fn_lanes_topology`
+(`"single"`, `"ep"` or `"pp"`) and `fn_lanes_device_receipts`, one entry per
+card (EP rank order; PP input band to output band); the scalar `fn_lanes_*`
+receipt is the root's (rank 0, or the output band), and
+`continuous_batch_promotion` is `true` only on a single card.
 
 ## Multi-process notes
 

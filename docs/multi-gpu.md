@@ -330,8 +330,10 @@ when the ranks are not one arch (a mixed gfx1100/gfx1201 set is refused:
 are visible, or when a directed card pair is not peer-accessible. EP has no
 host-staged fallback for a missing peer pair; the load refuses. EP also refuses
 DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, drafters, CASK, PFlash,
-lane batching and the retained Redline default, and
-`HIPFIRE_MTP_SAMPLED_MODE=naive`. Flash-Next EP stays **opt-in and
+the retained Redline default and `HIPFIRE_MTP_SAMPLED_MODE=naive`. Exact AR
+lane batching (`serve.vmm_batch`) is **not** refused under EP; see
+[fn-lanes under PP and EP](#flash-next-fn-lanes-continuous-batching-under-pp-and-ep).
+Flash-Next EP stays **opt-in and
 experimental** (`topology.ep` defaults to `1`). EP decode is eager (no graph
 capture).
 
@@ -686,12 +688,12 @@ string or a blanket “always refuse at load.”
 | Flash-Next (Qwen4) `pp>1`, unsupported options | `qwen4: pipeline parallelism (topology.pp = N) does not support <subject>; drop the option or set topology.pp = 1`, subjects: DFlash, DSpark, n-gram drafting, DDTree, adaptive KV, an EAGLE drafter, CASK, PFlash, an experts-per-token override, a non-Single compute placement, the MTP n-gram modifier. Full list: [refusals](#flash-next-pipeline-parallelism-host-staged) |
 | Flash-Next (Qwen4) `pp>1`, environment and config requests | Same sentence with subjects host-mapped routed experts (`HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`), the expert hotset, expert staging, session snapshots, the session cache disk tier, the NPU trunk |
 | Flash-Next (Qwen4) `pp>1`, mesh, bands and budget | Refused before any allocation, naming `topology.pp`: pp outside `2..=8` or `tp`/`ep` ≠ 1, `HIPFIRE_EMULATE_GPUS`, too few visible devices, unknown PCI identity, an arch other than gfx1100/gfx1201, mixed arches, `HIPFIRE_MESH_TRANSPORT=peer`, a bad `HIPFIRE_PP_LAYERS`, a band that does not fit its card |
-| Flash-Next (Qwen4) `pp>1` + native MTP | Admitted only on explicit request (`--spec mtp`) and only for greedy requests; sampled/penalized requests run AR, MTP sessions are not distributed, DFlash/DSpark/n-gram/DDTree/lanes stay refused |
+| Flash-Next (Qwen4) `pp>1` + native MTP | Admitted only on explicit request (`--spec mtp`) and only for greedy requests; sampled/penalized requests run AR, MTP sessions are not distributed, DFlash/DSpark/n-gram/DDTree stay refused. fn-lanes under PP are AR lanes only: native-MTP lanes are not staged ([fn-lanes under PP and EP](#flash-next-fn-lanes-continuous-batching-under-pp-and-ep)) |
 
 EP-only: `tp>1` with a DFlash draft → refused; non-EP arch → `load_model_ep` error.
 Flash-Next `topology.ep > 1` has its own refusals (pp/tp ≠ 1, `ep` above 8, an
 arch other than gfx1100/gfx1201, mixed arches, too few devices, missing peer
-access, DFlash/DSpark/n-gram/DDTree/adaptive KV/drafters/CASK/PFlash/lanes/Redline,
+access, DFlash/DSpark/n-gram/DDTree/adaptive KV/drafters/CASK/PFlash/Redline,
 `HIPFIRE_MTP_SAMPLED_MODE=naive`): see
 [Flash-Next EP: enabling and status](#flash-next-ep-enabling-and-status).
 
@@ -907,9 +909,53 @@ Mesh, rank, band and budget refusals use the prefix
   trunk-overlay sidecar and a set `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`
   (`qwen4: topology.pp does not admit … (host-mapped expert layers)`).
 
-Also refused under PP: lane batching and the daemon-level `tp > 1 && pp > 1`
-(`mutually exclusive`). The synthetic `hipfire bench --matrix` probes
+Also refused under PP: the daemon-level `tp > 1 && pp > 1`
+(`mutually exclusive`). Exact AR lane batching is admitted under PP; see
+[fn-lanes under PP and EP](#flash-next-fn-lanes-continuous-batching-under-pp-and-ep).
+The synthetic `hipfire bench --matrix` probes
 (`bench_prefill` / `bench_decode`) are **not** refused under PP, TP or EP.
+
+#### Flash-Next fn-lanes continuous batching under PP and EP
+
+With `serve.vmm_batch` on, a Qwen4 load under `topology.pp` or `topology.ep`
+(`2..=8`) stages the same exact **AR fn-lanes** route as a single card
+(`continuous_batch_route = "fn-lanes"`, greedy-only lanes). Nothing here is
+measured: the multi-card GPU gates and every throughput or per-stream figure are
+**pending**, and no speedup or exactness claim is made for these topologies by
+this page.
+
+- **Staging and admission.** Lanes are staged after the weights, from each
+  device's remaining free memory. The check is per device: every band (PP) or
+  rank (EP) needs `lane store bytes <= free` on its own card. If any device does
+  not fit, nothing is staged, the reason is logged and the load keeps the
+  singleton route (`continuous_batch_capable = false`). The singleton's own
+  admission and residency plan are not changed by staging.
+- **EP.** The trunk is replicated, so every rank holds a full lane-store replica
+  and runs each lane entry through the same per-rank worker fan-out as the
+  singleton EP forward.
+- **PP.** Each band holds a band-scoped lane store. Bands run **sequentially**
+  for a lane step: HC streams cross each band edge through pinned host memory
+  (no peer access), exactly as the singleton PP forward. There is no
+  micro-batch overlap between bands.
+- **AR lanes only.** Native-MTP lanes are not staged under PP/EP
+  (`continuous_batch_spec = false`, `continuous_batch_spec_mode = "off"`),
+  whatever `speculation.mtp` requests.
+- **No promotion.** A running singleton request is never promoted into a lane
+  under PP/EP (`continuous_batch_promotion = false`); on one card it is `true`.
+- **gfx1201 stays per-lane.** Row-local stages run once per lane, with the
+  singleton's typed ops, until grouped stages are certified for gfx1201
+  (`fn_lanes_stage_policy` / `fn_lanes_stage_evidence` in the load ack). A step
+  of C lanes is therefore C serial trunk passes under both topologies; this is
+  the policy, not a tuning gap.
+- **Load ack.** `fn_lanes_topology` is `single`, `ep` or `pp`;
+  `fn_lanes_device_receipts` has one entry per card (EP: rank order; PP: input
+  band to output band). The scalar `fn_lanes_*` receipt fields are the root's:
+  rank 0 under EP, the output band under PP.
+- **Bench.** `hipfire bench --concurrency … --backend batch` accepts the `vmm`
+  and `fn-lanes` routes. It loads through the same path as the other bench
+  arms, which forwards the configured `topology.pp` (load `params.pp`) and the
+  configured `topology.ep` (daemon process config), so the sweep measures the
+  PP/EP topology configured for the model.
 
 #### Qualify a box: `fn-ep-gate` mode `pp`
 

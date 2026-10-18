@@ -532,8 +532,12 @@ After `load_model`, request handling builds sampling defaults
 Continuous batching is a separate exact-id staging route
 (`hipfire_loader::continuous_batch_route`): Qwen3.5 (5/6) and Flash-Next
 (16). Qwen4 batches only as exact AR lanes through the VMM branch
-(`serve.vmm_batch`; there is no fixed-lane Qwen4 body), and its lane steps are
-refused under expert parallelism. LFM2 (11) has no servable batch path.
+(`serve.vmm_batch`; there is no fixed-lane Qwen4 body). Lane steps run on one
+card, replicated across EP ranks, or band-split across PP bands (sequential
+bands, host-staged HC edges; each device's lane store must fit its own free
+memory). Multi-card lanes are AR only: no native-MTP lanes and no promotion of a
+running singleton; their GPU gates and performance are pending. LFM2 (11) has
+no servable batch path.
 
 Capability examples that are **implemented** but not automatically
 “product-certified”:
