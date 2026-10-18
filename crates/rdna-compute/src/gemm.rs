@@ -88,8 +88,38 @@ static DISPATCH_GFX1151_QKVZA_R2: LazyLock<bool> =
 static DISPATCH_GFX1151_QKVZA_R2_BUFFER: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_R2_BUFFER", false));
 
+/// Pure decision for a developer opt-in whose kernel AMD clang 24 miscompiles
+/// (scalar `__builtin_bit_cast` of a vector
+/// `.y` lane reads lane 0). Returns `(selected, refusal)`: `selected` is always
+/// `false` — the default route runs — and `refusal` carries the one-time
+/// message when the opt-in was requested. `raw` is the variable's raw value;
+/// only `"1"` requests the opt-in, as for `developer_bool`.
+pub(crate) fn miscompiled_optin_decision(var: &str, raw: Option<&str>) -> (bool, Option<String>) {
+    let refusal = (raw == Some("1")).then(|| {
+        format!(
+            "{var}=1 refused: AMD clang 24 miscompiles this kernel (scalar bit-casts of a vector .y lane read lane 0); \
+             running the default route"
+        )
+    });
+    (false, refusal)
+}
+
+/// Reads `var` once, logs the refusal when it is set, and returns the (always
+/// `false`) selection. Callers hold the result in a `LazyLock`, so the refusal
+/// is logged once per process.
+pub(crate) fn refuse_miscompiled_optin(var: &str) -> bool {
+    let raw = hipfire_config::developer_var(var).ok();
+    let (selected, refusal) = miscompiled_optin_decision(var, raw.as_deref());
+    if let Some(message) = refusal {
+        eprintln!("[hipfire] {message}");
+    }
+    selected
+}
+
+// The R4-stream QKVZA kernel stays compiled but is never selected: see
+// `miscompiled_optin_decision`.
 static DISPATCH_GFX1151_QKVZA_R4_STREAM: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_R4_STREAM", false));
+    LazyLock::new(|| refuse_miscompiled_optin("HIPFIRE_GFX1151_QKVZA_R4_STREAM"));
 
 static DISPATCH_GFX1151_QKVZA_WAVE64_SHARE_X: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_WAVE64_SHARE_X", false));
@@ -52510,5 +52540,45 @@ mod mq2_gfx1030_moe_abi_tests {
             super::kernels::GEMV_Q8_0_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_SRC,
             "gemv_q8_0_moe_down_residual_scaled_k8_indexed",
         );
+    }
+}
+
+#[cfg(test)]
+mod miscompiled_optin_refusal_tests {
+    use super::miscompiled_optin_decision;
+
+    const VARS: [&str; 2] = [
+        "HIPFIRE_GFX1151_QKVZA_R4_STREAM",
+        "HIPFIRE_GFX1151_GATE_UP_HYBRID_BUFFER",
+    ];
+
+    #[test]
+    fn miscompiled_optin_unset_runs_default_route_without_refusal() {
+        for var in VARS {
+            assert_eq!(miscompiled_optin_decision(var, None), (false, None));
+        }
+    }
+
+    #[test]
+    fn miscompiled_optin_set_runs_default_route_and_names_the_defect() {
+        for var in VARS {
+            let (selected, refusal) = miscompiled_optin_decision(var, Some("1"));
+            assert!(!selected, "{var}=1 must not select the miscompiled kernel");
+            let message = refusal.expect("a requested opt-in must be refused");
+            assert!(message.contains(&format!("{var}=1 refused")), "{message}");
+            assert_eq!(
+                message,
+                format!(
+                    "{var}=1 refused: AMD clang 24 miscompiles this kernel (scalar bit-casts of a vector .y lane read lane 0); running the default route"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn miscompiled_optin_explicit_zero_runs_default_route_without_refusal() {
+        for var in VARS {
+            assert_eq!(miscompiled_optin_decision(var, Some("0")), (false, None));
+        }
     }
 }

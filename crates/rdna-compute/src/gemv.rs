@@ -8,6 +8,12 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 
+// The hybrid-buffer MoE gate/up kernel stays compiled but is never selected:
+// see `crate::gemm::miscompiled_optin_decision`.
+static GFX1151_GATE_UP_HYBRID_BUFFER: LazyLock<bool> = LazyLock::new(|| {
+    crate::gemm::refuse_miscompiled_optin("HIPFIRE_GFX1151_GATE_UP_HYBRID_BUFFER")
+});
+
 /// Per-part output views of rows `first..first + n` (row stride `m`) of the
 /// four-part row launchers; an empty part (`m == 0`) views nothing.
 fn x4_group_ys(
@@ -15021,9 +15027,10 @@ impl Gpu {
             let gfx1151_pair_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
                 && hipfire_config::developer_bool("HIPFIRE_GFX1151_GATE_UP_PAIR_BUFFER", false);
-            let gfx1151_hybrid_buffer = self.arch_caps.is_gfx1151()
-                && k == 2_048
-                && hipfire_config::developer_bool("HIPFIRE_GFX1151_GATE_UP_HYBRID_BUFFER", false);
+            // Fails closed: the hybrid kernel is miscompiled by AMD clang 24
+            // (see `refuse_miscompiled_optin`); the opt-in is refused and logged once.
+            let gfx1151_hybrid_buffer =
+                self.arch_caps.is_gfx1151() && k == 2_048 && *GFX1151_GATE_UP_HYBRID_BUFFER;
             let gfx1151_k2048_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
                 && (hipfire_config::developer_bool("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS", false)

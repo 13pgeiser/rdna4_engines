@@ -778,7 +778,10 @@ derived by `scripts/check-lifecycle.py` (wired into `scripts/no-gpu-ci.sh`):
 | `deprecated` | Deprecated since 0.4.0, removed in 0.5.0: the alias of a deprecated schema key, a deprecated knob, or only referenced by deprecated code. Using it prints a one-line warning. |
 
 A `; …` suffix records deprecated **values** of a supported variable
-(`HIPFIRE_KV_MODE=asymN|turbo*`, `HIPFIRE_DFLASH_WINDOW=0`). The 0.4.0
+(`HIPFIRE_KV_MODE=asymN|turbo*`, `HIPFIRE_DFLASH_WINDOW=0`) or **refused**
+values: `HIPFIRE_GFX1151_QKVZA_R4_STREAM=1` and
+`HIPFIRE_GFX1151_GATE_UP_HYBRID_BUFFER=1` fail closed (one-time stderr refusal,
+default route runs) because AMD clang 24 miscompiles their kernels. The 0.4.0
 deprecations are listed in [`CHANGELOG.md`](../CHANGELOG.md).
 
 ---
@@ -939,8 +942,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_CONV_QKNORM_SHAPE` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/rdna-compute/src/norm.rs | developer |
 | `HIPFIRE_CONV_SCALAR_PREP` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs | developer |
 | `HIPFIRE_CPU_EXEC_TRACE` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
-| `HIPFIRE_CPU_EXPERT_PIN` | crates/hipfire-cpu/src/splice_pool.rs, crates/hipfire-dispatch/src/cpu_exec.rs | developer |
-| `HIPFIRE_CPU_EXPERT_THREADS` | crates/hipfire-arch-qwen4/examples/qwen4_cpu_split_parity.rs, crates/hipfire-dispatch/src/cpu_exec.rs | developer |
+| `HIPFIRE_CPU_EXPERT_PIN` | crates/hipfire-cpu/src/splice_pool.rs, crates/hipfire-dispatch/examples/d2_cpu_arm_bench.rs | developer |
+| `HIPFIRE_CPU_EXPERT_THREADS` | crates/hipfire-arch-qwen4/examples/qwen4_cpu_split_parity.rs, crates/hipfire-dispatch/examples/d2_cpu_arm_bench.rs | developer |
 | `HIPFIRE_CQN_BLOCK` | crates/rdna-compute/src/kernels.rs, crates/rdna-compute/src/rows_batched.rs | developer |
 | `HIPFIRE_CQN_KERNEL` | crates/rdna-compute/src/kernels.rs, crates/rdna-compute/src/rows_batched.rs | developer |
 | `HIPFIRE_CQN_SCALAR_PREP` | crates/rdna-compute/src/kernels.rs | developer |
@@ -1432,7 +1435,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GFX1151_FA2_TWIN` | crates/rdna-compute/src/attention.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GFX1151_FA_PREP` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
 | `HIPFIRE_GFX1151_GATE_UP_ALL_BUFFER` | crates/rdna-compute/src/gemv.rs | developer |
-| `HIPFIRE_GFX1151_GATE_UP_HYBRID_BUFFER` | crates/rdna-compute/src/gemv.rs | developer |
+| `HIPFIRE_GFX1151_GATE_UP_HYBRID_BUFFER` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/gemv.rs | developer; `1` refused (fails closed to the default route): AMD clang 24 miscompiles the kernel (`.y` vector-lane bit-casts read lane 0) |
 | `HIPFIRE_GFX1151_GATE_UP_K2048` | crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_GFX1151_GATE_UP_LOW_VGPR` | crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_GFX1151_GATE_UP_PAIRED_WAVES` | crates/rdna-compute/src/gemv.rs | developer |
@@ -1471,7 +1474,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GFX1151_QKVZA_PAIR_BUFFER` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_GFX1151_QKVZA_R2` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_GFX1151_QKVZA_R2_BUFFER` | crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_GFX1151_QKVZA_R4_STREAM` | crates/rdna-compute/src/gemm.rs | developer |
+| `HIPFIRE_GFX1151_QKVZA_R4_STREAM` | crates/rdna-compute/src/gemm.rs | developer; `1` refused (fails closed to the default route): AMD clang 24 miscompiles the kernel (`.y` vector-lane bit-casts read lane 0) |
 | `HIPFIRE_GFX1151_QKVZA_WAVE64` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_GFX1151_QKVZA_WAVE64_SHARE_X` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_GFX1151_QKVZA_X_BUFFER_LARGE` | crates/rdna-compute/src/gemm.rs | developer |

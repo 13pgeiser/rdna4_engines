@@ -85,6 +85,8 @@ DEPRECATED_ENV_NAME = re.compile(r"PFLASH|CASK|TRIATT")
 ENV_VALUE_NOTES = {
     "HIPFIRE_DFLASH_WINDOW": "`0` (legacy contiguous DFlash) deprecated, removal 0.5.0",
     "HIPFIRE_KV_MODE": "`asymN`/`turbo*` values deprecated, removal 0.5.0",
+    "HIPFIRE_GFX1151_QKVZA_R4_STREAM": "`1` refused (fails closed to the default route): AMD clang 24 miscompiles the kernel (`.y` vector-lane bit-casts read lane 0)",
+    "HIPFIRE_GFX1151_GATE_UP_HYBRID_BUFFER": "`1` refused (fails closed to the default route): AMD clang 24 miscompiles the kernel (`.y` vector-lane bit-casts read lane 0)",
 }
 # Developer-namespace spellings of deprecated env knobs (for TOML profiles).
 DEPRECATED_DEVELOPER_KEYS = {"dflash_ctx_cap", "cask_off"}
