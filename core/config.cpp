@@ -73,6 +73,8 @@ static const Flag g_flags[] = {
     { "--gpu-headroom-mib",   "N",      "VRAM left unclaimed on every card (default 96)" },
     { "--kv-cache-dtype",     "T",      "bf16 | fp8 -- fp8 halves what a token of context costs" },
     { "--host-pool-mib",      "N",      "pinned host tier" },
+    { "--host-headroom-mib",  "N",      "host RAM to leave free for the system when radiance\n"
+    "                                    pins its host memory at startup (default 4096)" },
     { "--embedding-placement", "WHERE", "ram (default) | vram: where the token embedding lives. ram\n"
     "                                    pins it in host memory beside --host-pool-mib, read over the\n"
     "                                    link in place; by default a model whose output head reads the\n"
@@ -461,6 +463,7 @@ int config_parse(int argc, char** argv, Config* c) {
         /* --gpu-headroom is accepted as an alias of --gpu-headroom-mib. */
         else if (S("--gpu-headroom-mib") || S("--gpu-headroom"))
                                                { if (!num(0, INT64_MAX, &c->gpu_headroom_mib)) return RAD_E_INVAL; }
+        else if (S("--host-headroom-mib"))      { if (!num(0, INT64_MAX, &c->host_headroom_mib)) return RAD_E_INVAL; }
         else if (S("--kv-cache-dtype")) {
             if (!(v = need(i))) return RAD_E_INVAL;
             if (std::strcmp(v, "bf16") && std::strcmp(v, "fp8")) {
@@ -1000,6 +1003,7 @@ const ShowRow kShow[] = {
     { "--gpu-headroom-mib",   [](const Config& c) { return num(c.gpu_headroom_mib); } },
     { "--kv-cache-dtype",     [](const Config& c) { return c.kv_cache_dtype; } },
     { "--host-pool-mib",      [](const Config& c) { return num(c.host_pool_mib); } },
+    { "--host-headroom-mib",  [](const Config& c) { return num(c.host_headroom_mib); } },
     { "--embedding-placement", [](const Config& c) { return std::string(table_placement_name(c.embedding_placement)); } },
     { "--ngram-placement",    [](const Config& c) { return std::string(table_placement_name(c.ngram_placement)); } },
     { "--vision-tower-placement", [](const Config& c) { return std::string(table_placement_name(c.tower_placement)); } },

@@ -685,7 +685,8 @@ GiB a card at `--tp 2`. Under `ram` each rank pins its own shard in host memory 
 `--host-pool-mib`, and the lookup reads a step's rows over the link, so the table costs no VRAM. The
 table is the model-level weight only `embed_lookup` reads. A model whose head is tied to it keeps it
 on the card (the head's GEMM would stream it whole every step), and so does a host that cannot pin
-it (available memory and memory cgroups, after the pools, with 4 GiB to spare); startup says which.
+it (available memory and memory cgroups, after the pools, with `--host-headroom-mib` to spare,
+default 4 GiB); startup says which.
 An explicit `ram` turns either case into a refusal. `disk` is refused: the lookup writes activations
 the card reads, which a host kernel reading the container cannot do.
 
@@ -711,9 +712,9 @@ from the container through a row cache with direct reads on the host; about half
 are first-seen, so steps wait on the drive. `ram` copies the table into host memory at load (12 to
 40 s more startup, depending on the page cache) and the card's gather kernel reads the pinned copy,
 so a step has no host work. `vram` puts all of it on every card. `ram` needs the table's size free
-after the pinned host pools and the prefix cache's host tier, with 4 GiB to spare, under every
-memory cgroup the process sits in, and refuses the start otherwise. `auto` takes the first of `vram`,
-`ram` and `disk` that holds the table. Without a device kernel for the gather (no libr4d) the table is
+after the pinned host pools and the prefix cache's host tier, with `--host-headroom-mib` to spare
+(default 4 GiB), under every memory cgroup the process sits in, and refuses the start otherwise.
+`auto` takes the first of `vram`, `ram` and `disk` that holds the table. Without a device kernel for the gather (no libr4d) the table is
 read on the host: `vram` is refused, and `ram` is a copy in locked huge pages, which also needs a
 memlock limit that large (`--ulimit memlock=-1` in Docker, `LimitMEMLOCK=infinity` under systemd).
 
@@ -1072,8 +1073,9 @@ running or not, and a conversation without a snapshot under its next prompt reus
 backoff keeps 9 for a 200K-token conversation at the default 2048-token interval, so 10 a sequence,
 80 at `--max-num-seqs 8`. The store is pinned for the life of the server, so `auto` takes at most an
 eighth of host memory (and never less than 8 slots where the host can pin them), and never more than
-the host can pin after the host pools, the host tier and the activation arenas. The startup log says
-what it chose; Flash-Next at `--tp 2 --max-num-seqs 8` on a host with 128 GB of RAM:
+the host can pin after the host pools, the host tier, the activation arenas and
+`--host-headroom-mib`. The startup log says what it chose; Flash-Next at `--tp 2
+--max-num-seqs 8` on a host with 128 GB of RAM:
 
 ```
 checkpoint slots: auto: 80 linear-state snapshot(s) of 113.50 MiB in pinned host memory (8.87 GiB),
@@ -1267,6 +1269,7 @@ still verified by the adapter, so output is exact and only the acceptance rate c
 | `--gpu-headroom-mib N` | 96 | VRAM left unclaimed on every card |
 | `--kv-cache-dtype T` | bf16 | `bf16` or `fp8` |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |
+| `--host-headroom-mib N` | 4096 | host RAM left free for the system when startup pins host memory — kept for the unpooled allocations, staging and page cache (§4.3) |
 | `--embedding-placement WHERE` | ram | `ram` or `vram`: the token embedding pinned in host memory beside `--host-pool-mib` and read in place, or on the card (§4.3) |
 | `--ngram-placement WHERE` | auto | `auto`, `vram`, `ram` or `disk`: an n-gram table on the card, as a copy in RAM made at load and read by the card, or read from the container (§4.3) |
 | `--vision-tower-placement WHERE` | vram | `vram` or `ram`: the encoder towers (vision, and audio where a model has one) on the card, or pinned in host memory beside `--host-pool-mib` and read in place once an image (§4.3) |

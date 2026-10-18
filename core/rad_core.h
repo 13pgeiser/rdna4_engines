@@ -743,6 +743,7 @@ struct Config {
      * always resolve to bf16 and only add a third name. */
     std::string kv_cache_dtype = "bf16";
     int64_t host_pool_mib = 0;
+    int64_t host_headroom_mib = 4096; /* --host-headroom-mib: RAM left free for the system at startup */
     /* File tier for weights: what fits in neither the VRAM slab nor the pinned host pool is read
      * from the container with O_DIRECT ahead of the ops that read it (a scheduled unit by the
      * exact prefetch, a routed expert a routed layer at a time). Off by default because disk

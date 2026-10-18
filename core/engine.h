@@ -159,6 +159,10 @@ private:
      * time. Requests and unloads go to the table alone and never wait for a load's copy. */
     std::mutex                 lora_mu_;
     std::set<std::string>      lora_targets_;
+    /* --host-headroom-mib in bytes: the host RAM startup leaves free for the system when it
+     * pins host memory (engine_bringup.cpp). 4 GiB suits a busy server; a small host wants to
+     * leave less to make room for its tiers, which is why it is a flag and not a constant. */
+    int64_t host_headroom_bytes() const { return cfg_.host_headroom_mib * ((int64_t)1 << 20); }
     /* Resolves --embedding-placement, --vision-tower-placement and --ngram-placement into Config
      * before the card is split (engine_bringup.cpp describes how auto chooses). `wfs` is every
      * rank's footprint, read for its towers. `host_late` is the pinned host memory startup
