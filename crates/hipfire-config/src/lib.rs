@@ -9614,6 +9614,33 @@ pub mod memory {
         super::developer_typed_bool("HIPFIRE_QWEN4_D2_DEFAULT")
     }
 
+    /// Developer kill switch `HIPFIRE_QWEN4_DIRECT_LOAD` for the discrete-GPU
+    /// Qwen4 direct weight reader (parallel `O_DIRECT`/buffered file reads
+    /// straight into pinned or staged device memory). Default on; exactly `0`
+    /// restores the unchanged mmap + single-thread copy path. Unified-memory
+    /// devices never take the direct reader regardless of this value.
+    pub fn qwen4_direct_load() -> bool {
+        parse_qwen4_direct_load(process_value("HIPFIRE_QWEN4_DIRECT_LOAD").as_deref())
+    }
+
+    /// Pure truth table behind [`qwen4_direct_load`]: only a trimmed `0` is
+    /// off; unset, empty and every other spelling keep the default (on).
+    pub fn parse_qwen4_direct_load(raw: Option<&str>) -> bool {
+        raw.map(str::trim) != Some("0")
+    }
+
+    /// Developer `HIPFIRE_LOAD_WEIGHT_DIGEST=<path>`: when set and not blank,
+    /// the Qwen4 loader appends one JSONL record per fulfilled weight
+    /// (`name`, `layer`, `residency`, `dtype`, `logical_bytes`, `sha256` of the
+    /// logical bytes: host-owner hash or device download) to that file after a
+    /// successful fulfillment. Unset or blank writes nothing.
+    pub fn load_weight_digest_path() -> Option<PathBuf> {
+        developer_var("HIPFIRE_LOAD_WEIGHT_DIGEST")
+            .ok()
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from)
+    }
+
     /// How much of a split step the GPU takes (`memory.offload_passback_share`).
     ///
     /// Read only when [`offload_exec`] is [`OffloadExec::Passback`]; in any other
@@ -9702,6 +9729,17 @@ pub mod memory {
             assert_eq!(OffloadExec::Pcie.to_string(), "pcie");
             assert_eq!(OffloadExec::Cpu.to_string(), "cpu");
             assert_eq!(OffloadExec::Passback.to_string(), "passback");
+        }
+
+        #[test]
+        fn qwen4_direct_load_is_default_on_and_only_zero_is_off() {
+            assert!(parse_qwen4_direct_load(None));
+            assert!(parse_qwen4_direct_load(Some("")));
+            assert!(parse_qwen4_direct_load(Some("1")));
+            assert!(parse_qwen4_direct_load(Some(" 1 ")));
+            assert!(parse_qwen4_direct_load(Some("true")));
+            assert!(!parse_qwen4_direct_load(Some("0")));
+            assert!(!parse_qwen4_direct_load(Some(" 0 ")));
         }
 
         #[test]

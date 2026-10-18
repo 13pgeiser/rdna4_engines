@@ -6786,6 +6786,28 @@ impl Gpu {
         }
     }
 
+    /// Allocate a raw host-mapped owner without copying its payload.
+    ///
+    /// The returned host pointer is writable through the logical length plus
+    /// `HOST_TAIL_PAD_BYTES`, and remains valid until `free_tensor`. The caller
+    /// must initialize the payload and zero the tail before publishing it.
+    pub fn alloc_raw_host_mapped(
+        &mut self,
+        byte_size: usize,
+        shape: &[usize],
+    ) -> HipResult<(GpuTensor, *mut u8)> {
+        self.bind_thread()?;
+        let started = std::time::Instant::now();
+        let tensor = self.alloc_host_mapped_tensor(byte_size, shape, DType::Raw)?;
+        crate::load_phases::add(
+            "weights.host_alloc",
+            crate::load_phases::ns_since(started),
+            (byte_size + HOST_TAIL_PAD_BYTES) as u64,
+        );
+        let host = self.host_mapped[&(tensor.buf.as_ptr() as usize)] as *mut u8;
+        Ok((tensor, host))
+    }
+
     /// Upload raw bytes into a **host-mapped** tensor: pinned system RAM the
     /// kernels read directly over PCIe (zero-copy), charged to no device heap.
     ///

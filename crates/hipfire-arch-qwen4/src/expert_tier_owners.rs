@@ -18,6 +18,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hip_bridge::{DeviceBuffer, HipRuntime, HIP_HOST_MALLOC_MAPPED};
+use hipfire_runtime::hfq_parallel::{
+    self, DeviceRangeCopy, DirectSource, HostRangeCopy, HFQ_READER_LANES,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::expert_arena::ARENA_TAIL_PAD_BYTES;
@@ -453,6 +456,98 @@ fn pointer_bytes(entries: &[usize]) -> &[u8] {
     }
 }
 
+/// A logical payload span, never including table bytes or owner tail padding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PayloadSpan {
+    file_offset: u64,
+    len: u64,
+    tier: Placement,
+    dst_offset: u64,
+}
+
+/// Preserve copy order, merging only runs contiguous in both address spaces.
+fn coalesce_spans(spans: &[PayloadSpan]) -> Result<Vec<PayloadSpan>, ExpertTierOwnerError> {
+    let mut runs: Vec<PayloadSpan> = Vec::with_capacity(spans.len());
+    for span in spans {
+        span.file_offset
+            .checked_add(span.len)
+            .ok_or(ExpertTierOwnerError::Overflow)?;
+        span.dst_offset
+            .checked_add(span.len)
+            .ok_or(ExpertTierOwnerError::Overflow)?;
+        if let Some(last) = runs.last_mut() {
+            if last.tier == span.tier
+                && last.file_offset.checked_add(last.len) == Some(span.file_offset)
+                && last.dst_offset.checked_add(last.len) == Some(span.dst_offset)
+            {
+                last.len = last
+                    .len
+                    .checked_add(span.len)
+                    .ok_or(ExpertTierOwnerError::Overflow)?;
+                continue;
+            }
+        }
+        runs.push(*span);
+    }
+    Ok(runs)
+}
+
+fn payload_spans(plan: &ExpertTierPlan) -> Result<Vec<PayloadSpan>, ExpertTierOwnerError> {
+    let mut spans = Vec::new();
+    for tier in [Placement::Device, Placement::HostMapped] {
+        for copy in plan.copies(tier) {
+            checked_extent(
+                tier,
+                copy.dst_offset,
+                copy.src.len as u64,
+                plan.owner_bytes(tier),
+            )?;
+            spans.push(PayloadSpan {
+                file_offset: copy.src.offset as u64,
+                len: copy.src.len as u64,
+                tier,
+                dst_offset: copy.dst_offset,
+            });
+        }
+    }
+    for window in plan.host_windows() {
+        for (span, offset) in &window.spans {
+            checked_extent(
+                Placement::HostMapped,
+                *offset,
+                span.len as u64,
+                plan.owner_bytes(Placement::HostMapped),
+            )?;
+            spans.push(PayloadSpan {
+                file_offset: span.offset as u64,
+                len: span.len as u64,
+                tier: Placement::HostMapped,
+                dst_offset: *offset,
+            });
+        }
+    }
+    coalesce_spans(&spans)
+}
+
+fn record_direct_stats(stats: hfq_parallel::DirectReadStats) {
+    for (phase, ns, bytes) in [
+        (
+            "expert_tiers.direct_read",
+            stats.direct_read_ns,
+            stats.bytes_direct,
+        ),
+        (
+            "expert_tiers.buffered_read",
+            stats.buffered_read_ns,
+            stats.bytes_buffered,
+        ),
+    ] {
+        if bytes != 0 {
+            rdna_compute::load_phases::add(phase, ns, bytes);
+        }
+    }
+}
+
 fn copy_span<'src>(
     src: &dyn Fn(u64, u64) -> Result<&'src [u8], String>,
     source_offset: u64,
@@ -480,6 +575,65 @@ fn copy_span<'src>(
         copied += n;
     }
     Ok(())
+}
+
+/// The direct path's spans: [`payload_spans`] with every source extent checked
+/// against the artifact's EOF before anything is allocated.
+///
+/// Expert slab offsets are already ABSOLUTE file offsets (the sealed HFQ index
+/// offsets, which the mmap path reads through `HfqFile::data_range` over the
+/// whole-file mapping). The direct reader takes them unchanged: rebasing on
+/// the HFQ data section shifts every expert (Q4L identity gate, 526f3b6ba).
+fn direct_payload_spans(
+    plan: &ExpertTierPlan,
+    source: &DirectSource,
+) -> Result<Vec<PayloadSpan>, ExpertTierOwnerError> {
+    let spans = payload_spans(plan)?;
+    let file_len = source.file_identity().len;
+    for span in &spans {
+        let end = span
+            .file_offset
+            .checked_add(span.len)
+            .ok_or(ExpertTierOwnerError::Overflow)?;
+        if end > file_len {
+            return Err(ExpertTierOwnerError::Source(format!(
+                "expert span {}+{} exceeds the {file_len}-byte artifact",
+                span.file_offset, span.len
+            )));
+        }
+    }
+    Ok(spans)
+}
+
+/// Fill the host-mapped tier's spans of `spans` (from
+/// [`direct_payload_spans`]) at `base` with direct parallel reads.
+///
+/// # Safety
+/// `base` must designate a writable allocation covering every host span's
+/// destination extent, exclusive to this call.
+unsafe fn fill_host_spans(
+    source: &DirectSource,
+    spans: &[PayloadSpan],
+    base: *mut u8,
+) -> Result<hfq_parallel::DirectReadStats, ExpertTierOwnerError> {
+    let copies = spans
+        .iter()
+        .filter(|span| span.tier == Placement::HostMapped)
+        .map(|span| {
+            let offset =
+                usize::try_from(span.dst_offset).map_err(|_| ExpertTierOwnerError::Overflow)?;
+            Ok(HostRangeCopy {
+                file_offset: span.file_offset,
+                len: usize::try_from(span.len).map_err(|_| ExpertTierOwnerError::Overflow)?,
+                dst: (base as usize)
+                    .checked_add(offset)
+                    .ok_or(ExpertTierOwnerError::Overflow)? as *mut u8,
+            })
+        })
+        .collect::<Result<Vec<_>, ExpertTierOwnerError>>()?;
+    // SAFETY: forwarded from the caller's contract.
+    unsafe { hfq_parallel::read_ranges_into_host(source, &copies, HFQ_READER_LANES) }
+        .map_err(|error| ExpertTierOwnerError::Source(error.to_string()))
 }
 
 impl ExpertTierOwners {
@@ -576,6 +730,129 @@ impl ExpertTierOwners {
         copied
     }
 
+    fn read_payloads(
+        &self,
+        gpu: &mut Gpu,
+        source: &DirectSource,
+        spans: &[PayloadSpan],
+    ) -> Result<(), ExpertTierOwnerError> {
+        self.zero_tail(Placement::Device)?;
+        if let Some(owner) = &self.device {
+            let copies = spans
+                .iter()
+                .filter(|span| span.tier == Placement::Device)
+                .map(|span| {
+                    Ok(DeviceRangeCopy {
+                        file_offset: span.file_offset,
+                        len: usize::try_from(span.len)
+                            .map_err(|_| ExpertTierOwnerError::Overflow)?,
+                        dst: owner,
+                        dst_offset: usize::try_from(span.dst_offset)
+                            .map_err(|_| ExpertTierOwnerError::Overflow)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, ExpertTierOwnerError>>()?;
+            let stats =
+                hfq_parallel::upload_ranges_to_device(gpu, source, &copies, HFQ_READER_LANES)
+                    .map_err(ExpertTierOwnerError::Source)?;
+            record_direct_stats(stats);
+            rdna_compute::load_phases::add(
+                "expert_tiers.h2d",
+                stats.h2d_ns,
+                copies.iter().map(|copy| copy.len as u64).sum(),
+            );
+        }
+        self.zero_tail(Placement::HostMapped)?;
+        if let Some(owner) = &self.host {
+            // SAFETY: payload_spans checked every destination extent against
+            // this private pinned allocation. Plan copies do not overlap.
+            let stats = unsafe { fill_host_spans(source, spans, owner.cpu_address as *mut u8) }?;
+            record_direct_stats(stats);
+        }
+        Ok(())
+    }
+
+    fn write_payload_digest(
+        &self,
+        path: &std::path::Path,
+        spans: &[PayloadSpan],
+    ) -> Result<(), ExpertTierOwnerError> {
+        use hipfire_runtime::weight_store::{
+            append_weight_digest_line, Sha256Stream, WeightDigestRow,
+        };
+        // Hash destinations, not mmap sources: this detects read/copy errors.
+        // A single bounded scratch is reused across all logical device ranges.
+        let mut scratch = Vec::new();
+        for (tier, name, residency) in [
+            (Placement::Device, "qwen4.expert_tiers.device", "device"),
+            (
+                Placement::HostMapped,
+                "qwen4.expert_tiers.host",
+                "host_mapped",
+            ),
+        ] {
+            let mut hash = Sha256Stream::new();
+            let mut logical_bytes = 0u64;
+            for span in spans.iter().filter(|span| span.tier == tier) {
+                logical_bytes = logical_bytes
+                    .checked_add(span.len)
+                    .ok_or(ExpertTierOwnerError::Overflow)?;
+                let offset =
+                    usize::try_from(span.dst_offset).map_err(|_| ExpertTierOwnerError::Overflow)?;
+                let len = usize::try_from(span.len).map_err(|_| ExpertTierOwnerError::Overflow)?;
+                match tier {
+                    Placement::HostMapped => {
+                        let owner = self
+                            .host
+                            .as_ref()
+                            .ok_or(ExpertTierOwnerError::MissingBase(tier))?;
+                        // SAFETY: spans contain only checked logical extents
+                        // within the private pinned owner, now fully filled.
+                        let bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                (owner.cpu_address as *const u8).add(offset),
+                                len,
+                            )
+                        };
+                        hash.update(bytes);
+                    }
+                    Placement::Device => {
+                        let owner = self
+                            .device
+                            .as_ref()
+                            .ok_or(ExpertTierOwnerError::MissingBase(tier))?;
+                        let mut copied = 0;
+                        while copied < len {
+                            let n = (len - copied).min(COPY_CHUNK_BYTES as usize);
+                            scratch.resize(n, 0);
+                            self.hip
+                                .memcpy_dtoh_at(&mut scratch, owner, offset + copied)
+                                .map_err(runtime_error)?;
+                            hash.update(&scratch);
+                            copied += n;
+                        }
+                    }
+                }
+            }
+            if logical_bytes != 0 {
+                let sha256 = hash.finish_hex();
+                append_weight_digest_line(
+                    path,
+                    &WeightDigestRow {
+                        name,
+                        layer: None,
+                        residency,
+                        dtype: "expert_payload",
+                        logical_bytes,
+                        sha256: &sha256,
+                    },
+                )
+                .map_err(|error| ExpertTierOwnerError::Source(error.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
     fn zero_tail(&self, tier: Placement) -> Result<(), ExpertTierOwnerError> {
         let bytes = self.plan.owner_bytes(tier);
         if bytes == 0 {
@@ -663,14 +940,39 @@ impl Drop for ExpertTierOwners {
     }
 }
 
-/// Allocate, fill and freeze a validated placement plan. Source requests are
-/// at most 8 MiB; no whole-model temporary or per-expert owner is created.
-/// The source mapping need only remain valid until this call returns.
+/// Allocate, fill and freeze a validated placement plan using bounded mmap
+/// copies. The source mapping need only remain valid until this call returns.
 pub fn materialize<'src>(
     gpu: &mut Gpu,
     plan: Arc<ExpertTierPlan>,
     src: &dyn Fn(u64, u64) -> Result<&'src [u8], String>,
 ) -> Result<ExpertTierLease, ExpertTierOwnerError> {
+    materialize_impl(gpu, plan, src, None)
+}
+
+/// Fill the same owners directly from the artifact, without faulting mmap
+/// payloads. Allocation, table publication and rollback match `materialize`.
+pub fn materialize_direct<'src>(
+    gpu: &mut Gpu,
+    plan: Arc<ExpertTierPlan>,
+    source: &DirectSource,
+    src: &dyn Fn(u64, u64) -> Result<&'src [u8], String>,
+) -> Result<ExpertTierLease, ExpertTierOwnerError> {
+    materialize_impl(gpu, plan, src, Some(source))
+}
+
+fn materialize_impl<'src>(
+    gpu: &mut Gpu,
+    plan: Arc<ExpertTierPlan>,
+    src: &dyn Fn(u64, u64) -> Result<&'src [u8], String>,
+    direct_source: Option<&DirectSource>,
+) -> Result<ExpertTierLease, ExpertTierOwnerError> {
+    let digest_path = hipfire_runtime::weight_store::weight_digest_path();
+    let spans = match direct_source {
+        Some(source) => Some(direct_payload_spans(&plan, source)?),
+        None if digest_path.is_some() => Some(payload_spans(&plan)?),
+        None => None,
+    };
     gpu.bind_thread().map_err(runtime_error)?;
     // Gpu owns HipRuntime by value and exposes no shared handle. A second
     // dlopen of the same HIP library supplies a standalone lifetime-safe handle
@@ -699,28 +1001,40 @@ pub fn materialize<'src>(
             .map(|owner| owner.as_ptr() as usize as u64),
         owners.host.as_ref().map(|owner| owner.device_alias),
     )?;
-    for tier in [Placement::Device, Placement::HostMapped] {
-        owners.zero_tail(tier)?;
-        for copy in owners.plan.copies(tier) {
-            owners.copy_payload(
-                tier,
-                copy.src.offset as u64,
-                copy.src.len as u64,
-                copy.dst_offset,
-                src,
-            )?;
+    if let Some(source) = direct_source {
+        owners.read_payloads(
+            gpu,
+            source,
+            spans.as_deref().expect("direct spans planned above"),
+        )?;
+    } else {
+        for tier in [Placement::Device, Placement::HostMapped] {
+            owners.zero_tail(tier)?;
+            for copy in owners.plan.copies(tier) {
+                owners.copy_payload(
+                    tier,
+                    copy.src.offset as u64,
+                    copy.src.len as u64,
+                    copy.dst_offset,
+                    src,
+                )?;
+            }
+        }
+        for window in owners.plan.host_windows() {
+            for (span, offset) in &window.spans {
+                owners.copy_payload(
+                    Placement::HostMapped,
+                    span.offset as u64,
+                    span.len as u64,
+                    *offset,
+                    src,
+                )?;
+            }
         }
     }
-    for window in owners.plan.host_windows() {
-        for (span, offset) in &window.spans {
-            owners.copy_payload(
-                Placement::HostMapped,
-                span.offset as u64,
-                span.len as u64,
-                *offset,
-                src,
-            )?;
-        }
+    if let Some(path) = digest_path {
+        owners
+            .write_payload_digest(&path, spans.as_deref().expect("digest spans planned above"))?;
     }
     // Install each allocation in the RAII owner before its upload can fail.
     owners.gate_up_table = Some(GpuTensor {
@@ -1438,5 +1752,327 @@ mod tests {
                 assert_eq!(bytes, entry.to_ne_bytes());
             }
         }
+    }
+
+    // ---- payload span coalescing ------------------------------------------
+
+    fn span(file_offset: u64, len: u64, tier: Placement, dst_offset: u64) -> PayloadSpan {
+        PayloadSpan {
+            file_offset,
+            len,
+            tier,
+            dst_offset,
+        }
+    }
+
+    fn span_bytes(spans: &[PayloadSpan]) -> u64 {
+        spans.iter().map(|s| s.len).sum()
+    }
+
+    /// Logical payload bytes the plan asks to copy: tier copies plus host windows.
+    fn plan_payload_bytes(plan: &ExpertTierPlan) -> u64 {
+        let copies: u64 = [Placement::Device, Placement::HostMapped]
+            .into_iter()
+            .flat_map(|tier| plan.copies(tier))
+            .map(|copy| copy.src.len as u64)
+            .sum();
+        let windows: u64 = plan
+            .host_windows()
+            .iter()
+            .flat_map(|window| window.spans.iter())
+            .map(|(span, _)| span.len as u64)
+            .sum();
+        copies + windows
+    }
+
+    #[test]
+    fn coalesce_merges_contiguous_same_tier_runs_in_both_address_spaces() {
+        let input = [
+            span(100, 10, Placement::Device, 1000),
+            span(110, 20, Placement::Device, 1010),
+            span(130, 5, Placement::Device, 1030),
+        ];
+        let out = coalesce_spans(&input).unwrap();
+        assert_eq!(out, vec![span(100, 35, Placement::Device, 1000)]);
+        assert_eq!(span_bytes(&out), span_bytes(&input));
+
+        let host = [
+            span(0, 256, Placement::HostMapped, 512),
+            span(256, 256, Placement::HostMapped, 768),
+        ];
+        assert_eq!(
+            coalesce_spans(&host).unwrap(),
+            vec![span(0, 512, Placement::HostMapped, 512)]
+        );
+    }
+
+    #[test]
+    fn coalesce_splits_on_source_gap() {
+        let input = [
+            span(100, 10, Placement::Device, 1000),
+            span(111, 10, Placement::Device, 1010),
+        ];
+        let out = coalesce_spans(&input).unwrap();
+        assert_eq!(out, input.to_vec());
+        assert_eq!(span_bytes(&out), 20);
+    }
+
+    #[test]
+    fn coalesce_splits_on_destination_gap() {
+        let input = [
+            span(100, 10, Placement::HostMapped, 1000),
+            span(110, 10, Placement::HostMapped, 1011),
+        ];
+        let out = coalesce_spans(&input).unwrap();
+        assert_eq!(out, input.to_vec());
+        assert_eq!(span_bytes(&out), 20);
+    }
+
+    #[test]
+    fn coalesce_splits_on_tier_change_even_when_contiguous() {
+        let input = [
+            span(100, 10, Placement::Device, 1000),
+            span(110, 10, Placement::HostMapped, 1010),
+            span(120, 10, Placement::Device, 1020),
+        ];
+        let out = coalesce_spans(&input).unwrap();
+        assert_eq!(out, input.to_vec());
+        assert_eq!(span_bytes(&out), 30);
+    }
+
+    #[test]
+    fn coalesce_empty_input_is_empty() {
+        assert_eq!(coalesce_spans(&[]).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn coalesce_rejects_file_end_overflow() {
+        assert!(matches!(
+            err(coalesce_spans(&[span(u64::MAX, 1, Placement::Device, 0)])),
+            ExpertTierOwnerError::Overflow
+        ));
+        assert!(matches!(
+            err(coalesce_spans(&[
+                span(0, 1, Placement::Device, 0),
+                span(u64::MAX - 3, 4, Placement::HostMapped, 0),
+            ])),
+            ExpertTierOwnerError::Overflow
+        ));
+    }
+
+    #[test]
+    fn coalesce_rejects_destination_end_overflow() {
+        assert!(matches!(
+            err(coalesce_spans(&[span(
+                0,
+                1,
+                Placement::HostMapped,
+                u64::MAX
+            )])),
+            ExpertTierOwnerError::Overflow
+        ));
+        assert!(matches!(
+            err(coalesce_spans(&[
+                span(0, 1, Placement::Device, 0),
+                span(1, 4, Placement::Device, u64::MAX - 3),
+            ])),
+            ExpertTierOwnerError::Overflow
+        ));
+    }
+
+    #[test]
+    fn payload_spans_all_host_plan_preserves_logical_bytes() {
+        let plan = all_host_plan();
+        let spans = payload_spans(&plan).unwrap();
+        assert!(!spans.is_empty());
+        assert!(spans
+            .iter()
+            .all(|s| s.tier == Placement::HostMapped && s.len > 0));
+        assert_eq!(span_bytes(&spans), plan_payload_bytes(&plan));
+        assert_eq!(span_bytes(&spans), TOTAL as u64 * (GU + DN) as u64);
+        // Already maximal: a second pass changes nothing.
+        assert_eq!(coalesce_spans(&spans).unwrap(), spans);
+    }
+
+    #[test]
+    fn payload_spans_all_device_plan_preserves_logical_bytes() {
+        let plan = all_device_plan();
+        let spans = payload_spans(&plan).unwrap();
+        assert!(!spans.is_empty());
+        assert!(spans
+            .iter()
+            .all(|s| s.tier == Placement::Device && s.len > 0));
+        assert_eq!(span_bytes(&spans), plan_payload_bytes(&plan));
+        assert_eq!(span_bytes(&spans), TOTAL as u64 * (GU + DN) as u64);
+        assert_eq!(coalesce_spans(&spans).unwrap(), spans);
+    }
+
+    #[test]
+    fn payload_spans_mixed_plan_preserves_logical_bytes_per_tier() {
+        let plan = mixed_plan();
+        let spans = payload_spans(&plan).unwrap();
+        assert_eq!(span_bytes(&spans), plan_payload_bytes(&plan));
+        for tier in [Placement::Device, Placement::HostMapped] {
+            let want: u64 = plan.copies(tier).map(|c| c.src.len as u64).sum();
+            let got: u64 = spans.iter().filter(|s| s.tier == tier).map(|s| s.len).sum();
+            assert!(want > 0);
+            assert_eq!(got, want, "{tier:?}");
+        }
+        assert_eq!(coalesce_spans(&spans).unwrap(), spans);
+    }
+
+    #[test]
+    fn payload_spans_include_host_windows_in_every_plan_mix() {
+        let window_bytes: u64 = mtp_spans().iter().map(|s| s.len as u64).sum();
+        for base in [all_host_plan(), all_device_plan(), mixed_plan()] {
+            let without = payload_spans(&base).unwrap();
+            let plan = base.with_host_window("mtp", &mtp_spans()).unwrap();
+            let spans = payload_spans(&plan).unwrap();
+            assert_eq!(span_bytes(&spans), plan_payload_bytes(&plan));
+            assert_eq!(span_bytes(&spans), span_bytes(&without) + window_bytes);
+            // The far-apart window sources are never merged away.
+            for (src, dst) in &plan.host_windows()[0].spans {
+                assert!(
+                    spans.iter().any(|s| s.tier == Placement::HostMapped
+                        && s.file_offset <= src.offset as u64
+                        && src.offset as u64 + src.len as u64 <= s.file_offset + s.len
+                        && s.dst_offset + (src.offset as u64 - s.file_offset) == *dst),
+                    "window span {src:?} -> {dst} missing"
+                );
+            }
+            assert_eq!(coalesce_spans(&spans).unwrap(), spans);
+        }
+    }
+
+    /// Regression (Q4L identity gate, 526f3b6ba): slab offsets come from the
+    /// sealed HFQ index and are ABSOLUTE file offsets. The direct fill must
+    /// place exactly the bytes the mmap path reads through
+    /// `HfqFile::data_range`, on a real HFQ file whose data section starts at
+    /// a nonzero offset (rebasing on `data_offset` shifts every expert).
+    #[test]
+    fn direct_host_fill_matches_mmap_on_nonzero_data_offset_hfq() {
+        use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqFile, HfqMemTensor};
+        const FGU: usize = 40;
+        const FDN: usize = 24;
+        let path = std::env::temp_dir().join(format!(
+            "q4l-abs-offsets-{}-{:?}.hfq",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let tensors: Vec<HfqMemTensor> = (0..TOTAL)
+            .flat_map(|i| {
+                [("gate_up", FGU, 0usize), ("down", FDN, 1)].map(|(proj, len, p)| {
+                    HfqMemTensor {
+                        name: format!("expert.{i}.{proj}"),
+                        quant_type: 0,
+                        shape: vec![len as u32],
+                        group_size: 0,
+                        // Distinct per tensor and position: any shifted read differs.
+                        data: (0..len)
+                            .map(|j| {
+                                (((i * 2 + p) * 4096 + j) as u32)
+                                    .wrapping_mul(2_654_435_761)
+                                    .rotate_right(13) as u8
+                            })
+                            .collect(),
+                    }
+                })
+            })
+            .collect();
+        write_hfqm_package_mem(&path, 0, "{}", &tensors).unwrap();
+        let hfq = HfqFile::open(&path).unwrap();
+        assert!(
+            hfq.data_offset() > 0,
+            "fixture must have a nonzero data section offset"
+        );
+        let infos = hfq.tensors();
+        let slabs: Vec<ExpertSlab> = (0..TOTAL)
+            .map(|i| {
+                let (gu, dn) = (&infos[2 * i], &infos[2 * i + 1]);
+                ExpertSlab {
+                    format: ExpertFormat::Mq4Xts,
+                    gate_up: ExpertSlabSpan {
+                        offset: gu.data_offset,
+                        len: gu.data_size,
+                    },
+                    down: ExpertSlabSpan {
+                        offset: dn.data_offset,
+                        len: dn.data_size,
+                    },
+                }
+            })
+            .collect();
+        // The fixture detects the rebasing bug: a data_offset-shifted span
+        // reads different bytes (or falls outside the file).
+        let first = slabs[0].gate_up;
+        assert_ne!(
+            hfq.data_range(first.offset + hfq.data_offset() as usize, first.len),
+            hfq.data_range(first.offset, first.len)
+        );
+        let source = DirectSource::open(&hfq).unwrap();
+        let rank = [0u32, 7, 513, 24_575];
+        for plan in [
+            plan_expert_tiers_from_slabs(&slabs, &[], 0).unwrap(),
+            plan_expert_tiers_from_slabs(&slabs, &rank, u64::MAX).unwrap(),
+        ] {
+            let spans = direct_payload_spans(&plan, &source).unwrap();
+            let mut owner = vec![0u8; plan.owner_bytes(Placement::HostMapped) as usize];
+            // SAFETY: `owner` covers the whole host tier, exclusive to the call.
+            unsafe { fill_host_spans(&source, &spans, owner.as_mut_ptr()) }.unwrap();
+            // Device spans carry the file offsets `upload_ranges_to_device`
+            // reads; read them into a host image of the device owner.
+            let mut device = vec![0u8; plan.owner_bytes(Placement::Device) as usize];
+            let device_reads: Vec<HostRangeCopy> = spans
+                .iter()
+                .filter(|span| span.tier == Placement::Device)
+                .map(|span| HostRangeCopy {
+                    file_offset: span.file_offset,
+                    len: span.len as usize,
+                    dst: device[span.dst_offset as usize..].as_mut_ptr(),
+                })
+                .collect();
+            // SAFETY: every extent was checked inside the device owner image.
+            unsafe { hfq_parallel::read_ranges_into_host(&source, &device_reads, 4) }.unwrap();
+            for (tier, image) in [
+                (Placement::HostMapped, &owner),
+                (Placement::Device, &device),
+            ] {
+                for copy in plan.copies(tier) {
+                    let dst = copy.dst_offset as usize;
+                    assert_eq!(
+                        &image[dst..dst + copy.src.len],
+                        hfq.data_range(copy.src.offset, copy.src.len).unwrap(),
+                        "{tier:?} expert {}/{} {:?}",
+                        copy.layer,
+                        copy.expert,
+                        copy.proj
+                    );
+                }
+            }
+        }
+        // A span past EOF is refused before any allocation.
+        let file_len = hfq.file_len() as usize;
+        let past_eof: Vec<ExpertSlab> = slabs
+            .iter()
+            .map(|slab| ExpertSlab {
+                format: slab.format,
+                gate_up: ExpertSlabSpan {
+                    offset: slab.gate_up.offset + file_len,
+                    ..slab.gate_up
+                },
+                down: ExpertSlabSpan {
+                    offset: slab.down.offset + file_len,
+                    ..slab.down
+                },
+            })
+            .collect();
+        let plan = plan_expert_tiers_from_slabs(&past_eof, &[], 0).unwrap();
+        assert!(matches!(
+            direct_payload_spans(&plan, &source),
+            Err(ExpertTierOwnerError::Source(_))
+        ));
+        drop(source);
+        drop(hfq);
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -17,13 +17,22 @@
 //! assembling typed weights, and therefore removes the cell from the store's
 //! cleanup set.
 use crate::device_mesh::{DeviceMesh, MeshEpoch};
+use crate::hfq_parallel::{
+    read_ranges_into_host, upload_ranges_to_device, DeviceRangeCopy, DirectReadStats, DirectSource,
+    HostRangeCopy, HFQ_READER_LANES,
+};
 use crate::mesh_placement::BandPlacement;
 use crate::model_source::{SourceFormat, SourcePayload, SourceRangeDescriptor};
+use crate::offload::HOST_MAPPED_PAD_BYTES;
 use crate::tp_shard::ExpertAssign;
 use crate::weight_manifest::{placement_devices, ShardPolicy, WeightEntry, WeightResidency};
 use rdna_compute::{DType, Gpu, GpuTensor};
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 thread_local! {
     static RESIDENT_ALLOCATIONS: std::cell::Cell<usize> =
@@ -292,6 +301,27 @@ pub struct WeightStore {
     /// separately materialized endpoints. Retained after assembly takes handles.
     aliases: HashMap<WeightPlacementKey, String>,
     origin: Option<WeightOrigin>,
+    /// Logical (unpadded) payload bytes per resident placement, for the
+    /// developer weight digest. A pooled device buffer may be larger than
+    /// the payload it carries.
+    logical_bytes: HashMap<WeightPlacementKey, usize>,
+    /// A host-mapped owner allocated one entry ahead while the previous
+    /// entry's direct read was in flight. It is the newest allocation, so
+    /// [`WeightStore::release_unchecked`] frees it before any journaled
+    /// resident.
+    staged_host: Option<StagedHostAlloc>,
+    /// Set once per fulfillment when the developer digest is enabled; with
+    /// it clear, `logical_bytes` is never touched (zero cost off).
+    capture_logical: bool,
+}
+
+/// See [`WeightStore::staged_host`]. The host address is stored as an integer
+/// so the census stays free of raw pointers.
+struct StagedHostAlloc {
+    index: usize,
+    len: usize,
+    tensor: GpuTensor,
+    host: usize,
 }
 
 /// The only owner that may roll back resident allocations before publication.
@@ -432,6 +462,9 @@ impl WeightStore {
             journal: Vec::new(),
             aliases: HashMap::new(),
             origin: Some(origin),
+            logical_bytes: HashMap::new(),
+            staged_host: None,
+            capture_logical: false,
         }
     }
 
@@ -536,6 +569,12 @@ impl WeightStore {
         self.projections.insert(key, projection);
         Ok(())
     }
+
+    fn note_logical_bytes(&mut self, key: &WeightPlacementKey, bytes: usize) {
+        if self.capture_logical {
+            self.logical_bytes.insert(key.clone(), bytes);
+        }
+    }
     /// Record an external range in the census without creating a placement
     /// handle or journal entry.
     fn record_external(
@@ -631,6 +670,11 @@ impl WeightStore {
     /// buffer and are removed without GPU work.
     fn release_unchecked(mut self, gpu: &mut Gpu) -> hip_bridge::HipResult<()> {
         let mut first_error = None;
+        if let Some(staged) = self.staged_host.take() {
+            if let Err(error) = gpu.free_tensor(staged.tensor) {
+                first_error.get_or_insert(error);
+            }
+        }
         for key in self.journal.drain(..).rev() {
             let handle = match self.placements.remove(&key) {
                 Some(handle) => handle,
@@ -1101,6 +1145,446 @@ fn upload_range_pooled(
     Ok(tensor)
 }
 
+/// Fulfillment-local lookahead for [`upload_range_host_direct`]: the next
+/// host-mapped entry's payload (fetched once, consumed by its own iteration)
+/// and the error of its early pinned allocation, reported when that entry's
+/// turn comes so failures keep their sequential attribution.
+#[derive(Default)]
+struct HostLookahead<'a> {
+    payload: Option<(usize, Result<SourcePayload<'a>, String>)>,
+    alloc_error: Option<(usize, String)>,
+}
+
+/// Fetch the payload of `weights[next]` when it is a plain host-mapped entry
+/// and report `(index, len)` when it is a non-empty source range, so its
+/// pinned owner can be allocated while the current read runs.
+fn peek_next_host_range<'a, F>(
+    weights: &[WeightEntry],
+    next: usize,
+    ep: Option<EpFulfill>,
+    source: &F,
+    look: &mut HostLookahead<'a>,
+) -> Option<(usize, usize)>
+where
+    F: Fn(&WeightEntry) -> Result<SourcePayload<'a>, String>,
+{
+    let entry = weights.get(next)?;
+    if entry.residency != WeightResidency::HostMapped
+        || matches!(entry.policy, ShardPolicy::Tied { .. })
+        || (ep.is_some() && matches!(entry.policy, ShardPolicy::ExpertSharded { .. }))
+    {
+        return None;
+    }
+    let payload = source(entry);
+    let len = match &payload {
+        Ok(SourcePayload::Range(descriptor)) => usize::try_from(descriptor.length)
+            .ok()
+            .filter(|&len| len != 0),
+        _ => None,
+    };
+    look.payload = Some((next, payload));
+    len.map(|len| (next, len))
+}
+
+/// Per-tensor read buckets of a direct read. The reader emits no timers.
+fn record_direct_stats(stats: &DirectReadStats) {
+    use rdna_compute::load_phases::add;
+    if stats.bytes_direct != 0 || stats.direct_read_ns != 0 {
+        add(
+            "weights.direct_read",
+            stats.direct_read_ns,
+            stats.bytes_direct,
+        );
+    }
+    if stats.bytes_buffered != 0 || stats.buffered_read_ns != 0 {
+        add(
+            "weights.buffered_read",
+            stats.buffered_read_ns,
+            stats.bytes_buffered,
+        );
+    }
+    if stats.h2d_ns != 0 {
+        add(
+            "weights.h2d",
+            stats.h2d_ns,
+            stats.bytes_direct + stats.bytes_buffered,
+        );
+    }
+}
+
+/// A direct read addresses absolute offsets of the file `direct` was opened
+/// on; refuse a descriptor sealed against any other file (or an overlay).
+fn check_direct_identity(
+    direct: &DirectSource,
+    descriptor: &SourceRangeDescriptor,
+) -> Result<(), String> {
+    match descriptor.source_identity().files.as_slice() {
+        [file] if file == direct.file_identity() => Ok(()),
+        _ => Err(
+            "source range is not sealed against the direct reader's file; refusing direct read"
+                .to_string(),
+        ),
+    }
+}
+
+/// Direct-read twin of [`upload_range_pooled`]: same pooled allocation, same
+/// zeroed tail pad, but the whole file range streams through the pinned
+/// double-buffered reader instead of the descriptor's positional reader.
+fn upload_range_direct_device(
+    gpu: &mut Gpu,
+    direct: &DirectSource,
+    descriptor: &SourceRangeDescriptor,
+    dtype: DType,
+    logical_shape: &[usize],
+    tail_pad: usize,
+) -> Result<GpuTensor, String> {
+    let payload_len = usize::try_from(descriptor.length)
+        .map_err(|_| "source range length does not fit usize".to_string())?;
+    if payload_len == 0 {
+        return Err("source range has zero length".to_string());
+    }
+    let alignment = quant_block_bytes(dtype);
+    if payload_len % alignment != 0 {
+        return Err(format!(
+            "source range length {payload_len} is not aligned to {alignment}-byte blocks for {dtype:?}"
+        ));
+    }
+    check_direct_identity(direct, descriptor)?;
+    let alloc_started = std::time::Instant::now();
+    let mut tensor = gpu
+        .alloc_tensor(&[payload_len + tail_pad], DType::Raw)
+        .map_err(|error| format!("pooled allocation failed: {error}"))?;
+    rdna_compute::load_phases::add(
+        "weights.device_alloc",
+        rdna_compute::load_phases::ns_since(alloc_started),
+        (payload_len + tail_pad) as u64,
+    );
+    let result = (|| {
+        if tail_pad != 0 {
+            // A pooled buffer may be recycled: the pad must read as zeros.
+            gpu.hip
+                .memcpy_htod_offset(&tensor.buf, payload_len, &vec![0u8; tail_pad])
+                .map_err(|error| format!("pooled tail pad upload failed: {error}"))?;
+        }
+        let copy = [DeviceRangeCopy {
+            file_offset: descriptor.offset,
+            len: payload_len,
+            dst: &tensor.buf,
+            dst_offset: 0,
+        }];
+        let started = std::time::Instant::now();
+        let stats = upload_ranges_to_device(gpu, direct, &copy, HFQ_READER_LANES)
+            .map_err(|error| format!("direct source range upload failed: {error}"))?;
+        rdna_compute::load_phases::add(
+            "weights.device_upload",
+            rdna_compute::load_phases::ns_since(started),
+            payload_len as u64,
+        );
+        record_direct_stats(&stats);
+        Ok::<(), String>(())
+    })();
+    if let Err(error) = result {
+        let _ = gpu.free_tensor(tensor);
+        return Err(error);
+    }
+    descriptor.release_uploaded(descriptor.offset, descriptor.length);
+    tensor.shape = logical_shape.to_vec();
+    Ok(tensor)
+}
+
+fn read_host_range(
+    direct: &DirectSource,
+    file_offset: u64,
+    len: usize,
+    dst: usize,
+) -> Result<DirectReadStats, String> {
+    let copy = [HostRangeCopy {
+        file_offset,
+        len,
+        dst: dst as *mut u8,
+    }];
+    // SAFETY: `dst` is the host pointer of a live pinned allocation of at
+    // least `len` bytes that nothing else references until the caller joins
+    // this read.
+    unsafe { read_ranges_into_host(direct, &copy, HFQ_READER_LANES) }
+        .map_err(|error| format!("direct source range read failed: {error}"))
+}
+
+/// Fill one host-mapped owner straight from the file. The owner comes from
+/// `store.staged_host` when the previous entry staged it, else is allocated
+/// now. While this entry's read runs on its own thread, the next host-mapped
+/// entry's pinned owner (`next`) is allocated on the calling thread, which is
+/// the only one that may touch `gpu`; allocation order stays manifest order.
+/// An early allocation failure is deferred to `alloc_error` and surfaces at
+/// that entry's own turn.
+#[allow(clippy::too_many_arguments)]
+fn upload_range_host_direct(
+    gpu: &mut Gpu,
+    store: &mut WeightStore,
+    direct: &DirectSource,
+    index: usize,
+    descriptor: &SourceRangeDescriptor,
+    shape: &[usize],
+    next: Option<(usize, usize, &[usize])>,
+    alloc_error: &mut Option<(usize, String)>,
+) -> Result<GpuTensor, String> {
+    let len = usize::try_from(descriptor.length)
+        .map_err(|_| "source range length does not fit usize".to_string())?;
+    if len == 0 {
+        return Err("source range has zero length".to_string());
+    }
+    check_direct_identity(direct, descriptor)?;
+    let (tensor, host) = match store.staged_host.take() {
+        Some(staged) if staged.index == index && staged.len == len => {
+            (staged.tensor, staged.host as *mut u8)
+        }
+        stale => {
+            if let Some(stale) = stale {
+                let _ = gpu.free_tensor(stale.tensor);
+            }
+            if let Some((failed, message)) = alloc_error.take() {
+                if failed == index {
+                    return Err(format!("host-mapped allocation failed: {message}"));
+                }
+            }
+            gpu.alloc_raw_host_mapped(len, shape)
+                .map_err(|error| format!("host-mapped allocation failed: {error}"))?
+        }
+    };
+    let host_addr = host as usize;
+    let file_offset = descriptor.offset;
+    let (read, next_alloc) = std::thread::scope(|scope| {
+        let reader = scope.spawn(move || read_host_range(direct, file_offset, len, host_addr));
+        let next_alloc = next.map(|(next_index, next_len, next_shape)| {
+            (
+                next_index,
+                next_len,
+                gpu.alloc_raw_host_mapped(next_len, next_shape),
+            )
+        });
+        let read = reader
+            .join()
+            .unwrap_or_else(|_| Err("direct reader thread panicked".to_string()));
+        (read, next_alloc)
+    });
+    match next_alloc {
+        Some((next_index, next_len, Ok((next_tensor, next_host)))) => {
+            store.staged_host = Some(StagedHostAlloc {
+                index: next_index,
+                len: next_len,
+                tensor: next_tensor,
+                host: next_host as usize,
+            });
+        }
+        Some((next_index, _, Err(error))) => {
+            *alloc_error = Some((next_index, error.to_string()));
+        }
+        None => {}
+    }
+    let stats = match read {
+        Ok(stats) => stats,
+        Err(reason) => {
+            // Newest allocation first, mirroring reverse-order rollback.
+            if let Some(staged) = store.staged_host.take() {
+                let _ = gpu.free_tensor(staged.tensor);
+            }
+            let _ = gpu.free_tensor(tensor);
+            return Err(reason);
+        }
+    };
+    // SAFETY: `host` is a live pinned allocation of `len +
+    // HOST_MAPPED_PAD_BYTES` bytes and the read has completed.
+    unsafe {
+        std::ptr::write_bytes(host.add(len), 0, HOST_MAPPED_PAD_BYTES as usize);
+    }
+    record_direct_stats(&stats);
+    descriptor.release_uploaded(descriptor.offset, descriptor.length);
+    Ok(tensor)
+}
+
+/// Chunk size of device downloads while hashing a resident tensor.
+const WEIGHT_DIGEST_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Serializes digest appends of concurrent ranks/bands in one process; each
+/// batch is also a single `O_APPEND` write, which keeps records whole across
+/// processes.
+static WEIGHT_DIGEST_APPEND: Mutex<()> = Mutex::new(());
+
+fn append_digest_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let _guard = WEIGHT_DIGEST_APPEND
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .write_all(bytes)
+}
+
+/// Path of the developer weight digest, from `HIPFIRE_LOAD_WEIGHT_DIGEST`.
+pub fn weight_digest_path() -> Option<PathBuf> {
+    hipfire_config::memory::load_weight_digest_path()
+}
+
+/// Create or empty the digest file so a load starts from a clean record.
+pub fn truncate_weight_digest(path: &Path) -> io::Result<()> {
+    std::fs::File::create(path).map(|_| ())
+}
+
+/// Incremental SHA-256 for callers hashing a logical payload from several
+/// spans.
+pub struct Sha256Stream(Sha256);
+
+impl Sha256Stream {
+    pub fn new() -> Self {
+        Self(Sha256::new())
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    pub fn finish_hex(self) -> String {
+        hex_lower(&self.0.finalize())
+    }
+}
+
+impl Default for Sha256Stream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(DIGITS[usize::from(byte >> 4)] as char);
+        out.push(DIGITS[usize::from(byte & 15)] as char);
+    }
+    out
+}
+
+/// SHA-256 of `bytes`, lowercase hex.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex_lower(&Sha256::digest(bytes))
+}
+
+/// SHA-256 of `len` bytes at `offset` of a device buffer, downloaded in
+/// bounded chunks so a whole-VRAM tensor is never staged on the host at once.
+pub fn sha256_hex_device(
+    gpu: &Gpu,
+    buf: &hip_bridge::DeviceBuffer,
+    offset: usize,
+    len: usize,
+) -> Result<String, String> {
+    if offset.checked_add(len).is_none_or(|end| end > buf.size()) {
+        return Err(format!(
+            "digest range {offset}+{len} exceeds device buffer of {} bytes",
+            buf.size()
+        ));
+    }
+    gpu.bind_thread().map_err(|error| error.to_string())?;
+    let mut stream = Sha256Stream::new();
+    let mut chunk = vec![0u8; len.min(WEIGHT_DIGEST_CHUNK_BYTES)];
+    let mut done = 0usize;
+    while done < len {
+        let take = (len - done).min(WEIGHT_DIGEST_CHUNK_BYTES);
+        gpu.hip
+            .memcpy_dtoh_at(&mut chunk[..take], buf, offset + done)
+            .map_err(|error| format!("digest download failed: {error}"))?;
+        stream.update(&chunk[..take]);
+        done += take;
+    }
+    Ok(stream.finish_hex())
+}
+
+/// One JSONL digest record.
+pub struct WeightDigestRow<'a> {
+    pub name: &'a str,
+    pub layer: Option<usize>,
+    pub residency: &'a str,
+    pub dtype: &'a str,
+    pub logical_bytes: u64,
+    pub sha256: &'a str,
+}
+
+fn weight_digest_line(row: &WeightDigestRow<'_>) -> String {
+    serde_json::json!({
+        "name": row.name,
+        "layer": row.layer,
+        "residency": row.residency,
+        "dtype": row.dtype,
+        "logical_bytes": row.logical_bytes,
+        "sha256": row.sha256,
+    })
+    .to_string()
+}
+
+/// Append one record: whole line serialized first, then one locked
+/// `O_APPEND` write.
+pub fn append_weight_digest_line(path: &Path, row: &WeightDigestRow<'_>) -> io::Result<()> {
+    let mut line = weight_digest_line(row).into_bytes();
+    line.push(b'\n');
+    append_digest_bytes(path, &line)
+}
+
+/// Append one digest record per resident placement of a freshly fulfilled
+/// transaction, in allocation order. Hashes logical payload bytes only (the
+/// exact stored size, so compact expert shards hash their shard): a
+/// host-mapped owner is hashed in place, a device tensor is downloaded in
+/// bounded chunks; tail pads are excluded. Aliases and external rows own no
+/// bytes and are skipped. The whole batch is serialized first and appended in
+/// one locked write, so concurrent ranks never interleave lines. Returns the
+/// number of records written.
+pub fn write_weight_digest(
+    path: &Path,
+    transaction: &WeightLoadTransaction,
+    gpu: &Gpu,
+) -> io::Result<usize> {
+    let Some(store) = transaction.store.as_ref() else {
+        return Ok(0);
+    };
+    let mut out = Vec::new();
+    let mut rows = 0usize;
+    for key in &store.journal {
+        let Some(WeightHandle::Resident(tensor)) = store.placements.get(key) else {
+            continue;
+        };
+        let logical = store
+            .logical_bytes
+            .get(key)
+            .copied()
+            .unwrap_or_else(|| tensor.buf.size());
+        let (residency, sha256) = if tensor.buf.is_host_mapped() {
+            let host = gpu.host_bytes(tensor).and_then(|host| host.get(..logical));
+            let host = host.ok_or_else(|| {
+                io::Error::other(format!("host-mapped digest range missing for {}", key.name))
+            })?;
+            ("host_mapped", sha256_hex(host))
+        } else {
+            let hash = sha256_hex_device(gpu, &tensor.buf, 0, logical).map_err(io::Error::other)?;
+            ("device", hash)
+        };
+        let dtype = format!("{:?}", tensor.dtype);
+        out.extend_from_slice(
+            weight_digest_line(&WeightDigestRow {
+                name: &key.name,
+                layer: key.layer,
+                residency,
+                dtype: &dtype,
+                logical_bytes: logical as u64,
+                sha256: &sha256,
+            })
+            .as_bytes(),
+        );
+        out.push(b'\n');
+        rows += 1;
+    }
+    append_digest_bytes(path, &out)?;
+    Ok(rows)
+}
+
 fn rollback_fulfill_error(
     store: WeightStore,
     gpu: &mut Gpu,
@@ -1562,7 +2046,7 @@ fn upload_expert_compact(
     n_experts: usize,
     assign: ExpertAssign,
     payload: SourcePayload<'_>,
-) -> Result<(GpuTensor, DType), String> {
+) -> Result<(GpuTensor, DType, usize), String> {
     let (info, bytes): (&crate::model_source::TensorInfo, &[u8]) = match &payload {
         SourcePayload::Borrowed { info, bytes } => (info, bytes),
         SourcePayload::Owned { info, bytes } => (info, bytes.as_slice()),
@@ -1588,7 +2072,7 @@ fn upload_expert_compact(
     let mut tensor = upload_resident_bytes(gpu, entry.residency, &compact, &shape)
         .map_err(|error| format!("pooled upload failed: {error}"))?;
     tensor.dtype = dtype;
-    Ok((tensor, dtype))
+    Ok((tensor, dtype, compact.len()))
 }
 
 /// Fulfill a Single manifest from the canonical source payload seam.
@@ -1629,6 +2113,33 @@ pub fn fulfill_manifest_from_payloads_ep<'a, F>(
 where
     F: Fn(&WeightEntry) -> Result<SourcePayload<'a>, String>,
 {
+    fulfill_manifest_from_payloads_direct(weights, mesh, n_layers, gpu, expected, ep, None, source)
+}
+
+/// [`fulfill_manifest_from_payloads_ep`] with an optional [`DirectSource`].
+/// With `direct == None` this is exactly the existing path. With
+/// `Some(direct)` every [`SourcePayload::Range`] entry (device-resident and
+/// host-mapped) is read straight from its absolute file offset in the file
+/// `direct` was opened on: host-mapped owners are allocated through
+/// `Gpu::alloc_raw_host_mapped`, filled by the parallel reader and tail-zeroed,
+/// with the next host-mapped entry's owner allocated while the current read is
+/// in flight; device owners use the pooled allocation of the buffered range
+/// path. Borrowed and Owned payloads are untouched, and expert-parallel
+/// `ExpertSharded` stacks still require them.
+#[allow(clippy::too_many_arguments)]
+pub fn fulfill_manifest_from_payloads_direct<'a, F>(
+    weights: &[WeightEntry],
+    mesh: &DeviceMesh,
+    n_layers: usize,
+    gpu: &mut Gpu,
+    expected: WeightOrigin,
+    ep: Option<EpFulfill>,
+    direct: Option<&DirectSource>,
+    source: F,
+) -> Result<WeightLoadTransaction, FulfillError>
+where
+    F: Fn(&WeightEntry) -> Result<SourcePayload<'a>, String>,
+{
     if let Some(error) = target_error(mesh) {
         return Err(error);
     }
@@ -1660,7 +2171,9 @@ where
         reason,
     })?;
     let mut store = WeightStore::with_origin(origin);
-    for entry in weights {
+    let mut look = HostLookahead::default();
+    store.capture_logical = weight_digest_path().is_some();
+    for (entry_index, entry) in weights.iter().enumerate() {
         let devices = placement_devices(entry, mesh, &placement);
         if devices.as_slice() != [0] {
             return Err(rollback_fulfill_error(
@@ -1737,7 +2250,7 @@ where
                     ));
                 }
             };
-            let (tensor, dtype) =
+            let (tensor, dtype, logical) =
                 match upload_expert_compact(gpu, entry, ep, *n_experts, *assign, payload) {
                     Ok(uploaded) => uploaded,
                     Err(reason) => {
@@ -1748,6 +2261,7 @@ where
                         ));
                     }
                 };
+            store.note_logical_bytes(&key, logical);
             let projection = projection_for(entry, ep.rank, ep.ranks, dtype);
             if let Err(reason) = store.insert(key, WeightHandle::Resident(tensor), projection) {
                 return Err(rollback_fulfill_error(
@@ -1766,7 +2280,11 @@ where
             continue;
         }
         let read_entry = fulfillment_source(entry);
-        let payload = match source(&read_entry) {
+        let fetched = match look.payload.take() {
+            Some((index, prefetched)) if index == entry_index => prefetched,
+            _ => source(&read_entry),
+        };
+        let payload = match fetched {
             Ok(payload) => payload,
             Err(reason) => {
                 return Err(rollback_fulfill_error(
@@ -1863,6 +2381,7 @@ where
                         ));
                     }
                 };
+                store.note_logical_bytes(&key, bytes.len());
                 let projection = projection_for(entry, 0, 1, dtype);
                 if let Err(reason) = store.insert(key, WeightHandle::Resident(tensor), projection) {
                     return Err(rollback_fulfill_error(
@@ -1945,6 +2464,7 @@ where
                             ));
                         }
                     };
+                store.note_logical_bytes(&key, bytes.len());
                 let projection = projection_for(entry, 0, 1, dtype);
                 if let Err(reason) = store.insert(key, WeightHandle::Resident(tensor), projection) {
                     return Err(rollback_fulfill_error(
@@ -2041,23 +2561,50 @@ where
                     }
                     continue;
                 }
-                if entry.residency == WeightResidency::HostMapped {
-                    return Err(rollback_fulfill_error(
-                        store,
+                let uploaded = match (entry.residency, direct) {
+                    (WeightResidency::HostMapped, None) => {
+                        return Err(rollback_fulfill_error(
+                            store,
+                            gpu,
+                            fulfill_entry_error(
+                                entry,
+                                "host-mapped residency needs a borrowed or owned payload, not a source range",
+                            ),
+                        ));
+                    }
+                    (WeightResidency::HostMapped, Some(direct)) => {
+                        let next =
+                            peek_next_host_range(weights, entry_index + 1, ep, &source, &mut look);
+                        upload_range_host_direct(
+                            gpu,
+                            &mut store,
+                            direct,
+                            entry_index,
+                            &descriptor,
+                            &entry.logical_shape,
+                            next.map(|(index, len)| {
+                                (index, len, weights[index].logical_shape.as_slice())
+                            }),
+                            &mut look.alloc_error,
+                        )
+                    }
+                    (_, Some(direct)) => upload_range_direct_device(
                         gpu,
-                        fulfill_entry_error(
-                            entry,
-                            "host-mapped residency needs a borrowed or owned payload, not a source range",
-                        ),
-                    ));
-                }
-                let tensor = match upload_range_pooled(
-                    gpu,
-                    &descriptor,
-                    dtype,
-                    &entry.logical_shape,
-                    range_tail_pad(entry),
-                ) {
+                        direct,
+                        &descriptor,
+                        dtype,
+                        &entry.logical_shape,
+                        range_tail_pad(entry),
+                    ),
+                    (_, None) => upload_range_pooled(
+                        gpu,
+                        &descriptor,
+                        dtype,
+                        &entry.logical_shape,
+                        range_tail_pad(entry),
+                    ),
+                };
+                let tensor = match uploaded {
                     Ok(mut tensor) => {
                         tensor.dtype = dtype;
                         tensor
@@ -2070,6 +2617,7 @@ where
                         ));
                     }
                 };
+                store.note_logical_bytes(&key, range_len);
                 let projection = projection_for(entry, 0, 1, dtype);
                 if let Err(reason) = store.insert(key, WeightHandle::Resident(tensor), projection) {
                     return Err(rollback_fulfill_error(
@@ -2093,6 +2641,9 @@ where
                 source.clone(),
             );
         }
+    }
+    if let Some(staged) = store.staged_host.take() {
+        let _ = gpu.free_tensor(staged.tensor);
     }
     Ok(WeightLoadTransaction::new(store))
 }
@@ -3015,5 +3566,175 @@ mod tests {
         assert_eq!(source_dtype("BF16").unwrap(), DType::BF16);
         assert_eq!(source_dtype("mq4g128v2").unwrap(), DType::MQ4G128V2);
         assert!(source_dtype("I64").is_err());
+    }
+
+    #[test]
+    fn sha256_helpers_match_known_vectors_and_stream_split() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let mut stream = Sha256Stream::new();
+        stream.update(b"a");
+        stream.update(b"");
+        stream.update(b"bc");
+        assert_eq!(stream.finish_hex(), sha256_hex(b"abc"));
+    }
+
+    #[test]
+    fn digest_rows_append_as_whole_jsonl_lines_and_truncate_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("digest.jsonl");
+        append_weight_digest_line(
+            &path,
+            &WeightDigestRow {
+                name: "wq",
+                layer: Some(3),
+                residency: "device",
+                dtype: "Q4F16G64",
+                logical_bytes: 4096,
+                sha256: &sha256_hex(b"abc"),
+            },
+        )
+        .unwrap();
+        append_weight_digest_line(
+            &path,
+            &WeightDigestRow {
+                name: "qwen4.expert_tiers.host",
+                layer: None,
+                residency: "host_mapped",
+                dtype: "expert_payload",
+                logical_bytes: 7,
+                sha256: &sha256_hex(b""),
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.ends_with('\n'));
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["name"], "wq");
+        assert_eq!(rows[0]["layer"], 3);
+        assert_eq!(rows[0]["residency"], "device");
+        assert_eq!(rows[0]["dtype"], "Q4F16G64");
+        assert_eq!(rows[0]["logical_bytes"], 4096);
+        assert_eq!(rows[0]["sha256"], sha256_hex(b"abc"));
+        assert!(rows[1]["layer"].is_null());
+        assert_eq!(rows[1]["residency"], "host_mapped");
+        assert!(text.lines().next().unwrap().starts_with("{\"name\":\"wq\""));
+        truncate_weight_digest(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    }
+
+    #[test]
+    fn logical_bytes_are_captured_only_when_digest_enabled() {
+        let key = WeightPlacementKey::new("wq", Some(0), 0);
+        let mut store = WeightStore::default();
+        store.note_logical_bytes(&key, 64);
+        assert!(
+            store.logical_bytes.is_empty(),
+            "off by default: no map growth"
+        );
+        store.capture_logical = true;
+        store.note_logical_bytes(&key, 64);
+        assert_eq!(store.logical_bytes.get(&key), Some(&64));
+    }
+
+    fn descriptor_sealed_to(
+        files: Vec<crate::model_source::SourceFileIdentity>,
+    ) -> SourceRangeDescriptor {
+        let identity = SourceIdentity {
+            canonical_path: PathBuf::from("/test/source"),
+            format: SourceFormat::Safetensors,
+            files,
+            metadata_json: "{}".to_string(),
+            manifest: Vec::new(),
+        };
+        let reader = SourceReader::from_inner(TestRangeReader {
+            identity: identity.clone(),
+            bytes: vec![0u8; 8],
+        });
+        SourceRangeDescriptor::from_parts(
+            Arc::new(identity),
+            0,
+            8,
+            "Q4K".to_string(),
+            vec![8],
+            reader,
+        )
+        .expect("test descriptor has a checked range")
+    }
+
+    #[test]
+    fn direct_identity_accepts_only_the_readers_own_single_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.hfq");
+        let other_path = dir.path().join("b.hfq");
+        std::fs::write(&path, vec![1u8; 4096]).unwrap();
+        std::fs::write(&other_path, vec![2u8; 8192]).unwrap();
+        let direct = DirectSource::open_path(&path).unwrap();
+        let other = DirectSource::open_path(&other_path).unwrap();
+
+        let matching = descriptor_sealed_to(vec![direct.file_identity().clone()]);
+        assert!(check_direct_identity(&direct, &matching).is_ok());
+        assert!(check_direct_identity(&other, &matching).is_err());
+
+        let none = descriptor_sealed_to(Vec::new());
+        assert!(check_direct_identity(&direct, &none).is_err());
+
+        let overlay = descriptor_sealed_to(vec![
+            direct.file_identity().clone(),
+            other.file_identity().clone(),
+        ]);
+        assert!(check_direct_identity(&direct, &overlay).is_err());
+    }
+
+    /// Offset-base guard for the direct weight path: a sealed HFQ descriptor
+    /// carries the ABSOLUTE file offset, and the direct host reader reads it
+    /// unchanged, on a real HFQ whose data section starts at a nonzero offset.
+    #[test]
+    fn direct_host_read_uses_absolute_descriptor_offsets_on_nonzero_data_offset_hfq() {
+        use crate::hfq::{write_hfqm_package_mem, HfqFile, HfqMemTensor};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("abs.hfq");
+        let tensors: Vec<HfqMemTensor> = (0..3u32)
+            .map(|t| HfqMemTensor {
+                name: format!("w{t}"),
+                quant_type: 2,
+                shape: vec![1024 + 4 * t],
+                group_size: 0,
+                data: (0..(1024 + 4 * t) * 4)
+                    .map(|j| (t * 7919 + j).wrapping_mul(2_654_435_761).rotate_right(13) as u8)
+                    .collect(),
+            })
+            .collect();
+        write_hfqm_package_mem(&path, 0, "{}", &tensors).unwrap();
+        let hfq = HfqFile::open(&path).unwrap();
+        assert!(hfq.data_offset() > 0);
+        let direct = DirectSource::open(&hfq).unwrap();
+        for tensor in &tensors {
+            let descriptor = hfq.tensor_range(&tensor.name).unwrap().unwrap();
+            check_direct_identity(&direct, &descriptor).unwrap();
+            assert!(
+                descriptor.offset >= hfq.data_offset(),
+                "descriptor offset is absolute"
+            );
+            let mut got = vec![0u8; descriptor.length as usize];
+            read_host_range(
+                &direct,
+                descriptor.offset,
+                got.len(),
+                got.as_mut_ptr() as usize,
+            )
+            .unwrap();
+            assert_eq!(got, tensor.data, "{}", tensor.name);
+        }
     }
 }

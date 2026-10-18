@@ -2236,6 +2236,7 @@ pub struct HfqModelSource {
     hfq: HfqFile,
     infos: Vec<crate::model_source::TensorInfo>,
     index: std::collections::HashMap<String, usize>,
+    prefer_ranges: bool,
 }
 
 impl HfqModelSource {
@@ -2261,7 +2262,16 @@ impl HfqModelSource {
                 }
             })
             .collect();
-        Self { hfq, infos, index }
+        Self {
+            hfq,
+            infos,
+            index,
+            prefer_ranges: false,
+        }
+    }
+    /// Prefer checked file ranges without discarding the discrete-GPU mmap.
+    pub fn set_prefer_ranges(&mut self, enabled: bool) {
+        self.prefer_ranges = enabled;
     }
     pub fn source_identity(&self) -> Result<Arc<SourceIdentity>, SourceError> {
         self.hfq.source_identity()
@@ -2312,6 +2322,19 @@ impl crate::model_source::ModelSource for HfqModelSource {
     }
     fn tensor_range(&self, name: &str) -> Result<Option<SourceRangeDescriptor>, SourceError> {
         HfqModelSource::tensor_range(self, name)
+    }
+
+    fn tensor_payload<'a>(
+        &'a self,
+        name: &str,
+    ) -> Result<Option<crate::model_source::SourcePayload<'a>>, SourceError> {
+        use crate::model_source::SourcePayload;
+        if !self.prefer_ranges {
+            if let Some((info, bytes)) = self.tensor_data(name) {
+                return Ok(Some(SourcePayload::Borrowed { info, bytes }));
+            }
+        }
+        Ok(self.tensor_range(name)?.map(SourcePayload::Range))
     }
 
     fn tensor_names(&self) -> Vec<&str> {
@@ -3759,6 +3782,33 @@ mod compact_qwen4_ple_tests {
     };
     use super::*;
     use crate::model_source::{ModelSource, SourceError, SourceFormat, SourcePayload};
+
+    #[test]
+    fn direct_source_range_preference_retains_mmap_and_old_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("range-preference.hfq");
+        write_compact_qwen4_ple_hfq(&path).unwrap();
+        let mut source = HfqModelSource::from_hfq(HfqFile::open(&path).unwrap());
+        let name = COMPACT_PLE_NAMES[0];
+        assert!(matches!(
+            source.tensor_payload(name).unwrap(),
+            Some(SourcePayload::Borrowed { .. })
+        ));
+        let expected = source.tensor_data(name).unwrap().1.to_vec();
+        source.set_prefer_ranges(true);
+        let Some(SourcePayload::Range(range)) = source.tensor_payload(name).unwrap() else {
+            panic!("direct source must prefer checked ranges");
+        };
+        let mut actual = vec![0; expected.len()];
+        range.read_exact(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(source.tensor_data(name).unwrap().1, expected);
+        source.set_prefer_ranges(false);
+        assert!(matches!(
+            source.tensor_payload(name).unwrap(),
+            Some(SourcePayload::Borrowed { .. })
+        ));
+    }
 
     fn range(hfq: &HfqFile, name: &str) -> SourceRangeDescriptor {
         let source: &dyn ModelSource = hfq;

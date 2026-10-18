@@ -1972,6 +1972,30 @@ fn load_qwen4_rank_scoped(
     if use_ranges {
         hfq.drop_mmap();
     }
+    // Direct weight reads (HIPFIRE_QWEN4_DIRECT_LOAD, default on; exactly
+    // `0` is the old mmap + single-thread-copy path): discrete GPUs only.
+    let direct_source = if use_ranges || !hipfire_config::memory::qwen4_direct_load() {
+        None
+    } else if hfq.has_overlay() {
+        None
+    } else {
+        Some(
+            hipfire_runtime::hfq_parallel::DirectSource::open(&hfq)
+                .map_err(|error| format!("qwen4: direct load: {error}"))?,
+        )
+    };
+    match &direct_source {
+        Some(direct) => eprintln!(
+            "  qwen4 direct load: on ({} lanes, {})",
+            hipfire_runtime::hfq_parallel::HFQ_READER_LANES,
+            if direct.is_direct_available() {
+                "O_DIRECT"
+            } else {
+                "buffered-only"
+            }
+        ),
+        None => eprintln!("  qwen4 direct load: off"),
+    }
     // The state formats (memory.kv_cache for QSA, state_quant for GDN),
     // resolved before any allocation.
     let state_format = hipfire_arch_qwen4::resolve_state_format(
@@ -2749,21 +2773,35 @@ fn load_qwen4_rank_scoped(
     // check mode verifies it unchanged instead of snapshotting it (§2.4).
     let weights_role =
         hip_bridge::registry::role_scope(hip_bridge::registry::AllocationRole::Weights);
+    // HIPFIRE_LOAD_WEIGHT_DIGEST: every rank/band appends its records after
+    // a successful fulfillment (and the hot-set materialization below
+    // appends too). Only a single-device load truncates the file; an EP/PP
+    // run's caller supplies a fresh path.
+    let digest_path = hipfire_config::memory::load_weight_digest_path();
+    if let Some(path) = digest_path.as_deref() {
+        if ep.is_none() && band.is_none() {
+            hipfire_runtime::weight_store::truncate_weight_digest(path)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+        }
+    }
     let expert_tiers = if let Some((plan, budget)) = hotset_plan {
         use hipfire_arch_qwen4::expert_tier_plan::Placement;
         let device_experts = plan.device_experts();
         let tiers_io0 = rdna_compute::load_phases::thread_io();
         let tiers_started = std::time::Instant::now();
-        let lease = hipfire_arch_qwen4::expert_tier_owners::materialize(
-            ctx.gpu,
-            plan,
-            &|offset, len| {
-                let offset = usize::try_from(offset).map_err(|_| "hotset source offset overflow")?;
-                let len = usize::try_from(len).map_err(|_| "hotset source length overflow")?;
-                hfq.data_range(offset, len)
-                    .ok_or_else(|| format!("HIPFIRE_QWEN4_EXPERT_HOTSET: source span {offset}+{len} is outside the artifact mmap"))
-            },
-        ).map_err(|error| format!(
+        let source = |offset, len| {
+            let offset = usize::try_from(offset).map_err(|_| "hotset source offset overflow")?;
+            let len = usize::try_from(len).map_err(|_| "hotset source length overflow")?;
+            hfq.data_range(offset, len)
+                .ok_or_else(|| format!("HIPFIRE_QWEN4_EXPERT_HOTSET: source span {offset}+{len} is outside the artifact mmap"))
+        };
+        let lease = if let Some(direct) = direct_source.as_ref() {
+            hipfire_arch_qwen4::expert_tier_owners::materialize_direct(
+                ctx.gpu, plan, direct, &source,
+            )
+        } else {
+            hipfire_arch_qwen4::expert_tier_owners::materialize(ctx.gpu, plan, &source)
+        }.map_err(|error| format!(
             "HIPFIRE_QWEN4_EXPERT_HOTSET: materialize failed after tier placement was committed (owners may be partly allocated; cannot safely fall back): {error}"
         ))?;
         let tiers_ns = rdna_compute::load_phases::ns_since(tiers_started);
@@ -2810,10 +2848,13 @@ fn load_qwen4_rank_scoped(
         None
     };
     let npu_identity = hipfire_arch_qwen4::npu_trunk::model_index_identity(&hfq, &ctx.gpu.arch);
-    let source = HfqModelSource::from_hfq(hfq);
+    let mut source = HfqModelSource::from_hfq(hfq);
+    // Direct load: payloads are checked file ranges the weight store reads
+    // straight into its pinned/staged destination; the mapping stays.
+    source.set_prefer_ranges(direct_source.is_some());
     let weights_io0 = rdna_compute::load_phases::thread_io();
     let weights_started = std::time::Instant::now();
-    let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads_ep(
+    let transaction = hipfire_runtime::weight_store::fulfill_manifest_from_payloads_direct(
         &manifest.weights,
         &mesh,
         config.num_hidden_layers,
@@ -2823,6 +2864,7 @@ fn load_qwen4_rank_scoped(
             rank: placement.rank,
             ranks: placement.ranks,
         }),
+        direct_source.as_ref(),
         |entry| {
             // A slab layer arena is one span of the container, not a tensor:
             // the recipe resolves it before the by-name read.
@@ -2830,11 +2872,34 @@ fn load_qwen4_rank_scoped(
                 &source,
                 &recipe,
                 entry,
-                qwen4_use_range_payload(use_ranges, entry.residency),
+                // Expert-parallel expert stacks compact from a borrowed
+                // payload; everything else reads a checked range when direct.
+                qwen4_use_range_payload(
+                    use_ranges
+                        || (direct_source.is_some()
+                            && !(ep.is_some()
+                                && matches!(
+                                    entry.policy,
+                                    hipfire_runtime::weight_manifest::ShardPolicy::ExpertSharded { .. }
+                                ))),
+                    entry.residency,
+                ),
             )
         },
     )
     .map_err(|error| format!("qwen4: manifest fulfillment failed: {error}"))?;
+    if let Some(path) = digest_path.as_deref() {
+        match hipfire_runtime::weight_store::write_weight_digest(path, &transaction, &*ctx.gpu) {
+            Ok(records) => eprintln!(
+                "  qwen4 weight digest: {records} records appended to {}",
+                path.display()
+            ),
+            Err(error) => {
+                let _ = transaction.rollback(&mut *ctx.gpu);
+                return Err(format!("qwen4: weight digest {}: {error}", path.display()));
+            }
+        }
+    }
     let weights_ns = rdna_compute::load_phases::ns_since(weights_started);
     rdna_compute::load_phases::add("weights", weights_ns, 0);
     if let (Some((read0, faults0)), Some((read1, faults1))) =
