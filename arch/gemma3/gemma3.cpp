@@ -576,7 +576,8 @@ int Gemma3Mlp::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, const 
                RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_ff), RAD_STR("dtype", g.dtype)),
                RAD_NOWEIGHTS),
               {w.gu}, {w.ffn});
-    if (ln_down.quant && !ln_down.shared_in && rad_op_declared(b, "gelu_mul_quant_i8"))
+    // Not under calibration: the tap reads the bf16 activation this fusion never writes.
+    if (ln_down.quant && !ln_down.shared_in && !calib_dir() && rad_op_declared(b, "gelu_mul_quant_i8"))
         op_gq = rw(b, RAD_OP(b, "gelu_mul_quant_i8",
                      RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_ff), RAD_STR("dtype", g.dtype)),
                      RAD_NOWEIGHTS),
@@ -1058,7 +1059,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
     /* The fused junctions, used only when every one resolves and every linear a junction feeds
      * reads its int8 pair (see gemma4_bf16). */
-    if (g.n_layer > 0) {
+    // Neither junction family under calibration: the tap reads each linear's bf16 input, which
+    // the fused junctions never write (an MXFP4 container wrote zero Grams for q/k/v and gate_up).
+    if (g.n_layer > 0 && !calib_dir()) {
         bool ok = true;
         for (const Layer& lay : m.layers)
             ok = ok && lay.attn.ln_q.quant && lay.attn.ln_k.shared_in && lay.attn.ln_v.shared_in &&
@@ -1089,7 +1092,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
 
     /* ---- the MXFP4 trunk's junctions, when every block's inputs are E4M3 pairs it can write. */
-    if (g.n_layer > 0 && !m.fuse) {
+    if (g.n_layer > 0 && !m.fuse && !calib_dir()) {
         bool ok = true;
         for (const Layer& lay : m.layers)
             ok = ok && lay.attn.ln_q.mx && !lay.attn.ln_q.shared_in && lay.attn.ln_k.shared_in &&
@@ -1119,19 +1122,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
 
     /* ---- the calibration tap. It reads the bf16 input of every linear, which the fused junctions
-     * never write, so it needs an unfused container (bf16, i8a8). */
+     * never write, so under it none is declared (above): any container calibrates, unfused. */
     if (calib_dir()) {
-        if (m.fuse) {
-            fprintf(stderr, "radiance: gemma3: calibration reads each linear's bf16 input, which this "
-                            "container's fused junctions do not write; calibrate on the bf16 or an "
-                            "i8a8 container\n");
-            return RAD_E_INVAL;
-        }
         m.calib_lo = 0;
         m.calib_hi = g.n_layer;
         if (const char* s = std::getenv("RADIANCE_G3_CALIB_LAYERS")) {
             long long lo = 0, hi = 0;
-            if (std::sscanf(s, "%lld:%lld", &lo, &hi) != 2 || lo < 0 || hi > g.n_layer || lo >= hi) {
+            int used = 0;
+            if (std::sscanf(s, "%lld:%lld%n", &lo, &hi, &used) != 2 || s[used] != '\0' || lo < 0 ||
+                hi > g.n_layer || lo >= hi) {
                 fprintf(stderr, "radiance: gemma3: RADIANCE_G3_CALIB_LAYERS '%s' is not lo:hi within "
                                 "0:%lld\n", s, (long long)g.n_layer);
                 return RAD_E_INVAL;

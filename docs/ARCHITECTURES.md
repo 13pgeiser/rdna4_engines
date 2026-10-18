@@ -563,8 +563,10 @@ under a tenth of the weight bytes, and the dense arm's 2112 is not whole 128-blo
 # `gemma3`: Gemma 3 text (TranslateGemma)
 
 `arch/gemma3` serves the language model of a `Gemma3ForConditionalGeneration` checkpoint (the
-vision tower and projector are not mapped, so never converted): TranslateGemma 27B, and the Gemma 3
-text sizes with its config keys. It is `gemma4_bf16`'s block structure with Gemma 3's differences;
+vision tower and projector are not mapped, so never converted). Written and measured for
+TranslateGemma 27B; another Gemma 3 size with the same config keys should declare (4B and 12B have
+a 256 head, served by the h256 rows) but is untested, and the 1B, a `Gemma3ForCausalLM`, keeps its
+tensors under names this plugin does not map. It is `gemma4_bf16`'s block structure with Gemma 3's differences;
 the reference is transformers' `modeling_gemma3` (4.57).
 
 ```
@@ -617,16 +619,19 @@ above), which matters little for translation prompts, whose shared prefix is a l
 | `codes=u4 zero=u8 group=128 scale=f16` | `gemm_nt_q` w4a8i8_asym | int8, a scale per (row, 128) |
 
 A linear reading the same activation as the one before it (k and v after q, up after gate) reuses
-its codes. On an MXFP4 or int8 trunk the q and k norms and both rotaries are one `qkv_norm_rope` at
-`v_norm` 0, and each junction (the branch's post-norm, the residual add, the next norm and the next
-linear's quantiser) is one `ar_rmsnorm_post_quant_fp8` at two ranks on the exact wire, the branch's
-all-reduce in the same launch, or a post-norm and `rmsnorm_quant_fp8` otherwise. Where a row is
-missing the plugin declares the chain, and the startup notes say which form each took.
+its codes. On every trunk the q and k norms and both rotaries are one `qkv_norm_rope` at `v_norm` 0.
+On an MXFP4 trunk each junction (the branch's post-norm, the residual add, the next norm and the
+next linear's E4M3 quantiser) is one `ar_rmsnorm_post_quant_fp8` at two ranks on the exact wire,
+the branch's all-reduce in the same launch, or a post-norm and `rmsnorm_quant_fp8` otherwise; a
+w4a8 / w8a8 trunk takes `gemma4_bf16`'s fused junctions; an i8a8 or asymmetric-int4 trunk runs the
+chain. Where a row is missing the plugin declares the chain, and the startup notes say which form
+each took. Under calibration no junction is fused (below).
 
 **Calibration.** Serve a calibration container (int8, `translategemma-27b-i8a8.recipe`: KL 0.003
 against bf16, and it fits two 32 GB cards) with `RADIANCE_CALIB_DIR` set, push a corpus of the
 prompts you will serve through prefill, and each linear's input Gram is written once
-`RADIANCE_CALIB_TOKENS` have passed. `RADIANCE_G3_CALIB_LAYERS=lo:hi` limits the tap to a layer
+`RADIANCE_CALIB_TOKENS` have passed; the junctions run unfused meanwhile, so the tap sees every
+linear's bf16 input from any container. `RADIANCE_G3_CALIB_LAYERS=lo:hi` limits the tap to a layer
 slice, so the 21504-wide down projections of 62 layers can be taken in passes. At two ranks the
 column-split linears (o, down) see their rank's columns only and write `<stem>.part`; libquant
 assembles the parts block diagonally (docs/TOOLS.md). Give every prompt a distinct first line, or
@@ -650,8 +655,9 @@ and SiLU; target layers 1, 16, 30, 44, 59; mask token `<unused0>`, 6; block 8; w
 `qwen35_fp8` serves Qwen's: the trunk copies the residual stream after each tapped layer's junction
 into `dflash_src`, the probe fixes the depth at block - 1, and `rad_block_dflash2.h` applies the
 embedding scale through `embed_lookup`'s `mult` (only when it is not 1, so other drafters' graphs are
-unchanged). On held-out translation prompts it accepts 3.3 tokens a verify step: 152 tok/s a stream
-and 364 at four, against 56 and 175 without it.
+unchanged). On 64 held-out translation pieces it accepts 3.3 tokens a verify step: 152 tok/s a
+stream and 364 at four, against 56 and 175 without it on the same pieces (the table's 205 at four
+is one 800-token translation run four times).
 
 ---
 

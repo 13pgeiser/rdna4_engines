@@ -6040,7 +6040,8 @@ TEST(gemma3_steps_lint_clean_at_one_and_two_ranks) {
             gemma3::step(&c, &batch);
             CHECK_LINT(b, &c);
             CHECK(c.step_fail.empty());
-            CHECK_EQ(count_op(b, "all_reduce") + count_op(b, "ar_rmsnorm_quant_fp8") > 0, world == 2);
+            CHECK_EQ(count_op(b, "all_reduce") + count_op(b, "ar_rmsnorm_quant_fp8") +
+                     count_op(b, "ar_rmsnorm_post_quant_fp8") > 0, world == 2);
         }
 }
 
