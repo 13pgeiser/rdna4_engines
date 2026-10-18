@@ -680,6 +680,7 @@ fn dispatch_swiglu_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), Di
         MQ3G256V2 => hip!(gpu.gemv_mq3g256v2_residual(w.buf, x_in, residual, m, k)),
         MQ2G256V2 => hip!(gpu.gemv_mq2g256v2_residual(w.buf, x_in, residual, m, k)),
         MQ4CG256 => hip!(gpu.gemv_mq4cg256_residual(w.buf, x_in, residual, m, k)),
+        MQ3G256 => hip!(gpu.gemv_hfq3g256_residual(w.buf, x_in, residual, m, k)),
         MQ5G256 => hip!(gpu.gemv_hfq5g256_residual(w.buf, x_in, residual, m, k)),
         MQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x_in, residual, m, k)),
         MQ3G256Lloyd => hip!(gpu.gemv_mq3g256_lloyd_residual(w.buf, x_in, residual, m, k)),
