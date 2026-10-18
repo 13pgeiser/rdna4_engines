@@ -838,7 +838,7 @@ pub static FIELDS: &[ConfigField] = &[
     // Sparse in the process config (like `replay.backend`): when the user,
     // registry or a compatibility env never set it, the key is absent, so the
     // loader can tell "unset" (a Flash-Next load then picks the engine from a
-    // measured rate comparison, see `memory::offload_exec_explicit`) from an
+    // measured decode-cost comparison, see `memory::offload_exec_explicit`) from an
     // explicit `pcie`. The built-in `pcie` stays the raw value
     // ([`memory::offload_exec`]) every other consumer reads.
     ConfigField {
@@ -852,7 +852,7 @@ pub static FIELDS: &[ConfigField] = &[
         experimental: false,
         env_compat: Some("HIPFIRE_OFFLOAD_EXEC"),
         include_builtin_in_process_config: false,
-        help: "Which engine executes the ops that read a spilled layer's weights: 'pcie' runs the GPU kernels against host-mapped weights over the link; 'cpu' executes those GEMVs on the CPU instead; 'passback' is scheduled co-inference — both engines run the same spilled step concurrently (the GPU arm is the 'pcie' path, the CPU arm is the 'cpu' path), divided by output rows per 'memory.offload_passback_share'. Not a third engine and not a fallback: it decides who multiplies, never what is spilled — placement stays memory.gpu_layer_budget, and the KV cache stays in VRAM either way. Unset behaves as 'pcie' everywhere except one measured default: a Flash-Next (qwen4) load whose host-placed routed experts the D2 CPU split can serve (hot-set tier layers, or un-tiered aggregate layers whose allocations are host-mapped QT44/QT53) runs only that D2 split (decode and <=4-row verify of the host-mapped experts) when this device's measured CPU engine rate beats its measured zero-copy host-link rate (the passback calibration); unified-memory, unmeasured and slower-CPU devices stay on the link, and prefill, placement and host allocations never change. The typed developer key developer.qwen4_d2_default forces or vetoes that comparison. An explicit value, 'pcie' included, always wins. Empty and unknown values fall back to 'pcie'.",
+        help: "Which engine executes the ops that read a spilled layer's weights: 'pcie' runs the GPU kernels against host-mapped weights over the link; 'cpu' executes those GEMVs on the CPU instead; 'passback' is scheduled co-inference — both engines run the same spilled step concurrently (the GPU arm is the 'pcie' path, the CPU arm is the 'cpu' path), divided by output rows per 'memory.offload_passback_share'. Not a third engine and not a fallback: it decides who multiplies, never what is spilled — placement stays memory.gpu_layer_budget, and the KV cache stays in VRAM either way. Unset behaves as 'pcie' everywhere except one measured default: a Flash-Next (qwen4) load whose host-placed routed experts the D2 CPU split can serve (hot-set tier layers, or un-tiered aggregate layers whose allocations are host-mapped QT44/QT53) runs only that D2 split (decode and <=4-row verify of the host-mapped experts) when its predicted per-layer decode cost is at least 15% below PCIe's: the production CPU arm timed on this model's real host experts plus the copy-transport handoff, against the live zero-copy host-link rate plus a launch floor, compared pessimistically (the slowest of 5 CPU arm samples against the fastest of 5 link samples); unified-memory devices, a failed or inconclusive measurement and links the CPU does not beat by that margin stay on the link, and prefill, placement and host allocations never change. The typed developer key developer.qwen4_d2_default forces or vetoes that comparison. An explicit value, 'pcie' included, always wins. Empty and unknown values fall back to 'pcie'.",
     },
     field!(
         "memory.offload_passback_share",
@@ -9461,7 +9461,7 @@ pub mod memory {
     /// `developer.qwen4_d2_default` (env `HIPFIRE_QWEN4_D2_DEFAULT`), a typed
     /// boolean: `Some(true)` forces the Flash-Next un-tiered whole-layer D2
     /// split on for a load that has host-placed experts (skipping only the
-    /// measured CPU-vs-link comparison), `Some(false)` never arms the default,
+    /// measured decode-cost comparison), `Some(false)` never arms the default,
     /// `None` (unset) takes the measured selector. An explicit
     /// `memory.offload_exec` still wins over every value.
     pub fn qwen4_d2_default() -> Option<bool> {

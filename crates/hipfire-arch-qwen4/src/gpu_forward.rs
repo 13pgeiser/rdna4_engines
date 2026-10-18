@@ -1334,6 +1334,7 @@ fn slab_codec_tag_bytes(codecs: &[u8]) -> Vec<u8> {
     bytes
 }
 
+pub(crate) use cpu_splice::ColdLayerSource;
 mod cpu_splice;
 
 impl RoutedExpertWeights for Qwen4MoeLayerRuntime {

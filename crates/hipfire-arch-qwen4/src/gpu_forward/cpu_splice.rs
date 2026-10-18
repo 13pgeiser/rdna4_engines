@@ -556,6 +556,113 @@ impl HostSpanOwner {
     }
 }
 
+/// The cold-expert byte source of one host layer, resolved from the loaded
+/// weights exactly as the layer build resolves it, for the D2 selector's
+/// real-arm probe ([`crate::d2_default`]). It runs before the layer runtimes
+/// exist, so it builds the same borrowed views ([`CpuTierOwners`] for a hot-set
+/// tier layer, [`CpuExpertOwners`] for an un-tiered host-mapped aggregate) and
+/// copies nothing.
+pub(crate) struct ColdLayerSource {
+    owner: HostSpanOwner,
+    gate_up_dtype: DType,
+    down_dtype: DType,
+    experts: usize,
+}
+
+impl ColdLayerSource {
+    /// Resolve trunk layer `layer`'s cold experts. `gate_up` / `down` are the
+    /// layer's aggregate expert references (read only for an un-tiered layer;
+    /// a tier layer's codecs are the fixed QT44 gate/up + QT53 down pair, as in
+    /// the layer build). `Err` names what could not be resolved.
+    pub(crate) fn new(
+        gpu: &Gpu,
+        weights: &Qwen4Weights,
+        config: &Qwen4Config,
+        layer: usize,
+        gate_up: &TensorRef,
+        down: &TensorRef,
+    ) -> Result<Self, String> {
+        let experts = config.num_experts;
+        let extents = |gate_up_dtype: DType, down_dtype: DType| {
+            let gate_up = crate::projection::checked_bytes(
+                2 * config.moe_intermediate_size,
+                row_stride(gate_up_dtype, config.hidden_size),
+            );
+            let down = crate::projection::checked_bytes(
+                config.hidden_size,
+                row_stride(down_dtype, config.moe_intermediate_size),
+            );
+            gate_up
+                .zip(down)
+                .ok_or_else(|| format!("layer {layer}: expert byte extent overflows"))
+        };
+        let (gate_up_dtype, down_dtype, owner) = match weights.expert_tier_layer(layer) {
+            Some(view) => {
+                let (gate_up_dtype, down_dtype) = (DType::MQ4G256V2, DType::MQ4G128V2);
+                let (gate_up_bytes, down_bytes) = extents(gate_up_dtype, down_dtype)?;
+                let owners = CpuTierOwners::new(
+                    &view.lease(),
+                    view.layer(),
+                    experts,
+                    gate_up_bytes,
+                    down_bytes,
+                )?;
+                (gate_up_dtype, down_dtype, HostSpanOwner::Tier(owners))
+            }
+            None => {
+                let gate_up = weights
+                    .resident(gate_up)
+                    .map_err(|error| format!("layer {layer}: {error}"))?;
+                let down = weights
+                    .resident(down)
+                    .map_err(|error| format!("layer {layer}: {error}"))?;
+                let (gate_up_bytes, down_bytes) = extents(gate_up.dtype, down.dtype)?;
+                let owners = CpuExpertOwners::new(
+                    gpu,
+                    gate_up,
+                    down,
+                    experts,
+                    gate_up_bytes,
+                    down_bytes,
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "layer {layer}: the aggregate expert allocations have no resolvable \
+                         pinned host bytes"
+                    )
+                })?;
+                (gate_up.dtype, down.dtype, HostSpanOwner::WholeLayer(owners))
+            }
+        };
+        Ok(Self {
+            owner,
+            gate_up_dtype,
+            down_dtype,
+            experts,
+        })
+    }
+
+    /// The layer's resident gate/up and down codecs.
+    pub(crate) fn codecs(&self) -> (DType, DType) {
+        (self.gate_up_dtype, self.down_dtype)
+    }
+
+    /// Experts the layer addresses (cold or not).
+    pub(crate) fn experts(&self) -> usize {
+        self.experts
+    }
+
+    /// Borrowed CPU payload of cold expert `expert`; `None` for a
+    /// device-resident or out-of-range expert or a codec with no CPU executor.
+    pub(crate) fn cold_payload(
+        &self,
+        expert: usize,
+    ) -> Option<hipfire_dispatch::cpu_exec::CpuMoeExpert<'_>> {
+        self.owner
+            .payload(expert, self.gate_up_dtype, self.down_dtype)
+    }
+}
+
 /// Hex of a layer bitmap: bit `i` is layer label `i`, rendered as one big
 /// number (most significant byte first), `"0"` when empty. Pure.
 pub(super) fn layer_bitmap_hex(labels: &[usize]) -> String {

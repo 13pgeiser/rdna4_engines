@@ -405,7 +405,9 @@ fn pinned_h2d_copies(gpu: &Gpu, bytes: usize, timed: usize) -> Result<f32, Strin
 /// [`PROBE_BYTES`] host-mapped tensor is copied into a device tensor by the
 /// engine's `copy_f32_buffer` kernel (one untimed launch, then
 /// [`PROBE_TIMED_COPIES`] timed ones, each fenced by a device synchronize).
-/// Both tensors are freed on every path. Informational: no selector reads it.
+/// Both tensors are freed on every path. Informational (`hipfire calibrate`
+/// stores it): the D2 selector takes its own live samples with
+/// [`zero_copy_read_samples`].
 pub fn probe_zero_copy_gbps(gpu: &mut Gpu) -> Result<f64, String> {
     let elems = PROBE_BYTES / 4;
     let src = gpu
@@ -432,6 +434,65 @@ pub fn probe_zero_copy_gbps(gpu: &mut Gpu) -> Result<f64, String> {
             }
         }
         Ok(gbps_from_ms(PROBE_BYTES, best_ms))
+    })();
+    // A failed launch may still be queued: drain before the buffers go away.
+    let _ = gpu.hip.device_synchronize();
+    let _ = gpu.free_tensor(dst);
+    let _ = gpu.free_tensor(src);
+    timed
+}
+
+/// Individual zero-copy read wall times plus the individual launch floors,
+/// for the D2 selector ([`crate::d2_default`]), which needs the sample spread
+/// and the fastest samples that the best-of figure of
+/// [`probe_zero_copy_gbps`] discards.
+///
+/// A `bytes` host-mapped tensor is read by the engine's `copy_f32_buffer`
+/// kernel into a device tensor: one untimed launch, then `N` launches each
+/// timed from the host launch to `device_synchronize` returning. Each read
+/// sample is wall nanoseconds for the whole read. Each floor sample is the
+/// same timing of a one-element read of the same pair after its own untimed
+/// launch (the cost a layer's kernels pay regardless of bytes). Both tensors
+/// are freed on every path. Returns `(reads, floors)`.
+pub fn zero_copy_read_samples<const N: usize>(
+    gpu: &mut Gpu,
+    bytes: usize,
+) -> Result<([u64; N], [u64; N]), String> {
+    let elems = bytes / 4;
+    if elems == 0 || N == 0 {
+        return Err("empty zero-copy sample request".to_string());
+    }
+    let src = gpu
+        .upload_raw_host(&vec![0u8; bytes], &[bytes])
+        .map_err(|error| format!("host-mapped buffer: {error}"))?;
+    let dst = match gpu.alloc_tensor(&[elems], DType::F32) {
+        Ok(dst) => dst,
+        Err(error) => {
+            let _ = gpu.free_tensor(src);
+            return Err(format!("device buffer: {error}"));
+        }
+    };
+    let timed = (|| -> Result<([u64; N], [u64; N]), String> {
+        let launch = |gpu: &mut Gpu, n: usize| -> Result<u64, String> {
+            let start = Instant::now();
+            gpu.copy_f32_buffer(&dst, &src, n)
+                .map_err(|error| format!("zero-copy read: {error}"))?;
+            gpu.hip
+                .device_synchronize()
+                .map_err(|error| format!("synchronize: {error}"))?;
+            Ok(start.elapsed().as_nanos() as u64)
+        };
+        let mut reads = [0u64; N];
+        launch(gpu, elems)?;
+        for sample in &mut reads {
+            *sample = launch(gpu, elems)?;
+        }
+        let mut floors = [0u64; N];
+        launch(gpu, 1)?;
+        for sample in &mut floors {
+            *sample = launch(gpu, 1)?;
+        }
+        Ok((reads, floors))
     })();
     // A failed launch may still be queued: drain before the buffers go away.
     let _ = gpu.hip.device_synchronize();

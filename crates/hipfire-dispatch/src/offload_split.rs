@@ -849,8 +849,10 @@ pub fn probe_synthetic(
 
 /// [`probe_synthetic`] with the CPU arm's worker pool chosen. The routed-expert
 /// splice (D1/D2) runs its CPU side on [`CpuProbePool::Splice`] (one pinned
-/// worker per physical core), so a default that asks "does the splice's CPU
-/// engine beat the link?" must time that pool, not the global one.
+/// worker per physical core), so a dense probe of that engine must time that
+/// pool, not the global one. This is a dense, alone-and-best-of figure: the
+/// qwen4 D2 default no longer decides from it (it times the production
+/// expert arm on the model's real spans instead).
 pub fn probe_synthetic_on(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
