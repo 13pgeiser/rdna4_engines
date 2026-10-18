@@ -2320,6 +2320,21 @@ encoder and decoders taken from a MiniMax-H3 container (`data/recipes/minimax-h3
 how), served the same way and named `fastvideo-fasth3-8-step-v2`. Its card notes that difficult
 motion, fine detail and some audio may fall below the base model's; it serves text to video only.
 
+**Latent upscaling.** A container that carries LBH-123-AI's latent upscaler
+(`LBH-123-AI/Minimax_h3_latent_Upscaler`, Apache-2.0; the recipe says how to add it to a container,
+in place) takes **`latent_upscale`**, a factor from 1 to 4: the first steps run at `size` divided
+by it (each side rounded to a multiple of 32), the clean small latent is enlarged to `size` by the
+upscaler, re-noised, and the last **`upscale_refine_steps`** run at the full size (3 of FastH3's 8
+and 12 of the base model's 49 by default). The steps at the small size cost a fraction of a
+full-size step's, so most of the time goes to the refinement. The video object of an upscaled
+video carries `latent_upscale`, the `upscale_refine_steps` it ran and `upscale_from`, the small
+size.
+
+```sh
+curl -s http://localhost:8000/v1/videos -H 'Content-Type: application/json' -d '{
+  "prompt": "...", "size": "1344x768", "seed": 7, "latent_upscale": 2}'
+```
+
 On two R9700s (`--tp 2`, 300 W) a 5.17 s clip at 1344x768 takes about 68 s with FastH3 and about
 8.8 minutes with MiniMax-H3's default 50 steps. Both attentions run their scores in int8 and
 P.V in fp8 (docs/ARCHITECTURES.md); a step's cost grows with the square of the rows, so a longer
@@ -2513,7 +2528,7 @@ is the part of a log to paste into an issue. Its sections:
   warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 1.8.0
+I STARTUP REPORT -- radiance 1.8.1
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [command line]
 I   --tp                               2                                           [command line]

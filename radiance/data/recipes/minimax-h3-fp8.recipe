@@ -15,6 +15,15 @@
 #       --reuse minimax-h3-fp8.rad --changed <the transformer's tensor names, "transformer." first> \
 #       -o fasth3-8step-fp8.rad
 #
+# LBH-123-AI's latent upscaler (Minimax_h3_latent_Upscaler, Apache-2.0) is a companion folder:
+# put its config.json (minimax_h3_latent_upscaler_3d_conv_v1/config.json) and its bf16 weights,
+# named diffusion_pytorch_model.safetensors, in latent_upscaler/ of the pipeline directory. It
+# converts with the rest, or is appended to a container converted without it, which keeps every
+# weight the container holds where it is:
+#
+#   rad-convert <pipeline directory> --recipe data/recipes/minimax-h3-fp8.recipe \
+#       --reuse minimax-h3-fp8.rad --in-place
+#
 # Every linear of the text encoder's first 50 layers, of the token refiner and of the DiT's 50
 # blocks, and the per-modality modulation projections, become E4M3 codes with a bf16 scale a
 # 128 x 128 block, read by the fp8a8 GEMMs. What keeps the checkpoint's precision is read once a
@@ -44,3 +53,5 @@ vae.blk.*.ffn_up.weight              cast dtype=bf16
 vae.blk.*.ffn_down.weight            cast dtype=bf16
 vae.proj_out.*                       cast dtype=bf16
 aud.*.weight                         cast dtype=f32
+ups.embed.*                          cast dtype=f32
+ups.*.emb_layers.*                   cast dtype=f32

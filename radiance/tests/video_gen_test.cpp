@@ -110,6 +110,7 @@ char kind_of(int gen) {
     case RAD_GEN_PASS_VSTEP:   return 'S';
     case RAD_GEN_PASS_ADECODE: return 'A';
     case RAD_GEN_PASS_VDECODE: return 'D';
+    case RAD_GEN_PASS_VUPSCALE: return 'U';
     default:                   return '?';
     }
 }
@@ -277,6 +278,133 @@ TEST(a_second_request_is_conditioned_early_and_denoised_after_the_first) {
         CHECK_OK(f.drv.done());
     }
     CHECK_EQ(kinds, std::string("CCSADSAD"));
+}
+
+/* Latent upscaling's small size: each side over the factor, rounded half up to the size multiple,
+ * at least one multiple and at most the side. */
+TEST(the_small_size_is_each_side_over_the_factor_at_the_multiple) {
+    const RadVideoGenDecl d = decl_small();
+    int32_t w = 0, h = 0;
+    gen::video_small_size(d, 1344, 768, 2.0, &w, &h);
+    CHECK_EQ(w, 672);
+    CHECK_EQ(h, 384);
+    gen::video_small_size(d, 1344, 768, 4.0, &w, &h);
+    CHECK_EQ(w, 352);                      /* 336 is 10.5 multiples, rounded up */
+    CHECK_EQ(h, 192);
+    gen::video_small_size(d, 1280, 768, 4.0, &w, &h);
+    CHECK_EQ(w, 320);
+    CHECK_EQ(h, 192);
+    gen::video_small_size(d, 64, 32, 4.0, &w, &h);
+    CHECK_EQ(w, 32);                       /* never below one multiple */
+    CHECK_EQ(h, 32);
+    gen::video_small_size(d, 64, 64, 1.2, &w, &h);
+    CHECK_EQ(w, 64);                       /* 1.67 multiples round back to the side */
+    CHECK_EQ(h, 64);
+}
+
+/* An upscaled request: its first evaluations at the small size, the last of them stepping to the
+ * clean estimate, then the upscale pass with both geometries, the factor and the first full-size
+ * step's sigmas, then the full-size steps and the decodes at the full size. */
+TEST(an_upscaled_request_runs_small_steps_then_the_upscale_then_full_steps) {
+    VideoFixture f;
+    f.build();
+    f.prog.video_gen.upscale_max = 4.0;
+    f.prog.video_gen.upscale_refine = 1;
+    CHECK_OK(f.start());
+    const gen::VideoSchedule sc = gen::video_schedule(f.prog.video_gen, 4);
+    REQUIRE_EQ(sc.steps, 3);
+    std::string why;
+    auto r = f.req(1, 4);
+    r->width = 64;
+    r->height = 64;
+    r->upscale = 2.0;
+    auto t = r->ticket;
+    CHECK_OK(f.drv.submit(std::move(r), &why));
+    CHECK_EQ(t->small_width, 32);
+    CHECK_EQ(t->small_height, 32);
+    CHECK_EQ(t->refine, 1);
+    CHECK_EQ(t->steps, 3);
+    /* 3 frames: 2 latent frames, 30 soundtrack latents a channel. Small: 1 x 1 patches a frame;
+     * full: 2 x 2. */
+    const int64_t small_rows = 3 + 60 + 2 * 1, full_rows = 3 + 60 + 2 * 4;
+    std::string kinds;
+    int steps_seen = 0;
+    for (int i = 0; i < 20; ++i) {
+        const RadBatch* b = f.drv.next(i);
+        if (!b) break;
+        const RadVideoGenBatch* V = b->vgen_b;
+        REQUIRE(V != nullptr);
+        kinds += kind_of(b->gen);
+        if (b->gen == RAD_GEN_PASS_VSTEP) {
+            const bool small = steps_seen < 2;
+            CHECK_EQ(b->n_tok, small ? small_rows : full_rows);
+            CHECK_EQ(V->geom.lat_h, small ? 2 : 4);
+            CHECK_EQ(V->geom.lat_w, small ? 2 : 4);
+            CHECK_EQ(V->geom_d[RAD_VGEOM_LAT_H], small ? 2 : 4);
+            CHECK_EQ(V->seg_cu[3], (int32_t)(small ? small_rows : full_rows));
+            CHECK_EQ(V->sched[1], sc.sig_v[(size_t)steps_seen]);
+            /* The last small step lands on the clean estimate. */
+            CHECK_EQ(V->sched[2], steps_seen == 1 ? 0.0f : sc.sig_v[(size_t)steps_seen + 1]);
+            CHECK_EQ(V->sched[5], steps_seen == 1 ? 0.0f : sc.sig_a[(size_t)steps_seen + 1]);
+            ++steps_seen;
+        } else if (b->gen == RAD_GEN_PASS_VUPSCALE) {
+            CHECK_EQ(b->n_tok, (int64_t)0);
+            CHECK_EQ(V->geom.lat_h, 4);
+            CHECK_EQ(V->geom_from.lat_h, 2);
+            CHECK_EQ(V->geom_from.lat_w, 2);
+            CHECK_EQ(V->upscale[0], 2.0f);
+            CHECK_EQ(V->sched[1], sc.sig_v[2]);
+            CHECK_EQ(V->sched[4], sc.sig_a[2]);
+            const int32_t* g = V->geom_d;
+            CHECK(std::vector<int32_t>(g + RAD_VGEOM_UP_SRC, g + RAD_VGEOM_UP_SRC + 14) ==
+                  std::vector<int32_t>({ 2, 2, 2, 4, 4, 2, 4, 4, 2, 1, 1, 2, 2, 2 }));
+        } else if (b->gen == RAD_GEN_PASS_VDECODE) {
+            CHECK_EQ(V->geom.lat_h, 4);
+        }
+        f.answer(0);
+        CHECK_OK(f.drv.done());
+    }
+    CHECK_EQ(kinds, std::string("CSSUSAD"));
+    CHECK(t->t_small_ns > 0 && t->t_upscaled_ns >= t->t_small_ns);
+    CHECK_EQ(t->status(), (int)RAD_OK);
+}
+
+/* Upscaling is refused when the model has none, past its largest factor, when the factor leaves
+ * the size as it is, and when the refinement leaves no small step or takes none. */
+TEST(an_upscale_that_cannot_run_is_refused_at_submit) {
+    VideoFixture f;
+    f.build();
+    CHECK_OK(f.start());
+    std::string why;
+    auto r = f.req(1, 4);
+    r->upscale = 2.0;
+    CHECK_EQ(f.drv.submit(std::move(r), &why), (int)RAD_E_INVAL);
+    CHECK(has(why, "no latent upscaler"));
+
+    VideoFixture g;
+    g.build();
+    g.prog.video_gen.upscale_max = 4.0;
+    g.prog.video_gen.upscale_refine = 1;
+    CHECK_OK(g.start());
+    auto refused = [&](double factor, int32_t refine, const char* what) {
+        auto q = g.req(1, 4);
+        q->width = 64;
+        q->height = 64;
+        q->upscale = factor;
+        q->refine = refine;
+        why.clear();
+        CHECK_EQ(g.drv.submit(std::move(q), &why), (int)RAD_E_INVAL);
+        CHECK(has(why, what));
+    };
+    refused(5.0, 0, "at most 4");
+    refused(1.2, 0, "leaves 64x64");
+    refused(2.0, 3, "1..2");
+    auto ok = g.req(1, 4);
+    ok->width = 64;
+    ok->height = 64;
+    ok->upscale = 2.0;
+    ok->refine = 2;
+    CHECK_OK(g.drv.submit(std::move(ok), &why));
 }
 
 /* What can never run is refused at submit: an empty or long prompt, a size off the multiple,

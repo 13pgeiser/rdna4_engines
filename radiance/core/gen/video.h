@@ -53,10 +53,14 @@ public:
     int32_t frames = 0, width = 0, height = 0, steps = 0;
     int64_t sample_rate = 0, channels = 0;
     double  fps = 0.0;
+    /* With latent upscaling, the size the first evaluations run at and the evaluations after the
+     * upscale; zero without. */
+    int32_t small_width = 0, small_height = 0, refine = 0;
     /* Usage, written by the driver before finish(): prompt tokens, rows a step and per-phase
-     * times. */
+     * times (t_small_ns the last small step done, t_upscaled_ns the upscale; zero without). */
     int64_t in_tokens = 0, rows = 0;
-    int64_t t_submit_ns = 0, t_cond_ns = 0, t_denoised_ns = 0, t_done_ns = 0;
+    int64_t t_submit_ns = 0, t_cond_ns = 0, t_small_ns = 0, t_upscaled_ns = 0, t_denoised_ns = 0,
+            t_done_ns = 0;
 
 private:
     mutable std::mutex      mu_;
@@ -72,6 +76,10 @@ struct VideoRequest {
     int32_t  width = 0, height = 0;   /* pixels, within the declaration's limits */
     int32_t  chunks = 0;           /* the length in chunks (RadVideoGenDecl) */
     int32_t  steps = 0;            /* sigma grid points; 0: the model's default */
+    /* Latent upscaling (abi/rad_builder.h, RadVideoGenDecl): the factor, 0 for none, and the
+     * evaluations at the full size after it, 0 for the model's default. */
+    double   upscale = 0.0;
+    int32_t  refine = 0;
     uint64_t seed = 0;
     std::shared_ptr<VideoTicket> ticket;
 };
@@ -83,6 +91,12 @@ struct VideoShape {
     int64_t video_rows = 0, audio_rows = 0;
 };
 VideoShape video_shape(const RadVideoGenDecl& d, int32_t width, int32_t height, int32_t chunks);
+
+/* The small size a request's first evaluations run at under latent upscaling by `factor`: each
+ * side divided by it and rounded to the nearest multiple of the size multiple, at least one
+ * multiple and at most the side. */
+void video_small_size(const RadVideoGenDecl& d, int32_t width, int32_t height, double factor,
+                      int32_t* small_w, int32_t* small_h);
 
 /* The two schedules a request of `steps` grid points runs (RadVideoGenDecl, "The sampler"): each
  * the f32 sigmas, last 0, and the model evaluations it takes, the shorter of the two. With a

@@ -1073,7 +1073,8 @@ is [video sparse attention](#video-sparse-attention)) and its gated residual
 `gate_add` `act` none; the soundtrack's vocoder is `conv_t1d`, `snake_aa` and `conv1d` `clamp`
 ([Audio generation](#audio-generation)). Each op rounds where the reference model materialises a
 bf16 tensor and keeps f32 where it computes in f32; the libref function says which
-(`libref/ref_gen.cpp`, `libref/ref_video.cpp`).
+(`libref/ref_gen.cpp`, `libref/ref_video.cpp`). Its latent upscaler's ops are
+[below](#the-latent-upscaler).
 
 | op | params | operands |
 |---|---|---|
@@ -1244,6 +1245,81 @@ fp8 P.V form (`v` E4M3 codes, `v_scale` `[n_head * head_dim]`), before the epilo
 
 MiniMax-H3: `tile_t`, `tile_h` and `tile_w` 4, `patch` 2, `sparsity` 0.8, `head_dim` 128, the
 default `scale` `1 / sqrt(head_dim)`.
+
+### The latent upscaler
+
+MiniMax-H3's latent upscaler (`LatentResizer3D`) is a 3-D convolutional network over the video
+latent: its 24 channels to 512 by a 3 x 3 x 3 convolution, residual blocks
+(`t = silu(GN(x)); h = conv3(t); t = silu(GN(h) (1 + scale) + shift); x = x + conv3(t)`, the
+scale and shift from the upscale factor's embedding) and temporal blocks
+(`t = silu(GN(x)); t = dwconv_t5(t); x = x + pwconv(t)`, the 1 x 1 x 1 `pwconv` a `gemm_nt_bias`)
+at the source size, a spatial bilinear resize, the same blocks at the target size, and
+`GroupNorm(32)`, SiLU and a 3 x 3 x 3 convolution back to 24 channels. `patch_fold` turns its output
+back into the transformer's patch rows and `flow_renoise` takes them to the noise level a refining
+pass starts from. Each op rounds once into its output (`libref/ref_video.cpp`).
+
+| op | params | operands |
+|---|---|---|
+| `conv3d_ndhwc` | `M`(range) `cin` `cout` `k` `kt` `dtype` | `x`, `w`w, `b`w, `geom`, `res`? → `y` |
+| `group_norm` | `M`(range) `n` `groups` `eps`:f64 `act` `dtype` | `x`, `w`w, `b`w, `mod`?, `stats`:inout → `y` |
+| `tconv_dw` | `M`(range) `n` `k` `dtype` | `x`, `w`w, `b`w, `geom` → `y` |
+| `resize_bilinear` | `M`(range) `n` `dtype` | `x`, `geom` → `y` |
+| `patch_fold` | `M`(range) `C` `pt` `ph` `pw` `mul` `add` `dtype` | `x`, `geom` → `y` |
+| `flow_renoise` | `M`(range) `n` `stream` `dtype` | `sigma`, `seed`, `x`:inout |
+
+Activations are voxel rows: row `(t, i, j)` of a `T x H x W` volume is `(t H + i) W + j`, channels
+innermost (NDHWC). `geom` is the request's volume, i32 on the device (the parameters are fixed at
+declare). An output holds at least the rows the volume writes; rows past them are not written.
+Every op honours its activation operands' row pitches. `rd` is a rounding into the output's dtype.
+
+- `conv3d_ndhwc`: `x [>= T H W, cin]`, `y` and `res` `[>= T H W, cout]`, `geom = (T, H, W)`; `w` is
+  PyTorch's Conv3d weight `[cout, cin, kt, k, k]` (a kernel may relayout it at load, as
+  `conv2d_nhwc`'s layout hook does) and `b [cout]`. Stride 1, zero padding `kt/2` frames and `k/2`
+  rows and columns on each side (`same`; `k` and `kt` odd):
+  `y[(t,i,j), o] = rd(f32(sum over (dt, kh, kw, ci) of w[o, ci, dt, kh, kw]
+  x[(t+dt-kt/2, i+kh-k/2, j+kw-k/2), ci]) + b[o])`, terms outside the volume zero, f32 accumulation
+  in an order of the implementation's (libref: the taps in `(dt, kh, kw)` order, each tap's
+  channels ascending). With `res`, `y = rd(rd(acc + b) + res)`: the convolution's output rounded,
+  then the residual added and rounded, as a block's `skip(x) + h` in bf16. `res` may be the same
+  memory as `y` (the residual added in place); `x` never aliases `y`. x, y, res and w bf16 (also
+  f32), b bf16 or f32. MiniMax-H3: `k` = `kt` = 3, `(cin, cout)` `(24, 512)`, `(512, 512)`,
+  `(512, 24)`.
+- `group_norm` is PyTorch's `nn.GroupNorm(groups, n)` on `[1, n, T, H, W]`: `x` and `y`
+  `[>= M, n]` (`M` is `y`'s rows), group `g` the channels `[g n/groups, (g+1) n/groups)` of all
+  `M` rows. `mean_g` and the biased `var_g` are over the group's `M n/groups` values, accumulated in
+  f32 or better (libref: f64, two passes, row-major); `rstd_g = 1 / sqrt(f32(var_g) + eps)` in f32.
+  Then, in f32, `v = (x - mean_g) rstd_g w[c] + b[c]`; with `mod` (`[>= 2n]`, f32 or bf16, one row:
+  `scale = mod[0:n]`, `shift = mod[n:2n]`) `v = v (1 + scale[c]) + shift[c]`; `act` `none` or
+  `silu` (`v / (1 + exp(-v))`); one rounding into `y`. `stats` is f32 of at least
+  `groups (2 + 3 1024)` values: afterwards `stats[2g]` and `stats[2g+1]` hold group `g`'s `mean_g`
+  and `rstd_g`, and the rest is the implementation's scratch (partial sums of up to 1024 parts a
+  group; libref leaves it untouched). A kernel may take several launches but must be deterministic,
+  a fixed reduction order with no float atomics. `y` may be the same memory as `x`. `w` and `b`
+  `[n]`, bf16 or f32. MiniMax-H3: `n` 512, `groups` 32, `eps` 1e-5.
+- `tconv_dw`: a depthwise convolution along the frames (a Conv3d of kernel `(k, 1, 1)`, one group a
+  channel): `geom = (T, H, W)`, `P = H W` rows a frame, `w` PyTorch's `[n, 1, k, 1, 1]` (tap `j` of
+  channel `c` at `c k + j`), `b [n]`, `k` odd:
+  `y[(t, p), c] = rd(f32(sum_j w[c, j] x[(t + j - k/2, p), c]) + b[c])`, frames outside `[0, T)`
+  zero, the sum f32 in ascending `j`. `x` never aliases `y`. MiniMax-H3: `n` 512, `k` 5.
+- `resize_bilinear`: `geom = (T, h, w, H, W)`, `x [>= T h w, n]`, `y [>= T H W, n]`; each frame
+  resized on its own, as torch's `upsample_bilinear2d` with `align_corners=False` computes it for an
+  output size (not a scale factor): `sh = f32(h) / f32(H)`, `src = max(sh (f32(i) + 0.5) - 0.5, 0)`
+  in f32, `i0 = (int)src`, `i1 = i0 + (i0 < h - 1)`, `l1 = src - i0`, `l0 = 1 - l1`, the same for
+  columns, then
+  `v = l0y (l0x x[i0,j0] + l1x x[i0,j1]) + l1y (l0x x[i1,j0] + l1x x[i1,j1])` in f32 (each product
+  and sum one rounding), rounded once into `y`. Any sizes, shrinking too. The upscaler's
+  `F.interpolate(mode="trilinear")` at an unchanged frame count weighs each frame by exactly 1 and
+  its neighbour by 0, so this is that resize. `x` never aliases `y`.
+- `patch_fold` is `patch_unfold`'s inverse, normalising: voxel rows
+  `x [(F pt) (Hp ph) (Wp pw), C]` to patch rows `y [F Hp Wp, C pt ph pw]`, `geom = (F, Hp, Wp)`,
+  `y[(f,i,j), c pt ph pw + a ph pw + b pw + d] = f32(f32(x[(f pt + a, i ph + b, j pw + d), c]
+  mul[c]) + add[c])`, `mul` and `add` lists of `C` values kept in f32. `x` bf16 or f32, `y` f32.
+  `M` is `y`'s rows. MiniMax-H3: `C` 24, `pt` 1, `ph` = `pw` = 2.
+- `flow_renoise` re-noises a clean latent to noise level `s` with a fresh stream, over `x`'s rows:
+  `x[k, c] = f32(f32(f32(1 - s) x[k, c]) + f32(s z(k n + c)))`, `s` = `sigma` (f32 `[1]`),
+  `z(e) = rad_philox_normal_s(seed, stream, e)` (`abi/rad_philox.h`), `seed` u32 `[2]` low word
+  first, `stream` the parameter. `x` f32 `[M, n]` at its row pitch. MiniMax-H3: `n` 96 (the video's
+  patch rows) and 32 (the soundtrack's), `stream` 1.
 
 ## Mixture of experts
 

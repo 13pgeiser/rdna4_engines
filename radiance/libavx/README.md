@@ -3,7 +3,7 @@
 The conventional op vocabulary in hand-written x86 SIMD, dispatched at run time by CPU feature.
 
 libavx is a kernel plugin beside `libref` and `libr4d`. libref is the only other host
-implementation, and it is a slow reference. libavx implements all 150 of libref's ops with the
+implementation, and it is a slow reference. libavx implements all 161 of libref's ops with the
 same schemas and the same answers to a tolerance, the image generator's included (below).
 
     cmake -S libavx -B build-avx -DCMAKE_PREFIX_PATH=<radiance prefix> && cmake --build build-avx -j4
@@ -639,6 +639,19 @@ per (head, query tile), 64 keys of a visible tile packed at a time for broadcast
 online softmax, as `attn_prefix_self`'s f32 form; a prefix query tile sees every tile, so the tasks
 are scheduled dynamically.
 
+Its latent upscaler adds six (`avx_video.cpp`). `conv3d_ndhwc` is GEMMs over bands of patch rows, as
+`conv2d_nhwc`: the weight re-laid once a launch as `[cout][dt][kh][kw][cin]`, an output voxel's
+patch its 27 input voxels' channel runs (zeros outside the volume), each band one `gemm_nt_into`
+into f32 rows; a row is then rounded once, or with `res` rounded, its residual added and rounded
+again, the residual read before the row is written so it may be y. `group_norm` sums its
+statistics in f64 over fixed 64-row blocks combined in block order, so its bytes do not depend on
+the thread count, and keeps those sums in its own memory: only `stats[0, 2 groups)` is written.
+Both are held to the tolerance table. `tconv_dw` (each tap's product rounded before its add, in
+libref's order), `resize_bilinear` (the source rows and weights taken once a launch in libref's
+f32 steps), `patch_fold` and `flow_renoise` (`rad_philox_normal_s` a Philox block at a time) are
+libref's bit for bit and held to zero error by the hand-built cases. The convolution has not been
+tuned: MiniMax-H3 is not served on the CPU.
+
 ## Design choices
 
 Each choice below was measured on the platform above. The variants that did not pay are recorded
@@ -701,7 +714,8 @@ and spills a 16-register file, costing more than the FMA saves, so the AVX and A
     avx_{elementwise,norm,hc,quant,gemm,attn,qsa,moe,gdn,sample,misc}.cpp   the kernels; compiled 4x
     avx_gen.cpp        the image generator's norms, sampler, lanes and decoder ops; compiled 4x
     avx_gen_attn.cpp   attn_prefix_self, the generator's attention; compiled 4x
-    avx_video.cpp      the video decoder's patch unfold, tiles, stitch and positions; compiled 4x
+    avx_video.cpp      the video decoder's patch unfold, tiles, stitch and positions, and the
+                       latent upscaler's convolutions, norm, resize, fold and re-noise; compiled 4x
     avx_vsa.cpp        video sparse attention: the tile selection and the attention; compiled 4x
     avx_audio.cpp      the audio generator's vocoder, sampler, embeddings and window ops; compiled 4x
     avx_harness.h      plugin loading, row selection, the operand draw, guarded buffers, the

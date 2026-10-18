@@ -200,6 +200,14 @@ int     r4d_rad_vtile_gather          (const RadArgs*, RadStream);
 int     r4d_rad_vtile_stitch          (const RadArgs*, RadStream);
 int     r4d_rad_grid_pos3             (const RadArgs*, RadStream);
 int     r4d_rad_snake_aa              (const RadArgs*, RadStream);
+/* r4d_upscaler.hip: a video latent upscaler's 3D convolution, group norm, temporal depthwise
+ * convolution and resize, the patch fold and the re-noise. */
+int     r4d_rad_conv3d_ndhwc          (const RadArgs*, RadStream);
+int     r4d_rad_group_norm            (const RadArgs*, RadStream);
+int     r4d_rad_tconv_dw              (const RadArgs*, RadStream);
+int     r4d_rad_resize_bilinear       (const RadArgs*, RadStream);
+int     r4d_rad_patch_fold            (const RadArgs*, RadStream);
+int     r4d_rad_flow_renoise          (const RadArgs*, RadStream);
 /* r4d_vsa.hip: video sparse attention's selection (scratch for the tile means) and attention. */
 int     r4d_rad_vsa_select            (const RadArgs*, RadStream);
 int64_t r4d_rad_vsa_select_scratch    (const RadArgs*);
@@ -491,6 +499,14 @@ int r4d_rad_relayout_conv_tap(const RadParam*, int, int, const RadEncoding*, con
                               const RadTensor*, int, void*, int64_t);
 int r4d_rad_unrelayout_conv_tap(const RadParam*, int, int, const RadEncoding*, const int*,
                                 const void*, int64_t, const RadTensor*, int);
+/* conv3d_ndhwc's weight, PyTorch's [cout][cin][kt][k][k] stored tap-major [cout][kt][k][k][cin]
+ * (r4d_layout.cpp). */
+int r4d_rad_layout_conv3d_tap(const RadParam*, int, int, const RadEncoding*, const int*,
+                              const RadTensor*, int, RadLayout*);
+int r4d_rad_relayout_conv3d_tap(const RadParam*, int, int, const RadEncoding*, const int*,
+                                const RadTensor*, int, void*, int64_t);
+int r4d_rad_unrelayout_conv3d_tap(const RadParam*, int, int, const RadEncoding*, const int*,
+                                  const void*, int64_t, const RadTensor*, int);
 /* conv1d's weight, PyTorch's [cout][cin][k] stored [cout][k][cin], and conv_t1d's, PyTorch's
  * [cin][cout][2s] stored [s][cout][2][cin] (r4d_layout.cpp). */
 int r4d_rad_layout_conv1d_tap(const RadParam*, int, int, const RadEncoding*, const int*,
@@ -557,6 +573,7 @@ int r4d_rad_seg_mean        (const RadArgs*, RadStream);
 int r4d_rad_qk_norm_rope    (const RadArgs*, RadStream);
 int r4d_rad_cast_widen      (const RadArgs*, RadStream);
 int r4d_rad_cast_f16        (const RadArgs*, RadStream);
+int r4d_rad_cast_bf16       (const RadArgs*, RadStream);
 int r4d_rad_pool_rows       (const RadArgs*, RadStream);
 int r4d_rad_relu            (const RadArgs*, RadStream);
 int r4d_rad_silu            (const RadArgs*, RadStream);

@@ -2211,6 +2211,150 @@ void video_cases(std::vector<Hand>& hs) {
     }
 }
 
+/* ================================================================== the latent upscaler */
+/* Forms libref's cube descriptions do not draw: volumes of a different extent on every axis, an
+ * activation at a wider row pitch, the residual in place (res = y), a group norm in place (y = x)
+ * without its modulation and with a modulation row of the other dtype, statistics over several
+ * of avx's 64-row blocks and a part of one, kernels of other shapes, real resizes (MiniMax-H3's
+ * x2 and 4.2 x 4 ratios, and shrinking), output rows past the volume, the soundtrack's and the
+ * video's re-noise widths. tconv_dw, resize_bilinear, patch_fold and flow_renoise are held to
+ * zero error, libref's arithmetic bit for bit; the convolution's GEMM and the norm's statistics
+ * sum in another order and are held to the tolerance table. */
+void upscaler_cases(std::vector<Hand>& hs) {
+    const auto zero = [](int64_t) { return 0.0f; };
+    for (const uint32_t dt : { (uint32_t)RAD_F32, (uint32_t)RAD_BF16 }) {
+        const char* dn = dt == RAD_F32 ? "f32" : "bf16";
+        const uint32_t other = dt == RAD_F32 ? (uint32_t)RAD_BF16 : (uint32_t)RAD_F32;
+        const std::string sfx = std::string(", ") + dn;
+        const double tol = dt == RAD_F32 ? 1e-5 : 6e-3;
+
+        /* ---- conv3d_ndhwc ------------------------------------------------------------------ */
+        {
+            const int64_t T = 2, H = 3, W = 4, R = T * H * W, ci = 7, co = 11;
+            Hand h(("2 x 3 x 4, x at a pitch, the residual in place, f32 bias" + sfx).c_str(),
+                   "conv3d_ndhwc", tol);
+            h.view(dt, { R, ci }, { ci + 3, 1 }, R * (ci + 3), hfill(450))
+             .dense(dt, { co, ci, 3, 3, 3 }, hfill(451, 0.3f))
+             .dense(RAD_F32, { co }, hfill(452, 0.5f))
+             .idx({ T, H, W })
+             .dense(dt, { R, co }, hfill(453), true)
+             .alias(4)
+             .pi("M", R).pi("cin", ci).pi("cout", co).pi("k", 3).pi("kt", 3).ps("dtype", dn);
+            hs.push_back(std::move(h));
+
+            /* A temporal-only kernel over six frames of 2 x 3, two output rows past the volume. */
+            const int64_t R2 = 6 * 2 * 3, ci2 = 9, co2 = 50;
+            Hand g(("6 x 2 x 3 at kernel 5 x 1 x 1, rows past the volume" + sfx).c_str(),
+                   "conv3d_ndhwc", tol);
+            g.dense(dt, { R2, ci2 }, hfill(454))
+             .dense(dt, { co2, ci2, 5, 1, 1 }, hfill(455, 0.3f))
+             .dense(dt, { co2 }, hfill(456, 0.5f))
+             .idx({ 6, 2, 3 })
+             .none()
+             .dense(dt, { R2 + 2, co2 }, hfill(457), true)
+             .pi("M", R2 + 2).pi("cin", ci2).pi("cout", co2).pi("k", 1).pi("kt", 5)
+             .ps("dtype", dn);
+            hs.push_back(std::move(g));
+
+            Hand e(("an even kernel is refused" + sfx).c_str(), "conv3d_ndhwc", tol);
+            e.dense(dt, { R, ci }, hfill(458))
+             .dense(dt, { co, ci, 3, 2, 2 }, hfill(459))
+             .dense(dt, { co }, hfill(459))
+             .idx({ T, H, W })
+             .none()
+             .dense(dt, { R, co }, zero, true)
+             .pi("M", R).pi("cin", ci).pi("cout", co).pi("k", 2).pi("kt", 3).ps("dtype", dn)
+             .refuses(RAD_E_SHAPE);
+            hs.push_back(std::move(e));
+        }
+
+        /* ---- group_norm: stats f32 of exactly groups (2 + 3 1024) values --------------------- */
+        {
+            const int64_t R = 200, n = 48, G = 6;
+            const auto offset = [](int64_t i) { return 2.5f + 3.0f * hfill(460)(i); };
+            Hand h(("200 rows in 6 groups, y = x at a pitch, unmodulated" + sfx).c_str(),
+                   "group_norm", tol);
+            h.view(dt, { R, n }, { n + 5, 1 }, R * (n + 5), offset)
+             .dense(dt, { n }, hfill(461))
+             .dense(dt, { n }, hfill(462))
+             .none()
+             .dense(RAD_F32, { G * (2 + 3 * 1024) }, zero, true)
+             .alias(0)
+             .pi("M", R).pi("n", n).pi("groups", G).pf("eps", 1e-5).ps("act", "none")
+             .ps("dtype", dn);
+            hs.push_back(std::move(h));
+
+            const int64_t R2 = 150, n2 = 96, G2 = 32;
+            Hand g(("150 rows in 32 groups of 3, a modulation row of the other dtype, silu" +
+                    sfx).c_str(), "group_norm", tol);
+            g.dense(dt, { R2, n2 }, hfill(463, 2.0f))
+             .dense(dt, { n2 }, hfill(464))
+             .dense(dt, { n2 }, hfill(465))
+             .dense(other, { 2 * n2 }, hfill(466, 0.5f))
+             .dense(RAD_F32, { G2 * (2 + 3 * 1024) }, zero, true)
+             .dense(dt, { R2, n2 }, zero, true)
+             .pi("M", R2).pi("n", n2).pi("groups", G2).pf("eps", 1e-5).ps("act", "silu")
+             .ps("dtype", dn);
+            hs.push_back(std::move(g));
+        }
+
+        /* ---- tconv_dw: seven frames of 2 x 3, x at a pitch, rows past the volume ------------ */
+        {
+            const int64_t R = 7 * 2 * 3, n = 37;
+            Hand h(("7 x 2 x 3 at k 5, x at a pitch, rows past the volume" + sfx).c_str(),
+                   "tconv_dw", 0.0);
+            h.view(dt, { R, n }, { n + 3, 1 }, R * (n + 3), hfill(470))
+             .dense(dt, { n, 1, 5, 1, 1 }, hfill(471, 0.5f))
+             .dense(RAD_F32, { n }, hfill(472, 0.5f))
+             .idx({ 7, 2, 3 })
+             .dense(dt, { R + 2, n }, hfill(473), true)
+             .pi("M", R + 2).pi("n", n).pi("k", 5).ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+
+        /* ---- resize_bilinear: up and down at once, H3's ratios, shrinking ------------------- */
+        {
+            struct Rs { int64_t T, h, w, H, W, n; const char* what; };
+            static const Rs kRs[] = { { 2, 3, 5, 7, 4, 37, "3 x 5 to 7 x 4" },
+                                      { 2, 5, 3, 10, 6, 16, "5 x 3 to 10 x 6 (x2)" },
+                                      { 1, 5, 3, 21, 12, 16, "5 x 3 to 21 x 12 (4.2 x 4)" },
+                                      { 3, 6, 7, 4, 2, 20, "6 x 7 to 4 x 2" } };
+            for (const Rs& v : kRs) {
+                const int64_t rin = v.T * v.h * v.w, rout = v.T * v.H * v.W;
+                Hand h((std::string(v.what) + ", x at a pitch, rows past" + sfx).c_str(),
+                       "resize_bilinear", 0.0);
+                h.view(dt, { rin, v.n }, { v.n + 2, 1 }, rin * (v.n + 2), hfill(480 + v.h))
+                 .idx({ v.T, v.h, v.w, v.H, v.W })
+                 .dense(dt, { rout + 3, v.n }, hfill(481), true)
+                 .pi("M", rout + 3).pi("n", v.n).ps("dtype", dn);
+                hs.push_back(std::move(h));
+            }
+        }
+
+        /* ---- patch_fold: 2 x 3 x 2 patches of 2 x 2 x 2, x at a pitch, rows past ------------ */
+        {
+            Hand h(("2 x 3 x 2 patches of 2 x 2 x 2, x at a pitch, rows past" + sfx).c_str(),
+                   "patch_fold", 0.0);
+            h.view(dt, { 96, 5 }, { 8, 1 }, 96 * 8, hfill(490, 3.0f))
+             .idx({ 2, 3, 2 })
+             .dense(RAD_F32, { 14, 40 }, hfill(491), true)
+             .pi("M", 14).pi("C", 5).pi("pt", 2).pi("ph", 2).pi("pw", 2)
+             .ps("mul", "0.5 1.25 -2 0.3 1.7").ps("add", "0.1 -0.2 0.3 0 2.5").ps("dtype", dn);
+            hs.push_back(std::move(h));
+        }
+    }
+
+    /* ---- flow_renoise: the video's 96 and the soundtrack's 32, rows at a wider pitch --------- */
+    for (const int64_t n : { 96, 32 }) {
+        Hand h(("n " + std::to_string(n) + ", rows at a wider pitch").c_str(), "flow_renoise", 0.0);
+        h.dense(RAD_F32, { 1 }, [](int64_t) { return 0.37f; })
+         .idx({ 12345, 81 })
+         .view(RAD_F32, { 7, n }, { n + 5, 1 }, 7 * (n + 5), hfill(495, 2.0f), true)
+         .pi("M", 7).pi("n", n).pi("stream", 1).ps("dtype", "f32");
+        hs.push_back(std::move(h));
+    }
+}
+
 /* ================================================================== video sparse attention
  * What libref's descriptions cannot draw: uneven dense segments (13 and 14 rows: a tile each in
  * boxes of 4, two each in boxes of 2) before a 6 x 5 x 7 grid (a 10 x 14 latent at patch 2) with
@@ -3892,6 +4036,7 @@ bool hand_cases(const Check& ck) {
     packed_cases(hs);
     gen_cases(hs);
     video_cases(hs);
+    upscaler_cases(hs);
     vsa_cases(hs);
     qsa_cases(hs);
     encoder_cases(hs);

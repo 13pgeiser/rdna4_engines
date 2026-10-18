@@ -13,8 +13,9 @@
  *   1. ADECODE, then each VDECODE chunk in order, of a lane whose denoising is done: they finish
  *      a request and free its lane.
  *   2. VCOND of an admitted request, so its steps can follow the current request's without a gap.
- *   3. VSTEP of the oldest lane with steps left. Requests are denoised one after another, not in
- *      turns: a pass is one request's whole sequence, so taking turns would only delay the first.
+ *   3. VSTEP of the oldest lane with steps left, or its VUPSCALE once its small steps are done.
+ *      Requests are denoised one after another, not in turns: a pass is one request's whole
+ *      sequence, so taking turns would only delay the first.
  */
 #pragma once
 #include "video.h"
@@ -67,6 +68,14 @@ private:
         int64_t       n_samples = 0;     /* the soundtrack's samples a channel */
         VideoSchedule sched;
         std::vector<float> pos;          /* [3, rows] */
+        /* Latent upscaling: the evaluations at the small size (0: none), its geometry, rows and
+         * positions, the factor the network is told, and whether the upscale has run. */
+        int32_t       split = 0;
+        RadVideoGeom  geom_small{};
+        int64_t       rows_small = 0;
+        std::vector<float> pos_small;
+        float         factor = 0.0f;
+        bool          upscaled = false;
         int32_t  lane = -1;
         bool     admitted = false;
         bool     cond_done = false;
@@ -87,15 +96,19 @@ private:
     /* Staging regions: their offsets in the host span and every rank's slab. */
     struct Region { int64_t off = 0, bytes = 0, used = 0; };
     enum { R_TOK, R_POS, R_CU, R_ROPE, R_GEOM, R_SCHED, R_TV, R_TA, R_SEED, R_LANE, R_FIRST,
-           R_SEG, R_LAT, R_N };
+           R_SEG, R_LAT, R_UP, R_N };
 
     template <class T> T* hptr(int r) const { return reinterpret_cast<T*>(host_ + reg_[r].off); }
     template <class T> T* dptr(int rank, int r) const {
         return reinterpret_cast<T*>((char*)dev_[(size_t)rank] + reg_[r].off);
     }
     int  upload();
-    void base_batches(const Job& j, int64_t n_tok, int step);
-    void stage_geom(const Job& j, int32_t chunk);
+    /* The geometry and rows of the job's next step: the small ones before its upscale. */
+    bool small_now(const Job& j) const { return j.split > 0 && !j.upscaled; }
+    void base_batches(const Job& j, const RadVideoGeom& g, int64_t n_tok, int step);
+    void stage_geom(const Job& j, const RadVideoGeom& g, int64_t rows, int32_t chunk);
+    void stage_sched(const Job& j, int32_t i, bool to_clean);
+    void stage_seed(const Job& j);
 
     void admit_locked();
     void release_locked(Job& j);
@@ -104,6 +117,7 @@ private:
 
     const RadBatch* build_cond(Job& j, int step);
     const RadBatch* build_step(Job& j, int step);
+    const RadBatch* build_upscale(Job& j, int step);
     const RadBatch* build_audio(Job& j, int step);
     const RadBatch* build_chunk(Job& j, int step);
 

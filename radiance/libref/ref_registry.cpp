@@ -750,6 +750,25 @@ static const RadOperandSpec oAttnVsa[] = { OPD("q"), OPD("k"), OPD("v"), OPD("se
                                            OPD("geom"), OPD("sel"), OPD_O("coarse"),
                                            OPD_O("gate"), OUT("out"), OPD_O("k_i8"),
                                            OPD_O("k_scale"), OPD_O("v_scale") };
+/* ---- the latent upscaler (ref_video.cpp). `geom` is the request's volume, i32 on the device:
+ * (T, H, W) for conv3d_ndhwc and tconv_dw, (T, h, w, H, W) for resize_bilinear and (F, Hp, Wp)
+ * for patch_fold, which shares patch_unfold's parameters and operands. */
+static const RadParamSpec pConv3d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
+                                        P_INT("kt"), P_STR("dtype") };
+static const RadOperandSpec oConv3d[] = { OPD("x"), WGT("w"), WGT("b"), OPD("geom"),
+                                          OPD_O("res"), OUT("y") };
+/* `mod` is one row [scale | shift]; `stats` the per-group mean and rstd, then scratch. */
+static const RadParamSpec pGroupNorm[] = { P_INT("M"), P_INT("n"), P_INT("groups"), P_F64("eps"),
+                                           P_STR("act"), P_STR("dtype") };
+static const RadOperandSpec oGroupNorm[] = { OPD("x"), WGT("w"), WGT("b"), OPD_O("mod"),
+                                             INOUT("stats"), OUT("y") };
+static const RadParamSpec pTconvDw[] = { P_INT("M"), P_INT("n"), P_INT("k"), P_STR("dtype") };
+static const RadOperandSpec oTconvDw[] = { OPD("x"), WGT("w"), WGT("b"), OPD("geom"), OUT("y") };
+static const RadOperandSpec oResize[] = { OPD("x"), OPD("geom"), OUT("y") };
+/* `sigma` is one f32 value, `seed` two u32 words, low first. */
+static const RadParamSpec pFlowRenoise[] = { P_INT("M"), P_INT("n"), P_INT("stream"),
+                                             P_STR("dtype") };
+static const RadOperandSpec oFlowRenoise[] = { OPD("sigma"), OPD("seed"), INOUT("x") };
 
 /* ---- audio generation (ref_audio.cpp) */
 static const RadParamSpec pConv1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
@@ -1443,6 +1462,32 @@ static const RadOpSchema kSchemas[] = {
   "its k tiles of `sel` (k ascending video tiles, RAD_E_INVAL otherwise); f32 softmax with the "
   "max subtracted. With `coarse` and `gate`: out = rd(rd(o) + coarse[h][tile] gate), rd the "
   "output's dtype." },
+{ "conv3d_ndhwc", ARR(pConv3d), ARR(oConv3d),
+  "a 3-D convolution over voxel rows [T H W, cin] -> [T H W, cout] (geom = (T, H, W)): "
+  "PyTorch's Conv3d weight [cout, cin, kt, k, k] and bias, stride 1, `same` zero padding (kt/2 "
+  "frames, k/2 rows and columns a side; k and kt odd), f32 accumulation, rd(acc + b); with `res`, "
+  "rd(rd(acc + b) + res), `res` possibly y itself." },
+{ "group_norm", ARR(pGroupNorm), ARR(oGroupNorm),
+  "PyTorch's GroupNorm over all M rows: group g is channels [g n/groups, (g+1) n/groups), its "
+  "biased mean and variance in f64, rstd = 1 / sqrt(var + eps) in f32; v = (x - mean) rstd w + b, "
+  "with `mod` (one row [scale | shift]) v (1 + scale) + shift, `act` none or silu, one rounding. "
+  "stats[2g], stats[2g+1] get the mean and rstd; stats holds groups (2 + 3 1024) f32, the rest "
+  "scratch. y may be x." },
+{ "tconv_dw", ARR(pTconvDw), ARR(oTconvDw),
+  "a depthwise convolution along the frames of voxel rows (geom = (T, H, W)): PyTorch's "
+  "[n, 1, k, 1, 1] weight and bias, k odd, zero frames outside [0, T), the sum f32 in tap order, "
+  "rd(acc + b)." },
+{ "resize_bilinear", ARR(pMnD), ARR(oResize),
+  "each frame of voxel rows [T h w, n] resized to [T H W, n] (geom = (T, h, w, H, W)) as torch's "
+  "bilinear with align_corners=False at a size: src = max(f32(h / H) (i + 0.5) - 0.5, 0), its "
+  "floor and the next row clamped, weights in f32, rounded once." },
+{ "patch_fold", ARR(pPatchUnfold), ARR(oPatchUnfold),
+  "patch_unfold's inverse: voxel rows [(F pt) (Hp ph) (Wp pw), C] folded to patch rows "
+  "[F Hp Wp, C pt ph pw] (geom = (F, Hp, Wp)) and normalised, f32(f32(x * mul[c]) + add[c]) with "
+  "`mul` and `add` lists of C f32 values." },
+{ "flow_renoise", ARR(pFlowRenoise), ARR(oFlowRenoise),
+  "a clean latent re-noised to sigma s: x = f32(f32(f32(1 - s) x) + f32(s z)), z element "
+  "k n + c of the normal stream (seed, `stream`) (abi/rad_philox.h)." },
 { "conv1d", ARR(pConv1d), ARR(oConv1d),
   "a 1-D convolution over the sequences `cu_seqlens` bounds, channels innermost: x [rows, cin], "
   "y [rows, cout], PyTorch's [cout, cin, k] weight and an optional bias, dilation `dil` and padding "
@@ -1943,6 +1988,19 @@ SIMPLE("ref_vsa_select", "vsa_select", "attn",
 SIMPLE("ref_attn_vsa", "attn_vsa", "attn",
        "block-sparse attention over the prefix and selected video tiles, the gated coarse term",
        "float q, k, v, coarse, gate and out; i32 segs, geom and sel", ref_attn_vsa),
+SIMPLE("ref_conv3d_ndhwc", "conv3d_ndhwc", "conv",
+       "a 3-D convolution over voxel rows, channels innermost", DT_FLOAT, ref_conv3d_ndhwc),
+SIMPLE("ref_group_norm", "group_norm", "norm",
+       "a group norm over all rows, optionally modulated, then an activation", DT_FLOAT,
+       ref_group_norm),
+SIMPLE("ref_tconv_dw", "tconv_dw", "conv", "a depthwise convolution along a volume's frames",
+       DT_FLOAT, ref_tconv_dw),
+SIMPLE("ref_resize_bilinear", "resize_bilinear", "elem",
+       "each frame of a volume resized bilinearly", DT_FLOAT, ref_resize_bilinear),
+SIMPLE("ref_patch_fold", "patch_fold", "elem", "voxel rows to normalised patch rows", DT_FLOAT,
+       ref_patch_fold),
+SIMPLE("ref_flow_renoise", "flow_renoise", "elem", "a clean latent re-noised to a sigma", DT_FLOAT,
+       ref_flow_renoise),
 SIMPLE("ref_conv1d", "conv1d", "conv", "a 1-D convolution over sequences, channels innermost",
        DT_FLOAT, ref_conv1d),
 SIMPLE("ref_conv_t1d", "conv_t1d", "conv", "a transposed 1-D convolution growing each sequence",

@@ -641,6 +641,9 @@ struct VideoGenInfo {
     int64_t sample_rate = 0, channels = 0;
     int64_t default_steps = 0, max_steps = 0, max_lanes = 1;
     bool    fixed_steps = false;   /* a trained schedule: max_steps grid points and no other */
+    /* A latent upscaler: the largest factor (0: none) and the full-size evaluations by default. */
+    double  upscale_max = 0.0;
+    int64_t upscale_refine = 0;
 };
 
 class IVideoGen {

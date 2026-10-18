@@ -1,21 +1,35 @@
 /* avx_video.cpp -- the video generator's ops around its decoder (docs/OPS.md, "Video
  * generation"): the latent's patch rows unfolded to voxels, the tiles a video decoder runs over,
  * gathered from the latent and stitched back into frames, and the rotary positions of a tile's
- * tokens.
+ * tokens; and its latent upscaler's (docs/OPS.md, "The latent upscaler"): the 3-D convolution,
+ * the group norm, the temporal depthwise convolution, the per-frame resize, the fold back into
+ * patch rows and the re-noising.
  *
- * Bit-exact with libref (libref/ref_video.cpp): they are copies and roundings, and a seed must
- * give the same video bytes on both host libraries. Where libref multiplies and then adds in two
- * roundings, `keep` stops the compiler from fusing the pair (this plugin is built with
- * -ffp-contract=fast, libref without contraction); the stitch's bf16 blends are passes of whole
- * rows through x's dtype (`narrow_row`), so a product is rounded before the sum reads it.
+ * Bit-exact with libref (libref/ref_video.cpp) but for conv3d_ndhwc and group_norm: they are
+ * copies, roundings and short sums in libref's order, and a seed must give the same video bytes
+ * on both host libraries. Where libref multiplies and then adds in two roundings, `keep` stops the
+ * compiler from fusing the pair (this plugin is built with -ffp-contract=fast, libref without
+ * contraction); the stitch's bf16 blends are passes of whole rows through x's dtype
+ * (`narrow_row`), so a product is rounded before the sum reads it. conv3d_ndhwc is GEMMs over
+ * patch rows and group_norm sums its statistics over fixed row blocks; both are held to the
+ * tolerance table.
  */
 #include "avx_vec.h"
 #include "avx_common.h"
+#include "rad_philox.h"
 
 #include <algorithm>
 #include <vector>
 
 using namespace avx;
+
+namespace avx {
+inline namespace AVX_SUFFIX {
+/* gemm_nt's product over operands assembled by a composite kernel (avx_gemm.cpp). */
+int gemm_nt_into(const RadTensor* A, const RadTensor* B, const RadTensor* bias, const RadTensor* Y,
+                 int64_t M, int64_t N, int64_t K);
+}  /* inline namespace AVX_SUFFIX */
+}  /* namespace avx */
 
 namespace {
 
@@ -29,14 +43,50 @@ inline void narrow_row(uint32_t dt, float* v, int64_t n, float* tmp) {
     row_to_f32(dt, tmp, v, n);
 }
 
-/* A value the compiler may not fuse into the next add. */
+/* A value the compiler may not fuse into the next add. At the scalar level a vector is a float. */
 #if AVX_LEVEL == 0
 inline float keep(float x) { __asm__("" : "+x"(x)); return x; }
 #elif AVX_LEVEL == 3
 inline float keep(float x) { __asm__("" : "+v"(x)); return x; }
+inline vf keep(vf x) { __asm__("" : "+v"(x)); return x; }
 #else
 inline float keep(float x) { __asm__("" : "+x"(x)); return x; }
+inline vf keep(vf x) { __asm__("" : "+x"(x)); return x; }
 #endif
+
+/* A dense rank-2 view of `rows` x `cols` elements of dtype `dt` at `data`. */
+inline RadTensor mat_view(void* data, uint32_t dt, int64_t rows, int64_t cols) {
+    RadTensor t{};
+    t.data = data;
+    t.dtype = dt;
+    t.rank = 2;
+    t.shape[0] = rows; t.shape[1] = cols;
+    t.stride[0] = cols; t.stride[1] = 1;
+    return t;
+}
+
+/* Elements [e0, e0 + cnt) of the normal stream (seed, stream) into out (abi/rad_philox.h): the same
+ * arithmetic as rad_philox_normal_s, with one Philox block and one log per element pair instead of
+ * one each per element (avx_audio.cpp's). */
+void philox_normals_s(uint64_t seed, uint64_t stream, uint64_t e0, int64_t cnt, float* out) {
+    uint64_t e = e0;
+    int64_t i = 0;
+    while (i < cnt) {
+        const uint64_t g = e >> 2;
+        uint32_t c[4] = { (uint32_t)g, (uint32_t)(g >> 32), (uint32_t)stream,
+                          (uint32_t)(stream >> 32) };
+        rad_philox4x32_10(c, (uint32_t)seed, (uint32_t)(seed >> 32));
+        for (int pair = (int)((e & 3u) >> 1); pair < 2 && i < cnt; ++pair) {
+            const uint32_t wa = c[pair * 2], wb = c[pair * 2 + 1];
+            const float ua = ((float)(wa >> 8) + 0.5f) * (1.0f / 16777216.0f);
+            const float ub = ((float)(wb >> 8) + 0.5f) * (1.0f / 16777216.0f);
+            const float r = sqrtf(-2.0f * logf(ua));
+            const float t = 6.28318530717958647692f * ub;
+            if ((e & 1u) == 0) { out[i++] = r * cosf(t); ++e; }
+            if (i < cnt) { out[i++] = r * sinf(t); ++e; }
+        }
+    }
+}
 
 /* The f32 values of a space-separated list (libref's parse_f32_list): up to `cap` into out, the
  * count returned whatever it is. */
@@ -139,6 +189,44 @@ AVX_KERNEL(patch_unfold) {
             const int64_t r = ((f * pt + ta) * Hv + i * ph + yb) * Wv + j * pw + xd;
             out_row(Y, rowoff(Y, r, C), C, row);
         }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ patch_fold */
+/* Voxel rows folded into normalised patch rows, f32(f32(x * mul[c]) + add[c]) (libref): a task
+ * is a patch, its pt ph pw voxel rows read once each and dealt into its row. */
+AVX_KERNEL(patch_fold) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *G = &a->t[1], *Y = &a->t[2];
+    const int64_t C = p_int(a, "C", 0), pt = p_int(a, "pt", 0);
+    const int64_t ph = p_int(a, "ph", 0), pw = p_int(a, "pw", 0);
+    const char* ms = p_str(a, "mul", ""), *as = p_str(a, "add", "");
+    /* Each number takes at least two characters but the last, so this bounds the count. */
+    const int64_t cap = (int64_t)((std::strlen(ms) + std::strlen(as)) / 2 + 2);
+    float* lists = (float*)scratch_raw((size_t)(2 * cap + 16) * sizeof(float));
+    float *mul = lists, *add = lists + cap;
+    if (C <= 0 || pt <= 0 || ph <= 0 || pw <= 0 || parse_f32(ms, mul, cap) != C ||
+        parse_f32(as, add, cap) != C || numel(G) < 3)
+        return RAD_E_SHAPE;
+    const int64_t F = at(G, 0), Hp = at(G, 1), Wp = at(G, 2);
+    if (F <= 0 || Hp <= 0 || Wp <= 0) return RAD_E_SHAPE;
+    const int64_t vol = pt * ph * pw, Hv = Hp * ph, Wv = Wp * pw, K = C * vol;
+    const int64_t rows = F * Hp * Wp;
+    if (rows_of(Y, K) < rows || rows_of(X, C) < F * pt * Hv * Wv) return RAD_E_SHAPE;
+
+    AVX_PARALLEL_FOR_IF(rows * K >= AVX_PAR_MIN)
+    for (int64_t pi = 0; pi < rows; ++pi) {
+        float* buf = scratch_f32((size_t)(K + C + 32));
+        float *row = buf, *xs = buf + K + 16;
+        const int64_t f = pi / (Hp * Wp), i = (pi / Wp) % Hp, j = pi % Wp;
+        for (int64_t sub = 0; sub < vol; ++sub) {
+            const int64_t ta = sub / (ph * pw), tb = (sub / pw) % ph, td = sub % pw;
+            const int64_t r = ((f * pt + ta) * Hv + i * ph + tb) * Wv + j * pw + td;
+            const float* xr = in_row(X, rowoff(X, r, C), C, xs);
+            for (int64_t c = 0; c < C; ++c) row[c * vol + sub] = keep(xr[c] * mul[c]) + add[c];
+        }
+        out_row(Y, rowoff(Y, pi, K), K, row);
     }
     return RAD_OK;
 }
@@ -348,6 +436,354 @@ AVX_KERNEL(vtile_stitch) {
             const int64_t pb = rowoff(PV, k * npx + Yp * Wp + X0, 3);
             for (int64_t c = 0; c < 3; ++c) stt(PV, pb + c * laststride(PV), row[X0 * 3 + c]);
         }
+    }
+    return RAD_OK;
+}
+
+/* ================================================================== the latent upscaler
+ * Voxel rows (t, i, j) of a T x H x W volume, channels innermost, the volume in `geom`. */
+
+/* ------------------------------------------------------------------ conv3d_ndhwc */
+/* A 3-D convolution as GEMMs over bands of patch rows, as conv2d_nhwc and conv1d take theirs. The
+ * weight [cout, cin, kt, k, k] is re-laid once a launch as [cout][dt][kh][kw][cin] (bf16 copies
+ * when it is bf16, f32 otherwise), so an output voxel's patch row is its kt k k input voxels'
+ * channel runs back to back, zeros outside the volume: bf16 copies when x is bf16 with dense
+ * rows, f32 otherwise. A band is one gemm_nt_into into f32 rows, the bias added there; each row
+ * is then rounded once into y, or with `res` rounded to y's dtype, its residual row added and
+ * rounded again. A band's residual rows are read before its rows of y are written, row by row,
+ * so `res` may be y. The patches and the weight live in thread_local vectors that keep their
+ * high-water size, leaving the GEMM's scratch arenas to it. */
+AVX_KERNEL(conv3d_ndhwc) {
+    if (a->n_t < 6 || !rad_args_have(a, 4) || !rad_arg_in(a, 5)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *W = &a->t[1], *B = &a->t[2], *G = &a->t[3];
+    const RadTensor *R = rad_arg_in(a, 4), *Y = &a->t[5];
+    const int64_t cin = p_int(a, "cin", 0), cout = p_int(a, "cout", 0);
+    const int64_t k = p_int(a, "k", 0), kt = p_int(a, "kt", 0);
+    if (cin <= 0 || cout <= 0 || k <= 0 || kt <= 0 || !(k & 1) || !(kt & 1) || numel(G) < 3)
+        return RAD_E_SHAPE;
+    const int64_t T = at(G, 0), H = at(G, 1), Wd = at(G, 2);
+    if (T <= 0 || H <= 0 || Wd <= 0) return RAD_E_SHAPE;
+    const int64_t rows = T * H * Wd, taps = kt * k * k, KK = taps * cin;
+    if (rows_of(Y, cout) < rows || rows_of(X, cin) < rows || (R && rows_of(R, cout) < rows) ||
+        numel(W) < cout * KK || numel(B) < cout)
+        return RAD_E_SHAPE;
+    static thread_local std::vector<uint8_t> wbuf, pbuf;
+    static thread_local std::vector<float> ybuf;
+
+    /* ---- the weight, [cout][dt][kh][kw][cin] */
+    const bool w16 = W->dtype == RAD_BF16;
+    wbuf.resize((size_t)(cout * KK) * (w16 ? 2 : 4) + 64);
+    uint8_t* wp = wbuf.data();
+    AVX_PARALLEL_FOR_IF(cout * KK >= AVX_PAR_MIN)
+    for (int64_t co = 0; co < cout; ++co)
+        for (int64_t ci = 0; ci < cin; ++ci)
+            for (int64_t tp = 0; tp < taps; ++tp) {
+                const int64_t src = (co * cin + ci) * taps + tp, dst = co * KK + tp * cin + ci;
+                if (w16) ((uint16_t*)wp)[dst] = ((const uint16_t*)W->data)[src];
+                else     ((float*)wp)[dst] = ld_elem(W->data, W->dtype, src);
+            }
+    const RadTensor wt = mat_view(wp, w16 ? (uint32_t)RAD_BF16 : (uint32_t)RAD_F32, cout, KK);
+
+    /* ---- bands of patch rows: at least 8 Mi elements and eight times the weight, so the GEMM's
+     * per-call weight pack is amortised, at most 32 Mi (64 MiB of bf16 kept after the call) */
+    const bool x16 = X->dtype == RAD_BF16 && laststride(X) == 1;
+    const size_t ael = x16 ? 2 : 4;
+    const int64_t want = std::min<int64_t>((int64_t)1 << 25,
+                                           std::max<int64_t>((int64_t)1 << 23, 8 * cout * KK));
+    const int64_t band = std::max<int64_t>(1, std::min(rows, want / KK));
+    pbuf.resize((size_t)(band * KK) * ael + 64);
+    ybuf.resize((size_t)(band * cout) + 16);
+    char* pp = (char*)pbuf.data();
+    float* yp = ybuf.data();
+    const int64_t pz = kt / 2, ps = k / 2;
+    for (int64_t r0 = 0; r0 < rows; r0 += band) {
+        const int64_t nb = std::min(band, rows - r0);
+        AVX_PARALLEL_FOR_IF(nb * KK >= AVX_PAR_MIN)
+        for (int64_t pr = 0; pr < nb; ++pr) {
+            const int64_t r = r0 + pr, t = r / (H * Wd), i = (r / Wd) % H, j = r % Wd;
+            char* d = pp + (size_t)(pr * KK) * ael;
+            for (int64_t dz = 0; dz < kt; ++dz)
+                for (int64_t kh = 0; kh < k; ++kh)
+                    for (int64_t kw = 0; kw < k; ++kw, d += (size_t)cin * ael) {
+                        const int64_t tz = t + dz - pz, iy = i + kh - ps, ix = j + kw - ps;
+                        if (tz < 0 || tz >= T || iy < 0 || iy >= H || ix < 0 || ix >= Wd) {
+                            std::memset(d, 0, (size_t)cin * ael);
+                            continue;
+                        }
+                        const int64_t xo = rowoff(X, (tz * H + iy) * Wd + ix, cin);
+                        if (x16) {
+                            std::memcpy(d, (const uint16_t*)X->data + xo, (size_t)cin * 2);
+                        } else {
+                            const float* s = in_row(X, xo, cin, (float*)d);
+                            if (s != (const float*)d) std::memcpy(d, s, (size_t)cin * 4);
+                        }
+                    }
+        }
+        const RadTensor pt = mat_view(pp, x16 ? (uint32_t)RAD_BF16 : (uint32_t)RAD_F32, nb, KK);
+        const RadTensor yt = mat_view(yp, RAD_F32, nb, cout);
+        const int st = gemm_nt_into(&pt, &wt, B, &yt, nb, cout, KK);
+        if (st < 0) return st;
+        AVX_PARALLEL_FOR_IF(nb * cout >= AVX_PAR_MIN)
+        for (int64_t pr = 0; pr < nb; ++pr) {
+            float* row = yp + pr * cout;
+            if (R) {
+                float* buf = scratch_f32((size_t)(2 * cout + 32));
+                float *tmp = buf, *rs = buf + cout + 16;
+                narrow_row(Y->dtype, row, cout, tmp);
+                const float* rr = in_row(R, rowoff(R, r0 + pr, cout), cout, rs);
+                for (int64_t c = 0; c < cout; ++c) row[c] += rr[c];
+            }
+            out_row(Y, rowoff(Y, r0 + pr, cout), cout, row);
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ group_norm */
+/* A group norm over all rows (libref's definition). The statistics are f64 sums over fixed blocks
+ * of 64 rows, each block's per-group sums in row-major order and the blocks combined in block
+ * order, so the bytes do not depend on the thread count; two passes, the variance about the f64
+ * mean. The rows are then normalised in f32 from per-channel tables (the group's mean and rstd,
+ * w, b, 1 + scale and shift), each product kept apart from the add after it as libref rounds
+ * them, and rounded once. stats[0, 2 groups) gets the mean and rstd; the rest of `stats` is not
+ * touched, the block sums being kept in this plugin's own memory. */
+AVX_KERNEL(group_norm) {
+    if (a->n_t < 6 || !rad_args_have(a, 3) || !rad_arg_in(a, 4) || !rad_arg_in(a, 5))
+        return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *W = &a->t[1], *B = &a->t[2], *MD = rad_arg_in(a, 3);
+    const RadTensor *ST = &a->t[4], *Y = &a->t[5];
+    const int64_t n = p_int(a, "n", 0), G = p_int(a, "groups", 0);
+    const float eps = p_f32(a, "eps", 1e-5f);
+    static const char* const kActs[] = { "none", "silu" };
+    const int act = p_enum(a, "act", kActs, 2, 0);
+    if (act < 0 || act > 1) return RAD_E_INVAL;
+    if (n <= 0 || G <= 0 || n % G || numel(W) < n || numel(B) < n ||
+        (MD && numel(MD) < 2 * n) || numel(ST) < G * (2 + 3 * 1024))
+        return RAD_E_SHAPE;
+    const int64_t rows = rows_of(Y, n), cg = n / G;
+    if (rows <= 0 || rows_of(X, n) < rows) return RAD_E_SHAPE;
+    constexpr int64_t kBlock = 64;
+    const int64_t nblk = (rows + kBlock - 1) / kBlock;
+    const double cnt = (double)rows * (double)cg;
+    static thread_local std::vector<double> part;
+    part.assign((size_t)(nblk * G + 2 * G), 0.0);
+    double *ps = part.data(), *mu = ps + nblk * G, *var = mu + G;
+
+    /* Block bk's per-group sums of x, or with `dev` of (x - mu)^2, into ps[bk G, (bk + 1) G). */
+    for (const bool dev : { false, true }) {
+        AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+        for (int64_t bk = 0; bk < nblk; ++bk) {
+            float* xs = scratch_f32((size_t)n + 16);
+            double* s = ps + bk * G;
+            const int64_t r1 = std::min(rows, (bk + 1) * kBlock);
+            for (int64_t r = bk * kBlock; r < r1; ++r) {
+                const float* x = in_row(X, rowoff(X, r, n), n, xs);
+                for (int64_t g = 0; g < G; ++g) {
+                    const float* xg = x + g * cg;
+                    double acc = s[g];
+                    if (dev) {
+                        for (int64_t c = 0; c < cg; ++c) {
+                            const double d = (double)xg[c] - mu[g];
+                            acc += d * d;
+                        }
+                    } else {
+                        for (int64_t c = 0; c < cg; ++c) acc += (double)xg[c];
+                    }
+                    s[g] = acc;
+                }
+            }
+        }
+        for (int64_t g = 0; g < G; ++g) {
+            double tot = 0.0;
+            for (int64_t bk = 0; bk < nblk; ++bk) {
+                tot += ps[bk * G + g];
+                ps[bk * G + g] = 0.0;
+            }
+            (dev ? var : mu)[g] = tot / cnt;
+        }
+    }
+
+    /* Per-channel tables: mean, rstd, w, b, 1 + scale and shift. */
+    float* tab = (float*)scratch_raw((size_t)(6 * n + 16) * sizeof(float));
+    float *mc = tab, *rc = mc + n, *wc = rc + n, *bc = wc + n, *sc = bc + n, *sh = sc + n;
+    for (int64_t g = 0; g < G; ++g) {
+        const float m = (float)mu[g], rs = 1.0f / std::sqrt((float)var[g] + eps);
+        stt(ST, offlin(ST, 2 * g), m);
+        stt(ST, offlin(ST, 2 * g + 1), rs);
+        for (int64_t c = g * cg; c < (g + 1) * cg; ++c) { mc[c] = m; rc[c] = rs; }
+    }
+    for (int64_t c = 0; c < n; ++c) {
+        wc[c] = ld_elem(W->data, W->dtype, c);
+        bc[c] = ld_elem(B->data, B->dtype, c);
+        sc[c] = MD ? 1.0f + ldt(MD, offlin(MD, c)) : 1.0f;
+        sh[c] = MD ? ldt(MD, offlin(MD, n + c)) : 0.0f;
+    }
+    const bool modded = MD != nullptr;
+
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        float* buf = scratch_f32((size_t)(2 * n + 32));
+        float *xs = buf, *v = buf + n + 16;
+        const float* x = in_row(X, rowoff(X, r, n), n, xs);
+        const vf one = vf_set1(1.0f);
+        int64_t c = 0;
+        for (; c + VF_N <= n; c += VF_N) {
+            vf t = vf_mul(vf_sub(vf_loadu(x + c), vf_loadu(mc + c)), vf_loadu(rc + c));
+            t = vf_add(keep(vf_mul(t, vf_loadu(wc + c))), vf_loadu(bc + c));
+            if (modded) t = vf_add(keep(vf_mul(t, vf_loadu(sc + c))), vf_loadu(sh + c));
+            if (act) t = vf_div(t, vf_add(one, vf_exp(vf_sub(vf_zero(), t))));
+            vf_storeu(v + c, t);
+        }
+        for (; c < n; ++c) {
+            float t = (x[c] - mc[c]) * rc[c];
+            t = keep(t * wc[c]) + bc[c];
+            if (modded) t = keep(t * sc[c]) + sh[c];
+            if (act) t = t / (1.0f + sc_exp(-t));
+            v[c] = t;
+        }
+        out_row(Y, rowoff(Y, r, n), n, v);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ tconv_dw */
+/* A depthwise convolution along the frames, libref's sum bit for bit: each output row adds its
+ * in-volume taps in ascending order, every product rounded before its add, then the bias, a
+ * vector across the channels. The taps are re-laid once a launch as [k][n] f32 beside the bias. */
+AVX_KERNEL(tconv_dw) {
+    if (!rad_args_have(a, 5)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *W = &a->t[1], *B = &a->t[2], *G = &a->t[3], *Y = &a->t[4];
+    const int64_t n = p_int(a, "n", 0), k = p_int(a, "k", 0);
+    if (n <= 0 || k <= 0 || !(k & 1) || numel(G) < 3 || numel(W) < n * k || numel(B) < n)
+        return RAD_E_SHAPE;
+    const int64_t T = at(G, 0), H = at(G, 1), Wd = at(G, 2);
+    if (T <= 0 || H <= 0 || Wd <= 0) return RAD_E_SHAPE;
+    const int64_t P = H * Wd, rows = T * P;
+    if (rows_of(Y, n) < rows || rows_of(X, n) < rows) return RAD_E_SHAPE;
+    float* tab = (float*)scratch_raw((size_t)((k + 1) * n + 16) * sizeof(float));
+    for (int64_t c = 0; c < n; ++c) {
+        for (int64_t j = 0; j < k; ++j) tab[j * n + c] = ld_elem(W->data, W->dtype, c * k + j);
+        tab[k * n + c] = ld_elem(B->data, B->dtype, c);
+    }
+    const float* bias = tab + k * n;
+
+    AVX_PARALLEL_FOR_IF(rows * n * k >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        float* buf = scratch_f32((size_t)(2 * n + 32));
+        float *xs = buf, *acc = buf + n + 16;
+        const int64_t t = r / P, p = r % P;
+        for (int64_t c = 0; c < n; ++c) acc[c] = 0.0f;
+        for (int64_t j = 0; j < k; ++j) {
+            const int64_t tz = t + j - k / 2;
+            if (tz < 0 || tz >= T) continue;
+            const float* x = in_row(X, rowoff(X, tz * P + p, n), n, xs);
+            const float* w = tab + j * n;
+            int64_t c = 0;
+            for (; c + VF_N <= n; c += VF_N)
+                vf_storeu(acc + c, vf_add(vf_loadu(acc + c),
+                                          keep(vf_mul(vf_loadu(w + c), vf_loadu(x + c)))));
+            for (; c < n; ++c) acc[c] = acc[c] + keep(w[c] * x[c]);
+        }
+        int64_t c = 0;
+        for (; c + VF_N <= n; c += VF_N)
+            vf_storeu(acc + c, vf_add(vf_loadu(acc + c), vf_loadu(bias + c)));
+        for (; c < n; ++c) acc[c] = acc[c] + bias[c];
+        out_row(Y, rowoff(Y, r, n), n, acc);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ resize_bilinear */
+/* Each frame resized as torch's align_corners=False bilinear at a size, libref's arithmetic bit
+ * for bit: the source rows, columns and weights of every output row and column are taken once a
+ * launch (libref's f32 steps, the product before the subtraction kept apart), and an output row
+ * is its four source rows blended, a vector across the channels, each product kept apart from
+ * the add after it. */
+AVX_KERNEL(resize_bilinear) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *G = &a->t[1], *Y = &a->t[2];
+    const int64_t n = p_int(a, "n", 0);
+    if (n <= 0 || numel(G) < 5) return RAD_E_SHAPE;
+    const int64_t T = at(G, 0), h = at(G, 1), w = at(G, 2), H = at(G, 3), Wd = at(G, 4);
+    if (T <= 0 || h <= 0 || w <= 0 || H <= 0 || Wd <= 0) return RAD_E_SHAPE;
+    const int64_t rows = T * H * Wd;
+    if (rows_of(Y, n) < rows || rows_of(X, n) < T * h * w) return RAD_E_SHAPE;
+    /* Per output index of each axis: two source indices, then two weights. */
+    const int64_t E = H + Wd;
+    int64_t* idx =
+        (int64_t*)scratch_raw((size_t)E * (2 * sizeof(int64_t) + 2 * sizeof(float)) + 64);
+    float* lam = (float*)(idx + 2 * E);
+    auto axis = [&](int64_t e, int64_t o, int64_t in, int64_t out) {
+        const float s = (float)in / (float)out;
+        float src = keep(s * ((float)o + 0.5f)) - 0.5f;
+        if (src < 0.0f) src = 0.0f;
+        const int64_t i0 = (int64_t)src;
+        idx[2 * e] = i0;
+        idx[2 * e + 1] = i0 + (i0 < in - 1 ? 1 : 0);
+        lam[2 * e + 1] = src - (float)i0;
+        lam[2 * e] = 1.0f - lam[2 * e + 1];
+    };
+    for (int64_t i = 0; i < H; ++i) axis(i, i, h, H);
+    for (int64_t j = 0; j < Wd; ++j) axis(H + j, j, w, Wd);
+
+    AVX_PARALLEL_FOR_IF(rows * n * 4 >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        const int64_t t = r / (H * Wd), i = (r / Wd) % H, j = r % Wd;
+        const int64_t i0 = idx[2 * i], i1 = idx[2 * i + 1];
+        const int64_t j0 = idx[2 * (H + j)], j1 = idx[2 * (H + j) + 1];
+        const float l0y = lam[2 * i], l1y = lam[2 * i + 1];
+        const float l0x = lam[2 * (H + j)], l1x = lam[2 * (H + j) + 1];
+        float* buf = scratch_f32((size_t)(5 * n + 80));
+        float *s0 = buf, *s1 = s0 + n + 16, *s2 = s1 + n + 16, *s3 = s2 + n + 16, *v = s3 + n + 16;
+        const float* x00 = in_row(X, rowoff(X, (t * h + i0) * w + j0, n), n, s0);
+        const float* x01 = in_row(X, rowoff(X, (t * h + i0) * w + j1, n), n, s1);
+        const float* x10 = in_row(X, rowoff(X, (t * h + i1) * w + j0, n), n, s2);
+        const float* x11 = in_row(X, rowoff(X, (t * h + i1) * w + j1, n), n, s3);
+        const vf a0 = vf_set1(l0x), a1 = vf_set1(l1x), b0 = vf_set1(l0y), b1 = vf_set1(l1y);
+        int64_t c = 0;
+        for (; c + VF_N <= n; c += VF_N) {
+            const vf top = vf_add(keep(vf_mul(a0, vf_loadu(x00 + c))),
+                                  keep(vf_mul(a1, vf_loadu(x01 + c))));
+            const vf bot = vf_add(keep(vf_mul(a0, vf_loadu(x10 + c))),
+                                  keep(vf_mul(a1, vf_loadu(x11 + c))));
+            vf_storeu(v + c, vf_add(keep(vf_mul(b0, top)), keep(vf_mul(b1, bot))));
+        }
+        for (; c < n; ++c) {
+            const float top = keep(l0x * x00[c]) + keep(l1x * x01[c]);
+            const float bot = keep(l0x * x10[c]) + keep(l1x * x11[c]);
+            v[c] = keep(l0y * top) + keep(l1y * bot);
+        }
+        out_row(Y, rowoff(Y, r, n), n, v);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ flow_renoise */
+/* x = f32(f32(f32(1 - s) x) + f32(s z)) over x's rows, z the (seed, stream) normal stream at
+ * k n + c (libref's, bit for bit): a row's draws come a Philox block at a time. */
+AVX_KERNEL(flow_renoise) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *SG = &a->t[0], *SD = &a->t[1], *X = &a->t[2];
+    const int64_t n = p_int(a, "n", 0), sm = p_int(a, "stream", 0);
+    if (n <= 0 || sm < 0 || numel(SG) < 1 || numel(SD) < 2) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(X, n);
+    if (rows <= 0) return RAD_E_SHAPE;
+    const float s = ldt(SG, offlin(SG, 0)), oms = 1.0f - s;
+    const uint64_t sd = (uint64_t)(uint32_t)at(SD, 0) | ((uint64_t)(uint32_t)at(SD, 1) << 32);
+
+    AVX_PARALLEL_FOR_IF(rows * n * 8 >= AVX_PAR_MIN)
+    for (int64_t k = 0; k < rows; ++k) {
+        float* buf = scratch_f32((size_t)(3 * n + 48));
+        float *xs = buf, *z = xs + n + 16, *o = z + n + 16;
+        const float* x = in_row(X, rowoff(X, k, n), n, xs);
+        philox_normals_s(sd, (uint64_t)sm, (uint64_t)(k * n), n, z);
+        const vf vo = vf_set1(oms), vs = vf_set1(s);
+        int64_t c = 0;
+        for (; c + VF_N <= n; c += VF_N)
+            vf_storeu(o + c, vf_add(keep(vf_mul(vo, vf_loadu(x + c))),
+                                    keep(vf_mul(vs, vf_loadu(z + c)))));
+        for (; c < n; ++c) o[c] = keep(oms * x[c]) + keep(s * z[c]);
+        out_row(X, rowoff(X, k, n), n, o);
     }
     return RAD_OK;
 }

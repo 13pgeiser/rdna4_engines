@@ -59,6 +59,11 @@ struct FakeVideoGen : IVideoGen {
         t.sample_rate = 32000;
         t.channels = 2;
         t.fps = 24.0;
+        if (r->upscale > 1.0) {
+            t.small_width = (int32_t)(r->width / r->upscale) / 32 * 32;
+            t.small_height = (int32_t)(r->height / r->upscale) / 32 * 32;
+            t.refine = r->refine > 0 ? r->refine : (int32_t)inf.upscale_refine;
+        }
         if (finish_status == RAD_OK) {
             for (int s = 1; s <= 2; ++s) {
                 gen::VideoEvent e;
@@ -202,6 +207,47 @@ TEST(the_generator_gets_the_size_the_chunks_and_the_steps) {
     CHECK_EQ(v.gen.last().height, 1344);
     CHECK_EQ(v.gen.last().chunks, 14);     /* 240 frames: 17 * 14 + 5 = 243 */
     v.wait(str_at(json::parse(r.body, nullptr, false), "id"));
+}
+
+/* Latent upscaling: refused by a model without an upscaler; with one, the factor and the refine
+ * steps reach the generator, a factor of 1 is none, and the refine steps need a factor. */
+TEST(latent_upscale_reaches_the_generator_where_the_model_has_an_upscaler) {
+    Videos v;
+    CHECK_EQ(v.refused(Videos::body({ { "latent_upscale", 2 } })), std::string("latent_upscale"));
+    v.gen.inf.upscale_max = 4.0;
+    v.gen.inf.upscale_refine = 3;
+    CHECK_EQ(v.refused(Videos::body({ { "latent_upscale", 4.5 } })), std::string("latent_upscale"));
+    CHECK_EQ(v.refused(Videos::body({ { "latent_upscale", 0.5 } })), std::string("latent_upscale"));
+    CHECK_EQ(v.refused(Videos::body({ { "upscale_refine_steps", 2 } })),
+             std::string("upscale_refine_steps"));
+    CHECK_EQ(v.refused(Videos::body({ { "latent_upscale", 2 }, { "upscale_refine_steps", 1.5 } })),
+             std::string("upscale_refine_steps"));
+    HttpResponse r = v.create(Videos::body({ { "size", "512x512" }, { "latent_upscale", "2" },
+                                             { "upscale_refine_steps", 4 } }));
+    REQUIRE_EQ(r.status, 200);
+    CHECK_EQ(v.gen.last().upscale, 2.0);
+    CHECK_EQ(v.gen.last().refine, 4);
+    /* The video object says how it was made, at creation and when it is fetched. */
+    json o = json::parse(r.body, nullptr, false);
+    CHECK_EQ(o["latent_upscale"].get<double>(), 2.0);
+    CHECK_EQ(o["upscale_refine_steps"].get<int>(), 4);
+    CHECK_EQ(str_at(o, "upscale_from"), std::string("256x256"));
+    json done = v.wait(str_at(o, "id"));
+    CHECK_EQ(str_at(done, "upscale_from"), std::string("256x256"));
+    /* Without refine steps named, the generator's default is what the object reports. */
+    r = v.create(Videos::body({ { "size", "512x512" }, { "latent_upscale", 2 } }));
+    REQUIRE_EQ(r.status, 200);
+    o = json::parse(r.body, nullptr, false);
+    CHECK_EQ(o["upscale_refine_steps"].get<int>(), 3);
+    v.wait(str_at(o, "id"));
+    r = v.create(Videos::body({ { "latent_upscale", 1 } }));
+    REQUIRE_EQ(r.status, 200);
+    CHECK_EQ(v.gen.last().upscale, 0.0);
+    CHECK_EQ(v.gen.last().refine, 0);
+    o = json::parse(r.body, nullptr, false);
+    CHECK(!o.contains("latent_upscale") && !o.contains("upscale_refine_steps") &&
+          !o.contains("upscale_from"));
+    v.wait(str_at(o, "id"));
 }
 
 /* A form is read as JSON's fields are (OpenAI's clients send the create call as one). */

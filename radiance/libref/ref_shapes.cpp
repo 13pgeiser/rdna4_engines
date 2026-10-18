@@ -2568,6 +2568,97 @@ int ref_grid_pos3_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out
     return o.finish("grid_pos3", operand, out);
 }
 
+/* ---- the latent upscaler. A volume is c x c x c voxels, c the largest whose cube M holds (the
+ * ranged M is the output's rows), so a 3 x 3 x 3 volume and up has an interior voxel. Every geom
+ * entry being c, resize_bilinear's description is the identity resize; its hand cases resize. */
+static int64_t cube_side(int64_t M) {
+    int64_t c = 0;
+    while ((c + 1) * (c + 1) * (c + 1) <= M) ++c;
+    return c;
+}
+
+int ref_conv3d_ndhwc_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), cin = gi(p, n_p, "cin", 0), cout = gi(p, n_p, "cout", 0);
+    const int64_t k = gi(p, n_p, "k", 0), kt = gi(p, n_p, "kt", 0), c = cube_side(M);
+    if (c <= 0 || cin <= 0 || cout <= 0 || k <= 0 || kt <= 0 || !(k & 1) || !(kt & 1))
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { c * c * c, cin });                               /* x: voxel rows */
+    o.t(D, { cout, cin, kt, k, k });                          /* w */
+    o.t(D, { cout });                                         /* b */
+    o.t_idx({ 3 }, 0, c, 0);                                  /* geom: (T, H, W) */
+    o.t(D, { M, cout });                                      /* res */
+    o.t(D, { M, cout });                                      /* y */
+    return o.finish("conv3d_ndhwc", operand, out);
+}
+
+/* The modulated form; `stats` at the size the op requires. */
+int ref_group_norm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), G = gi(p, n_p, "groups", 0);
+    if (M <= 0 || n <= 0 || G <= 0 || n % G) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { M, n });                                         /* x */
+    o.t(D, { n });                                            /* w */
+    o.t(D, { n });                                            /* b */
+    o.t(D, { 2 * n });                                        /* mod: [scale | shift] */
+    o.t((uint32_t)RAD_F32, { G * (2 + 3 * 1024) });           /* stats, INOUT */
+    o.t(D, { M, n });                                         /* y */
+    return o.finish("group_norm", operand, out);
+}
+
+int ref_tconv_dw_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), k = gi(p, n_p, "k", 0);
+    const int64_t c = cube_side(M);
+    if (c <= 0 || n <= 0 || k <= 0 || !(k & 1)) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { c * c * c, n });                                 /* x */
+    o.t(D, { n, 1, k, 1, 1 });                                /* w */
+    o.t(D, { n });                                            /* b */
+    o.t_idx({ 3 }, 0, c, 0);                                  /* geom: (T, H, W) */
+    o.t(D, { M, n });                                         /* y */
+    return o.finish("tconv_dw", operand, out);
+}
+
+int ref_resize_bilinear_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0), c = cube_side(M);
+    if (c <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { c * c * c, n });                                 /* x */
+    o.t_idx({ 5 }, 0, c, 0);                                  /* geom: (T, h, w, H, W) */
+    o.t(D, { M, n });                                         /* y */
+    return o.finish("resize_bilinear", operand, out);
+}
+
+/* patch_unfold's 2 x 2 x 2 grid of patches, folded. */
+int ref_patch_fold_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), C = gi(p, n_p, "C", 0);
+    const int64_t pt = gi(p, n_p, "pt", 0), ph = gi(p, n_p, "ph", 0), pw = gi(p, n_p, "pw", 0);
+    const int64_t c = 2, vol = pt * ph * pw;
+    if (C <= 0 || pt <= 0 || ph <= 0 || pw <= 0 || M < c * c * c) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t(D, { c * c * c * vol, C });                           /* x: voxel rows */
+    o.t_idx({ 3 }, 0, c, 0);                                  /* geom: (F, Hp, Wp) */
+    o.t((uint32_t)RAD_F32, { M, C * vol });                   /* y: patch rows */
+    return o.finish("patch_fold", operand, out);
+}
+
+/* sigma in (0, 1); the latent f32. */
+int ref_flow_renoise_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    if (M <= 0 || n <= 0) return RAD_E_UNSUPPORTED;
+    const uint32_t F = (uint32_t)RAD_F32;
+    Opd o;
+    o.t_fill(F, { 1 }, (uint32_t)RAD_FILL_SIGMOID, 0);        /* sigma */
+    o.t_idx({ 2 }, (int64_t)1 << 30, -1, 0);                  /* seed: two words */
+    o.t(F, { M, n });                                         /* x, INOUT */
+    return o.finish("flow_renoise", operand, out);
+}
+
 /* ================================================================== video sparse attention
  *
  * The tiles come from the values of `segs` and `geom`, which a description draws only as

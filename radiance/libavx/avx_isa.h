@@ -111,7 +111,8 @@ int         avx_par_force(int threads);
     /* ---- video generation */                                                                   \
     X(rms_mod)              X(rms_mod_quant_fp8)    X(flow_x0_step)         X(patch_unfold)       \
     X(vtile_gather)         X(vtile_stitch)         X(grid_pos3)            X(vsa_select)         \
-    X(attn_vsa)                                                                                   \
+    X(attn_vsa)             X(conv3d_ndhwc)         X(group_norm)           X(tconv_dw)           \
+    X(resize_bilinear)      X(patch_fold)           X(flow_renoise)                               \
     /* ---- audio generation */                                                                   \
     X(conv1d)               X(conv_t1d)             X(snake)                X(cfg_topk_sample)    \
     X(rvq_embed)            X(frame_mix_store)      X(end_status)           X(frame_store)        \
