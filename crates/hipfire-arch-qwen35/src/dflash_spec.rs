@@ -2326,6 +2326,18 @@ impl DflashSpeculator {
         eprintln!("{line}");
         self.lookup = state;
     }
+
+    /// Drop an armed lookup once VMM DFlash lanes are staged for this load,
+    /// printing `[dflash] lookup: off (<why>)`. Lanes never run lookup and a
+    /// request can move between the singleton and a lane mid-decode, so an
+    /// armed singleton would make a request's text depend on server load
+    /// (the same reason the lanes refuse the adaptive block). No-op when the
+    /// lookup was never armed.
+    pub fn disarm_lookup(&mut self, why: &str) {
+        if self.lookup.take().is_some() {
+            eprintln!("{}", lookup::load_line(&Err(why.to_string()), 0));
+        }
+    }
 }
 
 impl Speculator for DflashSpeculator {
