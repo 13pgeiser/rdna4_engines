@@ -1987,6 +1987,14 @@ pub struct MoePrefillParams<'a> {
     /// mutation fence and the combine, and the grouped gate/up and down read
     /// the masked tile ids. `None` (the default) changes nothing.
     pub ep_tile_exchange: Option<MoeTileExchangeParams<'a>>,
+    /// Default-off expert IU4 prefill capability (`HIPFIRE_MOE_SYM_IU4`), bound
+    /// only by an architecture whose loader verified the routed tensors: the
+    /// loader's [`ExpertIu4Spec`](crate::families::moe_expert_iu4::ExpertIu4Spec)
+    /// and a `bool` that is `true` only when the loader verified symmetric
+    /// headers on every routed gate/up and down tensor of ALL model layers.
+    /// `None` (every non-Qwen35 constructor, and Qwen35 with the flag off) means
+    /// the route does not exist for this call and changes nothing.
+    pub expert_iu4: Option<(crate::families::moe_expert_iu4::ExpertIu4Spec, bool)>,
 }
 /// Dtype-only admission snapshot for grouped MoE prefill.
 ///

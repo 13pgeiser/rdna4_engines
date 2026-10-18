@@ -7563,7 +7563,28 @@ mod tests {
             shared_down_out: None,
             ep_layer_idx: 0,
             ep_tile_exchange: None,
+            expert_iu4: None,
         }
+    }
+
+    /// A prefill constructor that does not bind the expert IU4 capability (every
+    /// non-Qwen35 caller, and the base fixture the struct updates inherit from)
+    /// leaves `expert_iu4` absent, so the default-off route does not exist.
+    #[test]
+    fn base_prefill_params_carry_no_expert_iu4() {
+        let table = table(4, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xE6_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let scratch = prefill_scratch(0xE7_0000);
+        let params = ep_prefill_params(
+            &scratch,
+            &fixture.routed,
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            None,
+        );
+        assert!(params.expert_iu4.is_none());
     }
 
     fn ep_prefill_table() -> (ExpertTable, ExpertBindingCache, CompactFixture) {

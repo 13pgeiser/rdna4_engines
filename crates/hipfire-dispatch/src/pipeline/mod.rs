@@ -6819,6 +6819,153 @@ fn prefill_combine_stage(
     Ok(())
 }
 
+// ───────────────────── opt-in expert IU4 prefill stages ─────────────────────
+//
+// Launchers of the verdict `moe_program::decide_expert_iu4` admitted for a call
+// (`HIPFIRE_MOE_SYM_IU4`, default off): the scatter and every router/shared stage
+// are the existing ones; the stages below replace gate/up, the SwiGLU/rotation,
+// down and combine of the qt53 F32 fallback. They run only from an
+// `ExpertIu4Decision::Admitted` plan, re-check that the operands still describe
+// the proven call, and never fall back: a mismatch is an error, not a reroute.
+
+/// BF16 `[rows, width]` view over the front of `src`'s storage (the grouped
+/// scratch the F32 fallback uses as F32 rows). Aliases `src`; never freed.
+fn expert_iu4_bf16_view(
+    src: &GpuTensor,
+    rows: usize,
+    width: usize,
+    what: &str,
+) -> Result<GpuTensor, DispatchError> {
+    let bytes = moe_program::bf16_grouped_view_bytes(rows, width).ok_or_else(|| {
+        DispatchError::Hip(format!("expert IU4 {what}: BF16 view extent overflows"))
+    })?;
+    if src.buf.size() < bytes {
+        return Err(DispatchError::Hip(format!(
+            "expert IU4 {what}: buffer holds {} bytes, the BF16 [{rows}, {width}] view needs {bytes}",
+            src.buf.size()
+        )));
+    }
+    Ok(GpuTensor {
+        buf: src.buf.byte_view(0, bytes),
+        shape: vec![rows, width],
+        dtype: DType::BF16,
+    })
+}
+
+fn expert_iu4_require_plan(
+    p: &crate::families::moe::MoePrefillParams<'_>,
+    plan: &moe_program::ExpertIu4Plan,
+) -> Result<(), DispatchError> {
+    reject_fp8_moe(&p.dtypes)?;
+    check_qt53_prefill_fallback(p)?;
+    if !plan.matches(p) {
+        return Err(DispatchError::Hip(
+            "sealed moe: expert IU4 stage operands differ from the admitted plan".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// F32 `x_norm_batch` (not `x_rot_batch`) -> FWHT256/C2 A4 -> symmetric gate/up
+/// with the SwiGLU epilogue into BF16 `y_gate_up_grouped [grouped_rows, I]`.
+fn prefill_expert_iu4_gate_up_stage(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoePrefillParams<'_>,
+    plan: &moe_program::ExpertIu4Plan,
+) -> Result<(), DispatchError> {
+    expert_iu4_require_plan(p, plan)?;
+    let y = expert_iu4_bf16_view(
+        p.y_gate_up_grouped,
+        plan.grouped_rows,
+        plan.intermediate,
+        "gate/up rows",
+    )?;
+    let xq = hip!(gpu.qwen4_moe_rotate256_i4(p.x_norm_batch, plan.hidden, plan.rows))?;
+    hip!(gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
+        p.expert_gate_up_ptrs,
+        p.expert_tile_ids,
+        p.sorted_slot_index,
+        &xq,
+        &y,
+        2 * plan.intermediate,
+        plan.hidden,
+        plan.k_top,
+        plan.grouped_rows,
+        plan.rows,
+        false,
+    ))
+}
+
+/// BF16 grouped SwiGLU rows -> FWHT128/C2 A4 (compact flat-slot record) ->
+/// symmetric down into BF16 `y_down_grouped [grouped_rows, H]`.
+fn prefill_expert_iu4_down_stage(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoePrefillParams<'_>,
+    plan: &moe_program::ExpertIu4Plan,
+) -> Result<(), DispatchError> {
+    expert_iu4_require_plan(p, plan)?;
+    let h = expert_iu4_bf16_view(
+        p.y_gate_up_grouped,
+        plan.grouped_rows,
+        plan.intermediate,
+        "gate/up rows",
+    )?;
+    let y = expert_iu4_bf16_view(
+        p.y_down_grouped,
+        plan.grouped_rows,
+        plan.hidden,
+        "down rows",
+    )?;
+    let xq = hip!(gpu.qwen4_moe_rotate128_i4(
+        &h,
+        p.sorted_slot_index,
+        plan.intermediate,
+        plan.grouped_rows,
+        plan.total_slots,
+    ))?;
+    hip!(gpu.gemm_qwen4_moe_down_iu4_sym(
+        p.expert_down_ptrs,
+        p.expert_tile_ids,
+        p.sorted_slot_index,
+        &xq,
+        &y,
+        plan.hidden,
+        plan.intermediate,
+        1,
+        plan.grouped_rows,
+        plan.total_slots,
+        false,
+    ))
+}
+
+/// BF16 grouped down rows widened to F32 and combined in ascending top-k slot
+/// order (`fma(w, v, acc)`), then `+=` into the target the Path-2 combine
+/// (`moe_down_combine_grouped_k8`) would use. Its position relative to the shared
+/// expert and the mutation fence is the lowering's, unchanged.
+fn prefill_expert_iu4_combine_stage(
+    gpu: &mut Gpu,
+    p: &crate::families::moe::MoePrefillParams<'_>,
+    plan: &moe_program::ExpertIu4Plan,
+) -> Result<(), DispatchError> {
+    expert_iu4_require_plan(p, plan)?;
+    let y = expert_iu4_bf16_view(
+        p.y_down_grouped,
+        plan.grouped_rows,
+        plan.hidden,
+        "down rows",
+    )?;
+    hip!(gpu.moe_down_combine_grouped_bf16in_pm(
+        &y,
+        p.inverse_perm,
+        p.topk_weights,
+        p.routed_out.unwrap_or(p.x_batch),
+        plan.hidden,
+        plan.k_top,
+        plan.rows,
+        plan.grouped_rows,
+    ))
+}
+
 fn prefill_mutation_fence_stage() -> Result<(), DispatchError> {
     #[cfg(feature = "serve-fault-inject")]
     if crate::pipeline::sealed_moe::take_fault_after_expert_mutation() {

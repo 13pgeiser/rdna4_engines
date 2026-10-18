@@ -1659,6 +1659,19 @@ pub struct MoeFfnWeights {
     /// without allocating or rebuilding expert maps.
     pub(crate) expert_table: hipfire_dispatch::pipeline::sealed_moe::ExpertTable,
     pub(crate) expert_binding: hipfire_dispatch::pipeline::sealed_moe::ExpertBindingCache,
+    /// Opt-in symmetric IU4 grouped routed-expert prefill capability
+    /// (`HIPFIRE_MOE_SYM_IU4`). Tuple field: `.0` is the expert recipe and geometry
+    /// ([`hipfire_dispatch::families::moe_expert_iu4::ExpertIu4Spec`], built from the
+    /// config and the loaded codecs); `.1` is `true` only when the loader verified
+    /// symmetric headers on every routed gate/up and down tensor of ALL model MoE
+    /// layers (`qwen4_moe_sym_check`) and reserved the route's scratch. `None` is
+    /// the default: flag off, an ineligible layer (not uniform qt44 gate/up + qt53
+    /// down, host-mapped, paged, EP, tagged, AWQ, CPU-deferred), or any non-HFQ
+    /// loader. `None` adds no load-time work, no reservation and no runtime cost.
+    pub(crate) expert_iu4: Option<(
+        hipfire_dispatch::families::moe_expert_iu4::ExpertIu4Spec,
+        bool,
+    )>,
 }
 
 impl MoeFfnWeights {
@@ -3886,6 +3899,7 @@ mod tests {
             expert_execution_plan,
             expert_table,
             expert_binding,
+            expert_iu4: None,
         }
     }
 

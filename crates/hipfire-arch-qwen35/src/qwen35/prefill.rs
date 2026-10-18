@@ -1854,7 +1854,7 @@ fn native_mq4_widened_flags_admitted(
         && flags.wo_wmma_variant.is_none()
 }
 
-fn prefill_max_batch_for_model(gpu: &Gpu, weights: &Qwen35Weights) -> usize {
+pub(crate) fn prefill_max_batch_for_model(gpu: &Gpu, weights: &Qwen35Weights) -> usize {
     legacy_prefill_max_batch(
         explicit_prefill_max_batch(),
         gpu.arch.as_str(),
@@ -6598,6 +6598,7 @@ fn build_moe_prefill_params<'a>(
         shared_down_out: None,
         ep_layer_idx: 0,
         ep_tile_exchange: None,
+        expert_iu4: ffn.expert_iu4,
     };
     Ok((bound, moe_prefill_params))
 }

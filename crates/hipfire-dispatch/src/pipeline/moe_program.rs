@@ -241,6 +241,9 @@ pub(super) struct MoeStepState<'a> {
     /// The post-combine parity reference re-runs the routed GPU tail over the
     /// ORIGINAL ids; while set, the masked view is not applied.
     split_reference: Cell<bool>,
+    /// The call's one expert IU4 verdict ([`MoeStepState::expert_iu4_decision`]),
+    /// decided at the first routed stage and never re-decided.
+    expert_iu4: OnceCell<ExpertIu4Decision>,
 }
 
 /// A call abandoned between `Combine` (which queued the CP wait) and `JoinSplit`
@@ -315,6 +318,7 @@ impl<'a> MoeStepState<'a> {
             hc_row_folded: Cell::new(false),
             split_phase: Cell::new(SplitPhase::Idle),
             split_reference: Cell::new(false),
+            expert_iu4: OnceCell::new(),
         }
     }
 
@@ -1103,6 +1107,10 @@ impl<'a> SealedMoeOp<'a> {
                 "sealed moe: scatter is only valid for grouped prefill path 2".into(),
             ));
         }
+        // The expert IU4 verdict (default off: unbound, returns here without a
+        // read) is decided once, before the first routed launch; every later stage
+        // reads the same cached verdict.
+        self.state.expert_iu4_decision(gpu, params, selection);
         if selection
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
@@ -1144,6 +1152,11 @@ impl<'a> SealedMoeOp<'a> {
                 selection.path2_m_total,
             );
         }
+        if let ExpertIu4Decision::Admitted(plan) =
+            self.state.expert_iu4_decision(gpu, params, selection)
+        {
+            return super::prefill_expert_iu4_gate_up_stage(gpu, params, &plan);
+        }
         super::prefill_gate_up_stage(
             gpu,
             params,
@@ -1168,6 +1181,13 @@ impl<'a> SealedMoeOp<'a> {
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
         {
             return super::qt44_qt53_prefill::unscatter(gpu, params, selection.path2_m_total);
+        }
+        if matches!(
+            self.state.expert_iu4_decision(gpu, params, selection),
+            ExpertIu4Decision::Admitted(_)
+        ) {
+            // The gate/up epilogue already wrote the SwiGLU rows grouped.
+            return Ok(());
         }
         super::prefill_gate_up_unscatter_stage(gpu, params, selection.path2_m_total)
     }
@@ -1196,6 +1216,14 @@ impl<'a> SealedMoeOp<'a> {
                 params,
                 selection.uses_grouped_rows(),
             );
+        }
+        if matches!(
+            self.state.expert_iu4_decision(gpu, params, selection),
+            ExpertIu4Decision::Admitted(_)
+        ) {
+            // The SwiGLU is the gate/up epilogue and the rotation is the down A4
+            // producer: nothing is owed between them.
+            return Ok(());
         }
         let total_slots = params
             .batch_size
@@ -1284,6 +1312,11 @@ impl<'a> SealedMoeOp<'a> {
                 selection.path2_m_total,
             );
         }
+        if let ExpertIu4Decision::Admitted(plan) =
+            self.state.expert_iu4_decision(gpu, params, selection)
+        {
+            return super::prefill_expert_iu4_down_stage(gpu, params, &plan);
+        }
         let total_slots = params
             .batch_size
             .checked_mul(params.k_top)
@@ -1352,6 +1385,11 @@ impl<'a> SealedMoeOp<'a> {
                 selection.path2_m_total,
                 self.state.initial_zero.take(),
             );
+        }
+        if let ExpertIu4Decision::Admitted(plan) =
+            self.state.expert_iu4_decision(gpu, params, selection)
+        {
+            return super::prefill_expert_iu4_combine_stage(gpu, params, &plan);
         }
         let canonical_slot_order = matches!(
             &params.prelude.route,
@@ -3577,6 +3615,575 @@ pub(super) fn select_prefill(
     })
 }
 
+// ───────────────────── opt-in expert IU4 prefill route ─────────────────────
+//
+// `HIPFIRE_MOE_SYM_IU4` (default OFF). Only a prefill whose arch bound the
+// loader capability (`MoePrefillParams::expert_iu4`) ever consults any of this;
+// an unbound call returns [`ExpertIu4Decision::Unbound`] before reading a flag,
+// the device or an operand, so default-off adds no launch, query or allocation.
+//
+// The decision is made ONCE per invocation (first routed stage, the scatter) from
+// [`ExpertIu4Facts`], cached in [`MoeStepState`] and read by every later stage, so
+// the scatter, gate/up, down and combine can never disagree and no stage falls
+// back after an expert IU4 launch. Every capacity, scratch, capture and shape
+// check is part of that one pure decision and precedes the first IU4 launch.
+
+use crate::families::moe_expert_iu4::{
+    expert_iu4_admission, ExpertIu4Inputs, ExpertIu4Reject, ExpertIu4Spec,
+};
+
+/// Grouped-row tile of the symmetric GEMM launchers (`grouped_rows % 16 == 0`).
+const EXPERT_IU4_TILE_ROWS: usize = 16;
+/// `x_row_div * x_src_rows` bound of the PM symmetric GEMMs
+/// (`QWEN4_MOE_SYM_PM_MAX_SLOTS`, private to rdna-compute).
+const EXPERT_IU4_MAX_SLOTS: usize = 1 << 22;
+/// HIP grid-y extent the PM combine's `ceil(dim / 256)` must fit.
+const EXPERT_IU4_GRID_Y_MAX: usize = 65_535;
+/// Threads per workgroup of the PM combine (one output column each).
+const EXPERT_IU4_COMBINE_BLOCK: usize = 256;
+
+/// Bytes of a BF16 `[rows, width]` view, `None` on overflow.
+pub(super) fn bf16_grouped_view_bytes(rows: usize, width: usize) -> Option<usize> {
+    rows.checked_mul(width)?.checked_mul(2)
+}
+
+/// Why an IU4-capable call stays on the qt53 F32 fallback although it was not
+/// refused by [`expert_iu4_admission`]: a call shape this route does not own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExpertIu4Exclusion {
+    /// A specialized route (route policy / sealed grouped route) owns the call.
+    SpecializedRoute,
+    /// The recipe is not softmax-gated-shared.
+    Recipe,
+    /// CPU-deferred routed experts.
+    CpuDeferred,
+    /// CPU-cold/GPU-hot split.
+    CpuSplit,
+    /// EP partial accumulator (`routed_out`).
+    RoutedOut,
+    /// EP row gather.
+    EpRowGather,
+    /// EP tile exchange.
+    EpTileExchange,
+    /// Root-routed EP prefill (canonical slot-order combine).
+    CanonicalSlotOrder,
+    /// Staged (paged / host-staged) expert pointer tables.
+    StagedExpertTables,
+    /// Paro rotation sidecars.
+    Paro,
+    /// The loader spec disagrees with this call's geometry or dtypes.
+    SpecMismatch,
+    /// The normalized activation is not F32.
+    ActivationDtype,
+    /// A buffer, scratch, extent or kernel domain limit (named) is below what the
+    /// route needs.
+    Capacity(&'static str),
+}
+
+impl ExpertIu4Exclusion {
+    pub(super) const fn reason(&self) -> &'static str {
+        match self {
+            Self::SpecializedRoute => "a specialized route owns this call",
+            Self::Recipe => "recipe is not softmax-gated-shared",
+            Self::CpuDeferred => "CPU-deferred routed experts",
+            Self::CpuSplit => "CPU-cold/GPU-hot split",
+            Self::RoutedOut => "EP partial accumulator (routed_out)",
+            Self::EpRowGather => "EP row gather",
+            Self::EpTileExchange => "EP tile exchange",
+            Self::CanonicalSlotOrder => "root-routed EP canonical slot-order combine",
+            Self::StagedExpertTables => "staged expert pointer tables",
+            Self::Paro => "Paro rotation sidecars",
+            Self::SpecMismatch => "loader spec disagrees with the call geometry or dtypes",
+            Self::ActivationDtype => "normalized activation is not F32",
+            Self::Capacity(_) => "a buffer, scratch or kernel limit is below the route's need",
+        }
+    }
+
+    /// Stable log class (distinct from every [`ExpertIu4Reject`] class).
+    const fn class(&self) -> usize {
+        match self {
+            Self::SpecializedRoute => 19,
+            Self::Recipe => 20,
+            Self::CpuDeferred => 21,
+            Self::CpuSplit => 22,
+            Self::RoutedOut => 23,
+            Self::EpRowGather => 24,
+            Self::EpTileExchange => 25,
+            Self::CanonicalSlotOrder => 26,
+            Self::StagedExpertTables => 27,
+            Self::Paro => 28,
+            Self::SpecMismatch => 29,
+            Self::ActivationDtype => 30,
+            Self::Capacity(_) => 31,
+        }
+    }
+}
+
+/// Why the IU4 route is not taken: the pure admission or a call-shape exclusion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExpertIu4Fallback {
+    Admission(ExpertIu4Reject),
+    Exclusion(ExpertIu4Exclusion),
+}
+
+impl ExpertIu4Fallback {
+    pub(super) const fn reason(&self) -> &'static str {
+        match self {
+            Self::Admission(reject) => reject.reason(),
+            Self::Exclusion(exclusion) => exclusion.reason(),
+        }
+    }
+}
+
+/// Geometry proven by the decision; every IU4 stage launches exactly these extents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ExpertIu4Plan {
+    /// Physical rows (`batch_size`); `route_rows` only gated the floor.
+    pub(super) rows: usize,
+    /// Grouped (padded) rows: the scatter's `path2_m_total`.
+    pub(super) grouped_rows: usize,
+    /// `rows * k_top`.
+    pub(super) total_slots: usize,
+    /// Model width H (gate/up `k`, down `m`).
+    pub(super) hidden: usize,
+    /// Routed width I (gate/up output is `2 * I`, down `k`).
+    pub(super) intermediate: usize,
+    pub(super) k_top: usize,
+}
+
+impl ExpertIu4Plan {
+    /// The stage's operands still describe the call this plan was proven for.
+    pub(super) fn matches(&self, p: &MoePrefillParams<'_>) -> bool {
+        p.batch_size == self.rows
+            && p.m_total_max == self.grouped_rows
+            && p.gate_up_k == self.hidden
+            && p.down_m == self.hidden
+            && p.mi == self.intermediate
+            && p.down_k == self.intermediate
+            && p.k_top == self.k_top
+            && p.routed_out.is_none()
+    }
+}
+
+/// The single per-invocation verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExpertIu4Decision {
+    /// No capability bound by the arch (default): this route does not exist.
+    Unbound,
+    /// The existing qt53 F32 fallback runs, unchanged.
+    Fallback(ExpertIu4Fallback),
+    /// The IU4 sequence runs, from the scatter to the combine.
+    Admitted(ExpertIu4Plan),
+}
+
+/// Call-shape exclusions (each `true` refuses the route).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ExpertIu4CallShape {
+    pub(super) specialized_route: bool,
+    pub(super) not_softmax_gated_recipe: bool,
+    pub(super) cpu_deferred: bool,
+    pub(super) cpu_split: bool,
+    pub(super) routed_out: bool,
+    pub(super) ep_row_gather: bool,
+    pub(super) ep_tile_exchange: bool,
+    pub(super) canonical_slot_order: bool,
+    pub(super) staged_expert_tables: bool,
+    pub(super) paro: bool,
+}
+
+/// Extents of the call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ExpertIu4Dims {
+    pub(super) rows: usize,
+    pub(super) k_top: usize,
+    pub(super) n_exp: usize,
+    pub(super) hidden: usize,
+    pub(super) intermediate: usize,
+    pub(super) down_m: usize,
+    pub(super) down_k: usize,
+    pub(super) grouped_rows: usize,
+}
+
+/// Device bytes each operand holds (`DeviceBuffer::size`, the span every launcher checks).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ExpertIu4Held {
+    pub(super) x_norm: usize,
+    pub(super) x_batch: usize,
+    pub(super) sorted_slot_index: usize,
+    pub(super) inverse_perm: usize,
+    pub(super) topk_weights: usize,
+    pub(super) y_gate_up_grouped: usize,
+    pub(super) y_down_grouped: usize,
+}
+
+/// Usable bytes of the two reserved IU4 producer sidecars (`None` = not allocated):
+/// the smaller of the tracked reservation and the live buffer size. The producers
+/// grow these in place when short, which must never happen inside the sequence
+/// (it would invalidate captures and can allocate mid-prefill); the decision
+/// therefore admits only rows the load-time reservation already covers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ExpertIu4Scratch {
+    /// `int4_mmq_x_scratch`: the gate/up A4 record `[hidden / 128, rows]`.
+    pub(super) gate_x: Option<usize>,
+    /// `qwen4_moe_down_i4_scratch`: the down A4 record `[intermediate / 128, slots]`.
+    pub(super) down_i4: Option<usize>,
+}
+
+/// Pure scratch preflight: both sidecars exist and hold the producers' exact
+/// extents (`int4_mmq_reservation_bytes`, `qwen4_moe_down_i4_bytes`). The stable
+/// grouping scratch is not read: the route reuses the fused k8 scatter.
+pub(super) fn expert_iu4_scratch_ready(
+    dims: &ExpertIu4Dims,
+    scratch: &ExpertIu4Scratch,
+) -> Result<(), &'static str> {
+    let total_slots = dims.rows.checked_mul(dims.k_top).ok_or("rows")?;
+    let gate = rdna_compute::scratch::int4_mmq_reservation_bytes(dims.hidden, dims.rows)
+        .ok_or("int4_mmq_x_scratch")?;
+    let down = rdna_compute::scratch::qwen4_moe_down_i4_bytes(dims.intermediate, total_slots)
+        .ok_or("qwen4_moe_down_i4_scratch")?;
+    match scratch.gate_x {
+        Some(have) if have >= gate => {}
+        _ => return Err("int4_mmq_x_scratch"),
+    }
+    match scratch.down_i4 {
+        Some(have) if have >= down => {}
+        _ => return Err("qwen4_moe_down_i4_scratch"),
+    }
+    Ok(())
+}
+
+/// Everything the verdict reads; built from the params and the GPU, evaluated purely.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ExpertIu4Facts {
+    pub(super) capability: Option<(ExpertIu4Spec, bool)>,
+    /// `Gpu::moe_sym_iu4_requested()`.
+    pub(super) requested: bool,
+    /// `Gpu::route_rows(batch_size)`: the floor measure `moe_sym_iu4_applies` uses.
+    pub(super) route_rows: usize,
+    pub(super) min_rows: usize,
+    pub(super) use_path2: bool,
+    pub(super) has_dtype_tags: bool,
+    pub(super) has_down_awq: bool,
+    /// Graph capture, replay capture or recording is active.
+    pub(super) capturing_graph: bool,
+    pub(super) host_mapped: bool,
+    pub(super) shape: ExpertIu4CallShape,
+    pub(super) routed_gate_up: rdna_compute::DType,
+    pub(super) routed_down: rdna_compute::DType,
+    pub(super) x_norm_f32: bool,
+    pub(super) dims: ExpertIu4Dims,
+    pub(super) held: ExpertIu4Held,
+    pub(super) scratch: ExpertIu4Scratch,
+}
+
+/// Pure capacity / kernel-domain check of the IU4 sequence; `Err` names the
+/// first operand or limit that fails. Mirrors every launcher precondition
+/// (`require_span`s, 16-row tiles, slot bound, 32-bit PM byte extents, combine
+/// grid) so none of them can first fail after an IU4 launch.
+pub(super) fn expert_iu4_capacity(
+    dims: &ExpertIu4Dims,
+    held: &ExpertIu4Held,
+) -> Result<(), &'static str> {
+    let total_slots = dims
+        .rows
+        .checked_mul(dims.k_top)
+        .filter(|slots| *slots > 0)
+        .ok_or("rows")?;
+    if i32::try_from(dims.rows).is_err() || i32::try_from(dims.grouped_rows).is_err() {
+        return Err("rows");
+    }
+    if total_slots > EXPERT_IU4_MAX_SLOTS {
+        return Err("slots");
+    }
+    if dims.grouped_rows < total_slots || !dims.grouped_rows.is_multiple_of(EXPERT_IU4_TILE_ROWS) {
+        return Err("grouped_rows");
+    }
+    if dims.hidden.div_ceil(EXPERT_IU4_COMBINE_BLOCK) > EXPERT_IU4_GRID_Y_MAX {
+        return Err("hidden");
+    }
+    let fits = |bytes: Option<usize>, have: usize, name: &'static str| match bytes {
+        Some(bytes) if bytes <= u32::MAX as usize && have >= bytes => Ok(()),
+        _ => Err(name),
+    };
+    let f32_bytes = |a: usize, b: usize| a.checked_mul(b)?.checked_mul(4);
+    fits(
+        f32_bytes(dims.rows, dims.hidden),
+        held.x_norm,
+        "x_norm_batch",
+    )?;
+    fits(f32_bytes(dims.rows, dims.hidden), held.x_batch, "x_batch")?;
+    fits(
+        dims.grouped_rows.checked_mul(4),
+        held.sorted_slot_index,
+        "sorted_slot_index",
+    )?;
+    fits(
+        total_slots.checked_mul(4),
+        held.inverse_perm,
+        "inverse_perm",
+    )?;
+    fits(
+        total_slots.checked_mul(4),
+        held.topk_weights,
+        "topk_weights",
+    )?;
+    fits(
+        bf16_grouped_view_bytes(dims.grouped_rows, dims.intermediate),
+        held.y_gate_up_grouped,
+        "y_gate_up_grouped",
+    )?;
+    fits(
+        bf16_grouped_view_bytes(dims.grouped_rows, dims.hidden),
+        held.y_down_grouped,
+        "y_down_grouped",
+    )?;
+    Ok(())
+}
+
+/// The pure verdict. Order: unbound; [`expert_iu4_admission`] (requested, spec,
+/// headers verified, Path 2, row floor, tags, AWQ, capture, host-mapped); the
+/// call-shape exclusions; spec/geometry agreement; activation dtype; operand
+/// capacity; reserved scratch. An exclusion is reported only after admission
+/// accepted, so a Path-2 EP call is never labelled `NotPath2`.
+pub(super) fn decide_expert_iu4(f: &ExpertIu4Facts) -> ExpertIu4Decision {
+    use ExpertIu4Exclusion as X;
+    let Some((spec, headers_verified)) = f.capability else {
+        return ExpertIu4Decision::Unbound;
+    };
+    let inputs = ExpertIu4Inputs {
+        requested: f.requested,
+        symmetric_headers_verified: headers_verified,
+        use_path2: f.use_path2,
+        rows: f.route_rows,
+        min_rows: f.min_rows,
+        has_dtype_tags: f.has_dtype_tags,
+        has_down_awq: f.has_down_awq,
+        capturing_graph: f.capturing_graph,
+        host_mapped: f.host_mapped,
+    };
+    if let Err(reject) = expert_iu4_admission(&spec, &inputs) {
+        return ExpertIu4Decision::Fallback(ExpertIu4Fallback::Admission(reject));
+    }
+    let exclude = |x| ExpertIu4Decision::Fallback(ExpertIu4Fallback::Exclusion(x));
+    let s = &f.shape;
+    if let Some((_, x)) = [
+        (s.specialized_route, X::SpecializedRoute),
+        (s.not_softmax_gated_recipe, X::Recipe),
+        (s.cpu_deferred, X::CpuDeferred),
+        (s.cpu_split, X::CpuSplit),
+        (s.routed_out, X::RoutedOut),
+        (s.ep_row_gather, X::EpRowGather),
+        (s.ep_tile_exchange, X::EpTileExchange),
+        (s.canonical_slot_order, X::CanonicalSlotOrder),
+        (s.staged_expert_tables, X::StagedExpertTables),
+        (s.paro, X::Paro),
+    ]
+    .into_iter()
+    .find(|(on, _)| *on)
+    {
+        return exclude(x);
+    }
+    let d = &f.dims;
+    let agrees = spec.experts as usize == d.n_exp
+        && spec.top_k as usize == d.k_top
+        && spec.hidden as usize == d.hidden
+        && spec.intermediate as usize == d.intermediate
+        && d.down_m == d.hidden
+        && d.down_k == d.intermediate
+        && f.routed_gate_up == spec.gate_up_codec
+        && f.routed_down == spec.down_codec;
+    if !agrees {
+        return exclude(X::SpecMismatch);
+    }
+    if !f.x_norm_f32 {
+        return exclude(X::ActivationDtype);
+    }
+    if let Err(name) = expert_iu4_capacity(d, &f.held) {
+        return exclude(X::Capacity(name));
+    }
+    if let Err(name) = expert_iu4_scratch_ready(d, &f.scratch) {
+        return exclude(X::Capacity(name));
+    }
+    ExpertIu4Decision::Admitted(ExpertIu4Plan {
+        rows: d.rows,
+        grouped_rows: d.grouped_rows,
+        total_slots: d.rows * d.k_top,
+        hidden: d.hidden,
+        intermediate: d.intermediate,
+        k_top: d.k_top,
+    })
+}
+
+/// Whether graph capture, replay capture or recording is active (the IU4 route
+/// has no capture proof; scratch growth would also invalidate a capture).
+fn expert_iu4_capturing(gpu: &Gpu) -> bool {
+    gpu.graphs.capture_mode
+        || gpu.graphs.verify.capturing.is_some()
+        || gpu.graphs.replay.capturing.is_some()
+        || gpu.replay.is_recording()
+        || gpu.replay.retained_body_active()
+}
+
+/// Gather the verdict's facts. Only called with a bound capability.
+fn expert_iu4_facts(
+    gpu: &Gpu,
+    p: &MoePrefillParams<'_>,
+    selection: &MoePrefillSelection,
+) -> ExpertIu4Facts {
+    let (host_gate_up, host_down) =
+        crate::families::moe::routed_host_mapped_projections(p.routed_experts);
+    let held = |t: &GpuTensor| t.buf.size();
+    let usable = |buf: &Option<hip_bridge::DeviceBuffer>, tracked: usize| {
+        buf.as_ref().map(|b| b.size().min(tracked))
+    };
+    ExpertIu4Facts {
+        capability: p.expert_iu4,
+        requested: gpu.moe_sym_iu4_requested(),
+        route_rows: gpu.route_rows(p.batch_size),
+        min_rows: rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
+        use_path2: selection.resolution.use_path2,
+        has_dtype_tags: p.expert_dtype_tags.is_some() || p.dtypes.routed_has_mixed_experts,
+        has_down_awq: p.expert_down_awq_ptrs.is_some() || p.down_awq_scale.is_some(),
+        capturing_graph: expert_iu4_capturing(gpu),
+        host_mapped: host_gate_up
+            || host_down
+            || crate::families::moe::routed_host_mapped(p.routed_experts),
+        shape: ExpertIu4CallShape {
+            specialized_route: p.route_policy.is_some() || selection.route.is_some(),
+            not_softmax_gated_recipe: !matches!(p.recipe, MoeRecipe::SoftmaxGatedShared { .. }),
+            cpu_deferred: selection.cpu_deferred_experts || p.cpu_deferred_experts,
+            cpu_split: selection.cpu_split,
+            routed_out: p.routed_out.is_some(),
+            ep_row_gather: p.ep_row_gather.is_some(),
+            ep_tile_exchange: p.ep_tile_exchange.is_some(),
+            canonical_slot_order: !matches!(
+                p.prelude.route,
+                super::sealed_moe::PrefillRouteMode::Replicated
+            ),
+            staged_expert_tables: p.expert_stage_ptrs.is_some(),
+            paro: p.paro_gate_up.is_some() || p.paro_down.is_some(),
+        },
+        routed_gate_up: p.dtypes.routed_gate_up,
+        routed_down: p.dtypes.routed_down,
+        x_norm_f32: p.x_norm_batch.dtype == rdna_compute::DType::F32,
+        dims: ExpertIu4Dims {
+            rows: p.batch_size,
+            k_top: p.k_top,
+            n_exp: p.n_exp,
+            hidden: p.gate_up_k,
+            intermediate: p.mi,
+            down_m: p.down_m,
+            down_k: p.down_k,
+            grouped_rows: selection.path2_m_total,
+        },
+        held: ExpertIu4Held {
+            x_norm: held(p.x_norm_batch),
+            x_batch: held(p.x_batch),
+            sorted_slot_index: held(p.sorted_slot_index),
+            inverse_perm: held(p.inverse_perm),
+            topk_weights: held(p.topk_weights),
+            y_gate_up_grouped: held(p.y_gate_up_grouped),
+            y_down_grouped: held(p.y_down_grouped),
+        },
+        scratch: ExpertIu4Scratch {
+            gate_x: usable(
+                &gpu.scratch.int4_mmq_x_scratch,
+                gpu.scratch.int4_mmq_x_scratch_bytes,
+            ),
+            down_i4: usable(
+                &gpu.scratch.qwen4_moe_down_i4_scratch,
+                gpu.scratch.qwen4_moe_down_i4_scratch_bytes,
+            ),
+        },
+    }
+}
+
+/// Log class of a verdict (`None` for the unbound default, which logs nothing):
+/// admitted 0, each [`ExpertIu4Reject`] `1 + index`, each exclusion 19..=31.
+fn expert_iu4_log_class(decision: &ExpertIu4Decision) -> Option<usize> {
+    match decision {
+        ExpertIu4Decision::Unbound => None,
+        ExpertIu4Decision::Admitted(_) => Some(0),
+        ExpertIu4Decision::Fallback(ExpertIu4Fallback::Admission(reject)) => ExpertIu4Reject::ALL
+            .iter()
+            .position(|r| r == reject)
+            .map(|index| 1 + index),
+        ExpertIu4Decision::Fallback(ExpertIu4Fallback::Exclusion(x)) => Some(x.class()),
+    }
+}
+
+/// One stderr line describing the verdict (same `  <what> (<flag>): ...` shape as
+/// the loader's IU4 line); `None` for the unbound default.
+pub(super) fn expert_iu4_log_line(
+    arch: &str,
+    f: &ExpertIu4Facts,
+    decision: &ExpertIu4Decision,
+) -> Option<String> {
+    let (spec, _) = f.capability?;
+    let common = format!(
+        "arch={arch} rows={} route_rows={} gate_up={:?} down={:?} numerics={:?}",
+        f.dims.rows, f.route_rows, spec.gate_up_codec, spec.down_codec, spec.numerics
+    );
+    let head = "  moe expert IU4 prefill (HIPFIRE_MOE_SYM_IU4):";
+    match decision {
+        ExpertIu4Decision::Unbound => None,
+        ExpertIu4Decision::Admitted(_) => Some(format!(
+            "{head} requested={} admitted {common} modules=qwen4_moe_iu4_sym_pm_gfx1201\
+             [qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4,qwen4_moe_down_iu4_sym_pm_gfx1201_nt4]\
+             +moe_slot_ops_pm_gfx1201[moe_down_combine_grouped_bf16in_pm_gfx1201]",
+            f.requested
+        )),
+        ExpertIu4Decision::Fallback(fallback) => {
+            let detail = match fallback {
+                ExpertIu4Fallback::Exclusion(ExpertIu4Exclusion::Capacity(name)) => {
+                    format!("{} ({name})", fallback.reason())
+                }
+                _ => fallback.reason().to_string(),
+            };
+            Some(format!(
+                "{head} requested={} fallback to the qt53 F32 route: {detail} {common}",
+                f.requested
+            ))
+        }
+    }
+}
+
+/// Log the verdict once per process per decision class.
+fn log_expert_iu4_once(arch: &str, f: &ExpertIu4Facts, decision: &ExpertIu4Decision) {
+    static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Some(class) = expert_iu4_log_class(decision) else {
+        return;
+    };
+    let bit = 1u64 << class;
+    if LOGGED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed) & bit == 0 {
+        if let Some(line) = expert_iu4_log_line(arch, f, decision) {
+            eprintln!("{line}");
+        }
+    }
+}
+
+impl MoeStepState<'_> {
+    /// The call's one IU4 verdict, decided on first use and cached. Unbound (the
+    /// default: the arch bound no capability) returns before any flag, device or
+    /// operand read.
+    fn expert_iu4_decision(
+        &self,
+        gpu: &Gpu,
+        params: &MoePrefillParams<'_>,
+        selection: &MoePrefillSelection,
+    ) -> ExpertIu4Decision {
+        if params.expert_iu4.is_none() {
+            return ExpertIu4Decision::Unbound;
+        }
+        *self.expert_iu4.get_or_init(|| {
+            let facts = expert_iu4_facts(gpu, params, selection);
+            let decision = decide_expert_iu4(&facts);
+            log_expert_iu4_once(gpu.arch.as_str(), &facts, &decision);
+            decision
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3662,5 +4269,676 @@ mod tests {
         assert_eq!(calls.get(), 1);
         assert!(probe(true, 512, true));
         assert_eq!(calls.get(), 2);
+    }
+
+    // ── opt-in expert IU4 prefill route: the pure verdict ────────────────────
+
+    use crate::families::moe_expert_iu4::ExpertNumerics;
+    use rdna_compute::DType;
+
+    const A3B_ROWS: usize = 8192;
+    const A3B_TOP_K: usize = 8;
+    const A3B_GROUPED: usize = A3B_ROWS * A3B_TOP_K + 256 * 15;
+
+    fn a3b_spec() -> ExpertIu4Spec {
+        ExpertIu4Spec {
+            experts: 256,
+            top_k: 8,
+            hidden: 2048,
+            intermediate: 512,
+            gate_up_codec: DType::MQ4G256V2,
+            down_codec: DType::MQ4G128V2,
+            numerics: ExpertNumerics::SymmetricBf16SlotsF32OrderedCombine,
+        }
+    }
+
+    fn a3b_dims() -> ExpertIu4Dims {
+        ExpertIu4Dims {
+            rows: A3B_ROWS,
+            k_top: A3B_TOP_K,
+            n_exp: 256,
+            hidden: 2048,
+            intermediate: 512,
+            down_m: 2048,
+            down_k: 512,
+            grouped_rows: A3B_GROUPED,
+        }
+    }
+
+    fn a3b_held() -> ExpertIu4Held {
+        ExpertIu4Held {
+            x_norm: A3B_ROWS * 2048 * 4,
+            x_batch: A3B_ROWS * 2048 * 4,
+            sorted_slot_index: A3B_GROUPED * 4,
+            inverse_perm: A3B_ROWS * A3B_TOP_K * 4,
+            topk_weights: A3B_ROWS * A3B_TOP_K * 4,
+            y_gate_up_grouped: A3B_GROUPED * 512 * 2,
+            y_down_grouped: A3B_GROUPED * 2048 * 2,
+        }
+    }
+
+    fn a3b_scratch() -> ExpertIu4Scratch {
+        ExpertIu4Scratch {
+            gate_x: rdna_compute::scratch::int4_mmq_reservation_bytes(2048, A3B_ROWS),
+            down_i4: rdna_compute::scratch::qwen4_moe_down_i4_bytes(512, A3B_ROWS * A3B_TOP_K),
+        }
+    }
+
+    /// An admitted A3B prefill chunk on a device that requested the route.
+    fn admitted_facts() -> ExpertIu4Facts {
+        ExpertIu4Facts {
+            capability: Some((a3b_spec(), true)),
+            requested: true,
+            route_rows: A3B_ROWS,
+            min_rows: rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
+            use_path2: true,
+            has_dtype_tags: false,
+            has_down_awq: false,
+            capturing_graph: false,
+            host_mapped: false,
+            shape: ExpertIu4CallShape::default(),
+            routed_gate_up: DType::MQ4G256V2,
+            routed_down: DType::MQ4G128V2,
+            x_norm_f32: true,
+            dims: a3b_dims(),
+            held: a3b_held(),
+            scratch: a3b_scratch(),
+        }
+    }
+
+    fn fallback(facts: ExpertIu4Facts) -> ExpertIu4Fallback {
+        match decide_expert_iu4(&facts) {
+            ExpertIu4Decision::Fallback(fallback) => fallback,
+            other => panic!("expected a fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expert_iu4_admits_the_a3b_prefill_chunk_with_exact_plan() {
+        assert_eq!(
+            decide_expert_iu4(&admitted_facts()),
+            ExpertIu4Decision::Admitted(ExpertIu4Plan {
+                rows: A3B_ROWS,
+                grouped_rows: A3B_GROUPED,
+                total_slots: A3B_ROWS * A3B_TOP_K,
+                hidden: 2048,
+                intermediate: 512,
+                k_top: 8,
+            })
+        );
+        // The row floor is inclusive, on the route-row measure.
+        let at_floor = ExpertIu4Facts {
+            route_rows: rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
+            ..admitted_facts()
+        };
+        assert!(matches!(
+            decide_expert_iu4(&at_floor),
+            ExpertIu4Decision::Admitted(_)
+        ));
+    }
+
+    #[test]
+    fn expert_iu4_unbound_is_byte_neutral_whatever_else_is_true() {
+        // No capability (the default and every non-Qwen35 arch): nothing else is read.
+        let hostile = ExpertIu4Facts {
+            capability: None,
+            requested: false,
+            use_path2: false,
+            capturing_graph: true,
+            host_mapped: true,
+            has_dtype_tags: true,
+            route_rows: 1,
+            shape: ExpertIu4CallShape {
+                routed_out: true,
+                ep_tile_exchange: true,
+                ..ExpertIu4CallShape::default()
+            },
+            ..admitted_facts()
+        };
+        assert_eq!(decide_expert_iu4(&hostile), ExpertIu4Decision::Unbound);
+        assert_eq!(expert_iu4_log_class(&ExpertIu4Decision::Unbound), None);
+        assert_eq!(
+            expert_iu4_log_line("gfx1201", &hostile, &ExpertIu4Decision::Unbound),
+            None
+        );
+    }
+
+    #[test]
+    fn expert_iu4_fallback_table() {
+        use ExpertIu4Exclusion as X;
+        use ExpertIu4Fallback::{Admission, Exclusion};
+        let base = admitted_facts();
+        let shape = |f: fn(&mut ExpertIu4CallShape)| {
+            let mut s = ExpertIu4CallShape::default();
+            f(&mut s);
+            s
+        };
+        let cases: Vec<(&str, ExpertIu4Facts, ExpertIu4Fallback)> = vec![
+            (
+                "flag off / not requested",
+                ExpertIu4Facts {
+                    requested: false,
+                    ..base
+                },
+                Admission(ExpertIu4Reject::NotRequested),
+            ),
+            (
+                "headers not verified on every layer",
+                ExpertIu4Facts {
+                    capability: Some((a3b_spec(), false)),
+                    ..base
+                },
+                Admission(ExpertIu4Reject::HeadersNotVerified),
+            ),
+            (
+                "path 1",
+                ExpertIu4Facts {
+                    use_path2: false,
+                    ..base
+                },
+                Admission(ExpertIu4Reject::NotPath2),
+            ),
+            (
+                "below the row floor",
+                ExpertIu4Facts {
+                    route_rows: rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS - 1,
+                    ..base
+                },
+                Admission(ExpertIu4Reject::BelowMinRows),
+            ),
+            (
+                "dtype tags",
+                ExpertIu4Facts {
+                    has_dtype_tags: true,
+                    ..base
+                },
+                Admission(ExpertIu4Reject::MixedTags),
+            ),
+            (
+                "down AWQ",
+                ExpertIu4Facts {
+                    has_down_awq: true,
+                    ..base
+                },
+                Admission(ExpertIu4Reject::DownAwq),
+            ),
+            (
+                "graph capture / recording",
+                ExpertIu4Facts {
+                    capturing_graph: true,
+                    ..base
+                },
+                Admission(ExpertIu4Reject::GraphCapture),
+            ),
+            (
+                "host-mapped experts",
+                ExpertIu4Facts {
+                    host_mapped: true,
+                    ..base
+                },
+                Admission(ExpertIu4Reject::HostMapped),
+            ),
+            (
+                "wrong gate/up codec in the spec",
+                ExpertIu4Facts {
+                    capability: Some((
+                        ExpertIu4Spec {
+                            gate_up_codec: DType::MQ4G256,
+                            ..a3b_spec()
+                        },
+                        true,
+                    )),
+                    ..base
+                },
+                Admission(ExpertIu4Reject::GateUpCodec),
+            ),
+            (
+                "specialized route",
+                ExpertIu4Facts {
+                    shape: shape(|s| s.specialized_route = true),
+                    ..base
+                },
+                Exclusion(X::SpecializedRoute),
+            ),
+            (
+                "recipe",
+                ExpertIu4Facts {
+                    shape: shape(|s| s.not_softmax_gated_recipe = true),
+                    ..base
+                },
+                Exclusion(X::Recipe),
+            ),
+            (
+                "CPU-deferred",
+                ExpertIu4Facts {
+                    shape: shape(|s| s.cpu_deferred = true),
+                    ..base
+                },
+                Exclusion(X::CpuDeferred),
+            ),
+            (
+                "CPU split",
+                ExpertIu4Facts {
+                    shape: shape(|s| s.cpu_split = true),
+                    ..base
+                },
+                Exclusion(X::CpuSplit),
+            ),
+            (
+                "EP routed_out (Path 2 stays true: never NotPath2)",
+                ExpertIu4Facts {
+                    shape: shape(|s| s.routed_out = true),
+                    ..base
+                },
+                Exclusion(X::RoutedOut),
+            ),
+            (
+                "EP row gather",
+                ExpertIu4Facts {
+                    shape: shape(|s| s.ep_row_gather = true),
+                    ..base
+                },
+                Exclusion(X::EpRowGather),
+            ),
+            (
+                "EP tile exchange",
+                ExpertIu4Facts {
+                    shape: shape(|s| s.ep_tile_exchange = true),
+                    ..base
+                },
+                Exclusion(X::EpTileExchange),
+            ),
+            (
+                "canonical slot-order (root-routed EP)",
+                ExpertIu4Facts {
+                    shape: shape(|s| s.canonical_slot_order = true),
+                    ..base
+                },
+                Exclusion(X::CanonicalSlotOrder),
+            ),
+            (
+                "staged expert tables",
+                ExpertIu4Facts {
+                    shape: shape(|s| s.staged_expert_tables = true),
+                    ..base
+                },
+                Exclusion(X::StagedExpertTables),
+            ),
+            (
+                "paro",
+                ExpertIu4Facts {
+                    shape: shape(|s| s.paro = true),
+                    ..base
+                },
+                Exclusion(X::Paro),
+            ),
+            (
+                "spec geometry disagrees",
+                ExpertIu4Facts {
+                    dims: ExpertIu4Dims {
+                        intermediate: 768,
+                        down_k: 768,
+                        ..a3b_dims()
+                    },
+                    ..base
+                },
+                Exclusion(X::SpecMismatch),
+            ),
+            (
+                "routed down dtype disagrees",
+                ExpertIu4Facts {
+                    routed_down: DType::MQ4G256V2,
+                    ..base
+                },
+                Exclusion(X::SpecMismatch),
+            ),
+            (
+                "activation is not F32",
+                ExpertIu4Facts {
+                    x_norm_f32: false,
+                    ..base
+                },
+                Exclusion(X::ActivationDtype),
+            ),
+            (
+                "BF16 gate/up view does not fit",
+                ExpertIu4Facts {
+                    held: ExpertIu4Held {
+                        y_gate_up_grouped: A3B_GROUPED * 512 * 2 - 1,
+                        ..a3b_held()
+                    },
+                    ..base
+                },
+                Exclusion(X::Capacity("y_gate_up_grouped")),
+            ),
+            (
+                "gate A4 scratch undersized (larger chunk than the load reservation)",
+                ExpertIu4Facts {
+                    scratch: ExpertIu4Scratch {
+                        gate_x: rdna_compute::scratch::int4_mmq_reservation_bytes(
+                            2048,
+                            A3B_ROWS / 2,
+                        ),
+                        ..a3b_scratch()
+                    },
+                    ..base
+                },
+                Exclusion(X::Capacity("int4_mmq_x_scratch")),
+            ),
+            (
+                "down A4 scratch never reserved",
+                ExpertIu4Facts {
+                    scratch: ExpertIu4Scratch {
+                        down_i4: None,
+                        ..a3b_scratch()
+                    },
+                    ..base
+                },
+                Exclusion(X::Capacity("qwen4_moe_down_i4_scratch")),
+            ),
+        ];
+        for (label, facts, want) in cases {
+            assert_eq!(fallback(facts), want, "{label}");
+        }
+    }
+
+    #[test]
+    fn expert_iu4_admission_precedes_exclusions() {
+        // A call that is both below the floor and EP reports the admission reason.
+        let facts = ExpertIu4Facts {
+            route_rows: 1,
+            shape: ExpertIu4CallShape {
+                routed_out: true,
+                ..ExpertIu4CallShape::default()
+            },
+            ..admitted_facts()
+        };
+        assert_eq!(
+            fallback(facts),
+            ExpertIu4Fallback::Admission(ExpertIu4Reject::BelowMinRows)
+        );
+    }
+
+    #[test]
+    fn expert_iu4_plan_is_the_physical_call_not_the_route_rows() {
+        // Under the batch-invariant profile `route_rows` is the canonical chunk, but the
+        // launches carry the physical rows: the floor reads route_rows, the plan rows.
+        let physical = 1024usize;
+        let grouped = physical * A3B_TOP_K + 256 * 15;
+        let facts = ExpertIu4Facts {
+            route_rows: A3B_ROWS,
+            dims: ExpertIu4Dims {
+                rows: physical,
+                grouped_rows: grouped,
+                ..a3b_dims()
+            },
+            held: ExpertIu4Held {
+                x_norm: physical * 2048 * 4,
+                x_batch: physical * 2048 * 4,
+                sorted_slot_index: grouped * 4,
+                inverse_perm: physical * A3B_TOP_K * 4,
+                topk_weights: physical * A3B_TOP_K * 4,
+                y_gate_up_grouped: grouped * 512 * 2,
+                y_down_grouped: grouped * 2048 * 2,
+            },
+            scratch: ExpertIu4Scratch {
+                gate_x: rdna_compute::scratch::int4_mmq_reservation_bytes(2048, physical),
+                down_i4: rdna_compute::scratch::qwen4_moe_down_i4_bytes(512, physical * A3B_TOP_K),
+            },
+            ..admitted_facts()
+        };
+        match decide_expert_iu4(&facts) {
+            ExpertIu4Decision::Admitted(plan) => {
+                assert_eq!(
+                    (plan.rows, plan.total_slots, plan.grouped_rows),
+                    (physical, physical * 8, grouped)
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn expert_iu4_bf16_view_bytes_are_exact_and_checked() {
+        assert_eq!(
+            bf16_grouped_view_bytes(A3B_GROUPED, 512),
+            Some(A3B_GROUPED * 512 * 2)
+        );
+        assert_eq!(
+            bf16_grouped_view_bytes(A3B_GROUPED, 2048),
+            Some(A3B_GROUPED * 2048 * 2)
+        );
+        assert_eq!(bf16_grouped_view_bytes(0, 512), Some(0));
+        assert_eq!(bf16_grouped_view_bytes(usize::MAX, 2), None);
+        assert_eq!(bf16_grouped_view_bytes(usize::MAX / 2 + 1, 1), None);
+    }
+
+    #[test]
+    fn expert_iu4_capacity_table() {
+        let d = a3b_dims();
+        let h = a3b_held();
+        assert_eq!(expert_iu4_capacity(&d, &h), Ok(()));
+        let short = |f: fn(&mut ExpertIu4Held), name: &str| {
+            let mut held = h;
+            f(&mut held);
+            assert_eq!(
+                expert_iu4_capacity(&d, &held),
+                Err(name_static(name)),
+                "{name}"
+            );
+        };
+        short(|h| h.x_norm -= 1, "x_norm_batch");
+        short(|h| h.x_batch -= 1, "x_batch");
+        short(|h| h.sorted_slot_index -= 1, "sorted_slot_index");
+        short(|h| h.inverse_perm -= 1, "inverse_perm");
+        short(|h| h.topk_weights -= 1, "topk_weights");
+        short(|h| h.y_gate_up_grouped -= 1, "y_gate_up_grouped");
+        short(|h| h.y_down_grouped -= 1, "y_down_grouped");
+        // Domain limits.
+        let with = |d: ExpertIu4Dims| expert_iu4_capacity(&d, &h);
+        assert_eq!(with(ExpertIu4Dims { rows: 0, ..d }), Err("rows"));
+        assert_eq!(
+            with(ExpertIu4Dims {
+                grouped_rows: d.grouped_rows + 1,
+                ..d
+            }),
+            Err("grouped_rows")
+        );
+        assert_eq!(
+            with(ExpertIu4Dims {
+                grouped_rows: A3B_ROWS * 8 - 16,
+                ..d
+            }),
+            Err("grouped_rows")
+        );
+        assert_eq!(
+            with(ExpertIu4Dims {
+                rows: (1 << 22) / 8 + 1,
+                ..d
+            }),
+            Err("slots")
+        );
+        assert_eq!(
+            with(ExpertIu4Dims {
+                hidden: 256 * 65_536,
+                ..d
+            }),
+            Err("hidden")
+        );
+        // The PM down kernel's 32-bit Y byte extent.
+        let wide = ExpertIu4Dims {
+            grouped_rows: 1 << 21,
+            ..d
+        };
+        let held = ExpertIu4Held {
+            sorted_slot_index: usize::MAX / 8,
+            y_gate_up_grouped: usize::MAX / 8,
+            y_down_grouped: usize::MAX / 8,
+            ..h
+        };
+        assert_eq!(expert_iu4_capacity(&wide, &held), Err("y_down_grouped"));
+    }
+
+    /// Interns the table's names as the `&'static str` the function returns.
+    fn name_static(name: &str) -> &'static str {
+        [
+            "x_norm_batch",
+            "x_batch",
+            "sorted_slot_index",
+            "inverse_perm",
+            "topk_weights",
+            "y_gate_up_grouped",
+            "y_down_grouped",
+        ]
+        .into_iter()
+        .find(|candidate| *candidate == name)
+        .expect("known operand")
+    }
+
+    #[test]
+    fn expert_iu4_scratch_preflight_table() {
+        let d = a3b_dims();
+        let ok = a3b_scratch();
+        assert_eq!(expert_iu4_scratch_ready(&d, &ok), Ok(()));
+        // Exact extents of the producers' allocators: one byte short fails.
+        let gate = ok.gate_x.unwrap();
+        let down = ok.down_i4.unwrap();
+        assert_eq!(gate, 2048 / 128 * A3B_ROWS * 72);
+        assert_eq!(down, 512 / 128 * A3B_ROWS * A3B_TOP_K * 72);
+        assert_eq!(
+            expert_iu4_scratch_ready(
+                &d,
+                &ExpertIu4Scratch {
+                    gate_x: Some(gate - 1),
+                    ..ok
+                }
+            ),
+            Err("int4_mmq_x_scratch")
+        );
+        assert_eq!(
+            expert_iu4_scratch_ready(
+                &d,
+                &ExpertIu4Scratch {
+                    down_i4: Some(down - 1),
+                    ..ok
+                }
+            ),
+            Err("qwen4_moe_down_i4_scratch")
+        );
+        assert_eq!(
+            expert_iu4_scratch_ready(&d, &ExpertIu4Scratch { gate_x: None, ..ok }),
+            Err("int4_mmq_x_scratch")
+        );
+        assert_eq!(
+            expert_iu4_scratch_ready(
+                &d,
+                &ExpertIu4Scratch {
+                    down_i4: None,
+                    ..ok
+                }
+            ),
+            Err("qwen4_moe_down_i4_scratch")
+        );
+        // Larger reservations are fine; a rejected shape is never admitted.
+        assert_eq!(
+            expert_iu4_scratch_ready(
+                &d,
+                &ExpertIu4Scratch {
+                    gate_x: Some(gate * 2),
+                    down_i4: Some(down * 2)
+                }
+            ),
+            Ok(())
+        );
+        let odd = ExpertIu4Dims {
+            hidden: 2048 + 128,
+            ..d
+        };
+        assert_eq!(
+            expert_iu4_scratch_ready(&odd, &ok),
+            Err("int4_mmq_x_scratch")
+        );
+    }
+
+    #[test]
+    fn expert_iu4_log_classes_are_distinct_and_lines_carry_the_decision() {
+        use ExpertIu4Exclusion as X;
+        let mut classes = std::collections::BTreeSet::new();
+        let mut push = |decision: ExpertIu4Decision| {
+            let class = expert_iu4_log_class(&decision).expect("loggable");
+            assert!(class < 64);
+            assert!(classes.insert(class), "{decision:?} reuses class {class}");
+        };
+        push(ExpertIu4Decision::Admitted(ExpertIu4Plan {
+            rows: 1,
+            grouped_rows: 16,
+            total_slots: 8,
+            hidden: 2048,
+            intermediate: 512,
+            k_top: 8,
+        }));
+        for reject in ExpertIu4Reject::ALL {
+            push(ExpertIu4Decision::Fallback(ExpertIu4Fallback::Admission(
+                reject,
+            )));
+        }
+        for x in [
+            X::SpecializedRoute,
+            X::Recipe,
+            X::CpuDeferred,
+            X::CpuSplit,
+            X::RoutedOut,
+            X::EpRowGather,
+            X::EpTileExchange,
+            X::CanonicalSlotOrder,
+            X::StagedExpertTables,
+            X::Paro,
+            X::SpecMismatch,
+            X::ActivationDtype,
+            X::Capacity("x"),
+        ] {
+            push(ExpertIu4Decision::Fallback(ExpertIu4Fallback::Exclusion(x)));
+        }
+
+        let facts = admitted_facts();
+        let admitted = decide_expert_iu4(&facts);
+        let line = expert_iu4_log_line("gfx1201", &facts, &admitted).unwrap();
+        for needle in [
+            "requested=true",
+            "admitted",
+            "arch=gfx1201",
+            "MQ4G256V2",
+            "MQ4G128V2",
+            "SymmetricBf16SlotsF32OrderedCombine",
+            "qwen4_moe_iu4_sym_pm_gfx1201",
+            "_nt4",
+            "moe_slot_ops_pm_gfx1201",
+            "moe_down_combine_grouped_bf16in_pm_gfx1201",
+            "rows=8192",
+        ] {
+            assert!(line.contains(needle), "{needle}: {line}");
+        }
+
+        let refused = ExpertIu4Facts {
+            requested: false,
+            ..facts
+        };
+        let line = expert_iu4_log_line("gfx1100", &refused, &decide_expert_iu4(&refused)).unwrap();
+        assert!(line.contains("requested=false"), "{line}");
+        assert!(
+            line.contains(ExpertIu4Reject::NotRequested.reason()),
+            "{line}"
+        );
+        assert!(line.contains("arch=gfx1100"), "{line}");
+
+        let tight = ExpertIu4Facts {
+            scratch: ExpertIu4Scratch {
+                gate_x: None,
+                ..a3b_scratch()
+            },
+            ..facts
+        };
+        let line = expert_iu4_log_line("gfx1201", &tight, &decide_expert_iu4(&tight)).unwrap();
+        assert!(line.contains("int4_mmq_x_scratch"), "{line}");
     }
 }

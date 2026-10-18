@@ -1212,6 +1212,7 @@ fn build_moe_prefill<'a>(
         shared_down_out: moe.shared_down_out,
         ep_layer_idx: moe.layer_idx,
         ep_tile_exchange: moe.tile_exchange,
+        expert_iu4: None,
     })
 }
 
@@ -1668,6 +1669,20 @@ mod step_graph_tests {
         assert_split(&[9, 8, 8, 8, 8, 7], true, true);
         assert_split(&[9, 8, 8, 8, 8, 7], true, false);
         assert_split(&[9, 8, 8, 8, 8, 7], false, false);
+    }
+}
+
+#[cfg(test)]
+mod expert_iu4_binding_tests {
+    /// Qwen4 binds the FN symmetric route elsewhere; its prefill constructor must
+    /// never carry the Qwen35 expert IU4 capability.
+    #[test]
+    fn moe_prefill_constructor_binds_no_expert_iu4() {
+        let src = include_str!("program.rs");
+        let production = src.split(concat!("#[cfg", "(test)]")).next().unwrap();
+        assert_eq!(production.matches("MoePrefillParams {").count(), 1);
+        assert_eq!(production.matches("expert_iu4:").count(), 1);
+        assert_eq!(production.matches("expert_iu4: None,").count(), 1);
     }
 }
 

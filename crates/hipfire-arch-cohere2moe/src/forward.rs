@@ -830,6 +830,7 @@ pub fn forward_batch(
                     shared_down_out: None,
                     ep_layer_idx: 0,
                     ep_tile_exchange: None,
+                    expert_iu4: None,
                 };
                 let call = seal_prefill(bound, &ctx, params)
                     .map_err(|e| format!("cohere2moe L{l} seal prefill: {e:?}"))?;
@@ -897,4 +898,17 @@ pub fn forward_batch(
         gpu.free_tensor(t).ok();
     }
     Ok(logits)
+}
+
+#[cfg(test)]
+mod expert_iu4_binding_tests {
+    /// Cohere never binds the Qwen35 expert IU4 capability.
+    #[test]
+    fn moe_prefill_constructor_binds_no_expert_iu4() {
+        let src = include_str!("forward.rs");
+        let production = src.split(concat!("#[cfg", "(test)]")).next().unwrap();
+        assert_eq!(production.matches("MoePrefillParams {").count(), 1);
+        assert_eq!(production.matches("expert_iu4:").count(), 1);
+        assert_eq!(production.matches("expert_iu4: None,").count(), 1);
+    }
 }

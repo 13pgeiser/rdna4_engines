@@ -1435,6 +1435,17 @@ pub const DECISIONS: &[Decision] = &[
         evidence: "the refused branches launch nothing and mutate no split state; the D2 split blocks the host between the router and the routed tail and a CPU routed-expert forward never runs recorded, captured, replayed or shadow-validated, so no recorded program is produced that differs from the eager one. The D2 gate sites only widen the same refusal to the specialized capture slots and retained transports; there is no arithmetic or lifecycle change",
         reaches: &[],
     },
+    Decision {
+        id: "a3b-expert-iu4-eager-only",
+        predicates: &[IsRecording, CaptureMode, GraphSlotCapturing],
+        condition: "opt-in symmetric IU4 expert prefill route (HIPFIRE_MOE_SYM_IU4, default off; bound only to qt44/qt53 `.mq4rs` artifacts whose symmetric headers verified at load): hipfire-dispatch moe_program.rs expert_iu4_facts sets ExpertIu4Inputs::capturing_graph from expert_iu4_capturing (`graphs.capture_mode || graphs.verify.capturing || graphs.replay.capturing || replay.is_recording() || replay.retained_body_active()`, moe_program.rs:3864-3870), and expert_iu4_admission (families/moe_expert_iu4.rs:255-257) rejects it with GraphCapture",
+        effect: KernelSelection,
+        switches: "eager: grouped IU4 PM gate_up/SiLU and down GEMMs plus the BF16 ordered combine (qwen4_moe_iu4_sym_pm_gfx1201, moe_slot_ops_pm_gfx1201); hipGraph capture, Redline recording or a retained body: the incumbent Path-2 expert route for the same artifact (qt53 down on its typed F32 fallback)",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "the IU4 route quantizes the expert activations to int4 and combines in BF16, so its output differs from the incumbent route's; it is default off and binds only to verified symmetric `.mq4rs` artifacts, while the Redline default programs are plain-AR decode tapes on `.mq4r` and dense artifacts where the capability is unbound and the MoE prefill program does not run, so no default program reaches it; the refusing branch is the unchanged incumbent route",
+        reaches: &[],
+    },
 ];
 pub const SITES: &[Site] = &[
     Site {
@@ -1905,6 +1916,12 @@ pub const SITES: &[Site] = &[
         function: "absorbs_clear",
         occurrences: 2,
         decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "expert_iu4_capturing",
+        occurrences: 4,
+        decisions: &["a3b-expert-iu4-eager-only"],
     },
     Site {
         file: "hipfire-dispatch/src/pipeline/moe_program.rs",

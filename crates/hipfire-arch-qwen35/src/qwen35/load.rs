@@ -2970,7 +2970,7 @@ fn load_weights_inner(
             host_expert_bytes as f64 / (1u64 << 30) as f64,
         );
     }
-    Ok(Qwen35Weights {
+    let mut weights = Qwen35Weights {
         token_embd,
         embd_format,
         output_norm,
@@ -2980,7 +2980,11 @@ fn load_weights_inner(
         pager: None,
         lm_head_aliases_embd,
         ep_shard: None,
-    })
+    };
+    // Model-level symmetric IU4 verdict + scratch reservation (no-op unless the
+    // flag made a MoE layer carry a capability).
+    finalize_expert_iu4(devices, layout, &mut weights);
+    Ok(weights)
 }
 
 // ── HfqSource ─────────────────────────────────────────────────────────────
@@ -5991,6 +5995,7 @@ impl PendingMoeFfn {
             expert_binding,
             mixed_expert_gate_up_tiers,
             mixed_expert_down_tiers,
+            expert_iu4: None,
         })
     }
     /// Sealed EP commit: run the C1 compact live bind over the rank's owned
@@ -6107,6 +6112,7 @@ impl PendingMoeFfn {
             expert_binding,
             mixed_expert_gate_up_tiers,
             mixed_expert_down_tiers,
+            expert_iu4: None,
         })
     }
 }
@@ -6623,7 +6629,321 @@ pub(crate) fn load_moe_ffn(
         }
     }
 
-    pending.commit(expert_execution_plan, expert_table, expert_binding, gpu)
+    let mut ffn = pending.commit(expert_execution_plan, expert_table, expert_binding, gpu)?;
+    // Opt-in symmetric IU4 expert prefill route (`HIPFIRE_MOE_SYM_IU4`, default
+    // off): flag off => no check, no capability, no reservation. The model-level
+    // verdict and scratch reservation run once in `finalize_expert_iu4`.
+    if gpu.moe_sym_iu4_requested() {
+        ffn.expert_iu4 = expert_iu4_layer_capability(gpu, config, &ffn, residency.experts_host());
+    }
+    Ok(ffn)
+}
+
+// ─── Opt-in symmetric IU4 routed-expert prefill capability ─────────────────
+
+type ExpertIu4Capability = (
+    hipfire_dispatch::families::moe_expert_iu4::ExpertIu4Spec,
+    bool,
+);
+
+/// Facts of one loaded MoE layer that decide whether it can carry the IU4
+/// capability. Pure data so the decision is CPU-testable.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExpertIu4LayerFacts {
+    pub(crate) experts: usize,
+    pub(crate) top_k: usize,
+    pub(crate) hidden: usize,
+    pub(crate) intermediate: usize,
+    /// Routed experts are host-mapped (`memory.moe_expert_budget` spill).
+    pub(crate) experts_host: bool,
+    /// Loaded resident expert tensors (`0` when paged; the pager owns them).
+    pub(crate) resident_experts: usize,
+    /// `Some(dtype)` only when every expert's gate_up has that dtype.
+    pub(crate) gate_up_dtype: Option<DType>,
+    /// `Some(dtype)` only when every expert's down has that dtype.
+    pub(crate) down_dtype: Option<DType>,
+    /// Every expert's gate_up is `[2 * intermediate, hidden]` and down is
+    /// `[hidden, intermediate]`.
+    pub(crate) shapes_ok: bool,
+    pub(crate) has_dtype_tags: bool,
+    pub(crate) has_awq: bool,
+    pub(crate) cpu_deferred: bool,
+    pub(crate) paro: bool,
+}
+
+/// `Some(dtype)` when the iterator is non-empty and every item is equal.
+fn uniform_dtype(mut dtypes: impl Iterator<Item = DType>) -> Option<DType> {
+    let first = dtypes.next()?;
+    dtypes.all(|dtype| dtype == first).then_some(first)
+}
+
+fn expert_iu4_layer_facts(
+    ffn: &MoeFfnWeights,
+    config: &Qwen35Config,
+    experts_host: bool,
+) -> ExpertIu4LayerFacts {
+    let (hidden, intermediate) = (config.dim, config.moe_intermediate_size);
+    ExpertIu4LayerFacts {
+        experts: config.num_experts,
+        top_k: config.num_experts_per_tok,
+        hidden,
+        intermediate,
+        experts_host,
+        resident_experts: ffn.experts.len(),
+        gate_up_dtype: uniform_dtype(ffn.experts.iter().map(|e| e.gate_up.gpu_dtype)),
+        down_dtype: uniform_dtype(ffn.experts.iter().map(|e| e.down.gpu_dtype)),
+        shapes_ok: ffn.experts.iter().all(|e| {
+            (e.gate_up.m, e.gate_up.k) == (2 * intermediate, hidden)
+                && (e.down.m, e.down.k) == (hidden, intermediate)
+        }),
+        has_dtype_tags: ffn.expert_dtype_tags.is_some()
+            || ffn.mixed_expert_gate_up_tiers.is_some()
+            || ffn.mixed_expert_down_tiers.is_some()
+            || ffn.global_expert_dtypes.is_some(),
+        has_awq: ffn.expert_down_awq_ptrs.is_some()
+            || ffn
+                .experts
+                .iter()
+                .any(|e| e.gate_up.awq_scale.is_some() || e.down.awq_scale.is_some()),
+        cpu_deferred: ffn.cpu_deferred_experts,
+        paro: ffn.paro_shared.is_some(),
+    }
+}
+
+/// Pure per-layer eligibility: the expert spec this layer would carry, or the
+/// first reason it cannot carry the capability. Resident, uniform qt44
+/// (MQ4G256V2) gate_up + qt53 (MQ4G128V2) down only; the spec's own geometry
+/// requirements are those of `ExpertIu4Spec::validate`.
+pub(crate) fn expert_iu4_layer_spec(
+    facts: &ExpertIu4LayerFacts,
+) -> Result<hipfire_dispatch::families::moe_expert_iu4::ExpertIu4Spec, &'static str> {
+    use hipfire_dispatch::families::moe_expert_iu4::{ExpertIu4Spec, ExpertNumerics};
+    if facts.experts_host {
+        return Err("routed experts are host-mapped");
+    }
+    if facts.experts == 0 || facts.resident_experts != facts.experts {
+        return Err("routed experts are not fully resident (paged, EP or absent)");
+    }
+    if facts.gate_up_dtype != Some(DType::MQ4G256V2) || facts.down_dtype != Some(DType::MQ4G128V2) {
+        return Err("routed experts are not uniform qt44 gate/up + qt53 down");
+    }
+    if !facts.shapes_ok {
+        return Err("routed expert shapes do not match the model geometry");
+    }
+    if facts.has_dtype_tags {
+        return Err("routed experts carry per-expert dtype tags");
+    }
+    if facts.has_awq {
+        return Err("routed experts carry AWQ scales");
+    }
+    if facts.cpu_deferred {
+        return Err("routed FFN is deferred to the CPU expert splice");
+    }
+    if facts.paro {
+        return Err("routed experts carry ParoQuant sidecars");
+    }
+    let (Ok(experts), Ok(top_k), Ok(hidden), Ok(intermediate)) = (
+        u32::try_from(facts.experts),
+        u32::try_from(facts.top_k),
+        u32::try_from(facts.hidden),
+        u32::try_from(facts.intermediate),
+    ) else {
+        return Err("expert geometry exceeds 32 bits");
+    };
+    let spec = ExpertIu4Spec {
+        experts,
+        top_k,
+        hidden,
+        intermediate,
+        gate_up_codec: DType::MQ4G256V2,
+        down_codec: DType::MQ4G128V2,
+        numerics: ExpertNumerics::SymmetricBf16SlotsF32OrderedCombine,
+    };
+    spec.validate().map_err(|reject| reject.reason())?;
+    Ok(spec)
+}
+
+/// Model-level result of the per-layer capabilities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExpertIu4Verdict {
+    pub(crate) spec: hipfire_dispatch::families::moe_expert_iu4::ExpertIu4Spec,
+    pub(crate) verified: bool,
+    /// First reason `verified` is false.
+    pub(crate) reason: Option<&'static str>,
+}
+
+/// Pure model verdict over every MoE layer's capability, in layer order.
+/// `None` when no layer carries one (flag off or nothing eligible: no work).
+/// `verified` only when EVERY MoE layer carries the same spec with verified
+/// symmetric headers; otherwise the capability is withheld from ALL layers.
+pub(crate) fn expert_iu4_model_verdict(
+    layers: &[Option<ExpertIu4Capability>],
+) -> Option<ExpertIu4Verdict> {
+    let spec = layers.iter().flatten().next()?.0;
+    let mut reason = None;
+    for layer in layers {
+        match layer {
+            None => {
+                reason.get_or_insert("a MoE layer is not eligible for the symmetric IU4 route");
+            }
+            Some((layer_spec, _)) if *layer_spec != spec => {
+                reason.get_or_insert("MoE layers disagree on the expert recipe or geometry");
+            }
+            Some((_, false)) => {
+                reason.get_or_insert("a MoE layer's routed headers are not symmetric");
+            }
+            Some((_, true)) => {}
+        }
+    }
+    Some(ExpertIu4Verdict {
+        spec,
+        verified: reason.is_none(),
+        reason,
+    })
+}
+
+/// One log line per process for the first layer-level refusal.
+fn log_expert_iu4_refusal_once(layer_idx: u16, reason: &str) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "  qwen35 symmetric IU4 MoE (HIPFIRE_MOE_SYM_IU4): layer {layer_idx} refused: {reason}"
+        );
+    }
+}
+
+/// Per-layer capability. Only called when the flag is requested. Ineligible
+/// layers return `None`; eligible ones run the FN load-time header verifier
+/// (`verify_symmetric`: gate/up `(2I, H, 136)`, down `(H, I, 68)`) over the
+/// layer's expert pointer tables. The verifier is optional: a verifier kernel
+/// error means verification is unavailable, so the layer carries
+/// `(spec, false)` (logged once) and the load continues on the E0 fallback.
+fn expert_iu4_layer_capability(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    ffn: &MoeFfnWeights,
+    experts_host: bool,
+) -> Option<ExpertIu4Capability> {
+    let facts = expert_iu4_layer_facts(ffn, config, experts_host);
+    let spec = match expert_iu4_layer_spec(&facts) {
+        Ok(spec) => spec,
+        Err(reason) => {
+            log_expert_iu4_refusal_once(ffn.layer_idx, reason);
+            return None;
+        }
+    };
+    let (experts, hidden, intermediate) = (facts.experts, facts.hidden, facts.intermediate);
+    let checked = gpu
+        .qwen4_moe_sym_check(
+            &ffn.expert_gate_up_ptrs,
+            2 * intermediate,
+            hidden,
+            experts,
+            136,
+        )
+        .and_then(|gate_up| {
+            if gate_up {
+                gpu.qwen4_moe_sym_check(&ffn.expert_down_ptrs, hidden, intermediate, experts, 68)
+            } else {
+                Ok(false)
+            }
+        });
+    let symmetric = match checked {
+        Ok(symmetric) => {
+            if !symmetric {
+                log_expert_iu4_refusal_once(ffn.layer_idx, "routed headers are not symmetric");
+            }
+            symmetric
+        }
+        Err(error) => {
+            log_expert_iu4_refusal_once(
+                ffn.layer_idx,
+                &format!(
+                    "symmetric header verification unavailable: {}",
+                    error.message
+                ),
+            );
+            false
+        }
+    };
+    Some((spec, symmetric))
+}
+
+fn layer_moe_ffn_mut(layer: &mut LayerWeights) -> Option<&mut MoeFfnWeights> {
+    match layer {
+        LayerWeights::DeltaNetMoe(l) => Some(&mut l.ffn),
+        LayerWeights::FullAttnMoe(l) => Some(&mut l.ffn),
+        _ => None,
+    }
+}
+
+/// Model-level IU4 finalization, once after every layer is loaded. Does
+/// nothing (no GPU work, no reservation, no log) unless some MoE layer carries
+/// a capability. If ANY MoE layer failed, the capability is withheld from ALL
+/// layers (verified=false) and the reason logged once. When verified, sizes the
+/// route's scratch for the model's prefill chunk ceiling
+/// ([`prefill_max_batch_for_model`], the ceiling the ordinary MoE prefill
+/// chunks under) on every device hosting a MoE layer, so no allocation happens
+/// inside prefill. A failed reservation withholds the capability instead of
+/// failing the load.
+fn finalize_expert_iu4(devices: &mut [Gpu], layout: &Layout, weights: &mut Qwen35Weights) {
+    use std::collections::BTreeSet;
+    let mut caps: Vec<Option<ExpertIu4Capability>> = Vec::new();
+    let mut hosting: BTreeSet<usize> = BTreeSet::new();
+    for (index, layer) in weights.layers.iter_mut().enumerate() {
+        if let Some(ffn) = layer_moe_ffn_mut(layer) {
+            caps.push(ffn.expert_iu4);
+            hosting.insert(layout.device_for_layer(index));
+        }
+    }
+    let Some(verdict) = expert_iu4_model_verdict(&caps) else {
+        return;
+    };
+    let mut verified = verdict.verified;
+    let mut reason = verdict.reason.map(str::to_owned);
+    if verified {
+        let spec = verdict.spec;
+        for device in hosting {
+            let max_rows = super::prefill::prefill_max_batch_for_model(&devices[device], weights);
+            // The rotate256_i4 / rotate128_i4 launches lazily build the FWHT sign
+            // tables; build them here too so an admitted prefill allocates nothing.
+            let gpu = &mut devices[device];
+            let reserved = gpu
+                .reserve_qwen4_moe_sym(
+                    max_rows,
+                    spec.top_k as usize,
+                    spec.experts as usize,
+                    spec.hidden as usize,
+                    spec.intermediate as usize,
+                )
+                .and_then(|()| gpu.ensure_mq_signs())
+                .and_then(|()| gpu.ensure_mq_signs_128());
+            if let Err(error) = reserved {
+                verified = false;
+                reason = Some(format!(
+                    "symmetric IU4 scratch/sign-table reservation failed on device {device}: {}",
+                    error.message
+                ));
+                break;
+            }
+        }
+    }
+    for layer in weights.layers.iter_mut() {
+        if let Some(ffn) = layer_moe_ffn_mut(layer) {
+            if let Some((_, flag)) = ffn.expert_iu4.as_mut() {
+                *flag = verified;
+            }
+        }
+    }
+    match reason {
+        None => eprintln!(
+            "  qwen35 symmetric IU4 MoE (HIPFIRE_MOE_SYM_IU4): {} MoE layers verified symmetric; scratch reserved",
+            caps.len()
+        ),
+        Some(reason) => eprintln!(
+            "  qwen35 symmetric IU4 MoE (HIPFIRE_MOE_SYM_IU4): capability withheld for all layers: {reason}"
+        ),
+    }
 }
 
 // ─── Sealed EP streaming load ─────────────────────────────────────────────────
@@ -8922,5 +9242,131 @@ mod qt53_blob_tests {
         let mut data = finite.clone();
         data[4..68].fill(0xFF);
         validate_mq4g128v2_blob(&data, 2, 256).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod expert_iu4_load_tests {
+    use super::*;
+    use hipfire_dispatch::families::moe_expert_iu4::{ExpertIu4Spec, ExpertNumerics};
+
+    /// A3B shapes: E=256, top_k=8, H=2048, I=512, resident uniform qt44 + qt53.
+    fn a3b() -> ExpertIu4LayerFacts {
+        ExpertIu4LayerFacts {
+            experts: 256,
+            top_k: 8,
+            hidden: 2048,
+            intermediate: 512,
+            experts_host: false,
+            resident_experts: 256,
+            gate_up_dtype: Some(DType::MQ4G256V2),
+            down_dtype: Some(DType::MQ4G128V2),
+            shapes_ok: true,
+            has_dtype_tags: false,
+            has_awq: false,
+            cpu_deferred: false,
+            paro: false,
+        }
+    }
+
+    fn a3b_spec() -> ExpertIu4Spec {
+        ExpertIu4Spec {
+            experts: 256,
+            top_k: 8,
+            hidden: 2048,
+            intermediate: 512,
+            gate_up_codec: DType::MQ4G256V2,
+            down_codec: DType::MQ4G128V2,
+            numerics: ExpertNumerics::SymmetricBf16SlotsF32OrderedCombine,
+        }
+    }
+
+    #[test]
+    fn uniform_dtype_requires_non_empty_equal() {
+        assert_eq!(uniform_dtype(std::iter::empty()), None);
+        assert_eq!(
+            uniform_dtype([DType::MQ4G128V2; 3].into_iter()),
+            Some(DType::MQ4G128V2)
+        );
+        assert_eq!(
+            uniform_dtype([DType::MQ4G128V2, DType::MQ4G256V2].into_iter()),
+            None
+        );
+    }
+
+    #[test]
+    fn layer_spec_admits_resident_uniform_qt44_qt53() {
+        assert_eq!(expert_iu4_layer_spec(&a3b()), Ok(a3b_spec()));
+    }
+
+    #[test]
+    fn layer_spec_refusal_table() {
+        let cases: [(&str, fn(&mut ExpertIu4LayerFacts)); 14] = [
+            ("host-mapped", |f| f.experts_host = true),
+            ("not fully resident", |f| f.resident_experts = 0),
+            ("not fully resident", |f| f.resident_experts = 255),
+            ("not fully resident", |f| f.experts = 0),
+            ("not uniform qt44", |f| f.gate_up_dtype = None),
+            ("not uniform qt44", |f| {
+                f.down_dtype = Some(DType::MQ4G256V2)
+            }),
+            ("not uniform qt44", |f| {
+                f.gate_up_dtype = Some(DType::MQ4G128V2)
+            }),
+            ("shapes do not match", |f| f.shapes_ok = false),
+            ("dtype tags", |f| f.has_dtype_tags = true),
+            ("AWQ", |f| f.has_awq = true),
+            ("CPU expert splice", |f| f.cpu_deferred = true),
+            ("ParoQuant", |f| f.paro = true),
+            // Spec geometry requirement surfaces its reason.
+            ("top_k", |f| f.top_k = 10),
+            ("multiple of 128", |f| f.intermediate = 576),
+        ];
+        for (needle, edit) in cases {
+            let mut facts = a3b();
+            edit(&mut facts);
+            let reason = expert_iu4_layer_spec(&facts).expect_err(needle);
+            assert!(reason.contains(needle), "{needle}: got {reason}");
+        }
+    }
+
+    #[test]
+    fn model_verdict_is_none_without_any_capability() {
+        // Flag off / nothing eligible: no layer carries a capability.
+        assert_eq!(expert_iu4_model_verdict(&[]), None);
+        assert_eq!(expert_iu4_model_verdict(&[None, None, None]), None);
+    }
+
+    #[test]
+    fn model_verdict_verifies_only_when_every_layer_does() {
+        let ok = Some((a3b_spec(), true));
+        let verdict = expert_iu4_model_verdict(&[ok, ok, ok]).unwrap();
+        assert!(verdict.verified);
+        assert_eq!(verdict.reason, None);
+        assert_eq!(verdict.spec, a3b_spec());
+
+        // One asymmetric layer withholds the capability from the whole model.
+        let bad = Some((a3b_spec(), false));
+        for layers in [[bad, ok, ok], [ok, bad, ok], [ok, ok, bad]] {
+            let verdict = expert_iu4_model_verdict(&layers).unwrap();
+            assert!(!verdict.verified);
+            assert!(verdict.reason.unwrap().contains("not symmetric"));
+        }
+
+        // An ineligible layer beside capable ones also withholds it.
+        for layers in [[None, ok, ok], [ok, None, ok], [ok, ok, None]] {
+            let verdict = expert_iu4_model_verdict(&layers).unwrap();
+            assert!(!verdict.verified);
+            assert!(verdict.reason.unwrap().contains("not eligible"));
+        }
+
+        // Layers that disagree on the recipe never verify.
+        let other = ExpertIu4Spec {
+            top_k: 4,
+            ..a3b_spec()
+        };
+        let verdict = expert_iu4_model_verdict(&[ok, Some((other, true))]).unwrap();
+        assert!(!verdict.verified);
+        assert!(verdict.reason.unwrap().contains("disagree"));
     }
 }
