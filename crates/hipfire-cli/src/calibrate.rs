@@ -15,6 +15,7 @@
 use crate::{live_daemon_pids, Paths};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
+use hipfire_arch_qwen4::d2_default::{self, D2Default};
 use hipfire_arch_qwen4::host_link::{
     link_from_calibration, link_route_choices, probe_pinned_h2d_gbps, probe_zero_copy_gbps,
     HostLink, RouteChoice,
@@ -126,6 +127,64 @@ struct DeviceRow {
     /// What the engine's selectors would pick from this entry; empty unless the
     /// entry is fresh, discrete, and carries a usable pinned H2D rate.
     routes: Vec<RouteChoice>,
+    /// The D2 default's verdict from the stored rates; `None` unless the
+    /// entry is fresh.
+    d2: Option<D2Show>,
+}
+
+/// What the D2 default (decode of host-placed routed experts on the CPU, see
+/// [`d2_default`]) would decide on this device from the stored rates, for the
+/// Flash-Next shape. It assumes the load's other gates pass (no explicit
+/// `memory.offload_exec`, host-placed routed experts).
+struct D2Show {
+    /// `Flash-Next mq4g256v2 k=2560`.
+    shape: String,
+    /// `on` (the stored rates select D2), `off`, or `probe` (the record
+    /// supplies no rates for the shape, so the engine measures at load).
+    status: &'static str,
+    text: String,
+    /// The `k` of the stored entry that supplied the rates.
+    stored_k: Option<usize>,
+    cpu_gbps: Option<f64>,
+    link_gbps: Option<f64>,
+}
+
+/// [`d2_default::decide`] on the rates `lookup` stores
+/// ([`d2_default::stored_rates`], the same lookup the engine makes at load).
+fn d2_show(lookup: &Lookup) -> Option<D2Show> {
+    let Lookup::Fresh { device, .. } = lookup else {
+        return None;
+    };
+    let (dtype, k) = d2_default::FLASH_NEXT_SHAPE;
+    let format = hipfire_runtime::offload_calibrate::format_name(dtype)?;
+    let stored = d2_default::stored_rates(lookup, dtype, k);
+    let verdict = d2_default::decide(None, None, false, 1, device.unified, || {
+        stored.as_ref().ok().map(|found| found.rates)
+    });
+    let (status, text) = match (&stored, verdict) {
+        (_, D2Default::Unified) => ("off", verdict.describe().unwrap_or_default()),
+        (Err(why), _) => (
+            "probe",
+            format!("not stored for this shape; the engine measures at model load ({why})"),
+        ),
+        (Ok(found), _) => (
+            if verdict.selects_d2() { "on" } else { "off" },
+            format!(
+                "{}; {}",
+                verdict.describe().unwrap_or_default(),
+                found.describe(k)
+            ),
+        ),
+    };
+    let found = stored.as_ref().ok();
+    Some(D2Show {
+        shape: format!("Flash-Next {format} k={k}"),
+        status,
+        text,
+        stored_k: found.map(|found| found.recorded_k),
+        cpu_gbps: found.map(|found| found.rates.cpu_bytes_per_s / 1e9),
+        link_gbps: found.map(|found| found.rates.link_bytes_per_s / 1e9),
+    })
 }
 
 fn identity_of(gpu: &DetectedGpu) -> DeviceIdentity {
@@ -179,6 +238,7 @@ fn device_rows(
                 measured: Some(entry.clone()),
                 live: None,
                 routes: Vec::new(),
+                d2: None,
             }),
             Some(id) => {
                 let lookup = calibration::lookup_in(record, host, id);
@@ -188,6 +248,7 @@ fn device_rows(
                     measured: Some(entry.clone()),
                     live: Some(id.clone()),
                     routes: routes_for(&lookup, &id.arch),
+                    d2: d2_show(&lookup),
                 });
             }
         }
@@ -206,6 +267,7 @@ fn device_rows(
             measured: None,
             live: Some(id.clone()),
             routes: Vec::new(),
+            d2: None,
         });
     }
     rows
@@ -412,6 +474,9 @@ fn render_row(row: &DeviceRow) -> String {
             );
         }
     }
+    if let Some(d2) = &row.d2 {
+        let _ = writeln!(out, "    D2 default    {}: {}", d2.shape, d2.text);
+    }
     match row.freshness {
         Freshness::Stale(_) | Freshness::Missing(_) => {
             out.push_str(
@@ -443,6 +508,14 @@ fn show_json(
                     "value": r.value,
                     "why": r.why,
                 })).collect::<Vec<_>>(),
+                "d2_default": row.d2.as_ref().map(|d2| serde_json::json!({
+                    "shape": d2.shape,
+                    "status": d2.status,
+                    "text": d2.text,
+                    "stored_k": d2.stored_k,
+                    "cpu_gbps": d2.cpu_gbps,
+                    "link_gbps": d2.link_gbps,
+                })),
             })
         })
         .collect();
@@ -574,8 +647,8 @@ fn announce_detection(host: &HostFacts, gpus: &[DetectedGpu]) {
 /// Engine split probes: the offload-bench matrix (every CPU-decodable dense
 /// format, rayon global pool as the CPU arm), one format at a time so the 60 s
 /// budget is checked before each and a format that errors is reported and skipped
-/// while the others still run. A splice-pool entry set is added alongside these
-/// when the D2 default's `probe_rates` lands.
+/// while the others still run, then the D2 default's own splice-pool entry for
+/// each of those formats ([`splice_probes`]).
 fn engine_probes(gpu: &mut Gpu, started: Instant, bdf: &str) -> Vec<EngineRate> {
     use hipfire_runtime::offload_calibrate::{
         calibrate, format_names, CalibrateOptions, DEFAULT_BUFFER_MB, DEFAULT_REPS,
@@ -615,6 +688,40 @@ fn engine_probes(gpu: &mut Gpu, started: Instant, bdf: &str) -> Vec<EngineRate> 
             }
             Err(e) => eprintln!("engine split probe ({name}) on {bdf} failed: {}", e.message),
         }
+    }
+    rates.extend(splice_probes(gpu, started, bdf));
+    rates
+}
+
+/// The D2 default's measurement ([`d2_default::probe_rates`]: the splice
+/// pool's pinned physical-core CPU GEMV against the GPU GEMV over the same
+/// host-mapped bytes) for every CPU-decodable offload-bench format at
+/// `DEFAULT_K`, stored as splice-pool entries ([`d2_default::stored_entry`]) so
+/// the selector reads them at model load instead of probing. Budget-checked
+/// per format like [`engine_probes`].
+fn splice_probes(gpu: &mut Gpu, started: Instant, bdf: &str) -> Vec<EngineRate> {
+    use hipfire_runtime::offload_calibrate::{formats, DEFAULT_K};
+    let mut rates = Vec::new();
+    for (name, dtype) in formats() {
+        if !within_budget(started, &format!("D2 engine rates ({name})"), bdf) {
+            continue;
+        }
+        let t = Instant::now();
+        let Some(measured) = d2_default::probe_rates(gpu, dtype, DEFAULT_K) else {
+            eprintln!("D2 engine rates ({name}) on {bdf}: no usable measurement; not recorded");
+            continue;
+        };
+        let Some(entry) = d2_default::stored_entry(dtype, DEFAULT_K, measured) else {
+            eprintln!("D2 engine rates ({name}) on {bdf}: no row stride at k={DEFAULT_K}");
+            continue;
+        };
+        eprintln!(
+            "D2 engine rates {name} k={DEFAULT_K} on {bdf}: cpu {:.1} GB/s, gpu {:.1} GB/s ({:.1} s)",
+            entry.cpu_gbps,
+            entry.gpu_gbps,
+            t.elapsed().as_secs_f64()
+        );
+        rates.push(entry);
     }
     rates
 }
@@ -1085,5 +1192,98 @@ mod tests {
     fn budget_is_spent_at_sixty_seconds() {
         assert!(!budget_spent(Duration::from_millis(59_999)));
         assert!(budget_spent(Duration::from_secs(60)));
+    }
+
+    fn d2_rates(cpu_gbps: f64, link_gbps: f64) -> d2_default::HostDecodeRates {
+        d2_default::HostDecodeRates::classify(cpu_gbps * 1e9, link_gbps * 1e9).unwrap()
+    }
+
+    /// `device` plus the splice entry `hipfire calibrate` stores for the
+    /// Flash-Next gate/up format at `DEFAULT_K`.
+    fn device_with_splice(bdf: &str, cpu_gbps: f64, link_gbps: f64) -> DeviceCalibration {
+        let mut dev = device(bdf);
+        let (dtype, _) = d2_default::FLASH_NEXT_SHAPE;
+        dev.engine.push(
+            d2_default::stored_entry(
+                dtype,
+                hipfire_runtime::offload_calibrate::DEFAULT_K,
+                d2_rates(cpu_gbps, link_gbps),
+            )
+            .unwrap(),
+        );
+        dev
+    }
+
+    #[test]
+    fn calibrate_stores_one_splice_entry_per_format_at_the_default_k() {
+        use hipfire_runtime::offload_calibrate::{formats, DEFAULT_K};
+        let mut seen = Vec::new();
+        for (name, dtype) in formats() {
+            let entry = d2_default::stored_entry(dtype, DEFAULT_K, d2_rates(100.0, 5.0))
+                .unwrap_or_else(|| panic!("{name} has no stored entry shape"));
+            assert_eq!(entry.format, name);
+            assert_eq!(
+                (entry.k, entry.pool.as_str(), entry.reps),
+                (5120, "splice", 5)
+            );
+            assert!(entry.m > 0);
+            seen.push(entry.format);
+        }
+        assert!(seen.contains(&"mq4g256v2".to_string()));
+    }
+
+    #[test]
+    fn show_states_the_d2_verdict_from_stored_splice_rates() {
+        // j1760's XTX: CPU 105.9 / link 4.25 GB/s measured at k=5120.
+        let rec = record(vec![device_with_splice("0000:67:00.0", 105.9, 4.25)]);
+        let rows = device_rows(Some(&rec), &host(), &[live("0000:67:00.0")]);
+        let d2 = rows[0].d2.as_ref().expect("a fresh device has a verdict");
+        assert_eq!(d2.status, "on");
+        assert!(
+            d2.text
+                .contains("from stored calibration (k=5120, wanted 2560)"),
+            "{}",
+            d2.text
+        );
+        let text = render_summary(&rec, &Freshness::Fresh, &rows);
+        assert!(
+            text.contains("D2 default    Flash-Next mq4g256v2 k=2560: ON"),
+            "{text}"
+        );
+        let value = show_json(Some(&rec), &host_freshness(Some(&rec), &host()), &rows).unwrap();
+        let json = &value["devices"][0]["d2_default"];
+        assert_eq!(json["status"], "on");
+        assert_eq!(json["shape"], "Flash-Next mq4g256v2 k=2560");
+        assert_eq!(json["stored_k"], 5120);
+        assert!((json["cpu_gbps"].as_f64().unwrap() - 105.9).abs() < 1e-6);
+        assert!((json["link_gbps"].as_f64().unwrap() - 4.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn show_reports_off_probe_and_no_verdict_forms() {
+        // The link faster by a wide margin: off, from the stored rates.
+        let rec = record(vec![device_with_splice("0000:67:00.0", 2.0, 10.0)]);
+        let rows = device_rows(Some(&rec), &host(), &[live("0000:67:00.0")]);
+        assert_eq!(rows[0].d2.as_ref().unwrap().status, "off");
+        // A fresh device with no splice entry: the engine probes at load.
+        let rec = record(vec![device("0000:67:00.0")]);
+        let rows = device_rows(Some(&rec), &host(), &[live("0000:67:00.0")]);
+        let d2 = rows[0].d2.as_ref().unwrap();
+        assert_eq!(d2.status, "probe");
+        assert!(d2.stored_k.is_none() && d2.cpu_gbps.is_none());
+        // Unified memory never reaches the rate comparison.
+        let mut unified = device_with_splice("0000:67:00.0", 105.9, 4.25);
+        unified.unified = true;
+        let rec = record(vec![unified]);
+        let rows = device_rows(Some(&rec), &host(), &[live("0000:67:00.0")]);
+        assert_eq!(rows[0].d2.as_ref().unwrap().status, "off");
+        // A stale, missing or absent device states no D2 verdict.
+        let rec = record(vec![device_with_splice("0000:67:00.0", 105.9, 4.25)]);
+        let mut changed = live("0000:67:00.0");
+        changed.vram_bytes = 16 << 30;
+        let rows = device_rows(Some(&rec), &host(), &[changed, live("0000:03:00.0")]);
+        assert!(rows.iter().all(|row| row.d2.is_none()));
+        let value = show_json(Some(&rec), &host_freshness(Some(&rec), &host()), &rows).unwrap();
+        assert!(value["devices"][0]["d2_default"].is_null());
     }
 }

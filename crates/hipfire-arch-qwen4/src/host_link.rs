@@ -300,7 +300,7 @@ pub fn link_from_calibration(lookup: &Lookup) -> Option<HostLink> {
 
 /// [`calibration::lookup`] for `gpu`, built from the same live identity
 /// (PCI address, arch, VRAM total) `hipfire calibrate` records.
-fn calibration_lookup(gpu: &Gpu) -> Lookup {
+pub(crate) fn calibration_lookup(gpu: &Gpu) -> Lookup {
     let bdf = match gpu.hip.device_pci_bus_id(gpu.device_id) {
         Ok(bdf) => bdf,
         Err(error) => return Lookup::Missing(format!("PCI address unavailable: {error}")),

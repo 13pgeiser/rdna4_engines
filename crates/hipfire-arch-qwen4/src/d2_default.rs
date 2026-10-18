@@ -38,11 +38,41 @@
 //! 6. `developer.qwen4_d2_default = true` (`HIPFIRE_QWEN4_D2_DEFAULT=1`): on,
 //!    skipping only the rate comparison (lab and receipt runs).
 //! 7. The measured rates of the **existing** passback calibration
-//!    (`hipfire_dispatch::offload_split::probe_synthetic_on`): the CPU
-//!    GEMV on the splice's own pinned physical-core pool against the GPU GEMV
-//!    reading the same host-mapped bytes over the link, on the layers' real
-//!    gate/up format. On only when the CPU is strictly faster. A failed or
-//!    unusable measurement is off, and so is a tie.
+//!    ([`probe_rates`], `hipfire_dispatch::offload_split::probe_synthetic_on`):
+//!    the CPU GEMV on the splice's own pinned physical-core pool against the
+//!    GPU GEMV reading the same host-mapped bytes over the link, on the layers'
+//!    real gate/up format. On only when the CPU is strictly faster. A failed or
+//!    unusable measurement is off, and so is a tie. A `hipfire calibrate`
+//!    record that still matches this host ([`stored_rates`]) supplies these two
+//!    rates instead and the probe does not run; a stale, missing or
+//!    non-matching record leaves the probe exactly as it was. The load log
+//!    names the source.
+//!
+//! # Stored rates
+//!
+//! `hipfire calibrate` stores one splice-pool entry per CPU-decodable
+//! `offload-bench` format at `k` = `DEFAULT_K` (5120), over
+//! [`DEFAULT_BUFFER_MB`] of weight and [`DEFAULT_REPS`] passes, which is what
+//! [`probe_rates`] measures. The lookup is keyed on that same tuple:
+//!
+//! 1. an exact `(format, k = hidden size, splice, 192 MiB, 5 reps)` entry from
+//!    a record whose fingerprint matches (the host and device checks of
+//!    `hipfire_config::calibration::lookup`) wins;
+//! 2. a same-format splice entry at another `k` is used only when its
+//!    CPU-vs-link margin `|cpu - link| / link` is outside the measured
+//!    ±[`K_SENSITIVITY`] (6%) `k` sensitivity; the log then says `from stored
+//!    calibration (k=<recorded>, wanted <k>)`;
+//! 3. otherwise the live probe runs.
+//!
+//! The stored path allocates nothing on the device and opens no stream; the
+//! probe's device buffers (an activation, an output scratch) are freed back to
+//! the allocator pool and its weight is host memory. The load's free-VRAM
+//! sizing reads (the loader's expert placement, `attach_forward`'s prefill
+//! chunk rung) all happen before [`resolve`]; the one later read, the
+//! loader's context admission (`qwen4_memory_admission`), runs only for a
+//! unified-memory sequence, where this default never looks up or probes. No
+//! sizing decision therefore sees the difference and no copy-path init is
+//! needed.
 //!
 //! There is no arch rule: a gfx1201 card on a link the CPU beats arms, and a
 //! gfx1100 card on a link the CPU does not beat does not.
@@ -88,6 +118,19 @@ impl HostDecodeRates {
     /// The CPU engine strictly beats the link engine.
     pub fn cpu_faster(self) -> bool {
         self.cpu_bytes_per_s > self.link_bytes_per_s
+    }
+
+    /// `|cpu - link| / link`: how far apart the two engines are, relative to
+    /// the link engine.
+    pub fn margin(self) -> f64 {
+        (self.cpu_bytes_per_s - self.link_bytes_per_s).abs() / self.link_bytes_per_s
+    }
+
+    /// The margin is strictly outside the measured ±[`K_SENSITIVITY`] the
+    /// engine rate moves with `k`, so a rate measured at another `k` still
+    /// decides the same engine order.
+    pub fn margin_exceeds_k_sensitivity(self) -> bool {
+        self.margin() > K_SENSITIVITY
     }
 }
 
@@ -285,12 +328,225 @@ fn cached_rates(
     *lock().entry(key).or_insert(measured)
 }
 
-/// The rates for this device and probe shape, measured once per process per
-/// `(device ordinal, gate/up dtype, k)`.
+/// The rates for this device and probe shape, resolved once per process per
+/// `(device ordinal, gate/up dtype, k)`: a matching `hipfire calibrate` record
+/// ([`stored_rates`]) supplies them without a probe, otherwise
+/// [`probe_rates`] measures. The source is logged when it is resolved.
 fn measured_rates(gpu: &mut Gpu, config: &Qwen4Config, dtype: DType) -> Option<HostDecodeRates> {
     let k = config.hidden_size;
     let key = (gpu.device_id, dtype, k);
-    cached_rates(&RATES, key, || probe_rates(gpu, dtype, k))
+    cached_rates(&RATES, key, || {
+        let lookup = crate::host_link::calibration_lookup(gpu);
+        let (rates, source) = rates_from(&lookup, dtype, k, || probe_rates(gpu, dtype, k));
+        eprintln!(
+            "  qwen4 D2 default rates (device {}, {dtype:?} k={k}): {}",
+            gpu.device_id,
+            source.describe(k)
+        );
+        rates
+    })
+}
+
+/// The selector's shape for a Flash-Next load: the host layers' gate/up
+/// format and the hidden size `k` the probe runs at
+/// (`Qwen4Config::validate_flash_next`: `hidden_size` 2560). `hipfire
+/// calibrate --show` states the verdict for this shape.
+pub const FLASH_NEXT_SHAPE: (DType, usize) = (DType::MQ4G256V2, 2560);
+
+/// The CPU pool a stored engine rate must have been measured on: the splice's
+/// own pinned physical-core pool, what [`probe_rates`] times.
+pub const SPLICE_POOL: &str = "splice";
+
+/// How far the engine rate moves with `k`: j1760 (7900 XTX, `offload-bench`
+/// mq4g256v2) read CPU 105.9 / GPU 4.25 GB/s at k=5120 and 111.8 / 4.19 GB/s
+/// at k=2560, within 6%. A stored rate at another `k` decides only a CPU-vs-link
+/// margin larger than this.
+pub const K_SENSITIVITY: f64 = 0.06;
+
+/// The engine rates a fresh calibration record states for one probe shape.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredRates {
+    pub rates: HostDecodeRates,
+    /// The `k` the stored entry was measured at.
+    pub recorded_k: usize,
+    /// `Calibration::measured_at` of the record.
+    pub measured_at: String,
+}
+
+impl StoredRates {
+    /// Load-log and `--show` text for a stored result wanted at `wanted_k`.
+    pub fn describe(&self, wanted_k: usize) -> String {
+        if self.recorded_k == wanted_k {
+            format!(
+                "from stored calibration (k={}) [calibrated {}]",
+                self.recorded_k, self.measured_at
+            )
+        } else {
+            format!(
+                "from stored calibration (k={}, wanted {wanted_k}) [calibrated {}]",
+                self.recorded_k, self.measured_at
+            )
+        }
+    }
+}
+
+/// Rows of the weight [`probe_rates`] times for `dtype` at `k`:
+/// [`DEFAULT_BUFFER_MB`] of weight at the format's row stride. `None` for a
+/// format with no CPU decoder or a `k` that yields no row stride.
+fn probe_rows(dtype: DType, k: usize) -> Option<usize> {
+    let row_bytes = hipfire_dispatch::row_bytes_for(dtype, k)?;
+    if row_bytes == 0 {
+        return None;
+    }
+    Some((DEFAULT_BUFFER_MB << 20).div_ceil(row_bytes))
+}
+
+/// The calibration-record entry `hipfire calibrate` stores for one
+/// [`probe_rates`] result, in the shape [`stored_rates`] reads back: the
+/// offload-bench format name, the splice pool, [`DEFAULT_REPS`] passes over
+/// [`DEFAULT_BUFFER_MB`] of weight, rates in GB/s. `None` for a dtype the
+/// offload-bench matrix does not name or a shape with no row stride.
+pub fn stored_entry(
+    dtype: DType,
+    k: usize,
+    rates: HostDecodeRates,
+) -> Option<hipfire_config::calibration::EngineRate> {
+    Some(hipfire_config::calibration::EngineRate {
+        format: hipfire_runtime::offload_calibrate::format_name(dtype)?.to_owned(),
+        k: k as u64,
+        m: probe_rows(dtype, k)? as u64,
+        pool: SPLICE_POOL.to_owned(),
+        reps: DEFAULT_REPS as u32,
+        cpu_gbps: rates.cpu_bytes_per_s / 1e9,
+        gpu_gbps: rates.link_bytes_per_s / 1e9,
+    })
+}
+
+/// The stored entry's rates when it is exactly the shape [`probe_rates`]
+/// measures at its `k` ([`stored_entry`]'s shape: splice pool, [`DEFAULT_REPS`]
+/// passes, [`probe_rows`] rows) with usable figures. Returns `(k, rates)`.
+fn probe_shaped_entry(
+    dtype: DType,
+    format: &str,
+    entry: &hipfire_config::calibration::EngineRate,
+) -> Option<(usize, HostDecodeRates)> {
+    if entry.format != format || entry.pool != SPLICE_POOL || entry.reps != DEFAULT_REPS as u32 {
+        return None;
+    }
+    let k = usize::try_from(entry.k).ok().filter(|&k| k > 0)?;
+    if probe_rows(dtype, k)? as u64 != entry.m {
+        return None;
+    }
+    let rates = HostDecodeRates::classify(entry.cpu_gbps * 1e9, entry.gpu_gbps * 1e9)?;
+    Some((k, rates))
+}
+
+/// The rates a calibration `lookup` supplies for `dtype` at `wanted_k`, or why
+/// the live probe must run:
+///
+/// 1. a stale or missing record states nothing (the same fingerprint as every
+///    other calibration consumer);
+/// 2. an exact `(format, k = wanted_k, splice pool, 192 MiB, 5 reps)` entry
+///    wins;
+/// 3. otherwise the nearest same-format splice entry at another `k` whose
+///    CPU-vs-link margin lies outside [`K_SENSITIVITY`] (a margin that wide
+///    does not depend on `k`);
+/// 4. otherwise `Err`: the live probe.
+pub fn stored_rates(
+    lookup: &hipfire_config::calibration::Lookup,
+    dtype: DType,
+    wanted_k: usize,
+) -> Result<StoredRates, String> {
+    use hipfire_config::calibration::Lookup;
+    let (device, measured_at) = match lookup {
+        Lookup::Fresh {
+            device,
+            measured_at,
+        } => (device, measured_at),
+        Lookup::Stale(reason) => return Err(format!("calibration stale: {reason}")),
+        Lookup::Missing(reason) => return Err(reason.clone()),
+    };
+    let Some(format) = hipfire_runtime::offload_calibrate::format_name(dtype) else {
+        return Err(format!(
+            "calibration stores no engine rate for {dtype:?} (not an offload-bench format)"
+        ));
+    };
+    let stored = |k: usize, rates: HostDecodeRates| StoredRates {
+        rates,
+        recorded_k: k,
+        measured_at: measured_at.clone(),
+    };
+    // One pass over the record, no allocation. Distance order is
+    // `(|k - wanted|, k)`: ties go to the lower k, and a duplicate keeps the
+    // first in record order.
+    let key = |k: usize| (k.abs_diff(wanted_k), k);
+    let mut nearest: Option<(usize, HostDecodeRates)> = None;
+    let mut decisive: Option<(usize, HostDecodeRates)> = None;
+    for (k, rates) in device
+        .engine
+        .iter()
+        .filter_map(|entry| probe_shaped_entry(dtype, format, entry))
+    {
+        if k == wanted_k {
+            return Ok(stored(k, rates));
+        }
+        if nearest.is_none_or(|(best, _)| key(k) < key(best)) {
+            nearest = Some((k, rates));
+        }
+        if rates.margin_exceeds_k_sensitivity()
+            && decisive.is_none_or(|(best, _)| key(k) < key(best))
+        {
+            decisive = Some((k, rates));
+        }
+    }
+    match (decisive, nearest) {
+        (Some((k, rates)), _) => Ok(stored(k, rates)),
+        (None, Some((k, rates))) => Err(format!(
+            "calibration {format} k={k} has a CPU-vs-link margin of {:.1}%, inside the \
+             ±{:.0}% k sensitivity at wanted k={wanted_k}",
+            rates.margin() * 100.0,
+            K_SENSITIVITY * 100.0
+        )),
+        (None, None) => Err(format!(
+            "calibration has no splice-pool {format} rate over {DEFAULT_BUFFER_MB} MiB \
+             and {DEFAULT_REPS} reps"
+        )),
+    }
+}
+
+/// Where one load's engine rates came from.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RateSource {
+    Stored(StoredRates),
+    /// The live probe ran; `why` is the calibration's reason for not
+    /// supplying the rates.
+    Probed {
+        why: String,
+    },
+}
+
+impl RateSource {
+    pub fn describe(&self, wanted_k: usize) -> String {
+        match self {
+            Self::Stored(stored) => stored.describe(wanted_k),
+            Self::Probed { why } => format!("measured at load [{why}]"),
+        }
+    }
+}
+
+/// The rates for `dtype` at `wanted_k`: the calibration `lookup`'s
+/// ([`stored_rates`]) with `probe` not run, else `probe`'s. A stale, missing or
+/// non-matching record leaves exactly the live probe's behavior.
+pub fn rates_from(
+    lookup: &hipfire_config::calibration::Lookup,
+    dtype: DType,
+    wanted_k: usize,
+    probe: impl FnOnce() -> Option<HostDecodeRates>,
+) -> (Option<HostDecodeRates>, RateSource) {
+    match stored_rates(lookup, dtype, wanted_k) {
+        Ok(stored) => (Some(stored.rates), RateSource::Stored(stored)),
+        Err(why) => (probe(), RateSource::Probed { why }),
+    }
 }
 
 /// The exact measurement the default's selector takes for one shape: the CPU
@@ -302,11 +558,7 @@ fn measured_rates(gpu: &mut Gpu, config: &Qwen4Config, dtype: DType) -> Option<H
 /// `MQ4G256V2`, 2560); `hipfire calibrate` runs this same function so a stored
 /// result and a load-time measurement cannot drift.
 pub fn probe_rates(gpu: &mut Gpu, dtype: DType, k: usize) -> Option<HostDecodeRates> {
-    let row_bytes = hipfire_dispatch::row_bytes_for(dtype, k)?;
-    if row_bytes == 0 {
-        return None;
-    }
-    let m = (DEFAULT_BUFFER_MB << 20).div_ceil(row_bytes);
+    let m = probe_rows(dtype, k)?;
     let ctx = DispatchCtx::new(gpu);
     match probe_synthetic_on(gpu, &ctx, dtype, m, k, DEFAULT_REPS, CpuProbePool::Splice) {
         Ok(cal) => HostDecodeRates::classify(cal.cpu_bytes_per_s, cal.gpu_bytes_per_s),
@@ -629,5 +881,249 @@ mod tests {
         assert_eq!(before, after);
         assert_eq!(before, (false, false, false), "unset mode is pcie");
         assert_eq!(hipfire_config::memory::offload_exec(), OffloadExec::Pcie);
+    }
+
+    use hipfire_config::calibration::{DeviceCalibration, EngineRate, Lookup};
+
+    const MQ4: DType = DType::MQ4G256V2;
+
+    /// A stored splice entry exactly as `hipfire calibrate` writes it, from
+    /// figures in GB/s.
+    fn entry(dtype: DType, k: usize, cpu_gbps: f64, link_gbps: f64) -> EngineRate {
+        stored_entry(dtype, k, rates(cpu_gbps * 1e9, link_gbps * 1e9).unwrap())
+            .expect("an offload-bench format with a row stride")
+    }
+
+    fn fresh(engine: Vec<EngineRate>) -> Lookup {
+        Lookup::Fresh {
+            device: DeviceCalibration {
+                pci_bdf: "0000:67:00.0".to_string(),
+                arch: "gfx1100".to_string(),
+                vram_bytes: 24 << 30,
+                unified: false,
+                link: None,
+                pinned_h2d_gbps: Some(7.1),
+                zero_copy_gbps: Some(7.0),
+                engine,
+            },
+            measured_at: "2026-10-18T00:37:16Z".to_string(),
+        }
+    }
+
+    /// `rates_from` with a probe that reports `probed` and counts its runs.
+    fn resolved(
+        lookup: &Lookup,
+        k: usize,
+        probed: Option<HostDecodeRates>,
+    ) -> (Option<HostDecodeRates>, RateSource, usize) {
+        let runs = Cell::new(0);
+        let (found, source) = rates_from(lookup, MQ4, k, || {
+            runs.set(runs.get() + 1);
+            probed
+        });
+        (found, source, runs.get())
+    }
+
+    fn close(a: HostDecodeRates, b: HostDecodeRates) -> bool {
+        let near = |x: f64, y: f64| (x - y).abs() <= 1e-9 * y.abs();
+        near(a.cpu_bytes_per_s, b.cpu_bytes_per_s) && near(a.link_bytes_per_s, b.link_bytes_per_s)
+    }
+
+    /// A matching record supplies the rates without running the probe, and
+    /// `decide` lands on the same verdict as the probe that measured them.
+    #[test]
+    fn matching_record_skips_the_probe_and_decides_like_the_probe() {
+        for (cpu, link) in [(111.8, 4.19), (3.0, 7.0)] {
+            let measured = rates(cpu * 1e9, link * 1e9);
+            let lookup = fresh(vec![entry(MQ4, 2560, cpu, link)]);
+            let (found, source, runs) = resolved(&lookup, 2560, None);
+            assert_eq!(runs, 0, "a matching record must not probe");
+            assert!(close(found.unwrap(), measured.unwrap()), "{found:?}");
+            assert_eq!(
+                source.describe(2560),
+                "from stored calibration (k=2560) [calibrated 2026-10-18T00:37:16Z]"
+            );
+            let via_record = decide(None, None, false, 40, false, || found);
+            let via_probe = decide(None, None, false, 40, false, || measured);
+            assert_eq!(via_record.selects_d2(), via_probe.selects_d2());
+            assert_eq!(
+                std::mem::discriminant(&via_record),
+                std::mem::discriminant(&via_probe)
+            );
+        }
+    }
+
+    /// An absent, stale or unreadable record leaves exactly the probe: it
+    /// runs once, its figures and its failure pass through unchanged, and the
+    /// source says why the record was not used.
+    #[test]
+    fn absent_stale_or_non_matching_record_runs_the_probe_unchanged() {
+        let probed = rates(105.9e9, 4.25e9);
+        let other_pool = EngineRate {
+            pool: "global".to_string(),
+            ..entry(MQ4, 2560, 40.0, 6.0)
+        };
+        let other_reps = EngineRate {
+            reps: 3,
+            ..entry(MQ4, 2560, 40.0, 6.0)
+        };
+        let other_buffer = EngineRate {
+            m: entry(MQ4, 2560, 40.0, 6.0).m / 2,
+            ..entry(MQ4, 2560, 40.0, 6.0)
+        };
+        let other_format = entry(DType::MQ6G256V2, 2560, 40.0, 6.0);
+        let unusable = EngineRate {
+            cpu_gbps: 0.0,
+            ..entry(MQ4, 2560, 40.0, 6.0)
+        };
+        let cases = [
+            (
+                Lookup::Missing("no calibration in config.toml".to_string()),
+                "no calibration in config.toml",
+            ),
+            (
+                Lookup::Stale("PCIe link changed".to_string()),
+                "calibration stale: PCIe link changed",
+            ),
+            (fresh(Vec::new()), "no splice-pool"),
+            (fresh(vec![other_pool]), "no splice-pool"),
+            (fresh(vec![other_reps]), "no splice-pool"),
+            (fresh(vec![other_buffer]), "no splice-pool"),
+            (fresh(vec![other_format]), "no splice-pool"),
+            (fresh(vec![unusable]), "no splice-pool"),
+        ];
+        for (lookup, why) in cases {
+            for outcome in [probed, None] {
+                let (found, source, runs) = resolved(&lookup, 2560, outcome);
+                assert_eq!(runs, 1, "{why}: the probe runs exactly once");
+                assert_eq!(found, outcome, "{why}: the probe's result is unchanged");
+                let RateSource::Probed { why: reason } = &source else {
+                    panic!("{why}: expected the probe, got {source:?}");
+                };
+                assert!(reason.contains(why), "{reason:?} should contain {why:?}");
+                assert!(source.describe(2560).starts_with("measured at load ["));
+            }
+        }
+    }
+
+    /// A dtype the `offload-bench` matrix does not name has no stored shape.
+    #[test]
+    fn unnamed_dtype_always_probes() {
+        let lookup = fresh(vec![entry(MQ4, 2560, 105.9, 4.25)]);
+        let (found, source, runs) = {
+            let probed = rates(2.0, 1.0);
+            let runs = Cell::new(0);
+            let (found, source) = rates_from(&lookup, DType::F32, 2560, || {
+                runs.set(runs.get() + 1);
+                probed
+            });
+            (found, source, runs.get())
+        };
+        assert_eq!((found, runs), (rates(2.0, 1.0), 1));
+        assert!(matches!(source, RateSource::Probed { .. }));
+    }
+
+    /// An exact `(format, k)` entry wins even when another `k` is closer to
+    /// decisive, and an entry of another format never answers.
+    #[test]
+    fn exact_tuple_wins_and_the_format_must_match() {
+        let lookup = fresh(vec![
+            entry(MQ4, 5120, 105.9, 4.25),
+            entry(MQ4, 2560, 4.4, 4.25),
+            entry(DType::MQ6G256V2, 2560, 1.0, 9.0),
+        ]);
+        let (found, source, runs) = resolved(&lookup, 2560, None);
+        assert_eq!(runs, 0);
+        assert!(close(found.unwrap(), rates(4.4e9, 4.25e9).unwrap()));
+        let RateSource::Stored(stored) = source else {
+            panic!("expected the stored record");
+        };
+        assert_eq!(stored.recorded_k, 2560);
+        // The exact entry is used inside the band too: the band only gates
+        // other k values.
+        assert!(!found.unwrap().margin_exceeds_k_sensitivity());
+    }
+
+    /// Another `k` answers only when the CPU-vs-link margin is outside the
+    /// measured ±6% sensitivity; the log names both `k` values.
+    #[test]
+    fn other_k_is_used_only_outside_the_k_sensitivity_band() {
+        // j1760: CPU 105.9 / GPU 4.25 GB/s measured at k=5120, wanted 2560.
+        let lookup = fresh(vec![entry(MQ4, 5120, 105.9, 4.25)]);
+        let (found, source, runs) = resolved(&lookup, 2560, None);
+        assert_eq!(runs, 0);
+        assert!(found.unwrap().cpu_faster());
+        assert_eq!(
+            source.describe(2560),
+            "from stored calibration (k=5120, wanted 2560) [calibrated 2026-10-18T00:37:16Z]"
+        );
+        // The stored link faster by a wide margin is decisive too.
+        let slow_cpu = fresh(vec![entry(MQ4, 5120, 2.0, 10.0)]);
+        let (found, _, runs) = resolved(&slow_cpu, 2560, None);
+        assert_eq!(runs, 0);
+        assert!(!found.unwrap().cpu_faster());
+        assert!(found.unwrap().margin_exceeds_k_sensitivity());
+        // Inside the band (±6% of the link rate) the live probe decides,
+        // whichever engine the stored figures favor.
+        for (cpu, link) in [(105.9, 100.0), (94.1, 100.0), (100.0, 100.0)] {
+            let near = fresh(vec![entry(MQ4, 5120, cpu, link)]);
+            let (found, source, runs) = resolved(&near, 2560, rates(7.0, 1.0));
+            assert_eq!(runs, 1, "{cpu}/{link} is inside the band");
+            assert_eq!(found, rates(7.0, 1.0));
+            let RateSource::Probed { why } = source else {
+                panic!("expected the probe");
+            };
+            assert!(
+                why.contains("k sensitivity") && why.contains("k=5120"),
+                "{why}"
+            );
+        }
+        // Just outside the band (6.1% apart) is used.
+        for (cpu, link) in [(106.1, 100.0), (93.9, 100.0)] {
+            let wide = fresh(vec![entry(MQ4, 5120, cpu, link)]);
+            assert_eq!(resolved(&wide, 2560, None).2, 0, "{cpu}/{link}");
+        }
+    }
+
+    /// With several other `k` entries the nearest decisive one answers.
+    #[test]
+    fn nearest_decisive_other_k_answers() {
+        let lookup = fresh(vec![
+            entry(MQ4, 10240, 30.0, 4.0),
+            entry(MQ4, 5120, 4.1, 4.0),
+            entry(MQ4, 7680, 60.0, 4.0),
+        ]);
+        // 5120 is the nearest to 2560 but inside the band; 7680 is the
+        // nearer decisive one (5120 away against 7680).
+        let (_, source, runs) = resolved(&lookup, 2560, None);
+        assert_eq!(runs, 0);
+        let RateSource::Stored(stored) = source else {
+            panic!("expected the stored record");
+        };
+        assert_eq!(stored.recorded_k, 7680);
+    }
+
+    /// `hipfire calibrate`'s writer and the selector's reader agree on the
+    /// tuple, and an entry that is not the probe's shape is ignored.
+    #[test]
+    fn written_entry_reads_back_and_a_reshaped_entry_does_not() {
+        let written = entry(MQ4, 5120, 105.9, 4.25);
+        assert_eq!(written.format, "mq4g256v2");
+        assert_eq!(written.pool, SPLICE_POOL);
+        assert_eq!(written.reps, DEFAULT_REPS as u32);
+        let row_bytes = hipfire_dispatch::row_bytes_for(MQ4, 5120).unwrap();
+        assert_eq!(written.m, (192usize << 20).div_ceil(row_bytes) as u64);
+        let read = stored_rates(&fresh(vec![written.clone()]), MQ4, 5120).unwrap();
+        assert!(close(read.rates, rates(105.9e9, 4.25e9).unwrap()));
+        assert_eq!(read.recorded_k, 5120);
+        let reshaped = EngineRate {
+            m: written.m + 1,
+            ..written
+        };
+        assert!(stored_rates(&fresh(vec![reshaped]), MQ4, 5120).is_err());
+        assert_eq!(
+            stored_entry(DType::F32, 5120, rates(2.0, 1.0).unwrap()),
+            None
+        );
     }
 }
