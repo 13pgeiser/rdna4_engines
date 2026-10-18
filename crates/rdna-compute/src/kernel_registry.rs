@@ -306,6 +306,26 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         kernels::GATED_DELTA_NET_Q8_SRC,
         ["gated_delta_net_q8"]
     );
+    // DFlash verify tape capture (`Gpu::tape_copy_batched`, tape_copy.rs): the
+    // kernel source has no arch guard and the launcher no arch gate
+    // (HIPFIRE_VERIFY_TAPE_COPY_BATCH defaults on), so every inventory carries
+    // it; module key == symbol, source is the launcher's own constant.
+    add!(
+        "tape_copy_batched",
+        crate::tape_copy::TAPE_COPY_BATCHED_SRC,
+        ["tape_copy_batched"]
+    );
+    // Lane-table conv of the lane-batched CB DFlash verify (`Gpu::
+    // conv1d_silu_split_f32_lanes`, lane_gdn.rs). The kernel has no arch
+    // guard; its only caller is admitted by `lane_gdn_batch_admitted`, which
+    // requires exact gfx1201, so only that inventory carries it.
+    if arch == "gfx1201" {
+        add!(
+            "conv1d_silu_split_f32_lanes",
+            crate::lane_gdn::CONV1D_SILU_SPLIT_LANES_SRC,
+            ["conv1d_silu_split_f32_lanes"]
+        );
+    }
 
     // Matrix-dependent default precompile modules; each name and source is
     // taken from the same constants as dispatch.rs:4900-5174.
@@ -7221,11 +7241,13 @@ mod tests {
         // gfx1151 already packaged it) and the gfx1201 DFlash-draft MQ4G256V2
         // overwrite WMMA twins `gemm_mq4g256v2_overwrite_wmma_gfx12` and
         // `gemm_mq4g256v2_overwrite_wmma_gfx12_vt` (default draft lm_head and
-        // projections; the 27B draft cold-compiled them) are additional to P0's 92. Existing
+        // projections; the 27B draft cold-compiled them) and the DFlash verify
+        // tape-capture copy `tape_copy_batched` plus the lane-batched CB verify
+        // conv `conv1d_silu_split_f32_lanes` (exact-gfx1201 route) are additional to P0's 92. Existing
         // module digests above remain unchanged.
         assert_eq!(
             registry.len(),
-            count + 158,
+            count + 160,
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
@@ -7619,6 +7641,59 @@ mod tests {
         ] {
             for arch in ["gfx1100", "gfx1151", "gfx906", "gfx942"] {
                 assert!(lookup(arch, module, "").is_err(), "{arch}: leaked {module}");
+            }
+        }
+    }
+
+    /// The DFlash verify tape-capture copy and the lane-batched conv are
+    /// packaged under the exact module key and symbol their launchers pass to
+    /// `ensure_kernel`, with the launchers' own source constants, and each
+    /// entry's recipe is the compiler's recipe for that source. The copy kernel
+    /// has no arch guard or launcher gate, so every inventory carries it; the
+    /// lane conv is only admitted on exact gfx1201 (`lane_gdn_batch_admitted`).
+    #[test]
+    fn dflash_tape_copy_and_lane_conv_match_launchers_and_compiler() {
+        use crate::lane_gdn::{CONV1D_SILU_SPLIT_LANES_SRC, CONV1D_SILU_SPLIT_LANES_SYMBOL};
+        use crate::tape_copy::{TAPE_COPY_BATCHED_SRC, TAPE_COPY_BATCHED_SYMBOL};
+        for arch in SUPPORTED_ARCHES {
+            for extra_flags in ["", "-DIU4_A4_CANDIDATES=2"] {
+                let copy = lookup(arch, TAPE_COPY_BATCHED_SYMBOL, extra_flags)
+                    .unwrap_or_else(|e| panic!("{arch}: tape copy not packaged: {e:?}"));
+                assert_eq!(copy.module, TAPE_COPY_BATCHED_SYMBOL, "{arch}");
+                assert_eq!(copy.symbols, [TAPE_COPY_BATCHED_SYMBOL], "{arch}");
+                assert_eq!(copy.source(), TAPE_COPY_BATCHED_SRC, "{arch}");
+                let recipe = KernelCompiler::recipe_for_source(
+                    arch,
+                    TAPE_COPY_BATCHED_SYMBOL,
+                    TAPE_COPY_BATCHED_SRC,
+                    extra_flags,
+                );
+                assert_eq!(copy.flags, recipe.flags, "{arch}: {extra_flags}");
+                assert_eq!(
+                    copy.scheduler_profile, recipe.scheduler_profile,
+                    "{arch}: {extra_flags}"
+                );
+
+                let conv = lookup(arch, CONV1D_SILU_SPLIT_LANES_SYMBOL, extra_flags);
+                if *arch != "gfx1201" {
+                    assert!(conv.is_err(), "{arch}: leaked lane conv");
+                    continue;
+                }
+                let conv = conv.unwrap();
+                assert_eq!(conv.module, CONV1D_SILU_SPLIT_LANES_SYMBOL);
+                assert_eq!(conv.symbols, [CONV1D_SILU_SPLIT_LANES_SYMBOL]);
+                assert_eq!(conv.source(), CONV1D_SILU_SPLIT_LANES_SRC);
+                let recipe = KernelCompiler::recipe_for_source(
+                    arch,
+                    CONV1D_SILU_SPLIT_LANES_SYMBOL,
+                    CONV1D_SILU_SPLIT_LANES_SRC,
+                    extra_flags,
+                );
+                assert_eq!(conv.flags, recipe.flags, "{extra_flags}");
+                assert_eq!(
+                    conv.scheduler_profile, recipe.scheduler_profile,
+                    "{extra_flags}"
+                );
             }
         }
     }
