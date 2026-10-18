@@ -533,6 +533,33 @@ pub(crate) enum RouteLoad {
     },
 }
 
+/// What an unplanned kernel request does, so the warning never claims a
+/// compile that did not run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LazyKind {
+    /// A native embedded image: loaded and bound, never compiled.
+    EmbeddedImage,
+    /// A HIP module whose object the compiler already holds from before the
+    /// request (planned/predicted compile, or an earlier load): bound only.
+    HipPrecompiled,
+    /// A HIP module with no pre-request module record under this name. It
+    /// compiles only if its cache entry is missing; a module compiled
+    /// earlier under a compiler-family alias name only loads and binds.
+    HipNoRecord,
+}
+
+impl LazyKind {
+    fn what(self) -> &'static str {
+        match self {
+            Self::EmbeddedImage => "native image loaded lazily (embedded; no compile)",
+            Self::HipPrecompiled => "bound lazily (module already compiled)",
+            Self::HipNoRecord => {
+                "loaded lazily (no pre-ready module record; compiled now only if not in the kernel cache)"
+            }
+        }
+    }
+}
+
 impl RouteLoad {
     /// Planned modules are not yet loaded: raw launches must refuse.
     pub(crate) fn pending(&self) -> bool {
@@ -541,24 +568,17 @@ impl RouteLoad {
 
     /// Gate a kernel request the preloaded plan did not bind: a sealed route
     /// refuses it, an open route counts it and warns once per request with
-    /// the module, route and phase (during load / after ready), and any
-    /// other state loads it silently. `precompiled` marks a module whose
-    /// object a predicted compile already cached: the request only binds it.
-    pub(crate) fn admit_unplanned(&mut self, module_name: &str, func_name: &str) -> HipResult<()> {
-        self.admit_unplanned_module(module_name, func_name, false)
-    }
-
-    pub(crate) fn admit_unplanned_module(
+    /// the module, route, phase (during load / after ready) and what the
+    /// request does ([`LazyKind`]), and any other state loads it silently.
+    /// The counters count unplanned requests, not compiles: a bind of an
+    /// already compiled or embedded module counts like any other miss.
+    pub(crate) fn admit_unplanned(
         &mut self,
         module_name: &str,
         func_name: &str,
-        precompiled: bool,
+        kind: LazyKind,
     ) -> HipResult<()> {
-        let what = if precompiled {
-            "bound lazily (module precompiled)"
-        } else {
-            "compiled/loaded lazily"
-        };
+        let what = kind.what();
         match self {
             Self::Sealed => Err(unplanned_route_kernel(module_name, func_name)),
             Self::Open {
@@ -804,10 +824,14 @@ pub(crate) fn compile_and_load_kernel(
     if functions.contains_key(func_name) {
         return Ok(());
     }
-    route.admit_unplanned_module(
+    route.admit_unplanned(
         module_name,
         func_name,
-        compiler.compiled_kernels().contains_key(module_name),
+        if compiler.compiled_kernels().contains_key(module_name) {
+            LazyKind::HipPrecompiled
+        } else {
+            LazyKind::HipNoRecord
+        },
     )?;
     load_kernel_module(
         compiler,
@@ -3904,15 +3928,19 @@ mod route_load_tests {
             stats: RouteKernelStats::default(),
         };
         assert!(open
-            .admit_unplanned("gemv_mq2g256v2", "gemv_mq2g256v2")
+            .admit_unplanned("gemv_mq2g256v2", "gemv_mq2g256v2", LazyKind::HipNoRecord)
             .is_ok());
         assert!(open
-            .admit_unplanned("topk8_rescore_mq6g256v2", "topk8_rescore_mq6g256v2_k2560")
+            .admit_unplanned(
+                "topk8_rescore_mq6g256v2",
+                "topk8_rescore_mq6g256v2_k2560",
+                LazyKind::EmbeddedImage
+            )
             .is_ok());
         assert!(matches!(open, RouteLoad::Open { unplanned: 2, .. }));
         let mut sealed = RouteLoad::Sealed;
         let error = sealed
-            .admit_unplanned("gemv_mq2g256v2", "gemv_mq2g256v2")
+            .admit_unplanned("gemv_mq2g256v2", "gemv_mq2g256v2", LazyKind::HipNoRecord)
             .unwrap_err();
         assert!(error
             .to_string()
@@ -3925,7 +3953,7 @@ mod route_load_tests {
             },
         ] {
             assert!(lazy
-                .admit_unplanned("gemv_mq2g256v2", "gemv_mq2g256v2")
+                .admit_unplanned("gemv_mq2g256v2", "gemv_mq2g256v2", LazyKind::HipNoRecord)
                 .is_ok());
         }
     }
@@ -3990,14 +4018,22 @@ mod route_load_tests {
             open: Some("qwen3.8-flash-next gfx1100 predicted".into()),
             stats: RouteKernelStats::default(),
         };
-        route.admit_unplanned("a", "a_f32").unwrap();
-        route.admit_unplanned_module("b", "b_f32", true).unwrap();
-        assert_eq!(route.stats().lazy_during_load, 2);
+        route
+            .admit_unplanned("a", "a_f32", LazyKind::HipNoRecord)
+            .unwrap();
+        route
+            .admit_unplanned("b", "b_f32", LazyKind::HipPrecompiled)
+            .unwrap();
+        route
+            .admit_unplanned("n", "n_f32", LazyKind::EmbeddedImage)
+            .unwrap();
+        assert_eq!(route.stats().lazy_during_load, 3);
         let mut open = route.finished();
         assert!(matches!(open, RouteLoad::Open { unplanned: 0, .. }));
-        open.admit_unplanned("c", "c_f32").unwrap();
+        open.admit_unplanned("c", "c_f32", LazyKind::HipNoRecord)
+            .unwrap();
         assert!(matches!(open, RouteLoad::Open { unplanned: 1, .. }));
-        assert_eq!(open.stats().lazy_during_load, 2);
+        assert_eq!(open.stats().lazy_during_load, 3);
     }
 
     /// A model that left its closed plan finishes open with the preload's

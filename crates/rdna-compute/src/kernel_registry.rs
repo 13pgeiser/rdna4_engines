@@ -315,6 +315,14 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         crate::tape_copy::TAPE_COPY_BATCHED_SRC,
         ["tape_copy_batched"]
     );
+    // `Gpu::bf16_round_trip_f32` (norm.rs): module `bf16_round_trip`, symbol
+    // `bf16_round_trip_f32`, source `kernels::BF16_ROUND_TRIP_SRC`; no arch
+    // guard in the kernel or launcher (Qwen4 storage boundaries, dots.ocr).
+    add!(
+        "bf16_round_trip",
+        kernels::BF16_ROUND_TRIP_SRC,
+        ["bf16_round_trip_f32"]
+    );
     // Lane-table conv of the lane-batched CB DFlash verify (`Gpu::
     // conv1d_silu_split_f32_lanes`, lane_gdn.rs). The kernel has no arch
     // guard; its only caller is admitted by `lane_gdn_batch_admitted`, which
@@ -1739,6 +1747,19 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
     }
     if arch == "gfx1151" {
+        // QSA gathered F16 WMMA attention (`tensor_ops::qsa_gathered_wmma_launch_with`
+        // and the QSA F16 arena producer): the route is gfx1151-only for F32/Q8
+        // K/V (`qsa_gathered_wmma_enabled`); the Q8 converter stays HIP even when
+        // the PM image serves the attend kernel.
+        add!(
+            "indexed_attention_gathered_wmma",
+            crate::tensor_ops::INDEXED_ATTENTION_GATHERED_WMMA_SRC,
+            [
+                "indexed_attention_gathered_wmma_f16",
+                "indexed_attention_kv_f16vb",
+                "indexed_attention_kv_f16vb_q8",
+            ]
+        );
         add!(
             "attention_flash_q8_0_tile_gqa_gfx1151",
             kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1151_SRC,
@@ -3644,6 +3665,1283 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ["qwen35_fa_prep_gfx1151"]
         );
     }
+
+    // FirstRequestJit discovery batch 1 (cell R4, qwen3.6:35b-a3b mq4p on
+    // gfx1201, hold frj-disc-r4-v2-01): modules the first requests compiled
+    // after `ready`. Each source is the exact constant/expression the launcher
+    // passes to `ensure_kernel`; the gfx1201 sources' sha256 equal the observed
+    // kcache `.hip` files. Siblings the same launcher selects on gfx1100 /
+    // gfx1151 under defaults are packaged with them.
+
+    // Decode 3-/4-way fused Q8_0 projections (`Gpu::fused_qkv_q8_0` /
+    // `fused_qkvza_q8_0`, gemm.rs): scalar kernels, no arch gate (the
+    // dispatch tables route Q8_0 decode here "cross-arch").
+    add!(
+        "fused_qkv_q8_0",
+        kernels::FUSED_QKV_Q8_0_SRC,
+        ["fused_qkv_q8_0"]
+    );
+    add!(
+        "fused_qkvza_q8_0",
+        kernels::FUSED_QKVZA_Q8_0_SRC,
+        ["fused_qkvza_q8_0"]
+    );
+    // Coverage batch A (no arch gate in the launchers, embedding.rs /
+    // gemm.rs `fused_gate_up_q8_0`): default resident-codec embeddings
+    // (pipeline/layer_ops.rs MQ4V2 and BF16 `EmbeddingOp`) and the Q8_0
+    // decode fused gate/up (families/fused_qkv.rs).
+    add!(
+        "embedding_mq4v2_batched",
+        kernels::EMBEDDING_MQ4V2_BATCHED_SRC,
+        ["embedding_mq4v2_batched"]
+    );
+    add!(
+        "embedding_bf16_batched",
+        kernels::EMBEDDING_BF16_BATCHED_SRC,
+        ["embedding_bf16_batched"]
+    );
+    add!(
+        "fused_gate_up_q8_0",
+        kernels::FUSED_GATE_UP_Q8_0_SRC,
+        ["fused_gate_up_q8_0"]
+    );
+    // Coverage batch B: HFQ6 gate/up scalar fallback
+    // (`gemm_gate_up_hfq6g256`: the decode `None` arm on every non-dp4a arch
+    // and the prefill tail; the WMMA twins are registered per arch); no arch gates.
+    add!(
+        "gemm_gate_up_hfq6g256",
+        kernels::GEMM_GATE_UP_HFQ6G256_SRC,
+        ["gemm_gate_up_hfq6g256"]
+    );
+    // The `gemv_hfq4g256_residual_scaled` module is shared by the routed
+    // `_cpu`/`_gpu` accumulators, the shared-expert sigmoid decode launcher
+    // (plain-module fallback) and its batched prefill twin
+    // (`gemv.rs` `gemv_hfq4g256_residual_*`); the batched launcher has no
+    // arch gate on the RDNA wave32 MoE routes.
+    // `default_route_entries` carries the module without the batched symbol
+    // (gfx1151/gfx1201); the same-source twin here supersedes it in the corpus.
+    if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201") {
+        add!(
+            "gemv_hfq4g256_residual_scaled",
+            kernels::GEMV_HFQ4G256_RESIDUAL_SCALED_SRC,
+            [
+                "gemv_hfq4g256_residual_scaled_cpu",
+                "gemv_hfq4g256_residual_scaled_gpu",
+                "gemv_hfq4g256_residual_sigmoid_scaled_gpu",
+                "gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched"
+            ]
+        );
+        // Mixed-precision (dtype-tag) MoE batched decode/prefill GEMVs
+        // (`gemv_mixed_moe_gate_up_k8_indexed_batched`,
+        // `gemv_mixed_moe_down_k8_indexed_batched_expanded`; wave32 RDNA only).
+        add!(
+            "gemv_mixed_moe_gate_up_indexed_batched",
+            kernels::GEMV_MIXED_MOE_GATE_UP_INDEXED_BATCHED_SRC,
+            ["gemv_mixed_moe_gate_up_k8_indexed_batched"]
+        );
+        add!(
+            "gemv_mixed_moe_down_k8_indexed_batched_expanded",
+            kernels::GEMV_MIXED_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC,
+            ["gemv_mixed_moe_down_k8_indexed_batched_expanded"]
+        );
+        // Uniform-dtype Qwen3.5-MoE decode GEMVs (hipfire-dispatch
+        // `pipeline/mod.rs` decode gate/up + down stages, no arch branch in
+        // the gemv.rs launchers): HFQ6 (qt15) gate/up and expanded down,
+        // MQ6V2 (qt47) gate/up and expanded down, and the default-on
+        // single-token nine-path d4 fused decode for uniform MQ4G256 and
+        // MQ6G256V2 experts (`moe_program.rs` ninepath_d4; `_d3` and
+        // `_last_combine` are developer opt-ins).
+        add!(
+            "gemv_hfq6g256_moe_gate_up_indexed",
+            kernels::GEMV_HFQ6G256_MOE_GATE_UP_INDEXED_SRC,
+            ["gemv_hfq6g256_moe_gate_up_k8_indexed"]
+        );
+        add!(
+            "gemv_hfq6g256_moe_down_k8_indexed_batched_expanded",
+            kernels::GEMV_HFQ6G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC,
+            ["gemv_hfq6g256_moe_down_k8_indexed_batched_expanded"]
+        );
+        add!(
+            "gemv_hfq4g256_moe_ninepath_d4",
+            kernels::GEMV_HFQ4G256_MOE_NINEPATH_D4_SRC,
+            ["gemv_hfq4g256_moe_ninepath_d4"]
+        );
+        add!(
+            "gemv_mq6g256v2_moe_ninepath_d4",
+            kernels::GEMV_MQ6G256V2_MOE_NINEPATH_D4_SRC,
+            ["gemv_mq6g256v2_moe_ninepath_d4"]
+        );
+        add!(
+            "gemv_mq6g256v2_moe_gate_up_k8_indexed",
+            kernels::GEMV_MQ6G256V2_MOE_GATE_UP_K8_INDEXED_SRC,
+            ["gemv_mq6g256v2_moe_gate_up_k8_indexed"]
+        );
+        add!(
+            "gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded",
+            kernels::GEMV_MQ6G256V2_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC,
+            ["gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded"]
+        );
+    }
+    // Coverage batch D (ClassifyOther / ClassifyGemm; every module's launcher
+    // sink, source constant and symbol are the ones named below, symbol ==
+    // module unless noted). RDNA-core arches only.
+    if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201") {
+        // Sampled DFlash (`HIPFIRE_DFLASH_FAST_SAMPLE` default on): sampling.rs
+        // `batched_categorical_sample_f32` / `chain_accept_spec_f32`.
+        add!(
+            "batched_categorical_sample",
+            kernels::BATCHED_CATEGORICAL_SAMPLE_SRC,
+            ["batched_categorical_sample_f32"]
+        );
+        add!(
+            "chain_accept_spec",
+            kernels::CHAIN_ACCEPT_SPEC_SRC,
+            ["chain_accept_spec_f32"]
+        );
+        // Decode fused projections of MQ6G256V2 / MQ3G256V2 (`ArchPredicate::Always`).
+        add!(
+            "fused_qkv_mq6g256v2",
+            kernels::FUSED_QKV_MQ6G256V2_SRC,
+            ["fused_qkv_mq6g256v2"]
+        );
+        add!(
+            "fused_qkvza_mq6g256v2",
+            kernels::FUSED_QKVZA_MQ6G256V2_SRC,
+            ["fused_qkvza_mq6g256v2"]
+        );
+        add!(
+            "fused_gate_up_mq6g256v2",
+            kernels::FUSED_GATE_UP_MQ6G256V2_SRC,
+            ["fused_gate_up_mq6g256v2"]
+        );
+        add!(
+            "fused_qkv_mq3g256v2",
+            kernels::FUSED_QKV_MQ3G256V2_SRC,
+            ["fused_qkv_mq3g256v2"]
+        );
+        add!(
+            "fused_qkvza_mq3g256v2",
+            kernels::FUSED_QKVZA_MQ3G256V2_SRC,
+            ["fused_qkvza_mq3g256v2"]
+        );
+        add!(
+            "fused_gate_up_mq3g256v2",
+            kernels::FUSED_GATE_UP_MQ3G256V2_SRC,
+            ["fused_gate_up_mq3g256v2"]
+        );
+        // HFQ4 A3B MoE decode gate/up (`gemv_hfq4g256_moe_gate_up_k8_indexed`,
+        // gemv.rs plain-module arm; the gfx1100/gfx1151 tuned variants are
+        // developer envs). `default_route_entries` carries the same source.
+        add!(
+            "gemv_hfq4g256_moe_gate_up_indexed",
+            kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC,
+            ["gemv_hfq4g256_moe_gate_up_k8_indexed"]
+        );
+        // Q8_0 lm_head / spec-verify batched GEMM (`gemm_q8_0_batched_f32_chunked`).
+        add!(
+            "gemm_q8_0_batched",
+            kernels::GEMM_Q8_0_BATCHED_SRC,
+            ["gemm_q8_0_batched"]
+        );
+        // HFQ4 scalar batch-1 / `HIPFIRE_FP16=0` prefill fallbacks.
+        add!(
+            "gemm_qkvza_hfq4g256",
+            kernels::GEMM_QKVZA_HFQ4G256_SRC,
+            ["gemm_qkvza_hfq4g256"]
+        );
+        add!(
+            "gemm_qkv_hfq4g256",
+            kernels::GEMM_QKV_HFQ4G256_SRC,
+            ["gemm_qkv_hfq4g256"]
+        );
+        add!(
+            "gemm_gate_up_hfq4g256",
+            kernels::GEMM_GATE_UP_HFQ4G256_SRC,
+            ["gemm_gate_up_hfq4g256"]
+        );
+        add!(
+            "gemm_hfq4g256_residual",
+            kernels::GEMM_HFQ4G256_RESIDUAL_SRC,
+            ["gemm_hfq4g256_residual"]
+        );
+    }
+    if matches!(arch, "gfx1100" | "gfx1151") {
+        // MQ3G256 v1 prefill QKV / QKVZA / residual: base WMMA plus the MB4
+        // twins (`flags.mq3_mb4` None: batch >= 128 and large M).
+        add!(
+            "gemm_qkv_hfq3g256_wmma",
+            kernels::GEMM_QKV_HFQ3G256_WMMA_SRC,
+            ["gemm_qkv_hfq3g256_wmma"]
+        );
+        add!(
+            "gemm_qkv_hfq3g256_wmma_mb4",
+            kernels::GEMM_QKV_HFQ3G256_WMMA_MB4_SRC,
+            ["gemm_qkv_hfq3g256_wmma_mb4"]
+        );
+        add!(
+            "gemm_qkvza_hfq3g256_wmma",
+            kernels::GEMM_QKVZA_HFQ3G256_WMMA_SRC,
+            ["gemm_qkvza_hfq3g256_wmma"]
+        );
+        add!(
+            "gemm_qkvza_hfq3g256_wmma_mb4",
+            kernels::GEMM_QKVZA_HFQ3G256_WMMA_MB4_SRC,
+            ["gemm_qkvza_hfq3g256_wmma_mb4"]
+        );
+        add!(
+            "gemm_hfq3g256_residual_wmma",
+            kernels::GEMM_HFQ3G256_RESIDUAL_WMMA_SRC,
+            ["gemm_hfq3g256_residual_wmma"]
+        );
+        add!(
+            "gemm_hfq3g256_residual_wmma_mb4",
+            kernels::GEMM_HFQ3G256_RESIDUAL_WMMA_MB4_SRC,
+            ["gemm_hfq3g256_residual_wmma_mb4"]
+        );
+        // MQ4G256 v1 gfx11 WMMA prefill (batch < 128, no MMQ).
+        add!(
+            "gemm_qkvza_hfq4g256_wmma",
+            kernels::GEMM_QKVZA_HFQ4G256_WMMA_SRC,
+            ["gemm_qkvza_hfq4g256_wmma"]
+        );
+        add!(
+            "gemm_qkv_hfq4g256_wmma",
+            kernels::GEMM_QKV_HFQ4G256_WMMA_SRC,
+            ["gemm_qkv_hfq4g256_wmma"]
+        );
+        // F16 lm_head (`gemm_f16_batched_lmhead`; gfx12 takes `gemm_f16_wmma_mb8`).
+        add!(
+            "gemm_mw16_residual_wmma",
+            kernels::GEMM_MW16_RESIDUAL_WMMA_SRC,
+            ["gemm_mw16_residual_wmma"]
+        );
+        // Sparse sampled DFlash host-accept target rows (speculative.rs
+        // `dflash_target_rows_into`; the device accept path is gfx1201-only).
+        // Module name == `sampled_rows_compact::SAMPLED_ROWS_COMPACT_MODULE`.
+        add!(
+            "sampled_rows_compact",
+            crate::sampled_rows_compact::SAMPLED_ROWS_COMPACT_SRC,
+            ["sampled_rows_compact_f32"]
+        );
+        // gfx11 sibling of the HFQ4 grouped MoE WMMA (same launcher's non-gfx12 arm).
+        add!(
+            "gemm_hfq4g256_moe_grouped_wmma_k2",
+            kernels::GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC,
+            ["gemm_hfq4g256_moe_grouped_wmma_k2"]
+        );
+    }
+    if arch == "gfx1201" {
+        // Discovery batch R11 (cell R11, hold frj-disc-r11-v2-01, 27B mq4
+        // DFlash) and R13 (frj-disc-r13-v2-01, 27B mq4 AR): the non-slab AWQ
+        // IU4 prefill producers (`HIPFIRE_G12_NORM` default on, slab off), the
+        // k6144 gated norm and the fp8q FA prep (module name == symbol).
+        add!(
+            "fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2",
+            kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC,
+            ["fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2"]
+        );
+        add!(
+            "fused_silu_mul_mq_rotate_awq_i4_gfx12",
+            kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC,
+            ["fused_silu_mul_mq_rotate_awq_i4_gfx12"]
+        );
+        add!(
+            "gated_norm_mq_rotate_awq_i4_gfx12_v2",
+            kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC,
+            ["gated_norm_mq_rotate_awq_i4_gfx12_v2"]
+        );
+        add!(
+            "gated_norm_mq_rotate_awq_i4_gfx12_v2_xbf16",
+            kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_XBF16_SRC,
+            ["gated_norm_mq_rotate_awq_i4_gfx12_v2_xbf16"]
+        );
+        add!(
+            "sigmoid_mul_rotate_x_mq_awq_i4_gfx12",
+            kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC,
+            ["sigmoid_mul_rotate_x_mq_awq_i4_gfx12"]
+        );
+        add!(
+            "sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12",
+            kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GIL_GFX12_SRC,
+            ["sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12"]
+        );
+        add!(
+            "gated_norm_mq_rotate_k6144_gfx1201",
+            kernels::gated_norm_mq_rotate_k6144_gfx1201_src(),
+            ["gated_norm_mq_rotate_k6144_gfx1201"]
+        );
+        add!(
+            "qwen35_fa_prep_fp8q_batched_gfx1201",
+            crate::qwen35_fa_batch::FA_PREP_BATCHED_GFX1201_SRC,
+            ["qwen35_fa_prep_fp8q_batched_gfx1201"]
+        );
+        // Q8 decode fused epilogue with an AWQ scale on gfx1201 (A3B).
+        add!(
+            "attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1201",
+            kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1201_SRC,
+            ["attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1201"]
+        );
+        add!(
+            "attention_flash_q8_0_rows4_d8",
+            kernels::ATTENTION_FLASH_Q8_0_TILE_ROWS_SRC,
+            ["attention_flash_q8_0_rows4_d8"]
+        );
+        add!(
+            "attention_flash_q8_0_rows8_d8",
+            kernels::ATTENTION_FLASH_Q8_0_TILE_ROWS_SRC,
+            ["attention_flash_q8_0_rows8_d8"]
+        );
+        // Dynamic MQ6V2/MQ3V2 gfx12 GEMM families (`gfx12_bt_tile`: base for
+        // N < 64, bt4/bt8/bt12 above; shared `_mq5v2` module suffix, symbol is
+        // the unsuffixed kname).
+        add!(
+            "gemm_qkvza_mq6g256v2_wmma_gfx12_mq5v2",
+            kernels::GEMM_QKVZA_MQ6G256V2_WMMA_GFX12_SRC,
+            ["gemm_qkvza_mq6g256v2_wmma_gfx12"]
+        );
+        add!(
+            "gemm_qkvza_mq6g256v2_wmma_gfx12_bt4_mq5v2",
+            kernels::GEMM_QKVZA_MQ6G256V2_WMMA_GFX12_BT_SRC,
+            ["gemm_qkvza_mq6g256v2_wmma_gfx12_bt4"]
+        );
+        add!(
+            "gemm_qkvza_mq6g256v2_wmma_gfx12_bt8_mq5v2",
+            kernels::GEMM_QKVZA_MQ6G256V2_WMMA_GFX12_BT_SRC,
+            ["gemm_qkvza_mq6g256v2_wmma_gfx12_bt8"]
+        );
+        add!(
+            "gemm_qkvza_mq6g256v2_wmma_gfx12_bt12_mq5v2",
+            kernels::GEMM_QKVZA_MQ6G256V2_WMMA_GFX12_BT_SRC,
+            ["gemm_qkvza_mq6g256v2_wmma_gfx12_bt12"]
+        );
+        add!(
+            "gemm_gate_up_mq6g256v2_wmma_gfx12_mq5v2",
+            kernels::GEMM_GATE_UP_MQ6G256V2_WMMA_GFX12_SRC,
+            ["gemm_gate_up_mq6g256v2_wmma_gfx12"]
+        );
+        add!(
+            "gemm_gate_up_mq6g256v2_wmma_gfx12_bt4_mq5v2",
+            kernels::GEMM_GATE_UP_MQ6G256V2_WMMA_GFX12_BT_SRC,
+            ["gemm_gate_up_mq6g256v2_wmma_gfx12_bt4"]
+        );
+        add!(
+            "gemm_gate_up_mq6g256v2_wmma_gfx12_bt8_mq5v2",
+            kernels::GEMM_GATE_UP_MQ6G256V2_WMMA_GFX12_BT_SRC,
+            ["gemm_gate_up_mq6g256v2_wmma_gfx12_bt8"]
+        );
+        add!(
+            "gemm_gate_up_mq6g256v2_wmma_gfx12_bt12_mq5v2",
+            kernels::GEMM_GATE_UP_MQ6G256V2_WMMA_GFX12_BT_SRC,
+            ["gemm_gate_up_mq6g256v2_wmma_gfx12_bt12"]
+        );
+        add!(
+            "gemm_qkvza_mq3g256v2_wmma_gfx12_mq5v2",
+            kernels::GEMM_QKVZA_MQ3G256V2_WMMA_GFX12_SRC,
+            ["gemm_qkvza_mq3g256v2_wmma_gfx12"]
+        );
+        add!(
+            "gemm_qkvza_mq3g256v2_wmma_gfx12_bt4_mq5v2",
+            kernels::GEMM_QKVZA_MQ3G256V2_WMMA_GFX12_BT_SRC,
+            ["gemm_qkvza_mq3g256v2_wmma_gfx12_bt4"]
+        );
+        add!(
+            "gemm_qkvza_mq3g256v2_wmma_gfx12_bt8_mq5v2",
+            kernels::GEMM_QKVZA_MQ3G256V2_WMMA_GFX12_BT_SRC,
+            ["gemm_qkvza_mq3g256v2_wmma_gfx12_bt8"]
+        );
+        add!(
+            "gemm_qkvza_mq3g256v2_wmma_gfx12_bt12_mq5v2",
+            kernels::GEMM_QKVZA_MQ3G256V2_WMMA_GFX12_BT_SRC,
+            ["gemm_qkvza_mq3g256v2_wmma_gfx12_bt12"]
+        );
+        add!(
+            "gemm_gate_up_mq3g256v2_wmma_gfx12_mq5v2",
+            kernels::GEMM_GATE_UP_MQ3G256V2_WMMA_GFX12_SRC,
+            ["gemm_gate_up_mq3g256v2_wmma_gfx12"]
+        );
+        add!(
+            "gemm_gate_up_mq3g256v2_wmma_gfx12_bt4_mq5v2",
+            kernels::GEMM_GATE_UP_MQ3G256V2_WMMA_GFX12_BT_SRC,
+            ["gemm_gate_up_mq3g256v2_wmma_gfx12_bt4"]
+        );
+        add!(
+            "gemm_gate_up_mq3g256v2_wmma_gfx12_bt8_mq5v2",
+            kernels::GEMM_GATE_UP_MQ3G256V2_WMMA_GFX12_BT_SRC,
+            ["gemm_gate_up_mq3g256v2_wmma_gfx12_bt8"]
+        );
+        add!(
+            "gemm_gate_up_mq3g256v2_wmma_gfx12_bt12_mq5v2",
+            kernels::GEMM_GATE_UP_MQ3G256V2_WMMA_GFX12_BT_SRC,
+            ["gemm_gate_up_mq3g256v2_wmma_gfx12_bt12"]
+        );
+        add!(
+            "gemm_mq3g256v2_residual_wmma_gfx12_mq5v2",
+            kernels::GEMM_MQ3G256V2_RESIDUAL_WMMA_GFX12_SRC,
+            ["gemm_mq3g256v2_residual_wmma_gfx12"]
+        );
+        add!(
+            "gemm_mq3g256v2_residual_wmma_gfx12_bt4_mq5v2",
+            kernels::GEMM_MQ3G256V2_RESIDUAL_WMMA_GFX12_BT_SRC,
+            ["gemm_mq3g256v2_residual_wmma_gfx12_bt4"]
+        );
+        add!(
+            "gemm_mq3g256v2_residual_wmma_gfx12_bt8_mq5v2",
+            kernels::GEMM_MQ3G256V2_RESIDUAL_WMMA_GFX12_BT_SRC,
+            ["gemm_mq3g256v2_residual_wmma_gfx12_bt8"]
+        );
+        add!(
+            "gemm_mq3g256v2_residual_wmma_gfx12_bt12_mq5v2",
+            kernels::GEMM_MQ3G256V2_RESIDUAL_WMMA_GFX12_BT_SRC,
+            ["gemm_mq3g256v2_residual_wmma_gfx12_bt12"]
+        );
+        // Discovery batch R7 (cell R7, hold frj-disc-r7-v2-01, mq4r A3B):
+        // `Gpu::gemm_hfq4g256_moe_grouped_wmma*` picks the gfx12 module on
+        // RDNA4 (`HIPFIRE_MOE_GROUPED_M2` developer opt-in is not registered);
+        // the residual and QKVZA launchers pick bt4/bt8/bt12 via
+        // `gfx12_bt_tile` (one source each, symbol == module). The QKV
+        // launcher has no bt family.
+        add!(
+            "gemm_hfq4g256_moe_grouped_wmma_gfx12",
+            kernels::GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC,
+            ["gemm_hfq4g256_moe_grouped_wmma_gfx12"]
+        );
+        add!(
+            "gemm_hfq4g256_residual_wmma_gfx12_bt4",
+            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC,
+            ["gemm_hfq4g256_residual_wmma_gfx12_bt4"]
+        );
+        add!(
+            "gemm_hfq4g256_residual_wmma_gfx12_bt8",
+            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC,
+            ["gemm_hfq4g256_residual_wmma_gfx12_bt8"]
+        );
+        add!(
+            "gemm_hfq4g256_residual_wmma_gfx12_bt12",
+            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC,
+            ["gemm_hfq4g256_residual_wmma_gfx12_bt12"]
+        );
+        add!(
+            "gemm_qkvza_hfq4g256_wmma_gfx12_bt4",
+            kernels::GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC,
+            ["gemm_qkvza_hfq4g256_wmma_gfx12_bt4"]
+        );
+        add!(
+            "gemm_qkvza_hfq4g256_wmma_gfx12_bt8",
+            kernels::GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC,
+            ["gemm_qkvza_hfq4g256_wmma_gfx12_bt8"]
+        );
+        add!(
+            "gemm_qkvza_hfq4g256_wmma_gfx12_bt12",
+            kernels::GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC,
+            ["gemm_qkvza_hfq4g256_wmma_gfx12_bt12"]
+        );
+        // gfx1201 default MQ4V2 FP8 prefill pre-pass (`Gpu::prepare_mq4v2_fp8_x`,
+        // scratch.rs): one module per entry, both over the same TU.
+        add!(
+            "pack_f16_to_fp8_mq4v2_gfx12",
+            kernels::PACK_F16_TO_FP8_MQ4V2_GFX12_SRC,
+            ["pack_f16_to_fp8_mq4v2_gfx12"]
+        );
+        add!(
+            "pack_f32_to_fp8_mq4v2_gfx12",
+            kernels::PACK_F32_TO_FP8_MQ4V2_GFX12_SRC,
+            ["pack_f32_to_fp8_mq4v2_gfx12"]
+        );
+        // HFQ3 gfx12 QKV / QKVZA / residual WMMA (gate/up twin is above).
+        add!(
+            "gemm_qkv_hfq3g256_wmma_gfx12",
+            kernels::GEMM_QKV_HFQ3G256_WMMA_GFX12_SRC,
+            ["gemm_qkv_hfq3g256_wmma_gfx12"]
+        );
+        add!(
+            "gemm_qkvza_hfq3g256_wmma_gfx12",
+            kernels::GEMM_QKVZA_HFQ3G256_WMMA_GFX12_SRC,
+            ["gemm_qkvza_hfq3g256_wmma_gfx12"]
+        );
+        add!(
+            "gemm_hfq3g256_residual_wmma_gfx12",
+            kernels::GEMM_HFQ3G256_RESIDUAL_WMMA_GFX12_SRC,
+            ["gemm_hfq3g256_residual_wmma_gfx12"]
+        );
+        // MTP/DFlash temperature verify softmax (norm.rs
+        // `softmax_temp_topp_batched_into_f32`), same module and source the
+        // gfx11 inventory carries; formerly pushed only by `route_corpus`.
+        add!(
+            "softmax_temp_topp_batched",
+            kernels::SOFTMAX_TEMP_BATCHED_SRC,
+            ["softmax_temp_batched_f32", "softmax_temp_topp_batched_f32"]
+        );
+    }
+    if matches!(arch, "gfx1151" | "gfx1201") {
+        add!(
+            "gemv_hfq4g256_residual_mq6v2",
+            kernels::GEMV_MQ6G256V2_RESIDUAL_SRC,
+            ["gemv_mq6g256v2_residual"]
+        );
+        add!(
+            "gemv_hfq4g256_residual_mq3g256v2",
+            kernels::GEMV_MQ3G256V2_RESIDUAL_SRC,
+            ["gemv_mq3g256v2_residual"]
+        );
+        add!(
+            "gemv_mq3g256v2_mq3v2",
+            kernels::GEMV_MQ3G256V2_SRC,
+            ["gemv_mq3g256v2"]
+        );
+    }
+    if arch == "gfx1151" {
+        // Q8_0 4-wave WMMA batched GEMM (`gemm_q8_0_batched_chunked`: M >= 4096,
+        // M and N multiples of 64) and the 248320x2048 lm_head r1 hybrid-buffer
+        // GEMV (`gemv_hfq4g256`, and `gemv_mq4g256v2` over the same module
+        // plus `_mq4v2`; shape-gated, no env).
+        add!(
+            "gemm_q8_0_wmma_4w",
+            kernels::GEMM_Q8_0_WMMA_4W_SRC,
+            ["gemm_q8_0_wmma_4w"]
+        );
+        add!(
+            "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151",
+            kernels::GEMV_HFQ4G256_LM_HEAD_R1_HYBRID_BUFFER_GFX1151_SRC,
+            ["gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151"]
+        );
+        add!(
+            "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151_mq4v2",
+            kernels::GEMV_MQ4G256V2_SRC,
+            ["gemv_mq4g256v2"]
+        );
+    }
+    if arch == "gfx1100" {
+        // DFlash draft collapse modules (dflash_draft_fusion.rs: module name ==
+        // symbol, all over `COLLAPSE_SRC`); previously only exported as
+        // symbols of `dynamic_conv_residual_gfx1100`, never as module keys.
+        add!(
+            "gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks2",
+            crate::dflash_draft_fusion::COLLAPSE_SRC,
+            ["gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks2"]
+        );
+        add!(
+            "gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks4",
+            crate::dflash_draft_fusion::COLLAPSE_SRC,
+            ["gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks4"]
+        );
+        add!(
+            "gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks8",
+            crate::dflash_draft_fusion::COLLAPSE_SRC,
+            ["gemm_mq4g256v2_overwrite_ksplit_lds_dflash_gfx1100_ks8"]
+        );
+        add!(
+            "mq_rotate_x_f16_dflash_gfx1100",
+            crate::dflash_draft_fusion::COLLAPSE_SRC,
+            ["mq_rotate_x_f16_dflash_gfx1100"]
+        );
+        add!(
+            "gemm_hfq4g256_overwrite_wmma_k2_dflash_gfx1100",
+            crate::dflash_draft_fusion::COLLAPSE_SRC,
+            ["gemm_hfq4g256_overwrite_wmma_k2_dflash_gfx1100"]
+        );
+        // gfx11-dGPU arch-suffixed GEMV module names of the MQ6V2/MQ3V2
+        // dense GEMV launchers (`gemv_hfq4g256_residual_for_arch` /
+        // `gemv_mq3g256v2_for_arch` return the `_rdna3` module name on
+        // gfx1100; the symbols are the plain ones); gfx1151/gfx1201 take the
+        // unsuffixed names above.
+        add!(
+            "gemv_hfq4g256_residual_rdna3_mq6v2",
+            kernels::GEMV_MQ6G256V2_RESIDUAL_SRC,
+            ["gemv_mq6g256v2_residual"]
+        );
+        add!(
+            "gemv_hfq4g256_residual_rdna3_mq3g256v2",
+            kernels::GEMV_MQ3G256V2_RESIDUAL_SRC,
+            ["gemv_mq3g256v2_residual"]
+        );
+        add!(
+            "gemv_mq3g256v2_rdna3_mq3v2",
+            kernels::GEMV_MQ3G256V2_SRC,
+            ["gemv_mq3g256v2"]
+        );
+        // Q8 KV multi-row flash tile (`attention_flash_q8_0_rows_masked_logical`:
+        // N 4..=32 at ctx > 4096, default on gfx1100/gfx1201; rows4 for N 4..7,
+        // rows8 for N >= 8; D=256 heads use the d8 entries; d4 is head_dim 128).
+        add!(
+            "attention_flash_q8_0_rows4_d8",
+            kernels::ATTENTION_FLASH_Q8_0_TILE_ROWS_SRC,
+            ["attention_flash_q8_0_rows4_d8"]
+        );
+        add!(
+            "attention_flash_q8_0_rows8_d8",
+            kernels::ATTENTION_FLASH_Q8_0_TILE_ROWS_SRC,
+            ["attention_flash_q8_0_rows8_d8"]
+        );
+        // DFlash draft MQ4G256 deterministic K-split collapse
+        // (`gemm_hfq4g256_overwrite_ksplit_det_dflash`, exact gfx1100): the
+        // K-split GEMM plus its finalize kernel from the collapse source.
+        add!(
+            "gemm_hfq4g256_residual_wmma_ksplit_det",
+            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_SRC,
+            ["gemm_hfq4g256_residual_wmma_ksplit_det"]
+        );
+        add!(
+            "gemm_ksplit_det_overwrite_finalize_dflash_gfx1100",
+            crate::dflash_draft_fusion::COLLAPSE_SRC,
+            ["gemm_ksplit_det_overwrite_finalize_dflash_gfx1100"]
+        );
+        // The K-split finalize `gemm_hfq4g256_residual_wmma`'s `ksplit_det`
+        // variant pairs with the partial GEMM above (gemm.rs `fin_name`).
+        add!(
+            "gemm_ksplit_det_finalize",
+            kernels::GEMM_KSPLIT_DET_FINALIZE_SRC,
+            ["gemm_ksplit_det_finalize"]
+        );
+    }
+    // Coverage batch E: MQ6 v1 plain residual (`gemm_hfq6g256_residual`, the
+    // n=1 / `HIPFIRE_FP16=0` fallback of `K::GemmHfq6G256Residual`) and the
+    // DFlash F32 draft-weight batched GEMM (`gemm_f32_batched`,
+    // hipfire-runtime dflash.rs `DType::F32` arm); no arch gate.
+    if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201") {
+        add!(
+            "gemm_hfq6g256_residual",
+            kernels::GEMM_HFQ6G256_RESIDUAL_SRC,
+            ["gemm_hfq6g256_residual"]
+        );
+        add!(
+            "gemm_f32_batched",
+            kernels::GEMM_F32_SRC,
+            ["gemm_f32_batched"]
+        );
+    }
+    // lm_head rm2 muse tile (`gemm_hfq4g256_residual_muse_gfx1100_rm` rm=2):
+    // gfx1151 at batch % 96 == 0 and (m/32)*(batch/96) >= 256 (default DFlash
+    // FC projection), gfx1100 at the exact Glimmer M19968 K6656 B192 shape.
+    // Module name is the file, the symbol is the rm2_bv6 entry (rm 3/4/6 are
+    // never requested).
+    if matches!(arch, "gfx1100" | "gfx1151") {
+        add!(
+            "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt",
+            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_BT_SRC,
+            ["gemm_hfq4g256_residual_wmma_gfx1100_muse_rm2_bv6"]
+        );
+    }
+    if arch == "gfx1151" {
+        // Q8 decode fused gate/up epilogue with an AWQ scale (A3B on gfx1151,
+        // `attention_flash_reduce_gated_mq_rotate_gfx1100`).
+        add!(
+            "attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1151",
+            kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1151_SRC,
+            ["attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1151"]
+        );
+        // Flash-Next NPU trunk G80 activation producer / BF16 consume and
+        // epilogue kernels (npu_trunk.rs `ensure_kernel_public("npu_trunk",
+        // NPU_TRUNK_SRC, ..)`; exact gfx1151, needs the XDNA NPU; `_pm`
+        // consumers and the i8 GEMM are embedded images, not this source).
+        add!(
+            "npu_trunk",
+            kernels::NPU_TRUNK_SRC,
+            [
+                "npu_trunk_consume_bf16_fast",
+                "npu_trunk_epi_bf16",
+                "npu_trunk_pack_a_bf16"
+            ]
+        );
+    }
+    // Batched Q8_0 flash tile (`attention_flash_q8_0_tile_batched` /
+    // `_masked` / windowed callers, attention.rs `launch_asym_flash_batched`);
+    // gfx1100 carries it above. Source goes through `ensure_givens4_kernel`'s
+    // strip-and-prepend, i.e. `assemble_asym`.
+    if matches!(arch, "gfx1151" | "gfx1201") {
+        add!(
+            "attention_flash_q8_0_tile_batched",
+            assemble_asym(kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC),
+            ["attention_flash_q8_0_tile_batched"]
+        );
+    }
+    // gfx11 WMMA Q8_0 prefill twins of the gfx12 projections below
+    // (`gemm_qkv_q8_0_wmma` / `gemm_qkvza_q8_0_wmma` /
+    // `gemm_q8_0_residual_wmma`, gemm.rs; RDNA4 delegates to the gfx12 twins)
+    // and the gfx11 mixed-dtype grouped MoE WMMA (`gemm_mixed_moe_grouped_wmma_impl`
+    // non-gfx12, non-`HIPFIRE_MOE_GROUPED_4W` arm).
+    if matches!(arch, "gfx1100" | "gfx1151") {
+        add!(
+            "gemm_qkv_q8_0_wmma",
+            kernels::GEMM_QKV_Q8_0_WMMA_SRC,
+            ["gemm_qkv_q8_0_wmma"]
+        );
+        add!(
+            "gemm_qkvza_q8_0_wmma",
+            kernels::GEMM_QKVZA_Q8_0_WMMA_SRC,
+            ["gemm_qkvza_q8_0_wmma"]
+        );
+        add!(
+            "gemm_q8_0_residual_wmma",
+            kernels::GEMM_Q8_0_RESIDUAL_WMMA_SRC,
+            ["gemm_q8_0_residual_wmma"]
+        );
+        add!(
+            "gemm_gate_up_q8_0_wmma",
+            kernels::GEMM_GATE_UP_Q8_0_WMMA_SRC,
+            ["gemm_gate_up_q8_0_wmma"]
+        );
+        // HFQ3 prefill gate/up (`gemm_gate_up_hfq3g256_wmma`: base WMMA, or
+        // the MB4 twin at N>=128 and gate+up M>=4096 on RDNA3 dGPU/3.5).
+        add!(
+            "gemm_gate_up_hfq3g256_wmma",
+            kernels::GEMM_GATE_UP_HFQ3G256_WMMA_SRC,
+            ["gemm_gate_up_hfq3g256_wmma"]
+        );
+        add!(
+            "gemm_gate_up_hfq3g256_wmma_mb4",
+            kernels::GEMM_GATE_UP_HFQ3G256_WMMA_MB4_SRC,
+            ["gemm_gate_up_hfq3g256_wmma_mb4"]
+        );
+        // DFlash draft full-attention WMMA tiles (hipfire-dispatch
+        // `AttnFullF32`, HasWmmaW32 = RDNA3/3.5): B=8 `attention_dflash_wmma_f32`
+        // and the B=16/head_dim=128 N64 tile `attention_dflash_wmma_n64_f32`.
+        add!(
+            "attention_dflash_wmma_f32",
+            kernels::ATTENTION_DFLASH_WMMA_SRC,
+            ["attention_dflash_wmma_f32"]
+        );
+        add!(
+            "attention_dflash_wmma_n64_f32",
+            kernels::ATTENTION_DFLASH_WMMA_N64_SRC,
+            ["attention_dflash_wmma_n64_f32"]
+        );
+        add!(
+            "gemm_mixed_moe_grouped_wmma_k2",
+            kernels::GEMM_MIXED_MOE_GROUPED_WMMA_K2_SRC,
+            ["gemm_mixed_moe_grouped_wmma_k2"]
+        );
+    }
+    if arch == "gfx1201" {
+        add!(
+            "gemm_qkv_q8_0_wmma_gfx12",
+            kernels::GEMM_QKV_Q8_0_WMMA_GFX12_SRC,
+            ["gemm_qkv_q8_0_wmma_gfx12"]
+        );
+        add!(
+            "gemm_qkvza_q8_0_wmma_gfx12",
+            kernels::GEMM_QKVZA_Q8_0_WMMA_GFX12_SRC,
+            ["gemm_qkvza_q8_0_wmma_gfx12"]
+        );
+        add!(
+            "gemm_q8_0_residual_wmma_gfx12",
+            kernels::GEMM_Q8_0_RESIDUAL_WMMA_GFX12_SRC,
+            ["gemm_q8_0_residual_wmma_gfx12"]
+        );
+        add!(
+            "gemm_gate_up_q8_0_wmma_gfx12",
+            kernels::GEMM_GATE_UP_Q8_0_WMMA_GFX12_SRC,
+            ["gemm_gate_up_q8_0_wmma_gfx12"]
+        );
+        // HFQ3 prefill gate/up on gfx12 (`gemm_gate_up_hfq3g256_wmma`
+        // delegates here on RDNA4; the MB4 twin is gfx11-only).
+        add!(
+            "gemm_gate_up_hfq3g256_wmma_gfx12",
+            kernels::GEMM_GATE_UP_HFQ3G256_WMMA_GFX12_SRC,
+            ["gemm_gate_up_hfq3g256_wmma_gfx12"]
+        );
+        // DFlash draft full-attention WMMA tile, gfx12 lowering
+        // (`attention_dflash_wmma_f32`, attention.rs: `has_wmma_w32_gfx12`).
+        add!(
+            "attention_dflash_wmma_f32_gfx12",
+            kernels::ATTENTION_DFLASH_WMMA_GFX12_SRC,
+            ["attention_dflash_wmma_f32_gfx12"]
+        );
+
+        // Mixed-dtype grouped MoE WMMA: `gemm_mixed_moe_grouped_wmma_impl`
+        // picks the gfx12 module, or the coalesced twin (`..._coalesced`:
+        // speculative-verify windows over host-mapped routed projections).
+        add!(
+            "gemm_mixed_moe_grouped_wmma_gfx12",
+            kernels::GEMM_MIXED_MOE_GROUPED_WMMA_GFX12_SRC,
+            ["gemm_mixed_moe_grouped_wmma_gfx12"]
+        );
+        add!(
+            "gemm_mixed_moe_grouped_wmma_coalesced_gfx1201",
+            kernels::GEMM_MIXED_MOE_GROUPED_WMMA_COALESCED_GFX1201_SRC,
+            ["gemm_mixed_moe_grouped_wmma_coalesced_gfx1201"]
+        );
+        // `Gpu::gemm_gate_up_hfq4g256_wmma_gfx12` batch-tile family
+        // (`gfx12_bt_tile`: bt4 for N in [64,128), bt8 at multiples of 128,
+        // bt12 at multiples of 192 / N >= 192): one source, symbol == module.
+        // `HIPFIRE_GATE_UP_BT=0` and the `_ldsstage` module are developer-only.
+        add!(
+            "gemm_gate_up_hfq4g256_wmma_gfx12_bt4",
+            kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC,
+            ["gemm_gate_up_hfq4g256_wmma_gfx12_bt4"]
+        );
+        add!(
+            "gemm_gate_up_hfq4g256_wmma_gfx12_bt8",
+            kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC,
+            ["gemm_gate_up_hfq4g256_wmma_gfx12_bt8"]
+        );
+        add!(
+            "gemm_gate_up_hfq4g256_wmma_gfx12_bt12",
+            kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC,
+            ["gemm_gate_up_hfq4g256_wmma_gfx12_bt12"]
+        );
+    }
+    // FirstRequestJit coverage batch G (ClassifyGemmTuples / ClassifyGemvTuples
+    // holes): each module name, source expression and symbol is the one its
+    // launcher passes to `ensure_kernel` on the default route of that arch.
+    if arch == "gfx1151" {
+        add!(
+            "fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151",
+            kernels::FUSED_QKVZA_HFQ4G256_K2048_ALL_BUFFER_GFX1151_SRC,
+            ["fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151"]
+        );
+        add!(
+            "gemm_gate_up_hfq4g256_wmma_ldscoop_nosync",
+            kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_NOSYNC_SRC,
+            ["gemm_gate_up_hfq4g256_wmma_ldscoop_nosync"]
+        );
+        add!(
+            "gemm_hfq4g256_residual_wmma_k2",
+            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_K2_SRC,
+            ["gemm_hfq4g256_residual_wmma_k2"]
+        );
+        add!(
+            "gemm_hfq4g256_residual_wmma_k2x32",
+            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_K2X32_SRC,
+            ["gemm_hfq4g256_residual_wmma_k2x32"]
+        );
+        add!(
+            "gemm_hfq4g256_moe_grouped_mmq_gfx1151",
+            kernels::GEMM_HFQ4G256_MOE_GROUPED_MMQ_GFX1151_SRC,
+            ["gemm_hfq4g256_moe_grouped_mmq_gfx1151"]
+        );
+        add!(
+            "gemm_hfq6g256_moe_grouped_wmma_gfx1151",
+            kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX1151_SRC,
+            ["gemm_hfq6g256_moe_grouped_wmma_gfx1151"]
+        );
+        add!(
+            "gemm_mqv2_wmma_gfx1151_bt",
+            kernels::gemm_mqv2_wmma_gfx11_bt_src(true),
+            [
+                "gemm_qkvza_mq3g256v2_wmma_gfx11_bt4",
+                "gemm_qkvza_mq3g256v2_wmma_gfx11_bt12",
+                "gemm_qkv_mq3g256v2_wmma_gfx11_bt4",
+                "gemm_qkv_mq3g256v2_wmma_gfx11_bt12",
+                "gemm_gate_up_mq3g256v2_wmma_gfx11_bt12",
+                "gemm_gate_up_mq3g256v2_wmma_gfx11_bt6",
+                "gemm_mq3g256v2_residual_wmma_gfx11_bt4",
+                "gemm_mq3g256v2_residual_wmma_gfx11_bt6",
+                "gemm_mq3g256v2_residual_wmma_gfx11_bt8",
+                "gemm_qkvza_mq6g256v2_wmma_gfx11_bt4",
+                "gemm_qkvza_mq6g256v2_wmma_gfx11_bt12",
+                "gemm_qkv_mq6g256v2_wmma_gfx11_bt4",
+                "gemm_qkv_mq6g256v2_wmma_gfx11_bt12",
+                "gemm_gate_up_mq6g256v2_wmma_gfx11_bt12",
+                "gemm_gate_up_mq6g256v2_wmma_gfx11_bt6",
+                "gemm_mq6g256v2_residual_wmma_gfx11_bt4",
+                "gemm_mq6g256v2_residual_wmma_gfx11_bt6",
+                "gemm_mq6g256v2_residual_wmma_gfx11_bt8"
+            ]
+        );
+        add!(
+            "fused_rmsnorm_mq_rotate_i4_b8_gfx1151",
+            kernels::FUSED_RMSNORM_MQ_ROTATE_I4_B8_GFX1151_SRC,
+            ["fused_rmsnorm_mq_rotate_i4_b8_gfx1151"]
+        );
+        add!(
+            "fused_rmsnorm_mq_rotate_i4_fold_b8",
+            kernels::FUSED_RMSNORM_MQ_ROTATE_I4_FOLD_B8_SRC,
+            ["fused_rmsnorm_mq_rotate_i4_fold_b8"]
+        );
+        add!(
+            "gemv_hfq4g256_residual_rt_low_gfx1151",
+            kernels::GEMV_HFQ4G256_RESIDUAL_RT_LOW_GFX1151_SRC,
+            ["gemv_hfq4g256_residual_rt_low_gfx1151"]
+        );
+    }
+    if arch == "gfx1201" {
+        add!(
+            "gemm_f16_wmma_mb8_gfx12",
+            kernels::GEMM_F16_WMMA_MB8_GFX12_SRC,
+            ["gemm_f16_wmma_mb8_gfx12"]
+        );
+        add!(
+            "gemm_hfq6g256_moe_grouped_wmma_gfx12",
+            kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC,
+            ["gemm_hfq6g256_moe_grouped_wmma_gfx12"]
+        );
+        add!(
+            "gemm_mq6g256v2_moe_grouped_wmma_gfx12",
+            kernels::GEMM_MQ6G256V2_MOE_GROUPED_WMMA_GFX12_SRC,
+            ["gemm_mq6g256v2_moe_grouped_wmma_gfx12"]
+        );
+        add!(
+            "gemm_mq2g256_lloyd_moe_grouped_wmma_gfx12",
+            kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_GFX12_SRC,
+            ["gemm_mq2g256_lloyd_moe_grouped_wmma_gfx12"]
+        );
+        add!(
+            "gemm_qkv_hfq4g256_wmma_gfx12_mq3v2",
+            kernels::GEMM_QKV_MQ3G256V2_WMMA_GFX12_SRC,
+            ["gemm_qkv_mq3g256v2_wmma_gfx12"]
+        );
+        add!(
+            "gemm_qkv_hfq4g256_wmma_gfx12_mq6v2",
+            kernels::GEMM_QKV_MQ6G256V2_WMMA_GFX12_SRC,
+            ["gemm_qkv_mq6g256v2_wmma_gfx12"]
+        );
+        add!(
+            "gemm_qkv_mqv2_wmma_gfx1201_bt",
+            kernels::GEMM_QKV_MQV2_WMMA_GFX1201_BT_SRC,
+            ["gemm_qkv_mq6g256v2_wmma_gfx1201_bt8"]
+        );
+        add!(
+            "gemm_mq4g256v2_residual_mmq_iu4_gfx12_v3",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_V3_SRC,
+            [
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_v3",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_v3",
+                "quantize_int4_mmq_ds128"
+            ]
+        );
+        add!(
+            "fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab",
+            kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SLAB_SRC,
+            ["fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab"]
+        );
+        add!(
+            "fused_rmsnorm_mq_rotate_i4_gfx12_v2",
+            kernels::FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC,
+            ["fused_rmsnorm_mq_rotate_i4_gfx12_v2"]
+        );
+        add!(
+            "fused_silu_mul_mq_rotate_i4_gfx12",
+            kernels::FUSED_SILU_MUL_MQ_ROTATE_I4_GFX12_SRC,
+            ["fused_silu_mul_mq_rotate_i4_gfx12"]
+        );
+        add!(
+            "gated_norm_mq_rotate_i4_gfx12_v2_xbf16",
+            kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_V2_XBF16_SRC,
+            ["gated_norm_mq_rotate_i4_gfx12_v2_xbf16"]
+        );
+        add!(
+            "mq_rotate_x_awq_i4_gfx12",
+            kernels::MQ_ROTATE_X_AWQ_I4_GFX12_SRC,
+            ["rotate_x_mq_awq_i4_gfx12"]
+        );
+        add!(
+            "mq_rotate_x_i4_gfx12",
+            kernels::MQ_ROTATE_X_I4_GFX12_SRC,
+            ["mq_rotate_x_i4_gfx12"]
+        );
+    }
+    if arch == "gfx1100" {
+        add!(
+            "gemm_gate_up_hfq4g256_wmma",
+            kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC,
+            ["gemm_gate_up_hfq4g256_wmma"]
+        );
+        add!(
+            "gemm_hfq4g256_moe_grouped_mmq_gfx11_dgpu",
+            kernels::GEMM_HFQ4G256_MOE_GROUPED_MMQ_GFX11_DGPU_SRC,
+            ["gemm_hfq4g256_moe_grouped_mmq_gfx11_dgpu"]
+        );
+        add!(
+            "gemm_hfq6g256_moe_grouped_wmma_k2",
+            kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_K2_SRC,
+            ["gemm_hfq6g256_moe_grouped_wmma_k2"]
+        );
+        add!(
+            "fused_rmsnorm_mq_rotate_i4_b8",
+            kernels::FUSED_RMSNORM_MQ_ROTATE_I4_B8_SRC,
+            ["fused_rmsnorm_mq_rotate_i4_b8"]
+        );
+        add!(
+            "gated_norm_mq_rotate_k6144_gfx1100",
+            kernels::gated_norm_mq_rotate_k6144_gfx1100_src(),
+            ["gated_norm_mq_rotate_k6144_gfx1100"]
+        );
+        add!(
+            "gemv_hfq3g256_rdna3",
+            kernels::GEMV_HFQ3G256_GFX1100_SRC,
+            ["gemv_hfq3g256"]
+        );
+        add!(
+            "gemv_hfq3g256_residual_rdna3",
+            kernels::GEMV_HFQ3G256_RESIDUAL_GFX1100_SRC,
+            ["gemv_hfq3g256_residual"]
+        );
+        add!(
+            "gemv_hfq4g256_residual_stage_x32_gfx1100",
+            kernels::GEMV_HFQ4G256_RESIDUAL_STAGE_X32_GFX1100_SRC,
+            ["gemv_hfq4g256_residual"]
+        );
+        add!(
+            "gemv_hfq4g256_residual_sigmoid_buffer_gfx1100",
+            kernels::GEMV_HFQ4G256_RESIDUAL_SIGMOID_BUFFER_GFX1100_SRC,
+            ["gemv_hfq4g256_residual_sigmoid_scaled_gpu"]
+        );
+        add!(
+            "gemv_hfq4g256_moe_gate_up_indexed_cpol_slc",
+            kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_CPOL_SLC_GFX1100_SRC,
+            ["gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_slc"]
+        );
+    }
+    if matches!(arch, "gfx1100" | "gfx1151") {
+        add!(
+            "gemm_hfq4g256_residual_mmq",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
+            [
+                "gemm_hfq4g256_residual_mmq",
+                "gemm_hfq4g256_residual_mmq_full_add",
+                "quantize_q8_1_mmq_ds4"
+            ]
+        );
+        add!(
+            "gemm_mq6g256v2_moe_grouped_wmma_k2",
+            kernels::GEMM_MQ6G256V2_MOE_GROUPED_WMMA_K2_SRC,
+            ["gemm_mq6g256v2_moe_grouped_wmma_k2"]
+        );
+        add!(
+            "gemm_mq2g256_lloyd_moe_grouped_wmma_k2",
+            kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC,
+            ["gemm_mq2g256_lloyd_moe_grouped_wmma_k2"]
+        );
+        add!(
+            "gemm_gate_up_mq3g256v2_wmma",
+            kernels::GEMM_GATE_UP_MQ3G256V2_WMMA_SRC,
+            ["gemm_gate_up_mq3g256v2_wmma"]
+        );
+        add!(
+            "gemm_qkv_mq3g256v2_wmma",
+            kernels::GEMM_QKV_MQ3G256V2_WMMA_SRC,
+            ["gemm_qkv_mq3g256v2_wmma"]
+        );
+        add!(
+            "gemm_qkvza_mq3g256v2_wmma",
+            kernels::GEMM_QKVZA_MQ3G256V2_WMMA_SRC,
+            ["gemm_qkvza_mq3g256v2_wmma"]
+        );
+        add!(
+            "gemm_mq3g256v2_residual_wmma",
+            kernels::GEMM_MQ3G256V2_RESIDUAL_WMMA_SRC,
+            ["gemm_mq3g256v2_residual_wmma"]
+        );
+        add!(
+            "gemm_gate_up_mq6g256v2_wmma",
+            kernels::GEMM_GATE_UP_MQ6G256V2_WMMA_SRC,
+            ["gemm_gate_up_mq6g256v2_wmma"]
+        );
+        add!(
+            "gemm_qkv_mq6g256v2_wmma",
+            kernels::GEMM_QKV_MQ6G256V2_WMMA_SRC,
+            ["gemm_qkv_mq6g256v2_wmma"]
+        );
+        add!(
+            "gemm_qkvza_mq6g256v2_wmma",
+            kernels::GEMM_QKVZA_MQ6G256V2_WMMA_SRC,
+            ["gemm_qkvza_mq6g256v2_wmma"]
+        );
+        add!(
+            "fused_silu_mul_mq_rotate_i4",
+            kernels::FUSED_SILU_MUL_MQ_ROTATE_I4_SRC,
+            ["fused_silu_mul_mq_rotate_i4"]
+        );
+        add!(
+            "mq_rotate_x_awq_i4",
+            kernels::MQ_ROTATE_X_AWQ_I4_SRC,
+            ["rotate_x_mq_awq_i4"]
+        );
+    }
+    if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201") {
+        add!(
+            "gemm_mq4g128v2_multirow_gfx1151",
+            kernels::GEMM_MQ4G128V2_MULTIROW_GFX1151_SRC,
+            ["gemm_mq4g128v2_multirow_gfx1151"]
+        );
+        add!(
+            "gemv_mq4g128v2",
+            kernels::GEMV_MQ4G128V2_SRC,
+            ["gemv_mq4g128v2"]
+        );
+        add!(
+            "moe_topk_renorm_top10_batched",
+            kernels::MOE_TOPK_RENORM_TOP10_BATCHED_SRC,
+            [
+                "moe_topk_renorm_top10_batched",
+                "moe_router_logits_guard_top10"
+            ]
+        );
+        add!(
+            "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
+            kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC,
+            ["gemv_hfq4g256_moe_down_k8_indexed_batched_expanded"]
+        );
+        add!(
+            "gemv_mq2g256_lloyd_moe_down_indexed",
+            kernels::GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_SRC,
+            ["gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed"]
+        );
+        add!(
+            "gemv_mq2g256_lloyd_moe_gate_up_indexed",
+            kernels::GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_SRC,
+            ["gemv_mq2g256_lloyd_moe_gate_up_k8_indexed"]
+        );
+        add!(
+            "gemv_mq3g256_lloyd_moe_down_indexed",
+            kernels::GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_SRC,
+            ["gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexed"]
+        );
+    }
+    if matches!(arch, "gfx1151" | "gfx1201") {
+        add!(
+            "gemv_hfq3g256",
+            kernels::GEMV_HFQ3G256_SRC,
+            ["gemv_hfq3g256"]
+        );
+        add!(
+            "gemv_hfq3g256_residual",
+            kernels::GEMV_HFQ3G256_RESIDUAL_SRC,
+            ["gemv_hfq3g256_residual"]
+        );
+        add!(
+            "gemv_hfq4g256_multirow_default_mq3v2",
+            kernels::GEMV_MQ3G256V2_MULTIROW_SRC,
+            ["gemv_mq3g256v2_multirow_r2"]
+        );
+    }
+    if arch == "gfx1100" {
+        add!(
+            "gemm_mq4g256v2_residual_mmq_iu4_gfx11_symfold",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX11_SYMFOLD_SRC,
+            [
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100_symfold"
+            ]
+        );
+    }
+    if arch == "gfx1151" {
+        add!(
+            "gemm_mq4g256v2_residual_mmq_iu4_gfx11_symfold",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX11_SYMFOLD_SRC,
+            [
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151_symfold",
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151_symfold"
+            ]
+        );
+    }
+    // `moe_down_combine_rmsnorm_mq_rotate_vecsum_*` (moe.rs): the exact-arch
+    // down+combine+RMSNorm+rotate tails, previously only in
+    // `default_route_entries`; the symbols are those launchers' own.
+    if arch == "gfx1100" {
+        add!(
+            "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1100",
+            kernels::MOE_DOWN_COMBINE_RMSNORM_MQ_ROTATE_VECSUM_GFX1100_SRC,
+            ["moe_down_combine_rmsnorm_mq_rotate_vecsum"]
+        );
+    }
+    if arch == "gfx1151" {
+        add!(
+            "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151",
+            kernels::MOE_DOWN_COMBINE_RMSNORM_MQ_ROTATE_VECSUM_GFX1151_SRC,
+            ["moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151"]
+        );
+    }
+    // Sampled DFlash host-accept fallback on gfx1201 (the device accept path
+    // is the default there; `dflash_target_rows_into` is the host fallback).
+    if arch == "gfx1201" {
+        add!(
+            "sampled_rows_compact",
+            crate::sampled_rows_compact::SAMPLED_ROWS_COMPACT_SRC,
+            ["sampled_rows_compact_f32"]
+        );
+    }
+    // MQ4V2 weight-reuse batch-tile modules (`mqv2_prefill_batch_tile`): under
+    // the gfx1100/gfx1151 batch >= 64 IU4/A8/Q8_1 MMQ guard they are reached
+    // for N < 64 launches whose `route_rows` is >= 96 (Qwen4 prefill-invariant
+    // scope, default Flash-Next), and on gfx1201 the QKV BT8 tile when the IU4
+    // route does not take the launch. Module name per arch as each launcher
+    // names it; symbols are every arm the launcher can select.
+    if arch == "gfx1100" {
+        add!(
+            "gemm_qkvza_mq4g256v2_wmma_gfx11_bt",
+            kernels::GEMM_QKVZA_MQ4G256V2_WMMA_GFX11_BT_SRC,
+            [
+                "gemm_qkvza_mq4g256v2_wmma_gfx11_bt4",
+                "gemm_qkvza_mq4g256v2_wmma_gfx11_bt12"
+            ]
+        );
+        add!(
+            "gemm_qkv_mq4g256v2_wmma_gfx11_bt",
+            kernels::GEMM_QKV_MQ4G256V2_WMMA_GFX11_BT_SRC,
+            [
+                "gemm_qkv_mq4g256v2_wmma_gfx11_bt4",
+                "gemm_qkv_mq4g256v2_wmma_gfx11_bt12"
+            ]
+        );
+        add!(
+            "gemm_gate_up_mq4g256v2_wmma_gfx11_bt",
+            kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX11_BT_SRC,
+            [
+                "gemm_gate_up_mq4g256v2_wmma_gfx11_bt6",
+                "gemm_gate_up_mq4g256v2_wmma_gfx11_bt12"
+            ]
+        );
+        add!(
+            "gemm_mq4g256v2_residual_wmma_gfx11_bt",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX11_BT_SRC,
+            [
+                "gemm_mq4g256v2_residual_wmma_gfx11_bt4",
+                "gemm_mq4g256v2_residual_wmma_gfx11_bt6",
+                "gemm_mq4g256v2_residual_wmma_gfx11_bt8"
+            ]
+        );
+    }
+    if arch == "gfx1151" {
+        add!(
+            "gemm_qkvza_mq4g256v2_wmma_gfx1151_bt",
+            kernels::GEMM_QKVZA_MQ4G256V2_WMMA_GFX11_BT_SRC,
+            [
+                "gemm_qkvza_mq4g256v2_wmma_gfx11_bt4",
+                "gemm_qkvza_mq4g256v2_wmma_gfx11_bt12"
+            ]
+        );
+        add!(
+            "gemm_qkv_mq4g256v2_wmma_gfx1151_bt",
+            kernels::GEMM_QKV_MQ4G256V2_WMMA_GFX11_BT_SRC,
+            [
+                "gemm_qkv_mq4g256v2_wmma_gfx11_bt4",
+                "gemm_qkv_mq4g256v2_wmma_gfx11_bt12"
+            ]
+        );
+        add!(
+            "gemm_gate_up_mq4g256v2_wmma_gfx1151_bt",
+            kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX11_BT_SRC,
+            [
+                "gemm_gate_up_mq4g256v2_wmma_gfx11_bt6",
+                "gemm_gate_up_mq4g256v2_wmma_gfx11_bt12"
+            ]
+        );
+        add!(
+            "gemm_mq4g256v2_residual_wmma_gfx1151_bt",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX11_BT_SRC,
+            [
+                "gemm_mq4g256v2_residual_wmma_gfx11_bt4",
+                "gemm_mq4g256v2_residual_wmma_gfx11_bt6",
+                "gemm_mq4g256v2_residual_wmma_gfx11_bt8"
+            ]
+        );
+    }
+    if arch == "gfx1201" {
+        add!(
+            "gemm_qkv_mq4g256v2_wmma_gfx1201_bt",
+            kernels::GEMM_QKV_MQ4G256V2_WMMA_GFX1201_BT_SRC,
+            [
+                "gemm_qkv_mq4g256v2_wmma_gfx1201_bt4",
+                "gemm_qkv_mq4g256v2_wmma_gfx1201_bt8",
+                "gemm_qkv_mq4g256v2_wmma_gfx1201_bt12"
+            ]
+        );
+    }
     Ok(entries)
 }
 
@@ -4905,15 +6203,14 @@ pub fn validate_route_plan(plan: &RouteKernelPlan) -> Result<(), RegistryError> 
 //
 // A route without a closed plan (a refused option, a layout no walk covers,
 // an open walked plan whose walks missed a rung) still has a predictable
-// kernel set: the modules a kernel-load trace of its family compiled, plus
-// every module a compatible walked plan bound. [`predicted_kernels`] resolves
-// those module names to the exact registry recipes (the installer inventory,
-// never another arch's source) so a loader can compile them before ready
-// instead of at the first request. Compiling is always safe; binding a symbol
-// into the loader's function cache is not: that cache is keyed by symbol name
-// alone, so a symbol two registry modules export (or one an embedded image
-// exports) could return the wrong image to a launcher that asked for the
-// other. Only symbols with exactly one registry owner are bound.
+// kernel set: the arch's whole installer inventory. [`predicted_kernels`]
+// resolves it to the exact registry recipes (never another arch's source) so
+// a loader can compile it before ready instead of at the first request.
+// Compiling is always safe; binding a symbol into the loader's function
+// cache is not: that cache is keyed by symbol name alone, so a symbol two
+// registry modules export (or one an embedded image exports) could return
+// the wrong image to a launcher that asked for the other. Only symbols a
+// family trace proved, with exactly one registry owner, are bound.
 
 /// One kernel-load trace fixture and the model archs it describes.
 struct FamilyTrace {
@@ -4936,25 +6233,24 @@ const FAMILY_TRACES: &[FamilyTrace] = &[
     },
 ];
 
-/// How a predicted module set was chosen.
+/// How a predicted module set was chosen. Both compile the arch's whole
+/// installer inventory; they differ in what binds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PredictionBasis {
-    /// The family's trace rows on this exact arch plus compatible walked HIP
-    /// rows: modules the runtime was observed to compile, symbols it bound.
-    FamilyTrace,
-    /// No trustworthy trace for this load: the loader did not recognise an
-    /// exact closed or walked plan (`exact_plan` false), the family is
-    /// unknown, or its fixture has no rows for this arch (names are never
-    /// borrowed across arches). This arch's whole installer inventory,
-    /// compile only (nothing is bound).
-    ConservativeArchInventory,
+    /// The loader recognised an exact plan of a family whose trace has rows
+    /// for this arch: the symbols the trace and matching walked rows proved
+    /// bind eagerly (conflict-free subset), everything else compile only.
+    ArchInventoryFamilyBindings,
+    /// No proof for this load (unrecognised or refused route, unknown
+    /// family, or no trace rows for this arch): nothing is bound.
+    ArchInventoryCompileOnly,
 }
 
 impl PredictionBasis {
     pub fn label(self) -> &'static str {
         match self {
-            Self::FamilyTrace => "family-trace",
-            Self::ConservativeArchInventory => "conservative-arch-inventory",
+            Self::ArchInventoryFamilyBindings => "arch-inventory (family-proven bindings)",
+            Self::ArchInventoryCompileOnly => "arch-inventory compile-only",
         }
     }
 }
@@ -4970,10 +6266,8 @@ pub struct PredictKernelInput<'a> {
     pub pm_decode: bool,
     /// True only when the loader recognised this exact header layout, arch
     /// and policy axes as a closed or walked route plan (`planned` is that
-    /// plan). A family trace proves coverage for the layouts it was walked
-    /// on, not for the family: every other load (a refused or unrecognised
-    /// route, a DFlash/vision/other-codec/feature variant) is predicted as
-    /// the arch's whole installer inventory, compile-only.
+    /// plan). Only then may the family trace choose which symbols bind
+    /// eagerly; the compile set is the arch's whole inventory either way.
     pub exact_plan: bool,
 }
 
@@ -4990,7 +6284,7 @@ pub struct PredictedKernels {
     pub family: &'static str,
     pub basis: PredictionBasis,
     pub modules: Vec<PredictedModule>,
-    /// Names the family selected but the set leaves out, with the reason
+    /// Inventory modules the set leaves out, with the reason
     /// (already in the route plan, accepted pm_decode twin, ambiguous or
     /// stale recipe).
     pub omitted: Vec<(&'static str, &'static str)>,
@@ -5042,22 +6336,20 @@ fn traced_symbols(
 /// resolved to exact registry recipes and minus everything `planned` already
 /// covers. Pure CPU: no weight payload, compiler or HIP call.
 ///
-/// Selection: only a load whose exact header layout, arch and policy axes
-/// the loader recognised as a route plan (`exact_plan`) may use its family's
-/// trace: that family's trace rows for `arch` plus every HIP row of the
-/// walked plans for that model arch and arch (any layout, any spec route; a
-/// row whose recorded source hash no longer matches the registry is omitted
-/// as stale). A trace covers the layouts it was walked on, not the family,
-/// so every other load (refused or unrecognised route, another codec,
-/// DFlash, vision, non-default features), a family with no rows for `arch`,
-/// and an unknown family are the arch's whole installer inventory,
-/// compile-only: no module names are ever borrowed from another arch.
+/// Compile set: always the arch's whole installer inventory. An open plan is
+/// open exactly because its walks were incomplete, and a family trace covers
+/// the layouts it was walked on, not the family, so no subset of the
+/// inventory is trusted to be enough (another codec, DFlash, vision, an AR
+/// plan's MTP fallback, a kernel registered after the walk).
 ///
-/// Binding: only symbols the trace or a walk observed from the module, and
-/// only when every registry corpus entry that exports them belongs to that
-/// module and no embedded image or `planned` entry of another module
-/// exports them. Modules whose recipe differs between corpus entries are
-/// omitted outright.
+/// Bind set: the trace is trusted only to choose which symbols bind eagerly.
+/// Only for an exact plan (`exact_plan`) of a traced family with rows for
+/// `arch`: the symbols those rows and the matching walked HIP rows observed
+/// (a walked row whose source hash no longer matches proves nothing), and
+/// only when every registry corpus entry that exports a symbol belongs to
+/// its module and no embedded image or `planned` entry of another module
+/// exports it. Everything else compiles only. Modules whose recipe differs
+/// between corpus entries are omitted outright.
 pub fn predicted_kernels(
     input: &PredictKernelInput<'_>,
     planned: &RouteKernelPlan,
@@ -5071,45 +6363,28 @@ pub fn predicted_kernels(
     let trace = input
         .model_arch
         .and_then(|id| FAMILY_TRACES.iter().find(|t| t.model_archs.contains(&id)));
-    let mut names: BTreeSet<&'static str> = BTreeSet::new();
-    // Symbols a trace row or a walked row proved for each module.
+    // Compile set: always the arch's whole installer inventory. Binding set:
+    // only symbols a family trace row or a matching walked row proved.
+    let names: BTreeSet<&'static str> = inventory.iter().map(|e| e.module).collect();
     let mut proven: HashMap<&'static str, BTreeSet<&'static str>> = HashMap::new();
-    let (family, basis) = match trace {
-        None => {
-            names.extend(inventory.iter().map(|e| e.module));
-            ("unknown-family", PredictionBasis::ConservativeArchInventory)
+    let family = trace.map_or("unknown-family", |t| t.family);
+    if let (Some(trace), true) = (trace, input.exact_plan) {
+        for (module, symbols) in traced_symbols(trace.fixture, input.arch) {
+            proven.entry(module).or_default().extend(symbols);
         }
-        Some(trace) => {
-            let own = traced_symbols(trace.fixture, input.arch);
-            if own.is_empty() || !input.exact_plan {
-                names.extend(inventory.iter().map(|e| e.module));
-                (trace.family, PredictionBasis::ConservativeArchInventory)
-            } else {
-                for (module, symbols) in own {
-                    names.insert(module);
-                    proven.entry(module).or_default().extend(symbols);
-                }
-                if let Some(model_arch) = input.model_arch {
-                    for plan in walked_route_plans()?
-                        .iter()
-                        .filter(|p| p.model_arch == model_arch && p.arch == input.arch)
-                    {
-                        for row in plan.rows.iter().filter(|row| !row.embedded) {
-                            let Some(found) = by_name.get(row.module) else {
-                                omitted
-                                    .push((row.module, "walked module missing from the registry"));
-                                continue;
-                            };
-                            if format!("{:x}", Sha256::digest(found.source.as_bytes()))
-                                != row.sha256
-                            {
-                                omitted.push((
-                                    found.module,
-                                    "walked source hash differs from the registry",
-                                ));
-                                continue;
-                            }
-                            names.insert(found.module);
+        // A walked row proves its symbols only while its recorded source
+        // still matches the registry; a stale row proves nothing.
+        if !proven.is_empty() {
+            if let Some(model_arch) = input.model_arch {
+                for plan in walked_route_plans()?
+                    .iter()
+                    .filter(|p| p.model_arch == model_arch && p.arch == input.arch)
+                {
+                    for row in plan.rows.iter().filter(|row| !row.embedded) {
+                        let Some(found) = by_name.get(row.module) else {
+                            continue;
+                        };
+                        if format!("{:x}", Sha256::digest(found.source.as_bytes())) == row.sha256 {
                             proven
                                 .entry(found.module)
                                 .or_default()
@@ -5117,9 +6392,13 @@ pub fn predicted_kernels(
                         }
                     }
                 }
-                (trace.family, PredictionBasis::FamilyTrace)
             }
         }
+    }
+    let basis = if proven.is_empty() {
+        PredictionBasis::ArchInventoryCompileOnly
+    } else {
+        PredictionBasis::ArchInventoryFamilyBindings
     };
 
     // Symbol ownership across every launcher source the registry knows, and
@@ -5149,7 +6428,7 @@ pub fn predicted_kernels(
     }
     // Names embedded images bind into the same function cache.
     let mut foreign: HashSet<&'static str> = HashSet::new();
-    if basis != PredictionBasis::ConservativeArchInventory {
+    if !proven.is_empty() {
         foreign.extend(
             crate::pm_decode_twins::GFX1201_TWINS
                 .iter()
@@ -5238,14 +6517,8 @@ fn route_corpus(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regis
     all.extend(default_route_entries(arch, extra_flags)?);
     let arch = all.first().map(|e| e.arch).unwrap_or("");
     if arch == "gfx1201" {
-        // norm.rs `softmax_temp_topp_batched_into_f32` (MTP temperature verify).
-        all.push(entry(
-            arch,
-            "softmax_temp_topp_batched",
-            &["softmax_temp_topp_batched_f32"],
-            kernels::SOFTMAX_TEMP_BATCHED_SRC.into(),
-            extra_flags,
-        ));
+        // `softmax_temp_topp_batched` (norm.rs `softmax_temp_topp_batched_into_f32`,
+        // MTP temperature verify) is in the installer inventory.
         // VMM continuous batching exact route (forward_slots/vmm/exact.rs):
         // the batched VMM KV write and row-batched flash decode, and the
         // rows-batched singleton twins — the launchers' own module sources.
@@ -5525,6 +6798,7 @@ fn qwen36_27b_plain_rotate(input: &RouteKernelInput<'_>) -> Qwen36PlainRotate {
 const WALKED_ROUTE_PLAN_FILES: &[&str] = &[
     include_str!("route_plans/qwen3.8-flash-next.gfx1201.tsv"),
     include_str!("route_plans/qwen3.8-flash-next-base.mq4-xts.gfx1201.tsv"),
+    include_str!("route_plans/qwen3.8-flash-next-base.mq2-xts.gfx1201.tsv"),
 ];
 
 /// One parsed `route_plans/*.tsv`.
@@ -7243,11 +8517,34 @@ mod tests {
         // `gemm_mq4g256v2_overwrite_wmma_gfx12_vt` (default draft lm_head and
         // projections; the 27B draft cold-compiled them) and the DFlash verify
         // tape-capture copy `tape_copy_batched` plus the lane-batched CB verify
-        // conv `conv1d_silu_split_f32_lanes` (exact-gfx1201 route) are additional to P0's 92. Existing
+        // conv `conv1d_silu_split_f32_lanes` (exact-gfx1201 route) and the
+        // `bf16_round_trip` storage-boundary kernel and the one hundred sixteen
+        // FirstRequestJit modules (batch 1, cell R4, hold frj-disc-r4-v2-01:
+        // fused/gfx12 Q8_0 QKV, QKVZA and residual projections, the
+        // gate/up bt4/bt8/bt12 family, grouped and coalesced mixed-MoE WMMA,
+        // the mixed-MoE gate/up and expanded-down GEMVs, the scaled residual
+        // GEMV and the batched Q8_0 flash tile; coverage batch A: the MQ4V2
+        // and BF16 batched embeddings, the Q8_0 decode fused gate/up and its
+        // gfx12 WMMA prefill twin; coverage batch B: the HFQ6 scalar gate/up,
+        // the HFQ3 gfx12 WMMA gate/up; coverage
+        // batch C: the DFlash WMMA attention tiles, the uniform HFQ6/MQ6V2
+        // MoE decode GEMVs and the HFQ4/MQ6V2 nine-path d4 decode; coverage
+        // batch D: sampled-DFlash categorical/chain-accept, the softmax-temp
+        // top-p batch kernel (formerly route-only on gfx1201), HFQ3 gfx12
+        // QKV/QKVZA/residual WMMA, MQ6V2/MQ3V2 fused decode projections, the
+        // Q8_0 batched GEMM and the HFQ4 scalar prefill fallbacks; coverage
+        // batch E: the MQ6 v1 plain residual GEMM and the DFlash F32 batched
+        // GEMM; coverage batch F: the gfx12 MQ4V2 FP8 activation packers;
+        // discovery batch R7: the HFQ4 grouped MoE WMMA, the residual and
+        // QKVZA bt4/bt8/bt12 families and the HFQ4 gate/up indexed GEMV;
+        // cells R11/R13 and the dynamic MQ6V2/MQ3V2 gfx12 GEMM `_mq5v2`
+        // families, Q8 multi-row/AWQ-reduce attention; coverage batch G: the
+        // classified gemm/gemv tuple holes and the gfx1201 MQ4V2 QKV BT tile) are
+        // additional to P0's 92. Existing
         // module digests above remain unchanged.
         assert_eq!(
             registry.len(),
-            count + 160,
+            count + 277,
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
@@ -7698,6 +8995,81 @@ mod tests {
         }
     }
 
+    /// `Gpu::bf16_round_trip_f32` (norm.rs) passes module `bf16_round_trip`,
+    /// source `kernels::BF16_ROUND_TRIP_SRC` and symbol `bf16_round_trip_f32`
+    /// to `ensure_kernel` on every call (Qwen4 MoE / dense-FFN / QSA storage
+    /// boundaries, dots.ocr). The kernel has no arch guard and the launcher no
+    /// arch gate, so every inventory carries it, with the compiler's recipe.
+    #[test]
+    fn bf16_round_trip_matches_launcher_and_compiler() {
+        for arch in SUPPORTED_ARCHES {
+            for extra_flags in ["", "-DIU4_A4_CANDIDATES=2"] {
+                let entry = lookup(arch, "bf16_round_trip", extra_flags)
+                    .unwrap_or_else(|e| panic!("{arch}: bf16_round_trip not packaged: {e:?}"));
+                assert_eq!(entry.symbols, ["bf16_round_trip_f32"], "{arch}");
+                assert_eq!(entry.source(), kernels::BF16_ROUND_TRIP_SRC, "{arch}");
+                let recipe = KernelCompiler::recipe_for_source(
+                    arch,
+                    "bf16_round_trip",
+                    kernels::BF16_ROUND_TRIP_SRC,
+                    extra_flags,
+                );
+                assert_eq!(entry.flags, recipe.flags, "{arch}: {extra_flags}");
+                assert_eq!(
+                    entry.scheduler_profile, recipe.scheduler_profile,
+                    "{arch}: {extra_flags}"
+                );
+            }
+            // The strided Qwen4 sibling is a different module and source.
+            assert_ne!(
+                kernels::BF16_ROUND_TRIP_SRC,
+                kernels::QWEN4_BF16_ROUND_TRIP_SRC
+            );
+        }
+    }
+
+    /// The QSA gathered F16 WMMA module (`tensor_ops::qsa_gathered_wmma_launch_with`,
+    /// the F16 arena producer) is requested on gfx1151, its only route arch
+    /// (`qsa_gathered_wmma_enabled`: F32/Q8 K/V); it was compiled after `ready`
+    /// by the first request of a Halo Flash-Next MQ4 load. Its gfx1151 source,
+    /// recipe and every launched symbol are packaged, and no other arch carries it.
+    #[test]
+    fn qsa_gathered_wmma_is_packaged_on_gfx1151() {
+        for extra_flags in ["", "-DIU4_A4_CANDIDATES=2"] {
+            let entry = lookup("gfx1151", "indexed_attention_gathered_wmma", extra_flags)
+                .unwrap_or_else(|e| panic!("gathered QSA module not packaged: {e:?}"));
+            assert_eq!(
+                entry.symbols,
+                [
+                    "indexed_attention_gathered_wmma_f16",
+                    "indexed_attention_kv_f16vb",
+                    "indexed_attention_kv_f16vb_q8",
+                ]
+            );
+            assert_eq!(
+                entry.source(),
+                crate::tensor_ops::INDEXED_ATTENTION_GATHERED_WMMA_SRC
+            );
+            let recipe = KernelCompiler::recipe_for_source(
+                "gfx1151",
+                "indexed_attention_gathered_wmma",
+                crate::tensor_ops::INDEXED_ATTENTION_GATHERED_WMMA_SRC,
+                extra_flags,
+            );
+            assert_eq!(entry.flags, recipe.flags, "{extra_flags}");
+            assert_eq!(
+                entry.scheduler_profile, recipe.scheduler_profile,
+                "{extra_flags}"
+            );
+        }
+        for arch in SUPPORTED_ARCHES.iter().filter(|arch| **arch != "gfx1151") {
+            assert!(
+                lookup(arch, "indexed_attention_gathered_wmma", "").is_err(),
+                "{arch}: gathered QSA module leaked"
+            );
+        }
+    }
+
     /// Every module a kernel-load trace loaded (rows: arch, module, symbols the
     /// run resolved) is in that arch's installer inventory and exports every
     /// resolved symbol, so a compiler-free pack serves the whole traced run.
@@ -7738,6 +9110,15 @@ mod tests {
         assert_trace_packaged(include_str!("../tests/fixtures/kernel-trace-qwen35.tsv"));
     }
 
+    /// Every module the FirstRequestJit discovery holds (fresh kernel cache,
+    /// product defaults, diverse first requests) compiled after `ready`.
+    #[test]
+    fn first_request_discovery_is_packaged() {
+        assert_trace_packaged(include_str!(
+            "../tests/fixtures/kernel-trace-first-request.tsv"
+        ));
+    }
+
     const FN_TRACE: &str = include_str!("../tests/fixtures/kernel-trace-qwen4-flash-next.tsv");
     const Q35_TRACE: &str = include_str!("../tests/fixtures/kernel-trace-qwen35.tsv");
 
@@ -7766,11 +9147,14 @@ mod tests {
         }
     }
 
-    /// A traced family on an arch with trace rows predicts exactly those
-    /// modules (a strict subset of the arch inventory), each with the
-    /// registry's own recipe for that arch.
+    /// An exact open plan of a traced family compiles the arch's WHOLE
+    /// inventory minus the plan: the open plan's walks are incomplete by
+    /// definition, so no traced subset is trusted to be enough. Every recipe
+    /// is the registry's own for that arch, modules the trace and walks never
+    /// saw (another codec, a newly registered kernel) are in, and only
+    /// trace- or walk-proven symbols bind.
     #[test]
-    fn predicted_family_is_the_traced_union_with_exact_recipes() {
+    fn exact_open_plan_compiles_whole_inventory_and_binds_only_proven() {
         for (arch, model_arch, fixture) in [
             ("gfx1151", 16, FN_TRACE),
             ("gfx1201", 16, FN_TRACE),
@@ -7781,28 +9165,49 @@ mod tests {
             let predicted = predict(arch, Some(model_arch), false, &no_plan());
             assert_eq!(
                 predicted.basis,
-                PredictionBasis::FamilyTrace,
+                PredictionBasis::ArchInventoryFamilyBindings,
                 "{arch} {model_arch}"
             );
-            let inventory = entries(arch, "").unwrap();
-            assert!(
-                predicted.modules.len() < inventory.len(),
-                "{arch}: not the whole inventory"
+            assert_eq!(
+                predicted.basis.label(),
+                "arch-inventory (family-proven bindings)"
             );
-            for module in traced_symbols(fixture, arch).into_keys() {
-                match predicted.modules.iter().find(|m| m.entry.module == module) {
-                    Some(found) => {
-                        let registry = inventory.iter().find(|e| e.module == module).unwrap();
-                        assert_eq!(found.entry.arch, arch);
-                        assert_eq!(found.entry.source, registry.source, "{arch} {module}");
-                        assert_eq!(found.entry.flags, registry.flags, "{arch} {module}");
-                        assert_eq!(found.entry.symbols, registry.symbols, "{arch} {module}");
-                        assert_eq!(found.entry.scheduler_profile, registry.scheduler_profile);
-                    }
-                    None => assert!(
-                        predicted.omitted.iter().any(|(m, _)| *m == module),
-                        "{arch} {model_arch}: traced module {module} neither predicted nor omitted"
-                    ),
+            let inventory = entries(arch, "").unwrap();
+            let mut distinct: Vec<_> = inventory.iter().map(|e| e.module).collect();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert_eq!(
+                predicted.modules.len() + predicted.omitted.len(),
+                distinct.len(),
+                "{arch} {model_arch}: every inventory module is predicted or omitted with a reason"
+            );
+            let traced = traced_symbols(fixture, arch);
+            assert!(
+                predicted
+                    .modules
+                    .iter()
+                    .any(|m| !traced.contains_key(m.entry.module)),
+                "{arch} {model_arch}: modules the trace never saw must still compile"
+            );
+            for module in &predicted.modules {
+                let registry = inventory
+                    .iter()
+                    .find(|e| e.module == module.entry.module)
+                    .unwrap();
+                let name = module.entry.module;
+                assert_eq!(module.entry.arch, arch);
+                assert_eq!(module.entry.source, registry.source, "{arch} {name}");
+                assert_eq!(module.entry.flags, registry.flags, "{arch} {name}");
+                assert_eq!(module.entry.symbols, registry.symbols, "{arch} {name}");
+                assert_eq!(module.entry.scheduler_profile, registry.scheduler_profile);
+                // Modules the trace never saw bind nothing.
+                let walked = walked_route_plans()
+                    .unwrap()
+                    .iter()
+                    .filter(|p| p.model_arch == model_arch && p.arch == arch)
+                    .any(|p| p.rows.iter().any(|r| r.module == name));
+                if !traced.contains_key(name) && !walked {
+                    assert!(module.bind.is_empty(), "{arch} {name}: unproven bind");
                 }
             }
             let mut names: Vec<_> = predicted.modules.iter().map(|m| m.entry.module).collect();
@@ -7813,8 +9218,8 @@ mod tests {
         }
     }
 
-    /// Every HIP row of the walked plans for the family and arch joins the
-    /// prediction (or is omitted with a reason) even when the trace lacks it.
+    /// Every HIP row of the walked plans for the family and arch is
+    /// predicted (or omitted with a reason) even when the trace lacks it.
     #[test]
     fn predicted_family_includes_walked_hip_rows() {
         let predicted = predict("gfx1201", Some(16), false, &no_plan());
@@ -7840,16 +9245,73 @@ mod tests {
         assert!(checked > 0, "no walked HIP rows checked");
     }
 
+    /// Every row of every checked-in walked plan (each layout, arch and spec
+    /// route, including plans with no header fixture such as the split mq2
+    /// Flash-Next plan) resolves the way `walked_route_entries_in` resolves
+    /// it at load: a HIP row to exactly one inventory recipe with the walked
+    /// source SHA-256 and every walked symbol (so the release pack serves
+    /// it), an embedded row to a runtime image with the walked image SHA-256.
+    #[test]
+    fn every_walked_plan_row_resolves_with_its_walked_identity() {
+        let plans = walked_route_plans().unwrap();
+        assert!(plans.len() >= 3, "walked plans missing");
+        for plan in plans {
+            let flags = default_feature_flags(plan.arch).unwrap();
+            let inventory = entries(plan.arch, &flags.hipcc_extra_flags).unwrap();
+            for native_mtp in [false, true] {
+                let rows: Vec<_> = plan
+                    .rows
+                    .iter()
+                    .filter(|row| row.native_mtp == native_mtp)
+                    .collect();
+                let what = format!("{} {} native_mtp={native_mtp}", plan.layout, plan.arch);
+                assert!(rows.iter().any(|row| !row.embedded), "{what}: no HIP rows");
+                for row in rows {
+                    if row.embedded {
+                        let (_, image, _) =
+                            walked_embedded_image(plan.arch, row.module, row.sha256)
+                                .unwrap_or_else(|| panic!("{what}: no image for {}", row.module));
+                        assert_eq!(
+                            format!("{:x}", Sha256::digest(image)),
+                            row.sha256,
+                            "{what}: {} image",
+                            row.module
+                        );
+                        continue;
+                    }
+                    let found: Vec<_> = inventory
+                        .iter()
+                        .filter(|e| e.module == row.module)
+                        .collect();
+                    assert_eq!(found.len(), 1, "{what}: {} recipes", row.module);
+                    assert_eq!(
+                        format!("{:x}", Sha256::digest(found[0].source.as_bytes())),
+                        row.sha256,
+                        "{what}: {} source",
+                        row.module
+                    );
+                    for symbol in &row.symbols {
+                        assert!(
+                            found[0].symbols.contains(symbol),
+                            "{what}: {} lacks {symbol}",
+                            row.module
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// A traced family on an arch its fixture has no rows for is never
     /// completed from another arch's names: the whole inventory, compile-only.
     #[test]
-    fn traced_family_without_arch_rows_is_conservative_not_borrowed() {
+    fn traced_family_without_arch_rows_compiles_whole_inventory_without_borrowing() {
         assert!(
             traced_symbols(FN_TRACE, "gfx1100").is_empty(),
             "fixture grew gfx1100 rows"
         );
         let predicted = predict("gfx1100", Some(16), false, &no_plan());
-        assert_eq!(predicted.basis, PredictionBasis::ConservativeArchInventory);
+        assert_eq!(predicted.basis, PredictionBasis::ArchInventoryCompileOnly);
         assert_eq!(predicted.family, "qwen3.8-flash-next");
         assert_eq!(predicted.bound_symbols(), 0);
         let inventory = entries("gfx1100", "").unwrap();
@@ -7891,7 +9353,7 @@ mod tests {
                 .unwrap();
                 assert_eq!(
                     predicted.basis,
-                    PredictionBasis::ConservativeArchInventory,
+                    PredictionBasis::ArchInventoryCompileOnly,
                     "{arch} {model_arch:?}"
                 );
                 assert_eq!(predicted.bound_symbols(), 0, "{arch} {model_arch:?}");
@@ -7904,7 +9366,7 @@ mod tests {
                 let traced = traced_symbols(FN_TRACE, arch);
                 assert!(
                     predicted.modules.len() > traced.len(),
-                    "{arch} {model_arch:?}: conservative set must exceed the traced union"
+                    "{arch} {model_arch:?}: the set must exceed the traced union"
                 );
             }
         }
@@ -7915,8 +9377,8 @@ mod tests {
     fn unknown_family_is_conservative_compile_only() {
         for model_arch in [None, Some(99)] {
             let predicted = predict("gfx1100", model_arch, false, &no_plan());
-            assert_eq!(predicted.basis, PredictionBasis::ConservativeArchInventory);
-            assert_eq!(predicted.basis.label(), "conservative-arch-inventory");
+            assert_eq!(predicted.basis, PredictionBasis::ArchInventoryCompileOnly);
+            assert_eq!(predicted.basis.label(), "arch-inventory compile-only");
             let mut distinct: Vec<_> = entries("gfx1100", "")
                 .unwrap()
                 .iter()

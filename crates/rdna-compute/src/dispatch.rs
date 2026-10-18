@@ -3834,9 +3834,11 @@ impl Gpu {
                 .check_function_image(func_name, image.as_bytes())
                 .map_err(|reason| hip_bridge::HipError::new(0, &reason));
         }
-        self.scratch
-            .route_load
-            .admit_unplanned(module_name, func_name)?;
+        self.scratch.route_load.admit_unplanned(
+            module_name,
+            func_name,
+            crate::scratch::LazyKind::EmbeddedImage,
+        )?;
         if !self.modules.contains_key(module_name) {
             if hipfire_config::developer_var("HIPFIRE_MODULE_LOAD_AUDIT").as_deref() == Ok("1") {
                 // Developer-only route-closure audit, as `scratch::load_embedded_module`.

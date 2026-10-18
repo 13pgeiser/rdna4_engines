@@ -35,7 +35,7 @@ pub(crate) const GATED_DELTA_CHUNK_Q8_WMMA_SRC: &str =
 
 pub(crate) const INDEXED_ATTENTION_DENSE_WMMA_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_dense_wmma.gfx1151.hip");
-const INDEXED_ATTENTION_GATHERED_WMMA_SRC: &str =
+pub(crate) const INDEXED_ATTENTION_GATHERED_WMMA_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1151.hip");
 const INDEXED_ATTENTION_GATHERED_WMMA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/indexed_attention_gathered_wmma.gfx1201.hip");

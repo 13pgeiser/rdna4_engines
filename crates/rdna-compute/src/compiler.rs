@@ -1816,6 +1816,12 @@ impl KernelCompiler {
             return Err(e);
         }
 
+        // The one place hipcc really ran (a cache miss): cache hits, packaged
+        // objects and embedded native images never reach here. Bracketed by
+        // the loader's route begin/ready lines, a line after ready is a
+        // request-time compile.
+        eprintln!("  {name}: hipcc compiled ({arch}, key {src_hash})");
+
         if !nonempty_blob(&tmp_obj) {
             cleanup_tmp();
             return Err(hip_bridge::HipError::new(

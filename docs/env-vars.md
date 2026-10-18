@@ -592,13 +592,14 @@ the total CPU/RAM budget between them rather than launching three full pools.
 before acknowledging `loaded`. Exact routes selected by
 `kernel_registry::route_entries` use their header, architecture, policy and
 walked-context gates; a sealed route rejects an unplanned kernel after ready.
-An open or unsupported route additionally prepares exact registry recipes
-selected from its model-family traces and compatible walked modules. Without
-a trustworthy family prediction, it conservatively compiles the architecture
-inventory without binding ambiguous exports. Predictions are not closure
-proofs: only unambiguous, route-compatible symbols bind eagerly; other prepared
-modules bind when dispatch selects them. Genuinely unpredicted kernels remain
-lazy and log whether they were requested during load or after ready.
+Every open or unsupported route prepares the architecture's entire exact HIP
+registry inventory, excluding modules already in its plan and HIP modules
+replaced by accepted native twins. A family trace never limits this compile
+set: newly registered predictable kernels must not fall through to a request.
+For an exact plan, family traces and matching walked rows prove which
+unambiguous, route-compatible symbols may bind eagerly. Unproven exports stay
+compile-only until selected. Predictions are not closure proofs; genuinely
+unpredicted kernels remain lazy and identify their phase in the log.
 
 Missing compiles overlap the weight sweep using the bounded
 `HIPFIRE_JIT_JOBS` budget. If no worker fits alongside weights but one fits
@@ -606,27 +607,36 @@ before them, preparation runs before weights. If neither budget fits, or a
 predicted compile fails, the load fails instead of deferring that work to the
 first request. Verified installed packs satisfy matching recipes without
 compiler processes. Readiness logs identify the prediction basis, modules
-compiled before ready, eager bindings and compile-only modules; after-ready
-misses are counted separately. `HIPFIRE_ROUTE_PLAN=0` remains the explicit
-developer route-walking opt-out, not a product cold-start policy.
+prepared before ready, eager bindings and compile-only modules. A
+`<module>: hipcc compiled (<arch>, key <effective-key>)` line records an actual
+cache-miss compiler run; cache hits and embedded-image loads never emit it.
+Unplanned-request counters include binds and image loads, not just compiles.
+`HIPFIRE_ROUTE_PLAN=0` remains the explicit developer route-walking opt-out,
+not a product cold-start policy.
 
 See [the artifact inventory](first-request-jit-inventory.md) for exact shipped
 identities and plan coverage. A pack's module inventory is not proof that a
 model's route is closed. This is a cold-start/readiness change, not a
 steady-state speedup.
 
-The Flash-Next plan is generated, not written by hand:
-`scripts/route_plan_walk.py` drives the real dispatch through the route's
-request axes (every prompt row count to 300 and the chunk/staging tails,
-decode contexts to 120K, greedy and nine sampling variants, n-gram copies,
-session resumes, long-context QSA) under `HIPFIRE_MODULE_LOAD_AUDIT=1`, and
-`scripts/route_plan_build.py` turns the walks into
-`crates/rdna-compute/src/route_plans/<family>.<arch>.tsv`. Each row records
-the effective source or image SHA-256; a row that no longer matches the
-registry refuses the plan (lazy loading) and fails
-`cargo test -p rdna-compute --test fn_route_plan`, which also checks that
-every planned HIP module is a release-pack entry. Regenerate the plan after a
-change to the Flash-Next dispatch or its kernel sources.
+Walked plans are generated, not written by hand:
+`scripts/route_plan_walk.py` drives real dispatch through the route's request
+axes under `HIPFIRE_MODULE_LOAD_AUDIT=1`, and
+`scripts/route_plan_build.py` records the exact header layout, architecture,
+resolved policy axes, walked context ceiling and source/image identities in
+`crates/rdna-compute/src/route_plans/<family>.<arch>.tsv`. Flash-Next records
+its QSA/GDN axes; dense 27B and A3B additionally pin head geometry, expert
+geometry/placement, KV formats, state format, backend and prefill chunk.
+Native-MTP head metadata is fingerprinted separately where needed.
+
+An initial walk produces an open plan. Replay it with
+`route_plan_walk.py --sealed`, then pass the successful replay to
+`route_plan_build.py --sealed-replay ROUTE=DIR` to certify `#! sealed` for
+that route. A predicted, mismatched or unplanned replay cannot certify closure.
+Stale source/image identities refuse the exact plan and use open predictive
+preparation instead; the route-plan CPU tests reject stale checked-in rows.
+Regenerate after changing dispatch or kernel sources. Pack membership and
+real route closure are separate requirements.
 
 To build a compiler-free `gfx1201` RMSNorm package for the production
 `Gpu::rmsnorm_f32` route, run

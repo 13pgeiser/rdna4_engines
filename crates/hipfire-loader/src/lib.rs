@@ -3361,8 +3361,8 @@ const LAZY_KERNELS_NOTE: &str = "compiling kernels on first use (one-time, cache
 ///
 /// Everything predictable is compiled before the model is loaded: a refused
 /// route (no closed plan) and an open walked plan both add the model
-/// family's predicted module set (traced unions, or the conservative arch
-/// inventory when the family has no trace for this arch; see
+/// family's predicted module set (the arch's whole installer inventory
+/// minus the plan; the family trace only chooses which symbols bind; see
 /// `kernel_registry::predicted_kernels`). That coverage is never a closure:
 /// the route finishes open, never sealed. `HIPFIRE_ROUTE_PLAN=0` (a route
 /// walk) returns `None` and loads lazily with no preload, so the walk
@@ -3427,7 +3427,7 @@ fn begin_route_kernels(
                 model_arch,
                 hipcc_extra_flags: &gpu.flags.hipcc_extra_flags,
                 pm_decode: gpu.flags.pm_decode,
-                // Only an exact recognised plan proves the family trace.
+                // Only an exact recognised plan lets the family trace choose binds.
                 exact_plan: refusal.is_none(),
             },
             &plan,
@@ -3533,7 +3533,8 @@ fn log_open_route(
     match predicted {
         Some(predicted) => eprintln!(
             "  kernels: {route} ready, open (never sealed): {}/{} predicted {} modules [{}] compiled before ready \
-             ({} symbols in {} modules bound, {} compile-only); {} unplanned kernels compiled during load; \
+             ({} symbols in {} modules bound, {} compile-only); {} unplanned kernel requests during load \
+             (counts requests, not compiles: includes binds of already compiled or embedded modules); \
              off-plan loads after ready stay lazy, warn and are counted",
             stats.predicted_compiled,
             predicted.modules,
@@ -3546,7 +3547,7 @@ fn log_open_route(
         ),
         None => eprintln!(
             "  kernels: {route} preloaded (open: off-plan loads stay lazy and warn); \
-             {} unplanned kernels compiled during load",
+             {} unplanned kernel requests during load (counts requests, not compiles)",
             stats.lazy_during_load
         ),
     }
