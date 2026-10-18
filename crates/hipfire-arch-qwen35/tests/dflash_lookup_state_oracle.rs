@@ -821,18 +821,23 @@ fn scenarios(rig: &Rig, rf: &Reference) -> (Vec<Scenario>, Vec<(String, String)>
         )),
     }
     // Rejection inside the kept learned prefix (K = m + 1 keeps the learned
-    // candidate the incumbent window rejected): includes accepted = 0.
+    // candidate the incumbent window rejected): any reference window with a
+    // learned rejection (m <= 13 leaves at least one tail row in 16) and a
+    // continuation reaching past K; the lowest-accept such window is used.
     let learned_w = rf
         .wins
         .iter()
         .enumerate()
-        .position(|(w, r)| r.accepted <= 6 && rem(w) >= r.accepted + 1 + 6);
+        .filter(|(w, r)| r.accepted <= 13 && rem(*w) >= r.accepted + 2)
+        .min_by_key(|(_, r)| r.accepted)
+        .map(|(w, _)| w);
     match learned_w {
         Some(w) => {
             let m = rf.wins[w].accepted;
             let k = m + 1;
             let cont: Vec<u32> = rf.cont(w).to_vec();
-            let t = cont[k..k + 6].to_vec();
+            let l = 6usize.min(15 - k).min(cont.len() - k);
+            let t = cont[k..k + l].to_vec();
             let rows = 1 + k + t.len();
             out.push(Scenario {
                 name: format!("tail_learned_reject@w{w}"),
@@ -845,7 +850,8 @@ fn scenarios(rig: &Rig, rf: &Reference) -> (Vec<Scenario>, Vec<(String, String)>
         }
         None => skipped.push((
             "tail_learned_reject".into(),
-            "no reference window with accepted <= 6 and a long enough continuation".into(),
+            "no reference window with a learned rejection (accepted <= 13) and a continuation past it"
+                .into(),
         )),
     }
 
