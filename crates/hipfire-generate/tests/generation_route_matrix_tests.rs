@@ -208,6 +208,18 @@ fn capability_rows() -> Vec<(GenerationRoute, GenerationRouteInputs)> {
             },
         ),
         (
+            // Gemma 4 has one route. `has_speculator: true` is deliberate: an
+            // attached EAGLE drafter must not move a turn off `gemma4_ar`
+            // (the developer-gated spec branch is chosen inside the producer).
+            GenerationRoute::Gemma4Ar,
+            GenerationRouteInputs {
+                arch_id: 13,
+                has_speculator: true,
+                temp: 0.0,
+                ..base()
+            },
+        ),
+        (
             GenerationRoute::MiniMaxAr,
             GenerationRouteInputs {
                 arch_id: 10,
@@ -327,6 +339,11 @@ const SAFE_ROUTES: &[GenerationRoute] = &[
     // terminal, parsing calls with the same Qwen `<tool_call>` parser as
     // `qwen_ar` because Maple's vendor template emits the identical shape.
     GenerationRoute::MapleAr,
+    // Arch 13, legacy contract like Maple. `generate_gemma4` renders tools
+    // through the embedded template, withholds the model's native
+    // `<|tool_call>call:NAME{ARGS}<tool_call|>` blocks from content and stages
+    // the parsed calls on a `finish_reason=tool_calls` commit_ready terminal.
+    GenerationRoute::Gemma4Ar,
 ];
 
 /// Pure gate model mirroring generate()'s tools preflight:
@@ -1008,7 +1025,8 @@ fn qwen4_native_mtp_with_ngram_flag_remains_the_native_route() {
 }
 
 #[test]
-fn exact_safe_set_is_qwen_ar_qwen4_ar_mtp_dflash_ds4_ar_ep_spec_glimmer_ar_spec_and_maple_ar() {
+fn exact_safe_set_is_qwen_ar_qwen4_ar_mtp_dflash_ds4_ar_ep_spec_glimmer_ar_spec_maple_ar_and_gemma4_ar(
+) {
     let mut from_all: Vec<GenerationRoute> = GenerationRoute::ALL
         .iter()
         .copied()
@@ -1018,13 +1036,49 @@ fn exact_safe_set_is_qwen_ar_qwen4_ar_mtp_dflash_ds4_ar_ep_spec_glimmer_ar_spec_
     let mut expected = SAFE_ROUTES.to_vec();
     expected.sort_by_key(|r| r.name());
     assert_eq!(from_all, expected);
-    assert_eq!(from_all.len(), 10);
+    assert_eq!(from_all.len(), 11);
     // Negative: every other ALL member is denied for tools.
     for &r in GenerationRoute::ALL {
         if !SAFE_ROUTES.contains(&r) {
             assert!(!r.supports_tools(), "{:?} must not be tool-safe", r);
         }
     }
+}
+
+/// Gemma 4 (arch 13) used to fall through every arch arm to `unknown`, so a
+/// tools request was refused as "tools are not supported on producer route
+/// unknown". It now has its own named, tool-capable route whatever the
+/// sampling or drafter state; only EP (no Gemma EP producer) stays unknown.
+#[test]
+fn gemma4_is_classified_and_routes_tools() {
+    for (temp, has_speculator, nonneutral_penalties) in [
+        (0.0, false, false),
+        (0.0, true, false),
+        (0.7, true, false),
+        (0.7, false, true),
+    ] {
+        let route = select_generation_route(&GenerationRouteInputs {
+            arch_id: 13,
+            temp,
+            has_speculator,
+            nonneutral_penalties,
+            ..base()
+        });
+        assert_eq!(route, GenerationRoute::Gemma4Ar);
+        assert_eq!(route.name(), "gemma4_ar");
+        assert!(pure_tools_gate(route, true).allowed);
+        assert!(!route.supports_stop());
+        let adapter = generation_route_adapter(route).expect("gemma4 adapter");
+        assert_eq!(adapter.route, GenerationRoute::Gemma4Ar);
+    }
+    assert_eq!(
+        select_generation_route(&GenerationRouteInputs {
+            arch_id: 13,
+            ep: true,
+            ..base()
+        }),
+        GenerationRoute::Unknown
+    );
 }
 
 #[test]

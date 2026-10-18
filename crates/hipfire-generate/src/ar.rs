@@ -854,8 +854,8 @@ pub fn truncate_checkpoints(
 /// dispatch branch choice and tools capability. Precedence matches production:
 /// EP (Qwen 5|6 → QwenAr semantic AR over `generate_ep`, which refines MoE vs
 /// dense-TP by loaded `EpArch`) / arch short-circuits (Qwen2, DeepSeek4, LFM,
-/// Cohere, MiniMax, dots) → pp>1 → Qwen/LLaMA DFlash/spec (MTP uses the generic
-/// wrapper) → default AR/unknown.
+/// Cohere, Maple, Gemma 4, MiniMax, dots) → pp>1 → Qwen/LLaMA DFlash/spec (MTP
+/// uses the generic wrapper) → default AR/unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GenerationRoute {
     QwenAr,
@@ -870,6 +870,7 @@ pub enum GenerationRoute {
     CohereAr,
     CohereSpec,
     MapleAr,
+    Gemma4Ar,
     MiniMaxAr,
     MiniMaxEp,
     MiniMaxSpec,
@@ -900,6 +901,7 @@ impl GenerationRoute {
         Self::CohereAr,
         Self::CohereSpec,
         Self::MapleAr,
+        Self::Gemma4Ar,
         Self::MiniMaxAr,
         Self::MiniMaxEp,
         Self::MiniMaxSpec,
@@ -916,7 +918,7 @@ impl GenerationRoute {
 
     /// Proven semantic-safe producers for non-empty tools.
     /// Exactly: Qwen AR, Qwen4 AR, Qwen4 native MTP, Qwen DFlash/spec, DS4 AR,
-    /// DS4 EP, DS4 spec, Glimmer AR, Glimmer spec, Maple AR.
+    /// DS4 EP, DS4 spec, Glimmer AR, Glimmer spec, Maple AR, Gemma 4.
     ///
     /// `Qwen4Spec` runs the same `<tool_call>` router (`Qwen35Emit` via the
     /// Qwen4 carrier) over committed tokens that `Qwen4Ar` runs through
@@ -934,6 +936,14 @@ impl GenerationRoute {
     /// `emit_text::extract_tool_calls_from_text` used for `qwen_ar`, because
     /// Maple's vendor template emits the identical
     /// `<tool_call>{json}</tool_call>` shape.
+    ///
+    /// `Gemma4Ar` is admitted on the same legacy contract. `generate_gemma4`
+    /// renders `tools` through the model's embedded template, withholds its
+    /// native `<|tool_call>call:NAME{ARGS}<tool_call|>` blocks from the
+    /// content stream (`GemmaToolSplitter`), and stages the parsed calls on a
+    /// `finish_reason == "tool_calls"` terminal. A load whose template carries
+    /// no tool format refuses tools by name instead. The developer-gated EAGLE
+    /// branch never serves a tools request, so tools always decode AR.
     pub const fn supports_tools(self) -> bool {
         matches!(
             self,
@@ -947,6 +957,7 @@ impl GenerationRoute {
                 | Self::GlimmerAr
                 | Self::GlimmerSpec
                 | Self::MapleAr
+                | Self::Gemma4Ar
         )
     }
 
@@ -989,6 +1000,7 @@ impl GenerationRoute {
             Self::CohereAr => "cohere_ar",
             Self::CohereSpec => "cohere_spec",
             Self::MapleAr => "maple_ar",
+            Self::Gemma4Ar => "gemma4_ar",
             Self::MiniMaxAr => "minimax_ar",
             Self::MiniMaxEp => "minimax_ep",
             Self::MiniMaxSpec => "minimax_spec",
@@ -1357,6 +1369,7 @@ define_route_start!(deepseek4_spec_route_start, 9);
 define_route_start!(cohere_ar_route_start, 12);
 define_route_start!(cohere_spec_route_start, 12);
 define_route_start!(maple_ar_route_start, 15);
+define_route_start!(gemma4_ar_route_start, 13);
 define_route_start!(minimax_ar_route_start, 10);
 define_route_start!(minimax_ep_route_start, 10);
 define_route_start!(minimax_spec_route_start, 10);
@@ -1386,6 +1399,7 @@ define_route_terminal!(
 define_route_terminal!(cohere_ar_route_terminal, GenerationRoute::CohereAr);
 define_route_terminal!(cohere_spec_route_terminal, GenerationRoute::CohereSpec);
 define_route_terminal!(maple_ar_route_terminal, GenerationRoute::MapleAr);
+define_route_terminal!(gemma4_ar_route_terminal, GenerationRoute::Gemma4Ar);
 define_route_terminal!(minimax_ar_route_terminal, GenerationRoute::MiniMaxAr);
 define_route_terminal!(minimax_ep_route_terminal, GenerationRoute::MiniMaxEp);
 define_route_terminal!(minimax_spec_route_terminal, GenerationRoute::MiniMaxSpec);
@@ -1461,6 +1475,11 @@ pub fn generation_route_adapter(route: GenerationRoute) -> Option<GenerationRout
             route,
             start: cohere_spec_route_start,
             terminal: cohere_spec_route_terminal,
+        },
+        GenerationRoute::Gemma4Ar => GenerationRouteAdapter {
+            route,
+            start: gemma4_ar_route_start,
+            terminal: gemma4_ar_route_terminal,
         },
         GenerationRoute::MapleAr => GenerationRouteAdapter {
             route,
@@ -1795,6 +1814,11 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
         // speculator built by the carrier must NOT change the route — an
         // arch-15 turn is always plain AR.
         15 => return GenerationRoute::MapleAr,
+        // Gemma 4. One route: the EAGLE speculator is a developer opt-in
+        // (`HIPFIRE_GEMMA4_EAGLE=1`) decided inside `generate_gemma4` after
+        // tokenization, and it never takes a tools request, so a tool turn is
+        // always the AR producer this route names.
+        13 => return GenerationRoute::Gemma4Ar,
         10 => {
             let spec_ok = i.has_speculator && (i.temp <= 1e-6 || i.ngram_can_sample);
             return if spec_ok {
@@ -2846,6 +2870,9 @@ pub fn generate(
                 repeat_window,
             );
             return;
+        }
+        GenerationRoute::Gemma4Ar => {
+            unreachable!("gemma4 dispatches through generation_early_route before this match")
         }
         GenerationRoute::MapleAr => {
             // Arch 15 has no pflash/no eviction, but it DOES honour the

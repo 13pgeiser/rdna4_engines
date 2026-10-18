@@ -16697,6 +16697,169 @@ effort = "high"
         );
     }
 
+    /// Gemma 4 request: the OpenAI `tools` shape for `get_temperature`.
+    #[cfg(unix)]
+    fn gemma4_tool_body(h: &Task11HttpHarness, stream: bool) -> serde_json::Value {
+        let mut body = h.base_body("t22-gemma4-tool", stream);
+        body["tools"] = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "get_temperature",
+                "description": "current temperature in a city",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } }
+                }
+            }
+        }]);
+        body
+    }
+
+    /// Gemma 4 (legacy contract, two-phase terminal) must reach an HTTP
+    /// body with content, finish reason and usage on a non-stream request.
+    #[cfg(unix)]
+    #[test]
+    fn gemma4_legacy_nonstream_returns_body_with_usage() {
+        let h = Task11HttpHarness::spawn("gemma4-nonstream");
+        let (status, json, text) = post_status(h.port(), &h.base_body("t22-gemma4-stop", false));
+        assert_eq!(status, 200, "{text}");
+        let choice = &json["choices"][0];
+        assert_eq!(
+            choice["message"]["content"], "391\n\nExplanation.",
+            "{text}"
+        );
+        assert_eq!(choice["finish_reason"], "stop", "{text}");
+        assert_eq!(json["usage"]["prompt_tokens"], 31, "{text}");
+        assert_eq!(json["usage"]["completion_tokens"], 5, "{text}");
+        assert_eq!(json["usage"]["total_tokens"], 36, "{text}");
+    }
+
+    /// Streaming ends with content deltas, a finish chunk, the usage chunk
+    /// (`choices: []`) and `[DONE]`.
+    #[cfg(unix)]
+    #[test]
+    fn gemma4_legacy_stream_ends_with_usage_chunk() {
+        let h = Task11HttpHarness::spawn("gemma4-stream");
+        let mut body = h.base_body("t22-gemma4-stop", true);
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
+
+        // Raw wire order: finish chunk, then usage chunk, then [DONE].
+        let (status, bytes) = raw_nonstream_post(h.port(), &body);
+        let wire = String::from_utf8(bytes).expect("SSE body is UTF-8");
+        assert_eq!(status, 200, "{wire}");
+        let chunks: Vec<serde_json::Value> = wire
+            .split("\n\n")
+            .filter_map(|frame| frame.trim().strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).expect("SSE data is JSON"))
+            .collect();
+        assert!(
+            wire.trim_end().ends_with("data: [DONE]"),
+            "stream must end with [DONE]: {wire}"
+        );
+        let finish_idx = chunks
+            .iter()
+            .position(|c| c["choices"][0]["finish_reason"] == "stop")
+            .unwrap_or_else(|| panic!("no finish_reason=stop chunk: {wire}"));
+        let usage_chunk = chunks.last().expect("usage chunk");
+        assert!(
+            finish_idx + 1 < chunks.len(),
+            "usage follows finish: {wire}"
+        );
+        assert_eq!(usage_chunk["choices"], serde_json::json!([]), "{wire}");
+        assert_eq!(usage_chunk["usage"]["prompt_tokens"], 31, "{wire}");
+        assert_eq!(usage_chunk["usage"]["completion_tokens"], 5, "{wire}");
+
+        let cap = capture_stream(h.port(), body).expect("gemma4 stream completes");
+        assert!(cap.saw_role);
+        assert_eq!(cap.content, "391\n\nExplanation.");
+        assert!(!cap.content_deltas.is_empty());
+        assert_eq!(cap.finish.as_deref(), Some("stop"));
+        let usage = cap.usage.expect("usage chunk delivered");
+        assert_eq!(usage["prompt_tokens"], 31);
+        assert_eq!(usage["completion_tokens"], 5);
+        assert_eq!(usage["total_tokens"], 36);
+        assert!(cap.saw_done);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gemma4_legacy_length_is_reported() {
+        let h = Task11HttpHarness::spawn("gemma4-length");
+        let (status, json, text) = post_status(h.port(), &h.base_body("t22-gemma4-length", false));
+        assert_eq!(status, 200, "{text}");
+        let choice = &json["choices"][0];
+        assert_eq!(choice["finish_reason"], "length", "{text}");
+        assert_eq!(
+            choice["message"]["content"], "391\n\nExplanation.",
+            "{text}"
+        );
+        assert_eq!(json["usage"]["completion_tokens"], 5, "{text}");
+    }
+
+    /// Gemma 4 tool calls ride the `commit_ready`/`done` terminal and are
+    /// routed to the client as structured OpenAI tool_calls (non-stream and
+    /// stream), with usage that includes the cached prefix.
+    #[cfg(unix)]
+    #[test]
+    fn gemma4_legacy_tool_call_is_routed() {
+        let h = Task11HttpHarness::spawn("gemma4-tools");
+        let (status, json, text) = post_status(h.port(), &gemma4_tool_body(&h, false));
+        assert_eq!(status, 200, "{text}");
+        let choice = &json["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls", "{text}");
+        // Pure tool turn: content is JSON null (serve convention).
+        assert!(choice["message"]["content"].is_null(), "{text}");
+        let calls = choice["message"]["tool_calls"]
+            .as_array()
+            .expect("tool_calls");
+        assert_eq!(calls.len(), 1, "{text}");
+        assert_eq!(calls[0]["type"], "function", "{text}");
+        assert_eq!(calls[0]["function"]["name"], "get_temperature", "{text}");
+        let arguments: serde_json::Value = serde_json::from_str(
+            calls[0]["function"]["arguments"]
+                .as_str()
+                .expect("arguments string"),
+        )
+        .expect("arguments are JSON");
+        assert_eq!(arguments, serde_json::json!({ "city": "Oslo" }));
+        assert_eq!(json["usage"]["prompt_tokens"], 88, "{text}");
+        assert_eq!(
+            json["usage"]["prompt_tokens_details"]["cached_tokens"], 28,
+            "{text}"
+        );
+
+        // The daemon received the tools array.
+        let generate = last_generate_without_ids(&h);
+        let tools = generate["tools"]
+            .as_array()
+            .expect("generate carries tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "get_temperature");
+
+        let mut stream_body = gemma4_tool_body(&h, true);
+        stream_body["stream_options"] = serde_json::json!({ "include_usage": true });
+        let cap = capture_stream(h.port(), stream_body).expect("gemma4 tool stream completes");
+        assert!(
+            cap.content.is_empty(),
+            "no content on a pure tool turn: {:?}",
+            cap.content
+        );
+        assert_eq!(cap.tool_calls.len(), 1, "{:?}", cap.tool_calls);
+        let (index, _id, name, arguments) = &cap.tool_calls[0];
+        assert_eq!(*index, 0);
+        assert_eq!(name.as_deref(), Some("get_temperature"));
+        let streamed: serde_json::Value =
+            serde_json::from_str(arguments.as_deref().expect("streamed arguments"))
+                .expect("streamed arguments are JSON");
+        assert_eq!(streamed, serde_json::json!({ "city": "Oslo" }));
+        assert_eq!(cap.finish.as_deref(), Some("tool_calls"));
+        let usage = cap.usage.expect("usage chunk delivered");
+        assert_eq!(usage["prompt_tokens"], 88);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 28);
+        assert!(cap.saw_done);
+    }
+
     #[cfg(unix)]
     #[derive(Debug, Default)]
     struct StreamCapture {

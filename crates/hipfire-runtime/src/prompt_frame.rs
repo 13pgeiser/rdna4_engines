@@ -1316,6 +1316,22 @@ impl<'a> JinjaChatFrame<'a> {
         tools: Option<&[serde_json::Value]>,
         tool_call_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> Result<String, String> {
+        let messages = messages
+            .iter()
+            .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
+            .collect();
+        self.render_message_values(messages, tools, tool_call_kwargs)
+    }
+
+    /// [`Self::render_messages`] over already-serialized messages, for an
+    /// architecture whose template reads a message shape [`Message`] does not
+    /// serialize to (Gemma 4 reads OpenAI `tool_calls[].function`).
+    pub fn render_message_values(
+        &self,
+        mut messages: Vec<serde_json::Value>,
+        tools: Option<&[serde_json::Value]>,
+        tool_call_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<String, String> {
         use minijinja::{Environment, Error, ErrorKind, Value};
         use minijinja_contrib::pycompat::unknown_method_callback;
 
@@ -1409,11 +1425,7 @@ impl<'a> JinjaChatFrame<'a> {
         // message is patched, and only when it is a system turn — every other
         // template / model serializes through unchanged.
         let messages_val = {
-            let mut arr: Vec<serde_json::Value> = messages
-                .iter()
-                .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
-                .collect();
-            if let Some(serde_json::Value::Object(map)) = arr.first_mut() {
+            if let Some(serde_json::Value::Object(map)) = messages.first_mut() {
                 let is_system = matches!(
                     map.get("role"),
                     Some(serde_json::Value::String(r)) if r == "system"
@@ -1433,7 +1445,7 @@ impl<'a> JinjaChatFrame<'a> {
                         .or_insert_with(|| serde_json::Value::String(String::new()));
                 }
             }
-            Value::from_serialize(&arr)
+            Value::from_serialize(&messages)
         };
         let reasoning_strength_val = match self.reasoning_strength {
             Some(s) => Value::from_serialize(s),
