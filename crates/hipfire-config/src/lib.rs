@@ -1592,6 +1592,18 @@ pub static FIELDS: &[ConfigField] = &[
         "DFlash2 proposal width per serving configuration, never per live batch (batched lanes stay byte-identical to the singleton). Default `auto` = 8 on a `serve.vmm_batch` serve with `continuous_batch_size` >= 4, else 16; `16` restores the previous fixed width. Legacy DFlash drafts keep their declared width."
     ),
     field!(
+        "speculation.dflash_lookup",
+        "dflash_lookup",
+        Speculation,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(&["auto", "on", "off", "1", "0"]),
+        true,
+        false,
+        Some("HIPFIRE_DFLASH_LOOKUP"),
+        "Request-local verbatim-copy lookup composed into the dense Qwen3.5-class DFlash2 singleton verify window: a Copy window (lookup candidates replace the learned candidates) or a Tail window (first K learned candidates plus a lookup tail, at most 16 verify rows), taken only when measured acceptance per measured window price pays; a request with no lookup proposal runs the incumbent window unchanged. on/1 arms it on a singleton DFlash2 selector chain (no DDTree, no retained-PM4 verify, no CACTUS); off/0 disables it; auto (default) is off for now. Developer `HIPFIRE_SPEC_LOOKUP_TAIL=0` disables only the Tail windows."
+    ),
+    field!(
         "speculation.dflash",
         "dflash_mode",
         Speculation,
@@ -4988,6 +5000,29 @@ fn mtp_ngram_copy_enabled_for_arch_value(
         _ => false,
     }
 }
+/// Dense Qwen3.5-class DFlash2 verbatim-copy lookup arming
+/// (`speculation.dflash_lookup`, env override `HIPFIRE_DFLASH_LOOKUP`).
+/// `on`/`1` arms it; `off`/`0` disables it; `auto` (the schema default; an
+/// unset key also resolves to `auto`) is off for now — a later slice flips
+/// `auto` per qualified capability. This only resolves the user policy; the
+/// consumer (`DflashSpeculator`) additionally requires a singleton DFlash2
+/// selector chain and reports the reason it declined.
+pub fn dflash_lookup_enabled() -> bool {
+    dflash_lookup_enabled_value(process_value("HIPFIRE_DFLASH_LOOKUP").as_deref())
+}
+fn dflash_lookup_enabled_value(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "on"))
+}
+/// Developer kill switch for the Tail windows of the DFlash lookup
+/// (`HIPFIRE_SPEC_LOOKUP_TAIL=0`, read through the `[developer]` namespace):
+/// an exact `0` disables only the Tail windows (Copy windows stay); anything
+/// else, including unset, leaves them on.
+pub fn dflash_lookup_tail_enabled() -> bool {
+    dflash_lookup_tail_enabled_value(process_value("HIPFIRE_SPEC_LOOKUP_TAIL").as_deref())
+}
+fn dflash_lookup_tail_enabled_value(value: Option<&str>) -> bool {
+    value != Some("0")
+}
 fn ngram_mod_triple_with_defaults(defaults: (usize, usize, usize)) -> (usize, usize, usize) {
     ngram_mod_triple_resolve(defaults, |name| developer_var(name).ok())
 }
@@ -7325,6 +7360,49 @@ mod tests {
             ngram_mod_triple_resolve(NGRAM_MOD_COPY_TRIPLE, none),
             (5, 1, 63)
         );
+    }
+
+    #[test]
+    fn dflash_lookup_key_and_resolver() {
+        let field = field("speculation.dflash_lookup").expect("dflash_lookup schema field");
+        assert_eq!(field.env_compat, Some("HIPFIRE_DFLASH_LOOKUP"));
+        assert_eq!(field.legacy_key, "dflash_lookup");
+        assert!(matches!(field.default, DefaultValue::String("auto")));
+        for raw in ["auto", "on", "off", "1", "0"] {
+            assert!(
+                field.validate(&ConfigValue::String(raw.into())).is_ok(),
+                "{raw}"
+            );
+        }
+        assert!(field.validate(&ConfigValue::String("yes".into())).is_err());
+        assert!(field.validate(&ConfigValue::String("true".into())).is_err());
+        // auto/unset resolve OFF until a qualified capability flips auto.
+        for (raw, expect) in [
+            (Some("on"), true),
+            (Some("1"), true),
+            (Some("off"), false),
+            (Some("0"), false),
+            (Some("auto"), false),
+            (Some(""), false),
+            (Some("yes"), false),
+            (None, false),
+        ] {
+            assert_eq!(dflash_lookup_enabled_value(raw), expect, "{raw:?}");
+        }
+        // The live (unset) snapshot resolves to the auto default: off.
+        assert!(!dflash_lookup_enabled());
+    }
+
+    #[test]
+    fn dflash_lookup_tail_kill_switch_is_strict_zero() {
+        // Default on (lookup itself is gated by `speculation.dflash_lookup`);
+        // only an exact `0` disables the Tail windows.
+        assert!(dflash_lookup_tail_enabled_value(None));
+        assert!(dflash_lookup_tail_enabled_value(Some("1")));
+        assert!(dflash_lookup_tail_enabled_value(Some("")));
+        assert!(dflash_lookup_tail_enabled_value(Some("off")));
+        assert!(!dflash_lookup_tail_enabled_value(Some("0")));
+        assert!(dflash_lookup_tail_enabled());
     }
 
     #[test]
