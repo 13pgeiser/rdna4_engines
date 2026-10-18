@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <string>
@@ -27,6 +28,16 @@ namespace {
 extern "C" void dpotrf_(const char* uplo, const int* n, double* a, const int* lda, int* info);
 extern "C" void dpotri_(const char* uplo, const int* n, double* a, const int* lda, int* info);
 
+/* dpotrf rejects a non-positive pivot but lets a NaN through, where the loops' !(s > 0) refuses
+ * it: a factor whose diagonal is not finite and positive is refused here as there. */
+static bool diag_ok(const std::vector<double>& a, int64_t k) {
+    for (int64_t i = 0; i < k; ++i) {
+        const double d = a[(size_t)(i * k + i)];
+        if (!(d > 0.0) || !std::isfinite(d)) return false;
+    }
+    return true;
+}
+
 /* Zero the row-major strict upper (upper = true) or strict lower triangle. */
 static void zero_triangle(std::vector<double>& a, int64_t k, bool upper) {
 #pragma omp parallel for schedule(static)
@@ -36,16 +47,16 @@ static void zero_triangle(std::vector<double>& a, int64_t k, bool upper) {
     }
 }
 
-bool chol_lower(std::vector<double>& a, int64_t k) {
+bool chol_lower_lapack(std::vector<double>& a, int64_t k) {
     const int n = (int)k;
     int info = 0;
     dpotrf_("U", &n, a.data(), &n, &info);
     if (info != 0) return false;
     zero_triangle(a, k, true);
-    return true;
+    return diag_ok(a, k);
 }
 
-void inv_from_chol(std::vector<double>& l, int64_t k) {
+void inv_from_chol_lapack(std::vector<double>& l, int64_t k) {
     const int n = (int)k;
     int info = 0;
     dpotri_("U", &n, l.data(), &n, &info);
@@ -55,16 +66,18 @@ void inv_from_chol(std::vector<double>& l, int64_t k) {
         for (int64_t j = i + 1; j < k; ++j) l[(size_t)(i * k + j)] = l[(size_t)(j * k + i)];
 }
 
-bool chol_upper(std::vector<double>& a, int64_t k) {
+bool chol_upper_lapack(std::vector<double>& a, int64_t k) {
     const int n = (int)k;
     int info = 0;
     dpotrf_("L", &n, a.data(), &n, &info);
     if (info != 0) return false;
     zero_triangle(a, k, false);
-    return true;
+    return diag_ok(a, k);
 }
-#else
-bool chol_lower(std::vector<double>& a, int64_t k) {
+#endif  /* RAD_LQ_LAPACK */
+
+/* The single-threaded loops: the reference, and the only path without OpenBLAS. */
+bool chol_lower_loop(std::vector<double>& a, int64_t k) {
     for (int64_t i = 0; i < k; ++i) {
         for (int64_t j = 0; j <= i; ++j) {
             double s = a[(size_t)(i * k + j)];
@@ -82,7 +95,7 @@ bool chol_lower(std::vector<double>& a, int64_t k) {
 }
 
 /* A = L L^T, factored in place -> A^-1, full and symmetric: L^-1 first, then L^-T L^-1. */
-void inv_from_chol(std::vector<double>& l, int64_t k) {
+void inv_from_chol_loop(std::vector<double>& l, int64_t k) {
     for (int64_t j = 0; j < k; ++j) {
         l[(size_t)(j * k + j)] = 1.0 / l[(size_t)(j * k + j)];
         for (int64_t i = j + 1; i < k; ++i) {
@@ -103,7 +116,7 @@ void inv_from_chol(std::vector<double>& l, int64_t k) {
 }
 
 /* A -> U upper with A = U^T U. */
-bool chol_upper(std::vector<double>& a, int64_t k) {
+bool chol_upper_loop(std::vector<double>& a, int64_t k) {
     for (int64_t i = 0; i < k; ++i) {
         double d = a[(size_t)(i * k + i)];
         for (int64_t t = 0; t < i; ++t) {
@@ -122,11 +135,46 @@ bool chol_upper(std::vector<double>& a, int64_t k) {
     }
     return true;
 }
-#endif  /* RAD_LQ_LAPACK */
+
+/* LAPACK where OpenBLAS was found; RAD_LQ_LAPACK=0 takes the loops instead, the reference the
+ * LAPACK path is checked against (quant_algo_test). */
+bool use_lapack() {
+#ifdef RAD_LQ_LAPACK
+    const char* e = std::getenv("RAD_LQ_LAPACK");
+    return !(e && e[0] == '0');
+#else
+    return false;
+#endif
+}
+
+bool chol_lower(std::vector<double>& a, int64_t k) {
+#ifdef RAD_LQ_LAPACK
+    if (use_lapack()) return chol_lower_lapack(a, k);
+#endif
+    return chol_lower_loop(a, k);
+}
+
+void inv_from_chol(std::vector<double>& l, int64_t k) {
+#ifdef RAD_LQ_LAPACK
+    if (use_lapack()) return inv_from_chol_lapack(l, k);
+#endif
+    inv_from_chol_loop(l, k);
+}
+
+bool chol_upper(std::vector<double>& a, int64_t k) {
+#ifdef RAD_LQ_LAPACK
+    if (use_lapack()) return chol_upper_lapack(a, k);
+#endif
+    return chol_upper_loop(a, k);
+}
+
+/* Layer factors kept at once (RAD_LQ_FACTOR_CACHE_ALL: every one). */
+constexpr size_t kFactors = 4;
 
 struct Cache {
     std::mutex mu;
     std::map<std::string, Gram> f;   /* null = looked and found nothing */
+    std::deque<std::string> order;   /* f's keys, oldest first */
 };
 
 Cache& cache() {
@@ -170,14 +218,19 @@ Gram gptq_factor(const char* dir, const char* name, int64_t K, int64_t domain, d
         if (it != c.f.end()) return it->second;
     }
     auto keep = [&](Gram u) {
-        /* One factor at a time: a dense model reads each layer's once, and a 21504-wide factor
-         * is 3.7 GB (every one kept OOM-killed TranslateGemma 27B's conversion at layer 25).
-         * Experts of one layer arrive together, so they still share it.
-         * RAD_LQ_FACTOR_CACHE_ALL keeps the old behaviour. */
+        /* A few layer factors, the oldest dropped first: a dense model reads each layer's
+         * once, and a 21504-wide factor is 1.85 GB in f32 (every one kept OOM-killed
+         * TranslateGemma 27B's conversion at layer 25). A MoE layer's experts run in parallel
+         * and alternate between its gate_up and down stems, so one kept factor would be
+         * recomputed over and over. RAD_LQ_FACTOR_CACHE_ALL keeps every one. */
         static const bool all = std::getenv("RAD_LQ_FACTOR_CACHE_ALL") != nullptr;
-        if (layer) {
-            if (!all) c.f.clear();
+        if (layer && !c.f.count(key)) {
+            while (!all && c.order.size() >= kFactors) {
+                c.f.erase(c.order.front());
+                c.order.pop_front();
+            }
             c.f.emplace(key, u);
+            c.order.push_back(key);
         }
         return u;
     };
