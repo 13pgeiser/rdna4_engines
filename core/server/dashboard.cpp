@@ -1354,16 +1354,41 @@ for (const k of METRICS) {
 }
 /* The axis follows the WINDOW's own minimum and maximum, not zero. This is a sparkline: what it
  * is for is the variation, and the number above it already states the level -- scaled from zero
- * every steady state is a flat line on the floor. No variation draws down the middle. */
+ * every steady state is a flat line on the floor. No variation draws down the middle.
+ *
+ * THE ENDS OF THAT RANGE ARE PERCENTILES, not the extremes. On a min/max axis one rare spike
+ * owns the whole box and the typical variation is squeezed into a couple of pixels: measured over
+ * real /stats samples, prefill sits at zero on a third of polls and spikes past 4,000 on the rest,
+ * which leaves its middle band 0.1px of the 15px available -- a flat line for a metric that is
+ * anything but. Taking the 5th and 95th percentiles and clamping to them gives the ordinary
+ * movement the height it was being denied (the same samples' middle band rises 1.2x to 3.9x
+ * depending on the metric). The cost is stated rather than hidden: a spike beyond the 95th now
+ * draws pinned to the top of the box instead of towering over the line, so the box shows how the
+ * metric has been behaving and not how bad its worst poll was. The number above still carries the
+ * level, and the detail line still carries the extremes.
+ *
+ * THE INSET IS ONE UNIT, not two and three. The stroke is 1.25 units wide, so a half-unit of
+ * clearance keeps it off the edge of the box; the extra it used to leave was a fifth of the
+ * height spent on nothing, and on a 17px box that is the difference between a line that moves
+ * and one that merely shifts. */
 function spark(key, vals) {
   const s = M[key], w = 200, h = 22;
   if (vals.length < 3) { s.line.setAttribute("d", ""); return; }
-  const hi = Math.max(...vals), lo = Math.min(...vals), span = hi - lo;
+  const q = (sorted, p) => sorted[Math.min(sorted.length - 1, Math.floor(p * (sorted.length - 1)))];
+  const sorted = [...vals].sort((a, b) => a - b);
+  let lo = q(sorted, 0.05), hi = q(sorted, 0.95);
+  /* WHEN THE PERCENTILES COLLAPSE, fall back to the extremes. If nine tenths of the window holds
+   * one value, the 5th and 95th land on it and carry nothing -- and a metric that is constant
+   * apart from rare spikes has those spikes as its ONLY news, so pinning them outside the axis
+   * would draw a flat line where the old axis at least showed them. */
+  if (!(hi > lo)) { lo = sorted[0]; hi = sorted[sorted.length - 1]; }
+  const span = hi - lo;
   const dx = w / (vals.length - 1);
   let d = "";
   for (let i = 0; i < vals.length; i++) {
-    const t = span > Math.abs(hi) * 1e-3 ? (vals[i] - lo) / span : 0.5;
-    d += (i ? "L" : "M") + (i * dx).toFixed(1) + "," + (h - 2 - (h - 5) * t).toFixed(1);
+    let t = span > Math.abs(hi) * 1e-3 ? (vals[i] - lo) / span : 0.5;
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    d += (i ? "L" : "M") + (i * dx).toFixed(1) + "," + (h - 1 - (h - 2) * t).toFixed(1);
   }
   s.line.setAttribute("d", d);
 }
