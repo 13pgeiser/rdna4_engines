@@ -1491,9 +1491,14 @@ impl<'a> SealedMoeOp<'a> {
     }
 
     /// The canonical combine of a split call: the unchanged BF16 combine over
-    /// the original ids/weights and the joined `down_expanded` slot rows, then
-    /// (only while the lab parity record asks for it) the unmasked GPU tail is
-    /// re-run into the now-dead `down_expanded`. The reference never re-combines.
+    /// the original ids/weights and the joined slot rows, then (only while the
+    /// lab parity record asks for it) the unmasked GPU tail is re-run into the
+    /// now-dead `down_expanded`. The reference never re-combines.
+    ///
+    /// The combine reads [`CpuSplitExecutor::combine_outputs`]: the joined
+    /// `down_expanded` (copy return) or the mapped cold-result view (mapped
+    /// return, all-cold layers). Nothing else about the combine changes; the
+    /// lab reference re-run still targets the `down_expanded` scratch.
     fn split_combine_decode(
         &self,
         gpu: &mut Gpu,
@@ -1505,8 +1510,14 @@ impl<'a> SealedMoeOp<'a> {
         let executor = decode_split_executor(params)?;
         let target = params.routed_out.unwrap_or(params.x_residual);
         let rows = params.batch_size;
-        executor.parity_before_combine(&*gpu, rows, params.down_expanded, target)?;
-        super::decode_combine_stage(gpu, params, target, selection.route)?;
+        let combine_input = executor.combine_outputs(params.down_expanded)?;
+        let combine_params = MoeParams {
+            down_expanded: combine_input,
+            ..*params
+        };
+        executor.parity_before_combine(&*gpu, rows, combine_input, target)?;
+        super::decode_combine_stage(gpu, &combine_params, target, selection.route)?;
+        executor.combine_enqueued(&*gpu)?;
         executor.parity_after_combine(&*gpu, rows, target)?;
         if executor.wants_reference() {
             self.split_reference_tail(gpu)?;
@@ -1534,14 +1545,20 @@ impl<'a> SealedMoeOp<'a> {
         let executor = prefill_split_executor(params)?;
         let target = params.routed_out.unwrap_or(params.x_batch);
         let rows = params.batch_size;
-        executor.parity_before_combine(&*gpu, rows, params.down_expanded, target)?;
+        let combine_input = executor.combine_outputs(params.down_expanded)?;
+        let combine_params = MoePrefillParams {
+            down_expanded: combine_input,
+            ..*params
+        };
+        executor.parity_before_combine(&*gpu, rows, combine_input, target)?;
         super::qt44_qt53_prefill::combine(
             gpu,
-            params,
+            &combine_params,
             selection.uses_grouped_rows(),
             selection.path2_m_total,
             false,
         )?;
+        executor.combine_enqueued(&*gpu)?;
         executor.parity_after_combine(&*gpu, rows, target)?;
         if executor.wants_reference() {
             self.split_reference_tail(gpu)?;

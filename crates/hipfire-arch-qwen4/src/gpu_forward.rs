@@ -3317,14 +3317,46 @@ impl Qwen4MoeLayerRuntime {
         else {
             return Ok(self);
         };
-        match hipfire_dispatch::cpu_split::CpuSplitExecutor::new(
-            gpu,
-            config.hidden_size,
-            config.moe_intermediate_size,
-            config.num_experts_per_tok,
-            hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS,
-            &placement,
-        ) {
+        // `HIPFIRE_QWEN4_D2_RETURN` is read from the immutable process snapshot
+        // for this load: an invalid spelling refuses the load before any
+        // executor storage exists. `copy` (the default and the kill value)
+        // leaves the executor exactly as `new` built it.
+        let built: Result<hipfire_dispatch::cpu_split::CpuSplitExecutor, String> = (|| {
+            let request = hipfire_config::memory::qwen4_d2_return()?;
+            let mut executor = hipfire_dispatch::cpu_split::CpuSplitExecutor::new(
+                gpu,
+                config.hidden_size,
+                config.moe_intermediate_size,
+                config.num_experts_per_tok,
+                hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS,
+                &placement,
+            )
+            .map_err(|error| format!("{error:?}"))?;
+            if request == hipfire_config::memory::D2Return::Mapped {
+                match executor.enable_mapped_return(gpu) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        let release = executor
+                            .free_gpu(gpu)
+                            .err()
+                            .map(|free| format!("; executor release also failed: {free:?}"))
+                            .unwrap_or_default();
+                        return Err(format!("{error:?}{release}"));
+                    }
+                }
+                // A refusal is capability routing and is never silent; the
+                // selected modes are summarized once per load by the loader
+                // from `split_return_modes`.
+                if let Some(reason) = executor.return_refusal() {
+                    eprintln!(
+                        "  qwen4 D2 return: layer {}: mapped refused, copy kept: {reason}",
+                        self.label
+                    );
+                }
+            }
+            Ok(executor)
+        })();
+        match built {
             Ok(executor) => {
                 self.cpu_split = Some(executor);
                 Ok(self)
@@ -3336,7 +3368,7 @@ impl Qwen4MoeLayerRuntime {
                     .map(|free| format!("; release also failed: {free:?}"))
                     .unwrap_or_default();
                 Err(Qwen4GpuForwardError::Dispatch(format!(
-                    "layer {label} CPU split executor: {error:?}{cleanup}"
+                    "layer {label} CPU split executor: {error}{cleanup}"
                 )))
             }
         }
@@ -6680,6 +6712,20 @@ impl Qwen4GpuForward {
                     .cpu_cold_owners
                     .as_ref()
                     .map(|owners| (layer.label, owners.kind().label()))
+            })
+            .collect()
+    }
+    /// The D2 cold-result return mode (`"mapped"` or `"copy"`) of every armed
+    /// split layer, in layer order.
+    pub(crate) fn split_return_modes(&self) -> Vec<(usize, &'static str)> {
+        self.moe
+            .iter()
+            .flatten()
+            .filter_map(|layer| {
+                layer
+                    .cpu_split
+                    .as_ref()
+                    .map(|executor| (layer.label, executor.return_mode().as_str()))
             })
             .collect()
     }

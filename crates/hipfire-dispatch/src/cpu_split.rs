@@ -16,7 +16,8 @@
 use crate::cpu_exec::{self, CpuMoeExpert};
 use crate::families::moe::RoutedExpertWeights;
 use crate::types::DispatchError;
-use hip_bridge::{HipError, PinnedTransferBuffer};
+use hip_bridge::{HipError, MappedHostBuffer, MappedPublished, PinnedTransferBuffer};
+use hipfire_config::memory::D2Return;
 use hipfire_cpu::quant::CpuQuant;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::cell::{Cell, RefCell};
@@ -105,6 +106,210 @@ pub struct SplitTiming {
     pub serial: bool,
 }
 
+/// Cold-result transport of one executor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum D2ReturnMode {
+    /// Cold slots are copied host-to-device into `down_expanded`, queued
+    /// behind the GPU tail's masked zero stores (the original transport).
+    #[default]
+    Copy,
+    /// The CPU writes the cold slots into an owned mapped, coherent host
+    /// allocation and the unchanged canonical combine reads it directly. No
+    /// cold-slot H2D is issued. All-cold layers only.
+    Mapped,
+}
+
+impl D2ReturnMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Mapped => "mapped",
+        }
+    }
+}
+
+/// Why a layer cannot use the mapped return, or `None`. The mapped view
+/// REPLACES the combine's expanded input, so it must hold every live slot:
+/// only a layer whose every expert is cold qualifies.
+fn mapped_return_refusal(placement: &[u8]) -> Option<&'static str> {
+    if placement.is_empty() {
+        return Some("empty ownership plan");
+    }
+    if !placement.iter().all(|&p| p == 1) {
+        return Some(
+            "mixed hot/cold placement: the mapped return replaces the whole combine input, so only an all-cold layer can use it (copy transport kept)",
+        );
+    }
+    None
+}
+
+/// A transport decision and the capability reason when the request was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReturnDecision {
+    pub mode: D2ReturnMode,
+    pub refusal: Option<&'static str>,
+}
+
+/// Capability routing of the requested transport for one layer's ownership
+/// plan: `Mapped` is honoured on all-cold plans only, every other request or
+/// plan keeps `Copy` and (for a refused `Mapped`) says why.
+pub fn select_return_mode(request: D2Return, placement: &[u8]) -> ReturnDecision {
+    match request {
+        D2Return::Copy => ReturnDecision {
+            mode: D2ReturnMode::Copy,
+            refusal: None,
+        },
+        D2Return::Mapped => match mapped_return_refusal(placement) {
+            None => ReturnDecision {
+                mode: D2ReturnMode::Mapped,
+                refusal: None,
+            },
+            Some(reason) => ReturnDecision {
+                mode: D2ReturnMode::Copy,
+                refusal: Some(reason),
+            },
+        },
+    }
+}
+
+/// Zero every slot row of `out` that is not a host slot: exactly the bytes the
+/// copy transport's `down_expanded` holds there (the masked GPU tail stores
+/// zero for slots owned by neither arm). `host_slots` is strictly ascending.
+fn zero_unwritten_slots(out: &mut [f32], dim: usize, host_slots: &[u32]) {
+    let mut next = 0usize;
+    for &slot in host_slots {
+        let slot = slot as usize;
+        out[next * dim..slot * dim].fill(0.0);
+        next = slot + 1;
+    }
+    out[next * dim..].fill(0.0);
+}
+
+/// What the executor did for one recorded call (lab records only).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SplitTransport {
+    /// Transport this call used; `Copy` for every call of a copy executor and
+    /// for a lab all-hot call of a mapped one.
+    pub mode: D2ReturnMode,
+    /// Cold-slot H2D enqueues this call issued (zero on a mapped call).
+    pub output_copy_calls: u64,
+    /// Mapped generations this call published (1 on a mapped call).
+    pub mapped_publications: u64,
+    /// Retirements that actually blocked, prepare and join of this call.
+    pub mapped_retire_waits: u64,
+}
+
+/// Per-generation protocol of the mapped return, independent of HIP so the
+/// ordering is testable without a device:
+/// `Idle -> Published (join) -> Lent (combine_outputs) -> InFlight
+/// (combine_enqueued) -> Idle (next prepare retires)`. A lab all-hot call
+/// bypasses the mapped view (`Bypassed`); any failure is `Poisoned`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReturnStage {
+    Idle,
+    Published,
+    Lent,
+    InFlight,
+    Bypassed,
+    Poisoned,
+}
+
+/// Which tensor the canonical combine must read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CombineSource {
+    Expanded,
+    Mapped,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReturnProtocol {
+    stage: ReturnStage,
+}
+
+impl ReturnProtocol {
+    const fn new() -> Self {
+        Self {
+            stage: ReturnStage::Idle,
+        }
+    }
+
+    /// `prepare`: `Ok(true)` when the previous generation's consumer must be
+    /// retired before anything can write the buffer. A published generation
+    /// whose combine was never enqueued is a protocol error.
+    fn admit_prepare(&mut self) -> Result<bool, &'static str> {
+        match self.stage {
+            ReturnStage::Idle => Ok(false),
+            ReturnStage::Bypassed => {
+                self.stage = ReturnStage::Idle;
+                Ok(false)
+            }
+            ReturnStage::InFlight => Ok(true),
+            ReturnStage::Published | ReturnStage::Lent => {
+                Err("the previous generation was published but its combine was never enqueued")
+            }
+            ReturnStage::Poisoned => Err("the mapped return is poisoned"),
+        }
+    }
+
+    fn retired(&mut self) {
+        if self.stage == ReturnStage::InFlight {
+            self.stage = ReturnStage::Idle;
+        }
+    }
+
+    /// `join` may write only over a retired buffer.
+    fn begin_join(&self) -> Result<(), &'static str> {
+        match self.stage {
+            ReturnStage::Idle => Ok(()),
+            _ => Err("join over a mapped generation that was not retired"),
+        }
+    }
+
+    fn published(&mut self) {
+        self.stage = ReturnStage::Published;
+    }
+    fn bypassed(&mut self) {
+        self.stage = ReturnStage::Bypassed;
+    }
+    fn poison(&mut self) {
+        self.stage = ReturnStage::Poisoned;
+    }
+
+    /// `combine_outputs`: the published view is handed out once per generation.
+    fn lend(&mut self) -> Result<CombineSource, &'static str> {
+        match self.stage {
+            ReturnStage::Published => {
+                self.stage = ReturnStage::Lent;
+                Ok(CombineSource::Mapped)
+            }
+            ReturnStage::Bypassed => Ok(CombineSource::Expanded),
+            ReturnStage::Idle => Err("combine_outputs before a successful join of this generation"),
+            ReturnStage::Lent => Err("combine_outputs twice for one generation"),
+            ReturnStage::InFlight => Err("combine_outputs after the generation was consumed"),
+            ReturnStage::Poisoned => Err("combine_outputs after a failed join"),
+        }
+    }
+
+    /// `combine_enqueued`: `Ok(true)` when the published token must be marked
+    /// in flight, `Ok(false)` for a bypassed (copy) call.
+    fn enqueued(&mut self) -> Result<bool, &'static str> {
+        match self.stage {
+            ReturnStage::Lent => {
+                self.stage = ReturnStage::InFlight;
+                Ok(true)
+            }
+            ReturnStage::Bypassed => {
+                self.stage = ReturnStage::Idle;
+                Ok(false)
+            }
+            ReturnStage::Published => Err("combine_enqueued without combine_outputs"),
+            ReturnStage::Idle => Err("combine_enqueued without a published generation"),
+            ReturnStage::InFlight => Err("combine_enqueued twice for one generation"),
+            ReturnStage::Poisoned => Err("combine_enqueued after a failed join"),
+        }
+    }
+}
+
 /// One record per recorded layer call, in call order. Timing mode leaves every
 /// tensor Vec empty.
 #[derive(Clone, Debug)]
@@ -132,6 +337,8 @@ pub struct SplitParityRecord {
     /// [rows*top_k*dim] all-GPU tail on ORIGINAL ids, run after the D2 combine.
     pub gpu_expanded: Vec<f32>,
     pub timing: SplitTiming,
+    /// Transport of this call (filled at `join`).
+    pub transport: SplitTransport,
 }
 
 /// Hard ceiling on `max_records` (guards unbounded lab memory).
@@ -204,6 +411,24 @@ struct Transaction {
     failed: bool,
     /// Set by `prepare` only for an `AllCold` diagnostic run.
     cold_shadow: Option<Arc<dyn CpuShadow>>,
+    /// Mapped-return generation protocol (inert for a copy executor).
+    ret: ReturnProtocol,
+    /// Published token of the current mapped generation until it is marked in
+    /// flight by `combine_enqueued`.
+    token: Option<MappedPublished>,
+    /// This call reads the mapped view (mapped executor, not a lab all-hot call).
+    mapped_call: bool,
+    /// `mapped_retire_waits` when this call's `prepare` began.
+    waits_base: u64,
+}
+
+/// The mapped cold-result return: one owning mapped host allocation and its
+/// non-owning device view. The view is `Borrowed` and is never passed to a free
+/// path; `buf` strictly outlives every use of it (both die together in
+/// `free_gpu`, after a device synchronize, and `buf` quiesces itself on drop).
+struct MappedReturn {
+    view: GpuTensor,
+    buf: RefCell<MappedHostBuffer>,
 }
 
 /// Preallocated per-layer transaction and immutable expert ownership plan.
@@ -226,6 +451,16 @@ pub struct CpuSplitExecutor {
     ref_pending: Cell<bool>,
     layer: Cell<usize>,
     parity: RefCell<ParityState>,
+    /// Mapped cold-result return; `None` selects the copy transport.
+    mapped: Option<MappedReturn>,
+    /// Why a requested mapped return was refused (copy transport kept).
+    return_refusal: Option<String>,
+    /// Cold-slot H2D enqueues, ever.
+    output_copy_calls: Cell<u64>,
+    /// Mapped generations published, ever.
+    mapped_publications: Cell<u64>,
+    /// Mapped retirements that actually blocked, ever.
+    mapped_retire_waits: Cell<u64>,
 }
 
 impl CpuSplitExecutor {
@@ -298,6 +533,10 @@ impl CpuSplitExecutor {
                 ready: false,
                 failed: false,
                 cold_shadow: None,
+                ret: ReturnProtocol::new(),
+                token: None,
+                mapped_call: false,
+                waits_base: 0,
             }),
             diag_on: Cell::new(false),
             recording: Cell::new(false),
@@ -312,6 +551,11 @@ impl CpuSplitExecutor {
                 records: Vec::new(),
                 open: None,
             }),
+            mapped: None,
+            return_refusal: None,
+            output_copy_calls: Cell::new(0),
+            mapped_publications: Cell::new(0),
+            mapped_retire_waits: Cell::new(0),
         })
     }
 
@@ -332,6 +576,174 @@ impl CpuSplitExecutor {
     }
     pub fn top_k(&self) -> usize {
         self.top_k
+    }
+
+    /// The transport this executor's cold results use.
+    pub fn return_mode(&self) -> D2ReturnMode {
+        if self.mapped.is_some() {
+            D2ReturnMode::Mapped
+        } else {
+            D2ReturnMode::Copy
+        }
+    }
+
+    /// Why a requested mapped return was refused (the copy transport is kept).
+    pub fn return_refusal(&self) -> Option<&str> {
+        self.return_refusal.as_deref()
+    }
+
+    /// Bytes of the owned mapped cold-result allocation; 0 on the copy transport.
+    pub fn mapped_capacity_bytes(&self) -> usize {
+        self.mapped.as_ref().map_or(0, |m| m.view.buf.size())
+    }
+
+    /// `(output_copy_calls, mapped_publications, mapped_retire_waits)`, each
+    /// cumulative: cold-slot H2D enqueues, mapped generations published and
+    /// retirements that actually blocked.
+    pub fn transport_counters(&self) -> (u64, u64, u64) {
+        (
+            self.output_copy_calls.get(),
+            self.mapped_publications.get(),
+            self.mapped_retire_waits.get(),
+        )
+    }
+
+    /// Switch this executor's cold return to the mapped transport, or keep
+    /// the copy transport and record why. Call once, at load, before the first
+    /// `prepare`, and only when the operator asked for `mapped`. Capability
+    /// routing, never a silent numeric fallback: a mixed hot/cold plan, an
+    /// allocation failure or a missing/null device alias is a refusal that
+    /// leaves [`Self::return_refusal`] set and the original copy transport
+    /// running. A failed alias is NEVER replaced by the host pointer.
+    pub fn enable_mapped_return(&mut self, gpu: &Gpu) -> Result<D2ReturnMode, DispatchError> {
+        if self.mapped.is_some() || self.return_refusal.is_some() {
+            return Err(err("the cold-result return was already selected"));
+        }
+        {
+            let st = self.state.get_mut();
+            if st.failed || st.ready {
+                return Err(err(
+                    "cold-result return selection with an active transaction",
+                ));
+            }
+        }
+        if gpu.device_id != self.device {
+            return Err(err("cold-result return selection on another device"));
+        }
+        let decision = select_return_mode(D2Return::Mapped, &self.placement);
+        if let Some(reason) = decision.refusal {
+            self.return_refusal = Some(reason.to_string());
+            return Ok(D2ReturnMode::Copy);
+        }
+        gpu.bind_thread().map_err(err)?;
+        let values = self.max_rows * self.top_k * self.dim;
+        let buffer = match gpu.hip.mapped_host_buffer(values * 4) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                self.return_refusal = Some(format!(
+                    "mapped host allocation of {} bytes failed: {error}",
+                    values * 4
+                ));
+                return Ok(D2ReturnMode::Copy);
+            }
+        };
+        // SAFETY: `buffer` owns the mapped allocation and is stored next to
+        // this Borrowed view in `MappedReturn`; the pair is only dropped
+        // together (`free_gpu`, after a device synchronize) and the view is
+        // never given to a free path.
+        let view = GpuTensor {
+            buf: unsafe { buffer.device_buffer().alias() },
+            shape: vec![values],
+            dtype: DType::F32,
+        };
+        self.mapped = Some(MappedReturn {
+            view,
+            buf: RefCell::new(buffer),
+        });
+        Ok(D2ReturnMode::Mapped)
+    }
+
+    /// Prove the mapped buffer's previous consumer finished: a cheap poll
+    /// first, a blocking wait only if it is still outstanding (counted).
+    fn prove_retired(&self, gpu: &Gpu, buf: &mut MappedHostBuffer) -> Result<(), DispatchError> {
+        if buf.try_retire(&gpu.hip).map_err(err)? {
+            return Ok(());
+        }
+        self.mapped_retire_waits
+            .set(self.mapped_retire_waits.get() + 1);
+        buf.retire(&gpu.hip).map_err(err)
+    }
+
+    /// The tensor the canonical combine must read as its expanded slot rows:
+    /// `expanded` on the copy transport; on the mapped transport the published
+    /// mapped view, handed out ONCE after a successful `join` of this
+    /// generation. Refused before `join`, after a failed `join`, after the
+    /// generation was consumed and on a second request. Pair every call with
+    /// [`Self::combine_enqueued`] right after the combine is enqueued.
+    pub fn combine_outputs<'a>(
+        &'a self,
+        expanded: &'a GpuTensor,
+    ) -> Result<&'a GpuTensor, DispatchError> {
+        let Some(mapped) = self.mapped.as_ref() else {
+            return Ok(expanded);
+        };
+        let mut st = self
+            .state
+            .try_borrow_mut()
+            .map_err(|_| err("combine_outputs during an active transaction"))?;
+        if st.failed {
+            return Err(err("combine_outputs after a failed transaction"));
+        }
+        if st.ready {
+            return Err(err("combine_outputs before join"));
+        }
+        match st.ret.lend().map_err(err)? {
+            CombineSource::Expanded => Ok(expanded),
+            CombineSource::Mapped => Ok(&mapped.view),
+        }
+    }
+
+    /// Call right after the canonical combine is enqueued: on the mapped
+    /// transport records the in-flight consumer of the published generation (a
+    /// retirement event on the active stream) so the next `prepare` can prove
+    /// it finished. No-op on the copy transport. An error poisons the
+    /// transaction.
+    pub fn combine_enqueued(&self, gpu: &Gpu) -> Result<(), DispatchError> {
+        let Some(mapped) = self.mapped.as_ref() else {
+            return Ok(());
+        };
+        let mut st = self
+            .state
+            .try_borrow_mut()
+            .map_err(|_| err("combine_enqueued during an active transaction"))?;
+        if st.failed {
+            return Err(err("combine_enqueued after a failed transaction"));
+        }
+        let result = (|| {
+            if !st.ret.enqueued().map_err(err)? {
+                return Ok(());
+            }
+            let token = st
+                .token
+                .take()
+                .ok_or_else(|| err("combine_enqueued lost the published token"))?;
+            gpu.bind_thread().map_err(err)?;
+            let mut buf = mapped
+                .buf
+                .try_borrow_mut()
+                .map_err(|_| err("mapped return buffer is in use"))?;
+            buf.mark_gpu_reading(&gpu.hip, token, gpu.active_stream.as_ref())
+                .map_err(err)
+        })();
+        if result.is_err() {
+            st.failed = true;
+            st.ret.poison();
+            let _ = gpu.hip.device_synchronize();
+            if self.diag_on.get() {
+                self.close_open();
+            }
+        }
+        result
     }
 
     /// Freeze one diagnostic run for this layer. Replaces any previous
@@ -629,6 +1041,12 @@ impl CpuSplitExecutor {
             return Err(err("failed or unfinished transaction"));
         }
         let result = (|| {
+            let retire_first = if self.mapped.is_some() {
+                st.waits_base = self.mapped_retire_waits.get();
+                st.ret.admit_prepare().map_err(err)?
+            } else {
+                false
+            };
             st.input
                 .download_async(&gpu.hip, &x_rot.buf, 0, nx * 4, gpu.active_stream.as_ref())
                 .map_err(err)?;
@@ -654,6 +1072,21 @@ impl CpuSplitExecutor {
             // These may synchronize the stream, intentionally BEFORE its tail.
             st.mask.complete(&gpu.hip).map_err(err)?;
             st.output.complete(&gpu.hip).map_err(err)?;
+            if retire_first {
+                // The input completion above synchronized the stream, so the
+                // previous generation's combine is normally finished: this is
+                // a poll, not a wait. Nothing can write the buffer before it.
+                let mapped = self
+                    .mapped
+                    .as_ref()
+                    .ok_or_else(|| err("mapped retirement without a mapped return"))?;
+                let mut buf = mapped
+                    .buf
+                    .try_borrow_mut()
+                    .map_err(|_| err("mapped return buffer is in use"))?;
+                self.prove_retired(gpu, &mut buf)?;
+                st.ret.retired();
+            }
             for s in 0..slots {
                 let at = (nx + s) * 4;
                 let id =
@@ -696,6 +1129,7 @@ impl CpuSplitExecutor {
                     gpu.active_stream.as_ref(),
                 )
                 .map_err(err)?;
+            st.mapped_call = self.mapped.is_some() && endpoint != SplitEndpoint::AllHot;
             st.rows = rows;
             st.ready = true;
             Ok(())
@@ -744,6 +1178,7 @@ impl CpuSplitExecutor {
             d2_expanded: Vec::new(),
             d2_target: Vec::new(),
             gpu_expanded: Vec::new(),
+            transport: SplitTransport::default(),
             timing: SplitTiming {
                 prepare_ns,
                 cold_slots: cold as u32,
@@ -841,6 +1276,8 @@ impl CpuSplitExecutor {
         let tj0 = diag.then(Instant::now);
         let serial = diag && self.parity.borrow().serial;
         let shadow = st.cold_shadow.clone();
+        let copies0 = self.output_copy_calls.get();
+        let publications0 = self.mapped_publications.get();
         let result = (|| {
             if serial {
                 sync_stream(gpu)?;
@@ -869,6 +1306,9 @@ impl CpuSplitExecutor {
                 gpu_ids,
                 host_slots,
                 host_count,
+                ret,
+                token,
+                mapped_call,
                 ..
             } = &mut *st;
             // SAFETY: hipHostMalloc storage is aligned, initialized and idle.
@@ -880,6 +1320,49 @@ impl CpuSplitExecutor {
                     rows * self.dim,
                 )
             };
+            if *mapped_call {
+                // Mapped return: the cold slots go straight into the mapped
+                // allocation the canonical combine will read; NO cold-slot H2D.
+                let mapped = self
+                    .mapped
+                    .as_ref()
+                    .ok_or_else(|| err("mapped call without a mapped return"))?;
+                ret.begin_join().map_err(err)?;
+                let mut buf = mapped
+                    .buf
+                    .try_borrow_mut()
+                    .map_err(|_| err("mapped return buffer is in use"))?;
+                // `prepare` retired the previous consumer; prove it again
+                // before the first host store (no-op when already Retired).
+                self.prove_retired(gpu, &mut buf)?;
+                let mut write = buf.begin_write().map_err(err)?;
+                let all = write.f32_mut().map_err(err)?;
+                let rows_out = &mut all[..slots * self.dim];
+                let t_cpu = diag.then(Instant::now);
+                cpu_exec::moe_cpu_host_slot_outputs(
+                    self.dim,
+                    self.mi,
+                    rows,
+                    self.top_k,
+                    self.placement.len(),
+                    &ids[..slots],
+                    Some(&gpu_ids[..slots]),
+                    &host_slots[..*host_count],
+                    &resolved[..*host_count],
+                    x,
+                    false,
+                    rows_out,
+                )?;
+                // Slots owned by neither arm hold zero in the copy transport's
+                // expanded rows (masked zero stores); match those bytes.
+                zero_unwritten_slots(rows_out, self.dim, &host_slots[..*host_count]);
+                let cpu_ns = t_cpu.map_or(0, |t| ns(t, Instant::now()));
+                *token = Some(write.publish());
+                ret.published();
+                self.mapped_publications
+                    .set(self.mapped_publications.get() + 1);
+                return Ok(cpu_ns);
+            }
             let out = unsafe {
                 std::slice::from_raw_parts_mut(
                     output.as_bytes_mut().as_mut_ptr().cast::<f32>(),
@@ -920,7 +1403,11 @@ impl CpuSplitExecutor {
                 output
                     .upload_async(&gpu.hip, &dst, offset, len, gpu.active_stream.as_ref())
                     .map_err(err)?;
+                self.output_copy_calls.set(self.output_copy_calls.get() + 1);
                 i = j;
+            }
+            if self.mapped.is_some() {
+                ret.bypassed();
             }
             Ok(cpu_ns)
         })();
@@ -937,6 +1424,16 @@ impl CpuSplitExecutor {
                             o.rec.timing.join_total_ns = ns(tj0, now);
                             o.t_join_end = now;
                             o.stage = Stage::Joined;
+                            o.rec.transport = SplitTransport {
+                                mode: if st.mapped_call {
+                                    D2ReturnMode::Mapped
+                                } else {
+                                    D2ReturnMode::Copy
+                                },
+                                output_copy_calls: self.output_copy_calls.get() - copies0,
+                                mapped_publications: self.mapped_publications.get() - publications0,
+                                mapped_retire_waits: self.mapped_retire_waits.get() - st.waits_base,
+                            };
                         }
                     }
                 }
@@ -944,6 +1441,7 @@ impl CpuSplitExecutor {
             }
             Err(e) => {
                 st.failed = true;
+                st.ret.poison();
                 let _ = gpu.hip.device_synchronize();
                 if diag {
                     self.close_open();
@@ -953,29 +1451,276 @@ impl CpuSplitExecutor {
         }
     }
 
-    /// Per-layer live transfer volume: original x/ids/weights download, masked
-    /// ids upload, and just the cold F32 expanded slot returns. No residual.
+    /// Per-layer live host<->device transfer volume: original x/ids/weights
+    /// download, masked ids upload, and on the copy transport just the cold F32
+    /// expanded slot returns (H2D). On the mapped transport no cold slot is
+    /// copied: that return is [`Self::mapped_return_bytes`]. No residual.
     pub fn transfer_bytes(&self, rows: usize, cold_slots: usize) -> (usize, usize) {
+        let returned = if self.mapped.is_some() {
+            0
+        } else {
+            4 * cold_slots * self.dim
+        };
         (
             4 * rows * (self.dim + 2 * self.top_k),
-            4 * rows * self.top_k + 4 * cold_slots * self.dim,
+            4 * rows * self.top_k + returned,
         )
+    }
+
+    /// Bytes the canonical combine reads remotely from the mapped allocation
+    /// for `cold_slots` cold slot rows (PCIe reads, not H2D copies); 0 on the
+    /// copy transport.
+    pub fn mapped_return_bytes(&self, cold_slots: usize) -> usize {
+        if self.mapped.is_some() {
+            4 * cold_slots * self.dim
+        } else {
+            0
+        }
     }
 
     pub fn free_gpu(self, gpu: &Gpu) -> Result<(), HipError> {
         gpu.bind_thread()?;
         if let Err(e) = gpu.hip.device_synchronize() {
-            // Both pinned copy sources and the mask allocation may still be
-            // referenced. Retain the whole owner if retirement is unproved.
+            // Both pinned copy sources, the mapped cold-result allocation and
+            // the mask allocation may still be referenced. Retain the whole
+            // owner if retirement is unproved.
             std::mem::forget(self);
             return Err(e);
         }
         let Self {
             masked_indices,
             state,
+            mapped,
             ..
         } = self;
         drop(state);
+        // Drop the owning allocation (it quiesces its consumer itself and
+        // retains the memory if that fails), then the Borrowed view with it.
+        // The view is never passed to `hip.free`.
+        drop(mapped);
         gpu.hip.free(masked_indices.buf)
+    }
+}
+
+#[cfg(test)]
+mod return_tests {
+    use super::*;
+    use hipfire_config::memory::parse_d2_return;
+
+    /// One whole generation: prepare, join, hand out the view, enqueue.
+    fn run_generation(p: &mut ReturnProtocol) {
+        assert_eq!(p.admit_prepare(), Ok(p.stage == ReturnStage::InFlight));
+        p.retired();
+        p.begin_join().unwrap();
+        p.published();
+        assert_eq!(p.lend(), Ok(CombineSource::Mapped));
+        assert_eq!(p.enqueued(), Ok(true));
+    }
+
+    #[test]
+    fn combine_outputs_refuses_before_join() {
+        let mut p = ReturnProtocol::new();
+        assert!(p.lend().is_err());
+        assert_eq!(p.stage, ReturnStage::Idle);
+        // A prepared-but-unjoined generation is still `Idle`.
+        assert_eq!(p.admit_prepare(), Ok(false));
+        assert!(p.lend().is_err());
+    }
+
+    #[test]
+    fn combine_outputs_refuses_after_a_failed_join() {
+        let mut p = ReturnProtocol::new();
+        p.admit_prepare().unwrap();
+        p.poison();
+        assert!(p.lend().is_err());
+        assert!(p.enqueued().is_err());
+        assert!(
+            p.admit_prepare().is_err(),
+            "a poisoned return never serves another call"
+        );
+        assert!(p.begin_join().is_err());
+    }
+
+    #[test]
+    fn combine_outputs_hands_out_the_view_once_per_generation() {
+        let mut p = ReturnProtocol::new();
+        p.admit_prepare().unwrap();
+        p.begin_join().unwrap();
+        p.published();
+        assert_eq!(p.lend(), Ok(CombineSource::Mapped));
+        assert!(p.lend().is_err(), "twice");
+        assert_eq!(p.enqueued(), Ok(true));
+        assert!(p.lend().is_err(), "after the token was consumed");
+    }
+
+    #[test]
+    fn combine_enqueued_requires_a_published_and_lent_generation() {
+        let mut p = ReturnProtocol::new();
+        assert!(p.enqueued().is_err(), "nothing published");
+        p.admit_prepare().unwrap();
+        assert!(p.enqueued().is_err(), "prepared only");
+        p.begin_join().unwrap();
+        p.published();
+        assert!(
+            p.enqueued().is_err(),
+            "published but combine_outputs never asked"
+        );
+        assert_eq!(p.lend(), Ok(CombineSource::Mapped));
+        assert_eq!(p.enqueued(), Ok(true));
+        assert!(p.enqueued().is_err(), "twice");
+    }
+
+    #[test]
+    fn next_prepare_retires_the_consumer_before_any_write() {
+        let mut p = ReturnProtocol::new();
+        run_generation(&mut p);
+        assert_eq!(p.stage, ReturnStage::InFlight);
+        assert!(
+            p.begin_join().is_err(),
+            "no write over an unretired consumer"
+        );
+        assert_eq!(
+            p.admit_prepare(),
+            Ok(true),
+            "next prepare must retire first"
+        );
+        assert!(
+            p.begin_join().is_err(),
+            "still unretired until the proof lands"
+        );
+        p.retired();
+        p.begin_join().unwrap();
+    }
+
+    #[test]
+    fn repeated_generations_alternate_retire_and_publish() {
+        let mut p = ReturnProtocol::new();
+        for generation in 0..8 {
+            assert_eq!(
+                p.stage == ReturnStage::InFlight,
+                generation > 0,
+                "generation {generation}"
+            );
+            run_generation(&mut p);
+        }
+    }
+
+    #[test]
+    fn a_skipped_combine_enqueued_is_a_protocol_error_at_the_next_prepare() {
+        let mut p = ReturnProtocol::new();
+        p.admit_prepare().unwrap();
+        p.begin_join().unwrap();
+        p.published();
+        assert!(p.admit_prepare().is_err(), "published, never handed out");
+        let mut q = ReturnProtocol::new();
+        q.admit_prepare().unwrap();
+        q.begin_join().unwrap();
+        q.published();
+        q.lend().unwrap();
+        assert!(
+            q.admit_prepare().is_err(),
+            "handed out, never marked in flight"
+        );
+    }
+
+    #[test]
+    fn a_bypassed_call_reads_the_expanded_rows_and_never_marks_a_token() {
+        let mut p = ReturnProtocol::new();
+        run_generation(&mut p);
+        assert_eq!(p.admit_prepare(), Ok(true));
+        p.retired();
+        p.begin_join().unwrap();
+        p.bypassed();
+        assert_eq!(p.lend(), Ok(CombineSource::Expanded));
+        assert_eq!(p.enqueued(), Ok(false));
+        assert_eq!(p.stage, ReturnStage::Idle);
+        // An un-enqueued bypassed call does not block the next prepare.
+        p.begin_join().unwrap();
+        p.bypassed();
+        assert_eq!(p.admit_prepare(), Ok(false));
+        p.begin_join().unwrap();
+    }
+
+    #[test]
+    fn mixed_placement_selects_copy_with_a_reason() {
+        let decision = select_return_mode(D2Return::Mapped, &[1, 1, 0, 1]);
+        assert_eq!(decision.mode, D2ReturnMode::Copy);
+        assert!(decision
+            .refusal
+            .is_some_and(|r| r.contains("mixed hot/cold")));
+        let all_hot = select_return_mode(D2Return::Mapped, &[0, 0, 0]);
+        assert_eq!(all_hot.mode, D2ReturnMode::Copy);
+        assert!(all_hot.refusal.is_some());
+        let empty = select_return_mode(D2Return::Mapped, &[]);
+        assert_eq!(empty.mode, D2ReturnMode::Copy);
+        assert!(empty.refusal.is_some());
+    }
+
+    #[test]
+    fn all_cold_placement_selects_mapped() {
+        let decision = select_return_mode(D2Return::Mapped, &[1; 512]);
+        assert_eq!(
+            decision,
+            ReturnDecision {
+                mode: D2ReturnMode::Mapped,
+                refusal: None
+            }
+        );
+    }
+
+    #[test]
+    fn the_default_and_the_kill_value_select_copy_without_a_refusal() {
+        for placement in [&[1u8, 1, 1][..], &[1, 0][..]] {
+            let decision = select_return_mode(D2Return::Copy, placement);
+            assert_eq!(
+                decision,
+                ReturnDecision {
+                    mode: D2ReturnMode::Copy,
+                    refusal: None
+                }
+            );
+        }
+        assert_eq!(D2ReturnMode::default(), D2ReturnMode::Copy);
+    }
+
+    #[test]
+    fn flag_spellings_drive_the_selection() {
+        let all_cold = [1u8; 8];
+        let request =
+            |raw: Option<&str>| parse_d2_return(raw).map(|r| select_return_mode(r, &all_cold).mode);
+        assert_eq!(request(None), Ok(D2ReturnMode::Copy));
+        assert_eq!(request(Some("copy")), Ok(D2ReturnMode::Copy));
+        assert_eq!(request(Some("mapped")), Ok(D2ReturnMode::Mapped));
+        assert!(request(Some("pinned")).is_err());
+        assert!(request(Some("")).is_err());
+    }
+
+    #[test]
+    fn unwritten_slots_are_zeroed_and_host_slots_untouched() {
+        let dim = 3;
+        let mut out = vec![f32::NAN; 5 * dim];
+        for slot in [1usize, 2, 4] {
+            out[slot * dim..(slot + 1) * dim].fill(slot as f32);
+        }
+        zero_unwritten_slots(&mut out, dim, &[1, 2, 4]);
+        for slot in 0..5usize {
+            let want = if [1, 2, 4].contains(&slot) {
+                slot as f32
+            } else {
+                0.0
+            };
+            assert!(
+                out[slot * dim..(slot + 1) * dim]
+                    .iter()
+                    .all(|v| v.to_bits() == want.to_bits()),
+                "slot {slot}"
+            );
+        }
+        let mut none = vec![f32::NAN; 2 * dim];
+        zero_unwritten_slots(&mut none, dim, &[]);
+        assert!(none.iter().all(|v| v.to_bits() == 0));
+        let mut all = vec![7.0f32; 2 * dim];
+        zero_unwritten_slots(&mut all, dim, &[0, 1]);
+        assert!(all.iter().all(|&v| v == 7.0));
     }
 }

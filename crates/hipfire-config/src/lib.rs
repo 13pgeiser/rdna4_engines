@@ -9641,6 +9641,52 @@ pub mod memory {
             .map(PathBuf::from)
     }
 
+    /// Cold-result transport of the D2 CPU split (`developer.qwen4_d2_return`,
+    /// env `HIPFIRE_QWEN4_D2_RETURN`).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum D2Return {
+        /// The cold slots are copied host-to-device behind the GPU tail
+        /// (today's transport, the default and the kill value).
+        #[default]
+        Copy,
+        /// The CPU writes the cold slots into a mapped, coherent host
+        /// allocation that the canonical combine reads directly. Honoured only
+        /// on all-cold layers; a mixed layer stays on `Copy`.
+        Mapped,
+    }
+
+    impl D2Return {
+        /// The spelling [`parse_d2_return`] accepts for this mode.
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Copy => "copy",
+                Self::Mapped => "mapped",
+            }
+        }
+    }
+
+    /// Pure body of [`qwen4_d2_return`]: unset is `Copy`; `copy` and `mapped`
+    /// (exact, lower-case) select a mode; every other spelling, including the
+    /// empty string, is an error that names the accepted values. A mistyped
+    /// transport must refuse the load, never silently run the other one.
+    pub fn parse_d2_return(raw: Option<&str>) -> std::result::Result<D2Return, String> {
+        match raw {
+            None => Ok(D2Return::Copy),
+            Some("copy") => Ok(D2Return::Copy),
+            Some("mapped") => Ok(D2Return::Mapped),
+            Some(other) => Err(format!(
+                "HIPFIRE_QWEN4_D2_RETURN={other:?} is not a D2 return mode: expected `mapped` or `copy`"
+            )),
+        }
+    }
+
+    /// `developer.qwen4_d2_return` (env `HIPFIRE_QWEN4_D2_RETURN`): the D2
+    /// cold-result transport, read from the process snapshot. Resolve it once
+    /// per load; an invalid value is an `Err` the loader must propagate.
+    pub fn qwen4_d2_return() -> std::result::Result<D2Return, String> {
+        parse_d2_return(process_value("HIPFIRE_QWEN4_D2_RETURN").as_deref())
+    }
+
     /// How much of a split step the GPU takes (`memory.offload_passback_share`).
     ///
     /// Read only when [`offload_exec`] is [`OffloadExec::Passback`]; in any other
@@ -9702,6 +9748,27 @@ pub mod memory {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn d2_return_parses_mapped_copy_and_refuses_everything_else() {
+            assert_eq!(parse_d2_return(None), Ok(D2Return::Copy));
+            assert_eq!(D2Return::default(), D2Return::Copy);
+            assert_eq!(parse_d2_return(Some("copy")), Ok(D2Return::Copy));
+            assert_eq!(parse_d2_return(Some("mapped")), Ok(D2Return::Mapped));
+            for bad in [
+                "", "Mapped", "COPY", " mapped", "1", "0", "true", "pinned", "mapped ",
+            ] {
+                let error = parse_d2_return(Some(bad)).unwrap_err();
+                assert!(
+                    error.contains("HIPFIRE_QWEN4_D2_RETURN"),
+                    "{bad:?}: {error}"
+                );
+                assert!(error.contains("`mapped` or `copy`"), "{bad:?}: {error}");
+            }
+            for mode in [D2Return::Copy, D2Return::Mapped] {
+                assert_eq!(parse_d2_return(Some(mode.as_str())), Ok(mode));
+            }
+        }
 
         #[test]
         fn offload_exec_roundtrip() {

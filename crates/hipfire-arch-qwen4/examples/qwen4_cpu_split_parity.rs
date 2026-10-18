@@ -27,6 +27,13 @@
 //! `memory.offload_exec` always wins over the force, so any explicit value is refused here),
 //! and every armed layer must be a whole-layer host owner: split owner kind `whole-layer`,
 //! identity `cpu-whole-split-v1/<bitmap of the host-placed layers>`, placement all-cold.
+//! `HIPFIRE_QWEN4_D2_RETURN=mapped|copy` (default `copy`) selects the cold-result
+//! transport at load: `mapped` makes every all-cold layer's canonical combine read
+//! the CPU-written mapped allocation instead of H2D-copied slots (a mixed-placement
+//! layer keeps `copy`). Every layer reports its return mode, `output_copy_calls`,
+//! `mapped_publications` and `mapped_retire_waits`; a gate checks that a mapped call
+//! publishes once with zero cold-slot copies. The same-input gates run unchanged on
+//! the tensor the combine actually read (the mapped view in mapped mode).
 //! The all-CPU oracle reads the artifact's aggregate tensors at the D1 spans (tensor data
 //! offset + expert * stride), re-derived here independently of the slab adapter and compared
 //! with it, never through a bundle owner. The AllCold endpoint must reproduce that oracle
@@ -102,7 +109,8 @@ use hipfire_arch_qwen4::expert_slabs::ExpertFormat;
 use hipfire_arch_qwen4::expert_tier_plan::plan_expert_tiers_from_slabs;
 use hipfire_dispatch::cpu_exec::{cpu_quant_for, moe_cpu_host_slot_outputs, CpuMoeExpert};
 use hipfire_dispatch::cpu_split::{
-    CpuShadow, SplitEndpoint, SplitParityConfig, SplitParityMode, SplitParityRecord, SplitTiming,
+    CpuShadow, D2ReturnMode, SplitEndpoint, SplitParityConfig, SplitParityMode, SplitParityRecord,
+    SplitTiming,
 };
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
@@ -966,6 +974,17 @@ struct LayerAgg {
     nonfinite: u64,
     /// Experts the record's placement mask puts on the device (0 for a whole-layer owner).
     placement_hot: u64,
+    /// Calls that read the mapped cold-result view / the original H2D copy transport.
+    mapped_calls: u64,
+    copy_calls: u64,
+    /// Cold-slot H2D enqueues, mapped generations published and retirements that
+    /// actually blocked, summed over this layer's recorded calls.
+    output_copy_calls: u64,
+    mapped_publications: u64,
+    mapped_retire_waits: u64,
+    /// Calls whose counters contradict their return mode (mapped: exactly one
+    /// publication and zero output copies; copy: no publication).
+    transport_violations: u64,
     d2_vs_cpu: Diff,
     d2_vs_gpu: Diff,
     cpu_vs_gpu: Diff,
@@ -1051,6 +1070,24 @@ fn analyze(rec: &SplitParityRecord, shadow: &HfqShadow, agg: &mut LayerAgg) -> R
     let t_gpu = target(&rec.gpu_expanded);
 
     agg.calls += 1;
+    let transport = rec.transport;
+    match transport.mode {
+        D2ReturnMode::Mapped => {
+            agg.mapped_calls += 1;
+            if transport.output_copy_calls != 0 || transport.mapped_publications != 1 {
+                agg.transport_violations += 1;
+            }
+        }
+        D2ReturnMode::Copy => {
+            agg.copy_calls += 1;
+            if transport.mapped_publications != 0 {
+                agg.transport_violations += 1;
+            }
+        }
+    }
+    agg.output_copy_calls += transport.output_copy_calls;
+    agg.mapped_publications += transport.mapped_publications;
+    agg.mapped_retire_waits += transport.mapped_retire_waits;
     agg.placement_hot += rec.placement.iter().filter(|&&p| p == 0).count() as u64;
     agg.rows += rows as u64;
     agg.twin_mismatch += bit_mismatch(&twin, &rec.d2_target);
@@ -1413,6 +1450,10 @@ fn print_layers(aggs: &BTreeMap<usize, LayerAgg>) {
             "        bitwise mismatching elements: twin {} hot-slots {} cold-slots {} hot-rows {} cold-rows {}  non-finite {}",
             a.twin_mismatch, a.hot_slot_mismatch, a.cold_slot_mismatch, a.hot_row_mismatch, a.cold_row_mismatch, a.nonfinite
         );
+        println!(
+            "        return transport: mapped calls {} copy calls {}  output_copy_calls {} mapped_publications {} mapped_retire_waits {}  violations {}",
+            a.mapped_calls, a.copy_calls, a.output_copy_calls, a.mapped_publications, a.mapped_retire_waits, a.transport_violations
+        );
     }
 }
 
@@ -1430,6 +1471,12 @@ fn layer_json(layer: usize, a: &LayerAgg) -> Value {
         },
         "nonfinite": a.nonfinite,
         "placement_hot_experts": a.placement_hot,
+        "return_transport": {
+            "return_mode": if a.mapped_calls > 0 && a.copy_calls == 0 { "mapped" } else if a.mapped_calls == 0 { "copy" } else { "mixed" },
+            "mapped_calls": a.mapped_calls, "copy_calls": a.copy_calls,
+            "output_copy_calls": a.output_copy_calls, "mapped_publications": a.mapped_publications,
+            "mapped_retire_waits": a.mapped_retire_waits, "violations": a.transport_violations,
+        },
     })
 }
 
@@ -1465,6 +1512,16 @@ fn bitwise_gates(gates: &mut Vec<Gate>, run: &str, aggs: &BTreeMap<usize, LayerA
         format!("{run}: records"),
         aggs.values().all(|a| a.calls == steps as u64),
         format!("{} layers x {steps} steps, one call each", aggs.len()),
+    );
+    gate(
+        gates,
+        format!("{run}: return transport accounting"),
+        sum(|a| a.transport_violations) == 0,
+        format!(
+            "mapped calls {} copy calls {}, output_copy_calls {} mapped_publications {} mapped_retire_waits {} (a mapped call publishes once and issues zero cold-slot copies; a copy call publishes nothing)",
+            sum(|a| a.mapped_calls), sum(|a| a.copy_calls), sum(|a| a.output_copy_calls),
+            sum(|a| a.mapped_publications), sum(|a| a.mapped_retire_waits)
+        ),
     );
     gate(
         gates,
@@ -1612,6 +1669,11 @@ fn real_main() -> R<bool> {
         args.steps,
         args.rows,
         if args.greedy { "greedy" } else { "teacher-forced" },
+    );
+    println!(
+        "qwen4_cpu_split_parity: HIPFIRE_QWEN4_D2_RETURN requested {} (a mixed-placement layer keeps copy; per-layer return mode and counters are reported below)",
+        hipfire_config::memory::qwen4_d2_return()
+            .map_or_else(|refusal| format!("INVALID ({refusal})"), |mode| mode.as_str().to_string()),
     );
 
     let mut gates: Vec<Gate> = Vec::new();
@@ -1969,6 +2031,7 @@ fn real_main() -> R<bool> {
             "placement_digest": m.placement_digest,
             "placement_source": m.placement_source,
             "d2_force": hipfire_config::memory::qwen4_d2_default(),
+            "d2_return_requested": hipfire_config::memory::qwen4_d2_return().ok().map(|mode| mode.as_str()),
             "offload_exec_explicit": hipfire_config::memory::offload_exec_explicit().map(|v| v.to_string()),
             "span_digest": m.span_digest,
             "host_exec_identity": identity,

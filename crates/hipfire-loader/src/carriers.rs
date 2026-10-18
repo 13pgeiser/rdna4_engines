@@ -3021,8 +3021,26 @@ fn load_qwen4_rank_scoped(
         } else {
             "measured D2 default"
         };
+        // Only a load that asked for `mapped` (or has a mapped layer) says
+        // anything about the cold return; the default copy load is unchanged.
+        let return_modes = bundle.split_return_modes();
+        let mapped = return_modes
+            .iter()
+            .filter(|(_, mode)| *mode == "mapped")
+            .count();
+        let cold_return = if mapped > 0
+            || hipfire_config::memory::qwen4_d2_return()
+                == Ok(hipfire_config::memory::D2Return::Mapped)
+        {
+            format!(
+                "; cold return: {mapped} mapped, {} copy",
+                return_modes.len() - mapped
+            )
+        } else {
+            String::new()
+        };
         eprintln!(
-            "  qwen4 routed experts: CPU split (D2) armed on {} layers ({}; {source}): decode and <=4-row verify run their host-placed cold experts on the CPU; prefill and wider verify stay on PCIe",
+            "  qwen4 routed experts: CPU split (D2) armed on {} layers ({}; {source}{cold_return}): decode and <=4-row verify run their host-placed cold experts on the CPU; prefill and wider verify stay on PCIe",
             split_kinds.len(),
             by_kind.join(", ")
         );

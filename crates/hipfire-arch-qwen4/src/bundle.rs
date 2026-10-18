@@ -1066,6 +1066,15 @@ impl Qwen4Bundle {
             .unwrap_or_default()
     }
 
+    /// D2 cold-result return mode (`"mapped"` or `"copy"`) of every armed
+    /// D2 split layer, as `(layer label, mode)` in layer order.
+    pub fn split_return_modes(&self) -> Vec<(usize, &'static str)> {
+        self.execution
+            .as_ref()
+            .map(Qwen4GpuForward::split_return_modes)
+            .unwrap_or_default()
+    }
+
     /// Numerical identity of every armed CPU arithmetic mode (D1 and the D2
     /// owner kinds); empty when none is armed.
     pub fn host_exec_identity(&self) -> String {
