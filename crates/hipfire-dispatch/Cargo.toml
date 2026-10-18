@@ -34,3 +34,7 @@ flash-attn-ck = ["rdna-compute/flash-attn-ck"]
 [[example]]
 name = "d2_cpu_arm_bench"
 required-features = ["lab"]
+
+[[example]]
+name = "d2_mapped_return_pilot"
+required-features = ["lab"]

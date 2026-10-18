@@ -10,7 +10,7 @@ use crate::{DeviceBuffer, MemcpyKind};
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_uint, c_void, CString, OsStr, OsString};
 use std::ptr;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Per-thread accumulators for time spent inside HIP FFI calls. Used by
@@ -1906,6 +1906,67 @@ impl HipRuntime {
         })
     }
 
+    /// Mapped + coherent host storage with a non-owning device alias, for CPU
+    /// results the GPU reads in place. See [`MappedHostBuffer`].
+    ///
+    /// Refuses a zero/oversized extent and any alias failure (including a null
+    /// alias); there is no host-pointer fallback. Starts zeroed, `Retired`,
+    /// generation 0. The library stays loaded until the allocation is freed.
+    pub fn mapped_host_buffer(&self, size: usize) -> HipResult<MappedHostBuffer> {
+        check_mapped_extent(size)?;
+        let free = self.missing_vmm_symbol("hipHostFree", self.fn_host_free)?;
+        let device = self.current_device()?;
+        let retire_event = self.event_create_with_flags(HIP_EVENT_DISABLE_TIMING)?;
+        let flags = HIP_HOST_MALLOC_MAPPED | HIP_HOST_MALLOC_COHERENT;
+        let allocated = match crate::emu_budget::active() {
+            None => self.host_malloc_raw(size, flags).map(|p| (p, None)),
+            Some(budget) => crate::emu_budget::charged_alloc(
+                &budget,
+                crate::emu_budget::Class::HostPinned,
+                size,
+                || self.host_malloc_raw(size, flags),
+            ),
+        };
+        let (host, token) = match allocated {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = self.event_destroy(retire_event);
+                return Err(e);
+            }
+        };
+        // SAFETY: hipHostMalloc succeeded with a non-zero extent; initialize
+        // once so the host slices handed out are ordinary initialized bytes.
+        unsafe { std::ptr::write_bytes(host.cast::<u8>(), 0, size) };
+        // From here the buffer owns the allocation: any refusal below drops
+        // it in the Retired phase, which frees the host memory and the charge.
+        let mut buffer = MappedHostBuffer {
+            host,
+            // SAFETY: placeholder null view of extent 0, replaced below
+            // before the buffer escapes; never dereferenced.
+            device_view: unsafe { DeviceBuffer::from_raw(ptr::null_mut(), 0) },
+            size,
+            ledger: MappedLedger::new(),
+            retire_event,
+            device,
+            free,
+            token,
+            get_device: self.fn_get_device,
+            set_device: self.fn_set_device,
+            synchronize: self.fn_device_synchronize,
+            event_synchronize: self.fn_event_synchronize,
+            event_destroy: self.fn_event_destroy,
+            _lib: Arc::clone(&self._lib),
+        };
+        let alias = self
+            .host_get_device_pointer(host, 0)
+            .and_then(|alias| checked_alias(alias, size))?;
+        // SAFETY: `alias` is the non-null device address of the live `size`-byte
+        // mapped allocation owned by `buffer`; the view is Borrowed (never
+        // freed) and `buffer` outlives every use of it.
+        buffer.device_view = unsafe { DeviceBuffer::from_raw(alias, size) };
+        Ok(buffer)
+    }
+
     pub fn mem_get_allocation_granularity(
         &self,
         prop: &HipMemAllocationProp,
@@ -3591,6 +3652,454 @@ impl Drop for PinnedTransferBuffer {
     }
 }
 
+// ── Mapped host result buffer ───────────────────────────────────
+
+/// Lifecycle phase of a [`MappedHostBuffer`].
+///
+/// `Retired → CpuWriting → Published → GpuReading → Retired`. Host bytes are
+/// writable only in `CpuWriting`, which is reachable only from `Retired`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MappedPhase {
+    /// No GPU consumer can be reading; the host may begin a write.
+    Retired,
+    /// The host holds the unique [`MappedWrite`].
+    CpuWriting,
+    /// The host finished writing; the consumer has not been recorded yet.
+    Published,
+    /// A consumer was enqueued; the host must not write until retirement.
+    GpuReading,
+}
+
+static NEXT_MAPPED_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Proof that one generation of a [`MappedHostBuffer`] was published.
+///
+/// Carries the buffer identity and generation; consumed by
+/// [`MappedHostBuffer::mark_gpu_reading`]. Not `Clone`/`Copy`, so one
+/// publication can be marked in flight at most once.
+#[must_use = "a published generation must be passed to mark_gpu_reading"]
+#[derive(Debug, PartialEq, Eq)]
+pub struct MappedPublished {
+    buffer: u64,
+    generation: u64,
+}
+
+impl MappedPublished {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// How a quiescence request must be satisfied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MappedQuiesce {
+    /// Nothing can be in flight.
+    Done,
+    /// Wait on (or query) the recorded retirement event.
+    Event,
+    /// No event covers the consumer; only a device synchronize proves it.
+    Device,
+}
+
+/// Pure, HIP-free phase ledger embedded in [`MappedHostBuffer`].
+#[derive(Debug)]
+struct MappedLedger {
+    id: u64,
+    phase: MappedPhase,
+    generation: u64,
+    /// `GpuReading` entered without a recorded retirement event (the record
+    /// call failed). Retirable only by device synchronization.
+    unfenced: bool,
+}
+
+impl MappedLedger {
+    fn new() -> Self {
+        Self {
+            id: NEXT_MAPPED_ID.fetch_add(1, Ordering::Relaxed),
+            phase: MappedPhase::Retired,
+            generation: 0,
+            unfenced: false,
+        }
+    }
+
+    fn begin_write(&mut self) -> Result<(), &'static str> {
+        if self.phase != MappedPhase::Retired {
+            return Err("mapped buffer is not retired; cannot begin a host write");
+        }
+        if self.generation == u64::MAX {
+            return Err("mapped buffer generation counter exhausted");
+        }
+        self.phase = MappedPhase::CpuWriting;
+        Ok(())
+    }
+
+    /// An unpublished write returns to `Retired`; the generation is unchanged.
+    fn abandon_write(&mut self) {
+        if self.phase == MappedPhase::CpuWriting {
+            self.phase = MappedPhase::Retired;
+        }
+    }
+
+    /// `begin_write` guarantees `generation < u64::MAX` while `CpuWriting`.
+    fn publish(&mut self) -> Result<MappedPublished, &'static str> {
+        if self.phase != MappedPhase::CpuWriting {
+            return Err("mapped buffer is not being written; cannot publish");
+        }
+        self.generation += 1;
+        self.phase = MappedPhase::Published;
+        Ok(MappedPublished {
+            buffer: self.id,
+            generation: self.generation,
+        })
+    }
+
+    fn check_token(&self, token: &MappedPublished) -> Result<(), &'static str> {
+        if token.buffer != self.id {
+            return Err("published token belongs to a different mapped buffer");
+        }
+        if self.phase != MappedPhase::Published {
+            return Err("mapped buffer is not in the Published phase");
+        }
+        if token.generation != self.generation {
+            return Err("published token is stale (generation mismatch)");
+        }
+        Ok(())
+    }
+
+    fn enter_gpu_reading(
+        &mut self,
+        token: &MappedPublished,
+        fenced: bool,
+    ) -> Result<(), &'static str> {
+        self.check_token(token)?;
+        self.phase = MappedPhase::GpuReading;
+        self.unfenced = !fenced;
+        Ok(())
+    }
+
+    fn retire_plan(&self) -> Result<MappedQuiesce, &'static str> {
+        match self.phase {
+            MappedPhase::Retired => Ok(MappedQuiesce::Done),
+            MappedPhase::GpuReading if self.unfenced => Ok(MappedQuiesce::Device),
+            MappedPhase::GpuReading => Ok(MappedQuiesce::Event),
+            MappedPhase::CpuWriting => Err("mapped buffer is being written; nothing to retire"),
+            MappedPhase::Published => {
+                Err("mapped buffer was published but never marked GpuReading; refusing to retire")
+            }
+        }
+    }
+
+    /// Drop must assume any non-`Retired` phase may have a consumer in flight.
+    fn drop_plan(&self) -> MappedQuiesce {
+        match self.phase {
+            MappedPhase::Retired => MappedQuiesce::Done,
+            MappedPhase::GpuReading if !self.unfenced => MappedQuiesce::Event,
+            _ => MappedQuiesce::Device,
+        }
+    }
+
+    fn complete_retirement(&mut self) {
+        debug_assert_eq!(self.phase, MappedPhase::GpuReading);
+        self.phase = MappedPhase::Retired;
+        self.unfenced = false;
+    }
+}
+
+/// Reject extents that cannot back a Rust byte slice or a HIP allocation.
+fn check_mapped_extent(size: usize) -> HipResult<()> {
+    if size == 0 {
+        return Err(HipError::new(
+            0,
+            "mapped_host_buffer requires non-zero size",
+        ));
+    }
+    if size > isize::MAX as usize {
+        return Err(HipError::new(
+            0,
+            "mapped_host_buffer size exceeds isize::MAX",
+        ));
+    }
+    Ok(())
+}
+
+/// A mapped allocation is usable only with a non-null device alias. Never fall
+/// back to the host pointer: the GPU is not guaranteed to dereference it.
+fn checked_alias(alias: *mut c_void, size: usize) -> HipResult<*mut c_void> {
+    if alias.is_null() {
+        return Err(HipError::new(
+            0,
+            &format!("hipHostGetDevicePointer returned a null alias for {size} mapped bytes"),
+        ));
+    }
+    Ok(alias)
+}
+
+/// `f32` view legality: a whole number of elements at an aligned address.
+fn check_f32_extent(host_addr: usize, size: usize) -> HipResult<()> {
+    if !size.is_multiple_of(4) {
+        return Err(HipError::new(
+            0,
+            &format!("mapped buffer of {size} bytes is not a whole number of f32"),
+        ));
+    }
+    if !host_addr.is_multiple_of(std::mem::align_of::<f32>()) {
+        return Err(mapped_err("mapped host pointer is not f32-aligned"));
+    }
+    Ok(())
+}
+
+fn mapped_err(msg: &'static str) -> HipError {
+    HipError::new(0, msg)
+}
+
+/// Host-written, GPU-read result storage: one
+/// `hipHostMalloc(Mapped | Coherent)` allocation plus its device alias.
+///
+/// The allocation is owned here exactly once; [`MappedHostBuffer::device_buffer`]
+/// is a non-owning (`Borrowed`) view that must never be freed or registered
+/// as a second owner. Host bytes are reachable only through
+/// [`MappedHostBuffer::begin_write`] from the `Retired` phase. After the
+/// consumer is enqueued, [`MappedHostBuffer::mark_gpu_reading`] records a
+/// retirement event; the host may write again only after
+/// [`MappedHostBuffer::retire`] / [`MappedHostBuffer::try_retire`] prove that
+/// event complete. Drop retires before freeing and retains the allocation if
+/// retirement fails.
+///
+/// The runtime used by `mark_gpu_reading`/`retire`/`try_retire` must be bound
+/// to [`MappedHostBuffer::device`], and the stream must outlive its work.
+pub struct MappedHostBuffer {
+    host: *mut c_void,
+    device_view: DeviceBuffer,
+    size: usize,
+    ledger: MappedLedger,
+    retire_event: Event,
+    device: i32,
+    free: unsafe extern "C" fn(*mut c_void) -> u32,
+    /// Emu `HostPinned` charge; `None` when emu is off. Released only after
+    /// `free` succeeds in `Drop`; a failed free keeps the charge.
+    token: Option<crate::emu_budget::Token>,
+    get_device: unsafe extern "C" fn(*mut c_int) -> u32,
+    set_device: unsafe extern "C" fn(c_int) -> u32,
+    synchronize: unsafe extern "C" fn() -> u32,
+    event_synchronize: unsafe extern "C" fn(HipEvent) -> u32,
+    event_destroy: unsafe extern "C" fn(HipEvent) -> u32,
+    _lib: Arc<Library>,
+}
+
+// SAFETY: this is the unique owner of its mapped host allocation; moving it
+// does not move the allocation. Host access requires `&mut self` in the
+// Retired phase, and every GPU-facing operation requires exclusive
+// `&mut self`; the caller must bind the recorded device before HIP calls.
+// Drop binds that device itself, quiesces the consumer and restores the prior
+// binding, retaining the allocation and library if quiescence fails. The
+// non-owning device view is only a pointer value. Deliberately NOT Sync.
+unsafe impl Send for MappedHostBuffer {}
+
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<MappedHostBuffer>();
+};
+
+/// Unique host writer for one generation. Dropping it unpublished returns the
+/// buffer to `Retired` without advancing the generation.
+pub struct MappedWrite<'a> {
+    buf: &'a mut MappedHostBuffer,
+    published: bool,
+}
+
+impl MappedWrite<'_> {
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the buffer holds `size` initialized bytes until Drop, the
+        // ledger is CpuWriting (no consumer in flight), and `&mut self` plus
+        // the buffer's `&mut` borrow exclude other host access.
+        unsafe { std::slice::from_raw_parts_mut(self.buf.host.cast::<u8>(), self.buf.size) }
+    }
+
+    /// The whole buffer as `f32`; refuses when the size is not a multiple of 4.
+    pub fn f32_mut(&mut self) -> HipResult<&mut [f32]> {
+        let size = self.buf.size;
+        check_f32_extent(self.buf.host as usize, size)?;
+        // SAFETY: extent is a checked multiple of 4, the pointer is checked
+        // aligned, bytes are initialized, and exclusivity is as `bytes_mut`.
+        Ok(unsafe { std::slice::from_raw_parts_mut(self.buf.host.cast::<f32>(), size / 4) })
+    }
+
+    /// Finish the write and advance the generation.
+    ///
+    /// Issues `fence(SeqCst)`: this orders the host stores for other *host*
+    /// threads only. It is NOT a proof that the GPU observes the bytes; GPU
+    /// visibility is established only by an oracle on real hardware.
+    pub fn publish(mut self) -> MappedPublished {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        let token = self
+            .buf
+            .ledger
+            .publish()
+            .expect("MappedWrite exists only in the CpuWriting phase");
+        self.published = true;
+        token
+    }
+}
+
+impl Drop for MappedWrite<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            self.buf.ledger.abandon_write();
+        }
+    }
+}
+
+impl MappedHostBuffer {
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    pub fn device(&self) -> i32 {
+        self.device
+    }
+
+    pub fn phase(&self) -> MappedPhase {
+        self.ledger.phase
+    }
+
+    /// Number of completed publications (0 until the first `publish`).
+    pub fn generation(&self) -> u64 {
+        self.ledger.generation
+    }
+
+    /// Non-owning device alias. It is `Borrowed`: never free it, never
+    /// register it as an owner, and do not let it outlive this buffer.
+    pub fn device_buffer(&self) -> &DeviceBuffer {
+        &self.device_view
+    }
+
+    /// Start a host write. Only legal from `Retired`.
+    pub fn begin_write(&mut self) -> HipResult<MappedWrite<'_>> {
+        self.ledger.begin_write().map_err(mapped_err)?;
+        Ok(MappedWrite {
+            buf: self,
+            published: false,
+        })
+    }
+
+    /// Record that the consumer of `token`'s generation was just enqueued on
+    /// `stream` (`None` = the default stream). Call it right after the launch.
+    ///
+    /// Refuses a foreign or stale token without changing the phase. If the
+    /// event record fails the consumer may still be in flight, so the phase
+    /// becomes `GpuReading` *without* an event: [`Self::try_retire`] then
+    /// never succeeds and [`Self::retire`] uses a device synchronize.
+    pub fn mark_gpu_reading(
+        &mut self,
+        hip: &HipRuntime,
+        token: MappedPublished,
+        stream: Option<&Stream>,
+    ) -> HipResult<()> {
+        self.ledger.check_token(&token).map_err(mapped_err)?;
+        let recorded = hip.event_record(&self.retire_event, stream);
+        self.ledger
+            .enter_gpu_reading(&token, recorded.is_ok())
+            .map_err(mapped_err)?;
+        recorded
+    }
+
+    /// Block until the recorded consumer finished, then return to `Retired`.
+    /// No-op when already `Retired`; refuses `Published`/`CpuWriting`. On error
+    /// the phase is unchanged.
+    pub fn retire(&mut self, hip: &HipRuntime) -> HipResult<()> {
+        match self.ledger.retire_plan().map_err(mapped_err)? {
+            MappedQuiesce::Done => return Ok(()),
+            MappedQuiesce::Event => hip.event_synchronize(&self.retire_event)?,
+            MappedQuiesce::Device => hip.device_synchronize()?,
+        }
+        self.ledger.complete_retirement();
+        Ok(())
+    }
+
+    /// Non-blocking [`Self::retire`]: `Ok(true)` once retired, `Ok(false)`
+    /// while the consumer is outstanding (always `false` after a failed event
+    /// record: use `retire`). On error the phase is unchanged.
+    pub fn try_retire(&mut self, hip: &HipRuntime) -> HipResult<bool> {
+        match self.ledger.retire_plan().map_err(mapped_err)? {
+            MappedQuiesce::Done => Ok(true),
+            MappedQuiesce::Device => Ok(false),
+            MappedQuiesce::Event => {
+                if hip.event_query(&self.retire_event)? {
+                    self.ledger.complete_retirement();
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+    }
+
+    /// Run `call` with this buffer's device bound, restoring the caller's
+    /// binding afterwards. `true` only if every HIP step succeeded.
+    fn quiesce_on_device(&self, call: impl FnOnce() -> u32) -> bool {
+        let mut previous = 0;
+        // SAFETY: the owner keeps the function-pointer library live; out-param
+        // is a stack local.
+        let got = unsafe { (self.get_device)(&mut previous) };
+        crate::error::observe_raw_code(got);
+        if got != HIP_SUCCESS {
+            return false;
+        }
+        // SAFETY: as above; binds the device recorded at construction.
+        let bound = unsafe { (self.set_device)(self.device) };
+        crate::error::observe_raw_code(bound);
+        if bound != HIP_SUCCESS {
+            return false;
+        }
+        let code = call();
+        crate::error::observe_raw_code(code);
+        // SAFETY: as above; restores the caller's device binding.
+        let restored = unsafe { (self.set_device)(previous) };
+        crate::error::observe_raw_code(restored);
+        code == HIP_SUCCESS && restored == HIP_SUCCESS
+    }
+}
+
+impl Drop for MappedHostBuffer {
+    fn drop(&mut self) {
+        let event_raw = self.retire_event.0;
+        let quiesced = match self.ledger.drop_plan() {
+            MappedQuiesce::Done => true,
+            MappedQuiesce::Event => self.quiesce_on_device(|| {
+                // SAFETY: live event owned by this buffer; device is bound.
+                unsafe { (self.event_synchronize)(event_raw) }
+            }),
+            MappedQuiesce::Device => self.quiesce_on_device(|| {
+                // SAFETY: device synchronize takes no arguments; device is bound.
+                unsafe { (self.synchronize)() }
+            }),
+        };
+        if !quiesced {
+            // Retain allocation, event and library rather than freeing memory
+            // the device may still read after a failed drain. The unreleased
+            // emu token stays charged.
+            std::mem::forget(Arc::clone(&self._lib));
+            return;
+        }
+        // SAFETY: the consumer is quiesced, so the event is idle and unshared.
+        let destroyed = unsafe { (self.event_destroy)(event_raw) };
+        crate::error::observe_raw_code(destroyed);
+        // SAFETY: unique hipHostMalloc owner of `host`; library still live.
+        let code = unsafe { (self.free)(self.host) };
+        crate::error::observe_raw_code(code);
+        if let Some(token) = self.token.take() {
+            let _ =
+                crate::emu_budget::charged_free::<crate::emu_budget::Process>(Some(token), || {
+                    if code == HIP_SUCCESS {
+                        Ok(())
+                    } else {
+                        Err(HipError::new(code, "hipHostFree"))
+                    }
+                });
+        }
+    }
+}
+
 /// GPU stream handle.
 pub struct Stream(HipStream);
 impl Stream {
@@ -3699,5 +4208,250 @@ mod pageable_copy_staging_tests {
                 "preset {preset:?} with =1"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod mapped_ledger_tests {
+    use super::{
+        check_f32_extent, check_mapped_extent, checked_alias, MappedLedger, MappedPhase,
+        MappedPublished, MappedQuiesce,
+    };
+    use std::ffi::c_void;
+
+    /// Drive a ledger through one write → publish.
+    fn publish_one(l: &mut MappedLedger) -> MappedPublished {
+        l.begin_write().unwrap();
+        l.publish().unwrap()
+    }
+
+    fn full_cycle(l: &mut MappedLedger) {
+        let t = publish_one(l);
+        l.enter_gpu_reading(&t, true).unwrap();
+        l.complete_retirement();
+    }
+
+    #[test]
+    fn starts_retired_generation_zero() {
+        let l = MappedLedger::new();
+        assert_eq!(l.phase, MappedPhase::Retired);
+        assert_eq!(l.generation, 0);
+        assert_eq!(l.retire_plan(), Ok(MappedQuiesce::Done));
+        assert_eq!(l.drop_plan(), MappedQuiesce::Done);
+    }
+
+    #[test]
+    fn legal_cycle_walks_every_phase() {
+        let mut l = MappedLedger::new();
+        l.begin_write().unwrap();
+        assert_eq!(l.phase, MappedPhase::CpuWriting);
+        let t = l.publish().unwrap();
+        assert_eq!(l.phase, MappedPhase::Published);
+        assert_eq!(t.generation(), 1);
+        l.enter_gpu_reading(&t, true).unwrap();
+        assert_eq!(l.phase, MappedPhase::GpuReading);
+        assert_eq!(l.retire_plan(), Ok(MappedQuiesce::Event));
+        assert_eq!(l.drop_plan(), MappedQuiesce::Event);
+        l.complete_retirement();
+        assert_eq!(l.phase, MappedPhase::Retired);
+    }
+
+    #[test]
+    fn begin_write_only_from_retired() {
+        let mut l = MappedLedger::new();
+        l.begin_write().unwrap();
+        assert!(l.begin_write().is_err(), "CpuWriting");
+        let t = l.publish().unwrap();
+        assert!(l.begin_write().is_err(), "Published");
+        l.enter_gpu_reading(&t, true).unwrap();
+        assert!(l.begin_write().is_err(), "GpuReading");
+        assert_eq!(l.phase, MappedPhase::GpuReading);
+        l.complete_retirement();
+        l.begin_write().unwrap();
+    }
+
+    #[test]
+    fn publish_only_from_cpu_writing() {
+        let mut l = MappedLedger::new();
+        assert!(l.publish().is_err(), "Retired");
+        let t = publish_one(&mut l);
+        assert!(l.publish().is_err(), "Published");
+        l.enter_gpu_reading(&t, true).unwrap();
+        assert!(l.publish().is_err(), "GpuReading");
+        assert_eq!(l.generation, 1);
+    }
+
+    #[test]
+    fn mark_requires_published_phase() {
+        let mut l = MappedLedger::new();
+        let t = publish_one(&mut l);
+        l.enter_gpu_reading(&t, true).unwrap();
+        // Already GpuReading: a same-generation token (forged for the test) is refused.
+        let again = MappedPublished {
+            buffer: l.id,
+            generation: l.generation,
+        };
+        assert!(l.enter_gpu_reading(&again, true).is_err());
+        l.complete_retirement();
+        assert!(l.enter_gpu_reading(&again, true).is_err(), "Retired");
+        l.begin_write().unwrap();
+        assert!(l.enter_gpu_reading(&again, true).is_err(), "CpuWriting");
+        assert_eq!(l.phase, MappedPhase::CpuWriting);
+    }
+
+    #[test]
+    fn generation_is_monotonic_one_per_publication() {
+        let mut l = MappedLedger::new();
+        for want in 1..=64u64 {
+            let t = publish_one(&mut l);
+            assert_eq!(t.generation(), want);
+            assert_eq!(l.generation, want);
+            l.enter_gpu_reading(&t, true).unwrap();
+            l.complete_retirement();
+        }
+    }
+
+    #[test]
+    fn foreign_token_refused_without_state_change() {
+        let mut a = MappedLedger::new();
+        let mut b = MappedLedger::new();
+        assert_ne!(a.id, b.id);
+        let ta = publish_one(&mut a);
+        let tb = publish_one(&mut b);
+        assert_eq!(ta.generation(), tb.generation());
+        assert!(a.enter_gpu_reading(&tb, true).is_err());
+        assert_eq!(a.phase, MappedPhase::Published);
+        assert!(b.enter_gpu_reading(&ta, true).is_err());
+        assert_eq!(b.phase, MappedPhase::Published);
+        a.enter_gpu_reading(&ta, true).unwrap();
+        b.enter_gpu_reading(&tb, true).unwrap();
+    }
+
+    #[test]
+    fn stale_token_refused() {
+        let mut l = MappedLedger::new();
+        let first = publish_one(&mut l);
+        l.enter_gpu_reading(&first, true).unwrap();
+        l.complete_retirement();
+        let _second = publish_one(&mut l);
+        assert!(l.check_token(&first).is_err());
+        assert!(l.enter_gpu_reading(&first, true).is_err());
+        assert_eq!(l.phase, MappedPhase::Published);
+        assert_eq!(l.generation, 2);
+    }
+
+    #[test]
+    fn abandoned_write_returns_retired_without_generation_bump() {
+        let mut l = MappedLedger::new();
+        full_cycle(&mut l);
+        assert_eq!(l.generation, 1);
+        l.begin_write().unwrap();
+        l.abandon_write();
+        assert_eq!(l.phase, MappedPhase::Retired);
+        assert_eq!(l.generation, 1);
+        // abandon is inert outside CpuWriting.
+        let t = publish_one(&mut l);
+        l.abandon_write();
+        assert_eq!(l.phase, MappedPhase::Published);
+        l.enter_gpu_reading(&t, true).unwrap();
+        l.abandon_write();
+        assert_eq!(l.phase, MappedPhase::GpuReading);
+    }
+
+    #[test]
+    fn retire_plan_refuses_published_and_writing() {
+        let mut l = MappedLedger::new();
+        l.begin_write().unwrap();
+        assert!(l.retire_plan().is_err(), "CpuWriting");
+        let _t = l.publish().unwrap();
+        assert!(l.retire_plan().is_err(), "Published without mark");
+        assert_eq!(l.phase, MappedPhase::Published);
+        // Drop must still quiesce an unmarked Published buffer by device sync.
+        assert_eq!(l.drop_plan(), MappedQuiesce::Device);
+    }
+
+    #[test]
+    fn failed_event_record_fails_closed_to_device_sync() {
+        let mut l = MappedLedger::new();
+        let t = publish_one(&mut l);
+        l.enter_gpu_reading(&t, false).unwrap();
+        assert_eq!(l.phase, MappedPhase::GpuReading);
+        assert_eq!(l.retire_plan(), Ok(MappedQuiesce::Device));
+        assert_eq!(l.drop_plan(), MappedQuiesce::Device);
+        assert!(l.begin_write().is_err());
+        l.complete_retirement();
+        assert_eq!(l.phase, MappedPhase::Retired);
+        assert!(!l.unfenced);
+        // The next fenced cycle is event-based again.
+        let t = publish_one(&mut l);
+        l.enter_gpu_reading(&t, true).unwrap();
+        assert_eq!(l.retire_plan(), Ok(MappedQuiesce::Event));
+    }
+
+    #[test]
+    fn retire_error_keeps_phase_because_completion_is_explicit() {
+        // retire/try_retire call complete_retirement only after the HIP wait
+        // succeeds; planning alone never changes the phase.
+        let mut l = MappedLedger::new();
+        let t = publish_one(&mut l);
+        l.enter_gpu_reading(&t, true).unwrap();
+        for _ in 0..3 {
+            assert_eq!(l.retire_plan(), Ok(MappedQuiesce::Event));
+            assert_eq!(l.phase, MappedPhase::GpuReading);
+        }
+        assert_eq!(l.generation, 1);
+    }
+
+    #[test]
+    fn generation_exhaustion_refuses_new_write() {
+        let mut l = MappedLedger::new();
+        l.generation = u64::MAX - 1;
+        full_cycle(&mut l);
+        assert_eq!(l.generation, u64::MAX);
+        assert!(l.begin_write().is_err());
+        assert_eq!(l.phase, MappedPhase::Retired);
+    }
+
+    #[test]
+    fn extent_guards() {
+        assert!(check_mapped_extent(0).is_err());
+        assert!(check_mapped_extent(usize::MAX).is_err());
+        assert!(check_mapped_extent(isize::MAX as usize + 1).is_err());
+        assert!(check_mapped_extent(1).is_ok());
+        assert!(check_mapped_extent(isize::MAX as usize).is_ok());
+    }
+
+    #[test]
+    fn f32_extent_refusal() {
+        assert!(check_f32_extent(4096, 0).is_ok());
+        assert!(check_f32_extent(4096, 4).is_ok());
+        assert!(check_f32_extent(4096, 102_400).is_ok());
+        for bad in [1usize, 2, 3, 5, 102_401, 102_403] {
+            assert!(check_f32_extent(4096, bad).is_err(), "size {bad}");
+        }
+        assert!(check_f32_extent(4097, 8).is_err(), "misaligned");
+    }
+
+    #[test]
+    fn null_alias_refused() {
+        assert!(checked_alias(std::ptr::null_mut(), 64).is_err());
+        let mut byte = 0u8;
+        let p = (&mut byte as *mut u8).cast::<c_void>();
+        assert_eq!(checked_alias(p, 64).unwrap(), p);
+    }
+
+    #[test]
+    fn token_is_not_clone_or_copy() {
+        // Inherent-const-priority probe: resolves to `true` only if Clone.
+        trait NotClone {
+            const IS_CLONE: bool = false;
+        }
+        impl<T> NotClone for T {}
+        struct Probe<T>(std::marker::PhantomData<T>);
+        #[allow(dead_code)]
+        impl<T: Clone> Probe<T> {
+            const IS_CLONE: bool = true;
+        }
+        assert!(!<Probe<MappedPublished>>::IS_CLONE);
     }
 }

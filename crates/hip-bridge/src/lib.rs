@@ -30,8 +30,9 @@ pub use ffi::{arm_hip_fault, keep_host_memory_out_of_reclaim};
 pub use ffi::{launch_counters, memory_effects};
 pub use ffi::{
     Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp,
-    HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, Module,
-    PinnedHostBuffer, PinnedTransferBuffer, Stream, HIP_ERROR_NOT_READY, HIP_EVENT_DISABLE_TIMING,
+    HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime,
+    MappedHostBuffer, MappedPhase, MappedPublished, MappedWrite, Module, PinnedHostBuffer,
+    PinnedTransferBuffer, Stream, HIP_ERROR_NOT_READY, HIP_EVENT_DISABLE_TIMING,
     HIP_EVENT_RELEASE_TO_SYSTEM, HIP_HOST_MALLOC_COHERENT, HIP_HOST_MALLOC_MAPPED,
     HIP_MEM_ACCESS_FLAGS_PROT_READ, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM,
     HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED, HIP_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
