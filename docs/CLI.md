@@ -465,7 +465,7 @@ Perf claim protocol (warmup, fresh-process, noise): [methodology/perf-benchmarki
 | `--pp`, `--ctx` | Comma lists for the matrix; default `128,512,2048,4096,8192,20000`. |
 | `--tg N` | Matrix decode length; default `128`. |
 | `--sustained-tg N`, `--sustained-ctx` | Sustained-decode rows run when `--sustained-tg` is set; `--sustained-ctx` defaults to `128,8192`. |
-| `--warmups N` | Warmup iterations before the measured runs of `--ttft` and `--matrix`; default `10`. |
+| `--warmups N` | Discarded warmup requests before the measured runs of the standard bench, `--ttft` and `--matrix`; default `10`. A standard-bench warmup is a full request with the same prompt and `--max-tokens` as a measured run, and `0` skips warmups entirely. The standard `--json` output records the count actually run as `warmups_run`. Not used by `--concurrency`, which always runs its own discarded warmup per K ([below](#bench-concurrency---concurrency)). |
 | `--ttft` | Client-side time to first token: per run, generate one token on the standard prompt and time request-send to first streamed token; reports `prompt_tokens` and TTFT. Standard path only (not with `--matrix`). |
 | `--max-tokens N` | Generated tokens per measured request: default `128` on the standard bench, `256` on the `--concurrency` `steady` shape. |
 | `--reasoning-on` | Let a reasoning model think during the bench (off by default, because a think span usually cannot close inside the benchmark's token budget and the daemon then fails that turn closed); pair with a large enough `--max-tokens`. |

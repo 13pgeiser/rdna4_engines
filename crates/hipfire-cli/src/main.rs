@@ -6518,11 +6518,14 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             &max_seq_json,
         )
     } else {
-        // The warmup exists to populate kernel caches and its output is
-        // discarded, so it stays in answer mode even under --reasoning-on: a
-        // 16-token budget cannot close a think span, and letting the warmup
-        // think would abort the run before a single measured sample.
-        let _ = bench_generate(&mut engine, "Hello", 16)?;
+        // Warmups are discarded requests with the measured prompt, token
+        // budget and reasoning mode, so the first measured run meets the same
+        // prefill shape, kernels and caches the measured runs use. `--warmups
+        // 0` runs none.
+        let warmups_run = run_standard_bench_warmups(&args, &prompt, |request| {
+            engine.generate(request, |_| Ok(()))?;
+            Ok(())
+        })?;
         let mut decode = Vec::new();
         let mut prefill = Vec::new();
         let mut wall = Vec::new();
@@ -6624,6 +6627,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             }),
             &loaded,
         );
+        let report = with_warmups_run(report, warmups_run);
         if args.json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
@@ -7255,7 +7259,7 @@ fn open_bench_engine(
 /// Answer mode is the default rather than an opt-in so every model runs the
 /// same turn shape. A reasoning model (any Qwen3.6 SKU, for one) opens
 /// `<think>` within its first tokens and would spend the benchmark's whole
-/// budget — 16 tokens for the warmup, 128 for a measured run — inside it,
+/// budget — 128 tokens in a measured run — inside it,
 /// ending every sample mid-thought at `finish_reason=length`.
 ///
 /// Benchmarks measure tokens per second and never read the text, so asking for
@@ -7290,6 +7294,41 @@ fn bench_generate_request_reasoning(
         request["reasoning_effort"] = serde_json::json!("none");
     }
     request
+}
+
+/// The discarded warmup request of the standard bench: the measured request
+/// shape (prompt, `--max-tokens`, `--reasoning-on`), never a shorter stand-in.
+fn standard_bench_warmup_request(args: &BenchArgs, prompt: &str) -> serde_json::Value {
+    bench_generate_request_reasoning(prompt, args.standard_max_tokens() as u64, args.reasoning_on)
+}
+
+/// Issue exactly `args.warmups` warmup requests through `generate`, stopping at
+/// the first error, and return how many ran (`0` for `--warmups 0`). The
+/// request is built once; each warmup after the first gets a fresh `id`, as
+/// every measured generate does.
+fn run_standard_bench_warmups(
+    args: &BenchArgs,
+    prompt: &str,
+    mut generate: impl FnMut(&serde_json::Value) -> Result<()>,
+) -> Result<usize> {
+    if args.warmups == 0 {
+        return Ok(0);
+    }
+    let mut request = standard_bench_warmup_request(args, prompt);
+    for i in 0..args.warmups {
+        if i > 0 {
+            request["id"] = serde_json::json!(request_id());
+        }
+        generate(&request)?;
+    }
+    Ok(args.warmups)
+}
+
+/// Record in the standard bench report how many warmup requests actually ran
+/// (the count `run_standard_bench_warmups` returned, not the flag).
+fn with_warmups_run(mut report: serde_json::Value, warmups_run: usize) -> serde_json::Value {
+    report["warmups_run"] = serde_json::json!(warmups_run);
+    report
 }
 
 /// The speculation route a generate `done` event reports, or `None` when the
@@ -18325,6 +18364,167 @@ effort = "high"
             prompt_file,
             emu: None,
         }
+    }
+
+    fn parse_bench_args(extra: &[&str]) -> BenchArgs {
+        let mut argv = vec!["hipfire", "bench", "qwen:test"];
+        argv.extend_from_slice(extra);
+        match Cli::try_parse_from(argv).unwrap().command {
+            Some(Commands::Bench(args)) => args,
+            other => panic!("expected bench command, got {other:?}"),
+        }
+    }
+
+    fn collect_standard_warmups(args: &BenchArgs, prompt: &str) -> (usize, Vec<serde_json::Value>) {
+        let mut requests = Vec::new();
+        let ran = run_standard_bench_warmups(args, prompt, |request| {
+            requests.push(request.clone());
+            Ok(())
+        })
+        .unwrap();
+        (ran, requests)
+    }
+
+    #[test]
+    fn bench_warmups_flag_defaults_to_ten_and_accepts_zero() {
+        assert_eq!(parse_bench_args(&[]).warmups, 10);
+        assert_eq!(parse_bench_args(&["--warmups", "3"]).warmups, 3);
+        assert_eq!(parse_bench_args(&["--warmups", "0"]).warmups, 0);
+    }
+
+    #[test]
+    fn standard_bench_zero_warmups_issue_no_requests() {
+        let args = parse_bench_args(&["--warmups", "0"]);
+        let (ran, requests) = collect_standard_warmups(&args, "measured prompt");
+        assert_eq!(ran, 0);
+        assert!(requests.is_empty());
+    }
+
+    #[test]
+    fn standard_bench_runs_exactly_the_requested_warmups() {
+        for (extra, expected) in [
+            (vec!["--warmups", "1"], 1),
+            (vec!["--warmups", "3"], 3),
+            (vec![], 10),
+        ] {
+            let args = parse_bench_args(&extra);
+            let (ran, requests) = collect_standard_warmups(&args, "measured prompt");
+            assert_eq!(ran, expected, "{extra:?}");
+            assert_eq!(requests.len(), expected, "{extra:?}");
+        }
+    }
+
+    #[test]
+    fn standard_bench_warmups_match_measured_prompt_and_max_tokens() {
+        // Default budget (128) and an explicit one, never the old 16-token
+        // "Hello" stand-in.
+        for (extra, max_tokens) in [
+            (vec!["--warmups", "2"], 128u64),
+            (vec!["--warmups", "2", "--max-tokens", "37"], 37),
+        ] {
+            let args = parse_bench_args(&extra);
+            let (_, requests) = collect_standard_warmups(&args, "measured prompt");
+            assert_eq!(requests.len(), 2);
+            for request in &requests {
+                assert_eq!(request["type"], "generate");
+                assert_eq!(request["prompt"], "measured prompt");
+                assert_eq!(request["max_tokens"].as_u64(), Some(max_tokens));
+            }
+            let measured = bench_generate_request_reasoning(
+                "measured prompt",
+                args.standard_max_tokens() as u64,
+                args.reasoning_on,
+            );
+            for key in [
+                "type",
+                "prompt",
+                "temperature",
+                "top_p",
+                "repeat_penalty",
+                "max_tokens",
+                "attempt_id",
+                "max_think_tokens",
+                "assistant_prefix",
+                "reasoning_effort",
+            ] {
+                assert_eq!(requests[0][key], measured[key], "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn standard_bench_warmups_follow_reasoning_mode_of_measured_runs() {
+        let args = parse_bench_args(&["--warmups", "1", "--reasoning-on", "--max-tokens", "512"]);
+        let (_, requests) = collect_standard_warmups(&args, "p");
+        assert_eq!(requests[0]["max_tokens"].as_u64(), Some(512));
+        assert!(requests[0].get("max_think_tokens").is_none());
+        assert!(requests[0].get("assistant_prefix").is_none());
+        assert!(requests[0].get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn standard_bench_warmups_share_shape_with_distinct_ids() {
+        let args = parse_bench_args(&["--warmups", "3"]);
+        let (_, requests) = collect_standard_warmups(&args, "p");
+        assert_eq!(requests.len(), 3);
+        let ids: std::collections::HashSet<&str> = requests
+            .iter()
+            .map(|request| request["id"].as_str().expect("string id"))
+            .collect();
+        assert_eq!(ids.len(), 3, "every warmup needs its own request id");
+        let strip = |request: &serde_json::Value| {
+            let mut request = request.clone();
+            request.as_object_mut().unwrap().remove("id");
+            request
+        };
+        assert!(requests
+            .iter()
+            .all(|request| strip(request) == strip(&requests[0])));
+    }
+
+    #[test]
+    fn standard_bench_report_records_actual_warmups_run() {
+        for extra in [vec!["--warmups", "0"], vec!["--warmups", "4"], vec![]] {
+            let args = parse_bench_args(&extra);
+            let (ran, _) = collect_standard_warmups(&args, "p");
+            let report = with_warmups_run(
+                serde_json::json!({ "protocol": "native-generate-v1", "runs": args.runs }),
+                ran,
+            );
+            assert_eq!(report["warmups_run"].as_u64(), Some(args.warmups as u64));
+            assert_eq!(report["protocol"], "native-generate-v1");
+            assert_eq!(report["runs"].as_u64(), Some(args.runs as u64));
+        }
+        // The recorded value is the count that ran, not the flag.
+        let report = with_warmups_run(serde_json::json!({}), 2);
+        assert_eq!(report["warmups_run"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn ttft_and_matrix_keep_the_warmups_flag() {
+        let ttft = parse_bench_args(&["--ttft", "--warmups", "3"]);
+        assert!(ttft.ttft && !ttft.matrix);
+        assert_eq!(ttft.warmups, 3);
+        let matrix = parse_bench_args(&["--matrix", "--warmups", "1"]);
+        assert!(matrix.matrix && !matrix.ttft);
+        assert_eq!(matrix.warmups, 1);
+        assert_eq!(parse_bench_args(&["--ttft"]).warmups, 10);
+        assert_eq!(parse_bench_args(&["--matrix"]).warmups, 10);
+    }
+
+    #[test]
+    fn standard_bench_warmup_error_stops_the_loop() {
+        let args = parse_bench_args(&["--warmups", "5"]);
+        let mut calls = 0;
+        let result = run_standard_bench_warmups(&args, "p", |_| {
+            calls += 1;
+            if calls == 2 {
+                bail!("daemon failed")
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 2);
     }
 
     #[test]
