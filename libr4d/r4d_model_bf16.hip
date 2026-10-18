@@ -580,7 +580,7 @@ __global__ __launch_bounds__(kThreads) void kv_store_fp8v4_kernel(
     const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
     const int32_t* __restrict__ slot, uint8_t* __restrict__ kv,
     uint32_t head_dim, uint32_t kv_heads, uint32_t block_size, uint32_t n_blocks,
-    uint32_t k_ld, uint32_t v_ld, float k_inv, uint32_t row) {
+    uint32_t k_ld, uint32_t v_ld, float k_inv, float v_inv, uint32_t row) {
     const uint32_t t = blockIdx.x;
     const int32_t s = slot[t];
     if (s < 0 || (uint32_t)s / block_size >= n_blocks) return;
@@ -595,7 +595,7 @@ __global__ __launch_bounds__(kThreads) void kv_store_fp8v4_kernel(
 #pragma unroll
         for (int e = 0; e < 4; ++e) {
             kf[e] = bf16_to_f32(k[(size_t)t * k_ld + j + (uint32_t)e]) * k_inv;
-            vf[e] = bf16_to_f32(v[(size_t)t * v_ld + j + (uint32_t)e]);
+            vf[e] = bf16_to_f32(v[(size_t)t * v_ld + j + (uint32_t)e]) * v_inv;
         }
         const uint32_t voff = K6 ? head_dim * 3 / 4 : head_dim;
         const uint32_t vsoff = K6 ? head_dim * 21 / 16 : head_dim * 3 / 2;
@@ -603,7 +603,9 @@ __global__ __launch_bounds__(kThreads) void kv_store_fp8v4_kernel(
             // A group of 32 is 8 lanes; its scale absmax / 31 in f16, codes 6-bit two's complement.
             float kmax = fmaxf(fmaxf(fabsf(kf[0]), fabsf(kf[1])), fmaxf(fabsf(kf[2]), fabsf(kf[3])));
             for (int m = 4; m >= 1; m >>= 1) kmax = fmaxf(kmax, __shfl_xor(kmax, m, 32));
-            const __fp16 k16 = (__fp16)fminf(kmax / 31.0f, 65504.0f);
+            // Clamped so 31 times it stays an f16 (65504): a group gone inf
+            // or NaN decodes finite, as the E4M3 form's clamp to 448 does.
+            const __fp16 k16 = (__fp16)fminf(kmax / 31.0f, 2112.0f);
             const float ksc = (float)k16;
             uint32_t q[4];
 #pragma unroll
@@ -633,7 +635,8 @@ __global__ __launch_bounds__(kThreads) void kv_store_fp8v4_kernel(
 
         float amax = fmaxf(fmaxf(fabsf(vf[0]), fabsf(vf[1])), fmaxf(fabsf(vf[2]), fabsf(vf[3])));
         for (int m = 4; m >= 1; m >>= 1) amax = fmaxf(amax, __shfl_xor(amax, m, 32));
-        const __fp16 s16 = (__fp16)fminf(amax / 7.0f, 65504.0f);
+        // Clamped so 7 times it stays an f16: see the K scale above.
+        const __fp16 s16 = (__fp16)fminf(amax / 7.0f, 8188.0f);
         const float sc = (float)s16;
         uint32_t q[4];
 #pragma unroll
@@ -1861,7 +1864,8 @@ static int kv_store_q4(const RadArgs* a, RadStream stream, int k6) {
     if (g.kv->dtype != RAD_F8E4M3) return R4D_NO(RAD_E_DTYPE);
     if (g.head_dim % 32) return R4D_NO(RAD_E_SHAPE);
     const double ks = r4d_getf(a, "k_scale", 1.0);
-    if (!(ks > 0.0)) return R4D_NO(RAD_E_INVAL);
+    const double vs = r4d_getf(a, "v_scale", 1.0);
+    if (!(ks > 0.0) || !(vs > 0.0)) return R4D_NO(RAD_E_INVAL);
     long long k_ld = g.k_ld ? g.k_ld : g.kv_heads * g.head_dim;
     long long v_ld = g.v_ld ? g.v_ld : g.kv_heads * g.head_dim;
     if (k6)
@@ -1870,13 +1874,13 @@ static int kv_store_q4(const RadArgs* a, RadStream stream, int k6) {
                         (const int32_t*)r4d_addr(g.sm), (uint8_t*)r4d_addr(g.kv),
                         (uint32_t)g.head_dim, (uint32_t)g.kv_heads, (uint32_t)g.block_size,
                         (uint32_t)g.n_blocks, (uint32_t)k_ld, (uint32_t)v_ld, (float)(1.0 / ks),
-                        (uint32_t)(g.head_dim * r16 / 16)) == RAD_OK ? RAD_OK : RAD_E_DEVICE;
+                        (float)(1.0 / vs), (uint32_t)(g.head_dim * r16 / 16)) == RAD_OK ? RAD_OK : RAD_E_DEVICE;
     return R4D_EMIT(stream, kv_store_fp8v4_kernel<0>, dim3((uint32_t)g.T), dim3(kThreads), 0,
                     (const uint16_t*)r4d_addr(g.k), (const uint16_t*)r4d_addr(g.v),
                     (const int32_t*)r4d_addr(g.sm), (uint8_t*)r4d_addr(g.kv),
                     (uint32_t)g.head_dim, (uint32_t)g.kv_heads, (uint32_t)g.block_size,
                     (uint32_t)g.n_blocks, (uint32_t)k_ld, (uint32_t)v_ld, (float)(1.0 / ks),
-                    (uint32_t)(g.head_dim * r16 / 16)) == RAD_OK ? RAD_OK : RAD_E_DEVICE;
+                    (float)(1.0 / vs), (uint32_t)(g.head_dim * r16 / 16)) == RAD_OK ? RAD_OK : RAD_E_DEVICE;
 }
 extern "C" int r4d_rad_kv_store_fp8v4(const RadArgs* a, RadStream stream) { return kv_store_q4(a, stream, 0); }
 extern "C" int r4d_rad_kv_store_k6v4(const RadArgs* a, RadStream stream) { return kv_store_q4(a, stream, 1); }

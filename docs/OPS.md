@@ -814,7 +814,8 @@ base belongs to the block manager, not the batch.
 
 **`kv_dtype` `fp8_v4` and `k6_v4`** (device-only) are the quantised layouts of
 `--kv-cache-dtype` (`RadBuildCtx::kv_quant`). A head's dims are grouped by 32, each group with an
-f16 scale (its absmax over the largest code), codes two's complement. A token's row in a head, at
+f16 scale (its absmax over the largest code, clamped so every code decodes finite in f16),
+codes two's complement. A token's row in a head, at
 head_dim HD:
 
 | bytes | `fp8_v4` (25 HD / 16) | `k6_v4` (22 HD / 16) |

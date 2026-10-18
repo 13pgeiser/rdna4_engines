@@ -174,7 +174,7 @@ __global__ __launch_bounds__(256) void r4d_qk_norm_rope_gate_kernel(
           if constexpr (KV == QK_KV_K6V4) {
             float kmax = fabsf(kf);
             for (int m = 16; m >= 1; m >>= 1) kmax = fmaxf(kmax, __shfl_xor(kmax, m, 32));
-            const __fp16 k16 = (__fp16)fminf(kmax / 31.0f, 65504.0f);
+            const __fp16 k16 = (__fp16)fminf(kmax / 31.0f, 2112.0f);   // finite codes, as kv_store_k6v4
             const float ksc = (float)k16;
             const float r = ksc > 0.0f ? rintf(kf / ksc) : 0.0f;
             const int q = ((int)fminf(fmaxf(r, -31.0f), 31.0f)) & 0x3F;
@@ -191,10 +191,10 @@ __global__ __launch_bounds__(256) void r4d_qk_norm_rope_gate_kernel(
                                                            0, false);
             c[t] = (unsigned char)(pk & 0xFF);
           }
-          const float vf = __bfloat162float(vb);
+          const float vf = __bfloat162float(vb) * kvs.v_inv;
           float amax = fabsf(vf);
           for (int m = 16; m >= 1; m >>= 1) amax = fmaxf(amax, __shfl_xor(amax, m, 32));
-          const __fp16 s16 = (__fp16)fminf(amax / 7.0f, 65504.0f);
+          const __fp16 s16 = (__fp16)fminf(amax / 7.0f, 8188.0f);   // finite codes, as kv_store_fp8v4
           const float sc = (float)s16;
           const float r = sc > 0.0f ? rintf(vf / sc) : 0.0f;
           const int q = ((int)fminf(fmaxf(r, -7.0f), 7.0f)) & 0xF;
@@ -411,7 +411,8 @@ static int qk_kv_q4(const RadArgs* args, RadStream stream, int k6) {
   if (v_ld < 0) return R4D_NO(RAD_E_STRIDE);
   if (Mv < M || r4d_numel(sm) != M) return R4D_NO(RAD_E_SHAPE);
   const double ks = r4d_getf(args, "k_scale", 1.0);
-  if (!(ks > 0.0)) return R4D_NO(RAD_E_INVAL);
+  const double vs = r4d_getf(args, "v_scale", 1.0);
+  if (!(ks > 0.0) || !(vs > 0.0)) return R4D_NO(RAD_E_INVAL);
   QkKvStore kvs{};
   kvs.v          = (const __hip_bfloat16*)r4d_p(v);
   kvs.slot       = (const int32_t*)r4d_p(sm);
@@ -420,7 +421,7 @@ static int qk_kv_q4(const RadArgs* args, RadStream stream, int k6) {
   kvs.block_size = (int)bs;
   kvs.n_blocks   = (int)kv->shape[0];
   kvs.k_inv      = 1.0f / (float)ks;
-  kvs.v_inv      = 1.0f;
+  kvs.v_inv      = 1.0f / (float)vs;
   kvs.row        = (int)(hd * r16 / 16);
   return k6 ? qk_body<QK_KV_K6V4>(args, stream, kvs) : qk_body<QK_KV_F8V4>(args, stream, kvs);
 }

@@ -941,7 +941,7 @@ static void attn_numeric_case(const Plugin& pl, const char* name, int64_t head_d
     if (!r) { ok(name, false, "row absent"); return; }
     const int64_t seqs = 1, kv_heads = 2, bs = 16;
     const int64_t q_heads = kv_heads * gqa;
-    const int64_t max_blocks = ctx / bs;
+    const int64_t max_blocks = (ctx + bs - 1) / bs;   /* a ctx past a whole block: a partial last one */
     const int64_t total_q = seqs * q_len;
     const int kv_is_fp8 = std::strcmp(kv_dtype, "bf16") != 0;
     const int kvq = !std::strcmp(kv_dtype, "fp8_v4") ? 1 : !std::strcmp(kv_dtype, "k6_v4") ? 2 : 0;
@@ -18563,6 +18563,13 @@ static void device_phase(const Plugin& pl) {
     attn_numeric_case(pl, "attn_prefill_h256_gqa6_k6v4",  256, 6, 100, "k6_v4",  0, 1024);
     attn_numeric_case(pl, "attn_decode_h256_gqa6_k6v4",   256, 6, 1,   "k6_v4",  0, 1024);
     attn_numeric_case(pl, "attn_decode_h256_gqa6_k6v4",   256, 6, 4,   "k6_v4",  0, 2048);
+    /* A ctx past a whole block (a partial last tile), and q_len 7: three waves, where the V
+     * staging's unit count is not a multiple of the threads. */
+    for (const char* kv : { "fp8_v4", "k6_v4" }) {
+        const std::string dec = std::string("attn_decode_h256_gqa6_") + (kv[0] == 'f' ? "fp8v4" : "k6v4");
+        attn_numeric_case(pl, dec.c_str(), 256, 6, 1, kv, 0, 1000);
+        attn_numeric_case(pl, dec.c_str(), 256, 6, 7, kv, 0, 1000);
+    }
     attn_numeric_case(pl, "attn_prefill_h256_gqa2_bf16kv",   256, 2, 64, "bf16",     1024, 2048);
     attn_numeric_case(pl, "attn_decode_h256_gqa2_fp8kv",    256, 2,  1, "fp8_e4m3", 1024);
     attn_numeric_case(pl, "attn_decode_h256_gqa2_bf16kv",   256, 2,  1, "bf16",     1024);
