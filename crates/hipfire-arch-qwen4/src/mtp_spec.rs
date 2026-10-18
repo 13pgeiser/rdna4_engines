@@ -8219,8 +8219,11 @@ impl Qwen4MtpDrafter {
         if ops.is_mesh() {
             self.refuse_unsupported_under_pp()?;
         }
-        self.ensure_resources(ops, target)?;
+        // The retained repair window ends before any resource change or forced
+        // append: a live retained ticket pins the row-capture rings, so release
+        // it first (as every other step/prefill entry does).
         self.release_retained(target);
+        self.ensure_resources(ops, target)?;
         // A retired request's head lags by the rows it owes: append them
         // first, so these rows follow them and the advance (the terminal
         // pending-seed flush among them) ends with head and target together.

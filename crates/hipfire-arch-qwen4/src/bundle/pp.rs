@@ -785,6 +785,22 @@ impl<L: Copy, H: Copy> WindowStore<L, H> {
     fn clear(&mut self) {
         self.live = None;
     }
+
+    /// Refuse real row-capture ring growth while a window is live (open or
+    /// retained): growing reallocates the rings its tickets point into. `rings`
+    /// are every band's allocated ring rows; an ensure of `rows` that every
+    /// band already covers (or a block of fewer than two rows, which captures
+    /// nothing) is a no-op and passes.
+    fn check_row_capture_resize(
+        &self,
+        rings: impl IntoIterator<Item = usize>,
+        rows: usize,
+    ) -> Result<(), String> {
+        if self.live.is_some() && rows >= 2 && rings.into_iter().any(|ring| ring < rows) {
+            return Err("row capture cannot be resized while a window is live".to_string());
+        }
+        Ok(())
+    }
 }
 
 /// Whether a window of `rows` rows arms the GDN row capture: a block of at
@@ -1436,7 +1452,9 @@ impl Qwen4Bundle {
 
     /// Allocate every band's few-row verify rollback ring for blocks of up to
     /// `rows` rows on its own device. `Ok(false)`: this GPU's GDN route captures
-    /// no rows (on every band; a mix refuses). Refused while a window is live.
+    /// no rows (on every band; a mix refuses). Refused only for real ring growth
+    /// while a window is live; an ensure every band's ring already covers is a
+    /// no-op and passes.
     pub(crate) fn pp_ensure_row_capture(
         &mut self,
         gpus: &mut Gpus,
@@ -1458,11 +1476,6 @@ impl Qwen4Bundle {
         rows: usize,
     ) -> Result<bool, BundleError> {
         mesh.require_ready(gpus)?;
-        if mesh.windows.live.is_some() {
-            return Err(pp_error(
-                "row capture cannot be resized while a window is live",
-            ));
-        }
         if rows < 2 {
             return Ok(false);
         }
@@ -1477,6 +1490,18 @@ impl Qwen4Bundle {
         if capable.iter().any(|&capable| !capable) {
             return Err(pp_error("the bands disagree on GDN row-capture support"));
         }
+        // Growth reallocates the rings a live (open or retained) window's
+        // tickets point into; refuse it before any bind or allocation. Rings
+        // that already cover `rows` make every per-band ensure below a no-op.
+        mesh.windows
+            .check_row_capture_resize(
+                mesh.bands
+                    .iter()
+                    .chain(std::iter::once(&*self))
+                    .map(|band| band.state.row_capture_rows()),
+                rows,
+            )
+            .map_err(pp_error)?;
         let history = self.config.linear_conv_kernel_dim - 1;
         for index in 0..mesh.stages() {
             let gpu = &mut gpus.devices[index];
@@ -3292,6 +3317,89 @@ mod window_tests {
         let second = open(&mut store, &mesh, true);
         assert_ne!(first.key.window_gen, second.key.window_gen);
         assert!(store.require(&first, &[WindowPhase::Open]).is_err());
+    }
+
+    const GROWTH_REFUSAL: &str = "row capture cannot be resized while a window is live";
+
+    /// The live window and its phase survive a guard call untouched.
+    fn assert_live(store: &Store, window: &Qwen4PpWindow, phase: WindowPhase) {
+        assert!(store.require(window, &[phase]).is_ok());
+        assert_eq!(store.live.as_ref().map(|record| record.phase), Some(phase));
+    }
+
+    #[test]
+    fn a_live_window_allows_row_capture_ensures_its_rings_already_cover() {
+        let mesh = mesh();
+        let mut store = Store::new();
+        let window = open(&mut store, &mesh, true);
+        for phase in [WindowPhase::Open, WindowPhase::Retained] {
+            if phase == WindowPhase::Retained {
+                store.retain(&window).unwrap();
+            }
+            // K7 (8 ring rows): an equal and every shallower request is a no-op.
+            for rows in [8, 7, 5, 2] {
+                assert_eq!(store.check_row_capture_resize([8, 8, 8], rows), Ok(()));
+                assert_eq!(store.check_row_capture_resize([9, 8, 12], rows), Ok(()));
+                assert_live(&store, &window, phase);
+            }
+        }
+    }
+
+    #[test]
+    fn a_live_window_refuses_real_row_capture_growth_in_both_phases() {
+        let mesh = mesh();
+        let mut store = Store::new();
+        let window = open(&mut store, &mesh, false);
+        for phase in [WindowPhase::Open, WindowPhase::Retained] {
+            if phase == WindowPhase::Retained {
+                store.retain(&window).unwrap();
+            }
+            let refused = Err(GROWTH_REFUSAL.to_string());
+            // Every band short, then one undersized band among enough ones
+            // (at either end), then a zero-GDN band whose capacity metadata is 0.
+            assert_eq!(store.check_row_capture_resize([3, 3, 3], 8), refused);
+            assert_eq!(store.check_row_capture_resize([8, 8, 7], 8), refused);
+            assert_eq!(store.check_row_capture_resize([7, 8, 8], 8), refused);
+            assert_eq!(store.check_row_capture_resize([8, 8, 0], 8), refused);
+            assert_eq!(store.check_row_capture_resize([0, 0, 0], 2), refused);
+            assert_live(&store, &window, phase);
+        }
+    }
+
+    #[test]
+    fn a_block_of_fewer_than_two_rows_never_counts_as_growth() {
+        let mesh = mesh();
+        let mut store = Store::new();
+        let window = open(&mut store, &mesh, true);
+        for phase in [WindowPhase::Open, WindowPhase::Retained] {
+            if phase == WindowPhase::Retained {
+                store.retain(&window).unwrap();
+            }
+            for rows in [0, 1] {
+                assert_eq!(store.check_row_capture_resize([0, 0, 0], rows), Ok(()));
+                assert_live(&store, &window, phase);
+            }
+        }
+    }
+
+    #[test]
+    fn row_capture_growth_is_allowed_once_the_window_is_gone() {
+        let mesh = mesh();
+        let mut store = Store::new();
+        // No window ever opened: growth from empty rings is free.
+        assert_eq!(store.check_row_capture_resize([0, 0, 0], 8), Ok(()));
+        // A shallower K3 ring (4 rows) first, then K7 (8 rows) once released.
+        let window = open(&mut store, &mesh, true);
+        store.retain(&window).unwrap();
+        assert!(store.check_row_capture_resize([4, 4, 4], 8).is_err());
+        assert!(store.remove(&window));
+        assert_eq!(store.check_row_capture_resize([4, 4, 4], 8), Ok(()));
+        assert_eq!(store.check_row_capture_resize([8, 8, 0], 8), Ok(()));
+        // The same after an open window is released rather than retained.
+        let open_window = open(&mut store, &mesh, false);
+        assert!(store.check_row_capture_resize([4, 4, 4], 8).is_err());
+        assert!(store.remove(&open_window));
+        assert_eq!(store.check_row_capture_resize([4, 4, 4], 8), Ok(()));
     }
 
     #[test]
