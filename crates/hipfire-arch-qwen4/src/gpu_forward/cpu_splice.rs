@@ -724,7 +724,7 @@ impl ColdLayerSource {
                 plan.bytes
             ));
         }
-        let entries = cpu_slab_owner::plan_entries(plan, config, layer)
+        let entries = cpu_slab_owner::plan_entries(plan, config.kept_expert_ids(layer, false))
             .map_err(|error| format!("layer {layer}: {error}"))?;
         let owners =
             cpu_slab_owner::CpuSlabOwners::new(gpu, arena, plan.bytes, entries.into_iter())
