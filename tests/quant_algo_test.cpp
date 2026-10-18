@@ -272,6 +272,44 @@ TEST(an_expert_reads_its_own_hessian_before_its_layers) {
     CHECK(same_planes(run(both, e11), run(only_pool, e11)));
 }
 
+TEST(a_column_split_hessian_is_assembled_from_its_rank_parts) {
+    /* Under tensor parallelism a down projection's tap sees one rank's K / 2 input columns, and each
+     * rank writes the Gram of its own as `<stem>.part`. GPTQ against the two parts must quantise
+     * exactly as against one whole file holding them block diagonally (the cross-rank products
+     * zero, never formed). Parts that do not cover K are reported and the weight is rounded to
+     * nearest, as with no calibration at all. */
+    NEED_LIBQUANT();
+    const std::vector<float>& h = H();
+    const int64_t k2 = kC / 2;
+    std::vector<float> p0((size_t)(k2 * k2)), p1((size_t)(k2 * k2)), whole((size_t)(kC * kC), 0.0f);
+    for (int64_t i = 0; i < k2; ++i)
+        for (int64_t j = 0; j < k2; ++j) {
+            p0[(size_t)(i * k2 + j)] = h[(size_t)(i * kC + j)];
+            p1[(size_t)(i * k2 + j)] = h[(size_t)((k2 + i) * kC + k2 + j)];
+            whole[(size_t)(i * kC + j)] = p0[(size_t)(i * k2 + j)];
+            whole[(size_t)((k2 + i) * kC + k2 + j)] = p1[(size_t)(i * k2 + j)];
+        }
+    const TempDir tp("rad_quant_parts"), tw("rad_quant_whole"), ts("rad_quant_short"),
+                  tn("rad_quant_none");
+    REQUIRE(!tp.path.empty() && !tw.path.empty() && !ts.path.empty() && !tn.path.empty());
+    REQUIRE(write_gram(tp.path + "/gram.r0.blk.2.ffn_down.part.bin", k2, kT, p0));
+    REQUIRE(write_gram(tp.path + "/gram.r1.blk.2.ffn_down.part.bin", k2, kT, p1));
+    REQUIRE(write_gram(tw.path + "/gram.r0.blk.2.ffn_down.bin", kC, kT, whole));
+    REQUIRE(write_gram(ts.path + "/gram.r0.blk.2.ffn_down.part.bin", k2, kT, p0));
+
+    auto run = [&](const std::string& dir) -> Quantised {
+        Opts o;
+        o.s("codes", "i4").i("group", 32).s("scale", "f16").s("calib", dir.c_str());
+        Quantised q = quantise(quantizer("gptq"), o, "blk.2.ffn_down.weight", kR, kC, weight());
+        CHECK_EQ(q.status, RAD_OK);
+        return q;
+    };
+    const Quantised parts = run(tp.path), one = run(tw.path), short_ = run(ts.path), none = run(tn.path);
+    CHECK(same_planes(parts, one));
+    CHECK(!same_planes(parts, none));
+    CHECK(same_planes(short_, none));
+}
+
 TEST(awq_scales_the_columns_the_input_says_matter) {
     NEED_LIBQUANT();
     Opts g, x;

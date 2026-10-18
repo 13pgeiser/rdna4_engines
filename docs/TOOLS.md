@@ -278,7 +278,11 @@ rad-convert $SRC -o new.rad --recipe new.recipe --reuse old.rad
   it in. A container that stores a weight rotated records the rotated input, and a recipe that
   rotates the same weight reads it as it is. A weight with no file there is quantised uncalibrated,
   and the converter says so; `awq`, `autoround` and `paroquant` use the imatrix's diagonal instead
-  when `--imatrix` gives one. The three-step calibrated conversion is in [MOE-W4.md](MOE-W4.md).
+  when `--imatrix` gives one. Under tensor parallelism a column-split linear (an attention output or
+  down projection) sees only its rank's columns, so a tap may write each rank's Gram as
+  `gram.r<rank>.<stem>.part.bin`: with no whole file, libquant places the parts on the diagonal in
+  rank order (the cross-rank products, never formed, left zero). They must cover K and be in the
+  model's own domain. The three-step calibrated conversion is in [MOE-W4.md](MOE-W4.md).
 - `autoround` and `paroquant` are slow. AutoRound's 200 default steps each cost N·K² multiply-adds;
   on a 16-core Zen 5 at about 2.5 TFLOP/s that is minutes for a 17408-wide down projection and
   most of a working day for a 27B dense model. `iters=50` takes a quarter of the time.
