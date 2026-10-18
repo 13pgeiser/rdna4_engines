@@ -2651,7 +2651,7 @@ rad-kbench --home $RADIANCE_HOME --max-cases 1   # are the kernels correct?
 | `ROCM_PATH` | where ROCm lives, if not `/opt/rocm` (build time) |
 | `HF_TOKEN` | for `scripts/hfget.sh` and `--model <owner/name>` on a gated or private repo |
 | `XDG_CACHE_HOME` | where `--model <owner/name>` fetches to without `--download-dir` (`$XDG_CACHE_HOME/radiance/hf`, else `~/.cache/radiance/hf`) |
-| `R4D_AR_MAX_BLOCKS` | a ceiling on libr4d's collective block counts, for two tensor-parallel engines on one set of cards; set it in both (below). Unset, nothing changes |
+| `R4D_AR_MAX_BLOCKS` | a ceiling on libr4d's collective block counts, for two tensor-parallel engines on one set of cards; set it in both (below). The MoE models' hyper-connection gathers keep the minimum their LDS table needs. Unset, nothing changes |
 
 **Two engines on one set of cards.** Every block of a libr4d collective spins until its twin on the
 peer card has pushed, and a prefill-sized fused all-reduce launches more blocks than a card holds at

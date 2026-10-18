@@ -360,7 +360,9 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
      * R9700 holds. One engine survives that (both cards dispatch blocks in the same order, so the
      * lowest unfinished block is resident on both); two engines do not: one engine's spinning blocks
      * fill a card while their twins wait behind the other engine's kernel on the peer card, which
-     * waits for a slot on the full card. Two TP2 engines on two R9700s (Qwen3.8-27B and Gemma 3 27B)
+     * waits for a slot on the full card. Not capped: the hyper-connection gathers of the MoE paths
+     * (r4d_ar_gather_hc_write without its inverse scratch, r4d_ar_hc_write_wht6), whose LDS table
+     * needs a minimum block count, which may exceed the ceiling (dense models do not use them). Two TP2 engines on two R9700s (Qwen3.8-27B and Gemma 3 27B)
      * hung within a minute of concurrent prefill; MES then failed to evict the queues and the
      * failed reset froze the host. Capped in both engines so that their spinners together cannot
      * fill a card, the cycle cannot close. The flag and counter arrays keep their full size (maxb);
@@ -1207,6 +1209,7 @@ extern "C" int r4d_rad_ar_ln_had_quant_i8(const RadArgs* a, RadStream s) {
      * shim's count equal to the kernel's. */
     int nblocks = cfgv.nblocks > 0 ? cfgv.nblocks : nb_for(M * K * 2 / 16, in->max_blocks);
     if (nblocks > (int)M) nblocks = (int)M;
+    if (nblocks > in->max_blocks) nblocks = in->max_blocks;   // a tuned count under R4D_AR_MAX_BLOCKS too
     /* LDS floor on the block count. The compressed wire stages every row a block owns, so a count
      * chosen for the push alone can exceed LDS (at K = 5120, more than two rows per block). Raise
      * the count to the kernel's floor; refuse shapes no count within the flag capacity serves.

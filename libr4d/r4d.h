@@ -230,7 +230,8 @@ int r4d_gdn_recurrent_update_k128_v128_bf16_fp32state(
 // zeroed words, a handshake and a slot-parity counter per block of capacity (r4d_ar_seq.h).
 enum { R4D_AR_HANDLE_BYTES = 64 };
 // IPC scratch helpers, startup-only: alloc returns the device pointer and writes the IPC handle
-// (up to HANDLE_BYTES) into out_handle.
+// (up to HANDLE_BYTES) into out_handle. A refused export (beside another engine on the same cards)
+// leaves it zeroed with *out_len 0: libr4d's ranks are threads of one process and share the pointer.
 long r4d_ar_ipc_alloc(long size, int finegrained, char* out_handle, int* out_len);
 // Strided peer (or local) device-to-device copy through the copy engines; pitches and width in
 // bytes, height in rows. Returns 0 or -100 - hipError_t.
