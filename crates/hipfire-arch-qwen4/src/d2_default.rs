@@ -115,8 +115,9 @@
 //!   derived from the j1779 timeline; a mapped-result or CPU-wait transport
 //!   that is measured cheaper lowers it (and nothing else) here.
 //! * **PLE prewarm**: the probe does not wait for or pause the PLE sidecar
-//!   page-cache prewarm (`ple_prewarm`; no reusable pause guard exists on
-//!   this base). A prewarm running during the probe can only slow the CPU arm
+//!   page-cache prewarm (`ple_prewarm`; request-serving guards are acquired
+//!   after load, not around this probe). A prewarm running during the probe
+//!   can only slow the CPU arm
 //!   and add noise, which the pessimistic rule turns into PCIe (a lost D2 win
 //!   on a contended load, never a wrong D2).
 //!
