@@ -502,6 +502,40 @@ pub fn finish_load() -> (String, serde_json::Value) {
     (render_line(&snap), render_json(&snap))
 }
 
+/// End load `generation` without a receipt (failed, refused or rejected
+/// load): mark the registry inactive if that load is still the current one.
+/// A newer load (different generation) is never touched.
+pub fn abort_load(generation: u64) {
+    let mut st = lock();
+    if st.generation == generation {
+        st.active = false;
+    }
+}
+
+/// One load's active scope, held for the whole daemon `load` arm: created by
+/// [`begin_load_scope`] (which calls [`begin_load`]), it ends the scope on
+/// EVERY exit of the arm — success after [`finish_load`] (then a no-op),
+/// error ACK, refusal `continue`, panic unwind — so a rejected or failed load
+/// never leaves recording on while existing requests continue.
+#[must_use = "dropping the scope ends the load's recording immediately"]
+pub struct LoadScope {
+    generation: u64,
+}
+
+/// Start a load ([`begin_load`]) and return the guard that ends it.
+pub fn begin_load_scope() -> LoadScope {
+    begin_load();
+    LoadScope {
+        generation: generation(),
+    }
+}
+
+impl Drop for LoadScope {
+    fn drop(&mut self) {
+        abort_load(self.generation);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,6 +725,45 @@ mod tests {
         assert!(j["notes"].as_object().unwrap().is_empty());
         add("b", 1, 0);
         assert!(phase(&summary_json(), "b").is_some(), "active again");
+    }
+
+    #[test]
+    fn dropped_scope_without_finish_stops_recording() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            let _scope = begin_load_scope();
+            add("weights", 5, 0);
+            // error ACK / refusal `continue`: the arm exits without finish_load
+        }
+        add("late", 1, 0);
+        note("late_note", "x");
+        let j = summary_json();
+        assert!(
+            phase(&j, "late").is_none(),
+            "recorded after an aborted load"
+        );
+        assert!(j["notes"].get("late_note").is_none());
+    }
+
+    #[test]
+    fn scope_drop_after_finish_is_a_noop_and_never_touches_a_newer_load() {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let old = begin_load_scope();
+        add("a", 1, 0);
+        let (line, json) = finish_load();
+        assert!(line.contains("a=") && phase(&json, "a").is_some());
+        drop(old);
+        let newer = begin_load_scope();
+        // a stale guard of the previous generation ending late
+        abort_load(newer.generation.wrapping_sub(1));
+        add("b", 1, 0);
+        assert!(
+            phase(&summary_json(), "b").is_some(),
+            "newer load still active"
+        );
+        drop(newer);
+        add("c", 1, 0);
+        assert!(phase(&summary_json(), "c").is_none());
     }
 
     #[test]

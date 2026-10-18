@@ -1284,7 +1284,9 @@ fn main() {
                 let _ = stdout.flush();
             }
             "load" => {
-                rdna_compute::load_phases::begin_load();
+                // Held for the whole arm: every exit (success after the
+                // receipt, error ACK, refusal `continue`) ends the recording.
+                let _load_phase_scope = rdna_compute::load_phases::begin_load_scope();
                 // `params.pp` > 1 is explicit; otherwise `topology.pp` decides.
                 // Resolve once, before the weight-host envelope, slot caps and
                 // every pp gate below read the request.
