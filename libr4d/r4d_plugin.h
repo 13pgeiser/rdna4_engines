@@ -104,6 +104,13 @@ int     r4d_rad_attn_prefill_h256_gqa2_bf16 (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h256_gqa2_fp8   (const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_h256_gqa2_bf16  (const RadArgs*, RadStream);
 int64_t r4d_rad_attn_decode_h256_gqa2_scratch(const RadArgs*);
+/* Gemma 3 sliding window (r4d_attn_paged_h128_gqa2w.hip): head_dim 128, 2 queries per KV head,
+ * window >= 1. Decode (q_len*gqa <= 64) and windowed prefill, as the h256/gqa2 pair above. */
+int     r4d_rad_attn_prefill_h128_gqa2w_fp8  (const RadArgs*, RadStream);
+int     r4d_rad_attn_prefill_h128_gqa2w_bf16 (const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_h128_gqa2w_fp8   (const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_h128_gqa2w_bf16  (const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h128_gqa2w_scratch(const RadArgs*);
 /* Paged attention at head_dim 256 and 512, 1/2/4/8 queries per KV head, any window, causal or not
  * (r4d_attn_paged_window.hip): one entry point per geometry and cache dtype, every q_len and any q
  * row pitch, so they serve both attn_paged and attn_paged_qrow. */

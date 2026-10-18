@@ -9208,16 +9208,19 @@ static void gelu_mul_quant_i8_numeric(const Plugin& pl) {
  * over q and k, kernel by kernel, against the one dispatch. Both of Gemma 4 31B's classes at one
  * rank of two: sliding (head_dim 256, 16 q over 8 kv heads, full rotary, separate v) and global
  * (512, 16 over 2, the proportional `head` ladder over 128, k == v), at batch heights reaching
- * every width r4d_act_threads answers, including 256 at head_dim 512 (two channels per thread). */
+ * every width r4d_act_threads answers, including 256 at head_dim 512 (two channels per thread).
+ * Gemma 3's class (head_dim 128, 16 q over 8 kv heads at one rank of two) has no value norm
+ * (v_norm 0), so its chain is four ops and v must come back untouched. */
 static void qkv_norm_rope_numeric(const Plugin& pl) {
     const RadKernelInfo* np  = find(pl, "rmsnorm_p_bf16");
     const RadKernelInfo* nrm = find(pl, "rmsnorm_bf16");
     const RadKernelInfo* rp  = find(pl, "rope_bf16");
     const RadKernelInfo* fz  = find(pl, "qkv_norm_rope_bf16");
     if (!np || !nrm || !rp || !fz) { ok("qkv_norm_rope vs its five", false, "rows absent"); return; }
-    struct Cls { int64_t hd, nq, nkv, rot; const char* ladder; double theta; bool vk; };
-    for (const Cls& cl : { Cls{ 256, 16, 8, 256, "rotary", 10000.0, false },
-                           Cls{ 512, 16, 2, 128, "head", 1000000.0, true } }) {
+    struct Cls { int64_t hd, nq, nkv, rot; const char* ladder; double theta; bool vk, vn; };
+    for (const Cls& cl : { Cls{ 256, 16, 8, 256, "rotary", 10000.0, false, true },
+                           Cls{ 512, 16, 2, 128, "head", 1000000.0, true, true },
+                           Cls{ 128, 16, 8, 128, "rotary", 10000.0, false, false } }) {
         for (const int64_t M : { (int64_t)1, (int64_t)4, (int64_t)40 }) {
             const int64_t QD = cl.nq * cl.hd, KD = cl.nkv * cl.hd;
             std::vector<uint16_t> hq((size_t)M * QD), hk((size_t)M * KD), hv((size_t)M * KD);
@@ -9248,7 +9251,8 @@ static void qkv_norm_rope_numeric(const Plugin& pl) {
             st_memcpy(dp, hp.data(), hp.size() * 4, hipMemcpyHostToDevice);
             const double eps = 1e-6, wadd = 0.0;
             /* --- the five, in the order the unfused block issues them --- */
-            int rc = launch_row(np, { T(cl.vk ? dk[0] : dv[0], RAD_BF16, { M * cl.nkv, cl.hd }), T(dv[0], RAD_BF16, { M * cl.nkv, cl.hd }) },
+            int rc = !cl.vn ? RAD_OK
+                   : launch_row(np, { T(cl.vk ? dk[0] : dv[0], RAD_BF16, { M * cl.nkv, cl.hd }), T(dv[0], RAD_BF16, { M * cl.nkv, cl.hd }) },
                                 { PI("M", M * cl.nkv), PI("n", cl.hd), PF("eps", eps), PS("dtype", "bf16") });
             if (rc == RAD_OK)
                 rc = launch_row(nrm, { T(dq[0], RAD_BF16, { M * cl.nq, cl.hd }), T(dqw, RAD_BF16, { cl.hd }), T(dq[0], RAD_BF16, { M * cl.nq, cl.hd }) },
@@ -9268,7 +9272,7 @@ static void qkv_norm_rope_numeric(const Plugin& pl) {
                                 { PI("M", M), PI("head_dim", cl.hd), PI("n_head", cl.nq), PI("n_head_kv", cl.nkv),
                                   PF("theta", cl.theta), PF("eps", eps), PF("scale", 1.0), PS("mode", "neox"),
                                   PI("rotary_dim", cl.rot), PS("ladder", cl.ladder), PF("wadd", wadd),
-                                  PI("v_from_k", cl.vk ? 1 : 0), PS("dtype", "bf16") });
+                                  PI("v_from_k", cl.vk ? 1 : 0), PI("v_norm", cl.vn ? 1 : 0), PS("dtype", "bf16") });
             const std::string what = std::string("qkv_norm_rope hd=") + std::to_string(cl.hd) + " M=" + std::to_string(M);
             if (rc != RAD_OK) { ok((what + " vs its five").c_str(), false, "rc=" + std::to_string(rc)); continue; }
             int nd = 0, moved = 0;
@@ -18393,6 +18397,11 @@ static void device_phase(const Plugin& pl) {
     attn_case(pl, "attn_decode_h128_gqa2_fp8kv",   128, 2,  1, "fp8_e4m3", 0);
     attn_case(pl, "attn_decode_h128_gqa2_bf16kv",  128, 2,  1, "bf16",     0);
     attn_numeric_case(pl, "attn_prefill_h128_gqa2_fp8kv",  128, 2, 64, "fp8_e4m3", 0, 256);
+    /* Gemma 3's sliding layers: head_dim 128, gqa 2, window 1024, over a history past it. */
+    attn_numeric_case(pl, "attn_prefill_h128_gqa2w_fp8kv",  128, 2, 64, "fp8_e4m3", 1024, 2048);
+    attn_numeric_case(pl, "attn_prefill_h128_gqa2w_bf16kv", 128, 2, 64, "bf16",     1024, 2048);
+    attn_numeric_case(pl, "attn_decode_h128_gqa2w_fp8kv",   128, 2,  1, "fp8_e4m3", 1024, 2048);
+    attn_numeric_case(pl, "attn_decode_h128_gqa2w_bf16kv",  128, 2,  8, "bf16",     1024, 2048);
     attn_numeric_case(pl, "attn_prefill_h128_gqa2_bf16kv", 128, 2, 64, "bf16",     0, 256);
     attn_numeric_case(pl, "attn_decode_h128_gqa2_fp8kv",   128, 2,  1, "fp8_e4m3", 0, 256);
     attn_numeric_case(pl, "attn_decode_h128_gqa2_bf16kv",  128, 2,  1, "bf16",     0, 256);

@@ -186,6 +186,7 @@ extern "C" int r4d_rad_attn_prefill_h256_bf16(const RadArgs* a, RadStream s) {
 static int64_t decode_scratch_bytes_of(const R4DArgs* r, int which) {
     if (which == 1) return (int64_t)r4d_attn_decode_h128_gqa4_scratch_bytes(r);
     if (which == 2) return (int64_t)r4d_attn_decode_h256_gqa2_scratch_bytes(r);
+    if (which == 3) return (int64_t)r4d_attn_decode_h128_gqa2w_scratch_bytes(r);
     return (int64_t)r4d_attn_decode_h256_gqa6_scratch_bytes(r);
 }
 
@@ -296,4 +297,24 @@ extern "C" int r4d_rad_attn_decode_h256_gqa2_bf16(const RadArgs* a, RadStream s)
     int rc = decode_common(a, &r, 256, 2);
     if (rc != RAD_OK) return rc;
     return r4d_attn_decode_h256_gqa2_bf16kv(&r, (hipStream_t)s);
+}
+
+/* Gemma 3 sliding window (head_dim 128, gqa 2, window 1024) decode; its prefill entry points
+ * are in r4d_attn_paged_h128_gqa2w.hip. */
+extern "C" int64_t r4d_rad_attn_decode_h128_gqa2w_scratch(const RadArgs* a) {
+    return decode_scratch(a, 128, 3);
+}
+
+extern "C" int r4d_rad_attn_decode_h128_gqa2w_fp8(const RadArgs* a, RadStream s) {
+    R4DArgs r;
+    int rc = decode_common(a, &r, 128, 3);
+    if (rc != RAD_OK) return rc;
+    return r4d_attn_decode_h128_gqa2w_fp8kv(&r, (hipStream_t)s);
+}
+
+extern "C" int r4d_rad_attn_decode_h128_gqa2w_bf16(const RadArgs* a, RadStream s) {
+    R4DArgs r;
+    int rc = decode_common(a, &r, 128, 3);
+    if (rc != RAD_OK) return rc;
+    return r4d_attn_decode_h128_gqa2w_bf16kv(&r, (hipStream_t)s);
 }

@@ -363,9 +363,13 @@ __device__ __forceinline__ unsigned int arq_load_acq(const unsigned int* p) {
     return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
-template <bool WF32, bool RES, uint32_t THR, int WIRE>
+// POST: a sandwich-norm junction (Gemma 3): the reduced sum is post-normed against `wp` before the
+// residual add, `v = bf16(sum * s1 * (wp + wadd))` with s1 the sum's own rms, as rmsnorm_quant_i8's
+// POST computes it. `x` still receives the reduced sum. Exact wire and a residual only.
+template <bool WF32, bool RES, uint32_t THR, int WIRE, bool POST = false>
 __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
     uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
+    const void* __restrict__ wp,
     uint16_t* __restrict__ y, uint8_t* __restrict__ q, float* __restrict__ s,
     int4* peer_base, const int4* my_base, unsigned int* peer_flags, unsigned int* my_flags,
     unsigned int* seq_ctrs, char* loc_pack, long loc_scale_off, int M, uint32_t n, uint32_t nkb,
@@ -546,6 +550,27 @@ __global__ __launch_bounds__(THR) void ar_rmsnorm_quant_fp8_kernel(
 
         (void)pr;
         float ss = 0.0f;
+        if constexpr (POST && WIRE == 0 && RES) {
+            /* Pass one reduces and takes the sum's sum of squares; pass two post-norms it, adds it
+             * into the stream and takes the stream's. Each thread reads back only its own columns. */
+            float s1s = 0.0f;
+            for (uint32_t i = tid; i < n; i += THR) {
+                const uint16_t a = f2bf(bf2f(xr[i]) + bf2f(pr[i]));
+                xr[i] = a;
+                const float av = bf2f(a);
+                s1s += av * av;
+            }
+            const float s1 = rsqrtf(block_sum<THR / kWave>(s1s, lds) / (float)n + eps);
+            __syncthreads();   // lds is reused by the second sum
+            for (uint32_t i = tid; i < n; i += THR) {
+                const float g = WF32 ? ((const float*)wp)[i] : bf2f(((const uint16_t*)wp)[i]);
+                const uint16_t pv = f2bf(bf2f(xr[i]) * s1 * (g + wadd));
+                const uint16_t h = f2bf(bf2f(rr[i]) + bf2f(pv));
+                rr[i] = h;
+                const float v = bf2f(h);
+                ss += v * v;
+            }
+        } else
         for (uint32_t i = tid; i < n; i += THR) {
             /* The exact wire reduces here, in the norm's first pass; the compressed one already
              * reduced into `x`. */
@@ -741,8 +766,9 @@ extern "C" int r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long
                                         int M, int n, float eps, float wadd, int w_f32,
                                         int r_ld, int y_ld, int q_ld, int s_ld, long stream,
                                         int nblocks, int nthreads, int drain, int acq, int wire,
-                                        long loc_pack, long loc_scale_off) {
+                                        long loc_pack, long loc_scale_off, long wp) {
     if (!x || !w || !q || !s) return -1;
+    if (wp && (!res || wire != 0)) return -10;   // a post-norm needs the stream and the exact wire
     if (!peer_scratch || !my_scratch || !peer_flags || !my_flags || !seq_ctrs) return -1;
     if (M <= 0 || n <= 0) return -2;
     // n % 8: n bf16 is a whole number of 16B words (see the push), which also gives every lane its
@@ -765,18 +791,22 @@ extern "C" int r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long
     // The width must be r4d_act_threads', as for the standalone norm (it fixes the summation order).
     const int thr = nthreads ? nthreads : r4d_act_threads(M, n);
     if (thr != 256 && thr != 512 && thr != 1024) return -6;
-#define R4D_ARQ_T(wf, rs, T, W)                                                                  \
-    hipLaunchKernelGGL((ar_rmsnorm_quant_fp8_kernel<wf, rs, T, W>), dim3((uint32_t)nb), dim3(T),  \
+#define R4D_ARQ_P(wf, rs, T, W, PO)                                                              \
+    hipLaunchKernelGGL((ar_rmsnorm_quant_fp8_kernel<wf, rs, T, W, PO>), dim3((uint32_t)nb), dim3(T), \
                        0,                                                                        \
                        (hipStream_t)stream, (uint16_t*)x, (uint16_t*)res, (const void*)w,        \
+                       (const void*)wp,                                                          \
                        (uint16_t*)y, (uint8_t*)q, (float*)s, (int4*)peer_scratch,                \
                        (const int4*)my_scratch, (unsigned int*)peer_flags,                       \
                        (unsigned int*)my_flags, (unsigned int*)seq_ctrs, (char*)loc_pack,        \
                        (long)loc_scale_off, M, (uint32_t)n,                                      \
                        (uint32_t)nkb, eps, wadd, (uint32_t)r_ld, (uint32_t)y_ld, (uint32_t)q_ld, \
                        (uint32_t)s_ld, (int)slot_stride16, drain, acq, (unsigned)nbw)
+#define R4D_ARQ_T(wf, rs, T, W) R4D_ARQ_P(wf, rs, T, W, false)
 #define R4D_ARQ_W(wf, rs, T)                                                                     \
-    do { if (wire == 6) R4D_ARQ_T(wf, rs, T, 6); else R4D_ARQ_T(wf, rs, T, 0); } while (0)
+    do { if (wire == 6) R4D_ARQ_T(wf, rs, T, 6);                                                 \
+         else if (rs && wp) R4D_ARQ_P(wf, rs, T, 0, true);                                       \
+         else R4D_ARQ_T(wf, rs, T, 0); } while (0)
 #define R4D_ARQ(wf, rs)                                                                          \
     do { if (thr == 1024)     R4D_ARQ_W(wf, rs, 1024);                                           \
          else if (thr == 512) R4D_ARQ_W(wf, rs, 512);                                            \
@@ -786,6 +816,7 @@ extern "C" int r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long
 #undef R4D_ARQ
 #undef R4D_ARQ_W
 #undef R4D_ARQ_T
+#undef R4D_ARQ_P
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 

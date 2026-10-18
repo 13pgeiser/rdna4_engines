@@ -1156,7 +1156,7 @@ extern "C" int r4d_rad_ar_twoshot_4rank_ti8(const RadArgs* a, RadStream s) {
 
 /* ------------------------------------------------------------------ the fused all-reduce + norm */
 
-enum { AL_X = 0, AL_RESID, AL_W, AL_Q, AL_SCALE, AL_OUTBF16 };
+enum { AL_X = 0, AL_RESID, AL_W, AL_Q, AL_SCALE, AL_OUTBF16, AL_WPOST };
 
 extern "C" int r4d_rad_ar_ln_had_quant_i8(const RadArgs* a, RadStream s) {
     const ArInst* in = (const ArInst*)(a ? a->instance : nullptr);
@@ -1250,8 +1250,13 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
     const RadTensor* q  = r4d_opt(a, AL_Q);
     const RadTensor* sc = r4d_opt(a, AL_SCALE);
     const RadTensor* ob = r4d_opt(a, AL_OUTBF16);
+    /* ar_rmsnorm_quant_fp8's optional post-norm (Gemma 3's sandwich); ar_ln_had_quant_i8 has no
+     * seventh operand, and this function serves only the fp8 op. */
+    const RadTensor* wpo = r4d_opt(a, AL_WPOST);
     if (!x || !w || !q || !sc) return RAD_E_INVAL;
     if (!r4d_contig(w)) return RAD_E_STRIDE;
+    if (wpo && (!rs || !r4d_contig(wpo) || r4d_numel(wpo) != r4d_numel(w) || wpo->dtype != w->dtype))
+        return RAD_E_SHAPE;
 
     /* Rank 2 everywhere, as in rmsnorm_quant_fp8: a norm has a gain per channel, so flattening
      * everything after dim 0 into the row would put one gain across several heads. */
@@ -1291,6 +1296,7 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
         /* This rank's packed-half side buffer exists for every bf16 instance; missing means a
          * broken init. */
         if (!in->locpack) return RAD_E_STATE;
+        if (wpo) return RAD_E_UNSUPPORTED;   // the post-norm is the exact wire's only
     }
 
     R4dArCfg cfgv;
@@ -1327,7 +1333,7 @@ extern "C" int r4d_rad_ar_rmsnorm_quant_fp8(const RadArgs* a, RadStream s) {
         r4d_addr(sc), (int)M, (int)K, eps, wadd, w_f32,
         (int)rp, (int)yp, (int)qp, (int)sp,
         (long)(uintptr_t)s, nblocks, nthreads, cfgv.drain, cfgv.acq, wire,
-        in->locpack, in->slot_bytes / 2);
+        in->locpack, in->slot_bytes / 2, wpo ? r4d_addr(wpo) : 0);
     return e == 0 ? RAD_OK : RAD_E_SHAPE;
 }
 

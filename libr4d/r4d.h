@@ -100,6 +100,12 @@ int  r4d_attn_prefill_h256_gqa2_bf16kv(const R4DArgs* a, hipStream_t stream);
 int  r4d_attn_decode_h256_gqa2_fp8kv  (const R4DArgs* a, hipStream_t stream);
 int  r4d_attn_decode_h256_gqa2_bf16kv (const R4DArgs* a, hipStream_t stream);
 long r4d_attn_decode_h256_gqa2_scratch_bytes(const R4DArgs* a);
+/* Gemma 3 sliding window (r4d_attn_paged_h128_gqa2w.hip): head_dim 128, gqa 2, window >= 1. */
+int  r4d_attn_prefill_h128_gqa2w_fp8kv (const R4DArgs* a, hipStream_t stream);
+int  r4d_attn_prefill_h128_gqa2w_bf16kv(const R4DArgs* a, hipStream_t stream);
+int  r4d_attn_decode_h128_gqa2w_fp8kv  (const R4DArgs* a, hipStream_t stream);
+int  r4d_attn_decode_h128_gqa2w_bf16kv (const R4DArgs* a, hipStream_t stream);
+long r4d_attn_decode_h128_gqa2w_scratch_bytes(const R4DArgs* a);
 // The geometry the attention kernels above are compiled for, so a caller can check a model
 // before the first launch.
 void r4d_attn_dims(int* head_dim, int* gqa, int* block_size, int* max_decode_rows);
@@ -726,7 +732,7 @@ int  r4d_ar_rmsnorm_quant_fp8(long peer_scratch, long my_scratch, long peer_flag
                               int M, int n, float eps, float wadd, int w_f32,
                               int r_ld, int y_ld, int q_ld, int s_ld, long stream,
                               int nblocks, int nthreads, int drain, int acq, int wire,
-                              long loc_pack, long loc_scale_off);
+                              long loc_pack, long loc_scale_off, long wp = 0);
 int  r4d_ar_rmsnorm_quant_fp8_chunk_elems(void);
 
 // The same IPC with the sandwich-norm junction after it (r4d_rmsnorm_quant_i8.hip): post-norm of
