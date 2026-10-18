@@ -4855,6 +4855,13 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         return Ok(());
     }
 
+    // A batched forward is never the plain-AR Redline retained body: clear the
+    // eligibility the previous decode forward left set, so prefill-time gates
+    // (MoE IU4 / combine zinit / sealed retained admission) read as on a fresh
+    // load instead of seeing a retained body after the first Redline decode.
+    // The next `forward_scratch` re-arms it.
+    gpu.replay.enter_batched_forward();
+
     // Tree-verify mode runs as a single chunk (tree is small, O(16) nodes);
     // chunk splitting would require slicing the mask by chunk rows which
     // is extra work for a case we don't need.

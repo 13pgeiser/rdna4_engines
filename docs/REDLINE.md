@@ -229,7 +229,14 @@ It ships together with the prefill gate in
 `crates/hipfire-arch-qwen35/src/qwen35/prefill.rs`: the chunked GDN prefill
 scan is withheld only while a forward is being **recorded**
 (`is_recording()`), not for the whole life of a Redline-enabled process, so a
-Redline process prefills exactly like the HIP-graph default.
+Redline process prefills exactly like the HIP-graph default. Batched prefill
+(`forward_prefill_batch`'s batched path and `forward_prefill_batch_multi`)
+also clears the plain-AR eligibility the previous decode forward left set
+(`ReplayController::enter_batched_forward`). Otherwise, once the prepared tape
+is `Ready`, `retained_body_active()` and the PM4/AQL routing predicates would
+read true for the whole prefill. The MoE prefill gates (symmetric IU4 experts,
+combine zinit, sealed retained admission) therefore evaluate exactly as on a
+fresh load; the next plain-AR `forward_scratch` re-arms eligibility.
 
 Opt-out: `replay.backend = "hip"` (or `HIPFIRE_REPLAY_BACKEND=hip`, or the
 wizard's built-in `hip` profile) restores the HIP AR graph for the process. A

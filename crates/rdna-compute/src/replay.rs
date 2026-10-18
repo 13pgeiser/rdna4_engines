@@ -5722,6 +5722,18 @@ impl ReplayController {
         self.forward_eligible = eligible;
     }
 
+    /// Enter a batched (multi-row) forward such as a prompt prefill. It is never
+    /// the plain-AR retained body, so this clears the plain-AR eligibility left by
+    /// the previous decode forward. Without the reset, `retained_body_active()`
+    /// (and `should_route_pm4()` / `should_route_aql()`) read true for the whole
+    /// prefill once a prepared route is `Ready`, and every prefill-time gate that
+    /// keeps the retained body out (`docs/REDLINE.md` §3) behaves as if the
+    /// prefill were being recorded or replayed. The next plain-AR forward re-arms
+    /// eligibility through [`Self::set_forward_eligible`].
+    pub fn enter_batched_forward(&mut self) {
+        self.forward_eligible = false;
+    }
+
     pub fn is_enabled(&self) -> bool {
         self.request != ReplayBackendRequest::Hip && self.state != ReplayState::Fallback
     }
@@ -11246,6 +11258,75 @@ mod tests {
         assert_eq!(controller.state(), ReplayState::Hip);
         assert_eq!(controller.transport_name(), "aql");
         assert!(!controller.is_enabled());
+    }
+
+    /// Predicates every prefill-time gate reads: (recording, retained body, PM4
+    /// route, AQL route).
+    fn prefill_gate_view(controller: &ReplayController) -> (bool, bool, bool, bool) {
+        (
+            controller.is_recording(),
+            controller.retained_body_active(),
+            controller.should_route_pm4(),
+            controller.should_route_aql(),
+        )
+    }
+
+    #[test]
+    fn batched_forward_after_redline_decode_is_not_the_retained_body() {
+        // A fresh load with the Redline retained default armed (PM4 transport).
+        let mut fresh = ReplayController::new(ReplayBackendRequest::Auto);
+        fresh.apply_model_default(true, ReplayTransport::Pm4Ib);
+        let fresh_view = prefill_gate_view(&fresh);
+        assert_eq!(fresh_view, (false, false, false, false));
+
+        // After decode forwards: the tape is prepared and the last plain-AR
+        // forward left eligibility set, so the retained body reads active.
+        let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
+        controller.apply_model_default(true, ReplayTransport::Pm4Ib);
+        controller.set_forward_eligible(true);
+        controller.state = ReplayState::Ready;
+        assert!(controller.should_route_pm4());
+        assert!(controller.retained_body_active());
+
+        // The following prefill: every prefill gate reads as on the fresh load.
+        controller.enter_batched_forward();
+        assert!(!controller.retained_body_active());
+        assert_eq!(prefill_gate_view(&controller), fresh_view);
+        assert_eq!(
+            controller.state(),
+            ReplayState::Ready,
+            "the prepared tape survives"
+        );
+
+        // The next plain-AR decode forward routes the prepared tape again.
+        controller.set_forward_eligible(true);
+        assert!(controller.should_route_pm4());
+        assert!(controller.retained_body_active());
+
+        // Same on the AQL transport, and inside an open recording window.
+        let mut aql = ReplayController::new(ReplayBackendRequest::Auto);
+        aql.apply_model_default(true, ReplayTransport::AqlPackets);
+        aql.set_forward_eligible(true);
+        aql.state = ReplayState::Ready;
+        assert!(aql.should_route_aql());
+        aql.enter_batched_forward();
+        assert_eq!(prefill_gate_view(&aql), (false, false, false, false));
+
+        // A recording window left open by a decode forward that returned before
+        // finalizing (RecordingWarmup with stale eligibility): the following
+        // batched forward (qwen35 `forward_prefill_batch_multi` clears before its
+        // recording refusal) reads as not recording, so it runs eager instead of
+        // being refused or recorded; the window itself survives and the next
+        // plain-AR forward re-arms recording.
+        let mut recording = ReplayController::new(ReplayBackendRequest::Auto);
+        recording.apply_model_default(true, ReplayTransport::Pm4Ib);
+        recording.begin_auto_capture_if_armed().unwrap();
+        assert!(recording.is_recording());
+        recording.enter_batched_forward();
+        assert_eq!(prefill_gate_view(&recording), (false, false, false, false));
+        assert_eq!(recording.state(), ReplayState::RecordingWarmup);
+        recording.set_forward_eligible(true);
+        assert!(recording.is_recording());
     }
 
     #[test]

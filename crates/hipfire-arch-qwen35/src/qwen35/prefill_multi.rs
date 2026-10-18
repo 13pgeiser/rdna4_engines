@@ -1182,6 +1182,13 @@ pub fn forward_prefill_batch_multi(
     } else {
         verify_dense_math(gpu)
     };
+    // Never the plain-AR retained body (see `forward_prefill_batch`'s batched
+    // path). Cleared before the refusal: a recording window left open by a
+    // decode forward that returned early (RecordingWarmup with stale
+    // eligibility) then no longer reads as recording this batched forward, which
+    // runs eager; a genuine graph capture is still refused, and the next
+    // plain-AR forward re-arms eligibility.
+    gpu.replay.enter_batched_forward();
     if gpu.graphs.capture_mode || gpu.replay.is_recording() {
         return refuse("graph capture / replay recording is not supported");
     }
