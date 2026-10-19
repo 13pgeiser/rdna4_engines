@@ -1038,7 +1038,17 @@ impl Paths {
 }
 
 fn main() {
-    if let Err(error) = run() {
+    finish_command(run());
+}
+
+fn finish_command(result: Result<()>) {
+    if BENCH_INTERRUPT.load(Ordering::SeqCst) {
+        // Killing the daemon wakes its reader, so run() may return before the
+        // handler does. Finish reaping before either thread exits the process.
+        Engine::terminate_spawned();
+        std::process::exit(BENCH_INTERRUPTED_EXIT);
+    }
+    if let Err(error) = result {
         eprintln!("hipfire: {error:#}");
         std::process::exit(1);
     }
@@ -6387,6 +6397,10 @@ fn bench_prompt_tokens_from_done(done: &serde_json::Value) -> Option<u64> {
 /// conventional 128 + SIGINT; `ctrlc` does not report which signal arrived).
 const BENCH_INTERRUPTED_EXIT: i32 = 130;
 
+// Publish before killing a daemon: its stdout EOF can make the command return
+// an error on the main thread before the interrupt handler finishes reaping.
+static BENCH_INTERRUPT: AtomicBool = AtomicBool::new(false);
+
 /// Make an interrupted bench take its daemon with it. A process stopped by a
 /// signal never runs `Drop`, so the default disposition would leave the daemon
 /// (spawned through `Engine`) running: still loading or compiling kernels, and
@@ -6399,6 +6413,7 @@ const BENCH_INTERRUPTED_EXIT: i32 = 130;
 /// An already-installed process handler is left in place (`AlreadyExists`).
 fn install_bench_interrupt_handler() {
     let _ = ctrlc::set_handler(|| {
+        BENCH_INTERRUPT.store(true, Ordering::SeqCst);
         let reaped = Engine::terminate_spawned();
         eprintln!("hipfire bench: interrupted; terminated {reaped} owned daemon(s)");
         std::process::exit(BENCH_INTERRUPTED_EXIT);
@@ -20479,6 +20494,35 @@ effort = "high"
         assert!(payloads[1].contains("partial-before-eof"), "{payloads:?}");
         assert!(payloads[2].contains(r#""error""#), "{payloads:?}");
         assert_eq!(payloads.last().map(String::as_str), Some("[DONE]"));
+    }
+
+    /// Force the post-kill EOF error to finish on the main thread before the
+    /// signal handler exits. Isolate the process-wide flag and exit in a child.
+    #[test]
+    fn bench_interrupt_wins_over_daemon_eof_error() {
+        const CHILD_ENV: &str = "BENCH_INTERRUPT_EXIT_TEST_CHILD";
+        if env::var_os(CHILD_ENV).is_some() {
+            BENCH_INTERRUPT.store(true, Ordering::SeqCst);
+            finish_command(Err(anyhow!(
+                "daemon stdout closed during interrupt cleanup"
+            )));
+            panic!("interrupted command returned");
+        }
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "tests::bench_interrupt_wins_over_daemon_eof_error",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(BENCH_INTERRUPTED_EXIT),
+            "daemon EOF must not replace an interrupt with exit 1: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// Marks the child run of `accept_errors_do_not_stop_serving` (not a
