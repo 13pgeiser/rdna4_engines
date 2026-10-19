@@ -23,23 +23,26 @@ sibling notes (`NOTE-P3-PACK.md`, `NOTE-P2-ENCODE.md`); this one is about capabi
 - **Reference-media plumbing and caps.** The container declares 9/3/3 (images/videos/audios); the
   VAE-encode passes, the reference table, and the widened step layout are all in place, and the
   encode path is now unblocked by the host FFmpeg install.
-- **Video and audio references — wired, host-tested, and running on-device without fault; NOT yet
-  content-active.** The submit refusal that used to reject `ref_video_N` / `ref_video_audio_N` /
-  `ref_audio_N` is gone. The server decodes each into the encoder's form, the driver stages a
-  `Vencode` / `Aencode` pass and folds it into the reference table, and the widened step consumes it
-  (point 4). This is proven end-to-end: the host tier is green (`videos_test` decodes and speaks every
-  kind; `video_gen_test` clips-pads / zero-pads, slots a soundtrack to its video, and lays the table,
-  and refuses a non-encoding container by name), **and on the device the complete DaSiWa shape — a
-  picture + a video + that video's soundtrack + a standalone audio, four reference parts in one
-  request — runs every encoder pass and the widened denoise to a clean MP4 with no engine fault.**
-  What is **not** yet true: a fixed-seed content-control (same prompt, same reference *count*, only the
-  reference *content* differing) shows a reference **video** or **audio does not change the output**.
-  The reference **image** does (it also rides the text encoder — see point 4). The reason is isolated
-  to the VAE **encoders** producing content-invariant latents, not to the decode, staging, upload or
-  reference-table scatter (all of which are proven to carry distinct content per media item); it is the
-  open **encoder value-parity** task. Until that lands, a video / audio reference is accepted and
-  encoded but is, in effect, ignored by the output — treat image references as the only ones that
-  currently steer the generation.
+- **Video and audio references — device-verified, live, content-sensitive, deterministic.** The submit
+  refusal that used to reject `ref_video_N` / `ref_video_audio_N` / `ref_audio_N` is gone. The server
+  decodes each into the encoder's form, the driver stages a `Vencode` / `Aencode` pass and folds it into
+  the reference table, and the widened step consumes it (point 4). Proven end-to-end: the host tier is
+  green (`videos_test` decodes and speaks every kind; `video_gen_test` clips-pads / zero-pads, slots a
+  soundtrack to its video, lays the table, and refuses a non-encoding container by name); on the device
+  the complete DaSiWa shape — a picture + a video + that video's soundtrack + a standalone audio, four
+  reference parts in one request — runs every encoder pass and the widened denoise to a clean MP4 with no
+  engine fault. **And they steer the output:** a warm-server fixed-seed content-control (same prompt,
+  same reference *count*, only the reference *content* differing) gives **different decoded streams** for
+  a different reference video and for a different reference audio, and a *same*-reference rerun is
+  **bit-identical** (deterministic). The earlier "video / audio do not change the output" reading was a
+  measurement error — raw-MP4-byte comparison plus a cold-start pair (see point 4); the encoders are
+  content-live, not collapsed.
+- **Continuity chaining — drivable today through the reference paths.** DaSiWa's scene-to-scene lead-in
+  is the previous clip's tail fed back as a `ref_video_N` (+ `ref_video_audio_N`), not a special engine
+  mode. Two requests reproduce it: generate clip A, cut its tail, request clip B with `ref_video_1` = the
+  tail. A fixed-seed control confirms the tail conditions B (with-tail vs without-tail differ). The
+  pack's exact keyframe-pin rows (`kR2VCond`) remain unimplemented — a separate mechanism for FL2VA-style
+  start/end-frame pinning, which FL2VA itself reaches with two image references (see point 3).
 - **The modulation-cell merge** that lifts the count ceiling (next section).
 
 ## The reference-count ceiling: how it went from ≤5 to ≤9
@@ -99,14 +102,25 @@ matter how many there are.
    merge removes the *table-per-reference* growth, not the *per-reference token* cost. Raise
    `--max-model-len`, or use smaller / fewer references.
 
-3. **Continuity (tail conditioning) is not yet implemented.** The pack places keyframe / tail
-   *conditioning rows*, but the driver path that conditions on them **outside the sampler** and trims
-   after sampling — what makes clip N+1 continue seamlessly from clip N — is still pending. So
-   multi-segment seamless continuation, as the DaSiWa workflow uses it, is not reproduced yet. Single
-   generation conditioned on reference *images* is (see point 4 for video / audio).
+3. **Continuity chaining works through the reference paths; the bespoke keyframe-pin mechanism is
+   separate and still pending.** The DaSiWa "3-second lead-in" is *not* a special engine mode: per the
+   source-verified brief (`docs/NOTE-CONTINUITY.md` §1) the director feeds the previous keeper clip's
+   last ~3 s back as a **video + audio reference** (`media_mode: video_audio`, `slot 0`, `start: 0`) —
+   *conditioning media, not content*; the next scene simply continues from that tail and never replays
+   it. That is exactly the `ref_video_N` (+ `ref_video_audio_N`) path this port drives, so chaining is
+   available **today** with two requests: generate clip A, cut its tail, request clip B with
+   `ref_video_1` = the tail. A controlled same-seed check confirms the tail genuinely conditions B —
+   with-tail and without-tail give different output at an identical seed and prompt. The reference
+   engine additionally regenerates a leading overlap window as target rows and then trims it; here the
+   reference rows are fixed conditioning held outside the sampler and every output frame is new (no
+   overlap to trim), so the net "continues from the tail" semantics match but the seam may differ
+   subtly. What remains unimplemented is the pack's *keyframe* rows (`kR2VCond` / `kR2VCondAudio`) — a
+   distinct exact-pin mechanism for FL2VA-style start/end-frame conditioning (which FL2VA itself
+   achieves with two image references — see §2 of the continuity brief). Seam frame-equality is the
+   wrong metric to gate on: the brief states it is imperfect **by construction**, because the first new
+   frame is the tail's temporal *successor*, not a replay of its last frame.
 
-4. **Reference videos and audios are wired and run — through the VAEs, not the text encoder — but do
-   not yet steer the output.** A
+4. **Reference videos and audios steer the output — through the VAEs, not the text encoder.** A
    `ref_video_N` (mp4/mov), its soundtrack `ref_video_audio_N`, and a standalone `ref_audio_N`
    (wav/mp3/…) are decoded on the server into the encoder's own form (`encoder_video` /
    `encoder_audio` → `enc_pixels` / `enc_samples`), staged into a `Vencode` / `Aencode` pass, folded
@@ -120,28 +134,29 @@ matter how many there are.
    encoders (`encodes 0`) refuses such a part *by name* ("… is a reference video, but this container
    was converted without its VAE encoders") rather than drop it into a text-only video.
 
-   **The one thing that does not yet work is the encoder's numbers, not its plumbing.** A controlled
-   fixed-seed check — same prompt, same reference count, only the media content differing — shows a
-   reference video (two 512×512 videos with genuinely different decoded frames) and a reference audio
-   (a tone, a chirp, white noise) each producing a **byte-identical** output, while a reference image
-   of the same count changes it. The cause is isolated to the encoder by two facts. First, a debug
-   hash of the encoder *input* as the driver stages it is distinct for every media item (a tone, a
-   chirp and white noise all differ from silence and from one another), so decode, padding and
-   host→device upload hand the encoder genuinely different bytes. Second, the step folds those latents
-   into the sequence with a **linear projection** (`op_vin` / `op_ain`, each a `dense_bias` GEMM of the
-   reference's slot rows in `b_evc` / `b_enca` into `b_h`) — a linear map cannot send two different
-   input vectors to the same output, so had the encoder produced different latents, the conditioning
-   rows — and therefore the output — would differ. Both point the same way: the encoder is turning all
-   sufficiently-nonzero content into the same latent. A third check rules out the tempting shortcut — that the container's
-   encoder weights were converted empty or as placeholders (a zero weight maps every input to one bias, exactly this
-   signature): the `venc` / `aenc` tensors came from the genuine MiniMax-H3 sources and their recorded quantisation error
-   is ordinary bf16 rounding (relative Frobenius ≈ 1.6e-3, which a zero tensor cannot produce). The weights are real; the
-   defect is in how the kernels *execute* them. That is a
-   numerical-value-parity task (golden-compare the encode chain against the reference encoder, run by
-   run), deliberately **not** attempted blind here — a change that made the latents merely *differ*
-   could make them *wrong*, and the encoder kernels are shared with the image path (which is verified
-   live via the text encoder) and plain generation, both currently green. Until it lands, video /
-   audio references are accepted and encoded but inert; image references are the kind that steers.
+   **Video and audio references now steer the output.** The earlier "encoder collapse" reading was a
+   measurement error and has been corrected: on a *warm* server, a fixed-seed content-control (same
+   prompt, same reference count, only the media differing) gives **different** output for a different
+   reference **video** and for a different reference **audio**, and a rerun of the *same* reference is
+   **bit-identical** — so both VAE encoders are deterministic and content-sensitive on device, not
+   collapsed. A reference video (two 256×256 clips, testsrc vs mandelbrot) and a reference audio (440 Hz
+   tone vs white noise vs 880 Hz) each change both the output video and audio stream; the image path
+   steers as before. (The superseded "byte-identical output" claim came from comparing **raw MP4 bytes**,
+   which the muxer stamps, and from a pair that straddled the one-off cold-start request — neither is a
+   valid comparator; compare *decoded* streams on a warm server.) An env-gated device dump
+   (`R4D_ENC_DEBUG`, reads `b_evc` / `b_enca` after the encode pass) independently confirms the latents
+   themselves differ per media and reproduce byte-for-byte on a rerun. The scatter bounds were audited
+   and read exactly the slot region the encode pass wrote this job — no stale-neighbor read.
+
+   What remains is **strict numeric value-parity** of the encoder latents against the reference HF
+   encoder (a per-tensor golden), not *whether* the encoders are live. That golden is **environment-
+   blocked here**: this host has no `torch`, and every golden in the tree is a torch-baked `.h`, so no
+   value reference for the VAE / audio-VAE encoders can be produced locally. The genuine reference
+   sources are present (`MiniMax-H3-ref2va-src`, `MiniMax-H3/vae`, `MiniMax-H3/audio_vae`); generating a
+   value golden needs a torch-equipped box. Content-control + determinism + a bit-exact pack (see the
+   P3 pack note) is the strongest parity evidence obtainable on this machine; a published per-tensor
+   match is left open so that a change is never made merely to make latents *differ* when they could be
+   made *wrong*.
 
    What still differs from the DaSiWa reference (hence not pixel-for-pixel reproducible):
    - **The text encoder only *names* a moving picture; it never sees its pixels.** DaSiWa also shows
@@ -164,12 +179,14 @@ matter how many there are.
    the target size directly.
 
 6. **Numeric parity with the reference denoiser for the *conditioned* step is not yet published.**
-   A per-tensor / perceptual match to ComfyUI's outputs for the wide step is an open parity task.
-   **Reference-image** conditioning is verified *active* and *content-sensitive*
-   on-device (see the controlled check below); reference **video / audio** conditioning is wired and
-   runs to a clean completion but is **not** yet content-sensitive, because the VAE encoders are not
-   yet value-correct (point 4). Plain (unconditioned) generation retains its existing parity, and the
-   merge is a no-op there: with three fine segments the merged group table *is* the fine table.
+   A per-tensor / perceptual match to ComfyUI's outputs for the wide step remains an open parity task
+   (and, for the encoder values specifically, is environment-blocked on a torch-less host — point 4).
+   **All three** reference kinds — image, video and audio — are verified *active* and *content-sensitive*
+   on-device with a warm-server fixed-seed content-control (see the checks below); each is also
+   deterministic (a same-reference rerun is bit-identical). Strict *value* parity (the exact latents
+   matching the reference encoder) is a separate, still-open task and has never been the claim. Plain
+   (unconditioned) generation retains its existing parity, and the merge is a no-op there: with three
+   fine segments the merged group table *is* the fine table.
 
 ## Reproducing the checks
 
@@ -181,12 +198,13 @@ matter how many there are.
   same prompt, same reference count, but different reference content** must give **different**
   `sha256`s — that content-control is what proves the reference is genuinely consumed (a with-ref vs
   no-ref pair is confounded: an image also changes the prompt's token count). For **images** this
-  holds (two same-size photos → distinct output), proving image conditioning is live. For **videos and
-  audios it does NOT hold yet**: same seed, one reference video (or one reference audio), only the
-  media content differing → **identical** `sha256`, because the VAE encoders are not yet value-correct
-  (point 4). Do **not** read a with-video vs no-video difference as video conditioning working — that
-  only shows the reference *count* changed the sequence length (a geometry effect, not content); the
-  content-control pair above is the only honest test, and it currently reports video / audio inert.
+  holds for **images** (two same-size photos → distinct output), and now also for **videos and audios**:
+  same seed, one reference video (or one reference audio), only the media content differing → **distinct**
+  *decoded-stream* md5 (point 4). Compare decoded streams (`ffmpeg -map 0:v` / `-map 0:a -f md5`), never
+  raw MP4 bytes (the muxer stamps them), and on a warm server (the first post-boot request is a cold-start
+  outlier). Do **not** read a with-video vs no-video difference as content-control — that only shows the
+  reference *count* changed the sequence length (a geometry effect); the differing-content, fixed-count,
+  fixed-seed pair above is the honest test, and it reports all three kinds live.
   Independently of content, the path must *run*: a `ref_image_1 … ref_image_9` job must complete with
   a clean fault scan (the ceiling lift — the pinned build refused nine at submit), and a single request
   carrying **a picture + a video + that video's `ref_video_audio` soundtrack + a standalone
