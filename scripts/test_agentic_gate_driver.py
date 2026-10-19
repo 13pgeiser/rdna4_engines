@@ -657,3 +657,79 @@ def test_peak_rss_is_null_with_a_reason_when_unreadable(tmp_path, monkeypatch):
     assert rc == 0 and rec["daemon"]["exit_status"] == 0
     assert rec["daemon"]["peak_rss_kib"] is None
     assert "unreadable" in rec["daemon"]["peak_rss_measured"]
+
+
+# -- the memory sampler never reads /proc after the leader is reaped -----------
+
+def _delayed_sampler(tmp_path, monkeypatch):
+    """A driver whose first /proc read blocks until `gate` is set; `log` orders events."""
+    import io
+    import threading
+
+    log, gate = [], threading.Event()
+    first = [True]
+
+    def slow_open(path, *a, **k):
+        if str(path).startswith("/proc/"):
+            if first[0]:
+                first[0] = False
+                log.append("read-start")
+                gate.wait(30)
+            log.append("read-end")
+            return io.StringIO("VmHWM:\t1234 kB\nVmRSS:\t1000 kB\n")
+        return open(path, *a, **k)
+
+    real_waitpid = os.waitpid
+
+    def logged_waitpid(*a):
+        log.append("reap")
+        return real_waitpid(*a)
+
+    monkeypatch.setattr(driver, "open", slow_open, raising=False)
+    monkeypatch.setattr(driver.os, "waitpid", logged_waitpid)
+    d = driver.Driver(str(FAKE), str(tmp_path / "o.txt"))
+    assert d.start()
+    deadline = time.monotonic() + 10
+    while "read-start" not in log and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert log == ["read-start"]
+    d._close_stdin()                      # the fake exits on stdin EOF
+    assert d._wait_exit(10) == "exited"   # a zombie: still unreaped
+    return d, log, gate
+
+
+def _finish_driver(d):
+    for t in d._threads:
+        t.join(timeout=5)
+    d._out.close()
+
+
+def test_reap_waits_for_a_delayed_sampler_read_to_finish(tmp_path, monkeypatch):
+    import threading
+
+    d, log, gate = _delayed_sampler(tmp_path, monkeypatch)
+    threading.Timer(0.5, gate.set).start()   # the sampler finishes while the reap waits
+    assert d._reap() == 0
+    assert log[-1] == "reap" and log.count("reap") == 1
+    assert "read-end" in log[:-1]            # every read ended before the reap began
+    value, how = d._peak_record()
+    assert value == 1234 and "VmHWM" in how
+    assert not d._mem_thread.is_alive()
+    _finish_driver(d)
+
+
+def test_a_sampler_that_cannot_be_stopped_reports_no_value(tmp_path, monkeypatch):
+    monkeypatch.setattr(driver, "MEM_STOP_WAIT_S", 0.2)
+    d, log, gate = _delayed_sampler(tmp_path, monkeypatch)
+    assert d._reap() == 0                    # the daemon is reaped; the sampler is still in its read
+    assert log == ["read-start", "reap"]
+    gate.set()                               # the delayed read now completes AFTER the reap
+    d._mem_thread.join(timeout=10)
+    assert not d._mem_thread.is_alive() and "read-end" in log
+    value, how = d._peak_record()
+    assert value is None and "could not be stopped" in how and "not estimated" in how
+    rec_path = tmp_path / "rec.json"
+    d.write_record(str(rec_path), "/m", 1)
+    daemon = json.loads(rec_path.read_text())["daemon"]
+    assert daemon["peak_rss_kib"] is None and "could not be stopped" in daemon["peak_rss_measured"]
+    _finish_driver(d)

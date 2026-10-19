@@ -70,6 +70,7 @@ def _signals_blocked():
 LOAD_PARAMS = {"max_seq": 4096}
 LOAD_TIMEOUT_S = 180.0
 MEM_SAMPLE_S = 0.2
+MEM_STOP_WAIT_S = 5.0
 GENERATE_TIMEOUT_S = 120.0
 UNLOAD_TIMEOUT_S = 30.0
 EXIT_GRACE_S = 10.0
@@ -175,6 +176,9 @@ class Driver:
         self._session_errors = []
         self._killed_by_driver = False
         self._mem_stop = threading.Event()
+        self._mem_lock = threading.RLock()  # re-entered by the signal handler
+        self._mem_closed = False
+        self._mem_unavailable = None
         self._mem_thread = None
         self._mem_samples = 0
         self._peak_kib = None
@@ -292,12 +296,19 @@ class Driver:
         return True
 
     # -- peak memory -------------------------------------------------------
-    def _sample_mem(self):
-        """Fold VmHWM (else VmRSS) of the daemon leader into the peak; True if read.
+    # /proc/<pid>/status is read only while `_mem_lock` is held and `_mem_closed`
+    # is false. The reaper (`_close_mem_sampling`, always called before any reap)
+    # takes the same lock, so it waits out a read in progress, sets `_mem_closed`
+    # and only then lets the reap happen: after that flag no sampler can read, so
+    # no read can see a reused pid. If the lock cannot be taken in MEM_STOP_WAIT_S
+    # the sampler cannot be excluded; the reap still happens (the daemon must be
+    # reaped) but the peak is then discarded and recorded as unavailable. (A leader
+    # reaped by someone else is caught by `_leader_state`, not by this lock.)
+    def _read_proc_mem(self):
+        """One read of the leader's status; True if a Vm value was folded in.
 
-        Reads /proc/<pid>/status only while the leader is an unreaped child, so the
-        pid cannot belong to anyone else. Never estimates: an unreadable status
-        leaves the peak as it was (null if never read).
+        Caller holds `_mem_lock` and has seen `_mem_closed` false. Never estimates:
+        an unreadable status leaves the peak as it was (null if never read).
         """
         if self._leader_state() == "lost":
             return False
@@ -305,6 +316,8 @@ class Driver:
             with open(f"/proc/{self.proc.pid}/status", encoding="ascii", errors="replace") as f:
                 text = f.read()
         except OSError:
+            return False
+        if self._mem_unavailable:  # excluded too late: a value read now is not reported
             return False
         vals = {}
         for line in text.splitlines():
@@ -321,24 +334,47 @@ class Driver:
                 return True
         return False
 
+    def _sample_mem(self):
+        with self._mem_lock:
+            if self._mem_closed:
+                return False
+            return self._read_proc_mem()
+
     def _mem_loop(self):
         while True:
             self._sample_mem()
             if self._mem_stop.wait(MEM_SAMPLE_S):
                 return
 
-    def _stop_mem_sampler(self):
+    def _close_mem_sampling(self, final_read=False):
+        """Exclude the sampler for good; call before every reap. Idempotent.
+
+        With `final_read`, one last read is taken under the lock first (a zombie has
+        no Vm lines, so it normally yields nothing).
+        """
         self._mem_stop.set()
+        if not self._mem_lock.acquire(timeout=MEM_STOP_WAIT_S):
+            self._mem_unavailable = (
+                f"sampler could not be stopped within {MEM_STOP_WAIT_S:g}s before the reap; "
+                "any value it read is discarded"
+            )
+            self._mem_closed = True
+            return
+        try:
+            if final_read and not self._mem_closed:
+                self._final_mem_read = self._read_proc_mem()
+            self._mem_closed = True
+        finally:
+            self._mem_lock.release()
         t = self._mem_thread
         if t is not None and t is not threading.current_thread():
-            t.join(timeout=2)
+            t.join(timeout=1)  # tidiness only; exclusion is the lock, not the join
 
     def _reap(self):
         """Reap the exited leader; its real status, or None if it is not ours to reap."""
-        # The sampler stops, and one last read is tried, while the leader is still
-        # an unreaped reservation; nothing reads /proc/<pid> after the reap.
-        self._stop_mem_sampler()
-        self._final_mem_read = self._sample_mem()
+        # The sampler is excluded (and one last read taken) before the reap, never
+        # after: see the peak-memory notes above.
+        self._close_mem_sampling(final_read=True)
         with _signals_blocked():
             p = self.proc
             if p.returncode is None:
@@ -356,7 +392,7 @@ class Driver:
     def _ownership_lost(self, sent):
         self._terminated = True
         self.exit_status = "unknown"
-        self._stop_mem_sampler()
+        self._close_mem_sampling()
         if not self._lost_recorded:
             self._lost_recorded = True
             if sent:
@@ -393,7 +429,7 @@ class Driver:
         else:
             self._terminated = True
             self.exit_status = "unknown"
-            self._stop_mem_sampler()
+            self._close_mem_sampling()
             self._record_error("daemon survived SIGKILL; not reaped")
 
     # -- events ------------------------------------------------------------
@@ -559,6 +595,8 @@ class Driver:
 
     # -- terminal record ---------------------------------------------------
     def _peak_record(self):
+        if self._mem_unavailable:
+            return None, f"unavailable: {self._mem_unavailable}; not estimated"
         if self._peak_kib is None:
             return None, (
                 "unreadable: /proc/<pid>/status of the daemon leader gave no VmHWM/VmRSS "
