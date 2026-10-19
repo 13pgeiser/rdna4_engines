@@ -429,3 +429,28 @@ but confined to one op-order, and the frame-0 bisection made it golden-verifiabl
 **Verified device-live**: a single-image `ref2va` encode generated cleanly with the fix loaded, and all level
 shadows + the full tail now read ratio ~1.0 against the reference. Strict end-to-end numeric parity of the
 whole pipeline (benchmarks, multi-frame) remains #10/P6. #20 stays closed (norm already per-frame).
+
+## #10 / P6 — Radiance TP2 engine-throughput measured (2026-10-19)
+
+FFmpeg is now present on this box (the §6.1 "no libav → encoding_failed at t≈0" blocker is gone — clips
+mux to mp4 and generate to completion). The encoder **value-parity** half of P6 is done (both encoders at the
+bf16 floor, above). What was measured now is Radiance's own **engine wall-clock** at fixed shapes
+(`--tp 2 --vision-tower-placement ram --max-model-len 4096`, `wall = completed_at − created_at`, empty queue):
+
+| job | shape | wall |
+|---|---|---|
+| plain t2v | 256×256 · 3 s · 25 step | **12 s** |
+| plain t2v | 256×256 · 3 s · 50 step | 21 s |
+| plain t2v | 512×512 · 3 s · 25 step | 38 s |
+| plain t2v | 256×256 · 6 s · 25 step | 23 s |
+| ref2va full shape | 256×256 · 25 step (4 img + 1 vid + 2 aud) | **93 s** |
+| ref2va full shape | 512×512 · 25 step (4 img + 1 vid + 2 aud) | **121 s** |
+
+**These are engine throughput, not the §6 claim.** §6's win condition is `N × T_rad_tp2 < T_comfy_1clip`
+(one TP2 instance beating two single-GPU ComfyUI instances at equal work). The documented ComfyUI floors
+(590.4 s @ 12 s / 704×544 / 25 step; 315 s @ 7 s) are **stock-attention** (pre-sol) and INCLUDE queue wait —
+per the §6 Hermes correction they are only a floor, and the clean stock-vs-sol-attn pairs that the claim must
+be measured against are an **external Hermes deliverable** not available on this box (there is no second GPU
+pair running ComfyUI here). Against those floors the full-shape 512 clip (121 s) is far below a single
+ComfyUI clip, so the claim is *directionally* supported, but **P6's comparative verdict is blocked on the
+external sol-attn baseline**, not on anything in this branch. The harness is `build/tmp/bench.sh`.
