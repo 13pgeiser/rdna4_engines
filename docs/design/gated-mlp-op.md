@@ -1,8 +1,8 @@
 # One `GatedMlp` op for the dense gated FFN forms (#666 follow-up)
 
-Status: **deferred**. Kept as a reference; no implementation is scheduled. The first cut is a code
-move with no runtime change, so it is worth doing only together with a consumer: a tensor-parallel
-`SplitRule` for dense FFNs, or a ladder collapse (see "Collapse candidates").
+Status: **accepted**. Implementation runs together with dense tensor parallelism on the generic mesh
+engine, tracked in #927: the op first, then TP collectives in the mesh executor, then the `GatedMlp`
+`SplitRule`.
 Inputs: beta `9077c8b06` (Qwen4, Gemma 4, LFM2 #877 and MiniMax #884 landed); PR heads #915
 `50353da63` (Qwen3.5 decode, replaces #795), #881 `a9483b4c9` and #886 `52ed1ace3` (Glimmer).
 
@@ -257,9 +257,9 @@ The launch-trace oracle below has to show it.
 - `DenseFfn = 18`, `SandwichMlp = 20` and (once #915 lands) `SwigluFfn = 30` are retired, never
   reused (frozen-ID rule in `step_graph.rs`).
 - `mesh_split.rs` tests that build `OpKind::DenseFfn` move to `GatedMlp`.
-- The `SplitRule` stays `Opaque`. A tensor-parallel rule is the natural next step and is the reason
-  `Partial` is part of the op, but it is not part of this design. Under that rule, gate/up split by
-  column, down by row, and the output is a partial.
+- The `SplitRule` stays `Opaque` in the first migration slice. The tensor-parallel rule follows as its
+  own PR (#927 item 3) and is the reason `Partial` is part of the op: gate/up split by column, down
+  by row, and the output is a partial.
 
 ## Migration (one PR per row; each one deletes the old op/variant, no shims)
 
