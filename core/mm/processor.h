@@ -327,6 +327,25 @@ public:
     int encoder_image(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side, Frame* out,
                       std::string* why) const;
 
+    /* A moving picture in the video VAE's own form: decoded under the same `max_source_pixels`
+     * guard, then every frame resized to the one grid `encoder_image` picks. The frames are
+     * SAMPLED first: uniformly across the stream, to the largest count no more than `max_frames`
+     * (the declaration's max_enc_frames) that leaves the short final clip at 5 frames — the
+     * reference trims a reference video to `n % 17 == 5` so its 17-frame clips each contribute a
+     * full five latents. The returned count is that trimmed length, NOT clip-padded; the caller
+     * (the driver's encode pass) repeats the final frame out to a whole clip. `out` is empty only
+     * on error. */
+    int encoder_video(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side,
+                      int32_t max_frames, std::vector<Frame>* out, std::string* why) const;
+
+    /* A clip in the audio VAE's own form: its first stream as MONO float at `rate` Hz, truncated
+     * to `max_samples`. The caller duplicates it across the encoder's channels and zero-pads each
+     * to a whole hop (the encoder runs one channel at a time). This is a thin wrapper on the media
+     * decoder, kept here so every reference the server hands the VAEs is decoded under the
+     * processor. */
+    int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int64_t max_samples,
+                      std::vector<float>* out, std::string* why) const;
+
     /* Audio, when the program declares an audio encoder; `merge` and `max_frames` are the
      * encoder's. */
     int  init_audio(const AudioConfig& cfg, std::string* why = nullptr);

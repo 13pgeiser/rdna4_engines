@@ -970,6 +970,19 @@ typedef struct RadVideoGenDecl {
      * the arch abort mid-generation. 0 = no reference consumption, so no such limit. Trailing since
      * ABI 23: an older plugin declares none and keeps the 0 default. */
     int32_t       max_ref_segs;
+
+    /* Debug introspection of the encoder outputs (diagnostics only, not part of the serving
+     * contract). A generator that carries the VAE encoders names its internal audio / video latent
+     * buffers (b_enca / b_evc) and their byte sizes here, purely so a driver built with the
+     * R4D_ENC_DEBUG environment can read them back through the ordinary pass readback and log a
+     * digest — the one way to see the encoder's numbers without a device→host copy the arch step
+     * itself cannot issue. With the environment unset the driver never touches these fields, so a
+     * normal request is byte-unchanged; a container that carries no encoders leaves them zero.
+     * Trailing since ABI 23: an older plugin declares none and keeps the 0 default. */
+    rad_buf       dbg_enca;
+    int64_t       dbg_enca_bytes;
+    rad_buf       dbg_evc;
+    int64_t       dbg_evc_bytes;
 } RadVideoGenDecl;
 
 int rad_declare_video_generator(RadBuilder* b, const RadVideoGenDecl* d);

@@ -216,6 +216,15 @@ private:
     int64_t             audio_bytes_ = 0;
     std::vector<Readback> rb_;
 
+    /* Debug-only (R4D_ENC_DEBUG): a pinned slab the encoder's audio / video latent buffer is read
+     * back into after a Vencode / Aencode pass, so done() can log a digest. Allocated and used
+     * only when the environment is set and the generator named its encoders; otherwise enc_dbg_
+     * is false and these stay null / zero, so a normal request never touches them. */
+    bool                  enc_dbg_ = false;
+    char*                 enc_dbg_host_ = nullptr;
+    int64_t               enc_dbg_bytes_ = 0;   /* the slab's capacity */
+    int64_t               enc_dbg_used_ = 0;    /* bytes the last encode readback filled */
+
     std::vector<RadBatch>         out_;      /* one per rank */
     std::vector<RadVideoGenBatch> vout_;
     Pass                          pass_;

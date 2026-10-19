@@ -2600,7 +2600,11 @@ static int declare_aenc(RadBuilder* b, const RadModelMeta* meta, Model& m) {
                                           RAD_F64("scale", 1.0 / std::sqrt((double)hd)),
                                           RAD_INT("max_seqlen", T)),
                                RAD_NOWEIGHTS),
-                     { m.b_aqkv }, { m.b_aatt });
+                     /* Eight per-head issues share this op: the first head opens the running
+                      * head-sum and writes `b_ahsum`, the rest write `b_aatt`. Both are outputs
+                      * across the eight, so both must be declared or the arena may hand
+                      * `b_ahsum`'s bytes to an earlier op and the engine rejects the head-0 issue. */
+                     { m.b_aqkv }, { m.b_aatt, m.b_ahsum });
     m.p_op_pool = rw(b, RAD_OP(b, "pool_cols",
                                RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n", hd),
                                           RAD_INT("k", hd / kAudioC), RAD_STR("dtype", "bf16")),
@@ -2885,6 +2889,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              * and reads this cap, refusing an over-wide request at submit -- the model's ceilings
              * (max_ref_images & co.) stay the model's, this is the build's table. */
             d.max_ref_segs = kRefConsume ? kMaxSegs : 0;
+            /* Debug naming of the encoder outputs (R4D_ENC_DEBUG): the driver reads these back and
+             * logs a digest so the encoder's numbers can be inspected without a step-side d2h the
+             * arch cannot issue. Gated entirely by the environment on the driver side — unset, the
+             * fields are never read and a request is byte-unchanged. Sizes are the exact declared
+             * PERSIST extents above. */
+            d.dbg_enca = m.b_enca;
+            d.dbg_enca_bytes = m.aenc ? (int64_t)kEncSlotsA * kEncSlotRowsA * kAudioC * 4 : 0;
+            d.dbg_evc = m.b_evc;
+            d.dbg_evc_bytes = m.venc ? (int64_t)kEncSlotsV * kEncSlotRowsV * kPatchVals * 4 : 0;
         }
         RAD_ARCH_TRY(rad_declare_video_generator(b, &d));
     }
@@ -3634,8 +3647,13 @@ static void step_aenc(RadCtx* c, const RadBatch* batch, const Model& m) {
     const int64_t ld = 2048, hd = ld / 8;
     const RadOperand cu6 = praw(gd + 11, RAD_I32, 2);
     for (int32_t ch = 0; ch < V->enc_channels; ++ch) {
+        /* conv_in is conv1d's full positional schema [x, w, cu, res, y, b]; the input stream is
+         * this channel's mono samples and its cu is the stage-0 boundaries, the same {0, n_pad}
+         * the first block's convs index (gd + 1). The other conv1d sites below already carry all
+         * six — this stem is the only one that read too few. */
         RAD_ISSUE_N(c, m.op_ae_cin, n_pad, praw2(V->enc_samples + ch * n_pad, RAD_F32, n_pad, 1),
-                    brows(m.b_ax[0], n_pad));
+                    RAD_W(m.ae_cinw), praw(gd + 1, RAD_I32, 2), RAD_NONE,
+                    brows(m.b_ax[0], n_pad), RAD_W(m.ae_cinb));
         int64_t rows = n_pad;
         for (int blk = 0; blk < 5; ++blk) {
             const Model::AEncBlk& A = m.ae_blk[blk];
@@ -3644,15 +3662,17 @@ static void step_aenc(RadCtx* c, const RadBatch* batch, const Model& m) {
             const rad_buf S = m.b_ax[blk];
             for (int r = 0; r < 3; ++r) {
                 const Model::AEncUnit& U = A.u[r];
-                RAD_ISSUE_N(c, U.op_a1, R, brows(S, R), RAD_W(U.a1), brows(m.b_et1[blk], R));
+                RAD_ISSUE_N(c, U.op_a1, R, brows(S, R), RAD_W(U.a1), brows(m.b_et1[blk], R),
+                            RAD_NONE);
                 RAD_ISSUE_N(c, U.op_c1, R, brows(m.b_et1[blk], R), RAD_W(U.c1w), cu,
                             RAD_NONE, brows(m.b_et2[blk], R), RAD_W(U.c1b));
                 RAD_ISSUE_N(c, U.op_a2, R, brows(m.b_et2[blk], R), RAD_W(U.a2),
-                            brows(m.b_et1[blk], R));
+                            brows(m.b_et1[blk], R), RAD_NONE);
                 RAD_ISSUE_N(c, U.op_c2, R, brows(m.b_et1[blk], R), RAD_W(U.c2w), cu,
                             brows(S, R), brows(S, R), RAD_W(U.c2b));
             }
-            RAD_ISSUE_N(c, A.op_al, R, brows(S, R), RAD_W(A.al), brows(m.b_et1[blk], R));
+            RAD_ISSUE_N(c, A.op_al, R, brows(S, R), RAD_W(A.al), brows(m.b_et1[blk], R),
+                        RAD_NONE);
             RAD_ISSUE_N(c, A.op_ci, R, brows(m.b_et1[blk], R), brows(A.bi, R));
             RAD_ISSUE_N(c, A.op_dn, no, brows(A.bi, R), RAD_W(A.dnw), cu, RAD_NONE,
                         brows(A.bo, no), RAD_W(A.dnb));
@@ -3660,7 +3680,7 @@ static void step_aenc(RadCtx* c, const RadBatch* batch, const Model& m) {
             rows = no;
         }
         RAD_ISSUE_N(c, m.op_ae_snk6, rows, brows(m.b_ax[5], rows), RAD_W(m.ae_al6),
-                    brows(m.b_a6t, rows));
+                    brows(m.b_a6t, rows), RAD_NONE);
         RAD_ISSUE_N(c, m.op_ae_fin, rows, brows(m.b_a6t, rows), RAD_W(m.ae_finw), cu6,
                     RAD_NONE, brows(m.b_ax6, rows), RAD_W(m.ae_finb));
         RAD_ISSUE_N(c, m.op_ae_cast6, rows, brows(m.b_ax6, rows), brows(m.b_apb, rows));

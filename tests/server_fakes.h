@@ -399,6 +399,37 @@ struct FakeMultimodal : IMultimodal {
         *out = std::move(it);
         return RAD_OK;
     }
+    /* The video/audio VAE form, which the server fills only when a generator declares `encodes`.
+     * Synthetic frames and a mono tone of a fixed length, each call counted, so a test can watch the
+     * server decode each reference, spread the mono tone across the encoder's channels and hand it to
+     * the generator. The sides are the encoder grid; the counts are the NATURAL ones (a short video
+     * clip, a sample count that is not a whole hop) — padding is the driver's, not the server's. */
+    int32_t enc_frames = 5, enc_side = 16;
+    int64_t enc_n = 850;
+    int n_ienc = 0, n_venc = 0, n_aenc = 0;
+    int encoder_image(const uint8_t*, size_t, int32_t, int32_t, mm::Frame* out,
+                      std::string*) override {
+        ++n_ienc;
+        out->w = out->h = enc_side;
+        out->rgb.assign((size_t)enc_side * enc_side * 3, 128);
+        return RAD_OK;
+    }
+    int encoder_video(const uint8_t*, size_t, int32_t, int32_t, int32_t, std::vector<mm::Frame>* out,
+                      std::string*) override {
+        ++n_venc;
+        out->assign((size_t)enc_frames, mm::Frame{});
+        for (mm::Frame& f : *out) {
+            f.w = f.h = enc_side;
+            f.rgb.assign((size_t)enc_side * enc_side * 3, 64);
+        }
+        return RAD_OK;
+    }
+    int encoder_audio(const uint8_t*, size_t, int32_t, int64_t, std::vector<float>* out,
+                      std::string*) override {
+        ++n_aenc;
+        out->assign((size_t)enc_n, 0.5f);
+        return RAD_OK;
+    }
 };
 
 /* An embedding model's vector width, input bound and named prompts. */

@@ -195,6 +195,30 @@ int64_t fake_encode_geom(int32_t kind, const int64_t* in, int32_t* gd, int64_t c
     return need;
 }
 
+/* The encode geometry of the real VAEs, so a video or audio reference gets its true padded volume
+ * and latent counts (fake_encode_geom above only echoes its input, which is enough for a still
+ * picture). A video of T frames runs ceil(T/17) clips, padded to clips*17 frames (gd[23]) and
+ * reporting clips*5-3 latent frames (gd[24]), one frame for a still; an audio of n samples is
+ * right-padded to a whole hop (gd[0]) and reports n/800 rounded up as its latent frames (gd[12]).
+ * The driver clip-pads / zero-pads to these figures and reads gd[24] / gd[12] for the table. */
+int64_t fake_encode_vae(int32_t kind, const int64_t* in, int32_t* gd, int64_t cap) {
+    if (!gd) return kind == RAD_GEN_PASS_AENCODE ? 13 : 25;
+    const int64_t need = kind == RAD_GEN_PASS_AENCODE ? 13 : 25;
+    if (cap < need) return RAD_E_INVAL;
+    for (int64_t i = 0; i < need; ++i) gd[i] = 0;
+    if (kind == RAD_GEN_PASS_AENCODE) {
+        const int64_t lat = (in[0] + 799) / 800;   /* vae_audio_latents: ceil(n / hop) */
+        gd[0] = (int32_t)(lat * 800);              /* samples padded to a whole hop */
+        gd[12] = (int32_t)lat;                     /* latent frames */
+    } else {
+        const int64_t clips = (in[0] + 16) / 17;   /* ceil(T / clip length) */
+        gd[22] = (int32_t)clips;
+        gd[23] = (int32_t)(clips * 17);            /* frames padded to whole clips */
+        gd[24] = in[0] <= 1 ? 1 : (int32_t)(clips * 5 - 3);   /* vae_latent_frames */
+    }
+    return need;
+}
+
 struct VideoFixture {
     Program prog;
     gen::VideoDriver drv;
@@ -868,8 +892,10 @@ TEST(a_reference_conditioned_step_widens_to_the_pack_layout) {
     CHECK(saw_encode);
 }
 
-/* What the video path cannot consume is refused at submit, naming the part or the budget it
- * breaks — never silently dropped into a weaker video. */
+/* What the container cannot consume is refused at submit, naming the part or the budget it breaks —
+ * never silently dropped into a weaker video. A reference video, soundtrack or audio needs the VAE
+ * encoders; on a container converted without them (encodes 0) they are refused by name here, and on
+ * one that carries them they are encoded and consume — see the next test. */
 TEST(reference_media_the_generator_cannot_consume_are_refused_naming_the_part) {
     std::string why;
 
@@ -891,7 +917,8 @@ TEST(reference_media_the_generator_cannot_consume_are_refused_naming_the_part) {
         CHECK_EQ(g.drv.submit(std::move(q), &why), (int)RAD_E_INVAL);
         CHECK(has(why, what));
     };
-    /* Videos and audios reach the model through the VAEs, which the video path does not run. */
+    /* This container carries the tower but not the VAEs (encodes 0): a reference that reaches the
+     * model only through them is refused by name rather than dropped. */
     r = g.req();
     r->refs.push_back(ref_part(gen::VideoRefMedia::VIDEO, "ref_video_1", 1));
     refused(std::move(r), "ref_video_1");
@@ -922,6 +949,86 @@ TEST(reference_media_the_generator_cannot_consume_are_refused_naming_the_part) {
     why.clear();
     CHECK_EQ(h.drv.submit(std::move(r), &why), (int)RAD_E_INVAL);
     CHECK(has(why, "at most 4"));
+}
+
+/* The other half of the guard above: a container that DOES carry its VAE encoders consumes a
+ * reference video, its soundtrack and a standalone audio. Each queues an encode pass that folds its
+ * latents into a fixed slot and enters the pack's reference table. A video and its separately-given
+ * soundtrack are ONE row — the soundtrack folded into the video's `audio` word — encoded at the
+ * VIDEO's slot, audio first then video; a standalone audio is its own row. The request carries no
+ * `media` (only images feed the text encoder), and the driver hands each encoder its padded volume:
+ * a 5-frame clip repeated out to 17, an 850-sample audio zero-padded up to two 800-sample hops. */
+TEST(reference_videos_and_audios_are_encoded_into_the_reference_table) {
+    VideoFixture f;
+    f.build();
+    with_tower(f, 16);
+    RadVideoGenDecl& d = f.prog.video_gen;
+    d.encodes = 1;
+    d.enc_ratio = 16;
+    d.max_enc_frames = 289;
+    d.max_enc_side = 256;
+    d.max_enc_samples = 500000;
+    CHECK_OK(f.start_with_encode_gen(fake_encode_vae));
+    std::string why;
+    auto r = f.req(2, 2);   /* 2 steps keeps the walk short; the encodes all run before it */
+    /* A reference video: the 5-frame trimmed minimum at 16x16 (short final clip -> repeat frame). */
+    gen::VideoRefMedia v = ref_part(gen::VideoRefMedia::VIDEO, "ref_video_1", 1);
+    v.enc_frames = 5; v.enc_h = 16; v.enc_w = 16;
+    v.enc_pixels.assign(5 * 16 * 16 * 3, 1.0f);
+    /* Its soundtrack: 1600 samples over 2 channels — already whole hops, so unpadded. */
+    gen::VideoRefMedia a = ref_part(gen::VideoRefMedia::VIDEO_AUDIO, "ref_video_audio_1", 1);
+    a.enc_n = 1600; a.enc_channels = 2;
+    a.enc_samples.assign(2 * 1600, 0.25f);
+    /* A standalone audio: 850 samples, not a whole hop, so the driver zero-pads 750 onto it. */
+    gen::VideoRefMedia s = ref_part(gen::VideoRefMedia::AUDIO, "ref_audio_2", 2);
+    s.enc_n = 850; s.enc_channels = 2;
+    s.enc_samples.assign(2 * 850, -0.5f);
+    r->refs.push_back(v);
+    r->refs.push_back(a);
+    r->refs.push_back(s);
+    CHECK_OK(f.drv.submit(std::move(r), &why));
+
+    int saw_venc = 0, saw_vaudio = 0, saw_saudio = 0;
+    const int32_t* tab = nullptr;
+    for (int i = 0; i < 12 && saw_venc + saw_vaudio + saw_saudio < 3; ++i) {
+        const RadBatch* b = f.drv.next(0);
+        if (!b) break;
+        const RadVideoGenBatch* V = b->vgen_b;
+        if (b->gen == RAD_GEN_PASS_VENCODE || b->gen == RAD_GEN_PASS_AENCODE) {
+            REQUIRE(V != nullptr);
+            if (b->gen == RAD_GEN_PASS_VENCODE) {
+                CHECK_EQ(V->enc_kind, (int32_t)RAD_ENC_VIDEO);
+                CHECK_EQ(V->enc_slot, (int32_t)1);
+                CHECK_EQ(V->enc_frames, 17);        /* 5 frames clip-padded to one whole clip */
+                ++saw_venc;
+            } else if (V->enc_kind == RAD_ENC_VAUDIO) {   /* the soundtrack, at the VIDEO's slot */
+                CHECK_EQ(V->enc_slot, (int32_t)1);
+                CHECK_EQ(V->enc_n_samples, 1600);         /* whole hops: unpadded */
+                ++saw_vaudio;
+            } else {                                     /* the standalone audio, its own slot */
+                CHECK_EQ(V->enc_kind, (int32_t)RAD_ENC_AUDIO);
+                CHECK_EQ(V->enc_slot, (int32_t)2);
+                CHECK_EQ(V->enc_n_samples, 1600);         /* 850 zero-padded up to two hops */
+                ++saw_saudio;
+            }
+        }
+        if (V && V->ref_tab && !tab) tab = V->ref_tab;
+        f.answer(10 * i);
+        CHECK_OK(f.drv.done());
+    }
+    CHECK_EQ(saw_venc, 1);
+    CHECK_EQ(saw_vaudio, 1);
+    CHECK_EQ(saw_saudio, 1);
+    REQUIRE(tab != nullptr);
+    /* Two rows: the video (its soundtrack folded into the `audio` word) and the standalone audio. The
+     * VIDEO_AUDIO is not a row of its own. Video: kind 2, slot 1, 1x1 grid, 5 frames -> 2 latent
+     * frames, soundtrack 1600/800 = 2. Audio: kind 1, slot 2, no grid, 850 -> 2 latent frames. */
+    CHECK_EQ(tab[0], 2);
+    CHECK_EQ(tab[1], 0);
+    CHECK_EQ(tab[2], 2); CHECK_EQ(tab[3], 1); CHECK_EQ(tab[4], 1); CHECK_EQ(tab[5], 1);
+    CHECK_EQ(tab[6], 2); CHECK_EQ(tab[7], 2);
+    CHECK_EQ(tab[8], 1); CHECK_EQ(tab[9], 2); CHECK_EQ(tab[10], 0); CHECK_EQ(tab[11], 0);
+    CHECK_EQ(tab[12], 0); CHECK_EQ(tab[13], 2);
 }
 
 RAD_TEST_MAIN()

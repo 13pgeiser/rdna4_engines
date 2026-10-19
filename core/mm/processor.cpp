@@ -1042,6 +1042,69 @@ int Processor::encoder_image(const uint8_t* bytes, size_t n, int32_t ratio, int3
 }
 
 namespace {
+/* Which frames of a source video a reference clip keeps: spread uniformly over the stream, the
+ * largest count no more than both the stream's length and `max_frames` that is 5 modulo 17 — the
+ * reference's trim (`n % 17 == 5`), so the temporal encoder's 17-frame clips all land with the
+ * short final clip padded from five real frames. A stream too short to reach five yields what it
+ * has; the encode pass pads the final clip either way. */
+struct VaeSampleArgs { int32_t max_frames; };
+std::vector<int64_t> vae_sample_cb(const VideoInfo& info, const void* user) {
+    const VaeSampleArgs* a = static_cast<const VaeSampleArgs*>(user);
+    const int64_t avail = info.n_frames > 0 ? info.n_frames : 1;
+    const int64_t cap = a->max_frames > 0 ? std::min<int64_t>(a->max_frames, avail) : avail;
+    int64_t want = cap - (((cap - 5) % 17) + 17) % 17;   /* largest v <= cap with v % 17 == 5 */
+    if (want < 5) want = std::min<int64_t>(cap, 5);
+    const int64_t take = std::max<int64_t>(1, std::min(want, avail));
+    std::vector<int64_t> idx((size_t)take);
+    for (int64_t i = 0; i < take; ++i)
+        idx[(size_t)i] = take > 1 ? (i * (avail - 1)) / (take - 1) : 0;
+    return idx;
+}
+}  /* namespace */
+
+int Processor::encoder_video(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side,
+                             int32_t max_frames, std::vector<Frame>* out, std::string* why) const {
+    if (ratio < 1 || max_side < ratio) {
+        if (why) *why = "the encoder's side ratio and maximum are not usable";
+        return RAD_E_INVAL;
+    }
+    /* Same decode guard as a still: a reference the text encoder accepts the VAE accepts too. */
+    Video v;
+    const VaeSampleArgs a{ max_frames };
+    RAD_TRY(decode_video(bytes, n, vae_sample_cb, &a, cfg_.max_source_pixels, &v, why));
+    if (v.frames.empty()) {
+        if (why) *why = "the video holds no frames";
+        return RAD_E_INVAL;
+    }
+    /* One grid for every frame, the snap encoder_image applies to a still, taken from the first
+     * frame (a clip is one aspect throughout). */
+    auto snap = [&](int64_t s) {
+        int64_t v = (s / ratio) * ratio;
+        if (v < ratio) v = ratio;
+        if (v > max_side) v = max_side;
+        return (int32_t)v;
+    };
+    const Frame& f0 = v.frames.front();
+    const int32_t longest = std::max(f0.w, f0.h);
+    const double  scale = longest > max_side ? (double)max_side / (double)longest : 1.0;
+    const int32_t w = snap((int64_t)std::floor(f0.w * scale));
+    const int32_t h = snap((int64_t)std::floor(f0.h * scale));
+    out->clear();
+    out->reserve(v.frames.size());
+    for (const Frame& f : v.frames) {
+        Frame r;
+        resize_lanczos_rgb(f, w, h, &r);
+        out->push_back(std::move(r));
+    }
+    return RAD_OK;
+}
+
+int Processor::encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int64_t max_samples,
+                             std::vector<float>* out, std::string* why) const {
+    return decode_audio(bytes, n, rate, max_samples, out, why);
+}
+
+namespace {
 struct SampleArgs { double fps; int32_t lo, hi; bool gemma4; };
 std::vector<int64_t> sample_cb(const VideoInfo& info, const void* user) {
     const SampleArgs* a = static_cast<const SampleArgs*>(user);

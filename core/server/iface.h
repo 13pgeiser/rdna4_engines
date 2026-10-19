@@ -544,6 +544,26 @@ public:
         return RAD_E_UNSUPPORTED;
     }
 
+    /* A moving picture in a video VAE's encoder-ready form: decoded under the same guard, sampled to
+     * a clip-friendly frame count (at most `max_frames`) and resized to `encoder_image`'s grid. The
+     * frames are the trimmed, sampled count; the caller clip-pads to a whole clip. */
+    virtual int encoder_video(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side,
+                              int32_t max_frames, std::vector<mm::Frame>* out, std::string* why) {
+        (void)bytes; (void)n; (void)ratio; (void)max_side; (void)max_frames; (void)out;
+        if (why) *why = "this server prepares no reference media for a video encoder";
+        return RAD_E_UNSUPPORTED;
+    }
+
+    /* A clip in an audio VAE's encoder-ready form: its first stream as MONO float at `rate` Hz,
+     * truncated to `max_samples`. The caller spreads it across the encoder's channels and zero-pads
+     * to a hop. */
+    virtual int encoder_audio(const uint8_t* bytes, size_t n, int32_t rate, int64_t max_samples,
+                              std::vector<float>* out, std::string* why) {
+        (void)bytes; (void)n; (void)rate; (void)max_samples; (void)out;
+        if (why) *why = "this server prepares no reference media for an audio encoder";
+        return RAD_E_UNSUPPORTED;
+    }
+
     /* Audio in two halves, for a route that cuts a long recording into clips itself
      * (/v1/audio/transcriptions): the file decoded to mono samples at audio_rate(), at most
      * `max_samples` of them (RAD_E_INVAL past that, never a silent cut), and a clip of at most

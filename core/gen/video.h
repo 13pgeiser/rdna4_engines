@@ -86,16 +86,20 @@ struct VideoRefMedia {
     std::string data;                           /* the file's bytes */
 
     /* The reference in the encoder's own form, prepared by the server (which owns the decoder) so
-     * the driver stages bytes without ever touching a codec. The VAE encode pass reads exactly
-     * these; they are empty until the server decodes the part. IMAGE/VIDEO fill the pixels,
-     * AUDIO/VIDEO_AUDIO the samples.
+     * the driver stages bytes without ever touching a codec; they are empty until the server decodes
+     * the part. These are the NATURAL decoded shapes — the driver's encode pass, which owns the
+     * encoder's geometry, does the padding the encoder kernels demand (clip-padding a video's
+     * frames, zero-padding an audio's samples). IMAGE/VIDEO fill the pixels, AUDIO/VIDEO_AUDIO the
+     * samples.
      *   enc_pixels: f32 [enc_frames][enc_h][enc_w][3] row-major RGB in 0..255, UN-normalised —
      *     the video VAE applies ImageNet mean/std itself. Each side is snapped down to a multiple
      *     of the VAE's spatial ratio and capped at the declaration's max_enc_side, aspect kept,
-     *     because our encoder runs one volume and cannot tile the way the reference does. For a
-     *     still image enc_frames is 1.
-     *   enc_samples: f32 [enc_channels][enc_n] channel-major, each channel right-padded with
-     *     zeros out to a whole number of hops (geom entry 0), at the model's audio rate. */
+     *     because our encoder runs one volume and cannot tile the way the reference does. Frames are
+     *     the reference's sampled, trimmed count (for a still image, 1); the final short clip is
+     *     padded by the driver, not here.
+     *   enc_samples: f32 [enc_channels][enc_n] channel-major at the model's audio rate. A mono
+     *     source is spread across the channels (the audio VAE encodes one channel at a time); the
+     *     tail is right-padded with zeros to a whole hop by the driver. */
     std::vector<float> enc_pixels;
     int32_t            enc_frames = 0, enc_h = 0, enc_w = 0;
     std::vector<float> enc_samples;

@@ -437,6 +437,81 @@ TEST(ref2va_pictures_are_presented_before_the_prompt) {
     CHECK(g.tokens == want);
 }
 
+/* A generator that carries its VAE encoders (encodes 1): the reference parts are not merely passed
+ * as bytes — the picture, the video and both audios are decoded into the encoder's own form, the
+ * audio's mono tone spread across the encoder's channels — and every reference is spoken before the
+ * prompt in the reference's order: the picture's label and run, the soundtrack's `<Audio j>` right
+ * before its video's `<Video k>`, then the standalone `<Audio j>`. This is the server half; the
+ * driver half (padding, slots, the pack table) is tests/video_gen_test.cpp. */
+TEST(ref2va_videos_and_audios_are_encoded_and_spoken) {
+    FakeMultimodal mm;
+    mm.expand = { 900, 901 };
+    mm.enc_frames = 5; mm.enc_side = 16; mm.enc_n = 850;
+    FakeVideoGen gen;
+    std::unique_ptr<Fixture> f(new Fixture(Fixture::Tweak{ [&](ServerOptions& o, Deps& d) {
+        d.videos = &gen;
+        d.mm = &mm;
+        o.video_model = true;
+        gen.inf.encodes = 1;
+        gen.inf.enc_ratio = 16;
+        gen.inf.max_enc_side = 256;
+        gen.inf.max_enc_frames = 289;
+        gen.inf.max_enc_samples = 500000;
+    } }));
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/v1/videos";
+    q.form = { FormPart{ "prompt", "", "", "fox" },
+               FormPart{ "size", "", "", "256x256" },
+               FormPart{ "task", "", "", "ref2va" },
+               FormPart{ "ref_image_1", "a.png", "image/png", "PA" },
+               FormPart{ "ref_video_1", "v.mp4", "video/mp4", "ftyp" },
+               FormPart{ "ref_video_audio_1", "s.wav", "audio/wav", "RIFF" },
+               FormPart{ "ref_audio_1", "b.mp3", "audio/mpeg", "ID3" } };
+    HttpResponse r = f->srv->router().dispatch(q);
+    REQUIRE_EQ(r.status, 200);
+
+    /* One image, one video and two audios (the video's soundtrack plus the standalone) reached the
+     * encoder each belongs to. */
+    CHECK_EQ(mm.n_ienc, 1);
+    CHECK_EQ(mm.n_venc, 1);
+    CHECK_EQ(mm.n_aenc, 2);
+
+    const gen::VideoRequest& g = gen.last();
+    REQUIRE_EQ(g.refs.size(), (size_t)4);   /* sorted (kind, index): image, video, video_audio, audio */
+    /* The picture: one frame at the encoder grid, its pixels filled for the video VAE. */
+    CHECK_EQ((int)g.refs[0].kind, (int)gen::VideoRefMedia::IMAGE);
+    CHECK_EQ(g.refs[0].enc_frames, 1);
+    CHECK_EQ(g.refs[0].enc_h, 16);
+    CHECK_EQ(g.refs[0].enc_w, 16);
+    CHECK_EQ(g.refs[0].enc_pixels.size(), (size_t)16 * 16 * 3);
+    /* The video: the trimmed natural frame count, concatenated over the grid (the driver pads). */
+    CHECK_EQ((int)g.refs[1].kind, (int)gen::VideoRefMedia::VIDEO);
+    CHECK_EQ(g.refs[1].enc_frames, 5);
+    CHECK_EQ(g.refs[1].enc_pixels.size(), (size_t)5 * 16 * 16 * 3);
+    /* The soundtrack and the standalone audio: the mono tone spread across the generator's two
+     * channels, enc_n the natural (unpadded) count. */
+    CHECK_EQ((int)g.refs[2].kind, (int)gen::VideoRefMedia::VIDEO_AUDIO);
+    CHECK_EQ(g.refs[2].enc_channels, 2);
+    CHECK_EQ(g.refs[2].enc_n, (int64_t)850);
+    CHECK_EQ(g.refs[2].enc_samples.size(), (size_t)2 * 850);
+    CHECK_EQ(g.refs[2].enc_samples[0], g.refs[2].enc_samples[850]);   /* both channels the same tone */
+    CHECK_EQ((int)g.refs[3].kind, (int)gen::VideoRefMedia::AUDIO);
+    CHECK_EQ(g.refs[3].enc_n, (int64_t)850);
+
+    /* The prompt speaks every reference before the words, in the reference's order. */
+    std::vector<int32_t> want;
+    auto chars = [&](const std::string& s) { for (unsigned char c : s) want.push_back((int32_t)c); };
+    chars("<v>");
+    chars("<Picture 1>: ");
+    want.insert(want.end(), mm.expand.begin(), mm.expand.end());
+    chars("<Audio 1>: ");
+    chars("<Video 1>: ");
+    chars("<Audio 2>: ");
+    chars("fox");
+    CHECK(g.tokens == want);
+}
+
 /* Everything about the parts that cannot be right is refused naming the part (or `task` when
  * the media themselves are the question), before anything is queued. */
 TEST(ref2va_requests_are_refused_naming_the_part) {

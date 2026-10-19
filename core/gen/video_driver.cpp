@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 namespace rad {
@@ -282,6 +284,18 @@ int VideoDriver::init(const Program& prog, PositionsFn positions,
     vout_.assign(ranks_.size(), RadVideoGenBatch{});
     free_lanes_.clear();
     for (int64_t i = decl_.max_lanes - 1; i >= 0; --i) free_lanes_.push_back((int32_t)i);
+    /* Debug-only readback of the encoder outputs (R4D_ENC_DEBUG). Only when the environment names
+     * it AND the container carries encoders; a normal run leaves enc_dbg_ false and never reads
+     * decl_.dbg_* or touches enc_dbg_host_. */
+    if (std::getenv("R4D_ENC_DEBUG") &&
+        (decl_.dbg_enca_bytes > 0 || decl_.dbg_evc_bytes > 0)) {
+        enc_dbg_bytes_ = std::max(decl_.dbg_enca_bytes, decl_.dbg_evc_bytes);
+        enc_dbg_host_ = static_cast<char*>(rad_dev_alloc(enc_dbg_bytes_, RAD_MEM_HOST_PINNED));
+        enc_dbg_ = enc_dbg_host_ != nullptr;
+        if (!enc_dbg_)
+            RAD_ERR("video generator: R4D_ENC_DEBUG set but no pinned host for the %lld-byte "
+                    "encoder readback", (long long)enc_dbg_bytes_);
+    }
     return RAD_OK;
 }
 
@@ -296,9 +310,11 @@ void VideoDriver::fini() {
     if (host_) rad_dev_free(host_, RAD_MEM_HOST_PINNED);
     if (frames_host_) rad_dev_free(frames_host_, RAD_MEM_HOST_PINNED);
     if (audio_host_) rad_dev_free(audio_host_, RAD_MEM_HOST_PINNED);
+    if (enc_dbg_host_) rad_dev_free(enc_dbg_host_, RAD_MEM_HOST_PINNED);
     host_ = nullptr;
     frames_host_ = nullptr;
     audio_host_ = nullptr;
+    enc_dbg_host_ = nullptr;
 }
 
 /* ================================================================== requests */
@@ -313,20 +329,37 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
     if (T < 1 || T > d.max_text)
         return no("the prompt is " + std::to_string(T) + " tokens; this model takes 1.." +
                   std::to_string(d.max_text));
-    /* Reference conditioning: the images reach the language model through `media`, which the
-     * server built from the parts (gen/video.h) and build_cond stages into the conditioning
-     * pass. What this generator cannot consume yet is anything whose bytes reach the model
-     * through a VAE — a reference video's frames, a soundtrack, a standalone audio. Those are
-     * refused naming the part, rather than silently made into a weaker video. */
+    /* Reference conditioning reaches the model two ways. Reference images enter the language model
+     * through `media` (the server built it from the parts, gen/video.h; build_cond stages it into
+     * the conditioning pass) AND contribute VAE rows. A reference video, its soundtrack, and a
+     * standalone audio reach the model only as VAE rows: the server decodes them into the encoder's
+     * own form, one encode pass each folds their latents into the lane's fixed slots, and the step's
+     * pack lays those slots between the text and the target streams (RadVideoGenBatch::ref_tab).
+     * Every kind the declaration allows is consumed; the guard below is only about a container
+     * lacking its vision tower, which could encode nothing. */
     if (!r->refs.empty() && max_enc_ == 0)
         return no("this container was converted without its vision tower, so no request can "
                   "carry reference media");
+    /* A reference video, soundtrack or standalone audio reaches the model only through the VAE
+     * encoders (the video/audio Vencode/Aencode passes), which a container carries exactly when it
+     * declares `encodes`. Converted without them there is nothing to condition on, and the reference
+     * would drop silently into a text-only video — the very silent weakening this guard exists to
+     * prevent — so refuse it, naming the part. Images need only the tower and are checked below. */
+    if (!d.encodes)
+        for (const VideoRefMedia& m : r->refs)
+            if (m.kind != VideoRefMedia::IMAGE)
+                return no("'" + m.name + "' is a reference " +
+                          (m.kind == VideoRefMedia::VIDEO ? "video"
+                           : m.kind == VideoRefMedia::VIDEO_AUDIO ? "soundtrack" : "audio") +
+                          ", but this container was converted without its VAE encoders, so nothing "
+                          "can condition on it");
+    /* Only reference images add language-model soft-token rows, so only they need processed media.
+     * A reference video or audio reaches the model purely through the VAE encode rows the pack lays
+     * from the reference table, so a request of those alone carries no `media` and needs none. */
+    bool has_image = false;
     for (const VideoRefMedia& m : r->refs)
-        if (m.kind != VideoRefMedia::IMAGE)
-            return no("'" + m.name + "' is not consumed yet: reference videos and audios reach "
-                      "the model through the video and audio VAEs, which the video path does not "
-                      "run in this build; only ref_image_N parts condition a generation today");
-    if (!r->refs.empty() && !r->media)
+        if (m.kind == VideoRefMedia::IMAGE) has_image = true;
+    if (has_image && !r->media)
         return no("the request carries reference images but no processed media to condition on");
     if (r->media) {
         int64_t n_patch = 0;
@@ -369,33 +402,105 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
     j->geom.n_audio = s.n_audio;
     /* The pack's reference table (RadVideoGenBatch::ref_tab): every reference the DiT conditions
      * on, in presentation order, in ITS OWN latent grid -- {kind, slot, h, w, frames, audio} six
-     * words after the reference and keyframe counts. A picture's grid is the encoder's sides over
-     * the VAE ratio, one latent frame, no soundtrack; its slot is the one its Vencode pass folds
-     * its latents into. It must exist before the step layout is decided, because when the denoiser
-     * consumes it the reference rows are part of that layout. Only pictures queue today (videos and
-     * audios are refused at submit above until their decode paths land), so the keyframe count
-     * stays 0 and the table holds only picture rows. */
-    if (d.encodes)
+     * words after the reference and keyframe counts. `kind` is a pack Ref2VARefKind (picture 0,
+     * standalone audio 1, video 2), the server's VIDEO_AUDIO being folded into its video's `audio`
+     * word rather than a row of its own. Each reference's slot is the one its encode pass folds its
+     * latents into, and its latent counts come from the encoder's own geometry, not hand arithmetic:
+     * a picture is one latent frame (its grid the encoder's sides over the VAE ratio); a video's
+     * frames and its soundtrack's are the Vencode/Aencode latent counts rad_arch_encode_geom gives
+     * (a video's are the same before and after the encode pass clip-pads its short final clip). The
+     * table must exist before the step layout is decided, because when the denoiser consumes it the
+     * reference rows are part of that layout. The keyframe count stays 0 (continuation is separate
+     * work), so the table holds only reference rows. */
+    if (d.encodes) {
+        bool need_geom = false;
+        for (const VideoRefMedia& m : r->refs)
+            if (m.kind != VideoRefMedia::IMAGE) need_geom = true;
+        if (need_geom && !enc_geom_)
+            return no("the request carries a reference video or audio, but this plugin exports no "
+                      "rad_arch_encode_geom, so their encoder geometry cannot be sized");
+        int32_t eg[25];
+        /* A reference's latent frame counts, straight from the encoder's geometry. */
+        auto video_lat = [&](const VideoRefMedia& m) -> int64_t {
+            int64_t in[4] = { m.enc_frames, m.enc_h, m.enc_w, 3 };
+            return enc_geom_(RAD_GEN_PASS_VENCODE, in, eg, 25) < 0 ? -1 : (int64_t)eg[24];
+        };
+        auto audio_lat = [&](const VideoRefMedia& m) -> int64_t {
+            int64_t in[4] = { m.enc_n, 0, 0, m.enc_channels };
+            return enc_geom_(RAD_GEN_PASS_AENCODE, in, eg, 25) < 0 ? -1 : (int64_t)eg[12];
+        };
+        /* Pictures and videos share a side-grid check against the VAE ratio. */
+        auto bad_side = [&](const VideoRefMedia& m) {
+            return d.enc_ratio < 1 || m.enc_h < d.enc_ratio || m.enc_w < d.enc_ratio ||
+                   m.enc_h % d.enc_ratio || m.enc_w % d.enc_ratio;
+        };
         for (size_t i = 0; i < r->refs.size(); ++i) {
             const VideoRefMedia& m = r->refs[i];
-            if (m.kind != VideoRefMedia::IMAGE) continue;
-            if (m.enc_pixels.empty())
-                return no("'" + m.name + "' was not prepared for the video encoder");
-            if (m.index < 1)
-                return no("'" + m.name + "' has no slot in the conditioning");
-            if (d.enc_ratio < 1 || m.enc_h < d.enc_ratio || m.enc_w < d.enc_ratio ||
-                m.enc_h % d.enc_ratio || m.enc_w % d.enc_ratio)
-                return no("'" + m.name + "' has encoder sides (" + std::to_string(m.enc_h) + "x" +
-                          std::to_string(m.enc_w) + ") the VAE grid of " +
-                          std::to_string(d.enc_ratio) + " does not divide");
-            j->enc_q.push_back({RAD_ENC_IMAGE, m.index, (int32_t)i});
-            if (j->ref_tab.empty()) j->ref_tab.assign(2, 0);   /* [n_refs, n_keys] */
-            ++j->ref_tab[0];
-            j->ref_tab.insert(j->ref_tab.end(),
-                              {0 /*a picture*/, m.index, (int32_t)(m.enc_h / d.enc_ratio),
-                               (int32_t)(m.enc_w / d.enc_ratio), 1 /*one latent frame*/,
-                               0 /*no soundtrack*/});
+            if (m.kind == VideoRefMedia::IMAGE) {
+                if (m.enc_pixels.empty())
+                    return no("'" + m.name + "' was not prepared for the video encoder");
+                if (m.index < 1)
+                    return no("'" + m.name + "' has no slot in the conditioning");
+                if (bad_side(m))
+                    return no("'" + m.name + "' has encoder sides (" + std::to_string(m.enc_h) +
+                              "x" + std::to_string(m.enc_w) + ") the VAE grid of " +
+                              std::to_string(d.enc_ratio) + " does not divide");
+                j->enc_q.push_back({RAD_ENC_IMAGE, m.index, (int32_t)i});
+                if (j->ref_tab.empty()) j->ref_tab.assign(2, 0);   /* [n_refs, n_keys] */
+                ++j->ref_tab[0];
+                j->ref_tab.insert(j->ref_tab.end(),
+                                  {0 /*a picture*/, m.index, (int32_t)(m.enc_h / d.enc_ratio),
+                                   (int32_t)(m.enc_w / d.enc_ratio), 1 /*one latent frame*/,
+                                   0 /*no soundtrack*/});
+            } else if (m.kind == VideoRefMedia::VIDEO) {
+                if (m.enc_pixels.empty())
+                    return no("'" + m.name + "' was not prepared for the video encoder");
+                if (m.index < 1 || m.index > 3)
+                    return no("'" + m.name + "' has no video slot (1..3)");
+                if (bad_side(m))
+                    return no("'" + m.name + "' has encoder sides (" + std::to_string(m.enc_h) +
+                              "x" + std::to_string(m.enc_w) + ") the VAE grid of " +
+                              std::to_string(d.enc_ratio) + " does not divide");
+                /* A soundtrack given for this video (ref_video_audio_N) is folded into THIS row's
+                 * `audio` word, not a row of its own; the pack lays its block right before the
+                 * video's and the scatter reads the two back as the pair they are. It is encoded at
+                 * the VIDEO's slot, since aenc_slot_row numbers a soundtrack by its video. */
+                int64_t a_t = 0;
+                for (size_t k = 0; k < r->refs.size(); ++k) {
+                    const VideoRefMedia& a = r->refs[k];
+                    if (a.kind != VideoRefMedia::VIDEO_AUDIO || a.index != m.index) continue;
+                    if (a.enc_samples.empty() || a.enc_n < 1 || a.enc_channels < 1)
+                        return no("'" + a.name + "' (the soundtrack of '" + m.name +
+                                  "') was not prepared for the audio encoder");
+                    a_t = audio_lat(a);
+                    if (a_t < 1)
+                        return no("the audio encoder refuses the soundtrack '" + a.name + "'");
+                    j->enc_q.push_back({RAD_ENC_VAUDIO, m.index, (int32_t)k});
+                }
+                const int64_t v_t = video_lat(m);
+                if (v_t < 1) return no("the video encoder refuses '" + m.name + "'");
+                j->enc_q.push_back({RAD_ENC_VIDEO, m.index, (int32_t)i});
+                if (j->ref_tab.empty()) j->ref_tab.assign(2, 0);
+                ++j->ref_tab[0];
+                j->ref_tab.insert(j->ref_tab.end(),
+                                  {2 /*a video*/, m.index, (int32_t)(m.enc_h / d.enc_ratio),
+                                   (int32_t)(m.enc_w / d.enc_ratio), (int32_t)v_t, (int32_t)a_t});
+            } else if (m.kind == VideoRefMedia::AUDIO) {
+                if (m.enc_samples.empty() || m.enc_n < 1 || m.enc_channels < 1)
+                    return no("'" + m.name + "' was not prepared for the audio encoder");
+                if (m.index < 1 || m.index > 3)
+                    return no("'" + m.name + "' has no audio slot (1..3)");
+                const int64_t a_t = audio_lat(m);
+                if (a_t < 1) return no("the audio encoder refuses '" + m.name + "'");
+                j->enc_q.push_back({RAD_ENC_AUDIO, m.index, (int32_t)i});
+                if (j->ref_tab.empty()) j->ref_tab.assign(2, 0);
+                ++j->ref_tab[0];
+                j->ref_tab.insert(j->ref_tab.end(),
+                                  {1 /*a standalone audio*/, m.index, 0, 0, 0, (int32_t)a_t});
+            }
+            /* VIDEO_AUDIO rows are folded into their video above, so they take no row here. */
         }
+    }
     /* The step's packed sequence. When the denoiser consumes the reference table the pack is the
      * only source of its rows, segment boundaries and positions -- the reference rows sit between
      * the text and the target streams, so the plain `text + audio + video` arithmetic and the plain
@@ -525,10 +630,11 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
     j->n_chunks = r->chunks;
     j->n_samples = (int64_t)s.n_audio * (d.sample_rate / d.audio_rate);
     /* The reference table and the VAE encode queue were built above, before the step layout was
-     * chosen: each reference picture the server decoded into encoder form rides one Vencode pass,
-     * at the slot its index numbers within pictures -- the slot the encoder folds its latents into
-     * and the step's pack scatters them from. Reference videos and audios are refused above until
-     * their decode paths land, so only pictures are queued and the keyframe count stays 0. */
+     * chosen. Each reference the server decoded into encoder form rides one encode pass at the slot
+     * its index numbers within its kind -- a picture or video a Vencode pass, a standalone audio and
+     * every video's soundtrack an Aencode pass (a soundtrack at its video's slot, since the encoder
+     * and the scatter both number it by its video). The keyframe count stays 0: continuation is
+     * separate work. */
     /* The soundtrack's length, exactly the samples the decode will hand the encoder — the
      * number a caller that chains clips against an audio floor checks. A build without
      * libavcodec never gets the muxed file to read it back from, so it is logged here. */
@@ -1012,10 +1118,10 @@ const RadBatch* VideoDriver::build_chunk(Job& j, int step) {
 
 /* One media item through its VAE encoder: stage its encoder-ready bytes and the encode geometry
  * the plugin's rad_arch_encode_geom derives from them, then name the pass's kind and slot so the
- * encoder folds the latents into the lane's fixed slot rows. The bytes the server decoded must
- * already be padded to what the geom reports (a video's frames clip-padded, an audio's samples to
- * its hop) — the encoder reads that many and no more, so a disagreement is failed here rather than
- * run past the staged volume. */
+ * encoder folds the latents into the lane's fixed slot rows. The server sends the NATURAL decoded
+ * media; the padding the geom demands (a video's frames to a whole clip, an audio's samples to a
+ * whole hop) is applied here, since only the driver has the geom, and the encoder is handed exactly
+ * that padded volume. */
 const RadBatch* VideoDriver::build_encode(Job& j, int step) {
     for (int g = 0; g < R_N; ++g) reg_[g].used = 0;
     const Job::EncItem& it = j.enc_q[j.enc_next];
@@ -1028,34 +1134,50 @@ const RadBatch* VideoDriver::build_encode(Job& j, int step) {
     if (!enc_geom_)
         return fail("the request carries reference media to encode, but this plugin exports no "
                     "rad_arch_encode_geom");
+    /* The encoder kernels recompute their geometry from the batch's frame / sample counts and
+     * require them to be the padded figures rad_arch_encode_geom reports (a video's frames out to a
+     * whole clip, an audio's samples out to a whole hop). The server sends the NATURAL decoded
+     * media, so the padding lives here, where the geometry is known: a video's short final clip is
+     * filled by repeating its last frame, an audio's tail by zeros. A single picture is already
+     * clip- and hop-complete (one frame, no hop), so its bytes and staging are unchanged. */
     int32_t* gd = hptr<int32_t>(R_ENCG);
+    int64_t stage_frames = 0, stage_samples = 0;
     if (audio) {
         const int64_t n = m.enc_n;
         const int32_t ch = m.enc_channels;
-        if (n <= 0 || ch <= 0 || (int64_t)n * ch * 4 > reg_[R_ENCSM].bytes)
-            return fail("a reference audio does not fit one encode pass");
+        if (n <= 0 || ch <= 0) return fail("a reference audio has no samples or no channels");
         int64_t in[4] = { n, 0, 0, ch };
         if (enc_geom_(RAD_GEN_PASS_AENCODE, in, gd, 25) < 0)
             return fail("the audio encoder refuses " + std::to_string(n) + " samples over " +
                         std::to_string(ch) + " channels");
-        if ((int64_t)gd[0] != n)
-            return fail("a reference audio is not padded to the length rad_arch_encode_geom "
-                        "reports");
-        std::memcpy(hptr<float>(R_ENCSM), m.enc_samples.data(), (size_t)n * ch * 4);
-        reg_[R_ENCSM].used = n * ch * 4;
+        stage_samples = gd[0];   /* n rounded up to a whole hop; the encoder reads exactly this */
+        if (stage_samples * ch * 4 > reg_[R_ENCSM].bytes)
+            return fail("a reference audio does not fit one encode pass");
+        float* sm = hptr<float>(R_ENCSM);
+        std::memset(sm, 0, (size_t)stage_samples * ch * 4);   /* right-pad each channel with zeros */
+        for (int32_t c = 0; c < ch; ++c)
+            std::memcpy(sm + (size_t)c * stage_samples, m.enc_samples.data() + (size_t)c * n,
+                        (size_t)n * 4);
+        reg_[R_ENCSM].used = stage_samples * ch * 4;
     } else {
         const int64_t nf = m.enc_frames, H = m.enc_h, W = m.enc_w;
-        if (nf <= 0 || H <= 0 || W <= 0 || nf * H * W * 3 * 4 > reg_[R_ENCPX].bytes)
-            return fail("a reference picture or video does not fit one encode pass");
+        if (nf <= 0 || H <= 0 || W <= 0)
+            return fail("a reference picture or video has no frames or no sides");
         int64_t in[4] = { nf, H, W, 3 };
         if (enc_geom_(RAD_GEN_PASS_VENCODE, in, gd, 25) < 0)
             return fail("the video encoder refuses a reference at " + std::to_string(H) + "x" +
                         std::to_string(W) + " over " + std::to_string(nf) + " frames");
-        if ((int64_t)gd[23] != nf)
-            return fail("a reference is not padded to the clip count rad_arch_encode_geom "
-                        "reports");
-        std::memcpy(hptr<float>(R_ENCPX), m.enc_pixels.data(), (size_t)nf * H * W * 3 * 4);
-        reg_[R_ENCPX].used = nf * H * W * 3 * 4;
+        const int64_t area = H * W * 3;
+        stage_frames = gd[23];   /* nf clip-padded to a whole number of 17-frame clips */
+        if (stage_frames * area * 4 > reg_[R_ENCPX].bytes)
+            return fail("a reference picture or video does not fit one encode pass");
+        float* px = hptr<float>(R_ENCPX);
+        std::memcpy(px, m.enc_pixels.data(), (size_t)nf * area * 4);
+        /* Repeat the final frame out to the padded clip count: the causal encoder wants every clip
+         * full, and the reference pads the short last clip exactly this way. */
+        for (int64_t f = nf; f < stage_frames; ++f)
+            std::memcpy(px + f * area, px + (nf - 1) * area, (size_t)area * 4);
+        reg_[R_ENCPX].used = stage_frames * area * 4;
     }
     reg_[R_ENCG].used = 25 * 4;
     stage_geom(j, j.geom, j.rows, 0);
@@ -1069,11 +1191,11 @@ const RadBatch* VideoDriver::build_encode(Job& j, int step) {
         V.enc_slot = it.slot;
         if (audio) {
             V.enc_samples = dptr<float>(ri, R_ENCSM);
-            V.enc_n_samples = m.enc_n;
+            V.enc_n_samples = stage_samples;
             V.enc_channels = m.enc_channels;
         } else {
             V.enc_pixels = dptr<float>(ri, R_ENCPX);
-            V.enc_frames = m.enc_frames;
+            V.enc_frames = stage_frames;
             V.enc_height = m.enc_h;
             V.enc_width = m.enc_w;
         }
@@ -1082,6 +1204,15 @@ const RadBatch* VideoDriver::build_encode(Job& j, int step) {
     for (auto& B : out_) B.gen = kind;
     pass_.kind = kind;
     pass_.job = j.id;
+    if (enc_dbg_) {
+        const rad_buf   h = audio ? decl_.dbg_enca : decl_.dbg_evc;
+        const int64_t   n = audio ? decl_.dbg_enca_bytes : decl_.dbg_evc_bytes;
+        enc_dbg_used_ = 0;
+        if (h && n > 0) {
+            rb_.assign(1, Readback{h, n, enc_dbg_host_});
+            enc_dbg_used_ = n;
+        }
+    }
     return &out_[0];
 }
 
@@ -1097,6 +1228,27 @@ int VideoDriver::done() {
     case RAD_GEN_PASS_VENCODE:
     case RAD_GEN_PASS_AENCODE:
         /* The media's latents are now in the lane's slot rows; take the next reference, if any. */
+        if (enc_dbg_ && enc_dbg_used_ > 0) {
+            const int64_t nf = enc_dbg_used_ / 4;
+            const float* z = reinterpret_cast<const float*>(enc_dbg_host_);
+            uint64_t h = 1469598103934665603ULL;   /* FNV-1a over the readback bytes */
+            for (int64_t i = 0; i < enc_dbg_used_; ++i)
+                h = (h ^ (uint64_t)(uint8_t)enc_dbg_host_[i]) * 1099511628211ULL;
+            int64_t nz = 0;
+            float mx = 0.0f;
+            double sum = 0.0;
+            for (int64_t i = 0; i < nf; ++i) {
+                if (z[i] != 0.0f) ++nz;
+                const float a = z[i] < 0 ? -z[i] : z[i];
+                if (a > mx) mx = a;
+                sum += z[i];
+            }
+            RAD_ERR("enc_dbg %s slot %d: fnv %016llx floats %lld nonzero %lld maxabs %.6g "
+                    "sum %.6g  head[%.6g %.6g %.6g %.6g]",
+                    pass_.kind == RAD_GEN_PASS_AENCODE ? "AENCA(b_enca)" : "VENCV(b_evc)",
+                    (int)enc_dbg_used_, (unsigned long long)h, (long long)nf, (long long)nz,
+                    (double)mx, sum, (double)z[0], (double)z[1], (double)z[2], (double)z[3]);
+        }
         ++j->enc_next;
         break;
     case RAD_GEN_PASS_VSTEP: {

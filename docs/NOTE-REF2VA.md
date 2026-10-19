@@ -14,13 +14,32 @@ sibling notes (`NOTE-P3-PACK.md`, `NOTE-P2-ENCODE.md`); this one is about capabi
 ## What works today
 
 - **Image references — ≤9 photos, device-verified.** A request carrying `ref_image_1 … ref_image_9`
-  runs the full conditioned denoise on both cards and returns a video. Three fixed-seed runs of the
-  same prompt — no reference, one reference, nine references — produce three distinct outputs, so
-  the conditioning is demonstrably *live* (not inert) and reference-*aware*, and nine photos no
-  longer hit the earlier submit-time refusal.
+  runs the full conditioned denoise on both cards and returns a video. The conditioning is
+  demonstrably *live* and *content-sensitive*, not merely count-sensitive: at a fixed seed, two jobs
+  with the **same prompt and the same single reference but different photo content** give distinct
+  outputs (a strict content-control), and nine photos complete where the pinned build refused at
+  submit. Images steer the output because they feed the text encoder as well as the VAE — the route
+  the video / audio references lack (see point 4).
 - **Reference-media plumbing and caps.** The container declares 9/3/3 (images/videos/audios); the
   VAE-encode passes, the reference table, and the widened step layout are all in place, and the
   encode path is now unblocked by the host FFmpeg install.
+- **Video and audio references — wired, host-tested, and running on-device without fault; NOT yet
+  content-active.** The submit refusal that used to reject `ref_video_N` / `ref_video_audio_N` /
+  `ref_audio_N` is gone. The server decodes each into the encoder's form, the driver stages a
+  `Vencode` / `Aencode` pass and folds it into the reference table, and the widened step consumes it
+  (point 4). This is proven end-to-end: the host tier is green (`videos_test` decodes and speaks every
+  kind; `video_gen_test` clips-pads / zero-pads, slots a soundtrack to its video, and lays the table,
+  and refuses a non-encoding container by name), **and on the device the complete DaSiWa shape — a
+  picture + a video + that video's soundtrack + a standalone audio, four reference parts in one
+  request — runs every encoder pass and the widened denoise to a clean MP4 with no engine fault.**
+  What is **not** yet true: a fixed-seed content-control (same prompt, same reference *count*, only the
+  reference *content* differing) shows a reference **video** or **audio does not change the output**.
+  The reference **image** does (it also rides the text encoder — see point 4). The reason is isolated
+  to the VAE **encoders** producing content-invariant latents, not to the decode, staging, upload or
+  reference-table scatter (all of which are proven to carry distinct content per media item); it is the
+  open **encoder value-parity** task. Until that lands, a video / audio reference is accepted and
+  encoded but is, in effect, ignored by the output — treat image references as the only ones that
+  currently steer the generation.
 - **The modulation-cell merge** that lifts the count ceiling (next section).
 
 ## The reference-count ceiling: how it went from ≤5 to ≤9
@@ -55,17 +74,17 @@ matter how many there are.
 
 ## What this port still cannot reproduce (the honest list)
 
-1. **Many *interleaved* mixed-modality references would exceed the 8-group table** *(prospective —
-   only reachable once reference videos are wired, see point 4; today every accepted reference is a
-   photo, which is four groups and never binds).* Photos are free, but every reference *video* would
-   contribute two cells in order — *video-conditioned* then its *audio-conditioned* soundtrack — and
-   a photo placed after it **reopens** the video-conditioned cell, adding a group. Alternating photos
-   with video-plus-soundtrack refs could push the merged run past `kMaxSegs = 8` cells, which the
-   driver refuses at submit: *"these references change the conditioning's modulation cell N times,
-   but this deployment's modulation table holds 8 cells — ask for references that share their
-   modalities and target, or fewer of them."* **Workaround when videos arrive:** group references by
-   modality (all photos together, then the videos) so same-kind refs are contiguous and merge; the
-   ceiling only bites on heavy interleaving.
+1. **Many *interleaved* mixed-modality references can exceed the 8-group table.** Photos are free
+   (each `(video-ada, video-conditioned)`, one merged cell), but every reference *video* contributes
+   two cells in order — *video-conditioned* then its *audio-conditioned* soundtrack — and a photo
+   placed after it **reopens** the video-conditioned cell, adding a group. Alternating photos with
+   video-plus-soundtrack refs can push the merged run past `kMaxSegs = 8` cells, which the driver
+   refuses at submit: *"these references change the conditioning's modulation cell N times, but this
+   deployment's modulation table holds 8 cells — ask for references that share their modalities and
+   target, or fewer of them."* Since reference videos are now wired (point 4) this ceiling **binds for
+   real**, not just prospectively. **Workaround:** group references by modality (all photos together,
+   then the videos) so same-kind refs are contiguous and merge; the ceiling only bites on heavy
+   interleaving. A single video-plus-soundtrack is four to five groups and always fits.
 
    *Why the ceiling stays at 8:* widening it means growing the shared `b_ada` / `b_nout` / `b_modg`
    buffers on **both** cards — exactly the VRAM a dual-32 GB box does not have. Since the common case
@@ -86,23 +105,58 @@ matter how many there are.
    multi-segment seamless continuation, as the DaSiWa workflow uses it, is not reproduced yet. Single
    generation conditioned on reference *images* is (see point 4 for video / audio).
 
-4. **Reference videos and audios are refused at submit — not yet wired, even though the encoders
-   load.** `ref_video_N`, `ref_video_audio_N`, and `ref_audio_N` parts are accepted by the parser,
-   capped (3 / 3), and paired correctly, but the request is rejected with *"'ref_video_1' is not
-   consumed yet: reference videos and audios reach the model through the video and audio VAEs …
-   only ref_image_N parts condition a generation today."* The VAE encoders are declared and loaded,
-   and the `Vencode` pass runs for **image** references, but no path decodes a video's frames or an
-   audio's samples into the encoder. **Only reference images condition a generation today.** This is
-   the single largest remaining DaSiWa gap. The scaffolding is already designed for it — the
-   `VideoRefMedia` encoder view is documented as *"IMAGE/VIDEO fill the pixels, AUDIO/VIDEO_AUDIO the
-   samples,"* `decode_video` / `decode_audio` exist in the media layer, and the driver's encode
-   builder already branches on audio — so enabling them is bounded work, not a redesign:
-   (a) server-side, decode a video's frames / an audio's samples into `enc_pixels` / `enc_samples` on
-   the encoder grid (mirroring the image loop); (b) driver-side, drop the submit guard and enqueue
-   `RAD_ENC_VIDEO` / `RAD_ENC_VAUDIO` / `RAD_ENC_AUDIO` with the right latent grid and slot; (c) a
-   per-kind device differential (video, audio, video-with-soundtrack) proving each conditions the
-   output. Until then, treat the mixed-modality interleaving ceiling in point 1 as **prospective** —
-   today every accepted reference is a photo, which merges to four groups.
+4. **Reference videos and audios are wired and run — through the VAEs, not the text encoder — but do
+   not yet steer the output.** A
+   `ref_video_N` (mp4/mov), its soundtrack `ref_video_audio_N`, and a standalone `ref_audio_N`
+   (wav/mp3/…) are decoded on the server into the encoder's own form (`encoder_video` /
+   `encoder_audio` → `enc_pixels` / `enc_samples`), staged into a `Vencode` / `Aencode` pass, folded
+   into the pack's reference table, and consumed by the widened step — the same route an image
+   reference takes, only via a VAE instead of the language model. A video and its separately-given
+   soundtrack are **one** table row: the soundtrack folds into the video's `audio` word and encodes
+   at the video's slot (`aenc_slot_row` numbers it by its video). The driver clip-pads a video's short
+   final clip by repeating its last frame and zero-pads an audio's tail to a whole hop, because only
+   the driver holds the encoder geometry. A request of videos / audios alone carries no `media`: only
+   images add soft-token rows the text encoder reads. A container converted **without** its VAE
+   encoders (`encodes 0`) refuses such a part *by name* ("… is a reference video, but this container
+   was converted without its VAE encoders") rather than drop it into a text-only video.
+
+   **The one thing that does not yet work is the encoder's numbers, not its plumbing.** A controlled
+   fixed-seed check — same prompt, same reference count, only the media content differing — shows a
+   reference video (two 512×512 videos with genuinely different decoded frames) and a reference audio
+   (a tone, a chirp, white noise) each producing a **byte-identical** output, while a reference image
+   of the same count changes it. The cause is isolated to the encoder by two facts. First, a debug
+   hash of the encoder *input* as the driver stages it is distinct for every media item (a tone, a
+   chirp and white noise all differ from silence and from one another), so decode, padding and
+   host→device upload hand the encoder genuinely different bytes. Second, the step folds those latents
+   into the sequence with a **linear projection** (`op_vin` / `op_ain`, each a `dense_bias` GEMM of the
+   reference's slot rows in `b_evc` / `b_enca` into `b_h`) — a linear map cannot send two different
+   input vectors to the same output, so had the encoder produced different latents, the conditioning
+   rows — and therefore the output — would differ. Both point the same way: the encoder is turning all
+   sufficiently-nonzero content into the same latent. A third check rules out the tempting shortcut — that the container's
+   encoder weights were converted empty or as placeholders (a zero weight maps every input to one bias, exactly this
+   signature): the `venc` / `aenc` tensors came from the genuine MiniMax-H3 sources and their recorded quantisation error
+   is ordinary bf16 rounding (relative Frobenius ≈ 1.6e-3, which a zero tensor cannot produce). The weights are real; the
+   defect is in how the kernels *execute* them. That is a
+   numerical-value-parity task (golden-compare the encode chain against the reference encoder, run by
+   run), deliberately **not** attempted blind here — a change that made the latents merely *differ*
+   could make them *wrong*, and the encoder kernels are shared with the image path (which is verified
+   live via the text encoder) and plain generation, both currently green. Until it lands, video /
+   audio references are accepted and encoded but inert; image references are the kind that steers.
+
+   What still differs from the DaSiWa reference (hence not pixel-for-pixel reproducible):
+   - **The text encoder only *names* a moving picture; it never sees its pixels.** DaSiWa also shows
+     Qwen a strip of timestamped frames (~2 fps) so the language model perceives the motion; we give
+     it only the `<Video k>` / `<Audio j>` text label ahead of the prompt. Motion / identity
+     conditioning for a video therefore rides **entirely** on its VAE rows — images are the only
+     references that also carry soft-token rows. **The 2 fps frame strip is deferred.**
+   - **Audio is mono-spread, not kept stereo.** `encoder_audio` returns one mono stream; the server
+     duplicates it across the encoder's two channels. A truly stereo source is downmixed, unlike a
+     workflow that might preserve both channels.
+   - **Frame and slot ceilings.** A reference video is sampled and trimmed to a clip-friendly length
+     (`n % 17 == 5`, at least 5 frames, at most `max_enc_frames`), and slots are 1..3 for videos and
+     1..3 for audios — at most three videos, three soundtracks and three standalone audios. The row
+     budget (point 2) and the interleaving mod-group ceiling (point 1) remain the true binding limits
+     at high resolution, and now bind for real, since videos reopen the video-conditioned cell.
 
 5. **References and latent upscaling are mutually exclusive.** Combining the widened reference
    layout with the small-size-then-upscale denoise is not unified; a request asking for both is
@@ -110,10 +164,12 @@ matter how many there are.
    the target size directly.
 
 6. **Numeric parity with the reference denoiser for the *conditioned* step is not yet published.**
-   Conditioning is verified *active* and *reference-content-sensitive* on-device (see the controlled
-   check below), but a per-tensor / perceptual match to ComfyUI's outputs for the wide step is an open
-   parity task. Plain (unconditioned) generation retains its existing parity, and the merge is a no-op
-   there: with three fine segments the merged group table *is* the fine table.
+   A per-tensor / perceptual match to ComfyUI's outputs for the wide step is an open parity task.
+   **Reference-image** conditioning is verified *active* and *content-sensitive*
+   on-device (see the controlled check below); reference **video / audio** conditioning is wired and
+   runs to a clean completion but is **not** yet content-sensitive, because the VAE encoders are not
+   yet value-correct (point 4). Plain (unconditioned) generation retains its existing parity, and the
+   merge is a no-op there: with three fine segments the merged group table *is* the fine table.
 
 ## Reproducing the checks
 
@@ -122,9 +178,20 @@ matter how many there are.
   is sequence-length independent; a plain request merges to exactly its three fine segments.
 - **Device (controlled — a *fixed seed on every job*, or a distinct output proves nothing):** run
   `/v1/videos` with `task=ref2va` and one `seed` value held constant. Two jobs with the **same seed,
-  same prompt, same reference count, but different image content** must give **different** `sha256`s —
-  that content-control is what proves the reference is genuinely consumed (a with-ref vs no-ref pair
-  is confounded: an image also changes the prompt's token count). Add a `ref_image_1 … ref_image_9`
-  job: it must *complete* with a clean fault scan — that nine-photo completion is the ceiling lifted
-  (the pinned build refused it at submit). Sending `seed` and the reference parts requires `task=
-  ref2va`; the reference parts must be real file parts (e.g. `curl -F ref_image_1=@pic.png`).
+  same prompt, same reference count, but different reference content** must give **different**
+  `sha256`s — that content-control is what proves the reference is genuinely consumed (a with-ref vs
+  no-ref pair is confounded: an image also changes the prompt's token count). For **images** this
+  holds (two same-size photos → distinct output), proving image conditioning is live. For **videos and
+  audios it does NOT hold yet**: same seed, one reference video (or one reference audio), only the
+  media content differing → **identical** `sha256`, because the VAE encoders are not yet value-correct
+  (point 4). Do **not** read a with-video vs no-video difference as video conditioning working — that
+  only shows the reference *count* changed the sequence length (a geometry effect, not content); the
+  content-control pair above is the only honest test, and it currently reports video / audio inert.
+  Independently of content, the path must *run*: a `ref_image_1 … ref_image_9` job must complete with
+  a clean fault scan (the ceiling lift — the pinned build refused nine at submit), and a single request
+  carrying **a picture + a video + that video's `ref_video_audio` soundtrack + a standalone
+  `ref_audio`** must complete to an MP4 with a clean fault scan (every encoder pass + the widened step
+  execute — this is the complete DaSiWa shape running end-to-end). Sending `seed` with reference parts
+  requires `task=ref2va`; reference parts must be real file parts (`curl -F ref_image_1=@pic.png`,
+  `-F ref_video_1=@clip.mp4`, `-F ref_audio_1=@tone.wav`) — note a leading `<` or `;` in a text field
+  needs `--form-string`, not `-F`.

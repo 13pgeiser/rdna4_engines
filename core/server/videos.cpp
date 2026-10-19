@@ -511,14 +511,19 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             r->tokens.insert(r->tokens.end(), ids.begin(), ids.end());
         };
         /* The reference media are presented between the template's head and the prompt. Only the
-         * images reach the language model, so only they are decoded and processed here; a
-         * reference video's frames and every audio ride the video and audio VAE encoders, which
-         * the video path does not run in this build yet, so their parts pass through as bytes for
-         * the generator to refuse at submit naming the part — not silently dropped. (When videos
-         * land, a soundtrack's `<Audio j>` label is emitted right before its `<Video k>` label,
-         * the audio ordinal counting soundtracks and standalone audios together, per type.) */
+         * images reach the language model as soft-token rows, so only they are decoded and placed
+         * here; a reference video and every audio reach the model through the VAEs (decoded into the
+         * encoder's form below), so in the prompt they contribute only their spoken label. That
+         * label still rides ahead of the prompt in the reference's presentation order, because the
+         * text encoder sees `<Video k>` / `<Audio j>` markers even for media it only names: a
+         * soundtrack's `<Audio j>` label is emitted right before its video's `<Video k>` label, and
+         * `audio_ord` counts soundtracks and standalone audios together, in the order they are
+         * spoken (docs/PORT-REF2VA.md §3). */
         if (ref2va && deps_.mm && deps_.mm->accepts(MediaKind::Image)) {
-            /* Every picture is decoded and processed before any token is laid down. */
+            /* Every picture is decoded and processed before any token is laid down. A reference
+             * video or audio needs no vision item here — it reaches the model through the VAEs, so
+             * it contributes only its presentation label to the prompt (the 2 fps timestamped
+             * frames the reference also shows Qwen are deferred; see docs/NOTE-REF2VA.md). */
             std::vector<std::shared_ptr<mm::Item>> pics;
             MediaOpts mo;
             mo.max_pixels = (int64_t)W * (int64_t)H;   /* `match`: scaled to the output's area */
@@ -531,27 +536,42 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                     return bad(m.name.c_str(), "'" + m.name + "' could not be used: " + why);
                 pics.push_back(std::move(it));
             }
+            /* validate_refs numbered each kind 1..n without gaps, so a part's number is its
+             * presentation ordinal, and paired every soundtrack to a video of the same number. The
+             * reference presentation order (docs/PORT-REF2VA.md §3) is: every picture, then each
+             * video behind its soundtrack's label, then the standalone audios. `<Audio j>` counts
+             * soundtracks and standalone audios together, in the order they are spoken. */
+            auto has_soundtrack = [&](int32_t idx) {
+                for (const gen::VideoRefMedia& m : r->refs)
+                    if (m.kind == gen::VideoRefMedia::VIDEO_AUDIO && m.index == idx) return true;
+                return false;
+            };
             put(t.substr(0, p), true);
-            if (!pics.empty()) {
-                auto media = std::make_shared<mm::PromptMedia>();
-                size_t i = 0;
-                for (const gen::VideoRefMedia& m : r->refs) {
-                    if (m.kind != gen::VideoRefMedia::IMAGE) continue;
-                    /* validate_refs numbered each kind 1..n without gaps, so the part's number is
-                     * its presentation ordinal: `<Picture k>: ` then the picture's token run. The
-                     * label is encoded as its own string, as the reference tokenizer's output was
-                     * built. */
-                    put("<Picture " + std::to_string(m.index) + ">: ", false);
-                    mm::Placed pl;
-                    pl.item = pics[i++];
-                    pl.tok = (int32_t)r->tokens.size();
-                    r->tokens.insert(r->tokens.end(), pl.item->expand.begin(),
-                                     pl.item->expand.end());
-                    media->items.push_back(std::move(pl));
-                }
-                media->layout();
-                r->media = std::move(media);
+            std::shared_ptr<mm::PromptMedia> media;
+            if (!pics.empty()) media = std::make_shared<mm::PromptMedia>();
+            size_t i = 0;
+            for (const gen::VideoRefMedia& m : r->refs) {   /* sorted by (kind, index): images first */
+                if (m.kind != gen::VideoRefMedia::IMAGE) continue;
+                put("<Picture " + std::to_string(m.index) + ">: ", false);
+                mm::Placed pl;
+                pl.item = pics[i++];
+                pl.tok = (int32_t)r->tokens.size();
+                r->tokens.insert(r->tokens.end(), pl.item->expand.begin(),
+                                 pl.item->expand.end());
+                media->items.push_back(std::move(pl));
             }
+            int audio_ord = 0;
+            for (const gen::VideoRefMedia& m : r->refs) {
+                if (m.kind != gen::VideoRefMedia::VIDEO) continue;
+                if (has_soundtrack(m.index))
+                    put("<Audio " + std::to_string(++audio_ord) + ">: ", false);
+                put("<Video " + std::to_string(m.index) + ">: ", false);
+            }
+            for (const gen::VideoRefMedia& m : r->refs) {
+                if (m.kind != gen::VideoRefMedia::AUDIO) continue;
+                put("<Audio " + std::to_string(++audio_ord) + ">: ", false);
+            }
+            if (media) { media->layout(); r->media = std::move(media); }
             put(prompt, false);
             put(t.substr(p + kSlot.size()), true);
         } else {
@@ -567,29 +587,64 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                                      std::to_string(info.max_text));
     }
 
-    /* ---- the encoder's own view of every reference the VAE consumes. The text encoder saw the
-     * pictures above for identity; now each is also decoded and shrunk to the encoder's grid so the
-     * video VAE can turn it into conditioning rows. The driver stages these bytes into a Vencode
-     * pass; reference videos and their soundtracks, and the standalone audios, ride the same two
-     * encoders but are still refused at submit until those decode paths land, so only pictures are
-     * prepared here. The processor decodes under the same guard it used for the text encoder, so a
-     * reference that got this far decodes here too. */
+    /* ---- the encoder's own view of every reference the VAEs consume: pictures and videos through
+     * the video VAE (enc_pixels), soundtracks and standalone audios through the audio VAE
+     * (enc_samples). The text encoder saw the pictures above for identity; now each reference is
+     * decoded to the encoder's own grid so the driver can stage it into a Vencode or Aencode pass.
+     * These are the NATURAL decoded shapes — the driver's encode pass, which owns the encoder's
+     * geometry, clip-pads a video's frames and zero-pads an audio's samples to what it reports. The
+     * processor decodes under the same guard it used for the text encoder, so a reference that got
+     * this far decodes here too. */
     if (ref2va && info.encodes && deps_.mm) {
         for (gen::VideoRefMedia& m : r->refs) {
-            if (m.kind != gen::VideoRefMedia::IMAGE) continue;
-            mm::Frame fr;
             std::string why;
-            if (deps_.mm->encoder_image((const uint8_t*)m.data.data(), m.data.size(),
-                                        (int32_t)info.enc_ratio, (int32_t)info.max_enc_side, &fr,
-                                        &why) < 0)
-                return bad(m.name.c_str(), "'" + m.name + "' could not be encoded: " + why);
-            m.enc_frames = 1;
-            m.enc_h = fr.h;
-            m.enc_w = fr.w;
-            /* un-normalised RGB 0..255, row-major; the video VAE applies ImageNet mean/std itself */
-            m.enc_pixels.resize((size_t)fr.w * fr.h * 3);
-            for (size_t i = 0; i < m.enc_pixels.size(); ++i)
-                m.enc_pixels[i] = (float)fr.rgb[i];
+            const uint8_t* p = (const uint8_t*)m.data.data();
+            const size_t   n = m.data.size();
+            if (m.kind == gen::VideoRefMedia::IMAGE) {
+                mm::Frame fr;
+                if (deps_.mm->encoder_image(p, n, (int32_t)info.enc_ratio,
+                                            (int32_t)info.max_enc_side, &fr, &why) < 0)
+                    return bad(m.name.c_str(), "'" + m.name + "' could not be encoded: " + why);
+                m.enc_frames = 1;
+                m.enc_h = fr.h;
+                m.enc_w = fr.w;
+                /* un-normalised RGB 0..255, row-major; the video VAE applies ImageNet mean/std itself */
+                m.enc_pixels.resize((size_t)fr.w * fr.h * 3);
+                for (size_t i = 0; i < m.enc_pixels.size(); ++i)
+                    m.enc_pixels[i] = (float)fr.rgb[i];
+            } else if (m.kind == gen::VideoRefMedia::VIDEO) {
+                /* The frames the temporal VAE sees, sampled and resized to the encoder grid. The
+                 * count is the reference's trimmed length (n % 17 == 5); the driver's encode pass
+                 * repeats the final frame out to a whole clip, so this stays the natural count. */
+                std::vector<mm::Frame> fr;
+                if (deps_.mm->encoder_video(p, n, (int32_t)info.enc_ratio,
+                                            (int32_t)info.max_enc_side, (int32_t)info.max_enc_frames,
+                                            &fr, &why) < 0 || fr.empty())
+                    return bad(m.name.c_str(), "'" + m.name + "' could not be encoded: " + why);
+                m.enc_frames = (int32_t)fr.size();
+                m.enc_h = fr.front().h;
+                m.enc_w = fr.front().w;
+                const size_t area = (size_t)m.enc_w * m.enc_h * 3;
+                m.enc_pixels.resize(area * fr.size());
+                for (size_t f = 0; f < fr.size(); ++f)
+                    for (size_t i = 0; i < area; ++i)
+                        m.enc_pixels[f * area + i] = (float)fr[f].rgb[i];
+            } else {
+                /* A reference audio, or a reference video's soundtrack: mono at the model's audio
+                 * rate, then spread across the encoder's channels (the audio VAE encodes one
+                 * channel a time; a mono source becomes both). The driver zero-pads to a hop. */
+                std::vector<float> mono;
+                if (deps_.mm->encoder_audio(p, n, (int32_t)info.sample_rate, info.max_enc_samples,
+                                            &mono, &why) < 0 || mono.empty())
+                    return bad(m.name.c_str(), "'" + m.name + "' could not be decoded: " + why);
+                const int32_t ch = (int32_t)info.channels;
+                m.enc_channels = ch;
+                m.enc_n = (int64_t)mono.size();
+                m.enc_samples.assign((size_t)ch * mono.size(), 0.0f);
+                for (int32_t c = 0; c < ch; ++c)
+                    for (size_t i = 0; i < mono.size(); ++i)
+                        m.enc_samples[(size_t)c * mono.size() + i] = mono[i];
+            }
         }
     }
 
