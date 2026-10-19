@@ -156,7 +156,10 @@ PY
 fi
 
 # ---- Setup -----------------------------------------------------------------
-EXE="./target/release/daemon"
+# HIPFIRE_AGENTIC_GATE_EXE / HIPFIRE_AGENTIC_GATE_DRIVER_ARGS exist only for the
+# CPU tests (scripts/test_agentic_gate_driver.py): they point the gate at a fake
+# daemon (never rebuilt) and add driver flags such as short deadlines.
+EXE="${HIPFIRE_AGENTIC_GATE_EXE:-./target/release/daemon}"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 OUT="${HIPFIRE_AGENTIC_GATE_OUT:-/tmp/agentic-gate-$(date +%Y%m%d-%H%M%S).md}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
@@ -260,9 +263,15 @@ for f in "$PI_SYS" "$HERMES_SYS" "$USER_READ"; do
     fi
 done
 
-# Rebuild daemon if any tracked source is newer than the binary.
+# Rebuild daemon if any tracked source is newer than the binary. A test-supplied
+# HIPFIRE_AGENTIC_GATE_EXE is a test double and is never rebuilt.
 rebuild=0
-if [ ! -x "$EXE" ]; then
+if [ -n "${HIPFIRE_AGENTIC_GATE_EXE:-}" ]; then
+    if [ ! -x "$EXE" ]; then
+        echo "agentic-gate: HIPFIRE_AGENTIC_GATE_EXE is not executable: $EXE" >&2
+        exit 2
+    fi
+elif [ ! -x "$EXE" ]; then
     rebuild=1
 else
     for src in crates/hipfire-arch-qwen35/src/qwen35.rs crates/hipfire-runtime/src/llama.rs \
@@ -390,6 +399,8 @@ fi
 
 # ---- Run cells -------------------------------------------------------------
 HARD_FAIL=0
+DRIVER_FAIL=0
+read -r -a driver_extra <<< "${HIPFIRE_AGENTIC_GATE_DRIVER_ARGS:-}"
 SOFT_WARN_TOTAL=0
 
 # Group cells by model for single-load efficiency.
@@ -429,13 +440,19 @@ for model in "${!MODEL_CELLS[@]}"; do
         HIPFIRE_GRAPH=1 \
         python3 scripts/agentic_gate_driver.py \
             --exe "$EXE" --model "$model" --user-file "$USER_READ" \
-            --out "$OUTPUT_FILE" "${cell_args[@]}" &
+            --out "$OUTPUT_FILE" ${driver_extra[@]+"${driver_extra[@]}"} \
+            "${cell_args[@]}" &
     DRIVER_PID=$!
     wait "$DRIVER_PID"
     driver_rc=$?
     DRIVER_PID=""
     if [ "$driver_rc" -ne 0 ]; then
-        echo "agentic-gate: driver reported errors for $model_short (rc=$driver_rc); the parser scores what the daemon emitted" >&2
+        # A nonzero driver exit (deadline, daemon error/EOF/nonzero exit, failed
+        # unload, killed by a signal) can never PASS, whatever the parser sees.
+        DRIVER_FAIL=1
+        echo "agentic-gate: DRIVER FAILURE for $model_short (rc=$driver_rc)" >&2
+        echo "- **DRIVER FAILURE**: the session driver for $model_short exited rc=$driver_rc; the gate HARD_FAILs" >> "$OUT"
+        echo >> "$OUT"
     fi
 
     # Parse output, run detectors per cell, append to report.
@@ -462,9 +479,41 @@ for ev in events:
     if ev.get("type") == "token":
         by_id.setdefault(ev["id"], []).append(ev["text"])
 
-# Detect daemon panic / error (JSON error events).
-panic = any(ev.get("type") == "error" for ev in events)
-panic_msg = next((ev["message"] for ev in events if ev.get("type") == "error"), "")
+# Per-request terminal bookkeeping. Requests are sent strictly in cell order
+# (c{idx}_t1, then c{idx}_t2 for a multi-turn cell) with attempt_ids 1, 2, ...
+# in send order (scripts/agentic_gate_driver.py build_requests), so the parser
+# derives each request's expected (id, attempt_id) from the cell list alone.
+seq = []
+_attempt = 0
+for _idx, _cell in enumerate(cells):
+    _attempt += 1
+    seq.append((f"c{_idx}_t1", _attempt))
+    if _cell.split("|")[3] == "1":
+        _attempt += 1
+        seq.append((f"c{_idx}_t2", _attempt))
+expected = dict(seq)
+done_ok = set()
+req_errors = {rid: [] for rid, _ in seq}
+session_errors = []
+for ev in events:
+    et = ev.get("type")
+    if et == "done":
+        a = ev.get("attempt_id")
+        if ev.get("id") in expected and type(a) is int and a == expected[ev["id"]]:
+            done_ok.add(ev["id"])
+    elif et == "error":
+        # Daemon error events and the driver's synthetic ones (source
+        # agentic_gate_driver) alike. An error naming a request belongs to it;
+        # one with no id belongs to the request in flight (the first without a
+        # done yet); anything else is a session error and fails every cell.
+        msg = str(ev.get("message", ""))
+        rid = ev.get("id")
+        if rid is None:
+            rid = next((r for r, _ in seq if r not in done_ok), None)
+        if rid in req_errors:
+            req_errors[rid].append(msg)
+        else:
+            session_errors.append(msg)
 
 # GPU contention is printed on stderr (merged into stdout), not as a JSON event.
 fatal_singleton = "already reserved by holder PID" in raw_text
@@ -554,6 +603,23 @@ with open(report_path, "a") as report:
                 notes.append("soft: <tool_call> inside <think>...</think>")
                 if verdict == "PASS": verdict = "SOFT_WARN"
 
+        # Every request of the cell must end in an actual matching `done`
+        # (same id and attempt_id) with no error event naming or in flight for
+        # it; tokens seen never excuse a missing done or a present error.
+        for rid in [cid_t1] + ([cid_t2] if multi == "1" else []):
+            if rid not in done_ok:
+                verdict = "HARD_FAIL"
+                notes.append(f"{rid}: no matching done (attempt_id {expected[rid]})")
+                hard_fail = True
+            for msg in req_errors[rid]:
+                verdict = "HARD_FAIL"
+                notes.append(f"{rid}: error event: {msg}")
+                hard_fail = True
+        for msg in session_errors:
+            verdict = "HARD_FAIL"
+            notes.append(f"session error event: {msg}")
+            hard_fail = True
+
         # Multi-turn t2 evaluation if applicable
         if multi == "1":
             toks_t2 = by_id.get(cid_t2, [])
@@ -613,6 +679,18 @@ total_cells=${#CELLS[@]}
     echo "- soft warns: $soft_count"
 } >> "$OUT"
 
+if [ "$DRIVER_FAIL" -eq 1 ]; then
+    {
+        echo
+        echo "## Driver failure"
+        echo
+        echo "The session driver exited nonzero for one or more models (see the"
+        echo "DRIVER FAILURE lines above). Exit code 1 regardless of the cells' verdicts."
+    } >> "$OUT"
+    echo "agentic-gate: HARD FAIL (the session driver exited nonzero)"
+    echo "report: $OUT"
+    exit 1
+fi
 if [ "$HARD_FAIL" -eq 1 ]; then
     {
         echo

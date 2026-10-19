@@ -27,13 +27,19 @@ failures (deadline, daemon exit, spawn failure) are appended as synthetic
 {"type":"error","source":"agentic_gate_driver",...} lines.
 
 Only the daemon this driver spawned is ever signalled: its own process group
-(start_new_session), never a pattern match.
+(start_new_session), never a pattern match, and only while the daemon's leader is
+still an unreaped child (waitid WNOWAIT before every group signal; the single
+reap comes after the last one). If that ownership is lost nothing is signalled and
+no exit status is invented. The driver exits nonzero on any recorded error: a
+deadline, a daemon `error` event, EOF or a nonzero exit of the daemon it did not
+cause, a failed unload.
 
 Usage:
   agentic_gate_driver.py --exe EXE --model MODEL --user-file FILE --out FILE CELL...
 CELL is the gate's "model|system_file|clamp|multi|label" string.
 """
 import argparse
+import contextlib
 import json
 import os
 import queue
@@ -42,6 +48,17 @@ import subprocess
 import sys
 import threading
 import time
+
+
+@contextlib.contextmanager
+def _signals_blocked():
+    """Defer TERM/INT delivery across a check-then-signal or reap step."""
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGTERM, signal.SIGINT))
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+
 
 LOAD_PARAMS = {"max_seq": 4096}
 LOAD_TIMEOUT_S = 180.0
@@ -136,15 +153,21 @@ class Driver:
         self.proc = None
         self.errors = []
         self._events = queue.Queue()
-        self._out_lock = threading.Lock()
+        self._out_lock = threading.RLock()  # re-entered by the signal handler
         self._out = None
         self._threads = []
+        self._eof = False
+        self._terminated = False   # the leader was reaped or ownership was lost
+        self._lost_recorded = False
+        self.exit_status = None    # int, or "unknown" when not readable
 
     # -- output ------------------------------------------------------------
     def _write_line(self, text):
         if not text.endswith("\n"):
             text += "\n"
         with self._out_lock:
+            if self._out is None or self._out.closed:
+                return
             self._out.write(text)
             self._out.flush()
 
@@ -205,24 +228,104 @@ class Driver:
         except (BrokenPipeError, ValueError, OSError):
             pass
 
-    def kill(self):
-        """TERM then KILL the daemon's own process group (pgid == its pid)."""
-        if self.proc is None:
-            return
-        for sig, grace in ((signal.SIGTERM, TERM_GRACE_S), (signal.SIGKILL, EXIT_GRACE_S)):
+    # -- ownership ---------------------------------------------------------
+    # The leader's pid is signalled as a process group only while it is still an
+    # unreaped child of this process: until it is reaped its pid (== pgid) cannot
+    # be reused, so the group is provably the daemon's. The check uses
+    # waitid(WNOWAIT), which never reaps; the one reap happens after the last
+    # group signal. Popen.poll()/wait() are not used, because they reap.
+    def _leader_state(self):
+        """'running', 'exited' (a zombie, still unreaped) or 'lost' (not ours any more)."""
+        p = self.proc
+        if p is None or p.returncode is not None:
+            return "lost"
+        try:
+            info = os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+        except ChildProcessError:
+            return "lost"
+        return "running" if info is None else "exited"
+
+    def _wait_exit(self, timeout):
+        """Wait up to `timeout` s for the leader to exit, without reaping it."""
+        end = time.monotonic() + timeout
+        while True:
+            state = self._leader_state()
+            if state != "running" or time.monotonic() >= end:
+                return state
+            time.sleep(0.02)
+
+    def _signal_group(self, sig):
+        """killpg(sig) iff the leader is still an unreaped reservation; False if not."""
+        with _signals_blocked():
+            if self._leader_state() == "lost":
+                return False
             try:
                 os.killpg(self.proc.pid, sig)
             except (ProcessLookupError, PermissionError):
                 pass
-            try:
-                self.proc.wait(timeout=grace)
-                break
-            except subprocess.TimeoutExpired:
-                continue
+        return True
+
+    def _reap(self):
+        """Reap the exited leader; its real status, or None if it is not ours to reap."""
+        with _signals_blocked():
+            p = self.proc
+            if p.returncode is None:
+                try:
+                    pid, status = os.waitpid(p.pid, os.WNOHANG)
+                except ChildProcessError:
+                    return None
+                if pid == 0:
+                    return None
+                p.returncode = os.waitstatus_to_exitcode(status)
+            self._terminated = True
+            self.exit_status = p.returncode
+            return p.returncode
+
+    def _ownership_lost(self, sent):
+        self._terminated = True
+        self.exit_status = "unknown"
+        if not self._lost_recorded:
+            self._lost_recorded = True
+            if sent:
+                self._record_error(
+                    "process group ownership lost; not signalled further "
+                    f"(already sent {', '.join(sent)})"
+                )
+            else:
+                self._record_error("process group ownership lost; not signalled")
+
+    def kill(self):
+        """TERM, then KILL, the daemon's own process group; reap after the last signal.
+
+        Ownership is re-checked immediately before every group signal, the first
+        TERM included. Lost ownership sends nothing and fabricates no exit status.
+        Driver-initiated: the cause was recorded by the caller, so the resulting
+        exit status is not reported as an unexpected daemon exit.
+        """
+        if self.proc is None or self._terminated:
+            return
+        sent = []
+        for sig, grace in ((signal.SIGTERM, TERM_GRACE_S), (signal.SIGKILL, EXIT_GRACE_S)):
+            if not self._signal_group(sig):
+                self._ownership_lost(sent)
+                return
+            sent.append(sig.name)
+            state = self._wait_exit(grace)
+            if state == "lost":
+                self._ownership_lost(sent)
+                return
+        if state == "exited":
+            self._reap()
+        else:
+            self._terminated = True
+            self.exit_status = "unknown"
+            self._record_error("daemon survived SIGKILL; not reaped")
 
     # -- events ------------------------------------------------------------
     def next_event(self, deadline):
         """Next parsed JSON event; "timeout"/"eof" sentinels on those conditions."""
+        if self._eof:
+            return "eof"
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -232,6 +335,7 @@ class Driver:
             except queue.Empty:
                 return "timeout"
             if line is None:
+                self._eof = True
                 return "eof"
             s = line.strip()
             if not s.startswith("{"):
@@ -284,7 +388,8 @@ class Driver:
                 if not self.send({"type": "commit", "id": rid, "attempt_id": attempt}):
                     self._record_error("daemon stdin closed before commit", rid)
                     return False
-            elif typ == "done" and eid == rid:
+            elif (typ == "done" and eid == rid
+                  and type(ev.get("attempt_id")) is int and ev["attempt_id"] == attempt):
                 return True
             elif typ == "error" and eid in (rid, None):
                 # The daemon reported it; the parser sees the raw event line.
@@ -293,6 +398,7 @@ class Driver:
 
     def _unload(self):
         if not self.send({"type": "unload"}):
+            self._record_error("daemon stdin closed before unload")
             return
         deadline = time.monotonic() + self.unload_timeout
         while True:
@@ -301,9 +407,34 @@ class Driver:
                 self._record_error(f"unload deadline {self.unload_timeout:g}s exceeded")
                 return
             if ev == "eof":
+                self._record_error("daemon exited before unloaded")
                 return
             if ev.get("type") == "unloaded":
                 return
+
+    def _finish_daemon(self):
+        """Wait for the daemon to exit on its own, then reap it and judge its status.
+
+        An exit that the driver did not cause and that is not status 0 is an error;
+        the status recorded is the real one, or 'unknown' if it cannot be read.
+        """
+        state = self._wait_exit(2.0 if self.errors else EXIT_GRACE_S)
+        if state == "lost":
+            self._ownership_lost([])
+            return
+        if state == "running":
+            if not self.errors:
+                self._record_error(
+                    f"daemon did not exit within {EXIT_GRACE_S:g}s of unload; terminating it"
+                )
+            self.kill()
+            return
+        status = self._reap()
+        if status is None:
+            self.exit_status = "unknown"
+            self._record_error("daemon exit status unknown")
+        elif status != 0:
+            self._record_error(f"daemon exited with status {status}")
 
     def run(self, model_path, requests):
         """Drive one daemon session; returns 0 clean, 1 if any error was recorded."""
@@ -317,15 +448,12 @@ class Driver:
                 for req in requests:
                     if not self._run_request(req):
                         break
-                self._unload()
+                if not self._eof:  # a daemon that already exited has nothing to unload
+                    self._unload()
             self._close_stdin()
-            try:
-                # A session that already failed gets no long courtesy wait.
-                self.proc.wait(timeout=2.0 if self.errors else EXIT_GRACE_S)
-            except subprocess.TimeoutExpired:
-                self.kill()
+            self._finish_daemon()
         finally:
-            if self.proc.poll() is None:
+            if not self._terminated:
                 self.kill()
             for t in self._threads:
                 t.join(timeout=5)
@@ -358,6 +486,9 @@ def main(argv=None):
     )
 
     def on_signal(signum, _frame):
+        # Same guarded path as every other kill: the group is signalled only
+        # while the leader is still an unreaped reservation (after run() reaped
+        # it, this signals nothing).
         driver.kill()
         sys.exit(128 + signum)
 

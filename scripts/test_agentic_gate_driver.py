@@ -298,3 +298,253 @@ def test_driver_records_load_deadline_and_spawn_failure(tmp_path):
     assert proc.returncode == 1
     errs = [e for e in _events(out) if e["type"] == "error"]
     assert errs and "load deadline" in errs[0]["message"]
+
+
+# -- fail-closed negatives: driver rc AND the real gate ------------------------
+# Each scenario has valid tool-call tokens (or a clean done) and still must not
+# pass: the driver exits nonzero and `scripts/agentic-gate.sh --fast` run against
+# the fake daemon exits 1 with a DRIVER FAILURE report line.
+
+SHORT = "--load-timeout 5 --generate-timeout 1 --unload-timeout 1"
+
+NEGATIVES = {
+    "eof_before_done": ({"FAKE_FAULT": "eof_before_done"}, "daemon exited during generate"),
+    "error_with_id": ({"FAKE_FAULT": "error_after_tokens"}, "fake fault after tokens"),
+    "error_null_id": ({"FAKE_FAULT": "error_null_id"}, "fake fault with no id"),
+    "generate_deadline": ({"FAKE_FAULT": "hang_after_tokens"}, "generate deadline"),
+    "exit1_after_done": ({"FAKE_EXIT_AFTER_DONE": "1", "FAKE_EXIT_CODE": "3"}, None),
+    "exit1_at_unload": ({"FAKE_EXIT_ON_UNLOAD": "1", "FAKE_EXIT_CODE": "3"}, "status 3"),
+    "unload_eof": ({"FAKE_EOF_ON_UNLOAD": "1"}, "exited before unloaded"),
+}
+
+
+def _run_gate(tmp_path, env, mode="--fast"):
+    models = tmp_path / "models"
+    models.mkdir(exist_ok=True)
+    (models / "qwen3.6-27b.mq4").write_text("not a model; the fake daemon never reads it")
+    report = tmp_path / "gate-report.md"
+    full_env = dict(os.environ)
+    full_env.pop("HIPFIRE_SKIP_AGENTIC_GATE", None)
+    full_env.update({
+        "HIPFIRE_AGENTIC_GATE_EXE": str(FAKE),
+        "HIPFIRE_AGENTIC_GATE_DRIVER_ARGS": SHORT,
+        "HIPFIRE_AGENTIC_GATE_NO_VRAM_CHECK": "1",
+        "HIPFIRE_AGENTIC_GATE_OUT": str(report),
+        "HIPFIRE_MODELS_DIR": str(models),
+        "HIPFIRE_GPU_LOCKFILE": str(tmp_path / "gpu.lock"),
+        "ROCR_VISIBLE_DEVICES": "-1",
+        "HIP_VISIBLE_DEVICES": "-1",
+        "HIPFIRE_DEVICES": "-1",
+    })
+    full_env.update(env)
+    proc = subprocess.run(
+        ["bash", str(GATE), mode], capture_output=True, text=True, env=full_env, timeout=120
+    )
+    return proc, report.read_text() if report.exists() else ""
+
+
+def test_gate_passes_against_clean_fake_daemon(tmp_path):
+    """Positive control: the harness itself is sound, so the negatives mean something."""
+    proc, report = _run_gate(tmp_path, {})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "HARD_FAIL" not in report and "DRIVER FAILURE" not in report
+    assert "json ok: name='read_file'" in report
+
+
+@pytest.mark.parametrize("name", sorted(NEGATIVES))
+def test_driver_and_gate_fail_closed(tmp_path, name):
+    env, expect = NEGATIVES[name]
+    drv_dir = tmp_path / "drv"
+    drv_dir.mkdir()
+    dproc, out, _ = _run_driver(drv_dir, FAKE, extra=SHORT.split(), env=env)
+    assert dproc.returncode != 0, (dproc.stdout, dproc.stderr)
+    errs = [e for e in _events(out) if e["type"] == "error"]
+    assert errs, "no error event recorded"
+    if expect:
+        assert any(expect in str(e.get("message")) for e in errs), errs
+    # Valid tool-call tokens were seen where the scenario reaches them.
+    assert "<tool_call>" in out.read_text()
+
+    gate_dir = tmp_path / "gate"
+    gate_dir.mkdir()
+    proc, report = _run_gate(gate_dir, env)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "HARD FAIL" in proc.stdout
+    assert "DRIVER FAILURE" in report
+    assert "agentic-gate: PASS" not in proc.stdout
+
+
+def test_unload_send_failure_is_an_error(tmp_path):
+    class NoUnload(driver.Driver):
+        def send(self, obj):
+            return False if obj.get("type") == "unload" else super().send(obj)
+
+    cells, user = _cells(tmp_path)
+    d = NoUnload(str(FAKE), str(tmp_path / "o.txt"))
+    reqs = driver.build_requests(cells, "U", ["a", "b", "c"])
+    assert d.run("/models/m.mq4", reqs) == 1
+    assert "daemon stdin closed before unload" in d.errors
+
+
+# -- parser: a matching done and no error are required, whatever tokens were seen --
+
+def _score(tmp_path, lines, multi="0"):
+    sysf = tmp_path / "sys.txt"
+    sysf.write_text("SYS")
+    cell = f"m.mq4|{sysf}|0|{multi}|lbl"
+    out = tmp_path / "events.txt"
+    out.write_text("".join(json.dumps(l) + "\n" for l in lines))
+    report = tmp_path / "score.md"
+    report.write_text("")
+    parsed = subprocess.run(
+        [sys.executable, "-", str(out), str(report), cell],
+        input=_gate_parser(), capture_output=True, text=True,
+    )
+    assert parsed.returncode == 0, parsed.stderr
+    return report.read_text()
+
+
+TOK = {"type": "token", "id": "c0_t1",
+       "text": '<tool_call>{"name":"read_file","arguments":{"path":"a"}}</tool_call>'}
+DONE = {"type": "done", "id": "c0_t1", "attempt_id": 1}
+
+
+def test_parser_passes_a_cell_with_a_matching_done(tmp_path):
+    report = _score(tmp_path, [TOK, DONE])
+    assert "lbl    PASS" in report
+
+
+@pytest.mark.parametrize("label,events", [
+    ("eof before done", [TOK]),
+    ("commit_ready only", [TOK, {"type": "commit_ready", "id": "c0_t1", "attempt_id": 1}]),
+    ("done wrong attempt", [TOK, {"type": "done", "id": "c0_t1", "attempt_id": 2}]),
+    ("done no attempt", [TOK, {"type": "done", "id": "c0_t1"}]),
+    ("done wrong id", [TOK, {"type": "done", "id": "c9_t1", "attempt_id": 1}]),
+    ("error with id", [TOK, {"type": "error", "id": "c0_t1", "message": "boom"}, DONE]),
+    ("error null id in flight", [TOK, {"type": "error", "id": None, "message": "boom"}, DONE]),
+    ("error no id key in flight", [TOK, {"type": "error", "message": "boom"}, DONE]),
+    ("error after done, no id", [TOK, DONE, {"type": "error", "message": "late"}]),
+    ("driver synthetic error", [TOK, DONE, {"type": "error", "source": "agentic_gate_driver",
+                                            "message": "unload deadline 30s exceeded"}]),
+    ("driver synthetic error with id", [TOK, {"type": "error", "source": "agentic_gate_driver",
+                                              "id": "c0_t1", "message": "generate deadline"}]),
+])
+def test_parser_hard_fails_without_done_or_with_error(tmp_path, label, events):
+    report = _score(tmp_path, events)
+    assert "lbl    HARD_FAIL" in report, (label, report)
+
+
+def test_parser_requires_done_for_the_multiturn_second_request(tmp_path):
+    t2 = {"type": "token", "id": "c0_t2", "text": "ok"}
+    report = _score(tmp_path, [TOK, DONE, t2], multi="1")
+    assert "lbl    HARD_FAIL" in report and "c0_t2: no matching done (attempt_id 2)" in report
+    report = _score(
+        tmp_path, [TOK, DONE, t2, {"type": "done", "id": "c0_t2", "attempt_id": 2}], multi="1"
+    )
+    assert "lbl    PASS" in report
+
+
+# -- host ownership: signal only an unreaped leader we still own --------------
+
+@pytest.fixture
+def killpg_calls(monkeypatch):
+    calls = []
+    real = os.killpg
+    monkeypatch.setattr(driver.os, "killpg", lambda pgid, sig: calls.append((pgid, sig)) or real(pgid, sig))
+    return calls
+
+
+def _started(tmp_path):
+    d = driver.Driver(str(FAKE), str(tmp_path / "o.txt"))
+    assert d.start()
+    return d
+
+
+def _finish(d):
+    for t in d._threads:
+        t.join(timeout=5)
+    d._out.close()
+
+
+def test_lost_leader_is_never_signalled(tmp_path, killpg_calls):
+    d = _started(tmp_path)
+    pid = d.proc.pid
+    os.kill(pid, 9)           # the test, not the driver, ends and reaps the leader
+    os.waitpid(pid, 0)
+    d.kill()
+    assert killpg_calls == []
+    assert d.exit_status == "unknown"  # no exit status is invented
+    assert d.errors == ["process group ownership lost; not signalled"]
+    d.kill()                  # idempotent: still nothing sent, nothing re-recorded
+    assert killpg_calls == [] and len(d.errors) == 1
+    _finish(d)
+
+
+def test_waitid_childprocesserror_means_lost_in_a_full_session(tmp_path, monkeypatch, killpg_calls):
+    def lost(*_a, **_k):
+        raise ChildProcessError
+
+    monkeypatch.setattr(driver.os, "waitid", lost)
+    cells, _ = _cells(tmp_path)
+    d = driver.Driver(str(FAKE), str(tmp_path / "o.txt"))
+    rc = d.run("/models/m.mq4", driver.build_requests(cells, "U", ["a", "b", "c"]))
+    try:
+        os.waitpid(d.proc.pid, 0)  # the fake exits on stdin EOF; clean up the zombie
+    except ChildProcessError:
+        pass
+    assert rc == 1
+    assert killpg_calls == []
+    assert d.exit_status == "unknown"
+    assert "process group ownership lost; not signalled" in d.errors
+
+
+def test_signal_after_the_leader_was_reaped_sends_nothing(tmp_path, killpg_calls):
+    cells, _ = _cells(tmp_path)
+    d = driver.Driver(str(FAKE), str(tmp_path / "o.txt"))
+    assert d.run("/models/m.mq4", driver.build_requests(cells, "U", ["a", "b", "c"])) == 0
+    assert d.exit_status == 0 and d.proc.returncode == 0
+    d.kill()                  # what on_signal does after run()'s wait reaped the leader
+    assert killpg_calls == []
+    assert d.errors == []
+
+
+def test_kill_reaps_only_after_the_last_group_signal(tmp_path, killpg_calls):
+    d = _started(tmp_path)
+    pid = d.proc.pid
+    d.kill()
+    assert [c[0] for c in killpg_calls] == [pid, pid]  # TERM then the sweeping KILL
+    assert d.proc.returncode is not None and d.exit_status == d.proc.returncode
+    killpg_calls.clear()
+    d.kill()                  # reaped: no further group signal, even for a reused pgid
+    assert killpg_calls == []
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    _finish(d)
+
+
+def test_sigterm_to_the_driver_kills_only_its_group_once(tmp_path):
+    pidfile = tmp_path / "daemon.pid"
+    cells, user = _cells(tmp_path)
+    out = tmp_path / "out.txt"
+    env = dict(os.environ, FAKE_HANG="1", FAKE_PIDFILE=str(pidfile))
+    p = subprocess.Popen(
+        [sys.executable, str(DRIVER), "--exe", str(FAKE), "--model", "/models/m.mq4",
+         "--user-file", str(user), "--out", str(out), *cells],
+        env=env, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if out.exists() and '"type":"loaded"' in out.read_text().replace(" ", ""):
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("daemon never reported loaded")
+        p.terminate()
+        assert p.wait(timeout=30) == 143
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait()
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pidfile.read_text()), 0)

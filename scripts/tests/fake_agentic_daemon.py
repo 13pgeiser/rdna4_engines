@@ -17,6 +17,13 @@ Environment:
   FAKE_READY_DELAY     seconds between the last token and commit_ready (default 0)
   FAKE_HANG            "1": load works, every generate is swallowed (deadline test)
   FAKE_PIDFILE         if set, the daemon writes its pid there on start
+  FAKE_FAULT           eof_before_done | hang_after_tokens | error_after_tokens |
+                       error_null_id: once request FAKE_FAULT_ID (default c0_t1) has
+                       emitted its tokens: exit 0 (EOF), go silent, emit an error with
+                       that id, or emit an error with id null
+  FAKE_EXIT_AFTER_DONE N: exit FAKE_EXIT_CODE (default 1) after the Nth done
+  FAKE_EXIT_ON_UNLOAD  "1": reply `unloaded`, then exit FAKE_EXIT_CODE
+  FAKE_EOF_ON_UNLOAD   "1": exit 0 on unload without replying `unloaded`
   FAKE_ECHO_ENV        comma-separated env var names echoed in the `loaded` event
 """
 import json
@@ -29,6 +36,12 @@ import time
 COMMIT_TIMEOUT = float(os.environ.get("FAKE_COMMIT_TIMEOUT", "2.0"))
 READY_DELAY = float(os.environ.get("FAKE_READY_DELAY", "0"))
 HANG = os.environ.get("FAKE_HANG") == "1"
+FAULT = os.environ.get("FAKE_FAULT", "")
+FAULT_ID = os.environ.get("FAKE_FAULT_ID", "c0_t1")
+EXIT_CODE = int(os.environ.get("FAKE_EXIT_CODE", "1"))
+EXIT_AFTER_DONE = int(os.environ.get("FAKE_EXIT_AFTER_DONE", "0"))
+EXIT_ON_UNLOAD = os.environ.get("FAKE_EXIT_ON_UNLOAD") == "1"
+EOF_ON_UNLOAD = os.environ.get("FAKE_EOF_ON_UNLOAD") == "1"
 
 TOOL_CALL = '<tool_call>{"name":"read_file","arguments":{"path":"main.c"}}</tool_call>'
 INLINE = "The file defines main and returns zero."
@@ -48,6 +61,7 @@ def main():
         with open(os.environ["FAKE_PIDFILE"], "w") as f:
             f.write(str(os.getpid()))
     lines = queue.Queue()
+    dones = 0
 
     def reader():
         for raw in sys.stdin:
@@ -72,7 +86,11 @@ def main():
             emit({"type": "loaded", "arch": "fake", "model": msg.get("model"),
                   "env": {k: os.environ.get(k) for k in echo}})
         elif typ == "unload":
+            if EOF_ON_UNLOAD:
+                return 0  # exits without `unloaded`
             emit({"type": "unloaded"})
+            if EXIT_ON_UNLOAD:
+                return EXIT_CODE
         elif typ == "commit":
             continue  # no generate awaiting a commit: ignored
         elif typ == "generate":
@@ -86,6 +104,19 @@ def main():
                 continue
             text = INLINE if str(rid).endswith("_t2") else TOOL_CALL
             emit({"type": "token", "id": rid, "text": text})
+            if FAULT and rid == FAULT_ID:
+                if FAULT == "eof_before_done":
+                    return 0  # valid tool-call tokens, then stdout EOF
+                if FAULT == "hang_after_tokens":
+                    continue  # valid tokens, then silence: the driver's deadline fires
+                if FAULT == "error_after_tokens":
+                    emit({"type": "error", "id": rid, "attempt_id": attempt,
+                          "class": "fault", "message": "fake fault after tokens"})
+                    continue
+                if FAULT == "error_null_id":
+                    emit({"type": "error", "id": None, "class": "fault",
+                          "message": "fake fault with no id"})
+                    continue
             if READY_DELAY:
                 time.sleep(READY_DELAY)
             while True:  # a commit sent before commit_ready is ignored
@@ -117,6 +148,9 @@ def main():
             if committed:
                 emit({"type": "done", "id": rid, "attempt_id": attempt,
                       "tokens": 1, "finish_reason": "stop"})
+                dones += 1
+                if EXIT_AFTER_DONE and dones == EXIT_AFTER_DONE:
+                    return EXIT_CODE
             else:
                 emit({"type": "error", "id": rid, "attempt_id": attempt,
                       "class": "abort",
