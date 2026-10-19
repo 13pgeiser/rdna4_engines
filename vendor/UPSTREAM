@@ -64,6 +64,7 @@ vendor/llama/common/jinja/                   <- llama.cpp common/jinja/
     llama.h, no common.h -- which is why it lifts cleanly and chat.cpp did not.
 
     LOCAL CHANGES: patches/0015-jinja-print-a-list-or-a-dict-as-its-repr.patch
+                   patches/0021-jinja-a-dotted-integer-is-an-index.patch
 
 vendor/llama/common/chat.{h,cpp}
 vendor/llama/common/chat-auto-parser.h
@@ -554,3 +555,12 @@ PATCH SERIES
       \u form of a character it leaves out (\u0009 for \t), and a positive class admits \t \n
       \r \f \b only in their short form. gbnf_test covers each escape in and out of a class, quantified, and negated, and the
       refusals.
+
+  patches/0021-jinja-a-dotted-integer-is-an-index.patch
+
+      llama.cpp's ae9afff8 ("jinja : support dot property integer literals (#28817)"), after the
+      lifted commit; drop it on the next refresh. jinja2 reads `obj.0` as `obj[0]`; the engine
+      threw "Static member property must be an identifier". GLM-5's template tests a tool result
+      with `m.content.0.type`, and since the probe swallows the throw the template came back as
+      tools=0 tool_calls=0, as 0006 describes: every request with `tools` was refused.
+      tests/chat_test.cpp (a_dotted_integer_is_an_index_as_in_jinja2).

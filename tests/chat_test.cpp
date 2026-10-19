@@ -1016,6 +1016,33 @@ TEST(the_capability_probe_reads_what_the_template_actually_does) {
     CHECK(c.system_role);
 }
 
+/* jinja2 reads `obj.0` as `obj[0]`, and GLM-5's template tests a tool result with
+ * `m.content.0.type`. The engine threw on it, and the probe, which swallows a throw, reported a
+ * template that renders tools as one that cannot: every request with `tools` was refused. */
+TEST(a_dotted_integer_is_an_index_as_in_jinja2) {
+    ChatTemplate glm;
+    CHECK_OK(glm.load(
+        "{%- if tools %}<tools>{% for t in tools %}{{ t.function.name }};{% endfor %}</tools>{% endif %}"
+        "{%- for m in messages %}"
+        "{%- if m.role == 'tool' and m.content is not mapping and m.content.0.type == 'tool_reference' %}<ref/>"
+        "{%- else %}<{{ m.role }}>{{ m.content }}"
+        "{%- if m.tool_calls %}{% for c in m.tool_calls %}<call>{{ c.function.name }}</call>{% endfor %}{% endif %}"
+        "</{{ m.role }}>{%- endif %}"
+        "{%- endfor %}"
+        "{%- if add_generation_prompt %}<assistant>{% endif %}", "", ""));
+    CHECK(glm.caps().tools);
+    CHECK(glm.caps().tool_calls);
+
+    ChatTemplate first;
+    CHECK_OK(first.load("{{ messages.0.content }}|{{ messages.1.role }}", "", ""));
+    json msgs = json::array();
+    msgs.push_back({{"role", "user"}, {"content", "hi"}});
+    msgs.push_back({{"role", "assistant"}, {"content", "hello"}});
+    ChatPrompt p;
+    CHECK_OK(first.apply(msgs, json(), ChatOptions{}, &p));
+    CHECK_EQ(p.prompt, std::string("hi|assistant"));
+}
+
 /* Unparseable Jinja (common in hand-built containers) is reported at load time as an error value;
  * a throw would cross the bringup path. */
 TEST(a_template_that_does_not_parse_is_a_value_and_not_a_throw) {
