@@ -5358,4 +5358,117 @@ mod tests {
         clear_terminal_control();
         set_active_attempt_id(0);
     }
+
+    /// `scripts/agentic_gate_driver.py` emits the requests checked in at
+    /// `scripts/tests/fixtures/agentic-gate-requests.jsonl` (a pytest pins the
+    /// driver output to that file). Every generate line must pass the daemon's
+    /// real wire validation: a nonzero numeric attempt_id, an accepted reader
+    /// admission, the typed reasoning fields the generate arm parses, and the
+    /// explicit sampling fields the daemon resolves. A request the daemon
+    /// would refuse (the pre-protocol gate sent no attempt_id) fails here.
+    #[test]
+    fn agentic_gate_driver_requests_pass_daemon_wire_validation() {
+        let _lock = TERMINAL_TEST_LOCK.lock().unwrap();
+        clear_terminal_control();
+        batch_clear_all_terminals();
+        set_active_attempt_id(0);
+
+        let fixture = include_str!("../../../scripts/tests/fixtures/agentic-gate-requests.jsonl");
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut last_attempt = 0u64;
+        let mut generates = 0usize;
+        let mut loads = 0usize;
+        let mut unloads = 0usize;
+        for (n, line) in fixture.lines().enumerate() {
+            let msg: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("fixture line {}: invalid JSON: {e}", n + 1));
+            match msg["type"].as_str() {
+                Some("load") => {
+                    loads += 1;
+                    assert!(msg["model"].is_string());
+                    assert!(msg["params"]["max_seq"].as_u64().is_some());
+                    continue;
+                }
+                Some("unload") => {
+                    unloads += 1;
+                    continue;
+                }
+                Some("generate") => generates += 1,
+                other => panic!("fixture line {}: unexpected type {other:?}", n + 1),
+            }
+
+            // Wire attempt id: the same validator the generate arm runs first.
+            let attempt = require_wire_attempt_id(msg.get("attempt_id"))
+                .unwrap_or_else(|e| panic!("fixture line {}: {e}", n + 1));
+            assert!(
+                attempt > last_attempt,
+                "attempt ids must increase per request"
+            );
+            last_attempt = attempt;
+            let id = msg["id"].as_str().expect("string id");
+            assert!(seen_ids.insert(id.to_string()), "duplicate request id {id}");
+
+            // Reader-side admission accepts it as a fresh live key.
+            match announce_generate_terminal(&msg) {
+                Some((got_id, got_attempt, Some(_))) => {
+                    assert_eq!((got_id, got_attempt), (id, attempt));
+                }
+                other => panic!("fixture line {}: announce refused: {other:?}", n + 1),
+            }
+            batch_clear_terminal(id, attempt);
+
+            // Typed fields the generate arm reads.
+            assert!(msg["prompt"].is_string() && msg["system"].is_string());
+            assert!(msg["max_tokens"].as_u64().is_some_and(|v| v > 0));
+            let thinking_enabled = msg
+                .get("thinking_enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or_else(|| panic!("fixture line {}: thinking_enabled must be bool", n + 1));
+            let prefix = msg["assistant_prefix"].as_str().expect("assistant_prefix");
+            assert_eq!(
+                prefix,
+                if thinking_enabled {
+                    "open_think"
+                } else {
+                    "closed_think"
+                },
+                "prefix follows the serve path's Qwen Jinja framing"
+            );
+            assert!(
+                msg.get("max_think_tokens").is_none(),
+                "serve omits max_think_tokens unless an explicit positive cap is set"
+            );
+            let max_think_tokens = msg
+                .get("max_think_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let (enable_thinking, effort) = hipfire_engine::prompt::qwen_jinja_reasoning(
+                Some(thinking_enabled),
+                msg.get("reasoning_effort").and_then(|v| v.as_str()),
+                max_think_tokens,
+            );
+            assert_eq!(enable_thinking, thinking_enabled);
+            assert_eq!(effort, None);
+
+            // Explicit sampling wins over the model/arch defaults.
+            let (temp, top_p) =
+                hipfire_engine::scheduler::resolve_temp_top_p(&msg, 0, Some(0.7), Some(0.7));
+            assert_eq!((temp, top_p), (0.0, 1.0));
+            assert_eq!(msg["repeat_penalty"].as_f64(), Some(1.0));
+        }
+        assert_eq!((loads, unloads), (1, 1));
+        assert!(generates >= 2, "fixture must cover multi-turn requests");
+
+        // The pre-protocol gate request shape is refused by the same validator.
+        let legacy = serde_json::json!({ "type": "generate", "id": "c0_t1", "thinking": false });
+        assert_eq!(
+            require_wire_attempt_id(legacy.get("attempt_id")),
+            Err("missing attempt_id")
+        );
+        assert_eq!(announce_generate_terminal(&legacy), None);
+
+        batch_clear_all_terminals();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
 }

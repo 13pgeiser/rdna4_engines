@@ -20,11 +20,12 @@
 #     2. Tool-call structural validation (JSON.parse + schema match)
 #
 # What this gate does NOT cover (by design, today):
-#   - Jinja chat-template rendering. Master hardcodes AssistantPrefix::Plain
-#     at 4 daemon sites; there is no HIPFIRE_JINJA_CHAT toggle on master.
-#     PR #175 ships that toggle (gated 1=on, default off + Plain). When #175
-#     lands, this gate should grow a `jinja=1` axis so we exercise both
-#     framing paths. Until then, every cell uses the Plain scaffold.
+#   - Jinja chat-template rendering beyond what the daemon does for a request.
+#     Each generate carries `thinking_enabled` and `assistant_prefix` exactly as
+#     `hipfire serve` sends them: think-on cells `open_think`, the clamped cell
+#     and every second turn `closed_think`, never `max_think_tokens`. (Until
+#     the 2026-10 protocol repair the cells used the Plain scaffold, so think-on
+#     cells are framed differently from reports made before it.)
 #   - OpenAI HTTP path. Cells drive the daemon over stdin JSONL; the
 #     `serve` HTTP path runs additional Node-side Jinja rendering that
 #     this harness skips. OpenAI-shaped tool-call regressions need a
@@ -207,7 +208,7 @@ model_fits_vram() {
     [ "${HIPFIRE_AGENTIC_GATE_NO_VRAM_CHECK:-0}" = "1" ] && return 0
     [ -f "$REGISTRY" ] || return 0
     [ "$VRAM_BYTES" -gt 0 ] || return 0
-    # python3 is a hard script-wide dep (self-check + JSONL builder). No guard.
+    # python3 is a hard script-wide dep (self-check + session driver). No guard.
 
     local fname min_gb min_bytes
     fname="$(basename "$model_path")"
@@ -283,17 +284,20 @@ fi
 # The daemon reserves physical GPU UUIDs independently of HOME. A daemon
 # already using this card makes the gate fail before loading the model;
 # never unlink a GPU lock file (the active inode must remain).
-DAEMON_PID=""
+DRIVER_PID=""
 
 cleanup() {
-    # Kill ONLY the daemon we spawned, by tracked PID. Never pkill -f.
-    if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
-        kill "$DAEMON_PID" 2>/dev/null
-        # Give it a beat, then SIGKILL if still alive.
-        sleep 1
-        kill -9 "$DAEMON_PID" 2>/dev/null
+    # TERM only the driver we spawned, by tracked PID; it kills the daemon
+    # process group it started. Never pkill -f.
+    if [ -n "$DRIVER_PID" ] && kill -0 "$DRIVER_PID" 2>/dev/null; then
+        kill "$DRIVER_PID" 2>/dev/null
+        for _ in $(seq 1 20); do
+            kill -0 "$DRIVER_PID" 2>/dev/null || break
+            sleep 1
+        done
+        kill -9 "$DRIVER_PID" 2>/dev/null
     fi
-    DAEMON_PID=""
+    DRIVER_PID=""
     gpu_release 2>/dev/null || true
 }
 
@@ -395,132 +399,44 @@ for cell in "${CELLS[@]}"; do
     MODEL_CELLS["$model"]+="${cell}"$'\n'
 done
 
-# Iterate models; per model, build a single JSONL session.
+# Iterate models; per model, drive a single daemon session.
 for model in "${!MODEL_CELLS[@]}"; do
     model_short="$(basename "$model" .mq4)"
     echo "## $model_short" >> "$OUT"
     echo >> "$OUT"
     echo "agentic-gate: model $model_short ($(echo "${MODEL_CELLS[$model]}" | grep -c '|') cells)..."
 
-    # Build JSONL: load + (per cell: generate, optional second-turn generate) + unload
-    # Each cell gets a unique id ${prefix}_${cellnum}_t1 (and _t2 for multi-turn).
+    # Cell ids are c${idx}_t1 (and c${idx}_t2 for multi-turn). The driver
+    # (scripts/agentic_gate_driver.py) owns the daemon session: it sends load,
+    # then each generate with a unique nonzero attempt_id, answers the daemon's
+    # commit_ready with the matching commit, and waits for done before the next
+    # request, with per-step deadlines. The daemon's stdout and stderr land in
+    # $OUTPUT_FILE for the parser below.
     # Private HOME directories isolate config and caches, not GPU reservations.
     # The daemon's UUID lock still conflicts with any other user on this card.
-    JSONL_FILE="$(mktemp /tmp/agentic-gate-jsonl.XXXXXX)"
-
-    python3 - "$model" "$JSONL_FILE" <<'PY' >/dev/null
-import sys, json, os
-
-model_path = sys.argv[1]
-jsonl_path = sys.argv[2]
-
-# 4-second pacing between sends; daemon will buffer.
-# load
-print_load = json.dumps({"type": "load", "model": model_path,
-                         "params": {"max_seq": 4096}})
-
-with open(jsonl_path, "w") as f:
-    f.write(print_load + "\n")
-PY
-
-    # Read cells back for this model and build the JSONL body in Python (cleanest
-    # JSON escaping). Pass cells as repeated args.
     cell_args=()
     while IFS= read -r line; do
         [ -n "$line" ] && cell_args+=("$line")
     done <<< "${MODEL_CELLS[$model]}"
 
-    python3 - "$JSONL_FILE" "$USER_READ" "${cell_args[@]}" <<'PY' >/dev/null
-import sys, json
-
-jsonl = sys.argv[1]
-user_file = sys.argv[2]
-cells = sys.argv[3:]
-
-with open(user_file) as f:
-    user_prompt = f.read()
-
-with open(jsonl, "a") as out:
-    for idx, cell in enumerate(cells):
-        model, sys_path, clamp, multi, label = cell.split("|")
-        with open(sys_path) as f:
-            system = f.read()
-        max_think = 1 if clamp == "1" else 0
-        gen_msg = {
-            "type": "generate",
-            "id": f"c{idx}_t1",
-            "prompt": user_prompt,
-            "system": system,
-            "max_tokens": 256,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "repeat_penalty": 1.0,
-            "thinking": False if clamp == "1" else True,
-            "max_think_tokens": max_think,
-        }
-        out.write(json.dumps(gen_msg) + "\n")
-        if multi == "1":
-            # Synthesize a tool_response then ask the model to continue.
-            tool_resp_text = (
-                "<tool_response>\n"
-                "{\"contents\": \"int main() { return 0; }\"}\n"
-                "</tool_response>\n"
-                "Now describe what the file does in one sentence."
-            )
-            out.write(json.dumps({
-                "type": "generate", "id": f"c{idx}_t2",
-                "prompt": tool_resp_text, "system": "",
-                "max_tokens": 128, "temperature": 0.0, "top_p": 1.0,
-                "repeat_penalty": 1.0, "thinking": False, "max_think_tokens": 1,
-            }) + "\n")
-    # unload at end
-    out.write(json.dumps({"type": "unload"}) + "\n")
-PY
-
-    # Pace JSONL into the daemon. The daemon blocks on stdin readline, so we
-    # need a slow producer to allow load + each generate to complete in order.
-    # We use named-pipe + background daemon so we can capture the daemon's
-    # exact PID and kill ONLY that PID at end-of-cell. Never pkill -f.
     OUTPUT_FILE="$(mktemp /tmp/agentic-gate-out.XXXXXX)"
-    STDIN_FIFO="$(mktemp -u /tmp/agentic-gate-fifo.XXXXXX)"
-    mkfifo "$STDIN_FIFO"
 
-    # Spawn daemon in background, redirected stdin from FIFO, stdout to file.
-    # Any overlapping physical GPU UUID produces a FATAL contention message
-    # with the holder PID, regardless of HOME.
+    # The driver is backgrounded so cleanup can signal it by exact PID; on
+    # TERM it kills only the daemon process group it spawned. Any overlapping
+    # physical GPU UUID produces a FATAL contention message with the holder
+    # PID, regardless of HOME; the driver records the daemon's stderr for it.
     env HIPFIRE_KV_MODE=asym3 \
         HIPFIRE_GRAPH=1 \
-        "$EXE" < "$STDIN_FIFO" > "$OUTPUT_FILE" 2>&1 &
-    DAEMON_PID=$!
-
-    # Producer: pace each JSONL line. The daemon reads-and-blocks per
-    # newline, so we sleep after each send to let it complete.
-    (
-        while IFS= read -r line; do
-            printf '%s\n' "$line"
-            type="$(echo "$line" | python3 -c 'import sys,json;d=json.loads(sys.stdin.read());print(d["type"])' 2>/dev/null)"
-            case "$type" in
-                load)     sleep 90 ;;
-                generate) sleep 60 ;;
-                unload)   sleep 2  ;;
-            esac
-        done < "$JSONL_FILE"
-    ) > "$STDIN_FIFO"
-
-    # Producer is done; daemon will see EOF on stdin after unload. Wait
-    # briefly for graceful exit, then kill by tracked PID if still alive.
-    for _ in 1 2 3 4 5; do
-        if ! kill -0 "$DAEMON_PID" 2>/dev/null; then break; fi
-        sleep 1
-    done
-    if kill -0 "$DAEMON_PID" 2>/dev/null; then
-        kill "$DAEMON_PID" 2>/dev/null
-        sleep 1
-        kill -9 "$DAEMON_PID" 2>/dev/null
+        python3 scripts/agentic_gate_driver.py \
+            --exe "$EXE" --model "$model" --user-file "$USER_READ" \
+            --out "$OUTPUT_FILE" "${cell_args[@]}" &
+    DRIVER_PID=$!
+    wait "$DRIVER_PID"
+    driver_rc=$?
+    DRIVER_PID=""
+    if [ "$driver_rc" -ne 0 ]; then
+        echo "agentic-gate: driver reported errors for $model_short (rc=$driver_rc); the parser scores what the daemon emitted" >&2
     fi
-    wait "$DAEMON_PID" 2>/dev/null || true
-    DAEMON_PID=""
-    rm -f "$STDIN_FIFO" "$JSONL_FILE"
 
     # Parse output, run detectors per cell, append to report.
     python3 - "$OUTPUT_FILE" "$OUT" "${cell_args[@]}" <<'PY'
