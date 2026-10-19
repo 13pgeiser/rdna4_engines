@@ -11,5 +11,5 @@ error[E0308]: mismatched types
 note: function defined here
   --> src/lds.rs
    |
-   | pub fn rotate<R: 'static>(ring: Ring<R, Published, Writing>, drained: Drained<LdsWrite<R>>) -> Rotate<R> {
+   | pub fn rotate<R: 'static>(
    |        ^^^^^^
