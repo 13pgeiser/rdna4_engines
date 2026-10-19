@@ -357,6 +357,7 @@ mod tests {
         port: u16,
         credential: Arc<ManagementCredential>,
         shutdown: CancellationToken,
+        accept_loop: tokio::task::JoinHandle<()>,
     }
 
     async fn start() -> Running {
@@ -364,7 +365,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let credential = Arc::new(ManagementCredential::generate().unwrap());
         let shutdown = CancellationToken::new();
-        tokio::spawn(serve_management(
+        let accept_loop = tokio::spawn(serve_management(
             listener,
             Arc::clone(&credential),
             shutdown.clone(),
@@ -373,6 +374,7 @@ mod tests {
             port,
             credential,
             shutdown,
+            accept_loop,
         }
     }
 
@@ -450,21 +452,17 @@ mod tests {
             .expect("client helper cancels the shared shutdown token");
     }
 
+    /// `serve_management` owns its listener, so returning closes it. Waiting
+    /// for the task, not connecting until refused: once released, the port
+    /// can be rebound at once by a concurrent test's one-shot server, which
+    /// such a probe would then consume.
     #[tokio::test]
     async fn accept_loop_stops_when_shutdown_is_cancelled() {
         let running = start().await;
         running.shutdown.cancel();
-        let port = running.port;
-        let released = async {
-            loop {
-                if TcpStream::connect(("127.0.0.1", port)).await.is_err() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        };
-        tokio::time::timeout(Duration::from_secs(5), released)
+        tokio::time::timeout(Duration::from_secs(5), running.accept_loop)
             .await
-            .expect("management listener is released after shutdown");
+            .expect("accept loop returns, closing its listener, after shutdown")
+            .unwrap();
     }
 }
