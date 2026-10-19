@@ -1229,8 +1229,25 @@ const RadBatch* VideoDriver::build_encode(Job& j, int step) {
     pass_.kind = kind;
     pass_.job = j.id;
     if (enc_dbg_) {
-        const rad_buf   h = audio ? decl_.dbg_enca : decl_.dbg_evc;
-        const int64_t   n = audio ? decl_.dbg_enca_bytes : decl_.dbg_evc_bytes;
+        /* R4D_ENC_SEL picks which audio-pass buffer the readback names, so one binary can dump the
+         * whole final chain without a rebuild: "enca" (default, the normalised latent), "mp" (the
+         * mean_proj output, i.e. the latent before the fixed (z-mean)/std norm), "amb" (the mean_proj
+         * INPUT -- the pre_block output cast to f32), or "pre" (the raw bf16 pre_block buffer b_ax2).
+         * The split localises a latent-scale gap: if the gain is already present at "mp"/"amb", the
+         * norm op is innocent and the body carries it. "amb" is the RELIABLE f32 twin of "pre": the
+         * bf16 b_ax2 is arena-rotated scratch whose readback can lag the pass (b_amb2 is finite while
+         * b_ax2 dumps ±1e38 -- a stale read), so the f32 b_amb is what to trust for the pre_block
+         * value. The video pass and the default audio pass are untouched; only an env var selects. */
+        const char* sel = audio ? std::getenv("R4D_ENC_SEL") : nullptr;
+        const bool mp  = sel && std::strcmp(sel, "mp")  == 0 && decl_.dbg_ae_mp_bytes  > 0;
+        const bool amb = sel && std::strcmp(sel, "amb") == 0 && decl_.dbg_ae_amb_bytes > 0;
+        const bool pre = sel && std::strcmp(sel, "pre") == 0 && decl_.dbg_ae_pre_bytes > 0;
+        const rad_buf   h = mp  ? decl_.dbg_ae_mp : amb ? decl_.dbg_ae_amb : pre ? decl_.dbg_ae_pre
+                            : audio ? decl_.dbg_enca : decl_.dbg_evc;
+        const int64_t   n = mp  ? decl_.dbg_ae_mp_bytes : amb ? decl_.dbg_ae_amb_bytes
+                            : pre ? decl_.dbg_ae_pre_bytes
+                            : audio ? decl_.dbg_enca_bytes : decl_.dbg_evc_bytes;
+        enc_dbg_sel_ = mp ? "mp" : amb ? "amb" : pre ? "pre" : "";
         enc_dbg_used_ = 0;
         if (h && n > 0) {
             rb_.assign(1, Readback{h, n, enc_dbg_host_});
@@ -1267,13 +1284,14 @@ int VideoDriver::done() {
                 if (a > mx) mx = a;
                 sum += z[i];
             }
-            RAD_ERR("enc_dbg %s slot %d: fnv %016llx floats %lld nonzero %lld maxabs %.6g "
+            std::string tagstr = pass_.kind != RAD_GEN_PASS_AENCODE ? "evc"
+                               : *enc_dbg_sel_ ? std::string("enc") + enc_dbg_sel_ : std::string("enca");
+            const char* tag = tagstr.c_str();
+            RAD_ERR("enc_dbg %s: fnv %016llx floats %lld nonzero %lld maxabs %.6g "
                     "sum %.6g  head[%.6g %.6g %.6g %.6g]",
-                    pass_.kind == RAD_GEN_PASS_AENCODE ? "AENCA(b_enca)" : "VENCV(b_evc)",
-                    (int)enc_dbg_used_, (unsigned long long)h, (long long)nf, (long long)nz,
+                    tag, (unsigned long long)h, (long long)nf, (long long)nz,
                     (double)mx, sum, (double)z[0], (double)z[1], (double)z[2], (double)z[3]);
-            enc_dbg_dump_file(pass_.kind == RAD_GEN_PASS_AENCODE ? "enca" : "evc",
-                              enc_dbg_host_, (size_t)enc_dbg_used_);
+            enc_dbg_dump_file(tag, enc_dbg_host_, (size_t)enc_dbg_used_);
         }
         ++j->enc_next;
         break;

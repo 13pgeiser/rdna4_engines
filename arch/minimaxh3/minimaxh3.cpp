@@ -2898,6 +2898,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             d.dbg_enca_bytes = m.aenc ? (int64_t)kEncSlotsA * kEncSlotRowsA * kAudioC * 4 : 0;
             d.dbg_evc = m.b_evc;
             d.dbg_evc_bytes = m.venc ? (int64_t)kEncSlotsV * kEncSlotRowsV * kPatchVals * 4 : 0;
+            /* The audio final chain, for the R4D_ENC_SEL readback dump. All are the mono latent for
+             * the last channel; one channel's rows = kEncSlotRowsA / kAudioCh.
+             *   dbg_ae_amb -- b_amb, the mean_proj INPUT (pre_block out cast to f32): the RELIABLE
+             *                 f32 twin of the arena-rotated bf16 b_ax2 below, so it is the stage to
+             *                 read to split a pre_block-vs-mean_proj scale gap.
+             *   dbg_ae_mp  -- b_amb2, the mean_proj output (pre-norm latent).
+             *   dbg_ae_pre -- b_ax2, the raw bf16 pre_block buffer; its readback can lag the pass
+             *                 (arena-rotated scratch), so prefer dbg_ae_amb for the pre_block value. */
+            d.dbg_ae_amb = m.b_amb;
+            d.dbg_ae_amb_bytes = m.aenc ? (int64_t)(kEncSlotRowsA / kAudioCh) * kAudioC * 4 : 0;
+            d.dbg_ae_mp = m.b_amb2;
+            d.dbg_ae_mp_bytes = m.aenc ? (int64_t)(kEncSlotRowsA / kAudioCh) * kAudioC * 4 : 0;
+            d.dbg_ae_pre = m.b_ax2;   /* bf16, hence the *2 */
+            d.dbg_ae_pre_bytes = m.aenc ? (int64_t)(kEncSlotRowsA / kAudioCh) * kAudioC * 2 : 0;
         }
         RAD_ARCH_TRY(rad_declare_video_generator(b, &d));
     }
@@ -3685,8 +3699,16 @@ static void step_aenc(RadCtx* c, const RadBatch* batch, const Model& m) {
                     RAD_NONE, brows(m.b_ax6, rows), RAD_W(m.ae_finb));
         RAD_ISSUE_N(c, m.op_ae_cast6, rows, brows(m.b_ax6, rows), brows(m.b_apb, rows));
         /* The pre-block: the attention over the 2048-wide stream, its eight heads' mean pooled
-         * to 32 and projected; then the gated MLP, and the two residuals. */
-        RAD_ISSUE_N(c, m.p_op_ln3, rows, brows(m.b_apb, rows), RAD_W(m.p_ln3w), RAD_W(m.p_ln3b),
+         * to 32 and projected; then the gated MLP, and the two residuals. The two 2048-wide
+         * LayerNorms are NOT interchangeable: the reference AttnProjection.forward (audio_vae.py
+         * 267) feeds the DOWN-PROJECTION from norm3 and the ATTENTION from norm1. Their learned
+         * affines differ (norm3 |w|mean 0.60, norm1 0.27), so the projection carries most of the
+         * block's output magnitude (std 6.6 vs 1.8); feeding them the other way shrinks the whole
+         * block to ~0.27x and every audio latent downstream with it. Hence the LayerNorm staged
+         * for the attention below (feeding p_op_qkv) is norm1, and the one staged for the
+         * projection (feeding p_op_proj) is norm3 -- each consumer reads the norm the reference
+         * gives it, even though both norms share the same b_aln3 scratch. */
+        RAD_ISSUE_N(c, m.p_op_ln1, rows, brows(m.b_apb, rows), RAD_W(m.p_ln1w), RAD_W(m.p_ln1b),
                     brows(m.b_aln3, rows));
         RAD_ISSUE_N(c, m.p_op_qkv, rows, brows(m.b_aln3, rows), RAD_W(m.p_qkvw), RAD_W(m.p_qkvb),
                     RAD_NONE, brows(m.b_aqkv, rows));
@@ -3704,7 +3726,7 @@ static void step_aenc(RadCtx* c, const RadBatch* batch, const Model& m) {
         RAD_ISSUE_N(c, m.p_op_pool, rows, brows(m.b_ahsum, rows), brows(m.b_apool, rows));
         RAD_ISSUE_N(c, m.p_op_aproj, rows, brows(m.b_apool, rows), RAD_W(m.p_apw), RAD_W(m.p_apb),
                     RAD_NONE, brows(m.b_a32a, rows));
-        RAD_ISSUE_N(c, m.p_op_ln1, rows, brows(m.b_apb, rows), RAD_W(m.p_ln1w), RAD_W(m.p_ln1b),
+        RAD_ISSUE_N(c, m.p_op_ln3, rows, brows(m.b_apb, rows), RAD_W(m.p_ln3w), RAD_W(m.p_ln3b),
                     brows(m.b_aln3, rows));
         RAD_ISSUE_N(c, m.p_op_proj, rows, brows(m.b_aln3, rows), RAD_W(m.p_prw), RAD_W(m.p_prb),
                     RAD_NONE, brows(m.b_eh, rows));

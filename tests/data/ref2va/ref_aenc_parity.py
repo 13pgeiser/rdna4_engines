@@ -79,6 +79,35 @@ def ref_latent(model, staged, ch, T):
     return out[:ch * T].numpy()                                    # used rows only
 
 
+def ref_pre_norm_z(model, wave_ch, T):
+    """The reference mean_proj OUTPUT for one mono channel — the latent BEFORE the fixed
+    (z - latents_mean)/latents_std, exactly what the device's b_amb2 (aenc.mp) holds. encode() folds
+    the norm into its last line (audio_vae.py:439-442), so we reproduce the stages up to mean_proj
+    directly: encoder -> pre_block -> mean_proj. wave_ch: f32 [L] (already hop-padded). Returns
+    [T, 32] (row-major, to match the device's [rows, kAudioC])."""
+    x = torch.from_numpy(wave_ch.reshape(1, 1, -1))              # [1, 1, L]
+    with torch.no_grad():
+        h = model.encoder(x)                                     # [1, latent_dim, T]
+        h = model.pre_block(h.transpose(1, 2)).transpose(1, 2)   # [1, 32, T]
+        z = model.mean_proj(h)                                   # [1, 32, T], pre-norm
+    return z[0].permute(1, 0).numpy()                            # [T, 32]
+
+
+def ref_pre_block_out(model, wave_ch, T):
+    """The reference pre_block (AttnProjection) OUTPUT for one mono channel — one stage before
+    mean_proj, what the device's b_ax2 (aenc.xfin) holds: encoder -> pre_block, WITHOUT mean_proj."""
+    x = torch.from_numpy(wave_ch.reshape(1, 1, -1))              # [1, 1, L]
+    with torch.no_grad():
+        h = model.encoder(x)                                     # [1, latent_dim, T]
+        h = model.pre_block(h.transpose(1, 2)).transpose(1, 2)   # [1, 32, T]
+    return h[0].permute(1, 0).numpy()                            # [T, 32]
+
+
+def _read_bf16(f):
+    u = np.fromfile(f, dtype=np.uint16)
+    return torch.from_numpy(u).view(torch.bfloat16).float().numpy()
+
+
 def slot_row(kind, slot):
     idx = (slot - 1) if kind == "vaudio" else (3 + slot - 1)
     return idx * SLOT_ROWS_A
@@ -135,6 +164,70 @@ def do_parity(m, enca_f, encsm_f, kind, slot, n):
     return 0 if rf < floor else 1
 
 
+def _affine_report(dev, ref):
+    """Sorted-multiset relFro + best global affine fit dev ~ a*ref + b. SORTED so it is immune to the
+    row/channel packing (b_amb2 stores one channel's [rows,32]; the reference mean_proj returns
+    [32,T] transposed here) — only the value DISTRIBUTION is compared, which is what a scale gap is."""
+    sa, sb = np.sort(dev.reshape(-1)), np.sort(ref.reshape(-1))
+    if sa.size != sb.size:
+        sys.exit(f"multiset sizes differ: device {sa.size} vs reference {sb.size}; check T / channel")
+    rf = float(np.linalg.norm(sa - sb)) / (float(np.linalg.norm(sb)) + 1e-12)
+    A = np.vstack([sb, np.ones_like(sb)]).T
+    (aa, bb), *_ = np.linalg.lstsq(A, sa, rcond=None)
+    resid = sa - (aa * sb + bb)
+    rf_aff = float(np.linalg.norm(resid)) / (float(np.linalg.norm(sb)) + 1e-12)
+    r2 = 1.0 - float(np.sum(resid ** 2)) / (float(np.sum((sa - sa.mean()) ** 2) + 1e-30))
+    return rf, rf_aff, aa, bb, r2
+
+
+def do_stage(m, dev_f, encsm_f, ch, T, stage):
+    """Walk the audio final chain backward to localise a latent-scale gap. Each stage compares the
+    DEVICE buffer (the last channel) against the reference at the SAME stage, pre-norm, so the fixed
+    (z-mean)/std is excluded and only the network is compared:
+        amb : device b_amb   (f32) vs reference pre_block (AttnProjection) output  [reliable]
+        mp  : device b_amb2  (f32) vs reference mean_proj output (the latent before the fixed norm)
+        pre : device b_ax2   (bf16) vs reference pre_block output — the raw bf16 buffer, whose
+              readback lags the arena (non-finite stale rows); kept only to show the lag. 'amb' is
+              its f32 mean_proj-input twin and is what to trust for the pre_block value.
+    Because pre_block's LayerNorms reset the deep-encoder scale, a ratio ~ ref at 'amb' but a collapse
+    only at 'mp' implicates mean_proj; a ratio already collapsed at 'amb' implicates pre_block (its LN
+    affines / branches), since the encoder body's absolute scale is normalised away before it."""
+    allsm = np.fromfile(encsm_f, dtype=np.float32)
+    stage_samples = allsm.size // AUDIO_CH
+    staged = allsm.reshape(AUDIO_CH, stage_samples)
+    ref_fn = ref_pre_norm_z if stage == "mp" else ref_pre_block_out
+    ref = ref_fn(m, staged[ch], T)                                # [T, 32]
+    # 'pre' reads the raw bf16 b_ax2 (arena-rotated, readback can lag -> untrustworthy); 'amb' reads
+    # b_amb, its f32 mean_proj-input twin, which is the reliable pre_block value.
+    raw = _read_bf16(dev_f) if stage == "pre" else np.fromfile(dev_f, dtype=np.float32)
+    dev = raw.reshape(-1, AUDIO_C)[:T]                            # last channel's used rows
+    if dev.shape != ref.shape:
+        sys.exit(f"device slice {dev.shape} vs reference {stage} {ref.shape}; check T / buffer rows")
+    nbad = int((~np.isfinite(dev)).sum())
+    if nbad:
+        # A readback with non-finite values cannot go through the sorted-multiset fit (it would need
+        # equal, all-finite sizes). The bf16 b_ax2 ('pre') lags the arena this way; 'amb' is its
+        # reliable f32 twin, so just report the corruption and point at the right stage.
+        print(f"STAGE '{stage}' READBACK UNUSABLE: {nbad} non-finite device values "
+              f"(min {np.nanmin(dev):.4g} max {np.nanmax(dev):.4g}). "
+              + ("The bf16 b_ax2 readback lags the arena — re-run with R4D_ENC_SEL=amb "
+                 "(--stage amb) for the reliable pre_block value."
+                 if stage == "pre" else "unexpected: check the buffer size/dtype."))
+        return
+    rf, rf_aff, aa, bb, r2 = _affine_report(dev, ref)
+    ratio = float(np.std(dev)) / (float(np.std(ref)) + 1e-12)
+    print(f"STAGE '{stage}' (device vs reference {stage} output, pre-norm), ch={ch} T={T}")
+    print(f"  reference |mean|={ref.mean():.4f} std={ref.std():.4f}; "
+          f"device |mean|={dev.mean():.4f} std={dev.std():.4f}")
+    print(f"  device/reference std ratio            = {ratio:.4f}")
+    print(f"  sorted relFro (dev vs ref)            = {rf:.3e}")
+    print(f"  global-affine dev ~ {aa:.4f}*ref {bb:+.4f}: R^2={r2:.3f}  relFro after affine={rf_aff:.3e}")
+    verdict = ("MATCHES reference — this stage is fine; the collapse is at/before it only if an earlier stage differs"
+               if ratio > 0.85 else
+               "COLLAPSED here — the gain is introduced AT this stage or upstream of it")
+    print(f"  verdict: {verdict}")
+
+
 def do_selftest(m):
     """No device: build a device-shaped b_enca from the reference itself (perfect) and a
     temporally-mis-pooled copy (a stand-in for the strided-conv bug #14 suspected), and confirm the
@@ -171,13 +264,24 @@ def main():
     ap.add_argument("--kind", choices=["audio", "vaudio"], default="audio")
     ap.add_argument("--slot", type=int, default=1)
     ap.add_argument("--n", type=int, help="raw enc_samples count (before hop padding)")
+    ap.add_argument("--dev", help="device stage readback (see --stage): 'mp'=b_amb2 f32, "
+                                  "'amb'=b_amb f32 (reliable pre_block out), 'pre'=b_ax2 bf16 (arena-laggy)")
+    ap.add_argument("--stage", choices=["mp", "amb", "pre"], default="mp",
+                    help="which final-chain stage --dev is")
+    ap.add_argument("--ch", type=int, default=AUDIO_CH - 1, help="channel in --dev (device keeps the last)")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     m = load_encoder()
     if a.selftest:
         sys.exit(do_selftest(m))
+    if a.dev:
+        if not a.encsm:
+            sys.exit("--dev also needs --encsm (it gives T and the reference waveform)")
+        allsm = np.fromfile(a.encsm, dtype=np.float32)
+        T = (allsm.size // AUDIO_CH) // AUDIO_HOP
+        sys.exit(do_stage(m, a.dev, a.encsm, a.ch, T, a.stage))
     if not (a.enca and a.encsm):
-        sys.exit("give --enca and --encsm (or --selftest); --n is optional/informational")
+        sys.exit("give --enca and --encsm, or --dev/--stage and --encsm (or --selftest); --n is informational")
     sys.exit(do_parity(m, a.enca, a.encsm, a.kind, a.slot, a.n))
 
 

@@ -224,6 +224,7 @@ private:
     char*                 enc_dbg_host_ = nullptr;
     int64_t               enc_dbg_bytes_ = 0;   /* the slab's capacity */
     int64_t               enc_dbg_used_ = 0;    /* bytes the last encode readback filled */
+    const char*           enc_dbg_sel_ = "";    /* R4D_ENC_SEL: "", "mp" or "pre" (audio) */
 
     std::vector<RadBatch>         out_;      /* one per rank */
     std::vector<RadVideoGenBatch> vout_;

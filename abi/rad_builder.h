@@ -983,6 +983,22 @@ typedef struct RadVideoGenDecl {
     int64_t       dbg_enca_bytes;
     rad_buf       dbg_evc;
     int64_t       dbg_evc_bytes;
+    /* The audio mean_proj OUTPUT (b_amb2), i.e. the latent BEFORE the fixed (z-mean)/std norm —
+     * the mono, last-channel slice of it. Read only when R4D_ENC_MP names it in place of b_enca,
+     * to split whether a latent-scale gap is introduced by the body or by the norm op. Trailing
+     * since ABI 23 with the fields above: an older plugin declares none and keeps the 0 default. */
+    rad_buf       dbg_ae_mp;
+    int64_t       dbg_ae_mp_bytes;
+    /* The audio pre_block OUTPUT (b_ax2), one stage before mean_proj; bf16, the mono last channel.
+     * Read only when R4D_ENC_SEL=pre, to split a body-scale gap between pre_block and mean_proj.
+     * Trailing since ABI 23 with the fields above. */
+    rad_buf       dbg_ae_pre;
+    int64_t       dbg_ae_pre_bytes;
+    /* The audio mean_proj INPUT (b_amb), i.e. the pre_block output cast to f32. Read with
+     * R4D_ENC_SEL=amb: it is the reliable f32 twin of the arena-rotated bf16 b_ax2, and splits a
+     * body-scale gap between pre_block and mean_proj. Trailing since ABI 23 with the fields above. */
+    rad_buf       dbg_ae_amb;
+    int64_t       dbg_ae_amb_bytes;
 } RadVideoGenDecl;
 
 int rad_declare_video_generator(RadBuilder* b, const RadVideoGenDecl* d);
