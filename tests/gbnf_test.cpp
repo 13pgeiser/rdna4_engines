@@ -1705,6 +1705,19 @@ TEST(json_schema_grammars_admit_exactly_their_instances) {
         { R"({"type":"string","pattern":"x|yz"})", { R"("x")", R"("ayzb")" }, { R"("y")" } },
         { R"({"type":"array","items":{"type":"string","pattern":"[0-9]+"}})",
           { R"(["1","x2"])", R"(["x\"1"])", "[]" }, { R"(["x"])", R"(["1","x"])" } },
+        /* \d \w \s and their negations (0018), as tool schemas send them: oh-my-pi's workpool tool
+         * carries "\S" thirteen times. A negated class must not cross the closing quote. */
+        { R"({"type":"string","pattern":"\\S"})", { R"("a")", R"(" a ")" }, { R"("")", R"("   ")" } },
+        { R"({"type":"array","items":{"type":"string","pattern":"\\S"}})",
+          { R"(["a"," b"])" }, { R"(["  "])", R"(["a","  "])" } },
+        { R"({"type":"string","pattern":"^\\d{4}-\\d{2}-\\d{2}$"})",
+          { R"("2026-10-19")" }, { R"("2026-1-19")", R"("20x6-10-19")" } },
+        { R"({"type":"string","pattern":"^[\\w-]+$"})", { R"("a_b-1")" }, { R"("a b")", R"("")" } },
+        { R"({"type":"string","pattern":"^-?\\d+(?:\\.\\d+)?$"})",
+          { R"("3")", R"("-3.14")" }, { R"("3.")", R"("x")" } },
+        { R"({"type":"string","pattern":"^a\\sb$"})", { R"("a b")", R"("a\tb")" }, { R"("ab")" } },
+        { R"({"type":"string","pattern":"^[\\s\\S]{2}$"})", { R"("ab")", R"("a ")" }, { R"("a")" } },
+        { R"({"type":"string","pattern":"^\\D$"})", { R"("x")" }, { R"("7")" } },
         { R"({"type":"array","items":{"type":"integer"},"minItems":1,"maxItems":3})",
           { "[1]", "[1,2,3]", "[-4,0]" }, { "[]", "[1,2,3,4]", R"(["a"])" } },
         { R"({"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"string"}},)"
@@ -1725,7 +1738,8 @@ TEST(json_schema_grammars_admit_exactly_their_instances) {
         fprintf(stderr, "    SKIP number bounds: the converter does not enforce minimum/maximum "
                         "on \"number\"\n");
     for (const char* schema : { R"({"type":"string","pattern":"^a|b"})",
-                                R"({"type":"string","pattern":"a|b$"})" }) {
+                                R"({"type":"string","pattern":"a|b$"})",
+                                R"({"type":"string","pattern":"^[a\\S]$"})" }) {
         std::string gbnf, err;
         CHECK(grammar_from_json_schema(schema, "root", &gbnf, &err) < 0);
     }

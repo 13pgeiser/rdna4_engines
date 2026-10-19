@@ -1108,11 +1108,12 @@ TEST(json_schema_refuses_what_it_cannot_actually_enforce) {
               "{\"$ref\":\"https://example.com/s.json#/x\"}", "root", &gbnf, &err) < 0);
     CHECK(!err.empty());
 
-    /* GBNF cannot spell \d. Copying it through would succeed here and produce a grammar that
-     * fails to load, an internal error on a schema we accepted. */
+    /* GBNF cannot spell \b. Copying it through would succeed here and produce a grammar that
+     * fails to load, an internal error on a schema we accepted. (\d and its kin are written out
+     * as classes since vendor patch 0018.) */
     err.clear();
     CHECK(grammar_from_json_schema(
-              "{\"type\":\"string\",\"pattern\":\"^\\\\d+$\"}", "root", &gbnf, &err) < 0);
+              "{\"type\":\"string\",\"pattern\":\"^a\\\\bb$\"}", "root", &gbnf, &err) < 0);
     CHECK(!err.empty());
 
     /* A stray ']' is in NON_LITERAL_SET but claimed by no arm of the pattern scanner, so the

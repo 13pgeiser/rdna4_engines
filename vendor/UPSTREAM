@@ -102,6 +102,7 @@ vendor/llama/common/regex-partial.{h,cpp}    <- llama.cpp common/*
                    patches/0014-json-schema-a-not-of-every-type-is-never.patch
                    patches/0016-chat-analyse-a-template-once.patch
                    patches/0017-json-schema-a-pattern-without-anchors-searches.patch
+                   patches/0018-json-schema-shorthand-classes-are-written-out.patch
 
     On 0003: a `pattern` in a `response_format` reaches _visit_pattern() as client data, and three
     of its paths do not survive that. `front()`/`back()` run on an empty string; `seq.back()` runs
@@ -506,3 +507,20 @@ PATCH SERIES
       backslashes is a literal and does not count as an anchor. tests/gbnf_test.cpp
       (json_schema_grammars_admit_exactly_their_instances) holds the converter to the search
       reading, on plain strings and on array items, and pins the refusal.
+
+  patches/0018-json-schema-shorthand-classes-are-written-out.patch
+
+      \d \w \s and their negations were refused in a literal ("Unsupported regex escape") and
+      copied raw inside a class, where GBNF cannot load them. Tool schemas use them freely:
+      oh-my-pi's workpool tool carries "\S" thirteen times, so with 0017 the request got past
+      the anchors and was refused here instead. Each shorthand is now written out before the
+      scanner reads the pattern, as the class ECMA-262 gives it: \d [0-9], \w [A-Za-z0-9_], \s the
+      ECMA-262 space characters. A JSON string holds text, so the negated forms leave out '"',
+      '\' and the control characters and admit any JSON escape instead -- a match cannot run past
+      the closing quote -- and \s also admits the escapes \t \n \f \r. In a class a positive
+      shorthand becomes its ranges ([\w-], [\da-f]) and [\s\S] and its kin become any text; a
+      negated shorthand mixed into a class has no GBNF spelling and is refused with a message
+      that says so. The escapes are judged on the encoded text, so \D admits an escape such as
+      \u0031 that decodes to a digit. sample_test's "cannot spell" case moves from \d to \b,
+      which is still refused; gbnf_test covers \S on strings and array items, \d dates and
+      decimals, [\w-], \s with an escaped tab, [\s\S] and \D, and the refused [a\S].

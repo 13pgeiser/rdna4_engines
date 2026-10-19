@@ -330,6 +330,77 @@ static std::string anchor_pattern(const std::string & p) {
     return "^" + (starts ? "" : any) + "(?:" + core + ")" + (ends ? "" : any) + "$";
 }
 
+// RADIANCE: \d \w \s and their negations, which GBNF cannot spell, written out as the classes
+// ECMA-262 gives them, before the scanner reads the pattern. A JSON string holds text, not raw
+// bytes: the negated forms leave out '"', '\' and the control characters, which a string can only
+// carry escaped, and admit any JSON escape instead, so a match never runs past the closing quote;
+// \s adds the escapes \t \n \f \r for the same reason. In a class a positive shorthand becomes its
+// ranges and [\s\S] and its kin become any text; a negated one mixed into a class has no spelling,
+// so false is returned and the pattern refused.
+static bool expand_shorthands(const std::string & p, std::string & out) {
+    static const std::string sp = " \\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF";
+    static const std::string esc = "\\\\(?:[\"\\\\/bfnrt]|u[0-9A-Fa-f]{4})";
+    static const std::string raw = "\"\\\\\\x00-\\x1F";
+    auto negated = [&](const std::string & cls) { return "(?:[^" + cls + raw + "]|" + esc + ")"; };
+    out.clear();
+    for (size_t i = 0; i < p.size(); ++i) {
+        const char c = p[i];
+        if (c == '\\' && i + 1 < p.size()) {
+            const char n = p[++i];
+            switch (n) {
+                case 'd': out += "[0-9]"; break;
+                case 'w': out += "[A-Za-z0-9_]"; break;
+                case 's': out += "(?:[" + sp + "]|\\\\[tnfr])"; break;
+                case 'D': out += negated("0-9"); break;
+                case 'W': out += negated("A-Za-z0-9_"); break;
+                case 'S': out += negated(sp); break;
+                default: out += c; out += n; break;
+            }
+            continue;
+        }
+        if (c != '[') {
+            out += c;
+            continue;
+        }
+        // The class runs to the first unescaped ']', as the scanner reads it.
+        size_t j = i + 1;
+        std::string body;
+        while (j < p.size() && p[j] != ']') {
+            if (p[j] == '\\' && j + 1 < p.size()) {
+                body += p.substr(j, 2);
+                j += 2;
+            } else {
+                body += p[j++];
+            }
+        }
+        if (body == "\\s\\S" || body == "\\S\\s" || body == "\\d\\D" || body == "\\D\\d" ||
+            body == "\\w\\W" || body == "\\W\\w") {
+            out += "(?:[^" + raw + "]|" + esc + ")";
+            i = j;
+            continue;
+        }
+        std::string cls = "[";
+        for (size_t k = 0; k < body.size(); ++k) {
+            if (body[k] == '\\' && k + 1 < body.size()) {
+                const char n = body[++k];
+                if (n == 'd') cls += "0-9";
+                else if (n == 'w') cls += "A-Za-z0-9_";
+                else if (n == 's') cls += sp;
+                else if (n == 'D' || n == 'W' || n == 'S') return false;
+                else { cls += '\\'; cls += n; }
+            } else {
+                cls += body[k];
+            }
+        }
+        out += cls;
+        if (j < p.size()) {
+            out += ']';
+        }
+        i = j;
+    }
+    return true;
+}
+
 static std::unordered_set<char> ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS = {'^', '$', '.', '[', ']', '(', ')', '|', '{', '}', '*', '+', '?'};
 
 static std::string replacePattern(const std::string & input, const std::regex & regex, const std::function<std::string(const std::smatch  &)> & replacement) {
@@ -397,7 +468,13 @@ private:
     }
 
     std::string _visit_pattern(const std::string & client_pattern, const std::string & name) {
-        const std::string pattern = anchor_pattern(client_pattern);
+        std::string expanded;
+        if (!expand_shorthands(client_pattern, expanded)) {
+            _errors.push_back("Unsupported pattern: \\D, \\W or \\S inside a character class "
+                              "cannot be spelled in GBNF");
+            return "";
+        }
+        const std::string pattern = anchor_pattern(expanded);
         // RADIANCE: front()/back() on an empty string is UB, and `pattern` is client data straight
         // off the wire. The size test has to come first.
         if (pattern.size() < 2 || !(pattern.front() == '^' && pattern.back() == '$')) {
