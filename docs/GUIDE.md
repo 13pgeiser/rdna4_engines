@@ -1217,6 +1217,17 @@ Of sources 2 to 4, the first that states anything is used whole.
 radiance --model m.rad --temp 0.7 --top-p 0.8 --top-k 20
 ```
 
+**The windowed no-repeat-n-gram ban** (`no_repeat_ngram_size` /
+`no_repeat_ngram_window_size` in a `generation_config.json`, the same names under
+`generation.*` in the container; `ngram_ban_n` / `ngram_window` in a request) comes from the same
+four sources; there is no command-line flag. A negative window is the reference's "the whole
+sequence", which this sampler spells 0. Unlimited-OCR's checkpoint states 35 over the last 128,
+so that is what a request sending neither field gets:
+
+```json
+{"messages": [...], "ngram_ban_n": 35, "ngram_window": 128}
+```
+
 **The rest of the sampler** has a flag per field, spelled like the request field:
 `--presence-penalty`, `--frequency-penalty`, `--repetition-penalty`, `--repeat-last-n`,
 `--typical-p`, `--dry-multiplier`, `--dry-base`, `--dry-allowed-length`, `--dry-penalty-last-n`,

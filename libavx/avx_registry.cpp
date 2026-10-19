@@ -305,6 +305,14 @@ static const RadParamSpec pAttnNa3d[] = { P_INT("M"), P_INT("head_dim"), P_INT("
                                           P_INT("kw"), P_STR("dtype"), P_F64O("scale") };
 static const RadOperandSpec oAttnNa3d[] = { OPD("q"), OPD("k"), OPD("v"), OPD("geom"), OUT("out") };
 
+/* The SAM tower's attention: windowed tiles with a decomposed relative-position term, the two tables
+ * weights of [2*L-1, head_dim] (see libref/ref_registry.cpp and docs/OPS.md). */
+static const RadParamSpec pSamAttn[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
+                                         P_INT("grid_h"), P_INT("grid_w"), P_INT("window"),
+                                         P_F64("scale"), P_STR("dtype") };
+static const RadOperandSpec oSamAttn[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"),
+                                           OUT("out"), WGT("rel_pos_h"), WGT("rel_pos_w") };
+
 static const RadParamSpec pKvStore[]   = { P_INT("M"), P_INT("head_dim"), P_INT("n_head_kv"),
                                            P_INT("block_size"), P_STR("kv_dtype"),
                                            P_F64O("k_scale"), P_F64O("v_scale") };
@@ -775,6 +783,8 @@ static const RadParamSpec pPenal[]  = { P_INT("M"), P_INT("n_vocab"), P_INTO("vo
 static const RadOperandSpec oPenalties[] = { INOUT("logits"), OPD("params"), OPD("history") };
 static const RadOperandSpec oDry[]       = { INOUT("logits"), OPD("params"), OPD("history"),
                                              OPD_O("breakers") };
+static const RadOperandSpec oNgramBan[]  = { INOUT("logits"), OPD("params"), OPD("history"),
+                                             OPD("ngram") };
 static const RadOperandSpec oTemp[]      = { INOUT("logits"), OPD("params") };
 static const RadOperandSpec oMask[]      = { INOUT("logits"), OPD("params"), OPD("bitmask") };
 static const RadParamSpec pTopk[]        = { P_INT("M"), P_INT("n_vocab"), P_INTO("vocab_off") };
@@ -971,6 +981,11 @@ static const RadOpSchema kSchemas[] = {
   "start." },
 { "attn_na3d", ARR(pAttnNa3d), ARR(oAttnNa3d),
   "3-D neighborhood attention over a volume, libref's window and arithmetic." },
+{ "sam_attn", ARR(pSamAttn), ARR(oSamAttn),
+  "SAM tower attention: per cu segment of grid_h*grid_w rows, pad to multiples of `window` with "
+  "zero rows, tile into window x window windows (window 0 is one tile over the segment) and attend "
+  "each tile to all of its rows. logits = scale*q.k + q.Rh[i_h,j_h] + q.Rw[i_w,j_w] over the head's "
+  "whole head_dim, softmax in f32 with the max subtracted, out = sum p*v, pad rows dropped." },
 { "kv_store", ARR(pKvStore), ARR(oKvStore), "scatter k and v into the paged cache." },
 { "rope_table", ARR(pRopeTable), ARR(oRopeTable), "cos/sin at each position's own row." },
 { "qsa_block_key", ARR(pQsaBlockKey), ARR(oQsaBlockKey),
@@ -1207,6 +1222,10 @@ static const RadOpSchema kSchemas[] = {
 { "sample_penalties", ARR(pPenal), ARR(oPenalties),
   "repetition, frequency and presence penalties." },
 { "sample_dry", ARR(pPenal), ARR(oDry), "DRY repetition-suffix penalty, once per token." },
+{ "sample_ngram_ban", ARR(pPenal), ARR(oNgramBan),
+  "the windowed no-repeat-ngram ban: every token completing an n-gram the last `window` tokens of "
+  "the row's history contain is set to -infinity. `ngram` is an i32 {n, window} pair a row; n 0 "
+  "is off." },
 { "sample_temp", ARR(pMVocab), ARR(oTemp), "per-request temperature." },
 { "sample_topk", ARR(pTopk), ARR(oTopk), "exact top-k candidate set, descending, ties to the "
   "lower id." },
@@ -1513,6 +1532,9 @@ SIMPLE("avx_attn_cross", "attn_cross", "attn",
        L(attn_cross)),
 SIMPLE("avx_attn_na3d", "attn_na3d", "attn", "3-D neighborhood attention over a volume", DT_FLOAT,
        L(attn_na3d)),
+SIMPLE("avx_sam_attn", "sam_attn", "attn",
+       "SAM tower attention: windowed tiles with decomposed relative position", DT_FLOAT,
+       L(sam_attn)),
 ROW("avx_kv_store", "kv_store", "attn", "scatter k and v into the paged cache", DT_ANY,
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])), L(kv_store)),
 SIMPLE("avx_rope", "rope", "attn", "rotary embedding in place", DT_FLOAT, L(rope)),
@@ -1748,6 +1770,8 @@ SIMPLE("avx_sample_penalties", "sample_penalties", "sample",
        "repetition, frequency and presence penalties", DT_FLOAT, L(sample_penalties)),
 SIMPLE("avx_sample_dry", "sample_dry", "sample", "DRY repetition-suffix penalty", DT_FLOAT,
        L(sample_dry)),
+SIMPLE("avx_sample_ngram_ban", "sample_ngram_ban", "sample", "windowed no-repeat-ngram ban",
+       DT_FLOAT, L(sample_ngram_ban)),
 SIMPLE("avx_sample_temp", "sample_temp", "sample", "per-request temperature", DT_FLOAT,
        L(sample_temp)),
 SIMPLE("avx_sample_topk", "sample_topk", "sample", "exact top-k candidate set", DT_FLOAT,

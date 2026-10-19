@@ -1382,6 +1382,37 @@ int ref_chan_stats_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     return o.finish("chan_stats", operand, out);
 }
 
+/* The SAM tower's attention (ref_sam_attn.cpp): a row of `n_head * head_dim`, one raster
+ * grid_h x grid_w segment a cu entry, and the two rel_pos tables. Their length follows the contract
+ * in arch/common/rad_block_sam.h: 2*maxdist-1 rows with maxdist the window, or the longer grid axis
+ * for a global layer (which is the length a resampled table needs; the op resamples along dim 0
+ * either way). */
+int ref_sam_attn_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M   = gi(p, n_p, "M", 0);
+    const int64_t hd  = gi(p, n_p, "head_dim", 0);
+    const int64_t nh  = gi(p, n_p, "n_head", 0);
+    const int64_t gh  = gi(p, n_p, "grid_h", 0);
+    const int64_t gw  = gi(p, n_p, "grid_w", 0);
+    const int64_t win = gi(p, n_p, "window", 0);
+    if (M <= 0 || hd <= 0 || nh <= 0 || gh <= 0 || gw <= 0 || win < 0) return RAD_E_UNSUPPORTED;
+    const int64_t W = nh * hd;
+    const int64_t S = n_seq_of(p, n_p);
+    const int64_t maxd = win > 0 ? win : (gh > gw ? gh : gw);
+    const int64_t tab  = 2 * maxd - 1;
+    const uint32_t D = act_dt(p, n_p);
+
+    Opd o;
+    o.t(D, { M, W });                                /* q */
+    o.t(D, { M, W });                                /* k */
+    o.t(D, { M, W });                                /* v */
+    /* [0, ..., M], the batch's shape, not a draw. */
+    o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);   /* cu_seqlens */
+    o.t(D, { M, W });                                /* out */
+    o.t(D, { tab, hd });                             /* rel_pos_h */
+    o.t(D, { tab, hd });                             /* rel_pos_w */
+    return o.finish("sam_attn", operand, out);
+}
+
 int ref_kv_store_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M   = gi(p, n_p, "M", 0);
     const int64_t hd  = gi(p, n_p, "head_dim", 0);
@@ -2350,6 +2381,23 @@ int ref_sample_penalties_shape(const RadParam* p, int n_p, int operand, RadOpdDe
 }
 int ref_sample_dry_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     return penalty_shape(p, n_p, operand, "sample_dry", true, out);
+}
+
+/* The n-gram ban reads the same history the two penalty stages do and writes the logits in place,
+ * and adds one small plane beside them: `ngram`, an i32 {n-gram length, window} pair a row. It is
+ * a plane of its own rather than fields in `params` because the params row is a fixed 24-word wire
+ * format shared by every sampler op (and recorded in the kbench fixtures). Drawn in 0..63 so both
+ * a length inside the 64-token history and the 0 (= off) and whole-window forms occur. */
+int ref_sample_ngram_ban_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    int64_t M = 0, nv = 0;
+    if (sample_vocab(p, n_p, &M, &nv) < 0) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t((uint32_t)RAD_F32, { M, nv });                              /* logits, INOUT */
+    sample_params(o, M, REF_SAMPLE_HIST, 0);                        /* params */
+    o.t_idx({ M, (int64_t)REF_SAMPLE_HIST }, nv, -1,
+            (uint32_t)RAD_OPD_F_IDX_HISTORY);                       /* history */
+    o.t_idx({ M, 2 }, 64, -1, 0);                                   /* ngram: {n, window} */
+    return o.finish("sample_ngram_ban", operand, out);
 }
 
 int ref_sample_temp_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {

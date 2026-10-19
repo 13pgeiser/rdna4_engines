@@ -103,6 +103,7 @@ int         avx_par_force(int threads);
     X(attn_paged)           X(attn_dense)           X(attn_cross) X(attn_na3d) X(table_add) X(mix_rows) X(chan_stats) X(kv_store)             X(rope)               \
     X(rope_table)           X(qk_norm_rope)         X(qsa_block_key)        X(attn_local_rel)     \
     X(qsa_score)            X(qsa_select)           X(qsa_tail_store)       X(qsa_work)           \
+    X(sam_attn)             \
     /* ---- mixture of experts */                                                                 \
     X(router_topk)          X(moe_scatter)          X(moe_gemm)             X(moe_gemm_q)         \
     X(moe_gather)           X(row_topk)             X(row_topk_merge)       X(logit_rerank)     \
@@ -139,7 +140,7 @@ int         avx_par_force(int threads);
     X(sample_penalties)     X(sample_dry)           X(sample_temp)          X(sample_topk)        \
     X(sample_topp)          X(sample_minp)          X(sample_typical)       X(sample_xtc)         \
     X(sample_merge_topk)    X(sample_mask)          X(sample_pick)          X(sample_argmax)      \
-    X(sample_logprobs)      X(dflash_select)        X(dflash_conv)
+    X(sample_ngram_ban)     X(sample_logprobs)      X(dflash_select)        X(dflash_conv)
 
 /* One ISA level's table: one member per op, in AVX_OP_LIST order. A missing definition is a link
  * error from that level's avx_table.cpp object. */

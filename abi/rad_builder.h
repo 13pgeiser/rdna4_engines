@@ -310,13 +310,20 @@ enum {
     RAD_KV_FULL    = 0,   /* paged, per-token, growing -- full attention */
     RAD_KV_WINDOW  = 1,   /* paged, per-token, bounded by the window */
     RAD_KV_LINEAR  = 2,   /* per-sequence, fixed size -- GDN recurrent state */
-    RAD_KV_CONV    = 3    /* per-sequence, a rolling window of width-1 + num_spec entries */
+    RAD_KV_CONV    = 3,   /* per-sequence, a rolling window of width-1 + num_spec entries */
+    /* Paged exactly like RAD_KV_WINDOW, but the window's floor is per sequence and set at
+     * runtime (R-SWA, spec §7.2): `window` is the ring's W, and a sequence keeps everything from
+     * position 0 up to its own prompt (prefill and image rows) plus a ring of W slots after it,
+     * rewritten in place. So the group is sized for the whole context plus one ring a sequence,
+     * never checkpointed, and never reused from the prefix cache. A model that serves a fixed
+     * sliding window declares RAD_KV_WINDOW instead. */
+    RAD_KV_RING    = 4
 };
 
 typedef struct RadKVGroupDecl {
     int      kind;            /* RAD_KV_* */
     uint32_t dtype;
-    int64_t  window;          /* RAD_KV_WINDOW: the window; 0 otherwise */
+    int64_t  window;          /* RAD_KV_WINDOW: the window; RAD_KV_RING: the ring's W; 0 otherwise */
     int64_t  n_head_kv;
     int64_t  head_dim;
     int64_t  state_dim[2];    /* RAD_KV_LINEAR: the per-head state geometry, e.g. {128,128} */

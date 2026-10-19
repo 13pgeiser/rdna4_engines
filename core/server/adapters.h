@@ -706,10 +706,13 @@ public:
                 std::shared_ptr<mm::Item>* out, std::string* why) override {
         if (!accepts(k)) { if (why) *why = "this kind of media is not served"; return RAD_E_UNSUPPORTED; }
         if (k == MediaKind::Audio) return p_->audio(bytes.data(), bytes.size(), out, why);
-        return k == MediaKind::Image
-                   ? p_->image(bytes.data(), bytes.size(), opts.image_tokens, out, why,
-                               opts.max_pixels)
-                   : p_->video(bytes.data(), bytes.size(), out, why);
+        if (k == MediaKind::Video) return p_->video(bytes.data(), bytes.size(), out, why);
+        mm::ImageMode mode;
+        mode.kind = (int32_t)opts.image_mode;
+        mode.base_size = opts.image_base_size;
+        mode.image_size = opts.image_size;
+        return p_->image(bytes.data(), bytes.size(), opts.image_tokens, out, why,
+                         opts.max_pixels, mode);
     }
 
     int32_t audio_rate() const override {

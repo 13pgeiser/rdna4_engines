@@ -177,6 +177,14 @@ void host_dry(CandidateSet& s, const int32_t* history, int64_t n_history,
 void host_xtc(CandidateSet& s, float probability, float threshold, size_t min_keep,
               uint64_t seed, uint64_t pos);
 
+/* The windowed no-repeat-ngram ban (`sample_ngram_ban`, Unlimited-OCR's
+ * SlidingWindowNoRepeatNgramProcessor): a candidate whose token would complete an `n`-gram the
+ * last `window` tokens of `history` already contain gets -infinity. `n` <= 0 is off, `window` <= 0
+ * is the whole history. It runs after the penalties and DRY and before every cut, so the greedy
+ * path sees it too. */
+void host_ngram_ban(CandidateSet& s, const int32_t* history, int64_t n_history, int32_t n,
+                    int32_t window);
+
 /* The grammar mask. One bit per token, set means admissible; a cleared bit sets the logit to -inf
  * instead of removing the candidate, so nothing downstream is renumbered. `n_words` is
  * ceil(n_vocab/32). */
@@ -203,7 +211,8 @@ constexpr int64_t kSampleCandidates = 1024;
 constexpr int64_t kSampleMergeCandidates = 4096;
 
 enum class ChainOrder {
-    Radiance = 0,   /* penalties, DRY, temperature, mask, top-k, top-p/min-p/typical, XTC, pick */
+    /* penalties, DRY, n-gram ban, temperature, mask, top-k, top-p/min-p/typical, XTC, pick */
+    Radiance = 0,
     LlamaCpp = 1    /* penalties, DRY, top-k, typical, top-p, min-p, XTC, temperature, pick */
 };
 

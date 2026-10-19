@@ -625,7 +625,9 @@ int ref_conv2d_unfold(const RadArgs* a, RadStream) {
         if (T <= 0) continue;
         const int64_t To = (T + 2 * pad - kh) / st + 1, o0 = t0 / st;
         if (To <= 0) continue;
-        if (t0 + T > Min || (o0 + To) * Wo > Mout) return RAD_E_SHAPE;
+        if (t0 + T > Min || (o0 + To) * Wo > Mout) {
+            return RAD_E_SHAPE;
+        }
         if (V && numel(V) < (t0 + T - 1) * vst + 1) return RAD_E_SHAPE;
 
         REF_PAR_FOR(To * Wo * K)

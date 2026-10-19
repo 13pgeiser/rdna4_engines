@@ -4619,6 +4619,9 @@ TEST(every_request_key_is_served_refused_or_ignored_as_its_list_says) {
         { "timings_per_token", { true, json::parse(R"({"stream":true})") } },
         { "return_progress", { true, json::parse(R"({"stream":true})") } },
         { "session_id", { "s", none } }, { "n_probs", { 2, none } },
+        /* The windowed no-repeat-ngram ban and Unlimited-OCR's picture mode. */
+        { "ngram_ban_n", { 35, none } }, { "ngram_window", { 128, none } },
+        { "images_config", { "gundam", none } },
         { "messages", { json::parse(R"([{"role":"user","content":"yo"}])"), none } },
         { "tools", { json::parse(R"([{"type":"function","function":{"name":"f"}}])"), none } },
         { "tool_choice", { "auto", none } },

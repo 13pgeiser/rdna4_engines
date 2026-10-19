@@ -588,6 +588,14 @@ struct SamplingParams {
      * scheduler thread where every other request's step waits; held here, starting is a lookup.
      * Null for a request not admitted through the server; the sampler then compiles. */
     std::shared_ptr<const GbnfProgram> grammar_program;
+
+    /* The windowed no-repeat-ngram ban (core/sample/sampler.h, `sample_ngram_ban`): a token that
+     * would complete an `ngram_ban_n`-gram already present in the last `ngram_window` tokens of
+     * the sequence is banned. `ngram_ban_n` 0 is off, the default; `ngram_window` <= 0 searches
+     * the whole staged history (the un-windowed processor). Unlimited-OCR's generation_config
+     * asks for 35 and 128 (the model card's document mode uses 1024). */
+    int    ngram_ban_n = 0;
+    int    ngram_window = 0;
 };
 
 /* Raw logits at chosen vocabulary ids at the prompt's last position, for a caller that answers

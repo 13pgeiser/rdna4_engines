@@ -30,21 +30,44 @@ RAD_ADV_FN bool adv_is_eog(const AdvanceArgs& a, int32_t t) {
 
 /* Every group's slots for the row's `n` positions (from the positions just written) and its
  * length from `base`. A position past the block table gets slot -1 ("no slot"); the builder sizes
- * tables for the furthest reachable position, so only a row whose output is unused hits this. */
+ * tables for the furthest reachable position, so only a row whose output is unused hits this.
+ *
+ * A runtime window (e.ring, KVManager::set_window) must be computed exactly as the host builder
+ * staged it (BatchBuilder::build_groups), because this runs after the build and overwrites what it
+ * wrote:
+ *   - `used` stops at the table: the ring reuses its blocks, so the sequence's held span is the
+ *     table's, not the context's. Without this the decode walks bt[(used-1)/block] past the end,
+ *     reads the -1 padding the builder fills and faults the card on a negative block (the P4a
+ *     regression);
+ *   - a position at or past ring_pos lives in the ring, at block
+ *     ring_pos/block + ((p - ring_pos)/block) % ring_blocks, not at (p - first)/block, which runs
+ *     off the table once the ring wraps. */
 RAD_ADV_FN void adv_groups(const AdvanceArgs& a, int i, int32_t k, int32_t base, int32_t n) {
     const AdvGroup* G = reinterpret_cast<const AdvGroup*>(a.slab + a.grp_off);
     const int32_t* pos = adv_i32(a, a.pos_off);
     for (int g = 0; g < a.n_groups; ++g) {
         const AdvGroup& e = G[g];
         const int32_t first = adv_i32(a, e.first_off)[i];
-        adv_i32(a, e.used_off)[i] = base + n - first;
+        /* Per sequence: each prompt has its own floor and its own table (advance.h). */
+        const int32_t rpos = e.ring ? adv_i32(a, e.rpos_off)[i] : 0;
+        const int32_t tlen = e.ring ? adv_i32(a, e.tlen_off)[i] : 0;
+        const bool ring = e.ring && tlen > 0;
+        int64_t used = (int64_t)base + n - first;
+        if (ring) {
+            const int64_t span = (int64_t)tlen * e.block_size;
+            if (used > span) used = span;
+        }
+        adv_i32(a, e.used_off)[i] = (int32_t)used;
         if (!e.paged) continue;
         const int32_t* bt = adv_i32(a, e.bt_off) + (int64_t)i * e.pitch;
         int32_t* slot = adv_i32(a, e.slot_off);
         for (int32_t j = 0; j < n; ++j) {
             const int32_t p = pos[k + j];
-            const int32_t bi = (p - first) / e.block_size;
-            slot[k + j] = (p >= first && bi < e.pitch && bt[bi] >= 0)
+            int32_t bi = (p - first) / e.block_size;
+            if (ring && p >= rpos && e.ring_blocks > 0)
+                bi = rpos / e.block_size +
+                     ((p - rpos) / e.block_size) % e.ring_blocks;
+            slot[k + j] = (p >= first && bi >= 0 && bi < e.pitch && bt[bi] >= 0)
                               ? bt[bi] * e.block_size + p % e.block_size : -1;
         }
     }

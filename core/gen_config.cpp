@@ -22,6 +22,13 @@ void take(const char* what, const char* src, double v, double lo, double hi, boo
              src, what, v, lo_open ? "(" : "[", lo, hi);
 }
 
+/* An integer field (a token count), same contract. */
+void take_i(const char* what, const char* src, int64_t v, int64_t lo, int64_t hi, int* dst) {
+    if (v >= lo && v <= hi) { *dst = (int)v; return; }
+    RAD_WARN("%s states %s %lld, which is outside [%lld, %lld]; ignoring it",
+             src, what, (long long)v, (long long)lo, (long long)hi);
+}
+
 }  /* namespace */
 
 SamplingParams GenSampling::onto(SamplingParams base) const {
@@ -29,16 +36,29 @@ SamplingParams GenSampling::onto(SamplingParams base) const {
     if (top_p >= 0.0f) base.top_p = top_p;
     if (min_p >= 0.0f) base.min_p = min_p;
     if (top_k >= 0)    base.top_k = top_k;
+    if (ngram_ban_n >= 0)    base.ngram_ban_n = ngram_ban_n;
+    if (ngram_window >= 0)   base.ngram_window = ngram_window;
     return base;
 }
 
 std::string GenSampling::describe(const SamplingParams& sp) {
-    char buf[200];
+    char buf[320];
     std::snprintf(buf, sizeof buf, "temperature %.2f, top_k %d%s, top_p %.2f, min_p %.2f",
                   (double)sp.temp, sp.top_k,
                   sp.top_k == 0 ? " (the 1024 most likely tokens, the sampler's candidate width)" : "",
                   (double)sp.top_p, (double)sp.min_p);
-    return buf;
+    std::string s(buf);
+    if (sp.ngram_ban_n > 0) {
+        char ban[96];
+        if (sp.ngram_window > 0)
+            std::snprintf(ban, sizeof ban, ", ngram ban n %d over the last %d tokens",
+                          sp.ngram_ban_n, sp.ngram_window);
+        else
+            std::snprintf(ban, sizeof ban, ", ngram ban n %d over the whole sequence",
+                          sp.ngram_ban_n);
+        s += ban;
+    }
+    return s;
 }
 
 std::vector<GenFieldSource> gen_sampling_sources(const GenSampling& stated, const std::string& src,
@@ -88,6 +108,22 @@ bool gen_sampling_parse(const std::string& json_text, const char* src, GenSampli
         if (v >= -1) out->top_k = (int)(v < 0 ? 0 : v);
         else RAD_WARN("%s states top_k %lld, which is not a count; ignoring it", src, (long long)v);
     }
+
+    /* The windowed no-repeat-n-gram ban. Its checkpoint name in transformers is
+     * no_repeat_ngram_size / no_repeat_ngram_window_size (Unlimited-OCR ships 35 over the last
+     * 128); this sampler's own names are taken too. The reference's negative window means the
+     * whole sequence, which this sampler spells 0. */
+    it = j.find("no_repeat_ngram_size");
+    if (it == j.end() || !it->is_number_integer()) it = j.find("ngram_ban_n");
+    if (it != j.end() && it->is_number_integer())
+        take_i("no_repeat_ngram_size", src, it->get<int64_t>(), 0, 256, &out->ngram_ban_n);
+
+    it = j.find("no_repeat_ngram_window_size");
+    if (it == j.end() || !it->is_number_integer()) it = j.find("ngram_window");
+    if (it != j.end() && it->is_number_integer()) {
+        const int64_t v = it->get<int64_t>();
+        take_i("no_repeat_ngram_window_size", src, v < 0 ? 0 : v, 0, 131072, &out->ngram_window);
+    }
     return out->any();
 }
 
@@ -105,7 +141,8 @@ bool gen_sampling_from_kv(const std::function<const char*(const char*)>& get, Ge
     /* Rebuilt as JSON and passed to gen_sampling_parse, so container metadata and the original
      * file share one set of range checks and one reading of `do_sample`. */
     nlohmann::json j = nlohmann::json::object();
-    static const char* const kFields[] = { "do_sample", "temperature", "top_p", "min_p", "top_k" };
+    static const char* const kFields[] = { "do_sample", "temperature", "top_p", "min_p", "top_k",
+                                           "no_repeat_ngram_size", "no_repeat_ngram_window_size" };
     for (const char* k : kFields) {
         const char* v = get(k);
         if (!v || !*v) continue;
@@ -122,6 +159,7 @@ bool gen_sampling_from_kv(const std::function<const char*(const char*)>& get, Ge
             continue;
         }
         if (std::strcmp(k, "top_k") == 0) j[k] = (int64_t)d;
+        else if (std::strncmp(k, "no_repeat_ngram", 15) == 0) j[k] = (int64_t)d;
         else                              j[k] = d;
     }
     if (j.empty()) return false;

@@ -87,6 +87,7 @@ const char* bld_kv_kind_name(int k) {
         case RAD_KV_WINDOW: return "window";
         case RAD_KV_LINEAR: return "linear";
         case RAD_KV_CONV:   return "conv";
+        case RAD_KV_RING:   return "ring";
         default:            return "?";
     }
 }
@@ -336,7 +337,7 @@ rad_buf Builder::decl_buffer(const char* name, const RadBufDecl* d) {
 rad_kvgroup Builder::decl_kv_group(const char* name, const RadKVGroupDecl* d) {
     if (finished_) return err(RAD_E_STATE, "decl_kv_group('%s') after declare finished", name ? name : "");
     if (!name || !*name || !d) return err(RAD_E_INVAL, "decl_kv_group: null name or declaration");
-    if (d->kind < RAD_KV_FULL || d->kind > RAD_KV_CONV)
+    if (d->kind < RAD_KV_FULL || d->kind > RAD_KV_RING)
         return err(RAD_E_INVAL, "kv group '%s': unknown kind %d", name, d->kind);
 
     std::string n = scoped(name);
@@ -923,7 +924,7 @@ int Builder::kv_group_zero(rad_kvgroup h) {
      * state is saved and cleared on every rank, so a zero-sized one would mismatch those
      * copies. */
     const int kind = prog_.kv_groups[h].decl.kind;
-    if (kind != RAD_KV_FULL && kind != RAD_KV_WINDOW) {
+    if (kind != RAD_KV_FULL && kind != RAD_KV_WINDOW && kind != RAD_KV_RING) {
         err(RAD_E_INVAL, "kv group '%s': kv_group_zero on a group that is not paged",
             prog_.kv_groups[h].name.c_str());
         return RAD_E_INVAL;
@@ -1964,7 +1965,8 @@ void Builder::finish_kv_groups() {
         KVGroupInfo& gi = prog_.kv_groups[g];
         const RadKVGroupDecl& d = gi.decl;
 
-        if ((d.kind == RAD_KV_FULL || d.kind == RAD_KV_WINDOW) && gi.block_size == 0) {
+        if ((d.kind == RAD_KV_FULL || d.kind == RAD_KV_WINDOW || d.kind == RAD_KV_RING) &&
+            gi.block_size == 0) {
             /* The plugin may never have asked; the manifest still needs the answer. */
             kv_block_size((rad_kvgroup)g);
         }
@@ -1977,6 +1979,7 @@ void Builder::finish_kv_groups() {
         switch (d.kind) {
             case RAD_KV_FULL:
             case RAD_KV_WINDOW:
+            case RAD_KV_RING:
                 /* One block holds K and V for block_size tokens, the block manager's unit. */
                 gi.bytes_per_block =
                     rad_dtype_bytes(d.dtype, 2 * gi.block_size * elem_n_head * d.head_dim) * n_bound;

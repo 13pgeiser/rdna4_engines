@@ -206,6 +206,28 @@ static const RadOperandSpec oAttnNa3d[] = { { "q", RAD_OPD_IN, 0 }, { "k", RAD_O
                                             { "v", RAD_OPD_IN, 0 }, { "geom", RAD_OPD_IN, 0 },
                                             { "out", RAD_OPD_OUT, 0 } };
 
+/* Unlimited-OCR's SAM tower (r4d_sam_attn_bf16.hip): windowed attention with a decomposed relative
+ * position. The two tables are weights, [2*L-1, head_dim] with L the window or the grid. */
+static const RadParamSpec pSamAttn[] = {
+    P_INT("M"),
+    P_INT("head_dim"),
+    P_INT("n_head"),
+    P_INT("grid_h"),
+    P_INT("grid_w"),
+    P_INT("window"),
+    P_F64("scale"),
+    P_STR("dtype"),
+};
+static const RadOperandSpec oSamAttn[] = {
+    { "q",          RAD_OPD_IN,     0 },
+    { "k",          RAD_OPD_IN,     0 },
+    { "v",          RAD_OPD_IN,     0 },
+    { "cu_seqlens", RAD_OPD_IN,     0 },
+    { "out",        RAD_OPD_OUT,    0 },
+    { "rel_pos_h",  RAD_OPD_WEIGHT, 0 },
+    { "rel_pos_w",  RAD_OPD_WEIGHT, 0 },
+};
+
 /* Not docs/OPS.md's `qk_norm_rope` (qkv in place, `theta`): this kernel splits a packed [q|gate]
  * projection per head, writes q, k and the gate to three destinations, and takes a precomputed
  * cos/sin table. Hence its own op name. */
@@ -2089,6 +2111,15 @@ static const RadOperandSpec oDry[] = {
     { "history",  RAD_OPD_IN,    0 },
     { "breakers", RAD_OPD_IN,    1 },
 };
+/* The n-gram ban's own plane: one i32 {n-gram length, window} pair a row (n 0 = off, window <= 0
+ * = the whole staged history). A plane beside `params` rather than fields in it, because the
+ * params row is the fixed 24-word RadSampleParams every sampler op shares. */
+static const RadOperandSpec oNgramBan[] = {
+    { "logits",  RAD_OPD_INOUT, 0 },
+    { "params",  RAD_OPD_IN,    0 },
+    { "history", RAD_OPD_IN,    0 },
+    { "ngram",   RAD_OPD_IN,    0 },
+};
 static const RadOperandSpec oTemp[] = {
     { "logits", RAD_OPD_INOUT, 0 },
     { "params", RAD_OPD_IN,    0 },
@@ -2806,6 +2837,11 @@ static const RadOpSchema kSchemas[] = {
            "DRY: penalise, once, each token that would extend a suffix of the history that has "
            "occurred before, by its longest such repeat -- what stops a model looping on a phrase "
            "rather than on a token. Tokens the breaker plane marks are exempt."),
+    SCHEMA("sample_ngram_ban", pPenal, oNgramBan,
+           "the windowed no-repeat-ngram ban: every token completing an n-gram the last `window` "
+           "tokens of the row's history contain is set to -infinity. `ngram` is one i32 "
+           "{n, window} pair a row; the window bounds the n-gram's START index, as in the "
+           "reference, window <= 0 searches the whole span and n 0 is off."),
     SCHEMA("sample_temp", pMVocab, oTemp,
            "per-request temperature. temp <= 0 leaves the row untouched; greedy is sample_argmax."),
     SCHEMA("sample_mask", pMVocab, oMask,
@@ -2861,6 +2897,11 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("attn_na3d", pAttnNa3d, oAttnNa3d,
            "3-D neighborhood attention over the voxels of geom = (T, H, W): each query sees the "
            "kt x kh x kw window centred on it, shifted inward at the border."),
+    SCHEMA("sam_attn", pSamAttn, oSamAttn,
+           "Unlimited-OCR's SAM tower attention: per cu segment of grid_h*grid_w rows, pad to "
+           "multiples of `window` with zero rows, tile into window x window windows (0 = the whole "
+           "segment) and attend each tile to all of its rows. logits = scale*q.k + q.Rh[i_h,j_h] + "
+           "q.Rw[i_w,j_w], softmax in f32, out = sum p*v, pad rows dropped."),
     SCHEMA("qk_norm_rope_gate", pQkNormRopeGate, oQkNormRopeGate,
            "split [q|gate] per head, QK RMS norm over the head, partial NeoX RoPE and the gate "
            "copy, in one pass. Not docs/OPS.md's qk_norm_rope: different operands, and a "
@@ -3818,6 +3859,14 @@ static const RadConstraint cCastNarrow[] = {
 static const RadConstraint cAttnDenseH64[] = {
     C_EQ("head_dim", 64), C_EQ("gqa", 1), C_IN("dtype", "bf16"),
 };
+/* Unlimited-OCR's SAM tower (r4d_sam_attn_bf16.hip): one block per (segment, tile, head), a thread
+ * a query row, q and the output accumulator in registers; only head_dim 64 is instantiated and the
+ * tables must be exactly 2*tile-1 rows (a geometry needing get_rel_pos's resampling is libref's
+ * and libavx's). */
+static const RadConstraint cSamAttn[] = {
+    C_EQ("head_dim", 64), C_IN("dtype", "bf16"),
+};
+
 static const RadConstraint cAttnDenseH256G2[] = {
     C_EQ("head_dim", 256), C_EQ("gqa", 2), C_IN("dtype", "bf16"),
 };
@@ -5505,6 +5554,20 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r4d_rad_sample_dry, nullptr, nullptr, nullptr,
   r4d_shape_sample_dry },
 
+{ "sample_ngram_ban_f32", "sample_ngram_ban", "sample",
+  "the windowed no-repeat-ngram ban (Unlimited-OCR's SlidingWindowNoRepeatNgramProcessor): every "
+  "token that would complete an n-gram the last `window` tokens of the row's history contain is "
+  "set to -infinity",
+  "any vocabulary; ONE BLOCK A ROW, the search positions dealt across its threads, the n-1-token "
+  "prefix staged in LDS. Integer comparisons and one constant store, so it is bit-identical to "
+  "libref; the same column written by two positions is an idempotent -infinity",
+  "f32 logits in place, i32 history, i32 {n, window} per-row pair",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cSampleVoc), NOTUNE,
+  /* No `opd_shape`: r4d_shapes.cpp declares the sampler's shapes, and the oracle (libref) describes
+   * this op for the tools that ask. */
+  nullptr, nullptr, r4d_rad_sample_ngram_ban },
+
 { "sample_temp_f32", "sample_temp", "sample",
   "per-request temperature",
   "any vocabulary; a row with temp <= 0 or exactly 1 is skipped whole",
@@ -6294,6 +6357,16 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cAttnVit), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_vit },
+
+{ "sam_attn_bf16", "sam_attn", "attn",
+  "Unlimited-OCR's SAM tower attention: windowed tiles with a decomposed relative-position term",
+  "head_dim 64; any grid, window and segment count (a segment is one grid_h*grid_w); q/k/v/out at "
+  "their own row pitch (column slices of one fused projection); rel_pos tables exactly 2*tile-1 "
+  "rows (a geometry needing get_rel_pos's resampling is libref's and libavx's)",
+  "bf16 query / key / value / out and rel_pos tables, i32 cu_seqlens, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cSamAttn), NOTUNE,
+  nullptr, nullptr, r4d_rad_sam_attn },
 
 { "attn_dense_h64_bf16", "attn_dense", "attn",
   "dense varlen attention over cu_seqlens: bidirectional with an optional two-sided window or "

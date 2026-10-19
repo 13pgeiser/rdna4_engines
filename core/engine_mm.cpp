@@ -20,6 +20,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <string>
 
 namespace rad {
 
@@ -47,10 +49,53 @@ int Engine::run_encodes() {
 
     Rank& r0 = *ranks_[0];
     const Program& prog = r0.program;
+
+    /* Diagnostic: RADIANCE_DEBUG_MM_BUFFERS names encoder buffers (comma separated, with an
+     * optional `:rows` cap) and each pass writes them, as raw bytes, to `<dump dir>/buf.<name>`.
+     * The pass has finished and been read back, so the copy sees each buffer's last writer; the
+     * tower's per-stage intermediates are tapped inside the pass instead (rad_block_sam.h). */
+    struct DumpBuf { std::string name; int64_t rows; };
+    std::vector<DumpBuf> dump_bufs;
+    static const char* const dump_list = std::getenv("RADIANCE_DEBUG_MM_BUFFERS");
+    if (dump_dir && *dump_dir && dump_list) {
+        for (const char* s = dump_list; *s; ) {
+            const char* e = s;
+            while (*e && *e != ',') ++e;
+            std::string want(s, (size_t)(e - s));
+            s = *e ? e + 1 : e;
+            int64_t rows = 0;
+            if (const size_t colon = want.find(':'); colon != std::string::npos) {
+                rows = std::strtoll(want.c_str() + colon + 1, nullptr, 10);
+                want.resize(colon);
+            }
+            if (!want.empty()) dump_bufs.push_back({ want, rows });
+        }
+    }
+    auto answers_to = [](const std::string& name, const std::string& want) {
+        if (name.size() < want.size() ||
+            name.compare(name.size() - want.size(), want.size(), want) != 0) return false;
+        return name.size() == want.size() || name[name.size() - want.size() - 1] == '.';
+    };
     for (auto& ip : items) {
         if (ip->encoded) continue;
         const RadEncoderDecl& e = ip->kind == mm::Kind::Audio ? prog.audio_encoder : prog.encoder;
         ip->embd.assign((size_t)(ip->n_rows() * e.n_embd), 0);
+        /* Diagnostic: RADIANCE_DEBUG_MM_ROWS=<raw bf16 file> substitutes a reference encoder's
+         * rows for the tower's, to tell a tower difference from a language-model one. */
+        if (const char* rp = std::getenv("RADIANCE_DEBUG_MM_ROWS")) {
+            if (FILE* rf = std::fopen(rp, "rb")) {
+                const size_t want = ip->embd.size() * sizeof(uint16_t);
+                const size_t got = std::fread(ip->embd.data(), 1, want, rf);
+                std::fclose(rf);
+                if (got == want) {
+                    ip->encoded = true;
+                    RAD_INFO("encoder: %zu row(s) taken from %s instead of the tower", 
+                             (size_t)ip->n_rows(), rp);
+                    continue;
+                }
+                RAD_ERR("encoder: %s holds %zu bytes, wanted %zu", rp, got, want);
+            }
+        }
         if (dump_dir && *dump_dir) dump(*ip, ".pix.bf16", ip->pixels.data(), ip->pixels.size());
     }
 
@@ -132,6 +177,35 @@ int Engine::run_encodes() {
             }
             /* Sync every rank's stream: the next pass rewrites every rank's staging and arena. */
             for (auto& rk : ranks_) RAD_TRY(rad_stream_sync(rk->ctx.stream()));
+
+            if (dump_dir && *dump_dir && !dump_bufs.empty()) {
+                for (const DumpBuf& d : dump_bufs) {
+                    for (size_t bi = 1; bi < prog.buffers.size(); ++bi) {
+                        const BufferInfo& info = prog.buffers[bi];
+                        if (!answers_to(info.name, d.name) || info.bytes <= 0) continue;
+                        const int64_t nrow = info.decl.rank >= 1 ? info.decl.shape[0] : 1;
+                        const int64_t rowb = nrow > 0 ? info.bytes / nrow : info.bytes;
+                        const int64_t rows = d.rows > 0 ? std::min<int64_t>(d.rows, nrow) : nrow;
+                        void* ptr = r0.ctx.buf_ptr((rad_buf)bi);
+                        std::vector<char> raw((size_t)(rows * rowb));
+                        if (!ptr || rad_memcpy_async(raw.data(), ptr, raw.size(),
+                                                     r0.ctx.stream()) < 0)
+                            continue;
+                        rad_stream_sync(r0.ctx.stream());
+                        char path[512];
+                        std::snprintf(path, sizeof path, "%s/mm_%016llx%016llx_buf.%s.raw",
+                                      dump_dir, (unsigned long long)parts.front().item->key_hi,
+                                      (unsigned long long)parts.front().item->key_lo,
+                                      info.name.c_str());
+                        if (FILE* f = std::fopen(path, "wb")) {
+                            std::fwrite(raw.data(), 1, raw.size(), f);
+                            std::fclose(f);
+                            RAD_INFO("encoder: wrote %s (%lld rows of %lld bytes)", path,
+                                     (long long)rows, (long long)rowb);
+                        }
+                    }
+                }
+            }
         }
     }
 

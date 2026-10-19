@@ -524,6 +524,12 @@ struct MediaOpts {
     /* A picture over this many pixels is first scaled down to that area (PIL's bicubic, sides
      * truncated), as a model's own pipeline may do before its processor; 0 leaves it as sent. */
     int64_t max_pixels = 0;
+    /* Which of the checkpoint's picture modes, for one that has two (Unlimited-OCR): 0 is the
+     * server's choice (mm::ImageMode::Default), 1 gundam, 2 base. A request that carries
+     * several pictures chooses base unless it says otherwise. */
+    int32_t image_mode = 0;
+    /* The mode's sizes, when the request states them; 0 keeps the mode's own. */
+    int32_t image_base_size = 0, image_size = 0;
 };
 
 class IMultimodal {

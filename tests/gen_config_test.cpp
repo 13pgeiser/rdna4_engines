@@ -206,4 +206,56 @@ TEST(gen_config_derives_the_sidecar_path) {
     CHECK_EQ(gen_sidecar_path("/a.b/model.rad"), std::string("/a.b/model.generation.json"));
 }
 
+/* Unlimited-OCR's generation_config.json, verbatim: it states no temperature or top-k, only the
+ * windowed no-repeat-n-gram ban, so it must be claimed as stated (or the ban would never reach a
+ * request that sends no sampler fields). `do_sample: false` still means greedy and ignores it. */
+TEST(gen_config_reads_the_ngram_ban) {
+    const char* const kUnlimitedOcr = R"({
+    "bos_token_id": 0,
+    "eos_token_id": 1,
+    "no_repeat_ngram_size": 35,
+    "no_repeat_ngram_window_size": 128,
+    "max_new_tokens": 32768,
+    "use_cache": true
+})";
+    GenSampling g;
+    CHECK(gen_sampling_parse(kUnlimitedOcr, "test", &g));
+    CHECK_EQ(g.ngram_ban_n, 35);
+    CHECK_EQ(g.ngram_window, 128);
+    CHECK(g.temp < 0.0f);
+    const SamplingParams sp = g.onto(SamplingParams{});
+    CHECK_EQ(sp.ngram_ban_n, 35);
+    CHECK_EQ(sp.ngram_window, 128);
+    CHECK(GenSampling::describe(sp).find("ngram ban n 35 over the last 128 tokens") !=
+          std::string::npos);
+
+    /* The container's flattened copy reads the same. */
+    GenSampling kv;
+    CHECK(gen_sampling_from_kv(kv_of({ { "no_repeat_ngram_size", "35" },
+                                       { "no_repeat_ngram_window_size", "128" } }),
+                               &kv));
+    CHECK_EQ(kv.ngram_ban_n, 35);
+    CHECK_EQ(kv.ngram_window, 128);
+
+    /* This sampler's spellings, and the reference's negative window as "the whole sequence". */
+    GenSampling own;
+    CHECK(gen_sampling_parse(R"({"ngram_ban_n": 35, "ngram_window": -1})", "test", &own));
+    CHECK_EQ(own.ngram_ban_n, 35);
+    CHECK_EQ(own.ngram_window, 0);
+
+    /* A size outside [0, 256] is dropped on its own; the window still reads. */
+    GenSampling bad;
+    CHECK(gen_sampling_parse(R"({"no_repeat_ngram_size": 5000,
+                                 "no_repeat_ngram_window_size": 128})", "test", &bad));
+    CHECK_EQ(bad.ngram_ban_n, -1);
+    CHECK_EQ(bad.ngram_window, 128);
+
+    /* do_sample false is greedy: transformers ignores the ban under it, and so does this. */
+    GenSampling greedy;
+    CHECK(gen_sampling_parse(R"({"do_sample": false, "no_repeat_ngram_size": 35})", "test",
+                             &greedy));
+    CHECK_EQ(greedy.ngram_ban_n, -1);
+    CHECK_EQ(greedy.onto(SamplingParams{}).ngram_ban_n, 0);
+}
+
 RAD_TEST_MAIN()

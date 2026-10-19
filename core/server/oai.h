@@ -158,6 +158,11 @@ struct OaiRequest {
     /* /v1/embeddings: a soft-token budget for the request's images, 0 the server's. */
     int32_t image_tokens = 0;
 
+    /* `images_config`: which of the checkpoint's picture modes a request's pictures get, and the
+     * sizes it states (Unlimited-OCR's gundam and base modes). 0 keeps the server's choice: base
+     * for a request with several pictures, gundam otherwise. */
+    int32_t image_mode = 0, image_base_size = 0, image_size = 0;
+
     int  n_choices() const { return (int)prompts.size() * n; }
 };
 

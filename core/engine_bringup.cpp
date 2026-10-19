@@ -1037,7 +1037,10 @@ int Engine::declare() {
      * area, which would need 16x the activation memory on every card. */
     if (cfg_.mm_max_patches < 0) {
         const char* enc = rad_meta_gets(&meta_, "radiance.encoder", "");
-        const bool tower = rad_meta_geti(&meta_, "vision_config.patch_size", 0) > 0;
+        /* A checkpoint's vision_config states a tower as a flat patch_size, or (Unlimited-OCR's
+         * DeepEncoder) only the per-width tables under a `vision_config.image_size`. */
+        const bool tower = rad_meta_geti(&meta_, "vision_config.patch_size", 0) > 0 ||
+                           rad_meta_geti(&meta_, "vision_config.image_size", 0) > 0;
         cfg_.mm_max_patches = (enc && *enc) || (!file_ && tower) ? 16384 : 0;
         /* Whole output rows a pass: the plugin's merge, when it states one. */
         RadArchProbe pb{};
@@ -1295,6 +1298,21 @@ void Engine::probe_arena_levels() {
 }
 
 /* ================================================================== 5. plan */
+
+/* R-SWA: a RAD_KV_RING group names its ring's W in the declaration (`window`). Tell the manager
+ * before it plans, so the group is planned for per-sequence windows: sized for the whole context
+ * plus one ring a sequence (the ring in the fixed costs), never capped at the declare-time
+ * window, never snapshotted. Every plan (each sizing probe and the real manager) goes through
+ * here, so they all plan the same bytes. */
+static int declare_ring_windows(KVManager& kv, const Program& prog) {
+    for (size_t g = 1; g < prog.kv_groups.size(); ++g) {
+        const RadKVGroupDecl& d = prog.kv_groups[g].decl;
+        if (d.kind != RAD_KV_RING) continue;
+        RAD_TRY(kv.declare_runtime_window((int32_t)g, d.window));
+    }
+    return RAD_OK;
+}
+
 int Engine::plan() {
     /* The budget is resolved once, for every rank, before any rank allocates. vram_budget_resolve
      * folds the smallest capacity with the largest program so one split fits every card, and
@@ -1373,6 +1391,19 @@ int Engine::plan() {
             ngram_bytes = std::max(ngram_bytes, wf.ngram);
             ngram_device = ngram_device || wf.ngram_device;
             ngram_host = ngram_host || wf.ngram_host;
+            /* One --max-model-len sequence's cache: the least a KV pool can hold and still serve
+             * every acceptable request (configure_kv warns below it). --ngram-placement auto puts
+             * the table on the card only if the pool stays above it. */
+            {
+                Config one = cfg_;
+                one.max_seqs = 1;
+                KVManager single;
+                if (declare_ring_windows(single, r->program) == RAD_OK &&
+                    single.plan_groups(r->program.kv_groups, one) == RAD_OK) {
+                    kv_floor = std::max(kv_floor, single.ceiling(ctx));
+                    f.kv_one = single.ceiling(ctx);
+                }
+            }
             /* The staging region is sized only where the arena lends its top: without smaller
              * levels nothing returns it to the slab at decode, and a deterministic plan moves
              * nothing. */
@@ -1381,7 +1412,8 @@ int Engine::plan() {
              * memory, and the real pool does not exist yet. */
             KVManager probe;
             host_arenas += arena_host_bytes(r->program);
-            if (probe.plan_groups(r->program.kv_groups, cfg_) == RAD_OK) {
+            if (declare_ring_windows(probe, r->program) == RAD_OK &&
+                probe.plan_groups(r->program.kv_groups, cfg_) == RAD_OK) {
                 ck_slot += probe.checkpoint_bytes();
                 f.kv_ceiling = probe.ceiling(ctx);
                 f.kv_fixed   = probe.fixed_bytes();
@@ -1512,7 +1544,8 @@ int Engine::plan() {
              * its carve). */
             for (size_t i = 0; i < ranks_.size(); ++i) {
                 probes[i] = std::make_unique<KVManager>();
-                if (probes[i]->plan_groups(ranks_[i]->program.kv_groups, cfg_) != RAD_OK) {
+                if (declare_ring_windows(*probes[i], ranks_[i]->program) != RAD_OK ||
+                    probes[i]->plan_groups(ranks_[i]->program.kv_groups, cfg_) != RAD_OK) {
                     kept = fmt("rank %d's KV groups did not plan", ranks_[i]->index);
                     break;
                 }
@@ -2850,6 +2883,7 @@ int Engine::configure_kv() {
     for (size_t i = 0; i < ranks_.size(); ++i) {
         auto& r = ranks_[i];
         LogRank lr(r->index);
+        RAD_TRY(declare_ring_windows(r->kv, r->program));
         RAD_TRY(r->kv.plan_groups(r->program.kv_groups, cfg_));
         const int64_t t = r->kv.paged_tokens(r->pools.kv().avail());
         /* A rank plan() re-sized for the common token count must page at least that count (same
@@ -3074,13 +3108,16 @@ int Engine::configure_kv() {
     /* Can the pool hold one max-length sequence? The context limit and KV pool come from unrelated
      * flags; otherwise such a request is accepted and then refused at admission with a message
      * about blocks. Only full paged groups apply: a window group costs the window, and a linear
-     * group is O(1) in context. */
+     * group is O(1) in context. A runtime-window (RAD_KV_RING) group is not checked here either:
+     * it is sized for the whole context plus one ring a sequence and its tokens are a per-sequence
+     * reference rather than the pool's capacity, so the comparison would be about the wrong
+     * number. */
     {
         const int64_t want = cfg_.max_ctx ? cfg_.max_ctx : meta_.n_ctx_train;
         const KVManager& kv = ranks_[0]->kv;
         for (int32_t g = 0; g < kv.n_groups(); ++g) {
             const KVGroupPlan* p = kv.plan(g);
-            if (!p || !p->paged() || p->window_blocks > 0) continue;
+            if (!p || !p->paged() || p->window_blocks > 0 || p->runtime_win) continue;
             const int64_t cap = p->n_blocks * p->block_size;
             if (cap >= want) continue;
             /* A hard limit, unlike the backing ratio (how much of every-sequence-at-max_ctx the
@@ -3368,16 +3405,18 @@ int Engine::start() {
     (void)rad_dev_set(ranks_[0]->device);
 
     /* The most the cache can hold: the whole carve, including lent blocks (a request reclaims them
-     * in the same step). Tokens are the smallest over the full paged groups; a windowed group
-     * bounds history, not capacity. /stats and /metrics report the same numbers (kv_tokens_max,
-     * radiance:kv_cache_max_tokens). */
+     * in the same step). Tokens are the smallest over the full paged groups; a fixed-window group
+     * bounds history, not capacity. A runtime-window (RAD_KV_RING) group does hold its sequences'
+     * references, so it counts like a full group. /stats and /metrics report the same numbers
+     * (kv_tokens_max, radiance:kv_cache_max_tokens). */
     {
         const KVManager& kv = ranks_[0]->kv;
         int64_t bytes = 0, state = 0, tokens = 0;
         for (const KVGroupPlan& p : kv.plans()) {
             bytes += kv.pool_bytes_carved(p.index);
             if (p.stateful()) state += kv.pool_bytes_carved(p.index);
-            if (!p.paged() || p.kind == RAD_KV_WINDOW || p.block_size <= 0) continue;
+            if (!p.paged() || (p.kind == RAD_KV_WINDOW && !p.runtime_win) || p.block_size <= 0)
+                continue;
             const int64_t t = p.n_blocks * p.block_size;
             if (tokens == 0 || t < tokens) tokens = t;
         }

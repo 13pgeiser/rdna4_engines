@@ -40,6 +40,49 @@ static bool meta_bool(const RadModelMeta& m, const char* key, bool dflt) {
 }
 
 int VisionConfig::from_meta(const RadModelMeta& m, std::string* why) {
+    /* Unlimited-OCR: one processor class, two modes, both stated in preprocessor_config.json and
+     * processor_config.json (`processor.*`). Every key has the reference's default, so a container
+     * converted before the tower landed still states a processor. */
+    if (!std::strcmp(rad_meta_gets(&m, "model_type", ""), "unlimited_ocr")) {
+        family = Family::UnlimitedOcr;
+        patch      = (int32_t)rad_meta_geti(&m, "processor.patch_size",
+                                            rad_meta_geti(&m, "vision_config.patch_size", 16));
+        downsample = (int32_t)rad_meta_geti(&m, "processor.downsample_ratio", 4);
+        merge      = downsample;
+        temporal   = 1;
+        base_size  = (int32_t)rad_meta_geti(&m, "preprocessor.size.height", 1024);
+        tile       = (int32_t)rad_meta_geti(&m, "preprocessor.tile_size", 640);
+        /* The base mode's whole view: what the reference states for its input, and what the
+         * preprocessor's `size` is. Multi-page inference may ask for the tile instead. */
+        image_size = (int32_t)rad_meta_geti(&m, "preprocessor.size.width", base_size);
+        crop_mode  = meta_bool(m, "preprocessor.crop_to_patches", true);
+        if (const char* t = rad_meta_gets(&m, "processor.image_token", nullptr); t && *t)
+            image_token = t;
+        min_tiles  = (int32_t)rad_meta_geti(&m, "preprocessor.min_patches", 2);
+        max_tiles  = (int32_t)rad_meta_geti(&m, "preprocessor.max_patches", 32);
+        tok_image  = (int32_t)rad_meta_geti(&m, "image_token_id", -1);
+        if (!read_triple(m, "preprocessor.image_mean", mean)) mean[0] = mean[1] = mean[2] = 0.5f;
+        if (!read_triple(m, "preprocessor.image_std", stdv)) stdv[0] = stdv[1] = stdv[2] = 0.5f;
+        /* 3 is PIL's bicubic, the only filter this processor stages. */
+        const int64_t resample = rad_meta_geti(&m, "preprocessor.resample", 3);
+        if (resample != 3) {
+            if (why) *why = "the container resamples pictures with filter " +
+                            std::to_string(resample) + "; this processor stages PIL's bicubic (3)";
+            return RAD_E_UNSUPPORTED;
+        }
+        /* No video; the bands only have to be consistent for check(). */
+        const int64_t f2 = (int64_t)factor() * factor();
+        image_min_pixels = video_min_pixels = f2;
+        image_max_pixels = video_max_pixels = (int64_t)base_size * base_size;
+        min_frames       = 1;
+        std::string bad;
+        if (check(&bad) < 0) {
+            if (why) *why = "the container's Unlimited-OCR processor configuration is "
+                            "inconsistent: " + bad;
+            return RAD_E_INVAL;
+        }
+        return RAD_OK;
+    }
     /* LFM2-VL states its processor twice, in config.json and in processor_config.json's
      * image_processor; the latter is what the reference processor reads, so it goes first. */
     if (!std::strcmp(rad_meta_gets(&m, "model_type", ""), "lfm2_vl")) {
@@ -199,6 +242,20 @@ int VisionConfig::check(std::string* why) const {
                       ") is not a range of whole merged patches");
         if (!(max_pixels_tolerance > 0.0) || max_segment_patches <= 0)
             return no("max_pixels_tolerance and max_num_patches must be positive");
+    }
+    if (family == Family::UnlimitedOcr) {
+        if (patch <= 0 || downsample <= 0 || merge != downsample)
+            return no("the tower's geometry (patch_size " + std::to_string(patch) +
+                      ", downsample_ratio " + std::to_string(downsample) +
+                      ") does not cut a whole merged patch");
+        if (base_size <= 0 || base_size % factor() || image_size <= 0 || image_size % factor())
+            return no("the global view's side (" + std::to_string(base_size) + " and " +
+                      std::to_string(image_size) + " pixels) is not a whole number of merged "
+                      "patches");
+        if (min_tiles < 1 || max_tiles < min_tiles || tile <= 0 || tile % factor())
+            return no("the tiling (min_patches " + std::to_string(min_tiles) + ", max_patches " +
+                      std::to_string(max_tiles) + ", tile_size " + std::to_string(tile) +
+                      ") is not a range of whole merged patches");
     }
     if (family == Family::Gemma4) {
         if (!soft_budget_ok(image_soft_tokens))
@@ -425,69 +482,95 @@ int coeffs(int32_t in_size, int32_t out_size, std::vector<int32_t>* bounds,
 
 }  /* namespace */
 
+/* One pass over an axis. `horizontal` reads rows [y0, y0 + rows) of `src` and writes w columns;
+ * `vertical` reads rows from `shift` on and writes h rows. Both accumulate in fixed point and
+ * round each output to eight bits, as Pillow does -- the intermediate's rounding is part of the
+ * function. */
+static void pass_horizontal(const Frame& src, int32_t y0, int32_t rows, int32_t w,
+                            const std::vector<int32_t>& bh, const std::vector<int32_t>& kh,
+                            int32_t ksh, int prec, Frame* out) {
+    out->w = w;
+    out->h = rows;
+    out->rgb.assign((size_t)w * (size_t)rows * 3, 0);
+    for (int32_t yy = 0; yy < rows; ++yy) {
+        const uint8_t* row = src.rgb.data() + (size_t)(yy + y0) * (size_t)src.w * 3;
+        uint8_t* o = out->rgb.data() + (size_t)yy * (size_t)w * 3;
+        for (int32_t xx = 0; xx < w; ++xx) {
+            const int32_t xmin = bh[(size_t)xx * 2], xmax = bh[(size_t)xx * 2 + 1];
+            const int32_t* k = kh.data() + (size_t)xx * (size_t)ksh;
+            int32_t s0 = 1 << (prec - 1), s1 = s0, s2 = s0;
+            for (int32_t x = 0; x < xmax; ++x) {
+                const uint8_t* p = row + (size_t)(x + xmin) * 3;
+                s0 += p[0] * k[x];
+                s1 += p[1] * k[x];
+                s2 += p[2] * k[x];
+            }
+            o[xx * 3 + 0] = clip8(s0, prec);
+            o[xx * 3 + 1] = clip8(s1, prec);
+            o[xx * 3 + 2] = clip8(s2, prec);
+        }
+    }
+}
+
+static void pass_vertical(const Frame& src, int32_t shift, int32_t h,
+                          const std::vector<int32_t>& bv, const std::vector<int32_t>& kv,
+                          int32_t ksv, int prec, Frame* out) {
+    out->w = src.w;
+    out->h = h;
+    out->rgb.assign((size_t)src.w * (size_t)h * 3, 0);
+    for (int32_t yy = 0; yy < h; ++yy) {
+        const int32_t ymin = bv[(size_t)yy * 2] - shift, ymax = bv[(size_t)yy * 2 + 1];
+        const int32_t* k = kv.data() + (size_t)yy * (size_t)ksv;
+        uint8_t* o = out->rgb.data() + (size_t)yy * (size_t)src.w * 3;
+        for (int32_t xx = 0; xx < src.w; ++xx) {
+            int32_t s0 = 1 << (prec - 1), s1 = s0, s2 = s0;
+            for (int32_t y = 0; y < ymax; ++y) {
+                const uint8_t* p = src.rgb.data() + ((size_t)(y + ymin) * (size_t)src.w + xx) * 3;
+                s0 += p[0] * k[y];
+                s1 += p[1] * k[y];
+                s2 += p[2] * k[y];
+            }
+            o[xx * 3 + 0] = clip8(s0, prec);
+            o[xx * 3 + 1] = clip8(s1, prec);
+            o[xx * 3 + 2] = clip8(s2, prec);
+        }
+    }
+}
+
 static void resize_bicubic_impl(const Frame& in, int32_t w, int32_t h, Frame* out, bool torch) {
     if (in.w == w && in.h == h) { *out = in; return; }
     std::vector<int32_t> bh, kh, bv, kv;
     int ph = kPrec, pv = kPrec;
     const int ksh = coeffs(in.w, w, &bh, &kh, torch, &ph);
     const int ksv = coeffs(in.h, h, &bv, &kv, torch, &pv);
+    const bool need_h = w != in.w, need_v = h != in.h;
 
-    /* The source rows the vertical pass reads, which is all the horizontal pass has to produce. */
-    const int y_first = bv[0];
-    const int y_last = bv[(size_t)h * 2 - 2] + bv[(size_t)h * 2 - 1];
-    const bool need_h = w != in.w;
-    const bool need_v = h != in.h;
+    /* Pillow's pass order (libImaging/Resample.c): vertical first when the height shrinks and by
+     * more than twice what the width does, so the horizontal pass runs over fewer rows. The
+     * intermediate is eight bits, so the order changes the picture: both are the reference's.
+     * torchvision's on a uint8 tensor (ATen's CPU kernel) is horizontal first at every size. */
+    const bool horizontal_first =
+        torch || !((int64_t)in.h - h > 0 && (int64_t)in.h - h > 2 * ((int64_t)in.w - w));
 
     Frame tmp;
-    const Frame* src = &in;
+    if (need_h && need_v) {
+        if (horizontal_first) {
+            /* Only the source rows the vertical pass reads are resampled horizontally. */
+            const int32_t y0 = bv[0];
+            const int32_t rows = bv[(size_t)h * 2 - 2] + bv[(size_t)h * 2 - 1] - y0;
+            pass_horizontal(in, y0, rows, w, bh, kh, ksh, ph, &tmp);
+            pass_vertical(tmp, y0, h, bv, kv, ksv, pv, out);
+        } else {
+            pass_vertical(in, 0, h, bv, kv, ksv, pv, &tmp);
+            pass_horizontal(tmp, 0, h, w, bh, kh, ksh, ph, out);
+        }
+        return;
+    }
     if (need_h) {
-        const int rows = need_v ? y_last - y_first : in.h;
-        const int y0 = need_v ? y_first : 0;
-        tmp.w = w;
-        tmp.h = rows;
-        tmp.rgb.assign((size_t)w * rows * 3, 0);
-        for (int yy = 0; yy < rows; ++yy) {
-            const uint8_t* row = in.rgb.data() + (size_t)(yy + y0) * in.w * 3;
-            uint8_t* o = tmp.rgb.data() + (size_t)yy * w * 3;
-            for (int xx = 0; xx < w; ++xx) {
-                const int xmin = bh[(size_t)xx * 2], xmax = bh[(size_t)xx * 2 + 1];
-                const int32_t* k = kh.data() + (size_t)xx * ksh;
-                int32_t s0 = 1 << (ph - 1), s1 = s0, s2 = s0;
-                for (int x = 0; x < xmax; ++x) {
-                    const uint8_t* p = row + (size_t)(x + xmin) * 3;
-                    s0 += p[0] * k[x];
-                    s1 += p[1] * k[x];
-                    s2 += p[2] * k[x];
-                }
-                o[xx * 3 + 0] = clip8(s0, ph);
-                o[xx * 3 + 1] = clip8(s1, ph);
-                o[xx * 3 + 2] = clip8(s2, ph);
-            }
-        }
-        src = &tmp;
+        pass_horizontal(in, 0, in.h, w, bh, kh, ksh, ph, out);
+        return;
     }
-    if (!need_v) { *out = std::move(tmp); return; }
-    const int shift = need_h ? y_first : 0;
-    out->w = src->w;
-    out->h = h;
-    out->rgb.assign((size_t)src->w * h * 3, 0);
-    for (int yy = 0; yy < h; ++yy) {
-        const int ymin = bv[(size_t)yy * 2] - shift, ymax = bv[(size_t)yy * 2 + 1];
-        const int32_t* k = kv.data() + (size_t)yy * ksv;
-        uint8_t* o = out->rgb.data() + (size_t)yy * src->w * 3;
-        for (int xx = 0; xx < src->w; ++xx) {
-            int32_t s0 = 1 << (pv - 1), s1 = s0, s2 = s0;
-            for (int y = 0; y < ymax; ++y) {
-                const uint8_t* p = src->rgb.data() + ((size_t)(y + ymin) * src->w + xx) * 3;
-                s0 += p[0] * k[y];
-                s1 += p[1] * k[y];
-                s2 += p[2] * k[y];
-            }
-            o[xx * 3 + 0] = clip8(s0, pv);
-            o[xx * 3 + 1] = clip8(s1, pv);
-            o[xx * 3 + 2] = clip8(s2, pv);
-        }
-    }
+    pass_vertical(in, 0, h, bv, kv, ksv, pv, out);
 }
 
 void resize_bicubic(const Frame& in, int32_t w, int32_t h, Frame* out) {
@@ -678,6 +761,19 @@ int Processor::init(const VisionConfig& cfg,
         encode_text_ = std::move(encode_text);
         return RAD_OK;
     }
+    if (cfg.family == Family::UnlimitedOcr) {
+        /* The vocabulary spells the marker (`processor.image_token`), and every placeholder of a
+         * picture is that same id: there is nothing else to resolve. */
+        if (!token_id) return RAD_E_INVAL;
+        if (cfg_.tok_image < 0) cfg_.tok_image = token_id(cfg_.image_token);
+        if (cfg_.tok_image < 0) return RAD_E_NOTFOUND;
+        /* A tile's line and the global view are each one segment, so each must fit one pass. */
+        const int64_t q = cfg.tile / cfg.patch;
+        const int64_t g = std::max(cfg.base_size, cfg.image_size) / cfg.patch;
+        if (q * (q + 4) > cfg.max_patches || g * (g + 4) > cfg.max_patches) return RAD_E_INVAL;
+        encode_text_ = std::move(encode_text);
+        return RAD_OK;
+    }
     /* The largest image one encoder pass takes, in pixels. Lowering the band's ceiling to it makes
      * smart_resize keep every image inside a pass. */
     const int64_t pass_px = cfg.max_patches * cfg.patch * cfg.patch;
@@ -725,6 +821,55 @@ void lfm2_grid(int64_t h, int64_t w, int32_t min_tiles, int32_t max_tiles, int32
                 *cols = c; *rows = r;
             }
         }
+}
+
+/* Unlimited-OCR's ratios of one tile count tie only when they are each other's transpose: two
+ * ratios of the same count are equally near an aspect only if one mirrors the other about it. So
+ * the reference's set order matters for exactly the (c, r) pairs below, the tall ones (c < r)
+ * its `sorted(set(...), key=area)` visits after their wide transpose -- the order CPython's set
+ * has for the 2..32-tile range the checkpoint states. It comes from the reference itself
+ * (tests/mkuocrgolden.py dumps it); outside that range the wide side is taken as last. */
+bool uocr_tall_last(int32_t c, int32_t r) {
+    static const int8_t kTallLast[][2] = {
+        {1, 3},  {1, 4},  {1, 5},  {1, 6},  {1, 7},  {1, 9},  {1, 13}, {1, 14},
+        {1, 16}, {1, 18}, {1, 20}, {1, 22}, {1, 27}, {1, 29}, {2, 3},  {2, 4},
+        {2, 5},  {2, 6},  {2, 7},  {2, 8},  {2, 9},  {2, 14}, {2, 15}, {2, 16},
+        {3, 5},  {3, 7},  {3, 9},  {4, 5},  {4, 6},  {4, 7},  {4, 8},
+    };
+    for (const auto& p : kTallLast)
+        if (p[0] == c && p[1] == r) return true;
+    return false;
+}
+
+void uocr_grid(int64_t h, int64_t w, int32_t min_tiles, int32_t max_tiles, int32_t tile,
+               int32_t* cols, int32_t* rows) {
+    *cols = *rows = 1;
+    if (h <= 0 || w <= 0 || min_tiles < 1 || max_tiles < min_tiles) return;
+    const double aspect = (double)w / (double)h;
+    const double area = (double)w * (double)h;
+    const double half = 0.5 * (double)tile * (double)tile;
+    double best = INFINITY;
+    for (int32_t n = min_tiles; n <= max_tiles; ++n) {
+        int32_t deferred[8];      /* the transposed ratios the reference visits last */
+        int32_t n_deferred = 0;
+        auto visit = [&](int32_t c, int32_t r) {
+            const double diff = std::fabs(aspect - (double)c / (double)r);
+            if (diff < best) {
+                best = diff; *cols = c; *rows = r;
+            } else if (diff == best && area > half * (double)n) {
+                *cols = c; *rows = r;
+            }
+        };
+        for (int32_t c = 1; c <= n; ++c) {
+            if (n % c) continue;
+            if (c < n / c && uocr_tall_last(c, n / c)) {
+                if (n_deferred < 8) deferred[n_deferred++] = c;
+                continue;
+            }
+            visit(c, n / c);
+        }
+        for (int32_t k = 0; k < n_deferred; ++k) visit(deferred[k], n / deferred[k]);
+    }
 }
 
 /* LFM2-VL's image processor (transformers' Lfm2VlImageProcessor), segment by segment: the tiles
@@ -804,10 +949,224 @@ int Processor::image_lfm2(const Frame& f, std::shared_ptr<Item>* out, std::strin
     return RAD_OK;
 }
 
-int Processor::image_from(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const {
+int uocr_mode(const VisionConfig& c, const ImageMode& mode, bool* crop, int32_t* base_size,
+              int32_t* image_size, std::string* why) {
+    auto no = [why](const std::string& w) {
+        if (why) *why = w;
+        return RAD_E_INVAL;
+    };
+    if (c.family != Family::UnlimitedOcr) return no("this model has one picture mode, not two");
+    const int32_t F = c.factor();
+    const bool cr = mode.kind == ImageMode::Base   ? false
+                  : mode.kind == ImageMode::Gundam ? true
+                                                    : c.crop_mode;
+    const int32_t bs = mode.base_size > 0 ? mode.base_size : c.base_size;
+    const int32_t is = mode.image_size > 0 ? mode.image_size : c.image_size;
+    if (cr) {
+        /* The crops are the tile the checkpoint was trained at; the reference's image_size is
+         * that same number, so a request may only restate it. */
+        if (bs % F)
+            return no("base_size " + std::to_string(bs) + " is not a whole number of merged "
+                      "patches (" + std::to_string(F) + ")");
+        if (bs < 4 * F)
+            return no("base_size " + std::to_string(bs) + " is under two output rows");
+        if (mode.image_size > 0 && mode.image_size != c.tile)
+            return no("crop mode cuts pictures into " + std::to_string(c.tile) + "-pixel tiles; "
+                      "image_size " + std::to_string(mode.image_size) + " is not one");
+        *crop = true; *base_size = bs; *image_size = c.tile;
+        return RAD_OK;
+    }
+    if (is % F)
+        return no("image_size " + std::to_string(is) + " is not a whole number of merged patches "
+                  "(" + std::to_string(F) + ")");
+    if (is < 4 * F) return no("image_size " + std::to_string(is) + " is under two output rows");
+    if (mode.base_size > 0 && mode.base_size != bs)
+        return no("the base mode pads a page to image_size, not base_size");
+    *crop = false; *base_size = bs; *image_size = is;
+    return RAD_OK;
+}
+
+int64_t uocr_tokens(const VisionConfig& c, const ImageMode& mode, int32_t cols, int32_t rows) {
+    bool crop = false;
+    int32_t bs = 0, is = 0;
+    if (uocr_mode(c, mode, &crop, &bs, &is, nullptr) < 0) return -1;
+    const int32_t P = c.patch, D = c.downsample;
+    /* The global view: `g` lines of `g` features, each followed by a newline, then the view
+     * separator (`[tok] * g + [tok]) * g + [tok]`). */
+    const int32_t g = (crop ? bs : is) / P / D;
+    int64_t t = (int64_t)(g + 1) * g + 1;
+    /* The local views, when the picture is tiled: one line per feature row holding every tile's
+     * row, a newline after it (`[tok] * q * cols + [tok]) * q * rows`). */
+    if (crop && (int64_t)cols * rows > 1) {
+        const int32_t q = c.tile / P / D;
+        t += (int64_t)(q * cols + 1) * q * rows;
+    }
+    return t;
+}
+
+void pad_bicubic(const Frame& in, int32_t w, int32_t h, uint8_t fill, Frame* out) {
+    /* ImageOps.pad: contain() fits the picture inside w x h at its own aspect (PIL's bicubic,
+     * rounded as its round() does), then it is pasted centred on `fill`. */
+    int32_t nw = w, nh = h;
+    if (in.w > 0 && in.h > 0) {
+        const double im_ratio = (double)in.w / (double)in.h;
+        const double dst_ratio = (double)w / (double)h;
+        if (im_ratio != dst_ratio) {
+            if (im_ratio > dst_ratio) {
+                nh = (int32_t)pyround((double)in.h / (double)in.w * (double)w);
+                if (nh == 0) nh = 1;
+            } else {
+                nw = (int32_t)pyround((double)in.w / (double)in.h * (double)h);
+                if (nw == 0) nw = 1;
+            }
+        }
+    }
+    const Frame* src = &in;
+    Frame fitted;
+    if (nw != in.w || nh != in.h) {
+        resize_bicubic(in, nw, nh, &fitted);
+        src = &fitted;
+    }
+    out->w = w;
+    out->h = h;
+    out->rgb.assign((size_t)w * (size_t)h * 3, fill);
+    const int32_t x = nw != w ? (int32_t)pyround((double)(w - nw) * 0.5) : 0;
+    const int32_t y = nw != w ? 0 : (int32_t)pyround((double)(h - nh) * 0.5);
+    for (int32_t yy = 0; yy < src->h; ++yy)
+        std::memcpy(out->rgb.data() + ((size_t)(y + yy) * (size_t)w + (size_t)x) * 3,
+                    src->rgb.data() + (size_t)yy * (size_t)src->w * 3, (size_t)src->w * 3);
+}
+
+/* Unlimited-OCR's picture processor, the reference's infer() and infer_multi() exactly: the
+ * global view is the picture ImageOps.pad-ed to base_size (in the base mode, to image_size,
+ * squared first when that side is a tile or less), and in the gundam mode a picture larger than a
+ * tile is cut the way dynamic_preprocess cuts it. Each view is staged as its feature grid plus
+ * `downsample` patch columns nothing is read from, because the reference's layout puts a newline
+ * after every line of features: one output row per downsample x downsample patches, and the last
+ * column's rows are where those newlines go. The segments are, in the reference's order, the
+ * local grid's lines (one per tile row; a line wider than a pass is cut into chunks of whole
+ * tiles, its last chunk carrying the newline column), then the global view's grid, then the view
+ * separator's single row. */
+int Processor::image_unlimitedocr(const Frame& f, const ImageMode& mode,
+                                  std::shared_ptr<Item>* out, std::string* why) const {
     const VisionConfig& c = cfg_;
+    const int32_t P = c.patch, M = c.merge;
+    bool crop = false;
+    int32_t base_size = 0, image_size = 0;
+    RAD_TRY(uocr_mode(c, mode, &crop, &base_size, &image_size, why));
+    if (f.w <= 0 || f.h <= 0) {
+        if (why) *why = "the picture has no size";
+        return RAD_E_INVAL;
+    }
+    const int32_t q = c.tile / P;                  /* a tile's patch rows */
+    int32_t cols = 1, rows = 1;
+    const bool tiled = crop && (f.w > c.tile || f.h > c.tile);
+    if (tiled) uocr_grid(f.h, f.w, c.min_tiles, c.max_tiles, c.tile, &cols, &rows);
+
+    /* The global view. The base mode squares a page of a tile or less before padding it, as the
+     * reference's multi-page path does. */
+    Frame global;
+    if (crop) {
+        pad_bicubic(f, base_size, base_size, 127, &global);
+    } else if (image_size <= c.tile) {
+        Frame sq;
+        resize_bicubic(f, image_size, image_size, &sq);
+        pad_bicubic(sq, image_size, image_size, 127, &global);
+    } else {
+        pad_bicubic(f, image_size, image_size, 127, &global);
+    }
+    const int32_t g = (crop ? base_size : image_size) / P;
+    if ((int64_t)g * (g + 4) > c.max_patches) {
+        if (why) *why = "the global view's " + std::to_string((long long)g * (g + 4)) +
+                        " patches are more than one encoder pass holds (" +
+                        std::to_string(c.max_patches) + ")";
+        return RAD_E_INVAL;
+    }
+
+    /* ToTensor then Normalize, in f32: (u / 255 - mean) / std, rounded to bf16. */
+    uint16_t lut[3][256];
+    for (int ch = 0; ch < 3; ++ch)
+        for (int v = 0; v < 256; ++v) {
+            const float p = (float)v / 255.0f;
+            lut[ch][v] = rad_f32_to_bf16((p - c.mean[ch]) / c.stdv[ch]);
+        }
+
+    auto it = std::make_shared<Item>();
+    it->kind = Kind::Image;
+    it->patch_dim = c.patch_dim();
+    it->rope_1d = true;
+    it->patch_raster = true;
+    int64_t seg_row = 0;
+    /* One segment of `gh` x `gw` patches from (x0, y0) of `src`, of which the first `real_w`
+     * patches a row carry pixels; the rest are the newline column. */
+    auto append = [&](const Frame& src, int32_t x0, int32_t y0, int32_t gh, int32_t gw,
+                      int32_t real_w) {
+        it->segments.push_back({ gh, gw, it->n_patch });
+        it->seg_at.push_back((int32_t)seg_row);
+        it->expand.insert(it->expand.end(), (size_t)(gh / M) * (size_t)(gw / M), c.tok_image);
+        seg_row += (int64_t)(gh / M) * (gw / M);
+        it->n_patch += (int64_t)gh * gw;
+        const size_t at = it->pixels.size();
+        it->pixels.resize(at + (size_t)gh * (size_t)gw * (size_t)it->patch_dim, 0);
+        uint16_t* dst = it->pixels.data() + at;
+        for (int32_t py = 0; py < gh; ++py)
+            for (int32_t px = 0; px < real_w; ++px) {
+                uint16_t* pp = dst + ((size_t)py * (size_t)gw + (size_t)px) * (size_t)it->patch_dim;
+                const int32_t py0 = y0 + py * P, px0 = x0 + px * P;
+                for (int ch = 0; ch < 3; ++ch)
+                    for (int y = 0; y < P; ++y) {
+                        const uint8_t* row = src.rgb.data() +
+                            ((size_t)(py0 + y) * (size_t)src.w + (size_t)px0) * 3 + (size_t)ch;
+                        for (int x = 0; x < P; ++x) *pp++ = lut[ch][row[x * 3]];
+                    }
+            }
+    };
+
+    if (tiled) {
+        Frame big;
+        resize_bicubic(f, cols * c.tile, rows * c.tile, &big);
+        /* A chunk of a line must fit one pass: q rows of q patches a tile, plus the newline
+         * column its last chunk holds. */
+        int64_t per_row = c.max_patches / q;
+        const int64_t chunk = per_row > 4 ? (per_row - 4) / q : 0;
+        if (chunk < 1) {
+            if (why) *why = "one encoder pass holds no line of " + std::to_string(q) +
+                            "-patch tiles (" + std::to_string(c.max_patches) + " patches)";
+            return RAD_E_INVAL;
+        }
+        for (int32_t r = 0; r < rows; ++r)
+            for (int32_t c0 = 0; c0 < cols; c0 += (int32_t)chunk) {
+                const int32_t n = std::min<int32_t>((int32_t)chunk, cols - c0);
+                const bool last = c0 + n == cols;
+                append(big, c0 * c.tile, r * c.tile, q, q * n + (last ? 4 : 0), q * n);
+            }
+    }
+    append(global, 0, 0, g, g + 4, g);
+    /* The view separator: one output row, from a grid of exactly one merged cell and no pixels. */
+    append(global, 0, 0, M, M, 0);
+
+    it->n_seg = (int32_t)it->segments.size();
+    it->grid_t = 1;
+    it->grid_h = it->segments[0].h;
+    it->grid_w = it->segments[0].w;
+    it->rows_h = it->grid_h / M;
+    it->rows_w = it->grid_w / M;
+    it->seg_rows = it->rows_h * it->rows_w;
+    content_key(*it, &it->key_hi, &it->key_lo);
+    *out = std::move(it);
+    return RAD_OK;
+}
+
+int Processor::image_from(const Frame& f, std::shared_ptr<Item>* out, std::string* why,
+                          const ImageMode& mode) const {
+    const VisionConfig& c = cfg_;
+    if (mode.kind != ImageMode::Default && c.family != Family::UnlimitedOcr) {
+        if (why) *why = "this model has one picture mode; images_config names one of two";
+        return RAD_E_UNSUPPORTED;
+    }
     if (c.family == Family::Gemma4) return image_gemma4(f, c.image_soft_tokens, out, why);
     if (c.family == Family::Lfm2) return image_lfm2(f, out, why);
+    if (c.family == Family::UnlimitedOcr) return image_unlimitedocr(f, mode, out, why);
     int64_t h = 0, w = 0;
     RAD_TRY(smart_resize_image(f.h, f.w, c.factor(), c.image_min_pixels, c.image_max_pixels,
                                &h, &w, why));
@@ -979,7 +1338,12 @@ int Processor::video_from(const Video& v, std::shared_ptr<Item>* out, std::strin
 }
 
 int Processor::image(const uint8_t* bytes, size_t n, int32_t image_tokens,
-                     std::shared_ptr<Item>* out, std::string* why, int64_t max_pixels) const {
+                     std::shared_ptr<Item>* out, std::string* why, int64_t max_pixels,
+                     const ImageMode& mode) const {
+    if (mode.kind != ImageMode::Default && cfg_.family != Family::UnlimitedOcr) {
+        if (why) *why = "this model has one picture mode; images_config names one of two";
+        return RAD_E_UNSUPPORTED;
+    }
     if (image_tokens != 0) {
         if (cfg_.family != Family::Gemma4) {
             if (why) *why = "this model's processor sizes an image by its pixels, not by a token "
@@ -1003,7 +1367,7 @@ int Processor::image(const uint8_t* bytes, size_t n, int32_t image_tokens,
     }
     if (cfg_.family == Family::Gemma4)
         return image_gemma4(f, image_tokens ? image_tokens : cfg_.image_soft_tokens, out, why);
-    return image_from(f, out, why);
+    return image_from(f, out, why, mode);
 }
 
 namespace {

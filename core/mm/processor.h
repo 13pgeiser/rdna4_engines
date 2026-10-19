@@ -55,8 +55,20 @@ enum class Kind { Image, Video, Audio };
  *           is cut into tile x tile crops, min_tiles..max_tiles of them in the ratio nearest its
  *           own, followed by the whole picture at the budgeted size as a thumbnail. Patches
  *           (y, x, channel) normalised by the mean and deviation, resized with torchvision's
- *           fixed-point bicubic; images only, and the tokens rotate at their positions. */
-enum class Family { QwenVL, Gemma4, Lfm2 };
+ *           fixed-point bicubic; images only, and the tokens rotate at their positions.
+ *   UnlimitedOcr
+ *           Unlimited-OCR's DeepSeek-OCR shape, in the checkpoint's two modes (ImageMode): the
+ *           picture padded (ImageOps.pad) to base_size x base_size on a 127 grey as the global
+ *           view, and, in the gundam mode, a picture larger than one tile cut into min_tiles..
+ *           max_tiles tile x tile crops at the tile in the ratio nearest its own (its
+ *           dynamic_preprocess). The SAM neck downsamples by `downsample`, so patch * downsample
+ *           is one output row. A view's rows are laid out as the reference's feature grid plus a
+ *           column of newlines, which is why every segment carries `downsample` extra patch
+ *           columns that nothing is read from: patches are raster order (Item::patch_raster), one
+ *           patch (channel, y, x), each value (u / 255 - mean) / std in f32, rounded to bf16.
+ *           Every placeholder is one id (the picture marker itself); the tokens rotate at their
+ *           positions. */
+enum class Family { QwenVL, Gemma4, Lfm2, UnlimitedOcr };
 
 struct VisionConfig {
     Family  family = Family::QwenVL;
@@ -81,6 +93,17 @@ struct VisionConfig {
     double  max_pixels_tolerance = 0.0;
     int64_t max_segment_patches = 0;
 
+    /* UnlimitedOcr: the two modes' sizes, from the checkpoint's preprocessor config. The gundam
+     * mode pads the global view to `base_size` and cuts crops at `tile`; the base mode (a page of
+     * a multi-page document) pads the whole picture to `image_size`. `downsample` is the SAM
+     * neck's ratio: one output row is `patch * downsample` pixels a side. `crop_mode` is the
+     * deployment's mode when a request names none. */
+    int32_t base_size = 0, image_size = 0, downsample = 0;
+    bool    crop_mode = false;
+    /* The vocabulary's spelling of the picture marker (`processor.image_token`); every
+     * placeholder of a picture is that one id. */
+    std::string image_token = "<image>";
+
     /* Deployment bounds, not the checkpoint's. `max_patches` is the encoder's pass size: an image
      * is one segment and a segment is never split, so the image band's ceiling is lowered to fit
      * it. `max_source_pixels` bounds what the decoder may hold before any resize. */
@@ -100,6 +123,18 @@ struct VisionConfig {
     /* Read from the container; refuses one with no vision tower. Processor-only keys the
      * container omits take the family's defaults. */
     int from_meta(const RadModelMeta& m, std::string* why);
+};
+
+/* Which picture processor a request gets, for a checkpoint that has more than one: Unlimited-OCR
+ * states two modes and the reference names them gundam (one picture: the global view at base_size
+ * plus crops) and base (a page of a multi-page document: the global view only, at image_size).
+ * `Default` is the deployment's (`VisionConfig::crop_mode`); a request may pick either mode and,
+ * with it, the sizes the checkpoint states differently. `base_size` and `image_size` of 0 keep the
+ * mode's own. */
+struct ImageMode {
+    enum Kind : int32_t { Default = 0, Gundam = 1, Base = 2 };
+    int32_t kind = Default;
+    int32_t base_size = 0, image_size = 0;
 };
 
 /* The audio feature extractor family, from the container's audio_config.model_type. The
@@ -199,6 +234,9 @@ struct Item {
     /* The model rotates this item's tokens at their token positions (LFM2-VL's 1-D rotary), not
      * on the grid the Qwen-VL family's M-RoPE lays out (RopeLayout). */
     bool rope_1d = false;
+    /* Patches are in raster order (row by row), not merge-block order: the coordinate planes
+     * invert the one or the other (Unlimited-OCR's tower reads a picture patch by patch). */
+    bool patch_raster = false;
 
     int32_t seg_h(int32_t s) const { return segments.empty() ? grid_h : segments[(size_t)s].h; }
     int32_t seg_w(int32_t s) const { return segments.empty() ? grid_w : segments[(size_t)s].w; }
@@ -309,13 +347,15 @@ public:
 
     /* `image_tokens` is a Gemma 4 soft-token budget for this image (0: the configured one); a
      * processor that sizes images by pixels refuses a non-zero one. `max_pixels`, when set, first
-     * scales a larger picture down to that area with PIL's bicubic. */
+     * scales a larger picture down to that area with PIL's bicubic. `mode` picks one of the
+     * checkpoint's picture modes where it has more than one (Unlimited-OCR). */
     int image(const uint8_t* bytes, size_t n, int32_t image_tokens, std::shared_ptr<Item>* out,
-              std::string* why, int64_t max_pixels = 0) const;
+              std::string* why, int64_t max_pixels = 0, const ImageMode& mode = ImageMode{}) const;
     int video(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out, std::string* why) const;
 
     /* From an already-decoded picture or frame list; for tests. */
-    int image_from(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
+    int image_from(const Frame& f, std::shared_ptr<Item>* out, std::string* why,
+                   const ImageMode& mode = ImageMode{}) const;
     int video_from(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;
 
     /* Audio, when the program declares an audio encoder; `merge` and `max_frames` are the
@@ -332,6 +372,8 @@ private:
     int image_gemma4(const Frame& f, int32_t soft, std::shared_ptr<Item>* out,
                      std::string* why) const;
     int image_lfm2(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
+    int image_unlimitedocr(const Frame& f, const ImageMode& mode, std::shared_ptr<Item>* out,
+                           std::string* why) const;
     /* Lfm2's markers: <|img_thumbnail|>, and <|img_row_R_col_C|> at (R-1) * max_tiles + C-1. */
     int32_t              tok_thumbnail_ = -1;
     std::vector<int32_t> tok_tiles_;
@@ -388,6 +430,25 @@ void cap_area(const Frame& in, int64_t max_pixels, Frame* out);
  * aspect, the larger grid of two equally near when the picture fills over half of it. */
 void lfm2_grid(int64_t h, int64_t w, int32_t min_tiles, int32_t max_tiles, int32_t tile,
                int32_t* cols, int32_t* rows);
+/* Whether the reference's ratio set visits the tall side (c, r), c < r, of a transposed pair after
+ * the wide one: the only tie two ratios of one tile count can have. From the reference itself. */
+bool uocr_tall_last(int32_t c, int32_t r);
+/* Unlimited-OCR's tile grid (its dynamic_preprocess): the min..max-tile grid nearest the picture's
+ * aspect, the one whose area the picture covers over half of when two are equally near, exactly
+ * as the reference's set ordering resolves it. The reference calls it only for a picture larger
+ * than one tile; this answers for any size. */
+void uocr_grid(int64_t h, int64_t w, int32_t min_tiles, int32_t max_tiles, int32_t tile,
+               int32_t* cols, int32_t* rows);
+/* The placeholders a picture takes: the global view's rows plus its separator, and, when tiled,
+ * one line of `cols` tiles per feature row with a newline after it. `cols` * `rows` is the tile
+ * grid. */
+int64_t uocr_tokens(const VisionConfig& c, const ImageMode& mode, int32_t cols, int32_t rows);
+/* The mode `mode` resolves to for this deployment; RAD_E_INVAL names an unsupported size. */
+int uocr_mode(const VisionConfig& c, const ImageMode& mode, bool* crop, int32_t* base_size,
+              int32_t* image_size, std::string* why);
+/* PIL's ImageOps.pad: `in` fitted inside w x h keeping its aspect (its bicubic), centred on `fill`
+ * in the channels' order (127 127 127 for the reference's 0.5 mean). */
+void pad_bicubic(const Frame& in, int32_t w, int32_t h, uint8_t fill, Frame* out);
 
 }  /* namespace mm */
 }  /* namespace rad */

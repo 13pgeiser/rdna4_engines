@@ -240,6 +240,7 @@ const char* kAcceptedCommon[] = {
     "dry_sequence_breakers", "samplers",
     "grammar", "json_schema", "priority", "logprobs", "ignore_eos",
     "timings_per_token", "return_progress", "session_id", "n_probs",
+    "ngram_ban_n", "ngram_window",
 };
 
 const char* kAcceptedChat[] = {
@@ -249,6 +250,8 @@ const char* kAcceptedChat[] = {
     "thinking_token_budget", "thinking_budget", "thinking_budget_tokens",
     "reasoning_budget_tokens", "reasoning_format", "continue_final_message",
     "functions", "function_call",
+    /* Unlimited-OCR's picture modes: which of the checkpoint's two a request's pictures get. */
+    "images_config",
 };
 
 /* `preserved_tokens` is llama-server's: control tokens a raw completion's text keeps. On chat the
@@ -891,6 +894,64 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
     auto sid = b.find("session_id");
     if (sid != b.end() && sid->is_string()) r->session_label = session_label_of(sid->get<std::string>());
 
+    /* The windowed no-repeat-ngram ban (core/sample/sampler.h): `ngram_ban_n` is the banned
+     * n-gram's length and `ngram_window` how far back it looks; the checkpoint's own generation
+     * config asks for 35 and 128 (Unlimited-OCR). The reference spells them
+     * no_repeat_ngram_size and no_repeat_ngram_window_size; both are taken. */
+    i64 = r->sp.ngram_ban_n;
+    if (!get_any(b, { "ngram_ban_n", "no_repeat_ngram_size" }, &i64, nullptr, err))
+        return RAD_E_INVAL;
+    if (i64 < 0 || i64 > 256) {
+        *err = err_bad("ngram_ban_n", "must be in [0, 256]");
+        return RAD_E_INVAL;
+    }
+    r->sp.ngram_ban_n = (int)i64;
+    i64 = r->sp.ngram_window;
+    if (!get_any(b, { "ngram_window", "no_repeat_ngram_window_size" }, &i64, nullptr, err))
+        return RAD_E_INVAL;
+    if (i64 > 131072) {
+        *err = err_bad("ngram_window", "must be at most 131072 tokens of history; 0 or less "
+                                       "searches the whole sequence");
+        return RAD_E_INVAL;
+    }
+    r->sp.ngram_window = (int)i64;
+
+    /* `images_config`: Unlimited-OCR's two picture modes. A string names one ("gundam" for a
+     * single picture -- the global view plus crops --, "base" for a page of a multi-page
+     * document); an object carries the reference runner's own dict. */
+    auto ic = b.find("images_config");
+    if (ic != b.end() && !ic->is_null()) {
+        if (ic->is_string()) {
+            const std::string m = ic->get<std::string>();
+            if (m == "gundam") r->image_mode = 1;
+            else if (m == "base") r->image_mode = 2;
+            else if (!m.empty()) {
+                *err = err_bad("images_config", "expected \"gundam\" or \"base\", got \"" + m +
+                                                    "\"");
+                return RAD_E_INVAL;
+            }
+        } else if (ic->is_object()) {
+            const json& o = *ic;
+            int64_t bs = 0, is = 0;
+            if (!get_int(o, "base_size", &bs, err)) return RAD_E_INVAL;
+            if (!get_int(o, "image_size", &is, err)) return RAD_E_INVAL;
+            bool crop = true;
+            if (!get_bool(o, "crop_mode", &crop, err)) return RAD_E_INVAL;
+            if (bs < 0 || bs > 65536 || is < 0 || is > 65536) {
+                *err = err_bad("images_config", "base_size and image_size must be in [0, 65536]");
+                return RAD_E_INVAL;
+            }
+            r->image_mode = crop ? 1 : 2;
+            r->image_base_size = (int32_t)bs;
+            r->image_size = (int32_t)is;
+        } else {
+            *err = err_bad("images_config",
+                           "expected \"gundam\", \"base\", or an object with base_size, "
+                           "image_size and crop_mode");
+            return RAD_E_INVAL;
+        }
+    }
+
     RAD_TRY(apply_sampler_order(b, &r->sp, err));
 
     auto so = b.find("stream_options");
@@ -1472,6 +1533,16 @@ int tokenize_with_media(const std::string& rendered, const OaiDeps& d,
     out->text = rendered;
     auto pm = std::make_shared<mm::PromptMedia>();
     const std::string marker = RAD_MEDIA_MARKER;
+    /* The checkpoint's mode for a picture no request named: a request that carries several
+     * pictures is a multi-page document, which the reference processes page by page without
+     * crops (infer_multi); one picture is the page-with-crops mode (infer). */
+    size_t n_images = 0;
+    for (const auto& m : media) n_images += m.first == MediaKind::Image ? 1 : 0;
+    auto opts_for = [&](MediaKind k) {
+        MediaOpts mo = opts;
+        if (k == MediaKind::Image && mo.image_mode == 0 && n_images > 1) mo.image_mode = 2;
+        return mo;
+    };
     size_t pos = 0, mi = 0;
     for (;;) {
         size_t at = rendered.find(marker, pos);
@@ -1491,7 +1562,8 @@ int tokenize_with_media(const std::string& rendered, const OaiDeps& d,
         }
         std::shared_ptr<mm::Item> item;
         std::string why;
-        const int s = d.mm->prepare(media[mi].first, media[mi].second, opts, &item, &why);
+        const int s = d.mm->prepare(media[mi].first, media[mi].second, opts_for(media[mi].first),
+                                    &item, &why);
         if (s < 0 || !item) {
             *err = err_bad("messages[].content[]", "the media could not be used: " +
                                                        (why.empty() ? std::string(rad_strerror(s))
@@ -2058,7 +2130,25 @@ int parse_chat_request(const std::string& body, const OaiDeps& d, const OaiLimit
         p.tokens = d.tok->encode(rendered, false, /*parse_special=*/true);
         p.text = rendered;
     } else {
-        RAD_TRY(tokenize_with_media(rendered, d, media, MediaOpts{}, &p, err));
+        MediaOpts mo;
+        mo.image_mode = out->image_mode;
+        mo.image_base_size = out->image_base_size;
+        mo.image_size = out->image_size;
+        RAD_TRY(tokenize_with_media(rendered, d, media, mo, &p, err));
+    }
+    /* Not every template renders BOS: this checkpoint's is a bare concatenation of the parts, while
+     * its tokenizer states `add_bos_token: true` (and the reference's own `infer` prepends id 0).
+     * Add it only when the rendered prompt does not already start with it, so a template that does
+     * render it is untouched. A media run's placeholders shift by one with it. */
+    {
+        const ITokenizer::VocabInfo vi = d.tok->vocab_info();
+        if (vi.add_bos && vi.bos >= 0 && (p.tokens.empty() || p.tokens.front() != vi.bos)) {
+            p.tokens.insert(p.tokens.begin(), vi.bos);
+            if (p.media) {
+                for (auto& pl : p.media->items) pl.tok += 1;
+                p.media->layout();
+            }
+        }
     }
     if (p.tokens.empty()) {
         *err = err_bad("messages", "the rendered prompt tokenised to nothing");

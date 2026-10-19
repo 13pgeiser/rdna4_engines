@@ -375,6 +375,16 @@ static const RadParamSpec pAttnNa3d[] = { P_INT("M"), P_INT("head_dim"), P_INT("
                                           P_INT("kw"), P_STR("dtype"), P_F64O("scale") };
 static const RadOperandSpec oAttnNa3d[] = { OPD("q"), OPD("k"), OPD("v"), OPD("geom"), OUT("out") };
 
+/* The SAM tower's attention. `q`, `k` and `v` are the three column slices of one fused projection,
+ * so each is read at its own row pitch. The two rel_pos tables are weights: [2*L-1, head_dim] with
+ * L the window (or the grid for a global layer), resampled along dim 0 when a geometry needs it.
+ * `grid_h` x `grid_w` rows a segment, `window` 0 for a whole-segment tile. */
+static const RadParamSpec pSamAttn[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
+                                         P_INT("grid_h"), P_INT("grid_w"), P_INT("window"),
+                                         P_F64("scale"), P_STR("dtype") };
+static const RadOperandSpec oSamAttn[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"),
+                                           OUT("out"), WGT("rel_pos_h"), WGT("rel_pos_w") };
+
 /* `k_scale` and `v_scale` are the descales an fp8 cache is read back with, so a store divides by
  * them; optional because a bf16 cache has none. */
 static const RadParamSpec pKvStore[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head_kv"),
@@ -694,6 +704,9 @@ static const RadOperandSpec oPenalties[] = { INOUT("logits"), OPD("params"), OPD
  * is a whole DRY sequence breaker and never penalised. Absent, no token is exempt. */
 static const RadOperandSpec oDry[]       = { INOUT("logits"), OPD("params"), OPD("history"),
                                              OPD_O("breakers") };
+/* The windowed n-gram ban: penalties' operands plus a {n, window} pair a row. */
+static const RadOperandSpec oNgramBan[]  = { INOUT("logits"), OPD("params"), OPD("history"),
+                                             OPD("ngram") };
 static const RadOperandSpec oTemp[]      = { INOUT("logits"), OPD("params") };
 /* `bitmask` is [rows, ceil(n_vocab/32)] uint32, addressed by the row's mask_row -- which is -1 for
  * an unconstrained sequence, so the plane is shared and shorter than M. */
@@ -1308,6 +1321,14 @@ static const RadOpSchema kSchemas[] = {
 { "attn_na3d", ARR(pAttnNa3d), ARR(oAttnNa3d),
   "3-D neighborhood attention (NATTEN's na3d) over the voxels of geom = (T, H, W): a query sees the "
   "kt x kh x kw window centred on it, shifted inward at the border, each extent at most its axis." },
+{ "sam_attn", ARR(pSamAttn), ARR(oSamAttn),
+  "Unlimited-OCR's SAM tower attention: per cu segment of grid_h*grid_w rows in raster grid order, "
+  "pad to multiples of `window` with ZERO rows (window_partition, after norm1), cut into window x "
+  "window tiles and attend each tile to all of its rows; `window` 0 is one tile over the segment. "
+  "logits = scale*q.k + q.Rh[i_h,j_h] + q.Rw[i_w,j_w], dotted over the head's whole head_dim, "
+  "softmax in f32 over the tile's keys (pad keys included), out = sum p*v, written back in segment "
+  "row order with pad rows dropped. The tables are [2*L-1, head_dim], linearly resampled along "
+  "dim 0 when a geometry's axes need it (get_rel_pos)." },
 { "kv_store", ARR(pKvStore), ARR(oKvStore),
   "Writes k and v into the paged cache at slot_mapping; a negative slot is skipped. The cache is "
   "INOUT rather than the OUT docs/OPS.md draws, because the op touches only the mapped slots." },
@@ -1515,6 +1536,12 @@ static const RadOpSchema kSchemas[] = {
   "repeats capped at the row's dry_rep_limit. Only lengths at or above allowed_length count, and "
   "a token the optional `breakers` plane marks is never penalised. dry_penalty_last_n windows the "
   "TAIL of the history; 0 turns the stage off for the row. Columns are ids less vocab_off." },
+{ "sample_ngram_ban", ARR(pPenal), ARR(oNgramBan),
+  "The windowed no-repeat-ngram ban (Unlimited-OCR's SlidingWindowNoRepeatNgramProcessor): bans, "
+  "by setting -infinity, every token that would complete an n-gram the last `window` tokens of "
+  "the row's history already contain. `ngram` is one i32 {n, window} pair a row; the window "
+  "bounds the n-gram's START index, as in the reference, window <= 0 searches the whole span and "
+  "n 0 is off. Columns are ids less vocab_off." },
 { "sample_temp", ARR(pMVocab), ARR(oTemp),
   "logits /= temp, per row. temp <= 0 leaves the row untouched -- greedy decoding is "
   "sample_argmax, and a temperature of zero silently meaning something else is how a sampler "
@@ -2118,6 +2145,9 @@ SIMPLE("ref_attn_cross", "attn_cross", "attn",
        ref_attn_cross),
 SIMPLE("ref_attn_na3d", "attn_na3d", "attn", "3-D neighborhood attention over a volume", DT_FLOAT,
        ref_attn_na3d),
+SIMPLE("ref_sam_attn", "sam_attn", "attn",
+       "SAM tower attention: windowed tiles with decomposed relative position", DT_FLOAT,
+       ref_sam_attn),
 ROW("ref_kv_store", "kv_store", "attn", "scatter k and v into the paged cache", DT_ANY,
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
     nullptr, nullptr, ref_kv_store, nullptr),
@@ -2223,6 +2253,8 @@ SIMPLE("ref_sample_logprobs", "sample_logprobs", "sample", "the raw distribution
        DT_FLOAT, ref_sample_logprobs),
 SIMPLE("ref_sample_dry", "sample_dry", "sample", "DRY repetition-suffix penalty", DT_FLOAT,
        ref_sample_dry),
+SIMPLE("ref_sample_ngram_ban", "sample_ngram_ban", "sample",
+       "windowed no-repeat-ngram ban", DT_FLOAT, ref_sample_ngram_ban),
 SIMPLE("ref_sample_typical", "sample_typical", "sample", "locally typical narrowing in place",
        DT_FLOAT, ref_sample_typical),
 SIMPLE("ref_sample_xtc", "sample_xtc", "sample", "exclude-top-choices narrowing in place",

@@ -42,6 +42,7 @@
 #include "r4d_fp8_lm.h"
 #include "rad_encoding.h"
 #include "rad_philox.h"
+#include "rad_sample.h"
 #include "rad_yarn.h"
 
 #include <dlfcn.h>
@@ -18802,6 +18803,295 @@ static void sample_argmax_case(const Plugin& pl) {
        " agree=" + (agree ? "1" : "0"));
 }
 
+/* sample_ngram_ban, against a host port of the reference processor.
+ *
+ * The oracle is modeling_unlimitedocr.py:353-383's SlidingWindowNoRepeatNgramProcessor, restated
+ * here over int arrays: with the row's history s[0, hl) (oldest first),
+ *
+ *     search_start = max(0, hl - window)     (window <= 0: the whole span)
+ *     search_end   = hl - n + 1
+ *     prefix       = s[hl - n + 1, hl)       (empty at n == 1)
+ *
+ * and every n-gram whose first n-1 tokens equal the prefix bans the token after it. The window
+ * bounds the START, so an n-gram that spans the window boundary is searched, and repeated tokens
+ * make matches dense.
+ *
+ * Checked, over three vocabularies/shards and rows with n = 0 (off), 1 (empty prefix), 2, 3 and 5
+ * and windows short of, equal to and longer than the history plus the whole-span form, the (n,
+ * window) pair coming from its own i32 plane as the engine sends it:
+ *   a banned column is exactly -infinity and every other column is bit-identical to its input;
+ *   a token on another rank's shard (under `vocab_off`) is never written;
+ *   rows 2 and up repeat an earlier stretch, so the ban is exercised, and the totals are printed.
+ * The kernel does integer comparisons and stores one constant, so this is an equality check, not a
+ * tolerance. */
+
+/* The reference rule for one row: `banned` gets 1 for every global id `s` bans. */
+static void ngram_ban_ref(const int32_t* s, int64_t hl, int n, int window,
+                          std::vector<char>* banned) {
+    std::fill(banned->begin(), banned->end(), (char)0);
+    if (n <= 0 || hl < n) return;
+    const int64_t win = (window > 0 && window < hl) ? window : hl;
+    const int64_t start = hl - win, end = hl - n + 1;
+    if (end <= start) return;
+    const int64_t plen = n - 1, p0 = hl - plen;
+    for (int64_t idx = start; idx < end; ++idx) {
+        bool match = true;
+        for (int64_t j = 0; j < plen && match; ++j) match = s[idx + j] == s[p0 + j];
+        if (!match) continue;
+        const int32_t tok = s[idx + plen];
+        if (tok >= 0 && (size_t)tok < banned->size()) (*banned)[(size_t)tok] = 1;
+    }
+}
+
+static void sample_ngram_ban_case(const Plugin& pl) {
+    const char* what = "sample_ngram_ban vs the reference processor, banned columns exact";
+    const RadKernelInfo* r = find(pl, "sample_ngram_ban_f32");
+    if (!r) { ok(what, false, "row absent"); return; }
+
+    /* Six rows over one 96-token history each. Eight ids spread over the vocabulary (a multiple of
+     * 7), so n-grams repeat and the banned ids straddle both shards; row 5 copies row 0's first 40
+     * tokens into its last 40, which makes the first ban findable far from the end. */
+    const int64_t M = 6, H = 96, V = 64;
+    struct Row { int32_t n; int32_t window; };
+    const Row rows[M] = { { 0, 128 }, { 1, 96 }, { 2, 96 }, { 3, 96 }, { 4, 96 }, { 2, 48 } };
+
+    std::vector<int32_t> hist((size_t)(M * H));
+    uint32_t rs = 0x2f6e2b1u;
+    for (int64_t m = 0; m < M; ++m) {
+        int32_t* h = &hist[(size_t)(m * H)];
+        for (int64_t i = 0; i < H; ++i) {
+            rs = rs * 1664525u + 1013904223u;
+            h[i] = (int32_t)(((rs >> 9) % 8u) * 7u);
+        }
+        if (m == 5)
+            for (int64_t i = 0; i < 40; ++i) h[H - 40 + i] = h[i];
+    }
+
+    /* Two shard configurations: the whole vocabulary, and this rank holding ids [16, 64). */
+    struct Shard { int64_t voff, nv; };
+    const Shard shards[2] = { { 0, V }, { 16, V - 16 } };
+
+    int64_t n_cases = 0, banned_total = 0, mismatches = 0;
+    std::string first;
+    for (const Shard& sh : shards) {
+        const int64_t nv = sh.nv;
+
+        std::vector<float> lg((size_t)(M * nv));
+        for (int64_t m = 0; m < M; ++m)
+            for (int64_t i = 0; i < nv; ++i)
+                lg[(size_t)(m * nv + i)] = 0.001f * (float)((m * 37 + i) % 511) - 0.25f;
+
+        std::vector<RadSampleParams> sp((size_t)M);
+        std::memset(sp.data(), 0, sizeof(RadSampleParams) * (size_t)M);
+        std::vector<int32_t> ng((size_t)(M * 2));
+        for (int64_t m = 0; m < M; ++m) {
+            sp[(size_t)m].temp = 1.0f;
+            sp[(size_t)m].top_p = 1.0f;
+            sp[(size_t)m].rep_penalty = 1.0f;
+            sp[(size_t)m].mask_row = -1;
+            sp[(size_t)m].hist_off = 0;
+            sp[(size_t)m].hist_len = (int32_t)H;
+            ng[(size_t)(2 * m)]     = rows[m].n;
+            ng[(size_t)(2 * m + 1)] = rows[m].window;
+        }
+
+        void* d_lg = dalloc((size_t)(M * nv) * 4);
+        void* d_pr = dalloc((size_t)M * sizeof(RadSampleParams));
+        void* d_h  = dalloc((size_t)(M * H) * 4);
+        void* d_ng = dalloc((size_t)(M * 2) * 4);
+        st_memcpy(d_lg, lg.data(), (size_t)(M * nv) * 4, hipMemcpyHostToDevice);
+        st_memcpy(d_pr, sp.data(), (size_t)M * sizeof(RadSampleParams), hipMemcpyHostToDevice);
+        st_memcpy(d_h, hist.data(), (size_t)(M * H) * 4, hipMemcpyHostToDevice);
+        st_memcpy(d_ng, ng.data(), (size_t)(M * 2) * 4, hipMemcpyHostToDevice);
+
+        std::vector<RadTensor> ts = { T(d_lg, RAD_F32, { M, nv }),
+                                      T(d_pr, RAD_F32, { M, (int64_t)(sizeof(RadSampleParams) / 4) }),
+                                      T(d_h, RAD_I32, { M, H }),
+                                      T(d_ng, RAD_I32, { M, 2 }) };
+        std::vector<RadParam> ps = { PI("M", M), PI("n_vocab", nv), PI("vocab_off", sh.voff) };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        const int rc = r->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        if (rc != RAD_OK) { ok(what, false, "launch rc=" + std::to_string(rc)); return; }
+
+        std::vector<float> got((size_t)(M * nv), 0.0f);
+        st_memcpy(got.data(), d_lg, (size_t)(M * nv) * 4, hipMemcpyDeviceToHost);
+
+        std::vector<char> banned((size_t)V, 0);
+        for (int64_t m = 0; m < M; ++m) {
+            ngram_ban_ref(&hist[(size_t)(m * H)], H, rows[m].n, rows[m].window, &banned);
+            for (int64_t i = 0; i < nv; ++i) {
+                const int64_t g = sh.voff + i;
+                const size_t k = (size_t)(m * nv + i);
+                ++n_cases;
+                const bool want = (size_t)g < banned.size() && banned[(size_t)g] != 0;
+                if (want) ++banned_total;
+                const float gv = got[k];
+                const bool is_inf = std::isinf(gv) && gv < 0.0f;
+                if (want != is_inf || (!want && std::memcmp(&gv, &lg[k], 4) != 0)) {
+                    ++mismatches;
+                    if (first.empty())
+                        first = fmt("row %lld col %lld (id %lld) want %s", (long long)m,
+                                    (long long)i, (long long)g, want ? "banned" : "kept");
+                }
+            }
+        }
+        /* A token outside this rank's shard is another rank's column and has no column here, so
+         * the kernel's `col < 0` / `col >= n_vocab` tests skip it: the [0, nv) window above is the
+         * whole surface the kernel can write, and under `vocab_off` 16 its id space is
+         * [16, 64). dalloc's buffers are released by the case's dfree_all. */
+    }
+
+    std::printf("  ngram_ban: %lld columns over %lld rows x 2 shards, %lld banned, "
+                "%lld mismatches\n", (long long)n_cases, (long long)M, (long long)banned_total,
+                (long long)mismatches);
+    ok(what, mismatches == 0 && banned_total > 0,
+       "banned=" + std::to_string(banned_total) + " mismatch=" + std::to_string(mismatches) +
+       (first.empty() ? "" : " " + first));
+}
+
+/* sam_attn, against a host port of deepencoder.py's attention (get_rel_pos + window_partition).
+ *
+ * Two geometries: window 14 on a 16x16 grid (2x2 windows after padding to 28x28, so the zero pad
+ * rows take part in the softmax) over two segments, and the global form (window 0) on the same
+ * grid. q/k/v are stored at their own row pitch with a filler column in front, as the tower's three
+ * column slices of one fused projection are, so a kernel reading q dense fails. */
+static void sam_attn_case(const Plugin& pl) {
+    const char* what = "sam_attn vs a host port of the reference attention";
+    const RadKernelInfo* r = find(pl, "sam_attn_bf16");
+    if (!r) { ok(what, false, "row absent"); return; }
+
+    struct Geo { int64_t gh, gw, win, nh, hd, nseq; };
+    const Geo geos[2] = { { 16, 16, 14, 2, 64, 2 }, { 16, 16, 0, 2, 64, 1 } };
+    int64_t checked = 0, bad_total = 0;
+    float worst = 0.0f;
+
+    for (const Geo& g : geos) {
+        const int64_t W = g.nh * g.hd, R = g.gh * g.gw, M = g.nseq * R;
+        const int64_t tab = 2 * (g.win > 0 ? g.win : (g.gh > g.gw ? g.gh : g.gw)) - 1;
+        /* One filler column, so the row pitch is W + 1: q/k/v/out are all slices. */
+        const int64_t ld = W + 1;
+        const float scale = 1.0f / std::sqrt((float)g.hd);
+
+        std::vector<uint16_t> q((size_t)(M * ld)), k((size_t)(M * ld)), v((size_t)(M * ld));
+        std::vector<uint16_t> rh((size_t)(tab * g.hd)), rw((size_t)(tab * g.hd));
+        for (size_t i = 0; i < q.size(); ++i) {
+            q[i] = st_rand_bf16((uint32_t)i);
+            k[i] = st_rand_bf16((uint32_t)i + 0x51ed2701u);
+            v[i] = st_rand_bf16((uint32_t)i + 0xa341316cu);
+        }
+        for (size_t i = 0; i < rh.size(); ++i) {
+            rh[i] = h_to_bf16(0.1f * h_bf16(st_rand_bf16((uint32_t)i + 0x1234567u)));
+            rw[i] = h_to_bf16(0.1f * h_bf16(st_rand_bf16((uint32_t)i + 0x7654321u)));
+        }
+        std::vector<int32_t> cu((size_t)g.nseq + 1);
+        for (int64_t s = 0; s <= g.nseq; ++s) cu[(size_t)s] = (int32_t)(s * R);
+
+        void* d_q  = dalloc(q.size() * 2);
+        void* d_k  = dalloc(k.size() * 2);
+        void* d_v  = dalloc(v.size() * 2);
+        void* d_o  = dalloc((size_t)(M * ld) * 2);
+        void* d_cu = dalloc(cu.size() * 4);
+        void* d_rh = dalloc(rh.size() * 2);
+        void* d_rw = dalloc(rw.size() * 2);
+        st_memcpy(d_q, q.data(), q.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_k, k.data(), k.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_v, v.data(), v.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_cu, cu.data(), cu.size() * 4, hipMemcpyHostToDevice);
+        st_memcpy(d_rh, rh.data(), rh.size() * 2, hipMemcpyHostToDevice);
+        st_memcpy(d_rw, rw.data(), rw.size() * 2, hipMemcpyHostToDevice);
+
+        /* The two views: [M, W] at pitch ld. */
+        RadTensor tq = T(d_q, RAD_BF16, { M, W });  tq.stride[0] = ld;
+        RadTensor tk = T(d_k, RAD_BF16, { M, W });  tk.stride[0] = ld;
+        RadTensor tv = T(d_v, RAD_BF16, { M, W });  tv.stride[0] = ld;
+        RadTensor to = T(d_o, RAD_BF16, { M, W });  to.stride[0] = ld;
+        std::vector<RadTensor> ts = { tq, tk, tv, T(d_cu, RAD_I32, { g.nseq + 1 }), to,
+                                      T(d_rh, RAD_BF16, { tab, g.hd }),
+                                      T(d_rw, RAD_BF16, { tab, g.hd }) };
+        std::vector<RadParam> ps = {
+            PI("M", M), PI("head_dim", g.hd), PI("n_head", g.nh), PI("grid_h", g.gh),
+            PI("grid_w", g.gw), PI("window", g.win), PF("scale", scale), PS("dtype", "bf16"),
+        };
+        run_case(r, ts, ps);
+
+        std::vector<uint16_t> oh((size_t)(M * ld));
+        st_memcpy(oh.data(), d_o, oh.size() * 2, hipMemcpyDeviceToHost);
+
+        const int64_t th = g.win > 0 ? g.win : g.gh, tw = g.win > 0 ? g.win : g.gw;
+        const int64_t keys = th * tw;
+        std::vector<double> logits((size_t)keys), acc((size_t)g.hd);
+        for (int64_t s = 0; s < g.nseq; ++s)
+            for (int64_t ih = 0; ih < g.gh; ++ih)
+                for (int64_t iw = 0; iw < g.gw; ++iw) {
+                    const int64_t row = cu[(size_t)s] + ih * g.gw + iw;
+                    const int64_t ty = g.win > 0 ? ih / g.win : 0;
+                    const int64_t tx = g.win > 0 ? iw / g.win : 0;
+                    const int64_t lh = ih - ty * th, lw = iw - tx * tw;
+                    for (int64_t h = 0; h < g.nh; ++h) {
+                        double qf[256];
+                        for (int64_t c = 0; c < g.hd; ++c)
+                            qf[c] = h_bf16(q[(size_t)(row * ld + h * g.hd + c)]);
+                        for (int64_t jh = 0; jh < th; ++jh) {
+                            const uint16_t* hrp = &rh[(size_t)((lh - jh + th - 1) * g.hd)];
+                            double hr = 0.0;
+                            for (int64_t c = 0; c < g.hd; ++c) hr += qf[c] * h_bf16(hrp[c]);
+                            for (int64_t jw = 0; jw < tw; ++jw) {
+                                const uint16_t* wrp = &rw[(size_t)((lw - jw + tw - 1) * g.hd)];
+                                double sc = hr;
+                                for (int64_t c = 0; c < g.hd; ++c) sc += qf[c] * h_bf16(wrp[c]);
+                                const int64_t kh = ty * th + jh, kw = tx * tw + jw;
+                                if (kh < g.gh && kw < g.gw) {
+                                    const int64_t krow = cu[(size_t)s] + kh * g.gw + kw;
+                                    double d = 0.0;
+                                    for (int64_t c = 0; c < g.hd; ++c)
+                                        d += qf[c] * h_bf16(k[(size_t)(krow * ld + h * g.hd + c)]);
+                                    sc += scale * d;
+                                }
+                                logits[(size_t)(jh * tw + jw)] = sc;
+                            }
+                        }
+                        double mx = -INFINITY;
+                        for (int64_t j = 0; j < keys; ++j) mx = std::max(mx, logits[(size_t)j]);
+                        double sum = 0.0;
+                        for (int64_t j = 0; j < keys; ++j) {
+                            logits[(size_t)j] = std::exp(logits[(size_t)j] - mx);
+                            sum += logits[(size_t)j];
+                        }
+                        for (int64_t c = 0; c < g.hd; ++c) acc[(size_t)c] = 0.0;
+                        for (int64_t jh = 0; jh < th; ++jh) {
+                            const int64_t kh = ty * th + jh;
+                            if (kh >= g.gh) continue;
+                            for (int64_t jw = 0; jw < tw; ++jw) {
+                                const int64_t kw = tx * tw + jw;
+                                if (kw >= g.gw) continue;
+                                const double p = logits[(size_t)(jh * tw + jw)] / sum;
+                                const int64_t krow = cu[(size_t)s] + kh * g.gw + kw;
+                                for (int64_t c = 0; c < g.hd; ++c)
+                                    acc[(size_t)c] +=
+                                        p * h_bf16(v[(size_t)(krow * ld + h * g.hd + c)]);
+                            }
+                        }
+                        for (int64_t c = 0; c < g.hd; ++c) {
+                            const float got = h_bf16(oh[(size_t)(row * ld + h * g.hd + c)]);
+                            const float diff = std::fabs(got - (float)acc[(size_t)c]);
+                            worst = std::max(worst, diff);
+                            ++checked;
+                            if (diff > 1e-3f + 2e-2f * std::fabs((float)acc[(size_t)c])) ++bad_total;
+                        }
+                    }
+                }
+        dfree_all();
+    }
+    std::printf("  sam_attn: %lld values, max_err=%.5g, %lld outside the house tolerance\n",
+                (long long)checked, (double)worst, (long long)bad_total);
+    ok(what, bad_total == 0 && checked > 0,
+       "bad=" + std::to_string(bad_total) + "/" + std::to_string(checked));
+}
+
 /* qsa_select, against a host sort of the same scores.
  *
  * Focused on ties and the tail. Block scores (sums of relus over a shared grid) tie often, so the
@@ -24583,6 +24873,16 @@ static void device_phase(const Plugin& pl) {
     if (sel("sample_argmax_f32")) {
         if (!g_case) std::printf("\nthe greedy sampler, against a host scan\n");
         sample_argmax_case(pl);
+    }
+
+    if (sel("sample_ngram_ban_f32")) {
+        if (!g_case) std::printf("\nthe n-gram ban, against the reference processor\n");
+        sample_ngram_ban_case(pl);
+    }
+
+    if (sel("sam_attn_bf16")) {
+        if (!g_case) std::printf("\nthe SAM tower attention, against a host port of the reference\n");
+        sam_attn_case(pl);
     }
 
     if (sel("qsa_work_bf16")) {

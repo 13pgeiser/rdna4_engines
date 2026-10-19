@@ -70,6 +70,20 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
     has_linear_state_ = false;
     for (const auto& g : kvgeom_.g) if (!g.paged) has_linear_state_ = true;
 
+    /* R-SWA: which groups carry runtime per-sequence windows, and the W they arm a sequence
+     * with. Empty unless the engine declared one (KVManager::declare_runtime_window), so a model
+     * with a fixed window (gemma4) takes none of the runtime-window paths. */
+    rswa_windows_.clear();
+    for (size_t i = 1; i < kvgeom_.g.size(); ++i) {
+        const int64_t w = kv->runtime_window_tokens((int32_t)i);
+        if (w > 0) rswa_windows_.push_back({(int32_t)i, w});
+    }
+    if (!rswa_windows_.empty())
+        RAD_INFO("R-SWA: %zu KV group(s) with a runtime window; a sequence keeps its prompt as the "
+                 "reference and decodes into a ring of %lld token(s) after it, and is excluded from "
+                 "the prefix cache, checkpoints and speculation",
+                 rswa_windows_.size(), (long long)rswa_windows_[0].tokens);
+
     /* A hit can leave a drafter's own cache short only where a paged group is not prefix-cached
      * (scheduler.h, hit_holes_draft_). With the cache off cached_groups() is empty and this is
      * true, which costs nothing: no hits are taken, and every first block pass is at ctx_len 0. */
@@ -407,7 +421,12 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
      * and failed requests are published too; their prompts were computed, and a client that hangs
      * up mid-answer is likely to ask for that prefix again. */
     if (publish && cfg_.prefix_cache && pc_ && kv_->has_sequence(s.req->id) &&
-        s.req->n_computed > 0) {
+        s.req->n_computed > 0 && !kv_->has_runtime_window(s.req->id)) {
+        /* R-SWA: a sequence with a runtime window is not published (KVManager::set_window). Its
+         * table is a reference plus a ring rather than a prefix from position 0, and the window
+         * length is runtime data that no cache key carries; a hit would adopt blocks for a window
+         * this sequence does not have. prefix.cpp already skips a windowed group -- this makes the
+         * policy explicit, rather than a consequence of the kind declared at build time. */
         const std::vector<int32_t>& cg = pc_->cached_groups();
         pub_blocks_.assign(cg.size(), {});
         bool ok = !cg.empty();
@@ -466,6 +485,11 @@ void Scheduler::close_request(SchedReq& s, ReqState st, const char* reason, bool
  * refusal leaves the entry without one. */
 void Scheduler::reserve_ckpt(StepEntry& e, const Request& r, int64_t pos, int32_t tok) {
     int32_t cs = -1;
+    /* R-SWA: a sequence with a runtime window is never checkpointed. The window is runtime data
+     * (the prompt's own length), so a slot would describe a window the sequence does not have, and
+     * the ring is not the [lo, pos) block list a restore seeds. The prefix cache can never reuse
+     * it either, so the copy would be dead weight. */
+    if (kv_->has_runtime_window(r.id)) return;
     if (pc_->reserve_checkpoint(r, pos, &cs) < 0 || cs < 0) return;
     e.ckpt_tok = tok;
     e.ckpt_slot = cs;
@@ -917,6 +941,20 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve) {
     Request& r = *s.req;
 
     if (!kv_->has_sequence(r.id)) RAD_TRY(kv_->add_sequence(r.id));
+
+    /* R-SWA: the visible set becomes [0, prompt) plus a ring of W once the prompt is placed. The
+     * floor is this sequence's own prompt length (image tokens included, they are prompt rows),
+     * and it is armed here rather than at the prefill's end so no checkpoint is reserved for the
+     * sequence: a snapshot would describe a window the sequence no longer has (set_window). */
+    for (const RswaWindow& w : rswa_windows_) {
+        const int rc = kv_->set_window(r.id, (int64_t)r.prompt.size(), w.tokens);
+        if (rc < 0) {
+            RAD_WARN("request %llu: runtime window of %lld tokens over a %zu-token prompt: %s",
+                     (unsigned long long)r.id, (long long)w.tokens, r.prompt.size(),
+                     rad_strerror(rc));
+            return rc;
+        }
+    }
 
     /* A fresh attempt: nothing looked up or counted yet. A request that kept an earlier
      * attempt's hit (n_computed > 0) keeps what it found. */

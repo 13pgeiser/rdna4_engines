@@ -9,6 +9,7 @@
  * Chain order (reordering changes which tokens survive):
  *
  *     penalties (repetition / frequency / presence, then DRY)
+ *     the windowed no-repeat-ngram ban
  *     temperature
  *     the grammar mask
  *     top-k
@@ -46,6 +47,8 @@
  *
  *   sample_penalties   M(range) n_vocab vocab_off?   logits, params, history  -> logits (inout)
  *   sample_dry         M(range) n_vocab vocab_off?   logits, params, history, breakers?
+ *                                                                          -> logits (inout)
+ *   sample_ngram_ban   M(range) n_vocab vocab_off?   logits, params, history, ngram
  *                                                                          -> logits (inout)
  *   sample_temp        M(range) n_vocab   logits, params                  -> logits (inout)
  *   sample_mask        M(range) n_vocab   logits, params, bitmask         -> logits (inout)
@@ -232,6 +235,9 @@ private:
     /* Declared op handles; RAD_NULL_HANDLE means unresolved, which admission refuses by name. */
     rad_op op_penalties_ = RAD_NULL_HANDLE;
     rad_op op_dry_       = RAD_NULL_HANDLE;
+    /* The windowed no-repeat-ngram ban (`sample_ngram_ban`), the stage Unlimited-OCR's
+     * generation_config asks for. It reads the same history plane as the two above. */
+    rad_op op_ngram_ban_ = RAD_NULL_HANDLE;
     rad_op op_temp_      = RAD_NULL_HANDLE;
     rad_op op_temp_late_ = RAD_NULL_HANDLE;   /* sample_temp over the candidates (temp_last) */
     rad_op op_mask_      = RAD_NULL_HANDLE;
@@ -252,6 +258,7 @@ private:
     rad_buf buf_params_late_ = RAD_NULL_HANDLE;   /* the late temperature's rows */
     rad_buf buf_hist_    = RAD_NULL_HANDLE;
     rad_buf buf_brk_     = RAD_NULL_HANDLE;   /* DRY's single-token breaker marks, beside history */
+    rad_buf buf_ngram_   = RAD_NULL_HANDLE;   /* the n-gram ban's {n, window} pair a row */
     rad_buf buf_mask_    = RAD_NULL_HANDLE;
     rad_buf buf_cand_i_  = RAD_NULL_HANDLE;
     rad_buf buf_cand_v_  = RAD_NULL_HANDLE;
@@ -275,6 +282,7 @@ private:
     const DeviceSampleParams* cur_stage_ = nullptr;   /* what the last build staged */
     int32_t*            hist_stage_   = nullptr;
     uint8_t*            brk_stage_    = nullptr;
+    int32_t*            ngram_stage_  = nullptr;   /* [rows][2]: n-gram length, window */
     uint32_t*           mask_stage_   = nullptr;
 
     int64_t mask_words_ = 0;      /* words for this rank's shard; what the mask op indexes */
@@ -282,6 +290,9 @@ private:
     /* Whether any DRY row this step has breakers; only then is the breaker plane uploaded and
      * passed to sample_dry. */
     bool    any_brk_    = false;
+    /* Whether any row this step runs the n-gram ban. Its history is the plane the penalties use,
+     * so this only decides whether that plane is uploaded and the op issued. */
+    bool    any_ngram_  = false;
 
     /* The whole-vocabulary mask the grammar fills, from which this rank's shard is cut. Used
      * only when the head is sharded; see declare(). */

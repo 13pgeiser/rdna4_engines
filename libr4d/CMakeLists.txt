@@ -71,6 +71,8 @@ set(R4D_UNITS
   # An encoder's dense attention (bidirectional, GQA in the workgroup, a two-sided window) and
   # the small ops around it: act_mul, seg_mean, qk_norm_rope with a v norm, the f32 widening.
   "r4d_attn_dense_bf16|"
+  # Unlimited-OCR's SAM tower: windowed attention with decomposed relative position.
+  "r4d_sam_attn_bf16|"
   "r4d_encoder_bf16|"
   # The image generator: attention over a paged prefix plus the pass's own rows, the causal
   # head_dim-128 dense form and the 1152-wide decoder head; plus the sampler, adaptive norm,
@@ -161,6 +163,8 @@ set(R4D_UNITS
   "r4d_sample_chain_f32|"
   "r4d_model_bf16|"
   "r4d_sample_stages_f32|"
+  # The windowed no-repeat-ngram ban: one block a row over the row's history.
+  "r4d_sample_ngram_f32|"
   "r4d_quant_act_i8|"
   "r4d_rmsnorm_quant_i8|"
   "r4d_qkv_norm_rope|"

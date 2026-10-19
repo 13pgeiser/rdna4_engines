@@ -148,6 +148,8 @@ int ref_attn_cross         (const RadArgs*, RadStream);
 int ref_table_add          (const RadArgs*, RadStream);
 int ref_mix_rows           (const RadArgs*, RadStream);
 int ref_chan_stats         (const RadArgs*, RadStream);
+/* Unlimited-OCR's SAM tower: windowed attention with decomposed relative position (ref_sam_attn.cpp). */
+int ref_sam_attn           (const RadArgs*, RadStream);
 int ref_kv_store           (const RadArgs*, RadStream);
 int ref_rope               (const RadArgs*, RadStream);
 int ref_rope_table         (const RadArgs*, RadStream);
@@ -276,6 +278,7 @@ void    ref_collective_fini(void*);
 /* ---- sampling */
 int ref_sample_penalties   (const RadArgs*, RadStream);
 int ref_sample_dry         (const RadArgs*, RadStream);
+int ref_sample_ngram_ban   (const RadArgs*, RadStream);
 int ref_sample_temp        (const RadArgs*, RadStream);
 int ref_sample_topk        (const RadArgs*, RadStream);
 int ref_sample_topp        (const RadArgs*, RadStream);
@@ -391,6 +394,7 @@ REF_SHAPE_FN(ref_attn_cross);
 REF_SHAPE_FN(ref_table_add);
 REF_SHAPE_FN(ref_mix_rows);
 REF_SHAPE_FN(ref_chan_stats);
+REF_SHAPE_FN(ref_sam_attn);
 REF_SHAPE_FN(ref_kv_store);
 REF_SHAPE_FN(ref_rope);
 REF_SHAPE_FN(ref_rope_table);
@@ -496,6 +500,7 @@ REF_SHAPE_FN(ref_all_gather);
 
 REF_SHAPE_FN(ref_sample_penalties);
 REF_SHAPE_FN(ref_sample_dry);
+REF_SHAPE_FN(ref_sample_ngram_ban);
 REF_SHAPE_FN(ref_sample_temp);
 REF_SHAPE_FN(ref_sample_topk);
 REF_SHAPE_FN(ref_sample_topp);

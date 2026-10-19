@@ -158,6 +158,9 @@ int64_t r4d_rad_lora_shrink_wmma_scratch(const RadArgs*);
 int     r4d_rad_lora_expand_tiled       (const RadArgs*, RadStream);
 int     r4d_rad_attn_vit              (const RadArgs*, RadStream);
 int     r4d_rad_attn_dense            (const RadArgs*, RadStream);
+/* Unlimited-OCR's SAM tower: windowed tiles with decomposed relative position
+ * (r4d_sam_attn_bf16.hip). */
+int     r4d_rad_sam_attn              (const RadArgs*, RadStream);
 int     r4d_rad_seg_sinusoid          (const RadArgs*, RadStream);
 /* The image generator's attention (r4d_attn_gen.hip): a paged prefix and the pass's own rows, the
  * causal-capable dense form at head_dim 128 (a text encoder's prompt), and one 1152-wide head
@@ -709,6 +712,9 @@ int r4d_rad_logits_gemm     (const RadArgs*, RadStream);
  * fused one lacks. */
 int r4d_rad_sample_penalties (const RadArgs*, RadStream);
 int r4d_rad_sample_dry       (const RadArgs*, RadStream);
+/* The windowed no-repeat-ngram ban (r4d_sample_ngram_f32.hip): the row's history, one -infinity
+ * a banned column. */
+int r4d_rad_sample_ngram_ban(const RadArgs*, RadStream);
 int r4d_rad_sample_temp      (const RadArgs*, RadStream);
 int r4d_rad_sample_mask      (const RadArgs*, RadStream);
 int r4d_rad_sample_topk      (const RadArgs*, RadStream);

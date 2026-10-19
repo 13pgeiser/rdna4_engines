@@ -420,6 +420,13 @@ private:
      * meta.n_layers; drafter layers bind from `base_layer` up) that the cache does not index?
      * Unlike a drafter hole, recomputing the tail cannot repair it; see admit_one. */
     bool          hit_holes_trunk_ = false;
+    /* R-SWA: the groups whose KV manager carries per-sequence runtime windows, with the W a
+     * sequence is armed with (IKVManager::runtime_window_tokens). Empty for every model that does
+     * not declare one, in which case admission and commit are exactly as before. A sequence with
+     * one keeps its prompt as a reference and decodes into a ring after it; it is excluded from
+     * prefix publish, checkpoints and speculation (the window is runtime data). */
+    struct RswaWindow { int32_t group = -1; int64_t tokens = 0; };
+    std::vector<RswaWindow> rswa_windows_;
     /* Draft refill: the drafter's window where a hit can leave a hole in a windowed block
      * drafter's cache, else 0. The drafter would be declined until its window slid past the hole,
      * which on a chat's follow-up turn is most of the reply, so the hit ends one window before the

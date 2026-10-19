@@ -1,10 +1,18 @@
 /* unlimitedocr_bf16 -- baidu/Unlimited-OCR's decoder: a small Llama-MoE, bf16 weights and bf16
  * activations.
  *
- * P1 scope (aijuus/plans/UNLIMITED-OCR-PLUGIN.md): the TEXT-ONLY trunk. The DeepEncoder vision
- * tower (SAM ViT-B/16 + CLIP ViT-L/14, `model.vision_tower`/`model.projector`) is P2 and not
- * declared here; the R-SWA ring KV is P4 and every layer serves plain causal paged attention; the
- * windowed no-repeat-ngram sampler is P5.
+ * Scope (aijuus/plans/UNLIMITED-OCR-PLUGIN.md): the text trunk (P1) plus the DeepEncoder vision
+ * tower (P2, arch/common/rad_block_sam.h: SAM ViT-B/16 at 1024 -> 16x16x1024 map -> CLIP ViT-L/14
+ * -> the projector -> the 273-row layout, declared with rad_declare_encoder(RAD_MM_IMAGE),
+ * patch_dim 768 = 3*16*16, merge 16, n_embd 1280). The tower's weights are mapped always; its ops
+ * and the encoder pass are declared only when SAM's `sam_attn` op resolves, because no existing op
+ * can carry the decomposed rel_pos_h/rel_pos_w attention bias (rad_block_sam.h's header states the
+ * op and why). Without it this plugin is the P1 text-only trunk and refuses images by name. The
+ * decoder's KV is one RAD_KV_RING group with the checkpoint's `sliding_window_size` (128), the
+ * reference's own R-SWA: prefill is fully causal, and from the end of the prefill the ring of the
+ * last W generated tokens is appended to the prompt (`SlidingWindowLlamaAttention`, which keeps
+ * the prompt as reference and overwrites ring slots in place). The windowed no-repeat-ngram
+ * sampler is P5.
  *
  * ============================== THE SHAPE (config.json) ==============================
  *
@@ -30,6 +38,7 @@
 #include <arch/rad_arch.h>
 #include <arch/rad_block_mlp.h>
 #include <arch/rad_block_moe_fp8.h>
+#include <arch/rad_block_sam.h>
 
 #include "attn_llama.h"
 
@@ -58,7 +67,7 @@ struct Model {
     int64_t n_rot  = 0;
     int64_t first_dense = 1;   /* layers [0, first_dense) are dense MLPs */
 
-    rad_kvgroup kv_full = 0;
+    rad_kvgroup kv = 0;
 
     /* the residual stream and the vocabulary edges */
     rad_buf b_x = 0, b_h = 0, b_hout = 0, b_logits = 0;
@@ -76,9 +85,13 @@ struct Model {
     rad_buf b_sgu = 0, b_sff = 0, b_sout = 0;
 
     MoeFP8::Config moecfg{};
+    /* The DeepEncoder vision tower (arch/common/rad_block_sam.h). Its weights are mapped always;
+     * its ops and the encoder pass only when SAM's attention op resolves. */
+    DeepEncoder enc;
 
     rad_weight w_tok = 0, w_out_norm = 0, w_lm_head = 0;
-    rad_op op_embed = 0, op_embed_ar = 0, op_final_norm = 0, op_gather = 0, op_logits = 0;
+    rad_op op_embed = 0, op_embed_ar = 0, op_mm = 0, op_final_norm = 0, op_gather = 0,
+           op_logits = 0;
 
     std::vector<Layer> layers;
 };
@@ -248,14 +261,30 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     const int64_t moe_rows = 2048;
     mc.rows = g.max_tok < moe_rows ? g.max_tok : moe_rows;
 
-    /* ---- KV: one full group. R-SWA (P4) turns this into a windowed group with the window set at
-     * prefill end; P1 is the plain full-cache decode the plan uses as the P1-P3 baseline. */
+    /* ---- KV: one R-SWA ring group.
+     *
+     * The reference's `SlidingWindowLlamaAttention` keeps the prefill as reference and from the
+     * prefill's end keeps the last `sliding_window_size` generated tokens in a ring it overwrites
+     * in place, attending over both. RAD_KV_RING is that: paged like a window group, but the floor
+     * is per sequence and armed at admission (`visible_lo = prefill length`), so a decode query
+     * sees [0, prefill) U [prefill, prefill + W). Prefill itself stays fully causal, which is why
+     * the attention op keeps `causal=1` and `window=0`: the visible set is the block table's job,
+     * and `causal=0` would make a prefill chunk non-causal.
+     *
+     * A checkpoint that states no window gets the plain full cache, so the text trunk still
+     * serves. Prefix caching and speculation switch off for the group automatically (a runtime
+     * window's KV before the prompt end is not reusable and a draft cannot know where the ring
+     * starts). */
+    const int64_t win = rad_meta_geti(meta, "sliding_window_size", 0) > 0
+                            ? rad_meta_geti(meta, "sliding_window_size", 0)
+                            : rad_meta_geti(meta, "sliding_window", 0);
     RadKVGroupDecl fd{};
-    fd.kind      = RAD_KV_FULL;
+    fd.kind      = win > 0 ? RAD_KV_RING : RAD_KV_FULL;
     fd.dtype     = rad_kv_cache_dtype(ctx, RAD_BF16);
+    fd.window    = win > 0 ? win : 0;
     fd.n_head_kv = g.n_head_kv;
     fd.head_dim  = g.head_dim;
-    m.kv_full = rad_decl_kv_group(b, nm.f("kv_attn"), &fd);
+    m.kv = rad_decl_kv_group(b, nm.f("kv_attn"), &fd);
     g.kv_dtype = rad_dtype_name(fd.dtype);
 
     /* ---- activation buffers. */
@@ -339,6 +368,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
     }
 
+    /* ---- the DeepEncoder tower: map and declare its weights, then (when `sam_attn` resolves) its
+     * ops and the encoder pass. Without that op the tower stays off and images are refused. */
+    RAD_ARCH_TRY(m.enc.declare(b, ctx, nm, g.n_embd, (int)g.n_layer + 64));
+
+    /* A picture's rows overwrite its placeholders' embeddings after the (all-reduced) lookup and
+     * before the first block. Declared only when the tower is, since otherwise no step can carry
+     * media rows. */
+    if (m.enc.on)
+        m.op_mm = rw(b, RAD_OP(b, "scatter_rows",
+                               RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("n", g.n_embd),
+                                          RAD_STR("dtype", "bf16")),
+                               RAD_NOWEIGHTS),
+                     {m.b_x}, {m.b_x});
+
     AttnLlamaBF16::Wire aw{};
     aw.x = m.b_x; aw.h = m.b_h; aw.q = m.b_q; aw.k = m.b_k; aw.v = m.b_v; aw.attn = m.b_attn;
 
@@ -365,8 +408,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         as.k    = nm.ckpt("model.layers.%lld.self_attn.k_proj.weight", (long long)l);
         as.v    = nm.ckpt("model.layers.%lld.self_attn.v_proj.weight", (long long)l);
         as.o    = nm.ckpt("model.layers.%lld.self_attn.o_proj.weight", (long long)l);
-        RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv_full));
-        RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, m.kv_full, m.n_rot, aw, as));
+        RAD_ARCH_TRY(rad_bind_layer_kv(b, (int)l, m.kv));
+        RAD_ARCH_TRY(lay.attn.declare(b, nm, g, (int)l, m.kv, m.n_rot, aw, as));
 
         if (lay.dense) {
             MlpBF16::Src ms{};
@@ -420,10 +463,13 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
              (long long)mc.n_ff_shared,
              (long long)g.n_head, (long long)g.n_head_kv, (long long)g.head_dim,
              (long long)g.vocab_off, (long long)(g.vocab_off + g.n_vocab));
-    rad_note(b, "R-SWA is NOT served by this plugin pass: every layer decodes full-cache causal. "
-                "The ring (sliding_window_size %lld) is the plan's P4 (per-sequence RAD_KV_WINDOW "
-                "window set at prefill end, causal=0 over reference+ring)",
-             (long long)rad_meta_geti(meta, "sliding_window_size", 0));
+    if (win > 0)
+        rad_note(b, "R-SWA: the KV group is a runtime ring (RAD_KV_RING), window %lld tokens from "
+                    "the prefill's end (the reference's SlidingWindowLlamaAttention); prefill is "
+                    "fully causal, and prefix cache and speculation are off for it", (long long)win);
+    else
+        rad_note(b, "R-SWA: the checkpoint states no sliding_window_size, so the KV group is a "
+                    "plain full cache");
     rad_note(b, "generation_config asks for SlidingWindowNoRepeatNgramProcessor n=35 -- the "
                 "plan's P5 sample_ngram_ban op; temp-0 parity checks run with it off");
     return RAD_OK;
@@ -432,8 +478,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 static void step(RadCtx* c, const RadBatch* batch) {
     Model& m = g_model[rad_rank(c)];
 
-    /* No encoder pass is declared (the vision tower is P2). */
-    if (batch->enc) return;
+    if (batch->enc) {
+        m.enc.step(c, batch);
+        return;
+    }
 
     RAD_ISSUE(c, m.op_embed,
               praw(batch->token_ids, RAD_I32, batch->n_tok), RAD_W(m.w_tok),
@@ -441,6 +489,10 @@ static void step(RadCtx* c, const RadBatch* batch) {
     if (m.op_embed_ar)
         RAD_ISSUE_N(c, m.op_embed_ar, (int64_t)batch->n_tok * m.g.n_embd,
                     brows(m.b_x, batch->n_tok), RAD_NONE);
+    if (m.op_mm && batch->n_mm_rows > 0)
+        RAD_ISSUE_N(c, m.op_mm, batch->n_mm_rows,
+                    praw2(batch->mm_embd, RAD_BF16, batch->n_mm_rows, m.g.n_embd),
+                    praw(batch->mm_rows, RAD_I32, batch->n_mm_rows), brows(m.b_x, batch->n_tok));
 
     for (const Layer& l : m.layers) {
         l.attn.step(c, batch);

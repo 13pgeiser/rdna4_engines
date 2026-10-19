@@ -953,8 +953,8 @@ TEST(op_vocabulary) {
         "gdn_recurrent_update", "gdn_conv_recurrent_update", "gdn_gated_rmsnorm",
         "all_reduce", "all_gather",
         "embed_lookup", "logits_gemm",
-        "sample_penalties", "sample_dry", "sample_temp", "sample_topk", "sample_topp",
-        "sample_minp", "sample_typical", "sample_xtc", "sample_mask", "sample_pick",
+        "sample_penalties", "sample_dry", "sample_ngram_ban", "sample_temp", "sample_topk",
+        "sample_topp", "sample_minp", "sample_typical", "sample_xtc", "sample_mask", "sample_pick",
         "sample_argmax", "sample_merge_topk", "sample_logprobs",
         /* The image generator's (arch/qwenimage21): a DiT's modulation and gates, the per-lane
          * sampler state, the VAE's convolutions and shortcuts, attention over a cached prefix. */
@@ -994,6 +994,8 @@ TEST(op_vocabulary) {
         /* LTX-2.5's diffusion decoder: its rotary's voxel coordinates and its neighborhood
          * attention. */
         "vol_index", "attn_na3d",
+        /* Unlimited-OCR's SAM tower: windowed attention with decomposed relative position. */
+        "sam_attn",
     };
     for (const char* op : kOps) {
         if (!kern(op)) fprintf(stderr, "    missing op '%s'\n", op);
@@ -5099,6 +5101,181 @@ TEST(op_sample_pick_draws_the_specified_uniform) {
     CHECK(agree > 60);
 }
 
+/* ================================================================== the n-gram ban */
+/* Unlimited-OCR's SlidingWindowNoRepeatNgramProcessor, ported straight from
+ * modeling_unlimitedocr.py:353-383 as the oracle's second formulation. `s` is the row's history
+ * oldest first; the result marks every global token id it bans. */
+static std::vector<char> ref_ngram_banned(const std::vector<int32_t>& s, int n, int window) {
+    std::vector<char> banned(256, 0);
+    if (n <= 0 || (int64_t)s.size() < (int64_t)n) return banned;
+    const int64_t len = (int64_t)s.size();
+    const int64_t search_start = window > 0 ? std::max<int64_t>(0, len - window) : 0;
+    const int64_t search_end   = len - n + 1;
+    if (search_end <= search_start) return banned;
+    std::vector<int32_t> prefix;
+    if (n > 1) prefix.assign(s.begin() + (size_t)(len - n + 1), s.end());
+    for (int64_t idx = search_start; idx < search_end; ++idx) {
+        bool match = true;
+        for (size_t j = 0; j < prefix.size(); ++j)
+            if (s[(size_t)(idx + (int64_t)j)] != prefix[j]) { match = false; break; }
+        if (!match) continue;
+        const int32_t tok = s[(size_t)(idx + n - 1)];
+        if (tok >= 0 && tok < (int32_t)banned.size()) banned[(size_t)tok] = 1;
+    }
+    return banned;
+}
+
+/* The op over one row: returns the banned global ids it wrote as -infinity, and whether every other
+ * column is bit-for-bit its input. */
+static std::vector<int32_t> ref_ngram_op(const std::vector<int32_t>& s, int n, int window,
+                                         int n_vocab, bool* untouched_out) {
+    const int64_t H = 8;   /* the history plane's extent in these cases */
+    T lg(RAD_F32, {1, n_vocab});
+    std::vector<float> in((size_t)n_vocab);
+    for (int64_t i = 0; i < n_vocab; ++i) in[(size_t)i] = 0.5f * (float)i - 1.0f;
+    lg.f(in);
+    T hist(RAD_I32, {1, H});
+    std::vector<int64_t> hv((size_t)H, 0);
+    for (size_t i = 0; i < s.size() && i < (size_t)H; ++i) hv[i] = s[i];
+    hist.n(hv);
+
+    SP sp(1);
+    sp[0].hist_off = 0;
+    sp[0].hist_len = (int32_t)std::min<size_t>(s.size(), (size_t)H);
+    T ng(RAD_I32, {1, 2}); ng.n({ n, window });
+
+    A a; a.t(lg).t(sp.operand()).t(hist).t(ng).i("M", 1).i("n_vocab", n_vocab);
+    if (run("sample_ngram_ban", a) != RAD_OK) return { -99 };
+
+    std::vector<int32_t> banned;
+    bool untouched = true;
+    for (int64_t i = 0; i < n_vocab; ++i) {
+        const float v = lg.at(i);
+        if (std::isinf(v) && v < 0.0f) banned.push_back((int32_t)i);
+        else if (std::memcmp(&v, &in[(size_t)i], 4) != 0) untouched = false;
+    }
+    if (untouched_out) *untouched_out = untouched;
+    return banned;
+}
+
+/* The reference's banned set and the op's, over:
+ *   - every binary history of length 0..6, n 1..4 and windows 0, 2, 3, 4 and 64. A binary
+ *     alphabet makes repeats and the "abcabc" shapes dense, and lengths short of, equal to and
+ *     longer than n cover the early exits;
+ *   - 200 random histories over five ids, lengths 1..24, n 1..8 and windows 0..16, where the
+ *     window boundary falls inside repeated runs;
+ *   - the named shapes: an n-gram whose last token is the window's last (idx == search_end - 1),
+ *     an n-gram that starts at search_start while an earlier copy starts before it, n == 1 (the
+ *     empty prefix, every window token banned) and n == 0 (off). */
+TEST(op_sample_ngram_ban_matches_the_reference_processor) {
+    int64_t trials = 0, mismatches = 0, bans = 0;
+    bool all_untouched = true;
+
+    auto trial = [&](const std::vector<int32_t>& s_in, int n, int window) {
+        /* The engine's plane holds the LAST H tokens of the sequence (build_step truncates the
+         * oldest), so the oracle and the op must both see that span. */
+        const std::vector<int32_t> s = s_in.size() > 8
+                                           ? std::vector<int32_t>(s_in.end() - 8, s_in.end())
+                                           : s_in;
+        const int n_vocab = 8;
+        bool untouched = true;
+        const std::vector<int32_t> got = ref_ngram_op(s, n, window, n_vocab, &untouched);
+        if (got.size() == 1 && got[0] == -99) { ++mismatches; return; }
+        const std::vector<char> want = ref_ngram_banned(s, n, window);
+        ++trials;
+        bans += (int64_t)got.size();
+        all_untouched = all_untouched && untouched;
+        int64_t live = 0;
+        for (int id = 0; id < n_vocab; ++id) live += want[(size_t)id] ? 1 : 0;
+        if (live != (int64_t)got.size()) { ++mismatches; return; }
+        for (int32_t id : got)
+            if (id < 0 || id >= n_vocab || !want[(size_t)id]) { ++mismatches; return; }
+    };
+
+    /* Every binary history of length 0..6. */
+    for (int64_t len = 0; len <= 6; ++len) {
+        for (int64_t bits = 0; bits < (int64_t)1 << len; ++bits) {
+            std::vector<int32_t> s;
+            for (int64_t i = 0; i < len; ++i) s.push_back((int32_t)((bits >> i) & 1));
+            for (int n = 1; n <= 4; ++n)
+                for (int w : { 0, 2, 3, 4, 64 }) trial(s, n, w);
+        }
+    }
+
+    /* Random histories over five ids. */
+    uint32_t rs = 0x9e3779b9u;
+    for (int it = 0; it < 200; ++it) {
+        rs = rs * 1664525u + 1013904223u;
+        const int64_t len = 1 + (int64_t)((rs >> 8) % 24u);
+        std::vector<int32_t> s((size_t)len);
+        for (int64_t i = 0; i < len; ++i) {
+            rs = rs * 1664525u + 1013904223u;
+            s[(size_t)i] = (int32_t)((rs >> 12) % 5u);
+        }
+        rs = rs * 1664525u + 1013904223u;
+        const int n = 1 + (int)((rs >> 8) % 8u);
+        rs = rs * 1664525u + 1013904223u;
+        const int w = (int)((rs >> 8) % 17u);
+        trial(s, n, w);
+    }
+
+    /* The named shapes. [4,1,2, 4,1,2, 4,1,2] with n 3 and window 6: the newest complete n-gram
+     * starts exactly at search_end - 1, and the earlier copy at search_start bans the same token;
+     * window 3 moves search_start so that only the spanning copy is searched. */
+    trial({ 4, 1, 2, 4, 1, 2, 4, 1, 2 }, 3, 6);
+    trial({ 4, 1, 2, 4, 1, 2, 4, 1, 2 }, 3, 3);
+    trial({ 1, 1, 1, 1, 1, 1 }, 2, 4);        /* repeated tokens, every position matches */
+    trial({ 1, 1, 1, 1, 1, 1 }, 1, 3);        /* n 1: the entire window is banned */
+    trial({ 1, 1, 1, 1, 1, 1 }, 0, 3);        /* off */
+    trial({ 7, 2, 7, 2, 7 }, 2, 0);           /* window 0: the whole span */
+
+    CHECK(trials > 2500);
+    CHECK(mismatches == 0);
+    CHECK(bans > 0);
+    /* Every column the reference does not ban is bit-for-bit its input: the op writes -infinity
+     * and nothing else, so penalties and temperature see the same numbers. */
+    CHECK(all_untouched);
+}
+
+/* Off is the default, and off must be invisible to greedy decoding: sample_ngram_ban writes
+ * nothing for a row with ngram_ban_n 0, so the argmax over the same row is the same token. With
+ * the ban on, the outcome changes exactly when the ban covers the argmax's token. */
+TEST(op_sample_ngram_ban_off_leaves_greedy_decoding_unchanged) {
+    /* Token 5 is the clear maximum. Its id appears 4 times in the history, so both the ban and the
+     * penalties have something to do; the ban is off here. */
+    T hist(RAD_I32, {1, 8}); hist.n({ 5, 1, 5, 2, 5, 3, 5, 1 });
+
+    auto greedy = [&](int n, int window, std::vector<float>* after) {
+        T lg(RAD_F32, {1, 8});
+        lg.f({ 0.0f, 0.1f, 0.2f, 0.3f, 0.4f, 4.0f, 0.5f, 0.6f });
+        SP sp(1);
+        sp[0].hist_off = 0;
+        sp[0].hist_len = 8;
+        T ng(RAD_I32, {1, 2}); ng.n({ n, window });
+        A a; a.t(lg).t(sp.operand()).t(hist).t(ng).i("M", 1).i("n_vocab", 8);
+        CHECK_OK(run("sample_ngram_ban", a));
+        T tk(RAD_I32, {1});
+        A b; b.t(lg).t(sp.operand()).t(tk).i("M", 1).i("n_vocab", 8);
+        CHECK_OK(run("sample_argmax", b));
+        if (after)
+            for (int64_t i = 0; i < 8; ++i) after->push_back(lg.at(i));
+        return tk.iat(0);
+    };
+
+    std::vector<float> off_logits;
+    CHECK_EQ(greedy(0, 0, &off_logits), 5);
+    /* Bit-identical to the input: the stage did not run. */
+    static const float kIn[8] = { 0.0f, 0.1f, 0.2f, 0.3f, 0.4f, 4.0f, 0.5f, 0.6f };
+    for (int64_t i = 0; i < 8; ++i) CHECK(std::memcmp(&off_logits[(size_t)i], &kIn[i], 4) == 0);
+
+    /* The history's prefix (5,1) is followed by token 5 at positions 0 and 2 in [5,1,5,2,5,3,5,1]:
+     * with n 2 the ban covers 5, so greedy moves to the next best (token 7). */
+    CHECK_EQ(greedy(2, 8, nullptr), 7);
+    /* A ban that only names other tokens leaves the argmax alone: with n 2 and a one-token window,
+     * search_start == search_end - 1 is impossible (window 1 < n), so nothing is banned. */
+    CHECK_EQ(greedy(2, 1, nullptr), 5);
+}
+
 /* ================================================================== failure modes */
 /* Nothing that did not do the work returns RAD_OK. The engine turns these into a named abort
  * rather than a silent fallback (spec §17). */
@@ -7847,6 +8024,11 @@ std::vector<Geo> geometries() {
                                     .s("kv_dtype", "f32").i("n_head", 4).i("ctx", 9)),
         G("attn_dense", "M", 6, a.i("M", R).i("head_dim", 8).i("gqa", 2).i("causal", 1)
                                 .s("dtype", "f32").i("n_head", 4)),
+        /* One-row segments, so M is also the segment count (n_seq, the description's hint for
+         * cu_seqlens). The real grids are op_sam_attn_*'s. */
+        G("sam_attn", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2).i("grid_h", 1)
+                              .i("grid_w", 1).i("window", 1).i("n_seq", R)
+                              .d("scale", 0.3535533905932738).s("dtype", "bf16")),
         G("kv_store", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head_kv", 2).i("block_size", 4)
                               .s("kv_dtype", "f32")),
         G("rope", "M", 3, a.i("M", R).i("head_dim", 8).i("n_head", 2).i("n_head_kv", 1)
@@ -7914,6 +8096,7 @@ std::vector<Geo> geometries() {
         G("logits_gemm", "M", 3, a.i("M", R).i("n_vocab", 20).i("n_embd", 8).s("dtype", "f32")),
         G("sample_penalties", "M", 2, a.i("M", R).i("n_vocab", 64)),
         G("sample_dry", "M", 2, a.i("M", R).i("n_vocab", 64)),
+        G("sample_ngram_ban", "M", 2, a.i("M", R).i("n_vocab", 64)),
         G("sample_temp", "M", 2, a.i("M", R).i("n_vocab", 64)),
         G("sample_topk", "M", 2, a.i("M", R).i("n_vocab", 64)),
         G("sample_topp", "M", 2, a.i("M", R).i("n_cand", 16)),
@@ -8496,4 +8679,339 @@ TEST(gather_rows_moves_packed_codes_exactly) {
      * 5 ties to the even code (4). */
     const float wf[6] = { 0.5f, 1.0f, -2.0f, 6.0f, 0.0f, 4.0f };
     for (int i = 0; i < 6; ++i) CHECK_EQ(e.at(i), wf[i]);
+}
+
+/* ================================================================== sam_attn
+ * Unlimited-OCR's SAM tower attention (arch/common/rad_block_sam.h, libref/ref_sam_attn.cpp).
+ *
+ * The expected values are a direct port of deepencoder.py's Attention.forward /
+ * add_decomposed_rel_pos / window_partition in double, not a second call into libref: the padding
+ * rule, the per-head rel_pos channel dot and the resampling of a table along its row axis each have
+ * a way to be wrong that an oracle sharing libref's code could not see. */
+
+namespace {
+
+struct SamIn {
+    int64_t gh = 1, gw = 1, win = 0, nh = 1, hd = 1, nseq = 1;
+    std::vector<float> q, k, v, rh, rw;   /* [M, nh*hd] and [2*L-1, hd], row-major */
+    int64_t W()    const { return nh * hd; }
+    int64_t rows() const { return nseq * gh * gw; }
+    int64_t tab()  const { return 2 * (win > 0 ? win : (gh > gw ? gh : gw)) - 1; }
+};
+
+/* A deterministic draw in [-1, 1]: index-driven, so a wrong pitch or row map reads other numbers. */
+static void sam_fill(SamIn& in, uint32_t seed) {
+    uint32_t s = seed | 1u;
+    auto next = [&s] { s = s * 1664525u + 1013904223u; return ((s >> 8) & 0xffffu) / 32767.5f - 1.0f; };
+    in.q.resize((size_t)(in.rows() * in.W()));
+    in.k.resize(in.q.size());
+    in.v.resize(in.q.size());
+    for (auto* x : { &in.q, &in.k, &in.v })
+        for (auto& f : *x) f = next();
+    in.rh.resize((size_t)(in.tab() * in.hd));
+    in.rw.resize(in.rh.size());
+    for (auto* x : { &in.rh, &in.rw })
+        for (auto& f : *x) f = 0.1f * next();
+}
+
+/* F.interpolate(..., size=want, mode="linear"), align_corners False, over dim 0. */
+static std::vector<double> sam_table(const std::vector<float>& raw, int64_t hd, int64_t want) {
+    const int64_t rows = hd > 0 ? (int64_t)raw.size() / hd : 0;
+    std::vector<double> out((size_t)(want * hd), 0.0);
+    const double span = (double)rows / (double)want;
+    for (int64_t d = 0; d < want; ++d) {
+        double src = ((double)d + 0.5) * span - 0.5;
+        if (src < 0.0) src = 0.0;
+        if (src > (double)(rows - 1)) src = (double)(rows - 1);
+        const int64_t i0 = (int64_t)src, i1 = i0 + 1 < rows ? i0 + 1 : i0;
+        const double f = src - (double)i0;
+        for (int64_t c = 0; c < hd; ++c)
+            out[(size_t)(d * hd + c)] = raw[(size_t)(i0 * hd + c)] * (1.0 - f) +
+                                        raw[(size_t)(i1 * hd + c)] * f;
+    }
+    return out;
+}
+
+/* `drop_pads` is the WRONG reading of window_partition: pad keys removed from the softmax instead of
+ * attending as zeros. Used only to prove a case can tell the two apart. */
+static std::vector<float> sam_oracle(const SamIn& in, bool drop_pads = false) {
+    const int64_t W = in.W(), R = in.gh * in.gw, M = in.rows();
+    const int64_t th = in.win > 0 ? in.win : in.gh, tw = in.win > 0 ? in.win : in.gw;
+    const std::vector<double> Rh = sam_table(in.rh, in.hd, 2 * th - 1);
+    const std::vector<double> Rw = sam_table(in.rw, in.hd, 2 * tw - 1);
+    const double scale = 1.0 / std::sqrt((double)in.hd);
+    std::vector<float> out((size_t)(M * W), 0.0f);
+    std::vector<double> logits, acc;
+    for (int64_t s = 0; s < in.nseq; ++s)
+        for (int64_t ih = 0; ih < in.gh; ++ih)
+            for (int64_t iw = 0; iw < in.gw; ++iw) {
+                const int64_t row = s * R + ih * in.gw + iw;
+                const int64_t ty = in.win > 0 ? ih / in.win : 0;
+                const int64_t tx = in.win > 0 ? iw / in.win : 0;
+                const int64_t lh = ih - ty * th, lw = iw - tx * tw;
+                for (int64_t h = 0; h < in.nh; ++h) {
+                    const float* qf = &in.q[(size_t)(row * W + h * in.hd)];
+                    logits.clear();
+                    std::vector<int64_t> kvrow;
+                    for (int64_t jh = 0; jh < th; ++jh) {
+                        const double* hrp = &Rh[(size_t)((lh - jh + th - 1) * in.hd)];
+                        double hr = 0.0;
+                        for (int64_t c = 0; c < in.hd; ++c) hr += qf[c] * hrp[c];
+                        for (int64_t jw = 0; jw < tw; ++jw) {
+                            const int64_t kh = ty * th + jh, kw = tx * tw + jw;
+                            const bool real = kh < in.gh && kw < in.gw;
+                            if (drop_pads && !real) continue;
+                            const double* wrp = &Rw[(size_t)((lw - jw + tw - 1) * in.hd)];
+                            double sc = hr;
+                            for (int64_t c = 0; c < in.hd; ++c) sc += qf[c] * wrp[c];
+                            if (real) {
+                                const float* kf = &in.k[(size_t)((s * R + kh * in.gw + kw) * W +
+                                                                h * in.hd)];
+                                double d = 0.0;
+                                for (int64_t c = 0; c < in.hd; ++c) d += qf[c] * kf[c];
+                                sc += scale * d;
+                                kvrow.push_back(s * R + kh * in.gw + kw);
+                            } else {
+                                kvrow.push_back(-1);
+                            }
+                            logits.push_back(sc);
+                        }
+                    }
+                    double mx = -INFINITY;
+                    for (double v : logits) mx = std::max(mx, v);
+                    double sum = 0.0;
+                    for (double& v : logits) { v = std::exp(v - mx); sum += v; }
+                    acc.assign((size_t)in.hd, 0.0);
+                    for (size_t j = 0; j < logits.size(); ++j) {
+                        if (kvrow[j] < 0) continue;
+                        const float* vf = &in.v[(size_t)(kvrow[j] * W + h * in.hd)];
+                        const double p = logits[j] / sum;
+                        for (int64_t c = 0; c < in.hd; ++c) acc[(size_t)c] += p * vf[c];
+                    }
+                    for (int64_t c = 0; c < in.hd; ++c)
+                        out[(size_t)(row * W + h * in.hd + c)] = (float)acc[(size_t)c];
+                }
+            }
+    return out;
+}
+
+/* Run the op; `pitch` > 0 stores every operand at that row pitch (a column slice of a wider
+ * buffer), 0 uses W. Returns the output read back at the same pitch. */
+static std::vector<float> sam_run(const SamIn& in, int64_t pitch, int* rc) {
+    const int64_t W = in.W(), R = in.gh * in.gw, M = in.rows();
+    const int64_t ld = pitch > 0 ? pitch : W;
+    T q(RAD_BF16, { M, ld }), k(RAD_BF16, { M, ld }), v(RAD_BF16, { M, ld }), o(RAD_BF16, { M, ld });
+    for (int64_t r = 0; r < M; ++r)
+        for (int64_t c = 0; c < W; ++c) {
+            st_dt(RAD_BF16, q.t.data, r * ld + c, in.q[(size_t)(r * W + c)]);
+            st_dt(RAD_BF16, k.t.data, r * ld + c, in.k[(size_t)(r * W + c)]);
+            st_dt(RAD_BF16, v.t.data, r * ld + c, in.v[(size_t)(r * W + c)]);
+        }
+    T rh(RAD_BF16, { in.tab(), in.hd }), rw(RAD_BF16, { in.tab(), in.hd });
+    for (size_t i = 0; i < in.rh.size(); ++i) {
+        st_dt(RAD_BF16, rh.t.data, (int64_t)i, in.rh[i]);
+        st_dt(RAD_BF16, rw.t.data, (int64_t)i, in.rw[i]);
+    }
+    T cu(RAD_I32, { in.nseq + 1 });
+    for (int64_t s = 0; s <= in.nseq; ++s) st_int(RAD_I32, cu.t.data, s, s * R);
+
+    A a;
+    /* A pitch wider than W is a strided VIEW of the storage: shape [M, W], stride[0] = ld, which is
+     * what the tower's column slices of one fused projection are. */
+    auto view = [&](const T& x) {
+        RadTensor v = x.t;
+        v.shape[1] = W;
+        v.stride[0] = ld;
+        v.stride[1] = 1;
+        return v;
+    };
+    a.ts.push_back(view(q));
+    a.ts.push_back(view(k));
+    a.ts.push_back(view(v));
+    a.t(cu);
+    a.ts.push_back(view(o));
+    a.t(rh).t(rw)
+     .i("M", M).i("head_dim", in.hd).i("n_head", in.nh).i("grid_h", in.gh).i("grid_w", in.gw)
+     .i("window", in.win).d("scale", 1.0 / std::sqrt((double)in.hd)).s("dtype", "bf16");
+    *rc = run("sam_attn", a);
+    std::vector<float> out((size_t)(M * W), 0.0f);
+    for (int64_t r = 0; r < M; ++r)
+        for (int64_t c = 0; c < W; ++c) out[(size_t)(r * W + c)] = ld_dt(RAD_BF16, o.t.data, r * ld + c);
+    return out;
+}
+
+/* Compare two [M, W] rows: max absolute difference and the number outside 2e-3 + 2e-2 * |want|. */
+static void sam_cmp(const std::vector<float>& got, const std::vector<float>& want, float* maxd,
+                    int64_t* bad) {
+    *maxd = 0.0f;
+    *bad = 0;
+    for (size_t i = 0; i < want.size(); ++i) {
+        const float d = std::fabs(got[i] - want[i]);
+        if (d > *maxd) *maxd = d;
+        if (d > 2e-3f + 2e-2f * std::fabs(want[i])) ++*bad;
+    }
+}
+
+}  /* namespace */
+
+/* One row, one key: the softmax is 1 and the output is v, bit for bit after bf16 rounding. The same
+ * with window 1 over a 1x3 grid, where every row is a tile of its own. */
+TEST(op_sam_attn_single_key_returns_v) {
+    SamIn one;
+    one.gh = one.gw = 1; one.win = 1; one.nh = 1; one.hd = 4;
+    one.q = { 3.0f, -1.0f, 0.5f, 2.0f };
+    one.k = { 1.0f, 2.0f, 3.0f, 4.0f };
+    one.v = { 0.5f, -1.0f, 2.0f, 0.25f };
+    one.rh.assign(4, 0.0f);
+    one.rw.assign(4, 0.0f);
+    int rc = 0;
+    std::vector<float> got = sam_run(one, 0, &rc);
+    CHECK_EQ(rc, (int)RAD_OK);
+    for (int64_t c = 0; c < 4; ++c) CHECK_EQ(got[(size_t)c], one.v[(size_t)c]);
+
+    SamIn strip = one;
+    strip.gh = 1; strip.gw = 3;
+    strip.q = { 1, 2, 3, 4, -1, 0, 1, -2, 0.5f, 0.5f, 0.5f, 0.5f };
+    strip.k = { 1, 0, 0, 0, 1, 1, 0, 0, 2, 2, 2, 2 };
+    strip.v = { 0.5f, 0.25f, 0.125f, 0.0625f, -0.5f, -0.25f, -0.125f, -0.0625f,
+                9.0f, 8.0f, 7.0f, 6.0f };
+    strip.rh.assign(4, 0.25f);
+    strip.rw.assign(4, -0.25f);
+    got = sam_run(strip, 0, &rc);
+    CHECK_EQ(rc, (int)RAD_OK);
+    for (int64_t i = 0; i < 12; ++i) CHECK_EQ(got[(size_t)i], strip.v[(size_t)i]);
+}
+
+/* Window 14 over 16x16: the grid pads to 28x28, so the last two rows and columns of the last window
+ * are ZERO keys that still take part in the softmax. Compared against the double port, then against
+ * the port with the pads removed: the two differ, which is what makes this case able to see the
+ * rule. */
+TEST(op_sam_attn_windowed_matches_the_reference_port) {
+    SamIn in;
+    in.gh = 16; in.gw = 16; in.win = 14; in.nh = 2; in.hd = 8;
+    sam_fill(in, 0x51ed2701u);
+    int rc = 0;
+    const std::vector<float> got = sam_run(in, 0, &rc);
+    CHECK_EQ(rc, (int)RAD_OK);
+    float maxd = 0.0f; int64_t bad = 0;
+    const std::vector<float> want = sam_oracle(in);
+    sam_cmp(got, want, &maxd, &bad);
+    CHECK_EQ(bad, 0LL);
+    CHECK(maxd < 2e-3f);
+
+    const std::vector<float> nopad = sam_oracle(in, true);
+    float pad_max = 0.0f;
+    for (size_t i = 0; i < nopad.size(); ++i)
+        pad_max = std::max(pad_max, std::fabs(nopad[i] - want[i]));
+    CHECK(pad_max > 1e-3f);          /* the case can tell the two rules apart */
+}
+
+/* Window 0: the whole segment is one tile, over a square grid and over a 6x10 one whose rel_pos
+ * tables are 2*10-1 rows long and must be resampled to 2*6-1 for the row axis. */
+TEST(op_sam_attn_global_and_non_square) {
+    SamIn sq;
+    sq.gh = 16; sq.gw = 16; sq.win = 0; sq.nh = 2; sq.hd = 8;
+    sam_fill(sq, 0xa341316cu);
+    int rc = 0;
+    float maxd = 0.0f; int64_t bad = 0;
+    sam_cmp(sam_run(sq, 0, &rc), sam_oracle(sq), &maxd, &bad);
+    CHECK_EQ(rc, (int)RAD_OK);
+    CHECK_EQ(bad, 0LL);
+    CHECK(maxd < 2e-3f);
+
+    SamIn ns;
+    ns.gh = 6; ns.gw = 10; ns.win = 0; ns.nh = 3; ns.hd = 4;
+    sam_fill(ns, 0x7f4a7c15u);
+    CHECK_EQ(ns.tab(), 19LL);
+    sam_cmp(sam_run(ns, 0, &rc), sam_oracle(ns), &maxd, &bad);
+    CHECK_EQ(rc, (int)RAD_OK);
+    CHECK_EQ(bad, 0LL);
+    CHECK(maxd < 2e-3f);
+}
+
+/* Two segments: each is one tile (window 0). The second segment's rows are computed from its own
+ * data only, so changing the first segment's q/k/v must leave them bit for bit unchanged while the
+ * first segment's move. */
+TEST(op_sam_attn_segments_are_independent) {
+    SamIn in;
+    in.gh = 8; in.gw = 8; in.win = 0; in.nh = 2; in.hd = 8; in.nseq = 2;
+    sam_fill(in, 0x2545f491u);
+    int rc = 0;
+    const std::vector<float> base = sam_run(in, 0, &rc);
+    CHECK_EQ(rc, (int)RAD_OK);
+    float maxd = 0.0f; int64_t bad = 0;
+    sam_cmp(base, sam_oracle(in), &maxd, &bad);
+    CHECK_EQ(bad, 0LL);
+    CHECK(maxd < 2e-3f);
+
+    SamIn alt = in;
+    for (int64_t i = 0; i < 64 * in.W(); ++i) {        /* the first segment's rows */
+        alt.q[(size_t)i] = -alt.q[(size_t)i];
+        alt.k[(size_t)i] += 0.25f;
+    }
+    const std::vector<float> moved = sam_run(alt, 0, &rc);
+    CHECK_EQ(rc, (int)RAD_OK);
+    const size_t half = base.size() / 2;
+    bool first_changed = false, second_same = true;
+    for (size_t i = 0; i < half; ++i)
+        first_changed |= base[i] != moved[i];
+    for (size_t i = half; i < base.size(); ++i)
+        second_same &= base[i] == moved[i];
+    CHECK(first_changed);
+    CHECK(second_same);
+}
+
+/* The tower's q/k/v are the three column slices of one fused projection, so every operand is read
+ * at a row pitch wider than W. The result must be bit-identical to the dense-pitch one. */
+TEST(op_sam_attn_reads_at_a_row_pitch) {
+    SamIn in;
+    in.gh = 16; in.gw = 16; in.win = 14; in.nh = 2; in.hd = 8;
+    sam_fill(in, 0x1234567u);
+    int rc = 0;
+    const std::vector<float> dense = sam_run(in, 0, &rc);
+    CHECK_EQ(rc, (int)RAD_OK);
+    const std::vector<float> strided = sam_run(in, in.W() + 3, &rc);
+    CHECK_EQ(rc, (int)RAD_OK);
+    for (size_t i = 0; i < dense.size(); ++i) CHECK_EQ(strided[i], dense[i]);
+}
+
+/* Refusals: a segment that is not one grid, an absent table, a negative window, a zero head. */
+TEST(op_sam_attn_refuses_malformed_geometry) {
+    SamIn in;
+    in.gh = 4; in.gw = 4; in.win = 0; in.nh = 1; in.hd = 4; in.nseq = 2;
+    sam_fill(in, 0x9e3779b9u);
+    const int64_t W = in.W(), R = in.gh * in.gw, M = in.rows();
+
+    auto build = [&](T& q, T& k, T& v, T& cu, T& o, T& rh, T& rw, A& a, int64_t window) {
+        a.t(q).t(k).t(v).t(cu).t(o).t(rh).t(rw)
+         .i("M", M).i("head_dim", in.hd).i("n_head", in.nh).i("grid_h", in.gh)
+         .i("grid_w", in.gw).i("window", window).d("scale", 0.5).s("dtype", "bf16");
+    };
+    T q(RAD_BF16, { M, W }), k(RAD_BF16, { M, W }), v(RAD_BF16, { M, W }), o(RAD_BF16, { M, W });
+    q.f(in.q); k.f(in.k); v.f(in.v);
+    T rh(RAD_BF16, { in.tab(), in.hd }), rw(RAD_BF16, { in.tab(), in.hd });
+    rh.f(in.rh); rw.f(in.rw);
+
+    /* cu says the first segment is half a grid. */
+    T cu_short(RAD_I32, { 3 }); cu_short.n({ 0, R / 2, M });
+    A a1; build(q, k, v, cu_short, o, rh, rw, a1, 0);
+    CHECK_EQ(run("sam_attn", a1), (int)RAD_E_SHAPE);
+
+    T cu_ok(RAD_I32, { 3 }); cu_ok.n({ 0, R, M });
+    A a2; build(q, k, v, cu_ok, o, rh, rw, a2, 0);
+    CHECK_OK(run("sam_attn", a2));
+
+    /* An absent rel_pos table. */
+    A a3; a3.t(q).t(k).t(v).t(cu_ok).t(o).t(rh).tnull()
+          .i("M", M).i("head_dim", in.hd).i("n_head", in.nh).i("grid_h", in.gh)
+          .i("grid_w", in.gw).i("window", 0).d("scale", 0.5).s("dtype", "bf16");
+    CHECK_EQ(run("sam_attn", a3), (int)RAD_E_INVAL);
+
+    /* A negative window, and a zero head width. */
+    A a4; build(q, k, v, cu_ok, o, rh, rw, a4, -1);
+    CHECK_EQ(run("sam_attn", a4), (int)RAD_E_SHAPE);
+    A a5; a5.t(q).t(k).t(v).t(cu_ok).t(o).t(rh).t(rw)
+          .i("M", M).i("head_dim", 0).i("n_head", in.nh).i("grid_h", in.gh)
+          .i("grid_w", in.gw).i("window", 0).d("scale", 0.5).s("dtype", "bf16");
+    CHECK_EQ(run("sam_attn", a5), (int)RAD_E_SHAPE);
 }

@@ -12,6 +12,7 @@
 #include <cfloat>
 #include <cmath>
 #include <numeric>
+#include <unordered_set>
 
 namespace rad {
 
@@ -526,8 +527,33 @@ int32_t host_argmax(const float* logits, int64_t n_vocab) {
     return (int32_t)best;
 }
 
-/* ================================================================== the chain */
+void host_ngram_ban(CandidateSet& s, const int32_t* history, int64_t n_history, int32_t n,
+                    int32_t window) {
+    if (n <= 0 || !history || n_history < (int64_t)n) return;
+    const int64_t len = n_history;
+    const int64_t win = (window > 0 && window < len) ? window : len;
+    const int64_t start = len - win, end = len - n + 1;
+    if (end <= start) return;
+    const int64_t plen = (int64_t)n - 1, p0 = len - plen;
 
+    /* The set of tokens a continuation would complete an n-gram with, as the reference builds it:
+     * every n-gram in the window whose first n-1 tokens equal the current prefix contributes the
+     * token after them. */
+    std::unordered_set<int32_t> banned;
+    for (int64_t idx = start; idx < end; ++idx) {
+        bool match = true;
+        for (int64_t j = 0; j < plen; ++j) {
+            if (history[idx + j] != history[p0 + j]) { match = false; break; }
+        }
+        if (match) banned.insert(history[idx + plen]);
+    }
+    if (banned.empty()) return;
+    s.sorted = false;   /* a -infinity candidate belongs after every finite one */
+    for (Candidate& c : s.c)
+        if (banned.count(c.id) != 0) c.logit = -INFINITY;
+}
+
+/* ================================================================== the chain */
 int32_t host_sample_into(CandidateSet& s, const SamplingParams& sp, const HostRefInput& in,
                          ChainOrder order) {
     /* Penalties first in both orders: they act on raw logits, the cuts on probabilities. */
@@ -546,6 +572,10 @@ int32_t host_sample_into(CandidateSet& s, const SamplingParams& sp, const HostRe
         host_dry(s, in.history, in.n_history, in.total_context, dp,
                  in.dry_breakers ? *in.dry_breakers : kNone);
     }
+
+    /* The n-gram ban, after the penalties and before the greedy split: the device chain issues it
+     * there, so a greedy request sees the same masked distribution. Off at ngram_ban_n 0. */
+    host_ngram_ban(s, in.history, in.n_history, sp.ngram_ban_n, sp.ngram_window);
 
     /* Greedy skips the chain: penalties -> mask -> argmax. Temperature 0 collapses every other
      * logit to -inf, so a mask applied after it could leave nothing. */

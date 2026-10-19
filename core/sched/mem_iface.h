@@ -44,6 +44,24 @@ struct IKVManager {
     /* After a committed step, a window group frees what no later query can read
      * (KVManager::trim_window). */
     virtual void trim_window(uint64_t seq, int64_t keep_from) { (void)seq; (void)keep_from; }
+    /* R-SWA (KVManager::declare_runtime_window): the W this group arms a sequence with, 0 when it
+     * carries no runtime windows. The scheduler arms every sequence it admits with
+     * set_window(seq, prompt length, W); a manager with no runtime window refuses it and the
+     * scheduler never asks. */
+    virtual int64_t runtime_window_tokens(int32_t group) const { (void)group; return 0; }
+    virtual int  set_window(uint64_t seq, int64_t visible_lo, int64_t window_tokens) {
+        (void)seq; (void)visible_lo; (void)window_tokens;
+        return RAD_E_UNSUPPORTED;
+    }
+    /* The sequence's runtime window in `group`, if it has one (KVManager::runtime_window). A
+     * sequence with one is excluded from prefix publish, checkpoint snapshots and speculation:
+     * the window is runtime data and the ring rewrites its slots in place. */
+    virtual bool runtime_window(uint64_t seq, int32_t group, SeqWindow* out) const {
+        (void)seq; (void)group; (void)out;
+        return false;
+    }
+
+    virtual bool has_runtime_window(uint64_t seq) const { (void)seq; return false; }
     /* Window snapshot of a prefix hit (KVManager::has_window_snapshot / seed_window). The
      * defaults mean no hit on a windowed trunk is ever resumed. */
     virtual bool has_window_snapshot() const { return false; }
@@ -95,7 +113,11 @@ struct IKVManager {
 
     /* Absolute token position that block_table(seq, group)[0] covers: zero for a full group,
      * non-zero for a window group once blocks below the window are recycled. The step batch maps
-     * a slot as `(pos - first_block_pos) / block_size`. */
+     * a slot as `(pos - first_block_pos) / block_size`.
+     *
+     * A sequence with a runtime window (runtime_window) keeps first_block_pos 0 even once the ring
+     * recycles: its table is [reference][ring] from position 0 and the ring's positions map
+     * modulo ring_blocks (SeqWindow), so only the slot index recycles, never the table. */
     virtual int64_t first_block_pos(uint64_t seq, int32_t group) const = 0;
 
     /* Index of the first entry of block_table(seq, group) changed since the previous call;
@@ -213,7 +235,7 @@ struct KVGeom {
         for (const KVGroupInfo& gi : groups) {
             G e;
             e.kind = gi.decl.kind;
-            e.paged = (e.kind == RAD_KV_FULL || e.kind == RAD_KV_WINDOW);
+            e.paged = (e.kind == RAD_KV_FULL || e.kind == RAD_KV_WINDOW || e.kind == RAD_KV_RING);
             e.block_size = gi.block_size > 0 ? gi.block_size : 1;
             e.window = gi.decl.window;
             k.g.push_back(e);
@@ -226,6 +248,23 @@ struct KVGeom {
     int32_t slot(int gi, const std::vector<int32_t>& bt, int64_t first_pos, int64_t pos) const {
         const G& e = g[(size_t)gi];
         int64_t bi = (pos - first_pos) / e.block_size;
+        if (bi < 0 || bi >= (int64_t)bt.size()) return -1;
+        return (int32_t)(bt[(size_t)bi] * e.block_size + (pos % e.block_size));
+    }
+
+    /* The same slot for a runtime window (SeqWindow): the reference maps linearly (first_pos is
+     * 0 there), and a position at or past the ring's start lives in block
+     * ring_pos/block + ((pos - ring_pos)/block) % ring_blocks, which is what rewrites the ring's
+     * slots in place. ring_pos is block-aligned, so `pos % block` stays the in-block offset. */
+    int32_t slot_ring(int gi, const std::vector<int32_t>& bt, int64_t first_pos, int64_t pos,
+                      const SeqWindow& w) const {
+        const G& e = g[(size_t)gi];
+        int64_t bi;
+        if (w.set && pos >= w.ring_pos) {
+            bi = w.ring_pos / e.block_size + ((pos - w.ring_pos) / e.block_size) % w.ring_blocks;
+        } else {
+            bi = (pos - first_pos) / e.block_size;
+        }
         if (bi < 0 || bi >= (int64_t)bt.size()) return -1;
         return (int32_t)(bt[(size_t)bi] * e.block_size + (pos % e.block_size));
     }
@@ -244,6 +283,12 @@ struct KVBinding final : IKVManager {
     int  ensure(uint64_t s, int64_t n) override     { return m->ensure(s, n); }
     int  ensure_from(uint64_t s, int64_t n, int64_t k) override { return m->ensure(s, n, k); }
     void trim_window(uint64_t s, int64_t k) override { m->trim_window(s, k); }
+    int64_t runtime_window_tokens(int32_t g) const override { return m->runtime_window_tokens(g); }
+    int  set_window(uint64_t s, int64_t lo, int64_t w) override { return m->set_window(s, lo, w); }
+    bool runtime_window(uint64_t s, int32_t g, SeqWindow* o) const override {
+        return m->runtime_window(s, g, o);
+    }
+    bool has_runtime_window(uint64_t s) const override { return m->has_runtime_window(s); }
     bool has_window_snapshot() const override { return m->has_window_snapshot(); }
     int  seed_window(uint64_t s, int64_t p) override { return m->seed_window(s, p); }
     int  adopt(uint64_t s, int32_t g, const std::vector<int32_t>& b, int64_t n) override {

@@ -775,6 +775,7 @@ bytes).
 | `attn_cross` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `cu_seqlens`, `cu_k` → `out` |
 | `attn_na3d` | `M`(range) `head_dim` `kt` `kh` `kw` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `geom` → `out` |
 | `attn_local_rel` | `M`(range) `head_dim` `n_head` `left` `right` `softcap`:f64 `cu_div`/opt `dtype` | `q`, `k`, `v`, `relk`, `pds`w, `cu_seqlens` → `out` |
+| `sam_attn` | `M`(range) `head_dim` `n_head` `grid_h` `grid_w` `window` `scale`:f64 `dtype` | `q`, `k`, `v`, `cu_seqlens`, `out`, `rel_pos_h`w, `rel_pos_w`w |
 | `kv_store` | `M`(range) `head_dim` `n_head_kv` `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `k`, `v`, `slot_mapping`, `kv_cache`:inout |
 | `rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `ladder`/opt `llama3_factor`:f64/opt `llama3_low`:f64/opt `llama3_high`:f64/opt `llama3_orig`:f64/opt | `qkv`:inout, `positions` |
 | `rope_table` | `M`(range) `rot` `theta`:f64 `scale`:f64 `dtype` `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `head_dim`/opt `ladder`/opt | `positions` → `cos_sin` |
@@ -830,6 +831,22 @@ softmax over the visible keys and the weighted sum of `v`, all in f32 and rounde
 `[left + 1, n_head * head_dim]`, row `d` the projected position for distance `d`. The upstream
 reference computes this in 12-query blocks over 24-key windows with a Transformer-XL shift, giving
 every key outside the window a `-1e9` logit, so the sliding form is the same function.
+
+**`sam_attn`** is Unlimited-OCR's DeepEncoder (SAM ViT-B/16) attention: windowed, with *decomposed*
+relative position. Each `cu_seqlens` segment is `grid_h * grid_w` rows in raster grid order (row
+`i_h * grid_w + i_w`). With `window > 0` the grid is padded to multiples of `window` with ZERO rows
+(deepencoder's `window_partition`, applied after `norm1`), cut into `window x window` tiles and each
+tile attends to all of its rows -- the pad rows are keys and values, so their logits (which carry the
+relative-position terms even though their `q` and `k` are zero) take part in the softmax and their
+`v` contributes nothing. `window` 0 is one tile over the whole segment (the global-attention layers).
+The logits are `scale * q.k + q.Rh[i_h, j_h] + q.Rw[i_w, j_w]`, each dot over the head's whole
+`head_dim`, with `i_h - j_h + L - 1` indexing `rel_pos_h` and `i_w - j_w + L - 1` indexing
+`rel_pos_w` (`L` the window, or the grid axis for a global layer); softmax in f32 with the max
+subtracted over the tile's keys, `out = sum p * v`, written back in segment row order with the pad
+rows dropped. The tables are `[2*L - 1, head_dim]` where `L = window`, or `max(grid_h, grid_w)` for
+a global layer; a geometry whose axes need a longer table has it resampled along dim 0 by
+`get_rel_pos`'s linear interpolation. `q`, `k` and `v` are the three column slices of one fused
+projection, so each may be a strided view of a `[M, 3 * n_head * head_dim]` buffer.
 
 **`rope`'s multi-component modes.** `mrope`, `imrope` and `axial` rotate with NeoX pairing and let
 several position components drive different frequencies. `positions` is then `[C, M]`,
@@ -2365,9 +2382,17 @@ the usual rescale, pairs by value).
 | op | params | operands |
 |---|---|---|
 | `sample_dry` | `M` `n_vocab` `vocab_off`/opt | `logits`:inout, `params`, `history`, `breakers`? |
+| `sample_ngram_ban` | `M` `n_vocab` `vocab_off`/opt | `logits`:inout, `params`, `history`, `ngram` |
 | `sample_typical` | `M` `n_cand` | `cand_idx`:inout, `cand_val`:inout, `params` |
 | `sample_xtc` | `M` `n_cand` | `cand_idx`:inout, `cand_val`:inout, `params` |
 | `sample_chain` | `M` `n_vocab` `temp`:f64/opt `p`:f64/opt `min_p`:f64/opt `k`/opt | `logits`, `query`?, `u` → `draw` |
+
+`sample_ngram_ban` is the windowed no-repeat-ngram ban (Unlimited-OCR's
+`SlidingWindowNoRepeatNgramProcessor`): every token that would complete an n-gram the last `window`
+tokens of the row's history already contain is set to -infinity. `ngram` is one i32
+`{n-gram length, window}` pair a row; the window bounds the n-gram's START index, so one that spans
+the window boundary is still searched. `window` <= 0 searches the whole staged history (the
+un-windowed processor) and `n` 0 turns the stage off, which is the default.
 
 `sample_dry` is llama.cpp's DRY: it penalises, once, each token that would extend a repeated suffix
 of the history, by its longest such repeat. Sequence breakers are strings, so they are resolved

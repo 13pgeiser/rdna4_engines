@@ -199,6 +199,11 @@ private:
         int32_t  *h_rows = nullptr, *d_rows = nullptr;
         int32_t  *h_first = nullptr, *d_first = nullptr;
         AdvGroup *h_grp = nullptr, *d_grp = nullptr;
+        /* [max_seqs] per-sequence runtime-window data for the advance: the block-aligned first
+         * ring position and the block table's length in blocks, 0 when the sequence has no
+         * runtime window (advance.h). Per sequence because each prompt has its own floor. */
+        int32_t  *h_rpos = nullptr, *d_rpos = nullptr;
+        int32_t  *h_tlen = nullptr, *d_tlen = nullptr;
 
         char*      h_derived = nullptr;   /* derivation staging, byte-addressed */
         /* [3][n_tok] rotary positions and [n_tok] encoder-row targets (RadBatch::rope_pos,
