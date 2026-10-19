@@ -89,7 +89,9 @@ pub(crate) fn probe_lock_file(path: &Path, shared: bool) -> GpuLock {
     let mode = if shared { libc::LOCK_SH } else { libc::LOCK_EX };
     // SAFETY: `file` owns a valid descriptor for the whole call.
     if unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } == 0 {
-        // SAFETY: same descriptor; the close below would release it anyway.
+        // SAFETY: same descriptor. Unlock explicitly rather than on close: a
+        // child forked by another thread holds a copy of this descriptor, and
+        // with it the lock, until it execs.
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
         return GpuLock::Free;
     }
@@ -313,6 +315,14 @@ mod tests {
         dir
     }
 
+    /// Unlock, then close. Closing alone frees a flock only once every
+    /// descriptor of the open file description is gone, and a child that
+    /// another test thread is spawning holds a copy until it execs.
+    fn release(holder: File) {
+        // SAFETY: valid descriptor owned by `holder`.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_UN) }, 0);
+    }
+
     #[test]
     fn status_parsing_reads_vmpin_and_cap_ipc_lock() {
         let text =
@@ -359,8 +369,77 @@ mod tests {
             probe_lock_file(&path, true),
             GpuLock::Busy { holder: Some(4242) }
         );
-        drop(holder);
+        release(holder);
         assert_eq!(probe_lock_file(&path, false), GpuLock::Free);
+    }
+
+    /// The race behind the flaky release check, made deterministic: another
+    /// thread forks a child that holds copies of every descriptor until it
+    /// execs. Closing a holder leaves its lock held by that copy; unlocking
+    /// frees it at once; CLOEXEC drops the copy at exec.
+    #[test]
+    fn lock_release_survives_a_child_forked_mid_spawn() {
+        use std::os::unix::process::CommandExt;
+
+        let dir = scratch("forked");
+        let closed_path = dir.join("closed.lock");
+        let unlocked_path = dir.join("unlocked.lock");
+        let closed = File::create(&closed_path).unwrap();
+        let unlocked = File::create(&unlocked_path).unwrap();
+        for holder in [&closed, &unlocked] {
+            // SAFETY: valid descriptor owned by `holder`.
+            assert_eq!(
+                unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+        }
+        let (mut ready_r, ready_w) = std::io::pipe().unwrap();
+        let (go_r, go_w) = std::io::pipe().unwrap();
+        let (ready_fd, go_fd, go_w_fd) = (ready_w.as_raw_fd(), go_r.as_raw_fd(), go_w.as_raw_fd());
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        // SAFETY: the hook runs in the forked child before exec and only calls
+        // the async-signal-safe `close`, `write` and `read`.
+        unsafe {
+            command.pre_exec(move || {
+                libc::close(go_w_fd);
+                libc::write(ready_fd, [1u8].as_ptr().cast(), 1);
+                let mut byte = 0u8;
+                libc::read(go_fd, (&mut byte as *mut u8).cast(), 1);
+                Ok(())
+            });
+        }
+        // `spawn` returns only after the child execs, so it runs on its own
+        // thread, like a concurrent test starting a process.
+        let spawner = std::thread::spawn(move || {
+            let child = command.spawn();
+            drop(ready_w);
+            child
+        });
+        let mut byte = [0u8];
+        assert_eq!(ready_r.read(&mut byte).unwrap(), 1, "child never forked");
+
+        drop(closed);
+        assert_eq!(
+            probe_lock_file(&closed_path, false),
+            GpuLock::Busy { holder: None }
+        );
+        release(unlocked);
+        assert_eq!(probe_lock_file(&unlocked_path, false), GpuLock::Free);
+
+        drop(go_w);
+        let mut child = spawner.join().unwrap().unwrap();
+        let leaked = std::fs::read_dir(format!("/proc/{}/fd", child.id()))
+            .unwrap()
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .filter(|target| *target == closed_path || *target == unlocked_path)
+            .collect::<Vec<_>>();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            leaked.is_empty(),
+            "lock descriptors survived exec: {leaked:?}"
+        );
     }
 
     #[test]
