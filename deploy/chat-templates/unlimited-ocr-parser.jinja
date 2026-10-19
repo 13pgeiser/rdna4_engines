@@ -1,0 +1,40 @@
+{#- Unlimited-OCR is a single-shot document parser: it expects the picture marker(s) followed by
+    the reference instruction, e.g. "<__media__>document parsing." (the server replaces each
+    marker with a picture's token run). Chat clients send the picture plus arbitrary text, often
+    nothing, and resend earlier turns including their pictures. A parser without its start
+    instruction free-runs like a language model and first emits prose (the Chinese preamble seen
+    from LibreChat), and text from earlier turns or a system message would be concatenated into
+    the prompt. This template keeps every picture marker (the server requires the rendered prompt
+    to account for every picture in the request) and the final user turn's text, drops other
+    text, and supplies the reference instruction when the final turn carries none. -#}
+{%- set ns = namespace(last=none, at=-1) -%}
+{%- for message in messages -%}
+  {%- if message['role'] == 'user' -%}
+    {%- set ns.last = message -%}
+    {%- set ns.at = loop.index0 -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- for message in messages -%}
+  {%- set mi = loop.index0 -%}
+  {%- if message['content'] is string -%}
+    {%- set c = message['content'] -%}
+    {%- if mi == ns.at -%}
+      {{- c -}}
+    {%- else -%}
+      {%- for piece in c.split('<__media__>') -%}
+        {%- if not loop.last -%}<__media__>{%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- for part in message['content'] -%}
+      {%- if part['type'] == 'media_marker' -%}<__media__>
+      {%- elif part['type'] == 'text' and mi == ns.at and ns.last is not none -%}{{- part['text'] -}}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if ns.last is not none and ns.last['content'] is string -%}
+  {%- if ns.last['content'] == '<__media__>' -%}document parsing.
+  {%- elif ns.last['content'] == '<__media__><__media__>' -%}Multi page parsing.
+  {%- endif -%}
+{%- endif -%}

@@ -22,3 +22,4 @@ services:
       --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
       --tp 1 --max-num-seqs 8 --max-model-len 32768 --kv-cache-dtype fp8
       --gpu-headroom-mib 96
+      --override-chat-template /chat-templates/unlimited-ocr-parser.jinja
