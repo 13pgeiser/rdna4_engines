@@ -185,6 +185,9 @@ pub struct Qwen4Bundle {
     pub(crate) spec_top1: Option<GpuTensor>,
     pub(crate) spec_hidden: Option<GpuTensor>,
     pub(crate) spec_host_top1: Vec<u8>,
+    /// DFlash2 drafter's target layers and capture rows (`None`: no DFlash2
+    /// drafter is armed; a forward then captures the MTP wide hidden).
+    pub(crate) dflash: Option<crate::dflash_target::Qwen4DflashTarget>,
     /// Lab observation of every speculative forward's logits; unarmed it
     /// records nothing (`crate::lab_window`).
     #[cfg(feature = "lab")]
@@ -873,6 +876,7 @@ impl Qwen4Bundle {
             spec_top1: None,
             spec_hidden: None,
             spec_host_top1: Vec::new(),
+            dflash: None,
             #[cfg(feature = "lab")]
             lab_logits: crate::lab_window::LabLogitsTap::default(),
             penalty_stage: None,
@@ -1804,7 +1808,14 @@ impl Qwen4Bundle {
                 tokens.len()
             )));
         }
-        let hidden = if capture_hidden {
+        // An armed DFlash2 drafter captures its target layers instead of the
+        // MTP head's wide hidden.
+        let layer_capture = if capture_hidden {
+            self.dflash_layer_capture(tokens.len())?
+        } else {
+            None
+        };
+        let hidden = if capture_hidden && layer_capture.is_none() {
             let width = self
                 .config
                 .hc_count
@@ -1829,9 +1840,11 @@ impl Qwen4Bundle {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
         let prior_scope = std::mem::replace(&mut forward.prefill_scope, true);
+        forward.layer_capture = layer_capture;
         let result = forward
             .forward_chunk_silent(self, gpu, tokens, hidden.as_ref())
             .map_err(|error| BundleError::Forward(error.to_string()));
+        forward.layer_capture = None;
         forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
         result
@@ -1908,7 +1921,12 @@ impl Qwen4Bundle {
             .as_ref()
             .ok_or_else(|| BundleError::Forward("Qwen4 spec argmax is not attached".to_string()))?
             .sub_offset(0, top1_len);
-        let hidden = if capture_hidden {
+        let layer_capture = if capture_hidden {
+            self.dflash_layer_capture(tokens.len())?
+        } else {
+            None
+        };
+        let hidden = if capture_hidden && layer_capture.is_none() {
             let width = self
                 .config
                 .hc_count
@@ -1933,6 +1951,7 @@ impl Qwen4Bundle {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
         let prior_scope = std::mem::replace(&mut forward.prefill_scope, prefill);
+        forward.layer_capture = layer_capture;
         let result = forward
             .forward_chunk(
                 self,
@@ -1944,6 +1963,7 @@ impl Qwen4Bundle {
                 output_rows,
             )
             .map_err(|error| BundleError::Forward(error.to_string()));
+        forward.layer_capture = None;
         forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
         result?;
@@ -4330,6 +4350,7 @@ impl Qwen4Bundle {
             spec_logits,
             spec_top1,
             spec_hidden,
+            dflash,
             session,
             pair_session_stage,
             slowlink,
@@ -4377,6 +4398,9 @@ impl Qwen4Bundle {
             })
             .unwrap_or(Ok(()));
         let mut spec_error = pair_stage_error;
+        if let Some(Err(error)) = dflash.map(|target| target.free_gpu(gpu)) {
+            spec_error.get_or_insert(error);
+        }
         for tensor in [spec_logits, spec_top1, spec_hidden].into_iter().flatten() {
             if let Err(error) = gpu.free_tensor(tensor) {
                 spec_error.get_or_insert(error);

@@ -414,6 +414,18 @@ pub trait SpecTarget {
         Err("target does not expose lm_head over hidden".into())
     }
 
+    /// [`lm_head_logits`](Self::lm_head_logits) left on the device: a
+    /// non-owning `[n, vocab]` F32 view of the target's logit scratch, valid
+    /// until the target's next forward or head call. Returns `Err` by default.
+    fn lm_head_logits_device(
+        &mut self,
+        _gpu: &mut Gpu,
+        _hidden_rows: &GpuTensor,
+        _n: usize,
+    ) -> Result<GpuTensor, String> {
+        Err("target does not expose a device lm_head over hidden".into())
+    }
+
     /// Like [`verify_block`](Self::verify_block), but returns the FULL per-position
     /// target logits (`block.len() × vocab`, row-major) instead of the per-position
     /// argmax. The caller uses the full logits to draw from the target distribution

@@ -4947,7 +4947,7 @@ impl Qwen4ExpertStage {
 /// the step interpreter (so the whole layer program stays one interpreter
 /// call): a host layer's compute waits for its staged experts, and after the
 /// call the stage is freed / refilled ([`Qwen4ExpertStage::after_moe`]).
-struct StagedMoeHooks<'s> {
+struct StagedMoeHooks<'s, 'c> {
     stage: &'s Qwen4ExpertStage,
     bundle: &'s Qwen4Bundle,
     moe: &'s [Option<Qwen4MoeLayerRuntime>],
@@ -4956,9 +4956,11 @@ struct StagedMoeHooks<'s> {
     /// The stage error behind a hook failure, returned instead of the
     /// interpreter's stringified one.
     error: Option<Qwen4GpuForwardError>,
+    /// The forward's DFlash2 layer capture, announced every step.
+    capture: Option<&'c mut (dyn MoeStepHooks + 'c)>,
 }
 
-impl StagedMoeHooks<'_> {
+impl StagedMoeHooks<'_, '_> {
     fn fail(&mut self, result: Result<(), Qwen4GpuForwardError>) -> Result<(), DispatchError> {
         result.map_err(|error| {
             let message = error.to_string();
@@ -4968,7 +4970,14 @@ impl StagedMoeHooks<'_> {
     }
 }
 
-impl MoeStepHooks for StagedMoeHooks<'_> {
+impl MoeStepHooks for StagedMoeHooks<'_, '_> {
+    fn before_step(&mut self, gpu: &mut Gpu, step: &Step<'_>) -> Result<(), DispatchError> {
+        match self.capture.as_deref_mut() {
+            Some(capture) => capture.before_step(gpu, step),
+            None => Ok(()),
+        }
+    }
+
     fn before_moe(&mut self, gpu: &mut Gpu) -> Result<(), DispatchError> {
         let result = match self.moe.get(self.layer) {
             None => Err(invalid("G2 staged forward ran more MoE calls than layers")),
@@ -6910,6 +6919,77 @@ impl<'a> LayerPhaseEnv<'a> {
 pub type Qwen4QsaTap =
     Box<dyn FnMut(&mut Gpu, usize, &IndexedAttentionOp<'_>) -> Result<(), String> + Send>;
 
+/// DFlash2 target features of the forwards that run while it is set
+/// ([`Qwen4Bundle`]'s capturing spec entries arm and clear it): the completed
+/// output of each listed trunk layer, averaged over its hyper-connection
+/// streams, into that layer's slot of `rows[row..]` (F32, `layers.len() *
+/// hidden` per row). Captured eagerly between the interpreter's steps, so the
+/// step program and its fusions are the ones the forward runs without it.
+pub(crate) struct Qwen4LayerCapture {
+    /// Zero-based trunk layers, ascending; `layer + 1` is never the PLE layer.
+    pub(crate) layers: SmallVec<[usize; 8]>,
+    /// F32 rows of the whole forward request (a non-owning view).
+    pub(crate) rows: GpuTensor,
+    /// Request row the running tile starts at (the tile loops set it).
+    pub(crate) row: usize,
+}
+
+/// The interpreter hook of a [`Qwen4LayerCapture`] forward: right before
+/// each target step (the mixer of the layer after a captured one) the
+/// streams hold the captured layer's completed output.
+struct LayerCaptureHooks<'h> {
+    targets: SmallVec<[(*const (), usize); 8]>,
+    fired: u32,
+    streams: &'h GpuTensor,
+    rows: GpuTensor,
+    n: usize,
+    hc: usize,
+    hidden: usize,
+    slots: usize,
+    bf16: bool,
+}
+
+impl LayerCaptureHooks<'_> {
+    fn capture(&self, gpu: &mut Gpu, slot: usize) -> Result<(), DispatchError> {
+        rdna_compute::tensor_ops::hc_mean_capture_f32(
+            gpu,
+            self.streams,
+            &self.rows,
+            self.n,
+            self.hc,
+            self.hidden,
+            self.slots * self.hidden,
+            slot * self.hidden,
+            self.bf16,
+        )
+        .map_err(|error| DispatchError::Hip(format!("Qwen4 layer capture: {error}")))
+    }
+
+    fn missed(&self) -> bool {
+        self.fired != (1u32 << self.targets.len()) - 1
+    }
+}
+
+impl MoeStepHooks for LayerCaptureHooks<'_> {
+    fn before_moe(&mut self, _gpu: &mut Gpu) -> Result<(), DispatchError> {
+        Ok(())
+    }
+    fn after_moe(&mut self, _gpu: &mut Gpu) -> Result<(), DispatchError> {
+        Ok(())
+    }
+    fn before_step(&mut self, gpu: &mut Gpu, step: &Step<'_>) -> Result<(), DispatchError> {
+        let at = step as *const Step<'_> as *const ();
+        for index in 0..self.targets.len() {
+            let (target, slot) = self.targets[index];
+            if target == at {
+                self.capture(gpu, slot)?;
+                self.fired |= 1 << index;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Reusable production forward owner.  Construct it once per assembled bundle
 /// and use `forward_token`/`forward_chunk` repeatedly; both methods share the
 /// exact same chunk implementation.
@@ -6968,6 +7048,9 @@ pub struct Qwen4GpuForward {
     /// single-token HIP forward, for expert-cache sizing. `None` when unset.
     route_trace: Option<RouteTrace>,
     pub(crate) qsa_tap: Option<Qwen4QsaTap>,
+    /// DFlash2 target-feature capture of the forwards that run while it is
+    /// set; `None` everywhere else (see [`Qwen4LayerCapture`]).
+    pub(crate) layer_capture: Option<Qwen4LayerCapture>,
     /// `HIPFIRE_QWEN4_CUT_LAYERS`, read once at construction: when set, the
     /// program runs as separate interpreter runs split at these layers (eager
     /// only; no retained replay).
@@ -8330,6 +8413,7 @@ impl Qwen4GpuForward {
             trunk_zba,
             trunk_a4,
             qsa_tap: None,
+            layer_capture: None,
             lane_scope: false,
             prefill_scope: false,
             scope,
@@ -9318,9 +9402,9 @@ impl Qwen4GpuForward {
             if let Some(banks) =
                 self.npu_trunk_pair(bundle.state.position, tokens.len() - offset, max_chunk)
             {
-                if self.cut_layers.is_some() {
+                if self.cut_layers.is_some() || self.layer_capture.is_some() {
                     return Err(invalid(format!(
-                        "{CUT_LAYERS_ENV} cannot run with the NPU trunk pair route"
+                        "{CUT_LAYERS_ENV} and the DFlash2 layer capture cannot run with the NPU trunk pair route"
                     )));
                 }
                 let rows = banks[0] + banks[1];
@@ -9388,6 +9472,9 @@ impl Qwen4GpuForward {
                     Ok::<_, Qwen4GpuForwardError>(capture.sub_offset(capture_offset, capture_len))
                 })
                 .transpose()?;
+            if let Some(layer_capture) = self.layer_capture.as_mut() {
+                layer_capture.row = offset;
+            }
             let output_policy = if output_rows == Qwen4OutputRows::All || final_chunk {
                 Qwen4OutputPolicy::Rows(output_rows)
             } else {
@@ -9449,9 +9536,9 @@ impl Qwen4GpuForward {
             if let Some(banks) =
                 self.npu_trunk_pair(bundle.state.position, tokens.len() - offset, max_chunk)
             {
-                if self.cut_layers.is_some() {
+                if self.cut_layers.is_some() || self.layer_capture.is_some() {
                     return Err(invalid(format!(
-                        "{CUT_LAYERS_ENV} cannot run with the NPU trunk pair route"
+                        "{CUT_LAYERS_ENV} and the DFlash2 layer capture cannot run with the NPU trunk pair route"
                     )));
                 }
                 let rows = banks[0] + banks[1];
@@ -9486,6 +9573,9 @@ impl Qwen4GpuForward {
                     Ok::<_, Qwen4GpuForwardError>(capture.sub_offset(capture_offset, capture_len))
                 })
                 .transpose()?;
+            if let Some(layer_capture) = self.layer_capture.as_mut() {
+                layer_capture.row = offset;
+            }
             self.forward_chunk_inner(
                 bundle,
                 gpu,
@@ -10033,6 +10123,11 @@ impl Qwen4GpuForward {
         let (input, output) = (self.scope.input, self.scope.output);
         let mesh_route_rows = self.mesh_route_rows;
         let mesh_run = mesh_route_rows.is_some();
+        if self.layer_capture.is_some() && (mesh_run || !input || !output) {
+            return Err(invalid(
+                "the DFlash2 layer capture runs on a whole single-card trunk only",
+            ));
+        }
         if (!input && argmax_of.is_some())
             || (!output
                 && (output_policy.requested_rows(n).is_some() || wide_hidden_capture.is_some()))
@@ -10363,7 +10458,8 @@ impl Qwen4GpuForward {
         {
             Some(stage)
                 if n >= stage.min_rows
-                    && (stage.capture || wide_hidden_capture.is_none())
+                    && (stage.capture
+                        || (wide_hidden_capture.is_none() && self.layer_capture.is_none()))
                     && self.qsa_tap.is_none() =>
             {
                 let capturing = match gpu.active_stream.as_ref() {
@@ -10414,6 +10510,16 @@ impl Qwen4GpuForward {
             streams: &self.scratch.streams,
             gates: &self.scratch.hc_gates,
         };
+        // DFlash2 layer capture: each captured layer's slot, keyed by the
+        // step (the next layer's mixer) before which the streams hold its
+        // completed output; the trunk's last layer is captured after the
+        // program instead.
+        let capture_layers: SmallVec<[usize; 8]> = self
+            .layer_capture
+            .as_ref()
+            .map(|capture| capture.layers.clone())
+            .unwrap_or_default();
+        let mut capture_at: SmallVec<[(usize, usize); 8]> = SmallVec::new();
         for layer_index in band.clone() {
             if let Some(cuts) = cut_layers.as_ref() {
                 if cuts.contains(layer_index) {
@@ -10491,6 +10597,20 @@ impl Qwen4GpuForward {
                     });
                 }
             }
+            // DFlash2 layer capture of the previous layer: keyed by this
+            // layer's mixer, the step after `push_mixer_prefix`'s HC read.
+            let captured_slot = layer_index
+                .checked_sub(1)
+                .and_then(|previous| capture_layers.iter().position(|&l| l == previous));
+            if let Some(slot) = captured_slot {
+                if ple_layer_index == Some(layer_index) {
+                    return Err(invalid(format!(
+                        "DFlash2 layer capture of layer {} would include the PLE layer",
+                        layer_index - 1
+                    )));
+                }
+                capture_at.push((steps.len() + 1, slot));
+            }
             layer_env.push_mixer_prefix(&mut steps, layer_index, layer, &description)?;
 
             match &description.ffn {
@@ -10528,6 +10648,17 @@ impl Qwen4GpuForward {
                     && gpu.qwen4_moe_sym_iu4_applies(route_n);
                 dump_ends.push((layer_index, steps.len(), bf16_grouped));
             }
+        }
+        let capture_last = capture_layers
+            .iter()
+            .position(|&layer| layer + 1 == band.end);
+        if capture_at.len() + usize::from(capture_last.is_some()) != capture_layers.len()
+            || capture_layers.len() > 32
+        {
+            return Err(invalid(format!(
+                "DFlash2 layer capture {capture_layers:?} is outside trunk layers {}..{}",
+                band.start, band.end
+            )));
         }
         validate_steps(gpu, &steps).map_err(|error| {
             Qwen4GpuForwardError::Dispatch(format!("preflight Qwen4 typed program: {error:?}"))
@@ -10849,6 +10980,7 @@ impl Qwen4GpuForward {
                 && self.qsa_tap.is_none()
                 && !mesh_run
                 && self.cut_layers.is_none()
+                && self.layer_capture.is_none()
                 && !hipfire_dispatch::pipeline::qsa_projection_hook_installed();
             // `HIPFIRE_QWEN4_CUT_LAYERS` is the cut-safe eager schedule: refuse
             // every route that would execute the program some other way.
@@ -10995,8 +11127,32 @@ impl Qwen4GpuForward {
                 // Parity harness only: a QSA projection hook counts slots from
                 // each forward's first QSA step (no-op with no hook installed).
                 hipfire_dispatch::pipeline::reset_qsa_projection_slot();
-                let execute = |gpu: &mut Gpu, steps: &[Step<'_>]| {
-                    execute_validated_steps(gpu, &ctx, steps).map_err(|error| {
+                let mut capture_hooks =
+                    self.layer_capture.as_ref().map(|capture| LayerCaptureHooks {
+                        targets: capture_at
+                            .iter()
+                            .map(|&(at, slot)| (&steps[at] as *const Step<'_> as *const (), slot))
+                            .collect(),
+                        fired: 0,
+                        streams: &self.scratch.streams,
+                        rows: capture.rows.sub_offset(
+                            capture.row * capture_layers.len() * config.hidden_size,
+                            n * capture_layers.len() * config.hidden_size,
+                        ),
+                        n,
+                        hc: dims.hc_count,
+                        hidden: config.hidden_size,
+                        slots: capture_layers.len(),
+                        bf16: bf16_state,
+                    });
+                let mut execute = |gpu: &mut Gpu, steps: &[Step<'_>]| {
+                    match capture_hooks.as_mut() {
+                        Some(hooks) => {
+                            execute_validated_steps_with_moe_hooks(gpu, &ctx, steps, hooks)
+                        }
+                        None => execute_validated_steps(gpu, &ctx, steps),
+                    }
+                    .map_err(|error| {
                         Qwen4GpuForwardError::Dispatch(format!(
                             "execute Qwen4 layer program: {error:?}"
                         ))
@@ -11061,6 +11217,9 @@ impl Qwen4GpuForward {
                         moe: &self.moe,
                         layer: 0,
                         error: None,
+                        capture: capture_hooks
+                            .as_mut()
+                            .map(|hooks| hooks as &mut dyn MoeStepHooks),
                     };
                     let mut run = |gpu: &mut Gpu, steps: &[Step<'_>]| {
                         execute_validated_steps_with_moe_hooks(gpu, &ctx, steps, &mut hooks)
@@ -11176,6 +11335,18 @@ impl Qwen4GpuForward {
                             execute(gpu, &steps[split..])?;
                         }
                         (None, None) => execute(gpu, &steps)?,
+                    }
+                }
+                if let Some(hooks) = capture_hooks.as_ref() {
+                    if hooks.missed() {
+                        return Err(invalid(
+                            "DFlash2 layer capture: a capture boundary ran inside a fused step",
+                        ));
+                    }
+                    if let Some(slot) = capture_last {
+                        hooks.capture(gpu, slot).map_err(|error| {
+                            Qwen4GpuForwardError::Dispatch(format!("{error:?}"))
+                        })?;
                     }
                 }
             }
