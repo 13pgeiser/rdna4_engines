@@ -213,3 +213,11 @@ matter how many there are.
   requires `task=ref2va`; reference parts must be real file parts (`curl -F ref_image_1=@pic.png`,
   `-F ref_video_1=@clip.mp4`, `-F ref_audio_1=@tone.wav`) — note a leading `<` or `;` in a text field
   needs `--form-string`, not `-F`.
+- **Full-shape content-control (the DaSiWa max request, all kinds live).** One request carrying four
+  `ref_image_N`, a `ref_video_1` + its `ref_video_audio_1`, and a standalone `ref_audio_1` is accepted at
+  submit (the interleaving group guard passes when the four photos are contiguous) and completes to an MP4
+  with a clean fault scan. Holding the seed, the four photos, the video and the soundtrack fixed and changing
+  only the *standalone audio* gives **different** decoded video *and* audio streams — so the full-shape
+  denoise consumes the audio reference too, not just its count. Reproduction scripts: `refdet.sh`
+  (video-ref determinism + content-control), `chain.sh` (tail-as-`ref_video` chaining), `fullshape.sh`
+  (this max-shape control) under the build tree.
