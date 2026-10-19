@@ -19,31 +19,11 @@ struct ProjectMeta {
     long xr, xh, wp, yr, yh;
     int rows, heads;
 };
-/* Absorption streams adjacent latent columns; expansion reduces a contiguous weight row. */
-__global__ void project_absorb(const uint16_t* x, const uint16_t* w, uint16_t* y, ProjectMeta m) {
-    const int col = blockIdx.x * 128 + threadIdx.x, head = blockIdx.y, r = blockIdx.z;
-    if (col >= 512) return;
-    float sum = 0;
-    for (int j = 0; j < 256; ++j)
-        sum = fmaf(bf16_to_f32(x[(long)r * m.xr + head * m.xh + j]),
-                   bf16_to_f32(w[((long)head * 512 + j) * m.wp + col]), sum);
-    y[(long)r * m.yr + head * m.yh + col] = f32_to_bf16(sum);
-}
-__global__ void project_expand(const uint16_t* x, const uint16_t* w, uint16_t* y, ProjectMeta m) {
-    const int lane = threadIdx.x & 31, col = blockIdx.x * 4 + (threadIdx.x >> 5), head = blockIdx.y,
-              r = blockIdx.z;
-    float sum = 0;
-    for (int j = lane; j < 512; j += 32)
-        sum = fmaf(bf16_to_f32(x[(long)r * m.xr + head * m.xh + j]),
-                   bf16_to_f32(w[((long)head * 512 + 256 + col) * m.wp + j]), sum);
-#pragma unroll
-    for (int mask = 16; mask; mask >>= 1) sum += __shfl_xor(sum, mask, 32);
-    if (!lane) y[(long)r * m.yr + head * m.yh + col] = f32_to_bf16(sum);
-}
-/* project_absorb and project_expand with R rows a thread (absorb) or a wave (expand): each weight
- * element is loaded once for R rows. Every row's sum runs over j in the same order, and
- * r4d_xor_sum<32> exchanges as the shuffle loop does, so the bytes match the one-row kernels.
- * A tail group past the last row reads that row again and stores nothing for it. */
+/* Absorption streams adjacent latent columns; expansion reduces a contiguous weight row. R rows
+ * a thread (absorb) or a wave (expand): each weight element is loaded once for R rows. Every row's
+ * sum runs over j in the same order whatever R is (expand: each lane's share in ascending j, then
+ * r4d_xor_sum<32>), so a row's bytes do not depend on the batch it is in. A tail group past the
+ * last row reads that row again and stores nothing for it. */
 template <int R>
 __global__ void project_absorb_rows(const uint16_t* x, const uint16_t* w, uint16_t* y,
                                     ProjectMeta m) {
@@ -122,24 +102,11 @@ int project_body(const RadArgs* a, RadStream stream) {
         return RAD_E_SHAPE;
     const ProjectMeta m{ x.stride[0], x.stride[1],     w.stride[0], y.stride[0],
                          y.stride[1], (int)x.shape[0], (int)h };
-    /* RADIANCE_MLA_PROJECT: `old` the one-row kernels on shuffle sums, the reference the selftest
-     * holds the row forms to byte for byte; 1, 2, 4 or 8 pins the rows a thread (absorb) or a
-     * wave (expand). */
-    const char* form = std::getenv("RADIANCE_MLA_PROJECT");
     const auto* xp = (const uint16_t*)x.data;
     const auto* wp = (const uint16_t*)w.data;
     auto* yp = (uint16_t*)y.data;
-    if (form && !std::strcmp(form, "old")) {
-        if (absorb)
-            return R4D_EMIT(stream, project_absorb, dim3(4, h, m.rows), dim3(128), 0, xp, wp, yp,
-                            m);
-        return R4D_EMIT(stream, project_expand, dim3(64, h, m.rows), dim3(128), 0, xp, wp, yp, m);
-    }
-    const long R = form && *form ? std::strtol(form, nullptr, 10)
-                   : m.rows >= 8 ? 8
-                   : m.rows >= 4 ? 4
-                   : m.rows >= 2 ? 2
-                                 : 1;
+    /* The largest of 8, 4, 2 and 1 rows a group that the batch fills. */
+    const int R = m.rows >= 8 ? 8 : m.rows >= 4 ? 4 : m.rows >= 2 ? 2 : 1;
 #define MLA_PROJECT_ROWS(RR)                                                                       \
     do {                                                                                           \
         const unsigned groups = (unsigned)((m.rows + RR - 1) / RR);                                \
@@ -639,10 +606,9 @@ int body(const RadArgs* a, RadStream stream) {
     // Vectors need every cache row on a sixteen-byte boundary.
     const bool wide = g_mla_matrix_form != 1 && !((uintptr_t)kv.data & 15) && !(kv.stride[0] % 8) &&
                       !(kv.stride[2] % 8);
-    /* RADIANCE_MLA_PAIR=pos keeps the positional pairing, for comparison; the union's LDS lists
-     * hold a table of at most kUnionBlocks entries. */
-    const char* pairing = std::getenv("RADIANCE_MLA_PAIR");
-    const bool by_page = !(pairing && !std::strcmp(pairing, "pos")) && bt.shape[1] <= kUnionBlocks;
+    /* The union's LDS lists hold a table of at most kUnionBlocks entries; a wider table takes the
+     * positional pairing. */
+    const bool by_page = bt.shape[1] <= kUnionBlocks;
     const bool stats = MATRIX && env_on("RADIANCE_MLA_CONFLICT_STATS");
     Meta m{ q.stride[0],  q.stride[1],      kv.stride[0],  kv.stride[2],
             bt.stride[0], bt.stride[1],     len.stride[0], o.stride[0],

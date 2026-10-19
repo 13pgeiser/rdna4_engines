@@ -229,7 +229,7 @@ struct Fixture {
         return (rad_op)(P.ops.size() - 1);
     }
 
-    int start(rad::ResidencyTable* res = nullptr, bool profile = false) {
+    int start(rad::ResidencyTable* res = nullptr, bool profile = false, bool record = false) {
         CtxDesc d;
         d.program     = &P;
         d.rank        = 1;
@@ -241,8 +241,8 @@ struct Fixture {
         d.registry    = registry;
         /* The arch bodies here issue whatever a case asks, which the batch does not describe, so
          * no pass may be recorded and replayed under the batch's key (a card records passes; the
-         * host backend cannot). */
-        d.record_passes = false;
+         * host backend cannot). A case about the recording decision itself asks for it. */
+        d.record_passes = record;
         return ctx.init(d);
     }
 
@@ -1867,6 +1867,25 @@ TEST(a_lane_built_mid_step_starts_behind_lane_zero) {
         CHECK_OK(c.set_lane(0));
     }));
     CHECK_EQ(dev_get(f, f.ctx.buf_ptr(y)), 4242);
+}
+
+/* A calibration tap's gram_accum sums across passes while its plugin counts the summed rows in
+ * step; a played pass reissues the sum without calling step (#122). A program holding one records
+ * no passes; one without records them wherever the backend can. */
+TEST(a_program_with_a_calibration_tap_records_no_passes) {
+    {
+        Fixture f;
+        f.add_buffer("x", RAD_BF16, 64, 4, 0);
+        loose_op(f);
+        CHECK_OK(f.start(nullptr, false, /*record=*/true));
+        CHECK_EQ(f.ctx.records_passes(), rad::tape_supported());
+    }
+    Fixture f;
+    f.add_buffer("x", RAD_BF16, 64, 4, 0);
+    loose_op(f);
+    loose_op(f, "gram_accum");
+    CHECK_OK(f.start(nullptr, false, /*record=*/true));
+    CHECK(!f.ctx.records_passes());
 }
 
 /* ================================================================== the pass key */

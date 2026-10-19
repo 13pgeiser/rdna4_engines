@@ -774,10 +774,9 @@ int PrefixCache::reserve_checkpoint(uint64_t session, int64_t pos, const BlockHa
             /* Evict the least recently used snapshot, where a use is its reservation or a lookup
              * resuming from it, and never one handed out or reserved this step (its admission
              * restores from the slot ahead of the step; the save lands in it after). A tip gets
-             * no protection beyond its recency: sessions
-             * are request ids, and a client that rewrites its last message leaves one tip per
-             * turn that no later turn reaches, while the anchor every turn resumes from is used
-             * each turn. */
+             * no protection beyond its recency: sessions are request ids, and a client that
+             * rewrites its last message leaves one tip per turn that no later turn reaches, while
+             * the anchor every turn resumes from is used each turn. */
             const Ckpt* victim = nullptr;
             for (const auto& kvp : ck_by_prefix_) {
                 if (handed(kvp.first) || reserved(kvp.first)) continue;

@@ -6,7 +6,8 @@
  * threads through `submit()` and leave through their VideoTicket.
  *
  * A request holds a lane from admission to its last chunk. Its geometry, schedule and rotary
- * positions are fixed at submit, so nothing is computed between passes but the staging.
+ * positions are fixed at submit, so nothing is computed between passes but the staging; a request
+ * whose length the model predicts is shaped again once, after its VCOND pass.
  *
  * Pass priority, one pass at a time:
  *
@@ -76,6 +77,13 @@ private:
         std::vector<float> pos_small;
         float         factor = 0.0f;
         bool          upscaled = false;
+        /* Guidance resolved against the model's defaults (RadVideoGenBatch::guidance_h) and the
+         * negative prompt's tokens the VCOND pass carries (0: none). */
+        float         guidance[8] = {};
+        int32_t       n_neg = 0;
+        /* The request named no length and the model predicts one (RadVideoGenDecl::duration_out):
+         * shaped at default_chunks until its VCOND pass is done. */
+        bool          auto_len = false;
         int32_t  lane = -1;
         bool     admitted = false;
         bool     cond_done = false;
@@ -96,7 +104,7 @@ private:
     /* Staging regions: their offsets in the host span and every rank's slab. */
     struct Region { int64_t off = 0, bytes = 0, used = 0; };
     enum { R_TOK, R_POS, R_CU, R_ROPE, R_GEOM, R_SCHED, R_TV, R_TA, R_SEED, R_LANE, R_FIRST,
-           R_SEG, R_LAT, R_UP, R_N };
+           R_SEG, R_LAT, R_UP, R_IMG, R_GUIDE, R_N };
 
     template <class T> T* hptr(int r) const { return reinterpret_cast<T*>(host_ + reg_[r].off); }
     template <class T> T* dptr(int rank, int r) const {
@@ -105,6 +113,8 @@ private:
     int  upload();
     /* The geometry and rows of the job's next step: the small ones before its upscale. */
     bool small_now(const Job& j) const { return j.split > 0 && !j.upscaled; }
+    int  shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_t steps, std::string* why);
+    int32_t predicted_chunks(double log_seconds, std::string* note) const;
     void base_batches(const Job& j, const RadVideoGeom& g, int64_t n_tok, int step);
     void stage_geom(const Job& j, const RadVideoGeom& g, int64_t rows, int32_t chunk);
     void stage_sched(const Job& j, int32_t i, bool to_clean);
@@ -123,6 +133,10 @@ private:
 
     RadVideoGenDecl     decl_{};
     std::vector<double> rungs_;        /* decl_.rungs points here */
+    std::vector<double> refine_rungs_; /* decl_.refine_rungs */
+    std::string         default_negative_;
+    std::vector<std::string> decoder_names_;   /* RadVideoGenDecl::decoders */
+    std::vector<int64_t>     decoder_area_;    /* each one's largest frame */
     std::string         name_;
     PositionsFn         positions_ = nullptr;
     int64_t             max_tok_ = 0;
@@ -136,6 +150,7 @@ private:
     int64_t             frames_bytes_ = 0;
     float*              audio_host_ = nullptr;
     int64_t             audio_bytes_ = 0;
+    float*              duration_host_ = nullptr;   /* duration_out's readback, f32 [1] */
     std::vector<Readback> rb_;
 
     std::vector<RadBatch>         out_;      /* one per rank */

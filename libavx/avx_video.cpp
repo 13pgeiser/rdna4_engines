@@ -458,14 +458,21 @@ AVX_KERNEL(conv3d_ndhwc) {
     const RadTensor *X = &a->t[0], *W = &a->t[1], *B = &a->t[2], *G = &a->t[3];
     const RadTensor *R = rad_arg_in(a, 4), *Y = &a->t[5];
     const int64_t cin = p_int(a, "cin", 0), cout = p_int(a, "cout", 0);
-    const int64_t k = p_int(a, "k", 0), kt = p_int(a, "kt", 0);
-    if (cin <= 0 || cout <= 0 || k <= 0 || kt <= 0 || !(k & 1) || !(kt & 1) || numel(G) < 3)
+    const int64_t k = p_int(a, "k", 0), kt = p_int(a, "kt", 0), tpre = p_int(a, "tpre", 0);
+    /* The frames' padding (libref's): zero, the edge frame repeated, or causal with `tpre` more
+     * copies of the first frame in front (T + tpre frames out). */
+    const char* tps = p_str(a, "tpad", "zero");
+    const int tpad = !std::strcmp(tps, "zero") ? 0 : !std::strcmp(tps, "replicate") ? 1
+                   : !std::strcmp(tps, "causal") ? 2 : -1;
+    if (tpad < 0 || (tpre && tpad != 2)) return RAD_E_INVAL;
+    if (cin <= 0 || cout <= 0 || k <= 0 || kt <= 0 || !(k & 1) || !(kt & 1) || tpre < 0 ||
+        numel(G) < 3)
         return RAD_E_SHAPE;
     const int64_t T = at(G, 0), H = at(G, 1), Wd = at(G, 2);
     if (T <= 0 || H <= 0 || Wd <= 0) return RAD_E_SHAPE;
-    const int64_t rows = T * H * Wd, taps = kt * k * k, KK = taps * cin;
-    if (rows_of(Y, cout) < rows || rows_of(X, cin) < rows || (R && rows_of(R, cout) < rows) ||
-        numel(W) < cout * KK || numel(B) < cout)
+    const int64_t rows = (T + tpre) * H * Wd, taps = kt * k * k, KK = taps * cin;
+    if (rows_of(Y, cout) < rows || rows_of(X, cin) < T * H * Wd ||
+        (R && rows_of(R, cout) < rows) || numel(W) < cout * KK || numel(B) < cout)
         return RAD_E_SHAPE;
     static thread_local std::vector<uint8_t> wbuf, pbuf;
     static thread_local std::vector<float> ybuf;
@@ -505,7 +512,10 @@ AVX_KERNEL(conv3d_ndhwc) {
             for (int64_t dz = 0; dz < kt; ++dz)
                 for (int64_t kh = 0; kh < k; ++kh)
                     for (int64_t kw = 0; kw < k; ++kw, d += (size_t)cin * ael) {
-                        const int64_t tz = t + dz - pz, iy = i + kh - ps, ix = j + kw - ps;
+                        int64_t tz = t + dz - pz;
+                        if (tpad == 1) tz = std::min<int64_t>(std::max<int64_t>(tz, 0), T - 1);
+                        else if (tpad == 2) tz = std::max<int64_t>(t + dz - (kt - 1) - tpre, 0);
+                        const int64_t iy = i + kh - ps, ix = j + kw - ps;
                         if (tz < 0 || tz >= T || iy < 0 || iy >= H || ix < 0 || ix >= Wd) {
                             std::memset(d, 0, (size_t)cin * ael);
                             continue;

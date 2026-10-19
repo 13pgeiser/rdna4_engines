@@ -43,7 +43,6 @@ struct Model {
     rad_op mprev = 0, membed = 0, membed_ar = 0, men = 0, mhn = 0, meh = 0, mnorm_op = 0,
            mselect = 0, mback = 0, mcopy = 0, mhead = 0;
     bool have_mtp = false;
-    bool fuse_router = false, fuse_swiglu = false, gather_inverse = false;
 };
 static std::unique_ptr<Model> models[MAX_RANKS];
 static thread_local std::unique_ptr<Model> probe_model;
@@ -159,7 +158,7 @@ static int buffers(RadBuilder* b, Model& m) {
     m.mw.eoff = decl_b(b, nm.f("expert_offsets"), RAD_I32, { 289 });
     m.mw.ecnt = decl_b(b, nm.f("expert_counts"), RAD_I32, { 288 });
     m.mw.sorted = decl_b(b, nm.f("expert_sorted"), RAD_I32, { R * 8 });
-    if (m.gather_inverse) m.mw.inv = decl_b(b, nm.f("expert_inverse"), RAD_I32, { R * 8 });
+    m.mw.inv = decl_b(b, nm.f("expert_inverse"), RAD_I32, { R * 8 });
     m.mw.egu = decl_b(b, nm.f("expert_gate_up"), RAD_BF16, { R * 8, 2 * F });
     m.mw.eff.x = decl_b(b, nm.f("expert_ff"), RAD_BF16, { R * 8, F });
     RAD_ARCH_TRY(m.mw.eff.declare_qs(b, nm, g, "expert_ff", F, R * 8));
@@ -242,7 +241,7 @@ static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool dra
                        nm.ckpt("%s.mlp.gate_proj.weight", pre),
                        nm.ckpt("%s.mlp.up_proj.weight", pre),
                        nm.ckpt("%s.mlp.down_proj.weight", pre) };
-        lay.dense.swiglu_quant = m.fuse_swiglu;
+        lay.dense.swiglu_quant = true;
         RAD_ARCH_TRY(lay.dense.declare(b, nm, g, l, w, s, false, draft, kArNone, false, 10));
     } else {
         auto w = m.mw;
@@ -261,8 +260,8 @@ static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool dra
         s.cfg.route_scale = 2.5;
         s.cfg.swiglu_limit = 10;
         s.cfg.shared_ungated = 1;
-        s.cfg.router_fuse = m.fuse_router;
-        s.cfg.swiglu_quant = m.fuse_swiglu;
+        s.cfg.router_fuse = 1;
+        s.cfg.swiglu_quant = 1;
         for (int q = 0; q < 2; ++q) {
             s.cfg.ff_lo[q] = g.rank * (2048 / g.world);
             s.cfg.ff_hi[q] = (g.rank + 1) * (2048 / g.world);
@@ -272,19 +271,6 @@ static int layer(RadBuilder* b, Model& m, Layer& lay, Names& nm, int l, bool dra
     }
     if (!draft) RAD_ARCH_TRY(lay.ffn_hc.declare_post(b));
     return RAD_OK;
-}
-/* A decode fusion of the MoE block, on unless its variable is 0. Each is byte-identical to the
- * launches it replaces, so the switch is about speed alone; 0 restores the separate launches. */
-static int fusion_switch(const char* name, bool* out) {
-    const char* e = std::getenv(name);
-    *out = true;
-    if (!e || !*e || !std::strcmp(e, "1")) return RAD_OK;
-    if (!std::strcmp(e, "0")) {
-        *out = false;
-        return RAD_OK;
-    }
-    fprintf(stderr, "radiance: %s='%s'; it is 0 or 1\n", name, e);
-    return RAD_E_INVAL;
 }
 static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* ctx) {
     if (!b || !meta || !ctx || ctx->is_draft || ctx->rank < 0 || ctx->rank >= MAX_RANKS)
@@ -326,9 +312,6 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     g.wire_exact = !ctx->tp_wire_lossy;
     g.wire_min_bytes = ctx->tp_wire_min_bytes;
     if (g.max_tok < 1 || g.max_ctx < 1 || g.max_seqs < 1 || g.eps <= 0) return RAD_E_INVAL;
-    RAD_ARCH_TRY(fusion_switch("RADIANCE_GLM_ROUTER_FUSE", &m.fuse_router));
-    RAD_ARCH_TRY(fusion_switch("RADIANCE_GLM_SWIGLU_QUANT", &m.fuse_swiglu));
-    RAD_ARCH_TRY(fusion_switch("RADIANCE_GLM_GATHER_INVERSE", &m.gather_inverse));
     RAD_ARCH_TRY(buffers(b, m));
     RadKVGroupDecl d{};
     d.kind = RAD_KV_FULL;

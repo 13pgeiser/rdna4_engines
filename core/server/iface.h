@@ -127,11 +127,8 @@ struct SchedMetrics {
      * a decode step regardless of load. */
     int64_t step_ns = 0;
     int64_t step_ns_decode = 0;
-    /* The fastest single-sequence decode step this process has measured, nanoseconds; 0 until one
-     * runs. The dashboard reads this instead of asking a human to type a ruler (see the same field
-     * on rad::SchedMetrics, where it is recorded). */
+    /* The single-sequence decode floor and most recent window (rad::SchedMetrics). */
     int64_t step_ns_decode_best = 0;
-    /* The most recent completed single-sequence decode window mean; see SchedMetrics. */
     int64_t step_ns_decode_recent = 0;
 };
 
@@ -589,7 +586,19 @@ struct ImageGenInfo {
     /* The model samples on a schedule of its own and takes no step count (a distilled model). */
     bool    fixed_schedule = false;
     int64_t fixed_steps = 0;
+    /* Guidance in the model card's terms: with `cfg_original` the scale s means cond + s (cond -
+     * uncond), off at 0, and the core runs s + 1; otherwise uncond + s (cond - uncond), off at 1. */
     double  default_cfg = 1.0;
+    bool    cfg_original = false;
+    /* The negative prompt a guided request gets when it names none; without one it must. */
+    bool        has_default_negative = false;
+    std::string default_negative;
+    /* The pictures are not read by the conditioning network: they go to the generator's own
+     * encoder only (RAD_GEN_LAYOUT_JOINT_STEP). */
+    bool    refs_encoder_only = false;
+    /* A reference picture is shrunk to `ref_area` only when larger, then centre-cropped to the
+     * size multiple; otherwise resized to `ref_area` at its aspect. */
+    bool    ref_shrink_only = false;
 };
 
 class IImageGen {
@@ -650,6 +659,22 @@ struct VideoGenInfo {
     /* A latent upscaler: the largest factor (0: none) and the full-size evaluations by default. */
     double  upscale_max = 0.0;
     int64_t upscale_refine = 0;
+    /* `steps` counts model evaluations rather than sigma grid points (RadVideoGenDecl form 1). */
+    bool    step_evals = false;
+    /* Guidance (RadVideoGenDecl::guidance): the terms a request may name, their defaults and the
+     * negative prompt a guided request gets when it names none. */
+    bool    guidance = false;
+    double  guidance_default[8] = {};
+    std::string default_negative;
+    /* Image to video: a first frame is taken, after an H.264 round trip at image_crf when > 0. */
+    bool    image_cond = false;
+    int32_t image_crf = 0;
+    /* A length head: a request that names no length gets the one the model predicts. */
+    bool    length_head = false;
+    /* The decoders a request may name, the default first, and each one's largest frame in pixels
+     * (RadVideoGenDecl::decoders); empty for a model with one. */
+    std::vector<std::string> decoders;
+    std::vector<int64_t>     decoder_max_area;
 };
 
 class IVideoGen {

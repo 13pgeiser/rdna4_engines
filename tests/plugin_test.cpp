@@ -996,12 +996,10 @@ TEST(libr4d_resolves_the_vision_attention_without_a_window) {
 }
 
 /* GLM-5.3-Flash's MLA at eight heads a rank: the matrix row ranks above the wave row and serves
- * every M up to its bound, a decode step's rows and a prefill chunk alike. RADIANCE_MLA_MATRIX_MAX_M
- * lowers that bound, which this case does not cover. */
+ * every M up to its bound, a decode step's rows and a prefill chunk alike. */
 TEST(libr4d_resolves_the_mla_attention_by_rows) {
     const std::string so = libr4d();
     if (so.empty()) return;
-    if (std::getenv("RADIANCE_MLA_MATRIX_MAX_M")) return;
     Registry r;
     CHECK(r.load_plugin(so, 0) >= 0);
     Geometry g;

@@ -367,6 +367,13 @@ static const RadParamSpec pAttnDense[] = { P_INT("M"), P_INT("head_dim"), P_INT(
                                            P_INTO("window_right") };
 static const RadOperandSpec oAttnDense[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"),
                                              OUT("out") };
+static const RadParamSpec pAttnCross[] = { P_INT("M"), P_INT("head_dim"), P_INT("gqa"),
+                                           P_INT("causal"), P_STR("dtype"), P_F64O("scale") };
+static const RadOperandSpec oAttnCross[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"),
+                                             OPD("cu_k"), OUT("out") };
+static const RadParamSpec pAttnNa3d[] = { P_INT("M"), P_INT("head_dim"), P_INT("kt"), P_INT("kh"),
+                                          P_INT("kw"), P_STR("dtype"), P_F64O("scale") };
+static const RadOperandSpec oAttnNa3d[] = { OPD("q"), OPD("k"), OPD("v"), OPD("geom"), OUT("out") };
 
 /* `k_scale` and `v_scale` are the descales an fp8 cache is read back with, so a store divides by
  * them; optional because a bf16 cache has none. */
@@ -693,6 +700,13 @@ static const RadOperandSpec oMerge[]     = { OPD("gathered"), OPD("params"),
 static const RadParamSpec pLnMod[]   = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype") };
 static const RadOperandSpec oLnMod[] = { OPD("x"), OPD("s"), OPD("cu_seqlens"), OUT("y") };
 /* `act` is the gate's activation, "tanh" (the default) or "none". */
+static const RadParamSpec pTableAdd[] = { P_INT("M"), P_INT("n"), P_INT("L"), P_STR("dtype") };
+static const RadOperandSpec oTableAdd[] = { OPD("x"), WGT("t"), OUT("y") };
+static const RadParamSpec pMixRows[] = { P_INT("M"), P_INT("n"), P_INT("k"), P_STR("dtype") };
+static const RadParamSpec pChanStats[] = { P_INT("M"), P_INT("n"), P_STR("mode"), P_INTO("var"),
+                                           P_F64O("eps"), P_STR("dtype") };
+static const RadOperandSpec oChanStats[] = { OPD("x"), WGT("mean"), WGT("s"), OUT("y") };
+static const RadOperandSpec oMixRows[] = { OPD("x"), WGT("w"), OUT("y") };
 static const RadParamSpec pGateAdd[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_STRO("act") };
 static const RadOperandSpec oGateAdd[] = { OPD("y"), OPD("g"), OPD("cu_seqlens"), INOUT("x") };
 static const RadParamSpec pLnModQ[]  = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
@@ -701,12 +715,14 @@ static const RadOperandSpec oLnModQ[] = { OPD_O("y"), OPD_O("g"), OPD("s"), OPD(
                                           INOUT("x"), OUT("q"), OUT("scale"), OUT_O("z") };
 /* `s` is [n_seq, >= 2n], [shift | scale] in each row. */
 static const RadParamSpec pRmsMod[]  = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INTO("gated"),
-                                         P_STR("dtype") };
-static const RadOperandSpec oRmsMod[] = { OPD_O("y"), OPD_O("g"), OPD("s"), WGT("w"),
+                                         P_STR("dtype"), P_F64O("wadd"),
+                                         P_INTO("norm_once"), P_STRO("norm") };
+static const RadOperandSpec oRmsMod[] = { OPD_O("y"), OPD_O("g"), OPD("s"), WGT_O("w"),
                                           OPD("cu_seqlens"), INOUT("x"), OUT("z") };
 static const RadParamSpec pRmsModQ[]  = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
-                                          P_INT("gated"), P_STR("dtype") };
-static const RadOperandSpec oRmsModQ[] = { OPD_O("y"), OPD_O("g"), OPD("s"), WGT("w"),
+                                          P_INT("gated"), P_STR("dtype"), P_F64O("wadd"),
+                                         P_INTO("norm_once"), P_STRO("norm") };
+static const RadOperandSpec oRmsModQ[] = { OPD_O("y"), OPD_O("g"), OPD("s"), WGT_O("w"),
                                            OPD("cu_seqlens"), INOUT("x"), OUT("q"), OUT("scale"),
                                            OUT_O("z") };
 /* `t`, `sigma` and `sigma_next` are one f32 value each. */
@@ -789,7 +805,8 @@ static const RadOperandSpec oAttnVsa[] = { OPD("q"), OPD("k"), OPD("v"), OPD("se
  * (T, H, W) for conv3d_ndhwc and tconv_dw, (T, h, w, H, W) for resize_bilinear and (F, Hp, Wp)
  * for patch_fold, which shares patch_unfold's parameters and operands. */
 static const RadParamSpec pConv3d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
-                                        P_INT("kt"), P_STR("dtype") };
+                                        P_INT("kt"), P_STR("dtype"), P_STRO("tpad"),
+                                        P_INTO("tpre") };
 static const RadOperandSpec oConv3d[] = { OPD("x"), WGT("w"), WGT("b"), OPD("geom"),
                                           OPD_O("res"), OUT("y") };
 /* `mod` is one row [scale | shift]; `stats` the per-group mean and rstd, then scratch. */
@@ -804,6 +821,52 @@ static const RadOperandSpec oResize[] = { OPD("x"), OPD("geom"), OUT("y") };
 static const RadParamSpec pFlowRenoise[] = { P_INT("M"), P_INT("n"), P_INT("stream"),
                                              P_STR("dtype") };
 static const RadOperandSpec oFlowRenoise[] = { OPD("sigma"), OPD("seed"), INOUT("x") };
+
+/* ---- LTX-2 (ref_ltx.cpp) */
+static const RadParamSpec pRopeSplit[] = { P_INT("M"), P_INT("n_head"), P_INT("head_dim"),
+                                           P_INT("dim"), P_INT("n_dims"), P_F64("theta"),
+                                           P_STR("max"), P_INTO("head0"), P_STR("dtype") };
+static const RadOperandSpec oRopeSplit[] = { INOUT("x"), OPD("positions") };
+static const RadParamSpec pHeadGate[] = { P_INT("M"), P_INT("n_head"), P_INT("head_dim"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oHeadGate[] = { OPD("g"), INOUT("x") };
+static const RadParamSpec pLtxGuide[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oLtxGuide[] = { OPD("vc"), OPD_O("vu"), OPD_O("vs"), OPD_O("vm"),
+                                            OPD("scales"), OPD("sched"), INOUT("stats"),
+                                            INOUT("x") };
+static const RadParamSpec pPixelNorm[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("form"),
+                                           P_STRO("act"), P_INTO("ileave"), P_STR("dtype"),
+                                           P_F64O("mult") };
+static const RadOperandSpec oPixelNorm[] = { OPD("x"), OUT("y") };
+static const RadParamSpec pD2s3d[] = { P_INT("M"), P_INT("C"), P_INT("st"), P_INT("sh"), P_INT("sw"),
+                                       P_INTO("drop"), P_STR("dtype") };
+static const RadOperandSpec oD2s3d[] = { OPD("x"), OPD("geom"), OUT("y") };
+static const RadParamSpec pS2d3d[] = { P_INT("M"), P_INT("C"), P_INT("st"), P_INT("sh"), P_INT("sw"),
+                                       P_INTO("tpre"), P_INTO("group"), P_STR("mode"),
+                                       P_INTO("add"), P_STR("dtype") };
+static const RadOperandSpec oS2d3d[] = { OPD("x"), OPD("geom"), INOUT("y") };
+static const RadParamSpec pPixPatch[] = { P_INT("M"), P_INT("p"), P_INT("C"), P_STRO("order"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oPixPatch[] = { OPD("x"), OUT("y") };
+static const RadParamSpec pVolIndex[] = { P_INT("M") };
+static const RadOperandSpec oVolIndex[] = { OPD("geom"), OUT("y") };
+static const RadParamSpec pTileGrid[] = { P_INT("M"), P_INT("tile"), P_INT("stride"), P_STRO("rule"),
+                                          P_INTO("min"), P_INTO("tile_t"), P_INTO("stride_t"),
+                                          P_INTO("min_t"), P_INTO("tail") };
+static const RadOperandSpec oTileGrid[] = { OPD("geom"), OUT("y") };
+static const RadParamSpec pTileCrop[] = { P_INT("M"), P_INT("C"), P_STR("dtype") };
+static const RadOperandSpec oTileCrop[] = { OPD("x"), OPD("geom"), OPD("box"), OUT("y") };
+static const RadParamSpec pTileStitch[] = { P_INT("M"), P_INT("tile"), P_INT("stride"),
+                                            P_STRO("rule"), P_INTO("min"), P_INTO("tile_t"),
+                                            P_INTO("stride_t"), P_INTO("min_t"), P_INT("scale"),
+                                            P_INTO("scale_t"), P_INT("p"), P_INT("C"),
+                                            P_STRO("order"), P_STR("dtype") };
+static const RadOperandSpec oTileStitch[] = { OPD("x"), OPD("geom"), OPD("first"), OUT("y") };
+static const RadParamSpec pStftMel[] = { P_INT("M"), P_INT("hop"), P_INT("nfft"), P_INT("n_mel"),
+                                         P_INT("ch"), P_STR("dtype") };
+static const RadOperandSpec oStftMel[] = { OPD("x"), WGT("basis"), WGT("mel"), OUT("y") };
+static const RadParamSpec pBweUp[] = { P_INT("M"), P_INT("ratio"), P_INT("ch"), P_STR("dtype") };
+static const RadOperandSpec oBweUp[] = { OPD("x"), OPD("res"), OUT("y") };
 
 /* ---- audio generation (ref_audio.cpp) */
 static const RadParamSpec pConv1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
@@ -864,6 +927,8 @@ static const RadParamSpec pIota[] = { P_INT("M"), P_INT("start"), P_INT("step"),
                                       P_INTO("period") };
 static const RadOperandSpec oIota[] = { OUT("y") };
 static const RadParamSpec pCuRepeat[] = { P_INT("M"), P_INT("mult") };
+static const RadParamSpec pIntAffine[] = { P_INT("M"), P_STR("src"), P_STR("mul"), P_STR("add") };
+static const RadOperandSpec oIntAffine[] = { OPD("x"), OUT("y") };
 static const RadOperandSpec oCuRepeat[] = { OPD("len"), OUT("y") };
 
 /* ================================================================== the schema table */
@@ -948,6 +1013,16 @@ static const RadOpSchema kSchemas[] = {
   "rows; nothing else broadcasts. With `div`, y = rd(rd(a + b) / div), rd y's dtype: the last "
   "sum of a mean taken pairwise." },
 { "mul", ARR(pMnD), ARR(oBinary), "y = a * b, with the same one broadcast rule as `add`." },
+{ "table_add", ARR(pTableAdd), ARR(oTableAdd),
+  "y[r, l n + c] = x[r, c] + t[l, c]: a shared modulation row plus each of L learned rows, f32 sum "
+  "rounded once; `M` is y's rows." },
+{ "chan_stats", ARR(pChanStats), ARR(oChanStats),
+  "a latent through per-channel statistics held as weights: `denorm` y = rd(rd(x std) + mean), "
+  "`norm` y = rd(rd(x - mean) / std); std is `s`, or sqrt(s + eps) with `var` 1, each statistic "
+  "rounded to y's dtype." },
+{ "mix_rows", ARR(pMixRows), ARR(oMixRows),
+  "y[r, c] = sum_i w[i] x[r k + i, c], i < k: a Linear(k, 1) across k consecutive rows, f32 sum in "
+  "ascending i rounded once; `M` is y's rows." },
 { "mul_weight", ARR(pMulWeight), ARR(oMulWeight),
   "y = x * w, `w` a WEIGHT of one element (a scalar for the whole output) or of one row "
   "(broadcast down the rows): a learned gain on an activation. f32 product, rounded once." },
@@ -1203,6 +1278,13 @@ static const RadOpSchema kSchemas[] = {
   "window, or i - j < window and j - i < window_right with `window_right`; 0 none. `block` cuts "
   "a segment into blocks of that many rows from its start, each attending within itself; 0 "
   "none." },
+{ "attn_cross", ARR(pAttnCross), ARR(oAttnCross),
+  "attn_dense with each entry's keys a run of their own: queries rows [cu[s], cu[s+1]), keys and "
+  "values rows [cu_k[s], cu_k[s+1]); with `causal` a query sees key j of its run when j <= its own "
+  "index, both counted from their run's start. A query that sees no key is zero." },
+{ "attn_na3d", ARR(pAttnNa3d), ARR(oAttnNa3d),
+  "3-D neighborhood attention (NATTEN's na3d) over the voxels of geom = (T, H, W): a query sees the "
+  "kt x kh x kw window centred on it, shifted inward at the border, each extent at most its axis." },
 { "kv_store", ARR(pKvStore), ARR(oKvStore),
   "Writes k and v into the paged cache at slot_mapping; a negative slot is skipped. The cache is "
   "INOUT rather than the OUT docs/OPS.md draws, because the op touches only the mapped slots." },
@@ -1572,6 +1654,53 @@ static const RadOpSchema kSchemas[] = {
 { "flow_renoise", ARR(pFlowRenoise), ARR(oFlowRenoise),
   "a clean latent re-noised to sigma s: x = f32(f32(f32(1 - s) x) + f32(s z)), z element "
   "k n + c of the normal stream (seed, `stream`) (abi/rad_philox.h)." },
+{ "rope_split", ARR(pRopeSplit), ARR(oRopeSplit),
+  "LTX-2's rotary over fractional coordinates: dim/2 pairs over all heads, the first `pad` "
+  "unrotated, then freq[k] = f32(theta^linspace(0,1,steps)[k] pi/2) with the n_dims coordinates "
+  "interleaved; angle f32(f32(2 f32(c / max)) - 1) freq; each head's halves rotated against each "
+  "other in f32, rounded to x's dtype. `head0` is the operand's first head." },
+{ "head_gate", ARR(pHeadGate), ARR(oHeadGate),
+  "x = rd(x rd(2 rd(sigmoid(g)))) per head: LTX-2's gated attention output." },
+{ "pixel_norm", ARR(pPixelNorm), ARR(oPixelNorm),
+  "an RMS norm over each row's n values as bf16 tensors compute it, every step rounded to y's "
+  "dtype: m = rd(sum rd(x^2) / n), then x rd(rsqrt(rd(m + eps))) (`form` rsqrt) or "
+  "x / rd(sqrt(rd(m + eps))) (div), optionally silu; `ileave` L writes x's row t L + l to "
+  "columns c L + l of y's row t." },
+{ "d2s3d", ARR(pD2s3d), ARR(oD2s3d),
+  "depth to space over voxel rows: packed channel ((c st + a) sh + b) sw + d of x's row (t, i, j) "
+  "to y's (t st + a - (st - 1), i sh + b, j sw + d), the first st - 1 frames dropped." },
+{ "s2d3d", ARR(pS2d3d), ARR(oS2d3d),
+  "space to depth over voxel rows, `tpre` leading frames prepended: each st x sh x sw box a packed "
+  "row (`mode` copy), or each run of `group` packed channels averaged (mean); `add` adds into y." },
+{ "pix_patch", ARR(pPixPatch), ARR(oPixPatch),
+  "an image [H, W C] to patch rows [H/p, (W/p) C p p], channel c's (ph, pw) at c p p + pw p + ph "
+  "(order wh) or c p p + ph p + pw (hw)." },
+{ "patch_pix8", ARR(pPixPatch), ARR(oPixPatch),
+  "patch rows [R, w C p p] to RGB bytes [R p, w p C] by to_rgba8's rule, pix_patch's channel "
+  "order." },
+{ "vol_index", ARR(pVolIndex), ARR(oVolIndex),
+  "a volume's voxel coordinates (t, i, j), component-major: attention's rotary positions." },
+{ "tile_grid", ARR(pTileGrid), ARR(oTileGrid),
+  "the tiles of a grid as diffusers cuts them (`rule` stride: tiled_decode's, a tile every "
+  "`stride` cells; intervals: _tile_intervals', a short last remnant merged), in space and "
+  "optionally time, one row (t, h, w, t0, y0, x0, k, count) a tile." },
+{ "tile_crop", ARR(pTileCrop), ARR(oTileCrop),
+  "one tile's voxels out of a volume: y[(a, i, j)] = x[(t0 + a, y0 + i, x0 + j)], box "
+  "(t, h, w, t0, y0, x0)." },
+{ "tile_stitch", ARR(pTileStitch), ARR(oTileStitch),
+  "decoded tiles to RGB bytes: diffusers' in-place blend_v then blend_h of each tile with the one "
+  "above and the one to its left, then blend_t of each time band with the one before, each kept to "
+  "its stride, then patch_pix8's bytes." },
+{ "stft_logmel", ARR(pStftMel), ARR(oStftMel),
+  "each channel's causal log-mel spectrogram from a windowed DFT basis and a mel filterbank, every "
+  "stored tensor rounded to y's dtype: frames S / hop, columns h n_mel + m." },
+{ "bwe_up", ARR(pBweUp), ARR(oBweUp),
+  "y = clamp(rd(res + up(x)), -1, 1): x raised `ratio` times by a Hann-windowed sinc resampler "
+  "(width ceil(6 / 0.99), taps in x's dtype, edges replicated)." },
+{ "ltx_guide", ARR(pLtxGuide), ARR(oLtxGuide),
+  "LTX-2's sampler step: each pass's clean estimate x - v sigma, the guidance deltas (CFG, STG, "
+  "modality) added in f32, an optional rescale by the deviations' ratio, the velocity back and "
+  "an Euler step of x, all f32. `scales` f32[4] (gs, stg, ms, rescale), `sched` f32[2]." },
 { "conv1d", ARR(pConv1d), ARR(oConv1d),
   "a 1-D convolution over the sequences `cu_seqlens` bounds, channels innermost: x [rows, cin], "
   "y [rows, cout], PyTorch's [cout, cin, k] weight and an optional bias, dilation `dil` and padding "
@@ -1636,6 +1765,9 @@ static const RadOpSchema kSchemas[] = {
   "y[i] = start + i * step over y's elements, or start + (i % period) * step with `period`." },
 { "cu_repeat", ARR(pCuRepeat), ARR(oCuRepeat),
   "bounds of equal sequences, y[j] = j * len[0] * mult over y's elements." },
+{ "int_affine", ARR(pIntAffine), ARR(oIntAffine),
+  "y[j] = (src[j] < 0 ? 0 : x[src[j]]) * mul[j] + add[j] over three integer lists: shapes and "
+  "bounds derived from a pass's device geometry." },
 };
 
 /* ================================================================== the kernel table */
@@ -1819,6 +1951,12 @@ SIMPLE("ref_silu_mul", "silu_mul", "elem", "silu-gated product over a fused gate
 SIMPLE("ref_act_mul", "act_mul", "elem", "act(a) * b over two operands", DT_FLOAT, ref_act_mul),
 SIMPLE("ref_mul_weight", "mul_weight", "elem", "x * a scalar or one-row weight", DT_FLOAT,
        ref_mul_weight),
+SIMPLE("ref_table_add", "table_add", "elem", "a row plus each of L table rows", DT_FLOAT,
+       ref_table_add),
+SIMPLE("ref_mix_rows", "mix_rows", "elem", "a weighted sum of k consecutive rows", DT_FLOAT,
+       ref_mix_rows),
+SIMPLE("ref_chan_stats", "chan_stats", "elem", "per-channel statistics held as weights",
+       DT_FLOAT, ref_chan_stats),
 SIMPLE("ref_seg_mean", "seg_mean", "elem", "mean of each cu_seqlens segment's rows", DT_FLOAT,
        ref_seg_mean),
 SIMPLE("ref_pool_rows", "pool_rows", "elem", "mean of every k consecutive rows, then a multiplier",
@@ -1942,6 +2080,11 @@ ROW("ref_attn_paged", "attn_paged", "attn",
     nullptr, nullptr, ref_attn_paged, nullptr),
 SIMPLE("ref_attn_dense", "attn_dense", "attn", "dense varlen attention over cu_seqlens", DT_FLOAT,
        ref_attn_dense),
+SIMPLE("ref_attn_cross", "attn_cross", "attn",
+       "dense varlen attention, keys bounded apart from the queries (cu_k)", DT_FLOAT,
+       ref_attn_cross),
+SIMPLE("ref_attn_na3d", "attn_na3d", "attn", "3-D neighborhood attention over a volume", DT_FLOAT,
+       ref_attn_na3d),
 ROW("ref_kv_store", "kv_store", "attn", "scatter k and v into the paged cache", DT_ANY,
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])),
     nullptr, nullptr, ref_kv_store, nullptr),
@@ -2117,6 +2260,27 @@ SIMPLE("ref_patch_fold", "patch_fold", "elem", "voxel rows to normalised patch r
        ref_patch_fold),
 SIMPLE("ref_flow_renoise", "flow_renoise", "elem", "a clean latent re-noised to a sigma", DT_FLOAT,
        ref_flow_renoise),
+SIMPLE("ref_rope_split", "rope_split", "elem", "LTX-2's split rotary over coordinates", DT_FLOAT,
+       ref_rope_split),
+SIMPLE("ref_head_gate", "head_gate", "elem", "each head times 2 sigmoid of its logit", DT_FLOAT,
+       ref_head_gate),
+SIMPLE("ref_ltx_guide", "ltx_guide", "elem", "LTX-2's guided sampler step", DT_FLOAT,
+       ref_ltx_guide),
+SIMPLE("ref_pixel_norm", "pixel_norm", "norm", "an RMS norm as bf16 tensors compute it", DT_FLOAT,
+       ref_pixel_norm),
+SIMPLE("ref_d2s3d", "d2s3d", "elem", "depth to space over voxel rows", DT_FLOAT, ref_d2s3d),
+SIMPLE("ref_s2d3d", "s2d3d", "elem", "space to depth over voxel rows", DT_FLOAT, ref_s2d3d),
+SIMPLE("ref_pix_patch", "pix_patch", "elem", "an image to patch rows", DT_FLOAT, ref_pix_patch),
+SIMPLE("ref_patch_pix8", "patch_pix8", "elem", "patch rows to RGB bytes", DT_FLOAT, ref_patch_pix8),
+SIMPLE("ref_vol_index", "vol_index", "elem", "a volume's voxel coordinates", DT_ANY, ref_vol_index),
+SIMPLE("ref_tile_grid", "tile_grid", "elem", "a tiled decode's boxes", DT_ANY, ref_tile_grid),
+SIMPLE("ref_tile_crop", "tile_crop", "elem", "a tile out of a volume", DT_FLOAT, ref_tile_crop),
+SIMPLE("ref_tile_stitch", "tile_stitch", "elem", "decoded tiles blended to RGB bytes", DT_FLOAT,
+       ref_tile_stitch),
+SIMPLE("ref_stft_logmel", "stft_logmel", "elem", "a causal log-mel spectrogram", DT_FLOAT,
+       ref_stft_logmel),
+SIMPLE("ref_bwe_up", "bwe_up", "elem", "a sinc-resampled waveform plus a residual, clamped",
+       DT_FLOAT, ref_bwe_up),
 SIMPLE("ref_conv1d", "conv1d", "conv", "a 1-D convolution over sequences, channels innermost",
        DT_FLOAT, ref_conv1d),
 SIMPLE("ref_conv_t1d", "conv_t1d", "conv", "a transposed 1-D convolution growing each sequence",
@@ -2150,6 +2314,8 @@ SIMPLE("ref_interleave2", "interleave2", "elem", "two streams interleaved", DT_A
        ref_interleave2),
 SIMPLE("ref_iota", "iota", "elem", "an arithmetic index sequence", DT_ANY, ref_iota),
 SIMPLE("ref_cu_repeat", "cu_repeat", "elem", "bounds of equal sequences", DT_ANY, ref_cu_repeat),
+SIMPLE("ref_int_affine", "int_affine", "elem", "integers derived from device geometry", DT_ANY,
+       ref_int_affine),
 };
 
 /* ================================================================== plugin exports */

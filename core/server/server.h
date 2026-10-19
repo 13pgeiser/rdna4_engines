@@ -181,6 +181,9 @@ public:
      * also takes a nonsense word it takes any word, and the result is empty. Used to refuse words
      * outside the set and for /server_info; called once, before run(). */
     std::vector<std::string> probe_reasoning_efforts();
+    /* The effort the template applies to a request that names none, found by the probe above as
+     * the one whose render is the same; "" when none matches or the probe found no set. */
+    const std::string& template_default_effort() const { return template_default_effort_; }
     /* Renders each --reasoning-effort-map target as a request's effort. Empty when the template
      * takes all of them; otherwise the first refusal, naming the target. */
     std::string check_reasoning_effort_map() const;
@@ -198,6 +201,7 @@ public:
     void note_ready(uint64_t begin_ns);
 
 private:
+    std::string template_default_effort_;
     struct Generation;
     struct TranscriptionJob;   /* speech.cpp */
     struct RealtimeSession;    /* realtime.cpp */
@@ -357,8 +361,8 @@ private:
     std::atomic<int64_t> speech_sessions_{0};
     std::atomic<bool>    stopping_{false};
     int64_t              started_at_ = 0;
-    /* Seconds from the top of Engine::start() to the moment the server began listening -- the
-     * cost of a restart, measured on this machine rather than guessed. 0 until note_ready(). */
+    /* Seconds from the top of Engine::start() to the moment the server began listening; 0 until
+     * note_ready(). */
     int64_t              startup_s_ = 0;
 
     /* Sinks whose HTTP side is gone but whose engine side may still be mid-step. Held until the

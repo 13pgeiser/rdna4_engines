@@ -81,6 +81,7 @@ set(R4D_UNITS
   # decoder's patch unfold, tiles, stitch and rotary positions, and the soundtrack decoder's
   # alias-free SnakeBeta.
   "r4d_video|"
+  "r4d_ltx|"
   # A video latent upscaler: the 3x3x3 convolution as an implicit GEMM over voxel rows, the group
   # norm, the temporal depthwise convolution, the per-frame bilinear resize, the patch fold and the
   # re-noise.

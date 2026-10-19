@@ -327,4 +327,99 @@ TEST(the_generator_admits_in_order_and_shutdown_answers_every_ticket) {
     CHECK(f.drv.next(1) == nullptr);
 }
 
+/* The joint layout (RAD_GEN_LAYOUT_JOINT_STEP): no KV group; the conditioning's prompt padded to
+ * the declared multiple (padding at position 1, valid_cu bounding the prompt), the reference
+ * picture's tokens after it with its own l and scaled positions, and stored for every lane of the
+ * request. A denoising entry is that conditioning, read from its lane and branch's store rows,
+ * then the image, both in the pass order and mode by mode. */
+TEST(the_joint_layout_carries_the_conditioning_in_every_step) {
+    Program prog;
+    prog.generator = decl_base();
+    RadGeneratorDecl& d = prog.generator;
+    d.layout = RAD_GEN_LAYOUT_JOINT_STEP;
+    d.cond_rows = 64;
+    d.pad_multiple = 8;
+    d.pad_token = 99;
+    d.rope_hw_scale = 0.5;
+    d.rope_text_l = 1;
+    d.ref_area = 32 * 32;
+    prog.ctx.max_tok = 2048;
+    prog.ctx.max_seqs = 8;
+    prog.kv_groups.emplace_back();
+    gen::Driver drv;
+    REQUIRE_EQ(drv.init(prog, nullptr, { gen::Driver::RankIO{} }), (int)RAD_OK);
+    auto r = std::make_unique<gen::Request>();
+    r->width = 64;
+    r->height = 32;
+    r->n = 2;
+    r->pos.tokens = { 1, 2, 3, 4, 5 };
+    r->pos.n_drop = 1;
+    r->has_neg = true;
+    r->neg.tokens = { 1, 6 };
+    r->neg.n_drop = 1;
+    r->cfg = 3.0f;
+    gen::Pixels px;
+    px.w = 32;
+    px.h = 32;
+    px.ch = 4;
+    px.bf16.assign(32 * 32 * 4, 0);
+    r->refs.push_back(px);
+    r->ticket = std::make_shared<gen::Ticket>();
+    std::string why;
+    REQUIRE_EQ(drv.submit(std::move(r), &why), (int)RAD_OK);
+
+    /* The positive conditioning: 4 text rows padded to 8, then the picture's 2 x 2 tokens. */
+    const RadBatch* b = drv.next(0);
+    REQUIRE(b != nullptr);
+    REQUIRE_EQ(b->gen, (int32_t)RAD_GEN_PASS_COND);
+    const RadGenBatch* G = b->gen_b;
+    CHECK_EQ(b->n_kv_groups, (int32_t)0);
+    CHECK_EQ(b->n_tok, (int64_t)9);                   /* five tokens and four padding */
+    CHECK_EQ(G->rows, (int64_t)12);                   /* 8 text rows and 4 picture tokens */
+    CHECK_EQ(G->n_pad, (int32_t)4);
+    CHECK_EQ(G->branch, (int32_t)0);
+    CHECK_EQ(G->valid_cu[1], (int32_t)5);
+    CHECK_EQ(b->token_ids[8], (int32_t)99);
+    CHECK_EQ(b->positions[8], (int32_t)1);
+    CHECK_EQ(G->n_lane, (int64_t)2);
+    CHECK_EQ(G->src[0], (int32_t)1);                  /* the prompt row after the drop */
+    CHECK_EQ(G->src[8], (int32_t)-1);                 /* the picture's first latent row */
+    CHECK_EQ(G->rope_f[3 * 12 + 2], 2.0f);            /* text row 2: l = 2 */
+    CHECK_EQ(G->rope_f[3 * 12 + 9], -1.0f);           /* the picture: l = -1 */
+    CHECK_EQ(G->rope_f[2 * 12 + 9], 0.5f);            /* its token (0, 1): w = 0.5 */
+    CHECK_OK(drv.done());
+    b = drv.next(1);
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->gen_b->branch, (int32_t)1);
+    CHECK_EQ(b->gen_b->rows, (int64_t)12);            /* one token padded to 8, the picture */
+    CHECK_OK(drv.done());
+
+    /* A step: four entries (two images, each with its negative), 12 + 8 rows each. */
+    b = drv.next(2);
+    REQUIRE(b != nullptr);
+    REQUIRE_EQ(b->gen, (int32_t)RAD_GEN_PASS_DENOISE);
+    G = b->gen_b;
+    REQUIRE_EQ(b->n_seq, (int64_t)4);
+    CHECK_EQ(b->n_tok, (int64_t)80);
+    CHECK_EQ(G->n_img, (int64_t)32);
+    CHECK_EQ(b->cu_seqlens[1], (int32_t)20);
+    const int32_t lane0 = G->lane_dh[0];
+    CHECK_EQ(G->src[0], (int32_t)(2 * lane0 * 64));             /* lane 0's positive row 0 */
+    CHECK_EQ(G->src[20], (int32_t)((2 * lane0 + 1) * 64));      /* its negative row 0 */
+    CHECK_EQ(G->src[12], (int32_t)-1);                          /* the first image row */
+    CHECK_EQ(G->img_rows[0], (int32_t)12);
+    CHECK_EQ(G->img_cu[1], (int32_t)8);
+    CHECK_EQ(G->mode_cu[1], (int32_t)8);                        /* entry 0: text 0..8 */
+    CHECK_EQ(G->mode_cu[2], (int32_t)12);                       /* pictures 8..12 */
+    CHECK_EQ(G->mode_cu[3], (int32_t)20);                       /* image to 20 */
+    CHECK_EQ(G->n_mode_h[0], (int64_t)32);
+    CHECK_EQ(G->n_mode_h[1], (int64_t)16);
+    CHECK_EQ(G->n_mode_h[2], (int64_t)32);
+    CHECK_EQ(G->mode_rows[32], (int32_t)8);                     /* the first picture row */
+    CHECK_EQ(G->mode_ccu[1 * 5 + 1], (int32_t)4);               /* pictures: entry 1 from 4 */
+    CHECK_EQ(G->mode_rope_f[4 * 32 + 3 * 16 + 0], -1.0f);       /* the pictures' l plane */
+    CHECK_EQ(G->rope_f[1 * 80 + 12 + 4], 0.5f);                 /* image token (1, 0): h = 0.5 */
+    CHECK_OK(drv.done());
+}
+
 RAD_TEST_MAIN()

@@ -946,6 +946,14 @@ TEST(an_effort_the_template_refuses_is_answered_with_the_set_it_takes) {
     CHECK_EQ(set[0], std::string("low"));
     CHECK_EQ(set[1], std::string("medium"));
     CHECK_EQ(set[2], std::string("xhigh"));
+    CHECK(f.srv->template_default_effort().empty());   /* no level renders as no level */
+    /* A template that writes one level when a request names none, as Qwen3.8's writes xhigh
+     * (#113): the probe names it. */
+    f.tmpl.default_effort = "\"xhigh\"";
+    f.srv->probe_reasoning_efforts();
+    CHECK_EQ(f.srv->template_default_effort(), std::string("xhigh"));
+    f.tmpl.default_effort.clear();
+    f.srv->probe_reasoning_efforts();
 
     OaiLimits lim = f.limits();
     lim.reasoning_efforts = set;
@@ -4014,6 +4022,56 @@ TEST(a_responses_request_becomes_the_chat_request_it_means) {
 
     CHECK(responses_to_chat(R"({"input":"x","previous_response_id":"resp_1"})", lim, &chat,
                             &echo, &e) < 0);
+}
+
+/* A namespace groups function tools (Codex sends every MCP server's tools that way). They reach
+ * the model flattened to <namespace>__<name>, the reply's function_call item reports the two apart,
+ * streamed and not, and the next turn's call and tool_choice come back joined (#119). */
+TEST(a_namespaces_tools_are_offered_flat_and_answered_apart) {
+    OaiLimits lim;
+    std::string chat, echo;
+    ApiError e;
+    std::map<std::string, std::pair<std::string, std::string>> ns;
+    CHECK_OK(responses_to_chat(R"({
+        "tools":[{"type":"function","name":"plain","parameters":{"type":"object"}},
+                 {"type":"namespace","name":"crm","description":"d","tools":[
+                    {"type":"function","name":"find","parameters":{"type":"object"}},
+                    {"type":"custom","name":"raw"}]}],
+        "tool_choice":{"type":"function","namespace":"crm","name":"find"},
+        "input":[{"role":"user","content":"x"},
+                 {"type":"function_call","call_id":"c1","namespace":"crm","name":"find","arguments":"{}"},
+                 {"type":"function_call_output","call_id":"c1","output":"y"}]})",
+        lim, &chat, &echo, &e, &ns));
+    const json c = json::parse(chat);
+    CHECK_EQ(c["tools"].size(), (size_t)2);                       /* the custom tool left out */
+    CHECK_EQ(c["tools"][1]["function"].value("name", ""), std::string("crm__find"));
+    CHECK_EQ(c["messages"][1]["tool_calls"][0]["function"].value("name", ""), std::string("crm__find"));
+    CHECK_EQ(c["tool_choice"]["function"].value("name", ""), std::string("crm__find"));
+    CHECK_EQ(ns.size(), (size_t)1);
+    CHECK_EQ(ns["crm__find"].first, std::string("crm"));
+    CHECK_EQ(json::parse(echo)["tools"].size(), (size_t)2);      /* echoed as sent */
+
+    /* A flattened name may not shadow a top-level tool's. */
+    CHECK(responses_to_chat(R"({"input":"x","tools":[{"type":"function","name":"crm__find"},
+        {"type":"namespace","name":"crm","tools":[{"type":"function","name":"find"}]}]})",
+        lim, &chat, &echo, &e, &ns) < 0);
+
+    Fixture f;
+    f.sched.reply = R"(TOOL:crm__find:{"q":"P"})";
+    const std::string tools = R"("tools":[{"type":"namespace","name":"crm","tools":[)"
+                              R"({"type":"function","name":"find","parameters":{"type":"object"}}]}],)";
+    HttpResponse r = f.post("/v1/responses", "{" + tools + R"("input":"find P"})");
+    CHECK_EQ(r.status, 200);
+    const json o = json::parse(r.body);
+    CHECK_EQ(o["output"][0].value("type", ""), std::string("function_call"));
+    CHECK_EQ(o["output"][0].value("namespace", ""), std::string("crm"));
+    CHECK_EQ(o["output"][0].value("name", ""), std::string("find"));
+    f.sched.join_all();
+    HttpResponse st = f.post("/v1/responses", "{" + tools + R"("stream":true,"input":"find P"})");
+    const std::string body = drain(st);
+    CHECK(has(body, R"("namespace":"crm")"));
+    CHECK(!has(body, "crm__find"));
+    f.sched.join_all();
 }
 
 TEST(the_responses_api_answers_with_a_response_object_and_its_events) {

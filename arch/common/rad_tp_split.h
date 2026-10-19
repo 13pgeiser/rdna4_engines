@@ -4,19 +4,12 @@
 #ifndef RAD_TP_SPLIT_H
 #define RAD_TP_SPLIT_H
 #include "rad_arch.h"
-#include <cstdlib>
 
 namespace rad {
 namespace arch {
-/* Rows from which a replicated F32 projection splits its columns over the ranks
- * (RADIANCE_GLM_TP_SPLIT_ROWS, 0 never). Below it the collective's latency outweighs the
- * saved arithmetic, so decode keeps the replicated form. */
-inline int64_t glm_tp_split_rows() {
-    const char* e = std::getenv("RADIANCE_GLM_TP_SPLIT_ROWS");
-    if (!e || !*e) return 256;
-    const long long v = std::strtoll(e, nullptr, 10);
-    return v > 0 ? (int64_t)v : 0;
-}
+/* Rows from which a replicated F32 projection splits its columns over the ranks. Below it the
+ * collective's latency outweighs the saved arithmetic, so decode keeps the replicated form. */
+constexpr int64_t kGlmTpSplitRows = 256;
 
 /* The split's ops are declared whatever the step size, and each gather's message as a range of
  * rows: the engine's arena levels declare again at a smaller max_tok and must get the same graph
@@ -33,8 +26,8 @@ struct SplitF32Proj {
 
     int declare(RadBuilder* b, Names& nm, const Geom& g, const char* name, int64_t rows, int64_t n,
                 int64_t width, rad_weight weight, rad_buf input, rad_buf output) {
-        min_rows = glm_tp_split_rows();
-        if (g.world < 2 || !min_rows || n % g.world || (n / g.world * 4) % 16) {
+        min_rows = kGlmTpSplitRows;
+        if (g.world < 2 || n % g.world || (n / g.world * 4) % 16) {
             min_rows = 0;
             return RAD_OK;
         }

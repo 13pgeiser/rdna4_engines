@@ -3,7 +3,9 @@
  * tile (eight heads of two neighbouring rows) on the tables it meets in serving: a prefill chunk
  * whose rows share one table, and rows past the DSA budget, where each row selects its own top
  * blocks and neighbours share most blocks but rarely a table position. The conflict counters
- * (RADIANCE_MLA_CONFLICT_STATS) show which of the two the pairing saw. */
+ * (RADIANCE_MLA_CONFLICT_STATS) show which of the two the pairing saw. Both pairings run on the
+ * same operands: the union at the case's table width, the positional pairing on the table
+ * widened past the union's lists (kUnionBlocks, 520 entries) with absent entries no row reaches. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
@@ -22,7 +24,7 @@ extern "C" void r4d_mla_matrix_stats(unsigned long long* out);
 
 namespace {
 
-constexpr int D = 512, BS = 4;
+constexpr int D = 512, BS = 4, kUnionBlocks = 520;
 
 enum class Fill { prefill, topk, ragged, repeat };
 
@@ -35,6 +37,7 @@ struct Case {
     bool scratch = false;     /* lets the launcher split the history */
     int form = 0;             /* r4d_mla_matrix_pin_form */
     int expect_second = -1;   /* positional pairing: 0 no second pass, 1 some, -1 either */
+    /* Unsplit only: with scratch the widened table gives the positional run more splits. */
     bool bitwise_a = true; /* the union's request r equals the positional pairing's bit for bit */
     bool bitwise_all = false; /* both requests do (the tables agree position by position) */
     bool union_falls_back = false; /* the table is wider than the union's lists */
@@ -234,14 +237,24 @@ int run(const Case& c, std::mt19937& rng) {
                 want[((size_t)r * H + h) * D + d] = sum > 0 ? acc[d] / sum : 0.0;
         }
 
-    /* Both pairings on the same operands: the positional one (RADIANCE_MLA_PAIR=pos) and the
-     * union, which must never take a second pass. */
+    /* Both pairings on the same operands: the positional one, on the table widened past the
+     * union's lists, and at the case's own width the launcher's choice, the union, which must
+     * never take a second pass. A tile of 16 heads has no pairing and runs once. */
     const bool paired = H % 16 == 8;
+    const int wide = std::max(B, kUnionBlocks + 1);
+    std::vector<int> bt_wide((size_t)M * wide, -1);
+    for (int r = 0; r < M; ++r)
+        std::copy(bt.begin() + (size_t)r * B, bt.begin() + (size_t)(r + 1) * B,
+                  bt_wide.begin() + (size_t)r * wide);
     std::vector<uint16_t> by_pos;
     int fails = 0;
     for (const char* pairing : { "pos", "union" }) {
-        if (!paired && !std::strcmp(pairing, "union")) break;
-        setenv("RADIANCE_MLA_PAIR", pairing, 1);
+        const bool by_page = !std::strcmp(pairing, "union");
+        if (!paired && by_page) break;
+        const bool widened = paired && !by_page;
+        t[2] = widened ? tens(bt_wide.data(), RAD_I32, { M, wide })
+                       : tens(bt.data(), RAD_I32, { M, B });
+        p[3].ival = widened ? wide : B;
         std::fill(out.begin(), out.end(), 0xffff);
         unsigned long long stats[3];
         r4d_mla_matrix_stats(stats);
@@ -249,7 +262,6 @@ int run(const Case& c, std::mt19937& rng) {
         const int rc = r4d_rad_mla_attn_matrix(&a, nullptr);
         r4d_mla_matrix_pin_form(0);
         r4d_mla_matrix_stats(stats);
-        unsetenv("RADIANCE_MLA_PAIR");
         if (rc != RAD_OK) {
             std::printf("%-40s %-5s launch returned %d\n", c.name.c_str(), pairing, rc);
             ++fails;
@@ -265,7 +277,6 @@ int run(const Case& c, std::mt19937& rng) {
         }
         bool ok = bad == 0;
         std::string note;
-        const bool by_page = !std::strcmp(pairing, "union");
         if (!by_page) {
             by_pos = out;
             if (c.expect_second >= 0 && (stats[1] > 0) != (c.expect_second == 1)) {
@@ -297,11 +308,11 @@ int run(const Case& c, std::mt19937& rng) {
             std::snprintf(buf, sizeof buf, "  vs pos: %zu/%zu differ (r/r+1), max abs %.2e",
                           first_diff_a, diff_b, max_ab);
             note += buf;
-            if (c.bitwise_a && first_diff_a) {
+            if (c.bitwise_a && !c.scratch && first_diff_a) {
                 note += "  (request r differs)";
                 ok = false;
             }
-            if (c.bitwise_all && diff_b) {
+            if (c.bitwise_all && !c.scratch && diff_b) {
                 note += "  (request r+1 differs)";
                 ok = false;
             }

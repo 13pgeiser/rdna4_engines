@@ -171,6 +171,33 @@ TEST(usage_counts_each_pictures_tokens_in_every_branch) {
 
 /* `background: auto` keeps an edited picture's transparency and is opaque otherwise; a mask must
  * be the first picture's size. */
+/* A model whose card states guidance as cond + s (cond - uncond) and guides by default (Krea 2):
+ * a request naming nothing is guided at the card's scale with the model's own empty negative
+ * prompt, handed on as s + 1; `guidance_scale` is the same field as `true_cfg_scale`, 0 turns it
+ * off, and naming both is refused. An RGB model refuses a transparent background. */
+TEST(guidance_follows_the_model_cards_terms_and_its_default_negative) {
+    Images s;
+    s.img.inf.cfg_original = true;
+    s.img.inf.default_cfg = 4.5;
+    s.img.inf.has_default_negative = true;
+    s.img.inf.default_negative = "";
+    s.img.inf.pixel_channels = 3;
+    s.gen({ { "prompt", "a fox" } });
+    REQUIRE(!s.img.got.empty());
+    CHECK(s.last().has_neg);
+    CHECK_EQ(s.last().cfg, 5.5f);
+    s.gen({ { "prompt", "a fox" }, { "guidance_scale", 2.0 } });
+    CHECK(s.last().has_neg);
+    CHECK_EQ(s.last().cfg, 3.0f);
+    s.gen({ { "prompt", "a fox" }, { "guidance_scale", 0.0 } });
+    CHECK(!s.last().has_neg);
+    const json both = s.gen({ { "prompt", "x" }, { "guidance_scale", 2.0 }, { "true_cfg_scale", 2.0 } },
+                            400);
+    CHECK_EQ(str_at(both["error"], "param"), std::string("guidance_scale"));
+    const json alpha = s.gen({ { "prompt", "x" }, { "background", "transparent" } }, 400);
+    CHECK_EQ(str_at(alpha["error"], "param"), std::string("background"));
+}
+
 TEST(an_auto_background_follows_the_pictures_alpha) {
     if (!mm::decoder_available()) return;
     Images s;

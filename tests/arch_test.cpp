@@ -2375,7 +2375,6 @@ TEST(manifold_connections_preserve_saved_coefficients_and_use_a_separate_residua
 
 TEST(manifold_read_splits_its_projection_by_chunks_over_ranks_from_the_row_threshold) {
     using namespace rad::arch;
-    unsetenv("RADIANCE_GLM_TP_SPLIT_ROWS");
     for (int world : { 1, 2, 4, 8 })
         for (int rank = 0; rank < world; ++rank) {
             RadBuilder b;
@@ -2501,7 +2500,6 @@ TEST(glm_routing_keeps_f32_logits_and_correction_replicated_under_tp4) {
 
 TEST(glm_router_and_index_head_split_columns_over_ranks_from_the_row_threshold) {
     using namespace rad::arch;
-    unsetenv("RADIANCE_GLM_TP_SPLIT_ROWS");
     for (int world : { 1, 2, 4, 8 })
         for (int rank = 0; rank < world; ++rank) {
             RadBuilder b;
@@ -2578,44 +2576,6 @@ TEST(glm_router_and_index_head_split_columns_over_ranks_from_the_row_threshold) 
             REQUIRE_EQ(ctx.issues.size(), (size_t)2);
             CHECK_EQ(ctx.issues[0].op, router.op_project);
         }
-    {
-        setenv("RADIANCE_GLM_TP_SPLIT_ROWS", "64", 1);
-        RadBuilder b;
-        Names nm("");
-        Geom g{};
-        g.n_embd = 4096;
-        g.max_tok = 128;
-        g.world = 8;
-        g.rank = 5;
-        GlmRouter::Config cfg;
-        cfg.rows = 128;
-        GlmRouter::Wire w;
-        w.input = decl_b(&b, "hidden", RAD_BF16, { 128, 4096 });
-        w.logits = decl_b(&b, "logits", RAD_F32, { 128, 288 });
-        w.ids = decl_b(&b, "ids", RAD_I32, { 128, 8 });
-        w.weights = decl_b(&b, "weights", RAD_F32, { 128, 8 });
-        GlmRouter::Src src{ "model.layers.3.mlp.gate.weight",
-                            "model.layers.3.mlp.gate.e_score_correction_bias" };
-        GlmRouter router;
-        REQUIRE_EQ(router.declare(&b, nm, g, 3, "blk.3.router", cfg, w, src), RAD_OK);
-        RadCtx ctx;
-        router.step(&ctx, 0, 64);
-        router.step(&ctx, 0, 63);
-        REQUIRE_EQ(ctx.issues.size(), (size_t)5);
-        CHECK_EQ(ctx.issues[0].op, router.split.op_part);
-        CHECK_EQ(ctx.issues[3].op, router.op_project);
-        setenv("RADIANCE_GLM_TP_SPLIT_ROWS", "0", 1);
-        RadBuilder off;
-        GlmRouter whole;
-        auto w2 = w;
-        w2.input = decl_b(&off, "hidden", RAD_BF16, { 128, 4096 });
-        w2.logits = decl_b(&off, "logits", RAD_F32, { 128, 288 });
-        w2.ids = decl_b(&off, "ids", RAD_I32, { 128, 8 });
-        w2.weights = decl_b(&off, "weights", RAD_F32, { 128, 8 });
-        REQUIRE_EQ(whole.declare(&off, nm, g, 3, "blk.3.router", cfg, w2, src), RAD_OK);
-        CHECK_EQ(count_op(off, "all_gather"), 0);
-        unsetenv("RADIANCE_GLM_TP_SPLIT_ROWS");
-    }
 }
 
 TEST(absorbed_mla_shards_complete_heads_and_reads_one_latent_cache) {
@@ -2681,7 +2641,6 @@ TEST(
     meta.kv_val = vals;
     const auto mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
     const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
-    unsetenv("RADIANCE_GLM_TP_SPLIT_ROWS");
     for (int world : { 1, 4, 8 })
         for (int rank = 0; rank < world; ++rank) {
             RadBuilder b;
@@ -2900,77 +2859,72 @@ TEST(glm53_sizing_declares_match_the_real_graph_at_every_arena_level) {
     meta.kv_val = vals;
     const auto mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
     const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
-    unsetenv("RADIANCE_GLM_TP_SPLIT_ROWS");
-    // 256 is the default threshold; at 2048 the 256- and 1024-row levels lie below it.
     const int world = 8, rank = 3;
-    for (const char* split : { "256", "2048" })
-        for (int64_t R : { 256, 3072 }) {
-            setenv("RADIANCE_GLM_TP_SPLIT_ROWS", split, 1);
-            auto encs = [&](RadBuilder& b) {
-                b.kv_block = 4;
-                b.encs = { { "mtp.blk.45.ffn_gate_up_exps", fp8 },
-                           { "mtp.blk.45.ffn_down_exps", fp8 },
-                           { "ffn_gate_up_exps", mx },
-                           { "ffn_down_exps", mx },
-                           { "ffn_gate_up_shexp", mx },
-                           { "ffn_down_shexp", mx },
-                           { "ffn_gate_up.weight", fp8 },
-                           { "ffn_down.weight", fp8 } };
-            };
-            RadBuildCtx c{};
-            c.rank = rank;
-            c.world_size = world;
-            c.max_tok = 4096;
-            c.max_seqs = 8;
-            c.max_ctx = 32768;
-            c.max_spec = 3;
-            RadBuilder full;
-            encs(full);
-            REQUIRE_EQ(glm5next::declare(&full, &meta, &c), RAD_OK);
-            RadBuildCtx p = c;
-            p.max_tok = R;
-            p.shape_probe = 1;
-            RadBuilder small;
-            encs(small);
-            REQUIRE_EQ(glm5next::declare(&small, &meta, &p), RAD_OK);
-            REQUIRE_EQ(small.ops.size(), full.ops.size());
-            int differ = 0;
-            for (size_t i = 0; i < full.ops.size(); ++i) {
-                if (small.ops[i].op != full.ops[i].op) {
-                    ++differ;
+    for (int64_t R : { 256, 3072 }) {
+        auto encs = [&](RadBuilder& b) {
+            b.kv_block = 4;
+            b.encs = { { "mtp.blk.45.ffn_gate_up_exps", fp8 },
+                       { "mtp.blk.45.ffn_down_exps", fp8 },
+                       { "ffn_gate_up_exps", mx },
+                       { "ffn_down_exps", mx },
+                       { "ffn_gate_up_shexp", mx },
+                       { "ffn_down_shexp", mx },
+                       { "ffn_gate_up.weight", fp8 },
+                       { "ffn_down.weight", fp8 } };
+        };
+        RadBuildCtx c{};
+        c.rank = rank;
+        c.world_size = world;
+        c.max_tok = 4096;
+        c.max_seqs = 8;
+        c.max_ctx = 32768;
+        c.max_spec = 3;
+        RadBuilder full;
+        encs(full);
+        REQUIRE_EQ(glm5next::declare(&full, &meta, &c), RAD_OK);
+        RadBuildCtx p = c;
+        p.max_tok = R;
+        p.shape_probe = 1;
+        RadBuilder small;
+        encs(small);
+        REQUIRE_EQ(glm5next::declare(&small, &meta, &p), RAD_OK);
+        REQUIRE_EQ(small.ops.size(), full.ops.size());
+        int differ = 0;
+        for (size_t i = 0; i < full.ops.size(); ++i) {
+            if (small.ops[i].op != full.ops[i].op) {
+                ++differ;
+                continue;
+            }
+            REQUIRE_EQ(small.ops[i].p.size(), full.ops[i].p.size());
+            for (size_t k = 0; k < full.ops[i].p.size(); ++k) {
+                const RecParam& a = full.ops[i].p[k];
+                const RecParam& q = small.ops[i].p[k];
+                if (a.kind == RAD_P_RANGE) continue;
+                // A capacity may shrink: its kernel writes by its operands' extents.
+                if (full.ops[i].op == "qsa_work" && a.key == "work" && q.ival <= a.ival)
                     continue;
-                }
-                REQUIRE_EQ(small.ops[i].p.size(), full.ops[i].p.size());
-                for (size_t k = 0; k < full.ops[i].p.size(); ++k) {
-                    const RecParam& a = full.ops[i].p[k];
-                    const RecParam& q = small.ops[i].p[k];
-                    if (a.kind == RAD_P_RANGE) continue;
-                    // A capacity may shrink: its kernel writes by its operands' extents.
-                    if (full.ops[i].op == "qsa_work" && a.key == "work" && q.ival <= a.ival)
-                        continue;
-                    if (a.ival != q.ival || a.sval != q.sval || a.dval != q.dval) {
-                        fprintf(stderr,
-                                "    split %s R %lld: op %zu '%s' param '%s': "
-                                "%lld real, %lld small\n",
-                                split, (long long)R, i, full.ops[i].op.c_str(), a.key.c_str(),
-                                a.ival, q.ival);
-                        ++differ;
-                    }
+                if (a.ival != q.ival || a.sval != q.sval || a.dval != q.dval) {
+                    fprintf(stderr,
+                            "    R %lld: op %zu '%s' param '%s': "
+                            "%lld real, %lld small\n",
+                            (long long)R, i, full.ops[i].op.c_str(), a.key.c_str(),
+                            a.ival, q.ival);
+                    ++differ;
                 }
             }
-            CHECK_EQ(differ, 0);
-            REQUIRE_EQ(small.bufs.size(), full.bufs.size());
-            for (size_t i = 0; i < full.bufs.size(); ++i)
-                for (uint32_t d = 1; d < full.bufs[i].d.rank; ++d)
-                    CHECK_EQ(small.bufs[i].d.shape[d], full.bufs[i].d.shape[d]);
         }
-    unsetenv("RADIANCE_GLM_TP_SPLIT_ROWS");
+        CHECK_EQ(differ, 0);
+        REQUIRE_EQ(small.bufs.size(), full.bufs.size());
+        for (size_t i = 0; i < full.bufs.size(); ++i)
+            for (uint32_t d = 1; d < full.bufs[i].d.rank; ++d)
+                CHECK_EQ(small.bufs[i].d.shape[d], full.bufs[i].d.shape[d]);
+    }
 }
 
-/* The MoE block's decode fusions (RADIANCE_GLM_*): each switch, alone and with the others, changes
- * exactly its launches against the step without switches, over a two-row trunk step, its draft
- * pass and a 512-row prefill (past the router fusion's one-workgroup sort), with the step lint
- * clean throughout. A switch value other than 0 or 1 is refused. */
+/* The MoE block's decode fusions: over a two-row trunk step, its draft pass and a 512-row prefill
+ * (past the router fusion's one-workgroup sort), each fused launch stands where it fits and the
+ * launches it replaces are gone, with the step lint clean throughout. The sort writes each slot's
+ * row (`moe_scatter_inv`) and the gather reads it (`moe_gather_inv`) in every MoE pass. */
 TEST(glm53_moe_decode_fusions_replace_their_launches_where_they_fit) {
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
@@ -2985,175 +2939,122 @@ TEST(glm53_moe_decode_fusions_replace_their_launches_where_they_fit) {
     meta.kv_val = vals;
     const auto mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
     const auto fp8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 128, 128);
-    const char* const env[] = { "RADIANCE_GLM_ROUTER_FUSE", "RADIANCE_GLM_SWIGLU_QUANT",
-                                "RADIANCE_GLM_GATHER_INVERSE" };
-    const int n_env = (int)(sizeof env / sizeof env[0]);
-    unsetenv("RADIANCE_GLM_TP_SPLIT_ROWS");
-    auto clear = [&]() {
-        for (const char* e : env) unsetenv(e);
-    };
     using Counts = std::map<std::string, int>;
-    /* Launches the first two switches remove (negative) and add, per step: trunk, draft pass,
-     * prefill. The trunk has 42 MoE layers, each a routed and a shared clamped SwiGLU, and three
-     * dense ones. The third turns every remaining sort and gather into its inverse form. */
-    struct Delta {
+    /* Launches per step: trunk, draft pass, prefill. The trunk has 42 MoE layers, each a routed
+     * and a shared clamped SwiGLU, and three dense ones. */
+    struct Want {
         const char* op;
         int trunk, draft, prefill;
     };
-    const std::vector<Delta> deltas[] = {
-        { { "router_sigmoid_topk_scatter", 42, 1, 0 },
-          { "router_sigmoid_topk", -42, -1, 0 },
-          { "moe_scatter", -42, -1, 0 },
-          { "fill", -42, -1, 0 } },
-        { { "swiglu_clamped_quant_fp8", 87, 2, 87 },
-          { "swiglu_clamped", -87, -2, -87 },
-          { "quant_act_fp8", -87, -2, -87 } },
+    const Want wants[] = {
+        { "router_sigmoid_topk_scatter", 42, 1, 0 }, { "router_sigmoid_topk", 0, 0, 42 },
+        { "swiglu_clamped_quant_fp8", 87, 2, 87 },   { "swiglu_clamped", 0, 0, 0 },
+        { "moe_scatter", 0, 0, 0 },                  { "moe_gather", 0, 0, 0 },
     };
     for (int world : { 1, 8 }) {
-        Counts base[3];
-        for (int mask = 0; mask < (1 << n_env); ++mask) {
-            // At one rank only the extremes: no switch reads the world.
-            if (world == 1 && mask && mask != (1 << n_env) - 1) continue;
-            for (int e = 0; e < n_env; ++e) setenv(env[e], mask >> e & 1 ? "1" : "0", 1);
-            RadBuilder b;
-            b.kv_block = 4;
-            b.encs = { { "mtp.blk.45.ffn_gate_up_exps", fp8 },
-                       { "mtp.blk.45.ffn_down_exps", fp8 },
-                       { "ffn_gate_up_exps", mx },
-                       { "ffn_down_exps", mx },
-                       { "ffn_gate_up_shexp", mx },
-                       { "ffn_down_shexp", mx },
-                       { "ffn_gate_up.weight", fp8 },
-                       { "ffn_down.weight", fp8 } };
-            RadBuildCtx build{};
-            build.rank = 0;
-            build.world_size = world;
-            build.max_tok = 512;
-            build.max_seqs = 4;
-            build.max_ctx = 4096;
-            build.max_spec = 3;
-            REQUIRE_EQ(glm5next::declare(&b, &meta, &build), RAD_OK);
-            int32_t cu[] = { 0, 2 }, positions[] = { 0, 1 }, ctxlens[] = { 0 }, ids[] = { 7, 9 },
-                    slots[] = { 0, 1 }, out[] = { 1 };
-            int32_t sidx[] = { 0, 0, 0, 1, 1, 1 }, ci[] = { 0 }, tables[32]{};
-            std::vector<RadKVGroupBatch> kv(b.kv_groups.size());
-            for (size_t i = 0; i < kv.size(); ++i) {
-                kv[i].group = (rad_kvgroup)i + 1;
-                kv[i].slot_mapping = slots;
-                kv[i].block_table = tables;
-                kv[i].block_table_pitch = 32;
-                kv[i].state_index = b.kv_groups[i].d.kind == RAD_KV_CONV ? ci : sidx;
-                kv[i].state_index_pitch = b.kv_groups[i].d.kind == RAD_KV_CONV ? 1 : 6;
-            }
-            RadBatch batch{};
-            batch.phase = RAD_PHASE_PREFILL;
-            batch.n_tok = 2;
-            batch.n_seq = 1;
-            batch.token_ids = ids;
-            batch.positions = positions;
-            batch.cu_seqlens = cu;
-            batch.ctx_lens = ctxlens;
-            batch.kv = kv.data();
-            batch.n_kv_groups = (int)kv.size();
-            batch.n_out = 1;
-            batch.out_ids = out;
-            RadCtx ctx;
-            ctx.b = &b;
-            ctx.rank = 0;
-            ctx.world = world;
-            ctx.batch = &batch;
-            Counts got[3];
-            /* With the inverse, the fused selection writes it as its ninth operand and the gather
-             * reads it as its third. */
-            const rad_buf inv = find_b(b, "expert_inverse")
-                                    ? (rad_buf)(find_b(b, "expert_inverse") - &b.bufs[0] + 1)
-                                    : 0;
-            CHECK_EQ(inv != 0, (mask & 4) != 0);
-            auto run = [&](int k) {
-                ctx.issues.clear();
-                glm5next::step(&ctx, &batch);
-                CHECK(ctx.step_fail.empty());
-                CHECK_LINT(b, &ctx);
-                for (const auto& op : issued_ops(b, ctx)) ++got[k][op];
-                for (const auto& is : ctx.issues) {
-                    const RecOp* o = b.op_of(is.op);
-                    if (!o || !inv) continue;
-                    if (o->op == "router_sigmoid_topk_scatter")
-                        CHECK(is.opd.size() > 8 && is.opd[8].kind == RAD_OPK_BUF &&
-                              is.opd[8].handle == inv);
-                    if (o->op == "moe_gather_inv")
-                        CHECK(is.opd.size() > 2 && is.opd[2].kind == RAD_OPK_BUF &&
-                              is.opd[2].handle == inv);
-                }
-            };
-            run(0);
-            batch.draft_pass = -1;
-            batch.n_draft_out = 1;
-            batch.draft_out_ids = out;
-            run(1);
-            std::vector<int32_t> long_ids(512, 7), long_positions(512), long_slots(512),
-                long_tables(1024);
-            for (int i = 0; i < 512; ++i) long_positions[i] = long_slots[i] = i;
-            int32_t long_cu[] = { 0, 512 }, last = 511;
-            for (auto& group : kv) {
-                group.slot_mapping = long_slots.data();
-                group.block_table = long_tables.data();
-                group.block_table_pitch = 1024;
-            }
-            batch.n_tok = 512;
-            batch.token_ids = long_ids.data();
-            batch.positions = long_positions.data();
-            batch.cu_seqlens = long_cu;
-            batch.out_ids = &last;
-            batch.draft_pass = 0;
-            batch.n_draft_out = 0;
-            batch.max_q_len = 512;
-            run(2);
-            if (mask == 0) {
-                for (int k = 0; k < 3; ++k) base[k] = got[k];
-                continue;
-            }
-            for (int k = 0; k < 3; ++k) {
-                Counts want = base[k];
-                for (int e = 0; e < 2; ++e)
-                    if (mask >> e & 1)
-                        for (const Delta& d : deltas[e])
-                            want[d.op] += k == 0 ? d.trunk : k == 1 ? d.draft : d.prefill;
-                if (mask & 4) {
-                    want["moe_scatter_inv"] += want["moe_scatter"];
-                    want["moe_scatter"] = 0;
-                    want["moe_gather_inv"] += want["moe_gather"];
-                    want["moe_gather"] = 0;
-                }
-                for (auto it = want.begin(); it != want.end();)
-                    it = it->second == 0 ? want.erase(it) : std::next(it);
-                if (got[k] != want) {
-                    fprintf(stderr, "    world %d switches %d step %d:", world, mask, k);
-                    for (const auto& [op, n] : want)
-                        if (got[k][op] != n)
-                            fprintf(stderr, " %s %d (want %d)", op.c_str(), got[k][op], n);
-                    for (const auto& [op, n] : got[k])
-                        if (!want.count(op)) fprintf(stderr, " %s %d (want 0)", op.c_str(), n);
-                    fprintf(stderr, "\n");
-                }
-                CHECK(got[k] == want);
-            }
-        }
-    }
-    for (const char* e : env) {
-        clear();
-        setenv(e, "2", 1);
         RadBuilder b;
+        b.kv_block = 4;
+        b.encs = { { "mtp.blk.45.ffn_gate_up_exps", fp8 },
+                   { "mtp.blk.45.ffn_down_exps", fp8 },
+                   { "ffn_gate_up_exps", mx },
+                   { "ffn_down_exps", mx },
+                   { "ffn_gate_up_shexp", mx },
+                   { "ffn_down_shexp", mx },
+                   { "ffn_gate_up.weight", fp8 },
+                   { "ffn_down.weight", fp8 } };
         RadBuildCtx build{};
         build.rank = 0;
-        build.world_size = 8;
-        build.max_tok = 64;
+        build.world_size = world;
+        build.max_tok = 512;
         build.max_seqs = 4;
         build.max_ctx = 4096;
         build.max_spec = 3;
-        CHECK_EQ(glm5next::declare(&b, &meta, &build), RAD_E_INVAL);
+        REQUIRE_EQ(glm5next::declare(&b, &meta, &build), RAD_OK);
+        int32_t cu[] = { 0, 2 }, positions[] = { 0, 1 }, ctxlens[] = { 0 }, ids[] = { 7, 9 },
+                slots[] = { 0, 1 }, out[] = { 1 };
+        int32_t sidx[] = { 0, 0, 0, 1, 1, 1 }, ci[] = { 0 }, tables[32]{};
+        std::vector<RadKVGroupBatch> kv(b.kv_groups.size());
+        for (size_t i = 0; i < kv.size(); ++i) {
+            kv[i].group = (rad_kvgroup)i + 1;
+            kv[i].slot_mapping = slots;
+            kv[i].block_table = tables;
+            kv[i].block_table_pitch = 32;
+            kv[i].state_index = b.kv_groups[i].d.kind == RAD_KV_CONV ? ci : sidx;
+            kv[i].state_index_pitch = b.kv_groups[i].d.kind == RAD_KV_CONV ? 1 : 6;
+        }
+        RadBatch batch{};
+        batch.phase = RAD_PHASE_PREFILL;
+        batch.n_tok = 2;
+        batch.n_seq = 1;
+        batch.token_ids = ids;
+        batch.positions = positions;
+        batch.cu_seqlens = cu;
+        batch.ctx_lens = ctxlens;
+        batch.kv = kv.data();
+        batch.n_kv_groups = (int)kv.size();
+        batch.n_out = 1;
+        batch.out_ids = out;
+        RadCtx ctx;
+        ctx.b = &b;
+        ctx.rank = 0;
+        ctx.world = world;
+        ctx.batch = &batch;
+        Counts got[3];
+        /* With the inverse, the fused selection writes it as its ninth operand and the gather
+         * reads it as its third. */
+        const rad_buf inv = find_b(b, "expert_inverse")
+                                ? (rad_buf)(find_b(b, "expert_inverse") - &b.bufs[0] + 1)
+                                : 0;
+        REQUIRE(inv != 0);
+        auto run = [&](int k) {
+            ctx.issues.clear();
+            glm5next::step(&ctx, &batch);
+            CHECK(ctx.step_fail.empty());
+            CHECK_LINT(b, &ctx);
+            for (const auto& op : issued_ops(b, ctx)) ++got[k][op];
+            for (const auto& is : ctx.issues) {
+                const RecOp* o = b.op_of(is.op);
+                if (!o) continue;
+                if (o->op == "router_sigmoid_topk_scatter")
+                    CHECK(is.opd.size() > 8 && is.opd[8].kind == RAD_OPK_BUF &&
+                          is.opd[8].handle == inv);
+                if (o->op == "moe_gather_inv")
+                    CHECK(is.opd.size() > 2 && is.opd[2].kind == RAD_OPK_BUF &&
+                          is.opd[2].handle == inv);
+            }
+        };
+        run(0);
+        batch.draft_pass = -1;
+        batch.n_draft_out = 1;
+        batch.draft_out_ids = out;
+        run(1);
+        std::vector<int32_t> long_ids(512, 7), long_positions(512), long_slots(512),
+            long_tables(1024);
+        for (int i = 0; i < 512; ++i) long_positions[i] = long_slots[i] = i;
+        int32_t long_cu[] = { 0, 512 }, last = 511;
+        for (auto& group : kv) {
+            group.slot_mapping = long_slots.data();
+            group.block_table = long_tables.data();
+            group.block_table_pitch = 1024;
+        }
+        batch.n_tok = 512;
+        batch.token_ids = long_ids.data();
+        batch.positions = long_positions.data();
+        batch.cu_seqlens = long_cu;
+        batch.out_ids = &last;
+        batch.draft_pass = 0;
+        batch.n_draft_out = 0;
+        batch.max_q_len = 512;
+        run(2);
+        for (int k = 0; k < 3; ++k)
+            for (const Want& w : wants) {
+                const int want = k == 0 ? w.trunk : k == 1 ? w.draft : w.prefill;
+                if (got[k][w.op] != want)
+                    fprintf(stderr, "    world %d step %d: %s %d (want %d)\n", world, k, w.op,
+                            got[k][w.op], want);
+                CHECK_EQ(got[k][w.op], want);
+            }
     }
-    clear();
 }
 
 TEST(dsa_cache_uses_distinct_index_and_attention_pages_and_a_speculative_tail_ring) {
@@ -3296,7 +3197,7 @@ TEST(glm_dense_ffn_keeps_clipping_and_disables_the_unclipped_fp8_epilogue) {
     MlpFP8::Src src{ "post_attention_layernorm.weight", "mlp.gate_proj.weight",
                      "mlp.up_proj.weight", "mlp.down_proj.weight" };
     REQUIRE_EQ(block.declare(&b, nm, g, 0, w, src, false, false, kArNone, false, 10), RAD_OK);
-    CHECK_EQ(block.op_gated, 0);
+    CHECK_EQ(block.op_gated, 0u);
     CHECK_EQ(b.ops[block.gq_ffn.op - 1].op, std::string("swiglu_clamped"));
     RadCtx ctx;
     ctx.b = &b;
@@ -3619,12 +3520,12 @@ TEST(mxfp4_expert_declarations_preserve_tp4_and_tp8_scale_geometry_and_movement_
                 if (glm) {
                     CHECK_EQ(b.weights[moe.w_router - 1].d.dtype, RAD_F32);
                     CHECK_EQ(b.ops[moe.op_topk - 1].op, std::string("router_sigmoid_topk"));
-                    CHECK_EQ(moe.op_topk_scatter, 0);
-                    CHECK_EQ(moe.op_router_fused, 0);
+                    CHECK_EQ(moe.op_topk_scatter, 0u);
+                    CHECK_EQ(moe.op_router_fused, 0u);
                     CHECK_EQ(b.ops[moe.gq_exp.op - 1].op, std::string("swiglu_clamped"));
                     CHECK_EQ(b.ops[moe.gq_sh.op - 1].op, std::string("swiglu_clamped"));
                     CHECK_EQ(b.ops[moe.op_sgate - 1].op, std::string("fill"));
-                    CHECK_EQ(moe.w_sgate, 0);
+                    CHECK_EQ(moe.w_sgate, 0u);
                     bool plain_shared = false;
                     for (const auto& p : b.ops[moe.op_gather - 1].p)
                         if (p.key == "act") plain_shared = p.sval == "none";
@@ -9475,10 +9376,9 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
     }
 }
 
-/* With the decode fusions switched off, GLM declares and steps the graph and launches it had
- * before them, at one and eight ranks: a 4096-row prefill after history, a mixed step, a decode
- * step, a verify and its draft passes. */
-TEST(glm53_without_fusion_switches_is_the_pinned_graph_and_steps) {
+/* GLM declares and steps the pinned graph and launches at one and eight ranks: a 4096-row prefill
+ * after history, a mixed step, a decode step, a verify and its draft passes. */
+TEST(glm53_is_the_pinned_graph_and_steps) {
     const char* keys[] = { "num_nextn_predict_layers", "hc_mult", "n_routed_experts",
                            "index_topk" };
     const char* vals[] = { "1", "4", "288", "2048" };
@@ -9496,12 +9396,8 @@ TEST(glm53_without_fusion_switches_is_the_pinned_graph_and_steps) {
         int world;
         uint64_t graph, steps;
     };
-    const Case cases[] = { { 1, 0xd48139cb64abf0b1ull, 0x6982726c635df529ull },
-                           { 8, 0x90fc5bc69f1cfb10ull, 0x197c95726131b817ull } };
-    for (const char* e :
-         { "RADIANCE_GLM_ROUTER_FUSE", "RADIANCE_GLM_SWIGLU_QUANT", "RADIANCE_GLM_GATHER_INVERSE" })
-        setenv(e, "0", 1);
-    unsetenv("RADIANCE_GLM_TP_SPLIT_ROWS");
+    const Case cases[] = { { 1, 0xed3fc26c486ea1b5ull, 0x98ba2952bb37b075ull },
+                           { 8, 0x8204e073efdeee0cull, 0x1279aecfe4e32d9aull } };
     for (const Case& cs : cases) {
         RadBuilder b;
         b.kv_block = 4;
@@ -9525,9 +9421,6 @@ TEST(glm53_without_fusion_switches_is_the_pinned_graph_and_steps) {
         CHECK_EQ(g, cs.graph);
         CHECK_EQ(s, cs.steps);
     }
-    for (const char* e :
-         { "RADIANCE_GLM_ROUTER_FUSE", "RADIANCE_GLM_SWIGLU_QUANT", "RADIANCE_GLM_GATHER_INVERSE" })
-        unsetenv(e);
 }
 
 /* Under a span a Flash-Next prefill of two intervals runs a pass at a time. At every world its

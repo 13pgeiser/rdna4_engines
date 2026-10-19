@@ -376,7 +376,8 @@ public:
     RadGeneratorDecl generator{};
     struct GenStrings {
         std::string name, tmpl_text, tmpl_edit, tmpl_image, tmpl_image_sep, drop_prefix,
-                    tmpl_transparent;
+                    tmpl_transparent, default_negative;
+        bool        has_default_negative = false;
         std::vector<double> sigmas;
     } gen_str;
     bool is_generator() const { return generator.layout != 0; }
@@ -392,6 +393,11 @@ public:
     struct VideoGenStrings {
         std::string name, tmpl;
         std::vector<double> rungs;   /* RadVideoGenDecl::rungs; the declaration's pointer is null */
+        std::vector<double> refine_rungs;
+        std::string default_negative;
+        /* RadVideoGenDecl::decoders, one name each, and their largest frames (0: max_area). */
+        std::vector<std::string> decoders;
+        std::vector<int64_t>     decoder_max_area;
     } vgen_str;
     bool is_video_generator() const { return video_gen.max_lanes != 0; }
     /* Driven by passes, not token steps: any generator. */
@@ -740,8 +746,9 @@ struct Config {
     /* --kv-cache-dtype bf16|fp8|fp8_v4|k6_v4. fp8 is an E4M3 cache with per-(sequence, head)
      * descales; it halves the per-token cost, most of the KV pool at production context. fp8_v4
      * keeps K as E4M3 and V as int4 in groups of 32, k6_v4 also K as int6 (RadBuildCtx::kv_quant),
-     * served only where the plugin says so. Each changes the model's output slightly, so it is explicit and bf16 is the
-     * default. No "auto": it would always resolve to bf16 and only add another name. */
+     * served only where the plugin says so. Each changes the model's output slightly, so it is
+     * explicit and bf16 is the default. No "auto": it would always resolve to bf16 and only add
+     * another name. */
     std::string kv_cache_dtype = "bf16";
     int64_t host_pool_mib = 0;
     int64_t host_headroom_mib = 4096; /* --host-headroom-mib: RAM left free for the system at startup */

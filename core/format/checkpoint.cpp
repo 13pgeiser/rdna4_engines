@@ -56,6 +56,25 @@ void MetaOwn::finish() {
  * path, and typed fields are read from `text_config.X`, falling back to `X`, so a plugin finds
  * `vision_config.depth` under that name either way.
  */
+/* An array's scalars appended to `s` space-separated, nested arrays flattened row-major (a
+ * vocoder's per-resnet dilations, [[1, 3, 5], [1, 3, 5]], read as "1 3 5 1 3 5"); false for an
+ * array holding an object or a null. */
+static bool join_scalars(const nlohmann::json& v, std::string* s) {
+    for (const auto& e : v) {
+        if (e.is_array()) {
+            if (!join_scalars(e, s)) return false;
+            continue;
+        }
+        if (!s->empty()) *s += ' ';
+        if (e.is_number_integer()) *s += fmt("%lld", (long long)e.get<int64_t>());
+        else if (e.is_number())    *s += fmt("%.17g", e.get<double>());
+        else if (e.is_string())    *s += e.get<std::string>();
+        else if (e.is_boolean())   *s += e.get<bool>() ? "1" : "0";
+        else return false;
+    }
+    return true;
+}
+
 static void flatten_json(const nlohmann::json& j, const std::string& prefix, MetaOwn* out) {
     for (auto it = j.begin(); it != j.end(); ++it) {
         const std::string key = prefix.empty() ? it.key() : prefix + "." + it.key();
@@ -74,19 +93,10 @@ static void flatten_json(const nlohmann::json& j, const std::string& prefix, Met
         else if (v.is_string())       out->kv(key, v.get<std::string>());
         else if (v.is_array()) {
             /* An array of scalars becomes a space-separated string (mrope_section "11 11 10",
-             * layer_types "linear_attention full_attention ..."). Arrays of objects are
-             * skipped. */
+             * layer_types "linear_attention full_attention ..."), nested arrays row-major.
+             * Arrays of objects are skipped. */
             std::string s;
-            bool ok = true;
-            for (const auto& e : v) {
-                if (!s.empty()) s += ' ';
-                if (e.is_number_integer()) s += fmt("%lld", (long long)e.get<int64_t>());
-                else if (e.is_number())    s += fmt("%.17g", e.get<double>());
-                else if (e.is_string())    s += e.get<std::string>();
-                else if (e.is_boolean())   s += e.get<bool>() ? "1" : "0";
-                else { ok = false; break; }
-            }
-            if (ok) out->kv(key, s);
+            if (join_scalars(v, &s)) out->kv(key, s);
         }
     }
 }
@@ -590,7 +600,9 @@ int Checkpoint::open_diffusers() {
             RAD_TRY(meta_merge_json_file(dir_ + "/" + sc + "/scheduler_config.json", sc, true,
                                          &meta_));
     }
-    for (const char* sub : { "processor", "tokenizer" }) {
+    /* The tokenizer's own folder, or the text encoder's when the release keeps it there (FLUX.3
+     * [klein]'s modular pipeline points its tokenizer at text_encoder/). */
+    for (const char* sub : { "processor", "tokenizer", "text_encoder" }) {
         const std::string d = dir_ + "/" + sub;
         if (!path_exists(d + "/tokenizer.json")) continue;
         tok_dir_ = d;
@@ -1552,9 +1564,9 @@ static int resolve_wnorm(Checkpoint& ck, const RadNameMap& m, bool optional, Ckp
     return RAD_OK;
 }
 
-/* RAD_MAP_TRANSPOSE (src[0] [.., a, b] read as [.., b, a]) and RAD_MAP_EMA (src[0] the embedding
- * sums [bins, ...], src[1] the cluster usage [bins]; each row over max(usage, 1e-5)), computed in
- * f32 into `derived`. */
+/* RAD_MAP_TRANSPOSE (src[0] [.., a, b] read as [.., b, a]), RAD_MAP_EMA (src[0] the embedding
+ * sums [bins, ...], src[1] the cluster usage [bins]; each row over max(usage, 1e-5)) and
+ * RAD_MAP_TAP (one index of one dimension of src[0]), computed in f32 into `derived`. */
 static int resolve_derived(Checkpoint& ck, const std::vector<const RadNameMap*>& maps,
                            bool optional, CkptWeight* out, std::string* why) {
     auto refuse = [&](int rc, std::string msg) {
@@ -1618,7 +1630,30 @@ static int resolve_derived(Checkpoint& ck, const std::vector<const RadNameMap*>&
         return refuse(RAD_E_FORMAT, "'" + a->name + "' cannot be read as f32");
     out->rank = (uint32_t)rank;
     for (size_t i = 0; i < rank; ++i) out->shape[i] = a->shape[i];
-    if (ema) {
+    if (m.mode == RAD_MAP_TAP) {
+        const int d = m.concat_dim;
+        if (d < 0 || (size_t)d >= rank || rank < 3)
+            return refuse(RAD_E_SHAPE, "'" + a->name + "' has rank " + std::to_string(rank) +
+                                       "; a tap of dimension " + std::to_string(d) +
+                                       " leaves no matrix");
+        const int64_t k = a->shape[(size_t)d];
+        const int64_t t = m.src_index[0] < 0 ? k + m.src_index[0] : m.src_index[0];
+        if (t < 0 || t >= k)
+            return refuse(RAD_E_SHAPE, "tap " + std::to_string(m.src_index[0]) + " of '" +
+                                       a->name + "' dimension " + std::to_string(d) + " of " +
+                                       std::to_string(k));
+        int64_t outer = 1, inner = 1;
+        for (int i = 0; i < d; ++i) outer *= a->shape[(size_t)i];
+        for (size_t i = (size_t)d + 1; i < rank; ++i) inner *= a->shape[i];
+        out->derived.resize((size_t)(outer * inner));
+        for (int64_t o = 0; o < outer; ++o)
+            std::memcpy(&out->derived[(size_t)(o * inner)], &src[(size_t)((o * k + t) * inner)],
+                        (size_t)inner * sizeof(float));
+        out->rank = (uint32_t)(rank - 1);
+        for (size_t i = (size_t)d; i + 1 < rank; ++i) out->shape[i] = a->shape[i + 1];
+        out->why = "it is tap " + std::to_string(t) + " of '" + a->name + "' dimension " +
+                   std::to_string(d) + ", at convert -- a recipe rule stores it";
+    } else if (ema) {
         const int64_t bins = a->shape[0], per = n / bins;
         int64_t un = 1;
         for (int64_t x : u->shape) un *= x;
@@ -1673,7 +1708,8 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
     if (maps.empty()) return refuse(RAD_E_NOTFOUND, "the name map has no entry for it");
     if (maps.front()->mode == RAD_MAP_WNORM)
         return resolve_wnorm(ck, *maps.front(), optional, out, why);
-    if (maps.front()->mode == RAD_MAP_TRANSPOSE || maps.front()->mode == RAD_MAP_EMA)
+    if (maps.front()->mode == RAD_MAP_TRANSPOSE || maps.front()->mode == RAD_MAP_EMA ||
+        maps.front()->mode == RAD_MAP_TAP)
         return resolve_derived(ck, maps, optional, out, why);
     struct Src1 { const char* name; int index; int64_t rows; };
     std::vector<Src1> srcs;

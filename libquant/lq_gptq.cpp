@@ -136,16 +136,14 @@ bool chol_upper_loop(std::vector<double>& a, int64_t k) {
     return true;
 }
 
+#ifdef RAD_LQ_LAPACK
 /* LAPACK where OpenBLAS was found; RAD_LQ_LAPACK=0 takes the loops instead, the reference the
  * LAPACK path is checked against (quant_algo_test). */
 bool use_lapack() {
-#ifdef RAD_LQ_LAPACK
     const char* e = std::getenv("RAD_LQ_LAPACK");
     return !(e && e[0] == '0');
-#else
-    return false;
-#endif
 }
+#endif
 
 bool chol_lower(std::vector<double>& a, int64_t k) {
 #ifdef RAD_LQ_LAPACK
@@ -168,7 +166,7 @@ bool chol_upper(std::vector<double>& a, int64_t k) {
     return chol_upper_loop(a, k);
 }
 
-/* Layer factors kept at once (RAD_LQ_FACTOR_CACHE_ALL: every one). */
+/* Layer factors kept at once. */
 constexpr size_t kFactors = 4;
 
 struct Cache {
@@ -222,10 +220,9 @@ Gram gptq_factor(const char* dir, const char* name, int64_t K, int64_t domain, d
          * once, and a 21504-wide factor is 1.85 GB in f32 (every one kept OOM-killed
          * TranslateGemma 27B's conversion at layer 25). A MoE layer's experts run in parallel
          * and alternate between its gate_up and down stems, so one kept factor would be
-         * recomputed over and over. RAD_LQ_FACTOR_CACHE_ALL keeps every one. */
-        static const bool all = std::getenv("RAD_LQ_FACTOR_CACHE_ALL") != nullptr;
+         * recomputed over and over. */
         if (layer && !c.f.count(key)) {
-            while (!all && c.order.size() >= kFactors) {
+            while (c.order.size() >= kFactors) {
                 c.f.erase(c.order.front());
                 c.order.pop_front();
             }

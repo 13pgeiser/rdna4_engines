@@ -67,41 +67,8 @@ __global__ void mhc_partial_kernel(const uint16_t* h, const float* fn, Out out, 
     }
 }
 
-// Prefill reuses each F32 mixing weight across four BF16 token rows.
-// Each row keeps the same accumulation and reduction order as the scalar-row path.
-template <class Out>
-__global__ void mhc_partial_rows4_kernel(const uint16_t* h, const float* fn, Out out, int width,
-                                         int mix, int chunk0, long hp, long fp, long rows) {
-    __shared__ float sums[4][4];
-    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
-    const int j = blockIdx.y, chunk = chunk0 + blockIdx.x;
-    const long first = (long)blockIdx.z * 4;
-    float sum[4] = { 0, 0, 0, 0 };
-    for (int i = chunk * 2048 + tid; i < min(width, (chunk + 1) * 2048); i += 128) {
-        const float weight = j == mix ? 0 : fn[(long)j * fp + i];
-#pragma unroll
-        for (int r = 0; r < 4; ++r)
-            if (first + r < rows) {
-                const float v = bf16_to_f32(h[(first + r) * hp + i]);
-                sum[r] += v * (j == mix ? v : weight);
-            }
-    }
-#pragma unroll
-    for (int r = 0; r < 4; ++r) {
-        sum[r] = warp_sum(sum[r]);
-        if (!lane) sums[r][wave] = sum[r];
-    }
-    __syncthreads();
-    if (!tid)
-        for (int r = 0; r < 4; ++r)
-            if (first + r < rows) {
-                *out.at(first + r, j, chunk) = sums[r][0] + sums[r][1] + sums[r][2] + sums[r][3];
-                if (j == mix) out.pad(first + r, mix, chunk);
-            }
-}
-
-// Reuse each input across four coefficients and each weight across four rows.
-// All per-output K accumulation and reduction orders match the rows4 path.
+// Prefill reuses each input across four coefficients and each F32 mixing weight across four BF16
+// token rows. Every output keeps mhc_partial_kernel's accumulation and reduction order.
 template <class Out>
 __global__ void mhc_partial_rows4_coeff4_kernel(const uint16_t* h, const float* fn, Out out,
                                                 int width, int mix, int chunk0, long hp, long fp,
@@ -246,17 +213,18 @@ __global__ __launch_bounds__(128) void mhc_partial_vec_kernel(const uint16_t* h,
         }
 }
 
-template <class In, bool VecX>
+// The geometries without the chunk split: one workgroup a row projects the residual itself from
+// `fn`, then mixes and collapses it.
 __global__ void mhc_pre_kernel(const uint16_t* h, const float* fn, const float* scale,
                                const float* base, uint16_t* x, float* post, float* comb, int n,
                                int hc, int iterations, float eps, float heps, long hp, long fp,
-                               long xp, long pp, long cp, int chunks, In in) {
+                               long xp, long pp, long cp) {
     __shared__ float sums[8], inverse, coefficients[80], pre[8], c[64];
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
     const long r = blockIdx.x;
     const int width = hc * n, mix = hc * (hc + 2);
     float ss = 0;
-    for (int i = tid; !chunks && i < width; i += 256) {
+    for (int i = tid; i < width; i += 256) {
         const float v = bf16_to_f32(h[r * hp + i]);
         ss += v * v;
     }
@@ -265,20 +233,14 @@ __global__ void mhc_pre_kernel(const uint16_t* h, const float* fn, const float* 
     __syncthreads();
     if (!tid) {
         float s = 0;
-        if (chunks)
-            for (int i = 0; i < chunks; ++i) s += *in.at(r, mix, i);
-        else
-            for (int i = 0; i < 8; ++i) s += sums[i];
+        for (int i = 0; i < 8; ++i) s += sums[i];
         inverse = rsqrtf(s / (float)width + eps);
     }
     __syncthreads();
     for (int j = wave; j < mix; j += 8) {
         float dot = 0;
-        if (chunks)
-            for (int i = lane; i < chunks; i += 32) dot += *in.at(r, j, i);
-        else
-            for (int i = lane; i < width; i += 32)
-                dot += bf16_to_f32(h[r * hp + i]) * fn[(long)j * fp + i];
+        for (int i = lane; i < width; i += 32)
+            dot += bf16_to_f32(h[r * hp + i]) * fn[(long)j * fp + i];
         dot = warp_sum(dot);
         if (!lane) coefficients[j] = dot * inverse;
     }
@@ -319,7 +281,7 @@ __global__ void mhc_pre_kernel(const uint16_t* h, const float* fn, const float* 
         for (int j = 0; j < hc * hc; ++j) comb[r * cp + j] = c[j];
     }
     __syncthreads();
-    if (VecX && mix_rows_vec(h + r * hp, x + r * xp, pre, n, hc, tid, 256)) return;
+    if (mix_rows_vec(h + r * hp, x + r * xp, pre, n, hc, tid, 256)) return;
     for (int i = tid; i < n; i += 256) {
         float v = 0;
         for (int j = 0; j < hc; ++j) v += pre[j] * bf16_to_f32(h[r * hp + j * n + i]);
@@ -383,29 +345,8 @@ __device__ __forceinline__ float glm_warp_mix(int lane, long row, const float* s
     if (lane < 16) comb[row * cp + lane] = value;
     return pre;
 }
-template <class In>
-__global__ void mhc_pre_glm_warp_kernel(const uint16_t* h, const float* scale, const float* base,
-                                        uint16_t* x, float* post, float* comb, int iterations,
-                                        float eps, float heps, long hp, long xp, long pp, long cp,
-                                        In in) {
-    const int lane = threadIdx.x;
-    const long row = blockIdx.x;
-    const float pre =
-        glm_warp_mix(lane, row, scale, base, post, comb, iterations, eps, heps, pp, cp, in);
-    const float p0 = __shfl(pre, 0, 32), p1 = __shfl(pre, 1, 32), p2 = __shfl(pre, 2, 32),
-                p3 = __shfl(pre, 3, 32);
-    for (int i = lane; i < 4096; i += 32) {
-        float v = 0;
-        v += p0 * bf16_to_f32(h[row * hp + i]);
-        v += p1 * bf16_to_f32(h[row * hp + 4096 + i]);
-        v += p2 * bf16_to_f32(h[row * hp + 8192 + i]);
-        v += p3 * bf16_to_f32(h[row * hp + 12288 + i]);
-        x[row * xp + i] = f32_to_bf16(v);
-    }
-}
-
-// The warp kernel's mix on wave 0, then the collapsed read over the whole block: one wave writing
-// 4096 columns a row was most of a decode step's mhc_pre.
+// glm_warp_mix on wave 0, then the collapsed read over the whole block: one wave writing 4096
+// columns a row would be most of a decode step's mhc_pre.
 template <class In>
 __global__ __launch_bounds__(256) void mhc_pre_glm_wide_kernel(
     const uint16_t* h, const float* scale, const float* base, uint16_t* x, float* post, float* comb,
@@ -516,23 +457,15 @@ constexpr int kChunkCols = 2048, kPartStride = 28;
 template <class Out>
 int emit_partials(RadStream stream, const RadTensor& h, const RadTensor& fn, Out out, int n, int hc,
                   int chunk0, int count, long rows) {
-    const char* rows4 = std::getenv("RADIANCE_MHC_PREFILL_ROWS4");
-    const char* coeff4 = std::getenv("RADIANCE_MHC_PREFILL_COEFF4");
-    /* From 2 rows the four-slot form (RADIANCE_MHC_PARTIAL_VEC 0 off, 1 at every row count;
-     * RADIANCE_MHC_PARTIAL_ROWS 1, 2 or 4 pins its rows a wave), on 16-byte weight and 8-byte
-     * residual rows; GLM's 2048-column chunks only. Measured cold on gfx1201 at GLM's shape:
-     * one row a wave leads up to 16 rows (13 us against the old 20 to 36), two rows from 48
-     * (20 against 22 us, at 128 rows 34 against 39, at 2048 391 against 500); four rows a wave
-     * trail two at every count. */
-    const char* vec = std::getenv("RADIANCE_MHC_PARTIAL_VEC");
+    /* From 2 rows the four-slot form, on 16-byte weight and 8-byte residual rows; GLM's
+     * 2048-column chunks only. Measured cold on gfx1201 at GLM's shape: one row a wave leads up
+     * to 16 rows (13 us against 20 to 36 for the one-slot kernels), two rows from 48 (20 against
+     * 22 us, at 128 rows 34 against 39, at 2048 391 against 500); four rows a wave trail two at
+     * every count. */
     const bool vec_aligned = ((uintptr_t)fn.data & 15) == 0 && fn.stride[0] % 4 == 0 &&
                              ((uintptr_t)h.data & 7) == 0 && h.stride[0] % 4 == 0 &&
                              hc * n % kChunkCols == 0;
-    if (vec_aligned && (vec ? vec[0] == '1' : rows >= 2)) {
-        const char* pin_rows = std::getenv("RADIANCE_MHC_PARTIAL_ROWS");
-        const long R = pin_rows && *pin_rows ? std::strtol(pin_rows, nullptr, 10)
-                       : rows >= 32          ? 2
-                                             : 1;
+    if (vec_aligned && rows >= 2) {
         const int mix = hc * (hc + 2), groups = (mix + 4) / 4;
 #define MHC_VEC(RR)                                                                                \
     do {                                                                                           \
@@ -542,25 +475,18 @@ int emit_partials(RadStream stream, const RadTensor& h, const RadTensor& fn, Out
                         (const float*)fn.data, out, mix, chunk0, count, (long)h.stride[0],         \
                         (long)fn.stride[0], rows, items);                                          \
     } while (0)
-        if (R == 4) MHC_VEC(4);
-        if (R == 2) MHC_VEC(2);
+        if (rows >= 32) MHC_VEC(2);
         MHC_VEC(1);
 #undef MHC_VEC
     }
-    const char* rows4_min = std::getenv("RADIANCE_MHC_ROWS4_MIN");
-    const bool use_rows4 =
-        (!rows4 || rows4[0] == '1') &&
-        rows >= (rows4_min && *rows4_min ? std::strtol(rows4_min, nullptr, 10) : 32);
-    if (use_rows4 && (!coeff4 || coeff4[0] == '1'))
+    /* Otherwise four rows and four coefficients a block from 32 rows, one row and one coefficient
+     * below. */
+    constexpr long kRows4Min = 32;
+    if (rows >= kRows4Min)
         return R4D_EMIT(stream, (mhc_partial_rows4_coeff4_kernel<Out>),
                         dim3(count, (hc * (hc + 2) + 4) / 4, (unsigned)((rows + 3) / 4)), dim3(128),
                         0, (const uint16_t*)h.data, (const float*)fn.data, out, hc * n,
                         hc * (hc + 2), chunk0, (long)h.stride[0], (long)fn.stride[0], rows);
-    if (use_rows4)
-        return R4D_EMIT(stream, (mhc_partial_rows4_kernel<Out>),
-                        dim3(count, hc * (hc + 2) + 1, (unsigned)((rows + 3) / 4)), dim3(128), 0,
-                        (const uint16_t*)h.data, (const float*)fn.data, out, hc * n, hc * (hc + 2),
-                        chunk0, (long)h.stride[0], (long)fn.stride[0], rows);
     return R4D_EMIT(stream, (mhc_partial_kernel<Out>),
                     dim3(count, hc * (hc + 2) + 1, (unsigned)rows), dim3(128), 0,
                     (const uint16_t*)h.data, (const float*)fn.data, out, hc * n, hc * (hc + 2),
@@ -571,39 +497,19 @@ int emit_partials(RadStream stream, const RadTensor& h, const RadTensor& fn, Out
 template <class In>
 int emit_finish(RadStream stream, const RadTensor& h, const float* fn, long fp, const RadTensor& s,
                 const RadTensor& b, const RadTensor& x, const RadTensor& p, const RadTensor& c,
-                int n, int hc, int iters, float eps, float heps, long rows, int chunks, bool split,
-                In in) {
-    const char* warp = std::getenv("RADIANCE_MHC_PREFILL_WARP");
+                int n, int hc, int iters, float eps, float heps, long rows, bool split, In in) {
     /* The warp mix at every row count: byte-identical to the scalar one and a quarter of its time
-     * at one to six rows. RADIANCE_MHC_FINISH, for the microbenchmark: `old` the one-wave finish
-     * from 32 rows and the scalar mix and read below, `scalar` that mix with the wide read. */
-    const char* form = std::getenv("RADIANCE_MHC_FINISH");
-    const bool old = form && !std::strcmp(form, "old");
-    const bool warp_mix = split && (warp ? warp[0] == '1' : true) &&
-                          (old ? rows >= 32 : !(form && !std::strcmp(form, "scalar")));
-    if (warp_mix && old)
-        return R4D_EMIT(stream, (mhc_pre_glm_warp_kernel<In>), dim3((unsigned)rows), dim3(32), 0,
-                        (const uint16_t*)h.data, (const float*)s.data, (const float*)b.data,
-                        (uint16_t*)x.data, (float*)p.data, (float*)c.data, iters, eps, heps,
-                        (long)h.stride[0], (long)x.stride[0], (long)p.stride[0], (long)c.stride[0],
-                        in);
-    if (warp_mix)
+     * at one to six rows. */
+    if (split)
         return R4D_EMIT(stream, (mhc_pre_glm_wide_kernel<In>), dim3((unsigned)rows), dim3(256), 0,
                         (const uint16_t*)h.data, (const float*)s.data, (const float*)b.data,
                         (uint16_t*)x.data, (float*)p.data, (float*)c.data, iters, eps, heps,
                         (long)h.stride[0], (long)x.stride[0], (long)p.stride[0], (long)c.stride[0],
                         in);
-    if (old)
-        return R4D_EMIT(stream, (mhc_pre_kernel<In, false>), dim3((unsigned)rows), dim3(256), 0,
-                        (const uint16_t*)h.data, fn, (const float*)s.data, (const float*)b.data,
-                        (uint16_t*)x.data, (float*)p.data, (float*)c.data, n, hc, iters, eps, heps,
-                        (long)h.stride[0], fp, (long)x.stride[0], (long)p.stride[0],
-                        (long)c.stride[0], split ? chunks : 0, in);
-    return R4D_EMIT(stream, (mhc_pre_kernel<In, true>), dim3((unsigned)rows), dim3(256), 0,
+    return R4D_EMIT(stream, mhc_pre_kernel, dim3((unsigned)rows), dim3(256), 0,
                     (const uint16_t*)h.data, fn, (const float*)s.data, (const float*)b.data,
                     (uint16_t*)x.data, (float*)p.data, (float*)c.data, n, hc, iters, eps, heps,
-                    (long)h.stride[0], fp, (long)x.stride[0], (long)p.stride[0], (long)c.stride[0],
-                    split ? chunks : 0, in);
+                    (long)h.stride[0], fp, (long)x.stride[0], (long)p.stride[0], (long)c.stride[0]);
 }
 bool coefficients(const RadArgs* a, long* iters, float* eps, float* heps) {
     *iters = r4d_geti_or(a, "iterations", 0);
@@ -640,7 +546,7 @@ int pre_body(const RadArgs* a, RadStream stream) {
         if (rc < 0) return rc;
     }
     return emit_finish(stream, h, (const float*)fn.data, (long)fn.stride[0], s, b, x, p, c, n, hc,
-                       (int)iters, eps, heps, rows, chunks, split, in);
+                       (int)iters, eps, heps, rows, split, in);
 }
 int partial_body(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 3) return RAD_E_INVAL;
@@ -676,7 +582,7 @@ int finish_body(const RadArgs* a, RadStream stream) {
         return RAD_E_SHAPE;
     const Dense in{ (float*)part.data, (long)part.stride[0], kPartStride, 0 };
     return emit_finish(stream, h, nullptr, 0, s, b, x, p, c, n, hc, (int)iters, eps, heps, rows,
-                       chunks, true, in);
+                       true, in);
 }
 int post_body(const RadArgs* a, RadStream stream) {
     if (!a || a->n_t < 5) return RAD_E_INVAL;
@@ -689,12 +595,10 @@ int post_body(const RadArgs* a, RadStream stream) {
         !matrix(p, RAD_F32, rows, hc) || !matrix(c, RAD_F32, rows, hc * hc) ||
         !matrix(o, RAD_BF16, rows, hc * n) || o.data == h.data)
         return RAD_E_SHAPE;
-    /* RADIANCE_MHC_POST_VEC=0 keeps the per-output kernel, for the microbenchmark. */
-    const char* vec = std::getenv("RADIANCE_MHC_POST_VEC");
     const auto aligned = [](const RadTensor& t) {
         return ((uintptr_t)t.data & 15) == 0 && t.stride[0] % 8 == 0;
     };
-    if ((!vec || vec[0] == '1') && hc == 4 && n % 8 == 0 && aligned(x) && aligned(h) && aligned(o))
+    if (hc == 4 && n % 8 == 0 && aligned(x) && aligned(h) && aligned(o))
         return R4D_EMIT(stream, mhc_post_vec_kernel, dim3((n / 8 + 255) / 256, (unsigned)rows),
                         dim3(256), 0, (const uint16_t*)x.data, (const uint16_t*)h.data,
                         (const float*)p.data, (const float*)c.data, (uint16_t*)o.data, n,

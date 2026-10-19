@@ -164,6 +164,10 @@ int     r4d_rad_seg_sinusoid          (const RadArgs*, RadStream);
  * (an image decoder's mid block). */
 int     r4d_rad_attn_prefix_self      (const RadArgs*, RadStream);
 int     r4d_rad_attn_dense_h128       (const RadArgs*, RadStream);
+int     r4d_rad_attn_cross            (const RadArgs*, RadStream);
+int     r4d_rad_table_add             (const RadArgs*, RadStream);
+int     r4d_rad_mix_rows              (const RadArgs*, RadStream);
+int     r4d_rad_chan_stats            (const RadArgs*, RadStream);
 int     r4d_rad_attn_dense_wide       (const RadArgs*, RadStream);
 /* The image generator's other ops (r4d_gen.hip). */
 int     r4d_rad_ln_mod                (const RadArgs*, RadStream);
@@ -204,6 +208,7 @@ int     r4d_rad_interleave2           (const RadArgs*, RadStream);
 int     r4d_rad_attn_dense_small_h256 (const RadArgs*, RadStream);
 int     r4d_rad_iota                  (const RadArgs*, RadStream);
 int     r4d_rad_cu_repeat             (const RadArgs*, RadStream);
+int     r4d_rad_int_affine            (const RadArgs*, RadStream);
 /* r4d_video.hip */
 int     r4d_rad_rms_mod               (const RadArgs*, RadStream);
 int     r4d_rad_rms_mod_quant_fp8     (const RadArgs*, RadStream);
@@ -221,6 +226,21 @@ int     r4d_rad_tconv_dw              (const RadArgs*, RadStream);
 int     r4d_rad_resize_bilinear       (const RadArgs*, RadStream);
 int     r4d_rad_patch_fold            (const RadArgs*, RadStream);
 int     r4d_rad_flow_renoise          (const RadArgs*, RadStream);
+int     r4d_rad_rope_split            (const RadArgs*, RadStream);
+int     r4d_rad_head_gate             (const RadArgs*, RadStream);
+int     r4d_rad_ltx_guide             (const RadArgs*, RadStream);
+int     r4d_rad_pixel_norm            (const RadArgs*, RadStream);
+int     r4d_rad_d2s3d                 (const RadArgs*, RadStream);
+int     r4d_rad_s2d3d                 (const RadArgs*, RadStream);
+int     r4d_rad_pix_patch             (const RadArgs*, RadStream);
+int     r4d_rad_patch_pix8            (const RadArgs*, RadStream);
+int     r4d_rad_vol_index             (const RadArgs*, RadStream);
+int     r4d_rad_attn_na3d             (const RadArgs*, RadStream);
+int     r4d_rad_tile_grid             (const RadArgs*, RadStream);
+int     r4d_rad_tile_crop             (const RadArgs*, RadStream);
+int     r4d_rad_tile_stitch           (const RadArgs*, RadStream);
+int     r4d_rad_stft_logmel           (const RadArgs*, RadStream);
+int     r4d_rad_bwe_up                (const RadArgs*, RadStream);
 /* r4d_vsa.hip: video sparse attention's selection (scratch for the tile means) and attention. */
 int     r4d_rad_vsa_select            (const RadArgs*, RadStream);
 int64_t r4d_rad_vsa_select_scratch    (const RadArgs*);
@@ -280,6 +300,24 @@ int64_t r4d_rad_attn_decode_h256_gqa6_scratch(const RadArgs*);
  * kernel; see attn_decode_gq_h256_gqa6_fp8kv. */
 int     r4d_rad_attn_decode_gq_h256_gqa6_fp8(const RadArgs*, RadStream);
 int     r4d_rad_attn_decode_gq_h256_gqa6_bf16(const RadArgs*, RadStream);
+/* The fp8_v4 and k6_v4 caches on both: prefill, decode, and decode with the gate and quantiser in
+ * the merge (R4D_ATTN_V4 in r4d_attn_paged_gqa8.hip). */
+int     r4d_rad_attn_prefill_h256_gqa12_fp8v4(const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_h256_gqa12_fp8v4(const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_gq_h256_gqa12_fp8v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa12_fp8v4_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa12_k6v4(const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_h256_gqa12_k6v4(const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_gq_h256_gqa12_k6v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa12_k6v4_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa6_fp8v4(const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_h256_gqa6_fp8v4(const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_gq_h256_gqa6_fp8v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa6_fp8v4_scratch(const RadArgs*);
+int     r4d_rad_attn_prefill_h256_gqa6_k6v4(const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_h256_gqa6_k6v4(const RadArgs*, RadStream);
+int     r4d_rad_attn_decode_gq_h256_gqa6_k6v4(const RadArgs*, RadStream);
+int64_t r4d_rad_attn_decode_h256_gqa6_k6v4_scratch(const RadArgs*);
 
 /* -- gated delta net (r4d_gdn_*.hip) -- */
 int r4d_rad_gdn_chunk_scan      (const RadArgs*, RadStream);

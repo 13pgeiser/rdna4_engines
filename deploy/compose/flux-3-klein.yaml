@@ -1,0 +1,15 @@
+# FLUX.3 [klein] (black-forest-labs/flux-3-image-klein) as block fp8: text to image and edits from up
+# to ten reference pictures on OpenAI's /v1/images/generations and /v1/images/edits, on one card,
+# RADIANCE_GPU in .env (default 0). For the base model, point --model at flux-3-klein-base-fp8.rad.
+# The FLUX Kommunity License (non-commercial use) applies.
+name: radiance-flux-3-klein
+services:
+  radiance:
+    extends: { file: common.yaml, service: radiance }
+    container_name: radiance-flux-3-klein
+    environment:
+      ROCR_VISIBLE_DEVICES: "${RADIANCE_GPU:-0}"
+    command: >
+      --model /models/flux-3-klein-fp8.rad
+      --host :: --port ${PORT:-8000} --api-key ${RADIANCE_API_KEY:?set RADIANCE_API_KEY in .env}
+      --tp 1

@@ -116,6 +116,62 @@ __global__ __launch_bounds__(kT) void gate_add_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------- table_add
+// y[r, l n + c] = x[r, c] + t[l, c], f32 sum rounded once: one workgroup a (row, table row).
+__global__ __launch_bounds__(kT) void table_add_kernel(
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ t, uint16_t* __restrict__ y,
+    int n, int L, int x_ld, int y_ld) {
+    const int r = blockIdx.x / L, l = blockIdx.x % L;
+    for (int i = threadIdx.x * 8; i < n; i += kT * 8) {
+        float a[8], b[8];
+        ld8(x + (size_t)r * x_ld + i, a);
+        ld8(t + (size_t)l * n + i, b);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) a[j] += b[j];
+        st8(y + (size_t)r * y_ld + (size_t)l * n + i, a);
+    }
+}
+
+// ---------------------------------------------------------------------------- mix_rows
+// y[r, c] = sum_i w[i] x[r k + i, c], f32 in ascending i, rounded once: one workgroup a row.
+__global__ __launch_bounds__(kT) void mix_rows_kernel(
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ w, uint16_t* __restrict__ y,
+    int n, int k, int x_ld, int y_ld) {
+    const int r = blockIdx.x;
+    for (int i = threadIdx.x * 8; i < n; i += kT * 8) {
+        float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0}, v[8];
+        for (int q = 0; q < k; ++q) {
+            const float wq = bf2f(w[q]);
+            ld8(x + (size_t)(r * k + q) * x_ld + i, v);
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) acc[j] += wq * v[j];
+        }
+        st8(y + (size_t)r * y_ld + i, acc);
+    }
+}
+
+// ---------------------------------------------------------------------------- chan_stats
+// The statistics are rounded on the host side of each thread (cheap: n reads), every step as
+// libref rounds it.
+__global__ __launch_bounds__(kT) void chan_stats_kernel(
+    const uint16_t* __restrict__ x, const uint16_t* __restrict__ mean,
+    const uint16_t* __restrict__ sv, uint16_t* __restrict__ y, int n, int x_ld, int y_ld,
+    int var, float eps, int norm) {
+    const int r = blockIdx.x;
+    for (int i = threadIdx.x * 8; i < n; i += kT * 8) {
+        float a[8], mu[8], sd[8];
+        ld8(x + (size_t)r * x_ld + i, a);
+        ld8(mean + i, mu);
+        ld8(sv + i, sd);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float s = var ? bfr(sqrtf(sd[j] + eps)) : sd[j];
+            a[j] = norm ? bfr(bfr(a[j] - mu[j]) / s) : bfr(bfr(a[j] * s) + mu[j]);
+        }
+        st8(y + (size_t)r * y_ld + i, a);
+    }
+}
+
 // ---------------------------------------------------------------------------- ln_mod_quant_fp8
 // gate_add, ln_mod and quant_act_fp8 in one pass over the row: the DiT block's norm in front of
 // every quantised linear, with the previous branch's gated residual folded in. Three passes over a
@@ -207,7 +263,8 @@ __global__ __launch_bounds__(kT) void timestep_kernel(
     int round, int y_ld) {
     const int m = blockIdx.x;
     const float tv = t[m];
-    const float tt = round ? scale * bfr(bfr(tv * scale) / scale) : scale * tv;
+    const float tt = round == 3 ? bfr(scale * bfr(tv)) : round == 2 ? scale * bfr(tv)
+                   : round ? scale * bfr(bfr(tv * scale) / scale) : scale * tv;
     for (int i = threadIdx.x; i < h; i += kT) {
         const float f = expf(coef * (float)i / (float)h);
         const float arg = tt * f;
@@ -339,6 +396,25 @@ __device__ __forceinline__ float ca_rd(const float*, float v) { return v; }
 __device__ __forceinline__ void ca_st(uint16_t* p, int64_t i, float v) { p[i] = f32_to_bf16(v); }
 __device__ __forceinline__ void ca_st(float* p, int64_t i, float v) { p[i] = v; }
 
+// The element-wise form, any of x, the statistics (TW) and y in bf16 or f32: a latent kept in
+// f32, or rows whose pitch the 8-wide kernel cannot take (an encoder's mean channels beside its
+// log-variance). Each step rounds to y's dtype as the reference stores it; the explicit _rn
+// intrinsics keep the compiler from contracting x s + mean into one fused multiply-add.
+template <typename TX, typename TW, typename TY>
+__global__ __launch_bounds__(kT) void chan_stats_any_kernel(
+    const TX* __restrict__ x, const TW* __restrict__ mean, const TW* __restrict__ sv,
+    TY* __restrict__ y, int n, int x_ld, int y_ld, int var, float eps, int norm) {
+    const int r = blockIdx.x;
+    for (int i = threadIdx.x; i < n; i += kT) {
+        const float mu = ca_rd(y, ca_ld(mean, (size_t)i)), v = ca_ld(sv, (size_t)i);
+        const float sd = ca_rd(y, var ? __fsqrt_rn(__fadd_rn(v, eps)) : v);
+        const float a = ca_ld(x, (size_t)r * x_ld + i);
+        ca_st(y, (int64_t)r * y_ld + i,
+              norm ? ca_rd(y, __fdiv_rn(ca_rd(y, __fsub_rn(a, mu)), sd))
+                   : ca_rd(y, __fadd_rn(ca_rd(y, __fmul_rn(a, sd)), mu)));
+    }
+}
+
 template <typename T>
 __global__ __launch_bounds__(kT) void chan_affine_kernel(
     const T* __restrict__ x, T* __restrict__ y, int64_t total, int n, int x_ld, int inv, int rnd,
@@ -467,7 +543,7 @@ template <int TP, int TC, int KS, int UP>
 __global__ __launch_bounds__(256) void conv_igemm_kernel(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
     const uint16_t* __restrict__ bias, uint16_t* __restrict__ y, int Hv, int Wv, int cin, int Wo,
-    int cout, int k, int stride, int up, int pt, int x_ld, int y_ld, int Mpx, int K) {
+    int cout, int k, int stride, int up, int pt, int pl, int x_ld, int y_ld, int Mpx, int K) {
     constexpr int BP = 2 * TP * 16, BC = 4 * TC * 16;
     constexpr int CPR = CV_BK / 8;
     constexpr int AL = BP * CPR / 256, WL = BC * CPR / 256;
@@ -512,7 +588,7 @@ __global__ __launch_bounds__(256) void conv_igemm_kernel(
     auto loadA = [&](int i) -> r4d_u32x4 {
         if (!a_ok[i] || a_t[i] >= kk2) return zero;
         const int kh = a_t[i] / kq, kw = a_t[i] - kh * kq;
-        const int iy = a_oy[i] * stride + kh - pt, ix = a_ox[i] * stride + kw - pt;
+        const int iy = a_oy[i] * stride + kh - pt, ix = a_ox[i] * stride + kw - pl;
         if (iy < 0 || iy >= Hv || ix < 0 || ix >= Wv) return zero;
         /* Both are non-negative here, so a halving is a shift. */
         const int sy = UP == 1 ? iy : UP == 2 ? (iy >> 1) : iy / up;
@@ -600,7 +676,7 @@ __global__ __launch_bounds__(256) void conv_igemm_kernel(
 __global__ __launch_bounds__(kT) void conv_direct_kernel(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
     const uint16_t* __restrict__ bias, uint16_t* __restrict__ y, int Hv, int Wv, int cin, int Wo,
-    int cout, int k, int stride, int up, int pt, int x_ld, int y_ld, int64_t total) {
+    int cout, int k, int stride, int up, int pt, int pl, int x_ld, int y_ld, int64_t total) {
     const int64_t t = (int64_t)blockIdx.x * kT + threadIdx.x;
     if (t >= total) return;
     const int co = (int)(t % cout);
@@ -612,7 +688,7 @@ __global__ __launch_bounds__(kT) void conv_direct_kernel(
         const int iy = oy * stride + kh - pt;
         if (iy < 0 || iy >= Hv) continue;
         for (int kw = 0; kw < k; ++kw) {
-            const int ix = ox * stride + kw - pt;
+            const int ix = ox * stride + kw - pl;
             if (ix < 0 || ix >= Wv) continue;
             const uint16_t* xp = x + (size_t)(iy / up) * x_ld + (size_t)(ix / up) * cin;
             const uint16_t* wp = w + (size_t)co * K + (size_t)(kh * k + kw) * cin;
@@ -637,9 +713,10 @@ inline bool rows8(const RadTensor* t, long long n, long long* rows, long long* l
 }
 
 // A dense [H, W * c] image operand.
-inline bool image_of(const RadTensor* t, long long c, long long* H, long long* W) {
+inline bool image_of(const RadTensor* t, long long c, long long* H, long long* W,
+                     bool pitched = false) {
     if (!t || t->rank != 2 || c <= 0 || t->shape[1] % c || t->stride[1] != 1 ||
-        t->stride[0] != t->shape[1])
+        (pitched ? t->stride[0] < t->shape[1] : t->stride[0] != t->shape[1]))
         return false;
     *H = t->shape[0];
     *W = t->shape[1] / c;
@@ -750,6 +827,87 @@ extern "C" int r4d_rad_gate_add(const RadArgs* a, RadStream s) {
                        (const uint16_t*)y->data, (const uint16_t*)g->data, (const int*)cu->data,
                        (uint16_t*)x->data, (int)n, (int)n_seq, (int)yl, (int)gl, (int)xl, none);
     return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_table_add(const RadArgs* a, RadStream s) {
+    const RadTensor *x = r4d_opt(a, 0), *t = r4d_opt(a, 1), *y = r4d_opt(a, 2);
+    if (!x || !t || !y) return R4D_NO(RAD_E_INVAL);
+    if (!is_bf16(x) || !is_bf16(t) || !is_bf16(y)) return R4D_NO(RAD_E_DTYPE);
+    const long long n = r4d_geti_or(a, "n", 0), L = r4d_geti_or(a, "L", 0);
+    long long rx = 0, xl = 0, ry = 0, yl = 0;
+    if (L <= 0 || !rows8(x, n, &rx, &xl) || !rows8(y, n * L, &ry, &yl) || !r4d_contig(t) ||
+        ((uintptr_t)t->data & 15))
+        return R4D_NO(RAD_E_STRIDE);
+    if (ry <= 0 || rx < ry || r4d_numel(t) < L * n) return R4D_NO(RAD_E_SHAPE);
+    hipLaunchKernelGGL(table_add_kernel, dim3((unsigned)(ry * L)), dim3(kT), 0, (hipStream_t)s,
+                       (const uint16_t*)x->data, (const uint16_t*)t->data, (uint16_t*)y->data,
+                       (int)n, (int)L, (int)xl, (int)yl);
+    return st_of(hipGetLastError());
+}
+
+extern "C" int r4d_rad_mix_rows(const RadArgs* a, RadStream s) {
+    const RadTensor *x = r4d_opt(a, 0), *w = r4d_opt(a, 1), *y = r4d_opt(a, 2);
+    if (!x || !w || !y) return R4D_NO(RAD_E_INVAL);
+    if (!is_bf16(x) || !is_bf16(w) || !is_bf16(y)) return R4D_NO(RAD_E_DTYPE);
+    const long long n = r4d_geti_or(a, "n", 0), k = r4d_geti_or(a, "k", 0);
+    long long rx = 0, xl = 0, ry = 0, yl = 0;
+    if (k <= 0 || !rows8(x, n, &rx, &xl) || !rows8(y, n, &ry, &yl) || !r4d_contig(w))
+        return R4D_NO(RAD_E_STRIDE);
+    if (ry <= 0 || rx < ry * k || r4d_numel(w) < k) return R4D_NO(RAD_E_SHAPE);
+    hipLaunchKernelGGL(mix_rows_kernel, dim3((unsigned)ry), dim3(kT), 0, (hipStream_t)s,
+                       (const uint16_t*)x->data, (const uint16_t*)w->data, (uint16_t*)y->data,
+                       (int)n, (int)k, (int)xl, (int)yl);
+    return st_of(hipGetLastError());
+}
+
+template <typename TX, typename TW, typename TY>
+static int chan_stats_any(const RadTensor* x, const RadTensor* mn, const RadTensor* sv,
+                          const RadTensor* y, long long rows, long long n, long long xl,
+                          long long yl, int var, float eps, int norm, RadStream s) {
+    hipLaunchKernelGGL((chan_stats_any_kernel<TX, TW, TY>), dim3((unsigned)rows), dim3(kT), 0,
+                       (hipStream_t)s, (const TX*)x->data, (const TW*)mn->data,
+                       (const TW*)sv->data, (TY*)y->data, (int)n, (int)xl, (int)yl, var, eps,
+                       norm);
+    return st_of(hipGetLastError());
+}
+
+/* Both rows: bf16 (chan_stats_bf16, eight channels a thread when every row and statistic is
+ * 16-byte aligned, element-wise otherwise) and f32 (chan_stats_f32: x and y f32 over bf16 or f32
+ * statistics, a latent kept in f32 before a bf16 network reads it). */
+extern "C" int r4d_rad_chan_stats(const RadArgs* a, RadStream s) {
+    const RadTensor *x = r4d_opt(a, 0), *mn = r4d_opt(a, 1), *sv = r4d_opt(a, 2), *y = r4d_opt(a, 3);
+    if (!x || !mn || !sv || !y) return R4D_NO(RAD_E_INVAL);
+    const long long n = r4d_geti_or(a, "n", 0);
+    const char* mode = r4d_gets(a, "mode");
+    const int norm = mode && !std::strcmp(mode, "norm");
+    if (!mode || (!norm && std::strcmp(mode, "denorm"))) return R4D_NO(RAD_E_INVAL);
+    auto bf_f32 = [](const RadTensor* t) { return is_bf16(t) || t->dtype == RAD_F32; };
+    if (!bf_f32(x) || !bf_f32(y) || !bf_f32(mn) || mn->dtype != sv->dtype || x->dtype != y->dtype)
+        return R4D_NO(RAD_E_DTYPE);
+    if (n <= 0) return R4D_NO(RAD_E_SHAPE);
+    const int var = (int)r4d_geti_or(a, "var", 0);
+    const float eps = (float)r4d_getf(a, "eps", 0.0);
+    long long rx = 0, xl = 0, ry = 0, yl = 0;
+    if (is_bf16(x) && is_bf16(mn) && rows8(x, n, &rx, &xl) && rows8(y, n, &ry, &yl) &&
+        r4d_contig(mn) && r4d_contig(sv) && !((uintptr_t)mn->data & 15) &&
+        !((uintptr_t)sv->data & 15)) {
+        if (ry <= 0 || rx < ry || r4d_numel(mn) < n || r4d_numel(sv) < n)
+            return R4D_NO(RAD_E_SHAPE);
+        hipLaunchKernelGGL(chan_stats_kernel, dim3((unsigned)ry), dim3(kT), 0, (hipStream_t)s,
+                           (const uint16_t*)x->data, (const uint16_t*)mn->data,
+                           (const uint16_t*)sv->data, (uint16_t*)y->data, (int)n, (int)xl, (int)yl,
+                           var, eps, norm);
+        return st_of(hipGetLastError());
+    }
+    xl = r4d_rows_pitch(x, n, &rx);
+    yl = r4d_rows_pitch(y, n, &ry);
+    if (xl < 0 || yl < 0 || !r4d_contig(mn) || !r4d_contig(sv)) return R4D_NO(RAD_E_STRIDE);
+    if (ry <= 0 || rx < ry || r4d_numel(mn) < n || r4d_numel(sv) < n) return R4D_NO(RAD_E_SHAPE);
+    const bool f = x->dtype == RAD_F32, wf = mn->dtype == RAD_F32;
+#define R4D_CS(TX, TW) chan_stats_any<TX, TW, TX>(x, mn, sv, y, ry, n, xl, yl, var, eps, norm, s)
+    if (f) return wf ? R4D_CS(float, float) : R4D_CS(float, uint16_t);
+    return wf ? R4D_CS(uint16_t, float) : R4D_CS(uint16_t, uint16_t);
+#undef R4D_CS
 }
 
 /* Both rows: a bf16 embedding (timestep_embed_bf16) or an f32 one (timestep_embed_f32, a timestep
@@ -957,13 +1115,19 @@ extern "C" int r4d_rad_conv2d_nhwc(const RadArgs* a, RadStream s) {
     const long long up = r4d_geti_or(a, "up", 1);
     const char* pad = r4d_gets(a, "pad");
     const bool down = pad && !std::strcmp(pad, "down");
-    if (pad && !down && std::strcmp(pad, "same")) return R4D_NO(RAD_E_INVAL);
+    const bool causal = pad && !std::strcmp(pad, "causal");
+    if (pad && !down && !causal && std::strcmp(pad, "same")) return R4D_NO(RAD_E_INVAL);
     if (cin <= 0 || cout <= 0 || k <= 0 || stride <= 0 || up <= 0) return R4D_NO(RAD_E_SHAPE);
     long long Hin = 0, Win = 0, Ho = 0, Wo = 0;
-    if (!image_of(x, cin, &Hin, &Win) || !image_of(y, cout, &Ho, &Wo)) return R4D_NO(RAD_E_SHAPE);
+    /* y may be a column slice of wider rows (a channel written into its own columns): both kernels
+     * store at its row pitch. */
+    if (!image_of(x, cin, &Hin, &Win) || !image_of(y, cout, &Ho, &Wo, true))
+        return R4D_NO(RAD_E_SHAPE);
     const long long Hv = Hin * up, Wv = Win * up;
-    const long long pt = down ? 0 : k / 2, pb = down ? 1 : k / 2;
-    if ((Hv + pt + pb - k) / stride + 1 != Ho || (Wv + pt + pb - k) / stride + 1 != Wo)
+    /* Rows padded above `pt` and below `pb`, columns `pl` left and `pr` right. */
+    const long long pt = down ? 0 : causal ? k - 1 : k / 2, pb = down ? 1 : causal ? 0 : k / 2;
+    const long long pl = down ? 0 : k / 2, pr = down ? 1 : k / 2;
+    if ((Hv + pt + pb - k) / stride + 1 != Ho || (Wv + pl + pr - k) / stride + 1 != Wo)
         return R4D_NO(RAD_E_SHAPE);
     const long long K = k * k * cin;
     if (r4d_numel(w) < cout * K || r4d_numel(b) < cout) return R4D_NO(RAD_E_SHAPE);
@@ -977,7 +1141,7 @@ extern "C" int r4d_rad_conv2d_nhwc(const RadArgs* a, RadStream s) {
                            (const uint16_t*)x->data, (const uint16_t*)w->data,
                            (const uint16_t*)b->data, (uint16_t*)y->data, (int)Hv, (int)Wv,
                            (int)cin, (int)Wo, (int)cout, (int)k, (int)stride, (int)up, (int)pt,
-                           (int)x->stride[0], (int)y->stride[0], (int64_t)total);
+                           (int)pl, (int)x->stride[0], (int)y->stride[0], (int64_t)total);
         return st_of(hipGetLastError());
     }
     // 128 pixels a block, and the widest channel tile (192, 128, then 64) that leaves under a third
@@ -995,7 +1159,7 @@ extern "C" int r4d_rad_conv2d_nhwc(const RadArgs* a, RadStream s) {
                             (unsigned)((cout + 4 * TC * 16 - 1) / (4 * TC * 16))),               \
                        dim3(256), 0, st, (const uint16_t*)x->data, (const uint16_t*)w->data,     \
                        (const uint16_t*)b->data, (uint16_t*)y->data, (int)Hv, (int)Wv, (int)cin, \
-                       (int)Wo, (int)cout, (int)k, (int)stride, (int)up, (int)pt,                \
+                       (int)Wo, (int)cout, (int)k, (int)stride, (int)up, (int)pt, (int)pl,       \
                        (int)x->stride[0], (int)y->stride[0], (int)Mpx, (int)K)
     /* The decoder's two kernel sizes at its two sampling rates, and the generic form for the rest. */
 #define R4D_CONV_K(TP, TC)                                                                       \

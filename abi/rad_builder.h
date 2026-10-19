@@ -72,7 +72,8 @@ const char* rad_meta_gets(const RadModelMeta* m, const char* key, const char* df
  *     [21HD/16, 22HD/16) V's scales (absmax / 7)
  *
  * Codes are two's complement (int4 -7..7, int6 -31..31). The group is declared at RAD_F8E4M3 with
- * head_dim the row's bytes / 2 so the core sizes pages from it; only the layout's kernels read it. */
+ * head_dim the row's bytes / 2 so the core sizes pages from it; only the layout's kernels read
+ * it. */
 enum {
     RAD_KVQ_NONE = 0,
     RAD_KVQ_V4   = 1,
@@ -428,7 +429,7 @@ int rad_op_declared(RadBuilder* b, const char* op);
  * convert-time fusions (q/k/v into one qkv, gate and up into gate_up). It is the only component
  * that knows both sides, and rad-convert reads the map from it (spec §2.4). */
 enum { RAD_MAP_COPY = 0, RAD_MAP_CONCAT = 1, RAD_MAP_WNORM = 2, RAD_MAP_ROWS = 3,
-       RAD_MAP_TRANSPOSE = 4, RAD_MAP_EMA = 5 };
+       RAD_MAP_TRANSPOSE = 4, RAD_MAP_EMA = 5, RAD_MAP_TAP = 6 };
 
 typedef struct RadNameMap {
     const char* declared;        /* the name given to rad_decl_weight */
@@ -472,7 +473,13 @@ typedef struct RadNameMap {
  * divided by max(usage, 1e-5), in f32. Successive EMA maps for one name stack their codebooks
  * along dim 0, as CONCAT maps extend (a residual quantiser's codebooks as one table).
  *
- * TRANSPOSE and EMA are computed at convert in f32, like WNORM, and stored as the recipe says. */
+ * RAD_MAP_TAP keeps one index of one dimension of src[0], dropping that dimension: index
+ * src_index[0] (negative counts from the end) of dimension `concat_dim`. A causal 3-D convolution
+ * run on a single frame reads only its last temporal tap, so [cout, cin, kt, kh, kw] read at tap -1
+ * of dimension 2 is the 2-D convolution it then is.
+ *
+ * TRANSPOSE, EMA and TAP are computed at convert in f32, like WNORM, and stored as the recipe
+ * says. */
 
 int rad_decl_name_map(RadBuilder* b, const RadNameMap* m);
 
@@ -653,8 +660,21 @@ enum { RAD_GEN_PASS_COND = 1, RAD_GEN_PASS_DENOISE = 2, RAD_GEN_PASS_DECODE = 3 
  *                in all three; a picture of h x w tokens holds the count in the first, and its row
  *                and column, centred on zero (-(n - n/2) .. n/2 - 1), in the other two, after which
  *                the count moves on by max(h, w). Text rows attend causally, a picture's rows to
- *                each other both ways, every row to every row before it. */
-enum { RAD_GEN_LAYOUT_JOINT_GRID = 1 };
+ *                each other both ways, every row to every row before it.
+ *
+ *   JOINT_STEP   the conditioning is not cached as keys and values but rides in every denoising
+ *                step beside the image, since the model updates it as it goes. The conditioning
+ *                is the prompt's rows after `drop_prefix`, then `pad_token` rows up to a multiple
+ *                of `pad_multiple`, then each reference picture's latent tokens in raster order
+ *                (the pictures are not in the prompt; `tmpl_image` is unused). No KV group is
+ *                declared: the COND pass leaves the conditioning's rows in the plugin's own state,
+ *                once for every lane the request's images run in, and each DENOISE entry is that
+ *                conditioning followed by the image (RadGenBatch, "the joint layout"). Rotary
+ *                positions are four f32 components (t, h, w, l): a text or padding row is (0, 0,
+ *                0, l), l its index with `rope_text_l` and 0 without; a picture's token at row h,
+ *                column w (from 0) is (0, s h, s w, l) with s `rope_hw_scale`, l -(1 + k) for
+ *                the k-th reference picture and 0 for the image being made. */
+enum { RAD_GEN_LAYOUT_JOINT_GRID = 1, RAD_GEN_LAYOUT_JOINT_STEP = 2 };
 
 typedef struct RadGeneratorDecl {
     const char* name;             /* "qwen-image" -- for messages */
@@ -716,6 +736,25 @@ typedef struct RadGeneratorDecl {
      * pixels of the image a decode pass made. */
     int64_t max_lanes;
     rad_buf image_out;
+
+    /* ---- the JOINT_STEP layout (zero for JOINT_GRID) */
+    /* The most rows one conditioning lays out (text, padding and reference latents together):
+     * the plugin keeps `cond_rows` rows a lane a branch, and a longer prompt is refused. */
+    int64_t     cond_rows;
+    double      rope_hw_scale;
+    int32_t     rope_text_l;
+    int32_t     pad_multiple;
+    int32_t     pad_token;
+    /* Guidance as the model's card states its scale s: 1 when s means cond + s (cond - uncond),
+     * which the core runs as s + 1, 0 when it means uncond + s (cond - uncond). `default_cfg` is
+     * in the card's terms. */
+    int32_t     cfg_original;
+    /* The negative prompt guidance uses when a request names none ("" is a prompt); null when a
+     * guided request must name its own. */
+    const char* default_negative;
+    /* 1: a reference picture is shrunk to `ref_area` only when larger and cut to `size_multiple`
+     * by a centred crop; 0: resized to `ref_area` at its own aspect. */
+    int32_t     ref_shrink_only;
 } RadGeneratorDecl;
 
 int rad_declare_generator(RadBuilder* b, const RadGeneratorDecl* d);
@@ -934,6 +973,77 @@ typedef struct RadVideoGenDecl {
      * and fewer than the default schedule's. */
     double        upscale_max;
     int32_t       upscale_refine;
+
+    /* ---- appended in ABI 24 (LTX-2.5) */
+    /* The sampler's form. 0: the grid points above. 1: diffusers' FlowMatchEulerDiscrete as
+     * LTX-2 runs it -- a request's `steps` are its evaluations n, between 1 and max_steps; sigmas
+     * linspace(1, 1/n, n), computed in f64 and taken to f32, and with `dyn_shift` 1 shifted by mu
+     * as exp(mu) / (exp(mu) + 1/s - 1) in f32, mu linear in the video's latent tokens from
+     * `base_seq` (`base_shift`) to `max_seq` (`max_shift`); then, with `shift_terminal` > 0,
+     * stretched so the last is shift_terminal; and a closing 0. A trained schedule (n_rungs > 0)
+     * is the rungs taken to f32 and a closing 0, with default_steps and max_steps both n_rungs.
+     * Both modalities step the same sigmas; shift_video and shift_audio are unused. */
+    int32_t       sched_kind;
+    int32_t       dyn_shift;
+    double        base_shift, max_shift;
+    int64_t       base_seq, max_seq;
+    double        shift_terminal;
+    /* With latent upscaling under a trained schedule of form 1: the sigmas the evaluations after
+     * the upscale step through (a second stage's own schedule, its first the sigma the upscaled
+     * latents are re-noised to), instead of the schedule's tail. The small size then runs every
+     * rung, its last to the clean estimate, and a request's refinement is n_refine_rungs. */
+    int32_t       n_refine_rungs;
+    const double* refine_rungs;
+    /* The text rows of every VSTEP pass, whatever the prompt's length (0: the prompt's tokens):
+     * a model whose text encoder writes a fixed number of rows. */
+    int64_t       step_text_rows;
+    /* Guidance terms (RadVideoGenBatch::guidance_h) when `guidance` is 1: the defaults a request
+     * that names none gets, the video's scale, spatio-temporal scale, modality scale and rescale,
+     * then the soundtrack's four. A request whose video or soundtrack scale is not 1 is guided
+     * against a negative prompt: its own, else `default_negative` (null: ""). The VCOND pass then
+     * carries both prompts, the positive first (two cu_seqlens entries). */
+    int32_t       guidance;
+    double        guidance_default[8];
+    const char*   default_negative;
+    /* Image to video: 1 when the model can start from a first frame (OpenAI's
+     * `input_reference`), handed to the VCOND pass resized to the size the first evaluations run
+     * at (RadVideoGenBatch `image`), after an H.264 round trip at `image_crf` when that is > 0
+     * (the compression the model was trained against). */
+    int32_t       image_cond;
+    int32_t       image_crf;
+    /* A left-padded text encoder: the VCOND pass's positions count so that each prompt ends at
+     * `text_left_pad` - 1, the place it holds in a sequence padded on the left to that length (0:
+     * from 0). */
+    int64_t       text_left_pad;
+    /* The soundtrack's latent rows a step carries for each latent (0: audio_channels, a stream of
+     * rows a channel); a model whose latent holds every channel at once carries 1. */
+    int32_t       audio_streams;
+    /* A latent upscaler of one fixed factor, upscale_max: a request's sides must then be
+     * multiples of size_multiple x upscale_max, so the small size is exactly the full size over
+     * the factor. */
+    int32_t       upscale_exact;
+    /* A length head: a model that predicts from the prompt how long its video should be. With
+     * `duration_out` set, every VCOND pass writes to it (f32 [1], device) the natural log of that
+     * length in seconds. For a request that names no length the core takes its exponent, clamps it
+     * to [duration_min, duration_max] seconds, rounds it to frames at the frame rate and floors
+     * that to the chunk grid (frames_per_chunk n + frames_tail; one chunk more when the floor falls
+     * under duration_min and duration_max allows it), then holds it to min_chunks..max_chunks and
+     * to what a pass carries. Until that VCOND pass is done such a request is shaped at
+     * `default_chunks`, so the pass may not depend on the length: its geometry carries the
+     * provisional frame count, and `t_video` / `t_audio` the provisional schedule. 0: a request
+     * that names no length is made at default_chunks. `duration_dtype` is the precision the model
+     * takes the exponent in: RAD_F32, or RAD_BF16 for a head run in bf16, whose length is
+     * exp(x) in f32 rounded to bf16. Frames round half to even, as Python's round(). */
+    rad_buf       duration_out;
+    double        duration_min, duration_max;
+    uint32_t      duration_dtype;
+    /* Decoders: a model with more than one way to turn its latents into frames names them,
+     * space-separated, its default first (LTX-2.5: "vae diffusion"). A request may name one; every
+     * VDECODE pass carries its index (RadVideoGenBatch::decoder). `decoder_max_area`, when set,
+     * holds each decoder's largest frame in pixels (0: max_area), and a request over it is refused.
+     * Null: one decoder. */
+    const char*    decoders;
+    const int64_t* decoder_max_area;
 } RadVideoGenDecl;
 
 int rad_declare_video_generator(RadBuilder* b, const RadVideoGenDecl* d);

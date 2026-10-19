@@ -1,8 +1,9 @@
 // R4D dense attention, varlen over cu_seqlens segments, grouped-query: an encoder's, non-causal with
 // an optional two-sided window, i - j < window behind and j - i < wright ahead (wright is
 // `window_right`, or `window` for the symmetric |i - j| < window), or causal with an optional
-// window behind (a codec's sliding layers). bf16 in and out, f16 operands, f32 accumulate. Head
-// widths 64, 256 and 512 are compiled; each (head_dim, gqa) pair is a row.
+// window behind (a codec's sliding layers, a text encoder's prompt). bf16 in and out, f16
+// operands, f32 accumulate. Head widths 64, 256 and 512 are compiled; each (head_dim, gqa) pair
+// is a row.
 //
 // Core from the vision kernel (r4d_attn_vit_h72_bf16.hip): S^T = K.Q^T, so the wave32
 // column-distributed accumulator gives each lane one query row, softmax state is lane-private, and
@@ -39,7 +40,8 @@ __global__ __launch_bounds__(NQB * GQA * DSPLIT * 32)
 void r4d_attn_dense_kernel(const uint16_t* __restrict__ gq, const uint16_t* __restrict__ gk,
                            const uint16_t* __restrict__ gv, uint16_t* __restrict__ go,
                            const int* __restrict__ cu, float scale, int window, int wright,
-                           int block, int cdiv, int causal, int q_ld, int k_ld, int v_ld, int o_ld)
+                           int block, int cdiv, int causal, int q_ld, int k_ld, int v_ld, int o_ld,
+                           int krep)
 {
     typedef DT16<1> D;
     typedef D::frag frag16;
@@ -73,8 +75,9 @@ void r4d_attn_dense_kernel(const uint16_t* __restrict__ gq, const uint16_t* __re
     const int dp  = warp % DSPLIT;
     const int g   = (warp / DSPLIT) % GQA;
     const int qbi = warp / (DSPLIT * GQA);
-    const int kvh = blockIdx.y, seq = blockIdx.z;
-    const int hq  = kvh * GQA + g;
+    // blockIdx.y is a group of GQA query heads; krep groups read one KV head.
+    const int kvh = blockIdx.y / krep, seq = blockIdx.z;
+    const int hq  = blockIdx.y * GQA + g;
 
     const int s0 = cu[seq] / cdiv, slen = cu[seq + 1] / cdiv - s0;
     const int q0 = blockIdx.x * BQ;
@@ -301,21 +304,25 @@ void r4d_attn_dense_kernel(const uint16_t* __restrict__ gq, const uint16_t* __re
 // ---- launch ----------------------------------------------------------------------------------
 // One instantiation per (head_dim, gqa), at a workgroup shape picked for it:
 //   h64  gqa1: 8 query blocks of 16, K/V tiles of 64 keys          (the vision towers' heads)
-//   h256 gqa2: 8 query blocks x 2 heads, tiles of 32 (LDS: 37 KiB)
-//   h256 gqa4: 4 query blocks x 4 heads, tiles of 32 (LDS: 37 KiB)
-//   h512 gqa4: 2 query blocks x 4 heads x 2 head halves, tiles of 16 (LDS: 57 KiB)
+//   h256 gqa2, 4, 8: 8, 4, 2 query blocks x the heads, tiles of 32 (LDS: 37 KiB)
+//   h512 gqa2, 4, 8: 4, 2, 1 query blocks x the heads x 2 head halves, tiles of 16 (LDS: 57 KiB)
+// The LDS holds one K/V tile, so the query heads a workgroup carries change its waves, not it.
+// A wider group (16 query heads a KV head and up, any multiple of 8) runs as krep workgroups of
+// eight heads each over the same KV head: 16 heads in one would need 32 waves and, at h512, more
+// than 64 KiB of LDS.
 template<int HD, int GQA, int NQB, int DSPLIT, int TILE>
 static int r4d_attn_dense_launch(const void* q, const void* k, const void* v, void* o,
                                  const void* cu, int num_seqs, int max_seqlen, int n_head_kv,
                                  float scale, int window, int wright, int block, int cdiv,
-                                 int causal, int q_ld, int k_ld, int v_ld, int o_ld, hipStream_t s)
+                                 int causal, int q_ld, int k_ld, int v_ld, int o_ld, hipStream_t s,
+                                 int krep = 1)
 {
     constexpr int BQ = NQB * 16;
-    dim3 grid((max_seqlen + BQ - 1) / BQ, n_head_kv, num_seqs);
+    dim3 grid((max_seqlen + BQ - 1) / BQ, n_head_kv * krep, num_seqs);
     hipLaunchKernelGGL((r4d_attn_dense_kernel<HD, GQA, NQB, DSPLIT, TILE>), grid,
                        dim3(NQB * GQA * DSPLIT * 32), 0, s, (const uint16_t*)q, (const uint16_t*)k,
                        (const uint16_t*)v, (uint16_t*)o, (const int*)cu, scale, window, wright,
-                       block, cdiv, causal, q_ld, k_ld, v_ld, o_ld);
+                       block, cdiv, causal, q_ld, k_ld, v_ld, o_ld, krep);
     const hipError_t e = hipGetLastError();
     return e == hipSuccess ? 0 : -100 - (int)e;
 }
@@ -338,27 +345,34 @@ extern "C" int r4d_attn_dense_bf16(const void* q, const void* k, const void* v, 
         return -4;
     if (num_seqs <= 0 || max_seqlen <= 0) return 0;
     if (wright == 0) wright = window;
-    const int gqa = n_head / n_head_kv;
+    int gqa = n_head / n_head_kv, krep = 1;
+    if (gqa > 8 && gqa % 8 == 0) krep = gqa / 8, gqa = 8;
     hipStream_t s = (hipStream_t)stream;
     if (head_dim == 64 && gqa == 1)
         return r4d_attn_dense_launch<64, 1, 8, 1, 64>(q, k, v, o, cu_seqlens, num_seqs, max_seqlen,
                                                       n_head_kv, scale, window, wright, block,
                                                       cdiv, causal, q_ld, k_ld, v_ld, o_ld, s);
-    if (head_dim == 256 && gqa == 2)
-        return r4d_attn_dense_launch<256, 2, 8, 1, 32>(q, k, v, o, cu_seqlens, num_seqs,
-                                                       max_seqlen, n_head_kv, scale, window,
-                                                       wright, block, cdiv, causal, q_ld, k_ld,
-                                                       v_ld, o_ld, s);
-    if (head_dim == 256 && gqa == 4)
-        return r4d_attn_dense_launch<256, 4, 4, 1, 32>(q, k, v, o, cu_seqlens, num_seqs,
-                                                       max_seqlen, n_head_kv, scale, window,
-                                                       wright, block, cdiv, causal, q_ld, k_ld,
-                                                       v_ld, o_ld, s);
-    if (head_dim == 512 && gqa == 4)
-        return r4d_attn_dense_launch<512, 4, 2, 2, 16>(q, k, v, o, cu_seqlens, num_seqs,
-                                                       max_seqlen, n_head_kv, scale, window,
-                                                       wright, block, cdiv, causal, q_ld, k_ld,
-                                                       v_ld, o_ld, s);
+#define R4D_DENSE(HD, G, NQB, DS, T)                                                              \
+    return r4d_attn_dense_launch<HD, G, NQB, DS, T>(q, k, v, o, cu_seqlens, num_seqs, max_seqlen, \
+                                                    n_head_kv, scale, window, wright, block,      \
+                                                    cdiv, causal, q_ld, k_ld, v_ld, o_ld, s, krep)
+    if (head_dim == 256) {
+        switch (gqa) {
+            case 2: R4D_DENSE(256, 2, 8, 1, 32);
+            case 4: R4D_DENSE(256, 4, 4, 1, 32);
+            case 8: R4D_DENSE(256, 8, 2, 1, 32);
+            default: return -1;
+        }
+    }
+    if (head_dim == 512) {
+        switch (gqa) {
+            case 2: R4D_DENSE(512, 2, 4, 2, 16);
+            case 4: R4D_DENSE(512, 4, 2, 2, 16);
+            case 8: R4D_DENSE(512, 8, 1, 2, 16);
+            default: return -1;
+        }
+    }
+#undef R4D_DENSE
     return -1;
 }
 

@@ -316,11 +316,11 @@ extern "C" int r4d_shape_cast(const RadParam* p, int n_p, int operand,
 
     const int64_t M = pi(p, n_p, "M");
     const int64_t n = pi(p, n_p, "n");
-    /* Three rows serve the op, bf16 -> bf16 (a strided row copy), bf16 -> f32 and bf16 -> f16,
-     * and the shims refuse any other pair, so another pair is declined here. */
+    /* The rows serve bf16 -> bf16 and f32 -> f32 (strided row copies), bf16 -> f32, bf16 -> f16
+     * and f32 -> bf16, and the shims refuse any other pair, so another pair is declined here. */
     const uint32_t f = dt_par(p, n_p, "from"), t = dt_par(p, n_p, "to");
-    if (f != (uint32_t)RAD_BF16 ||
-        (t != (uint32_t)RAD_BF16 && t != (uint32_t)RAD_F32 && t != (uint32_t)RAD_F16))
+    const uint32_t bf = (uint32_t)RAD_BF16, f32 = (uint32_t)RAD_F32, f16 = (uint32_t)RAD_F16;
+    if (!(f == bf && (t == bf || t == f32 || t == f16)) && !(f == f32 && (t == bf || t == f32)))
         return RAD_E_UNSUPPORTED;
     const RadOpdDesc l[] = { opd(f, M, n), opd(t, M, n) };
     R4D_PICK(l);

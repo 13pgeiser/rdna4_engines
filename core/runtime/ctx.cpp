@@ -113,8 +113,15 @@ int Ctx::prepare() {
     RAD_TRY(bind_routing());
     RAD_TRY(bind_profiling());
     /* Recorded passes need a recording backend, and are off whenever every issue must be seen:
-     * per-op profile, oracle. */
-    tape_on_ = record_passes_ && tape_supported() && !profiling_ && !oracle_;
+     * per-op profile, oracle, and a calibration tap. A `gram_accum` sums across passes while its
+     * plugin counts the rows it has summed in step and writes the Grams once a token target is
+     * reached; a played pass reissues the accumulation without calling step, so the files would
+     * hold more rows than their header says and be written late. */
+    const bool taps = std::any_of(program_->ops.begin(), program_->ops.end(),
+                                  [](const OpInfo& o) { return o.op == "gram_accum"; });
+    tape_on_ = record_passes_ && tape_supported() && !profiling_ && !oracle_ && !taps;
+    if (taps && record_passes_ && tape_supported() && rank_ == 0)
+        RAD_INFO("recorded passes: off, the program accumulates calibration Grams (gram_accum)");
     return RAD_OK;
 }
 

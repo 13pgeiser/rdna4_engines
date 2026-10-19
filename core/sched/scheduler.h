@@ -604,9 +604,7 @@ private:
      * covered, both decayed with the same time constant, so their ratio is tokens over time. */
     double  tps_win_prefill_ = 0.0, tps_win_decode_ = 0.0, tps_win_time_ = 0.0;
     bool    step_open_ = false;
-    /* Estimator for the single-sequence decode floor (see rad::DecodeFloor). Replaces a raw min
-     * over step brackets, which latched a degenerate bracket forever (live defect 2026-10-18:
-     * 1.16 ms against a 15.55 ms mean). step_finished feeds it each single-sequence decode step. */
+    /* The single-sequence decode floor (rad::DecodeFloor), fed by step_finished. */
     DecodeFloor decode_floor_;
 
     /* arrival; mu_ held */

@@ -18,6 +18,8 @@ namespace mm {
 
 /* `src` resized to w x h. */
 void resize_lanczos_rgba(const FrameRGBA& src, int32_t w, int32_t h, FrameRGBA* out);
+/* The same with PIL's BILINEAR filter (a triangle of support 1, widened when shrinking). */
+void resize_bilinear_rgba(const FrameRGBA& src, int32_t w, int32_t h, FrameRGBA* out);
 /* `src` over an opaque white ground. */
 void composite_white(const FrameRGBA& src, Frame* out);
 

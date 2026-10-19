@@ -106,6 +106,67 @@ void image_rope(int32_t pos, int32_t h, int32_t w, int32_t* planes, int64_t n_to
         }
 }
 
+void grid_rope_f(double hw_scale, float l, int32_t h, int32_t w, float* planes, int64_t n_total) {
+    const float s = (float)hw_scale;
+    int64_t k = 0;
+    for (int32_t r = 0; r < h; ++r)
+        for (int32_t c = 0; c < w; ++c, ++k) {
+            planes[k] = 0.0f;
+            planes[n_total + k] = s * (float)r;
+            planes[2 * n_total + k] = s * (float)c;
+            planes[3 * n_total + k] = l;
+        }
+}
+
+int build_joint_layout(const Branch& b, int32_t pad_multiple, double hw_scale, bool text_l,
+                       const std::vector<std::pair<int32_t, int32_t>>& ref_hw, Layout* out,
+                       std::string* why) {
+    *out = Layout{};
+    const int64_t T = (int64_t)b.tokens.size();
+    if (b.n_drop < 0 || b.n_drop >= T) {
+        if (why) *why = "the conditioning prompt is no longer than its fixed prefix";
+        return RAD_E_INVAL;
+    }
+    if (b.media) {
+        if (why) *why = "the joint layout reads no pictures in the prompt";
+        return RAD_E_INVAL;
+    }
+    const int64_t text = T - b.n_drop;
+    const int64_t padded = pad_multiple > 0 ? (text + pad_multiple - 1) / pad_multiple * pad_multiple
+                                            : text;
+    int64_t refs = 0;
+    for (const auto& hw : ref_hw) refs += (int64_t)hw.first * hw.second;
+    const int64_t rows = padded + refs;
+    out->rows = rows;
+    out->text = padded;
+    out->n_pad = (int32_t)(padded - text);
+    out->src.resize((size_t)rows);
+    out->rope_f.assign((size_t)(4 * rows), 0.0f);
+    for (int64_t i = 0; i < padded; ++i) {
+        out->src[(size_t)i] = (int32_t)(b.n_drop + i);
+        if (text_l) out->rope_f[(size_t)(3 * rows + i)] = (float)i;
+    }
+    out->seg.push_back(0);
+    out->bidi.push_back(0);
+    int64_t row = padded, lat = 0;
+    for (size_t k = 0; k < ref_hw.size(); ++k) {
+        const int32_t h = ref_hw[k].first, w = ref_hw[k].second;
+        const int64_t n = (int64_t)h * w;
+        std::vector<float> pl((size_t)(4 * n));
+        grid_rope_f(hw_scale, -(float)(1 + k), h, w, pl.data(), n);
+        for (int cc = 0; cc < 4; ++cc)
+            std::memcpy(&out->rope_f[(size_t)(cc * rows + row)], &pl[(size_t)(cc * n)],
+                        (size_t)n * sizeof(float));
+        for (int64_t i = 0; i < n; ++i) out->src[(size_t)(row + i)] = (int32_t)(-(1 + lat + i));
+        out->seg.push_back((int32_t)row);
+        out->bidi.push_back(1);
+        row += n;
+        lat += n;
+    }
+    out->seg.push_back((int32_t)rows);
+    return RAD_OK;
+}
+
 int build_layout(const Branch& b, int64_t slot_rows,
                  const std::vector<std::pair<int32_t, int32_t>>& ref_hw, Layout* out,
                  std::string* why) {

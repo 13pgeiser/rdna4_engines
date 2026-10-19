@@ -130,19 +130,26 @@ the cards the engine runs on.
 | `flashnext-tp1.yaml` | `qwen3.8-next-flash-fp8-iq4r-moe.rad` | The same on one card: a 42 GiB pinned host pool for the experts that do not fit, 4096-token prefill steps, 4 sequences |
 | `flashnext-bf16.yaml` | `qwen3.8-flash-next-bf16.rad` | Qwen3.8-Flash-Next in bf16, streamed from the disk tier. A reference, not a production server |
 | `qwen3.6-35b-a3b.yaml` | `qwen3.6-35b-a3b-fp8.rad` | Qwen3.6-35B-A3B, FP8 |
+| `ornith-1.5-35b-a3b.yaml` | `ornith-1.5-35b-a3b-fp8.rad` | Ornith-1.5-35B-A3B, FP8, MTP, vision |
 | `qwen3.8-27b-fp8.yaml` | `qwen3.8-27b-fp8.rad` | Qwen3.8-27B FP8 with its DFlash2 drafter and vision tower |
 | `qwen3.8-27b-mxfp4.yaml` | `qwen3.8-27b-mxfp4.rad` | Qwen3.8-27B with AMD's Quark AWQ-MXFP4 trunk, its DFlash2 drafter and vision tower |
 | `qwen3.8-27b-paro.yaml` | `qwen3.8-27b-paro-int4.rad` | Qwen3.8-27B ParoQuant int4 (learned rotations) with its DFlash2 drafter and vision tower, on one card; the int5 and MXFP4 containers serve from it too |
 | `qwen3.8-27b-bf16.yaml` | `qwen3.8-27b-bf16.rad` | Qwen3.8-27B in bf16 |
 | `gemma4-31b-w4a8.yaml` | `gemma4-31b-w4a8.rad` | Gemma 4 31B, int4 trunk with int8 activations, its assistant head as the MTP drafter, vision tower |
+| `gemma4-31b-heretic-ara-w4a8.yaml` | `gemma4-31b-heretic-ara-w4a8.rad` | The same for Gemma 4 31B heretic-ara (refusals removed) |
+| `translategemma-27b.yaml` | `translategemma-27b-mxfp4-gptq.rad` | TranslateGemma 27B MXFP4 with its chat template (`gemma3.jinja`) |
+| `glm53-flash.yaml` | `glm53-flash-mxfp4.rad` | GLM-5.3-Flash, MXFP4 experts and block-FP8 attention, on eight cards |
 | `minicpm5-2b.yaml` | `minicpm5-2b-fp8.rad` | MiniCPM5-2B FP8 with its DSpark drafter |
 | `minicpm5-2b-bf16.yaml` | `minicpm5-2b-bf16.rad` | MiniCPM5-2B in bf16 with its DSpark drafter |
 | `embeddinggemma2.yaml` | `embeddinggemma2-bf16.rad` | EmbeddingGemma 2 in bf16: text, image, video and audio embeddings on one card (`RADIANCE_GPU`) |
 | `qwen-image-2.1.yaml` | `qwen-image-2.1-fp8.rad` | Qwen-Image 2.1 as block fp8 on two cards: OpenAI's images API, generation and edits |
 | `qwen-image-2.1-turbo.yaml` | `qwen-image-2.1-turbo-fp8.rad` | Qwen-Image 2.1 Turbo, the same in 8 steps |
+| `krea-2-turbo.yaml`, `krea-2-raw.yaml` | `krea-2-turbo-fp8.rad`, `krea-2-raw-fp8.rad` | Krea 2 Turbo and Raw as block fp8: text to image on one card (`RADIANCE_GPU`) |
+| `flux-3-klein.yaml` | `flux-3-klein-fp8.rad` | FLUX.3 [klein] as block fp8: generation and edits on one card (`RADIANCE_GPU`); the base container serves the same way |
 | `qwen3-asr-1.7b.yaml` | `Qwen3-ASR-1.7B-hf/` (the checkpoint) | Qwen3-ASR 1.7B: `/v1/audio/transcriptions` and live `/v1/realtime`, on one card (`RADIANCE_GPU`) |
 | `minimax-h3.yaml` | `minimax-h3-fp8.rad` | MiniMax-H3 as block fp8: video with its stereo soundtrack on `/v1/videos`, two cards and about 39 GiB of pinned host memory |
 | `fasth3.yaml` | `fasth3-8-step-v2-fp8.rad` | FastVideo's FastH3 8-Step V2, the same in eight steps |
+| `ltx-2.5.yaml` | `ltx-2.5-distilled-fp8.rad` | LTX-2.5 distilled as block fp8: video with its stereo soundtrack on `/v1/videos`, one card (`RADIANCE_GPU`), the text encoder in pinned host memory; the base container serves the same way |
 | `minimax-music3.yaml` | `minimax-music3-bf16.rad` | MiniMax-Music3 in bf16: songs from lyrics and a description on `/v1/audio/speech` |
 | `breeze-tts2.yaml` | `breeze-tts2-bf16.rad` | Breeze-TTS-2 in bf16: speech on `/v1/audio/speech` and live over `/v1/audio/speech/stream`, on one card (`RADIANCE_GPU`) |
 
@@ -163,7 +170,7 @@ docker compose -f flashnext.yaml down       # stop
 ```
 
 Every model listens on the same port and most take both cards (`flashnext-tp1.yaml`,
-`qwen3.8-27b-paro.yaml` and `embeddinggemma2.yaml` take one), so run one at a time: `down` one
-before `up` on another. The server runs as the host user given in `.env`. `/health`, `/ping` and
+`qwen3.8-27b-paro.yaml` and the files that read `RADIANCE_GPU` take one, `glm53-flash.yaml`
+eight), so run one at a time: `down` one before `up` on another. The server runs as the host user given in `.env`. `/health`, `/ping` and
 the dashboard page answer without the API key, and the health check fetches `/health` with
 busybox's `wget`.

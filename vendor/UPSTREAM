@@ -552,9 +552,9 @@ PATCH SERIES
       An escaped space or non-ASCII character is itself. \x and \u in a class need their hex
       digits; "\0" before a digit (a legacy octal) is refused. Every other class escape is now
       refused at conversion with a message naming it. Limits: a negated class still admits the
-      \u form of a character it leaves out (\u0009 for \t), and a positive class admits \t \n
-      \r \f \b only in their short form. gbnf_test covers each escape in and out of a class, quantified, and negated, and the
-      refusals.
+      \u form of a character it leaves out (\u0009 for \t), and a positive class admits \t \n \r \f
+      \b only in their short form. gbnf_test covers each escape in and out of a class, quantified,
+      and negated, and the refusals.
 
   patches/0021-jinja-a-dotted-integer-is-an-index.patch
 

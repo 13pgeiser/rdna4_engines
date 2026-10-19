@@ -362,9 +362,10 @@ int build(ArInst* in, int rank, int world, long long max_numel, int dtype_code, 
      * fill a card while their twins wait behind the other engine's kernel on the peer card, which
      * waits for a slot on the full card. Not capped: the hyper-connection gathers of the MoE paths
      * (r4d_ar_gather_hc_write without its inverse scratch, r4d_ar_hc_write_wht6), whose LDS table
-     * needs a minimum block count, which may exceed the ceiling (dense models do not use them). Two TP2 engines on two R9700s (Qwen3.8-27B and Gemma 3 27B)
-     * hung within a minute of concurrent prefill; MES then failed to evict the queues and the
-     * failed reset froze the host. Capped in both engines so that their spinners together cannot
+     * needs a minimum block count, which may exceed the ceiling (dense models do not use them).
+     * Two TP2 engines on two R9700s (Qwen3.8-27B and Gemma 3 27B) hung within a minute of
+     * concurrent prefill; MES then failed to evict the queues and the failed reset froze the
+     * host. Capped in both engines so that their spinners together cannot
      * fill a card, the cycle cannot close. The flag and counter arrays keep their full size (maxb);
      * only the launch counts shrink, and each element's sum is the same. Unset, nothing changes. */
     if (const char* e = std::getenv("R4D_AR_MAX_BLOCKS")) {

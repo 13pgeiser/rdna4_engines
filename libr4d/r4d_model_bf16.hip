@@ -837,9 +837,11 @@ extern "C" int r4d_sigmoid_bf16(long x, long y, int M, int n, int x_ld, int y_ld
 // y[m, i] = v over an [M, n] extent with a row pitch, for a rank with nothing to compute whose
 // downstream reader (an all-reduce, a residual) still needs a defined buffer. A memset cannot
 // handle the pitch or a two-byte value.
-__global__ __launch_bounds__(kThreads) void fill_kernel(uint16_t* __restrict__ y, uint32_t n,
-                                                        uint32_t y_ld, uint16_t v) {
-    uint16_t* __restrict__ yr = y + (size_t)blockIdx.x * y_ld;
+// T is the element's bits: uint16_t for bf16, uint32_t for f32.
+template<typename T>
+__global__ __launch_bounds__(kThreads) void fill_kernel(T* __restrict__ y, uint32_t n,
+                                                        uint32_t y_ld, T v) {
+    T* __restrict__ yr = y + (size_t)blockIdx.x * y_ld;
     for (uint32_t i = threadIdx.x; i < n; i += kThreads) yr[i] = v;
 }
 
@@ -854,8 +856,20 @@ extern "C" int r4d_fill_bf16(long y, int M, int n, int y_ld, float value, long s
     if (!y) return -1;
     if (M <= 0 || n <= 0) return -2;
     if (!y_ld) y_ld = n;
-    hipLaunchKernelGGL(fill_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
-                       (uint16_t*)y, (uint32_t)n, (uint32_t)y_ld, f32_to_bf16_host(value));
+    hipLaunchKernelGGL(fill_kernel<uint16_t>, dim3((uint32_t)M), dim3(kThreads), 0,
+                       (hipStream_t)stream, (uint16_t*)y, (uint32_t)n, (uint32_t)y_ld,
+                       f32_to_bf16_host(value));
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+extern "C" int r4d_fill_f32(long y, int M, int n, int y_ld, float value, long stream) {
+    if (!y) return -1;
+    if (M <= 0 || n <= 0) return -2;
+    if (!y_ld) y_ld = n;
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof bits);
+    hipLaunchKernelGGL(fill_kernel<uint32_t>, dim3((uint32_t)M), dim3(kThreads), 0,
+                       (hipStream_t)stream, (uint32_t*)y, (uint32_t)n, (uint32_t)y_ld, bits);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -1306,8 +1320,10 @@ extern "C" int r4d_rad_cast(const RadArgs* a, RadStream s) {
     const RadTensor* x = r4d_opt(a, CS_X);
     const RadTensor* y = r4d_opt(a, CS_Y);
     if (!x || !y) return R4D_NO(RAD_E_INVAL);
-    R4D_NEED(dt_bf16(x));
-    R4D_NEED(dt_bf16(y));
+    /* A copy at the dtype both sides share: bf16, or f32 (a latent kept aside and put back). */
+    if (x->dtype != y->dtype || (x->dtype != RAD_BF16 && x->dtype != RAD_F32))
+        return R4D_NO(RAD_E_DTYPE);
+    const long long es = x->dtype == RAD_F32 ? 4 : 2;
 
     const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
     if (n <= 0) return R4D_NO(RAD_E_SHAPE);
@@ -1319,7 +1335,7 @@ extern "C" int r4d_rad_cast(const RadArgs* a, RadStream s) {
      * while the source holds the live rows, so the source need only have at least as many. */
     if (M <= 0 || Mx < M) return R4D_NO(RAD_E_SHAPE);
 
-    return r4d_p2p_copy2d(r4d_addr(y), r4d_addr(x), y_ld * 2, x_ld * 2, n * 2, M,
+    return r4d_p2p_copy2d(r4d_addr(y), r4d_addr(x), y_ld * es, x_ld * es, n * es, M,
                           (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
@@ -1566,7 +1582,7 @@ extern "C" int r4d_rad_sigmoid(const RadArgs* a, RadStream s) {
 extern "C" int r4d_rad_fill(const RadArgs* a, RadStream s) {
     const RadTensor* y = r4d_opt(a, 0);
     if (!y) return R4D_NO(RAD_E_INVAL);
-    R4D_NEED(dt_bf16(y));
+    if (y->dtype != RAD_BF16 && y->dtype != RAD_F32) return R4D_NO(RAD_E_DTYPE);
     const long long n = r4d_geti_or(a, "n", r4d_dim(y, (int)y->rank - 1));
     if (n <= 0) return R4D_NO(RAD_E_SHAPE);
     long long M = 0;
@@ -1574,8 +1590,9 @@ extern "C" int r4d_rad_fill(const RadArgs* a, RadStream s) {
     if (y_ld < 0) return R4D_NO(RAD_E_STRIDE);
     if (M <= 0) return R4D_NO(RAD_E_SHAPE);
     const double v = r4d_getf(a, "value", 0.0);
-    return r4d_fill_bf16(r4d_addr(y), (int)M, (int)n, (int)y_ld, (float)v,
-                         (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
+    const int e = (y->dtype == RAD_F32 ? r4d_fill_f32 : r4d_fill_bf16)(
+        r4d_addr(y), (int)M, (int)n, (int)y_ld, (float)v, (long)(uintptr_t)s);
+    return e == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
 /* ------------------------------------------------------------------ logit_softcap */

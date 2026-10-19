@@ -72,8 +72,8 @@ struct ManifoldConn {
     }
     int declare_split(RadBuilder* b, Names& nm, const char* name) {
         const int64_t total = c.hc * g.n_embd / kChunk;
-        split_rows = glm_tp_split_rows();
-        if (g.world < 2 || g.n_embd != 4096 || c.hc != 4 || !split_rows || total % g.world) {
+        split_rows = kGlmTpSplitRows;
+        if (g.world < 2 || g.n_embd != 4096 || c.hc != 4 || total % g.world) {
             split_rows = 0;
             return RAD_OK;
         }

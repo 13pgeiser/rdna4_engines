@@ -2,6 +2,7 @@
  * waits on, and a request's shape and schedule (video.h). */
 #include "video_driver.h"
 #include "rad_internal.h"
+#include "rad_plugin.h"
 
 #include <algorithm>
 #include <chrono>
@@ -75,7 +76,7 @@ VideoShape video_shape(const RadVideoGenDecl& d, int32_t width, int32_t height, 
     if (r2 > den || (r2 == den && (q & 1))) ++q;
     s.n_audio = (int32_t)q;
     s.video_rows = (int64_t)s.lat_frames * (s.lat_h / d.patch) * (s.lat_w / d.patch);
-    s.audio_rows = d.audio_channels * (int64_t)s.n_audio;
+    s.audio_rows = (d.audio_streams > 0 ? d.audio_streams : d.audio_channels) * (int64_t)s.n_audio;
     return s;
 }
 
@@ -120,8 +121,47 @@ static std::vector<float> rung_sigmas(double shift, const double* rungs, int32_t
     return s;
 }
 
-VideoSchedule video_schedule(const RadVideoGenDecl& d, int32_t steps) {
+/* Form 1 (RadVideoGenDecl::sched_kind): FlowMatchEulerDiscreteScheduler.set_timesteps with
+ * LTX-2's sigmas. numpy's linspace in f64 (i * step + start, the last exactly the stop) taken to
+ * f32; the shift and the terminal stretch in f32, as numpy computes on an f32 array with Python
+ * scalars. */
+static std::vector<float> flow_sigmas(const RadVideoGenDecl& d, int32_t n, int64_t tokens) {
+    std::vector<float> s((size_t)n);
+    const double stop = 1.0 / n, step = n > 1 ? (stop - 1.0) / (n - 1) : 0.0;
+    for (int32_t i = 0; i < n; ++i) s[(size_t)i] = (float)(i == n - 1 && n > 1 ? stop : i * step + 1.0);
+    if (d.dyn_shift) {
+        const double m = (d.max_shift - d.base_shift) / (double)(d.max_seq - d.base_seq);
+        const double mu = (double)tokens * m + (d.base_shift - m * (double)d.base_seq);
+        const float e = (float)std::exp(mu);
+        for (float& v : s) v = e / (e + (1.0f / v - 1.0f));
+    }
+    if (d.shift_terminal > 0.0) {
+        const float sf = (1.0f - s.back()) / (float)(1.0 - d.shift_terminal);
+        for (float& v : s) v = 1.0f - (1.0f - v) / sf;
+    }
+    s.push_back(0.0f);
+    return s;
+}
+
+VideoSchedule video_schedule(const RadVideoGenDecl& d, int32_t steps, int64_t video_tokens,
+                             bool refine) {
     VideoSchedule v;
+    if (d.sched_kind == 1) {
+        if (d.n_rungs > 0) {
+            if (steps != d.n_rungs) return v;
+            for (int32_t i = 0; i < d.n_rungs; ++i) v.sig_v.push_back((float)d.rungs[i]);
+            if (refine)
+                for (int32_t i = 0; i < d.n_refine_rungs; ++i)
+                    v.sig_v.push_back((float)d.refine_rungs[i]);
+            v.sig_v.push_back(0.0f);
+        } else {
+            if (steps < 1) return v;
+            v.sig_v = flow_sigmas(d, steps, video_tokens);
+        }
+        v.sig_a = v.sig_v;
+        v.steps = (int32_t)v.sig_v.size() - 1;
+        return v;
+    }
     if (d.n_rungs > 0) {
         if (steps != d.n_rungs + 1) return v;
         v.sig_v = rung_sigmas(d.shift_video, d.rungs, d.n_rungs);
@@ -146,10 +186,12 @@ int64_t align_up(int64_t v) { return (v + kAlign - 1) / kAlign * kAlign; }
 /* Region offsets and sizes, in the enum's order (video_driver.h), and the total; shared by the
  * allocation and the VRAM budget. */
 int64_t carve(const RadVideoGenDecl& d, int64_t max_tok, int64_t (*bytes)[2], int n) {
+    /* A guided model's VCOND carries the negative prompt after the positive. */
+    const int64_t prompts = d.guidance ? 2 : 1;
     const int64_t want[] = {
-        d.max_text * 4,          /* R_TOK */
-        d.max_text * 4,          /* R_POS */
-        2 * 4,                   /* R_CU */
+        prompts * d.max_text * 4,   /* R_TOK */
+        prompts * d.max_text * 4,   /* R_POS */
+        3 * 4,                   /* R_CU */
         3 * max_tok * 4,         /* R_ROPE: a step's rotary positions */
         RAD_VGEOM_N * 4,         /* R_GEOM */
         6 * 4,                   /* R_SCHED */
@@ -161,6 +203,8 @@ int64_t carve(const RadVideoGenDecl& d, int64_t max_tok, int64_t (*bytes)[2], in
         4 * 4,                   /* R_SEG */
         4 * 4,                   /* R_LAT */
         4,                       /* R_UP */
+        d.image_cond ? d.max_area * 3 * 2 : 0,   /* R_IMG: a first frame, bf16 */
+        8 * 4,                   /* R_GUIDE */
     };
     int64_t off = 0;
     for (int r = 0; r < n; ++r) {
@@ -206,9 +250,17 @@ int VideoDriver::init(const Program& prog, PositionsFn positions,
                 "video generator must", name_.c_str());
         return RAD_E_UNSUPPORTED;
     }
-    if (max_tok_ < decl_.max_text) {
-        RAD_ERR("video generator '%s': a pass carries %lld rows and a prompt may be %lld tokens",
-                name_.c_str(), (long long)max_tok_, (long long)decl_.max_text);
+    decoder_names_ = prog.vgen_str.decoders;
+    decoder_area_ = prog.vgen_str.decoder_max_area;
+    refine_rungs_ = prog.vgen_str.refine_rungs;
+    decl_.refine_rungs = refine_rungs_.empty() ? nullptr : refine_rungs_.data();
+    default_negative_ = prog.vgen_str.default_negative;
+    decl_.default_negative = default_negative_.c_str();
+    const int64_t prompts = decl_.guidance ? 2 : 1;
+    if (max_tok_ < prompts * decl_.max_text) {
+        RAD_ERR("video generator '%s': a pass carries %lld rows and %s may be %lld tokens",
+                name_.c_str(), (long long)max_tok_, prompts == 2 ? "a prompt and its negative" :
+                "a prompt", (long long)(prompts * decl_.max_text));
         return RAD_E_UNSUPPORTED;
     }
     int64_t b[R_N][2];
@@ -222,7 +274,8 @@ int VideoDriver::init(const Program& prog, PositionsFn positions,
     host_ = static_cast<char*>(rad_dev_alloc(bytes_, RAD_MEM_HOST_PINNED));
     frames_host_ = static_cast<uint8_t*>(rad_dev_alloc(frames_bytes_, RAD_MEM_HOST_PINNED));
     audio_host_ = static_cast<float*>(rad_dev_alloc(audio_bytes_, RAD_MEM_HOST_PINNED));
-    if (!host_ || !frames_host_ || !audio_host_) {
+    duration_host_ = static_cast<float*>(rad_dev_alloc(64, RAD_MEM_HOST_PINNED));
+    if (!host_ || !frames_host_ || !audio_host_ || !duration_host_) {
         RAD_ERR("video generator: no pinned host memory for the pass staging and outputs (%lld + "
                 "%lld + %lld bytes)", (long long)bytes_, (long long)frames_bytes_,
                 (long long)audio_bytes_);
@@ -258,12 +311,157 @@ void VideoDriver::fini() {
     if (host_) rad_dev_free(host_, RAD_MEM_HOST_PINNED);
     if (frames_host_) rad_dev_free(frames_host_, RAD_MEM_HOST_PINNED);
     if (audio_host_) rad_dev_free(audio_host_, RAD_MEM_HOST_PINNED);
+    if (duration_host_) rad_dev_free(duration_host_, RAD_MEM_HOST_PINNED);
+    duration_host_ = nullptr;
     host_ = nullptr;
     frames_host_ = nullptr;
     audio_host_ = nullptr;
 }
 
 /* ================================================================== requests */
+/* A length head's prediction (RadVideoGenDecl::duration_out) in chunks: diffusers'
+ * LTX2DurationHead.predict_num_frames on the chunk grid -- the seconds clamped to the declared
+ * bounds, rounded to frames, floored to the grid and lifted one chunk when that falls under the
+ * minimum -- then held to min_chunks..max_chunks. `note` says what was clamped. */
+int32_t VideoDriver::predicted_chunks(double log_seconds, std::string* note) const {
+    const RadVideoGenDecl& d = decl_;
+    const double fps = (double)d.fps_num / (double)d.fps_den;
+    float e = std::exp((float)log_seconds);
+    if (d.duration_dtype == RAD_BF16) e = rad_bf16_to_f32(rad_f32_to_bf16(e));
+    const double sec = e;
+    auto round_even = [](double v) { return (int64_t)std::nearbyint(v); };
+    const int64_t lo = std::max<int64_t>(1, round_even(d.duration_min * fps));
+    const int64_t hi = round_even(d.duration_max * fps);
+    const int64_t want = std::isfinite(sec) ? round_even(sec * fps) : hi;
+    const int64_t frames = std::max(lo, std::min(want, hi));
+    int64_t n = std::max<int64_t>(0, (frames - d.frames_tail) / d.frames_per_chunk);
+    if (d.frames_per_chunk * n + d.frames_tail < lo &&
+        d.frames_per_chunk * (n + 1) + d.frames_tail <= hi)
+        ++n;
+    std::string what = fmt(": %.3f s predicted", sec);
+    if (!(sec >= d.duration_min && sec <= d.duration_max))
+        what += fmt(", held to %g..%g s", d.duration_min, d.duration_max);
+    if (n < d.min_chunks || n > d.max_chunks) {
+        n = std::max<int64_t>(d.min_chunks, std::min<int64_t>(n, d.max_chunks));
+        what += fmt(", within the %lld..%lld frames this model makes",
+                    (long long)(d.frames_per_chunk * d.min_chunks + d.frames_tail),
+                    (long long)(d.frames_per_chunk * d.max_chunks + d.frames_tail));
+    }
+    if (note) *note = what;
+    return (int32_t)n;
+}
+
+/* The request's shape at `chunks` long: its geometry, rows and positions, its schedule, the
+ * upscale's split and what its ticket says it makes. Run at submit, and again for a request whose
+ * length the model predicts once its VCOND pass has written the prediction. */
+int VideoDriver::shape_job(Job& j, const VideoRequest& r, int32_t chunks, int32_t steps,
+                           std::string* why) {
+    const RadVideoGenDecl& d = decl_;
+    auto no = [&](const std::string& w) {
+        if (why) *why = w;
+        return RAD_E_INVAL;
+    };
+    const int64_t T = (int64_t)r.tokens.size();
+    const VideoShape s = video_shape(d, r.width, r.height, chunks);
+    j.geom.n_text = (int32_t)(d.step_text_rows > 0 ? d.step_text_rows : T);
+    j.geom.frames = s.frames;
+    j.geom.lat_frames = s.lat_frames;
+    j.geom.lat_h = s.lat_h;
+    j.geom.lat_w = s.lat_w;
+    j.geom.n_audio = s.n_audio;
+    j.rows = j.geom.n_text + s.audio_rows + s.video_rows;
+    if (j.rows > max_tok_)
+        return no("a step of this video is " + std::to_string(j.rows) + " rows and a pass "
+                  "carries " + std::to_string(max_tok_) + "; ask for a shorter or smaller video");
+    const int64_t nr = positions_(RAD_VPOS_STEP, &j.geom, nullptr, 0);
+    const int64_t nd = positions_(RAD_VPOS_DECODE, &j.geom, nullptr, 0);
+    if (nr != j.rows || nd <= 0 || nd > max_tok_)
+        return no("the model lays this video out in " + std::to_string(nr) + " step rows and " +
+                  std::to_string(nd) + " decoder rows, which this server cannot run");
+    j.dec_rows = nd;
+    j.pos.assign((size_t)(3 * nr), 0.0f);
+    if (positions_(RAD_VPOS_STEP, &j.geom, j.pos.data(), nr) != nr)
+        return no("the model could not lay this video out");
+    /* The schedule follows the upscale's split, which needs the small size first. */
+    const bool upscaling = r.upscale > 1.0;
+    const bool own_refine = upscaling && d.n_refine_rungs > 0;
+    int64_t first_tokens = s.video_rows;
+    if (upscaling) {
+        int32_t sw = 0, sh = 0;
+        video_small_size(d, r.width, r.height, r.upscale, &sw, &sh);
+        first_tokens = video_shape(d, sw, sh, chunks).video_rows;
+    }
+    j.sched = video_schedule(d, steps, first_tokens, own_refine);
+    if (j.sched.steps < 1) return no("the schedule has no steps");
+    int32_t first_w = r.width, first_h = r.height;
+    if (upscaling) {
+        if (!(d.upscale_max > 1.0)) return no("this model has no latent upscaler");
+        if (d.upscale_exact) {
+            const int64_t m = (int64_t)std::llround(d.size_multiple * d.upscale_max);
+            if (r.upscale != d.upscale_max || r.width % m || r.height % m)
+                return no("this model's latent upscaler enlarges by exactly " +
+                          fmt("%g", d.upscale_max) + ": latent_upscale must be that, and both "
+                          "sides multiples of " + std::to_string(m));
+        }
+        if (r.upscale > d.upscale_max)
+            return no("latent_upscale is at most " + fmt("%g", d.upscale_max) + " for this model");
+        int32_t sw = 0, sh = 0;
+        video_small_size(d, r.width, r.height, r.upscale, &sw, &sh);
+        if (sw == r.width && sh == r.height)
+            return no("latent_upscale " + fmt("%g", r.upscale) + " leaves " +
+                      std::to_string(r.width) + "x" + std::to_string(r.height) + " as it is: "
+                      "the small size is each side over the factor, rounded to a multiple of " +
+                      std::to_string(d.size_multiple));
+        const int32_t evals = j.sched.steps;
+        int32_t refine = r.refine;
+        if (own_refine) {
+            if (refine != 0 && refine != d.n_refine_rungs)
+                return no("upscale_refine_steps must be " + std::to_string(d.n_refine_rungs) +
+                          ": this model refines the upscaled video over the schedule it was "
+                          "trained on");
+            refine = d.n_refine_rungs;
+        }
+        if (refine == 0) refine = std::min<int32_t>(d.upscale_refine, evals - 1);
+        if (refine < 1 || refine >= evals)
+            return no("upscale_refine_steps must be 1.." + std::to_string(evals - 1) + ": the "
+                      "schedule takes " + std::to_string(evals) + " evaluations and the small "
+                      "size at least one of them");
+        const VideoShape ss = video_shape(d, sw, sh, chunks);
+        j.geom_small = j.geom;
+        j.geom_small.lat_h = ss.lat_h;
+        j.geom_small.lat_w = ss.lat_w;
+        j.rows_small = j.geom.n_text + ss.audio_rows + ss.video_rows;
+        const int64_t ns = positions_(RAD_VPOS_STEP, &j.geom_small, nullptr, 0);
+        if (ns != j.rows_small)
+            return no("the model lays the small size " + std::to_string(sw) + "x" +
+                      std::to_string(sh) + " out in " + std::to_string(ns) + " step rows, which "
+                      "this server cannot run");
+        j.pos_small.assign((size_t)(3 * ns), 0.0f);
+        if (positions_(RAD_VPOS_STEP, &j.geom_small, j.pos_small.data(), ns) != ns)
+            return no("the model could not lay the small size out");
+        j.split = evals - refine;
+        j.factor = (float)(((double)r.width / sw + (double)r.height / sh) / 2.0);
+        r.ticket->small_width = sw;
+        r.ticket->small_height = sh;
+        r.ticket->refine = refine;
+        first_w = sw;
+        first_h = sh;
+    }
+    if (!r.image.empty()) {
+        if (!d.image_cond) return no("this model cannot start from a picture");
+        if (r.image.size() != (size_t)first_w * first_h * 3)
+            return no("the first frame is not " + std::to_string(first_w) + "x" +
+                      std::to_string(first_h) + " RGB");
+    }
+    j.n_chunks = chunks;
+    j.n_samples = (int64_t)s.n_audio * (d.sample_rate / d.audio_rate);
+    VideoTicket& t = *r.ticket;
+    t.frames = s.frames;
+    t.steps = j.sched.steps;
+    t.rows = j.rows;
+    return RAD_OK;
+}
+
 int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
     if (!r || !r->ticket) return RAD_E_INVAL;
     const RadVideoGenDecl& d = decl_;
@@ -275,7 +473,7 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
     if (T < 1 || T > d.max_text)
         return no("the prompt is " + std::to_string(T) + " tokens; this model takes 1.." +
                   std::to_string(d.max_text));
-    if (r->chunks < d.min_chunks || r->chunks > d.max_chunks)
+    if (r->chunks != 0 && (r->chunks < d.min_chunks || r->chunks > d.max_chunks))
         return no("the length must be " + std::to_string(d.min_chunks) + ".." +
                   std::to_string(d.max_chunks) + " chunks");
     const int64_t W = r->width, H = r->height;
@@ -287,87 +485,53 @@ int VideoDriver::submit(std::unique_ptr<VideoRequest> r, std::string* why) {
                   " pixels, the long side at most " + std::to_string(d.max_aspect) +
                   " times the short");
     const int32_t steps = r->steps > 0 ? r->steps : (int32_t)d.default_steps;
-    if (d.n_rungs > 0 && steps != d.n_rungs + 1)
-        return no("num_inference_steps must be " + std::to_string(d.n_rungs + 1) + ": this model "
+    const bool evals = d.sched_kind == 1;   /* form 1 counts evaluations, form 0 grid points */
+    const int32_t rung_steps = evals ? d.n_rungs : d.n_rungs + 1;
+    if (d.n_rungs > 0 && steps != rung_steps)
+        return no("num_inference_steps must be " + std::to_string(rung_steps) + ": this model "
                   "runs the schedule it was trained on, " + std::to_string(d.n_rungs) +
                   " evaluations");
-    if (steps < 2 || steps > d.max_steps)
-        return no("num_inference_steps must be 2.." + std::to_string(d.max_steps) + " (sigma grid "
-                  "points, the last one 0)");
+    if (steps < (evals ? 1 : 2) || steps > d.max_steps)
+        return no("num_inference_steps must be " + std::to_string(evals ? 1 : 2) + ".." +
+                  std::to_string(d.max_steps) + (evals ? " (model evaluations)" :
+                  " (sigma grid points, the last one 0)"));
 
     auto j = std::make_unique<Job>();
-    const VideoShape s = video_shape(d, r->width, r->height, r->chunks);
-    j->geom.n_text = (int32_t)T;
-    j->geom.frames = s.frames;
-    j->geom.lat_frames = s.lat_frames;
-    j->geom.lat_h = s.lat_h;
-    j->geom.lat_w = s.lat_w;
-    j->geom.n_audio = s.n_audio;
-    j->rows = T + s.audio_rows + s.video_rows;
-    if (j->rows > max_tok_)
-        return no("a step of this video is " + std::to_string(j->rows) + " rows and a pass "
-                  "carries " + std::to_string(max_tok_) + "; ask for a shorter or smaller video");
-    const int64_t nr = positions_(RAD_VPOS_STEP, &j->geom, nullptr, 0);
-    const int64_t nd = positions_(RAD_VPOS_DECODE, &j->geom, nullptr, 0);
-    if (nr != j->rows || nd <= 0 || nd > max_tok_)
-        return no("the model lays this video out in " + std::to_string(nr) + " step rows and " +
-                  std::to_string(nd) + " decoder rows, which this server cannot run");
-    j->dec_rows = nd;
-    j->pos.assign((size_t)(3 * nr), 0.0f);
-    if (positions_(RAD_VPOS_STEP, &j->geom, j->pos.data(), nr) != nr)
-        return no("the model could not lay this video out");
-    j->sched = video_schedule(d, steps);
-    if (j->sched.steps < 1) return no("the schedule has no steps");
-    if (r->upscale > 1.0) {
-        if (!(d.upscale_max > 1.0)) return no("this model has no latent upscaler");
-        if (r->upscale > d.upscale_max)
-            return no("latent_upscale is at most " + fmt("%g", d.upscale_max) + " for this model");
-        int32_t sw = 0, sh = 0;
-        video_small_size(d, r->width, r->height, r->upscale, &sw, &sh);
-        if (sw == r->width && sh == r->height)
-            return no("latent_upscale " + fmt("%g", r->upscale) + " leaves " +
-                      std::to_string(r->width) + "x" + std::to_string(r->height) + " as it is: "
-                      "the small size is each side over the factor, rounded to a multiple of " +
-                      std::to_string(d.size_multiple));
-        const int32_t evals = j->sched.steps;
-        int32_t refine = r->refine;
-        if (refine == 0) refine = std::min<int32_t>(d.upscale_refine, evals - 1);
-        if (refine < 1 || refine >= evals)
-            return no("upscale_refine_steps must be 1.." + std::to_string(evals - 1) + ": the "
-                      "schedule takes " + std::to_string(evals) + " evaluations and the small "
-                      "size at least one of them");
-        const VideoShape ss = video_shape(d, sw, sh, r->chunks);
-        j->geom_small = j->geom;
-        j->geom_small.lat_h = ss.lat_h;
-        j->geom_small.lat_w = ss.lat_w;
-        j->rows_small = T + ss.audio_rows + ss.video_rows;
-        const int64_t ns = positions_(RAD_VPOS_STEP, &j->geom_small, nullptr, 0);
-        if (ns != j->rows_small)
-            return no("the model lays the small size " + std::to_string(sw) + "x" +
-                      std::to_string(sh) + " out in " + std::to_string(ns) + " step rows, which "
-                      "this server cannot run");
-        j->pos_small.assign((size_t)(3 * ns), 0.0f);
-        if (positions_(RAD_VPOS_STEP, &j->geom_small, j->pos_small.data(), ns) != ns)
-            return no("the model could not lay the small size out");
-        j->split = evals - refine;
-        j->factor = (float)(((double)r->width / sw + (double)r->height / sh) / 2.0);
-        r->ticket->small_width = sw;
-        r->ticket->small_height = sh;
-        r->ticket->refine = refine;
+    /* Guidance: the request's terms over the model's defaults; a negative prompt only when a
+     * scale asks for the unconditional branch. */
+    bool named = r->has_neg;
+    for (int i = 0; i < 8; ++i) {
+        named = named || !std::isnan(r->guidance[i]);
+        j->guidance[i] = (float)(std::isnan(r->guidance[i]) ? d.guidance_default[i] : r->guidance[i]);
+        if (!(j->guidance[i] >= 0.0f) || !std::isfinite(j->guidance[i]))
+            return no("guidance terms must be finite and not negative");
     }
-    j->n_chunks = r->chunks;
-    j->n_samples = (int64_t)s.n_audio * (d.sample_rate / d.audio_rate);
+    if (!d.guidance && named)
+        return no("this model takes no guidance or negative prompt");
+    j->n_neg = 0;
+    if (d.guidance && (j->guidance[0] != 1.0f || j->guidance[4] != 1.0f)) {
+        const int64_t N = (int64_t)r->neg_tokens.size();
+        if (N < 1 || N > d.max_text)
+            return no("the negative prompt is " + std::to_string(N) + " tokens; this model takes "
+                      "1.." + std::to_string(d.max_text));
+        j->n_neg = (int32_t)N;
+    }
+    if (r->decoder < 0 || (r->decoder > 0 && (size_t)r->decoder >= decoder_area_.size()))
+        return no("this model has no decoder " + std::to_string(r->decoder));
+    if (r->decoder > 0 && W * H > decoder_area_[(size_t)r->decoder])
+        return no("the " + decoder_names_[(size_t)r->decoder] + " decoder makes frames of " +
+                  std::to_string(decoder_area_[(size_t)r->decoder]) + " pixels at most");
+    j->auto_len = r->chunks == 0 && d.duration_out != RAD_NULL_HANDLE;
+    const int32_t chunks = r->chunks == 0 ? (int32_t)d.default_chunks : r->chunks;
+    if (shape_job(*j, *r, chunks, steps, why) < 0) return RAD_E_INVAL;
 
     VideoTicket& t = *r->ticket;
-    t.frames = s.frames;
     t.width = r->width;
     t.height = r->height;
-    t.steps = j->sched.steps;
     t.sample_rate = d.sample_rate;
     t.channels = d.audio_channels;
     t.fps = (double)d.fps_num / (double)d.fps_den;
     t.in_tokens = T;
-    t.rows = j->rows;
     t.t_submit_ns = (int64_t)rad_mono_ns();
     std::lock_guard<std::mutex> lk(mu_);
     if (closed_) {
@@ -472,8 +636,16 @@ void VideoDriver::stage_geom(const Job& j, const RadVideoGeom& g0, int64_t rows,
                                b.lat_frames, b.lat_h / p, b.lat_w / p };
         std::memcpy(g + RAD_VGEOM_UP_SRC, up, sizeof up);
     }
+    g[RAD_VGEOM_AUDIO_VOL] = g0.n_audio;
+    g[RAD_VGEOM_AUDIO_VOL + 1] = 1;
+    g[RAD_VGEOM_AUDIO_VOL + 2] = 1;
+    const int32_t ppf = (int32_t)((g0.lat_h / decl_.patch) * (g0.lat_w / decl_.patch));
+    g[RAD_VGEOM_FIRST_CU] = 0;
+    g[RAD_VGEOM_FIRST_CU + 1] = ppf;
+    g[RAD_VGEOM_FIRST_CU + 2] = ppf * g0.lat_frames;
     reg_[R_GEOM].used = RAD_VGEOM_N * 4;
-    const int64_t audio_rows = decl_.audio_channels * (int64_t)g0.n_audio;
+    const int64_t audio_rows =
+        (decl_.audio_streams > 0 ? decl_.audio_streams : decl_.audio_channels) * (int64_t)g0.n_audio;
     const int64_t video_rows = rows - g0.n_text - audio_rows;
     *hptr<int32_t>(R_LANE) = j.lane;
     *hptr<int32_t>(R_FIRST) = j.step == 0;
@@ -487,6 +659,8 @@ void VideoDriver::stage_geom(const Job& j, const RadVideoGeom& g0, int64_t rows,
     lat[1] = (int32_t)video_rows;
     lat[2] = 0;
     lat[3] = (int32_t)audio_rows;
+    std::memcpy(hptr<float>(R_GUIDE), j.guidance, sizeof j.guidance);
+    reg_[R_GUIDE].used = sizeof j.guidance;
     reg_[R_LANE].used = 4;
     reg_[R_FIRST].used = 4;
     reg_[R_SEG].used = 4 * 4;
@@ -529,6 +703,10 @@ void VideoDriver::base_batches(const Job& j, const RadVideoGeom& g, int64_t n_to
         V.dec_rows = j.dec_rows;
         V.n_samples = j.n_samples;
         V.upscale = dptr<float>(ri, R_UP);
+        V.guidance_h = j.guidance;
+        V.guidance = dptr<float>(ri, R_GUIDE);
+        V.has_image = !j.req->image.empty();
+        V.decoder = j.req->decoder;
         B.vgen_b = &V;
     }
 }
@@ -581,30 +759,54 @@ const RadBatch* VideoDriver::batch_for(int rank) const {
 
 const RadBatch* VideoDriver::build_cond(Job& j, int step) {
     for (int g = 0; g < R_N; ++g) reg_[g].used = 0;
-    const int64_t T = j.geom.n_text;
+    /* The prompt, then the negative prompt when the request is guided against one, each its own
+     * sequence from position 0. */
+    const int64_t T = (int64_t)j.req->tokens.size(), N = j.n_neg;
     int32_t* tok = hptr<int32_t>(R_TOK);
     int32_t* pos = hptr<int32_t>(R_POS);
     std::memcpy(tok, j.req->tokens.data(), (size_t)T * 4);
-    for (int64_t i = 0; i < T; ++i) pos[i] = (int32_t)i;
+    if (N > 0) std::memcpy(tok + T, j.req->neg_tokens.data(), (size_t)N * 4);
+    /* A left-padded encoder's prompt ends at text_left_pad - 1. */
+    const int64_t lp = decl_.text_left_pad;
+    for (int64_t i = 0; i < T; ++i) pos[i] = (int32_t)(lp > 0 ? lp - T + i : i);
+    for (int64_t i = 0; i < N; ++i) pos[T + i] = (int32_t)(lp > 0 ? lp - N + i : i);
     int32_t* cu = hptr<int32_t>(R_CU);
     cu[0] = 0;
     cu[1] = (int32_t)T;
+    cu[2] = (int32_t)(T + N);
+    /* The first frame as the reference's image processor hands it to the VAE: x / 255 * 2 - 1 in
+     * f32, then bf16. */
+    const std::vector<uint8_t>& img = j.req->image;
+    if (!img.empty()) {
+        uint16_t* px = hptr<uint16_t>(R_IMG);
+        for (size_t i = 0; i < img.size(); ++i)
+            px[i] = rad_f32_to_bf16(2.0f * ((float)img[i] / 255.0f) - 1.0f);
+        reg_[R_IMG].used = (int64_t)img.size() * 2;
+    }
     float* tv = hptr<float>(R_TV);
     float* ta = hptr<float>(R_TA);
     for (int32_t i = 0; i < j.sched.steps; ++i) {
         tv[i] = 1.0f - j.sched.sig_v[(size_t)i];
         ta[i] = 1.0f - j.sched.sig_a[(size_t)i];
     }
-    reg_[R_TOK].used = T * 4;
-    reg_[R_POS].used = T * 4;
-    reg_[R_CU].used = 2 * 4;
+    reg_[R_TOK].used = (T + N) * 4;
+    reg_[R_POS].used = (T + N) * 4;
+    reg_[R_CU].used = (N > 0 ? 3 : 2) * 4;
     reg_[R_TV].used = j.sched.steps * 4;
     reg_[R_TA].used = j.sched.steps * 4;
     const RadVideoGeom& g = small_now(j) ? j.geom_small : j.geom;
     stage_geom(j, g, small_now(j) ? j.rows_small : j.rows, 0);
     if (upload() < 0) return nullptr;
-    base_batches(j, g, T, step);
-    for (auto& B : out_) B.gen = RAD_GEN_PASS_VCOND;
+    base_batches(j, g, T + N, step);
+    for (size_t r = 0; r < out_.size(); ++r) {
+        RadBatch& B = out_[r];
+        B.gen = RAD_GEN_PASS_VCOND;
+        B.n_seq = N > 0 ? 2 : 1;
+        B.max_q_len = B.max_q_len_prefill = (int32_t)std::max(T, N);
+        vout_[r].n_neg = (int32_t)N;
+        if (!img.empty()) vout_[r].image = dptr<uint16_t>((int)r, R_IMG);
+    }
+    if (j.auto_len) rb_.assign(1, Readback{ decl_.duration_out, 4, duration_host_ });
     pass_.kind = RAD_GEN_PASS_VCOND;
     pass_.job = j.id;
     return &out_[0];
@@ -691,6 +893,7 @@ const RadBatch* VideoDriver::build_audio(Job& j, int step) {
 const RadBatch* VideoDriver::build_chunk(Job& j, int step) {
     for (int g = 0; g < R_N; ++g) reg_[g].used = 0;
     stage_geom(j, j.geom, j.rows, j.chunk);
+    stage_seed(j);   /* a decoder that denoises draws from the request's seed */
     if (upload() < 0) return nullptr;
     base_batches(j, j.geom, j.dec_rows, step);
     const bool last = j.chunk == j.n_chunks - 1;
@@ -715,6 +918,26 @@ int VideoDriver::done() {
     case RAD_GEN_PASS_VCOND:
         j->cond_done = true;
         j->req->ticket->t_cond_ns = now;
+        if (j->auto_len) {
+            j->auto_len = false;
+            std::string note, why;
+            int32_t n = predicted_chunks((double)duration_host_[0], &note);
+            /* Shaped as at submit, which passed at default_chunks; a longer video than a pass
+             * can carry is shortened until it fits. */
+            const int32_t steps = j->req->steps > 0 ? j->req->steps : (int32_t)decl_.default_steps;
+            const int32_t at_submit = j->n_chunks;
+            while (n > at_submit && shape_job(*j, *j->req, n, steps, &why) < 0) --n;
+            if (n <= at_submit && shape_job(*j, *j->req, n, steps, &why) < 0) {
+                fail_locked(*j, RAD_E_INVAL, why);
+                break;
+            }
+            RAD_INFO("video: the model gives the prompt %d frames (%.2f s)%s", j->geom.frames,
+                     (double)j->geom.frames * decl_.fps_den / decl_.fps_num, note.c_str());
+            VideoEvent e;
+            e.kind = VideoEvent::LENGTH;
+            e.n = j->geom.frames;
+            j->req->ticket->push(std::move(e));
+        }
         break;
     case RAD_GEN_PASS_VSTEP: {
         ++j->step;

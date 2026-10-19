@@ -51,10 +51,49 @@ __device__ __forceinline__ void st8(float* p, const float* f) {
     *(float4*)p = make_float4(f[0], f[1], f[2], f[3]);
     *(float4*)(p + 4) = make_float4(f[4], f[5], f[6], f[7]);
 }
-// Eight per-channel values of an f32 or bf16 vector, its dtype known only at run time.
-__device__ __forceinline__ void ld8w(const void* p, bool f32, int c, float* f) {
-    if (f32) ld8((const float*)p + c, f);
-    else     ld8((const uint16_t*)p + c, f);
+// Four- and two-channel forms of the above, and a chunk of CW (8, 4 or 2) channels through them.
+__device__ __forceinline__ void ld4(const uint16_t* p, float* f) {
+    const uint2 u = *(const uint2*)p;
+    f[0] = bf16w_lo(u.x); f[1] = bf16w_hi(u.x); f[2] = bf16w_lo(u.y); f[3] = bf16w_hi(u.y);
+}
+__device__ __forceinline__ void ld4(const float* p, float* f) {
+    const float4 a = *(const float4*)p;
+    f[0] = a.x; f[1] = a.y; f[2] = a.z; f[3] = a.w;
+}
+__device__ __forceinline__ void st4(uint16_t* p, const float* f) {
+    *(uint2*)p = make_uint2(bf16x2_rne(f[0], f[1]), bf16x2_rne(f[2], f[3]));
+}
+__device__ __forceinline__ void st4(float* p, const float* f) {
+    *(float4*)p = make_float4(f[0], f[1], f[2], f[3]);
+}
+__device__ __forceinline__ void ld2(const uint16_t* p, float* f) {
+    const uint32_t u = *(const uint32_t*)p;
+    f[0] = bf16w_lo(u); f[1] = bf16w_hi(u);
+}
+__device__ __forceinline__ void ld2(const float* p, float* f) {
+    const float2 a = *(const float2*)p;
+    f[0] = a.x; f[1] = a.y;
+}
+__device__ __forceinline__ void st2(uint16_t* p, const float* f) {
+    *(uint32_t*)p = bf16x2_rne(f[0], f[1]);
+}
+__device__ __forceinline__ void st2(float* p, const float* f) {
+    *(float2*)p = make_float2(f[0], f[1]);
+}
+template <int CW, typename T> __device__ __forceinline__ void ldc(const T* p, float* f) {
+    if constexpr (CW == 8) ld8(p, f);
+    else if constexpr (CW == 4) ld4(p, f);
+    else ld2(p, f);
+}
+template <int CW, typename T> __device__ __forceinline__ void stc(T* p, const float* f) {
+    if constexpr (CW == 8) st8(p, f);
+    else if constexpr (CW == 4) st4(p, f);
+    else st2(p, f);
+}
+// CW per-channel values of an f32 or bf16 vector, its dtype known only at run time.
+template <int CW> __device__ __forceinline__ void ldcw(const void* p, bool f32, int c, float* f) {
+    if (f32) ldc<CW>((const float*)p + c, f);
+    else     ldc<CW>((const uint16_t*)p + c, f);
 }
 
 // The volume a request runs at: (T, H, W) and its row count, or false for a geometry the operands
@@ -101,6 +140,11 @@ __device__ __forceinline__ bool volume_of(const int* geom, long long rows, int* 
 // guarded load instead, its last tile running past K), so neither operand's addresses cost vector
 // arithmetic per tile.
 //
+// `tpad` pads the frames other than with zeros (LTX-2's VAE): 1 replicate, the frame clamped into
+// the volume; 2 causal, output frame t's tap dt reading frame max(t + dt - 1 - tpre, 0), so the
+// output has tpre more frames than the input. A neighbour's frame is resolved when its offset is,
+// once a tap.
+//
 // Measured on the R9700 at 300 W, warm, against gemm_nt_bias at bf16 at the same M, N and K = 27
 // cin: 512 -> 512 at 84 x 48 x 37 148 TFLOP/s (the GEMM 146), at 42 x 24 x 37 149 (145). The
 // select-and-pointer form of the gather this replaces ran 136 and 134: its loop issued twice the
@@ -133,13 +177,13 @@ __device__ __forceinline__ unsigned short conv_finish(float acc, float bv, unsig
 
 /* `vec` (host-checked): y, res and the bias take 16-byte accesses at every eight-column boundary.
  * `xrows` bounds the volume the device geometry may name, `xbytes` is x's extent (at most kOob)
- * and `Mcap` bounds the rows written. */
+ * and `Mcap` bounds the rows written; `tpad` and `tpre` as above. */
 template <bool C64, bool RES, bool BF32>
 __global__ __launch_bounds__(kCThreads) R4D_WAVES(6) void conv3d_kernel(
     const unsigned short* __restrict__ X, const unsigned short* __restrict__ Wt,
     const void* __restrict__ bias, const unsigned short* R, unsigned short* C,
     const int* __restrict__ geom, unsigned ldx, unsigned ldr, unsigned ldc, int Mcap, int xrows,
-    unsigned xbytes, int cin, int N, unsigned vec) {
+    unsigned xbytes, int cin, int N, unsigned vec, int tpad, int tpre) {
     typedef r4d_u32x4 U4;
     __shared__ __attribute__((aligned(16))) unsigned char s_a[2][kCBM * kCPB];
 
@@ -147,7 +191,8 @@ __global__ __launch_bounds__(kCThreads) R4D_WAVES(6) void conv3d_kernel(
     long long vol;
     if (!volume_of(geom, xrows, &gT, &gH, &gW, &vol)) return;
     const int HW = gH * gW;
-    const int Mv = vol < (long long)Mcap ? (int)vol : Mcap;
+    const long long ovol = vol + (long long)tpre * HW;
+    const int Mv = ovol < (long long)Mcap ? (int)ovol : Mcap;
 
     const uint32_t tid = threadIdx.x, lane = tid & 31u;
     const uint32_t wave = __builtin_amdgcn_readfirstlane(tid >> 5);
@@ -197,10 +242,14 @@ __global__ __launch_bounds__(kCThreads) R4D_WAVES(6) void conv3d_kernel(
         const int delta = dt * HW + dy * gW + dx;
 #pragma unroll
         for (uint32_t i = 0; i < kCSPT; ++i) {
-            const bool ok = tap < kTaps && (unsigned)(vt[i] + dt) < (unsigned)gT &&
+            int ft = vt[i] + dt;
+            if (tpad == 1) ft = min(max(ft, 0), gT - 1);
+            else if (tpad == 2) ft = max(ft - 1 - tpre, 0);
+            const bool ok = tap < kTaps && vt[i] >= 0 && (unsigned)ft < (unsigned)gT &&
                             (unsigned)(vy[i] + dy) < (unsigned)gH &&
                             (unsigned)(vx[i] + dx) < (unsigned)gW;
-            off[i] = ok ? (uint32_t)(vm[i] + delta) * ldx * 2u + (C64 ? ch * 16u : 0u) : kOob;
+            const int src = tpad ? (ft * gH + vy[i] + dy) * gW + vx[i] + dx : vm[i] + delta;
+            off[i] = ok ? (uint32_t)src * ldx * 2u + (C64 ? ch * 16u : 0u) : kOob;
         }
     };
 
@@ -387,9 +436,9 @@ __device__ __forceinline__ void chan_merge(float& n, float& mean, float& m2, flo
     n = nab;
 }
 
-/* `cpr_log`: log2 of the chunks a row (n / 8, a power of two dividing the block); `gs8` the chunks
- * a group. */
-template <typename TX>
+/* `cpr_log`: log2 of the chunks a row (n / CW, a power of two dividing the block); `gs8` the
+ * chunks a group. A chunk is CW channels: 8, or 4 for groups of 4 channels. */
+template <typename TX, int CW>
 __global__ __launch_bounds__(kT) void gn_part_kernel(const TX* __restrict__ x,
                                                      float* __restrict__ stats, int M, int groups,
                                                      int cpr_log, int gs8, int ldx, int rpp) {
@@ -401,16 +450,16 @@ __global__ __launch_bounds__(kT) void gn_part_kernel(const TX* __restrict__ x,
     const int r0 = p * rpp, r1 = min(M, r0 + rpp);
     float cnt = 0.0f, s1 = 0.0f, s2 = 0.0f, shift = 0.0f;
     for (int r = r0 + slot; r < r1; r += slots) {
-        float v[8];
-        ld8(x + (size_t)r * ldx + c * 8, v);
+        float v[CW];
+        ldc<CW>(x + (size_t)r * ldx + c * CW, v);
         if (cnt == 0.0f) shift = v[0];
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
+        for (int j = 0; j < CW; ++j) {
             const float d = v[j] - shift;
             s1 += d;
             s2 += d * d;
         }
-        cnt += 8.0f;
+        cnt += (float)CW;
     }
     float mean = 0.0f, m2 = 0.0f;
     if (cnt > 0.0f) {
@@ -466,7 +515,7 @@ __global__ __launch_bounds__(kT) void gn_final_kernel(float* __restrict__ stats,
 
 /* `wf`, `bf`: the gain's and bias's dtype is f32; `modk` 0 no modulation, 1 a bf16 row, 2 an f32
  * one. x and y may be the same memory: a thread reads its chunk before it writes it. */
-template <typename TX, typename TY>
+template <typename TX, typename TY, int CW>
 __global__ __launch_bounds__(kT) void gn_apply_kernel(
     const TX* x, TY* y, const void* __restrict__ w, const void* __restrict__ b,
     const void* __restrict__ mod, const float* __restrict__ stats, int M, int n, int cpr_log,
@@ -475,27 +524,27 @@ __global__ __launch_bounds__(kT) void gn_apply_kernel(
     const int tid = threadIdx.x;
     const int r = blockIdx.x * slots + (tid >> cpr_log);
     if (r >= M) return;
-    const int ck = tid & ((1 << cpr_log) - 1), c = ck * 8;
+    const int ck = tid & ((1 << cpr_log) - 1), c = ck * CW;
     const int g = ck / gs8;
     const float mean = stats[2 * g], rstd = stats[2 * g + 1];
-    float v[8], wv[8], bv[8];
-    ld8(x + (size_t)r * ldx + c, v);
-    ld8w(w, wf != 0, c, wv);
-    ld8w(b, bf != 0, c, bv);
+    float v[CW], wv[CW], bv[CW];
+    ldc<CW>(x + (size_t)r * ldx + c, v);
+    ldcw<CW>(w, wf != 0, c, wv);
+    ldcw<CW>(b, bf != 0, c, bv);
 #pragma unroll
-    for (int j = 0; j < 8; ++j) v[j] = (v[j] - mean) * rstd * wv[j] + bv[j];
+    for (int j = 0; j < CW; ++j) v[j] = (v[j] - mean) * rstd * wv[j] + bv[j];
     if (modk) {
-        float sc[8], sf[8];
-        ld8w(mod, modk == 2, c, sc);
-        ld8w(mod, modk == 2, n + c, sf);
+        float sc[CW], sf[CW];
+        ldcw<CW>(mod, modk == 2, c, sc);
+        ldcw<CW>(mod, modk == 2, n + c, sf);
 #pragma unroll
-        for (int j = 0; j < 8; ++j) v[j] = v[j] * (1.0f + sc[j]) + sf[j];
+        for (int j = 0; j < CW; ++j) v[j] = v[j] * (1.0f + sc[j]) + sf[j];
     }
     if (silu) {
 #pragma unroll
-        for (int j = 0; j < 8; ++j) v[j] = v[j] / (1.0f + expf(-v[j]));
+        for (int j = 0; j < CW; ++j) v[j] = v[j] / (1.0f + expf(-v[j]));
     }
-    st8(y + (size_t)r * ldy + c, v);
+    stc<CW>(y + (size_t)r * ldy + c, v);
 }
 
 // ---------------------------------------------------------------------------- tconv_dw
@@ -720,6 +769,15 @@ extern "C" int r4d_rad_conv3d_ndhwc(const RadArgs* a, RadStream stream) {
     if (r4d_numel(w) < cout * K || r4d_numel(b) < cout || r4d_numel(geom) < 3)
         return R4D_NO(RAD_E_SHAPE);
     if (!r4d_contig(w) || !r4d_contig(b) || !r4d_contig(geom)) return R4D_NO(RAD_E_STRIDE);
+    const char* tp = r4d_gets(a, "tpad");
+    int tpad = 0;
+    if (tp && *tp) {
+        if (!std::strcmp(tp, "replicate")) tpad = 1;
+        else if (!std::strcmp(tp, "causal")) tpad = 2;
+        else if (std::strcmp(tp, "zero")) return R4D_NO(RAD_E_INVAL);
+    }
+    const long long tpre = r4d_geti_or(a, "tpre", 0);
+    if (tpre < 0 || tpre > 64 || (tpre && tpad != 2)) return R4D_NO(RAD_E_INVAL);
     long long rx = 0, ldx = 0, ry = 0, rr = 0;
     if (!rows8(x, cin, &rx, &ldx) || !r4d_aligned(r4d_p(w), 16)) return R4D_NO(RAD_E_STRIDE);
     const long long ldy = r4d_rows_pitch(y, cout, &ry);
@@ -747,7 +805,8 @@ extern "C" int r4d_rad_conv3d_ndhwc(const RadArgs* a, RadStream stream) {
 #define C3_L(C6, RS, BF)                                                                          \
     return R4D_EMIT(stream, (conv3d_kernel<C6, RS, BF>), grid, dim3(kCThreads), 0, Xp, Wp, Bp, Rp, \
                     Cp, (const int*)r4d_p(geom), (unsigned)ldx, (unsigned)ldr, (unsigned)ldy,      \
-                    (int)Mcap, (int)rx, (unsigned)xbytes, (int)cin, (int)cout, vec)
+                    (int)Mcap, (int)rx, (unsigned)xbytes, (int)cin, (int)cout, vec, tpad,         \
+                    (int)tpre)
 #define C3_RES(C6, BF) do { if (res) C3_L(C6, true, BF); C3_L(C6, false, BF); } while (0)
 #define C3_BF(C6) do { if (bf32) C3_RES(C6, true); C3_RES(C6, false); } while (0)
     if (c64) C3_BF(true);
@@ -774,12 +833,14 @@ extern "C" int r4d_rad_group_norm(const RadArgs* a, RadStream stream) {
         if (!std::strcmp(act, "silu")) silu = 1;
         else if (std::strcmp(act, "none")) return R4D_NO(RAD_E_INVAL);
     }
-    /* A thread an 8-channel chunk inside one group, a row's chunks a power of two dividing the
-     * 256-thread block. */
-    const int cpr_log = (n > 0 && !(n & 7)) ? log2_exact(n / 8) : -1;
-    if (cpr_log < 0 || n / 8 > kT || groups <= 0 || groups > kT || n % groups ||
-        (n / groups) % 8)
+    /* A thread a chunk of CW channels inside one group (8; 4 for groups of 4 channels, the
+     * FLUX.2 VAE's 128 channels in 32 groups; 2 for groups of 2), a row's chunks a power of two
+     * dividing the 256-thread block. */
+    if (groups <= 0 || groups > kT || n <= 0 || n % groups || (n / groups) % 2)
         return R4D_NO(RAD_E_SHAPE);
+    const int CW = (n / groups) % 8 == 0 ? 8 : (n / groups) % 4 == 0 ? 4 : 2;
+    const int cpr_log = log2_exact(n / CW);
+    if (cpr_log < 0 || n / CW > kT) return R4D_NO(RAD_E_SHAPE);
     if (r4d_numel(w) < n || r4d_numel(b) < n || (mod && r4d_numel(mod) < 2 * n) ||
         r4d_numel(st) < groups * (2 + 3 * kGnParts))
         return R4D_NO(RAD_E_SHAPE);
@@ -797,29 +858,36 @@ extern "C" int r4d_rad_group_norm(const RadArgs* a, RadStream stream) {
     long long rpp = (M + kGnParts - 1) / kGnParts;
     rpp = (rpp + slots - 1) / slots * slots;
     const int parts = (int)((M + rpp - 1) / rpp);
-    const int gs8 = (int)(n / groups / 8);
+    const int gs8 = (int)(n / groups / CW);
     float* S = (float*)r4d_wp(st);
     const float eps = (float)r4d_getf(a, "eps", 1e-5);
     int rc;
-    if (is_f32(x))
-        rc = R4D_EMIT(stream, gn_part_kernel<float>, dim3((unsigned)parts), dim3(kT), 0,
-                      (const float*)r4d_p(x), S, (int)M, (int)groups, cpr_log, gs8, (int)ldx,
-                      (int)rpp);
-    else
-        rc = R4D_EMIT(stream, gn_part_kernel<uint16_t>, dim3((unsigned)parts), dim3(kT), 0,
-                      (const uint16_t*)r4d_p(x), S, (int)M, (int)groups, cpr_log, gs8, (int)ldx,
-                      (int)rpp);
+#define GN_P(TX, C4)                                                                              \
+    rc = R4D_EMIT(stream, (gn_part_kernel<TX, C4>), dim3((unsigned)parts), dim3(kT), 0,           \
+                  (const TX*)r4d_p(x), S, (int)M, (int)groups, cpr_log, gs8, (int)ldx, (int)rpp)
+    if (is_f32(x)) {
+        if (CW == 8)      GN_P(float, 8);
+        else if (CW == 4) GN_P(float, 4);
+        else              GN_P(float, 2);
+    } else {
+        if (CW == 8)      GN_P(uint16_t, 8);
+        else if (CW == 4) GN_P(uint16_t, 4);
+        else              GN_P(uint16_t, 2);
+    }
+#undef GN_P
     if (rc != RAD_OK) return R4D_NO(rc);
     rc = R4D_EMIT(stream, gn_final_kernel, dim3((unsigned)groups), dim3(kT), 0, S, (int)groups,
                   parts, eps);
     if (rc != RAD_OK) return R4D_NO(rc);
     const int modk = !mod ? 0 : is_f32(mod) ? 2 : 1;
     const dim3 grid((unsigned)((M + slots - 1) / slots));
-#define GN_A(TX, TY)                                                                              \
-    return R4D_EMIT(stream, (gn_apply_kernel<TX, TY>), grid, dim3(kT), 0, (const TX*)r4d_p(x),    \
+#define GN_A2(TX, TY, C4)                                                                         \
+    return R4D_EMIT(stream, (gn_apply_kernel<TX, TY, C4>), grid, dim3(kT), 0, (const TX*)r4d_p(x),\
                     (TY*)r4d_wp(y), r4d_p(w), r4d_p(b), r4d_p(mod), (const float*)S, (int)M,      \
                     (int)n, cpr_log, gs8, (int)ldx, (int)ldy, (int)is_f32(w), (int)is_f32(b),     \
                     modk, silu)
+#define GN_A(TX, TY)                                                                              \
+    do { if (CW == 8) GN_A2(TX, TY, 8); if (CW == 4) GN_A2(TX, TY, 4); GN_A2(TX, TY, 2); } while (0)
     if (is_f32(x)) {
         if (is_f32(y)) GN_A(float, float);
         GN_A(float, uint16_t);
@@ -827,6 +895,7 @@ extern "C" int r4d_rad_group_norm(const RadArgs* a, RadStream stream) {
     if (is_f32(y)) GN_A(uint16_t, float);
     GN_A(uint16_t, uint16_t);
 #undef GN_A
+#undef GN_A2
 }
 
 /* ------------------------------------------------------------------ tconv_dw */

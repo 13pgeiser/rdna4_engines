@@ -19,5 +19,7 @@
 // the pages at 4 (RadKVGroupDecl takes the block size from the resolved kernel). A row saying 16
 // here would refuse at issue rather than at declare.
 #define G8_BLOCK_SIZE 4
+// The fp8_v4 and k6_v4 caches (--kv-cache-dtype), which qwen4exp_fp8 offers for these layers.
+#define R4D_ATTN_V4   1
 
 #include "r4d_attn_paged_gqa8.hip"

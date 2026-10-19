@@ -125,10 +125,7 @@ HttpResponse Server::handle_stats(const HttpRequest&) {
     o["model"]     = opt_.model_id;
     o["version"]   = opt_.version;
     o["uptime_s"]  = unix_now() - started_at_;
-    /* How long this process took to come up, measured on this machine. Raw figure: a restart's
-     * real cost, for whoever is deciding whether one is worth it. 0 before the server listens.
-     * The page no longer consumes it -- see the note on the decode-step detail line for why the
-     * payback arithmetic that used to live there was removed. */
+    /* Seconds this process took to come up, the cost of a restart; 0 before the server listens. */
     o["startup_s"] = startup_s_;
     o["in_flight"] = in_flight_.load(std::memory_order_relaxed);
     o["queue_cap"] = queue_depth_;
@@ -1363,31 +1360,18 @@ for (const k of METRICS) {
  * is for is the variation, and the number above it already states the level -- scaled from zero
  * every steady state is a flat line on the floor. No variation draws down the middle.
  *
- * THE ENDS OF THAT RANGE ARE PERCENTILES, not the extremes. On a min/max axis one rare spike
- * owns the whole box and the typical variation is squeezed into a couple of pixels: measured over
- * real /stats samples, prefill sits at zero on a third of polls and spikes past 4,000 on the rest,
- * which leaves its middle band 0.1px of the 15px available -- a flat line for a metric that is
- * anything but. Taking the 5th and 95th percentiles and clamping to them gives the ordinary
- * movement the height it was being denied (the same samples' middle band rises 1.2x to 3.9x
- * depending on the metric). The cost is stated rather than hidden: a spike beyond the 95th now
- * draws pinned to the top of the box instead of towering over the line, so the box shows how the
- * metric has been behaving and not how bad its worst poll was. The number above still carries the
- * level, and the detail line still carries the extremes.
- *
- * THE INSET IS ONE UNIT, not two and three. The stroke is 1.25 units wide, so a half-unit of
- * clearance keeps it off the edge of the box; the extra it used to leave was a fifth of the
- * height spent on nothing, and on a 17px box that is the difference between a line that moves
- * and one that merely shifts. */
+ * The ends of the range are the 5th and 95th percentiles, not the extremes: on a min/max axis one
+ * rare spike owns the box and the typical variation is squeezed into a pixel. A spike past the
+ * 95th draws pinned to the top; the number above carries the level and the detail line the
+ * extremes. The stroke is 1.25 units wide, so a one-unit inset keeps it off the edge. */
 function spark(key, vals) {
   const s = M[key], w = 200, h = 22;
   if (vals.length < 3) { s.line.setAttribute("d", ""); return; }
   const q = (sorted, p) => sorted[Math.min(sorted.length - 1, Math.floor(p * (sorted.length - 1)))];
   const sorted = [...vals].sort((a, b) => a - b);
   let lo = q(sorted, 0.05), hi = q(sorted, 0.95);
-  /* WHEN THE PERCENTILES COLLAPSE, fall back to the extremes. If nine tenths of the window holds
-   * one value, the 5th and 95th land on it and carry nothing -- and a metric that is constant
-   * apart from rare spikes has those spikes as its ONLY news, so pinning them outside the axis
-   * would draw a flat line where the old axis at least showed them. */
+  /* A window that is one value apart from rare spikes puts both percentiles on that value; the
+   * extremes then serve, so the spikes still show. */
   if (!(hi > lo)) { lo = sorted[0]; hi = sorted[sorted.length - 1]; }
   const span = hi - lo;
   const dx = w / (vals.length - 1);
@@ -1686,34 +1670,15 @@ function renderRequests(list, poolTokens) {
 let prev = null, prevAt = 0, bars = [], devs = [], layerBars = [];
 let lastStepMs = null, lastTps = null;
 
-/* THE SINGLE-STREAM FLOOR and the engine's most recent window, shown as two numbers and
- * interpreted by nobody. The engine records the fastest single-sequence decode window it has
- * measured (step_ns_decode_best) and its most recent one (step_ns_decode_recent); the page states
- * both and draws no conclusion. Neither is asked of a human: a typed ruler goes stale and
- * mis-advises silently, and a browser meter sees only the steps taken while this tab is open. On
- * an engine too old to emit the floor, the page falls back to the fastest single-stream step this
- * tab has seen.
- *
- * THERE IS DELIBERATELY NO RESTART ADVICE HERE, and it was not never-built -- it was built,
- * deployed, measured, and removed the same day (2026-10-18). It compared the floor against the
- * recent window, called the gap drift, and priced a payback from startup_s. The gap is not drift.
- * On a HEALTHY shared lane the floor sat flat at 14.79 ms while the recent window moved between
- * 15.2 and 16.5 ms -- 3% to 11% -- tracking what else the lane was doing: it froze when the lane
- * went idle and ROSE on a fresh short request, so it was neither context length nor engine age.
- * The payback formula assumes a restart's improvement is permanent, so acting on it pays the 49 s
- * bringup and re-drifts within minutes; the line was telling the operator to restart every 12-19
- * minutes forever, for a gain that was never there. What best-vs-recent actually measures is the
- * distance between the lane's most favorable moment and its typical one.
- *
- * A verdict could go back here IF someone first observes the thing none of today's data shows:
- * step time rising with ENGINE AGE and STAYING up. Every excursion seen so far was load. The
- * full chain, including the estimator that survives this, is in patches/CHANGELOG-SOURCE.md. */
+/* The single-stream floor and the engine's most recent window, shown as two numbers with no
+ * verdict. The engine records the fastest single-sequence decode window it has measured
+ * (step_ns_decode_best) and its most recent one (step_ns_decode_recent). Their gap is not engine
+ * drift: on a healthy lane the recent window moves 3-11% above a flat floor with whatever else the
+ * lane is doing, so a restart priced against it would not pay back. Until the engine's first
+ * window completes, the fastest single-stream step this tab has seen stands in. */
 let c1hist = [];
 const C1CAP = 7200;                       /* an hour at 2 polls/s of single-stream samples */
-let bestEver = 0;                         /* the best engine floor ever seen here, across restarts */
-try { bestEver = parseFloat(localStorage.getItem("radiance.c1best")) || 0; } catch (e) {}
 const bestAt = {};                        /* fastest step seen at each concurrency, this process */
-
 
 function update(s, dt) {
   $("ver").textContent = s.version + "  ·  up " + dur(s.uptime_s);
@@ -1734,35 +1699,21 @@ function update(s, dt) {
   M.step.u.textContent = st.u;
   setMetric("step",    lastStepMs,    st.n);
 
-  /* THE FLOOR, single-stream on both sides of the engine's own measurement. The floor is a
- * single-sequence window, so the engine keys it to one row deliberately: a decode step at eight
- * sequences is a different measurement, and reading it against a single-sequence floor would
- * report a batch arriving as a slowdown. */
+  /* Single-stream steps only: the floor is a single-sequence window, and a batched step read
+   * against it would report a batch arriving as a slowdown. */
   if (s.running === 1 && stepMs != null) { c1hist.push(stepMs); if (c1hist.length > C1CAP) c1hist.shift(); }
   const engBestMs = s.step_ns_decode_best > 0 ? s.step_ns_decode_best / 1e6 : 0;
   const engRecentMs = s.step_ns_decode_recent > 0 ? s.step_ns_decode_recent / 1e6 : 0;
-  if (engBestMs > 0 && (bestEver === 0 || engBestMs < bestEver)) {
-    bestEver = engBestMs;
-    try { localStorage.setItem("radiance.c1best", String(bestEver)); } catch (e) {}
-  }
   const floorMs = engBestMs > 0 ? engBestMs : (c1hist.length ? Math.min(...c1hist) : 0);
-  /* The two engine figures, stated plainly. Painted every poll: without a verdict there is
-   * nothing for a fast repaint to make unactionable, and `recent` only moves when a window of 32
-   * single-sequence steps completes anyway. */
   let det = "";
   if (floorMs > 0) {
     det = "best " + floorMs.toFixed(2) + "ms";
     if (engRecentMs > 0) det += " · recent " + engRecentMs.toFixed(2) + "ms";
   }
-  /* THE STEP AS A PERCENTAGE OF THE FASTEST THIS PROCESS HAS DONE AT THIS CONCURRENCY: ~99% is the fastest the lane has done, anything slower a percentage of it. Keyed by
- * concurrency on purpose: a c8 step read against the single-stream floor would report the batch
- * arriving as a slowdown -- the mistake that took the old drift line out. Raw ratio, no
- * threshold, no colour: the number is the statement. Capped at ~99 (shown with a tilde): `now` is a ~500 ms poll mean while
- * `best` is a 32-step window mean, so a fast stretch shorter than a window can read faster than the
- * recorded floor. That is "at your best", not a new record -- the engine only ratchets the floor on a
- * completed 32-step window, and a sub-window blip is not one. The cap is 99, not 100: a 500 ms window that briefly beats the
- * floor is not a sustained record, and 100% would claim a floor the window cannot confirm -- it
- * would read as a bug. ~99% says "at your best" without overclaiming. */
+  /* The step as a percentage of the fastest at this concurrency (`@cN` above one). `now` is a
+   * ~500 ms poll mean and `best` a 32-step window mean, so a short fast stretch can beat the
+   * floor; the figure is capped at 99 and shown as ~99, "at the best", rather than claiming a
+   * record the window cannot confirm. */
   if (s.running > 0 && lastStepMs != null) {
     const k = s.running;
     if (!(k in bestAt) || lastStepMs < bestAt[k]) bestAt[k] = lastStepMs;

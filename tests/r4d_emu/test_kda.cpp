@@ -1,15 +1,19 @@
-/* tests/r4d_emu: kda_update (r4d_kda.hip) on the host SIMT emulator. Every row and prefetch form
- * must give the old one-row kernel's output and whole state buffer bit for bit, in all four modes:
- * prefill per candidate and anchored, verify per candidate and anchored (after the replay of the
- * accepted prefix). Cold starts, an unseated sequence, an empty sequence and an unwritten slot
- * are mixed in. The GPU check of the same claim is r4d_selftest's kda_forms. */
+/* tests/r4d_emu: kda_update (r4d_kda.hip) on the host SIMT emulator, held to libref's kda_update
+ * (from $RADIANCE_HOME, which ctest sets) over the output and the whole state buffer, in all four
+ * modes: prefill per candidate and anchored, verify per candidate and anchored (after the replay
+ * of the accepted prefix). Cold starts, an unseated sequence, an empty sequence and an unwritten
+ * slot are mixed in, so a byte the reference leaves alone must stay as it was. The kernel's lane
+ * reductions sum in another order than libref's loops: f32 state within 2e-5 + 2e-5 |x|, bf16
+ * output within one rounding step. */
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "r4d_plugin.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <random>
 #include <string>
 #include <vector>
@@ -33,6 +37,32 @@ static uint16_t f2b(float f) {
     return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 
+/* libref's kda_update, through the plugin's own exports, or null. */
+static RadLaunchFn load_libref() {
+    const char* home = std::getenv("RADIANCE_HOME");
+    if (!home || !*home) return nullptr;
+    const std::string p = std::string(home) + "/kernels/libref.so";
+    void* h = dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!h) return nullptr;
+    auto open = (int (*)(void))dlsym(h, "rad_plugin_open"); /* as the loader does */
+    if (open && open() < 0) return nullptr;
+    auto cnt = (int (*)(void))dlsym(h, "rad_kernel_count");
+    auto at = (const RadKernelInfo* (*)(int))dlsym(h, "rad_kernel_at");
+    if (!cnt || !at) return nullptr;
+    for (int i = 0; i < cnt(); ++i) {
+        const RadKernelInfo* k = at(i);
+        if (k && k->op && !std::strcmp(k->op, "kda_update")) return k->launch;
+    }
+    return nullptr;
+}
+
+static float bf16_value(uint16_t b) {
+    const uint32_t u = (uint32_t)b << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
 struct Case {
     const char* name;
     const char* mode;
@@ -43,6 +73,11 @@ struct Case {
 };
 
 int main() {
+    const RadLaunchFn reference = load_libref();
+    if (!reference) {
+        std::printf("FAIL libref's kda_update not loadable (set RADIANCE_HOME)\n");
+        return 1;
+    }
     std::mt19937 rng(41);
     std::uniform_real_distribution<float> u(-1.f, 1.f);
     const int64_t H = 2, D = 128, slots = 16, tokens = 9;
@@ -93,12 +128,6 @@ int main() {
           { 1, 1, 0 },
           { { 5, 4.f }, { 6, 3.f }, { 7, 0.f } } },
     };
-    struct Form {
-        const char* rows;
-        const char* prefetch;
-    };
-    const Form forms[] = { { "1", "1" }, { "2", "1" }, { "4", "1" },
-                           { "1", "0" }, { "2", "0" }, { "4", "0" } };
     int fails = 0, checks = 0;
     for (const Case& c : cases) {
         std::vector<float> start = state0;
@@ -106,7 +135,7 @@ int main() {
             for (int64_t h = 0; h < H; ++h) start[(size_t)((sc.first * H + h) * D * D)] = sc.second;
         const int64_t seqs = (int64_t)c.cu.size() - 1;
         std::vector<int> idx = c.idx, cu = c.cu, acc = c.accepted, init = c.init;
-        auto run = [&](std::vector<uint16_t>& out, std::vector<float>& state) {
+        auto run = [&](RadLaunchFn launch, std::vector<uint16_t>& out, std::vector<float>& state) {
             out.assign((size_t)(tokens * H * D), 0x7777);
             state = start;
             RadTensor t[13] = { tens(in[0].data(), RAD_BF16, { tokens, H, D }),
@@ -149,39 +178,40 @@ int main() {
             a.n_t = 13;
             a.p = p;
             a.n_p = 9;
-            return r4d_rad_kda_update(&a, nullptr);
+            return launch(&a, nullptr);
         };
         std::vector<uint16_t> ref_out, out;
         std::vector<float> ref_state, state;
-        setenv("RADIANCE_KDA_FORM", "old", 1);
-        if (run(ref_out, ref_state) != RAD_OK) {
-            std::printf("FAIL %s: old form refused\n", c.name);
+        ++checks;
+        if (run(reference, ref_out, ref_state) != RAD_OK ||
+            run(r4d_rad_kda_update, out, state) != RAD_OK) {
+            std::printf("FAIL %s: refused\n", c.name);
             ++fails;
             continue;
         }
-        unsetenv("RADIANCE_KDA_FORM");
         bool written = false;
         for (size_t i = 0; i < ref_out.size(); ++i) written = written || ref_out[i] != 0x7777;
-        if (!written) {
-            std::printf("FAIL %s: the old form wrote no output\n", c.name);
-            ++fails;
+        size_t bad = 0;
+        double out_err = 0, state_err = 0;
+        for (size_t i = 0; i < out.size(); ++i) {
+            if (out[i] == ref_out[i]) continue;
+            const float x = bf16_value(out[i]), y = bf16_value(ref_out[i]);
+            const double e = std::fabs((double)x - y);
+            out_err = std::max(out_err, e);
+            if (!std::isfinite(x) || ref_out[i] == 0x7777 || out[i] == 0x7777 ||
+                e > 1e-6 + 0.008 * std::fabs(y))
+                ++bad;
         }
-        for (const Form& f : forms) {
-            setenv("RADIANCE_KDA_ROWS", f.rows, 1);
-            setenv("RADIANCE_KDA_PREFETCH", f.prefetch, 1);
-            ++checks;
-            const bool same = run(out, state) == RAD_OK && out == ref_out &&
-                              std::memcmp(state.data(), ref_state.data(), state.size() * 4) == 0;
-            if (!same) {
-                ++fails;
-                std::printf("FAIL %s, %s rows a wave, prefetch %s: differs from the old form\n",
-                            c.name, f.rows, f.prefetch);
-            }
+        for (size_t i = 0; i < state.size(); ++i) {
+            if (state[i] == ref_state[i]) continue;
+            const double e = std::fabs((double)state[i] - ref_state[i]);
+            state_err = std::max(state_err, e);
+            if (!std::isfinite(state[i]) || e > 2e-5 + 2e-5 * std::fabs(ref_state[i])) ++bad;
         }
-        unsetenv("RADIANCE_KDA_ROWS");
-        unsetenv("RADIANCE_KDA_PREFETCH");
+        std::printf("%-24s output max %.3g, state max %.3g%s\n", c.name, out_err, state_err,
+                    !written ? "  NO OUTPUT" : bad ? "  FAIL" : "");
+        if (!written || bad) ++fails;
     }
-    std::printf("kda_update forms against the old kernel: %d of %d bit-identical\n", checks - fails,
-                checks);
+    std::printf("kda_update against libref: %d of %d within bounds\n", checks - fails, checks);
     return fails ? 1 : 0;
 }

@@ -75,6 +75,7 @@ private:
         bool     have_kv = false;
         bool     encoded = false;
         std::vector<int32_t> rope_img;   /* [3, image tokens]: the image's rows at this sequence */
+        std::vector<float>   rope_img_f; /* JOINT_STEP: [4, image tokens] */
     };
     struct Job {
         uint64_t id = 0;
@@ -117,7 +118,7 @@ private:
     struct Region { int64_t off = 0, bytes = 0, used = 0; };
     enum { R_TOK, R_POS, R_ROPE, R_CU, R_MMROW, R_ENCPIX, R_ENCCRD, R_ENCCU, R_SRC, R_GROPE,
            R_SEG, R_SLOT, R_PX, R_MASK, R_SIG, R_SIGN, R_CFG, R_PAIR, R_LANE, R_FLAGS, R_SEED,
-           R_BT, R_USED, R_N };
+           R_BT, R_USED, R_ROPEF, R_ICU, R_IROWS, R_MCU, R_VCU, R_MROWS, R_MSRC, R_MCCU, R_MROPE, R_N };
 
     int  layout_regions();
     template <class T> T* hptr(int r) const { return reinterpret_cast<T*>(host_ + reg_[r].off); }
@@ -132,6 +133,13 @@ private:
     void release_locked(Job& j);
     void fail_locked(Job& j, int status, const std::string& why);
     Job* job_locked(uint64_t id);
+
+    /* The JOINT_STEP layout: the conditioning rides in every denoising entry, and no KV. */
+    bool joint() const { return decl_.layout == RAD_GEN_LAYOUT_JOINT_STEP; }
+    /* An entry's rows in a denoising pass. */
+    int64_t entry_rows(const Job& j, int branch) const {
+        return j.tokens + (joint() ? j.cond[branch].lay.rows : 0);
+    }
 
     const RadBatch* build_cond(Job& j, int branch, int step);
     const RadBatch* build_denoise(const std::vector<int32_t>& lanes, int step);
@@ -162,6 +170,7 @@ private:
     Pass                         pass_;
     /* Host arrays a COND pass's plugin reads on the host (RadGenBatch's _h fields). */
     std::vector<int32_t>         host_bidi_, host_px_, host_lanes_;
+    int64_t                      host_nmode_[3] = { 0, 0, 0 };
 
     mutable std::mutex           mu_;
     std::deque<std::unique_ptr<Job>> jobs_;  /* arrival order */

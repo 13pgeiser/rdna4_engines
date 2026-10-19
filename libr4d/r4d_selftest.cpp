@@ -944,11 +944,12 @@ static void attn_oracle_one(const uint16_t* qh, const uint8_t* kv, int kv_is_fp8
  * compare the bf16 output against the oracle above. A negative control corrupts part of the
  * reference and requires the comparison to fail. */
 static void attn_numeric_case(const Plugin& pl, const char* name, int64_t head_dim, int64_t gqa,
-                              int64_t q_len, const char* kv_dtype, int window, int64_t ctx = 64) {
+                              int64_t q_len, const char* kv_dtype, int window, int64_t ctx = 64,
+                              int64_t bs = 16) {
     if (!sel(name)) return;
     const RadKernelInfo* r = find(pl, name);
     if (!r) { ok(name, false, "row absent"); return; }
-    const int64_t seqs = 1, kv_heads = 2, bs = 16;
+    const int64_t seqs = 1, kv_heads = 2;
     const int64_t q_heads = kv_heads * gqa;
     const int64_t max_blocks = (ctx + bs - 1) / bs;   /* a ctx past a whole block: a partial last one */
     const int64_t total_q = seqs * q_len;
@@ -2671,9 +2672,12 @@ static void rowtopk_shard_case(const Plugin& pl) {
  * zero scale group and a scale of 1. The E4M3 cache is random bytes except NaN codes, the bf16 one
  * random finite values, and the descales are not 1.
  *
- * `i8` runs both at int8 codes (the operand an int8 out projection reads), with the same claim. */
-static void attn_gq_fold_case(const Plugin& pl, int64_t S, bool bf16, bool i8 = false) {
-    const std::string kvs = bf16 ? "bf16kv" : "fp8kv";
+ * `i8` runs both at int8 codes (the operand an int8 out projection reads), with the same claim.
+ * `kvq` 1 or 2 runs them over an fp8_v4 or k6_v4 cache instead of the E4M3 one: random codes with
+ * finite f16 group scales. */
+static void attn_gq_fold_case(const Plugin& pl, int64_t S, bool bf16, bool i8 = false,
+                              int kvq = 0) {
+    const std::string kvs = bf16 ? "bf16kv" : kvq == 1 ? "fp8v4" : kvq == 2 ? "k6v4" : "fp8kv";
     const std::string fold = "attn_decode_gq_h256_gqa12_" + kvs;
     const std::string pair = "attn_decode_h256_gqa12_" + kvs;
     if (!sel(fold.c_str())) return;
@@ -2701,7 +2705,10 @@ static void attn_gq_fold_case(const Plugin& pl, int64_t S, bool bf16, bool i8 = 
     std::vector<uint16_t> hq((size_t)(S * nq * hd)), hqg((size_t)(S * nq * 2 * hd));
     for (auto& x : hq)  x = h_to_bf16(rnd(2.0f));
     for (auto& x : hqg) x = h_to_bf16(rnd(6.0f));
-    const size_t cbytes = (size_t)(nb * nkv * bs * 2 * hd) * (bf16 ? 2 : 1);
+    /* A token's row in a page: 2 * head_dim elements, or the v4 layouts' 25 / 22 * head_dim / 16
+     * bytes (RadBuildCtx::kv_quant). */
+    const int64_t rowb = kvq == 2 ? 22 * hd / 16 : kvq == 1 ? 25 * hd / 16 : 2 * hd;
+    const size_t cbytes = (size_t)(nb * nkv * bs * rowb) * (bf16 ? 2 : 1);
     std::vector<uint8_t> hc(cbytes);
     if (bf16) {
         for (size_t i = 0; i + 1 < cbytes; i += 2) {
@@ -2713,6 +2720,18 @@ static void attn_gq_fold_case(const Plugin& pl, int64_t S, bool bf16, bool i8 = 
             x = (uint8_t)(rnd(128.0f) + 128.0f);
             if ((x & 0x7f) == 0x7f) x ^= 1;                        /* E4M3's NaN codes */
         }
+        /* The group scales: K's (k6_v4) and V's, finite and positive. */
+        const int64_t vs = kvq == 2 ? hd * 21 / 16 : hd * 3 / 2, ks = hd * 5 / 4;
+        if (kvq)
+            for (size_t r0 = 0; r0 < cbytes; r0 += (size_t)rowb)
+                for (int64_t g = 0; g < hd / 32; ++g) {
+                    const _Float16 v = (_Float16)(0.03125f * (1.0f + (rnd(1.0f) + 1.0f) * 2.0f));
+                    std::memcpy(&hc[r0 + (size_t)(vs + g * 2)], &v, 2);
+                    if (kvq == 2) {
+                        const _Float16 k = (_Float16)(0.0078125f * (1.0f + (rnd(1.0f) + 1.0f) * 2.0f));
+                        std::memcpy(&hc[r0 + (size_t)(ks + g * 2)], &k, 2);
+                    }
+                }
     }
     std::vector<float> hds((size_t)(S * nkv));
     for (auto& x : hds) x = 0.75f + 0.5f * (rnd(1.0f) + 1.0f) * 0.5f;
@@ -2741,7 +2760,7 @@ static void attn_gq_fold_case(const Plugin& pl, int64_t S, bool bf16, bool i8 = 
     auto attn_ops = [&](void* out) {
         return std::vector<RadTensor>{
             T(d_q, RAD_BF16, { S, nq, hd }),
-            T(d_c, bf16 ? RAD_BF16 : RAD_F8E4M3, { nb, nkv, bs, 2 * hd }),
+            T(d_c, bf16 ? RAD_BF16 : RAD_F8E4M3, { nb, nkv, bs, rowb }),
             TI32({ S, maxb }, table),
             TI32({ S }, used),
             T(d_kd, RAD_F32, { S, nkv }),
@@ -2752,7 +2771,7 @@ static void attn_gq_fold_case(const Plugin& pl, int64_t S, bool bf16, bool i8 = 
     std::vector<RadParam> pa = {
         PI("q_len", 1), PI("head_dim", hd), PI("gqa", nq / nkv), PI("block_size", bs),
         PI("causal", 1), PI("window", 0), PS("q_dtype", "bf16"),
-        PS("kv_dtype", bf16 ? "bf16" : "fp8_e4m3"),
+        PS("kv_dtype", bf16 ? "bf16" : kvq == 1 ? "fp8_v4" : kvq == 2 ? "k6_v4" : "fp8_e4m3"),
         PI("n_head", nq), PI("max_seqs", S), PI("max_ctx", maxb * bs),
     };
 
@@ -6807,6 +6826,1186 @@ void snake_aa_cases(const Plugin& pl) {
 
 }  /* namespace vid */
 
+/* ================================================================== the joint image generators
+ * Krea 2's and FLUX.3's ops: table_add, mix_rows, chan_stats, attn_cross, rms_mod's zero-centred
+ * and LayerNorm forms, timestep_embed's bf16 roundings and the wide attention at 384 and 512, each
+ * against the host's arithmetic in libref's order. */
+namespace g3 {
+
+using namespace au;
+
+/* y[r, l n + c] = x[r, c] + t[l, c]: exact, x at a wider pitch, y a column slice. */
+void table_add_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "table_add_bf16");
+    if (!r) { ok("table_add_bf16", false, "row absent"); return; }
+    const int64_t M = 3, n = 6144 * 6, L = 1, xld = n + 64, yld = 28 * n;
+    std::vector<float> x = randv((size_t)(M * xld), 1.0f), t = randv((size_t)(L * n), 0.5f);
+    for (float& v : x) v = bfr(v);
+    for (float& v : t) v = bfr(v);
+    RadTensor tx = T(up_bf16(x), RAD_BF16, { M, n });
+    tx.stride[0] = xld;
+    void* dy = dalloc((size_t)(M * yld) * 2);
+    RadTensor ty = T((char*)dy + 5 * n * 2, RAD_BF16, { M, L * n });
+    ty.stride[0] = yld;
+    const int rc = launch(r, { tx, T(up_bf16(t), RAD_BF16, { L, n }), ty },
+                          { PI("M", M), PI("n", n), PI("L", L), PS("dtype", "bf16") });
+    if (rc != RAD_OK) { ok("table_add_bf16", false, "rc " + std::to_string(rc)); return; }
+    const std::vector<float> all = down_bf16(dy, (size_t)(M * yld));
+    int64_t bad = 0;
+    for (int64_t row = 0; row < M; ++row)
+        for (int64_t c = 0; c < n; ++c)
+            bad += all[(size_t)(row * yld + 5 * n + c)] != bfr(x[(size_t)(row * xld + c)] + t[(size_t)c]);
+    ok("table_add_bf16 one block's table into its columns, exact", bad == 0,
+       fmt("%lld values differ", (long long)bad));
+}
+
+/* y[r, c] = sum_i w[i] x[r k + i, c], twelve taps of 2560. */
+void mix_rows_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "mix_rows_bf16");
+    if (!r) { ok("mix_rows_bf16", false, "row absent"); return; }
+    const int64_t M = 37, n = 2560, k = 12;
+    std::vector<float> x = randv((size_t)(M * k * n), 1.0f), w = randv((size_t)k, 0.3f);
+    for (float& v : x) v = bfr(v);
+    for (float& v : w) v = bfr(v);
+    void* dy = dalloc((size_t)(M * n) * 2);
+    const int rc = launch(r, { T(up_bf16(x), RAD_BF16, { M * k, n }), T(up_bf16(w), RAD_BF16, { k }),
+                               T(dy, RAD_BF16, { M, n }) },
+                          { PI("M", M), PI("n", n), PI("k", k), PS("dtype", "bf16") });
+    if (rc != RAD_OK) { ok("mix_rows_bf16", false, "rc " + std::to_string(rc)); return; }
+    std::vector<float> want((size_t)(M * n));
+    for (int64_t row = 0; row < M; ++row)
+        for (int64_t c = 0; c < n; ++c) {
+            float acc = 0.0f;
+            for (int64_t i = 0; i < k; ++i) acc += w[(size_t)i] * x[(size_t)((row * k + i) * n + c)];
+            want[(size_t)(row * n + c)] = bfr(acc);
+        }
+    check("mix_rows_bf16 twelve taps", down_bf16(dy, want.size()), want, 8e-3);
+}
+
+/* Both modes, a deviation and a variance (FLUX's BatchNorm, eps 1e-4). */
+void chan_stats_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "chan_stats_bf16");
+    if (!r) { ok("chan_stats_bf16", false, "row absent"); return; }
+    const int64_t M = 33, n = 128;
+    for (const bool norm : { false, true })
+        for (const int var : { 0, 1 }) {
+            std::vector<float> x = randv((size_t)(M * n), 2.0f), mu = randv((size_t)n, 0.5f);
+            std::vector<float> sv((size_t)n);
+            for (int64_t c = 0; c < n; ++c) sv[(size_t)c] = bfr(0.3f + 0.02f * (float)c);
+            for (float& v : x) v = bfr(v);
+            for (float& v : mu) v = bfr(v);
+            void* dy = dalloc((size_t)(M * n) * 2);
+            const int rc = launch(r, { T(up_bf16(x), RAD_BF16, { M, n }),
+                                       T(up_bf16(mu), RAD_BF16, { n }),
+                                       T(up_bf16(sv), RAD_BF16, { n }), T(dy, RAD_BF16, { M, n }) },
+                                  { PI("M", M), PI("n", n), PS("mode", norm ? "norm" : "denorm"),
+                                    PI("var", var), PF("eps", 1e-4), PS("dtype", "bf16") });
+            const std::string nm = fmt("chan_stats_bf16 %s var %d", norm ? "norm" : "denorm", var);
+            if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+            std::vector<float> want((size_t)(M * n));
+            for (int64_t row = 0; row < M; ++row)
+                for (int64_t c = 0; c < n; ++c) {
+                    const float sd = var ? bfr(std::sqrt(sv[(size_t)c] + 1e-4f)) : sv[(size_t)c];
+                    const float xv = x[(size_t)(row * n + c)];
+                    want[(size_t)(row * n + c)] = norm ? bfr(bfr(xv - mu[(size_t)c]) / sd)
+                                                       : bfr(bfr(xv * sd) + mu[(size_t)c]);
+                }
+            check(nm, down_bf16(dy, want.size()), want, 8e-3);
+        }
+}
+
+/* The f32 form over bf16 and f32 statistics: exact against the host's f32 steps. */
+void chan_stats_f32_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "chan_stats_f32");
+    if (!r) { ok("chan_stats_f32", false, "row absent"); return; }
+    const int64_t M = 19, n = 128;
+    for (const bool wf32 : { false, true })
+        for (const bool norm : { false, true })
+            for (const int var : { 0, 1 }) {
+                std::vector<float> x = randv((size_t)(M * n), 2.0f), mu = randv((size_t)n, 0.5f);
+                std::vector<float> sv((size_t)n);
+                for (int64_t c = 0; c < n; ++c) sv[(size_t)c] = 0.3f + 0.0137f * (float)c;
+                if (!wf32) {
+                    for (float& v : mu) v = bfr(v);
+                    for (float& v : sv) v = bfr(v);
+                }
+                void* dy = dalloc((size_t)(M * n) * 4);
+                const uint32_t wd = wf32 ? RAD_F32 : RAD_BF16;
+                const int rc = launch(r, { T(up_f32(x), RAD_F32, { M, n }),
+                                           T(wf32 ? up_f32(mu) : up_bf16(mu), wd, { n }),
+                                           T(wf32 ? up_f32(sv) : up_bf16(sv), wd, { n }),
+                                           T(dy, RAD_F32, { M, n }) },
+                                      { PI("M", M), PI("n", n), PS("mode", norm ? "norm" : "denorm"),
+                                        PI("var", var), PF("eps", 1e-4), PS("dtype", "f32") });
+                const std::string nm = fmt("chan_stats_f32 %s stats %s var %d", norm ? "norm" : "denorm",
+                                           wf32 ? "f32" : "bf16", var);
+                if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+                std::vector<float> want((size_t)(M * n));
+                for (int64_t row = 0; row < M; ++row)
+                    for (int64_t c = 0; c < n; ++c) {
+                        volatile float e = sv[(size_t)c] + 1e-4f;
+                        const float sd = var ? std::sqrt((float)e) : sv[(size_t)c];
+                        const float xv = x[(size_t)(row * n + c)];
+                        volatile float t = norm ? xv - mu[(size_t)c] : xv * sd;
+                        want[(size_t)(row * n + c)] = norm ? (float)t / sd : (float)t + mu[(size_t)c];
+                    }
+                /* f32 against f32 (rel() would round the answer to bf16 first): each error over
+                 * the size of the terms it came from, |x s| + |mean| or |x - mean| / s, since a
+                 * result near zero is a cancellation. The device's square root may sit an ulp from
+                 * the host's. */
+                const std::vector<float> got = down_f32(dy, want.size());
+                double worst = 0;
+                for (int64_t row = 0; row < M; ++row)
+                    for (int64_t c = 0; c < n; ++c) {
+                        const size_t e = (size_t)(row * n + c);
+                        const double sd = var ? std::sqrt((double)sv[(size_t)c] + 1e-4) : sv[(size_t)c];
+                        const double xv = x[e], m = mu[(size_t)c];
+                        const double size = norm ? (std::fabs(xv) + std::fabs(m)) / sd
+                                                 : std::fabs(xv * sd) + std::fabs(m);
+                        worst = std::max(worst, std::fabs((double)got[e] - want[e]) /
+                                                    std::max(1e-30, size));
+                    }
+                ok(fmt("%s (max error over the terms %.3g, bound 5e-7)", nm.c_str(), worst).c_str(),
+                   worst <= 5e-7);
+            }
+}
+
+/* Host attention over q rows [q0, q1) against key rows [k0, k1), causal on relative indices. */
+static void host_attn(const std::vector<float>& q, const std::vector<float>& k,
+                      const std::vector<float>& v, int64_t qld, int64_t kld, int64_t nh,
+                      int64_t nkv, int64_t hd, int64_t q0, int64_t q1, int64_t k0, int64_t k1,
+                      bool causal, std::vector<float>* out) {
+    const float sc = 1.0f / std::sqrt((float)hd);
+    for (int64_t i = q0; i < q1; ++i)
+        for (int64_t h = 0; h < nh; ++h) {
+            const int64_t kh = h / (nh / nkv);
+            const int64_t je = causal ? std::min<int64_t>(k1, k0 + (i - q0) + 1) : k1;
+            std::vector<double> s;
+            double mx = -1e30;
+            for (int64_t j = k0; j < je; ++j) {
+                double d = 0;
+                for (int64_t t = 0; t < hd; ++t)
+                    d += (double)q[(size_t)(i * qld + h * hd + t)] * k[(size_t)(j * kld + kh * hd + t)];
+                s.push_back(d * sc);
+                mx = std::max(mx, s.back());
+            }
+            double sum = 0;
+            for (double& e : s) { e = std::exp(e - mx); sum += e; }
+            for (int64_t t = 0; t < hd; ++t) {
+                double a = 0;
+                for (int64_t j = k0; j < je; ++j)
+                    a += s[(size_t)(j - k0)] * v[(size_t)(j * kld + kh * hd + t)];
+                (*out)[(size_t)(i * nh * hd + h * hd + t)] = s.empty() ? 0.0f : (float)(a / sum);
+            }
+        }
+}
+
+/* Two entries, queries and keys of different counts, at gqa 1 and 4, causal and not. */
+void attn_cross_cases(const Plugin& pl, int64_t hd) {
+    const std::string row = fmt("attn_cross_h%lld_bf16", (long long)hd);
+    const RadKernelInfo* r = find(pl, row.c_str());
+    if (!r) { ok(row.c_str(), false, "row absent"); return; }
+    for (const int64_t gqa : { 1, 4 })
+        for (const int causal : { 0, 1 }) {
+            const int64_t nkv = 2, nh = nkv * gqa, Q = 150, K = 211;
+            const std::vector<int32_t> cuq = { 0, 70, 150 }, cuk = { 0, 123, 211 };
+            std::vector<float> q = randv((size_t)(Q * nh * hd), 1.0f);
+            std::vector<float> k = randv((size_t)(K * nkv * hd), 1.0f), v = randv((size_t)(K * nkv * hd), 1.0f);
+            for (float& x : q) x = bfr(x);
+            for (float& x : k) x = bfr(x);
+            for (float& x : v) x = bfr(x);
+            void* dout = dalloc((size_t)(Q * nh * hd) * 2);
+            const int rc = launch(r, { T(up_bf16(q), RAD_BF16, { Q, nh * hd }),
+                                       T(up_bf16(k), RAD_BF16, { K, nkv * hd }),
+                                       T(up_bf16(v), RAD_BF16, { K, nkv * hd }),
+                                       T(up_i32(cuq), RAD_I32, { 3 }), T(up_i32(cuk), RAD_I32, { 3 }),
+                                       T(dout, RAD_BF16, { Q, nh * hd }) },
+                                  { PI("M", Q), PI("head_dim", hd), PI("gqa", gqa),
+                                    PI("causal", causal), PS("dtype", "bf16") });
+            const std::string nm = fmt("%s gqa %lld causal %d", row.c_str(), (long long)gqa, causal);
+            if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+            std::vector<float> want((size_t)(Q * nh * hd));
+            for (int e = 0; e < 2; ++e)
+                host_attn(q, k, v, nh * hd, nkv * hd, nh, nkv, hd, cuq[(size_t)e], cuq[(size_t)e + 1],
+                          cuk[(size_t)e], cuk[(size_t)e + 1], causal != 0, &want);
+            check(nm, down_bf16(dout, want.size()), want, 2e-2);
+        }
+}
+
+/* attn_dense at the grouped h256 and h512 rows, causal and not, over two segments: a text
+ * encoder's prompt (Gemma 4's sliding and global layers). */
+void attn_dense_gqa_cases(const Plugin& pl) {
+    for (const int64_t hd : { 256, 512 })
+        for (const int64_t gqa : { 2, 4, 8, 16 }) {
+            /* 16 query heads a KV head run on the gqa-8 row, two workgroups a KV head. */
+            const std::string row = fmt("attn_dense_h%lld_gqa%lld_bf16", (long long)hd,
+                                        (long long)std::min<int64_t>(gqa, 8));
+            const RadKernelInfo* r = find(pl, row.c_str());
+            if (!r) { ok(row.c_str(), false, "row absent"); continue; }
+            for (const int causal : { 0, 1 }) {
+                const int64_t nkv = 2, nh = nkv * gqa, total = 173;
+                const std::vector<int32_t> cu = { 0, 101, 173 };
+                std::vector<float> q = randv((size_t)(total * nh * hd), 1.0f);
+                std::vector<float> k = randv((size_t)(total * nkv * hd), 1.0f);
+                std::vector<float> v = randv((size_t)(total * nkv * hd), 1.0f);
+                for (float& x : q) x = bfr(x);
+                for (float& x : k) x = bfr(x);
+                for (float& x : v) x = bfr(x);
+                void* dout = dalloc((size_t)(total * nh * hd) * 2);
+                const int rc = launch(r, { T(up_bf16(q), RAD_BF16, { total, nh * hd }),
+                                           T(up_bf16(k), RAD_BF16, { total, nkv * hd }),
+                                           T(up_bf16(v), RAD_BF16, { total, nkv * hd }),
+                                           T(up_i32(cu), RAD_I32, { 3 }),
+                                           T(dout, RAD_BF16, { total, nh * hd }) },
+                                      { PI("M", total), PI("head_dim", hd), PI("gqa", gqa),
+                                        PI("causal", causal), PS("dtype", "bf16"),
+                                        PI("max_seqlen", 101) });
+                const std::string nm = fmt("%s gqa %lld causal %d", row.c_str(), (long long)gqa,
+                                           causal);
+                if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+                std::vector<float> want((size_t)(total * nh * hd));
+                for (int e = 0; e < 2; ++e)
+                    host_attn(q, k, v, nh * hd, nkv * hd, nh, nkv, hd, cu[(size_t)e],
+                              cu[(size_t)e + 1], cu[(size_t)e], cu[(size_t)e + 1], causal != 0, &want);
+                check(nm, down_bf16(dout, want.size()), want, 2e-2);
+            }
+        }
+}
+
+/* One wide head over every pixel, 384 and 512. */
+void attn_wide_cases(const Plugin& pl) {
+    for (const int64_t hd : { 384, 512 }) {
+        const std::string row = fmt("attn_dense_h%lld_bf16", (long long)hd);
+        const RadKernelInfo* r = find(pl, row.c_str());
+        if (!r) { ok(row.c_str(), false, "row absent"); continue; }
+        const int64_t N = 300;
+        const std::vector<int32_t> cu = { 0, (int32_t)N };
+        std::vector<float> qkv = randv((size_t)(N * 3 * hd), 1.0f);
+        for (float& x : qkv) x = bfr(x);
+        void* d = up_bf16(qkv);
+        auto col = [&](int c) {
+            RadTensor t = T((char*)d + c * hd * 2, RAD_BF16, { N, hd });
+            t.stride[0] = 3 * hd;
+            return t;
+        };
+        void* dout = dalloc((size_t)(N * hd) * 2);
+        const int rc = launch(r, { col(0), col(1), col(2), T(up_i32(cu), RAD_I32, { 2 }),
+                                   T(dout, RAD_BF16, { N, hd }) },
+                              { PI("M", N), PI("head_dim", hd), PI("gqa", 1), PI("causal", 0),
+                                PS("dtype", "bf16") });
+        if (rc != RAD_OK) { ok(row.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> q((size_t)(N * hd)), k((size_t)(N * hd)), v((size_t)(N * hd));
+        for (int64_t i = 0; i < N; ++i)
+            for (int64_t t = 0; t < hd; ++t) {
+                q[(size_t)(i * hd + t)] = qkv[(size_t)(i * 3 * hd + t)];
+                k[(size_t)(i * hd + t)] = qkv[(size_t)(i * 3 * hd + hd + t)];
+                v[(size_t)(i * hd + t)] = qkv[(size_t)(i * 3 * hd + 2 * hd + t)];
+            }
+        std::vector<float> want((size_t)(N * hd));
+        host_attn(q, k, v, hd, hd, 1, 1, hd, 0, N, 0, N, false, &want);
+        check(row + " one head over 300 rows", down_bf16(dout, want.size()), want, 2e-2);
+    }
+}
+
+/* rms_mod's zero-centred gain rounded once (Krea 2) and its gainless LayerNorm (FLUX), gated
+ * and not, plain and quantised. */
+void rms_mod_forms(const Plugin& pl) {
+    for (const bool quant : { false, true }) {
+        const char* name = quant ? "rms_mod_quant_fp8_bf16" : "rms_mod_bf16";
+        const RadKernelInfo* r = find(pl, name);
+        if (!r) { ok(name, false, "row absent"); continue; }
+        const int64_t n = 3072, M = 7, segs = 3, pitch = 3 * n;
+        const std::vector<int32_t> cu = { 0, 2, 5, 7 };
+        for (const bool layer : { false, true })
+            for (const int gated : { 0, 1 }) {
+                std::vector<float> x = randv((size_t)(M * n), 2.0f), y = randv((size_t)(M * n), 1.0f);
+                std::vector<float> tab = randv((size_t)(segs * pitch), 0.5f), w = randv((size_t)n, 0.1f);
+                for (float& v : x) v = bfr(v + 0.7f);
+                for (float& v : y) v = bfr(v);
+                for (float& v : tab) v = bfr(v);
+                for (float& v : w) v = bfr(v);
+                void* dx = up_bf16(x);
+                void* dtab = up_bf16(tab);
+                RadTensor tg = T(dtab, RAD_BF16, { segs, n });
+                tg.stride[0] = pitch;
+                RadTensor ts2 = T((char*)dtab + n * 2, RAD_BF16, { segs, 2 * n });
+                ts2.stride[0] = pitch;
+                RadTensor ty = T(up_bf16(y), RAD_BF16, { M, n });
+                if (!gated) { absent(ty); absent(tg); }
+                RadTensor tw = T(up_bf16(w), RAD_BF16, { n });
+                if (layer) absent(tw);
+                void* dz = dalloc((size_t)(M * n) * 2);
+                void* dq = dalloc((size_t)(M * n));
+                void* dqs = dalloc((size_t)(M * n / 128) * 4);
+                std::vector<RadTensor> args = { ty, tg, ts2, tw, T(up_i32(cu), RAD_I32, { 4 }),
+                                                T(dx, RAD_BF16, { M, n }) };
+                std::vector<RadParam> ps = { PI("M", M), PI("n", n), PF("eps", 1e-6),
+                                             PI("gated", gated), PS("dtype", "bf16") };
+                if (layer) ps.push_back(PS("norm", "layer"));
+                else { ps.push_back(PF("wadd", 1.0)); ps.push_back(PI("norm_once", 1)); }
+                if (quant) {
+                    args.push_back(T(dq, RAD_F8E4M3, { M, n }));
+                    args.push_back(T(dqs, RAD_F32, { M, n / 128 }));
+                    ps.push_back(PI("group", 128));
+                }
+                args.push_back(T(dz, RAD_BF16, { M, n }));
+                const std::string nm = fmt("%s %s gated %d", name, layer ? "layer" : "zero-centred",
+                                           gated);
+                const int rc = launch(r, args, ps);
+                if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+                std::vector<float> want((size_t)(M * n));
+                for (int64_t row = 0; row < M; ++row) {
+                    const int64_t e = seq_of(cu, row);
+                    float* xv = x.data() + row * n;
+                    if (gated)
+                        for (int64_t i = 0; i < n; ++i)
+                            xv[i] = bfr(xv[i] + bfr(tab[(size_t)(e * pitch + i)] * y[(size_t)(row * n + i)]));
+                    float mu = 0.0f;
+                    if (layer) {
+                        for (int64_t i = 0; i < n; ++i) mu += xv[i];
+                        mu /= (float)n;
+                    }
+                    float ss = 0.0f;
+                    for (int64_t i = 0; i < n; ++i) ss += (xv[i] - mu) * (xv[i] - mu);
+                    const float rs = 1.0f / std::sqrt(ss / (float)n + 1e-6f);
+                    for (int64_t i = 0; i < n; ++i) {
+                        const float vv = xv[i] - mu;
+                        const float n2 = layer ? bfr(vv * rs) : bfr(vv * rs * (w[(size_t)i] + 1.0f));
+                        const float sc = bfr(1.0f + tab[(size_t)(e * pitch + 2 * n + i)]);
+                        want[(size_t)(row * n + i)] = bfr(bfr(n2 * sc) + tab[(size_t)(e * pitch + n + i)]);
+                    }
+                }
+                check(nm + " norm", down_bf16(dz, want.size()), want, 4e-3);
+                if (quant) {
+                    std::vector<uint8_t> qb((size_t)(M * n));
+                    st_memcpy(qb.data(), dq, qb.size(), hipMemcpyDeviceToHost);
+                    const std::vector<float> qs = down_f32(dqs, (size_t)(M * n / 128));
+                    std::vector<float> deq((size_t)(M * n));
+                    for (size_t i = 0; i < deq.size(); ++i) deq[i] = rad_fp8e4m3_to_f32(qb[i]) * qs[i / 128];
+                    check(nm + " codes", deq, want, 4e-2);
+                }
+            }
+    }
+}
+
+/* timestep_embed's round 2 (1000 bf16(t)) and 3 (bf16(1000 bf16(t))): the angle from each. */
+void timestep_round_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "timestep_embed_bf16");
+    if (!r) { ok("timestep_embed_bf16", false, "row absent"); return; }
+    const std::vector<float> t = { 0.9876543f, 0.5f, 0.0123457f };
+    for (const int round : { 2, 3 }) {
+        void* dy = dalloc((size_t)(3 * 256) * 2);
+        const int rc = launch(r, { T(up_f32(t), RAD_F32, { 3 }), T(dy, RAD_BF16, { 3, 256 }) },
+                              { PI("M", 3), PI("n", 256), PF("scale", 1000.0),
+                                PF("max_period", 10000.0), PI("round", round),
+                                PS("dtype", "bf16") });
+        const std::string nm = fmt("timestep_embed_bf16 round %d", round);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> want(3 * 256);
+        for (int m = 0; m < 3; ++m) {
+            const float tt = round == 3 ? bfr(1000.0f * bfr(t[(size_t)m])) : 1000.0f * bfr(t[(size_t)m]);
+            for (int i = 0; i < 128; ++i) {
+                const float f = std::exp(-std::log(10000.0f) * (float)i / 128.0f);
+                want[(size_t)(m * 256 + i)] = bfr(std::cos(tt * f));
+                want[(size_t)(m * 256 + 128 + i)] = bfr(std::sin(tt * f));
+            }
+        }
+        check(nm, down_bf16(dy, want.size()), want, 2e-2);
+    }
+}
+
+}  /* namespace g3 */
+
+/* ================================================================== LTX-2
+ * rope_split, head_gate and ltx_guide against the host's arithmetic in libref's order: the rotary's
+ * device sincosf within a few bf16 steps, the gate exact, the guided step's f64 deviations. */
+namespace ltx {
+
+using namespace au;
+
+static double lin01(int64_t i, int64_t steps) {
+    if (steps <= 1) return 0.0;
+    const double st = 1.0 / (double)(steps - 1);
+    return i < steps / 2 ? st * (double)i : 1.0 - st * (double)(steps - 1 - i);
+}
+
+/* The video's 3-axis rotary over a rank's second and third heads of 4096 (two pairs padded), and
+ * a 1-axis one over 2048, each over a column slice of a fused [q | k | v] row. */
+void rope_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "rope_split");
+    if (!r) { ok("rope_split", false, "row absent"); return; }
+    struct Case { int64_t nh, hd, dim, nd, h0; const char* mx; };
+    for (const Case cs : { Case{ 2, 128, 4096, 3, 1, "20 2048 2048" },
+                           Case{ 32, 64, 2048, 1, 0, "20" } }) {
+        const int64_t M = 77, w = cs.nh * cs.hd, ld = 3 * w + 8;
+        std::vector<float> x = randv((size_t)(M * ld), 1.0f);
+        for (float& v : x) v = bfr(v);
+        std::vector<float> pos((size_t)(cs.nd * M));
+        for (int64_t d = 0; d < cs.nd; ++d)
+            for (int64_t i = 0; i < M; ++i)
+                pos[(size_t)(d * M + i)] = d == 0 ? (float)i / 24.0f : (float)(32 * (i % 9) + 16);
+        void* dx = up_bf16(x);
+        RadTensor tx = T((char*)dx + w * 2, RAD_BF16, { M, w });
+        tx.stride[0] = ld;
+        const int rc = launch(r, { tx, T(up_f32(pos), RAD_F32, { cs.nd, M }) },
+                              { PI("M", M), PI("n_head", cs.nh), PI("head_dim", cs.hd),
+                                PI("dim", cs.dim), PI("n_dims", cs.nd), PF("theta", 10000.0),
+                                PS("max", cs.mx), PI("head0", cs.h0), PS("dtype", "bf16") });
+        const std::string nm = fmt("rope_split %lld axes over %lld", (long long)cs.nd,
+                                   (long long)cs.dim);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        float mx[3] = { 20.0f, 2048.0f, 2048.0f };
+        const int64_t P2 = cs.dim / 2, steps = P2 / cs.nd, pad = P2 - steps * cs.nd, half = cs.hd / 2;
+        std::vector<float> want((size_t)(M * w)), got((size_t)(M * w));
+        const std::vector<float> all = down_bf16(dx, (size_t)(M * ld));
+        for (int64_t i = 0; i < M; ++i)
+            for (int64_t c = 0; c < w; ++c) {
+                want[(size_t)(i * w + c)] = x[(size_t)(i * ld + w + c)];
+                got[(size_t)(i * w + c)] = all[(size_t)(i * ld + w + c)];
+            }
+        for (int64_t i = 0; i < M; ++i)
+            for (int64_t h = 0; h < cs.nh; ++h)
+                for (int64_t k = 0; k < half; ++k) {
+                    const int64_t p = (cs.h0 + h) * half + k;
+                    if (p < pad) continue;
+                    const int64_t j = p - pad, d = j % cs.nd, f = j / cs.nd;
+                    const float fr = (float)(std::pow(10000.0, lin01(f, steps)) * M_PI / 2.0);
+                    const float g = pos[(size_t)(d * M + i)] / mx[d];
+                    const float ang = (2.0f * g - 1.0f) * fr;
+                    const float co = (float)std::cos((double)ang), si = (float)std::sin((double)ang);
+                    const float x1 = x[(size_t)(i * ld + w + h * cs.hd + k)];
+                    const float x2 = x[(size_t)(i * ld + w + h * cs.hd + half + k)];
+                    want[(size_t)(i * w + h * cs.hd + k)] = bfr(x1 * co - x2 * si);
+                    want[(size_t)(i * w + h * cs.hd + half + k)] = bfr(x2 * co + x1 * si);
+                }
+        check(nm, got, want, 4e-3);
+        /* The columns either side of the slice are untouched. */
+        int64_t moved = 0;
+        for (int64_t i = 0; i < M; ++i)
+            for (int64_t c = 0; c < w; ++c) moved += all[(size_t)(i * ld + c)] != x[(size_t)(i * ld + c)];
+        ok(fmt("%s leaves the neighbouring columns", nm.c_str()).c_str(), moved == 0);
+    }
+}
+
+void gate_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "head_gate");
+    if (!r) { ok("head_gate", false, "row absent"); return; }
+    const int64_t M = 53, nh = 32, hd = 128, gld = nh + 3;
+    std::vector<float> x = randv((size_t)(M * nh * hd), 2.0f), g = randv((size_t)(M * gld), 3.0f);
+    for (float& v : x) v = bfr(v);
+    for (float& v : g) v = bfr(v);
+    void* dx = up_bf16(x);
+    RadTensor tg = T(up_bf16(g), RAD_BF16, { M, nh });
+    tg.stride[0] = gld;
+    const int rc = launch(r, { tg, T(dx, RAD_BF16, { M, nh * hd }) },
+                          { PI("M", M), PI("n_head", nh), PI("head_dim", hd), PS("dtype", "bf16") });
+    if (rc != RAD_OK) { ok("head_gate", false, "rc " + std::to_string(rc)); return; }
+    std::vector<float> want((size_t)(M * nh * hd));
+    for (int64_t i = 0; i < M; ++i)
+        for (int64_t c = 0; c < nh * hd; ++c) {
+            const float sg = bfr(1.0f / (1.0f + std::exp(-g[(size_t)(i * gld + c / hd)])));
+            want[(size_t)(i * nh * hd + c)] = bfr(x[(size_t)(i * nh * hd + c)] * bfr(2.0f * sg));
+        }
+    const std::vector<float> got = down_bf16(dx, want.size());
+    ok("head_gate 32 heads of 128, logits at a wider pitch",
+       differ(got, want) <= (int64_t)(want.size() / 1000), fmt("%lld differ", (long long)differ(got, want)));
+}
+
+/* Every pass bound with the rescale on, then CFG alone: x after one step against the host's f64
+ * deviations. */
+void guide_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "ltx_guide");
+    if (!r) { ok("ltx_guide", false, "row absent"); return; }
+    const int64_t M = 3000, n = 128;
+    for (const bool full : { true, false }) {
+        std::vector<float> x = randv((size_t)(M * n), 1.0f);
+        std::vector<std::vector<float>> v(4);
+        for (auto& e : v) {
+            e = randv((size_t)(M * n), 1.0f);
+            for (float& q : e) q = bfr(q);
+        }
+        const std::vector<float> sc = full ? std::vector<float>{ 3.0f, 1.0f, 3.0f, 0.7f }
+                                           : std::vector<float>{ 7.0f, 0.0f, 1.0f, 0.0f };
+        const std::vector<float> sh = { 0.909375f, 0.725f };
+        void* dx = up_f32(x);
+        void* st = dalloc((size_t)8200 * 4);
+        const int rc = launch(r, { T(up_bf16(v[0]), RAD_BF16, { M, n }),
+                                   T(up_bf16(v[1]), RAD_BF16, { M, n }),
+                                   full ? T(up_bf16(v[2]), RAD_BF16, { M, n }) : RadTensor{},
+                                   full ? T(up_bf16(v[3]), RAD_BF16, { M, n }) : RadTensor{},
+                                   T(up_f32(sc), RAD_F32, { 4 }), T(up_f32(sh), RAD_F32, { 2 }),
+                                   T(st, RAD_F32, { 8200 }), T(dx, RAD_F32, { M, n }) },
+                              { PI("M", M), PI("n", n), PS("dtype", "bf16") });
+        const std::string nm = full ? "ltx_guide every pass, rescaled" : "ltx_guide CFG alone";
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        const float sig = sh[0], dt = sh[1] - sh[0];
+        std::vector<float> x0c((size_t)(M * n)), g((size_t)(M * n)), want((size_t)(M * n));
+        for (size_t e = 0; e < want.size(); ++e) {
+            const float xc = x[e] - v[0][e] * sig;
+            float gv = xc;
+            gv = gv + (sc[0] - 1.0f) * (xc - (x[e] - v[1][e] * sig));
+            if (full) gv = gv + sc[1] * (xc - (x[e] - v[2][e] * sig));
+            if (full) gv = gv + (sc[2] - 1.0f) * (xc - (x[e] - v[3][e] * sig));
+            x0c[e] = xc;
+            g[e] = gv;
+        }
+        float fac = 1.0f;
+        if (sc[3] > 0.0f) {
+            auto sd = [&](const std::vector<float>& a) {
+                double m = 0.0, q = 0.0;
+                for (float e : a) m += e;
+                m /= (double)a.size();
+                for (float e : a) q += ((double)e - m) * ((double)e - m);
+                return (float)std::sqrt(q / (double)(a.size() - 1));
+            };
+            fac = sd(x0c) / sd(g);
+        }
+        const float kept = (float)(1.0 - (double)sc[3]);
+        for (size_t e = 0; e < want.size(); ++e) {
+            float gv = g[e];
+            if (sc[3] > 0.0f) gv = sc[3] * (gv * fac) + kept * gv;
+            want[e] = x[e] + dt * ((x[e] - gv) / sig);
+        }
+        /* An f32 latent: compared in f32 (check() holds a bf16 answer). */
+        const std::vector<float> got = down_f32(dx, want.size());
+        double e = 0.0, w2 = 0.0;
+        for (size_t i = 0; i < want.size(); ++i) {
+            e += ((double)got[i] - want[i]) * ((double)got[i] - want[i]);
+            w2 += (double)want[i] * want[i];
+        }
+        const double rl = std::sqrt(e / w2);
+        ok(fmt("%s (rel_l2 %.3g, bound 1e-6)", nm.c_str(), rl).c_str(), rl <= 1e-6);
+    }
+}
+
+
+/* ---- LTX-2's VAE, audio VAE and vocoder ops, each against a host port of its libref function
+ * (libref/ref_ltx.cpp). Copies are compared bit for bit; sums the kernel orders differently to a
+ * relative L2. */
+
+/* The div form with SiLU (the VAE's norm) at bf16, and the rsqrt form interleaving 4 layers and
+ * scaled (the connectors') at f32 in and bf16 out. */
+void pixel_norm_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "pixel_norm");
+    if (!r) { ok("pixel_norm", false, "row absent"); return; }
+    struct Case { int64_t rows, n, L; bool div, silu, xf32; float eps, mult; };
+    for (const Case c : { Case{ 333, 512, 1, true, true, false, 1e-8f, 1.0f },
+                          Case{ 4 * 37, 96, 4, false, false, true, 1e-6f, 2.75f } }) {
+        std::vector<float> x = randv((size_t)(c.rows * c.n), 2.0f);
+        void* dx = c.xf32 ? up_f32(x) : up_bf16(x);
+        void* dy = dalloc((size_t)(c.rows * c.n) * 2);
+        std::vector<RadParam> ps = { PI("M", c.rows / c.L), PI("n", c.n), PF("eps", c.eps),
+                                     PS("form", c.div ? "div" : "rsqrt"), PS("dtype", "bf16") };
+        if (c.silu) ps.push_back(PS("act", "silu"));
+        if (c.L > 1) ps.push_back(PI("ileave", c.L));
+        if (c.mult != 1.0f) ps.push_back(PF("mult", c.mult));
+        const int rc = launch(r, { T(dx, c.xf32 ? RAD_F32 : RAD_BF16, { c.rows, c.n }),
+                                   T(dy, RAD_BF16, { c.rows / c.L, c.n * c.L }) },
+                              ps);
+        const std::string nm = fmt("pixel_norm %s%s over %lld, %lld layers interleaved",
+                                   c.div ? "div" : "rsqrt", c.silu ? " silu" : "", (long long)c.n,
+                                   (long long)c.L);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> want((size_t)(c.rows * c.n));
+        for (int64_t q = 0; q < c.rows; ++q) {
+            float ss = 0.0f;
+            for (int64_t i = 0; i < c.n; ++i) {
+                const float v = x[(size_t)(q * c.n + i)];
+                ss += bfr(v * v);
+            }
+            const float v = bfr(bfr(ss / (float)c.n) + c.eps);
+            const float s = c.div ? bfr(std::sqrt(v)) : bfr(1.0f / std::sqrt(v));
+            for (int64_t i = 0; i < c.n; ++i) {
+                const float xv = x[(size_t)(q * c.n + i)];
+                float z = bfr(c.div ? xv / s : xv * s);
+                if (c.silu) z = bfr(z / (1.0f + std::exp(-z)));
+                if (c.mult != 1.0f) z = bfr(z * c.mult);
+                want[(size_t)((q / c.L) * c.n * c.L + i * c.L + q % c.L)] = z;
+            }
+        }
+        check(nm, down_bf16(dy, want.size()), want, 4e-3);
+    }
+}
+
+/* The upsampler's 2 x 2 x 2 and 1 x 2 x 2 depth to space; the downsampler's space to depth, copy
+ * with a frame prepended, and the residual's group mean added into y. */
+void resample_cases(const Plugin& pl) {
+    const RadKernelInfo* rd = find(pl, "d2s3d");
+    const RadKernelInfo* rs = find(pl, "s2d3d");
+    if (!rd || !rs) { ok("d2s3d / s2d3d", false, "row absent"); return; }
+    struct D { int64_t st, drop; };
+    for (const D dd : { D{ 2, 1 }, D{ 1, 0 }, D{ 2, 0 } }) {
+        const int64_t st = dd.st, drop = dd.drop;
+        const int64_t T0 = 3, H = 5, W = 7, C = 24, P = st * 4;
+        const int64_t To = T0 * st - drop, M = To * H * 2 * W * 2;
+        std::vector<float> x = randv((size_t)(T0 * H * W * C * P), 1.0f);
+        void* dx = up_bf16(x);
+        void* dy = dalloc((size_t)((M + 5) * C) * 2);
+        const int rc = launch(rd, { T(dx, RAD_BF16, { T0 * H * W, C * P }),
+                                    TI32({ 3 }, { (int32_t)T0, (int32_t)H, (int32_t)W }),
+                                    T(dy, RAD_BF16, { M + 5, C }) },
+                              { PI("M", M), PI("C", C), PI("st", st), PI("sh", 2), PI("sw", 2),
+                                PI("drop", drop), PS("dtype", "bf16") });
+        const std::string nm = fmt("d2s3d %lld x 2 x 2, %lld dropped", (long long)st, (long long)drop);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> want((size_t)(M * C));
+        const int64_t Ho = H * 2, Wo = W * 2;
+        for (int64_t q = 0; q < M; ++q) {
+            const int64_t tt = q / (Ho * Wo) + drop, ii = (q / Wo) % Ho, jj = q % Wo;
+            const int64_t t = tt / st, aa = tt % st, i = ii / 2, b = ii % 2, j = jj / 2, d = jj % 2;
+            for (int64_t c = 0; c < C; ++c)
+                want[(size_t)(q * C + c)] =
+                    x[(size_t)(((t * H + i) * W + j) * C * P + ((c * st + aa) * 2 + b) * 2 + d)];
+        }
+        const std::vector<float> got = down_bf16(dy, want.size());
+        ok(nm.c_str(), differ(got, want) == 0, fmt("%lld differ", (long long)differ(got, want)));
+    }
+    struct S { int64_t tpre, group; bool mean, add; };
+    for (const S c : { S{ 1, 1, false, false }, S{ 1, 4, true, true } }) {
+        const int64_t T0 = 5, H = 6, W = 4, C = 16, P = C * 8, Co = c.mean ? P / c.group : P;
+        const int64_t To = (T0 + c.tpre) / 2, M = To * (H / 2) * (W / 2);
+        std::vector<float> x = randv((size_t)(T0 * H * W * C), 1.0f), y0 = randv((size_t)(M * Co), 1.0f);
+        void* dx = up_bf16(x);
+        void* dy = up_bf16(y0);
+        std::vector<RadParam> ps = { PI("M", T0 * H * W), PI("C", C), PI("st", 2), PI("sh", 2),
+                                     PI("sw", 2), PI("tpre", c.tpre), PI("group", c.group),
+                                     PS("mode", c.mean ? "mean" : "copy"), PI("add", c.add),
+                                     PS("dtype", "bf16") };
+        const int rc = launch(rs, { T(dx, RAD_BF16, { T0 * H * W, C }),
+                                    TI32({ 3 }, { (int32_t)T0, (int32_t)H, (int32_t)W }),
+                                    T(dy, RAD_BF16, { M, Co }) },
+                              ps);
+        const std::string nm = fmt("s2d3d %s, a frame prepended%s", c.mean ? "group mean" : "copy",
+                                   c.add ? ", added" : "");
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> want((size_t)(M * Co));
+        const int64_t Ho = H / 2, Wo = W / 2;
+        for (int64_t q = 0; q < M; ++q) {
+            const int64_t t = q / (Ho * Wo), i = (q / Wo) % Ho, j = q % Wo;
+            auto val = [&](int64_t p) {
+                const int64_t d = p % 2, b = (p / 2) % 2, aa = (p / 4) % 2, cc = p / 8;
+                const int64_t v = t * 2 + aa, tr = v < c.tpre ? v : v - c.tpre;
+                return x[(size_t)(((tr * H + i * 2 + b) * W + j * 2 + d) * C + cc)];
+            };
+            for (int64_t o = 0; o < Co; ++o) {
+                float v;
+                if (!c.mean) {
+                    v = val(o);
+                } else {
+                    float s = 0.0f;
+                    for (int64_t p = o * c.group; p < (o + 1) * c.group; ++p) s += val(p);
+                    v = bfr(s / (float)c.group);
+                }
+                want[(size_t)(q * Co + o)] = c.add ? bfr(y0[(size_t)(q * Co + o)] + v) : v;
+            }
+        }
+        const std::vector<float> got = down_bf16(dy, want.size());
+        ok(nm.c_str(), differ(got, want) == 0, fmt("%lld differ", (long long)differ(got, want)));
+    }
+}
+
+/* An RGB image to 4 x 4 patches and back to bytes, both orders. */
+void patch_cases(const Plugin& pl) {
+    const RadKernelInfo* rp = find(pl, "pix_patch");
+    const RadKernelInfo* r8 = find(pl, "patch_pix8");
+    if (!rp || !r8) { ok("pix_patch / patch_pix8", false, "row absent"); return; }
+    for (const bool wh : { true, false }) {
+        const int64_t H = 24, W = 40, C = 3, p = 4, w = W / p, cols = w * C * p * p;
+        std::vector<float> x = randv((size_t)(H * W * C), 1.2f);
+        void* dx = up_bf16(x);
+        void* dy = dalloc((size_t)(H / p * cols) * 2);
+        const std::vector<RadParam> ps = { PI("M", H / p), PI("p", p), PI("C", C),
+                                           PS("order", wh ? "wh" : "hw"), PS("dtype", "bf16") };
+        int rc = launch(rp, { T(dx, RAD_BF16, { H, W * C }), T(dy, RAD_BF16, { H / p, cols }) }, ps);
+        const char* ord = wh ? "wh" : "hw";
+        if (rc != RAD_OK) { ok(fmt("pix_patch %s", ord).c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> want((size_t)(H / p * cols));
+        auto col = [&](int64_t c, int64_t ph, int64_t pw) {
+            return c * p * p + (wh ? pw * p + ph : ph * p + pw);
+        };
+        for (int64_t yy = 0; yy < H; ++yy)
+            for (int64_t xx = 0; xx < W; ++xx)
+                for (int64_t c = 0; c < C; ++c)
+                    want[(size_t)((yy / p) * cols + (xx / p) * C * p * p + col(c, yy % p, xx % p))] =
+                        x[(size_t)((yy * W + xx) * C + c)];
+        const std::vector<float> got = down_bf16(dy, want.size());
+        ok(fmt("pix_patch %s", ord).c_str(), differ(got, want) == 0,
+           fmt("%lld differ", (long long)differ(got, want)));
+        void* d8 = dalloc((size_t)(H * W * C));
+        RadTensor t8 = T(d8, RAD_U8, { H, W * C });
+        rc = launch(r8, { T(dy, RAD_BF16, { H / p, cols }), t8 }, ps);
+        if (rc != RAD_OK) { ok(fmt("patch_pix8 %s", ord).c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<uint8_t> g8((size_t)(H * W * C)), w8(g8.size());
+        st_memcpy(g8.data(), d8, g8.size(), hipMemcpyDeviceToHost);
+        for (size_t e = 0; e < w8.size(); ++e) {
+            const float cl = std::min(std::max(x[e], -1.0f), 1.0f);
+            const float u = std::min(std::max(bfr(bfr(cl / 2.0f) + 0.5f), 0.0f), 1.0f);
+            w8[e] = (uint8_t)std::nearbyint(u * 255.0f);
+        }
+        ok(fmt("patch_pix8 %s is pix_patch's inverse in bytes", ord).c_str(), differ(g8, w8) == 0,
+           fmt("%lld differ", (long long)differ(g8, w8)));
+    }
+}
+
+/* diffusers' tiled decodes. The boxes of a 29 x 33 grid at tile 16, stride 14 (bands of 16, 15
+ * and 1 rows, 16, 16 and 5 columns) and of the diffusion decoder's 61 x 68 x 100 grid under
+ * `intervals` (two time bands, the last 8 tail cells longer; one row band; a 12-column remnant
+ * merged); a 2 x 4 x 3 box out of a volume; and tiles stitched to bytes against a host
+ * transcription of the in-place blends (libref/ref_ltx.cpp): five frames over a 9 x 10 grid at
+ * tile 4, stride 3, and 9 cells of 2 frames in two time bands at tile 6, stride 4, rule
+ * `intervals`, its spatial remnant merged. */
+struct HostCut {
+    int64_t tile, stride, min;
+    bool    iv;
+    int64_t count(int64_t L) const {
+        if (iv && L <= tile) return 1;
+        int64_t n = (L + stride - 1) / stride;
+        while (iv && n > 1 && L - (n - 1) * stride < min) --n;
+        return n;
+    }
+    int64_t len(int64_t L, int64_t k) const {
+        return k == count(L) - 1 ? L - k * stride : std::min(tile, L - k * stride);
+    }
+};
+
+/* Neighborhood attention against a host transcription: two heads of 64 over a 6 x 9 x 13 volume
+ * with the decoder's 3 x 5 x 5 window, and with its 11 x 11 x 11 one, which the 6 frames clamp. */
+void na3d_cases(const Plugin& pl) {
+    const RadKernelInfo* rn = find(pl, "attn_na3d_h64");
+    if (!rn) { ok("attn_na3d", false, "row absent"); return; }
+    struct K { int64_t kt, kh, kw; };
+    for (const K w : { K{ 3, 5, 5 }, K{ 11, 11, 11 } }) {
+        const int64_t T0 = 6, H = 9, W = 13, V = T0 * H * W, hd = 64, nhd = 2, D = nhd * hd;
+        std::vector<float> q = randv((size_t)(V * D), 1.0f), k = randv((size_t)(V * D), 1.0f),
+                           v = randv((size_t)(V * D), 1.0f);
+        for (auto* x : { &q, &k, &v })
+            for (auto& e : *x) e = bfr(e);
+        void* dq = up_bf16(q);
+        void* dk = up_bf16(k);
+        void* dv = up_bf16(v);
+        void* dout = dalloc((size_t)(V * D) * 2);
+        const int rc = launch(rn, { T(dq, RAD_BF16, { V, D }), T(dk, RAD_BF16, { V, D }),
+                                    T(dv, RAD_BF16, { V, D }),
+                                    TI32({ 3 }, { (int32_t)T0, (int32_t)H, (int32_t)W }),
+                                    T(dout, RAD_BF16, { V, D }) },
+                              { PI("M", V), PI("head_dim", hd), PI("kt", w.kt), PI("kh", w.kh),
+                                PI("kw", w.kw), PS("dtype", "bf16") });
+        const std::string nm = fmt("attn_na3d %lld x %lld x %lld over 6 x 9 x 13", (long long)w.kt,
+                                   (long long)w.kh, (long long)w.kw);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        const int64_t nt = std::min(w.kt, T0), nh = std::min(w.kh, H), nw = std::min(w.kw, W);
+        auto start = [](int64_t c, int64_t n, int64_t L) {
+            return std::min(std::max<int64_t>(c - n / 2, 0), L - n);
+        };
+        std::vector<float> want((size_t)(V * D));
+        for (int64_t r = 0; r < V; ++r)
+            for (int64_t h = 0; h < nhd; ++h) {
+                const int64_t t = r / (H * W), i = (r / W) % H, j = r % W;
+                const int64_t t0 = start(t, nt, T0), i0 = start(i, nh, H), j0 = start(j, nw, W);
+                std::vector<double> sc;
+                std::vector<int64_t> keys;
+                double mx = -1e300;
+                for (int64_t a1 = t0; a1 < t0 + nt; ++a1)
+                    for (int64_t b1 = i0; b1 < i0 + nh; ++b1)
+                        for (int64_t c1 = j0; c1 < j0 + nw; ++c1) {
+                            const int64_t key = (a1 * H + b1) * W + c1;
+                            double d = 0;
+                            for (int64_t e = 0; e < hd; ++e)
+                                d += (double)q[(size_t)(r * D + h * hd + e)] * k[(size_t)(key * D + h * hd + e)];
+                            d /= 8.0;
+                            sc.push_back(d);
+                            keys.push_back(key);
+                            mx = std::max(mx, d);
+                        }
+                double sum = 0;
+                for (double& x : sc) { x = std::exp(x - mx); sum += x; }
+                for (int64_t e = 0; e < hd; ++e) {
+                    double acc = 0;
+                    for (size_t n = 0; n < keys.size(); ++n) acc += sc[n] * v[(size_t)(keys[n] * D + h * hd + e)];
+                    want[(size_t)(r * D + h * hd + e)] = (float)(acc / sum);
+                }
+            }
+        check(nm.c_str(), down_bf16(dout, want.size()), want, 8e-3);
+    }
+}
+
+/* A 3 x 4 x 5 volume's voxel coordinates. */
+void vol_index_cases(const Plugin& pl) {
+    const RadKernelInfo* rv = find(pl, "vol_index");
+    if (!rv) { ok("vol_index", false, "row absent"); return; }
+    const int64_t T0 = 3, H = 4, W = 5, n = T0 * H * W + 4;
+    void* dy = dalloc((size_t)(3 * n) * 4);
+    const int rcode = launch(rv, { TI32({ 3 }, { (int32_t)T0, (int32_t)H, (int32_t)W }),
+                                   T(dy, RAD_I32, { 3, n }) },
+                             { PI("M", n) });
+    if (rcode != RAD_OK) { ok("vol_index 3 x 4 x 5", false, "rc " + std::to_string(rcode)); return; }
+    std::vector<int32_t> got((size_t)(3 * n));
+    st_memcpy(got.data(), dy, got.size() * 4, hipMemcpyDeviceToHost);
+    int64_t bad = 0;
+    for (int64_t m = 0; m < T0 * H * W; ++m)
+        bad += got[(size_t)m] != m / (H * W) || got[(size_t)(n + m)] != (m / W) % H ||
+               got[(size_t)(2 * n + m)] != m % W;
+    ok("vol_index 3 x 4 x 5", bad == 0, fmt("%lld differ", (long long)bad));
+}
+
+void tile_cases(const Plugin& pl) {
+    const RadKernelInfo* rg = find(pl, "tile_grid");
+    const RadKernelInfo* rc = find(pl, "tile_crop");
+    const RadKernelInfo* rs = find(pl, "tile_stitch");
+    if (!rg || !rc || !rs) { ok("tile_grid / tile_crop / tile_stitch", false, "row absent"); return; }
+    struct G { int32_t T, H, W; std::vector<RadParam> ps; HostCut cs, ct; int64_t tail, n; const char* nm; };
+    const std::vector<G> grids = {
+        { 3, 29, 33, { PI("M", 12), PI("tile", 16), PI("stride", 14) },
+          { 16, 14, 1, false }, { 1 << 30, 1 << 30, 1, false }, 0, 12, "tile_grid 29 x 33" },
+        { 61, 68, 100, { PI("M", 4), PI("tile", 96), PI("stride", 88), PS("rule", "intervals"),
+                         PI("min", 13), PI("tile_t", 40), PI("stride_t", 28), PI("min_t", 6),
+                         PI("tail", 8) },
+          { 96, 88, 13, true }, { 40, 28, 6, true }, 8, 4, "tile_grid intervals 61 x 68 x 100" },
+    };
+    for (const G& g : grids) {
+        void* dy = dalloc((size_t)(g.n * 8) * 4);
+        const int rcode = launch(rg, { TI32({ 3 }, { g.T, g.H, g.W }), T(dy, RAD_I32, { g.n, 8 }) },
+                                 g.ps);
+        if (rcode != RAD_OK) { ok(g.nm, false, "rc " + std::to_string(rcode)); continue; }
+        std::vector<int32_t> got((size_t)(g.n * 8)), want((size_t)(g.n * 8), 0);
+        st_memcpy(got.data(), dy, got.size() * 4, hipMemcpyDeviceToHost);
+        const int64_t nt = g.ct.count(g.T), ni = g.cs.count(g.H), nj = g.cs.count(g.W);
+        const int64_t count = nt * ni * nj;
+        for (int64_t k = 0; k < std::min(count, g.n); ++k) {
+            const int64_t kt = k / (ni * nj), i = (k / nj) % ni, j = k % nj;
+            const int64_t v[8] = { g.ct.len(g.T, kt) + (kt == nt - 1 ? g.tail : 0), g.cs.len(g.H, i),
+                                   g.cs.len(g.W, j), kt * g.ct.stride, i * g.cs.stride,
+                                   j * g.cs.stride, k, count };
+            for (int e = 0; e < 8; ++e) want[(size_t)(k * 8 + e)] = (int32_t)v[e];
+        }
+        ok(g.nm, got == want, "rows differ");
+    }
+    {
+        const int64_t T0 = 5, H = 7, W = 9, C = 6, t = 2, h = 4, w = 3, t0 = 2, y0 = 2, x0 = 5;
+        std::vector<float> x = randv((size_t)(T0 * H * W * C), 1.0f);
+        void* dx = up_bf16(x);
+        void* dy = dalloc((size_t)((t * h * w + 3) * C) * 2);
+        const int rcode = launch(rc, { T(dx, RAD_BF16, { T0 * H * W, C }),
+                                       TI32({ 3 }, { (int32_t)T0, (int32_t)H, (int32_t)W }),
+                                       TI32({ 6 }, { (int32_t)t, (int32_t)h, (int32_t)w, (int32_t)t0,
+                                                     (int32_t)y0, (int32_t)x0 }),
+                                       T(dy, RAD_BF16, { t * h * w + 3, C }) },
+                                 { PI("M", t * h * w + 3), PI("C", C), PS("dtype", "bf16") });
+        if (rcode != RAD_OK) {
+            ok("tile_crop 2 x 4 x 3 at (2, 2, 5)", false, "rc " + std::to_string(rcode));
+        } else {
+            std::vector<float> want((size_t)(t * h * w * C));
+            for (int64_t r = 0; r < t * h * w; ++r) {
+                const int64_t f = r / (h * w), i = (r / w) % h, j = r % w;
+                for (int64_t c = 0; c < C; ++c)
+                    want[(size_t)(r * C + c)] =
+                        x[(size_t)((((t0 + f) * H + y0 + i) * W + x0 + j) * C + c)];
+            }
+            const std::vector<float> got = down_bf16(dy, want.size());
+            ok("tile_crop 2 x 4 x 3 at (2, 2, 5)", differ(got, want) == 0,
+               fmt("%lld differ", (long long)differ(got, want)));
+        }
+    }
+    struct S { int64_t T, H, W; HostCut cs, ct; int64_t sc, st, f0, nf; bool wh; const char* rule; };
+    const std::vector<S> stitches = {
+        { 5, 9, 10, { 4, 3, 1, false }, { 1 << 30, 1 << 30, 1, false }, 2, 1, 1, 3, true, "stride" },
+        { 5, 9, 10, { 4, 3, 1, false }, { 1 << 30, 1 << 30, 1, false }, 2, 1, 1, 3, false, "stride" },
+        { 9, 7, 13, { 6, 4, 4, true }, { 6, 4, 2, true }, 2, 2, 0, 17, true, "intervals" },
+    };
+    for (const S& k : stitches) {
+        const int64_t p = 2, C = 3, P = C * p * p;
+        const int64_t nt = k.ct.count(k.T), ni = k.cs.count(k.H), nj = k.cs.count(k.W);
+        int64_t hs = 0, ws = 0;
+        for (int64_t i = 0; i < ni; ++i) hs += k.cs.len(k.H, i);
+        for (int64_t j = 0; j < nj; ++j) ws += k.cs.len(k.W, j);
+        auto frames = [&](int64_t kt) { return k.st * k.ct.len(k.T, kt) - (kt == 0 ? k.st - 1 : 0); };
+        int64_t ftot = 0;
+        for (int64_t kt = 0; kt < nt; ++kt) ftot += frames(kt);
+        const int64_t rows = ftot * k.sc * k.sc * hs * ws;
+        std::vector<float> x = randv((size_t)(rows * P), 1.3f);
+        for (auto& v : x) v = bfr(v);
+        auto offset = [&](int64_t kt, int64_t i, int64_t j) {
+            int64_t before = 0, left = 0, above = 0;
+            for (int64_t q = 0; q < kt; ++q) before += frames(q);
+            for (int64_t q = 0; q < j; ++q) left += k.cs.len(k.W, q);
+            for (int64_t q = 0; q < i; ++q) above += k.cs.len(k.H, q);
+            return k.sc * k.sc * (before * hs * ws + frames(kt) * (above * ws + k.cs.len(k.H, i) * left));
+        };
+        auto R = [&](int64_t kt, int64_t i, int64_t j, int64_t f, int64_t yy, int64_t xx, int64_t c) {
+            const int64_t wp = k.cs.len(k.W, j) * k.sc, hp = k.cs.len(k.H, i) * k.sc;
+            const int64_t row = offset(kt, i, j) + (f * hp + yy / p) * wp + xx / p;
+            const int64_t col = c * p * p + (k.wh ? (xx % p) * p + yy % p : (yy % p) * p + xx % p);
+            return x[(size_t)(row * P + col)];
+        };
+        auto mix = [&](float va, float vb, int64_t q, int64_t e) {
+            const float wa = (float)(1.0 - (double)q / (double)e), wb = (float)((double)q / (double)e);
+            return bfr(bfr(va * wa) + bfr(vb * wb));
+        };
+        const int64_t Hpx = k.H * k.sc * p, Wpx = k.W * k.sc * p, s = k.cs.stride * k.sc * p;
+        const int64_t E = (k.cs.tile - k.cs.stride) * k.sc * p, Et = (k.ct.tile - k.ct.stride) * k.st;
+        const int64_t band = k.ct.stride * k.st;
+        auto Sv = [&](int64_t kt, int64_t f, int64_t Yp, int64_t Xp, int64_t c) {
+            const int64_t i = std::min(Yp / s, ni - 1), ly = Yp - i * s;
+            const int64_t j = std::min(Xp / s, nj - 1), lx = Xp - j * s;
+            const int64_t ha = i > 0 ? k.cs.len(k.H, i - 1) * k.sc * p : 0;
+            const int64_t ev = i > 0 ? std::min(std::min(ha, k.cs.len(k.H, i) * k.sc * p), E) : 0;
+            const int64_t wl = j > 0 ? k.cs.len(k.W, j - 1) * k.sc * p : 0;
+            const int64_t eh = j > 0 ? std::min(std::min(wl, k.cs.len(k.W, j) * k.sc * p), E) : 0;
+            const bool vb = i > 0 && ly < ev, hb = j > 0 && lx < eh;
+            float V = R(kt, i, j, f, ly, lx, c);
+            if (vb) {
+                float A = R(kt, i - 1, j, f, ha - ev + ly, lx, c);
+                if (hb) A = mix(R(kt, i - 1, j - 1, f, ha - ev + ly, wl - eh + lx, c), A, lx, eh);
+                V = mix(A, V, ly, ev);
+            }
+            if (hb) {
+                float L = R(kt, i, j - 1, f, ly, wl - eh + lx, c);
+                if (vb) L = mix(R(kt, i - 1, j - 1, f, ha - ev + ly, wl - eh + lx, c), L, ly, ev);
+                V = mix(L, V, lx, eh);
+            }
+            return V;
+        };
+        std::vector<uint8_t> want((size_t)(k.nf * Hpx * Wpx * C));
+        for (int64_t r = 0; r < k.nf * Hpx; ++r) {
+            const int64_t n = k.f0 + r / Hpx, Yp = r % Hpx;
+            const int64_t kt = std::min((n + k.st - 1) / band, nt - 1);
+            const int64_t f = n - (kt == 0 ? 0 : kt * band - (k.st - 1));
+            const int64_t et = kt > 0 ? std::min(std::min(frames(kt - 1), frames(kt)), Et) : 0;
+            for (int64_t Xp = 0; Xp < Wpx; ++Xp)
+                for (int64_t c = 0; c < C; ++c) {
+                    float v = Sv(kt, f, Yp, Xp, c);
+                    if (kt > 0 && f < et) v = mix(Sv(kt - 1, frames(kt - 1) - et + f, Yp, Xp, c), v, f, et);
+                    const float cl = std::min(std::max(v, -1.0f), 1.0f);
+                    const float u = std::min(std::max(bfr(bfr(cl / 2.0f) + 0.5f), 0.0f), 1.0f);
+                    want[(size_t)((r * Wpx + Xp) * C + c)] = (uint8_t)std::nearbyint(u * 255.0f);
+                }
+        }
+        void* dx = up_bf16(x);
+        void* dy = dalloc(want.size());
+        std::vector<RadParam> ps = { PI("M", k.nf * Hpx), PI("tile", k.cs.tile), PI("stride", k.cs.stride),
+                                     PS("rule", k.rule), PI("min", k.cs.min), PI("scale", k.sc),
+                                     PI("scale_t", k.st), PI("p", p), PI("C", C),
+                                     PS("order", k.wh ? "wh" : "hw"), PS("dtype", "bf16") };
+        if (nt > 1 || k.ct.tile < (1 << 30)) {
+            ps.push_back(PI("tile_t", k.ct.tile));
+            ps.push_back(PI("stride_t", k.ct.stride));
+            ps.push_back(PI("min_t", k.ct.min));
+        }
+        const int rcode = launch(rs, { T(dx, RAD_BF16, { rows, P }),
+                                       TI32({ 3 }, { (int32_t)k.T, (int32_t)k.H, (int32_t)k.W }),
+                                       TI32({ 1 }, { (int32_t)k.f0 }),
+                                       T(dy, RAD_U8, { k.nf * Hpx, Wpx * C }) },
+                                 ps);
+        const std::string nm = fmt("tile_stitch %s %lld x %lld x %lld %s, frames %lld..%lld", k.rule,
+                                   (long long)k.T, (long long)k.H, (long long)k.W, k.wh ? "wh" : "hw",
+                                   (long long)k.f0, (long long)(k.f0 + k.nf - 1));
+        if (rcode != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rcode)); continue; }
+        std::vector<uint8_t> got(want.size());
+        st_memcpy(got.data(), dy, got.size(), hipMemcpyDeviceToHost);
+        ok(nm.c_str(), differ(got, want) == 0, fmt("%lld differ", (long long)differ(got, want)));
+    }
+}
+
+/* The extender's MelSTFT shape (512-point DFT, hop 128, 64 mel bins) over two channels, bf16. */
+void stft_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "stft_logmel");
+    if (!r) { ok("stft_logmel", false, "row absent"); return; }
+    const int64_t nfft = 512, hop = 128, nm = 64, ch = 2, F = nfft / 2 + 1, S = 37 * hop;
+    const int64_t frames = S / hop;
+    std::vector<float> x = randv((size_t)(S * ch), 0.5f);
+    std::vector<float> basis((size_t)(2 * F * nfft)), mel((size_t)(nm * F));
+    for (int64_t k = 0; k < F; ++k)
+        for (int64_t j = 0; j < nfft; ++j) {
+            const double wnd = 0.5 - 0.5 * std::cos(2.0 * M_PI * (double)j / (double)nfft);
+            const double ang = -2.0 * M_PI * (double)(k * j) / (double)nfft;
+            basis[(size_t)(k * nfft + j)] = (float)(wnd * std::cos(ang));
+            basis[(size_t)((F + k) * nfft + j)] = (float)(wnd * std::sin(ang));
+        }
+    for (float& v : mel) v = std::fabs(rnd()) * 0.05f;
+    void* dx = up_bf16(x);
+    void* db = up_bf16(basis);
+    void* dm = up_bf16(mel);
+    void* dy = dalloc((size_t)(frames * ch * nm) * 2);
+    const int rc = launch(r, { T(dx, RAD_BF16, { S, ch }), T(db, RAD_BF16, { 2 * F, 1, nfft }),
+                               T(dm, RAD_BF16, { nm, F }), T(dy, RAD_BF16, { frames, ch * nm }) },
+                          { PI("M", frames), PI("hop", hop), PI("nfft", nfft), PI("n_mel", nm),
+                            PI("ch", ch), PS("dtype", "bf16") });
+    if (rc != RAD_OK) { ok("stft_logmel", false, "rc " + std::to_string(rc)); return; }
+    std::vector<float> want((size_t)(frames * ch * nm));
+    for (int64_t t = 0; t < frames; ++t)
+        for (int64_t h = 0; h < ch; ++h) {
+            std::vector<float> mag((size_t)F);
+            for (int64_t k = 0; k < F; ++k) {
+                float re = 0.0f, im = 0.0f;
+                for (int64_t j = 0; j < nfft; ++j) {
+                    const int64_t s = t * hop + j - (nfft - hop);
+                    if (s < 0) continue;
+                    re += basis[(size_t)(k * nfft + j)] * x[(size_t)(s * ch + h)];
+                    im += basis[(size_t)((F + k) * nfft + j)] * x[(size_t)(s * ch + h)];
+                }
+                re = bfr(re);
+                im = bfr(im);
+                mag[(size_t)k] = bfr(std::sqrt(bfr(bfr(re * re) + bfr(im * im))));
+            }
+            for (int64_t m = 0; m < nm; ++m) {
+                float s = 0.0f;
+                for (int64_t k = 0; k < F; ++k) s += mel[(size_t)(m * F + k)] * mag[(size_t)k];
+                want[(size_t)(t * ch * nm + h * nm + m)] = std::log(std::max(bfr(s), bfr(1e-5f)));
+            }
+        }
+    check("stft_logmel 512-point, hop 128, 64 mel bins, 2 channels", down_bf16(dy, want.size()),
+          want, 5e-3);
+}
+
+/* A decoder's volume at a scale and a constant, off a device geometry. */
+void int_affine_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "int_affine");
+    if (!r) { ok("int_affine", false, "row absent"); return; }
+    RadTensor x = TI32({ 4 }, { 21, 16, 24, 30 });
+    void* dy = dalloc(5 * 4);
+    const int rc = launch(r, { x, T(dy, RAD_I32, { 5 }) },
+                          { PI("M", 5), PS("src", "0 1 2 -1 3"), PS("mul", "8 2 2 0 4"),
+                            PS("add", "-7 0 0 1 -3") });
+    if (rc != RAD_OK) { ok("int_affine", false, "rc " + std::to_string(rc)); return; }
+    const std::vector<int32_t> got = down_i32(dy, 5);
+    ok("int_affine (8 F - 7, 2 h, 2 w, 1, 4 n - 3)",
+       got == std::vector<int32_t>({ 161, 32, 48, 1, 117 }));
+}
+
+/* 16 kHz to 48 kHz over two channels, f32 out as the vocoder's waveform. */
+void bwe_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "bwe_up");
+    if (!r) { ok("bwe_up", false, "row absent"); return; }
+    const int64_t S = 400, ch = 2, ratio = 3, O = S * ratio;
+    std::vector<float> x = randv((size_t)(S * ch), 0.8f), res = randv((size_t)(O * ch), 0.5f);
+    void* dx = up_bf16(x);
+    void* dr = up_bf16(res);
+    void* dy = dalloc((size_t)(O * ch) * 4);
+    const int rc = launch(r, { T(dx, RAD_BF16, { S, ch }), T(dr, RAD_BF16, { O, ch }),
+                               T(dy, RAD_F32, { O, ch }) },
+                          { PI("M", O), PI("ratio", ratio), PI("ch", ch), PS("dtype", "bf16") });
+    if (rc != RAD_OK) { ok("bwe_up", false, "rc " + std::to_string(rc)); return; }
+    const int64_t w = (int64_t)std::ceil(6.0 / 0.99), K = 2 * w * ratio + 1;
+    std::vector<float> f((size_t)K);
+    for (int64_t n = 0; n < K; ++n) {
+        const float u = ((float)n / (float)ratio - (float)w) * 0.99f;
+        const float uc = std::min(std::max(u, -6.0f), 6.0f);
+        const float cw = std::cos(uc * (float)M_PI / 6.0f / 2.0f);
+        const float pu = (float)M_PI * u;
+        const float sinc = u == 0.0f ? 1.0f : std::sin(pu) / pu;
+        f[(size_t)n] = bfr(sinc * (cw * cw) * 0.99f / (float)ratio);
+    }
+    std::vector<float> want((size_t)(O * ch));
+    for (int64_t o = 0; o < O; ++o)
+        for (int64_t h = 0; h < ch; ++h) {
+            const int64_t u = o + 2 * w * ratio;
+            float acc = 0.0f;
+            for (int64_t k = u % ratio; k < K; k += ratio) {
+                const int64_t s = std::min(std::max<int64_t>((u - k) / ratio - w, 0), S - 1);
+                acc += f[(size_t)k] * x[(size_t)(s * ch + h)];
+            }
+            const float up = bfr((float)ratio * bfr(acc));
+            const float v = bfr(res[(size_t)(o * ch + h)] + up);
+            want[(size_t)(o * ch + h)] = std::min(std::max(v, -1.0f), 1.0f);
+        }
+    check("bwe_up 3x over 2 channels, f32 out", down_f32(dy, want.size()), want, 4e-3);
+}
+
+/* conv2d_nhwc's three paddings (same, down, causal) on the implicit GEMM, and causal on the direct
+ * kernel (the audio VAE's 2-channel input). */
+void conv2d_cases(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "conv2d_nhwc_bf16");
+    if (!r) { ok("conv2d_nhwc_bf16", false, "row absent"); return; }
+    struct Case { const char* pad; int64_t cin, cout, k, stride, H, W; };
+    for (const Case c : { Case{ "same", 64, 96, 3, 1, 9, 13 }, Case{ "down", 32, 64, 3, 2, 10, 14 },
+                          Case{ "causal", 64, 128, 3, 1, 11, 8 },
+                          Case{ "causal", 2, 32, 3, 1, 12, 16 } }) {
+        const bool down = !std::strcmp(c.pad, "down"), causal = !std::strcmp(c.pad, "causal");
+        const int64_t pt = down ? 0 : causal ? c.k - 1 : c.k / 2, pb = down ? 1 : causal ? 0 : c.k / 2;
+        const int64_t pl0 = down ? 0 : c.k / 2, pr = down ? 1 : c.k / 2;
+        const int64_t Ho = (c.H + pt + pb - c.k) / c.stride + 1, Wo = (c.W + pl0 + pr - c.k) / c.stride + 1;
+        const int64_t K = c.cin * c.k * c.k;
+        std::vector<float> x = randv((size_t)(c.H * c.W * c.cin), 1.0f);
+        std::vector<float> w = randv((size_t)(c.cout * K), 1.5f / std::sqrt((float)K));
+        std::vector<float> b = randv((size_t)c.cout, 0.3f);
+        for (float& e : w) e = bfr(e);
+        const std::vector<RadParam> ps = { PI("M", Ho), PI("cin", c.cin), PI("cout", c.cout),
+                                           PI("k", c.k), PI("stride", c.stride), PS("pad", c.pad),
+                                           PI("up", 1), PS("dtype", "bf16") };
+        const std::string nm = fmt("conv2d_nhwc_bf16 pad %s, %lld -> %lld, stride %lld", c.pad,
+                                   (long long)c.cin, (long long)c.cout, (long long)c.stride);
+        void* dw = stored_weight(r, ps, w, c.cout, K, nm.c_str());
+        void* dx = up_bf16(x);
+        void* db = up_bf16(b);
+        void* dy = dalloc((size_t)(Ho * Wo * c.cout) * 2);
+        const int rc = launch(r, { T(dx, RAD_BF16, { c.H, c.W * c.cin }), T(dw, RAD_BF16, { c.cout, K }),
+                                   T(db, RAD_BF16, { c.cout }), T(dy, RAD_BF16, { Ho, Wo * c.cout }) },
+                              ps);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> want((size_t)(Ho * Wo * c.cout));
+        for (int64_t oy = 0; oy < Ho; ++oy)
+            for (int64_t ox = 0; ox < Wo; ++ox)
+                for (int64_t o = 0; o < c.cout; ++o) {
+                    double acc = 0.0;
+                    for (int64_t kh = 0; kh < c.k; ++kh)
+                        for (int64_t kw = 0; kw < c.k; ++kw) {
+                            const int64_t iy = oy * c.stride + kh - pt, ix = ox * c.stride + kw - pl0;
+                            if (iy < 0 || iy >= c.H || ix < 0 || ix >= c.W) continue;
+                            for (int64_t ci = 0; ci < c.cin; ++ci)
+                                acc += (double)w[(size_t)(((o * c.cin + ci) * c.k + kh) * c.k + kw)] *
+                                       x[(size_t)((iy * c.W + ix) * c.cin + ci)];
+                        }
+                    want[(size_t)((oy * Wo + ox) * c.cout + o)] = bfr((float)acc + b[(size_t)o]);
+                }
+        check(nm, down_bf16(dy, want.size()), want, 5e-3);
+    }
+    /* One output channel into the second half of wider rows (an audio decoder's conv_out writing
+     * a channel's mel bins into its own columns): the slice right, the other half untouched. */
+    {
+        const int64_t cin = 128, H = 9, W = 16, k = 3, K = cin * k * k, P = 2 * W;
+        std::vector<float> x = randv((size_t)(H * W * cin), 1.0f);
+        std::vector<float> w = randv((size_t)K, 1.5f / std::sqrt((float)K)), b = { 0.25f };
+        for (float& e : w) e = bfr(e);
+        const std::vector<RadParam> ps = { PI("M", H), PI("cin", cin), PI("cout", 1), PI("k", k),
+                                           PI("stride", 1), PS("pad", "causal"), PI("up", 1),
+                                           PS("dtype", "bf16") };
+        const char* nm = "conv2d_nhwc_bf16 causal 128 -> 1 into a column slice";
+        void* dw = stored_weight(r, ps, w, 1, K, nm);
+        std::vector<float> pre((size_t)(H * P), -7.5f);
+        void* dy = up_bf16(pre);
+        RadTensor ty = T((uint16_t*)dy + W, RAD_BF16, { H, W });
+        ty.stride[0] = P;
+        const int rc = launch(r, { T(up_bf16(x), RAD_BF16, { H, W * cin }), T(dw, RAD_BF16, { 1, K }),
+                                   T(up_bf16(b), RAD_BF16, { 1 }), ty },
+                              ps);
+        if (rc != RAD_OK) ok(nm, false, "rc " + std::to_string(rc));
+        else {
+            const std::vector<float> got = down_bf16(dy, (size_t)(H * P));
+            std::vector<float> want((size_t)(H * W)), sl((size_t)(H * W));
+            bool kept = true;
+            for (int64_t oy = 0; oy < H; ++oy)
+                for (int64_t ox = 0; ox < W; ++ox) {
+                    double acc = 0.0;
+                    for (int64_t kh = 0; kh < k; ++kh)
+                        for (int64_t kw = 0; kw < k; ++kw) {
+                            const int64_t iy = oy + kh - (k - 1), ix = ox + kw - k / 2;
+                            if (iy < 0 || ix < 0 || ix >= W) continue;
+                            for (int64_t ci = 0; ci < cin; ++ci)
+                                acc += (double)w[(size_t)((ci * k + kh) * k + kw)] *
+                                       x[(size_t)((iy * W + ix) * cin + ci)];
+                        }
+                    want[(size_t)(oy * W + ox)] = bfr((float)acc + b[0]);
+                    sl[(size_t)(oy * W + ox)] = got[(size_t)(oy * P + W + ox)];
+                    kept = kept && got[(size_t)(oy * P + ox)] == -7.5f;
+                }
+            check(nm, sl, want, 5e-3);
+            ok("conv2d_nhwc_bf16 leaves the columns outside the slice alone", kept);
+        }
+    }
+}
+
+}  /* namespace ltx */
+
 /* ---- a video latent upscaler's ops, at MiniMax-H3's shapes ---------------------------------------
  *
  * The upscaler runs a 37-frame clip at its 42 x 24 latent (the source) and at 84 x 48 (the
@@ -6886,14 +8085,18 @@ std::vector<int64_t> conv_rows(const Vol& v, int64_t M, int64_t want) {
 
 /* libref's conv3d_ndhwc at output row r: the products (exact in f32) summed in f64, rounded to f32,
  * the bias added in f32 and rounded; with a residual, that plus the residual, rounded. `wt` is the
- * weight tap-major, as the row stores it. */
+ * weight tap-major, as the row stores it. `v` is the input's volume; `tpad` 1 replicates the edge
+ * frames, 2 is causal with `tpre` more first frames in front. */
 void conv3d_row(const std::vector<float>& x, int64_t cin, const std::vector<float>& wt,
                 const std::vector<float>& b, const float* res, const Vol& v, int64_t cout,
-                int64_t r, float* out) {
+                int64_t r, float* out, int tpad = 0, int64_t tpre = 0) {
     const int64_t HW = v.H * v.W, t = r / HW, y = (r / v.W) % v.H, xx = r % v.W;
     std::vector<double> acc((size_t)cout, 0.0);
     for (int64_t tap = 0; tap < 27; ++tap) {
-        const int64_t nt = t + tap / 9 - 1, ny = y + (tap / 3) % 3 - 1, nx = xx + tap % 3 - 1;
+        int64_t nt = t + tap / 9 - 1;
+        if (tpad == 1) nt = std::min<int64_t>(std::max<int64_t>(nt, 0), v.T - 1);
+        else if (tpad == 2) nt = std::max<int64_t>(nt - 1 - tpre, 0);
+        const int64_t ny = y + (tap / 3) % 3 - 1, nx = xx + tap % 3 - 1;
         if (nt < 0 || nt >= v.T || ny < 0 || ny >= v.H || nx < 0 || nx >= v.W) continue;
         const float* xr = &x[(size_t)((nt * HW + ny * v.W + nx) * cin)];
         for (int64_t o = 0; o < cout; ++o) {
@@ -6919,18 +8122,23 @@ struct ConvCase {
     int64_t xpad, ypad, yextra;   /* pitch padding, output rows past the volume */
     int64_t mshort;   /* the M parameter this short of T H W: the volume's rows are written */
     int64_t sample;   /* rows checked besides the faces; 0 every row */
+    int tpad = 0;     /* 0 zero, 1 replicate, 2 causal frame padding */
+    int64_t tpre = 0; /* causal: more first frames in front, as many more output frames */
 };
 
 void conv3d_case(const RadKernelInfo* r, const ConvCase& c) {
     const Vol& v = c.v;
-    const int64_t vol = v.T * v.H * v.W, M = vol, K = 27 * c.cin;
+    const Vol vo{ v.T + c.tpre, v.H, v.W };
+    const int64_t vol = v.T * v.H * v.W, M = vo.T * v.H * v.W, K = 27 * c.cin;
     const int64_t ldx = c.cin + c.xpad, ldy = c.cout + c.ypad, yrows = M + c.yextra;
-    const std::string nm = fmt("conv3d_ndhwc_bf16 %s: %lld -> %lld at %lld x %lld, %lld frames%s%s%s",
+    static const char* const kTpad[] = { "", ", replicate", ", causal" };
+    const std::string nm = fmt("conv3d_ndhwc_bf16 %s: %lld -> %lld at %lld x %lld, %lld frames%s%s%s%s",
                                c.what, (long long)c.cin, (long long)c.cout, (long long)v.H,
                                (long long)v.W, (long long)v.T,
                                c.res == 2 ? ", res in place" : c.res ? ", res" : "",
                                c.bf32 ? ", f32 bias" : "",
-                               c.xpad || c.ypad || c.yextra || c.mshort ? ", pitched" : "");
+                               c.xpad || c.ypad || c.yextra || c.mshort ? ", pitched" : "",
+                               kTpad[c.tpad]);
     g_seed = 0xc03dull + (uint64_t)(c.cin * 131 + c.cout * 7 + v.T);
     std::vector<float> x = randv((size_t)(vol * c.cin), 1.0f);
     std::vector<float> w = randv((size_t)(c.cout * K), 1.5f / std::sqrt((float)K));
@@ -6945,6 +8153,8 @@ void conv3d_case(const RadKernelInfo* r, const ConvCase& c) {
                 wt[(size_t)((o * 27 + t) * c.cin + ci)] = w[(size_t)((o * c.cin + ci) * 27 + t)];
     std::vector<RadParam> ps = { PI("M", M - c.mshort), PI("cin", c.cin), PI("cout", c.cout),
                                  PI("k", 3), PI("kt", 3), PS("dtype", "bf16") };
+    if (c.tpad) ps.push_back(PS("tpad", c.tpad == 1 ? "replicate" : "causal"));
+    if (c.tpre) ps.push_back(PI("tpre", c.tpre));
     void* dw = stored_weight(r, ps, w, c.cout, K, nm.c_str());
     void* dx = up_rows(x, vol, c.cin, ldx, vol);
     std::vector<float> bb = b;
@@ -6969,7 +8179,7 @@ void conv3d_case(const RadKernelInfo* r, const ConvCase& c) {
     const std::vector<uint16_t> yb = down_u16(dy, (size_t)(yrows * ldy));
     std::vector<int64_t> rows;
     if (c.sample) {
-        rows = conv_rows(v, M, c.sample);
+        rows = conv_rows(vo, M, c.sample);
     } else {
         for (int64_t i = 0; i < M; ++i) rows.push_back(i);
     }
@@ -6977,7 +8187,7 @@ void conv3d_case(const RadKernelInfo* r, const ConvCase& c) {
     par_for((int64_t)rows.size(), [&](int64_t i) {
         const int64_t rr = rows[(size_t)i];
         conv3d_row(x, c.cin, wt, b, c.res ? &res[(size_t)(rr * c.cout)] : nullptr, v, c.cout, rr,
-                   &want[(size_t)i * c.cout]);
+                   &want[(size_t)i * c.cout], c.tpad, c.tpre);
         for (int64_t o = 0; o < c.cout; ++o)
             got[(size_t)i * c.cout + o] = h_bf16(yb[(size_t)(rr * ldy + o)]);
     });
@@ -7005,6 +8215,12 @@ void conv3d_cases(const Plugin& pl) {
              ConvCase{ "one frame", Vol{ 1, 9, 13 }, 16, 24, 2, true, 0, 8, 2, 0, 0 },
              ConvCase{ "one row", Vol{ 4, 1, 21 }, 8, 8, 0, false, 8, 0, 0, 0, 0 },
              ConvCase{ "two tiles a tap", Vol{ 2, 11, 6 }, 128, 136, 2, false, 0, 0, 7, 0, 0 },
+             /* LTX-2's VAE: the decoder's replicated frames, the encoder's causal ones (its
+              * 48-channel patchified input off the 64-channel tile), and the temporal
+              * downsampler's first frame prepended once more. */
+             ConvCase{ "replicate", Vol{ 4, 6, 10 }, 128, 128, 2, false, 0, 0, 3, 0, 0, 1, 0 },
+             ConvCase{ "causal", Vol{ 5, 7, 9 }, 48, 128, 0, false, 8, 0, 0, 0, 0, 2, 0 },
+             ConvCase{ "causal, one more frame", Vol{ 3, 6, 6 }, 64, 64, 1, true, 0, 8, 4, 0, 0, 2, 1 },
          })
         conv3d_case(r, c);
     /* A 15 s clip at the target size: 411264 rows, the largest volume the model runs. */
@@ -7083,6 +8299,13 @@ void group_norm_cases(const Plugin& pl) {
              G{ "f32 in, bf16 out", 101, 512, 32, true, false, false, 0, false, false, -3.0f, 16 },
              G{ "one row", 1, 512, 32, false, false, false, 1, true, false, 0.0f, 0 },
              G{ "64 channels", 1000, 64, 8, false, true, false, 0, true, false, 0.0f, 8 },
+             /* Groups of 4 channels (four-channel chunks): the FLUX.2 VAE's 128 channels in 32
+              * groups at a 256 x 256 image, bf16 with SiLU, then f32 rows over a large mean. */
+             G{ "4 channels a group", 256 * 256, 128, 32, false, false, false, 0, true, false, 0.0f, 0 },
+             /* Groups of 2 channels (two-channel chunks): a 64-wide latent upsampler in 32 groups. */
+             G{ "2 channels a group", 48 * 8 * 8, 64, 32, false, false, false, 0, true, false, 0.0f, 0 },
+             G{ "2 channels a group, f32 rows", 777, 64, 32, true, true, true, 2, false, false, 5.0f, 8 },
+             G{ "4 channels a group, f32", 777, 128, 32, true, true, true, 2, false, false, 20.0f, 8 },
          }) {
         const int64_t M = g.M, n = g.n, ld = n + g.pad, rows = M + 2;
         const std::string nm = fmt("group_norm %s: %lld x %lld in %lld groups", g.what,
@@ -12030,12 +13253,13 @@ static void mla_check(const Plugin& pl, int64_t rows, int64_t heads, int64_t blo
         st_memcpy(right, (char*)scratch + 128 + need, 128, hipMemcpyDeviceToHost);
         for (int i = 0; i < 128; ++i) guards = guards && left[i] == 0xa5 && right[i] == 0xa5;
     }
-    const char* pairing = std::getenv("RADIANCE_MLA_PAIR");
+    /* Paired tiles walk the union of both tables up to 520 entries (kUnionBlocks), past it the
+     * tables position by position. */
+    const bool positional = std::strstr(name, "matrix") && heads % 16 && blocks > 520;
     ok(fmt("MLA M=%lld heads=%lld blocks=%lld%s%s%s split/unsplit, max error %.8g", (long long)rows,
            (long long)heads, (long long)blocks,
            fill == MlaFill::topk ? fmt(" topk:%lld", (long long)swaps).c_str() : "",
-           form ? fmt(" pinned form %d", form).c_str() : "",
-           pairing && std::strstr(name, "matrix") ? fmt(" pairing %s", pairing).c_str() : "",
+           form ? fmt(" pinned form %d", form).c_str() : "", positional ? " positional pairing" : "",
            max_error)
            .c_str(),
        matches);
@@ -12169,8 +13393,7 @@ static void mla_perf(const Plugin& pl, int64_t M, int64_t blocks, int64_t heads,
                                  PI("blocks", blocks), PI("block_size", bs), PF("scale", 0.0625),
                                  PS("dtype", "bf16") };
     std::vector<uint16_t> base, rule;
-    auto run = [&](const char* name, int form, const char* label, bool positional = false) {
-        ScopedEnv pairing("RADIANCE_MLA_PAIR", positional ? "pos" : nullptr);
+    auto run = [&](const char* name, int form, const char* label) {
         const RadKernelInfo* r = find(pl, name);
         if (!r) {
             std::printf("  %-34s row absent\n", label);
@@ -12235,28 +13458,15 @@ static void mla_perf(const Plugin& pl, int64_t M, int64_t blocks, int64_t heads,
                 ulp = std::max(ulp, std::abs(ord(got[i]) - ord(base[i])));
                 abs_err = std::max(abs_err, std::fabs(x - y));
             }
-            /* The two key loads stage the same values: their outputs must agree to the bit. The
-             * pairings walk request r of a pair in the same order (equal at one split) and r+1 in
-             * another. */
-            std::string same =
+            /* The two key loads stage the same values: their outputs must agree to the bit. */
+            const std::string same =
                 form == 1 && !rule.empty()
                     ? (rule == got ? ", bit-identical to form 0" : ", DIFFERS from form 0")
                     : "";
-            if (positional && !rule.empty()) {
-                size_t differ[2] = { 0, 0 };
-                float apart = 0;
-                for (size_t i = 0; i < got.size(); ++i)
-                    if (got[i] != rule[i]) {
-                        ++differ[(i / (size_t)(heads * D)) % 2];
-                        apart = std::max(apart, std::fabs(h_bf16(got[i]) - h_bf16(rule[i])));
-                    }
-                same = fmt(", vs union %zu/%zu values differ (r/r+1), max abs %.3g", differ[0],
-                           differ[1], apart);
-            }
             std::snprintf(diff, sizeof diff, "%smax %d ulp, max abs %.3g%s",
                           finite ? "" : "NONFINITE ", ulp, abs_err, same.c_str());
         }
-        if (form == 0 && !positional) rule = got;
+        if (form == 0) rule = got;
         std::printf("  %-34s %10.2f us  %7.2f TFLOP/s  %s\n", label, us, flops / (us * 1e6), diff);
         if (form >= 0 && pl.mla_stats) {
             /* One more launch with the conflict counters on, outside the timing. */
@@ -12276,10 +13486,13 @@ static void mla_perf(const Plugin& pl, int64_t M, int64_t blocks, int64_t heads,
         std::printf("  mla_attn_matrix_bf16 serves heads a multiple of 8 only\n");
         return;
     }
-    if (heads % 16) {
+    /* Tables of up to 520 entries (kUnionBlocks) pair by their union, wider ones by position. */
+    if (heads % 16 && blocks <= 520) {
         run("mla_attn_matrix_bf16", 0, "matrix paired, union, vector load");
         run("mla_attn_matrix_bf16", 1, "matrix paired, union, element load");
-        run("mla_attn_matrix_bf16", 0, "matrix paired, positional, vector", true);
+    } else if (heads % 16) {
+        run("mla_attn_matrix_bf16", 0, "matrix paired, positional, vector");
+        run("mla_attn_matrix_bf16", 1, "matrix paired, positional, element");
     } else {
         run("mla_attn_matrix_bf16", 0, "matrix 16 heads, vector load");
         run("mla_attn_matrix_bf16", 1, "matrix 16 heads, element load");
@@ -12449,41 +13662,6 @@ static void kda_check(const Plugin& pl, const char* mode, bool cold, int accepte
     dlclose(ref);
 }
 
-/* Saves the given switches on construction and restores them on destruction; pin() sets each
- * to its value or, for nullptr, back to what the caller had. */
-struct EnvPins {
-    std::vector<const char*> names;
-    std::vector<std::string> saved;
-    std::vector<bool> had;
-    explicit EnvPins(std::initializer_list<const char*> n) : names(n) {
-        for (const char* k : names) {
-            const char* v = std::getenv(k);
-            had.push_back(v != nullptr);
-            saved.push_back(v ? v : "");
-        }
-    }
-    void pin(std::initializer_list<const char*> values) {
-        size_t i = 0;
-        for (const char* v : values) {
-            if (v)
-                setenv(names[i], v, 1);
-            else if (had[i])
-                setenv(names[i], saved[i].c_str(), 1);
-            else
-                unsetenv(names[i]);
-            ++i;
-        }
-    }
-    ~EnvPins() {
-        for (size_t i = 0; i < names.size(); ++i) {
-            if (had[i])
-                setenv(names[i], saved[i].c_str(), 1);
-            else
-                unsetenv(names[i]);
-        }
-    }
-};
-
 /* One launch, then a 200 ms warm-up and `iters` timed launches (st_time_us: --cold gives the
  * median of flushed launches). -1 when the row refuses the arguments. */
 static double form_us(const RadKernelInfo* r, RadArgs* a, int iters) {
@@ -12510,15 +13688,16 @@ static std::vector<uint8_t> fetch_bytes(const void* d, size_t bytes) {
     return v;
 }
 
-/* kda_update at GLM's TP8 shape (eight heads, 128 x 128 state per head), every form held byte for
- * byte to the one-row kernel on shuffle sums (RADIANCE_KDA_FORM=old) over the output and the
- * whole state buffer, the slots no sequence names included: prefill of M tokens as one sequence
- * per candidate and as three anchored sequences (one cold, one unseated), and the verify step of
- * eight sequences with up to six candidates, per candidate and anchored, the anchored one after a
- * replay of the accepted prefix. `iters` below zero compares only, as a case. */
-static void kda_forms(const Plugin& pl, int64_t M, int iters) {
+/* kda_update at GLM's TP8 shape (eight heads, 128 x 128 state per head): prefill of M tokens as
+ * one sequence per candidate and as three anchored sequences (one cold, one unseated), and the
+ * verify step of eight sequences with up to six candidates, per candidate and anchored, the
+ * anchored one after a replay of the accepted prefix. Timed, or with `iters` below zero held to
+ * libref over the output and the whole state buffer, the slots no sequence names included, as a
+ * case: the lane reductions sum in another order than libref's loops, so f32 state within
+ * 2e-5 + 2e-5 |x| and bf16 output within one rounding step. */
+static void kda_perf(const Plugin& pl, int64_t M, int iters) {
     const bool check = iters < 0;
-    if (iters == 0) iters = 50;
+    if (iters <= 0) iters = 50;
     if (M < 1 || M > 65535) {
         std::printf("--perfkda: 1 <= M <= 65535\n");
         return;
@@ -12526,6 +13705,23 @@ static void kda_forms(const Plugin& pl, int64_t M, int iters) {
     const RadKernelInfo* row = find(pl, "kda_update_k128_v128_bf16");
     if (!row) {
         std::printf("--perfkda: row kda_update_k128_v128_bf16 absent\n");
+        return;
+    }
+    const RadKernelInfo* oracle = nullptr;
+    void* ref = nullptr;
+    if (check && g_plugin) {
+        std::string path(g_plugin);
+        path = path.substr(0, path.find_last_of('/') + 1) + "libref.so";
+        ref = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+        auto count = ref ? (int (*)(void))dlsym(ref, "rad_kernel_count") : nullptr;
+        auto at = ref ? (const RadKernelInfo* (*)(int))dlsym(ref, "rad_kernel_at") : nullptr;
+        if (count && at)
+            for (int i = 0; i < count() && !oracle; ++i)
+                if (!std::strcmp(at(i)->op, "kda_update")) oracle = at(i);
+    }
+    if (check && !oracle) {
+        ok("KDA at GLM's TP8 shape", false, "reference operation unavailable");
+        if (ref) dlclose(ref);
         return;
     }
     const int64_t H = 8, D = 128, slots = 64, tokens = std::max<int64_t>(M, 48);
@@ -12628,20 +13824,6 @@ static void kda_forms(const Plugin& pl, int64_t M, int iters) {
         cases.push_back(c);
     }
 
-    EnvPins env({ "RADIANCE_KDA_FORM", "RADIANCE_KDA_ROWS", "RADIANCE_KDA_PREFETCH" });
-    struct Form {
-        const char* what;
-        const char* form;
-        const char* rows;
-        const char* prefetch;
-    };
-    const Form forms[] = { { "rule", nullptr, nullptr, nullptr },
-                           { "1 row a wave", "new", "1", "1" },
-                           { "2 rows a wave", "new", "2", "1" },
-                           { "4 rows a wave", "new", "4", "1" },
-                           { "1 row a wave, no prefetch", "new", "1", "0" },
-                           { "2 rows a wave, no prefetch", "new", "2", "0" },
-                           { "4 rows a wave, no prefetch", "new", "4", "0" } };
     if (!check)
         std::printf("kda_update at GLM's TP8 shape (8 heads, 128 x 128), %s, %d launches\n",
                     g_cold > 0 ? fmt("cold (%lld MiB, median)", (long long)(g_cold >> 20)).c_str()
@@ -12691,54 +13873,65 @@ static void kda_forms(const Plugin& pl, int64_t M, int iters) {
         a.p = ps.data();
         a.n_p = (int)ps.size();
         a.world_size = 1;
-        auto run = [&]() {
-            st_memcpy(d_state, start.data(), state_bytes, hipMemcpyHostToDevice);
-            st_memset(d_out, 0xff, out_bytes);
-            if (row->launch(&a, nullptr) != RAD_OK || st_stream_sync(nullptr) != hipSuccess)
-                return false;
-            return true;
-        };
-        auto outputs = [&]() {
-            std::vector<uint8_t> o = fetch_bytes(d_out, out_bytes);
-            const std::vector<uint8_t> s = fetch_bytes(d_state, state_bytes);
-            o.insert(o.end(), s.begin(), s.end());
-            return o;
-        };
-        env.pin({ "old", nullptr, nullptr });
-        const bool ref_ok = run();
-        const std::vector<uint8_t> ref = outputs();
-        if (check)
-            ok(fmt("KDA %s: old form served", c.what.c_str()).c_str(), ref_ok);
-        else
-            std::printf("  %s\n    %-34s %8.1f us\n", c.what.c_str(), "old",
-                        ref_ok ? form_us(row, &a, iters) : -1.0);
-        for (const Form& f : forms) {
-            env.pin({ f.form, f.rows, f.prefetch });
-            const bool served = run();
-            const bool same = served && outputs() == ref;
-            if (check) {
-                ok(fmt("KDA %s, %s: byte-identical to the old form", c.what.c_str(), f.what)
-                       .c_str(),
-                   ref_ok && same, served ? "" : "not served");
-                continue;
+        st_memcpy(d_state, start.data(), state_bytes, hipMemcpyHostToDevice);
+        st_memset(d_out, 0xff, out_bytes);
+        if (check) {
+            std::vector<uint16_t> want_out((size_t)(tokens * H * D), 0xffff);
+            std::vector<float> want_state = start;
+            void* const host[13] = { in[0].data(),      in[1].data(),      in[2].data(),
+                                     in[3].data(),      in[4].data(),      alog.data(),
+                                     bias.data(),       want_state.data(), c.idx.data(),
+                                     c.cu.data(),       c.accepted.data(), c.init.data(),
+                                     want_out.data() };
+            std::vector<RadTensor> ht = t;
+            for (int i = 0; i < 13; ++i) ht[(size_t)i].data = host[i];
+            RadArgs ha = a;
+            ha.t = ht.data();
+            const bool served = oracle->launch(&ha, nullptr) == RAD_OK &&
+                                row->launch(&a, nullptr) == RAD_OK &&
+                                st_stream_sync(nullptr) == hipSuccess;
+            std::vector<uint16_t> got_out(want_out.size());
+            std::vector<float> got_state(state_floats);
+            st_memcpy(got_out.data(), d_out, out_bytes, hipMemcpyDeviceToHost);
+            st_memcpy(got_state.data(), d_state, state_bytes, hipMemcpyDeviceToHost);
+            size_t bad = 0;
+            for (size_t i = 0; i < got_out.size(); ++i) {
+                if (got_out[i] == want_out[i]) continue;
+                const float x = h_bf16(got_out[i]), y = h_bf16(want_out[i]);
+                if (!std::isfinite(x) || !std::isfinite(y) ||
+                    std::fabs(x - y) > 0.008f + 0.008f * std::fabs(y)) {
+                    if (bad < 4) std::printf("        out[%zu]: %.6g, libref %.6g\n", i, x, y);
+                    ++bad;
+                }
             }
-            const double us = served ? form_us(row, &a, iters) : -1.0;
-            if (us < 0)
-                std::printf("    %-34s not served\n", f.what);
-            else
-                std::printf("    %-34s %8.1f us%s\n", f.what, us,
-                            same ? "  = old" : "  DIFFERS from old");
+            for (size_t i = 0; i < got_state.size(); ++i) {
+                if (got_state[i] == want_state[i]) continue;
+                if (!std::isfinite(got_state[i]) ||
+                    std::fabs(got_state[i] - want_state[i]) > 2e-5f + 2e-5f * std::fabs(want_state[i])) {
+                    if (bad < 4)
+                        std::printf("        state[%zu] (slot %zu): %.9g, libref %.9g, start %.9g\n", i,
+                                    i / (size_t)(H * D * D), got_state[i], want_state[i], start[i]);
+                    ++bad;
+                }
+            }
+            ok(fmt("KDA %s: output and whole state at libref's (%zu outside)", c.what.c_str(), bad)
+                   .c_str(),
+               served && !bad, served ? "" : "not served");
+            continue;
         }
+        const double us = form_us(row, &a, iters);
+        if (us < 0)
+            std::printf("  %-44s not served\n", c.what.c_str());
+        else
+            std::printf("  %-44s %8.1f us\n", c.what.c_str(), us);
     }
+    if (ref) dlclose(ref);
 }
 
-/* mla_project at GLM's TP8 shape (eight heads, head_dim 256, latent 512) in both modes, every row
- * form held byte for byte to the one-row kernels on shuffle sums (RADIANCE_MLA_PROJECT=old) over
- * the whole pitched output, so a store past a row or into the pitch shows. M not a multiple of the
- * rows a group checks the tail. `iters` below zero compares only, as a case. */
-static void project_forms(const Plugin& pl, int64_t M, int iters) {
-    const bool check = iters < 0;
-    if (iters == 0) iters = 100;
+/* mla_project at GLM's TP8 shape (eight heads, head_dim 256, latent 512) in both modes, on pitched
+ * tensors, timed. mla_project_check holds the row to libref. */
+static void project_perf(const Plugin& pl, int64_t M, int iters) {
+    if (iters <= 0) iters = 100;
     if (M < 1 || M > 65535) {
         std::printf("--perfproject: 1 <= M <= 65535\n");
         return;
@@ -12758,14 +13951,11 @@ static void project_forms(const Plugin& pl, int64_t M, int iters) {
         return;
     }
     st_memcpy(d_w, w.data(), w.size() * 2, hipMemcpyHostToDevice);
-    EnvPins env({ "RADIANCE_MLA_PROJECT" });
-    if (!check)
-        std::printf(
-            "mla_project at GLM's TP8 shape (8 heads, 256 <-> 512), M=%lld, %s, %d launches\n",
-            (long long)M,
-            g_cold > 0 ? fmt("cold (%lld MiB, median)", (long long)(g_cold >> 20)).c_str()
-                       : "warm (back to back, mean)",
-            iters);
+    std::printf("mla_project at GLM's TP8 shape (8 heads, 256 <-> 512), M=%lld, %s, %d launches\n",
+                (long long)M,
+                g_cold > 0 ? fmt("cold (%lld MiB, median)", (long long)(g_cold >> 20)).c_str()
+                           : "warm (back to back, mean)",
+                iters);
     for (const char* mode : { "absorb", "expand" }) {
         const bool absorb = !std::strcmp(mode, "absorb");
         const int64_t xd = absorb ? 256 : 512, yd = absorb ? 512 : 256;
@@ -12797,38 +13987,12 @@ static void project_forms(const Plugin& pl, int64_t M, int iters) {
         a.p = ps.data();
         a.n_p = (int)ps.size();
         a.world_size = 1;
-        const size_t y_bytes = (size_t)(M * yr * 2);
-        auto run = [&]() {
-            st_memset(d_y, 0xa5, y_bytes);
-            return row->launch(&a, nullptr) == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
-        };
-        env.pin({ "old" });
-        const bool ref_ok = run();
-        const std::vector<uint8_t> ref = fetch_bytes(d_y, y_bytes);
-        if (check)
-            ok(fmt("MLA project %s M=%lld: old form served", mode, (long long)M).c_str(), ref_ok);
+        st_memset(d_y, 0xa5, (size_t)(M * yr * 2));
+        const double us = form_us(row, &a, iters);
+        if (us < 0)
+            std::printf("  %-8s not served\n", mode);
         else
-            std::printf("  %s\n    %-20s %8.1f us\n", mode, "old",
-                        ref_ok ? form_us(row, &a, iters) : -1.0);
-        for (const char* f : { (const char*)nullptr, "1", "2", "4", "8" }) {
-            env.pin({ f });
-            const bool served = run();
-            const bool same = served && fetch_bytes(d_y, y_bytes) == ref;
-            const std::string what = f ? fmt("%s rows a group", f) : std::string("rule");
-            if (check) {
-                ok(fmt("MLA project %s M=%lld, %s: byte-identical to the old form", mode,
-                       (long long)M, what.c_str())
-                       .c_str(),
-                   ref_ok && same, served ? "" : "not served");
-                continue;
-            }
-            const double us = served ? form_us(row, &a, iters) : -1.0;
-            if (us < 0)
-                std::printf("    %-20s not served\n", what.c_str());
-            else
-                std::printf("    %-20s %8.1f us%s\n", what.c_str(), us,
-                            same ? "  = old" : "  DIFFERS from old");
-        }
+            std::printf("  %-8s %8.1f us\n", mode, us);
     }
 }
 
@@ -12939,7 +14103,7 @@ static void mx_experts_check(const Plugin& pl, int M, int parts, bool pooled, co
     }
     ok("MXFP4 expert storage allocation", memory_ok);
     if (!memory_ok) {
-        for (void* p : pinned) hipHostFree(p);
+        for (void* p : pinned) hip_ck(hipHostFree(p), "hipHostFree", __LINE__);
         dlclose(ref);
         return;
     }
@@ -13009,27 +14173,9 @@ static void mx_experts_check(const Plugin& pl, int M, int parts, bool pooled, co
                                                                0.004f + 0.008f * std::fabs(want));
             }
         }
-    const char* lut = std::getenv("RADIANCE_MXFP4_LUT");
-    const char* pipe = std::getenv("RADIANCE_MXFP4_PREFILL_PIPE");
-    auto env_or = [](const char* n, const char* d) {
-        const char* v = std::getenv(n);
-        return v ? v : d;
-    };
-    const char* p64 = std::getenv("RADIANCE_MXFP4_PREFILL_P64");
-    const std::string p64s =
-        !p64 ? std::string("rule")
-        : p64[0] == '1'
-            ? fmt("BM%s BN%s K%s x%s out%s db%s", env_or("RADIANCE_MXFP4_PREFILL_P64_BM", "rule"),
-                  env_or("RADIANCE_MXFP4_PREFILL_P64_BN", "rule"),
-                  env_or("RADIANCE_MXFP4_PREFILL_P64_STAGE_K", "rule"),
-                  env_or("RADIANCE_MXFP4_PREFILL_P64_COLTILES", "4"),
-                  env_or("RADIANCE_MXFP4_PREFILL_P64_STAGE_OUT", "rule"),
-                  env_or("RADIANCE_MXFP4_PREFILL_P64_DB", "0"))
-            : std::string("off");
-    ok(fmt("MXFP4 M=%d N=%d K=%d parts=%d pooled=%d %s exceptional=%d holes=%d lut=%s pipe=%s "
-           "p64=%s, pointer tables and dropped slots",
-           M, OUT, NK, parts, pooled, order, exceptional, holes, lut ? lut : "rule",
-           pipe ? pipe : "rule", p64s.c_str())
+    ok(fmt("MXFP4 M=%d N=%d K=%d parts=%d pooled=%d %s exceptional=%d holes=%d experts=%d top=%d, "
+           "pointer tables and dropped slots",
+           M, OUT, NK, parts, pooled, order, exceptional, holes, NE, top)
            .c_str(),
        match);
     ok("MXFP4 grouped output red zones and pitch", guards);
@@ -13047,7 +14193,7 @@ static void mx_experts_check(const Plugin& pl, int M, int parts, bool pooled, co
     ok("MXFP4 layout rejects a different scale group",
        row->layout(ps.data(), (int)ps.size(), 2, &enc, &selection, &plane, 1, &layout) ==
            RAD_E_DTYPE);
-    for (void* p : pinned) hipHostFree(p);
+    for (void* p : pinned) hip_ck(hipHostFree(p), "hipHostFree", __LINE__);
     dlclose(ref);
 }
 
@@ -13062,12 +14208,10 @@ static void mx_experts_check(const Plugin& pl, int M, int parts, bool pooled, co
  * the touched experts are the real traffic. Warm, a touched set under 64 MiB is cache-resident
  * after the first launch; --cold is the engine's case.
  *
- * Forms are chosen by the RADIANCE_MXFP4_* environment, read at every launch. Their rule is
- * mirrored here only to name the form and count the expert slices it streams: a (job, expert)
- * pair reads the whole slice across the column blocks, so row groups re-read an expert once per
- * group its run spans, and the expert-major decode form once per 16 of its rows. Every form must
- * match the bytes of a pinned reference ("old": the TP8 prefill form with its stage prefetch from
- * 512 routed rows, below that the rule), since each keeps one accumulation order per element. */
+ * The form is the launcher's rule, mirrored here only to name it and count the expert slices it
+ * streams: a (job, expert) pair reads the whole slice across the column blocks, so row groups
+ * re-read an expert once per group its run spans, the expert-major decode form once per 16 of its
+ * rows, and the P64 and GLM prefill forms once per job. */
 static void mx_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_t top_k,
                     bool f8 = false, const char* skew = nullptr) {
     if (iters <= 0) iters = 100;
@@ -13177,125 +14321,8 @@ static void mx_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_
             : "warm (back to back, mean)",
         iters);
 
-    constexpr int kEnvs = 22;
-    static const char* const kEnvMx[kEnvs] = { "RADIANCE_MXFP4_DECODE_EXPERTS",
-                                               "RADIANCE_MXFP4_ALIGNED_JOBS",
-                                               "RADIANCE_MXFP4_PREFILL_N32",
-                                               "RADIANCE_MXFP4_PREFILL_M32",
-                                               "RADIANCE_MXFP4_PREFILL_N64",
-                                               "RADIANCE_MXFP4_PREFILL_CACHE_ROWS",
-                                               "RADIANCE_MXFP4_EXPERTS_STAGE_K",
-                                               "RADIANCE_MXFP4_EXPERTS_COLTILES",
-                                               "RADIANCE_MXFP4_LUT",
-                                               "RADIANCE_MXFP4_PREFILL_PIPE",
-                                               "RADIANCE_MXFP4_PREFILL_P64",
-                                               "RADIANCE_MXFP4_PREFILL_P64_MIN_T_GATE_UP",
-                                               "RADIANCE_MXFP4_PREFILL_P64_MIN_T_DOWN",
-                                               "RADIANCE_MXFP4_PREFILL_P64_BM",
-                                               "RADIANCE_MXFP4_PREFILL_P64_BN",
-                                               "RADIANCE_MXFP4_PREFILL_P64_STAGE_K",
-                                               "RADIANCE_MXFP4_PREFILL_P64_COLTILES",
-                                               "RADIANCE_MXFP4_PREFILL_P64_STAGE_OUT",
-                                               "RADIANCE_MXFP4_PREFILL_P64_T_BM64",
-                                               "RADIANCE_MXFP4_PREFILL_P64_T_BN128",
-                                               "RADIANCE_MXFP4_PREFILL_P64_T_DOWN_WIDE",
-                                               "RADIANCE_MXFP4_PREFILL_P64_DB" };
-    /* The F32-scale row has no prefill forms; its slots 1..5 and 8..21 name the MXFP4 switches,
-     * which it does not read. */
-    static const char* const kEnvF8[kEnvs] = { "RADIANCE_FP8F32_DECODE_EXPERTS",
-                                               "RADIANCE_MXFP4_ALIGNED_JOBS",
-                                               "RADIANCE_MXFP4_PREFILL_N32",
-                                               "RADIANCE_MXFP4_PREFILL_M32",
-                                               "RADIANCE_MXFP4_PREFILL_N64",
-                                               "RADIANCE_MXFP4_PREFILL_CACHE_ROWS",
-                                               "RADIANCE_FP8F32_EXPERTS_STAGE_K",
-                                               "RADIANCE_FP8F32_EXPERTS_COLTILES",
-                                               "RADIANCE_MXFP4_LUT",
-                                               "RADIANCE_MXFP4_PREFILL_PIPE",
-                                               "RADIANCE_MXFP4_PREFILL_P64",
-                                               "RADIANCE_MXFP4_PREFILL_P64_MIN_T_GATE_UP",
-                                               "RADIANCE_MXFP4_PREFILL_P64_MIN_T_DOWN",
-                                               "RADIANCE_MXFP4_PREFILL_P64_BM",
-                                               "RADIANCE_MXFP4_PREFILL_P64_BN",
-                                               "RADIANCE_MXFP4_PREFILL_P64_STAGE_K",
-                                               "RADIANCE_MXFP4_PREFILL_P64_COLTILES",
-                                               "RADIANCE_MXFP4_PREFILL_P64_STAGE_OUT",
-                                               "RADIANCE_MXFP4_PREFILL_P64_T_BM64",
-                                               "RADIANCE_MXFP4_PREFILL_P64_T_BN128",
-                                               "RADIANCE_MXFP4_PREFILL_P64_T_DOWN_WIDE",
-                                               "RADIANCE_MXFP4_PREFILL_P64_DB" };
-    const char* const* const kEnv = f8 ? kEnvF8 : kEnvMx;
-    std::string saved[kEnvs];
-    bool had[kEnvs];
-    for (int i = 0; i < kEnvs; ++i) {
-        const char* v = std::getenv(kEnv[i]);
-        had[i] = v != nullptr;
-        if (v) saved[i] = v;
-    }
-    auto restore = [&]() {
-        for (int i = 0; i < kEnvs; ++i) {
-            if (had[i])
-                setenv(kEnv[i], saved[i].c_str(), 1);
-            else
-                unsetenv(kEnv[i]);
-        }
-    };
-    auto on = [](const char* n, bool dflt) {
-        const char* v = std::getenv(n);
-        return v ? v[0] == '1' : dflt;
-    };
-    /* body()'s glm_prefill: the default of the prefill switches at GLM's projections. */
+    /* body()'s glm_prefill: the measured GLM slices, at which the prefill forms serve. */
     const bool glm = !f8 && E == 288 && top_k == 8;
-    auto num = [](const char* n, long dflt) {
-        const char* v = std::getenv(n);
-        return v && *v ? std::strtol(v, nullptr, 10) : dflt;
-    };
-    /* env nullptr: the environment as given. Expert-major forms pin stage and column tiles; the
-     * prefill forms exist only from 512 routed rows. `lut` 0 or 1 pins the weight decode, `pipe`
-     * the TP8 prefill form's stage prefetch (-1: as given); the arithmetic decode without the
-     * prefetch is the bytewise reference of the others. `bm` > 0 pins the P64 form below its row
-     * bound at BM, BN, stage, column tiles (down only), LDS output and double buffer (gate_up
-     * only); every other pinned form pins P64 off. */
-    struct Form {
-        const char* env;
-        int stage, tiles, lut, pipe = -1, bm = 0, bn = 0, sk = 0, ct = 0, out = 0, db = 0;
-    };
-    std::vector<Form> forms = { { nullptr, 0, 0, -1 },    { "100000", 256, 1, -1 },
-                                { "100000", 256, 4, -1 }, { "100000", 128, 1, -1 },
-                                { "100000", 128, 4, -1 }, { "000000", 0, 0, -1 } };
-    if (!f8)
-        for (int lut : { 0, 1 }) {
-            forms.push_back({ "100000", 256, 1, lut });
-            forms.push_back({ "100000", 128, 4, lut });
-        }
-    if (Tr >= 512 && !f8) {
-        for (const char* f : { "010000", "001000", "011000", "011100", "011110", "011111" })
-            forms.push_back({ f, 0, 0, -1 });
-        for (int pipe : { 0, 1 })
-            for (int lut : { 0, 1 }) forms.push_back({ "011111", 0, 0, lut, pipe });
-    }
-    const Form old = Tr >= 512 && !f8 ? Form{ "011111", 0, 0, 1, 1 } : Form{ nullptr, 0, 0, -1 };
-    auto apply = [&](const Form& F) {
-        restore();
-        if (!F.env) return;
-        for (int i = 0; i < 6; ++i) setenv(kEnv[i], F.env[i] == '1' ? "1" : "0", 1);
-        const int pinned[2] = { F.stage, F.tiles };
-        for (int i = 0; i < 2; ++i) {
-            if (F.stage)
-                setenv(kEnv[6 + i], std::to_string(pinned[i]).c_str(), 1);
-            else
-                unsetenv(kEnv[6 + i]);
-        }
-        const int pinned2[2] = { F.lut, F.pipe };
-        for (int i = 8; i < 10; ++i)
-            if (pinned2[i - 8] >= 0) setenv(kEnv[i], pinned2[i - 8] ? "1" : "0", 1);
-        setenv(kEnv[10], F.bm ? "1" : "0", 1);
-        if (F.bm) {
-            const int v[7] = { 0, 0, F.bm, F.bn, F.sk, F.ct, F.out };
-            for (int i = 0; i < 7; ++i) setenv(kEnv[11 + i], std::to_string(v[i]).c_str(), 1);
-            setenv(kEnv[21], F.db ? "1" : "0", 1);
-        }
-    };
 
     struct Proj {
         const char* name;
@@ -13315,28 +14342,6 @@ static void mx_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_
                     P.name, (long long)N, (long long)K, (long long)P.parts,
                     P.srt ? "sorted" : "token", slice / 1048576.0, touched * slice / 1048576.0,
                     E * slice / 1048576.0);
-        /* P64 over BM x BN x stage; at down's K (A resident) also over column tiles, and the LDS
-         * output at the default. */
-        std::vector<Form> pf = forms;
-        if (Tr >= 512 && !f8) {
-            for (int bm : { 32, 64 })
-                for (int bn : { 64, 128 })
-                    for (int sk2 : { 128, 256 })
-                        for (int ct : { 1, 4 }) {
-                            if (ct == 1 && K > 256) continue;
-                            pf.push_back({ "000000", 0, 0, -1, -1, bm, bn, sk2, ct, 0 });
-                        }
-            pf.push_back({ "000000", 0, 0, -1, -1, 64, 128, 128, 4, 1 });
-            /* The double buffer where two stages fit in LDS (streamed A, gate_up). */
-            if (K > 256) {
-                for (int bm : { 32, 64 })
-                    for (int bn : { 64, 128 })
-                        pf.push_back({ "000000", 0, 0, -1, -1, bm, bn, 128, 4, 0, 1 });
-                pf.push_back({ "000000", 0, 0, -1, -1, 32, 64, 256, 4, 0, 1 });
-                pf.push_back({ "000000", 0, 0, -1, -1, 64, 128, 128, 4, 1, 1 });
-            }
-        }
-
         std::vector<uint8_t> av((size_t)(Ma * K));
         for (size_t i = 0; i < av.size(); ++i)
             av[i] = rad_f32_to_fp8e4m3((float)((int)(st_mix32((uint32_t)i) % 33) - 16) / 4);
@@ -13428,74 +14433,36 @@ static void mx_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_
         a.world_size = 1;
         const double flop = 2.0 * (double)Tr * (double)N * (double)K;
         const size_t ybytes = (size_t)(Tr * N) * 2;
-        std::vector<uint8_t> reference(ybytes), got(ybytes);
-        apply(old);
-        st_memset(d_y, 0xff, ybytes);
-        bool have_old = r->launch(&a, nullptr) == RAD_OK && st_stream_sync(nullptr) == hipSuccess;
-        if (have_old) st_memcpy(reference.data(), d_y, ybytes, hipMemcpyDeviceToHost);
-        std::printf("    old: %s\n",
-                    !have_old ? "not served, no byte comparison"
-                    : old.env ? "TP8 prefill form, stage prefetch and table decode pinned"
-                              : "the rule");
-        for (size_t f = 0; f < pf.size(); ++f) {
-            apply(pf[f]);
-            const long max_t = f8 ? num("RADIANCE_FP8F32_DECODE_EXPERTS_MAX_T", -1)
-                                  : num(P.srt ? "RADIANCE_MXFP4_DECODE_EXPERTS_MAX_T_DOWN"
-                                              : "RADIANCE_MXFP4_DECODE_EXPERTS_MAX_T_GATE_UP",
-                                        glm ? (P.srt ? 6143 : 768) : 511);
-            const char* forced = std::getenv(kEnv[0]);
-            const bool pwide = K > 256 ? Tr >= num(kEnv[19], 24576) : Tr >= num(kEnv[20], 24576);
-            const long dbm = pwide || (K > 256 && Tr >= num(kEnv[18], 12288)) ? 64 : 32;
-            const long dbn = pwide ? 128 : 64;
-            const long dsk = K > 256 && !pwide ? 256 : 128;
-            const long pbm = num(kEnv[13], dbm) == 32 ? 32 : 64,
-                       pbn = num(kEnv[14], dbn) == 64 ? 64 : 128;
-            const long psk = num(kEnv[15], dsk) == 256 ? 256 : 128;
-            const bool p64 = !f8 && on(kEnv[10], glm) && !(forced && forced[0] == '1') &&
-                             Tr >= num(P.srt ? kEnv[12] : kEnv[11], P.srt ? 5760 : 769) &&
-                             (Tr + pbm - 1) / pbm + E <= 65535;
-            const bool expert = !p64 && on(kEnv[0], max_t < 0 || Tr <= max_t);
-            const long esk = num(kEnv[6], K <= 256 ? 128 : 256) == 128 ? 128 : 256;
-            const long et = num(kEnv[7], K <= 256 || (f8 && Tr < 128) ? 4 : 1) == 4 ? 4 : 1;
-            const bool aligned = !p64 && !expert && !f8 && on(kEnv[1], glm) && Tr >= 512;
-            const bool wide = !p64 && !expert && !f8 && on(kEnv[2], glm) && Tr >= 512;
-            const bool tall = wide && aligned && on(kEnv[3], glm), n64 = tall && on(kEnv[4], glm);
-            const bool cached = n64 && on(kEnv[5], glm), lut = f8 || p64 || on(kEnv[8], true);
-            const bool pipe = cached && on(kEnv[9], glm);
-            const long pct = K <= 256 && num(kEnv[16], 4) != 1 ? 4 : 1;
-            const bool pout = num(kEnv[17], pwide ? 1 : 0) == 1;
-            const bool pdb =
-                K > 256 && num(kEnv[21], 0) == 1 && (psk == 128 || (pbm == 32 && pbn == 64));
-            const int64_t jr = p64 ? pbm : tall ? 32 : 16, tile = Tr < 32 ? 1 : Tr < 128 ? 4 : 16;
+        {
+            const bool pwide = Tr >= 24576;
+            const int64_t pbm = pwide || (K > 256 && Tr >= 12288) ? 64 : 32;
+            const bool p64 =
+                glm && Tr >= (P.srt ? 5760 : 769) && (Tr + pbm - 1) / pbm + E <= 65535;
+            const bool expert = !p64 && (f8 || Tr <= (glm ? (P.srt ? 6143 : 768) : 511));
+            const bool pipe = !p64 && !expert && glm;
+            const int64_t jr = p64 ? pbm : pipe ? 32 : 16;
             int64_t streams = 0;
-            if (p64 || aligned || expert)
+            if (p64 || pipe || expert)
                 for (int64_t e = 0; e < E; ++e)
                     streams += (off[(size_t)(e + 1)] - off[(size_t)e] + jr - 1) / jr;
             else
                 for (int64_t i = 0; i < Tr; ++i)
-                    streams += i % tile == 0 || owner[(size_t)i] != owner[(size_t)(i - 1)];
+                    streams += i % 16 == 0 || owner[(size_t)i] != owner[(size_t)(i - 1)];
             const std::string label =
-                std::string(pf[f].env ? "" : "rule: ") +
-                (p64      ? fmt("P64 BM%ld BN%ld K%ld", pbm, pbn, psk) +
-                                (K <= 256 ? fmt(" x%ld, A resident", pct) : "") +
-                                (pout ? ", LDS out" : "") + (pdb ? ", double buffer" : "")
-                 : expert ? fmt("expert-major K%ld x%ld tiles", esk, et)
-                          : std::string(n64    ? "M32N64"
-                                        : tall ? "M32N32"
-                                        : wide ? "M16N32"
-                                        : f8   ? "M16N64"
-                                               : "M16N16") +
-                                (aligned ? " aligned jobs"
-                                         : fmt(" row groups of %lld", (long long)tile)) +
-                                (cached ? ", cached rows" : "") + (pipe ? ", pipe" : "")) +
-                (lut ? "" : ", fp4x4");
+                p64 ? fmt("P64 BM%lld BN%d K%d", (long long)pbm, pwide ? 128 : 64,
+                          K > 256 && !pwide ? 256 : 128) +
+                          (K <= 256 ? " x4, A resident" : "") + (pwide ? ", LDS out" : "")
+                : expert ? fmt("expert-major K%d x%d tiles", K <= 256 ? 128 : 256,
+                               K <= 256 || (f8 && Tr < 128) ? 4 : 1)
+                : pipe   ? std::string("GLM prefill form, jobs of 32 rows")
+                         : std::string("row groups of 16");
             st_memset(d_y, 0xff, ybytes);
             const int rc = r->launch(&a, nullptr);
             if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) {
                 std::printf("    %-46s rc=%d (not served)\n", label.c_str(), rc);
+                dfree_all();
                 continue;
             }
-            st_memcpy(got.data(), d_y, ybytes, hipMemcpyDeviceToHost);
             {
                 hipEvent_t w0, w1;
                 st_ev_create(&w0);
@@ -13512,28 +14479,17 @@ static void mx_perf(const Plugin& pl, int64_t Mtok, int iters, int64_t E, int64_
                 st_ev_destroy(w1);
             }
             const double us = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
-            if (f == 0) {
-                rule_us += us;
-                rule_bytes += touched * slice;
-            }
-            std::string same;
-            if (have_old) {
-                int64_t diff = 0;
-                for (size_t i = 0; i < ybytes; i += 2)
-                    diff += std::memcmp(&got[i], &reference[i], 2) != 0;
-                same = diff ? fmt("  %lld elements differ from old", (long long)diff) : "  = old";
-            }
-            std::printf(
-                "    %-46s %9.1f us  %7.1f GB/s touched  %5.2fx streamed  %6.1f TFLOP/s%s\n",
-                label.c_str(), us, touched * slice / (us * 1e3),
-                touched ? (double)streams / (double)touched : 0.0, flop / (us * 1e6), same.c_str());
+            rule_us += us;
+            rule_bytes += touched * slice;
+            std::printf("    %-46s %9.1f us  %7.1f GB/s touched  %5.2fx streamed  %6.1f TFLOP/s\n",
+                        label.c_str(), us, touched * slice / (us * 1e3),
+                        touched ? (double)streams / (double)touched : 0.0, flop / (us * 1e6));
         }
-        restore();
         dfree_all();
     }
     if (rule_us > 0)
-        std::printf("  the rule's forms, gate_up + down: %.1f us a layer, %.1f GB/s touched\n",
-                    rule_us, rule_bytes / (rule_us * 1e3));
+        std::printf("  gate_up + down: %.1f us a layer, %.1f GB/s touched\n", rule_us,
+                    rule_bytes / (rule_us * 1e3));
 }
 
 /* The gated residual's read at int8 codes. The same inputs run with the codes plane as E4M3 and
@@ -13832,10 +14788,9 @@ static void hc_prefill(const Plugin& pl, int64_t M, int iters, bool timed, bool 
 /* mHC's chunk-split read, as tensor parallelism issues it: every rank's mhc_pre_partial over its
  * chunks, the partials joined row by row as the row-interleaved all_gather lays them out (here on
  * the host), then mhc_pre_finish. The result must be byte-identical to mhc_pre on the same inputs,
- * under each of mhc_pre's kernel switches, since both run the same projection and finishing
- * kernels; the partial matrix's padding slots must be zero. */
-static void mhc_split_check(const Plugin& pl, int64_t rows, int world, const char* env,
-                            const char* value) {
+ * since both run the same projection and finishing kernels; the partial matrix's padding slots
+ * must be zero. */
+static void mhc_split_check(const Plugin& pl, int64_t rows, int world) {
     const RadKernelInfo* pre = find(pl, "mhc_pre_bf16");
     const RadKernelInfo* part_row = find(pl, "mhc_pre_partial_bf16");
     const RadKernelInfo* fin = find(pl, "mhc_pre_finish_bf16");
@@ -13843,9 +14798,6 @@ static void mhc_split_check(const Plugin& pl, int64_t rows, int world, const cha
     if (!pre || !part_row || !fin) { ok(nm, false, "row absent"); return; }
     const int64_t n = 4096, hc = 4, W = hc * n, mix = hc * (hc + 2), S = 28, total = 8;
     const int64_t mine = total / world, hp = W + 6, xp = n + 2;
-    const char* saved = env ? std::getenv(env) : nullptr;
-    const std::string keep = saved ? saved : "";
-    if (env) setenv(env, value, 1);
 
     std::vector<uint16_t> hv((size_t)(rows * hp));
     for (size_t i = 0; i < hv.size(); ++i)
@@ -13929,22 +14881,21 @@ static void mhc_split_check(const Plugin& pl, int64_t rows, int world, const cha
     good = good && launch(fin, split, fp);
     const Out got = fetch(sx, sp, sc);
     const bool same = good && got.x == want.x && got.p == want.p && got.c == want.c;
-    ok(fmt("%s at M=%lld over %d ranks%s%s%s: byte-identical to mhc_pre", nm, (long long)rows,
-           world, env ? ", " : "", env ? env : "", env ? (std::string("=") + value).c_str() : "")
+    ok(fmt("%s at M=%lld over %d ranks: byte-identical to mhc_pre", nm, (long long)rows, world)
            .c_str(), same, good ? (got.x != want.x ? "x differs" : got.p != want.p ? "post differs"
                                                                      : got.c != want.c ? "comb differs" : "")
                                 : "launch failed");
     ok(fmt("%s at M=%lld over %d ranks: zero padding", nm, (long long)rows, world).c_str(), padded);
-    if (env) { if (saved) setenv(env, keep.c_str(), 1); else unsetenv(env); }
 }
 
 /* mhc_pre and mhc_post at GLM's shape (n 4096, four streams, 2048-column chunks, 20 Sinkhorn
- * rounds), every form timed and compared byte for byte with the old dispatch
- * (RADIANCE_MHC_FINISH=old, RADIANCE_MHC_PARTIAL_VEC=0, the per-output mhc_post).
- * The whole op, its partials alone (all eight chunks, and the one chunk a rank computes at TP8)
- * and its finish alone over those partials. GB/s counts h and x (and mhc_post's output); the
- * mixing weights (1.5 MiB) stay in L2. `iters` below zero runs each form once and reports only
- * the comparisons, as a case. */
+ * rounds), timed on 16-byte rows, where the vector forms run (four-slot partials, the finish's
+ * 16-byte collapse, the eight-column mhc_post), and compared byte for byte with the same operands
+ * on a residual pitched by two elements, where the scalar forms run (one slot a thread, four rows
+ * and four coefficients a block from 32 rows, the per-output mhc_post). The whole op, its partials
+ * alone (all eight chunks, and the one chunk a rank computes at TP8) and its finish alone over
+ * those partials. GB/s counts h and x (and mhc_post's output); the mixing weights (1.5 MiB) stay
+ * in L2. `iters` below zero runs each form once and reports only the comparisons, as a case. */
 static void mhcpre_perf(const Plugin& pl, int64_t rows, int iters) {
     const bool check = iters < 0;
     if (iters == 0) iters = 200;
@@ -13955,29 +14906,14 @@ static void mhcpre_perf(const Plugin& pl, int64_t rows, int iters) {
     const RadKernelInfo* post = find(pl, "mhc_post_bf16");
     if (!pre || !part || !fin || !post) { std::printf("--perfmhcpre: an mhc row is absent\n"); return; }
     const int64_t n = 4096, hc = 4, W = hc * n, mix = hc * (hc + 2), S = 28, total = 8;
-    static const char* const kEnv[5] = { "RADIANCE_MHC_FINISH", "RADIANCE_MHC_ROWS4_MIN",
-                                         "RADIANCE_MHC_POST_VEC", "RADIANCE_MHC_PARTIAL_VEC",
-                                         "RADIANCE_MHC_PARTIAL_ROWS" };
-    std::string saved[5];
-    bool had[5];
-    for (int i = 0; i < 5; ++i) {
-        const char* v = std::getenv(kEnv[i]);
-        had[i] = v != nullptr;
-        if (v) saved[i] = v;
-    }
-    auto pin = [&](const char* finish, const char* rows4, const char* vec,
-                   const char* pvec = nullptr, const char* prows = nullptr) {
-        const char* v[5] = { finish, rows4, vec, pvec, prows };
-        for (int i = 0; i < 5; ++i) {
-            if (v[i]) setenv(kEnv[i], v[i], 1);
-            else if (had[i]) setenv(kEnv[i], saved[i].c_str(), 1);
-            else unsetenv(kEnv[i]);
-        }
-    };
+    const int64_t pitched = W + 2;
 
     std::vector<uint16_t> hv((size_t)(rows * W)), yv((size_t)(rows * n));
     for (size_t i = 0; i < hv.size(); ++i)
         hv[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i * 3u + 11u) % 2001) - 1000) / 1000);
+    std::vector<uint16_t> hpv((size_t)(rows * pitched), 0);
+    for (int64_t r = 0; r < rows; ++r)
+        std::memcpy(&hpv[(size_t)(r * pitched)], &hv[(size_t)(r * W)], (size_t)W * 2);
     for (size_t i = 0; i < yv.size(); ++i)
         yv[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i * 5u + 3u) % 2001) - 1000) / 500);
     std::vector<float> fv((size_t)(mix * W)), sv = { 0.7f, 0.9f, 1.1f }, bv((size_t)mix);
@@ -13985,6 +14921,7 @@ static void mhcpre_perf(const Plugin& pl, int64_t rows, int iters) {
         fv[i] = (float)((int)(st_mix32((uint32_t)i + 77u) % 2001) - 1000) / 100000;
     for (size_t i = 0; i < bv.size(); ++i) bv[i] = (float)((int)(i % 7) - 3) * 0.25f;
     void* d_h = dalloc(hv.size() * 2);
+    void* d_hp = dalloc(hpv.size() * 2);
     void* d_y = dalloc(yv.size() * 2);
     void* d_f = dalloc(fv.size() * 4);
     void* d_s = dalloc(12);
@@ -13995,11 +14932,13 @@ static void mhcpre_perf(const Plugin& pl, int64_t rows, int iters) {
     void* d_part = dalloc((size_t)(rows * total * S * 4));
     void* d_part1 = dalloc((size_t)(rows * S * 4));
     void* d_out = dalloc((size_t)(rows * W * 2));
-    if (!d_h || !d_y || !d_f || !d_s || !d_b || !d_x || !d_p || !d_c || !d_part || !d_part1 || !d_out) {
+    if (!d_h || !d_hp || !d_y || !d_f || !d_s || !d_b || !d_x || !d_p || !d_c || !d_part || !d_part1 ||
+        !d_out) {
         std::printf("--perfmhcpre: alloc failed\n");
         return;
     }
     st_memcpy(d_h, hv.data(), hv.size() * 2, hipMemcpyHostToDevice);
+    st_memcpy(d_hp, hpv.data(), hpv.size() * 2, hipMemcpyHostToDevice);
     st_memcpy(d_y, yv.data(), yv.size() * 2, hipMemcpyHostToDevice);
     st_memcpy(d_f, fv.data(), fv.size() * 4, hipMemcpyHostToDevice);
     st_memcpy(d_s, sv.data(), 12, hipMemcpyHostToDevice);
@@ -14008,6 +14947,8 @@ static void mhcpre_perf(const Plugin& pl, int64_t rows, int iters) {
                     ts = T(d_s, RAD_F32, { 3 }), tb = T(d_b, RAD_F32, { mix }),
                     tx = T(d_x, RAD_BF16, { rows, n }), tp = T(d_p, RAD_F32, { rows, hc }),
                     tc = T(d_c, RAD_F32, { rows, hc * hc });
+    RadTensor thp = T(d_hp, RAD_BF16, { rows, W });
+    thp.stride[0] = pitched;
     std::vector<RadParam> coef = { PI("M", rows), PI("n", n), PI("hc", hc), PI("iterations", 20),
                                    PF("eps", 1e-6), PF("hc_eps", 1e-6), PI("chunk", 2048),
                                    PS("dtype", "bf16") };
@@ -14021,6 +14962,8 @@ static void mhcpre_perf(const Plugin& pl, int64_t rows, int iters) {
     std::vector<RadTensor> a_fin = { T(d_part, RAD_F32, { rows, total * S }), th, ts, tb, tx, tp, tc };
     std::vector<RadTensor> a_post = { T(d_y, RAD_BF16, { rows, n }), th, tp, tc,
                                       T(d_out, RAD_BF16, { rows, W }) };
+    std::vector<RadTensor> a_pre_p = a_pre, a_all_p = a_all, a_post_p = a_post;
+    a_pre_p[0] = a_all_p[0] = a_post_p[1] = thp;
     auto args = [](std::vector<RadTensor>& t, std::vector<RadParam>& p) {
         RadArgs a{};
         a.t = t.data(); a.n_t = (int)t.size(); a.p = p.data(); a.n_p = (int)p.size();
@@ -14028,7 +14971,8 @@ static void mhcpre_perf(const Plugin& pl, int64_t rows, int iters) {
         return a;
     };
     RadArgs A_pre = args(a_pre, coef), A_all = args(a_all, p_all), A_one = args(a_one, p_one),
-            A_fin = args(a_fin, coef), A_post = args(a_post, coef);
+            A_fin = args(a_fin, coef), A_post = args(a_post, coef), A_pre_p = args(a_pre_p, coef),
+            A_all_p = args(a_all_p, p_all), A_post_p = args(a_post_p, coef);
     auto timed = [&](const RadKernelInfo* r, RadArgs* a) {
         if (r->launch(a, nullptr) != RAD_OK || st_stream_sync(nullptr) != hipSuccess) return -1.0;
         if (check) return 0.0;
@@ -14068,7 +15012,7 @@ static void mhcpre_perf(const Plugin& pl, int64_t rows, int iters) {
     auto line = [&](const char* what, double us, double bytes, const std::string& same) {
         if (check) {
             ok(fmt("%s at M=%lld%s", what, (long long)rows,
-                   same.empty() ? " is served" : ": byte-identical to the old dispatch").c_str(),
+                   same.empty() ? " is served" : ": byte-identical to the pitched rows").c_str(),
                us >= 0 && same.find("DIFFERS") == std::string::npos, us < 0 ? "not served" : "");
             return;
         }
@@ -14076,75 +15020,49 @@ static void mhcpre_perf(const Plugin& pl, int64_t rows, int iters) {
         std::printf("  %-44s %8.1f us  %7.1f GB/s%s\n", what, us, bytes / (us * 1e3), same.c_str());
     };
     auto cmp = [](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
-        return a == b ? std::string("  = old") : std::string("  DIFFERS from old");
+        return a == b ? std::string("  = pitched") : std::string("  DIFFERS from pitched");
     };
 
-    pin("old", nullptr, "0", "0");
-    const double us_old = timed(pre, &A_pre);
+    const size_t x_bytes = (size_t)(rows * n * 2), part_bytes = (size_t)(rows * total * S * 4),
+                 out_bytes = (size_t)(rows * W * 2);
+    const double us_pre_p = timed(pre, &A_pre_p);
     const std::vector<uint8_t> ref = outputs();
-    line("mhc_pre, old dispatch", us_old, hx, "");
-    struct Pv { const char* what; const char* finish; const char* rows4; const char* pvec;
-                const char* prows; };
-    for (const Pv& v : { Pv{ "mhc_pre, rule", nullptr, nullptr, nullptr, nullptr },
-                         Pv{ "mhc_pre, finish: scalar mix, wide read", "scalar", nullptr, nullptr, nullptr },
-                         Pv{ "mhc_pre, old partials (rows4 from 32)", nullptr, nullptr, "0", nullptr },
-                         Pv{ "mhc_pre, four-slot partials, 1 row a wave", nullptr, nullptr, "1", "1" },
-                         Pv{ "mhc_pre, four-slot partials, 2 rows a wave", nullptr, nullptr, "1", "2" },
-                         Pv{ "mhc_pre, four-slot partials, 4 rows a wave", nullptr, nullptr, "1", "4" } }) {
-        pin(v.finish, v.rows4, nullptr, v.pvec, v.prows);
-        st_memset(d_x, 0xff, (size_t)(rows * n * 2));
-        const double us = timed(pre, &A_pre);
-        line(v.what, us, hx, us < 0 ? "" : cmp(outputs(), ref));
-    }
-    pin(nullptr, nullptr, nullptr, "0");
-    if (part->launch(&A_all, nullptr) == RAD_OK) st_stream_sync(nullptr);
-    const std::vector<uint8_t> part_ref = fetch(d_part, (size_t)(rows * total * S * 4));
-    for (const Pv& v : { Pv{ "mhc_pre_partial, 8 chunks, old", nullptr, nullptr, "0", nullptr },
-                         Pv{ "mhc_pre_partial, 8 chunks, rule", nullptr, nullptr, nullptr, nullptr },
-                         Pv{ "mhc_pre_partial, 8 chunks, four-slot x1", nullptr, nullptr, "1", "1" },
-                         Pv{ "mhc_pre_partial, 8 chunks, four-slot x2", nullptr, nullptr, "1", "2" },
-                         Pv{ "mhc_pre_partial, 8 chunks, four-slot x4", nullptr, nullptr, "1", "4" },
-                         Pv{ "mhc_pre_partial, 8 chunks, rows4 at every M", nullptr, "1", "0", nullptr },
-                         Pv{ "mhc_pre_partial, 8 chunks, scalar-row", nullptr, "1000000", "0", nullptr } }) {
-        pin(nullptr, v.rows4, nullptr, v.pvec, v.prows);
-        st_memset(d_part, 0xff, (size_t)(rows * total * S * 4));
-        const double us = timed(part, &A_all);
-        const bool is_ref = v.pvec && !std::strcmp(v.pvec, "0") && !v.rows4;
-        line(v.what, us, (double)rows * W * 2, us < 0 || is_ref ? std::string()
-             : cmp(fetch(d_part, (size_t)(rows * total * S * 4)), part_ref));
-    }
-    pin(nullptr, nullptr, nullptr);
+    line("mhc_pre, pitched rows", us_pre_p, hx, "");
+    st_memset(d_x, 0xff, x_bytes);
+    const double us_pre = timed(pre, &A_pre);
+    line("mhc_pre", us_pre, hx, us_pre < 0 ? "" : cmp(outputs(), ref));
+
+    st_memset(d_part, 0xff, part_bytes);
+    const double us_all_p = timed(part, &A_all_p);
+    const std::vector<uint8_t> part_ref = fetch(d_part, part_bytes);
+    line("mhc_pre_partial, 8 chunks, pitched rows", us_all_p, (double)rows * W * 2, "");
+    st_memset(d_part, 0xff, part_bytes);
+    const double us_all = timed(part, &A_all);
+    line("mhc_pre_partial, 8 chunks", us_all, (double)rows * W * 2,
+         us_all < 0 ? "" : cmp(fetch(d_part, part_bytes), part_ref));
     line("mhc_pre_partial, 1 chunk (a TP8 rank's)", timed(part, &A_one), (double)rows * W * 2 / 8, "");
+
     if (part->launch(&A_all, nullptr) == RAD_OK) st_stream_sync(nullptr);
-    for (const Pv& v : { Pv{ "mhc_pre_finish, old", "old", nullptr, nullptr, nullptr },
-                         Pv{ "mhc_pre_finish, rule", nullptr, nullptr, nullptr, nullptr },
-                         Pv{ "mhc_pre_finish, scalar mix, wide read", "scalar", nullptr, nullptr, nullptr } }) {
-        pin(v.finish, nullptr, nullptr);
-        st_memset(d_x, 0xff, (size_t)(rows * n * 2));
-        const double us = timed(fin, &A_fin);
-        line(v.what, us, hx, us < 0 ? "" : cmp(outputs(), ref));
-    }
+    st_memset(d_x, 0xff, x_bytes);
+    const double us_fin = timed(fin, &A_fin);
+    line("mhc_pre_finish", us_fin, hx, us_fin < 0 ? "" : cmp(outputs(), ref));
+
     const double post_bytes = (double)rows * (2 * W + n) * 2;
-    pin(nullptr, nullptr, "0");
-    const double us_post_old = timed(post, &A_post);
-    const std::vector<uint8_t> post_ref = fetch(d_out, (size_t)(rows * W * 2));
-    line("mhc_post, old", us_post_old, post_bytes, "");
-    pin(nullptr, nullptr, nullptr);
-    st_memset(d_out, 0xff, (size_t)(rows * W * 2));
+    const double us_post_p = timed(post, &A_post_p);
+    const std::vector<uint8_t> post_ref = fetch(d_out, out_bytes);
+    line("mhc_post, pitched rows", us_post_p, post_bytes, "");
+    st_memset(d_out, 0xff, out_bytes);
     const double us_post = timed(post, &A_post);
-    line("mhc_post, rule", us_post, post_bytes,
-         us_post < 0 ? "" : cmp(fetch(d_out, (size_t)(rows * W * 2)), post_ref));
-    for (int i = 0; i < 5; ++i) {
-        if (had[i]) setenv(kEnv[i], saved[i].c_str(), 1);
-        else unsetenv(kEnv[i]);
-    }
+    line("mhc_post", us_post, post_bytes,
+         us_post < 0 ? "" : cmp(fetch(d_out, out_bytes), post_ref));
 }
 
-/* router_sigmoid_topk's wave-per-row select against the serial scan (RADIANCE_ROUTER_SELECT=old),
- * byte for byte over ids and weights with their pitches filled, so an overrun or a missed slot
- * shows. Logits, bias and outputs are pitched, the bias strided. `ties` puts logits on steps of
- * 1/2 and the bias on steps of 1/8, so many experts share a rank and the lower-index rule
- * decides. `iters` below zero compares only, as a case; otherwise both are timed. */
+/* router_sigmoid_topk's wave-per-row select against libref's: the ids exactly and the weights to
+ * a relative 1e-5 (the card's expf and the host's may differ in the last place), with the pitches
+ * filled, so an overrun or a missed slot shows. Logits, bias and outputs are pitched, the bias
+ * strided. `ties` puts logits on steps of 1/2 and the bias on steps of 1/8, so many experts share
+ * a rank and the lower-index rule decides. `iters` below zero compares only, as a case; otherwise
+ * the select is timed. */
 static void router_select(const Plugin& pl, int64_t rows, int64_t ne, int64_t k, int norm,
                           bool ties, int iters) {
     const bool check = iters < 0;
@@ -14180,45 +15098,70 @@ static void router_select(const Plugin& pl, int64_t rows, int64_t ne, int64_t k,
     RadArgs a{};
     a.t = ts.data(); a.n_t = 4; a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
 
-    const char* saved = std::getenv("RADIANCE_ROUTER_SELECT");
-    const std::string keep = saved ? saved : "";
-    auto run = [&](const char* form, std::vector<uint8_t>* out, double* us) -> int {
-        if (form) setenv("RADIANCE_ROUTER_SELECT", form, 1);
-        else unsetenv("RADIANCE_ROUTER_SELECT");
-        st_memset(d_i, 0xa5, (size_t)(rows * ip * 4));
-        st_memset(d_w, 0xa5, (size_t)(rows * wp * 4));
-        const int rc = r->launch(&a, nullptr);
-        if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) return rc != RAD_OK ? rc : RAD_E_DEVICE;
-        out->resize((size_t)(rows * (ip + wp) * 4));
-        st_memcpy(out->data(), d_i, (size_t)(rows * ip * 4), hipMemcpyDeviceToHost);
-        st_memcpy(out->data() + rows * ip * 4, d_w, (size_t)(rows * wp * 4), hipMemcpyDeviceToHost);
-        if (!check) *us = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
-        return (int)RAD_OK;
-    };
-    std::vector<uint8_t> old, got;
-    double us_old = 0, us_new = 0;
-    const int orc = run("old", &old, &us_old);
-    const int nrc = orc == RAD_OK ? run(nullptr, &got, &us_new) : orc;
-    if (saved) setenv("RADIANCE_ROUTER_SELECT", keep.c_str(), 1);
-    else unsetenv("RADIANCE_ROUTER_SELECT");
-    const bool same = nrc == RAD_OK && got == old;
-    if (check) {
-        size_t first = 0;
-        if (nrc == RAD_OK && !same) while (first < got.size() && got[first] == old[first]) ++first;
-        ok(fmt("router_sigmoid_topk select at M=%lld n_expert=%lld top_k=%lld norm=%d%s: "
-               "byte-identical to the serial scan", (long long)rows, (long long)ne, (long long)k,
-               norm, ties ? ", tied ranks" : "").c_str(), same,
-           nrc != RAD_OK ? fmt("rc=%d", nrc) : same ? "" : fmt("first byte %zu", first));
+    st_memset(d_i, 0xa5, (size_t)(rows * ip * 4));
+    st_memset(d_w, 0xa5, (size_t)(rows * wp * 4));
+    int rc = r->launch(&a, nullptr);
+    if (rc == RAD_OK && st_stream_sync(nullptr) != hipSuccess) rc = RAD_E_DEVICE;
+    if (!check) {
+        if (rc != RAD_OK) { std::printf("--perfrouter: launch failed (rc %d)\n", rc); return; }
+        const double us = st_time_us([&](int) { r->launch(&a, nullptr); }, iters, nullptr);
+        std::printf("router_sigmoid_topk, M=%lld (n_expert %lld, top %lld, norm %d), %s, %d "
+                    "launches\n", (long long)rows, (long long)ne, (long long)k, norm,
+                    g_cold > 0 ? fmt("cold (%lld MiB, median)", (long long)(g_cold >> 20)).c_str()
+                               : "warm (back to back, mean)", iters);
+        std::printf("  %-28s %8.1f us\n", "wave per row", us);
         return;
     }
-    if (nrc != RAD_OK) { std::printf("--perfrouter: launch failed (rc %d)\n", nrc); return; }
-    std::printf("router_sigmoid_topk, M=%lld (n_expert %lld, top %lld, norm %d), %s, %d launches\n",
-                (long long)rows, (long long)ne, (long long)k, norm,
-                g_cold > 0 ? fmt("cold (%lld MiB, median)", (long long)(g_cold >> 20)).c_str()
-                           : "warm (back to back, mean)", iters);
-    std::printf("  %-28s %8.1f us\n", "serial scan (old)", us_old);
-    std::printf("  %-28s %8.1f us%s\n", "wave per row", us_new,
-                same ? "  = old" : "  DIFFERS from old");
+    const std::string name = fmt("router_sigmoid_topk select at M=%lld n_expert=%lld top_k=%lld "
+                                 "norm=%d%s: libref's ids and weights", (long long)rows,
+                                 (long long)ne, (long long)k, norm, ties ? ", tied ranks" : "");
+    if (rc != RAD_OK) { ok(name.c_str(), false, fmt("rc=%d", rc)); return; }
+    std::vector<int32_t> ids((size_t)(rows * ip)), want_ids((size_t)(rows * ip));
+    std::vector<float> wts((size_t)(rows * wp)), want_wts((size_t)(rows * wp));
+    st_memcpy(ids.data(), d_i, ids.size() * 4, hipMemcpyDeviceToHost);
+    st_memcpy(wts.data(), d_w, wts.size() * 4, hipMemcpyDeviceToHost);
+    std::memset(want_ids.data(), 0xa5, want_ids.size() * 4);
+    std::memset(want_wts.data(), 0xa5, want_wts.size() * 4);
+    void* ref = nullptr;
+    if (g_plugin) {
+        std::string path(g_plugin);
+        path = path.substr(0, path.find_last_of('/') + 1) + "libref.so";
+        ref = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    }
+    const auto count = ref ? (int (*)())dlsym(ref, "rad_kernel_count") : nullptr;
+    const auto at = ref ? (const RadKernelInfo* (*)(int))dlsym(ref, "rad_kernel_at") : nullptr;
+    const RadKernelInfo* oracle = nullptr;
+    for (int i = 0; count && at && i < count(); ++i)
+        if (!std::strcmp(at(i)->op, "router_sigmoid_topk")) oracle = at(i);
+    if (!oracle) {
+        ok(name.c_str(), false, "reference operation unavailable");
+        if (ref) dlclose(ref);
+        return;
+    }
+    std::vector<RadTensor> hs = ts;
+    hs[0].data = lg.data(); hs[1].data = bv.data();
+    hs[2].data = want_ids.data(); hs[3].data = want_wts.data();
+    RadArgs ha = a;
+    ha.t = hs.data();
+    const int hrc = oracle->launch(&ha, nullptr);
+    dlclose(ref);
+    if (hrc != RAD_OK) { ok(name.c_str(), false, fmt("host oracle rc=%d", hrc)); return; }
+    int64_t bad = 0, first = -1;
+    for (int64_t row = 0; row < rows; ++row) {
+        for (int64_t c = 0; c < ip; ++c) {
+            const size_t i = (size_t)(row * ip + c);
+            if (ids[i] != want_ids[i] && !bad++) first = row;
+        }
+        for (int64_t c = 0; c < wp; ++c) {
+            const size_t i = (size_t)(row * wp + c);
+            const bool same =
+                c < k ? std::fabs(wts[i] - want_wts[i]) <= 1e-5f * std::fabs(want_wts[i])
+                      : std::memcmp(&wts[i], &want_wts[i], 4) == 0;
+            if (!same && !bad++) first = row;
+        }
+    }
+    ok(name.c_str(), bad == 0, bad ? fmt("%lld words differ, the first in row %lld", (long long)bad,
+                                         (long long)first) : "");
 }
 
 /* ---- GLM's decode fusions of the MoE block (r4d_glm.hip), each against the separate launches it
@@ -14557,11 +15500,12 @@ static void moefuse_perf(const Plugin& pl, int64_t rows, int iters) {
     moefuse_gather(pl, rows, false, iters);
 }
 
-/* gemm_nt_f32 at every tile form (RADIANCE_F32_GEMM_TILE), each compared byte for byte with the
- * one-wave-per-output legacy kernel. Rows are pitched and the output keeps a filled pitch, so an
- * overrun or a missed tail shows as a byte difference. Timed, every form also prints its time,
- * its GB/s on weight + input + output and its TFLOP/s; weights rotate over copies past the
- * last-level cache, as in bf16_perf. */
+/* gemm_nt_f32 at the tile form its rule picks for M, compared byte for byte with the arithmetic
+ * every form keeps, written out on the host: lane l folds k = l, l+32, ... with fmaf, then the xor
+ * butterfly over 16, 8, 4, 2, 1. Rows are pitched and the output keeps a filled pitch, so an
+ * overrun or a missed tail shows as a byte difference. Timed, it also prints its time, its GB/s on
+ * weight + input + output and its TFLOP/s; weights rotate over copies past the last-level cache,
+ * as in bf16_perf. */
 static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int iters, bool timed) {
     const RadKernelInfo* r = find(pl, "gemm_nt_f32_bf16");
     if (!r) { ok("gemm_nt_f32_bf16 forms", false, "row absent"); return; }
@@ -14576,17 +15520,15 @@ static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int ite
     void* d_w = dalloc(wbytes * (size_t)copies);
     void* d_y = dalloc(ybytes);
     if (!d_x || !d_w || !d_y) { ok("gemm_nt_f32_bf16 forms", false, "allocation failed"); return; }
-    {
-        std::vector<uint16_t> x((size_t)M * (size_t)xp);
-        for (size_t i = 0; i < x.size(); ++i)
-            x[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i) % 2001) - 1000) / 1000);
-        st_memcpy(d_x, x.data(), x.size() * 2, hipMemcpyHostToDevice);
-        std::vector<float> w((size_t)N * (size_t)K);
-        for (size_t i = 0; i < w.size(); ++i)
-            w[i] = (float)((int)(st_mix32((uint32_t)i + 0x51ed27u) % 2001) - 1000) / 8000;
-        for (int c = 0; c < copies; ++c)
-            st_memcpy((uint8_t*)d_w + (size_t)c * wbytes, w.data(), wbytes, hipMemcpyHostToDevice);
-    }
+    std::vector<uint16_t> x((size_t)M * (size_t)xp);
+    for (size_t i = 0; i < x.size(); ++i)
+        x[i] = h_to_bf16((float)((int)(st_mix32((uint32_t)i) % 2001) - 1000) / 1000);
+    st_memcpy(d_x, x.data(), x.size() * 2, hipMemcpyHostToDevice);
+    std::vector<float> w((size_t)N * (size_t)K);
+    for (size_t i = 0; i < w.size(); ++i)
+        w[i] = (float)((int)(st_mix32((uint32_t)i + 0x51ed27u) % 2001) - 1000) / 8000;
+    for (int c = 0; c < copies; ++c)
+        st_memcpy((uint8_t*)d_w + (size_t)c * wbytes, w.data(), wbytes, hipMemcpyHostToDevice);
     std::vector<RadTensor> ts = {
         T(d_x, RAD_BF16, { M, K }), T(d_w, RAD_F32, { N, K }), T(d_y, RAD_F32, { M, N }),
     };
@@ -14596,70 +15538,57 @@ static void f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int ite
     std::memset(&a, 0, sizeof(a));
     a.t = ts.data(); a.n_t = 3; a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
 
-    const char* saved = std::getenv("RADIANCE_F32_GEMM_TILE");
-    const std::string keep = saved ? saved : "";
-    auto run = [&](const char* form, std::vector<uint8_t>* out) -> int {
-        if (form) setenv("RADIANCE_F32_GEMM_TILE", form, 1);
-        else unsetenv("RADIANCE_F32_GEMM_TILE");
-        std::vector<uint8_t> fill(ybytes, 0xa5);
-        st_memcpy(d_y, fill.data(), ybytes, hipMemcpyHostToDevice);
-        ts[1].data = d_w;
-        const int rc = r->launch(&a, nullptr);
-        if (rc != RAD_OK || st_stream_sync(nullptr) != hipSuccess) return rc != RAD_OK ? rc : RAD_E_DEVICE;
-        out->resize(ybytes);
-        st_memcpy(out->data(), d_y, ybytes, hipMemcpyDeviceToHost);
-        return (int)RAD_OK;
-    };
-    static const char* kForms[] = { "1x1", "2x1", "4x1", "8x1", "4x2", "8x2", "4x4", "8x4",
-                                    "16x2", "16x4", nullptr };
-    std::vector<uint8_t> legacy, got;
-    const int lrc = run("legacy", &legacy);
-    ok(fmt("gemm_nt_f32 legacy form at M=%lld N=%lld K=%lld", (long long)M, (long long)N,
-           (long long)K).c_str(), lrc == RAD_OK);
-    if (lrc == RAD_OK) {
-        for (const char* const* f = kForms;; ++f) {
-            const char* form = *f;
-            const int rc = run(form, &got);
-            const bool same = rc == RAD_OK && got == legacy;
-            size_t first = 0;
-            if (rc == RAD_OK && !same)
-                while (first < got.size() && got[first] == legacy[first]) ++first;
-            ok(fmt("gemm_nt_f32 form %s at M=%lld N=%lld K=%lld: byte-identical to legacy",
-                   form ? form : "default", (long long)M, (long long)N, (long long)K).c_str(),
-               same, rc != RAD_OK ? fmt("rc=%d", rc) : same ? "" : fmt("first byte %zu", first));
-            if (!form) break;
+    std::vector<uint8_t> fill(ybytes, 0xa5), got(ybytes);
+    st_memcpy(d_y, fill.data(), ybytes, hipMemcpyHostToDevice);
+    int rc = r->launch(&a, nullptr);
+    if (rc == RAD_OK && st_stream_sync(nullptr) != hipSuccess) rc = RAD_E_DEVICE;
+    if (rc == RAD_OK) st_memcpy(got.data(), d_y, ybytes, hipMemcpyDeviceToHost);
+    /* The arithmetic on the host, into a copy of the filled output. */
+    std::vector<uint8_t> want = fill;
+    for (int64_t row = 0; row < M; ++row)
+        for (int64_t c = 0; c < N; ++c) {
+            float lane[32];
+            for (int l = 0; l < 32; ++l) {
+                float sum = 0;
+                for (int64_t j = l; j < K; j += 32)
+                    sum = std::fmaf(h_bf16(x[(size_t)(row * xp + j)]), w[(size_t)(c * K + j)], sum);
+                lane[l] = sum;
+            }
+            for (int mask = 16; mask; mask >>= 1) {
+                float next[32];
+                for (int l = 0; l < 32; ++l) next[l] = lane[l] + lane[l ^ mask];
+                std::memcpy(lane, next, sizeof lane);
+            }
+            std::memcpy(&want[(size_t)(row * yp + c) * 4], &lane[0], 4);
         }
-    }
-    if (timed && lrc == RAD_OK) {
+    const bool same = rc == RAD_OK && got == want;
+    size_t first = 0;
+    if (rc == RAD_OK && !same)
+        while (first < got.size() && got[first] == want[first]) ++first;
+    ok(fmt("gemm_nt_f32 at M=%lld N=%lld K=%lld: byte-identical to the host arithmetic",
+           (long long)M, (long long)N, (long long)K).c_str(),
+       same, rc != RAD_OK ? fmt("rc=%d", rc) : same ? "" : fmt("first byte %zu", first));
+    if (timed && rc == RAD_OK) {
         const double bytes = (double)wbytes + (double)M * K * 2 + (double)M * N * 4;
         const double flop = 2.0 * (double)M * (double)N * (double)K;
         std::printf("\ngemm_nt_f32  N=%lld K=%lld M=%lld  %.2f MiB weight, %d copies, %d iters\n",
                     (long long)N, (long long)K, (long long)M, (double)wbytes / (1 << 20), copies,
                     iters);
-        static const char* kTimed[] = { "legacy", "1x1", "2x1", "4x1", "8x1", "4x2", "8x2", "4x4",
-                                        "8x4", "16x2", "16x4", nullptr };
-        for (const char* const* f = kTimed;; ++f) {
-            const char* form = *f;
-            if (form) setenv("RADIANCE_F32_GEMM_TILE", form, 1);
-            else unsetenv("RADIANCE_F32_GEMM_TILE");
-            const double us = st_time_us([&](int i) {
-                ts[1].data = (uint8_t*)d_w + (size_t)(i % copies) * wbytes;
-                r->launch(&a, nullptr);
-            }, iters, nullptr);
-            std::printf("  %-8s %9.1f us  %7.1f GB/s  %6.2f TFLOP/s\n", form ? form : "default",
-                        us, bytes / (us * 1e3), flop / (us * 1e6));
-            if (!form) break;
-        }
+        const double us = st_time_us([&](int i) {
+            ts[1].data = (uint8_t*)d_w + (size_t)(i % copies) * wbytes;
+            r->launch(&a, nullptr);
+        }, iters, nullptr);
+        std::printf("  %-8s %9.1f us  %7.1f GB/s  %6.2f TFLOP/s\n", "rule", us,
+                    bytes / (us * 1e3), flop / (us * 1e6));
         ts[1].data = d_w;
     }
-    if (saved) setenv("RADIANCE_F32_GEMM_TILE", keep.c_str(), 1);
-    else unsetenv("RADIANCE_F32_GEMM_TILE");
 }
 
-/* gemm_fp8a8_f32scale's dense forms (RADIANCE_FP8F32_FORM: decode at several R x S, rows) each
- * compared byte for byte with the legacy 16x64 tile; the output keeps a filled pitch, so an
- * overrun or a missed row shows. Timed, every form also prints its time and GB/s on the weight and its scale plane, the
- * weight rotating over copies past the last-level cache. */
+/* gemm_fp8a8_f32scale's dense form at the shape (a decode form or a row tile, by the rule)
+ * compared byte for byte with the legacy 16x64 tile, which an activation pitch off 16 bytes takes;
+ * the output keeps a filled pitch, so an overrun or a missed row shows. Timed, it also prints its
+ * time and GB/s on the weight and its scale plane, the weight rotating over copies past the
+ * last-level cache. */
 static void fp8f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int iters, bool timed) {
     const RadKernelInfo* r = find(pl, "gemm_fp8a8_f32scale");
     if (!r) { ok("gemm_fp8a8_f32scale forms", false, "row absent"); return; }
@@ -14671,11 +15600,12 @@ static void fp8f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int 
         if (copies > 64) copies = 64;
     }
     void* d_a = dalloc((size_t)(M * K));
+    void* d_al = dalloc((size_t)(M * (K + 8)));
     void* d_as = dalloc((size_t)(M * sk * 4));
     void* d_w = dalloc(wb * (size_t)copies);
     void* d_s = dalloc(sb);
     void* d_y = dalloc(yb);
-    if (!d_a || !d_as || !d_w || !d_s || !d_y) { ok("gemm_fp8a8_f32scale forms", false, "allocation failed"); return; }
+    if (!d_a || !d_al || !d_as || !d_w || !d_s || !d_y) { ok("gemm_fp8a8_f32scale forms", false, "allocation failed"); return; }
     {
         std::vector<uint8_t> a((size_t)(M * K)), w(wb);
         for (size_t i = 0; i < a.size(); ++i)
@@ -14683,6 +15613,9 @@ static void fp8f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int 
         for (size_t i = 0; i < w.size(); ++i)
             w[i] = rad_f32_to_fp8e4m3((float)((int)(st_mix32((uint32_t)i + 0x9e37u) % 2001) - 1000) / 500);
         st_memcpy(d_a, a.data(), a.size(), hipMemcpyHostToDevice);
+        /* The same rows at a pitch of K + 8 bytes. */
+        st_memcpy2d(d_al, (size_t)(K + 8), a.data(), (size_t)K, (size_t)K, (size_t)M,
+                    hipMemcpyHostToDevice);
         for (int c = 0; c < copies; ++c)
             st_memcpy((uint8_t*)d_w + (size_t)c * wb, w.data(), wb, hipMemcpyHostToDevice);
         std::vector<float> as((size_t)(M * sk)), s(sb / 4);
@@ -14703,18 +15636,16 @@ static void fp8f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int 
     RadArgs a;
     std::memset(&a, 0, sizeof(a));
     a.t = ts.data(); a.n_t = (int)ts.size(); a.p = ps.data(); a.n_p = (int)ps.size(); a.world_size = 1;
-    const char* saved = std::getenv("RADIANCE_FP8F32_FORM");
-    const std::string keep = saved ? saved : "";
-    auto set = [](const char* form) {
-        if (form) setenv("RADIANCE_FP8F32_FORM", form, 1);
-        else unsetenv("RADIANCE_FP8F32_FORM");
-    };
-    auto run = [&](const char* form, std::vector<uint8_t>* out) -> int {
-        set(form);
+    /* `legacy` reads the rows at the pitch off 16 bytes. */
+    auto run = [&](bool legacy, std::vector<uint8_t>* out) -> int {
         std::vector<uint8_t> fill(yb, 0xa5);
         st_memcpy(d_y, fill.data(), yb, hipMemcpyHostToDevice);
+        ts[0].data = legacy ? d_al : d_a;
+        ts[0].stride[0] = legacy ? K + 8 : K;
         ts[2].data = d_w;
         const int rc = r->launch(&a, nullptr);
+        ts[0].data = d_a;
+        ts[0].stride[0] = K;
         if (rc != RAD_OK) return rc;
         if (st_stream_sync(nullptr) != hipSuccess) return (int)RAD_E_DEVICE;
         out->resize(yb);
@@ -14722,47 +15653,30 @@ static void fp8f32_forms(const Plugin& pl, int64_t M, int64_t N, int64_t K, int 
         return (int)RAD_OK;
     };
     std::vector<uint8_t> legacy, got;
-    const int lrc = run("legacy", &legacy);
+    const int lrc = run(true, &legacy);
     ok(fmt("gemm_fp8a8_f32scale legacy form at M=%lld N=%lld K=%lld", (long long)M, (long long)N,
            (long long)K).c_str(), lrc == RAD_OK);
-    static const char* kForms[] = { "decode", "decode1x16", "decode2x16", "decode3x8",
-                                    "decode1x8x2", "decode1x8x4", "decode2x8x2", "decode3x8x2",
-                                    "decode2x4x4", "rows1", "rows4", nullptr };
+    const int rc = lrc == RAD_OK ? run(false, &got) : lrc;
     if (lrc == RAD_OK) {
-        for (const char* const* f = kForms;; ++f) {
-            const int rc = run(*f, &got);
-            const bool same = rc == RAD_OK && got == legacy;
-            size_t first = 0;
-            if (rc == RAD_OK && !same) while (first < got.size() && got[first] == legacy[first]) ++first;
-            ok(fmt("gemm_fp8a8_f32scale form %s at M=%lld N=%lld K=%lld: byte-identical to legacy",
-                   *f ? *f : "default", (long long)M, (long long)N, (long long)K).c_str(),
-               same, rc != RAD_OK ? fmt("rc=%d", rc) : same ? "" : fmt("first byte %zu", first));
-            if (!*f) break;
-        }
+        const bool same = rc == RAD_OK && got == legacy;
+        size_t first = 0;
+        if (rc == RAD_OK && !same) while (first < got.size() && got[first] == legacy[first]) ++first;
+        ok(fmt("gemm_fp8a8_f32scale at M=%lld N=%lld K=%lld: byte-identical to legacy",
+               (long long)M, (long long)N, (long long)K).c_str(),
+           same, rc != RAD_OK ? fmt("rc=%d", rc) : same ? "" : fmt("first byte %zu", first));
     }
-    if (timed && lrc == RAD_OK) {
+    if (timed && rc == RAD_OK) {
         const double bytes = (double)(wb + sb), flop = 2.0 * (double)M * (double)N * (double)K;
         std::printf("\ngemm_fp8a8_f32scale  N=%lld K=%lld M=%lld  %.2f MiB weight + scales, %d copies, "
                     "%d iters\n", (long long)N, (long long)K, (long long)M, bytes / (1 << 20), copies, iters);
-        static const char* kTimed[] = { "legacy", "decode1x8", "decode1x16", "decode3x8",
-                                        "decode1x8x2", "decode1x16x2", "decode1x4x4",
-                                        "decode1x8x4", "decode2x8x2", "decode2x4x2",
-                                        "decode2x4x4", "decode3x8x2", "decode3x4x2", "rows1",
-                                        "rows2", nullptr };
-        for (const char* const* f = kTimed;; ++f) {
-            set(*f);
-            const double us = st_time_us([&](int i) {
-                ts[2].data = (uint8_t*)d_w + (size_t)(i % copies) * wb;
-                r->launch(&a, nullptr);
-            }, iters, nullptr);
-            std::printf("  %-11s %9.1f us  %7.1f GB/s  %6.2f TFLOP/s\n", *f ? *f : "default", us,
-                        bytes / (us * 1e3), flop / (us * 1e6));
-            if (!*f) break;
-        }
+        const double us = st_time_us([&](int i) {
+            ts[2].data = (uint8_t*)d_w + (size_t)(i % copies) * wb;
+            r->launch(&a, nullptr);
+        }, iters, nullptr);
+        std::printf("  %-11s %9.1f us  %7.1f GB/s  %6.2f TFLOP/s\n", "rule", us,
+                    bytes / (us * 1e3), flop / (us * 1e6));
         ts[2].data = d_w;
     }
-    if (saved) setenv("RADIANCE_FP8F32_FORM", keep.c_str(), 1);
-    else unsetenv("RADIANCE_FP8F32_FORM");
 }
 
 /* The block-quantised trunk GEMMs GLM's checkpoints resolve to, at one shape: E4M3 with F32
@@ -22093,6 +23007,20 @@ static void device_phase(const Plugin& pl) {
     attn_numeric_case(pl, "attn_prefill_h256_gqa6_k6v4",  256, 6, 100, "k6_v4",  0, 1024);
     attn_numeric_case(pl, "attn_decode_h256_gqa6_k6v4",   256, 6, 1,   "k6_v4",  0, 1024);
     attn_numeric_case(pl, "attn_decode_h256_gqa6_k6v4",   256, 6, 4,   "k6_v4",  0, 2048);
+    /* Flash-Next's QSA layers (#138): twelve queries per KV head over 4-token pages, and six at
+     * four ranks, each layout's prefill (a long history and a ragged last tile), decode, and the
+     * widest verify (q_len 5 at gqa 12, 10 at gqa 6). */
+    for (const char* kv : { "fp8_v4", "k6_v4" }) {
+        const std::string t = kv[0] == 'f' ? "fp8v4" : "k6v4";
+        const std::string p12 = "attn_prefill_h256_gqa12_" + t, d12 = "attn_decode_h256_gqa12_" + t;
+        const std::string p6 = "attn_prefill_h256_gqa6_bs4_" + t, d6 = "attn_decode_h256_gqa6_bs4_" + t;
+        attn_numeric_case(pl, p12.c_str(), 256, 12, 64, kv, 0, 1000, 4);
+        attn_numeric_case(pl, d12.c_str(), 256, 12, 1,  kv, 0, 1000, 4);
+        attn_numeric_case(pl, d12.c_str(), 256, 12, 5,  kv, 0, 2048, 4);
+        attn_numeric_case(pl, p6.c_str(),  256, 6,  64, kv, 0, 1000, 4);
+        attn_numeric_case(pl, d6.c_str(),  256, 6,  1,  kv, 0, 1000, 4);
+        attn_numeric_case(pl, d6.c_str(),  256, 6,  10, kv, 0, 2048, 4);
+    }
     /* A ctx past a whole block (a partial last tile), and q_len 7: three waves, where the V
      * staging's unit count is not a multiple of the threads. */
     for (const char* kv : { "fp8_v4", "k6_v4" }) {
@@ -22120,6 +23048,11 @@ static void device_phase(const Plugin& pl) {
     attn_numeric_case(pl, "attn_decode_h128_gqa2_bf16kv",  128, 2, 24, "bf16",     0, 256);
     attn_gq_fold_case(pl, 3, false);
     attn_gq_fold_case(pl, 24, false);
+    /* And over the fp8_v4 and k6_v4 caches (Flash-Next's --kv-cache-dtype fp8_v4 / k6_v4). */
+    for (int kvq : { 1, 2 }) {
+        attn_gq_fold_case(pl, 3, false, false, kvq);
+        attn_gq_fold_case(pl, 24, false, false, kvq);
+    }
     attn_gq_fold_case(pl, 3, true);
     attn_gq_fold_case(pl, 24, true);
     for (const bool bf16 : { false, true }) {
@@ -22898,6 +23831,64 @@ static void device_phase(const Plugin& pl) {
                     for (int64_t c = 0; c < n; ++c) if (got[(size_t)(m * wide + c)] != want) { val = false; break; }
                 ok("fill_bf16 writes a given value, RNE-rounded", val);
             }
+        }
+    }
+    /* --- the f32 forms: a latent kept aside and put back, a zeroed f32 scratch --- */
+    if (sel("cast_f32_f32")) {
+        const RadKernelInfo* r = find(pl, "cast_f32_f32");
+        if (!r) ok("cast_f32_f32", false, "row absent");
+        else {
+            const int64_t M = 6, n = 36, wide = 2 * n;
+            std::vector<float> src((size_t)(M * n));
+            for (int64_t i = 0; i < M * n; ++i) src[(size_t)i] = 0.37f * (float)((i * 29) % 83) - 9.1f;
+            void* d_src = dalloc((size_t)M * n * 4);
+            void* d_dst = dalloc((size_t)M * wide * 4);
+            std::vector<float> pre((size_t)(M * wide), -7.5f);
+            st_memcpy(d_src, src.data(), (size_t)M * n * 4, hipMemcpyHostToDevice);
+            st_memcpy(d_dst, pre.data(), (size_t)M * wide * 4, hipMemcpyHostToDevice);
+            RadTensor ty = T(d_dst, RAD_F32, { M, n });
+            ty.data = (void*)((float*)d_dst + n);
+            ty.stride[0] = wide;
+            std::vector<RadTensor> ts = { T(d_src, RAD_F32, { M, n }), ty };
+            std::vector<RadParam> ps = { PI("M", M), PI("n", n), PS("from", "f32"), PS("to", "f32") };
+            run_case(r, ts, ps);
+            std::vector<float> got((size_t)(M * wide));
+            st_memcpy(got.data(), d_dst, (size_t)M * wide * 4, hipMemcpyDeviceToHost);
+            bool copied = true, spilled = false;
+            for (int64_t m = 0; m < M; ++m)
+                for (int64_t c = 0; c < wide; ++c) {
+                    const float g = got[(size_t)(m * wide + c)];
+                    if (c >= n) copied = copied && std::memcmp(&g, &src[(size_t)(m * n + c - n)], 4) == 0;
+                    else spilled = spilled || g != -7.5f;
+                }
+            ok("cast_f32_f32 copies into a column slice, byte for byte", copied);
+            ok("cast_f32_f32 leaves the columns outside the slice alone", !spilled);
+        }
+    }
+    if (sel("fill_f32")) {
+        const RadKernelInfo* r = find(pl, "fill_f32");
+        if (!r) ok("fill_f32", false, "row absent");
+        else {
+            const int64_t M = 5, n = 40, wide = 2 * n;
+            void* d = dalloc((size_t)M * wide * 4);
+            std::vector<float> pre((size_t)(M * wide), -7.5f);
+            st_memcpy(d, pre.data(), (size_t)M * wide * 4, hipMemcpyHostToDevice);
+            RadTensor ty = T(d, RAD_F32, { M, n });
+            ty.stride[0] = wide;
+            std::vector<RadTensor> ts = { ty };
+            std::vector<RadParam> ps = { PI("M", M), PI("n", n), PS("dtype", "f32"), PF("value", 1.37) };
+            run_case(r, ts, ps);
+            std::vector<float> got((size_t)(M * wide));
+            st_memcpy(got.data(), d, (size_t)M * wide * 4, hipMemcpyDeviceToHost);
+            bool val = true, spilled = false;
+            for (int64_t m = 0; m < M; ++m)
+                for (int64_t c = 0; c < wide; ++c) {
+                    const float g = got[(size_t)(m * wide + c)];
+                    if (c < n) val = val && g == 1.37f;
+                    else spilled = spilled || g != -7.5f;
+                }
+            ok("fill_f32 writes the value exactly", val);
+            ok("fill_f32 leaves the columns past the pitch alone", !spilled);
         }
     }
     /* --- byte rows: the KV tier's transfer pair --- */
@@ -23704,6 +24695,31 @@ static void device_phase(const Plugin& pl) {
     if (sel("resize_bilinear")) ups::resize_bilinear_cases(pl);
     if (sel("patch_fold_f32")) ups::patch_fold_cases(pl);
     if (sel("flow_renoise_f32")) ups::flow_renoise_cases(pl);
+    /* The joint image generators' ops. */
+    if (sel("table_add_bf16")) g3::table_add_cases(pl);
+    if (sel("mix_rows_bf16")) g3::mix_rows_cases(pl);
+    if (sel("chan_stats_bf16")) g3::chan_stats_cases(pl);
+    if (sel("chan_stats_f32")) g3::chan_stats_f32_cases(pl);
+    if (sel("attn_cross_h128_bf16")) g3::attn_cross_cases(pl, 128);
+    if (sel("attn_cross_h64_bf16")) g3::attn_cross_cases(pl, 64);
+    if (sel("attn_dense_gqa")) g3::attn_dense_gqa_cases(pl);
+    if (sel("attn_dense_h384_bf16") || sel("attn_dense_h512_bf16")) g3::attn_wide_cases(pl);
+    if (sel("rms_mod_bf16") || sel("rms_mod_quant_fp8_bf16")) g3::rms_mod_forms(pl);
+    if (sel("timestep_embed_bf16")) g3::timestep_round_cases(pl);
+    /* LTX-2's. */
+    if (sel("rope_split")) ltx::rope_cases(pl);
+    if (sel("head_gate")) ltx::gate_cases(pl);
+    if (sel("ltx_guide")) ltx::guide_cases(pl);
+    if (sel("pixel_norm")) ltx::pixel_norm_cases(pl);
+    if (sel("d2s3d") || sel("s2d3d")) ltx::resample_cases(pl);
+    if (sel("pix_patch") || sel("patch_pix8")) ltx::patch_cases(pl);
+    if (sel("tile_grid") || sel("tile_crop") || sel("tile_stitch")) ltx::tile_cases(pl);
+    if (sel("vol_index")) ltx::vol_index_cases(pl);
+    if (sel("attn_na3d")) ltx::na3d_cases(pl);
+    if (sel("stft_logmel")) ltx::stft_cases(pl);
+    if (sel("bwe_up")) ltx::bwe_cases(pl);
+    if (sel("conv2d_nhwc_bf16")) ltx::conv2d_cases(pl);
+    if (sel("int_affine")) ltx::int_affine_cases(pl);
     if (sel("vsa_select_h128_bf16")) vsa::select_cases(pl);
     if (sel("attn_vsa_h128_bf16")) vsa::attn_cases(pl);
     if (sel("quant_cols_fp8_bf16")) vsa::quant_cols_cases(pl);
@@ -23797,37 +24813,14 @@ static void device_phase(const Plugin& pl) {
         fp8_f32scale_check(pl, true, 4, true, true, 288);
         fp8_f32scale_check(pl, true, 65, false);
         fp8_f32scale_check(pl, true, 65, true);
-        // The rule takes the expert-major form; pinned, the row tiles stay covered, and every
-        // stage and column-tile count meets several column tiles, a K of one stage and of
-        // several, and runs past sixteen rows.
-        const char* const pins[3] = { "RADIANCE_FP8F32_DECODE_EXPERTS",
-                                      "RADIANCE_FP8F32_EXPERTS_STAGE_K",
-                                      "RADIANCE_FP8F32_EXPERTS_COLTILES" };
-        std::string kept[3];
-        bool given[3];
-        for (int i = 0; i < 3; ++i) {
-            const char* v = std::getenv(pins[i]);
-            given[i] = v;
-            if (v) kept[i] = v;
-        }
-        setenv(pins[0], "0", 1);
+        // The grouped row's three expert-major tilings, each over several column tiles and runs
+        // past sixteen rows: K 256 at 128 stages over four column tiles (above), a longer K at the
+        // 256 stage over four column tiles under 128 routed rows, and over one from there (top_k
+        // is 4 here).
         fp8_f32scale_check(pl, true, 17, true, true, 6, 512, 512);
-        fp8_f32scale_check(pl, true, 65, false);
-        setenv(pins[0], "1", 1);
-        for (const char* stage : { "128", "256" })
-            for (const char* tiles : { "1", "4" }) {
-                setenv(pins[1], stage, 1);
-                setenv(pins[2], tiles, 1);
-                fp8_f32scale_check(pl, true, 17, true, true, 6, 512, 512);
-                fp8_f32scale_check(pl, true, 4, false, true, 288, 512, 384);
-                fp8_f32scale_check(pl, true, 65, false);
-            }
-        for (int i = 0; i < 3; ++i) {
-            if (given[i])
-                setenv(pins[i], kept[i].c_str(), 1);
-            else
-                unsetenv(pins[i]);
-        }
+        fp8_f32scale_check(pl, true, 4, false, true, 288, 512, 384);
+        fp8_f32scale_check(pl, true, 65, true, true, 6, 512, 512);
+        fp8_f32scale_check(pl, true, 65, false, true, 288, 512, 384);
     }
 
     if (sel("moe_gemm_w4a8_mod4")) {
@@ -23889,17 +24882,14 @@ static void device_phase(const Plugin& pl) {
             mhc_check(pl, nm, 33, 129, 8);
         }
     if (sel("mhc_pre_bf16") || sel("mhc_post_bf16")) {
-        /* Every finish and partial form and the vector mhc_post against the old dispatch, at the
-         * decode, verify and prefill row counts and on 16-byte rows, the vector paths' case. */
+        /* The vector forms on 16-byte rows against the scalar forms on pitched rows, at the
+         * decode, verify and prefill row counts. */
         for (int64_t rows : { 1, 6, 48, 128, 2048 }) mhcpre_perf(pl, rows, -1);
     }
     if (sel("mhc_pre_partial_bf16") || sel("mhc_pre_finish_bf16")) {
         for (int world : { 2, 4, 8 })
             for (int64_t rows : { 1, 4, 31, 32, 33, 65, 130 })
-                mhc_split_check(pl, rows, world, nullptr, nullptr);
-        for (const char* env : { "RADIANCE_MHC_PREFILL_COEFF4", "RADIANCE_MHC_PREFILL_ROWS4",
-                                 "RADIANCE_MHC_PREFILL_WARP" })
-            for (int64_t rows : { 33, 130 }) mhc_split_check(pl, rows, 8, env, "0");
+                mhc_split_check(pl, rows, world);
     }
     if (sel("swiglu_clamped_bf16")) {
         for (int64_t rows : { 1, 7, 33 })
@@ -23980,15 +24970,14 @@ static void device_phase(const Plugin& pl) {
     }
     if (sel("mla_project_bf16")) {
         for (const char* mode : { "absorb", "expand" }) {
-            for (int64_t rows : { 1, 2, 4, 33 })
+            /* Every rows-a-group form (1, 2, 4, 8) and tails past the last full group. */
+            for (int64_t rows : { 1, 2, 3, 4, 6, 33, 130 })
                 for (int64_t heads : { 8, 16 }) mla_project_check(pl, rows, heads, mode);
             mla_project_check(pl, 1, 1, mode);
             mla_project_check(pl, 1, 64, mode);
             for (int64_t rows : { 1, 4, 33 })
                 for (int64_t heads : { 8, 16 }) mla_project_check(pl, rows, heads, mode, true);
         }
-        /* Every row form against the one-row kernels, byte for byte, with tails at 3, 33 and 130. */
-        for (int64_t rows : { 1, 3, 6, 33, 130 }) project_forms(pl, rows, -1);
     }
     if (sel("mla_attn_matrix_bf16")) {
         mla_check(pl, 7, 16, 17, "mla_attn_matrix_bf16");
@@ -24026,13 +25015,9 @@ static void device_phase(const Plugin& pl) {
                       swaps);
         mla_check(pl, 33, 8, 513, "mla_attn_matrix_bf16", MlaFill::topk, "mla_attn_bf16", 0, 16);
         mla_check(pl, 4, 16, 65, "mla_attn_matrix_bf16", MlaFill::topk, nullptr, 0, 4);
-        { /* The positional pairing, kept for comparison; tables wider than the union's lists
-             * (kUnionBlocks, 520) take it too. */
-            ScopedEnv positional("RADIANCE_MLA_PAIR", "pos");
-            mla_check(pl, 33, 8, 17, "mla_attn_matrix_bf16", MlaFill::ragged, nullptr);
-            mla_check(pl, 7, 8, 513, "mla_attn_matrix_bf16", MlaFill::prefill, nullptr);
-            mla_check(pl, 7, 8, 65, "mla_attn_matrix_bf16", MlaFill::topk, nullptr, 0, 16);
-        }
+        /* Tables wider than the union's lists (kUnionBlocks, 520) take the positional pairing. */
+        mla_check(pl, 33, 8, 521, "mla_attn_matrix_bf16", MlaFill::ragged, nullptr);
+        mla_check(pl, 7, 8, 521, "mla_attn_matrix_bf16", MlaFill::prefill, nullptr);
         mla_check(pl, 4, 8, 600, "mla_attn_matrix_bf16", MlaFill::topk, nullptr, 0, 16);
         /* The element-wise key load, the fallback for a cache the vectors cannot read. */
         mla_check(pl, 33, 16, 17, "mla_attn_matrix_bf16", MlaFill::ragged, nullptr, 1);
@@ -24048,8 +25033,8 @@ static void device_phase(const Plugin& pl) {
                 kda_check(pl, mode, false, accepted, true);
                 kda_check(pl, mode, true, accepted, true);
             }
-        /* Every form against the one-row shuffle-sum kernel, byte for byte, in all four modes. */
-        for (int64_t M : { 1, 7, 48, 300 }) kda_forms(pl, M, -1);
+        /* GLM's TP8 shape against libref, in all four modes. */
+        for (int64_t M : { 1, 7, 48, 300 }) kda_perf(pl, M, -1);
     }
     if (sel("moe_gemm_mxfp4a8")) {
         for (int m : { 1, 17, 65, 257 })
@@ -24067,151 +25052,32 @@ static void device_phase(const Plugin& pl) {
         for (int shape : { 1, 2, 3, 4 })
             mx_experts_check(pl, 65, shape % 2 ? 2 : 1, true, "sorted", shape, false, 288, 8);
         mx_experts_check(pl, 1, 1, false, "token", 0, true);
-        // The rule takes the expert-major form at decode (at GLM's TP8 slices also above). Pinned,
-        // the row groups and the TP8 prefill form stay covered, and every expert-major stage and
-        // column-tile count meets narrow, parted and wide experts and runs of a hundred rows.
-        // Both weight decodes (RADIANCE_MXFP4_LUT) meet every form; dropped slots inside the runs
-        // and runs under 16 rows (288 experts) reach the TP8 prefill form at 65 and 257 tokens,
-        // with and without its stage prefetch (RADIANCE_MXFP4_PREFILL_PIPE).
-        constexpr int kPins = 10;
-        const char* const pins[kPins] = {
-            "RADIANCE_MXFP4_DECODE_EXPERTS",     "RADIANCE_MXFP4_EXPERTS_STAGE_K",
-            "RADIANCE_MXFP4_EXPERTS_COLTILES",   "RADIANCE_MXFP4_LUT",
-            "RADIANCE_MXFP4_ALIGNED_JOBS",       "RADIANCE_MXFP4_PREFILL_N32",
-            "RADIANCE_MXFP4_PREFILL_M32",        "RADIANCE_MXFP4_PREFILL_N64",
-            "RADIANCE_MXFP4_PREFILL_CACHE_ROWS", "RADIANCE_MXFP4_PREFILL_PIPE"
-        };
-        std::string kept[kPins];
-        bool given[kPins];
-        for (int i = 0; i < kPins; ++i) {
-            const char* v = std::getenv(pins[i]);
-            given[i] = v;
-            if (v) kept[i] = v;
-        }
-        // P64 is the rule at GLM's TP8 slices from 769 rows; off here, so the forms above stay the
-        // ones these cases name, and pinned or by its rule further down.
-        constexpr int kP64 = 12;
-        const char* const p64[kP64] = { "RADIANCE_MXFP4_PREFILL_P64",
-                                        "RADIANCE_MXFP4_PREFILL_P64_MIN_T_GATE_UP",
-                                        "RADIANCE_MXFP4_PREFILL_P64_MIN_T_DOWN",
-                                        "RADIANCE_MXFP4_PREFILL_P64_BM",
-                                        "RADIANCE_MXFP4_PREFILL_P64_BN",
-                                        "RADIANCE_MXFP4_PREFILL_P64_STAGE_K",
-                                        "RADIANCE_MXFP4_PREFILL_P64_COLTILES",
-                                        "RADIANCE_MXFP4_PREFILL_P64_STAGE_OUT",
-                                        "RADIANCE_MXFP4_PREFILL_P64_T_BM64",
-                                        "RADIANCE_MXFP4_PREFILL_P64_T_BN128",
-                                        "RADIANCE_MXFP4_PREFILL_P64_T_DOWN_WIDE",
-                                        "RADIANCE_MXFP4_PREFILL_P64_DB" };
-        std::string kept64[kP64];
-        bool given64[kP64];
-        for (int i = 0; i < kP64; ++i) {
-            const char* v = std::getenv(p64[i]);
-            given64[i] = v;
-            if (v) kept64[i] = v;
-        }
-        for (int i = 1; i < kP64; ++i) unsetenv(p64[i]);
-        setenv(p64[0], "0", 1);
-        for (const char* lut : { "0", "1" }) {
-            setenv(pins[3], lut, 1);
-            setenv(pins[0], "0", 1);
-            for (int shape : { 1, 2, 3, 4 })
-                mx_experts_check(pl, 17, shape % 2 ? 2 : 1, false, "sorted", shape);
-            mx_experts_check(pl, 1, 1, false, "token", 0, true);
-            for (const char* pipe : { "0", "1" }) {
-                setenv(pins[9], pipe, 1);
-                for (int shape : { 3, 4 }) {
-                    mx_experts_check(pl, 65, shape % 2 ? 2 : 1, true, "sorted", shape, false, 288,
-                                     8);
-                    for (int m : { 65, 257 })
-                        mx_experts_check(pl, m, shape % 2 ? 2 : 1, true,
-                                         shape == 4 ? "sorted" : "token", shape, false, 288, 8,
-                                         true);
-                }
-                // The TP8 prefill form outside GLM's slices: E8M0 codes 0 and 255, narrower and
-                // shorter odd experts, dropped slots.
-                for (int i = 4; i < 9; ++i) setenv(pins[i], "1", 1);
-                mx_experts_check(pl, 257, 2, false, "token", 0, true, 3, 2, true);
-                mx_experts_check(pl, 257, 1, true, "sorted", 0, false, 3, 2, true);
-                for (int i = 4; i < 9; ++i) unsetenv(pins[i]);
-            }
-            unsetenv(pins[9]);
-            setenv(pins[0], "1", 1);
-            for (const char* stage : { "128", "256" })
-                for (const char* tiles : { "1", "4" }) {
-                    setenv(pins[1], stage, 1);
-                    setenv(pins[2], tiles, 1);
-                    mx_experts_check(pl, 17, 1, false, "sorted", 2);
-                    mx_experts_check(pl, 4, 2, true, "token", 3);
-                    mx_experts_check(pl, 17, 2, false, "token");
-                    mx_experts_check(pl, 257, 2, true, "sorted");
-                    mx_experts_check(pl, 65, 1, false, "sorted", 4, false, 288, 8, true);
-                }
-            unsetenv(pins[1]);
-            unsetenv(pins[2]);
-        }
-        // The P64 form pinned below its row bounds: every BM x BN x stage at GLM's TP8 slices over
-        // 288 experts and 65 tokens (runs of about two rows, dropped slots), column tiles 1 and 4
-        // with and without the LDS output at 257 tokens, and outside GLM's slices E8M0 codes 0 and
-        // 255 with narrower and shorter odd experts; then by its rule at 1024, 2048 and 4096 tokens
-        // (gate_up BM32 BN64 K256, BM64 BN64 K256 and BM64 BN128 K128 with the LDS output, down BM32
-        // BN64 K128 x4 and BM64 BN128 K128 x4 with the LDS output). It always takes the table decode.
-        auto pin = [&](int bm, int bn, int sk, int ct, int out, int db = 0) {
-            const int v[8] = { 1, 0, 0, bm, bn, sk, ct, out };
-            for (int i = 0; i < 8; ++i) setenv(p64[i], std::to_string(v[i]).c_str(), 1);
-            setenv(p64[11], db ? "1" : "0", 1);
-        };
-        setenv(pins[0], "0", 1);
-        for (int bm : { 32, 64 })
-            for (int bn : { 64, 128 })
-                for (int sk : { 128, 256 }) {
-                    pin(bm, bn, sk, 4, 0);
-                    for (int shape : { 3, 4 })
-                        mx_experts_check(pl, 65, shape % 2 ? 2 : 1, true,
-                                         shape == 4 ? "sorted" : "token", shape, false, 288, 8,
-                                         true);
-                }
-        for (int out : { 0, 1 })
-            for (int ct : { 1, 4 }) {
-                pin(64, 128, 128, ct, out);
-                for (int shape : { 3, 4 })
-                    mx_experts_check(pl, 257, shape % 2 ? 2 : 1, true,
-                                     shape == 4 ? "sorted" : "token", shape, false, 288, 8, true);
-            }
-        for (int out : { 0, 1 }) {
-            pin(64, 128, 128, 4, out);
-            mx_experts_check(pl, 257, 2, false, "token", 0, true, 3, 2, true);
-            mx_experts_check(pl, 257, 1, true, "sorted", 0, false, 3, 2, true);
-        }
-        // The double buffer at gate_up's slice wherever two stages fit, and with E8M0 codes 0 and
-        // 255 outside GLM's slices.
-        for (int bm : { 32, 64 })
-            for (int bn : { 64, 128 }) {
-                pin(bm, bn, 128, 4, bm == 64 && bn == 128, 1);
-                mx_experts_check(pl, 257, 2, true, "token", 3, false, 288, 8, true);
-            }
-        pin(32, 64, 256, 4, 0, 1);
-        mx_experts_check(pl, 257, 2, true, "token", 3, false, 288, 8, true);
+        // The form follows the routed rows (top_k 2 away from GLM, 8 at its 288 experts). Away
+        // from GLM's slices the row groups from 512 rows: E8M0 codes 0 and 255, narrower and
+        // shorter odd experts, dropped slots.
         mx_experts_check(pl, 257, 2, false, "token", 0, true, 3, 2, true);
-        for (int i = 0; i < kP64; ++i) unsetenv(p64[i]);
-        unsetenv(pins[0]);
-        for (int m : { 1024, 2048 })
-            for (int shape : { 3, 4 })
-                mx_experts_check(pl, m, shape % 2 ? 2 : 1, true, shape == 4 ? "sorted" : "token",
+        mx_experts_check(pl, 257, 1, true, "sorted", 0, false, 3, 2, true);
+        // At GLM's TP4 slices the GLM prefill form from 512 rows, with dropped slots and runs under
+        // 16 rows, and with E8M0 codes 0 and 255.
+        for (int shape : { 1, 2 })
+            for (int m : { 65, 257 }) {
+                mx_experts_check(pl, m, shape % 2 ? 2 : 1, true, shape == 2 ? "sorted" : "token",
                                  shape, false, 288, 8, true);
-        mx_experts_check(pl, 4096, 1, true, "sorted", 4, false, 288, 8, true);
-        for (int i = 0; i < kP64; ++i) {
-            if (given64[i])
-                setenv(p64[i], kept64[i].c_str(), 1);
-            else
-                unsetenv(p64[i]);
-        }
-        for (int i = 0; i < kPins; ++i) {
-            if (given[i])
-                setenv(pins[i], kept[i].c_str(), 1);
-            else
-                unsetenv(pins[i]);
-        }
+                mx_experts_check(pl, m, shape % 2 ? 2 : 1, false, shape == 2 ? "sorted" : "token",
+                                 shape, true, 288, 8);
+            }
+        // At GLM's TP8 slices the expert-major form to its bound (gate_up 768 rows, down below
+        // P64's 5760), then P64 by its rule: gate_up BM32 BN64 K256 from 769 rows, BM64 BN64 K256
+        // from 12288 and BM64 BN128 K128 with the LDS output from 24576; down BM32 BN64 K128 x4
+        // from 5760 rows and BM64 BN128 K128 x4 with the LDS output from 24576.
+        mx_experts_check(pl, 96, 2, true, "token", 3, false, 288, 8, true);
+        mx_experts_check(pl, 719, 1, true, "sorted", 4, false, 288, 8, true);
+        for (int m : { 97, 1024, 2048, 3072 })
+            mx_experts_check(pl, m, 2, true, "token", 3, false, 288, 8, true);
+        for (int m : { 720, 1024, 2048, 4096 })
+            mx_experts_check(pl, m, 1, true, "sorted", 4, false, 288, 8, true);
+        mx_experts_check(pl, 1024, 2, false, "token", 3, true, 288, 8);
+        mx_experts_check(pl, 1024, 1, false, "sorted", 4, true, 288, 8);
     }
 
     if (sel("hc_read_e4m3")) {
@@ -24614,8 +25480,8 @@ static void usage(void) {
                 "  --perf N K M [iters]:  time the fp8 decode GEMMs at one shape and print the\n"
                 "             weight bandwidth each reaches.\n"
                 "  --perfbf16 N K M [iters]:  the bf16 skinny GEMM at every variant it has.\n"
-                "  --perff32 N K M [iters]:  gemm_nt_f32 at every tile form, each compared byte\n"
-                "             for byte with the legacy kernel, with GB/s and TFLOP/s.\n"
+                "  --perff32 N K M [iters]:  gemm_nt_f32 at the tile form its rule picks, compared\n"
+                "             byte for byte with the host arithmetic, with GB/s and TFLOP/s.\n"
                 "  --perfq N K M [iters]:  the block-quantised trunk rows GLM resolves to: E4M3 with\n"
                 "             F32 block scales and the three OCP-MXFP4 rows, GB/s on weight + scales.\n"
                 "  --perfw8 N K M [iters]:  the 8-bit trunk GEMMs -- block E4M3 W8A8 and the int8\n"
@@ -24669,27 +25535,22 @@ static void usage(void) {
                 "  --perfmxf8 M [iters] [experts] [top_k] [skew]:  the same at the FP8 experts with f32\n"
                 "             block scales (moe_gemm_fp8a8_f32scale, GLM's MTP layer).\n"
                 "  --perfmhcpre M [iters]:  mhc_pre (whole, partials alone, finish alone) and\n"
-                "             mhc_post at GLM's shape, every form against the old dispatch.\n"
+                "             mhc_post at GLM's shape, 16-byte rows against pitched ones.\n"
                 "  --perfrouter M [iters]:  router_sigmoid_topk at GLM's shape (288 experts, top 8),\n"
-                "             the wave-per-row select against the serial scan.\n"
+                "             the wave-per-row select timed.\n"
                 "  --perfmoefuse M [iters]:  GLM's decode fusions of the MoE block at M token\n"
                 "             rows (288 experts, top 8, TP8 widths), each against the separate\n"
                 "             launches it replaces: time of both and a byte comparison of every\n"
                 "             output (`= old` or DIFFERS). The router fusion takes M <= 128.\n"
                 "  --perfkda M [iters]:  kda_update at GLM's TP8 shape: prefill of M tokens (one\n"
-                "             sequence, and three anchored) and the 8x6 verify step, every row and\n"
-                "             prefetch form timed and compared byte for byte with the old kernel.\n"
-                "  --perfproject M [iters]:  mla_project at GLM's TP8 shape, both modes, every\n"
-                "             rows-a-group form timed and compared byte for byte with the old kernels.\n"
+                "             sequence, and three anchored) and the 8x6 verify step, timed.\n"
+                "  --perfproject M [iters]:  mla_project at GLM's TP8 shape, both modes, timed.\n"
                 "  --perfmx M [iters] [experts] [top_k] [skew]:  the MXFP4 expert GEMM at GLM's\n"
                 "             TP8 slices (gate_up 512 x 4096, down 4096 x 256) over a routing of an\n"
                 "             M-token chunk (288 experts, top 8 by default; uniform, or `skew` a Gamma\n"
                 "             CV per expert as g1.0 or a Zipf exponent as z1.1): time, touched weight\n"
-                "             bytes, GB/s and TFLOP/s per projection; the rule, the expert-major form\n"
-                "             at each pinned stage and column-tile count, the row groups and from 512\n"
-                "             routed rows every prefill form and the P64 raster (BM x BN x stage,\n"
-                "             down also x column tiles), each compared with the bytes of the pinned\n"
-                "             TP8 prefill form.\n"
+                "             bytes, GB/s and TFLOP/s per projection of the form the rule picks, and\n"
+                "             how often it streams each touched expert slice.\n"
                 "  --perfmla M blocks heads [iters] [fill]:  MLA attention without the oracle, so\n"
                 "             a 2048-row prefill chunk at 2k/8k context fits (blocks 513/2049).\n"
                 "             The wave row and the matrix row at both key loads (paired tiles at\n"
@@ -24778,7 +25639,7 @@ int main(int argc, char** argv) {
             perf_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != '-') perf_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perff32")) {
-            /* gemm_nt_f32 at every tile form (see f32_forms). */
+            /* gemm_nt_f32 at its rule's tile form (see f32_forms). */
             if (i + 3 >= argc) { usage(); return 2; }
             perf_f32 = 1;
             perf_n = std::strtoll(argv[++i], nullptr, 0);
@@ -24874,7 +25735,7 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) ar8_it = (int)std::strtol(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) ar8_dt = argv[++i];
         } else if (!std::strcmp(argv[i], "--perfmhcpre")) {
-            /* mhc_pre and mhc_post at GLM's shape, every form, against the old dispatch. */
+            /* mhc_pre and mhc_post at GLM's shape, 16-byte rows against pitched ones. */
             if (i + 1 >= argc) { usage(); return 2; }
             mhc_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mhc_it = (int)std::strtol(argv[++i], nullptr, 0);
@@ -24887,7 +25748,7 @@ int main(int argc, char** argv) {
             mf_m = std::strtoll(argv[++i], nullptr, 0);
             if (i + 1 < argc && argv[i + 1][0] != 0x2d) mf_it = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfkda") || !std::strcmp(argv[i], "--perfproject")) {
-            /* kda_update or mla_project at GLM's TP8 shape, every form, against the old kernel. */
+            /* kda_update or mla_project at GLM's TP8 shape, timed. */
             if (i + 1 >= argc) { usage(); return 2; }
             const bool kda = !std::strcmp(argv[i], "--perfkda");
             (kda ? kda_m : proj_m) = std::strtoll(argv[++i], nullptr, 0);
@@ -24895,7 +25756,7 @@ int main(int argc, char** argv) {
                 (kda ? kda_it : proj_it) = (int)std::strtol(argv[++i], nullptr, 0);
         } else if (!std::strcmp(argv[i], "--perfmx") || !std::strcmp(argv[i], "--perfmxf8")) {
             mx_f8 = !std::strcmp(argv[i], "--perfmxf8");
-            /* An expert GEMM at GLM's TP8 slices over an M-token chunk, every form: MXFP4, or with
+            /* An expert GEMM at GLM's TP8 slices over an M-token chunk: MXFP4, or with
              * --perfmxf8 the FP8 experts with f32 block scales. */
             if (i + 1 >= argc) { usage(); return 2; }
             mx_m = std::strtoll(argv[++i], nullptr, 0);
@@ -25058,8 +25919,8 @@ int main(int argc, char** argv) {
     if (kda_m || proj_m) {
         if (!load(&pl, path)) return 1;
 #ifdef RAD_HAVE_HIP
-        if (kda_m) kda_forms(pl, kda_m, kda_it);
-        if (proj_m) project_forms(pl, proj_m, proj_it);
+        if (kda_m) kda_perf(pl, kda_m, kda_it);
+        if (proj_m) project_perf(pl, proj_m, proj_it);
         dfree_all();
 #else
         skip("kda_update and mla_project timing", "built without HIP");

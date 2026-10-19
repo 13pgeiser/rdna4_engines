@@ -30,6 +30,12 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 | Gemma 4 31B heretic-ara (refusals removed): GPTQ int4 trunk, int8 activations, MTP, vision | `gemma4-31b-heretic-ara-w4a8.rad` (20 GiB) | [download](https://huggingface.co/keptn/gemma4-31b-heretic-ara-w4a8) | `gemma4-31b-heretic-ara-w4a8.yaml` |
 | Qwen-Image 2.1 FP8: text to image and image edits | `qwen-image-2.1-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-fp8) | `qwen-image-2.1.yaml` |
 | Qwen-Image 2.1 Turbo FP8: the same in 8 steps | `qwen-image-2.1-turbo-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-qwen-image-2.1-turbo-fp8) | `qwen-image-2.1-turbo.yaml` |
+| Krea 2 Turbo FP8: text to image, one card | `krea-2-turbo-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/krea-2-turbo-radiance-fp8) | `krea-2-turbo.yaml` |
+| Krea 2 Raw FP8: the same, undistilled | `krea-2-raw-fp8.rad` (16 GiB) | [download](https://huggingface.co/StillDeadcode/krea-2-raw-radiance-fp8) | `krea-2-raw.yaml` |
+| FLUX.3 [klein] FP8: text to image and edits from up to ten pictures, one card | `flux-3-klein-fp8.rad` (9.3 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-flux-3-klein-fp8) | `flux-3-klein.yaml` |
+| FLUX.3 [klein] base FP8 | `flux-3-klein-base-fp8.rad` (9.3 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-flux-3-klein-base-fp8) | `flux-3-klein.yaml` |
+| LTX-2.5 distilled FP8: video with its stereo soundtrack from text or a first frame, one card | `ltx-2.5-distilled-fp8.rad` (37 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-ltx-2.5-distilled-fp8) | `ltx-2.5.yaml` |
+| LTX-2.5 base FP8 | `ltx-2.5-fp8.rad` (37 GiB) | [download](https://huggingface.co/StillDeadcode/radiance-ltx-2.5-fp8) | `ltx-2.5.yaml` |
 | MiniMax-H3 FP8: video with its stereo soundtrack from text | `minimax-h3-fp8.rad` (60 GiB) | [download](https://huggingface.co/StillDeadcode/minimax-h3-fp8) | `minimax-h3.yaml` |
 | FastH3 8-Step V2 FP8: the same in eight steps | `fasth3-8-step-v2-fp8.rad` (62 GiB) | [download](https://huggingface.co/StillDeadcode/fasth3-8-step-v2-fp8) | `fasth3.yaml` |
 | MiniMax-Music3 bf16: songs from lyrics and a description | `minimax-music3-bf16.rad` (20 GiB) | [download](https://huggingface.co/StillDeadcode/minimax-music3-bf16) | `minimax-music3.yaml` |

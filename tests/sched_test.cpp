@@ -1746,6 +1746,23 @@ static Interleaved interleave_run(int64_t n, bool decoder, int steps) {
     return out;
 }
 
+/* Between a commit and the next step (where an encoder pass is prepared) the committed step's
+ * plan names a request the scheduler may already have released: a client cancelled it and the
+ * server reaped it. prefill_continues() reads only an open step's plan (#127). */
+TEST(prefill_continues_reads_no_committed_plan) {
+    Fixture f;
+    f.build();
+    CHECK_OK(f.start());
+    f.sch.set_stage_rows(64);
+    const uint64_t p = f.submit(2000, 4);
+    CHECK(f.sch.step() != nullptr);
+    CHECK(f.sch.prefill_continues());
+    f.commit_plain(12);
+    CHECK_OK(f.sch.cancel(p));
+    CHECK_OK(f.sch.reap(p));
+    CHECK(!f.sch.prefill_continues());
+}
+
 TEST(interleave_off_puts_a_chunk_in_every_step) {
     const Interleaved r = interleave_run(0, /*decoder=*/true, 8);
     CHECK_EQ(r.shape, std::string("CCCCCCCC"));
@@ -2717,9 +2734,9 @@ TEST(the_decode_floor_records_only_single_sequence_decode_steps) {
     f.build(/*blocks=*/4096, /*states=*/64);
     CHECK_OK(f.start());
 
-    /* A prefill step samples nothing. Budget 128 tokens: this test walks 1 prefill +
-     * (kWindow-1) + 1 + kWindow = 65 steps, so 64 would run dry one step short. */
-    uint64_t a = f.submit(160, 128, /*priority=*/0, /*ignore_eos=*/true);
+    /* A prefill step samples nothing. Budget 320 tokens: this test walks 1 prefill + one window,
+     * at most six windows until the floor is set and one more, 257 steps. */
+    uint64_t a = f.submit(160, 320, /*priority=*/0, /*ignore_eos=*/true);
     REQUIRE(f.sch.step() != nullptr);
     f.commit_plain(11);
     f.sch.step_finished();
@@ -2745,9 +2762,11 @@ TEST(the_decode_floor_records_only_single_sequence_decode_steps) {
     f.sch.step_finished();
     CHECK_EQ(f.sch.metrics().step_ns_decode_best, (int64_t)0);
 
-    /* The SECOND window is the first gated one and sets the floor: positive, and no larger than
-     * the cumulative decode time it was drawn from. */
-    for (int i = 0; i < rad::DecodeFloor::kWindow; ++i) {
+    /* The first gated window sets the floor: positive, and no larger than the cumulative decode
+     * time it was drawn from. The fixture's steps take microseconds and vary widely, so the gate
+     * may reject some and the window take more than kWindow steps to fill. */
+    for (int i = 0; i < 6 * rad::DecodeFloor::kWindow && !f.sch.metrics().step_ns_decode_best;
+         ++i) {
         REQUIRE(f.sch.step() != nullptr);
         f.commit_plain(14);
         f.sch.step_finished();
@@ -2769,27 +2788,23 @@ TEST(the_decode_floor_records_only_single_sequence_decode_steps) {
 }
 
 TEST(the_decode_floor_ignores_a_decode_step_issued_behind_a_prefill) {
-    /* The live defect was a raw min latching the first decode step, which is issued ahead behind
-     * the prefill's host-side staging and whose bracket holds no GPU work. The fix does NOT
-     * exclude that step -- it is a real single-sequence decode step and belongs in the floor. It
-     * is made harmless by averaging: the floor is a min over window means, so the one degenerate
-     * bracket is diluted by the honest steps sharing its window. This pins that the
-     * prefill-following decode step IS eligible: a full window of decode steps that BEGINS with it
-     * produces a floor. Under the old predecessor-phase gate the first step was dropped, so a
-     * window of exactly kWindow decode steps fed only kWindow-1 samples and left the floor unset
-     * -- this test would have failed on that design. */
+    /* The decode step issued behind the prefill's host-side staging is a real single-sequence
+     * decode step: it is eligible, and the window mean dilutes its short bracket. Decode steps
+     * that begin with it produce a floor. The fixture's steps take microseconds and vary widely,
+     * so the gate may reject some and a window take more than kWindow steps to fill. */
     Fixture f;
     f.build(/*blocks=*/4096, /*states=*/64);
     CHECK_OK(f.start());
 
-    uint64_t a = f.submit(160, 128, /*priority=*/0, /*ignore_eos=*/true);
+    uint64_t a = f.submit(160, 256, /*priority=*/0, /*ignore_eos=*/true);
     REQUIRE(f.sch.step() != nullptr);          /* prefill */
     f.commit_plain(21);
     f.sch.step_finished();
 
-    /* Two windows: window 1 (holding the prefill-following step) is the un-gated warmup, so the
-     * floor only appears once a second, gated window completes. */
-    for (int i = 0; i < 2 * rad::DecodeFloor::kWindow; ++i) {
+    /* Window 1 (holding the prefill-following step) is the un-gated warmup, so the floor only
+     * appears once a gated window completes. */
+    for (int i = 0; i < 6 * rad::DecodeFloor::kWindow && !f.sch.metrics().step_ns_decode_best;
+         ++i) {
         REQUIRE(f.sch.step() != nullptr);
         CHECK_EQ(f.sch.plan().phase, RAD_PHASE_DECODE);
         CHECK_EQ(f.sch.plan().n_seq_decode, 1);

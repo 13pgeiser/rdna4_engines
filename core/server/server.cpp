@@ -170,7 +170,12 @@ void Server::register_routes() {
     router_.post("/v1/responses",        [this](const HttpRequest& q) { return handle_responses(q); });
     router_.post("/responses",           [this](const HttpRequest& q) { return handle_responses(q); });
     auto responses_tokens = [this](const HttpRequest& q) {
-        return count_tokens(q, responses_to_chat, ApiShape::OpenAI, "response.input_tokens");
+        return count_tokens(q,
+                            [](const std::string& b, const OaiLimits& l, std::string* c,
+                               std::string* ec, ApiError* e) {
+                                return responses_to_chat(b, l, c, ec, e);
+                            },
+                            ApiShape::OpenAI, "response.input_tokens");
     };
     router_.post("/v1/responses/input_tokens", responses_tokens);
     router_.post("/responses/input_tokens", responses_tokens);
@@ -210,9 +215,7 @@ static const int64_t kSpareWorkers = 64;
 void Server::note_ready(uint64_t begin_ns) {
     if (begin_ns == 0) return;
     const uint64_t now = rad_mono_ns();
-    /* Only a start in the past is a duration. A stamp that arrives out of order is ignored rather
-     * than written as zero: a zero cost would price every restart as free in any payback formula
-     * that divides by it. */
+    /* A stamp that is not in the past leaves the figure unset rather than writing a zero. */
     if (now <= begin_ns) return;
     startup_s_ = (int64_t)((now - begin_ns) / 1000000000ull);
 }
@@ -264,20 +267,32 @@ std::vector<std::string> Server::probe_reasoning_efforts() {
     l.default_reasoning_effort.clear();
     l.reasoning_effort_map.clear();
     l.probe = true;
-    auto takes = [&](const std::string& effort) {
+    template_default_effort_.clear();
+    auto render = [&](const std::string& effort, std::string* text) {
         std::string body = R"({"messages":[{"role":"user","content":"Hello"}],"max_tokens":1)";
         if (!effort.empty()) body += R"(,"reasoning_effort":)" + json(effort).dump();
         body += "}";
         OaiRequest r;
         ApiError e;
-        return parse_chat_request(body, odeps_, l, &r, &e) >= 0;
+        if (parse_chat_request(body, odeps_, l, &r, &e) < 0) return false;
+        if (text) *text = r.prompts.empty() ? std::string() : r.prompts[0].text;
+        return true;
     };
     /* A render that fails without an effort says nothing about efforts; one that takes a
      * nonsense word takes every word. */
-    if (!takes("") || takes("radiance-probe-not-a-level")) return {};
-    std::vector<std::string> set;
-    for (const char* w : { "low", "medium", "high", "xhigh", "max" })
-        if (takes(w)) set.push_back(w);
+    std::string plain;
+    if (!render("", &plain) || render("radiance-probe-not-a-level", nullptr)) return {};
+    std::vector<std::string> set, same;
+    for (const char* w : { "low", "medium", "high", "xhigh", "max" }) {
+        std::string text;
+        if (!render(w, &text)) continue;
+        set.push_back(w);
+        if (text == plain) same.push_back(w);
+    }
+    /* The level a request naming none gets: the one level whose render is the same. A template may
+     * spend it in a system prompt the client never sees (#113: Qwen3.8's is xhigh). Several, or
+     * none, say nothing. */
+    if (same.size() == 1) template_default_effort_ = same[0];
     lim_.reasoning_efforts = set;
     return set;
 }
@@ -1548,10 +1563,12 @@ HttpResponse Server::handle_responses(const HttpRequest& req) {
     std::string chat, echo;
     ApiError err;
     OaiRequest r;
-    if (responses_to_chat(req.body, lim_, &chat, &echo, &err) < 0 ||
+    std::map<std::string, std::pair<std::string, std::string>> ns;
+    if (responses_to_chat(req.body, lim_, &chat, &echo, &err, &ns) < 0 ||
         parse_chat_request(chat, odeps_, lim_, &r, &err) < 0)
         return error_response(err, req.peer);
     r.shape = ApiShape::Responses;
+    r.tool_namespace = std::move(ns);
     r.id = random_id("resp_");
     r.echo_json = std::move(echo);
     return serve(req, r);

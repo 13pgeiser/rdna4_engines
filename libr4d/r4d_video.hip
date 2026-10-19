@@ -82,7 +82,8 @@ __global__ __launch_bounds__(kT) void rms_mod_kernel(
     const uint16_t* __restrict__ yd, const uint16_t* __restrict__ g, const uint16_t* __restrict__ s,
     const uint16_t* __restrict__ w, const int* __restrict__ cu, uint16_t* __restrict__ x,
     uint8_t* __restrict__ q, float* __restrict__ qs, uint16_t* __restrict__ z, int n, int n_seq,
-    float eps, int y_ld, int g_ld, int s_ld, int x_ld, int q_ld, int qs_ld, int z_ld) {
+    float eps, int y_ld, int g_ld, int s_ld, int x_ld, int q_ld, int qs_ld, int z_ld, float wadd,
+    int once, int layer, int none) {
     __shared__ float sh[kT / 32];
     const int r = blockIdx.x;
     const int e = seq_of(cu, n_seq, r);
@@ -109,7 +110,32 @@ __global__ __launch_bounds__(kT) void rms_mod_kernel(
             for (int j = 0; j < 8; ++j) { v[k][j] = f[j]; ss += f[j] * f[j]; }
         }
     }
-    const float rs = 1.0f / sqrtf(block_sum(ss, sh) / (float)n + eps);
+    /* A LayerNorm centres first: the mean's block sum, then the centred squares'. */
+    float mu = 0.0f;
+    if (layer) {
+        float sm = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < kRmChunks; ++k) {
+            const int i = ((int)threadIdx.x + k * kT) * 8;
+            if (i < n) {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) sm += v[k][j];
+            }
+        }
+        mu = block_sum(sm, sh) / (float)n;
+        __syncthreads();
+        ss = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < kRmChunks; ++k) {
+            const int i = ((int)threadIdx.x + k * kT) * 8;
+            if (i < n) {
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) { v[k][j] -= mu; ss += v[k][j] * v[k][j]; }
+            }
+        }
+    }
+    /* `none`: no norm (libref's n2 = x); the flag is the same for the whole workgroup. */
+    const float rs = none ? 1.0f : 1.0f / sqrtf(block_sum(ss, sh) / (float)n + eps);
     const uint16_t* sr = s + (size_t)e * s_ld;
     #pragma unroll
     for (int k = 0; k < kRmChunks; ++k) {
@@ -118,10 +144,11 @@ __global__ __launch_bounds__(kT) void rms_mod_kernel(
         float shf[8], scf[8], wf[8], o[8];
         ld8(sr + i, shf);
         ld8(sr + n + i, scf);
-        ld8(w + i, wf);
+        if (w) ld8(w + i, wf);
         #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            const float n2 = bfr(bfr(v[k][j] * rs) * wf[j]);
+            const float n1 = once ? v[k][j] * rs : bfr(v[k][j] * rs);
+            const float n2 = w ? bfr(n1 * (wf[j] + wadd)) : bfr(v[k][j] * rs);
             o[j] = bfr(bfr(n2 * bfr(1.0f + scf[j])) + shf[j]);
         }
         if (z) st8(z + (size_t)r * z_ld + i, o);
@@ -431,10 +458,10 @@ static int rms_mod_launch(const RadArgs* a, RadStream st, bool quant) {
     const RadTensor* q = quant ? r4d_opt(a, 6) : nullptr;
     const RadTensor* qs = quant ? r4d_opt(a, 7) : nullptr;
     const RadTensor* z = r4d_opt(a, quant ? 8 : 6);
-    if (!sc || !w || !cu || !x || (quant ? (!q || !qs) : !z)) return R4D_NO(RAD_E_INVAL);
+    if (!sc || !cu || !x || (quant ? (!q || !qs) : !z)) return R4D_NO(RAD_E_INVAL);
     const bool gated = r4d_geti_or(a, "gated", 0) != 0;
     if (gated && (!y || !g)) return R4D_NO(RAD_E_INVAL);
-    if (!is_bf16(x) || !is_bf16(sc) || !is_bf16(w) || !is_i32(cu) ||
+    if (!is_bf16(x) || !is_bf16(sc) || (w && !is_bf16(w)) || !is_i32(cu) ||
         (gated && (!is_bf16(y) || !is_bf16(g))) || (z && !is_bf16(z)) ||
         (quant && (q->dtype != RAD_F8E4M3 || qs->dtype != RAD_F32)))
         return R4D_NO(RAD_E_DTYPE);
@@ -445,7 +472,7 @@ static int rms_mod_launch(const RadArgs* a, RadStream st, bool quant) {
     long long rx = 0, xl = 0, ry = 0, yl = 0, rg = 0, gl = 0, rs = 0, sl = 0, rz = 0, zl = 0;
     long long rq = 0, rqs = 0, ql = 0, qsl = 0;
     if (!rows8(x, n, &rx, &xl) || !rows8(sc, 2 * n, &rs, &sl) || !r4d_contig(cu) ||
-        !r4d_contig(w) || ((uintptr_t)w->data & 15) ||
+        (w && (!r4d_contig(w) || ((uintptr_t)w->data & 15))) ||
         (gated && (!rows8(y, n, &ry, &yl) || !rows8(g, n, &rg, &gl))) ||
         (z && !rows8(z, n, &rz, &zl)))
         return R4D_NO(RAD_E_STRIDE);
@@ -455,18 +482,26 @@ static int rms_mod_launch(const RadArgs* a, RadStream st, bool quant) {
         if (ql < 0 || (ql & 7) || ((uintptr_t)q->data & 7) || qsl < 0) return R4D_NO(RAD_E_STRIDE);
     }
     const long long n_seq = r4d_numel(cu) - 1, rows = quant ? rq : rz;
-    if (rows <= 0 || n_seq <= 0 || rx < rows || rs < n_seq || r4d_numel(w) < n ||
+    if (rows <= 0 || n_seq <= 0 || rx < rows || rs < n_seq || (w && r4d_numel(w) < n) ||
         (quant && rqs < rows) || (gated && (ry < rows || rg < n_seq)) || (z && rz < rows))
         return R4D_NO(RAD_E_SHAPE);
     const float eps = (float)r4d_getf(a, "eps", 1e-6);
+    const float wadd = (float)r4d_getf(a, "wadd", 0.0);
+    const int once = (int)r4d_geti_or(a, "norm_once", 0);
+    const char* nk = r4d_gets(a, "norm");
+    const int layer = nk && !std::strcmp(nk, "layer");
+    const int none = nk && !std::strcmp(nk, "none");
+    if ((nk && !layer && !none && std::strcmp(nk, "rms")) || (none && w)) return R4D_NO(RAD_E_INVAL);
 #define R4D_RMQ(G, Q)                                                                             \
     hipLaunchKernelGGL((rms_mod_kernel<G, Q>), dim3((unsigned)rows), dim3(kT), 0,                 \
                        (hipStream_t)st, G ? (const uint16_t*)y->data : nullptr,                   \
                        G ? (const uint16_t*)g->data : nullptr, (const uint16_t*)sc->data,         \
-                       (const uint16_t*)w->data, (const int*)cu->data, (uint16_t*)x->data,        \
+                       w ? (const uint16_t*)w->data : nullptr, (const int*)cu->data,              \
+                       (uint16_t*)x->data,                                                        \
                        Q ? (uint8_t*)q->data : nullptr, Q ? (float*)qs->data : nullptr,           \
                        z ? (uint16_t*)z->data : nullptr, (int)n, (int)n_seq, eps, (int)yl,        \
-                       (int)gl, (int)sl, (int)xl, (int)ql, (int)qsl, (int)zl)
+                       (int)gl, (int)sl, (int)xl, (int)ql, (int)qsl, (int)zl, wadd, once, layer, \
+                       none)
     if (quant) {
         if (gated) R4D_RMQ(true, true);
         else       R4D_RMQ(false, true);

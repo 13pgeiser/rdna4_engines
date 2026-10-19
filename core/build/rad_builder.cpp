@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -940,7 +941,8 @@ int Builder::decl_name_map(const RadNameMap* m) {
         return RAD_E_INVAL;
     }
     if (m->mode != RAD_MAP_COPY && m->mode != RAD_MAP_CONCAT && m->mode != RAD_MAP_WNORM &&
-        m->mode != RAD_MAP_ROWS && m->mode != RAD_MAP_TRANSPOSE && m->mode != RAD_MAP_EMA) {
+        m->mode != RAD_MAP_ROWS && m->mode != RAD_MAP_TRANSPOSE && m->mode != RAD_MAP_EMA &&
+        m->mode != RAD_MAP_TAP) {
         err(RAD_E_INVAL, "name map for '%s': unknown mode %d", m->declared, m->mode);
         return RAD_E_INVAL;
     }
@@ -951,9 +953,9 @@ int Builder::decl_name_map(const RadNameMap* m) {
                                    : "the magnitude and the direction", m->n_src);
         return RAD_E_INVAL;
     }
-    if (m->mode == RAD_MAP_TRANSPOSE && m->n_src != 1) {
-        err(RAD_E_INVAL, "name map for '%s': a transpose map names one source, not %d",
-            m->declared, m->n_src);
+    if ((m->mode == RAD_MAP_TRANSPOSE || m->mode == RAD_MAP_TAP) && m->n_src != 1) {
+        err(RAD_E_INVAL, "name map for '%s': a %s map names one source, not %d", m->declared,
+            m->mode == RAD_MAP_TAP ? "tap" : "transpose", m->n_src);
         return RAD_E_INVAL;
     }
 
@@ -1192,16 +1194,27 @@ int Builder::declare_generator(const RadGeneratorDecl* d) {
                 : prog_.is_audio_generator() ? "an audio generator" : "a video generator");
         return RAD_E_STATE;
     }
-    if (d->layout != RAD_GEN_LAYOUT_JOINT_GRID) {
+    if (d->layout != RAD_GEN_LAYOUT_JOINT_GRID && d->layout != RAD_GEN_LAYOUT_JOINT_STEP) {
         err(RAD_E_INVAL, "declare_generator '%s': layout %d is not one this engine builds", nm,
             (int)d->layout);
         return RAD_E_INVAL;
     }
+    const bool joint = d->layout == RAD_GEN_LAYOUT_JOINT_STEP;
     auto has = [](const char* t, const char* what) { return t && std::strstr(t, what); };
-    if (!has(d->tmpl_text, "{prompt}") || !has(d->tmpl_edit, "{prompt}") ||
-        !has(d->tmpl_edit, "{images}") || !has(d->tmpl_image, "{image}")) {
-        err(RAD_E_INVAL, "declare_generator '%s': tmpl_text needs {prompt}, tmpl_edit {images} and "
-                         "{prompt}, and tmpl_image {image}, where the picture's tokens go", nm);
+    if (joint ? !has(d->tmpl_text, "{prompt}") || !has(d->tmpl_edit, "{prompt}")
+              : !has(d->tmpl_text, "{prompt}") || !has(d->tmpl_edit, "{prompt}") ||
+                    !has(d->tmpl_edit, "{images}") || !has(d->tmpl_image, "{image}")) {
+        err(RAD_E_INVAL, "declare_generator '%s': tmpl_text and tmpl_edit need {prompt}, and "
+                         "with the pictures in the prompt tmpl_edit needs {images} and tmpl_image "
+                         "{image}, where the picture's tokens go", nm);
+        return RAD_E_INVAL;
+    }
+    if (joint && (d->cond_rows <= 0 || !(d->rope_hw_scale > 0) || d->pad_multiple < 0 ||
+                  (d->pad_multiple > 0 && d->pad_token < 0))) {
+        err(RAD_E_INVAL, "declare_generator '%s': the joint layout needs cond_rows, a positive "
+                         "rope_hw_scale and, with padding, a pad token (cond_rows %lld, scale %g, "
+                         "pad %d to a multiple of %d)", nm, (long long)d->cond_rows,
+            d->rope_hw_scale, (int)d->pad_token, (int)d->pad_multiple);
         return RAD_E_INVAL;
     }
     if (d->latent_channels <= 0 || d->latent_scale <= 0 || d->size_multiple <= 0 ||
@@ -1220,7 +1233,8 @@ int Builder::declare_generator(const RadGeneratorDecl* d) {
         return RAD_E_INVAL;
     }
     if (d->n_sigmas < 0 || (d->n_sigmas > 0 && !d->sigmas) ||
-        (d->n_sigmas == 0 && d->default_steps <= 0) || !(d->default_cfg >= 1.0) ||
+        (d->n_sigmas == 0 && d->default_steps <= 0) ||
+        !(d->default_cfg >= (d->cfg_original ? 0.0 : 1.0)) ||
         (d->dyn_shift && (d->max_seq <= d->base_seq || d->base_seq <= 0)) ||
         (!d->dyn_shift && !(d->shift > 0)) || d->shift_terminal < 0 || d->shift_terminal >= 1) {
         err(RAD_E_INVAL, "declare_generator '%s': the sampler is incomplete (%d fixed sigmas, %lld "
@@ -1255,17 +1269,19 @@ int Builder::declare_generator(const RadGeneratorDecl* d) {
     g.name             = nm;
     g.tmpl_text        = d->tmpl_text;
     g.tmpl_edit        = d->tmpl_edit;
-    g.tmpl_image       = d->tmpl_image;
+    g.tmpl_image       = d->tmpl_image ? d->tmpl_image : "";
     g.tmpl_image_sep   = d->tmpl_image_sep ? d->tmpl_image_sep : "";
     g.drop_prefix      = d->drop_prefix ? d->drop_prefix : "";
     g.tmpl_transparent = d->tmpl_transparent ? d->tmpl_transparent : "";
+    g.has_default_negative = d->default_negative != nullptr;
+    g.default_negative = d->default_negative ? d->default_negative : "";
     g.sigmas.assign(d->sigmas, d->sigmas + d->n_sigmas);
     prog_.generator = *d;
     /* The Program is moved after declare, which would invalidate pointers into gen_str, so the
      * decl's string fields are cleared; read them only through gen_str. */
     RadGeneratorDecl& c = prog_.generator;
     c.name = c.tmpl_text = c.tmpl_edit = c.tmpl_image = c.tmpl_image_sep = nullptr;
-    c.drop_prefix = c.tmpl_transparent = nullptr;
+    c.drop_prefix = c.tmpl_transparent = c.default_negative = nullptr;
     c.sigmas = nullptr;
     return RAD_OK;
 }
@@ -1461,22 +1477,78 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
             (long long)d->audio_latent_channels);
         return RAD_E_INVAL;
     }
-    if (d->default_steps <= 0 || d->max_steps < d->default_steps || !(d->shift_video > 0.0) ||
-        !(d->shift_audio > 0.0) || d->max_lanes <= 0) {
+    /* Form 1 (LTX-2's FlowMatchEulerDiscrete) steps both modalities the same sigmas and reads
+     * no per-modality shift. */
+    const bool shifts = d->sched_kind == 1 || (d->shift_video > 0.0 && d->shift_audio > 0.0);
+    if (d->default_steps <= 0 || d->max_steps < d->default_steps || !shifts || d->max_lanes <= 0) {
         err(RAD_E_INVAL, "declare_video_generator '%s': the sampler is incomplete (%lld steps by "
                          "default, %lld at most, shifts %g and %g, %lld lanes)", nm,
             (long long)d->default_steps, (long long)d->max_steps, d->shift_video, d->shift_audio,
             (long long)d->max_lanes);
         return RAD_E_INVAL;
     }
-    if (d->n_rungs < 0 || (d->n_rungs > 0 && !d->rungs) ||
-        (d->n_rungs > 0 && (d->default_steps != d->n_rungs + 1 || d->max_steps != d->n_rungs + 1))) {
-        err(RAD_E_INVAL, "declare_video_generator '%s': a trained schedule of %d rungs runs %d grid "
-                         "points, which default_steps and max_steps must both be (%lld, %lld)", nm,
-            (int)d->n_rungs, (int)d->n_rungs + 1, (long long)d->default_steps,
+    /* Form 0 counts grid points, form 1 evaluations. */
+    const int64_t rung_steps = d->sched_kind == 1 ? d->n_rungs : d->n_rungs + 1;
+    if (d->sched_kind < 0 || d->sched_kind > 1 || d->n_rungs < 0 || (d->n_rungs > 0 && !d->rungs) ||
+        (d->n_rungs > 0 && (d->default_steps != rung_steps || d->max_steps != rung_steps))) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': a trained schedule of %d rungs runs %lld "
+                         "steps, which default_steps and max_steps must both be (%lld, %lld)", nm,
+            (int)d->n_rungs, (long long)rung_steps, (long long)d->default_steps,
             (long long)d->max_steps);
         return RAD_E_INVAL;
     }
+    if (d->sched_kind == 1 && d->dyn_shift &&
+        (!(d->max_seq > d->base_seq) || !std::isfinite(d->base_shift) ||
+         !std::isfinite(d->max_shift))) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': the dynamic shift runs from %lld tokens "
+                         "(%g) to %lld (%g); the second length must be the larger", nm,
+            (long long)d->base_seq, d->base_shift, (long long)d->max_seq, d->max_shift);
+        return RAD_E_INVAL;
+    }
+    if (!(d->shift_terminal >= 0.0 && d->shift_terminal < 1.0)) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': shift_terminal %g is outside [0, 1)", nm,
+            d->shift_terminal);
+        return RAD_E_INVAL;
+    }
+    if (d->n_refine_rungs < 0 || (d->n_refine_rungs > 0 && (!d->refine_rungs ||
+        d->sched_kind != 1 || d->n_rungs == 0 || !(d->upscale_max > 1.0)))) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': refinement rungs need a trained schedule of "
+                         "form 1 and a latent upscaler", nm);
+        return RAD_E_INVAL;
+    }
+    for (int i = 0; i < d->n_refine_rungs; ++i)
+        if (!(d->refine_rungs[i] > 0.0 && d->refine_rungs[i] <= 1.0) ||
+            (i > 0 && !(d->refine_rungs[i] < d->refine_rungs[i - 1]))) {
+            err(RAD_E_INVAL, "declare_video_generator '%s': refinement rung %d (%g) is outside "
+                             "(0, 1] or not below the one before it", nm, i, d->refine_rungs[i]);
+            return RAD_E_INVAL;
+        }
+    if (d->step_text_rows < 0 || d->step_text_rows > d->max_text * 64 || d->image_crf < 0 ||
+        d->image_crf > 51 || (d->image_cond != 0 && d->image_cond != 1) ||
+        (d->guidance != 0 && d->guidance != 1)) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': step_text_rows %lld, image_cond %d, "
+                         "image_crf %d (0..51) or guidance %d is out of range", nm,
+            (long long)d->step_text_rows, (int)d->image_cond, (int)d->image_crf, (int)d->guidance);
+        return RAD_E_INVAL;
+    }
+    if (d->text_left_pad < 0 || (d->text_left_pad > 0 && d->text_left_pad < d->max_text) ||
+        d->audio_streams < 0 ||
+        (d->upscale_exact && (!(d->upscale_max > 1.0) ||
+                              d->upscale_max != std::floor(d->upscale_max)))) {
+        err(RAD_E_INVAL, "declare_video_generator '%s': text_left_pad %lld must hold the longest "
+                         "prompt (%lld), audio_streams %d may not be negative, and an exact "
+                         "upscaler's factor (%g) is a whole number above 1", nm,
+            (long long)d->text_left_pad, (long long)d->max_text, (int)d->audio_streams,
+            d->upscale_max);
+        return RAD_E_INVAL;
+    }
+    if (d->guidance)
+        for (int i = 0; i < 8; ++i)
+            if (!std::isfinite(d->guidance_default[i]) || d->guidance_default[i] < 0.0) {
+                err(RAD_E_INVAL, "declare_video_generator '%s': default guidance term %d (%g) must "
+                                 "be finite and not negative", nm, i, d->guidance_default[i]);
+                return RAD_E_INVAL;
+            }
     for (int i = 0; i < d->n_rungs; ++i)
         if (!(d->rungs[i] > 0.0 && d->rungs[i] <= 1.0) ||
             (i > 0 && !(d->rungs[i] < d->rungs[i - 1]))) {
@@ -1486,9 +1558,13 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
         }
     /* An upscaler needs a schedule it can split: one evaluation at the small size at least, and
      * `upscale_refine` of them after it by default. */
-    const int64_t def_evals = d->n_rungs > 0 ? d->n_rungs : d->default_steps - 1;
+    const int64_t def_evals = d->n_rungs > 0 ? d->n_rungs
+                            : d->sched_kind == 1 ? d->default_steps : d->default_steps - 1;
+    const bool own_refine = d->n_refine_rungs > 0;
     if (d->upscale_max != 0.0 &&
-        (!(d->upscale_max > 1.0) || d->upscale_refine < 1 || d->upscale_refine >= def_evals)) {
+        (!(d->upscale_max > 1.0) ||
+         (!own_refine && (d->upscale_refine < 1 || d->upscale_refine >= def_evals)) ||
+         (own_refine && d->upscale_refine != d->n_refine_rungs))) {
         err(RAD_E_INVAL, "declare_video_generator '%s': a latent upscaler of factor %g at most, "
                          "refining %d evaluations of %lld by default; the factor must be above 1 "
                          "and the refinement 1 to %lld", nm, d->upscale_max, (int)d->upscale_refine,
@@ -1521,15 +1597,52 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
     if (!buf_ok(d->frames_out, RAD_U8, chunk_px, "frames_out") ||
         !buf_ok(d->audio_out, RAD_F32, max_samples * d->audio_channels, "audio_out"))
         return RAD_E_INVAL;
+    if (d->duration_out != RAD_NULL_HANDLE) {
+        if (!buf_ok(d->duration_out, RAD_F32, 1, "duration_out")) return RAD_E_INVAL;
+        if (!(d->duration_min > 0.0 && d->duration_max > d->duration_min) ||
+            !std::isfinite(d->duration_max) ||
+            (d->duration_dtype != RAD_F32 && d->duration_dtype != RAD_BF16)) {
+            err(RAD_E_INVAL, "declare_video_generator '%s': a length head clamps to "
+                             "[%g, %g] seconds in dtype %u; the bounds must be positive, finite "
+                             "and in order, the dtype f32 or bf16", nm, d->duration_min,
+                d->duration_max, (unsigned)d->duration_dtype);
+            return RAD_E_INVAL;
+        }
+    }
     prog_.vgen_str.name = nm;
     prog_.vgen_str.tmpl = d->tmpl;
     prog_.vgen_str.rungs.assign(d->rungs, d->rungs + d->n_rungs);
+    prog_.vgen_str.refine_rungs.assign(d->refine_rungs, d->refine_rungs + d->n_refine_rungs);
+    prog_.vgen_str.default_negative = d->default_negative ? d->default_negative : "";
+    prog_.vgen_str.decoders.clear();
+    prog_.vgen_str.decoder_max_area.clear();
+    for (const char* s = d->decoders; s && *s;) {
+        while (*s == ' ') ++s;
+        const char* e = s;
+        while (*e && *e != ' ') ++e;
+        if (e > s) prog_.vgen_str.decoders.emplace_back(s, e);
+        s = e;
+    }
+    for (size_t i = 0; i < prog_.vgen_str.decoders.size(); ++i) {
+        const int64_t a = d->decoder_max_area ? d->decoder_max_area[i] : 0;
+        if (a < 0 || a > d->max_area) {
+            err(RAD_E_INVAL, "declare_video_generator '%s': decoder '%s' makes frames of %lld pixels "
+                             "at most, outside 0..max_area", nm,
+                prog_.vgen_str.decoders[i].c_str(), (long long)a);
+            return RAD_E_INVAL;
+        }
+        prog_.vgen_str.decoder_max_area.push_back(a > 0 ? a : d->max_area);
+    }
     prog_.video_gen = *d;
     /* As for the other generators: the Program is moved after declare; strings and the rungs live
      * in vgen_str. */
     prog_.video_gen.name = nullptr;
     prog_.video_gen.tmpl = nullptr;
     prog_.video_gen.rungs = nullptr;
+    prog_.video_gen.refine_rungs = nullptr;
+    prog_.video_gen.default_negative = nullptr;
+    prog_.video_gen.decoders = nullptr;
+    prog_.video_gen.decoder_max_area = nullptr;
     return RAD_OK;
 }
 

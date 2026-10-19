@@ -73,7 +73,7 @@ static const Flag g_flags[] = {
     { "--gpu-headroom-mib",   "N",      "VRAM left unclaimed on every card (default 96)" },
     { "--kv-cache-dtype",     "T",      "bf16 | fp8 | fp8_v4 | k6_v4 -- fp8 halves what a token of\n"
                                         "context costs; fp8_v4 keeps V in 4 bits (0.78 of fp8), k6_v4\n"
-                                        "also K in 6 (0.69); both Qwen3.8-27B" },
+                                        "also K in 6 (0.69); both Qwen3.8-27B and -Flash-Next" },
     { "--host-pool-mib",      "N",      "pinned host tier" },
     { "--host-headroom-mib",  "N",      "host RAM to leave free for the system when radiance\n"
     "                                    pins its host memory at startup (default 4096)" },

@@ -5,9 +5,6 @@
 #include "r4d_moe_sort.h"
 #include <climits>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 
 namespace {
 __global__ void gemm_nt_f32_kernel(const uint16_t* x, const float* w, float* y, long xp, long wp,
@@ -71,31 +68,6 @@ __global__ void __launch_bounds__(128)
                 if (c0 + c < n) y[(long)(r0 + q) * yp + c0 + c] = sum[q][c];
 }
 
-// The tile forms, by rows x columns per wave. RADIANCE_F32_GEMM_TILE names one ("8x4") or
-// "legacy"; unset or unknown picks by M. All forms are byte-identical, so the choice is speed only.
-struct F32Tile {
-    int r, c;
-};
-constexpr F32Tile kF32Tiles[] = { { 1, 1 }, { 2, 1 }, { 4, 1 }, { 8, 1 },  { 4, 2 },
-                                  { 8, 2 }, { 4, 4 }, { 8, 4 }, { 16, 2 }, { 16, 4 } };
-F32Tile f32_tile(long rows, long n) {
-    if (const char* e = std::getenv("RADIANCE_F32_GEMM_TILE")) {
-        if (!std::strcmp(e, "legacy")) return { 0, 0 };
-        int r = 0, c = 0;
-        if (std::sscanf(e, "%dx%d", &r, &c) == 2)
-            for (const F32Tile& t : kF32Tiles)
-                if (t.r == r && t.c == c) return t;
-    }
-    // Measured on gfx1201 (r4d_selftest --perff32, cold) at N 4/32/36/288, K 4096. 16x4 gains
-    // 3-5 % at N 288/32 above 64 rows but loses 16 % at N 36; 8x4 holds at every width. A
-    // projection of a few columns has too few waves for wide tiles at any M.
-    if (n <= 8) return { 4, 1 };
-    if (rows <= 1) return { 0, 0 };
-    if (rows <= 2) return { 2, 1 };
-    if (rows < 16) return { 4, 1 };
-    if (rows < 64) return { 4, 4 };
-    return { 8, 4 };
-}
 template <int R, int C>
 int gemm_f32_tile(RadStream stream, const RadTensor& x, const RadTensor& w, const RadTensor& y,
                   long n, long k) {
@@ -117,52 +89,28 @@ int gemm_f32_body(const RadArgs* a, RadStream stream) {
         w.stride[1] != 1 || y.stride[1] != 1 || x.stride[0] < k || w.stride[0] < k ||
         y.stride[0] < n)
         return RAD_E_SHAPE;
-    const F32Tile t = f32_tile(x.shape[0], n);
-#define R4D_F32_TILE(R, C)                                                                         \
-    if (t.r == R && t.c == C) return gemm_f32_tile<R, C>(stream, x, w, y, n, k);
-    R4D_F32_TILE(1, 1)
-    R4D_F32_TILE(2, 1) R4D_F32_TILE(4, 1) R4D_F32_TILE(8, 1) R4D_F32_TILE(4, 2) R4D_F32_TILE(8, 2)
-        R4D_F32_TILE(4, 4) R4D_F32_TILE(8, 4) R4D_F32_TILE(16, 2) R4D_F32_TILE(16, 4)
-#undef R4D_F32_TILE
-            return R4D_EMIT(stream, gemm_nt_f32_kernel, dim3((n + 3) / 4, x.shape[0]), dim3(128), 0,
-                            (const uint16_t*)x.data, (const float*)w.data, (float*)y.data,
-                            x.stride[0], w.stride[0], y.stride[0], (int)n, (int)k);
+    /* The tile form, rows x columns per wave, by M; all forms are byte-identical, so the choice is
+     * speed only. Measured on gfx1201 (r4d_selftest --perff32, cold) at N 4/32/36/288, K 4096.
+     * 16x4 gains 3-5 % at N 288/32 above 64 rows but loses 16 % at N 36; 8x4 holds at every
+     * width. A projection of a few columns has too few waves for wide tiles at any M. */
+    const long rows = x.shape[0];
+    if (n <= 8) return gemm_f32_tile<4, 1>(stream, x, w, y, n, k);
+    if (rows <= 1)
+        return R4D_EMIT(stream, gemm_nt_f32_kernel, dim3((n + 3) / 4, x.shape[0]), dim3(128), 0,
+                        (const uint16_t*)x.data, (const float*)w.data, (float*)y.data,
+                        x.stride[0], w.stride[0], y.stride[0], (int)n, (int)k);
+    if (rows <= 2) return gemm_f32_tile<2, 1>(stream, x, w, y, n, k);
+    if (rows < 16) return gemm_f32_tile<4, 1>(stream, x, w, y, n, k);
+    if (rows < 64) return gemm_f32_tile<4, 4>(stream, x, w, y, n, k);
+    return gemm_f32_tile<8, 4>(stream, x, w, y, n, k);
 }
-__global__ void router_sigmoid_kernel(const float* logits, const float* bias, int* ids,
-                                      float* weights, long lp, long bp, long ip, long wp, int ne,
-                                      int k, int norm, float factor) {
-    __shared__ float probabilities[512], ranking[512];
-    const int r = blockIdx.x;
-    for (int e = threadIdx.x; e < ne; e += 256) {
-        const float p = 1.0f / (1.0f + expf(-logits[(long)r * lp + e]));
-        probabilities[e] = p;
-        ranking[e] = p + bias[(long)e * bp];
-    }
-    __syncthreads();
-    if (threadIdx.x) return;
-    int index[32];
-    float chosen[32], total = 0;
-    for (int j = 0; j < k; ++j) {
-        int best = 0;
-        for (int e = 1; e < ne; ++e)
-            if (ranking[e] > ranking[best]) best = e;
-        index[j] = best;
-        chosen[j] = probabilities[best];
-        total += chosen[j];
-        ranking[best] = -INFINITY;
-    }
-    const float mult = norm ? factor / (total + 1e-20f) : factor;
-    for (int j = 0; j < k; ++j) {
-        ids[(long)r * ip + j] = index[j];
-        weights[(long)r * wp + j] = chosen[j] * mult;
-    }
-}
-// The scan above in one wave per row. Lane l holds experts l, l+32, ... as 64-bit keys: the
-// rank's order-preserving bits (-0 folded to +0) over ~e, so equal ranks order as the scan's strict
-// `>` does, to the lower expert. Round j takes the largest key below round j-1's winner and parks
-// it on lane j (top_k <= 32). Probabilities, `total` in round order, `mult` and the weights are
-// the scan's expressions, so a finite row gives the same bytes. A NaN rank is never selected here,
-// while the scan takes expert 0 first when its rank is NaN.
+// router_sigmoid_topk in one wave per row: p = sigmoid(logit), the top_k largest ranks p + bias
+// in descending order, equal ranks to the lower expert, as a serial scan with a strict `>` takes
+// them. Lane l holds experts l, l+32, ... as 64-bit keys: the rank's order-preserving bits (-0
+// folded to +0) over ~e, so equal ranks order to the lower expert. Round j takes the largest key
+// below round j-1's winner and parks it on lane j (top_k <= 32). `total` sums the selected p in
+// round order, mult = norm ? factor / (total + 1e-20) : factor, and a weight is p * mult. A NaN
+// rank is never selected.
 // OWN is a template bound because the keys are registers; a lane-derived trip count would index
 // them divergently, which gfx12 lowers to a v_movrels loop.
 __device__ __forceinline__ unsigned long long router_rank_key(float rank, int e) {
@@ -283,12 +231,6 @@ int router_body(const RadArgs* a, RadStream stream) {
         bias.stride[0] < 1)
         return RAD_E_SHAPE;
     const int norm = (int)(r4d_geti_or(a, "norm", 0) != 0);
-    const char* select = std::getenv("RADIANCE_ROUTER_SELECT");
-    if (select && !std::strcmp(select, "old"))
-        return R4D_EMIT(stream, router_sigmoid_kernel, dim3(lg.shape[0]), dim3(256), 0,
-                        (const float*)lg.data, (const float*)bias.data, (int*)ids.data,
-                        (float*)w.data, lg.stride[0], bias.stride[0], ids.stride[0], w.stride[0],
-                        (int)ne, (int)k, norm, factor);
     const dim3 grid((unsigned)((lg.shape[0] + 3) / 4));
     if (ne <= 9 * 32)
         return R4D_EMIT(stream, router_sigmoid_wave_kernel<9>, grid, dim3(128), 0,

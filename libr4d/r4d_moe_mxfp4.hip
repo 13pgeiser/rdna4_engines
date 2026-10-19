@@ -10,14 +10,14 @@
 #include "r4d_mxfp4.h"
 #include <climits>
 #include <algorithm>
-#include <cstdlib>
+#include <cstring>
 
 namespace {
 struct MxMeta {
     long wstep[2], sstep[2];
     int wrow[2], srow[2], n[2], k[2];
     long ar, asr, yr;
-    int T, Arows, N, K, experts, topk, sorted_a, tile, parts, aligned_jobs;
+    int T, Arows, N, K, experts, topk, sorted_a, parts;
     int stage_out, out16;
 };
 __device__ const uint8_t* entry(const void* base, long step, int e) {
@@ -26,96 +26,43 @@ __device__ const uint8_t* entry(const void* base, long step, int e) {
 /* E2M1 values are exactly representable in E4M3. Stage those codes directly,
  * use FP8 WMMA, and fold each 32-wide E8M0 scale into the F32 accumulator.
  * No persistent expansion or checkpoint relayout is needed. */
-// Four independent bytes: magnitudes >=2 map to (m+12)*4; 0/1 map to 0/48.
-// Expand each magnitude-test bit into a byte mask without cross-byte carries.
-__device__ __forceinline__ uint32_t fp4x4(uint32_t n) {
-    const uint32_t mag = n & 0x07070707u, flag = (mag + 0x06060606u) & 0x08080808u;
-    const uint32_t mask = (flag << 5) - (flag >> 3);
-    return ((((mag + 0x0c0c0c0cu) << 2) & mask) | (((mag & 0x01010101u) * 0x30u) & ~mask) |
-            ((n & 0x08080808u) << 4));
-}
-/* Eight codes of a packed word to their E4M3 bytes in k order. The table form (r4d_mxfp4.h, v_perm
- * on the magnitude) gives the same bytes in about a third of the instructions; the arithmetic form
- * stays reachable (RADIANCE_MXFP4_LUT=0) as the bytewise reference. */
-template <bool Lut>
+/* Eight codes of a packed word to their E4M3 bytes in k order, by table (r4d_mxfp4.h, v_perm on
+ * the magnitude): the bytes of the bytewise arithmetic decode in about a third of the
+ * instructions. */
 __device__ __forceinline__ uint2 mx_codes8(uint32_t packed) {
-    if constexpr (Lut) {
-        uint32_t lo, hi;
-        r4d_mxfp4_unpack8_exact(packed, &lo, &hi);
-        return uint2{ lo, hi };
-    } else {
-        const uint32_t low = fp4x4(packed & 0x0f0f0f0fu), high = fp4x4((packed >> 4) & 0x0f0f0f0fu);
-        return uint2{ __byte_perm(low, high, 0x5140), __byte_perm(low, high, 0x7362) };
-    }
+    uint32_t lo, hi;
+    r4d_mxfp4_unpack8_exact(packed, &lo, &hi);
+    return uint2{ lo, hi };
 }
-template <int ColTiles, int RowTiles, bool CachedRows, bool Lut>
+/* The row-group form: a one-wave block per (16 columns, 16 sorted rows), the rows split at each
+ * expert boundary. */
 __global__ void moe_mxfp4_fp8_kernel(const uint8_t* a, const float* as, const void* w0,
                                      const void* s0, const void* w1, const void* s1,
                                      const int* sorted, const int* offset, uint16_t* y, MxMeta m) {
-    __shared__ __align__(16) uint8_t aa[16 * RowTiles * 136], bb[16 * ColTiles * 136];
-    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5,
-              col0 = blockIdx.x * (16 * ColTiles);
-    constexpr int JobRows = 16 * RowTiles, Threads = 32 * ColTiles * RowTiles;
-    const int wave_col = ColTiles == 1 ? 0 : wave % ColTiles,
-              wave_row = RowTiles == 1 ? 0 : wave / ColTiles;
-    int first = blockIdx.y * m.tile;
-    int group_end = min((int)(blockIdx.y + 1) * m.tile, m.T), job_expert = 0;
-    if (m.aligned_jobs) {
-        // Expert e begins at job floor(offset[e]/JobRows)+e. The extra job per expert
-        // bounds padding without a prefix-sum pass; every live job owns one row tile
-        // of one expert, so hot experts still spread across independent CTAs.
-        const int job = blockIdx.y, tail = offset[m.experts] / JobRows + m.experts;
-        if (job >= tail) {
-            const int r0 = offset[m.experts] + (job - tail) * JobRows;
-            for (int r = r0; r < min(r0 + JobRows, m.T); ++r)
-                if (tid < 16 * ColTiles && col0 + tid < m.N) y[(long)r * m.yr + col0 + tid] = 0;
-            return;
+    __shared__ __align__(16) uint8_t aa[16 * 136], bb[16 * 136];
+    const int tid = threadIdx.x, lane = tid & 31, col0 = blockIdx.x * 16;
+    const int first = blockIdx.y * 16, group_end = min((int)(blockIdx.y + 1) * 16, m.T);
+    for (int start = first; start < group_end;) {
+        if (sorted[start] < 0 || offset[m.experts] <= start) {
+            if (tid < 16 && col0 + tid < m.N) y[(long)start * m.yr + col0 + tid] = 0;
+            ++start;
+            continue;
         }
         int lo = 0, hi = m.experts;
         while (lo + 1 < hi) {
             const int mid = (lo + hi) / 2;
-            if (offset[mid] / JobRows + mid <= job)
+            if (offset[mid] <= start)
                 lo = mid;
             else
                 hi = mid;
         }
-        job_expert = lo;
-        first = offset[lo] + (job - (offset[lo] / JobRows + lo)) * JobRows;
-        group_end = min(first + JobRows, offset[lo + 1]);
-    }
-    for (int start = first; start < group_end;) {
-        if (sorted[start] < 0 || offset[m.experts] <= start) {
-            if (tid < 16 * ColTiles && col0 + tid < m.N) y[(long)start * m.yr + col0 + tid] = 0;
-            ++start;
-            continue;
-        }
-        int lo = m.aligned_jobs ? job_expert : 0, hi = m.experts;
-        if (!m.aligned_jobs)
-            while (lo + 1 < hi) {
-                const int mid = (lo + hi) / 2;
-                if (offset[mid] <= start)
-                    lo = mid;
-                else
-                    hi = mid;
-            }
         const int cls = lo & 1, end = min(group_end, offset[lo + 1]);
         if (end <= start) return;
         const auto* w = entry(cls ? w1 : w0, m.wstep[cls], lo / 2);
         const auto* ws = entry(cls ? s1 : s0, m.sstep[cls], lo / 2);
         auto total = r4d_fp8::acc_zero();
-        // Routing is invariant across K; each activation scale covers all four groups.
-        int sources[8];
-        if constexpr (CachedRows) {
-#pragma unroll
-            for (int row = 0; row < 8; ++row) {
-                const int r = start + wave_row * 16 + (lane >> 4) * 8 + row;
-                const int flat = r < end ? sorted[r] : -1;
-                const int ar = flat < 0 ? -1 : m.sorted_a ? r : flat / m.topk;
-                sources[row] = ar >= 0 && ar < m.Arows ? ar : -1;
-            }
-        }
         for (int kb = 0; kb < m.k[cls]; kb += 128) {
-            for (int j = tid; j < 16 * RowTiles * 16; j += Threads) {
+            for (int j = tid; j < 16 * 16; j += 32) {
                 const int r = j / 16, d = (j % 16) * 8;
                 const int ar = start + r < end && sorted[start + r] >= 0
                                    ? (m.sorted_a ? start + r : sorted[start + r] / m.topk)
@@ -124,56 +71,40 @@ __global__ void moe_mxfp4_fp8_kernel(const uint8_t* a, const float* as, const vo
                 if (ar >= 0 && ar < m.Arows) __builtin_memcpy(&av, a + (long)ar * m.ar + kb + d, 8);
                 *reinterpret_cast<uint2*>(aa + r * 136 + d) = av;
             }
-            for (int j = tid; j < 16 * ColTiles * 16; j += Threads) {
+            for (int j = tid; j < 16 * 16; j += 32) {
                 const int r = j / 16, d = (j % 16) * 8;
                 const int n = col0 + r, part = n / (m.N / m.parts), within = n % (m.N / m.parts);
                 const int wn = part * (m.n[cls] / m.parts) + within;
                 uint32_t packed = 0;
                 if (n < m.N && within < m.n[cls] / m.parts)
                     __builtin_memcpy(&packed, w + (long)wn * m.wrow[cls] + (kb + d) / 2, 4);
-                *reinterpret_cast<uint2*>(bb + r * 136 + d) = mx_codes8<Lut>(packed);
+                *reinterpret_cast<uint2*>(bb + r * 136 + d) = mx_codes8(packed);
             }
             __syncthreads();
-            if (start + wave_row * 16 < end) {
-                const int n = col0 + wave_col * 16 + (lane & 15), part = n / (m.N / m.parts),
-                          within = n % (m.N / m.parts);
-                const int wn = part * (m.n[cls] / m.parts) + within;
-                const bool valid = n < m.N && within < m.n[cls] / m.parts;
-                float activation[8];
-                if constexpr (CachedRows) {
+            const int n = col0 + (lane & 15), part = n / (m.N / m.parts),
+                      within = n % (m.N / m.parts);
+            const int wn = part * (m.n[cls] / m.parts) + within;
+            const bool valid = n < m.N && within < m.n[cls] / m.parts;
 #pragma unroll
-                    for (int row = 0; row < 8; ++row)
-                        activation[row] =
-                            sources[row] >= 0 ? as[(long)sources[row] * m.asr + kb / 128] : 0;
-                }
+            for (int group = 0; group < 4; ++group) {
+                const int exp = valid ? ws[(long)wn * m.srow[cls] + kb / 32 + group] : 127;
+                auto raw = r4d_fp8::acc_zero();
 #pragma unroll
-                for (int group = 0; group < 4; ++group) {
-                    const int exp = valid ? ws[(long)wn * m.srow[cls] + kb / 32 + group] : 127;
-                    auto raw = r4d_fp8::acc_zero();
+                for (int k = group * 32; k < (group + 1) * 32; k += 16)
+                    raw = r4d_fp8::mma(r4d_fp8::frag<128>(aa, 0, k, lane),
+                                       r4d_fp8::frag<128>(bb, 0, k, lane), raw);
+                // E8M0 maps directly to the F32 exponent field; code zero is 2^-127,
+                // a representable subnormal, and code 255 is NaN.
+                const float scale = __uint_as_float(exp == 255 ? 0x7fc00000u
+                                                    : exp      ? ((uint32_t)exp << 23)
+                                                               : 0x00400000u);
 #pragma unroll
-                    for (int k = group * 32; k < (group + 1) * 32; k += 16)
-                        raw = r4d_fp8::mma(r4d_fp8::frag<128>(aa, wave_row * 16, k, lane),
-                                           r4d_fp8::frag<128>(bb, wave_col * 16, k, lane), raw);
-                    // E8M0 maps directly to the F32 exponent field; code zero is 2^-127,
-                    // a representable subnormal, and code 255 is NaN.
-                    const float scale = __uint_as_float(exp == 255 ? 0x7fc00000u
-                                                        : exp      ? ((uint32_t)exp << 23)
-                                                                   : 0x00400000u);
-#pragma unroll
-                    for (int row = 0; row < 8; ++row) {
-                        if constexpr (CachedRows) {
-                            if (sources[row] >= 0) total[row] += raw[row] * activation[row] * scale;
-                        } else {
-                            const int r = start + wave_row * 16 + (lane >> 4) * 8 + row;
-                            if (r < end) {
-                                const int ar = sorted[r] < 0 ? -1
-                                               : m.sorted_a  ? r
-                                                             : sorted[r] / m.topk;
-                                if (ar >= 0 && ar < m.Arows)
-                                    total[row] +=
-                                        raw[row] * as[(long)ar * m.asr + kb / 128] * scale;
-                            }
-                        }
+                for (int row = 0; row < 8; ++row) {
+                    const int r = start + (lane >> 4) * 8 + row;
+                    if (r < end) {
+                        const int ar = sorted[r] < 0 ? -1 : m.sorted_a ? r : sorted[r] / m.topk;
+                        if (ar >= 0 && ar < m.Arows)
+                            total[row] += raw[row] * as[(long)ar * m.asr + kb / 128] * scale;
                     }
                 }
             }
@@ -181,8 +112,7 @@ __global__ void moe_mxfp4_fp8_kernel(const uint8_t* a, const float* as, const vo
         }
 #pragma unroll
         for (int row = 0; row < 8; ++row) {
-            const int r = start + wave_row * 16 + (lane >> 4) * 8 + row,
-                      n = col0 + wave_col * 16 + (lane & 15);
+            const int r = start + (lane >> 4) * 8 + row, n = col0 + (lane & 15);
             if (r < end && n < m.N) y[(long)r * m.yr + n] = f32_to_bf16(total[row]);
         }
         start = end;
@@ -201,18 +131,20 @@ __device__ __forceinline__ r4d_u32x4 mx_ldg16(const uint8_t* p) {
 __device__ __forceinline__ uint32_t mx_ldg4(const uint8_t* p) {
     return *(const __attribute__((address_space(1))) mx_g4*)p;
 }
-/* The TP8 prefill form (M32N64, aligned jobs, cached rows) with its loads a stage ahead. A job's
- * row table resolves into LDS once; the next 128 of K (activation bytes, weight codes, an exponent
- * dword a column, the activation scales) is loaded into registers while the current stage computes
- * from LDS. The form above waits on three dependent latencies a stage: the routing entry, the
- * activation row it names, and the exponent bytes it reads after the barrier. A job begins at its
- * first row even when that slot is dropped; rows are independent, so the bytes are the same.
+/* The GLM prefill form: jobs of 32 rows of one expert by 64 columns, eight waves, with its loads a
+ * stage ahead. Expert e begins at job floor(offset[e]/32)+e: the extra job per expert bounds the
+ * padding without a prefix-sum pass, and every live job owns one row tile of one expert, so hot
+ * experts still spread across independent blocks. A job's row table resolves into LDS once; the
+ * next 128 of K (activation bytes, weight codes, an exponent dword a column, the activation
+ * scales) is loaded into registers while the current stage computes from LDS, where a form that
+ * loads after the barrier waits on three dependent latencies a stage: the routing entry, the
+ * activation row it names, and the exponent bytes. A job begins at its first row even when that
+ * slot is dropped; rows are independent, so the bytes are the same.
  * The exponents are decoded once, at staging; the fold carries no row predicate, the epilogue
  * writes a dropped row's zero instead.
  * One stage ahead only: a deeper prefetch measured slower on the expert-major forms. The barriers
  * order LDS only (lds_barrier), so the prefetch stays in flight across them and L0 keeps the
  * activation rows the next column block reads. */
-template <bool Lut>
 __global__ __launch_bounds__(256)
     R4D_WAVES(16) void moe_mxfp4_prefill_kernel(const uint8_t* a, const float* as, const void* w0,
                                                 const void* s0, const void* w1, const void* s1,
@@ -285,7 +217,7 @@ __global__ __launch_bounds__(256)
         *reinterpret_cast<r4d_u32x4*>(aa + arow * P + ad) = ra;
 #pragma unroll
         for (int t = 0; t < 4; ++t)
-            *reinterpret_cast<uint2*>(bb + wcol * P + 2 * wd + 8 * t) = mx_codes8<Lut>(rw[t]);
+            *reinterpret_cast<uint2*>(bb + wcol * P + 2 * wd + 8 * t) = mx_codes8(rw[t]);
         if (tid < BN) {
             // E8M0 maps directly to the F32 exponent field; code zero is 2^-127, a representable
             // subnormal, and code 255 is NaN.
@@ -351,13 +283,8 @@ __global__ __launch_bounds__(256)
  * fresh WMMA pair from zero, folded as (raw * activation scale) * E8M0 scale and added, two
  * roundings and an add (the unit is built -ffp-contract=off). The tiles of a wave are separate
  * accumulators, so no element sees another order. `stage_out` writes the output through LDS in
- * 16-byte rows instead of a lane's 2-byte column stores.
- *
- * DB (streamed A only): two LDS stages, one barrier a stage. The next stage is stored into the
- * other buffer after the current one computes, which every wave last read before the previous
- * barrier; the single-buffer order needs a second barrier before it may overwrite the stage it
- * computes from. Same bytes in LDS, same per-element sequence. */
-template <int BM, int BN, int StageK, int CT, bool Resident, bool DB = false>
+ * 16-byte rows instead of a lane's 2-byte column stores. */
+template <int BM, int BN, int StageK, int CT, bool Resident>
 struct MxP64 {
     static constexpr int Threads = 256, WR = BM / 16, WC = 8 / WR, TC = BN / (16 * WC),
                          KB = StageK / 128;
@@ -366,28 +293,27 @@ struct MxP64 {
     static constexpr int TPA = Threads / BM, ACh = StageK / 16 / TPA, RCh = KR / 16 / TPA;
     static constexpr int TPW = Threads / BN, WCh = StageK / 32 / TPW,
                          SAK = Resident ? KR / 128 : KB;
-    static constexpr int NB = DB ? 2 : 1, BB = NB * BN * PB > BM *PO ? NB * BN * PB : BM * PO;
-    static constexpr int Lds = NB * (BM * PA + 16 * KB * BN + 4 * SAK * BM) + BB + 4 * BM;
+    static constexpr int BB = BN * PB > BM * PO ? BN * PB : BM * PO;
+    static constexpr int Lds = BM * PA + 16 * KB * BN + 4 * SAK * BM + BB + 4 * BM;
     // The waves a SIMD the LDS admits (128 KiB a WGP, a block's eight waves over four SIMDs):
     // stating it keeps the compiler from trading the stage registers for waves it cannot get.
     static constexpr int Waves = 2 * (131072 / Lds > 8 ? 8 : 131072 / Lds);
 };
-template <int BM, int BN, int StageK, int CT, bool Resident, bool DB = false>
+template <int BM, int BN, int StageK, int CT, bool Resident>
 __global__ __launch_bounds__(256)
-    R4D_WAVES((MxP64<BM, BN, StageK, CT, Resident, DB>::Waves)) void moe_mxfp4_p64_kernel(
+    R4D_WAVES((MxP64<BM, BN, StageK, CT, Resident>::Waves)) void moe_mxfp4_p64_kernel(
         const uint8_t* a, const float* as, const void* w0, const void* s0, const void* w1,
         const void* s1, const int* sorted, const int* offset, uint16_t* y, MxMeta m) {
-    using G = MxP64<BM, BN, StageK, CT, Resident, DB>;
+    using G = MxP64<BM, BN, StageK, CT, Resident>;
     constexpr int Threads = G::Threads, WC = G::WC, TC = G::TC, KB = G::KB, AK = G::AK, PA = G::PA,
                   PB = G::PB;
     constexpr int PO = G::PO, TPA = G::TPA, TPW = G::TPW, SAK = G::SAK;
     static_assert(BM % 16 == 0 && 8 % G::WR == 0 && TC >= 1 && TC * 16 * WC == BN &&
                       (Resident || CT == 1) && G::ACh >= 1 && G::WCh >= 1 && BN * KB <= Threads &&
-                      BM * SAK <= Threads && !(DB && Resident) && G::Lds <= 65536,
+                      BM * SAK <= Threads && G::Lds <= 65536,
                   "stage chunks must divide evenly over the block, in 64 KiB of LDS");
-    constexpr int NB = G::NB;
-    __shared__ __align__(16) uint8_t aa[NB * BM * PA], bb[G::BB];
-    __shared__ __align__(16) float ss[NB * 4 * KB * BN], sa[NB * SAK * BM];
+    __shared__ __align__(16) uint8_t aa[BM * PA], bb[G::BB];
+    __shared__ __align__(16) float ss[4 * KB * BN], sa[SAK * BM];
     __shared__ int src[BM];
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, wave_row = wave / WC,
               wave_col = wave % WC;
@@ -479,20 +405,19 @@ __global__ __launch_bounds__(256)
         re = 0x7f7f7f7fu;
         if (evalid && k0 + ekb * 128 < kc) re = mx_ldg4(ep + (k0 + ekb * 128) / 32);
     };
-    auto store = [&](int b) {
+    auto store = [&]() {
         if constexpr (!Resident) {
 #pragma unroll
             for (int i = 0; i < G::ACh; ++i)
-                *reinterpret_cast<r4d_u32x4*>(aa + b * BM * PA + arow * PA + (a0 + i * TPA) * 16) =
-                    ra[i];
-            if (tid < BM * KB) sa[b * SAK * BM + tid] = rsa;
+                *reinterpret_cast<r4d_u32x4*>(aa + arow * PA + (a0 + i * TPA) * 16) = ra[i];
+            if (tid < BM * KB) sa[tid] = rsa;
         }
 #pragma unroll
         for (int i = 0; i < G::WCh; ++i) {
 #pragma unroll
             for (int t = 0; t < 4; ++t)
-                *reinterpret_cast<uint2*>(bb + b * BN * PB + wcol * PB + (w0c + i * TPW) * 32 +
-                                          8 * t) = mx_codes8<true>(rw[i][t]);
+                *reinterpret_cast<uint2*>(bb + wcol * PB + (w0c + i * TPW) * 32 + 8 * t) =
+                    mx_codes8(rw[i][t]);
         }
         if (tid < BN * KB) {
 // E8M0 maps directly to the F32 exponent field; code zero is 2^-127, a representable
@@ -500,7 +425,7 @@ __global__ __launch_bounds__(256)
 #pragma unroll
             for (int g = 0; g < 4; ++g) {
                 const uint32_t exp = (re >> (8 * g)) & 0xffu;
-                ss[b * 4 * KB * BN + (ekb * 4 + g) * BN + ecol] =
+                ss[(ekb * 4 + g) * BN + ecol] =
                     __uint_as_float(exp == 255 ? 0x7fc00000u
                                     : exp      ? (exp << 23)
                                                : 0x00400000u);
@@ -510,32 +435,30 @@ __global__ __launch_bounds__(256)
     r4d_fp8::f8v total[TC];
 #pragma unroll
     for (int t = 0; t < TC; ++t) total[t] = r4d_fp8::acc_zero();
-    auto compute = [&](int s, int b) {
+    auto compute = [&](int s) {
         const int k0 = (s % ksn) * StageK;
-        const uint8_t *ab = aa + b * BM * PA, *bp = bb + b * BN * PB;
-        const float* sp = ss + b * 4 * KB * BN;
 #pragma unroll
         for (int kb = 0; kb < KB; ++kb) {
             if (k0 + kb * 128 >= kc) break;
-            const float* sar = sa + b * SAK * BM + (Resident ? k0 / 128 + kb : kb) * BM + rowbase;
+            const float* sar = sa + (Resident ? k0 / 128 + kb : kb) * BM + rowbase;
             float activation[8];
 #pragma unroll
             for (int row = 0; row < 8; ++row) activation[row] = sar[row];
             const int ka = (Resident ? k0 : 0) + kb * 128;
 #pragma unroll
             for (int group = 0; group < 4; ++group) {
-                const auto fa0 = r4d_fp8::frag<AK>(ab, wave_row * 16, ka + group * 32, lane);
-                const auto fa1 = r4d_fp8::frag<AK>(ab, wave_row * 16, ka + group * 32 + 16, lane);
+                const auto fa0 = r4d_fp8::frag<AK>(aa, wave_row * 16, ka + group * 32, lane);
+                const auto fa1 = r4d_fp8::frag<AK>(aa, wave_row * 16, ka + group * 32 + 16, lane);
 #pragma unroll
                 for (int t = 0; t < TC; ++t) {
                     auto raw = r4d_fp8::mma(
-                        fa0, r4d_fp8::frag<StageK>(bp, colw + t * 16, kb * 128 + group * 32, lane),
+                        fa0, r4d_fp8::frag<StageK>(bb, colw + t * 16, kb * 128 + group * 32, lane),
                         r4d_fp8::acc_zero());
                     raw = r4d_fp8::mma(
                         fa1,
-                        r4d_fp8::frag<StageK>(bp, colw + t * 16, kb * 128 + group * 32 + 16, lane),
+                        r4d_fp8::frag<StageK>(bb, colw + t * 16, kb * 128 + group * 32 + 16, lane),
                         raw);
-                    const float scale = sp[(kb * 4 + group) * BN + colw + t * 16 + (lane & 15)];
+                    const float scale = ss[(kb * 4 + group) * BN + colw + t * 16 + (lane & 15)];
 // A dropped row folds zeros (or NaN under a code-255 scale) and is written as 0.
 #pragma unroll
                     for (int row = 0; row < 8; ++row)
@@ -586,21 +509,11 @@ __global__ __launch_bounds__(256)
         }
     };
     load(0);
-    if constexpr (DB) {
-        store(0);
-        lds_barrier();
-    }
     for (int s = 0; s < S; ++s) {
-        if constexpr (DB) {
-            if (s + 1 < S) load(s + 1);
-            if (live) compute(s, s & 1);
-            if (s + 1 < S) store((s + 1) & 1);
-        } else {
-            store(0);
-            lds_barrier();
-            if (s + 1 < S) load(s + 1);
-            if (live) compute(s, 0);
-        }
+        store();
+        lds_barrier();
+        if (s + 1 < S) load(s + 1);
+        if (live) compute(s);
         lds_barrier();
         if (s % ksn == ksn - 1) {
             epilogue(colb + (s / ksn) * BN);
@@ -620,7 +533,7 @@ __global__ __launch_bounds__(256)
  * A stage of StageK of K is loaded into registers while the previous one computes from LDS; at
  * gate_up's K of 4096 the 256 stage measured fastest. Block row `experts` zeroes the dropped rows
  * past offset[experts]. */
-template <int Waves, int StageK, bool Lut>
+template <int Waves, int StageK>
 __global__ __launch_bounds__(32 * Waves) void moe_mxfp4_expert_kernel(
     const uint8_t* a, const float* as, const void* w0, const void* s0, const void* w1,
     const void* s1, const int* sorted, const int* offset, uint16_t* y, MxMeta m) {
@@ -715,7 +628,7 @@ __global__ __launch_bounds__(32 * Waves) void moe_mxfp4_expert_kernel(
                 const uint32_t q[4] = { rw[i].x, rw[i].y, rw[i].z, rw[i].w };
 #pragma unroll
                 for (int t = 0; t < 4; ++t)
-                    *reinterpret_cast<uint2*>(bb + c * P + 2 * d + 8 * t) = mx_codes8<Lut>(q[t]);
+                    *reinterpret_cast<uint2*>(bb + c * P + 2 * d + 8 * t) = mx_codes8(q[t]);
             }
 #pragma unroll
             for (int i = 0; i < SChunks; ++i) {
@@ -777,7 +690,7 @@ struct MxStage {
     uint32_t s[SChunks];
     float sa;
 };
-template <int StageK, int ColTiles, bool Lut>
+template <int StageK, int ColTiles>
 __global__ __launch_bounds__(128) void moe_mxfp4_expert_staged_kernel(
     const uint8_t* a, const float* as, const void* w0, const void* s0, const void* w1,
     const void* s1, const int* sorted, const int* offset, uint16_t* y, MxMeta m) {
@@ -870,8 +783,7 @@ __global__ __launch_bounds__(128) void moe_mxfp4_expert_staged_kernel(
                           d = (j % (StageK / 32)) * 16;
 #pragma unroll
                 for (int t = 0; t < 4; ++t)
-                    *reinterpret_cast<uint2*>(bb + c * P + 2 * d + 8 * t) =
-                        mx_codes8<Lut>(R.w[i][t]);
+                    *reinterpret_cast<uint2*>(bb + c * P + 2 * d + 8 * t) = mx_codes8(R.w[i][t]);
             }
 #pragma unroll
             for (int i = 0; i < St::SChunks; ++i) {
@@ -993,78 +905,24 @@ int body(const RadArgs* a, RadStream stream) {
     m.ar = aq->stride[0];
     m.asr = as->stride[0];
     m.yr = y->stride[0];
-    m.tile = m.T < 32 ? 1 : m.T < 128 ? 4 : 16;
     // Validated GLM projections at TP4 and TP8: retain the small/decode path and other models.
     const bool glm_prefill = ne == 288 && top == 8 && nn[0] == nn[1] && kk[0] == kk[1] &&
                              ((parts == 2 && (nn[0] == 1024 || nn[0] == 512) && kk[0] == 4096) ||
                               (parts == 1 && nn[0] == 4096 && (kk[0] == 512 || kk[0] == 256)));
-    auto enabled = [&](const char* name) {
-        const char* v = std::getenv(name);
-        return v ? v[0] == '1' : glm_prefill;
-    };
-    /* The expert-major form up to a routed-row bound per projection (token rows: gate_up, sorted
-     * rows: down), measured at GLM's TP8 slices: gate_up up to 768 rows, where the prefill form
-     * overtakes it, down up to 6143 rows (at 8192 the pipelined prefill form reads the slice
-     * 2.2 times less often and wins by a quarter). Other shapes keep the decode band. The environment
-     * moves the bounds, forces either side (RADIANCE_MXFP4_DECODE_EXPERTS 0 or 1) and pins stage
-     * and tiles, for the microbenchmark. */
-    const char* lut_env = std::getenv("RADIANCE_MXFP4_LUT");
-    const bool lut = lut_env ? lut_env[0] == '1' : true;
-    auto env_long = [](const char* name, long dflt) {
-        const char* v = std::getenv(name);
-        return v && *v ? std::strtol(v, nullptr, 10) : dflt;
-    };
-    const long max_t =
-        env_long(m.sorted_a ? "RADIANCE_MXFP4_DECODE_EXPERTS_MAX_T_DOWN"
-                            : "RADIANCE_MXFP4_DECODE_EXPERTS_MAX_T_GATE_UP",
-                 glm_prefill && (nn[0] == 512 || kk[0] == 256) ? (m.sorted_a ? 6143 : 768) : 511);
-    const char* experts_env = std::getenv("RADIANCE_MXFP4_DECODE_EXPERTS");
+    const bool tp8 = glm_prefill && (nn[0] == 512 || kk[0] == 256);
     /* The P64 form from a routed-row bound per projection, ahead of the expert-major band (its
      * down bound overlaps it): gate_up from 769 rows, where the prefill forms begin, down from
-     * 20 rows an expert at GLM's 288. Default at GLM's TP8 slices only, the measured ones
-     * (RADIANCE_MXFP4_PREFILL_P64=0 keeps the TP8 prefill form of stage 1, which also takes a grid
-     * P64 cannot address). The
-     * tile follows the rows an expert, measured at the TP8 slices (perfmx, cold): down BM32 BN64
-     * K128 over four column tiles up to 3072 tokens (2048: 647 against 831 us), above BM64 BN128
-     * K128 x4 with the LDS output (4096: 1101 against 1607); gate_up BM32 BN64 K256 up to 1536
-     * tokens (768: 563 against 660), BM64 BN64 K256 up to 3072 (2048: 941 against 995), above
-     * BM64 BN128 K128 with the LDS output (4096: 1715 against 1915). BM, BN, stage, column tiles,
-     * the LDS output, the double buffer and the three row bounds move with the environment, and a
-     * forced expert-major form (DECODE_EXPERTS=1) keeps precedence. */
-    const char* p64_env = std::getenv("RADIANCE_MXFP4_PREFILL_P64");
-    const bool resident = m.K <= 256;
-    long dbm = 32, dbn = 64, dsk = 128, dout = 0;
-    if (resident) {
-        if (m.T >= env_long("RADIANCE_MXFP4_PREFILL_P64_T_DOWN_WIDE", 24576)) {
-            dbm = 64;
-            dbn = 128;
-            dout = 1;
-        }
-    } else if (m.T < env_long("RADIANCE_MXFP4_PREFILL_P64_T_BM64", 12288))
-        dsk = 256;
-    else if (m.T < env_long("RADIANCE_MXFP4_PREFILL_P64_T_BN128", 24576)) {
-        dbm = 64;
-        dsk = 256;
-    } else {
-        dbm = 64;
-        dbn = 128;
-        dout = 1;
-    }
-    const long bm = env_long("RADIANCE_MXFP4_PREFILL_P64_BM", dbm) == 32 ? 32 : 64;
-    const bool tp8 = glm_prefill && (nn[0] == 512 || kk[0] == 256);
-    if ((p64_env ? p64_env[0] == '1' : tp8) && !(experts_env && experts_env[0] == '1') &&
-        m.T >= env_long(m.sorted_a ? "RADIANCE_MXFP4_PREFILL_P64_MIN_T_DOWN"
-                                   : "RADIANCE_MXFP4_PREFILL_P64_MIN_T_GATE_UP",
-                        m.sorted_a ? 5760 : 769) &&
-        (m.T + bm - 1) / bm + m.experts <= 65535) {
-        const long bn = env_long("RADIANCE_MXFP4_PREFILL_P64_BN", dbn) == 64 ? 64 : 128;
-        const long sk = env_long("RADIANCE_MXFP4_PREFILL_P64_STAGE_K", dsk) == 256 ? 256 : 128;
-        const long ct = resident && env_long("RADIANCE_MXFP4_PREFILL_P64_COLTILES", 4) != 1 ? 4 : 1;
-        m.stage_out = env_long("RADIANCE_MXFP4_PREFILL_P64_STAGE_OUT", dout) == 1;
-        // The double buffer exists where two stages fit in 64 KiB of LDS: every 128 stage, and
-        // the 256 stage at BM32 BN64.
-        const bool db = !resident && env_long("RADIANCE_MXFP4_PREFILL_P64_DB", 0) == 1 &&
-                        (sk == 128 || (bm == 32 && bn == 64));
+     * 20 rows an expert at GLM's 288. At GLM's TP8 slices only, the measured ones; a grid P64
+     * cannot address takes the forms below. The tile follows the rows an expert, measured at the
+     * TP8 slices (perfmx, cold): down BM32 BN64 K128 over four column tiles up to 3072 tokens
+     * (2048: 647 against 831 us), above BM64 BN128 K128 x4 with the LDS output (4096: 1101
+     * against 1607); gate_up BM32 BN64 K256 up to 1536 tokens (768: 563 against 660), BM64 BN64
+     * K256 up to 3072 (2048: 941 against 995), above BM64 BN128 K128 with the LDS output (4096:
+     * 1715 against 1915). */
+    const bool resident = m.K <= 256, wide = m.T >= 24576;
+    const long bm = wide || (!resident && m.T >= 12288) ? 64 : 32;
+    if (tp8 && m.T >= (m.sorted_a ? 5760 : 769) && (m.T + bm - 1) / bm + m.experts <= 65535) {
+        m.stage_out = wide;
         m.out16 = (reinterpret_cast<uintptr_t>(y->data) & 15) == 0 && m.yr % 8 == 0;
         const long jobs = (m.T + bm - 1) / bm + m.experts;
 #define MX_P64(BM, BN, SK, CT, R)                                                                  \
@@ -1072,85 +930,40 @@ int body(const RadArgs* a, RadStream stream) {
              dim3(((long)m.N + BN * CT - 1) / (BN * CT), jobs), dim3(256), 0,                      \
              (const uint8_t*)aq->data, (const float*)as->data, w[0]->data, s[0]->data, w[1]->data, \
              s[1]->data, (const int*)sorted->data, (const int*)off->data, (uint16_t*)y->data, m)
-#define MX_P64D(BM, BN, SK)                                                                        \
-    R4D_EMIT(stream, (moe_mxfp4_p64_kernel<BM, BN, SK, 1, false, true>),                           \
-             dim3(((long)m.N + BN - 1) / BN, jobs), dim3(256), 0, (const uint8_t*)aq->data,        \
-             (const float*)as->data, w[0]->data, s[0]->data, w[1]->data, s[1]->data,               \
-             (const int*)sorted->data, (const int*)off->data, (uint16_t*)y->data, m)
-        if (db) {
-            if (sk == 256) return MX_P64D(32, 64, 256);
-            if (bm == 32) return bn == 64 ? MX_P64D(32, 64, 128) : MX_P64D(32, 128, 128);
-            return bn == 64 ? MX_P64D(64, 64, 128) : MX_P64D(64, 128, 128);
-        }
-#undef MX_P64D
-#define MX_P64_SK(BM, BN, CT, R)                                                                   \
-    return sk == 256 ? MX_P64(BM, BN, 256, CT, R) : MX_P64(BM, BN, 128, CT, R);
-#define MX_P64_BN(BM, CT, R)                                                                       \
-    if (bn == 64) { MX_P64_SK(BM, 64, CT, R) }                                                     \
-    MX_P64_SK(BM, 128, CT, R)
-#define MX_P64_BM(CT, R)                                                                           \
-    if (bm == 32) { MX_P64_BN(32, CT, R) }                                                         \
-    MX_P64_BN(64, CT, R)
-        if (!resident) { MX_P64_BM(1, false) }
-        if (ct == 1) { MX_P64_BM(1, true) }
-        MX_P64_BM(4, true)
-#undef MX_P64_BM
-#undef MX_P64_BN
-#undef MX_P64_SK
+        if (resident) return wide ? MX_P64(64, 128, 128, 4, true) : MX_P64(32, 64, 128, 4, true);
+        if (wide) return MX_P64(64, 128, 128, 1, false);
+        return bm == 64 ? MX_P64(64, 64, 256, 1, false) : MX_P64(32, 64, 256, 1, false);
 #undef MX_P64
     }
-    if (experts_env ? experts_env[0] == '1' : max_t < 0 || m.T <= max_t) {
-        const long stage = env_long("RADIANCE_MXFP4_EXPERTS_STAGE_K", m.K <= 256 ? 128 : 256);
-        const long tiles = env_long("RADIANCE_MXFP4_EXPERTS_COLTILES", m.K <= 256 ? 4 : 1);
+    /* The expert-major form up to a routed-row bound per projection (token rows: gate_up, sorted
+     * rows: down), measured at GLM's TP8 slices: gate_up up to 768 rows, where the prefill form
+     * overtakes it, down up to 6143 rows (at 8192 the pipelined prefill form reads the slice
+     * 2.2 times less often and wins by a quarter). Other shapes keep the decode band. A K of 256
+     * takes 128 stages over four column tiles, a longer K the 256 stage over one. */
+    if (m.T <= (tp8 ? (m.sorted_a ? 6143 : 768) : 511)) {
 #define MX_EXPERTS(KERNEL, C)                                                                      \
     R4D_EMIT(stream, KERNEL, dim3(((long)m.N + 64 * C - 1) / (64 * C), m.experts + 1), dim3(128),  \
              0, (const uint8_t*)aq->data, (const float*)as->data, w[0]->data, s[0]->data,          \
              w[1]->data, s[1]->data, (const int*)sorted->data, (const int*)off->data,              \
              (uint16_t*)y->data, m)
-#define MX_EXPERTS_LUT(L)                                                                          \
-    if (stage == 128)                                                                              \
-        return tiles == 4 ? MX_EXPERTS((moe_mxfp4_expert_staged_kernel<128, 4, L>), 4)             \
-                          : MX_EXPERTS((moe_mxfp4_expert_staged_kernel<128, 1, L>), 1);            \
-    return tiles == 4 ? MX_EXPERTS((moe_mxfp4_expert_staged_kernel<256, 4, L>), 4)                 \
-                      : MX_EXPERTS((moe_mxfp4_expert_kernel<4, 256, L>), 1);
-        if (lut) { MX_EXPERTS_LUT(true) }
-        MX_EXPERTS_LUT(false)
-#undef MX_EXPERTS_LUT
+        if (m.K <= 256) return MX_EXPERTS((moe_mxfp4_expert_staged_kernel<128, 4>), 4);
+        return MX_EXPERTS((moe_mxfp4_expert_kernel<4, 256>), 1);
 #undef MX_EXPERTS
     }
-    m.aligned_jobs = enabled("RADIANCE_MXFP4_ALIGNED_JOBS") && m.T >= 512;
-    const bool wide = enabled("RADIANCE_MXFP4_PREFILL_N32") && m.T >= 512;
-    const bool tall = wide && m.aligned_jobs && enabled("RADIANCE_MXFP4_PREFILL_M32");
-    const int job_rows = tall ? 32 : 16;
-    const int jobs =
-        m.aligned_jobs ? (m.T + job_rows - 1) / job_rows + m.experts : (m.T + m.tile - 1) / m.tile;
+    /* From 512 routed rows (past the expert-major band) the GLM prefill form at GLM's slices, in
+     * jobs of 32 rows of one expert; elsewhere the row groups, 16 sorted rows a block. */
+    const bool pipe = glm_prefill && m.T >= 512;
+    const int jobs = pipe ? (m.T + 31) / 32 + m.experts : (m.T + 15) / 16;
     if (jobs > 65535) return RAD_E_SHAPE;
-#define MX_EMIT(CT, RT, CACHE, L)                                                                  \
-    R4D_EMIT(stream, (moe_mxfp4_fp8_kernel<CT, RT, CACHE, L>),                                     \
-             dim3(((long)m.N + 16 * CT - 1) / (16 * CT), jobs), dim3(32 * CT * RT), 0,             \
-             (const uint8_t*)aq->data, (const float*)as->data, w[0]->data, s[0]->data, w[1]->data, \
-             s[1]->data, (const int*)sorted->data, (const int*)off->data, (uint16_t*)y->data, m)
-#define MX_PIPE(L)                                                                                 \
-    R4D_EMIT(stream, (moe_mxfp4_prefill_kernel<L>), dim3(((long)m.N + 63) / 64, jobs), dim3(256),  \
-             0, (const uint8_t*)aq->data, (const float*)as->data, w[0]->data, s[0]->data,          \
-             w[1]->data, s[1]->data, (const int*)sorted->data, (const int*)off->data,              \
-             (uint16_t*)y->data, m)
-    const char* cached = std::getenv("RADIANCE_MXFP4_PREFILL_CACHE_ROWS");
-    const bool pipe = enabled("RADIANCE_MXFP4_PREFILL_PIPE");
-#define MX_EMIT_LUT(L)                                                                             \
-    if (tall && enabled("RADIANCE_MXFP4_PREFILL_N64")) {                                           \
-        if (cached ? cached[0] == '1' : glm_prefill)                                               \
-            return pipe ? MX_PIPE(L) : MX_EMIT(4, 2, true, L);                                     \
-        return MX_EMIT(4, 2, false, L);                                                            \
-    }                                                                                              \
-    if (tall) return MX_EMIT(2, 2, false, L);                                                      \
-    if (wide) return MX_EMIT(2, 1, false, L);                                                      \
-    return MX_EMIT(1, 1, false, L);
-    if (lut) { MX_EMIT_LUT(true) }
-    MX_EMIT_LUT(false)
-#undef MX_EMIT_LUT
-#undef MX_PIPE
-#undef MX_EMIT
+    if (pipe)
+        return R4D_EMIT(stream, moe_mxfp4_prefill_kernel, dim3(((long)m.N + 63) / 64, jobs),
+                        dim3(256), 0, (const uint8_t*)aq->data, (const float*)as->data,
+                        w[0]->data, s[0]->data, w[1]->data, s[1]->data, (const int*)sorted->data,
+                        (const int*)off->data, (uint16_t*)y->data, m);
+    return R4D_EMIT(stream, moe_mxfp4_fp8_kernel, dim3(((long)m.N + 15) / 16, jobs), dim3(32), 0,
+                    (const uint8_t*)aq->data, (const float*)as->data, w[0]->data, s[0]->data,
+                    w[1]->data, s[1]->data, (const int*)sorted->data, (const int*)off->data,
+                    (uint16_t*)y->data, m);
 }
 }
 extern "C" int r4d_rad_moe_mxfp4(const RadArgs* a, RadStream stream) { return body(a, stream); }

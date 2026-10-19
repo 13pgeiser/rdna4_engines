@@ -1,6 +1,7 @@
 /* Canonical E4M3 weights with exact F32 block scales: native FP8 WMMA and F32 scale folding, no
- * checkpoint scale narrowing. The grouped form and the legacy dense form compute one 16x64 output
- * tile a block; the dense decode and prefill forms below them produce the same bytes faster. */
+ * checkpoint scale narrowing. The legacy dense form computes one 16x64 output tile a block; the
+ * dense decode and prefill forms below it produce the same bytes faster, and the grouped form runs
+ * expert-major over the same per-element sequence. */
 #include <hip/hip_runtime.h>
 #include "r4d_args.h"
 #include "r4d_emit.h"
@@ -8,108 +9,75 @@
 #include "r4d_fp8_wmma.h"
 #include "r4d_launch.h"
 #include <climits>
-#include <cstdio>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 
 namespace {
 struct Meta {
     long ar, asr, yr, wr, sr, wstep[2], sstep[2];
-    int T, N, K, experts, topk, sorted_a, tile;
+    int T, N, K, experts, topk, sorted_a;
 };
 __device__ const uint8_t* entry(const void* p, long step, int e) {
     return step ? (const uint8_t*)p + step * e : ((const uint8_t* const*)p)[e];
 }
-template <bool Grouped>
-__global__ void fp8_f32scale(const uint8_t* a, const float* as, const void* w0, const void* s0,
-                             const void* w1, const void* s1, const int* sorted, const int* offsets,
+/* The legacy dense form: a block per 16 rows by 64 columns, the operands staged through LDS a
+ * dword at a time, so it serves any row pitch and alignment. */
+__global__ void fp8_f32scale(const uint8_t* a, const float* as, const uint8_t* w, const float* ws,
                              uint16_t* y, Meta m) {
     const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, n0 = blockIdx.x * 64;
     __shared__ uint8_t qa[16 * 136], wb[64 * 136];
     __shared__ int source[16];
-    int first = (int)blockIdx.y * (Grouped ? m.tile : 16);
-    const int limit = min(first + (Grouped ? m.tile : 16), m.T);
-    while (first < limit) {
-        int expert = 0, end = limit;
-        if constexpr (Grouped) {
-            // Tile sorted rows rather than launching every expert, most of which are empty
-            // during native MTP decode. Split a tile at each expert boundary.
-            if (sorted[first] < 0 || offsets[m.experts] <= first) {
-                for (int c = tid; c < 64; c += 128)
-                    if (n0 + c < m.N) y[(long)first * m.yr + n0 + c] = 0;
-                ++first;
-                continue;
+    const int first = (int)blockIdx.y * 16, end = min(first + 16, m.T);
+    if (tid < 16) {
+        const int r = first + tid;
+        source[tid] = r < end ? r : -1;
+    }
+    __syncthreads();
+    auto acc = r4d_fp8::acc_zero();
+    for (int k0 = 0; k0 < m.K; k0 += 128) {
+        for (int j = tid; j < 16 * 32; j += 128) {
+            const int r = j / 32, c = (j % 32) * 4, src = source[r];
+            uint32_t v = 0;
+            if (src >= 0) {
+                const auto* p = a + (long)src * m.ar + k0 + c;
+                v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+                    ((uint32_t)p[3] << 24);
             }
-            int lo = 0, hi = m.experts;
-            while (lo + 1 < hi) {
-                const int mid = (lo + hi) / 2;
-                if (offsets[mid] <= first)
-                    lo = mid;
-                else
-                    hi = mid;
-            }
-            expert = lo;
-            end = min(limit, offsets[expert + 1]);
-            if (end <= first) return;
+            *(uint32_t*)(qa + r * 136 + c) = v;
         }
-        const int parity = Grouped ? expert & 1 : 0, e = Grouped ? expert / 2 : 0;
-        const auto* w = entry(parity ? w1 : w0, m.wstep[parity], e);
-        const auto* ws = (const float*)entry(parity ? s1 : s0, m.sstep[parity], e);
-        if (tid < 16) {
-            const int r = first + tid;
-            const int flat = Grouped && r < end ? sorted[r] : r;
-            source[tid] = r < end && flat >= 0 ? (Grouped && !m.sorted_a ? flat / m.topk : r) : -1;
+        for (int j = tid; j < 64 * 32; j += 128) {
+            const int r = j / 32, c = (j % 32) * 4;
+            const auto* p = w + (long)(n0 + r) * m.wr + k0 + c;
+            *(uint32_t*)(wb + r * 136 + c) = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                                             ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
         }
         __syncthreads();
-        auto acc = r4d_fp8::acc_zero();
-        for (int k0 = 0; k0 < m.K; k0 += 128) {
-            for (int j = tid; j < 16 * 32; j += 128) {
-                const int r = j / 32, c = (j % 32) * 4, src = source[r];
-                uint32_t v = 0;
-                if (src >= 0) {
-                    const auto* p = a + (long)src * m.ar + k0 + c;
-                    v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
-                        ((uint32_t)p[3] << 24);
-                }
-                *(uint32_t*)(qa + r * 136 + c) = v;
-            }
-            for (int j = tid; j < 64 * 32; j += 128) {
-                const int r = j / 32, c = (j % 32) * 4;
-                const auto* p = w + (long)(n0 + r) * m.wr + k0 + c;
-                *(uint32_t*)(wb + r * 136 + c) = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-                                                 ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-            }
-            __syncthreads();
-            auto raw = r4d_fp8::acc_zero();
+        auto raw = r4d_fp8::acc_zero();
 #pragma unroll
-            for (int k = 0; k < 128; k += 16)
-                raw = r4d_fp8::mma(r4d_fp8::frag<128>(qa, 0, k, lane),
-                                   r4d_fp8::frag<128>(wb, wave * 16, k, lane), raw);
-            const float weight_scale = ws[(long)(n0 / 128) * m.sr + k0 / 128];
-#pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const int src = source[(lane >> 4) * 8 + j];
-                const float scale = src >= 0 ? as[(long)src * m.asr + k0 / 128] * weight_scale : 0;
-                acc[j] += raw[j] * scale;
-            }
-            __syncthreads();
-        }
+        for (int k = 0; k < 128; k += 16)
+            raw = r4d_fp8::mma(r4d_fp8::frag<128>(qa, 0, k, lane),
+                               r4d_fp8::frag<128>(wb, wave * 16, k, lane), raw);
+        const float weight_scale = ws[(long)(n0 / 128) * m.sr + k0 / 128];
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            const int r = first + (lane >> 4) * 8 + j, c = n0 + wave * 16 + (lane & 15);
-            if (r < end) y[(long)r * m.yr + c] = f32_to_bf16(acc[j]);
+            const int src = source[(lane >> 4) * 8 + j];
+            const float scale = src >= 0 ? as[(long)src * m.asr + k0 / 128] * weight_scale : 0;
+            acc[j] += raw[j] * scale;
         }
         __syncthreads();
-        first = end;
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int r = first + (lane >> 4) * 8 + j, c = n0 + wave * 16 + (lane & 15);
+        if (r < end) y[(long)r * m.yr + c] = f32_to_bf16(acc[j]);
     }
 }
 /* The grouped form expert-major: a block per (column span, expert) takes every row of its
  * expert in 16-row tiles, so an expert slice is read from memory once however its rows fall in
- * the sorted order (the row tiles above re-read it once per tile its run spans). Each element
- * keeps the sequence above: per 128 of K in order a fresh chain of eight WMMAs, folded as raw *
- * (activation scale * weight scale). A block walks ColTiles column tiles of 64, each over K in
- * stages of StageK, as one stage sequence with the next stage loaded into registers while the
+ * the sorted order (16-row tiles of the sorted order read it once per tile its run spans). Each
+ * element keeps the sequence above: per 128 of K in order a fresh chain of eight WMMAs, folded as
+ * raw * (activation scale * weight scale). A block walks ColTiles column tiles of 64, each over K
+ * in stages of StageK, as one stage sequence with the next stage loaded into registers while the
  * current one computes from LDS. Block row `experts` zeroes the dropped rows past
  * offsets[experts]. */
 typedef unsigned f8_u4 __attribute__((ext_vector_type(4)));
@@ -237,15 +205,15 @@ __global__ __launch_bounds__(128) void fp8_f32scale_experts(const uint8_t* a, co
 }
 // Both forms below keep fp8_f32scale's arithmetic for every output: per 128-K block the same
 // eight-mma chain from zero over the same fragments (the bytes at k + 8*(lane/16) of the block's
-// row segment, which the old kernel copied through LDS unchanged), then acc += raw * (a_scale *
+// row segment, which the legacy form copies through LDS unchanged), then acc += raw * (a_scale *
 // w_scale) in ascending block order. A WMMA output depends only on its own A row, B column and
 // C, so which rows and columns share a tile does not change it.
 
 // Decode: one wave C adjacent 16-column tiles, S waves of a block on S consecutive K blocks at
 // once, the fragments loaded straight from global memory; R row tiles share each weight fragment
 // and C column tiles each activation fragment. Each wave scales its own partial products (the
-// a_scale x w_scale product and the multiply are the old fold's own two roundings) into LDS; then
-// every wave folds a share of the outputs, adding the round's products in block order to the
+// a_scale x w_scale product and the multiply are the legacy fold's own two roundings) into LDS;
+// then every wave folds a share of the outputs, adding the round's products in block order to the
 // output's running sum, which lives in LDS between rounds. The block's activation scales are
 // staged in LDS when they fit (`stage`).
 template <int R, int C>
@@ -338,7 +306,7 @@ __global__ void fp8_f32scale_decode(const uint8_t* a, const float* as, const uin
     }
 }
 
-// Prefill: the old kernel's 64-column block and LDS layout over R row tiles, so a staged weight
+// Prefill: the legacy form's 64-column block and LDS layout over R row tiles, so a staged weight
 // block serves R*16 rows instead of 16, staged with 16-byte loads and the next K block loaded
 // into registers while the current one is multiplied.
 template <int R>
@@ -413,54 +381,18 @@ __global__ void __launch_bounds__(128)
         }
 }
 
-// The dense form. RADIANCE_FP8F32_FORM names "legacy", "rows1"/"rows2"/"rows4" (row tiles a
-// block) or "decode", optionally "decodeRxS" or "decodeRxSxC" (R row tiles, S waves a block, C
-// column tiles a wave); otherwise the rule at the end of dense_form. The forms are byte-identical;
-// the choice is speed only.
+// The dense form: a decode form (`decode`, C column tiles a wave, S waves a block) or the row
+// tiles (R of 16 rows a block), by the rule at the end of dense_form. The forms are
+// byte-identical; the choice is speed only.
 struct Form {
-    int kind = 0, r = 0, s = 0, c = 1;
-};   // kind 0 legacy, 1 decode, 2 rows
+    bool decode = false;
+    int r = 1, s = 1, c = 1;
+};
 constexpr int kLdsCap = 64 * 1024;
 long decode_lds(int R, int S, int C, long KB, bool stage) {
     return ((long)S * R * C * 8 * 32 + (long)R * C * 8 * 32 + (stage ? (long)R * 16 * KB : 0)) * 4;
 }
-// Row tiles a decode block shares a weight fragment over (at most three: four need 192 registers
-// and spill), then waves a block: doubled while the grid stays under 1024 waves, the K blocks last
-// and the exchange fits the LDS.
-Form decode_plan(long N, long K, long T) {
-    Form f;
-    f.kind = 1;
-    const long tiles = (T + 15) / 16, kb = K / 128;
-    f.r = (int)(tiles >= 3 ? 3 : tiles);
-    const long blocks = (N / 16) * ((tiles + f.r - 1) / f.r);
-    f.s = 1;
-    while (f.s < 32 && f.s * 2 <= kb && blocks * f.s < 1024 &&
-           decode_lds(f.r, f.s * 2, 1, kb, false) <= kLdsCap)
-        f.s *= 2;
-    return f;
-}
 Form dense_form(long N, long K, long T) {
-    if (const char* e = std::getenv("RADIANCE_FP8F32_FORM")) {
-        if (!std::strcmp(e, "legacy")) return Form{};
-        if (!std::strncmp(e, "rows", 4)) {
-            Form f;
-            f.kind = 2;
-            f.r = e[4] == '1' ? 1 : e[4] == '2' ? 2 : 4;
-            return f;
-        }
-        if (!std::strncmp(e, "decode", 6)) {
-            Form f = decode_plan(N, K, T);
-            int r = 0, s = 0, c = 1;
-            const int n = std::sscanf(e + 6, "%dx%dx%d", &r, &s, &c);
-            if (n >= 2 && r >= 1 && r <= 3 && s >= 1 && s <= 32 && (s & (s - 1)) == 0 &&
-                (c == 1 || c == 2 || c == 4) && !(r == 3 && c == 4)) {
-                f.r = r;
-                f.s = s;
-                f.c = c;
-            }
-            return f;
-        }
-    }
     // Measured on gfx1201 (r4d_selftest --perfq, cold) at GLM's six shapes: decode1x8 up to 16
     // rows; from 17 to 64 two column tiles a wave (decode1x8x2) lead by 5 to 15 %, except at N 512
     // (too few column tiles, 1x8 stays) and N 4096 over K 1536, where the 16-row tile wins; from 65
@@ -472,14 +404,12 @@ Form dense_form(long N, long K, long T) {
     const bool rows =
         T > 128 || (T > 64 && K <= 2048) || (T > 16 && T <= 64 && K <= 1536 && N >= 4096);
     if (!rows) {
-        f.kind = 1;
-        f.r = 1;
+        f.decode = true;
         f.c = T > 16 && T <= 64 && N > 512 ? 2 : 1;
         f.s = 8;
         while (f.s > 1 && f.s > kb) f.s /= 2;
         return f;
     }
-    f.kind = 2;
     f.r = T > 64 && N >= 4096 ? 2 : 1;
     return f;
 }
@@ -494,35 +424,28 @@ int dense_fast(RadStream stream, const RadTensor& x, const RadTensor& xs, const 
                const RadTensor& ws, const RadTensor& y, const Meta& m, bool* done) {
     *done = false;
     const Form f = dense_form(m.N, m.K, m.T);
-    if (!f.kind || m.wr % 16 || m.ar % 16 ||
+    if (m.wr % 16 || m.ar % 16 ||
         (reinterpret_cast<uintptr_t>(x.data) | reinterpret_cast<uintptr_t>(w.data)) % 16)
         return RAD_OK;
     const uint8_t *xa = (const uint8_t*)x.data, *wa = (const uint8_t*)w.data;
     const float *xsa = (const float*)xs.data, *wsa = (const float*)ws.data;
     uint16_t* ya = (uint16_t*)y.data;
-    if (f.kind == 1) {
+    if (f.decode) {
         const long kb = m.K / 128;
-        const int stage = decode_lds(f.r, f.s, f.c, kb, true) <= kLdsCap;
-        const long lds = decode_lds(f.r, f.s, f.c, kb, stage);
+        const int stage = decode_lds(1, f.s, f.c, kb, true) <= kLdsCap;
+        const long lds = decode_lds(1, f.s, f.c, kb, stage);
         if (lds > kLdsCap || m.N % (16 * f.c)) return RAD_OK;
         *done = true;
-        const dim3 grid(m.N / (16 * f.c), (unsigned)(((m.T + 15) / 16 + f.r - 1) / f.r)),
-            block(32 * f.s);
-#define F32S_DECODE(R_, C_)                                                                        \
-    if (f.r == R_ && f.c == C_)                                                                    \
-        return R4D_EMIT(stream, (fp8_f32scale_decode<R_, C_>), grid, block, (uint32_t)lds, xa,     \
-                        xsa, wa, wsa, ya, m, stage);
-        F32S_DECODE(1, 1)
-        F32S_DECODE(2, 1) F32S_DECODE(3, 1) F32S_DECODE(1, 2) F32S_DECODE(2, 2) F32S_DECODE(3, 2)
-            F32S_DECODE(1, 4) F32S_DECODE(2, 4)
-#undef F32S_DECODE
-                * done = false;
-        return RAD_OK;
+        const dim3 grid(m.N / (16 * f.c), (unsigned)((m.T + 15) / 16)), block(32 * f.s);
+        if (f.c == 2)
+            return R4D_EMIT(stream, (fp8_f32scale_decode<1, 2>), grid, block, (uint32_t)lds, xa,
+                            xsa, wa, wsa, ya, m, stage);
+        return R4D_EMIT(stream, (fp8_f32scale_decode<1, 1>), grid, block, (uint32_t)lds, xa, xsa,
+                        wa, wsa, ya, m, stage);
     }
     *done = true;
-    if (f.r == 1) return emit_rows<1>(stream, xa, xsa, wa, wsa, ya, m);
     if (f.r == 2) return emit_rows<2>(stream, xa, xsa, wa, wsa, ya, m);
-    return emit_rows<4>(stream, xa, xsa, wa, wsa, ya, m);
+    return emit_rows<1>(stream, xa, xsa, wa, wsa, ya, m);
 }
 int body(const RadArgs* a, RadStream stream, bool grouped) {
     if (!a || !a->t || a->n_t < (grouped ? 9 : 5)) return RAD_E_INVAL;
@@ -539,7 +462,7 @@ int body(const RadArgs* a, RadStream stream, bool grouped) {
         y.shape[1] != N || x.stride[1] != 1 || xs.stride[1] != 1 || y.stride[1] != 1 ||
         y.shape[0] < 1 || y.shape[0] > INT_MAX)
         return RAD_E_SHAPE;
-    const int rank = grouped ? 3 : 2;
+    const uint32_t rank = grouped ? 3 : 2;
     if (w.rank != rank || ws.rank != rank || w.shape[rank - 2] != N || w.shape[rank - 1] != K ||
         ws.shape[rank - 2] != N / 128 || ws.shape[rank - 1] != K / 128 || w.stride[rank - 1] != 1 ||
         ws.stride[rank - 1] != 1)
@@ -553,75 +476,46 @@ int body(const RadArgs* a, RadStream stream, bool grouped) {
     m.T = (int)y.shape[0];
     m.N = N;
     m.K = K;
-    const void *w1 = nullptr, *s1 = nullptr;
-    const int *sorted = nullptr, *offsets = nullptr;
-    if (grouped) {
-        m.experts = r4d_geti_or(a, "n_expert", 0);
-        m.topk = r4d_geti_or(a, "top_k", 0);
-        const char* order = r4d_gets(a, "a_order");
-        m.sorted_a = order && !std::strcmp(order, "sorted");
-        const auto &wo = a->t[6], &so = a->t[7], &st = a->t[4], &off = a->t[5];
-        if (m.experts < 2 || m.topk < 1 || r4d_geti_or(a, "N_odd", N) != N ||
-            r4d_geti_or(a, "K_odd", K) != K || wo.dtype != RAD_F8E4M3 || so.dtype != RAD_F32 ||
-            wo.rank != 3 || so.rank != 3 || wo.shape[1] != N || wo.shape[2] != K ||
-            so.shape[1] != N / 128 || so.shape[2] != K / 128 || wo.stride[1] != m.wr ||
-            so.stride[1] != m.sr || wo.stride[2] != 1 || so.stride[2] != 1 || st.dtype != RAD_I32 ||
-            off.dtype != RAD_I32 || st.rank != 1 || off.rank != 1 || st.stride[0] != 1 ||
-            off.stride[0] != 1 || st.shape[0] < m.T || off.shape[0] < m.experts + 1 || !wo.data ||
-            !so.data || !st.data || !off.data)
-            return RAD_E_SHAPE;
-        m.wstep[0] = w.stride[0];
-        m.wstep[1] = wo.stride[0];
-        m.sstep[0] = ws.stride[0] * 4;
-        m.sstep[1] = so.stride[0] * 4;
-        if (w.shape[0] < (m.experts + 1) / 2 || wo.shape[0] < m.experts / 2) return RAD_E_SHAPE;
-        w1 = wo.data;
-        s1 = so.data;
-        sorted = (const int*)st.data;
-        offsets = (const int*)off.data;
-    } else {
+    if (!grouped) {
         if (x.shape[0] != m.T) return RAD_E_SHAPE;
-        m.wstep[0] = N * m.wr;
-        m.sstep[0] = (N / 128) * m.sr * 4;
         bool done = false;
         const int rc = dense_fast(stream, x, xs, w, ws, y, m, &done);
         if (done || rc < 0) return rc;
+        return R4D_EMIT(stream, fp8_f32scale, dim3(N / 64, (m.T + 15) / 16), dim3(128), 0,
+                        (const uint8_t*)x.data, (const float*)xs.data, (const uint8_t*)w.data,
+                        (const float*)ws.data, (uint16_t*)y.data, m);
     }
-    m.tile = m.T < 32 ? 1 : m.T < 128 ? 4 : 16;
-    if (grouped) {
-        /* The expert-major form at every routed-row count unless the environment bounds or
-         * refuses it (RADIANCE_FP8F32_DECODE_EXPERTS 0 or 1, ..._MAX_T). Measured at GLM's TP8
-         * slices: a long K (gate_up's 4096) wants the 256 stage, 25 to 40 % ahead of 128, and
-         * under 128 routed rows four tiles a block on top; at down's K of 256 every variant
-         * reads within a few percent of the bandwidth, so it keeps 128 over four tiles. Stage
-         * and tiles can be pinned, for the microbenchmark. */
-        auto env_long = [](const char* name, long dflt) {
-            const char* v = std::getenv(name);
-            return v && *v ? std::strtol(v, nullptr, 10) : dflt;
-        };
-        const char* force = std::getenv("RADIANCE_FP8F32_DECODE_EXPERTS");
-        const long max_t = env_long("RADIANCE_FP8F32_DECODE_EXPERTS_MAX_T", -1);
-        if (force ? force[0] == '1' : max_t < 0 || m.T <= max_t) {
-            const long stage = env_long("RADIANCE_FP8F32_EXPERTS_STAGE_K", K <= 256 ? 128 : 256);
-            const long tiles =
-                env_long("RADIANCE_FP8F32_EXPERTS_COLTILES", K <= 256 || m.T < 128 ? 4 : 1);
+    m.experts = r4d_geti_or(a, "n_expert", 0);
+    m.topk = r4d_geti_or(a, "top_k", 0);
+    const char* order = r4d_gets(a, "a_order");
+    m.sorted_a = order && !std::strcmp(order, "sorted");
+    const auto &wo = a->t[6], &so = a->t[7], &st = a->t[4], &off = a->t[5];
+    if (m.experts < 2 || m.topk < 1 || r4d_geti_or(a, "N_odd", N) != N ||
+        r4d_geti_or(a, "K_odd", K) != K || wo.dtype != RAD_F8E4M3 || so.dtype != RAD_F32 ||
+        wo.rank != 3 || so.rank != 3 || wo.shape[1] != N || wo.shape[2] != K ||
+        so.shape[1] != N / 128 || so.shape[2] != K / 128 || wo.stride[1] != m.wr ||
+        so.stride[1] != m.sr || wo.stride[2] != 1 || so.stride[2] != 1 || st.dtype != RAD_I32 ||
+        off.dtype != RAD_I32 || st.rank != 1 || off.rank != 1 || st.stride[0] != 1 ||
+        off.stride[0] != 1 || st.shape[0] < m.T || off.shape[0] < m.experts + 1 || !wo.data ||
+        !so.data || !st.data || !off.data)
+        return RAD_E_SHAPE;
+    m.wstep[0] = w.stride[0];
+    m.wstep[1] = wo.stride[0];
+    m.sstep[0] = ws.stride[0] * 4;
+    m.sstep[1] = so.stride[0] * 4;
+    if (w.shape[0] < (m.experts + 1) / 2 || wo.shape[0] < m.experts / 2) return RAD_E_SHAPE;
+    /* The expert-major form at every routed-row count. Measured at GLM's TP8 slices: a long K
+     * (gate_up's 4096) wants the 256 stage, 25 to 40 % ahead of 128, and under 128 routed rows
+     * four tiles a block on top; at down's K of 256 every variant reads within a few percent of
+     * the bandwidth, so it keeps 128 over four tiles. */
 #define F8_EXPERTS(SK, C)                                                                          \
     R4D_EMIT(stream, (fp8_f32scale_experts<SK, C>),                                                \
              dim3((N + 64 * C - 1) / (64 * C), m.experts + 1), dim3(128), 0,                       \
-             (const uint8_t*)x.data, (const float*)xs.data, w.data, ws.data, w1, s1, sorted,       \
-             offsets, (uint16_t*)y.data, m)
-            if (stage == 256) return tiles == 4 ? F8_EXPERTS(256, 4) : F8_EXPERTS(256, 1);
-            return tiles == 4 ? F8_EXPERTS(128, 4) : F8_EXPERTS(128, 1);
+             (const uint8_t*)x.data, (const float*)xs.data, w.data, ws.data, wo.data, so.data,     \
+             (const int*)st.data, (const int*)off.data, (uint16_t*)y.data, m)
+    if (K > 256) return m.T < 128 ? F8_EXPERTS(256, 4) : F8_EXPERTS(256, 1);
+    return F8_EXPERTS(128, 4);
 #undef F8_EXPERTS
-        }
-    }
-    if (grouped)
-        return R4D_EMIT(stream, fp8_f32scale<true>, dim3(N / 64, (m.T + m.tile - 1) / m.tile),
-                        dim3(128), 0, (const uint8_t*)x.data, (const float*)xs.data, w.data,
-                        ws.data, w1, s1, sorted, offsets, (uint16_t*)y.data, m);
-    return R4D_EMIT(stream, fp8_f32scale<false>, dim3(N / 64, (m.T + 15) / 16), dim3(128), 0,
-                    (const uint8_t*)x.data, (const float*)xs.data, w.data, ws.data, w1, s1, sorted,
-                    offsets, (uint16_t*)y.data, m);
 }
 int dense(const RadArgs* a, RadStream stream) { return body(a, stream, false); }
 int grouped(const RadArgs* a, RadStream stream) { return body(a, stream, true); }

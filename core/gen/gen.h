@@ -129,6 +129,11 @@ struct Layout {
     std::vector<int32_t> seg;          /* [n_seg + 1] */
     std::vector<int32_t> bidi;         /* [n_seg] */
     int32_t              next_pos = 0; /* the rotary count after the last row: the image's frame */
+    /* JOINT_STEP only: the text's rows (padding included), the padding rows among them, and the
+     * f32 positions, [4, rows] component-major (`rope` is then empty). */
+    int64_t              text = 0;
+    int32_t              n_pad = 0;
+    std::vector<float>   rope_f;
 };
 /* `ref_hw` is each reference's latent grid (h, w), in media order. RAD_E_INVAL with `why` when the
  * prompt does not start with its drop prefix or a picture's slots do not tile its latent grid. */
@@ -136,6 +141,17 @@ int build_layout(const Branch& b, int64_t slot_rows, const std::vector<std::pair
                  Layout* out, std::string* why);
 /* The rotary positions of an h x w image at frame `pos`: [3, h * w] component-major. */
 void image_rope(int32_t pos, int32_t h, int32_t w, int32_t* planes, int64_t n_total);
+
+/* A conditioning in the JOINT_STEP layout (RadGeneratorDecl): the prompt's rows after its drop
+ * prefix, padding to a multiple of `pad_multiple` (0: none), then each reference picture's latent
+ * tokens. `src` is the prompt row behind a text row -- a padding row's is past the prompt's last,
+ * where the COND pass appends the padding tokens -- or -(1 + i) for reference latent row i. One
+ * text segment (causal) and a segment per picture (bidirectional). */
+int build_joint_layout(const Branch& b, int32_t pad_multiple, double hw_scale, bool text_l,
+                       const std::vector<std::pair<int32_t, int32_t>>& ref_hw, Layout* out,
+                       std::string* why);
+/* The f32 positions (0, s h, s w, l) of an h x w grid: [4, h * w] component-major. */
+void grid_rope_f(double hw_scale, float l, int32_t h, int32_t w, float* planes, int64_t n_total);
 
 }  /* namespace gen */
 }  /* namespace rad */

@@ -966,7 +966,7 @@ TEST(op_vocabulary) {
          * denoiser, and the index helpers that feed them. */
         "conv1d", "conv_t1d", "snake", "cfg_topk_sample", "rvq_embed", "frame_mix_store",
         "end_status", "resample_nearest", "fourier_embed", "win_input", "win_prep", "win_finish",
-        "chan_split", "interleave2", "iota", "cu_repeat", "frame_store",
+        "chan_split", "interleave2", "iota", "cu_repeat", "int_affine", "frame_store",
         /* The video generator's (MiniMax-H3): its DiT's modulated norm and sampler step, its
          * decoder's patch unfold, tiles, stitch and positions, and the vocoder's alias-free
          * activation. */
@@ -979,6 +979,20 @@ TEST(op_vocabulary) {
          * the fold back into patch rows and the re-noising. */
         "conv3d_ndhwc", "group_norm", "tconv_dw", "resize_bilinear", "patch_fold",
         "flow_renoise",
+        /* The joint image generators' (Krea 2, FLUX.3): attention over separate key bounds, a
+         * per-layer table added to every row, a learned mix of consecutive rows, and the VAE's
+         * channel statistics. */
+        "attn_cross", "table_add", "mix_rows", "chan_stats",
+        /* LTX-2's: its rotary over fractional coordinates, the per-head gate and the guided
+         * sampler step. */
+        "rope_split", "head_gate", "ltx_guide",
+        /* Its VAE's norm, resampling and patches; its vocoder's spectrogram and resampler. */
+        "pixel_norm", "d2s3d", "s2d3d", "pix_patch", "patch_pix8", "stft_logmel", "bwe_up",
+        /* Its VAE decoded in tiles: the boxes, a tile's latent, the blended stitch. */
+        "tile_grid", "tile_crop", "tile_stitch",
+        /* LTX-2.5's diffusion decoder: its rotary's voxel coordinates and its neighborhood
+         * attention. */
+        "vol_index", "attn_na3d",
     };
     for (const char* op : kOps) {
         if (!kern(op)) fprintf(stderr, "    missing op '%s'\n", op);
@@ -7063,6 +7077,188 @@ TEST(scale_rows_gates_each_row_by_its_scalar) {
     CHECK_EQ(y2.at(2), 36.0f); CHECK_EQ(y2.at(3), 48.0f);
 }
 
+/* tile_grid: diffusers' tiled_decode boxes -- a tile every `stride` latents while it starts inside
+ * the axis, `tile` long or to the edge -- one row (t, h, w, t0, y0, x0, k, count) a tile, rows past
+ * the count zero. 29 rows at stride 14 are bands of 16, 15 and 1; 16 columns are bands of 16 and
+ * 2. Under `intervals` (the diffusion decoder's _tile_intervals) an axis of `tile` cells or fewer
+ * is one band and a last band shorter than `min` joins the one before: 61 frames at 40 / 28 are
+ * [0, 40) and [28, 61); 68 rows at 96 / 88 one band; 100 columns at 96 / 88, min 13, one band
+ * of 96 and then [88, 100) is 12 < 13, merged: [0, 100). The last time band carries `tail` more. */
+TEST(tile_grid_cuts_where_tiled_decode_does) {
+    T g(RAD_I32, {3}); g.n({3, 29, 16});
+    T y(RAD_I32, {7, 8});
+    A a; a.t(g).t(y).i("M", 7).i("tile", 16).i("stride", 14);
+    CHECK_OK(run("tile_grid", a));
+    const int32_t want[7][8] = { { 3, 16, 16, 0, 0, 0, 0, 6 },   { 3, 16, 2, 0, 0, 14, 1, 6 },
+                                 { 3, 15, 16, 0, 14, 0, 2, 6 },  { 3, 15, 2, 0, 14, 14, 3, 6 },
+                                 { 3, 1, 16, 0, 28, 0, 4, 6 },   { 3, 1, 2, 0, 28, 14, 5, 6 },
+                                 { 0, 0, 0, 0, 0, 0, 0, 0 } };
+    for (int k = 0; k < 7; ++k)
+        for (int e = 0; e < 8; ++e) CHECK_EQ(y.iat(k * 8 + e), want[k][e]);
+    T g2(RAD_I32, {3}); g2.n({61, 68, 100});
+    T y2(RAD_I32, {3, 8});
+    A b; b.t(g2).t(y2).i("M", 3).i("tile", 96).i("stride", 88).s("rule", "intervals").i("min", 13)
+        .i("tile_t", 40).i("stride_t", 28).i("min_t", 6).i("tail", 8);
+    CHECK_OK(run("tile_grid", b));
+    const int32_t want2[3][8] = { { 40, 68, 100, 0, 0, 0, 0, 2 }, { 41, 68, 100, 28, 0, 0, 1, 2 },
+                                  { 0, 0, 0, 0, 0, 0, 0, 0 } };
+    for (int k = 0; k < 3; ++k)
+        for (int e = 0; e < 8; ++e) CHECK_EQ(y2.iat(k * 8 + e), want2[k][e]);
+}
+
+/* attn_na3d is attention over each query's window: on a 2 x 4 x 5 volume with a 3 x 3 x 3 window
+ * (2 in time, the axis's length), the window of the corner voxel (0, 0, 0) is shifted inward to
+ * start at (0, 0, 0), and of (1, 3, 4) to start at (0, 1, 2); against attention over exactly those
+ * keys. */
+TEST(attn_na3d_attends_the_inward_shifted_window) {
+    const int64_t Tn = 2, Hn = 4, Wn = 5, V = Tn * Hn * Wn, hd = 4;
+    auto val = [](int64_t i) { return (float)((i * 29) % 23 - 11) / 8.0f; };
+    std::vector<float> qv((size_t)(V * hd)), kv((size_t)(V * hd)), vv((size_t)(V * hd));
+    for (int64_t i = 0; i < V * hd; ++i) { qv[(size_t)i] = val(i); kv[(size_t)i] = val(i + 7); vv[(size_t)i] = val(i + 13); }
+    T q(RAD_F32, {V, hd}); q.f(qv);
+    T k(RAD_F32, {V, hd}); k.f(kv);
+    T v(RAD_F32, {V, hd}); v.f(vv);
+    T g(RAD_I32, {3}); g.n({Tn, Hn, Wn});
+    T o(RAD_F32, {V, hd});
+    A a; a.t(q).t(k).t(v).t(g).t(o).i("M", V).i("head_dim", hd).i("kt", 3).i("kh", 3).i("kw", 3)
+        .s("dtype", "f32");
+    CHECK_OK(run("attn_na3d", a));
+    struct Q { int64_t t, i, j, t0, i0, j0; };
+    for (const Q c : { Q{ 0, 0, 0, 0, 0, 0 }, Q{ 1, 3, 4, 0, 1, 2 }, Q{ 0, 2, 2, 0, 1, 1 } }) {
+        const int64_t r = (c.t * Hn + c.i) * Wn + c.j;
+        std::vector<double> sc;
+        std::vector<int64_t> keys;
+        for (int64_t a1 = c.t0; a1 < c.t0 + 2; ++a1)
+            for (int64_t b1 = c.i0; b1 < c.i0 + 3; ++b1)
+                for (int64_t c1 = c.j0; c1 < c.j0 + 3; ++c1) {
+                    const int64_t key = (a1 * Hn + b1) * Wn + c1;
+                    double d = 0;
+                    for (int64_t e = 0; e < hd; ++e) d += (double)qv[(size_t)(r * hd + e)] * kv[(size_t)(key * hd + e)];
+                    sc.push_back(d / 2.0);
+                    keys.push_back(key);
+                }
+        double mx = -1e30, sum = 0;
+        for (double x : sc) mx = std::max(mx, x);
+        for (double& x : sc) { x = std::exp(x - mx); sum += x; }
+        for (int64_t e = 0; e < hd; ++e) {
+            double want = 0;
+            for (size_t n = 0; n < keys.size(); ++n) want += sc[n] / sum * vv[(size_t)(keys[n] * hd + e)];
+            CHECK_NEAR(o.at(r * hd + e), want, 1e-5);
+        }
+    }
+}
+
+/* vol_index: a 2 x 2 x 3 volume's coordinates, component-major; voxel 7 is (1, 0, 1). */
+TEST(vol_index_writes_each_voxels_coordinates) {
+    T g(RAD_I32, {3}); g.n({2, 2, 3});
+    T y(RAD_I32, {3, 12});
+    A a; a.t(g).t(y).i("M", 12);
+    CHECK_OK(run("vol_index", a));
+    CHECK_EQ(y.iat(7), 1); CHECK_EQ(y.iat(12 + 7), 0); CHECK_EQ(y.iat(24 + 7), 1);
+    CHECK_EQ(y.iat(11), 1); CHECK_EQ(y.iat(12 + 11), 1); CHECK_EQ(y.iat(24 + 11), 2);
+}
+
+/* tile_crop copies a box out of the volume: a 2 x 3 x 4 volume of its row indices, the 1 x 2 x 2
+ * box at (1, 1, 1). */
+TEST(tile_crop_copies_the_box) {
+    T x(RAD_F32, {24, 1});
+    std::vector<float> v(24);
+    for (int i = 0; i < 24; ++i) v[(size_t)i] = (float)i;
+    x.f(v);
+    T g(RAD_I32, {3}); g.n({2, 3, 4});
+    T b(RAD_I32, {6}); b.n({1, 2, 2, 1, 1, 1});
+    T y(RAD_F32, {4, 1});
+    A a; a.t(x).t(g).t(b).t(y).i("M", 4).i("C", 1).s("dtype", "f32");
+    CHECK_OK(run("tile_crop", a));
+    CHECK_EQ(y.at(0), 17.0f); CHECK_EQ(y.at(1), 18.0f);
+    CHECK_EQ(y.at(2), 21.0f); CHECK_EQ(y.at(3), 22.0f);
+}
+
+/* tile_stitch: tiles cut from one picture stitch back to that picture's bytes (every blend mixes
+ * equal values; with an extent of 2 the weights are 0, 0.5 and 1, so exactly); and across a seam
+ * between a tile of zeros and one of ones, the first column of the right tile is the left tile's
+ * margin and the second their mean. A 5 x 5 latent grid at tile 4, stride 3, a latent 1 x 1 patch
+ * of 2 x 2 pixels: bands of 4 and 2 latents, 8 and 4 pixels, kept to 6. */
+TEST(tile_stitch_blends_as_tiled_decode_and_keeps_a_cut_picture) {
+    const int64_t H = 5, W = 5, tile = 4, stride = 3, p = 2, Hp = H * p, Wp = W * p;
+    auto band = [&](int64_t L, int64_t k) { return std::min(tile, L - k * stride); };
+    auto band_of = [](int64_t L, int64_t k, int64_t t, int64_t s) { return std::min(t, L - k * s); };
+    std::vector<float> img((size_t)(Hp * Wp));
+    for (int64_t i = 0; i < Hp * Wp; ++i) img[(size_t)i] = (float)((i * 37) % 63 - 31) / 32.0f;
+    auto store = [&](auto value) {
+        std::vector<float> v;
+        for (int64_t i = 0; i < 2; ++i)
+            for (int64_t j = 0; j < 2; ++j)
+                for (int64_t py = 0; py < band(H, i); ++py)      /* patch rows of the tile */
+                    for (int64_t px = 0; px < band(W, j); ++px)
+                        for (int64_t dx = 0; dx < p; ++dx)        /* order wh: column offset outer */
+                            for (int64_t dy = 0; dy < p; ++dy)
+                                v.push_back(value(i, j, py * p + dy, px * p + dx));
+        return v;
+    };
+    auto run_stitch = [&](const std::vector<float>& tiles, std::vector<uint8_t>* out) {
+        T x(RAD_F32, {(int64_t)tiles.size() / (p * p), p * p}); x.f(tiles);
+        T g(RAD_I32, {3}); g.n({1, H, W});
+        T f(RAD_I32, {1}); f.n({0});
+        T y(RAD_U8, {Hp, Wp});
+        A a; a.t(x).t(g).t(f).t(y).i("M", Hp).i("tile", tile).i("stride", stride).i("scale", 1)
+            .i("p", p).i("C", 1).s("dtype", "f32");
+        CHECK_OK(run("tile_stitch", a));
+        out->resize((size_t)(Hp * Wp));
+        for (int64_t i = 0; i < Hp * Wp; ++i) (*out)[(size_t)i] = y.mem[(size_t)i];
+    };
+    std::vector<uint8_t> got;
+    run_stitch(store([&](int64_t i, int64_t j, int64_t yy, int64_t xx) {
+                   return img[(size_t)((i * stride * p + yy) * Wp + j * stride * p + xx)];
+               }), &got);
+    for (int64_t i = 0; i < Hp * Wp; ++i) {
+        const float u = std::min(std::max(img[(size_t)i] / 2.0f + 0.5f, 0.0f), 1.0f);
+        CHECK_EQ((int)got[(size_t)i], (int)std::nearbyint(u * 255.0f));
+    }
+    /* Left tiles zeros, right tiles ones: row 0 is 0 to column 6, the margin (0) at 6, the mean at
+     * 7, then 1 (bytes 128, 128, 191, 255). */
+    run_stitch(store([](int64_t, int64_t j, int64_t, int64_t) { return j ? 1.0f : 0.0f; }), &got);
+    CHECK_EQ((int)got[5], 128); CHECK_EQ((int)got[6], 128);
+    CHECK_EQ((int)got[7], 191); CHECK_EQ((int)got[8], 255);
+
+    /* In time too: 4 cells of 2 frames, the first one frame (7 frames), cut at tile_t 3, stride_t 2
+     * into cells [0, 3) (frames 0..4) and [2, 4) (frames 3..6); each tile is its box of a 7-frame
+     * clip, and every frame stitches back to the clip's bytes. */
+    const int64_t nfr = 7;
+    std::vector<float> clip((size_t)(nfr * Hp * Wp));
+    for (int64_t i = 0; i < (int64_t)clip.size(); ++i) clip[(size_t)i] = (float)((i * 53) % 61 - 30) / 32.0f;
+    std::vector<float> tiles3;
+    for (int64_t kt = 0; kt < 2; ++kt) {
+        const int64_t P = kt == 0 ? 0 : 3, F = kt == 0 ? 5 : 4;
+        for (int64_t i = 0; i < 2; ++i)
+            for (int64_t j = 0; j < 2; ++j)
+                for (int64_t f = 0; f < F; ++f)
+                    for (int64_t py = 0; py < band_of(H, i, tile, stride); ++py)
+                        for (int64_t px = 0; px < band_of(W, j, tile, stride); ++px)
+                            for (int64_t dx = 0; dx < p; ++dx)
+                                for (int64_t dy = 0; dy < p; ++dy)
+                                    tiles3.push_back(clip[(size_t)(((P + f) * Hp + i * stride * p +
+                                                                    py * p + dy) * Wp +
+                                                                   j * stride * p + px * p + dx)]);
+    }
+    {
+        T x(RAD_F32, {(int64_t)tiles3.size() / (p * p), p * p}); x.f(tiles3);
+        T g(RAD_I32, {3}); g.n({4, H, W});
+        T f(RAD_I32, {1}); f.n({0});
+        T y(RAD_U8, {nfr * Hp, Wp});
+        A a; a.t(x).t(g).t(f).t(y).i("M", nfr * Hp).i("tile", tile).i("stride", stride)
+            .i("tile_t", 3).i("stride_t", 2).i("scale", 1).i("scale_t", 2).i("p", p).i("C", 1)
+            .s("dtype", "f32");
+        CHECK_OK(run("tile_stitch", a));
+        int64_t bad = 0;
+        for (int64_t i = 0; i < nfr * Hp * Wp; ++i) {
+            const float u = std::min(std::max(clip[(size_t)i] / 2.0f + 0.5f, 0.0f), 1.0f);
+            bad += (int)y.mem[(size_t)i] != (int)std::nearbyint(u * 255.0f);
+        }
+        CHECK_EQ(bad, (int64_t)0);
+    }
+}
+
 TEST(sigmoid_is_the_logistic_function) {
     T x(RAD_F32, {1, 4}); x.f({0, 100, -100, 1});
     T y(RAD_F32, {1, 4});
@@ -7749,6 +7945,7 @@ std::vector<Geo> geometries() {
         G("interleave2", "M", 4, a.i("M", R).s("dtype", "f32")),
         G("iota", "M", 4, a.i("M", R).i("start", 0).i("step", 1)),
         G("cu_repeat", "M", 3, a.i("M", R).i("mult", 2)),
+        G("int_affine", "M", 3, a.i("M", R).s("src", "0 -1 2").s("mul", "2 0 4").s("add", "-1 5 -3")),
         G("frame_store", "M", 2, a.i("M", R).i("n_codes", 4).i("stride", 6).i("rep", 2)
                                  .i("skip", 0)),
         G("rms_mod", "M", 4, a.i("M", R).i("n", 8).d("eps", 1e-6).i("gated", 1).s("dtype", "bf16")),
@@ -7784,6 +7981,35 @@ std::vector<Geo> geometries() {
         G("patch_fold", "M", 8, a.i("M", R).i("C", 3).i("pt", 1).i("ph", 2).i("pw", 2)
                                 .s("mul", "1 2 3").s("add", "0 1 2").s("dtype", "f32")),
         G("flow_renoise", "M", 3, a.i("M", R).i("n", 8).i("stream", 1).s("dtype", "f32")),
+        G("attn_cross", "M", 6, a.i("M", R).i("head_dim", 8).i("gqa", 2).i("causal", 0)
+                                .s("dtype", "f32").i("n_head", 2)),
+        G("table_add", "M", 3, a.i("M", R).i("n", 8).i("L", 3).s("dtype", "f32")),
+        G("mix_rows", "M", 3, a.i("M", R).i("n", 8).i("k", 4).s("dtype", "f32")),
+        G("chan_stats", "M", 3, a.i("M", R).i("n", 8).s("mode", "norm").s("dtype", "f32")),
+        G("rope_split", "M", 3, a.i("M", R).i("n_head", 2).i("head_dim", 8).i("dim", 16)
+                                .i("n_dims", 3).d("theta", 10000.0).s("max", "20 2048 2048")
+                                .s("dtype", "f32")),
+        G("head_gate", "M", 3, a.i("M", R).i("n_head", 2).i("head_dim", 8).s("dtype", "f32")),
+        G("ltx_guide", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
+        G("pixel_norm", "M", 4, a.i("M", R).i("n", 8).d("eps", 1e-6).s("form", "rsqrt")
+                                .i("ileave", 2).d("mult", 2.5).s("dtype", "f32")),
+        /* M 7 is a cube of side 1 and 14 one of side 2, so the zero-row call sees the volume
+         * change. */
+        G("d2s3d", "M", 7, a.i("M", R).i("C", 3).i("st", 2).i("sh", 2).i("sw", 2).s("dtype", "f32")),
+        G("s2d3d", "M", 7, a.i("M", R).i("C", 6).i("st", 1).i("sh", 1).i("sw", 1)
+                           .i("group", 2).s("mode", "mean").s("dtype", "f32")),
+        G("pix_patch", "M", 4, a.i("M", R).i("p", 2).i("C", 3).s("dtype", "f32")),
+        G("patch_pix8", "M", 4, a.i("M", R).i("p", 2).i("C", 3).s("dtype", "f32")),
+        G("stft_logmel", "M", 3, a.i("M", R).i("hop", 4).i("nfft", 8).i("n_mel", 3).i("ch", 2)
+                                 .s("dtype", "f32")),
+        G("bwe_up", "M", 6, a.i("M", R).i("ratio", 3).i("ch", 2).s("dtype", "f32")),
+        G("tile_grid", "M", 4, a.i("M", R).i("tile", 4).i("stride", 3)),
+        G("vol_index", "M", 7, a.i("M", R)),
+        G("attn_na3d", "M", 7, a.i("M", R).i("head_dim", 8).i("kt", 3).i("kh", 3).i("kw", 3)
+                               .s("dtype", "f32")),
+        G("tile_crop", "M", 7, a.i("M", R).i("C", 3).s("dtype", "f32")),
+        G("tile_stitch", "M", 100, a.i("M", R).i("tile", 4).i("stride", 3).i("scale", 2).i("p", 2)
+                                   .i("C", 3).s("dtype", "f32")),
     };
 }
 #undef G

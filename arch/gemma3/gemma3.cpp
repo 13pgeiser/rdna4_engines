@@ -867,13 +867,12 @@ static int declare_dflash2(RadBuilder* b, const RadModelMeta* meta, const RadBui
     dw.ds      = decl_b(b, nm.f("df_ds"),   RAD_F32, {sr, 1});
     dw.dsum    = decl_b(b, nm.f("df_dsum"), RAD_F32, {dg.n_embd / 128, spad});
     dw.dlog    = decl_b(b, nm.f("df_dlog"), dg.act_dtype, {sr, Dflash2::head_rows(dg)});
-    /* Rescoring against the trunk's head needs logit_rerank to read its rows; RADIANCE_G3_DF_RERANK=0
-     * keeps the coarse head's scores. */
+    /* Candidates are rescored against the trunk's head when logit_rerank can read its rows (fp8
+     * or int8) and every candidate a rank proposes is one it owns; the planes are then kRerankR
+     * wide and the selector reads the first sel_topk. */
     {
-        const char* rr = std::getenv("RADIANCE_G3_DF_RERANK");
         const uint32_t hd = weight_codes_dtype(b, nm.f("output.weight"), RAD_BF16);
-        if (!(rr && rr[0] == '0') && (hd == RAD_F8E4M3 || hd == RAD_I8) &&
-            (Dflash2::head_sharded(dg) || dg.world <= 1)) {
+        if ((hd == RAD_F8E4M3 || hd == RAD_I8) && (Dflash2::head_sharded(dg) || dg.world <= 1)) {
             m.df.w_lm  = m.w_lm;
             m.df.top_w = Dflash2::kRerankR;
         }

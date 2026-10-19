@@ -1043,6 +1043,36 @@ TEST(a_dotted_integer_is_an_index_as_in_jinja2) {
     CHECK_EQ(p.prompt, std::string("hi|assistant"));
 }
 
+/* A template that takes one system message, first, as many do, against conversations the Chat
+ * Completions API allows: a system message after a user turn, and two at the head. They are
+ * rendered with the system messages merged, in order, into one at the head (#137). Any other
+ * refusal comes back in the template's own words, without the parser-generation wrapper. */
+TEST(system_messages_a_template_takes_only_first_are_merged_at_the_head) {
+    ChatTemplate t;
+    CHECK_OK(t.load(
+        "{%- for m in messages %}"
+        "{%- if m.role == 'system' and not loop.first %}"
+        "{{- raise_exception('System message must be at the beginning.') }}{%- endif %}"
+        "{%- if m.role == 'user' and m.content == 'boom' %}{{- raise_exception('no boom') }}{%- endif %}"
+        "<{{ m.role }}>{{ m.content }}</{{ m.role }}>"
+        "{%- endfor %}{%- if add_generation_prompt %}<assistant>{% endif %}", "", ""));
+    ChatOptions opt;
+    opt.quiet = true;
+    auto render = [&](const json& msgs, ChatPrompt* p) { return t.apply(msgs, json(), opt, p); };
+    ChatPrompt a, b, c, d;
+    CHECK_OK(render(json::parse(R"([{"role":"system","content":"s"},{"role":"user","content":"hi"}])"), &a));
+    CHECK_EQ(a.prompt, std::string("<system>s</system><user>hi</user><assistant>"));
+    CHECK_OK(render(json::parse(R"([{"role":"user","content":"hi"},{"role":"system","content":"s"}])"), &b));
+    CHECK_EQ(b.prompt, std::string("<system>s</system><user>hi</user><assistant>"));
+    CHECK_OK(render(json::parse(R"([{"role":"system","content":"s1"},{"role":"system",
+        "content":[{"type":"text","text":"s2"}]},{"role":"user","content":"hi"}])"), &c));
+    CHECK_EQ(c.prompt, std::string("<system>s1\n\ns2</system><user>hi</user><assistant>"));
+    CHECK(render(json::parse(R"([{"role":"system","content":"s"},{"role":"user","content":"boom"}])"),
+                 &d) < 0);
+    CHECK(d.error.find("no boom") != std::string::npos);
+    CHECK(d.error.find("Unable to generate parser") == std::string::npos);
+}
+
 /* Unparseable Jinja (common in hand-built containers) is reported at load time as an error value;
  * a throw would cross the bringup path. */
 TEST(a_template_that_does_not_parse_is_a_value_and_not_a_throw) {

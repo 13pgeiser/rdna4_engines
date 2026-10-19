@@ -219,11 +219,12 @@ ARG TEST_EXCLUDE=
 #       ctest --test-dir /build -L gpu --output-on-failure
 # Tests run TEST_JOBS at a time, else JOBS (default one per two hardware threads, about one per
 # core on an SMT machine: the per-binary CPU budgets in tests/CMakeLists.txt hold for tests that do
-# not share a core); the `perf` entries, which assert wall-clock costs, run alone (RUN_SERIAL). The build
-# sandbox forbids io_uring, so avx_check skips its file-backed gather case, and perf_event_open, so
-# the tests that bound work count CPU time rather than instructions (tests/work_counter.h). The
-# `oot` suite (every shipped plugin rebuilt against the installed package) repeats this stage's
-# whole compile, so it runs from the development tree instead (tests/oot_plugins.sh).
+# not share a core); the `perf` entries, which assert wall-clock costs, run alone (RUN_SERIAL). The
+# build sandbox forbids io_uring, so avx_check skips its file-backed gather case, and
+# perf_event_open, so the tests that bound work count CPU time rather than instructions
+# (tests/work_counter.h). The `oot` suite (every shipped plugin rebuilt against the installed
+# package) repeats this stage's whole compile, so it runs from the development tree instead
+# (tests/oot_plugins.sh).
 RUN echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
     bash /src/docker/llvm-check.sh /build \
  && RAD_TEST_CPU_BUDGET_SCALE="${TEST_CPU_BUDGET_SCALE}" \

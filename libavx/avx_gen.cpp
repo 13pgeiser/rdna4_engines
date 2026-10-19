@@ -325,21 +325,27 @@ AVX_KERNEL(ln_mod_quant_fp8) {
 /* Both forms: with `gated` the branch added through the gate row (no tanh) and the residual stored
  * in x's dtype; then n1 = rd(x rsqrt(mean(x^2) + eps)), n2 = rd(n1 w), m = rd(n2 rd(1 + scale)),
  * z = rd(m + shift), rd the norm chain's dtype (z's for rms_mod, bf16 for the quantised form,
- * libref's rule). The sum of squares is the vector reduction, held to the tolerance table; every
+ * libref's rule); `norm` none takes n2 = x. The sum of squares is the vector reduction, held to the tolerance table; every
  * rounding is a pass through the stored dtype, so the rest is libref's arithmetic. The per-entry
  * rows (1 + scale rounded, the shift and the gate) and the gain are built once a launch. */
 static int rms_mod_run(const RadArgs* a, bool quant) {
     if (a->n_t < (quant ? 9 : 7)) return RAD_E_INVAL;
-    const RadTensor *Yv = rad_arg_in(a, 0), *G = rad_arg_in(a, 1), *S = &a->t[2], *W = &a->t[3];
+    const RadTensor *Yv = rad_arg_in(a, 0), *G = rad_arg_in(a, 1), *S = &a->t[2];
+    const RadTensor* W = rad_arg_in(a, 3);
     const RadTensor *cu = &a->t[4], *X = &a->t[5];
     const RadTensor *Q = quant ? &a->t[6] : nullptr, *SC = quant ? &a->t[7] : nullptr;
     const RadTensor* Z = quant ? rad_arg_in(a, 8) : &a->t[6];
     const int64_t n = p_int(a, "n", 0), grp = quant ? p_int(a, "group", 0) : 1;
     const bool gated = p_int(a, "gated", 0) != 0;
     const float eps = p_f32(a, "eps", 1e-6f);
+    const float wadd = p_f32(a, "wadd", 0.0f);
+    const bool once = p_int(a, "norm_once", 0) != 0;
+    const char* nk = p_str(a, "norm", "rms");
+    const bool layer = std::strcmp(nk, "layer") == 0, none = std::strcmp(nk, "none") == 0;
+    if ((!layer && !none && std::strcmp(nk, "rms") != 0) || (none && W)) return RAD_E_INVAL;
     if (n <= 0 || grp <= 0 || n % grp || (gated && (!Yv || !G))) return RAD_E_SHAPE;
     const int64_t rows = rows_of(quant ? Q : Z, n), n_seq = numel(cu) - 1, ngrp = n / grp;
-    if (rows <= 0 || n_seq <= 0 || rows_of(X, n) < rows || numel(W) < n ||
+    if (rows <= 0 || n_seq <= 0 || rows_of(X, n) < rows || (W && numel(W) < n) ||
         numel(S) < n_seq * 2 * n)
         return RAD_E_SHAPE;
     if (gated && (rows_of(Yv, n) < rows || numel(G) < n_seq * n)) return RAD_E_SHAPE;
@@ -359,7 +365,8 @@ static int rms_mod_run(const RadArgs* a, bool quant) {
                 row[n + i] = ldt(S, e * s_rs + i * s_cs);
                 if (gated) row[2 * n + i] = ldt(G, e * g_rs + i * g_cs);
             }
-        for (int64_t i = 0; i < n; ++i) tabs[n_seq * tw + i] = ldt(W, i * laststride(W));
+        for (int64_t i = 0; i < n; ++i)
+            tabs[n_seq * tw + i] = W ? ldt(W, i * laststride(W)) + wadd : 1.0f;
     }
     const float* wrow = tabs + n_seq * tw;
 
@@ -380,13 +387,23 @@ static int rms_mod_run(const RadArgs* a, bool quant) {
         } else {
             std::memcpy(v, xv, (size_t)n * sizeof(float));
         }
-        const float rs = 1.0f / std::sqrt(row_sumsq(v, n) / (float)n + eps);
+        if (layer) {
+            /* Centred first, the mean an f32 sum in ascending order (libref's). */
+            float mu = 0.0f;
+            for (int64_t k = 0; k < n; ++k) mu += v[k];
+            mu /= (float)n;
+            for (int64_t k = 0; k < n; ++k) v[k] -= mu;
+        }
+        /* `none`: no norm, the residual as it is (libref's n2 = x). */
+        const float rs = none ? 1.0f : 1.0f / std::sqrt(row_sumsq(v, n) / (float)n + eps);
         const vf vr = vf_set1(rs);
         int64_t i = 0;
         for (; i + VF_N <= n; i += VF_N) vf_storeu(o + i, vf_mul(vf_loadu(v + i), vr));
         for (; i < n; ++i) o[i] = v[i] * rs;
-        narrow_row(dt, o, n, tmp);
-        mul_rows(o, wrow, n);
+        if (W) {
+            if (!once) narrow_row(dt, o, n, tmp);
+            mul_rows(o, wrow, n);
+        }
         narrow_row(dt, o, n, tmp);
         mul_rows(o, ent, n);
         narrow_row(dt, o, n, tmp);
@@ -424,7 +441,9 @@ AVX_KERNEL(timestep_embed) {
     for (int64_t i = 0; i < h; ++i) f[i] = sc_exp(coef * (float)i / (float)h);
     for (int64_t m = 0; m < rows; ++m) {
         const float tv = ldt(T, offlin(T, m));
-        const float tt = round ? scale * narrow1(RAD_BF16, narrow1(RAD_BF16, tv * scale) / scale)
+        const float tt = round == 3 ? narrow1(RAD_BF16, scale * narrow1(RAD_BF16, tv))
+                       : round == 2 ? scale * narrow1(RAD_BF16, tv)
+                       : round ? scale * narrow1(RAD_BF16, narrow1(RAD_BF16, tv * scale) / scale)
                                : scale * tv;
         for (int64_t i = 0; i < h; ++i) {
             const float arg = tt * f[i];
@@ -553,14 +572,15 @@ AVX_KERNEL(randn_lanes) {
  *   x'  = bf16(x + bf16(bf16(sigma_next - sigma) * v'))
  *
  * flag 4 writes x - sigma v' to the lane's preview, and flag 2 restores the kept region,
- * x' = bf16(m x' + (1 - m)((1 - sigma_next) src + sigma_next noise)). libref requires every
- * operand, the optional three included. Every entry is checked before any lane is written. */
+ * x' = bf16(m x' + (1 - m)((1 - sigma_next) src + sigma_next noise)). inp, mask and preview are
+ * optional, as in libref: an entry whose flags need one that is absent is refused. Every entry is
+ * checked before any lane is written. */
 AVX_KERNEL(flow_euler) {
-    if (!rad_args_have(a, 13)) return RAD_E_INVAL;
+    if (!rad_args_have(a, 9) || !rad_arg_in(a, 11)) return RAD_E_INVAL;
     const RadTensor *V = &a->t[0], *sg = &a->t[1], *sgn = &a->t[2], *cfg = &a->t[3];
     const RadTensor *pair = &a->t[4], *lane = &a->t[5], *fl = &a->t[6], *seed = &a->t[7];
-    const RadTensor *cu = &a->t[8], *inp = &a->t[9], *mask = &a->t[10], *st = &a->t[11];
-    const RadTensor* pv = &a->t[12];
+    const RadTensor *cu = &a->t[8], *inp = rad_arg_in(a, 9), *mask = rad_arg_in(a, 10);
+    const RadTensor *st = &a->t[11], *pv = rad_arg_in(a, 12);
     const int64_t n = p_int(a, "n", 0), stride = p_int(a, "stride", 0);
     if (n <= 0 || stride <= 0) return RAD_E_SHAPE;
     const int64_t n_seq = numel(cu) - 1, st_rows = rows_of(st, n), v_rows = rows_of(V, n);
@@ -576,6 +596,8 @@ AVX_KERNEL(flow_euler) {
         if (len > 0 && (b0 < 0 || b0 + len > v_rows)) return RAD_E_SHAPE;
         if (pr >= 0 && len > 0 && (cu_at(cu, pr) < 0 || cu_at(cu, pr) + len > v_rows))
             return RAD_E_SHAPE;
+        const int64_t f = ldi(fl, offlin(fl, e));
+        if (((f & kInpaint) && (!inp || !mask)) || ((f & kPreview) && !pv)) return RAD_E_INVAL;
     }
     const uint32_t dt = st->dtype;
     for (int64_t e = 0; e < n_seq; ++e) {
@@ -776,8 +798,11 @@ AVX_KERNEL(conv2d_nhwc) {
     const int64_t Ho = Y->shape[0], Wo = Y->shape[1] / cout;
     if (Hin <= 0 || Win <= 0 || Ho <= 0 || Wo <= 0) return RAD_E_SHAPE;
     const int64_t Hv = Hin * up, Wv = Win * up;
-    const int64_t pt = down ? 0 : k / 2, pb = down ? 1 : k / 2;
-    if ((Hv + pt + pb - k) / stride + 1 != Ho || (Wv + pt + pb - k) / stride + 1 != Wo)
+    /* `causal` pads k - 1 rows above and none below (libref's). */
+    const bool causal = pad && !std::strcmp(pad, "causal");
+    const int64_t pt = down ? 0 : causal ? k - 1 : k / 2, pb = down ? 1 : causal ? 0 : k / 2;
+    const int64_t pl = down ? 0 : k / 2, pr = down ? 1 : k / 2;
+    if ((Hv + pt + pb - k) / stride + 1 != Ho || (Wv + pl + pr - k) / stride + 1 != Wo)
         return RAD_E_SHAPE;
     if (numel(W) < cout * cin * k * k || numel(B) < cout) return RAD_E_SHAPE;
     const int64_t xr = X->stride[0], yr = Y->stride[0];
@@ -855,7 +880,7 @@ AVX_KERNEL(conv2d_nhwc) {
                 for (int64_t kh = 0; kh < k; ++kh) {
                     const int64_t iy = oy * stride + kh - pt;
                     for (int64_t kw = 0; kw < k; ++kw) {
-                        const int64_t ix = ox * stride + kw - pt;
+                        const int64_t ix = ox * stride + kw - pl;
                         char* d = dst + (size_t)((kh * k + kw) * cin) * ael;
                         if (iy < 0 || iy >= Hv || ix < 0 || ix >= Wv) {
                             std::memset(d, 0, (size_t)cin * ael);
@@ -1184,5 +1209,87 @@ AVX_KERNEL(scatter_add_rows) {
     }
     AVX_PARALLEL_FOR_IF(M * n >= AVX_PAR_MIN)
     for (int64_t m = 0; m < M; ++m) add_row(m);
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ table_add */
+/* libref's table_add: y[r, l n + c] = x[r, c] + t[l, c], f32 sum rounded once to y's dtype. */
+AVX_KERNEL(table_add) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *T = &a->t[1], *Y = &a->t[2];
+    const int64_t n = p_int(a, "n", 0), L = p_int(a, "L", 0);
+    if (n <= 0 || L <= 0 || numel(T) < L * n) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(Y, L * n);
+    if (rows <= 0 || rows_of(X, n) < rows) return RAD_E_SHAPE;
+    AVX_PARALLEL_FOR_IF(rows * L * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        float* buf = scratch_f32((size_t)(3 * n + 64));
+        float *xs = buf, *ts = buf + n + 16, *p = ts + n + 16;
+        const float* xv = in_row(X, rowoff(X, r, n), n, xs);
+        for (int64_t l = 0; l < L; ++l) {
+            const float* tv = in_row(T, l * n * laststride(T), n, ts);
+            for (int64_t c = 0; c < n; ++c) p[c] = xv[c] + tv[c];
+            out_row(Y, rowoff(Y, r, L * n) + l * n * laststride(Y), n, p);
+        }
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ mix_rows */
+/* libref's mix_rows: y[r, c] = sum_i w[i] x[r k + i, c], f32 in ascending i, rounded once. */
+AVX_KERNEL(mix_rows) {
+    if (!rad_args_have(a, 3)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *W = &a->t[1], *Y = &a->t[2];
+    const int64_t n = p_int(a, "n", 0), k = p_int(a, "k", 0);
+    if (n <= 0 || k <= 0 || numel(W) < k) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(Y, n);
+    if (rows <= 0 || rows_of(X, n) < rows * k) return RAD_E_SHAPE;
+    std::vector<float> w((size_t)k);
+    for (int64_t i = 0; i < k; ++i) w[(size_t)i] = ldt(W, i * laststride(W));
+    AVX_PARALLEL_FOR_IF(rows * n * k >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        float* buf = scratch_f32((size_t)(2 * n + 64));
+        float *xs = buf, *acc = buf + n + 16;
+        for (int64_t c = 0; c < n; ++c) acc[c] = 0.0f;
+        for (int64_t i = 0; i < k; ++i) {
+            const float* xv = in_row(X, rowoff(X, r * k + i, n), n, xs);
+            for (int64_t c = 0; c < n; ++c) acc[c] += w[(size_t)i] * xv[c];
+        }
+        out_row(Y, rowoff(Y, r, n), n, acc);
+    }
+    return RAD_OK;
+}
+
+/* ------------------------------------------------------------------ chan_stats */
+/* libref's chan_stats: per-channel statistics held as weights, every step rounded as libref. */
+AVX_KERNEL(chan_stats) {
+    if (!rad_args_have(a, 4)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *Mn = &a->t[1], *Sd = &a->t[2], *Y = &a->t[3];
+    const int64_t n = p_int(a, "n", 0);
+    const bool var = p_int(a, "var", 0) != 0;
+    const float eps = p_f32(a, "eps", 0.0f);
+    const char* mode = p_str(a, "mode", "denorm");
+    const bool norm = std::strcmp(mode, "norm") == 0;
+    if (!norm && std::strcmp(mode, "denorm") != 0) return RAD_E_INVAL;
+    if (n <= 0 || numel(Mn) < n || numel(Sd) < n) return RAD_E_SHAPE;
+    const int64_t rows = rows_of(Y, n);
+    if (rows <= 0 || rows_of(X, n) < rows) return RAD_E_SHAPE;
+    const uint32_t dt = Y->dtype;
+    std::vector<float> mu((size_t)n), sd((size_t)n);
+    for (int64_t c = 0; c < n; ++c) {
+        mu[(size_t)c] = narrow1(dt, ldt(Mn, c * laststride(Mn)));
+        const float v = ldt(Sd, c * laststride(Sd));
+        sd[(size_t)c] = narrow1(dt, var ? std::sqrt(v + eps) : v);
+    }
+    AVX_PARALLEL_FOR_IF(rows * n >= AVX_PAR_MIN)
+    for (int64_t r = 0; r < rows; ++r) {
+        float* buf = scratch_f32((size_t)(2 * n + 32));
+        float *xs = buf, *o = buf + n + 16;
+        const float* xv = in_row(X, rowoff(X, r, n), n, xs);
+        for (int64_t c = 0; c < n; ++c)
+            o[c] = norm ? narrow1(dt, narrow1(dt, xv[c] - mu[(size_t)c]) / sd[(size_t)c])
+                        : narrow1(dt, narrow1(dt, xv[c] * sd[(size_t)c]) + mu[(size_t)c]);
+        out_row(Y, rowoff(Y, r, n), n, o);
+    }
     return RAD_OK;
 }

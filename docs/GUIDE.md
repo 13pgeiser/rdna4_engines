@@ -276,9 +276,13 @@ and runs.
 | `lfm2_bf16` | LiquidAI LFM2 and LFM2-VL in bf16, including d1 (§5.13) |
 | `embgemma2` | EmbeddingGemma 2, an embedding model (§5.6) |
 | `qwenimage21` | Qwen-Image 2.1 and 2.1-Turbo, an image model (§5.6) |
+| `krea2` | Krea 2 Raw and Turbo, an image model from text (§5.6) |
+| `flux3`, `flux3distilled` | FLUX.3 [klein] and its base, an image model that also edits (§5.6); one plugin under the two names the releases give themselves |
 | `qwen3asr_bf16` | Qwen3-ASR, speech to text from the checkpoint as it ships (§5.14) |
 | `minimaxmusic3` | MiniMax-Music3, songs from a description and lyrics (§5.15) |
 | `breeze` | Breeze-TTS-2, speech from text and an optional description of the voice (§5.15) |
+| `minimaxh3` | MiniMax-H3 and FastH3, video with its stereo soundtrack from text (§5.16) |
+| `ltx2` | LTX-2.5, video with its stereo soundtrack from text or a first frame (§5.16) |
 
 **4. Falling back to the reference library is fatal.** If any op resolves to `libref`, the engine
 refuses to start and names the ops, because serving from it is orders of magnitude slower with nothing
@@ -392,6 +396,27 @@ rad-convert /srv/models/Qwen/Qwen-Image-2.1 -o qwen-image-2.1-fp8.rad \
     --recipe data/recipes/qwen-image-2.1-fp8.recipe
 rad-convert /srv/models/Qwen/Qwen-Image-2.1-Turbo -o qwen-image-2.1-turbo-fp8.rad \
     --recipe data/recipes/qwen-image-2.1-fp8.recipe
+
+# Krea 2 Raw or Turbo, and FLUX.3 [klein] or its base, image models (§5.6): the diffusers pipeline
+# directory; fp8 blocks for the text encoder and the DiT. Krea 2 takes a recipe either way (or
+# krea-2-bf16.recipe), since the release stores its embedders and modulations f32
+rad-convert /srv/models/krea/Krea-2-Turbo -o krea-2-turbo-fp8.rad \
+    --recipe data/recipes/krea-2-fp8.recipe
+rad-convert /srv/models/black-forest-labs/flux-3-image-klein -o flux-3-klein-fp8.rad \
+    --recipe data/recipes/flux-3-klein-fp8.recipe
+
+# LTX-2.5, video with sound (§5.16): the diffusers pipeline directory, latent_upsampler/ included
+# for the distilled release's two-stage recipe; fp8 blocks for the text encoder, the connectors and
+# the DiT, or bf16 (both recipes keep the vocoders f32, which they run in)
+rad-convert /srv/models/Lightricks/LTX-2.5-Diffusers -o ltx-2.5-fp8.rad \
+    --recipe data/recipes/ltx-2.5-fp8.recipe
+# Its full (SFT) DiT, transformer_full/, is guided and takes the base schedule back: a folder whose
+# transformer/ links to it, and the scheduler's shifting turned on as the release's README does
+mkdir ltx-2.5-full && ln -s /srv/models/Lightricks/LTX-2.5-Diffusers/* ltx-2.5-full/
+rm ltx-2.5-full/transformer ltx-2.5-full/transformer_full
+ln -s /srv/models/Lightricks/LTX-2.5-Diffusers/transformer_full ltx-2.5-full/transformer
+rad-convert ltx-2.5-full -o ltx-2.5-full-fp8.rad --recipe data/recipes/ltx-2.5-fp8.recipe \
+    --set scheduler.use_dynamic_shifting=1 --set scheduler.shift_terminal=0.1
 
 # MiniMax-Music3, songs (§5.15): the diffusers pipeline directory is the checkpoint (language model,
 # depth decoder, condition encoder, DiT, vocoder, tokenizer); bf16 throughout (21 GB, one card or two)
@@ -729,9 +754,10 @@ are first-seen, so steps wait on the drive. `ram` copies the table into host mem
 so a step has no host work. `vram` puts all of it on every card. `ram` needs the table's size free
 after the pinned host pools and the prefix cache's host tier, with `--host-headroom-mib` to spare
 (default 4 GiB), under every memory cgroup the process sits in, and refuses the start otherwise.
-`auto` takes the first of `vram`, `ram` and `disk` that holds the table. Without a device kernel for the gather (no libr4d) the table is
-read on the host: `vram` is refused, and `ram` is a copy in locked huge pages, which also needs a
-memlock limit that large (`--ulimit memlock=-1` in Docker, `LimitMEMLOCK=infinity` under systemd).
+`auto` takes the first of `vram`, `ram` and `disk` that holds the table. Without a device kernel
+for the gather (no libr4d) the table is read on the host: `vram` is refused, and `ram` is a copy in
+locked huge pages, which also needs a memlock limit that large (`--ulimit memlock=-1` in Docker,
+`LimitMEMLOCK=infinity` under systemd).
 
 **`--weights-disk-tier`** serves a model larger than the card and the host pool together, with every
 step paced by the drive. A routed expert that fits neither lives only in the container. Before each
@@ -792,8 +818,10 @@ widths.
 `fp8_v4` and `k6_v4` narrow the trunk's attention cache further, in groups of 32 dimensions with an
 f16 scale each: `fp8_v4` keeps K in E4M3 and stores V as int4, `k6_v4` stores K as int6 too. A token
 then costs 25/32 or 22/32 of what fp8 costs, and a drafter's cache stays fp8. libr4d has their
-kernels for Qwen3.8-27B's attention (head_dim 256, gqa 6), so the plugin offers them there and the
-server refuses them, naming the plugin, anywhere else. On two R9700s at the serve flags of
+kernels for Qwen3.8-27B's attention (head_dim 256, gqa 6) and Qwen3.8-Flash-Next's (head_dim 256,
+gqa 12 over 4-token pages, gqa 6 a rank at four ranks), so `qwen35_fp8` and `qwen4exp_fp8` offer
+them there and the server refuses them, naming the plugin, anywhere else. Flash-Next's QSA indexer
+keeps its own key cache, so its share of a token does not shrink. On two R9700s at the serve flags of
 `qwen3.8-27b-mxfp4.yaml` with `--max-num-batched-tokens 2048` and 12 GiB a card left to another
 engine, against the bf16 model on 17 long log-analysis documents (60 368 scored positions):
 
@@ -1229,6 +1257,13 @@ radiance --model m.rad --chat-template-kwargs @template-vars.json
   startup with the template's message.
 - `/tokenize` renders `messages` with the same variables.
 
+**System messages.** Many templates raise unless a conversation has one system message, first; the
+Chat Completions API allows any number anywhere. A conversation the template refuses that has a
+system message after the first message, or more than one, is rendered again with its system
+messages merged, in order and separated by a blank line, into one at the head; the first such
+request logs a warning. Anything else a template refuses is a 400 on `messages` in the template's
+own words.
+
 **`--reasoning-effort`** is the default for chat requests that set none, passed to the chat template
 verbatim, so the legal set is the template's. Qwen3.8 takes `xhigh|medium|low` and defaults to
 `xhigh`, which on a short task can spend the whole token budget inside `<think>` and return empty
@@ -1345,7 +1380,7 @@ still verified by the adapter, so output is exact and only the acceptance rate c
 | flag | default | |
 |---|---|---|
 | `--gpu-headroom-mib N` | 96 | VRAM left unclaimed on every card |
-| `--kv-cache-dtype T` | bf16 | `bf16`, `fp8`, or on Qwen3.8-27B `fp8_v4` or `k6_v4` (§4.4) |
+| `--kv-cache-dtype T` | bf16 | `bf16`, `fp8`, or on Qwen3.8-27B and Qwen3.8-Flash-Next `fp8_v4` or `k6_v4` (§4.4) |
 | `--host-pool-mib N` | 0 | pinned host tier (weights) |
 | `--host-headroom-mib N` | 4096 | host RAM left free for the system when startup pins host memory — kept for the unpooled allocations, staging and page cache (§4.3) |
 | `--embedding-placement WHERE` | ram | `ram` or `vram`: the token embedding pinned in host memory beside `--host-pool-mib` and read in place, or on the card (§4.3) |
@@ -1721,7 +1756,7 @@ becomes up to 280 tokens by default (`--image-tokens`, or a request's `image_tok
 `document`, `Retrieval-query`, `STS`, ...) and applies to text and content-part inputs; a model that
 states a default prompt applies it when the request names none.
 
-**An image model** (Qwen-Image 2.1 or 2.1-Turbo) serves OpenAI's images API only; completions, chat
+**An image model** (Qwen-Image 2.1 or 2.1-Turbo, Krea 2, FLUX.3 [klein]) serves OpenAI's images API only; completions, chat
 and embeddings answer 501. OpenAI images clients (Open WebUI, the OpenAI SDKs) work unchanged; the
 picture always comes back in the response. The engine sizes the step, batch and context for an image
 model itself (`--max-num-batched-tokens` and `--max-model-len` from the model's largest pass,
@@ -1784,6 +1819,15 @@ area (its latent rows replace its vision tokens). One card holds the fp8 contain
 20256 rows: four pictures with their prompt. Two cards hold all ten the model takes, and the bf16
 container. A request the cache can never hold is a 400 naming the rows it needed. The models are
 under Qwen's research license, non-commercial.
+
+**Krea 2 and FLUX.3 [klein]** take the same fields with their own defaults. Both make RGB pictures
+(`background: transparent` is a 400), 1024x1024 by default, sides rounded down to multiples of 16,
+up to 2048x2048 (16384 latent tokens). Krea 2 Raw runs 28 steps at guidance 4.5 against an empty
+negative prompt and Turbo 8 steps unguided; Krea 2 reads only text, so `/v1/images/edits` answers
+501. FLUX.3 [klein] runs 16 steps unguided and its base 50 at guidance 3.5; both edit from up to ten
+pictures, each shrunk to 1024x1024 of area when larger. The guidance scale is `guidance_scale` or
+`true_cfg_scale` (one of them), in the model card's terms. FLUX.3's pipeline can rewrite a prompt
+with a separate language model first; radiance reads the prompt as given.
 
 ### 5.7 Request fields
 
@@ -1912,8 +1956,12 @@ llama-server (`chat_template_kwargs`, `top_k`, ...). The answer is a response ob
 stream with every event's `output_index`, `content_index` and `sequence_number`, opening with
 `response.created` and `response.in_progress` at once, as OpenAI's and vLLM's do: they report the
 response object, not output. A reply cut at
-`max_output_tokens` is `incomplete`. Function tools are offered to the model; built-in tools (web
-search, file search, computer use) and freeform custom tools are left out, as in llama-server.
+`max_output_tokens` is `incomplete`. Function tools are offered to the model, and so are the
+function tools a `namespace` groups (Codex sends every MCP server's tools that way), named
+`<namespace>__<name>`: the reply's `function_call` item carries `namespace` and `name` apart, and a
+`function_call` input item or a `tool_choice` naming a namespace is joined back the same way. Two
+tools that would share a name are refused. Built-in tools (web search, file search, computer use)
+and freeform custom tools are left out, as in llama-server.
 Responses are not stored, so `previous_response_id` is refused: send the conversation as `input`.
 What a response object cannot carry is refused: `n` other than 1, and logprobs (`include` naming
 `message.output_text.logprobs`, `top_logprobs`, `logprobs`, `n_probs`), which
@@ -2362,7 +2410,7 @@ and the session goes on.
 
 ### 5.16 Video: `/v1/videos`
 
-A video generation model (MiniMax-H3) answers OpenAI's video jobs: `POST /v1/videos` queues a video
+A video generation model (MiniMax-H3, LTX-2.5) answers OpenAI's video jobs: `POST /v1/videos` queues a video
 with its stereo soundtrack and answers at once with the video object; `GET /v1/videos/{id}` reports
 its `status` (`queued`, `in_progress`, `completed`, `failed`) and `progress` (0 to 100);
 `GET /v1/videos/{id}/content` downloads the MP4 once it is completed (`?variant=thumbnail` gives the
@@ -2427,6 +2475,54 @@ The MP4 holds H.264 video (yuv420p, BT.709) and AAC audio at 32 kHz stereo. A fi
 for an hour (`expires_at`), at most 32 of them. MiniMax-H3's license excludes use in the EU, the UK,
 the Republic of Korea and the USA without a separate license from MiniMax.
 
+**LTX-2.5** takes the same jobs with its own limits, and starts from a picture as well as from text:
+
+```sh
+radiance --model ltx-2.5-fp8.rad --vision-tower-placement ram
+
+# image to video: the picture is the first frame (a file in the form, or a data: URL in JSON)
+curl -s http://localhost:8000/v1/videos -F 'prompt=the fox turns and runs into the trees' \
+  -F 'size=768x512' -F 'seconds=5' -F 'input_reference=@fox.png'
+```
+
+- **`prompt`** is read as written (no template), at most 1024 tokens; **`negative_prompt`** is
+  what guidance steers away from, empty by default.
+- **`seconds`** is rounded up to steps of 8 frames at 24 a second, from 17 frames (0.71 s) to 161
+  (6.7 s). Left out (or `"auto"`), the release's duration head chooses the length the prompt
+  implies, as diffusers does when `num_frames` is omitted: its prediction held to 1 to 20 seconds,
+  rounded to frames and down to the 8-frame steps, then to the 161 frames this server makes. The
+  video object says `"seconds": "auto"` until the prompt is read, then the length chosen. A
+  container without the head makes 121 frames (5.04 s). **`size`**: both sides multiples of 32 from 256, at most
+  1920 x 1088 pixels of area, at most 3:1; 960x544 by default, the release's own. A step carries at
+  most 121 frames at 1920x1088 (a longer video at that size is refused). Up to 960 x 544 of area
+  the VAE decodes each frame whole, as the pipeline does by default; a larger frame is decoded in
+  diffusers' tiles (`vae.enable_tiling()`: 512 pixels every 448) and blended where they overlap,
+  as the release's two-stage README does at 1920x1088.
+- **`input_reference`** is the first frame, resized and cropped to `size` and put through H.264
+  at CRF 18 first, as the model was trained.
+- **`decoder`** picks how the latents become frames: `vae` (the default, the convolutional VAE that
+  diffusers' LTX2Pipeline decodes with) or `diffusion`, the release's diffusion decoder (the
+  README's "Decode with the diffusion decoder"): four stages of neighborhood-attention blocks, then
+  one denoising step from noise over 4 x 4 pixel patches, run in its own tiles (768 pixels every
+  704, 80 frames every 56) as diffusers' `enable_tiling()` runs it. It draws its noise from the
+  request's seed, so a seed repeats its video. Frames of at most 960 x 544 of area.
+- The base model runs 30 steps (`num_inference_steps`, at most 64), each up to four evaluations:
+  **`guidance_scale`** against the negative prompt, **`stg_scale`** against the model with block
+  28's self-attentions bypassed, **`modality_scale`** against the model without its cross-modal
+  attentions, and **`guidance_rescale`**, by default 3, 1, 3 and 0.7 for the video. The
+  soundtrack's own four are the same fields prefixed `audio_` (7, 1, 3, 0.7). A scale of 1 (0 for
+  `stg_scale`) drops its evaluation, so `{"guidance_scale": 1, "stg_scale": 0, "modality_scale":
+  1, ...}` runs one evaluation a step.
+- The distilled release runs its 8 trained steps unguided, and only those; with its latent
+  upsampler in the container, **`latent_upscale`** 2 (sides multiples of 64) runs them at half the
+  size, enlarges the clean latent, re-noises it and refines at the full size in 3 more. `size` is
+  the output's: the release's README recipe is `"size": "1920x1088", "latent_upscale": 2` (its first
+  stage at 960x544).
+
+The MP4's soundtrack is 48 kHz stereo. LTX-2.5 runs on one card; `--tp` above 1 is refused. Its
+Gemma 4 text encoder (13 GiB in fp8) does not fit a 32 GB card beside the DiT: serve it with
+`--vision-tower-placement ram`, which keeps it in pinned host memory and reads it once a prompt.
+
 ## 6. Operation
 
 ### 6.1 The dashboard
@@ -2464,18 +2560,13 @@ take twice as long as its neighbour — so nothing is compared until 32 have bee
 averaged. A single slow step moves neither figure.
 
 The percentage, `now X% of best`, is the page's own live window read against the
-floor. `now` is the mean of the steps that completed in the last poll (~500 ms);
-the figure is that mean as a fraction of `best`, so ~99% is the fastest the lane
-has done and anything slower reads a percentage of it (a step at 80% of the
-floor's speed reads "80% of best"). It is capped at ~99, shown with a tilde: `now` is a ~500 ms mean
-while `best` is a 32-step window mean, so a fast stretch shorter than a window can
-read faster than the recorded floor. That is "at your best", not a new record —
-the engine only lowers `best` on a completed 32-step window, and a sub-window blip
-is not one. The cap is 99 rather than 100 because a 500 ms window that briefly beats the floor is
-not a sustained record; 100% would claim a floor the window cannot confirm and would read as a
-bug, while ~99% says "at your best" without overclaiming. At higher concurrency the figure is keyed to that concurrency (`@c8`)
-and read against the fastest step seen at that concurrency, because a batched step
-is a different measurement and would report a batch arriving as a slowdown.
+floor: the mean of the steps that completed in the last poll (~500 ms) as a
+fraction of `best`, so a step at 80% of the floor's speed reads "80% of best". A
+fast stretch shorter than a window can beat the 32-step floor without being a new
+record, so the figure is capped and the fastest reads `~99%`. At higher
+concurrency it is keyed to that concurrency (`@c8`) and read against the fastest
+step seen there, because a batched step is a different measurement and would
+report a batch arriving as a slowdown.
 
 The gap between them is normal, and it is not degradation. `best` is the most
 favorable moment the lane has hit; `recent` is what it is doing now. On a healthy
@@ -2657,7 +2748,7 @@ is the part of a log to paste into an issue. Its sections:
   warning is also printed as a `W` line of its own.
 
 ```
-I STARTUP REPORT -- radiance 1.8.1
+I STARTUP REPORT -- radiance 1.9.0
 I CONFIGURATION -- every option, the value in force, and where it came from
 I   --model                            /models/flashnext.rad                       [command line]
 I   --tp                               2                                           [command line]
@@ -2754,8 +2845,6 @@ reductions running on fewer blocks: Qwen3.8-27B's 41k-token prefill 9.5 s uncapp
 | `RADIANCE_CALIB_DIR` | where an engine run writes calibration data for a recipe's `gptq calib=DIR` |
 | `RADIANCE_CALIB_TOKENS` | with `RADIANCE_CALIB_DIR`, the tokens the calibration tap accumulates before it writes and switches itself off (default 65536) |
 | `RADIANCE_G3_CALIB_LAYERS` | `lo:hi`: `arch/gemma3`'s calibration tap over layers lo to hi - 1 only, to take a large model's Grams in passes (docs/ARCHITECTURES.md) |
-| `RADIANCE_GLM_TP_SPLIT_ROWS` | `arch/glm5next` under tensor parallelism: the pass height from which the router, the index head gates and the mHC projection split their f32 work over the ranks and gather it, bit-identical to the replicated form (default 256; `0` or a value that does not parse never splits) |
-| `RADIANCE_GLM_ROUTER_FUSE`, `RADIANCE_GLM_SWIGLU_QUANT`, `RADIANCE_GLM_GATHER_INVERSE` | `arch/glm5next`'s MoE decode fusions, each byte-identical to the launches it replaces: unset, empty or `1` on, `0` off, any other value refuses the start. For comparing, not for deployment (docs/ARCHITECTURES.md) |
 | `RADIANCE_PROFILE_EVERY` | with `--profile-ops`, dump the per-op table every N steps (default 32) |
 | `RADIANCE_LOG_STEPS` | log one line per step: its phase, sequences, and each one's token count and context (§4.5) |
 | `RADIANCE_AR8_SHARD_WEIGHTS`, `RADIANCE_AR8_PIECES` | the eight-rank two-shot's shard weights (`auto`, the default, reads the PCIe links; `off`; or eight integers) and piece count, with `RADIANCE_AR8_SHARD_WEIGHTS_MIN_ELEMS` and `RADIANCE_AR8_PIECES_MIN_ELEMS` for the message size each starts at (§4.7) |

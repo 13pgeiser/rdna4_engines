@@ -297,6 +297,13 @@ static const RadParamSpec pAttnDense[]   = { P_INT("M"), P_INT("head_dim"), P_IN
                                              P_INTO("window_right") };
 static const RadOperandSpec oAttnDense[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"),
                                              OUT("out") };
+static const RadParamSpec pAttnCross[]   = { P_INT("M"), P_INT("head_dim"), P_INT("gqa"),
+                                             P_INT("causal"), P_STR("dtype"), P_F64O("scale") };
+static const RadOperandSpec oAttnCross[] = { OPD("q"), OPD("k"), OPD("v"), OPD("cu_seqlens"),
+                                             OPD("cu_k"), OUT("out") };
+static const RadParamSpec pAttnNa3d[] = { P_INT("M"), P_INT("head_dim"), P_INT("kt"), P_INT("kh"),
+                                          P_INT("kw"), P_STR("dtype"), P_F64O("scale") };
+static const RadOperandSpec oAttnNa3d[] = { OPD("q"), OPD("k"), OPD("v"), OPD("geom"), OUT("out") };
 
 static const RadParamSpec pKvStore[]   = { P_INT("M"), P_INT("head_dim"), P_INT("n_head_kv"),
                                            P_INT("block_size"), P_STR("kv_dtype"),
@@ -504,6 +511,13 @@ static const RadOperandSpec oAllGather[] = { OPD("x"), OUT("y") };
 /* ---- image generation --------------------------------------------------------------------- */
 static const RadParamSpec pLnMod[]   = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype") };
 static const RadOperandSpec oLnMod[] = { OPD("x"), OPD("s"), OPD("cu_seqlens"), OUT("y") };
+static const RadParamSpec pTableAdd[] = { P_INT("M"), P_INT("n"), P_INT("L"), P_STR("dtype") };
+static const RadOperandSpec oTableAdd[] = { OPD("x"), WGT("t"), OUT("y") };
+static const RadParamSpec pMixRows[] = { P_INT("M"), P_INT("n"), P_INT("k"), P_STR("dtype") };
+static const RadParamSpec pChanStats[] = { P_INT("M"), P_INT("n"), P_STR("mode"), P_INTO("var"),
+                                           P_F64O("eps"), P_STR("dtype") };
+static const RadOperandSpec oChanStats[] = { OPD("x"), WGT("mean"), WGT("s"), OUT("y") };
+static const RadOperandSpec oMixRows[] = { OPD("x"), WGT("w"), OUT("y") };
 static const RadParamSpec pGateAdd[] = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_STRO("act") };
 static const RadOperandSpec oGateAdd[] = { OPD("y"), OPD("g"), OPD("cu_seqlens"), INOUT("x") };
 static const RadParamSpec pLnModQ[]  = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
@@ -511,12 +525,14 @@ static const RadParamSpec pLnModQ[]  = { P_INT("M"), P_INT("n"), P_F64("eps"), P
 static const RadOperandSpec oLnModQ[] = { OPD_O("y"), OPD_O("g"), OPD("s"), OPD("cu_seqlens"),
                                           INOUT("x"), OUT("q"), OUT("scale"), OUT_O("z") };
 static const RadParamSpec pRmsMod[]  = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INTO("gated"),
-                                         P_STR("dtype") };
-static const RadOperandSpec oRmsMod[] = { OPD_O("y"), OPD_O("g"), OPD("s"), WGT("w"),
+                                         P_STR("dtype"), P_F64O("wadd"),
+                                         P_INTO("norm_once"), P_STRO("norm") };
+static const RadOperandSpec oRmsMod[] = { OPD_O("y"), OPD_O("g"), OPD("s"), WGT_O("w"),
                                           OPD("cu_seqlens"), INOUT("x"), OUT("z") };
 static const RadParamSpec pRmsModQ[]  = { P_INT("M"), P_INT("n"), P_F64("eps"), P_INT("group"),
-                                          P_INT("gated"), P_STR("dtype") };
-static const RadOperandSpec oRmsModQ[] = { OPD_O("y"), OPD_O("g"), OPD("s"), WGT("w"),
+                                          P_INT("gated"), P_STR("dtype"), P_F64O("wadd"),
+                                         P_INTO("norm_once"), P_STRO("norm") };
+static const RadOperandSpec oRmsModQ[] = { OPD_O("y"), OPD_O("g"), OPD("s"), WGT_O("w"),
                                            OPD("cu_seqlens"), INOUT("x"), OUT("q"), OUT("scale"),
                                            OUT_O("z") };
 static const RadOperandSpec oFlowX0[] = { OPD("v"), OPD("t"), OPD("sigma"), OPD("sigma_next"),
@@ -590,7 +606,8 @@ static const RadOperandSpec oAttnVsa[] = { OPD("q"), OPD("k"), OPD("v"), OPD("se
 /* ---- the latent upscaler (avx_video.cpp), as libref declares it; patch_fold takes
  * patch_unfold's parameters and operands ------------------------------------------------------ */
 static const RadParamSpec pConv3d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
-                                        P_INT("kt"), P_STR("dtype") };
+                                        P_INT("kt"), P_STR("dtype"), P_STRO("tpad"),
+                                        P_INTO("tpre") };
 static const RadOperandSpec oConv3d[] = { OPD("x"), WGT("w"), WGT("b"), OPD("geom"),
                                           OPD_O("res"), OUT("y") };
 static const RadParamSpec pGroupNorm[] = { P_INT("M"), P_INT("n"), P_INT("groups"), P_F64("eps"),
@@ -603,6 +620,52 @@ static const RadOperandSpec oResize[] = { OPD("x"), OPD("geom"), OUT("y") };
 static const RadParamSpec pFlowRenoise[] = { P_INT("M"), P_INT("n"), P_INT("stream"),
                                              P_STR("dtype") };
 static const RadOperandSpec oFlowRenoise[] = { OPD("sigma"), OPD("seed"), INOUT("x") };
+
+/* ---- LTX-2 (avx_ltx.cpp) */
+static const RadParamSpec pRopeSplit[] = { P_INT("M"), P_INT("n_head"), P_INT("head_dim"),
+                                           P_INT("dim"), P_INT("n_dims"), P_F64("theta"),
+                                           P_STR("max"), P_INTO("head0"), P_STR("dtype") };
+static const RadOperandSpec oRopeSplit[] = { INOUT("x"), OPD("positions") };
+static const RadParamSpec pHeadGate[] = { P_INT("M"), P_INT("n_head"), P_INT("head_dim"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oHeadGate[] = { OPD("g"), INOUT("x") };
+static const RadParamSpec pLtxGuide[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oLtxGuide[] = { OPD("vc"), OPD_O("vu"), OPD_O("vs"), OPD_O("vm"),
+                                            OPD("scales"), OPD("sched"), INOUT("stats"),
+                                            INOUT("x") };
+static const RadParamSpec pPixelNorm[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("form"),
+                                           P_STRO("act"), P_INTO("ileave"), P_STR("dtype"),
+                                           P_F64O("mult") };
+static const RadOperandSpec oPixelNorm[] = { OPD("x"), OUT("y") };
+static const RadParamSpec pD2s3d[] = { P_INT("M"), P_INT("C"), P_INT("st"), P_INT("sh"), P_INT("sw"),
+                                       P_INTO("drop"), P_STR("dtype") };
+static const RadOperandSpec oD2s3d[] = { OPD("x"), OPD("geom"), OUT("y") };
+static const RadParamSpec pS2d3d[] = { P_INT("M"), P_INT("C"), P_INT("st"), P_INT("sh"), P_INT("sw"),
+                                       P_INTO("tpre"), P_INTO("group"), P_STR("mode"),
+                                       P_INTO("add"), P_STR("dtype") };
+static const RadOperandSpec oS2d3d[] = { OPD("x"), OPD("geom"), INOUT("y") };
+static const RadParamSpec pPixPatch[] = { P_INT("M"), P_INT("p"), P_INT("C"), P_STRO("order"),
+                                          P_STR("dtype") };
+static const RadOperandSpec oPixPatch[] = { OPD("x"), OUT("y") };
+static const RadParamSpec pVolIndex[] = { P_INT("M") };
+static const RadOperandSpec oVolIndex[] = { OPD("geom"), OUT("y") };
+static const RadParamSpec pTileGrid[] = { P_INT("M"), P_INT("tile"), P_INT("stride"), P_STRO("rule"),
+                                          P_INTO("min"), P_INTO("tile_t"), P_INTO("stride_t"),
+                                          P_INTO("min_t"), P_INTO("tail") };
+static const RadOperandSpec oTileGrid[] = { OPD("geom"), OUT("y") };
+static const RadParamSpec pTileCrop[] = { P_INT("M"), P_INT("C"), P_STR("dtype") };
+static const RadOperandSpec oTileCrop[] = { OPD("x"), OPD("geom"), OPD("box"), OUT("y") };
+static const RadParamSpec pTileStitch[] = { P_INT("M"), P_INT("tile"), P_INT("stride"),
+                                            P_STRO("rule"), P_INTO("min"), P_INTO("tile_t"),
+                                            P_INTO("stride_t"), P_INTO("min_t"), P_INT("scale"),
+                                            P_INTO("scale_t"), P_INT("p"), P_INT("C"),
+                                            P_STRO("order"), P_STR("dtype") };
+static const RadOperandSpec oTileStitch[] = { OPD("x"), OPD("geom"), OPD("first"), OUT("y") };
+static const RadParamSpec pStftMel[] = { P_INT("M"), P_INT("hop"), P_INT("nfft"), P_INT("n_mel"),
+                                         P_INT("ch"), P_STR("dtype") };
+static const RadOperandSpec oStftMel[] = { OPD("x"), WGT("basis"), WGT("mel"), OUT("y") };
+static const RadParamSpec pBweUp[] = { P_INT("M"), P_INT("ratio"), P_INT("ch"), P_STR("dtype") };
+static const RadOperandSpec oBweUp[] = { OPD("x"), OPD("res"), OUT("y") };
 
 /* ---- audio generation (avx_audio.cpp), as libref declares it ------------------------------ */
 static const RadParamSpec pConv1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
@@ -664,6 +727,8 @@ static const RadParamSpec pIota[] = { P_INT("M"), P_INT("start"), P_INT("step"),
 static const RadOperandSpec oIota[] = { OUT("y") };
 static const RadParamSpec pCuRepeat[] = { P_INT("M"), P_INT("mult") };
 static const RadOperandSpec oCuRepeat[] = { OPD("len"), OUT("y") };
+static const RadParamSpec pIntAffine[] = { P_INT("M"), P_STR("src"), P_STR("mul"), P_STR("add") };
+static const RadOperandSpec oIntAffine[] = { OPD("x"), OUT("y") };
 
 /* ---- vocabulary edges --------------------------------------------------------------------- */
 static const RadParamSpec pEmbed[]    = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
@@ -881,6 +946,11 @@ static const RadOpSchema kSchemas[] = {
 { "attn_dense", ARR(pAttnDense), ARR(oAttnDense),
   "dense varlen attention over cu_seqlens; a non-causal window may reach further right "
   "(`window_right`)." },
+{ "attn_cross", ARR(pAttnCross), ARR(oAttnCross),
+  "attn_dense with each entry's keys a run of their own (cu_k); causal counts from each run's "
+  "start." },
+{ "attn_na3d", ARR(pAttnNa3d), ARR(oAttnNa3d),
+  "3-D neighborhood attention over a volume, libref's window and arithmetic." },
 { "kv_store", ARR(pKvStore), ARR(oKvStore), "scatter k and v into the paged cache." },
 { "rope_table", ARR(pRopeTable), ARR(oRopeTable), "cos/sin at each position's own row." },
 { "qsa_block_key", ARR(pQsaBlockKey), ARR(oQsaBlockKey),
@@ -949,6 +1019,13 @@ static const RadOpSchema kSchemas[] = {
 { "ln_mod", ARR(pLnMod), ARR(oLnMod),
   "y = bf16(bf16(LN(x)) * bf16(1 + s[seq])): a gainless layer norm and the row's entry's "
   "modulation row of `s` ([n_seq, >= n] at its own pitch)." },
+{ "table_add", ARR(pTableAdd), ARR(oTableAdd),
+  "y[r, l n + c] = x[r, c] + t[l, c], f32 sum rounded once." },
+{ "chan_stats", ARR(pChanStats), ARR(oChanStats),
+  "per-channel statistics held as weights: denorm rd(rd(x std) + mean), norm rd(rd(x - mean) / "
+  "std)." },
+{ "mix_rows", ARR(pMixRows), ARR(oMixRows),
+  "y[r, c] = sum_i w[i] x[r k + i, c], f32 in ascending i, rounded once." },
 { "gate_add", ARR(pGateAdd), ARR(oGateAdd),
   "x = bf16(x + bf16(bf16(tanh(g[seq])) * y)), or with `act` none the gate g itself, bit for bit "
   "libref's." },
@@ -1032,6 +1109,29 @@ static const RadOpSchema kSchemas[] = {
 { "flow_renoise", ARR(pFlowRenoise), ARR(oFlowRenoise),
   "x = f32(f32(1 - s) x) + f32(s z), z the (seed, stream) normal stream at k n + c, bit for bit "
   "libref's." },
+{ "rope_split", ARR(pRopeSplit), ARR(oRopeSplit),
+  "LTX-2's split rotary over fractional coordinates, libref's arithmetic element by element." },
+{ "head_gate", ARR(pHeadGate), ARR(oHeadGate),
+  "x = rd(x rd(2 rd(sigmoid(g)))) per head, libref's." },
+{ "ltx_guide", ARR(pLtxGuide), ARR(oLtxGuide),
+  "LTX-2's guided sampler step in f32, libref's arithmetic with the deviations in f64." },
+{ "pixel_norm", ARR(pPixelNorm), ARR(oPixelNorm),
+  "an RMS norm over each row as bf16 tensors compute it, every step rounded; rsqrt or div form, "
+  "optionally silu, `ileave` interleaving the output; libref's." },
+{ "d2s3d", ARR(pD2s3d), ARR(oD2s3d), "depth to space over voxel rows, libref's copy." },
+{ "s2d3d", ARR(pS2d3d), ARR(oS2d3d),
+  "space to depth over voxel rows, a copy or the mean of each group, libref's." },
+{ "pix_patch", ARR(pPixPatch), ARR(oPixPatch), "an image to patch rows, libref's copy." },
+{ "patch_pix8", ARR(pPixPatch), ARR(oPixPatch), "patch rows to RGB bytes, libref's rule." },
+{ "vol_index", ARR(pVolIndex), ARR(oVolIndex), "a volume's voxel coordinates, libref's." },
+{ "tile_grid", ARR(pTileGrid), ARR(oTileGrid), "a tiled decode's boxes, libref's cut." },
+{ "tile_crop", ARR(pTileCrop), ARR(oTileCrop), "a tile out of a volume, libref's copy." },
+{ "tile_stitch", ARR(pTileStitch), ARR(oTileStitch),
+  "decoded tiles blended to RGB bytes, libref's blends and rounding." },
+{ "stft_logmel", ARR(pStftMel), ARR(oStftMel),
+  "each channel's causal log-mel spectrogram, libref's roundings." },
+{ "bwe_up", ARR(pBweUp), ARR(oBweUp),
+  "a Hann-windowed sinc resampler plus a residual, clamped, libref's roundings." },
 { "conv1d", ARR(pConv1d), ARR(oConv1d),
   "a 1-D convolution over the sequences `cu_seqlens` bounds, channels innermost, PyTorch's "
   "[cout, cin, k] weight, dilation `dil`, centred or (`causal`) all on the left, zeros outside "
@@ -1073,6 +1173,8 @@ static const RadOpSchema kSchemas[] = {
 { "interleave2", ARR(pInterleave), ARR(oInterleave2), "two streams interleaved, y [rows, 2]." },
 { "iota", ARR(pIota), ARR(oIota), "y[i] = start + i * step." },
 { "cu_repeat", ARR(pCuRepeat), ARR(oCuRepeat), "y[j] = j * len[0] * mult." },
+{ "int_affine", ARR(pIntAffine), ARR(oIntAffine),
+  "y[j] = (src[j] < 0 ? 0 : x[src[j]]) * mul[j] + add[j] over three integer lists." },
 { "embed_lookup", ARR(pEmbedM), ARR(oEmbed),
   "embedding gather, vocab-parallel with an offset; `mult` multiplies every row (rounded once)." },
 { "embed_lookup_q", ARR(pEmbed), ARR(oEmbedQ),
@@ -1382,6 +1484,11 @@ ROW("avx_attn_paged", "attn_paged", "attn",
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])), L(attn_paged)),
 SIMPLE("avx_attn_dense", "attn_dense", "attn", "dense varlen attention over cu_seqlens", DT_FLOAT,
        L(attn_dense)),
+SIMPLE("avx_attn_cross", "attn_cross", "attn",
+       "dense varlen attention, keys bounded apart from the queries (cu_k)", DT_FLOAT,
+       L(attn_cross)),
+SIMPLE("avx_attn_na3d", "attn_na3d", "attn", "3-D neighborhood attention over a volume", DT_FLOAT,
+       L(attn_na3d)),
 ROW("avx_kv_store", "kv_store", "attn", "scatter k and v into the paged cache", DT_ANY,
     cPagedBlock, (int)(sizeof(cPagedBlock) / sizeof(cPagedBlock[0])), L(kv_store)),
 SIMPLE("avx_rope", "rope", "attn", "rotary embedding in place", DT_FLOAT, L(rope)),
@@ -1458,6 +1565,12 @@ SIMPLE("avx_ln_mod", "ln_mod", "norm", "gainless layer norm times (1 + an entry'
        DT_FLOAT, L(ln_mod)),
 SIMPLE("avx_gate_add", "gate_add", "elem", "x += act(gate row) * y, act tanh or none", DT_FLOAT,
        L(gate_add)),
+SIMPLE("avx_table_add", "table_add", "elem", "a row plus each of L table rows", DT_FLOAT,
+       L(table_add)),
+SIMPLE("avx_mix_rows", "mix_rows", "elem", "a weighted sum of k consecutive rows", DT_FLOAT,
+       L(mix_rows)),
+SIMPLE("avx_chan_stats", "chan_stats", "elem", "per-channel statistics held as weights",
+       DT_FLOAT, L(chan_stats)),
 SIMPLE("avx_ln_mod_quant_fp8", "ln_mod_quant_fp8", "norm",
        "gated residual, adaptive norm and the E4M3 quantiser in one pass",
        "float in, fp8_e4m3 out, f32 scale, bf16 z", L(ln_mod_quant_fp8)),
@@ -1526,6 +1639,27 @@ SIMPLE("avx_patch_fold", "patch_fold", "elem", "voxel rows to normalised patch r
        L(patch_fold)),
 SIMPLE("avx_flow_renoise", "flow_renoise", "elem", "a clean latent re-noised to a sigma",
        DT_FLOAT, L(flow_renoise)),
+SIMPLE("avx_rope_split", "rope_split", "elem", "LTX-2's split rotary over coordinates", DT_FLOAT,
+       L(rope_split)),
+SIMPLE("avx_head_gate", "head_gate", "elem", "each head times 2 sigmoid of its logit", DT_FLOAT,
+       L(head_gate)),
+SIMPLE("avx_ltx_guide", "ltx_guide", "elem", "LTX-2's guided sampler step", DT_FLOAT,
+       L(ltx_guide)),
+SIMPLE("avx_pixel_norm", "pixel_norm", "norm", "an RMS norm as bf16 tensors compute it", DT_FLOAT,
+       L(pixel_norm)),
+SIMPLE("avx_d2s3d", "d2s3d", "elem", "depth to space over voxel rows", DT_FLOAT, L(d2s3d)),
+SIMPLE("avx_s2d3d", "s2d3d", "elem", "space to depth over voxel rows", DT_FLOAT, L(s2d3d)),
+SIMPLE("avx_pix_patch", "pix_patch", "elem", "an image to patch rows", DT_FLOAT, L(pix_patch)),
+SIMPLE("avx_patch_pix8", "patch_pix8", "elem", "patch rows to RGB bytes", DT_FLOAT, L(patch_pix8)),
+SIMPLE("avx_vol_index", "vol_index", "elem", "a volume's voxel coordinates", DT_ANY, L(vol_index)),
+SIMPLE("avx_tile_grid", "tile_grid", "elem", "a tiled decode's boxes", DT_ANY, L(tile_grid)),
+SIMPLE("avx_tile_crop", "tile_crop", "elem", "a tile out of a volume", DT_FLOAT, L(tile_crop)),
+SIMPLE("avx_tile_stitch", "tile_stitch", "elem", "decoded tiles blended to RGB bytes", DT_FLOAT,
+       L(tile_stitch)),
+SIMPLE("avx_stft_logmel", "stft_logmel", "elem", "a causal log-mel spectrogram", DT_FLOAT,
+       L(stft_logmel)),
+SIMPLE("avx_bwe_up", "bwe_up", "elem", "a sinc-resampled waveform plus a residual, clamped",
+       DT_FLOAT, L(bwe_up)),
 
 SIMPLE("avx_conv1d", "conv1d", "conv", "a 1-D convolution over sequences, as GEMMs over patch rows",
        DT_FLOAT, L(conv1d)),
@@ -1560,6 +1694,8 @@ SIMPLE("avx_interleave2", "interleave2", "elem", "two streams interleaved", DT_A
        L(interleave2)),
 SIMPLE("avx_iota", "iota", "elem", "an arithmetic index sequence", DT_ANY, L(iota)),
 SIMPLE("avx_cu_repeat", "cu_repeat", "elem", "bounds of equal sequences", DT_ANY, L(cu_repeat)),
+SIMPLE("avx_int_affine", "int_affine", "elem", "integers derived from device geometry", DT_ANY,
+       L(int_affine)),
 
 SIMPLE("avx_embed_lookup", "embed_lookup", "vocab", "embedding gather", DT_FLOAT, L(embed_lookup)),
 /* Its layout hook only validates: the table is read as stored and other encodings are refused

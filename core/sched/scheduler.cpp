@@ -1599,7 +1599,10 @@ const RadBatch* Scheduler::step() {
 /* ------------------------------------------------------------------ media */
 bool Scheduler::prefill_continues() const {
     std::lock_guard<std::mutex> lk(mu_);
-    if (stage_rows_ <= 0) return false;
+    /* Only the step being released has a plan to read. Between a commit and the next step (an
+     * encoder pass is prepared there) `plan_` is the committed step's, whose requests in_step() no
+     * longer holds: a cancel and reap may have released one (#127). */
+    if (stage_rows_ <= 0 || !step_open_) return false;
     /* The next step is held to decode rows (--prefill-interleave): experts staged for a chunk now
      * would be dropped by that step. */
     if (interleave_left_ > 0) return false;
@@ -2010,13 +2013,8 @@ void Scheduler::step_finished() {
     m_.step_ns += ns;
     if (plan_.phase == RAD_PHASE_DECODE) {
         m_.step_ns_decode += ns;
-        /* The single-sequence floor, keyed to the concurrency of THIS step (plan_.n_seq_decode is
-         * the row count that was just timed, not a later snapshot). A mixed step is excluded by the
-         * phase gate even when it carries one decode row: its lone row shares the step with a
-         * prefill chunk and is not the mechanical floor. The estimator is a min over WINDOW MEANS,
-         * not raw brackets: a decode step issued ahead behind a long host commit has no GPU work
-         * in its bracket, and a raw min latches that degenerate forever; averaging a window of
-         * single-row steps first dilutes it. See rad::DecodeFloor. */
+        /* The single-sequence floor over the step just timed (rad::DecodeFloor). A mixed step
+         * never counts: its decode row shares the step with a prefill chunk. */
         if (plan_.n_seq_decode == 1) {
             decode_floor_.update(ns);
             m_.step_ns_decode_best  = decode_floor_.best();

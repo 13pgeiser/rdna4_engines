@@ -373,7 +373,7 @@ kernels with its chunk-sum order, so the pair is byte-identical to `mhc_pre` (`r
 and two from 32, where the weight rows are 16-byte and the residual rows 8-byte aligned; the
 finish forms the 4x4 mixing on one wave and collapses the row over the workgroup; `mhc_post` at
 `hc` 4 writes eight columns of every stream a thread on 16-byte rows. Every form gives the bytes
-of the scalar kernels it replaces.
+of the scalar kernels that serve the rows it cannot read.
 
 ### Gemma 4's audio tower
 
@@ -518,7 +518,7 @@ form by `M`, `N` and `K`; on rows that are not 16-byte aligned it takes the 16x6
 are byte-identical (`tests/r4d_emu/test_fp8f32.cpp`). The grouped row takes equal-width parity
 tables (`N_odd = N`, `K_odd = K`), token or sorted activations, and stacked planes or pointer
 tables, and runs expert-major: a block per (column span, expert) takes every row of its expert,
-each element keeping the row-tile form's sequence.
+each element keeping the 16x64 tile's sequence.
 
 **`group` has different meanings in this table.** A kernel that reads it the other way is wrong,
 not slow. `libref/ref_quant.cpp` is the definition.
@@ -772,6 +772,8 @@ bytes).
 |---|---|---|
 | `attn_paged` | `q_len`(range) `head_dim` `gqa` `block_size`/der `causal` `window` `q_dtype` `kv_dtype` `scale`:f64/opt `max_ctx`/opt `n_head`/opt `max_seqs`/opt | `q`, `kv_cache`, `block_table`, `seqused`, `k_descale`?, `v_descale`?, `cu_seqlens`? → `out` |
 | `attn_dense` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt `max_seqlen`/opt `window`/opt `cu_div`/opt `block`/opt `window_right`/opt | `q`, `k`, `v`, `cu_seqlens` → `out` |
+| `attn_cross` | `M`(range) `head_dim` `gqa` `causal` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `cu_seqlens`, `cu_k` → `out` |
+| `attn_na3d` | `M`(range) `head_dim` `kt` `kh` `kw` `dtype` `scale`:f64/opt | `q`, `k`, `v`, `geom` → `out` |
 | `attn_local_rel` | `M`(range) `head_dim` `n_head` `left` `right` `softcap`:f64 `cu_div`/opt `dtype` | `q`, `k`, `v`, `relk`, `pds`w, `cu_seqlens` → `out` |
 | `kv_store` | `M`(range) `head_dim` `n_head_kv` `block_size` `kv_dtype` `k_scale`:f64/opt `v_scale`:f64/opt | `k`, `v`, `slot_mapping`, `kv_cache`:inout |
 | `rope` | `M`(range) `head_dim` `n_head` `n_head_kv` `theta`:f64 `scale`:f64 `mode` `rotary_dim`/opt `sections`/opt `yarn_factor`:f64/opt `yarn_low`:f64/opt `yarn_high`:f64/opt `yarn_magnitude`:f64/opt `ladder`/opt `llama3_factor`:f64/opt `llama3_low`:f64/opt `llama3_high`:f64/opt `llama3_orig`:f64/opt | `qkv`:inout, `positions` |
@@ -800,6 +802,24 @@ with `window_right = r + 1` (non-causal only: key `j` visible when `i - j < wind
 `j - i < window_right`). `q`, `k` and `v` may each be `[tokens, heads, head_dim]` or
 `[tokens, heads * head_dim]`, and the second form may be a column slice of a fused projection read
 at its row pitch, so a tower's `[q|k|v]` row needs no copy.
+
+**`attn_cross`** is `attn_dense` with each entry's keys a run of their own: entry `s`'s queries
+are rows `[cu_seqlens[s], cu_seqlens[s+1])` of `q`, its keys and values rows `[cu_k[s], cu_k[s+1])`
+of `k` and `v`, and with `causal` a query sees key `j` of its run when `j <= i`, both counted from
+their run's start. A query that sees no key is zero. It is a video's rows reading their prompt
+(cross attention), and a padded prompt whose padding rows see only the prompt (`cu_k` the
+prompt's rows, `cu_seqlens` the prompt and its padding: every padding row sees every prompt row
+and none of the padding, as a masked padding token does in the reference).
+
+**`attn_na3d`** is 3-D neighborhood attention, NATTEN's `na3d` (LTX-2.5's diffusion decoder). The
+rows of `q`, `k`, `v` and `out` are the voxels of the volume `geom` = `(T, H, W)` (i32 on the
+device), `(t, i, j)` row-major, each `[rows, heads head_dim]` at its own row pitch (column slices of
+a fused projection). A query sees the keys of a `kt x kh x kw` window, each extent at most its axis,
+centred on it and shifted inward at the border: along an axis of `L` and window `n` it starts at
+`clamp(c - n / 2, 0, L - n)`, so it always holds `n` keys. Per head, in f32: each score the dot over
+`d` ascending times `scale` (default `1 / sqrt(head_dim)`), the window's keys in raster order, the
+softmax as `attn_cross` takes it, the output rounded to its dtype. Rows past `T H W` are not
+written. libr4d serves `head_dim` 64.
 
 **`attn_local_rel`** is Gemma 4's audio attention: local, with a relative-position term and a
 softcap. Query row `i` of a segment sees key rows `j` of the same segment with
@@ -918,8 +938,11 @@ The group is declared at `RAD_F8E4M3` with head_dim the row's bytes / 2, so the 
 as it does for fp8, and the cache operand's last extent is the row. The ops take the model's
 head_dim. libr4d's rows are `kv_store_fp8v4` / `kv_store_k6v4`,
 `qk_norm_rope_gate_kv_store_fp8v4` / `_k6v4` (byte-identical to the prologue and the store, as at
-the other widths), and `attn_prefill_h256_gqa6_{fp8v4,k6v4}` and `attn_decode_h256_gqa6_{fp8v4,k6v4}`,
-which widen the codes to f16 in a tile's staging. `r4d_selftest` holds the stores to an exactly
+the other widths), `attn_prefill_h256_gqa6_{fp8v4,k6v4}` and `attn_decode_h256_gqa6_{fp8v4,k6v4}`,
+which widen the codes to f16 in a tile's staging, and the same kernels at Qwen3.8-Flash-Next's
+ratios over 4-token pages: `attn_{prefill,decode,decode_gq}_h256_gqa12_{fp8v4,k6v4}` and
+`attn_{prefill,decode,decode_gq}_h256_gqa6_bs4_{fp8v4,k6v4}`, the `decode_gq` rows with the output
+gate and quantiser in the split-KV merge. `r4d_selftest` holds the stores to an exactly
 representable set and the attention rows to its inline oracle.
 
 ### `qk_norm_rope_gate` (device-only)
@@ -976,6 +999,9 @@ says which (`libref/ref_gen.cpp`).
 | `ln_mod_quant_fp8` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` | `y`?, `g`?, `s`, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`? |
 | `timestep_embed` | `M`(range) `n` `scale`:f64 `max_period`:f64 `round`/opt `dtype` | `t` → `y` |
 | `gather_rows2` | `M`(range) `n` `dtype` | `a`, `b`, `idx` → `y` |
+| `table_add` | `M`(range) `n` `L` `dtype` | `x`, `t`w → `y` |
+| `mix_rows` | `M`(range) `n` `k` `dtype` | `x`, `w`w → `y` |
+| `chan_stats` | `M`(range) `n` `mode` `var`/opt `eps`:f64/opt `dtype` | `x`, `mean`w, `s`w → `y` |
 | `lane_gather` | `M`(range) `n` `stride` `dtype` | `src`, `lane`, `cu_seqlens` → `y` |
 | `lane_store` | `M`(range) `n` `stride` `dtype` | `src`, `lane`, `dst`:inout |
 | `randn_lanes` | `M`(range) `n` `stride` `dtype` | `flags`, `seed`, `lane`, `cu_seqlens`, `dst`:inout |
@@ -1007,8 +1033,20 @@ source into every listed lane (a repainted picture's latent into each of its ima
   store would round it, so the bytes are the three ops'.
 - `timestep_embed`: `[cos | sin]` of `t' * f_i`, `f_i = exp(-ln(max_period) * i / (n/2))` in f32,
   `t' = scale * t`; with `round` 1, `t' = scale * bf16(bf16(t * scale) / scale)`, the value
-  diffusers' pipeline hands its transformer. `t` is f32 `[M]`.
+  diffusers' pipeline hands its transformer; with `round` 2, `t' = scale * bf16(t)` (a pipeline
+  that hands the transformer `t` in bf16 and scales it inside, Krea 2's); with `round` 3,
+  `t' = bf16(scale * bf16(t))` (the scaling also in bf16, FLUX's). `t` is f32 `[M]`.
 - `gather_rows2`: `y[i] = idx[i] >= 0 ? a[idx[i]] : b[-1 - idx[i]]`, zeros past either source.
+- `table_add`: `y[r, l n + c] = x[r, c] + t[l, c]` for each of `L` rows of the weight `t` `[L, n]`,
+  the sum f32 and rounded once: a modulation shared by every block plus each block's own learned
+  table (Krea 2, LTX-2), every block's rows in one launch, read at `l n` of each `y` row.
+- `chan_stats`: a latent through per-channel statistics a VAE keeps as weights, `mean` and `s`
+  `[n]`: `std` is `s`, or with `var` 1 `sqrt(s + eps)` (a BatchNorm's running variance, FLUX's VAE),
+  each statistic rounded to `y`'s dtype as the reference casts it; `mode` `denorm` is
+  `y = rd(rd(x std) + mean)` and `norm` is `y = rd(rd(x - mean) / std)`.
+- `mix_rows`: `y[r, c] = sum_i w[i] x[r k + i, c]` over `i < k`, f32 in ascending `i` and rounded
+  once: a `Linear(k, 1)` across `k` consecutive rows (Krea 2's text fusion folds a token's twelve
+  tapped encoder layers, laid out as consecutive rows, into one).
 - `randn_lanes`: for entries whose `flags` carry 1, the lane's rows become the entry's seed's
   standard-normal stream (`abi/rad_philox.h`), element `(k, c)` the stream's `k * n + c`. `seed` is
   `[n_seq, 2]` u32, low word first.
@@ -1025,7 +1063,8 @@ shapes: an image's size belongs to a request, and a parameter is fixed at declar
 - `conv2d_nhwc`: `w` is PyTorch's `[cout, cin, k, k]` (a kernel may store it permuted through its
   layout hook), `b` `[cout]`; `up` 2 reads the input upsampled 2x nearest-neighbour; `pad` `same`
   is `k/2` zeros a side, `down` is none above and left and one below and right
-  (`ZeroPad2d((0,1,0,1))` before a stride-2 conv). f32 accumulation, the bias added, one rounding.
+  (`ZeroPad2d((0,1,0,1))` before a stride-2 conv), `causal` is `k - 1` rows above, none below and
+  `k/2` columns a side (causal along the rows: LTX-2's audio VAE). f32 accumulation, the bias added, one rounding.
 - `l2norm_chan`: each pixel's channels to unit L2 (eps 1e-12), times `sqrt(n)`, times `gamma`
   (three roundings), then `act` `none` or `silu`.
 - `chan_affine`: `mul` and `add` are space-separated lists of `n` values, each rounded to bf16;
@@ -1090,6 +1129,7 @@ libref function says which (`libref/ref_audio.cpp`).
 | `interleave2` | `M`(range) `dtype` | `a`, `b` → `y` |
 | `iota` | `M`(range) `start` `step` `period`/opt | → `y` |
 | `cu_repeat` | `M`(range) `mult` | `len` → `y` |
+| `int_affine` | `M`(range) `src` `mul` `add` | `x` → `y` |
 
 **Frames.** A lane is one piece; a frame is one step of its language model, whose branches (the
 conditional first, then the unconditional) are consecutive rows, `rep` of them a lane.
@@ -1120,7 +1160,10 @@ conditional first, then the unconditional) are consecutive rows, `rep` of them a
   `status[lane] >= 0` (frame 0 only moves past the prompt; a negative status ended the piece).
 - `iota`: `y[i] = start + i * step`, or `start + (i % period) * step` with `period` (the
   positions of equal sequences laid end to end). `cu_repeat`: `y[j] = j * len[0] * mult`, the bounds of equal
-  sequences whose length lives on the device.
+  sequences whose length lives on the device. `int_affine`:
+  `y[j] = (src[j] < 0 ? 0 : x[src[j]]) mul[j] + add[j]` over three lists of integers of one length
+  (`src` -1 a constant): the shapes and bounds a model derives from a pass's device geometry, such
+  as a decoder's volume at each of its scales.
 
 **Windows.** The denoiser runs over windows of frames, each entry of a window step a lane's latent
 in a state buffer `stride` rows a lane (`lat_cu` bounds each entry's rows, `win_lane` names its
@@ -1194,8 +1237,8 @@ bf16 tensor and keeps f32 where it computes in f32; the libref function says whi
 
 | op | params | operands |
 |---|---|---|
-| `rms_mod` | `M`(range) `n` `eps`:f64 `gated`/opt `dtype` | `y`?, `g`?, `s`, `w`w, `cu_seqlens`, `x`:inout → `z` |
-| `rms_mod_quant_fp8` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` | `y`?, `g`?, `s`, `w`w, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`? |
+| `rms_mod` | `M`(range) `n` `eps`:f64 `gated`/opt `dtype` `wadd`:f64/opt `norm_once`/opt `norm`/opt | `y`?, `g`?, `s`, `w`w?, `cu_seqlens`, `x`:inout → `z` |
+| `rms_mod_quant_fp8` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` `wadd`:f64/opt `norm_once`/opt `norm`/opt | `y`?, `g`?, `s`, `w`w?, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`? |
 | `flow_x0_step` | `M`(range) `n` `dtype` | `v`, `t`, `sigma`, `sigma_next`, `x`:inout |
 | `patch_unfold` | `M`(range) `C` `pt` `ph` `pw` `mul` `add` `dtype` | `x`, `geom` → `y` |
 | `vtile_gather` | `M`(range) `n` `tile` `overlap` `frames` `period` `n_reg` `dtype` | `x`, `reg`w, `geom` → `y` |
@@ -1211,7 +1254,14 @@ reads its entry's rows of `s` and `g`.
   stored `x`), `n2 = bf16(n1 w)`, `m = bf16(n2 bf16(1 + scale[e]))`, `z = bf16(m + shift[e])`.
   `s` is `[n_seq, >= 2n]` at its own row pitch, `shift = s[e, 0:n]` and `scale = s[e, n:2n]` (a
   column slice of the modulation table); `g` is `[n_seq, >= n]` at its own pitch; `w` is `[n]`.
-  The residual rounds to `x`'s dtype and the norm chain to `z`'s.
+  The residual rounds to `x`'s dtype and the norm chain to `z`'s. `wadd` is added to the gain in
+  f32 (a zero-centred norm's `1 + w`), and with `norm_once` 1 the norm and its gain round together,
+  `n2 = bf16(x rsqrt(mean(x^2) + eps) (w + wadd))`, as an f32 RMS norm with a gain stores its
+  output (Krea 2's). `norm` `layer` (default `rms`) is a LayerNorm instead: `x` centred by its
+  mean (an f32 sum in ascending order) and `rsqrt` of the centred values' biased variance plus
+  `eps`. Without `w` the norm has no gain and rounds once, `n2 = bf16((x - mean) rsqrt(var +
+  eps))` (FLUX.3's LayerNorm without an affine). `norm` `none` takes no norm and no gain,
+  `n2 = x`, and refuses `w` (LTX-2's text keys and values, modulated as they are).
 - `rms_mod_quant_fp8` is `rms_mod` with the norm chain in bf16, then `quant_act_fp8` of that bf16
   row per `group` as `ln_mod_quant_fp8` takes it; `z` written when bound.
 - `flow_x0_step` is MiniMax-H3's sampler step over a lane's rows, all f32, each product and sum
@@ -1376,7 +1426,7 @@ pass starts from. Each op rounds once into its output (`libref/ref_video.cpp`).
 
 | op | params | operands |
 |---|---|---|
-| `conv3d_ndhwc` | `M`(range) `cin` `cout` `k` `kt` `dtype` | `x`, `w`w, `b`w, `geom`, `res`? → `y` |
+| `conv3d_ndhwc` | `M`(range) `cin` `cout` `k` `kt` `dtype` `tpad`/opt `tpre`/opt | `x`, `w`w, `b`w, `geom`, `res`? → `y` |
 | `group_norm` | `M`(range) `n` `groups` `eps`:f64 `act` `dtype` | `x`, `w`w, `b`w, `mod`?, `stats`:inout → `y` |
 | `tconv_dw` | `M`(range) `n` `k` `dtype` | `x`, `w`w, `b`w, `geom` → `y` |
 | `resize_bilinear` | `M`(range) `n` `dtype` | `x`, `geom` → `y` |
@@ -1395,7 +1445,10 @@ Every op honours its activation operands' row pitches. `rd` is a rounding into t
   `y[(t,i,j), o] = rd(f32(sum over (dt, kh, kw, ci) of w[o, ci, dt, kh, kw]
   x[(t+dt-kt/2, i+kh-k/2, j+kw-k/2), ci]) + b[o])`, terms outside the volume zero, f32 accumulation
   in an order of the implementation's (libref: the taps in `(dt, kh, kw)` order, each tap's
-  channels ascending). With `res`, `y = rd(rd(acc + b) + res)`: the convolution's output rounded,
+  channels ascending). `tpad` (optional) pads the frames instead with `replicate` (the edge frame
+  repeated, `kt/2` a side) or `causal` (the first frame repeated `kt - 1` times in front, nothing
+  after; with `tpre` that many more copies in front, and y then has `T + tpre` frames): LTX-2's
+  decoder and encoder. With `res`, `y = rd(rd(acc + b) + res)`: the convolution's output rounded,
   then the residual added and rounded, as a block's `skip(x) + h` in bf16. `res` may be the same
   memory as `y` (the residual added in place); `x` never aliases `y`. x, y, res and w bf16 (also
   f32), b bf16 or f32. MiniMax-H3: `k` = `kt` = 3, `(cin, cout)` `(24, 512)`, `(512, 512)`,
@@ -1436,6 +1489,134 @@ Every op honours its activation operands' row pitches. `rd` is a rounding into t
   `z(e) = rad_philox_normal_s(seed, stream, e)` (`abi/rad_philox.h`), `seed` u32 `[2]` low word
   first, `stream` the parameter. `x` f32 `[M, n]` at its row pitch. MiniMax-H3: `n` 96 (the video's
   patch rows) and 32 (the soundtrack's), `stream` 1.
+
+## LTX-2
+
+The ops LTX-2's audio-video transformer adds (`libref/ref_ltx.cpp`): its rotary over fractional
+coordinates, the per-head gate on every attention's output, and the sampler step that combines a
+step's guidance passes in the clean-estimate space. Each rounds where the reference rounds
+(diffusers' `transformer_ltx2.py` and `pipeline_ltx2.py`): the transformer in bf16, the rotary,
+guidance and sampler in f32.
+
+| op | params | operands |
+|---|---|---|
+| `rope_split` | `M`(range) `n_head` `head_dim` `dim` `n_dims` `theta`:f64 `max` `head0`/opt `dtype` | `x`:inout, `positions` |
+| `head_gate` | `M`(range) `n_head` `head_dim` `dtype` | `g`, `x`:inout |
+| `ltx_guide` | `M`(range) `n` `dtype` | `vc`, `vu`?, `vs`?, `vm`?, `scales`, `sched`, `stats`:inout, `x`:inout |
+| `pixel_norm` | `M`(range) `n` `eps`:f64 `form` `act`/opt `ileave`/opt `dtype` `mult`:f64/opt | `x` → `y` |
+| `d2s3d` | `M`(range) `C` `st` `sh` `sw` `drop`/opt `dtype` | `x`, `geom` → `y` |
+| `s2d3d` | `M`(range) `C` `st` `sh` `sw` `tpre`/opt `group`/opt `mode` `add`/opt `dtype` | `x`, `geom`, `y`:inout |
+| `pix_patch` | `M`(range) `p` `C` `order`/opt `dtype` | `x` → `y` |
+| `patch_pix8` | `M`(range) `p` `C` `order`/opt `dtype` | `x` → `y` |
+| `stft_logmel` | `M`(range) `hop` `nfft` `n_mel` `ch` `dtype` | `x`, `basis`w, `mel`w → `y` |
+| `bwe_up` | `M`(range) `ratio` `ch` `dtype` | `x`, `res` → `y` |
+| `vol_index` | `M`(range) | `geom` → `y` |
+| `tile_grid` | `M`(range) `tile` `stride` `rule`/opt `min`/opt `tile_t`/opt `stride_t`/opt `min_t`/opt `tail`/opt | `geom` → `y` |
+| `tile_crop` | `M`(range) `C` `dtype` | `x`, `geom`, `box` → `y` |
+| `tile_stitch` | `M`(range) `tile` `stride` `rule`/opt `min`/opt `tile_t`/opt `stride_t`/opt `min_t`/opt `scale` `scale_t`/opt `p` `C` `order`/opt `dtype` | `x`, `geom`, `first` → `y` |
+
+- `rope_split` is LTX2AudioVideoRotaryPosEmbed's "split" rotary. Over the full width `dim` of all
+  heads there are `P = dim / 2` pairs: the first `pad = P - steps n_dims` are not rotated, and the
+  rest are a frequency ladder `freq[k] = f32(theta^linspace(0, 1, steps)[k] pi / 2)` (f64 before
+  the cast, torch's linspace), `steps = P / n_dims`, its pairs interleaving the coordinates: pair
+  `pad + k n_dims + d` turns by coordinate `d` at `freq[k]`. A coordinate `c` gives the angle
+  `a = f32(f32(2 f32(c / max[d])) - 1) freq[k]`, `max` a list of `n_dims` values. Head `h` owns
+  pairs `[h hd/2, (h+1) hd/2)` and turns its halves against each other,
+  `o1 = f32(f32(x1 cos a) - f32(x2 sin a))`, `o2 = f32(f32(x2 cos a) + f32(x1 sin a))`, rounded to
+  `x`'s dtype. `head0` is the first head the operand holds (a rank's share). `positions` is
+  `[n_dims, M]`, f32 or integer, at its own strides. LTX-2.5: the video's self-attention `dim`
+  4096, `n_dims` 3, `max` `20 2048 2048` (two padded pairs); the soundtrack's and both cross
+  attentions' `dim` 2048, `n_dims` 1, `max` `20`; the text connectors' `max` 4096 over the row
+  index.
+- `head_gate`: `x = rd(x rd(2 rd(sigmoid(g))))` for each head's `head_dim` values, `g`
+  `[M, >= n_head]` the head's logit (the gated attention's `to_gate_logits`), each operand at its
+  own row pitch.
+- `ltx_guide` is one sampler step over a modality's latent `x` (f32 `[M, n]`, all of it: the
+  rescale's deviations are over every value) from its guidance passes' velocities (`[M, n]`, read
+  as f32), all in f32:
+
+      x0_p = f32(x - f32(v_p sigma))                                         each pass p
+      g    = x0_c [+ f32(f32(gs - 1) f32(x0_c - x0_u))] [+ f32(stg f32(x0_c - x0_s))]
+                  [+ f32(f32(ms - 1) f32(x0_c - x0_m))]                      left to right
+      r > 0:  g = f32(f32(r f32(g f32(std(x0_c) / std(g)))) + f32(f32(1 - r) g))
+      v    = f32(f32(x - g) / sigma),  x = f32(x + f32(f32(sigma_next - sigma) v))
+
+  A bracketed term is taken when its pass is bound and its coefficient is not zero. `std` is the
+  unbiased deviation over all `M n` values, accumulated in f64. `scales` is f32 `[4]`
+  `(gs, stg, ms, r)` and `sched` f32 `[2]` `(sigma, sigma_next)`, both read on the device; `stats`
+  is f32 of at least 8200 values, the implementation's scratch.
+
+Its VAE, audio VAE and vocoder run in bf16 tensors, and these ops round where those tensors are
+stored (`rd`, the output's dtype unless said).
+
+- `pixel_norm` is an RMS norm over each row's `n` values: `m = rd(sum rd(x^2) / n)` (f32 sum in
+  ascending order), then `form` `rsqrt` `z = rd(x rd(1 / sqrt(rd(m + eps))))` or `div`
+  `z = rd(x / rd(sqrt(rd(m + eps))))`, with `act` silu `z = rd(z / (1 + exp(-z)))`, and with
+  `mult` `z = rd(z mult)` (the connectors' scale to the DiT's width). The VAE's
+  PerChannelRMSNorm and the audio VAE's PixelNorm are the div form (with the SiLU after them
+  fused); the text connectors' per-layer norm is the rsqrt form, whose output `ileave` L
+  interleaves: x's row `t L + l` goes to columns `c L + l` of y's row `t`, as the reference
+  flattens `[C, layers]`.
+- `d2s3d` and `s2d3d` resample voxel rows (`geom` = x's `(T, H, W)`, i32 on the device), the
+  packed channel of `(c, a, b, d)` being `((c st + a) sh + b) sw + d` (a the frame offset, b the
+  row's, d the column's). `d2s3d` is the upsampler's depth to space,
+  `y[(t st + a - drop, i sh + b, j sw + d), c] = x[(t, i, j), packed]`, the first `drop` frames
+  dropped (by default `st - 1`, the causal mapping; 0 keeps them, as a decoder's tile that does not
+  start the video does). `s2d3d` is the downsampler's space to depth over the volume with `tpre` leading
+  frames prepended (frames `0 .. tpre - 1` again): `mode` copy writes the packed row, `mean`
+  averages each run of `group` packed channels (f32 sum, divided, one rounding); with `add` 1
+  `y = rd(y + v)`. `M` is x's rows.
+- `pix_patch` and `patch_pix8` are the patchifier both ways over dense 2-D operands whose shapes
+  give the sizes: a `p x p` patch of `C` channels is one row of `C p p` values, channel `c`'s
+  `(ph, pw)` at `c p p + pw p + ph` (`order` wh, LTX-2's) or `c p p + ph p + pw` (hw).
+  `pix_patch` takes an image `[H, W C]` to `[H / p, (W / p) C p p]`; `patch_pix8` takes patch rows
+  `[R, w C p p]` to RGB bytes `[R p, w p C]` by `to_rgba8`'s rule,
+  `round(255 clamp(rd(rd(clamp(v, -1, 1) / 2) + 0.5), 0, 1))`, rd x's dtype.
+- `vol_index` writes a volume's voxel coordinates, the rotary positions of attention over it:
+  `geom` = `(T, H, W)`, `y` i32 `[3, n]` component-major at its own row pitch, voxel
+  `m = (t H + i) W + j`'s `(t, i, j)` at column `m`, for `m < min(n, T H W)`.
+- `tile_grid`, `tile_crop` and `tile_stitch` run a decoder in tiles as diffusers does: LTX-2's VAE
+  (`tiled_decode`, `rule` `stride`, the default) and LTX-2.5's diffusion decoder
+  (`_tile_intervals`, `rule` `intervals`). Along an axis of `L` cells a tile starts at every
+  multiple of `stride` below `L`; under `intervals` an axis of `tile` cells or fewer is one tile, and
+  while more than one start is left and the last leaves fewer than `min` cells (default 1) that
+  start is dropped. A tile but the last is `min(tile, L - start)` long, the last runs to `L`. The
+  same cut with `tile_t`, `stride_t` and `min_t` makes time bands (without `tile_t`, one band of
+  every frame); tiles are raster-ordered over (time band, row band, column band). `tile_grid`
+  writes the tiles of the grid `geom` = `(T, H, W)` to `y` i32 `[M, 8]`, row k
+  `(t, h, w, t0, y0, x0, k, count)`, the last time band `tail` cells longer than its cut (frames a
+  decoder carries past `T`); rows past the count are zero. A row's `(t, h, w)` is a decoder's volume
+  operand and its first six entries `tile_crop`'s `box`: `tile_crop` copies the box
+  `y[(a, i, j)] = x[(t0 + a, y0 + i, x0 + j)]` out of the volume `x` (`geom` its `(T, H, W)`).
+  `tile_stitch` takes every tile's decoder output back to back in tile order: a cell is `scale`
+  patches of `p x p` pixels a side and `scale_t` frames (default 1), the video's first cell one
+  frame, so tile `(kt, i, j)` with cells `[t0, t1)` in time holds `scale_t (t1 - t0)` frames (less
+  `scale_t - 1` when `t0` is 0) of `(h scale) x (w scale)` rows of patches (`pix_patch`'s columns).
+  `geom` is the grid the tiles cut, `first` the first frame `y` holds, and `y` RGB bytes
+  `[n (H scale p), (W scale p) C]`. A frame is the time band whose kept frames hold it (a band but
+  the last keeps `stride_t scale_t`, the first `scale_t - 1` fewer), a pixel `(Y, X)` the tile
+  `(Y / s, X / s)` of that band, `s = stride scale p`, the last band of an axis keeping the rest.
+  With every product and sum rounded to `x`'s dtype and
+  `mix(a, b, k, e) = rd(rd(a f32(1 - k / e)) + rd(b f32(k / e)))`, a band's picture is diffusers'
+  in-place `blend_v` with the tile above and then `blend_h` with the tile to the left over
+  `min(their extents, (tile - stride) scale p)` pixels, the neighbours read as their own blends
+  left them (libref/ref_ltx.cpp writes the four-tile corner out), and a frame of a band within
+  `min(their frames, (tile_t - stride_t) scale_t)` of its start is `blend_t` of the band before and
+  this one; the byte is `patch_pix8`'s.
+- `stft_logmel` is each channel's causal log-mel spectrogram (the bandwidth extender's MelSTFT):
+  `x [S, ch]`, `basis [2F, 1, nfft]` (the windowed DFT, real then imaginary rows,
+  `F = nfft / 2 + 1`), `mel [n_mel, F]`; frame `t` reads samples `t hop + j - (nfft - hop)`, zero
+  before the start; `s_k = rd(sum_j basis[k, j] x)`,
+  `mag_k = rd(sqrt(rd(rd(re_k^2) + rd(im_k^2))))`,
+  `y[t, h n_mel + m] = rd(log(max(rd(sum_k mel[m, k] mag_k), rd(1e-5))))`; y is `[S / hop, ch n_mel]`.
+- `bwe_up` is the extender's output: x `[S, ch]` raised `ratio` times by its Hann-windowed sinc
+  resampler (width `w = ceil(6 / 0.99)`, `2 w ratio + 1` taps
+  `rd(sinc(u) cos^2(clamp(u, -6, 6) pi / 12) 0.99 / ratio)` with `u = f32(n / ratio - w) 0.99`,
+  the input's edges replicated), `up = rd(ratio rd(sum taps x))`, then
+  `y = clamp(rd(res + up), -1, 1)`; rd is x's dtype, y f32 or x's dtype.
+
+The VAEs' convolutions are `conv3d_ndhwc` with `tpad` and the audio VAE's `conv2d_nhwc` with
+`pad` causal.
 
 ## Mixture of experts
 
@@ -1582,9 +1763,9 @@ with `route_scale` 2.5.
 libr4d's `router_sigmoid_topk_f32` takes up to 512 experts and `top_k` up to 32, f32 logits, bias
 and weights, i32 ids, pitched rows, `M` up to 65535. It selects in one wave per row: each lane
 holds its experts as order-preserving keys (`-0` as `+0`, ties to the lower expert), and round `j`
-takes the largest key below round `j-1`'s winner. A row without NaN ranks gives the bytes of the
-serial scan. A NaN rank is never selected, and a row with fewer than `top_k` other ranks names
-expert 0 in its empty slots, weighted by expert 0's `p`.
+takes the largest key below round `j-1`'s winner. A row without NaN ranks gives the bytes of a
+serial scan with a strict `>`. A NaN rank is never selected, and a row with fewer than `top_k`
+other ranks names expert 0 in its empty slots, weighted by expert 0's `p`.
 
 **`router_sigmoid_topk_scatter`** (device-only) is `router_sigmoid_topk` and `moe_scatter` over its
 `ids` in one launch, and with `gate` `[M, 1]` also the `fill` of an ungated shared arm's gate with
@@ -1621,8 +1802,10 @@ at this dtype. The form follows the routed rows. The expert-major form, a block 
 expert) that reads each expert slice once, takes up to 511 rows, and at GLM's TP8 slices (288
 experts, top 8) gate_up up to 768 and down up to 6143. At those slices the wide prefill form (P64:
 jobs of 32 or 64 rows of one expert) takes gate_up from 769 rows and down from 5760, ahead of the
-expert-major band. Elsewhere the row-group forms serve. Every form gives the bytes of the
-arithmetic-decode row-group form (`tests/r4d_emu/test_moemx.cpp`).
+expert-major band. At GLM's TP4 slices the GLM prefill form (jobs of 32 rows of one expert, its
+loads a stage ahead) takes from 512 rows; elsewhere the row groups (16 sorted rows a block) serve.
+Every form gives the bytes of one per-element sequence, restated on the host by
+`tests/r4d_emu/test_moemx.cpp`.
 
 **`moe_gemm_q_mod4`** is the same GEMM over four classes by the expert's number mod 4. `w`/`w_scale`
 hold class 0 at `[N, K]` and `w_q`/`w_q_scale` class `q` at `[N_q, K_q]` (defaulting to `N`, `K`);
@@ -1730,12 +1913,12 @@ at most 32 tokens. `mode=prefill` commits its final state and sets the count to 
 scratch slot replays nothing.
 
 libr4d's `kda_update_k128_v128_bf16` takes `head_k = head_v = 128`, 1 to 65535 heads, bf16
-activations, f32 `A_log`, `dt_bias` and state, both modes and both state forms. A wave holds one,
-two or four value rows of a head (four by default, the next token's operands loaded while the
-current one reduces) and runs the sequence's tokens in order; every form gives the bytes of the
-one-row kernel (`tests/r4d_emu/test_kda.cpp`). Under `anchor`, `verify` replays the accepted prefix
-in a separate dispatch before the window, so no value row overwrites factors another is still
-reading. A sequence whose window or slots are out of bounds is skipped on the device, not refused.
+activations, f32 `A_log`, `dt_bias` and state, both modes and both state forms. A wave holds four
+value rows of a head, loads the next token's operands while the current one reduces and runs the
+sequence's tokens in order (held to libref by `r4d_selftest` and `tests/r4d_emu/test_kda.cpp`).
+Under `anchor`, `verify` replays the accepted prefix in a separate dispatch before the window, so
+no value row overwrites factors another is still reading. A sequence whose window or slots are
+out of bounds is skipped on the device, not refused.
 
 **Speculative rollback is part of the schema** (`spec.md` §10). The recurrent state and the conv
 window have already absorbed rejected tokens, so the state cache is a rolling window of
@@ -2495,11 +2678,10 @@ it as bf16 high and low parts with f32 accumulation. At a multiple of 16 a tile 
 one query; otherwise it pairs eight heads of two neighbouring queries, loading a key once where
 both tables name the page, so GLM-5.3's 8 heads a rank fill the tile. The pairing walks the union
 of the two tables, so each chunk runs once, for tables of up to 520 entries; past that it pairs
-by table position, with a second pass where the two differ.
-`RADIANCE_MLA_MATRIX_MAX_M` lowers the matrix row's `M` bound (65535 by default); past it the
-wave row, `mla_attn_bf16`, serves: a wave per head with an online softmax. Both split a short
-batch's history across workgroups and merge the f32 partials before narrowing, into the fixed
-scratch their hooks reserve; without scratch they compute unsplit.
+by table position, with a second pass where the two differ. Other head counts take the wave row,
+`mla_attn_bf16`: a wave per head with an online softmax. Both split a short batch's history across
+workgroups and merge the f32 partials before narrowing, into the fixed scratch their hooks
+reserve; without scratch they compute unsplit.
 
 `mla_project` moves a query into the latent and a latent result out of it, through the bf16
 weight `b` `[heads*2*head_dim, latent_dim]` that stores each head's key rows, then its value rows.
@@ -2512,8 +2694,8 @@ per-head width. Its rows are head-major, so a tensor-parallel slice of whole hea
 
 libr4d's `mla_project_bf16` serves `head_dim` 256 and `latent_dim` 512, up to 64 heads, pitched
 tensors. It takes up to eight rows a thread (`absorb`) or a wave (`expand`), loading each weight
-element once for them, with every row's sum in the one-row kernels' order, so all forms give the
-same bytes.
+element once for them, with every row's sum in the same order whatever the group, so a row's bytes
+do not depend on the batch.
 
 ## Draft heads
 

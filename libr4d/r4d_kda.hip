@@ -1,6 +1,5 @@
 /* Exact recurrent baseline for GLM KDA, including speculative candidate snapshots.
- * One wave owns one, two or four value rows and keeps each row's 128-wide state in four
- * registers per lane.
+ * One wave owns four value rows and keeps each row's 128-wide state in four registers per lane.
  * Prefill uses the same recurrence and commits only its final state. */
 #include <hip/hip_runtime.h>
 #include "r4d_args.h"
@@ -26,29 +25,16 @@ struct KdaJob : KdaMeta {
     const int *idx, *cu, *accepted, *init;
 };
 
-__device__ float sum(float v) {
-    for (int d = 16; d; d >>= 1) v += __shfl_down(v, d, 32);
-    return __shfl(v, 0, 32);
-}
-/* r4d_wave_sum adds the same partners in the same order as sum() does for lane 0, and every
- * other lane forms the same additions with the operands swapped, so all lanes hold lane 0's bits
- * without the broadcast. */
-template <bool Dpp>
-__device__ __forceinline__ float wave_total(float v) {
-    if constexpr (Dpp)
-        return r4d_wave_sum(v);
-    else
-        return sum(v);
-}
 __device__ long factor_offset(long base, int logical, long pitch) {
     return base + (logical / 128) * pitch + (logical % 128);
 }
 /* Separate dispatch: all old factor reads finish before the next window overwrites them. */
-template <bool Dpp>
 __global__ void kda_replay_kernel(float* state, const int* idx, const int* cu, const int* accepted,
                                   const int* init, KdaMeta m) {
     const int lane = threadIdx.x & 31, e = blockIdx.x * 4 + (threadIdx.x >> 5), head = blockIdx.y,
               seq = blockIdx.z;
+    /* A sequence without tokens this step leaves its slots as they are. */
+    if (cu[(long)seq * m.cs0] == cu[(long)(seq + 1) * m.cs0]) return;
     const int anchor = idx[(long)seq * m.is0],
               scratch = idx[(long)seq * m.is0 + (m.width / 2) * m.is1];
     if (anchor < 0 || anchor >= m.slots || scratch < 0 || scratch >= m.slots || anchor == scratch)
@@ -80,123 +66,17 @@ __global__ void kda_replay_kernel(float* state, const int* idx, const int* cu, c
         }
         const float delta =
             state[factor_offset(fb, f + 384, m.ss2)] *
-            (state[factor_offset(fb, f + 128 + e, m.ss2)] - wave_total<Dpp>(prediction));
+            (state[factor_offset(fb, f + 128 + e, m.ss2)] - r4d_wave_sum(prediction));
 #pragma unroll
         for (int d = 0; d < 4; ++d) s[d] += delta * k[d];
     }
 #pragma unroll
     for (int d = 0; d < 4; ++d) state[sb + lane + d * 32] = s[d];
 }
-__global__ void kda_update_kernel(const uint16_t* q, const uint16_t* k, const uint16_t* v,
-                                  const uint16_t* g, const uint16_t* beta, const float* alog,
-                                  const float* bias, float* state_ptr, uint16_t* out,
-                                  const int* idx, const int* cu, const int* accepted_ptr,
-                                  const int* init, KdaMeta meta) {
-    KdaJob j{};
-    static_cast<KdaMeta&>(j) = meta;
-    j.input[0] = q;
-    j.input[1] = k;
-    j.input[2] = v;
-    j.input[3] = g;
-    j.input[4] = beta;
-    j.alog = alog;
-    j.bias = bias;
-    j.state = state_ptr;
-    j.out = out;
-    j.idx = idx;
-    j.cu = cu;
-    j.accepted = accepted_ptr;
-    j.init = init;
-    const int lane = threadIdx.x & 31, e = blockIdx.x * 4 + (threadIdx.x >> 5);
-    const int head = blockIdx.y, seq = blockIdx.z;
-    const int begin = j.cu[(long)seq * j.cs0], end = j.cu[(long)(seq + 1) * j.cs0];
-    const int accepted = j.accepted ? j.accepted[(long)seq * j.as0] : 1;
-    if (begin < 0 || end < begin || end > j.tokens || accepted < 1 ||
-        accepted > (j.anchor ? 32 : j.width) ||
-        (j.verify && end - begin > (j.anchor ? 32 : j.width)))
-        return;
-    const int read = j.idx[(long)seq * j.is0 + (j.verify && !j.anchor ? accepted - 1 : 0) * j.is1];
-    if (read >= j.slots) return;
-    if (read < 0) {
-        if (!lane)
-            for (int t = begin; t < end; ++t) j.out[(long)t * j.os0 + (long)head * j.os1 + e] = 0;
-        return;
-    }
-    const bool initialized = !j.init || j.init[(long)seq * j.hs0] != 0;
-    const int scratch = j.anchor ? j.idx[(long)seq * j.is0 + (j.width / 2) * j.is1] : 0;
-    if (j.anchor && (scratch < 0 || scratch >= j.slots || scratch == read)) return;
-    const long fb = (long)scratch * j.ss0 + (long)head * j.ss1;
-    const long initial = (long)read * j.ss0 + (long)head * j.ss1 + (long)e * j.ss2;
-    float state[4];
-#pragma unroll
-    for (int d = 0; d < 4; ++d) state[d] = initialized ? j.state[initial + lane + 32 * d] : 0;
-    const float gain = expf(j.alog[head]);
-    for (int t = begin; t < end; ++t) {
-        float q[4], k[4], decay[4], sq = 0, sk = 0;
-#pragma unroll
-        for (int d = 0; d < 4; ++d) {
-            const int channel = lane + d * 32;
-            q[d] = bf16_to_f32(j.input[0][(long)t * j.row[0] + (long)head * j.head[0] + channel]);
-            k[d] = bf16_to_f32(j.input[1][(long)t * j.row[1] + (long)head * j.head[1] + channel]);
-            sq += q[d] * q[d];
-            sk += k[d] * k[d];
-            const float raw =
-                bf16_to_f32(j.input[3][(long)t * j.row[3] + (long)head * j.head[3] + channel]);
-            decay[d] = expf(j.lower / (1.0f + expf(-gain * (raw + j.bias[head * 128 + channel]))));
-        }
-        const float qi = j.scale * rsqrtf(sum(sq) + j.eps), ki = rsqrtf(sum(sk) + j.eps);
-        const float beta =
-            1.0f /
-            (1.0f + expf(-bf16_to_f32(j.input[4][(long)t * j.row[4] + (long)head * j.head[4]])));
-        float predicted = 0;
-#pragma unroll
-        for (int d = 0; d < 4; ++d) {
-            q[d] *= qi;
-            k[d] *= ki;
-            state[d] *= decay[d];
-            predicted += state[d] * k[d];
-        }
-        predicted = sum(predicted);
-        const float value =
-            bf16_to_f32(j.input[2][(long)t * j.row[2] + (long)head * j.head[2] + e]);
-        if (j.anchor && j.verify) {
-            const int f = 1 + (t - begin) * 385;
-            if (e == 0) {
-#pragma unroll
-                for (int d = 0; d < 4; ++d) {
-                    const int c = lane + 32 * d;
-                    j.state[factor_offset(fb, f + c, j.ss2)] = k[d];
-                    j.state[factor_offset(fb, f + 256 + c, j.ss2)] = decay[d];
-                }
-                if (!lane) j.state[factor_offset(fb, f + 384, j.ss2)] = beta;
-            }
-            if (!lane) j.state[factor_offset(fb, f + 128 + e, j.ss2)] = value;
-        }
-        const float delta = beta * (value - predicted);
-        float result = 0;
-#pragma unroll
-        for (int d = 0; d < 4; ++d) {
-            state[d] += delta * k[d];
-            result += state[d] * q[d];
-        }
-        result = sum(result);
-        if (!lane) j.out[(long)t * j.os0 + (long)head * j.os1 + e] = f32_to_bf16(result);
-        if ((!j.anchor && j.verify) || (!j.verify && t + 1 == end)) {
-            const int write = j.idx[(long)seq * j.is0 + (j.verify ? t - begin : 0) * j.is1];
-            if (write >= 0 && write < j.slots) {
-                const long target = (long)write * j.ss0 + (long)head * j.ss1 + (long)e * j.ss2;
-#pragma unroll
-                for (int d = 0; d < 4; ++d) j.state[target + lane + 32 * d] = state[d];
-            }
-        }
-    }
-    if (j.anchor && e == 0 && !lane) j.state[fb] = j.verify ? (float)(end - begin) : 0.0f;
-}
-/* kda_update_kernel with R value rows a wave: the loads, norms and decay exponentials, which do
- * not depend on the state, are formed once for R rows, and the rows' reductions interleave. Each
- * row's arithmetic is kda_update_kernel's in its order, so the bytes match (selftest --perfkda).
- * With Prefetch the next token's operands are loaded while this one is reduced. */
-template <int R, bool Prefetch>
+/* R value rows a wave: the loads, norms and decay exponentials, which do not depend on the state,
+ * are formed once for R rows, and the rows' reductions interleave. The next token's operands are
+ * loaded while this one is reduced. */
+template <int R>
 __global__ void kda_rows_kernel(const uint16_t* q, const uint16_t* k, const uint16_t* v,
                                 const uint16_t* g, const uint16_t* beta, const float* alog,
                                 const float* bias, float* state_ptr, uint16_t* out, const int* idx,
@@ -222,7 +102,7 @@ __global__ void kda_rows_kernel(const uint16_t* q, const uint16_t* k, const uint
     const int head = blockIdx.y, seq = blockIdx.z;
     const int begin = j.cu[(long)seq * j.cs0], end = j.cu[(long)(seq + 1) * j.cs0];
     const int accepted = j.accepted ? j.accepted[(long)seq * j.as0] : 1;
-    if (begin < 0 || end < begin || end > j.tokens || accepted < 1 ||
+    if (begin < 0 || end <= begin || end > j.tokens || accepted < 1 ||
         accepted > (j.anchor ? 32 : j.width) ||
         (j.verify && end - begin > (j.anchor ? 32 : j.width)))
         return;
@@ -269,14 +149,11 @@ __global__ void kda_rows_kernel(const uint16_t* q, const uint16_t* k, const uint
         for (int r = 0; r < R; ++r) o.value[r] = ldg_u16(vb + (long)t * j.row[2] + r);
     };
     Token cur;
-    if (Prefetch && begin < end) fetch(begin, cur);
+    if (begin < end) fetch(begin, cur);
     for (int t = begin; t < end; ++t) {
-        [[maybe_unused]] Token next;
+        Token next;
         /* The last token loads itself again rather than a row past `end`. */
-        if constexpr (Prefetch)
-            fetch(t + 1 < end ? t + 1 : t, next);
-        else
-            fetch(t, cur);
+        fetch(t + 1 < end ? t + 1 : t, next);
         float qv[4], kv[4], decay[4], sq = 0, sk = 0;
 #pragma unroll
         for (int d = 0; d < 4; ++d) {
@@ -355,7 +232,7 @@ __global__ void kda_rows_kernel(const uint16_t* q, const uint16_t* k, const uint
                         j.state[target + r * j.ss2 + lane + 32 * d] = state[r][d];
             }
         }
-        if constexpr (Prefetch) cur = next;
+        cur = next;
     }
     if (j.anchor && e0 == 0 && !lane) j.state[fb] = j.verify ? (float)(end - begin) : 0.0f;
 }
@@ -448,44 +325,18 @@ int body(const RadArgs* a, RadStream stream) {
         j.init = (const int*)init->data;
         j.hs0 = init->stride[0];
     }
-    /* RADIANCE_KDA_FORM=old is the one-row kernel on shuffle sums, the reference the selftest
-     * holds every form to byte for byte; RADIANCE_KDA_ROWS (1, 2 or 4 value rows a wave) and
-     * RADIANCE_KDA_PREFETCH=0 pin the other form's variants for the microbenchmark. */
-    const char* kform = std::getenv("RADIANCE_KDA_FORM");
-    const bool old = kform && !std::strcmp(kform, "old");
     const unsigned seqs = (unsigned)(cu.shape[0] - 1);
     if (j.anchor && j.verify) {
         const int rc =
-            old ? R4D_EMIT(stream, kda_replay_kernel<false>, dim3(32, (unsigned)H, seqs), dim3(128),
-                           0, j.state, j.idx, j.cu, j.accepted, j.init, static_cast<KdaMeta>(j))
-                : R4D_EMIT(stream, kda_replay_kernel<true>, dim3(32, (unsigned)H, seqs), dim3(128),
-                           0, j.state, j.idx, j.cu, j.accepted, j.init, static_cast<KdaMeta>(j));
+            R4D_EMIT(stream, kda_replay_kernel, dim3(32, (unsigned)H, seqs), dim3(128), 0, j.state,
+                     j.idx, j.cu, j.accepted, j.init, static_cast<KdaMeta>(j));
         if (rc != RAD_OK) return rc;
     }
-    if (old)
-        return R4D_EMIT(stream, kda_update_kernel, dim3(32, (unsigned)H, seqs), dim3(128), 0,
-                        j.input[0], j.input[1], j.input[2], j.input[3], j.input[4], j.alog, j.bias,
-                        j.state, j.out, j.idx, j.cu, j.accepted, j.init, static_cast<KdaMeta>(j));
-    const char* rows_env = std::getenv("RADIANCE_KDA_ROWS");
-    const long rows = rows_env && *rows_env ? std::strtol(rows_env, nullptr, 10) : 4;
-    const char* prefetch_env = std::getenv("RADIANCE_KDA_PREFETCH");
-    const bool prefetch = !prefetch_env || prefetch_env[0] != '0';
-#define KDA_ROWS(RR, PF)                                                                           \
-    return R4D_EMIT(stream, (kda_rows_kernel<RR, PF>), dim3(32 / RR, (unsigned)H, seqs),           \
-                    dim3(128), 0, j.input[0], j.input[1], j.input[2], j.input[3], j.input[4],      \
-                    j.alog, j.bias, j.state, j.out, j.idx, j.cu, j.accepted, j.init,               \
-                    static_cast<KdaMeta>(j))
-    if (rows == 1) {
-        if (prefetch) KDA_ROWS(1, true);
-        KDA_ROWS(1, false);
-    }
-    if (rows == 2) {
-        if (prefetch) KDA_ROWS(2, true);
-        KDA_ROWS(2, false);
-    }
-    if (prefetch) KDA_ROWS(4, true);
-    KDA_ROWS(4, false);
-#undef KDA_ROWS
+    constexpr int kRows = 4;
+    return R4D_EMIT(stream, (kda_rows_kernel<kRows>), dim3(32 / kRows, (unsigned)H, seqs),
+                    dim3(128), 0, j.input[0], j.input[1], j.input[2], j.input[3], j.input[4],
+                    j.alog, j.bias, j.state, j.out, j.idx, j.cu, j.accepted, j.init,
+                    static_cast<KdaMeta>(j));
 }
 }
 extern "C" int r4d_rad_kda_update(const RadArgs* a, RadStream stream) { return body(a, stream); }
