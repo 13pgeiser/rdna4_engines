@@ -12,14 +12,12 @@
 //! one layout, and judges request shapes against the frozen profile. It never
 //! touches a GPU, so every number here is exercised by CPU tests.
 //!
-//! # Selector truth table
-//!
 //! `HIPFIRE_QWEN4_SLOWLINK_PREFILL` (`developer.qwen4_slowlink_prefill`, a
 //! typed boolean): `0` incumbent (kill switch), `1` lab candidate, unset
-//! automatic. Automatic is gated by [`S1_AUTO_QUALIFIED`], which stays `false`
-//! until every promotion gate has passed, so an unset selector is the incumbent
-//! today. The candidate (forced or, later, automatic) is selected only when
-//! all of these hold, checked in this order, cheapest first:
+//! automatic. The automatic selector admits S1 from 1,537 rows (one row past
+//! the 1,536-row tile: the first genuinely multi-chunk request). The
+//! candidate (forced or automatic) is selected only when all of these hold,
+//! checked in this order, cheapest first:
 //!
 //! 1. exact `gfx1100`, a discrete device ([`preflight`]);
 //! 2. the qualified MQ4 packed recipe on a single-device, whole-model,
@@ -88,20 +86,17 @@ pub const S1_WINDOW_ROWS: usize = 16384;
 /// bypass). The automatic selector starts at [`S1_MIN_AUTO_REQUEST_ROWS`].
 pub const S1_MIN_FORCED_REQUEST_ROWS: usize = S1_TILE_ROWS + 1;
 
-/// Fewest request rows the automatic selector sends to S1: where the
-/// performance qualification starts. The 1,400 tok/s target is not
-/// generalised to shorter prompts.
-pub const S1_MIN_AUTO_REQUEST_ROWS: usize = 16384;
+/// Fewest request rows the automatic selector sends to S1: one row past the
+/// tile, the first genuinely multi-chunk request. Requests of at most one
+/// tile are a named bypass; the 1,400 tok/s target is not generalised to
+/// shorter prompts.
+pub const S1_MIN_AUTO_REQUEST_ROWS: usize = S1_TILE_ROWS + 1;
 
 /// Preferred resident trunk layers of an S1 load beside its own charges.
 /// INFORMATION ONLY: placement keeps the largest count that fits
 /// ([`PlacementBudget::largest_fitting_layers`]), which may be fewer (down to
 /// zero) or more; no kernel or correctness gate needs this many.
 pub const S1_PREFERRED_RESIDENT_LAYERS: usize = 10;
-
-/// Whether an unset selector may choose S1. `false` until every promotion
-/// gate has passed; the kill switch and the lab force work either way.
-pub const S1_AUTO_QUALIFIED: bool = false;
 
 /// Routed experts one transport page holds.
 pub const EXPERTS_PER_PAGE: usize = 32;
@@ -235,8 +230,6 @@ pub struct Deficit {
 pub enum SlowlinkDecline {
     /// `HIPFIRE_QWEN4_SLOWLINK_PREFILL=0`.
     KillSwitch,
-    /// Unset selector while [`S1_AUTO_QUALIFIED`] is `false`.
-    AutoNotQualified,
     UnqualifiedArch(String),
     UnifiedMemory,
     Unsupported(&'static str),
@@ -277,9 +270,6 @@ impl fmt::Display for SlowlinkDecline {
         const MIB: u64 = 1 << 20;
         match self {
             Self::KillSwitch => write!(f, "{SLOWLINK_PREFILL_ENV}=0"),
-            Self::AutoNotQualified => {
-                write!(f, "automatic selection is not qualified; unset is the incumbent")
-            }
             Self::UnqualifiedArch(arch) => write!(f, "{arch} is not gfx1100"),
             Self::UnifiedMemory => write!(f, "unified memory has no link to stream over"),
             Self::Unsupported(what) => write!(f, "unsupported mode: {what}"),
@@ -337,10 +327,8 @@ fn explicit_chunk_rows(env: Option<&str>) -> Option<usize> {
 /// the host link. Order is part of the contract (cheapest and most absolute
 /// first), so an automatic or killed selector never reaches the rest.
 pub fn preflight(mode: SlowlinkMode, shape: &LoadShape<'_>) -> Result<(), SlowlinkDecline> {
-    match mode {
-        SlowlinkMode::Off => return Err(SlowlinkDecline::KillSwitch),
-        SlowlinkMode::Auto if !S1_AUTO_QUALIFIED => return Err(SlowlinkDecline::AutoNotQualified),
-        SlowlinkMode::Force | SlowlinkMode::Auto => {}
+    if mode == SlowlinkMode::Off {
+        return Err(SlowlinkDecline::KillSwitch);
     }
     if shape.arch != "gfx1100" {
         return Err(SlowlinkDecline::UnqualifiedArch(shape.arch.to_string()));
@@ -2048,11 +2036,9 @@ pub fn select_profile(
             "qwen4: {SLOWLINK_PREFILL_ENV}=1 cannot be admitted: {decline}"
         ));
     }
-    if decline != SlowlinkDecline::AutoNotQualified {
-        eprintln!(
-            "  qwen4 slow-link prefill (S1): not selected ({decline}); incumbent placement unchanged"
-        );
-    }
+    eprintln!(
+        "  qwen4 slow-link prefill (S1): not selected ({decline}); incumbent placement unchanged"
+    );
     Ok(None)
 }
 
@@ -2397,7 +2383,6 @@ pub struct RequestVerdict {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestBypass {
     KillSwitch,
-    AutoNotQualified,
     TooShort {
         rows: usize,
         minimum: usize,
@@ -2422,7 +2407,6 @@ pub fn qualify_request(
 ) -> Result<RequestVerdict, RequestBypass> {
     let minimum = match mode {
         SlowlinkMode::Off => return Err(RequestBypass::KillSwitch),
-        SlowlinkMode::Auto if !S1_AUTO_QUALIFIED => return Err(RequestBypass::AutoNotQualified),
         SlowlinkMode::Auto => S1_MIN_AUTO_REQUEST_ROWS,
         SlowlinkMode::Force => S1_MIN_FORCED_REQUEST_ROWS,
     };
@@ -2598,12 +2582,8 @@ mod tests {
     }
 
     #[test]
-    fn slowlink_admission_unset_is_the_incumbent_until_qualified() {
-        assert!(!S1_AUTO_QUALIFIED, "default-off until every gate passes");
-        assert_eq!(
-            preflight(SlowlinkMode::Auto, &shape()),
-            Err(SlowlinkDecline::AutoNotQualified)
-        );
+    fn slowlink_admission_unset_selects_automatically_with_kill_switch_only() {
+        assert_eq!(preflight(SlowlinkMode::Auto, &shape()), Ok(()));
         assert_eq!(
             preflight(SlowlinkMode::Off, &shape()),
             Err(SlowlinkDecline::KillSwitch)
@@ -4560,7 +4540,10 @@ mod tests {
         );
         assert_eq!(
             qualify_request(SlowlinkMode::Auto, &profile, &req(16384)),
-            Err(RequestBypass::AutoNotQualified)
+            Ok(RequestVerdict {
+                rows: 16384,
+                windows: 1
+            })
         );
         assert_eq!(
             qualify_request(SlowlinkMode::Force, &profile, &req(0)),
@@ -4621,7 +4604,28 @@ mod tests {
                 maximum: 4
             })
         );
-        assert_eq!(S1_MIN_AUTO_REQUEST_ROWS, 16384);
+        // Automatic and forced share the 1537-row floor (one row past the
+        // tile): at most one tile is a named bypass on either selector.
+        assert_eq!(S1_MIN_AUTO_REQUEST_ROWS, 1537);
+        assert_eq!(S1_MIN_FORCED_REQUEST_ROWS, 1537);
+        for mode in [SlowlinkMode::Auto, SlowlinkMode::Force] {
+            assert_eq!(
+                qualify_request(mode, &profile, &req(1536)),
+                Err(RequestBypass::TooShort {
+                    rows: 1536,
+                    minimum: 1537
+                }),
+                "{mode:?}"
+            );
+            assert_eq!(
+                qualify_request(mode, &profile, &req(1537)),
+                Ok(RequestVerdict {
+                    rows: 1537,
+                    windows: 1
+                }),
+                "{mode:?}"
+            );
+        }
         assert_eq!(profile.windows_for(1), 1);
         assert_eq!(profile.windows_for(32768), 2);
     }

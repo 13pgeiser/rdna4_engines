@@ -922,8 +922,44 @@ impl Qwen4Bundle {
     }
 
     /// The orchestrator's complete receipt of the request (route, windows,
-    /// bytes, spans); stored as given.
+    /// bytes, spans); stored as given. The layer-major publication emits the
+    /// `qwen4 prefill route` DEBUG event from the receipt's own borrowed
+    /// scalars (`selected_by`, `entry_pos`, `prompt_rows`, `tile_rows`,
+    /// `resident_layers`); the incumbent path emits at
+    /// [`Self::slowlink_record_incumbent`].
     pub(crate) fn slowlink_set_receipt(&mut self, receipt: Value) {
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let selected_by = receipt
+                .get("selected_by")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let entry_pos = receipt
+                .get("entry_pos")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let prompt_rows = receipt
+                .get("prompt_rows")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let tile_rows = receipt
+                .get("tile_rows")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let resident_layers = receipt
+                .get("resident_layers")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            Self::trace_prefill_route(
+                true,
+                "layer-major",
+                selected_by,
+                None,
+                entry_pos as usize,
+                prompt_rows as usize,
+                resident_layers as usize,
+                tile_rows as usize,
+            );
+        }
         self.slowlink.receipt = Some(StoredReceipt::Json(receipt));
         self.slowlink.receipt_fresh = true;
     }
@@ -1009,6 +1045,23 @@ impl Qwen4Bundle {
             .execution
             .as_ref()
             .map_or(0, |forward| forward.scratch.max_chunk);
+        let prompt_rows: usize = windows.iter().map(|window| window.1).sum();
+        let bypass_reason = self.slowlink.bypass.as_deref();
+        let selected_by = match crate::slowlink_admission::SlowlinkMode::from_env() {
+            crate::slowlink_admission::SlowlinkMode::Off => "env0",
+            crate::slowlink_admission::SlowlinkMode::Force => "env1",
+            crate::slowlink_admission::SlowlinkMode::Auto => "auto",
+        };
+        Self::trace_prefill_route(
+            false,
+            "incumbent",
+            selected_by,
+            bypass_reason,
+            entry,
+            prompt_rows,
+            0,
+            tile_rows,
+        );
         self.slowlink.receipt = Some(StoredReceipt::Incumbent {
             reason: self.slowlink.bypass.take(),
             entry,
@@ -1016,6 +1069,35 @@ impl Qwen4Bundle {
             tile_rows,
         });
         self.slowlink.receipt_fresh = true;
+    }
+    /// The DEBUG route event of one prefill request (`qwen4 prefill route`):
+    /// the existing receipt's own scalars, borrowed at publication, never
+    /// cloned for logging. Disabled (the default) it performs no allocation
+    /// or work beyond the enabled check: every argument is a scalar or
+    /// `&str`, and the one `Option<&str>` formats as empty when absent.
+    fn trace_prefill_route(
+        selected: bool,
+        route: &str,
+        selected_by: &str,
+        bypass_reason: Option<&str>,
+        entry_pos: usize,
+        prompt_rows: usize,
+        resident_layers: usize,
+        tile_rows: usize,
+    ) {
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                selected,
+                route,
+                selected_by,
+                bypass_reason = bypass_reason.unwrap_or(""),
+                entry_pos,
+                prompt_rows,
+                resident_layers,
+                tile_rows,
+                "qwen4 prefill route",
+            );
+        }
     }
 
     /// Why this request cannot run layer-major, judged on host state alone

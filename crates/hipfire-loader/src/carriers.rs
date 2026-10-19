@@ -7957,16 +7957,30 @@ mod qwen4_slowlink_tests {
     }
 
     #[test]
-    fn slowlink_unset_and_killed_selectors_never_probe_or_build_inputs() {
-        for mode in [s1::SlowlinkMode::Auto, s1::SlowlinkMode::Off] {
+    fn slowlink_killed_selector_never_probes_or_builds_inputs() {
+        let (probes, builds, outcome) = select(
+            s1::SlowlinkMode::Off,
+            "gfx1100",
+            HostLink::Discrete { gbps: 7.09 },
+            free_for(10),
+        );
+        assert_eq!((probes, builds), (0, 0));
+        assert_eq!(outcome, Ok(None));
+    }
+
+    #[test]
+    fn slowlink_unset_selector_probes_and_admits_like_force() {
+        for mode in [s1::SlowlinkMode::Auto, s1::SlowlinkMode::Force] {
             let (probes, builds, outcome) = select(
                 mode,
                 "gfx1100",
                 HostLink::Discrete { gbps: 7.09 },
                 free_for(10),
             );
-            assert_eq!((probes, builds), (0, 0), "{mode:?}");
-            assert_eq!(outcome, Ok(None), "{mode:?}");
+            assert_eq!((probes, builds), (1, 1), "{mode:?}");
+            let profile = outcome.unwrap().expect("admitted");
+            assert_eq!(profile.resident_layers, 10, "{mode:?}");
+            assert_eq!(profile.tile_rows, s1::S1_PRODUCT_TILE_ROWS, "{mode:?}");
         }
     }
 

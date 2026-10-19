@@ -2311,7 +2311,20 @@ fn with_tile_frames<T>(
         .weights
         .layer(layer_index)
         .ok_or_else(|| invalid(format!("layer {layer_index} is not owned by this band")))?;
-    let layer_moe = forward.moe.get(layer_index).and_then(Option::as_ref);
+    // The D2 executor gate (`cpu_split_executor`) sees only the row count, so
+    // the dry-run and execution frames bind the same selected-runtime view as
+    // the forward loop: the runtime this layer actually selected with no
+    // executor. S1 never runs expert parallel, so no balanced-live or EP-full
+    // runtime exists here and the selection is the static runtime; it is
+    // written through the shared selector so a future caller that does select
+    // another runtime cannot silently bind the wrong one.
+    let layer_moe = crate::gpu_forward::select_layer_moe(
+        None::<&crate::gpu_forward::Qwen4MoeLayerRuntime>,
+        None,
+        false,
+        false,
+        forward.moe.get(layer_index).and_then(Option::as_ref),
+    );
     let tile_streams: Vec<GpuTensor> = tiles
         .iter()
         .map(|tile| f32_view(streams, tile.stream_offset, tile.rows * geo.wide))

@@ -1708,7 +1708,7 @@ impl Qwen4MoeLayerRuntime {
 /// few-row forward), else for an EP forward's full chunk (`full_chunk`) the
 /// static runtime under a tile route or the EP full table (`ep_full`: `None`
 /// outside EP, `Some(layer's full runtime)` under EP), else the static runtime.
-fn select_layer_moe<'a, R>(
+pub(crate) fn select_layer_moe<'a, R>(
     balanced_live: Option<&'a R>,
     ep_full: Option<Option<&'a R>>,
     full_chunk: bool,
@@ -1732,7 +1732,7 @@ fn select_layer_moe<'a, R>(
 /// layer selected, never of another runtime (the layer's table and cache are
 /// bound to the selected one). Without a selected runtime the description's
 /// own binding stands.
-fn bind_routed_view<'a, R>(
+pub(crate) fn bind_routed_view<'a, R>(
     selected: Option<&'a R>,
     bound: &'a dyn RoutedExpertWeights,
     view: impl FnOnce(&'a R) -> &'a dyn RoutedExpertWeights,
