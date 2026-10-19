@@ -900,8 +900,8 @@ fn decode_run(
     call: &DecodeCall<'_>,
     picks: &mut [u32],
 ) -> Result<(), StepFailure> {
-    let result = if decode_overlap_enabled(std::env::var("HIPFIRE_PP_LANE_OVERLAP").ok().as_deref())
-    {
+    let overlap = hipfire_config::developer_var("HIPFIRE_PP_LANE_OVERLAP").ok();
+    let result = if decode_overlap_enabled(overlap.as_deref()) {
         decode_run_overlap(refs, stores, gpus, bounce, events, call, picks)
     } else {
         decode_run_sequential(refs, stores, gpus, bounce, call, picks)
