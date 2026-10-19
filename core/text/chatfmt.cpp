@@ -7,6 +7,7 @@
  * reply. */
 #include "llama/common/chat.h"
 #include "llama/common/chat-auto-parser.h"
+#include "llama/common/chat-auto-parser-helpers.h"
 #include "llama/common/json-schema-to-grammar.h"
 #include "shim/log.h"
 
@@ -120,6 +121,29 @@ int reasoning_anywhere_check(const ChatFormat& f, std::string* why) {
     return RAD_OK;
 }
 
+/* Does the template write an argument's value on lines of its own? Then one newline at each end
+ * is the tags' (ChatFormat::value_newlines). A template that writes it flush against its tags
+ * (`<arg_value>VALUE</arg_value>`) leaves those newlines to the value; reading them as the tags'
+ * would drop a written file's last line break. A render that fails counts as own lines. */
+bool value_on_own_lines(const common_chat_template& tmpl, const ChatFormat& c) {
+    static const char* const kValue = "RADIANCE_VALUE_PROBE";
+    ojson call = { { "id", "call_0" }, { "type", "function" } };
+    call["function"] = { { "name", "probe" }, { "arguments", { { "arg", kValue } } } };
+    ojson reply = { { "role", "assistant" }, { "content", "" } };
+    reply["tool_calls"] = ojson::array({ call });
+    ojson params = { { "type", "object" } };
+    params["properties"]["arg"]["type"] = "string";
+    ojson tool = { { "type", "function" } };
+    tool["function"] = { { "name", "probe" }, { "description", "probe" } };
+    tool["function"]["parameters"] = params;
+    template_params tp;
+    tp.messages = ojson::array({ ojson{ { "role", "user" }, { "content", "hi" } }, reply });
+    tp.tools = ojson::array({ tool });
+    const std::string r = autoparser::apply_template(tmpl, tp);
+    const std::string flush = c.arg_name_suffix + c.arg_value_prefix + kValue + c.arg_value_suffix;
+    return r.find(flush) == std::string::npos;
+}
+
 }  /* namespace */
 
 /* ================================================================== validity */
@@ -162,9 +186,10 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
     if (f.call_open.empty() && !f.call_close.empty())
         return no("call_close without call_open");
     const bool object = f.object_args();
-    /* An object's own `{` may be what ends the name; anything else needs its suffix. */
-    if (!object || !f.name_suffix.empty()) {
-        if (f.name_suffix.empty() || trim_ws(f.name_suffix).empty())
+    /* Without a suffix the name ends at what follows it: the object's `{`, or a tagged call's
+     * first argument or close. */
+    if (!f.name_suffix.empty()) {
+        if (trim_ws(f.name_suffix).empty())
             return no("name_suffix must end the function name with something besides whitespace");
         if (is_ws((unsigned char)f.name_suffix[0]))
             return no("name_suffix " + show(f.name_suffix) + " may not begin with whitespace");
@@ -176,9 +201,17 @@ int chat_format_check(const ChatFormat& f, std::string* why) {
         if (f.arg_name_suffix.empty() && f.arg_value_prefix.empty())
             return no("nothing ends an argument name: arg_name_suffix and arg_value_prefix are "
                       "empty");
-        if (!f.arg_name_suffix.empty() && !f.arg_value_prefix.empty())
-            return no("arg_name_suffix and arg_value_prefix are both set; the streaming parser "
-                      "reads one delimiter between an argument's name and its value");
+        if (f.name_suffix.empty()) {
+            /* The name runs to the first arg_prefix or call_end. A wrapped format also reads
+             * name_prefix alone as a call, told from prose only by its closed name tag, and
+             * without a suffix there is none. */
+            if (!f.call_open.empty())
+                return no("name_suffix is empty, which a tagged call allows only when name_prefix "
+                          "opens it, and call_open is set");
+            if (is_ws((unsigned char)f.arg_prefix[0]))
+                return no("arg_prefix " + show(f.arg_prefix) + " may not begin with whitespace "
+                          "when it is what ends the function name");
+        }
         if (f.string_value != ChatValue::Raw && f.string_value != ChatValue::Cdata)
             return no("string_value must be RAD_CHAT_VALUE_RAW or RAD_CHAT_VALUE_CDATA");
         if ((uint32_t)f.other_value > (uint32_t)ChatValue::Json)
@@ -362,9 +395,18 @@ int chat_format_from_template(const std::string& jinja, const std::string& bos,
             c.arg_name_suffix  = t.arguments.name_suffix;
             c.arg_value_prefix = t.arguments.value_prefix;
             c.arg_value_suffix = t.arguments.value_suffix;
+            /* A name the per-call opener itself opens, with no tag of its own around it
+             * (GLM's `<tool_call>NAME<arg_key>`): the opener is the name's prefix and the
+             * per-call close the call's own, so the name ends at the first argument or close. */
+            if (c.name_prefix.empty() && !c.call_open.empty() && c.call_end.empty()) {
+                c.name_prefix = c.call_open;
+                c.call_end    = c.call_close;
+                c.call_open.clear();
+                c.call_close.clear();
+            }
             c.string_value     = ChatValue::Cdata;
             c.other_value      = ChatValue::Json;
-            c.value_newlines   = true;
+            c.value_newlines   = value_on_own_lines(tmpl, c);
             /* The section or per-call opener both triggers the lazy grammar and ends an
              * unclosed reasoning block. A format with neither gets no grammar and no break,
              * since its calls open with the name prefix, which a model also writes in prose. */
@@ -853,7 +895,9 @@ int chat_format_grammar(const ChatFormat& f, const ChatGrammarRequest& req, Chat
                 if (!req_arms.empty()) args = seq({ any_arg, rep(seq({ space(), any_arg }), 0, -1) });
                 else if (!opt_arms.empty()) args = seq({ eps(), rep(seq({ space(), any_arg }), 0, -1) });
 
-                G open = wrap(seq({ lit(f.name_prefix), wrap(lit(name)), lit(f.name_suffix) }));
+                /* Without a suffix the name ends where its arguments or close begin. */
+                G open = wrap(seq({ lit(f.name_prefix), wrap(lit(name)),
+                                    f.name_suffix.empty() ? eps() : lit(f.name_suffix) }));
                 G func = seq({ open, eps(), space(), args, space(), wrap(lit(f.call_end)) });
                 b.add_rule(rule_name("tool-" + name), render(func));
                 choices.push_back(rule_ref(rule_name("tool-" + name)));

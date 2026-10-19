@@ -196,7 +196,7 @@ TEST(an_older_struct_reads_the_object_fields_as_zero) {
     CHECK(!f.object_bare_keys);
     CHECK(!f.reasoning_anywhere);
     CHECK(chat_format_check(f, &why) == RAD_E_UNSUPPORTED);
-    CHECK(why.find("name_suffix") != std::string::npos);
+    CHECK(why.find("call_end") != std::string::npos);
 }
 
 TEST(an_object_format_the_parser_cannot_read_is_refused_by_name) {

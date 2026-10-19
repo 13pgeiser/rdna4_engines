@@ -995,6 +995,8 @@ TEST(the_derived_formats_are_the_ones_in_service) {
         CHECK(refused.empty());
         CHECK_EQ(f.reasoning_open, std::string("<think>\n"));
         CHECK_EQ(f.reasoning_close, std::string("\n</think>\n\n"));
+        /* Qwen writes a value on lines of its own, MiniCPM flush against its tags. */
+        CHECK_EQ(f.value_newlines, is_qwen(m));
         if (is_qwen(m)) {
             CHECK_EQ(f.call_open, std::string("<tool_call>\n"));
             CHECK_EQ(f.call_close, std::string("</tool_call>"));
@@ -1260,7 +1262,9 @@ TEST(a_format_the_parser_cannot_read_is_refused_by_name) {
     CHECK(refused([](RadChatFormat& c) { c.name_suffix = ""; }, "name_suffix"));
     CHECK(refused([](RadChatFormat& c) { c.call_end = ""; }, "call_end"));
     CHECK(refused([](RadChatFormat& c) { c.arg_value_suffix = ""; }, "arg_value_suffix"));
-    CHECK(refused([](RadChatFormat& c) { c.arg_value_prefix = "\""; }, "both set"));
+    CHECK(refused([](RadChatFormat& c) {
+        c.call_open = ""; c.call_close = ""; c.name_suffix = ""; c.arg_prefix = "\n<parameter=";
+    }, "whitespace"));
     CHECK(refused([](RadChatFormat& c) { c.arg_prefix = "</function>\n"; }, "told apart"));
     CHECK(refused([](RadChatFormat& c) { c.reasoning_close = ""; }, "reasoning_close"));
     static const char* const other[] = { "<call>" };
@@ -1440,6 +1444,48 @@ TEST(the_chat_bridge_derives_the_whole_request_from_one_format) {
         derived, json::parse(R"([{"type":"function","function":{"name":"a>b"}}])"), &why);
     CHECK(bad.prompt.empty());
     CHECK(why.find("a>b") != std::string::npos);
+}
+
+/* GLM-5.3-Flash's template reads list items as `m.content.0.type`, jinja2's dotted index, and
+ * writes calls as `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`. The
+ * capability probe renders with tools and tool calls, so a runtime that throws on the dotted index
+ * reports no tool support; and a name the opener opens, with no tag of its own, must be a format
+ * the derivation describes, or every request with tools is refused. */
+TEST(glm53_serves_tools_from_its_template) {
+    std::shared_ptr<Vocab> v = vocab_with(fixture("glm53"));
+    REQUIRE(v != nullptr);
+    server::ChatTemplateBridge br;
+    CHECK_OK(br.init(*v));
+    CHECK(br.supports_tools());
+    CHECK_EQ(br.tool_refusal(), std::string());
+    const server::ChatRender r = bridge_render(br, agent_tools());
+    REQUIRE(!r.prompt.empty());
+    CHECK(r.prompt.find("<tools>") != std::string::npos);
+    for (const auto& t : agent_tools())
+        CHECK(r.prompt.find("\"name\": \"" + t["function"]["name"].get<std::string>() + "\"") !=
+              std::string::npos);
+    CHECK(!r.grammar.empty());
+    CHECK(r.grammar_lazy);
+    REQUIRE(r.grammar_triggers.size() == 1);
+    CHECK_EQ(r.grammar_triggers[0].type, 1);
+    CHECK_EQ(r.grammar_triggers[0].value, std::string("<tool_call>"));
+    /* Each tag is a marker of its own: one the decoder suppresses as a control token is
+     * structure the parser never sees. */
+    for (const char* t : { "<think>", "</think>", "<tool_call>", "</tool_call>", "<arg_key>",
+                           "</arg_key>", "<arg_value>", "</arg_value>" })
+        CHECK(std::find(r.preserved_tokens.begin(), r.preserved_tokens.end(), t) !=
+              r.preserved_tokens.end());
+    REQUIRE(r.parser != nullptr);
+    std::unique_ptr<server::IReplyReader> rd = r.parser->open();
+    rd->feed("Look.</think>\n<tool_call>read<arg_key>path</arg_key><arg_value>/a"
+             "</arg_value><arg_key>limit</arg_key><arg_value>3</arg_value></tool_call>", nullptr);
+    rd->finish(nullptr);
+    const server::ParsedMessage pm = rd->message();
+    CHECK_EQ(pm.reasoning, std::string("Look."));
+    CHECK_EQ(pm.content, std::string());
+    REQUIRE(pm.tool_calls.size() == 1);
+    CHECK_EQ(pm.tool_calls[0].name, std::string("read"));
+    CHECK_EQ(pm.tool_calls[0].arguments, std::string("{\"path\":\"/a\",\"limit\":3}"));
 }
 
 /* A template writing each call as a JSON object is not a describable format: the model still
@@ -1654,6 +1700,302 @@ TEST(an_object_format_the_parser_cannot_read_is_refused) {
                   "name_prefix is empty"));
 }
 
+/* ================================================================== a name the opener opens
+ *
+ * GLM-5 writes a call as `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...
+ * </tool_call>`: the per-call opener opens the name, nothing of its own closes it, and it ends at
+ * the first argument or the call's close. Values are flush against their tags, strings raw and
+ * anything else JSON. The legacy path reads the opener as a wrapper around a call with an empty
+ * name tag, which is a different format, so these replies are checked against the messages they
+ * were rendered from rather than against the old parser. */
+
+static const char* const kGlmOpener[] = { "<tool_call>" };
+
+static RadChatFormat glm_abi() {
+    RadChatFormat c;
+    std::memset(&c, 0, sizeof c);
+    c.struct_size = sizeof c;
+    c.name = "glm-declared";
+    c.reasoning_open = "<think>";
+    c.reasoning_close = "</think>";
+    c.reasoning_breaks = kGlmOpener;
+    c.n_reasoning_breaks = 1;
+    c.name_prefix = "<tool_call>";
+    c.name_suffix = "";
+    c.call_end = "</tool_call>";
+    c.arg_prefix = "<arg_key>";
+    c.arg_name_suffix = "</arg_key>";
+    c.arg_value_prefix = "<arg_value>";
+    c.arg_value_suffix = "</arg_value>";
+    c.string_value = RAD_CHAT_VALUE_CDATA;
+    c.other_value = RAD_CHAT_VALUE_JSON;
+    c.value_newlines = 0;
+    c.triggers = kGlmOpener;
+    c.n_triggers = 1;
+    return c;
+}
+
+/* The agent's tools and one that takes no arguments. */
+static const json& glm_tools() {
+    static const json t = [] {
+        json v = agent_tools();
+        v.push_back(json::parse(R"({"type":"function","function":{"name":"now",
+            "description":"The time.","parameters":{"type":"object","properties":{}}}})"));
+        return v;
+    }();
+    return t;
+}
+
+/* GLM's template, the format derived from it, and the request every reply here answers. */
+struct Glm {
+    ChatTemplate tmpl;
+    ChatFormat   f;
+    ChatPrompt   head;
+    std::shared_ptr<const ReplyParser> parser;
+    std::string  grammar;
+};
+
+static const Glm* glm() {
+    static std::unique_ptr<Glm> g = []() -> std::unique_ptr<Glm> {
+        auto g = std::make_unique<Glm>();
+        std::string why, refused;
+        const std::string src = fixture("glm53");
+        if (g->tmpl.load(src, "", "<|user|>") < 0) return nullptr;
+        if (chat_format_from_template(src, "", "<|user|>", &g->f, &refused, &why) < 0 ||
+            !refused.empty())
+            return nullptr;
+        ChatOptions opt;
+        opt.parallel_tool_calls = true;
+        const json user = json::array({ { { "role", "user" }, { "content", "Fix the failing test in /work." } } });
+        if (g->tmpl.apply(user, glm_tools(), opt, &g->head) < 0) return nullptr;
+        ReplyOptions ro;
+        ro.generation_prompt = g->head.generation_prompt;
+        ro.tools = &glm_tools();
+        ro.terminators = { "<|user|>", "<|observation|>", "<|endoftext|>" };
+        g->parser = parser_of(g->f, ro);
+        ChatGrammarRequest gq;
+        gq.tools = &glm_tools();
+        gq.generation_prompt = g->head.generation_prompt;
+        ChatGrammar gr;
+        if (chat_format_grammar(g->f, gq, &gr, &why) < 0) return nullptr;
+        g->grammar = gr.text;
+        return g->parser ? std::move(g) : nullptr;
+    }();
+    return g.get();
+}
+
+/* The assistant turn as GLM's template writes it after the generation prompt. */
+static std::string glm_reply(const Glm& g, const json& assistant) {
+    json msgs = json::array({ { { "role", "user" }, { "content", "Fix the failing test in /work." } } });
+    msgs.push_back(assistant);
+    ChatOptions opt;
+    opt.add_generation_prompt = false;
+    opt.parallel_tool_calls = true;
+    ChatPrompt whole;
+    if (g.tmpl.apply(msgs, glm_tools(), opt, &whole) < 0) return "";
+    const std::string& head = g.head.prompt;
+    if (whole.prompt.compare(0, head.size(), head) != 0) return "";
+    std::string r = whole.prompt.substr(head.size());
+    while (!r.empty() && r.back() == '\n') r.pop_back();
+    return r;
+}
+
+static bool no_markup(const std::string& s) {
+    for (const char* t : { "<tool_call>", "</tool_call>", "<arg_key>", "</arg_key>", "<arg_value>",
+                           "</arg_value>", "<think>", "</think>" })
+        if (s.find(t) != std::string::npos) return false;
+    return true;
+}
+
+TEST(glm53_derives_a_name_the_opener_opens) {
+    const Glm* g = glm();
+    REQUIRE(g != nullptr);
+    const ChatFormat& f = g->f;
+    CHECK_EQ(f.reasoning_open, std::string("<think>"));
+    CHECK_EQ(f.reasoning_close, std::string("</think>"));
+    CHECK(f.call_open.empty() && f.call_close.empty());
+    CHECK_EQ(f.name_prefix, std::string("<tool_call>"));
+    CHECK(f.name_suffix.empty());
+    CHECK_EQ(f.call_end, std::string("</tool_call>"));
+    CHECK_EQ(f.arg_prefix, std::string("<arg_key>"));
+    CHECK_EQ(f.arg_name_suffix, std::string("</arg_key>"));
+    CHECK_EQ(f.arg_value_prefix, std::string("<arg_value>"));
+    CHECK_EQ(f.arg_value_suffix, std::string("</arg_value>"));
+    /* The template writes a value flush against its tags, so its newlines are its own. */
+    CHECK(!f.value_newlines);
+    CHECK(f.triggers == std::vector<std::string>{ "<tool_call>" });
+    CHECK(f.reasoning_breaks == std::vector<std::string>{ "<tool_call>" });
+    CHECK(g->head.generation_prompt.find("<think>") != std::string::npos);
+    CHECK(g->parser->reasoning().starts_open);
+
+    /* A plugin declares the same format through the ABI, unchanged, and gets the same grammar. */
+    RadChatFormat c = glm_abi();
+    ChatFormat declared;
+    std::string why;
+    CHECK_OK(chat_format_from_abi(&c, &declared, &why));
+    CHECK_OK(chat_format_check(declared, &why));
+    ChatFormat derived = f;
+    derived.name = declared.name;
+    CHECK_EQ(chat_format_describe(derived), chat_format_describe(declared));
+    CHECK(chat_format_markers(derived) == chat_format_markers(declared));
+    ChatGrammarRequest gq;
+    gq.tools = &glm_tools();
+    gq.generation_prompt = g->head.generation_prompt;
+    ChatGrammar gr;
+    CHECK_OK(chat_format_grammar(declared, gq, &gr, &why));
+    CHECK_EQ(gr.text, g->grammar);
+    CHECK(gr.lazy);
+    CHECK(gr.trigger_words == std::vector<std::string>{ "<tool_call>" });
+
+    /* Wrapped, a suffixless name would make the bare name_prefix in prose a call. */
+    c.call_open = "<calls>";
+    c.call_close = "</calls>";
+    static const char* const wrap[] = { "<calls>" };
+    c.reasoning_breaks = wrap;
+    CHECK_OK(chat_format_from_abi(&c, &declared, &why));
+    CHECK(chat_format_check(declared, &why) < 0);
+    CHECK(why.find("name_suffix") != std::string::npos);
+}
+
+TEST(glm53_replies_read_back_as_the_messages_they_render) {
+    const Glm* g = glm();
+    REQUIRE(g != nullptr);
+    const ReplyParser& p = *g->parser;
+    struct Case { const char* what; json msg; };
+    const std::vector<Case> cases = {
+        { "one call, string and integer",
+          message("Look.", "", { call("read", { { "path", "/a" }, { "limit", 3 } }) }) },
+        { "two calls",
+          message("Two.", "", { call("bash", { { "command", "ls -la" }, { "timeout", 30 } }),
+                                call("read", { { "path", "/b" } }) }) },
+        { "a call with no arguments", message("", "", { call("now", json::object()) }) },
+        { "content, then a call",
+          message("Plan.", "I will read it.", { call("read", { { "path", "/c" } }) }) },
+        { "values holding tags and newlines",
+          message("", "", { call("write", { { "path", "/x.html" },
+                                            { "content", "\n<p>a & b</p>\n<arg_key>k</arg_key> "
+                                                         "<tool_call>f</tool_call>\nend\n" } }) }) },
+        { "a structured value",
+          message("", "", { call("edit", { { "path", "/d" },
+                                           { "edits", json::parse(R"([{"oldText":"a","newText":"b"}])") } }) }) },
+    };
+    for (const Case& k : cases) {
+        const std::string reply = glm_reply(*g, k.msg);
+        REQUIRE(!reply.empty());
+        bool strict = false;
+        const ReplyMessage m = reply_parse(p, reply, &strict);
+        const std::string where = std::string(k.what) + ": " + quote(reply) + "\n  " + show(m);
+        if (!strict) ::radtest::fail(__FILE__, __LINE__, "left the grammar: " + where);
+        CHECK_EQ(m.reasoning, k.msg.value("reasoning_content", std::string()));
+        CHECK_EQ(m.content, k.msg["content"].get<std::string>());
+        CHECK(no_markup(m.content));
+        const json& calls = k.msg["tool_calls"];
+        if (m.calls.size() != calls.size()) {
+            ::radtest::fail(__FILE__, __LINE__, "call count: " + where);
+            continue;
+        }
+        for (size_t i = 0; i < calls.size(); ++i) {
+            const json& fn = calls[i]["function"];
+            CHECK_EQ(m.calls[i].name, fn["name"].get<std::string>());
+            CHECK(m.calls[i].closed);
+            /* The arguments as written, in the reply's order; JSON values keep their spacing. */
+            CHECK(json::parse(m.calls[i].arguments) == json::parse(fn["arguments"].get<std::string>()));
+        }
+        const std::string s = stream_all(p, reply);
+        if (!s.empty()) ::radtest::fail(__FILE__, __LINE__, std::string(k.what) + ": " + s);
+        /* What constrained decoding admits from the trigger on is the reply's call text. */
+        const size_t at = reply.find("<tool_call>");
+        REQUIRE(at != std::string::npos);
+        CHECK_EQ(object_admits(g->grammar, reply.substr(at)), 1);
+    }
+    CHECK_EQ(reply_parse(p, glm_reply(*g, cases[0].msg)).calls[0].arguments,
+             std::string("{\"path\":\"/a\",\"limit\":3}"));
+
+    /* Every message the other formats are checked with, too. */
+    size_t n = 0;
+    for (const json& msg : rendered_corpus()) {
+        const std::string reply = glm_reply(*g, msg);
+        if (reply.empty()) continue;
+        const ReplyMessage m = reply_parse(p, reply);
+        const size_t want = msg.contains("tool_calls") ? msg["tool_calls"].size() : 0;
+        bool ok = m.calls.size() == want && no_markup(m.content);
+        for (size_t i = 0; ok && i < want; ++i) {
+            const json& fn = msg["tool_calls"][i]["function"];
+            ok = m.calls[i].name == fn["name"].get<std::string>() &&
+                 round_trips(json::parse(fn["arguments"].get<std::string>()),
+                             json::parse(m.calls[i].arguments), true);
+        }
+        if (!ok) ::radtest::fail(__FILE__, __LINE__, "rendered: " + quote(reply) + "\n  " + show(m));
+        const std::string s = stream_all(p, reply, 512);
+        if (!s.empty()) ::radtest::fail(__FILE__, __LINE__, "rendered: " + s + "\n  " + quote(reply));
+        ++n;
+    }
+    CHECK(n > 10);
+}
+
+/* Without a tag of its own the name is read until something shows it is no name, so an opener
+ * in prose, a stray name and a reply cut off anywhere must all stay readable. */
+TEST(glm53_reads_what_strays_from_its_grammar) {
+    const Glm* g = glm();
+    REQUIRE(g != nullptr);
+    const ReplyParser& p = *g->parser;
+    bool strict = true;
+
+    ReplyMessage m = reply_parse(p, "</think>Wrap a call in <tool_call> tags, then stop.", &strict);
+    CHECK(m.calls.empty());
+    CHECK_EQ(m.content, std::string("Wrap a call in <tool_call> tags, then stop."));
+
+    /* GLM-4.5 put newlines around its tags. */
+    m = reply_parse(p, "</think><tool_call>read\n<arg_key>path</arg_key><arg_value>/a</arg_value>\n"
+                       "</tool_call>", &strict);
+    CHECK(strict);
+    REQUIRE(m.calls.size() == 1);
+    CHECK_EQ(m.calls[0].name, std::string("read"));
+    CHECK_EQ(m.calls[0].arguments, std::string("{\"path\":\"/a\"}"));
+
+    m = reply_parse(p, "</think><tool_call>\nread<arg_key>path</arg_key><arg_value>/a</arg_value>"
+                       "</tool_call>", &strict);
+    CHECK(!strict);
+    REQUIRE(m.calls.size() == 1);
+    CHECK_EQ(m.calls[0].name, std::string("read"));
+
+    m = reply_parse(p, "</think><tool_call>nope<arg_key>a</arg_key><arg_value>1</arg_value>"
+                       "</tool_call>", &strict);
+    CHECK(!strict);
+    REQUIRE(m.calls.size() == 1);
+    CHECK_EQ(m.calls[0].name, std::string("nope"));
+    CHECK_EQ(m.calls[0].arguments, std::string("{\"a\":\"1\"}"));
+
+    /* An unclosed reasoning block ends where a call begins. */
+    m = reply_parse(p, "thinking<tool_call>now</tool_call>", &strict);
+    CHECK_EQ(m.reasoning, std::string("thinking"));
+    REQUIRE(m.calls.size() == 1);
+    CHECK_EQ(m.calls[0].name, std::string("now"));
+
+    /* Cut off anywhere, the reply holds no markup in its content and names no other call. */
+    const std::string reply = glm_reply(*g, message("Look.", "Reading.",
+        { call("read", { { "path", "/a" }, { "limit", 3 } }), call("now", json::object()) }));
+    for (size_t k = 0; k <= reply.size(); ++k) {
+        const ReplyMessage t = reply_parse(p, reply.substr(0, k));
+        if (!no_markup(t.content) || t.calls.size() > 2 ||
+            (!t.calls.empty() && t.calls[0].name != "read") ||
+            (t.calls.size() == 2 && t.calls[1].name != "now"))
+            ::radtest::fail(__FILE__, __LINE__, "cut at " + std::to_string(k) + ": " +
+                            quote(reply.substr(0, k)) + "\n  " + show(t));
+    }
+
+    /* A tool whose name runs into a tag that ends names is refused at admission, by name. */
+    const json bad = json::parse(R"([{"type":"function","function":{"name":"a<arg_key>b"}}])");
+    ReplyOptions ro;
+    ro.tools = &bad;
+    std::shared_ptr<const ReplyFormat> rf;
+    std::shared_ptr<const ReplyParser> rp;
+    std::string why;
+    CHECK_OK(ReplyFormat::compile(g->f, &rf, &why));
+    CHECK(ReplyParser::create(rf, ro, &rp, &why) < 0);
+    CHECK(why.find("a<arg_key>b") != std::string::npos);
+}
+
 /* ================================================================== cost
  *
  * The legacy path re-parses the whole reply per chunk, O(n^2). The parser's own count of what it
@@ -1802,3 +2144,4 @@ TEST(a_long_reply_holds_a_constant_number_of_bytes) {
 }
 
 RAD_TEST_MAIN()
+

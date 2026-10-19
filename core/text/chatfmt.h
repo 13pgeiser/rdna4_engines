@@ -22,12 +22,16 @@
  *   Qwen3.6 / Qwen3.8    <tool_call>\n<function=NAME>\n<parameter=ARG>\nVALUE\n</parameter>\n
  *                        </function>\n</tool_call>
  *   MiniCPM5             <function name="NAME"><param name="ARG">VALUE</param></function>
+ *   GLM-5                <tool_call>NAME<arg_key>ARG</arg_key><arg_value>VALUE</arg_value>
+ *                        </tool_call>
  *
  * A call's name sits between a prefix and a suffix and the call ends with its own close; each
  * argument is a name between a prefix and a suffix, then a value ending at its own suffix; calls
- * may be wrapped one by one. Arguments are typed by the tool's JSON schema: a string-typed one is
- * raw text (optionally CDATA-wrapped), any other type is JSON, and text that does not parse as
- * JSON is taken raw, since models often write Python literals into a tag.
+ * may be wrapped one by one. A name may also have no suffix of its own (GLM): it then ends where
+ * the first argument or the call's close begins, and that tag is read as what it is. Arguments
+ * are typed by the tool's JSON schema: a string-typed one is raw text (optionally CDATA-wrapped),
+ * any other type is JSON, and text that does not parse as JSON is taken raw, since models often
+ * write Python literals into a tag.
  *
  * Object family (ChatArgs::Object): a call is its name and one object holding the arguments.
  *
@@ -107,8 +111,9 @@ struct ChatFormat {
     /* Around each call: "<tool_call>\n", "</tool_call>". When set, a call written without it
      * (name_prefix alone) is still read as a call (chatparse.h). */
     std::string call_open, call_close;
-    /* "<function=", ">\n". In the object family name_suffix may be empty; the name then ends at
-     * the object's `{`. */
+    /* "<function=", ">\n". name_suffix may be empty: in the object family the name then ends at
+     * the object's `{`; in the tagged family, where name_prefix must open the call (no
+     * call_open), at the first arg_prefix or call_end, which stay part of the call's body. */
     std::string name_prefix, name_suffix;
     std::string call_end;                     /* "</function>\n"; may be empty for an object */
 
@@ -120,6 +125,8 @@ struct ChatFormat {
     bool        object_bare_keys = false;
 
     std::string arg_prefix;                   /* "<parameter=" */
+    /* What ends a name and opens its value. Both may be set (GLM: "</arg_key>", "<arg_value>"):
+     * they are then read as one delimiter, written back to back. */
     std::string arg_name_suffix;              /* ">\n"   (MiniCPM: empty, the value prefix ends it) */
     std::string arg_value_prefix;             /* ""      (MiniCPM: "\">") */
     std::string arg_value_suffix;             /* "</parameter>\n" */

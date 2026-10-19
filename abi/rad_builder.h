@@ -1110,10 +1110,13 @@ typedef struct RadChatFormat {
     const char* call_open;           /* around each call; "" when calls are not wrapped */
     const char* call_close;
     const char* name_prefix;         /* "" when the model has no tool calls */
+    /* "" when nothing of its own ends the name: then the object's `{` does, or, for tagged
+     * arguments in an unwrapped call, the first arg_prefix or call_end, which begin the body */
     const char* name_suffix;
     const char* call_end;
     const char* arg_prefix;
-    const char* arg_name_suffix;     /* "" when arg_value_prefix alone ends the name */
+    /* "" when arg_value_prefix alone ends the name; both set are written back to back */
+    const char* arg_name_suffix;
     const char* arg_value_prefix;
     const char* arg_value_suffix;
 
