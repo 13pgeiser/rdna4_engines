@@ -1718,6 +1718,18 @@ TEST(json_schema_grammars_admit_exactly_their_instances) {
         { R"({"type":"string","pattern":"^a\\sb$"})", { R"("a b")", R"("a\tb")" }, { R"("ab")" } },
         { R"({"type":"string","pattern":"^[\\s\\S]{2}$"})", { R"("ab")", R"("a ")" }, { R"("a")" } },
         { R"({"type":"string","pattern":"^\\D$"})", { R"("x")" }, { R"("7")" } },
+        /* identity escapes of punctuation (0019): zod's email pattern sends "\-" inside a class, and
+         * JavaScript-written patterns escape "/". An escaped '-' in a class is not a range. */
+        { R"({"type":"string","pattern":"^a\\/b$"})", { R"("a/b")" }, { R"("ab")" } },
+        { R"({"type":"string","pattern":"^a\\-b$"})", { R"("a-b")" }, { R"("ab")" } },
+        { R"({"type":"string","pattern":"^[a\\-z]$"})", { R"("a")", R"("-")", R"("z")" }, { R"("b")" } },
+        { R"({"type":"string","pattern":"^[a\\^]$"})", { R"("^")", R"("a")" }, { R"("b")" } },
+        { R"({"type":"string","pattern":"^[\\^a]$"})", { R"("^")", R"("a")" }, { R"("b")" } },
+        { R"({"type":"string","pattern":"^[\\--z]$"})", { R"("-")", R"("a")" }, { R"("+")" } },
+        { R"({"type":"string","pattern":"^[\\.]$"})", { R"(".")" }, { R"("a")" } },
+        { R"({"type":"string","pattern":"a\\-b"})", { R"("xa-by")" }, { R"("ab")" } },
+        { R"({"type":"string","pattern":"^(?:[A-Za-z0-9_'+\\-]+\\.)*[A-Za-z0-9_'+\\-]*[A-Za-z0-9_+-]@(?:[A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"})",
+          { R"("a.b@c.io")", R"("x-y@d-e.org")" }, { R"("a@b")", R"("a b@c.io")" } },
         { R"({"type":"array","items":{"type":"integer"},"minItems":1,"maxItems":3})",
           { "[1]", "[1,2,3]", "[-4,0]" }, { "[]", "[1,2,3,4]", R"(["a"])" } },
         { R"({"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"string"}},)"

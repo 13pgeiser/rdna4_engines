@@ -103,6 +103,7 @@ vendor/llama/common/regex-partial.{h,cpp}    <- llama.cpp common/*
                    patches/0016-chat-analyse-a-template-once.patch
                    patches/0017-json-schema-a-pattern-without-anchors-searches.patch
                    patches/0018-json-schema-shorthand-classes-are-written-out.patch
+                   patches/0019-json-schema-identity-escapes-of-punctuation.patch
 
     On 0003: a `pattern` in a `response_format` reaches _visit_pattern() as client data, and three
     of its paths do not survive that. `front()`/`back()` run on an empty string; `seq.back()` runs
@@ -524,3 +525,14 @@ PATCH SERIES
       \u0031 that decodes to a digit. sample_test's "cannot spell" case moves from \d to \b,
       which is still refused; gbnf_test covers \S on strings and array items, \d dates and
       decimals, [\w-], \s with an escaped tab, [\s\S] and \D, and the refused [a\S].
+
+  patches/0019-json-schema-identity-escapes-of-punctuation.patch
+
+      Patterns written in JavaScript escape punctuation that needs no escape: "\/" in a path,
+      "\-" in a class (zod's email pattern carries both "[A-Za-z0-9_'+\-]" and "[A-Za-z0-9\-]").
+      Outside a class these were refused ("Unsupported regex escape"); inside one they were copied
+      raw and the grammar failed to load. Outside a class such an escape is now the bare
+      character -- regex syntax characters and '"' keep their backslash and go the old way --
+      and inside a class it is written \xHH, so an escaped '-' or '^' cannot read as a range or
+      a negation. gbnf_test covers "\/" and "\-" in literals, "\-" "\^" "\." in classes and as
+      a range endpoint, an unanchored "a\-b", and zod's email pattern.
