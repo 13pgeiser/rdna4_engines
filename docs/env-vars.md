@@ -800,7 +800,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1671
+**Count:** 1672
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -823,6 +823,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_AGENTIC_GATE_EXE` | scripts/agentic-gate.sh, scripts/test_agentic_gate_driver.py | harness |
 | `HIPFIRE_AGENTIC_GATE_NO_VRAM_CHECK` | scripts/agentic-gate.sh, scripts/test_agentic_gate_driver.py | harness |
 | `HIPFIRE_AGENTIC_GATE_OUT` | scripts/agentic-gate.sh, scripts/test_agentic_gate_driver.py | harness |
+| `HIPFIRE_AGENTIC_GATE_RAW_DIR` | scripts/agentic-gate.sh, scripts/test_agentic_gate_driver.py | harness |
 | `HIPFIRE_ALLOW_BF16_QUANTIZED_TARGET` | crates/hipfire-arch-qwen4/src/artifact.rs | developer |
 | `HIPFIRE_ALLOW_FMT` | scripts/no-cargo-fmt-guard.py, scripts/test-no-cargo-fmt-guard.py | harness |
 | `HIPFIRE_ALLOW_MIXED_ARCH` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | stable |

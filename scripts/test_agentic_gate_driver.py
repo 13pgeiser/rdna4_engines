@@ -548,3 +548,112 @@ def test_sigterm_to_the_driver_kills_only_its_group_once(tmp_path):
             p.wait()
     with pytest.raises(ProcessLookupError):
         os.kill(int(pidfile.read_text()), 0)
+
+
+# -- raw archive and terminal record -----------------------------------------
+
+def _raw_run(tmp_path, env=None, mode_env=True):
+    raw = tmp_path / "raw"
+    run_env = dict(env or {})
+    if mode_env:
+        run_env["HIPFIRE_AGENTIC_GATE_RAW_DIR"] = str(raw)
+    proc, report = _run_gate(tmp_path, run_env)
+    return proc, report, raw
+
+
+def _record(raw):
+    return json.loads((raw / "qwen3.6-27b.driver.json").read_text())
+
+
+def test_raw_dir_archives_output_and_record_for_a_clean_run(tmp_path):
+    proc, _report, raw = _raw_run(tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    log = (raw / "qwen3.6-27b.daemon-output.jsonl").read_text()
+    assert '"type":"done"' in log and "fake-daemon: started" in log  # stdout JSON and stderr
+    rec = _record(raw)
+    assert rec["driver_rc"] == 0 and rec["loaded"] is True
+    (req,) = rec["requests"]
+    assert (req["id"], req["attempt_id"]) == ("c0_t1", 1)
+    assert req["commit_ready_seen"] and req["commit_sent"] and req["done_seen"]
+    assert req["finish_reason"] == "stop" and req["tokens"] == 1 and req["errors"] == []
+    assert rec["unload"] == "unloaded"
+    assert rec["daemon"]["exit_status"] == 0
+    assert rec["daemon"]["started"] and not rec["daemon"]["killed_by_driver"]
+    assert isinstance(rec["daemon"]["peak_rss_kib"], int) and rec["daemon"]["peak_rss_kib"] > 0
+    assert "VmHWM" in rec["daemon"]["peak_rss_measured"]
+    assert rec["errors"] == [] and rec["session_errors"] == []
+    assert not list(raw.glob("*.tmp"))
+
+
+def test_raw_dir_failure_cases_record_the_real_exit_status(tmp_path):
+    exit_dir = tmp_path / "exit"
+    exit_dir.mkdir()
+    proc, _r, raw = _raw_run(exit_dir, {"FAKE_EXIT_ON_UNLOAD": "1", "FAKE_EXIT_CODE": "3"})
+    assert proc.returncode == 1
+    rec = _record(raw)
+    assert rec["driver_rc"] == 1
+    assert rec["daemon"]["exit_status"] == 3 and not rec["daemon"]["killed_by_driver"]
+    assert rec["requests"][0]["done_seen"] and rec["unload"] == "unloaded"
+    assert any("status 3" in e for e in rec["errors"])
+    assert (raw / "qwen3.6-27b.daemon-output.jsonl").exists()
+
+    eof_dir = tmp_path / "eof"
+    eof_dir.mkdir()
+    proc, _r, raw = _raw_run(eof_dir, {"FAKE_FAULT": "eof_before_done"})
+    assert proc.returncode == 1
+    rec = _record(raw)
+    (req,) = rec["requests"]
+    assert rec["driver_rc"] == 1
+    assert not req["commit_ready_seen"] and not req["commit_sent"] and not req["done_seen"]
+    assert req["errors"] and req["errors"][0]["source"] == "agentic_gate_driver"
+    assert rec["unload"] == "not attempted" and rec["daemon"]["exit_status"] == 0
+    assert '"type":"token"' in (raw / "qwen3.6-27b.daemon-output.jsonl").read_text()
+
+
+def test_without_raw_dir_no_archive_files_are_written(tmp_path):
+    proc, _report, _raw = _raw_run(tmp_path, mode_env=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    names = {p.name for p in tmp_path.rglob("*") if p.is_file()}
+    assert not [n for n in names if n.endswith((".daemon-output.jsonl", ".driver.json"))]
+    assert not (tmp_path / "raw").exists()
+
+
+def test_raw_dir_must_be_absolute(tmp_path):
+    proc, _report = _run_gate(tmp_path, {"HIPFIRE_AGENTIC_GATE_RAW_DIR": "relative/dir"})
+    assert proc.returncode == 2 and "must be absolute" in proc.stderr
+
+
+def test_driver_record_says_ownership_lost(tmp_path):
+    d = driver.Driver(str(FAKE), str(tmp_path / "o.txt"))
+    d._reqs = {}
+    assert d.start()
+    pid = d.proc.pid
+    os.kill(pid, 9)
+    os.waitpid(pid, 0)  # reaped elsewhere
+    d.kill()
+    rec_path = tmp_path / "rec.json"
+    d.write_record(str(rec_path), "/m", 1)
+    rec = json.loads(rec_path.read_text())
+    assert rec["daemon"]["exit_status"] == "ownership lost"
+    assert rec["driver_rc"] == 1 and rec["unload"] == "not attempted"
+    for t in d._threads:
+        t.join(timeout=5)
+    d._out.close()
+
+
+def test_peak_rss_is_null_with_a_reason_when_unreadable(tmp_path, monkeypatch):
+    def no_proc(path, *a, **k):  # shadows the builtin inside the driver module only
+        if str(path).startswith("/proc/"):
+            raise OSError("procfs unavailable")
+        return open(path, *a, **k)
+
+    cells, _ = _cells(tmp_path)
+    monkeypatch.setattr(driver, "open", no_proc, raising=False)
+    d = driver.Driver(str(FAKE), str(tmp_path / "o.txt"))
+    rc = d.run("/models/m.mq4", driver.build_requests(cells, "U", ["a", "b", "c"]))
+    rec_path = tmp_path / "rec.json"
+    d.write_record(str(rec_path), "/models/m.mq4", rc)
+    rec = json.loads(rec_path.read_text())
+    assert rc == 0 and rec["daemon"]["exit_status"] == 0
+    assert rec["daemon"]["peak_rss_kib"] is None
+    assert "unreadable" in rec["daemon"]["peak_rss_measured"]

@@ -53,6 +53,9 @@
 #                                            for your host)
 #
 # Report destination: /tmp/agentic-gate-<timestamp>.md (or $HIPFIRE_AGENTIC_GATE_OUT)
+# Raw archive: with HIPFIRE_AGENTIC_GATE_RAW_DIR=<absolute dir> set, each model's raw
+# daemon output is kept as <dir>/<model>.daemon-output.jsonl and the driver's
+# machine-readable terminal record as <dir>/<model>.driver.json (logs only).
 
 set -u
 cd "$(dirname "$0")/.."
@@ -263,6 +266,20 @@ for f in "$PI_SYS" "$HERMES_SYS" "$USER_READ"; do
     fi
 done
 
+# HIPFIRE_AGENTIC_GATE_RAW_DIR (absolute, created here) archives, per model, the
+# driver's raw daemon output and its terminal record. Unset: nothing is written.
+RAW_DIR="${HIPFIRE_AGENTIC_GATE_RAW_DIR:-}"
+if [ -n "$RAW_DIR" ]; then
+    case "$RAW_DIR" in
+        /*) ;;
+        *) echo "agentic-gate: HIPFIRE_AGENTIC_GATE_RAW_DIR must be absolute: $RAW_DIR" >&2; exit 2 ;;
+    esac
+    if ! mkdir -p -- "$RAW_DIR"; then
+        echo "agentic-gate: cannot create HIPFIRE_AGENTIC_GATE_RAW_DIR: $RAW_DIR" >&2
+        exit 2
+    fi
+fi
+
 # Rebuild daemon if any tracked source is newer than the binary. A test-supplied
 # HIPFIRE_AGENTIC_GATE_EXE is a test double and is never rebuilt.
 rebuild=0
@@ -400,6 +417,7 @@ fi
 # ---- Run cells -------------------------------------------------------------
 HARD_FAIL=0
 DRIVER_FAIL=0
+ARCHIVE_FAIL=0
 read -r -a driver_extra <<< "${HIPFIRE_AGENTIC_GATE_DRIVER_ARGS:-}"
 SOFT_WARN_TOTAL=0
 
@@ -432,6 +450,11 @@ for model in "${!MODEL_CELLS[@]}"; do
 
     OUTPUT_FILE="$(mktemp /tmp/agentic-gate-out.XXXXXX)"
 
+    record_args=()
+    if [ -n "$RAW_DIR" ]; then
+        record_args=(--record "$RAW_DIR/$model_short.driver.json")
+    fi
+
     # The driver is backgrounded so cleanup can signal it by exact PID; on
     # TERM it kills only the daemon process group it spawned. Any overlapping
     # physical GPU UUID produces a FATAL contention message with the holder
@@ -440,7 +463,8 @@ for model in "${!MODEL_CELLS[@]}"; do
         HIPFIRE_GRAPH=1 \
         python3 scripts/agentic_gate_driver.py \
             --exe "$EXE" --model "$model" --user-file "$USER_READ" \
-            --out "$OUTPUT_FILE" ${driver_extra[@]+"${driver_extra[@]}"} \
+            --out "$OUTPUT_FILE" ${record_args[@]+"${record_args[@]}"} \
+            ${driver_extra[@]+"${driver_extra[@]}"} \
             "${cell_args[@]}" &
     DRIVER_PID=$!
     wait "$DRIVER_PID"
@@ -663,7 +687,20 @@ PY
     # Read per-model summary written to stderr by the python detector.
     # (We didn't capture stderr above; instead recompute by running a thin checker.)
     # For simplicity, re-run a quick aggregator from the report file.
-    rm -f "$OUTPUT_FILE"
+    # HIPFIRE_AGENTIC_GATE_RAW_DIR: keep the raw daemon record (logs only, never
+    # a model file) before the temp file goes. A failed copy keeps the temp file.
+    if [ -n "$RAW_DIR" ]; then
+        if cp -- "$OUTPUT_FILE" "$RAW_DIR/$model_short.daemon-output.jsonl"; then
+            rm -f "$OUTPUT_FILE"
+        else
+            ARCHIVE_FAIL=1
+            echo "agentic-gate: could not archive the raw daemon output for $model_short; kept $OUTPUT_FILE" >&2
+            echo "- **ARCHIVE FAILURE**: could not copy the raw daemon output for $model_short to $RAW_DIR; kept $OUTPUT_FILE" >> "$OUT"
+            echo >> "$OUT"
+        fi
+    else
+        rm -f "$OUTPUT_FILE"
+    fi
 done
 
 # ---- Aggregate verdict -----------------------------------------------------
@@ -679,6 +716,11 @@ total_cells=${#CELLS[@]}
     echo "- soft warns: $soft_count"
 } >> "$OUT"
 
+if [ "$ARCHIVE_FAIL" -eq 1 ]; then
+    echo "agentic-gate: HARD FAIL (the raw daemon output could not be archived)"
+    echo "report: $OUT"
+    exit 1
+fi
 if [ "$DRIVER_FAIL" -eq 1 ]; then
     {
         echo
