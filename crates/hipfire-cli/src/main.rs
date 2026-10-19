@@ -10393,22 +10393,25 @@ mod tests {
         assert!(empty.contains("software adapters are skipped"));
     }
 
+    /// Points `launch_tui` at the checked-in `tests/fixtures/fake_tui.sh`,
+    /// executed in place and never written or chmod-ed at runtime, and names
+    /// the record file it fills. The env guards must outlive the launch.
+    #[cfg(unix)]
+    fn fake_tui_fixture(paths: &Paths) -> (PathBuf, EnvGuard, EnvGuard) {
+        fs::create_dir_all(&paths.root).unwrap();
+        let record = paths.root.join("tui-args.txt");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_tui.sh");
+        let tui = EnvGuard::set("HIPFIRE_TUI_BIN", script.to_str().unwrap());
+        let args = EnvGuard::set("FAKE_TUI_ARGS", record.to_str().unwrap());
+        (record, tui, args)
+    }
+
     #[cfg(unix)]
     #[test]
     fn config_without_action_launches_the_tui_on_settings() {
-        use std::os::unix::fs::PermissionsExt;
         let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let paths = test_paths("config-tui-settings");
-        fs::create_dir_all(&paths.root).unwrap();
-        let record = paths.root.join("tui-args.txt");
-        let script = paths.root.join("fake-tui.sh");
-        let body = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
-            record.display()
-        );
-        fs::write(&script, body).unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        let _tui = EnvGuard::set("HIPFIRE_TUI_BIN", script.to_str().unwrap());
+        let (record, _tui, _args) = fake_tui_fixture(&paths);
         config_command(
             &paths,
             ConfigArgs {
@@ -10419,6 +10422,112 @@ mod tests {
         .unwrap();
         assert_eq!(fs::read_to_string(&record).unwrap(), "--settings\n");
         let _ = fs::remove_dir_all(&paths.root);
+    }
+
+    /// The race behind the flaky ETXTBSY, made deterministic. The test used to
+    /// write a fresh `<root>/fake-tui.sh`, chmod it and exec it. A concurrent
+    /// test forking a child at that moment copies the still-open write
+    /// descriptor into the child; `O_CLOEXEC` closes the copy only at the
+    /// child's exec, so until then the inode has a live writer and exec of the
+    /// script fails ETXTBSY even though this thread already closed its own fd.
+    /// Renaming does not help (the writer pins the inode, not the name).
+    ///
+    /// Here a decoy writer is opened on that historical path, a child is
+    /// forked while it is open and parked in `pre_exec` (before exec, so the
+    /// copy is live), and the parent's writer is closed. The negative control
+    /// then repeats the old write+chmod+launch on the same pinned inode and
+    /// must fail ETXTBSY every time; the immutable fixture launched through
+    /// the same helper and `config_command` call must still succeed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_tui_launch_is_unaffected_by_a_child_pinning_the_historical_script_inode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let paths = test_paths("config-tui-pinned-writer");
+        fs::create_dir_all(&paths.root).unwrap();
+        let historical = paths.root.join("fake-tui.sh");
+        let writer = fs::File::create(&historical).unwrap();
+
+        let (mut ready_r, ready_w) = io::pipe().unwrap();
+        let (go_r, go_w) = io::pipe().unwrap();
+        let (ready_fd, go_fd, go_w_fd) = (
+            std::os::fd::AsRawFd::as_raw_fd(&ready_w),
+            std::os::fd::AsRawFd::as_raw_fd(&go_r),
+            std::os::fd::AsRawFd::as_raw_fd(&go_w),
+        );
+        let mut command = Command::new("/bin/true");
+        // SAFETY: the hook runs in the forked child before exec and only calls
+        // the async-signal-safe `close`, `write` and `read`.
+        unsafe {
+            command.pre_exec(move || {
+                libc::close(go_w_fd);
+                libc::write(ready_fd, [1u8].as_ptr().cast(), 1);
+                let mut byte = 0u8;
+                libc::read(go_fd, (&mut byte as *mut u8).cast(), 1);
+                Ok(())
+            });
+        }
+        // `spawn` returns only after the child execs, so it runs on its own
+        // thread, like a concurrent test starting a process.
+        let spawner = std::thread::spawn(move || {
+            let child = command.spawn();
+            drop(ready_w);
+            child
+        });
+        let mut byte = [0u8];
+        assert_eq!(ready_r.read(&mut byte).unwrap(), 1, "child never forked");
+        // The child now holds a copy of `writer`; closing ours leaves the
+        // historical inode write-pinned until that child execs.
+        drop(writer);
+
+        let (record, tui, _args) = fake_tui_fixture(&paths);
+        let fixed = config_command(
+            &paths,
+            ConfigArgs {
+                model: None,
+                action: None,
+            },
+        );
+        let fixed_record = fs::read_to_string(&record);
+
+        // Negative control: the original runtime fs::write + chmod + launch
+        // at the historical destination, on the same pinned inode.
+        let old_body = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+            record.display()
+        );
+        fs::write(&historical, old_body).unwrap();
+        fs::set_permissions(&historical, fs::Permissions::from_mode(0o755)).unwrap();
+        let old_tui = EnvGuard::set("HIPFIRE_TUI_BIN", historical.to_str().unwrap());
+        let control = config_command(
+            &paths,
+            ConfigArgs {
+                model: None,
+                action: None,
+            },
+        );
+
+        // Release, join and reap the parked child before any assertion.
+        drop(go_w);
+        let child = spawner.join().unwrap();
+        let reaped = child.and_then(|mut child| child.wait());
+        drop(old_tui);
+        drop(tui);
+        let _ = fs::remove_dir_all(&paths.root);
+
+        reaped.expect("parked /bin/true child failed");
+        fixed.expect("immutable fixture launch must not depend on the historical inode");
+        assert_eq!(fixed_record.unwrap(), "--settings\n");
+        let err =
+            control.expect_err("old runtime-written script must fail while its inode is pinned");
+        assert_eq!(
+            err.root_cause()
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::raw_os_error),
+            Some(libc::ETXTBSY),
+            "unexpected launch error: {err:#}"
+        );
     }
 
     fn test_paths(label: &str) -> Paths {
