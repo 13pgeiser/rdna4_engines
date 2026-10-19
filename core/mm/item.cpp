@@ -3,6 +3,8 @@
  * metadata reader, the real device layer. */
 #include "mm/processor.h"
 
+#include <algorithm>
+
 namespace rad {
 namespace mm {
 
@@ -40,6 +42,38 @@ void Item::coords(int64_t first, int64_t count, int32_t* planes) const {
         planes[count + k]     = (int32_t)col;
         planes[2 * count + k] = seg_h(s);
         planes[3 * count + k] = seg_w(s);
+    }
+}
+
+/* The rotary layout of one prompt: one run per segment, the text in front of a run counting up
+ * and a grid advancing the rotary by its longer side. Pure computation over the items, like the
+ * accessors above, so it lives here rather than in the processor. */
+void PromptMedia::layout() {
+    rope.runs.clear();
+    int64_t pos = 0, tok = 0;
+    for (size_t pi = 0; pi < items.size(); ++pi) {
+        const Placed& p = items[pi];
+        const Item& it = *p.item;
+        const int32_t m = it.rows_h > 0 ? it.grid_h / it.rows_h : 1;
+        for (int32_t s = 0; s < it.n_seg; ++s) {
+            const int64_t run_tok = (int64_t)p.tok + it.seg_at[(size_t)s];
+            pos += run_tok - tok;            /* the text in front of the run counts up */
+            const int32_t rh = it.segments.empty() ? it.rows_h : it.seg_h(s) / m;
+            const int32_t rw = it.segments.empty() ? it.rows_w : it.seg_w(s) / m;
+            RopeLayout::Run r;
+            r.tok = (int32_t)run_tok;
+            r.n = (int32_t)(it.row_at(s + 1) - it.row_at(s));
+            r.w = rw;
+            r.base = (int32_t)pos;
+            r.flat = it.rope_1d;
+            /* A grid advances the rotary by its longer side; a 1-D run by its length. */
+            pos += it.rope_1d ? r.n : std::max(rh, rw);
+            tok = run_tok + r.n;
+            r.shift = (int32_t)(pos - tok);
+            r.item = (int32_t)pi;
+            r.row0 = (int32_t)it.row_at(s);
+            rope.runs.push_back(r);
+        }
     }
 }
 

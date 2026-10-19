@@ -346,9 +346,10 @@ int ref_vtile_stitch(const RadArgs* a, RadStream) {
  * `geom` carries the request's volume; an output holds at least the rows the volume writes. */
 
 /* ------------------------------------------------------------------ conv3d_ndhwc */
-/* A 3-D convolution, stride 1 with `same` zero padding: kt / 2 frames and k / 2 rows and columns
- * on each side (kt and k odd). x [>= T H W, cin], y and `res` [>= T H W, cout], geom = (T, H, W);
- * w is PyTorch's Conv3d weight [cout, cin, kt, k, k] and b [cout]:
+/* A 3-D convolution over the volume geom = (T, H, W). The defaults are stride 1 with `same` zero
+ * padding: kt / 2 frames and k / 2 rows and columns on each side (kt and k odd); x
+ * [>= T H W, cin] and y and `res` [>= rows out, cout]; w is PyTorch's Conv3d weight
+ * [cout, cin, kt, k, k] and b [cout]:
  *
  *   acc = sum over (dt, kh, kw, ci) of w[o, ci, dt, kh, kw] x[(t + dt - kt/2, i + kh - k/2,
  *                                                              j + kw - k/2), ci]
@@ -357,7 +358,25 @@ int ref_vtile_stitch(const RadArgs* a, RadStream) {
  * terms outside the volume zero. acc is f32, the taps in (dt, kh, kw) order and each tap's
  * channels ascending; rd is y's dtype. With `res` the convolution's output is rounded before the
  * residual is added, as a residual block's skip(x) + h adds two bf16 tensors. `res` may be y
- * itself: each output element reads its own residual before its write, and no other. */
+ * itself: each output element reads its own residual before its write, and no other.
+ *
+ * The optional `stride` (spatial) and `stride_t` pad first and then stride, `causal` 1 takes the
+ * temporal padding front-only (kt - 1 zeros, none behind), `pad` `down` pads none above and left
+ * and one below and right, and `reflect` 1 mirrors the spatial padding instead of zeroing it;
+ * these CausalConv3d forms need k = kt = 3. Output (t, i, j) then reads
+ * x[(t stride_t + dt - ft, i stride + kh - pt, j stride + kw - pl), ci] over the lengths
+ *
+ *   ((T + ft + bk - kt) / stride_t + 1) ((H + pt + pb - k) / stride + 1)
+ *   ((W + pl + pr - k) / stride + 1)                                   (floor divisions)
+ *
+ * with ft / bk and pt / pb / pl / pr the front / back and top / bottom / left / right pads. The
+ * time axis is always zero-padded; `reflect` mirrors each spatial axis once, torch's `reflect`
+ * (x[-n] = x[n], x[D + n] = x[D - 2 - n]), so each pad must be below the axis it pads. */
+static int64_t idiv_floor(int64_t a, int64_t b) {
+    const int64_t q = a / b;
+    return (a % b && (a < 0) != (b < 0)) ? q - 1 : q;
+}
+
 int ref_conv3d_ndhwc(const RadArgs* a, RadStream) {
     if (a->n_t < 6 || !have(a, 4) || !t_in(a, 5)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *w = &a->t[1], *b = &a->t[2], *geom = &a->t[3];
@@ -366,29 +385,48 @@ int ref_conv3d_ndhwc(const RadArgs* a, RadStream) {
     const int64_t k = p_int(a, "k", 0), kt = p_int(a, "kt", 0);
     if (cin <= 0 || cout <= 0 || k <= 0 || kt <= 0 || !(k & 1) || !(kt & 1) || numel(geom) < 3)
         return RAD_E_SHAPE;
+    const int64_t sp = p_int(a, "stride", 1), st = p_int(a, "stride_t", 1);
+    const int64_t causal = p_int(a, "causal", 0), reflect = p_int(a, "reflect", 0);
+    const char* pads = p_str(a, "pad", "same");
+    const bool down = pads && !std::strcmp(pads, "down");
+    if (sp <= 0 || st <= 0 || (causal && causal != 1) || (reflect && reflect != 1) ||
+        !(!pads || !std::strcmp(pads, "same") || down))
+        return RAD_E_SHAPE;
+    const bool gen = sp != 1 || st != 1 || causal || down || reflect;
+    if (gen && (k != 3 || kt != 3)) return RAD_E_SHAPE;
     const int64_t T = ldi(geom, 0), H = ldi(geom, 1), W = ldi(geom, 2);
     if (T <= 0 || H <= 0 || W <= 0) return RAD_E_SHAPE;
-    const int64_t rows = T * H * W, taps = kt * k * k;
-    if (rows_of(y, cout) < rows || rows_of(x, cin) < rows || (res && rows_of(res, cout) < rows) ||
-        numel(w) < cout * cin * taps || numel(b) < cout)
+    const int64_t ft = causal ? kt - 1 : kt / 2, bk = causal ? 0 : kt / 2;
+    const int64_t pt = down ? 0 : k / 2, pb = down ? 1 : k / 2;
+    const int64_t pl = down ? 0 : k / 2, pr = down ? 1 : k / 2;
+    if (reflect && (std::max(pt, pb) >= H || std::max(pl, pr) >= W)) return RAD_E_SHAPE;
+    const int64_t T2 = idiv_floor(T + ft + bk - kt, st) + 1;
+    const int64_t H2 = idiv_floor(H + pt + pb - k, sp) + 1;
+    const int64_t W2 = idiv_floor(W + pl + pr - k, sp) + 1;
+    if (T2 <= 0 || H2 <= 0 || W2 <= 0) return RAD_E_SHAPE;
+    const int64_t rows = T * H * W, orows = T2 * H2 * W2, taps = kt * k * k;
+    if (rows_of(y, cout) < orows || rows_of(x, cin) < rows ||
+        (res && rows_of(res, cout) < orows) || numel(w) < cout * cin * taps || numel(b) < cout)
         return RAD_E_SHAPE;
-    const int64_t pz = kt / 2, ps = k / 2, xs = laststride(x), ys = laststride(y);
+    const int64_t xs = laststride(x), ys = laststride(y);
     const int64_t rs = res ? laststride(res) : 0;
     const uint32_t dt = y->dtype;
-    REF_PAR_FOR(rows * cout * cin * taps)
-    for (int64_t r = 0; r < rows; ++r) {
-        const int64_t t = r / (H * W), i = (r / W) % H, j = r % W;
+    REF_PAR_FOR(orows * cout * cin * taps)
+    for (int64_t r = 0; r < orows; ++r) {
+        const int64_t t = r / (H2 * W2), i = (r / W2) % H2, j = r % W2;
         const int64_t yb = rowoff(y, r, cout), rb = res ? rowoff(res, r, cout) : 0;
         for (int64_t o = 0; o < cout; ++o) {
             float acc = 0.0f;
             for (int64_t dz = 0; dz < kt; ++dz) {
-                const int64_t tz = t + dz - pz;
+                const int64_t tz = t * st + dz - ft;
                 if (tz < 0 || tz >= T) continue;
                 for (int64_t kh = 0; kh < k; ++kh) {
-                    const int64_t iy = i + kh - ps;
+                    int64_t iy = i * sp + kh - pt;
+                    if (reflect) iy = iy < 0 ? -iy : (iy >= H ? 2 * H - 2 - iy : iy);
                     if (iy < 0 || iy >= H) continue;
                     for (int64_t kw = 0; kw < k; ++kw) {
-                        const int64_t ix = j + kw - ps;
+                        int64_t ix = j * sp + kw - pl;
+                        if (reflect) ix = ix < 0 ? -ix : (ix >= W ? 2 * W - 2 - ix : ix);
                         if (ix < 0 || ix >= W) continue;
                         const int64_t xb = rowoff(x, (tz * H + iy) * W + ix, cin);
                         const int64_t wb = o * cin * taps + (dz * k + kh) * k + kw;

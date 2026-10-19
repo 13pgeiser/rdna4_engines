@@ -414,6 +414,7 @@ AVX_KERNEL(timestep_embed) {
     const float scale = p_f32(a, "scale", 1000.0f);
     const double mp = p_f32(a, "max_period", 10000.0f);
     const int round = (int)p_int(a, "round", 0);
+    const float clamp = p_f32(a, "clamp_min", 0.0f);
     if (n <= 0 || (n & 1)) return RAD_E_SHAPE;
     const int64_t rows = rows_of(Y, n);
     if (rows <= 0 || numel(T) < rows) return RAD_E_SHAPE;
@@ -423,7 +424,7 @@ AVX_KERNEL(timestep_embed) {
     float *f = buf, *row = buf + n;
     for (int64_t i = 0; i < h; ++i) f[i] = sc_exp(coef * (float)i / (float)h);
     for (int64_t m = 0; m < rows; ++m) {
-        const float tv = ldt(T, offlin(T, m));
+        const float tv = std::fmax(ldt(T, offlin(T, m)), clamp);   /* ref pins are floors */
         const float tt = round ? scale * narrow1(RAD_BF16, narrow1(RAD_BF16, tv * scale) / scale)
                                : scale * tv;
         for (int64_t i = 0; i < h; ++i) {

@@ -952,7 +952,17 @@ int Engine::declare() {
                 decide("--max-model-len", std::to_string(cfg_.max_ctx),
                        "a video generator: a step's rows");
             }
-            if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
+            /* `auto` is left to the vision rule below, which keys on the container's
+             * `radiance.encoder`: a container converted with a vision tower's weights (a ref2va
+             * conditioning checkpoint) serves reference media through it, and one converted
+             * without them stays text-only. A video generator that carries no tower pays
+             * nothing for this: the rule resolves to 0 exactly as this branch used to. */
+            if (cfg_.mm_max_patches < 0 && pb.gen_patches > 0) {
+                cfg_.mm_max_patches = pb.gen_patches;
+                decide("--mm-max-patches", std::to_string(cfg_.mm_max_patches),
+                       "a video generator: every reference media patch of one conditioning, "
+                       "the pass size the plugin states");
+            }
             if (cfg_.n_spec < 0) cfg_.n_spec = 0;
             cfg_.prefix_cache = false;
         } else if (pb.gen_rows > 0) {

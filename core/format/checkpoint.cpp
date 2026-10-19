@@ -1249,6 +1249,291 @@ int Checkpoint::add_draft(const std::string& dir, const std::string& prefix) {
     return RAD_OK;
 }
 
+/* PEFT exports wrap HF module paths in the name of the net the adapter trained: ai-toolkit spells
+ * a DiT module `diffusion_model.<path>`, diffusers' wrappers `transformer.` or `unet.`. */
+static const char* const kLoraPrefixes[] = { "diffusion_model.", "transformer.", "unet." };
+
+/* One `modules` rule of the map: the module pattern split at its single `*`, and the target
+ * patterns into which the matched run is substituted, in B-row order. */
+struct LoraRule {
+    bool                     star = false;
+    std::string              pre, suf;
+    std::vector<std::string> targets;
+    bool match(const std::string& m, std::string* tok) const {
+        if (!star) {
+            if (m != pre) return false;
+            tok->clear();
+            return true;
+        }
+        if (m.size() < pre.size() + suf.size() || m.compare(0, pre.size(), pre) != 0) return false;
+        if (m.compare(m.size() - suf.size(), suf.size(), suf) != 0) return false;
+        *tok = m.substr(pre.size(), m.size() - pre.size() - suf.size());
+        return !tok->empty();
+    }
+};
+
+/* Read the map file: {"strip": [...], "modules": {"<pat>": ["<t>", ...], ...}}. The module
+ * order is preserved (an nlohmann object keeps insertion order), so the first rule whose
+ * pattern matches a module wins. */
+static int lora_map_read(const std::string& file, std::vector<std::string>* strip,
+                         std::vector<LoraRule>* rules) {
+    std::ifstream f(file);
+    if (!f) { RAD_ERR("lora: --lora-map %s cannot be read", file.c_str()); return RAD_E_NOTFOUND; }
+    nlohmann::ordered_json j;
+    try {
+        j = nlohmann::ordered_json::parse(f);
+    } catch (const std::exception& e) {
+        RAD_ERR("lora: --lora-map %s: %s", file.c_str(), e.what());
+        return RAD_E_FORMAT;
+    }
+    if (!j.is_object()) { RAD_ERR("lora: --lora-map %s is not a JSON object", file.c_str());
+                          return RAD_E_FORMAT; }
+    if (j.contains("strip")) {
+        if (!j["strip"].is_array()) { RAD_ERR("lora: --lora-map 'strip' is not a list");
+                                      return RAD_E_FORMAT; }
+        for (const auto& s : j["strip"]) {
+            if (!s.is_string()) { RAD_ERR("lora: --lora-map 'strip' holds a non-string");
+                                  return RAD_E_FORMAT; }
+            strip->push_back(s.get<std::string>());
+        }
+    }
+    if (!j.contains("modules") || !j["modules"].is_object()) {
+        RAD_ERR("lora: --lora-map %s has no 'modules' object", file.c_str());
+        return RAD_E_FORMAT;
+    }
+    for (const auto& [pat, t] : j["modules"].items()) {
+        if (!t.is_array() || t.empty()) {
+            RAD_ERR("lora: --lora-map rule '%s' is not a non-empty list", pat.c_str());
+            return RAD_E_FORMAT;
+        }
+        const size_t star = pat.find('*');
+        LoraRule r;
+        r.star = star != std::string::npos;
+        r.pre  = r.star ? pat.substr(0, star) : pat;
+        r.suf  = r.star ? pat.substr(star + 1) : "";
+        for (const auto& x : t) {
+            if (!x.is_string()) {
+                RAD_ERR("lora: --lora-map rule '%s' holds a non-string target", pat.c_str());
+                return RAD_E_FORMAT;
+            }
+            r.targets.push_back(x.get<std::string>());
+        }
+        rules->push_back(std::move(r));
+    }
+    return RAD_OK;
+}
+
+int Checkpoint::add_lora(const std::string& path, double strength,
+                         std::vector<std::string>* merged, const std::string* map_json) {
+    if (kind_ != SafeT) {
+        RAD_ERR("lora: an adapter merges into a safetensors source; %s is not one", path_.c_str());
+        return RAD_E_UNSUPPORTED;
+    }
+    if (import_ != Import::None) {
+        RAD_ERR("lora: this checkpoint ships its weights packed by a quantiser; an adapter merges "
+                "into the plain tensors its training saw, not into the codes");
+        return RAD_E_UNSUPPORTED;
+    }
+    std::vector<std::string> files;
+    std::error_code ec;
+    if (std::filesystem::is_directory(path, ec)) {
+        for (const auto& e : std::filesystem::directory_iterator(path, ec))
+            if (e.path().extension() == ".safetensors") files.push_back(e.path().string());
+        std::sort(files.begin(), files.end());
+    } else
+        files.push_back(path);
+    if (files.empty()) {
+        RAD_ERR("lora: %s holds no .safetensors file", path.c_str());
+        return RAD_E_NOTFOUND;
+    }
+
+    /* The module lookup strips wrapper prefixes: the map's first, then the builtin ones. */
+    std::vector<std::string> strips;
+    std::vector<LoraRule>    rules;
+    if (map_json && lora_map_read(*map_json, &strips, &rules) < 0) return RAD_E_FORMAT;
+    for (const char* pre : kLoraPrefixes) strips.push_back(pre);
+
+    /* One pair's A/B/alpha, by module; `module` keeps the wrapper prefix, so the lookup below
+     * strips it. */
+    struct Pair { std::string module; const StTensor *a = nullptr, *b = nullptr, *al = nullptr; };
+
+    int n_merged = 0;
+    for (const std::string& f : files) {
+        SafeTensorsFile st;
+        if (st.open(f) != RAD_OK) return RAD_E_FORMAT;
+        std::vector<Pair> pairs;
+        std::map<std::string, size_t> by_module;
+        for (const StTensor& t : st.tensors()) {
+            if (t.name.size() > 12 && t.name.compare(t.name.size() - 12, 12, ".dora.scalar") == 0) {
+                RAD_ERR("lora: '%s' is a DoRA adapter; only plain LoRA merges (a magnitude vector "
+                        "has no place in a weight merge)", t.name.c_str());
+                return RAD_E_UNSUPPORTED;
+            }
+            const char* suf = nullptr;
+            if (t.name.size() > 14 && t.name.compare(t.name.size() - 14, 14, ".lora_A.weight") == 0)
+                suf = ".lora_A.weight";
+            else if (t.name.size() > 18 &&
+                     t.name.compare(t.name.size() - 18, 18, ".lora_down.weight") == 0)
+                suf = ".lora_down.weight";
+            if (suf) {
+                Pair p;
+                p.module = t.name.substr(0, t.name.size() - std::strlen(suf));
+                p.a      = &t;
+                by_module[p.module] = pairs.size();
+                pairs.push_back(std::move(p));
+            } else if (t.name.size() > 14 &&
+                       t.name.compare(t.name.size() - 14, 14, ".lora_B.weight") == 0) {
+                auto it = by_module.find(t.name.substr(0, t.name.size() - 14));
+                if (it != by_module.end()) pairs[it->second].b = &t;
+            } else if (t.name.size() > 6 &&
+                       t.name.compare(t.name.size() - 6, 6, ".alpha") == 0) {
+                auto it = by_module.find(t.name.substr(0, t.name.size() - 6));
+                if (it != by_module.end()) pairs[it->second].al = &t;
+            }
+        }
+        if (pairs.empty()) {
+            RAD_ERR("lora: %s holds no .lora_A.weight / .lora_down.weight tensors", f.c_str());
+            return RAD_E_NOTFOUND;
+        }
+        for (Pair& p : pairs) {
+            if (!p.b) {
+                RAD_ERR("lora: '%s' ships its A but no B", p.module.c_str());
+                return RAD_E_FORMAT;
+            }
+            /* The targets, in merge order: `<module>.weight`, then the same under each
+             * prefix-stripped spelling (the module never carries its `.weight` -- PEFT names the
+             * module, the target adds it), then the first map rule the stripped module matches,
+             * whose target patterns name one or several tensors the fused module was trained as.
+             * The first spelling the checkpoint holds wins. */
+            std::string norm = p.module;
+            for (const std::string& s : strips)
+                if (norm.size() > s.size() && norm.compare(0, s.size(), s) == 0) {
+                    norm.erase(0, s.size());
+                    break;
+                }
+            std::vector<const SrcTensor*> tg;
+            if (const SrcTensor* W = find(p.module + ".weight")) tg.push_back(W);
+            if (tg.empty() && norm != p.module)
+                if (const SrcTensor* W = find(norm + ".weight")) tg.push_back(W);
+            for (const LoraRule& ru : rules) {
+                std::string tok;
+                if (!ru.match(norm, &tok)) continue;
+                for (const std::string& pat : ru.targets) {
+                    std::string nm = pat;
+                    const size_t star = nm.find('*');
+                    if (star != std::string::npos) nm.replace(star, 1, tok);
+                    const SrcTensor* W = find(nm);
+                    if (!W) {
+                        RAD_ERR("lora: the map maps '%s' onto '%s', which this checkpoint does "
+                                "not ship", p.module.c_str(), nm.c_str());
+                        return RAD_E_NOTFOUND;
+                    }
+                    tg.push_back(W);
+                }
+                break;
+            }
+            if (tg.empty()) {
+                RAD_ERR("lora: '%s' names a module this checkpoint does not ship as "
+                        "'<module>.weight' (nor stripped of a known wrapper prefix)%s",
+                        p.module.c_str(),
+                        map_json ? " and no --lora-map rule matches it" : "");
+                return RAD_E_NOTFOUND;
+            }
+            const StTensor& A = *p.a;
+            const StTensor& B = *p.b;
+            if (A.shape.size() != 2 || B.shape.size() != 2 || A.shape[0] <= 0 ||
+                A.shape[0] != B.shape[1]) {
+                RAD_ERR("lora: '%s' is not a rank-%lld pair of matrices: [a %lld x %lld, "
+                        "b %lld x %lld]",
+                        p.module.c_str(), (long long)A.shape[0], (long long)A.shape[0],
+                        (long long)A.shape[1], (long long)B.shape[0], (long long)B.shape[1]);
+                return RAD_E_FORMAT;
+            }
+            const auto plain = [](uint32_t d) {
+                return d == RAD_BF16 || d == RAD_F16 || d == RAD_F32;
+            };
+            if (!plain(A.dtype) || !plain(B.dtype)) {
+                RAD_ERR("lora: '%s' ships A/B in dtypes the merge cannot read", p.module.c_str());
+                return RAD_E_UNSUPPORTED;
+            }
+            const int64_t K = A.shape[1], r = A.shape[0];
+            int64_t rows = 0;
+            for (const SrcTensor* W : tg) {
+                if (W->gptq_bits || W->ct_group || W->rad_dtype == RAD_DT_INVALID ||
+                    !plain(W->rad_dtype)) {
+                    RAD_ERR("lora: '%s' is not a plain bf16/f16/f32 matrix, so an adapter cannot "
+                            "merge into it", W->name.c_str());
+                    return RAD_E_UNSUPPORTED;
+                }
+                if (W->shape.size() != 2 || W->shape[1] != K) {
+                    RAD_ERR("lora: '%s' [a %lld x %lld, b %lld x %lld] does not fit '%s' "
+                            "[%lld x %lld]",
+                            p.module.c_str(), (long long)A.shape[0], (long long)A.shape[1],
+                            (long long)B.shape[0], (long long)B.shape[1], W->name.c_str(),
+                            (long long)W->shape[0], (long long)W->shape[1]);
+                    return RAD_E_FORMAT;
+                }
+                rows += W->shape[0];
+            }
+            if (rows != B.shape[0]) {
+                RAD_ERR("lora: '%s' merges into %zu target(s) whose rows sum to %lld, but its B "
+                        "has %lld", p.module.c_str(), tg.size(), (long long)rows,
+                        (long long)B.shape[0]);
+                return RAD_E_FORMAT;
+            }
+            float scale = (float)strength;
+            if (p.al) {
+                const int64_t n_el = p.al->shape.empty() ? 1 : p.al->numel();
+                if (n_el != 1 || (p.al->dtype != RAD_F32 && p.al->dtype != RAD_BF16 &&
+                                  p.al->dtype != RAD_F16)) {
+                    RAD_ERR("lora: '%s.alpha' is not a single number", p.module.c_str());
+                    return RAD_E_FORMAT;
+                }
+                scale *= rad_load_f32(p.al->data, p.al->dtype, 0) / (float)r;
+            }
+            /* The module is the targets' concatenation, so B's rows split along them in listed
+             * order: target i takes rows [off, off + N_i) as its own.
+             *
+             * Row at a time, rank-1 updates into an f32 row buffer. A is copied to f32 once per
+             * pair (r rows -- a few KiB to a few MiB): the rank sweep then reads plain f32
+             * contiguously against the accumulator, which is what the compiler vectorises and
+             * the cache wants; paying rad_load_f32's dtype switch per element instead made the
+             * real 416-pair merge an hour of scalar work. The same f32 sums as the textbook
+             * order, up to the rounding of the accumulation itself, which the bf16 cast
+             * swallows. */
+            std::vector<float> Af((size_t)(r * K));
+            for (int64_t i = 0; i < r * K; ++i) Af[(size_t)i] = rad_load_f32(A.data, A.dtype, i);
+            std::vector<float> acc((size_t)K);
+            int64_t off = 0;
+            for (const SrcTensor* W : tg) {
+                const int64_t N = W->shape[0];
+                auto out = std::make_unique<uint8_t[]>((size_t)W->bytes);
+                for (int64_t n = 0; n < N; ++n) {
+                    for (int64_t j = 0; j < r; ++j) {
+                        const float b = scale * rad_load_f32(B.data, B.dtype, (off + n) * r + j);
+                        if (b == 0.f) continue;
+                        const float* ar = Af.data() + (size_t)j * K;
+                        for (int64_t k = 0; k < K; ++k) acc[(size_t)k] += b * ar[k];
+                    }
+                    for (int64_t k = 0; k < K; ++k)
+                        rad_store_f32(out.get(), W->rad_dtype, n * K + k,
+                                      rad_load_f32(W->data, W->rad_dtype, n * K + k) +
+                                          acc[(size_t)k]);
+                    std::fill(acc.begin(), acc.end(), 0.f);
+                }
+                SrcTensor& t = tensors_[index_[W->name]];
+                t.data = out.get();
+                owned_.push_back(std::move(out));
+                if (merged) merged->push_back(t.name);
+                ++n_merged;
+                off += N;
+            }
+        }
+    }
+    RAD_INFO("lora     %s: %d tensor(s) merged at strength %g", path.c_str(), n_merged, strength);
+    return RAD_OK;
+}
+
 const SrcTensor* Checkpoint::find(const std::string& n) const {
     auto it = index_.find(n);
     return it == index_.end() ? nullptr : &tensors_[it->second];

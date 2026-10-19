@@ -12,8 +12,10 @@
  *
  *   1. ADECODE, then each VDECODE chunk in order, of a lane whose denoising is done: they finish
  *      a request and free its lane.
- *   2. VCOND of an admitted request, so its steps can follow the current request's without a gap.
- *   3. VSTEP of the oldest lane with steps left, or its VUPSCALE once its small steps are done.
+ *   2. VENCODE or AENCODE of an admitted request's reference media, one per reference, so the
+ *      video and audio VAE latents are in the lane's slots before its prompt runs.
+ *   3. VCOND of an admitted request, so its steps can follow the current request's without a gap.
+ *   4. VSTEP of the oldest lane with steps left, or its VUPSCALE once its small steps are done.
  *      Requests are denoised one after another, not in turns: a pass is one request's whole
  *      sequence, so taking turns would only delay the first.
  */
@@ -34,9 +36,18 @@ public:
         RadStream stream = nullptr;
     };
     using PositionsFn = int64_t (*)(int, const RadVideoGeom*, float*, int64_t);
+    using SegsFn      = int64_t (*)(const RadVideoGeom*, int32_t*, int64_t);
+    using PackFn      = int64_t (*)(const RadVideoGeom*, const int32_t*, int32_t*, int64_t,
+                                    float*, int64_t);
+    using EncodeGeomFn = int64_t (*)(int32_t, const int64_t*, int32_t*, int64_t);
 
-    /* `positions` is the plugin's rad_arch_video_positions. */
-    int  init(const Program& prog, PositionsFn positions, const std::vector<RankIO>& ranks);
+    /* `positions` is the plugin's rad_arch_video_positions; `segs`, optional, is its
+     * rad_arch_video_segs (null = the driver stages the plain segment table itself); `pack`,
+     * optional, is its rad_arch_video_pack (null = reference-conditioned sequences cannot be
+     * laid out and such requests are refused); `enc_geom`, optional, is its
+     * rad_arch_encode_geom (null = no encode pass runs). */
+    int  init(const Program& prog, PositionsFn positions, const std::vector<RankIO>& ranks,
+              SegsFn segs = nullptr, PackFn pack = nullptr, EncodeGeomFn enc_geom = nullptr);
     void fini();
     ~VideoDriver() override { fini(); }
 
@@ -68,6 +79,38 @@ private:
         int64_t       n_samples = 0;     /* the soundtrack's samples a channel */
         VideoSchedule sched;
         std::vector<float> pos;          /* [3, rows] */
+        /* The VAE references of a reference-conditioned request (RadVideoGenBatch::ref_tab):
+         * the pack's input, empty until the path consumes them (it is refused at submit
+         * before that). The step reads it host-side, so nothing stages it. */
+        std::vector<int32_t> ref_tab;
+        /* When the generator's denoiser consumes that table (`decl_.ref_rows`), the step's packed
+         * sequence carries reference rows between the text and the target streams, laid out by
+         * rad_arch_video_pack. These hold that step layout: `ref_wide` marks it, `seg` the pack's
+         * segment boundaries with the video grid last, `nseg` their count, and `lat_v`/`lat_a` the
+         * TARGET video and audio row counts -- the rows the sampler owns and the Euler steps update,
+         * which the plain `rows - text - audio` arithmetic no longer recovers once references ride
+         * ahead of the streams. Left empty/0 on the plain path and on every non-step pass (decode,
+         * encode, upscale), which keep their own ref-less segment table. */
+        bool                 ref_wide = false;
+        int32_t              nseg = 0;
+        std::vector<int32_t> seg;
+        int64_t              lat_v = 0, lat_a = 0;
+        /* The denoising step's row count: the widened total once references ride, otherwise equal
+         * to `rows`. Only build_step uses it -- the encode, decode, audio and upscale passes keep
+         * staging against the plain `rows` (their segment table and target counts are their own,
+         * never the reference layout), so widening the step cannot disturb them. `pos` widens with
+         * it, since build_step is the only pass that stages R_ROPE from `pos`. */
+        int64_t              step_rows = 0;
+        /* The VAE encode queue: the reference media whose bytes reach the model through a video or
+         * audio VAE, one item per Vencode/Aencode pass, in presentation order, built at submit for
+         * the parts the server decoded into encoder form (gen/video.h enc_pixels/enc_samples).
+         * `enc_kind` is the RAD_ENC_* the pass names and `enc_slot` its 1-based number within that
+         * kind (the reference's index); `ref` indexes req->refs. `enc_next` is the next to run;
+         * once it reaches enc_q.size() the media are all encoded. Empty for a request the encoder
+         * has nothing to do with. */
+        struct EncItem { int32_t kind, slot, ref; };
+        std::vector<EncItem> enc_q;
+        size_t               enc_next = 0;
         /* Latent upscaling: the evaluations at the small size (0: none), its geometry, rows and
          * positions, the factor the network is told, and whether the upscale has run. */
         int32_t       split = 0;
@@ -95,8 +138,15 @@ private:
 
     /* Staging regions: their offsets in the host span and every rank's slab. */
     struct Region { int64_t off = 0, bytes = 0, used = 0; };
+    /* R_MMROW/R_ENCPIX/R_ENCCRD/R_ENCCU stage the conditioning pass's reference media, as the
+     * image generator's driver does (core/gen/driver.cpp); R_ROPE carries a step's f32 positions
+     * and a conditioning's [3,T] i32 M-RoPE, never in the same pass. */
+    /* R_ENCPX/R_ENCSM/R_ENCG stage one media item for a Vencode/Aencode pass: the encoder-ready
+     * pixels ([frames,h,w,3] f32) or samples ([ch,n] f32) and the encode geometry the plugin's
+     * rad_arch_encode_geom returned, staged verbatim as device i32 for the kernels to read. */
     enum { R_TOK, R_POS, R_CU, R_ROPE, R_GEOM, R_SCHED, R_TV, R_TA, R_SEED, R_LANE, R_FIRST,
-           R_SEG, R_LAT, R_UP, R_N };
+           R_SEG, R_LAT, R_UP, R_MMROW, R_ENCPIX, R_ENCCRD, R_ENCCU,
+           R_ENCPX, R_ENCSM, R_ENCG, R_N };
 
     template <class T> T* hptr(int r) const { return reinterpret_cast<T*>(host_ + reg_[r].off); }
     template <class T> T* dptr(int rank, int r) const {
@@ -106,7 +156,8 @@ private:
     /* The geometry and rows of the job's next step: the small ones before its upscale. */
     bool small_now(const Job& j) const { return j.split > 0 && !j.upscaled; }
     void base_batches(const Job& j, const RadVideoGeom& g, int64_t n_tok, int step);
-    void stage_geom(const Job& j, const RadVideoGeom& g, int64_t rows, int32_t chunk);
+    void stage_geom(const Job& j, const RadVideoGeom& g, int64_t rows, int32_t chunk,
+                    bool ref_step = false);
     void stage_sched(const Job& j, int32_t i, bool to_clean);
     void stage_seed(const Job& j);
 
@@ -120,12 +171,23 @@ private:
     const RadBatch* build_upscale(Job& j, int step);
     const RadBatch* build_audio(Job& j, int step);
     const RadBatch* build_chunk(Job& j, int step);
+    /* One Vencode or Aencode pass for the job's next queued reference (enc_q[enc_next]): stages
+     * that part's encoder-ready pixels or samples and the encode geometry, and names its kind and
+     * slot. Returns null and fails the job if the bytes no longer fit a pass. */
+    const RadBatch* build_encode(Job& j, int step);
 
     RadVideoGenDecl     decl_{};
     std::vector<double> rungs_;        /* decl_.rungs points here */
     std::string         name_;
     PositionsFn         positions_ = nullptr;
+    SegsFn              segs_ = nullptr;
+    PackFn              pack_ = nullptr;
+    EncodeGeomFn        enc_geom_ = nullptr;
     int64_t             max_tok_ = 0;
+    /* The conditioning's encoder view: the tower's per-patch width and the patches one pass
+     * carries. Zero when the program declares no vision encoder, which bounds the media regions
+     * and rejects any request that carries references. */
+    int64_t             patch_dim_ = 0, max_enc_ = 0;
     std::vector<RankIO> ranks_;
 
     char*               host_ = nullptr;   /* pinned, same layout as each slab */

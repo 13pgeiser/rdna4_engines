@@ -443,16 +443,26 @@ AVX_KERNEL(vtile_stitch) {
 /* ================================================================== the latent upscaler
  * Voxel rows (t, i, j) of a T x H x W volume, channels innermost, the volume in `geom`. */
 
+/* Floor division, Python-style, for the output lengths' PyTorch rule. */
+static int64_t idiv_floor(int64_t x, int64_t d) {
+    const int64_t q = x / d;
+    return (x % d && (x < 0) != (d < 0)) ? q - 1 : q;
+}
+
 /* ------------------------------------------------------------------ conv3d_ndhwc */
 /* A 3-D convolution as GEMMs over bands of patch rows, as conv2d_nhwc and conv1d take theirs. The
  * weight [cout, cin, kt, k, k] is re-laid once a launch as [cout][dt][kh][kw][cin] (bf16 copies
  * when it is bf16, f32 otherwise), so an output voxel's patch row is its kt k k input voxels'
- * channel runs back to back, zeros outside the volume: bf16 copies when x is bf16 with dense
- * rows, f32 otherwise. A band is one gemm_nt_into into f32 rows, the bias added there; each row
- * is then rounded once into y, or with `res` rounded to y's dtype, its residual row added and
- * rounded again. A band's residual rows are read before its rows of y are written, row by row,
- * so `res` may be y. The patches and the weight live in thread_local vectors that keep their
- * high-water size, leaving the GEMM's scratch arenas to it. */
+ * channel runs back to back, zeros outside the volume (or `reflect`'s mirror): bf16 copies when x
+ * is bf16 with dense rows, f32 otherwise. A band is one gemm_nt_into into f32 rows, the bias
+ * added there; each row is then rounded once into y, or with `res` rounded to y's dtype, its
+ * residual row added and rounded again. A band's residual rows are read before its rows of y are
+ * written, row by row, so `res` may be y. The patches and the weight live in thread_local vectors
+ * that keep their high-water size, leaving the GEMM's scratch arenas to it.
+ *
+ * The optional `stride`/`stride_t`/`causal`/`pad`/`reflect` are libref's CausalConv3d forms (its
+ * comment and docs/OPS.md); an output voxel is read from `stride`-spaced, pad-shifted input
+ * voxels of the (T2, H2, W2) output grid. */
 AVX_KERNEL(conv3d_ndhwc) {
     if (a->n_t < 6 || !rad_args_have(a, 4) || !rad_arg_in(a, 5)) return RAD_E_INVAL;
     const RadTensor *X = &a->t[0], *W = &a->t[1], *B = &a->t[2], *G = &a->t[3];
@@ -461,10 +471,27 @@ AVX_KERNEL(conv3d_ndhwc) {
     const int64_t k = p_int(a, "k", 0), kt = p_int(a, "kt", 0);
     if (cin <= 0 || cout <= 0 || k <= 0 || kt <= 0 || !(k & 1) || !(kt & 1) || numel(G) < 3)
         return RAD_E_SHAPE;
+    const int64_t sp = p_int(a, "stride", 1), st = p_int(a, "stride_t", 1);
+    const int64_t causal = p_int(a, "causal", 0), reflect = p_int(a, "reflect", 0);
+    const char* pads = p_str(a, "pad", "same");
+    const bool down = pads && !std::strcmp(pads, "down");
+    if (sp <= 0 || st <= 0 || (causal && causal != 1) || (reflect && reflect != 1) ||
+        !(!pads || !std::strcmp(pads, "same") || down))
+        return RAD_E_SHAPE;
+    const bool gen = sp != 1 || st != 1 || causal || down || reflect;
+    if (gen && (k != 3 || kt != 3)) return RAD_E_SHAPE;
     const int64_t T = at(G, 0), H = at(G, 1), Wd = at(G, 2);
     if (T <= 0 || H <= 0 || Wd <= 0) return RAD_E_SHAPE;
-    const int64_t rows = T * H * Wd, taps = kt * k * k, KK = taps * cin;
-    if (rows_of(Y, cout) < rows || rows_of(X, cin) < rows || (R && rows_of(R, cout) < rows) ||
+    const int64_t ft = causal ? kt - 1 : kt / 2, bk = causal ? 0 : kt / 2;
+    const int64_t pt = down ? 0 : k / 2, pb = down ? 1 : k / 2;
+    const int64_t pl = down ? 0 : k / 2, pr = down ? 1 : k / 2;
+    if (reflect && (std::max(pt, pb) >= H || std::max(pl, pr) >= Wd)) return RAD_E_SHAPE;
+    const int64_t T2 = idiv_floor(T + ft + bk - kt, st) + 1;
+    const int64_t H2 = idiv_floor(H + pt + pb - k, sp) + 1;
+    const int64_t W2 = idiv_floor(Wd + pl + pr - k, sp) + 1;
+    if (T2 <= 0 || H2 <= 0 || W2 <= 0) return RAD_E_SHAPE;
+    const int64_t rows = T * H * Wd, orows = T2 * H2 * W2, taps = kt * k * k, KK = taps * cin;
+    if (rows_of(Y, cout) < orows || rows_of(X, cin) < rows || (R && rows_of(R, cout) < orows) ||
         numel(W) < cout * KK || numel(B) < cout)
         return RAD_E_SHAPE;
     static thread_local std::vector<uint8_t> wbuf, pbuf;
@@ -490,22 +517,27 @@ AVX_KERNEL(conv3d_ndhwc) {
     const size_t ael = x16 ? 2 : 4;
     const int64_t want = std::min<int64_t>((int64_t)1 << 25,
                                            std::max<int64_t>((int64_t)1 << 23, 8 * cout * KK));
-    const int64_t band = std::max<int64_t>(1, std::min(rows, want / KK));
+    const int64_t band = std::max<int64_t>(1, std::min(orows, want / KK));
     pbuf.resize((size_t)(band * KK) * ael + 64);
     ybuf.resize((size_t)(band * cout) + 16);
     char* pp = (char*)pbuf.data();
     float* yp = ybuf.data();
-    const int64_t pz = kt / 2, ps = k / 2;
-    for (int64_t r0 = 0; r0 < rows; r0 += band) {
-        const int64_t nb = std::min(band, rows - r0);
+    for (int64_t r0 = 0; r0 < orows; r0 += band) {
+        const int64_t nb = std::min(band, orows - r0);
         AVX_PARALLEL_FOR_IF(nb * KK >= AVX_PAR_MIN)
-        for (int64_t pr = 0; pr < nb; ++pr) {
-            const int64_t r = r0 + pr, t = r / (H * Wd), i = (r / Wd) % H, j = r % Wd;
-            char* d = pp + (size_t)(pr * KK) * ael;
+        for (int64_t br = 0; br < nb; ++br) {
+            const int64_t r = r0 + br, t = r / (H2 * W2), i = (r / W2) % H2, j = r % W2;
+            char* d = pp + (size_t)(br * KK) * ael;
             for (int64_t dz = 0; dz < kt; ++dz)
                 for (int64_t kh = 0; kh < k; ++kh)
                     for (int64_t kw = 0; kw < k; ++kw, d += (size_t)cin * ael) {
-                        const int64_t tz = t + dz - pz, iy = i + kh - ps, ix = j + kw - ps;
+                        const int64_t tz = t * st + dz - ft;
+                        int64_t iy = i * sp + kh - pt;
+                        int64_t ix = j * sp + kw - pl;
+                        if (reflect) {   /* torch's mirror, no repeated edge, then the bounds */
+                            if (iy < 0) iy = -iy; else if (iy >= H) iy = 2 * H - 2 - iy;
+                            if (ix < 0) ix = -ix; else if (ix >= Wd) ix = 2 * Wd - 2 - ix;
+                        }
                         if (tz < 0 || tz >= T || iy < 0 || iy >= H || ix < 0 || ix >= Wd) {
                             std::memset(d, 0, (size_t)cin * ael);
                             continue;
@@ -524,16 +556,16 @@ AVX_KERNEL(conv3d_ndhwc) {
         const int st = gemm_nt_into(&pt, &wt, B, &yt, nb, cout, KK);
         if (st < 0) return st;
         AVX_PARALLEL_FOR_IF(nb * cout >= AVX_PAR_MIN)
-        for (int64_t pr = 0; pr < nb; ++pr) {
-            float* row = yp + pr * cout;
+        for (int64_t br = 0; br < nb; ++br) {
+            float* row = yp + br * cout;
             if (R) {
                 float* buf = scratch_f32((size_t)(2 * cout + 32));
                 float *tmp = buf, *rs = buf + cout + 16;
                 narrow_row(Y->dtype, row, cout, tmp);
-                const float* rr = in_row(R, rowoff(R, r0 + pr, cout), cout, rs);
+                const float* rr = in_row(R, rowoff(R, r0 + br, cout), cout, rs);
                 for (int64_t c = 0; c < cout; ++c) row[c] += rr[c];
             }
-            out_row(Y, rowoff(Y, r0 + pr, cout), cout, row);
+            out_row(Y, rowoff(Y, r0 + br, cout), cout, row);
         }
     }
     return RAD_OK;

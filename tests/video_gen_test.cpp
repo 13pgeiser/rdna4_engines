@@ -68,6 +68,133 @@ int64_t fake_positions(int which, const RadVideoGeom* g, float* pos, int64_t cap
     return rows;
 }
 
+/* The pack's boundary table for this fake's layout: [0 | text | text + stereo | total]. */
+int64_t fake_segs(const RadVideoGeom* g, int32_t* cu, int64_t cap) {
+    const int64_t audio = 2 * (int64_t)g->n_audio;
+    const int64_t rows = g->n_text + audio +
+                         (int64_t)g->lat_frames * (g->lat_h / 2) * (g->lat_w / 2);
+    const int32_t t[4] = { 0, g->n_text, (int32_t)(g->n_text + audio), (int32_t)rows };
+    if (!cu) return 4;
+    if (cap < 4) return RAD_E_INVAL;
+    for (int i = 0; i < 4; ++i) cu[i] = t[i];
+    return 4;
+}
+/* Same count, wrong boundaries -- the driver must stage its own table, not this one. */
+int64_t fake_segs_wrong(const RadVideoGeom* g, int32_t* cu, int64_t cap) {
+    if (!cu) return 4;
+    if (cap < 4) return RAD_E_INVAL;
+    cu[0] = 0; cu[1] = g->n_text + 1; cu[2] = 999999; cu[3] = 12345;
+    return 4;
+}
+/* A segmentation R_SEG cannot hold -- also falls back to the driver's own table. */
+int64_t fake_segs_more(const RadVideoGeom* g, int32_t* cu, int64_t cap) {
+    if (!cu) return 5;
+    if (cap < 5) return RAD_E_INVAL;
+    cu[0] = 0; cu[1] = g->n_text; cu[2] = g->n_text + 4; cu[3] = g->n_text + 8; cu[4] = 99;
+    return 5;
+}
+
+/* The reference-aware layout export for this fake: it lays out the plain sequence only (a
+ * reference table would be the real plugin's to present), answering with the rows and writing
+ * the boundaries and positions when roomy. */
+int64_t fake_pack(const RadVideoGeom* g, const int32_t* ref_tab, int32_t* seg, int64_t cap_seg,
+                  float* pos, int64_t cap_pos) {
+    if (ref_tab) return RAD_E_INVAL;
+    const int64_t audio = 2 * (int64_t)g->n_audio;
+    const int64_t rows = g->n_text + audio +
+                         (int64_t)g->lat_frames * (g->lat_h / 2) * (g->lat_w / 2);
+    if (seg) {
+        if (cap_seg < 4) return RAD_E_INVAL;
+        seg[0] = 0; seg[1] = g->n_text; seg[2] = (int32_t)(g->n_text + audio);
+        seg[3] = (int32_t)rows;
+    }
+    if (pos) {
+        if (cap_pos < rows) return RAD_E_INVAL;
+        for (int64_t c = 0; c < 3; ++c)
+            for (int64_t i = 0; i < rows; ++i) pos[c * rows + i] = (float)(c * 1000 + i);
+    }
+    return rows;
+}
+/* Right-shaped but the rows do not match the geometry -- the driver stages its own table. */
+int64_t fake_pack_wrong(const RadVideoGeom* g, const int32_t* ref_tab, int32_t* seg,
+                        int64_t cap_seg, float* pos, int64_t cap_pos) {
+    (void)ref_tab; (void)pos; (void)cap_pos;
+    if (!seg) return 999999;
+    if (cap_seg < 4) return RAD_E_INVAL;
+    seg[0] = 0; seg[1] = g->n_text + 1; seg[2] = 999999; seg[3] = 12345;
+    return 12345;
+}
+/* A plain table with an entry past the fourth: the rows are right and the first boundaries
+ * match, but the extra word poisons the table the geometry backs -- fallback again. */
+int64_t fake_pack_more(const RadVideoGeom* g, const int32_t* ref_tab, int32_t* seg,
+                       int64_t cap_seg, float* pos, int64_t cap_pos) {
+    (void)ref_tab; (void)pos; (void)cap_pos;
+    const int64_t audio = 2 * (int64_t)g->n_audio;
+    const int64_t rows = g->n_text + audio +
+                         (int64_t)g->lat_frames * (g->lat_h / 2) * (g->lat_w / 2);
+    if (!seg) return rows;
+    if (cap_seg < 5) return RAD_E_INVAL;
+    seg[0] = 0; seg[1] = g->n_text; seg[2] = (int32_t)(g->n_text + audio);
+    seg[3] = (int32_t)rows; seg[4] = 99;
+    return rows;
+}
+
+/* The reference-aware layout: when a reference table rides, lay out
+ * [text | one block per reference | audio target | video target] -- boundaries are segment starts
+ * with the total rows last, so the video target runs [seg[nseg-2], seg[nseg-1]). Each picture
+ * contributes a fixed 4 rows: this fake lays out the structure the driver stages, not the
+ * reference's real visual-token arithmetic. With no table it lays the plain sequence, so the
+ * encode/decode passes that call the pack without references get their plain table. */
+int64_t fake_pack_ref(const RadVideoGeom* g, const int32_t* ref_tab, int32_t* seg, int64_t cap_seg,
+                      float* pos, int64_t cap_pos) {
+    const int64_t audio = 2 * (int64_t)g->n_audio;
+    const int64_t vtarget = (int64_t)g->lat_frames * (g->lat_h / 2) * (g->lat_w / 2);
+    if (!ref_tab) {
+        const int64_t rows = g->n_text + audio + vtarget;
+        if (seg) {
+            if (cap_seg < 4) return RAD_E_INVAL;
+            seg[0] = 0; seg[1] = g->n_text; seg[2] = (int32_t)(g->n_text + audio);
+            seg[3] = (int32_t)rows;
+        }
+        if (pos) {
+            if (cap_pos < 3 * rows) return RAD_E_INVAL;
+            for (int64_t c = 0; c < 3; ++c)
+                for (int64_t i = 0; i < rows; ++i) pos[c * rows + i] = (float)(c * 1000 + i);
+        }
+        return rows;
+    }
+    const int32_t nr = ref_tab[0], nk = ref_tab[1];
+    const int64_t rper = 4;
+    const int64_t rows = g->n_text + (int64_t)nr * rper + audio + vtarget;
+    const int64_t nseg = (int64_t)nr + 4;
+    if (!seg) return rows;
+    if (cap_seg < nseg || nk != 0) return RAD_E_INVAL;
+    seg[0] = 0;
+    for (int32_t r = 0; r < nr; ++r) seg[1 + r] = (int32_t)(g->n_text + (int64_t)r * rper);
+    seg[1 + nr] = (int32_t)(g->n_text + (int64_t)nr * rper);   /* audio target start */
+    seg[2 + nr] = (int32_t)(seg[1 + nr] + audio);               /* video target start */
+    seg[3 + nr] = (int32_t)(seg[2 + nr] + vtarget);             /* total rows */
+    if (pos) {
+        if (cap_pos < 3 * rows) return RAD_E_INVAL;
+        for (int64_t c = 0; c < 3; ++c)
+            for (int64_t i = 0; i < rows; ++i) pos[c * rows + i] = (float)(c * 1000 + i);
+    }
+    return rows;
+}
+
+/* The encode-geometry export for this fake: it agrees with what the driver staged — a video is
+ * padded to its own frame count (gd[23]), an audio to its own sample count (gd[0]) — so an encode
+ * pass accepts the staged volume and moves on. Only what the driver validates matters here. */
+int64_t fake_encode_geom(int32_t kind, const int64_t* in, int32_t* gd, int64_t cap) {
+    if (!gd) return kind == RAD_GEN_PASS_AENCODE ? 13 : 25;
+    const int64_t need = kind == RAD_GEN_PASS_AENCODE ? 13 : 25;
+    if (cap < need) return RAD_E_INVAL;
+    for (int64_t i = 0; i < need; ++i) gd[i] = 0;
+    if (kind == RAD_GEN_PASS_AENCODE) gd[0] = (int32_t)in[0];   /* n_pad = the sample count */
+    else gd[23] = (int32_t)in[0];                               /* T_pad = the frame count */
+    return need;
+}
+
 struct VideoFixture {
     Program prog;
     gen::VideoDriver drv;
@@ -79,6 +206,19 @@ struct VideoFixture {
         prog.ctx.max_seqs = 1;
     }
     int start() { return drv.init(prog, fake_positions, { gen::VideoDriver::RankIO{} }); }
+    int start_with(gen::VideoDriver::SegsFn segs) {
+        return drv.init(prog, fake_positions, { gen::VideoDriver::RankIO{} }, segs);
+    }
+    int start_with_pack(gen::VideoDriver::PackFn pack) {
+        return drv.init(prog, fake_positions, { gen::VideoDriver::RankIO{} }, nullptr, pack);
+    }
+    int start_with_encode_gen(gen::VideoDriver::EncodeGeomFn enc) {
+        return drv.init(prog, fake_positions, { gen::VideoDriver::RankIO{} }, nullptr, nullptr,
+                        enc);
+    }
+    int start_with_pack_encode(gen::VideoDriver::PackFn pack, gen::VideoDriver::EncodeGeomFn enc) {
+        return drv.init(prog, fake_positions, { gen::VideoDriver::RankIO{} }, nullptr, pack, enc);
+    }
     std::unique_ptr<gen::VideoRequest> req(int32_t chunks = 2, int32_t steps = 0) {
         auto r = std::make_unique<gen::VideoRequest>();
         r->tokens = { 1, 2, 3 };
@@ -302,6 +442,74 @@ TEST(the_small_size_is_each_side_over_the_factor_at_the_multiple) {
     CHECK_EQ(h, 64);
 }
 
+/* A plugin exporting the pack's boundary table stages it into R_SEG; one exporting a table the
+ * geometry does not back, or more segments than the register holds, does not -- the driver's own
+ * plain table goes instead. All three stage the same bytes for a plain request. */
+TEST(the_plugin_segment_table_is_staged_and_a_disagreeing_one_falls_back) {
+    const gen::VideoDriver::SegsFn fns[3] = { fake_segs, fake_segs_wrong, fake_segs_more };
+    for (gen::VideoDriver::SegsFn fn : fns) {
+        VideoFixture f;
+        f.build();
+        CHECK_OK(f.start_with(fn));
+        std::string why;
+        auto r = f.req(1);
+        CHECK_OK(f.drv.submit(std::move(r), &why));
+        bool saw_step = false;
+        for (int i = 0; i < 20 && !saw_step; ++i) {
+            const RadBatch* b = f.drv.next(i);
+            if (!b) break;
+            if (b->gen == RAD_GEN_PASS_VSTEP) {
+                const RadVideoGenBatch* V = b->vgen_b;
+                REQUIRE(V != nullptr);
+                const int32_t audio = 2 * V->geom.n_audio;
+                CHECK_EQ(V->seg_cu[0], 0);
+                CHECK_EQ(V->seg_cu[1], V->geom.n_text);
+                CHECK_EQ(V->seg_cu[2], (int32_t)(V->geom.n_text + audio));
+                CHECK_EQ(V->seg_cu[3], (int32_t)b->n_tok);
+                saw_step = true;
+            }
+            f.answer(10 * i);
+            CHECK_OK(f.drv.done());
+        }
+        CHECK(saw_step);
+    }
+}
+
+/* The reference-aware export is preferred over rad_arch_video_segs for the plain sequence it
+ * also lays out; a pack whose rows the geometry does not back, or that writes past the plain
+ * table's fourth boundary, falls back -- and a plain request stages the same bytes in every
+ * case. The batch carries no reference table: the driver's is empty until references ride. */
+TEST(the_reference_aware_pack_is_preferred_and_a_disagreeing_one_falls_back) {
+    const gen::VideoDriver::PackFn fns[3] = { fake_pack, fake_pack_wrong, fake_pack_more };
+    for (gen::VideoDriver::PackFn fn : fns) {
+        VideoFixture f;
+        f.build();
+        CHECK_OK(f.start_with_pack(fn));
+        std::string why;
+        auto r = f.req(1);
+        CHECK_OK(f.drv.submit(std::move(r), &why));
+        bool saw_step = false;
+        for (int i = 0; i < 20 && !saw_step; ++i) {
+            const RadBatch* b = f.drv.next(i);
+            if (!b) break;
+            if (b->gen == RAD_GEN_PASS_VSTEP) {
+                const RadVideoGenBatch* V = b->vgen_b;
+                REQUIRE(V != nullptr);
+                const int32_t audio = 2 * V->geom.n_audio;
+                CHECK_EQ(V->seg_cu[0], 0);
+                CHECK_EQ(V->seg_cu[1], V->geom.n_text);
+                CHECK_EQ(V->seg_cu[2], (int32_t)(V->geom.n_text + audio));
+                CHECK_EQ(V->seg_cu[3], (int32_t)b->n_tok);
+                CHECK(V->ref_tab == nullptr);
+                saw_step = true;
+            }
+            f.answer(10 * i);
+            CHECK_OK(f.drv.done());
+        }
+        CHECK(saw_step);
+    }
+}
+
 /* An upscaled request: its first evaluations at the small size, the last of them stepping to the
  * clean estimate, then the upscale pass with both geometries, the factor and the first full-size
  * step's sigmas, then the full-size steps and the decodes at the full size. */
@@ -441,6 +649,278 @@ TEST(a_request_that_cannot_run_is_refused_at_submit) {
     refused(f.req(0), "chunks");
     refused(f.req(1, 6), "num_inference_steps");
     refused(f.req(1, 1), "num_inference_steps");
+}
+
+namespace {
+
+/* A synthetic picture as the processor hands one over: eight patches in one temporal group,
+ * merged two by two into two output rows. `expand` is the two placeholder tokens the driver's
+ * rope layout sits on; `pixels` are an index pattern so a byte-parity check has something to
+ * check against when the tower path is exercised end to end. */
+std::shared_ptr<mm::Item> synthetic_picture(int64_t patch_dim) {
+    auto it = std::make_shared<mm::Item>();
+    it->kind = mm::Kind::Image;
+    it->grid_t = 1;
+    it->grid_h = 2;
+    it->grid_w = 4;
+    it->n_patch = 8;
+    it->patch_dim = patch_dim;
+    it->pixels.resize((size_t)(it->n_patch * patch_dim));
+    for (size_t i = 0; i < it->pixels.size(); ++i) it->pixels[i] = (uint16_t)i;
+    it->n_seg = 1;
+    it->seg_rows = 2;
+    it->rows_h = 1;
+    it->rows_w = 2;
+    it->expand = { 700, 701 };
+    it->seg_at = { 0 };
+    return it;
+}
+
+gen::VideoRefMedia ref_part(gen::VideoRefMedia::Kind kind, const char* name, int32_t index) {
+    gen::VideoRefMedia m;
+    m.kind = kind;
+    m.index = index;
+    m.name = name;
+    m.data = "x";
+    return m;
+}
+
+/* The encoder view of a request whose prompt is { 1, expand..., 2, 3 }. */
+std::shared_ptr<mm::PromptMedia> picture_media(int64_t patch_dim, int32_t tok) {
+    auto pm = std::make_shared<mm::PromptMedia>();
+    mm::Placed pl;
+    pl.item = synthetic_picture(patch_dim);
+    pl.tok = tok;
+    pm->items.push_back(std::move(pl));
+    pm->layout();
+    return pm;
+}
+
+void with_tower(VideoFixture& f, int64_t max_enc) {
+    f.prog.encoder.modalities = RAD_MM_IMAGE;
+    f.prog.encoder.patch_dim = 6;
+    f.prog.ctx.max_enc_patches = max_enc;
+}
+
+}  /* namespace */
+
+/* A reference picture's conditioning pass carries the tower's input and the M-RoPE grid exactly
+ * as the image driver stages them, and nothing of it leaks into the step passes that follow. */
+TEST(a_reference_image_conditions_the_video_prompt) {
+    VideoFixture f;
+    f.build();
+    with_tower(f, 16);
+    CHECK_OK(f.start());
+    std::string why;
+    auto r = f.req(2);
+    r->tokens = { 1, 700, 701, 2, 3 };
+    r->refs.push_back(ref_part(gen::VideoRefMedia::IMAGE, "ref_image_1", 1));
+    r->media = picture_media(6, 1);
+    CHECK_OK(f.drv.submit(std::move(r), &why));
+
+    /* The first pass conditions: its media fields carry the picture. */
+    const RadBatch* b = f.drv.next(0);
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->gen, (int)RAD_GEN_PASS_VCOND);
+    CHECK_EQ(b->n_tok, (int64_t)5);
+    CHECK_EQ(b->rope_mixed, 1);
+    CHECK(b->rope_pos != nullptr);
+    CHECK_EQ(b->n_mm_rows, (int64_t)2);
+    CHECK(b->mm_rows != nullptr);
+    CHECK_EQ(b->enc, 0);
+    CHECK_EQ(b->enc_n_patch, (int64_t)8);
+    CHECK(b->enc_pixels != nullptr);
+    CHECK(b->enc_coord != nullptr);
+    CHECK_EQ(b->enc_n_seg, 1);
+    CHECK(b->enc_cu != nullptr);
+    CHECK_EQ(b->enc_max_seg, 8);
+    CHECK(b->vgen_b != nullptr);
+    f.answer(0);
+    CHECK_OK(f.drv.done());
+
+    /* The steps after it carry no media: every pass starts from a zeroed batch, so the tower
+     * never sees a stale conditioning. */
+    std::string kinds = "C";
+    for (int i = 1; i < 10; ++i) {
+        b = f.drv.next(i);
+        if (!b) break;
+        kinds += kind_of(b->gen);
+        if (b->gen == RAD_GEN_PASS_VSTEP) {
+            CHECK(b->rope_pos == nullptr);
+            CHECK_EQ(b->rope_mixed, 0);
+            CHECK_EQ(b->n_mm_rows, (int64_t)0);
+            CHECK_EQ(b->enc_n_patch, (int64_t)0);
+            CHECK_EQ(b->n_tok, (int64_t)(5 + 100 + 6));
+        }
+        f.answer(0);
+        CHECK_OK(f.drv.done());
+    }
+    CHECK_EQ(kinds, std::string("CSSADD"));
+}
+
+/* With the encoders declared, a reference picture queues a Vencode pass and enters the pack's
+ * reference table: the picture in its OWN latent grid (the encoder's sides over the VAE ratio), at
+ * the slot its encode pass numbers, one latent frame, no soundtrack. Until step_dit consumes it the
+ * table rides the batch untouched, but it must be exactly what the pack scatters from. */
+TEST(a_reference_picture_fills_the_pack_reference_table) {
+    VideoFixture f;
+    f.build();
+    with_tower(f, 16);
+    RadVideoGenDecl& d = f.prog.video_gen;
+    d.encodes = 1;
+    d.enc_ratio = 16;
+    d.max_enc_frames = 1;
+    d.max_enc_side = 16;
+    CHECK_OK(f.start_with_encode_gen(fake_encode_geom));
+    std::string why;
+    auto r = f.req(2);
+    r->tokens = { 1, 700, 701, 2, 3 };
+    gen::VideoRefMedia m = ref_part(gen::VideoRefMedia::IMAGE, "ref_image_1", 1);
+    m.enc_frames = 1;
+    m.enc_h = 16;
+    m.enc_w = 16;
+    m.enc_pixels.assign(16 * 16 * 3, 1.0f);
+    r->refs.push_back(m);
+    r->media = picture_media(6, 1);
+    CHECK_OK(f.drv.submit(std::move(r), &why));
+
+    /* The first pass encodes the picture, before any conditioning or denoising. */
+    const RadBatch* b = f.drv.next(0);
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->gen, (int)RAD_GEN_PASS_VENCODE);
+    CHECK(b->vgen_b != nullptr);
+    CHECK(b->vgen_b->ref_tab != nullptr);
+    CHECK_EQ(b->vgen_b->enc_kind, (int32_t)RAD_ENC_IMAGE);
+    CHECK_EQ(b->vgen_b->enc_slot, (int32_t)1);
+    CHECK_OK(f.drv.done());
+
+    /* The reference table: {n_refs, n_keys} then one 6-word picture row {kind, slot, h, w, frames,
+     * audio} — a picture (kind 0), slot 1, a 1x1 latent grid (16/16), one latent frame, no sound. */
+    const int32_t* tab = b->vgen_b->ref_tab;
+    CHECK_EQ(tab[0], 1);
+    CHECK_EQ(tab[1], 0);
+    CHECK_EQ(tab[2], 0);
+    CHECK_EQ(tab[3], 1);
+    CHECK_EQ(tab[4], 1);
+    CHECK_EQ(tab[5], 1);
+    CHECK_EQ(tab[6], 1);
+    CHECK_EQ(tab[7], 0);
+}
+
+/* A generator whose denoiser consumes the reference table lays each conditioned step at the pack's
+ * widened layout: the reference block rides between the text and the target streams, the step
+ * stages the pack's full segment-boundary table (video grid last) and its [3, rows] positions, and
+ * the sampler's target counts are the pack's video and audio segments -- not the whole widened
+ * step (the reference rows are pinned, never sampled). The encode pass that precedes it keeps its
+ * plain table; only the step is widened. */
+TEST(a_reference_conditioned_step_widens_to_the_pack_layout) {
+    VideoFixture f;
+    f.build();
+    with_tower(f, 16);
+    RadVideoGenDecl& d = f.prog.video_gen;
+    d.encodes = 1;
+    d.enc_ratio = 16;
+    d.max_enc_frames = 1;
+    d.max_enc_side = 16;
+    d.ref_rows = 1;                     // the denoiser consumes the table: turn the widening on
+    CHECK_OK(f.start_with_pack_encode(fake_pack_ref, fake_encode_geom));
+    std::string why;
+    auto r = f.req(2);
+    r->tokens = { 1, 700, 701, 2, 3 };   /* 5 text tokens */
+    gen::VideoRefMedia m = ref_part(gen::VideoRefMedia::IMAGE, "ref_image_1", 1);
+    m.enc_frames = 1;
+    m.enc_h = 16;
+    m.enc_w = 16;
+    m.enc_pixels.assign(16 * 16 * 3, 1.0f);
+    r->refs.push_back(m);
+    r->media = picture_media(6, 1);
+    CHECK_OK(f.drv.submit(std::move(r), &why));
+
+    const gen::VideoShape s = gen::video_shape(d, 64, 32, 2);
+    const int64_t n_text = 5, audio = 2 * s.n_audio, vtarget = s.video_rows, rper = 4;
+    const int64_t widened = n_text + rper + audio + vtarget;
+
+    bool saw_step = false, saw_encode = false;
+    for (int i = 0; i < 20; ++i) {
+        const RadBatch* b = f.drv.next(i);
+        if (!b) break;
+        if (b->gen == RAD_GEN_PASS_VSTEP) {
+            const RadVideoGenBatch* V = b->vgen_b;
+            REQUIRE(V != nullptr);
+            saw_step = true;
+            CHECK(V->ref_tab != nullptr);
+            CHECK_EQ(b->n_tok, widened);                       /* widened by the reference block */
+            CHECK_EQ(V->seg_cu[0], 0);
+            CHECK_EQ(V->seg_cu[1], (int32_t)n_text);           /* text | reference */
+            CHECK_EQ(V->seg_cu[2], (int32_t)(n_text + rper));  /* audio target start */
+            CHECK_EQ(V->seg_cu[3], (int32_t)(n_text + rper + audio));   /* video target start */
+            CHECK_EQ(V->seg_cu[4], (int32_t)widened);
+            CHECK_EQ(V->lat_cu[1], (int32_t)vtarget);          /* sampler owns the target streams */
+            CHECK_EQ(V->lat_cu[3], (int32_t)audio);            /* only, not the reference rows */
+        } else if (b->gen == RAD_GEN_PASS_VENCODE) {
+            saw_encode = true;
+        }
+        f.answer(10 * i);
+        CHECK_OK(f.drv.done());
+    }
+    CHECK(saw_step);
+    CHECK(saw_encode);
+}
+
+/* What the video path cannot consume is refused at submit, naming the part or the budget it
+ * breaks — never silently dropped into a weaker video. */
+TEST(reference_media_the_generator_cannot_consume_are_refused_naming_the_part) {
+    std::string why;
+
+    /* A container converted without its tower takes no reference media at all. */
+    VideoFixture f;
+    f.build();
+    CHECK_OK(f.start());
+    auto r = f.req();
+    r->refs.push_back(ref_part(gen::VideoRefMedia::IMAGE, "ref_image_1", 1));
+    CHECK_EQ(f.drv.submit(std::move(r), &why), (int)RAD_E_INVAL);
+    CHECK(has(why, "vision tower"));
+
+    VideoFixture g;
+    g.build();
+    with_tower(g, 16);
+    CHECK_OK(g.start());
+    auto refused = [&](std::unique_ptr<gen::VideoRequest> q, const char* what) {
+        why.clear();
+        CHECK_EQ(g.drv.submit(std::move(q), &why), (int)RAD_E_INVAL);
+        CHECK(has(why, what));
+    };
+    /* Videos and audios reach the model through the VAEs, which the video path does not run. */
+    r = g.req();
+    r->refs.push_back(ref_part(gen::VideoRefMedia::VIDEO, "ref_video_1", 1));
+    refused(std::move(r), "ref_video_1");
+    r = g.req();
+    r->refs.push_back(ref_part(gen::VideoRefMedia::IMAGE, "ref_image_1", 1));
+    r->refs.push_back(ref_part(gen::VideoRefMedia::VIDEO_AUDIO, "ref_video_audio_1", 1));
+    refused(std::move(r), "ref_video_audio_1");
+    r = g.req();
+    r->refs.push_back(ref_part(gen::VideoRefMedia::AUDIO, "ref_audio_2", 2));
+    refused(std::move(r), "ref_audio_2");
+    /* An image part with nothing behind it would become a text-only video. */
+    r = g.req();
+    r->refs.push_back(ref_part(gen::VideoRefMedia::IMAGE, "ref_image_1", 1));
+    refused(std::move(r), "no processed media");
+    /* A run placed past the prompt, and more patches than one conditioning pass encodes. */
+    r = g.req();
+    r->refs.push_back(ref_part(gen::VideoRefMedia::IMAGE, "ref_image_1", 1));
+    r->media = picture_media(6, 3);   /* expand would run to token 5, past the 3-token prompt */
+    refused(std::move(r), "past the end");
+    VideoFixture h;
+    h.build();
+    with_tower(h, 4);
+    CHECK_OK(h.start());
+    r = h.req();
+    r->tokens = { 1, 700, 701, 2, 3 };
+    r->refs.push_back(ref_part(gen::VideoRefMedia::IMAGE, "ref_image_1", 1));
+    r->media = picture_media(6, 1);
+    why.clear();
+    CHECK_EQ(h.drv.submit(std::move(r), &why), (int)RAD_E_INVAL);
+    CHECK(has(why, "at most 4"));
 }
 
 RAD_TEST_MAIN()

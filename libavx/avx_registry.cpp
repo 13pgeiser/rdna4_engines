@@ -486,7 +486,7 @@ static const RadOperandSpec oRmsModQ[] = { OPD_O("y"), OPD_O("g"), OPD("s"), WGT
 static const RadOperandSpec oFlowX0[] = { OPD("v"), OPD("t"), OPD("sigma"), OPD("sigma_next"),
                                           INOUT("x") };
 static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale"), P_F64("max_period"),
-                                          P_INTO("round"), P_STR("dtype") };
+                                          P_INTO("round"), P_F64O("clamp_min"), P_STR("dtype") };
 static const RadOperandSpec oTimestep[] = { OPD("t"), OUT("y") };
 static const RadOperandSpec oGather2[]  = { OPD("a"), OPD("b"), OPD("idx"), OUT("y") };
 static const RadParamSpec pLane[] = { P_INT("M"), P_INT("n"), P_INT("stride"), P_STR("dtype") };
@@ -554,7 +554,9 @@ static const RadOperandSpec oAttnVsa[] = { OPD("q"), OPD("k"), OPD("v"), OPD("se
 /* ---- the latent upscaler (avx_video.cpp), as libref declares it; patch_fold takes
  * patch_unfold's parameters and operands ------------------------------------------------------ */
 static const RadParamSpec pConv3d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
-                                        P_INT("kt"), P_STR("dtype") };
+                                        P_INT("kt"), P_STR("dtype"), P_INTO("stride"),
+                                        P_INTO("stride_t"), P_INTO("causal"), P_STRO("pad"),
+                                        P_INTO("reflect") };
 static const RadOperandSpec oConv3d[] = { OPD("x"), WGT("w"), WGT("b"), OPD("geom"),
                                           OPD_O("res"), OUT("y") };
 static const RadParamSpec pGroupNorm[] = { P_INT("M"), P_INT("n"), P_INT("groups"), P_F64("eps"),
@@ -571,7 +573,7 @@ static const RadOperandSpec oFlowRenoise[] = { OPD("sigma"), OPD("seed"), INOUT(
 /* ---- audio generation (avx_audio.cpp), as libref declares it ------------------------------ */
 static const RadParamSpec pConv1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
                                         P_INT("dil"), P_STRO("act"), P_STR("dtype"),
-                                        P_INTO("causal") };
+                                        P_INTO("causal"), P_INTO("stride"), P_INTO("pad") };
 static const RadOperandSpec oConv1d[] = { OPD("x"), WGT("w"), OPD("cu_seqlens"), OPD_O("res"),
                                           OUT("y"), WGT_O("b") };
 static const RadParamSpec pConvT1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("stride"),
@@ -737,6 +739,9 @@ static const RadOpSchema kSchemas[] = {
   "local attention with a relative-position term and a softcap (Gemma 4's audio)." },
 { "pool_rows", ARR(pPoolRows), ARR(oUnary),
   "y[r] = the mean of x's rows [r*k, r*k + k), rounded to y's dtype, times mult, rounded again." },
+{ "pool_cols", ARR(pPoolRows), ARR(oUnary),
+  "y[m][c] = the mean of x[m]'s columns [c*k, c*k + k), rounded to y's dtype, times mult, rounded "
+  "again." },
 { "silu_mul", ARR(pMnD), ARR(oGateUp),
   "silu-gated product over a fused [M, 2n] gate_up: y = silu(gate) * up." },
 { "gelu_mul", ARR(pMnD), ARR(oGateUp),
@@ -952,8 +957,11 @@ static const RadOpSchema kSchemas[] = {
   "and their `sel` tiles, blocked online softmax; the gated coarse term on the output rounded "
   "to its dtype." },
 { "conv3d_ndhwc", ARR(pConv3d), ARR(oConv3d),
-  "a 3-D convolution over voxel rows, `same` zero padding, PyTorch's [cout, cin, kt, k, k] "
-  "weight, as GEMMs over bands of patch rows; with `res` (possibly y) rd(rd(acc + b) + res)." },
+  "a 3-D convolution over voxel rows, defaults `same` zero padding, PyTorch's "
+  "[cout, cin, kt, k, k] weight, as GEMMs over bands of patch rows. `stride`/`stride_t` pad "
+  "then stride (3x3x3 only), `causal` 1 pads time front-only with kt - 1 zeros, `pad` `down` "
+  "pads none above/left and one below/right, `reflect` 1 mirrors the spatial padding. With "
+  "`res` (possibly y) rd(rd(acc + b) + res)." },
 { "group_norm", ARR(pGroupNorm), ARR(oGroupNorm),
   "a group norm over all rows, its statistics in f64 over fixed row blocks combined in order, "
   "then the optional [scale | shift] row and silu, one rounding; stats[0, 2 groups) the mean "
@@ -1183,6 +1191,8 @@ SIMPLE("avx_seg_mean", "seg_mean", "elem", "mean of each cu_seqlens segment's ro
        L(seg_mean)),
 SIMPLE("avx_pool_rows", "pool_rows", "elem", "mean of every k consecutive rows, then a multiplier",
        DT_FLOAT, L(pool_rows)),
+SIMPLE("avx_pool_cols", "pool_cols", "elem", "mean of every k consecutive columns, then a "
+       "multiplier", DT_FLOAT, L(pool_cols)),
 SIMPLE("avx_relu", "relu", "elem", "max(x, 0)", DT_FLOAT, L(relu)),
 SIMPLE("avx_clamp", "clamp", "elem", "x clamped to two weight scalars", DT_FLOAT, L(clamp)),
 SIMPLE("avx_conv2d", "conv2d", "elem", "segment-wise 2-D convolution, channels innermost",

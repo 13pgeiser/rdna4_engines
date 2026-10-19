@@ -78,15 +78,42 @@ struct VisionTower {
         return rad_meta_geti(m, "vision_config.depth", 0) > 0;
     }
 
+    /* `gate_weights` asks for a weight-presence check before anything of the tower is declared:
+     * a config's vision_config does not promise the checkpoint ships the weights (see declare),
+     * and a declared weight with no source fails convert and load alike. When it is set and the
+     * stem is not there, declare returns RAD_OK having declared nothing — `on` stays false and
+     * the caller drops its media wiring. Callers whose checkpoints always ship their tower
+     * leave it false and see the tower exactly as before. */
     int declare(RadBuilder* b, const RadModelMeta* m, const RadBuildCtx* ctx, Names& nm,
-                int64_t model_embd, int first_group, bool deepstack = false);
+                int64_t model_embd, int first_group, bool deepstack = false,
+                bool gate_weights = false);
     void step(RadCtx* c, const RadBatch* batch) const;
 };
 
 inline int VisionTower::declare(RadBuilder* b, const RadModelMeta* m, const RadBuildCtx* ctx,
-                                Names& nm, int64_t model_embd, int first_group, bool deepstack) {
+                                Names& nm, int64_t model_embd, int first_group, bool deepstack,
+                                bool gate_weights) {
     on = false;
     if (!present(m) || ctx->max_enc_patches <= 0) return RAD_OK;
+
+    /* The weight gate, first and before any shape is read: the stem's map is registered here,
+     * so w_patch below is declared through it instead of mapped again (a COPY map declared
+     * twice is refused). The lookup of a weight's encoding resolves through the name map —
+     * convert resolves the map against the checkpoint, load looks the name up in the container —
+     * so mapping first and then asking is the only presence test both sides answer the same way.
+     * A stem that stays unfound leaves its map entry dangling, which is inert: name maps are
+     * consulted by name when a declared weight resolves and are not serialized into the
+     * container. */
+    if (gate_weights) {
+        if (map_copy(b, nm.f("v.patch.weight"), nm.ckpt("model.visual.patch_embed.proj.weight")) < 0)
+            return RAD_E_INVAL;
+        RadEncoding enc;
+        if (rad_weight_encoding(b, nm.f("v.patch.weight"), &enc, nullptr, nullptr) != RAD_OK) {
+            std::fprintf(stderr, "radiance: vision_config names a tower the checkpoint does not "
+                                 "ship; declaring without it\n");
+            return RAD_OK;
+        }
+    }
 
     depth    = rad_meta_geti(m, "vision_config.depth", 0);
     width    = rad_meta_geti(m, "vision_config.hidden_size", 0);
@@ -173,8 +200,12 @@ inline int VisionTower::declare(RadBuilder* b, const RadModelMeta* m, const RadB
         if (map_copy(b, dn, src) < 0) return 0;
         return decl_w(b, dn, dt, shp, ACC, RAD_SHARD_NONE, g);
     };
-    w_patch = bw(nm.f("v.patch.weight"), nm.ckpt("model.visual.patch_embed.proj.weight"),
-                 RAD_BF16, { width, patch_dim }, grp_model());
+    /* The gated stem is already mapped by the gate above; declaring the map again would fail. */
+    w_patch = gate_weights
+        ? decl_w(b, nm.f("v.patch.weight"), RAD_BF16, { width, patch_dim },
+                 RAD_ACCESS_PER_REQUEST, RAD_SHARD_NONE, grp_model())
+        : bw(nm.f("v.patch.weight"), nm.ckpt("model.visual.patch_embed.proj.weight"),
+             RAD_BF16, { width, patch_dim }, grp_model());
     b_patch = bw(nm.f("v.patch.bias"), nm.ckpt("model.visual.patch_embed.proj.bias"),
                  RAD_BF16, { width }, grp_model());
     w_pos   = bw(nm.f("v.pos.weight"), nm.ckpt("model.visual.pos_embed.weight"),

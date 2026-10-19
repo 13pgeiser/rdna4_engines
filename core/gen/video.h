@@ -8,6 +8,7 @@
  */
 #pragma once
 #include "rad_core.h"
+#include "mm/processor.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -71,6 +72,37 @@ private:
     std::string             why_;
 };
 
+/* One file of a reference-conditioned request (task "ref2va"): an image or a video that
+ * conditions identity and motion, a video's separately-given soundtrack, or a standalone audio.
+ * The server reads the parts' bytes, bounds them and orders them; decoding them and turning
+ * them into conditioning rows is the generator's. `index` is the part's 1-based number within
+ * its kind, which fixes its slot in the conditioning; VIDEO_AUDIO #i is the soundtrack of
+ * VIDEO #i. */
+struct VideoRefMedia {
+    enum Kind : int32_t { IMAGE = 0, VIDEO = 1, VIDEO_AUDIO = 2, AUDIO = 3 };
+    Kind        kind = IMAGE;
+    int32_t     index = 0;
+    std::string name, filename, content_type;   /* the part's name and what the client called the file */
+    std::string data;                           /* the file's bytes */
+
+    /* The reference in the encoder's own form, prepared by the server (which owns the decoder) so
+     * the driver stages bytes without ever touching a codec. The VAE encode pass reads exactly
+     * these; they are empty until the server decodes the part. IMAGE/VIDEO fill the pixels,
+     * AUDIO/VIDEO_AUDIO the samples.
+     *   enc_pixels: f32 [enc_frames][enc_h][enc_w][3] row-major RGB in 0..255, UN-normalised —
+     *     the video VAE applies ImageNet mean/std itself. Each side is snapped down to a multiple
+     *     of the VAE's spatial ratio and capped at the declaration's max_enc_side, aspect kept,
+     *     because our encoder runs one volume and cannot tile the way the reference does. For a
+     *     still image enc_frames is 1.
+     *   enc_samples: f32 [enc_channels][enc_n] channel-major, each channel right-padded with
+     *     zeros out to a whole number of hops (geom entry 0), at the model's audio rate. */
+    std::vector<float> enc_pixels;
+    int32_t            enc_frames = 0, enc_h = 0, enc_w = 0;
+    std::vector<float> enc_samples;
+    int64_t            enc_n = 0;
+    int32_t            enc_channels = 0;
+};
+
 struct VideoRequest {
     std::vector<int32_t> tokens;   /* the prompt, rendered and tokenised */
     int32_t  width = 0, height = 0;   /* pixels, within the declaration's limits */
@@ -81,6 +113,17 @@ struct VideoRequest {
     double   upscale = 0.0;
     int32_t  refine = 0;
     uint64_t seed = 0;
+    /* Reference conditioning, sorted by (kind, index); empty for a text-only request. The bytes
+     * are the VAE's (P2): reference videos and audios become conditioning rows through the
+     * video/audio VAEs, not the TE. */
+    std::vector<VideoRefMedia> refs;
+    /* The references' TE view: every image and video reference processed to patches, placed in
+     * `tokens` at their presentation markers, with the M-RoPE layout over the whole conditioning
+     * (§3's presentation order). The server decodes and processes; the driver stages it into the
+     * conditioning pass's encoder fields (RadBatch::enc_* / rope_pos / mm_rows) exactly as the
+     * image generator's driver does. Null for a request whose references carry nothing the TE
+     * sees — audios are label-only, and a text-only request has none. */
+    std::shared_ptr<mm::PromptMedia> media;
     std::shared_ptr<VideoTicket> ticket;
 };
 

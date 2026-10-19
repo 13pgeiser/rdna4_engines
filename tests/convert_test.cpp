@@ -326,6 +326,293 @@ TEST(changed_is_refused_without_reuse_or_for_a_tensor_nothing_reads) {
     }
 }
 
+/* ================================================================== --lora */
+
+namespace {
+
+/* A PEFT adapter file: `<module>.lora_A.weight` [r,K] of 0.25 and `<module>.lora_B.weight`
+ * [N,r] of 0.5 -- so B @ A is 0.25 * r everywhere -- and, when `alpha` is given, a rank-0
+ * `<module>.alpha` scalar. */
+bool write_lora(const std::string& path, const std::string& module, int64_t N, int64_t K,
+                int64_t r, const float* alpha) {
+    std::vector<tiny::Tensor> ts;
+    tiny::Tensor A{ module + ".lora_A.weight", "F32", { r, K }, {} };
+    A.bytes.resize((size_t)(r * K) * 4);
+    for (int64_t i = 0; i < r * K; ++i) rad_store_f32(A.bytes.data(), RAD_F32, i, 0.25f);
+    tiny::Tensor B{ module + ".lora_B.weight", "F32", { N, r }, {} };
+    B.bytes.resize((size_t)(N * r) * 4);
+    for (int64_t i = 0; i < N * r; ++i) rad_store_f32(B.bytes.data(), RAD_F32, i, 0.5f);
+    ts.push_back(std::move(A));
+    ts.push_back(std::move(B));
+    if (alpha) {
+        tiny::Tensor s{ module + ".alpha", "F32", {}, std::vector<uint8_t>(4, 0) };
+        rad_store_f32(s.bytes.data(), RAD_F32, 0, *alpha);
+        ts.push_back(std::move(s));
+    }
+    return tiny::write_safetensors(path, ts);
+}
+
+/* A copy of the world's checkpoint with each named tensor raised everywhere by its delta, in
+ * the same f32 arithmetic add_lora does. */
+bool copy_ckpt_bumped(World& w, const std::string& ck,
+                      const std::vector<std::pair<std::string, float>>& bumps) {
+    if (mkdir(ck.c_str(), 0755) != 0) return false;
+    for (const char* f : { "config.json", "tokenizer.json" })
+        if (!copy_file(w.ckpt + "/" + f, ck + "/" + f)) return false;
+    std::vector<tiny::Tensor> ts = tiny::read_safetensors(w.ckpt + "/model.safetensors");
+    size_t hits = 0;
+    for (tiny::Tensor& t : ts)
+        for (const std::pair<std::string, float>& b : bumps)
+            if (t.name == b.first) {
+                ++hits;
+                for (size_t i = 0; i < t.bytes.size() / 2; ++i)
+                    rad_store_f32(t.bytes.data(), RAD_BF16, (int64_t)i,
+                                  rad_load_f32(t.bytes.data(), RAD_BF16, (int64_t)i) + b.second);
+            }
+    return hits == bumps.size() && tiny::write_safetensors(ck + "/model.safetensors", ts);
+}
+
+bool copy_ckpt_raised(World& w, const std::string& ck, const std::string& target, float delta) {
+    return copy_ckpt_bumped(w, ck, { { target, delta } });
+}
+
+}  /* namespace */
+
+/* --lora merges W + B @ A into the tensor the module names, and the merge marks that tensor
+ * changed: --reuse converts the weights reading it and copies the rest untouched. The merged
+ * container is byte-identical to one converted from a hand-raised checkpoint -- same f32
+ * arithmetic, same recipe. */
+TEST(lora_merges_into_its_target_and_reconverts_the_weights_that_read_it) {
+    World& w = world();
+    REQUIRE(w.ok);
+    const std::string target = "model.layers.0.mlp.down_proj.weight";
+    const auto it = w.src.find(target);
+    REQUIRE(it != w.src.end());
+    REQUIRE_EQ(it->second.dtype, std::string("BF16"));
+    REQUIRE_EQ(it->second.shape.size(), (size_t)2);
+    const int64_t N = it->second.shape[0], K = it->second.shape[1];
+
+    /* PEFT names the module, without the target's `.weight`. */
+    const std::string mod = target.substr(0, target.size() - 7);
+    tiny::TempDir d("convert_l");
+    REQUIRE(write_lora(d / "lora.safetensors", mod, N, K, 2, nullptr));
+    std::string log;
+    REQUIRE_EQ(convert(w.ckpt, { "-o", d / "merged.rad", "--recipe", w.recipe, "--reuse", w.base,
+                                 "--lora", d / "lora.safetensors" }, &log), 0);
+    CHECK(has(log, "merged at strength 1"));
+    RadFile m;
+    REQUIRE_EQ(m.open((d / "merged.rad").c_str()), RAD_OK);
+    RadFile base;
+    REQUIRE_EQ(base.open(w.base.c_str()), RAD_OK);
+    const std::vector<std::string> diff = differing_weights(base, m);
+    CHECK_EQ(diff.size(), (size_t)1);
+    CHECK(!diff.empty() && diff[0] == "blk.0.ffn_down.weight");
+
+    REQUIRE(copy_ckpt_raised(w, d / "ref", target, 0.5f * 0.25f * 2.f));
+    REQUIRE_EQ(convert(d / "ref", { "-o", d / "ref.rad", "--recipe", w.recipe }, nullptr), 0);
+    RadFile rf;
+    REQUIRE_EQ(rf.open((d / "ref.rad").c_str()), RAD_OK);
+    const RadFileEntry* a = m.find("blk.0.ffn_down.weight");
+    const RadFileEntry* b = rf.find("blk.0.ffn_down.weight");
+    REQUIRE(a && b);
+    CHECK(entry_bytes(m, *a) == entry_bytes(rf, *b));
+}
+
+/* A module spelled under a wrapper prefix resolves to the checkpoint's tensor, and an .alpha
+ * states the scale: alpha 4 at rank 2 doubles the merge. */
+TEST(lora_strips_wrapper_prefixes_and_scales_by_alpha) {
+    World& w = world();
+    REQUIRE(w.ok);
+    const std::string target = "model.layers.0.mlp.down_proj.weight";
+    const auto it = w.src.find(target);
+    REQUIRE(it != w.src.end());
+    const int64_t N = it->second.shape[0], K = it->second.shape[1];
+
+    tiny::TempDir d("convert_lp");
+    const std::string mod = target.substr(0, target.size() - 7);
+    const float alpha = 4.f;
+    REQUIRE(write_lora(d / "lora.safetensors", "diffusion_model." + mod, N, K, 2, &alpha));
+    std::string log;
+    REQUIRE_EQ(convert(w.ckpt, { "-o", d / "merged.rad", "--recipe", w.recipe,
+                                 "--lora", d / "lora.safetensors" }, &log), 0);
+    REQUIRE(copy_ckpt_raised(w, d / "ref", target, 0.5f * 0.25f * 2.f * 2.f));
+    REQUIRE_EQ(convert(d / "ref", { "-o", d / "ref.rad", "--recipe", w.recipe }, nullptr), 0);
+    RadFile m, rf;
+    REQUIRE_EQ(m.open((d / "merged.rad").c_str()), RAD_OK);
+    REQUIRE_EQ(rf.open((d / "ref.rad").c_str()), RAD_OK);
+    const RadFileEntry* a = m.find("blk.0.ffn_down.weight");
+    const RadFileEntry* b = rf.find("blk.0.ffn_down.weight");
+    REQUIRE(a && b);
+    CHECK(entry_bytes(m, *a) == entry_bytes(rf, *b));
+    /* And --lora-strength scales the whole merge: 0.5 of an alpha/r of 2 is a scale of 1. */
+    REQUIRE_EQ(convert(w.ckpt, { "-o", d / "half.rad", "--recipe", w.recipe,
+                                 "--lora", d / "lora.safetensors", "--lora-strength", "0.5" },
+                       nullptr), 0);
+    REQUIRE(copy_ckpt_raised(w, d / "ref_half", target, 0.5f * 0.25f * 2.f));
+    REQUIRE_EQ(convert(d / "ref_half", { "-o", d / "ref_half.rad", "--recipe", w.recipe },
+                       nullptr), 0);
+    RadFile h, rh;
+    REQUIRE_EQ(h.open((d / "half.rad").c_str()), RAD_OK);
+    REQUIRE_EQ(rh.open((d / "ref_half.rad").c_str()), RAD_OK);
+    const RadFileEntry* c = h.find("blk.0.ffn_down.weight");
+    const RadFileEntry* e = rh.find("blk.0.ffn_down.weight");
+    REQUIRE(c && e);
+    CHECK(entry_bytes(h, *c) == entry_bytes(rh, *e));
+}
+
+/* A module the checkpoint does not ship is refused by name; A and B that do not fit the target
+ * are refused with the shapes; --lora with --in-place is refused where --changed is. */
+TEST(lora_refusals_name_the_module_the_shapes_or_the_flag) {
+    World& w = world();
+    REQUIRE(w.ok);
+    const std::string target = "model.layers.0.mlp.down_proj.weight";
+    const auto it = w.src.find(target);
+    REQUIRE(it != w.src.end());
+    const int64_t N = it->second.shape[0], K = it->second.shape[1];
+    tiny::TempDir d("convert_lf");
+
+    std::string log;
+    REQUIRE(write_lora(d / "nope.safetensors", "model.layers.0.mlp.nope_proj", N, K, 2, nullptr));
+    CHECK(convert(w.ckpt, { "-o", d / "a.rad", "--recipe", w.recipe,
+                            "--lora", d / "nope.safetensors" }, &log) != 0);
+    CHECK(has(log, "nope_proj"));
+    CHECK(!exists(d / "a.rad"));
+
+    {
+        std::vector<tiny::Tensor> ts;
+        const std::string mod = target.substr(0, target.size() - 7);
+        tiny::Tensor A{ mod + ".lora_A.weight", "F32", { 2, K + 3 }, {} };
+        A.bytes.assign((size_t)(2 * (K + 3)) * 4, 0);
+        tiny::Tensor B{ mod + ".lora_B.weight", "F32", { N + 1, 2 }, {} };
+        B.bytes.assign((size_t)((N + 1) * 2) * 4, 0);
+        ts.push_back(std::move(A));
+        ts.push_back(std::move(B));
+        REQUIRE(tiny::write_safetensors(d / "bad.safetensors", ts));
+    }
+    CHECK(convert(w.ckpt, { "-o", d / "b.rad", "--recipe", w.recipe,
+                            "--lora", d / "bad.safetensors" }, &log) != 0);
+    CHECK(has(log, "does not fit"));
+    CHECK(!exists(d / "b.rad"));
+
+    CHECK(convert(w.ckpt, { "--recipe", w.recipe, "--reuse", w.base, "--in-place",
+                            "--lora", d / "nope.safetensors" }, &log) != 0);
+    CHECK(has(log, "--lora merges into the source"));
+}
+
+/* A --lora-map rule lands one fused module on several checkpoint tensors: B's rows split
+ * along the targets in the order listed, each taking its own row count, and every target
+ * joins the changed set. */
+TEST(lora_map_fuses_one_module_into_several_targets_by_row_window) {
+    World& w = world();
+    REQUIRE(w.ok);
+    const std::string q = "model.layers.0.self_attn.q_proj.weight";
+    const std::string k = "model.layers.0.self_attn.k_proj.weight";
+    const std::string v = "model.layers.0.self_attn.v_proj.weight";
+    const auto qq = w.src.find(q), qk = w.src.find(k), qv = w.src.find(v);
+    REQUIRE(qq != w.src.end() && qk != w.src.end() && qv != w.src.end());
+    const int64_t Nq = qq->second.shape[0], Nk = qk->second.shape[0], Nv = qv->second.shape[0],
+                  K = qq->second.shape[1];
+    REQUIRE(qk->second.shape[1] == K && qv->second.shape[1] == K);
+    REQUIRE(Nq != Nk);  /* an asymmetric split can only come from the targets' own row counts */
+
+    tiny::TempDir d("convert_lm");
+    REQUIRE(tiny::write_text(d / "map.json",
+                             R"({"strip": ["diffusion_model."], "modules": {"layers.*.attn.qkv": [
+                                   "model.layers.*.self_attn.q_proj.weight",
+                                   "model.layers.*.self_attn.k_proj.weight",
+                                   "model.layers.*.self_attn.v_proj.weight"]}})"));
+    /* A [2,K] of 0.25; B's three windows read 0.5, 1.0 and 2.0 -- so with no .alpha the
+     * merge must raise q, k and v by 0.25, 0.5 and 1.0 (r * b * 0.25 each). No other
+     * attribution of B's rows -- one size for all, or the windows in another order --
+     * produces those three deltas on those three tensors. */
+    const int64_t r = 2, N = Nq + Nk + Nv;
+    std::vector<tiny::Tensor> ts;
+    tiny::Tensor A{ "diffusion_model.layers.0.attn.qkv.lora_A.weight", "F32", { r, K }, {} };
+    A.bytes.resize((size_t)(r * K) * 4);
+    for (int64_t i = 0; i < r * K; ++i) rad_store_f32(A.bytes.data(), RAD_F32, i, 0.25f);
+    tiny::Tensor B{ "diffusion_model.layers.0.attn.qkv.lora_B.weight", "F32", { N, r }, {} };
+    B.bytes.resize((size_t)(N * r) * 4);
+    for (int64_t n = 0; n < N; ++n) {
+        const float b = n < Nq ? 0.5f : n < Nq + Nk ? 1.0f : 2.0f;
+        for (int64_t j = 0; j < r; ++j) rad_store_f32(B.bytes.data(), RAD_F32, n * r + j, b);
+    }
+    ts.push_back(std::move(A));
+    ts.push_back(std::move(B));
+    REQUIRE(tiny::write_safetensors(d / "qkv.safetensors", ts));
+
+    std::string log;
+    REQUIRE_EQ(convert(w.ckpt, { "-o", d / "merged.rad", "--recipe", w.recipe, "--reuse", w.base,
+                                 "--lora", d / "qkv.safetensors", "--lora-map", d / "map.json" },
+                       &log), 0);
+    CHECK(has(log, "merged at strength 1"));
+    RadFile m, base;
+    REQUIRE_EQ(m.open((d / "merged.rad").c_str()), RAD_OK);
+    REQUIRE_EQ(base.open(w.base.c_str()), RAD_OK);
+    const std::vector<std::string> diff = differing_weights(base, m);
+    CHECK_EQ(diff.size(), (size_t)1);  /* all three merged, and only the weight reading them */
+    CHECK(!diff.empty() && diff[0] == "blk.0.attn_qkv.weight");
+
+    REQUIRE(copy_ckpt_bumped(w, d / "ref", { { q, 0.25f }, { k, 0.5f }, { v, 1.0f } }));
+    REQUIRE_EQ(convert(d / "ref", { "-o", d / "ref.rad", "--recipe", w.recipe }, nullptr), 0);
+    RadFile rf;
+    REQUIRE_EQ(rf.open((d / "ref.rad").c_str()), RAD_OK);
+    const RadFileEntry* a = m.find("blk.0.attn_qkv.weight");
+    const RadFileEntry* b = rf.find("blk.0.attn_qkv.weight");
+    REQUIRE(a && b);
+    CHECK(entry_bytes(m, *a) == entry_bytes(rf, *b));
+}
+
+/* A rule whose target the checkpoint lacks is a refusal, not a miss; a B whose rows do not
+ * sum to its targets' rows is a refusal; --lora-map without --lora is a refusal. */
+TEST(lora_map_refusals_name_the_target_the_sums_or_the_flag) {
+    World& w = world();
+    REQUIRE(w.ok);
+    const int64_t Nq = w.src["model.layers.0.self_attn.q_proj.weight"].shape[0];
+    const int64_t Nk = w.src["model.layers.0.self_attn.k_proj.weight"].shape[0];
+    const int64_t K = w.src["model.layers.0.self_attn.q_proj.weight"].shape[1];
+    tiny::TempDir d("convert_lmr");
+
+    /* One pair of the fused module's name, B of any row count. */
+    const std::string mod = "diffusion_model.layers.0.attn.qkv";
+    const auto pair = [&](int64_t rows) {
+        std::vector<tiny::Tensor> ts;
+        tiny::Tensor A{ mod + ".lora_A.weight", "F32", { 2, K }, {} };
+        A.bytes.assign((size_t)(2 * K) * 4, 0);
+        tiny::Tensor B{ mod + ".lora_B.weight", "F32", { rows, 2 }, {} };
+        B.bytes.assign((size_t)(rows * 2) * 4, 0);
+        ts.push_back(std::move(A));
+        ts.push_back(std::move(B));
+        return tiny::write_safetensors(d / "p.safetensors", ts);
+    };
+
+    std::string log;
+    REQUIRE(tiny::write_text(d / "ghost.json",
+                             R"({"strip": ["diffusion_model."], "modules": {"layers.*.attn.qkv": [
+                                   "model.layers.*.self_attn.q_proj.weight",
+                                   "model.layers.*.self_attn.ghost_proj.weight"]}})"));
+    REQUIRE(pair(Nq + Nk));
+    CHECK(convert(w.ckpt, { "-o", d / "a.rad", "--recipe", w.recipe, "--lora", d / "p.safetensors",
+                            "--lora-map", d / "ghost.json" }, &log) != 0);
+    CHECK(has(log, "ghost_proj"));
+    CHECK(has(log, "does not ship"));
+    CHECK(!exists(d / "a.rad"));
+
+    REQUIRE(tiny::write_text(d / "ok.json",
+                             R"({"strip": ["diffusion_model."], "modules": {"layers.*.attn.qkv": [
+                                   "model.layers.*.self_attn.q_proj.weight",
+                                   "model.layers.*.self_attn.k_proj.weight"]}})"));
+    REQUIRE(pair(Nq + Nk + 1));  /* one row past the two targets */
+    CHECK(convert(w.ckpt, { "-o", d / "b.rad", "--recipe", w.recipe, "--lora", d / "p.safetensors",
+                            "--lora-map", d / "ok.json" }, &log) != 0);
+    CHECK(has(log, "rows sum to"));
+    CHECK(!exists(d / "b.rad"));
+
+    CHECK(convert(w.ckpt, { "-o", d / "c.rad", "--recipe", w.recipe,
+                            "--lora-map", d / "ok.json" }, &log) != 0);
+    CHECK(has(log, "--lora-map renames"));
+    CHECK(!exists(d / "c.rad"));
+}
+
 /* ================================================================== --in-place */
 
 /* Extending a container with nothing new keeps every weight at its offset, and the .pre-append

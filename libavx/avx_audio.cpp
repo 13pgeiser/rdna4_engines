@@ -235,20 +235,32 @@ AVX_KERNEL(conv1d) {
     if (!Y->data) return RAD_E_INVAL;
     const int64_t cin = p_int(a, "cin", 0), cout = p_int(a, "cout", 0), k = p_int(a, "k", 0);
     const int64_t dil = p_int(a, "dil", 1), causal = p_int(a, "causal", 0);
+    const int64_t st = p_int(a, "stride", 1), ep = p_int(a, "pad", -1);
     const char* act = p_str(a, "act", "none");
     const bool tanh_out = act && !std::strcmp(act, "tanh");
     const bool clamp_out = act && !std::strcmp(act, "clamp");
     if (!tanh_out && !clamp_out && act && std::strcmp(act, "none")) return RAD_E_INVAL;
-    if (cin <= 0 || cout <= 0 || k <= 0 || (!causal && (k & 1) == 0) || dil <= 0 ||
-        causal < 0 || causal > 1)
+    if (cin <= 0 || cout <= 0 || k <= 0 || (!causal && st <= 1 && (k & 1) == 0) || dil <= 0 ||
+        causal < 0 || causal > 1 || st < 1 || (st > 1 && (causal || ep < 0)) ||
+        (st <= 1 && ep >= 0))
         return RAD_E_SHAPE;
     const int64_t n_seq = numel(cu) - 1;
     if (n_seq <= 0) return RAD_E_SHAPE;
     const int64_t r0 = cu_at(cu, 0), r1 = cu_at(cu, n_seq);
-    if (r0 < 0 || r1 <= r0 || rows_of(Y, cout) < r1 || rows_of(X, cin) < r1) return RAD_E_SHAPE;
+    if (r0 < 0 || r1 <= r0 || rows_of(X, cin) < r1) return RAD_E_SHAPE;
     if (numel(W) < cout * cin * k || (B && numel(B) < cout)) return RAD_E_SHAPE;
-    if (res && rows_of(res, cout) < r1) return RAD_E_SHAPE;
-    const int64_t pad = causal ? dil * (k - 1) : dil * (k - 1) / 2, KK = k * cin;
+    /* The strided form (libref's rule): bf16, one full sequence, y the formula's rows. */
+    int64_t hi = r1;
+    if (st > 1) {
+        if (X->dtype != RAD_BF16) return RAD_E_DTYPE;
+        if (n_seq != 1 || r0 != 0 || r1 != rows_of(X, cin)) return RAD_E_SHAPE;
+        hi = (r1 + 2 * ep - dil * (k - 1) - 1) / st + 1;
+        if (hi <= 0 || rows_of(Y, cout) != hi) return RAD_E_SHAPE;
+    } else if (rows_of(Y, cout) < r1) {
+        return RAD_E_SHAPE;
+    }
+    if (res && rows_of(res, cout) < hi) return RAD_E_SHAPE;
+    const int64_t pad = ep >= 0 ? ep : (causal ? dil * (k - 1) : dil * (k - 1) / 2), KK = k * cin;
     static thread_local std::vector<uint8_t> wbuf, pbuf;
     static thread_local std::vector<float> ybuf;
 
@@ -263,16 +275,18 @@ AVX_KERNEL(conv1d) {
     const bool b16 = X->dtype == RAD_BF16 && laststride(X) == 1;
     const uint32_t adt = b16 ? (uint32_t)RAD_BF16 : (uint32_t)RAD_F32;
     const size_t ael = b16 ? 2 : 4;
-    /* A 1-wide kernel's patch row is x's own row. */
-    const bool direct = k == 1 && X->rank == 2 && X->shape[1] == cin && X->stride[1] == 1 &&
-                        (X->dtype == RAD_BF16 || X->dtype == RAD_F32);
-    const int64_t band = band_rows(KK, cout, r1 - r0);
+    /* A 1-wide kernel's patch row is x's own row; a strided op reads rows `stride` apart, so it
+     * always builds patches. */
+    const bool direct = k == 1 && st == 1 && X->rank == 2 && X->shape[1] == cin &&
+                        X->stride[1] == 1 && (X->dtype == RAD_BF16 || X->dtype == RAD_F32);
+    const int64_t lo = st > 1 ? 0 : r0;   /* a strided op's rows are output rows from 0 */
+    const int64_t band = band_rows(KK, cout, hi - lo);
     if (!direct) pbuf.resize((size_t)(band * KK) * ael + 64);
     ybuf.resize((size_t)(band * cout) + 16);
     char* pp = (char*)pbuf.data();
     float* yp = ybuf.data();
-    for (int64_t b0 = r0; b0 < r1; b0 += band) {
-        const int64_t nb = std::min(band, r1 - b0);
+    for (int64_t b0 = lo; b0 < hi; b0 += band) {
+        const int64_t nb = std::min(band, hi - b0);
         RadTensor pt;
         if (direct) {
             pt = mat_view((char*)X->data + (size_t)(b0 * X->stride[0]) * rad_dtype_bits(X->dtype) / 8,
@@ -282,10 +296,10 @@ AVX_KERNEL(conv1d) {
             pt = mat_view(pp, adt, nb, KK);
             AVX_PARALLEL_FOR_IF(nb * KK >= AVX_PAR_MIN)
             for (int64_t p = 0; p < nb; ++p) {
-                const int64_t r = b0 + p, e = seq_of(cu, n_seq, r);
+                const int64_t r = b0 + p, e = seq_of(cu, n_seq, st > 1 ? r * st : r);
                 const int64_t s0 = cu_at(cu, e), s1 = cu_at(cu, e + 1);
                 for (int64_t t = 0; t < k; ++t) {
-                    const int64_t ir = r + t * dil - pad;
+                    const int64_t ir = r * st + t * dil - pad;
                     patch_slot(X, ir, cin, ir >= s0 && ir < s1, b16,
                                pp + (size_t)(p * KK + t * cin) * ael);
                 }

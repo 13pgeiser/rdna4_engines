@@ -30,7 +30,10 @@
 # step or less: the embedding table, context_embedder and norm_out (bf16), the timestep MLP and the
 # four patch projections (f32), every norm and bias. The video decoder's linears are cast to bf16
 # from the checkpoint's f32, its norms, layer scales, biases and register tokens stay f32; the
-# audio decoder stays f32 (its weight norms folded at convert).
+# audio decoder stays f32 (its weight norms folded at convert). The ref2va encoders convert with
+# them when the checkpoint ships them: the audio encoder's f32 chain convs are weight-normalised
+# and stored folded; the video encoder's 3x3x3 convs are cast to bf16, which is how the implicit-
+# GEMM kernel stores them (conv_in and the k=1 convs read f32 as declared and need no rule).
 
 te.blk.*.attn_qkv.weight             rtn  codes=fp8_e4m3 block=128x128 scale=bf16
 te.blk.*.attn_output.weight          rtn  codes=fp8_e4m3 block=128x128 scale=bf16
@@ -53,5 +56,23 @@ vae.blk.*.ffn_up.weight              cast dtype=bf16
 vae.blk.*.ffn_down.weight            cast dtype=bf16
 vae.proj_out.*                       cast dtype=bf16
 aud.*.weight                         cast dtype=f32
+# The audio encoder's strided downsamplers and its attention/MLP pre-block run in a bf16 island
+# inside the f32 chain (arch/minimaxh3/minimaxh3.cpp, declare_aenc): conv1d, layernorm and gemm
+# pin every operand to one dtype, so their weights cast; the chain's own f32 weights are stored
+# folded from the checkpoint's weight-norm pairs.
+aenc.d*.w                              cast dtype=bf16
+aenc.d*.b                              cast dtype=bf16
+aenc.pb.*                              cast dtype=bf16
+aenc.b*.u*.c1.weight                   cast dtype=f32
+aenc.b*.u*.c2.weight                   cast dtype=f32
+aenc.cin.weight                        cast dtype=f32
+aenc.fin.weight                        cast dtype=f32
+# The video encoder: the implicit-GEMM kernel stores its 3x3x3 weights bf16 tap-major, so those
+# four name classes cast; conv_in (3 input channels) and the k=1 shortcut/quant convs run on the
+# reference kernel with their f32 weights as they are, and the norms and biases need no rule.
+venc.l*.b*.c1w                         cast dtype=bf16
+venc.l*.b*.c2w                         cast dtype=bf16
+venc.l*.dnw                            cast dtype=bf16
+venc.cout.weight                       cast dtype=bf16
 ups.embed.*                          cast dtype=f32
 ups.*.emb_layers.*                   cast dtype=f32

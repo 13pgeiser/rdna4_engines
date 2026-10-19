@@ -45,6 +45,9 @@ struct FakeVideoGen : IVideoGen {
         inf.default_steps = 50;
         inf.max_steps = 65;
         inf.max_lanes = 2;
+        inf.max_ref_images = 9;
+        inf.max_ref_videos = 3;
+        inf.max_ref_audios = 3;
     }
     const VideoGenInfo& info() const override { return inf; }
     int submit(std::unique_ptr<gen::VideoRequest> r, std::string*) override {
@@ -328,6 +331,11 @@ TEST(a_failed_generation_is_a_failed_job_with_its_reason) {
     HttpResponse r = v.create(Videos::body());
     REQUIRE_EQ(r.status, 200);
     json o = v.wait(str_at(json::parse(r.body, nullptr, false), "id"));
+    /* The job's thread opens the MP4 writer before it draws a step, so without a codec it fails
+     * the write before the generator is asked to fail -- the reason under test is unreachable.
+     * Same guard as the completion case above. */
+    if (str_at(o, "status") == "failed" && has(str_at(o["error"], "message"), "no libavcodec"))
+        SKIP("this build has no libavcodec to reach the generator with");
     CHECK_EQ(str_at(o, "status"), std::string("failed"));
     CHECK_EQ(str_at(o["error"], "code"), std::string("generation_failed"));
     CHECK(has(str_at(o["error"], "message"), "the engine stopped"));
@@ -338,6 +346,181 @@ TEST(the_video_routes_are_501_without_a_video_model) {
     Fixture f;
     CHECK_EQ(f.post("/v1/videos", Videos::body().dump()).status, 501);
     CHECK_EQ(f.get("/v1/videos").status, 501);
+}
+
+/* ref2va: the reference file parts are read from the form, and the generator gets them bounded,
+ * numbered and paired — sorted by (kind, number), images first, a soundtrack after its video. */
+TEST(ref2va_reference_media_reach_the_generator) {
+    Videos v;
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/v1/videos";
+    q.form = { FormPart{ "prompt", "", "", "a fox in the snow" },
+               FormPart{ "size", "", "", "256x256" },
+               FormPart{ "task", "", "", "ref2va" },
+               FormPart{ "ref_video_audio_1", "tail.wav", "audio/wav", "RIFF" },
+               FormPart{ "ref_image_2", "b.jpg", "image/jpeg", "JPEG" },
+               FormPart{ "ref_audio_1", "song.mp3", "audio/mpeg", "ID3" },
+               FormPart{ "ref_video_1", "tail.mp4", "video/mp4", "ftyp" },
+               FormPart{ "ref_image_1", "a.png", "image/png", "png" } };
+    HttpResponse r = v.f->srv->router().dispatch(q);
+    REQUIRE_EQ(r.status, 200);
+    const gen::VideoRequest& g = v.gen.last();
+    REQUIRE_EQ(g.refs.size(), (size_t)5);
+    CHECK_EQ((int)g.refs[0].kind, (int)gen::VideoRefMedia::IMAGE);
+    CHECK_EQ(g.refs[0].index, 1);
+    CHECK_EQ(g.refs[0].name, std::string("ref_image_1"));
+    CHECK_EQ(g.refs[0].data, std::string("png"));
+    CHECK_EQ((int)g.refs[1].kind, (int)gen::VideoRefMedia::IMAGE);
+    CHECK_EQ(g.refs[1].index, 2);
+    CHECK_EQ((int)g.refs[2].kind, (int)gen::VideoRefMedia::VIDEO);
+    CHECK_EQ(g.refs[2].filename, std::string("tail.mp4"));
+    CHECK_EQ(g.refs[2].data, std::string("ftyp"));
+    CHECK_EQ((int)g.refs[3].kind, (int)gen::VideoRefMedia::VIDEO_AUDIO);
+    CHECK_EQ(g.refs[3].index, 1);
+    CHECK_EQ((int)g.refs[4].kind, (int)gen::VideoRefMedia::AUDIO);
+    CHECK_EQ(g.refs[4].filename, std::string("song.mp3"));
+    json o = json::parse(r.body, nullptr, false);
+    CHECK_EQ(str_at(o, "task"), std::string("ref2va"));
+    REQUIRE(o["refs"].is_array());
+    REQUIRE_EQ(o["refs"].size(), (size_t)5);
+    CHECK_EQ(o["refs"][0].get<std::string>(), std::string("ref_image_1"));
+    CHECK_EQ(o["refs"][4].get<std::string>(), std::string("ref_audio_1"));
+    v.wait(str_at(o, "id"));
+}
+
+/* ref2va with a vision encoder loaded: the pictures are decoded and processed, then presented
+ * between the template's head and the prompt — each `<Picture k>: ` label (its own tokenised
+ * string) followed by the picture's token run, in part order — and the placed media rides the
+ * request to the generator (docs/PORT-REF2VA.md §3's presentation order). */
+TEST(ref2va_pictures_are_presented_before_the_prompt) {
+    FakeMultimodal mm;
+    mm.expand = { 900, 901, 902 };
+    FakeVideoGen gen;
+    std::unique_ptr<Fixture> f(new Fixture(Fixture::Tweak{ [&](ServerOptions& o, Deps& d) {
+        d.videos = &gen;
+        d.mm = &mm;
+        o.video_model = true;
+    } }));
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/v1/videos";
+    q.form = { FormPart{ "prompt", "", "", "a fox" },
+               FormPart{ "size", "", "", "256x256" },
+               FormPart{ "task", "", "", "ref2va" },
+               FormPart{ "ref_image_2", "b.png", "image/png", "PB" },
+               FormPart{ "ref_image_1", "a.png", "image/png", "PA" } };
+    HttpResponse r = f->srv->router().dispatch(q);
+    REQUIRE_EQ(r.status, 200);
+    /* Both parts were decoded as images, in presentation order. */
+    REQUIRE_EQ(mm.got.size(), (size_t)2);
+    CHECK(mm.got[0].first == MediaKind::Image);
+    CHECK(mm.got[0].second == std::vector<uint8_t>({ 'P', 'A' }));
+    CHECK(mm.got[1].second == std::vector<uint8_t>({ 'P', 'B' }));
+    const gen::VideoRequest& g = gen.last();
+    REQUIRE(g.media != nullptr);
+    REQUIRE_EQ(g.media->items.size(), (size_t)2);
+    CHECK_EQ(g.media->items[0].tok, 16);    /* "<v>" + "<Picture 1>: " */
+    CHECK_EQ(g.media->items[1].tok, 32);    /* + the first run + "<Picture 2>: " */
+    /* The token stream exactly: head, label and run per picture in part order, the prompt last.
+     * The fake tokenizer turns a character into its code and leaves other ids as sent. */
+    std::vector<int32_t> want;
+    auto chars = [&](const std::string& s) {
+        for (unsigned char c : s) want.push_back((int32_t)c);
+    };
+    chars("<v>");
+    chars("<Picture 1>: ");
+    want.insert(want.end(), mm.expand.begin(), mm.expand.end());
+    chars("<Picture 2>: ");
+    want.insert(want.end(), mm.expand.begin(), mm.expand.end());
+    chars("a fox");
+    CHECK(g.tokens == want);
+}
+
+/* Everything about the parts that cannot be right is refused naming the part (or `task` when
+ * the media themselves are the question), before anything is queued. */
+TEST(ref2va_requests_are_refused_naming_the_part) {
+    Videos v;
+    auto refused = [&](const std::vector<FormPart>& media, const std::string& param) {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/videos";
+        q.form = { FormPart{ "prompt", "", "", "a fox" }, FormPart{ "size", "", "", "256x256" },
+                   FormPart{ "task", "", "", "ref2va" } };
+        for (const FormPart& m : media) q.form.push_back(m);
+        HttpResponse r = v.f->srv->router().dispatch(q);
+        CHECK_EQ(r.status, 400);
+        CHECK_EQ(str_at(json::parse(r.body, nullptr, false)["error"], "param"), param);
+    };
+    /* The task without any media (and JSON alone cannot carry the bytes). */
+    refused({}, "task");
+    CHECK_EQ(v.refused(Videos::body({ { "task", "ref2va" } })), std::string("task"));
+    /* Empty bytes, an extension the media readers do not take. */
+    refused({ FormPart{ "ref_image_1", "a.png", "image/png", "" } }, "ref_image_1");
+    refused({ FormPart{ "ref_image_1", "notes.txt", "text/plain", "x" } }, "ref_image_1");
+    /* Numbering with a gap or a repeat. */
+    refused({ FormPart{ "ref_image_1", "a.png", "image/png", "x" },
+              FormPart{ "ref_image_3", "b.png", "image/png", "x" } }, "ref_image_2");
+    refused({ FormPart{ "ref_image_1", "a.png", "image/png", "x" },
+              FormPart{ "ref_image_1", "b.png", "image/png", "y" } }, "ref_image_1");
+    /* A soundtrack with no video of its number; ten images over the API's nine. */
+    refused({ FormPart{ "ref_video_audio_1", "s.wav", "audio/wav", "x" } }, "ref_video_audio_1");
+    {
+        std::vector<FormPart> ten;
+        for (int i = 1; i <= 10; ++i)
+            ten.push_back(FormPart{ "ref_image_" + std::to_string(i), "p.png", "image/png", "x" });
+        refused(ten, "ref_image_10");
+    }
+    /* Reference files with no task, and with t2va: the task is the mistake. */
+    for (const char* task : { (const char*)nullptr, "t2va" }) {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/videos";
+        q.form = { FormPart{ "prompt", "", "", "a fox" }, FormPart{ "size", "", "", "256x256" } };
+        if (task) q.form.push_back(FormPart{ "task", "", "", task });
+        q.form.push_back(FormPart{ "ref_image_1", "a.png", "image/png", "x" });
+        HttpResponse r = v.f->srv->router().dispatch(q);
+        CHECK_EQ(r.status, 400);
+        CHECK_EQ(str_at(json::parse(r.body, nullptr, false)["error"], "param"),
+                 std::string("task"));
+    }
+    /* The caps ride the capability block /v1/models and /server_info share, so a client can
+     * gate on them without probing a refusal. This fake declares 9/3/3 and a 64-token prompt,
+     * all at or under the API's caps, so the declaration shows through. */
+    auto caps = [&](json* out) {
+        HttpRequest mq;
+        mq.method = "GET";
+        mq.path = "/v1/models";
+        HttpResponse mr = v.f->srv->router().dispatch(mq);
+        CHECK_EQ(mr.status, 200);
+        *out = json::parse(mr.body, nullptr, false)["data"][0]["capabilities"];
+    };
+    json c;
+    caps(&c);
+    CHECK_EQ(c["video_generation"], true);
+    CHECK_EQ(c["video_max_text"], 64);
+    CHECK_EQ(c["video_max_ref_images"], 9);
+    CHECK_EQ(c["video_max_ref_videos"], 3);
+    CHECK_EQ(c["video_max_ref_audios"], 3);
+    /* A model that declares no reference media does not take the task at all. */
+    v.gen.inf.max_ref_images = v.gen.inf.max_ref_videos = v.gen.inf.max_ref_audios = 0;
+    HttpRequest q;
+    q.method = "POST";
+    q.path = "/v1/videos";
+    q.form = { FormPart{ "prompt", "", "", "a fox" }, FormPart{ "size", "", "", "256x256" },
+               FormPart{ "task", "", "", "ref2va" },
+               FormPart{ "ref_image_1", "a.png", "image/png", "x" } };
+    HttpResponse r = v.f->srv->router().dispatch(q);
+    CHECK_EQ(r.status, 400);
+    CHECK_EQ(str_at(json::parse(r.body, nullptr, false)["error"], "param"), std::string("task"));
+    CHECK_EQ(v.gen.got.size(), (size_t)0);   /* nothing was ever queued */
+    /* And the caps the model now reports match what it refuses: zero counts say the same thing
+     * the refusal does, before a client spends a request on it. */
+    caps(&c);
+    CHECK_EQ(c["video_max_ref_images"], 0);
+    CHECK_EQ(c["video_max_ref_videos"], 0);
+    CHECK_EQ(c["video_max_ref_audios"], 0);
+    CHECK_EQ(c["video_max_text"], 64);
 }
 
 RAD_TEST_MAIN()

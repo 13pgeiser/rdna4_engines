@@ -94,6 +94,15 @@ struct Plugin {
     int64_t (*arch_text_prepare)(int, const char*, char*, int64_t) = nullptr;
     /* Required of a video generator (rad_builder.h); null for every other plugin. */
     int64_t (*arch_video_positions)(int, const RadVideoGeom*, float*, int64_t) = nullptr;
+    /* Optional (rad_builder.h); null means the video driver stages the plain
+     * [text | audio | video] boundary table itself. */
+    int64_t (*arch_video_segs)(const RadVideoGeom*, int32_t*, int64_t) = nullptr;
+    /* Optional (rad_builder.h); null means the driver lays no reference-conditioned sequence
+     * out and refuses requests that carry VAE references. */
+    int64_t (*arch_video_pack)(const RadVideoGeom*, const int32_t*, int32_t*, int64_t, float*,
+                               int64_t) = nullptr;
+    /* Optional (rad_builder.h); null means the driver runs no encode pass. */
+    int64_t (*arch_encode_geom)(int32_t, const int64_t*, int32_t*, int64_t) = nullptr;
 
     RadPluginCloseFn close = nullptr;
 };

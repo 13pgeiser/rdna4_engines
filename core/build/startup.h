@@ -99,6 +99,22 @@ int rad_tools_text_prepare(const LoadedPlugins& plugins, int field, const std::s
 using VideoPositionsFn = int64_t (*)(int, const RadVideoGeom*, float*, int64_t);
 VideoPositionsFn rad_tools_video_positions(const LoadedPlugins& plugins);
 
+/* The architecture plugin's video segment boundary table (rad_arch_video_segs), or null when it
+ * exports none -- the video driver then stages the plain table itself. */
+using VideoSegsFn = int64_t (*)(const RadVideoGeom*, int32_t*, int64_t);
+VideoSegsFn rad_tools_video_segs(const LoadedPlugins& plugins);
+
+/* The architecture plugin's reference-aware sequence layout (rad_arch_video_pack), or null
+ * when it exports none -- the driver then refuses requests carrying VAE references. */
+using VideoPackFn = int64_t (*)(const RadVideoGeom*, const int32_t*, int32_t*, int64_t, float*,
+                                int64_t);
+VideoPackFn rad_tools_video_pack(const LoadedPlugins& plugins);
+
+/* The architecture plugin's encode-pass geometry (rad_arch_encode_geom), or null when it
+ * exports none -- the driver then runs no encode pass. */
+using EncodeGeomFn = int64_t (*)(int32_t, const int64_t*, int32_t*, int64_t);
+EncodeGeomFn rad_tools_encode_geom(const LoadedPlugins& plugins);
+
 /* Run declare.
  *
  * `also` declares into the same builder after the architecture plugin, which is how the sampler

@@ -50,8 +50,12 @@ inline int64_t ldi(const RadTensor* t, int64_t i) {
  * them), outside of which the input reads zero (each sequence is padded on its own). w is
  * PyTorch's Conv1d weight [cout, cin, k], b [cout], `dil` the dilation and the padding
  * dil (k - 1) / 2 on each side (k odd), so a sequence keeps its length; with `causal` 1 all of it,
- * dil (k - 1), on the left (any k). `res`, when bound, is added after the bias; then `act` (none,
- * tanh, or clamp to [-1, 1], a vocoder's output clamp). f32 accumulation, one rounding. */
+ * dil (k - 1), on the left (any k). With `stride` > 1 - bf16 only, the encoder's downsample - the
+ * op is one sequence [0, rows of x], `pad` explicit and any k, and output row m reads
+ * x[m * stride + tap * dil - pad]: PyTorch's zero-padded strided conv, whose output length
+ * (rows + 2 pad - dil (k - 1) - 1) / stride + 1 the y operand must have exactly. `res`, when
+ * bound, is added after the bias; then `act` (none, tanh, or clamp to [-1, 1], a vocoder's output
+ * clamp). f32 accumulation, one rounding. */
 int ref_conv1d(const RadArgs* a, RadStream) {
     if (!have(a, 3)) return RAD_E_INVAL;
     const RadTensor *x = &a->t[0], *w = &a->t[1], *cu = &a->t[2];
@@ -59,29 +63,42 @@ int ref_conv1d(const RadArgs* a, RadStream) {
     if (!y->data) return RAD_E_INVAL;
     const int64_t cin = p_int(a, "cin", 0), cout = p_int(a, "cout", 0), k = p_int(a, "k", 0);
     const int64_t dil = p_int(a, "dil", 1), causal = p_int(a, "causal", 0);
+    const int64_t st = p_int(a, "stride", 1), pp = p_int(a, "pad", -1);
     const char* act = p_str(a, "act", "none");
     const bool tanh_out = act && !std::strcmp(act, "tanh");
     const bool clamp_out = act && !std::strcmp(act, "clamp");
     if (!tanh_out && !clamp_out && act && std::strcmp(act, "none")) return RAD_E_INVAL;
-    if (cin <= 0 || cout <= 0 || k <= 0 || (!causal && (k & 1) == 0) || dil <= 0 ||
-        causal < 0 || causal > 1)
+    if (cin <= 0 || cout <= 0 || k <= 0 || (!causal && st <= 1 && (k & 1) == 0) || dil <= 0 ||
+        causal < 0 || causal > 1 || st < 1 || (st > 1 && (causal || pp < 0)) ||
+        (st <= 1 && pp >= 0))
         return RAD_E_SHAPE;
     const int64_t n_seq = numel(cu) - 1;
     if (n_seq <= 0) return RAD_E_SHAPE;
     const int64_t r0 = cu_at(cu, 0), r1 = cu_at(cu, n_seq);
-    if (r0 < 0 || r1 <= r0 || rows_of(y, cout) < r1 || rows_of(x, cin) < r1) return RAD_E_SHAPE;
+    if (r0 < 0 || r1 <= r0 || rows_of(x, cin) < r1) return RAD_E_SHAPE;
     if (numel(w) < cout * cin * k || (b && numel(b) < cout)) return RAD_E_SHAPE;
-    if (res && rows_of(res, cout) < r1) return RAD_E_SHAPE;
-    const int64_t pad = causal ? dil * (k - 1) : dil * (k - 1) / 2;
-    REF_PAR_FOR((r1 - r0) * cout * cin * k)
-    for (int64_t r = r0; r < r1; ++r) {
-        const int64_t e = seq_of(cu, n_seq, r);
+    /* The strided form: one full sequence, bf16, and y exactly the formula's rows. */
+    int64_t hi = r1;
+    if (st > 1) {
+        if (x->dtype != RAD_BF16) return RAD_E_DTYPE;
+        if (n_seq != 1 || r0 != 0 || r1 != rows_of(x, cin)) return RAD_E_SHAPE;
+        hi = (r1 + 2 * pp - dil * (k - 1) - 1) / st + 1;
+        if (hi <= 0 || rows_of(y, cout) != hi) return RAD_E_SHAPE;
+    } else if (rows_of(y, cout) < r1) {
+        return RAD_E_SHAPE;
+    }
+    if (res && rows_of(res, cout) < hi) return RAD_E_SHAPE;
+    const int64_t pad = pp >= 0 ? pp : (causal ? dil * (k - 1) : dil * (k - 1) / 2);
+    const int64_t lo = st > 1 ? 0 : r0;   /* a strided op starts at row 0 of its one sequence */
+    REF_PAR_FOR((hi - lo) * cout * cin * k)
+    for (int64_t r = lo; r < hi; ++r) {
+        const int64_t e = seq_of(cu, n_seq, st > 1 ? r * st : r);
         const int64_t s0 = cu_at(cu, e), s1 = cu_at(cu, e + 1);
         const int64_t yb = rowoff(y, r, cout), ys = laststride(y);
         for (int64_t co = 0; co < cout; ++co) {
             float acc = 0.0f;
             for (int64_t kk = 0; kk < k; ++kk) {
-                const int64_t ir = r + kk * dil - pad;
+                const int64_t ir = r * st + kk * dil - pad;
                 if (ir < s0 || ir >= s1) continue;
                 const int64_t xb = rowoff(x, ir, cin), xs = laststride(x);
                 for (int64_t ci = 0; ci < cin; ++ci)

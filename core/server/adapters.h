@@ -710,6 +710,15 @@ public:
                    : p_->video(bytes.data(), bytes.size(), out, why);
     }
 
+    int encoder_image(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side,
+                      mm::Frame* out, std::string* why) override {
+        if (!p_ || !mm::decoder_available()) {
+            if (why) *why = "no picture decoder is available";
+            return RAD_E_UNSUPPORTED;
+        }
+        return p_->encoder_image(bytes, n, ratio, max_side, out, why);
+    }
+
     int32_t audio_rate() const override {
         return accepts(MediaKind::Audio) ? p_->audio_config().rate : 0;
     }

@@ -318,6 +318,15 @@ public:
     int image_from(const Frame& f, std::shared_ptr<Item>* out, std::string* why) const;
     int video_from(const Video& v, std::shared_ptr<Item>* out, std::string* why) const;
 
+    /* A picture in the video VAE's own form: decoded under the same `max_source_pixels` guard as
+     * `image` (so any reference the text encoder accepts the encoder accepts too), then scaled —
+     * aspect kept — so both sides are multiples of `ratio` and neither exceeds `max_side`, the
+     * single-volume encoder's square bound. Returns the resized RGB; the caller hands it to the
+     * encoder un-normalised (the VAE applies its own mean/std). `ratio`/`max_side` come from the
+     * generator's declaration (RadVideoGenDecl enc_ratio / max_enc_side). */
+    int encoder_image(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side, Frame* out,
+                      std::string* why) const;
+
     /* Audio, when the program declares an audio encoder; `merge` and `max_frames` are the
      * encoder's. */
     int  init_audio(const AudioConfig& cfg, std::string* why = nullptr);

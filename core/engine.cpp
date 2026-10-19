@@ -1516,7 +1516,9 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         std::vector<gen::VideoDriver::RankIO> gio;
         for (auto& rk : ranks_) gio.push_back({ rk->device, rk->ctx.stream() });
         auto d = std::make_unique<gen::VideoDriver>();
-        RAD_TRY(d->init(ranks_[0]->program, rad_tools_video_positions(plugins_), gio));
+        RAD_TRY(d->init(ranks_[0]->program, rad_tools_video_positions(plugins_), gio,
+                        rad_tools_video_segs(plugins_), rad_tools_video_pack(plugins_),
+                        rad_tools_encode_geom(plugins_)));
         vid_gen_ = d.get();
         gen_ = std::move(d);
         RAD_TRY(rad_dev_set(ranks_[0]->device));
@@ -2498,6 +2500,16 @@ int Engine::run_server() {
         in.upscale_max = vd.upscale_max;
         in.upscale_refine = vd.upscale_refine;
         in.max_lanes = vd.max_lanes;
+        in.max_ref_images = vd.max_ref_images;
+        in.max_ref_videos = vd.max_ref_videos;
+        in.max_ref_audios = vd.max_ref_audios;
+        in.encodes = vd.encodes;
+        in.max_enc_frames = vd.max_enc_frames;
+        in.max_enc_side = vd.max_enc_side;
+        in.max_enc_samples = vd.max_enc_samples;
+        in.enc_ratio = vd.enc_ratio;
+        /* A plugin that declares no ceilings leaves all three 0, and the server then serves
+         * ref2va as unimplemented — which is right until the generator can consume the bytes. */
         video_bridge.drv = vid_gen_;
         d.videos = &video_bridge;
         if (cfg_.served_model_name.empty() && !in.name.empty()) {

@@ -288,6 +288,10 @@ private:
     /* What this deployment can do (chat, tools, reasoning, grammar, media, logprobs, reasoning
      * efforts), shared by /server_info's `capabilities` and the model entry so they agree. */
     json capabilities() const;
+    /* What a video model lets a request carry: the prompt ceiling the /v1/videos parser
+     * enforces and the reference-media counts, as validate_refs() will apply them. Defined in
+     * videos.cpp, beside the ref2va contract's own caps. */
+    static void video_caps(json& caps, const IVideoGen* gen);
     HttpResponse handle_reset_prefix_cache(const HttpRequest& req);
 
     /* ------------------------------------------------------------------ dashboard.cpp */

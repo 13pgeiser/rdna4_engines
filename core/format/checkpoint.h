@@ -121,6 +121,31 @@ public:
      * tensors and config.json keys under `draft.`. */
     int add_draft(const std::string& dir, const std::string& prefix);
 
+    /* Merge PEFT adapters into the tensors they name, before anything reads the checkpoint:
+     * `path` is a .safetensors file or a directory of them, holding `<module>.lora_A.weight`
+     * [r,K] / `<module>.lora_B.weight` [N,r] pairs (ComfyUI's `.lora_down`/`.lora_up` spellings
+     * read too), with an optional `<module>.alpha` scalar -- the module never carries its own
+     * `.weight`. The target is `<module>.weight`, looked up under that name and, failing that,
+     * after stripping a wrapper prefix ("diffusion_model.", "transformer.", "unet.");
+     * a module the checkpoint does not ship is
+     * a refusal naming it, since a merge that silently hits nothing is a different model. The
+     * merge is the PEFT one, in f32: W += strength * (alpha/r where an .alpha states one, else 1)
+     * * B @ A, cast back to the target's dtype. Targets must be plain bf16/f16/f32 matrices --
+     * an adapter cannot merge into a quantised export or a non-matrix. Call this right after
+     * open(): it re-points a merged tensor's bytes, and views taken before it would read the
+     * unmerged ones. `merged` receives each target's name.
+     *
+     * `map_json` (null = none) names a file holding per-architecture module rules for adapters
+     * trained against a module layout the checkpoint does not spell -- a fused qkv, renamed blocks:
+     * `{"strip": ["prefix."], "modules": {"<pattern>": ["<target pattern>", ...]}}`, where a
+     * `*` in a module pattern matches one run of characters (the block index) and the same run
+     * fills every `*` in that rule's target patterns. Several targets share one delta: the
+     * module is the concatenation, so B's rows split along the targets in the order listed,
+     * each taking its own row count (they must sum to B's rows). A rule whose target the
+     * checkpoint lacks is a refusal, never a miss -- the rule says the tensor is there. */
+    int add_lora(const std::string& path, double strength, std::vector<std::string>* merged,
+                 const std::string* map_json = nullptr);
+
     const SrcTensor* find(const std::string& n) const;
     const std::vector<SrcTensor>& tensors() const { return tensors_; }
     bool               is_gguf() const { return kind_ == Gguf; }

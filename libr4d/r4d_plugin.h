@@ -575,6 +575,7 @@ int r4d_rad_cast_widen      (const RadArgs*, RadStream);
 int r4d_rad_cast_f16        (const RadArgs*, RadStream);
 int r4d_rad_cast_bf16       (const RadArgs*, RadStream);
 int r4d_rad_pool_rows       (const RadArgs*, RadStream);
+int r4d_rad_pool_cols       (const RadArgs*, RadStream);
 int r4d_rad_relu            (const RadArgs*, RadStream);
 int r4d_rad_silu            (const RadArgs*, RadStream);
 int r4d_rad_gelu            (const RadArgs*, RadStream);

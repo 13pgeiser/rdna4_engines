@@ -533,6 +533,17 @@ public:
     virtual int prepare(MediaKind k, const std::vector<uint8_t>& bytes, const MediaOpts& opts,
                         std::shared_ptr<mm::Item>* out, std::string* why) = 0;
 
+    /* A picture in a video VAE's encoder-ready form: decoded under the same guard as prepare() and
+     * resized so both sides are multiples of `ratio` and neither exceeds `max_side`. The video
+     * generator's server uses it to fill a reference's encoder pixels; a server with no video VAE
+     * leaves it unsupported. */
+    virtual int encoder_image(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side,
+                              mm::Frame* out, std::string* why) {
+        (void)bytes; (void)n; (void)ratio; (void)max_side; (void)out;
+        if (why) *why = "this server prepares no reference media for a video encoder";
+        return RAD_E_UNSUPPORTED;
+    }
+
     /* Audio in two halves, for a route that cuts a long recording into clips itself
      * (/v1/audio/transcriptions): the file decoded to mono samples at audio_rate(), at most
      * `max_samples` of them (RAD_E_INVAL past that, never a silent cut), and a clip of at most
@@ -644,6 +655,18 @@ struct VideoGenInfo {
     /* A latent upscaler: the largest factor (0: none) and the full-size evaluations by default. */
     double  upscale_max = 0.0;
     int64_t upscale_refine = 0;
+    /* Reference conditioning (SGLang's task "ref2va"): how many reference images, videos and
+     * standalone audios the model takes — all 0 for one that makes video from text only, which
+     * is every model until the declaration carries them (abi/rad_builder.h, RadVideoGenDecl).
+     * A video's soundtrack rides with the video and is not counted among the audios. */
+    int64_t max_ref_images = 0, max_ref_videos = 0, max_ref_audios = 0;
+    /* The video and audio VAE encoders (RadVideoGenDecl): nonzero when the container carries them,
+     * so the server decodes and resizes reference media into the encoder's own form before submit;
+     * the per-pass ceilings it snaps to (a video's clip-padded frames, the encoder's square side,
+     * an audio's samples) and `enc_ratio`, the side multiple the geom demands. All 0 without the
+     * encoders — a text-only or TE-only model leaves them and the server never prepares pixels. */
+    int64_t encodes = 0, max_enc_frames = 0, max_enc_side = 0, max_enc_samples = 0;
+    int64_t enc_ratio = 0;
 };
 
 class IVideoGen {

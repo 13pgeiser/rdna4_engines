@@ -256,7 +256,8 @@ TEST(op_vocabulary) {
     static const char* kOps[] = {
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "mtp_enter",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
-        "pool_rows", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw", "rel_sinusoid",
+        "pool_rows", "pool_cols", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw",
+        "rel_sinusoid",
         "seg_sinusoid", "attn_local_rel", "gelu", "silu", "sigmoid", "logit_softcap", "scale",
         "fill",
         "gather_rows", "scatter_rows", "ngram_ids", "ple_gate", "ple_conv", "causal_conv1d",
@@ -2633,6 +2634,18 @@ TEST(op_pool_rows) {
     CHECK(run("pool_rows", bad) < 0);
 }
 
+/* pool_cols: the mean of every k columns of a row, rounded, then the multiplier. */
+TEST(op_pool_cols) {
+    T x(RAD_F32, {2, 4}); x.f({ 1, 2,  3, 4,  5, 6,  7, 9 });
+    T y(RAD_F32, {2, 2});
+    A a; a.t(x).t(y).i("M", 2).i("n", 4).i("k", 2).d("mult", 2.0).s("dtype", "f32");
+    CHECK_OK(run("pool_cols", a));
+    CHECK_NEAR(y.at(0), 3.0f, 1e-6);  CHECK_NEAR(y.at(1), 7.0f, 1e-6);
+    CHECK_NEAR(y.at(2), 11.0f, 1e-6); CHECK_NEAR(y.at(3), 16.0f, 1e-6);
+    A bad; bad.t(x).t(y).i("M", 2).i("n", 4).i("k", 3).s("dtype", "f32");
+    CHECK(run("pool_cols", bad) < 0);
+}
+
 /* rmsnorm with no gain: a unit gain. */
 TEST(op_rmsnorm_no_gain) {
     T x(RAD_F32, {1, 2}); x.f({ 3, 4 });
@@ -4775,6 +4788,17 @@ TEST(timestep_embed_is_cos_then_sin_of_the_scaled_time) {
     CHECK_OK(run("timestep_embed", b));
     CHECK_NEAR(y2.at(0), std::cos(300.78125), 1e-5);
     CHECK_NEAR(y2.at(1), std::sin(300.78125), 1e-5);
+
+    /* clamp_min raises a timestep below the floor -- the reference conditioning's near-clean pin --
+     * before embedding. h = n/2 = 1 so f_0 = 1 and the row is just [cos | sin](t'). Row 0's t is
+     * below the floor and rides it; row 1's is above and rides itself. */
+    T t3(RAD_F32, {2}); t3.f({0.05f, 1.0f});
+    T y3(RAD_F32, {2, 2});
+    A c; c.t(t3).t(y3).i("M", 2).i("n", 2).d("scale", 1.0).d("max_period", 100.0)
+           .d("clamp_min", 0.999).s("dtype", "f32");
+    CHECK_OK(run("timestep_embed", c));
+    CHECK_NEAR(y3.at(0), std::cos(0.999), 1e-6); CHECK_NEAR(y3.at(1), std::sin(0.999), 1e-6);
+    CHECK_NEAR(y3.at(2), std::cos(1.0), 1e-6);   CHECK_NEAR(y3.at(3), std::sin(1.0), 1e-6);
 }
 
 /* gather_rows2: idx >= 0 reads a, idx < 0 reads b[-1 - idx], and a row past either source is
@@ -5531,6 +5555,59 @@ TEST(conv3d_ndhwc_rounds_the_conv_before_the_residual_in_place) {
     CHECK_EQ(y2.at(0), 1.0078125f);
 }
 
+/* The CausalConv3d forms: `stride`/`stride_t` pad then stride, `causal` 1 takes the time pad
+ * front-only, `pad` `down` pads none above and left and one below and right, and `reflect` 1
+ * mirrors the spatial pads. Three frames of 2 x 2, causal, spatial stride 2 with `down` and a
+ * reflect: the output is one voxel a frame, and frame t reads frames t - 2, t - 1 and t. With
+ * the weight taps w[(1,0,0)] = 1, w[(2,1,1)] = 3, w[(0,2,2)] = 100, w[(0,0,2)] = 10 and
+ * w[(0,2,0)] = 20 (the three dt = 0 taps mirror (row 2 or column 2 back to (0, 0)), output t is
+ * 3 x x[(t,1,1)] + x[(t - 1,0,0)] + 130 x[(t - 2,0,0)] + b, the frame terms zero outside:
+ * 120.5, 250.5 and 120 x 3 + 50 + 10 x 13 + 0.5 = 1710.5. Refused: `stride` with a 5-wide
+ * kernel, a `pad` that is neither `same` nor `down`, a reflect whose pad reaches the axis at
+ * H 1, a zero stride, a causal that is neither 0 nor 1, and y short of the strided output. */
+TEST(conv3d_ndhwc_causal_forms_stride_mirror_and_pad_front_only) {
+    T x(RAD_F32, {12, 1}); x.f({10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120});
+    std::vector<float> wv(27, 0.0f);
+    wv[9] = 1.0f;     /* (dt 1, kh 0, kw 0): the previous frame's (0, 0) */
+    wv[22] = 3.0f;    /* (dt 2, kh 1, kw 1): this frame's (1, 1) */
+    wv[8] = 100.0f;   /* (dt 0, kh 2, kw 2): both axes reflect to (0, 0) */
+    wv[2] = 10.0f;    /* (dt 0, kh 0, kw 2): the column reflects to 0 */
+    wv[6] = 20.0f;    /* (dt 0, kh 2, kw 0): the row reflects to 0 */
+    T w(RAD_F32, {1, 1, 3, 3, 3}); w.f(wv);
+    T b(RAD_F32, {1}); b.f({0.5f});
+    T geom(RAD_I32, {3}); geom.n({3, 2, 2});
+    T y(RAD_F32, {3, 1});
+    A a; a.t(x).t(w).t(b).t(geom).tnull().t(y).i("M", 3).i("cin", 1).i("cout", 1).i("k", 3)
+          .i("kt", 3).s("dtype", "f32").i("stride", 2).i("stride_t", 1).i("causal", 1)
+          .s("pad", "down").i("reflect", 1);
+    CHECK_OK(run("conv3d_ndhwc", a));
+    CHECK_EQ(y.at(0), 120.5f);
+    CHECK_EQ(y.at(1), 250.5f);
+    CHECK_EQ(y.at(2), 1710.5f);
+
+    A e5; e5.t(x).t(w).t(b).t(geom).tnull().t(y).i("M", 3).i("cin", 1).i("cout", 1).i("k", 5)
+           .i("kt", 3).s("dtype", "f32").i("stride", 2);
+    CHECK_EQ(run("conv3d_ndhwc", e5), RAD_E_SHAPE);
+    A ep; ep.t(x).t(w).t(b).t(geom).tnull().t(y).i("M", 3).i("cin", 1).i("cout", 1).i("k", 3)
+            .i("kt", 3).s("dtype", "f32").s("pad", "mirror");
+    CHECK_EQ(run("conv3d_ndhwc", ep), RAD_E_SHAPE);
+    T g1(RAD_I32, {3}); g1.n({2, 1, 2});
+    A eh; eh.t(x).t(w).t(b).t(g1).tnull().t(y).i("M", 4).i("cin", 1).i("cout", 1).i("k", 3)
+            .i("kt", 3).s("dtype", "f32").i("causal", 1).i("reflect", 1);
+    CHECK_EQ(run("conv3d_ndhwc", eh), RAD_E_SHAPE);
+    A e0; e0.t(x).t(w).t(b).t(geom).tnull().t(y).i("M", 3).i("cin", 1).i("cout", 1).i("k", 3)
+             .i("kt", 3).s("dtype", "f32").i("stride", 0);
+    CHECK_EQ(run("conv3d_ndhwc", e0), RAD_E_SHAPE);
+    A e2; e2.t(x).t(w).t(b).t(geom).tnull().t(y).i("M", 3).i("cin", 1).i("cout", 1).i("k", 3)
+             .i("kt", 3).s("dtype", "f32").i("causal", 2);
+    CHECK_EQ(run("conv3d_ndhwc", e2), RAD_E_SHAPE);
+    T y2(RAD_F32, {2, 1});
+    A es; es.t(x).t(w).t(b).t(geom).tnull().t(y2).i("M", 2).i("cin", 1).i("cout", 1).i("k", 3)
+             .i("kt", 3).s("dtype", "f32").i("stride", 2).i("stride_t", 1).i("causal", 1)
+             .s("pad", "down").i("reflect", 1);
+    CHECK_EQ(run("conv3d_ndhwc", es), RAD_E_SHAPE);
+}
+
 /* group_norm's statistics are over every row of a group's channels. Two rows of four channels in
  * two groups: group 0 (channels 0 and 1) holds 1, 1, 3, 3, so mean 2 and var 1 (a per-row mean
  * would make row 0 constant); group 1 holds 8, 12, 12, 8, mean 10 and var 4, rstd 0.5 (eps 0).
@@ -6117,6 +6194,44 @@ TEST(conv_t1d_takes_any_kernel_of_at_least_a_stride) {
     A e; e.t(x2).t(w2).t(b2).t(cu2).t(y2).i("M", 2).i("cin", 1).i("cout", 1).i("stride", 2)
           .i("k", 5).s("dtype", "f32");
     CHECK_EQ(run("conv_t1d", e), RAD_E_SHAPE);
+}
+
+/* conv1d's strided form (a DAC encoder's downsample): kernel 2 stride, pad stride / 2, one
+ * sequence. x rows [1 .. 8], w [1, 2, 3, 4], stride 2, pad 1: output row m reads
+ * x[2m - 1 + t] (zeros outside [0, 8)): 20, 40, 60, 44 — 8 rows halve to exactly 4. */
+TEST(conv1d_strided_downsamples_one_sequence) {
+    T x(RAD_BF16, {8, 1}); x.f({1, 2, 3, 4, 5, 6, 7, 8});
+    T w(RAD_BF16, {1, 1, 4}); w.f({1, 2, 3, 4});
+    T cu(RAD_I32, {2}); cu.n({0, 8});
+    T y(RAD_BF16, {4, 1});
+    A a; a.t(x).t(w).t(cu).tnull().t(y).tnull().i("M", 8).i("cin", 1).i("cout", 1).i("k", 4)
+          .i("dil", 1).i("stride", 2).i("pad", 1).s("dtype", "bf16");
+    CHECK_OK(run("conv1d", a));
+    CHECK_EQ(y.at(0), 20.0f); CHECK_EQ(y.at(1), 40.0f);
+    CHECK_EQ(y.at(2), 60.0f); CHECK_EQ(y.at(3), 44.0f);
+
+    /* The refusals: `pad` without a stride, a stride without `pad`, a stride over more than
+     * one sequence, a y that is not the formula's rows, and a stride on the f32 rows. */
+    A p; p.t(x).t(w).t(cu).tnull().t(y).tnull().i("M", 8).i("cin", 1).i("cout", 1).i("k", 4)
+           .i("dil", 1).i("pad", 1).s("dtype", "bf16");
+    CHECK_EQ(run("conv1d", p), RAD_E_SHAPE);
+    A q; q.t(x).t(w).t(cu).tnull().t(y).tnull().i("M", 8).i("cin", 1).i("cout", 1).i("k", 4)
+           .i("dil", 1).i("stride", 2).s("dtype", "bf16");
+    CHECK_EQ(run("conv1d", q), RAD_E_SHAPE);
+    T cu2(RAD_I32, {3}); cu2.n({0, 4, 8});
+    A m; m.t(x).t(w).t(cu2).tnull().t(y).tnull().i("M", 8).i("cin", 1).i("cout", 1).i("k", 4)
+           .i("dil", 1).i("stride", 2).i("pad", 1).s("dtype", "bf16");
+    CHECK_EQ(run("conv1d", m), RAD_E_SHAPE);
+    T y5(RAD_BF16, {5, 1});
+    A r; r.t(x).t(w).t(cu).tnull().t(y5).tnull().i("M", 8).i("cin", 1).i("cout", 1).i("k", 4)
+           .i("dil", 1).i("stride", 2).i("pad", 1).s("dtype", "bf16");
+    CHECK_EQ(run("conv1d", r), RAD_E_SHAPE);
+    T xf(RAD_F32, {8, 1}); xf.f({1, 2, 3, 4, 5, 6, 7, 8});
+    T wf(RAD_F32, {1, 1, 4}); wf.f({1, 2, 3, 4});
+    T yf(RAD_F32, {4, 1});
+    A f; f.t(xf).t(wf).t(cu).tnull().t(yf).tnull().i("M", 8).i("cin", 1).i("cout", 1).i("k", 4)
+           .i("dil", 1).i("stride", 2).i("pad", 1).s("dtype", "f32");
+    CHECK_EQ(run("conv1d", f), RAD_E_DTYPE);
 }
 
 /* conv1d `act` clamp: min(max(y, -1), 1) after the bias. */
@@ -6866,6 +6981,7 @@ std::vector<Geo> geometries() {
         G("act_mul", "M", 3, a.i("M", R).i("n", 8).s("act", "silu").s("dtype", "f32")),
         G("seg_mean", "M", 6, a.i("M", R).i("n", 8).s("dtype", "f32").i("n_seq", 2)),
         G("pool_rows", "M", 6, a.i("M", R).i("n", 8).i("k", 2).s("dtype", "f32")),
+        G("pool_cols", "M", 6, a.i("M", R).i("n", 8).i("k", 2).s("dtype", "f32")),
         G("relu", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("clamp", "M", 3, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("conv2d", "M", 8, a.i("M", R).i("width", 4).i("cin", 2).i("cout", 3).i("kh", 3).i("kw", 3)
@@ -7006,7 +7122,7 @@ std::vector<Geo> geometries() {
                                       .i("gated", 1).s("dtype", "bf16")),
         G("gate_add", "M", 4, a.i("M", R).i("n", 8).s("dtype", "bf16")),
         G("timestep_embed", "M", 3, a.i("M", R).i("n", 8).d("scale", 1000.0)
-                                    .d("max_period", 10000.0).s("dtype", "f32")),
+                                    .d("max_period", 10000.0).d("clamp_min", 0.3).s("dtype", "f32")),
         G("gather_rows2", "M", 4, a.i("M", R).i("n", 8).s("dtype", "f32")),
         G("lane_gather", "M", 4, a.i("M", R).i("n", 8).i("stride", 4).s("dtype", "bf16")),
         G("lane_store", "M", 4, a.i("M", R).i("n", 8).i("stride", 8).s("dtype", "bf16")),

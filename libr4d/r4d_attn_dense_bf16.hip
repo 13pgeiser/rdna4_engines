@@ -301,6 +301,7 @@ void r4d_attn_dense_kernel(const uint16_t* __restrict__ gq, const uint16_t* __re
 // ---- launch ----------------------------------------------------------------------------------
 // One instantiation per (head_dim, gqa), at a workgroup shape picked for it:
 //   h64  gqa1: 8 query blocks of 16, K/V tiles of 64 keys          (the vision towers' heads)
+//   h256 gqa1: 8 query blocks of 16, tiles of 32 (LDS: 37 KiB) — an encoder's own heads
 //   h256 gqa2: 8 query blocks x 2 heads, tiles of 32 (LDS: 37 KiB)
 //   h256 gqa4: 4 query blocks x 4 heads, tiles of 32 (LDS: 37 KiB)
 //   h512 gqa4: 2 query blocks x 4 heads x 2 head halves, tiles of 16 (LDS: 57 KiB)
@@ -344,6 +345,11 @@ extern "C" int r4d_attn_dense_bf16(const void* q, const void* k, const void* v, 
         return r4d_attn_dense_launch<64, 1, 8, 1, 64>(q, k, v, o, cu_seqlens, num_seqs, max_seqlen,
                                                       n_head_kv, scale, window, wright, block,
                                                       cdiv, causal, q_ld, k_ld, v_ld, o_ld, s);
+    if (head_dim == 256 && gqa == 1)
+        return r4d_attn_dense_launch<256, 1, 8, 1, 32>(q, k, v, o, cu_seqlens, num_seqs,
+                                                       max_seqlen, n_head_kv, scale, window,
+                                                       wright, block, cdiv, causal, q_ld, k_ld,
+                                                       v_ld, o_ld, s);
     if (head_dim == 256 && gqa == 2)
         return r4d_attn_dense_launch<256, 2, 8, 1, 32>(q, k, v, o, cu_seqlens, num_seqs,
                                                        max_seqlen, n_head_kv, scale, window,

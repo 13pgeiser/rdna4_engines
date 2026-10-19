@@ -97,6 +97,10 @@ std::vector<Case> build_cases() {
                               HS("dtype", dt) });
         add("pool_rows",   { HI("M", 27), HI("n", 645), HI("k", 9), HF("mult", 27.712812921102035),
                              HS("dtype", dt) }, EB(27, 645, w, 1));
+        add("pool_cols",   { HI("M", 27), HI("n", 648), HI("k", 9), HF("mult", 27.712812921102035),
+                             HS("dtype", dt) }, EB(27, 648, w, 1));
+        add("pool_cols",   { HI("M", 40), HI("n", 256), HI("k", 8), HS("dtype", dt) },
+            EB(40, 256, w, 1));
         add("scatter_rows", { HI("M", 6), HI("n", 645), HS("dtype", dt) }, EB(6, 645, w, 2));
         add("scale_rows",  { HI("M", 6), HI("n", 645), HS("act", "sigmoid"), HS("dtype", dt) },
                            EB(6, 645, w, 2));
@@ -317,6 +321,11 @@ std::vector<Case> build_cases() {
         add("attn_dense", { HI("M", 24), HI("head_dim", 64), HI("gqa", 1), HI("causal", 0),
                             HS("dtype", dt), HF("scale", 0.125), HI("max_seqlen", 24),
                             HI("block", 7) });
+    /* An audio encoder's own-heads attention: head_dim 256, no GQA, causal with a window. */
+    for (const char* dt : { "f32", "bf16" })
+        add("attn_dense", { HI("M", 24), HI("head_dim", 256), HI("gqa", 1), HI("causal", 1),
+                            HS("dtype", dt), HF("scale", 0.125), HI("max_seqlen", 24),
+                            HI("window", 8) });
     for (const char* dt : { "f32", "bf16" })
         add("seg_sinusoid", { HI("M", 30), HI("n", 64), HI("period", 13), HS("dtype", dt) });
     /* Gemma 4's audio attention: left 12, over segments longer than the window. */
@@ -768,6 +777,9 @@ std::vector<Case> build_cases() {
                                 HS("act", act), HS("dtype", dt) });
         add("group_norm", { HI("M", 150), HI("n", 96), HI("groups", 4), HF("eps", 1e-5),
                             HS("act", "silu"), HS("dtype", dt) });
+        /* Four channels a group at the video encoder's first level, its eps. */
+        add("group_norm", { HI("M", 130), HI("n", 128), HI("groups", 32), HF("eps", 1e-6),
+                            HS("act", "silu"), HS("dtype", dt) });
         add("tconv_dw", { HI("M", 27), HI("n", 645), HI("k", 5), HS("dtype", dt) });
         add("tconv_dw", { HI("M", 64), HI("n", 37), HI("k", 3), HS("dtype", dt) });
         add("resize_bilinear", { HI("M", 27), HI("n", 645), HS("dtype", dt) });
@@ -829,6 +841,13 @@ std::vector<Case> build_cases() {
         for (int dil : { 1, 3 })
             add("conv1d", { HI("M", 24), HI("cin", 20), HI("cout", 13), HI("k", 7),
                             HI("dil", dil), HI("causal", 1), HS("dtype", dt) });
+        /* The strided downsample (a DAC encoder block's): kernel 2 stride, pad ceil(stride / 2),
+         * one sequence. The form is bf16-only, so it rides the bf16 arm alone. */
+        if (std::strcmp(dt, "bf16") == 0)
+            for (int s : { 2, 4, 5 })
+                add("conv1d", { HI("M", 24), HI("cin", 20), HI("cout", 13), HI("k", 2 * s),
+                                HI("dil", 1), HI("stride", s), HI("pad", (s + 1) / 2),
+                                HS("dtype", dt) });
         for (int s : { 2, 4, 8 })
             add("conv_t1d", { HI("M", 12), HI("cin", 20), HI("cout", 13), HI("stride", s),
                               HS("dtype", dt) });

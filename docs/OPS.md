@@ -200,6 +200,7 @@ at once. Run it before adding a kernel plugin; the loader names only the first c
 | `act_mul` | `M`(range) `n` `act` `dtype` | `a`, `b` → `y` (act(a)·b, two operands) |
 | `seg_mean` | `M`(range) `n` `dtype` | `x`, `cu_seqlens` → `y` (one mean row a segment) |
 | `pool_rows` | `M`(range) `n` `k` `mult`:f64/opt `dtype` | `x` → `y` (one mean row a window of k rows) |
+| `pool_cols` | `M`(range) `n` `k` `mult`:f64/opt `dtype` | `x` → `y` (one mean column a window of k columns) |
 | `relu` | `M`(range) `n` `dtype` | `x` → `y` |
 | `clamp` | `M`(range) `n` `dtype` | `x`, `lo`w, `hi`w → `y` |
 | `conv2d` | `M`(range) `width` `cin` `cout` `kh` `kw` `stride` `pad` `cu_div`/opt `valid_stride`/opt `dtype` `t_last`/opt `act`/opt | `x`, `w`w, `cu_seqlens`, `valid`? → `y`; `b`w? |
@@ -265,6 +266,14 @@ op; the segment count is `cu_seqlens`' length less one. An empty segment is a ze
 **`pool_rows`** is a vision pooler over windows laid out consecutively: row `r` of `y` is the mean
 of `x`'s rows `[r*k, r*k + k)`, summed in f32 and rounded to `y`'s dtype, then times `mult` and
 rounded again (the unfused pair stores the mean). `M` is the input row count, a multiple of `k`.
+
+**`pool_cols`** is its transpose-sibling, pooling along the width: column `c` of row `m` of `y` is
+the mean of `x[m]`'s columns `[c*k, c*k + k)`, with the same f32 sum, the same two roundings and the
+same optional `mult`. `n` is the input width, a multiple of `k`; `y` has `n / k` columns. An audio
+encoder's attention head pooling needs it because its `adaptive_avg_pool1d` runs across the feature
+axis of a single row, where `pool_rows` can only reach across rows — a `pool_cols` then a row
+reinterpretation then a `pool_rows` is what folds a head-major attention output to its mean pooled
+form.
 
 **`fill`** writes `y = value` over the extent (`value` 0 when absent). A rank issues it where it
 computes nothing but a downstream reader still expects a defined buffer: an attention-zero rank's
@@ -858,7 +867,7 @@ says which (`libref/ref_gen.cpp`).
 | `ln_mod` | `M`(range) `n` `eps`:f64 `dtype` | `x`, `s`, `cu_seqlens` → `y` |
 | `gate_add` | `M`(range) `n` `dtype` `act`/opt | `y`, `g`, `cu_seqlens`, `x`:inout |
 | `ln_mod_quant_fp8` | `M`(range) `n` `eps`:f64 `group` `gated` `dtype` | `y`?, `g`?, `s`, `cu_seqlens`, `x`:inout → `q`, `scale`, `z`? |
-| `timestep_embed` | `M`(range) `n` `scale`:f64 `max_period`:f64 `round`/opt `dtype` | `t` → `y` |
+| `timestep_embed` | `M`(range) `n` `scale`:f64 `max_period`:f64 `round`/opt `clamp_min`:f64/opt `dtype` | `t` → `y` |
 | `gather_rows2` | `M`(range) `n` `dtype` | `a`, `b`, `idx` → `y` |
 | `lane_gather` | `M`(range) `n` `stride` `dtype` | `src`, `lane`, `cu_seqlens` → `y` |
 | `lane_store` | `M`(range) `n` `stride` `dtype` | `src`, `lane`, `dst`:inout |
@@ -891,7 +900,9 @@ source into every listed lane (a repainted picture's latent into each of its ima
   store would round it, so the bytes are the three ops'.
 - `timestep_embed`: `[cos | sin]` of `t' * f_i`, `f_i = exp(-ln(max_period) * i / (n/2))` in f32,
   `t' = scale * t`; with `round` 1, `t' = scale * bf16(bf16(t * scale) / scale)`, the value
-  diffusers' pipeline hands its transformer. `t` is f32 `[M]`.
+  diffusers' pipeline hands its transformer. `t` is f32 `[M]`. With `clamp_min`, each `t` is first
+  raised to that floor (`t = max(t, clamp_min)`) -- the reference conditioning's near-clean pin
+  timesteps, which sit above the sampler's decaying schedule. `0` (default) leaves `t` untouched.
 - `gather_rows2`: `y[i] = idx[i] >= 0 ? a[idx[i]] : b[-1 - idx[i]]`, zeros past either source.
 - `randn_lanes`: for entries whose `flags` carry 1, the lane's rows become the entry's seed's
   standard-normal stream (`abi/rad_philox.h`), element `(k, c)` the stream's `k * n + c`. `seed` is
@@ -956,7 +967,7 @@ libref function says which (`libref/ref_audio.cpp`).
 
 | op | params | operands |
 |---|---|---|
-| `conv1d` | `M`(range) `cin` `cout` `k` `dil` `act`/opt `dtype` `causal`/opt | `x`, `w`w, `cu_seqlens`, `res`? → `y`; `b`w? |
+| `conv1d` | `M`(range) `cin` `cout` `k` `dil` `act`/opt `dtype` `causal`/opt `stride`/opt `pad`/opt | `x`, `w`w, `cu_seqlens`, `res`? → `y`; `b`w? |
 | `conv_t1d` | `M`(range) `cin` `cout` `stride` `dtype` `pad`/opt `k`/opt | `x`, `w`w, `b`w, `cu_seqlens` → `y` |
 | `snake` | `M`(range) `n` `dtype` `log`/opt | `x`, `alpha`w → `y`; `beta`w? |
 | `snake_aa` | `M`(range) `n` `ratio` `k` `log`/opt `dtype` | `x`, `alpha`w, `beta`w, `f_up`w, `f_down`w, `cu_seqlens` → `y` |
@@ -1031,7 +1042,13 @@ input reads zero outside it.
 - `conv1d`: PyTorch's `[cout, cin, k]` weight, `k` odd, dilation `dil` and padding
   `dil (k - 1) / 2` a side, or with `causal` 1 (any `k`) `dil (k - 1)` on the left; `res` is added
   after the bias, then `act` `none`, `tanh` or `clamp`, `min(max(y, -1), 1)` (BigVGAN's output
-  clamp; a NaN stays NaN). f32 accumulation, one rounding.
+  clamp; a NaN stays NaN). f32 accumulation, one rounding. With `stride` > 1 (bf16 rows only: the
+  encoder's downsample) `pad` is required, `k` is any size, and the op is one sequence
+  `cu_seqlens` = `[0, rows of x]`: output row `m` reads `x[m stride + tap dil - pad]` with zeros
+  outside, PyTorch's zero-padded strided conv exactly (`k = 2 stride`, `pad = ceil(stride / 2)`
+  gives `M / stride` rows), and `y` has
+  `(rows + 2 pad - dil (k - 1) - 1) / stride + 1` rows exactly. An explicit `pad` without a
+  stride, and an even `k` with neither, are refused.
 - `conv_t1d`: PyTorch's `[cin, cout, k]` transposed weight, any `k` of at least a stride (two
   strides by default), padding `pad` (`(k - stride) / 2` by default, which needs `k - stride` even;
   0 is the causal form, whose full output's last `k - stride` rows are dropped; it may exceed a
@@ -1260,7 +1277,7 @@ pass starts from. Each op rounds once into its output (`libref/ref_video.cpp`).
 
 | op | params | operands |
 |---|---|---|
-| `conv3d_ndhwc` | `M`(range) `cin` `cout` `k` `kt` `dtype` | `x`, `w`w, `b`w, `geom`, `res`? → `y` |
+| `conv3d_ndhwc` | `M`(range) `cin` `cout` `k` `kt` `dtype` `stride`/opt `stride_t`/opt `causal`/opt `pad`/opt `reflect`/opt | `x`, `w`w, `b`w, `geom`, `res`? → `y` |
 | `group_norm` | `M`(range) `n` `groups` `eps`:f64 `act` `dtype` | `x`, `w`w, `b`w, `mod`?, `stats`:inout → `y` |
 | `tconv_dw` | `M`(range) `n` `k` `dtype` | `x`, `w`w, `b`w, `geom` → `y` |
 | `resize_bilinear` | `M`(range) `n` `dtype` | `x`, `geom` → `y` |
@@ -1272,10 +1289,10 @@ innermost (NDHWC). `geom` is the request's volume, i32 on the device (the parame
 declare). An output holds at least the rows the volume writes; rows past them are not written.
 Every op honours its activation operands' row pitches. `rd` is a rounding into the output's dtype.
 
-- `conv3d_ndhwc`: `x [>= T H W, cin]`, `y` and `res` `[>= T H W, cout]`, `geom = (T, H, W)`; `w` is
-  PyTorch's Conv3d weight `[cout, cin, kt, k, k]` (a kernel may relayout it at load, as
-  `conv2d_nhwc`'s layout hook does) and `b [cout]`. Stride 1, zero padding `kt/2` frames and `k/2`
-  rows and columns on each side (`same`; `k` and `kt` odd):
+- `conv3d_ndhwc`: `x [>= T H W, cin]`, `y` and `res` `[>= rows out, cout]`, `geom = (T, H, W)`;
+  `w` is PyTorch's Conv3d weight `[cout, cin, kt, k, k]` (a kernel may relayout it at load, as
+  `conv2d_nhwc`'s layout hook does) and `b [cout]`. The defaults are stride 1 with zero padding
+  `kt/2` frames and `k/2` rows and columns on each side (`pad` `same`; `k` and `kt` odd):
   `y[(t,i,j), o] = rd(f32(sum over (dt, kh, kw, ci) of w[o, ci, dt, kh, kw]
   x[(t+dt-kt/2, i+kh-k/2, j+kw-k/2), ci]) + b[o])`, terms outside the volume zero, f32 accumulation
   in an order of the implementation's (libref: the taps in `(dt, kh, kw)` order, each tap's
@@ -1284,6 +1301,22 @@ Every op honours its activation operands' row pitches. `rd` is a rounding into t
   memory as `y` (the residual added in place); `x` never aliases `y`. x, y, res and w bf16 (also
   f32), b bf16 or f32. MiniMax-H3: `k` = `kt` = 3, `(cin, cout)` `(24, 512)`, `(512, 512)`,
   `(512, 24)`.
+  The optional `stride` (rows and columns), `stride_t` (frames), `causal`, `pad` and `reflect`
+  give the video encoder's `CausalConv3d` forms; they are accepted for `k = kt = 3` only. The
+  padding is computed first — front/back frame pad `ft`/`bk` and top/bottom/left/right spatial pad
+  — then one strided pass: output `(t, i, j)` reads
+  `x[(t stride_t + dt - ft, i stride + kh - pt, j stride + kw - pl), ci]` (the same tap order),
+  and `y` holds `((T + ft + bk - kt) / stride_t + 1) ((H + pt + pb - k) / stride + 1)
+  ((W + pl + pr - k) / stride + 1)` rows — PyTorch's length rule, which the plugins check the
+  operand rows against. The defaults give `ft = bk = kt/2` and `pt = pb = pl = pr = k/2`.
+  `causal` 1 zeroes `ft = kt - 1` frames in front and none behind (`bk = 0`), so one frame in
+  gives one frame out at any temporal stride — the reference's `T == 1` tap truncation included.
+  `pad` `down` (which needs `k = 3`) pads none above and left and one below and right
+  (`pt = pl = 0`, `pb = pr = 1`); the name and orientation are `conv2d_nhwc`'s. `reflect` 1
+  mirrors the *spatial* pads instead of zeroing them — torch `F.pad` mode `reflect`: a mirror
+  with no repeated edge, `x[-n] = x[n]`, `x[D + n] = x[D - 2 - n]` — so a padded dimension must
+  exceed its pad (`H, W >= 2` for the one-px pads). The frame pad is always zeros. MiniMax-H3's
+  encoder uses `reflect` 1 `causal` 1 everywhere, `pad` `down` plus `stride` 2 in `Downsample3D`.
 - `group_norm` is PyTorch's `nn.GroupNorm(groups, n)` on `[1, n, T, H, W]`: `x` and `y`
   `[>= M, n]` (`M` is `y`'s rows), group `g` the channels `[g n/groups, (g+1) n/groups)` of all
   `M` rows. `mean_g` and the biased `var_g` are over the group's `M n/groups` values, accumulated in

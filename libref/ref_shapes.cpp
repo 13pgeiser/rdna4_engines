@@ -459,6 +459,16 @@ int ref_pool_rows_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out
     return o.finish("pool_rows", operand, out);
 }
 
+int ref_pool_cols_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t n = gi(p, n_p, "n", 0), k = gi(p, n_p, "k", 0), M = gi(p, n_p, "M", 0);
+    if (M <= 0 || n <= 0 || k <= 0 || n % k) return RAD_E_UNSUPPORTED;
+    Opd o;
+    o.t(D, { M, n });          /* x */
+    o.t(D, { M, n / k });      /* y */
+    return o.finish("pool_cols", operand, out);
+}
+
 int ref_relu_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const uint32_t D = act_dt(p, n_p);
     const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
@@ -2765,19 +2775,27 @@ int ref_attn_vsa_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
  * REF_LANES lanes, as the image generator's are. */
 static int64_t two_seqs(int64_t M) { return M >= 4 ? 2 : 1; }
 
+/* `M` is the input rows; with `stride` > 1 (bf16, one sequence, explicit `pad`) the output is
+ * PyTorch's strided length, `M` being the rows of the one sequence `cu_seqlens` must cover. */
 int ref_conv1d_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = gi(p, n_p, "M", 0), cin = gi(p, n_p, "cin", 0), cout = gi(p, n_p, "cout", 0);
     const int64_t k = gi(p, n_p, "k", 0), causal = gi(p, n_p, "causal", 0);
-    if (M <= 0 || cin <= 0 || cout <= 0 || k <= 0 || (!causal && (k & 1) == 0))
+    const int64_t st = gi(p, n_p, "stride", 1), pp = gi(p, n_p, "pad", -1);
+    const int64_t dil = gi(p, n_p, "dil", 1);
+    if (M <= 0 || cin <= 0 || cout <= 0 || k <= 0 || (!causal && st <= 1 && (k & 1) == 0) ||
+        st < 1 || (st > 1 && (causal || pp < 0)) || (st <= 1 && pp >= 0))
         return RAD_E_UNSUPPORTED;
     const uint32_t D = act_dt(p, n_p);
-    const int64_t S = two_seqs(M);
+    if (st > 1 && D != (uint32_t)RAD_BF16) return RAD_E_UNSUPPORTED;
+    const int64_t S = st > 1 ? 1 : two_seqs(M);
+    const int64_t O = st > 1 ? (M + 2 * pp - dil * (k - 1) - 1) / st + 1 : M;
+    if (O <= 0) return RAD_E_UNSUPPORTED;
     Opd o;
     o.t(D, { M, cin });                                       /* x */
     o.t(D, { cout, cin, k });                                 /* w */
     o.t_idx({ S + 1 }, 0, -1, (uint32_t)RAD_OPD_F_IDX_CU);    /* cu_seqlens */
-    o.t(D, { M, cout });                                      /* res */
-    o.t(D, { M, cout });                                      /* y */
+    o.t(D, { O, cout });                                      /* res */
+    o.t(D, { O, cout });                                      /* y */
     o.t(D, { cout });                                         /* b */
     return o.finish("conv1d", operand, out);
 }

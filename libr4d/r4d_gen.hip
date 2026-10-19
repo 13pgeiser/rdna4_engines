@@ -204,9 +204,9 @@ __device__ __forceinline__ void st1(float* p, float v) { *p = v; }
 template <typename TY>
 __global__ __launch_bounds__(kT) void timestep_kernel(
     const float* __restrict__ t, TY* __restrict__ y, int h, float scale, float coef,
-    int round, int y_ld) {
+    int round, float clamp_min, int y_ld) {
     const int m = blockIdx.x;
-    const float tv = t[m];
+    const float tv = fmaxf(t[m], clamp_min);   /* ref pins are floors; 0 -> identity */
     const float tt = round ? scale * bfr(bfr(tv * scale) / scale) : scale * tv;
     for (int i = threadIdx.x; i < h; i += kT) {
         const float f = expf(coef * (float)i / (float)h);
@@ -769,14 +769,15 @@ extern "C" int r4d_rad_timestep_embed(const RadArgs* a, RadStream s) {
     const float coef = (float)(-std::log((double)mp));
     const float scale = (float)r4d_getf(a, "scale", 1000.0);
     const int round = (int)r4d_geti_or(a, "round", 0);
+    const float clamp = (float)r4d_getf(a, "clamp_min", 0.0);
     if (y->dtype == RAD_F32)
         hipLaunchKernelGGL(timestep_kernel<float>, dim3((unsigned)ry), dim3(kT), 0,
                            (hipStream_t)s, (const float*)t->data, (float*)y->data, (int)(n / 2),
-                           scale, coef, round, (int)yl);
+                           scale, coef, round, clamp, (int)yl);
     else
         hipLaunchKernelGGL(timestep_kernel<uint16_t>, dim3((unsigned)ry), dim3(kT), 0,
                            (hipStream_t)s, (const float*)t->data, (uint16_t*)y->data, (int)(n / 2),
-                           scale, coef, round, (int)yl);
+                           scale, coef, round, clamp, (int)yl);
     return st_of(hipGetLastError());
 }
 

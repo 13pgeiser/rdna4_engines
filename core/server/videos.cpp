@@ -15,8 +15,11 @@
  * (`w:h`) instead lays the model's own canvas over that ratio: the short edge (the model's, or
  * `short_edge`), the area capped at the model's largest, both sides rounded to the multiple.
  * A video's length is a whole number of the model's chunks: `seconds` is rounded up to the next.
- * Nothing that conditions on media is served: `input_reference` and non-empty `conditions` are
- * refused.
+ * A model that takes reference media (VideoGenInfo) also serves SGLang's `task` value `ref2va`:
+ * the media are form file parts named `ref_image_N` (at most 9), `ref_video_N` (3), a video's
+ * soundtrack as `ref_video_audio_N` and standalone audios as `ref_audio_N` (3), N 1-based and
+ * contiguous within each kind. `input_reference` and non-empty `conditions` are still refused:
+ * the parts carry the bytes, so no JSON array of media is read.
  *
  * A model with a latent upscaler also takes `latent_upscale`, a factor from 1 to its largest: the
  * first steps run at `size` divided by it and the latent is enlarged to `size` for the last
@@ -38,11 +41,15 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <random>
 #include <thread>
+#include <vector>
 
 namespace rad {
 namespace server {
@@ -61,6 +68,9 @@ struct Server::VideoJob {
     std::string err_code, err_message;
     std::string mp4;
     std::vector<uint8_t> first;   /* the first frame, RGB, for the thumbnail */
+    /* Reference conditioning: the reference parts' names in conditioning order, empty for a
+     * text-only job. */
+    std::vector<std::string> refs;
     /* Latent upscaling, as the generator resolved it: the factor, the evaluations after it and the
      * small size; refine 0 when the video is not upscaled. */
     double      upscale = 0.0;
@@ -118,7 +128,136 @@ void canvas_for(double rw, double rh, int64_t short_edge, int64_t max_area, int6
     *h = std::max<int64_t>(mult, (int64_t)std::nearbyint(H / mult) * mult);
 }
 
+/* What a ref2va request may carry whatever a model declares: the reference media the source
+ * workflows were built with — nine images, three videos each with an optional soundtrack, three
+ * standalone audios. A model's declaration can only lower these. */
+constexpr int32_t kMaxRefImages = 9, kMaxRefVideos = 3, kMaxRefAudios = 3;
+
+/* A form file part's name for task ref2va: `ref_image_N`, `ref_video_N`, `ref_video_audio_N`
+ * (a video's separately-given soundtrack) or `ref_audio_N`, N plain and 1-based. False for any
+ * other name; `ref_video_audio_` is tried before `ref_video_` because one contains the other. */
+bool parse_ref_name(const std::string& name, gen::VideoRefMedia::Kind* kind, int32_t* index) {
+    static const struct { const char* pfx; gen::VideoRefMedia::Kind kind; } kKinds[] = {
+        { "ref_image_",       gen::VideoRefMedia::IMAGE       },
+        { "ref_video_audio_", gen::VideoRefMedia::VIDEO_AUDIO },
+        { "ref_video_",       gen::VideoRefMedia::VIDEO       },
+        { "ref_audio_",       gen::VideoRefMedia::AUDIO       },
+    };
+    for (const auto& k : kKinds) {
+        const size_t n = std::strlen(k.pfx);
+        if (name.compare(0, n, k.pfx) != 0 || name.size() == n) continue;
+        char* e = nullptr;
+        const long v = std::strtol(name.c_str() + n, &e, 10);
+        if (*e == '\0' && v >= 1 && v <= 99) { *kind = k.kind; *index = (int32_t)v; return true; }
+    }
+    return false;
+}
+
+/* True when the file ends in one of these extensions, case-insensitively — what the client
+ * called the file, which the media readers make the first word of what it holds. */
+bool has_ext(const std::string& f, const std::vector<std::string>& exts) {
+    const size_t d = f.find_last_of('.');
+    if (d == std::string::npos) return false;
+    std::string e = f.substr(d + 1);
+    for (char& c : e) c = (char)std::tolower((unsigned char)c);
+    for (const std::string& x : exts) if (e == x) return true;
+    return false;
+}
+
+std::string ext_list(const std::vector<std::string>& exts) {
+    std::string s;
+    for (const std::string& x : exts) { if (!s.empty()) s += ", "; s += "." + x; }
+    return s;
+}
+
+/* The reference parts of a ref2va request, and their order. Refused with `*err` naming the part
+ * when one carries no bytes or an extension the media readers do not take, when a kind is over
+ * the API's or the model's count, when a kind's numbers leave a gap or repeat, or when a
+ * soundtrack has no video of the same number. On return `refs` is sorted by (kind, number): the
+ * order the generator builds the conditioning in. */
+int validate_refs(std::vector<gen::VideoRefMedia>& refs, const VideoGenInfo& info, ApiError* err) {
+    if (refs.empty()) {
+        *err = err_bad("task", "ref2va takes at least one reference part: ref_image_N, "
+                               "ref_video_N, ref_video_audio_N or ref_audio_N");
+        return -1;
+    }
+    const struct {
+        const char* pfx;
+        gen::VideoRefMedia::Kind kind;
+        int32_t cap;
+        std::vector<std::string> exts;
+    } kinds[] = {
+        { "ref_image",       gen::VideoRefMedia::IMAGE,
+          std::min(kMaxRefImages, (int32_t)info.max_ref_images),
+          { "png", "jpg", "jpeg", "webp" } },
+        { "ref_video",       gen::VideoRefMedia::VIDEO,
+          std::min(kMaxRefVideos, (int32_t)info.max_ref_videos),
+          { "mp4", "mov" } },
+        { "ref_video_audio", gen::VideoRefMedia::VIDEO_AUDIO,
+          std::min(kMaxRefVideos, (int32_t)info.max_ref_videos),
+          { "mp4", "mov", "wav", "mp3", "m4a", "aac", "flac", "ogg" } },
+        { "ref_audio",       gen::VideoRefMedia::AUDIO,
+          std::min(kMaxRefAudios, (int32_t)info.max_ref_audios),
+          { "wav", "mp3", "m4a", "aac", "flac", "ogg" } },
+    };
+    for (const auto& k : kinds) {
+        std::vector<bool> got(k.cap + 1, false);
+        int n = 0;
+        for (const gen::VideoRefMedia& m : refs) {
+            if (m.kind != k.kind) continue;
+            ++n;
+            if (m.data.empty())
+                return *err = err_bad(m.name, "'" + m.name + "' carries an empty file"), -1;
+            if (!has_ext(m.filename, k.exts))
+                return *err = err_bad(m.name, "'" + m.name + "' must be one of " +
+                                                  ext_list(k.exts)), -1;
+            if (m.index > k.cap)
+                return *err = err_bad(m.name, k.cap == 0
+                                                  ? "this model takes no parts named " +
+                                                    std::string(k.pfx) + "_N"
+                                                  : "this model takes at most " +
+                                                    std::to_string(k.cap) + " parts named " +
+                                                    std::string(k.pfx) + "_N"), -1;
+            if (got[m.index])
+                return *err = err_bad(m.name, "two parts are numbered " + std::string(k.pfx) +
+                                                  "_" + std::to_string(m.index)), -1;
+            got[m.index] = true;
+        }
+        for (int i = 1; i <= n; ++i)
+            if (!got[i])
+                return *err = err_bad(std::string(k.pfx) + "_" + std::to_string(i),
+                                      "the " + std::string(k.pfx) + "_N parts must be numbered 1 "
+                                      "to " + std::to_string(n) + " without gaps or repeats"), -1;
+    }
+    for (const gen::VideoRefMedia& m : refs) {
+        if (m.kind != gen::VideoRefMedia::VIDEO_AUDIO) continue;
+        bool paired = false;
+        for (const gen::VideoRefMedia& v : refs)
+            paired = paired || (v.kind == gen::VideoRefMedia::VIDEO && v.index == m.index);
+        if (!paired)
+            return *err = err_bad(m.name, "'" + m.name + "' is the soundtrack of a reference "
+                                          "video; give ref_video_" + std::to_string(m.index) +
+                                          " with it"), -1;
+    }
+    std::stable_sort(refs.begin(), refs.end(),
+                     [](const gen::VideoRefMedia& a, const gen::VideoRefMedia& b) {
+                         return a.kind != b.kind ? a.kind < b.kind : a.index < b.index;
+                     });
+    return 0;
+}
+
 }  /* namespace */
+
+/* The caps the /v1/models and /server_info capability block reports for a video model. The
+ * counts are the ones validate_refs() will apply — the model's declaration under the API's,
+ * since a declaration can only lower those — so what a client gates on is what it will meet. */
+void Server::video_caps(json& caps, const IVideoGen* gen) {
+    const VideoGenInfo& info = gen->info();
+    caps["video_max_text"]       = info.max_text;
+    caps["video_max_ref_images"] = std::min(kMaxRefImages, (int32_t)info.max_ref_images);
+    caps["video_max_ref_videos"] = std::min(kMaxRefVideos, (int32_t)info.max_ref_videos);
+    caps["video_max_ref_audios"] = std::min(kMaxRefAudios, (int32_t)info.max_ref_audios);
+}
 
 HttpResponse Server::handle_video_create(const HttpRequest& req) {
     if (!deps_.videos || !deps_.tok)
@@ -127,17 +266,33 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
                               req.peer);
     const VideoGenInfo& info = deps_.videos->info();
 
+    const bool takes_refs = info.max_ref_images > 0 || info.max_ref_videos > 0 ||
+                            info.max_ref_audios > 0;
     /* JSON, or a form whose fields are strings (OpenAI's clients send the create call as a form,
-     * since it may carry a file). */
+     * since it may carry a file). A form may carry the reference media of a ref2va request as
+     * named file parts; they are collected here and checked once the task is known. */
+    std::vector<gen::VideoRefMedia> refs;
     json body = json::object();
     if (!req.form.empty()) {
         for (const FormPart& p : req.form) {
             if (p.name == "input_reference")
-                return error_response(err_unsupported("input_reference", "this server makes video "
-                                                      "from text only"), req.peer);
-            if (!p.filename.empty())
-                return error_response(err_bad(p.name, "'" + p.name + "' takes text, not a file"),
-                                      req.peer);
+                return error_response(err_unsupported("input_reference", takes_refs
+                                                      ? "this server reads reference media as "
+                                                        "ref_image_N file parts"
+                                                      : "this server makes video from text "
+                                                        "only"), req.peer);
+            if (!p.filename.empty()) {
+                gen::VideoRefMedia m;
+                if (!parse_ref_name(p.name, &m.kind, &m.index))
+                    return error_response(err_bad(p.name, "'" + p.name + "' takes text, not a "
+                                                          "file"), req.peer);
+                m.name = p.name;
+                m.filename = p.filename;
+                m.content_type = p.content_type;
+                m.data = p.data;
+                refs.push_back(std::move(m));
+                continue;
+            }
             json v = p.data;
             if (p.name == "target" || p.name == "conditions") {
                 v = json::parse(p.data, nullptr, false);
@@ -179,16 +334,41 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
         return bad("prompt", "the prompt is required, as a non-empty string");
     const std::string prompt = body["prompt"].get<std::string>();
     if (has(body, "input_reference"))
-        return error_response(err_unsupported("input_reference", "this server makes video from "
-                                              "text only"), req.peer);
-    if (has(body, "task") && (!body["task"].is_string() || body["task"].get<std::string>() != "t2va")) {
-        ApiError e = err_unsupported("task", "this server makes video from text: t2va");
-        e.supported = { "t2va" };
-        return error_response(e, req.peer);
+        return error_response(err_unsupported("input_reference", takes_refs
+                                              ? "this server reads reference media as ref_image_N "
+                                                "file parts"
+                                              : "this server makes video from text only"),
+                              req.peer);
+    /* The task: text always; reference conditioning for a model that takes reference media. */
+    bool ref2va = false;
+    if (has(body, "task")) {
+        const std::string task = body["task"].is_string() ? body["task"].get<std::string>() : "";
+        if (task == "ref2va" && takes_refs) ref2va = true;
+        else if (task != "t2va") {
+            ApiError e = err_unsupported("task", takes_refs
+                                         ? "this server makes video from text or from reference "
+                                           "media: t2va, ref2va"
+                                         : "this server makes video from text: t2va");
+            e.supported = takes_refs ? std::vector<std::string>{ "t2va", "ref2va" }
+                                     : std::vector<std::string>{ "t2va" };
+            return error_response(e, req.peer);
+        }
     }
     if (has(body, "conditions") && (!body["conditions"].is_array() || !body["conditions"].empty()))
-        return error_response(err_unsupported("conditions", "this server makes video from text "
-                                              "only; conditions must be empty"), req.peer);
+        return error_response(err_unsupported("conditions", takes_refs
+                                              ? "reference media arrive as ref_* file parts; "
+                                                "conditions must be empty"
+                                              : "this server makes video from text only; "
+                                                "conditions must be empty"), req.peer);
+    /* The reference parts, in conditioning order, before anything else reads them. Files with no
+     * task are a caller's mistake about the task, not about the part. */
+    if (!refs.empty() && !ref2va)
+        return bad("task", "reference files are given: send them with task ref2va, or send "
+                           "none");
+    if (ref2va) {
+        ApiError e;
+        if (validate_refs(refs, info, &e) < 0) return error_response(e, req.peer);
+    }
     json target = json::object();
     if (has(body, "target")) {
         if (!body["target"].is_object()) return bad("target", "expected an object");
@@ -314,8 +494,13 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
         std::random_device rd;
         r->seed = (((uint64_t)rd() << 32) ^ rd()) & (((uint64_t)1 << 53) - 1);
     }
+    r->refs = std::move(refs);
 
-    /* ---- the prompt: the template's text with special tokens, the prompt without */
+    /* ---- the prompt: the template's text with special tokens, the reference media in its
+     * presentation order, the prompt last (docs/PORT-REF2VA.md §3: images, then videos each
+     * after its soundtrack's label, then the standalone audios). Each `<Picture k>: ` label is
+     * encoded as its own string, as the tokenizer the source workflows were checked against sees
+     * it; the picture's token run follows its label, taken from the processed item. */
     {
         static const std::string kSlot = "{prompt}";
         const std::string& t = info.tmpl;
@@ -325,13 +510,87 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
             const auto ids = deps_.tok->encode(s, false, special);
             r->tokens.insert(r->tokens.end(), ids.begin(), ids.end());
         };
-        put(t.substr(0, p), true);
-        put(prompt, false);
-        put(t.substr(p + kSlot.size()), true);
+        /* The reference media are presented between the template's head and the prompt. Only the
+         * images reach the language model, so only they are decoded and processed here; a
+         * reference video's frames and every audio ride the video and audio VAE encoders, which
+         * the video path does not run in this build yet, so their parts pass through as bytes for
+         * the generator to refuse at submit naming the part — not silently dropped. (When videos
+         * land, a soundtrack's `<Audio j>` label is emitted right before its `<Video k>` label,
+         * the audio ordinal counting soundtracks and standalone audios together, per type.) */
+        if (ref2va && deps_.mm && deps_.mm->accepts(MediaKind::Image)) {
+            /* Every picture is decoded and processed before any token is laid down. */
+            std::vector<std::shared_ptr<mm::Item>> pics;
+            MediaOpts mo;
+            mo.max_pixels = (int64_t)W * (int64_t)H;   /* `match`: scaled to the output's area */
+            for (const gen::VideoRefMedia& m : r->refs) {
+                if (m.kind != gen::VideoRefMedia::IMAGE) continue;
+                const std::vector<uint8_t> bytes(m.data.begin(), m.data.end());
+                std::shared_ptr<mm::Item> it;
+                std::string why;
+                if (deps_.mm->prepare(MediaKind::Image, bytes, mo, &it, &why) < 0 || !it)
+                    return bad(m.name.c_str(), "'" + m.name + "' could not be used: " + why);
+                pics.push_back(std::move(it));
+            }
+            put(t.substr(0, p), true);
+            if (!pics.empty()) {
+                auto media = std::make_shared<mm::PromptMedia>();
+                size_t i = 0;
+                for (const gen::VideoRefMedia& m : r->refs) {
+                    if (m.kind != gen::VideoRefMedia::IMAGE) continue;
+                    /* validate_refs numbered each kind 1..n without gaps, so the part's number is
+                     * its presentation ordinal: `<Picture k>: ` then the picture's token run. The
+                     * label is encoded as its own string, as the reference tokenizer's output was
+                     * built. */
+                    put("<Picture " + std::to_string(m.index) + ">: ", false);
+                    mm::Placed pl;
+                    pl.item = pics[i++];
+                    pl.tok = (int32_t)r->tokens.size();
+                    r->tokens.insert(r->tokens.end(), pl.item->expand.begin(),
+                                     pl.item->expand.end());
+                    media->items.push_back(std::move(pl));
+                }
+                media->layout();
+                r->media = std::move(media);
+            }
+            put(prompt, false);
+            put(t.substr(p + kSlot.size()), true);
+        } else {
+            put(t.substr(0, p), true);
+            put(prompt, false);
+            put(t.substr(p + kSlot.size()), true);
+        }
         if ((int64_t)r->tokens.size() > info.max_text)
-            return bad("prompt", "the prompt is " + std::to_string(r->tokens.size()) +
+            return bad("prompt", "the prompt" + std::string(ref2va ? " with its reference media"
+                                                                    : "") +
+                                     " is " + std::to_string(r->tokens.size()) +
                                      " tokens; this model takes at most " +
                                      std::to_string(info.max_text));
+    }
+
+    /* ---- the encoder's own view of every reference the VAE consumes. The text encoder saw the
+     * pictures above for identity; now each is also decoded and shrunk to the encoder's grid so the
+     * video VAE can turn it into conditioning rows. The driver stages these bytes into a Vencode
+     * pass; reference videos and their soundtracks, and the standalone audios, ride the same two
+     * encoders but are still refused at submit until those decode paths land, so only pictures are
+     * prepared here. The processor decodes under the same guard it used for the text encoder, so a
+     * reference that got this far decodes here too. */
+    if (ref2va && info.encodes && deps_.mm) {
+        for (gen::VideoRefMedia& m : r->refs) {
+            if (m.kind != gen::VideoRefMedia::IMAGE) continue;
+            mm::Frame fr;
+            std::string why;
+            if (deps_.mm->encoder_image((const uint8_t*)m.data.data(), m.data.size(),
+                                        (int32_t)info.enc_ratio, (int32_t)info.max_enc_side, &fr,
+                                        &why) < 0)
+                return bad(m.name.c_str(), "'" + m.name + "' could not be encoded: " + why);
+            m.enc_frames = 1;
+            m.enc_h = fr.h;
+            m.enc_w = fr.w;
+            /* un-normalised RGB 0..255, row-major; the video VAE applies ImageNet mean/std itself */
+            m.enc_pixels.resize((size_t)fr.w * fr.h * 3);
+            for (size_t i = 0; i < m.enc_pixels.size(); ++i)
+                m.enc_pixels[i] = (float)fr.rgb[i];
+        }
     }
 
     /* ---- admitted and queued: the job holds its place until its file is written */
@@ -344,6 +603,7 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
     j->size = std::to_string(W) + "x" + std::to_string(H);
     j->created_at = unix_now();
     j->seed = r->seed;
+    for (const gen::VideoRefMedia& m : r->refs) j->refs.push_back(m.name);
     j->ticket = std::make_shared<gen::VideoTicket>();
     r->ticket = j->ticket;
     const int64_t n_tok = (int64_t)r->tokens.size();
@@ -365,13 +625,14 @@ HttpResponse Server::handle_video_create(const HttpRequest& req) {
         j->refine = tk.refine;
         j->upscale_from = std::to_string(tk.small_width) + "x" + std::to_string(tk.small_height);
     }
-    RAD_INFO("video %s: %s, %lld frames (%s s), %lld prompt tokens, %d steps%s, seed=%llu",
+    RAD_INFO("video %s: %s, %lld frames (%s s), %lld prompt tokens, %d steps%s%s, seed=%llu",
              j->id.c_str(), j->size.c_str(), (long long)frames, j->seconds.c_str(),
              (long long)n_tok, steps > 0 ? steps : (int)tk.steps,
              tk.refine > 0 ? rad::fmt(" (the first %d at %dx%d, upscaled for the last %d)",
                                       (int)(tk.steps - tk.refine), (int)tk.small_width,
                                       (int)tk.small_height, (int)tk.refine).c_str()
                            : "",
+             j->refs.empty() ? "" : rad::fmt(", %zu reference parts", j->refs.size()).c_str(),
              (unsigned long long)j->seed);
     std::lock_guard<std::mutex> lk(videos_m_);
     sweep_videos_locked(unix_now());
@@ -529,6 +790,10 @@ json Server::video_json(const VideoJob& j) {
         o["latent_upscale"] = j.upscale;
         o["upscale_refine_steps"] = j.refine;
         o["upscale_from"] = j.upscale_from;
+    }
+    if (!j.refs.empty()) {
+        o["task"] = "ref2va";
+        o["refs"] = j.refs;   /* the reference parts, in conditioning order */
     }
     o["remixed_from_video_id"] = nullptr;
     if (j.failed) {

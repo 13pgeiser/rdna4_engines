@@ -460,6 +460,34 @@ int ref_pool_rows(const RadArgs* a, RadStream) {
     return RAD_OK;
 }
 
+/* ------------------------------------------------------------------ pool_cols */
+/* Column c of row m of y is the mean of x[m]'s columns [c*k, c*k + k), summed in f32 and rounded
+ * to y's dtype, then multiplied by `mult` and rounded again — pool_rows' dual: it pools the
+ * columns, what a torch adaptive_avg_pool1d over the feature axis of an encoder's posterior head
+ * computes. */
+int ref_pool_cols(const RadArgs* a, RadStream) {
+    if (!have(a, 2)) return RAD_E_INVAL;
+    const RadTensor *X = &a->t[0], *Y = &a->t[1];
+    const int64_t n = p_int(a, "n", 0), k = p_int(a, "k", 0);
+    const float mult = p_f32(a, "mult", 1.0f);
+    if (n <= 0 || k <= 0 || n % k) return RAD_E_SHAPE;
+    const int64_t M = rows_of(X, n), nw = n / k;
+    if (M <= 0 || numel(Y) < M * nw) return RAD_E_SHAPE;
+    const float inv = 1.0f / (float)k;
+
+    REF_PAR_FOR(M * nw * k)
+    for (int64_t r = 0; r < M; ++r) {
+        const int64_t yb = rowoff(Y, r, nw), ys = laststride(Y), xs = laststride(X);
+        for (int64_t c = 0; c < nw; ++c) {
+            float acc = 0.0f;
+            for (int64_t j = 0; j < k; ++j) acc += ldt(X, rowoff(X, r, n) + (c * k + j) * xs);
+            stt(Y, yb + c * ys, acc * inv);
+            stt(Y, yb + c * ys, ldt(Y, yb + c * ys) * mult);
+        }
+    }
+    return RAD_OK;
+}
+
 /* ------------------------------------------------------------------ relu */
 /* y = max(x, 0) over [M, n], each operand at its own row pitch. */
 int ref_relu(const RadArgs* a, RadStream) {

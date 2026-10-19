@@ -284,6 +284,21 @@ VideoPositionsFn rad_tools_video_positions(const LoadedPlugins& lp) {
     return ap ? ap->arch_video_positions : nullptr;
 }
 
+VideoSegsFn rad_tools_video_segs(const LoadedPlugins& lp) {
+    const Plugin* ap = rad_tools_registry().plugin(lp.arch_plugin);
+    return ap ? ap->arch_video_segs : nullptr;
+}
+
+VideoPackFn rad_tools_video_pack(const LoadedPlugins& lp) {
+    const Plugin* ap = rad_tools_registry().plugin(lp.arch_plugin);
+    return ap ? ap->arch_video_pack : nullptr;
+}
+
+EncodeGeomFn rad_tools_encode_geom(const LoadedPlugins& lp) {
+    const Plugin* ap = rad_tools_registry().plugin(lp.arch_plugin);
+    return ap ? ap->arch_encode_geom : nullptr;
+}
+
 const RadAudioFormat* rad_tools_audio_format(const LoadedPlugins& lp, const RadModelMeta& meta) {
     const Plugin* ap = rad_tools_registry().plugin(lp.arch_plugin);
     if (!ap || !ap->arch_audio_format) return nullptr;

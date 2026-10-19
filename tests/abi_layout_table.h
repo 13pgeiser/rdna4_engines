@@ -1,4 +1,4 @@
-/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 21 and
+/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 23 and
  * RAD_FORMAT_VER 2, as { type, field, offset, size } rows ("" is the struct itself). A snapshot
  * of the headers on x86-64 Linux, which abi_layout_test.cpp holds the layout to; regenerate it
  * from the test's printout only together with a version bump. */
@@ -588,7 +588,7 @@
 { "RadTunable", "n_values", 16, 4 },
 { "RadTunable", "deflt", 24, 8 },
 { "RadTunable", "doc", 32, 8 },
-{ "RadVideoGenBatch", "", 0, 192 },
+{ "RadVideoGenBatch", "", 0, 248 },
 { "RadVideoGenBatch", "lane", 0, 4 },
 { "RadVideoGenBatch", "geom", 4, 24 },
 { "RadVideoGenBatch", "geom_d", 32, 8 },
@@ -610,7 +610,16 @@
 { "RadVideoGenBatch", "n_samples", 152, 8 },
 { "RadVideoGenBatch", "geom_from", 160, 24 },
 { "RadVideoGenBatch", "upscale", 184, 8 },
-{ "RadVideoGenDecl", "", 0, 288 },
+{ "RadVideoGenBatch", "enc_pixels", 192, 8 },
+{ "RadVideoGenBatch", "enc_frames", 200, 4 },
+{ "RadVideoGenBatch", "enc_height", 204, 4 },
+{ "RadVideoGenBatch", "enc_width", 208, 4 },
+{ "RadVideoGenBatch", "enc_samples", 216, 8 },
+{ "RadVideoGenBatch", "enc_n_samples", 224, 8 },
+{ "RadVideoGenBatch", "enc_channels", 232, 4 },
+{ "RadVideoGenBatch", "enc_slot", 236, 4 },
+{ "RadVideoGenBatch", "enc_geom_d", 240, 8 },
+{ "RadVideoGenDecl", "", 0, 352 },
 { "RadVideoGenDecl", "name", 0, 8 },
 { "RadVideoGenDecl", "tmpl", 8, 8 },
 { "RadVideoGenDecl", "max_text", 16, 8 },
@@ -648,6 +657,15 @@
 { "RadVideoGenDecl", "rungs", 264, 8 },
 { "RadVideoGenDecl", "upscale_max", 272, 8 },
 { "RadVideoGenDecl", "upscale_refine", 280, 4 },
+{ "RadVideoGenDecl", "max_ref_images", 288, 8 },
+{ "RadVideoGenDecl", "max_ref_videos", 296, 8 },
+{ "RadVideoGenDecl", "max_ref_audios", 304, 8 },
+{ "RadVideoGenDecl", "encodes", 312, 4 },
+{ "RadVideoGenDecl", "max_enc_frames", 320, 8 },
+{ "RadVideoGenDecl", "max_enc_side", 328, 8 },
+{ "RadVideoGenDecl", "max_enc_samples", 336, 8 },
+{ "RadVideoGenDecl", "enc_ratio", 344, 4 },
+{ "RadVideoGenDecl", "ref_rows", 348, 4 },
 { "RadVideoGeom", "", 0, 24 },
 { "RadVideoGeom", "n_text", 0, 4 },
 { "RadVideoGeom", "frames", 4, 4 },

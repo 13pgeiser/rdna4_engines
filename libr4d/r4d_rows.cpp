@@ -2132,8 +2132,8 @@ static const RadOperandSpec oGateAdd[] = {
     { "y", RAD_OPD_IN, 0 }, { "g", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
     { "x", RAD_OPD_INOUT, 0 },
 };
-static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale"),
-                                          P_F64("max_period"), P_INTO("round"), P_STR("dtype") };
+static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale"), P_F64("max_period"),
+                                          P_INTO("round"), P_F64O("clamp_min"), P_STR("dtype") };
 static const RadOperandSpec oTimestep[] = { { "t", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 } };
 static const RadOperandSpec oGather2[] = {
     { "a", RAD_OPD_IN, 0 }, { "b", RAD_OPD_IN, 0 }, { "idx", RAD_OPD_IN, 0 }, { "y", RAD_OPD_OUT, 0 },
@@ -2194,7 +2194,7 @@ static const RadOperandSpec oAttnPS[] = {
 /* ---- audio generation (r4d_audio.hip); the same specs as libref's (ref_registry.cpp). */
 static const RadParamSpec pConv1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
                                         P_INT("dil"), P_STRO("act"), P_STR("dtype"),
-                                        P_INTO("causal") };
+                                        P_INTO("causal"), P_INTO("stride"), P_INTO("pad") };
 static const RadOperandSpec oConv1d[] = {
     { "x", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
     { "res", RAD_OPD_IN, 1 }, { "y", RAD_OPD_OUT, 0 }, { "b", RAD_OPD_WEIGHT, 1 },
@@ -2334,7 +2334,9 @@ static const RadOperandSpec oGridPos3[] = { { "y", RAD_OPD_OUT, 0 } };
 /* ---- a video latent upscaler (r4d_upscaler.hip); the same specs as libref's. `geom` is the
  * request's volume, i32 on the device; patch_fold takes patch_unfold's specs. */
 static const RadParamSpec pConv3d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
-                                        P_INT("kt"), P_STR("dtype") };
+                                        P_INT("kt"), P_STR("dtype"), P_INTO("stride"),
+                                        P_INTO("stride_t"), P_INTO("causal"), P_STRO("pad"),
+                                        P_INTO("reflect") };
 static const RadOperandSpec oConv3d[] = {
     { "x", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 }, { "b", RAD_OPD_WEIGHT, 0 },
     { "geom", RAD_OPD_IN, 0 }, { "res", RAD_OPD_IN, 1 }, { "y", RAD_OPD_OUT, 0 },
@@ -2432,6 +2434,10 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("pool_rows", pPoolRows, oUnary,
            "Row r of y is the mean of x's rows [r*k, r*k + k), summed in f32 and rounded, then "
            "times `mult` and rounded again."),
+    SCHEMA("pool_cols", pPoolRows, oUnary,
+           "Column c of row m of y is the mean of x[m]'s columns [c*k, c*k + k), summed in f32 and "
+           "rounded, then times `mult` and rounded again. n, the input width, is a multiple of k; "
+           "y has n / k columns."),
     SCHEMA("sigmoid", pMnDtype, oUnary, "y = 1 / (1 + exp(-x))."),
     SCHEMA("relu", pMnDtype, oUnary, "y = max(x, 0)."),
     SCHEMA("silu", pMnDtype, oUnary, "y = x * sigmoid(x)."),
@@ -2990,7 +2996,10 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("conv1d", pConv1d, oConv1d,
            "a 1-D convolution over the sequences cu_seqlens bounds, channels innermost, zeros outside "
            "each; dilation `dil`, padding dil (k - 1) / 2 a side or, with `causal`, dil (k - 1) on "
-           "the left; `res` added after the bias, then `act`."),
+           "the left; `res` added after the bias, then `act`. bf16 only with `stride` > 1: one "
+           "sequence [0, rows of x], an explicit `pad` and any k, output row m reading "
+           "x[m * stride + tap * dil - pad], the output rows (rows + 2 pad - dil (k - 1) - 1) / "
+           "stride + 1."),
     SCHEMA("conv_t1d", pConvT1d, oConvT1d,
            "a transposed 1-D convolution of kernel `k` (2 stride by default, or stride), padding "
            "`pad` ((k - stride) / 2 by default, 0 the causal form): each sequence grows `stride` "
@@ -3046,9 +3055,13 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("grid_pos3", pGridPos3, oGridPos3,
            "a video decoder's rotary positions over tiles of `period` rows, f32 [3, M]."),
     SCHEMA("conv3d_ndhwc", pConv3d, oConv3d,
-           "a stride-1 `same` 3D convolution over NDHWC voxel rows of the device volume geom = "
-           "(T, H, W), PyTorch's [cout, cin, kt, k, k] weight, f32 accumulation; with `res`, "
-           "y = rd(rd(acc + b) + res), res may alias y."),
+           "a 3D convolution over NDHWC voxel rows of the device volume geom = (T, H, W), "
+           "PyTorch's [cout, cin, kt, k, k] weight, f32 accumulation; default stride 1 with "
+           "`same` zero padding; `stride`/`stride_t` > 1 (3x3x3 only) pad first then stride, "
+           "`causal` 1 takes the temporal padding front-only (kt - 1 zeros, none behind), `pad` "
+           "`down` pads none above and left and one below and right, `reflect` 1 mirrors the "
+           "spatial padding instead of zeroing it; with `res`, y = rd(rd(acc + b) + res), res "
+           "may alias y."),
     SCHEMA("group_norm", pGroupNorm, oGroupNorm,
            "nn.GroupNorm over all of y's rows (biased variance, rstd in f32), then the optional "
            "modulation v (1 + mod[0:n]) + mod[n:2n] and `act` (none or silu), one rounding; "
@@ -3369,6 +3382,10 @@ static const RadConstraint cCastNarrow[] = {
 /* Causal or not at head_dim 64: a vision tower's heads, and a codec's sliding causal layers. */
 static const RadConstraint cAttnDenseH64[] = {
     C_EQ("head_dim", 64), C_EQ("gqa", 1), C_IN("dtype", "bf16"),
+};
+/* head_dim 256 with no GQA (an encoder's own heads), sequences past the small kernel's LDS. */
+static const RadConstraint cAttnDenseH256G1[] = {
+    C_EQ("head_dim", 256), C_EQ("gqa", 1), C_GE("max_seqlen", 33), C_IN("dtype", "bf16"),
 };
 static const RadConstraint cAttnDenseH256G2[] = {
     C_EQ("head_dim", 256), C_EQ("gqa", 2), C_EQ("causal", 0), C_IN("dtype", "bf16"),
@@ -4563,6 +4580,15 @@ static const RadKernelInfo kKernels[] = {
   ROW(cBf16Row), NOTUNE,
   nullptr, nullptr, r4d_rad_pool_rows },
 
+{ "pool_cols_bf16", "pool_cols", "elem",
+  "mean of every k consecutive columns within a row, then a multiplier: an encoder posterior's "
+  "adaptive-average pooling over the feature axis",
+  "any n and k with n % k == 0; a thread an output column",
+  "bf16 in and out, f32 sum, two roundings",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_pool_cols },
+
 { "rmsnorm_bf16", "rmsnorm", "norm",
   "root-mean-square norm with a gain, two passes over the row",
   "any n; the sum of squares accumulates in f32 and only the store narrows",
@@ -5395,6 +5421,16 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   "bf16 query / key / value / out, f16 operands, fp32 accumulate",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cAttnDenseH64), NOTUNE,
+  nullptr, nullptr, r4d_rad_attn_dense },
+
+{ "attn_dense_h256_bf16", "attn_dense", "attn",
+  "dense varlen attention over cu_seqlens: bidirectional with an optional two-sided window or "
+  "blocks, or causal with an optional window behind",
+  "head_dim 256, multi-head (no GQA), q/k/v/o at their own token pitches (column slices of a "
+  "fused projection allowed), sequences past the small kernel's 32-row LDS bound",
+  "bf16 query / key / value / out, f16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cAttnDenseH256G1), NOTUNE,
   nullptr, nullptr, r4d_rad_attn_dense },
 
 { "attn_dense_h256_gqa2_bf16", "attn_dense", "attn",

@@ -678,7 +678,7 @@ static const RadOperandSpec oRmsModQ[] = { OPD_O("y"), OPD_O("g"), OPD("s"), WGT
 static const RadOperandSpec oFlowX0[] = { OPD("v"), OPD("t"), OPD("sigma"), OPD("sigma_next"),
                                           INOUT("x") };
 static const RadParamSpec pTimestep[] = { P_INT("M"), P_INT("n"), P_F64("scale"), P_F64("max_period"),
-                                          P_INTO("round"), P_STR("dtype") };
+                                          P_INTO("round"), P_F64O("clamp_min"), P_STR("dtype") };
 static const RadOperandSpec oTimestep[] = { OPD("t"), OUT("y") };
 static const RadOperandSpec oGather2[]  = { OPD("a"), OPD("b"), OPD("idx"), OUT("y") };
 static const RadParamSpec pLane[] = { P_INT("M"), P_INT("n"), P_INT("stride"), P_STR("dtype") };
@@ -753,8 +753,12 @@ static const RadOperandSpec oAttnVsa[] = { OPD("q"), OPD("k"), OPD("v"), OPD("se
 /* ---- the latent upscaler (ref_video.cpp). `geom` is the request's volume, i32 on the device:
  * (T, H, W) for conv3d_ndhwc and tconv_dw, (T, h, w, H, W) for resize_bilinear and (F, Hp, Wp)
  * for patch_fold, which shares patch_unfold's parameters and operands. */
+/* `stride`/`stride_t`/`causal`/`pad`/`reflect`: the video encoder's CausalConv3d forms; the
+ * defaults are the stride-1 `same` zero padding of everything shipped before them. */
 static const RadParamSpec pConv3d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
-                                        P_INT("kt"), P_STR("dtype") };
+                                        P_INT("kt"), P_STR("dtype"), P_INTO("stride"),
+                                        P_INTO("stride_t"), P_INTO("causal"), P_STRO("pad"),
+                                        P_INTO("reflect") };
 static const RadOperandSpec oConv3d[] = { OPD("x"), WGT("w"), WGT("b"), OPD("geom"),
                                           OPD_O("res"), OUT("y") };
 /* `mod` is one row [scale | shift]; `stats` the per-group mean and rstd, then scratch. */
@@ -773,7 +777,7 @@ static const RadOperandSpec oFlowRenoise[] = { OPD("sigma"), OPD("seed"), INOUT(
 /* ---- audio generation (ref_audio.cpp) */
 static const RadParamSpec pConv1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("k"),
                                         P_INT("dil"), P_STRO("act"), P_STR("dtype"),
-                                        P_INTO("causal") };
+                                        P_INTO("causal"), P_INTO("stride"), P_INTO("pad") };
 static const RadOperandSpec oConv1d[] = { OPD("x"), WGT("w"), OPD("cu_seqlens"), OPD_O("res"),
                                           OUT("y"), WGT_O("b") };
 static const RadParamSpec pConvT1d[] = { P_INT("M"), P_INT("cin"), P_INT("cout"), P_INT("stride"),
@@ -899,6 +903,10 @@ static const RadOpSchema kSchemas[] = {
 { "pool_rows", ARR(pPoolRows), ARR(oUnary),
   "Row r of y is the mean of x's rows [r*k, r*k + k), summed in f32 and rounded to y's dtype, then "
   "times `mult` (default 1) and rounded again. M, the input rows, is a multiple of k." },
+{ "pool_cols", ARR(pPoolRows), ARR(oUnary),
+  "Column c of row m of y is the mean of x[m]'s columns [c*k, c*k + k), summed in f32 and rounded "
+  "to y's dtype, then times `mult` (default 1) and rounded again. n, the input width, is a "
+  "multiple of k." },
 { "relu", ARR(pMnD), ARR(oUnary), "y = max(x, 0), each operand at its own row pitch." },
 { "clamp", ARR(pMnD), ARR(oClamp),
   "y = min(max(x, lo), hi), `lo` and `hi` WEIGHTS of one element each: a clipped linear's range." },
@@ -1463,10 +1471,15 @@ static const RadOpSchema kSchemas[] = {
   "max subtracted. With `coarse` and `gate`: out = rd(rd(o) + coarse[h][tile] gate), rd the "
   "output's dtype." },
 { "conv3d_ndhwc", ARR(pConv3d), ARR(oConv3d),
-  "a 3-D convolution over voxel rows [T H W, cin] -> [T H W, cout] (geom = (T, H, W)): "
-  "PyTorch's Conv3d weight [cout, cin, kt, k, k] and bias, stride 1, `same` zero padding (kt/2 "
-  "frames, k/2 rows and columns a side; k and kt odd), f32 accumulation, rd(acc + b); with `res`, "
-  "rd(rd(acc + b) + res), `res` possibly y itself." },
+  "a 3-D convolution over voxel rows of geom = (T, H, W) -> [rows out, cout]: "
+  "PyTorch's Conv3d weight [cout, cin, kt, k, k] and bias, f32 accumulation, rd(acc + b). "
+  "Defaults are stride 1 with `same` zero padding (kt/2 frames, k/2 rows and columns a side; "
+  "k and kt odd). `stride` (spatial) and `stride_t` > 1 pad then stride (3x3x3 only); `causal` "
+  "1 pads the time axis front-only with kt - 1 zeros and none behind (so one frame in gives "
+  "one frame out at any stride, the reference's T==1 tap truncation); `pad` `down` pads none "
+  "above and left and one below and right; `reflect` 1 mirrors the spatial padding (torch "
+  "mode `reflect`, a mirror with no repeated edge, so the padded dimension must exceed the "
+  "pad). With `res`, rd(rd(acc + b) + res), `res` possibly y itself." },
 { "group_norm", ARR(pGroupNorm), ARR(oGroupNorm),
   "PyTorch's GroupNorm over all M rows: group g is channels [g n/groups, (g+1) n/groups), its "
   "biased mean and variance in f64, rstd = 1 / sqrt(var + eps) in f32; v = (x - mean) rstd w + b, "
@@ -1492,7 +1505,9 @@ static const RadOpSchema kSchemas[] = {
   "a 1-D convolution over the sequences `cu_seqlens` bounds, channels innermost: x [rows, cin], "
   "y [rows, cout], PyTorch's [cout, cin, k] weight and an optional bias, dilation `dil` and padding "
   "dil (k - 1) / 2 a side (k odd), or dil (k - 1) on the left with `causal` 1, zeros outside each "
-  "sequence; `res` added after the bias, then `act` none, tanh or clamp (to [-1, 1])." },
+  "sequence; `res` added after the bias, then `act` none, tanh or clamp (to [-1, 1]). bf16 only "
+  "with `stride` > 1: one sequence [0, rows of x], an explicit `pad` and any k, output row m "
+  "reading x[m * stride + tap * dil - pad] — PyTorch's zero-padded strided conv exactly." },
 { "conv_t1d", ARR(pConvT1d), ARR(oConvT1d),
   "a transposed 1-D convolution of kernel `k` >= stride (2 stride by default), padding `pad` "
   "((k - stride) / 2 by default, 0 the causal form): each sequence of x [rows, cin] grows "
@@ -1713,6 +1728,8 @@ SIMPLE("ref_seg_mean", "seg_mean", "elem", "mean of each cu_seqlens segment's ro
        ref_seg_mean),
 SIMPLE("ref_pool_rows", "pool_rows", "elem", "mean of every k consecutive rows, then a multiplier",
        DT_FLOAT, ref_pool_rows),
+SIMPLE("ref_pool_cols", "pool_cols", "elem", "mean of every k consecutive columns, then a "
+       "multiplier", DT_FLOAT, ref_pool_cols),
 SIMPLE("ref_relu", "relu", "elem", "max(x, 0)", DT_FLOAT, ref_relu),
 SIMPLE("ref_clamp", "clamp", "elem", "x clamped to two weight scalars", DT_FLOAT, ref_clamp),
 SIMPLE("ref_conv2d", "conv2d", "elem", "segment-wise 2-D convolution, channels innermost",

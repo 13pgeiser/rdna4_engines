@@ -424,6 +424,8 @@ enum {
  *   ADECODE  no rows of the pass's own.
  *   VDECODE  `dec_rows` rows of the decoder's own (rad_arch_video_positions, RAD_VPOS_DECODE).
  *   VUPSCALE no rows of the pass's own: the lane's video latent from `geom_from` to `geom`.
+ *   VENCODE  no rows of the pass's own: a reference video's pixels in `enc_pixels`.
+ *   AENCODE  no rows of the pass's own: a reference audio's samples in `enc_samples`.
  *
  * Every pointer is device memory unless the name ends in _h. */
 typedef struct RadVideoGenBatch {
@@ -468,7 +470,54 @@ typedef struct RadVideoGenBatch {
      * soundtrack's) the latents are re-noised to; `seed` is a step's. */
     RadVideoGeom    geom_from;
     const float*    upscale;       /* f32 [1]: the factor the network is told */
+
+    /* ---- VENCODE / AENCODE (rad_builder.h, "Reference conditioning"). `enc_pixels` is a
+     * Vencode pass's f32 [enc_frames, enc_height, enc_width, 3] row-major RGB, values 0..255 —
+     * un-normalised: the encoder applies its own pixel normalisation first. `enc_frames` is the
+     * clip-padded frame count the export reports (entry 23): 1 for a still, else a whole number
+     * of clips with a short last clip pre-padded by repeating its final frame. `enc_samples` is
+     * an Aencode pass's f32 [enc_channels, enc_n_samples] channel-major — each channel a
+     * contiguous sequence the encoder's convolutions read in place — right-padded with zeros to
+     * the length `rad_arch_encode_geom` reports (its entry 0). `enc_geom_d` is that length and
+     * the pass's other plugin-defined geometry, device i32, the driver staging verbatim what the
+     * export returned (the encoder's kernels read the padded lengths from here, as a cu does).
+     * `enc_kind` names the media the pass carries and `enc_slot` is its 1-based number within
+     * that kind; RAD_ENC_TAIL is the request's continuity tail — its slot 0 — which rides
+     * Vencode. A pass writes nothing the core reads back: the latents live in the lane. Trailing
+     * since ABI 23: a batch an older engine built carries none. */
+    const float*    enc_pixels;
+    int32_t         enc_frames, enc_height, enc_width;
+    const float*    enc_samples;
+    int64_t         enc_n_samples;
+    int32_t         enc_channels;
+    int32_t         enc_slot;
+    const int32_t*  enc_geom_d;
+    int32_t         enc_kind;
+
+    /* ---- Reference rows of a VSTEP pass (rad_builder.h, rad_arch_video_pack). `ref_tab` is the
+     * request's keyframes and VAE references as a host int32 table -- the driver holds it, and
+     * the step reads it host-side as it reads `geom`. Null when the request conditions on no
+     * VAE media; otherwise self-describing: [0] the number of references, [1] the number of
+     * keyframes, then 6 words per reference {kind, slot, height, width, frames, audio} and 3
+     * words per keyframe {frame, video, audio}, in the order the references are presented. A
+     * reference's `kind` is 0 a picture, 1 a standalone audio, 2 a video, 3 a video's
+     * soundtrack; `slot` is its 1-based number within its kind -- the slot its encode pass
+     * wrote. The counts are latent units: a reference's own latent grid (height, width), its
+     * latent frames and its audio latents, 0 where the kind carries neither. A batch without
+     * the field laid out is one an older engine built: no references. Trailing since ABI 23. */
+    const int32_t*  ref_tab;
 } RadVideoGenBatch;
+
+/* RadVideoGenBatch::enc_kind: which reference media an encode pass carries. A plugin's latent
+ * buffer is indexed by the kind and the slot together: two kinds both number their media from
+ * 1, so the kind is what keeps image 1 and video 1 apart. */
+enum {
+    RAD_ENC_TAIL = 0,     /* the request's continuity tail: the frames of the clip it continues */
+    RAD_ENC_IMAGE = 1,    /* a reference picture; rides Vencode */
+    RAD_ENC_VIDEO = 2,    /* a reference video; rides Vencode */
+    RAD_ENC_VAUDIO = 3,   /* the soundtrack of reference video `enc_slot`; rides Aencode */
+    RAD_ENC_AUDIO = 4     /* a standalone reference audio; rides Aencode */
+};
 
 /* RadVideoGenBatch::geom_d. The request's latent geometry, then a VDECODE pass's chunk: the latent
  * frames it reads (from latent frame `chunk_lat0`), its latent grid again so that (frames, h, w,

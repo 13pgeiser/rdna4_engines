@@ -5256,7 +5256,50 @@ void conv1d_cases(const Plugin& pl) {
         }
         check(nm + " numerics", down_bf16(dy, want.size()), want, 1e-2);
     }
-    /* An even kernel is causal only. */
+    /* The strided downsample (a DAC encoder block's): kernel 2 stride, pad ceil(stride / 2),
+     * one sequence, rows 8 * stride halved to exactly 8, on the tiled and the direct kernels. */
+    struct D { int64_t cin, cout, s, pad; };
+    for (const D& c : { D{ 16, 32, 2, 1 }, D{ 16, 128, 4, 2 }, D{ 5, 9, 2, 1 },
+                        D{ 6, 3, 5, 3 } }) {
+        const int64_t in = 8 * c.s, k = 2 * c.s, out = 8;
+        const std::vector<int32_t> cu = { 0, (int32_t)in };
+        std::vector<float> x = randv((size_t)(in * c.cin), 1.0f);
+        std::vector<float> w = randv((size_t)(c.cout * c.cin * k), 0.3f);
+        for (auto& v : w) v = bfr(v);
+        std::vector<RadParam> ps = { PI("M", in), PI("cin", c.cin), PI("cout", c.cout),
+                                     PI("k", k), PI("dil", 1), PS("dtype", "bf16"),
+                                     PI("causal", 0), PI("stride", c.s), PI("pad", c.pad) };
+        const std::string nm = fmt("conv1d_bf16 strided cin %lld cout %lld k %lld stride %lld",
+                                   (long long)c.cin, (long long)c.cout, (long long)k,
+                                   (long long)c.s);
+        void* dx = up_bf16(x);
+        void* dw = stored_weight(r, ps, w, c.cout, c.cin * k, nm.c_str());
+        void* dcu = up_i32(cu);
+        void* dy = dalloc((size_t)(out * c.cout) * 2);
+        if (!dw) continue;
+        RadTensor tres = TA(RAD_BF16, { out, c.cout }), tb = TA(RAD_BF16, { c.cout });
+        absent(tres); absent(tb);
+        const int rc = launch(r, { T(dx, RAD_BF16, { in, c.cin }),
+                                   T(dw, RAD_BF16, { c.cout, c.cin, k }), T(dcu, RAD_I32, { 2 }),
+                                   tres, T(dy, RAD_BF16, { out, c.cout }), tb }, ps);
+        if (rc != RAD_OK) { ok(nm.c_str(), false, "rc " + std::to_string(rc)); continue; }
+        std::vector<float> want((size_t)(out * c.cout));
+        for (int64_t m = 0; m < out; ++m)
+            for (int64_t co = 0; co < c.cout; ++co) {
+                float acc = 0.0f;
+                for (int64_t kk = 0; kk < k; ++kk) {
+                    const int64_t ir = m * c.s + kk - c.pad;
+                    if (ir < 0 || ir >= in) continue;
+                    for (int64_t ci = 0; ci < c.cin; ++ci)
+                        acc += w[(size_t)((co * c.cin + ci) * k + kk)] *
+                               x[(size_t)(ir * c.cin + ci)];
+                }
+                want[(size_t)(m * c.cout + co)] = acc;
+            }
+        check(nm + " numerics", down_bf16(dy, want.size()), want, 1e-2);
+    }
+    /* An even kernel is causal only; a stride needs its pad and its one sequence; and the
+     * strided form refuses the f32 rows. */
     std::vector<RadParam> ps = { PI("M", 4), PI("cin", 8), PI("cout", 16), PI("k", 4), PI("dil", 1),
                                  PS("dtype", "bf16") };
     const int rc = launch(r, { TA(RAD_BF16, { 4, 8 }), TA(RAD_BF16, { 16, 8, 4 }),
@@ -5265,6 +5308,30 @@ void conv1d_cases(const Plugin& pl) {
                           ps);
     ok("conv1d_bf16 refuses an even symmetric kernel", rc == RAD_E_SHAPE,
        "rc " + std::to_string(rc));
+    const std::vector<RadParam> nopad = { PI("M", 8), PI("cin", 8), PI("cout", 16), PI("k", 4),
+                                          PI("dil", 1), PS("dtype", "bf16"), PI("stride", 2) };
+    const int rn = launch(r, { TA(RAD_BF16, { 8, 8 }), TA(RAD_BF16, { 16, 8, 4 }),
+                               TI32({ 2 }, { 0, 8 }), TA(RAD_BF16, { 4, 16 }),
+                               TA(RAD_BF16, { 4, 16 }), TA(RAD_BF16, { 16 }) }, nopad);
+    ok("conv1d_bf16 refuses a stride without pad", rn == RAD_E_SHAPE, "rc " + std::to_string(rn));
+    const std::vector<RadParam> two = { PI("M", 8), PI("cin", 8), PI("cout", 16), PI("k", 4),
+                                        PI("dil", 1), PS("dtype", "bf16"), PI("stride", 2),
+                                        PI("pad", 1) };
+    const int rt = launch(r, { TA(RAD_BF16, { 8, 8 }), TA(RAD_BF16, { 16, 8, 4 }),
+                               TI32({ 3 }, { 0, 4, 8 }), TA(RAD_BF16, { 4, 16 }),
+                               TA(RAD_BF16, { 4, 16 }), TA(RAD_BF16, { 16 }) }, two);
+    ok("conv1d_bf16 refuses a stride over two sequences", rt == RAD_E_SHAPE,
+       "rc " + std::to_string(rt));
+    if (const RadKernelInfo* f = find(pl, "conv1d_f32")) {
+        /* Odd k so the refusal comes from the stride, not from the even-kernel rule. */
+        const std::vector<RadParam> f32 = { PI("M", 8), PI("cin", 8), PI("cout", 16), PI("k", 3),
+                                            PI("dil", 1), PS("dtype", "f32"), PI("stride", 2),
+                                            PI("pad", 1) };
+        const int rf = launch(f, { TA(RAD_F32, { 8, 8 }), TA(RAD_F32, { 16, 8, 3 }),
+                                   TI32({ 2 }, { 0, 8 }), TA(RAD_F32, { 4, 16 }),
+                                   TA(RAD_F32, { 4, 16 }), TA(RAD_F32, { 16 }) }, f32);
+        ok("conv1d_f32 refuses a stride", rf == RAD_E_DTYPE, "rc " + std::to_string(rf));
+    }
 }
 
 /* conv_t1d: kernel 2 stride or stride, any padding below stride, an odd stride. */
@@ -5792,13 +5859,14 @@ void rope_llama3_case(const Plugin& pl) {
     ok("rope_bf16 refuses llama3 beside YaRN", rc2 == RAD_E_INVAL, "rc " + std::to_string(rc2));
 }
 
-/* attn_dense causal at head_dim 64 over a fused [rows, 3 * 16 * 64] row (a codec transformer's
- * sliding layers), with a window behind and without, one sequence or two, against libref's mask. */
-void attn_causal_h64_case(const Plugin& pl, int64_t window, std::vector<int32_t> cu) {
-    const char* name = "attn_dense_h64_bf16";
+/* attn_dense causal over a fused [rows, 3 * nh * hd] row (a codec transformer's sliding layers,
+ * an audio encoder's own-heads attention), with a window behind and without, one sequence or
+ * two, against libref's mask. */
+void attn_causal_case(const Plugin& pl, const char* name, int64_t hd, int64_t nh,
+                      int64_t window, std::vector<int32_t> cu) {
     const RadKernelInfo* r = find(pl, name);
     if (!r) { ok(name, false, "row absent"); return; }
-    const int64_t hd = 64, nh = 16, total = cu.back(), wq = nh * hd, width = 3 * wq;
+    const int64_t total = cu.back(), wq = nh * hd, width = 3 * wq;
     std::vector<float> qkv = randv((size_t)(total * width), 1.0f);
     void* d = up_bf16(qkv);
     auto col = [&](int64_t first, int64_t w) {
@@ -6498,18 +6566,32 @@ std::vector<int64_t> conv_rows(const Vol& v, int64_t M, int64_t want) {
     return rows;
 }
 
+/* Floor division for the CausalConv3d output lengths (PyTorch's rule). */
+int64_t idiv_fl(int64_t a, int64_t b) {
+    return a >= 0 ? a / b : -((-a + b - 1) / b);
+}
+
 /* libref's conv3d_ndhwc at output row r: the products (exact in f32) summed in f64, rounded to f32,
  * the bias added in f32 and rounded; with a residual, that plus the residual, rounded. `wt` is the
- * weight tap-major, as the row stores it. */
+ * weight tap-major, as the row stores it. `vo` is the output volume; the classic form is
+ * sp = st = 1 with the symmetric pads (causal = down = refl = 0), `vi` the input volume. */
 void conv3d_row(const std::vector<float>& x, int64_t cin, const std::vector<float>& wt,
-                const std::vector<float>& b, const float* res, const Vol& v, int64_t cout,
-                int64_t r, float* out) {
-    const int64_t HW = v.H * v.W, t = r / HW, y = (r / v.W) % v.H, xx = r % v.W;
+                const std::vector<float>& b, const float* res, const Vol& vi, const Vol& vo,
+                int64_t sp, int64_t st, int64_t causal, int64_t down, int64_t refl,
+                int64_t cout, int64_t r, float* out) {
+    const int64_t OHW = vo.H * vo.W, HW = vi.H * vi.W;
+    const int64_t t = r / OHW, y = (r / vo.W) % vo.H, xx = r % vo.W;
+    const int64_t ft = causal ? 2 : 1, pt = down ? 0 : 1, pl = down ? 0 : 1;
     std::vector<double> acc((size_t)cout, 0.0);
     for (int64_t tap = 0; tap < 27; ++tap) {
-        const int64_t nt = t + tap / 9 - 1, ny = y + (tap / 3) % 3 - 1, nx = xx + tap % 3 - 1;
-        if (nt < 0 || nt >= v.T || ny < 0 || ny >= v.H || nx < 0 || nx >= v.W) continue;
-        const float* xr = &x[(size_t)((nt * HW + ny * v.W + nx) * cin)];
+        const int64_t nt = t * st + tap / 9 - ft;
+        int64_t ny = y * sp + (tap / 3) % 3 - pt, nx = xx * sp + tap % 3 - pl;
+        if (refl) {   /* torch's mirror, no repeated edge, then the bounds */
+            if (ny < 0) ny = -ny; else if (ny >= vi.H) ny = 2 * vi.H - 2 - ny;
+            if (nx < 0) nx = -nx; else if (nx >= vi.W) nx = 2 * vi.W - 2 - nx;
+        }
+        if (nt < 0 || nt >= vi.T || ny < 0 || ny >= vi.H || nx < 0 || nx >= vi.W) continue;
+        const float* xr = &x[(size_t)((nt * HW + ny * vi.W + nx) * cin)];
         for (int64_t o = 0; o < cout; ++o) {
             const float* wr = &wt[(size_t)((o * 27 + tap) * cin)];
             double s = 0.0;
@@ -6531,20 +6613,31 @@ struct ConvCase {
     int res;          /* 0 none, 1 its own operand, 2 the output itself */
     bool bf32;        /* an f32 bias */
     int64_t xpad, ypad, yextra;   /* pitch padding, output rows past the volume */
-    int64_t mshort;   /* the M parameter this short of T H W: the volume's rows are written */
+    int64_t mshort;   /* the M parameter this short of the output rows: those are written */
     int64_t sample;   /* rows checked besides the faces; 0 every row */
+    /* The CausalConv3d forms; the defaults are the stride-1 `same` padding. */
+    int64_t sp = 1, st = 1, causal = 0, down = 0, refl = 0;
 };
 
 void conv3d_case(const RadKernelInfo* r, const ConvCase& c) {
     const Vol& v = c.v;
-    const int64_t vol = v.T * v.H * v.W, M = vol, K = 27 * c.cin;
+    const int64_t ft = c.causal ? 2 : 1, bk = c.causal ? 0 : 1;
+    const int64_t pt = c.down ? 0 : 1, pb = c.down ? 1 : 1, pl = c.down ? 0 : 1, pr = c.down ? 1 : 1;
+    const Vol vo{ idiv_fl(v.T + ft + bk - 3, c.st) + 1, idiv_fl(v.H + pt + pb - 3, c.sp) + 1,
+                  idiv_fl(v.W + pl + pr - 3, c.sp) + 1 };
+    const int64_t vol = v.T * v.H * v.W, M = vo.T * vo.H * vo.W, K = 27 * c.cin;
+    const bool gen = c.sp != 1 || c.st != 1 || c.causal || c.down || c.refl;
     const int64_t ldx = c.cin + c.xpad, ldy = c.cout + c.ypad, yrows = M + c.yextra;
-    const std::string nm = fmt("conv3d_ndhwc_bf16 %s: %lld -> %lld at %lld x %lld, %lld frames%s%s%s",
+    const std::string nm = fmt("conv3d_ndhwc_bf16 %s: %lld -> %lld at %lld x %lld, %lld frames%s%s%s%s",
                                c.what, (long long)c.cin, (long long)c.cout, (long long)v.H,
                                (long long)v.W, (long long)v.T,
                                c.res == 2 ? ", res in place" : c.res ? ", res" : "",
                                c.bf32 ? ", f32 bias" : "",
-                               c.xpad || c.ypad || c.yextra || c.mshort ? ", pitched" : "");
+                               c.xpad || c.ypad || c.yextra || c.mshort ? ", pitched" : "",
+                               gen ? fmt(", stride %lld t %lld%s%s%s", (long long)c.sp,
+                                         (long long)c.st, c.causal ? " causal" : "",
+                                         c.down ? " down" : "", c.refl ? " reflect" : "").c_str()
+                                     : "");
     g_seed = 0xc03dull + (uint64_t)(c.cin * 131 + c.cout * 7 + v.T);
     std::vector<float> x = randv((size_t)(vol * c.cin), 1.0f);
     std::vector<float> w = randv((size_t)(c.cout * K), 1.5f / std::sqrt((float)K));
@@ -6559,6 +6652,9 @@ void conv3d_case(const RadKernelInfo* r, const ConvCase& c) {
                 wt[(size_t)((o * 27 + t) * c.cin + ci)] = w[(size_t)((o * c.cin + ci) * 27 + t)];
     std::vector<RadParam> ps = { PI("M", M - c.mshort), PI("cin", c.cin), PI("cout", c.cout),
                                  PI("k", 3), PI("kt", 3), PS("dtype", "bf16") };
+    if (gen)
+        ps.insert(ps.end(), { PI("stride", c.sp), PI("stride_t", c.st), PI("causal", c.causal),
+                              PS("pad", c.down ? "down" : "same"), PI("reflect", c.refl) });
     void* dw = stored_weight(r, ps, w, c.cout, K, nm.c_str());
     void* dx = up_rows(x, vol, c.cin, ldx, vol);
     std::vector<float> bb = b;
@@ -6583,15 +6679,15 @@ void conv3d_case(const RadKernelInfo* r, const ConvCase& c) {
     const std::vector<uint16_t> yb = down_u16(dy, (size_t)(yrows * ldy));
     std::vector<int64_t> rows;
     if (c.sample) {
-        rows = conv_rows(v, M, c.sample);
+        rows = conv_rows(vo, M, c.sample);
     } else {
         for (int64_t i = 0; i < M; ++i) rows.push_back(i);
     }
     std::vector<float> want(rows.size() * (size_t)c.cout), got(want.size());
     par_for((int64_t)rows.size(), [&](int64_t i) {
         const int64_t rr = rows[(size_t)i];
-        conv3d_row(x, c.cin, wt, b, c.res ? &res[(size_t)(rr * c.cout)] : nullptr, v, c.cout, rr,
-                   &want[(size_t)i * c.cout]);
+        conv3d_row(x, c.cin, wt, b, c.res ? &res[(size_t)(rr * c.cout)] : nullptr, v, vo, c.sp,
+                   c.st, c.causal, c.down, c.refl, c.cout, rr, &want[(size_t)i * c.cout]);
         for (int64_t o = 0; o < c.cout; ++o)
             got[(size_t)i * c.cout + o] = h_bf16(yb[(size_t)(rr * ldy + o)]);
     });
@@ -6624,7 +6720,31 @@ void conv3d_cases(const Plugin& pl) {
     /* A 15 s clip at the target size: 411264 rows, the largest volume the model runs. */
     conv3d_case(r, ConvCase{ "102 frames", Vol{ 102, 84, 48 }, 512, 512, 2, false, 0, 0, 0, 0, 2000 });
 
-    /* Refusals: a 5-wide kernel, a channel count off the 16-byte chunk. */
+    /* The video encoder's CausalConv3d forms: a res block (causal, reflect), the downsample
+     * (per-axis stride 2 with the `down` pad and a reflect), the first conv on a 24-channel
+     * input (the non-C64 K walk), one frame in (the reference's T == 1 truncation is subsumed),
+     * the `down` pad at stride 1, a temporal-only stride and a pitched two-channel-tiles-a-tap
+     * downsample with the residual in place. */
+    for (const ConvCase& c : {
+             ConvCase{ "encoder block", Vol{ 5, 5, 7 }, 64, 64, 1, false, 0, 0, 0, 0, 0,
+                       1, 1, 1, 0, 1 },
+             ConvCase{ "encoder downsample", Vol{ 4, 6, 6 }, 64, 32, 0, false, 0, 0, 0, 0, 0,
+                       2, 2, 1, 1, 1 },
+             ConvCase{ "encoder conv_in", Vol{ 3, 4, 5 }, 24, 64, 0, false, 0, 0, 0, 0, 0,
+                       1, 1, 1, 0, 1 },
+             ConvCase{ "one frame causal", Vol{ 1, 3, 3 }, 16, 16, 0, false, 0, 0, 0, 0, 0,
+                       1, 1, 1, 0, 1 },
+             ConvCase{ "down no stride", Vol{ 2, 4, 4 }, 8, 8, 0, false, 0, 0, 0, 0, 0,
+                       1, 1, 0, 1, 1 },
+             ConvCase{ "temporal stride", Vol{ 6, 3, 4 }, 16, 24, 0, true, 0, 0, 0, 0, 0,
+                       1, 2, 1, 0, 1 },
+             ConvCase{ "down pitched two tiles", Vol{ 3, 5, 5 }, 128, 136, 2, false, 8, 8, 4, 0, 0,
+                       2, 1, 1, 1, 1 },
+         })
+        conv3d_case(r, c);
+
+    /* Refusals: a 5-wide kernel, a channel count off the 16-byte chunk, a zero stride, a causal
+     * that is neither 0 nor 1 and a pad that is neither `same` nor `down`. */
     ok("conv3d_ndhwc_bf16 refuses k 5",
        launch(r, { TA(RAD_BF16, { 8, 8 }), TA(RAD_BF16, { 8, 1000 }), TA(RAD_BF16, { 8 }),
                    TI32({ 3 }, { 2, 2, 2 }), TA(RAD_BF16, { 8, 8 }), TA(RAD_BF16, { 8, 8 }) },
@@ -6635,6 +6755,18 @@ void conv3d_cases(const Plugin& pl) {
                    TI32({ 3 }, { 2, 2, 2 }), TA(RAD_BF16, { 8, 8 }), TA(RAD_BF16, { 8, 8 }) },
               { PI("M", 8), PI("cin", 12), PI("cout", 8), PI("k", 3), PI("kt", 3),
                 PS("dtype", "bf16") }) == RAD_E_SHAPE);
+    for (const auto& bad : { std::pair<const char*, RadParam>{ "stride 0", PI("stride", 0) },
+                             { "stride_t -1", PI("stride_t", -1) },
+                             { "causal 2", PI("causal", 2) }, { "reflect 3", PI("reflect", 3) },
+                             { "pad mirror", PS("pad", "mirror") } }) {
+        std::vector<RadParam> ps = { PI("M", 8), PI("cin", 8), PI("cout", 8), PI("k", 3),
+                                     PI("kt", 3), PS("dtype", "bf16"), bad.second };
+        ok((std::string("conv3d_ndhwc_bf16 refuses ") + bad.first).c_str(),
+           launch(r, { TA(RAD_BF16, { 8, 8 }), TA(RAD_BF16, { 8, 216 }), TA(RAD_BF16, { 8 }),
+                       TI32({ 3 }, { 2, 2, 2 }), TA(RAD_BF16, { 8, 8 }), TA(RAD_BF16, { 8, 8 }) },
+                  ps) == RAD_E_SHAPE,
+           "launched");
+    }
 }
 
 /* ------------------------------------------------------------------ group_norm */
@@ -6697,6 +6829,12 @@ void group_norm_cases(const Plugin& pl) {
              G{ "f32 in, bf16 out", 101, 512, 32, true, false, false, 0, false, false, -3.0f, 16 },
              G{ "one row", 1, 512, 32, false, false, false, 1, true, false, 0.0f, 0 },
              G{ "64 channels", 1000, 64, 8, false, true, false, 0, true, false, 0.0f, 8 },
+             /* Four channels a group (the video encoder's first level, 128 in 32): four-channel
+              * chunks. Pitched bf16 with SiLU; then f32 output, f32 gain and bias and a bf16
+              * modulation, so every narrow vector load runs. */
+             G{ "128 in 32 groups", 130, 128, 32, false, false, false, 0, true, false, 0.0f, 8 },
+             G{ "64 in 16 groups, modulated", 41, 64, 16, false, true, true, 1, false, false,
+                0.0f, 0 },
          }) {
         const int64_t M = g.M, n = g.n, ld = n + g.pad, rows = M + 2;
         const std::string nm = fmt("group_norm %s: %lld x %lld in %lld groups", g.what,
@@ -7430,6 +7568,28 @@ void timestep_f32_case(const Plugin& pl) {
             want[(size_t)(m * n + h + i)] = (float)std::sin((double)arg);
         }
     check_f32("timestep_embed_f32 numerics", down_f32(dy, want.size()), want, 1e-6);
+
+    /* clamp_min raises every below-floor timestep to the floor before embedding -- the device
+     * mirror of the ref pins. Rows whose t already sits at or above the floor are untouched. */
+    void* dy2 = dalloc((size_t)(M * n) * 4);
+    const float floor_t = 0.9f;
+    const int rc2 = launch(r, { T(dt, RAD_F32, { M }), T(dy2, RAD_F32, { M, n }) },
+                           { PI("M", M), PI("n", n), PF("scale", 1.0), PF("max_period", 10000.0),
+                             PF("clamp_min", floor_t), PS("dtype", "f32") });
+    if (rc2 != RAD_OK) { ok("timestep_embed_f32 clamp_min", false, "rc " + std::to_string(rc2)); }
+    else {
+        std::vector<float> want2((size_t)(M * n));
+        for (int64_t m = 0; m < M; ++m) {
+            const float tv = t[(size_t)m] > floor_t ? t[(size_t)m] : floor_t;
+            for (int64_t i = 0; i < h; ++i) {
+                const float f = (float)std::exp((double)(coef * (float)i / (float)h));
+                const float arg = tv * f;
+                want2[(size_t)(m * n + i)] = (float)std::cos((double)arg);
+                want2[(size_t)(m * n + h + i)] = (float)std::sin((double)arg);
+            }
+        }
+        check_f32("timestep_embed_f32 clamp_min numerics", down_f32(dy2, want2.size()), want2, 1e-6);
+    }
 }
 
 void randn_f32_case(const Plugin& pl) {
@@ -17836,6 +17996,24 @@ static void device_phase(const Plugin& pl) {
             run_case(r, ts, ps);
         }
     }
+    if (sel("pool_cols_bf16")) {
+        const RadKernelInfo* r = find(pl, "pool_cols_bf16");
+        if (!r) ok("pool_cols_bf16", false, "row absent");
+        else {
+            /* The audio encoder posterior head's two column poolings: 2048 -> 256 and 256 -> 32,
+             * eight a group, the second carrying a multiplier. */
+            std::vector<RadTensor> ts = { T(nullptr, RAD_BF16, { 17, 2048 }),
+                                          T(nullptr, RAD_BF16, { 17, 256 }) };
+            std::vector<RadParam> ps = { PI("M", 17), PI("n", 2048), PI("k", 8),
+                                         PS("dtype", "bf16") };
+            run_case(r, ts, ps);
+            std::vector<RadTensor> ts2 = { T(nullptr, RAD_BF16, { 137, 256 }),
+                                           T(nullptr, RAD_BF16, { 137, 32 }) };
+            std::vector<RadParam> ps2 = { PI("M", 137), PI("n", 256), PI("k", 8),
+                                          PF("mult", 0.125), PS("dtype", "bf16") };
+            run_case(r, ts2, ps2);
+        }
+    }
     /* --- the audio tower's ops, numerically: each kernel against the formula libref implements,
      * computed on the host from the same bf16 inputs (rad-kbench's replay fixture predates these
      * ops). Relative L2 against a bf16 rounding of the answer. */
@@ -19242,10 +19420,15 @@ static void device_phase(const Plugin& pl) {
     if (sel("mul_weight_bf16")) au::mul_weight_f32_case(pl);
     if (sel("qk_norm_rope_bf16")) au::qk_norm_rope_f32_gain_case(pl);
     if (sel("attn_dense_h64_bf16")) {
-        au::attn_causal_h64_case(pl, 72, { 0, 89 });
-        au::attn_causal_h64_case(pl, 0, { 0, 89 });
-        au::attn_causal_h64_case(pl, 72, { 0, 13, 89 });
-        au::attn_causal_h64_case(pl, 9, { 0, 40, 200 });
+        au::attn_causal_case(pl, "attn_dense_h64_bf16", 64, 16, 72, { 0, 89 });
+        au::attn_causal_case(pl, "attn_dense_h64_bf16", 64, 16, 0, { 0, 89 });
+        au::attn_causal_case(pl, "attn_dense_h64_bf16", 64, 16, 72, { 0, 13, 89 });
+        au::attn_causal_case(pl, "attn_dense_h64_bf16", 64, 16, 9, { 0, 40, 200 });
+    }
+    if (sel("attn_dense_h256_bf16")) {
+        au::attn_causal_case(pl, "attn_dense_h256_bf16", 256, 8, 72, { 0, 137 });
+        au::attn_causal_case(pl, "attn_dense_h256_bf16", 256, 8, 0, { 0, 137 });
+        au::attn_causal_case(pl, "attn_dense_h256_bf16", 256, 8, 9, { 0, 40, 200 });
     }
     if (sel("conv1d_dw_bf16")) au::conv1d_dw_bias_cases(pl);
     if (sel("attn_dense_h256_gqa4_bf16")) {

@@ -156,6 +156,26 @@ void resize_lanczos_rgba(const FrameRGBA& src, int32_t w, int32_t h, FrameRGBA* 
     }
 }
 
+void resize_lanczos_rgb(const Frame& src, int32_t w, int32_t h, Frame* out) {
+    /* Wrapping opaque and running the RGBA kernel is exactly PIL's LANCZOS on the RGB image: at
+     * alpha 255 the premultiply is the identity and the divide-back takes the al == 255 branch. */
+    FrameRGBA pre;
+    pre.w = src.w;
+    pre.h = src.h;
+    pre.rgba.resize((size_t)src.w * src.h * 4);
+    for (size_t i = 0; i < (size_t)src.w * src.h; ++i) {
+        for (int c = 0; c < 3; ++c) pre.rgba[i * 4 + c] = src.rgb[i * 3 + c];
+        pre.rgba[i * 4 + 3] = 255;
+    }
+    FrameRGBA post;
+    resize_lanczos_rgba(pre, w, h, &post);
+    out->w = post.w;
+    out->h = post.h;
+    out->rgb.resize((size_t)post.w * post.h * 3);
+    for (size_t i = 0; i < (size_t)post.w * post.h; ++i)
+        for (int c = 0; c < 3; ++c) out->rgb[i * 3 + c] = post.rgba[i * 4 + c];
+}
+
 void composite_white(const FrameRGBA& src, Frame* out) {
     out->w = src.w;
     out->h = src.h;

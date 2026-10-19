@@ -55,7 +55,7 @@ __device__ __forceinline__ uint64_t seed_of(const uint32_t* seed, int e) {
 
 // ---------------------------------------------------------------------------- conv1d
 // An implicit GEMM, r4d_gen.hip's conv_igemm_kernel cut to one dimension: y[row][cout] = sum
-// over (tap, cin) of x[row + tap * dil - pad][cin] * w[cout][tap][cin], the weight stored
+// over (tap, cin) of x[row * stride + tap * dil - pad][cin] * w[cout][tap][cin], the weight stored
 // tap-major (r4d_layout.cpp relayouts PyTorch's [cout][cin][k] at load), so a 64-wide K tile is
 // eight 16-byte reads of input rows. A chunk outside its row's sequence reads zeros, which is the
 // per-sequence padding. Eight waves, BP rows x BC output channels a block, the next K tile's
@@ -71,12 +71,14 @@ __device__ __forceinline__ float conv_act(float v, int act) {
     return v;
 }
 
+/* `st` is the stride: row * st + tap * dil - pad is the input row, the sequence bounds zeroing
+ * outside keeps the stride 1 and (single-sequence) stride > 1 forms the same gather. */
 template <int TP, int TC>
 __global__ __launch_bounds__(256) void conv1d_igemm_kernel(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
     const uint16_t* __restrict__ bias, const uint16_t* __restrict__ res,
     const int* __restrict__ cu, uint16_t* __restrict__ y, int n_seq, int r_beg, int r_end,
-    int cin, int cout, int k, int dil, int pad, int x_ld, int y_ld, int res_ld, int act) {
+    int cin, int cout, int k, int dil, int pad, int st, int x_ld, int y_ld, int res_ld, int act) {
     constexpr int BP = 2 * TP * 16, BC = 4 * TC * 16;
     constexpr int CPR = C1_BK / 8;
     constexpr int AL = BP * CPR / 256, WL = BC * CPR / 256;
@@ -121,7 +123,7 @@ __global__ __launch_bounds__(256) void conv1d_igemm_kernel(
     const r4d_u32x4 zero = {0u, 0u, 0u, 0u};
     auto loadA = [&](int i) -> r4d_u32x4 {
         if (!a_ok[i] || a_t[i] >= k) return zero;
-        const int ir = a_row[i] + a_t[i] * dil - pad;
+        const int ir = a_row[i] * st + a_t[i] * dil - pad;
         if (ir < a_s0[i] || ir >= a_s1[i]) return zero;
         return *(const r4d_u32x4*)(x + (size_t)ir * x_ld + a_ci[i]);
     };
@@ -213,7 +215,7 @@ __global__ __launch_bounds__(kT) void conv1d_direct_kernel(
     const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
     const uint16_t* __restrict__ bias, const uint16_t* __restrict__ res,
     const int* __restrict__ cu, uint16_t* __restrict__ y, int n_seq, int r_beg, int r_end,
-    int cin, int cout, int k, int dil, int pad, int x_ld, int y_ld, int res_ld, int act) {
+    int cin, int cout, int k, int dil, int pad, int st, int x_ld, int y_ld, int res_ld, int act) {
     const int64_t t = (int64_t)blockIdx.x * kT + threadIdx.x;
     const int64_t total = (int64_t)(r_end - r_beg) * cout;
     if (t >= total) return;
@@ -223,7 +225,7 @@ __global__ __launch_bounds__(kT) void conv1d_direct_kernel(
     const int s0 = cu[sq], s1 = cu[sq + 1];
     float acc = 0.0f;
     for (int kk = 0; kk < k; ++kk) {
-        const int ir = row + kk * dil - pad;
+        const int ir = row * st + kk * dil - pad;
         if (ir < s0 || ir >= s1) continue;
         const uint16_t* xp = x + (size_t)ir * x_ld;
         const uint16_t* wp = w + ((size_t)co * k + kk) * cin;
@@ -1061,10 +1063,15 @@ extern "C" int r4d_rad_conv1d(const RadArgs* a, RadStream s) {
     const long long cin = r4d_geti_or(a, "cin", 0), cout = r4d_geti_or(a, "cout", 0);
     const long long k = r4d_geti_or(a, "k", 0), dil = r4d_geti_or(a, "dil", 1);
     const long long causal = r4d_geti_or(a, "causal", 0);
+    /* The strided form: `stride` > 1 with `pad` explicit, any k, a single sequence covering all of
+     * x (the encoder's downsample, k = 2 stride and pad ceil(stride / 2)). `pad` means nothing
+     * without a stride, and the causal form keeps its own left-only padding. */
+    const long long st = r4d_geti_or(a, "stride", 1), pp = r4d_geti_or(a, "pad", -1);
     const int act = conv1d_act(r4d_gets(a, "act"));
     if (act < 0) return R4D_NO(RAD_E_INVAL);
-    if (cin <= 0 || cout <= 0 || k <= 0 || (!causal && (k & 1) == 0) || dil <= 0 || causal < 0 ||
-        causal > 1)
+    if (cin <= 0 || cout <= 0 || k <= 0 || (!causal && st <= 1 && (k & 1) == 0) || dil <= 0 ||
+        causal < 0 || causal > 1 || st < 1 || (st > 1 && (causal || pp < 0)) ||
+        (st <= 1 && pp >= 0))
         return R4D_NO(RAD_E_SHAPE);
     long long rx = 0, ry = 0, rr = 0;
     const long long xl = r4d_rows_pitch(x, cin, &rx), yl = r4d_rows_pitch(y, cout, &ry);
@@ -1074,10 +1081,20 @@ extern "C" int r4d_rad_conv1d(const RadArgs* a, RadStream s) {
     if (n_seq <= 0 || ry <= 0 || rx < ry || (res && rr < ry) || r4d_numel(w) < cout * cin * k ||
         (b && r4d_numel(b) < cout))
         return R4D_NO(RAD_E_SHAPE);
+    /* The strided output length is PyTorch's, exactly (rx and ry are the row counts; xl and yl
+     * are the pitches): a graph that wants a truncated floor drops the last output row itself.
+     * One sequence, and cu_seqlens covers every input row (libref, which reads cu, checks its
+     * ends; the zeroing gather below makes those ends the whole padding, so the length rule is
+     * the part checkable here). */
+    if (st > 1) {
+        if (n_seq != 1 || rx + 2 * pp < dil * (k - 1) + 1 ||
+            ry != (rx + 2 * pp - dil * (k - 1) - 1) / st + 1)
+            return R4D_NO(RAD_E_SHAPE);
+    }
     const uint16_t* bp = b ? (const uint16_t*)b->data : nullptr;
-    /* Both kernels read input row row + tap * dil - pad: half the reach a side, or all of it on
-     * the left for the causal form. */
-    const int pad = (int)(causal ? dil * (k - 1) : dil * (k - 1) / 2);
+    /* Both kernels read input row row * stride + tap * dil - pad: half the reach a side, all of
+     * it on the left for the causal form, or the explicit `pad` around the strided gather. */
+    const int pad = (int)(pp >= 0 ? pp : (causal ? dil * (k - 1) : dil * (k - 1) / 2));
     const bool tiled = (cin % 8) == 0 && cout >= 16 && (xl % 8) == 0 &&
                        ((uintptr_t)x->data & 15) == 0 && ((uintptr_t)w->data & 15) == 0;
     const uint16_t* rp = res ? (const uint16_t*)res->data : nullptr;
@@ -1090,8 +1107,8 @@ extern "C" int r4d_rad_conv1d(const RadArgs* a, RadStream s) {
                                dim3(256), 0, (hipStream_t)s, (const uint16_t*)x->data,
                                (const uint16_t*)w->data, bp, rp,
                                (const int*)cu->data, (uint16_t*)y->data, (int)n_seq, 0, (int)ry,
-                               (int)cin, (int)cout, (int)k, (int)dil, pad, (int)xl, (int)yl,
-                               (int)rl, act);
+                               (int)cin, (int)cout, (int)k, (int)dil, pad, (int)st, (int)xl,
+                               (int)yl, (int)rl, act);
         } else {
             constexpr int TP = 4, TC = 1, BP = 128, BC = 64;
             hipLaunchKernelGGL((conv1d_igemm_kernel<TP, TC>),
@@ -1099,15 +1116,15 @@ extern "C" int r4d_rad_conv1d(const RadArgs* a, RadStream s) {
                                dim3(256), 0, (hipStream_t)s, (const uint16_t*)x->data,
                                (const uint16_t*)w->data, bp, rp,
                                (const int*)cu->data, (uint16_t*)y->data, (int)n_seq, 0, (int)ry,
-                               (int)cin, (int)cout, (int)k, (int)dil, pad, (int)xl, (int)yl,
-                               (int)rl, act);
+                               (int)cin, (int)cout, (int)k, (int)dil, pad, (int)st, (int)xl,
+                               (int)yl, (int)rl, act);
         }
     } else {
         hipLaunchKernelGGL(conv1d_direct_kernel, dim3(blocks_for(ry * cout)), dim3(kT), 0,
                            (hipStream_t)s, (const uint16_t*)x->data, (const uint16_t*)w->data,
                            bp, rp, (const int*)cu->data, (uint16_t*)y->data,
                            (int)n_seq, 0, (int)ry, (int)cin, (int)cout, (int)k, (int)dil, pad,
-                           (int)xl, (int)yl, (int)rl, act);
+                           (int)st, (int)xl, (int)yl, (int)rl, act);
     }
     return st_of(hipGetLastError());
 }
@@ -1174,6 +1191,11 @@ extern "C" int r4d_rad_conv1d_f32(const RadArgs* a, RadStream s) {
     const long long causal = r4d_geti_or(a, "causal", 0);
     const int act = conv1d_act(r4d_gets(a, "act"));
     if (act < 0) return R4D_NO(RAD_E_INVAL);
+    /* The strided form lives on the bf16 rows (the DAC encoder it serves runs there); the f32
+     * vocoder is stride 1 with the derived padding, so a stride or an explicit pad is refused
+     * as a dtype choice rather than silently ignored. */
+    if (r4d_geti_or(a, "stride", 1) != 1 || r4d_geti_or(a, "pad", -1) >= 0)
+        return R4D_NO(RAD_E_DTYPE);
     if (cin <= 0 || cout <= 0 || k <= 0 || (!causal && (k & 1) == 0) || dil <= 0 || causal < 0 ||
         causal > 1)
         return R4D_NO(RAD_E_SHAPE);

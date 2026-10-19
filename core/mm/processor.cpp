@@ -1,5 +1,6 @@
 /* processor.cpp -- see processor.h. */
 #include "mm/processor.h"
+#include "mm/imaging.h"
 
 #include "rad_internal.h"
 #include "rad_plugin.h"
@@ -1006,6 +1007,40 @@ int Processor::image(const uint8_t* bytes, size_t n, int32_t image_tokens,
     return image_from(f, out, why);
 }
 
+int Processor::encoder_image(const uint8_t* bytes, size_t n, int32_t ratio, int32_t max_side,
+                             Frame* out, std::string* why) const {
+    if (ratio < 1 || max_side < ratio) {
+        if (why) *why = "the encoder's side ratio and maximum are not usable";
+        return RAD_E_INVAL;
+    }
+    /* The same decode guard as image(): a reference the text encoder accepts must reach the VAE
+     * too, so the two never disagree on what a request may carry. */
+    Frame f;
+    RAD_TRY(decode_image(bytes, n, cfg_.max_source_pixels, &f, why));
+    /* Snap both sides down to a multiple of the encoder's ratio, neither above max_side, aspect
+     * kept as close as the grid allows: scale the longest side to fit, then floor each side to the
+     * grid. Flooring (never rounding up) is what keeps a side within max_side; a side under one
+     * grid step is raised to it, the smallest volume the encoder accepts. Our encoder runs one
+     * volume rather than tiling at 256, so a reference larger than the bound is shrunk here — the
+     * one place the reference and this build differ on an oversized input. */
+    auto snap = [&](int64_t s) {
+        int64_t v = (s / ratio) * ratio;
+        if (v < ratio) v = ratio;
+        if (v > max_side) v = max_side;   /* max_side is itself a multiple of ratio */
+        return (int32_t)v;
+    };
+    const int32_t longest = std::max(f.w, f.h);
+    const double  scale = longest > max_side ? (double)max_side / (double)longest : 1.0;
+    const int32_t w = snap((int64_t)std::floor(f.w * scale));
+    const int32_t h = snap((int64_t)std::floor(f.h * scale));
+    if (w == f.w && h == f.h) {
+        *out = std::move(f);
+        return RAD_OK;
+    }
+    resize_lanczos_rgb(f, w, h, out);
+    return RAD_OK;
+}
+
 namespace {
 struct SampleArgs { double fps; int32_t lo, hi; bool gemma4; };
 std::vector<int64_t> sample_cb(const VideoInfo& info, const void* user) {
@@ -1526,37 +1561,6 @@ int Processor::audio(const uint8_t* bytes, size_t n, std::shared_ptr<Item>* out,
     const bool whole = acfg_.family == AudioFamily::Qwen3ASR;
     RAD_TRY(decode_audio(bytes, n, acfg_.rate, acfg_.max_samples + (whole ? 1 : 0), &s, why));
     return audio_from(s, out, why);
-}
-
-/* ================================================================== rotary layout */
-
-void PromptMedia::layout() {
-    rope.runs.clear();
-    int64_t pos = 0, tok = 0;
-    for (size_t pi = 0; pi < items.size(); ++pi) {
-        const Placed& p = items[pi];
-        const Item& it = *p.item;
-        const int32_t m = it.rows_h > 0 ? it.grid_h / it.rows_h : 1;
-        for (int32_t s = 0; s < it.n_seg; ++s) {
-            const int64_t run_tok = (int64_t)p.tok + it.seg_at[(size_t)s];
-            pos += run_tok - tok;            /* the text in front of the run counts up */
-            const int32_t rh = it.segments.empty() ? it.rows_h : it.seg_h(s) / m;
-            const int32_t rw = it.segments.empty() ? it.rows_w : it.seg_w(s) / m;
-            RopeLayout::Run r;
-            r.tok = (int32_t)run_tok;
-            r.n = (int32_t)(it.row_at(s + 1) - it.row_at(s));
-            r.w = rw;
-            r.base = (int32_t)pos;
-            r.flat = it.rope_1d;
-            /* A grid advances the rotary by its longer side; a 1-D run by its length. */
-            pos += it.rope_1d ? r.n : std::max(rh, rw);
-            tok = run_tok + r.n;
-            r.shift = (int32_t)(pos - tok);
-            r.item = (int32_t)pi;
-            r.row0 = (int32_t)it.row_at(s);
-            rope.runs.push_back(r);
-        }
-    }
 }
 
 }  /* namespace mm */
