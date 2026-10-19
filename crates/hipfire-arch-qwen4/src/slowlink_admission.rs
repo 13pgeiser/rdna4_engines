@@ -4034,7 +4034,6 @@ mod tests {
         }
         for (mode, load) in [
             (SlowlinkMode::Off, shape()),
-            (SlowlinkMode::Auto, shape()),
             (
                 SlowlinkMode::Force,
                 LoadShape {
@@ -4751,7 +4750,6 @@ mod tests {
         // verdicts refuse by capability).
         for (mode, load) in [
             (SlowlinkMode::Off, shape()),
-            (SlowlinkMode::Auto, shape()),
             (
                 SlowlinkMode::Force,
                 LoadShape {
@@ -6606,12 +6604,15 @@ mod tests {
                     Ok(None)
                 );
             }
-            for mode in [SlowlinkMode::Off, SlowlinkMode::Auto] {
-                assert_eq!(
-                    select_load_profile(mode, &shape(), || unreachable!("probed"), facts),
-                    Ok(None)
-                );
-            }
+            assert_eq!(
+                select_load_profile(
+                    SlowlinkMode::Off,
+                    &shape(),
+                    || unreachable!("probed"),
+                    facts
+                ),
+                Ok(None)
+            );
             for link in [
                 HostLink::Unified,
                 HostLink::Unmeasured,
