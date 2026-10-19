@@ -1,9 +1,10 @@
 # Structural guard: make `cargo fmt` fail loudly instead of reformatting the
 # whole workspace.
 #
-# WHY: the repo carries historical rustfmt debt, so CI only checks CHANGED
-# files (scripts/ci-rustfmt-changed.sh). A bare `cargo fmt` rewrites every file
-# in the workspace, burying the real change under a 200+ file diff. This alias
+# WHY: master (until the 0.4.3 release merge) and branches cut before the 0.4.3
+# sweep carry historical rustfmt debt; there a bare `cargo fmt` rewrites 1000+
+# files, burying the real change. (beta is clean since the sweep, and its land
+# gate runs `cargo-fmt --all -- --check` directly.) This alias
 # shadows the external `cargo-fmt` subcommand so the mistake is impossible
 # rather than merely discouraged — it covers humans, IDEs, and non-Claude
 # agents, none of which read CLAUDE.md.

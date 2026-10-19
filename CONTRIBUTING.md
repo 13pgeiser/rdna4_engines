@@ -289,8 +289,12 @@ which gates passed. One logical change per PR; the PR template
 ([`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md))
 lists the evidence each surface owes. Format only the files you changed
 with `scripts/fmt-changed.sh <master|beta>` (base ref = the branch you
-cut from); bare `cargo fmt` is blocked on purpose. CI's rustfmt and
-clippy jobs are advisory; the pre-commit hook still checks rustfmt on
+cut from); bare `cargo fmt` is blocked on purpose. `beta` is rustfmt-clean
+since the 0.4.3 sweep and `scripts/pre-commit-ci.sh` checks the whole
+workspace, so formatting your files is all it takes; a branch cut before
+the sweep replays onto it with `scripts/fmt-sweep-rebase.sh <sweep-sha>`
+(then rebase onto `beta` as usual). CI's rustfmt
+and clippy jobs are advisory; the pre-commit hook still checks rustfmt on
 staged files.
 
 For perf claims: include the binary md5

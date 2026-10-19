@@ -64,6 +64,7 @@ python3 -m unittest discover -s scripts/jev_eval -p 'test_*.py'
 python3 scripts/test_install_revision.py
 python3 scripts/test_uninstall.py
 bash scripts/test-gpu-lock.sh
+bash scripts/test-fmt-sweep-rebase.sh
 
 echo "== Env/docs drift check =="
 python3 scripts/check-env-docs.py
