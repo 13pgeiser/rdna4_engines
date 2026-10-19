@@ -1754,18 +1754,21 @@ function update(s, dt) {
     det = "best " + floorMs.toFixed(2) + "ms";
     if (engRecentMs > 0) det += " · recent " + engRecentMs.toFixed(2) + "ms";
   }
-  /* THE STEP AS A PERCENTAGE OF THE FASTEST THIS PROCESS HAS DONE AT THIS CONCURRENCY: 100% is the fastest step, anything slower a percentage of it. Keyed by
+  /* THE STEP AS A PERCENTAGE OF THE FASTEST THIS PROCESS HAS DONE AT THIS CONCURRENCY: ~99% is the fastest the lane has done, anything slower a percentage of it. Keyed by
  * concurrency on purpose: a c8 step read against the single-stream floor would report the batch
  * arriving as a slowdown -- the mistake that took the old drift line out. Raw ratio, no
- * threshold, no colour: the number is the statement. Capped at 100: `now` is a ~500 ms poll mean while
+ * threshold, no colour: the number is the statement. Capped at ~99 (shown with a tilde): `now` is a ~500 ms poll mean while
  * `best` is a 32-step window mean, so a fast stretch shorter than a window can read faster than the
  * recorded floor. That is "at your best", not a new record -- the engine only ratchets the floor on a
- * completed 32-step window, and a sub-window blip is not one. */
+ * completed 32-step window, and a sub-window blip is not one. The cap is 99, not 100: a 500 ms window that briefly beats the
+ * floor is not a sustained record, and 100% would claim a floor the window cannot confirm -- it
+ * would read as a bug. ~99% says "at your best" without overclaiming. */
   if (s.running > 0 && lastStepMs != null) {
     const k = s.running;
     if (!(k in bestAt) || lastStepMs < bestAt[k]) bestAt[k] = lastStepMs;
     const ref = k === 1 && floorMs > 0 ? floorMs : bestAt[k];
-    if (ref > 0) det += " · now " + Math.min(100, Math.round(100 * ref / lastStepMs)) + "% of best" + (k === 1 ? "" : "@c" + k);
+    const shown = ref > 0 ? Math.min(99, Math.round(100 * ref / lastStepMs)) : 0;
+    if (ref > 0) det += " · now " + (shown === 99 ? "~99" : shown) + "% of best" + (k === 1 ? "" : "@c" + k);
   }
   $("m-stepdet").textContent = det;
 

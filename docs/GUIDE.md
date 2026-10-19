@@ -2459,13 +2459,15 @@ averaged. A single slow step moves neither figure.
 
 The percentage, `now X% of best`, is the page's own live window read against the
 floor. `now` is the mean of the steps that completed in the last poll (~500 ms);
-the figure is that mean as a fraction of `best`, so 100% is the fastest the lane
+the figure is that mean as a fraction of `best`, so ~99% is the fastest the lane
 has done and anything slower reads a percentage of it (a step at 80% of the
-floor's speed reads "80% of best"). It is capped at 100: `now` is a ~500 ms mean
+floor's speed reads "80% of best"). It is capped at ~99, shown with a tilde: `now` is a ~500 ms mean
 while `best` is a 32-step window mean, so a fast stretch shorter than a window can
 read faster than the recorded floor. That is "at your best", not a new record —
 the engine only lowers `best` on a completed 32-step window, and a sub-window blip
-is not one. At higher concurrency the figure is keyed to that concurrency (`@c8`)
+is not one. The cap is 99 rather than 100 because a 500 ms window that briefly beats the floor is
+not a sustained record; 100% would claim a floor the window cannot confirm and would read as a
+bug, while ~99% says "at your best" without overclaiming. At higher concurrency the figure is keyed to that concurrency (`@c8`)
 and read against the fastest step seen at that concurrency, because a batched step
 is a different measurement and would report a batch arriving as a slowdown.
 
