@@ -25,6 +25,7 @@ docker/build.sh -s gpu-host            # stream the commit over ssh; gpu-host bu
 docker/build.sh -j 8                   # cap compile jobs (a device kernel takes 2-3 GB under hipcc)
 docker/build.sh -J 4                   # tests at a time (default: the compile jobs)
 docker/build.sh -B 5                   # every test's CPU budget times 5, for a host slower per thread
+docker/build.sh -E tokenizer_perf_test # leave tests matching a regex out of the test stage
 docker/build.sh -t 'gfx1200;gfx1201'   # GPU architectures to compile kernels for (default gfx1201)
 docker/build.sh -r <commit>            # any other commit
 docker/build.sh --target build         # stop at a stage, tagged radiance-<stage>

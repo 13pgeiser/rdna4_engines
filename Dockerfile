@@ -208,6 +208,10 @@ ARG TEST_JOBS=
 # slower per thread than the one the budgets were set on: a VM on an EPYC 7302 spends 4.6x the
 # quoted CPU time on tokenizer_test's reference pass.
 ARG TEST_CPU_BUDGET_SCALE=
+# A ctest -E regex of entries to leave out, for a host where a timing assertion does not hold:
+# tokenizer_perf_test's one-word ratio reads 10-12 against its 9 on a Zen 2 VM with 512 KiB of L2,
+# where the sandbox leaves it CPU time rather than instructions to count.
+ARG TEST_EXCLUDE=
 # Host-only: a build container has no /dev/kfd. The `gpu`-labelled tests (the *_card entries,
 # r4d_selftest, kbench) run against a card from this stage:
 #   docker buildx build --target build -t radiance-build . && docker run --rm \
@@ -223,7 +227,8 @@ ARG TEST_CPU_BUDGET_SCALE=
 RUN echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true; \
     bash /src/docker/llvm-check.sh /build \
  && RAD_TEST_CPU_BUDGET_SCALE="${TEST_CPU_BUDGET_SCALE}" \
-    ctest --test-dir /build -LE 'gpu|oot' -j"${TEST_JOBS:-${JOBS:-$(( ($(nproc) + 1) / 2 ))}}" --output-on-failure \
+    ctest --test-dir /build -LE 'gpu|oot' ${TEST_EXCLUDE:+-E "${TEST_EXCLUDE}"} \
+      -j"${TEST_JOBS:-${JOBS:-$(( ($(nproc) + 1) / 2 ))}}" --output-on-failure \
  && touch /build/host-tests-passed
 
 # ----------------------------------------------------------------------------------------- rootfs
