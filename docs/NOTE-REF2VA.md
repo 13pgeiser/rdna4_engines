@@ -75,6 +75,39 @@ ninth photos change behavior, by being allowed.
 In short: **for photos the modulation table is no longer the limit.** Nine photos are four groups no
 matter how many there are.
 
+## Throughput (self-contained — no reference needed)
+
+Wall-clock per job on this dual-gfx1201 / TP2 box, measured as the server's own `completed_at −
+created_at` on an **empty queue** (so the figure is the job, not a queue wait). Fixed seed; 25 steps
+unless noted. The plain rows are unconditioned; the "full shape" rows are the complete DaSiWa request
+— four `ref_image_N` + a `ref_video_1` + its `ref_video_audio_1` + a standalone `ref_audio_1`.
+
+| shape | steps | wall |
+|---|---|---|
+| plain 256×256, 3 s | 25 | 11 s |
+| plain 256×256, 3 s | 50 | 21 s |
+| plain 512×512, 3 s | 25 | 38 s |
+| plain 256×256, 6 s | 25 | 23 s |
+| full-shape ref2va 256×256, 3 s | 25 | 93 s |
+| full-shape ref2va 512×512, 3 s | 25 | 121 s |
+
+What they show, and what they deliberately do not:
+
+- **Steps scale ~linearly** — 25 → 50 doubles the wall (11 s → 21 s), as a per-step DiT should.
+- **Pixels scale sub-linearly** — 4× the pixels (256² → 512²) costs ~3.5×, not 4×.
+- **Duration scales ~linearly** — 3 s → 6 s roughly doubles the target rows and the wall.
+- **Conditioning is the dominant cost, and it is the *sequence length*, not the encoders.** The full
+  reference set takes 256×256 from 11 s to 93 s (~8×) and 512×512 from 38 s to 121 s (~3×). The extra
+  time is the widened denoise — each step now attends over *text + every reference row + the targets*
+  instead of the targets alone — so the overhead shrinks in *relative* terms as the target grows (the
+  reference rows are a fixed addend on a longer sequence). The VAE encodes are a one-time pre-pass,
+  not per-step, which is why the multiplier falls with resolution.
+
+These are **self-contained** numbers — they characterise *this* build's throughput and scaling and are
+reproducible here (driver: `build/tmp/bench.sh`). They are **not** a parity figure: a ComfyUI-reference
+throughput comparison and the per-tensor *value* parity both need the reference stack and are tracked
+as point 6 / point 4. Nothing here claims to match ComfyUI's timings.
+
 ## What this port still cannot reproduce (the honest list)
 
 1. **Many *interleaved* mixed-modality references can exceed the 8-group table.** Photos are free
