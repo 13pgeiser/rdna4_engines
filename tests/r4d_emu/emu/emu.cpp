@@ -2,6 +2,7 @@
 #include "rad_plugin.h"
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -47,11 +48,12 @@ struct Sched {
     std::vector<Fiber> f;
     void* main_sp = nullptr;
     int cur = -1, nthreads = 0;
-    EmuIdx bid{};
+    EmuIdx bid{}, bdim{}, gdim{};
     void (*body)(void*) = nullptr;
     void* ctx = nullptr;
-    /* block barrier */
+    /* block barrier; or_acc[g % 3] collects __syncthreads_or's predicates at generation g */
     int arrive = 0; unsigned gen = 0;
+    int or_acc[3] = {};
     /* wave barriers and exchange slots, double-buffered by parity */
     int warrive[64] = {}; unsigned wgen[64] = {};
     int slot[64][2][32] = {};
@@ -82,14 +84,25 @@ extern "C" void emu_entry();
 
 EmuIdx& emu_thread_idx() { return S.f[S.cur].tid; }
 EmuIdx& emu_block_idx() { return S.bid; }
+EmuIdx& emu_block_dim() { return S.bdim; }
+EmuIdx& emu_grid_dim() { return S.gdim; }
 
 void __syncthreads() {
     Fiber& me = S.f[S.cur];
     const unsigned g = S.gen;
-    if (++S.arrive == S.nthreads) { S.arrive = 0; ++S.gen; return; }
+    /* Clearing the next generation's slot here, as the barrier completes, keeps it ahead of every
+     * write to it (threads arrive at g + 1 only after g completes) and behind every read of the
+     * slot it shares a residue with (g - 2's, read before arriving at g - 1). */
+    if (++S.arrive == S.nthreads) { S.arrive = 0; S.or_acc[(g + 1) % 3] = 0; ++S.gen; return; }
     me.waiting = 1;
     while (S.gen == g) yield();
     me.waiting = 0;
+}
+int __syncthreads_or(int p) {
+    const unsigned g = S.gen;
+    if (p) S.or_acc[g % 3] = 1;
+    __syncthreads();
+    return S.or_acc[g % 3];
 }
 
 static void wave_barrier(int w) {
@@ -165,6 +178,23 @@ static _Float16 g_ha[64][2][32][8], g_hb[64][2][32][8];
 emu_v8f emu_wmma_f16(emu_v8h a, emu_v8h b, emu_v8f c) {
     return emu_wmma(g_ha, g_hb, a, b, c, [](_Float16 v) { return (float)v; });
 }
+namespace {
+struct Bytes8 {
+    uint8_t v[8];
+    uint8_t operator[](int e) const { return v[e]; }
+};
+}
+static uint8_t g_qa[64][2][32][8], g_qb[64][2][32][8];
+emu_v8f emu_wmma_fp8(emu_v2i a, emu_v2i b, emu_v8f c) {
+    Bytes8 pa, pb;
+    std::memcpy(pa.v, &a, 8);
+    std::memcpy(pb.v, &b, 8);
+    return emu_wmma(g_qa, g_qb, pa, pb, c, [](uint8_t v) { return rad_fp8e4m3_to_f32(v); });
+}
+emu_v8i emu_wmma_iu8(bool, emu_v2i, bool, emu_v2i, emu_v8i, bool) {
+    std::fprintf(stderr, "emu: v_wmma_i32_16x16x16_iu8 is not emulated\n");
+    std::abort();
+}
 unsigned emu_ballot(bool p) {
     int l;
     const int* s = exchange(p ? 1 : 0, &l, kOpBallot);
@@ -236,6 +266,8 @@ void emu_run_grid(dim3 grid, dim3 block, void (*body)(void*), void* ctx, size_t 
     }
     lds_reserve(dyn_lds);
     S.body = body; S.ctx = ctx; S.nthreads = n;
+    S.bdim = EmuIdx{block.x, block.y, block.z};
+    S.gdim = EmuIdx{grid.x, grid.y, grid.z};
     S.f.resize(n);
     for (auto& f : S.f) if (!f.stack) f.stack.reset(new char[kStack]);
     for (unsigned bz = 0; bz < grid.z; ++bz)
@@ -244,6 +276,7 @@ void emu_run_grid(dim3 grid, dim3 block, void (*body)(void*), void* ctx, size_t 
         S.bid = EmuIdx{bx, by, bz};
         std::memset(g_lds, 0xA5, dyn_lds);
         S.arrive = 0; S.gen = 0;
+        for (int& a : S.or_acc) a = 0;
         for (int w = 0; w < 64; ++w) { S.warrive[w] = 0; S.wgen[w] = 0; }
         for (int t = 0; t < n; ++t) {
             Fiber& f = S.f[t];

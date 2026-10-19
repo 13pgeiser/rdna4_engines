@@ -251,6 +251,9 @@ with the gate in the first half.
 is positive and finite (GLM-5.3's is 10). The clip precedes the SiLU, and the gate has no lower
 clip.
 
+libr4d's `swiglu_clamped_bf16` serves bf16 in and out at any width, pitched rows, `M` up to
+65535.
+
 **`add` and `mul`** broadcast a `b` of exactly `n` elements along the rows of a taller output (a
 bias add). Nothing else broadcasts, in these or any other elementwise op. `add`'s `div` divides
 the sum after its rounding, `y = rd(rd(a + b) / div)` with `rd` `y`'s dtype (absent, 1: the plain
@@ -358,6 +361,19 @@ row-interleaved `all_gather` with `row = chunks*S` joins the ranks' matrices int
 the sum of its chunks' partials, then `mhc_pre`'s gates, Sinkhorn mixing and collapse. The order
 of that sum is the implementation's, so the pair matches `mhc_pre` to rounding, and bit for bit
 only where an implementation says so.
+
+libr4d serves `mhc_pre`, `mhc_post` and `mhc_contract` at `hc` 2 to 8, `n` up to 16384 and
+`M` up to 65535 (`iterations` 1 to 256), bf16 activations with f32 `fn`, `scale`, `base`,
+`post` and `comb`. At GLM's geometry (`n` 4096, `hc` 4) `mhc_pre` runs as eight 2048-column chunk
+partials held in `x`'s rows, then a finishing kernel; other geometries project and finish in one
+workgroup per row. `mhc_pre_partial` and `mhc_pre_finish` serve that geometry only (`n` 4096,
+`hc` 4, `chunk` 2048, a 28-float chunk stride) and run `mhc_pre`'s own projection and finishing
+kernels with its chunk-sum order, so the pair is byte-identical to `mhc_pre` (`r4d_selftest`,
+`tests/r4d_emu/test_mhc.cpp`). The projection takes a four-slot form from two rows, one row a wave
+and two from 32, where the weight rows are 16-byte and the residual rows 8-byte aligned; the
+finish forms the 4x4 mixing on one wave and collapses the row over the workgroup; `mhc_post` at
+`hc` 4 writes eight columns of every stream a thread on 16-byte rows. Every form gives the bytes
+of the scalar kernels it replaces.
 
 ### Gemma 4's audio tower
 
@@ -494,6 +510,16 @@ f32, read as the checkpoint stores them. A scale that bf16 cannot represent exac
 value, which `fp8a8`'s bf16 scale plane would round. It applies to `gemm_nt_q` and `moe_gemm_q`
 with `group` 128.
 
+libr4d reads both canonical planes in place, with no relayout: `gemm_fp8a8_f32scale` for
+`gemm_nt_q` and `moe_gemm_fp8a8_f32scale` for `moe_gemm_q`, `N` and `K` multiples of 128, E4M3
+WMMA with the f32 scale product folded per 128 of K, bf16 out. The dense row picks a decode form
+(row tiles sharing each weight fragment, several waves on consecutive K blocks) or a row-tile
+form by `M`, `N` and `K`; on rows that are not 16-byte aligned it takes the 16x64 tile. The forms
+are byte-identical (`tests/r4d_emu/test_fp8f32.cpp`). The grouped row takes equal-width parity
+tables (`N_odd = N`, `K_odd = K`), token or sorted activations, and stacked planes or pointer
+tables, and runs expert-major: a block per (column span, expert) takes every row of its expert,
+each element keeping the row-tile form's sequence.
+
 **`group` has different meanings in this table.** A kernel that reads it the other way is wrong,
 not slow. `libref/ref_quant.cpp` is the definition.
 
@@ -545,6 +571,7 @@ and is optional.
 | `givens_rotate` | `M` `n` `group` `dtype` `stages` `parts` | `x`, `pairs`w, `angle`w, `rscale`w → `y` |
 | `rmsnorm_quant_fp8` | `M` `n` `eps`:f64 `group` `dtype` `wadd`:f64/opt | `x`, `residual`:inout?, `w`w → `q`, `scale`, `out_bf16`? |
 | `gated_quant_fp8` | `M` `n` `group` `dtype` `act`:str/opt | `gate_up` → `q`, `scale`, `out_bf16`? |
+| `swiglu_clamped_quant_fp8` | `M`(range) `n` `limit`:f64 `group` `dtype` | `gate_up` → `q`, `scale`, `out_bf16`? |
 | `gemm_nt_q_gated` | `M` `N` `K` `group` `dtype` `act` | `a`, `a_scale`, `b`w, `b_scale`w → `q`, `scale`, `out_bf16`? |
 
 `quant_cols_fp8` is the same E4M3 quantiser with one scale per column over all `M` rows,
@@ -558,6 +585,12 @@ tensor between them is never written. It is a separate schema, not a flag on `ge
 it does not produce that op's `y`. `act` is required here, unlike on the quantiser: an
 implementation may compile one gate only, and an optional parameter would let it resolve for
 another.
+
+`swiglu_clamped_quant_fp8` (device-only) is `swiglu_clamped` then `quant_act_fp8` over its
+product in one pass. The product is rounded to bf16 before the quantiser reads it, as the pair
+reads it from its bf16 tensor, so the codes, scales and `out_bf16` are the pair's bytes, NaN and
+infinite inputs included (`r4d_selftest`). `n` is a multiple of 4, `group` 128, `M` up to 65535,
+rows pitched.
 
 `out_bf16` is part of the function, not an optimisation: the unfused pair leaves a bf16 tensor
 behind and takes the codes over it, so a layer with a bf16 consumer of the post-norm value must ask
@@ -686,6 +719,12 @@ implementation reads `res` before it stores the product over it.
 accumulation and an f32 `y`; `dtype` (`bf16`) names the activation. It exists for the projections
 whose weights and results must not narrow to bf16: GLM's router logits and its indexer's signed
 head gates.
+
+libr4d's `gemm_nt_f32_bf16` takes `N` up to 512, `K` up to 16384, `M` up to 65535 and pitched
+rows. A wave computes a tile of rows by columns, chosen by `M` and `N` (a single column per wave
+at one row, eight rows by four columns from 64 rows, four rows by one column at `N <= 8`); each
+output keeps one order (lane `l` sums `k = l, l+32, ...` with fused multiply-add, then a fixed
+butterfly), so every tile is byte-identical (`tests/r4d_emu/test_f32.cpp`).
 
 ### Runtime LoRA: `lora_shrink` and `lora_expand`
 
@@ -1408,6 +1447,9 @@ Every op honours its activation operands' row pitches. `rd` is a rounding into t
 | `router_gemm_topk_scatter` | `M`(range) `K` `n_expert` `n_local`/opt `top_k` `norm` `dtype` `expert_base`/opt `protect`:str/opt | `a`, `b`w, `gate_b`w? → `logits`, `expert_ids`, `expert_w`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`? |
 | `moe_gemm` | `M`(range) `N` `K` `n_expert` `top_k` `a_order` `dtype` | `a`, `w`wt, `sorted_tok`, `expert_offset` → `y` |
 | `router_sigmoid_topk` | `M`(range) `n_expert` `top_k` `norm` `route_scale`:f64 `dtype` | `logits`, `bias`w → `ids`, `weights` |
+| `router_sigmoid_topk_scatter` | `M`(range) `n_expert` `n_local`/opt `top_k` `norm` `route_scale`:f64 `dtype` `expert_base`/opt `protect`:str/opt | `logits`, `bias`w → `ids`, `weights`, `sorted_tok`, `expert_offset`, `expert_count`, `gate`?, `inverse`? |
+| `moe_scatter_inv` | `M`(range) `n_expert` `top_k` `expert_base`/opt `protect`:str/opt | `expert_ids` → `sorted_tok`, `expert_offset`, `expert_count`, `inverse` |
+| `moe_gather_inv` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `inverse`, `shared`?, `shared_gate`? → `y` |
 | `moe_gather` | `M`(range) `n` `top_k` `dtype` `act`:str/opt | `y_expert`, `expert_w`, `sorted_tok`, `shared`?, `shared_gate`? → `y` |
 | `row_topk` | `M`(range) `N` `R` `vocab_off`/opt `dtype` | `x` → `idx`, `val`, `pairs`? |
 | `row_topk_merge` | `M` `R` `world_size` `dtype` | `gathered` → `idx`, `val` |
@@ -1502,6 +1544,11 @@ block's all-reduce.
 With bf16 expert outputs, `expert_w` may be bf16 or f32. f32 mixture weights stay f32 through
 the sum; only the gathered result narrows to bf16, as with bf16 weights.
 
+libr4d's `moe_gather_bf16` takes f32 weights in its column-per-thread kernel, with the self-scan
+up to 512 slots (and `top_k` up to 64) and the two prepass launches above. The wave-per-token
+form past 512 slots reads bf16 weights only, so f32 weights stay on the column-per-thread kernel
+at every size.
+
 ### Quantised experts and the row gate
 
 | op | params | operands |
@@ -1532,10 +1579,50 @@ with fewer than `top_k` selectable experts has no defined selection (libref refu
 Grouped selection (`n_group > 1`) is not this op. GLM-5.3 routes 8 of 288 experts in one group
 with `route_scale` 2.5.
 
+libr4d's `router_sigmoid_topk_f32` takes up to 512 experts and `top_k` up to 32, f32 logits, bias
+and weights, i32 ids, pitched rows, `M` up to 65535. It selects in one wave per row: each lane
+holds its experts as order-preserving keys (`-0` as `+0`, ties to the lower expert), and round `j`
+takes the largest key below round `j-1`'s winner. A row without NaN ranks gives the bytes of the
+serial scan. A NaN rank is never selected, and a row with fewer than `top_k` other ranks names
+expert 0 in its empty slots, weighted by expert 0's `p`.
+
+**`router_sigmoid_topk_scatter`** (device-only) is `router_sigmoid_topk` and `moe_scatter` over its
+`ids` in one launch, and with `gate` `[M, 1]` also the `fill` of an ungated shared arm's gate with
+1 (GLM-5.3's shared expert has no gate, and the gather reads one). `n_expert`, `n_local`,
+`expert_base` and `protect` are as in `router_topk_scatter`. Every output is the bytes the
+separate launches write, including a row with fewer than `top_k` non-NaN ranks (NaN logits),
+whose empty slots carry expert 0 into the sort as `ids` does (`r4d_selftest`). Bounded like
+`router_topk_scatter` (`M * top_k <= 1024`, one workgroup) and refused past it. With `inverse` the
+sort is `moe_scatter_inv`'s.
+
+**`moe_scatter_inv`** and **`moe_gather_inv`** (device-only) are `moe_scatter` and `moe_gather`
+with the gather's slot table passed between them. `inverse` `[M * top_k]` holds, for slot
+`token * top_k + slot`, its row in `sorted_tok`, or -1 when the slot was dropped; `moe_gather`
+builds exactly that table from `sorted_tok` before it sums (a scan of the sort per token up to 512
+slots, two prepass launches above), and `moe_gather_inv` reads it instead. They are ops of their
+own because `moe_scatter`'s and `moe_gather`'s operand lists are the shared vocabulary's.
+`moe_scatter_inv` is the same sort (one launch up to 1024 slots, three above, `n_expert` up to
+512), and `moe_gather_inv` runs the kernel `moe_gather` picks at the same size, bf16 or f32
+weights; both are byte-identical to the pair they replace, at GLM's shape with f32 routing weights
+and the shared arm folded in (`r4d_selftest`).
+
 At `dtype=mxfp4a8`, `w` and `w_odd` are OCP e2m1 codes and `w_scale` and `w_odd_scale` hold one
 E8M0 exponent per (row, 32 of K), typed `e8m0` or raw `u8`; either way a byte is an exponent, not
 an integer multiplier. `a` and `a_scale` are `quant_act_fp8`'s pair, and `group` is that
 activation's scale group, independent of the weight's 32-wide grid.
+
+libr4d's `moe_gemm_mxfp4a8` keeps the canonical bytes, including pointer tables of device or
+device-mapped host addresses: a wave decodes the packed e2m1 words into exact E4M3 bytes and runs
+fp8 WMMA, folding each 32-wide E8M0 exponent into the f32 accumulator. Per 128 of K, each 32-wide
+group is a fresh WMMA pair, folded as raw * activation scale * E8M0 scale. It serves `group` 128,
+`K` a multiple of 128, 2 to 512 experts, `top_k` up to 32, token or sorted activations, `parts`,
+and an odd class narrower in `N` or `K`, with `M` up to 32767; there is no `moe_gemm_q_mod4` row
+at this dtype. The form follows the routed rows. The expert-major form, a block per (column block,
+expert) that reads each expert slice once, takes up to 511 rows, and at GLM's TP8 slices (288
+experts, top 8) gate_up up to 768 and down up to 6143. At those slices the wide prefill form (P64:
+jobs of 32 or 64 rows of one expert) takes gate_up from 769 rows and down from 5760, ahead of the
+expert-major band. Elsewhere the row-group forms serve. Every form gives the bytes of the
+arithmetic-decode row-group form (`tests/r4d_emu/test_moemx.cpp`).
 
 **`moe_gemm_q_mod4`** is the same GEMM over four classes by the expert's number mod 4. `w`/`w_scale`
 hold class 0 at `[N, K]` and `w_q`/`w_q_scale` class `q` at `[N_q, K_q]` (defaulting to `N`, `K`);
@@ -1641,6 +1728,14 @@ stores it back, then runs the window from it, writing each token's record and th
 as the new count; the committed state does not advance past the accepted prefix, and a window has
 at most 32 tokens. `mode=prefill` commits its final state and sets the count to zero. A zeroed
 scratch slot replays nothing.
+
+libr4d's `kda_update_k128_v128_bf16` takes `head_k = head_v = 128`, 1 to 65535 heads, bf16
+activations, f32 `A_log`, `dt_bias` and state, both modes and both state forms. A wave holds one,
+two or four value rows of a head (four by default, the next token's operands loaded while the
+current one reduces) and runs the sequence's tokens in order; every form gives the bytes of the
+one-row kernel (`tests/r4d_emu/test_kda.cpp`). Under `anchor`, `verify` replays the accepted prefix
+in a separate dispatch before the window, so no value row overwrites factors another is still
+reading. A sequence whose window or slots are out of bounds is skipped on the device, not refused.
 
 **Speculative rollback is part of the schema** (`spec.md` §10). The recurrent state and the conv
 window have already absorbed rejected tokens, so the state cache is a rolling window of
@@ -2354,11 +2449,16 @@ contiguous inner rows and a four-byte-aligned page pitch of at least 136 bytes: 
 untouched. That is one block-size-4 group of the indexer's KV, with no separate scale allocation.
 `block_size`, when given, is 4 and names the consuming layout to the cache planner.
 
+libr4d's `dsa_pool_fp8` serves `n` 128 and `ratio` 4, the cache form included: one wave per pooled
+row, the softmax channels and the Hadamard in registers, pitched rows.
+
 `dsa_query` rotates each bf16 query head by the same normalized Walsh-Hadamard transform, rounds
 to bf16, and quantises to E4M3 with the same power-of-two scale: `x` `[M, n]`, `q` `[M, n]`,
 `scale` `[M, 1]`, token and head flattened into `M`. There is no RoPE and no RMS norm. Unlike
 `had_quant_act_fp8`, both the normalization of the rotation and the power-of-two scale are part of
 the op. `n` is a power of two up to 256.
+
+libr4d's `dsa_query_fp8` serves `n` 128, one wave per query head, pitched rows.
 
 `dsa_score` takes E4M3 queries `[M, heads, n]` with f32 scales and signed f32 gates `[M, heads]`,
 E4M3 pooled keys `[pages, n]` with f32 scales `[pages]`. `bt[seqs, blocks]` names key pages,
@@ -2374,6 +2474,11 @@ history makes no future block eligible.
 embedded scale are read in place. `q` may be flattened `[M*heads, n]` with `q_scale`
 `[M*heads, 1]`, each with its own row pitch, which is `dsa_query`'s output as written.
 
+libr4d's `dsa_score_fp8` serves `n` 128 and 32 heads, `M` up to 65535, both key forms and both
+query forms. A block of two waves covers the 32 heads of one query row against one or two 16-key
+tiles (two past 32 blocks); the dot products run on fp8 WMMA, and scales and gates fold only after
+each head's ReLU.
+
 `mla_attn` is absorbed latent attention: one latent vector per token is both key and value.
 `q` and `out` are `[M, heads, latent_dim]`, `kv` is `[pages, 1, block_size, latent_dim]`, and
 `bt[M, blocks]` is each query's own page table, the selected complete pages followed by its tail.
@@ -2383,6 +2488,19 @@ contributes nothing, and a row with no visible key outputs zero. The softmax is 
 rounded once. `scale` is positive and finite and comes from the original query/key head width,
 not the latent width (GLM: `1/sqrt(256)` against a latent of 512).
 
+libr4d has two `mla_attn` rows, both at `latent_dim` 512, `block_size` 4 and up to 64 heads. The
+matrix row, `mla_attn_matrix_bf16`, ranks above the wave row and takes heads in multiples of 8: the
+heads are the WMMA tile's rows, so all of them share each latent load, and the probabilities enter
+it as bf16 high and low parts with f32 accumulation. At a multiple of 16 a tile holds 16 heads of
+one query; otherwise it pairs eight heads of two neighbouring queries, loading a key once where
+both tables name the page, so GLM-5.3's 8 heads a rank fill the tile. The pairing walks the union
+of the two tables, so each chunk runs once, for tables of up to 520 entries; past that it pairs
+by table position, with a second pass where the two differ.
+`RADIANCE_MLA_MATRIX_MAX_M` lowers the matrix row's `M` bound (65535 by default); past it the
+wave row, `mla_attn_bf16`, serves: a wave per head with an online softmax. Both split a short
+batch's history across workgroups and merge the f32 partials before narrowing, into the fixed
+scratch their hooks reserve; without scratch they compute unsplit.
+
 `mla_project` moves a query into the latent and a latent result out of it, through the bf16
 weight `b` `[heads*2*head_dim, latent_dim]` that stores each head's key rows, then its value rows.
 `mode=absorb` multiplies `a` `[M, heads, head_dim]` by the head's key block as stored,
@@ -2391,6 +2509,11 @@ weight `b` `[heads*2*head_dim, latent_dim]` that stores each head's key rows, th
 accumulate in f32 and round once to bf16. The KV cache stays latent; only this weight carries the
 per-head width. Its rows are head-major, so a tensor-parallel slice of whole heads is a row range.
 `a` and `y` may also be `[M, heads*width]`, heads contiguous, with their own token pitch.
+
+libr4d's `mla_project_bf16` serves `head_dim` 256 and `latent_dim` 512, up to 64 heads, pitched
+tensors. It takes up to eight rows a thread (`absorb`) or a wave (`expand`), loading each weight
+element once for them, with every row's sum in the one-row kernels' order, so all forms give the
+same bytes.
 
 ## Draft heads
 

@@ -1,7 +1,7 @@
 /* r4d_fuse.cpp -- the chain of unfused ops each fused kernel computes in one launch.
  *
  * `RadKernelInfo::replaces` (rad_abi.h) makes a fused row's claim to be byte-identical to the ops
- * it replaces executable. Eleven of libr4d's fusions have no libref kernel, so this is their only
+ * it replaces executable. Most of libr4d's fusions have no libref kernel, so this is their only
  * oracle: a caller runs the fused row against its chain built from this plugin's own unfused rows,
  * and expects identical bytes, not a tolerance.
  *
@@ -145,6 +145,16 @@ struct Step {
         q.key  = key;
         q.kind = RAD_P_INT;
         q.ival = v;
+        s->p[s->n_p++] = q;
+        return *this;
+    }
+
+    Step& pf64(const char* key, double v) {
+        if (s->n_p >= RAD_MAX_FUSE_PARAMS) { ok = false; return *this; }
+        RadParam q{};
+        q.key  = key;
+        q.kind = RAD_P_F64;
+        q.dval = v;
         s->p[s->n_p++] = q;
         return *this;
     }
@@ -300,6 +310,82 @@ extern "C" int r4d_fuse_gated_quant_fp8(const RadParam* p, int n_p, uint64_t pre
         Step s(out, "quant_act_fp8");
         s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "group").mirror(p, n_p, "dtype");
         return s.wire({ 3, 1, 2 });                 /* x, q, scale */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
+ * swiglu_clamped_quant_fp8 -- GLM's clipped SwiGLU and the fp8 quantiser in one pass.
+ * (kernel: libr4d/r4d_glm.hip, swiglu_clamped_quant_kernel)
+ *
+ * Operands: [0] gate_up  [1] q  [2] scale  [3] out_bf16?
+ *
+ * Each element is `swiglu_clamped_bf16`'s expression, rounded to bf16 once, and the codes are
+ * quant_act_fp8's over that rounded value, so the chain is the two rows with the product between.
+ */
+extern "C" int r4d_fuse_swiglu_clamped_quant_fp8(const RadParam* p, int n_p, uint64_t present,
+                                                 int step, RadFuseStep* out) {
+
+    if (!out) return RAD_E_INVAL;
+    const int64_t M = pi(p, n_p, "M"), n = pi(p, n_p, "n");
+    if (!fp8_geometry_ok(p, n_p, M, n)) return RAD_E_UNSUPPORTED;
+    const int16_t mid = RAD_FUSE_HAS(present, 3) ? (int16_t)3 : RAD_FUSE_TMP(0);
+
+    switch (step) {
+    case 0: {
+        Step s(out, "swiglu_clamped");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "limit").mirror(p, n_p, "dtype");
+        return s.wire({ 0, mid });                  /* gate_up, y */
+    }
+    case 1: {
+        Step s(out, "quant_act_fp8");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n").mirror(p, n_p, "group").mirror(p, n_p, "dtype");
+        return s.wire({ mid, 1, 2 });               /* x, q, scale */
+    }
+    default:
+        return RAD_E_NOTFOUND;
+    }
+}
+
+/* ==========================================================================================
+ * router_sigmoid_topk_scatter -- GLM's selection, the sort over its ids and the shared gate's fill.
+ * (kernel: libr4d/r4d_glm.hip, router_sigmoid_scatter_kernel)
+ *
+ * Operands: [0] logits  [1] bias  [2] ids  [3] weights  [4] sorted_tok  [5] expert_offset
+ *           [6] expert_count  [7] gate?  [8] inverse?
+ *
+ * The sort runs over this rank's slice, so `moe_scatter`'s `n_expert` is the fused op's `n_local`;
+ * with the inverse it is `moe_scatter_inv`. The fill steps in only with the gate.
+ */
+extern "C" int r4d_fuse_router_sigmoid_topk_scatter(const RadParam* p, int n_p, uint64_t present,
+                                                    int step, RadFuseStep* out) {
+
+    if (!out) return RAD_E_INVAL;
+    const int64_t ne = pi(p, n_p, "n_expert"), nl = pi(p, n_p, "n_local", ne);
+    if (ne <= 0 || nl <= 0 || nl > ne) return RAD_E_UNSUPPORTED;
+
+    switch (step) {
+    case 0: {
+        Step s(out, "router_sigmoid_topk");
+        s.mirror(p, n_p, "M").mirror(p, n_p, "n_expert").mirror(p, n_p, "top_k")
+         .mirror(p, n_p, "norm").mirror(p, n_p, "route_scale").mirror(p, n_p, "dtype");
+        return s.wire({ 0, 1, 2, 3 });              /* logits, bias, ids, weights */
+    }
+    case 1: {
+        const bool inv = RAD_FUSE_HAS(present, 8) != 0;
+        Step s(out, inv ? "moe_scatter_inv" : "moe_scatter");
+        s.mirror(p, n_p, "M").pint("n_expert", nl).mirror(p, n_p, "top_k")
+         .mirror_opt(p, n_p, "expert_base").mirror_opt(p, n_p, "protect");
+        if (inv) return s.wire({ 2, 4, 5, 6, 8 });  /* expert_ids, sorted_tok, offset, count, inverse */
+        return s.wire({ 2, 4, 5, 6 });              /* expert_ids, sorted_tok, offset, count */
+    }
+    case 2: {
+        if (!RAD_FUSE_HAS(present, 7)) return RAD_E_NOTFOUND;
+        Step s(out, "fill");
+        s.mirror(p, n_p, "M").pint("n", 1).pstr("dtype", "bf16").pf64("value", 1.0);
+        return s.wire({ 7 });                       /* y */
     }
     default:
         return RAD_E_NOTFOUND;

@@ -469,6 +469,50 @@ static const RadParamSpec pHcPlain[] = {
 static const RadOperandSpec oHcEnter[] = {
     { "x", RAD_OPD_IN, 0 }, { "h", RAD_OPD_OUT, 0 },
 };
+static const RadParamSpec pMhcPre[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("iterations"), P_F64("eps"),
+    P_F64("hc_eps"), P_STR("dtype"),
+};
+static const RadOperandSpec oMhcPre[] = {
+    {"h", RAD_OPD_IN, 0}, {"fn", RAD_OPD_WEIGHT, 0}, {"scale", RAD_OPD_WEIGHT, 0},
+    {"base", RAD_OPD_WEIGHT, 0}, {"x", RAD_OPD_OUT, 0}, {"post", RAD_OPD_OUT, 0},
+    {"comb", RAD_OPD_OUT, 0},
+};
+static const RadParamSpec pMhcPrePartial[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("chunk"), P_INT("first"), P_INT("chunks"),
+    P_STR("dtype"),
+};
+static const RadOperandSpec oMhcPrePartial[] = {
+    {"h", RAD_OPD_IN, 0}, {"fn", RAD_OPD_WEIGHT, 0}, {"part", RAD_OPD_OUT, 0},
+};
+static const RadParamSpec pMhcPreFinish[] = {
+    P_INT("M"), P_INT("n"), P_INT("hc"), P_INT("iterations"), P_F64("eps"),
+    P_F64("hc_eps"), P_INT("chunk"), P_STR("dtype"),
+};
+static const RadOperandSpec oMhcPreFinish[] = {
+    {"part", RAD_OPD_IN, 0}, {"h", RAD_OPD_IN, 0}, {"scale", RAD_OPD_WEIGHT, 0},
+    {"base", RAD_OPD_WEIGHT, 0}, {"x", RAD_OPD_OUT, 0}, {"post", RAD_OPD_OUT, 0},
+    {"comb", RAD_OPD_OUT, 0},
+};
+static const RadOperandSpec oMhcPost[] = {
+    {"x", RAD_OPD_IN, 0}, {"h", RAD_OPD_IN, 0}, {"post", RAD_OPD_IN, 0},
+    {"comb", RAD_OPD_IN, 0}, {"out", RAD_OPD_OUT, 0},
+};
+static const RadOperandSpec oMhcContract[] = {
+    {"h", RAD_OPD_IN, 0}, {"x", RAD_OPD_OUT, 0},
+};
+static const RadParamSpec pKdaUpdate[] = {
+    P_INT("M"), P_INT("heads"), P_INT("head_k"), P_INT("head_v"), P_F64("lower_bound"),
+    P_F64("scale"), P_F64("l2_eps"), P_STR("mode"), P_STR("dtype"),
+    P_STRO("state_form"),
+};
+static const RadOperandSpec oKdaUpdate[] = {
+    {"q", RAD_OPD_IN, 0}, {"k", RAD_OPD_IN, 0}, {"v", RAD_OPD_IN, 0},
+    {"a", RAD_OPD_IN, 0}, {"b", RAD_OPD_IN, 0}, {"A_log", RAD_OPD_WEIGHT, 0},
+    {"dt_bias", RAD_OPD_WEIGHT, 0}, {"state", RAD_OPD_INOUT, 0}, {"state_idx", RAD_OPD_IN, 0},
+    {"cu", RAD_OPD_IN, 0}, {"num_accepted", RAD_OPD_IN, 1}, {"has_init", RAD_OPD_IN, 1},
+    {"o", RAD_OPD_OUT, 0},
+};
 static const RadOperandSpec oHcWrite[] = {
     { "y", RAD_OPD_IN, 0 }, { "inj", RAD_OPD_IN, 0 }, { "h", RAD_OPD_INOUT, 0 },
 };
@@ -816,6 +860,16 @@ static const RadOperandSpec oMoeScatter[] = {
     { "expert_offset", RAD_OPD_OUT, 0 },
     { "expert_count",  RAD_OPD_OUT, 0 },
 };
+/* moe_scatter with each slot's row in `sorted_tok` beside it: moe_gather_inv reads that table
+ * instead of rebuilding it. Ops of their own, since the shared vocabulary fixes moe_scatter's and
+ * moe_gather's operands. */
+static const RadOperandSpec oMoeScatterInv[] = {
+    { "expert_ids",    RAD_OPD_IN,  0 },
+    { "sorted_tok",    RAD_OPD_OUT, 0 },
+    { "expert_offset", RAD_OPD_OUT, 0 },
+    { "expert_count",  RAD_OPD_OUT, 0 },
+    { "inverse",       RAD_OPD_OUT, 0 },
+};
 /* `a_order` ("token" or "sorted") says which rows the activation has: one per token, gathered
  * through sorted_tok, or one per (token, slot) already in scatter order. A routed block's two
  * grouped GEMMs differ (gate_up reads the block input, down reads gate_up's output), and the row
@@ -898,6 +952,14 @@ static const RadOperandSpec oMoeGather[] = {
      * the following `scale_rows`. Both terms are rounded to bf16 before the sum, as in the unfused
      * pair. The shared arm runs on one rank, so this removes a dispatch per layer the other rank
      * would wait out in the all-reduce, and the routed arm's `moe` buffer is never written. */
+    { "shared",      RAD_OPD_IN,  1 },
+    { "shared_gate", RAD_OPD_IN,  1 },
+    { "y",           RAD_OPD_OUT, 0 },
+};
+static const RadOperandSpec oMoeGatherInv[] = {
+    { "y_expert",    RAD_OPD_IN,  0 },
+    { "expert_w",    RAD_OPD_IN,  0 },
+    { "inverse",     RAD_OPD_IN,  0 },
     { "shared",      RAD_OPD_IN,  1 },
     { "shared_gate", RAD_OPD_IN,  1 },
     { "y",           RAD_OPD_OUT, 0 },
@@ -1565,6 +1627,51 @@ static const RadParamSpec pMnDtype[] = {
     { "M",     RAD_P_INT, RAD_REQUIRED },
     { "n",     RAD_P_INT, RAD_REQUIRED },
     { "dtype", RAD_P_STR, RAD_REQUIRED },
+};
+static const RadParamSpec pSwigluClamped[] = { P_INT("M"), P_INT("n"), P_F64("limit"),
+                                               P_STR("dtype") };
+static const RadParamSpec pSwigluClampedQuant[] = { P_INT("M"), P_INT("n"), P_F64("limit"),
+                                                    P_INT("group"), P_STR("dtype") };
+static const RadParamSpec pDsaPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype"),
+                                         P_INTO("block_size") };
+static const RadParamSpec pMlaAttn[] = { P_INT("M"),      P_INT("latent_dim"), P_INT("heads"),
+                                         P_INT("blocks"), P_INT("block_size"), P_F64("scale"),
+                                         P_STR("dtype") };
+static const RadParamSpec pMlaProject[] = { P_INT("M"),          P_INT("heads"), P_INT("head_dim"),
+                                            P_INT("latent_dim"), P_STR("mode"),  P_STR("dtype") };
+static const RadOperandSpec oMlaAttn[] = { { "q", RAD_OPD_IN, 0 },
+                                           { "kv", RAD_OPD_IN, 0 },
+                                           { "bt", RAD_OPD_IN, 0 },
+                                           { "length", RAD_OPD_IN, 0 },
+                                           { "out", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pDsaScore[] = { P_INT("M"),      P_INT("n"),    P_INT("heads"),
+                                          P_INT("blocks"), P_INT("seqs"), P_STR("dtype") };
+static const RadOperandSpec oDsaScore[] = {
+    { "q", RAD_OPD_IN, 0 },  { "q_scale", RAD_OPD_IN, 0 }, { "gate", RAD_OPD_IN, 0 },
+    { "k", RAD_OPD_IN, 0 },  { "k_scale", RAD_OPD_IN, 1 }, { "bt", RAD_OPD_IN, 0 },
+    { "cu", RAD_OPD_IN, 0 }, { "nc", RAD_OPD_IN, 0 },      { "score", RAD_OPD_OUT, 0 }
+};
+static const RadOperandSpec oDsaPool[] = {
+    { "kg", RAD_OPD_IN, 0 },     { "ape", RAD_OPD_WEIGHT, 0 }, { "q", RAD_OPD_OUT, 0 },
+    { "scale", RAD_OPD_OUT, 0 }, { "page", RAD_OPD_IN, 1 },    { "cache", RAD_OPD_INOUT, 1 }
+};
+static const RadParamSpec pRouterSigmoid[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
+    P_INT("norm"), P_F64("route_scale"), P_STR("dtype") };
+static const RadOperandSpec oRouterSigmoid[] = {
+    { "logits", RAD_OPD_IN, 0 }, { "bias", RAD_OPD_WEIGHT, 0 },
+    { "ids", RAD_OPD_OUT, 0 }, { "weights", RAD_OPD_OUT, 0 }
+};
+/* router_sigmoid_topk and moe_scatter as one op, with `ids` named once, and the `fill` of an
+ * ungated shared arm's gate with 1 as an optional output. */
+static const RadParamSpec pRouterSigmoidScatter[] = { P_INT("M"), P_INT("n_expert"),
+    P_INTO("n_local"), P_INT("top_k"), P_INT("norm"), P_F64("route_scale"), P_STR("dtype"),
+    P_INTO("expert_base"), P_STRO("protect") };
+static const RadOperandSpec oRouterSigmoidScatter[] = {
+    { "logits", RAD_OPD_IN, 0 },        { "bias", RAD_OPD_WEIGHT, 0 },
+    { "ids", RAD_OPD_OUT, 0 },          { "weights", RAD_OPD_OUT, 0 },
+    { "sorted_tok", RAD_OPD_OUT, 0 },   { "expert_offset", RAD_OPD_OUT, 0 },
+    { "expert_count", RAD_OPD_OUT, 0 }, { "gate", RAD_OPD_OUT, 1 },
+    { "inverse", RAD_OPD_OUT, 1 }
 };
 /* `logit_softcap`'s, matching ref's `pMnCap` (spec §2.3). `cap` must be > 0; the op refuses a
  * non-positive cap (a division by zero in every lane). */
@@ -2432,6 +2539,23 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("mul_weight", pMulWeight, oMulWeight,
            "y = x * w, `w` a WEIGHT of one element (a scalar for the whole output) or of one row "
            "(broadcast down the rows): a learned gain on an activation. f32 product, rounded once."),
+    SCHEMA("mla_attn", pMlaAttn, oMlaAttn,
+           "Softmax over selected latent vectors used as both key and value; per-query page tables and visible lengths."),
+    SCHEMA("mla_project", pMlaProject, oGemmNt,
+           "Per-head query absorption or value expansion through the shared [head,(K|V),latent] BF16 matrix."),
+    SCHEMA("dsa_score", pDsaScore, oDsaScore,
+           "Per-head ReLU of FP8 dot products, then signed head gates and scales; invalid history is -inf."),
+    SCHEMA("dsa_pool", pDsaPool, oDsaPool,
+           "Channel-wise softmax pooling with learned position bias, BF16, normalized Hadamard, BF16, power-of-two FP8."),
+    SCHEMA("dsa_query", pMnDtype, oQuantActFp8,
+           "Normalized Hadamard, BF16 boundary and power-of-two E4M3 quantization per query head."),
+    SCHEMA("gemm_nt_f32", pGemmNt, oGemmNt,
+           "BF16 activations times F32 weights, F32 accumulation and output; preserves routing and index gate precision."),
+    SCHEMA("swiglu_clamped", pSwigluClamped, oGateUp,
+           "silu(min(gate,limit))*clamp(up,-limit,limit); gate is the first half."),
+    SCHEMA("swiglu_clamped_quant_fp8", pSwigluClampedQuant, oGatedQuantFp8,
+           "`swiglu_clamped` then `quant_act_fp8` over its product, in one pass: the codes are "
+           "taken over the BF16-ROUNDED product, which `out_bf16` receives when present."),
     SCHEMA("silu_mul", pMnDtype, oGateUp,
            "y[.., i] = silu(gate_up[.., i]) * gate_up[.., n + i]. The GATE IS THE FIRST HALF, "
             "which is the order rad-convert fuses gate_proj and up_proj in."),
@@ -2673,6 +2797,22 @@ static const RadOpSchema kSchemas[] = {
            "the two ops it replaces."),
     SCHEMA("hc_enter", pHcPlain, oHcEnter,
            "h[s] = x for each of the hc streams -- the wide residual stream's first value."),
+    SCHEMA("mhc_pre", pMhcPre, oMhcPre,
+           "Whole-residual RMS-scaled projection, sigmoid gates and Sinkhorn mixing; coefficients f32."),
+    SCHEMA("mhc_pre_partial", pMhcPrePartial, oMhcPrePartial,
+           "mhc_pre's projection over chunks [first, first+chunks) of `chunk` residual columns: "
+           "per chunk the hc*(hc+2) coefficient partials and the sum of squares, zero-padded to "
+           "a multiple of four floats; tensor-parallel ranks each take their chunks."),
+    SCHEMA("mhc_pre_finish", pMhcPreFinish, oMhcPreFinish,
+           "mhc_pre from every chunk's partials: chunk sums, gates, Sinkhorn mixing and the "
+           "collapse of h; the pair is mhc_pre."),
+    SCHEMA("mhc_post", pHcPlain, oMhcPost,
+           "out[dst,i] = post[dst]*x[i] + sum_src comb[src,dst]*h[src,i]; separate output."),
+    SCHEMA("mhc_contract", pHcPlain, oMhcContract,
+           "Mean over the hc residual streams, rounded once to dtype."),
+    SCHEMA("kda_update", pKdaUpdate, oKdaUpdate,
+           "Bounded per-channel KDA recurrence. verify stores candidate states; prefill commits final state. "
+           "Absolute cu offsets, accepted-prefix read slot, optional cold initialization, no output norm."),
     SCHEMA("hc_read", pHcRead, oHcRead,
            "the read half of a gated residual: a grouped rmsnorm, a low-rank sigmoid gate, and "
            "the mean of the gated streams -- plus the per-branch write gains and, optionally, "
@@ -2722,6 +2862,14 @@ static const RadOpSchema kSchemas[] = {
            "With `add` present the form is y = bf16(x * act(s)) + add: the product is NARROWED "
            "before the sum, which is what makes the fused form bit-identical to the two ops it "
            "stands in for rather than merely close to them."),
+    SCHEMA("router_sigmoid_topk", pRouterSigmoid, oRouterSigmoid,
+           "Single-group sigmoid routing; correction bias selects experts, original scores weight them."),
+    SCHEMA("router_sigmoid_topk_scatter", pRouterSigmoidScatter, oRouterSigmoidScatter,
+           "`router_sigmoid_topk` then `moe_scatter` over its ids, in one launch, and with `gate` "
+           "present the ungated shared arm's `fill` of its gate with 1; with `inverse` the sort is "
+           "`moe_scatter_inv`. Every output is the bytes the separate launches write, including a "
+           "row with fewer finite ranks than top_k. Bounded by the sort's single-workgroup form: "
+           "M * top_k <= 1024, refused above."),
     SCHEMA("router_topk", pRouterTopk, oRouterTopk,
            "softmax over ALL n_expert logits, then the top_k of them by value with ties to the "
            "lower expert id, then -- if `norm` -- the kept weights renormalised to sum to one. The "
@@ -2755,6 +2903,13 @@ static const RadOpSchema kSchemas[] = {
            "does not depend on the scheduler. `protect` lists local experts sorted LAST, in that "
            "order, the rest closed up: `expert_offset` and `expert_count` are then in sort order, "
            "and a layer's protected experts are one trailing run a second grouped GEMM serves."),
+    SCHEMA("moe_scatter_inv", pMoeScatter, oMoeScatterInv,
+           "`moe_scatter`, also writing `inverse`: for every slot token*top_k + slot its row in "
+           "`sorted_tok`, -1 for a dropped slot. That is the table `moe_gather` builds from "
+           "`sorted_tok` before it sums, so `moe_gather_inv` reads it instead."),
+    SCHEMA("moe_gather_inv", pMoeGather, oMoeGatherInv,
+           "`moe_gather` reading the slot table `moe_scatter_inv` wrote instead of rebuilding it "
+           "from `sorted_tok`: the same sums in ascending slot order, the same bytes."),
     SCHEMA("moe_gemm", pMoeGemm, oMoeGemm,
            "y[i] = a[row(i)] @ w[e]^T in SORTED order, e being the expert whose offset range "
            "contains i, both operands unquantised and one accumulator over K. `a_order` picks "
@@ -3662,6 +3817,77 @@ static const RadConstraint cHcReadE4m3[] = {
 static const RadConstraint cHcPlain[] = {
     C_GE("M", 1), C_GE("n", 1), C_GE("hc", 2), C_LE("hc", 8), C_IN("dtype", "bf16"),
 };
+static const RadConstraint cMhcPlain[] = {
+    C_GE("M", 1),  C_LE("M", 65535), C_GE("n", 1),          C_LE("n", 16384),
+    C_GE("hc", 2), C_LE("hc", 8),    C_IN("dtype", "bf16"),
+};
+/* GLM's split projection only: eight 2048-column chunks of a 4 x 4096 residual. */
+static const RadConstraint cMhcPrePartial[] = {
+    C_GE("M", 1),     C_LE("M", 65535), C_EQ("n", 4096),   C_EQ("hc", 4),     C_EQ("chunk", 2048),
+    C_GE("first", 0), C_LE("first", 7), C_GE("chunks", 1), C_LE("chunks", 8), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cMhcPreFinish[] = {
+    C_GE("M", 1),        C_LE("M", 65535),      C_EQ("n", 4096),       C_EQ("hc", 4),
+    C_EQ("chunk", 2048), C_IN("dtype", "bf16"), C_GE("iterations", 1), C_LE("iterations", 256),
+};
+static const RadConstraint cKdaUpdate[] = {
+    C_GE("M", 1),          C_GE("heads", 1),    C_LE("heads", 65535),
+    C_EQ("head_k", 128),   C_EQ("head_v", 128), C_IN("mode", "prefill verify"),
+    C_IN("dtype", "bf16"),
+};
+static const RadConstraint cMhcPre[] = {
+    C_GE("M", 1),          C_LE("M", 65535),      C_GE("n", 1),
+    C_LE("n", 16384),      C_GE("hc", 2),         C_LE("hc", 8),
+    C_IN("dtype", "bf16"), C_GE("iterations", 1), C_LE("iterations", 256),
+};
+static const RadConstraint cDsaPool[] = { C_GE("M", 1), C_EQ("n", 128), C_EQ("ratio", 4),
+                                          C_IN("dtype", "bf16") };
+static const RadConstraint cDsaQuery[] = { C_GE("M", 1), C_LE("M", 2147483644), C_EQ("n", 128),
+                                           C_IN("dtype", "bf16") };
+static const RadConstraint cFp8F32Scale[] = {
+    C_GE("M", 1),    C_GE("N", 128),     C_DIV("N", 128),          C_GE("K", 128),
+    C_DIV("K", 128), C_EQ("group", 128), C_IN("dtype", "fp8a8f32")
+};
+static const RadConstraint cGemmNtF32[] = { C_GE("M", 1),         C_LE("M", 65535),
+                                            C_GE("N", 1),         C_LE("N", 512),
+                                            C_GE("K", 1),         C_LE("K", 16384),
+                                            C_IN("dtype", "bf16") };
+static const RadConstraint cDsaScore[] = {
+    C_GE("M", 1),      C_LE("M", 65535), C_EQ("n", 128),           C_EQ("heads", 32),
+    C_GE("blocks", 1), C_GE("seqs", 1),  C_IN("dtype", "fp8_e4m3")
+};
+static const RadConstraint cMlaAttn[] = {
+    C_GE("M", 1),      C_LE("M", 65535),  C_EQ("latent_dim", 512), C_GE("heads", 1),
+    C_LE("heads", 64), C_GE("blocks", 1), C_EQ("block_size", 4),   C_IN("dtype", "bf16")
+};
+static const RadConstraint cMlaProject[] = { C_GE("M", 1),
+                                             C_LE("M", 65535),
+                                             C_GE("heads", 1),
+                                             C_LE("heads", 64),
+                                             C_EQ("head_dim", 256),
+                                             C_EQ("latent_dim", 512),
+                                             C_IN("mode", "absorb expand"),
+                                             C_IN("dtype", "bf16") };
+/* The matrix row outranks the wave row (mla_attn_bf16) at every M, the pairing walking the union
+ * of both rows' pages: measured cold on gfx1201 (r4d_selftest --perfmla), a 2048-row chunk
+ * with DSA tables (fill topk:16) takes 7.1 ms against 12.4 ms on the wave row and 13.0 ms on the
+ * positional pairing, fresh 3.8 against 6.3 ms, a decode step of 8x6 rows 0.23 against 0.82 ms.
+ * RADIANCE_MLA_MATRIX_MAX_M lowers the bound, read once as the table loads; 0 is never. */
+static long long mla_matrix_max_m() {
+    const char* e = std::getenv("RADIANCE_MLA_MATRIX_MAX_M");
+    char* end = nullptr;
+    const long long v = e && *e ? std::strtoll(e, &end, 10) : -1;
+    return end && !*end && v >= 0 ? (v < 65535 ? v : 65535) : 65535;
+}
+static const RadConstraint cMlaMatrix[] = { C_GE("M", 1),
+                                            C_LE("M", mla_matrix_max_m()),
+                                            C_EQ("latent_dim", 512),
+                                            C_GE("heads", 8),
+                                            C_LE("heads", 64),
+                                            C_DIV("heads", 8),
+                                            C_GE("blocks", 1),
+                                            C_EQ("block_size", 4),
+                                            C_IN("dtype", "bf16") };
 /* `n` is bounded by LDS: nh (hc*n) and ne (n) are both bf16 and live through the second phase;
  * 28672 elements is that budget at hc 4. */
 static const RadConstraint cMtpEnter[] = {
@@ -3681,6 +3907,15 @@ static const RadConstraint cRouterTopK[] = {
     C_GE("M", 1), C_GE("n_expert", 1), C_LE("n_expert", 512), C_GE("top_k", 1),
     C_LE("top_k", 32), C_IN("dtype", "bf16"),
 };
+static const RadConstraint cRouterSigmoid[] = { C_GE("M", 1),        C_LE("M", 65535),
+                                                C_GE("n_expert", 1), C_LE("n_expert", 512),
+                                                C_GE("top_k", 1),    C_LE("top_k", 32),
+                                                C_IN("dtype", "f32") };
+/* The sort's single-workgroup form bounds M * top_k at 1024, which the shim checks. */
+static const RadConstraint cRouterSigmoidScatter[] = { C_GE("M", 1),        C_LE("M", 1024),
+                                                       C_GE("n_expert", 1), C_LE("n_expert", 512),
+                                                       C_GE("top_k", 1),    C_LE("top_k", 32),
+                                                       C_IN("dtype", "f32") };
 /* The selection's bounds and the skinny GEMM's decode band: four 16-row tiles. */
 static const RadConstraint cRouterGemmTopkScatter[] = {
     C_GE("M", 1), C_LE("M", 64), C_DIV("K", 16), C_GE("n_expert", 1), C_LE("n_expert", 512),
@@ -3692,6 +3927,11 @@ static const RadConstraint cMoeScatter[] = {
 static const RadConstraint cMoeGemmQ[] = {
     C_GE("M", 1), C_DIV("N", 64), C_DIV("K", 128), C_GE("n_expert", 1), C_LE("n_expert", 65536),
     C_GE("top_k", 1), C_EQ("group", 128), C_IN("dtype", "fp8a8"),
+};
+static const RadConstraint cMoeMx[] = {
+    C_GE("M", 1), C_LE("M", 32767), C_GE("N", 1), C_DIV("K", 128),
+    C_GE("n_expert", 2), C_LE("n_expert", 512), C_GE("top_k", 1), C_LE("top_k", 32),
+    C_EQ("group", 128), C_IN("dtype", "mxfp4a8"),
 };
 /* The same op at a four-bit expert weight: same band and operands, only the stored weight plane
  * and scale grid differ, so the dtype string alone separates the rows.
@@ -3915,6 +4155,10 @@ static const RadConstraint cArGatherHcWrite4[] = {
 };
 static const RadConstraint cGatedQuantFp8[] = {
     C_DIV("n", 4), C_EQ("group", R4D_FP8_BLOCK), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cSwigluClampedQuant[] = {
+    C_GE("M", 1), C_LE("M", 65535), C_DIV("n", 4), C_EQ("group", R4D_FP8_BLOCK),
+    C_IN("dtype", "bf16"),
 };
 /* n divisible by the group, as in cHadQuantActFp8. */
 static const RadConstraint cGatedHadQuantFp8[] = {
@@ -4805,6 +5049,70 @@ static const RadKernelInfo kKernels[] = {
    nullptr, nullptr, r4d_rad_scale, nullptr, nullptr, nullptr,
    r4d_shape_scale },
 
+{ "mla_attn_matrix_bf16", "mla_attn", "attn", "head-tiled WMMA latent attention with FP32 softmax",
+  "latent_dim=512, heads a multiple of 8 (heads%16==8 pairs two requests a tile), block_size=4",
+  "bf16 operands; FP32 probabilities via high/low BF16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY + 1, ROW(cMlaMatrix), NOTUNE,
+  nullptr, nullptr, r4d_rad_mla_attn_matrix, r4d_rad_mla_attn_matrix_scratch, nullptr, nullptr,
+  r4d_shape_mla_attn },
+{ "mla_attn_bf16", "mla_attn", "attn", "absorbed MLA with a shared latent cache and split history",
+  "latent_dim=512, heads<=64, block_size=4", "bf16 Q/cache/output, f32 softmax and partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaAttn), NOTUNE,
+  nullptr, nullptr, r4d_rad_mla_attn, r4d_rad_mla_attn_scratch, nullptr, nullptr,
+  r4d_shape_mla_attn },
+{ "gemm_fp8a8_f32scale", "gemm_nt_q", "gemm", "FP8 WMMA with canonical F32 block scales",
+  "N and K multiples of 128; pitched activations and row-major weights", "E4M3 codes, F32 scales, BF16 output",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cFp8F32Scale), NOTUNE,
+  nullptr, nullptr, r4d_rad_fp8_f32scale, nullptr, r4d_layout_fp8_f32scale, nullptr,
+  nullptr },
+{ "moe_gemm_fp8a8_f32scale", "moe_gemm_q", "moe", "grouped FP8 WMMA with canonical F32 block scales",
+  "equal parity widths; token/sorted activations; canonical pointer tables", "E4M3 codes, F32 scales, BF16 output",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cFp8F32Scale), NOTUNE,
+  nullptr, nullptr, r4d_rad_moe_fp8_f32scale, nullptr, r4d_layout_fp8_f32scale, nullptr,
+  nullptr },
+{ "dsa_score_fp8", "dsa_score", "attn", "32-head FP8 WMMA index scoring over paged keys",
+  "n=128, heads=32; ragged sequences and pitched tensors", "E4M3 codes, f32 scales and gates",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDsaScore), NOTUNE,
+  nullptr, nullptr, r4d_rad_dsa_score, nullptr, nullptr, nullptr,
+  r4d_shape_dsa_score },
+{ "mla_project_bf16", "mla_project", "attn", "per-head absorbed MLA projections",
+  "head_dim=256, latent_dim=512; pitched tensors", "bf16 input, weights and output; fp32 arithmetic",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMlaProject), NOTUNE,
+  nullptr, nullptr, r4d_rad_mla_project, nullptr, nullptr, nullptr,
+  r4d_shape_mla_project },
+{ "dsa_query_fp8", "dsa_query", "attn", "normalized index queries in wave-local registers",
+  "n=128; flattened heads and pitched rows", "bf16 input, E4M3 codes and power-of-two f32 scale",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDsaQuery), NOTUNE,
+  nullptr, nullptr, r4d_rad_dsa_query, nullptr, nullptr, nullptr,
+  r4d_shape_dsa_query },
+{ "gemm_nt_f32_bf16", "gemm_nt_f32", "gemm", "F32 routing and index gate projection",
+  "N<=512, K<=16384; pitched rows", "bf16 input, f32 weights and output",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cGemmNtF32), NOTUNE,
+  nullptr, nullptr, r4d_rad_gemm_nt_f32, nullptr, nullptr, nullptr,
+  r4d_shape_gemm_nt_f32 },
+{ "dsa_pool_fp8", "dsa_pool", "attn", "learned compressed index keys in wave-local registers",
+  "n=128, ratio=4; pitched rows", "bf16 keys/gates, f32 position bias; FP8 codes and f32 scale",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cDsaPool), NOTUNE,
+  nullptr, nullptr, r4d_rad_dsa_pool, nullptr, nullptr, nullptr,
+  r4d_shape_dsa_pool },
+{ "swiglu_clamped_bf16", "swiglu_clamped", "elem",
+  "asymmetrically clipped SwiGLU", "positive finite limit; pitched rows",
+  "bf16 in and out, fp32 arithmetic", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r4d_rad_swiglu_clamped, nullptr, nullptr, nullptr,
+  r4d_shape_silu_mul },
+{ "swiglu_clamped_quant_fp8", "swiglu_clamped_quant_fp8", "quant",
+  "asymmetrically clipped SwiGLU and the fp8 activation quantiser in one pass",
+  "positive finite limit; n a multiple of 4; the gated operand is [M][2n], gate then up; "
+  "group 128; pitched rows",
+  "bf16 in, E4M3 out with an f32 scale per (row, 128 columns) and an optional bf16 out; the codes "
+  "are taken over the BF16-ROUNDED product",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cSwigluClampedQuant), NOTUNE,
+  nullptr, nullptr, r4d_rad_swiglu_clamped_quant_fp8, nullptr, nullptr, nullptr,
+  r4d_shape_gated_quant_fp8, nullptr,
+  /* `swiglu_clamped` + `quant_act_fp8` (r4d_fuse.cpp). */
+  r4d_fuse_swiglu_clamped_quant_fp8 },
 { "silu_mul_bf16", "silu_mul", "elem",
   "silu-gated product over a fused [M, 2n] gate_up",
   "any n; the gate is the first half",
@@ -5663,6 +5971,37 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   nullptr, nullptr, r4d_rad_gdn_conv_recurrent_update, nullptr, nullptr, nullptr, nullptr,
   nullptr, r4d_fuse_gdn_conv_recurrent_update },
 
+{ "kda_update_k128_v128_bf16", "kda_update", "gdn", "per-channel KDA recurrence and candidate rollback",
+  "heads 1..65535, K=V=128, prefill and verify", "bf16 activations, f32 gates and state",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cKdaUpdate), NOTUNE,
+  nullptr, nullptr, r4d_rad_kda_update, nullptr, nullptr, nullptr,
+  r4d_shape_kda_update },
+{ "mhc_pre_bf16", "mhc_pre", "norm", "manifold residual gates and Sinkhorn mixing",
+  "M 1..65535, n 1..16384, hc 2..8, iterations 1..256", "bf16 activation, f32 weights and coefficients",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMhcPre), NOTUNE,
+  nullptr, nullptr, r4d_rad_mhc_pre, nullptr, nullptr, nullptr,
+  r4d_shape_mhc_pre },
+{ "mhc_pre_partial_bf16", "mhc_pre_partial", "norm", "mHC projection partials of a chunk range",
+  "n 4096, hc 4, chunk 2048 (GLM)", "bf16 activation, f32 weights and partials",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMhcPrePartial), NOTUNE,
+  nullptr, nullptr, r4d_rad_mhc_pre_partial, nullptr, nullptr, nullptr,
+  r4d_shape_mhc_pre_partial },
+{ "mhc_pre_finish_bf16", "mhc_pre_finish", "norm", "mHC gates and Sinkhorn mixing from gathered partials",
+  "n 4096, hc 4, chunk 2048 (GLM), iterations 1..256", "bf16 activation, f32 partials and coefficients",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMhcPreFinish), NOTUNE,
+  nullptr, nullptr, r4d_rad_mhc_pre_finish, nullptr, nullptr, nullptr,
+  r4d_shape_mhc_pre_finish },
+{ "mhc_post_bf16", "mhc_post", "norm", "source-to-destination manifold residual update",
+  "M 1..65535, n 1..16384, hc 2..8", "bf16 activation, f32 coefficients",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMhcPlain), NOTUNE,
+  nullptr, nullptr, r4d_rad_mhc_post, nullptr, nullptr, nullptr,
+  r4d_shape_mhc_post },
+{ "mhc_contract_bf16", "mhc_contract", "norm", "mean over manifold residual streams",
+  "M 1..65535, n 1..16384, hc 2..8", "bf16",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMhcPlain), NOTUNE,
+  nullptr, nullptr, r4d_rad_mhc_contract, nullptr, nullptr, nullptr,
+  r4d_shape_mhc_contract },
+
 /* ---------------------------------------------------------------- the gated residual --------
  * r4d_hc_bf16.hip. Three rows; the read is two launches behind one entry point, because `x`
  * depends on every column of the low-rank waist and the kernel boundary is the grid-wide
@@ -6275,6 +6614,22 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   nullptr, nullptr, r4d_rad_scale_rows, nullptr, nullptr, nullptr,
   r4d_shape_scale_rows },
 
+{ "router_sigmoid_topk_f32", "router_sigmoid_topk", "moe",
+  "sigmoid correction-bias routing", "single group, experts <=512, top_k<=32",
+  "f32 logits, bias and weights; i32 ids", RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cRouterSigmoid), NOTUNE,
+  nullptr, nullptr, r4d_rad_router_sigmoid_topk, nullptr, nullptr, nullptr,
+  r4d_shape_router_sigmoid_topk },
+{ "router_sigmoid_topk_scatter_f32", "router_sigmoid_topk_scatter", "moe",
+  "sigmoid correction-bias routing, the stable counting sort and the ungated shared gate in one "
+  "launch", "single group, experts <=512, top_k<=32, M*top_k<=1024",
+  "f32 logits, bias and weights; i32 ids, sorted slots, offsets and counts; bf16 gate",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cRouterSigmoidScatter), NOTUNE,
+  nullptr, nullptr, r4d_rad_router_sigmoid_topk_scatter, nullptr, nullptr, nullptr,
+  r4d_shape_router_sigmoid_topk_scatter, nullptr,
+  /* `router_sigmoid_topk` + `moe_scatter` (+ `fill` with the gate) (r4d_fuse.cpp). */
+  r4d_fuse_router_sigmoid_topk_scatter },
 { "router_topk_bf16", "router_topk", "moe",
   "softmax over a row of expert logits and the exact top-k of it, one wave a row",
   "n_expert <= 512, top_k <= min(n_expert, 32); bf16 logits and weights, i32 ids",
@@ -6316,6 +6671,23 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cMoeScatter), NOTUNE,
   nullptr, nullptr, r4d_rad_moe_scatter, r4d_rad_moe_scatter_scratch, nullptr, nullptr,
   r4d_shape_moe_scatter },
+
+{ "moe_scatter_inv_i32", "moe_scatter_inv", "moe",
+  "moe_scatter's stable counting sort, also writing every slot's row in the sort",
+  "n_expert <= 512; one launch at M*top_k <= 1024 and three above it",
+  "i32 throughout",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cMoeScatter), NOTUNE,
+  nullptr, nullptr, r4d_rad_moe_scatter_inv, r4d_rad_moe_scatter_scratch, nullptr, nullptr,
+  r4d_shape_moe_scatter_inv },
+
+{ "moe_gemm_mxfp4a8", "moe_gemm_q", "moe",
+  "canonical MXFP4 experts decoded in packed words into exact FP8 WMMA tiles, scales folded per 32 values",
+  "K multiple 128, parity tables, token and sorted order, parts and narrower odd experts",
+  "E2M1 and E8M0 weights, E4M3 activations and f32 scales, bf16 output",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY, ROW(cMoeMx), NOTUNE,
+  nullptr, nullptr, r4d_rad_moe_mxfp4, nullptr, r4d_rad_layout_moe_mxfp4, nullptr,
+  r4d_shape_moe_mxfp4 },
 
 { "moe_gemm_fp8a8", "moe_gemm_q", "moe",
   "the grouped block-scaled fp8 GEMM: one contiguous range of expert-sorted rows a block, looping "
@@ -6406,6 +6778,15 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
   ROW(cMoeGather), NOTUNE,
   nullptr, nullptr, r4d_rad_moe_gather, r4d_rad_moe_gather_scratch, nullptr, nullptr,
   r4d_shape_moe_gather },
+
+{ "moe_gather_inv_bf16", "moe_gather_inv", "moe",
+  "moe_gather over the slot table moe_scatter_inv wrote: no prepass and no scan of the sort",
+  "any M and n; the decode kernel up to 512 slots, the prefill forms above, as moe_gather",
+  "bf16 in and out, f32 or bf16 routing weights",
+  RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
+  ROW(cMoeGather), NOTUNE,
+  nullptr, nullptr, r4d_rad_moe_gather_inv, nullptr, nullptr, nullptr,
+  r4d_shape_moe_gather_inv },
 
 { "rowtopk_bf16", "row_topk", "select",
   "exact per-row top-R of a bf16 matrix, descending, ties to the lower column",

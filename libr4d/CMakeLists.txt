@@ -103,6 +103,13 @@ set(R4D_UNITS
   # launches behind one entry point: the mix depends on every column of the low-rank waist, so it
   # needs a grid-wide barrier.
   "r4d_hc_bf16|"
+  "r4d_mhc|"
+  "r4d_glm|"
+  "r4d_dsa|"
+  "r4d_mla|"
+  "r4d_kda|"
+  "r4d_moe_mxfp4|"
+  "r4d_fp8_f32scale|"
   "r4d_ngram_ids|"
   "r4d_ple_gate_bf16|"
   "r4d_ple_conv_bf16|"

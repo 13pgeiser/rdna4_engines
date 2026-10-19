@@ -643,6 +643,10 @@ void r4d_moe_gemm_pin_down_dec(int pin);
 // (refused likewise, and below 512 rows, whose scratch is not sized for their weight planes).
 // All bit-identical; r4d_selftest compares their bytes.
 void r4d_hc_read_pin_prefill(int form);
+// Test hook: pins the MLA matrix row's key load. 0 is the launcher's rule (sixteen-byte vectors
+// wherever the cache rows are aligned to them), 1 the element-wise load the rule falls back to.
+// Bit-identical; r4d_selftest compares them and --perfmla times both.
+void r4d_mla_matrix_pin_form(int form);
 // Test hook: records the function each launch dispatches into `fns[0..cap)`, in order, until the
 // next call, and returns how many launches the previous recording saw (which may exceed its cap).
 // Null `fns` stops recording. r4d_selftest uses it to show that a pinned form dispatches a kernel

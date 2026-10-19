@@ -995,6 +995,25 @@ TEST(libr4d_resolves_the_vision_attention_without_a_window) {
     for (const Band& x : b) CHECK_EQ(picked(x.dom[RAD_DOMAIN_DEVICE].row), "attn_vit_h72_bf16");
 }
 
+/* GLM-5.3-Flash's MLA at eight heads a rank: the matrix row ranks above the wave row and serves
+ * every M up to its bound, a decode step's rows and a prefill chunk alike. RADIANCE_MLA_MATRIX_MAX_M
+ * lowers that bound, which this case does not cover. */
+TEST(libr4d_resolves_the_mla_attention_by_rows) {
+    const std::string so = libr4d();
+    if (so.empty()) return;
+    if (std::getenv("RADIANCE_MLA_MATRIX_MAX_M")) return;
+    Registry r;
+    CHECK(r.load_plugin(so, 0) >= 0);
+    Geometry g;
+    g.set_i("latent_dim", 512);
+    g.set_i("heads", 8);
+    g.set_i("blocks", 513);
+    g.set_i("block_size", 4);
+    g.set_s("dtype", "bf16");
+    CHECK_EQ(band_names(r.build_bands("mla_attn", "M", 1, 2048, g)), "2048:mla_attn_matrix_bf16 ");
+    CHECK_EQ(band_names(r.build_bands("mla_attn", "M", 1, 48, g)), "48:mla_attn_matrix_bf16 ");
+}
+
 /* ================================================================== constraints that are not intervals */
 namespace {
 std::string extra_dir()   { return home() + "/testkernels/extra"; }
