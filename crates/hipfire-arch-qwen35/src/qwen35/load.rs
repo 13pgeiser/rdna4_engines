@@ -1355,16 +1355,6 @@ pub(crate) fn load_paroquant_weight(
     group_size: u32,
     krot: u8,
 ) -> HipResult<WeightTensor> {
-    // This loader tags every tensor ParoQ4G128; a G64 checkpoint must not reach
-    // the G128 kernels (llama's shared loader is the one that maps G64).
-    if group_size != 128 {
-        return Err(HipError::new(
-            0,
-            &format!(
-                "{tensor_prefix}: qwen3.5 ParoQuant supports group_size 128 only, got {group_size}"
-            ),
-        ));
-    }
     let qw_name = format!("{tensor_prefix}.qweight");
     let qz_name = format!("{tensor_prefix}.qzeros");
     let sc_name = format!("{tensor_prefix}.scales");
@@ -3166,9 +3156,20 @@ pub struct ParoSource<'a> {
 }
 impl<'a> ParoSource<'a> {
     pub fn new(source: &'a dyn ModelSource, c: &'a Qwen35Config) -> HipResult<Self> {
-        source
+        let qc = source
             .quant_config()
             .ok_or_else(|| HipError::new(0, "ParoQuant model must have quantization_config"))?;
+        // qwen3.5 Paro decode/prefill bind only the G128 kernels; the shared
+        // loader would hand a G64 checkpoint ParoQ4G64 weights they never admit.
+        if qc.group_size != 128 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "qwen3.5 ParoQuant supports group_size 128 only, got {}",
+                    qc.group_size
+                ),
+            ));
+        }
         let mp = paro_text_prefix(source)?;
         Ok(Self { source, mp, c })
     }
