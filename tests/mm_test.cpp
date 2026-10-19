@@ -1449,6 +1449,55 @@ TEST(unlimitedocr_tie_order_is_the_references) {
     CHECK_EQ(listed, kUocrNTallLast);
 }
 
+/* A line wider than one encoder pass is cut into chunks of whole tiles; only the last chunk
+ * carries the newline column, and only the real 4x4 view separator is flagged as one. */
+TEST(unlimitedocr_wide_lines_are_chunked_whole_tiles) {
+    Processor p;
+    REQUIRE_EQ(p.init(uocr_cfg(), [](const std::string&) { return std::vector<int32_t>{}; },
+                      uocr_marker), RAD_OK);
+    const int32_t q = kUocrTile / kUocrPatch;              /* 40 */
+    const int32_t w = 16000, h = 1024;                     /* 15.6:1: a 16-tile line */
+    int32_t cols = 1, rows = 1;
+    uocr_grid(h, w, kUocrMinTiles, kUocrMaxTiles, kUocrTile, &cols, &rows);
+    REQUIRE(cols > 10);                                    /* more than one chunk */
+    const int32_t chunk = (int32_t)((16384 / q - 4) / q);   /* 10 */
+
+    ImageMode mode;
+    mode.kind = ImageMode::Gundam;
+    std::shared_ptr<Item> it;
+    std::string why;
+    REQUIRE_EQ(p.image_from(frame(0, h, w), &it, &why, mode), RAD_OK);
+    REQUIRE(it != nullptr);
+
+    /* Two line chunks, the global view, the separator. */
+    REQUIRE_EQ(it->n_seg, 4);
+    CHECK_EQ(it->seg_h(0), q);
+    CHECK_EQ(it->seg_h(1), q);
+    CHECK(!it->seg_is_sep(0));
+    CHECK(!it->seg_is_sep(1));
+    CHECK(!it->seg_is_sep(2));
+    CHECK(it->seg_is_sep(3));
+    CHECK_EQ(it->seg_w(3), kUocrDownsample);
+    CHECK_EQ(it->seg_h(3), kUocrDownsample);
+
+    /* Earlier chunks end at their last tile; only the last has the 4 newline columns. */
+    CHECK_EQ(it->seg_w(0), q * chunk);
+    CHECK_EQ(it->seg_w(1), q * (cols - chunk) + kUocrDownsample);
+    for (int32_t s = 0; s < 2; ++s) CHECK_EQ(it->seg_w(s) % q, s == 1 ? kUocrDownsample : 0);
+
+    /* The placeholders are the reference's layout: (10*cols + 1) * 10 lines, plus 273 + 1. */
+    const int64_t want = 273 + (int64_t)(10 * cols + 1) * 10;
+    CHECK_EQ((int64_t)it->expand.size(), want);
+    CHECK_EQ(it->n_rows(), want);
+    CHECK_EQ(uocr_tokens(p.config(), mode, cols, rows), want);
+
+    /* Rows: each chunk contributes its patches / 16, the global 272, the separator 1. */
+    CHECK_EQ(it->row_at(1), (int64_t)q * it->seg_w(0) / 16);
+    CHECK_EQ(it->row_at(2), (int64_t)q * it->seg_w(0) / 16 + (int64_t)q * it->seg_w(1) / 16);
+    CHECK_EQ(it->row_at(3), it->row_at(2) + 272);
+    CHECK_EQ(it->row_at(4), want);
+}
+
 /* dynamic_preprocess's grid for a sweep of shapes, the exact ties of its ratio set included. */
 TEST(unlimitedocr_tile_grids_are_the_references) {
     for (const GoldUocrGrid& g : kUocrGrid) {
