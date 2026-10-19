@@ -1196,8 +1196,14 @@ const RadBatch* VideoDriver::build_encode(Job& j, int step) {
         for (int64_t f = nf; f < stage_frames; ++f)
             std::memcpy(px + f * area, px + (nf - 1) * area, (size_t)area * 4);
         reg_[R_ENCPX].used = stage_frames * area * 4;
+        if (enc_dbg_)
+            enc_dbg_dump_file("encpx_" + std::to_string((int)it.kind) + "_" +
+                              std::to_string((int)it.slot), px, (size_t)stage_frames * area * 4);
     }
     reg_[R_ENCG].used = 25 * 4;
+    if (enc_dbg_)
+        enc_dbg_dump_file("encg_" + std::to_string((int)it.kind) + "_" +
+                          std::to_string((int)it.slot), gd, 25 * 4);
     stage_geom(j, j.geom, j.rows, 0);
     if (upload() < 0) return nullptr;
     base_batches(j, j.geom, 0, step);

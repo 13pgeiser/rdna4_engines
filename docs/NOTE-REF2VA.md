@@ -212,8 +212,30 @@ as point 6 / point 4. Nothing here claims to match ComfyUI's timings.
    match ComfyUI latent-for-latent. Reproduce: dump with `R4D_ENC_DEBUG=1 R4D_ENC_DUMPDIR=<dir>` over one
    `ref_audio` request, then `ref_aenc_parity.py --enca enca.f32 --encsm encsm_4_1.f32 --kind audio
    --slot 1` (its `--selftest` validates the reshape / slot / metric logic with no device). The audio
-   encoder is the cleanest first measurement because it has no spatial preprocessing to confound it; the
-   video VAE remains the harder, still-unmeasured half.
+   encoder is the cleanest first measurement because it has no spatial preprocessing to confound it.
+
+   The **video / image VAE encoder has now been measured the same way and diverges too** — with the
+   *same signature*. A single reference picture is the cleanest video case (the `encode()` T==1 branch,
+   one clip, exactly one latent frame, so no temporal keep-first/last ambiguity). The device stores
+   `b_evc` as the *patch-folded* normalised latent (24 ch × a 2×2 patch = 96-wide rows), so the harness
+   compares the two **sorted** value vectors — the fold is a pure bijection and the latent norm is
+   per-channel, so a faithful encoder has an identical multiset regardless of fold order (this sidesteps
+   re-deriving the fold's layout, the mistake that once cost a bogus audio reading). Result on a 256×256
+   gradient picture: **sorted relative Frobenius 0.65, device latent std 0.44 vs reference 1.15** (a
+   ~2.6× under-spread), max-abs deviation 4.26. Note the ratio: the audio path collapsed std 0.59→0.23
+   (~2.6×) and the video path 1.15→0.44 (~2.6×) — the *same* qualitative signature across two entirely
+   different kernel families (strided conv1d vs `conv3d_ndhwc`). **And for BOTH families the latent
+   normalisation constants are byte-identical to the reference** (`kVaeLatentsMean/Std` vs `LATENTS_MEAN/
+   STD` max rel-diff 0.0; `kAudioLatents*` likewise verified earlier), so the collapse is *not* the
+   normalisation constants. That refines the earlier "suspect the strided conv1d temporal reduction"
+   note: the divergence is not audio-specific, so the leading hypothesis is now the encoder *network*
+   forward path shared in shape by both (a per-level norm / activation scale or a weight-quantisation
+   attenuation), not a single family's conv reduction. Localising it needs stage-by-stage activation
+   dumps of a device encode against the reference module-by-module — substantial work on kernels the
+   live image / plain paths also run through, and deliberately **not** blind-fixed. Reproduce: dump with
+   `R4D_ENC_DEBUG=1 R4D_ENC_DUMPDIR=<dir>` over one single-image `ref2va` request (emits `encpx_1_<slot>`,
+   `encg_1_<slot>`, `evc`), then `ref_venc_parity.py --evc evc.f32 --encpx encpx_1_1.f32 --encg
+   encg_1_1.f32 --slot 1` (`--selftest` validates the fold/norm/sorted model with no device).
 
    What still differs from the DaSiWa reference (hence not pixel-for-pixel reproducible):
    - **The text encoder only *names* a moving picture; it never sees its pixels.** DaSiWa also shows
