@@ -454,3 +454,24 @@ be measured against are an **external Hermes deliverable** not available on this
 pair running ComfyUI here). Against those floors the full-shape 512 clip (121 s) is far below a single
 ComfyUI clip, so the claim is *directionally* supported, but **P6's comparative verdict is blocked on the
 external sol-attn baseline**, not on anything in this branch. The harness is `build/tmp/bench.sh`.
+
+## #8 kR2VCond keyframe-pin (FL2VA exact-pin) — disposition: left optional, not wired (2026-10-19)
+
+The pack layer is **done and reference-verified** (`ref2va_build` emits `kR2VCond`/`kR2VCondAudio`; golden
+fl2va/chain assert segment order/size/position/`img_pos`/`mod` bit-exact; `ref_pack_of`/`rad_arch_video_pack`
+already parse `nk` up to 8). What remains is **engine wiring only**: driver populates keyframe rows in
+`ref_tab` (`nk` stays 0 today — see `video_driver.cpp` submit/stage_geom "continuation is separate"), `step_dit`
+scatters cond rows from the reserved `RAD_ENC_TAIL` slot via `op_vin`/`op_ain`, a continuation-tail *input*
+API, and persisting the prior clip's tail latent across requests.
+
+**Not implemented, deliberately.** DaSiWa chaining — the actual capability — already works via the
+**ref_video slot0 path** (no new code, device-verified), so the exact-pin is an alternative pinning mechanism,
+not a requirement. The wiring lands in the **shared `step_dit`** (serves every conditioned + plain path), and
+its *purpose* — an exact frame pin — is a **numeric-fidelity** claim with no golden to check against on this
+box (there is no reference FL2VA engine to diff latents against; same external limit as P6's comparative
+claim). Building it would be a blind change to shared kernels that could ship a silently-wrong latent, which
+the workflow rule forbids. It is left **pending and optional**; a function-level device battery (keyframe
+present/absent → deterministic content-sensitive change) is the verification available here, but that
+verifies consumption, not the exact pin, and does not justify the shared-path regression risk given chaining
+already works. **User action to unblock a faithful implementation:** a reference FL2VA engine (or the Hermes
+golden rows) to diff the pinned-clip latents against.
