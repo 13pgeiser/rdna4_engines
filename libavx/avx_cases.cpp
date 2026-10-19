@@ -113,6 +113,39 @@ std::vector<Case> build_cases() {
      * on is the trunk case, off the final mixer; they differ in the operand list. */
     for (const char* dt : { "f32", "bf16" }) {
         add("hc_enter",  { HI("M", 5), HI("n", 128), HI("hc", 4), HS("dtype", dt) });
+        add("swiglu_clamped", { HI("M", 5), HI("n", 259), HF("limit", 0.5), HS("dtype", dt) });
+        if (!std::strcmp(dt, "bf16"))
+            add("dsa_pool", { HI("M", 7), HI("n", 128), HI("ratio", 4), HS("dtype", "bf16") });
+        if (!std::strcmp(dt, "bf16"))
+            add("dsa_query", { HI("M", 7), HI("n", 128), HS("dtype", "bf16") });
+        if (!std::strcmp(dt, "bf16"))
+            add("gemm_nt_f32", { HI("M", 4), HI("N", 32), HI("K", 129), HS("dtype", "bf16") });
+        if (!std::strcmp(dt, "bf16"))
+            for (const char* mode : { "absorb", "expand" })
+                add("mla_project", { HI("M", 3), HI("heads", 2), HI("head_dim", 17),
+                                     HI("latent_dim", 31), HS("mode", mode), HS("dtype", "bf16") });
+        if (!std::strcmp(dt, "bf16"))
+            add("dsa_score", { HI("M", 3), HI("n", 128), HI("heads", 32), HI("blocks", 17),
+                               HI("seqs", 2), HS("dtype", "fp8_e4m3") });
+        for (int norm : { 0, 1 })
+            add("router_sigmoid_topk",
+                { HI("M", 5), HI("n_expert", 288), HI("top_k", 8), HI("norm", norm),
+                  HF("route_scale", 2.5), HS("dtype", dt) });
+        add("mhc_pre", { HI("M", 3), HI("n", 129), HI("hc", 4), HI("iterations", 20),
+                         HF("eps", 1e-5), HF("hc_eps", 1e-6), HS("dtype", dt) });
+        add("mhc_pre_partial", { HI("M", 3), HI("n", 129), HI("hc", 4), HI("chunk", 129),
+                                 HI("first", 1), HI("chunks", 2), HS("dtype", dt) });
+        add("mhc_pre_finish",
+            { HI("M", 3), HI("n", 129), HI("hc", 4), HI("iterations", 20), HF("eps", 1e-5),
+              HF("hc_eps", 1e-6), HI("chunk", 129), HS("dtype", dt) });
+        add("mhc_post", { HI("M", 3), HI("n", 129), HI("hc", 4), HS("dtype", dt) });
+        add("mhc_contract", { HI("M", 3), HI("n", 129), HI("hc", 4), HS("dtype", dt) });
+        add("mla_attn", { HI("M", 3), HI("latent_dim", 32), HI("heads", 2), HI("blocks", 7),
+                          HI("block_size", 4), HF("scale", 0.125), HS("dtype", dt) });
+        for (const char* mode : { "prefill", "verify" })
+            add("kda_update", { HI("M", 3), HI("heads", 2), HI("head_k", 32), HI("head_v", 32),
+                                HF("lower_bound", -5), HF("scale", 0.1767766952966369),
+                                HF("l2_eps", 1e-6), HS("mode", mode), HS("dtype", dt) });
         add("hc_write",  { HI("M", 5), HI("n", 128), HI("hc", 4), HS("dtype", dt) });
         add("hc_read",   { HI("M", 5), HI("n", 128), HI("hc", 4), HI("lowrank", 8),
                            HF("eps", 1e-6), HS("dtype", dt), HF("wadd", 1), HI("inject", 1),
@@ -134,6 +167,10 @@ std::vector<Case> build_cases() {
     }
     add("ngram_ids", { HI("M", 9), HI("heads", 3), HI("ngram", 4), HI("eos", 2) });
 
+    for (const char* order : { "token", "sorted" })
+        add("moe_gemm_q",
+            { HI("M", 9), HI("N", 64), HI("K", 128), HI("n_expert", 8), HI("top_k", 2),
+              HI("group", 128), HS("a_order", order), HS("dtype", "mxfp4a8") });
     /* One scale per column over the rows: no group. */
     add("quant_cols_fp8", { HI("M", 5), HI("n", 256), HS("dtype", "bf16") }, EB(5, 256, 2, 1.5));
     add("quant_cols_fp8", { HI("M", 7), HI("n", 96), HS("dtype", "f32") }, EB(7, 96, 4, 1.25));
@@ -214,7 +251,7 @@ std::vector<Case> build_cases() {
     /* The formats libref describes (ref_shapes.cpp): block fp8, and the int4 and int8 weights
      * against quant_act_i8's step-ordered codes. The bias form needs `a_scale`, which fp8a16 (a
      * bf16 activation) does not have, so libref declines it there. */
-    for (const char* dt : { "fp8a8", "fp8a16", "w4a8", "w8a8" })
+    for (const char* dt : { "fp8a8", "fp8a8f32", "fp8a16", "w4a8", "w8a8" })
         for (int M : { 1, 65 }) {
             const double fl = 2.0 * M * 96 * 256;
             add("gemm_nt_q",      { HI("M", M), HI("N", 96), HI("K", 256), HI("group", 128),
@@ -439,6 +476,10 @@ std::vector<Case> build_cases() {
                         HI("seqs", 3) });
     add("qsa_select", { HI("M", 2), HI("blocks", 1), HI("topk", 1), HI("ratio", 3),
                         HI("seqs", 1) });
+    add("qsa_select", { HI("M", 4), HI("blocks", 300), HI("topk", 32), HI("ratio", 4),
+                        HI("seqs", 1), HI("signed", 1) });
+    add("qsa_select", { HI("M", 7), HI("blocks", 129), HI("topk", 16), HI("ratio", 4),
+                        HI("seqs", 3), HI("signed", 1) });
     add("qsa_tail_store", { HI("M", 3), HI("n", 37), HI("ratio", 2), HI("ring", 2), HI("seqs", 3),
                             HS("dtype", "f32") });
     add("qsa_work", { HI("M", 3), HI("n", 40), HI("ratio", 2), HI("ring", 3), HI("seqs", 3),
@@ -523,6 +564,9 @@ std::vector<Case> build_cases() {
             add("moe_gemm_q", { HI("M", 9), HI("N", 64), HI("K", 128), HI("n_expert", 8),
                                 HI("top_k", 2), HI("group", 128), HS("a_order", order),
                                 HS("dtype", "fp8a8") });
+            add("moe_gemm_q",
+                { HI("M", 9), HI("N", 128), HI("K", 256), HI("n_expert", 8), HI("top_k", 2),
+                  HI("group", 128), HS("a_order", order), HS("dtype", "fp8a8f32") });
         }
         /* Two classes at different widths: a gate/up pair whose odd experts are half as wide
          * (the output's second part begins past the odd class's zeros), and a down projection

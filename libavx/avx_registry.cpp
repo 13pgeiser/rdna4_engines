@@ -67,6 +67,26 @@ static const RadOperandSpec oHcRead[]  = { OPD("h"), WGT("w"), WGT("mix_down"), 
                                            WGT_O("inject_w"), OUT("x"), OUT_O("inj"), OUT_O("q"),
                                            OUT_O("scale"), OUT_O("rq"), OUT_O("rscale") };
 
+static const RadParamSpec pMhcPre[] = { P_INT("M"), P_INT("n"), P_INT("hc"),
+    P_INT("iterations"), P_F64("eps"), P_F64("hc_eps"), P_STR("dtype") };
+static const RadOperandSpec oMhcPre[] = { OPD("h"), WGT("fn"), WGT("scale"), WGT("base"),
+    OUT("x"), OUT("post"), OUT("comb") };
+static const RadParamSpec pMhcPrePartial[] = { P_INT("M"), P_INT("n"), P_INT("hc"),
+    P_INT("chunk"), P_INT("first"), P_INT("chunks"), P_STR("dtype") };
+static const RadOperandSpec oMhcPrePartial[] = { OPD("h"), WGT("fn"), OUT("part") };
+static const RadParamSpec pMhcPreFinish[] = { P_INT("M"), P_INT("n"), P_INT("hc"),
+    P_INT("iterations"), P_F64("eps"), P_F64("hc_eps"), P_INT("chunk"), P_STR("dtype") };
+static const RadOperandSpec oMhcPreFinish[] = { OPD("part"), OPD("h"), WGT("scale"), WGT("base"),
+    OUT("x"), OUT("post"), OUT("comb") };
+static const RadOperandSpec oMhcPost[] = { OPD("x"), OPD("h"), OPD("post"), OPD("comb"), OUT("out") };
+static const RadOperandSpec oMhcContract[] = { OPD("h"), OUT("x") };
+static const RadParamSpec pKdaUpdate[] = { P_INT("M"), P_INT("heads"), P_INT("head_k"),
+    P_INT("head_v"), P_F64("lower_bound"), P_F64("scale"), P_F64("l2_eps"),
+    P_STR("mode"), P_STR("dtype"), P_STRO("state_form") };
+static const RadOperandSpec oKdaUpdate[] = { OPD("q"), OPD("k"), OPD("v"), OPD("a"), OPD("b"),
+    WGT("A_log"), WGT("dt_bias"), INOUT("state"), OPD("state_idx"), OPD("cu"),
+    OPD_O("num_accepted"), OPD_O("has_init"), OUT("o") };
+
 static const RadParamSpec pNgramIds[]   = { P_INT("M"), P_INT("heads"), P_INT("ngram"),
                                             P_INT("eos") };
 static const RadOperandSpec oNgramIds[] = { OPD("tok"), INOUT("state"), OPD("cu"), WGT("mult"),
@@ -110,6 +130,22 @@ static const RadOperandSpec oLayernorm[] = { OPD("x"), WGT("w"), WGT_O("b"), OUT
 static const RadParamSpec pGridEmbed[]   = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype") };
 static const RadOperandSpec oGridEmbed[] = { INOUT("x"), WGT("table"), OPD("coord") };
 
+static const RadParamSpec pSwigluClamped[] = { P_INT("M"), P_INT("n"), P_F64("limit"), P_STR("dtype") };
+static const RadParamSpec pDsaPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype"), P_INTO("block_size") };
+static const RadParamSpec pMlaAttn[] = { P_INT("M"), P_INT("latent_dim"), P_INT("heads"),
+    P_INT("blocks"), P_INT("block_size"), P_F64("scale"), P_STR("dtype") };
+static const RadParamSpec pMlaProject[] = { P_INT("M"), P_INT("heads"), P_INT("head_dim"),
+    P_INT("latent_dim"), P_STR("mode"), P_STR("dtype") };
+static const RadOperandSpec oMlaAttn[] = { OPD("q"), OPD("kv"), OPD("bt"), OPD("length"), OUT("out") };
+static const RadParamSpec pDsaScore[] = { P_INT("M"), P_INT("n"), P_INT("heads"),
+    P_INT("blocks"), P_INT("seqs"), P_STR("dtype") };
+static const RadOperandSpec oDsaScore[] = { OPD("q"), OPD("q_scale"), OPD("gate"), OPD("k"),
+    OPD_O("k_scale"), OPD("bt"), OPD("cu"), OPD("nc"), OUT("score") };
+static const RadOperandSpec oDsaPool[] = { OPD("kg"), WGT("ape"), OUT("q"), OUT("scale"),
+    OPD_O("page"), INOUT_O("cache") };
+static const RadParamSpec pRouterSigmoid[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
+    P_INT("norm"), P_F64("route_scale"), P_STR("dtype") };
+static const RadOperandSpec oRouterSigmoid[] = { OPD("logits"), WGT("bias"), OUT("ids"), OUT("weights") };
 static const RadParamSpec pMnD[]      = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 /* `add`'s `div` divides the rounded sum (libref's pAdd). */
 static const RadParamSpec pAdd[]      = { P_INT("M"), P_INT("n"), P_STR("dtype"), P_F64O("div") };
@@ -697,6 +733,14 @@ static const RadOpSchema kSchemas[] = {
   "f32 sum, the multiply from residual_out after narrowing, as libref." },
 { "hc_enter", ARR(pHcWrite), ARR(oHcEnter),
   "h[s] = x for each of the hc streams -- the wide residual stream's first value." },
+{ "mhc_pre", ARR(pMhcPre), ARR(oMhcPre), "Whole-residual RMS projection, sigmoid gates and Sinkhorn mixing." },
+{ "mhc_pre_partial", ARR(pMhcPrePartial), ARR(oMhcPrePartial),
+  "mhc_pre's projection over chunks [first, first+chunks) of `chunk` columns, zero-padded per chunk." },
+{ "mhc_pre_finish", ARR(pMhcPreFinish), ARR(oMhcPreFinish),
+  "mhc_pre from every chunk's partials: chunk sums, gates, Sinkhorn mixing, collapse." },
+{ "mhc_post", ARR(pHcWrite), ARR(oMhcPost), "Source-to-destination manifold residual update." },
+{ "mhc_contract", ARR(pHcWrite), ARR(oMhcContract), "Mean over manifold residual streams." },
+{ "kda_update", ARR(pKdaUpdate), ARR(oKdaUpdate), "Bounded per-channel KDA with candidate-state rollback." },
 { "hc_read", ARR(pHcRead), ARR(oHcRead),
   "The read half of a gated residual: grouped norm, low-rank gate, stream mix, and optionally the "
   "block-scaled fp8 form of x and its Hadamard-rotated twin. See docs/OPS.md for the three facts "
@@ -737,6 +781,20 @@ static const RadOpSchema kSchemas[] = {
   "local attention with a relative-position term and a softcap (Gemma 4's audio)." },
 { "pool_rows", ARR(pPoolRows), ARR(oUnary),
   "y[r] = the mean of x's rows [r*k, r*k + k), rounded to y's dtype, times mult, rounded again." },
+{ "mla_attn", ARR(pMlaAttn), ARR(oMlaAttn),
+  "Softmax over selected latent vectors used as both key and value; per-query page tables and visible lengths." },
+{ "mla_project", ARR(pMlaProject), ARR(oGemm),
+  "Per-head query absorption or value expansion through the shared [head,(K|V),latent] BF16 matrix." },
+{ "dsa_score", ARR(pDsaScore), ARR(oDsaScore),
+  "Per-head ReLU of FP8 dot products, then signed head gates and scales; invalid history is -inf." },
+{ "gemm_nt_f32", ARR(pGemm), ARR(oGemm),
+  "BF16 activations times F32 weights, F32 accumulation and output; preserves routing and index gate precision." },
+{ "dsa_query", ARR(pMnD), ARR(oQuantFp8),
+  "Normalized Hadamard, BF16 boundary and power-of-two E4M3 quantization per query head." },
+{ "dsa_pool", ARR(pDsaPool), ARR(oDsaPool),
+  "Channel-wise softmax pooling with learned position bias, BF16, normalized Hadamard, BF16, power-of-two FP8." },
+{ "swiglu_clamped", ARR(pSwigluClamped), ARR(oGateUp),
+  "silu(min(gate,limit))*clamp(up,-limit,limit); gate is the first half." },
 { "silu_mul", ARR(pMnD), ARR(oGateUp),
   "silu-gated product over a fused [M, 2n] gate_up: y = silu(gate) * up." },
 { "gelu_mul", ARR(pMnD), ARR(oGateUp),
@@ -848,6 +906,8 @@ static const RadOpSchema kSchemas[] = {
 { "qk_norm_rope", ARR(pQkNormRope), ARR(oQkNormRope), "per-head QK norm then rotary embedding." },
 { "scale_rows", ARR(pScaleRows), ARR(oScaleRows),
   "one scalar per row, optionally through an activation, broadcast across the row." },
+{ "router_sigmoid_topk", ARR(pRouterSigmoid), ARR(oRouterSigmoid),
+  "Single-group sigmoid routing; correction bias selects experts, original scores weight them." },
 { "router_topk", ARR(pRouter), ARR(oRouter), "softmax then exact top-k routing." },
 { "moe_scatter", ARR(pScatter), ARR(oScatter),
   "stable counting sort of routing slots by expert." },
@@ -1160,6 +1220,12 @@ SIMPLE("avx_rmsnorm_add", "rmsnorm_add", "norm", "residual add then RMS norm", D
        L(rmsnorm_add)),
 SIMPLE("avx_hc_enter", "hc_enter", "norm", "gated residual entry: hc copies of x", DT_FLOAT,
        L(hc_enter)),
+SIMPLE("avx_mhc_pre", "mhc_pre", "norm", "manifold gates and Sinkhorn mixing", DT_FLOAT, L(mhc_pre)),
+SIMPLE("avx_mhc_pre_partial", "mhc_pre_partial", "norm", "manifold projection partials", DT_FLOAT, L(mhc_pre_partial)),
+SIMPLE("avx_mhc_pre_finish", "mhc_pre_finish", "norm", "manifold gates from projection partials", DT_FLOAT, L(mhc_pre_finish)),
+SIMPLE("avx_mhc_post", "mhc_post", "norm", "manifold residual update", DT_FLOAT, L(mhc_post)),
+SIMPLE("avx_mhc_contract", "mhc_contract", "norm", "mean of residual streams", DT_FLOAT, L(mhc_contract)),
+SIMPLE("avx_kda_update", "kda_update", "gdn", "bounded KDA and candidate-state rollback", DT_FLOAT, L(kda_update)),
 ROWL("avx_hc_read", "hc_read", "norm",
      "gated residual read: grouped norm, low-rank gate, stream mix",
      DT_FLOAT ", or mixing matrices of E4M3 / int8 codes with a scale plane, joined", L(hc_read),
@@ -1203,6 +1269,20 @@ SIMPLE("avx_seg_sinusoid", "seg_sinusoid", "elem",
 SIMPLE("avx_attn_local_rel", "attn_local_rel", "attn",
        "local attention with a relative-position term and a softcap", DT_FLOAT,
        L(attn_local_rel)),
+SIMPLE("avx_mla_attn", "mla_attn", "attn", "absorbed latent MQA attention", DT_FLOAT,
+       L(mla_attn)),
+SIMPLE("avx_dsa_score", "dsa_score", "attn", "weighted FP8 index scoring", DT_FLOAT,
+       L(dsa_score)),
+SIMPLE("avx_dsa_pool", "dsa_pool", "attn", "learned compressed FP8 index keys", DT_FLOAT,
+       L(dsa_pool)),
+SIMPLE("avx_dsa_query", "dsa_query", "attn", "normalized FP8 index queries", DT_FLOAT,
+       L(dsa_query)),
+SIMPLE("avx_gemm_nt_f32", "gemm_nt_f32", "gemm", "F32 routing projection", DT_FLOAT,
+       L(gemm_nt_f32)),
+SIMPLE("avx_mla_project", "mla_project", "attn", "absorbed MLA projections", DT_FLOAT,
+       L(mla_project)),
+SIMPLE("avx_swiglu_clamped", "swiglu_clamped", "elem", "asymmetrically clipped SwiGLU", DT_FLOAT,
+       L(swiglu_clamped)),
 SIMPLE("avx_silu_mul", "silu_mul", "elem", "silu-gated product over a fused gate_up", DT_FLOAT,
        L(silu_mul)),
 SIMPLE("avx_gelu_mul", "gelu_mul", "elem", "gelu_tanh-gated product over a fused gate_up", DT_FLOAT,
@@ -1325,6 +1405,8 @@ SIMPLE("avx_qsa_work", "qsa_work", "attn",
 
 SIMPLE("avx_router_topk", "router_topk", "moe", "softmax then exact top-k routing", DT_FLOAT,
        L(router_topk)),
+SIMPLE("avx_router_sigmoid_topk", "router_sigmoid_topk", "moe", "sigmoid correction-bias routing", DT_FLOAT,
+       L(router_sigmoid_topk)),
 SIMPLE("avx_moe_scatter", "moe_scatter", "moe", "stable counting sort of routing slots by expert",
        "i32 indices", L(moe_scatter)),
 SIMPLE("avx_moe_gemm", "moe_gemm", "moe", "grouped GEMM over the expert-sorted rows", DT_FLOAT,

@@ -751,6 +751,34 @@ TEST(kv_block_size_comes_off_the_kernel) {
     CHECK_EQ((int)gi.layers.size(), 2);
 }
 
+TEST(glm_index_cache_pages_are_sized_by_the_real_pool_consumer) {
+    Registry reg;
+    REQUIRE_EQ(reg.load_dir(home() + "/kernels", { "libref" }), RAD_OK);
+    Builder b(reg, make_meta(), make_ctx());
+    RadKVGroupDecl kd{};
+    kd.kind = RAD_KV_FULL;
+    kd.dtype = RAD_U8;
+    kd.n_head_kv = 1;
+    kd.head_dim = 17;
+    const auto group = b.decl_kv_group("glm_index", &kd);
+    RadWeightDecl wd{};
+    wd.dtype = RAD_F32;
+    wd.rank = 2;
+    wd.shape[0] = 4;
+    wd.shape[1] = 128;
+    wd.access = RAD_ACCESS_PER_TOKEN;
+    wd.shard = RAD_SHARD_NONE;
+    const auto ape = b.decl_weight("pool_ape", &wd);
+    const RadParam params[] = { RAD_RANGE("M", 1, 12), RAD_INT("n", 128), RAD_INT("ratio", 4),
+                                RAD_STR("dtype", "bf16"), RAD_INT("block_size", 4) };
+    REQUIRE(b.decl_op("dsa_pool", params, 5, &ape, 1));
+    CHECK_EQ(b.kv_block_size(group), 4);
+    CHECK_OK(b.bind_layer_kv(0, group));
+    CHECK_OK(b.bind_layer_kv(1, group));
+    REQUIRE_EQ(b.finish(), RAD_OK);
+    CHECK_EQ(b.program().kv_groups[group].bytes_per_block, (int64_t)(2 * 136));
+}
+
 TEST(a_kv_group_with_no_layers_is_an_error) {
     NEED_PLUGIN(reg)
     Builder b(reg, make_meta(), make_ctx());

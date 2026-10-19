@@ -229,6 +229,669 @@ int run(const char* op, A& args, int rank = 0, int world = 1) {
 
 }  /* namespace */
 
+TEST(manifold_read_uses_whole_stream_rms_and_unaveraged_pre_mix) {
+    T h(RAD_F32, {1, 2}); h.f({1, 3});
+    T fn(RAD_F32, {8, 2});
+    fn.f({3.0f * std::log(3.0f), 0});
+    T scale(RAD_F32, {3}); scale.f({1, 1, 1});
+    T base(RAD_F32, {8}); base.f({0, 0, std::log(3.0f), 0, 0, 0, 0, 0});
+    T x(RAD_F32, {1, 1}), post(RAD_F32, {1, 2}), comb(RAD_F32, {1, 4});
+    A a; a.t(h).t(fn).t(scale).t(base).t(x).t(post).t(comb)
+        .i("M", 1).i("n", 1).i("hc", 2).i("iterations", 20)
+        .d("eps", 4).d("hc_eps", 0).s("dtype", "f32");
+    REQUIRE_EQ(run("mhc_pre", a), RAD_OK);
+    /* RMS inverse = 1/3, pre = [3/4,1/2], post = [3/2,1]. */
+    CHECK_NEAR(x.at(0), 2.25f, 1e-6);
+    CHECK_NEAR(post.at(0), 1.5f, 1e-6);
+    CHECK_EQ(post.at(1), 1.0f);
+    for (int i = 0; i < 4; ++i) CHECK_EQ(comb.at(i), 0.5f);
+    a.ps[3].ival = 0;
+    CHECK_EQ(run("mhc_pre", a), RAD_E_SHAPE);
+}
+
+/* Two ranks each project half of the chunks; their partials, joined row by row as the
+ * row-interleaved all_gather lays them out, finish to mhc_pre. Quarter-step inputs keep every
+ * product and sum exact, so the split is compared bit for bit. */
+TEST(manifold_read_split_by_chunks_finishes_to_the_whole_read) {
+    const int64_t M = 3, n = 8, hc = 4, W = hc * n, mix = hc * (hc + 2), S = 28;
+    T h(RAD_F32, {M, W}), fn(RAD_F32, {mix, W}), scale(RAD_F32, {3}), base(RAD_F32, {mix});
+    std::vector<float> hv((size_t)(M * W)), fv((size_t)(mix * W)), bv((size_t)mix);
+    for (size_t i = 0; i < hv.size(); ++i) hv[i] = (float)((int)((i * 7) % 9) - 4) * 0.25f;
+    for (size_t i = 0; i < fv.size(); ++i) fv[i] = (float)((int)((i * 5) % 7) - 3) * 0.125f;
+    for (size_t i = 0; i < bv.size(); ++i) bv[i] = (float)((int)(i % 5) - 2) * 0.5f;
+    h.f(hv); fn.f(fv); scale.f({0.5f, 0.25f, 1.0f}); base.f(bv);
+    T x(RAD_F32, {M, n}), post(RAD_F32, {M, hc}), comb(RAD_F32, {M, hc * hc});
+    A whole; whole.t(h).t(fn).t(scale).t(base).t(x).t(post).t(comb)
+        .i("M", M).i("n", n).i("hc", hc).i("iterations", 20)
+        .d("eps", 1e-5).d("hc_eps", 1e-6).s("dtype", "f32");
+    REQUIRE_EQ(run("mhc_pre", whole), RAD_OK);
+    T gathered(RAD_F32, {M, 4 * S});
+    for (int rank = 0; rank < 2; ++rank) {
+        T part(RAD_F32, {M, 2 * S});
+        part.f(std::vector<float>((size_t)(M * 2 * S), 9.0f));
+        A pa; pa.t(h).t(fn).t(part).i("M", M).i("n", n).i("hc", hc).i("chunk", 8)
+            .i("first", 2 * rank).i("chunks", 2).s("dtype", "f32");
+        REQUIRE_EQ(run("mhc_pre_partial", pa), RAD_OK);
+        for (int64_t r = 0; r < M; ++r) for (int64_t c = 0; c < 2; ++c)
+            for (int64_t j = mix + 1; j < S; ++j) CHECK_EQ(part.at(r * 2 * S + c * S + j), 0.0f);
+        for (int64_t r = 0; r < M; ++r) for (int64_t i = 0; i < 2 * S; ++i)
+            st_dt(RAD_F32, gathered.t.data, r * 4 * S + rank * 2 * S + i, part.at(r * 2 * S + i));
+    }
+    T x2(RAD_F32, {M, n}), post2(RAD_F32, {M, hc}), comb2(RAD_F32, {M, hc * hc});
+    A fa; fa.t(gathered).t(h).t(scale).t(base).t(x2).t(post2).t(comb2)
+        .i("M", M).i("n", n).i("hc", hc).i("iterations", 20)
+        .d("eps", 1e-5).d("hc_eps", 1e-6).i("chunk", 8).s("dtype", "f32");
+    REQUIRE_EQ(run("mhc_pre_finish", fa), RAD_OK);
+    for (int64_t i = 0; i < M * n; ++i) CHECK_EQ(x2.at(i), x.at(i));
+    for (int64_t i = 0; i < M * hc; ++i) CHECK_EQ(post2.at(i), post.at(i));
+    for (int64_t i = 0; i < M * hc * hc; ++i) CHECK_EQ(comb2.at(i), comb.at(i));
+    /* A chunk that does not divide the residual, or a range past its end, is refused. */
+    T part(RAD_F32, {M, 2 * S});
+    A bad; bad.t(h).t(fn).t(part).i("M", M).i("n", n).i("hc", hc).i("chunk", 8)
+        .i("first", 3).i("chunks", 2).s("dtype", "f32");
+    CHECK_EQ(run("mhc_pre_partial", bad), RAD_E_SHAPE);
+    fa.ps[6].ival = 7;
+    CHECK_EQ(run("mhc_pre_finish", fa), RAD_E_SHAPE);
+}
+
+TEST(manifold_post_mixes_sources_into_destinations_and_contracts_by_mean) {
+    T h(RAD_F32, {1, 6}); h.f({10, 20, 30, 40, 50, 60});
+    T x(RAD_F32, {1, 2}); x.f({2, 4});
+    T post(RAD_F32, {1, 3}); post.f({1, 2, 3});
+    T comb(RAD_F32, {1, 9}); comb.f({0, 1, 0, 0, 0, 1, 1, 0, 0});
+    T out(RAD_F32, {1, 6});
+    A a; a.t(x).t(h).t(post).t(comb).t(out).i("M", 1).i("n", 2).i("hc", 3).s("dtype", "f32");
+    REQUIRE_EQ(run("mhc_post", a), RAD_OK);
+    const float expected[] = {52, 64, 14, 28, 36, 52};
+    for (int i = 0; i < 6; ++i) CHECK_EQ(out.at(i), expected[i]);
+    /* The input remains the unnormalized residual. */
+    CHECK_EQ(h.at(0), 10.0f);
+    a.ts[4] = h.t;
+    CHECK_EQ(run("mhc_post", a), RAD_E_SHAPE);
+    T contracted(RAD_F32, {1, 2});
+    A c; c.t(h).t(contracted).i("M", 1).i("n", 2).i("hc", 3).s("dtype", "f32");
+    REQUIRE_EQ(run("mhc_contract", c), RAD_OK);
+    CHECK_EQ(contracted.at(0), 30.0f);
+    CHECK_EQ(contracted.at(1), 40.0f);
+}
+
+TEST(manifold_sinkhorn_first_pass_and_epsilon_are_distinct) {
+    T h(RAD_F32, {1, 2}); h.f({1, 3});
+    T fn(RAD_F32, {8, 2}), scale(RAD_F32, {3}); scale.f({1, 1, 1});
+    T base(RAD_F32, {8}); base.f({0, 0, 0, 0, std::log(3.0f), 0, 0, 0});
+    T x(RAD_F32, {1, 1}), post(RAD_F32, {1, 2}), comb(RAD_F32, {1, 4});
+    A a; a.t(h).t(fn).t(scale).t(base).t(x).t(post).t(comb)
+        .i("M", 1).i("n", 1).i("hc", 2).i("iterations", 1)
+        .d("eps", 1e-5).d("hc_eps", 0).s("dtype", "f32");
+    REQUIRE_EQ(run("mhc_pre", a), RAD_OK);
+    const float first[] = {0.6f, 1.0f / 3, 0.4f, 2.0f / 3};
+    for (int i = 0; i < 4; ++i) CHECK_NEAR(comb.at(i), first[i], 1e-6);
+    a.ps[3].ival = 20;
+    REQUIRE_EQ(run("mhc_pre", a), RAD_OK);
+    CHECK_NEAR(comb.at(0), 0.633974596f, 1e-6);
+    CHECK_NEAR(comb.at(1), 0.366025404f, 1e-6);
+    /* Uniform logits: first pass is (.5 + .25) / (1.5 + .25) = 3/7. */
+    base.f({0, 0, 0, 0, 0, 0, 0, 0});
+    a.ps[3].ival = 1;
+    a.ps[5].dval = 0.25;
+    REQUIRE_EQ(run("mhc_pre", a), RAD_OK);
+    CHECK_EQ(x.at(0), 3.0f);
+    for (int i = 0; i < 4; ++i) CHECK_NEAR(comb.at(i), 3.0f / 7, 1e-6);
+}
+
+TEST(kda_candidate_states_restore_the_accepted_prefix) {
+    T q(RAD_F32, {2, 1, 2}); q.f({1, 0, 1, 0});
+    T k(RAD_F32, {2, 1, 2}); k.f({1, 0, 1, 0});
+    T v(RAD_F32, {2, 1, 1}); v.f({2, 2});
+    T g(RAD_F32, {2, 1, 2}); g.f({0, std::log(3.0f), 0, std::log(3.0f)});
+    T b(RAD_F32, {2, 1}), alog(RAD_F32, {1}), bias(RAD_F32, {2});
+    T state(RAD_F32, {3, 1, 1, 2}); state.f({4, 8, 0, 0, 123, 456});
+    T idx(RAD_I32, {1, 2}); idx.n({0, 1});
+    T cu(RAD_I32, {2}); cu.n({0, 2});
+    T accepted(RAD_I32, {1}); accepted.n({1});
+    T out(RAD_F32, {2, 1, 1});
+    A a; a.t(q).t(k).t(v).t(g).t(b).t(alog).t(bias).t(state).t(idx).t(cu).t(accepted).tnull().t(out)
+        .i("M", 2).i("heads", 1).i("head_k", 2).i("head_v", 1)
+        .d("lower_bound", -std::log(16.0)).d("scale", 1).d("l2_eps", 1e-6)
+        .s("mode", "verify").s("dtype", "f32");
+    REQUIRE_EQ(run("kda_update", a), RAD_OK);
+    /* Decays [1/4,1/8] distinguish the per-channel gate from a scalar gate. */
+    CHECK_NEAR(out.at(0), 1.5f, 3e-6);
+    CHECK_NEAR(out.at(1), 1.1875f, 3e-6);
+    CHECK_NEAR(state.at(0), 1.5f, 3e-6);
+    CHECK_NEAR(state.at(1), 1.0f, 3e-6);
+    CHECK_NEAR(state.at(2), 1.1875f, 3e-6);
+    CHECK_NEAR(state.at(3), 0.125f, 3e-6);
+    CHECK_EQ(state.at(4), 123.0f);
+    CHECK_EQ(state.at(5), 456.0f);
+    /* The next step rejects candidate 1 and reads candidate 0, then writes candidate 0's slot. */
+    cu.n({0, 1});
+    REQUIRE_EQ(run("kda_update", a), RAD_OK);
+    CHECK_NEAR(out.at(0), 1.1875f, 3e-6);
+    /* Accepting both candidates instead starts from slot 1. */
+    accepted.n({2});
+    REQUIRE_EQ(run("kda_update", a), RAD_OK);
+    CHECK_NEAR(out.at(0), 1.1484375f, 3e-6);
+    accepted.n({3});
+    CHECK_EQ(run("kda_update", a), RAD_E_SHAPE);
+}
+
+TEST(kda_prefill_commits_final_state_and_uses_absolute_cu_offsets) {
+    T q(RAD_F32, {3, 1, 2}); q.f({1000, 1000, 1, 0, 1, 0});
+    T k(RAD_F32, {3, 1, 2}); k.f({1000, 1000, 1, 0, 1, 0});
+    T v(RAD_F32, {3, 1, 1}); v.f({1000, 2, 2});
+    T g(RAD_F32, {3, 1, 2}); g.f({0, 0, 0, std::log(3.0f), 0, std::log(3.0f)});
+    T b(RAD_F32, {3, 1}), alog(RAD_F32, {1}), bias(RAD_F32, {2});
+    T state(RAD_F32, {2, 1, 1, 2}); state.f({4, 8, 123, 456});
+    T idx(RAD_I32, {1, 1}); idx.n({0});
+    T cu(RAD_I32, {2}); cu.n({1, 3});
+    T init(RAD_I32, {1}); init.n({1});
+    T out(RAD_F32, {3, 1, 1}); out.f({77, 77, 77});
+    A a; a.t(q).t(k).t(v).t(g).t(b).t(alog).t(bias).t(state).t(idx).t(cu).tnull().t(init).t(out)
+        .i("M", 3).i("heads", 1).i("head_k", 2).i("head_v", 1)
+        .d("lower_bound", -std::log(16.0)).d("scale", 1).d("l2_eps", 1e-6)
+        .s("mode", "prefill").s("dtype", "f32");
+    REQUIRE_EQ(run("kda_update", a), RAD_OK);
+    CHECK_EQ(out.at(0), 77.0f);
+    CHECK_NEAR(out.at(1), 1.5f, 3e-6);
+    CHECK_NEAR(out.at(2), 1.1875f, 3e-6);
+    CHECK_NEAR(state.at(0), 1.1875f, 3e-6);
+    CHECK_NEAR(state.at(1), 0.125f, 3e-6);
+    CHECK_EQ(state.at(2), 123.0f);
+    init.n({0});
+    REQUIRE_EQ(run("kda_update", a), RAD_OK);
+    CHECK_NEAR(out.at(1), 1.0f, 3e-6);
+    CHECK_NEAR(out.at(2), 1.125f, 3e-6);
+    idx.n({-1});
+    REQUIRE_EQ(run("kda_update", a), RAD_OK);
+    CHECK_EQ(out.at(1), 0.0f);
+    CHECK_EQ(out.at(2), 0.0f);
+}
+
+TEST(mla_attention_reads_one_latent_and_masks_the_last_selected_page) {
+    T q(RAD_F32, { 1, 1, 2 }), kv(RAD_F32, { 2, 1, 2, 2 }), bt(RAD_I32, { 1, 2 });
+    T len(RAD_I32, { 1 }), out(RAD_F32, { 1, 1, 2 });
+    q.f({ 0, 0 });
+    kv.f({ 3, 5, 1000, -1000, 1, 0, 0, 1 });
+    bt.n({ 1, 0 });
+    len.n({ 3 });
+    A a;
+    a.t(q)
+        .t(kv)
+        .t(bt)
+        .t(len)
+        .t(out)
+        .i("M", 7)
+        .i("latent_dim", 2)
+        .i("heads", 1)
+        .i("blocks", 2)
+        .i("block_size", 2)
+        .d("scale", 1)
+        .s("dtype", "f32");
+    REQUIRE_EQ(run("mla_attn", a), RAD_OK);
+    CHECK_NEAR(out.at(0), 4.0 / 3, 1e-6);
+    CHECK_EQ(out.at(1), 2);
+    q.f({ std::log(3.0f), 0 });
+    kv.f({ 0, 0, 1000, -1000, 1, 0, 0, 0 });
+    len.n({ 2 });
+    REQUIRE_EQ(run("mla_attn", a), RAD_OK);
+    CHECK_NEAR(out.at(0), 0.75, 1e-6);
+    CHECK_EQ(out.at(1), 0);
+    len.n({ 0 });
+    REQUIRE_EQ(run("mla_attn", a), RAD_OK);
+    CHECK_EQ(out.at(0), 0);
+    CHECK_EQ(out.at(1), 0);
+    len.n({ 3 });
+    bt.n({ -1, 99 });
+    REQUIRE_EQ(run("mla_attn", a), RAD_OK);
+    CHECK_EQ(out.at(0), 0);
+    CHECK_EQ(out.at(1), 0);
+}
+
+TEST(dsa_score_relu_is_per_head_before_signed_weights_and_masks_invalid_history) {
+    T q(RAD_F8E4M3, { 2, 2, 2 }), qs(RAD_F32, { 2, 2 }), gate(RAD_F32, { 2, 2 });
+    T k(RAD_F8E4M3, { 3, 2 }), ks(RAD_F32, { 3 }), bt(RAD_I32, { 2, 3 });
+    T cu(RAD_I32, { 3 }), nc(RAD_I32, { 2 }), out(RAD_F32, { 2, 3 });
+    q.f({ 1, 0, 0, 1, -1, 0, 0, -1 });
+    qs.f({ 2, 0.5, 1, 1 });
+    gate.f({ -1, 4, 2, -1 });
+    k.f({ 1, -1, 2, 3, -2, -4 });
+    ks.f({ 0.25, 0.5, 1 });
+    bt.n({ 0, 1, -1, 2, 0, 1 });
+    cu.n({ 0, 1, 2 });
+    nc.n({ 2, 1 });
+    A a;
+    a.t(q)
+        .t(qs)
+        .t(gate)
+        .t(k)
+        .t(ks)
+        .t(bt)
+        .t(cu)
+        .t(nc)
+        .t(out)
+        .i("M", 9)
+        .i("n", 2)
+        .i("heads", 2)
+        .i("blocks", 3)
+        .i("seqs", 2)
+        .s("dtype", "fp8_e4m3");
+    REQUIRE_EQ(run("dsa_score", a), RAD_OK);
+    CHECK_EQ(out.at(0), -0.25f);
+    CHECK_EQ(out.at(1), 0.5f);
+    CHECK_EQ(out.at(3), 0);
+    for (int i : { 2, 4, 5 }) CHECK_EQ(out.at(i), -INFINITY);
+    bt.n({ 99, 1, -1, 2, 0, 1 });
+    REQUIRE_EQ(run("dsa_score", a), RAD_OK);
+    CHECK_EQ(out.at(0), -INFINITY);
+}
+
+TEST(kda_anchor_replays_only_the_accepted_prefix_of_the_previous_window) {
+    constexpr int D = 128;
+    for (int accepted : { 1, 2, 3 }) {
+        T q(RAD_BF16, { 3, 1, D }), k(RAD_BF16, { 3, 1, D }), v(RAD_BF16, { 3, 1, D }),
+            g(RAD_BF16, { 3, 1, D });
+        T beta(RAD_BF16, { 3, 1 }), al(RAD_F32, { 1 }), bias(RAD_F32, { D });
+        T anchor(RAD_F32, { 2, 1, D, D }), candidate(RAD_F32, { 3, 1, D, D });
+        T ai(RAD_I32, { 1, 6 }), ci(RAD_I32, { 1, 3 }), cu(RAD_I32, { 2 }), na(RAD_I32, { 1 }),
+            init(RAD_I32, { 1 });
+        T ao(RAD_BF16, { 3, 1, D }), co(RAD_BF16, { 3, 1, D });
+        std::vector<float> values(3 * D);
+        for (int j = 0; j < 3 * D; ++j) values[j] = (float)(j % 17 - 8) * 0.125f;
+        q.f(values);
+        v.f(values);
+        for (int j = 0; j < 3 * D; ++j) values[j] = (float)(j % 11 - 5) * 0.25f;
+        k.f(values);
+        g.f(std::vector<float>(3 * D, 0));
+        beta.f({ 0, 0.5f, -0.5f });
+        al.f({ 0 });
+        bias.f(std::vector<float>(D, -1));
+        anchor.f(std::vector<float>(2 * D * D, 0));
+        candidate.f(std::vector<float>(3 * D * D, 0));
+        ai.n({ 0, 0, 0, 1, 1, 1 });
+        ci.n({ 0, 1, 2 });
+        cu.n({ 0, 3 });
+        na.n({ 1 });
+        init.n({ 1 });
+        A a;
+        a.t(q)
+            .t(k)
+            .t(v)
+            .t(g)
+            .t(beta)
+            .t(al)
+            .t(bias)
+            .t(anchor)
+            .t(ai)
+            .t(cu)
+            .t(na)
+            .t(init)
+            .t(ao)
+            .i("M", 3)
+            .i("heads", 1)
+            .i("head_k", D)
+            .i("head_v", D)
+            .d("lower_bound", -5)
+            .d("scale", 1.0 / std::sqrt(128.0))
+            .d("l2_eps", 1e-6)
+            .s("mode", "verify")
+            .s("dtype", "bf16")
+            .s("state_form", "anchor");
+        A c;
+        c.t(q)
+            .t(k)
+            .t(v)
+            .t(g)
+            .t(beta)
+            .t(al)
+            .t(bias)
+            .t(candidate)
+            .t(ci)
+            .t(cu)
+            .t(na)
+            .t(init)
+            .t(co)
+            .i("M", 3)
+            .i("heads", 1)
+            .i("head_k", D)
+            .i("head_v", D)
+            .d("lower_bound", -5)
+            .d("scale", 1.0 / std::sqrt(128.0))
+            .d("l2_eps", 1e-6)
+            .s("mode", "verify")
+            .s("dtype", "bf16");
+        REQUIRE_EQ(run("kda_update", a), RAD_OK);
+        REQUIRE_EQ(run("kda_update", c), RAD_OK);
+        for (int j = 0; j < 3 * D; ++j) CHECK_EQ(ao.at(j), co.at(j));
+        for (int j = 0; j < D * D; ++j) CHECK_EQ(anchor.at(j), 0);
+        std::vector<float> committed(D * D);
+        for (int j = 0; j < D * D; ++j) committed[j] = candidate.at((accepted - 1) * D * D + j);
+        na.n({ accepted });
+        REQUIRE_EQ(run("kda_update", a), RAD_OK);
+        REQUIRE_EQ(run("kda_update", c), RAD_OK);
+        for (int j = 0; j < 3 * D; ++j) CHECK_EQ(ao.at(j), co.at(j));
+        for (int j = 0; j < D * D; ++j) CHECK_EQ(anchor.at(j), committed[j]);
+        const auto saved = anchor.mem;
+        na.n({ 4 });
+        CHECK_EQ(run("kda_update", a), RAD_E_SHAPE);
+        CHECK(anchor.mem == saved);
+    }
+}
+
+TEST(mla_projects_the_key_and_value_halves_with_opposite_orientations) {
+    T q(RAD_BF16, { 1, 2, 2 }), w(RAD_BF16, { 8, 3 }), latent(RAD_BF16, { 1, 2, 3 }),
+        out(RAD_BF16, { 1, 2, 2 });
+    q.f({ 2, -1, 3, 1 });
+    w.f({ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, -1, 0, 1, 2, 0, -2, 2, 3, 4, 5, 6, 7 });
+    A a;
+    a.t(q)
+        .t(w)
+        .t(latent)
+        .i("M", 7)
+        .i("heads", 2)
+        .i("head_dim", 2)
+        .i("latent_dim", 3)
+        .s("mode", "absorb")
+        .s("dtype", "bf16");
+    REQUIRE_EQ(run("mla_project", a), RAD_OK);
+    CHECK_EQ(latent.at(0), -2);
+    CHECK_EQ(latent.at(1), -1);
+    CHECK_EQ(latent.at(2), 0);
+    CHECK_EQ(latent.at(3), -1);
+    CHECK_EQ(latent.at(4), 0);
+    CHECK_EQ(latent.at(5), 1);
+    A b;
+    b.t(latent)
+        .t(w)
+        .t(out)
+        .i("M", 7)
+        .i("heads", 2)
+        .i("head_dim", 2)
+        .i("latent_dim", 3)
+        .s("mode", "expand")
+        .s("dtype", "bf16");
+    REQUIRE_EQ(run("mla_project", b), RAD_OK);
+    CHECK_EQ(out.at(0), -22);
+    CHECK_EQ(out.at(1), -31);
+    CHECK_EQ(out.at(2), 2);
+    CHECK_EQ(out.at(3), 2);
+    auto flatten = [](RadTensor& t) {
+        t.rank = 2;
+        t.shape[1] *= t.shape[2];
+        t.stride[1] = t.stride[2];
+    };
+    flatten(a.ts[0]);
+    flatten(a.ts[2]);
+    REQUIRE_EQ(run("mla_project", a), RAD_OK);
+    flatten(b.ts[0]);
+    flatten(b.ts[2]);
+    REQUIRE_EQ(run("mla_project", b), RAD_OK);
+    CHECK_EQ(out.at(0), -22);
+    CHECK_EQ(out.at(1), -31);
+    CHECK_EQ(out.at(2), 2);
+    CHECK_EQ(out.at(3), 2);
+}
+
+TEST(moe_gather_preserves_f32_mixture_weights_between_bf16_expert_outputs) {
+    T experts(RAD_BF16, { 2, 1 }), weights(RAD_F32, { 1, 2 }), sorted(RAD_I32, { 2 }),
+        out(RAD_BF16, { 1, 1 });
+    experts.f({ 1024, -1024 });
+    weights.f({ 1.0f + 1.0f / 8192, 1 });
+    sorted.n({ 0, 1 });
+    A a;
+    a.t(experts)
+        .t(weights)
+        .t(sorted)
+        .tnull()
+        .tnull()
+        .t(out)
+        .i("M", 1)
+        .i("n", 1)
+        .i("top_k", 2)
+        .s("dtype", "bf16");
+    REQUIRE_EQ(run("moe_gather", a), RAD_OK);
+    CHECK_EQ(out.at(0), 0.125f);
+}
+
+TEST(dsa_query_normalizes_the_rotation_and_rounds_power_of_two_scales) {
+    T x(RAD_BF16, { 1, 4 }), q(RAD_F8E4M3, { 1, 4 }), scale(RAD_F32, { 1, 1 });
+    A a;
+    a.t(x).t(q).t(scale).i("M", 7).i("n", 4).s("dtype", "bf16");
+    x.f({ 3, 4, 7, 7 });
+    REQUIRE_EQ(run("dsa_query", a), RAD_OK);
+    CHECK_EQ(scale.at(0), 1.0f / 32);
+    CHECK_EQ(q.at(0), 320);
+    CHECK_EQ(q.at(1), -16);
+    CHECK_EQ(q.at(2), -112);
+    CHECK_EQ(q.at(3), -16);
+    for (float v : { 0.0f, 224.0f, 225.0f }) {
+        x.f({ v, v, v, v });
+        REQUIRE_EQ(run("dsa_query", a), RAD_OK);
+        CHECK_EQ(scale.at(0), v == 0 ? std::ldexp(1.0f, -22) : v == 224 ? 1.0f : 2.0f);
+        CHECK_EQ(q.at(0), v == 0 ? 0 : v == 224 ? 448 : 224);
+        for (int d = 1; d < 4; ++d) CHECK_EQ(q.at(d), 0);
+    }
+}
+
+TEST(f32_projection_preserves_small_weight_differences_and_output_bits) {
+    T x(RAD_BF16, { 1, 2 }), w(RAD_F32, { 2, 2 }), y(RAD_F32, { 1, 2 });
+    x.f({ 1, -1 });
+    w.f({ 1.0001f, 1.0f, 2.0002f, 2.0f });
+    A a;
+    a.t(x).t(w).t(y).i("M", 7).i("N", 2).i("K", 2).s("dtype", "bf16");
+    REQUIRE_EQ(run("gemm_nt_f32", a), RAD_OK);
+    CHECK_EQ(y.at(0), 1.0001f - 1.0f);
+    CHECK_EQ(y.at(1), 2.0002f - 2.0f);
+}
+
+TEST(dsa_pool_writes_paged_codes_and_scales_and_the_scorer_reads_them) {
+    T kg(RAD_BF16, { 12, 256 }), ape(RAD_F32, { 4, 128 }), q(RAD_F8E4M3, { 3, 128 }),
+        scales(RAD_F32, { 3, 1 });
+    T pages(RAD_I32, { 3 }), cache(RAD_U8, { 4, 1, 4, 34 });
+    std::vector<float> input(12 * 256, 0);
+    for (int r = 0; r < 12; ++r)
+        for (int d = 0; d < 128; ++d) input[r * 256 + d] = 1;
+    kg.f(input);
+    ape.f(std::vector<float>(512, 0));
+    pages.n({ 2, -1, 9 });
+    std::fill(cache.mem.begin(), cache.mem.end(), 0xa5);
+    A pool;
+    pool.t(kg)
+        .t(ape)
+        .t(q)
+        .t(scales)
+        .t(pages)
+        .t(cache)
+        .i("M", 3)
+        .i("n", 128)
+        .i("ratio", 4)
+        .s("dtype", "bf16");
+    REQUIRE_EQ(run("dsa_pool", pool), RAD_OK);
+    for (int i = 0; i < 4 * 136; ++i)
+        if (i >= 2 * 136 && i < 2 * 136 + 128)
+            CHECK_EQ(cache.mem[i], q.mem[i - 2 * 136]);
+        else if (i < 2 * 136 + 128 || i >= 2 * 136 + 132)
+            CHECK_EQ(cache.mem[i], 0xa5);
+    float stored = 0;
+    std::memcpy(&stored, cache.mem.data() + 2 * 136 + 128, sizeof(stored));
+    CHECK_EQ(stored, scales.at(0));
+    T query(RAD_F8E4M3, { 1, 32, 128 }), qs(RAD_F32, { 1, 32 }), gate(RAD_F32, { 1, 32 });
+    query.f(std::vector<float>(32 * 128, 1));
+    qs.f(std::vector<float>(32, 1));
+    gate.f(std::vector<float>(32, 1));
+    T bt(RAD_I32, { 1, 3 }), cu(RAD_I32, { 2 }), nc(RAD_I32, { 1 }), out(RAD_F32, { 1, 3 });
+    bt.n({ 2, -1, 9 });
+    cu.n({ 0, 1 });
+    nc.n({ 3 });
+    A score;
+    score.t(query)
+        .t(qs)
+        .t(gate)
+        .t(cache)
+        .tnull()
+        .t(bt)
+        .t(cu)
+        .t(nc)
+        .t(out)
+        .i("M", 1)
+        .i("n", 128)
+        .i("heads", 32)
+        .i("blocks", 3)
+        .i("seqs", 1)
+        .s("dtype", "fp8_e4m3");
+    REQUIRE_EQ(run("dsa_score", score), RAD_OK);
+    CHECK_EQ(out.at(0), 5.5f);
+    CHECK(std::isinf(out.at(1)) && out.at(1) < 0);
+    CHECK(std::isinf(out.at(2)) && out.at(2) < 0);
+}
+
+TEST(dsa_pool_uses_channel_gates_bf16_boundaries_and_power_of_two_scales) {
+    T kg(RAD_BF16, { 2, 8 }), ape(RAD_F32, { 2, 4 }), q(RAD_F8E4M3, { 1, 4 }),
+        scale(RAD_F32, { 1, 1 });
+    kg.f({ 0, 2, 4, 6, 0, 0, 0, 0, 4, 6, 8, 10, 0, 0, 0, 0 });
+    ape.f({ 0, 0, 0, 0, std::log(3.0f), 0, std::log(3.0f), -std::log(3.0f) });
+    A a;
+    a.t(kg).t(ape).t(q).t(scale).i("M", 7).i("n", 4).i("ratio", 2).s("dtype", "bf16");
+    REQUIRE_EQ(run("dsa_pool", a), RAD_OK);
+    // Pooled [3,4,7,7]; H4/sqrt(4) = [10.5,-.5,-3.5,-.5].
+    // 10.5*32=336 is the FP8 midpoint 320/352, rounded to even 320.
+    CHECK_EQ(scale.at(0), 1.0f / 32);
+    CHECK_EQ(q.at(0), 320);
+    CHECK_EQ(q.at(1), -16);
+    CHECK_EQ(q.at(2), -112);
+    CHECK_EQ(q.at(3), -16);
+    ape.f(std::vector<float>(8, 0));
+    for (float key : { 0.0f, 224.0f, 225.0f }) {
+        kg.f({ key, key, key, key, 0, 0, 0, 0, key, key, key, key, 0, 0, 0, 0 });
+        REQUIRE_EQ(run("dsa_pool", a), RAD_OK);
+        CHECK_EQ(scale.at(0), key == 0 ? std::ldexp(1.0f, -22) : key == 224 ? 1.0f : 2.0f);
+        CHECK_EQ(q.at(0), key == 0 ? 0 : key == 224 ? 448 : 224);
+        for (int i = 1; i < 4; ++i) CHECK_EQ(q.at(i), 0);
+    }
+}
+
+TEST(swiglu_clamping_is_asymmetric_and_precedes_the_activation) {
+    T gu(RAD_F32, { 1, 12 }), y(RAD_F32, { 1, 6 });
+    gu.f({ -20, -2, 0, 2, 10, 20, -20, 20, 20, -20, 20, 20 });
+    A a;
+    a.t(gu).t(y).i("M", 9).i("n", 6).d("limit", 10).s("dtype", "f32");
+    REQUIRE_EQ(run("swiglu_clamped", a), RAD_OK);
+    const float gate[] = { -20, -2, 0, 2, 10, 10 }, up[] = { -10, 10, 10, -10, 10, 10 };
+    for (int i = 0; i < 6; ++i)
+        CHECK_NEAR(y.at(i), (gate[i] / (1 + std::exp(-gate[i]))) * up[i], 1e-5);
+    CHECK(y.at(0) > 0 && y.at(0) < 1e-5); // a negative gate must not clamp to -10
+    CHECK_EQ(y.at(4), y.at(5));
+    A bad;
+    bad.t(gu).t(y).i("M", 1).i("n", 6).d("limit", 0).s("dtype", "f32");
+    CHECK_EQ(run("swiglu_clamped", bad), RAD_E_SHAPE);
+}
+
+TEST(sigmoid_router_uses_correction_only_for_selection_and_stable_ties) {
+    T lg(RAD_F32, { 1, 4 }), bias(RAD_F32, { 4 }), ids(RAD_I32, { 1, 2 }), w(RAD_F32, { 1, 2 });
+    lg.f({ -std::log(3.0f), std::log(3.0f), 0, 0 });
+    bias.f({ 1, -1, 0, 0 });
+    for (int norm : { 0, 1 }) {
+        A a;
+        a.t(lg)
+            .t(bias)
+            .t(ids)
+            .t(w)
+            .i("M", 9)
+            .i("n_expert", 4)
+            .i("top_k", 2)
+            .i("norm", norm)
+            .d("route_scale", 2.5)
+            .s("dtype", "f32");
+        REQUIRE_EQ(run("router_sigmoid_topk", a), RAD_OK);
+        CHECK_EQ(ids.at(0), 0);
+        CHECK_EQ(ids.at(1), 2);
+        CHECK_NEAR(w.at(0), norm ? 2.5 / 3 : 0.625, 1e-6);
+        CHECK_NEAR(w.at(1), norm ? 5.0 / 3 : 1.25, 1e-6);
+    }
+    lg.f({ 0, 0, 0, 0 });
+    bias.f({ 0, 0, 0, 0 });
+    A tie;
+    tie.t(lg)
+        .t(bias)
+        .t(ids)
+        .t(w)
+        .i("M", 1)
+        .i("n_expert", 4)
+        .i("top_k", 2)
+        .i("norm", 1)
+        .d("route_scale", 2.5)
+        .s("dtype", "f32");
+    REQUIRE_EQ(run("router_sigmoid_topk", tie), RAD_OK);
+    CHECK_EQ(ids.at(0), 0);
+    CHECK_EQ(ids.at(1), 1);
+    CHECK_EQ(w.at(0), 1.25f);
+    CHECK_EQ(w.at(1), 1.25f);
+}
+
+TEST(grouped_mxfp4_preserves_e2m1_codes_and_e8m0_scales) {
+    T input(RAD_F8E4M3, { 2, 64 });
+    std::vector<float> values(128, 1.0f);
+    for (int i = 64; i < 128; ++i) values[(size_t)i] = 2;
+    input.f(values);
+    T as(RAD_F32, { 2, 1 });
+    as.f({ 0.5f, 0.5f });
+    T even(RAD_FP4E2M1, { 1, 1, 64 });
+    even.raw(std::vector<uint8_t>(32, 0x22));
+    T odd(RAD_FP4E2M1, { 1, 1, 64 });
+    odd.raw(std::vector<uint8_t>(32, 0x33));
+    T es(RAD_U8, { 1, 1, 2 });
+    es.raw({ 127, 128 });
+    T os(RAD_U8, { 1, 1, 2 });
+    os.raw({ 126, 127 });
+    T sorted(RAD_I32, { 2 });
+    sorted.n({ 1, 0 });
+    T offsets(RAD_I32, { 3 });
+    offsets.n({ 0, 1, 2 });
+    T out(RAD_BF16, { 2, 1 });
+    A a;
+    a.t(input)
+        .t(as)
+        .t(even)
+        .t(es)
+        .t(sorted)
+        .t(offsets)
+        .t(odd)
+        .t(os)
+        .t(out)
+        .i("M", 2)
+        .i("N", 1)
+        .i("K", 64)
+        .i("n_expert", 2)
+        .i("top_k", 1)
+        .i("group", 64)
+        .s("a_order", "token")
+        .s("dtype", "mxfp4a8");
+    REQUIRE_EQ(run("moe_gemm_q", a), RAD_OK);
+    /* E2M1 0x2=1, 0x3=1.5. The second half of each row has its own power-of-two scale. */
+    CHECK_EQ(out.at(0), 96.0f);
+    CHECK_EQ(out.at(1), 36.0f);
+    a.strs.emplace_back("sorted");
+    a.ps[6].sval = a.strs.back().c_str();
+    REQUIRE_EQ(run("moe_gemm_q", a), RAD_OK);
+    CHECK_EQ(out.at(0), 48.0f);
+    CHECK_EQ(out.at(1), 72.0f);
+    /* Each expert may have a separate address, including host-resident weights. */
+    void* wp0[] = { even.t.data };
+    void* wp1[] = { odd.t.data };
+    void* sp0[] = { es.t.data };
+    void* sp1[] = { os.t.data };
+    const int operands[] = { 2, 3, 6, 7 };
+    void* tables[] = { wp0, sp0, wp1, sp1 };
+    for (int i = 0; i < 4; ++i) {
+        a.ts[(size_t)operands[i]].data = tables[i];
+        a.ts[(size_t)operands[i]].stride[0] = 0;
+    }
+    a.ts[3].dtype = a.ts[7].dtype = RAD_E8M0;
+    REQUIRE_EQ(run("moe_gemm_q", a), RAD_OK);
+    CHECK_EQ(out.at(0), 48.0f);
+    CHECK_EQ(out.at(1), 72.0f);
+}
+
 /* ================================================================== the plugin surface */
 TEST(plugin_surface) {
     CHECK(api().abi_version != nullptr);
@@ -255,6 +918,8 @@ TEST(plugin_surface) {
 TEST(op_vocabulary) {
     static const char* kOps[] = {
         "rmsnorm", "rmsnorm_p", "rmsnorm_add", "hc_enter", "hc_read", "hc_write", "mtp_enter",
+        "mhc_pre", "mhc_pre_partial", "mhc_pre_finish", "mhc_post", "mhc_contract", "swiglu_clamped", "router_sigmoid_topk", "dsa_pool", "dsa_query", "dsa_score", "mla_attn", "mla_project", "gemm_nt_f32",
+        "kda_update",
         "layernorm", "add", "mul", "mul_weight", "silu_mul", "gelu_mul", "act_mul", "seg_mean",
         "pool_rows", "relu", "clamp", "conv2d", "conv2d_unfold", "conv1d_dw", "rel_sinusoid",
         "seg_sinusoid", "attn_local_rel", "gelu", "silu", "sigmoid", "logit_softcap", "scale",
@@ -3316,7 +3981,7 @@ TEST(op_moe_gemm_q_scale_grid_by_dtype) {
     /* N 256, K 512, group 128; the last class at N 128, K 256. */
     const Want wants[] = { { "fp8a8", 2, 4 },      { "w4a8", 256, 4 },     { "w4a8h", 256, 4 },
                            { "w4nla8h", 256, 4 },  { "w4nl64a8h", 256, 8 }, { "w5nl64a8h", 256, 8 },
-                           { "w4nl32a8h", 256, 16 } };
+                           { "w4nl32a8h", 256, 16 }, { "mxfp4a8", 256, 16 } };
     for (const char* op : { "moe_gemm_q", "moe_gemm_q_mod4" }) {
         const RadKernelInfo* k = kern(op);
         REQUIRE(k != nullptr && k->opd_shape != nullptr);
@@ -3332,7 +3997,7 @@ TEST(op_moe_gemm_q_scale_grid_by_dtype) {
             RadOpdDesc d{}, dl{};
             REQUIRE_EQ(k->opd_shape(r->p, r->n_p, 3, &d), RAD_OK);
             REQUIRE_EQ(k->opd_shape(r->p, r->n_p, last, &dl), RAD_OK);
-            CHECK_EQ(d.dtype, (uint32_t)RAD_BF16);
+            CHECK_EQ(d.dtype, !std::strcmp(w.dt, "mxfp4a8") ? (uint32_t)RAD_U8 : (uint32_t)RAD_BF16);
             CHECK_EQ(d.rank, 3u);
             CHECK_EQ(d.shape[0], four ? 2LL : 4LL);
             if (d.shape[1] != w.rows || d.shape[2] != w.cols)
@@ -3402,7 +4067,7 @@ TEST(op_moe_gemm_q_scale_grid_by_dtype) {
     for (const char* op : { "moe_gemm_q", "moe_gemm_q_mod4" }) {
         const RadKernelInfo* k = kern(op);
         REQUIRE(k != nullptr && k->opd_shape != nullptr);
-        for (const char* dt : { "w8a8", "mxfp4a8", "" }) {
+        for (const char* dt : { "w8a8", "invalid", "" }) {
             A a;
             a.i("M", 2).i("N", 256).i("K", 512).i("n_expert", 8).i("top_k", 2).i("group", 128)
              .s("a_order", "token");
@@ -7038,6 +7703,30 @@ std::vector<Geo> geometries() {
         G("attn_prefix_self", "q_len", 3, a.i("q_len", R).i("head_dim", 8).i("gqa", 2)
                                           .i("block_size", 4).i("causal", 1).s("q_dtype", "bf16")
                                           .s("kv_dtype", "bf16").i("n_head", 4).i("ctx", 5)),
+        G("mhc_pre", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).i("iterations", 20).d("eps", 1e-5)
+                             .d("hc_eps", 1e-6).s("dtype", "f32")),
+        G("mhc_pre_partial", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).i("chunk", 8).i("first", 1)
+                                     .i("chunks", 2).s("dtype", "f32")),
+        G("mhc_pre_finish", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).i("iterations", 20)
+                                    .d("eps", 1e-5).d("hc_eps", 1e-6).i("chunk", 8)
+                                    .s("dtype", "f32")),
+        G("mhc_post", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).s("dtype", "f32")),
+        G("mhc_contract", "M", 3, a.i("M", R).i("n", 8).i("hc", 4).s("dtype", "f32")),
+        G("kda_update", "M", 3, a.i("M", R).i("heads", 2).i("head_k", 8).i("head_v", 8)
+                                .d("lower_bound", -5.0).d("scale", 0.35).d("l2_eps", 1e-6)
+                                .s("mode", "prefill").s("dtype", "f32")),
+        G("mla_attn", "M", 3, a.i("M", R).i("latent_dim", 8).i("heads", 2).i("blocks", 2)
+                              .i("block_size", 4).d("scale", 0.125).s("dtype", "f32")),
+        G("mla_project", "M", 3, a.i("M", R).i("heads", 2).i("head_dim", 4).i("latent_dim", 6)
+                                 .s("mode", "absorb").s("dtype", "bf16")),
+        G("dsa_score", "M", 4, a.i("M", R).i("n", 8).i("heads", 2).i("blocks", 3).i("seqs", 2)
+                               .s("dtype", "fp8_e4m3")),
+        G("dsa_pool", "M", 3, a.i("M", R).i("n", 8).i("ratio", 4).s("dtype", "bf16")),
+        G("dsa_query", "M", 3, a.i("M", R).i("n", 8).s("dtype", "bf16")),
+        G("gemm_nt_f32", "M", 3, a.i("M", R).i("N", 20).i("K", 40).s("dtype", "bf16")),
+        G("swiglu_clamped", "M", 3, a.i("M", R).i("n", 8).d("limit", 0.5).s("dtype", "f32")),
+        G("router_sigmoid_topk", "M", 3, a.i("M", R).i("n_expert", 6).i("top_k", 2).i("norm", 1)
+                                         .d("route_scale", 2.5).s("dtype", "f32")),
         G("conv1d", "M", 8, a.i("M", R).i("cin", 2).i("cout", 3).i("k", 3).i("dil", 1)
                             .s("dtype", "f32")),
         G("conv_t1d", "M", 8, a.i("M", R).i("cin", 2).i("cout", 3).i("stride", 2).s("dtype", "f32")),

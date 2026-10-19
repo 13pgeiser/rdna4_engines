@@ -120,6 +120,25 @@ static const RadOperandSpec oCausalConv[] = { OPD("x"), WGT("w"), INOUT("conv_st
 static const RadParamSpec pHcWrite[] = { P_INT("M"), P_INT("n"), P_INT("hc"), P_STR("dtype") };
 static const RadOperandSpec oHcEnter[] = { OPD("x"), OUT("h") };
 static const RadOperandSpec oHcWrite[] = { OPD("y"), OPD("inj"), INOUT("h") };
+static const RadParamSpec pMhcPre[] = { P_INT("M"), P_INT("n"), P_INT("hc"),
+    P_INT("iterations"), P_F64("eps"), P_F64("hc_eps"), P_STR("dtype") };
+static const RadOperandSpec oMhcPre[] = { OPD("h"), WGT("fn"), WGT("scale"), WGT("base"),
+    OUT("x"), OUT("post"), OUT("comb") };
+static const RadParamSpec pMhcPrePartial[] = { P_INT("M"), P_INT("n"), P_INT("hc"),
+    P_INT("chunk"), P_INT("first"), P_INT("chunks"), P_STR("dtype") };
+static const RadOperandSpec oMhcPrePartial[] = { OPD("h"), WGT("fn"), OUT("part") };
+static const RadParamSpec pMhcPreFinish[] = { P_INT("M"), P_INT("n"), P_INT("hc"),
+    P_INT("iterations"), P_F64("eps"), P_F64("hc_eps"), P_INT("chunk"), P_STR("dtype") };
+static const RadOperandSpec oMhcPreFinish[] = { OPD("part"), OPD("h"), WGT("scale"), WGT("base"),
+    OUT("x"), OUT("post"), OUT("comb") };
+static const RadOperandSpec oMhcPost[] = { OPD("x"), OPD("h"), OPD("post"), OPD("comb"), OUT("out") };
+static const RadOperandSpec oMhcContract[] = { OPD("h"), OUT("x") };
+static const RadParamSpec pKdaUpdate[] = { P_INT("M"), P_INT("heads"), P_INT("head_k"),
+    P_INT("head_v"), P_F64("lower_bound"), P_F64("scale"), P_F64("l2_eps"),
+    P_STR("mode"), P_STR("dtype"), P_STRO("state_form") };
+static const RadOperandSpec oKdaUpdate[] = { OPD("q"), OPD("k"), OPD("v"), OPD("a"), OPD("b"),
+    WGT("A_log"), WGT("dt_bias"), INOUT("state"), OPD("state_idx"), OPD("cu"),
+    OPD_O("num_accepted"), OPD_O("has_init"), OUT("o") };
 /* The MTP head's entry for a wide residual stream. `ngroup` is hc for a grouped norm over the
  * sub-streams, 1 for a flat one over the whole row (see ref_hc.cpp). */
 static const RadParamSpec pMtpEnter[] = { P_INT("M"), P_INT("n"), P_INT("hc"),
@@ -137,6 +156,22 @@ static const RadOperandSpec oLayernorm[] = { OPD("x"), WGT("w"), WGT_O("b"), OUT
 static const RadParamSpec pGridEmbed[] = { P_INT("M"), P_INT("n"), P_INT("side"), P_STR("dtype") };
 static const RadOperandSpec oGridEmbed[] = { INOUT("x"), WGT("table"), OPD("coord") };
 
+static const RadParamSpec pSwigluClamped[] = { P_INT("M"), P_INT("n"), P_F64("limit"), P_STR("dtype") };
+static const RadParamSpec pDsaPool[] = { P_INT("M"), P_INT("n"), P_INT("ratio"), P_STR("dtype"), P_INTO("block_size") };
+static const RadParamSpec pMlaAttn[] = { P_INT("M"), P_INT("latent_dim"), P_INT("heads"),
+    P_INT("blocks"), P_INT("block_size"), P_F64("scale"), P_STR("dtype") };
+static const RadParamSpec pMlaProject[] = { P_INT("M"), P_INT("heads"), P_INT("head_dim"),
+    P_INT("latent_dim"), P_STR("mode"), P_STR("dtype") };
+static const RadOperandSpec oMlaAttn[] = { OPD("q"), OPD("kv"), OPD("bt"), OPD("length"), OUT("out") };
+static const RadParamSpec pDsaScore[] = { P_INT("M"), P_INT("n"), P_INT("heads"),
+    P_INT("blocks"), P_INT("seqs"), P_STR("dtype") };
+static const RadOperandSpec oDsaScore[] = { OPD("q"), OPD("q_scale"), OPD("gate"), OPD("k"),
+    OPD_O("k_scale"), OPD("bt"), OPD("cu"), OPD("nc"), OUT("score") };
+static const RadOperandSpec oDsaPool[] = { OPD("kg"), WGT("ape"), OUT("q"), OUT("scale"),
+    OPD_O("page"), INOUT_O("cache") };
+static const RadParamSpec pRouterSigmoid[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
+    P_INT("norm"), P_F64("route_scale"), P_STR("dtype") };
+static const RadOperandSpec oRouterSigmoid[] = { OPD("logits"), WGT("bias"), OUT("ids"), OUT("weights") };
 static const RadParamSpec pMnD[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
 /* `div` divides the rounded sum, rounded again (default 1, the plain sum): a mean of branches
  * summed pairwise, as a vocoder averages its residual blocks. */
@@ -850,6 +885,33 @@ static const RadOpSchema kSchemas[] = {
   "is what every fused implementation does." },
 { "hc_enter", ARR(pHcWrite), ARR(oHcEnter),
   "h[s] = x for each of the hc streams -- the wide residual stream's first value. Shares `hc_write`'s parameter list." },
+{ "mhc_pre", ARR(pMhcPre), ARR(oMhcPre),
+  "Manifold hyper-connection read: RMS-scaled projection of the whole hc*n residual, sigmoid "
+  "pre/post gates and Sinkhorn mixing. x has dtype, post and comb are f32. comb is indexed "
+  "[source,destination]. First pass is row softmax + hc_eps then column normalization; later "
+  "passes add hc_eps to both normalization denominators. hc is 2..8; iterations is 1..256." },
+{ "mhc_pre_partial", ARR(pMhcPrePartial), ARR(oMhcPrePartial),
+  "mhc_pre's projection split by residual columns. Chunk c covers columns [c*chunk, (c+1)*chunk) "
+  "of the hc*n row; for chunks [first, first+chunks) part[m, (c-first)*S + j] is the sum over the "
+  "chunk of h*fn[j] for j < hc*(hc+2) and of h*h for j = hc*(hc+2), with S = hc*(hc+2)+1 rounded "
+  "up to a multiple of 4 and the slots past the last zero. chunk divides hc*n. Tensor-parallel "
+  "ranks each compute their chunks and an all_gather (row = chunks*S) joins them." },
+{ "mhc_pre_finish", ARR(pMhcPreFinish), ARR(oMhcPreFinish),
+  "mhc_pre from mhc_pre_partial's matrix over all hc*n/chunk chunks: each coefficient and the sum "
+  "of squares is the sum of its chunks' partials (the order is the implementation's), then "
+  "mhc_pre's gates, Sinkhorn mixing and collapse of h. part and mhc_pre_partial over every chunk "
+  "together are mhc_pre." },
+{ "mhc_post", ARR(pHcWrite), ARR(oMhcPost),
+  "out[dst,i] = post[dst]*x[i] + sum_src comb[src,dst]*h[src,i]. post and comb are f32; "
+  "out must not alias h. No normalization of the residual stream." },
+{ "mhc_contract", ARR(pHcWrite), ARR(oMhcContract),
+  "x[i] = mean over hc streams h[stream,i], rounded once to dtype." },
+{ "kda_update", ARR(pKdaUpdate), ARR(oKdaUpdate),
+  "L2-normalized KDA: per-channel decay exp(lower_bound*sigmoid(exp(A_log)*(a+dt_bias))), "
+  "beta=sigmoid(b), S*=decay; S+=beta*(v-S*k)*k; o=scale*S*q. State is f32 [slot,heads,V,K]. "
+  "verify reads state_idx[seq,num_accepted-1] and writes each candidate state_idx[seq,t]; "
+  "prefill reads/writes column zero, committing only the final state. cu offsets are absolute; "
+  "has_init=0 starts from zero and a negative initial slot emits zero output. No output norm." },
 { "hc_read", ARR(pHcRead), ARR(oHcRead),
   "The read half of a gated residual. N = grouped_rmsnorm(h) -- one rsqrt per `n`-wide stream, "
   "one gain of hc*n over all of them, `w + wadd`; g = sigmoid(mix_up @ silu(mix_down @ N / hc)); "
@@ -929,6 +991,18 @@ static const RadOpSchema kSchemas[] = {
   "keys j with 0 <= i - j <= left (`right` 0). qf = q * head_dim^-0.5/ln2 * softplus(pds); logit "
   "= qf.k * ln(1+e)/ln2 + qf.relk[i-j]; softcap * tanh(logit / softcap); softmax; .v. f32, one "
   "rounding." },
+{ "mla_attn", ARR(pMlaAttn), ARR(oMlaAttn),
+  "Softmax over selected latent vectors used as both key and value; per-query page tables and visible lengths." },
+{ "mla_project", ARR(pMlaProject), ARR(oGemm),
+  "Per-head query absorption or value expansion through the shared [head,(K|V),latent] BF16 matrix." },
+{ "dsa_score", ARR(pDsaScore), ARR(oDsaScore),
+  "Per-head ReLU of FP8 dot products, then signed head gates and scales; invalid history is -inf." },
+{ "dsa_query", ARR(pMnD), ARR(oQuantFp8),
+  "Normalized Hadamard, BF16 boundary and power-of-two E4M3 quantization per query head." },
+{ "dsa_pool", ARR(pDsaPool), ARR(oDsaPool),
+  "Channel-wise softmax pooling with learned position bias, BF16, normalized Hadamard, BF16, power-of-two FP8." },
+{ "swiglu_clamped", ARR(pSwigluClamped), ARR(oGateUp),
+  "silu(min(gate,limit))*clamp(up,-limit,limit); gate is the first half." },
 { "silu_mul", ARR(pMnD), ARR(oGateUp),
   "y[i] = silu(gate_up[i]) * gate_up[n + i]. The GATE IS THE FIRST HALF, which is the order "
   "rad-convert fuses gate and up into one weight in." },
@@ -1095,6 +1169,8 @@ static const RadOpSchema kSchemas[] = {
   "y = q * scale, the inverse of quant_act_i8g. It does NOT undo a rotation." },
 
 { "gemm_nt", ARR(pGemm), ARR(oGemm), "y[M,N] = a[M,K] @ b[N,K]^T, f32 accumulate." },
+{ "gemm_nt_f32", ARR(pGemm), ARR(oGemm),
+  "BF16 activations times F32 weights, F32 accumulation and output; preserves routing and index gate precision." },
 { "gemm_nt_bias", ARR(pGemmBias), ARR(oGemmBias),
   "gemm_nt with a per-column bias added in f32, rounded to y's dtype; then, optionally, `act` of "
   "that (\"gelu\" exact, \"gelu_tanh\" the tanh approximation, \"none\"), rounded; then `res` "
@@ -1184,6 +1260,8 @@ static const RadOpSchema kSchemas[] = {
   "when rows == n. `act` is \"sigmoid\" or \"none\", and it applies to the SCALAR. With `add` "
   "present the form is y = bf16(x * act(s)) + add -- the product NARROWED before the sum, which "
   "is what makes the fused form bit-identical to the pair it replaces." },
+{ "router_sigmoid_topk", ARR(pRouterSigmoid), ARR(oRouterSigmoid),
+  "Single-group sigmoid routing; correction bias selects experts, original scores weight them." },
 { "router_topk", ARR(pRouter), ARR(oRouter),
   "Softmax over ALL n_expert logits, then the top_k by probability with ties to the lower expert "
   "id, then -- if `norm` -- renormalise the kept weights to sum to one." },
@@ -1691,6 +1769,18 @@ SIMPLE("ref_rmsnorm_add", "rmsnorm_add", "norm", "residual add then RMS norm", D
        ref_rmsnorm_add),
 SIMPLE("ref_hc_enter", "hc_enter", "norm", "gated residual entry: hc copies of x", DT_FLOAT,
        ref_hc_enter),
+SIMPLE("ref_mhc_pre", "mhc_pre", "norm", "manifold residual gates and Sinkhorn mixing", DT_FLOAT,
+       ref_mhc_pre),
+SIMPLE("ref_mhc_pre_partial", "mhc_pre_partial", "norm", "manifold residual projection partials", DT_FLOAT,
+       ref_mhc_pre_partial),
+SIMPLE("ref_mhc_pre_finish", "mhc_pre_finish", "norm", "manifold residual gates from projection partials", DT_FLOAT,
+       ref_mhc_pre_finish),
+SIMPLE("ref_mhc_post", "mhc_post", "norm", "manifold residual source-to-destination update", DT_FLOAT,
+       ref_mhc_post),
+SIMPLE("ref_mhc_contract", "mhc_contract", "norm", "mean of manifold residual streams", DT_FLOAT,
+       ref_mhc_contract),
+SIMPLE("ref_kda_update", "kda_update", "gdn", "bounded per-channel delta recurrence and candidate rollback", DT_FLOAT,
+       ref_kda_update),
 ROWL("ref_hc_read", "hc_read", "norm",
      "gated residual read: grouped norm, low-rank gate, stream mix",
      DT_FLOAT ", or mixing matrices of E4M3 / int8 codes with a scale plane, joined",
@@ -1710,6 +1800,20 @@ SIMPLE("ref_grid_embed_aa", "grid_embed_aa", "elem",
        ref_grid_embed_aa),
 SIMPLE("ref_add", "add", "elem", "elementwise sum", DT_FLOAT, ref_add),
 SIMPLE("ref_mul", "mul", "elem", "elementwise product", DT_FLOAT, ref_mul),
+SIMPLE("ref_mla_attn", "mla_attn", "attn", "absorbed latent MQA attention", DT_FLOAT,
+       ref_mla_attn),
+SIMPLE("ref_dsa_score", "dsa_score", "attn", "weighted FP8 index scoring", DT_FLOAT,
+       ref_dsa_score),
+SIMPLE("ref_dsa_pool", "dsa_pool", "attn", "learned compressed FP8 index keys", DT_FLOAT,
+       ref_dsa_pool),
+SIMPLE("ref_dsa_query", "dsa_query", "attn", "normalized FP8 index queries", DT_FLOAT,
+       ref_dsa_query),
+SIMPLE("ref_gemm_nt_f32", "gemm_nt_f32", "gemm", "F32 routing projection", DT_FLOAT,
+       ref_gemm_nt_f32),
+SIMPLE("ref_mla_project", "mla_project", "attn", "absorbed MLA projections", DT_FLOAT,
+       ref_mla_project),
+SIMPLE("ref_swiglu_clamped", "swiglu_clamped", "elem", "asymmetrically clipped SwiGLU", DT_FLOAT,
+       ref_swiglu_clamped),
 SIMPLE("ref_silu_mul", "silu_mul", "elem", "silu-gated product over a fused gate_up", DT_FLOAT,
         ref_silu_mul),
 SIMPLE("ref_act_mul", "act_mul", "elem", "act(a) * b over two operands", DT_FLOAT, ref_act_mul),
@@ -1847,6 +1951,8 @@ SIMPLE("ref_qk_norm_rope", "qk_norm_rope", "attn", "per-head QK norm then rotary
 
 SIMPLE("ref_scale_rows", "scale_rows", "elem", "one scalar per row, broadcast across the row",
        DT_FLOAT, ref_scale_rows),
+SIMPLE("ref_router_sigmoid_topk", "router_sigmoid_topk", "moe", "sigmoid correction-bias routing", DT_FLOAT,
+       ref_router_sigmoid_topk),
 SIMPLE("ref_router_topk", "router_topk", "moe", "softmax then exact top-k routing", DT_FLOAT,
        ref_router_topk),
 SIMPLE("ref_moe_scatter", "moe_scatter", "moe", "stable counting sort of routing slots by expert",

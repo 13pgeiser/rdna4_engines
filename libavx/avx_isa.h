@@ -71,6 +71,16 @@ int         avx_par_force(int threads);
     /* ---- elementwise and norms */                                                              \
     X(rmsnorm)              X(rmsnorm_p)            X(rmsnorm_add)          X(hc_enter)           \
     X(hc_read)              X(hc_write)             X(mtp_enter)            X(layernorm)          \
+    X(mhc_pre)              X(mhc_post)             X(mhc_contract)         X(kda_update)         \
+    X(mhc_pre_partial)      X(mhc_pre_finish)                                                  \
+    X(swiglu_clamped)                                                                          \
+    X(router_sigmoid_topk)                                                                     \
+    X(dsa_pool)                                                                                \
+    X(dsa_query)                                                                               \
+    X(gemm_nt_f32)                                                                             \
+    X(mla_project)                                                                             \
+    X(dsa_score)                                                                               \
+    X(mla_attn)                                                                                \
     X(add)                  X(grid_embed)           X(grid_embed_aa)        X(causal_conv1d)      \
     X(mul)                  X(silu_mul)             X(gelu_mul)             X(gelu)               \
     X(silu)                 X(sigmoid)              X(logit_softcap)        X(gather_rows)        \
