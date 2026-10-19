@@ -1857,6 +1857,7 @@ with a separate language model first; radiance reads the prompt as given.
 |---|---|
 | `model` | accepted and not enforced: one server serves one model |
 | `messages` / `prompt` / `input` | chat / completion / embedding |
+| `images_config` | image models only: the processor mode the request wants, by name (`gundam`, `base`) or as an object restating the served sizes; a geometry the model does not serve is refused (Unlimited-OCR, §5.17) |
 | `max_tokens`, `max_completion_tokens`, `n_predict` | default: what the context leaves after the prompt (`--default-max-tokens`); -1 is llama-server's "no limit", the same without the default. Clamped to what the context leaves, and to `--max-tokens-cap`, rather than refused (§5.8) |
 | `temperature` | [0, 2] |
 | `top_p` | (0, 1] |
@@ -2544,6 +2545,50 @@ curl -s http://localhost:8000/v1/videos -F 'prompt=the fox turns and runs into t
 The MP4's soundtrack is 48 kHz stereo. LTX-2.5 runs on one card; `--tp` above 1 is refused. Its
 Gemma 4 text encoder (13 GiB in fp8) does not fit a 32 GB card beside the DiT: serve it with
 `--vision-tower-placement ram`, which keeps it in pinned host memory and reads it once a prompt.
+
+### 5.17 Documents: Unlimited-OCR
+
+`unlimited-ocr` (baidu/Unlimited-OCR, bf16; `deploy/compose/unlimited-ocr-bf16.yaml`) parses
+pictures of documents through the ordinary chat endpoint. It is a single-shot parser, not a
+conversation: one user message holds the picture(s) and the instruction, and the reply is the
+layout. The picture part comes **before** the text part (the reference prompt is `<image>` then
+the instruction):
+
+```sh
+curl http://127.0.0.1:8000/v1/chat/completions -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{
+  "model": "unlimited-ocr",
+  "messages": [{"role": "user", "content": [
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+    {"type": "text", "text": "document parsing."}]}],
+  "images_config": "gundam", "temperature": 0, "max_tokens": 2048}'
+```
+
+`images_config` selects the geometry:
+
+| value | meaning |
+|---|---|
+| `"gundam"` (or `{"base_size":1024,"image_size":640,"crop_mode":true}`) | one picture; larger than 640 px it is cut into 640-px tiles plus the 1024-px global view |
+| `{"base_size":1024,"image_size":640,"crop_mode":false}` | one 640-px page (a page scan) |
+| one image part per page, base mode, text `"Multi page parsing."` | several pages in one prompt |
+
+Only the 1024/640 geometry is served (`base_size` and `image_size` may restate it, nothing else);
+any other side is refused with a 400 rather than stopping the server. A PDF is **not** an accepted
+input: rasterise it first (`pdftoppm -r 200 -png`) and send the page images, a handful at a time.
+PNG, JPEG, WebP, GIF, BMP, TIFF, AVIF and HEIF decode; the request body is bounded by
+`--max-body-mib` (default 512).
+
+The reply is text, one block per detected region, with the region type and its box in the model's
+1024-pixel coordinates; the `<|det|>`/`<|/det|>` control tokens are stripped from the chat
+response, so a line reads `text [59, 54, 498, 70]The quick brown fox ...` (a multi-page reply has
+`<PAGE>` at each page start). Parse with
+`^(title|text|table|list|footer|image_footnote)\[(\d+), (\d+), (\d+), (\d+)\](.*)$`.
+
+The checkpoint's generation behaviour is kept: a 128-token generated-token ring (`RAD_KV_RING`,
+requests excluded from prefix reuse) and the 35-gram/128-token no-repeat ban, both overridable per
+request (`ngram_ban_n`, `ngram_window`). It needs about 7 GiB on one card, so serve it alone; the
+compose file takes `RADIANCE_GPU` and the model file's VRAM, with the vision tower on the card and
+an fp8 KV cache.
 
 ## 6. Operation
 
