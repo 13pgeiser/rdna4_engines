@@ -55,6 +55,7 @@ AUDIO_C = 32
 AUDIO_CH = 2
 ENC_MAX_SAMPLES = 500000
 SLOT_ROWS_A = AUDIO_CH * (ENC_MAX_SAMPLES // AUDIO_HOP)   # 1250
+MAXA = SLOT_ROWS_A // AUDIO_CH                            # per-channel row stride within a slot (625)
 VAE_SAFETENSORS = os.path.join(
     os.environ.get("COMFYUI_HOME", "/home/dustin/AI/ComfyUI"),
     "models/vae/minimax_h3_audio_vae_fp32.safetensors")
@@ -74,7 +75,7 @@ def ref_latent(model, staged, ch, T):
         z = model.encode(wave)                                    # [1, 32, ch, T']
     assert z.shape[1] == AUDIO_C and z.shape[2] == ch, tuple(z.shape)
     zp = z[0].permute(1, 2, 0)                                    # [ch, T', 32]
-    out = zp.reshape(ch * z.shape[3], AUDIO_C)                     # channel-major rows
+    out = zp.reshape(ch * z.shape[3], AUDIO_C)                     # channel-major rows (contiguous)
     return out[:ch * T].numpy()                                    # used rows only
 
 
@@ -107,7 +108,9 @@ def do_parity(m, enca_f, encsm_f, kind, slot, n):
     ref = ref_latent(m, staged, ch, T)                             # [ch*T, 32]
     enca = np.fromfile(enca_f, dtype=np.float32).reshape(-1, AUDIO_C)
     base = slot_row(kind, slot)
-    dev = enca[base:base + ch * T]                                 # device normalised latent
+    # Device layout: within a slot, channel c occupies rows [c*MAXA, c*MAXA+T). Stack them back to
+    # the reference's contiguous channel-major [ch*T, 32] so the two sides align row for row.
+    dev = np.vstack([enca[base:base + T], enca[base + MAXA:base + MAXA + T]])
     if dev.shape != ref.shape:
         sys.exit(f"device slice {dev.shape} vs reference {ref.shape}; check --kind/--slot/--n")
     rf, mx = rel_frobenius(dev, ref)

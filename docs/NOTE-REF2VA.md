@@ -190,17 +190,30 @@ as point 6 / point 4. Nothing here claims to match ComfyUI's timings.
    and read exactly the slot region the encode pass wrote this job — no stale-neighbor read.
 
    What remains is **strict numeric value-parity** of the encoder latents against the reference HF
-   encoder (a per-tensor golden), not *whether* the encoders are live. **This is now actionable, not
-   environment-blocked**: a `torch` environment is present on the box (`comfyui-rocm10-venv`,
-   torch 2.13.0+rocm; it also re-bakes the pack `golden.json`, whose keyframe cases came out
-   byte-identical). The genuine reference sources are present (`MiniMax-H3-ref2va-src`, `MiniMax-H3/vae`,
-   `MiniMax-H3/audio_vae`), so a per-tensor encoder value golden *can* be produced here — it simply has
-   not been yet. The crux is matching preprocessing bit-for-bit (decode / resize / normalization /
-   frame-sampling), not the encoder weights, which the convert log already showed are real. The discipline
-   stands: content-control + determinism + a bit-exact pack is the strongest *parity* evidence produced so
-   far, and the per-tensor value match is left open rather than asserted, so a change is never made merely
-   to make latents *differ* when they could be made *wrong*. A clean parity number, once produced, should
-   start from the audio encoder (no spatial preprocessing to confound it) before the video VAE.
+   encoder (a per-tensor golden), not *whether* the encoders are live. **This has now been measured on
+   the audio path.** A device-input-anchored check — feed the reference HF audio VAE (fp32) the device's
+   *own* staged `enc_samples`, then compare its latent to the device's `b_enca`; the reference and the
+   container use byte-identical encoder weights and `latents_mean/std`, verified, so only the kernels
+   can differ — gives a **relative Frobenius error ~0.79, correlation 0.67**, with the device latent's
+   std ~2.5× smaller than the reference's (0.23 vs 0.59). That is far beyond the fp8 floor: fp8
+   quantisation is unbiased (it neither collapses std nor anti-correlates channels) and the convert log's
+   own audio-quant error is ~1.6e-3. The causes are individually **ruled out** — precision (fp8 would
+   keep corr ~0.99), preprocessing (device-input-anchored), reference export (the 97 shared encoder
+   tensors are bit-identical to the HF source, and the `latents_mean/std` match to the last digit), and
+   normalisation constants (identical). Per-channel shape error stays ~0.77 even after removing scale and
+   a few channels are negatively correlated, so the gap is in the network *transform* (strided conv1d /
+   per-frame GroupNorm / the `AttnProjection` head), not a single scale. Localising it fully needs
+   stage-by-stage activation dumps of the device encoder against the reference module-by-module —
+   substantial work on kernels the live image / video paths also share, and deliberately **not**
+   blind-fixed. The audio result is measured; the **video / image VAE encoders are a separate kernel
+   family** (`conv3d_ndhwc`) and have not yet been measured this way. Functional conditioning is
+   unaffected — the DiT is internally consistent with the latents it is fed — but *numerical* fidelity to
+   the reference encoder is not achieved on the audio path, so audio-reference output is not guaranteed to
+   match ComfyUI latent-for-latent. Reproduce: dump with `R4D_ENC_DEBUG=1 R4D_ENC_DUMPDIR=<dir>` over one
+   `ref_audio` request, then `ref_aenc_parity.py --enca enca.f32 --encsm encsm_4_1.f32 --kind audio
+   --slot 1` (its `--selftest` validates the reshape / slot / metric logic with no device). The audio
+   encoder is the cleanest first measurement because it has no spatial preprocessing to confound it; the
+   video VAE remains the harder, still-unmeasured half.
 
    What still differs from the DaSiWa reference (hence not pixel-for-pixel reproducible):
    - **The text encoder only *names* a moving picture; it never sees its pixels.** DaSiWa also shows
