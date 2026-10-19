@@ -1102,7 +1102,7 @@ nav button.on { color:var(--fg); background:var(--track); }
               <div><div class="n" id="tps_n">–<u>tok</u></div>
                    <span class="cap">per step</span></div>
               <div><div class="n" id="acc_n">–<u>%</u></div>
-                   <span class="cap">accepted</span></div>
+                   <span class="cap">accepted now</span></div>
             </div>
             <div class="kv" id="spec"></div>
           </div>
@@ -1472,6 +1472,116 @@ function setMetric(key, value, text) {
   spark(key, hist[key]);
 }
 
+/* BEST / RECENT / NOW ON THE OTHER FOUR TILES, in the shape the decode step established.
+ *
+ * WHAT THESE ARE NOT: engine figures. The engine publishes a floor and a recent window for the
+ * decode step alone (step_ns_decode_best / _recent); for tok/s, requests in flight and acceptance
+ * it publishes ONE figure per poll and nothing older. So these three figures are page-side, and
+ * they mean:
+ *   best / highest - the extreme this page session has seen AT THE CURRENT CONCURRENCY.
+ *                      Resets on reload, not on restart.
+ *   recent         - the mean over the last 15 s at that concurrency; 5 s on prefill, whose
+ *                      events are shorter than the window that would fit them. Shorter
+ *                      than the sparkline on purpose:
+ *                      a 60 s mean still read 31 tok/s fifty seconds after the lane went
+ *                      quiet, which is the lane being remembered rather than measured.
+ *   now            - the current value as a percentage of that extreme.
+ * "highest" rather than "best" on the two tiles where more is not better: a lane at its highest
+ * request count is busy, not good. The word carries a direction the number alone does not.
+ *
+ * PER-CONCURRENCY BUCKETS, the decode step's structure: a c8 rate read against the
+ * single-stream best reports the batch arriving as a level change -- the mistake that took
+ * the old drift line out. Every figure on the line describes the current concurrency, and
+ * past c1 the line says so ("@c8"). Requests in flight is the exception: its value IS the
+ * concurrency, so bucketing it by concurrency would pin "highest" to the current number
+ * forever -- it keeps one session-wide bucket. While the lane is idle nothing new is
+ * recorded and the line keeps the last active concurrency's figures: frozen, no now clause,
+ * which is what the Decode Step tile does at idle.
+ *
+ * NO ~99 CAP HERE, unlike the decode step. That cap exists because `now` there is a 500 ms poll
+ * mean measured against a 32-step window mean -- different instruments, so a fast stretch can read
+ * faster than the floor without being one. Here the extreme is computed FROM the same series as
+ * `now`, so exceeding it is arithmetically impossible and 100% is exact: you are at your best.
+ */
+/* RECENT'S OWN WINDOW, deliberately shorter than the sparkline's. HIST is 60 s and that is right
+ * for a picture -- a sparkline wants the whole minute to show shape. It is wrong for a number:
+ * measured over real traffic (two 5 s bursts inside a quiet minute), a 60 s mean still read 31.7
+ * tok/s fifty seconds after the lane went quiet, and 30 s only brought that to 26.9. Fifteen
+ * seconds decays to zero within a quarter-minute of silence while still tracking the running mean
+ * mid-burst (52.8 against an actual 53.3). Ten and five overshoot -- 79 and 144 against that same
+ * 53 -- which is the current value wearing a different name, and the big number above already is
+ * that. `best`/`highest` stay full-session: an extreme wants every chance to be broken.
+ * Idle polls do not enter an active bucket -- the lane is not at that concurrency while it
+ * sleeps -- but they DO count in requests in flight's window, whose value is meaningful
+ * while nothing runs.
+ *
+ * PREFILL GETS ITS OWN WINDOW (RECENT_PREFILL, 5 s). Measured: small prompts prefill in 1.5-6 s
+ * above 100 tok/s; the operator's compaction reload -- the big one -- runs 7-15 s by his own
+ * count. A 15 s mean cannot report a 7 s event while it is running: it reaches barely half the
+ * peak by the event's end, then spends a quarter-minute averaging it down. Five seconds is
+ * shorter than the shortest event, so `recent` rides the prefill while it happens instead of
+ * diluting it. The engine's own figure is already a windowed rate (its help text: "over the
+ * scheduler's recent window"), so this window sits on top of the engine's smoothing -- it
+ * decides how long the page remembers, not how sharply the engine measures. */
+const RECENT = 30;                                    /* 15 s at the 500 ms poll */
+const RECENT_PREFILL = 10;   /* 5 s: shorter than the shortest prefill event (see above) */
+const extAt = {}, winAt = {};
+let lastActiveC = 0;
+function noteSample(key, c, value, cap) {
+  if (value == null || !finite(value)) return;
+  const e = extAt[key] || (extAt[key] = {});
+  const w = winAt[key] || (winAt[key] = {});
+  if (!(c in e) || value > e[c]) e[c] = value;
+  const s = w[c] || (w[c] = []);
+  s.push(value); if (s.length > (cap || RECENT)) s.shift();
+}
+function triple(key, c, label, fmt, showNow) {
+  /* RECENT IS A WINDOW MEAN, not a window maximum -- a maximum would sit equal to `best` on
+   * any steady lane, and two figures that always agree read as a broken instrument. */
+  const e = extAt[key];
+  if (!e || !(c in e)) return "";
+  /* A bucket whose extreme is zero still has a story -- requests in flight has seen nothing yet --
+   * so it renders. Only the `now` clause needs a nonzero extreme to divide by. */
+  const s = winAt[key][c];
+  let sum = 0;
+  for (const v of s) sum += v;
+  const recent = sum / s.length;
+  const now = s[s.length - 1];
+  const tag = typeof c === "number" && c > 1 ? "@c" + c : "";
+  let out = label + " " + fmt(e[c]) + " · recent " + fmt(recent);
+  /* THE SAME GUARD THE DECODE STEP USES: no `now` clause while nothing is running. A rate of
+   * zero is the lane being idle, not the lane being slow, and "now 0% of best" reads as a
+   * fault. The "@cN" tag rides the tail, exactly where the decode step puts it. */
+  if (showNow !== false && e[c] > 0) out += " · now " + Math.round(100 * now / e[c]) + "% of " + label + tag;
+  return out;
+}
+/* WINDOWED ACCEPTANCE. The engine's figure is cumulative and exact -- tot_accepted_/tot_drafted_
+ * over the life of the process -- so a best/recent/now line built on it would print the same
+ * number three times and call it a trend. The per-position counters the acceptance chart already
+ * reads are cumulative too, and the DIFFERENCE between two polls is exact acceptance over that
+ * interval, which is the only figure a detail line can move on. Each sample covers 10 s of
+ * drafting; `recent` averages the last RECENT samples AT THAT CONCURRENCY and `now` is
+ * the newest one -- different windows, free to disagree.
+ * The counters go backwards when the engine restarts; that poll resets the window rather than
+ * reporting a negative draft. */
+const ACC_WIN = 20;                                   /* 10 s of drafting at the 500 ms poll */
+let accPrev = null;
+const accDelta = [];
+function accWindow(s) {
+  let reach = 0, hit = 0;
+  for (const p of (s.draft_positions || [])) { reach += p.reached || 0; hit += p.accepted || 0; }
+  if (accPrev === null || reach < accPrev.r || hit < accPrev.a) {
+    accPrev = { r: reach, a: hit }; accDelta.length = 0; return null;
+  }
+  const dr = reach - accPrev.r, da = hit - accPrev.a;
+  accPrev = { r: reach, a: hit };
+  if (dr <= 0) return null;
+  accDelta.push({ r: dr, a: da }); if (accDelta.length > ACC_WIN) accDelta.shift();
+  let R = 0, A = 0;
+  for (const d of accDelta) { R += d.r; A += d.a; }
+  return R > 0 ? A / R : null;
+}
+
 
 /* ---------------------------------------------------------------- the batch
  *
@@ -1517,7 +1627,14 @@ function kvPanel(host, keys) {
   return out;
 }
 const totals = kvPanel($("totals"), ["Requests", "Steps"]);
-const spec = kvPanel($("spec"), ["Drafter", "Depth"]);
+/* "Average" is the LIFETIME MARGINAL ratio -- upstream's figure, unchanged, and the one this
+ * panel used to carry as its headline. A bullet now rather than the big number: see the note at
+ * the accept tile. It divides by every token DRAFTED, so it is not comparable with the live
+ * figure above it, which divides by the positions actually REACHED -- the two bases are worked
+ * through in the GUIDE, and both are derivable from the log. Deliberately not spelled out on the
+ * face of the panel: the distinction is an analysis-time concern, and a tooltip is invisible on
+ * the phone anyway. */
+const spec = kvPanel($("spec"), ["Drafter", "Depth", "Average"]);
 
 /* ---------------------------------------------------------------- meters */
 /* `split` gives the track a second segment for a fill that is two things -- see setSplit. */
@@ -1809,6 +1926,17 @@ function update(s, dt) {
   setMetric("decode",  s.decode_tps,  tps(s.decode_tps));
   setMetric("prefill", s.prefill_tps, tps(s.prefill_tps));
   setMetric("flight",  s.in_flight,   String(s.in_flight));
+  const busy = s.running > 0;
+  if (busy) {
+    lastActiveC = s.running;
+    noteSample("decode", s.running, s.decode_tps);
+    noteSample("prefill", s.running, s.prefill_tps, RECENT_PREFILL);
+  }
+  noteSample("flight", "*", s.in_flight);
+  const cNow = busy ? s.running : lastActiveC;
+  $("m-decodedet").textContent  = triple("decode", cNow, "best", tps, busy);
+  $("m-prefilldet").textContent = triple("prefill", cNow, "best", tps, busy);
+  $("m-flightdet").textContent  = triple("flight", "*", "highest", (v) => String(Math.round(v)), s.in_flight > 0);
   /* THE MERGED POOL, not the maximum over groups. The max is the right preemption signal and the
    * wrong headline: the drafter's own window group is sized one block-run per slot and therefore
    * sits at 100% for the whole life of the server, so a headline reading the max reads 100% on a
@@ -1834,9 +1962,23 @@ function update(s, dt) {
         + cnt3(s.kv_tokens_used) + " tok"
         + (kvGave > 0 ? "  ·  " + hb(kvGave) + " lent to experts" : "")
       : "";
-  setMetric("accept",  100 * s.draft_accept,
-            s.draft_positions && s.draft_positions.length
-            ? pctn(s.draft_accept, 0) : DASH);
+  const aw = accWindow(s);
+  if (aw != null) noteSample("accept", s.running > 0 ? s.running : lastActiveC, aw);
+  /* THE HEADLINE IS THE LIVE WINDOW, not the cumulative ratio. The engine's figure is exact but
+   * cumulative, so on a process that has been up for hours it cannot move: 559 fresh drafts moved
+   * it one point against a 33,000-draft denominator, and it froze outright the moment the lane
+   * went quiet. Every other tile's big number is the current value, and feeding the cumulative one
+   * here also fed the sparkline a quantity that is flat by construction.
+   * Polls with no new drafts push NOTHING and the headline freezes with them: acceptance is
+   * UNDEFINED when nothing was drafted, so neither 0 (reads as failure) nor the last value (reads
+   * as stable) is the truth. A server with no draft head shows the dash -- there is no such figure
+   * to show. The lifetime ratio stays on /stats and /metrics; what the tile answers is "what is it
+   * accepting now".
+   * THE SPARKLINE'S SCALE DIFFERS from the other tiles: its samples are 10 s drafting windows, not
+   * 500 ms polls, so this box spans up to 120 windows of actual drafting rather than 60 s. */
+  if (!(s.draft_positions && s.draft_positions.length)) setMetric("accept", null, DASH);
+  else if (aw != null) setMetric("accept", 100 * aw, pctn(aw, 0));
+  $("m-acceptdet").textContent = triple("accept", cNow, "highest", (v) => pct(v, 0), busy);
   M.flight.u.textContent = "/ " + s.queue_cap;
 
   const list = s.requests || [];
@@ -1922,10 +2064,22 @@ function update(s, dt) {
     const perStep = sps > 0 && s.decode_tps > 0 ? s.decode_tps / sps / seqs : null;
     if (perStep != null) lastTps = perStep;
     $("tps_n").firstChild.nodeValue = lastTps == null ? DASH : sig3(lastTps);
-    $("acc_n").firstChild.nodeValue = pctn(s.draft_accept, 0);
+    /* ACCEPTED IS THE LIVE FIGURE, matching the tile above it. `aw` is the same pooled drafting
+     * window the tile's headline reads, computed earlier in this function -- one derivation, two
+     * readers, so the panel and the tile cannot disagree.
+     * DESIGN DECISION, 10-19, at the Operator's direction: this section shows the REAL-TIME
+     * accepted percentage and the lifetime average sits in the bullets below it. The reasoning is
+     * on the tile; the short form is that a cumulative ratio on a process that has been up for
+     * hours is a number that cannot move, and a headline that cannot move reads as a dead page.
+     * PINNED, NOT PRICED: the Operator may prefer the average back in the big seat, and the swap
+     * is these two lines. What must not happen is the average returning as the headline with no
+     * bullet left behind, because then the live figure is the thing nobody can see.
+     * Undefined when nothing was drafted -- freeze rather than print 0 or repaint the last value. */
+    if (aw != null) $("acc_n").firstChild.nodeValue = pctn(aw, 0);
     $("specaside").textContent = "depth " + dp.length;
     spec["Drafter"].textContent       = drafterName;
     spec["Depth"].textContent         = dp.length;
+    spec["Average"].textContent        = pctn(s.draft_accept, 0) + "%";
   }
 
   /* ---- devices, in the same panel as the cache meter: they are one question. */

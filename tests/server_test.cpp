@@ -2284,6 +2284,12 @@ TEST(metrics_is_valid_prometheus_text_with_vllm_names) {
     CHECK_NEAR(find_one("radiance:draft_acceptance_ratio{"), 0.61, 1e-9);
     CHECK_NEAR(find_one("vllm:generation_tokens_total{"), 5.0, 1e-9);
 
+    /* An unmeasured decode floor is ABSENT, not 0: a floor of 0 seconds per token is an
+     * infinitely fast one, and a scrape would plot it as a record. This fixture never completes a
+     * window of 32 single-stream steps, so neither series may appear. */
+    CHECK(r.body.find("radiance:decode_step_seconds_best") == std::string::npos);
+    CHECK(r.body.find("radiance:decode_step_seconds_recent") == std::string::npos);
+
     /* Every sample carries the model_name label vLLM's dashboards group by. */
     for (auto& kv : d.samples)
         CHECK(kv.first.find("model_name=\"test-model\"") != std::string::npos);
@@ -2304,6 +2310,48 @@ TEST(metrics_is_valid_prometheus_text_with_vllm_names) {
     CHECK(r.body.find("vllm:time_to_first_token_seconds_bucket{model_name=\"test-model\","
                       "engine=\"0\",le=\"0.001\"}") != std::string::npos);
     CHECK(r.body.find("le=\"2560\"") != std::string::npos);
+}
+
+/* The decode floor reaches /metrics, in seconds. The scheduler keeps nanoseconds and the page
+ * divides for display; the wire uses the base unit Prometheus expects, the same choice
+ * radiance:engine_step_seconds_* already makes. */
+TEST(metrics_carries_the_decode_floor_in_seconds) {
+    Fixture f;
+    f.sched.m.step_ns_decode_best   = 14708911;   /* 14.71 ms/token: a measured floor */
+    f.sched.m.step_ns_decode_recent = 16428860;   /* 16.43 ms/token: the recent window */
+
+    HttpResponse r = f.get("/metrics");
+    CHECK_EQ(r.status, 200);
+    PromDoc d = parse_prom(r.body);
+    CHECK_EQ((int)d.errors.size(), 0);
+    CHECK_EQ(d.type["radiance:decode_step_seconds_best"], std::string("gauge"));
+    CHECK_EQ(d.type["radiance:decode_step_seconds_recent"], std::string("gauge"));
+
+    auto find_one = [&](const std::string& prefix) -> double {
+        for (auto& kv : d.samples)
+            if (kv.first.rfind(prefix, 0) == 0) return kv.second;
+        return -12345.0;
+    };
+    CHECK_NEAR(find_one("radiance:decode_step_seconds_best{"), 0.014708911, 1e-12);
+    CHECK_NEAR(find_one("radiance:decode_step_seconds_recent{"), 0.016428860, 1e-12);
+
+    /* A floor is a duration, so it must survive the number formatter: 0.0147 s rendered as an
+     * integer would read as infinitely fast. Checked on a prefix rather than the whole literal
+     * because num() prints 17 significant digits and the last ones are the double's own noise. */
+    CHECK(r.body.find("radiance:decode_step_seconds_best{model_name=\"test-model\",engine=\"0\"} 0.01470891")
+          != std::string::npos);
+}
+
+/* Half a window: a floor exists but the recent window has not completed since. Each series is
+ * gated on its own value, so one may appear while the other is absent. */
+TEST(metrics_omits_only_the_floor_half_that_is_unmeasured) {
+    Fixture f;
+    f.sched.m.step_ns_decode_best   = 15000000;
+    f.sched.m.step_ns_decode_recent = 0;
+
+    HttpResponse r = f.get("/metrics");
+    CHECK(r.body.find("radiance:decode_step_seconds_best{") != std::string::npos);
+    CHECK(r.body.find("radiance:decode_step_seconds_recent") == std::string::npos);
 }
 
 /* The scheduler's totals are cumulative, and a scrape turns them into counter increments by adding

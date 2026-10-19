@@ -113,6 +113,10 @@ private:
     Gauge   g_running_, g_waiting_, g_kv_util_, g_prefix_hit_;
     Gauge   g_kv_max_tokens_, g_kv_max_bytes_;
     Gauge   g_prefill_tps_, g_decode_tps_, g_draft_accept_, g_preempted_;
+    /* The decode floor, in seconds: the fastest single-sequence window this process has run,
+     * and the most recent one. Both stay 0 until a window of 32 single-stream steps completes,
+     * and both reset on restart -- the render omits them rather than expose an unmeasured 0. */
+    Gauge   g_step_best_, g_step_recent_;
     Gauge   queue_depth_;
     /* Per-position conditional draft acceptance (see render() and core/sched/draft.h). */
     enum { MAX_DRAFT_POS = 64 };

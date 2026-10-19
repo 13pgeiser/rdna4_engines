@@ -140,6 +140,10 @@ void Metrics::sample(const SchedMetrics& m) {
     g_prefill_tps_.set(m.prefill_tps);
     g_decode_tps_.set(m.decode_tps);
     g_draft_accept_.set(m.draft_acceptance);
+    /* Nanoseconds in the scheduler, seconds on the wire: the base unit Prometheus expects, and
+     * what radiance:engine_step_seconds_* already use. */
+    g_step_best_.set((double)m.step_ns_decode_best / 1e9);
+    g_step_recent_.set((double)m.step_ns_decode_recent / 1e9);
     const int seen = std::max(0, std::min(m.draft_depth_seen, (int)MAX_DRAFT_POS));
     for (int j = 0; j < seen; ++j) {
         const int64_t r = m.draft_pos_reached[j];
@@ -324,6 +328,23 @@ std::string Metrics::render() const {
             "Prefill throughput over the scheduler's recent window.", L, g_prefill_tps_.get());
     w.gauge("radiance:decode_tokens_per_second",
             "Decode throughput over the scheduler's recent window.", L, g_decode_tps_.get());
+    /* THE DECODE FLOOR, the two figures the dashboard's Decode Step tile shows. They were on
+     * /stats only, and /stats is documented as not a stable API -- so the one figure worth
+     * comparing across restarts was reachable only from the surface automation is told not to
+     * use. Omitted until measured: a floor of 0 seconds is not an unmeasured floor, it is an
+     * infinitely fast one, and a scrape would plot it as a record. Both reset on restart, so a
+     * freshly started server simply has no floor to report yet. */
+    if (g_step_best_.get() > 0)
+        w.gauge("radiance:decode_step_seconds_best",
+                "Fastest single-sequence decode step window this process has run, in seconds "
+                "per token. A mean over 32 consecutive single-stream steps, not a stopwatch "
+                "reading. Resets on restart.", L, g_step_best_.get());
+    if (g_step_recent_.get() > 0)
+        w.gauge("radiance:decode_step_seconds_recent",
+                "Most recent single-sequence decode step window, in seconds per token. The gap "
+                "to _best tracks what else the machine is doing, not wear; see docs/GUIDE.md. "
+                "Freezes while the lane is idle, because no window is completing.",
+                L, g_step_recent_.get());
     w.counter("radiance:engine_steps_total",
               "Scheduler steps executed. One forward pass of the model, plus whatever draft "
               "rounds followed it; with speculation a step emits more than one token.",
