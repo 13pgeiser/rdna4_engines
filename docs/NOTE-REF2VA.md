@@ -200,9 +200,11 @@ as point 6 / point 4. Nothing here claims to match ComfyUI's timings.
    own audio-quant error is ~1.6e-3. The causes are individually **ruled out** — precision (fp8 would
    keep corr ~0.99), preprocessing (device-input-anchored), reference export (the 97 shared encoder
    tensors are bit-identical to the HF source, and the `latents_mean/std` match to the last digit), and
-   normalisation constants (identical). Per-channel shape error stays ~0.77 even after removing scale and
-   a few channels are negatively correlated, so the gap is in the network *transform* (strided conv1d /
-   per-frame GroupNorm / the `AttnProjection` head), not a single scale. Localising it fully needs
+   normalisation constants (identical). (An earlier reading of this path — "shape error survives scale
+   removal, so *not* a single scale" — is **superseded by the affine decomposition in the last paragraph
+   below**: fitting one global `a·ref + b` to the two sorted distributions collapses most of this error, so
+   the dominant term *is* a single under-gain, and the corr / per-channel anti-correlation lives only in the
+   small post-affine residual.) Localising it fully needs
    stage-by-stage activation dumps of the device encoder against the reference module-by-module —
    substantial work on kernels the live image / video paths also share, and deliberately **not**
    blind-fixed. The audio result is measured; the **video / image VAE encoders are a separate kernel
@@ -236,6 +238,38 @@ as point 6 / point 4. Nothing here claims to match ComfyUI's timings.
    `R4D_ENC_DEBUG=1 R4D_ENC_DUMPDIR=<dir>` over one single-image `ref2va` request (emits `encpx_1_<slot>`,
    `encg_1_<slot>`, `evc`), then `ref_venc_parity.py --evc evc.f32 --encpx encpx_1_1.f32 --encg
    encg_1_1.f32 --slot 1` (`--selftest` validates the fold/norm/sorted model with no device).
+
+   **The decomposition that reframes #14 — the divergence is a near-pure UNDER-GAIN, not a conv bug.** Both
+   harnesses now fit a single global affine `dev_sorted ≈ a·ref_sorted + b` to the two value distributions:
+
+   | family | a (scale) | b (offset) | R² | relFro raw → after-affine |
+   |---|---|---|---|---|
+   | audio (conv1d) | **0.385** | +0.009 | **0.975** | 0.79 → **0.062** |
+   | video/image (conv3d) | **0.369** | +0.159 | 0.912 | 0.65 → **0.114** |
+
+   Two *entirely different* encoder networks (strided conv1d vs `conv3d_ndhwc`) both reduce to **≈0.37× the
+   reference** with R² 0.91–0.98 — near-perfect linearity. That **overrules the "not a single scale" and
+   "suspect the strided conv1d temporal reduction" readings above**: a conv-reduction or structural transform
+   bug would *not* collapse to a clean global scale. The device encoders are computing the *right shape* of
+   latent, just damped to ~0.37× amplitude (video additionally carries a small positive offset and slightly
+   more tail-compression — its R² 0.912 and residual 0.114 are the structural remainder). Because the scale
+   is ~0.37 for both but *not* bit-identical (0.385 vs 0.369), it is not one shared post-hoc multiply; it
+   reads as a **fixed per-level attenuation compounding across each architecture's own depth** (≈0.83× per
+   level over ~5–6 levels lands near 0.37, and the two archs' depths differ slightly).
+
+   Crucially, the DiT — which shares the container's fp8 weight path and the engine's normal conv / GroupNorm
+   / activation kernels — **generates correctly**, so this is *not* a global kernel or quant fault: the
+   under-gain is **confined to the encoder pass**. The prime suspect is therefore the encoders' per-level /
+   per-frame normalisation (the §5.13 per-frame GroupNorm `CS∈{8,4}` template) applying a near-constant
+   sub-unit gain that compounds level-over-level, or an encoder-path weight/activation dequant scale mismatch
+   that the convert-time quant round-trip does not see. If it is a fixed encoder-norm gain, a correct fix is
+   **confined to the encoder path and never touches the DiT's norms** — which is precisely why this is worth
+   localising rather than shipping. The **confirming step is cheap and read-only** (no math change, gated):
+   dump one encoder block's GroupNorm *input and output* on-device and test whether the output std is a fixed
+   fraction (~0.8×) of the reference GN's — that single dump pins the op. **Not blind-fixed** (the encoder
+   kernels are shared with the live image / plain encode paths; the standing rule is never ship a
+   merely-*different* latent). Reproduce: `--evc/--encpx/--encg` or `--enca/--encsm` as above; each harness
+   now prints the `a`/`b`/R²/after-affine line alongside the raw sorted relFro.
 
    What still differs from the DaSiWa reference (hence not pixel-for-pixel reproducible):
    - **The text encoder only *names* a moving picture; it never sees its pixels.** DaSiWa also shows

@@ -119,6 +119,16 @@ def do_parity(m, enca_f, encsm_f, kind, slot, n):
     print(f"  max abs deviation               = {mx:.3e}")
     print(f"  reference latent |mean|={ref.mean():.4f} std={ref.std():.4f}; "
           f"device |mean|={dev.mean():.4f} std={dev.std():.4f}")
+    # Decompose the gap (see ref_venc_parity.py for the rationale): a single global scale+bias that fits the
+    # two sorted distributions well means the divergence is mostly ONE network-level gain, not structural.
+    sa, sb = np.sort(dev.reshape(-1)), np.sort(ref.reshape(-1))
+    A = np.vstack([sb, np.ones_like(sb)]).T
+    (aa, bb), *_ = np.linalg.lstsq(A, sa, rcond=None)
+    resid = sa - (aa * sb + bb)
+    rf_aff = float(np.linalg.norm(resid)) / (float(np.linalg.norm(sb)) + 1e-12)
+    r2 = 1.0 - float(np.sum(resid ** 2)) / (float(np.sum((sa - sa.mean()) ** 2)) + 1e-30)
+    print(f"  global-affine fit  dev ~ {aa:.4f}*ref {bb:+.4f}:  R^2={r2:.3f}  residual(relFro after affine)={rf_aff:.3e}")
+    print(f"    (a large rf->rf_aff drop => mostly ONE network gain; rf_aff near rf => structural)")
     floor = 5e-3   # fp8 audio quant floor is ~1.6e-3; allow headroom for the bf16 activations
     print(f"  verdict: {'MATCH within quant floor' if rf < floor else 'DIVERGED beyond quant floor'} "
           f"(floor {floor:.0e})")

@@ -232,6 +232,19 @@ def do_parity(m, evc_f, encpx_f, encg_f, slot):
     print(f"  max abs deviation (sorted)             = {mx:.3e}")
     print(f"  reference std={ref.std():.4f} mean={ref.mean():.4f}; "
           f"device std={dev.std():.4f} mean={dev.mean():.4f}")
+    # Decompose the gap. A single global scale+bias fitting the two sorted distributions well means the
+    # divergence is mostly ONE network-level gain (a fixable mis-scaled norm/weight), not an intractable
+    # structural transform. This scale survives the fold's PER-CHANNEL norm — and those norm constants are
+    # byte-identical to the reference — so a COMMON-across-channels gain must live in the RAW encoder latent
+    # (a network gain), not the fold. The residual relFro after removing the affine is the STRUCTURAL part.
+    sa, sb = np.sort(dev.reshape(-1)), np.sort(ref)
+    A = np.vstack([sb, np.ones_like(sb)]).T
+    (aa, bb), *_ = np.linalg.lstsq(A, sa, rcond=None)
+    resid = sa - (aa * sb + bb)
+    rf_aff = float(np.linalg.norm(resid)) / (float(np.linalg.norm(sb)) + 1e-12)
+    r2 = 1.0 - float(np.sum(resid ** 2)) / (float(np.sum((sa - sa.mean()) ** 2)) + 1e-30)
+    print(f"  global-affine fit  dev ~ {aa:.4f}*ref {bb:+.4f}:  R^2={r2:.3f}  residual(relFro after affine)={rf_aff:.3e}")
+    print(f"    (a large rf->rf_aff drop => mostly ONE network gain; rf_aff near rf => structural)")
     # fp8 weights + bf16 activations are far coarser than the fp16 reference, so the floor is well above
     # the audio path's 5e-3. Interpret against the audio DIVERGENCE (0.79), not an absolute pass/fail.
     floor = 5e-2
