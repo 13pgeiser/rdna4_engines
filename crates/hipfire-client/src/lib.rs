@@ -544,6 +544,11 @@ fn http_error_message(status: u16, text: &str) -> String {
 
 pub type Result<T> = std::result::Result<T, ClientError>;
 
+/// Per-engine test hook run by the stdout reader at EOF after the pending
+/// senders are dropped and before the control slot is cleared.
+#[cfg(test)]
+type EofHook = Arc<dyn Fn() + Send + Sync>;
+
 struct Dispatch {
     pending: Arc<Mutex<HashMap<(String, u64), mpsc::Sender<Value>>>>,
     control: Arc<Mutex<Option<mpsc::Sender<Value>>>>,
@@ -602,6 +607,21 @@ impl Engine {
         daemon: impl AsRef<Path>,
         environment: &BTreeMap<String, String>,
         stderr: Stdio,
+    ) -> Result<Self> {
+        Self::spawn_with_stderr_hooked(
+            daemon,
+            environment,
+            stderr,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn spawn_with_stderr_hooked(
+        daemon: impl AsRef<Path>,
+        environment: &BTreeMap<String, String>,
+        stderr: Stdio,
+        #[cfg(test)] after_pending_clear: Option<EofHook>,
     ) -> Result<Self> {
         let daemon = daemon.as_ref();
         if !daemon.is_file() {
@@ -697,12 +717,21 @@ impl Engine {
                     let _ = sender.send(value);
                 }
             }
-            // On EOF, drop all pending senders to unblock waiters with Closed.
+            // On EOF, publish `stdout_closed` BEFORE dropping the pending
+            // senders: dropping them wakes waiters with `Closed`, and a woken
+            // waiter may call `exited()` at once. The Release store
+            // happens-before the drop, so `Closed` implies `exited()`.
+            stdout_closed_reader.store(true, Ordering::Release);
             {
                 let mut map = pending_clone.lock().unwrap();
                 map.clear();
             }
-            stdout_closed_reader.store(true, Ordering::Release);
+            // Test seam: park the reader right after waiters are woken, so a
+            // test can observe the waiter's view deterministically.
+            #[cfg(test)]
+            if let Some(hook) = &after_pending_clear {
+                hook();
+            }
             *control_clone.lock().unwrap() = None;
         });
         let inner = EngineInner {
@@ -3297,6 +3326,96 @@ done
         assert!(matches!(err, ClientError::Closed { .. }), "{err}");
         assert_eq!(engine.active_attempt_id(), None);
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Deterministic regression for the serve respawn flake: a waiter that
+    /// observes the reader's EOF disconnect (`Closed`) must already see
+    /// `exited() == true`, even though the child is still running (so
+    /// `try_wait` cannot answer) and the reader thread is parked right after
+    /// it dropped the pending senders. The child closes its stdout but keeps
+    /// reading stdin, and the reader is held at the per-engine test hook, so
+    /// the outcome never depends on thread scheduling or child exit.
+    #[cfg(unix)]
+    #[test]
+    fn generate_closed_implies_exited_before_reader_resumes() {
+        let root = env::temp_dir().join(format!(
+            "hipfire-client-eof-exited-{}-{}",
+            std::process::id(),
+            "i"
+        ));
+        let daemon = write_fake_daemon(
+            &root,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"close_stdout"'*)
+      exec 1>&-
+      ;;
+    *'"unload"'*)
+      exit 0
+      ;;
+  esac
+done
+"#,
+        );
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let hook_gate = Arc::clone(&gate);
+        let hook: EofHook = Arc::new(move || {
+            let (lock, cv) = &*hook_gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = cv.wait(released).unwrap();
+            }
+        });
+        let engine = Engine::spawn_with_stderr_hooked(
+            &daemon,
+            &BTreeMap::new(),
+            Stdio::inherit(),
+            Some(hook),
+        )
+        .unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        engine
+            .inner
+            .dispatch
+            .pending
+            .lock()
+            .unwrap()
+            .insert(("req-eof-exited".to_string(), 1), tx);
+        engine
+            .send(&serde_json::json!({"type": "close_stdout"}))
+            .unwrap();
+        // Blocks until the reader hits EOF and clears `pending`; the reader
+        // then parks in the hook, so nothing after the sender drop has run.
+        let result = engine.generate_with_rx("req-eof-exited", 1, &rx, None, &mut |_| Ok(()));
+        let exited = engine.exited();
+        let child_running = engine
+            .inner
+            .child
+            .lock()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_none();
+
+        // Release the parked reader and reap the child before asserting so a
+        // failure cannot leak either.
+        {
+            let (lock, cv) = &*gate;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        engine.inner.terminate();
+        let _ = fs::remove_dir_all(root);
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, ClientError::Closed { .. }), "{err}");
+        assert!(child_running, "child must still be alive for this test");
+        assert!(
+            exited,
+            "Closed reached the waiter before the engine published stdout EOF"
+        );
     }
 
     #[cfg(unix)]
