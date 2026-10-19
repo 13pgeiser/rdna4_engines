@@ -252,24 +252,42 @@ as point 6 / point 4. Nothing here claims to match ComfyUI's timings.
    "suspect the strided conv1d temporal reduction" readings above**: a conv-reduction or structural transform
    bug would *not* collapse to a clean global scale. The device encoders are computing the *right shape* of
    latent, just damped to ~0.37× amplitude (video additionally carries a small positive offset and slightly
-   more tail-compression — its R² 0.912 and residual 0.114 are the structural remainder). Because the scale
-   is ~0.37 for both but *not* bit-identical (0.385 vs 0.369), it is not one shared post-hoc multiply; it
-   reads as a **fixed per-level attenuation compounding across each architecture's own depth** (≈0.83× per
-   level over ~5–6 levels lands near 0.37, and the two archs' depths differ slightly).
+   more tail-compression — its R² 0.912 and residual 0.114 are the structural remainder).
 
-   Crucially, the DiT — which shares the container's fp8 weight path and the engine's normal conv / GroupNorm
-   / activation kernels — **generates correctly**, so this is *not* a global kernel or quant fault: the
-   under-gain is **confined to the encoder pass**. The prime suspect is therefore the encoders' per-level /
-   per-frame normalisation (the §5.13 per-frame GroupNorm `CS∈{8,4}` template) applying a near-constant
-   sub-unit gain that compounds level-over-level, or an encoder-path weight/activation dequant scale mismatch
-   that the convert-time quant round-trip does not see. If it is a fixed encoder-norm gain, a correct fix is
-   **confined to the encoder path and never touches the DiT's norms** — which is precisely why this is worth
-   localising rather than shipping. The **confirming step is cheap and read-only** (no math change, gated):
-   dump one encoder block's GroupNorm *input and output* on-device and test whether the output std is a fixed
-   fraction (~0.8×) of the reference GN's — that single dump pins the op. **Not blind-fixed** (the encoder
-   kernels are shared with the live image / plain encode paths; the standing rule is never ship a
-   merely-*different* latent). Reproduce: `--evc/--encpx/--encg` or `--enca/--encsm` as above; each harness
-   now prints the `a`/`b`/R²/after-affine line alongside the raw sorted relFro.
+   **Where the gain can and cannot be (architecture-narrowed).** A code sweep ruled the *body* out: both
+   encoders terminate in a **normalisation that re-writes the activation scale** before the latent is
+   emitted — video's last op before `conv_out`/`quant_conv` is `norm_out` (`venc_gn`,
+   `arch/minimaxh3/minimaxh3.cpp:2278`); the audio pre-block's `norm1/2/3` LayerNorms precede `proj`/
+   `mean_proj`. A GroupNorm/LayerNorm output has std ≈ its per-channel gamma *regardless of input
+   magnitude*, so **any gain accumulated in the encoder body is erased by that final norm — the earlier
+   "per-level attenuation compounding across depth" reading is therefore wrong** (it could not reach the
+   latent). The ~0.37 can only originate in the **final norm's affine application, or the final
+   conv/linear**: video `norm_out`(gamma `ve_now`)→`conv_out`→`quant_conv`; audio pre-block `norm3`(gamma)→
+   `proj`→`mean_proj`. The two families' scale differs slightly (0.385 vs 0.369) simply because those final
+   chains differ per arch.
+
+   **Why encoder-only is consistent with the DiT generating correctly:** the DiT's norms are **RMSNorm**
+   (`rmsnorm_op`, `minimaxh3.cpp:638`), whereas the encoders use the **GroupNorm / LayerNorm** kernels
+   (`r4d_upscaler.hip`, shared with the latent upscaler). A defect in *those* kernels is invisible to the
+   DiT's RMSNorm path — so an encoder-norm-kernel scale fault remains the leading suspect, and a fix could
+   stay confined to the encoder/upscaler norm path. The **narrowed confirming step** (device, gated, read-
+   only — no math change): dump the **per-channel std of `norm_out`'s output and of `conv_out`/`quant_conv`'s
+   output** (and audio's pre-block `norm3` output and `mean_proj` output). If the *post-final-norm* std is
+   already ~0.37× the reference, the fault is the final affine / norm kernel; if it is ~1.0× and the collapse
+   appears only after `conv_out`/`quant_conv`, the fault is those final conv weights. **Not blind-fixed**
+   (those kernels are shared with the live image / plain encode paths and the upscaler; standing rule: never
+   ship a merely-*different* latent). Reproduce: `--evc/--encpx/--encg` or `--enca/--encsm` as above; each
+   harness now prints the `a`/`b`/R²/after-affine line alongside the raw sorted relFro.
+
+   **Separate real fidelity gap found while localising (its own ticket, not the 0.37):** the device
+   GroupNorm reduces statistics over a level's **whole clip volume** (one mean/rstd per group;
+   `ref_video.cpp:472-495`, `r4d_upscaler.hip:540-565`), but the reference `TemporalIsolatedGroupNorm`
+   normalises **per frame** (time merged into batch; `comfy/ldm/minimax/vae.py:122-130`). This is exactly
+   neutral for the single-image parity measurement above (`T=1`), but it **biases real multi-frame video
+   reference encodes** — which is what DaSiWa feeds (ref videos are many frames). It changes per-frame
+   statistics (shape), not a clean scale, so it is a second, independent divergence stacked on the 0.37 for
+   video refs; recorded here, deliberately **not** touched (shared kernel; may be an intentional
+   temporal-consistency choice).
 
    What still differs from the DaSiWa reference (hence not pixel-for-pixel reproducible):
    - **The text encoder only *names* a moving picture; it never sees its pixels.** DaSiWa also shows
