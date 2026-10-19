@@ -38,6 +38,7 @@ SamplingParams GenSampling::onto(SamplingParams base) const {
     if (top_k >= 0)    base.top_k = top_k;
     if (ngram_ban_n >= 0)    base.ngram_ban_n = ngram_ban_n;
     if (ngram_window >= 0)   base.ngram_window = ngram_window;
+    if (!ngram_whitelist.empty()) base.ngram_whitelist = ngram_whitelist;
     return base;
 }
 
@@ -57,6 +58,8 @@ std::string GenSampling::describe(const SamplingParams& sp) {
             std::snprintf(ban, sizeof ban, ", ngram ban n %d over the whole sequence",
                           sp.ngram_ban_n);
         s += ban;
+        if (!sp.ngram_whitelist.empty())
+            s += ", whitelist " + std::to_string(sp.ngram_whitelist.size()) + " ids";
     }
     return s;
 }
@@ -124,6 +127,28 @@ bool gen_sampling_parse(const std::string& json_text, const char* src, GenSampli
         const int64_t v = it->get<int64_t>();
         take_i("no_repeat_ngram_window_size", src, v < 0 ? 0 : v, 0, 131072, &out->ngram_window);
     }
+
+    /* The ban's whitelist, a JSON array of token ids (the reference's whitelist_token_ids).
+     * Values are warned about and dropped, like every other field here: an id is a vocabulary
+     * coordinate, so a negative one is not a value at all. */
+    it = j.find("no_repeat_ngram_whitelist");
+    if (it == j.end() || !it->is_array()) {
+        if (it != j.end())
+            RAD_WARN("%s states a no_repeat_ngram_whitelist that is not an array; ignoring it",
+                     src);
+        it = j.find("ngram_whitelist");
+    }
+    if (it != j.end() && it->is_array()) {
+        for (const auto& v : *it) {
+            const int64_t id = v.is_number_integer() ? v.get<int64_t>() : -1;
+            if (id < 0 || id > INT32_MAX) {
+                RAD_WARN("%s states a no_repeat_ngram_whitelist entry outside [0, %d]; ignoring it",
+                         src, INT32_MAX);
+                continue;
+            }
+            out->ngram_whitelist.push_back((int)id);
+        }
+    }
     return out->any();
 }
 
@@ -142,13 +167,25 @@ bool gen_sampling_from_kv(const std::function<const char*(const char*)>& get, Ge
      * file share one set of range checks and one reading of `do_sample`. */
     nlohmann::json j = nlohmann::json::object();
     static const char* const kFields[] = { "do_sample", "temperature", "top_p", "min_p", "top_k",
-                                           "no_repeat_ngram_size", "no_repeat_ngram_window_size" };
+                                           "no_repeat_ngram_size", "no_repeat_ngram_window_size",
+                                           "no_repeat_ngram_whitelist" };
     for (const char* k : kFields) {
         const char* v = get(k);
         if (!v || !*v) continue;
         if (std::strcmp(k, "do_sample") == 0) {
             /* rad-convert writes a JSON boolean as "1" or "0". */
             j[k] = (std::strcmp(v, "0") != 0);
+            continue;
+        }
+        if (std::strcmp(k, "no_repeat_ngram_whitelist") == 0) {
+            /* Not a number: the container's metadata is string-valued, and the whitelist is a
+             * JSON array spelled as JSON text. */
+            try {
+                j[k] = nlohmann::json::parse(v);
+            } catch (const std::exception& e) {
+                RAD_WARN("the container states generation.%s as \"%s\", which is not a JSON "
+                         "array of ids (%s); ignoring it", k, v, e.what());
+            }
             continue;
         }
         char* end = nullptr;

@@ -14,11 +14,13 @@
 #include "rad_test.h"
 #include "rad_abi.h"
 #include "../libref/ref_common.h"
+#include "../core/sample/host_ref.h"   /* the host chain, for the whitelist's op-for-op form */
 #include "rad_sample.h"
 #include "rad_philox.h"
 #include "rad_runtime.h"   /* RAD_VGEOM_* */
 
 #include <algorithm>
+#include <cmath>
 #include <deque>
 #include <string>
 #include <thread>
@@ -5104,8 +5106,10 @@ TEST(op_sample_pick_draws_the_specified_uniform) {
 /* ================================================================== the n-gram ban */
 /* Unlimited-OCR's SlidingWindowNoRepeatNgramProcessor, ported straight from
  * modeling_unlimitedocr.py:353-383 as the oracle's second formulation. `s` is the row's history
- * oldest first; the result marks every global token id it bans. */
-static std::vector<char> ref_ngram_banned(const std::vector<int32_t>& s, int n, int window) {
+ * oldest first; `whitelist` is its `whitelist_token_ids`, removed from the banned set after it is
+ * built (line 379). The result marks every global token id it bans. */
+static std::vector<char> ref_ngram_banned(const std::vector<int32_t>& s, int n, int window,
+                                          const std::vector<int32_t>& whitelist = {}) {
     std::vector<char> banned(256, 0);
     if (n <= 0 || (int64_t)s.size() < (int64_t)n) return banned;
     const int64_t len = (int64_t)s.size();
@@ -5122,13 +5126,19 @@ static std::vector<char> ref_ngram_banned(const std::vector<int32_t>& s, int n, 
         const int32_t tok = s[(size_t)(idx + n - 1)];
         if (tok >= 0 && tok < (int32_t)banned.size()) banned[(size_t)tok] = 1;
     }
+    for (int32_t id : whitelist)
+        if (id >= 0 && id < (int32_t)banned.size()) banned[(size_t)id] = 0;
     return banned;
 }
 
 /* The op over one row: returns the banned global ids it wrote as -infinity, and whether every other
- * column is bit-for-bit its input. */
+ * column is bit-for-bit its input. `whitelist` ids arrive as the bitmask operand (a set bit marks
+ * an exempt column); an empty list passes an all-zero plane, and `no_operand` passes no 5th
+ * operand at all -- the default serving form. */
 static std::vector<int32_t> ref_ngram_op(const std::vector<int32_t>& s, int n, int window,
-                                         int n_vocab, bool* untouched_out) {
+                                         int n_vocab, bool* untouched_out,
+                                         const std::vector<int32_t>& whitelist = {},
+                                         bool no_operand = false) {
     const int64_t H = 8;   /* the history plane's extent in these cases */
     T lg(RAD_F32, {1, n_vocab});
     std::vector<float> in((size_t)n_vocab);
@@ -5143,8 +5153,16 @@ static std::vector<int32_t> ref_ngram_op(const std::vector<int32_t>& s, int n, i
     sp[0].hist_off = 0;
     sp[0].hist_len = (int32_t)std::min<size_t>(s.size(), (size_t)H);
     T ng(RAD_I32, {1, 2}); ng.n({ n, window });
+    const int64_t words = (n_vocab + 31) / 32;
+    T wl(RAD_I32, {1, words});
+    std::vector<int64_t> wv((size_t)words, 0);
+    for (int32_t id : whitelist)
+        if (id >= 0 && id < n_vocab) wv[(size_t)(id >> 5)] |= 1LL << (id & 31);
+    wl.n(wv);
 
-    A a; a.t(lg).t(sp.operand()).t(hist).t(ng).i("M", 1).i("n_vocab", n_vocab);
+    A a; a.t(lg).t(sp.operand()).t(hist).t(ng);
+    if (!no_operand) a.t(wl);
+    a.i("M", 1).i("n_vocab", n_vocab);
     if (run("sample_ngram_ban", a) != RAD_OK) return { -99 };
 
     std::vector<int32_t> banned;
@@ -5164,14 +5182,18 @@ static std::vector<int32_t> ref_ngram_op(const std::vector<int32_t>& s, int n, i
  *     longer than n cover the early exits;
  *   - 200 random histories over five ids, lengths 1..24, n 1..8 and windows 0..16, where the
  *     window boundary falls inside repeated runs;
+ *   - 300 of those shapes repeated with a random whitelist of 0..32 ids (some outside the
+ *     vocabulary), asserting `banned.difference_update(self.whitelist)`: the whitelist removes
+ *     bans and bans nothing, and every column it spares keeps its input bits;
  *   - the named shapes: an n-gram whose last token is the window's last (idx == search_end - 1),
  *     an n-gram that starts at search_start while an earlier copy starts before it, n == 1 (the
- *     empty prefix, every window token banned) and n == 0 (off). */
+ *     empty prefix, every window token banned) and n == 0 (off), each once with a whitelist. */
 TEST(op_sample_ngram_ban_matches_the_reference_processor) {
-    int64_t trials = 0, mismatches = 0, bans = 0;
+    int64_t trials = 0, mismatches = 0, bans = 0, wl_trials = 0, wl_bans = 0;
     bool all_untouched = true;
 
-    auto trial = [&](const std::vector<int32_t>& s_in, int n, int window) {
+    auto trial = [&](const std::vector<int32_t>& s_in, int n, int window,
+                     const std::vector<int32_t>& whitelist = {}, bool wl_case = false) {
         /* The engine's plane holds the LAST H tokens of the sequence (build_step truncates the
          * oldest), so the oracle and the op must both see that span. */
         const std::vector<int32_t> s = s_in.size() > 8
@@ -5179,11 +5201,12 @@ TEST(op_sample_ngram_ban_matches_the_reference_processor) {
                                            : s_in;
         const int n_vocab = 8;
         bool untouched = true;
-        const std::vector<int32_t> got = ref_ngram_op(s, n, window, n_vocab, &untouched);
+        const std::vector<int32_t> got = ref_ngram_op(s, n, window, n_vocab, &untouched, whitelist);
         if (got.size() == 1 && got[0] == -99) { ++mismatches; return; }
-        const std::vector<char> want = ref_ngram_banned(s, n, window);
+        const std::vector<char> want = ref_ngram_banned(s, n, window, whitelist);
         ++trials;
         bans += (int64_t)got.size();
+        if (wl_case) { ++wl_trials; wl_bans += (int64_t)got.size(); }
         all_untouched = all_untouched && untouched;
         int64_t live = 0;
         for (int id = 0; id < n_vocab; ++id) live += want[(size_t)id] ? 1 : 0;
@@ -5219,6 +5242,30 @@ TEST(op_sample_ngram_ban_matches_the_reference_processor) {
         trial(s, n, w);
     }
 
+    /* The same random shapes with random whitelists: 0..32 ids over a range wider than the
+     * vocabulary, so exempt tokens, non-banned tokens and out-of-vocabulary ids all occur. */
+    for (int it = 0; it < 300; ++it) {
+        rs = rs * 1664525u + 1013904223u;
+        const int64_t len = 1 + (int64_t)((rs >> 8) % 24u);
+        std::vector<int32_t> s((size_t)len);
+        for (int64_t i = 0; i < len; ++i) {
+            rs = rs * 1664525u + 1013904223u;
+            s[(size_t)i] = (int32_t)((rs >> 12) % 5u);
+        }
+        rs = rs * 1664525u + 1013904223u;
+        const int n = 1 + (int)((rs >> 8) % 8u);
+        rs = rs * 1664525u + 1013904223u;
+        const int w = (int)((rs >> 8) % 17u);
+        rs = rs * 1664525u + 1013904223u;
+        const int k = (int)((rs >> 8) % 33u);           /* 0..32 ids, empty included */
+        std::vector<int32_t> wl((size_t)k);
+        for (int j = 0; j < k; ++j) {
+            rs = rs * 1664525u + 1013904223u;
+            wl[(size_t)j] = (int32_t)((rs >> 12) % 12u);  /* ids 8..11 are out of vocabulary */
+        }
+        trial(s, n, w, wl, true);
+    }
+
     /* The named shapes. [4,1,2, 4,1,2, 4,1,2] with n 3 and window 6: the newest complete n-gram
      * starts exactly at search_end - 1, and the earlier copy at search_start bans the same token;
      * window 3 moves search_start so that only the spanning copy is searched. */
@@ -5228,31 +5275,60 @@ TEST(op_sample_ngram_ban_matches_the_reference_processor) {
     trial({ 1, 1, 1, 1, 1, 1 }, 1, 3);        /* n 1: the entire window is banned */
     trial({ 1, 1, 1, 1, 1, 1 }, 0, 3);        /* off */
     trial({ 7, 2, 7, 2, 7 }, 2, 0);           /* window 0: the whole span */
+    /* The same shapes with whitelists: the banned token exempted (ban vanishes), a token that
+     * would not be banned exempted (inert), an out-of-vocabulary id (inert) and n 0 with a
+     * whitelist (still off). */
+    trial({ 4, 1, 2, 4, 1, 2, 4, 1, 2 }, 3, 6, { 2 }, true);   /* a non-banned id: inert */
+    trial({ 4, 1, 2, 4, 1, 2, 4, 1, 2 }, 3, 6, { 4 }, true);   /* the banned id: ban vanishes */
+    trial({ 4, 1, 2, 4, 1, 2, 4, 1, 2 }, 3, 6, { 4, 2 }, true);
+    trial({ 1, 1, 1, 1, 1, 1 }, 1, 3, { 1 }, true);        /* n 1, the whole window exempted */
+    trial({ 1, 1, 1, 1, 1, 1 }, 1, 3, { 7 }, true);        /* out of vocabulary: inert */
+    trial({ 1, 1, 1, 1, 1, 1 }, 0, 3, { 1 }, true);        /* off stays off with a whitelist */
+    trial({ 7, 2, 7, 2, 7 }, 2, 0, { 7, 2 }, true);        /* every banned token exempted */
+
+    /* The whitelist as a plain bitmask must agree with the same case with the operand absent
+     * (the reference's empty whitelist): an all-zero plane bans exactly what no plane bans. */
+    {
+        bool u1 = true, u2 = true;
+        const std::vector<int32_t> s = { 4, 1, 2, 4, 1, 2, 4, 1 };
+        const std::vector<int32_t> a = ref_ngram_op(s, 3, 0, 8, &u1);
+        const std::vector<int32_t> b = ref_ngram_op(s, 3, 0, 8, &u2, {}, true);
+        CHECK(a == b);
+        CHECK(!a.empty());
+    }
 
     CHECK(trials > 2500);
     CHECK(mismatches == 0);
     CHECK(bans > 0);
+    CHECK(wl_trials >= 300);
+    /* The whitelist bites: random whitelists leave bans on the table AND remove some, so a
+     * kernel that ignored the plane would fail the sweeps above, not merely agree with them. */
+    CHECK(wl_bans > 0);
     /* Every column the reference does not ban is bit-for-bit its input: the op writes -infinity
      * and nothing else, so penalties and temperature see the same numbers. */
     CHECK(all_untouched);
 }
 
 /* Off is the default, and off must be invisible to greedy decoding: sample_ngram_ban writes
- * nothing for a row with ngram_ban_n 0, so the argmax over the same row is the same token. With
- * the ban on, the outcome changes exactly when the ban covers the argmax's token. */
+ * nothing for a row with ngram_ban_n 0 -- with a whitelist plane present as well, the reference's
+ * empty-whitelist default -- so the argmax over the same row is the same token and the logits are
+ * bit-identical. With the ban on, the outcome changes exactly when the ban covers the argmax's
+ * token, and the whitelist moves it back. */
 TEST(op_sample_ngram_ban_off_leaves_greedy_decoding_unchanged) {
     /* Token 5 is the clear maximum. Its id appears 4 times in the history, so both the ban and the
      * penalties have something to do; the ban is off here. */
     T hist(RAD_I32, {1, 8}); hist.n({ 5, 1, 5, 2, 5, 3, 5, 1 });
 
-    auto greedy = [&](int n, int window, std::vector<float>* after) {
+    auto greedy = [&](int n, int window, std::vector<float>* after, int wl_id = -1) {
         T lg(RAD_F32, {1, 8});
         lg.f({ 0.0f, 0.1f, 0.2f, 0.3f, 0.4f, 4.0f, 0.5f, 0.6f });
         SP sp(1);
         sp[0].hist_off = 0;
         sp[0].hist_len = 8;
         T ng(RAD_I32, {1, 2}); ng.n({ n, window });
-        A a; a.t(lg).t(sp.operand()).t(hist).t(ng).i("M", 1).i("n_vocab", 8);
+        T wl(RAD_I32, {1, 1});
+        wl.n({ wl_id >= 0 ? (int64_t)1 << wl_id : 0 });
+        A a; a.t(lg).t(sp.operand()).t(hist).t(ng).t(wl).i("M", 1).i("n_vocab", 8);
         CHECK_OK(run("sample_ngram_ban", a));
         T tk(RAD_I32, {1});
         A b; b.t(lg).t(sp.operand()).t(tk).i("M", 1).i("n_vocab", 8);
@@ -5263,17 +5339,94 @@ TEST(op_sample_ngram_ban_off_leaves_greedy_decoding_unchanged) {
     };
 
     std::vector<float> off_logits;
-    CHECK_EQ(greedy(0, 0, &off_logits), 5);
-    /* Bit-identical to the input: the stage did not run. */
+    CHECK_EQ(greedy(0, 0, &off_logits, 5), 5);
+    /* Bit-identical to the input: the stage did not run, whitelist plane present or not. */
     static const float kIn[8] = { 0.0f, 0.1f, 0.2f, 0.3f, 0.4f, 4.0f, 0.5f, 0.6f };
     for (int64_t i = 0; i < 8; ++i) CHECK(std::memcmp(&off_logits[(size_t)i], &kIn[i], 4) == 0);
+    std::vector<float> off_plain;
+    CHECK_EQ(greedy(0, 0, &off_plain), 5);
+    CHECK(off_plain == off_logits);
 
     /* The history's prefix (5,1) is followed by token 5 at positions 0 and 2 in [5,1,5,2,5,3,5,1]:
      * with n 2 the ban covers 5, so greedy moves to the next best (token 7). */
     CHECK_EQ(greedy(2, 8, nullptr), 7);
+    /* The whitelist removes 5 from the banned set (the reference's difference_update), and greedy
+     * is back on the maximum. */
+    CHECK_EQ(greedy(2, 8, nullptr, 5), 5);
     /* A ban that only names other tokens leaves the argmax alone: with n 2 and a one-token window,
      * search_start == search_end - 1 is impossible (window 1 < n), so nothing is banned. */
     CHECK_EQ(greedy(2, 1, nullptr), 5);
+}
+
+/* The host chain (core/sample/host_ref.cpp) reproduces the reference op for op: the banned set,
+ * then the whitelist removed from it, then -inf -- and off (ngram_ban_n 0) leaves the logits
+ * bit-identical through the greedy chain, whitelist plane present or not. */
+TEST(host_ngram_ban_whitelist_matches_the_reference) {
+    using namespace rad;
+    const std::vector<float> in = { 0.0f, 0.1f, 0.2f, 0.3f, 0.4f, 4.0f, 0.5f, 0.6f };
+    const std::vector<int32_t> hist = { 5, 1, 5, 2, 5, 3, 5, 1 };
+    auto bit = [](std::vector<uint32_t>& v, int id) { v[(size_t)(id >> 5)] |= 1u << (uint32_t)(id & 31); };
+
+    /* The bare ban: token 5 (the prefix (1) is followed by 5 in the window) gets -infinity, every
+     * other candidate keeps its input bits. */
+    {
+        CandidateSet s;
+        s.from_logits(in.data(), 8);
+        host_ngram_ban(s, hist.data(), 8, 2, 8);
+        int64_t banned = 0;
+        for (const Candidate& c : s.c) {
+            if (std::isinf(c.logit) && c.logit < 0.0f) { ++banned; CHECK_EQ(c.id, 5); }
+            else CHECK(std::memcmp(&c.logit, &in[(size_t)c.id], 4) == 0);
+        }
+        CHECK_EQ(banned, 1LL);
+    }
+    /* The whitelist bit for the banned token: banned.difference_update, nothing written. */
+    {
+        std::vector<uint32_t> wl(1, 0);
+        bit(wl, 5);
+        CandidateSet s;
+        s.from_logits(in.data(), 8);
+        host_ngram_ban(s, hist.data(), 8, 2, 8, wl.data(), 1);
+        for (const Candidate& c : s.c) CHECK(std::memcmp(&c.logit, &in[(size_t)c.id], 4) == 0);
+    }
+    /* A bit for a token that is not banned is inert; a bit past the plane marks nothing, so the
+     * ban stands. */
+    {
+        std::vector<uint32_t> wl(1, 0);
+        bit(wl, 3);
+        CandidateSet s;
+        s.from_logits(in.data(), 8);
+        host_ngram_ban(s, hist.data(), 8, 2, 8, wl.data(), 1);
+        bool five = false;
+        for (const Candidate& c : s.c) {
+            if (c.id == 5) { five = std::isinf(c.logit) && c.logit < 0.0f; continue; }
+            CHECK(std::memcmp(&c.logit, &in[(size_t)c.id], 4) == 0);
+        }
+        CHECK(five);
+    }
+    /* Off is invisible to the whole greedy chain: ngram_ban_n 0 with the whitelist input set and
+     * with it clear take the same token over bit-identical logits. */
+    {
+        std::vector<uint32_t> wl(1, 0);
+        bit(wl, 5);
+        SamplingParams sp;
+        sp.temp = 0.0f;                       /* greedy */
+        HostRefInput plain;
+        plain.history = hist.data();
+        plain.n_history = 8;
+        HostRefInput with = plain;
+        with.ngram_whitelist = wl.data();
+        with.ngram_whitelist_words = 1;
+        CandidateSet a, b;
+        a.from_logits(in.data(), 8);
+        b.from_logits(in.data(), 8);
+        CHECK_EQ(host_sample_into(a, sp, plain), 5);
+        CHECK_EQ(host_sample_into(b, sp, with), 5);
+        for (size_t i = 0; i < a.c.size(); ++i) {
+            CHECK(std::memcmp(&a.c[i].logit, &in[(size_t)a.c[i].id], 4) == 0);
+            CHECK(std::memcmp(&b.c[i].logit, &in[(size_t)b.c[i].id], 4) == 0);
+        }
+    }
 }
 
 /* ================================================================== failure modes */
@@ -8693,10 +8846,14 @@ namespace {
 
 struct SamIn {
     int64_t gh = 1, gw = 1, win = 0, nh = 1, hd = 1, nseq = 1;
-    std::vector<float> q, k, v, rh, rw;   /* [M, nh*hd] and [2*L-1, hd], row-major */
+    int64_t raw_rows = 0;                 /* 0: the geometry's own 2*tile-1; else the staged rows */
+    std::vector<float> q, k, v, rh, rw;   /* [M, nh*hd] and [tab(), hd], row-major */
     int64_t W()    const { return nh * hd; }
     int64_t rows() const { return nseq * gh * gw; }
-    int64_t tab()  const { return 2 * (win > 0 ? win : (gh > gw ? gh : gw)) - 1; }
+    int64_t tab()  const {
+        if (raw_rows > 0) return raw_rows;
+        return 2 * (win > 0 ? win : (gh > gw ? gh : gw)) - 1;
+    }
 };
 
 /* A deterministic draw in [-1, 1]: index-driven, so a wrong pitch or row map reads other numbers. */
@@ -8924,6 +9081,17 @@ TEST(op_sam_attn_global_and_non_square) {
     sam_fill(ns, 0x7f4a7c15u);
     CHECK_EQ(ns.tab(), 19LL);
     sam_cmp(sam_run(ns, 0, &rc), sam_oracle(ns), &maxd, &bad);
+    CHECK_EQ(rc, (int)RAD_OK);
+    CHECK_EQ(bad, 0LL);
+    CHECK(maxd < 2e-3f);
+
+    /* The production case the tower hits: a 40x40 global block whose wanted rel_pos rows are 79,
+     * served from the checkpoint's 127-row tables (both axes resize). */
+    SamIn p40;
+    p40.gh = p40.gw = 40; p40.win = 0; p40.nh = 2; p40.hd = 8; p40.raw_rows = 127;
+    sam_fill(p40, 0x2545f491u);
+    CHECK_EQ(p40.tab(), 127LL);
+    sam_cmp(sam_run(p40, 0, &rc), sam_oracle(p40), &maxd, &bad);
     CHECK_EQ(rc, (int)RAD_OK);
     CHECK_EQ(bad, 0LL);
     CHECK(maxd < 2e-3f);

@@ -240,7 +240,7 @@ const char* kAcceptedCommon[] = {
     "dry_sequence_breakers", "samplers",
     "grammar", "json_schema", "priority", "logprobs", "ignore_eos",
     "timings_per_token", "return_progress", "session_id", "n_probs",
-    "ngram_ban_n", "ngram_window",
+    "ngram_ban_n", "ngram_window", "ngram_whitelist", "no_repeat_ngram_whitelist",
 };
 
 const char* kAcceptedChat[] = {
@@ -915,6 +915,34 @@ static int parse_sampling(const json& b, const OaiLimits& lim, OaiRequest* r, Ap
         return RAD_E_INVAL;
     }
     r->sp.ngram_window = (int)i64;
+
+    /* The ban's whitelist (the reference's `whitelist_token_ids`, which is removed from the
+     * banned set before the -inf writes): token ids the ban must never touch. An array of
+     * non-negative integers; absent, empty or null is off, the reference's empty whitelist and
+     * the form the model's generation_config ships. */
+    auto nwl = b.find("ngram_whitelist");
+    if (nwl == b.end()) nwl = b.find("no_repeat_ngram_whitelist");
+    if (nwl != b.end() && !nwl->is_null()) {
+        if (!nwl->is_array()) {
+            *err = err_bad("ngram_whitelist", "expected an array of integer token ids");
+            return RAD_E_INVAL;
+        }
+        std::vector<int32_t> wl;
+        for (const auto& v : *nwl) {
+            int32_t id = 0;
+            if (!token_id(v, &id)) {
+                *err = err_bad("ngram_whitelist",
+                               "expected token ids in [0, " + std::to_string(INT32_MAX) + "]");
+                return RAD_E_INVAL;
+            }
+            if (wl.size() >= (size_t)1 << 20) {
+                *err = err_bad("ngram_whitelist", "at most 1048576 ids");
+                return RAD_E_INVAL;
+            }
+            wl.push_back(id);
+        }
+        r->sp.ngram_whitelist = std::move(wl);
+    }
 
     /* `images_config`: Unlimited-OCR's two picture modes. A string names one ("gundam" for a
      * single picture -- the global view plus crops --, "base" for a page of a multi-page

@@ -18868,8 +18868,10 @@ static void sample_ngram_ban_case(const Plugin& pl) {
     }
 
     /* Two shard configurations: the whole vocabulary, and this rank holding ids [16, 64). */
-    struct Shard { int64_t voff, nv; };
-    const Shard shards[2] = { { 0, V }, { 16, V - 16 } };
+    struct Shard { int64_t voff, nv; bool wl; };
+    const Shard shards[4] = { { 0, V, false }, { 16, V - 16, false }, { 0, V, true },
+                              { 16, V - 16, true } };
+    /* The whitelist pass un-bans ids 7 and 21 (the reference bans.difference_update(whitelist)). */
 
     int64_t n_cases = 0, banned_total = 0, mismatches = 0;
     std::string first;
@@ -18904,10 +18906,23 @@ static void sample_ngram_ban_case(const Plugin& pl) {
         st_memcpy(d_h, hist.data(), (size_t)(M * H) * 4, hipMemcpyHostToDevice);
         st_memcpy(d_ng, ng.data(), (size_t)(M * 2) * 4, hipMemcpyHostToDevice);
 
+        const int64_t wwords = (nv + 31) / 32;
+        std::vector<uint32_t> wl((size_t)(M * wwords), 0u);
+        for (int64_t m = 0; m < M && sh.wl; ++m)
+            for (int32_t id : { 7, 21 }) {
+                const int64_t col = (int64_t)id - sh.voff;
+                if (col >= 0 && col < nv) wl[(size_t)(m * wwords + col / 32)] |= 1u << (col % 32);
+            }
+        void* d_wl = nullptr;
+        if (sh.wl) {
+            d_wl = dalloc((size_t)(M * wwords) * 4);
+            st_memcpy(d_wl, wl.data(), (size_t)(M * wwords) * 4, hipMemcpyHostToDevice);
+        }
         std::vector<RadTensor> ts = { T(d_lg, RAD_F32, { M, nv }),
                                       T(d_pr, RAD_F32, { M, (int64_t)(sizeof(RadSampleParams) / 4) }),
                                       T(d_h, RAD_I32, { M, H }),
                                       T(d_ng, RAD_I32, { M, 2 }) };
+        if (sh.wl) ts.push_back(T(d_wl, RAD_U32, { M, wwords }));
         std::vector<RadParam> ps = { PI("M", M), PI("n_vocab", nv), PI("vocab_off", sh.voff) };
         RadArgs a;
         std::memset(&a, 0, sizeof(a));
@@ -18927,7 +18942,11 @@ static void sample_ngram_ban_case(const Plugin& pl) {
                 const int64_t g = sh.voff + i;
                 const size_t k = (size_t)(m * nv + i);
                 ++n_cases;
-                const bool want = (size_t)g < banned.size() && banned[(size_t)g] != 0;
+                const int64_t wcol = g - sh.voff;
+                const bool wled = sh.wl && wcol >= 0 && wcol < nv &&
+                                  ((wl[(size_t)(m * wwords + wcol / 32)] >>
+                                    (wcol % 32)) & 1u);
+                const bool want = !wled && (size_t)g < banned.size() && banned[(size_t)g] != 0;
                 if (want) ++banned_total;
                 const float gv = got[k];
                 const bool is_inf = std::isinf(gv) && gv < 0.0f;
@@ -18945,7 +18964,7 @@ static void sample_ngram_ban_case(const Plugin& pl) {
          * [16, 64). dalloc's buffers are released by the case's dfree_all. */
     }
 
-    std::printf("  ngram_ban: %lld columns over %lld rows x 2 shards, %lld banned, "
+    std::printf("  ngram_ban: %lld columns over %lld rows x 4 configs (2 shards + 2 whitelist), %lld banned, "
                 "%lld mismatches\n", (long long)n_cases, (long long)M, (long long)banned_total,
                 (long long)mismatches);
     ok(what, mismatches == 0 && banned_total > 0,
@@ -18964,14 +18983,18 @@ static void sam_attn_case(const Plugin& pl) {
     const RadKernelInfo* r = find(pl, "sam_attn_bf16");
     if (!r) { ok(what, false, "row absent"); return; }
 
-    struct Geo { int64_t gh, gw, win, nh, hd, nseq; };
-    const Geo geos[2] = { { 16, 16, 14, 2, 64, 2 }, { 16, 16, 0, 2, 64, 1 } };
+    /* tab_rows 0 means "2*tile-1, no resize". The third geometry is the production 40-grid global
+     * block: the checkpoint's 127-row tables serve the 79 rows that block wants. */
+    struct Geo { int64_t gh, gw, win, nh, hd, nseq, tab_rows; };
+    const Geo geos[3] = { { 16, 16, 14, 2, 64, 2, 0 }, { 16, 16, 0, 2, 64, 1, 0 },
+                          { 40, 40, 0, 2, 64, 1, 127 } };
     int64_t checked = 0, bad_total = 0;
     float worst = 0.0f;
 
     for (const Geo& g : geos) {
         const int64_t W = g.nh * g.hd, R = g.gh * g.gw, M = g.nseq * R;
-        const int64_t tab = 2 * (g.win > 0 ? g.win : (g.gh > g.gw ? g.gh : g.gw)) - 1;
+        const int64_t want = 2 * (g.win > 0 ? g.win : (g.gh > g.gw ? g.gh : g.gw)) - 1;
+        const int64_t tab = g.tab_rows > 0 ? g.tab_rows : want;
         /* One filler column, so the row pitch is W + 1: q/k/v/out are all slices. */
         const int64_t ld = W + 1;
         const float scale = 1.0f / std::sqrt((float)g.hd);
@@ -18987,6 +19010,29 @@ static void sam_attn_case(const Plugin& pl) {
             rh[i] = h_to_bf16(0.1f * h_bf16(st_rand_bf16((uint32_t)i + 0x1234567u)));
             rw[i] = h_to_bf16(0.1f * h_bf16(st_rand_bf16((uint32_t)i + 0x7654321u)));
         }
+        /* The oracle's tables, resampled exactly as libref's get_rel_pos does (f32, align_corners
+         * False, clamp at the edges); the kernel gets the raw rows. */
+        auto resized = [&](const std::vector<uint16_t>& raw) {
+            std::vector<float> out((size_t)(want * g.hd));
+            if (tab == want) {
+                for (size_t i = 0; i < out.size(); ++i) out[i] = h_bf16(raw[i]);
+                return out;
+            }
+            for (int64_t d = 0; d < want; ++d) {
+                double src = ((double)d + 0.5) * (double)tab / (double)want - 0.5;
+                if (src < 0.0) src = 0.0;
+                if (src > (double)(tab - 1)) src = (double)(tab - 1);
+                const int64_t i0 = (int64_t)src, i1 = i0 + 1 < tab ? i0 + 1 : i0;
+                const float f = (float)(src - (double)i0);
+                for (int64_t c = 0; c < g.hd; ++c) {
+                    const float a = h_bf16(raw[(size_t)(i0 * g.hd + c)]);
+                    out[(size_t)(d * g.hd + c)] =
+                        a + (h_bf16(raw[(size_t)(i1 * g.hd + c)]) - a) * f;
+                }
+            }
+            return out;
+        };
+        const std::vector<float> rhf = resized(rh), rwf = resized(rw);
         std::vector<int32_t> cu((size_t)g.nseq + 1);
         for (int64_t s = 0; s <= g.nseq; ++s) cu[(size_t)s] = (int32_t)(s * R);
 
@@ -19036,13 +19082,13 @@ static void sam_attn_case(const Plugin& pl) {
                         for (int64_t c = 0; c < g.hd; ++c)
                             qf[c] = h_bf16(q[(size_t)(row * ld + h * g.hd + c)]);
                         for (int64_t jh = 0; jh < th; ++jh) {
-                            const uint16_t* hrp = &rh[(size_t)((lh - jh + th - 1) * g.hd)];
+                            const float* hrp = &rhf[(size_t)((lh - jh + th - 1) * g.hd)];
                             double hr = 0.0;
-                            for (int64_t c = 0; c < g.hd; ++c) hr += qf[c] * h_bf16(hrp[c]);
+                            for (int64_t c = 0; c < g.hd; ++c) hr += qf[c] * hrp[c];
                             for (int64_t jw = 0; jw < tw; ++jw) {
-                                const uint16_t* wrp = &rw[(size_t)((lw - jw + tw - 1) * g.hd)];
+                                const float* wrp = &rwf[(size_t)((lw - jw + tw - 1) * g.hd)];
                                 double sc = hr;
-                                for (int64_t c = 0; c < g.hd; ++c) sc += qf[c] * h_bf16(wrp[c]);
+                                for (int64_t c = 0; c < g.hd; ++c) sc += qf[c] * wrp[c];
                                 const int64_t kh = ty * th + jh, kw = tx * tw + jw;
                                 if (kh < g.gh && kw < g.gw) {
                                     const int64_t krow = cu[(size_t)s] + kh * g.gw + kw;

@@ -17,9 +17,10 @@
 // row is computed once per (query row, tile row) rather than once per key.
 //
 // Head widths. HD is a template parameter and only 64 is instantiated (SAM ViT-B's 12 x 64); the
-// shim refuses any other width rather than reading past the registers. The tables must be exactly
-// 2*tile-1 rows, which every geometry the tower declares is; the shim declines a table that would
-// need get_rel_pos's resampling (libref and libavx serve that).
+// shim refuses any other width rather than reading past the registers. A table whose row count is
+// not 2*tile-1 is resampled on read (get_rel_pos's F.interpolate(size=want, mode="linear",
+// align_corners=False) in f32): the 127-row global tables give 79 rows at a 40 grid, and every
+// other geometry the tower declares already has exactly the rows it wants.
 //
 // Exactness. f32 throughout, one bf16 rounding of the output, exp2 (the hardware transcendental)
 // with the log2(e) factor; the selftest holds it to the house tolerance against a host port of the
@@ -35,12 +36,41 @@ namespace {
 constexpr uint32_t kThreads = 128;
 constexpr float    kLog2e   = 1.4426950408889634f;
 
+/* q . row(d) of a rel_pos table as the reference resized it to `want` rows: linear interpolation
+ * between the two source rows at align_corners=False's coordinate, clamped at the edges. With
+ * rows == want the source is row d itself (f == 0), so the direct read is unchanged bit for bit. */
+template <int HD>
+__device__ inline float tab_dot(const uint16_t* __restrict__ tab, int rows, int want, int d,
+                                const float* qf) {
+    if (rows == want) {
+        const uint16_t* rp = tab + (size_t)d * HD;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HD; ++c) s += qf[c] * bf16_to_f32(rp[c]);
+        return s;
+    }
+    double src = ((double)d + 0.5) * (double)rows / (double)want - 0.5;
+    if (src < 0.0) src = 0.0;
+    if (src > (double)(rows - 1)) src = (double)(rows - 1);
+    const int i0 = (int)src, i1 = i0 + 1 < rows ? i0 + 1 : i0;
+    const float f = (float)(src - (double)i0);
+    const uint16_t* a = tab + (size_t)i0 * HD;
+    const uint16_t* b = tab + (size_t)i1 * HD;
+    float s = 0.0f;
+#pragma unroll
+    for (int c = 0; c < HD; ++c) {
+        const float av = bf16_to_f32(a[c]);
+        s += qf[c] * (av + (bf16_to_f32(b[c]) - av) * f);
+    }
+    return s;
+}
+
 template <int HD>
 __global__ __launch_bounds__(kThreads) void sam_attn_kernel(
     const uint16_t* __restrict__ gq, const uint16_t* __restrict__ gk,
     const uint16_t* __restrict__ gv, uint16_t* __restrict__ go,
     const int* __restrict__ cu, const uint16_t* __restrict__ rh,
-    const uint16_t* __restrict__ rw,
+    const uint16_t* __restrict__ rw, int rh_rows, int rw_rows,
     int q_ld, int k_ld, int v_ld, int o_ld, int nhead, int gh, int gw, int th, int tw,
     int nth, int ntw, float scale) {
     // blockIdx.x = ((seq * nth + ty) * ntw + tx) * nhead + head: heads adjacent, so the tile's k/v
@@ -72,18 +102,12 @@ __global__ __launch_bounds__(kThreads) void sam_attn_kernel(
         float m = -INFINITY, l = 0.0f;
 
         for (int jh = 0; jh < th; ++jh) {
-            const uint16_t* hrp = rh + (size_t)(lh - jh + th - 1) * HD;
-            float hr = 0.0f;
-#pragma unroll
-            for (int c = 0; c < HD; ++c) hr += qf[c] * bf16_to_f32(hrp[c]);
+            const float hr = tab_dot<HD>(rh, rh_rows, 2 * th - 1, lh - jh + th - 1, qf);
 
             const int kh = ty * th + jh;
             const bool hreal = kh < gh;
             for (int jw = 0; jw < tw; ++jw) {
-                const uint16_t* wrp = rw + (size_t)(lw - jw + tw - 1) * HD;
-                float s = hr;
-#pragma unroll
-                for (int c = 0; c < HD; ++c) s += qf[c] * bf16_to_f32(wrp[c]);
+                float s = hr + tab_dot<HD>(rw, rw_rows, 2 * tw - 1, lw - jw + tw - 1, qf);
 
                 const int kw = tx * tw + jw;
                 const bool real = hreal && kw < gw;
@@ -124,6 +148,7 @@ __global__ __launch_bounds__(kThreads) void sam_attn_kernel(
 
 int launch_sam_attn(const uint16_t* q, const uint16_t* k, const uint16_t* v, uint16_t* o,
                     const int* cu, const uint16_t* rh, const uint16_t* rw,
+                    int rh_rows, int rw_rows,
                     int q_ld, int k_ld, int v_ld, int o_ld, int nseq, int nhead, int gh, int gw,
                     int win, float scale, long stream) {
     const int th = win > 0 ? win : gh, tw = win > 0 ? win : gw;
@@ -131,8 +156,8 @@ int launch_sam_attn(const uint16_t* q, const uint16_t* k, const uint16_t* v, uin
     const size_t blocks = (size_t)nseq * nth * ntw * nhead;
     if (blocks == 0 || blocks > 0x7fffffff) return R4D_NO(RAD_E_SHAPE);
     hipLaunchKernelGGL((sam_attn_kernel<64>), dim3((uint32_t)blocks), dim3(kThreads), 0,
-                       (hipStream_t)stream, q, k, v, o, cu, rh, rw, q_ld, k_ld, v_ld, o_ld, nhead,
-                       gh, gw, th, tw, nth, ntw, scale);
+                       (hipStream_t)stream, q, k, v, o, cu, rh, rw, rh_rows, rw_rows,
+                       q_ld, k_ld, v_ld, o_ld, nhead, gh, gw, th, tw, nth, ntw, scale);
     return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
 }
 
@@ -188,19 +213,20 @@ extern "C" int r4d_rad_sam_attn(const RadArgs* a, RadStream s) {
     const long long nseq = r4d_numel(cu) - 1;
     if (nseq < 1) return R4D_NO(RAD_E_SHAPE);
 
-    // The tables: [2*tile-1, head_dim] each, the tile being the window or the whole grid.
-    const long long th = win > 0 ? win : gh, tw = win > 0 ? win : gw;
+    // The tables: [2*tile-1, head_dim] when the geometry has its own, else the checkpoint's rows
+    // (the 127-row global table at a 40 grid), resampled on read.
     int64_t rhrows = 0, rhld = 0, rwrows = 0, rwld = 0;
     R4D_NEED(bf16_rows(rh, hd, &rhrows, &rhld));
     R4D_NEED(bf16_rows(rw, hd, &rwrows, &rwld));
-    if (rhrows != 2 * th - 1 || rwrows != 2 * tw - 1) return R4D_NO(RAD_E_UNSUPPORTED);
+    if (rhrows < 1 || rwrows < 1) return R4D_NO(RAD_E_UNSUPPORTED);
 
     const float scale = (float)r4d_getf(a, "scale", 1.0 / std::sqrt((double)hd));
 
     return launch_sam_attn((const uint16_t*)r4d_addr(q), (const uint16_t*)r4d_addr(k),
                            (const uint16_t*)r4d_addr(v), (uint16_t*)r4d_addr(o),
                            (const int*)r4d_addr(cu), (const uint16_t*)r4d_addr(rh),
-                           (const uint16_t*)r4d_addr(rw), (int)qld, (int)kld, (int)vld, (int)old,
+                           (const uint16_t*)r4d_addr(rw), (int)rhrows, (int)rwrows,
+                           (int)qld, (int)kld, (int)vld, (int)old,
                            (int)nseq, (int)nh, (int)gh, (int)gw, (int)win, scale,
                            (long)(uintptr_t)s);
 }

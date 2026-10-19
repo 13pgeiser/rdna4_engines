@@ -2382,7 +2382,7 @@ the usual rescale, pairs by value).
 | op | params | operands |
 |---|---|---|
 | `sample_dry` | `M` `n_vocab` `vocab_off`/opt | `logits`:inout, `params`, `history`, `breakers`? |
-| `sample_ngram_ban` | `M` `n_vocab` `vocab_off`/opt | `logits`:inout, `params`, `history`, `ngram` |
+| `sample_ngram_ban` | `M` `n_vocab` `vocab_off`/opt | `logits`:inout, `params`, `history`, `ngram`, `whitelist`? |
 | `sample_typical` | `M` `n_cand` | `cand_idx`:inout, `cand_val`:inout, `params` |
 | `sample_xtc` | `M` `n_cand` | `cand_idx`:inout, `cand_val`:inout, `params` |
 | `sample_chain` | `M` `n_vocab` `temp`:f64/opt `p`:f64/opt `min_p`:f64/opt `k`/opt | `logits`, `query`?, `u` → `draw` |

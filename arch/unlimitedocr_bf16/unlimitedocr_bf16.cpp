@@ -2,10 +2,14 @@
  * activations.
  *
  * Scope (aijuus/plans/UNLIMITED-OCR-PLUGIN.md): the text trunk (P1) plus the DeepEncoder vision
- * tower (P2, arch/common/rad_block_sam.h: SAM ViT-B/16 at 1024 -> 16x16x1024 map -> CLIP ViT-L/14
- * -> the projector -> the 273-row layout, declared with rad_declare_encoder(RAD_MM_IMAGE),
- * patch_dim 768 = 3*16*16, merge 16, n_embd 1280). The tower's weights are mapped always; its ops
- * and the encoder pass are declared only when SAM's `sam_attn` op resolves, because no existing op
+ * tower (P2, arch/common/rad_block_sam.h: SAM ViT-B/16 -> map -> CLIP ViT-L/14 -> the projector
+ * -> the 273-row layout of a 1024 view / 110 rows of a 640 tile, declared with
+ * rad_declare_encoder(RAD_MM_IMAGE), patch_dim 768 = 3*16*16, merge 16, n_embd 1280). The tower
+ * serves both view geometries the processor stages -- the gundam mode's 640 tiles and global
+ * view, and the base mode's pages -- as two op sets over the same weights, the 40 grid's absolute
+ * position tables bicubic+antialias resamples of the checkpoint's (arch/common/rad_resample.h).
+ * The tower's weights are mapped always; its ops and the encoder pass are declared only when
+ * SAM's `sam_attn` op resolves, because no existing op
  * can carry the decomposed rel_pos_h/rel_pos_w attention bias (rad_block_sam.h's header states the
  * op and why). Without it this plugin is the P1 text-only trunk and refuses images by name. The
  * decoder's KV is one RAD_KV_RING group with the checkpoint's `sliding_window_size` (128), the

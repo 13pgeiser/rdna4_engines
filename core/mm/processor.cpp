@@ -970,6 +970,9 @@ int uocr_mode(const VisionConfig& c, const ImageMode& mode, bool* crop, int32_t*
                       "patches (" + std::to_string(F) + ")");
         if (bs < 4 * F)
             return no("base_size " + std::to_string(bs) + " is under two output rows");
+        if (bs / c.patch != 64 && bs / c.patch != 40)
+            return no("the DeepEncoder serves base grids 64 and 40 (base_size 1024 or 640); "
+                      "base_size " + std::to_string(bs) + " is neither");
         if (mode.image_size > 0 && mode.image_size != c.tile)
             return no("crop mode cuts pictures into " + std::to_string(c.tile) + "-pixel tiles; "
                       "image_size " + std::to_string(mode.image_size) + " is not one");
@@ -980,6 +983,9 @@ int uocr_mode(const VisionConfig& c, const ImageMode& mode, bool* crop, int32_t*
         return no("image_size " + std::to_string(is) + " is not a whole number of merged patches "
                   "(" + std::to_string(F) + ")");
     if (is < 4 * F) return no("image_size " + std::to_string(is) + " is under two output rows");
+    if (is / c.patch != 64 && is / c.patch != 40)
+        return no("the DeepEncoder serves base grids 64 and 40 (image_size 1024 or 640); "
+                  "image_size " + std::to_string(is) + " is neither");
     if (mode.base_size > 0 && mode.base_size != bs)
         return no("the base mode pads a page to image_size, not base_size");
     *crop = false; *base_size = bs; *image_size = is;
@@ -1101,7 +1107,7 @@ int Processor::image_unlimitedocr(const Frame& f, const ImageMode& mode,
      * patches a row carry pixels; the rest are the newline column. */
     auto append = [&](const Frame& src, int32_t x0, int32_t y0, int32_t gh, int32_t gw,
                       int32_t real_w) {
-        it->segments.push_back({ gh, gw, it->n_patch });
+        it->segments.push_back({ gh, gw, it->n_patch, real_w == 0 });
         it->seg_at.push_back((int32_t)seg_row);
         it->expand.insert(it->expand.end(), (size_t)(gh / M) * (size_t)(gw / M), c.tok_image);
         seg_row += (int64_t)(gh / M) * (gw / M);

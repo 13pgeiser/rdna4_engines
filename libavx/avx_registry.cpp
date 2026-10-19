@@ -783,8 +783,10 @@ static const RadParamSpec pPenal[]  = { P_INT("M"), P_INT("n_vocab"), P_INTO("vo
 static const RadOperandSpec oPenalties[] = { INOUT("logits"), OPD("params"), OPD("history") };
 static const RadOperandSpec oDry[]       = { INOUT("logits"), OPD("params"), OPD("history"),
                                              OPD_O("breakers") };
+/* `whitelist` is optional, libref's: a bitmask plane a row, a SET bit exempting a token from
+ * the ban. Absent, nothing is exempt. */
 static const RadOperandSpec oNgramBan[]  = { INOUT("logits"), OPD("params"), OPD("history"),
-                                             OPD("ngram") };
+                                             OPD("ngram"), OPD_O("whitelist") };
 static const RadOperandSpec oTemp[]      = { INOUT("logits"), OPD("params") };
 static const RadOperandSpec oMask[]      = { INOUT("logits"), OPD("params"), OPD("bitmask") };
 static const RadParamSpec pTopk[]        = { P_INT("M"), P_INT("n_vocab"), P_INTO("vocab_off") };
@@ -1225,7 +1227,8 @@ static const RadOpSchema kSchemas[] = {
 { "sample_ngram_ban", ARR(pPenal), ARR(oNgramBan),
   "the windowed no-repeat-ngram ban: every token completing an n-gram the last `window` tokens of "
   "the row's history contain is set to -infinity. `ngram` is an i32 {n, window} pair a row; n 0 "
-  "is off." },
+  "is off. The optional `whitelist` bitmask exempts a token whose column bit is set; absent, "
+  "nothing is exempt." },
 { "sample_temp", ARR(pMVocab), ARR(oTemp), "per-request temperature." },
 { "sample_topk", ARR(pTopk), ARR(oTopk), "exact top-k candidate set, descending, ties to the "
   "lower id." },

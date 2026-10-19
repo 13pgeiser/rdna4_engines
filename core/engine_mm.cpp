@@ -119,6 +119,8 @@ int Engine::run_encodes() {
 
         size_t i = 0;
         int32_t seg = 0;
+        int32_t seg_grid = 0;   /* the pass's view grid; a pass is one geometry (a tower refuses
+                                   a mixed one: its position tables and grids are per geometry) */
         while (i < mine.size()) {
             std::vector<BatchBuilder::EncoderPart> parts;
             int64_t np = 0;
@@ -126,16 +128,27 @@ int Engine::run_encodes() {
                 mm::Item& it = *mine[i];
                 const int32_t first = seg;
                 for (; seg < it.n_seg; ++seg) {
+                    const int32_t g = it.seg_h(seg);
+                    /* The one-output-row view separator (core/mm marks it explicitly) belongs to
+                     * the pass of the view before it, so it neither breaks at a "grid change" nor
+                     * sets the pass's grid. A square segment that is a real view (a chunked line
+                     * of one tile) keeps the ordinary geometry rule below. */
+                    const bool sep = it.seg_is_sep(seg);
                     const int64_t seg_p = it.patch_at(seg + 1) - it.patch_at(seg);
                     if (seg_p > max_p) {
                         RAD_ERR("encoder: a segment of %lld patches does not fit a pass of %lld",
                                 (long long)seg_p, (long long)max_p);
                         return RAD_E_STATE;
                     }
+                    if (!sep && np > 0 && seg_grid != 0 && g != seg_grid) break;
                     if (np + seg_p > max_p) break;
                     np += seg_p;
+                    if (!sep) seg_grid = g;
                 }
-                if (seg == first) break;
+                if (seg == first) {
+                    if (seg_grid == 0) seg_grid = it.seg_h(seg);   /* a lone oversized segment */
+                    break;
+                }
                 parts.push_back({ &it, first, seg - first });
                 if (seg == it.n_seg) { ++i; seg = 0; }
             }

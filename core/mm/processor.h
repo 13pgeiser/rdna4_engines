@@ -229,7 +229,7 @@ struct Item {
      * thumbnail): each is `h` x `w` patches starting at patch `patch0`. Empty means every segment
      * is grid_h x grid_w. The rest of the engine reads segments only through the accessors below,
      * so both forms look alike. */
-    struct Segment { int32_t h = 0, w = 0; int64_t patch0 = 0; };
+    struct Segment { int32_t h = 0, w = 0; int64_t patch0 = 0; bool sep = false; };
     std::vector<Segment> segments;
     /* The model rotates this item's tokens at their token positions (LFM2-VL's 1-D rotary), not
      * on the grid the Qwen-VL family's M-RoPE lays out (RopeLayout). */
@@ -240,6 +240,9 @@ struct Item {
 
     int32_t seg_h(int32_t s) const { return segments.empty() ? grid_h : segments[(size_t)s].h; }
     int32_t seg_w(int32_t s) const { return segments.empty() ? grid_w : segments[(size_t)s].w; }
+    /* The one-output-row view separator (Unlimited-OCR stages it as a merge-grid cell of zeros).
+     * A square segment is not enough: a chunked line of one tile is q x q too. */
+    bool seg_is_sep(int32_t s) const { return !segments.empty() && segments[(size_t)s].sep; }
     /* Segment s's first patch and first output row; s == n_seg is the end of the item. */
     int64_t patch_at(int32_t s) const {
         if (segments.empty()) return (int64_t)s * grid_h * grid_w;

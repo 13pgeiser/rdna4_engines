@@ -704,9 +704,13 @@ static const RadOperandSpec oPenalties[] = { INOUT("logits"), OPD("params"), OPD
  * is a whole DRY sequence breaker and never penalised. Absent, no token is exempt. */
 static const RadOperandSpec oDry[]       = { INOUT("logits"), OPD("params"), OPD("history"),
                                              OPD_O("breakers") };
-/* The windowed n-gram ban: penalties' operands plus a {n, window} pair a row. */
+/* The windowed n-gram ban: penalties' operands plus a {n, window} pair a row.
+ * `whitelist` is optional: a bitmask plane [M, ceil(n_vocab/32)] like sample_mask's, a SET bit
+ * marking a token exempt from the ban (the reference's whitelist, removed from the banned set
+ * before the -inf writes). Absent, nothing is exempt. Rows are indexed by the sampled position,
+ * not by mask_row: every row the op bans reads its own words. */
 static const RadOperandSpec oNgramBan[]  = { INOUT("logits"), OPD("params"), OPD("history"),
-                                             OPD("ngram") };
+                                             OPD("ngram"), OPD_O("whitelist") };
 static const RadOperandSpec oTemp[]      = { INOUT("logits"), OPD("params") };
 /* `bitmask` is [rows, ceil(n_vocab/32)] uint32, addressed by the row's mask_row -- which is -1 for
  * an unconstrained sequence, so the plane is shared and shorter than M. */
@@ -1541,7 +1545,10 @@ static const RadOpSchema kSchemas[] = {
   "by setting -infinity, every token that would complete an n-gram the last `window` tokens of "
   "the row's history already contain. `ngram` is one i32 {n, window} pair a row; the window "
   "bounds the n-gram's START index, as in the reference, window <= 0 searches the whole span and "
-  "n 0 is off. Columns are ids less vocab_off." },
+  "n 0 is off. The optional `whitelist` bitmask (a SET bit, word w bit b covering column 32w + b, "
+  "the row's own plane row) exempts a token from the ban, as the reference's "
+  "`banned.difference_update(whitelist)` does; absent, nothing is exempt. Columns are ids less "
+  "vocab_off." },
 { "sample_temp", ARR(pMVocab), ARR(oTemp),
   "logits /= temp, per row. temp <= 0 leaves the row untouched -- greedy decoding is "
   "sample_argmax, and a temperature of zero silently meaning something else is how a sampler "

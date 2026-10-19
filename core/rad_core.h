@@ -596,6 +596,12 @@ struct SamplingParams {
      * asks for 35 and 128 (the model card's document mode uses 1024). */
     int    ngram_ban_n = 0;
     int    ngram_window = 0;
+    /* The ids exempt from that ban: the reference processor's whitelist
+     * (SlidingWindowNoRepeatNgramProcessor's `whitelist_token_ids`, whose set is removed from
+     * the banned set after it is built -- modeling_unlimitedocr.py:359,379). Global token ids,
+     * duplicates ignored. Empty (the default) is off: the ban is then bit-identical to the
+     * no-whitelist form. */
+    std::vector<int32_t> ngram_whitelist;
 };
 
 /* Raw logits at chosen vocabulary ids at the prompt's last position, for a caller that answers

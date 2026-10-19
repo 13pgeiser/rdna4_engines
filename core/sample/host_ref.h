@@ -181,9 +181,14 @@ void host_xtc(CandidateSet& s, float probability, float threshold, size_t min_ke
  * SlidingWindowNoRepeatNgramProcessor): a candidate whose token would complete an `n`-gram the
  * last `window` tokens of `history` already contain gets -infinity. `n` <= 0 is off, `window` <= 0
  * is the whole history. It runs after the penalties and DRY and before every cut, so the greedy
- * path sees it too. */
+ * path sees it too.
+ *
+ * `whitelist` is the reference's whitelist (a SET bit means exempt from the ban, the same plane
+ * form as host_mask's, word w bit b covering token 32w + b): ids removed from the banned set
+ * before anything is written, as `banned.difference_update(self.whitelist)` does. Null or zero
+ * words is off -- the reference's empty whitelist, the default serving form. */
 void host_ngram_ban(CandidateSet& s, const int32_t* history, int64_t n_history, int32_t n,
-                    int32_t window);
+                    int32_t window, const uint32_t* whitelist = nullptr, int64_t wl_words = 0);
 
 /* The grammar mask. One bit per token, set means admissible; a cleared bit sets the logit to -inf
  * instead of removing the candidate, so nothing downstream is renumbered. `n_words` is
@@ -224,6 +229,10 @@ struct HostRefInput {
     int64_t        total_context = 0;     /* DRY's clamp; 0 means use n_history */
     const uint32_t* bitmask  = nullptr;   /* grammar mask, or null */
     int64_t        n_words   = 0;
+    /* The n-gram ban's whitelist bitmask (a SET bit exempts a token, host_ngram_ban), null =
+     * no exemptions. */
+    const uint32_t* ngram_whitelist       = nullptr;
+    int64_t         ngram_whitelist_words = 0;
     uint64_t       pos       = 0;         /* output position: the RNG's second coordinate */
     const DryBreakers* dry_breakers = nullptr;   /* null runs DRY with no breakers */
     /* The chain's candidate width (SamplerConfig::max_candidates): top-k narrows every row to

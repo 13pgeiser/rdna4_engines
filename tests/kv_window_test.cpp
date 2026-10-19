@@ -460,4 +460,173 @@ TEST(rswa_advance_keeps_the_ring_span_and_slots) {
     CHECK_EQ(slot[0], -1);
 }
 
+/* The plan's P4 gate "flat KV bytes after prefill+128" at the KV-manager level, at the geometry
+ * R-SWA deploys at (block 16, W 128) and the P4a prompt size (a 176-token prompt = the 11-block
+ * table of the fault). The scheduler arms `visible_lo` = the prompt size at admission; the floor
+ * here is block-aligned so the visible set is exactly [0, P) U the last W positions, count P + W.
+ * The decode runs far past prefill + W and pins, every step:
+ *   - the visible set is exactly [0, P) plus the newest W positions, and its count is P + W;
+ *   - the block table is flat once the ring fills: ceil(P/B) reference + W/B ring blocks, never
+ *     one more (the sequence's KV bytes stop growing after prefill + 128);
+ *   - every ring write lands where adv_groups maps it (core/sched/advance_impl.h): block
+ *     ring_pos/B + ((p - ring_pos)/B) % ring_blocks -- so the manager's rule and the card's rule
+ *     are checked against the same table and positions;
+ *   - no write ever lands on a slot index >= table_len * block: the table is allocated from a
+ *     fresh pool so its physical ids are 0..len-1 (the min-heap), which makes that bound literal;
+ *     the un-ring'ed linear mapping runs past it from position 304 on, which is the R-SWA fault
+ *     class (used past the ring floor walking into the builder's -1 padding). */
+TEST(rswa_flat_kv_bytes_after_prefill_plus_128) {
+    const int64_t B = 16, W = 128, P = 176;         /* P is block-aligned: the set is exact */
+    const int64_t ring_blocks = W / B;              /* 8 */
+    const int64_t prefill_blocks = P / B;           /* 11: the P4a table */
+    const int64_t flat_blocks = prefill_blocks + ring_blocks;   /* 19 = 304 tokens */
+    const KVGroupInfo grp = window_group(B, W);
+    const std::vector<KVGroupInfo> g = groups_of(grp);
+    Config cfg = window_config();
+    Pools pools;
+    CHECK_OK(configure_pools(pools, cfg));
+    KVManager kv;
+    CHECK_OK(kv.declare_runtime_window(G_WIN, W));
+    CHECK_OK(kv.configure(g, cfg, pools.kv()));
+    CHECK_OK(kv.add_sequence(1));
+    CHECK_OK(kv.set_window(1, P, W));
+    const Ring r{ &kv, KVGeom::of(g), G_WIN };
+    const SeqWindow w = r.window();
+    CHECK_EQ(w.visible_lo, P);
+    CHECK_EQ(w.ring_pos, P);                        /* aligned floor: the ring starts at P */
+    CHECK_EQ(w.ring_blocks, ring_blocks);
+    CHECK_EQ(w.ring_span(B), W);
+
+    /* Prefill: 11 blocks, identity physical ids (fresh min-heap pool, one sequence). */
+    CHECK_OK(kv.ensure(1, P));
+    const std::vector<int32_t> bt0 = kv.block_table(1, G_WIN);
+    REQUIRE_EQ((long long)bt0.size(), prefill_blocks);
+    for (int64_t b = 0; b < prefill_blocks; ++b) CHECK_EQ(bt0[(size_t)b], (int32_t)b);
+
+    std::map<int32_t, int64_t> content;
+    for (int64_t p = 0; p < P; ++p) {
+        const int32_t s = r.slot(p);
+        REQUIRE(s >= 0);
+        CHECK(s < prefill_blocks * B);
+        content[s] = p;
+    }
+
+    /* Decode far past prefill + W. */
+    const int64_t L = 1000;
+    int64_t bad_step = -1, bad_map = -1, bad_pad = -1, bad_size = -1;
+    int32_t max_slot = -1;
+    for (int64_t p = P; p < P + L; ++p) {
+        CHECK_OK(kv.ensure(1, p + 1, p));
+        const int64_t n = p + 1;
+        const std::vector<int32_t>& bt = kv.block_table(1, G_WIN);
+        const int64_t table_len = (int64_t)bt.size();
+
+        /* Table length: the reference's 11 blocks, plus the ring's filling one block at a time,
+         * flat at 19 once the newest W positions span the whole ring. It never exceeds 19. */
+        const int64_t want_blocks =
+            n <= w.ring_pos ? (n + B - 1) / B
+                            : w.ring_pos / B + std::min(ring_blocks, (n - w.ring_pos + B - 1) / B);
+        if (table_len != want_blocks) bad_size = n;
+        CHECK(table_len <= flat_blocks);
+        if (n >= w.ring_pos + w.ring_span(B)) {
+            CHECK_EQ(table_len, flat_blocks);
+            CHECK_EQ(kv.held_blocks(G_WIN), flat_blocks);
+        }
+
+        /* The write itself: the ring rule, and never off the table. */
+        const int64_t bi = w.ring_pos / B + ((p - w.ring_pos) / B) % ring_blocks;
+        const int32_t s = r.slot(p);
+        REQUIRE(s >= 0);
+        if (s != (int32_t)(bt[(size_t)bi] * B + p % B)) bad_map = n;
+        if (bi >= table_len || s >= table_len * B) bad_pad = n;
+        if (s > max_slot) max_slot = s;
+        content[s] = p;
+
+        /* The visible set: exactly [0, P) plus the newest W positions; count P + min(n - P, W),
+         * flat P + W once the ring is full. */
+        std::set<int64_t> held, want;
+        for (const auto& kvp : content) held.insert(kvp.second);
+        for (int64_t q = 0; q < P; ++q) want.insert(q);
+        for (int64_t q = std::max(w.ring_pos, n - w.ring_span(B)); q < n; ++q) want.insert(q);
+        if (held != want) bad_step = n;
+        CHECK_EQ((long long)held.size(), P + std::min(n - P, W));
+    }
+    CHECK_EQ(bad_step, -1ll);
+    CHECK_EQ(bad_map, -1ll);
+    CHECK_EQ(bad_pad, -1ll);
+    CHECK_EQ(bad_size, -1ll);
+    CHECK(max_slot < flat_blocks * B);              /* 303 < 304: no write leaves the flat KV */
+    CHECK_EQ((long long)kv.block_table(1, G_WIN).size(), flat_blocks);
+    CHECK_EQ(kv.first_block_pos(1, G_WIN), 0ll);
+
+    /* The fault class: the linear rule the un-ring'ed advance used maps the same positions past
+     * the 19-block table from position 304 (the second ring lap) on, where the table has nothing
+     * -- the slot lookup returns -1 into the builder's padding. */
+    const Ring r_lin{ &kv, KVGeom::of(g), G_WIN };
+    for (int64_t p = 304; p < P + L; ++p)
+        CHECK_EQ(r_lin.geo.slot(G_WIN, kv.block_table(1, G_WIN), 0, p), -1);
+    /* The ring rule keeps every one of them on a real slot, cycling over the ring span. */
+    for (int64_t p = w.ring_pos; p < P + L; ++p) {
+        CHECK(r.slot(p) >= 0);
+        CHECK_EQ(r.slot(p), r.slot(p + w.ring_span(B)));   /* one lap: same slot, in place */
+        if (p + 1 < P + L) CHECK(r.slot(p) != r.slot(p + 1));
+    }
+
+    /* Cross-check with the card's rule (adv_groups) on the manager's own table: the same positions
+     * through the slab path must produce the manager's slots, and `used` must stop at the table. */
+    {
+        const std::vector<int32_t>& bt = kv.block_table(1, G_WIN);
+        const int32_t tlen = (int32_t)bt.size();
+        std::vector<char> slab(32768, 0);
+        const int64_t pos_off = 0, slot_off = (int64_t)L * 4;
+        const int64_t bt_off = slot_off + (int64_t)L * 4;
+        const int64_t first_off = bt_off + (int64_t)tlen * 4;
+        const int64_t rpos_off = first_off + 8, tlen_off = rpos_off + 8, used_off = tlen_off + 8;
+        const int64_t grp_off = (used_off + 8 + 7) & ~(int64_t)7;   /* AdvGroup holds int64 */
+        AdvanceArgs a;
+        a.slab = slab.data();
+        a.pos_off = pos_off; a.grp_off = grp_off; a.n_groups = 1;
+        int32_t* pos = reinterpret_cast<int32_t*>(slab.data() + pos_off);
+        for (int64_t j = 0; j < L; ++j) pos[j] = (int32_t)(P + j);
+        std::memcpy(slab.data() + bt_off, bt.data(), (size_t)tlen * 4);
+        *reinterpret_cast<int32_t*>(slab.data() + first_off) = 0;
+        *reinterpret_cast<int32_t*>(slab.data() + rpos_off) = (int32_t)w.ring_pos;
+        *reinterpret_cast<int32_t*>(slab.data() + tlen_off) = tlen;
+        AdvGroup* ag = reinterpret_cast<AdvGroup*>(slab.data() + grp_off);
+        ag->block_size = (int32_t)B; ag->paged = 1; ag->pitch = tlen;
+        ag->slot_off = slot_off; ag->used_off = used_off; ag->bt_off = bt_off;
+        ag->first_off = first_off; ag->rpos_off = rpos_off; ag->tlen_off = tlen_off;
+        ag->ring = 1; ag->ring_blocks = (int32_t)ring_blocks;
+
+        adv_groups(a, 0, 0, (int32_t)P, (int32_t)L);
+        CHECK_EQ(*reinterpret_cast<int32_t*>(slab.data() + used_off), (int32_t)(flat_blocks * B));
+        const int32_t* slot = reinterpret_cast<const int32_t*>(slab.data() + slot_off);
+        int64_t mismatches = 0, negatives = 0;
+        for (int64_t j = 0; j < L; ++j) {
+            if (slot[j] != r.slot(P + j)) ++mismatches;
+            if (slot[j] < 0) ++negatives;
+            CHECK(slot[j] < tlen * B);              /* every write inside the flat KV bytes */
+        }
+        CHECK_EQ(mismatches, 0ll);
+        CHECK_EQ(negatives, 0ll);
+
+        /* Without the ring the same advance walks off the padded table (the P4a fault). */
+        ag->ring = 0;
+        adv_groups(a, 0, 0, (int32_t)P, (int32_t)L);
+        CHECK_EQ(*reinterpret_cast<int32_t*>(slab.data() + used_off), (int32_t)(P + L));
+        CHECK_EQ(slot[304 - P], -1);                /* position 304: bt[19] is padding */
+    }
+
+    /* The reference is untouched by a thousand ring laps, and free returns the flat set. */
+    const std::vector<int32_t>& bt = kv.block_table(1, G_WIN);
+    for (int64_t p = 0; p < P; ++p) {
+        const int32_t slot = (int32_t)(bt[(size_t)(p / B)] * B + p % B);
+        REQUIRE(content.count(slot) > 0);
+        CHECK_EQ(content[slot], p);
+    }
+    const int64_t free0 = kv.free_blocks(G_WIN);
+    kv.free_sequence(1);
+    CHECK_EQ(kv.free_blocks(G_WIN), free0 + flat_blocks);
+}
+
 RAD_TEST_MAIN()

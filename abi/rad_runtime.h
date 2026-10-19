@@ -243,6 +243,12 @@ typedef struct RadBatch {
     /* A video generator's pass (rad_declare_video_generator; `gen` is one of its
      * RAD_GEN_PASS_*): its payload. Null on every other step. */
     const struct RadVideoGenBatch* vgen_b;
+
+    /* host: [enc_n_seg] each segment's grid in patches, the same values enc_coord planes 2 and 3
+     * carry. A plugin that has to pick a geometry before it issues ops (a tower with one set of
+     * position tables per grid) reads them here; they live as long as the pass. */
+    const int32_t* enc_seg_h;
+    const int32_t* enc_seg_w;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:

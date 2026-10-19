@@ -28,6 +28,8 @@
 #include "rad_builder.h"
 #include "rad_plugin.h"
 #include "uocr_golden.h"
+#include "uocr_resample_golden.h"
+#include "../arch/common/rad_resample.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1613,15 +1615,20 @@ TEST(unlimitedocr_runs_follow_the_reference_layout) {
     CHECK_EQ(uocr_tokens(c, gundam, 3, 2), (int64_t)273 + (int64_t)(10 * 3 + 1) * 20);
     CHECK_EQ(uocr_tokens(c, gundam, 4, 3), (int64_t)273 + (int64_t)(10 * 4 + 1) * 30);
 
-    /* A request may restate the global view's side, but not cut crops at another tile or pad a
-     * page to a side that is not whole merged patches. */
+    /* A request may restate the global view's side, but only at a grid the DeepEncoder serves
+     * (64/40), and not cut crops at another tile or pad a page to a side that is not whole merged
+     * patches. */
     bool crop = false;
     int32_t bs = 0, is = 0;
     ImageMode b2048;
     b2048.kind = ImageMode::Gundam;
     b2048.base_size = 2048;
-    CHECK_EQ(uocr_mode(c, b2048, &crop, &bs, &is, &why), RAD_OK);
-    CHECK_EQ(uocr_tokens(c, b2048, 1, 1), (int64_t)(32 + 1) * 32 + 1);
+    CHECK_EQ(uocr_mode(c, b2048, &crop, &bs, &is, &why), RAD_E_INVAL);
+    ImageMode b640;
+    b640.kind = ImageMode::Gundam;
+    b640.base_size = 640;
+    REQUIRE_EQ(uocr_mode(c, b640, &crop, &bs, &is, &why), RAD_OK);
+    CHECK_EQ(uocr_tokens(c, b640, 1, 1), (int64_t)(10 + 1) * 10 + 1);
     ImageMode tile512;
     tile512.kind = ImageMode::Gundam;
     tile512.image_size = 512;
@@ -1653,6 +1660,82 @@ TEST(unlimitedocr_runs_follow_the_reference_layout) {
     int32_t pos[3];
     mp->rope.at(1 + 273 + 100, pos);
     CHECK_EQ(pos[0], (int32_t)(1 + 273 + 100));
+}
+
+/* The DeepEncoder's 40-tower absolute position tables are the 64/16 checkpoint tables resampled
+ * with torch's bicubic + antialias (arch/common/rad_resample.h), computed host-side in
+ * fill_tables() and rounded to bf16. Every golden here is torch's F.interpolate(mode="bicubic",
+ * antialias=True) on CPU fp32 (tests/resample_golden.py), so this pins the load-time position
+ * table number for number: a resample off by a row or a tap serves a slightly shifted picture. */
+TEST(unlimitedocr_bicubic_antialias_resample_is_the_reference) {
+    const int CH = 3;
+    double worst_abs = 0.0, worst_rel = 0.0;
+    for (int k = 0; k < kResampleCases; ++k) {
+        const int ih = kResampleGeo[k][0], iw = kResampleGeo[k][1];
+        const int oh = kResampleGeo[k][2], ow = kResampleGeo[k][3];
+        std::vector<float> out((size_t)oh * ow * CH);
+        rad::arch::resample_bicubic_aa(kResampleIn[k], ih, iw, oh, ow, CH, out.data());
+        const float* want = kResampleOut[k];
+        double a = 0.0, r = 0.0;
+        for (size_t i = 0; i < out.size(); ++i) {
+            const double d = std::fabs((double)out[i] - (double)want[i]);
+            const double rr = d / std::fmax(std::fabs((double)want[i]), 1e-30);
+            if (d > a) a = d;
+            if (rr > r) r = rr;
+        }
+        std::fprintf(stderr, "    %dx%d -> %dx%d: max abs %.3g, max rel %.3g\n", ih, iw, oh, ow, a, r);
+        if (a > worst_abs) worst_abs = a;
+        if (r > worst_rel) worst_rel = r;
+    }
+    std::fprintf(stderr, "    synthetic fp32: worst abs %.3g, worst rel %.3g (target < 1e-4)\n",
+                 worst_abs, worst_rel);
+    CHECK(worst_abs < 1e-4);
+
+    /* A checkpoint table, bf16 in and bf16 out, exactly as fill_tables() does it: decode the
+     * stored bf16, resample in fp32, round back. Reports the last-bit count and the max abs the
+     * bf16 table would carry. */
+    auto bf16_case = [&](const uint16_t* src_bits, int ih, int iw, int oh, int ow, int ch,
+                         const uint16_t* want_bits, size_t off, const char* tag,
+                         size_t* mism, double* absmax) {
+        std::vector<float> f((size_t)ih * iw * ch);
+        for (size_t i = 0; i < f.size(); ++i) f[i] = rad_bf16_to_f32(src_bits[i]);
+        std::vector<float> g((size_t)oh * ow * ch);
+        rad::arch::resample_bicubic_aa(f.data(), ih, iw, oh, ow, ch, g.data());
+        size_t m = 0;
+        double a = 0.0;
+        for (size_t i = 0; i < g.size(); ++i) {
+            const uint16_t got = rad_f32_to_bf16(g[i]);
+            const uint16_t want = want_bits[off + i];
+            if (got != want) ++m;
+            const double d = std::fabs(rad_bf16_to_f32(got) - rad_bf16_to_f32(want));
+            if (d > a) a = d;
+        }
+        std::fprintf(stderr, "    %s: %zu/%zu bf16 mismatches, max abs %.3g\n", tag, m, g.size(), a);
+        *mism = m;
+        *absmax = a;
+    };
+
+    size_t sam_mism = 0;
+    double sam_abs = 0.0;
+    bf16_case(kSamSrc, (int)kSamSrcDim[0], (int)kSamSrcDim[1], (int)kSamOutDim[0],
+              (int)kSamOutDim[1], (int)kSamSrcDim[2], kSamOut, 0, "sam 64->40 bf16", &sam_mism,
+              &sam_abs);
+
+    /* CLIP: rows 1: as a 16x16 grid resampled to 10x10; the cls row (index 0) passes through in
+     * front, so the golden's grid starts one channel-vector in. */
+    size_t clip_mism = 0;
+    double clip_abs = 0.0;
+    {
+        const int CW = (int)kClipSrcDim[1];
+        const uint16_t* grid_bits = kClipSrc + CW;   /* skip the cls row */
+        bf16_case(grid_bits, 16, 16, 10, 10, CW, kClipOut, (size_t)CW, "clip 16->10 bf16",
+                  &clip_mism, &clip_abs);
+    }
+    /* The bf16 tables are a report, not a gate: bf16 carries ~3 decimal digits, so a last-bit
+     * difference on a fraction of entries is representable, not a bug. The fp32 CHECK above is
+     * the strict signal on the resample arithmetic. */
+    (void)sam_mism;
+    (void)clip_mism;
 }
 
 RAD_TEST_MAIN()

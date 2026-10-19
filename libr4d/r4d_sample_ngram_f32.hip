@@ -28,6 +28,11 @@
 // less `vocab_off`, and a token outside the shard is another rank's to mask (it is not a column
 // here at all).
 //
+// The optional `whitelist` plane is the reference's whitelist (modeling_unlimitedocr.py:359,379):
+// word w bit b of the row's own plane row covers column 32w + b, and a SET bit removes that token
+// from the banned set -- it is never written. Absent, nothing is exempt, and the kernel's answer
+// is the one before the whitelist existed.
+//
 // The scan is O(w * n) a row over a history of at most max_hist tokens, so one block a row with
 // the positions dealt out across the block's threads; the n-1-token prefix is staged in LDS once
 // when it fits (n <= 256), which is every request the model card asks for (35).
@@ -53,7 +58,8 @@ using SP = RadSampleParams;
 
 __global__ __launch_bounds__(kThreads) void ngram_ban_kernel(
     float* __restrict__ lg, const SP* __restrict__ sp, const int32_t* __restrict__ hist,
-    const int32_t* __restrict__ ng, uint32_t n_vocab, uint32_t lg_ld, uint32_t hmax, int32_t voff) {
+    const int32_t* __restrict__ ng, const uint32_t* __restrict__ wl, uint32_t wl_words,
+    uint32_t n_vocab, uint32_t lg_ld, uint32_t hmax, int32_t voff) {
     __shared__ int32_t pf[kMaxPrefix];
     __shared__ int64_t s_start, s_end, s_plen, s_p0;
 
@@ -96,6 +102,9 @@ __global__ __launch_bounds__(kThreads) void ngram_ban_kernel(
 
     const int32_t* __restrict__ h = hist + (size_t)m * hmax + ho;
     float* __restrict__ row = lg + (size_t)m * lg_ld;
+    // The row's own whitelist words (a SET bit exempts the column, the reference's
+    // `banned.difference_update(self.whitelist)`), read at the position loop below.
+    const uint32_t* __restrict__ w = wl ? wl + (size_t)m * wl_words : nullptr;
 
     // The prefix: LDS when it fits, otherwise each position reads it from the plane.
     const bool in_lds = plen <= (int64_t)kMaxPrefix;
@@ -116,18 +125,21 @@ __global__ __launch_bounds__(kThreads) void ngram_ban_kernel(
         const int32_t tok = h[idx + plen];
         const int64_t col = (int64_t)tok - voff;
         if (tok < 0 || col < 0 || col >= (int64_t)n_vocab) continue;
+        if (wl && ((w[col >> 5] >> (uint32_t)(col & 31)) & 1u) != 0u) continue;
         // Two positions may ban one token; the store is idempotent and the value is constant.
         row[col] = -INFINITY;
     }
 }
 
-int r4d_sample_ngram_ban_f32(long lg, long params, long hist, long ng, int M, int n_vocab,
-                             int hmax, int lg_ld, int vocab_off, long stream) {
+int r4d_sample_ngram_ban_f32(long lg, long params, long hist, long ng, long wl, int wl_words,
+                             int M, int n_vocab, int hmax, int lg_ld, int vocab_off, long stream) {
     if (!lg || !params || !hist || !ng) return R4D_NO(RAD_E_INVAL);
     if (M <= 0 || n_vocab <= 0 || hmax <= 0) return R4D_NO(RAD_E_SHAPE);
+    if (wl && wl_words <= 0) return R4D_NO(RAD_E_SHAPE);
     if (!lg_ld) lg_ld = n_vocab;
     hipLaunchKernelGGL(ngram_ban_kernel, dim3((uint32_t)M), dim3(kThreads), 0, (hipStream_t)stream,
                        (float*)lg, (const SP*)params, (const int32_t*)hist, (const int32_t*)ng,
+                       (const uint32_t*)wl, (uint32_t)(wl ? wl_words : 0),
                        (uint32_t)n_vocab, (uint32_t)lg_ld, (uint32_t)hmax, (int32_t)vocab_off);
     return hipGetLastError() == hipSuccess ? RAD_OK : R4D_NO(RAD_E_DEVICE);
 }
@@ -159,7 +171,7 @@ static int params_ok(const RadTensor* t, long long M) {
 }
 
 extern "C" int r4d_rad_sample_ngram_ban(const RadArgs* a, RadStream s) {
-    enum { V_LOGITS = 0, V_PARAMS, V_HIST, V_NGRAM };
+    enum { V_LOGITS = 0, V_PARAMS, V_HIST, V_NGRAM, V_WL };
     const RadTensor* lg = r4d_opt(a, V_LOGITS);
     if (!lg) return R4D_NO(RAD_E_INVAL);
     R4D_NEED(dt_f32(lg));
@@ -183,8 +195,20 @@ extern "C" int r4d_rad_sample_ngram_ban(const RadArgs* a, RadStream s) {
     /* One {n, window} pair a row, at least M of them. */
     if (r4d_numel(ng) < 2 * M) return R4D_NO(RAD_E_SHAPE);
 
+    /* The optional whitelist bitmask: contiguous words of 32 columns, M rows of them. */
+    const RadTensor* wl = r4d_opt(a, V_WL);
+    const long long wwords = (nv + 31) / 32;
+    long long wl_addr = 0;
+    if (wl) {
+        R4D_NEED(dt_i32(wl));
+        if (!r4d_contig(wl)) return R4D_NO(RAD_E_STRIDE);
+        if (r4d_numel(wl) < M * wwords) return R4D_NO(RAD_E_SHAPE);
+        wl_addr = r4d_addr(wl);
+    }
+
     const long long voff = r4d_geti_or(a, "vocab_off", 0);
     return r4d_sample_ngram_ban_f32(r4d_addr(lg), r4d_addr(pr), r4d_addr(h), r4d_addr(ng),
+                                    wl_addr, (int)wwords,
                                     (int)M, (int)nv, (int)hmax, (int)ld, (int)voff,
                                     (long)(uintptr_t)s);
 }

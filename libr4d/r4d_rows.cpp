@@ -2114,11 +2114,15 @@ static const RadOperandSpec oDry[] = {
 /* The n-gram ban's own plane: one i32 {n-gram length, window} pair a row (n 0 = off, window <= 0
  * = the whole staged history). A plane beside `params` rather than fields in it, because the
  * params row is the fixed 24-word RadSampleParams every sampler op shares. */
+/* `whitelist` is optional: a bitmask plane a row (a SET bit exempts that column from the ban,
+ * the reference's whitelist), [M, ceil(n_vocab/32)] i32/u32, contiguous. Absent, nothing is
+ * exempt. */
 static const RadOperandSpec oNgramBan[] = {
-    { "logits",  RAD_OPD_INOUT, 0 },
-    { "params",  RAD_OPD_IN,    0 },
-    { "history", RAD_OPD_IN,    0 },
-    { "ngram",   RAD_OPD_IN,    0 },
+    { "logits",    RAD_OPD_INOUT, 0 },
+    { "params",    RAD_OPD_IN,    0 },
+    { "history",   RAD_OPD_IN,    0 },
+    { "ngram",     RAD_OPD_IN,    0 },
+    { "whitelist", RAD_OPD_IN,    1 },
 };
 static const RadOperandSpec oTemp[] = {
     { "logits", RAD_OPD_INOUT, 0 },
@@ -2838,10 +2842,12 @@ static const RadOpSchema kSchemas[] = {
            "occurred before, by its longest such repeat -- what stops a model looping on a phrase "
            "rather than on a token. Tokens the breaker plane marks are exempt."),
     SCHEMA("sample_ngram_ban", pPenal, oNgramBan,
-           "the windowed no-repeat-ngram ban: every token completing an n-gram the last `window` "
-           "tokens of the row's history contain is set to -infinity. `ngram` is one i32 "
-           "{n, window} pair a row; the window bounds the n-gram's START index, as in the "
-           "reference, window <= 0 searches the whole span and n 0 is off."),
+            "the windowed no-repeat-ngram ban: every token completing an n-gram the last `window` "
+            "tokens of the row's history contain is set to -infinity. `ngram` is one i32 "
+            "{n, window} pair a row; the window bounds the n-gram's START index, as in the "
+            "reference, window <= 0 searches the whole span and n 0 is off. The optional "
+            "`whitelist` bitmask exempts a token whose column bit is set; absent, nothing is "
+            "exempt."),
     SCHEMA("sample_temp", pMVocab, oTemp,
            "per-request temperature. temp <= 0 leaves the row untouched; greedy is sample_argmax."),
     SCHEMA("sample_mask", pMVocab, oMask,
@@ -3860,9 +3866,9 @@ static const RadConstraint cAttnDenseH64[] = {
     C_EQ("head_dim", 64), C_EQ("gqa", 1), C_IN("dtype", "bf16"),
 };
 /* Unlimited-OCR's SAM tower (r4d_sam_attn_bf16.hip): one block per (segment, tile, head), a thread
- * a query row, q and the output accumulator in registers; only head_dim 64 is instantiated and the
- * tables must be exactly 2*tile-1 rows (a geometry needing get_rel_pos's resampling is libref's
- * and libavx's). */
+ * a query row, q and the output accumulator in registers; only head_dim 64 is instantiated and a
+ * rel_pos table that is not 2*tile-1 rows is linear-resampled on read (get_rel_pos), so the 127-row
+ * global tables serve a 40-grid block as 79 rows. */
 static const RadConstraint cSamAttn[] = {
     C_EQ("head_dim", 64), C_IN("dtype", "bf16"),
 };
@@ -6361,8 +6367,8 @@ R4D_WIN_PAIR(512, 1) R4D_WIN_PAIR(512, 2) R4D_WIN_PAIR(512, 4) R4D_WIN_PAIR(512,
 { "sam_attn_bf16", "sam_attn", "attn",
   "Unlimited-OCR's SAM tower attention: windowed tiles with a decomposed relative-position term",
   "head_dim 64; any grid, window and segment count (a segment is one grid_h*grid_w); q/k/v/out at "
-  "their own row pitch (column slices of one fused projection); rel_pos tables exactly 2*tile-1 "
-  "rows (a geometry needing get_rel_pos's resampling is libref's and libavx's)",
+  "their own row pitch (column slices of one fused projection); rel_pos tables of any row count "
+  ">= 1 (a table that is not 2*tile-1 rows is linear-resampled on read)",
   "bf16 query / key / value / out and rel_pos tables, i32 cu_seqlens, fp32 accumulate",
   RAD_DOMAIN_DEVICE, R4D_PRIO_ONLY,
   ROW(cSamAttn), NOTUNE,

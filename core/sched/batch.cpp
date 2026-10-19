@@ -1164,6 +1164,8 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         B.enc_n_seg = 0;
         B.enc_cu = nullptr;
         B.enc_max_seg = 0;
+        B.enc_seg_h = nullptr;
+        B.enc_seg_w = nullptr;
         B.n_checkpoints = n_ck;
         B.checkpoint_tok = n_ck ? on_rank(base, b0, s.d_cktok) : nullptr;
         B.checkpoint_slot = n_ck ? on_rank(base, b0, s.d_ckslot) : nullptr;
@@ -1232,6 +1234,8 @@ const RadBatch* BatchBuilder::build_encoder(const std::vector<EncoderPart>& part
     const int64_t max_segs = enc.max_patches / (enc.merge > 0 ? enc.merge : 1) + 1;
     int64_t n_patch = 0, n_seg = 0, max_seg = 0;
     enc_cu_host_[0] = 0;
+    enc_seg_h_host_.clear();
+    enc_seg_w_host_.clear();
     for (const EncoderPart& p : parts) {
         const mm::Item& it = *p.item;
         if (p.seg0 < 0 || p.n_seg <= 0 || p.seg0 + p.n_seg > it.n_seg) {
@@ -1254,6 +1258,8 @@ const RadBatch* BatchBuilder::build_encoder(const std::vector<EncoderPart>& part
         for (int32_t q = p.seg0; q < p.seg0 + p.n_seg; ++q) {
             const int64_t seg_p = it.patch_at(q + 1) - it.patch_at(q);
             enc_cu_host_[n_seg + 1] = enc_cu_host_[n_seg] + (int32_t)seg_p;
+            enc_seg_h_host_.push_back(it.seg_h(q));
+            enc_seg_w_host_.push_back(it.seg_w(q));
             ++n_seg;
             if (seg_p > max_seg) max_seg = seg_p;
         }
@@ -1300,6 +1306,8 @@ const RadBatch* BatchBuilder::build_encoder(const std::vector<EncoderPart>& part
         B.enc_n_seg = n_seg;
         B.enc_cu = static_cast<const int32_t*>(enc_cu_dev_[r]);
         B.enc_max_seg = (int32_t)max_seg;
+        B.enc_seg_h = enc_seg_h_host_.data();
+        B.enc_seg_w = enc_seg_w_host_.data();
     }
     out_last_ = out_next_;
     out_next_ = (out_next_ + 1) % kOut;

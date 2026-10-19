@@ -1228,6 +1228,17 @@ so that is what a request sending neither field gets:
 {"messages": [...], "ngram_ban_n": 35, "ngram_window": 128}
 ```
 
+**The ban's whitelist** (`ngram_whitelist` in a request, alias `no_repeat_ngram_whitelist`;
+`generation.no_repeat_ngram_whitelist` in the container and in a `generation_config.json`, a JSON
+array of ids) names token ids the ban must never ban: the reference processor removes them from
+the banned set before it blocks anything (`banned.difference_update(whitelist)`). Absent, null and
+empty all mean off -- the reference's empty whitelist, the form this checkpoint ships -- and off is
+bit-identical to a ban without the feature. There is no command-line flag.
+
+```json
+{"messages": [...], "ngram_ban_n": 35, "ngram_window": 128, "ngram_whitelist": [151645, 151644]}
+```
+
 **The rest of the sampler** has a flag per field, spelled like the request field:
 `--presence-penalty`, `--frequency-penalty`, `--repetition-penalty`, `--repeat-last-n`,
 `--typical-p`, `--dry-multiplier`, `--dry-base`, `--dry-allowed-length`, `--dry-penalty-last-n`,

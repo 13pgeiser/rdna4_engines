@@ -2387,7 +2387,11 @@ int ref_sample_dry_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
  * and adds one small plane beside them: `ngram`, an i32 {n-gram length, window} pair a row. It is
  * a plane of its own rather than fields in `params` because the params row is a fixed 24-word wire
  * format shared by every sampler op (and recorded in the kbench fixtures). Drawn in 0..63 so both
- * a length inside the 64-token history and the 0 (= off) and whole-window forms occur. */
+ * a length inside the 64-token history and the 0 (= off) and whole-window forms occur.
+ *
+ * The optional `whitelist` bitmask is sample_mask's plane shape (word w bit b covers column
+ * 32w + b, a SET bit marking an exempt token), addressed by the sampled row itself; a random draw
+ * fills it with random bits, so a sweep exercises exemptions as often as plain bans. */
 int ref_sample_ngram_ban_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     int64_t M = 0, nv = 0;
     if (sample_vocab(p, n_p, &M, &nv) < 0) return RAD_E_UNSUPPORTED;
@@ -2397,6 +2401,7 @@ int ref_sample_ngram_ban_shape(const RadParam* p, int n_p, int operand, RadOpdDe
     o.t_idx({ M, (int64_t)REF_SAMPLE_HIST }, nv, -1,
             (uint32_t)RAD_OPD_F_IDX_HISTORY);                       /* history */
     o.t_idx({ M, 2 }, 64, -1, 0);                                   /* ngram: {n, window} */
+    o.t((uint32_t)RAD_I32, { M, (nv + 31) / 32 });                  /* whitelist, optional */
     return o.finish("sample_ngram_ban", operand, out);
 }
 
